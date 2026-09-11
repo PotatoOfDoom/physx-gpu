@@ -88,7 +88,7 @@ void cpgContacts(uint3 dtid : SV_DispatchThreadID)
     const PgIn s = gIn[t];
 
     // lo/hi -> the 64-bit device address of this test's hull points
-    const uint64_t ptsAddr = (uint64_t(s.ptsAddrPack.y) << 32) | uint64_t(s.ptsAddrPack.x);
+    const PtsRef ptsAddr = ptsFromAddr((uint64_t(s.ptsAddrPack.y) << 32) | uint64_t(s.ptsAddrPack.x));
 
     ShapeRef sh;
     sh.type = s.meta.x; sh.core = s.core; sh.poseQ = s.poseQ; sh.poseP = s.poseP.xyz;

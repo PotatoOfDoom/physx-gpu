@@ -1865,6 +1865,169 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.70c — `convexCoreTrimeshNphase_Kernel32`, und was der Sweep über die Szene sagte
+
+Der dritte der fünf `convexCore*Nphase`-Kernel, und der erste, der einen BVH abläuft.
+Die Szene aus P9.70b war rot, mit beiden Hälften der Messung auf Band. Jetzt:
+
+```
+vorher (Kernel nicht gemappt)   80× y = -73.8070, 160 Fehlprüfungen
+nachher                         80× y =   0.5001,   0 Fehlprüfungen
+PXG_CPU_CONTROL=1               80× y =   0.5001            ← unabhängige Erwartung
+```
+
+Die 0.5001 ist nicht meine Zahl. Sie ist die, die PhysX' eigene CPU-Pipeline über
+demselben Boden liefert, und beide stimmen **körperweise** überein.
+
+### Fünf Schichten lagen schon verifiziert da — eine nicht
+
+`pxgSlangCvxCoreShape` (P9.67b), `pxgSlangCvxCoreCvx` (P9.69a), `pxgSlangCvxCoreMake`
+(P9.69b), `pxgSlangCvxCoreAcc` (P9.70) und `pxgSlangBv32` (P8.25) tragen zusammen fast
+den ganzen Kernel. `pxgSlangCvxCoreBvh` kam in dieser Tranche dazu — aber als **Lift**
+aus `npCvxBvhGlue`, nicht als Neuschrift: die Fixture kompiliert seither denselben Text
+und bleibt mit 8000 Fällen der Schiedsrichter.
+
+Was **nicht** liftbar war, ist der Mehr-Patch-Ausgabeschwanz. `ccoWriteContact`
+(`npCvxCoreOut.slang:281-402`) ist eine treue Portierung von cu:292-445 — und schreibt
+in einen **Fixture-Record**, nicht durch `Ptr<>` in `contactStream`/`patchStream`/
+`cmOutputs`. Es gab im Korpus keine Funktion, die diese Bytes an ihre Geräteadressen
+schreibt und die `InterlockedAdd` gegen `PxgPatchAndContactCounters` fährt. Das ist
+`pxgSlangCvxCoreOut32.slang`, geschrieben mit fünf benannten Unterschieden zum
+Ein-Patch-Schwanz — darunter, dass `touchChange` auf `numPatches` guckt, `nbContacts`
+aber auf `numPoints` (cu:365 gegen cu:374).
+
+### `PtsRef`: das Dreieck liegt auf dem Stack
+
+`TrimeshBvh::createConvex` baut `float4 verts[3]` **lokal** und setzt
+`core.points = verts`. Ein Stack-Array hat in SPIR-V keine Geräteadresse, und in den
+achtzehn Argumenten dieses Kernels ist kein Puffer frei — jeder ist eine lebende
+Ausgabe. Also musste der Pool-Parameter der Shape-Schicht beides können. `PtsRef`
+trägt `uint64_t addr` **oder** drei Vertices inline; `ptsAt` wählt.
+
+Getrennter By-Value-Parameter und **kein Feld von `ShapeRef`**, weil `ConvexW` ein
+`ShapeRef` einbettet und `inout` durch den ganzen Simplex-Lauf geht — 48 Byte mehr
+dort sind genau die Form, aus der P9.69a den Compile-Kollaps gemessen hat.
+
+### Der Sweep, und warum er ein neues Werkzeug brauchte
+
+`run_mutation_sweep.sh` fährt `gpuslang-tests <name>`. Engine-Kernel wie dieser haben
+**keine eigene Fixture** — ihre Verdrahtung ist genau das, was keine Fixture sieht.
+Bis hierher wurde sie von Hand gesweept oder gar nicht. „Gar nicht" heißt: behauptet,
+nicht gezeigt. `tools/run_scene_mutation_sweep.sh` schließt die Lücke, mit denselben
+Invarianten (forced-fresh `.spv`, `trap`, grüne Baseline vorher und nachher, Hang als
+eigene Klasse) und einem vierten Ausgang: ein **fehlendes Verdikt** ist ein Kill, nie
+ein Pass (P9.3a).
+
+```
+Kernel      15 Mutanten:  9 getötet, 6 überlebt
+Out32        9 Mutanten:  6 getötet, 3 überlebt
+```
+
+### Die Überlebenden, einzeln diagnostiziert
+
+Vier von ihnen waren **strukturelle No-ops dieser Szene**, und das ist ein Befund über
+die Szene, keine Entschuldigung für den Port:
+
+| Mutant | warum unsichtbar |
+|---|---|
+| `addpoints-world-identity` | `transform1.q` war Identität — Drehen mit q1 und mit Identität ist derselbe Punkt |
+| `transform0in1-no-inverse` | dito: `conj(q1)·q0` und `q1·q0` sind bei q1 = Identität dieselbe Quaternion |
+| `scalebounds-identity` | der Boden hat die Vorgabe-`PxMeshScale`, also ist die Skalen-Matrix die Einheit |
+| `bounds-getBounds-not-support` | `PxConvexCoreGeometry(core, margin = 0)` — der Term `+ dir * margin` ist `+ dir * 0` |
+
+Die Antwort darauf ist `PXG_CVXCORE_YAW` (Vorgabe 0.6 rad): Boden **und** Körper werden
+um Y gegiert. Der Boden bleibt waagerecht, die Ruhehöhe bleibt der Radius, die
+CPU-Kontrolle liefert weiter 0.5001 — aber `transform1.q` ist nicht mehr Identität.
+`addpoints-world-identity` **stirbt** daran.
+
+`transform0in1-no-inverse` stirbt **nicht**, und der Grund ist der eigentliche Fund
+dieser Tranche: ein Zylinder auf einem **ebenen, gleichförmigen** Boden ruht auf
+Radiushöhe, gleich wie er gegiert ist. Die Szene prüft Ruhehöhe und Lineargeschwindigkeit;
+eine falsche Orientierung im Netz-Frame erzeugt ein Drehmoment, keine Höhenänderung.
+
+### Der wichtigste Überlebende: die Szene sieht nur EINEN Patch
+
+`patch-reserve-single` (`numPatches * 64` → `64`) und `startContactIndex-frozen`
+überleben aus demselben Grund: ein flach liegender Zylinder auf einer Ebene erzeugt
+**genau einen** Kontaktpatch. Der Mehr-Patch-Schwanz — das eine genuin neue Stück
+Engine-Code dieser Tranche — wird von der Szene also zu einem Sechzehntel ausgeübt.
+
+Das ist nicht zu beschönigen und steht als Folgearbeit: eine **V-Rinne** als
+Netzboden. Ein Zylinder mit Radius r in einer V-Rinne mit Halbwinkel θ ruht mit seiner
+Achse auf `r / sin(θ)` über dem Scheitel — exakt rechenbar — und berührt **zwei** Wände
+mit **verschiedenen** Normalen. Das ist genau die Geometrie, die der Mehr-Patch-Schwanz
+braucht, und sie würde zugleich `transform0in1-no-inverse`, `cull-removed` und
+`bounds-no-fatten` scharf machen.
+
+### `checkTypes` ist live, nicht tot
+
+`no-checktypes-swap` überlebte, und die naheliegende Erklärung — die Engine normiere
+die Reihenfolge — ist **falsch**. Der `flip` bei
+`PxgNphaseImplementationContext.cpp:1602` ist lokal zur Bucket-Auswahl; danach geht die
+**ungetauschte** `workUnit` in `registerContactManagerInternal`. Das Paar kann also als
+(eTRIANGLEMESH, eCONVEXCORE) ankommen. Diese Szene erzeugt nur zufällig alle Paare
+kernzuerst — vermutlich weil der Boden vor den Körpern gebaut wird. Der Tausch bleibt
+transkribiert, und die Szene, die ihn scharf macht, steht aus.
+
+### Zwei Treuekorrekturen, die aus dem Lesen kamen und nicht aus dem Messen
+
+1. **Alle sechs Überlaufvergleiche sind 64-bittig.** `PxU32 + sizeof(PxContact)`
+   promotet über `size_t`, also kann `offset + 16` in CUDA **nicht** umlaufen — ein
+   Offset nahe `0xFFFFFFFF` **löst** den Test aus statt ihn zufällig zu bestehen. Die
+   Fixture `ccoWriteContact` modellierte das längst in `uint64_t`; die beiden
+   Engine-Schwänze rechneten 32-bittig. Engine und Fixture waren also uneins in genau
+   dem Fall, der zählt.
+2. **`materialIndex` wird vor dem `materials[]`-Zugriff auf `PxU16` verengt**
+   (cu:415-416), und `PxgShape::materialIndex` ist ein `PxU32`
+   (`PxgConvexConvexShape.h:53`). Beide Schwänze reichten den vollen `uint` weiter.
+
+Beides ist praktisch unerreichbar. Der Punkt eines bit-exakten Ports ist, dass
+„unerreichbar" kein Grund ist abzuweichen.
+
+### Drei Abweichungen, ausgesprochen statt versteckt
+
+- **Query-Bounds by value.** `_Callback` hält `const PxBounds3&` auf das **Temporary**
+  aus `bvh.scaleBounds(bounds)` (cu:566, :592). Die Referenz hängt für die ganze
+  Traversierung; es funktioniert nur, weil der Speicher ein unberührter POD-Stack-Slot
+  ist.
+- **Leere Lanes bekommen eine Null-Normale.** Die `.cu` ruft `addPoints` **außerhalb**
+  des `triIndex != 0xffffffff`-Guards (cu:1007-1009), übergibt also für Lanes ohne
+  Dreieck ein nie zugewiesenes `PxVec3 normal` — und `copyPoints` rotiert es
+  bedingungslos (cu:792). Der Wert wird nie gespeichert. Unbeobachtbar, aber nicht
+  absichtlich nachzubauen.
+- **Margin und Dreieck in verschiedenen Einheiten.** Die Margin kommt aus den
+  **invers**-skalierten Bounds, das Dreieck aus der **Vorwärts**-Skalierung. Bei
+  nicht-einheitlicher `PxMeshScale` sind das zwei Einheiten. Wortgetreu übernommen.
+
+### Die geteilte ABI-Zeile, dritter Nutzer
+
+`kCvxCorePlane` — 136 Byte, `numTests` + 14 Zeiger + drei Limits. Die drei Kernel
+unterscheiden sich nur in der Blockform: (1024,1,1), (512,1,1) und hier (32,4,1).
+Argument für Argument gegen `PxgNarrowphaseCore.cpp:963-983` geprüft, nicht nach
+Ähnlichkeit, weil P9.48d zeigt, was eine falsche Zeile kostet:
+`pushConstantSizeFor() == 0` und **jeder Start schweigend verweigert**, bei grüner
+Suite, grünen Fixtures und grünen Szenen.
+
+### Blockabdeckung
+
+```
+CUDA      block (32,4,1) = 128 Threads, 4 Tests, je ein Warp
+Port      [numthreads(32,1,1)], 4 Tests, SERIELL durchlaufen
+Gitter    ceil(numTests/4), unverändert weitergereicht
+Deckung   32 × 4 = 128 = Block → exakt
+```
+
+`check_block_coverage.py`: **331 Kernel geprüft, 0 unterdeckt, 0 unaufgelöst.**
+
+### Stand
+
+Beide Sweeps grün restauriert, alle vierzehn Prüfer grün, `convexcoretrimesh` ist in
+`run_scenes.sh`s `SCENES`-Liste aufgenommen. Manifest: `convexCoreTrimeshNphase_Kernel32`
+gemappt, erreichbar-nicht-gemappt fällt von 26 auf 25. Die Zahlen der vollen Suite in
+beiden Speichermodi und des Szenen-Sweeps folgen im nächsten Commit — sie liefen noch,
+als dieser geschrieben wurde, und eine Zahl, die ich nicht gemessen habe, schreibe ich
+nicht auf.
+
 ## P9.70b — die Szene zuerst, mit beiden Messungen, bevor der Kernel existiert
 
 `PXG_SCENE=convexcoretrimesh`: achtzig dynamische CONVEX-CORE-Zylinder auf einem

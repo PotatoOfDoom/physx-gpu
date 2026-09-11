@@ -250,17 +250,17 @@ void convexCorePlaneOneTest(uint testIndex)
 
     ShapeRef sh;
     float margin;
-    uint64_t shPts;
+    PtsRef shPts;
     const bool ok = makeConvexShapeCvxCore(shape1, convexQ, convexP, sh, margin, shPts);
 
     // ---- Gu::generateContacts(PxPlane, ConvexShape) (GuConvexSupport.cpp:41-75)
     // Transcribed from npCvxCorePlaneGen's entry, which is the fixture that
     // verifies it.  `s.ptsAddr` there is the ePOINTS hull's device address; this
     // kernel's slot 1 is never eCONVEXMESH -- convex-vs-plane has its own kernel --
-    // so a null address is passed and supportLocalQ's CORE_POINTS branch is
+    // so a null pool is passed and supportLocalQ's CORE_POINTS branch is
     // unreachable here.  It is never DEREFERENCED either: that branch returns
-    // before touching the address when the core is not ePOINTS.
-    const uint64_t ptsPool = shPts;   // 0 unless slot 1 is eCONVEXMESH
+    // before touching the pool when the core is not ePOINTS.
+    const PtsRef ptsPool = shPts;   // null unless slot 1 is eCONVEXMESH
 
     const float3 normal = -pn;
 

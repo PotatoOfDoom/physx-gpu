@@ -1468,6 +1468,14 @@ static const PxgKernelAbiRow kRows[] = {
     // same order (convexCoreCollision.cu:497-516 vs :449-468); the two launch sites
     // differ only in the block size.  Sharing the row keeps them from drifting.
     { "convexCoreConvexNphase_Kernel", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
+    // P9.70c: the THIRD sharer.  convexCoreTrimeshNphase_Kernel32
+    // (convexCoreCollision.cu:918-937) declares the same eighteen arguments in the
+    // same order as the two rows above; the launch sites differ only in the block
+    // shape -- (32,4,1) here against (1024,1,1) and (512,1,1).  Verified argument by
+    // argument against PxgNarrowphaseCore.cpp:963-983 rather than by resemblance,
+    // because P9.48d is what a wrong row costs: pushConstantSizeFor() returns 0 and
+    // every launch is REFUSED IN SILENCE, with the whole suite still green.
+    { "convexCoreTrimeshNphase_Kernel32", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

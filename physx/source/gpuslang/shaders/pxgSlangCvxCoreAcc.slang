@@ -67,12 +67,31 @@
 // makes as many as it has leaf batches.  The state machine is the same one, but
 // "many calls" is exercised by the scene, not by the bitwise fixture.
 
-static const float FLT_MAXQ = 3.402823466e+38f;
 static const float SAME_NORMAL = 0.999f;
 static const uint WARP_SIZE = 32u;
 static const uint MAX_PATCHES = 16u;
 static const uint MAX_PATCH_POINTS = 4u;
 static const uint MAX_CONVEX_CONTACTS = 4u;
+
+// ===========================================================================
+// THE FIVE SHARED HELPERS, AND WHY THEY ARE BEHIND A GUARD (P9.70c)
+// ===========================================================================
+//
+// npCvxCoreWarpAcc, the fixture, includes this file with NO module imported at
+// all -- the Phase-1 convention, which keeps a fixture readable on its own.  So
+// these live here.  cvxCoreTriNpBda, the engine kernel, imports
+// pxgSlangCvxCoreShape, which exports the same five as `public`, and two
+// definitions of one name do not compile.
+//
+// The guard suppresses the duplicates rather than renaming anything, so both
+// consumers still compile ONE accumulator -- which is the entire property the
+// P9.70 extraction exists for.  The suppression is only sound because the two
+// spellings are the same code, and that was checked rather than assumed:
+// dot3Q, crossQ, quatRotQ and NOIDX are character for character identical to
+// pxgSlangCvxCoreShape.slang:69-103; FLT_MAXQ is the same constant; magQ is the
+// same expression, written there through the magSq helper.
+#ifndef PXG_CVXCORE_ACC_HAS_HELPERS
+static const float FLT_MAXQ = 3.402823466e+38f;
 static const uint NOIDX = 0xFFFFFFFFu;
 
 float dot3Q(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -90,6 +109,7 @@ float3 quatRotQ(float4 q, float3 v)
                   vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
                   vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2);
 }
+#endif
 
 // minIndex/maxIndex: LOWEST lane index achieving the min/max over mask lanes
 uint minIndexQ(const float v[WARP_SIZE], uint mask, out float best)

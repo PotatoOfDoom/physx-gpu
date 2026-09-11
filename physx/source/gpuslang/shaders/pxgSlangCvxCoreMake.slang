@@ -58,10 +58,12 @@
 // `float4 pool[12]` BY VALUE, so this arm could not be written at all -- which is
 // why cvxCorePlaneNpBda documents its slot 1 as never being eCONVEXMESH rather than
 // handling it.  The layer now reads them through Ptr<float4>, and the address comes
-// back through `ptsAddr`.  core[0].x/y still carry the hull pointer because
-// supportLocalQ uses that word pair as its 64-bit NULL guard (review 164).
+// back through `pts` (P9.70c turned that out-parameter from a bare address into a
+// PtsRef, so the SAME layer can also serve a BVH triangle built on the stack; this
+// arm always takes the address form).  core[0].x/y still carry the hull pointer
+// because supportLocalQ uses that word pair as its 64-bit NULL guard (review 164).
 bool makeConvexShapeCvxCore(PxgShapeGpu s, float4 poseQ, float3 poseP,
-                            out ShapeRef sh, out float margin, out uint64_t ptsAddr)
+                            out ShapeRef sh, out float margin, out PtsRef pts)
 {
     sh.type = 0u;
     sh.core[0] = uint4(0u, 0u, 0u, 0u);
@@ -70,7 +72,7 @@ bool makeConvexShapeCvxCore(PxgShapeGpu s, float4 poseQ, float3 poseP,
     sh.poseQ = poseQ;
     sh.poseP = poseP;
     margin = 0.0f;
-    ptsAddr = 0UL;
+    pts = ptsFromAddr(0UL);
 
     if (s.type == EGT_CONVEXCORE)
     {
@@ -114,7 +116,7 @@ bool makeConvexShapeCvxCore(PxgShapeGpu s, float4 poseQ, float3 poseP,
         // PointsCore: { const float4* points; PxVec3 S; PxQuat R; PxU8 numPoints,
         // stride; } -- words 0/1 the pointer, 2..4 S, 5..8 R, 9 the packed counts.
         const uint64_t hull = s.hullOrMeshPtr;
-        ptsAddr = hull + 48UL;                     // ptr + 3 float4s
+        pts = ptsFromAddr(hull + 48UL);            // ptr + 3 float4s
         sh.core[0].x = uint(hull & 0xFFFFFFFFUL);  // the NULL guard reads this pair
         sh.core[0].y = uint(hull >> 32);
         sh.core[0].z = asuint(s.scaleX);           // S

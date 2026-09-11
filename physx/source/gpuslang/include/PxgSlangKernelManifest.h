@@ -77,7 +77,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexPlaneNphase_Kernel", "npCvxPlaneNphase.spv", "convexPlaneNphase_Kernel" },  // CONVEX_PLANE_KERNEL_MAIN (P5 Step 5 tranche C BDA)
     { "convexCorePlaneNphase_Kernel", "cvxCorePlaneNpBda.spv", "convexCorePlaneNphase_Kernel" },  // CONVEXCORE_PLANE_KERNEL_MAIN
     { "convexCoreConvexNphase_Kernel", "cvxCoreCvxNpBda.spv", "convexCoreConvexNphase_Kernel" },  // CONVEXCORE_CONVEX_KERNEL_MAIN
-    { "convexCoreTrimeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_TRIMESH_KERNEL32_MAIN (unmapped)
+    { "convexCoreTrimeshNphase_Kernel32", "cvxCoreTriNpBda.spv", "convexCoreTrimeshNphase_Kernel32" },  // CONVEXCORE_TRIMESH_KERNEL32_MAIN
     { "convexCoreTetmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_TETMESH_KERNEL32_MAIN (unmapped)
     { "convexCoreClothmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_CLOTHMESH_KERNEL32_MAIN (unmapped)
     { "convexConvexNphase_stage1Kernel", "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel" },  // CONVEX_CONVEX_KERNEL_EARLY_OUT

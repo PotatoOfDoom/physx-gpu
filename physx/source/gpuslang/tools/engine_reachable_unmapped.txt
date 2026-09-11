@@ -43,7 +43,9 @@ convexCoreClothmeshNphase_Kernel32
 # first of the five.  PXG_SCENE=convexcoreplane went from final y=-73.807 to
 # 0.5000, the cylinder's radius and the same number the capsule scene gives.
 convexCoreTetmeshNphase_Kernel32
-convexCoreTrimeshNphase_Kernel32
+# convexCoreTrimeshNphase_Kernel32 -- MAPPED in P9.70c (cvxCoreTriNpBda.spv).  The
+# third convexCore arm, and the one the `convexcoretrimesh` scene was written
+# against BEFORE the kernel existed, so the red measurement is on record.
 evaluatePointDistancesSDFBatch
 sb_heightfieldContactGenLaunch
 # sphereTrimeshNarrowphase -- MAPPED in P9.66b (sphereTriNpBda.spv).  It was the

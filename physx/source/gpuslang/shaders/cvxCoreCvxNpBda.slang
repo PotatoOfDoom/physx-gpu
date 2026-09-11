@@ -186,7 +186,7 @@ void convexCoreConvexOneTest(uint testIndex)
 
     ShapeRef shA, shB;
     float margin0, margin1;
-    uint64_t ptsA, ptsB;
+    PtsRef ptsA, ptsB;
     const bool okA = makeConvexShapeCvxCore(shape0, q0, p0 - shift, shA, margin0, ptsA);
     const bool okB = makeConvexShapeCvxCore(shape1, q1, p1 - shift, shB, margin1, ptsB);
 

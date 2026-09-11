@@ -151,8 +151,66 @@ public struct ShapeRef
     public float3 poseP;
 }
 
+// ---------------------------------------------------------------------------
+// PtsRef -- where a CORE_POINTS shape's vertices live.  P9.70c.
+//
+// Until now this was a bare `uint64_t ptsAddr`, because every ePOINTS shape the
+// layer had seen was a COOKED HULL: an array that already sits in device memory,
+// read through Ptr<float4>.  P9.69b made it an address precisely so a 255-vertex
+// hull would not be copied by value.
+//
+// The trimesh kernel breaks that assumption, and it is not a detail of style.
+// `TrimeshBvh::createConvex` (convexCoreCollision.cu:632-655) builds the triangle
+// on the STACK --
+//     float4 verts[_Bvh::PRIM_VERT_COUNT];
+//     ...
+//     core.points = verts;
+// -- and a stack array has no device address in SPIR-V.  There is nowhere in this
+// kernel's eighteen arguments to stage one either: every buffer it is handed is a
+// live output.  So the pool has to be able to BE the three vertices rather than
+// point at them.
+//
+// WHY A SEPARATE BY-VALUE PARAMETER AND NOT A FIELD OF ShapeRef: ConvexW (the
+// GJK/EPA working convex, pxgSlangCvxCoreCvx.slang) embeds a ShapeRef and is
+// passed `inout` through the whole simplex walk.  Growing ShapeRef by 48 bytes
+// grows ConvexW by 48 bytes on every one of those calls -- which is the exact
+// shape of the compile-time collapse P9.69a measured.  PtsRef rides alongside,
+// so ConvexW is unchanged.
+//
+// THE THREE VERTICES ARE INDEXED BY A SELECT CHAIN, not an array subscript: a
+// dynamically-indexed local array forces scratch memory, and the only indices
+// this arm ever sees are 0, 1 and 2.
+public struct PtsRef
+{
+    public uint64_t addr;        // device array, or 0 for the inline arm
+    public float3 v0, v1, v2;    // the inline arm (one BVH triangle)
+}
+
+public PtsRef ptsFromAddr(uint64_t a)
+{
+    PtsRef p;
+    p.addr = a;
+    p.v0 = float3(0, 0, 0); p.v1 = float3(0, 0, 0); p.v2 = float3(0, 0, 0);
+    return p;
+}
+
+public PtsRef ptsFromTri(float3 a, float3 b, float3 c)
+{
+    PtsRef p;
+    p.addr = 0uL;
+    p.v0 = a; p.v1 = b; p.v2 = c;
+    return p;
+}
+
+public float3 ptsAt(PtsRef p, uint i, uint stride)
+{
+    if (p.addr != 0uL)
+        return Ptr<float4>(p.addr)[(i * stride) / 16u].xyz;
+    return i == 0u ? p.v0 : (i == 1u ? p.v1 : p.v2);
+}
+
 // tranche-164 ConvexShape::supportLocal, margin-less, all seven types
-public float3 supportLocalQ(ShapeRef s, uint64_t ptsAddr, float3 dir)
+public float3 supportLocalQ(ShapeRef s, PtsRef pts, float3 dir)
 {
     const uint type = s.type;
     if (type == CORE_SEGMENT)
@@ -199,6 +257,10 @@ public float3 supportLocalQ(ShapeRef s, uint64_t ptsAddr, float3 dir)
         const uint w9 = s.core[2].y;
         const uint numPoints = w9 & 0xFFu;
         const uint stride = (w9 >> 8u) & 0xFFu;
+        // `core.points == NULL` (PointsCore's pointer, kept in core[0].xy as a lo/hi
+        // pair).  The INLINE arm must not trip this: the CUDA's `core.points = verts`
+        // is a live stack address, never null, so a PtsRef built by ptsFromTri
+        // carries a non-zero marker in core[0].x -- see pxgSlangCvxCoreBvh.slang.
         if ((s.core[0].x == 0u && s.core[0].y == 0u) || numPoints == 0u)
             return float3(0, 0, 0);
         const float3 S = float3(asfloat(s.core[0].z), asfloat(s.core[0].w), asfloat(s.core[1].x));
@@ -214,7 +276,7 @@ public float3 supportLocalQ(ShapeRef s, uint64_t ptsAddr, float3 dir)
         float maxDot = -FLT_MAXQ;
         for (uint i = 0u; i < numPoints; ++i)
         {
-            const float3 p = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
+            const float3 p = ptsAt(pts, i, stride);
             const float dot = dot3Q(d, p);
             if (dot > maxDot)
             {
@@ -222,7 +284,7 @@ public float3 supportLocalQ(ShapeRef s, uint64_t ptsAddr, float3 dir)
                 index = i;
             }
         }
-        const float3 point = Ptr<float4>(ptsAddr)[(index * stride) / 16u].xyz;
+        const float3 point = ptsAt(pts, index, stride);
         const float3 rp = quatRotQ(R, point);
         return quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
     }
@@ -343,7 +405,7 @@ public uint reducePolygonQ(const float3 pts[8], uint count, float3 normal, bool 
 
 // ConvexShape::contactFace core dispatch (GuConvexSupport.h L95-380 family,
 // tranches 165/166 verbatim): local-frame inputs, local-frame outputs
-public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLocal,
+public uint contactFaceQ(ShapeRef sh, PtsRef pts, float3 dir, float3 refLocal,
                   out float3 faceNormal, out float3 fp[4], out uint trig)
 {
     uint numPoints = 0u;
@@ -505,7 +567,7 @@ public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLo
         float maxDot[3] = { -3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f };
         for (uint i = 0u; i < poolN; ++i)
         {
-            const float3 raw = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
+            const float3 raw = ptsAt(pts, i, stride);
             const float3 rp = quatRotQ(R, raw);
             const float3 p = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z)); // getPoint(i)
             float dot = dot3Q(dir, p);
@@ -527,14 +589,14 @@ public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLo
         if (ok)
         {
             {
-                const float3 raw = Ptr<float4>(ptsAddr)[(index[0] * stride) / 16u].xyz;
+                const float3 raw = ptsAt(pts, index[0], stride);
                 const float3 rp = quatRotQ(R, raw);
                 p0 = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
             }
 
             if (index[2] == NOIDX)
             {
-                const float3 raw = Ptr<float4>(ptsAddr)[(index[1] * stride) / 16u].xyz;
+                const float3 raw = ptsAt(pts, index[1], stride);
                 const float3 rp = quatRotQ(R, raw);
                 const float3 p1 = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
                 const float3 n = getNormalizedQ(crossQ(crossQ(dir, p1 - p0), p1 - p0));
@@ -546,10 +608,10 @@ public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLo
             }
             else
             {
-                const float3 raw1 = Ptr<float4>(ptsAddr)[(index[1] * stride) / 16u].xyz;
+                const float3 raw1 = ptsAt(pts, index[1], stride);
                 const float3 rp1 = quatRotQ(R, raw1);
                 const float3 p1 = quatRotInvQ(R, float3(S.x * rp1.x, S.y * rp1.y, S.z * rp1.z));
-                const float3 raw2 = Ptr<float4>(ptsAddr)[(index[2] * stride) / 16u].xyz;
+                const float3 raw2 = ptsAt(pts, index[2], stride);
                 const float3 rp2 = quatRotQ(R, raw2);
                 const float3 p2 = quatRotInvQ(R, float3(S.x * rp2.x, S.y * rp2.y, S.z * rp2.z));
 
@@ -583,7 +645,7 @@ public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLo
             const float maxP = dot3Q(faceNormal, p0);
             for (uint i = 0u; i < poolN; ++i)
             {
-                const float3 raw = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
+                const float3 raw = ptsAt(pts, i, stride);
                 const float3 rp = quatRotQ(R, raw);
                 const float3 p = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
                 const float pP = dot3Q(faceNormal, p);

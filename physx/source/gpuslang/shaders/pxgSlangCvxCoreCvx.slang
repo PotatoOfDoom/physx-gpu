@@ -64,7 +64,7 @@
 // pegged).  Isolated and bisected: the shape layer as a module compiles in 0.75 s,
 // so pxgSlangCvxCoreShape stays a module and the plane kernel is unaffected; it is
 // this layer -- functions taking `inout ConvexW`, which carries `float3 verts[32]`,
-// plus `uint64_t pool` by value -- that slangc cannot get across a module
+// plus the pool descriptor by value -- that slangc cannot get across a module
 // boundary at any tolerable cost.  Textual inclusion has no such boundary and
 // costs nothing: the includer sees exactly these instructions, which is the whole
 // property the split is for.
@@ -87,7 +87,7 @@ struct ConvexW
 }
 
 // Convex<Support> ctor accuracy (L49-59)
-float convexAccuracy(ShapeRef s, uint64_t pool)
+float convexAccuracy(ShapeRef s, PtsRef pool)
 {
     const float3 X = float3(1, 0, 0), Y = float3(0, 1, 0), Z = float3(0, 0, 1);
     const float3 mn = float3(supportLocalQ(s, pool, -X).x, supportLocalQ(s, pool, -Y).y, supportLocalQ(s, pool, -Z).z);
@@ -98,7 +98,7 @@ float convexAccuracy(ShapeRef s, uint64_t pool)
 }
 
 // Convex<Support>::getBounds (L65-78): min/max via the pose's inverse basis
-void convexBounds(ShapeRef s, uint64_t pool, out float3 mn, out float3 mx)
+void convexBounds(ShapeRef s, PtsRef pool, out float3 mn, out float3 mx)
 {
     const float3 X = invBasis0(s.poseQ), Y = invBasis1(s.poseQ), Z = invBasis2(s.poseQ);
     mn = float3(poseTransform(s, supportLocalQ(s, pool, -X)).x,
@@ -110,7 +110,7 @@ void convexBounds(ShapeRef s, uint64_t pool, out float3 mn, out float3 mx)
 }
 
 // Convex<Support>::supportIndex (L80-110)
-uint supportIndexQ(inout ConvexW c, uint64_t pool, float3 dir)
+uint supportIndexQ(inout ConvexW c, PtsRef pool, float3 dir)
 {
     const float3 v = poseTransform(c.shape, supportLocalQ(c.shape, pool, quatRotInvQ(c.shape.poseQ, dir)));
     uint closest = MAX_VERTS;
@@ -137,7 +137,7 @@ struct GVert { float3 p; float s; uint aI; uint bI; }
 
 
 // Gu::RefGjkEpa::computeGjkDistance (tranche 169 verbatim, as a function)
-void gjkDistanceQ(ShapeRef sA, ShapeRef sB, uint64_t poolA, uint64_t poolB, float maxDist,
+void gjkDistanceQ(ShapeRef sA, ShapeRef sB, PtsRef poolA, PtsRef poolB, float maxDist,
                   out float retVal, out uint tag, out float3 pointA, out float3 pointB, out float3 axis)
 {
     ConvexW cA, cB;
@@ -459,7 +459,7 @@ uint fvAt(uint3 v, uint j) { return j == 0u ? v.x : (j == 1u ? v.y : v.z); }
 // EpaDepth::addPoint (L480-565).  Returns proj; fltMax mirrors the FLT_MAX
 // early-outs (the caller substitutes FLT_MAX).
 float epaAddPoint(inout EpaPoly P, inout ConvexW cA, inout ConvexW cB,
-                  uint64_t poolA, uint64_t poolB, float3 dir, float accuracy,
+                  PtsRef poolA, PtsRef poolB, float3 dir, float accuracy,
                   out bool fltMax)
 {
     fltMax = false;
@@ -553,7 +553,7 @@ float epaAddPoint(inout EpaPoly P, inout ConvexW cA, inout ConvexW cB,
 }
 
 // Gu::RefGjkEpa::computeEpaDepth (tranche 170 verbatim, as a function)
-void epaDepthQ(ShapeRef sA, ShapeRef sB, uint64_t poolA, uint64_t poolB,
+void epaDepthQ(ShapeRef sA, ShapeRef sB, PtsRef poolA, PtsRef poolB,
                out float retVal, out uint tag, out float3 pointA, out float3 pointB, out float3 axis)
 {
     ConvexW cA, cB;

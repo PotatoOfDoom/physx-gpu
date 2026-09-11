@@ -78,6 +78,71 @@ float combineScalars(float a, float b, uint mode)
     return 0.0f;
 }
 
+// ---------------------------------------------------------------------------
+// combineMaterials (npInsertPatch), factored out of cvxCoreWriteOutput by P9.70c
+// so the MULTI-PATCH tail (pxgSlangCvxCoreOut32.slang) shares these instructions
+// instead of carrying a second transcription of them.  That is P9.37's finding
+// applied a second time: the danger in a replicated tail is not that an operator
+// is mistyped, it is that an ASSOCIATION drifts, and a drifted association is
+// invisible until a scene disagrees.
+void cvxCoreCombineMaterials(uint64_t materialsAddr, uint mi0, uint mi1,
+                             out float sta, out float dyn, out float rest,
+                             out float damping, out uint matFlags)
+{
+    Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(materialsAddr);
+    const PxsMaterialDataGpu m0 = materials[mi0];
+    const PxsMaterialDataGpu m1 = materials[mi1];
+
+    const float r0f = m0.restitution, r1f = m1.restitution;
+    const bool compliant0 = r0f < 0.0f, compliant1 = r1f < 0.0f;
+    const bool exactlyOneCompliant = compliant0 != compliant1;
+    const bool bothCompliant = compliant0 && compliant1;
+    const uint m0flags = m0.flagsModes0 & 0xFFFFu;
+    const uint m1flags = m1.flagsModes0 & 0xFFFFu;
+    const uint m0fric = (m0.flagsModes0 >> 16u) & 0xFFu;
+    const uint m1fric = (m1.flagsModes0 >> 16u) & 0xFFu;
+    const uint m0rest = (m0.flagsModes0 >> 24u) & 0xFFu;
+    const uint m1rest = (m1.flagsModes0 >> 24u) & 0xFFu;
+    const uint m0damp = m0.modes1 & 0xFFu;
+    const uint m1damp = m1.modes1 & 0xFFu;
+    const bool cAcc0 = (m0flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
+    const bool cAcc1 = (m1flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
+    const bool exactlyOneAcc = cAcc0 != cAcc1;
+
+    if (bothCompliant && exactlyOneAcc)
+        rest = cAcc0 ? r0f : r1f;
+    else
+    {
+        const uint mode = exactlyOneCompliant ? MODE_MIN : max(m0rest, m1rest);
+        const float flip = (bothCompliant && (mode == MODE_MULTIPLY)) ? -1.0f : 1.0f;
+        rest = flip * combineScalars(r0f, r1f, mode);
+    }
+    if (bothCompliant && exactlyOneAcc)
+        damping = cAcc0 ? m0.damping : m1.damping;
+    else
+    {
+        const uint mode = exactlyOneCompliant ? MODE_MAX : max(m0damp, m1damp);
+        damping = combineScalars(m0.damping, m1.damping, mode);
+    }
+
+    const uint combineFlags = m0flags | m1flags;
+    if ((combineFlags & MAT_DISABLE_FRICTION) == 0u)
+    {
+        const uint fm = max(m0fric, m1fric);
+        const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
+        const float staF = combineScalars(m0.staticFriction, m1.staticFriction, fm);
+        const float fDyn = max(dynF, 0.0f);
+        dyn = fDyn;
+        sta = (staF - fDyn) >= 0.0f ? staF : fDyn;
+        matFlags = combineFlags;
+    }
+    else
+    {
+        matFlags = combineFlags | MAT_DISABLE_STRONG_FRICTION;
+        dyn = 0.0f; sta = 0.0f;
+    }
+}
+
 struct CvxCoreOutRefs
 {
     uint64_t cmOutputs;
@@ -117,12 +182,12 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     {
         InterlockedAdd(counters[0].contactsBytes, CONTACT_SIZE * nbContacts, contactByteOffset);
         InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * nbContacts, forceByteOffset);
-        if ((contactByteOffset + CONTACT_SIZE) > o.contactBytesLimit)
+        if ((uint64_t(contactByteOffset) + uint64_t(CONTACT_SIZE)) > uint64_t(o.contactBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
             contactByteOffset = INVALID;
         }
-        if ((forceByteOffset + FORCE_SIZE) > o.forceBytesLimit)
+        if ((uint64_t(forceByteOffset) + uint64_t(FORCE_SIZE)) > uint64_t(o.forceBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
             forceByteOffset = INVALID;
@@ -174,7 +239,7 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     if (nbContacts != 0u)
     {
         InterlockedAdd(counters[0].patchesBytes, PATCH_SIZE, patchIndex);
-        if ((patchIndex + PATCH_SIZE) > o.patchBytesLimit)
+        if ((uint64_t(patchIndex) + uint64_t(PATCH_SIZE)) > uint64_t(o.patchBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_PATCH);
             patchIndex = INVALID;
@@ -196,63 +261,18 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     //   normal, nbContacts) -- inlined, as npCvxPlaneNphase inlines it.
     if (patchIndex != INVALID)
     {
-        Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(o.materials);
-        const uint mi0 = shape0.materialIndex;
-        const uint mi1 = shape1.materialIndex;
-        const PxsMaterialDataGpu m0 = materials[mi0];
-        const PxsMaterialDataGpu m1 = materials[mi1];
-
-        const float r0f = m0.restitution, r1f = m1.restitution;
-        const bool compliant0 = r0f < 0.0f, compliant1 = r1f < 0.0f;
-        const bool exactlyOneCompliant = compliant0 != compliant1;
-        const bool bothCompliant = compliant0 && compliant1;
-        const uint m0flags = m0.flagsModes0 & 0xFFFFu;
-        const uint m1flags = m1.flagsModes0 & 0xFFFFu;
-        const uint m0fric = (m0.flagsModes0 >> 16u) & 0xFFu;
-        const uint m1fric = (m1.flagsModes0 >> 16u) & 0xFFu;
-        const uint m0rest = (m0.flagsModes0 >> 24u) & 0xFFu;
-        const uint m1rest = (m1.flagsModes0 >> 24u) & 0xFFu;
-        const uint m0damp = m0.modes1 & 0xFFu;
-        const uint m1damp = m1.modes1 & 0xFFu;
-        const bool cAcc0 = (m0flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
-        const bool cAcc1 = (m1flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
-        const bool exactlyOneAcc = cAcc0 != cAcc1;
-
-        float rest, damping;
-        if (bothCompliant && exactlyOneAcc)
-            rest = cAcc0 ? r0f : r1f;
-        else
-        {
-            const uint mode = exactlyOneCompliant ? MODE_MIN : max(m0rest, m1rest);
-            const float flip = (bothCompliant && (mode == MODE_MULTIPLY)) ? -1.0f : 1.0f;
-            rest = flip * combineScalars(r0f, r1f, mode);
-        }
-        if (bothCompliant && exactlyOneAcc)
-            damping = cAcc0 ? m0.damping : m1.damping;
-        else
-        {
-            const uint mode = exactlyOneCompliant ? MODE_MAX : max(m0damp, m1damp);
-            damping = combineScalars(m0.damping, m1.damping, mode);
-        }
-
-        const uint combineFlags = m0flags | m1flags;
-        float sta, dyn;
+        // PxU16 materialIndex0 = shape0.materialIndex; (cu:415-416).  PxgShape's
+        // field is a PxU32 (PxgConvexConvexShape.h:53), and the CUDA narrows it
+        // BEFORE it is used -- so the truncated value is what indexes materials[],
+        // not just what is stored in the patch.  P9.70c: both tails passed the full
+        // uint, which differs only above 65535 materials and therefore only where no
+        // scene will ever go.  Transcribed anyway; the point of a bit-exact port is
+        // that "unreachable" is not a reason to diverge.
+        const uint mi0 = shape0.materialIndex & 0xFFFFu;
+        const uint mi1 = shape1.materialIndex & 0xFFFFu;
+        float sta, dyn, rest, damping;
         uint matFlags;
-        if ((combineFlags & MAT_DISABLE_FRICTION) == 0u)
-        {
-            const uint fm = max(m0fric, m1fric);
-            const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
-            const float staF = combineScalars(m0.staticFriction, m1.staticFriction, fm);
-            const float fDyn = max(dynF, 0.0f);
-            dyn = fDyn;
-            sta = (staF - fDyn) >= 0.0f ? staF : fDyn;
-            matFlags = combineFlags;
-        }
-        else
-        {
-            matFlags = combineFlags | MAT_DISABLE_STRONG_FRICTION;
-            dyn = 0.0f; sta = 0.0f;
-        }
+        cvxCoreCombineMaterials(o.materials, mi0, mi1, sta, dyn, rest, damping, matFlags);
 
         Ptr<uint> patchBase = Ptr<uint>(o.patchStream + uint64_t(patchIndex));
         const uint one = asuint(1.0f);

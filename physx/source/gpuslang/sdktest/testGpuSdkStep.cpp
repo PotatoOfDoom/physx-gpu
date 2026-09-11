@@ -541,9 +541,16 @@ void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* m
 // distance -- is max(maxExtent * 0.01, FLT_EPSILON).  Two triangles spanning the
 // whole row weld support points metres apart, which is the conditioning trap
 // PXG_CPU_CONTROL=1 caught in P9.69c.  Small cells keep every pair well conditioned.
+// `rot` yaws the whole floor about Y (P9.70c).  It exists because the mutation sweep
+// measured that an IDENTITY floor transform makes four separate mutants structurally
+// invisible: with transform1.q == identity, `conj(q1)*q0` and `q1*q0` are the same
+// quaternion, and rotating a contact point by q1 and by identity is the same point.
+// A yaw keeps the floor horizontal -- so the asserted rest height is unchanged -- and
+// makes every one of those paths live.
 PxRigidStatic* addTessellatedMeshFloor(PxPhysics* physics, PxScene* scene,
                                        PxMaterial* material, float xMin, float xMax,
-                                       float zHalf, float cell)
+                                       float zHalf, float cell,
+                                       const PxQuat& rot = PxQuat(PxIdentity))
 {
     const int nx = PxMax(1, int((xMax - xMin) / cell + 0.5f));
     const int nz = PxMax(1, int((2.0f * zHalf) / cell + 0.5f));
@@ -574,7 +581,7 @@ PxRigidStatic* addTessellatedMeshFloor(PxPhysics* physics, PxScene* scene,
     if (!meshGeom) { std::printf("FAIL: createTriangleMesh (tessellated floor) returned null\n"); return nullptr; }
     std::printf("  tessellated mesh floor: %u verts, %u triangles (cell %.2f)\n",
                 md.points.count, md.triangles.count, double(cell));
-    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f)));
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f), rot));
     PxShape* fs = physics->createShape(PxTriangleMeshGeometry(meshGeom), *material);
     floor->attachShape(*fs);
     scene->addActor(*floor);
@@ -617,8 +624,23 @@ void buildConvexCoreTrimeshScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     const char* cellEnv = std::getenv("PXG_CVXCORE_CELL");
     const float cell = cellEnv ? float(std::atof(cellEnv)) : 1.5f;
 
+    // THE YAW IS WHAT GIVES THIS SCENE TEETH, and it was added because the P9.70c
+    // mutation sweep measured that without it the scene cannot see four separate
+    // defects.  With the floor at identity, `transform1.q` is identity, and then
+    // `transform1.transformInv(transform0)` computed with the conjugate and computed
+    // WITHOUT it are the same quaternion; so is rotating a contact point into world
+    // space by q1 and by identity.  Four mutants SURVIVED on that alone.
+    //
+    // A yaw about Y leaves the floor horizontal, so the asserted rest height is still
+    // the cylinder's radius and the CPU control still produces it.  The bodies are
+    // yawed with it, so each one still lands on the strip.  PXG_CVXCORE_YAW = 0
+    // restores the old, blind geometry for a bisect.
+    const char* yawEnv = std::getenv("PXG_CVXCORE_YAW");
+    const float yaw = yawEnv ? float(std::atof(yawEnv)) : 0.6f;
+    const PxQuat yawQ(yaw, PxVec3(0.0f, 1.0f, 0.0f));
+
     if (!addTessellatedMeshFloor(physics, scene, material,
-                                 -SPACING, float(PAIR_COUNT) * SPACING, 3.0f, cell))
+                                 -SPACING, float(PAIR_COUNT) * SPACING, 3.0f, cell, yawQ))
         return; // targets stays empty; main() hard-fails on that
 
     const float r = 0.5f, h = 1.0f;
@@ -629,6 +651,9 @@ void buildConvexCoreTrimeshScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
                                        capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f,
                                        float(i) * SPACING);
+        // Rotate the body into the yawed strip's frame.  The cylinder's axis is local
+        // +X and a yaw keeps it horizontal, so the rest height is untouched.
+        b->setGlobalPose(PxTransform(yawQ.rotate(PxVec3(float(i) * SPACING, 5.0f, 0.0f)), yawQ));
         b->setSleepThreshold(0.0f);
         b->setWakeCounter(1.0e9f);
         std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderOnTrimesh[%d]", i);

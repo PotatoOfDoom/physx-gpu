@@ -101,8 +101,8 @@ void cvgContacts(uint3 dtid : SV_DispatchThreadID)
     const CvxIn s = gIn[t];
 
     // lo/hi -> the 64-bit device addresses of this test's two hulls
-    const uint64_t ptsAddrA = (uint64_t(s.ptsAddrA.y) << 32) | uint64_t(s.ptsAddrA.x);
-    const uint64_t ptsAddrB = (uint64_t(s.ptsAddrB.y) << 32) | uint64_t(s.ptsAddrB.x);
+    const PtsRef ptsAddrA = ptsFromAddr((uint64_t(s.ptsAddrA.y) << 32) | uint64_t(s.ptsAddrA.x));
+    const PtsRef ptsAddrB = ptsFromAddr((uint64_t(s.ptsAddrB.y) << 32) | uint64_t(s.ptsAddrB.x));
 
     ShapeRef shA, shB;
     shA.type = s.metaA.x; shA.core = s.coreA; shA.poseQ = s.poseAq; shA.poseP = s.poseAp.xyz;
