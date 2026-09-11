@@ -3839,7 +3839,8 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     const bool floorPlane  = floorEnv && !std::strcmp(floorEnv, "plane");
     const bool floorSphere = floorEnv && !std::strcmp(floorEnv, "sphere");
     const bool floorMesh   = floorEnv && !std::strcmp(floorEnv, "mesh");
-    const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh;
+    const bool floorCore    = floorEnv && !std::strcmp(floorEnv, "convexcore");
+    const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh && !floorCore;
 
     PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
     if (!floorBox)
@@ -3890,6 +3891,49 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         floor->attachShape(*fs);
         scene->addActor(*floor);
         fs->release();
+    }
+
+    // PXG_SB_FLOOR=convexcore (P9.72): a static CONVEX CORE box, the FIFTH shape the
+    // softbody can land on -- and the only one whose pair, (eCONVEXCORE,
+    // eTETRAHEDRONMESH), routes to GPU_BUCKET_ID::eConvexCoreTetmesh, i.e. to
+    // convexCoreTetmeshNphase_Kernel32.  The guard is only
+    // isConvexCoreGpuCompatible(shape0) (PxgNphaseImplementationContext.cpp:1003-1014)
+    // and Gu::isGPUCompatible accepts every core type, so nothing else has to be true.
+    //
+    // PxConvexCore::Box takes FULL extents -- makeConvexShape doubles PxgShape's half
+    // extents into the core (pxgSlangCvxCoreMake.slang, EGT_BOX arm) -- so 20 x 1 x 20
+    // centred at y = -0.5 puts the top face at y = 0, the SAME floor height as the box,
+    // the plane, the sphere's north pole and the cooked mesh.  That is the point of
+    // adding it to this matrix rather than giving it a scene of its own: its settle
+    // number is directly comparable with the other four.
+    //
+    // *** THIS FLOOR IS EXPECTED TO FAIL UNTIL convexCoreTetmeshNphase_Kernel32 IS
+    // MAPPED. ***  Measured before the port, on the same softbody at the same height:
+    //
+    //   PXG_SB_FLOOR=box          settles at mean y = 0.48929, 16 contacts
+    //   PXG_SB_FLOOR=mesh         settles at mean y = 0.48830, 22 contacts
+    //   PXG_SB_FLOOR=convexcore   FALLS THROUGH to -49.8831, and the bridge reports
+    //                             convexCoreTetmeshNphase_Kernel32 launched 15 times
+    //                             with no SPIR-V mapping, every launch SKIPPED
+    //
+    // (-49.88 rather than the -50.77 of a clean free fall because the ground box is
+    // parked at y = -50.5 for every non-box floor, so the cube lands on that instead.)
+    //
+    // PXG_CPU_CONTROL=1 DOES NOT APPLY HERE, and that is worth stating rather than
+    // quietly skipping: PhysX deformables are GPU-only, so the control mode leaves the
+    // softbody motionless (drop = 0.0000) and reports four failures that say nothing
+    // about this floor.  The expectation comes from the OTHER FOUR FLOORS of this same
+    // matrix instead -- same cube, same solve, same floor height, differing only in the
+    // shape the contact is generated against.  That is why this floor belongs in the
+    // matrix and not in a scene of its own.
+    if (floorCore)
+    {
+        PxRigidStatic* coreGround = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+        PxShape* cs = physics->createShape(
+            PxConvexCoreGeometry(PxConvexCore::Box(PxVec3(20.0f, 1.0f, 20.0f))), *rigidMat);
+        coreGround->attachShape(*cs);
+        scene->addActor(*coreGround);
+        cs->release();
     }
 
     out.hasPlane = !floorNone;      // "there is a floor to settle on", whatever its shape
