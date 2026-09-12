@@ -4336,19 +4336,43 @@ static void refAttachPrepare(AttachConstraintHost& c, int slot, F4 bodyQ, V3 bod
 // barycentric scaling.  Needed for an ABSOLUTE check: signs and ratios alone cannot see a
 // dropped negation (it flips every run alike) nor a changed bias factor (it scales
 // everything alike).
+// P9.76a REWROTE THIS FROM THE CUDA, AND THAT IS THE POINT OF THE TRANCHE.
+//
+// The previous version hard-coded
+//     const float positionError = raXn0_biasW.w;           // for x, y AND z
+// under the comment "NOTE the upstream quirk: all THREE components use
+// raXn0_biasW.w, because CUDA passes constraint.raXn0_biasW three times".  That
+// comment describes the CLOTH call site (FEMClothExternalSolve.cu:1450-1452, which
+// really does pass the same row three times to the NON-template overload).  The
+// SOFTBODY call site is softBodyGM.cu:2167, the TEMPLATE overload
+// (attachments.cuh:138-145), and it forwards raXn0_biasW, raXn1_biasW AND
+// raXn2_biasW -- three DISTINCT rows.
+//
+// So this oracle agreed with the shader because it was written from the shader (or
+// from the cloth), not from the softbody CUDA.  An oracle that shares the defect it
+// is meant to catch is worse than no oracle: it converts an unverified kernel into a
+// kernel that is reported as verified.  Transcribed here from attachments.cuh:83-135
+// line by line, with the three rows read separately as that function reads them.
 static V3 refAttachSolvePGS(const AttachConstraintHost& c, int slot, V3 linVel1, float dt)
 {
     const float invDt = 1.0f / dt;
     const F4 raXn0_biasW = c.raXn0_biasW[slot];
+    const F4 raXn1_biasW = c.raXn1_biasW[slot];
+    const F4 raXn2_biasW = c.raXn2_biasW[slot];
     const F4 velMult = c.velMult_invMass[slot];
-    // A static anchor at rest contributes no rigid velocity.
-    // NOTE the upstream quirk: all THREE components use raXn0_biasW.w, because CUDA passes
-    // constraint.raXn0_biasW three times -- the Y and Z position errors are never read.
-    const float positionError = raXn0_biasW.w;
+    // A static anchor at rest contributes no rigid velocity, so the
+    // vel0.linVel/angVel terms of attachments.cuh:100-102 are zero and drop out.
+    // The three POSITION ERRORS do not: the prepare writes
+    // biasedErr0/1/2 = error.dot(normal0/1/2) = error.x / error.y / error.z into the
+    // three rows (softBodyGM.cu:2010-2012), and attachments.cuh:105-107 reads one
+    // from each.
+    const float positionErrorX = raXn0_biasW.w;
+    const float positionErrorY = raXn1_biasW.w;
+    const float positionErrorZ = raXn2_biasW.w;
     const float biasFactor = 0.5f;
-    const V3 velError{ linVel1.x - positionError * biasFactor * invDt,
-                       linVel1.y - positionError * biasFactor * invDt,
-                       linVel1.z - positionError * biasFactor * invDt };
+    const V3 velError{ linVel1.x - positionErrorX * biasFactor * invDt,
+                       linVel1.y - positionErrorY * biasFactor * invDt,
+                       linVel1.z - positionErrorZ * biasFactor * invDt };
     const V3 impulse{ velError.x * velMult.x, velError.y * velMult.y, velError.z * velMult.z };
     return V3{ -impulse.x * dt, -impulse.y * dt, -impulse.z * dt };
 }
@@ -6200,10 +6224,21 @@ PXG_TEST(softBodySimRigidAttachSolve)
     // the anchor mirrored through the origin makes the position error change sign, so every
     // component of every vertex delta must change sign with it.
     //
-    // All THREE components track the error's X component, not their own: CUDA's
-    // calculateAttachmentDeltaImpulsePGS passes constraint.raXn0_biasW three times, so the
-    // Y and Z position errors are never read.  That upstream quirk is reproduced here, and
-    // this check is where it becomes visible.
+    // P9.76a CORRECTED WHAT STOOD HERE.  It said:
+    //     "All THREE components track the error's X component, not their own: CUDA's
+    //      calculateAttachmentDeltaImpulsePGS passes constraint.raXn0_biasW three times,
+    //      so the Y and Z position errors are never read.  That upstream quirk is
+    //      reproduced here, and this check is where it becomes visible."
+    // That is the CLOTH call site's quirk (FEMClothExternalSolve.cu:1450-1452), not this
+    // one.  softBodyGM.cu:2167 calls the TEMPLATE overload (attachments.cuh:138-145),
+    // which forwards three DISTINCT rows, so each component tracks its OWN error
+    // component.  The claim lived in three places -- the shader, refAttachSolvePGS, and
+    // this comment -- which is how it survived: every place that could have contradicted
+    // it repeated it instead.
+    //
+    // Each component now tracks its own error component, so mirroring the anchor still
+    // flips all three, and the check is extended to Z because that is where the two
+    // formulas disagree in SIGN rather than only in magnitude.
     {
         std::vector<F4> delta2(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
         DevBuf bDelta2 = makeDev(dev, delta2);
@@ -6243,6 +6278,15 @@ PXG_TEST(softBodySimRigidAttachSolve)
             PXG_CHECK_MSG(gDelta[v].y * gD2[v].y < 0.0f,
                           "mirroring must flip vertex %u's delta.y (%g then %g)",
                           v, gDelta[v].y, gD2[v].y);
+            // P9.76a ADDED Z.  The old check stopped at X and Y, and Z is exactly where
+            // reading raXn0_biasW.w for all three axes disagrees with the CUDA in SIGN
+            // rather than only in magnitude -- so the one component that would have
+            // exposed the defect was the one not tested.
+            PXG_CHECK_MSG(gDelta[v].z * gD2[v].z < 0.0f,
+                          "mirroring must flip vertex %u's delta.z (%g then %g) -- Z is the "
+                          "component that tracks raXn2_biasW.w, and a solve reading "
+                          "raXn0_biasW.w for every axis gets its sign wrong here",
+                          v, gDelta[v].z, gD2[v].z);
         }
         dev->destroyBuffer(bDelta2.h); dev->destroyBuffer(bDesc2.h);
         dev->destroyBuffer(bAtt2.h); dev->destroyBuffer(bConstraint2.h);

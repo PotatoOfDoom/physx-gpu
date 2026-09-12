@@ -404,24 +404,58 @@ void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
             rigidAngVel = float3(iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z);
         }
 
-        // calculateAttachmentDeltaImpulsePGS (attachments.cuh:83).  NOTE the CUDA solve
-        // passes constraint.raXn0_biasW THREE TIMES, so raXn0/1/2 AND all three
-        // position-error components come from raXn0_biasW -- a faithful port of that
-        // upstream quirk, identical to the cloth path.
+        // calculateAttachmentDeltaImpulsePGS.  P9.76a CORRECTED THIS, AND THE CORRECTION
+        // IS THE WHOLE TRANCHE.
+        //
+        // What stood here was:
+        //     // NOTE the CUDA solve passes constraint.raXn0_biasW THREE TIMES, so
+        //     // raXn0/1/2 AND all three position-error components come from
+        //     // raXn0_biasW -- a faithful port of that upstream quirk, IDENTICAL TO
+        //     // THE CLOTH PATH.
+        // The last four words are the error, and they are the reason the error was
+        // made.  The quirk is real -- but it belongs to the CLOTH call site
+        // (FEMClothExternalSolve.cu:1450-1452), which passes constraint.raXn0_biasW
+        // three times to the NON-template overload.  THIS path's call site is
+        // softBodyGM.cu:2167, the TEMPLATE overload (attachments.cuh:138-145), whose
+        // body forwards raXn0_biasW, raXn1_biasW AND raXn2_biasW -- three DISTINCT
+        // rows -- into attachments.cuh:83, which reads one position error from each
+        // (:105-107) and dots the angular velocity against a different raXn per axis
+        // (:100-102).  femClothRigidAttachBda.slang gets this right in both
+        // directions: raXn0 thrice in its PGS arm (:436) and three distinct rows in
+        // its TGS arm (:531-533), because the cloth has BOTH kinds of call site.
+        //
+        // The prepare has always written all three rows correctly -- above at :298-300,
+        // and softBodyGM.cu:2010-2012 -- with .w carrying error.x, error.y and error.z
+        // respectively.  So the data was there the whole time; only this read was wrong.
+        //
+        // WHAT IT COST.  For a world anchor the sqrtInvInertia is zero, so the three
+        // .xyz rows collapse to (0,0,0) and that half was invisible.  The .w half was
+        // not: a volume pinned to the world and sagging under gravity has
+        // error ~ (0, sag, 0), so positionError = error.x ~ 0 and the attachment
+        // became a pure velocity damper with NO positional recovery.  For a KINEMATIC
+        // anchor the .xyz half is live too -- softBodyGM.cu:1973-1979 gives
+        // invMass0 == 0 && !isStatic the IDENTITY inertia, making the three rows
+        // ra x n0/n1/n2, three distinct non-zero vectors.
         const float4 raXn0_biasW = Ptr<float4>(cBase + RAC_raXn0_biasW)[offset];
+        const float4 raXn1_biasW = Ptr<float4>(cBase + RAC_raXn1_biasW)[offset];
+        const float4 raXn2_biasW = Ptr<float4>(cBase + RAC_raXn2_biasW)[offset];
         const float4 velMult = Ptr<float4>(cBase + RAC_velMult_invMass)[offset];
 
         const float3 raXn0 = float3(raXn0_biasW.x, raXn0_biasW.y, raXn0_biasW.z);
+        const float3 raXn1 = float3(raXn1_biasW.x, raXn1_biasW.y, raXn1_biasW.z);
+        const float3 raXn2 = float3(raXn2_biasW.x, raXn2_biasW.y, raXn2_biasW.z);
         const float velOfRigidX = rigidLinVel.x + dotVec(rigidAngVel, raXn0);
-        const float velOfRigidY = rigidLinVel.y + dotVec(rigidAngVel, raXn0);
-        const float velOfRigidZ = rigidLinVel.z + dotVec(rigidAngVel, raXn0);
+        const float velOfRigidY = rigidLinVel.y + dotVec(rigidAngVel, raXn1);
+        const float velOfRigidZ = rigidLinVel.z + dotVec(rigidAngVel, raXn2);
 
-        const float positionError = raXn0_biasW.w;
+        const float positionErrorX = raXn0_biasW.w;
+        const float positionErrorY = raXn1_biasW.w;
+        const float positionErrorZ = raXn2_biasW.w;
         const float biasFactor = 0.5f;
         // Cone-LIMITED branch DEFERRED (see header).
-        const float3 velError = float3(linVel1.x - positionError * biasFactor * invDt,
-                                       linVel1.y - positionError * biasFactor * invDt,
-                                       linVel1.z - positionError * biasFactor * invDt);
+        const float3 velError = float3(linVel1.x - positionErrorX * biasFactor * invDt,
+                                       linVel1.y - positionErrorY * biasFactor * invDt,
+                                       linVel1.z - positionErrorZ * biasFactor * invDt);
 
         const float3 deltaImpulse = float3((velError.x - velOfRigidX) * velMult.x,
                                            (velError.y - velOfRigidY) * velMult.y,

@@ -1866,6 +1866,104 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.76a — ein lebender Defekt in ausgeliefertem Code, und sein Orakel war mitschuldig
+
+Gefunden beim Lesen von `softBodyRigidAttachBda.slang` **als Vorlage** für den
+Partikel-Attachment-Port. Drei unabhängige Angriffe aus verschiedenen Richtungen plus
+ein Richter: **bestätigt und live**.
+
+### Der Defekt
+
+Der Solve las `raXn0_biasW` für alle drei Achsen, begründet mit:
+
+> *„NOTE the CUDA solve passes `constraint.raXn0_biasW` THREE TIMES … a faithful port of
+> that upstream quirk, **identical to the cloth path**."*
+
+Die letzten vier Worte sind die Fehlerursache, und sie stehen wörtlich im Code. Die
+Eigenart ist echt — sie gehört nur der **anderen** Aufrufstelle:
+
+| Pfad | CUDA-Aufrufstelle | übergibt |
+|---|---|---|
+| Cloth | `FEMClothExternalSolve.cu:1450-1452`, **Nicht-Template** | `raXn0` dreimal |
+| Softbody | `softBodyGM.cu:2167`, **Template** (`attachments.cuh:138-145`) | `raXn0`, `raXn1`, `raXn2` |
+
+Der Cloth-Port unterscheidet beide korrekt — `raXn0` dreimal im PGS-Arm (`:436`), drei
+getrennte Reihen im TGS-Arm (`:531-533`) — weil Cloth **beide** Aufrufstellen hat. Der
+Softbody-Port hat die PGS-Arm-Eigenart bedingungslos übernommen.
+
+### Was es gekostet hat
+
+Der Prepare schreibt seit jeher alle drei Reihen richtig
+(`softBodyGM.cu:2010-2012`, Slang `:298-300`), mit `error.x`, `error.y`, `error.z` in
+den `.w`. **Die Daten waren die ganze Zeit da; nur dieser Lesevorgang war falsch.**
+
+Der Defekt zerfällt in zwei Hälften, von denen nur eine immer sichtbar ist:
+
+- **Die `.w`-Hälfte ist für JEDEN Anker live.** Der Solve nahm `error.x` für alle drei
+  Achsen. Ein an der Welt verankertes Volumen, das unter Schwerkraft durchhängt, hat
+  `error ≈ (0, sag, 0)` — der Port sah `positionError ≈ 0`, und die Verankerung
+  entartete zu einem reinen Geschwindigkeitsdämpfer **ohne Positionsrückstellung**.
+- **Die `.xyz`-Hälfte schläft nur für statische und Welt-Anker**, weil deren
+  `sqrtInvInertia` null ist und alle drei Reihen zu `(0,0,0)` kollabieren. Für einen
+  **kinematischen** Anker ist sie live: `softBodyGM.cu:1973-1979` gibt
+  `invMass0 == 0 && !isStatic` die **Identitäts**-Trägheit, womit die drei Reihen
+  `ra × n0/n1/n2` sind — drei verschiedene Vektoren ungleich null.
+
+### Warum nichts es gefangen hat — das ist die eigentliche Lehre
+
+Der falsche Anspruch lebte an **drei** Stellen: im Shader, im CPU-Orakel
+`refAttachSolvePGS` (`testSoftBodySim.cpp:4339-4353`) und im Kommentar der
+Spiegel-Prüfung (`:6198`). **Jede Stelle, die ihn hätte widerlegen können, wiederholte
+ihn stattdessen.**
+
+Das Orakel war aus dem Port geschrieben, nicht aus der Softbody-CUDA. Ein Orakel, das
+den Defekt teilt, den es fangen soll, ist **schlimmer als keins**: es verwandelt einen
+ungeprüften Kernel in einen als geprüft gemeldeten. Dazu prüfte die Spiegel-Prüfung nur
+`.x` und `.y` — und `.z` ist genau die Komponente, in der die beiden Formeln im
+**Vorzeichen** auseinandergehen, nicht bloß im Betrag.
+
+Die **Prepare**-Vorrichtung war die ganze Zeit korrekt und schreibt drei verschiedene
+Reihen. Nur der Konsument und sein Orakel waren falsch. Diese Asymmetrie ist es, die
+„bereits verifiziert" verdeckt hat.
+
+### Die Reihenfolge der Arbeit war der Beweis
+
+```
+1. Orakel aus attachments.cuh:83-135 neu geschrieben
+2. Vorrichtung läuft  ->  ROT   (testSoftBodySim.cpp:6212)
+3. Shader korrigiert
+4. Vorrichtung läuft  ->  GRÜN  (66/66)
+```
+
+Schritt 2 ist der Beweis. Den Shader zuerst zu reparieren hätte das Rot versteckt und
+die Aussage auf „ich habe beides geändert und es ist grün" reduziert.
+
+### Sweep: 4 von 5
+
+```
+revert-poserr-thrice     KILLED
+poserr-yz-swapped        KILLED
+raxn-rows-swapped        KILLED
+bias-factor-one          KILLED
+revert-raxn0-thrice      SURVIVED
+```
+
+Der Überlebende trifft die `.xyz`-Hälfte, und sein Grund war **vorhergesagt**: der
+Weltanker der Vorrichtung hat null Trägheit, also sind alle drei Reihen `(0,0,0)` und
+kein Beobachter kann sie unterscheiden. Um ihn zu töten, braucht die Vorrichtung einen
+**kinematischen** Anker. Diagnostiziert, nicht entschuldigt — und benannt als die nächste
+Verschärfung.
+
+### Ein zweiter Verdacht, protokolliert und bewusst nicht eingemischt
+
+Der Shader leitet **beide** Einstiegspunkte durch *eine* Funktion, deren Arithmetik
+durchgehend die **PGS**-Formel ist; `isTGS` wählt nur den Geschwindigkeitspool
+(`:388-405`). `softBodyGM.cu:2290` ruft aber `calculateAttachmentDeltaImpulseTGS` — eine
+andere Formel (Positionsfehler, `biasCoefficient`, `isVelocityIteration`,
+`attachments.cuh:147-200`). Falls das standhält, ist es ein zweiter und größerer Defekt.
+Eigene Tranche, eigener Angriff — nicht hier mit hineingerechnet, weil eine Tranche, die
+zwei Dinge gleichzeitig ändert, von keinem der beiden mehr sauber Rechenschaft ablegt.
+
 ## P9.75 — eine Vorrichtung wählt die Werte, die eine Szene nicht wählen kann: 24 von 25 gegen 9
 
 P9.74 hat sechzehn Mutanten klassifiziert, die seine Szene nicht töten konnte. Sieben
