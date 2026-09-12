@@ -1435,6 +1435,9 @@ static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
 static const uint8_t kCvxCorePlane[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
                                          4, 4, 4 };
 
+// convexCoreTetmeshNphase_Kernel32: numTests(4), seven pointers, an 80-byte writer.
+static const uint8_t kCvxCoreTet[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
@@ -1476,6 +1479,14 @@ static const PxgKernelAbiRow kRows[] = {
     // because P9.48d is what a wrong row costs: pushConstantSizeFor() returns 0 and
     // every launch is REFUSED IN SILENCE, with the whole suite still green.
     { "convexCoreTrimeshNphase_Kernel32", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
+    // P9.72: convexCoreTetmeshNphase_Kernel32 does NOT share kCvxCorePlane, and the
+    // name is the only reason one would think it does.  It is a rigid-vs-SOFTBODY
+    // kernel (convexCoreCollision.cu:1095-1104) with NINE arguments, the last of them
+    // PxgFEMContactWriter BY VALUE -- nine device pointers + PxU32 maxNumContacts +
+    // a 4-byte tail pad = 80 bytes (PxgFEMCore.h:361-375, static_assert at
+    // tests/testFemClothSdfCg.cpp:140).  numTests 4 @0, seven pointers @8..@56, the
+    // writer at @64 (already 16-aligned, so paramAlign moves nothing) -> 144 bytes.
+    { "convexCoreTetmeshNphase_Kernel32", kCvxCoreTet, uint32_t(sizeof(kCvxCoreTet)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

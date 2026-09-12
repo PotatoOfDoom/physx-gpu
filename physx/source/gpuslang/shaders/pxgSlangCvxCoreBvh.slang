@@ -162,6 +162,46 @@ void cvxBvhCreateConvex(float3 scale, float4 scaleRot, float3 v0, float3 v1, flo
     outMargin = margin;
 }
 
+// ---------------------------------------------------------------------------
+// TetmeshBvh (convexCoreCollision.cu:1042-1093).  P9.72.
+//
+// It is the SIBLING of TrimeshBvh and it is much simpler, in three ways that all
+// have to be reproduced rather than assumed away:
+//
+//   scaleBounds IS THE IDENTITY (:1060-1063, `return bounds;`).  A softbody's tet
+//   mesh carries no PxMeshScale at all, so the query box goes to the traversal in
+//   the frame it was computed in.  Calling cvxBvhScaleBounds here with an identity
+//   PxMeshScale would give the same numbers -- and would also silently start
+//   working differently the day someone gives a softbody a scale.
+//
+//   createConvex TAKES THE VERTICES RAW (:1075-1079).  No mesh-scale matrix, no
+//   transform of any kind: `verts[0] = tetmeshVerts[inds.x];` straight out of the
+//   softbody's mPosition_InvMass.  Those positions are already in world space,
+//   which is also why the kernel's transform0in1 puts the CONVEX into that frame.
+//
+//   THERE ARE FOUR OF THEM.  PRIM_VERT_COUNT = 4 (:1071) and core.numPoints = 4
+//   (:1086).  That is what forced PtsRef's fourth inline vertex; before P9.72 the
+//   fourth corner had nowhere to go and ptsAt(p, 3, ...) returned the third.
+//
+// tetmeshSurfaceHint is read into the struct (:1046, :1057) and never used by any
+// of its methods.  Transcribed as absent rather than as a field nobody reads.
+void cvxBvhCreateConvexTet(float3 v0, float3 v1, float3 v2, float3 v3,
+                           float margin, out ShapeRef sh, out PtsRef pts, out float outMargin)
+{
+    sh.type = CORE_POINTS;
+    // The same PointsCore image as the triangle arm, with numPoints = 4.  The count
+    // lives in the low byte of word 9 and the stride in the next byte; supportLocalQ
+    // and contactFaceQ both read it from there, so a wrong count here does not fail
+    // loudly -- it silently drops a corner.
+    sh.core[0] = uint4(CVXBVH_PTS_MARKER, 0u, asuint(1.0f), asuint(1.0f));
+    sh.core[1] = uint4(asuint(1.0f), asuint(0.0f), asuint(0.0f), asuint(0.0f));
+    sh.core[2] = uint4(asuint(1.0f), 4u | (16u << 8u), 0u, 0u);
+    sh.poseQ = float4(0, 0, 0, 1);   // PxTransform(PxIdentity)
+    sh.poseP = float3(0, 0, 0);
+    pts = ptsFromTet(v0, v1, v2, v3);
+    outMargin = margin;
+}
+
 // TrimeshBvh::getTriNormal (:657-665): the SAME scale transform, then
 // (v1-v0).cross(v2-v0).getNormalized().  getNormalized is the guarded form --
 // magSq > 0 before the reciprocal -- which getNormalizedQ is.

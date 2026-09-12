@@ -42,7 +42,10 @@ convexCoreClothmeshNphase_Kernel32
 # convexCorePlaneNphase_Kernel -- MAPPED in P9.67c (cvxCorePlaneNpBda.spv), the
 # first of the five.  PXG_SCENE=convexcoreplane went from final y=-73.807 to
 # 0.5000, the cylinder's radius and the same number the capsule scene gives.
-convexCoreTetmeshNphase_Kernel32
+# convexCoreTetmeshNphase_Kernel32 -- MAPPED in P9.72 (cvxCoreTetNpBda.spv).  NOT a
+# sibling of the trimesh kernel despite the name: nine arguments ending in an 80-byte
+# PxgFEMContactWriter by value, no writeOutput, no patch accumulator.  Observed by
+# PXG_SCENE=softbody PXG_SB_FLOOR=convexcore.
 # convexCoreTrimeshNphase_Kernel32 -- MAPPED in P9.70c (cvxCoreTriNpBda.spv).  The
 # third convexCore arm, and the one the `convexcoretrimesh` scene was written
 # against BEFORE the kernel existed, so the red measurement is on record.

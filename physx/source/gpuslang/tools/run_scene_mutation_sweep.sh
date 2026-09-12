@@ -80,9 +80,25 @@ run_scene() {
 
 # The three verdict shapes, in the order they must be tested.  "no verdict" is
 # NOT a pass (P9.3a).
+#
+# P9.72 WIDENED THIS, AND THE WAY IT FOUND OUT IS THE POINT.  The first version
+# matched "^[  OK  ] gpu-sdk-step: scene", which is the verdict the RIGID-BODY
+# scenes print.  The softbody scenes print their own, e.g.
+#
+#   [  OK  ] gpu-sdk-step: FEM-volume softbody fell monotonically under gravity ...
+#
+# with no "scene" in it.  Against PXG_SCENE=softbody the driver therefore read a
+# perfectly green run as "silent" and REFUSED TO MEASURE -- which is exactly what it
+# was built to do (a missing verdict is never a pass) and is why the mistake cost a
+# re-run instead of a page of false survivors.  A narrower matcher that had guessed
+# "green" would have been the expensive failure.
+#
+# FAIL is tested FIRST: a failing run prints per-check "FAIL:" lines and then its own
+# "[ FAIL ] gpu-sdk-step: ..." verdict, and no run should ever print both markers --
+# but if one ever does, red must win.
 scene_verdict() {   # stdin: the run's output -> echoes green|red|silent
-    if echo "$1" | grep -q "^\[  OK  \] gpu-sdk-step: scene"; then echo green
-    elif echo "$1" | grep -q "^\[ FAIL \]"; then echo red
+    if echo "$1" | grep -q "^\[ FAIL \]"; then echo red
+    elif echo "$1" | grep -q "^\[  OK  \] gpu-sdk-step:"; then echo green
     else echo silent
     fi
 }

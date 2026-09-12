@@ -180,17 +180,26 @@ public struct ShapeRef
 // THE THREE VERTICES ARE INDEXED BY A SELECT CHAIN, not an array subscript: a
 // dynamically-indexed local array forces scratch memory, and the only indices
 // this arm ever sees are 0, 1 and 2.
+// FOUR inline vertices and not three (P9.72).  P9.70c sized this arm for a BVH
+// TRIANGLE, because the trimesh kernel was the only caller.  The tetmesh kernel's
+// `TetmeshBvh::PRIM_VERT_COUNT = 4` (convexCoreCollision.cu:1071) with
+// `core.numPoints = 4` (:1086) makes that a silent defect rather than a limit: with
+// only v0..v2, `ptsAt(p, 3, ...)` fell through to `p.v2` and EVERY TETRAHEDRON
+// COLLAPSED TO A TRIANGLE, with no error anywhere.  A support mapping over three of
+// a tet's four corners still returns a plausible point, so nothing would have
+// crashed and the contact would simply have been wrong.
 public struct PtsRef
 {
-    public uint64_t addr;        // device array, or 0 for the inline arm
-    public float3 v0, v1, v2;    // the inline arm (one BVH triangle)
+    public uint64_t addr;            // device array, or 0 for the inline arm
+    public float3 v0, v1, v2, v3;    // the inline arm (a BVH triangle, or a tetrahedron)
 }
 
 public PtsRef ptsFromAddr(uint64_t a)
 {
     PtsRef p;
     p.addr = a;
-    p.v0 = float3(0, 0, 0); p.v1 = float3(0, 0, 0); p.v2 = float3(0, 0, 0);
+    p.v0 = float3(0, 0, 0); p.v1 = float3(0, 0, 0);
+    p.v2 = float3(0, 0, 0); p.v3 = float3(0, 0, 0);
     return p;
 }
 
@@ -198,7 +207,15 @@ public PtsRef ptsFromTri(float3 a, float3 b, float3 c)
 {
     PtsRef p;
     p.addr = 0uL;
-    p.v0 = a; p.v1 = b; p.v2 = c;
+    p.v0 = a; p.v1 = b; p.v2 = c; p.v3 = float3(0, 0, 0);
+    return p;
+}
+
+public PtsRef ptsFromTet(float3 a, float3 b, float3 c, float3 d)
+{
+    PtsRef p;
+    p.addr = 0uL;
+    p.v0 = a; p.v1 = b; p.v2 = c; p.v3 = d;
     return p;
 }
 
@@ -206,7 +223,10 @@ public float3 ptsAt(PtsRef p, uint i, uint stride)
 {
     if (p.addr != 0uL)
         return Ptr<float4>(p.addr)[(i * stride) / 16u].xyz;
-    return i == 0u ? p.v0 : (i == 1u ? p.v1 : p.v2);
+    // The select chain stays a select chain rather than becoming an array subscript:
+    // a dynamically-indexed local array forces scratch memory, and the only indices
+    // this arm ever sees are 0..3.
+    return i == 0u ? p.v0 : (i == 1u ? p.v1 : (i == 2u ? p.v2 : p.v3));
 }
 
 // tranche-164 ConvexShape::supportLocal, margin-less, all seven types

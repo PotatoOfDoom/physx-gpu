@@ -1865,6 +1865,127 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.72 — `convexCoreTetmeshNphase_Kernel32`, und eine Szene die ihren eigenen Kern nicht prüft
+
+Der Kernel ist gemappt und die Szene ist grün:
+
+```
+vorher   Würfel fällt auf -49.8831, Kernel 15x gestartet und jeder Start ÜBERSPRUNGEN
+jetzt    ruht bei mean y = 0.48948, 47 Kontakte
+box      0.48929          mesh  0.48830        <- dieselbe Matrix, dieselbe Bodenhöhe
+```
+
+### Der Name sagt Geschwister, der Code sagt etwas anderes
+
+Ich hatte in der vorigen Runde geschrieben, dies sei „dieselbe Traversierungsform,
+derselbe Mehr-Patch-Schwanz". **Die zweite Hälfte war falsch, in acht Punkten.** Es ist
+kein Starrkörper-Narrowphase-Kernel, sondern ein **Starrkörper-gegen-Softbody**-Kernel:
+
+| | Trimesh | Tetmesh |
+|---|---|---|
+| Parameter | 18 | **9**, letzter `PxgFEMContactWriter` **by value** (80 B) |
+| ABI-Zeile | `kCvxCorePlane` (136 B) | **eigene**, 144 B |
+| Ausgabe | `writeOutput` -> contactStream/patchStream | `writeRigidVsDeformableContactNoBarycentric` |
+| `pxgSlangCvxCoreOut32` | benutzt | **gar nicht** |
+| `pxgSlangCvxCoreAcc` | benutzt | **gar nicht** — jede Lane schreibt direkt |
+| `generateContacts` | 7-Arg, `cullDir = triNormal` | **6-Arg**, ohne Cull |
+| `scaleBounds` | Mesh-Skalenmatrix | **Identität** |
+| Vertices | 3, vorwärts-skaliert | **4**, roh |
+| Netzquelle | `shape.hullOrMeshPtr` | `softbodies[shape.particleOrSoftbodyId]` |
+| `restDistance` | `NULL` | echt |
+| Stream | `mStream` | **Softbody-Stream** |
+
+Das ist zum dritten Mal die Lehre aus P9.70a/b, nur in die andere Richtung: dort hatte
+ich Ähnlichkeit unterstellt, wo etwas schon fertig war; hier, wo etwas ganz anderes ist.
+
+### Was der Prüfer gefangen hat
+
+Ich schrieb `EGT_TETRAHEDRONMESH = 9`. Das ist `eHEIGHTFIELD`; richtig ist **7**.
+`check_geom_type_constants.py` — der P9.57-Prüfer, der `PxGeometry.h` liest statt mein
+Gedächtnis — hat den Bau daran scheitern lassen.
+
+Der Schaden wäre **still** gewesen: `checkTypes` tauscht nur, wenn Slot 1 der Kern und
+Slot 0 das Netz ist. Mit 9 hätte der Arm nie ausgelöst, und ein netzzuerst ankommendes
+Paar wäre mit vertauschten Slots gerechnet worden. Genau die Klasse, für die der Prüfer
+gebaut wurde.
+
+### Was das adversarische Lesen verhindert hat, bevor es Code wurde
+
+1. **`PtsRef` trug drei Vertices.** `ptsAt(p, 3, ...)` fiel auf `p.v2` durch, und
+   `pxgSlangCvxCoreBvh.slang` hatte `3u | (16u << 8u)` fest im Kern-Abbild. Jedes
+   Tetraeder wäre **still zum Dreieck kollabiert** — eine Stützabbildung über drei von
+   vier Ecken liefert einen plausiblen Punkt, nichts wäre abgestürzt.
+2. **`writeRigidVsDeformableNoBaryAlt`** (`softBodyMeshContactGenBda.slang:206-221`)
+   heißt fast wie die gesuchte Funktion und ist eine **andere**: sie schreibt
+   `contactSortedByX` und lässt `contactByX`/`tempContactByX` unberührt. Sie zu liften
+   hätte Kontakte erzeugt, die die Sortierung nie sieht.
+
+### Und was der Sweep sagt, auch wenn es unbequem ist
+
+**Die beiden Mutanten, die den Kern dieser Tranche prüfen sollten, überleben.**
+
+```
+ptsref-v3-dropped    ptsAt(p,3,..) gibt wieder v2       SURVIVED
+tet-numpoints-3      numPoints 4 -> 3 im Kern-Abbild    SURVIVED
+```
+
+Beide stellen den Zustand vor P9.72 her — jedes Tetraeder ein Dreieck — und die Szene
+merkt es nicht. Die Diagnose ist geometrisch: ein Würfel, der flach auf einem ebenen
+Boden ruht, berührt ihn mit seinen **Oberflächen**-Tetraedern, deren vierte Ecke nach
+INNEN zeigt, vom Kontakt weg. Sie gewinnt die Stützabfrage in Kontaktrichtung nie.
+
+Die vierte Ecke ist damit **treu, aber nicht belegt**. Die sechs Kills belegen sie
+nicht, und sie als Beweis dafür auszugeben wäre die Art Behauptung, für die es diesen
+Abschnitt gibt.
+
+Die übrigen vier Überlebenden haben denselben Charakter — **ein** Softbody, **ein**
+Boden, Identitätsrotation, flache Durchdringung:
+
+| Überlebender | warum strukturell unsichtbar |
+|---|---|
+| `encode-shift-zero` | bei einem Softbody ist `sbId = 0`, also ist `(0 << 20) \| tetId == tetId` |
+| `serial-warps-1` | `numTests = 1`, also deckt `sub = 0` alles ab |
+| `transform0in1-no-inverse` | die Bodenrotation ist Identität |
+| `fake-erp-removed` | 40 % einer winzigen Durchdringung ist immer noch winzig |
+| `contact-index-collide` | die meisten Lanes liefern einen Punkt, also ist `index + 0 == index` |
+
+**Sechs sterben** und belegen, was die Szene kann: die Kontaktschreibung
+(`normal-not-negated`, `no-halfway-point`), die Geometrie (`tet-degenerate`,
+`bounds-no-fatten`) und die Traversierungs-Indizierung (`prim-index-no-start`,
+`rigidid-zero`).
+
+Die Szene ist also ein guter *funktioniert-es-überhaupt*-Beobachter und ein schwacher
+Unterscheider. Das steht als Folgearbeit, nicht als erledigt.
+
+### Der Sweep-Treiber hat sich durch einen eigenen Fehler bewährt
+
+`scene_verdict()` suchte `^[  OK  ] gpu-sdk-step: scene` — das Verdikt der
+**Starrkörper**-Szenen. Die Softbody-Szenen drucken
+
+```
+[  OK  ] gpu-sdk-step: FEM-volume softbody fell monotonically under gravity ...
+```
+
+ohne das Wort „scene". Der Treiber las einen völlig grünen Lauf als „kein Verdikt" und
+**verweigerte die Messung**.
+
+Das ist das Verhalten, das in seinem eigenen Kopf steht (P9.3a: ein fehlendes Verdikt
+ist nie ein Bestehen). Hätte er stattdessen auf Grün geraten, stünden hier zwölf
+falsche „SURVIVED" ohne Hinweis darauf, dass nichts gemessen wurde. So kostete es einen
+Neulauf. Der Matcher prüft jetzt FAIL zuerst und akzeptiert jedes
+`[  OK  ] gpu-sdk-step:`-Verdikt.
+
+### Stand
+
+Suite **853/853 in beiden Speichermodi**, Szenen **48/48**, Manifest **408/501**
+(81.4 %), alle vierzehn Prüfer grün. Erreichbar-nicht-gemappt: **25 → 24**.
+
+`PXG_SB_FLOOR=convexcore` ist bewusst noch **nicht** in `run_scenes.sh`s Liste: es ist
+ein Boden-Arm der `softbody`-Szene, die dort bereits mit ihrer Vorgabe (`box`) läuft.
+Der Arm bekommt seinen eigenen Sweep-Eintrag, wenn P9.73 ihn unterscheidungsfähig
+gemacht hat — ihn jetzt aufzunehmen hieße, eine Szene zu sweepen, von der gerade
+gemessen wurde, dass sie ihren eigenen Gegenstand nicht sieht.
+
 ## P9.71 — die V-Rinne: der Mehr-Patch-Schwanz war zu einem Sechzehntel geprüft
 
 P9.70c hat `pxgSlangCvxCoreOut32.slang` geschrieben — das einzige genuin neue
