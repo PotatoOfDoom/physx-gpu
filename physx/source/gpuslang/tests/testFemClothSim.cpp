@@ -56,6 +56,8 @@
 #include "PxgConvexConvexShape.h"            // PxgShape (P7.1 tranche 4a contact gen)
 #include "PxsTransformCache.h"               // PxsCachedTransform (P7.1 tranche 4a contact gen)
 #include "geometry/PxGeometry.h"             // PxGeometryType (P7.1 tranche 4a contact gen)
+#include "geometry/PxConvexCoreGeometry.h"  // PxConvexCore::Type (P9.75: eBOX read from the enum,
+                                            // never a remembered 2 -- the P9.57 rule)
 #include "foundation/PxBounds3.h"            // PxBounds3 (P7.1 tranche 4a midphase AABB)
 
 #include <cstdint>
@@ -13963,6 +13965,638 @@ PXG_TEST(femClothSimClothClothAttachmentCoverage)
                 (size_t(NB_ATT) - NB_PINNED) * 3u);
 
     for (PxgBufferHandle h : { bV.h, bT.h, bD.h, bDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.75 -- convexCoreClothmeshNphase_Kernel32 on the SHIPPED engine .spv
+// ===========================================================================
+//
+// WHY THIS EXISTS, AND WHAT IT IS ANSWERING.
+//
+// P9.74 mapped the kernel and swept it against PXG_SCENE=clothcvxcore.  After the
+// scene's verdict was sharpened the sweep killed 9 of 25 mutants, and the sixteen
+// survivors were classified with source evidence rather than filed as noise:
+//
+//   A  provably equivalent IN THAT SCENE (7)   -- nothing to fix, but nothing proved
+//   B  real change, below the scene's resolution (8)
+//   C  dead consumer (0)                        -- every field is read by a MAPPED kernel
+//   D  observationally identical by ALLOCATOR ACCIDENT, not construction (1)
+//
+// Classes A, B and D are all "the scene cannot see this", for three different
+// reasons, and no harder version of that scene reaches them: the scene has ONE
+// cloth (so clothId is 0 and the shift constant is unobservable), NO attachments
+// (so nbFilterPairs is 0 and `&&` cannot be told from `||`), ONE rigid (so the
+// 64-bit sort key is constant), and a resting contact (so half-penetration and the
+// ERP scaling are both fractions of a millimetre).
+//
+// A fixture is not a smaller scene.  It is the observer that CHOOSES those values,
+// and that is the whole argument for writing one here -- the same argument P9.73
+// made when P9.72's softbody scene could not see a tetrahedron's fourth vertex.
+//
+// WHAT IT DRIVES.  The SHIPPED cvxCoreClothNpBda.spv, not a copy.  P9.73 recorded
+// why that distinction is load-bearing: Phase-1 fixtures are self-contained by
+// convention, carrying their own copies of the shared functions, so mutants in the
+// shared modules survive them.  This one synthesises the fourteen device-side
+// arguments and dispatches the real entry point, exactly as the
+// cloth_planeVertContactGenLaunch fixture above does.
+//
+// THE GEOMETRY, AND WHY IT IS THE GEOMETRY.
+//
+//   The convex core is an analytic BOX of FULL extents (2,2,2) at the origin, so it
+//   spans [-1,1]^3 and its top face is the plane y = +1.  Analytic means no cooked
+//   hull and no device-side hull data -- the core's parameters ride in the
+//   PxMeshScale bytes (convexCoreCollision.cu:114-169), which is the one arm of
+//   makeConvexShape that needs nothing allocated.
+//
+//   The cloth's transform cache entry is IDENTITY, because a deformable surface has
+//   no rigid pose and its vertices are already world-space.  That makes
+//   transform0in1 == the box's pose and keeps the whole test in one frame.
+//
+//   Two triangles at y = 0.9, i.e. 0.1 INSIDE the top face.  0.1 is chosen to be
+//   far larger than the margins (the triangle margin is 0.001 * the fattened box
+//   dimension, about 0.002) and far smaller than every other way out of the box,
+//   so EPA's minimum-penetration axis is unambiguously +/-Y.
+//
+// WHAT MAKES no-half-penetration CHECKABLE -- the fact that had to be read, not
+// assumed.  faceClipQ's points are ALREADY midway between the two surfaces:
+//
+//     polyDists[i] = float4((pr0 + pr1) * 0.5f, dot3Q(axis, pr0 - pr1));
+//                                    -- pxgSlangCvxCoreCvx.slang, getContact
+//
+// where pr0 and pr1 are the point projected onto face0's and face1's planes along
+// the axis.  So the kernel's `point = patch[i].xyz + normal * patch[i].w * 0.5f`
+// moves that midpoint by another half separation and lands it ON ONE OF THE TWO
+// PLANES -- here y == 0.9 (the triangle) or y == 1.0 (the box face).  Dropping the
+// shift leaves it at y == 0.95, which is on neither.  That is an exact, analytic
+// discrimination, and it exists only because both surfaces here are planes.
+// ===========================================================================
+
+// Push blob, byte-identical to cvxCoreClothNpBda.slang's CvxCoreClothParams and to
+// the kCvxCoreCloth ABI row { 8,8,8,8,8,8,8,8,8,8,4,4,8,80 }.
+struct CvxCoreClothPush
+{
+    uint64_t stackPtr, midphasePairsNum, cmInputs, shapes, femClothes;
+    uint64_t shapeToRigidRemapTable, transformCache, contactDistance, restDistance, filterPairs;
+    uint32_t nbFilterPairs, stackSizeBytes;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
+    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
+    uint32_t w_maxNumContacts, pad172;
+};
+static_assert(sizeof(CvxCoreClothPush) == 176, "convex-core cloth push blob must be 176 bytes");
+static_assert(offsetof(CvxCoreClothPush, nbFilterPairs) == 80, "nbFilterPairs @80");
+static_assert(offsetof(CvxCoreClothPush, stackSizeNeededOnDevice) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(CvxCoreClothPush, w_outPoint) == 96, "writer @96");
+static_assert(offsetof(CvxCoreClothPush, w_maxNumContacts) == 168, "maxNumContacts @168");
+
+// PxComputeBarycentric, the TRIANGLE overload (PxMathUtils.h:390-409), transcribed
+// operation for operation so the comparison can be BIT-EXACT.  This TU is built
+// -ffp-contract=off, which is what the shaders' NoContraction stamp matches.
+//
+// NOT the corpus's `computeBarycentric` (fcPrim2.slang:309, fcStaticTriCloth.slang:215):
+// those are femClothPrimitives.cu's function, the same Cramer arithmetic plus a
+// [-1e-4, 1+1e-4] acceptance window whose bool gates a contact.  The kernel under
+// test has no such gate, and transcribing the windowed one would import a decision
+// that does not belong on this path.
+static F4 cpuTriBarycentric(V3c a, V3c b, V3c c, V3c p)
+{
+    const V3c v0{ b.x - a.x, b.y - a.y, b.z - a.z };
+    const V3c v1{ c.x - a.x, c.y - a.y, c.z - a.z };
+    const V3c v2{ p.x - a.x, p.y - a.y, p.z - a.z };
+    auto d3 = [](const V3c& u, const V3c& v) { return u.x * v.x + u.y * v.y + u.z * v.z; };
+    const float d00 = d3(v0, v0), d01 = d3(v0, v1), d11 = d3(v1, v1);
+    const float d20 = d3(v2, v0), d21 = d3(v2, v1);
+    const float denom = d00 * d11 - d01 * d01;
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    const float u = 1.0f - v - w;
+    return F4{ u, v, w, 0.0f };   // bary.w = 0 on the TRIANGLE overload (PxMathUtils.h:409)
+}
+
+// PxEncodeClothIndex (PxgSimulationCoreDesc.h:101-108), spelled from its own line --
+// PXG_BITSHIFT_ELEMENT_ID, not PXG_BITSHIFT_TET_ID.
+static uint32_t cpuEncodeCloth(uint32_t clothId, uint32_t elementId)
+{
+    return (clothId << PXG_BITSHIFT_ELEMENT_ID) | elementId;
+}
+
+PXG_TEST(cvxCoreClothNp)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the values the SCENE cannot choose ------------------------------
+    // Each of these makes at least one P9.74 class-A survivor observable.
+    const uint32_t CLOTH_ID = 3u;              // scene has one cloth, so clothId is 0 there
+    const uint32_t MATERIAL_INDEX = 0x1234u;
+    const uint64_t RIGID_NODE_IND = 0x00000007ABCDEF01ull;  // BOTH words non-zero and unequal
+    const float REST_DIST_CM0 = 0.05f;         // restDistance[0], the only correct read
+    const float REST_DIST_POISON = 999.0f;     // restDistance[1]: what pairIndex would read
+    const float CONTACT_OFF = 0.01f;           // per shape, so contactDist == 0.02
+
+    // ---- geometry --------------------------------------------------------
+    const float TRI_Y = 0.9f;                  // 0.1 inside the box's top face at y = 1
+    const float BOX_TOP_Y = 1.0f;
+    std::vector<F4> verts = {
+        F4{ -0.5f, TRI_Y, -0.5f, 1.0f }, F4{ 0.5f, TRI_Y, -0.5f, 1.0f }, F4{ 0.0f, TRI_Y, 0.5f, 1.0f },
+        F4{ -0.4f, TRI_Y,  0.2f, 1.0f }, F4{ 0.4f, TRI_Y,  0.2f, 1.0f }, F4{ 0.0f, TRI_Y, -0.6f, 1.0f },
+    };
+    // Triangle 2 is TILTED: its plane is not perpendicular to the contact normal.
+    // That is the whole point of case D below -- with a normal perpendicular to the
+    // triangle, shifting the contact point along it does NOT move the in-plane
+    // projection, so the barycentric of the raw point and of the shifted point are
+    // the same number and `bary-of-raw-point` is unobservable.  A tilted triangle
+    // breaks that degeneracy, and nothing about the resting scene ever could.
+    verts.push_back(F4{ -0.5f, 0.85f, -0.5f, 1.0f });
+    verts.push_back(F4{  0.5f, 0.95f, -0.5f, 1.0f });
+    verts.push_back(F4{  0.0f, 0.90f,  0.5f, 1.0f });
+    std::vector<uint32_t> triInds = { 0,1,2,0,  3,4,5,0,  6,7,8,0 };   // three uint4 rows
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bTris = makeDev(dev, triInds);
+
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(bVerts.addr);
+    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(bTris.addr);
+    // mTriMeshData is deliberately left NULL: this kernel never traverses, so
+    // getNodes() and scaleBounds() are unreachable from it (convexCoreCollision.cu:1195-1279).
+    // The kernel indexes femClothes[clothId] directly, so the array must REACH
+    // index CLOTH_ID.  Uploading one descriptor and then asking for index 3 reads
+    // off the end -- which is how the first run of this fixture segfaulted, and it
+    // is precisely the mistake a scene with one cloth can never teach.
+    std::vector<PxgFEMCloth> clothArr(CLOTH_ID + 1u);
+    std::memset(clothArr.data(), 0, clothArr.size() * sizeof(PxgFEMCloth));
+    clothArr[CLOTH_ID] = cloth;
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    // shape0: the convex CORE box.  The core TYPE rides in hullOrMeshPtr and the
+    // core DATA in the PxMeshScale bytes (convexCoreCollision.cu:114-169); eBOX is 2
+    // (PxConvexCoreGeometry.h:59), which is also the layer's CORE_BOX.  BoxCore
+    // carries FULL extents, and the margin is the scale rotation's w.
+    shapes[0].type = PxU32(PxGeometryType::eCONVEXCORE);
+    shapes[0].hullOrMeshPtr = size_t(PxConvexCore::Type::eBOX);
+    shapes[0].scale.scale = PxVec3(2.0f, 2.0f, 2.0f);
+    shapes[0].scale.rotation = PxQuat(0.0f, 0.0f, 0.0f, 0.0f);   // .w IS the margin: 0
+    shapes[0].materialIndex = MATERIAL_INDEX;
+    // shape1: the cloth's collision shape is a TRIANGLE mesh.
+    shapes[1].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[1].particleOrSoftbodyId = CLOTH_ID;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[0].transform = PxTransform(PxIdentity);   // the box, at the origin
+    tcache[1].transform = PxTransform(PxIdentity);   // the cloth: world-space verts
+    DevBuf bTc = makeDev(dev, tcache);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<float> contactDistArr = { CONTACT_OFF, CONTACT_OFF };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    // THE POISON SLOT.  restDistance is indexed by the CONTACT MANAGER index, which
+    // is 0 for both pairs; a port that indexed by the PAIR index would read slot 1
+    // for the second pair.  In the scene that mutant is invisible -- it reads past a
+    // 4-byte allocation into a 128-byte buddy slot that happens to hold zeros, which
+    // is exactly the accident P9.74 recorded as class D.  Here slot 1 is loud.
+    std::vector<float> restArr = { REST_DIST_CM0, REST_DIST_POISON };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { RIGID_NODE_IND, 0ull };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // ---- the filter, which the scene has none of -------------------------
+    // PxgRigidFilterPair: PxU64 index0, PxU64 index1, PxU32 index2, PxU32 pad[3].
+    // ONE entry, matching triangle 0's FIRST vertex only.  find() is then true for
+    // vertex .x and false for .y and .z, so:
+    //     A && B && C  ==  false  -> the pair is NOT skipped   (the engine's meaning)
+    //     A || (B && C) == true   -> the pair IS skipped       (the mutant)
+    // Note the parse: replacing only the first `&&` gives `A || (B && C)`, not a
+    // flat three-way OR -- C precedence, which Slang follows.
+    struct FilterPairHost { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
+    static_assert(sizeof(FilterPairHost) == 32, "PxgRigidFilterPair mirror == 32B");
+    std::vector<FilterPairHost> filters(1);
+    std::memset(filters.data(), 0, filters.size() * sizeof(FilterPairHost));
+    filters[0].index0 = RIGID_NODE_IND;
+    filters[0].index1 = cpuEncodeCloth(CLOTH_ID, triInds[0]);   // triangle 0's .x
+    DevBuf bFilters = makeDev(dev, filters);
+
+    // ---- the midphase pairs ---------------------------------------------
+    // uint4(cmIdx, primitiveIndex, 0, 0) -- femClothMidPhase.cu:98, and the Slang
+    // port agrees (femClothContactGenBda.slang:1087).  TWO pairs on the SAME contact
+    // manager with DIFFERENT triangles: that is what separates triIndex from the
+    // zeroed .w slot, and what separates restDistance[cmIndex] from [pairIndex].
+    std::vector<uint32_t> pairs = { 0u,0u,0u,0u,  0u,1u,0u,0u };
+    DevBuf bPairs = makeDev(dev, pairs);
+    std::vector<uint32_t> pairCount = { 2u };
+    DevBuf bPairNum = makeDev(dev, pairCount);
+    std::vector<uint32_t> stackNeeded = { 0u };
+    DevBuf bStackNeeded = makeDev(dev, stackNeeded);
+
+    WriterBufs w = makeWriter(dev, 64u);
+
+    CvxCoreClothPush push = {};
+    push.stackPtr = bPairs.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.cmInputs = bCin.addr;
+    push.shapes = bShapes.addr;
+    push.femClothes = bCloth.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.transformCache = bTc.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr;
+    push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = 1u;
+    push.stackSizeBytes = 4096u;           // far above 2 pairs: the clamp is a no-op here
+    push.stackSizeNeededOnDevice = bStackNeeded.addr;
+    push.w_outPoint = w.point.addr; push.w_outNormalPen = w.normalPen.addr;
+    push.w_outBarycentric = w.barycentric.addr; push.w_outContactInfo = w.info.addr;
+    push.w_totalContactCount = w.count.addr; push.w_contactByX = w.byRigid.addr;
+    push.w_tempContactByX = w.tempByRigid.addr; push.w_contactIndexSortedByX = w.idxByRigid.addr;
+    push.w_contactSortedByX = w.sortedByRigid.addr; push.w_maxNumContacts = w.maxContacts;
+
+    Kernel k("cvxCoreClothNpBda.spv", "convexCoreClothmeshNphase_Kernel32", {}, sizeof(CvxCoreClothPush));
+    k.dispatch(/*gridX*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- read back --------------------------------------------------------
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount > 0u && gCount <= w.maxContacts,
+                  "the kernel emitted %u contacts; a triangle 0.1 inside the box must produce "
+                  "some, and the filter must NOT suppress it (only one of three vertices is "
+                  "filtered, and the engine's test is &&)", gCount);
+
+    // A mutant that suppresses every contact (the filter always skipping, the
+    // convex arm never built, the swap gone) leaves gCount == 0, and
+    // downloadBuffer(.., 0) faults.  The first version of this fixture CRASHED on
+    // four such mutants: they were counted as kills, which is right, but a crash
+    // says only "something broke" where a check says what.  Bail out with the
+    // failure already recorded.
+    if (gCount == 0u)
+    {
+        std::printf("  cvxCoreCloth: no contacts at all -- nothing further can be checked\n");
+        destroyWriter(dev, w);
+        for (PxgBufferHandle h : { bVerts.h, bTris.h, bCloth.h, bShapes.h, bTc.h, bCin.h,
+                                   bCd.h, bRd.h, bRemap.h, bFilters.h, bPairs.h, bPairNum.h,
+                                   bStackNeeded.h })
+            dev->destroyBuffer(h);
+        return;
+    }
+
+    const std::vector<F4> gPoint = downloadBuffer<F4>(dev, w.point.h, gCount);
+    const std::vector<F4> gNP = downloadBuffer<F4>(dev, w.normalPen.h, gCount);
+    const std::vector<F4> gBary = downloadBuffer<F4>(dev, w.barycentric.h, gCount);
+    const std::vector<FemOtherContactInfoHost> gInfo =
+        downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, gCount);
+    const std::vector<uint64_t> gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, gCount);
+    const std::vector<uint32_t> gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, gCount);
+    const std::vector<uint32_t> gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, gCount);
+    const uint32_t gStackNeeded = downloadBuffer<uint32_t>(dev, bStackNeeded.h, 1)[0];
+
+    // ---- the per-contact invariants ---------------------------------------
+    size_t mm = 0;
+    uint32_t sawTri0 = 0u, sawTri1 = 0u, onTriPlane = 0u, onBoxPlane = 0u;
+    const uint32_t pairInd1Tri0 = cpuEncodeCloth(CLOTH_ID, 0u);
+    const uint32_t pairInd1Tri1 = cpuEncodeCloth(CLOTH_ID, 1u);
+
+    for (uint32_t i = 0; i < gCount; ++i)
+    {
+        // 1. THE REST DISTANCE IS THE CONTACT MANAGER's, for every contact.
+        if (f2u(gPoint[i].w) != f2u(REST_DIST_CM0))
+        { ++mm; std::printf("  cvxCoreCloth[%u] outPoint.w = %g, expected restDistance[cmIndex] = %g "
+                            "(restDistance[1] is %g -- reading it means indexing by pairIndex)\n",
+                            i, gPoint[i].w, REST_DIST_CM0, REST_DIST_POISON); }
+
+        // 2. THE FOURTH BARYCENTRIC SLOT IS A MODE SELECTOR, and this is the
+        //    TRIANGLE generator, so it must be 0.  `if (bc.w == 0.f) // Cloth triangle`
+        //    else `// Cloth vertex` -- FEMClothExternalSolve.cu:375,391,501 and
+        //    deformableUtils.cuh:501,549,568.  The mirror-image assertion for the
+        //    VERTEX path is above at cmpF4("outBarycentric", F4{0,0,0,1}, ...).
+        if (f2u(gBary[i].w) != f2u(0.0f))
+        { ++mm; std::printf("  cvxCoreCloth[%u] outBarycentric.w = %g, expected 0 -- a 1 here makes "
+                            "the solver read the contact as a VERTEX contact and index mDeltaPos "
+                            "with a TRIANGLE index\n", i, gBary[i].w); }
+
+        // 3. THE BARYCENTRIC IS OF THE WRITTEN CONTACT POINT.  Recomputed on the host
+        //    from the kernel's OWN outPoint, so this is a cross-check and not a
+        //    re-derivation: a port that took the barycentric of the pre-shift point,
+        //    or permuted u/v/w, disagrees with its own output.
+        const uint32_t tri = (gInfo[i].pairInd1 == pairInd1Tri1) ? 1u : 0u;
+        const uint32_t b0 = triInds[tri * 4u + 0u], b1 = triInds[tri * 4u + 1u], b2 = triInds[tri * 4u + 2u];
+        const V3c a{ verts[b0].x, verts[b0].y, verts[b0].z };
+        const V3c b{ verts[b1].x, verts[b1].y, verts[b1].z };
+        const V3c c{ verts[b2].x, verts[b2].y, verts[b2].z };
+        const F4 refBary = cpuTriBarycentric(a, b, c, V3c{ gPoint[i].x, gPoint[i].y, gPoint[i].z });
+        if (f2u(refBary.x) != f2u(gBary[i].x) || f2u(refBary.y) != f2u(gBary[i].y) ||
+            f2u(refBary.z) != f2u(gBary[i].z))
+        { ++mm; std::printf("  cvxCoreCloth[%u] outBarycentric (%g,%g,%g) != PxComputeBarycentric of "
+                            "its own outPoint (%g,%g,%g)\n", i, gBary[i].x, gBary[i].y, gBary[i].z,
+                            refBary.x, refBary.y, refBary.z); }
+
+        // 4. THE MATERIAL INDEX, WITH BIT 31 CLEARED.  setRigidMaterialIndex(mat)
+        //    followed by markInCollision(false) collapses to (mat & 0x7fffffff);
+        //    bit 31 is the isInCollision flag (PxgFEMCore.h:144-158).
+        if (gInfo[i].rigidMatInd_isInCollision != (MATERIAL_INDEX & 0x7fffffffu))
+        { ++mm; std::printf("  cvxCoreCloth[%u] rigidMatInd = 0x%08x, expected 0x%08x\n",
+                            i, gInfo[i].rigidMatInd_isInCollision, MATERIAL_INDEX & 0x7fffffffu); }
+
+        // 5. THE SORT KEY IS THE WHOLE 64-BIT NODE INDEX.  Both words of
+        //    RIGID_NODE_IND are non-zero and unequal, so a swapped pair is visible --
+        //    which it is not in a scene with one rigid.
+        if (gByRigid[i] != RIGID_NODE_IND)
+        { ++mm; std::printf("  cvxCoreCloth[%u] contactByRigid = 0x%016llx, expected 0x%016llx\n",
+                            i, (unsigned long long)gByRigid[i], (unsigned long long)RIGID_NODE_IND); }
+        if (gTempByRigid[i] != uint32_t(RIGID_NODE_IND & 0xffffffffull))
+        { ++mm; std::printf("  cvxCoreCloth[%u] tempContactByRigid = 0x%08x\n", i, gTempByRigid[i]); }
+        if (gIdxByRigid[i] != i)
+        { ++mm; std::printf("  cvxCoreCloth[%u] contactIndexSortedByRigid = %u\n", i, gIdxByRigid[i]); }
+        if (gInfo[i].pairInd0 != RIGID_NODE_IND)
+        { ++mm; std::printf("  cvxCoreCloth[%u] info.pairInd0 = 0x%016llx\n",
+                            i, (unsigned long long)gInfo[i].pairInd0); }
+
+        // 6. THE CLOTH ELEMENT ID.  CLOTH_ID is 3, not 0, so both the id itself and
+        //    the shift constant are observable here.
+        if (gInfo[i].pairInd1 != pairInd1Tri0 && gInfo[i].pairInd1 != pairInd1Tri1)
+        { ++mm; std::printf("  cvxCoreCloth[%u] info.pairInd1 = 0x%08x, expected 0x%08x (tri 0) or "
+                            "0x%08x (tri 1) -- clothId %u shifted by PXG_BITSHIFT_ELEMENT_ID\n",
+                            i, gInfo[i].pairInd1, pairInd1Tri0, pairInd1Tri1, CLOTH_ID); }
+        if (gInfo[i].pairInd1 == pairInd1Tri0) ++sawTri0;
+        if (gInfo[i].pairInd1 == pairInd1Tri1) ++sawTri1;
+
+        // 7. THE NORMAL IS NEGATED ON WRITE (convexCoreCollision.cu:1269), and the
+        //    SIGN is the point -- an abs() here would pin the axis and miss the
+        //    negation entirely, which is how the first version of this fixture let
+        //    `normal-not-negated` survive while the SCENE killed it.
+        //
+        //    The expected sign is derived, not fitted: the cloth sits 0.1 BELOW the
+        //    box's top face, inside the solid, so the direction that expels it is
+        //    +Y.  The written normal is that direction.
+        if (!(almostEqual(gNP[i].x, 0.0f, 1e-4f, 1e-5f) && almostEqual(gNP[i].z, 0.0f, 1e-4f, 1e-5f) &&
+              almostEqual(gNP[i].y, 1.0f, 1e-4f, 1e-5f)))
+        { ++mm; std::printf("  cvxCoreCloth[%u] outNormalPen.xyz = (%g,%g,%g), expected (0,1,0) -- "
+                            "the cloth is inside the box and must be pushed OUT, along +Y\n",
+                            i, gNP[i].x, gNP[i].y, gNP[i].z); }
+
+        // 8. THE PENETRATION IS WRITTEN RAW -- no 40%% ERP scaling.  The triangle sits
+        //    0.1 inside the top face, and the only margins in play are the convex's
+        //    (0) and the triangle's (0.001 * the fattened box dimension, ~0.002), so
+        //    the separation must land near -0.1.  The tetmesh kernel's
+        //    `if (d < 0) d *= 0.4f` would put it near -0.04, which this window
+        //    excludes by a factor of two.
+        //    The value is DERIVED to its last term, not bounded loosely:
+        //      penetration   = BOX_TOP_Y - TRI_Y                     = 0.1
+        //      convex margin = shape0.scale.rotation.w               = 0
+        //      box bounds    = the full extent, FATTENED by contactDist on each side
+        //                    = 2.0 + 2*0.02                          = 2.04
+        //      triangle margin = triMarginK * maxElement(dims)       = 0.001 * 2.04
+        //      separation    = -(penetration + triangle margin)      = -0.10204
+        //    and `dist -= marginA + marginB` is where the two margins leave.  A
+        //    window this tight also separates the three margin mutants, which a
+        //    +/-0.02 window could not: triMarginK = 0 gives -0.1, the unfattened
+        //    bounds give -0.102, and a one-sided contactDist gives -0.10202.
+        //    ONE FACTOR IN THIS LINE WAS WRONG AND THE SWEEP IS WHAT FOUND IT.  The
+        //    fattening is by `contactDist`, the SUM of the two shapes' offsets, on
+        //    each side -- not by one shape's CONTACT_OFF.  With 2.02 instead of 2.04
+        //    the reference landed exactly BETWEEN the clean value (-0.10204) and two
+        //    of the margin mutants (-0.102 and -0.10202), and tolerated both.  A
+        //    reference that sits in the middle of the mutants it is meant to exclude
+        //    is the worst possible kind: it passes, and it passes them too.
+        const float contactDistSum = 2.0f * CONTACT_OFF;              // == the kernel's contactDist
+        const float fattenedDim = 2.0f + 2.0f * contactDistSum;       // full extent + both sides
+        const float refSep = -( (BOX_TOP_Y - TRI_Y) + 0.001f * fattenedDim );
+        if (!almostEqual(gNP[i].w, refSep, 1e-4f, 2e-6f))
+        { ++mm; std::printf("  cvxCoreCloth[%u] separation = %.8g, expected %.8g raw (the 0.4x ERP "
+                            "hack of the TETMESH kernel would give %.8g)\n",
+                            i, gNP[i].w, refSep, refSep * 0.4f); }
+
+        // 9. THE HALF-PENETRATION SHIFT LANDS THE POINT ON A SURFACE.  faceClipQ
+        //    already returns the midpoint between the two projections, so one more
+        //    half-separation puts it on the triangle plane (0.9) or the box face
+        //    (1.0).  Omitting the shift leaves 0.95, which is neither.
+        const bool onTri = almostEqual(gPoint[i].y, TRI_Y, 1e-3f, 1e-4f);
+        const bool onBox = almostEqual(gPoint[i].y, BOX_TOP_Y, 1e-3f, 1e-4f);
+        if (onTri) ++onTriPlane;
+        if (onBox) ++onBoxPlane;
+        if (!onTri && !onBox)
+        { ++mm; std::printf("  cvxCoreCloth[%u] outPoint.y = %g, expected the triangle plane %g or "
+                            "the box face %g; %g would be the un-shifted midpoint\n",
+                            i, gPoint[i].y, TRI_Y, BOX_TOP_Y, 0.5f * (TRI_Y + BOX_TOP_Y)); }
+    }
+
+    // ---- the whole-run invariants -----------------------------------------
+    // BOTH triangles must appear.  With `triIndex = testPair.w` -- and the midphase
+    // writes uint4(cmIdx, prim, 0, 0) -- every contact would carry triangle 0.
+    PXG_CHECK_MSG(sawTri0 > 0u && sawTri1 > 0u,
+                  "contacts for triangle 0: %u, triangle 1: %u -- both midphase pairs must be "
+                  "consumed with their own triangle index", sawTri0, sawTri1);
+
+    // The atomicMax tail (convexCoreCollision.cu:1277-1278) reports the UNCLAMPED
+    // pair count in BYTES, which is how the engine learns to grow the stack.
+    PXG_CHECK_MSG(gStackNeeded == 2u * 16u,
+                  "stackSizeNeededOnDevice = %u, expected %u (numMidphasePairsFound * sizeof(uint4))",
+                  gStackNeeded, 2u * 16u);
+
+    PXG_CHECK_MSG(mm == 0, "convexCoreClothmeshNphase_Kernel32 contact invariants (%zu mismatches)", mm);
+
+    // Teeth: a run that produced contacts for only one of the two planes, or none on
+    // either, would satisfy every per-contact check above vacuously.
+    std::printf("    [ info ] cvxCoreCloth: %u contacts (tri0 %u, tri1 %u); on triangle plane %u, "
+                "on box face %u; normal (%g,%g,%g) sep %g point0 (%g,%g,%g)\n",
+                gCount, sawTri0, sawTri1, onTriPlane, onBoxPlane,
+                gNP[0].x, gNP[0].y, gNP[0].z, gNP[0].w, gPoint[0].x, gPoint[0].y, gPoint[0].z);
+
+    // =======================================================================
+    // CASE B -- THE PAIR ARRIVES MESH-FIRST, so checkTypes' swap arm has to fire.
+    //
+    // The scene reaches this arm and the first version of this fixture did not,
+    // because it put the core in slot 0 where the kernel already wants it.  A
+    // fixture that only ever feeds the easy order is asserting that the easy order
+    // works.  With the swap disabled, shape0 stays the TRIANGLE mesh,
+    // makeConvexShapeCvxCore returns false for it, and every pair is skipped -- so
+    // the count going to zero IS the discrimination.
+    // =======================================================================
+    {
+        std::vector<PxgContactManagerInput> cmSwapped(1);
+        std::memset(cmSwapped.data(), 0, sizeof(PxgContactManagerInput));
+        cmSwapped[0].shapeRef0 = 1u; cmSwapped[0].shapeRef1 = 0u;          // mesh first
+        cmSwapped[0].transformCacheRef0 = 1u; cmSwapped[0].transformCacheRef1 = 0u;
+        DevBuf bCinSwap = makeDev(dev, cmSwapped);
+        std::vector<uint32_t> sn2 = { 0u };
+        DevBuf bSn2 = makeDev(dev, sn2);
+        WriterBufs w2 = makeWriter(dev, 64u);
+
+        CvxCoreClothPush p2 = push;
+        p2.cmInputs = bCinSwap.addr;
+        p2.stackSizeNeededOnDevice = bSn2.addr;
+        p2.w_outPoint = w2.point.addr; p2.w_outNormalPen = w2.normalPen.addr;
+        p2.w_outBarycentric = w2.barycentric.addr; p2.w_outContactInfo = w2.info.addr;
+        p2.w_totalContactCount = w2.count.addr; p2.w_contactByX = w2.byRigid.addr;
+        p2.w_tempContactByX = w2.tempByRigid.addr; p2.w_contactIndexSortedByX = w2.idxByRigid.addr;
+        p2.w_contactSortedByX = w2.sortedByRigid.addr;
+
+        k.dispatch(1u, {}, p2, 1u, 1u);
+        dev->flush();
+
+        const uint32_t c2 = downloadBuffer<uint32_t>(dev, w2.count.h, 1)[0];
+        PXG_CHECK_MSG(c2 == gCount,
+                      "mesh-first gave %u contacts, core-first gave %u -- checkTypes must swap the "
+                      "two slots so the arm is order-independent", c2, gCount);
+        if (c2 == gCount)
+        {
+            const std::vector<F4> p2Point = downloadBuffer<F4>(dev, w2.point.h, c2);
+            const std::vector<F4> p2NP = downloadBuffer<F4>(dev, w2.normalPen.h, c2);
+            size_t sm = 0;
+            for (uint32_t i = 0; i < c2; ++i)
+                if (f2u(p2Point[i].x) != f2u(gPoint[i].x) || f2u(p2Point[i].y) != f2u(gPoint[i].y) ||
+                    f2u(p2Point[i].z) != f2u(gPoint[i].z) || f2u(p2NP[i].w) != f2u(gNP[i].w))
+                    ++sm;
+            PXG_CHECK_MSG(sm == 0, "mesh-first and core-first disagree on %zu of %u contacts", sm, c2);
+        }
+        destroyWriter(dev, w2);
+        dev->destroyBuffer(bCinSwap.h); dev->destroyBuffer(bSn2.h);
+    }
+
+    // =======================================================================
+    // CASE C -- THE MIDPHASE OVERFLOWED, so the stack clamp has to bite.
+    //
+    //     stackSize = stackSizeBytes / sizeof(uint4);
+    //     numPairs  = PxMin(numMidphasePairsFound, stackSize);
+    //
+    // stackSizeBytes = 16 means room for ONE uint4, so only the first of the two
+    // pairs is actually on the stack and only triangle 0 may be consumed.  The
+    // count reported through the atomicMax tail is the UNCLAMPED one -- that is how
+    // the engine learns to grow the buffer -- so it stays at 2 * 16.
+    //
+    // The scene cannot reach this: 32 pairs against a multi-megabyte stack make the
+    // clamp a no-op, which is why `no-clamp-to-stack` and `stack-size-in-bytes` are
+    // provably equivalent there and discriminating here.
+    // =======================================================================
+    {
+        std::vector<uint32_t> sn3 = { 0u };
+        DevBuf bSn3 = makeDev(dev, sn3);
+        WriterBufs w3 = makeWriter(dev, 64u);
+
+        CvxCoreClothPush p3 = push;
+        p3.stackSizeBytes = 16u;              // exactly one uint4
+        p3.stackSizeNeededOnDevice = bSn3.addr;
+        p3.w_outPoint = w3.point.addr; p3.w_outNormalPen = w3.normalPen.addr;
+        p3.w_outBarycentric = w3.barycentric.addr; p3.w_outContactInfo = w3.info.addr;
+        p3.w_totalContactCount = w3.count.addr; p3.w_contactByX = w3.byRigid.addr;
+        p3.w_tempContactByX = w3.tempByRigid.addr; p3.w_contactIndexSortedByX = w3.idxByRigid.addr;
+        p3.w_contactSortedByX = w3.sortedByRigid.addr;
+
+        k.dispatch(1u, {}, p3, 1u, 1u);
+        dev->flush();
+
+        const uint32_t c3 = downloadBuffer<uint32_t>(dev, w3.count.h, 1)[0];
+        const uint32_t sn3v = downloadBuffer<uint32_t>(dev, bSn3.h, 1)[0];
+        const std::vector<FemOtherContactInfoHost> i3 =
+            downloadBuffer<FemOtherContactInfoHost>(dev, w3.info.h, c3 ? c3 : 1u);
+        uint32_t tri1Leaked = 0u;
+        for (uint32_t i = 0; i < c3; ++i)
+            if (i3[i].pairInd1 == pairInd1Tri1) ++tri1Leaked;
+
+        PXG_CHECK_MSG(c3 == sawTri0 && tri1Leaked == 0u,
+                      "with room for ONE pair the kernel produced %u contacts (%u of them from the "
+                      "SECOND pair); expected %u, all from triangle 0 -- stackSizeBytes / 16 is the "
+                      "clamp, and the second uint4 is not on the stack",
+                      c3, tri1Leaked, sawTri0);
+        PXG_CHECK_MSG(sn3v == 2u * 16u,
+                      "stackSizeNeededOnDevice = %u under the clamp, expected %u -- the tail reports "
+                      "the UNCLAMPED count so the engine can grow the stack", sn3v, 2u * 16u);
+
+        destroyWriter(dev, w3);
+        dev->destroyBuffer(bSn3.h);
+    }
+
+    // =======================================================================
+    // CASE D -- A TILTED TRIANGLE, so the half-penetration shift moves the
+    // barycentric.
+    //
+    // Cases A-C all use triangles whose plane is perpendicular to the contact
+    // normal.  For those, `point = raw + normal * w * 0.5` slides along the
+    // triangle's own normal, the in-plane projection is unchanged, and
+    // PxComputeBarycentric returns the SAME three numbers for the raw point and the
+    // shifted one.  `bary-of-raw-point` is therefore not a different program there,
+    // and no amount of tightening reaches it.
+    //
+    // Triangle 2 is tilted (y from 0.85 to 0.95) while the contact normal stays +Y,
+    // because the way out of the box is still straight up.  Now the shift has a
+    // component in the triangle's plane and the two barycentrics differ.
+    // =======================================================================
+    {
+        std::vector<uint32_t> pairsD = { 0u, 2u, 0u, 0u };
+        DevBuf bPairsD = makeDev(dev, pairsD);
+        std::vector<uint32_t> pairNumD = { 1u };
+        DevBuf bPairNumD = makeDev(dev, pairNumD);
+        std::vector<uint32_t> snD = { 0u };
+        DevBuf bSnD = makeDev(dev, snD);
+        WriterBufs wD = makeWriter(dev, 64u);
+
+        CvxCoreClothPush pD = push;
+        pD.stackPtr = bPairsD.addr;
+        pD.midphasePairsNum = bPairNumD.addr;
+        pD.stackSizeNeededOnDevice = bSnD.addr;
+        pD.w_outPoint = wD.point.addr; pD.w_outNormalPen = wD.normalPen.addr;
+        pD.w_outBarycentric = wD.barycentric.addr; pD.w_outContactInfo = wD.info.addr;
+        pD.w_totalContactCount = wD.count.addr; pD.w_contactByX = wD.byRigid.addr;
+        pD.w_tempContactByX = wD.tempByRigid.addr; pD.w_contactIndexSortedByX = wD.idxByRigid.addr;
+        pD.w_contactSortedByX = wD.sortedByRigid.addr;
+
+        k.dispatch(1u, {}, pD, 1u, 1u);
+        dev->flush();
+
+        const uint32_t cD = downloadBuffer<uint32_t>(dev, wD.count.h, 1)[0];
+        PXG_CHECK_MSG(cD > 0u, "the tilted triangle produced no contacts (%u)", cD);
+        if (cD > 0u)
+        {
+            const std::vector<F4> dPoint = downloadBuffer<F4>(dev, wD.point.h, cD);
+            const std::vector<F4> dBary = downloadBuffer<F4>(dev, wD.barycentric.h, cD);
+            const std::vector<F4> dNP = downloadBuffer<F4>(dev, wD.normalPen.h, cD);
+            const V3c ta{ verts[6].x, verts[6].y, verts[6].z };
+            const V3c tb{ verts[7].x, verts[7].y, verts[7].z };
+            const V3c tc{ verts[8].x, verts[8].y, verts[8].z };
+            size_t dm = 0; uint32_t moved = 0u;
+            for (uint32_t i = 0; i < cD; ++i)
+            {
+                const F4 refB = cpuTriBarycentric(ta, tb, tc,
+                                                  V3c{ dPoint[i].x, dPoint[i].y, dPoint[i].z });
+                if (f2u(refB.x) != f2u(dBary[i].x) || f2u(refB.y) != f2u(dBary[i].y) ||
+                    f2u(refB.z) != f2u(dBary[i].z) || f2u(dBary[i].w) != f2u(0.0f))
+                { ++dm; std::printf("  cvxCoreCloth tilted[%u] bary (%g,%g,%g,%g) != of its own point "
+                                    "(%g,%g,%g,0)\n", i, dBary[i].x, dBary[i].y, dBary[i].z,
+                                    dBary[i].w, refB.x, refB.y, refB.z); }
+                // The non-triviality guard: if the shift did NOT move the barycentric
+                // -- which is what happens when the normal is perpendicular to the
+                // triangle -- then this case proves nothing and must say so rather
+                // than pass quietly.  P9.73 wrote the same kind of counter after a
+                // survivor showed a fixture was measuring a degenerate configuration.
+                const V3c raw{ dPoint[i].x - 0.0f * dNP[i].w,
+                               dPoint[i].y - (-dNP[i].y) * dNP[i].w * 0.5f,
+                               dPoint[i].z };
+                const F4 rawB = cpuTriBarycentric(ta, tb, tc, raw);
+                if (f2u(rawB.x) != f2u(refB.x) || f2u(rawB.y) != f2u(refB.y)) ++moved;
+            }
+            PXG_CHECK_MSG(dm == 0, "tilted-triangle barycentric mismatches: %zu of %u", dm, cD);
+            PXG_CHECK_MSG(moved > 0u,
+                          "the tilted case is DEGENERATE: for all %u contacts the barycentric of "
+                          "the shifted point equals that of the unshifted one, so this case cannot "
+                          "tell the two apart and proves nothing", cD);
+            std::printf("    [ info ] cvxCoreCloth tilted: %u contacts, %u of them with a "
+                        "shift-sensitive barycentric\n", cD, moved);
+        }
+        destroyWriter(dev, wD);
+        dev->destroyBuffer(bPairsD.h); dev->destroyBuffer(bPairNumD.h); dev->destroyBuffer(bSnD.h);
+    }
+
+    destroyWriter(dev, w);
+    for (PxgBufferHandle h : { bVerts.h, bTris.h, bCloth.h, bShapes.h, bTc.h, bCin.h,
+                               bCd.h, bRd.h, bRemap.h, bFilters.h, bPairs.h, bPairNum.h,
+                               bStackNeeded.h })
         dev->destroyBuffer(h);
 }
 
