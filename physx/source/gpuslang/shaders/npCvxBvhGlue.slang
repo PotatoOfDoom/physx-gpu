@@ -61,6 +61,8 @@ struct BvhIn
     float4 bmin, bmax;   // query bounds (world/shape space)
     float4 pmin, pmax;   // node box to intersect (scaled space)
     float4 v0, v1, v2;   // unscaled triangle verts
+    float4 v3;           // the FOURTH vertex, for the tetrahedron arm (P9.73)
+    float4 dir;          // support direction for the tet support query (P9.73)
 }
 
 struct BvhOut
@@ -70,6 +72,10 @@ struct BvhOut
     float4 verts[3];     // createConvex verts (w = 1)
     uint4 core[3];       // PointsCore image (tranche-163 packing, ptr = 0x30)
     float4 prim;         // x = margin, y = asfloat(coreType), zw = pose id marker
+    // ---- the TETRAHEDRON arm (P9.73) ----
+    float4 tetVerts[4];  // read back THROUGH ptsAt, so the storage itself is checked
+    uint4 tetCore[3];    // the tet PointsCore image (numPoints = 4)
+    float4 tetSup;       // supportLocalQ over the 4-point inline pool.  THE decisive one.
 }
 
 import pxgSlangCvxCoreShape;             // ShapeRef / PtsRef / ptsFromTri / CORE_POINTS
@@ -119,5 +125,40 @@ void cbgGlue(uint3 dtid : SV_DispatchThreadID)
     r.core[1] = sh.core[1];
     r.core[2] = sh.core[2];
     r.prim = float4(outMargin, asfloat(sh.type), 0, 0); // coreType = ePOINTS, identity pose
+
+    // ---- the TETRAHEDRON arm (P9.73) --------------------------------------
+    //
+    // WHY THIS EXISTS.  P9.72's mutation sweep measured that the observing scene
+    // (PXG_SCENE=softbody PXG_SB_FLOOR=convexcore) cannot see a tetrahedron's fourth
+    // vertex at all: both `ptsref-v3-dropped` (ptsAt(p,3,..) -> v2) and
+    // `tet-numpoints-3` (numPoints 4 -> 3) SURVIVED.  A cube resting flat on a planar
+    // floor touches it with its SURFACE tetrahedra, whose fourth corner points inward,
+    // away from the contact, so it never wins the support query.
+    //
+    // npCvxCoreSupport has an ePOINTS arm and cannot help either: it is a Phase-1
+    // fixture with its OWN copy of supportLocalQ and never compiles
+    // pxgSlangCvxCoreShape at all.  This fixture already imports that module and
+    // includes pxgSlangCvxCoreBvh, so it is the one place that drives the real code.
+    //
+    // THE SUPPORT QUERY IS THE DECISIVE OUTPUT, not the vertices.  Reading the four
+    // verts back would catch ptsref-v3-dropped but NOT tet-numpoints-3, which changes
+    // only the count in the core image.  supportLocalQ reads that count, so a 3 there
+    // silently drops v3 from the argmax -- and the returned point changes exactly when
+    // v3 was the extreme one.  The host mirror counts how often that happens, because
+    // a query where v3 never wins proves nothing.
+    ShapeRef tetSh;
+    PtsRef tetPts;
+    float tetMargin;
+    // createConvexTet takes the vertices RAW -- no mesh scale anywhere (cu:1075-1079).
+    cvxBvhCreateConvexTet(s.v0.xyz, s.v1.xyz, s.v2.xyz, s.v3.xyz, margin,
+                          tetSh, tetPts, tetMargin);
+    r.tetVerts[0] = float4(ptsAt(tetPts, 0u, 16u), 1.0f);
+    r.tetVerts[1] = float4(ptsAt(tetPts, 1u, 16u), 1.0f);
+    r.tetVerts[2] = float4(ptsAt(tetPts, 2u, 16u), 1.0f);
+    r.tetVerts[3] = float4(ptsAt(tetPts, 3u, 16u), 1.0f);
+    r.tetCore[0] = tetSh.core[0];
+    r.tetCore[1] = tetSh.core[1];
+    r.tetCore[2] = tetSh.core[2];
+    r.tetSup = float4(supportLocalQ(tetSh, tetPts, s.dir.xyz), 0.0f);
     gOut[t] = r;
 }

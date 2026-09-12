@@ -1865,6 +1865,77 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.73 — die vierte Tetraeder-Ecke, jetzt belegt statt nur treu
+
+P9.72 hat gemessen, dass seine eigene Szene den Kern der Tranche nicht sieht: die
+beiden Mutanten, die den Zustand davor wiederherstellen — jedes Tetraeder ein Dreieck —
+überlebten beide. Diese Tranche schließt die Lücke.
+
+```
+                        Szene (P9.72)   Fixture (P9.73)
+ptsref-v3-dropped       SURVIVED        KILLED
+tet-numpoints-3         SURVIVED        KILLED
+```
+
+Dazu fünf weitere: `ptsfromtet-drops-d`, `support-loop-short`, `tet-stride-8`,
+`tet-verts-scaled`, `support-tie-ge`. **7 von 7.**
+
+### Warum eine Fixture und nicht eine härtere Szene
+
+Die naheliegende Antwort wäre gewesen, die Szene zu verschärfen — zwei Softbodies, ein
+gegierter Boden, tiefere Durchdringung. Das hätte vier der sechs P9.72-Überlebenden
+erledigt, aber **nicht diese zwei**: ein Würfel berührt einen Boden mit seinen
+Oberflächen-Tetraedern, und deren vierte Ecke zeigt nach innen, vom Kontakt weg. Sie
+gewinnt die Stützabfrage in Kontaktrichtung nicht, wie tief er auch einsinkt.
+
+`npCvxCoreSupport` hätte auch nicht geholfen, obwohl sie einen ePOINTS-Arm und einen
+`float4 pts[32]`-Pool hat: sie ist eine Phase-1-Fixture mit **eigener Kopie** von
+`supportLocalQ` und kompiliert `pxgSlangCvxCoreShape` überhaupt nicht. Genau deshalb
+überlebten die Mutanten dort alles — sie treffen Code, den diese Fixture nie sieht.
+
+`npCvxBvhGlue` importiert das Modul und schließt `pxgSlangCvxCoreBvh` ein. Sie fährt
+also bereits den betroffenen Code; es fehlte nur der Tetraeder-Arm.
+
+### Die Stützabfrage ist der entscheidende Ausgang, nicht die Vertices
+
+Die vier Ecken durch `ptsAt` zurückzulesen fängt `ptsref-v3-dropped` — aber **nicht**
+`tet-numpoints-3`, der nur die Zahl im Kern-Abbild ändert. `supportLocalQ` liest diese
+Zahl, also fällt v3 bei einer 3 still aus dem Argmax, und der zurückgegebene Punkt
+ändert sich **genau dann, wenn v3 der äußerste war**.
+
+Darum zählt die Fixture mit, wie oft das eintritt, und lässt den Test scheitern, wenn
+es zu selten ist:
+
+```
+[ info ] bvh cov: ident 1600 neg 914 hit 3229 miss 4771 touch 471 v3wins 2062 tie 1333
+```
+
+2062 von 8000 — das erwartete Viertel für ein Argmax über vier Punkte. Eine Abfrage, in
+der v3 nie gewinnt, würde nichts beweisen, und der Wächter sagt das mit einer Zahl statt
+mit einem Kommentar.
+
+### Ein Kommentar von mir, den der Sweep widerlegt hat
+
+Im Host-Spiegel stand, der strikte `>`-Tie-Break sei tragend: „a mirror using >= would
+disagree on every degenerate tetrahedron". Der erste Sweep sagte **`support-tie-ge`
+SURVIVED**.
+
+Der Grund: zwei zufällige Vertices erzeugen nie exakt gleiche Skalarprodukte. Ein
+Gleichstand braucht zwei **verschiedene** Ecken bei **gleicher Projektion**, also eine
+Kante senkrecht zur Abfragerichtung — und das ist nicht exotisch, sondern genau, wie
+eine flache Fläche gegen einen flachen Boden aussieht. Die Fixture konstruiert jetzt
+1333 solche Fälle (Gram-Schmidt gegen `dir`), und der Mutant stirbt.
+
+Die Behauptung war richtig; der Test konnte sie nur nicht stützen. Die richtige Antwort
+darauf ist, den Test scharf zu machen — nicht den Kommentar zu entschärfen, bis er zur
+Messung passt.
+
+### Stand
+
+Suite **853/853 in beiden Speichermodi**, Szenen **48/48**, alle vierzehn Prüfer grün.
+Manifest unverändert **408/501** — diese Tranche fügt keinen Kernel hinzu, sondern
+Beweiskraft für einen bereits gemappten.
+
 ## P9.72 — `convexCoreTetmeshNphase_Kernel32`, und eine Szene die ihren eigenen Kern nicht prüft
 
 Der Kernel ist gemappt und die Szene ist grün:

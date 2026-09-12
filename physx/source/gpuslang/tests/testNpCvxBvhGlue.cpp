@@ -55,6 +55,8 @@ struct BvhIn
     F4 bmin, bmax;
     F4 pmin, pmax;
     F4 v0, v1, v2;
+    F4 v3;      // the fourth tetrahedron vertex (P9.73)
+    F4 dir;     // support direction for the tet support query (P9.73)
 };
 struct BvhOut
 {
@@ -63,6 +65,9 @@ struct BvhOut
     F4 verts[3];
     U4 core[3];
     F4 prim;
+    F4 tetVerts[4];
+    U4 tetCore[3];
+    F4 tetSup;
 };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -139,6 +144,43 @@ static void refBvh(const BvhIn& s, BvhOut& o)
     uint32_t six = 6;
     float sixf; std::memcpy(&sixf, &six, 4);
     o.prim = F4{ margin, sixf, 0, 0 };
+
+    // ---- the TETRAHEDRON arm (P9.73) --------------------------------------
+    // createConvexTet takes the vertices RAW: no mesh-scale transform anywhere
+    // (convexCoreCollision.cu:1075-1079).  So unlike the triangle arm above, the
+    // four verts come straight through.
+    o.tetVerts[0] = F4{ s.v0.x, s.v0.y, s.v0.z, 1.0f };
+    o.tetVerts[1] = F4{ s.v1.x, s.v1.y, s.v1.z, 1.0f };
+    o.tetVerts[2] = F4{ s.v2.x, s.v2.y, s.v2.z, 1.0f };
+    o.tetVerts[3] = F4{ s.v3.x, s.v3.y, s.v3.z, 1.0f };
+    o.tetCore[0] = U4{ 0x30u, 0u, f2u(1.0f), f2u(1.0f) };
+    o.tetCore[1] = U4{ f2u(1.0f), f2u(0.0f), f2u(0.0f), f2u(0.0f) };
+    o.tetCore[2] = U4{ f2u(1.0f), 4u | (16u << 8), 0u, 0u };
+
+    // supportLocalQ's CORE_POINTS arm, written from its SEMANTICS and not copied
+    // from the shader.  With S = (1,1,1) and R = identity the whole prologue --
+    //     d = R.rotateInv(S.multiply(R.rotate(dir)))
+    // -- collapses to d = dir, and the epilogue collapses the same way, so what is
+    // left is: pick the vertex maximising dot(dir, v_i) over i in [0, numPoints).
+    //
+    // THE TIE-BREAK IS LOAD-BEARING.  The comparison is strictly `>` starting from
+    // -FLT_MAX with index 0, so the LOWEST index wins a tie.  A mirror using >= would
+    // disagree on every degenerate tetrahedron.
+    //
+    // The mag < FLT_EPS early-out returns (0,0,0); the test feeds unit directions, so
+    // it is not reachable here and is not mirrored.
+    {
+        const V3 d{ s.dir.x, s.dir.y, s.dir.z };
+        const F4* v[4] = { &s.v0, &s.v1, &s.v2, &s.v3 };
+        uint32_t best = 0;
+        float maxDot = -3.402823466e+38f;
+        for (uint32_t k = 0; k < 4; ++k)
+        {
+            const float dp = d.x * v[k]->x + d.y * v[k]->y + d.z * v[k]->z;
+            if (dp > maxDot) { maxDot = dp; best = k; }
+        }
+        o.tetSup = F4{ v[best]->x, v[best]->y, v[best]->z, 0.0f };
+    }
 }
 
 PXG_TEST(npCvxBvhGlue_glue)
@@ -150,7 +192,7 @@ PXG_TEST(npCvxBvhGlue_glue)
 
     std::vector<BvhIn> in(N);
     std::vector<BvhOut> ref(N);
-    size_t cIdent = 0, cNeg = 0, cHit = 0, cMiss = 0, cTouch = 0;
+    size_t cIdent = 0, cNeg = 0, cHit = 0, cMiss = 0, cTouch = 0, cV3 = 0, cTie = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -180,16 +222,56 @@ PXG_TEST(npCvxBvhGlue_glue)
             s.pmax.x = s.pmin.x + 2;
             ++cTouch;
         }
-        for (F4* v : { &s.v0, &s.v1, &s.v2 })
+        for (F4* v : { &s.v0, &s.v1, &s.v2, &s.v3 })
             *v = F4{ rf(-3, 3), rf(-3, 3), rf(-3, 3), 0 };
+
+        // A UNIT support direction, so supportLocalQ's mag < FLT_EPS early-out is
+        // never taken and the argmax is always the thing under test.
+        {
+            V3 d{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+            float m2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (m2 < 1e-6f) d = V3{ 1, 0, 0 }, m2 = 1.f;
+            const float inv = 1.f / std::sqrt(m2);
+            s.dir = F4{ d.x * inv, d.y * inv, d.z * inv, 0 };
+        }
+
+        // EXACT TIES IN THE SUPPORT DOT, constructed on purpose (P9.73).  The mirror's
+        // comment calls the strict `>` tie-break load-bearing, and the first sweep
+        // refuted that claim: `support-tie-ge` SURVIVED, because two random vertices
+        // never produce an exactly equal dot.  A tie needs two DISTINCT vertices at
+        // the same projection, i.e. an edge PERPENDICULAR to the query direction --
+        // which is not exotic at all, it is what a flat face against a flat floor
+        // looks like.  So build one: move v1 off v0 along a direction perpendicular to
+        // dir, and the two project identically while staying different points.
+        if (i % 6 == 2)
+        {
+            const V3 d{ s.dir.x, s.dir.y, s.dir.z };
+            // any vector not parallel to d, made perpendicular by Gram-Schmidt
+            V3 t{ 1, 0, 0 };
+            if (std::fabs(d.x) > 0.9f) t = V3{ 0, 1, 0 };
+            const float dt = d.x * t.x + d.y * t.y + d.z * t.z;
+            const V3 perp{ t.x - d.x * dt, t.y - d.y * dt, t.z - d.z * dt };
+            const float pm = std::sqrt(perp.x * perp.x + perp.y * perp.y + perp.z * perp.z);
+            const float k = rf(0.5f, 2.0f) / (pm > 0 ? pm : 1.f);
+            s.v1 = F4{ s.v0.x + perp.x * k, s.v0.y + perp.y * k, s.v0.z + perp.z * k, 0 };
+            ++cTie;
+        }
 
         in[i] = s;
         refBvh(s, ref[i]);
         if (ref[i].marginOut.y != 0) ++cHit; else ++cMiss;
+        // NON-TRIVIALITY GUARD.  The support query only discriminates the fourth
+        // vertex on the cases where v3 IS the argmax; on the other three quarters a
+        // port that dropped it would agree anyway.  Count them, and fail below if the
+        // count is too low to mean anything.
+        if (ref[i].tetSup.x == s.v3.x && ref[i].tetSup.y == s.v3.y &&
+            ref[i].tetSup.z == s.v3.z) ++cV3;
     }
 
-    std::printf("[ info ] bvh cov: ident %zu neg %zu hit %zu miss %zu touch %zu\n",
-                cIdent, cNeg, cHit, cMiss, cTouch);
+    std::printf("[ info ] bvh cov: ident %zu neg %zu hit %zu miss %zu touch %zu v3wins %zu tie %zu\n",
+                cIdent, cNeg, cHit, cMiss, cTouch, cV3, cTie);
+    PXG_CHECK_MSG(cV3 > N / 8, "the fourth tet vertex must win the support query often "
+                  "enough to discriminate (v3 won %zu of %u)", cV3, N);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
