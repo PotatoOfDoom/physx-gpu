@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **853/853** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **854/854** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
 **29 are reachable** from the simulation pipeline.  58 are app-facing features that
@@ -1865,6 +1865,134 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.75 — eine Vorrichtung wählt die Werte, die eine Szene nicht wählen kann: 24 von 25 gegen 9
+
+P9.74 hat sechzehn Mutanten klassifiziert, die seine Szene nicht töten konnte. Sieben
+beweisbar äquivalent **in dieser Szene**, acht echte Änderungen unter ihrer Auflösung,
+einer identisch nur durch Allokator-Zufall. Alle drei Urteile sagen dasselbe: die Szene
+hat **ein** Tuch, **keine** Attachments, **einen** Rigid und einen ruhenden Kontakt — die
+Werte, die diese Mutanten sichtbar machen würden, kann sie nicht wählen.
+
+Eine Vorrichtung ist keine kleinere Szene. Sie ist der Beobachter, der diese Werte
+**wählt**. Das ist dasselbe Argument, das P9.73 gemacht hat, als P9.72s Softbody-Szene
+die vierte Tetraeder-Ecke nicht sehen konnte.
+
+```
+                          Szene (P9.74)      Vorrichtung (P9.75)
+rest-dist-by-pair         SURVIVED (Kl. D)   KILLED
+bary-w-is-one             SURVIVED           KILLED
+bary-of-raw-point         SURVIVED           KILLED
+no-half-penetration       SURVIVED           KILLED
+erp-hack-imported         SURVIVED           KILLED
+cloth-id-zero             SURVIVED (Kl. A)   KILLED (Fault)
+encode-shift-off-by-one   SURVIVED (Kl. A)   KILLED
+filter-or-not-and         SURVIVED (Kl. A)   KILLED
+no-clamp-to-stack         SURVIVED (Kl. A)   KILLED
+stack-size-in-bytes       SURVIVED (Kl. A)   KILLED
+tri-margin-zero           SURVIVED           KILLED
+margin-unfattened         SURVIVED           KILLED
+contact-dist-one-side     SURVIVED           KILLED
+mat-mask-dropped          SURVIVED           KILLED
+contact-by-x-hi-word      SURVIVED (Kl. A)   KILLED
+stride-is-one-block       SURVIVED           SURVIVED
+
+                          9 / 25             24 / 25
+```
+
+Sie fährt die **ausgelieferte** `cvxCoreClothNpBda.spv`, keine Kopie. P9.73 hat
+festgehalten, warum das tragend ist: Phase-1-Vorrichtungen sind per Konvention
+selbstenthaltend und tragen eigene Kopien der geteilten Funktionen, also überleben
+Mutanten im echten Shader sie. Diese synthetisiert die vierzehn Device-Argumente — der
+Convex-Core-Box braucht dafür **nichts** alloziert, weil die Kernparameter in den
+`PxMeshScale`-Bytes reisen — und startet den echten Einstiegspunkt.
+
+### Vier Fälle, jeder für einen Grund, den die anderen nicht abdecken
+
+**A — Fläche auf Fläche, analytisch.** Box mit vollen Ausdehnungen (2,2,2) im Ursprung,
+zwei Dreiecke 0,1 innerhalb der Deckfläche. Die Separation ist **bis zum letzten Term
+herleitbar**:
+
+```
+-( (BOX_TOP_Y - TRI_Y) + triMarginK * (2 + 2*contactDist) )
+= -( 0.1 + 0.001 * 2.04 ) = -0.10204
+```
+
+und genau das schreibt der Kernel. `clothId` ist **3**, beide Worte des Rigid-Node-Index
+sind ungleich null und voneinander verschieden — damit sind die Id, die Shift-Konstante
+und der 64-Bit-Sortierschlüssel beobachtbar. **Eine** der drei Ecken von Dreieck 0 steht
+in der Filterliste, und das ist, was `&&` von `||` trennt.
+
+**B — das Paar kommt Mesh-zuerst**, zwingt `checkTypes`' Tauscharm. Die erste Fassung
+fütterte nur die bequeme Reihenfolge, was heißt: sie behauptet, die bequeme Reihenfolge
+funktioniere.
+
+**C — `stackSizeBytes = 16`**, Platz für **ein** uint4, zwingt die Überlaufklemme. Der
+Schwanz meldet weiterhin die **ungeklemmte** Zahl, denn so lernt die Engine, den Stack zu
+vergrößern.
+
+**D — ein gekipptes Dreieck.** Steht die Normale senkrecht auf dem Dreieck, verschiebt
+`normal * w * 0.5` die Projektion in der Ebene **nicht**, und die Barycentric des rohen
+und des verschobenen Punktes ist dieselbe Zahl — `bary-of-raw-point` ist dort schlicht
+kein anderes Programm. Ein Zähler belegt, dass der Fall nicht entartet ist, statt still
+zu bestehen: **3 von 3** Kontakten haben eine verschiebungs-empfindliche Barycentric.
+
+### Was `no-half-penetration` prüfbar macht, musste gelesen werden
+
+`faceClipQ` liefert bereits den Mittelpunkt zwischen den beiden Flächenprojektionen:
+
+```slang
+polyDists[i] = float4((pr0 + pr1) * 0.5f, dot3Q(axis, pr0 - pr1));
+```
+
+Eine weitere halbe Separation legt den Punkt also **auf** eine der beiden Ebenen — hier
+die Box-Fläche bei y = 1,0, die alle sechs Kontakte treffen. Ohne die Verschiebung bleibt
+0,95, was auf keiner von beiden liegt. Diese Unterscheidung existiert nur, weil hier
+beide Flächen Ebenen sind.
+
+### Drei eigene Fehler, alle von der Messung gefunden
+
+**1. `clothId = 3` bei einem hochgeladenen Deskriptor.** Der Kernel indiziert
+`femClothes[3]`; der erste Lauf segfaultete. Genau das, was eine Szene mit einem Tuch nie
+lehren kann.
+
+**2. `PxAbs(gNP[i].y)` statt des Vorzeichens.** Diese Prüfung pinnte die Achse und war
+gegen die Negation blind — `normal-not-negated` überlebte die Vorrichtung, während die
+**Szene** ihn tötete. Das erwartete Vorzeichen ist hergeleitet, nicht gefittet: das Tuch
+liegt im Inneren der Box, und die Richtung, die es ausstößt, ist +Y.
+
+**3. Der Referenzwert der Separation war falsch, und zwar in die teuerste Richtung.** Ich
+hatte mit `CONTACT_OFF` (einem Shape) aufgebläht statt mit `contactDist` (der Summe), also
+2,02 wo der Kernel 2,04 nimmt. Der Referenzwert saß damit **genau zwischen** dem sauberen
+Wert (−0,10204) und zwei Margin-Mutanten (−0,102 und −0,10202) und duldete beide.
+
+```
+clean              sep -0.10204
+margin-unfattened  sep -0.102       (Differenz 4.0e-5)
+contact-dist-one   sep -0.10202     (Differenz 2.0e-5)
+```
+
+Ein Referenzwert in der Mitte der Mutanten, die er ausschließen soll, besteht — und sie
+bestehen mit. Die Korrektur machte aus drei Überlebenden drei Kills.
+
+Vier Kills kamen zunächst als **Absturz** statt als Prüfmeldung, was nur sagt, dass etwas
+kaputt ging. Ein Null-Kontakt-Wächter macht zwei davon zu benannten Fehlern; die anderen
+zwei faulten im Kernel selbst.
+
+### Der eine Überlebende
+
+`stride-is-one-block` ist äquivalent **für jedes Dispatch**, solange
+`numPairs ≤ 32 < 512 ≤` beide Schrittweiten: jeder Thread läuft genau eine Iteration, bei
+seinem eigenen `dtid.x`. Um ihn zu töten, bräuchte es über 16 384 Midphase-Paare. Was ihn
+hält, ist `check_grid_stride.py`, nicht diese Messung — und das ist als Grenze benannt,
+nicht als Erfolg verbucht.
+
+### Stand
+
+Suite **854/854 in beiden Speichermodi** (853 → 854: die Vorrichtung bekommt einen eigenen
+ctest-Eintrag, damit sie für sich sweepbar ist). Szenen **48/48**, alle vierzehn Prüfer
+grün. Manifest unverändert **409/501** — diese Tranche fügt keinen Kernel hinzu, sondern
+Beweiskraft für einen bereits gemappten.
 
 ## P9.74 — `convexCoreClothmeshNphase_Kernel32`, und ein Sweep, der die Szene widerlegt hat statt den Port
 
