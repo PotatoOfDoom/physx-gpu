@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **853/853** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
 **29 are reachable** from the simulation pipeline.  58 are app-facing features that
@@ -27,11 +27,12 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **404/501** kernels mapped (P9.66b filled SPHERE_TRIMESH_CORE).
-Of the 97 unmapped, **28 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **409/501** kernels mapped (P9.74 filled the last of the five convexCore*Nphase
+kernels, CONVEXCORE_CLOTHMESH_KERNEL32_MAIN).
+Of the 92 unmapped, **23 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
 are orphans — so "403/501" understates coverage of what this build can actually run.
-Scenes: **43/43** -- P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
+Scenes: **48/48** -- P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
 until P9.66b mapped sphereTrimeshNarrowphase; both now rest at y = 0.5000, the same
 number the `meshfloor` box control gives over the same floor.
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
@@ -1864,6 +1865,207 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.74 — `convexCoreClothmeshNphase_Kernel32`, und ein Sweep, der die Szene widerlegt hat statt den Port
+
+Der fünfte und letzte `convexCore*Nphase`-Kernel ist die **dritte** eigenständige Bauform
+der Familie. Der Name ist der einzige Grund, ihn für ein Geschwister der Trimesh- oder
+Tetmesh-Variante zu halten.
+
+### Was ihn von seinen vier Namensvettern trennt
+
+**Er traversiert überhaupt keinen BVH.** Alle anderen bauen eine Anfragebox und laufen
+`bv32TreeTraversal`. Dieser ist ein **Midphase-Paar-Konsument**:
+`cloth_midphaseGeneratePairsLaunch` lief schon auf demselben Stream
+(`PxgNarrowphaseCore.cpp:1143`) und hat `(cmIndex, triIndex)`-Paare auf dem Stack
+hinterlassen. Kein Knotenstapel, kein Ballot, kein `groupshared`, keine
+Kommunikation über Lanes hinweg — das einzige rein threadlokale Mitglied der Familie.
+`TrimeshBvh` wird trotzdem gebaut, aber nur `getTriIndices`, `createConvex` und
+`getTriBarycentric` sind von hier erreichbar.
+
+**Das Gitter ist fest und flach:** 32 Blöcke × 512 Threads, beides Literale am
+Startort (`PxgNarrowphaseCore.cpp:1186-1187`), mit Grid-Stride-Schleife über `numPairs`.
+
+**Die ABI-Zeile ist eine dritte, eigene**, 176 Byte, und teilt sich mit keiner der
+beiden bestehenden. Nicht `kCvxCorePlane` (136): vierzehn Argumente statt achtzehn,
+endend in einem Struct statt drei `PxU32`. Auch nicht `kCvxCoreTet` (144), obwohl beide
+im selben 80-Byte-`PxgFEMContactWriter` enden: dieser beginnt mit dem Midphase-Stackzeiger
+und seiner Paarzahl statt mit einem `numTests`-Skalar und trägt `filterPairs`,
+`nbFilterPairs`, `stackSizeBytes` und `stackSizeNeededOnDevice`, die der Tetmesh-Kernel
+gar nicht nimmt. `check_launch_abi.py` prüft nur, **dass** eine Zeile existiert; dass die
+176 Byte stimmen, beweist allein die bewegte Szene — der Shim vergleicht den Blob exakt
+und weist eine falsche Zeile lautlos ab (P9.48d).
+
+**Drei Unterschiede zum Tetmesh-Kernel, die einzeln stumm gewesen wären:**
+
+| | Tetmesh (P9.72) | Clothmesh (P9.74) |
+|---|---|---|
+| ERP-Hack | `if (d < 0) d *= 0.4f` (`:1184`) | **fehlt**, `dists[i]` roh (`:1269`) |
+| Kontaktschreiber | `...NoBarycentric` | **mit** Barycentric (`:1270-1272`) |
+| Index-Kodierung | `PXG_BITSHIFT_TET_ID` | `PXG_BITSHIFT_ELEMENT_ID` |
+
+Beide Shift-Konstanten sind heute 20 (`PxgSimulationCoreDesc.h:40-41`) — genau deshalb ist
+jede aus ihrer eigenen Zeile geschrieben. Und der Filter ist ein `&&`-Dreifachtest, kein
+`||`: ein Paar wird nur übersprungen, wenn **alle drei** Dreiecksecken gegen diesen Rigid
+gefiltert sind.
+
+### Die Frage, an der der ganze Port hing — geprüft, nicht angenommen
+
+`TrimeshBvh(const PxgFEMCloth&)` (`convexCoreCollision.cu:611-618`) setzt drei Member und
+sagt **nichts** über `scale` — während dieser Kernel `createConvex` und
+`getTriBarycentric` aufruft, die beide `scale.toMat33()` benutzen. Das liest sich wie
+uninitialisierter Speicher.
+
+Ist es nicht. `PxMeshScale` hat einen benutzerdefinierten Default-Konstruktor:
+
+```cpp
+PX_CUDA_CALLABLE PX_FORCE_INLINE PxMeshScale(): scale(1.0f), rotation(PxIdentity) {}
+                                                            // PxMeshScale.h:71
+```
+
+Ein Member von Klassentyp mit benutzerdefiniertem Default-Konstruktor wird bei
+Default-Initialisierung des umschließenden Objekts **konstruiert**. Der Wert ist
+deterministisch Identität, die CUDA wohldefiniert — **kein** Upstream-Bug-Kandidat. Der
+Port schreibt die Identität aus, statt die Transformation wegzulassen, damit beide
+Aufrufstellen in Deckung bleiben, falls ein Tuch je eine Skalierung trägt.
+
+### Der Sweep hat nicht den Port geprüft, sondern die Szene widerlegt
+
+Erster Durchlauf: **7 von 25**. Das las sich wie ein schwacher Port. Es war ein schwacher
+**Beobachter**, und wie das herauskam ist der Kern dieser Tranche.
+
+Statt die Überlebenden als szenenbedingt äquivalent abzulegen, wurde der lauteste von Hand
+reproduziert. `pair-uses-w-not-y` tauscht `testPair.y` gegen `testPair.w`, und die Midphase
+schreibt `make_uint4(cmIdx, primitiveIndex, 0, 0)` (`femClothMidPhase.cu:98`; der Slang-Port
+stimmt überein, `femClothContactGenBda.slang:1087`). `.w` ist also **null** und jeder Kontakt
+fällt auf Dreieck 0 zusammen:
+
+```
+            mean y     |dy| (letzte 60 Schritte)
+sauber      0.0161     0.000000
+Mutant     -0.8662     0.005865
+```
+
+Das Tuch sinkt fast einen Meter **in** einen Boden, dessen Deckfläche bei y = 0 liegt, und
+das Urteil hat es durchgewinkt. Beide Schranken — `yEnd > -2.0f` und `maxSettleStep < 1e-2f`
+— stammen aus `clothbox`, wo +0,69 gegen −73,81 zu unterscheiden war. Ein Faktor hundert;
+da sind sie großzügig und trotzdem entscheidend. Über diesem Boden entscheiden sie nichts.
+Das ist P9.20s Fehler an neuer Stelle: grün aus einem anderen Grund als dem behaupteten.
+
+Die neuen Schranken sind **aus der Geometrie abgeleitet, nicht auf den Mutanten gefittet**.
+`PxConvexCore::Box` nimmt volle Ausdehnungen, 8 × 1 × 8 um y = −0,5 spannt also y ∈ [−1, 0]
+mit Deckfläche exakt bei 0. Ein von dieser Fläche gehaltenes Tuch ruht bei
++contactOffset (gemessen 0,0161); bei −0,10 ist es bereits **in** der Box, was keine
+korrekte Kontaktmenge erzeugt. Settle-Schranke 2e-3 gegen einen sauberen Lauf, der
+vollständig still steht. Die anderen drei Böden behalten die alten Schranken — sie auf die
+Messung einer dritten Szene hin zu ändern wäre genau das Fitten, das hier vermieden wird.
+
+Zweiter Durchlauf gegen den geschärften Beobachter: **9 von 25**. Die zwei zusätzlichen
+Kills sind die substanziellen — `bary-uvw-rotated` (Impuls auf die falschen Dreiecksecken)
+und `pair-uses-w-not-y`.
+
+### Die sechzehn Überlebenden, klassifiziert statt entschuldigt
+
+Jeder wurde einer von vier Klassen zugeordnet, mit Beleg aus dem Quelltext, und jede
+Zuordnung wurde anschließend adversarisch angegriffen.
+
+**Klasse A — beweisbar äquivalent in dieser Szene (7).** Der mutierte Ausdruck liefert
+bitgleiche Werte.
+
+| Mutant | Warum |
+|---|---|
+| `cloth-id-zero` | `clothId == 0`: `mFEMClothIdPool` ist der einzige Allokator (`PxgBodySimManager.cpp:627`), `IDPoolBase()` startet bei 0 (`CmIDPool.h:46,64-75`), genau eine Fläche (`testGpuSdkStep.cpp:2711`) |
+| `encode-shift-off-by-one` | `0 << 20 == 0 << 21` |
+| `filter-or-not-and` | `nbFilterPairs == 0`: einzige Zuweisung `PxgSimulationCore.cpp:2020` in `if (dirtyRigidAttachments)`, und **beide** Zweige liefern 0 |
+| `no-clamp-to-stack`, `stack-size-in-bytes` | 32 Paare gegen einen 4-MiB-Stack |
+| `stride-is-one-block` | `numPairs ≤ 32 < 512 ≤` beide Schrittweiten, also **eine** Iteration je Thread — unabhängig von der Gittergröße |
+| `contact-by-x-hi-word` | ein einziger distinkter Sortierschlüssel: alle Elemente in einen Digit-Bucket, Basis-Offset 0, Ränge identisch — **ohne** Stabilitätsannahme |
+
+**Klasse B — echte Verhaltensänderung, unter der Auflösung der Szene (8).**
+`bary-of-raw-point`, `no-half-penetration`, `erp-hack-imported`, `tri-margin-zero`,
+`margin-unfattened`, `contact-dist-one-side`, `bary-w-is-one`, `mat-mask-dropped`.
+
+**Klasse C — toter Konsument: null.** Das ist ein eigenständiger Befund. Jedes Feld, das
+dieser Kernel schreibt, wird von einem **gemappten** Kernel gelesen; die Manifest-Zeilen
+sind einzeln nachgeschlagen (`:419`, `:428`, `:429`, `:441`, `:442`, `:195`, `:197`).
+Nichts hier ist im Leerlauf.
+
+Zwei Klasse-B-Fälle verdienen es, benannt zu werden, weil sie *knapp* keine Kills sind:
+
+*`bary-w-is-one`* — die vierte Barycentric-Komponente ist **kein freies Wort, sondern ein
+Modusschalter**: `if (bc.w == 0.f) // Cloth triangle` gegen `else // Cloth vertex`
+(`FEMClothExternalSolve.cu:375,391,501`; `deformableUtils.cuh:501,549,568`; Slang-Port
+`femClothRigidContactBda.slang:282,425`). Eine bestehende Vorrichtung pinnt die
+Gegenrichtung bereits fest: `testFemClothSim.cpp:2401`
+`cmpF4("outBarycentric", F4{0,0,0,1}, gBary)` behauptet w == 1 für den Vertex-Pfad. Der
+Mutant lässt also den **Dreiecks**-Generator die Vertex-Kodierung schreiben, und
+`elementId` (ein Dreiecksindex bis 31) landet dann in `mDeltaPos`, das genau `numVerts` = 25
+Elemente hat (`PxgSimulationCore.cpp:1780`) — die einzige Schranke ist
+`PX_MAX_NB_DEFORMABLE_SURFACE_TRI` = 0x000fffff (`PxDeformableSurface.h:56`). Indizes 25..31
+schreiben über das Ende hinaus. Die Szene sieht es nicht.
+
+*`mat-mask-dropped`* — setzt Bit 31, also `markInCollision(true)` statt `false`. Dass das
+nicht in einen wilden Materialtabellen-Zugriff läuft, hängt an **einer** Zeile:
+`getRigidMaterialIndex()` maskiert das Flag heraus (`PxgFEMCore.h:160`), bevor
+`&rigidBodyMaterials[...]` gebildet wird (`FEMClothExternalSolve.cu:506`). Ohne diese
+Maskierung wäre der Mutant ein sicherer Kill statt eines Überlebenden.
+
+**Klasse D — beobachtungsgleich durch Allokator-Zufall, nicht durch Konstruktion (1).**
+
+`rest-dist-by-pair` liest `restDistance[pairIndex]` statt `[cmIndex]`. In dieser Szene ist
+`cmIndex` immer 0 und `pairIndex` läuft 0..31, der Mutant liest also **124 Byte über das
+Ende einer 4-Byte-Allokation hinaus**. Er faultet nur deshalb nicht, weil der
+GPU-Buddy-Allokator eine 128-Byte-Mindestklasse hat
+(`PxgHeapMemoryAllocator.cpp:196,204,301-303`) — exakt 32 floats. Gemessen, dreimal
+hintereinander:
+
+```
+mean y 0.0161   lowest 0.0133   |dy| 0.000000     (dreimal identisch, = sauberer Lauf)
+```
+
+Die Slots 1..31 lesen als 0.0f zurück, und `restDistance[0]` ist ebenfalls 0.0f
+(`ScShapeCore.cpp:181` `mRestOffset = 0.0f`, kein `setRestOffset` in diesem Szenenarm).
+Beobachtungsgleich — aber aus keinem Grund, den der Quelltext garantiert. Ein Tuch mit 33
+Dreiecken bricht es.
+
+**Ein vorgeschlagener Versuch, der die Prüfung nicht überstanden hat.** Die
+Verifikationsstufe schlug vor, mit `PX_STOMP_ALLOCATED_MEMORY = 1` zu bauen, damit der Slot
+deterministisch 0xcd wird. Das funktioniert nicht: `PxgCudaBuffer.cpp:81` memset genau
+`mSize`, die **angeforderte** Größe (4 Byte), nicht den 128-Byte-Slot. Der Vorschlag war
+plausibel und falsch; nachgelesen statt übernommen.
+
+### Zwei eigene Fehler in dieser Tranche
+
+**1. Ich habe einen Mutanten committet.** `3979368` entstand, während der Sweep lief, und
+`run_scene_mutation_sweep.sh` mutiert die Quelle **an Ort und Stelle**. `git add -A` griff
+zu, während `rest-dist-by-pair` angewandt war. Die stehende Regel lautete „nie bauen,
+während eine Messung läuft". Sie ist zu schwach: ein Sweep konkurriert nicht bloß um die
+Maschine, er **schreibt den Baum um**, und der Fehlermodus ist kein wackliges Messergebnis,
+sondern ein committeter Defekt, den jeder spätere Leser als Absicht erbt. Die Regel lautet
+jetzt **nie committen**, und wenn ein Commit nicht warten kann: den pristinen Blob über
+`git hash-object -w` + `git update-index --cacheinfo` in den **Index** legen statt über den
+Arbeitsbaum. So ist `f15df9c` entstanden.
+
+Dass dieser Mutant ausgerechnet der einzige Klasse-D-Fall ist, ist die Pointe: ich hatte
+einen Out-of-Bounds-Zugriff eingecheckt, den **kein** Beobachter dieses Baums gesehen hätte.
+
+**2. Quelle wiederhergestellt, Shader nicht neu gebaut.** Die erste Verifikation nach der
+Wiederherstellung lief gegen die mutierte `.spv`. Genau die Falle, die der Sweep-Header seit
+P9.9 dokumentiert („zweimal gebissen"). Sofort aufgefallen, weil das Ergebnis rot war — was
+zeigt, dass der geschärfte Beobachter sofort gearbeitet hat.
+
+### Stand
+
+Suite **853/853 in beiden Speichermodi**, Szenen **48/48**, alle vierzehn Prüfer grün.
+Manifest **409/501** — `convexCoreClothmeshNphase_Kernel32` ist gemappt, und damit sind
+**alle fünf** `convexCore*Nphase`-Kernel auf Vulkan. Motor-erreichbare ungemappte Kernel:
+**23**.
+
+Zwei Deckungsgrenzen, die diese Szene strukturell nicht schließen kann und die deshalb
+benannt statt verschwiegen werden: die Grid-Stride-Schleife (≈32 Paare gegen 16 384
+Threads, also nie mehr als eine Iteration — was sie hält, ist `check_grid_stride.py`, nicht
+die Messung) und der Filter (`nbFilterPairs` = 0, `&&` und `||` sind ununterscheidbar).
+Beides braucht eine Vorrichtung oder eine zweite Szene, nicht eine härtere Fassung dieser.
 
 ## P9.73 — die vierte Tetraeder-Ecke, jetzt belegt statt nur treu
 
