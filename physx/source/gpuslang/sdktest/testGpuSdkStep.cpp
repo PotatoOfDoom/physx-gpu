@@ -2567,7 +2567,7 @@ struct ClothScene
 // WIRING, which is the part no fixture can reach.
 ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                            PxCudaContextManager* cudaCtx, bool convexFloor = false,
-                           bool meshFloor = false)
+                           bool meshFloor = false, bool coreFloor = false)
 {
     ClothScene out;
     out.cudaCtx = cudaCtx;
@@ -2577,7 +2577,42 @@ ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigid
     // rigidSumInternalContactAndJointBatches2 null-derefs the solver descriptors
     // with zero dynamic rigids, so one live dynamic body is required to keep that
     // proven path valid.  It rests at y=0.5, well below the cloth (spawned y~5).
-    if (meshFloor)
+    if (coreFloor)
+    {
+        // P9.74: a CONVEX CORE box floor, the FOURTH shape this cloth can land on and
+        // the only one whose pair routes to GPU_BUCKET_ID::eConvexCoreClothmesh, i.e.
+        // to convexCoreClothmeshNphase_Kernel32.  cndCaseConvexCoreTrimesh branches
+        // there when the second shape is NOT rigid
+        // (PxgNphaseImplementationContext.cpp:975-982) -- a cloth's collision shape is
+        // a TRIANGLE mesh, which is why the tetmesh kernel is not the one this reaches.
+        //
+        // PxConvexCore::Box takes FULL extents, so 8 x 1 x 8 centred at y = -0.5 puts
+        // the top face at y = 0 -- the same floor height as the box, the cooked convex
+        // slab and the cooked triangle mesh, so the settle number is comparable with
+        // all three.
+        //
+        // NO 100:1 PROBLEM HERE, unlike the cooked convex slab above: a convex CORE is
+        // an analytic box, not a cooked hull, so there is no cooker to refuse it for
+        // being oblong.  The 16 full extents are chosen to match the mesh floor's
+        // reach rather than to appease a cooker.
+        //
+        // *** THIS FLOOR IS EXPECTED TO FAIL UNTIL convexCoreClothmeshNphase_Kernel32
+        // IS MAPPED. ***  Measured before the port, all four floors of this scene:
+        //
+        //   clothbox       mean y =   0.6888   the box path
+        //   clothconvex    mean y =  -0.0000   the cooked-hull path
+        //   clothmesh      mean y = -39.5445   known red, an upstream defect
+        //                                      (femClothPrimitives.cu:3056), documented
+        //   clothcvxcore   mean y = -73.8069   falls through, and the bridge reports
+        //                                      the kernel launched 10x and SKIPPED
+        PxRigidStatic* coreGround = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+        PxShape* cs = physics->createShape(
+            PxConvexCoreGeometry(PxConvexCore::Box(PxVec3(16.0f, 1.0f, 16.0f))), *rigidMat);
+        coreGround->attachShape(*cs);
+        scene->addActor(*coreGround);
+        cs->release();
+    }
+    else if (meshFloor)
     {
         // P9.26: a cooked TRIANGLE MESH floor.  The narrowphase routes
         // eTRIANGLEMESH x the cloth to the cloth-vs-mesh chain, of which only the
@@ -2605,13 +2640,21 @@ ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigid
     // clear of the 2 x 2 cloth: it is a BOX, and a box under the cloth is served
     // by the already-mapped box path, which would carry the cloth and hide
     // whatever the convex path does or does not do.
-    // The live dynamic body is moved aside for BOTH non-box floors, for the
+    // The live dynamic body is moved aside for EVERY non-box floor, for the
     // reason P9.20 measured: it is a PxBoxGeometry, so a box under the cloth is
     // served by the already-mapped box path and would carry the cloth whatever
     // the floor does.
+    //
+    // P9.74 ADDED coreFloor TO THIS CONDITION AFTER WALKING INTO IT.  The first
+    // version of the convex-core arm left it out, and `clothcvxcore` came up GREEN
+    // at mean y = 0.6870 -- within 0.002 of `clothbox`'s 0.6888 -- while the bridge
+    // was printing that convexCoreClothmeshNphase_Kernel32 had been launched twice
+    // and SKIPPED both times.  The cloth was landing on this dynamic box, through
+    // the mapped box path, exactly as the paragraph above says it would.  The
+    // warning was already written; it just was not read.
     addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
                boxInertia(PxVec3(0.5f), 1000.0f), 1.5f,
-               (convexFloor || meshFloor) ? 3.0f : 0.0f);
+               (convexFloor || meshFloor || coreFloor) ? 3.0f : 0.0f);
 
     // Cook a small triangle GRID mesh.  buildGPUData + eENABLE_VERT_MAPPING are
     // MANDATORY: attachShape rejects a mesh whose getNbTriangleReferences()==0
@@ -6394,7 +6437,7 @@ int main()
     // The bar therefore sits at -2.0: four times the resting height and a
     // thirty-seventh of the free-fall figure.
     if (!std::strcmp(sceneName, "clothbox") || !std::strcmp(sceneName, "clothconvex") ||
-        !std::strcmp(sceneName, "clothmesh"))
+        !std::strcmp(sceneName, "clothmesh") || !std::strcmp(sceneName, "clothcvxcore"))
     {
         // `clothconvex` is `clothbox` with the ground BOX replaced by a cooked
         // CONVEX slab at the same height -- see buildClothScene.  It shares every
@@ -6402,8 +6445,9 @@ int main()
         // names, so anything that differs would be the routing or the manifest.
         const bool convexFloor = !std::strcmp(sceneName, "clothconvex");
         const bool meshFloor = !std::strcmp(sceneName, "clothmesh");
+        const bool coreFloor = !std::strcmp(sceneName, "clothcvxcore");
         ClothScene csc = buildClothScene(physics, scene, material, cudaCtx, convexFloor,
-                                         meshFloor);
+                                         meshFloor, coreFloor);
         if (!csc.surface || csc.numVerts == 0)
         {
             std::printf("[ FAIL ] gpu-sdk-step: %s scene build failed\n", sceneName);
@@ -6411,7 +6455,9 @@ int main()
         }
         std::printf("  [  OK  ] scene '%s' built: %u-vertex FEMCloth dropped onto the ground %s\n",
                     sceneName, csc.numVerts,
-                    meshFloor ? "cooked triangle mesh" : (convexFloor ? "convex slab" : "box"));
+                    coreFloor ? "convex CORE box"
+                              : (meshFloor ? "cooked triangle mesh"
+                                           : (convexFloor ? "convex slab" : "box")));
         if (!std::getenv("PXG_GPU_STEP"))
         {
             std::printf("[  OK  ] gpu-sdk-step: clothbox pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
