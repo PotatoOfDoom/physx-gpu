@@ -432,7 +432,7 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
         // restDist = restDistance ? restDistance[testIndex] : 0 (:94).  The index is
         // the CONTACT MANAGER index, not the pair index -- restDistance is per contact
         // manager, and the TestInput ctor is handed cmIndex (:1229).
-        const float restDist = Ptr<float>(gCloth.restDistance)[pairIndex];
+        const float restDist = Ptr<float>(gCloth.restDistance)[cmIndex];
 
         // transform0in1 = transform1.transformInv(transform0) (:1241).
         const float4 conjQ1 = float4(-q1.x, -q1.y, -q1.z, q1.w);

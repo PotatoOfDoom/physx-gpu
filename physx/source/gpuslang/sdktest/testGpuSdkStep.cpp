@@ -6499,9 +6499,47 @@ int main()
         // That is more constraints chattering, not a fall -- a falling cloth moves
         // 0.65 per step, three hundred times more.  The bar is 0.01: sixty-five times
         // below a fall and five times above the observed jitter.
-        if (!(maxSettleStep < 1e-2f))
+        //
+        // P9.74 GAVE THE CONVEX-CORE ARM ITS OWN TWO BARS, AND THE REASON IS A
+        // MEASUREMENT, NOT A PREFERENCE.
+        //
+        // Both bars above were calibrated for `clothbox`, where the distinction the
+        // scene had to draw was +0.69 against -73.81 -- a factor of a hundred, so
+        // `> -2.0` and `< 1e-2` were generous and still decisive.  Over the convex-core
+        // floor they are not decisive at all, and P9.74's mutation sweep is what said
+        // so out loud.  The mutant `pair-uses-w-not-y` -- `testPair.w` instead of
+        // `testPair.y`, and the midphase writes uint4(cmIdx, primIndex, 0, 0)
+        // (femClothMidPhase.cu:98), so EVERY pair collapses onto triangle 0 -- was
+        // reported SURVIVED.  Run by hand it gives:
+        //
+        //     clean    mean y  0.0161   |dy| 0.000000
+        //     mutant   mean y -0.8662   |dy| 0.005865
+        //
+        // The scene MOVED, by most of a metre, and the verdict swallowed it: -0.8662
+        // clears -2.0 and 0.005865 clears 1e-2.  That is the P9.20 failure again in a
+        // new place -- green for a reason that is not the reason claimed -- and the
+        // answer is the same one P9.71 used: sharpen the observer rather than write a
+        // paragraph excusing the survivor.
+        //
+        // THE NEW BARS ARE DERIVED FROM THE GEOMETRY, not fitted to the mutant.
+        // PxConvexCore::Box takes FULL extents, so 8 x 1 x 8 centred at y = -0.5 spans
+        // y in [-1, 0] and its TOP FACE IS AT y = 0 exactly.  A cloth held BY that face
+        // rests at +contactOffset; measured 0.0161.  A cloth at -0.10 is already inside
+        // the box, which no correct contact set produces -- so -0.10 is where "resting
+        // on the floor" stops being true, about six times the clean run's own distance
+        // from zero and eight times below the mutant.  The settle bar is 2e-3: the
+        // clean run goes fully still (0.000000), and 2e-3 still leaves three times the
+        // margin against the mutant's residual chatter.
+        //
+        // The other three floors keep the old bars.  Their top faces are at y = 0 too,
+        // but `clothbox`'s settled |dy| is 0.0020 (P9.15d's limit cycle) and
+        // `clothmesh` is a known-red upstream defect at -39.54; tightening those here
+        // would be changing two unrelated scenes on the strength of a third scene's
+        // measurement.
+        const float settleBar = coreFloor ? 2e-3f : 1e-2f;
+        if (!(maxSettleStep < settleBar))
         { std::printf("FAIL: the cloth is still moving %.6f per step at the end of the run -- "
-                      "it never came to rest\n", maxSettleStep); ++failures; }
+                      "it never came to rest (bar %.4f)\n", maxSettleStep, settleBar); ++failures; }
         // 2. IT STOPPED ON THE GROUND, not somewhere below it.  -73.81 was measured
         //    with cloth_boxVertexContactGenLaunch unmapped, in this same scene.
         //
@@ -6511,9 +6549,18 @@ int main()
         //    and it falls anyway because cloth_meshVertexContactGenLaunch is switched
         //    off upstream -- a message pointing at an unmapped box kernel would send
         //    the next reader looking for work that is already done.
-        if (!(yEnd > -2.0f))
+        const float restBar = coreFloor ? -0.10f : -2.0f;
+        if (!(yEnd > restBar))
         {
-            if (meshFloor)
+            if (coreFloor)
+                std::printf("FAIL: the cloth came to rest at y = %.4f -- it is INSIDE the convex "
+                            "core box, whose top face is at y = 0 (need > %.2f; the clean run "
+                            "gives 0.0161, and -73.81 was measured with "
+                            "convexCoreClothmeshNphase_Kernel32 unmapped).  A cloth that sinks "
+                            "into the floor instead of through it means the contacts exist but "
+                            "are wrong -- wrong triangle, wrong barycentric, or wrong "
+                            "penetration depth\n", yEnd, restBar);
+            else if (meshFloor)
                 std::printf("FAIL: the cloth came to rest at y = %.4f -- it fell through the "
                             "cooked triangle mesh (need > -2.0).  EXPECTED, and not this "
                             "port's doing: the chain is fully mapped, but "
