@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 408;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 409;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -79,7 +79,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexCoreConvexNphase_Kernel", "cvxCoreCvxNpBda.spv", "convexCoreConvexNphase_Kernel" },  // CONVEXCORE_CONVEX_KERNEL_MAIN
     { "convexCoreTrimeshNphase_Kernel32", "cvxCoreTriNpBda.spv", "convexCoreTrimeshNphase_Kernel32" },  // CONVEXCORE_TRIMESH_KERNEL32_MAIN
     { "convexCoreTetmeshNphase_Kernel32", "cvxCoreTetNpBda.spv", "convexCoreTetmeshNphase_Kernel32" },  // CONVEXCORE_TETMESH_KERNEL32_MAIN
-    { "convexCoreClothmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_CLOTHMESH_KERNEL32_MAIN (unmapped)
+    { "convexCoreClothmeshNphase_Kernel32", "cvxCoreClothNpBda.spv", "convexCoreClothmeshNphase_Kernel32" },  // CONVEXCORE_CLOTHMESH_KERNEL32_MAIN
     { "convexConvexNphase_stage1Kernel", "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel" },  // CONVEX_CONVEX_KERNEL_EARLY_OUT
     { "convexConvexNphase_stage2Kernel", "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel" },  // CONVEX_CONVEX_KERNEL_MAIN
     { "removeContactManagers_Stage5_CvxTri", "npPairMgmtBda.spv", "removeContactManagers_Stage5_CvxTri" },  // REMOVE_CONTACT_MANAGERS_5_CVXTRI (P8.37 BDA re-point)

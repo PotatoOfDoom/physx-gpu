@@ -1438,6 +1438,11 @@ static const uint8_t kCvxCorePlane[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
 // convexCoreTetmeshNphase_Kernel32: numTests(4), seven pointers, an 80-byte writer.
 static const uint8_t kCvxCoreTet[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
+// convexCoreClothmeshNphase_Kernel32: ten pointers, two PxU32, one pointer, an
+// 80-byte writer.  A THIRD distinct convex-core row -- see the note at its kRows
+// entry for why neither of the two above fits.
+static const uint8_t kCvxCoreCloth[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 80 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
@@ -1487,6 +1492,20 @@ static const PxgKernelAbiRow kRows[] = {
     // tests/testFemClothSdfCg.cpp:140).  numTests 4 @0, seven pointers @8..@56, the
     // writer at @64 (already 16-aligned, so paramAlign moves nothing) -> 144 bytes.
     { "convexCoreTetmeshNphase_Kernel32", kCvxCoreTet, uint32_t(sizeof(kCvxCoreTet)) },
+    // P9.74: convexCoreClothmeshNphase_Kernel32 (convexCoreCollision.cu:1196-1210)
+    // shares NEITHER row, and both near-misses are worth naming because either would
+    // have been silent.  It is not kCvxCorePlane (136 B): it has fourteen arguments,
+    // not eighteen, and ends in a struct rather than three PxU32.  It is not
+    // kCvxCoreTet (144 B) either, even though both end in the same 80-byte
+    // PxgFEMContactWriter: this one leads with the midphase stack pointer and its
+    // pair count instead of a numTests scalar, and carries filterPairs + nbFilterPairs
+    // + stackSizeBytes + stackSizeNeededOnDevice that the tetmesh kernel does not
+    // take at all.
+    //   ten pointers @0..@72, nbFilterPairs 4 @80, stackSizeBytes 4 @84,
+    //   stackSizeNeededOnDevice @88, the writer at @96 (8-aligned, paramAlign moves
+    //   nothing) -> 176 bytes.
+    // Verified argument by argument against PxgNarrowphaseCore.cpp:1167-1183.
+    { "convexCoreClothmeshNphase_Kernel32", kCvxCoreCloth, uint32_t(sizeof(kCvxCoreCloth)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

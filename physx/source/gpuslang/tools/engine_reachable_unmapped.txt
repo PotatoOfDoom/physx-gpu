@@ -37,7 +37,12 @@
 # convex-core collision against every geometry, sphere/trimesh, trimesh/plane,
 # trimesh/heightfield, triangle-triangle, softbody/heightfield.  A scene can watch
 # every one of these, which is what this project's method depends on.
-convexCoreClothmeshNphase_Kernel32
+# convexCoreClothmeshNphase_Kernel32 -- MAPPED in P9.74 (cvxCoreClothNpBda.spv).  The
+# LAST of the five, and the third distinct shape among them: a midphase-pair consumer
+# with no BVH traversal at all, a fixed 32x512 grid with a grid-stride loop, a triple
+# `&&` vertex filter, and a contact write WITH barycentric.  Its 176-byte ABI row is
+# shared with neither of the other two convex-core rows.  Observed by
+# PXG_SCENE=clothcvxcore.
 # convexCoreConvexNphase_Kernel -- mapped in P9.69c (cvxCoreCvxNpBda)
 # convexCorePlaneNphase_Kernel -- MAPPED in P9.67c (cvxCorePlaneNpBda.spv), the
 # first of the five.  PXG_SCENE=convexcoreplane went from final y=-73.807 to
