@@ -7,7 +7,10 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **854/854** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **855/855** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.77 added `gpuslang.launchAbiPack`, the FIFTEENTH static checker, and P9.76c added
+`softBodySimRigidAttachSolveTGS` inside the existing `gpuslang.softBodySim` case — a
+fixture, not a new ctest row, which is why the count moved by one and not by two.
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
 **29 are reachable** from the simulation pipeline.  58 are app-facing features that
@@ -32,7 +35,10 @@ kernels, CONVEXCORE_CLOTHMESH_KERNEL32_MAIN).
 Of the 92 unmapped, **23 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
 are orphans — so "403/501" understates coverage of what this build can actually run.
-Scenes: **48/48** -- P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
+Scenes: **49/49** -- P9.76c moved `softbodyhang` out of the pending-work list into the
+scored one: the FEM volume now hangs from its world pins at mean y = 4.4969 and stays
+there, after three measurements that each named a different defect (see P9.76c).
+P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
 until P9.66b mapped sphereTrimeshNarrowphase; both now rest at y = 0.5000, the same
 number the `meshfloor` box control gives over the same floor.
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
@@ -1865,6 +1871,121 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.76c — der TGS-Einstieg rechnete die PGS-Formel, und `softbodyhang` wird gewertet
+
+### Drei Messungen, und erst die dritte ist Physik
+
+`softbodyhang` ist die einzige Szene in diesem Baum, die die Softbody-gegen-**Rigid**-
+Anhangskette überhaupt erreicht. Ihre drei Zahlen sind die ganze Kette P9.76b → P9.76c:
+
+```
+ABI-Zeile 72 Byte, Kernel ABGEWIESEN        4.5000 -> -6.6589   (das Volumen fällt von seinen Pins)
+ABI-Zeile 80 Byte, Kernel rechnet PGS       4.5000 -> NaN       (ein ZWEITER Defekt, freigelegt)
+ABI-Zeile 80 Byte, Kernel rechnet TGS       4.5000 ->  4.4969   (es hängt, und bleibt hängen)
+```
+
+Die dritte Zeile ist stabil: Schritt 60 erreicht 4.49688 und Schritt 179 steht auf
+derselben Ziffer. **`softbodyhang` ist damit aus der Pending-Work-Liste in die gewertete
+`SCENES`-Liste gewandert — das war der Liefergegenstand dieser Tranche.** Szenen: 48 → 49.
+
+### Was der TGS-Arm wirklich rechnet
+
+`calculateAttachmentDeltaImpulseTGS` (`attachments.cuh:147-200`) ist **keine Variante**
+des PGS-Zwillings, sondern eine andere Gleichung. Vier Unterschiede, und der Port hatte
+keinen davon:
+
+1. **Ein anderer Puffer.** PGS mischt die Geschwindigkeit (`mSimVelocity_InvMass`,
+   `softBodyGM.cu:2125`), TGS den akkumulierten **Positions**-Delta (`mSimDeltaPos`,
+   `:2251`). Alles Weitere folgt daraus: ein TGS-„Fehler" ist ein Positionsfehler.
+2. **Eine dritte Zeile im Velocity-Pool.** `readVelocitiesTGS`
+   (`dataReadWriteHelper.cuh:144-151`) entpackt **vier** Vektoren aus **drei** `float4`,
+   über die Zeilengrenzen hinweg: `linDelta = (v1.z, v1.w, v2.x)`,
+   `angDelta = (v2.y, v2.z, v2.w)`. Der Port las zwei Zeilen, also waren beide still
+   `(0,0,0)`.
+3. **Die Fehlerform.** `tgsError.k = linDelta.k - positionError.k - angDelta·raXn_k`,
+   mit `linDelta = lin1 - rigidLinDelta`. Kein `invDt`, kein `biasFactor`.
+4. **`biasCoefficient` und `isVelocityIteration`.** Der Impuls wird mit
+   `biasCoefficient` skaliert, und die Starrkörpergeschwindigkeit geht nur über
+   `- velOfRigid * velDt` ein, mit `velDt == 0` in einer Geschwindigkeitsiteration.
+   Beide Argumente kamen seit P9.76b im Push-Block an und wurden in nichts gelesen.
+
+### Das Orakel zuerst, und es musste ROT sein
+
+Es gab kein CPU-Spiegelbild für den TGS-Solve — nur `refAttachSolvePGS`. Also
+`refAttachSolveTGS` **aus der CUDA** geschrieben, die Vorrichtung dagegen gestartet,
+**bevor** der Shader einen TGS-Arm hatte, und die drei Fehlschläge protokolliert:
+
+```
+vertex 1's TGS delta must match the CPU reference: ref(0.00010490, 0.00007251, -0.00014647)
+                                                   got(0.00835392, 0.01032264, -0.01268240)
+a velocity iteration must drop the velOfRigid*dt term: ref 0.00010411 got 0.00835392
+isVelocityIteration must CHANGE the result (both 0.00835392)
+```
+
+Das ist P9.76a als **Verfahren**, nicht als Merksatz: ein Orakel, das aus dem Port
+geschrieben ist, kann gegen den Port nicht fehlschlagen.
+
+### Ein „Unterschieds"-Test ist kein Korrektheitstest
+
+Die Vorrichtung prüft auch, dass TGS und PGS überhaupt **verschiedene** Zahlen liefern.
+Dieser Test war beim Rotlauf **grün** — obwohl der TGS-Einstieg den PGS-Rumpf ausführte.
+Grund: die beiden Arme unterschieden sich schon vorher darin, *wie* sie den Velocity-Pool
+auspacken (PGS addiert `initialVel`, TGS nicht), und das genügte für „verschieden".
+Festgehalten, weil es allgemein gilt: **ein Test auf Ungleichheit belegt keine Gleichung.**
+Gezählt hat nur der absolute Vergleich gegen das Orakel.
+
+### Zwei Überlebende, und keiner war eine Ausrede
+
+Sweep (21 Mutanten, forced-fresh) zuerst **19 tot, 2 überlebt**:
+
+- `vertex-scatter-drops-invmass` — der `elemIsVertex`-Arm des Scatters
+  (`deltaPos * softbodyState.w -> deltaPos`). Er überlebte **auch die PGS-Vorrichtung**:
+  beide prüfen Vertex 0 nur auf „bewegt" und auf seinen Referenzzähler und nehmen ihre
+  absolute Messung an Vertex 1, den die Vertex-Anhängung nie berührt. Der Scatter ist
+  **ein geteilter Schwanz**, also war seine Hälfte in beiden Vorrichtungen ungemessen.
+  Geschlossen durch einen absoluten Vertex-0-Test über **beide** Anhängungen.
+- `tail-assoc-swapped` — und der war die interessantere Diagnose.
+
+### Die Assoziation, und warum sie zuerst unbesiegbar war
+
+Die beiden Arme multiplizieren **dieselben drei Faktoren in verschiedener Reihenfolge**:
+
+```
+PGS   deltaPos * tetInvMass.k * barycentric.k    (softBodyGM.cu:2195-2198)
+TGS   deltaPos * barycentric.k * tetInvMass.k    (softBodyGM.cu:2318-2321)
+```
+
+Der Port gruppierte `deltaPos * (invMass * bary)` — das passt zu **keinem** von beiden.
+Korrigiert (die P9.37-Klasse), aber der Mutant, der die Korrektur zurücknimmt, überlebte.
+**Nicht** wegen der Toleranz: die inversen Massen der Vorrichtung waren `0.25 / 0.5 /
+0.75`, und eine Skalierung mit einer Zweierpotenz **vertauscht mit der Rundung** — die
+beiden Reihenfolgen waren bit-identisch, bei jeder denkbaren Toleranz.
+
+Also gemessen statt behauptet: der ULP-Abstand zwischen GPU-Kette und Host-Kette ist
+`0 0 0`, dreimal hintereinander. Der **ganze** TGS-Solve — Constraint-Block auf der GPU
+erzeugt, Solve auf dem Host nachgerechnet — stimmt auf llvmpipe **bit-exakt**. Damit:
+inverse Massen auf `0.55 / 0.30 / 0.70 / 0.60` (nicht-dyadisch), Vertex-1-Vergleich auf
+`f2u`-Gleichheit. **Sweep danach: 21/21 tot.**
+
+Die Lehre ist allgemeiner als dieser Mutant: *eine Vorrichtung kann eine ganze
+Defektklasse nicht sehen, weil ihre Eingabewerte zufällig Zweierpotenzen sind.*
+
+### Eine Upstream-Asymmetrie, dokumentiert und nicht geglättet
+
+Beide Softbody-Arme skalieren den Schwanz mit `dt` (`softBodyGM.cu:2199` und `:2312`).
+Der **Cloth**-TGS-Zwilling tut das nicht: `FEMClothExternalSolve.cu:1668` ist
+`deltaPos = -deltaImpulse`, ohne `dt`, aus **derselben**
+`calculateAttachmentDeltaImpulseTGS`. Jeder Port folgt seiner eigenen CUDA; notiert,
+nicht gemeldet.
+
+### Die offene Frage aus P9.76b, gelesen statt geschlossen
+
+Hat `femClothRigidAttachBda.slang` einen echten TGS-Arm oder dieselbe Kollaps-Struktur?
+**Gelesen: er hat einen echten.** `cloth_solveRigidClothAttachmentTGSLaunch` liest drei
+`float4`-Pool-Zeilen, bildet `linDelta`, `tgsError` mit `angDelta`-Term pro Achse und
+`FEMCLOTH_BIAS_COEFFICIENT` — vollständig portiert. Der Softbody-TGS-Arm war der
+Ausreißer, nicht die Regel.
 
 ## P9.76b + P9.77 — ein Kernel, der nie gelaufen ist, und der Prüfer, der ihn findet
 

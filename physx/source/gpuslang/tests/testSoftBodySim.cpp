@@ -4377,6 +4377,66 @@ static V3 refAttachSolvePGS(const AttachConstraintHost& c, int slot, V3 linVel1,
     return V3{ -impulse.x * dt, -impulse.y * dt, -impulse.z * dt };
 }
 
+// sb_solveRigidSoftAttachmentLaunchTGS (softBodyGM.cu:2209), TGS.
+// P9.76c.  Transcribed from calculateAttachmentDeltaImpulseTGS (attachments.cuh:147-200)
+// plus the kernel's own tail, and WRITTEN BEFORE the shader's TGS arm existed -- which is
+// P9.76a's rule made procedure: an oracle written from the port cannot fail against the
+// port.  The fixture below was run against the unported shader FIRST and had to be red.
+//
+// FOUR things this computes that the PGS reference does not, and every one of them is a
+// place the TGS arm could have been silently wrong:
+//   1. linDelta1 is a POSITION delta read from mSimDeltaPos, not a velocity read from
+//      mSimVelocity_InvMass (softBodyGM.cu:2251 vs :2125).  Same blend, different buffer.
+//   2. the rigid side subtracts its OWN accumulated linear delta: linDelta = linDelta1 -
+//      vel0.linDelta (attachments.cuh:163), which readVelocitiesTGS unpacks from a THIRD
+//      float4 row the PGS reader never touches (dataReadWriteHelper.cuh:144-151).
+//   3. the error is a position error with an angular-delta term per axis:
+//      tgsError.k = linDelta.k - positionError.k - vel0.angDelta.dot(raXn_k).
+//   4. deltaF is scaled by biasCoefficient, and the rigid velocity enters only through
+//      `- velOfRigid * velDt` with velDt == 0 on a velocity iteration.
+//
+// UPSTREAM ASYMMETRY, documented and NOT reconciled: the kernel tail here is
+// `deltaPos = -deltaImpulse * dt` (softBodyGM.cu:2312) while the cloth TGS twin at
+// FEMClothExternalSolve.cu:1668 is `deltaPos = -deltaImpulse` with no dt at all, from the
+// same calculateAttachmentDeltaImpulseTGS.  Both ports follow their own CUDA.
+static V3 refAttachSolveTGS(const AttachConstraintHost& c, int slot, V3 linDelta1,
+                            V3 rigidLinVel, V3 rigidAngVel, V3 rigidLinDelta, V3 rigidAngDelta,
+                            float dt, float biasCoefficient, bool isVelocityIteration)
+{
+    const F4 raXn0_biasW = c.raXn0_biasW[slot];
+    const F4 raXn1_biasW = c.raXn1_biasW[slot];
+    const F4 raXn2_biasW = c.raXn2_biasW[slot];
+    const F4 velMult = c.velMult_invMass[slot];
+
+    const V3 raXn0{ raXn0_biasW.x, raXn0_biasW.y, raXn0_biasW.z };
+    const V3 raXn1{ raXn1_biasW.x, raXn1_biasW.y, raXn1_biasW.z };
+    const V3 raXn2{ raXn2_biasW.x, raXn2_biasW.y, raXn2_biasW.z };
+
+    const float velOfRigid0 = rigidLinVel.x + dot3(rigidAngVel, raXn0);
+    const float velOfRigid1 = rigidLinVel.y + dot3(rigidAngVel, raXn1);
+    const float velOfRigid2 = rigidLinVel.z + dot3(rigidAngVel, raXn2);
+
+    const V3 linDelta{ linDelta1.x - rigidLinDelta.x, linDelta1.y - rigidLinDelta.y,
+                       linDelta1.z - rigidLinDelta.z };
+
+    const float positionErrorX = raXn0_biasW.w;
+    const float positionErrorY = raXn1_biasW.w;
+    const float positionErrorZ = raXn2_biasW.w;
+
+    // Cone-LIMITED branch not exercised (the fixture's axis_angle/low_high are the
+    // disabled shape), matching the shader's deferral.
+    const V3 tgsError{ linDelta.x - positionErrorX - dot3(rigidAngDelta, raXn0),
+                       linDelta.y - positionErrorY - dot3(rigidAngDelta, raXn1),
+                       linDelta.z - positionErrorZ - dot3(rigidAngDelta, raXn2) };
+
+    const float velDt = isVelocityIteration ? 0.0f : dt;
+    const V3 impulse{ (tgsError.x - velOfRigid0 * velDt) * velMult.x * biasCoefficient,
+                      (tgsError.y - velOfRigid1 * velDt) * velMult.y * biasCoefficient,
+                      (tgsError.z - velOfRigid2 * velDt) * velMult.z * biasCoefficient };
+
+    return V3{ -impulse.x * dt, -impulse.y * dt, -impulse.z * dt };
+}
+
 } // namespace p82dref
 
 struct V3ish { float x, y, z; };
@@ -5831,6 +5891,27 @@ static_assert(offsetof(SbSolveAttachPush, numAttachments) == 16, "count @16");
 static_assert(offsetof(SbSolveAttachPush, dt) == 56, "dt @56");
 static_assert(offsetof(SbSolveAttachPush, rigidDeltaVel) == 64, "rigidDeltaVel @64");
 
+// The TGS solve's OWN blob (P9.76b).  Two extra arguments in the HOST's order, which is
+// not the order the kernel signature suggests: biasCoefficient right after dt, and
+// isVelocityIteration AFTER the output pointer (PxgSoftBodyCore.cpp:1866).
+struct SbSolveAttachPushTGS
+{
+    uint64_t softbodies, attachments;
+    uint32_t numAttachments, pad20;
+    uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
+    float dt; float biasCoefficient;
+    uint64_t rigidDeltaVel;
+    uint32_t isVelocityIteration, pad76;
+};
+static_assert(sizeof(SbSolveAttachPushTGS) == 80, "sb attach solve TGS blob must be 80 bytes");
+static_assert(offsetof(SbSolveAttachPushTGS, biasCoefficient) == 60, "biasCoefficient @60");
+static_assert(offsetof(SbSolveAttachPushTGS, rigidDeltaVel) == 64, "rigidDeltaVel @64");
+static_assert(offsetof(SbSolveAttachPushTGS, isVelocityIteration) == 72, "isVelocityIteration @72");
+// The two solves are NOT interchangeable -- the assumption that they were is what kept
+// the TGS entry point refused on every engine launch until P9.76b.
+static_assert(sizeof(SbSolveAttachPushTGS) != sizeof(SbSolveAttachPush),
+              "PGS and TGS attachment solves have DIFFERENT pack sizes (72 vs 80)");
+
 PXG_TEST(softBodySimRigidAttachPrepare)
 {
     using namespace p80refit;
@@ -6301,6 +6382,342 @@ PXG_TEST(softBodySimRigidAttachSolve)
     dev->destroyBuffer(bVelPool.h); dev->destroyBuffer(bPrepDesc.h);
     dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
     dev->destroyBuffer(bSharedDesc.h);
+}
+
+// ===========================================================================
+// P9.76c -- sb_solveRigidSoftAttachmentLaunchTGS, the TGS arm's ARITHMETIC.
+//
+// WHY THIS FIXTURE EXISTS AND WHY IT DID NOT BEFORE.  Until P9.76b this entry point was
+// refused on every engine launch (its ABI row was 72 bytes where the host pack is 80), so
+// "what does it compute" was not a question that could be asked -- it computed nothing.
+// With the row corrected the kernel dispatched for the first time and the softbodyhang
+// scene went to NaN, which is what a PGS velocity formula fed position deltas does.
+//
+// WHAT THE SCENE CANNOT SEE, and this fixture therefore must:
+//   - a NON-ZERO rigid linDelta and angDelta.  readVelocitiesTGS unpacks four vectors from
+//     THREE float4 rows (dataReadWriteHelper.cuh:144-151); a port that stops after two rows
+//     gets linDelta == angDelta == 0, and in softbodyhang the anchor is static and its pool
+//     rows ARE zero, so the scene is blind to rows two and three by construction.  Here
+//     they are poked non-zero -- CUDA reads slot 0 for a static body too (:124), so this is
+//     the kernel's own behaviour, not an invented case.
+//   - mSimDeltaPos vs mSimVelocity_InvMass.  The two buffers are given deliberately
+//     unrelated contents; reading the wrong one is then a large absolute error rather than
+//     a subtle one.
+//   - biasCoefficient.  0.7f, which is neither 1 (dropped) nor 0.5 (the PGS biasFactor).
+//   - isVelocityIteration.  Only visible by running the kernel twice and requiring the two
+//     results to DIFFER: velDt is the sole consumer.
+//   - that TGS and PGS disagree AT ALL.  Before this tranche the TGS entry ran the PGS
+//     body verbatim, and no fixture asked.
+// ===========================================================================
+PXG_TEST(softBodySimRigidAttachSolveTGS)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float biasCoefficient = 0.7f;
+
+    const float invMass = 0.5f;
+    std::vector<F4> simPos = {
+        { 0.10f, 0.20f, 0.30f, invMass }, { 1.10f, 0.25f, 0.35f, invMass },
+        { 0.15f, 1.20f, 0.40f, invMass }, { 0.20f, 0.30f, 1.30f, invMass },
+    };
+    // The TGS solve reads mSimDeltaPos.  DISTINCT per vertex so the four-weight blend is
+    // observable, and with inverse masses that DIFFER from the position buffer's so a
+    // scatter scaled by the wrong buffer's .w is visible too.
+    // The inverse masses are deliberately NON-DYADIC.  With 0.25 / 0.5 / 0.75 the tet
+    // scatter's two multiplication orderings are bit-IDENTICAL -- scaling by a power of
+    // two commutes with rounding -- so the `tail-assoc-swapped` mutant was unkillable by
+    // construction, whatever the tolerance.  0.55 / 0.30 / 0.70 / 0.60 make the two
+    // orderings differ, and the bit-exact check below then sees it.
+    std::vector<F4> simDeltaPos = {
+        {  0.021f, -0.013f,  0.034f, 0.55f },
+        { -0.045f,  0.028f, -0.011f, 0.30f },
+        {  0.017f,  0.052f,  0.023f, 0.70f },
+        {  0.038f, -0.026f, -0.049f, 0.60f },
+    };
+    // Deliberately nothing like the deltas: if the TGS arm reads this buffer the absolute
+    // check below misses by two orders of magnitude, not by a rounding.
+    std::vector<F4> simVel(4, F4{ 2.0f, -3.0f, 4.0f, invMass });
+    std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bPos = makeDev(dev, simPos), bVel = makeDev(dev, simVel);
+    DevBuf bDeltaPos = makeDev(dev, simDeltaPos);
+    DevBuf bDelta = makeDev(dev, simDelta), bTets = makeDev(dev, simTets);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    sb.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDeltaPos.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t kN = 2u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    const F4 tetBary = { 0.4f, 0.2f, 0.3f, 0.1f };
+    const F4 axisAngle = { 0.0f, 1.0f, 0.0f, 0.25f };
+    const F4 lowHigh = { -1.0f, 1.0f, -2.0f, 2.0f };
+    const F4 localPose0 = { 0.8f, 0.9f, -0.6f, 0.0f };
+    std::vector<uint8_t> attBytes(kN * 96u, 0);
+    auto pokeAtt = [&](uint32_t i, F4 bary) {
+        uint8_t* b = attBytes.data() + size_t(i) * 96u;
+        const uint64_t i0 = staticNodeInd, i1 = 0ull;
+        std::memcpy(b + 0, &i0, 8); std::memcpy(b + 8, &i1, 8);
+        std::memcpy(b + 32, &localPose0, 16);
+        std::memcpy(b + 48, &lowHigh, 16);
+        std::memcpy(b + 64, &axisAngle, 16);
+        std::memcpy(b + 80, &bary, 16);
+    };
+    pokeAtt(0, F4{ 0, 0, 0, 0 });   // VERTEX
+    pokeAtt(1, tetBary);            // TET
+    DevBuf bAtt = makeDev(dev, attBytes);
+
+    std::vector<uint32_t> activeAtt = { 0u, 1u };
+    DevBuf bActive = makeDev(dev, activeAtt);
+    std::vector<uint64_t> attIds(kN, 0ull);
+    DevBuf bAttIds = makeDev(dev, attIds);
+    std::vector<uint8_t> constraintBytes(sizeof(p82dref::AttachConstraintHost), 0);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    std::vector<F4> rigidDeltaVel(2u * kN, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+    std::vector<F4> outSolverVelocity(4, F4{ 0, 0, 0, 0 });
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+
+    // THREE rows, all non-zero.  readVelocitiesTGS (dataReadWriteHelper.cuh:144-151):
+    //   linVel   = (v0.x, v0.y, v0.z)
+    //   angVel   = (v0.w, v1.x, v1.y)
+    //   linDelta = (v1.z, v1.w, v2.x)
+    //   angDelta = (v2.y, v2.z, v2.w)
+    // The packing straddles the float4 boundaries, so a row dropped or a component
+    // mis-assigned changes the answer -- which a pool of zeros could never show.
+    const F4 pv0 = {  0.310f, -0.220f,  0.130f,  0.440f };
+    const F4 pv1 = { -0.170f,  0.260f,  0.011f, -0.023f };
+    const F4 pv2 = {  0.034f, -0.041f,  0.052f, -0.019f };
+    std::vector<F4> velPool = { pv0, pv1, pv2, F4{ 9.f, 9.f, 9.f, 9.f } };
+    DevBuf bVelPool = makeDev(dev, velPool);
+    const p82dref::V3 rigidLinVel{ pv0.x, pv0.y, pv0.z };
+    const p82dref::V3 rigidAngVel{ pv0.w, pv1.x, pv1.y };
+    const p82dref::V3 rigidLinDelta{ pv1.z, pv1.w, pv2.x };
+    const p82dref::V3 rigidAngDelta{ pv2.y, pv2.z, pv2.w };
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    { const uint32_t one = 1u; std::memcpy(solverCoreDesc.data() + 268, &one, 4); }
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 160, bVelPool.addr);
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ---- PREPARE, so the solve reads a constraint this port produced ----
+    SbPrepAttachPush pp = {};
+    pp.softbodies = bDesc.addr; pp.rigidAttachments = bAtt.addr;
+    pp.activeRigidAttachments = bActive.addr; pp.rigidAttachmentIds = bAttIds.addr;
+    pp.numRigidAttachments = kN; pp.constraints = bConstraint.addr;
+    pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
+    pp.sharedDesc = 0ull; pp.rigidDeltaVel = bRigidDeltaVel.addr;
+    Kernel("softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch", {}, sizeof(SbPrepAttachPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- SOLVE, TGS, position iteration ----
+    SbSolveAttachPushTGS sp = {};
+    sp.softbodies = bDesc.addr; sp.attachments = bConstraint.addr; sp.numAttachments = kN;
+    sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr;
+    sp.dt = dt; sp.biasCoefficient = biasCoefficient;
+    sp.rigidDeltaVel = bRigidDeltaVel.addr; sp.isVelocityIteration = 0u;
+    Kernel("softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunchTGS", {}, sizeof(SbSolveAttachPushTGS))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 4);
+    std::printf("  tgs delta = (%.6g,%.6g,%.6g w=%.3g) (%.6g,%.6g,%.6g w=%.3g)\n",
+                gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w,
+                gDelta[1].x, gDelta[1].y, gDelta[1].z, gDelta[1].w);
+
+    for (uint32_t v = 0; v < 4u; ++v)
+        PXG_CHECK_MSG(gDelta[v].x != 0.0f || gDelta[v].y != 0.0f || gDelta[v].z != 0.0f,
+                      "vertex %u must be moved by the TGS attachment solve (got %g,%g,%g)",
+                      v, gDelta[v].x, gDelta[v].y, gDelta[v].z);
+    PXG_CHECK_MSG(f2u(gDelta[0].w) == f2u(2.0f),
+                  "vertex 0 is touched by BOTH attachments -> reference count 2 (got %g)",
+                  gDelta[0].w);
+    for (uint32_t v = 1; v < 4u; ++v)
+        PXG_CHECK_MSG(f2u(gDelta[v].w) == f2u(1.0f),
+                      "vertex %u is touched once -> reference count 1 (got %g)", v, gDelta[v].w);
+
+    // ---- ABSOLUTE, against the CPU transcription of attachments.cuh:147 -----------
+    // Vertex 1 carries only the TET attachment's share, so its delta is
+    // deltaPos * (mSimDeltaPos[1].w * bary.y) with nothing else folded in.
+    p82dref::AttachConstraintHost blk;
+    {
+        const auto cBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(blk));
+        std::memcpy(&blk, cBytes.data(), sizeof(blk));
+    }
+    p82dref::V3 blendedDelta{ 0, 0, 0 };
+    {
+        const float bw[4] = { tetBary.x, tetBary.y, tetBary.z, tetBary.w };
+        for (int v = 0; v < 4; ++v)
+        {
+            blendedDelta.x += simDeltaPos[v].x * bw[v];
+            blendedDelta.y += simDeltaPos[v].y * bw[v];
+            blendedDelta.z += simDeltaPos[v].z * bw[v];
+        }
+    }
+    {
+        const p82dref::V3 dp = p82dref::refAttachSolveTGS(blk, 1, blendedDelta, rigidLinVel,
+                                                          rigidAngVel, rigidLinDelta, rigidAngDelta,
+                                                          dt, biasCoefficient, false);
+        // BIT-EXACT, and in the shader's OWN association: (deltaPos * bary) * invMass,
+        // which is softBodyGM.cu:2318's ordering and not the PGS arm's.  Measured: the
+        // whole TGS chain -- constraint block produced on the GPU, solve recomputed on
+        // the host -- agrees to the bit on llvmpipe, repeatably and in both memory modes.
+        // That is what makes an ASSOCIATION mutant a kill rather than a rounding.
+        const float ex = (dp.x * tetBary.y) * simDeltaPos[1].w;
+        const float ey = (dp.y * tetBary.y) * simDeltaPos[1].w;
+        const float ez = (dp.z * tetBary.y) * simDeltaPos[1].w;
+        std::printf("  tgs ref[1] = (%.8g, %.8g, %.8g)\n", ex, ey, ez);
+        PXG_CHECK_MSG(f2u(gDelta[1].x) == f2u(ex) && f2u(gDelta[1].y) == f2u(ey) &&
+                      f2u(gDelta[1].z) == f2u(ez),
+                      "vertex 1's TGS delta must match the CPU reference BIT-EXACTLY: "
+                      "ref(%.9g, %.9g, %.9g) got(%.9g, %.9g, %.9g)",
+                      ex, ey, ez, gDelta[1].x, gDelta[1].y, gDelta[1].z);
+        PXG_CHECK_MSG(std::fabs(ex) > 1e-5f && std::fabs(ey) > 1e-5f && std::fabs(ez) > 1e-5f,
+                      "the reference must produce a real displacement on all three axes or "
+                      "the check has no teeth (%g, %g, %g)", ex, ey, ez);
+    }
+
+    // ---- VERTEX 0, ABSOLUTE: the VERTEX-attachment arm of the scatter -------------
+    // Added because the mutation sweep said so.  `vertex-scatter-drops-invmass`
+    // (deltaPos * softbodyState.w -> deltaPos in the elemIsVertex branch) SURVIVED the
+    // first run of this fixture AND of the PGS one: both check vertex 0 only for "moved"
+    // and for its reference count, and take their absolute reading from vertex 1, which
+    // the vertex attachment never touches.  The two arms of the scatter are one shared
+    // tail, so half of it was unmeasured in both.
+    //
+    // Vertex 0 carries BOTH attachments: the vertex one at slot 0 (whose linDelta1 is the
+    // vertex's own accumulated delta, not the tet blend) and the tet's first corner at
+    // slot 1, scaled by bary.x.
+    {
+        const p82dref::V3 lv0{ simDeltaPos[0].x, simDeltaPos[0].y, simDeltaPos[0].z };
+        const p82dref::V3 dp0 = p82dref::refAttachSolveTGS(blk, 0, lv0, rigidLinVel, rigidAngVel,
+                                                            rigidLinDelta, rigidAngDelta, dt,
+                                                            biasCoefficient, false);
+        const p82dref::V3 dp1 = p82dref::refAttachSolveTGS(blk, 1, blendedDelta, rigidLinVel,
+                                                            rigidAngVel, rigidLinDelta, rigidAngDelta,
+                                                            dt, biasCoefficient, false);
+        const float w0 = simDeltaPos[0].w;
+        const float ex = dp0.x * w0 + (dp1.x * tetBary.x) * w0;
+        const float ey = dp0.y * w0 + (dp1.y * tetBary.x) * w0;
+        const float ez = dp0.z * w0 + (dp1.z * tetBary.x) * w0;
+        std::printf("  tgs ref[0] = (%.8g, %.8g, %.8g)\n", ex, ey, ez);
+        PXG_CHECK_MSG(std::fabs(gDelta[0].x - ex) < 1e-5f * PxMax(1.0f, std::fabs(ex)) &&
+                      std::fabs(gDelta[0].y - ey) < 1e-5f * PxMax(1.0f, std::fabs(ey)) &&
+                      std::fabs(gDelta[0].z - ez) < 1e-5f * PxMax(1.0f, std::fabs(ez)),
+                      "vertex 0's TGS delta must match the CPU reference for BOTH its "
+                      "attachments: ref(%.8g, %.8g, %.8g) got(%.8g, %.8g, %.8g)",
+                      ex, ey, ez, gDelta[0].x, gDelta[0].y, gDelta[0].z);
+        // Without the inverse-mass factor the vertex share alone would be 1/w0 times
+        // bigger; the check above must be able to tell that apart from the true value.
+        PXG_CHECK_MSG(std::fabs(dp0.x * w0) > 1e-5f,
+                      "the VERTEX attachment's own share must be a real displacement or "
+                      "the inverse-mass factor is untested (%g)", dp0.x * w0);
+    }
+
+    // ---- isVelocityIteration is the ONLY consumer of velDt --------------------------
+    // Re-run with the flag set: velDt becomes 0, the `- velOfRigid * velDt` term vanishes,
+    // and every component must move.  A shader that ignores the flag returns the same
+    // numbers bit for bit.
+    {
+        std::vector<F4> zeroDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+        DevBuf bDeltaVI = makeDev(dev, zeroDelta);
+        PxgSoftBody sbVI = sb;
+        sbVI.mSimDelta = reinterpret_cast<float4*>(size_t(bDeltaVI.addr));
+        std::vector<PxgSoftBody> descVI = { sbVI };
+        DevBuf bDescVI = makeDev(dev, descVI);
+
+        SbSolveAttachPushTGS spVI = sp;
+        spVI.softbodies = bDescVI.addr; spVI.isVelocityIteration = 1u;
+        Kernel("softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunchTGS", {},
+               sizeof(SbSolveAttachPushTGS)).dispatch(1u, {}, spVI, 1u, 1u);
+        dev->flush();
+
+        const auto gVI = downloadBuffer<F4>(dev, bDeltaVI.h, 4);
+        const p82dref::V3 dpVI = p82dref::refAttachSolveTGS(blk, 1, blendedDelta, rigidLinVel,
+                                                             rigidAngVel, rigidLinDelta,
+                                                             rigidAngDelta, dt, biasCoefficient, true);
+        const float ex = (dpVI.x * tetBary.y) * simDeltaPos[1].w;
+        PXG_CHECK_MSG(std::fabs(gVI[1].x - ex) < 1e-6f * PxMax(1.0f, std::fabs(ex)),
+                      "a velocity iteration must drop the velOfRigid*dt term: ref %.8g got %.8g",
+                      ex, gVI[1].x);
+        PXG_CHECK_MSG(f2u(gVI[1].x) != f2u(gDelta[1].x),
+                      "isVelocityIteration must CHANGE the result (both %.8g) -- if it does "
+                      "not, the flag is being ignored", gDelta[1].x);
+        dev->destroyBuffer(bDeltaVI.h); dev->destroyBuffer(bDescVI.h);
+    }
+
+    // ---- TGS and PGS must not agree -------------------------------------------------
+    // The whole of P9.76c: before this tranche the TGS entry point ran the PGS body, and
+    // nothing anywhere said so.  Same constraint block, same softbody, two formulas.
+    {
+        std::vector<F4> zeroDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+        DevBuf bDeltaPGS = makeDev(dev, zeroDelta);
+        PxgSoftBody sbPGS = sb;
+        sbPGS.mSimDelta = reinterpret_cast<float4*>(size_t(bDeltaPGS.addr));
+        std::vector<PxgSoftBody> descPGS = { sbPGS };
+        DevBuf bDescPGS = makeDev(dev, descPGS);
+
+        SbSolveAttachPush spPGS = {};
+        spPGS.softbodies = bDescPGS.addr; spPGS.attachments = bConstraint.addr;
+        spPGS.numAttachments = kN; spPGS.prePrepDesc = bPrePrepDesc.addr;
+        spPGS.solverCoreDesc = bSolverCoreDesc.addr; spPGS.artiCoreDesc = 0ull;
+        spPGS.sharedDesc = bSharedDesc.addr; spPGS.dt = dt;
+        spPGS.rigidDeltaVel = bRigidDeltaVel.addr;
+        Kernel("softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch", {},
+               sizeof(SbSolveAttachPush)).dispatch(1u, {}, spPGS, 1u, 1u);
+        dev->flush();
+
+        const auto gPGS = downloadBuffer<F4>(dev, bDeltaPGS.h, 4);
+        std::printf("  pgs delta[1] = (%.6g, %.6g, %.6g)\n", gPGS[1].x, gPGS[1].y, gPGS[1].z);
+        PXG_CHECK_MSG(std::fabs(gPGS[1].x - gDelta[1].x) > 1e-5f ||
+                      std::fabs(gPGS[1].y - gDelta[1].y) > 1e-5f ||
+                      std::fabs(gPGS[1].z - gDelta[1].z) > 1e-5f,
+                      "the TGS solve must not reproduce the PGS solve: pgs(%.8g,%.8g,%.8g) "
+                      "tgs(%.8g,%.8g,%.8g)", gPGS[1].x, gPGS[1].y, gPGS[1].z,
+                      gDelta[1].x, gDelta[1].y, gDelta[1].z);
+        dev->destroyBuffer(bDeltaPGS.h); dev->destroyBuffer(bDescPGS.h);
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDeltaPos.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bAtt.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bAttIds.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bRigidDeltaVel.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h);
+    dev->destroyBuffer(bSolverTxIData.h); dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bVelPool.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
 }
 
 // ===========================================================================

@@ -35,20 +35,25 @@
 //   world axes, the position error, and the velocity multipliers.
 //
 //   sb_solveRigidSoftAttachmentLaunch{,TGS} (softBodyGM.cu:2085 / :2209, launch :1809 /
-//   :1866, SB_SOLVE_RIGID_SOFT_ATTACHMENT{,_TGS}) — solves it: a three-axis velocity
-//   constraint that drags the attached point back onto its anchor.
+//   :1866, SB_SOLVE_RIGID_SOFT_ATTACHMENT{,_TGS}) — solves it and drags the attached
+//   point back onto its anchor.  The PGS arm is a three-axis VELOCITY constraint; the
+//   TGS arm is a three-axis POSITION constraint over accumulated deltas, and the two
+//   share only their loop, their element blend and their atomic scatter (P9.76c).
 //
-// This is the same near-clone relationship as every other tranche in this port: the CUDA
-// argument packs are position-for-position and type-for-type identical to
-// cloth_rigidAttachmentPrepareLaunch / cloth_solveRigidClothAttachmentLaunch apart from
-// argument 0 (PxgSoftBody* vs PxgFEMCloth*), so the ABI rows are the cloth rows -- 80 bytes
-// for the prepare and 72 for the solve -- already proven in the bridge.
+// The prepare is a near-clone of cloth_rigidAttachmentPrepareLaunch, argument for
+// argument apart from argument 0 (PxgSoftBody* vs PxgFEMCloth*), so its ABI row is the
+// cloth row -- 80 bytes -- already proven in the bridge.
+//
+// THE SOLVES ARE NOT.  P9.76b: cloth builds ONE 9-argument pack and picks the entry point
+// with a ternary (PxgFEMClothCore.cpp:1845); softbody builds TWO -- 9 arguments / 72 bytes
+// for PGS (PxgSoftBodyCore.cpp:1810) and 11 / 80 for TGS (:1866).  Giving both the cloth
+// row left the TGS entry refused on every launch, silently, for as long as it existed.
 //
 // WHAT ACTUALLY DIFFERS from the cloth pair, in full:
 //   - PxgSoftBodyGpu for PxgFEMClothGpu, and the softbody id/element packing;
-//   - mSimPosition_InvMass (@96) / mSimVelocity_InvMass (@88) / mSimDelta (@272) for the
-//     cloth position / velocity / delta buffers, and mSimTetIndices (@80) for
-//     mTriangleVertexIndices;
+//   - mSimPosition_InvMass (@96) / mSimVelocity_InvMass (@88) / mSimDeltaPos (@128) /
+//     mSimDelta (@272) for the cloth position / velocity / accumulated-delta / delta
+//     buffers, and mSimTetIndices (@80) for mTriangleVertexIndices;
 //   - the element blend is over FOUR tet vertices, not three triangle vertices;
 //   - the inverse mass of a TET attachment is `getSoftBodyInvMass` (softBody.cuh:38):
 //     `baryMass * sqrt(bx^2+by^2+bz^2+bw^2)`, NOT the blended `.w` the cloth path uses.
@@ -201,9 +206,11 @@ struct SbSolveAttachParamsTGS
 [[vk::push_constant]]
 ConstantBuffer<SbSolveAttachParamsTGS> gSbSolveAttTGS;
 
-// The seven values the solve needs, so ONE body can serve two differently-sized
-// push blocks.  Each entry point fills this from its own block; nothing else in
-// the function reads a push constant.
+// The values the solve needs, so ONE body can serve two differently-sized push
+// blocks.  Each entry point fills this from its own block; nothing else in the
+// function reads a push constant.  The last two are TGS-only: the PGS entry leaves
+// biasCoefficient at 0 and isVelocityIteration at false, and the PGS arm of the
+// body reads neither.
 struct SbSolveAttArgs
 {
     uint numAttachments;
@@ -213,6 +220,8 @@ struct SbSolveAttArgs
     uint64_t prePrepDesc;
     uint64_t attachments;
     uint64_t sharedDesc;
+    float biasCoefficient;
+    bool isVelocityIteration;
 }
 
 [shader("compute")]
@@ -404,32 +413,41 @@ void solveRigidSoftAttachment(SbSolveAttArgs a, bool isTGS, uint idx, uint block
         const float4 baryOrType = Ptr<float4>(cBase + RAC_baryOrType)[offset];
         const bool elemIsVertex = femIsVertexType(baryOrType);
 
-        Ptr<float4> velGM = Ptr<float4>(softbodies[softBodyId].mSimVelocity_InvMass);
+        // P9.76c: THE TWO ARMS READ DIFFERENT BUFFERS.  PGS blends the VELOCITY
+        // (mSimVelocity_InvMass, softBodyGM.cu:2125); TGS blends the accumulated
+        // POSITION DELTA (mSimDeltaPos, :2251) -- and everything downstream follows
+        // from that, because a TGS "error" is a position error where a PGS one is a
+        // velocity error.  The blend itself, the .w inverse masses and the atomic
+        // scatter tail are identical in both, which is why one body still serves both.
+        Ptr<float4> srcGM = Ptr<float4>(isTGS ? softbodies[softBodyId].mSimDeltaPos
+                                              : softbodies[softBodyId].mSimVelocity_InvMass);
 
-        float4 softbodyVel;
+        float4 softbodyState;
         uint4 tetInd = uint4(0u, 0u, 0u, 0u);
         float4 tetInvMass = float4(0.0f, 0.0f, 0.0f, 0.0f);
         if (elemIsVertex)
         {
-            softbodyVel = velGM[elemIdx];
+            softbodyState = srcGM[elemIdx];
         }
         else
         {
             tetInd = Ptr<uint4>(softbodies[softBodyId].mSimTetIndices)[elemIdx];
-            const float4 v0 = velGM[tetInd.x];
-            const float4 v1 = velGM[tetInd.y];
-            const float4 v2 = velGM[tetInd.z];
-            const float4 v3 = velGM[tetInd.w];
-            softbodyVel = v0 * baryOrType.x + v1 * baryOrType.y + v2 * baryOrType.z + v3 * baryOrType.w;
+            const float4 v0 = srcGM[tetInd.x];
+            const float4 v1 = srcGM[tetInd.y];
+            const float4 v2 = srcGM[tetInd.z];
+            const float4 v3 = srcGM[tetInd.w];
+            softbodyState = v0 * baryOrType.x + v1 * baryOrType.y + v2 * baryOrType.z + v3 * baryOrType.w;
             tetInvMass = float4(v0.w, v1.w, v2.w, v3.w);
         }
 
-        const float3 linVel1 = float3(softbodyVel.x, softbodyVel.y, softbodyVel.z);
+        // CUDA's linVel1 (PGS) / linDelta1 (TGS) -- the same three floats, read from
+        // whichever buffer this arm blended.
+        const float3 lin1 = float3(softbodyState.x, softbodyState.y, softbodyState.z);
 
         const uint64_t rigidId = Ptr<uint64_t>(cBase + RAC_rigidId)[offset];
         const bool isStatic = nodeIsStaticBody(rigidId);
         // A static anchor holding a zero-inverse-mass (pinned) vertex has nothing to solve.
-        if (isStatic && softbodyVel.w == 0.0f)
+        if (isStatic && softbodyState.w == 0.0f)
             continue;
 
         // PxgVelocityReader::readVelocitiesPGS (dataReadWriteHelper.cuh:101).
@@ -440,13 +458,25 @@ void solveRigidSoftAttachment(SbSolveAttArgs a, bool isTGS, uint idx, uint block
 
         float3 rigidLinVel;
         float3 rigidAngVel;
+        // TGS-only, and zero on the PGS arm: readVelocitiesPGS has no counterpart.
+        float3 rigidLinDelta = float3(0.0f, 0.0f, 0.0f);
+        float3 rigidAngDelta = float3(0.0f, 0.0f, 0.0f);
         if (isTGS)
         {
+            // readVelocitiesTGS (dataReadWriteHelper.cuh:144-151) reads THREE float4
+            // rows, not two, and the four vectors straddle the row boundaries.  P9.76c:
+            // rows two and three were not read at all before this tranche, so linDelta
+            // and angDelta were silently (0,0,0) -- invisible in softbodyhang, whose
+            // anchor is static and whose pool rows are zero, and invisible to any
+            // fixture that had not yet been written.
             Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescTGSGpu>(a.sharedDesc)[0].iter_solverBodyVelPool);
             const float4 v0 = pool[accOffset + solverBodyIdx];
             const float4 v1 = pool[accOffset + solverBodyIdx + numSolverBodies];
+            const float4 v2 = pool[accOffset + solverBodyIdx + numSolverBodies + numSolverBodies];
             rigidLinVel = float3(v0.x, v0.y, v0.z);
             rigidAngVel = float3(v0.w, v1.x, v1.y);
+            rigidLinDelta = float3(v1.z, v1.w, v2.x);
+            rigidAngDelta = float3(v2.y, v2.z, v2.w);
         }
         else
         {
@@ -506,38 +536,85 @@ void solveRigidSoftAttachment(SbSolveAttArgs a, bool isTGS, uint idx, uint block
         const float positionErrorX = raXn0_biasW.w;
         const float positionErrorY = raXn1_biasW.w;
         const float positionErrorZ = raXn2_biasW.w;
-        const float biasFactor = 0.5f;
-        // Cone-LIMITED branch DEFERRED (see header).
-        const float3 velError = float3(linVel1.x - positionErrorX * biasFactor * invDt,
-                                       linVel1.y - positionErrorY * biasFactor * invDt,
-                                       linVel1.z - positionErrorZ * biasFactor * invDt);
 
-        const float3 deltaImpulse = float3((velError.x - velOfRigidX) * velMult.x,
-                                           (velError.y - velOfRigidY) * velMult.y,
-                                           (velError.z - velOfRigidZ) * velMult.z);
+        // P9.76c: THE TWO FORMULAS.  Until this tranche both entry points ran the PGS
+        // one -- which could not even be noticed before P9.76b, because the TGS entry
+        // was refused on every engine launch and no fixture covered it.  The moment the
+        // ABI row was corrected and it began to dispatch, softbodyhang went to NaN:
+        // a velocity formula fed accumulated position deltas, with 1/dt on the error.
+        //
+        // calculateAttachmentDeltaImpulseTGS (attachments.cuh:147-200) differs from its
+        // PGS twin in four places, and the port had none of them:
+        //   - the error is a POSITION error: linDelta - positionError - angDelta.raXn,
+        //     where linDelta = lin1 - rigidLinDelta.  No invDt anywhere;
+        //   - the rigid velocity enters only as `- velOfRigid * velDt`;
+        //   - velDt is 0 on a velocity iteration, dt otherwise;
+        //   - the whole product is scaled by biasCoefficient, which the host passes per
+        //     substep (and which is documented upstream as already multiplied by dt).
+        float3 deltaImpulse;
+        if (isTGS)
+        {
+            const float3 linDelta = float3(lin1.x - rigidLinDelta.x,
+                                           lin1.y - rigidLinDelta.y,
+                                           lin1.z - rigidLinDelta.z);
+            // Cone-LIMITED branch DEFERRED (see header) -- as in the PGS arm.
+            const float3 tgsError = float3(linDelta.x - positionErrorX - dotVec(rigidAngDelta, raXn0),
+                                           linDelta.y - positionErrorY - dotVec(rigidAngDelta, raXn1),
+                                           linDelta.z - positionErrorZ - dotVec(rigidAngDelta, raXn2));
+            const float velDt = a.isVelocityIteration ? 0.0f : dt;
+            const float bc = a.biasCoefficient;
+            deltaImpulse = float3((tgsError.x - velOfRigidX * velDt) * velMult.x * bc,
+                                  (tgsError.y - velOfRigidY * velDt) * velMult.y * bc,
+                                  (tgsError.z - velOfRigidZ * velDt) * velMult.z * bc);
+        }
+        else
+        {
+            const float biasFactor = 0.5f;
+            // Cone-LIMITED branch DEFERRED (see header).
+            const float3 velError = float3(lin1.x - positionErrorX * biasFactor * invDt,
+                                           lin1.y - positionErrorY * biasFactor * invDt,
+                                           lin1.z - positionErrorZ * biasFactor * invDt);
+
+            deltaImpulse = float3((velError.x - velOfRigidX) * velMult.x,
+                                  (velError.y - velOfRigidY) * velMult.y,
+                                  (velError.z - velOfRigidZ) * velMult.z);
+        }
 
         // DYNAMIC-rigid reaction DEFERRED: a static anchor never writes rigidDeltaVel.
 
         if (deltaImpulse.x != 0.0f || deltaImpulse.y != 0.0f || deltaImpulse.z != 0.0f)
         {
+            // BOTH softbody arms scale by dt here (softBodyGM.cu:2199 and :2312).  The
+            // cloth TGS twin does NOT -- FEMClothExternalSolve.cu:1668 is
+            // `deltaPos = -deltaImpulse` with no dt, out of the same
+            // calculateAttachmentDeltaImpulseTGS.  UPSTREAM ASYMMETRY, documented and
+            // not reconciled: each port follows its own CUDA.
             const float3 deltaPos = float3(-deltaImpulse.x * dt, -deltaImpulse.y * dt, -deltaImpulse.z * dt);
             const uint64_t simDelta = softbodies[softBodyId].mSimDelta;
             // AtomicAdd(mSimDelta[v], deltaPos * invMass * bary, 1.f): the xyz accumulate
             // and the w carries a reference count of 1 per touched vertex.
             if (elemIsVertex)
             {
-                pxgAtomicAddF4XYZ(simDelta, elemIdx, deltaPos * softbodyVel.w);
+                pxgAtomicAddF4XYZ(simDelta, elemIdx, deltaPos * softbodyState.w);
                 pxgAtomicAddF4W(simDelta, elemIdx, 1.0f);
             }
             else
             {
-                pxgAtomicAddF4XYZ(simDelta, tetInd.x, deltaPos * (tetInvMass.x * baryOrType.x));
+                // ASSOCIATION, the P9.37 class.  The two arms multiply the same three
+                // factors in DIFFERENT orders upstream, and C's left-to-right grouping
+                // makes that observable under NoContraction:
+                //   PGS  deltaPos * tetInvMass.k * barycentric.k   (softBodyGM.cu:2195-2198)
+                //   TGS  deltaPos * barycentric.k * tetInvMass.k   (softBodyGM.cu:2318-2321)
+                // Grouping (invMass * bary) first, as this port did, matches NEITHER.
+                const float4 f0 = isTGS ? baryOrType : tetInvMass;
+                const float4 f1 = isTGS ? tetInvMass : baryOrType;
+                pxgAtomicAddF4XYZ(simDelta, tetInd.x, (deltaPos * f0.x) * f1.x);
                 pxgAtomicAddF4W(simDelta, tetInd.x, 1.0f);
-                pxgAtomicAddF4XYZ(simDelta, tetInd.y, deltaPos * (tetInvMass.y * baryOrType.y));
+                pxgAtomicAddF4XYZ(simDelta, tetInd.y, (deltaPos * f0.y) * f1.y);
                 pxgAtomicAddF4W(simDelta, tetInd.y, 1.0f);
-                pxgAtomicAddF4XYZ(simDelta, tetInd.z, deltaPos * (tetInvMass.z * baryOrType.z));
+                pxgAtomicAddF4XYZ(simDelta, tetInd.z, (deltaPos * f0.z) * f1.z);
                 pxgAtomicAddF4W(simDelta, tetInd.z, 1.0f);
-                pxgAtomicAddF4XYZ(simDelta, tetInd.w, deltaPos * (tetInvMass.w * baryOrType.w));
+                pxgAtomicAddF4XYZ(simDelta, tetInd.w, (deltaPos * f0.w) * f1.w);
                 pxgAtomicAddF4W(simDelta, tetInd.w, 1.0f);
             }
         }
@@ -556,6 +633,8 @@ void sb_solveRigidSoftAttachmentLaunch(uint3 groupThreadId : SV_GroupThreadID, u
     a.prePrepDesc = gSbSolveAtt.prePrepDesc;
     a.attachments = gSbSolveAtt.attachments;
     a.sharedDesc = gSbSolveAtt.sharedDesc;
+    a.biasCoefficient = 0.0f;        // TGS-only; the PGS arm reads neither
+    a.isVelocityIteration = false;
     solveRigidSoftAttachment(a, false, groupThreadId.x, groupId.x);
 }
 
@@ -563,12 +642,9 @@ void sb_solveRigidSoftAttachmentLaunch(uint3 groupThreadId : SV_GroupThreadID, u
 [numthreads(256, 1, 1)]   // == RA_BLOCK; SB_UPDATEROTATION
 void sb_solveRigidSoftAttachmentLaunchTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    // Its OWN 80-byte block (see SbSolveAttachParamsTGS).  biasCoefficient and
-    // isVelocityIteration are read here and NOT yet used: the body still runs the
-    // PGS formula, which is a SEPARATE and larger question deliberately left to its
-    // own tranche.  It could not even be asked until now -- it is a question about
-    // what this kernel computes, and until this commit it computed nothing, because
-    // every launch was refused.
+    // Its OWN 80-byte block (see SbSolveAttachParamsTGS).  P9.76c gave the body a real
+    // TGS arm: until then this entry point ran the PGS formula, and both of its extra
+    // arguments were read into nothing.
     SbSolveAttArgs a;
     a.numAttachments = gSbSolveAttTGS.numAttachments;
     a.dt = gSbSolveAttTGS.dt;
@@ -577,5 +653,7 @@ void sb_solveRigidSoftAttachmentLaunchTGS(uint3 groupThreadId : SV_GroupThreadID
     a.prePrepDesc = gSbSolveAttTGS.prePrepDesc;
     a.attachments = gSbSolveAttTGS.attachments;
     a.sharedDesc = gSbSolveAttTGS.sharedDesc;
+    a.biasCoefficient = gSbSolveAttTGS.biasCoefficient;
+    a.isVelocityIteration = gSbSolveAttTGS.isVelocityIteration != 0u;
     solveRigidSoftAttachment(a, true, groupThreadId.x, groupId.x);
 }
