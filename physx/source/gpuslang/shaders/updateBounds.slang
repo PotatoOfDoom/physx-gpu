@@ -74,11 +74,25 @@ struct SimCoreAbiParams
     uint64_t scDesc; // const PxgSimulationCoreDesc*
 };
 
+// ENGINE launch ABI of mergeChangedAABBMgrHandlesLaunch (P9.79): also exactly
+// one device pointer ({8} blob), but to a DIFFERENT descriptor —
+// PxgUpdateActorDataDesc, the direct-GPU API's smaller twin.  Kept as its own
+// push block rather than folded into SimCoreAbiParams: the two blobs happen to
+// be the same size, and a shared name would make that coincidence look like a
+// shared layout.
+struct UpdateActorAbiParams
+{
+    uint64_t updateActorDesc; // const PxgUpdateActorDataDesc*
+};
+
 [[vk::push_constant]]
 ConstantBuffer<UpdateBoundsParams> gParams;
 
 [[vk::push_constant]]
 ConstantBuffer<SimCoreAbiParams> gSimCoreAbi;
+
+[[vk::push_constant]]
+ConstantBuffer<UpdateActorAbiParams> gUpdateActorAbi;
 
 RWStructuredBuffer<PxgShapeSim> gShapeSims;             // binding 0
 RWStructuredBuffer<PxgShape> gShapes;                   // binding 1
@@ -480,6 +494,67 @@ void updateChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
         if (lane == 0)
             changed[w] = gAabbMgrWord;
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// mirrors mergeChangedAABBMgrHandlesLaunch() in updateTransformAndBoundArray.cu:217
+// -- the DIRECT-GPU API's twin of the kernel directly above.
+//
+// *** WHAT IS DIFFERENT, AND WHY BOTH EXIST. ***
+//
+// Same ballot, same one-word-per-32-shapes packing, and exactly two differences:
+//
+//   1. the descriptor.  The sibling reads PxgSimulationCoreDesc; this one reads
+//      PxgUpdateActorDataDesc, which is uploaded on a different schedule (see
+//      PxgSimulationCore::gpuDmaUpdateData) and whose mUpdated array is the
+//      DIRECT-API changed-handle bitmap rather than the pipeline's own.
+//   2. `|=` instead of `=`.  That single character is the whole point of the
+//      kernel: the CPU-side API and the direct-GPU API each maintain their own
+//      idea of which shapes moved this frame, and the broadphase needs the
+//      UNION.  An `=` here would silently drop every handle the CPU path marked,
+//      and the broadphase would never re-sweep those shapes.
+//
+// Launched from ScPipeline.cpp:355, once per step, under
+// `if (isDirectGPUAPIInitialized())` -- which is why nothing in this harness
+// reached it before PXG_SCENE=directapi existed (P9.79).  Engine launch is
+// grid 64 / block 256 (PxgSimulationCoreKernelGridDim/BlockDim::UPDATE_AABBMGR_HANDLES).
+//
+// The groupshared-OR stands in for __ballot_sync for the same reason as in the
+// sibling: the llvmpipe subgroup width is not a fixed 32.  The read-modify-write
+// is done by lane 0 alone, exactly as the CUDA does it -- one thread per word,
+// so no atomic is needed and none is used.
+groupshared uint gAabbMgrMergeWord;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void mergeChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                      uint3 groupId : SV_GroupID)
+{
+    const PxgUpdateActorDataDescGpu desc =
+        (Ptr<PxgUpdateActorDataDescGpu>(gUpdateActorAbi.updateActorDesc))[0];
+
+    const uint numWords = desc.mBitMapWordCounts;
+    const uint numElements = numWords * 32u;
+
+    Ptr<uint> updated = Ptr<uint>(desc.mUpdated);
+    Ptr<uint> changed = Ptr<uint>(desc.mChangedAABBMgrHandles);
+
+    const uint lane = groupThreadId.x;
+
+    for (uint w = groupId.x; w < numWords; w += WorkgroupCount().x)
+    {
+        if (lane == 0)
+            gAabbMgrMergeWord = 0u;
+        GroupMemoryBarrierWithGroupSync();
+
+        const uint shape = w * 32u + lane;
+        if (shape < numElements && updated[shape] != 0u)
+            InterlockedOr(gAabbMgrMergeWord, 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+
+        if (lane == 0)
+            changed[w] = changed[w] | gAabbMgrMergeWord;   // CUDA: |=, not =
         GroupMemoryBarrierWithGroupSync();
     }
 }

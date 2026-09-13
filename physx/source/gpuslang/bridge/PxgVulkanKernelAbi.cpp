@@ -1404,6 +1404,35 @@ static const uint8_t kRadixDoubleCopy[] = { 8, 8, 8, 8, 8, 8, 8 };
 //   NOT aliased to kRadixDoubleCopy: that one is the SEVEN-pointer twin pack.
 //   numKeys is a const PxU32* DEVICE POINTER (deref'd on-device) -> 32-byte blob.
 static const uint8_t kRadixCopy[] = { 8, 8, 8, 8 };
+
+// gpucommon/src/CUDA/radixSortImpl.cu (P9.79, the direct-GPU API shape remap):
+//   radixSortCopy2(const PxU64* inValue, PxU64* outValue, PxU32* rank,
+//     const PxU32 numKeys) (radixSortImpl.cu:237) and
+//   radixSortCopyBits2(const PxU64* inValue, PxU32* outValue, PxU32* rank,
+//     const PxU32 numKeys, const bool lowBit) (radixSortImpl.cu:218).
+// NOT aliased to kRadixCopy: numKeys is a PxU32 BY VALUE here, not the
+// `const PxU32*` device pointer the non-"2" gathers take -- 4 bytes, not 8.
+// Both blobs round to 32; only the last argument's SIZE differs, and that is
+// exactly the difference the shim packs against.
+static const uint8_t kRadixCopy2[] = { 8, 8, 8, 4 };
+static const uint8_t kRadixCopyBits2[] = { 8, 8, 8, 4, 1 };
+
+// gpusimulationcontroller/src/CUDA/updateBodiesAndShapes.cu (P9.79):
+//   getRigidDynamicGlobalPose / getRigidDynamicLinearVelocity /
+//   getRigidDynamicAngularVelocity(void* data,
+//     const PxRigidDynamicGPUIndex* gpuIndices,
+//     const PxgBodySim* bodySimBufferDeviceData, const PxU32 nbElements)
+// -> 0, 8, 16, 24 = 28, rounded to a 32-byte blob.
+static const uint8_t kRigidGet[] = { 8, 8, 8, 4 };
+
+//   getD6JointForces / getD6JointTorques(PxVec3* data,
+//     const PxD6JointGPUIndex* gpuIndices, PxU32 nbElements,
+//     const PxgConstraintWriteback* constraintWriteBackBuffer, PxF32 oneOverDt,
+//     const PxgConstraintIdMapEntry* constraintIdMap, PxU32 constraintIdMapSize)
+// -> 0, 8, 16, 24, 32, 40, 48 = 52, rounded to a 56-byte blob.  The pack is NOT
+// sorted by size: two PxU32s sit between device pointers and each pads the
+// pointer after it up to the next multiple of 8.
+static const uint8_t kD6JointGet[] = { 8, 8, 4, 8, 4, 8, 4 };
 // gpucommon/src/CUDA/MemCopyBalanced.cu:95 (P8.20):
 //   clampMaxValues(PxU32* value0, PxU32* value1, PxU32* value2, const PxU32 maxValue)
 //   -> three pointers @0/@8/@16 + a PxU32 BY VALUE @24 = 28 data bytes, rounded to
@@ -1646,6 +1675,18 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
+    // P9.79 -- the DIRECT-GPU API family.  Every row below was missing, and every
+    // one of these kernels was refused on every launch, because until
+    // PXG_SCENE=directapi existed nothing in this project raised
+    // PxSceneFlag::eENABLE_DIRECT_GPU_API and so nothing ever launched them.
+    //
+    // updateBodiesLaunchDirectAPI takes the same single PxgNewBodiesDesc* as
+    // updateBodiesLaunch (PxgSimulationCore.cpp:2349 selects between the two on
+    // getEnableDirectGPUAPI()), and mergeChangedAABBMgrHandlesLaunch the same
+    // single pointer shape as its sibling one line up -- but to a different
+    // descriptor, PxgUpdateActorDataDesc (ScPipeline.cpp:355).
+    { "updateBodiesLaunchDirectAPI", kOnePtr, 1u },
+    { "mergeChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
     // P9.42: the frozen/unfrozen compaction trio, same one-pointer list
     // (PxgSimulationCore.cpp:2656-2660, :2695-2706)
     { "computeFrozenAndUnfrozenHistogramLaunch", kOnePtr, 1u },
@@ -2184,6 +2225,32 @@ static const PxgKernelAbiRow kRows[] = {
     // radixSortImpl.cu:119 / :163 — the single rank-indexed gathers share the pack.
     { "radixSortCopyHigh32Bits", kRadixCopy, uint32_t(sizeof(kRadixCopy)) },
     { "radixSortCopy", kRadixCopy, uint32_t(sizeof(kRadixCopy)) },
+    // radixSortImpl.cu:237 / :218 -- the AGGREGATE-aware gathers (P9.79).  These
+    // do NOT share kRadixCopy: their numKeys is a PxU32 BY VALUE, not a
+    // `const PxU32*` device pointer, so the fourth argument is 4 bytes and not 8.
+    // radixSortCopyBits2 carries a fifth, `const bool lowBit` -- ONE byte, which
+    // lands at offset 28 and pads the blob to 32.  Both are launched only from
+    // PxgGpuNarrowphaseCore::computeRigidsToShapes(), which
+    // PxgSimulationController.cpp:805 calls under `mEnableDirectGPUAPI`.
+    { "radixSortCopy2", kRadixCopy2, uint32_t(sizeof(kRadixCopy2)) },
+    { "radixSortCopyBits2", kRadixCopyBits2, uint32_t(sizeof(kRadixCopyBits2)) },
+    // updateBodiesAndShapes.cu:999 / :1019 / :1037 -- the direct-API rigid
+    // getters (P9.79).  One pack for all three
+    // (PxgSimulationCore::getRigidDynamicData, PxgSimulationCore.cpp:2755):
+    //   (void* data, const PxRigidDynamicGPUIndex*, const PxgBodySim*, PxU32)
+    // Only the element WIDTH of `data` differs between them (7 floats for the
+    // pose, 3 for a velocity), and that lives in the kernel body, not the pack.
+    { "getRigidDynamicGlobalPose", kRigidGet, uint32_t(sizeof(kRigidGet)) },
+    { "getRigidDynamicLinearVelocity", kRigidGet, uint32_t(sizeof(kRigidGet)) },
+    { "getRigidDynamicAngularVelocity", kRigidGet, uint32_t(sizeof(kRigidGet)) },
+    // updateBodiesAndShapes.cu:1344 / :1367 -- the D6 joint force/torque getters
+    // (P9.79), two instantiations of one template, so one pack
+    // (PxgSimulationCore::getD6JointData, PxgSimulationCore.cpp:3098).  Note the
+    // PxU32 nbElements SITS BETWEEN two device pointers, so the pointer that
+    // follows it is padded from 20 to 24; getting that wrong hands the kernel a
+    // wild constraintWriteBackBuffer.
+    { "getD6JointForces", kD6JointGet, uint32_t(sizeof(kD6JointGet)) },
+    { "getD6JointTorques", kD6JointGet, uint32_t(sizeof(kD6JointGet)) },
     // MemCopyBalanced.cu:95 — clampMaxValues(three PxU32*, const PxU32) -> {8,8,8,4}
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
     // convexMeshMidphase.cu:378 — the rigid convex-vs-trimesh midphase (P8.27).

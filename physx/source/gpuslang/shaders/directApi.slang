@@ -35,10 +35,28 @@
 //   - setRigidDynamicForce / setRigidDynamicTorque
 //
 // The PxVec3/PxTransform user arrays are tightly packed (12/28 bytes per
-// element) and therefore bound as raw float buffers.  copyUserData maps to
-// the already-ported MemCopyBalanced; setRigidDynamicGlobalPose (which also
-// refreshes bounds/transform cache) lives in updateBounds.slang next to the
-// bounds machinery it shares.
+// element) and therefore bound as raw float buffers.
+// setRigidDynamicGlobalPose (which also refreshes bounds/transform cache) lives
+// in updateBounds.slang next to the bounds machinery it shares.
+//
+// P9.79 -- A CORRECTION.  This header used to claim "copyUserData maps to the
+// already-ported MemCopyBalanced".  That was FALSE and worth saying so plainly:
+// copyUserData is a DIFFERENT CUDA kernel (updateBodiesAndShapes.cu:1280), with a
+// different argument pack ({8,4} over PxgPtrPair, not MemCopyBalanced's CopyDesc),
+// a different launch site, and its own unmapped manifest row.  Nothing maps it.
+//
+// What is TRUE about it, and is a measurement rather than a claim: its only launch
+// site is PxgMemCopyDispatcher::flushCommands, and PxgMemCopyDispatcher is
+// CONSTRUCTED NOWHERE in this tree -- not as a member, not as a local, not via
+// PX_NEW.  The class compiles and is dead.  So the kernel is unreachable here for
+// a reason no existing bucket names: not orphaned (a call site exists), not
+// standalone (no app factory gates it), not feature-gated -- its OWNER is never
+// built.  Recorded in tools/engine_reachable_unmapped.txt.
+//
+// P9.79 also moved the three GETTERS below onto the engine launch ABI, in
+// shaders/directApiBda.slang.  The entries here keep the Phase-1 bound-buffer form
+// and the testDirectApi fixture that drives it; the MANIFEST points the engine at
+// the BDA twins.  Same split as radixSortGather.slang / femContactSortBda.slang.
 
 import pxgSlangCommon;
 

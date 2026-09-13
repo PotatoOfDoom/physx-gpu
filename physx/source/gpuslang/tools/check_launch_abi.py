@@ -64,9 +64,14 @@ ABI = os.path.join(ROOT, "physx", "source", "gpuslang", "bridge",
 # list may shrink; a name that is not on it and has no ABI row fails the check.
 KNOWN_UNWIRED = {
     # simulation core / direct API
-    "updateBodyExternalVelocitiesLaunch", "updateBodiesLaunchDirectAPI",
-    "getRigidDynamicGlobalPose", "getRigidDynamicLinearVelocity",
-    "getRigidDynamicAngularVelocity", "getRigidDynamicLinearAcceleration",
+    "updateBodyExternalVelocitiesLaunch",
+    # P9.79 wired the three direct-API GETTERS the first direct-GPU-API scene
+    # actually launches (getRigidDynamicGlobalPose / LinearVelocity /
+    # AngularVelocity) and updateBodiesLaunchDirectAPI, and re-pointed them at
+    # directApiBda.spv.  What is left here is what PXG_SCENE=directapi does not
+    # yet drive: the SETTERS, and the two acceleration getters, which need
+    # PxSceneFlag::eENABLE_BODY_ACCELERATIONS on top of the direct-API flag.
+    "getRigidDynamicLinearAcceleration",
     "getRigidDynamicAngularAcceleration", "setRigidDynamicGlobalPose",
     "setRigidDynamicLinearVelocity", "setRigidDynamicAngularVelocity",
     "setRigidDynamicForce", "setRigidDynamicTorque",
@@ -78,8 +83,11 @@ KNOWN_UNWIRED = {
     "outputExceededForceThresholdElementIndice", "setThresholdElementsMask",
     "computeThresholdElementMaskIndices", "outputThresholdPairsMaskIndices",
     "createForceChangeThresholdElements",
-    # solver / sort odds and ends
-    "applyTGSSubstepGravity", "radixSortCopyBits2", "radixSortCopy2",
+    # solver / sort odds and ends.  P9.79 wired radixSortCopyBits2 and
+    # radixSortCopy2: PxgGpuNarrowphaseCore::computeRigidsToShapes() is their only
+    # caller and it runs only under the direct-GPU API, so PXG_SCENE=directapi is
+    # what finally launched them (and found them refused).
+    "applyTGSSubstepGravity",
     # the aggregate broadphase
     "updateDirtyAggregate", "updateAggregateBounds",
     "markAggregateBoundsUpdatedBitmap", "sortAndUpdateAggregateProjections",

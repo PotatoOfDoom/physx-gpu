@@ -15,15 +15,15 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 412;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 415;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
-    { "mergeChangedAABBMgrHandlesLaunch", nullptr, nullptr },  // MERGE_AABBMGR_HANDLES (unmapped)
+    { "mergeChangedAABBMgrHandlesLaunch", "updateBounds.spv", "mergeChangedAABBMgrHandlesLaunch" },  // MERGE_AABBMGR_HANDLES (P9.79)
     { "updateBodyExternalVelocitiesLaunch", "bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch" },  // UPDATE_BODY_EXTERNAL_VELOCITIES
     { "updateShapesLaunch", "bodyUpdate.spv", "updateShapesLaunch" },  // UPDATE_SHAPES
     { "updateBodiesLaunch", "bodyUpdate.spv", "updateBodiesLaunch" },  // UPDATE_BODIES
-    { "updateBodiesLaunchDirectAPI", "bodyUpdate.spv", "updateBodiesLaunchDirectAPI" },  // UPDATE_BODIES_DIRECT_API
+    { "updateBodiesLaunchDirectAPI", "directApiBda.spv", "updateBodiesLaunchDirectAPI" },  // UPDATE_BODIES_DIRECT_API (P9.79 BDA re-point)
     { "newArticulationsLaunch", "newArticulationsBda.spv", "newArticulationsLaunch" },  // NEW_ARTICULATIONS (P8.65 BDA)
     { "updateArticulationsLaunch", "updateArticulationsBda.spv", "updateArticulationsLaunch" },  // UPDATE_ARTICULATIONS (P8.124 BDA)
     { "updateJointsLaunch", "bodyUpdate.spv", "updateJointsLaunch" },  // UPDATE_JOINTS (P5 Step 5 BDA port)
@@ -196,8 +196,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortDoubleCopyHigh32Bits", "particleContactSortBda.spv", "radixSortDoubleCopyHigh32Bits" },  // RS_DOUBLE_COPY_HIGH_32BITS2 (P6.1 BDA re-point)
     { "radixSortCopy", "femContactSortBda.spv", "radixSortCopy" },  // RS_COPY_VALUE (P8.20 BDA re-point)
     { "radixSortDoubleCopy", "particleContactSortBda.spv", "radixSortDoubleCopy" },  // RS_DOUBLE_COPY_VALUE (P6.1 BDA re-point)
-    { "radixSortCopyBits2", "radixSortGather.spv", "radixSortCopyBits2" },  // RS_COPY_BITS2
-    { "radixSortCopy2", "radixSortGather.spv", "radixSortCopy2" },  // RS_COPY_VALUE2
+    { "radixSortCopyBits2", "directApiBda.spv", "radixSortCopyBits2" },  // RS_COPY_BITS2 (P9.79 BDA re-point)
+    { "radixSortCopy2", "directApiBda.spv", "radixSortCopy2" },  // RS_COPY_VALUE2 (P9.79 BDA re-point)
     { "accumulateDeltaVRigidFirstLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidFirstLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_FIRST (P9.44)
     { "accumulateDeltaVRigidSecondLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND (P9.44)
     { "accumulateDeltaVRigidSecondLaunchMultiStage1", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunchMultiStage1" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (P9.44)
@@ -346,9 +346,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeArtiCOM", "npArtiInverseDyn.spv", "computeArtiCOM" },  // COMPUTE_ARTI_COM (unmapped)
     { "computeArtiCentroidalMomentumMatrices", "npArtiInverseDyn.spv", "computeArtiCentroidalMomentumMatrices" },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
     { "applyParticleBufferDataDEPRECATED", nullptr, nullptr },  // APPLY_PARTICLE_BUFFER_DATA_DEPRECATED (unmapped)
-    { "getRigidDynamicGlobalPose", "directApi.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE
-    { "getRigidDynamicLinearVelocity", "directApi.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL
-    { "getRigidDynamicAngularVelocity", "directApi.spv", "getRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_GET_ANGVEL
+    { "getRigidDynamicGlobalPose", "directApiBda.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE (P9.79 BDA re-point)
+    { "getRigidDynamicLinearVelocity", "directApiBda.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL (P9.79 BDA re-point)
+    { "getRigidDynamicAngularVelocity", "directApiBda.spv", "getRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_GET_ANGVEL (P9.79 BDA re-point)
     { "getRigidDynamicLinearAcceleration", "directApi.spv", "getRigidDynamicLinearAcceleration" },  // RIGID_DYNAMIC_GET_LINACCEL
     { "getRigidDynamicAngularAcceleration", "directApi.spv", "getRigidDynamicAngularAcceleration" },  // RIGID_DYNAMIC_GET_ANGACCEL
     { "setRigidDynamicGlobalPose", "updateBounds.spv", "setRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_SET_GLOBAL_POSE
@@ -371,8 +371,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "getArtiTendonState", "npArtiGetSet.spv", "getArtiTendonState" },  // ARTI_GET_TENDON_STATE (unmapped)
     { "getArtiSpatialTendonAttachmentState", "npArtiGetSet.spv", "getArtiSpatialTendonAttachmentState" },  // ARTI_GET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
     { "getArtiFixedTendonJointState", "npArtiGetSet.spv", "getArtiFixedTendonJointState" },  // ARTI_GET_FIXED_TENDON_JOINT_STATE (unmapped)
-    { "getD6JointForces", nullptr, nullptr },  // D6_JOINT_GET_FORCE (unmapped)
-    { "getD6JointTorques", nullptr, nullptr },  // D6_JOINT_GET_TORQUE (unmapped)
+    { "getD6JointForces", "directApiBda.spv", "getD6JointForces" },  // D6_JOINT_GET_FORCE (P9.79)
+    { "getD6JointTorques", "directApiBda.spv", "getD6JointTorques" },  // D6_JOINT_GET_TORQUE (P9.79)
     { "updateDirtyAggregate", "broadphaseAggregateDirty.spv", "updateDirtyAggregate" },  // UPDATE_DIRTY_AGGREGATE
     { "updateAggregateBounds", "broadphaseAggregateBounds.spv", "updateAggregateBounds" },  // UPDATE_AGGREGATE_BOUND
     { "markAggregateBoundsUpdatedBitmap", "broadphaseAggregateBounds.spv", "markAggregateBoundsUpdatedBitmap" },  // MARK_AGGREGATE_BOUND_BITMAP

@@ -25,6 +25,7 @@
 #include "cudamanager/PxCudaContext.h" // PxCudaContext::memcpyHtoD/DtoH (particle buffer fill/read)
 #include "PxDeformableAttachment.h"  // PxParticleRigidAttachment (P9.76, PXG_SCENE=particleattach)
 #include "PxNodeIndex.h"             // PxNodeIndex().getInd() -- the STATIC anchor sentinel
+#include "PxDirectGPUAPI.h"          // PxDirectGPUAPI (P9.79, PXG_SCENE=directapi)
 
 #include <cstdio>
 #include <cmath>
@@ -1241,6 +1242,115 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eFREE);
 
     targets.push_back({ box, spawnY, restY, "boxOnD6Joint" });
+}
+
+// PXG_SCENE=directapi (P9.79): the FIRST scene in this harness that raises
+// PxSceneFlag::eENABLE_DIRECT_GPU_API, and therefore the first thing that asks the
+// direct-GPU-API kernels to run.
+//
+// *** WHY THIS SCENE HAD TO EXIST BEFORE ANYTHING COULD BE PORTED. ***
+//
+// P9.79's liveness audit of the twenty engine-reachable unmapped kernels found that
+// a whole family of them is gated behind this one scene flag and nothing else:
+// getD6JointForces / getD6JointTorques (PxgSimulationCore::getD6JointData),
+// mergeChangedAABBMgrHandlesLaunch (ScPipeline.cpp:355, `if
+// (isDirectGPUAPIInitialized())`), mergeTransformCacheAndBoundArrayChanges
+// (PxgSimulationController.cpp:703, `if (getEnableDirectGPUAPI())`) and
+// evaluatePointDistancesSDFBatch.  Not "rarely reached" -- UNREACHABLE, in every
+// one of the forty-nine scenes this harness had before today.
+//
+// And the twelve direct-API rigid getters and setters that ARE ported
+// (shaders/directApi.slang, plus setRigidDynamicGlobalPose in updateBounds.slang)
+// sit in check_launch_abi.py's KNOWN_UNWIRED list for the same reason: they have no
+// row in bridge/PxgVulkanKernelAbi.cpp, so pushConstantSizeFor() returns 0 and the
+// shim refuses every launch.  Nobody noticed, because nothing launched them.
+//
+// *** WHAT MAKES A REFUSAL VISIBLE HERE. ***
+//
+// With the direct-GPU API on, the SDK stops writing simulation results back into the
+// host actors: PxRigidDynamic::getGlobalPose() is no longer the body's pose, and the
+// direct read IS the only way to see where the box went.  So the scene's central
+// number -- did the box fall and rest? -- passes through
+// getRigidDynamicGlobalPose, and a refused launch cannot be mistaken for a correct
+// answer.
+//
+// It is made harder still to mistake: every device output buffer is POISONED with
+// -999 before each read (readPoisoned() below).  A refused kernel leaves the poison
+// in place, so the failure reads as an impossible number rather than as a stale but
+// plausible pose.  That distinction is the whole lesson of P9.48d, where 361
+// refusals looked exactly like "the kernel ran and found nothing".
+//
+// *** THE TWO BODIES, AND WHY THE SECOND ONE IS JOINTED OFF-CENTRE. ***
+//
+//   faller  -- a 1000 kg box dropped from y=5 onto the static ground box; rests at
+//              centre y=0.5, exactly as PXG_SCENE=box.  Read back as a pose and as a
+//              linear velocity, so two different getters are on the hook.
+//   hanger  -- a 1000 kg box held by a PxD6Joint with ALL SIX DOFs LOCKED, whose
+//              attachment point on the body is offset by -0.5 in x from the centre
+//              of mass.  The offset is the point: with the joint frame ON the centre
+//              of mass the reaction torque is identically zero, and "zero" is the one
+//              answer a refused kernel also gives.  Off-centre, static equilibrium
+//              fixes BOTH readings analytically:
+//
+//                  F = +m g y_hat                 |F| = 1000 * 9.81 = 9810 N
+//                  T = -r_att x F                 |T| = m g d = 4905 N m about +z
+//
+//              (r_att = (-d, 0, 0) is the vector from the centre of mass to the
+//              attachment point; d = 0.5.)  So getD6JointForces and getD6JointTorques
+//              each have a number to be wrong about, and they are different numbers.
+//
+// The sign convention the engine uses for the writeback is NOT asserted here -- it is
+// printed, and the checks are on magnitude and on the dominant axis.  Asserting a
+// convention this scene has not measured would be inventing certainty.
+struct DirectApiScene
+{
+    PxRigidDynamic* faller;
+    PxRigidDynamic* hanger;
+    PxD6Joint*      joint;
+    float           hangerAttachOffsetX;  // -d: attachment point relative to the COM
+    PxVec3          anchorWorld;          // the world point the hanger is pinned to
+    float           hangerMass;
+};
+
+DirectApiScene buildDirectApiScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    DirectApiScene s = {};
+    s.hangerAttachOffsetX = -0.5f;
+    s.hangerMass = 1000.0f;
+    // The anchor is off BOTH the x and z axes on purpose.  See the torque
+    // expectation at the check site: the engine reports the constraint torque about
+    // ACTOR0's origin, and actor0 here is the world, so every component of the
+    // anchor position appears in the answer.  A single-axis anchor would let a
+    // whole family of wrong conventions produce the same number.
+    s.anchorWorld = PxVec3(4.0f, 3.0f, 2.0f);
+
+    addGroundBox(physics, scene, material);
+
+    // The faller: identical to PXG_SCENE=box, so its rest height is a number this
+    // harness has measured forty-nine times over.
+    s.faller = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                          boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+
+    // The hanger: spawned so that its ATTACHMENT point (COM + (-0.5, 0, 0)) starts
+    // just above the world anchor and settles onto it.  addDynamic places bodies at
+    // z = 0, so the body is moved onto the anchor's z afterwards.
+    s.hanger = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                          boxInertia(PxVec3(0.5f), s.hangerMass), s.anchorWorld.y + 0.25f,
+                          s.anchorWorld.x - s.hangerAttachOffsetX);
+    s.hanger->setGlobalPose(PxTransform(PxVec3(s.anchorWorld.x - s.hangerAttachOffsetX,
+                                               s.anchorWorld.y + 0.25f, s.anchorWorld.z)));
+
+    // actor0 = NULL -> world frame at the anchor; localFrame1 is the attachment point
+    // expressed in the body's own frame, i.e. offset from the centre of mass.
+    s.joint = PxD6JointCreate(*physics, NULL, PxTransform(s.anchorWorld),
+                              s.hanger, PxTransform(PxVec3(s.hangerAttachOffsetX, 0.0f, 0.0f)));
+    s.joint->setMotion(PxD6Axis::eX, PxD6Motion::eLOCKED);
+    s.joint->setMotion(PxD6Axis::eY, PxD6Motion::eLOCKED);
+    s.joint->setMotion(PxD6Axis::eZ, PxD6Motion::eLOCKED);
+    s.joint->setMotion(PxD6Axis::eTWIST, PxD6Motion::eLOCKED);
+    s.joint->setMotion(PxD6Axis::eSWING1, PxD6Motion::eLOCKED);
+    s.joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
+    return s;
 }
 
 // PXG_SCENE=articulation (P8.55): the first ARTICULATION scene, and the first
@@ -5545,6 +5655,36 @@ int main()
     const char* solverEnv = std::getenv("PXG_SOLVER");
     const bool usePgs = solverEnv && !std::strcmp(solverEnv, "pgs");
     sceneDesc.solverType = usePgs ? PxSolverType::ePGS : PxSolverType::eTGS;
+    // P9.79 -- PXG_SCENE=directapi.  eENABLE_DIRECT_GPU_API is IMMUTABLE after
+    // createScene (PxDirectGPUAPI.h), so the scene name has to be read here rather
+    // than at the dispatch below; the dispatch reads the same variable again.
+    // The flag requires eENABLE_GPU_DYNAMICS + eGPU broadphase, so PXG_CPU_CONTROL
+    // and this scene are mutually exclusive -- say so rather than constructing a
+    // scene whose direct-API calls would all fail the isDirectGPUAPIInitialized()
+    // gate and read back as poison.
+    {
+        const char* sn = std::getenv("PXG_SCENE");
+        // PXG_DIRECTAPI_CONTROL=1 builds the SAME two bodies and the SAME joint
+        // WITHOUT the flag, so the joint reaction can be read the ordinary way
+        // (PxConstraint::getForce) and compared.  It is a DIAGNOSTIC, reported and
+        // never scored, exactly like PXG_CPU_CONTROL and PXG_PARTICLE_FLUID_CONTROL
+        // -- and it is what settled the torque convention: the first green run
+        // reported |T| = 39240, not the m*g*d = 4905 this scene had guessed, and a
+        // guess is not something to fit a constant to.
+        if (sn && !std::strcmp(sn, "directapi") && !std::getenv("PXG_DIRECTAPI_CONTROL"))
+        {
+            if (cpuControl)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=directapi requires the GPU pipeline; "
+                            "PXG_CPU_CONTROL=1 is incompatible with eENABLE_DIRECT_GPU_API\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+            std::printf("  [ P9.79 ] eENABLE_DIRECT_GPU_API raised: host writeback is OFF, the "
+                        "direct-API getters are the only way to see the simulation\n");
+        }
+    }
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
     sceneDesc.gpuDynamicsConfig.maxRigidPatchCount = 1024;
@@ -8322,6 +8462,266 @@ int main()
         return 2;
     }
 
+    // P9.79 -- PXG_SCENE=directapi.  Its own arm rather than a RestTarget, because
+    // with eENABLE_DIRECT_GPU_API raised the host actor poses are no longer updated
+    // by the simulation and the generic rest check would be reading a spawn pose.
+    if (!std::strcmp(sceneName, "directapi"))
+    {
+        DirectApiScene ds = buildDirectApiScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'directapi' built: a falling box + a 1000 kg box on a "
+                    "fully-locked D6 joint attached %.2f m off its centre of mass\n",
+                    ds.hangerAttachOffsetX);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: directapi pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+
+        // PXG_DIRECTAPI_CONTROL=1: the same scene with the direct-API flag NOT
+        // raised, read through the ORDINARY API.  Reported, never scored.
+        //
+        // This is the independent oracle for the joint reaction.  PxConstraint::
+        // getForce() and PxDirectGPUAPI::getD6JointData() are two different readers
+        // of the SAME PxgConstraintWriteback row, so agreement between them says the
+        // direct-API kernels transcribe the row correctly -- and, just as usefully,
+        // it says what FRAME the row is expressed in, which is not something this
+        // scene gets to decide.
+        if (std::getenv("PXG_DIRECTAPI_CONTROL"))
+        {
+            const float dtC = 1.0f / 60.0f;
+            for (int i = 0; i < 240; ++i) { scene->simulate(dtC); scene->fetchResults(true); }
+            PxVec3 f(0.0f), tq(0.0f);
+            ds.joint->getConstraint()->getForce(f, tq);
+            const PxVec3 hp = ds.hanger->getGlobalPose().p;
+            std::printf("  [ control ] PXG_DIRECTAPI_CONTROL=1 (no direct-GPU API, ordinary readback)\n");
+            std::printf("  [ control ] faller y=%.4f   hanger COM=(%.4f, %.4f, %.4f)\n",
+                        ds.faller->getGlobalPose().p.y, hp.x, hp.y, hp.z);
+            std::printf("  [ control ] PxConstraint::getForce  force =(%+9.2f, %+9.2f, %+9.2f) |F|=%.2f\n",
+                        f.x, f.y, f.z, f.magnitude());
+            std::printf("  [ control ] PxConstraint::getForce  torque=(%+9.2f, %+9.2f, %+9.2f) |T|=%.2f\n",
+                        tq.x, tq.y, tq.z, tq.magnitude());
+            std::printf("  [ control ] anchor=(%.2f, %.2f, %.2f)  m*g=%.2f\n",
+                        ds.anchorWorld.x, ds.anchorWorld.y, ds.anchorWorld.z, ds.hangerMass * 9.81f);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            std::printf("[ control ] gpu-sdk-step: directapi control run, not scored\n");
+            return 0;
+        }
+
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+
+        // One device index buffer and one device output buffer, reused for every read.
+        // POISON is the point: a refused launch leaves it untouched, so a wrong answer
+        // reads as an impossible number and never as a plausible stale one.
+        static const float POISON = -999.0f;
+        const size_t OUT_FLOATS = 8;                    // a PxTransform is 7; round up
+        CUdeviceptr devIdx = 0, devOut = 0;
+        if (ctx->memAlloc(&devIdx, sizeof(PxU32)) != 0 || !devIdx ||
+            ctx->memAlloc(&devOut, OUT_FLOATS * sizeof(float)) != 0 || !devOut)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: directapi memAlloc failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+
+        // Reads `count` floats back through the direct API after poisoning the output,
+        // so "refused" and "answered" are never the same bit pattern.
+        auto readPoisoned = [&](auto call, PxU32 gpuIndex, float* host, size_t count) -> bool
+        {
+            float poison[OUT_FLOATS];
+            for (size_t i = 0; i < OUT_FLOATS; ++i) poison[i] = POISON;
+            ctx->memcpyHtoD(devOut, poison, OUT_FLOATS * sizeof(float));
+            ctx->memcpyHtoD(devIdx, &gpuIndex, sizeof(PxU32));
+            const bool ok = call(devOut, devIdx);
+            ctx->memcpyDtoH(host, devOut, count * sizeof(float));
+            return ok;
+        };
+
+        PxDirectGPUAPI& api = scene->getDirectGPUAPI();
+        const PxU32 fallerIdx = ds.faller->getGPUIndex();
+        const PxU32 jointIdx  = ds.joint->getGPUIndex();
+
+        const float dt = 1.0f / 60.0f;
+        const int steps = 240;
+        std::printf("  stepping directapi (%d x %.4fs): faller gpuIndex=%u, joint gpuIndex=%u\n",
+                    steps, dt, fallerIdx, jointIdx);
+
+        // PxTransform is (q.xyzw, p.xyz): the CENTRE HEIGHT is element 5, not 6.
+        // Element 6 is p.z, which is ~0 for this scene -- so reading it as y gave a
+        // "did not begin falling" check that passed for every possible simulation,
+        // including one that never ran.  Found by the first green run printing
+        // "pose after 1 step y=0.0000" for a box spawned at y=5.
+        static const size_t POSE_PY = 5;
+        float poseAfterOne[8] = { POISON, POISON, POISON, POISON, POISON, POISON, POISON, POISON };
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i == 0)
+                readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+                    return api.getRigidDynamicData(reinterpret_cast<void*>(out),
+                                                   reinterpret_cast<const PxRigidDynamicGPUIndex*>(idx),
+                                                   PxRigidDynamicGPUAPIReadType::eGLOBAL_POSE, 1);
+                }, fallerIdx, poseAfterOne, 7);
+        }
+
+        float pose[8], linVel[8], angVel[8], jForce[8], jTorque[8];
+        const bool okPose = readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+            return api.getRigidDynamicData(reinterpret_cast<void*>(out),
+                                           reinterpret_cast<const PxRigidDynamicGPUIndex*>(idx),
+                                           PxRigidDynamicGPUAPIReadType::eGLOBAL_POSE, 1);
+        }, fallerIdx, pose, 7);
+        const bool okLin = readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+            return api.getRigidDynamicData(reinterpret_cast<void*>(out),
+                                           reinterpret_cast<const PxRigidDynamicGPUIndex*>(idx),
+                                           PxRigidDynamicGPUAPIReadType::eLINEAR_VELOCITY, 1);
+        }, fallerIdx, linVel, 3);
+        const bool okAng = readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+            return api.getRigidDynamicData(reinterpret_cast<void*>(out),
+                                           reinterpret_cast<const PxRigidDynamicGPUIndex*>(idx),
+                                           PxRigidDynamicGPUAPIReadType::eANGULAR_VELOCITY, 1);
+        }, fallerIdx, angVel, 3);
+        const bool okF = readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+            return api.getD6JointData(reinterpret_cast<void*>(out),
+                                      reinterpret_cast<const PxD6JointGPUIndex*>(idx),
+                                      PxD6JointGPUAPIReadType::eJOINT_FORCE, 1);
+        }, jointIdx, jForce, 3);
+        const bool okT = readPoisoned([&](CUdeviceptr out, CUdeviceptr idx) {
+            return api.getD6JointData(reinterpret_cast<void*>(out),
+                                      reinterpret_cast<const PxD6JointGPUIndex*>(idx),
+                                      PxD6JointGPUAPIReadType::eJOINT_TORQUE, 1);
+        }, jointIdx, jTorque, 3);
+
+        ctx->memFree(devIdx);
+        ctx->memFree(devOut);
+
+        // The host pose is printed as an INTERNAL CONTROL, not asserted: with the
+        // direct API on, PhysX stops writing simulation results back into the actor,
+        // so this number is expected to differ from the direct read.  If the two ever
+        // agree exactly, the direct read may be echoing the host rather than the GPU.
+        const PxVec3 hostP = ds.faller->getGlobalPose().p;
+
+        // *** THE TORQUE CONVENTION, MEASURED RATHER THAN ASSUMED -- AND IT IS NOT
+        //     THE SAME CONVENTION IN BOTH SOLVERS. ***
+        //
+        // This scene first guessed |T| = m*g*d, the moment of gravity about the
+        // body's own centre of mass, and under TGS measured 39240 where it expected
+        // 4905.  The guess was wrong, not the port, and PXG_DIRECTAPI_CONTROL=1
+        // settled it: that mode reads the SAME PxgConstraintWriteback row through
+        // PxConstraint::getForce() -- a different reader, direct-GPU API off -- and
+        // agrees with the direct-API read to the last digit in BOTH solver modes.
+        //
+        // What the four runs actually say (anchor (4,3,2), attachment 0.5 m to -x of
+        // the centre of mass, F measured as (0, -9810, 0) everywhere):
+        //
+        //   GPU TGS  direct-API    (-19620, 0, +39240)  = -(anchor    x F)
+        //   GPU TGS  getForce()    (-19620, 0, +39240)  identical
+        //   GPU PGS  direct-API    (     0, 0,  -4905)  = -(attachment x F)
+        //   GPU PGS  getForce()    (     0, 0,  -4905)  identical
+        //
+        // So both solver cores write "-(arm x F)" and they disagree about the ARM:
+        // TGS reports the moment about ACTOR0's origin (actor0 is NULL here, i.e.
+        // the world), PGS the moment about the hanger's own centre of mass.  That is
+        // an ENGINE property, not a port one -- the two direct-API kernels multiply
+        // one writeback row by oneOverDt and have no frame of their own -- so the
+        // expectation below follows the solver rather than pretending there is one
+        // answer.  Each is written as the RELATION applied to the force this run
+        // measured, never as a fitted triple: a constant would pass for this anchor
+        // and say nothing.
+        //
+        // ONE THING THIS TRANCHE DID NOT RESOLVE, recorded here so it is not lost:
+        // PXG_CPU_CONTROL=1 (PhysX's own CPU solver, same geometry) reports
+        // (0, 0, -4905) under PGS -- matching the GPU exactly -- but
+        // (-39240, 0, +78480) under TGS, which is exactly TWICE the GPU TGS answer.
+        // The linear force matches in all four combinations.  That factor of two
+        // lives in the TGS writeback, not in these getters, and it is P9.79b.
+        const float mass = ds.hangerMass, g = 9.81f;
+        const float expF = mass * g;
+        const PxVec3 F(jForce[0], jForce[1], jForce[2]);
+        const PxVec3 T(jTorque[0], jTorque[1], jTorque[2]);
+        const PxVec3 expFv(0.0f, -expF, 0.0f);
+        // the moment arm each solver core uses, as measured above
+        const PxVec3 torqueArm = usePgs ? PxVec3(ds.hangerAttachOffsetX, 0.0f, 0.0f)
+                                        : ds.anchorWorld;
+        const PxVec3 expT = -torqueArm.cross(F);   // the convention, applied to the MEASURED force
+        const float expTmag = expT.magnitude();
+
+        std::printf("  faller: pose after 1 step y=%.4f, final pose=(%.4f, %.4f, %.4f) q=(%.3f %.3f %.3f %.3f)\n",
+                    poseAfterOne[POSE_PY], pose[4], pose[5], pose[6], pose[0], pose[1], pose[2], pose[3]);
+        std::printf("  faller: linVel=(%.4f, %.4f, %.4f)  angVel=(%.4f, %.4f, %.4f)\n",
+                    linVel[0], linVel[1], linVel[2], angVel[0], angVel[1], angVel[2]);
+        std::printf("  faller: HOST pose (control, writeback is off) y=%.4f\n", hostP.y);
+        std::printf("  joint : force =(%+9.2f, %+9.2f, %+9.2f) |F|=%.2f   expected m*g = %.2f\n",
+                    F.x, F.y, F.z, F.magnitude(), expF);
+        std::printf("  joint : torque=(%+9.2f, %+9.2f, %+9.2f) |T|=%.2f   expected -(%s x F) = "
+                    "(%+9.2f, %+9.2f, %+9.2f)\n",
+                    T.x, T.y, T.z, T.magnitude(),
+                    usePgs ? "attachment" : "anchor", expT.x, expT.y, expT.z);
+        std::printf("  api returned: pose=%d linVel=%d angVel=%d force=%d torque=%d\n",
+                    int(okPose), int(okLin), int(okAng), int(okF), int(okT));
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+
+        int failures = 0;
+        auto poisoned = [&](const float* v, size_t n) {
+            for (size_t i = 0; i < n; ++i) if (v[i] == POISON) return true;
+            return false;
+        };
+        if (!okPose || !okLin || !okAng) { std::printf("FAIL: a direct-API rigid read returned false\n"); ++failures; }
+        if (!okF || !okT) { std::printf("FAIL: a direct-API D6 joint read returned false\n"); ++failures; }
+        if (poisoned(pose, 7))
+        { std::printf("FAIL: the global-pose read came back POISONED -- getRigidDynamicGlobalPose never ran "
+                      "(a mapped kernel with no row in bridge/PxgVulkanKernelAbi.cpp is refused on every "
+                      "launch; see check_launch_abi.py)\n"); ++failures; }
+        if (poisoned(linVel, 3) || poisoned(angVel, 3))
+        { std::printf("FAIL: a velocity read came back POISONED -- getRigidDynamicLinear/AngularVelocity never ran\n"); ++failures; }
+        if (poisoned(jForce, 3))
+        { std::printf("FAIL: the joint-force read came back POISONED -- getD6JointForces never ran\n"); ++failures; }
+        if (poisoned(jTorque, 3))
+        { std::printf("FAIL: the joint-torque read came back POISONED -- getD6JointTorques never ran\n"); ++failures; }
+        if (!(poseAfterOne[POSE_PY] < 5.0f))
+        { std::printf("FAIL: the faller did not begin falling (y after 1 step = %.4f)\n", poseAfterOne[POSE_PY]); ++failures; }
+        if (!(std::fabs(pose[5] - 0.5f) < 0.1f))
+        { std::printf("FAIL: the faller rests at y=%.4f, not 0.5 -- the direct-API pose read disagrees "
+                      "with the number PXG_SCENE=box has measured forty-nine times\n", pose[5]); ++failures; }
+        if (!(PxVec3(linVel[0], linVel[1], linVel[2]).magnitude() < 0.75f))
+        { std::printf("FAIL: the faller is not at rest (|v|=%.4f)\n",
+                      PxVec3(linVel[0], linVel[1], linVel[2]).magnitude()); ++failures; }
+        // The force is asserted COMPONENTWISE against static equilibrium: a 1000 kg
+        // box held still needs exactly m*g straight down and nothing sideways.
+        if (!((F - expFv).magnitude() < 0.02f * expF))
+        { std::printf("FAIL: joint force (%+.2f, %+.2f, %+.2f), expected (%+.2f, %+.2f, %+.2f) -- "
+                      "static equilibrium of a %.0f kg box\n",
+                      F.x, F.y, F.z, expFv.x, expFv.y, expFv.z, mass); ++failures; }
+        // The torque is asserted componentwise against -(arm x F) for this solver's
+        // arm.  Under TGS the anchor is off TWO axes, so two components have to come
+        // out right, not one; under PGS the single-axis attachment gives one.
+        if (!((T - expT).magnitude() < 0.02f * expTmag))
+        { std::printf("FAIL: joint torque (%+.2f, %+.2f, %+.2f), expected (%+.2f, %+.2f, %+.2f) = "
+                      "-(%s x F) with arm (%.2f, %.2f, %.2f)\n",
+                      T.x, T.y, T.z, expT.x, expT.y, expT.z,
+                      usePgs ? "attachment" : "anchor",
+                      torqueArm.x, torqueArm.y, torqueArm.z); ++failures; }
+        // ...and the torque must not be the trivially-right answer a refused kernel
+        // also gives.  The joint frame is off-centre precisely so this is non-zero.
+        if (!(T.magnitude() > 0.1f * expF))
+        { std::printf("FAIL: the joint torque is ~zero (%.2f) -- an unanswered query looks like this\n",
+                      T.magnitude()); ++failures; }
+
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the DIRECT-GPU API is live on Vulkan -- the box's pose and "
+                        "velocity came back from the GPU with host writeback off, and the D6 joint reports "
+                        "%.0f N and a torque of %.0f N m matching -(%s x F) to within 2%%\n",
+                        F.magnitude(), T.magnitude(), usePgs ? "attachment" : "anchor");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: directapi checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -8358,6 +8758,7 @@ int main()
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "          clothnet|particlepush|articulationjoint   (P9.41: pending-work, not scored)\n"
                        "          particleattach                          (P9.76: the particle ATTACHMENT chain)\n"
+                       "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

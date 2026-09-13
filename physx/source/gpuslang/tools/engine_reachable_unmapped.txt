@@ -67,13 +67,27 @@ trimeshPlaneNarrowphase
 # PxgSoftBodyCore.cpp (4)
 sb_copyOrApplySoftBodyDataDEPRECATED
 sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch
+# sb_plasticDeformLaunch / sb_plasticDeformLaunch2 -- P9.79's liveness audit found
+# that PxgSoftBodyCore::plasticDeformation() has EXACTLY ONE call site in the tree
+# and it is COMMENTED OUT (PxgSoftBodyCore.cpp:986, `//plasticDeformation();`).
+# They stay on this ratchet because the checker's ENGINE test is "a .cpp outside
+# gpuslang names the PxgKernelIds enum", which is true -- but porting them would
+# move the manifest and move what the port can DO by nothing, and no scene could
+# observe a wrong answer.  Left here WITH THE REASON rather than quietly ported.
 sb_plasticDeformLaunch
 sb_plasticDeformLaunch2
 
-# PxgSimulationCore.cpp (3)
-getD6JointForces
-getD6JointTorques
-mergeChangedAABBMgrHandlesLaunch
+# PxgSimulationCore.cpp (1) -- P9.79 mapped the other two.
+# getD6JointForces / getD6JointTorques -- MAPPED in P9.79 (directApiBda.spv).  The
+# first two kernels this project reached by RAISING A SCENE FLAG rather than by
+# adding geometry: they are launched only through PxDirectGPUAPI::getD6JointData,
+# which needs PxSceneFlag::eENABLE_DIRECT_GPU_API, which no scene raised until
+# PXG_SCENE=directapi.  Observed there as the 9810 N / 4905 N m static equilibrium
+# of a 1000 kg box held 0.5 m off its centre of mass.
+# mergeChangedAABBMgrHandlesLaunch -- MAPPED in P9.79 (updateBounds.spv), next to
+# the sibling it differs from by one character: `|=` where
+# updateChangedAABBMgrHandlesLaunch writes `=`.  Launched from ScPipeline.cpp:355
+# under `if (isDirectGPUAPIInitialized())`, 239 times in a 240-step directapi run.
 
 # PxgPBDParticleSystemCore.cpp (3)
 applyParticleBufferDataDEPRECATED
@@ -90,4 +104,18 @@ bodyInputAndRanksSingleBlockLaunch
 mergeTransformCacheAndBoundArrayChanges
 
 # PxgMemCopyDispatcher.cpp (1)
+# copyUserData -- a FIFTH kind of unreachability, found by P9.79 and named here
+# because no existing bucket covers it: its launch site
+# (PxgMemCopyDispatcher::flushCommands) is compiled, but PxgMemCopyDispatcher is
+# CONSTRUCTED NOWHERE -- not as a member, not as a local, not via PX_NEW.  The
+# owner class is dead, so the call site can never run.
+#
+# check_unmapped_reachability.py cannot see this: its ENGINE test is a
+# `PxgKernelIds::<ENUM>` text match over .cpp files outside gpuslang, and that match
+# succeeds.  The entry therefore STAYS on the ratchet -- shrinking it by hand on a
+# hand-verified argument is how a ratchet stops ratcheting -- but the measurement is
+# recorded so the next tranche does not spend a day porting a kernel nothing runs.
+# Turning this into a SIXTH checker bucket (DEAD_OWNER, re-derived per run like
+# STANDALONE's three legs) is worth doing when a second instance shows up; one
+# instance does not justify a checker that could itself be wrong.
 copyUserData

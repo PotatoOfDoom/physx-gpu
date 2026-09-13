@@ -97,7 +97,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
-        particlepush articulationjoint clothnet particlesoftbody particleattach"
+        particlepush articulationjoint clothnet particlesoftbody particleattach directapi"
 
 pass=0; fail=0; missing=0
 

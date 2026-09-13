@@ -7,7 +7,14 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **858/858** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **863/863** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.79 added five (`gpuslang.directApiRigidGet`, `.directApiD6JointGet`,
+`.directApiRadixCopy2`, `.directApiMergeAabb`, `.directApiUpdateBodies`) and the
+FIRST scene that raises `PxSceneFlag::eENABLE_DIRECT_GPU_API`.  Its liveness audit of
+the twenty engine-reachable unmapped kernels found a whole family behind that one flag
+-- nine kernels were being refused or skipped on every launch and nothing in
+forty-nine scenes could reach them.  Manifest **412 -> 415**, KNOWN_UNWIRED **54 -> 48**,
+engine-reachable unmapped **20 -> 17**.
 P9.78 added `gpuslang.pushBlock`, the SIXTEENTH static checker and the FIFTH written
 because its defect had already happened: `pushConstantSizeFor()` derives the pushed
 blob size from the ABI ROW and never from the SPIR-V, so a shader whose push block
@@ -24,7 +31,7 @@ P9.77 added `gpuslang.launchAbiPack`, the FIFTEENTH static checker, and P9.76c a
 fixture, not a new ctest row, which is why that tranche moved the count by one.
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
-**29 are reachable** from the simulation pipeline.  58 are app-facing features that
+**29 were reachable** from the simulation pipeline (17 after P9.79).  58 are app-facing features that
 this build cannot construct at all (`PxGpuCreatePhysicsGpu()` returns NULL and
 `physxgpu/src` is never compiled), and 11 are launched by nothing even upstream.
 P9.64 added `gpuslang.fixtureGrid`, the TWELFTH static checker and the THIRD written
@@ -1885,6 +1892,177 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.79 — die Direct-GPU-API, zum ersten Mal von einer Szene gefahren
+
+Neun Kernel. Aber die Tranche handelt nicht von neun Kerneln, sondern davon, **wie sie
+gefunden wurden**: nicht durch Lesen der Manifest-Liste, sondern durch eine
+**Lebendigkeitsprüfung** der zwanzig als engine-erreichbar geführten unmapped Kernel.
+
+### Der Befund, der die Tranche bestimmt hat
+
+Für jeden der zwanzig: welche Funktion startet ihn, und wer ruft die auf? Das Ergebnis
+war nicht das erwartete „zwanzig einzelne Aufgaben":
+
+```
+sb_plasticDeformLaunch / ...Launch2   plasticDeformation() hat GENAU EINEN Aufrufer,
+                                      und der ist AUSKOMMENTIERT
+                                      (PxgSoftBodyCore.cpp:986  //plasticDeformation();)
+copyUserData                          PxgMemCopyDispatcher wird NIRGENDS im Baum
+                                      konstruiert -- die Klasse ist übersetzt und tot
+getD6JointForces / getD6JointTorques  nur über PxDirectGPUAPI::getD6JointData
+mergeChangedAABBMgrHandlesLaunch      ScPipeline.cpp:355, if (isDirectGPUAPIInitialized())
+mergeTransformCacheAndBoundArray...   PxgSimulationController.cpp:703, if (getEnableDirectGPUAPI())
+evaluatePointDistancesSDFBatch        nur über PxDirectGPUAPI::evaluateSDFDistances
+```
+
+Eine ganze **Familie** hängt an **einem einzigen Szenen-Flag**, und
+`PxSceneFlag::eENABLE_DIRECT_GPU_API` hatte in neunundvierzig Szenen **niemand** gesetzt.
+
+Damit war die Reihenfolge festgelegt: erst der Beobachter, dann der Port.
+
+### PXG_SCENE=directapi, geschrieben bevor eine Zeile Shader existierte
+
+Zwei Körper. Ein 1000-kg-Würfel fällt aus y=5 auf den Boden — dieselbe Geometrie wie
+`PXG_SCENE=box`, deren Ruhehöhe 0.5 dieses Harness fünfzig Mal gemessen hat. Ein zweiter
+1000-kg-Würfel hängt an einem vollständig gesperrten D6-Gelenk, dessen Anker bei
+(4, 3, 2) liegt und dessen Befestigungspunkt **0.5 m neben dem Schwerpunkt**.
+
+Zwei Entscheidungen machen die Szene erst zu einem Instrument:
+
+**Mit der Direct-API schreibt die SDK nichts mehr in die Host-Aktoren zurück.**
+`PxRigidDynamic::getGlobalPose()` ist nicht mehr die Pose des Körpers — der direkte Lesezugriff
+**ist** der einzige Weg zu sehen, wohin der Würfel gefallen ist. Die zentrale Zahl der Szene
+läuft also zwangsläufig durch `getRigidDynamicGlobalPose`.
+
+**Jeder Ausgabepuffer wird vor jedem Lesen mit −999 VERGIFTET.** Ein abgewiesener Kernel
+lässt das Gift stehen. Das ist die Lehre aus P9.48d, wo 361 Abweisungen exakt wie
+„der Kernel lief und fand nichts" aussahen.
+
+Der allererste Lauf, gegen einen unveränderten Shader-Baum:
+
+```
+faller: final pose=(-999.0000, -999.0000, -999.0000)
+joint : force=(-999.00, -999.00, -999.00)   erwartet m*g = 9810.00
+
+[pxg-refused] sized getRigidDynamicGlobalPose      built a 32-byte push blob
+[pxg-refused] sized getRigidDynamicLinearVelocity  built a 32-byte push blob
+[pxg-refused] sized getRigidDynamicAngularVelocity built a 32-byte push blob
+[pxg-refused] sized radixSortCopyBits2             built a 32-byte push blob
+[pxg-refused] sized radixSortCopy2                 built a 32-byte push blob
+[pxg-refused] sized updateBodiesLaunchDirectAPI    built a 8-byte push blob
+[pxg-launch]  sized getD6JointForces               UNMAPPED -- skipped
+[pxg-launch]  sized getD6JointTorques              UNMAPPED -- skipped
+[pxg-launch]  sized mergeChangedAABBMgrHandlesLaunch UNMAPPED -- skipped
+```
+
+**Sechs der neun standen längst in `check_launch_abi.py`s KNOWN_UNWIRED-Ratsche** — genau
+wofür diese Ratsche da ist. Die Szene hat eine Namensliste in eine fehlschlagende Messung
+verwandelt. `radixSortCopy2`/`radixSortCopyBits2` tragen ihre Zugehörigkeit nicht im Namen:
+ihr einziger Aufrufer ist `PxgGpuNarrowphaseCore::computeRigidsToShapes()`, und der läuft
+nur unter `mEnableDirectGPUAPI`.
+
+### Was portiert wurde
+
+`shaders/directApiBda.slang` (neu) trägt sieben Entry-Points auf der Engine-ABI;
+`directApi.slang` behält seine Phase-1-Bindungsform und ihr Fixture. Dieselbe Teilung wie
+`radixSortGather.slang` / `femContactSortBda.slang` — das Manifest entscheidet, was die
+Engine bekommt. `mergeChangedAABBMgrHandlesLaunch` kam nach `updateBounds.slang`, direkt
+neben den Zwilling, von dem es sich um **ein Zeichen** unterscheidet: `|=` statt `=`.
+Dieses eine Zeichen ist der ganze Zweck des Kernels — CPU-API und Direct-API führen je
+eigene Changed-Handle-Bitmaps, und die Broadphase braucht die **Vereinigung**.
+
+Neu gespiegelt: `PxgUpdateActorDataDescGpu` (80 B). Seine Offsets sind nicht per
+Augenschein behauptet, sondern im Fixture per `static_assert` gegen das **echte** Struct
+festgenagelt, zusammen mit `PxgBodySim`, `PxgNewBodiesDesc`, `PxgConstraintWriteback` und
+`PxgConstraintIdMapEntry::eINVALID_ID`.
+
+### Das Drehmoment: eine Vermutung, die die Messung widerlegt hat — zweimal
+
+Die Szene erwartete zunächst |T| = m·g·d = 4905 N·m, das Moment der Schwerkraft um den
+Schwerpunkt. Gemessen wurden 39240. Eine geratene Konstante an die Messung anzupassen wäre
+das Gegenteil von Arbeit, also bekam die Szene einen **unabhängigen Orakel-Modus**:
+`PXG_DIRECTAPI_CONTROL=1` baut dieselbe Geometrie **ohne** das Flag und liest dieselbe
+`PxgConstraintWriteback`-Zeile über `PxConstraint::getForce()` — ein völlig anderer Leser.
+
+Vier Läufe, F überall (0, −9810, 0):
+
+```
+GPU TGS  direct-API   (-19620, 0, +39240)   = -(Anker        x F)
+GPU TGS  getForce()   (-19620, 0, +39240)   IDENTISCH
+GPU PGS  direct-API   (     0, 0,  -4905)   = -(Befestigung  x F)
+GPU PGS  getForce()   (     0, 0,  -4905)   IDENTISCH
+```
+
+Beide Solver-Kerne schreiben „−(Arm × F)" und sind sich über den **Arm** uneins: TGS meldet
+das Moment um den Ursprung von **actor0** (hier NULL, also die Welt), PGS um den Schwerpunkt
+des Körpers. Das ist eine **Engine-Eigenschaft**, keine Port-Eigenschaft — die beiden
+Getter multiplizieren eine Writeback-Zeile mit `oneOverDt` und haben keinen eigenen Rahmen.
+Die Erwartung folgt jetzt dem Solver und ist als **Relation auf die gemessene Kraft**
+geschrieben, nie als angepasstes Tripel.
+
+### Ein Befund, den diese Tranche NICHT aufgelöst hat
+
+`PXG_CPU_CONTROL=1` — PhysX' eigener CPU-Solver, gleiche Geometrie:
+
+```
+CPU PGS  (     0, 0,  -4905)   identisch zur GPU
+CPU TGS  (-39240, 0, +78480)   EXAKT DAS DOPPELTE der GPU-TGS-Antwort
+```
+
+Die lineare Kraft stimmt in allen vier Kombinationen. Der Faktor zwei sitzt in der
+**Winkel**-Zeile des TGS-Writebacks, nicht in diesen Gettern — innerhalb jeder Pipeline
+stimmen direkter und gewöhnlicher Leser bis zur letzten Stelle überein. Aufgenommen als
+**P9.79b**, nicht stillschweigend weggeglättet.
+
+### Was das Fixture wählt, was die Szene strukturell nicht kann
+
+Die Szene beweist, dass die Kernel laufen und mit einem seit fünfzig Messungen bekannten
+Wert übereinstimmen. Mehr kann sie nicht, weil in ihr **jede Indirektion zusammenfällt**:
+ein Körper bei gpuIndex 0 (`gpuIndices` ist die Identität), dessen Schwerpunkt im
+Körperursprung liegt (`body2Actor` ist die **Identität**, die ganze Invers-Komposition
+unsichtbar), ein Gelenk mit gültigem Map-Eintrag (keine der beiden Schutzabfragen wird je
+genommen), und ein Rank-Array ohne einen einzigen AGGREGATE-Eintrag.
+
+`tests/testDirectApiBda.cpp` wählt daher: `gpuIndices` als echte **Permutation** in einen
+größeren Pool (mit einem doppelt abgefragten Index), ein `body2Actor` mit echter Drehung
+**und** Verschiebung, eine ID-Map mit `eINVALID_ID`, einen abgefragten Index **hinter**
+`constraintIdMapSize`, `oneOverDt = 60`, und Rank-Arrays mit eingestreuten AGGREGATE-Werten.
+Alles bitgenau gegen CPU-Transkriptionen **aus der .cu**.
+
+### Der Mutationslauf hat das Fixture beim Schummeln erwischt
+
+39 Mutanten, zwangsfrisch. Der erste Lauf: **38 getötet, 1 ÜBERLEBT** —
+`d6-drop-mapsize-guard` (`if (index < constraintIdMapSize)` → `if (true)`).
+
+Diagnose, nicht Ausrede: der Gerätepuffer der ID-Map endete exakt bei `MAP_SIZE`, also
+landete ein Lesezugriff dahinter in genullter Polsterung, nahm die `eINVALID_ID`-Abzweigung
+**aus Versehen** und lieferte dasselbe `PxVec3(0)`, das die Schutzabfrage absichtlich
+liefert. **Klasse D — durch Zufall ununterscheidbar.**
+
+Die Korrektur ist genau das, wovor die Abfrage schützt, und die Engine sagt es selbst:
+*„the size is not taken from the device side map because it might be larger than the host
+side one"*. Die Geräte-Map trägt jetzt **zwölf** Einträge, wo der Host **sechs** kennt —
+mit gültigen Einträgen und lebendigen Writeback-Zeilen dahinter. Ohne die Abfrage kommt
+eine echte Antwort ungleich null zurück, und der Vergleich sieht sie.
+
+Ein zweiter Mutant war ANCHOR-FAIL: `const uint i = w * 32u + lane;` steht wörtlich auch im
+`=`-Zwilling. Die Schleifenvariable des Merge-Kernels heißt jetzt `shape` — ein besserer
+Name und ein eindeutiger Anker.
+
+Nach beiden Korrekturen: **39 von 39 getötet, 0 überlebt, 0 nocompile, 0 anchor-fail.**
+
+### Messungen
+
+| | |
+|---|---|
+| Szene TGS | faller y 5.0000 → **0.5000**, \|v\| 0.0035; Gelenk 9810.00 N, T = −(Anker × F) |
+| Szene PGS | faller y 5.0000 → **0.5000**, \|v\| 0.0001; Gelenk 9810.00 N, T = −(Befestigung × F) |
+| Host-Pose (Kontrolle) | bleibt 5.0000 — der Rückschrieb ist wirklich aus |
+| Manifest | 412 → **415** von 501 |
+| KNOWN_UNWIRED | 54 → **48** |
+| engine-erreichbar unmapped | 20 → **17** |
+| Suite | 858 → **863** in beiden Speichermodi |
 
 ## P9.78b — Reichweite ist nicht Abdeckung, und der Prüfer fand seinen eigenen Fehler
 

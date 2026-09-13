@@ -91,6 +91,29 @@ public struct PxgNewBodiesDescGpu
     public uint mNbNewBodies;                 // @16 (+4 bytes pad -> 24)
 }
 
+// mirrors PxgUpdateActorDataDesc (80 bytes incl. 4 bytes of padding after
+// mBitMapWordCounts; only ever dereferenced as desc[0]).  This is the DIRECT-GPU
+// API's twin of PxgSimulationCoreDesc: the same pipeline stage, a different and
+// much smaller descriptor, uploaded from PxgSimulationCore::gpuDmaUpdateData().
+//
+// P9.79 added it for mergeChangedAABBMgrHandlesLaunch, which is launched from
+// ScPipeline.cpp:355 under `if (isDirectGPUAPIInitialized())` and nowhere else.
+// Its offsets are pinned by testSimCoreDescLayout, like every other mirror here.
+public struct PxgUpdateActorDataDescGpu
+{
+    public uint64_t mBodySimBufferDeviceData;   // @0  PxgBodySim*
+    public uint64_t mShapes;                    // @8  PxgShape*
+    public uint64_t mTransformCache;            // @16 PxsCachedTransform*
+    public uint64_t mBounds;                    // @24 PxBounds3*
+    public uint64_t mRigidNodeIndices;          // @32 PxNodeIndex*
+    public uint64_t mShapeIndices;              // @40 PxU32*
+    public uint64_t mUpdated;                   // @48 PxU32*  (direct-API changed handles)
+    public uint64_t mChangedAABBMgrHandles;     // @56 PxU32*  (CPU-API changed handles)
+    public uint mBitMapWordCounts;              // @64 (+4 bytes pad)
+    public uint _pad0;                          // @68
+    public uint64_t mShapeSimsBufferDeviceData; // @72 const PxgShapeSim*
+}                                               // = 80
+
 // mirrors PxBounds3 (24 bytes, two tightly packed PxVec3)
 public struct PxBounds3Gpu
 {
