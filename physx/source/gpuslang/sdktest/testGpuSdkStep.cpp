@@ -23,6 +23,8 @@
 #include "cooking/PxCooking.h"
 #include "extensions/PxD6Joint.h"   // PxD6JointCreate + PxD6Axis/PxD6Motion (jointed scene)
 #include "cudamanager/PxCudaContext.h" // PxCudaContext::memcpyHtoD/DtoH (particle buffer fill/read)
+#include "PxDeformableAttachment.h"  // PxParticleRigidAttachment (P9.76, PXG_SCENE=particleattach)
+#include "PxNodeIndex.h"             // PxNodeIndex().getInd() -- the STATIC anchor sentinel
 
 #include <cstdio>
 #include <cmath>
@@ -1477,6 +1479,13 @@ struct ParticleScene
     // P9.41: non-null only for PXG_SCENE=particlepush -- the 10 kg box the cloud is
     // fired at.  It doubles as the scene's one live dynamic rigid.
     PxRigidDynamic* pushBox = nullptr;
+    // P9.76: non-null only for PXG_SCENE=particleattach -- the static anchor every
+    // pinned particle hangs from.  `freeParticle` is the ONE index deliberately left
+    // unpinned, which is this scene's internal control: if gravity were not running at
+    // all, "the cloud did not fall" would prove nothing.
+    PxRigidStatic* anchor = nullptr;
+    PxU32 numAttached = 0;
+    PxU32 freeParticle = 0;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -1499,14 +1508,30 @@ struct ParticleScene
 // the scene touches the box.  Whether the box moves is the observable.
 static const float PUSH_SPEED = 4.0f;
 static const float PUSH_BOX_X = 2.5f;
+// P9.76 -- attachMode (PXG_SCENE=particleattach): the solid 4x4x4 cloud, with every
+// particle but ONE pinned to a STATIC anchor at its own spawn position through
+// PxParticleBuffer::setRigidAttachments.  That is the only application entry point
+// into ps_rigidAttachmentPrepareLaunch and ps_solveRigidAttachments{,TGS}Launch, and
+// no other scene in this tree reaches them.
+//
+// The scene carries its OWN control, so it needs no second run and no environment
+// variable: particle 0 is deliberately left unpinned.  If the attachment chain is
+// live, the 63 pinned particles stay at y = 4 and particle 0 falls to the floor.  If
+// it is dead, all 64 fall together -- and if gravity were somehow not running, the
+// free particle would stay too, which is the reading "nothing moved" cannot
+// distinguish on its own.
+static const float ATTACH_START_Y = 4.0f;
+static const PxU32 ATTACH_FREE_PARTICLE = 0u;
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
                                  bool boundaryMode = false, bool meshFloorMode = false,
                                  bool hfFloorMode = false, bool diffuseMode = false,
-                                 bool convexFloorMode = false, bool pushMode = false)
+                                 bool convexFloorMode = false, bool pushMode = false,
+                                 bool attachMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
+    PxRigidStatic* groundStatic = nullptr;   // P9.76: the attach scene's anchor
 
     // A minimal rigid body (box on ground) FAR BELOW the cloud.  The engine drives
     // the rigid solver core for the particle island's iteration loop; with zero
@@ -1544,7 +1569,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     }
     else
     {
-        addGroundBox(physics, scene, rigidMat);
+        groundStatic = addGroundBox(physics, scene, rigidMat);
     }
     // The engine drives the rigid solver core for the particle island, so one live
     // dynamic rigid body is required (else rigidSumInternalContactAndJointBatches2
@@ -1699,9 +1724,13 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // pushMode: the bottom row sits exactly one rest offset above the ground, so the
     // cloud slides rather than drops, and the box face at x = 2.0 is 0.75 m from the
     // cloud's leading row -- eleven steps at PUSH_SPEED.
-    const float startY = fluidMode ? 0.6f : pushMode ? 0.25f : (startYEnv ? float(atof(startYEnv)) : 100.0f);
+    // attachMode: y = 4, well clear of the ground box at 0.5 but close enough that a
+    // free fall reaches it inside the run -- so "did not fall" and "fell" are two
+    // numbers a metre apart, not a tolerance argument.
+    const float startY = fluidMode ? 0.6f : pushMode ? 0.25f : attachMode ? ATTACH_START_Y
+                                                             : (startYEnv ? float(atof(startYEnv)) : 100.0f);
     const float cloudX = pushMode ? 0.5f : 0.0f;
-    if (startYEnv || fluidMode || pushMode)
+    if (startYEnv || fluidMode || pushMode || attachMode)
         ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
     std::vector<PxVec4> hostPos(N), hostVel(N, pushMode ? PxVec4(PUSH_SPEED, 0.0f, 0.0f, 0.0f)
                                                           : PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1781,6 +1810,56 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     ps->addParticleBuffer(buffer);
     scene->addActor(*ps);
 
+    // P9.76 -- the rigid ATTACHMENTS.  This is the recipe PxParticleAttachmentBuffer
+    // uses (ExtParticleExt.cpp:269-303), open-coded so the scene owns every byte:
+    //   - a STATIC anchor takes mID0 = PxNodeIndex().getInd() (the 0xffffffff
+    //     sentinel the prepare tests with isStaticBody) and mLocalPose0 in WORLD
+    //     space, not body space ("attachments to rigid static work in global space");
+    //   - mID1 is the BUFFER-LOCAL particle id;
+    //   - the cone limit is left default-constructed, i.e. DISABLED
+    //     (mAngle/mLowLimit/mHighLimit all -1), which is the branch this port defers;
+    //   - the array must live in DEVICE memory: setRigidAttachments takes a device
+    //     pointer and the prepare dereferences it from the GPU.
+    // The system must also be told the anchor participates, or the island manager has
+    // no reason to keep it around (NpPBDParticleSystem::addRigidAttachment).
+    if (attachMode)
+    {
+        if (!groundStatic)
+        {
+            std::printf("FAIL: particleattach needs the ground box as its anchor\n");
+            return out;
+        }
+        ps->addRigidAttachment(groundStatic);
+
+        std::vector<PxParticleRigidAttachment> att;
+        att.reserve(N - 1u);
+        for (PxU32 i = 0; i < N; ++i)
+        {
+            if (i == ATTACH_FREE_PARTICLE) continue;   // the scene's internal control
+            PxParticleRigidAttachment a(PxConeLimitedConstraint(), PxVec4(0.0f));
+            a.mID0 = PxNodeIndex().getInd();
+            a.mID1 = i;
+            // world position = where the particle was spawned, so the constraint's
+            // position error starts at zero and the cloud is asked to STAY, not move.
+            a.mLocalPose0 = PxVec4(hostPos[i].x, hostPos[i].y, hostPos[i].z, 0.0f);
+            att.push_back(a);
+        }
+        CUdeviceptr devAtt = 0;
+        const size_t bytes = att.size() * sizeof(PxParticleRigidAttachment);
+        if (ctx->memAlloc(&devAtt, bytes) != 0 || !devAtt)
+        {
+            std::printf("FAIL: memAlloc for %zu attachment bytes failed\n", bytes);
+            return out;
+        }
+        ctx->memcpyHtoD(devAtt, att.data(), bytes);
+        buffer->setRigidAttachments(reinterpret_cast<PxParticleRigidAttachment*>(devAtt),
+                                    PxU32(att.size()));
+        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_ATTACHMENTS);
+        out.anchor = groundStatic;
+        out.numAttached = PxU32(att.size());
+        out.freeParticle = ATTACH_FREE_PARTICLE;
+    }
+
     out.system = ps;
     out.buffer = buffer;
     out.numParticles = N;
@@ -1855,6 +1934,31 @@ float particleMeanY(const ParticleScene& psc)
     double sum = 0.0;
     for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
     return float(sum / double(psc.numParticles));
+}
+
+// P9.76 -- DtoH-read the particle buffer and split it into the PINNED mean y, the
+// pinned MINIMUM y and the ONE free particle's y.  Splitting is the whole point: the
+// mean over all 64 would blend the control into the signal it is meant to separate.
+struct AttachY { float pinnedMean, pinnedMin, freeY; bool finite; };
+AttachY particleAttachY(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    AttachY r; r.pinnedMean = 0.0f; r.pinnedMin = FLT_MAX; r.freeY = 0.0f; r.finite = true;
+    double sum = 0.0; PxU32 n = 0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i)
+    {
+        if (!std::isfinite(host[i].x) || !std::isfinite(host[i].y) || !std::isfinite(host[i].z))
+            r.finite = false;
+        if (i == psc.freeParticle) { r.freeY = host[i].y; continue; }
+        sum += double(host[i].y);
+        if (host[i].y < r.pinnedMin) r.pinnedMin = host[i].y;
+        ++n;
+    }
+    r.pinnedMean = n ? float(sum / double(n)) : 0.0f;
+    return r;
 }
 
 // DtoH-read the particle buffer and return the mean x of the cloud (P9.41: the
@@ -5900,6 +6004,93 @@ int main()
         return 2;
     }
 
+    // P9.76 -- PXG_SCENE=particleattach: the particle-vs-RIGID ATTACHMENT chain, and
+    // the first scene in this tree that reaches it at all.  63 of 64 particles are
+    // pinned to a static anchor at their spawn positions through
+    // PxParticleBuffer::setRigidAttachments; particle 0 is left free.
+    //
+    // What the three kernels have to do for this to pass:
+    //   ps_rigidAttachmentPrepareLaunch  turns each PxParticleRigidAttachment into a
+    //                                    three-axis constraint block;
+    //   ps_solveRigidAttachments{,TGS}Launch  drags the particle back to its anchor.
+    // If any of them is refused or unmapped, all 64 particles fall together.
+    if (!std::strcmp(sceneName, "particleattach"))
+    {
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
+                                               false, false, false, false, false, false, false,
+                                               /*attachMode*/ true);
+        if (!psc.system || !psc.buffer || !psc.anchor || psc.numAttached == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particleattach scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particleattach' built: %u of %u PBD particles pinned to a STATIC "
+                    "anchor at y=%.1f; particle %u left free as the scene's own control\n",
+                    psc.numAttached, psc.numParticles, ATTACH_START_Y, psc.freeParticle);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particleattach pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        AttachY a = particleAttachY(psc);
+        const float mean0 = a.pinnedMean, free0 = a.freeY;
+        bool finite = a.finite;
+        std::printf("  stepping particleattach (%d x %.4fs): pinned mean y0 = %.4f, free particle y0 = %.4f\n",
+                    steps, dt, mean0, free0);
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            a = particleAttachY(psc);
+            finite = finite && a.finite;
+            if (i < 3 || i == steps - 1 || (i % 20 == 0))
+                std::printf("    step %3d: pinned mean y = %.5f (min %.5f) | free y = %.5f\n",
+                            i, a.pinnedMean, a.pinnedMin, a.freeY);
+        }
+        std::printf("  particleattach: pinned mean y %.4f -> %.4f (sag %+.4f, min %.4f); free particle "
+                    "y %.4f -> %.4f (fell %+.4f)\n",
+                    mean0, a.pinnedMean, a.pinnedMean - mean0, a.pinnedMin, free0, a.freeY, a.freeY - free0);
+
+        int failures = 0;
+        // (1) THE PINNED PARTICLES HELD.  Free fall over 120 steps from y = 4 reaches
+        //     the floor, so the two outcomes are a metre apart and this bound is not a
+        //     tuned tolerance.
+        if (!(std::fabs(a.pinnedMean - mean0) < 0.15f))
+        { std::printf("FAIL: the pinned particles moved %+.4f (need |dy| < 0.15).  If the "
+                      "[pxg-unmapped] lines below name ps_rigidAttachmentPrepareLaunch or "
+                      "ps_solveRigidAttachments{,TGS}Launch, this is that; if they do not, the "
+                      "attachment chain ran and computed the wrong thing\n", a.pinnedMean - mean0);
+          ++failures; }
+        if (!(a.pinnedMin > ATTACH_START_Y - 0.6f))
+        { std::printf("FAIL: some pinned particle sank to y = %.4f -- the mean can hide one that "
+                      "let go\n", a.pinnedMin); ++failures; }
+        // (2) THE CONTROL FELL.  Without this, "nothing moved" would also be the reading
+        //     for a scene in which gravity never ran.
+        if (!(a.freeY < free0 - 2.0f))
+        { std::printf("FAIL: the UNPINNED particle only moved %+.4f -- gravity is not reaching the "
+                      "cloud, so the pinned particles standing still proves nothing\n",
+                      a.freeY - free0); ++failures; }
+        if (!finite) { std::printf("FAIL: a particle coordinate went non-finite\n"); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: %u particles HANG from their rigid attachments (mean y "
+                        "%.4f, sag %+.4f) while the one unpinned particle fell to %.4f -- the particle "
+                        "attachment chain is live on Vulkan: ps_rigidAttachmentPrepareLaunch and "
+                        "ps_solveRigidAttachments{,TGS}Launch\n",
+                        psc.numAttached, a.pinnedMean, a.pinnedMean - mean0, a.freeY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particleattach checks failed (%d)\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
@@ -8166,6 +8357,7 @@ int main()
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "          clothnet|particlepush|articulationjoint   (P9.41: pending-work, not scored)\n"
+                       "          particleattach                          (P9.76: the particle ATTACHMENT chain)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

@@ -1262,6 +1262,43 @@ static const uint8_t kPsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 4, 1, 8, 8 };
 //   artiCoreDesc@88).  Launch PxgParticleSystemCore.cpp:1948.
 static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1, 8 };
 
+// gpusimulationcontroller particlesystem.cu:5437 (P9.76, the particle-vs-rigid
+// attachment PREPARE).  Launch PxgParticleSystemCore.cpp:2369:
+//   (PxgParticleSystem* particleSystems, PxU64* rigidAttachmentIds,
+//    PxgParticleRigidConstraint* rigidConstraints, PxgPrePrepDesc* preDesc,
+//    PxgConstraintPrepareDesc* prepareDesc, PxReal dt, bool isTGS,
+//    PxU32* activeParticlesystems)
+//   -> 56-byte blob (dt@40, the bool's byte @44 plus 3 tail pad, pointer @48).
+//   `dt` and `isTGS` are DEAD in the kernel body; they are in the row because
+//   they are in the host pack, and the shim gates on the pack's size.
+static const uint8_t kPsPrepRigidAttach[] = { 8, 8, 8, 8, 8, 4, 1, 8 };
+
+// particlesystem.cu:5567 (PGS) and :5648 (TGS) -- P9.76, and the row is the
+// finding.  THE HOST BUILDS ONE PACK FOR BOTH (PxgParticleSystemCore.cpp:2155;
+// only the CUfunction differs from a ternary), yet the two kernels have
+// DIFFERENT signatures: the PGS one takes 8 parameters and stops at `dt`, the
+// TGS one takes 10.  cuLaunchKernel's void** form reads only as many entries as
+// the callee declares and ignores the surplus, so upstream never notices.
+//
+// The Vulkan shim does notice: it builds the blob from the HOST pack
+// (PxgVulkanCudaContext.cpp:443-462) and gates on blobSize == pushConstantSize,
+// which pushConstantSizeFor() derives from THIS row.  A row built from the PGS
+// kernel's OWN signature would be 64 bytes, and would then refuse every PGS
+// launch while silently truncating the TGS one that shares it -- P9.76b's defect
+// with the two halves swapped.  So both kernels take the 10-argument row.
+//
+// NOTE what this row does NOT constrain, measured in P9.76: the SHADER's push
+// struct is never compared against it.  pushConstantSizeFor() reads the row and
+// never the SPIR-V, so a shader declaring a SHORTER block launches happily and is
+// merely blind to the tail.  psRigidAttachBda.slang therefore declares the full
+// 72 bytes on both entry points as a matter of discipline, not because anything
+// would report it otherwise.
+//   (PxgParticleSystem*, PxgParticleRigidConstraint*, PxU32 numAttachments,
+//    PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveData>*,
+//    float4* deltaVel, PxReal dt, PxReal biasCoefficient, bool isVelocityIteration)
+//   -> 72-byte blob (count@16, dt@56, coeff@60, bool byte@64).
+static const uint8_t kPsSolveRigidAttach[] = { 8, 8, 4, 8, 8, 8, 8, 4, 4, 1 };
+
 // gpusimulationcontroller particlesystem.cu:2828 (P6.4b-2 per-particle deltaV accum):
 //   ps_accumulateDeltaVParticleLaunch(PxgParticleSystem* particleSystems,
 //     PxgParticlePrimitiveContact* sortedContacts, PxU32* totalNumPairs,
@@ -2125,6 +2162,11 @@ static const PxgKernelAbiRow kRows[] = {
     // 96-byte pack (PxgParticleSystemCore.cpp:2074-2089; only the CUfunction differs).
     { "ps_solvePCOutputRigidDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_solvePCOutputRigidDeltaVTGSLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
+    // P9.76: the particle-vs-rigid ATTACHMENT trio.  Both solves share one row
+    // because the host builds one pack for both -- see kPsSolveRigidAttach.
+    { "ps_rigidAttachmentPrepareLaunch", kPsPrepRigidAttach, uint32_t(sizeof(kPsPrepRigidAttach)) },
+    { "ps_solveRigidAttachmentsLaunch", kPsSolveRigidAttach, uint32_t(sizeof(kPsSolveRigidAttach)) },
+    { "ps_solveRigidAttachmentsTGSLaunch", kPsSolveRigidAttach, uint32_t(sizeof(kPsSolveRigidAttach)) },
     { "ps_finalizeParticlesLaunch", kPsFinalizeParticles, uint32_t(sizeof(kPsFinalizeParticles)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

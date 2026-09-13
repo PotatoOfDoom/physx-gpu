@@ -81,9 +81,6 @@ ps_solveShapes
 ps_update_volume_bound
 
 # PxgParticleSystemCore.cpp (3)
-ps_rigidAttachmentPrepareLaunch
-ps_solveRigidAttachmentsLaunch
-ps_solveRigidAttachmentsTGSLaunch
 
 # PxgCudaSolverCore.cpp + PxgTGSCudaSolverCore.cpp (2)
 bodyInputAndRanksBlocksLaunch

@@ -7,10 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **855/855** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.76 added `gpuslang.psRigidAttachPrepare` and `gpuslang.psRigidAttachSolve`;
 P9.77 added `gpuslang.launchAbiPack`, the FIFTEENTH static checker, and P9.76c added
 `softBodySimRigidAttachSolveTGS` inside the existing `gpuslang.softBodySim` case — a
-fixture, not a new ctest row, which is why the count moved by one and not by two.
+fixture, not a new ctest row, which is why that tranche moved the count by one.
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
 **29 are reachable** from the simulation pipeline.  58 are app-facing features that
@@ -30,12 +31,15 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **409/501** kernels mapped (P9.74 filled the last of the five convexCore*Nphase
-kernels, CONVEXCORE_CLOTHMESH_KERNEL32_MAIN).
-Of the 92 unmapped, **23 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **412/501** kernels mapped (P9.76 filled the particle-vs-rigid ATTACHMENT
+trio, the third and last of the three attachment families).
+Of the 89 unmapped, **20 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
-are orphans — so "403/501" understates coverage of what this build can actually run.
-Scenes: **49/49** -- P9.76c moved `softbodyhang` out of the pending-work list into the
+are orphans — so "412/501" understates coverage of what this build can actually run.
+Scenes: **50/50** -- P9.76 added `particleattach`, the first scene in this tree that
+reaches the particle-vs-rigid ATTACHMENT chain at all; it carries its own control (one
+of the 64 particles is deliberately left unpinned and falls while the other 63 hang).
+P9.76c moved `softbodyhang` out of the pending-work list into the
 scored one: the FEM volume now hangs from its world pins at mean y = 4.4969 and stays
 there, after three measurements that each named a different defect (see P9.76c).
 P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
@@ -1871,6 +1875,138 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.76 — die PARTIKEL-Anhangs-Trias, und derselbe ABI-Defekt mit vertauschten Hälften
+
+Die dritte und letzte Anhangs-Familie des Ports (nach Cloth und Softbody):
+
+```
+ps_rigidAttachmentPrepareLaunch      particlesystem.cu:5437   -> 56-Byte-Pack
+ps_solveRigidAttachmentsLaunch       particlesystem.cu:5567   (PGS)
+ps_solveRigidAttachmentsTGSLaunch    particlesystem.cu:5648   (TGS)
+```
+
+Manifest **409 → 412**, engine-erreichbare unmapped **23 → 20**.
+
+### Der ABI-Fund: ein Host-Pack, zwei Kernel-Signaturen
+
+Die beiden Solves haben **verschiedene CUDA-Signaturen** — der PGS nimmt 8 Parameter
+und endet bei `dt` (64 Byte), der TGS nimmt 10 (72) — und der **Host baut EINEN Pack
+für beide** (`PxgParticleSystemCore.cpp:2152`, nur die `CUfunction` kommt aus einem
+Ternär). Unter `cuLaunchKernel`s `void**`-Form ist das harmlos: der Treiber liest so
+viele Einträge, wie die Signatur deklariert, und ignoriert den Rest.
+
+Die ABI-Zeile muss deshalb die des **Hosts** sein, für **beide** Kernel. Eine aus der
+PGS-Signatur gebaute Zeile wäre 64 Byte — und die Brücke, die den Blob aus dem
+Host-`PxCudaKernelParam`-Array legt und auf `blobSize == pushConstantSizeFor(name)`
+prüft, würde jeden PGS-Launch abweisen **und** den TGS-Launch, der sich die Zeile
+teilt, still abschneiden. Das ist P9.76b mit vertauschten Hälften; gehalten wird es
+vom Prüfer aus P9.77, der genau Host-Pack gegen Zeile vergleicht.
+
+**Und eine Behauptung, die die Messung widerlegt hat.** Die erste Fassung dieses
+Eintrags — und des Shader-Headers — behauptete, ein PGS-Einstiegspunkt mit einem
+**kurzen** Push-Block werde abgewiesen. Das ist **falsch**. Der Block wurde
+versuchsweise auf 56 Byte geschrumpft, neu gebaut, und die Engine meldete:
+
+```
+[pxg-launch] ps_solveRigidAttachmentsLaunch        grid=(1024,1,1) blob=72
+[pxg-launch] sized ps_solveRigidAttachmentsLaunch  OK grid(1024,1,1)
+```
+
+Angenommen — und `particleattach` lief weiter grün durch, weil der Versuch `dt` mit
+der richtigen Konstante gestopft hatte. `pushConstantSizeFor()` liest die **ABI-Zeile**
+und **nie** die SPIR-V (`PhysXGpuVulkan.cpp:178-182`), also ist ein Shader mit zu
+kurzem Push-Block nicht abgewiesen, sondern **still blind für den Rest**. Das ist die
+gefährlichere Hälfte des Paares: eine Abweisung hinterlässt wenigstens eine Zeile im
+Trace. Daraus wird der sechzehnte Prüfer (Aufgabe P9.78).
+
+Zwei **tote Parameter** stehen aus demselben Grund im Prepare-Block: `dt` (@40) und
+`isTGS` (@44) werden im Kernelrumpf von nichts gelesen. Sie sind da, weil der Host sie
+dort hinlegt.
+
+### Was der Partikel-Prepare NICHT tut
+
+`invMass0 == 0 && !isStatic` — ein KINEMATISCHER Anker — bekommt bei Softbody und
+Cloth die **Identitäts-Trägheit** und `inertiaScale = 0` (`softBodyGM.cu:1973-1979`).
+Der Partikel-Prepare hat diese Verzweigung **nicht**: er liest `sqrtInvInertia`
+bedingungslos und bildet `resp = dot(s,s) + invMass0 + invMass1` ohne Skala
+(`:5533-5539`). *Es sieht aus wie das Geschwister und ist es nicht* — dieselbe Klasse,
+die P9.74/P9.76a/P9.76b dreimal getroffen hat, diesmal vor dem Schreiben gelesen.
+
+### Vier Indirektionen, die eine Szene alle auf die Identität zusammenfaltet
+
+Der Prepare findet seine Anhängung über eine **Binärsuche** in `mAttachmentRunsum`
+(welcher Partikel-*Puffer* sie besitzt), addiert `mParticleBufferRunsum` (puffer-lokale
+→ system-globale Partikel-Id), schlägt in `mUnsortedToSortedMapping` nach (global →
+sortiert) und addiert `mRigidAttachmentOffset` (Anhangs- → Constraint-Index). Eine
+Szene mit **einem** System und **einem** Puffer macht alle vier zur Identität.
+
+Die Vorrichtung wählt deshalb: **drei** System-Deskriptoren, von denen nur **zwei
+aktiv** sind, in umgekehrter Reihenfolge (`{2, 0}`); zwei bzw. drei Puffer je System;
+ein `mRigidAttachmentOffset` von 14; eine echte Permutation als Rückabbildung; einen
+kinematischen Anker mit **nicht**-identischer `sqrtInvInertia`; einen Partikel mit
+unendlicher Masse an einem statischen Anker (der einzige Eingang, der das `continue`
+nimmt); zwei Anhängungen auf **einem** Partikel (damit `mAccumDeltaP` wirklich
+akkumuliert); und Kegel-Achsen, die teils **null** sind, damit
+`PxVec3::getNormalized()`s Schutzzweig genommen wird.
+
+Constraint-Block **bit-exakt** gegen eine CPU-Transkription; beide Solve-Arme
+`mAccumDeltaP` und `deltaVel` **bit-exakt**.
+
+### `particleattach` — die Szene, die die Vorrichtung nicht ersetzen kann
+
+Keine Szene in diesem Baum erreichte die Kette bisher überhaupt. `particleattach`
+tut es: 63 von 64 PBD-Partikeln werden über
+`PxParticleBuffer::setRigidAttachments` an einen **statischen** Anker auf ihre
+eigenen Startpositionen geheftet — der einzige Anwendungs-Einstieg in diese drei
+Kernel. Die Szene trägt ihre **eigene Kontrolle**: Partikel 0 bleibt frei.
+
+```
+gepinnte 63:  mean y 4.7619 -> 4.7566  (Durchhang -0.0053, min 3.9210)
+freies Teil.: y      4.0000 -> 0.2500  (es fällt auf den Boden)
+```
+
+Ohne die Kontrolle wäre „nichts hat sich bewegt" auch die Lesart einer Szene, in
+der die Schwerkraft gar nicht läuft. Beide Zahlen zusammen sind die Aussage.
+
+Beide Solver-Arme sind gemessen, nicht nur einer: `PXG_SOLVER=pgs` schickt
+denselben Aufbau über `ps_solveRigidAttachmentsLaunch`, und der Launch-Trace zeigt
+`blob=56` für den Prepare und `blob=72` für **beide** Solves. Szenen **49 → 50**.
+
+### Der Sweep hat die Vorrichtung korrigiert, nicht den Port
+
+30 Mutanten, zuerst **26 tot, 2 überlebt, 1 Anker-Fehler** — und beide Überlebenden
+waren **beobachtungsgleich**, nicht harmlos:
+
+- `prep-groupid-y-direct` (`activeParticleSystems[y]` → `y`). Die aktive Liste war eine
+  **Permutation aller** Systeme, also vertauscht die Mutation nur, welcher Block welches
+  System bearbeitet — die Vereinigung der Schreibzugriffe ist identisch. Geheilt durch
+  ein **drittes, inaktives** System: jetzt bearbeitet ein direkter Index das falsche und
+  lässt die Lanes des richtigen auf ihrem Sentinel stehen.
+- `prep-rigidid-not-static-guard` (die `if (!isStatic)`-Wache fällt weg). Ein statischer
+  Knotenindex ist `0xffffffff`; ungeschützt landet der Zugriff auf
+  `solverBodyIndices[7]` — und der stand zufällig auf **0**, genau dem Wert, den die
+  Wache liefert. Geheilt, indem Eintrag 7 ungleich null gemacht wird.
+
+Das ist **Klasse D** aus P9.75 („beobachtungsgleich durch Allokator-Zufall"), hier
+zweimal durch **Aufbau**-Zufall: die Vorrichtung hatte die Daten so gewählt, dass die
+beiden Schreibweisen zusammenfallen. Danach **30/30**.
+
+Und ein Fund in eigener Sache: die erste Fassung des Prepare-Orakels hatte
+`PxQuat::rotate` ohne den Faktor 2 abgeschrieben (`vx = 2*v.x`). Der bit-exakte
+Vergleich hat das an **Byte 2 der allerersten Constraint-Lane** gemeldet — ein Orakel,
+das gegen einen 0xCD-Sentinel vergleicht, sagt einem auch, wo man selbst falsch liegt.
+
+### Aufgeschoben, wie in allen drei Anhangs-Familien
+
+Der **Kegel-Grenzzweig** beider Solves (`attachments.cuh:113` / `:176`). Neu ist, dass
+die Aufschiebung hier **gemessen** wird: die Vorrichtung prüft, dass
+`isConeLimitedEnabled` für jede ihrer Lanes falsch ist. Eine Vorrichtung, die den Kegel
+einschaltet, vergleicht gegen eine Aufschiebung.
+
+Ebenfalls dokumentiert: der PGS-Solve skaliert den Partikel-Delta mit `dt`, der
+TGS-Solve **nicht** (`:5638` gegen `:5718`) — dieselbe Upstream-Asymmetrie wie bei
+Softbody/Cloth, nur wieder anders herum verteilt.
 
 ## P9.76c — der TGS-Einstieg rechnete die PGS-Formel, und `softbodyhang` wird gewertet
 

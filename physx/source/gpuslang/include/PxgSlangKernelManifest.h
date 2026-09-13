@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 409;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 412;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -252,8 +252,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_calculateInflatableVolume", "npPsInflatable.spv", "ps_calculateInflatableVolume" },
     { "ps_solveInflatableVolume", "npPsInflatable.spv", "ps_solveInflatableVolume" },
     { "ps_solveShapes", nullptr, nullptr },  // PS_SOLVE_SHAPES (unmapped)
-    { "ps_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // PS_PREP_RIGID_ATTACHMENTS (unmapped)
-    { "ps_solveRigidAttachmentsLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS (unmapped)
+    { "ps_rigidAttachmentPrepareLaunch", "psRigidAttachBda.spv", "ps_rigidAttachmentPrepareLaunch" },  // PS_PREP_RIGID_ATTACHMENTS (P9.76 particle attachment port)
+    { "ps_solveRigidAttachmentsLaunch", "psRigidAttachBda.spv", "ps_solveRigidAttachmentsLaunch" },  // PS_SOLVE_RIGID_ATTACHMENTS (P9.76 particle attachment port)
     { "ps_update_volume_bound", nullptr, nullptr },  // PS_UPDATE_VOLUME_BOUND (unmapped)
     // DEAD IN 5.6.1 (found in P9.4): the kernel body exists
     // (particlesystem.cu:782) and the name is registered
@@ -277,7 +277,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
     { "ps_solvePCOutputParticleDeltaVTGSLaunch", "psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch" },  // PS_SOLVE_PC_PARTICLE_TGS (P6.6 BDA port: TGS twin of the particle-side PC solve)
     { "ps_solvePCOutputRigidDeltaVTGSLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVTGSLaunch" },  // PS_SOLVE_PC_RIGID_TGS (P9.44)
-    { "ps_solveRigidAttachmentsTGSLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (unmapped)
+    { "ps_solveRigidAttachmentsTGSLaunch", "psRigidAttachBda.spv", "ps_solveRigidAttachmentsTGSLaunch" },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (P9.76 particle attachment port)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", "npPsMaterials.spv", "ps_updateMaterials" },  // PS_UPDATE_MATERIALS
     { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
