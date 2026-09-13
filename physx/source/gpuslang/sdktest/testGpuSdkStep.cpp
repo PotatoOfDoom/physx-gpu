@@ -8630,12 +8630,23 @@ int main()
         // measured, never as a fitted triple: a constant would pass for this anchor
         // and say nothing.
         //
-        // ONE THING THIS TRANCHE DID NOT RESOLVE, recorded here so it is not lost:
-        // PXG_CPU_CONTROL=1 (PhysX's own CPU solver, same geometry) reports
-        // (0, 0, -4905) under PGS -- matching the GPU exactly -- but
-        // (-39240, 0, +78480) under TGS, which is exactly TWICE the GPU TGS answer.
-        // The linear force matches in all four combinations.  That factor of two
-        // lives in the TGS writeback, not in these getters, and it is P9.79b.
+        // AND THE FOURTH RUN, which P9.79b then explained.  PXG_CPU_CONTROL=1
+        // (PhysX's own CPU solver, same geometry) reports (0, 0, -4905) under PGS --
+        // matching the GPU exactly -- but (-39240, 0, +78480) under TGS, EXACTLY
+        // TWICE the GPU TGS answer, with the linear force matching everywhere.
+        //
+        // That factor of two is an UPSTREAM CPU-vs-CUDA divergence, not a port
+        // defect.  PhysX's CPU TGS writeback (DyTGSContactPrep.cpp:2856) accumulates
+        // `(ang0 + lin0.cross(rAWorld)) * appliedForce`; the CUDA kernel this port
+        // mirrors (solverBlockTGS.cuh:1157) accumulates only `ang0 * appliedForce`.
+        // Both then subtract `body0WorldOffset.cross(lin)`, and on the GPU side
+        // rAWorld and body0WorldOffset are the same field -- so the CPU counts the
+        // moment arm twice.  The PGS pair has no such term on either side, which is
+        // why PGS agrees.  Adding the CPU's term to solverTGS.slang as an experiment
+        // made the GPU print (-39240.00, +0.00, +78479.99): the CPU answer to the
+        // last digit.  See the long note at that writeback site.
+        //
+        // So the number this scene asserts under TGS is the CUDA's, deliberately.
         const float mass = ds.hangerMass, g = 9.81f;
         const float expF = mass * g;
         const PxVec3 F(jForce[0], jForce[1], jForce[2]);

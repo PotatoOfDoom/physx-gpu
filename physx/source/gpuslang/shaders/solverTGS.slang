@@ -1077,6 +1077,48 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
             const float4 body0WorldOffset_invMass0 = jointHeaders[batchIndex].rAWorld_invMass0D0[threadIndex];
             angVel -= cross(body0WorldOffset_invMass0.xyz, linVel);
 
+            // *** P9.79b -- AN UPSTREAM CPU-vs-CUDA DIVERGENCE, MEASURED AND KEPT. ***
+            //
+            // PhysX's own CPU TGS writeback (writeBack1DStep,
+            // lowleveldynamics/src/DyTGSContactPrep.cpp:2856) accumulates
+            //
+            //     ang += (c->ang0 + c->lin0.cross(header->rAWorld)) * c->appliedForce;
+            //
+            // The CUDA this file mirrors (writeBack1DBlockTGS, solverBlockTGS.cuh:1157)
+            // accumulates only
+            //
+            //     angVel += ang0WriteBack * appliedForce;
+            //
+            // -- the `+ lin0.cross(rAWorld)` term is NOT there.  Both then subtract
+            // body0WorldOffset.cross(lin), and on the GPU side body0WorldOffset and
+            // rAWorld are the SAME field (rAWorld_invMass0D0), so the CPU counts that
+            // moment arm twice where the CUDA counts it once.
+            //
+            // This is NOT a port defect and NOT a transcription slip: it is a
+            // difference between two of the engine's own solvers, and the PGS pair does
+            // not have it (DySolverConstraints.cpp:646 and solverBlock.cuh:826 both
+            // accumulate a pre-baked `ang0Writeback` with no cross term, which is why
+            // CPU and GPU PGS agree exactly).
+            //
+            // MEASURED, not inferred.  PXG_SCENE=directapi holds a 1000 kg box on a
+            // fully-locked D6 joint anchored at (4,3,2); |F| = 9810 N in all four
+            // combinations, and the torque is
+            //
+            //     GPU TGS  (-19620, 0, +39240)      CPU TGS  (-39240, 0, +78480)
+            //     GPU PGS  (     0, 0,  -4905)      CPU PGS  (     0, 0,  -4905)
+            //
+            // Adding the CPU's term here as an experiment made the GPU print
+            // (-39240.00, +0.00, +78479.99) -- the CPU answer to the last digit, not
+            // approximately.  That is what closes the diagnosis; the experiment was
+            // then reverted.
+            //
+            // THE PORT KEEPS THE CUDA BEHAVIOUR.  This project's whole method is
+            // bit-exact fidelity to the .cu, and "fix it to match the CPU" would make
+            // every future GPU-vs-CUDA comparison meaningless while silently changing
+            // what PxDirectGPUAPI::getD6JointData and PxConstraint::getForce report on
+            // the GPU path.  Recorded here so the next reader does not rediscover it as
+            // a bug in this file.
+
             const uint broken = breakable != 0
                 // P9.47: the TGS twin of solverBlock.cuh:840 -- magnitude(), not Length.
                 ? ((sqrt(dot(linVel, linVel)) > jointHeaders[batchIndex].linBreakImpulse[threadIndex] ||

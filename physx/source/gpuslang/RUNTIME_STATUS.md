@@ -1893,6 +1893,80 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.79b — der Faktor zwei im TGS-Drehmoment: eine Abweichung zwischen zwei Solvern der Engine selbst
+
+P9.79 hinterließ eine Messung ohne Erklärung: dieselbe Geometrie, vier Läufe, die
+lineare Kraft überall 9810 N — und das Drehmoment unter TGS auf der CPU **exakt
+doppelt** so groß wie auf der GPU. Diese Tranche erklärt sie, und die Erklärung
+ändert nichts am Port.
+
+### Die beiden Zeilen
+
+```cpp
+// CPU, writeBack1DStep      (lowleveldynamics/src/DyTGSContactPrep.cpp:2856)
+ang += (c->ang0 + c->lin0.cross(header->rAWorld)) * c->appliedForce;
+
+// CUDA, writeBack1DBlockTGS (gpusolver/src/CUDA/solverBlockTGS.cuh:1157)
+angVel += ang0WriteBack * appliedForce;
+```
+
+Der Term `+ lin0.cross(rAWorld)` fehlt im CUDA-Kernel. Danach ziehen **beide**
+`body0WorldOffset.cross(lin)` ab — und auf der GPU-Seite sind `rAWorld` und
+`body0WorldOffset` **dasselbe Feld** (`rAWorld_invMass0D0`). Die CPU zählt den
+Momentenarm also zweimal, die CUDA einmal.
+
+### Warum PGS übereinstimmt
+
+Kein Zufall, sondern derselbe Blick auf das Gegenstück:
+
+```cpp
+// CPU, writeBack1D  (lowleveldynamics/src/DySolverConstraints.cpp:646)
+ang += c->ang0Writeback * c->appliedForce;
+
+// CUDA, writeBack1DBlock (gpusolver/src/CUDA/solverBlock.cuh:826)
+angVel += ang0WriteBack * appliedForce;
+```
+
+Identisch. Die PGS-Zeile trägt ein Feld, das buchstäblich `ang0Writeback` heißt —
+für den Writeback vorberechnet. Die TGS-Zeile trägt
+`ang0XYZ_velMultiplierOrCoeff2`, den Jacobi-Term des **Lösens**, und die CPU
+kompensiert das beim Writeback. Die CUDA nicht.
+
+### Gemessen, nicht geschlossen
+
+Der Code-Vergleich ist ein Argument. Was die Diagnose schließt, ist ein Experiment:
+den CPU-Term versuchsweise in `solverTGS.slang` einsetzen und die Szene fahren.
+
+```
+vorher   GPU TGS  (-19620.00, +0.00, +39240.00)
+nachher  GPU TGS  (-39240.00, +0.00, +78479.99)
+CPU TGS  (-39240.00, +0.00, +78479.99)
+```
+
+Nicht ungefähr — **auf die letzte Stelle**. Das Experiment wurde danach
+zurückgenommen.
+
+### Was der Port tut: nichts
+
+Dies ist eine Abweichung zwischen zwei Solvern **der Engine selbst**, kein
+Transkriptionsfehler. Der Port bleibt bitgenau bei der `.cu`:
+
+* „an die CPU angleichen" würde jeden künftigen GPU-gegen-CUDA-Vergleich wertlos
+  machen — das ist die Messgrundlage dieses ganzen Projekts;
+* und es würde still ändern, was `PxDirectGPUAPI::getD6JointData` und
+  `PxConstraint::getForce` auf dem GPU-Pfad melden.
+
+Der Befund steht ausführlich an der Writeback-Stelle in `solverTGS.slang` und im
+`directapi`-Arm, damit der nächste Leser ihn nicht als Fehler **dieser** Datei
+wiederentdeckt. Nach der stehenden Regel wird er **dokumentiert, nicht gemeldet**.
+
+### Was offen bleibt, ehrlich benannt
+
+Ob es **weitere** CPU-gegen-CUDA-Abweichungen dieser Art gibt, weiß dieses Projekt
+nicht. Ein Prüfer dafür müsste den `Dy`-CPU-Solver gegen die CUDA-Kernel Paar für
+Paar diffen — ein eigenes Instrument, und eines, das leicht selbst falsch liegt.
+Ein einzelner Fund rechtfertigt ihn noch nicht; zwei würden es.
+
 ## P9.79 — die Direct-GPU-API, zum ersten Mal von einer Szene gefahren
 
 Neun Kernel. Aber die Tranche handelt nicht von neun Kerneln, sondern davon, **wie sie
