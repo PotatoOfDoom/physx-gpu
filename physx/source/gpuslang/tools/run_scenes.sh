@@ -96,7 +96,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
-        softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
+        softbody softbodyselfcollide softbodycloth softbodystack softbodyattach
         particlepush articulationjoint clothnet particlesoftbody"
 
 pass=0; fail=0; missing=0
@@ -162,6 +162,22 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
+    echo "    softbodyhang (P9.76b) -- the first scene in this tree that reaches the"
+    echo "     softbody-vs-RIGID attachment chain at all; softbodyattach is FEM-vs-FEM and"
+    echo "     never touches it, which is how the TGS half came to be refused on every"
+    echo "     launch without anyone noticing.  TWO numbers, and the pair is the finding:"
+    echo "       ABI row 72 bytes (the kernel REFUSED, as it always was):  4.5000 -> -6.6589"
+    echo "       ABI row 80 bytes (the kernel now DISPATCHED):             4.5000 -> NaN"
+    echo "     The first is what P9.76b's derivation needed: with the short row the"
+    echo "     attachment does nothing and the volume falls off its pins.  The second is a"
+    echo "     SECOND defect the row fix EXPOSED rather than caused: the TGS entry point"
+    echo "     runs the PGS formula (isTGS selects only the velocity pool), while"
+    echo "     softBodyGM.cu:2290 calls calculateAttachmentDeltaImpulseTGS -- a position"
+    echo "     error against linDelta, an angDelta term per axis, and biasCoefficient"
+    echo "     instead of invDt*biasFactor.  Over 3 steps it still hangs (4.4983); the"
+    echo "     divergence builds by step 60.  It moves into the scored list when the"
+    echo "     formula lands."
+    echo
     echo "    clothmesh -- and it is NOT waiting on this port.  P9.26 mapped the last"
     echo "     two kernels of the cloth-vs-cooked-mesh chain, and the cloth still falls"
     echo "     to -39.3333 with |dy| = 0.452011: EXACTLY the figure measured before they"
