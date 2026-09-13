@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **858/858** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.78 added `gpuslang.pushBlock`, the SIXTEENTH static checker and the FIFTH written
+because its defect had already happened: `pushConstantSizeFor()` derives the pushed
+blob size from the ABI ROW and never from the SPIR-V, so a shader whose push block
+disagrees with its row is not refused -- it reads bytes that were never pushed, with
+nothing to report it.  Over 358 mapped kernels with a row: **291 reach their last
+argument, 67 stop short** (a ratchet), **0 read past it**.
 P9.76 added `gpuslang.psRigidAttachPrepare` and `gpuslang.psRigidAttachSolve`;
 P9.77 added `gpuslang.launchAbiPack`, the FIFTEENTH static checker, and P9.76c added
 `softBodySimRigidAttachSolveTGS` inside the existing `gpuslang.softBodySim` case — a
@@ -1875,6 +1881,81 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.78 — der SECHZEHNTE Prüfer: was der Shim nie vergleicht
+
+P9.76 hat gemessen, dass `pushConstantSizeFor()` die Blob-Größe aus der **ABI-Zeile**
+ableitet und **nie** aus der SPIR-V. Damit gibt es zwei unabhängige Erklärungen des
+Push-Blocks — die Zeile und den Shader — und **nichts im Build vergleicht sie**.
+
+### Die Frage, die eine Antwort hat
+
+Nicht „sind die Größen gleich". Mehrere Shader dieses Korpus teilen sich **einen**
+Params-Struct über mehrere Entry-Points, bemessen nach dem größten; die übrigen
+deklarieren dann mehr, als ihre eigene Zeile schiebt, und sind völlig korrekt,
+solange sie den Überschuss nicht **lesen**. Der Prüfer läuft deshalb den Aufrufgraphen
+jedes Entry-Points ab, sammelt jeden über `OpAccessChain` erreichten Member und fragt:
+
+> Liest dieser Entry-Point **über** die Bytes hinaus, die die Brücke für ihn schiebt?
+
+```
+push-block REACH vs ABI row über 358 gemappte Kernel mit Zeile
+  EXACT      291   (erreicht das letzte echte Argument; Auffüllbytes werden nicht gelesen)
+  PREFIX      67   (bleibt vor dem letzten echten Argument stehen)
+  OVER-READ    0
+  UNDECIDED    0
+```
+
+### Der erste Lauf meldete 166 — und 99 davon waren mein Fehler
+
+Fast alle waren **genau vier Byte** zu kurz. `pxgKernelAbiPushSize` rundet die
+Gesamtgröße auf die größte Member-Ausrichtung auf; das letzte *echte* Argument endet
+davor. Ein Shader, der bei Byte 12 aufhört, während die Zeile 16 schiebt, ist nicht
+sparsam, sondern **fertig** — die vier Bytes sind Auffüllung, die niemand liest.
+Verglichen wird seither gegen das Ende des letzten Arguments. **166 → 67.**
+
+Dieselbe Lehre wie P9.77, zum zweiten Mal in zwei Tranchen: *die erste Meldung eines
+neuen Prüfers ist meistens ein Fehler im Prüfer.*
+
+### Die Selbstprüfung, die er bestehen musste
+
+Drei Kernel, deren Antwort ich aus der **CUDA** kannte, bevor der Prüfer lief:
+
+```
+ps_solveRigidAttachmentsLaunch     erreicht 60, letztes Argument endet bei 68
+sb_solveRigidSoftAttachmentLaunch  erreicht 60, letztes Argument endet bei 72
+boxBoxNphase_Kernel                erreicht 132, letztes Argument endet bei 136
+```
+
+Der erste ist der PGS-Arm aus P9.76, der `biasCoefficient` und `isVelocityIteration`
+nicht liest — aus der SPIR-V wiedergefunden statt aus der Signatur abgelesen. Der
+zweite ist die in P8.3 aufgeschobene Dynamik-Reaktion (`rigidDeltaVel` @64). Der
+dritte sagt es im Shader selbst: `float toleranceLength; // @132 (unused by this
+kernel, present for ABI parity)`.
+
+### Er ist nachweislich fehlschlagbar
+
+Drei Experimente, alle gemessen:
+
+1. Die Partikel-Solve-Zeile auf die **PGS-Signatur** gekürzt (64 statt 72 Byte) —
+   `ps_solveRigidAttachmentsTGSLaunch reaches byte 68, the row pushes 64`. Genau der
+   Defekt, über den P9.76s ABI-Überlegung ging, unabhängig aus der SPIR-V gefunden.
+2. Eine Ratschen-Zeile so verändert, dass ein Präfix-Leser **weniger** liest als
+   verzeichnet — `MOVED: was 136/136, now 132/136`.
+3. Einen erfundenen Kernel in die Ratsche geschrieben — `STALE`.
+
+### Was er nicht sehen kann
+
+Er misst eine **Reichweite**, keine Abdeckung. Ein **totes Argument in der Mitte** des
+Packs ist unsichtbar: `ps_rigidAttachmentPrepareLaunch`s `dt` (@40) und `isTGS` (@44)
+werden von nichts gelesen, stehen aber vor dem letzten Argument, also erscheint der
+Kernel als EXACT. Notiert, nicht behauptet — die 67 Ratschen-Zeilen sind eine untere
+Schranke für „nicht gelesene Engine-Argumente", keine vollständige Liste.
+
+Ebenso ungeprüft: die **Byte-Anordnung** innerhalb der geschobenen Bytes. Zwei
+gleich große Strukturen können ein Feld an verschiedenen Stellen führen. Geprüft wird
+das eine, was sich nachträglich nicht heilen lässt: Bytes zu lesen, die nie
+geschoben wurden.
 
 ## P9.76 — die PARTIKEL-Anhangs-Trias, und derselbe ABI-Defekt mit vertauschten Hälften
 

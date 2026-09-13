@@ -1,0 +1,92 @@
+# push_block_known.txt -- the P9.78 ratchet.
+#
+# Each line is an entry point whose Slang code reaches only a PREFIX of the
+# bytes the bridge pushes for it:
+#
+#     <cuda kernel name>   <highest byte reached>   <end of the row's last argument>
+#
+# That is not by itself a defect.  The engine's argument pack is one shape for a
+# whole family of kernels, and a port that defers an argument -- a pointer it
+# never dereferences, a tolerance the kernel is documented not to use, a
+# dynamic-rigid reaction another tranche will add -- legitimately stops early.
+# boxBoxNphase.slang says so in the struct itself: `float toleranceLength; //
+# @132 (unused by this kernel, present for ABI parity)`, and this file's entry
+# for it is exactly `132 136`.
+#
+# What the list is FOR is that the number stops being assumed.  The RECORDED
+# PAIR is checked, not just the name: an entry point that starts reading LESS
+# than it used to is a regression, and one that reads more means the line is
+# stale and should go.  The list may SHRINK, never grow.
+#
+# Note what this cannot see: an argument in the MIDDLE of the pack that nothing
+# reads.  The measure is a REACH, so a dead argument followed by a live one is
+# invisible here -- ps_rigidAttachmentPrepareLaunch's dead `dt` and `isTGS` are
+# exactly that, and they do not appear below.
+#
+accumulateDeltaVRigidSecondLaunchMultiStage1               88   92
+artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T     32   36
+boxBoxNphase_Kernel                                       132  136
+cloth_SphereContactGenLaunch                              188  192
+cloth_SphereVertexContactGenLaunch                        156  160
+cloth_boxTriangleContactGenLaunch                         188  192
+cloth_boxVertexContactGenLaunch                           156  160
+cloth_convexContactGenLaunch                              188  192
+cloth_convexVertexContactGenLaunch                        188  192
+cloth_heightfieldContactGenLaunch                         172  176
+cloth_meshContactGenLaunch                                188  192
+cloth_meshVertexContactGenLaunch                           96  176
+cloth_planeVertContactGenLaunch                           156  160
+cloth_psContactGenLaunch                                  172  176
+cloth_rigidContactPrepareLaunch                            80  100
+cloth_sdfMeshContactGenLaunch                             156  160
+cloth_solveClothClothDeltaEELaunch                         24   28
+cloth_solveClothClothDeltaVTLaunch                         24   28
+cloth_solveRigidClothAttachmentLaunch                      60   72
+cloth_solveRigidClothAttachmentTGSLaunch                   60   72
+cloth_stepLaunch                                           64   72
+cloth_updateClothContactValidityLaunch                     48   52
+computeArtiGravityForces                                   52   60
+constraint1DPrePrepLaunch                                   8   16
+convexCoreClothmeshNphase_Kernel32                        172  176
+convexCoreTetmeshNphase_Kernel32                          140  144
+convexTrimeshCorrelate                                     72   80
+markActiveSlabPGS                                          24   32
+markActiveSlabTGS                                          32   40
+preIntegrationLaunch                                       88   96
+preIntegrationLaunchTGS                                    92  100
+propagateAverageSolverBodyVelocityTGS                      20   24
+propagateStaticSolverBodyVelocitiesTGS                     28   36
+ps_applyDeltaLaunch                                        16   20
+ps_averageVertsLaunch                                      16   20
+ps_contactPrepareLaunch                                    72   80
+ps_diffuseParticleCopy                                     16   20
+ps_diffuseParticleOneWayCollision                          16   20
+ps_diffuseParticleSum                                      16   20
+ps_diffuseParticleUpdatePBF                                16   32
+ps_heightfieldCollisonLaunch                              132  136
+ps_meshCollisonLaunch                                     132  136
+ps_primitivesCollisionLaunch                              172  184
+ps_sdfMeshCollisonLaunch                                  132  136
+ps_solveAerodynamics2Launch                                16   20
+ps_solvePCOutputParticleDeltaVLaunch                       80   96
+ps_solvePCOutputParticleDeltaVTGSLaunch                    84   96
+ps_solveRigidAttachmentsLaunch                             60   68
+ps_stepParticlesLaunch                                     40   44
+ps_updateMaterials                                         24   28
+ps_updateUserBufferLaunch                                  16   20
+removeContactManagers_Stage1                                8   12
+removeContactManagers_Stage2                                8   12
+removeContactManagers_Stage3                                8   12
+removeContactManagers_Stage4                                8   12
+sb_clothContactGenLaunch                                  156  168
+sb_clothVertContactGenLaunch                              156  168
+sb_gm_stepSoftbodyLaunch                                   36   48
+sb_meshContactGenLaunch                                   188  192
+sb_primitiveContactGenLaunch                              188  192
+sb_psContactGenLaunch                                     188  192
+sb_rigidContactPrepareLaunch                               80  100
+sb_sbMidphaseGeneratePairsLaunch                          108  120
+sb_sdfMeshMidphaseGeneratePairsLaunch                     164  176
+sb_selfCollisionMidphaseGeneratePairsLaunch                76   88
+sb_solveRigidSoftAttachmentLaunch                          60   72
+updateBodiesLaunch_Part3                                    8   16

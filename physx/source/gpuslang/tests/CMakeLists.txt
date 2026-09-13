@@ -2740,3 +2740,12 @@ add_test(NAME gpuslang.blockCoverage
 # structs whose size wants the struct read).
 add_test(NAME gpuslang.launchAbiPack
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_launch_abi_pack.py)
+
+# P9.78: the SIXTEENTH checker.  pushConstantSizeFor() derives the pushed blob
+# size from the ABI ROW and never from the SPIR-V, so a shader whose push block
+# disagrees with its row is not refused -- it reads bytes that were never pushed,
+# silently.  This walks each entry point's call graph and compares the highest
+# push-constant byte it can reach against its row.  It needs the built .spv, so
+# it depends on the shader target like the other SPIR-V readers.
+add_test(NAME gpuslang.pushBlock
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_push_block.py ${SHADER_OUT_DIR})
