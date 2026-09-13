@@ -5279,6 +5279,91 @@ SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene,
     return out;
 }
 
+// ===========================================================================
+// PXG_SCENE=softbodyhang (P9.76b): a FEM volume hanging from WORLD-pinned simulation
+// vertices, with nothing beneath it.
+//
+// WHY A NEW SCENE WHEN softbodyattach ALREADY EXISTS.  That one (P8.19) is FEM-vs-FEM:
+// its attachment is addSoftBodyAttachment(volume, volume), which routes to the
+// sb_solveFemFemAttachment kernels.  It does NOT touch the RIGID attachment chain --
+// sb_rigidAttachmentPrepareLaunch and sb_solveRigidSoftAttachmentLaunch{,TGS} -- and
+// that is exactly why nothing in this tree noticed that the TGS half had never run.
+// A world anchor is a rigid attachment with a STATIC node index, which is what
+// PxgSimulationController's mRigidVolumeAttachments collects and what
+// getNbRigidSoftBodyAttachments() counts.
+//
+// A world anchor is also the configuration P9.76a's defect lived in: the position
+// error is ~ (0, sag, 0), and a solve reading raXn0_biasW.w for all three axes sees
+// error.x ~ 0 and applies no positional recovery at all.
+//
+// Nothing beneath it, by construction.  P8.19's header records that no VERTICAL
+// arrangement can prove an attachment works, because whatever is below catches the
+// body anyway; here there is simply no floor and no second volume.
+// ===========================================================================
+SoftBodyAttachScene buildSoftBodyHangScene(PxPhysics* physics, PxScene* scene,
+                                           PxMaterial* rigidMat, PxCudaContextManager* cudaCtx)
+{
+    SoftBodyAttachScene out;
+    out.cudaCtx = cudaCtx;
+
+    // One live dynamic rigid, parked far away: the softbody solve runs inside the rigid
+    // island loop and rigidSumInternalContactAndJointBatches2 null-derefs with zero
+    // dynamic rigids.  The same requirement every FEM scene here carries.
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f, 30.0f);
+
+    const float size = 1.0f;
+    const float baseY = 4.0f;                      // high, so a fall is unmistakable
+    out.upper = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, size, baseY);
+    if (!out.upper) return out;
+    out.numUpperSimVerts = out.upper->getSimulationMesh()->getNbVertices();
+    out.upperStartY = baseY + 0.5f * size;
+
+    // The TOP simulation vertices, read from the device buffer the solver actually uses.
+    const PxU32 nv = out.numUpperSimVerts;
+    std::vector<PxVec4> pos(nv);
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(pos.data(),
+                    reinterpret_cast<CUdeviceptr>(out.upper->getSimPositionInvMassBufferD()),
+                    nv * sizeof(PxVec4));
+    float maxY = -FLT_MAX;
+    for (PxU32 i = 0; i < nv; ++i) maxY = PxMax(maxY, pos[i].y);
+
+    static std::vector<PxU32> pinIdx;      // must outlive createDeformableAttachment's copy
+    static std::vector<PxVec4> pinPos;
+    pinIdx.clear(); pinPos.clear();
+    for (PxU32 i = 0; i < nv; ++i)
+    {
+        if (pos[i].y < maxY - 1e-3f)
+            continue;
+        pinIdx.push_back(i);
+        // The anchor is the vertex's OWN spawn position, so the initial constraint error
+        // is zero.  P8.19 measured what a large initial error does here: a 2.0 offset was
+        // closed in one step and the material blew up by step 90.
+        pinPos.push_back(PxVec4(pos[i].x, pos[i].y, pos[i].z, 0.0f));
+    }
+    if (pinIdx.empty())
+        return out;
+
+    PxDeformableAttachmentData attData;
+    attData.actor[0] = out.upper;
+    attData.type[0]  = PxDeformableAttachmentTargetType::eVERTEX;
+    attData.indices[0].data = pinIdx.data();
+    attData.indices[0].count = PxU32(pinIdx.size());
+    attData.actor[1] = NULL;                                   // world anchor
+    attData.type[1]  = PxDeformableAttachmentTargetType::eWORLD;
+    attData.coords[1].data = pinPos.data();
+    attData.coords[1].count = PxU32(pinPos.size());
+    attData.pose[1] = PxTransform(PxIdentity);
+
+    if (physics->createDeformableAttachment(attData))
+        out.nbAttachments = PxU32(pinIdx.size());
+    else
+        std::printf("FAIL: createDeformableAttachment (volume vertex -> world) returned null\n");
+
+    return out;
+}
+
 int main()
 {
     // LINE-BUFFER STDOUT.  This harness exists to drive scenes that crash, and a
@@ -7560,6 +7645,87 @@ int main()
 
     // PXG_SCENE=softbodyattach (P8.19): a free FEM volume hanging from a PINNED one, with no
     // floor under it and no contact between them.  Only the FEM-FEM attachment pair can hold it.
+    // PXG_SCENE=softbodyhang (P9.76b): the RIGID attachment chain, which softbodyattach
+    // does not reach.  See buildSoftBodyHangScene's header.
+    if (!std::strcmp(sceneName, "softbodyhang"))
+    {
+        SoftBodyAttachScene sh = buildSoftBodyHangScene(physics, scene, material, cudaCtx);
+        if (!sh.upper || sh.numUpperSimVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyhang scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (sh.nbAttachments == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyhang created no attachments -- the scene "
+                        "would be a free-fall test of nothing\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyhang' built: a %u-vertex FEM volume hung from %u "
+                    "WORLD-pinned simulation vertices (no floor beneath)\n",
+                    sh.numUpperSimVerts, sh.nbAttachments);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyhang GPU pipeline CONSTRUCTED + live over "
+                        "Vulkan (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_SB_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 180;
+        float mean0 = 0.0f, min0 = 0.0f;
+        if (!softBodyAttachUpperY(sh, mean0, min0))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyhang could not read the volume back\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  stepping the hang (%d x %.4fs): volume starts at mean y=%.4f (min %.4f)\n",
+                    steps, dt, mean0, min0);
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i == steps - 1 || (i % 60 == 0))
+            {
+                float mn = 0.0f, mean = 0.0f;
+                softBodyAttachUpperY(sh, mean, mn);
+                std::printf("    step %3d: mean y = %.5f (min %.5f)\n", i, mean, mn);
+            }
+        }
+        float meanEnd = 0.0f, minEnd = 0.0f;
+        const bool finite = softBodyAttachUpperY(sh, meanEnd, minEnd);
+        std::printf("  softbodyhang: mean y %.4f -> %.4f (min %.4f)\n", mean0, meanEnd, minEnd);
+
+        int failures = 0;
+        if (!finite || !std::isfinite(meanEnd))
+        { std::printf("FAIL: the volume's mean y is not finite (%.4f)\n", meanEnd); ++failures; }
+        // IT DID NOT FALL.  Only the rigid-attachment chain can hold it: there is no floor,
+        // no second volume, and no contact of any kind in this scene.  The bar is derived
+        // from the geometry, not fitted: the volume spawns centred at y = 4.5 and its top
+        // vertices are pinned where they started, so it may SAG -- a FEM volume under
+        // gravity always does -- but it cannot descend past its own height.  Anything below
+        // 3.0 means the pins are not holding.
+        if (!(meanEnd > 3.0f))
+        { std::printf("FAIL: the volume came to rest at y = %.4f -- it fell off its world pins "
+                      "(need > 3.0; it spawns at %.4f and a free fall over %d steps reaches "
+                      "about -44)\n", meanEnd, mean0, steps); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the FEM volume HANGS from its world pins "
+                        "(mean y %.4f from %.4f) -- the RIGID attachment chain runs on Vulkan: "
+                        "sb_rigidAttachmentPrepareLaunch and sb_solveRigidSoftAttachmentLaunch"
+                        "{,TGS}, the last of which was refused on every launch until P9.76b gave "
+                        "it its own 80-byte ABI row\n", meanEnd, mean0);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyhang checks failed (%d)\n", failures);
+        return 1;
+    }
+
     if (!std::strcmp(sceneName, "softbodyattach"))
     {
         SoftBodyAttachScene sa = buildSoftBodyAttachScene(physics, scene, material, cudaCtx);
