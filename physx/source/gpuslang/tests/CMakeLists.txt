@@ -2718,3 +2718,16 @@ add_test(NAME gpuslang.unmappedReachability
 # legitimate.  The known list is a RATCHET and is currently EMPTY.
 add_test(NAME gpuslang.blockCoverage
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_block_coverage.py)
+
+# P9.77, the FIFTEENTH checker, and the THIRD written because its defect had already
+# happened.  gpuslang.launchAbi (P9.48d) asks whether a mapped kernel HAS an ABI row;
+# it cannot ask whether the row MATCHES.  P9.76b is the difference: the softbody
+# attachment TGS solve carried the 72-byte PGS row while its launch site pushes 80,
+# so the shim's exact blobSize == pushConstantSize gate refused every launch and the
+# kernel had never run on Vulkan -- with fixtures, the suite and all 48 scenes green,
+# because a fixture dispatches the shader directly and never passes the gate.
+# This one derives the blob from the PX_CUDA_KERNEL_PARAM list at the launch site and
+# compares.  141 kernels decided, 99 in a ratcheted undecided set (mostly by-value
+# structs whose size wants the struct read).
+add_test(NAME gpuslang.launchAbiPack
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_launch_abi_pack.py)

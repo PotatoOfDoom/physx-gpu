@@ -160,6 +160,61 @@ struct SbSolveAttachParams
 [[vk::push_constant]]
 ConstantBuffer<SbSolveAttachParams> gSbSolveAtt;
 
+// ---------------------------------------------------------------------------
+// sb_solveRigidSoftAttachmentLaunchTGS push blob -- ITS OWN, AND THAT IS P9.76b.
+//
+// Both entry points used to share the 72-byte block above, and the ABI table gave
+// them one row, under a comment reading "both PGS and TGS share the pack".  That
+// is true of CLOTH -- PxgFEMClothCore.cpp:1845 builds one 9-argument pack and
+// picks the function with a ternary -- and FALSE of softbody, which has TWO packs:
+//   PGS  PxgSoftBodyCore.cpp:1810   9 arguments -> 72 bytes
+//   TGS  PxgSoftBodyCore.cpp:1866  11 arguments -> 80 bytes
+// The claim was carried over from the cloth row, exactly as P9.76a carried over a
+// cloth-only constraint quirk into this same file's solve.
+//
+// The cost was total and silent: the bridge builds the blob from the HOST pack and
+// the shim gates on blobSize == pushConstantSize (PxgVulkanCudaContext.cpp:459), so
+// the TGS kernel was refused on EVERY launch and has never run on Vulkan -- while
+// every fixture stayed green, because a fixture dispatches the shader directly and
+// never passes that gate.
+//
+// Two arguments the PGS pack does not have, in the HOST's order, which is not the
+// order one would guess from reading the kernel: biasCoefficient comes after dt,
+// and isVelocityIteration comes after the OUTPUT pointer.
+// ---------------------------------------------------------------------------
+struct SbSolveAttachParamsTGS
+{
+    uint64_t softbodies;         // @0
+    uint64_t attachments;        // @8
+    uint numAttachments;         // @16
+    uint _pad20;                 // @20
+    uint64_t prePrepDesc;        // @24
+    uint64_t solverCoreDesc;     // @32
+    uint64_t artiCoreDesc;       // @40  (DEFERRED, as in the PGS block)
+    uint64_t sharedDesc;         // @48
+    float dt;                    // @56
+    float biasCoefficient;       // @60
+    uint64_t rigidDeltaVel;      // @64  output
+    uint isVelocityIteration;    // @72  bool, 1 byte + 3 tail pad
+    uint _pad76;                 // @76 -> 80
+}
+[[vk::push_constant]]
+ConstantBuffer<SbSolveAttachParamsTGS> gSbSolveAttTGS;
+
+// The seven values the solve needs, so ONE body can serve two differently-sized
+// push blocks.  Each entry point fills this from its own block; nothing else in
+// the function reads a push constant.
+struct SbSolveAttArgs
+{
+    uint numAttachments;
+    float dt;
+    uint64_t softbodies;
+    uint64_t solverCoreDesc;
+    uint64_t prePrepDesc;
+    uint64_t attachments;
+    uint64_t sharedDesc;
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]   // == RA_BLOCK; SB_UPDATEROTATION
 void sb_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
@@ -316,15 +371,15 @@ void sb_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
     }
 }
 
-void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
+void solveRigidSoftAttachment(SbSolveAttArgs a, bool isTGS, uint idx, uint blockX)
 {
-    const uint numAttachments = gSbSolveAtt.numAttachments;
-    const float dt = gSbSolveAtt.dt;
+    const uint numAttachments = a.numAttachments;
+    const float dt = a.dt;
     const float invDt = 1.0f / dt;
 
-    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSbSolveAtt.softbodies);
-    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gSbSolveAtt.solverCoreDesc);
-    Ptr<PxgPrePrepDescGpu> prePrepDesc = Ptr<PxgPrePrepDescGpu>(gSbSolveAtt.prePrepDesc);
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(a.softbodies);
+    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(a.solverCoreDesc);
+    Ptr<PxgPrePrepDescGpu> prePrepDesc = Ptr<PxgPrePrepDescGpu>(a.prePrepDesc);
 
     const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
     const uint accOffset = solverCoreDesc[0].accumulatedBodyDeltaVOffset;
@@ -341,7 +396,7 @@ void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
 
         const uint index = workIndex / 32u;
         const uint offset = workIndex & 31u;
-        const uint64_t cBase = gSbSolveAtt.attachments + uint64_t(index) * RAC_STRIDE;
+        const uint64_t cBase = a.attachments + uint64_t(index) * RAC_STRIDE;
 
         const uint elemId = Ptr<uint>(cBase + RAC_elemId)[offset];
         const uint softBodyId = elemId >> PXG_BITSHIFT_TET_ID;
@@ -387,7 +442,7 @@ void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
         float3 rigidAngVel;
         if (isTGS)
         {
-            Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescTGSGpu>(gSbSolveAtt.sharedDesc)[0].iter_solverBodyVelPool);
+            Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescTGSGpu>(a.sharedDesc)[0].iter_solverBodyVelPool);
             const float4 v0 = pool[accOffset + solverBodyIdx];
             const float4 v1 = pool[accOffset + solverBodyIdx + numSolverBodies];
             rigidLinVel = float3(v0.x, v0.y, v0.z);
@@ -395,7 +450,7 @@ void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
         }
         else
         {
-            Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescPGSGpu>(gSbSolveAtt.sharedDesc)[0].iter_solverBodyVelPool);
+            Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescPGSGpu>(a.sharedDesc)[0].iter_solverBodyVelPool);
             const float4 iv0 = initialVel[solverBodyIdx];
             const float4 iv1 = initialVel[solverBodyIdx + numSolverBodies];
             const float4 dv0 = pool[accOffset + solverBodyIdx];
@@ -493,12 +548,34 @@ void solveRigidSoftAttachment(bool isTGS, uint idx, uint blockX)
 [numthreads(256, 1, 1)]   // == RA_BLOCK; SB_UPDATEROTATION
 void sb_solveRigidSoftAttachmentLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    solveRigidSoftAttachment(false, groupThreadId.x, groupId.x);
+    SbSolveAttArgs a;
+    a.numAttachments = gSbSolveAtt.numAttachments;
+    a.dt = gSbSolveAtt.dt;
+    a.softbodies = gSbSolveAtt.softbodies;
+    a.solverCoreDesc = gSbSolveAtt.solverCoreDesc;
+    a.prePrepDesc = gSbSolveAtt.prePrepDesc;
+    a.attachments = gSbSolveAtt.attachments;
+    a.sharedDesc = gSbSolveAtt.sharedDesc;
+    solveRigidSoftAttachment(a, false, groupThreadId.x, groupId.x);
 }
 
 [shader("compute")]
 [numthreads(256, 1, 1)]   // == RA_BLOCK; SB_UPDATEROTATION
 void sb_solveRigidSoftAttachmentLaunchTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    solveRigidSoftAttachment(true, groupThreadId.x, groupId.x);
+    // Its OWN 80-byte block (see SbSolveAttachParamsTGS).  biasCoefficient and
+    // isVelocityIteration are read here and NOT yet used: the body still runs the
+    // PGS formula, which is a SEPARATE and larger question deliberately left to its
+    // own tranche.  It could not even be asked until now -- it is a question about
+    // what this kernel computes, and until this commit it computed nothing, because
+    // every launch was refused.
+    SbSolveAttArgs a;
+    a.numAttachments = gSbSolveAttTGS.numAttachments;
+    a.dt = gSbSolveAttTGS.dt;
+    a.softbodies = gSbSolveAttTGS.softbodies;
+    a.solverCoreDesc = gSbSolveAttTGS.solverCoreDesc;
+    a.prePrepDesc = gSbSolveAttTGS.prePrepDesc;
+    a.attachments = gSbSolveAttTGS.attachments;
+    a.sharedDesc = gSbSolveAttTGS.sharedDesc;
+    solveRigidSoftAttachment(a, true, groupThreadId.x, groupId.x);
 }

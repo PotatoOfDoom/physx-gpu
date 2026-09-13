@@ -53,35 +53,48 @@
 # exactly P9.76b, and it is the case a per-site check would miss.
 #
 # ---------------------------------------------------------------------------
-# *** NOT YET WIRED INTO THE BUILD.  IT IS NOT TRUSTWORTHY YET. ***
+# FITNESS: IT HAS BEEN SEEN TO FAIL, AND EVERY FALSE POSITIVE WAS A BUG IN HERE
 # ---------------------------------------------------------------------------
-# It CATCHES its target: sb_solveRigidSoftAttachmentLaunchTGS is reported as
-# "row kSbRigidAttachSolve gives 72 bytes, PxgSoftBodyCore.cpp:1873 pushes 80",
-# which is exactly the hand derivation in P9.76b.
+# Reintroduce P9.76b's row and it says, by name:
 #
-# It also reports about twenty other kernels, and AT LEAST ONE OF THOSE IS A
-# FALSE POSITIVE: convexCoreTetmeshNphase_Kernel32 is flagged as 144-vs-80, and
-# that row is independently known correct -- P9.72 proved it the only way
-# available at the time, by watching the scene move from -73.8069 to a rest.  A
-# row cannot be both refused on every launch and responsible for a scene that
-# runs.
+#   sb_solveRigidSoftAttachmentLaunchTGS: row kSbRigidAttachSolve gives 72 bytes,
+#   PxgSoftBodyCore.cpp:1872 pushes 80
 #
-# THE CAUSE IS THE ASSOCIATION, not the arithmetic.  launch_packs() takes the
-# nearest `PxCudaKernelParam ... = { ... }` block within 4000 characters AFTER a
-# `PxgKernelIds::X` mention.  That is wrong wherever the block precedes the
-# getCuFunction call, wherever two launches sit close together, or wherever the
-# id is named in a comment.  Until the block is bound to its launch by SCOPE --
-# same enclosing braces, and the same CUfunction variable that reaches
-# launchKernel -- every report has to be checked by hand, which is precisely the
-# work a checker exists to remove.
+# Restore the row and it is green.  A checker that has never been watched to fail
+# is a checker whose defect class it cannot see (P9.64).
 #
-# A checker with a false-positive rate is not a weaker checker; it is a checker
-# that gets ignored, and then its true positives are ignored with it.  So this
-# file is committed as the work in progress it is, and stays out of
-# tests/CMakeLists.txt until the association is exact and the twenty reports are
-# each either confirmed or gone.  P9.64's rule cuts both ways: a checker that
-# cannot see its defect is worthless, and one that sees defects that are not
-# there is worse.
+# ITS FIRST RUN REPORTED TWENTY-ONE MISMATCHES.  Twenty were THIS FILE being wrong
+# about the engine, and each is worth naming because each is a way a plausible
+# parser lies:
+#
+#   14  the launch block was bound to the kernel by PROXIMITY -- the nearest
+#       PxCudaKernelParam block after a PxgKernelIds:: mention.  A block can
+#       precede its getCuFunction, two launches can sit side by side, and an id
+#       can be named in a comment.  Now it follows the CUfunction HANDLE into the
+#       launchKernel call that uses it, and takes the block that call names.
+#    3  a REFERENCE was sized like a pointer.  PX_CUDA_KERNEL_PARAM(x) pushes
+#       sizeof(x), and for `const PxVec3& gravity` that is 12, not 8.  This one
+#       accused preIntegrationLaunch -- a kernel that, were it really refused,
+#       would leave every rigid body un-integrated and all 48 scenes failing.
+#       That impossibility is what exposed the bug; a control that must not be
+#       wrong is worth more than another suspect.
+#    1  the FIRST block with the right name before the launch instead of the LAST,
+#       where two launches in one scope both call their array `kernelParams`.
+#    1  PX_CUDA_KERNEL_PARAM((x)) with inner parens, silently dropping arguments.
+#    1  COMMENTED-OUT parameters counted as live, silently adding arguments.
+#
+# Under-counting and over-counting are the same failure wearing two faces: the
+# checker being wrong about the engine while accusing the table.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT STILL CANNOT DECIDE
+# ---------------------------------------------------------------------------
+# 99 of the kernels with an ABI row are in KNOWN_UNDECIDED, and that is a recorded
+# blind spot, not a clean bill.  The largest cause is a struct passed BY VALUE
+# whose size this file does not know -- the contact-writer tails especially -- and
+# deciding those means reading the struct.  One cause can never be decided here at
+# all: the void** launch form carries no per-argument sizes, and the bridge reads
+# them from this very table, so there is nothing independent left to compare.
 
 import os
 import re
@@ -99,9 +112,123 @@ ENGINE_DIRS = [
 ]
 
 # Kernels whose pack this checker cannot yet decide.  RATCHET: may shrink, never
-# grow.  Each entry must say WHY, so that "undecided" never quietly becomes
-# "fine".  Populated on first run against the tree.
-KNOWN_UNDECIDED = set()
+# grow.  Being on this list is NOT a clean bill -- it is a recorded blind spot,
+# and the honest state of the tree is that 99 of the kernels with an ABI row have
+# one.
+#
+# THE REASONS, in the order they will be worth attacking:
+#   * a struct passed BY VALUE whose size this table does not know (the
+#     PxgFEMContactWriter / PxgSoftBodyContactWriter tails, and the PxgShape and
+#     PxBounds3 scalars).  Deciding these means reading the struct, which is the
+#     next real step and would take most of the list.
+#   * PxVec3 / PxQuat / PxTransform arguments passed by reference, whose sizeof is
+#     the referent's.
+#   * the void** launch form (PX_CUDA_KERNEL_PARAM2), which carries no per-argument
+#     sizes at all -- the bridge reads them from this very table, so there is
+#     nothing independent to compare against and these can never be decided here.
+#   * a pack assembled across a branch, or an argument that is a member expression
+#     rather than a plain variable.
+KNOWN_UNDECIDED = {
+    "ZeroBodies",
+    "ZeroBodiesTGS",
+    "artiContactConstraintBlockPrepareLaunch",
+    "artiJointConstraintBlockPrepareParallelLaunch",
+    "artiSolveBlockPartition",
+    "artiTGSContactConstraintBlockPrepareLaunch",
+    "artiTGSJointConstraintBlockPrepareParallelLaunch",
+    "boxBoxNphase_Kernel",
+    "clampMaxValue",
+    "clampMaxValues",
+    "cloth_SphereContactGenLaunch",
+    "cloth_SphereVertexContactGenLaunch",
+    "cloth_boxTriangleContactGenLaunch",
+    "cloth_boxVertexContactGenLaunch",
+    "cloth_clothContactPrepareLaunch",
+    "cloth_convexContactGenLaunch",
+    "cloth_convexVertexContactGenLaunch",
+    "cloth_heightfieldContactGenLaunch",
+    "cloth_heightfieldVertexContactGenLaunch",
+    "cloth_meshContactGenLaunch",
+    "cloth_meshVertexContactGenLaunch",
+    "cloth_planeVertContactGenLaunch",
+    "cloth_preIntegrateLaunch",
+    "cloth_psContactGenLaunch",
+    "cloth_rigidContactPrepareLaunch",
+    "cloth_sdfMeshContactGenLaunch",
+    "cloth_solveNonSharedTriangleEnergyClusterLaunch",
+    "cloth_solveNonSharedTriangleEnergyLaunch",
+    "cloth_solveTrianglePairEnergyClusterLaunch",
+    "cloth_solveTrianglePairEnergyLaunch",
+    "cloth_stepLaunch",
+    "computeAverageSolverBodyVelocity",
+    "computeAverageSolverBodyVelocityTGS",
+    "concludeBlocks",
+    "concludeBlocksTGS",
+    "contactConstraintBlockPrepareParallelLaunch",
+    "contactConstraintBlockPrepareParallelLaunchTGS",
+    "convexCoreConvexNphase_Kernel",
+    "convexCorePlaneNphase_Kernel",
+    "convexHeightFieldMidphase",
+    "convexHeightfieldNarrowphase",
+    "convexPlaneNphase_Kernel",
+    "convexTrimeshFinishContacts",
+    "convexTrimeshNarrowphase",
+    "dmaBackChangedElems",
+    "finishContactsKernel",
+    "initStaticKinematics",
+    "initializeManifolds",
+    "initializeSolverVelocitiesTGS",
+    "integrateCoreParallelLaunch",
+    "integrateCoreParallelLaunchTGS",
+    "jointConstraintBlockPrepareParallelLaunch",
+    "jointConstraintBlockPrepareParallelLaunchTGS",
+    "markActiveSlabPGS",
+    "markActiveSlabTGS",
+    "midphaseGeneratePairs",
+    "preIntegrationLaunch",
+    "preIntegrationLaunchTGS",
+    "prepareLostFoundPairs_Stage2",
+    "propagateAverageSolverBodyVelocityTGS",
+    "propagateSolverBodyVelocity",
+    "propagateStaticSolverBodyVelocities",
+    "propagateStaticSolverBodyVelocitiesTGS",
+    "ps_diffuseParticleCompact",
+    "ps_diffuseParticleCreate",
+    "ps_diffuseParticleUpdatePBF",
+    "ps_heightfieldCollisonLaunch",
+    "ps_meshCollisonLaunch",
+    "ps_preDiffuseIntegrateLaunch",
+    "ps_preIntegrateLaunch",
+    "ps_primitivesCollisionLaunch",
+    "ps_sdfMeshCollisonLaunch",
+    "ps_updateUserBufferLaunch",
+    "rigidSumInternalContactAndJointBatches1",
+    "rigidSumInternalContactAndJointBatches2",
+    "sb_clothContactGenLaunch",
+    "sb_clothContactPrepareLaunch",
+    "sb_clothVertContactGenLaunch",
+    "sb_gm_preIntegrateLaunch",
+    "sb_gm_stepSoftbodyLaunch",
+    "sb_meshContactGenLaunch",
+    "sb_primitiveContactGenLaunch",
+    "sb_psContactGenLaunch",
+    "sb_sbMidphaseGeneratePairsLaunch",
+    "sb_sdfMeshMidphaseGeneratePairsLaunch",
+    "sb_selfCollisionMidphaseGeneratePairsLaunch",
+    "sb_softbodyContactPrepareLaunch",
+    "solveBlockPartition",
+    "solveBlockUnified",
+    "solveStaticBlock",
+    "solveStaticBlockTGS",
+    "solveWholeIslandTGS",
+    "sphereHeightfieldNarrowphase",
+    "sphereNphase_Kernel",
+    "sphereTrimeshNarrowphase",
+    "writeBackBodies",
+    "writeBackBodiesTGS",
+    "writebackBlocks",
+    "writebackBlocksTGS",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +252,18 @@ def arg_size(decl_type):
     t = t.strip()
     if not t:
         return None
-    if t.endswith("*") or t.endswith("&"):          # any pointer / reference
+    # A POINTER is 8 bytes.  A REFERENCE IS NOT, and conflating them was a real
+    # bug in this checker's first run: PX_CUDA_KERNEL_PARAM(x) pushes sizeof(x),
+    # and for `const PxVec3& gravity` that is sizeof(PxVec3) == 12, not 8.  It
+    # made preIntegrationLaunch look 8 bytes short -- a kernel that, were it
+    # really refused, would leave every rigid body un-integrated and every one of
+    # the 48 scenes failing.  That control is what exposed it.  A reference now
+    # resolves to its REFERENT, which for PxVec3 is not in this table, so the
+    # kernel becomes UNDECIDED instead of falsely accused.
+    if t.endswith("*"):
         return PTR8
+    if t.endswith("&"):
+        return arg_size(t[:-1])
     if t.startswith("PxgDevicePointer<") or t.startswith("PxgTypedCudaBuffer<"):
         return PTR8
     base = t.split()[-1] if " " in t else t
@@ -221,7 +358,23 @@ def declared_size(src, var):
 
 
 def launch_packs(ids):
-    """kernel name -> list of (file, line, [arg sizes] or None)."""
+    """kernel name -> list of (file, line, [arg sizes] or None).
+
+    THE ASSOCIATION IS BOUND THROUGH THE CUfunction VARIABLE, not by proximity.
+    The first version took the nearest `PxCudaKernelParam ... = {...}` block within
+    4000 characters after a `PxgKernelIds::` mention, and that produced false
+    positives -- convexCoreTetmeshNphase_Kernel32 was reported 144-vs-80 although
+    P9.72 had proved that row correct by watching its scene move.  Proximity is not
+    a binding: a block can precede its getCuFunction, two launches can sit side by
+    side, and an id can be named in a comment.
+
+    So the chain is followed properly:
+        <var> = ...getCuFunction(PxgKernelIds::<ID>)     the function handle
+        launchKernel(<var>, ..., <params>, sizeof(<params>), ...)
+        PxCudaKernelParam <params>[] = { ... };          the block that call uses
+    A ternary that assigns TWO ids to one handle (the cloth attachment solve does
+    exactly this) correctly maps both kernels to the one shared pack -- which is
+    the true statement there, and the one the softbody row wrongly assumed."""
     packs = {}
     for path in engine_sources():
         try:
@@ -230,31 +383,69 @@ def launch_packs(ids):
             continue
         if "PxgKernelIds::" not in src:
             continue
-        for m in re.finditer(r"PxgKernelIds::(\w+)", src):
-            kid = m.group(1)
-            name = ids.get(kid)
-            if not name:
+        # every handle assignment, including the ternary two-id form
+        for hm in re.finditer(r"(\w+)\s*=\s*([^;]*?getCuFunction\s*\([^;]*?)\s*;", src, re.S):
+            handle, rhs = hm.group(1), hm.group(2)
+            kids = re.findall(r"PxgKernelIds::(\w+)", rhs)
+            if not kids:
                 continue
-            # the kernelParams block that follows this getCuFunction, within reach
-            tail = src[m.end():m.end() + 4000]
-            b = re.search(r"PxCudaKernelParam\s+\w+\s*\[\]\s*=\s*\{(.*?)\}\s*;", tail, re.S)
-            if not b:
+            # the launchKernel that uses this handle, before the handle is reassigned
+            tail = src[hm.end():]
+            nxt = re.search(r"\b" + re.escape(handle) + r"\s*=\s*[^;]*getCuFunction", tail, re.S)
+            region = tail[:nxt.start()] if nxt else tail
+            lm = re.search(r"launchKernel\s*\(\s*" + re.escape(handle) + r"\s*,(.*?)\)\s*;",
+                           region, re.S)
+            if not lm:
                 continue
-            args = re.findall(r"PX_CUDA_KERNEL_PARAM2?\(\s*([\w\.\->\[\]]+)\s*\)", b.group(1))
+            pm = re.search(r"(\w+)\s*,\s*sizeof\s*\(\s*\1\s*\)", lm.group(1))
+            if not pm:
+                continue                       # the void** form carries no sizes
+            pname = pm.group(1)
+            # THE LAST block with this name before the launch, not the first.  Two
+            # launches in one scope commonly BOTH name their array `kernelParams`
+            # (PxgParticleSystemCore.cpp:856-880 launches the first and second
+            # update-bound passes that way), and taking the first match handed the
+            # second kernel the first one's arguments.
+            blocks = list(re.finditer(r"PxCudaKernelParam\s+" + re.escape(pname) +
+                                      r"\s*\[\]\s*=\s*\{(.*?)\}\s*;",
+                                      region[:lm.start()], re.S))
+            if not blocks:
+                continue
+            bm = blocks[-1]
+            # The inner parens are optional and real: PxgNarrowphaseCore.cpp:7224
+            # writes PX_CUDA_KERNEL_PARAM((baseContactPatches)).  Missing them
+            # silently DROPPED those arguments and made the pack look 16 bytes
+            # short -- a checker that under-counts arguments accuses the row.
+            # COMMENTS MUST GO FIRST.  PxgNarrowphaseCore.cpp:3801-3802 carries two
+            # commented-out parameters inside the block --
+            #     //PX_CUDA_KERNEL_PARAM(pairs),
+            #     //PX_CUDA_KERNEL_PARAM(nbPairs),
+            # -- and counting them made ps_convexCollisionLaunch look like 25
+            # arguments instead of 23, accusing a row that is correct.  A checker
+            # that OVER-counts arguments accuses the row just as surely as one that
+            # under-counts; both are the checker being wrong about the engine.
+            block = re.sub(r"/\*.*?\*/", " ", bm.group(1), flags=re.S)
+            block = re.sub(r"//[^\n]*", " ", block)
+            args = re.findall(r"PX_CUDA_KERNEL_PARAM2?\(\s*\(?\s*([\w\.\->\[\]]+)\s*\)?\s*\)",
+                              block)
             if not args:
                 continue
             sizes = []
             for a in args:
-                if not re.match(r"^\w+$", a):     # a.b, p->q, v[i] -- not resolvable here
+                if not re.match(r"^\w+$", a):
                     sizes = None
                     break
-                s = declared_size(src, a)
-                if s is None:
+                sz = declared_size(src, a)
+                if sz is None:
                     sizes = None
                     break
-                sizes.append(s)
-            line = src[:m.start()].count("\n") + 1
-            packs.setdefault(name, []).append((os.path.relpath(path, ROOT), line, sizes))
+                sizes.append(sz)
+            line = src[:hm.start()].count("\n") + 1
+            for kid in kids:
+                name = ids.get(kid)
+                if name:
+                    packs.setdefault(name, []).append(
+                        (os.path.relpath(path, ROOT), line, sizes))
     return packs
 
 

@@ -439,9 +439,33 @@ static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
 // divergence in either signature cannot silently corrupt the other's blob.
 //   sb_rigidAttachmentPrepareLaunch  -- launch site PxgSoftBodyCore.cpp:2056.
 static const uint8_t kSbRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
-//   sb_solveRigidSoftAttachmentLaunch{,TGS}  -- launch site PxgSoftBodyCore.cpp:1810
-//   (both PGS and TGS share the pack).
+//   sb_solveRigidSoftAttachmentLaunch  -- launch site PxgSoftBodyCore.cpp:1810.
+//
+//   P9.76b CORRECTED WHAT STOOD HERE.  It read "sb_solveRigidSoftAttachmentLaunch{,TGS}
+//   -- launch site PxgSoftBodyCore.cpp:1810 (both PGS and TGS share the pack)", and gave
+//   BOTH kernels this 72-byte row.  That claim is TRUE OF CLOTH -- PxgFEMClothCore.cpp:1845
+//   really does build one 9-argument pack and pick the function with a ternary -- and FALSE
+//   of softbody, which has TWO separate packs at :1810 and :1866.  The claim was carried
+//   over from the cloth row above, the same way P9.76a carried over a cloth-only constraint
+//   quirk into the same file's solve.  Twice in one file pair: it looks like cloth, so it
+//   was treated as cloth.
+//
+//   The cost was total and silent.  The bridge builds the blob from the HOST pack
+//   (PxgVulkanCudaContext.cpp:443-462) and the shim gates on blobSize == pushConstantSize
+//   -- that file says so in its own comment at :459 -- so the TGS kernel was refused on
+//   EVERY launch and has never run on Vulkan.  check_launch_abi.py could not see it: it
+//   asks whether a row EXISTS, and this one did.  tools/check_launch_abi_pack.py (P9.77)
+//   is the checker that compares the row against the pack, and this is the entry it was
+//   written to catch.
 static const uint8_t kSbRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
+//   sb_solveRigidSoftAttachmentLaunchTGS  -- launch site PxgSoftBodyCore.cpp:1876-1888,
+//   ELEVEN arguments, derived one by one from that block and not from the CUDA signature:
+//     softbodiesd(8) constraintsd(8) nbRigidAttachments(4 @16, +4 pad) prePrepDescd(8 @24)
+//     solverCoreDescd(8 @32) artiCoreDescd(8 @40) sharedDescd(8 @48) dt(4 @56)
+//     biasCoefficient(4 @60) deltaVd(8 @64) isVelocityIteration(1 @72) -> 80 bytes.
+//   Note the ORDER: biasCoefficient comes after dt and isVelocityIteration AFTER the
+//   output pointer, which is the host's order, not the reading order one would guess.
+static const uint8_t kSbRigidAttachSolveTGS[] = { 8, 8, 4, 8, 8, 8, 8, 4, 4, 8, 1 };
 
 // gpusimulationcontroller FEMCloth.cu apply-external-deltas (P7.1 tranche 3c):
 //   cloth_applyExternalDeltasLaunch(PxgFEMCloth* femClothes, const PxU32*
@@ -1877,7 +1901,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_solveRigidClothAttachmentTGSLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     { "sb_rigidAttachmentPrepareLaunch", kSbRigidAttachPrep, uint32_t(sizeof(kSbRigidAttachPrep)) },
     { "sb_solveRigidSoftAttachmentLaunch", kSbRigidAttachSolve, uint32_t(sizeof(kSbRigidAttachSolve)) },
-    { "sb_solveRigidSoftAttachmentLaunchTGS", kSbRigidAttachSolve, uint32_t(sizeof(kSbRigidAttachSolve)) },
+    { "sb_solveRigidSoftAttachmentLaunchTGS", kSbRigidAttachSolveTGS, uint32_t(sizeof(kSbRigidAttachSolveTGS)) },
     { "cloth_applyExternalDeltasLaunch", kClothApplyExtDeltas, uint32_t(sizeof(kClothApplyExtDeltas)) },
     // gpunarrowphase FEMCloth-vs-primitive contact GENERATION (P7.1 tranche 4a BDA)
     { "cloth_midphaseGenerateVertexPairsLaunch", kClothMidphaseVertPairs, uint32_t(sizeof(kClothMidphaseVertPairs)) },

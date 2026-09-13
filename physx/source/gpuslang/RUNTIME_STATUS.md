@@ -1866,6 +1866,86 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.76b + P9.77 — ein Kernel, der nie gelaufen ist, und der Prüfer, der ihn findet
+
+### `sb_solveRigidSoftAttachmentLaunchTGS` wurde bei **jedem** Launch abgewiesen
+
+Der Softbody-Anhangs-Solve hat **zwei verschiedene** Host-Packs, nicht einen:
+
+```
+PGS   PxgSoftBodyCore.cpp:1810    9 Argumente  -> {8,8,4,8,8,8,8,4,8}      = 72 Byte
+TGS   PxgSoftBodyCore.cpp:1866   11 Argumente  -> {8,8,4,8,8,8,8,4,4,8,1}  = 80 Byte
+```
+
+`PxgVulkanKernelAbi.cpp:1879-1880` gab **beiden** die 72-Byte-Zeile, unter dem Kommentar
+„*both PGS and TGS share the pack*". Das gilt für **Cloth** — `PxgFEMClothCore.cpp:1845`
+baut tatsächlich *einen* 9-Argument-Pack und wählt die Funktion mit einem Ternär — und
+**nicht** für Softbody.
+
+**Derselbe Denkfehler wie P9.76a, in derselben Dateipaarung, am selben Tag gefunden.**
+P9.76a übernahm eine cloth-only Constraint-Eigenart; das hier übernahm eine cloth-only
+Startort-Behauptung. Zweimal: *es sieht aus wie Cloth, also ist es Cloth.*
+
+Die Brücke baut den Blob aus dem **Host**-Pack und der Shim prüft
+`blobSize == pushConstantSize` — `PxgVulkanCudaContext.cpp` sagt das in seinem eigenen
+Kommentar bei `:459`. Der TGS-Kernel war also auf Vulkan **nie gelaufen**, während jede
+Vorrichtung grün blieb: eine Vorrichtung dispatcht den Shader direkt und passiert das
+Gate nie.
+
+Das **beantwortet zugleich** die offene Frage aus P9.76a. Ob dieser Einstiegspunkt die
+PGS-Formel rechnet, ist eine Frage über Code, der nicht ausgeführt wird. Erst die Zeile,
+dann die Formel — in dieser Reihenfolge, weil die zweite Frage vorher gar nicht stellbar
+ist.
+
+Korrigiert wurde **beides zusammen**: die 80-Byte-Zeile *und* ein eigener 80-Byte-Push-
+Constant für den TGS-Einstieg. Nur die Zeile zu ändern hätte der Pipeline 80 gegeben,
+während der Shader 72 deklariert — derselbe Mismatch, nur andersherum.
+
+### Der fünfzehnte Prüfer — und warum sein erster Lauf fast wertlos war
+
+`check_launch_abi.py` (P9.48d) fragt, **ob** eine Zeile existiert. Es kann nicht fragen,
+ob sie **stimmt**. P9.48d war „gar keine Zeile" (Größe 0); das hier ist „eine Zeile in
+falscher Größe". Gleiches Ergebnis, und der bestehende Prüfer ist für die zweite Hälfte
+seiner eigenen Klasse blind.
+
+`tools/check_launch_abi_pack.py` leitet den Blob aus der `PX_CUDA_KERNEL_PARAM`-Liste am
+Startort ab und vergleicht. Sein Tauglichkeitstor: Defekt wieder eingesetzt → rot **mit
+Namen**, Defekt entfernt → grün.
+
+**Sein erster Lauf meldete einundzwanzig Mismatches. Zwanzig davon war dieser Prüfer,
+der sich über die Engine irrte.** Jeder verdient einen Namen, weil jeder eine Art ist,
+wie ein plausibler Parser lügt:
+
+| Weg | Ursache |
+|---|---|
+| −14 | Zuordnung über **Nähe** statt über den `CUfunction`-Handle |
+| −3 | eine **Referenz** wie ein Zeiger bemessen |
+| −1 | **erstes** statt **letztes** `kernelParams` vor dem Launch |
+| −1 | doppelte Klammern `PX_CUDA_KERNEL_PARAM((x))` verworfen |
+| −1 | **auskommentierte** Parameter mitgezählt |
+| **=1** | der echte |
+
+Der Referenz-Fehler ist der lehrreichste. `PX_CUDA_KERNEL_PARAM(x)` schiebt `sizeof(x)`,
+und für `const PxVec3& gravity` sind das **12**, nicht 8. Aufgefallen ist er an einer
+**Kontrolle, die nicht falsch sein durfte**: der Prüfer beschuldigte
+`preIntegrationLaunch`. Wäre das echt, würde kein starrer Körper integriert und keine der
+48 Szenen liefe. Eine Kontrolle, die nicht falsch sein darf, ist mehr wert als ein
+weiterer Verdächtiger.
+
+Und **Unter- und Überzählen sind dieselbe Krankheit**: beide beschuldigen die Zeile, und
+in beiden Fällen irrt der Prüfer über die Engine. Ein Prüfer mit Falsch-Positiven ist
+kein schwächerer Prüfer, sondern einer, der ignoriert wird — und dann werden seine
+Richtig-Positiven mit ignoriert.
+
+### Was er noch nicht kann
+
+99 der Kernel mit ABI-Zeile stehen in `KNOWN_UNDECIDED`, und das ist ein **protokollierter
+blinder Fleck**, kein Freispruch. Größte Ursache: ein per Wert übergebenes Struct, dessen
+Größe die Tabelle nicht kennt — vor allem die Contact-Writer-Schwänze; sie zu entscheiden
+heißt, das Struct zu lesen. Eine Ursache ist hier **grundsätzlich** nicht entscheidbar:
+die `void**`-Launch-Form trägt keine Argumentgrößen, und die Brücke liest sie aus genau
+dieser Tabelle — es bleibt nichts Unabhängiges zum Vergleichen.
+
 ## P9.76a — ein lebender Defekt in ausgeliefertem Code, und sein Orakel war mitschuldig
 
 Gefunden beim Lesen von `softBodyRigidAttachBda.slang` **als Vorlage** für den
