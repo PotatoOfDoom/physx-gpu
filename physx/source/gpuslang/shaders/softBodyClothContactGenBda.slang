@@ -112,9 +112,25 @@ struct SbClothCgParams
     uint64_t filterPairs;           // @80
     uint nbFilterPairs;             // @88
     uint _pad92;                    // @92
-    uint64_t stackSizeNeededOnDevice; // @96 (ABI parity only — the .cu writes it in the tail
-                                      //      of the driver, which is unreachable here since
-                                      //      the stack cap is applied to numPairs instead)
+    uint64_t stackSizeNeededOnDevice; // @96 (ABI parity only — see below; the reason is NOT
+                                      //      the one this comment used to give)
+    // P9.78b CORRECTED THIS.  What stood here was "the .cu writes it in the tail of the
+    // driver, which is unreachable here since the stack cap is applied to numPairs
+    // instead".  That is FALSE, and the coverage checker is what asked the question.
+    // softbodyPrimitives.cu:1648 guards the write with `globalWarpIdx == 0 &&
+    // threadIdx.x == 0` -- OUTSIDE the capped loop, and reachable whatever numPairs is.
+    // Capping numPairs is precisely WHY the tail write exists: it reports the UNCAPPED
+    // requirement so the host can grow the stack next frame.
+    //
+    // The omission is still correct, for a different reason: this kernel is UPSTREAM
+    // DEAD.  Its only launch site (PxgNarrowphaseCore.cpp:4704) sits inside
+    // `if (supportClothTriangleCollision)` (:4591), and that is a hard-coded local
+    // `bool supportClothTriangleCollision = false;` (:4529) with no other mention in the
+    // tree.  The LIVE half of the pair is the VERTEX generator, and it does implement
+    // the write -- softBodyClothVertContactGenBda.slang:217.
+    //
+    // A wrong reason that reaches the right conclusion is the P9.76a shape: it survives
+    // because nothing contradicts it.  The reason is now the one that is true.
     // --- PxgSoftBodyContactWriter, inlined (PxgSoftBodyCore.h:242) ---
     uint64_t w_outPoint;            // @104
     uint64_t w_outNormalPen;        // @112

@@ -12,8 +12,12 @@ P9.78 added `gpuslang.pushBlock`, the SIXTEENTH static checker and the FIFTH wri
 because its defect had already happened: `pushConstantSizeFor()` derives the pushed
 blob size from the ABI ROW and never from the SPIR-V, so a shader whose push block
 disagrees with its row is not refused -- it reads bytes that were never pushed, with
-nothing to report it.  Over 358 mapped kernels with a row: **291 reach their last
-argument, 67 stop short** (a ratchet), **0 read past it**.
+nothing to report it.  P9.78b replaced its high-water mark with per-argument COVERAGE
+and, doing so, found a wrong `paramAlign` transcription in itself AND in P9.77's
+checker (a 12-byte PxVec3 given alignment 16 instead of 4, mis-sizing 16 of the 358
+rows).  Over 358 mapped kernels with a row: **234 read every engine argument, 124
+leave 204 unread** (a ratchet), **0 read past the pushed bytes, 0 disagree on
+layout**.
 P9.76 added `gpuslang.psRigidAttachPrepare` and `gpuslang.psRigidAttachSolve`;
 P9.77 added `gpuslang.launchAbiPack`, the FIFTEENTH static checker, and P9.76c added
 `softBodySimRigidAttachSolveTGS` inside the existing `gpuslang.softBodySim` case — a
@@ -1881,6 +1885,83 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.78b — Reichweite ist nicht Abdeckung, und der Prüfer fand seinen eigenen Fehler
+
+P9.78 schloss mit einer selbst protokollierten Lücke: er misst eine **Reichweite**,
+kein **Abdecken**, also ist ein totes Argument **in der Mitte** des Packs unsichtbar.
+Diese Tranche schließt sie — und dabei ist etwas Besseres passiert als erwartet.
+
+### Die beiden Messungen widersprechen sich
+
+Statt eines Höchststands sammelt der Prüfer jetzt den **Byte-Bereich** jedes über
+`OpAccessChain` erreichten Members und fragt für **jedes** Engine-Argument, ob ein
+erreichter Member es überlappt:
+
+```
+Reichweite    67 Entry-Points bleiben vor ihrem letzten Argument stehen
+Abdeckung    124 Entry-Points lassen 204 Argumente ungelesen
+```
+
+`ps_rigidAttachmentPrepareLaunch` ist das Beispiel, das den Unterschied konkret macht:
+sein `dt` (@40) und `isTGS` (@44) werden von **nichts** gelesen — und die Reichweite
+wertete ihn als EXACT, weil `activeParticleSystems` (@48) dahinter liegt.
+
+### Der Prüfer fand einen Fehler in sich selbst — und in einem ausgelieferten Prüfer
+
+Der erste Lauf meldete zwei SUSPECTs, beide mit derselben Signatur: ein Argument, das
+auf **gar kein** deklariertes Shader-Feld trifft, obwohl der Shader das Feld
+nachweislich liest. Das ist keine Auslassung, sondern eine **Layout-Abweichung** — und
+sie war meine.
+
+`paramAlign` (`PxgVulkanCudaContext.cpp:114`) ist eine **Modulo-Leiter**: die größte
+Zweierpotenz, die die Größe *teilt*, gedeckelt bei 16. Meine Transkription lautete
+`size if size in (1,2,4,8) else 16` — richtig für jede Zweierpotenz und **falsch für
+den 12-Byte-`PxVec3`**, das per Wert übergebene `gravity`. 12 bekam 16 statt 4, und
+jedes folgende Argument verschob sich.
+
+```
+16 der 358 ABI-Zeilen falsch bemessen, alle mit einem PxVec3:
+  cloth_stepLaunch              falsch 80, richtig 64
+  preIntegrationLaunchTGS       falsch 112, richtig 96
+  ps_primitivesCollisionLaunch  falsch 192, richtig 176   ... und 13 weitere
+```
+
+**Dieselbe falsche Kopie steckte in `check_launch_abi_pack.py`** — dem Prüfer aus
+P9.77, zwei Commits alt. Dort hob sich der Fehler in den Verdikten auf, weil beide
+Seiten des Vergleichs dieselbe falsche Funktion benutzten; die Arithmetik war trotzdem
+falsch. Beide korrigiert; `launchAbiPack` bleibt grün.
+
+Nach der Korrektur: **124 statt 126** Entry-Points, **204 statt 208** Argumente, und
+**null** Argumente ohne deckendes Feld.
+
+### Daraus wurde eine eigene, schärfere Prüfung
+
+Ein Argument, das **kein deklariertes Feld** überlappt, ist etwas anderes als eines,
+das deklariert und nur nie gelesen wird: dort sind sich Shader-Struct und ABI-Zeile
+über das **Layout** uneins, und jedes Feld hinter der Divergenz liegt über den falschen
+Bytes. Das ist jetzt ein eigener Ausgang (`NO-MEMBER`), nicht ratschbar — und der
+Fitness-Test ist der Fehler selbst: mit wieder eingesetzter falscher Ausrichtung meldet
+er `cloth_stepLaunch 9@64+8` und 137 weitere Probleme.
+
+### Was die 204 sind
+
+Die Triage gegen die CUDA läuft; der Kopf der Verteilung ist eindeutig harmlos:
+
+- **`toleranceLength` ×34** (plus `tolerenceLength` ×6, Upstream-Tippfehler) — ABI-Parität,
+  im Shader selbst so kommentiert.
+- **`copyManifold` ×4** — `removeContactManagers_Stage1..4` nehmen in der CUDA **einen**
+  Parameter (`pairManagement.cu:45-64`), während der Host **einen** Zwei-Argument-Pack
+  baut und ihn auf alle fünf Stufen feuert (`PxgNarrowphaseCore.cpp:8527-8546). Das ist
+  die **dritte** Instanz von „ein Host-Pack, mehrere Kernel-Signaturen" in diesem
+  Codebestand, nach den Partikel-Solves und dem Softbody-Paar.
+- **`materials` ×4** — durch vier Partikel-Kontaktgeneratoren und ihre gesamte
+  Helferkette gereicht (`cudaParticleSystem.cu:1189-1679`) und **nie** dereferenziert.
+  Der Shader-Kommentar „unused; ABI parity" war richtig — jetzt geprüft statt geglaubt.
+- **`artiCoreDesc` ×14** — der aufgeschobene Artikulations-Zweig, in jedem betroffenen
+  Shader-Header dokumentiert.
+
+Die Ratsche trägt alle 124 mit ihrer Signatur; sie darf schrumpfen, nie wachsen.
 
 ## P9.78 — der SECHZEHNTE Prüfer: was der Shim nie vergleicht
 

@@ -18,10 +18,25 @@
 # corpus share ONE params struct across several entry points, sized for the
 # largest of them; the others then declare more than their own row pushes and
 # are perfectly correct as long as they do not READ the surplus.  So this walks
-# each entry point's call graph, collects every push-block member reached
-# through an OpAccessChain, and asks the question that has an answer:
+# each entry point's call graph, collects the byte RANGE of every push-block
+# member it reaches through an OpAccessChain, and asks two questions:
 #
-#     does the entry point read PAST the bytes the bridge pushes for it?
+#     1. does the entry point read PAST the bytes the bridge pushes for it?
+#        (never acceptable -- those bytes were never written)
+#     2. is there an engine argument NO reached member overlaps?
+#        (an argument the port never reads -- usually deliberate, never free)
+#
+# P9.78b REPLACED A HIGH-WATER MARK WITH RANGES, and that is the whole of it.
+# The first version asked only how FAR into the block an entry point reached,
+# which cannot see a dead argument in the MIDDLE of the pack.  Measured on the
+# same corpus, the two questions do not agree:
+#
+#     reach    67 entry points stop short of their last argument
+#     coverage 126 entry points leave 208 arguments unread
+#
+# ps_rigidAttachmentPrepareLaunch is the example that made the difference
+# concrete: its `dt` (@40) and `isTGS` (@44) are read by NOTHING, and the reach
+# measure scored it EXACT because activeParticleSystems (@48) sits after them.
 #
 # ---------------------------------------------------------------------------
 # WHY: THE MEASUREMENT THAT PROMPTED IT (P9.76)
@@ -48,10 +63,13 @@
 # ---------------------------------------------------------------------------
 # WHAT IT DOES *NOT* CHECK
 # ---------------------------------------------------------------------------
-# Byte LAYOUT within the pushed range.  Two structs of equal size can still
-# disagree on where a field sits, and this says nothing about that.  It checks
-# the one thing that cannot be recovered from downstream: reading bytes that
-# were never pushed.
+# Byte LAYOUT within the pushed range.  Two structs can agree on which bytes are
+# read and still disagree on what lives there.  Coverage is a necessary
+# condition, not a sufficient one.
+#
+# Nor can it tell a DELIBERATE omission from an accidental one -- that is a
+# question about the CUDA, and the answer goes in push_block_known.txt beside
+# the kernel, where a reader can check it.
 #
 # Nor does it check kernels with no ABI row: those are refused outright by the
 # shim (pushConstantSizeFor returns 0), which check_launch_abi.py already holds.
@@ -59,11 +77,28 @@
 # ---------------------------------------------------------------------------
 # THE RATCHET
 # ---------------------------------------------------------------------------
-# An entry point that reaches only a PREFIX of its row is not a defect -- it is
-# an argument the port defers, and several tranches did so deliberately.  Those
-# are reported with their measured slack and carried in push_block_known.txt so
-# the number is visible rather than assumed; the list may shrink, never grow.
-# Reading PAST the row is never acceptable and is not ratchetable.
+# An unread argument is usually not a defect.  The engine's argument pack is one
+# shape for a whole family of kernels, and three distinct benign causes account
+# for most of them:
+#
+#   - DEAD UPSTREAM.  The CUDA kernel does not use the parameter either.
+#     `removeContactManagers_Stage1..4` take ONE parameter in CUDA
+#     (pairManagement.cu:45-64) while the host builds a TWO-argument pack and
+#     fires it at all five stages (PxgNarrowphaseCore.cpp:8527-8546), so
+#     `copyManifold` is real in the row and absent from four of the kernels.
+#     `materials` is threaded through four particle contact-gen kernels and
+#     their whole helper chain (cudaParticleSystem.cu:1189-1679) and never
+#     dereferenced once.
+#   - ABI PARITY.  boxBoxNphase.slang says it in the struct itself:
+#     `float toleranceLength; // @132 (unused by this kernel, present for ABI
+#     parity)`.
+#   - A DEFERRED BRANCH.  articulations, cone limits, SDF, friction materials,
+#     a dynamic-rigid reaction -- documented in the shader's header.
+#
+# What the list is FOR is that the number stops being assumed.  The recorded
+# SIGNATURE is checked, not just the name: a kernel that starts leaving a
+# DIFFERENT argument unread is a regression the bare name would hide.  The list
+# may SHRINK, never grow.  Reading PAST the row is never ratchetable.
 #
 # Usage: python3 check_push_block.py [shader-dir]
 #        (default: ../../../../build-gpuslang/shaders)
@@ -82,6 +117,7 @@ KNOWN = os.path.join(os.path.dirname(__file__), "push_block_known.txt")
 # SPIR-V
 # ---------------------------------------------------------------------------
 OP_ENTRY_POINT = 15
+OP_MEMBER_NAME = 6
 OP_MEMBER_DECORATE = 72
 OP_DECORATE = 71
 OP_TYPE_BOOL = 20
@@ -132,6 +168,7 @@ class Module(object):
         self.pointers = {}       # id -> (storage class, pointee)
         self.push_vars = {}      # var id -> pointee type id
         self.entries = []        # (name, function id, [interface ids])
+        self.member_name = {}    # (struct id, member) -> source name
         self.fn_members = {}     # function id -> {(push var, member index)}
         self.fn_whole = {}       # function id -> {push var} loaded entire
         self.fn_calls = {}       # function id -> {callee ids}
@@ -146,7 +183,10 @@ class Module(object):
             op = w[i] & 0xFFFF
             if wc == 0:
                 break
-            if op == OP_ENTRY_POINT:
+            if op == OP_MEMBER_NAME:
+                nm, _ = literal_string(w[i + 3:i + wc])
+                self.member_name[(w[i + 1], w[i + 2])] = nm
+            elif op == OP_ENTRY_POINT:
                 name, used = literal_string(w[i + 3:i + wc])
                 self.entries.append((name, w[i + 2], list(w[i + 3 + used:i + wc])))
             elif op == OP_MEMBER_DECORATE and w[i + 3] == DECOR_OFFSET:
@@ -228,27 +268,50 @@ class Module(object):
             total = max(total, off + sz)
         return (total + 3) & ~3          # Vulkan push ranges are multiples of 4
 
-    def member_extent(self, sid, idx):
-        """(offset + size) of one struct member, or None when undecidable."""
+    def member_range(self, sid, idx):
+        """[offset, offset+size) of one struct member, or None when undecidable."""
         t = self.types.get(sid)
         if not t or t[0] != OP_TYPE_STRUCT or idx is None or idx >= len(t[1]):
             return None
         off = self.member_offset.get((sid, idx))
         sz = self.type_size(t[1][idx])
-        return None if (off is None or sz is None) else off + sz
+        return None if (off is None or sz is None) else (off, off + sz)
 
-    def reach_for_entry(self, name):
-        """The highest push-constant BYTE the entry point can read, or (None, note).
+    def block_members(self, name):
+        """[(offset, end, source name)] for the entry point's push block, so the
+        report can say WHICH field an unread argument overlaps rather than only
+        where it sits."""
+        for ename, _fn, iface in self.entries:
+            if ename != name:
+                continue
+            pushes = [v for v in iface if v in self.push_vars]
+            if len(pushes) != 1:
+                return []
+            sid = self.push_vars[pushes[0]]
+            t = self.types.get(sid)
+            if not t or t[0] != OP_TYPE_STRUCT:
+                return []
+            out = []
+            for idx in range(len(t[1])):
+                r = self.member_range(sid, idx)
+                if r:
+                    out.append((r[0], r[1], self.member_name.get((sid, idx), "?")))
+            return out
+        return []
 
-        Returns (reach, declared, note): `reach` is max(offset + size) over every
-        member reached through the entry point's call graph, `declared` is the
-        whole block's size."""
+    def coverage_for_entry(self, name):
+        """(reached byte ranges, declared block size, note).
+
+        Every push-block member the entry point can reach through its call
+        graph, as a byte range.  RANGES, not a single high-water mark: a reach
+        cannot see a dead argument in the MIDDLE of the pack, which is the blind
+        spot P9.78 recorded and P9.78b closes."""
         for ename, fn, iface in self.entries:
             if ename != name:
                 continue
             pushes = [v for v in iface if v in self.push_vars]
             if not pushes:
-                return 0, 0, "no push-constant variable in the interface"
+                return [], 0, "no push-constant variable in the interface"
             if len(pushes) > 1:
                 return None, None, "%d push-constant variables in one interface" % len(pushes)
             var = pushes[0]
@@ -264,52 +327,63 @@ class Module(object):
                 stack.extend(self.fn_calls.get(f, ()))
 
             if any(var in self.fn_whole.get(f, ()) for f in seen):
-                return declared, declared, "whole-block OpLoad"
+                return [(0, declared)], declared, "whole-block OpLoad"
 
-            reach = 0
+            ranges = []
             for f in seen:
                 for (v, idx) in self.fn_members.get(f, ()):
                     if v != var:
                         continue
                     if idx is None:
                         return None, declared, "non-constant member index"
-                    ext = self.member_extent(sid, idx)
-                    if ext is None:
+                    r = self.member_range(sid, idx)
+                    if r is None:
                         return None, declared, "member %d undecidable" % idx
-                    reach = max(reach, ext)
-            return (reach + 3) & ~3, declared, ""
+                    ranges.append(r)
+            return ranges, declared, ""
         return None, None, "entry point not found in the module"
 
 
 # ---------------------------------------------------------------------------
 # the ABI table and the manifest
 # ---------------------------------------------------------------------------
-def _abi_layout(row):
-    """(end of the last argument, total blob size) for an ABI row.
+def _param_align(size):
+    """paramAlign (PxgVulkanCudaContext.cpp:114) / abiAlign (PxgVulkanKernelAbi.cpp
+    :2206): the largest power of two that DIVIDES the size, capped at 16.
 
-    The second is pxgKernelAbiPushSize (PxgVulkanKernelAbi.cpp) transcribed; the
-    FIRST is where a shader can legitimately stop.  The two differ by the
-    TRAILING PADDING the blob alignment adds -- bytes the bridge pushes and
-    nothing is meant to read.  Comparing a reach against the rounded total
-    instead reported 166 "prefix readers" on this checker\'s first run, almost
-    all of them exactly four bytes short: padding, not a deferral."""
-    def align(s):
-        return s if s in (1, 2, 4, 8) else 16
-    off, ma = 0, 1
+    Transcribed as a modulo ladder, which it is.  P9.78b's first draft wrote it as
+    `size if size in (1,2,4,8) else 16`, which is right for every power-of-two size
+    and wrong for a 12-byte PxVec3 -- the by-value `gravity` argument.  That gave
+    16 where the bridge gives 4 and shifted every argument after it, mis-sizing 16
+    of the 358 rows and inventing two "unread arguments" that were nothing of the
+    kind.  The same wrong copy shipped in check_launch_abi_pack.py and is corrected
+    there too."""
+    if size == 0:
+        return 1
+    for a in (16, 8, 4, 2):
+        if size % a == 0:
+            return a
+    return 1
+
+
+def _abi_arg_ranges(row):
+    """[(start, end)] per CUDA argument, laid out exactly as the bridge lays the
+    blob out (PxgVulkanCudaContext.cpp:443-462)."""
+    out, off = [], 0
     for s in row:
-        a = align(s)
-        ma = max(ma, a)
+        a = _param_align(s)
         off = (off + a - 1) & ~(a - 1)
+        out.append((off, off + s))
         off += s
-    return (off + 3) & ~3, (off + ma - 1) & ~(ma - 1)
+    return out
 
 
 def abi_push_size(row):
-    return _abi_layout(row)[1]
-
-
-def abi_last_end(row):
-    return _abi_layout(row)[0]
+    """pxgKernelAbiPushSize (PxgVulkanKernelAbi.cpp:2231), transcribed."""
+    ranges = _abi_arg_ranges(row)
+    end = ranges[-1][1] if ranges else 0
+    ma = max([_param_align(s) for s in row] + [1])
+    return (end + ma - 1) & ~(ma - 1)
 
 
 def read_abi():
@@ -332,9 +406,10 @@ def read_manifest():
 
 
 def read_known():
-    """kernel -> (reach, last).  The RECORDED PAIR is part of the ratchet: a
-    prefix reader that starts reading LESS than it used to is a regression the
-    bare name would hide."""
+    """kernel -> the unread-argument SIGNATURE ("index@offset+size;...").
+
+    The signature is part of the ratchet, not just the name: a kernel that starts
+    leaving a DIFFERENT argument unread is a regression the bare name would hide."""
     known = {}
     if not os.path.exists(KNOWN):
         return known
@@ -343,10 +418,7 @@ def read_known():
         if not line:
             continue
         parts = line.split()
-        if len(parts) >= 3:
-            known[parts[0]] = (int(parts[1]), int(parts[2]))
-        else:
-            known[parts[0]] = None
+        known[parts[0]] = parts[1] if len(parts) > 1 else None
     return known
 
 
@@ -360,12 +432,13 @@ def main():
     known = read_known()
     modules = {}
 
-    exact = 0
+    full = 0
     no_row = 0
     missing_spv = 0
     undecided = []
     over = []      # the entry point can read PAST the pushed bytes
-    short = []     # it reaches only a prefix of them
+    nomember = []  # a row argument NO declared member overlaps -- a layout disagreement
+    partial = []   # (cuda, entry, unread argument indices, nargs, note)
 
     for cuda, spv, entry in read_manifest():
         path = os.path.join(shader_dir, spv)
@@ -382,65 +455,99 @@ def main():
         if row is None:
             no_row += 1
             continue
-        want = abi_push_size(row)
-        last = abi_last_end(row)
-        reach, declared, note = modules[spv].reach_for_entry(entry)
-        if reach is None:
+        ranges, declared, note = modules[spv].coverage_for_entry(entry)
+        if ranges is None:
             undecided.append((cuda, spv, entry, note))
             continue
+
+        want = abi_push_size(row)
+        reach = max([e for (_s, e) in ranges] + [0])
         if reach > want:
             over.append((cuda, entry, reach, want, declared, note))
-        elif reach >= last:
-            exact += 1          # reaches the last real argument; the rest is padding
-        else:
-            short.append((cuda, entry, reach, last, want, declared))
+            continue
 
-    total = exact + len(short) + len(over) + len(undecided)
-    print("push-block REACH vs ABI row over %d mapped kernels with a row "
+        args = _abi_arg_ranges(row)
+        fields = modules[spv].block_members(entry)
+
+        def name_at(a, b):
+            hit = [nm for (ms, me, nm) in fields if ms < b and a < me]
+            return "/".join(hit) if hit else "-"
+
+        # An argument NO DECLARED MEMBER overlaps is a different animal from one
+        # that is declared and simply never read: the shader's struct and the row
+        # disagree on the LAYOUT, so every field after the divergence sits over
+        # the wrong bytes.  P9.78b found its own alignment bug this way -- a
+        # 12-byte PxVec3 given alignment 16 instead of 4 shifted every later
+        # argument and produced exactly this signature.
+        unmapped = [i for i, (a, b) in enumerate(args)
+                    if fields and not any(ms < b and a < me for (ms, me, _n) in fields)]
+        unread = [i for i, (a, b) in enumerate(args)
+                  if i not in unmapped and not any(rs < b and a < re for (rs, re) in ranges)]
+
+        if unmapped:
+            nomember.append((cuda, entry,
+                             ";".join("%d@%d+%d" % (i, args[i][0], args[i][1] - args[i][0])
+                                      for i in unmapped)))
+        if unread:
+            partial.append((cuda, entry, unread, len(args),
+                            ";".join("%d@%d+%d:%s" % (i, args[i][0], args[i][1] - args[i][0],
+                                                      name_at(args[i][0], args[i][1]))
+                                     for i in unread)))
+        elif not unmapped:
+            full += 1
+
+    total = full + len(partial) + len(over) + len(undecided) + len(nomember)
+    print("push-block COVERAGE vs ABI row over %d mapped kernels with a row "
           "(%d without a row, %d with no built .spv)" % (total, no_row, missing_spv))
-    print("  EXACT      %d  (reaches the last real argument; trailing padding is not read)" % exact)
-    print("  PREFIX     %d  (stops short of the last real argument)" % len(short))
+    print("  FULL       %d  (every engine argument is read)" % full)
+    print("  PARTIAL    %d  (at least one argument no code reads)" % len(partial))
     print("  OVER-READ  %d  (can read past the pushed bytes)" % len(over))
+    print("  NO-MEMBER  %d  (a row argument no declared field covers -- layouts disagree)" % len(nomember))
     print("  UNDECIDED  %d" % len(undecided))
+    print("  unread arguments in total: %d" % sum(len(p[2]) for p in partial))
 
     failures = 0
+
+    if nomember:
+        print("\nA row argument that NO declared push-block field covers means the shader")
+        print("struct and the ABI row disagree on the LAYOUT, not merely on what is read:")
+        for cuda, entry, sig in sorted(nomember):
+            print("  %-52s %s" % (cuda, sig))
+        failures += len(nomember)
 
     if over:
         print("\nAn entry point that reaches BEYOND its ABI row reads bytes the bridge")
         print("never pushed.  Nothing reports this at runtime -- see the header:")
         for cuda, entry, reach, want, declared, note in sorted(over):
-            print("  %-52s %s reaches byte %d, the row pushes %d (block is %s)%s"
-                  % (cuda, entry, reach, want, declared, (" [%s]" % note) if note else ""))
+            print("  %-52s reaches byte %d, the row pushes %d (block is %s)%s"
+                  % (cuda, reach, want, declared, (" [%s]" % note) if note else ""))
         failures += len(over)
 
-    moved = []
-    for cuda, entry, reach, last, want, declared in short:
-        rec = known.get(cuda)
-        if rec is not None and rec != (reach, last):
-            moved.append((cuda, rec, (reach, last)))
-
-    fresh = [x for x in short if x[0] not in known]
+    seen_now = {c: sig for (c, _e, _u, _n, sig) in partial}
+    fresh = [x for x in partial if x[0] not in known]
     if fresh:
-        print("\n%d entry point(s) reach only a PREFIX of their row and are not on the" % len(fresh))
-        print("ratchet.  That is usually an argument the port defers on purpose -- record")
-        print("each in tools/push_block_known.txt with the reason, or read the tail:")
-        for cuda, entry, reach, last, want, declared in sorted(fresh):
-            print("  %-46s reaches %d, last argument ends at %d (%d pushed, block %s)"
-                  % (cuda, reach, last, want, declared))
+        print("\n%d entry point(s) leave an engine argument UNREAD and are not on the" % len(fresh))
+        print("ratchet.  That is usually deliberate -- an argument the port defers, or one")
+        print("the kernel is documented not to use -- but it is never free: record each in")
+        print("tools/push_block_known.txt with the reason, or read it:")
+        for cuda, entry, unread, nargs, sig in sorted(fresh):
+            print("  %-46s %d of %d arguments unread: %s" % (cuda, len(unread), nargs, sig))
         failures += len(fresh)
 
+    moved = [(c, known[c], sig) for c, sig in seen_now.items()
+             if known.get(c) is not None and known[c] != sig]
     if moved:
-        print("\n%d recorded prefix reader(s) MOVED.  Reading less than before is a" % len(moved))
-        print("regression; reading more means the ratchet line is stale:")
+        print("\n%d recorded partial reader(s) MOVED.  Leaving MORE unread is a" % len(moved))
+        print("regression; leaving less means the ratchet line is stale:")
         for cuda, was, now in sorted(moved):
-            print("  %-52s was %d/%d, now %d/%d" % (cuda, was[0], was[1], now[0], now[1]))
+            print("  %-46s was [%s], now [%s]" % (cuda, was, now))
         failures += len(moved)
 
-    stale = [k for k in known if k not in {x[0] for x in short}]
+    stale = [k for k in known if k not in seen_now]
     if stale:
-        print("\n%d STALE entry(ies) in push_block_known.txt -- these kernels no longer" % len(stale))
-        print("stop short of their row; remove the lines.  A ratchet that keeps finished")
-        print("kernels on its list stops ratcheting:")
+        print("\n%d STALE entry(ies) in push_block_known.txt -- these kernels now read" % len(stale))
+        print("every argument; remove the lines.  A ratchet that keeps finished kernels")
+        print("on its list stops ratcheting:")
         for k in sorted(stale):
             print("  %s" % k)
         failures += len(stale)
@@ -456,7 +563,8 @@ def main():
     if failures:
         print("\ncheck_push_block: %d problem(s)" % failures)
         return 1
-    print("\ncheck_push_block: clean (%d prefix reader(s) on the ratchet)" % len(short))
+    print("\ncheck_push_block: clean (%d partial reader(s) on the ratchet, %d unread arguments)"
+          % (len(partial), sum(len(p[2]) for p in partial)))
     return 0
 
 

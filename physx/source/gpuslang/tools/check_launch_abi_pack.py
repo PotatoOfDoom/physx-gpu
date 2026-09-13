@@ -270,18 +270,34 @@ def arg_size(decl_type):
     return SIZES.get(base) or SIZES.get(t)
 
 
+def _param_align(size):
+    """paramAlign (PxgVulkanCudaContext.cpp:114) / abiAlign (PxgVulkanKernelAbi.cpp
+    :2206): the largest power of two that DIVIDES the size, capped at 16.
+
+    Transcribed as a modulo ladder, which it is.  P9.78b's first draft wrote it as
+    `size if size in (1,2,4,8) else 16`, which is right for every power-of-two size
+    and wrong for a 12-byte PxVec3 -- the by-value `gravity` argument.  That gave
+    16 where the bridge gives 4 and shifted every argument after it, mis-sizing 16
+    of the 358 rows and inventing two "unread arguments" that were nothing of the
+    kind.  The same wrong copy shipped in check_launch_abi_pack.py and is corrected
+    there too."""
+    if size == 0:
+        return 1
+    for a in (16, 8, 4, 2):
+        if size % a == 0:
+            return a
+    return 1
+
+
 def abi_push_size(row):
-    """pxgKernelAbiPushSize, PxgVulkanKernelAbi.cpp:2165, transcribed."""
-    def align(s):
-        return s if s in (1, 2, 4, 8) else 16
+    """pxgKernelAbiPushSize, PxgVulkanKernelAbi.cpp:2231, transcribed."""
     off, ma = 0, 1
     for s in row:
-        a = align(s)
+        a = _param_align(s)
         ma = max(ma, a)
         off = (off + a - 1) & ~(a - 1)
         off += s
     return (off + ma - 1) & ~(ma - 1)
-
 
 # ---------------------------------------------------------------------------
 # the ABI table

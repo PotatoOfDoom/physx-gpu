@@ -1,92 +1,173 @@
-# push_block_known.txt -- the P9.78 ratchet.
+# push_block_known.txt -- the P9.78b ratchet.
 #
-# Each line is an entry point whose Slang code reaches only a PREFIX of the
-# bytes the bridge pushes for it:
+# Each line is an entry point that never reads one of the arguments the engine
+# pushes to it:
 #
-#     <cuda kernel name>   <highest byte reached>   <end of the row's last argument>
+#     <cuda kernel name>   <index>@<offset>+<size>:<slang field>;...   # <why>
 #
-# That is not by itself a defect.  The engine's argument pack is one shape for a
-# whole family of kernels, and a port that defers an argument -- a pointer it
-# never dereferences, a tolerance the kernel is documented not to use, a
-# dynamic-rigid reaction another tranche will add -- legitimately stops early.
-# boxBoxNphase.slang says so in the struct itself: `float toleranceLength; //
-# @132 (unused by this kernel, present for ABI parity)`, and this file's entry
-# for it is exactly `132 136`.
+# THE WHY COLUMN IS MEASURED, NOT ASSUMED.  All 204 unread arguments were read
+# against the engine's CUDA, one by one:
 #
-# What the list is FOR is that the number stops being assumed.  The RECORDED
-# PAIR is checked, not just the name: an entry point that starts reading LESS
-# than it used to is a regression, and one that reads more means the line is
-# stale and should go.  The list may SHRINK, never grow.
+#     dead-upstream  152   the CUDA kernel does not use the parameter either
+#     deferred        51   the shader's own header documents the omission
+#     suspect          1   claimed a real gap; refuted (see below)
 #
-# Note what this cannot see: an argument in the MIDDLE of the pack that nothing
-# reads.  The measure is a REACH, so a dead argument followed by a live one is
-# invisible here -- ps_rigidAttachmentPrepareLaunch's dead `dt` and `isTGS` are
-# exactly that, and they do not appear below.
+# The three recurring causes, with the evidence that settles each:
 #
-accumulateDeltaVRigidSecondLaunchMultiStage1               88   92
-artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T     32   36
-boxBoxNphase_Kernel                                       132  136
-cloth_SphereContactGenLaunch                              188  192
-cloth_SphereVertexContactGenLaunch                        156  160
-cloth_boxTriangleContactGenLaunch                         188  192
-cloth_boxVertexContactGenLaunch                           156  160
-cloth_convexContactGenLaunch                              188  192
-cloth_convexVertexContactGenLaunch                        188  192
-cloth_heightfieldContactGenLaunch                         172  176
-cloth_meshContactGenLaunch                                188  192
-cloth_meshVertexContactGenLaunch                           96  176
-cloth_planeVertContactGenLaunch                           156  160
-cloth_psContactGenLaunch                                  172  176
-cloth_rigidContactPrepareLaunch                            80  100
-cloth_sdfMeshContactGenLaunch                             156  160
-cloth_solveClothClothDeltaEELaunch                         24   28
-cloth_solveClothClothDeltaVTLaunch                         24   28
-cloth_solveRigidClothAttachmentLaunch                      60   72
-cloth_solveRigidClothAttachmentTGSLaunch                   60   72
-cloth_stepLaunch                                           64   72
-cloth_updateClothContactValidityLaunch                     48   52
-computeArtiGravityForces                                   52   60
-constraint1DPrePrepLaunch                                   8   16
-convexCoreClothmeshNphase_Kernel32                        172  176
-convexCoreTetmeshNphase_Kernel32                          140  144
-convexTrimeshCorrelate                                     72   80
-markActiveSlabPGS                                          24   32
-markActiveSlabTGS                                          32   40
-preIntegrationLaunch                                       88   96
-preIntegrationLaunchTGS                                    92  100
-propagateAverageSolverBodyVelocityTGS                      20   24
-propagateStaticSolverBodyVelocitiesTGS                     28   36
-ps_applyDeltaLaunch                                        16   20
-ps_averageVertsLaunch                                      16   20
-ps_contactPrepareLaunch                                    72   80
-ps_diffuseParticleCopy                                     16   20
-ps_diffuseParticleOneWayCollision                          16   20
-ps_diffuseParticleSum                                      16   20
-ps_diffuseParticleUpdatePBF                                16   32
-ps_heightfieldCollisonLaunch                              132  136
-ps_meshCollisonLaunch                                     132  136
-ps_primitivesCollisionLaunch                              172  184
-ps_sdfMeshCollisonLaunch                                  132  136
-ps_solveAerodynamics2Launch                                16   20
-ps_solvePCOutputParticleDeltaVLaunch                       80   96
-ps_solvePCOutputParticleDeltaVTGSLaunch                    84   96
-ps_solveRigidAttachmentsLaunch                             60   68
-ps_stepParticlesLaunch                                     40   44
-ps_updateMaterials                                         24   28
-ps_updateUserBufferLaunch                                  16   20
-removeContactManagers_Stage1                                8   12
-removeContactManagers_Stage2                                8   12
-removeContactManagers_Stage3                                8   12
-removeContactManagers_Stage4                                8   12
-sb_clothContactGenLaunch                                  156  168
-sb_clothVertContactGenLaunch                              156  168
-sb_gm_stepSoftbodyLaunch                                   36   48
-sb_meshContactGenLaunch                                   188  192
-sb_primitiveContactGenLaunch                              188  192
-sb_psContactGenLaunch                                     188  192
-sb_rigidContactPrepareLaunch                               80  100
-sb_sbMidphaseGeneratePairsLaunch                          108  120
-sb_sdfMeshMidphaseGeneratePairsLaunch                     164  176
-sb_selfCollisionMidphaseGeneratePairsLaunch                76   88
-sb_solveRigidSoftAttachmentLaunch                          60   72
-updateBodiesLaunch_Part3                                    8   16
+#   DEAD UPSTREAM.  removeContactManagers_Stage1..4 take ONE parameter in CUDA
+#     (pairManagement.cu:45-64) while the host builds a TWO-argument pack and
+#     fires it at all five stages (PxgNarrowphaseCore.cpp:8527-8546) -- the
+#     third instance in this codebase of "one host pack, several kernel
+#     signatures", after the particle solves (P9.76) and the softbody pair
+#     (P9.76b).  `materials` is threaded through four particle contact-gen
+#     kernels and their whole helper chain (cudaParticleSystem.cu:1189-1679)
+#     and never dereferenced once.  `toleranceLength` accounts for 40 of the
+#     204 on its own, upstream typo `tolerenceLength` included.
+#   ABI PARITY.  boxBoxNphase.slang says it in the struct itself:
+#     `float toleranceLength; // @132 (unused by this kernel, present for ABI
+#     parity)`.
+#   A DEFERRED BRANCH.  Articulations (14), cone limits, SDF, speculative CCD,
+#     a dynamic-rigid reaction -- each documented in its shader's header.
+#
+# THE ONE SUSPECT, and what it was worth: sb_clothContactGenLaunch was claimed
+# to drop the `stackSizeNeededOnDevice` atomicMax that softbodyPrimitives.cu
+# :1648 writes unconditionally in its tail.  Refuted as a port gap -- the kernel
+# is upstream-dead (`supportClothTriangleCollision = false`,
+# PxgNarrowphaseCore.cpp:4529, with no other mention in the tree) and the LIVE
+# sibling does implement the write (softBodyClothVertContactGenBda.slang:217).
+# But the shader's STATED REASON was false, and it has been corrected: the tail
+# guard is reachable, the kernel is simply dead.  A wrong reason reaching the
+# right conclusion is the P9.76a shape.
+#
+# What the list is FOR is that the number stops being assumed.  The recorded
+# SIGNATURE is checked, not just the name: a kernel that starts leaving a
+# DIFFERENT argument unread is a regression the bare name would hide.  The list
+# may SHRINK, never grow.
+#
+# Reading PAST the row, and a row argument no declared field covers at all, are
+# separate outcomes and neither is ratchetable.
+#
+accumulateDeltaVRigidSecondLaunchMultiStage1           6@48+8:solverCoreDesc;8@64+8:sharedDesc;12@88+1:isTGSWord      # dead-upstream
+accumulateDeltaVRigidSecondLaunchMultiStage2           10@80+1:useLocalRelaxWord;11@84+4:globalRelaxationCoefficient  # dead-upstream
+artiPropagateRigidImpulsesAndSolveSelfConstraints1T    2@16+1:velIterWord;3@20+4:elapsedTime                          # dead-upstream+deferred
+artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T 5@32+1:doFrictionWord                                          # dead-upstream
+artiSolveInternalConstraints1T                         6@32+8:staticContactUniqueIds;7@40+8:staticJointUniqueIds      # dead-upstream
+artiSolveInternalConstraintsTGS1T                      6@32+8:staticContactUniqueIds;7@40+8:staticJointUniqueIds      # dead-upstream
+boxBoxNphase_Kernel                                    18@132+4:toleranceLength                                       # dead-upstream
+clearDeltaVRigidSecondLaunchMulti                      3@24+8:solverCoreDesc                                          # dead-upstream
+cloth_SphereContactGenLaunch                           0@0+4:toleranceLength                                          # dead-upstream
+cloth_boxTriangleContactGenLaunch                      0@0+4:toleranceLength                                          # dead-upstream
+cloth_clothContactPrepareLaunch                        4@32+8:clothMaterials                                          # dead-upstream
+cloth_convexContactGenLaunch                           0@0+4:toleranceLength                                          # dead-upstream
+cloth_convexVertexContactGenLaunch                     0@0+4:toleranceLength                                          # dead-upstream
+cloth_differentClothCollisionEELaunch                  1@4+4:toleranceLength;3@16+8:transformCache;7@48+8:clothClothPairs;8@56+4:numClothClothPairs # dead-upstream
+cloth_differentClothCollisionVTLaunch                  1@4+4:toleranceLength;3@16+8:transformCache;7@48+8:clothClothPairs;8@56+4:numClothClothPairs # dead-upstream
+cloth_finalizeVelocitiesLaunch                         2@16+4:invTotalDt                                              # dead-upstream
+cloth_heightfieldContactGenLaunch                      0@0+4:toleranceLength                                          # dead-upstream
+cloth_heightfieldMidphaseGeneratePairsLaunch           1@4+4:toleranceLength                                          # dead-upstream
+cloth_heightfieldVertexContactGenLaunch                0@0+4:toleranceLength;1@8+8:cmInputs;2@16+8:transformCache;3@24+8:contactDistance;4@32+8:restDistance;5@40+8:gpuShapes;6@48+8:femClothes;7@56+8:shapeToRigidRemap;8@64+8:stackPtr;10@80+80:w_outPoint/w_outNormalPen/w_outBarycentric/w_outContactInfo/w_totalContactCount/w_contactByX/w_tempContactByX/w_contactIndexSortedByX/w_contactSortedByX/w_maxNumContacts/_pad156;11@160+4:stackSizeBytes # dead-upstream+deferred
+cloth_meshContactGenLaunch                             0@0+4:toleranceLength                                          # dead-upstream
+cloth_meshMidphaseGeneratePairsLaunch                  0@0+4:toleranceLength;3@24+8:bounds                            # dead-upstream
+cloth_meshVertexContactGenLaunch                       0@0+4:toleranceLength;1@8+8:cmInputs;2@16+8:transformCache;3@24+8:contactDistance;4@32+8:restDistance;5@40+8:gpuShapes;6@48+8:femClothes;7@56+8:shapeToRigidRemap;8@64+4:stackSizeBytes;9@72+8:stackPtr;12@96+80:w_outPoint/w_outNormalPen/w_outBarycentric/w_outContactInfo/w_totalContactCount/w_contactByX/w_tempContactByX/w_contactIndexSortedByX/w_contactSortedByX/w_maxNumContacts/_pad172 # dead-upstream+deferred
+cloth_midphaseGeneratePairsLaunch                      1@4+4:toleranceLength;3@16+8:transformCache                    # dead-upstream
+cloth_midphaseGenerateVertexPairsLaunch                1@4+4:toleranceLength;3@16+8:transformCache                    # dead-upstream
+cloth_midphaseVertexHeightfieldLaunch                  1@4+4:toleranceLength                                          # dead-upstream
+cloth_midphaseVertexMeshLaunch                         0@0+4:numWorkItems;1@4+4:toleranceLength;4@24+8:bounds         # dead-upstream
+cloth_particleContactPrepareLaunch                     2@16+8:contacts                                                # dead-upstream
+cloth_preIntegrateLaunch                               5@40+8:speculativeCCDContactOffset                             # deferred
+cloth_psContactGenLaunch                               0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
+cloth_psMidphaseGeneratePairsLaunch                    1@4+4:toleranceLength;4@24+8:transformCache;5@32+8:bounds      # dead-upstream
+cloth_queryRigidClothContactReferenceCountLaunch       6@48+8:artiCoreDesc                                            # deferred
+cloth_queryRigidClothContactReferenceCountTGSLaunch    6@48+8:artiCoreDesc                                            # deferred
+cloth_refitBoundLaunch                                 3@24+8:contactDists                                            # dead-upstream
+cloth_rigidAttachmentPrepareLaunch                     8@64+8:sharedDesc                                              # deferred
+cloth_rigidContactPrepareLaunch                        10@80+4:invDt;11@88+8:sharedDesc;12@96+1:isTGS                 # dead-upstream+deferred
+cloth_selfCollisionMidphaseEELaunch                    4@32+8:clothClothPairs;5@40+4:numClothClothPairs               # dead-upstream
+cloth_selfCollisionMidphaseVTLaunch                    4@32+8:clothClothPairs;5@40+4:numClothClothPairs               # dead-upstream
+cloth_solveClothClothDeltaEELaunch                     3@24+4:dt                                                      # dead-upstream
+cloth_solveClothClothDeltaVTLaunch                     3@24+4:dt                                                      # dead-upstream
+cloth_solveRigidClothAttachmentLaunch                  5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
+cloth_solveRigidClothAttachmentTGSLaunch               5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
+cloth_solveRigidClothCollisionLaunch                   6@48+8:artiCoreDesc                                            # deferred
+cloth_solveRigidClothCollisionTGSLaunch                6@48+8:artiCoreDesc                                            # deferred
+cloth_updateClothContactValidityLaunch                 7@48+4:dt                                                      # dead-upstream
+constraint1DPrePrepLaunch                              1@8+8:sharedDesc                                               # deferred
+convexHeightFieldMidphase                              9@64+8:cmOutputs                                               # dead-upstream
+convexHeightfieldPostProcess                           2@16+8:cvxTriIntermPtr                                         # dead-upstream
+convexTrimeshCorrelate                                 5@40+8:cmOutputs;10@72+8:pTempContactIndex                     # dead-upstream
+convexTrimeshPostProcess                               2@16+8:cvxTriIntermPtr                                         # dead-upstream
+markActiveSlabPGS                                      4@24+8:artiDesc                                                # deferred
+markActiveSlabTGS                                      6@32+8:artiDesc                                                # deferred
+midphaseGeneratePairs                                  9@64+8:cmOutputs                                               # dead-upstream
+preIntegrationLaunch                                   5@32+8:solverBodySleepDataPool                                 # dead-upstream
+preIntegrationLaunchTGS                                5@32+8:solverBodySleepDataPool                                 # dead-upstream
+propagateAverageSolverBodyVelocityTGS                  4@20+4:biasCoefficient                                         # dead-upstream
+propagateStaticSolverBodyVelocities                    3@20+4:nbStaticSlabs                                           # dead-upstream
+propagateStaticSolverBodyVelocitiesTGS                 3@20+4:nbStaticSlabs;5@28+4:elapsedTime;6@32+4:minPen          # dead-upstream
+ps_applyDeltaLaunch                                    2@16+4:dt                                                      # dead-upstream
+ps_averageVertsLaunch                                  2@16+4:invDt                                                   # dead-upstream
+ps_contactPrepareLaunch                                7@56+4:dt;8@60+1:isTGSWord;10@72+8:sharedDesc                  # dead-upstream+deferred
+ps_convexCollisionLaunch                               2@8+4:toleranceLength;9@64+8:materials                         # dead-upstream
+ps_convexDiffuseCollisionLaunch                        2@8+4:toleranceLength;9@64+8:materials                         # dead-upstream
+ps_diffuseParticleCopy                                 2@16+4:count                                                   # dead-upstream
+ps_diffuseParticleOneWayCollision                      2@16+4:count                                                   # dead-upstream
+ps_diffuseParticleSum                                  2@16+4:count                                                   # dead-upstream
+ps_diffuseParticleUpdatePBF                            2@16+12:gx/gy/gz;3@28+4:dt                                     # dead-upstream
+ps_findStartEndFEMFirstLaunch                          0@0+8:particleSystems                                          # dead-upstream
+ps_findStartEndFEMSecondLaunch                         2@16+8:blockOffsets                                            # deferred
+ps_findStartEndParticleFirstLaunch                     0@0+8:particleSystems                                          # dead-upstream
+ps_findStartEndParticleSecondLaunch                    2@16+8:blockOffsets                                            # deferred
+ps_heightfieldCollisonLaunch                           1@4+4:toleranceLength                                          # dead-upstream
+ps_integrateLaunch                                     2@16+4:dt                                                      # dead-upstream
+ps_meshCollisonLaunch                                  1@4+4:toleranceLength                                          # dead-upstream
+ps_primitivesBoundFirstPassLaunch                      3@24+8:transformCache                                          # dead-upstream
+ps_primitivesCollisionLaunch                           2@8+4:toleranceLength;9@64+8:materials                         # dead-upstream
+ps_primitivesDiffuseCollisionLaunch                    2@8+4:toleranceLength;9@64+8:materials                         # dead-upstream
+ps_rigidAttachmentPrepareLaunch                        5@40+4:dt;6@44+1:isTGS                                         # dead-upstream
+ps_sdfMeshCollisonLaunch                               0@0+4:tolerenceLength                                          # dead-upstream
+ps_solveAerodynamics2Launch                            2@16+4:dt                                                      # dead-upstream
+ps_solveInflatableVolume                               2@16+4:dt                                                      # dead-upstream
+ps_solveOneWayContactDeltaVLaunch                      2@16+4:invDt                                                   # dead-upstream
+ps_solvePCOutputParticleDeltaVLaunch                   1@8+8:sortedContacts;11@80+1:isVelIterWord;12@88+8:artiCoreDesc # dead-upstream+deferred
+ps_solvePCOutputParticleDeltaVTGSLaunch                1@8+8:sortedContacts;12@88+8:artiCoreDesc                      # dead-upstream+deferred
+ps_solvePCOutputRigidDeltaVLaunch                      1@8+8:sortedContacts;11@80+1:isVelIterWord                     # dead-upstream
+ps_solvePCOutputRigidDeltaVTGSLaunch                   1@8+8:sortedContacts                                           # dead-upstream
+ps_solveRigidAttachmentsLaunch                         8@60+4:biasCoefficient;9@64+1:isVelocityIteration              # dead-upstream
+ps_stepParticlesLaunch                                 1@8+8:activeParticleSystems;3@20+4:invTotalDt                  # dead-upstream
+ps_updateMaterials                                     3@24+4:invTotalDt                                              # dead-upstream
+ps_updateUserBufferLaunch                              2@16+4:count                                                   # dead-upstream
+removeContactManagers_Stage1                           1@8+1:copyManifold                                             # dead-upstream
+removeContactManagers_Stage2                           1@8+1:copyManifold                                             # dead-upstream
+removeContactManagers_Stage3                           1@8+1:copyManifold                                             # dead-upstream
+removeContactManagers_Stage4                           1@8+1:copyManifold                                             # dead-upstream
+sb_clothContactGenLaunch                               0@0+4:tolerenceLength;12@96+8:stackSizeNeededOnDevice          # dead-upstream+suspect
+sb_clothMidphaseGeneratePairsLaunch                    0@0+4:toleranceLength;3@24+8:bounds                            # dead-upstream
+sb_clothVertContactGenLaunch                           0@0+4:tolerenceLength;2@16+8:transformCache                    # dead-upstream
+sb_clothVertMidphaseGeneratePairsLaunch                0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
+sb_gm_cp_solveTetrahedronsPartitionLaunch              2@16+4:numActiveSoftbodies                                     # dead-upstream
+sb_gm_preIntegrateLaunch                               5@40+8:speculativeCCDContactOffset                             # deferred
+sb_heightfieldMidphaseGeneratePairsLaunch              1@4+4:toleranceLength                                          # dead-upstream
+sb_meshContactGenLaunch                                0@0+4:tolerenceLength                                          # dead-upstream
+sb_meshMidphaseGeneratePairsLaunch                     0@0+4:toleranceLength;3@24+8:bounds                            # dead-upstream
+sb_midphaseGeneratePairsLaunch                         1@4+4:toleranceLength;3@16+8:transformCache                    # dead-upstream
+sb_particleContactPrepareLaunch                        2@16+8:contacts                                                # dead-upstream
+sb_primitiveContactGenLaunch                           0@0+4:tolerenceLength                                          # dead-upstream
+sb_psContactGenLaunch                                  0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
+sb_psMidphaseGeneratePairsLaunch                       1@4+4:toleranceLength;4@24+8:transformCache;5@32+8:bounds      # dead-upstream
+sb_queryRigidSoftContactReferenceCountLaunch           6@48+8:artiCoreDesc                                            # deferred
+sb_queryRigidSoftContactReferenceCountLaunchTGS        6@48+8:artiCoreDesc                                            # deferred
+sb_rigidAttachmentPrepareLaunch                        8@64+8:sharedDesc                                              # deferred
+sb_rigidContactPrepareLaunch                           10@80+4:invDt;11@88+8:sharedDesc;12@96+1:isTGS                 # dead-upstream+deferred
+sb_sbMidphaseGeneratePairsLaunch                       0@0+4:toleranceLength;2@16+8:transformCache;3@24+8:bounds      # dead-upstream
+sb_sdfMeshMidphaseGeneratePairsLaunch                  0@0+4:tolerenceLength;3@24+8:bounds                            # dead-upstream
+sb_softbodyContactPrepareLaunch                        1@8+8:contacts                                                 # dead-upstream
+sb_solveRigidSoftAttachmentLaunch                      5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
+sb_solveRigidSoftAttachmentLaunchTGS                   5@40+8:artiCoreDesc;9@64+8:rigidDeltaVel                       # deferred
+sb_solveRigidSoftCollisionLaunch                       6@48+8:artiCoreDesc                                            # deferred
+sb_solveRigidSoftCollisionLaunchTGS                    6@48+8:artiCoreDesc                                            # deferred
+solveBlockUnified                                      4@24+1:doFrictionWord                                          # dead-upstream
+solveWholeIslandTGS                                    3@20+1:doFrictionWord                                          # dead-upstream
+sphereHeightfieldNarrowphase                           15@120+4:stackSizeBytes                                        # dead-upstream
+sphereNphase_Kernel                                    1@4+4:toleranceLength                                          # dead-upstream
+sphereTrimeshNarrowphase                               15@120+4:stackSizeBytes                                        # dead-upstream
+updateBodiesLaunch_Part3                               1@8+4:dt;2@12+1:integrateWord                                  # dead-upstream
