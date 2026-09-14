@@ -1893,6 +1893,95 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.80a — die beobachtende Szene für zwei PBD-Features, die noch nie eine Szene angelegt hat
+
+P9.79 hat die Reihenfolge festgelegt: **erst der Beobachter, dann der Port.** Diese
+Tranche liefert nur den Beobachter — rot, mit zwei eindeutigen Zahlen — und hält
+zwei Korrekturen fest, die beide **meine** waren.
+
+### Warum die beiden Kernel nie gestartet wurden
+
+`ps_solveShapes` und `ps_update_volume_bound` hängen an Host-Zählern, die in acht
+Partikelszenen **nie** über null standen:
+
+```
+solveShapes       mMaxRigidsPerBuffer  > 0   (PxgPBDParticleSystemCore.cpp:825)
+updateVolumeBound mMaxVolumesPerBuffer > 0   (:81)
+```
+
+Jede vorhandene Szene legt einen schlichten `PxParticleBuffer` mit `maxVolumes = 0`
+und ohne Rigids an. Ein Kernel, der **nie gestartet** wird, wird auch nie als
+`[pxg-unmapped]` gemeldet — die beiden waren selbst für dieses Instrument unsichtbar.
+
+`PXG_SCENE=particlerigid` legt den ersten `PxParticleRigidBuffer` an. Der trägt
+beide Features zugleich: die Shape-Matching-Arrays **und** (als gewöhnlicher
+`PxParticleBuffer`) die Partikelvolumen.
+
+### Die rote Messung
+
+```
+cluster: mean y 2.7500 -> 0.2500, y-extent 1.5000 -> 0.0000 (spawn 1.5000)
+volume : bound min=(-999.0000, -999.0000, -999.0000)   -- das Gift, unberührt
+[pxg-unmapped] ps_solveShapes          2160x gestartet, alle ÜBERSPRUNGEN
+[pxg-unmapped] ps_update_volume_bound   240x gestartet, alle ÜBERSPRUNGEN
+```
+
+Alle 64 Partikel liegen flach bei y = 0.2500. Weiter von „behält seine Form" kann
+eine Zahl nicht entfernt sein.
+
+### Korrektur eins: das Harness hat auf die eigene Szene geschlagen
+
+Der erste Lauf zeigte nicht Kollaps, sondern eine **Explosion** — 160 Einheiten
+breit, während die schlichte `PXG_SCENE=particle`-Wolke beim identischen Spawn
+ordentlich bei y = 0.9992 zur Ruhe kommt. „Die Kernel sind übersprungen" erklärt
+das nicht, und Raten wäre Raten gewesen. Also drei Schalter, jeder eine Messung:
+
+```
+NO_RIGIDS=1                  mean y -0.3302, extent 13.9877
+NO_VOLUMES=1                 mean y -0.3302, extent 13.9877
+beide aus                    mean y -0.3302, extent 13.9877   <- bitgleich
+PLAIN (gewöhnlicher Puffer)  mean y -0.3302, extent 13.9877   <- auch nicht der Typ
+```
+
+Übrig blieb der **Begleit-Rigidbody des Builders**: ohne `PXG_PARTICLE_STARTY` fällt
+er mit 1000 kg aus y = 5 bei x = 0 — mitten in die Wolke. Die Bag-Variante parkt ihn
+genau deshalb bei x = 20. Kein Port-Befund, sondern das Harness gegen sich selbst.
+Die drei Schalter bleiben: sie haben aus einer Theorie eine Messung gemacht.
+
+### Korrektur zwei: die Formprüfung maß zunächst nichts
+
+Mit korrekt geparktem Begleitkörper lautete das Ergebnis — **bei vollständig
+übersprungenem `ps_solveShapes`** —
+
+```
+cluster: y-extent 1.5000 -> 1.4990
+```
+
+Der Würfel behielt seine Form ohne den Kernel. Selbstkollision und acht
+Positionsiterationen genügen völlig, um einen kleinen granularen Würfel
+zusammenzuhalten, der zwei Meter tief fällt. Die Behauptung „der Würfel ist noch ein
+Würfel" war **unter der Nullhypothese wahr**.
+
+Die Antwort war nicht ein größerer Fallweg, sondern den Störfaktor zu entfernen:
+`eParticlePhaseSelfCollide` ist in dieser Szene **absichtlich aus**. Dann hält
+nichts die Partikel zusammen — außer dem Shape Matching, und genau das ist die
+Behauptung. Die Nullhypothese liefert seither 0.0000.
+
+(`eParticlePhaseSelfCollideFilter` ist dafür **nicht** das Flag: es filtert
+Nachbarn, die in der Ruhelage nah waren, und braucht gesetzte Ruhepositionen.)
+
+### Was noch offen ist
+
+Der Port selbst. `ps_solveShapes` ist substanziell — Blockreduktionen über
+Schwerpunkt und Momentenmatrix, eine polare Zerlegung und ein atomarer Delta-Tail;
+`extractRotation` (deformableUtils.cuh:46) ist in `softBodySolveBda.slang` bereits
+portiert und wiederverwendbar. `ps_update_volume_bound` ist eine Min/Max-Reduktion.
+Beide plastischen Zweige sind wegkompiliert (`ENABLE_PLASTIC_DEFORMATION 0`).
+
+Die Szene steht bis dahin in der **NICHT gewerteten** Liste von `run_scenes.sh`, wie
+`particlediffuse` vor P9.13d — sie scheitert, weil die Arbeit nicht getan ist, nicht
+weil Scheitern ihre Aufgabe wäre.
+
 ## P9.79b — der Faktor zwei im TGS-Drehmoment: eine Abweichung zwischen zwei Solvern der Engine selbst
 
 P9.79 hinterließ eine Messung ohne Erklärung: dieselbe Geometrie, vier Läufe, die

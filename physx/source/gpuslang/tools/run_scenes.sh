@@ -162,6 +162,19 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
+    # P9.80 -- particlerigid.  The FIRST PxParticleRigidBuffer this harness creates,
+    # and therefore the first thing that makes ps_solveShapes and
+    # ps_update_volume_bound reachable at all: both are guarded on the host by a
+    # count no scene had raised above zero.  Its RED measurement, on record:
+    #   cluster y-extent 1.5000 -> 0.0000  (all 64 particles flat on the floor)
+    #   volume bound still (-999, -999, -999) -- the poison, untouched
+    #   ps_solveShapes launched 2160x, ps_update_volume_bound 240x, all SKIPPED
+    # Self-collision is deliberately OFF in this scene: with it ON the cluster kept
+    # its shape (extent 1.4990 of 1.5000) with ps_solveShapes skipped entirely, so
+    # the observable measured nothing.  See the scene comment for that correction.
+    echo "    particlerigid -- PBD SHAPE MATCHING and PARTICLE VOLUME BOUNDS."
+    env PXG_SCENE=particlerigid PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  cluster:|^  volume :|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /' 
     # softbodyhang MOVED INTO THE SCORED LIST in P9.76c, and its three measurements are
     # the record of why it was ever here (kept in RUNTIME_STATUS.md, P9.76b/c):
     #   ABI row 72 B, kernel REFUSED:            4.5000 -> -6.6589   (it falls off its pins)

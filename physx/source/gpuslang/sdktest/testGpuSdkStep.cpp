@@ -1481,6 +1481,16 @@ static const float FLUID_BOUNDARY_SCALE = 1.0f;
 // arrays; DIFFUSE_THRESHOLD is the potential a fluid particle must exceed to
 // spawn one.  Both are overridable (PXG_DIFFUSE_THRESHOLD), and the CONTROL mode
 // raises the threshold out of reach rather than changing anything else.
+// P9.80 -- PXG_SCENE=particlerigid.  The cluster spawns just above the ground box
+// so it LANDS inside the run: the whole observable is what the landing does to its
+// shape.  RIGID_STIFFNESS is the shape-matching coefficient (1 = fully rigid); the
+// control sets it to 0, which is the same cluster with the matching switched off.
+// RIGID_VOLUME_POISON is written into the PxParticleVolume bound before stepping,
+// so a kernel that never ran is an impossible number and not a plausible one.
+static const float RIGID_START_Y = 2.0f;
+static const float RIGID_STIFFNESS = 1.0f;
+static const float RIGID_VOLUME_POISON = -999.0f;
+
 static const PxU32 MAX_DIFFUSE = 4096;
 static const float DIFFUSE_THRESHOLD = 1.0f;
 
@@ -1596,6 +1606,12 @@ struct ParticleScene
     PxRigidStatic* anchor = nullptr;
     PxU32 numAttached = 0;
     PxU32 freeParticle = 0;
+    // P9.80: non-null only for PXG_SCENE=particlerigid.  `rigidBuffer` aliases
+    // `buffer`; the volume array and the spawn AABB are kept so the scene can
+    // compare what ps_update_volume_bound wrote against what the particles are.
+    PxParticleRigidBuffer* rigidBuffer = nullptr;
+    PxBounds3 spawnBound = PxBounds3::empty();
+    float spawnExtentY = 0.0f;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -1637,7 +1653,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
                                  bool boundaryMode = false, bool meshFloorMode = false,
                                  bool hfFloorMode = false, bool diffuseMode = false,
                                  bool convexFloorMode = false, bool pushMode = false,
-                                 bool attachMode = false)
+                                 bool attachMode = false, bool rigidMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -1702,7 +1718,14 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         scene->addActor(*target);
         out.pushBox = target;
     }
-    else if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
+    // P9.80: rigidMode joins this branch for exactly the reason the comment above
+    // gives.  Its cluster settles at x = 0 like the bag does, and the free-fall
+    // placement below drops a 1000 kg box from y = 5 straight onto it -- which is
+    // what the scene's first run measured (the cluster scattered 160 units wide,
+    // where the plain bag at the identical spawn settles tidily).  That was the
+    // harness hitting its own scene, not the port: with both features switched off
+    // the number was bit-identical, and so was an ordinary PxParticleBuffer.
+    else if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode || rigidMode)
     {
         // On the mesh floor the puddle spreads to an RMS radius near 10, so the usual
         // x=20 parking spot is INSIDE the puddle and the aside box would start
@@ -1816,8 +1839,27 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         ps->setSolidRestOffset(restOffset);
         ps->setMaxVelocity(1e6f); // do not clamp the free fall
 
-        phase = ps->createPhase(pbdMat,
-            PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+        // P9.80 -- rigidMode DELIBERATELY CLEARS eParticlePhaseSelfCollide.
+        //
+        // The scene's first honest run said the shape observable was worthless: with
+        // ps_solveShapes skipped entirely, the 4x4x4 cluster still landed with a
+        // y-extent of 1.4990 against a spawn of 1.5000.  Self-collision plus eight
+        // position iterations is quite enough to hold a small granular cube together
+        // when it is dropped two metres onto a floor, so "the cube is still a cube"
+        // was true under the NULL HYPOTHESIS and measured nothing.
+        //
+        // Turning self-collision off removes the confound instead of trying to
+        // out-shout it with a bigger drop.  With it off there is nothing between the
+        // particles at all: gravity takes every one of them to the floor and the
+        // cluster collapses into a single layer.  The ONLY thing that can keep it a
+        // cube is the shape matching, which is exactly the claim the scene makes.
+        // NOTE eParticlePhaseSelfCollideFilter is NOT the flag for this: it filters
+        // out neighbours that were close in the REST pose and needs rest positions
+        // set.  What this scene wants is no self-collision at all -- empty flags.
+        phase = rigidMode
+            ? ps->createPhase(pbdMat, PxParticlePhaseFlags())
+            : ps->createPhase(pbdMat,
+                  PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
     }
 
     // Solid: a 4x4x4 grid.  Fluid: a TALL NARROW COLUMN (4 x 12 x 4), because the
@@ -1837,10 +1879,13 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // attachMode: y = 4, well clear of the ground box at 0.5 but close enough that a
     // free fall reaches it inside the run -- so "did not fall" and "fell" are two
     // numbers a metre apart, not a tolerance argument.
+    // rigidMode: low enough that the cluster LANDS inside the run -- the whole
+    // observable is what the landing does to its shape.
     const float startY = fluidMode ? 0.6f : pushMode ? 0.25f : attachMode ? ATTACH_START_Y
+                        : rigidMode ? RIGID_START_Y
                                                              : (startYEnv ? float(atof(startYEnv)) : 100.0f);
     const float cloudX = pushMode ? 0.5f : 0.0f;
-    if (startYEnv || fluidMode || pushMode || attachMode)
+    if (startYEnv || fluidMode || pushMode || attachMode || rigidMode)
         ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
     std::vector<PxVec4> hostPos(N), hostVel(N, pushMode ? PxVec4(PUSH_SPEED, 0.0f, 0.0f, 0.0f)
                                                           : PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1894,6 +1939,36 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         out.diffuse = db;
         buffer = db;
     }
+    else if (rigidMode)
+    {
+        // P9.80 -- a PxParticleRigidBuffer, which this harness had never created.
+        // It carries BOTH features this tranche exists for: the shape-matching
+        // rigid arrays AND (as a plain PxParticleBuffer) the particle volumes.
+        // One buffer therefore drives both ps_solveShapes and
+        // ps_update_volume_bound, whose host guards are mMaxRigidsPerBuffer > 0
+        // and mMaxVolumesPerBuffer > 0 -- neither ever true before today.
+        // PXG_PARTICLE_RIGID_PLAIN=1 builds the identical scene with an ORDINARY
+        // PxParticleBuffer instead.  A DIAGNOSTIC: it isolates the buffer TYPE from
+        // everything the two features do, which is the one difference the
+        // NO_RIGIDS/NO_VOLUMES knobs cannot switch off.
+        if (std::getenv("PXG_PARTICLE_RIGID_PLAIN"))
+        {
+            buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+            if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
+        }
+        else
+        {
+            PxParticleRigidBuffer* rb =
+                physics->createParticleRigidBuffer(N, /*maxVolumes*/ 1, /*maxRigids*/ 1, cudaCtx);
+            if (!rb)
+            {
+                std::printf("FAIL: createParticleRigidBuffer returned null (bridge stub not replaced?)\n");
+                return out;
+            }
+            out.rigidBuffer = rb;
+            buffer = rb;
+        }
+    }
     else
     {
         buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
@@ -1917,6 +1992,102 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
     buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
     buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+
+    // P9.80 -- the SHAPE-MATCHING rigid and the VOLUME, both filled here because
+    // every array a PxParticleRigidBuffer exposes is a DEVICE pointer.
+    if (rigidMode && out.rigidBuffer)
+    {
+        PxParticleRigidBuffer* rb = out.rigidBuffer;
+
+        // ONE rigid covering every particle.  mRigidOffsets is a runsum with
+        // numRigids + 1 entries: the CUDA reads rigidOffsets[rigidId] and
+        // [rigidId + 1] (particlesystem.cu:5178).
+        const PxU32 offsets[2] = { 0u, N };
+
+        // The shape-matching stiffness.  PXG_PARTICLE_RIGID_CONTROL=1 sets it to
+        // ZERO, which is the same cluster with the matching switched off -- the
+        // A/B this scene rests on.  With 0 the kernel still RUNS (its host guard is
+        // the rigid COUNT, not the coefficient) and lerps by 0, so the cluster
+        // behaves as loose granular material.
+        const bool rigidControl = std::getenv("PXG_PARTICLE_RIGID_CONTROL") != nullptr;
+        const float coeff = rigidControl ? 0.0f : RIGID_STIFFNESS;
+
+        // Local positions are RELATIVE TO THE CLUSTER'S CENTRE OF MASS, because
+        // that is what the kernel reconstructs against:
+        //   rigidPos = Rotate(newRot, localPositions[i]) + newCom
+        // (particlesystem.cu:5395).  The initial translation must be that same COM
+        // and the initial rotation the identity, or the first solve would yank the
+        // cluster toward a pose it was never in.
+        PxVec3 com(0.0f);
+        for (PxU32 i = 0; i < N; ++i) com += PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z);
+        com /= float(N);
+
+        std::vector<PxVec4> localPos(N), localNrm(N);
+        for (PxU32 i = 0; i < N; ++i)
+        {
+            const PxVec3 p(hostPos[i].x, hostPos[i].y, hostPos[i].z);
+            const PxVec3 d = p - com;
+            localPos[i] = PxVec4(d, 0.0f);
+            // The kernel rotates these into mNormalArray every step
+            // (particlesystem.cu:5411).  A radial normal makes them distinguishable
+            // per particle; .w is carried through untouched and is left at 0.
+            const float m = d.magnitude();
+            localNrm[i] = PxVec4(m > 0.0f ? d / m : PxVec3(0.0f, 1.0f, 0.0f), 0.0f);
+        }
+        const PxVec4 translation(com, 0.0f);
+        const PxVec4 rotation(0.0f, 0.0f, 0.0f, 1.0f);   // identity quaternion
+
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidOffsets()), offsets, sizeof(offsets));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidCoefficients()), &coeff, sizeof(float));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidLocalPositions()), localPos.data(),
+                        N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidLocalNormals()), localNrm.data(),
+                        N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidTranslations()), &translation, sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidRotations()), &rotation, sizeof(PxVec4));
+        // Two DIAGNOSTIC knobs, not scored modes, kept because they earned their
+        // place.  The scene's first run showed the cluster not merely failing to hold
+        // its shape but flying apart -- 160 units wide, where the plain
+        // PXG_SCENE=particle bag at the identical spawn settles tidily at mean y
+        // 0.9992.  "The kernels are skipped" does not by itself explain that, and
+        // guessing which feature caused it would have been guessing.  Switching each
+        // one off in turn said NEITHER: the number was bit-identical with both off,
+        // and PXG_PARTICLE_RIGID_PLAIN said it was not the buffer type either.  What
+        // was left was the harness's own companion rigid body falling on the cluster
+        // (see the aside-placement branch above).  The knobs stay: they are what made
+        // that a measurement instead of a theory.
+        const bool noRigids = std::getenv("PXG_PARTICLE_RIGID_NO_RIGIDS") != nullptr;
+        const bool noVolumes = std::getenv("PXG_PARTICLE_RIGID_NO_VOLUMES") != nullptr;
+        rb->setNbRigids(noRigids ? 0u : 1u);
+        rb->raiseFlags(PxParticleBufferFlag::eUPDATE_RIGID);
+
+        // ONE volume over the same particles.  Its bound is POISONED: the kernel
+        // overwrites it every step, so anything still holding -999 after the run
+        // means ps_update_volume_bound never ran.  There is no flag for volumes --
+        // mNumParticleVolumes on the buffer is what raises mMaxVolumesPerBuffer
+        // (PxgPBDParticleSystemCore.cpp:1699).
+        PxParticleVolume vol;
+        vol.bound = PxBounds3(PxVec3(RIGID_VOLUME_POISON), PxVec3(RIGID_VOLUME_POISON + 1.0f));
+        vol.particleIndicesOffset = 0;
+        vol.numParticles = N;
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getParticleVolumes()), &vol,
+                        sizeof(PxParticleVolume));
+        rb->setNbParticleVolumes(noVolumes ? 0u : 1u);
+
+        // the spawn AABB and y-extent, for the assertions
+        out.spawnBound = PxBounds3::empty();
+        for (PxU32 i = 0; i < N; ++i)
+            out.spawnBound.include(PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z));
+        out.spawnExtentY = out.spawnBound.maximum.y - out.spawnBound.minimum.y;
+    }
+    else if (rigidMode)
+    {
+        out.spawnBound = PxBounds3::empty();
+        for (PxU32 i = 0; i < N; ++i)
+            out.spawnBound.include(PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z));
+        out.spawnExtentY = out.spawnBound.maximum.y - out.spawnBound.minimum.y;
+    }
+
     ps->addParticleBuffer(buffer);
     scene->addActor(*ps);
 
@@ -6154,6 +6325,152 @@ int main()
     //                                    three-axis constraint block;
     //   ps_solveRigidAttachments{,TGS}Launch  drags the particle back to its anchor.
     // If any of them is refused or unmapped, all 64 particles fall together.
+    // P9.80 -- PXG_SCENE=particlerigid: the FIRST PxParticleRigidBuffer this
+    // harness has ever created, and therefore the first thing that makes
+    // ps_solveShapes and ps_update_volume_bound reachable at all.
+    //
+    // *** WHY NEITHER KERNEL WAS EVER LAUNCHED. ***
+    //
+    // Both are guarded on the HOST by a count that no scene had ever raised above
+    // zero: solveShapes on mMaxRigidsPerBuffer (PxgPBDParticleSystemCore.cpp:825)
+    // and updateVolumeBound on mMaxVolumesPerBuffer (:81).  Eight particle scenes,
+    // and every one of them creates a plain PxParticleBuffer with maxVolumes = 0
+    // and no rigids -- so the two kernels sat in the engine-reachable ratchet
+    // reporting nothing, invisible even to the [pxg-unmapped] machinery, because a
+    // kernel that is never launched is never reported.
+    //
+    // *** THE TWO OBSERVABLES. ***
+    //
+    //   SHAPE MATCHING.  A 4x4x4 cluster is spawned as ONE shape-matched rigid and
+    //   dropped onto the ground box.  ps_solveShapes fits a rotation+translation to
+    //   the deformed cluster each substep (a polar decomposition of the moment
+    //   matrix) and lerps every particle back toward that rigid pose.  With it, the
+    //   cluster LANDS AND KEEPS ITS SHAPE; without it, the same cluster is loose
+    //   granular material and spreads into a puddle.  PXG_PARTICLE_RIGID_CONTROL=1
+    //   is exactly that second run -- same scene, coefficient 0 -- so the claim is
+    //   an A/B and not a tolerance argument.
+    //
+    //   VOLUME BOUNDS.  One PxParticleVolume covers the same particles, and its
+    //   bound is POISONED with -999 before stepping.  ps_update_volume_bound
+    //   recomputes that AABB every step from the unsorted positions, so the check
+    //   is against the particles the scene reads back itself -- and a kernel that
+    //   never ran leaves an impossible number, not a plausible one (P9.48d).
+    if (!std::strcmp(sceneName, "particlerigid"))
+    {
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
+                                               false, false, false, false, false, false, false,
+                                               false, /*rigidMode*/ true);
+        const bool plainDiag = std::getenv("PXG_PARTICLE_RIGID_PLAIN") != nullptr;
+        if (!psc.system || !psc.buffer || (!psc.rigidBuffer && !plainDiag))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particlerigid scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        const bool rigidControl = std::getenv("PXG_PARTICLE_RIGID_CONTROL") != nullptr;
+        std::printf("  [  OK  ] scene 'particlerigid' built: %u PBD particles as ONE shape-matched rigid "
+                    "(coefficient %.1f%s) plus ONE particle volume, spawn y-extent %.4f\n",
+                    psc.numParticles, rigidControl ? 0.0f : RIGID_STIFFNESS,
+                    rigidControl ? ", PXG_PARTICLE_RIGID_CONTROL" : "", psc.spawnExtentY);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particlerigid pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 240;
+        const float y0 = particleMeanY(psc);
+        std::printf("  stepping particlerigid (%d x %.4fs): mean y0 = %.4f\n", steps, dt, y0);
+        for (int i = 0; i < steps; ++i) { scene->simulate(dt); scene->fetchResults(true); }
+
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        std::vector<PxVec4> host(psc.numParticles);
+        ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                        psc.numParticles * sizeof(PxVec4));
+        PxParticleVolume volOut;
+        volOut.bound = PxBounds3(PxVec3(RIGID_VOLUME_POISON), PxVec3(RIGID_VOLUME_POISON + 1.0f));
+        if (psc.rigidBuffer)
+            ctx->memcpyDtoH(&volOut, reinterpret_cast<CUdeviceptr>(psc.rigidBuffer->getParticleVolumes()),
+                            sizeof(PxParticleVolume));
+
+        // the AABB the scene computes from the particles it just read back -- the
+        // oracle ps_update_volume_bound is checked against
+        PxBounds3 ref = PxBounds3::empty();
+        for (PxU32 i = 0; i < psc.numParticles; ++i)
+            ref.include(PxVec3(host[i].x, host[i].y, host[i].z));
+        const float extentY = ref.maximum.y - ref.minimum.y;
+        const float meanY = particleMeanY(psc);
+
+        std::printf("  cluster: mean y %.4f -> %.4f, y-extent %.4f -> %.4f (spawn %.4f)\n",
+                    y0, meanY, psc.spawnExtentY, extentY, psc.spawnExtentY);
+        std::printf("  volume : bound min=(%.4f, %.4f, %.4f) max=(%.4f, %.4f, %.4f)\n",
+                    volOut.bound.minimum.x, volOut.bound.minimum.y, volOut.bound.minimum.z,
+                    volOut.bound.maximum.x, volOut.bound.maximum.y, volOut.bound.maximum.z);
+        std::printf("  particles: bound min=(%.4f, %.4f, %.4f) max=(%.4f, %.4f, %.4f)  [the oracle]\n",
+                    ref.minimum.x, ref.minimum.y, ref.minimum.z,
+                    ref.maximum.x, ref.maximum.y, ref.maximum.z);
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+
+        if (plainDiag)
+        {
+            std::printf("  [ control ] PXG_PARTICLE_RIGID_PLAIN=1: an ORDINARY PxParticleBuffer, same spawn, "
+                        "not scored\n");
+            std::printf("[ control ] gpu-sdk-step: particlerigid plain-buffer control run, not scored\n");
+            return 0;
+        }
+
+        int failures = 0;
+        bool finite = true;
+        for (PxU32 i = 0; i < psc.numParticles; ++i)
+            finite = finite && std::isfinite(host[i].x) && std::isfinite(host[i].y) && std::isfinite(host[i].z);
+        if (!finite) { std::printf("FAIL: a particle position is not finite\n"); ++failures; }
+        // the internal control: gravity ran at all
+        if (!(meanY < y0 - 0.25f))
+        { std::printf("FAIL: the cluster did not fall (mean y %.4f -> %.4f)\n", y0, meanY); ++failures; }
+        // ps_update_volume_bound: the poison is gone and the bound IS the particles'
+        for (int c = 0; c < 3; ++c)
+        {
+            const float bmin = (&volOut.bound.minimum.x)[c], bmax = (&volOut.bound.maximum.x)[c];
+            const float rmin = (&ref.minimum.x)[c], rmax = (&ref.maximum.x)[c];
+            if (bmin == RIGID_VOLUME_POISON || bmax == RIGID_VOLUME_POISON + 1.0f)
+            { std::printf("FAIL: volume bound component %d is still POISONED -- ps_update_volume_bound "
+                          "never ran (its host guard is mMaxVolumesPerBuffer > 0)\n", c); ++failures; break; }
+            if (!(std::fabs(bmin - rmin) < 1e-3f && std::fabs(bmax - rmax) < 1e-3f))
+            { std::printf("FAIL: volume bound component %d is (%.4f, %.4f), the particles are (%.4f, %.4f)\n",
+                          c, bmin, bmax, rmin, rmax); ++failures; }
+        }
+        // ps_solveShapes: the cluster kept its shape, or (control) it did not
+        if (rigidControl)
+        {
+            std::printf("  [ control ] PXG_PARTICLE_RIGID_CONTROL=1: shape-matching coefficient 0, "
+                        "not scored -- the y-extent above is the loose-granular number\n");
+            std::printf("[ control ] gpu-sdk-step: particlerigid control run, not scored\n");
+            return 0;
+        }
+        if (!(extentY > 0.6f * psc.spawnExtentY))
+        { std::printf("FAIL: the cluster COLLAPSED -- y-extent %.4f of a spawn %.4f.  Shape matching did "
+                      "not hold it; ps_solveShapes is the only thing that does\n",
+                      extentY, psc.spawnExtentY); ++failures; }
+        if (!(extentY < 1.6f * psc.spawnExtentY))
+        { std::printf("FAIL: the cluster EXPANDED -- y-extent %.4f of a spawn %.4f\n",
+                      extentY, psc.spawnExtentY); ++failures; }
+
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: a PBD SHAPE-MATCHED cluster landed and KEPT ITS SHAPE "
+                        "(y-extent %.4f of a spawn %.4f) and its particle volume's AABB matches the "
+                        "particles to 1e-3 -- both kernels are live on Vulkan\n",
+                        extentY, psc.spawnExtentY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particlerigid checks failed (%d)\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "particleattach"))
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
@@ -8769,6 +9086,7 @@ int main()
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "          clothnet|particlepush|articulationjoint   (P9.41: pending-work, not scored)\n"
                        "          particleattach                          (P9.76: the particle ATTACHMENT chain)\n"
+                       "          particlerigid                           (P9.80: PBD shape matching + volume bounds)\n"
                        "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
