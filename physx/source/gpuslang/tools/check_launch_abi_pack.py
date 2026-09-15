@@ -121,6 +121,21 @@ ENGINE_DIRS = [
 #     PxgFEMContactWriter / PxgSoftBodyContactWriter tails, and the PxgShape and
 #     PxBounds3 scalars).  Deciding these means reading the struct, which is the
 #     next real step and would take most of the list.
+#
+#     P9.81 MEASURED WHAT THAT STEP ACTUALLY NEEDS, because the two obvious fixes
+#     are not it and the next reader should not spend the afternoon on them.  For
+#     sb_heightfieldContactGenLaunch twelve of its thirteen pushed arguments
+#     resolve; only `writer` is None.  Adding "PxgFEMContactWriter": 80 to SIZES
+#     does not decide it, and neither does teaching the declaration regex the
+#     constructor form `Type var(args);` -- both were tried and measured.  The
+#     reason is that declared_size is FILE-scoped by design (see its docstring),
+#     and PxgNarrowphaseCore.cpp declares the name `writer` TWICE with different
+#     types: `PxgFEMContactWriter writer(softBodyCore);` at :1024 and
+#     `PxgParticleContactWriter& writer` at :3100.  Two types for one name in one
+#     translation unit is exactly the disagreement the resolver must refuse.  So
+#     the real step is FUNCTION scope, not a bigger type table -- and doing it
+#     without that scoping would make the checker confidently wrong, which is the
+#     one outcome worse than undecided.
 #   * PxVec3 / PxQuat / PxTransform arguments passed by reference, whose sizeof is
 #     the referent's.
 #   * the void** launch form (PX_CUDA_KERNEL_PARAM2), which carries no per-argument
@@ -209,6 +224,7 @@ KNOWN_UNDECIDED = {
     "sb_clothVertContactGenLaunch",
     "sb_gm_preIntegrateLaunch",
     "sb_gm_stepSoftbodyLaunch",
+    "sb_heightfieldContactGenLaunch",
     "sb_meshContactGenLaunch",
     "sb_primitiveContactGenLaunch",
     "sb_psContactGenLaunch",

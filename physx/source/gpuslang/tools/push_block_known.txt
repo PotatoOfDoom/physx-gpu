@@ -152,6 +152,7 @@ sb_meshContactGenLaunch                                0@0+4:tolerenceLength    
 sb_meshMidphaseGeneratePairsLaunch                     0@0+4:toleranceLength;3@24+8:bounds                            # dead-upstream
 sb_midphaseGeneratePairsLaunch                         1@4+4:toleranceLength;3@16+8:transformCache                    # dead-upstream
 sb_particleContactPrepareLaunch                        2@16+8:contacts                                                # dead-upstream
+sb_heightfieldContactGenLaunch                         0@0+4:tolerenceLength                                          # dead-upstream
 sb_primitiveContactGenLaunch                           0@0+4:tolerenceLength                                          # dead-upstream
 sb_psContactGenLaunch                                  0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
 sb_psMidphaseGeneratePairsLaunch                       1@4+4:toleranceLength;4@24+8:transformCache;5@32+8:bounds      # dead-upstream

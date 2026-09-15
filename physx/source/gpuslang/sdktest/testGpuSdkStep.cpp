@@ -4226,6 +4226,8 @@ struct SoftBodyScene
     bool hasBox = false;        // PXG_SB_FLOOR=box (the DEFAULT): the ground box, top at y=0
     bool hasPlaneShape = false; // PXG_SB_FLOOR=plane: the one floor that takes the PLANE
                                 // branch of sb_primitiveContactGenLaunch rather than GJK/EPA
+    bool hasHeightfield = false;// PXG_SB_FLOOR=heightfield (P9.81a): the SIXTH floor, and the
+                                // only one whose pair routes to GPU_BUCKET_ID::eSoftbodyHeightfield
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
@@ -4268,7 +4270,9 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     const bool floorSphere = floorEnv && !std::strcmp(floorEnv, "sphere");
     const bool floorMesh   = floorEnv && !std::strcmp(floorEnv, "mesh");
     const bool floorCore    = floorEnv && !std::strcmp(floorEnv, "convexcore");
-    const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh && !floorCore;
+    const bool floorHf     = floorEnv && !std::strcmp(floorEnv, "heightfield");
+    const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh
+                          && !floorCore && !floorHf;
 
     PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
     if (!floorBox)
@@ -4364,10 +4368,39 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         cs->release();
     }
 
+    // PXG_SB_FLOOR=heightfield (P9.81a): a cooked HEIGHTFIELD floor, the SIXTH shape the
+    // softbody can land on, and the only one whose pair routes to
+    // GPU_BUCKET_ID::eSoftbodyHeightfield -- i.e. to sb_heightfieldContactGenLaunch.  The
+    // routing is unconditional: gTable[eTETRAHEDRONMESH][eHEIGHTFIELD] is caseTetraHeightfield
+    // (PxgNphaseImplementationContext.cpp:1392/:1522), which returns that bucket with no
+    // compatibility test at all, so an overlapping AABB is the whole requirement.
+    //
+    // Every sample height is 0, so the surface is at exactly y = 0 -- the SAME floor height as
+    // the box, the plane, the sphere's north pole, the cooked mesh and the convex core.  That
+    // is the entire reason this arm belongs in the floor matrix rather than in a scene of its
+    // own: its settle number is directly comparable with theirs, so the expectation is
+    // MEASURED and not invented.  The five on record, same cube, same solve, same height:
+    //
+    //   PXG_SB_FLOOR=box          settles at mean y = 0.48929, 16 contacts
+    //   PXG_SB_FLOOR=mesh         settles at mean y = 0.48830, 22 contacts
+    //
+    // *** THIS FLOOR IS EXPECTED TO FAIL UNTIL sb_heightfieldContactGenLaunch IS MAPPED. ***
+    // The kernel is unmapped, and an unmapped launch is a skipped no-op, so the cube falls
+    // through a floor it cannot see -- exactly as the convexcore arm did before P9.72 and as
+    // the softbody itself did before the hull branch landed.  What makes this arm worth having
+    // is that the failure is now VISIBLE: the bridge reports the launch, the contact-chain
+    // probe reports zero contacts, and the verdict below fires.
+    if (floorHf)
+    {
+        if (!addHeightFieldFloor(physics, scene, rigidMat, 10.0f))
+            return out;   // addHeightFieldFloor prints its own FAIL
+    }
+
     out.hasPlane = !floorNone;      // "there is a floor to settle on", whatever its shape
     out.hasSphere = floorSphere;
     out.hasBox = floorBox;
     out.hasPlaneShape = floorPlane;
+    out.hasHeightfield = floorHf;
 
     // The one dynamic body the rigid PGS island needs: rigidSumInternalContactAndJointBatches2
     // null-derefs the solver descriptors with zero dynamic rigids, as in the cloth and
@@ -7912,7 +7945,7 @@ int main()
         // there and must not fail.
         const char* floorName = !sbs.hasPlane ? "none"
                               : sbs.hasPlaneShape ? "plane" : sbs.hasSphere ? "sphere"
-                              : sbs.hasBox ? "box" : "mesh";
+                              : sbs.hasBox ? "box" : sbs.hasHeightfield ? "heightfield" : "mesh";
         std::printf("  contact chain: max deformable-volume contacts = %u, first at step %d "
                     "(floor: %s)\n",
                     maxSbContacts, firstContactStep, floorName);

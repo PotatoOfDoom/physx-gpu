@@ -40,6 +40,10 @@
 //   softBodySimPreIntegrateTGS   — sb_gm_preIntegrateLaunch TGS branch (vel + zero posDelta)
 
 #include "pxgTestFramework.h"
+// P9.81: the heightfield decoders (Hf / buildHf / getTriangleNoAdj), so the step-2
+// contact-gen fixture below mirrors the SAME triangle the kernel decodes rather than
+// a second transcription of it.
+#include "pxgHeightfieldRef.h"
 
 // P9.57: FROM THE ENGINE ENUM, never a literal -- `PxGeometryType` grew
 // eCONVEXCORE at position 4 and shifted everything above eBOX by one.  The copy
@@ -12250,6 +12254,497 @@ PXG_TEST(softBodySimHeightfieldMidphase)
 
     for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bTetMesh.h, bDesc.h,
                                bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.81 -- sb_heightfieldContactGenLaunch, the softbody-vs-HEIGHTFIELD contact generator and
+// step 2 of the pair whose step 1 sits directly above.
+//
+// WHAT THIS FIXTURE IS FOR.  The GJK/EPA core is covered bit-exactly by the npTet* battery and
+// again by every softbody contact-gen fixture before this one, and the heightfield DECODER is
+// covered by step 1.  What is new is that this kernel is the mesh sibling's twin in shape and
+// differs from it in exactly three places, and every one of the three is the kind of difference
+// a scene-level settle number cannot see:
+//
+//   (1) NO FILTER ARM -- two fewer arguments, so the blob is 176 bytes and not 192.  Pinned by
+//       the static_asserts below, which is where a shared row would be caught.
+//   (2) NO FRONT-FACE GATE.  The mesh path keeps a contact only when
+//       `dot(gjkDirection, n) >= 0`; this one keeps it either way.  So TWO tetrahedra, one
+//       ABOVE the triangle and one BELOW it, must BOTH produce a contact.  A port that copies
+//       the sibling's gate emits one of the two, never both.
+//   (3) THE NORMAL WRITTEN IS THE TRIANGLE NORMAL, NOT THE GJK DIRECTION -- and therefore the
+//       penetration is the witness separation projected on the TRIANGLE normal.  On a flat
+//       field the triangle normal is exactly vertical, so a third tetrahedron is placed
+//       OVERHANGING AN EDGE: its closest feature is the triangle's boundary, GJK's direction is
+//       steeply tilted, and the two readings separate three ways at once --
+//           stored normal   : exactly vertical    vs  tilted by ~0.95 horizontally
+//           stored |pen|    : the VERTICAL gap    vs  the full slant distance
+//           and the edge contact's pen equals the flat-above contact's, which it cannot under
+//           the other reading.
+//       One of those would do; three make the diagnosis unambiguous when it fires.
+//
+// Plus the parts it shares with its sibling and which must not drift: the rigid-shaped output
+// (pairInd0 from shapeToRigidRemapTable[HEIGHTFIELD cache ref], the material from the
+// HEIGHTFIELD shape folded with & 0x7fffffff), alternativeWriteMode's side arrays, the stack
+// clamp and the UNCLAMPED stackSizeNeededOnDevice tail.
+//
+// TWO MORE TETRAHEDRA, EACH ADDED BECAUSE A MUTANT SURVIVED WITHOUT IT:
+//   * an APEX-DOWN one, whose FOURTH VERTEX is the closest feature.  Every other tet here
+//     points its base at the triangle and its apex away, so replacing v3 with v0 changes
+//     nothing -- the same blind spot P9.73 found in the softbody floor scene, and a mutant
+//     doing exactly that survived the first sweep.
+//   * a PENETRATING one, the only pair that reaches GJK's OVERLAP arm and therefore EPA at
+//     all.  It was added to test the one surviving mutant (a reversed search seed) on the
+//     branch where a seed is most likely to matter.  It survived that too, which is what
+//     turns "the seed is an initial direction, not an input" from a claim into a measurement.
+//
+// The triangle is not transcribed a second time: the expectation comes from hfref's
+// getTriangleNoAdj, the same decoder step 1's fixture checks, taken to world through the same
+// 180-degree rotation.
+// ===========================================================================
+namespace p981hfcg
+{
+struct SbHfCgPush
+{
+    float tolerenceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, softbodies,
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t wPoint, wNormalPen, wBarycentric, wContactInfo, wTotalCount, wContactByX,
+             wTempContactByX, wContactIndexSortedByX, wContactSortedByX;
+    uint32_t wMaxContacts, pad172;
+};
+// *** THE WHOLE POINT OF DIFFERENCE (1). ***  176, not the mesh sibling's 192: this signature
+// has no filterPairs/nbFilterPairs.  Sharing kSbMeshContactGen would put sixteen bytes of the
+// wrong thing into the writer and shift every contact pointer.
+static_assert(sizeof(SbHfCgPush) == 176, "sb heightfield CG blob must be 176 bytes");
+static_assert(offsetof(SbHfCgPush, stackSizeBytes) == 80, "stackSizeBytes @80");
+static_assert(offsetof(SbHfCgPush, stackSizeNeededOnDevice) == 88, "@88 -- @104 is the sibling");
+static_assert(offsetof(SbHfCgPush, wPoint) == 96, "the inlined writer starts @96");
+static_assert(offsetof(SbHfCgPush, wMaxContacts) == 168, "maxNumContacts @168");
+} // namespace p981hfcg
+
+PXG_TEST(softBodySimHeightfieldContactGen)
+{
+    using namespace p80refit;
+    using namespace p981hfcg;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the heightfield: 4 rows x 5 columns, flat at height 0, every cell solid -----------
+    // *** NOT SQUARE, AND THAT IS DELIBERATE. ***  Every vertex index in the decoder is
+    // `row * nbCols + column`, so on a SQUARE field reading nbRows where nbCols belongs is
+    // invisible -- the first draft of this fixture was 4 x 4 and a mutant swapping the two
+    // survived.  With 4 x 5 the two readings land on different vertices.
+    const uint32_t NB_ROWS = 4u, NB_COLS = 5u;
+    const uint8_t MAT_SOLID = 3u;
+    hfref::Hf hf;
+    hf.rows = NB_ROWS; hf.cols = NB_COLS;
+    hf.samples.assign(size_t(NB_ROWS) * NB_COLS, hfref::sampleWord(0, MAT_SOLID, false, MAT_SOLID));
+    // *** THE FIELD IS NOT FLAT, ONLY THE TARGET CELL IS. ***  Every other sample is raised by
+    // a distinct amount.  On a wholly flat field every triangle lies in the plane y = TY, so
+    // ANY error that picks the wrong vertices -- a shifted sample base, a dropped rotation, a
+    // swapped index -- still yields a horizontal triangle with a vertical normal and the
+    // assertions below all pass.  Measured: the first draft was flat and `hf-samples-offset-4`
+    // and `hf-drop-rotation` both survived for exactly that reason (Class D, P9.79).  With the
+    // surroundings raised, picking the wrong vertices TILTS the triangle and the normal moves.
+    for (uint32_t r = 0; r < NB_ROWS; ++r)
+        for (uint32_t c = 0; c < NB_COLS; ++c)
+            hf.samples[r * NB_COLS + c] =
+                hfref::sampleWord(int16_t(37 + 13 * int(r) + 29 * int(c)), MAT_SOLID, false,
+                                  MAT_SOLID);
+    // the four corners of the target cell, back to height 0 so the triangle stays horizontal
+    // and the penetration arithmetic below stays a one-liner
+    for (uint32_t r = 1u; r <= 2u; ++r)
+        for (uint32_t c = 1u; c <= 2u; ++c)
+            hf.samples[r * NB_COLS + c] = hfref::sampleWord(0, MAT_SOLID, false, MAT_SOLID);
+    hfref::buildHf(hf);
+    DevBuf bBlob = makeDev(dev, hf.blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- its placement: the SAME map step 1 uses ------------------------------------------
+    //     world = R * (hf * scale) + T,   R(x, y, z) = (-x, y, -z)
+    // A 180-degree rotation about y is exact in floating point, so it pins the quaternion
+    // rotate without spending tolerance on it.  All three scales are positive: the negative
+    // scale swap is step 1's documented gap and this fixture does not pretend to cover it.
+    const float ROW_SCALE = 2.0f, HEIGHT_SCALE = 0.01f, COL_SCALE = 0.5f;
+    const float TX = 5.0f, TY = 7.0f, TZ = 9.0f;
+    auto toWorld = [&](hfref::V3 v) {
+        return hfref::V3{ -v.x + TX, v.y + TY, -v.z + TZ };
+    };
+
+    // ---- the triangle this fixture aims at, from the SAME decoder step 1 checks ------------
+    // Cell (row 1, column 1) is vertexIndex 1 * nbCols + 1; its FIRST material slot is
+    // triangle (vertexIndex << 1) | 0.  Derived rather than written out, so the non-square
+    // field above cannot silently stop being the thing that is indexed.
+    const uint32_t CELL_R = 1u, CELL_C = 1u;
+    const uint32_t TRI = ((CELL_R * NB_COLS + CELL_C) << 1) | 0u;
+    hfref::V3 s0, s1, s2;
+    hfref::getTriangleNoAdj(hf, TRI, hfref::V3{ ROW_SCALE, HEIGHT_SCALE, COL_SCALE }, s0, s1, s2);
+    const hfref::V3 W0 = toWorld(s0), W1 = toWorld(s1), W2 = toWorld(s2);
+    // *** THE CROSS PRODUCT IS THE OTHER WAY ROUND *** -- v20 x v21, not the familiar one.
+    const hfref::V3 v20{ W2.x - W0.x, W2.y - W0.y, W2.z - W0.z };
+    const hfref::V3 v21{ W1.x - W0.x, W1.y - W0.y, W1.z - W0.z };
+    hfref::V3 nExp{ v20.y * v21.z - v20.z * v21.y,
+                    v20.z * v21.x - v20.x * v21.z,
+                    v20.x * v21.y - v20.y * v21.x };
+    {
+        const float m = std::sqrt(nExp.x * nExp.x + nExp.y * nExp.y + nExp.z * nExp.z);
+        nExp = hfref::V3{ nExp.x / m, nExp.y / m, nExp.z / m };
+    }
+    const hfref::V3 C{ (W0.x + W1.x + W2.x) / 3.0f, (W0.y + W1.y + W2.y) / 3.0f,
+                       (W0.z + W1.z + W2.z) / 3.0f };
+    std::printf("  triangle %u: W0=(%.4f %.4f %.4f) W1=(%.4f %.4f %.4f) W2=(%.4f %.4f %.4f)\n"
+                "  centroid=(%.4f %.4f %.4f)  n=(%.5f %.5f %.5f)\n",
+                TRI, W0.x, W0.y, W0.z, W1.x, W1.y, W1.z, W2.x, W2.y, W2.z,
+                C.x, C.y, C.z, nExp.x, nExp.y, nExp.z);
+    // A flat field: every triangle lies in the plane y = TY, so its normal is exactly vertical.
+    // If that ever stops holding the geometry below stops meaning what it says, so it is checked
+    // rather than assumed.
+    PXG_CHECK_MSG(std::fabs(nExp.x) < 1e-6f && std::fabs(nExp.z) < 1e-6f &&
+                  std::fabs(std::fabs(nExp.y) - 1.0f) < 1e-6f,
+                  "the field is flat, so the triangle normal must be exactly vertical; got "
+                  "(%.6f %.6f %.6f)", nExp.x, nExp.y, nExp.z);
+
+    // ---- the tetrahedra, built directly in WORLD space -------------------------------------
+    // The kernel reads mPosition_InvMass as world, so there is no transform to invert here.
+    // Each is a small triangular prism collapsed to a tet: a horizontal base face of side ~0.12
+    // and an apex 0.5 away from it, so the closest feature to the triangle is the BASE.
+    const float GAP = 0.02f;         // the vertical separation, well inside cDistance
+    const float EDGE_OUT = 0.06f;    // how far the edge tet overhangs, three times the gap
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    auto addTet = [&](float cx, float cz, float baseY, float apexDir) {
+        const uint32_t b = uint32_t(tetVerts.size());
+        tetVerts.push_back(F4{ cx - 0.06f, baseY, cz - 0.06f, 1.0f });
+        tetVerts.push_back(F4{ cx + 0.06f, baseY, cz - 0.06f, 1.0f });
+        tetVerts.push_back(F4{ cx,         baseY, cz + 0.06f, 1.0f });
+        tetVerts.push_back(F4{ cx,         baseY + apexDir * 0.5f, cz, 1.0f });
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        return uint32_t(tets.size() - 1u);
+    };
+    // ABOVE: base GAP above the plane, apex pointing up and away.
+    const uint32_t T_ABOVE = addTet(C.x, C.z, C.y + GAP, +1.0f);
+    // BELOW: base GAP below the plane, apex pointing down and away.  Difference (2): the mesh
+    // sibling's gate admits one of these two and rejects the other; this kernel keeps both.
+    const uint32_t T_BELOW = addTet(C.x, C.z, C.y - GAP, -1.0f);
+    // EDGE: the same height as ABOVE, but pushed past the triangle's W0 corner along the
+    // outward direction, so the closest point on the triangle is its BOUNDARY and GJK's
+    // direction is tilted ~72 degrees off vertical.  Difference (3).
+    const float outx = (W0.x - C.x), outz = (W0.z - C.z);
+    const float outm = std::sqrt(outx * outx + outz * outz);
+    const uint32_t T_EDGE = addTet(W0.x + (outx / outm) * EDGE_OUT,
+                                   W0.z + (outz / outm) * EDGE_OUT, C.y + GAP, +1.0f);
+    // FAR: ten units up, far outside any contact distance.
+    const uint32_t T_FAR = addTet(C.x, C.z, C.y + 10.0f, +1.0f);
+    // APEX: the only tetrahedron whose FOURTH VERTEX is the closest feature.  Every tet above
+    // has its base toward the triangle and its apex pointing away, so replacing v3 with v0
+    // changes nothing and a mutant that does exactly that survives -- measured, and the same
+    // blind spot P9.73 found in the softbody floor scene.  This one is inverted: its BASE is
+    // 0.5 above the plane and its apex reaches down to GAP above it.
+    // DEEP: the ONLY penetrating pair here, and the only one that reaches GJK's OVERLAP arm and
+    // therefore EPA.  Every other tetrahedron is separated, where GJK converges to the unique
+    // closest-point pair whatever direction it was seeded with -- which is why a mutant
+    // reversing the search direction survived a fixture made only of separated pairs.
+    const float DEEP_D = 0.01f;   // how far its base sits BELOW the triangle's plane
+    const uint32_t T_DEEP = addTet(C.x + 0.25f, C.z, C.y - DEEP_D, +1.0f);
+    const uint32_t T_APEX = [&]() {
+        const uint32_t b = uint32_t(tetVerts.size());
+        const float baseY = C.y + GAP + 0.5f;
+        tetVerts.push_back(F4{ C.x - 0.3f, baseY, C.z - 0.06f, 1.0f });
+        tetVerts.push_back(F4{ C.x - 0.3f, baseY, C.z + 0.06f, 1.0f });
+        tetVerts.push_back(F4{ C.x - 0.18f, baseY, C.z, 1.0f });
+        tetVerts.push_back(F4{ C.x - 0.24f, C.y + GAP, C.z, 1.0f });   // the apex, reaching DOWN
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        return uint32_t(tets.size() - 1u);
+    }();
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets);
+
+    const uint32_t SB_ID = 2u;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  HEIGHTFIELD is shapeRef0, SOFTBODY shapeRef1 -- the SWAPPED order, so a
+    // port that trusts position rather than geometry type reads the wrong half.
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
+    const uint32_t HF_MATERIAL = 0x80000005u;   // the HIGH BIT is set: the fold must drop it
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_HEIGHTFIELD_H;     shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = ROW_SCALE; shapes[0].sy = HEIGHT_SCALE; shapes[0].sz = COL_SCALE;
+    shapes[0].srw = 1.0f;
+    shapes[0].materialIndex = HF_MATERIAL;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    shapes[1].materialIndex = 0x0BADBADu;    // must never be the one that reaches the contact
+    DevBuf bShapes = makeDev(dev, shapes);
+    // cache refs: HEIGHTFIELD 1, SOFTBODY 0 -- distinct, so indexing the remap table or the
+    // contact distances with the wrong one shows.
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*hf cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // transform cache: slot 0 (the softbody) identity, slot 1 (the heightfield) R and T.
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;
+    xf[8 + 1] = 1.0f;                                       // 180 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // cDistance = contactDistance[sbCacheRef] + contactDistance[hfCacheRef] = 0.012 + 0.011.
+    // *** NEITHER HALF ALONE REACHES THE GAP. ***  0.023 clears the 0.02 separation; 0.012 and
+    // 0.011 do not.  With 0.03 + 0.02 -- the first draft -- a mutant that dropped one of the
+    // two addends still had 0.02 and still emitted every contact, and it survived.
+    std::vector<float> cd = { 0.012f, 0.011f, 999.0f, 999.0f };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> rd = { 0.125f, 777.0f };
+    DevBuf bRd = makeDev(dev, rd);
+
+    // shapeToRigidRemapTable is indexed by the HEIGHTFIELD's cache ref (1).  Slot 0 carries a
+    // poison so using the softbody's ref is visible rather than merely wrong.
+    const uint64_t RIGID_ID = 0x00000007ABCD1234ull;
+    std::vector<uint64_t> remap = { 0xDEADDEADDEADDEADull, RIGID_ID };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // ---- the pair stack, and the clamp -----------------------------------------------------
+    // FIVE entries are declared in midphasePairsNum but stackSizeBytes only covers FOUR, so the
+    // fifth -- which WOULD emit, being a copy of the first -- must be clamped away, while the
+    // tail still reports the unclamped demand.
+    const uint32_t NB_STACK_ENTRIES = 7u, DECLARED = 6u;
+    std::vector<uint32_t> stack;
+    auto push = [&](uint32_t tet) {
+        stack.push_back(0u); stack.push_back(tet); stack.push_back(TRI); stack.push_back(0u);
+    };
+    push(T_ABOVE); push(T_BELOW); push(T_EDGE); push(T_APEX); push(T_DEEP); push(T_FAR);
+    push(T_ABOVE);                       // beyond the clamp
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { NB_STACK_ENTRIES };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    // ---- the contact writer's buffers ------------------------------------------------------
+    const uint32_t MAXC = 8u, POISON = 0xFEEDFACEu;
+    std::vector<F4> zeroF4(MAXC, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<uint32_t> poison(MAXC * 4u, POISON);
+    DevBuf bPoint = makeDev(dev, zeroF4), bNormalPen = makeDev(dev, zeroF4),
+           bBary = makeDev(dev, zeroF4);
+    DevBuf bInfo = makeDev(dev, poison), bByX = makeDev(dev, poison),
+           bTempByX = makeDev(dev, poison), bIdxSorted = makeDev(dev, poison),
+           bSorted = makeDev(dev, poison);
+    std::vector<uint32_t> count = { 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    SbHfCgPush p = {};
+    p.tolerenceLength = 1.0f;
+    p.cmInputs = bCms.addr;
+    p.transformCache = bXf.addr;
+    p.contactDistance = bCd.addr;
+    p.restDistance = bRd.addr;
+    p.gpuShapes = bShapes.addr;
+    p.softbodies = bDesc.addr;
+    p.shapeToRigidRemapTable = bRemap.addr;
+    p.stackPtr = bStack.addr;
+    p.midphasePairsNum = bPairNum.addr;
+    p.stackSizeBytes = DECLARED * 16u;
+    p.stackSizeNeededOnDevice = bNeeded.addr;
+    p.wPoint = bPoint.addr; p.wNormalPen = bNormalPen.addr; p.wBarycentric = bBary.addr;
+    p.wContactInfo = bInfo.addr; p.wTotalCount = bCount.addr; p.wContactByX = bByX.addr;
+    p.wTempContactByX = bTempByX.addr; p.wContactIndexSortedByX = bIdxSorted.addr;
+    p.wContactSortedByX = bSorted.addr; p.wMaxContacts = MAXC;
+
+    {
+        Kernel k("softBodyHfContactGenBda.spv", "sb_heightfieldContactGenLaunch",
+                 {}, sizeof(SbHfCgPush));
+        // The engine's grid (PxgNarrowphaseCore.cpp:5462): x = SB_HFCG = 1024, y = z = 1,
+        // block (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK).
+        k.dispatch(/*gridX*/ 1024u, {}, p, 1u, 1u);
+    }
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, bNormalPen.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
+    const auto gByX = downloadBuffer<uint32_t>(dev, bByX.h, MAXC * 2u);
+    const auto gTempByX = downloadBuffer<uint32_t>(dev, bTempByX.h, MAXC * 4u);
+    const auto gIdxSorted = downloadBuffer<uint32_t>(dev, bIdxSorted.h, MAXC * 4u);
+    const auto gSorted = downloadBuffer<uint32_t>(dev, bSorted.h, MAXC * 4u);
+    const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+        std::printf("  contact %u: p=(%.5f %.5f %.5f) rest=%.5f n=(%.6f %.6f %.6f) pen=%.6f "
+                    "ind0=0x%08x%08x tet %u mat=%u\n",
+                    i, gPoint[i].x, gPoint[i].y, gPoint[i].z, gPoint[i].w,
+                    gNormalPen[i].x, gNormalPen[i].y, gNormalPen[i].z, gNormalPen[i].w,
+                    gInfo[i * 4u + 1u], gInfo[i * 4u + 0u],
+                    gInfo[i * 4u + 2u] & 0xfffffu, gInfo[i * 4u + 3u]);
+
+    // ---- difference (2): BOTH sides of the triangle survive ---------------------------------
+    PXG_CHECK_MSG(gCount == 5u,
+                  "five of the seven stack entries must emit: the tet ABOVE the triangle, the "
+                  "one BELOW it, the one overhanging its EDGE, the APEX-down one and the DEEP "
+                  "penetrating one.  The far tet is outside the contact distance and the seventh "
+                  "entry is beyond the stack clamp.  Got %u -- 4 means the mesh sibling's "
+                  "front-face gate was copied in, and this kernel does not have one "
+                  "(softbodyPrimitives.cu:1130 vs :878-881)", gCount);
+
+    // index the contacts by their tetrahedron, since the emission order is an atomic race
+    int idxAbove = -1, idxBelow = -1, idxEdge = -1, idxApex = -1, idxDeep = -1;
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+    {
+        const uint32_t tet = gInfo[i * 4u + 2u] & 0xfffffu;
+        if (tet == T_ABOVE) idxAbove = int(i);
+        else if (tet == T_BELOW) idxBelow = int(i);
+        else if (tet == T_EDGE) idxEdge = int(i);
+        else if (tet == T_APEX) idxApex = int(i);
+        else if (tet == T_DEEP) idxDeep = int(i);
+        PXG_CHECK_MSG(tet != T_FAR, "the tet ten units above the triangle must not emit: "
+                                    "cDistance is 0.023");
+    }
+    // *** RETURNING HERE IS NOT TIDINESS. ***  Every check below indexes gNormalPen with one of
+    // these, and a missing contact leaves the index at -1.  The first version read on and
+    // SEGFAULTED, which the sweep duly scored as a kill -- but a fixture that crashes instead
+    // of printing its diagnosis has thrown away the only thing that makes the kill useful.
+    if (idxAbove < 0 || idxBelow < 0 || idxEdge < 0 || idxApex < 0 || idxDeep < 0)
+    {
+        PXG_CHECK_MSG(false,
+                      "the five contacts must be one per tetrahedron (above %d, below %d, edge "
+                      "%d, apex %d, deep %d); a -1 is a tetrahedron that produced nothing and a "
+                      "repeat means the clamped seventh entry was processed",
+                      idxAbove, idxBelow, idxEdge, idxApex, idxDeep);
+        for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h,
+                                   bXf.h, bCd.h, bRd.h, bRemap.h, bStack.h, bPairNum.h,
+                                   bNeeded.h, bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h,
+                                   bTempByX.h, bIdxSorted.h, bSorted.h, bCount.h })
+            dev->destroyBuffer(h);
+        return;
+    }
+
+    auto near = [](float a, float b, float t) { return std::fabs(a - b) <= t; };
+
+    // ---- difference (3): the stored normal is the TRIANGLE normal, negated -----------------
+    const int idxOf[5] = { idxAbove, idxBelow, idxEdge, idxApex, idxDeep };
+    const char* nameOf[5] = { "above", "below", "edge", "apex", "deep" };
+    for (int which = 0; which < 5; ++which)
+    {
+        const int i = idxOf[which];
+        const char* nm = nameOf[which];
+        PXG_CHECK_MSG(near(gNormalPen[i].x, -nExp.x, 1e-4f) &&
+                      near(gNormalPen[i].y, -nExp.y, 1e-4f) &&
+                      near(gNormalPen[i].z, -nExp.z, 1e-4f),
+                      "%s: the stored normal is the TRIANGLE normal negated "
+                      "(flipOutputNormal = true), i.e. (%.5f %.5f %.5f); got (%.6f %.6f %.6f).  "
+                      "A tilted normal on the EDGE contact means GJK's direction was stored "
+                      "instead -- that is the mesh sibling's spelling, not this one's",
+                      nm, -nExp.x, -nExp.y, -nExp.z,
+                      gNormalPen[i].x, gNormalPen[i].y, gNormalPen[i].z);
+    }
+
+    // ---- and therefore the penetration is the VERTICAL gap, on all three -------------------
+    // pen = dot(witnessB - witnessA, n).  For the ABOVE tet the witnesses differ by (0,-GAP,0)
+    // and for the BELOW tet by (0,+GAP,0); the EDGE tet's base sits at the same height as the
+    // ABOVE tet's, so its projection on a VERTICAL normal is the same number -- while the slant
+    // distance its GJK direction would measure is sqrt(EDGE_OUT^2 + GAP^2) = 0.0632, three
+    // times larger.  That is the sharpest of the three reads.
+    const float penAbove = -GAP * nExp.y;
+    PXG_CHECK_MSG(near(gNormalPen[idxAbove].w, penAbove, 2e-4f),
+                  "above: pen is the witness separation projected on the triangle normal, "
+                  "%.6f; got %.6f", penAbove, gNormalPen[idxAbove].w);
+    PXG_CHECK_MSG(near(gNormalPen[idxBelow].w, -penAbove, 2e-4f),
+                  "below: the same gap on the other side, so pen flips sign to %.6f; got %.6f",
+                  -penAbove, gNormalPen[idxBelow].w);
+    PXG_CHECK_MSG(near(gNormalPen[idxEdge].w, penAbove, 2e-4f),
+                  "edge: its base is at the SAME height as the above tet's, so projected on the "
+                  "triangle normal its pen is the SAME %.6f.  Got %.6f -- about %.4f is the "
+                  "slant distance, which is what GJK's direction would have measured",
+                  penAbove, gNormalPen[idxEdge].w,
+                  std::sqrt(EDGE_OUT * EDGE_OUT + GAP * GAP));
+    PXG_CHECK_MSG(near(gNormalPen[idxApex].w, penAbove, 2e-4f),
+                  "apex: its FOURTH VERTEX reaches down to the same height, so its pen is the "
+                  "same %.6f; got %.6f (a much larger gap means the apex was not the closest "
+                  "feature, i.e. the fourth vertex never reached the cloud)",
+                  penAbove, gNormalPen[idxApex].w);
+
+    // The DEEP tet OVERLAPS: its base is DEEP_D below the plane, so the witness separation runs
+    // the other way along n and the projection changes sign against the separated contacts.
+    // This is the one pair that reaches GJK's OVERLAP arm and therefore EPA at all.
+    PXG_CHECK_MSG(near(gNormalPen[idxDeep].w, DEEP_D * nExp.y, 2e-4f),
+                  "deep: it penetrates by %.3f, so projected on the triangle normal its pen is "
+                  "%.6f -- the OPPOSITE SIGN to the separated contacts' %.6f; got %.6f",
+                  DEEP_D, DEEP_D * nExp.y, penAbove, gNormalPen[idxDeep].w);
+
+    // ---- WHERE the edge contact's witness landed -------------------------------------------
+    // The edge tet overhangs the W0 corner, so the closest point on the triangle is ON ITS
+    // BOUNDARY at that corner's x.  This is the assertion that pins the triangle's POSITION --
+    // every check above is about its normal and its height, and on a horizontal triangle those
+    // survive any in-plane displacement.  Measured: with only the normal and the height checked,
+    // `hf-drop-rotation` moved the whole triangle two units and SURVIVED.
+    PXG_CHECK_MSG(near(gPoint[idxEdge].x, W0.x, 1e-3f),
+                  "the edge witness lies on the triangle's boundary through W0, at x = %.4f; got "
+                  "%.5f -- a different x means the decoded triangle is not where the heightfield "
+                  "puts it", W0.x, gPoint[idxEdge].x);
+
+    // ---- the rigid-shaped output, shared with the sibling and not allowed to drift ----------
+    for (int which = 0; which < 5; ++which)
+    {
+        const int i = idxOf[which];
+        PXG_CHECK_MSG(gInfo[i * 4u + 0u] == uint32_t(RIGID_ID & 0xFFFFFFFFull) &&
+                      gInfo[i * 4u + 1u] == uint32_t(RIGID_ID >> 32),
+                      "pairInd0 is the PxNodeIndex from shapeToRigidRemapTable[HEIGHTFIELD "
+                      "cache ref] = 0x%08x%08x; got 0x%08x%08x (0xDEAD.. means the SOFTBODY's "
+                      "ref was used)", uint32_t(RIGID_ID >> 32), uint32_t(RIGID_ID & 0xFFFFFFFFull),
+                      gInfo[i * 4u + 1u], gInfo[i * 4u + 0u]);
+        PXG_CHECK_MSG((gInfo[i * 4u + 2u] >> 20) == SB_ID,
+                      "pairInd1 encodes (softbody %u, tet); got body %u",
+                      SB_ID, gInfo[i * 4u + 2u] >> 20);
+        PXG_CHECK_MSG(gInfo[i * 4u + 3u] == (HF_MATERIAL & 0x7FFFFFFFu),
+                      "the material comes from the HEIGHTFIELD shape and is folded with "
+                      "& 0x7fffffff: expected %u, got %u (%u is the softbody's decoy)",
+                      HF_MATERIAL & 0x7FFFFFFFu, gInfo[i * 4u + 3u], 0x0BADBADu);
+        PXG_CHECK_MSG(near(gPoint[i].w, 0.125f, 1e-6f),
+                      "the point's w is restDistance[cmIdx = 0] = 0.125; got %.6f (777 means "
+                      "cmIdx was ignored)", gPoint[i].w);
+        // the stored point is the witness on the SECOND cloud, i.e. on the TRIANGLE, whose
+        // plane is y = TY exactly
+        PXG_CHECK_MSG(near(gPoint[i].y, TY, 2e-3f),
+                      "the stored point is the witness on the TRIANGLE, at world y = %.3f; got "
+                      "%.5f (a value %.3f away is the witness on the TET instead)",
+                      TY, gPoint[i].y, GAP);
+    }
+
+    // ---- alternativeWriteMode's side arrays ------------------------------------------------
+    PXG_CHECK_MSG(gSorted[0] == uint32_t(RIGID_ID & 0xFFFFFFFFull),
+                  "contactSortedByX carries the rigid id's LOW word; got 0x%08x", gSorted[0]);
+    PXG_CHECK_MSG(gByX[0] == POISON && gByX[1] == POISON,
+                  "contactByX must be LEFT ALONE in the alternative write mode");
+    PXG_CHECK_MSG(gTempByX[0] == POISON,
+                  "tempContactByX must be LEFT ALONE in the alternative write mode");
+    for (uint32_t i = 0; i < gCount; ++i)
+        PXG_CHECK_MSG(gIdxSorted[i] == i,
+                      "contactIndexSortedByX is seeded with the identity in BOTH modes; slot "
+                      "%u holds %u", i, gIdxSorted[i]);
+    PXG_CHECK_MSG(gPoint[5].x == 0.0f && gNormalPen[5].x == 0.0f && gInfo[5 * 4u] == POISON,
+                  "nothing beyond the five contacts may be touched");
+
+    // ---- the clamp and the unclamped demand ------------------------------------------------
+    PXG_CHECK_MSG(gNeeded == NB_STACK_ENTRIES * 16u,
+                  "stackSizeNeededOnDevice must report the UNCLAMPED demand %u bytes so the "
+                  "host can grow the stack; got %u (%u is the clamped count and would pin the "
+                  "stack at its current size forever)",
+                  NB_STACK_ENTRIES * 16u, gNeeded, DECLARED * 16u);
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h,
+                               bCd.h, bRd.h, bRemap.h, bStack.h, bPairNum.h, bNeeded.h,
+                               bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h, bTempByX.h,
+                               bIdxSorted.h, bSorted.h, bCount.h })
         dev->destroyBuffer(h);
 }
 

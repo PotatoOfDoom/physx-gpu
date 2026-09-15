@@ -55,12 +55,56 @@
 # third convexCore arm, and the one the `convexcoretrimesh` scene was written
 # against BEFORE the kernel existed, so the red measurement is on record.
 evaluatePointDistancesSDFBatch
-sb_heightfieldContactGenLaunch
+# sb_heightfieldContactGenLaunch -- MAPPED in P9.81 (softBodyHfContactGenBda.spv),
+# and DRIVEN, by PXG_SB_FLOOR=heightfield -- the sixth floor of the softbody scene's
+# floor matrix and the first (softbody, heightfield) pair this harness has ever built.
+# Measured with the kernel skipped: the cube fell through to -49.8831 against 0.4893
+# on the box floor and 0.4883 on the cooked mesh, all three at the same floor height.
 # sphereTrimeshNarrowphase -- MAPPED in P9.66b (sphereTriNpBda.spv).  It was the
 # only unmapped kernel in testSDKSphereTriMeshSATGpu's chain, and it carried two
 # ordinary geometry pairs: sphere-vs-mesh and capsule-vs-mesh.
 triangleTriangleCollision
 triangleTriangleOverlaps
+# trimeshHeightfieldNarrowphase -- STAYS ON THIS RATCHET, and NOT because it is work.
+# It is UNREACHABLE, and this is a FIFTH kind of deadness, distinct from the four
+# already on record (commented-out caller; never-constructed owner; #if 0 body; a
+# host guard no scene raises):
+#
+#   *** A DISPATCH CASE FOR A BUCKET ID NO CLASSIFIER EVER PRODUCES. ***
+#
+# The kernel exists, its launcher exists, and PxgNphaseImplementationContext.cpp:225
+# has a `case GPU_BUCKET_ID::eTriangleHeightfield:` that calls it.  Nothing reaches
+# that case.  gTable[eTRIANGLEMESH][eHEIGHTFIELD] is cndCaseMeshHeightfield (:1319-
+# 1329), which returns eFemClothHeightfield when side 0 is cloth and eFallback
+# otherwise -- so a RIGID mesh against a heightfield goes to the CPU fallback, and
+# the CPU table's slot for that pair is PxcInvalidContactPair.  Repo-wide the token
+# eTriangleHeightfield appears in exactly three places: the enum (PxgNarrowphaseCore.h
+# :117), that dispatch case, and one count variable (:609).  Never as a result.
+#
+# THE SECOND PIECE OF EVIDENCE, and the one that makes this more than a naming
+# argument: its HOST LAUNCH PACK DOES NOT MATCH ITS OWN KERNEL.  The kernel declares
+# (toleranceLength, cmInputs, cmOutputs, shapes, transformCache, contactDistance, ...)
+# at trimeshCollision.cu:437-456; the pack at PxgNarrowphaseCore.cpp:1326-1344 passes
+# (numTests, cmInputs, transformCache, contactDistance, gpuShapes, cmOutputs, ...).
+# Slots 2..5 are a FOUR-WAY PERMUTATION of pointers.  Every one is 8 bytes, so the
+# launch would not fault -- it would read the contact-manager outputs as a transform
+# cache.  Its PLANE sibling, thirty lines earlier at :1236-1250, passes exactly the
+# order its kernel declares, which is what identifies the heightfield pack as a
+# mis-edited copy of it rather than a different convention.  It has never fired
+# because the bucket is never populated.  Documented as an upstream bug candidate;
+# NOT reported.
+#
+# Mapping this kernel would therefore move the manifest by one and move what the port
+# can DO by nothing, and no scene could observe a wrong answer from it -- the same
+# test this file applies to the 58 standalone kernels.  If upstream ever revives the
+# bucket, the pack has to be settled before a port can be validated against it.
+#
+# It is LISTED rather than deleted for the reason sb_plasticDeformLaunch is listed:
+# the checker's ENGINE test is "a .cpp outside gpuslang names the PxgKernelIds enum",
+# which is TRUE here -- PxgNarrowphaseCore.cpp launches it -- so deleting the line
+# makes the checker report it as un-ratcheted work.  A fifth kind of deadness with
+# ONE instance does not justify teaching the checker a DEAD_BUCKET test; a second
+# instance would, and the same standing rule already governs DEAD_OWNER.
 trimeshHeightfieldNarrowphase
 trimeshPlaneNarrowphase
 

@@ -136,6 +136,22 @@ done
 # is working correctly.
 run_one "particle (settling bag, STARTY=4.0)" PXG_SCENE=particle PXG_PARTICLE_STARTY=4.0
 
+# THE SOFTBODY FLOOR MATRIX, added in P9.81.  `softbody` above runs the DEFAULT floor
+# (the convex-hull ground box) and nothing else, so five of the scene's six floors --
+# each of which routes the same cube to a DIFFERENT narrowphase kernel -- were never
+# swept.  Three of them name a kernel this port had to supply, and those three are
+# scored here.  It is the same cube at the same height every time, so their settle
+# numbers are directly comparable, which is what makes the matrix a measurement
+# rather than three separate scenes:
+#
+#   box (the default, above)  0.4893    mesh  0.4883    heightfield  0.4891
+#
+# plane and sphere are left unscored: both route to sb_primitiveContactGenLaunch,
+# which the box arm already covers, so scoring them would buy runtime and no reach.
+run_one "softbody (mesh floor)"        PXG_SCENE=softbody PXG_SB_FLOOR=mesh
+run_one "softbody (convexcore floor)"  PXG_SCENE=softbody PXG_SB_FLOOR=convexcore
+run_one "softbody (heightfield floor)" PXG_SCENE=softbody PXG_SB_FLOOR=heightfield
+
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 
 if [ "${1:-}" = "--diagnostics" ]; then

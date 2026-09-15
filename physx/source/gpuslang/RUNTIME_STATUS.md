@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **865/865** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.81 added `softBodySimHeightfieldContactGen` INSIDE the existing `gpuslang.softBodySim`
+case -- a fixture, not a new ctest row, which is why that tranche moves the count by zero
+(the same shape as P9.76c).  Manifest **417 -> 418**, engine-reachable unmapped 15 and
+holding (one of the fifteen was RECLASSIFIED rather than ported), scenes **52 -> 55**.
 P9.80 added two (`gpuslang.psVolumeBound`, `gpuslang.psShapeMatch`) and the FIRST scene
 that creates a `PxParticleRigidBuffer` or asks a `PxParticleBuffer` for a volume.
 Manifest **415 -> 417**, engine-reachable unmapped **17 -> 15**, scenes **51 -> 52**.
@@ -51,9 +55,9 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **417/501** kernels mapped (P9.80 filled the two PBD particle-BUFFER
-features -- shape matching and volume bounds -- that no scene had ever created).
-Of the 84 unmapped, **15 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **418/501** kernels mapped (P9.81 filled the softbody-vs-HEIGHTFIELD contact
+gen, step 2 of a pair whose step 1 had been mapped since P8.11).
+Of the 83 unmapped, **14 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
 are orphans — so "417/501" understates coverage of what this build can actually run.
 (These three figures had drifted: P9.79 moved the manifest to 415 and the reachable
@@ -62,8 +66,9 @@ line said 50 after `directapi` had made it 51.  A counter block nobody reconcile
 counter block nobody can quote, so P9.80 reconciled all four against a measurement --
 `ctest`, `check_manifest`, `check_unmapped_reachability` and `run_scenes.sh` -- rather
 than against the previous paragraph.)
-Scenes: **52/52** -- P9.80 added `particlerigid` and P9.76 added `particleattach`, the
-first scene in this tree that
+Scenes: **55/55** -- P9.81 scored the softbody FLOOR MATRIX (mesh, convexcore,
+heightfield) that the sweep had been running one arm of, P9.80 added `particlerigid` and
+P9.76 added `particleattach`, the first scene in this tree that
 reaches the particle-vs-rigid ATTACHMENT chain at all; it carries its own control (one
 of the 64 particles is deliberately left unpinned and falls while the other 63 hang).
 P9.76c moved `softbodyhang` out of the pending-work list into the
@@ -1902,6 +1907,151 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.81 — der Softbody-gegen-Heightfield-Kontaktgenerator, und eine FÜNFTE Art von Totheit
+
+Die Liste der engine-erreichbaren unmapped Kernels stand bei 15. Diese Tranche nimmt
+einen davon weg, indem sie ihn portiert — und einen zweiten, indem sie **misst, dass er
+unerreichbar ist**. Das sind zwei verschiedene Ergebnisse, und die Datei sagt jetzt für
+jeden, welches davon gilt.
+
+### Erst der Beobachter
+
+`sb_heightfieldContactGenLaunch` hat **keinen** Wächter: der Launcher feuert ihn
+bedingungslos, und die einzige Bedingung ist `if (numTests == 0) return;` auf dem Bucket
+`eSoftbodyHeightfield`. In diesen Bucket kommt ein Paar über `caseTetraHeightfield`
+**ohne jeden Kompatibilitätstest** — überlappende AABBs zwischen einem
+`PxDeformableVolume` und einem `PxHeightFieldGeometry` sind die ganze Anforderung. Nur
+hatte das nie eine Szene gebaut: `addHeightFieldFloor` hatte fünf Aufrufstellen, und
+`PXG_SB_FLOOR` bot box, plane, sphere, mesh, convexcore und none.
+
+`PXG_SB_FLOOR=heightfield` ist der sechste Boden — und er gehört in **dieselbe
+Boden-Matrix**, weil seine Erwartung dann nicht erfunden, sondern **schon gemessen** ist:
+derselbe Würfel, derselbe Solver, dieselbe Bodenhöhe y = 0.
+
+```
+                        Kernel übersprungen       geportet
+box                     —                         0.4893  @ Schritt 50
+mesh                    —                         0.4883  @ Schritt 50
+heightfield             -49.8831 @ Schritt 198    0.4891  @ Schritt 50
+```
+
+Der **Schritt 198** ist dabei die eigentliche Pointe. Die Kontaktzähler-Sonde meldete im
+roten Lauf `max deformable-volume contacts = 24` — sie war also **unter der
+Null-Hypothese wahr** und hat nichts gemessen. Die 24 Kontakte waren die bei y = −50.5
+geparkte Bodenbox, auf der der Würfel nach 3,3 Sekunden Fall landete. Erst der späte
+erste Kontakt verrät das. Festgehalten statt stillschweigend übergangen: die Fall-Prüfung
+war hier der Beobachter, nicht der Kontaktzähler.
+
+### Drei Unterschiede zum Geschwisterkernel, und alle drei sind scharf
+
+`sb_meshContactGenLaunch` ist bereits geportet und hat dieselbe Form. Wer ihn kopiert,
+macht drei Fehler:
+
+1. **Kein Filter-Arm.** Zwei Argumente weniger → der Blob ist **176** statt 192 Byte. Eine
+   geteilte ABI-Zeile schöbe sechzehn Byte Unsinn in den Writer und verschöbe jeden
+   Kontaktzeiger — genau der Fehler, für den P9.77 seinen Checker geschrieben hat. Eigene
+   Zeile, mit Begründung im Kommentar.
+2. **Kein Front-Face-Gate.** Der Mesh-Pfad behält einen Kontakt nur bei
+   `dot(gjkDirection, n) >= 0`; dieser behält ihn in beide Richtungen.
+3. **Die geschriebene Normale ist die DREIECKSNORMALE, nicht die GJK-Richtung** — und
+   damit ist auch die Eindringtiefe die auf *sie* projizierte Zeugen-Differenz, nicht die
+   auf die GJK-Richtung.
+
+Unterschied (3) ist der, den eine Szene nicht sehen kann: bei einem flach aufliegenden
+Tetraeder fallen beide Lesarten zusammen. Das Fixture stellt deshalb ein Tetraeder **über
+eine Dreieckskante hinaus**: die GJK-Richtung kippt um ~72°, die Dreiecksnormale bleibt
+senkrecht, und die beiden Lesarten trennen sich dreifach gleichzeitig — Normalenrichtung,
+Betrag der Eindringtiefe, und die Gleichheit mit dem flach aufliegenden Kontakt.
+
+### Fünf Überlebende der ersten Mutationssweep — vier waren Fixture-Lücken
+
+| Mutant | warum er überlebte | was ihn jetzt tötet |
+|---|---|---|
+| `hf-samples-offset-4` | das Feld war **flach**, also lag jedes falsch dekodierte Dreieck trotzdem in der Ebene y = TY mit senkrechter Normale | alle Samples außer den vier Ecken der Zielzelle auf verschiedene Höhen gehoben — falsche Indizes **kippen** das Dreieck |
+| `hf-drop-rotation` | dasselbe, plus: alle Prüfungen betrafen Normale und Höhe, keine die **Position** | zusätzlich die x-Koordinate des Kantenzeugen gegen `W0.x` aus dem Host-Spiegel |
+| `hf-cdistance-one-side` | `cd = {0.03, 0.02}` — die 0.02 allein reichten noch für den 0.02-Spalt | `cd = {0.012, 0.011}`: die Summe trägt, **keine Hälfte allein** |
+| `hf-tet-drop-fourth-vertex` | jedes Tetraeder zeigte mit der **Basis** zum Dreieck, die Spitze weg — genau der blinde Fleck aus P9.73 | ein fünftes, **umgedrehtes** Tetraeder, dessen vierter Vertex nach unten das nächste Merkmal ist |
+| `hf-search-dir-reversed` | **keine Lücke** — siehe unten | — |
+
+Zweiter Sweep: **21 von 22 tot** (20 KILLED, 1 KILLED-FAULT), ein Überlebender.
+
+### Der eine Überlebende ist ein Ergebnis, keine Lücke
+
+Der GJK-**Startwert** (`triCenter - tetCenter` statt umgekehrt) überlebt. Das ist keine
+ungetestete Ecke: der Startwert ist eine Richtung, kein Eingabewert — GJK konvergiert für
+zwei konvexe Mengen gegen dasselbe eindeutige nächste Punktepaar, egal wo es losläuft;
+nur die Iterationszahl ändert sich. Man könnte einwenden, das sei bei **getrennten**
+Paaren leicht zu glauben. Das Fixture hat deshalb ein **durchdringendes** Tetraeder
+bekommen — das einzige Paar, das überhaupt GJKs OVERLAP-Zweig und damit EPA erreicht —
+und der Mutant überlebt auch das. Beide Zweige, gleiches Ergebnis. Notiert als
+gemessen-äquivalent, nicht als offene Flanke.
+
+### Und ein Fixture, das abgestürzt ist statt zu diagnostizieren
+
+`hf-add-frontface-gate` wurde im ersten Sweep als KILLED-**FAULT** gewertet. Der Grund
+war meiner: bei fehlendem Kontakt blieb ein Index auf −1 und das Fixture las weiter. Ein
+Absturz zählt als Kill — aber ein Fixture, das abstürzt, statt seine Diagnose zu drucken,
+hat das Einzige weggeworfen, was den Kill nützlich macht. Jetzt bricht es mit der
+Meldung ab, die sagt, welches Tetraeder nichts geliefert hat.
+
+### Die FÜNFTE Art von Totheit
+
+`trimeshHeightfieldNarrowphase` bleibt auf dem Ratchet — **nicht** weil es Arbeit ist:
+
+> **Ein Dispatch-Case für eine Bucket-ID, die kein Klassifizierer je erzeugt.**
+
+Der Kernel existiert, sein Launcher existiert, und
+`PxgNphaseImplementationContext.cpp:225` hat ein `case GPU_BUCKET_ID::eTriangleHeightfield:`,
+das ihn aufruft. Dort kommt nichts an: `gTable[eTRIANGLEMESH][eHEIGHTFIELD]` ist
+`cndCaseMeshHeightfield`, das für Cloth `eFemClothHeightfield` und sonst `eFallback`
+liefert — und der CPU-Slot für dieses Paar ist `PxcInvalidContactPair`. Im ganzen Baum
+taucht das Token `eTriangleHeightfield` an genau drei Stellen auf: im Enum, in jenem
+Dispatch-Case und in einer Zählvariablen. **Nie als Ergebnis.**
+
+Der zweite Beleg macht daraus mehr als einen Namensstreit: **sein Host-Launch-Pack passt
+nicht zu seinem eigenen Kernel.** Der Kernel deklariert
+`(toleranceLength, cmInputs, cmOutputs, shapes, transformCache, contactDistance, …)`; das
+Pack übergibt `(numTests, cmInputs, transformCache, contactDistance, gpuShapes, cmOutputs, …)`.
+Die Slots 2..5 sind eine **Vierer-Permutation** von Zeigern. Alle acht Byte groß, also
+würde der Start nicht faulten — der Kernel läse die Contact-Manager-Ausgaben als
+Transform-Cache. Sein Plane-Zwilling, dreißig Zeilen davor, übergibt exakt die Reihenfolge,
+die sein Kernel deklariert; das identifiziert das Heightfield-Pack als fehlerhaft
+abgeschriebene Kopie. Es hat nie gefeuert, weil der Bucket nie gefüllt wird. Als
+Upstream-Bug-Kandidat notiert, **nicht gemeldet.**
+
+Eine fünfte Art von Totheit mit **einer** Instanz rechtfertigt keinen DEAD_BUCKET-Test im
+Checker; eine zweite täte es — dieselbe Regel gilt schon für DEAD_OWNER.
+
+### Ein Ratchet, der nicht wachsen darf, und trotzdem wuchs
+
+`check_launch_abi_pack.py` konnte das Pack des neuen Kernels nicht entscheiden. Sein
+eigener Kopf sagt, die Ursache sei „ein by-value-Struct, dessen Größe diese Tabelle nicht
+kennt" und das Auflösen davon sei „der nächste echte Schritt". Zwei naheliegende Fixes
+wurden probiert und **gemessen**: `"PxgFEMContactWriter": 80` in `SIZES` entscheidet
+nichts, und der Deklarations-Regex um die Konstruktorform `Type var(args);` zu erweitern
+auch nicht. Der Grund liegt woanders: `declared_size` löst einen Namen **dateiweit** auf,
+und `PxgNarrowphaseCore.cpp` deklariert `writer` zweimal verschieden —
+`PxgFEMContactWriter` bei :1024 und `PxgParticleContactWriter&` bei :3100. Zwei Typen für
+einen Namen in einer Übersetzungseinheit ist genau die Uneinigkeit, die der Resolver
+verweigern **muss**. Der echte Schritt ist also **Funktions-Scope**, nicht eine größere
+Typtabelle — und ohne das Scoping würde eine größere Tabelle den Checker zuversichtlich
+falsch machen, was schlimmer ist als unentschieden. Als eigene Aufgabe notiert, mit
+dieser Messung, damit der nächste Anlauf nicht am falschen Ende beginnt.
+
+### Zahlen
+
+* Suite **865/865** in beiden Speichermodi. Der Zähler bewegt sich **nicht**: das neue
+  Fixture ist ein `PXG_TEST` im bestehenden `gpuslang.softBodySim`-Fall, keine neue
+  ctest-Zeile (dieselbe Form wie P9.76c).
+* Manifest **417 → 418/501**; engine-erreichbare unmapped **15**, davon einer neu als
+  unerreichbar klassifiziert statt portiert.
+* Szenen **52 → 55**: die Boden-Matrix wurde nur mit **einem** ihrer sechs Arme gesweept.
+  Drei davon nennen je einen eigenen Narrowphase-Kernel und sind jetzt gewertet; plane und
+  sphere bleiben ungewertet, weil beide auf `sb_primitiveContactGenLaunch` laufen, den der
+  box-Arm schon abdeckt.
+* Mutationssweep **21/22**, forced-fresh, Baseline vorher und nachher grün.
+* `sb_heightfieldContactGenLaunch` mit totem `tolerenceLength` in `push_block_known.txt`.
 
 ## P9.80 — die zwei PBD-Puffer-Features: geportet, verdrahtet, und von der Szene aus P9.80a gefahren
 

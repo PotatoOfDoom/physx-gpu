@@ -728,6 +728,19 @@ static const uint8_t kSbMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   its own row rather than aliased, so a future divergence upstream shows up here.
 static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
 
+// gpunarrowphase softbody-vs-HEIGHTFIELD contact gen (P9.81 step 2):
+//   sb_heightfieldContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, restDistance*, gpuShapes*, softbodies*, shapeToRigidRemapTable*,
+//   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, stackSizeNeededOnDevice*,
+//   PxgFEMContactWriter writer) -- launch site PxgNarrowphaseCore.cpp:5441.
+//
+// THIRTEEN arguments, not the mesh sibling's fifteen: this signature has no
+// filterPairs/nbFilterPairs, so the blob is 176 bytes and not 192.  Aliasing
+// kSbMeshContactGen here would push sixteen bytes of the wrong thing into the writer
+// and leave every contact pointer shifted -- the exact failure P9.77's
+// check_launch_abi.py was written to catch, which is why this gets its own row.
+static const uint8_t kSbHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
+
 // gpunarrowphase softbody-vs-HEIGHTFIELD midphase (P8.11 step 1):
 //   sb_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems, PxReal toleranceLength,
 //   cmInputs*, transformCache*, contactDistance*, gpuShapes*, softbodies*,
@@ -2074,6 +2087,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_sbMidphaseGeneratePairsLaunch", kSbSbMidphase, uint32_t(sizeof(kSbSbMidphase)) },
     { "sb_meshMidphaseGeneratePairsLaunch", kSbMeshMidphase, uint32_t(sizeof(kSbMeshMidphase)) },
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
+    { "sb_heightfieldContactGenLaunch", kSbHfContactGen, uint32_t(sizeof(kSbHfContactGen)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
     // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)
