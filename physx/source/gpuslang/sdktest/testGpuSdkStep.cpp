@@ -245,6 +245,155 @@ void buildMeshFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* materia
 }
 
 
+// PXG_SCENE=sdfmesh (P9.82a) -- the FIRST DYNAMIC TRIANGLE MESH in this harness, and
+// therefore the first scene that can reach the rigid trimesh-vs-plane and
+// trimesh-vs-trimesh narrowphase at all.
+//
+// ---------------------------------------------------------------------------
+// WHY A SCENE HAD TO BE BUILT, AND WHY IT NEEDS AN SDF
+// ---------------------------------------------------------------------------
+// Both pairs are gated on the mesh being DYNAMIC, and PhysX 5.6 will not simulate a
+// non-kinematic PxTriangleMeshGeometry without an SDF:
+//
+//   * NpRigidBodyTemplate.h:359-374 defines isSimGeom as "not plane/heightfield/
+//     tetmesh, and if trianglemesh then isDynamicMesh", where isDynamicMesh is
+//     literally `mesh->getSdfDataFast().mSdf != NULL`;
+//   * the GPU bucket classifier agrees independently: cndCaseMeshMesh
+//     (PxgNphaseImplementationContext.cpp:1117-1131) returns eTriangleTriangle only
+//     when both sides are rigid, both pass isMeshGPUCompatible, and at least one
+//     mesh has an SDF, and ScFiltering.cpp:399-405 KILLS the pair otherwise.
+//
+// Every cooked mesh in this file until now was cooked with `buildGPUData = true` and
+// nothing else, and every one of them is attached to a PxRigidStatic or a
+// PxDeformableSurface.  So no scene had ever produced either pair.  The SDF cooker
+// itself is available: GuCookingSDF.cpp is compiled into this build and, with
+// sdfDesc.sdfBuilder left NULL, physx::buildSDF uses the CPU winding-number path with
+// no CUDA involved.
+//
+// ---------------------------------------------------------------------------
+// TWO BODIES, ONE PER KERNEL, AND WHY THAT SEPARATION MATTERS
+// ---------------------------------------------------------------------------
+// A plane is infinite, so a single dynamic mesh would pair with BOTH the plane and any
+// static mesh and a single resting height could not say which kernel caught it.  So:
+//
+//   body A at x = -4: over the PLANE only               -> trimeshPlaneNarrowphase
+//   body B at x = +4: over a static mesh RAISED to y = 2 -> triangleTriangleOverlaps
+//                     (it pairs with the plane too, but the mesh is what it meets first)
+//
+// which makes the four outcomes distinguishable:
+//
+//   both mapped        A rests at 0.5    B rests at 2.5
+//   plane missing      A falls through   B rests at 2.5
+//   tri-tri missing    A rests at 0.5    B falls through the raised mesh to 0.5
+//   both missing       both fall
+//
+// The resting heights are not invented: a half-0.5 body on a floor at y = 0 rests at
+// centre 0.5, the same number PXG_SCENE=box, =plane and =meshfloor have all measured.
+//
+// *** EXPECTED TO FAIL UNTIL THE THREE KERNELS ARE MAPPED. ***  This is P9.82a; the
+// port is P9.82.  The red measurement is the point of building it first.
+PxTriangleMesh* cookSdfBox(PxPhysics* physics, float h)
+{
+    // A CLOSED box, 8 vertices and 12 triangles wound outward.  Closed matters twice
+    // over: an SDF is a signed distance, which needs an inside, and isMeshGPUCompatible
+    // needs the GRB BV32 tree that buildGPUData produces.
+    const PxVec3 v[8] = {
+        PxVec3(-h, -h, -h), PxVec3( h, -h, -h), PxVec3( h, -h,  h), PxVec3(-h, -h,  h),
+        PxVec3(-h,  h, -h), PxVec3( h,  h, -h), PxVec3( h,  h,  h), PxVec3(-h,  h,  h)
+    };
+    const PxU32 t[36] = {
+        0, 2, 1,  0, 3, 2,      // -y
+        4, 5, 6,  4, 6, 7,      // +y
+        0, 1, 5,  0, 5, 4,      // -z
+        3, 7, 6,  3, 6, 2,      // +z
+        0, 4, 7,  0, 7, 3,      // -x
+        1, 2, 6,  1, 6, 5       // +x
+    };
+    PxTriangleMeshDesc md;
+    md.points.count = 8; md.points.stride = sizeof(PxVec3); md.points.data = v;
+    md.triangles.count = 12; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = t;
+
+    // sdf.data stays NULL, so the cooker BUILDS the field; spacing is the only thing it
+    // needs from us.  0.05 over a 1-unit box is 20^3 cells -- small enough to cook in
+    // well under a second on the CPU path, fine enough that the box's faces are resolved.
+    // subgridSize 0 selects the DENSE field: the sparse form needs the subgrid block
+    // dimensions and a min/max range, which are the cooker's outputs, not ours.
+    PxSDFDesc sdfDesc;
+    sdfDesc.spacing = 0.05f;
+    sdfDesc.subgridSize = 0;
+    sdfDesc.numThreadsForSdfConstruction = 4;
+    md.sdfDesc = &sdfDesc;
+
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;
+    PxTriangleMesh* m = immediateCooking::createTriangleMesh(ck, md,
+                                                            physics->getPhysicsInsertionCallback());
+    if (!m) { std::printf("FAIL: createTriangleMesh with an SDF returned null\n"); return nullptr; }
+    return m;
+}
+
+void buildSdfMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                       std::vector<RestTarget>& targets)
+{
+    const float H = 0.5f;
+    PxTriangleMesh* sdfBox = cookSdfBox(physics, H);
+    if (!sdfBox) return;
+    // The claim the whole scene rests on, checked rather than assumed: without this the
+    // shape attaches (PX_CHECK_AND_RETURN_VAL compiles to nothing in this Release build)
+    // and then simply never collides, which would look exactly like an unmapped kernel.
+    if (!sdfBox->getSDF())
+    {
+        std::printf("FAIL: the cooked mesh carries NO SDF, so PhysX will not simulate it "
+                    "as a dynamic body and neither GPU pair can form\n");
+        return;
+    }
+    PxU32 sdx = 0, sdy = 0, sdz = 0;
+    sdfBox->getSDFDimensions(sdx, sdy, sdz);
+    std::printf("  sdfmesh: cooked a 12-triangle box with an SDF (dims %u x %u x %u)\n",
+                sdx, sdy, sdz);
+
+    // ---- the static PLANE, for body A ------------------------------------------------
+    PxRigidStatic* plane = physics->createRigidStatic(
+        PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+    PxShape* ps = physics->createShape(PxPlaneGeometry(), *material);
+    plane->attachShape(*ps);
+    scene->addActor(*plane);
+    ps->release();
+
+    // ---- the static MESH raised to y = 2, for body B ---------------------------------
+    // Two triangles wound so their normals point UP, cooked with buildGPUData so the pair
+    // passes isMeshGPUCompatible.  No SDF on this one: cndCaseMeshMesh needs at least one,
+    // and the dynamic body supplies it.
+    const float E = 2.0f;
+    const PxVec3 mv[4] = { PxVec3(-E, 0.0f, -E), PxVec3(-E, 0.0f, E),
+                           PxVec3( E, 0.0f, -E), PxVec3( E, 0.0f, E) };
+    const PxU32 mt[6] = { 0u, 1u, 2u,   2u, 1u, 3u };
+    PxTriangleMeshDesc md;
+    md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mv;
+    md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mt;
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;
+    PxTriangleMesh* shelf = immediateCooking::createTriangleMesh(ck, md,
+                                                                physics->getPhysicsInsertionCallback());
+    if (!shelf) { std::printf("FAIL: createTriangleMesh (shelf) returned null\n"); return; }
+    PxRigidStatic* shelfActor = physics->createRigidStatic(PxTransform(PxVec3(4.0f, 2.0f, 0.0f)));
+    PxShape* ss = physics->createShape(PxTriangleMeshGeometry(shelf), *material);
+    shelfActor->attachShape(*ss);
+    scene->addActor(*shelfActor);
+    ss->release();
+
+    // ---- the two dynamic SDF meshes ---------------------------------------------------
+    // Mass and inertia are set explicitly, as every other rigid scene here does: a solid
+    // box of half 0.5 at 1000 kg, so the settle is comparable with PXG_SCENE=box.
+    const PxVec3 inertia = boxInertia(PxVec3(H), 1000.0f);
+    PxRigidDynamic* a = addDynamic(physics, scene, material,
+                                   PxTriangleMeshGeometry(sdfBox), inertia, 5.0f, -4.0f);
+    targets.push_back({ a, 5.0f, H, "sdfBoxOnPlane" });
+    PxRigidDynamic* b = addDynamic(physics, scene, material,
+                                   PxTriangleMeshGeometry(sdfBox), inertia, 5.0f, 4.0f);
+    targets.push_back({ b, 5.0f, 2.0f + H, "sdfBoxOnMesh" });
+}
+
 // A cooked TRIANGLE MESH floor at y = 0: two triangles wound so the normals point
 // up, with buildGPUData so the mesh carries a BV32 tree.  Used by the particle
 // mesh-floor scene (P9.10c), which is the first scene in this port to put
@@ -9093,6 +9242,7 @@ int main()
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "sdfmesh")) buildSdfMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spheremesh")) buildSphereMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsulemesh")) buildCapsuleMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoreplane")) buildConvexCorePlaneScene(physics, scene, material, targets);

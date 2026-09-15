@@ -178,6 +178,20 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
+    # P9.82a -- sdfmesh.  The FIRST DYNAMIC TRIANGLE MESH this harness cooks, and
+    # therefore the first scene that can reach the rigid trimesh-vs-plane and
+    # trimesh-vs-trimesh narrowphase at all: PhysX will not simulate a non-kinematic
+    # PxTriangleMeshGeometry without an SDF, and no mesh in this tree had ever been
+    # cooked with one.  Its RED measurement, on record:
+    #   sdfBoxOnPlane  5.0000 -> -73.8070 (rest 0.500)   trimeshPlaneNarrowphase  183x SKIPPED
+    #   sdfBoxOnMesh   5.0000 -> -73.8070 (rest 2.500)   triangleTriangleOverlaps  10x SKIPPED
+    #                                                    triangleTriangleCollision 10x SKIPPED
+    # TWO bodies, because a plane is infinite: one over the plane alone and one over a
+    # static mesh raised to y = 2, so each kernel family has its own resting height and a
+    # single number cannot be credited to the wrong one.
+    echo "    sdfmesh -- the RIGID TRIMESH narrowphase, plane and triangle-triangle."
+    env PXG_SCENE=sdfmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  sdfmesh:|^  \[sdfBox|^FAIL:|^\[ *(OK|FAIL|PARTIAL) *\] gpu-sdk-step' | sed 's/^/    /'
     # particlerigid MOVED INTO THE SCORED LIST in P9.80, and its RED measurement is
     # the record of why it was ever here (kept in RUNTIME_STATUS.md, P9.80):
     #   cluster y-extent 1.5000 -> 0.0000  (all 64 particles flat on the floor)
