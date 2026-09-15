@@ -88,11 +88,14 @@
 // root-node bounds), grid distribution, and the patch-stream tail above.
 
 import pxgSlangCommon;
+// P9.82: the decision core -- vertex2Shape, calculatePCMConvexMargin, the arg-min/max
+// helpers, contactReduce6, the batching loop and the two manifold predicates -- now lives
+// in a module that the ENGINE kernel (triPlaneNpBda.slang) compiles too, so this fixture
+// certifies the code the engine runs rather than a second transcription of it.  The
+// bodies were MOVED, not retyped; what stayed here is buffer access, which does no
+// arithmetic.
+import pxgSlangTriPlane;
 
-static const uint PLANE_TRI_MAX_CONTACTS = 6u;
-static const float MESH_MANIFOLD_EPSILON = 0.05f;
-static const float BOX_MARGIN_RATIO = 0.25f;
-static const float FLT_MAX_LOCAL = 3.402823466e38f;
 static const uint OVERFLOW_CONTACT = 1u;
 static const uint OVERFLOW_FORCE = 2u;
 
@@ -133,125 +136,6 @@ RWStructuredBuffer<float4> gContactStream;// binding 9: byte offset / 16 indexin
 RWStructuredBuffer<uint4> gOutRec;        // binding 10: per case (contactPointsOfs, contactForcesOfs, nbContacts, fullGen)
 RWStructuredBuffer<float4> gDebug;        // binding 11: per case (worldNormal, retainedCount)
 
-// ---- helpers -----------------------------------------------------------------
-float3 vertex2Shape(float3 v, float3 scale, float4 rot)
-{
-    return quatRotateInv(rot, quatRotate(rot, v) * scale);
-}
-float calculatePCMConvexMargin(float3 extents_, float3 scale, float toleranceLength)
-{
-    const float3 extents = extents_ * scale;
-    const float mn = min(min(extents.x, extents.y), extents.z);
-    return min(mn * BOX_MARGIN_RATIO, toleranceLength * MESH_MANIFOLD_EPSILON);
-}
-
-// NOTE: with an empty mask (or all masked values at the sentinel) these
-// return idx 0, unlike CUDA maxIndex/minIndex (lowest MASKED index); every
-// call site below provably passes a nonempty mask with finite values
-uint lowestArgMax(float vals[32], uint mask, out float best)
-{
-    best = -FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
-}
-uint lowestArgMin(float vals[32], uint mask, out float best)
-{
-    best = FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-// contactReduce<clustering=true, keepDeepestPCM=true, maxPoints=6, dupeTest=false>
-// (contactReduction.cuh via the tranche-82 transcription), on lane arrays
-uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask, float clusterBias)
-{
-    const int maxPoints = int(PLANE_TRI_MAX_CONTACTS);
-    float3 point[32];
-    for (uint j = 0; j < 32; ++j)
-        point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);
-
-    const uint newCount = countbits(allMask);
-    if (newCount <= uint(maxPoints))
-        return allMask;
-
-    float v;
-    float vals[32];
-
-    for (uint j = 0; j < 32; ++j) vals[j] = sep[j];
-    const uint i0 = lowestArgMax(vals, allMask, v);
-    uint mask = 1u << i0;
-
-    for (uint j = 0; j < 32; ++j)
-    {
-        const float3 d = point[i0] - point[j];
-        vals[j] = sqrt(dot(d, d)); // PxVec3::magnitude(); sqrt(dot) keeps the
-                                   // IEEE-sqrt assumption minimal vs OpLength
-    }
-    const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const float3 dir = cross(normal, point[i1] - point[i0]);
-    float dval[32];
-    for (uint j = 0; j < 32; ++j) dval[j] = dot(dir, point[j] - point[i0]);
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint f = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << f;
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint g = lowestArgMin(vals, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    if (countbits(mask) == 4 && maxPoints > 4)
-    {
-        const uint i4 = lowestArgMin(sep, allMask & ~mask, v);
-        mask |= 1u << i4;
-    }
-
-    // clustering
-    {
-        float sepB[32];
-        for (uint j = 0; j < 32; ++j)
-            sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
-
-        int label[32];
-        int nbClusters = 0;
-        {
-            uint m = mask;
-            float tbest[32];
-            for (uint j = 0; j < 32; ++j) { tbest[j] = FLT_MAX_LOCAL; label[j] = -1; }
-            for (; m != 0; ++nbClusters, m &= (m - 1))
-            {
-                const uint anchor = firstbitlow(m);
-                for (uint j = 0; j < 32; ++j)
-                {
-                    const float3 dv = point[j] - point[anchor];
-                    const float d = dot(dv, dv);
-                    if (d < tbest[j]) { tbest[j] = d; label[j] = nbClusters; }
-                }
-            }
-        }
-
-        mask = 0;
-        for (int i = 0; i < nbClusters; ++i)
-        {
-            uint cluster = 0;
-            for (uint j = 0; j < 32; ++j)
-                if (label[j] == i) cluster |= 1u << j;
-            cluster &= allMask;
-            if (cluster != 0)
-                mask |= 1u << lowestArgMin(sepB, cluster, v);
-        }
-        for (int i = nbClusters; i < maxPoints; ++i)
-            mask |= 1u << lowestArgMin(sepB, allMask & ~mask, v);
-    }
-    return mask;
-}
-
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -289,11 +173,8 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
     const float4 prevQ = gManRel[ci * 2 + 0];
     const float3 prevP = gManRel[ci * 2 + 1].xyz;
     const float thresholdP = minMargin * ratio;
-    const float3 dP = trimeshToPlane.p() - prevP;
-    const float3 aD = abs(dP);
-    const float deltaP = max(aD.x, max(aD.y, aD.z));
-    const float deltaQ = dot(trimeshToPlane.q(), prevQ);
-    const bool invalidate = (deltaP > thresholdP) || (deltaQ < 0.9998f);
+    const bool invalidate = tpInvalidateManifold(trimeshToPlane.q(), trimeshToPlane.p(),
+                                                 prevQ, prevP, thresholdP);
 
     uint4 manMeta = gManMeta[ci];
     bool lostContacts = false;
@@ -311,14 +192,10 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
             const float3 pointA = gManPointA[base + s].xyz;
             const float3 pointB = gManPointB[base + s].xyz;
             float4 nPen = gManNPen[base + s];
-            const float3 localAInB = quatRotate(trimeshToPlane.q(), pointA) + trimeshToPlane.p();
-            const float3 v = localAInB - pointB;
-            const float penNew = dot(v, nPen.xyz);
-            const float3 projected = localAInB - nPen.xyz * nPen.w;
-            const float3 pd = pointB - projected;
-            nPen.w = penNew;
+            const bool lost = tpRefreshContact(trimeshToPlane.q(), trimeshToPlane.p(),
+                                               pointA, pointB, nPen, sqThr);
             gManNPen[base + s] = nPen;
-            if (dot(pd, pd) > sqThr)
+            if (lost)
                 lostContacts = true;
         }
         if (lostContacts)
@@ -388,45 +265,9 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
             }
             const uint totalContacts = offset + retainedCount;
 
-            // stage 2: warp-0 readMask batching loop over the shared buffer
-            float3 lanePt[32];
-            float laneSep[32];
-            bool laneHas[32];
-            for (uint l = 0; l < 32; ++l) { laneHas[l] = false; lanePt[l] = float3(0, 0, 0); laneSep[l] = FLT_MAX_LOCAL; }
-            for (uint ind = 0; ind < totalContacts;)
-            {
-                uint readMask = 0;
-                for (uint l = 0; l < 32; ++l)
-                    if (!laneHas[l]) readMask |= 1u << l;
-                for (uint l = 0; l < 32; ++l)
-                {
-                    if (laneHas[l]) continue;
-                    const uint readIndex = countbits(readMask & ((1u << l) - 1u)) + ind;
-                    if (readIndex < totalContacts)
-                    {
-                        lanePt[l] = contacts[readIndex];
-                        laneSep[l] = seps[readIndex];
-                        laneHas[l] = true;
-                    }
-                }
-                uint mask = 0;
-                for (uint l = 0; l < 32; ++l)
-                    if (laneHas[l]) mask |= 1u << l;
-                ind += countbits(readMask); // faithful: advances by FREE lanes, read or not
-                mask = contactReduce6(lanePt, laneSep, worldNormal, mask, clusterTolerance);
-                for (uint l = 0; l < 32; ++l)
-                    laneHas[l] = ((mask >> l) & 1) != 0;
-            }
-            // compact survivors to the buffer front
-            uint k2 = 0;
-            for (uint l = 0; l < 32; ++l)
-            {
-                if (!laneHas[l]) continue;
-                contacts[k2] = lanePt[l];
-                seps[k2] = laneSep[l];
-                ++k2;
-            }
-            retainedCount = k2;
+            // stage 2: warp-0 readMask batching loop, in pxgSlangTriPlane
+            retainedCount = tpBatchReduce(contacts, seps, totalContacts, worldNormal,
+                                          clusterTolerance);
         }
 
         // 4. PCM store
