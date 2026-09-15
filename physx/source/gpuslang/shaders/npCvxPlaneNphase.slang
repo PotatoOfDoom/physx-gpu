@@ -65,6 +65,11 @@
 // CONVEX_PLANE_WARPS_PER_BLOCK = 4), numBlocks = ceil(numTests / 4).
 
 import pxgSlangNpAbi;
+// P9.82: the output tail (reservation, registerContactPatch,
+// insertIntoPatchStream) MOVED into a module so triPlaneNpBda compiles the same
+// code instead of a second transcription of it.  This kernel's scene
+// (PXG_SCENE=convexplane) is what certifies those bodies.
+import pxgSlangNpPatchTail;
 
 // ---------------------------------------------------------------------------
 static const float PX_MAX_F32 = 3.4028235e38f;
@@ -488,25 +493,14 @@ void convexPlaneNphase_Kernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupTh
     Ptr<uint> touchChangeFlags = Ptr<uint>(gParams.touchChangeFlags);
     Ptr<uint> patchChangeFlags = Ptr<uint>(gParams.patchChangeFlags);
 
-    uint contactByteOffset = INVALID;
-    uint forceByteOffset = INVALID;
-    if (nbContacts != 0u)
-    {
-        InterlockedAdd(counters[0].contactsBytes, CONTACT_SIZE * nbContacts, contactByteOffset);
-        InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * nbContacts, forceByteOffset);
-        if ((contactByteOffset + CONTACT_SIZE) > gParams.contactBytesLimit)
-        {
-            InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
-            contactByteOffset = INVALID;
-        }
-        if ((forceByteOffset + FORCE_SIZE) > gParams.forceBytesLimit)
-        {
-            InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
-            forceByteOffset = INVALID;
-        }
-    }
+    uint forceByteOffset = NPT_INVALID;
+    const uint contactByteOffset =
+        nptReserveContacts(gParams.patchAndContactCounters, gParams.cmOutputs,
+                           gParams.startContactPoints, gParams.startContactForces,
+                           gParams.contactBytesLimit, gParams.forceBytesLimit,
+                           globalWarpIndex, nbContacts, forceByteOffset);
 
-    if (contactByteOffset != INVALID)
+    if (contactByteOffset != NPT_INVALID)
     {
         Ptr<float4> baseContactStream = Ptr<float4>(gParams.contactStream + uint64_t(contactByteOffset));
         for (uint L = 0u; L < 32u; ++L)
@@ -518,134 +512,17 @@ void convexPlaneNphase_Kernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupTh
                 baseContactStream[index] = float4(worldP, sepL[L]);
             }
         }
-        cmOutputs[globalWarpIndex].contactForces = gParams.startContactForces + uint64_t(forceByteOffset);
-        cmOutputs[globalWarpIndex].contactPoints = gParams.startContactPoints + uint64_t(contactByteOffset);
-    }
-    else
-    {
-        cmOutputs[globalWarpIndex].contactForces = 0uL;
-        cmOutputs[globalWarpIndex].contactPoints = 0uL;
     }
 
-    const uint allflags = cmOutputs[globalWarpIndex].allflagsWord;
-    const uint oldStatusFlags = (allflags >> 16u) & 0xFFu;
-    uint statusFlags = oldStatusFlags & (~FLAG_TOUCH_KNOWN);
-    if (nbContacts != 0u) statusFlags |= FLAG_HAS_TOUCH;
-    else                  statusFlags |= FLAG_HAS_NO_TOUCH;
-
-    const uint prevPatches = (allflags >> 8u) & 0xFFu;
-    const bool previouslyHadTouch = (oldStatusFlags & FLAG_HAS_TOUCH) != 0u;
-    const bool prevTouchKnown = (oldStatusFlags & FLAG_TOUCH_KNOWN) != 0u;
-    const uint numPatches = (nbContacts > 0u) ? 1u : 0u;
-    const bool currentlyHasTouch = nbContacts > 0u;
-    const bool change = (previouslyHadTouch != currentlyHasTouch) || (!prevTouchKnown);
-
-    touchChangeFlags[globalWarpIndex] = change ? 1u : 0u;
-    patchChangeFlags[globalWarpIndex] = (prevPatches != numPatches) ? 1u : 0u;
-
-    cmOutputs[globalWarpIndex].allflagsWord = (prevPatches << 24u) | (statusFlags << 16u) | (numPatches << 8u);
-    {
-        const uint nf = cmOutputs[globalWarpIndex].nbContactsFlags;
-        cmOutputs[globalWarpIndex].nbContactsFlags = (nf & 0xFFFF0000u) | (nbContacts & 0xFFFFu);
-    }
-
-    uint patchIndex = INVALID;
-    if (nbContacts != 0u)
-    {
-        InterlockedAdd(counters[0].patchesBytes, PATCH_SIZE, patchIndex);
-        if ((patchIndex + PATCH_SIZE) > gParams.patchBytesLimit)
-        {
-            InterlockedOr(counters[0].overflowError, OVERFLOW_PATCH);
-            patchIndex = INVALID;
-
-            statusFlags = (statusFlags & (~FLAG_TOUCH_KNOWN)) | FLAG_HAS_NO_TOUCH;
-            cmOutputs[globalWarpIndex].allflagsWord = (prevPatches << 24u) | (statusFlags << 16u);
-            const uint nf = cmOutputs[globalWarpIndex].nbContactsFlags;
-            cmOutputs[globalWarpIndex].nbContactsFlags = (nf & 0xFFFF0000u);
-            touchChangeFlags[globalWarpIndex] = previouslyHadTouch ? 1u : 0u;
-            patchChangeFlags[globalWarpIndex] = (prevPatches != 0u) ? 1u : 0u;
-        }
-        else
-        {
-            cmOutputs[globalWarpIndex].contactPatches = gParams.startContactPatches + uint64_t(patchIndex);
-        }
-    }
+    const uint patchIndex =
+        nptRegisterContactPatch(gParams.patchAndContactCounters, gParams.cmOutputs,
+                                gParams.touchChangeFlags, gParams.patchChangeFlags,
+                                gParams.startContactPatches, gParams.patchBytesLimit,
+                                globalWarpIndex, nbContacts);
 
     // insertIntoPatchStream(materials, patchStream, planeShape, convexShape,
     //   patchIndex, planeTransform.rotate((1,0,0)), nbContacts)
-    if (patchIndex != INVALID)
-    {
-        Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(gParams.materials);
-        const uint mi0 = planeShape.materialIndex;
-        const uint mi1 = convexShape.materialIndex;
-        const PxsMaterialDataGpu m0 = materials[mi0];
-        const PxsMaterialDataGpu m1 = materials[mi1];
-
-        const float r0f = m0.restitution, r1f = m1.restitution;
-        const bool compliant0 = r0f < 0.0f, compliant1 = r1f < 0.0f;
-        const bool exactlyOneCompliant = compliant0 != compliant1;
-        const bool bothCompliant = compliant0 && compliant1;
-        const uint m0flags = m0.flagsModes0 & 0xFFFFu;
-        const uint m1flags = m1.flagsModes0 & 0xFFFFu;
-        const uint m0fric = (m0.flagsModes0 >> 16u) & 0xFFu;
-        const uint m1fric = (m1.flagsModes0 >> 16u) & 0xFFu;
-        const uint m0rest = (m0.flagsModes0 >> 24u) & 0xFFu;
-        const uint m1rest = (m1.flagsModes0 >> 24u) & 0xFFu;
-        const uint m0damp = m0.modes1 & 0xFFu;
-        const uint m1damp = m1.modes1 & 0xFFu;
-        const bool cAcc0 = (m0flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
-        const bool cAcc1 = (m1flags & MAT_COMPLIANT_ACC_SPRING) != 0u;
-        const bool exactlyOneAcc = cAcc0 != cAcc1;
-
-        float rest, damping;
-        if (bothCompliant && exactlyOneAcc)
-            rest = cAcc0 ? r0f : r1f;
-        else
-        {
-            const uint mode = exactlyOneCompliant ? MODE_MIN : max(m0rest, m1rest);
-            const float flip = (bothCompliant && (mode == MODE_MULTIPLY)) ? -1.0f : 1.0f;
-            rest = flip * combineScalars(r0f, r1f, mode);
-        }
-        if (bothCompliant && exactlyOneAcc)
-            damping = cAcc0 ? m0.damping : m1.damping;
-        else
-        {
-            const uint mode = exactlyOneCompliant ? MODE_MAX : max(m0damp, m1damp);
-            damping = combineScalars(m0.damping, m1.damping, mode);
-        }
-
-        const uint combineFlags = m0flags | m1flags;
-        float sta, dyn;
-        uint matFlags;
-        if ((combineFlags & MAT_DISABLE_FRICTION) == 0u)
-        {
-            const uint fm = max(m0fric, m1fric);
-            const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
-            const float staF = combineScalars(m0.staticFriction, m1.staticFriction, fm);
-            const float fDyn = max(dynF, 0.0f);
-            dyn = fDyn;
-            sta = (staF - fDyn) >= 0.0f ? staF : fDyn;
-            matFlags = combineFlags;
-        }
-        else
-        {
-            matFlags = combineFlags | MAT_DISABLE_STRONG_FRICTION;
-            dyn = 0.0f; sta = 0.0f;
-        }
-
-        const float3 worldNormal = npAbiQuatRotate(planeTq, float3(1, 0, 0));
-        Ptr<uint> patchBase = Ptr<uint>(gParams.patchStream + uint64_t(patchIndex));
-        const uint one = asuint(1.0f);
-        patchBase[0] = one; patchBase[1] = one; patchBase[2] = one; patchBase[3] = one;
-        patchBase[4] = asuint(worldNormal.x);
-        patchBase[5] = asuint(worldNormal.y);
-        patchBase[6] = asuint(worldNormal.z);
-        patchBase[7] = asuint(rest);
-        patchBase[8] = asuint(dyn);
-        patchBase[9] = asuint(sta);
-        patchBase[10] = asuint(damping);
-        patchBase[11] = ((nbContacts & 0xFFu) << 16u) | ((matFlags & 0xFFu) << 24u);
-        patchBase[12] = (mi0 & 0xFFFFu) << 16u;
-        patchBase[13] = (mi1 & 0xFFFFu);
-    }
+    nptInsertIntoPatchStream(gParams.materials, gParams.patchStream,
+                             planeShape.materialIndex, convexShape.materialIndex,
+                             patchIndex, npAbiQuatRotate(planeTq, float3(1, 0, 0)), nbContacts);
 }
