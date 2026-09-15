@@ -129,6 +129,11 @@ static const uint8_t kInitStaticKin[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
 
 // gpusolver TGS kernels taking (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*)
 static const uint8_t kTwoPtr[] = { 8, 8 };
+
+// gpusimulationcontroller/src/CUDA/particlesystem.cu:5121 (P9.80):
+//   ps_solveShapes(PxgParticleSystem*, const PxU32* activeParticleSystems,
+//                  const PxReal dt, const PxReal biasCoefficient)
+static const uint8_t kPsSolveShapes[] = { 8, 8, 4, 4 };
 static const uint8_t kTwoPtrBool[] = { 8, 8, 1 };
 // computeArtiCOM(PxVec3* data, PxArticulationGPUIndex* gpuIndices, bool rootFrame,
 //   const PxgArticulation* articulations) -- P8.112
@@ -2253,6 +2258,19 @@ static const PxgKernelAbiRow kRows[] = {
     { "getD6JointTorques", kD6JointGet, uint32_t(sizeof(kD6JointGet)) },
     // MemCopyBalanced.cu:95 — clampMaxValues(three PxU32*, const PxU32) -> {8,8,8,4}
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
+    // particlesystem.cu:683 -- ps_update_volume_bound(const PxgParticleSystem*,
+    // const PxU32* activeParticleSystemIndices) -> {8,8} (P9.80).  Launched from
+    // PxgPBDParticleSystemCore.cpp:98 under `if (mMaxVolumesPerBuffer > 0)`, a
+    // guard no scene in this harness had ever made true before PXG_SCENE=particlerigid.
+    { "ps_update_volume_bound", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // particlesystem.cu:5121 -- ps_solveShapes(PxgParticleSystem*, const PxU32*,
+    // const PxReal dt, const PxReal biasCoefficient) -> {8,8,4,4} (P9.80).  The two
+    // floats pack at 16 and 20 and the blob rounds to 24, not 32: paramAlign is the
+    // modulo ladder, so a 4-byte argument aligns to 4.  Launched from
+    // PxgPBDParticleSystemCore.cpp:840 under `if (maxRigids > 0)`.  `dt` is DEAD in
+    // the kernel body -- present because the HOST pack has it, which is what the
+    // shim gates on.
+    { "ps_solveShapes", kPsSolveShapes, uint32_t(sizeof(kPsSolveShapes)) },
     // convexMeshMidphase.cu:378 — the rigid convex-vs-trimesh midphase (P8.27).
     { "midphaseGeneratePairs", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
     // convexHFMidphase.cu:350 -- convexHeightFieldMidphase has the SAME fifteen

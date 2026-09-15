@@ -133,6 +133,7 @@ ps_solvePCOutputParticleDeltaVTGSLaunch                1@8+8:sortedContacts;12@8
 ps_solvePCOutputRigidDeltaVLaunch                      1@8+8:sortedContacts;11@80+1:isVelIterWord                     # dead-upstream
 ps_solvePCOutputRigidDeltaVTGSLaunch                   1@8+8:sortedContacts                                           # dead-upstream
 ps_solveRigidAttachmentsLaunch                         8@60+4:biasCoefficient;9@64+1:isVelocityIteration              # dead-upstream
+ps_solveShapes                                         2@16+4:dt                                                     # dead-upstream
 ps_stepParticlesLaunch                                 1@8+8:activeParticleSystems;3@20+4:invTotalDt                  # dead-upstream
 ps_updateMaterials                                     3@24+4:invTotalDt                                              # dead-upstream
 ps_updateUserBufferLaunch                              2@16+4:count                                                   # dead-upstream

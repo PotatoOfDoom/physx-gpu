@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 415;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 417;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -251,10 +251,10 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_solveAerodynamics2Launch", "npPsAerodynamics.spv", "ps_solveAerodynamics2Launch" },
     { "ps_calculateInflatableVolume", "npPsInflatable.spv", "ps_calculateInflatableVolume" },
     { "ps_solveInflatableVolume", "npPsInflatable.spv", "ps_solveInflatableVolume" },
-    { "ps_solveShapes", nullptr, nullptr },  // PS_SOLVE_SHAPES (unmapped)
+    { "ps_solveShapes", "psShapeMatchBda.spv", "ps_solveShapes" },  // PS_SOLVE_SHAPES (P9.80)
     { "ps_rigidAttachmentPrepareLaunch", "psRigidAttachBda.spv", "ps_rigidAttachmentPrepareLaunch" },  // PS_PREP_RIGID_ATTACHMENTS (P9.76 particle attachment port)
     { "ps_solveRigidAttachmentsLaunch", "psRigidAttachBda.spv", "ps_solveRigidAttachmentsLaunch" },  // PS_SOLVE_RIGID_ATTACHMENTS (P9.76 particle attachment port)
-    { "ps_update_volume_bound", nullptr, nullptr },  // PS_UPDATE_VOLUME_BOUND (unmapped)
+    { "ps_update_volume_bound", "psVolumeBoundBda.spv", "ps_update_volume_bound" },  // PS_UPDATE_VOLUME_BOUND (P9.80)
     // DEAD IN 5.6.1 (found in P9.4): the kernel body exists
     // (particlesystem.cu:782) and the name is registered
     // (PxgKernelNames.h:314), but PS_UPDATE_SPRING is never handed to

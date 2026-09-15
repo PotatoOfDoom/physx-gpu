@@ -7,7 +7,10 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **863/863** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **865/865** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.80 added two (`gpuslang.psVolumeBound`, `gpuslang.psShapeMatch`) and the FIRST scene
+that creates a `PxParticleRigidBuffer` or asks a `PxParticleBuffer` for a volume.
+Manifest **415 -> 417**, engine-reachable unmapped **17 -> 15**, scenes **51 -> 52**.
 P9.79 added five (`gpuslang.directApiRigidGet`, `.directApiD6JointGet`,
 `.directApiRadixCopy2`, `.directApiMergeAabb`, `.directApiUpdateBodies`) and the
 FIRST scene that raises `PxSceneFlag::eENABLE_DIRECT_GPU_API`.  Its liveness audit of
@@ -48,12 +51,19 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **412/501** kernels mapped (P9.76 filled the particle-vs-rigid ATTACHMENT
-trio, the third and last of the three attachment families).
-Of the 89 unmapped, **20 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **417/501** kernels mapped (P9.80 filled the two PBD particle-BUFFER
+features -- shape matching and volume bounds -- that no scene had ever created).
+Of the 84 unmapped, **15 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
-are orphans — so "412/501" understates coverage of what this build can actually run.
-Scenes: **50/50** -- P9.76 added `particleattach`, the first scene in this tree that
+are orphans — so "417/501" understates coverage of what this build can actually run.
+(These three figures had drifted: P9.79 moved the manifest to 415 and the reachable
+count to 17 in its own paragraph but left this block saying 412 and 20, and the scene
+line said 50 after `directapi` had made it 51.  A counter block nobody reconciles is a
+counter block nobody can quote, so P9.80 reconciled all four against a measurement --
+`ctest`, `check_manifest`, `check_unmapped_reachability` and `run_scenes.sh` -- rather
+than against the previous paragraph.)
+Scenes: **52/52** -- P9.80 added `particlerigid` and P9.76 added `particleattach`, the
+first scene in this tree that
 reaches the particle-vs-rigid ATTACHMENT chain at all; it carries its own control (one
 of the 64 particles is deliberately left unpinned and falls while the other 63 hang).
 P9.76c moved `softbodyhang` out of the pending-work list into the
@@ -1892,6 +1902,137 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.80 — die zwei PBD-Puffer-Features: geportet, verdrahtet, und von der Szene aus P9.80a gefahren
+
+P9.80a hat den Beobachter gebaut und **rot** gemessen. Diese Tranche portiert die beiden
+Kernels, die er sichtbar gemacht hat, und dreht ihn grün:
+
+* `ps_solveShapes` (particlesystem.cu:5121) → `psShapeMatchBda.slang`
+* `ps_update_volume_bound` (particlesystem.cu:683) → `psVolumeBoundBda.slang`
+
+Beide waren nie `[pxg-unmapped]` gemeldet worden, und das ist kein Versehen der
+Instrumentierung, sondern ihre Grenze: **ein Kernel, der nie GESTARTET wird, wird nie als
+unmapped gemeldet** — die P9.40-Maschinerie sieht ausschließlich Launches. Beide Host-Wächter
+(`mMaxVolumesPerBuffer > 0`, `maxRigids > 0`) waren in allen 51 Szenen falsch.
+
+### Die Messung, vorher und nachher
+
+```
+                        ps_solveShapes übersprungen      geportet
+cluster y-Ausdehnung    1.5000 -> 0.0000                 1.5000 -> 1.4999
+volume bound            (-999,-999,-999), das Gift       min (-0.7500, 0.2499, -0.7500)
+                                                         max ( 0.7500, 1.7498,  0.7500)
+```
+
+Die A/B stammt aus **demselben laufenden Kernel**: `PXG_PARTICLE_RIGID_CONTROL=1` setzt nur
+den Steifigkeitskoeffizienten auf 0. Steifigkeit 1 → 1.4999, Steifigkeit 0 → 0.0000. Das
+trennt „der Kernel läuft und rechnet" von „der Kernel wird übersprungen", was eine reine
+Vorher/Nachher-Messung nicht kann. PGS ebenfalls grün. Die unabhängige Kontrolle ist der
+`particles:`-Bound, den die Szene selbst aus den Partikelpositionen bildet — er stimmt mit dem
+`volume:`-Bound aus dem Kernel überein.
+
+### Die Reduktion, und warum sie NICHT die Form von psBoundsBda haben darf
+
+`ps_solveShapes` ruft `blockReduction<AddOpPxReal, PxReal, 64>` zwölfmal pro Durchgang
+(dreimal Schwerpunkt, neunmal Momentenmatrix). psBoundsBda ersetzt die CUDA-Butterfly durch
+einen vollen Block-Baum und begründet das korrekt: **min/max ist assoziativ und
+rundungsfrei**, die Reihenfolge ist egal. **Für eine Summe gilt das nicht.** Also ist hier die
+Butterfly Zeile für Zeile nachgebaut (reduction.cuh:226-247):
+
+* Ebene 1 ist ein XOR-Butterfly mit Radius **16, 8, 4, 2, 1 — größter Schritt zuerst**
+  (shuffle.cuh's warpShuffleMin/Max läuft andersherum; für min/max harmlos, für add ein
+  anderer Baum);
+* Lane 0 jedes Warps schreibt ins Scratch, **ein** `__syncthreads()`;
+* Ebene 2 lädt `(threadIdx.x < numWarpsPerBlock) ? scratch[threadIndexInWarp] : initialValue`
+  und butterflyt erneut — bei 64 Threads sind das **zwei echte Warp-Summen und dreißig mit
+  +0.0f gepolsterte Lanes**, und diese Additionen sind real: `-0.0f + 0.0f` ist `+0.0f`;
+* `blockReduction` gibt die Summe **nur an die 32 Lanes von Warp 0** zurück, allen anderen
+  `initialValue`.
+
+Zwei Dinge muss der emulierte Pfad anders machen, beide von npPsInflatable geerbt: der
+Ebene-2-Butterfly wird **von jedem Thread** gerufen (`pxgWarpReduceAddF` liegt auf
+gruppenweiten Barrieren; CUDAs `__shfl_xor_sync` ist warp-lokal — nur Warp 0 hineinzulassen
+verklemmt die Workgroup), und es kommt **eine abschließende Barriere** dazu. Die fehlt in
+CUDA, und dort ist der Rücken-an-Rücken-Aufruf ein echtes Write-after-Read-Rennen auf dem
+Scratch; es beißt nur deshalb nicht, weil ein Warp seinen eigenen Block nicht um eine ganze
+Reduktion überholen kann.
+
+`ps_update_volume_bound` bekommt dagegen sehr wohl den portablen Block-Baum — dort ist es
+min/max, und die Engine pinnt ohnehin `UPDATEBOUND = 1024` („can't change this").
+
+### Zwei Upstream-Eigenheiten, wortgetreu übernommen — und eine davon ist jetzt gemessen
+
+**(a) `if (rigidId > numRigids) return;`** — GRÖSSER, nicht größer-gleich (particlesystem.cu:5150).
+`gridDim.x` ist das Maximum über alle Puffer, also überlebt bei einem Puffer mit weniger
+Rigids der Block mit `rigidId == numRigids` den Wächter und liest `rigidOffsets[numRigids+1]`
+— **einen Eintrag hinter dem Ende eines Arrays, das die API mit `numRigids + 1` Einträgen
+dokumentiert.** Der erste Entwurf des Fixtures hat das nur *beschrieben*: mit zwei Puffern zu
+je zwei Rigids wird dieser Block nie gestartet, und der Mutant `>` → `>=` überlebte prompt.
+Das Fixture hat jetzt einen **dritten Rigid-Puffer mit nur einem Rigid** und absichtlich
+überallozierten Arrays — die Polsterung macht den Upstream-Überlesevorgang *definiert*, damit
+das Fixture die **Semantik** des Wächters misst und nicht das, was der Allokator zufällig
+dahinter liegen ließ. Seitdem ist `sm-guard-gt-to-ge` ein Kill.
+
+**(b) `originalIndex = bufferIndex + localOffset`** (particlesystem.cu:5409), wobei
+`bufferIndex` ein **Rigid-Puffer**-Index ist, während jede Positionslesung drei Zeilen darüber
+`bufferOffset` benutzt. Das ist nicht nur schief, es ist **rennanfällig**: mit zwei
+Rigid-Puffern schreiben zwei verschiedene Blöcke dieselben Normalen-Slots, und nichts ordnet
+sie. Das Fixture hat es gemessen, bevor es verstanden war — 11 von 12 Läufen rot, einer grün.
+Die erste Fassung sagte die serielle Host-Reihenfolge voraus; das ist genau die Sorte
+Nichtdeterminismus, die man **nicht** mit einer weiteren Toleranz zudeckt. Der Vergleich
+sammelt jetzt pro Slot **jeden Wert, den ein Block dort legal hinterlassen haben könnte**, und
+verlangt, dass die Hardware einen davon produziert hat — plus die Zusicherung, dass die
+Überlappung überhaupt existiert, sonst ist die Maschinerie totes Gewicht in Rüstung. Danach
+15/15 grün. Upstream fällt es nie auf, weil jede ausgelieferte Szene **einen** Rigid-Puffer
+hat und der Ausdruck dann zu `localOffset` entartet. Als Bug-Kandidat notiert, **nicht
+gemeldet.**
+
+### Drei Überlebende der ersten Mutationssweep, alle Klasse D
+
+Klasse D ist „durch Zufall beobachtungsgleich" (P9.79). Alle drei Überlebenden von
+`psVolumeBoundBda` waren das, und keiner davon war ein korrekter Wächter:
+
+| Mutant | warum er überlebte | was ihn jetzt tötet |
+|---|---|---|
+| `vol-guard-ge-to-gt` | der Block eine Position hinter `mNumVolumes` las Allokations-Polster: `numParticles == 0`, Schleife null Durchläufe, nichts geschrieben, was jemand prüft | **Falle**: jedes Volume-Array hat `nbVols+1` Einträge, der letzte mit lebendem `numParticles` und vergiftetem Bound |
+| `vol-buffer-guard-off` | Block `y == nbBuffers` las das Polster hinter dem Sim-Buffer-Array — `mNumVolumes == 0`, sofortiges return | **Falle**: ein zusätzlicher Sim-Buffer-Eintrag mit einem eigenen, lebenden Fallen-Volume |
+| `vol-seed-zero` | jede Scheibe des Pseudozufallsfeldes umschließt in jeder Komponente die Null, also gewinnt eine 0-Saat nie | **zwei vorzeichenreine Regionen**: Partikel [2200,2500) strikt positiv, [2600,2900) strikt negativ, je ein Volume darauf gerichtet |
+
+Der zweite Sweep: `psVolumeBound` **13/13 tot** (12 KILLED, 1 KILLED-FAULT), `psShapeMatch`
+**21/21 tot**, null Überlebende, null NOCOMPILE. Getötet werden unter anderem die
+Butterfly-Breite (`5u` → `4u`), die Polsterbreite auf Ebene 2, der Reverse-Lookup in beiden
+Schleifen, `bufferOffset` vs. `bufferIndex`, die Drift-Klammer, der `passes`-Rest, das
+`.w`-Gewicht, die Vektordivision `* (1/n)` → `/ n` (die P9.36-Klasse) und die
+Quaternion-Multiplikationsreihenfolge.
+
+Ein Anchor-Fehlschlag war meiner: `if (rigidId > numRigids)` steht zweimal in der Datei — im
+Kopfkommentar und im Code. Mit dem Zeilenumbruch als Teil des Ankers ist er eindeutig.
+
+### Die Naht bei sin/cos
+
+`PxQuat(angle, axis)` ruft `PxSinCos` — die einzige Operation in `extractRotation` ohne
+Rundungsgarantie über Backends hinweg. Das Fixture teilt sich deshalb sauber: die
+**Translation ist der reduzierte Schwerpunkt und wird BITGENAU verglichen** (das ist der
+Assoziationsbaum, also genau das, was ein Port am ehesten subtil falsch macht), Rotationen,
+Deltas und Normalen gegen eine Toleranz — und das Fixture sagt, welche Hälfte welche ist. Das
+Delta-**Gewicht** (`.w`) ist wieder exakt: es ist eine Zählung von 1.0f-Additionen.
+
+### Zahlen
+
+* Suite **865/865** in beiden Speichermodi (863 → 865).
+* Manifest **415 → 417/501**; engine-erreichbare unmapped **17 → 15**.
+* Szenen **51 → 52**, `particlerigid` aus der Pending-Liste in die gewertete.
+* Mutationssweeps 13/13 und 21/21, forced-fresh, Baseline vorher und nachher grün.
+* `ps_solveShapes` mit einem toten `dt` in `push_block_known.txt` (dead-upstream): nur
+  `biasCoefficient` erreicht die Steifigkeit, `dt` steht im Push-Block, weil der HOST-Pack es
+  hat — dieselbe Form wie `ps_rigidAttachmentPrepareLaunch` (P9.76).
+
+### Offen, bewusst
+
+Die fünf Quaternion-Helfer stehen jetzt in **zwei** Dateien (softBodySolveBda und diese). Ein
+gemeinsames Modul lohnt beim **dritten** Abnehmer; bis dahin hält
+`check_helper_uniformity.py` die Kopien ehrlich.
 
 ## P9.80a — die beobachtende Szene für zwei PBD-Features, die noch nie eine Szene angelegt hat
 
