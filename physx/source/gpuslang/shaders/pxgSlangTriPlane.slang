@@ -52,6 +52,7 @@
 module pxgSlangTriPlane;
 
 import pxgSlangCommon;
+import pxgSlangPcmManifold;
 
 public static const uint PLANE_TRI_MAX_CONTACTS = 6u;
 public static const float MESH_MANIFOLD_EPSILON = 0.05f;
@@ -235,33 +236,23 @@ public uint tpBatchReduce(inout float3 contacts[198], inout float seps[198],
     return k2;
 }
 
-// invalidateManifold (manifold.cuh): the relative transform has drifted too far.
-// deltaP is the LARGEST ABSOLUTE COMPONENT of the translation difference, not its
-// length, and deltaQ is a raw quaternion dot -- no abs, so an antipodal but
-// equivalent rotation invalidates.  Both are upstream's.
+// The two manifold predicates live in pxgSlangPcmManifold, which already carried
+// them for the BDA callers.  P9.82's first draft gave them a SECOND home here
+// before noticing that -- the very duplication this module exists to prevent, made
+// by the commit that made the module.  These two are thin adapters onto that one
+// spelling, for the caller that holds the previous transform in registers.
 public bool tpInvalidateManifold(float4 relQ, float3 relP, float4 prevQ, float3 prevP,
                                  float thresholdP)
 {
-    const float3 dP = relP - prevP;
-    const float3 aD = abs(dP);
-    const float deltaP = max(aD.x, max(aD.y, aD.z));
-    const float deltaQ = dot(relQ, prevQ);
-    return (deltaP > thresholdP) || (deltaQ < 0.9998f);
+    return mmInvalidatePredicate(relQ, relP, prevQ, prevP, thresholdP);
 }
 
-// refreshManifolds' per-contact step: re-project the cached pointA through the
-// CURRENT relative transform, WRITE BACK the new penetration, and report whether
-// the point has slid further than the breaking threshold in the tangent plane.
-// The write-back happens even when the contact is then declared lost, which is
-// what the cached path downstream reads.
 public bool tpRefreshContact(float4 relQ, float3 relP, float3 pointA, float3 pointB,
                              inout float4 nPen, float sqThreshold)
 {
-    const float3 localAInB = quatRotate(relQ, pointA) + relP;
-    const float3 v = localAInB - pointB;
-    const float penNew = dot(v, nPen.xyz);
-    const float3 projected = localAInB - nPen.xyz * nPen.w;
-    const float3 pd = pointB - projected;
+    float penNew;
+    bool lost;
+    mmRefreshMath(relQ, relP, pointA, pointB, nPen.xyz, nPen.w, sqThreshold, penNew, lost);
     nPen.w = penNew;
-    return dot(pd, pd) > sqThreshold;
+    return lost;
 }

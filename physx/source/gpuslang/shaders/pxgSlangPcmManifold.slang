@@ -163,22 +163,54 @@ public float3 pcmTransform(float4 q, float3 t, float3 v)
 // orientation uses STRICTLY LESS.  A record that has moved exactly thresholdP
 // stays valid; one whose quaternion dot is exactly 0.9998 stays valid too.
 // ---------------------------------------------------------------------------
-public bool mmInvalidateManifold(uint64_t manifold, float4 aToB_q, float3 aToB_p,
-                                 float minMargin, float ratio)
+// The PREDICATE, on values.  Split out in P9.82 because the same arithmetic is
+// needed by a caller that holds the previous transform in registers rather than in
+// a manifold record -- npTriPlaneNp's fixture reads it from a StructuredBuffer --
+// and P9.82's first attempt gave it a second home in pxgSlangTriPlane before
+// noticing this one.  One spelling; the wrappers differ only in where the bytes
+// come from.
+//
+// deltaP is the LARGEST ABSOLUTE COMPONENT of the translation difference, not its
+// length, and deltaQ is a RAW quaternion dot with no abs -- so an antipodal but
+// geometrically equal rotation invalidates.  Both are upstream's.
+public bool mmInvalidatePredicate(float4 aToB_q, float3 aToB_p,
+                                  float4 prevQ, float3 prevP, float thresholdP)
 {
-    const float4 prevQ = Ptr<float4>(manifold + PCM_RELTRANSFORM_Q)[0];
-    const float4 prevP = Ptr<float4>(manifold + PCM_RELTRANSFORM_P)[0];
-
-    const float thresholdP = minMargin * ratio;
     const float thresholdQ = 0.9998f;
 
-    const float3 delta = aToB_p - float3(prevP.x, prevP.y, prevP.z);
+    const float3 delta = aToB_p - prevP;
     const float3 absDelta = float3(abs(delta.x), abs(delta.y), abs(delta.z));
 
     const float deltaP = max(absDelta.x, max(absDelta.y, absDelta.z));
     const float deltaQ = dot(aToB_q, prevQ);
 
     return (deltaP > thresholdP) || (deltaQ < thresholdQ);
+}
+
+// refreshManifolds' per-contact ARITHMETIC, on values -- see mmRefreshSlot below
+// for the two details it preserves (the projection uses the OLD penetration; the
+// write-back is unconditional within the slot guard).
+public void mmRefreshMath(float4 aToB_q, float3 aToB_p, float3 pointA, float3 pointB,
+                          float3 normal, float penOld, float sqProjectBreakingThreshold,
+                          out float penNew, out bool lost)
+{
+    const float3 localAInB = pcmTransform(aToB_q, aToB_p, pointA);
+    const float3 v = localAInB - pointB;
+    penNew = dot(v, normal);
+
+    const float3 projectedPoint = localAInB - normal * penOld;
+    const float3 projectedDifference = pointB - projectedPoint;
+    const float distance2d = dot(projectedDifference, projectedDifference);
+    lost = distance2d > sqProjectBreakingThreshold;
+}
+
+public bool mmInvalidateManifold(uint64_t manifold, float4 aToB_q, float3 aToB_p,
+                                 float minMargin, float ratio)
+{
+    const float4 prevQ = Ptr<float4>(manifold + PCM_RELTRANSFORM_Q)[0];
+    const float4 prevP = Ptr<float4>(manifold + PCM_RELTRANSFORM_P)[0];
+    return mmInvalidatePredicate(aToB_q, aToB_p, prevQ,
+                                 float3(prevP.x, prevP.y, prevP.z), minMargin * ratio);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,15 +270,12 @@ public bool mmRefreshSlot(uint64_t manifold, float4 aToB_q, float3 aToB_p,
     const float3 normal = loadF3(c + PCM_C_NORMAL);
     const float penOld = Ptr<float>(c + PCM_C_PEN)[0];
 
-    const float3 localAInB = pcmTransform(aToB_q, aToB_p, pointA);
-    const float3 v = localAInB - pointB;
-    const float penNew = dot(v, normal);
-
-    const float3 projectedPoint = localAInB - normal * penOld;
-    const float3 projectedDifference = pointB - projectedPoint;
-    const float distance2d = dot(projectedDifference, projectedDifference);
+    float penNew;
+    bool lost;
+    mmRefreshMath(aToB_q, aToB_p, pointA, pointB, normal, penOld,
+                  sqProjectBreakingThreshold, penNew, lost);
 
     Ptr<float>(c + PCM_C_PEN)[0] = penNew;
 
-    return distance2d > sqProjectBreakingThreshold;
+    return lost;
 }
