@@ -1921,6 +1921,50 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83a-6 — der ABI-Pack-Prüfer bekommt Funktions-Scope, und 64 nie verglichene Zeilen werden verglichen
+
+`check_launch_abi_pack.py` löste einen Namen über den **flachen Text** der ganzen `.cpp`
+auf. Zwei Funktionen einer Datei, die denselben Namen mit verschiedenen Typen deklarieren,
+machten ihn damit an **jeder** Launch-Stelle dieser Datei unentscheidbar — auch dort, wo
+C++ längst weiß, welche der beiden Deklarationen sichtbar ist. Das ist keine Grenze der
+Daten, das ist der Auflöser, der die Antwort wegwirft.
+
+Drei Stufen jetzt:
+
+1. **die umgebende Funktion**, Parameter eingeschlossen. Ist der Name dort deklariert, ist
+   das die Antwort — eine Größe oder unentscheidbar. Bei Uneinigkeit wird *nicht*
+   erweitert: mehr Kandidaten lösen keine Mehrdeutigkeit auf.
+2. **die Übersetzungseinheit**, wie bisher, für Namen auf Dateiebene.
+3. **die Schwester-Header**, und nur wenn die ersten beiden den Namen **gar nicht** gefunden
+   haben.
+
+**Stufe 3 ist genau die, die P9.82 als Netto-Verlust gemessen hatte** — ein Kernel gewonnen,
+**sechzehn** verloren, weil ein Header eine zweite Deklaration beisteuert, die der
+Übersetzungseinheit widerspricht, und der Auflöser dann zu Recht ablehnt. Die Notiz, die dort
+stehen blieb, hat vorhergesagt, dass Funktions-Scope diese Ursache beseitigt. Sie tut es: ein
+Name, den die Funktion deklariert, erreicht Stufe 3 nie.
+
+Gemessen, getrennt nach Stufe:
+
+```
+Basis                149 entschieden, 101 unentscheidbar
++ Funktions-Scope    153 entschieden   (+4, −0)
++ Header-Stufe       213 entschieden   (+60, −0)
+```
+
+**Alle 64 neu entschiedenen Zeilen stimmen mit ihrem Launch-Pack überein.** Das ist der Teil,
+der aufgeschrieben gehört: die Erweiterung war kein Weg, die Zahl schöner zu machen, sondern
+ein Test von 64 ABI-Zeilen, die noch nie mit irgendetwas verglichen worden waren — die ganze
+PGS/TGS-Solver- und Constraint-Prep-Familie, `boxBoxNphase_Kernel`,
+`convexTrimeshNarrowphase`, `sphereTrimeshNarrowphase` und `trimeshPlaneNarrowphase`. Keine
+einzige weicht ab.
+
+Die Ratsche schrumpft **101 → 37**, und die verbleibenden 37 sind genau die dokumentierte
+Ursache: Kernel mit einer **per Wert übergebenen Struktur**, deren Größe diese Datei nicht
+kennt (`PxgFEMContactWriter`/`PxgSoftBodyContactWriter`-Schwänze), plus die
+`preIntegrate`-Familie mit ihrem `PxVec3 gravity`. Das ist die nächste echte Stufe und
+bedeutet, die Struktur zu lesen.
+
 ## P9.82a/P9.82 — die erste dynamische SDF-Mesh-Szene dieses Harness, und die Ebenen-Hälfte des Trios
 
 ### Warum es keine Szene gab

@@ -87,14 +87,46 @@
 # checker being wrong about the engine while accusing the table.
 #
 # ---------------------------------------------------------------------------
+# HOW A NAME IS RESOLVED (three tiers, P9.83a-6)
+# ---------------------------------------------------------------------------
+# Until P9.83a-6 a name was resolved over the FLAT TEXT of the whole .cpp, and
+# that threw away information C++ already has.  Two functions of one file that
+# declare the same name with different types made the name undecidable at EVERY
+# launch site in that file, including the ones where only one of the two
+# declarations is in scope.  The resolver now asks, in order:
+#
+#   1. THE ENCLOSING FUNCTION (parameters included).  If the name is declared
+#      there, that is the answer -- a single size, or undecidable if the function
+#      itself declares it twice with different sizes.  It is deliberately not
+#      widened on a disagreement: more candidates cannot resolve an ambiguity.
+#   2. THE TRANSLATION UNIT, as before, for file-scope names.
+#   3. THE SIBLING HEADERS, and only when neither of the first two found the name
+#      AT ALL.
+#
+# TIER 3 IS THE ONE THAT WAS MEASURED TO BE A NET LOSS IN P9.82 AND IS NOT NOW.
+# Widening the FLAT scan to the headers gained one kernel and lost SIXTEEN, because
+# a header contributes a second declaration of a name the translation unit also
+# declares and the resolver then correctly refuses.  Function scope removes that
+# cause: a name declared in the function never reaches tier 3 at all.  Measured
+# again after the change -- tier 1 alone: +4 decided, 0 lost; tier 3 on top of it:
+# +60 decided, 0 lost.
+#
+# ---------------------------------------------------------------------------
 # WHAT IT STILL CANNOT DECIDE
 # ---------------------------------------------------------------------------
-# 99 of the kernels with an ABI row are in KNOWN_UNDECIDED, and that is a recorded
-# blind spot, not a clean bill.  The largest cause is a struct passed BY VALUE
-# whose size this file does not know -- the contact-writer tails especially -- and
-# deciding those means reading the struct.  One cause can never be decided here at
-# all: the void** launch form carries no per-argument sizes, and the bridge reads
-# them from this very table, so there is nothing independent left to compare.
+# 149 -> 213 kernels now decide, and 37 (was 101) are in KNOWN_UNDECIDED.  That is
+# still a recorded blind spot, not a clean bill.  The largest remaining cause is a
+# struct passed BY VALUE whose size this file does not know -- the contact-writer
+# tails especially -- and deciding those means reading the struct.  One cause can
+# never be decided here at all: the void** launch form carries no per-argument
+# sizes, and the bridge reads them from this very table, so there is nothing
+# independent left to compare.
+#
+# ALL 64 NEWLY DECIDED KERNELS AGREE WITH THEIR ROWS.  That is worth stating: the
+# widening was not a way to make the number look better, it was a test of 64 rows
+# that had never been compared to anything, and every one of them passed --
+# including the whole PGS/TGS solver and constraint-prep family, boxBoxNphase,
+# convexTrimeshNarrowphase, sphereTrimeshNarrowphase and trimeshPlaneNarrowphase.
 
 import os
 import re
@@ -113,8 +145,8 @@ ENGINE_DIRS = [
 
 # Kernels whose pack this checker cannot yet decide.  RATCHET: may shrink, never
 # grow.  Being on this list is NOT a clean bill -- it is a recorded blind spot,
-# and the honest state of the tree is that 99 of the kernels with an ABI row have
-# one.
+# and the honest state of the tree is that 37 of the kernels with an ABI row have
+# one (101 before P9.83a-6 taught the resolver function scope).
 #
 # THE REASONS, in the order they will be worth attacking:
 #   * a struct passed BY VALUE whose size this table does not know (the
@@ -144,21 +176,10 @@ ENGINE_DIRS = [
 #   * a pack assembled across a branch, or an argument that is a member expression
 #     rather than a plain variable.
 KNOWN_UNDECIDED = {
-    "ZeroBodies",
-    "ZeroBodiesTGS",
-    "artiContactConstraintBlockPrepareLaunch",
-    "artiJointConstraintBlockPrepareParallelLaunch",
-    "artiSolveBlockPartition",
-    "artiTGSContactConstraintBlockPrepareLaunch",
-    "artiTGSJointConstraintBlockPrepareParallelLaunch",
-    "boxBoxNphase_Kernel",
-    "clampMaxValue",
-    "clampMaxValues",
     "cloth_SphereContactGenLaunch",
     "cloth_SphereVertexContactGenLaunch",
     "cloth_boxTriangleContactGenLaunch",
     "cloth_boxVertexContactGenLaunch",
-    "cloth_clothContactPrepareLaunch",
     "cloth_convexContactGenLaunch",
     "cloth_convexVertexContactGenLaunch",
     "cloth_heightfieldContactGenLaunch",
@@ -168,47 +189,12 @@ KNOWN_UNDECIDED = {
     "cloth_planeVertContactGenLaunch",
     "cloth_preIntegrateLaunch",
     "cloth_psContactGenLaunch",
-    "cloth_rigidContactPrepareLaunch",
     "cloth_sdfMeshContactGenLaunch",
-    "cloth_solveNonSharedTriangleEnergyClusterLaunch",
-    "cloth_solveNonSharedTriangleEnergyLaunch",
-    "cloth_solveTrianglePairEnergyClusterLaunch",
-    "cloth_solveTrianglePairEnergyLaunch",
     "cloth_stepLaunch",
-    "computeAverageSolverBodyVelocity",
-    "computeAverageSolverBodyVelocityTGS",
-    "concludeBlocks",
-    "concludeBlocksTGS",
-    "contactConstraintBlockPrepareParallelLaunch",
-    "contactConstraintBlockPrepareParallelLaunchTGS",
-    "convexCoreConvexNphase_Kernel",
-    "convexCorePlaneNphase_Kernel",
-    "convexHeightFieldMidphase",
-    "convexHeightfieldNarrowphase",
-    "convexPlaneNphase_Kernel",
-    "convexTrimeshFinishContacts",
-    "convexTrimeshNarrowphase",
-    "dmaBackChangedElems",
-    "finishContactsKernel",
-    "initStaticKinematics",
-    "initializeManifolds",
-    "initializeSolverVelocitiesTGS",
-    "integrateCoreParallelLaunch",
-    "integrateCoreParallelLaunchTGS",
-    "jointConstraintBlockPrepareParallelLaunch",
-    "jointConstraintBlockPrepareParallelLaunchTGS",
-    "markActiveSlabPGS",
-    "markActiveSlabTGS",
-    "midphaseGeneratePairs",
     "preIntegrationLaunch",
     "preIntegrationLaunchTGS",
     "prepareLostFoundPairs_Stage2",
-    "propagateAverageSolverBodyVelocityTGS",
-    "propagateSolverBodyVelocity",
-    "propagateStaticSolverBodyVelocities",
-    "propagateStaticSolverBodyVelocitiesTGS",
     "ps_diffuseParticleCompact",
-    "ps_diffuseParticleCreate",
     "ps_diffuseParticleUpdatePBF",
     "ps_heightfieldCollisonLaunch",
     "ps_meshCollisonLaunch",
@@ -216,38 +202,17 @@ KNOWN_UNDECIDED = {
     "ps_preIntegrateLaunch",
     "ps_primitivesCollisionLaunch",
     "ps_sdfMeshCollisonLaunch",
-    "ps_updateUserBufferLaunch",
-    "rigidSumInternalContactAndJointBatches1",
-    "rigidSumInternalContactAndJointBatches2",
     "sb_clothContactGenLaunch",
-    "sb_clothContactPrepareLaunch",
     "sb_clothVertContactGenLaunch",
     "sb_gm_preIntegrateLaunch",
     "sb_gm_stepSoftbodyLaunch",
     "sb_heightfieldContactGenLaunch",
-    # P9.82: eighteen of its twenty arguments resolve; mContactStream and
-    # mPatchStream are CUdeviceptr MEMBERS declared in PxgNarrowphaseCore.h, which
-    # this resolver does not read.  See the note above _sibling_headers.
-    "trimeshPlaneNarrowphase",
     "sb_meshContactGenLaunch",
     "sb_primitiveContactGenLaunch",
     "sb_psContactGenLaunch",
     "sb_sbMidphaseGeneratePairsLaunch",
     "sb_sdfMeshMidphaseGeneratePairsLaunch",
     "sb_selfCollisionMidphaseGeneratePairsLaunch",
-    "sb_softbodyContactPrepareLaunch",
-    "solveBlockPartition",
-    "solveBlockUnified",
-    "solveStaticBlock",
-    "solveStaticBlockTGS",
-    "solveWholeIslandTGS",
-    "sphereHeightfieldNarrowphase",
-    "sphereNphase_Kernel",
-    "sphereTrimeshNarrowphase",
-    "writeBackBodies",
-    "writeBackBodiesTGS",
-    "writebackBlocks",
-    "writebackBlocksTGS",
 }
 
 
@@ -359,11 +324,113 @@ def engine_sources():
 
 
 DECL_CACHE = {}
+SPAN_CACHE = {}
+
+
+def _masked(src):
+    """`src` with comments and string/char literals replaced by spaces of the same
+    length, so brace counting sees only real braces.  Length is preserved because
+    every offset computed on this copy indexes the ORIGINAL."""
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif c in "\"'":
+            q, j = c, i + 1
+            while j < n and src[j] != q:
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def function_span(src, pos, cache_key):
+    """(start, end) of the OUTERMOST brace block containing `pos` -- i.e. the body of
+    the function the launch site sits in -- or None when `pos` is at file scope.
+
+    WHY FUNCTION SCOPE (P9.83a-6, and predicted by the note below since P9.82).
+    declared_size used to resolve a name over the flat text of the whole .cpp.  Two
+    functions of one file that declare the same name with different types then made
+    the name undecidable EVERYWHERE, even at a launch site where only one of the two
+    declarations is in scope.  That is not a limitation of the data -- C++ already
+    says which declaration wins -- it is the resolver throwing the answer away.
+
+    The span is the outermost block because a launch site inside an `if` or a `for`
+    still sees the enclosing function's locals; taking the innermost block would
+    resolve nothing.  Parameters are picked up too: `start` is the body's opening
+    brace, and the parameter list sits just before it, so the search text begins at
+    the previous `)`'s matching `(`."""
+    key = (cache_key, pos)
+    if key in SPAN_CACHE:
+        return SPAN_CACHE[key]
+    mask = _masked(src)
+    # walk back from pos, tracking depth, to the brace that opens the block at depth 1
+    depth, i, opens = 0, pos, []
+    while i > 0:
+        i -= 1
+        c = mask[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                opens.append(i)
+            else:
+                depth -= 1
+    if not opens:
+        SPAN_CACHE[key] = None
+        return None
+    start = opens[-1]                      # the OUTERMOST open brace still containing pos
+    # its matching close
+    depth, j = 0, start
+    n = len(mask)
+    while j < n:
+        if mask[j] == "{":
+            depth += 1
+        elif mask[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    end = min(j + 1, n)
+    # widen backwards over the parameter list so a parameter counts as a declaration
+    k = src.rfind(")", 0, start)
+    if k > 0:
+        depth2, t = 0, k
+        while t >= 0:
+            if mask[t] == ")":
+                depth2 += 1
+            elif mask[t] == "(":
+                depth2 -= 1
+                if depth2 == 0:
+                    break
+            t -= 1
+        if t >= 0 and start - t < 4000:
+            start = t
+    res = (start, end)
+    SPAN_CACHE[key] = res
+    return res
 
 
 # WIDENING THE DECLARATION SEARCH TO THE SIBLING HEADERS WAS TRIED AND MEASURED
-# TO BE A NET LOSS, so it is not here -- written down because it is the obvious
-# next idea and it costs an afternoon to re-discover.
+# TO BE A NET LOSS -- AND P9.83a-6 FIXED THE CAUSE AND PUT IT BACK AS TIER 3.
+# The paragraph below is the P9.82 measurement, kept because it is the reason the
+# widening is a THIRD tier rather than a wider flat scan.
 #
 # P9.82 needed it for trimeshPlaneNarrowphase: eighteen of its twenty pushed
 # arguments resolve and the two that do not are `mContactStream` and
@@ -376,9 +443,40 @@ DECL_CACHE = {}
 # One kernel gained, sixteen lost.  The real fix is the same one P9.81 measured for
 # the by-value writers: resolve a name in the ENCLOSING FUNCTION (or class) rather
 # than over a flat text, at which point both causes go away together.
+#
+# THEY DID.  P9.83a-6 implemented function scope and re-measured: the sixteen
+# losses do not happen, because a name the translation unit declares never reaches
+# the header tier.  trimeshPlaneNarrowphase -- the kernel that motivated the
+# attempt -- is among the 60 the header tier now decides.
 
 
-def declared_size(src, var, cache_key=None):
+HEADER_CACHE = {}
+
+
+def sibling_headers(path):
+    """The .h files of the same module as `path` (src/foo.cpp -> include/*.h and
+    src/*.h).  Returns [] when `path` is None -- the resolver is then being called
+    without a translation unit and has nothing to widen to."""
+    if not path:
+        return []
+    if path in HEADER_CACHE:
+        return HEADER_CACHE[path]
+    d = os.path.dirname(os.path.abspath(path))
+    roots = [d]
+    if os.path.basename(d) == "src":
+        roots.append(os.path.join(os.path.dirname(d), "include"))
+    out = []
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for fn in sorted(os.listdir(r)):
+            if fn.endswith(".h"):
+                out.append(os.path.join(r, fn))
+    HEADER_CACHE[path] = out
+    return out
+
+
+def declared_size(src, var, cache_key=None, pos=None):
     """The SIZE of `var` in this translation unit, or None when undecidable.
 
     IT RESOLVES TO A SIZE, NOT TO A TYPE, AND THAT DISTINCTION IS THE WHOLE
@@ -397,22 +495,70 @@ def declared_size(src, var, cache_key=None):
     # translation unit.  P9.82 hit it for real -- mContactStream resolves to 8 when
     # declared_size is called directly and came back None inside the sweep -- which
     # is a wrong answer, not merely a missing one.  The caller passes its path.
-    key = (cache_key if cache_key is not None else id(src), var)
+    span = function_span(src, pos, cache_key) if pos is not None else None
+    key = (cache_key if cache_key is not None else id(src), var, span)
     if key in DECL_CACHE:
         return DECL_CACHE[key]
-    sizes = set()
-    unresolved = False
-    for m in re.finditer(r"(?:^|[;{}\(,])\s*((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*[*&]?)\s+"
-                         + re.escape(var) + r"\s*(?:=|;|\)|,|\[)", src, re.M):
-        t = m.group(1).strip()
-        if t.split()[-1] in ("return", "else", "case", "new", "delete"):
+
+    def scan(text):
+        """(sizes seen, whether any declaration had an unresolvable type)"""
+        sizes, unresolved = set(), False
+        for m in re.finditer(r"(?:^|[;{}\(,])\s*((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*[*&]?)\s+"
+                             + re.escape(var) + r"\s*(?:=|;|\)|,|\[)", text, re.M):
+        # NOTE the leading-delimiter class: it is what keeps `foo(bar, baz)` from
+        # reading `bar` as a declaration of type `foo(`.
+            t = m.group(1).strip()
+            if t.split()[-1] in ("return", "else", "case", "new", "delete"):
+                continue
+            sz = arg_size(t)
+            if sz is None:
+                unresolved = True
+            else:
+                sizes.add(sz)
+        return sizes, unresolved
+
+    res = None
+    if span is not None:
+        sizes, unresolved = scan(src[span[0]:span[1]])
+        if sizes or unresolved:
+            # THE NAME IS DECLARED IN THIS FUNCTION, so this is the answer -- right or
+            # undecidable.  It is deliberately NOT widened to file scope on a
+            # disagreement: a name declared twice in one function body really is
+            # ambiguous to this resolver, and widening would only add more candidates.
+            res = sizes.pop() if (len(sizes) == 1 and not unresolved) else None
+            DECL_CACHE[key] = res
+            return res
+        # not declared in the function at all -> a member or a file-scope name,
+        # so fall through to the flat scan, which is what this resolver always did.
+    sizes, unresolved = scan(src)
+    if sizes or unresolved:
+        res = sizes.pop() if (len(sizes) == 1 and not unresolved) else None
+        DECL_CACHE[key] = res
+        return res
+
+    # TIER 3: THE SIBLING HEADERS, and only where the first two tiers found NOTHING.
+    #
+    # P9.82 tried widening the flat scan to the sibling include/*.h and measured a
+    # NET LOSS -- one kernel gained, SIXTEEN lost -- because a header contributes a
+    # second declaration of a name that the translation unit also declares, and
+    # declared_size then correctly refuses.  The note that stood here predicted that
+    # function scope would remove that cause, and it does: a name declared in the
+    # function never reaches this point, so the header can no longer contradict it.
+    #
+    # The tier is therefore strictly monotone by construction.  It runs ONLY when
+    # neither the function nor the translation unit declares the name at all, which
+    # is exactly the CUdeviceptr-member case (mContactStream, mPatchStream) the
+    # earlier attempt was after.  Measured: it may gain, it cannot lose.
+    hsizes, hunresolved = set(), False
+    for h in sibling_headers(cache_key):
+        try:
+            htext = open(h, errors="replace").read()
+        except OSError:
             continue
-        s = arg_size(t)
-        if s is None:
-            unresolved = True
-        else:
-            sizes.add(s)
-    res = sizes.pop() if (len(sizes) == 1 and not unresolved) else None
+        hs, hu = scan(htext)
+        hsizes |= hs
+        hunresolved = hunresolved or hu
+    res = hsizes.pop() if (len(hsizes) == 1 and not hunresolved) else None
     DECL_CACHE[key] = res
     return res
 
@@ -495,7 +641,7 @@ def launch_packs(ids):
                 if not re.match(r"^\w+$", a):
                     sizes = None
                     break
-                sz = declared_size(src, a, path)
+                sz = declared_size(src, a, path, hm.start())
                 if sz is None:
                     sizes = None
                     break
