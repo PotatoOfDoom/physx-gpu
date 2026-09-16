@@ -763,19 +763,31 @@ PXG_TEST(triTriOverlapEngineAbi)
     // x-offset given to the FIRST body of the pair; the boxes are at most ~3
     // units across after scaling, so 0.3 overlaps and 14 is far outside any
     // contact distance.
-    struct PairDef { uint32_t s0, s1, tc0, tc1; float sep; bool wantOverlap; };
+    //
+    // PAIR 5 IS THE `CLOSE` PAIR, AND IT IS THERE BECAUSE A MUTANT SURVIVED.
+    // The CUDA stores `overlaps[i] = (result != eDISTANT)`, so GJK_CLOSE -- the
+    // boxes do NOT intersect but sit within contactDistance of each other --
+    // counts as an overlap.  The first sweep replaced that with
+    // `result == GJK_OVERLAP` and nothing noticed: every true pair here was a
+    // deep intersection and every false one was far outside any contact
+    // distance, so the CLOSE band, which is the whole reason contactDistance is
+    // passed to the GJK at all, was never entered.  Pair 5 enters it with a wide
+    // contact distance and a real gap, and the mirror's verdict is asserted to
+    // be exactly GJK_CLOSE below -- an observable that is also true under the
+    // null hypothesis measures nothing.
+    struct PairDef { uint32_t s0, s1, tc0, tc1; float sep; bool wantOverlap; bool wantClose; };
     const PairDef pdef[11] = {
-        { 0, 1,  0,  1,  0.30f, true  },
-        { 1, 2,  2,  3, 14.00f, false },
-        { 2, 3,  4,  5, 15.50f, false },
-        { 3, 4,  6,  7,  0.10f, true  },
-        { 4, 5,  8,  9, 16.25f, false },
-        { 5, 6, 10, 11,  0.45f, true  },
-        { 6, 7, 12, 13,  0.20f, true  },
-        { 7, 0, 14, 15, 17.00f, false },
-        { 0, 3, 16, 17,  0.05f, true  },
-        { 3, 6, 18, 19, 18.50f, false },
-        { 6, 1, 20, 21,  0.35f, true  },
+        { 0, 1,  0,  1,  0.30f, true,  false },
+        { 1, 2,  2,  3, 14.00f, false, false },
+        { 2, 3,  4,  5, 15.50f, false, false },
+        { 3, 4,  6,  7,  0.10f, true,  false },
+        { 4, 5,  8,  9, 16.25f, false, false },
+        { 5, 6, 10, 11,  2.60f, true,  true  },   // separated, but inside a wide contactDistance
+        { 6, 7, 12, 13,  0.20f, true,  false },
+        { 7, 0, 14, 15, 17.00f, false, false },
+        { 0, 3, 16, 17,  0.05f, true,  false },
+        { 3, 6, 18, 19, 18.50f, false, false },
+        { 6, 1, 20, 21,  0.35f, true,  false },
     };
     const uint32_t N = 11;
 
@@ -806,8 +818,8 @@ PXG_TEST(triTriOverlapEngineAbi)
         // cd[ref0] or only cd[ref1] gets a different minSep.  They are small
         // beside the separations above, so they never flip a decision by
         // themselves -- they are checked by the bit-exact lowerBound comparison.
-        cdist[d.tc0] = 0.010f + 0.003f * float(i);
-        cdist[d.tc1] = 0.070f + 0.005f * float(i);
+        cdist[d.tc0] = d.wantClose ? 0.90f : (0.010f + 0.003f * float(i));
+        cdist[d.tc1] = d.wantClose ? 0.70f : (0.070f + 0.005f * float(i));
     }
 
     std::vector<CmInput> cms(N);
@@ -817,8 +829,10 @@ PXG_TEST(triTriOverlapEngineAbi)
     // ---- the host mirror: build each pair's TtoIn the way the kernel's blob
     //      walk must, then run the SAME refPrep/gjkRef the test above uses ----
     std::vector<uint8_t> want(N, 0);
+    std::vector<uint32_t> gotRet(N, 0);
+    std::vector<float> gotLower(N, 0.f), gotMinSep(N, 0.f);
     std::vector<float> refVA(size_t(N) * 8 * 4, 0.f), refVB(size_t(N) * 8 * 4, 0.f);
-    size_t nMarginal = 0, nTrue = 0, nFalse = 0;
+    size_t nMarginal = 0, nTrue = 0, nFalse = 0, nClose = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         const PairDef& d = pdef[i];
@@ -846,8 +860,12 @@ PXG_TEST(triTriOverlapEngineAbi)
         refPrep(s, &refVA[size_t(i) * 32], &refVB[size_t(i) * 32], gin);
         const GjkOut o = gjkRef(gin, refVA, refVB, i * 8);
         want[i] = (o.ret != GJK_DISTANT) ? 1u : 0u;
+        gotRet[i] = o.ret;
+        gotLower[i] = o.lowerBound;
+        gotMinSep[i] = gin.params[0];
         if (o.ret != GJK_OVERLAP && std::fabs(o.lowerBound - gin.params[0]) < 1e-3f) ++nMarginal;
         if (want[i]) ++nTrue; else ++nFalse;
+        if (o.ret == GJK_CLOSE) ++nClose;
     }
     // THE PATTERN IS PART OF THE FIXTURE, NOT AN OBSERVATION OF IT.  If the
     // hand-picked separations stop producing it -- because a constant moved, or
@@ -858,6 +876,14 @@ PXG_TEST(triTriOverlapEngineAbi)
                       "triTriOverlapEngineAbi: pair %u was meant to be %s and the CPU mirror says %s -- "
                       "the separation no longer produces the designed byte pattern",
                       i, pdef[i].wantOverlap ? "overlapping" : "distant", want[i] ? "overlapping" : "distant");
+    for (uint32_t i = 0; i < N; ++i)
+        PXG_CHECK_MSG(!pdef[i].wantClose || gotRet[i] == GJK_CLOSE,
+                      "triTriOverlapEngineAbi: pair %u is the CLOSE-band observable and the CPU mirror "
+                      "returned %u (0 distant, 1 close, 2 overlap) with lowerBound %.6f against minSep "
+                      "%.6f -- without a CLOSE pair the != eDISTANT test is indistinguishable from "
+                      "== eOVERLAP",
+                      i, gotRet[i], double(gotLower[i]), double(gotMinSep[i]));
+    PXG_CHECK_MSG(nClose >= 1, "triTriOverlapEngineAbi: no pair reaches GJK_CLOSE");
     PXG_CHECK_MSG(nMarginal == 0, "triTriOverlapEngineAbi: %zu pair(s) sit on the DISTANT boundary", nMarginal);
     PXG_CHECK_MSG(nTrue >= 4 && nFalse >= 4,
                   "triTriOverlapEngineAbi: coverage thin (%zu overlapping, %zu distant)", nTrue, nFalse);
