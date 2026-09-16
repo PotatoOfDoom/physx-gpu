@@ -711,15 +711,33 @@ PXG_TEST(triTriOverlapEngineAbi)
     // 1 exercises the single-slot fold (where the seed IS the answer), 32 the
     // full one (where no slot is poison and the mask can only be wrong low), and
     // 3 / 7 the ordinary case with live poison above them.
-    MeshBlob mesh[4];
+    //
+    // MESHES 4 AND 5 EXIST BECAUSE FOUR MUTANTS SURVIVED THE FIRST SWEEP.
+    // `shape1 = shapes[shapeRef0]`, `b1 = meshRootBox(shape0)` and swapping the
+    // two transforms all passed, because meshes 0..3 are four boxes of roughly
+    // the same size, symmetric about their origins, and every pair was either a
+    // deep intersection or fourteen units apart.  Under those conditions a
+    // per-pair BOOLEAN cannot tell the two operands apart at all.
+    //
+    // Mesh 4 is a near-point and mesh 5 is a slab that extends only in +x from
+    // its origin.  Pair 11 puts the point at x = 1.9 and the slab's origin at
+    // x = 0, and the asymmetry does the work:
+    //   correct        the point sits inside the slab's [0, 4] reach   -> TRUE
+    //   both operands the point twice, 1.9 apart                       -> FALSE
+    //   both meshes    same                                            -> FALSE
+    //   swapped poses  point at 0, slab now reaching [1.9, 5.9]        -> FALSE
+    // One pair, three mutants, and none of them needs a tolerance.
+    MeshBlob mesh[6];
     buildMeshBlob(mesh[0], 1, V3{ -1.0f, -0.8f, -1.2f }, V3{ 1.0f, 0.9f, 1.1f });
     buildMeshBlob(mesh[1], 3, V3{ -0.6f, -1.4f, -0.5f }, V3{ 1.3f, 0.7f, 1.5f });
     buildMeshBlob(mesh[2], 7, V3{ -1.1f, -0.9f, -1.0f }, V3{ 0.8f, 1.2f, 0.6f });
     buildMeshBlob(mesh[3], 32, V3{ -0.7f, -0.7f, -1.3f }, V3{ 1.4f, 1.1f, 0.9f });
+    buildMeshBlob(mesh[4], 2, V3{ -0.05f, -0.05f, -0.05f }, V3{ 0.05f, 0.05f, 0.05f });
+    buildMeshBlob(mesh[5], 4, V3{ 0.0f, -0.05f, -0.05f }, V3{ 4.0f, 0.05f, 0.05f });
 
-    PxgBufferHandle bMesh[4];
-    uint64_t meshAddr[4];
-    for (int i = 0; i < 4; ++i)
+    PxgBufferHandle bMesh[6];
+    uint64_t meshAddr[6];
+    for (int i = 0; i < 6; ++i)
     {
         bMesh[i] = createBufferFrom(dev, mesh[i].bytes);
         meshAddr[i] = dev->getBufferDeviceAddress(bMesh[i]);
@@ -733,9 +751,9 @@ PXG_TEST(triTriOverlapEngineAbi)
         (&q.x)[axis] = std::sin(a * 0.5f);
         return q;
     };
-    std::vector<GpuShape> shapes(8);
+    std::vector<GpuShape> shapes(10);
     struct ShapeDef { int mesh; V3 scale; int axis; float ang; };
-    const ShapeDef sdef[8] = {
+    const ShapeDef sdef[10] = {
         { 0, { 1.0f, 1.0f, 1.0f }, 0, 0.0f },      // identity scale rotation: the trivial case, kept once
         { 1, { 1.4f, 0.7f, 1.1f }, 0, 0.85f },
         { 2, { 0.6f, 1.3f, 0.9f }, 1, 1.20f },
@@ -744,8 +762,12 @@ PXG_TEST(triTriOverlapEngineAbi)
         { 1, { 1.2f, 0.9f, 1.4f }, 2, 1.05f },
         { 2, { 1.0f, 0.6f, 0.8f }, 0, 0.30f },
         { 3, { 0.9f, 1.2f, 1.0f }, 1, 0.95f },
+        // 8 and 9 are the asymmetry pair: unit scale and an identity scale
+        // rotation, so their whole difference is the MESH behind them.
+        { 4, { 1.0f, 1.0f, 1.0f }, 0, 0.0f },   // the near-point
+        { 5, { 1.0f, 1.0f, 1.0f }, 0, 0.0f },   // the +x slab
     };
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 10; ++i)
     {
         const ShapeDef& d = sdef[i];
         const F4 q = axisQuat(d.axis, d.ang);
@@ -775,34 +797,57 @@ PXG_TEST(triTriOverlapEngineAbi)
     // contact distance and a real gap, and the mirror's verdict is asserted to
     // be exactly GJK_CLOSE below -- an observable that is also true under the
     // null hypothesis measures nothing.
-    struct PairDef { uint32_t s0, s1, tc0, tc1; float sep; bool wantOverlap; bool wantClose; };
-    const PairDef pdef[11] = {
-        { 0, 1,  0,  1,  0.30f, true,  false },
-        { 1, 2,  2,  3, 14.00f, false, false },
-        { 2, 3,  4,  5, 15.50f, false, false },
-        { 3, 4,  6,  7,  0.10f, true,  false },
-        { 4, 5,  8,  9, 16.25f, false, false },
-        { 5, 6, 10, 11,  2.60f, true,  true  },   // separated, but inside a wide contactDistance
-        { 6, 7, 12, 13,  0.20f, true,  false },
-        { 7, 0, 14, 15, 17.00f, false, false },
-        { 0, 3, 16, 17,  0.05f, true,  false },
-        { 3, 6, 18, 19, 18.50f, false, false },
-        { 6, 1, 20, 21,  0.35f, true,  false },
+    //
+    // PAIRS 12 AND 13 EXIST FOR THE SAME REASON AS 11.  `cd[ref0] + cd[ref0]`
+    // survived the first sweep because every contact distance in the fixture was
+    // a few hundredths against gaps of zero or fourteen.  Each of the two now
+    // carries ONE large half and one tiny one, with a gap that sits between the
+    // doubled small half and the true sum -- 12 catches a kernel that reads only
+    // slot 0, 13 one that reads only slot 1.  The pair has to exist twice
+    // because one asymmetry only constrains one direction.
+    //
+    // `cd0`/`cd1` of zero mean "use the per-index default".  `identityPose` gives
+    // a pair the identity rotation on both bodies, which pair 11 needs: its whole
+    // argument is about WHERE each box sits, and a rotation would smear that.
+    struct PairDef
+    {
+        uint32_t s0, s1, tc0, tc1;
+        float sep;
+        bool wantOverlap;
+        bool wantClose;
+        bool identityPose;
+        float cd0, cd1;
     };
-    const uint32_t N = 11;
+    const PairDef pdef[14] = {
+        { 0, 1,  0,  1,  0.30f, true,  false, false, 0.0f,  0.0f  },
+        { 1, 2,  2,  3, 14.00f, false, false, false, 0.0f,  0.0f  },
+        { 2, 3,  4,  5, 15.50f, false, false, false, 0.0f,  0.0f  },
+        { 3, 4,  6,  7,  0.10f, true,  false, false, 0.0f,  0.0f  },
+        { 4, 5,  8,  9, 16.25f, false, false, false, 0.0f,  0.0f  },
+        { 5, 6, 10, 11,  2.60f, true,  true,  false, 0.90f, 0.70f },  // the CLOSE band
+        { 6, 7, 12, 13,  0.20f, true,  false, false, 0.0f,  0.0f  },
+        { 7, 0, 14, 15, 17.00f, false, false, false, 0.0f,  0.0f  },
+        { 0, 3, 16, 17,  0.05f, true,  false, false, 0.0f,  0.0f  },
+        { 3, 6, 18, 19, 18.50f, false, false, false, 0.0f,  0.0f  },
+        { 6, 1, 20, 21,  0.35f, true,  false, false, 0.0f,  0.0f  },
+        { 8, 9, 22, 23,  1.90f, true,  false, true,  0.0f,  0.0f  },  // operand asymmetry
+        { 0, 1, 24, 25,  3.00f, true,  true,  false, 0.05f, 1.20f },  // cd asymmetry, slot 0 small
+        { 0, 1, 26, 27,  3.00f, true,  true,  false, 1.20f, 0.05f },  // cd asymmetry, slot 1 small
+    };
+    const uint32_t N = 14;
 
     // ---- transforms: 22 entries, every one of them ROTATED ----------------
     // aToB is conj(q1)*q0 with rotInv(q1, p0 - p1); with q1 the identity the
     // conjugate is a no-op and the translation needs no rotating, so three
     // separate mistakes would become invisible.
-    std::vector<float> xf(22 * 8, 0.0f);
-    std::vector<float> cdist(22, 0.0f);
+    std::vector<float> xf(28 * 8, 0.0f);
+    std::vector<float> cdist(28, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
         const PairDef& d = pdef[i];
         const float a0 = 0.23f + 0.31f * float(i), a1 = -0.41f + 0.17f * float(i);
-        const F4 q0 = axisQuat(int(i % 3), a0);
-        const F4 q1 = axisQuat(int((i + 1) % 3), a1);
+        const F4 q0 = d.identityPose ? F4{ 0, 0, 0, 1 } : axisQuat(int(i % 3), a0);
+        const F4 q1 = d.identityPose ? F4{ 0, 0, 0, 1 } : axisQuat(int((i + 1) % 3), a1);
         float* r0 = xf.data() + size_t(d.tc0) * 8;
         float* r1 = xf.data() + size_t(d.tc1) * 8;
         r0[0] = q0.x; r0[1] = q0.y; r0[2] = q0.z; r0[3] = q0.w;
@@ -811,15 +856,16 @@ PXG_TEST(triTriOverlapEngineAbi)
         // 1.2 by pair 10 and pushed a pair meant to overlap apart on their own,
         // which the intent check below caught.  `sep` is the only thing that is
         // supposed to decide a flag.
-        r0[4] = d.sep; r0[5] = 0.04f * float(i); r0[6] = -0.03f * float(i);
+        const float jitter = d.identityPose ? 0.0f : 1.0f;
+        r0[4] = d.sep; r0[5] = jitter * 0.04f * float(i); r0[6] = jitter * -0.03f * float(i);
         r1[0] = q1.x; r1[1] = q1.y; r1[2] = q1.z; r1[3] = q1.w;
-        r1[4] = 0.0f; r1[5] = -0.03f * float(i); r1[6] = 0.02f * float(i);
+        r1[4] = 0.0f; r1[5] = jitter * -0.03f * float(i); r1[6] = jitter * 0.02f * float(i);
         // BOTH halves of the sum, and deliberately unequal: a kernel reading only
         // cd[ref0] or only cd[ref1] gets a different minSep.  They are small
         // beside the separations above, so they never flip a decision by
         // themselves -- they are checked by the bit-exact lowerBound comparison.
-        cdist[d.tc0] = d.wantClose ? 0.90f : (0.010f + 0.003f * float(i));
-        cdist[d.tc1] = d.wantClose ? 0.70f : (0.070f + 0.005f * float(i));
+        cdist[d.tc0] = d.cd0 > 0.0f ? d.cd0 : (0.010f + 0.003f * float(i));
+        cdist[d.tc1] = d.cd1 > 0.0f ? d.cd1 : (0.070f + 0.005f * float(i));
     }
 
     std::vector<CmInput> cms(N);
@@ -884,6 +930,21 @@ PXG_TEST(triTriOverlapEngineAbi)
                       "== eOVERLAP",
                       i, gotRet[i], double(gotLower[i]), double(gotMinSep[i]));
     PXG_CHECK_MSG(nClose >= 1, "triTriOverlapEngineAbi: no pair reaches GJK_CLOSE");
+    // The cd-asymmetry pairs only measure anything while the gap sits STRICTLY
+    // between the doubled small half and the true sum.  Outside that window both
+    // spellings agree and the pair silently stops testing the sum.
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (!(pdef[i].cd0 > 0.0f && pdef[i].cd1 > 0.0f) || pdef[i].identityPose) continue;
+        const float small = std::fmin(pdef[i].cd0, pdef[i].cd1);
+        const float sum = pdef[i].cd0 + pdef[i].cd1;
+        if (!(small * 2.0f < sum * 0.5f)) continue;   // pair 5 is the CLOSE pair, not an asymmetry one
+        PXG_CHECK_MSG(gotLower[i] > small * 2.0f && gotLower[i] < sum,
+                      "triTriOverlapEngineAbi: pair %u is a contact-distance asymmetry pair and its gap "
+                      "%.6f is outside (%.6f, %.6f) -- a kernel reading only one half of the sum would "
+                      "still get the same flag",
+                      i, double(gotLower[i]), double(small * 2.0f), double(sum));
+    }
     PXG_CHECK_MSG(nMarginal == 0, "triTriOverlapEngineAbi: %zu pair(s) sit on the DISTANT boundary", nMarginal);
     PXG_CHECK_MSG(nTrue >= 4 && nFalse >= 4,
                   "triTriOverlapEngineAbi: coverage thin (%zu overlapping, %zu distant)", nTrue, nFalse);
