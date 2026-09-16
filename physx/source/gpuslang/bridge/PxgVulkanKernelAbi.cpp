@@ -741,6 +741,20 @@ static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8,
 // check_launch_abi.py was written to catch, which is why this gets its own row.
 static const uint8_t kSbHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
 
+// gpunarrowphase rigid TRIMESH-vs-PLANE narrowphase (P9.82):
+//   trimeshPlaneNarrowphase(PxReal toleranceLength, cmInputs*, cmOutputs*, shapes*,
+//   transformCache*, contactDistance*, materials*, multiManifold*, contactStream*,
+//   patchStream*, patchAndContactCounters*, touchChangeFlags*, patchChangeFlags*,
+//   startContactPatches*, startContactPoints*, startContactForces*,
+//   PxU32 patchBytesLimit, PxU32 contactBytesLimit, PxU32 forceBytesLimit,
+//   PxReal clusterBias) -- launch site PxgNarrowphaseCore.cpp:1236.
+//
+// Its HEIGHTFIELD sibling thirty lines later does NOT share this row and must not
+// be given it: that pack passes numTests where the kernel declares toleranceLength
+// and permutes four of its pointer slots (see engine_reachable_unmapped.txt).  The
+// plane pack is the one that matches its kernel.
+static const uint8_t kTriPlaneCore[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
+
 // gpunarrowphase softbody-vs-HEIGHTFIELD midphase (P8.11 step 1):
 //   sb_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems, PxReal toleranceLength,
 //   cmInputs*, transformCache*, contactDistance*, gpuShapes*, softbodies*,
@@ -2088,6 +2102,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_meshMidphaseGeneratePairsLaunch", kSbMeshMidphase, uint32_t(sizeof(kSbMeshMidphase)) },
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
     { "sb_heightfieldContactGenLaunch", kSbHfContactGen, uint32_t(sizeof(kSbHfContactGen)) },
+    { "trimeshPlaneNarrowphase", kTriPlaneCore, uint32_t(sizeof(kTriPlaneCore)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
     // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)

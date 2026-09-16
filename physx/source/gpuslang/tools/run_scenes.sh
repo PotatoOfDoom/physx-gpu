@@ -186,6 +186,11 @@ if [ "${1:-}" = "--diagnostics" ]; then
     #   sdfBoxOnPlane  5.0000 -> -73.8070 (rest 0.500)   trimeshPlaneNarrowphase  183x SKIPPED
     #   sdfBoxOnMesh   5.0000 -> -73.8070 (rest 2.500)   triangleTriangleOverlaps  10x SKIPPED
     #                                                    triangleTriangleCollision 10x SKIPPED
+    # P9.82 mapped the PLANE half, and the scene now reads the third row of its own
+    # table -- "tri-tri missing", which is what it was built to be able to say:
+    #   sdfBoxOnPlane  5.0000 -> 0.5000 (rest 0.500)  CAUGHT
+    #   sdfBoxOnMesh   5.0000 -> 0.5000 (rest 2.500)  falls THROUGH the raised mesh
+    #                                                 and lands on the plane instead
     # TWO bodies, because a plane is infinite: one over the plane alone and one over a
     # static mesh raised to y = 2, so each kernel family has its own resting height and a
     # single number cannot be credited to the wrong one.

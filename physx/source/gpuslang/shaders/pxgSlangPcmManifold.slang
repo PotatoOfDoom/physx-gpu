@@ -122,9 +122,19 @@ public static const uint64_t PCM_C_PEN    = 36UL;
 // A float3 read from a NON-16-aligned address: three scalar loads, never a
 // Ptr<float3>, because the underlying float3 straddles the 16-byte grid inside
 // a 48-byte PxgContact.
-float3 loadF3(uint64_t a)
+public float3 loadF3(uint64_t a)
 {
     return float3(Ptr<float>(a)[0], Ptr<float>(a + 4UL)[0], Ptr<float>(a + 8UL)[0]);
+}
+
+// The write side, added in P9.82 for the PCM STORE: the only caller that fills a
+// manifold rather than refreshing one.  Scalar for the same reason loadF3 is --
+// the float3 straddles the 16-byte grid inside a 48-byte PxgContact.
+public void storeF3(uint64_t a, float3 v)
+{
+    Ptr<float>(a)[0] = v.x;
+    Ptr<float>(a + 4UL)[0] = v.y;
+    Ptr<float>(a + 8UL)[0] = v.z;
 }
 
 // ---------------------------------------------------------------------------

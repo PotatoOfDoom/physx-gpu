@@ -106,7 +106,12 @@ triangleTriangleOverlaps
 # ONE instance does not justify teaching the checker a DEAD_BUCKET test; a second
 # instance would, and the same standing rule already governs DEAD_OWNER.
 trimeshHeightfieldNarrowphase
-trimeshPlaneNarrowphase
+# trimeshPlaneNarrowphase -- MAPPED in P9.82 (triPlaneNpBda.spv), and DRIVEN, by
+# PXG_SCENE=sdfmesh -- the first scene in this harness to cook a triangle mesh with
+# an SDF and therefore the first that can put one on a non-kinematic rigid body at
+# all.  The kernel is ASSEMBLY, not a new transcription: Phase 1 had already
+# certified the whole algorithm bit-exactly in npTriPlaneNp.slang, so P9.82 moved
+# the shared parts into pxgSlangTriPlane / pxgSlangNpPatchTail and composed them.
 
 # PxgSoftBodyCore.cpp (4)
 sb_copyOrApplySoftBodyDataDEPRECATED

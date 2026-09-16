@@ -225,6 +225,10 @@ KNOWN_UNDECIDED = {
     "sb_gm_preIntegrateLaunch",
     "sb_gm_stepSoftbodyLaunch",
     "sb_heightfieldContactGenLaunch",
+    # P9.82: eighteen of its twenty arguments resolve; mContactStream and
+    # mPatchStream are CUdeviceptr MEMBERS declared in PxgNarrowphaseCore.h, which
+    # this resolver does not read.  See the note above _sibling_headers.
+    "trimeshPlaneNarrowphase",
     "sb_meshContactGenLaunch",
     "sb_primitiveContactGenLaunch",
     "sb_psContactGenLaunch",
@@ -357,7 +361,24 @@ def engine_sources():
 DECL_CACHE = {}
 
 
-def declared_size(src, var):
+# WIDENING THE DECLARATION SEARCH TO THE SIBLING HEADERS WAS TRIED AND MEASURED
+# TO BE A NET LOSS, so it is not here -- written down because it is the obvious
+# next idea and it costs an afternoon to re-discover.
+#
+# P9.82 needed it for trimeshPlaneNarrowphase: eighteen of its twenty pushed
+# arguments resolve and the two that do not are `mContactStream` and
+# `mPatchStream`, CUdeviceptr MEMBERS declared in PxgNarrowphaseCore.h, which this
+# resolver never reads.  Appending each .cpp's sibling include/*.h does resolve
+# them -- and turns SIXTEEN previously decided kernels UNDECIDED, because the
+# headers contribute a second declaration of some name that disagrees with the
+# one in the translation unit and declared_size then correctly refuses.
+#
+# One kernel gained, sixteen lost.  The real fix is the same one P9.81 measured for
+# the by-value writers: resolve a name in the ENCLOSING FUNCTION (or class) rather
+# than over a flat text, at which point both causes go away together.
+
+
+def declared_size(src, var, cache_key=None):
     """The SIZE of `var` in this translation unit, or None when undecidable.
 
     IT RESOLVES TO A SIZE, NOT TO A TYPE, AND THAT DISTINCTION IS THE WHOLE
@@ -369,7 +390,14 @@ def declared_size(src, var):
     ever needed: when every declaration of a name agrees on a size, that size is
     the answer no matter how the declarations are spelled.  Disagreement stays
     undecidable, which is the case that must never silently pass."""
-    key = (id(src), var)
+    # *** THE KEY IS THE CALLER'S, NOT id(src). ***  This cache was keyed on
+    # `id(src)`, which is only unique while that string OBJECT is alive: the caller
+    # reads one file per iteration into the same local, so a freed text can hand its
+    # address to the next file's and a cached answer then belongs to the wrong
+    # translation unit.  P9.82 hit it for real -- mContactStream resolves to 8 when
+    # declared_size is called directly and came back None inside the sweep -- which
+    # is a wrong answer, not merely a missing one.  The caller passes its path.
+    key = (cache_key if cache_key is not None else id(src), var)
     if key in DECL_CACHE:
         return DECL_CACHE[key]
     sizes = set()
@@ -467,7 +495,7 @@ def launch_packs(ids):
                 if not re.match(r"^\w+$", a):
                     sizes = None
                     break
-                sz = declared_size(src, a)
+                sz = declared_size(src, a, path)
                 if sz is None:
                     sizes = None
                     break
