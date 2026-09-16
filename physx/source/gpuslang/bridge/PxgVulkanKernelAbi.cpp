@@ -755,6 +755,16 @@ static const uint8_t kSbHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8
 // plane pack is the one that matches its kernel.
 static const uint8_t kTriPlaneCore[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
 
+// gpunarrowphase mesh-vs-mesh OVERLAP MARKING (P9.83):
+//   triangleTriangleOverlaps(PxU32 numWorkItems, cmInputs*, transformCache*,
+//   contactDistances*, gpuShapes*, cmOutputs*, PxU8* overlaps)
+//   (PxgNarrowphaseCore.cpp:1393-1401).
+// Seven arguments, 64 bytes.  cmOutputs is pushed and never read -- by the CUDA
+// either, which takes it at :1393 and never names it again; only the SECOND
+// kernel of the pair writes outputs.  It still occupies slot @40 and the row has
+// to say so, or `overlaps` would land on the output array.
+static const uint8_t kTriTriOverlap[] = { 4, 8, 8, 8, 8, 8, 8 };
+
 // gpunarrowphase softbody-vs-HEIGHTFIELD midphase (P8.11 step 1):
 //   sb_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems, PxReal toleranceLength,
 //   cmInputs*, transformCache*, contactDistance*, gpuShapes*, softbodies*,
@@ -2103,6 +2113,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
     { "sb_heightfieldContactGenLaunch", kSbHfContactGen, uint32_t(sizeof(kSbHfContactGen)) },
     { "trimeshPlaneNarrowphase", kTriPlaneCore, uint32_t(sizeof(kTriPlaneCore)) },
+    { "triangleTriangleOverlaps", kTriTriOverlap, uint32_t(sizeof(kTriTriOverlap)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
     // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)

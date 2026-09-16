@@ -104,7 +104,15 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # P9.21: fcVertexConvex joins for exactly the same reason -- it and
     # femClothContactGenBda now compile the SAME pxgSlangVertexConvexCloth, and
     # the P9.21 differential compares their contact streams bit for bit.
-    fcVertexConvex)
+    fcVertexConvex
+    # P9.83: triTriOverlapBda and npTriTriOverlap join TOGETHER, and the pairing is
+    # the point.  They compile the same two modules (pxgSlangTriTriOverlap and
+    # pxgSlangGjk) since P9.83 lifted the decision out of the Phase-1 shader, so
+    # stamping only one would contract the SHARED body differently in each -- the
+    # exact fcConvexTri/femClothContactGenBda situation five entries up.  The
+    # Phase-1 fixture compares against a CPU mirror built with -ffp-contract=off,
+    # so the stamp moves it toward its reference, not away.
+    triTriOverlapBda npTriTriOverlap)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -625,6 +633,12 @@ pxg_compile_shader(sphereTriNpBda sphereTrimeshNarrowphase)
 # plane-space projection and the reduction's anchor picks are mul-feeding-add
 # chains whose SIGN decides which contacts survive.
 pxg_compile_shader(triPlaneNpBda trimeshPlaneNarrowphase)
+# P9.83: triangleTriangleOverlaps on the engine ABI -- ASSEMBLY of
+# pxgSlangTriTriOverlap (the Phase-1 decision, lifted) and pxgSlangGjk (the
+# cold-start driver every deformable contact gen already ran).  One WARP per pair
+# with the grid sized from the block, so [numthreads] is the host's (32,2,1)
+# verbatim -- see the P9.68 note in the shader.  IS in PXG_NOCONTRACT_SHADERS.
+pxg_compile_shader(triTriOverlapBda triangleTriangleOverlaps)
 pxg_compile_shader(cvxCorePlaneNpBda convexCorePlaneNphase_Kernel)
 pxg_compile_shader(cvxCoreCvxNpBda convexCoreConvexNphase_Kernel)
 pxg_compile_shader(cvxCoreTriNpBda convexCoreTrimeshNphase_Kernel32)

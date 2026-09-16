@@ -37,6 +37,13 @@
 
 #include "pxgTestFramework.h"
 
+// P9.83: the ENGINE-ABI half of this file builds real cooked-mesh blobs, and the
+// BV32 node record is taken from the ENGINE HEADER rather than typed out.  The
+// same reason testCvxTriSetup.cpp gives: this fixture would otherwise be the
+// oracle for a layout it also defines, and a mutation sweep cannot see that.
+#include "GuBV32.h"
+#include "geometry/PxGeometry.h"   // PxGeometryType::eTRIANGLEMESH, never a literal (P9.57)
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -58,7 +65,11 @@ struct GjkOut
 };
 
 static const uint32_t DEGENERATE = 0xffffu;
-static const float PX_MAX_F32 = 3.4028234663852886e38f;
+// RENAMED IN P9.83.  This was PX_MAX_F32, which foundation/PxSimpleTypes.h
+// defines as a MACRO -- and GuBV32.h (included above for the engine's BV32 node
+// layout) drags it in.  The macro and this constant hold the same value; the
+// clash is purely lexical, and the local name is the one that gives way.
+static const float TTO_MAX_F32 = 3.4028234663852886e38f;
 static const uint32_t GJK_DISTANT = 0u, GJK_CLOSE = 1u, GJK_OVERLAP = 2u;
 
 static uint32_t asU32(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -228,7 +239,7 @@ static uint32_t closestPointTetW(float zV[32], const float dV[32], float closest
 
 static uint32_t supportIdx(V3 dir, const std::vector<float>& V, uint32_t vbase, uint32_t nb)
 {
-    uint32_t bestN = 0xFFFFFFFFu; float bestDist = -PX_MAX_F32;
+    uint32_t bestN = 0xFFFFFFFFu; float bestDist = -TTO_MAX_F32;
     for (uint32_t i = 0; i < nb; i += 32)
     {
         float d[32];
@@ -236,9 +247,9 @@ static uint32_t supportIdx(V3 dir, const std::vector<float>& V, uint32_t vbase, 
         {
             const uint32_t n = i + lane;
             V3 v = { V[(vbase + n) * 4], V[(vbase + n) * 4 + 1], V[(vbase + n) * 4 + 2] };
-            d[lane] = (n < nb) ? dot3(dir, v) : -PX_MAX_F32;
+            d[lane] = (n < nb) ? dot3(dir, v) : -TTO_MAX_F32;
         }
-        float chunkMax = -PX_MAX_F32; for (uint32_t lane = 0; lane < 32; ++lane) chunkMax = std::fmax(chunkMax, d[lane]);
+        float chunkMax = -TTO_MAX_F32; for (uint32_t lane = 0; lane < 32; ++lane) chunkMax = std::fmax(chunkMax, d[lane]);
         if (chunkMax > bestDist) { uint32_t ll = 0; for (uint32_t lane = 0; lane < 32; ++lane) if (d[lane] == chunkMax) { ll = lane; break; } bestDist = chunkMax; bestN = i + ll; }
     }
     return bestN;
@@ -255,9 +266,9 @@ static GjkOut gjkRef(const GjkIn& e, const std::vector<float>& VA, const std::ve
     for (uint32_t L = 0; L < 32; ++L)
     {
         const uint32_t c = L & 3u;
-        closestPointV[L] = (c == 0) ? initialUnitDir.x : (c == 1) ? initialUnitDir.y : (c == 2) ? initialUnitDir.z : PX_MAX_F32;
+        closestPointV[L] = (c == 0) ? initialUnitDir.x : (c == 1) ? initialUnitDir.y : (c == 2) ? initialUnitDir.z : TTO_MAX_F32;
     }
-    float upperBound = PX_MAX_F32, lowerBound = -PX_MAX_F32;
+    float upperBound = TTO_MAX_F32, lowerBound = -TTO_MAX_F32;
     float cmA[32]; magW(closestPointV, cmA);
     bool degenerate = false;
     int size = 0, backupSize = 0;
@@ -560,6 +571,359 @@ PXG_TEST(npTriTriOverlap_overlaps)
                   cOverlap, cDistant, cClose, cIdent, cMulti);
 
     for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.83: triTriOverlapBda -- triangleTriangleOverlaps on the ENGINE ABI
+// ===========================================================================
+// The test above certifies the DECISION (pxgSlangTriTriOverlap + pxgSlangGjk).
+// This one certifies the GLUE the engine kernel adds on top of it, which is the
+// only thing in that file the module does not already cover:
+//
+//   1. the contact-manager load and the NO-SWAP operand order;
+//   2. the cooked-blob walk to each mesh's BV32 ROOT node -- node 0, at +16;
+//   3. the mNbNodes MASK, i.e. that slots past the root's child count are NOT
+//      folded into the box;
+//   4. contactDistance[ref0] + contactDistance[ref1], both halves;
+//   5. the byte-lane store into an un-zeroed PxU8 array that FOUR pairs share.
+//
+// Every trap below exists because the corresponding bug is silent:
+//
+//   THE POISON SLOTS.  Child slots [mNbNodes, 32) of every root node carry
+//   +/-1e6.  A kernel that folds all 32 (or that reads mNbNodes from the wrong
+//   offset and gets something >= 32) produces a box a million units wide, and
+//   EVERY pair then overlaps -- which looks exactly like "the physics works"
+//   until something is supposed to be distant.  The expected pattern below has
+//   five distant pairs for that reason.
+//
+//   THE SECOND NODE.  Every blob carries nbPackedNodes = 2, and node 1 is all
+//   poison with mNbNodes = 32.  Reading node 1 instead of node 0 -- an off-by-one
+//   in the +16 header skip, or BV32_STRIDE used as the header size -- lands there.
+//
+//   THE SLOT SPLIT.  The live slots tile the box: slot 0 holds the low corner,
+//   slot n-1 the high one, and the union is the whole box.  A fold that stops
+//   after slot 0 gets the right minimum and a far too small maximum, so it is
+//   wrong in a direction a symmetric test would not notice.
+//
+//   THE UN-ZEROED ARRAY.  `overlaps` is uploaded as 0xFF everywhere, which is
+//   what mIntermStackAlloc.allocateAligned hands the CUDA: a fresh, unwritten
+//   allocation.  A store that ORs without clearing leaves every false flag
+//   reading as true, and a store that does a plain read-modify-write loses three
+//   of every four flags to the other warps sharing the word.
+//
+//   THE TAIL BYTES.  Eleven pairs occupy bytes 0..10 of a sixteen-byte buffer.
+//   Bytes 11..15 must come back STILL 0xFF: a kernel that writes whole words
+//   clobbers byte 11, and one whose `pairIdx >= numWorkItems` guard is wrong
+//   writes past the work.
+//
+//   THE EXPECTED PATTERN.  T,F,F,T | F,T,T,F | T,F,T -- every one of the four
+//   byte lanes carries both a true and a false somewhere.  With an alternating
+//   pattern a shift computed as `(pairIdx & 1) * 8` would still pass.
+namespace p983tto
+{
+struct GpuShape
+{
+    float sx, sy, sz;
+    float rx, ry, rz, rw;
+    uint32_t materialIndex;
+    uint32_t hullLo, hullHi;
+    uint32_t type;
+    uint32_t particleOrSoftbodyId;
+};
+static_assert(sizeof(GpuShape) == 48, "PxgShape mirror");
+
+struct CmInput { uint32_t shapeRef0, shapeRef1, tcRef0, tcRef1; };
+
+// PxgNarrowphaseCore.cpp:1393-1401 -- ABI row { 4,8,8,8,8,8,8 }
+struct TtoPush
+{
+    uint32_t numWorkItems;
+    uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, shapes, cmOutputs, overlaps;
+};
+static_assert(sizeof(TtoPush) == 56, "triTriOverlapBda push block / ABI row { 4,8,8,8,8,8,8 }");
+
+static const uint32_t POISON_SLOT_LO = 0xFFu;   // the byte the CUDA's allocation holds
+
+// One cooked mesh: the uint4 header, then nbPackedNodes BV32 records.  The
+// kernel never reads past the tree, so the vert/index/adjacency/remap sections
+// are represented by trailing zeros only.
+struct MeshBlob
+{
+    std::vector<uint8_t> bytes;
+    F4 mins[32], maxs[32];     // what the ROOT node actually carries
+    uint32_t nbNodes = 0;
+};
+
+static void buildMeshBlob(MeshBlob& m, uint32_t nbNodes, V3 lo, V3 hi)
+{
+    m.nbNodes = nbNodes;
+
+    physx::Gu::BV32DataPacked root;
+    physx::Gu::BV32DataPacked decoy;
+    for (uint32_t s = 0; s < 32; ++s)
+    {
+        if (s < nbNodes)
+        {
+            const float t0 = float(s) / float(nbNodes), t1 = float(s + 1) / float(nbNodes);
+            const V3 a{ lo.x + (hi.x - lo.x) * t0, lo.y + (hi.y - lo.y) * t0, lo.z + (hi.z - lo.z) * t0 };
+            const V3 b{ lo.x + (hi.x - lo.x) * t1, lo.y + (hi.y - lo.y) * t1, lo.z + (hi.z - lo.z) * t1 };
+            m.mins[s] = F4{ a.x, a.y, a.z, 0.0f };
+            m.maxs[s] = F4{ b.x, b.y, b.z, 0.0f };
+        }
+        else
+        {
+            m.mins[s] = F4{ -1.0e6f, -1.0e6f, -1.0e6f, 0.0f };
+            m.maxs[s] = F4{ 1.0e6f, 1.0e6f, 1.0e6f, 0.0f };
+        }
+        root.mMin[s] = physx::PxVec4(m.mins[s].x, m.mins[s].y, m.mins[s].z, m.mins[s].w);
+        root.mMax[s] = physx::PxVec4(m.maxs[s].x, m.maxs[s].y, m.maxs[s].z, m.maxs[s].w);
+        root.mData[s] = 0xBAD00000u | s;
+        decoy.mMin[s] = physx::PxVec4(-1.0e6f, -1.0e6f, -1.0e6f, 0.0f);
+        decoy.mMax[s] = physx::PxVec4(1.0e6f, 1.0e6f, 1.0e6f, 0.0f);
+        decoy.mData[s] = 0xDEAD0000u | s;
+    }
+    root.mNbNodes = nbNodes;
+    root.mDepth = 1;
+    decoy.mNbNodes = 32;      // the trap: folding this box makes everything overlap
+    decoy.mDepth = 2;
+
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) m.bytes.push_back(uint8_t(v >> (8 * i))); };
+    auto raw = [&](const void* p, size_t n)
+    { const uint8_t* b = static_cast<const uint8_t*>(p); for (size_t i = 0; i < n; ++i) m.bytes.push_back(b[i]); };
+
+    u32(12u);            // numVerts    -- never read by this kernel
+    u32(4u);             // numTris     -- never read by this kernel
+    u32(0xA5A5A5A5u);    // .z is NOT a node count (see pxgSlangCvxTriSetup)
+    u32(2u);             // nbPackedNodes: node 0 is the root, node 1 is the decoy
+    raw(&root, sizeof(root));
+    raw(&decoy, sizeof(decoy));
+    for (int i = 0; i < 64; ++i) u32(0);   // the sections past the tree
+}
+} // namespace p983tto
+
+PXG_TEST(triTriOverlapEngineAbi)
+{
+    using namespace p983tto;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- four meshes, four DIFFERENT root child counts ---------------------
+    // 1 exercises the single-slot fold (where the seed IS the answer), 32 the
+    // full one (where no slot is poison and the mask can only be wrong low), and
+    // 3 / 7 the ordinary case with live poison above them.
+    MeshBlob mesh[4];
+    buildMeshBlob(mesh[0], 1, V3{ -1.0f, -0.8f, -1.2f }, V3{ 1.0f, 0.9f, 1.1f });
+    buildMeshBlob(mesh[1], 3, V3{ -0.6f, -1.4f, -0.5f }, V3{ 1.3f, 0.7f, 1.5f });
+    buildMeshBlob(mesh[2], 7, V3{ -1.1f, -0.9f, -1.0f }, V3{ 0.8f, 1.2f, 0.6f });
+    buildMeshBlob(mesh[3], 32, V3{ -0.7f, -0.7f, -1.3f }, V3{ 1.4f, 1.1f, 0.9f });
+
+    PxgBufferHandle bMesh[4];
+    uint64_t meshAddr[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        bMesh[i] = createBufferFrom(dev, mesh[i].bytes);
+        meshAddr[i] = dev->getBufferDeviceAddress(bMesh[i]);
+    }
+
+    // ---- shapes: eight, all eTRIANGLEMESH, with NON-IDENTITY scale rotations
+    // With every scale rotation the identity, vertex2Shape collapses to a
+    // componentwise multiply and both quaternion rotations inside it vanish.
+    auto axisQuat = [](int axis, float a) {
+        F4 q{ 0, 0, 0, std::cos(a * 0.5f) };
+        (&q.x)[axis] = std::sin(a * 0.5f);
+        return q;
+    };
+    std::vector<GpuShape> shapes(8);
+    struct ShapeDef { int mesh; V3 scale; int axis; float ang; };
+    const ShapeDef sdef[8] = {
+        { 0, { 1.0f, 1.0f, 1.0f }, 0, 0.0f },      // identity scale rotation: the trivial case, kept once
+        { 1, { 1.4f, 0.7f, 1.1f }, 0, 0.85f },
+        { 2, { 0.6f, 1.3f, 0.9f }, 1, 1.20f },
+        { 3, { 1.1f, 1.1f, 0.5f }, 2, 0.45f },
+        { 0, { 0.8f, 1.5f, 1.2f }, 1, 0.70f },
+        { 1, { 1.2f, 0.9f, 1.4f }, 2, 1.05f },
+        { 2, { 1.0f, 0.6f, 0.8f }, 0, 0.30f },
+        { 3, { 0.9f, 1.2f, 1.0f }, 1, 0.95f },
+    };
+    for (int i = 0; i < 8; ++i)
+    {
+        const ShapeDef& d = sdef[i];
+        const F4 q = axisQuat(d.axis, d.ang);
+        shapes[i].sx = d.scale.x; shapes[i].sy = d.scale.y; shapes[i].sz = d.scale.z;
+        shapes[i].rx = q.x; shapes[i].ry = q.y; shapes[i].rz = q.z; shapes[i].rw = q.w;
+        shapes[i].materialIndex = 0;
+        shapes[i].hullLo = uint32_t(meshAddr[d.mesh] & 0xffffffffu);
+        shapes[i].hullHi = uint32_t(meshAddr[d.mesh] >> 32);
+        shapes[i].type = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+        shapes[i].particleOrSoftbodyId = 0;
+    }
+
+    // ---- the eleven pairs, and the separation that decides each flag -------
+    // Target pattern T,F,F,T | F,T,T,F | T,F,T -- see the header.  `sep` is the
+    // x-offset given to the FIRST body of the pair; the boxes are at most ~3
+    // units across after scaling, so 0.3 overlaps and 14 is far outside any
+    // contact distance.
+    struct PairDef { uint32_t s0, s1, tc0, tc1; float sep; bool wantOverlap; };
+    const PairDef pdef[11] = {
+        { 0, 1,  0,  1,  0.30f, true  },
+        { 1, 2,  2,  3, 14.00f, false },
+        { 2, 3,  4,  5, 15.50f, false },
+        { 3, 4,  6,  7,  0.10f, true  },
+        { 4, 5,  8,  9, 16.25f, false },
+        { 5, 6, 10, 11,  0.45f, true  },
+        { 6, 7, 12, 13,  0.20f, true  },
+        { 7, 0, 14, 15, 17.00f, false },
+        { 0, 3, 16, 17,  0.05f, true  },
+        { 3, 6, 18, 19, 18.50f, false },
+        { 6, 1, 20, 21,  0.35f, true  },
+    };
+    const uint32_t N = 11;
+
+    // ---- transforms: 22 entries, every one of them ROTATED ----------------
+    // aToB is conj(q1)*q0 with rotInv(q1, p0 - p1); with q1 the identity the
+    // conjugate is a no-op and the translation needs no rotating, so three
+    // separate mistakes would become invisible.
+    std::vector<float> xf(22 * 8, 0.0f);
+    std::vector<float> cdist(22, 0.0f);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const PairDef& d = pdef[i];
+        const float a0 = 0.23f + 0.31f * float(i), a1 = -0.41f + 0.17f * float(i);
+        const F4 q0 = axisQuat(int(i % 3), a0);
+        const F4 q1 = axisQuat(int((i + 1) % 3), a1);
+        float* r0 = xf.data() + size_t(d.tc0) * 8;
+        float* r1 = xf.data() + size_t(d.tc1) * 8;
+        r0[0] = q0.x; r0[1] = q0.y; r0[2] = q0.z; r0[3] = q0.w;
+        // The incidental y/z offsets vary per pair so no two transforms are the
+        // same, but they stay SMALL beside the boxes: with 0.12f/i they reached
+        // 1.2 by pair 10 and pushed a pair meant to overlap apart on their own,
+        // which the intent check below caught.  `sep` is the only thing that is
+        // supposed to decide a flag.
+        r0[4] = d.sep; r0[5] = 0.04f * float(i); r0[6] = -0.03f * float(i);
+        r1[0] = q1.x; r1[1] = q1.y; r1[2] = q1.z; r1[3] = q1.w;
+        r1[4] = 0.0f; r1[5] = -0.03f * float(i); r1[6] = 0.02f * float(i);
+        // BOTH halves of the sum, and deliberately unequal: a kernel reading only
+        // cd[ref0] or only cd[ref1] gets a different minSep.  They are small
+        // beside the separations above, so they never flip a decision by
+        // themselves -- they are checked by the bit-exact lowerBound comparison.
+        cdist[d.tc0] = 0.010f + 0.003f * float(i);
+        cdist[d.tc1] = 0.070f + 0.005f * float(i);
+    }
+
+    std::vector<CmInput> cms(N);
+    for (uint32_t i = 0; i < N; ++i)
+        cms[i] = CmInput{ pdef[i].s0, pdef[i].s1, pdef[i].tc0, pdef[i].tc1 };
+
+    // ---- the host mirror: build each pair's TtoIn the way the kernel's blob
+    //      walk must, then run the SAME refPrep/gjkRef the test above uses ----
+    std::vector<uint8_t> want(N, 0);
+    std::vector<float> refVA(size_t(N) * 8 * 4, 0.f), refVB(size_t(N) * 8 * 4, 0.f);
+    size_t nMarginal = 0, nTrue = 0, nFalse = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const PairDef& d = pdef[i];
+        const GpuShape& sh0 = shapes[d.s0];
+        const GpuShape& sh1 = shapes[d.s1];
+        const MeshBlob& m0 = mesh[sdef[d.s0].mesh];
+        const MeshBlob& m1 = mesh[sdef[d.s1].mesh];
+        const float* r0 = xf.data() + size_t(d.tc0) * 8;
+        const float* r1 = xf.data() + size_t(d.tc1) * 8;
+
+        TtoIn s{};
+        s.t0q = F4{ r0[0], r0[1], r0[2], r0[3] }; s.t0p = F4{ r0[4], r0[5], r0[6], 0 };
+        s.t1q = F4{ r1[0], r1[1], r1[2], r1[3] }; s.t1p = F4{ r1[4], r1[5], r1[6], 0 };
+        s.scaleS0 = F4{ sh0.sx, sh0.sy, sh0.sz, 0 }; s.scaleR0 = F4{ sh0.rx, sh0.ry, sh0.rz, sh0.rw };
+        s.scaleS1 = F4{ sh1.sx, sh1.sy, sh1.sz, 0 }; s.scaleR1 = F4{ sh1.rx, sh1.ry, sh1.rz, sh1.rw };
+        s.counts[0] = m0.nbNodes; s.counts[1] = m1.nbNodes;
+        s.misc = F4{ cdist[d.tc0] + cdist[d.tc1], 0, 0, 0 };
+        for (int L = 0; L < 32; ++L)
+        {
+            s.nMin0[L] = m0.mins[L]; s.nMax0[L] = m0.maxs[L];
+            s.nMin1[L] = m1.mins[L]; s.nMax1[L] = m1.maxs[L];
+        }
+
+        GjkIn gin{};
+        refPrep(s, &refVA[size_t(i) * 32], &refVB[size_t(i) * 32], gin);
+        const GjkOut o = gjkRef(gin, refVA, refVB, i * 8);
+        want[i] = (o.ret != GJK_DISTANT) ? 1u : 0u;
+        if (o.ret != GJK_OVERLAP && std::fabs(o.lowerBound - gin.params[0]) < 1e-3f) ++nMarginal;
+        if (want[i]) ++nTrue; else ++nFalse;
+    }
+    // THE PATTERN IS PART OF THE FIXTURE, NOT AN OBSERVATION OF IT.  If the
+    // hand-picked separations stop producing it -- because a constant moved, or
+    // because the geometry drifted -- the byte-lane traps silently weaken.  So
+    // the mirror's own verdict is checked against the intent first.
+    for (uint32_t i = 0; i < N; ++i)
+        PXG_CHECK_MSG(bool(want[i]) == pdef[i].wantOverlap,
+                      "triTriOverlapEngineAbi: pair %u was meant to be %s and the CPU mirror says %s -- "
+                      "the separation no longer produces the designed byte pattern",
+                      i, pdef[i].wantOverlap ? "overlapping" : "distant", want[i] ? "overlapping" : "distant");
+    PXG_CHECK_MSG(nMarginal == 0, "triTriOverlapEngineAbi: %zu pair(s) sit on the DISTANT boundary", nMarginal);
+    PXG_CHECK_MSG(nTrue >= 4 && nFalse >= 4,
+                  "triTriOverlapEngineAbi: coverage thin (%zu overlapping, %zu distant)", nTrue, nFalse);
+
+    // ---- run ---------------------------------------------------------------
+    // Sixteen bytes for eleven pairs: bytes 11..15 are the tail trap.  0xFF is
+    // what a fresh mIntermStackAlloc allocation hands the CUDA.
+    std::vector<uint32_t> overlapInit(4, 0xFFFFFFFFu);
+    std::vector<uint32_t> cmOutputs(N * 12, 0x5A5A5A5Au);   // pushed, never read
+
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCm = createBufferFrom(dev, cms);
+    PxgBufferHandle bOv = createBufferFrom(dev, overlapInit);
+    PxgBufferHandle bCmOut = createBufferFrom(dev, cmOutputs);
+
+    TtoPush push{};
+    push.numWorkItems = N;
+    push.cmInputs = dev->getBufferDeviceAddress(bCm);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.shapes = dev->getBufferDeviceAddress(bShapes);
+    push.cmOutputs = dev->getBufferDeviceAddress(bCmOut);
+    push.overlaps = dev->getBufferDeviceAddress(bOv);
+
+    {
+        // THE HOST'S OWN GRID, verbatim (PxgNarrowphaseCore.cpp:1407):
+        // numBlocks = ceil(numTests / NP_TRIMESH_WARPS_PER_BLOCK).  With N = 11
+        // and warpsPerBlock = 2 that is 6 groups covering 12 warps, so the last
+        // group's second warp is past the work and must write nothing.
+        const uint32_t WARPS_PER_BLOCK = 2;
+        const uint32_t groups = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        Kernel k("triTriOverlapBda.spv", "triangleTriangleOverlaps", {}, sizeof(TtoPush));
+        k.dispatch(groups, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    const auto gotWords = downloadBuffer<uint32_t>(dev, bOv, 4);
+    const uint8_t* got = reinterpret_cast<const uint8_t*>(gotWords.data());
+
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        // The CUDA stores `overlaps[i] = (result != eDISTANT)`, a bool, so the
+        // byte is exactly 0 or 1 -- not "non-zero".  A stale 0xFF would read as
+        // true to the consumer but is still a defect and is reported as one.
+        const uint8_t expect = want[i] ? 1u : 0u;
+        if (got[i] != expect)
+        {
+            ++mm;
+            std::printf("  pair %2u: got 0x%02x want 0x%02x%s\n", i, got[i], expect,
+                        got[i] == POISON_SLOT_LO ? "   (still the uploaded poison -- nothing was stored)" : "");
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "triTriOverlapEngineAbi: %zu overlap byte(s) wrong", mm);
+
+    size_t tail = 0;
+    for (uint32_t b = N; b < 16; ++b)
+        if (got[b] != POISON_SLOT_LO) { ++tail; std::printf("  tail byte %u: 0x%02x\n", b, got[b]); }
+    PXG_CHECK_MSG(tail == 0,
+                  "triTriOverlapEngineAbi: %zu byte(s) past numWorkItems were overwritten -- "
+                  "the store is not byte-scoped or the work guard is wrong", tail);
+
+    for (PxgBufferHandle h : { bShapes, bXf, bCd, bCm, bOv, bCmOut }) dev->destroyBuffer(h);
+    for (int i = 0; i < 4; ++i) dev->destroyBuffer(bMesh[i]);
 }
 
 } // namespace

@@ -98,7 +98,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "trimeshPlaneNarrowphase", "triPlaneNpBda.spv", "trimeshPlaneNarrowphase" },  // TRIMESH_PLANE_CORE (P9.82)  // TRIMESH_PLANE_CORE (unmapped)
     { "trimeshHeightfieldNarrowphase", nullptr, nullptr },  // TRIMESH_HEIGHTFIELD_CORE (unmapped)
     { "triangleTriangleCollision", nullptr, nullptr },  // TRIMESH_TRIMESH_CORE (unmapped)
-    { "triangleTriangleOverlaps", nullptr, nullptr },  // TRIMESH_TRIMESH_OVERLAP (unmapped)
+    { "triangleTriangleOverlaps", "triTriOverlapBda.spv", "triangleTriangleOverlaps" },  // TRIMESH_TRIMESH_OVERLAP (P9.83)
     { "evaluatePointDistancesSDFBatch", nullptr, nullptr },  // EVALUATE_POINT_DISTANCES_SDF (unmapped)
     { "updateFrictionPatches", "npCompressContacts.spv", "updateFrictionPatches" },  // UPDATE_FRICTION_PATCHES
     { "preIntegrationLaunch", "preIntegration.spv", "preIntegrationLaunch" },  // PRE_INTEGRATION

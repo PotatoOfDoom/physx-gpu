@@ -64,7 +64,6 @@ evaluatePointDistancesSDFBatch
 # only unmapped kernel in testSDKSphereTriMeshSATGpu's chain, and it carried two
 # ordinary geometry pairs: sphere-vs-mesh and capsule-vs-mesh.
 triangleTriangleCollision
-triangleTriangleOverlaps
 # trimeshHeightfieldNarrowphase -- STAYS ON THIS RATCHET, and NOT because it is work.
 # It is UNREACHABLE, and this is a FIFTH kind of deadness, distinct from the four
 # already on record (commented-out caller; never-constructed owner; #if 0 body; a

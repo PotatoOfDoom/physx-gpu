@@ -172,4 +172,5 @@ solveWholeIslandTGS                                    3@20+1:doFrictionWord    
 sphereHeightfieldNarrowphase                           15@120+4:stackSizeBytes                                        # dead-upstream
 sphereNphase_Kernel                                    1@4+4:toleranceLength                                          # dead-upstream
 sphereTrimeshNarrowphase                               15@120+4:stackSizeBytes                                        # dead-upstream
+triangleTriangleOverlaps                               5@40+8:cmOutputs                                               # dead-upstream
 updateBodiesLaunch_Part3                               1@8+4:dt;2@12+1:integrateWord                                  # dead-upstream
