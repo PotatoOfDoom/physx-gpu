@@ -191,6 +191,15 @@ if [ "${1:-}" = "--diagnostics" ]; then
     #   sdfBoxOnPlane  5.0000 -> 0.5000 (rest 0.500)  CAUGHT
     #   sdfBoxOnMesh   5.0000 -> 0.5000 (rest 2.500)  falls THROUGH the raised mesh
     #                                                 and lands on the plane instead
+    # P9.83a mapped triangleTriangleOverlaps, the FIRST of the two mesh-vs-mesh
+    # kernels.  The heights are unchanged -- the overlap byte is only the input to
+    # the second kernel, so nothing it decides can reach a contact yet -- but the
+    # measurement that DID change is the guard line:
+    #   before  triangleTriangleOverlaps  10x SKIPPED
+    #           triangleTriangleCollision 10x SKIPPED
+    #   after   triangleTriangleCollision 10x SKIPPED     (one kernel, not two)
+    # That is the whole observable P9.83a is entitled to claim, and it is worth
+    # writing down precisely because the resting heights look identical.
     # TWO bodies, because a plane is infinite: one over the plane alone and one over a
     # static mesh raised to y = 2, so each kernel family has its own resting height and a
     # single number cannot be credited to the wrong one.

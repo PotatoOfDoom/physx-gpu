@@ -7,7 +7,20 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **865/865** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **866/866** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83a added `gpuslang.subwordStore`, the SEVENTEENTH static checker and the first written
+because a MUTANT SURVIVED rather than because a defect shipped: a plain read-modify-write of
+a sub-word store is a lost update whenever two of the four byte lanes in a word have
+different writers, and no fixture can settle that -- the race needs two groups inside the
+word at the same instant, and llvmpipe may serialize them.  Its engine-ABI fixture
+(`triTriOverlapEngineAbi`) lives INSIDE the existing `gpuslang.npTriTriOverlap` case, so the
+tranche moves the ctest count by exactly one.  Manifest **419 -> 420**, engine-reachable
+unmapped **13 -> 12**, scenes **55** and holding (`sdfmesh` stays in the pending list until
+`triangleTriangleCollision` lands).
+P9.82 mapped `trimeshPlaneNarrowphase` behind P9.82a's `sdfmesh` scene -- the first mesh this
+tree has ever cooked an SDF for, and therefore the first dynamic `PxTriangleMeshGeometry`
+PhysX will simulate at all.  Manifest **418 -> 419**, engine-reachable unmapped **14 -> 13**,
+no new ctest row (the kernel is assembly of modules each of which already has one).
 P9.81 added `softBodySimHeightfieldContactGen` INSIDE the existing `gpuslang.softBodySim`
 case -- a fixture, not a new ctest row, which is why that tranche moves the count by zero
 (the same shape as P9.76c).  Manifest **417 -> 418**, engine-reachable unmapped 15 and
@@ -55,11 +68,11 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **418/501** kernels mapped (P9.81 filled the softbody-vs-HEIGHTFIELD contact
-gen, step 2 of a pair whose step 1 had been mapped since P8.11).
-Of the 83 unmapped, **14 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **420/501** kernels mapped (P9.82 the rigid trimesh-vs-PLANE narrowphase,
+P9.83a the mesh-vs-mesh OVERLAP marking kernel -- two thirds of the trimesh trio).
+Of the 81 unmapped, **12 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
-are orphans — so "417/501" understates coverage of what this build can actually run.
+are orphans — so "420/501" understates coverage of what this build can actually run.
 (These three figures had drifted: P9.79 moved the manifest to 415 and the reachable
 count to 17 in its own paragraph but left this block saying 412 and 20, and the scene
 line said 50 after `directapi` had made it 51.  A counter block nobody reconciles is a
@@ -1907,6 +1920,203 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.82a/P9.82 — die erste dynamische SDF-Mesh-Szene dieses Harness, und die Ebenen-Hälfte des Trios
+
+### Warum es keine Szene gab
+
+`gTable[ePLANE][eTRIANGLEMESH]` ist `cndCasePlaneMesh`
+(PxgNphaseImplementationContext.cpp:1052-1059) und liefert `eTrianglePlane`, sobald die
+Mesh-Seite rigide ist — **ohne** GPU-Kompatibilitätstest, anders als die Fälle
+Kugel/Kapsel/Box/Convex gegen Mesh. Das Tor liegt davor: PhysX 5.6 simuliert ein
+nicht-kinematisches `PxTriangleMeshGeometry` ohne SDF überhaupt nicht
+(`NpRigidBodyTemplate.h:359-374`, `isDynamicMesh` = `mesh->getSdfDataFast().mSdf != NULL`),
+und **kein Mesh in diesem Baum war je mit einem SDF gebacken worden**. `PX_CHECK_AND_RETURN_VAL`
+kompiliert in diesem Release-Build zu nichts, also hängt sich ein SDF-loses dynamisches Mesh
+still an und kollidiert nie.
+
+P9.82a baut den Beobachter zuerst: `PXG_SCENE=sdfmesh` backt mit `GuCookingSDF.cpp` das
+erste SDF dieses Harness (`sdfDesc.spacing = 0.05f`, `subgridSize = 0` für das dichte Feld,
+`sdfBuilder == NULL` → CPU-Windungszahlen) und prüft die Prämisse explizit mit
+`if (!sdfBox->getSDF())` — eine Szene, deren Voraussetzung still ausfällt, misst nichts.
+Gemessen ROT:
+
+```
+[sdfBoxOnPlane] start y=5.000, final y=0.5000 (rest 0.500)   CAUGHT
+[sdfBoxOnMesh]  start y=5.000, final y=0.5000 (rest 2.500)   fällt DURCH
+[pxg-unmapped] triangleTriangleCollision launched 10x, SKIPPED
+[pxg-unmapped] triangleTriangleOverlaps  launched 10x, SKIPPED
+```
+
+### Die Ebenen-Hälfte: Zusammenbau, keine zweite Abschrift
+
+Phase 1 hatte `trimeshPlaneNarrowphase` schon vollständig in `npTriPlaneNp.slang`
+abgeschrieben und bit-exakt zertifiziert. Eine zweite Abschrift hätte genau das Paar
+erzeugt, das P9.15d eine Tranche gekostet hat — eine Fixture, die eine Kopie zertifiziert,
+während die Engine die andere fährt. Also wurde erst **verschoben**, dann zusammengebaut:
+
+- `pxgSlangTriPlane` — der Entscheidungskern: `contactReduce6` mit seinem Clustering, die
+  `ind += popc(readMask)`-Überschreitung der Batch-Schleife, `calculatePCMConvexMargin`,
+  `vertex2Shape`;
+- `pxgSlangNpPatchTail` — der Ausgabe-Schwanz der rigiden Narrowphase (Reservierung,
+  `registerContactPatch`, `insertIntoPatchStream`), aus `npCvxPlaneNphase` gehoben;
+- `pxgSlangPcmManifold` — die Manifold-Prädikate, die vorher in **drei** Schreibweisen
+  vorlagen.
+
+### DEAD-CODE-ELIMINATION SCHLÄGT EINEN NAIVEN BISECT
+
+`triPlaneNpBda` segfaultete beim ersten Schritt. Der Bisect mit `if (true) return;` an
+aufeinanderfolgenden Punkten meldete Shape-Load, Blob-Lauf und Root-Reduce als SAUBER und
+zeigte auf das Manifold-Tor. **Das war eine Messung des Optimierers**: alles vor dem
+`return` wird tot, der Compiler entfernt es, und „sauber" heißt dann nur „nicht mehr
+vorhanden". Mit einem echten Seiteneffekt an jeder Schnittstelle
+(`Ptr<uint>(gTP.touchChangeFlags)[workIndex] = ...`) lag der Fehler wieder im Blob-Lauf.
+
+Ursache: `GEOM_TRIANGLEMESH = 4u` ist **eCONVEXCORE**; eTRIANGLEMESH ist **8**. Das Paar kam
+vertauscht zurück und der Kernel dereferenzierte den `hullOrMeshPtr` der EBENE als Mesh-Blob.
+Das ist die P9.57-Klasse exakt — jeder Wert des Enums ist eine plausible kleine Zahl.
+Behoben mit `CT_GEOM_TRIANGLEMESH` aus dem Modul, nie mit einem Literal.
+
+**Die Regel, die daraus folgt:** jeder Schnittpunkt eines Bisects braucht einen echten
+Seiteneffekt, sonst misst man die Dead-Code-Elimination.
+
+Nebenbei ein echter latenter Fehler im Projekt-eigenen Prüfer gefunden und behoben:
+`check_launch_abi_pack.py` schlüsselte seinen `DECL_CACHE` auf `id(src)`. Objekt-IDs
+freigegebener Strings werden wiederverwendet, also konnte eine gecachte Antwort zu einer
+anderen Übersetzungseinheit gehören. Jetzt auf dem Pfad des Aufrufers geschlüsselt.
+
+Manifest **418 → 419**, engine-erreichbar unmapped **14 → 13**. `sdfmesh` bleibt in der
+Liste der offenen Arbeit, bis das Tri-Tri-Paar steht.
+
+## P9.83a — triangleTriangleOverlaps auf der Engine-ABI, und eine veraltete „geht nicht"-Notiz
+
+### Die Notiz, die eine Tranche verhindert hätte
+
+`npTriTriOverlap.slang` schloss mit: „the sibling kernel triangleTriangleCollision is NOT
+ported: its core calls doTriangleSDFCollision over tex3D SDF textures — hardware filtering,
+not bit-exact-portable, same category as sdfCollision.cuh."
+
+**Das ist falsch, und zwar seit P9.12d/P9.34c.** `pxgSlangSdfTexture.slang` bildet den
+tex3D-Zugriff als explizite trilineare Mischung über das rohe Sparse-/Dense-Gitter nach —
+es ist gar keine Hardware-Filterung beteiligt —, und `pxgSlangSdfCollision.slang` trägt
+`doTriangleSDFCollision` selbst. **Zwei GEMAPPTE Engine-Kernel importieren beide bereits**:
+`sb_sdfMeshMidphaseGeneratePairsLaunch` → `softBodySdfMidphaseBda.spv` und
+`cloth_sdfMeshContactGenLaunch` → `femClothSdfMeshCgBda.spv`.
+
+Die Notiz steht korrigiert weiter dort, statt gelöscht zu sein. Ein veraltetes „geht nicht"
+ist die eine Art Kommentar, die eine Tranche stoppt, bevor sie anfängt, und die Aufzeichnung,
+es geglaubt zu haben, ist mehr wert als eine saubere Datei.
+
+### Der Kern wurde gehoben, nicht ein zweites Mal geschrieben
+
+`pxgSlangTriTriOverlap` trägt jetzt die Entscheidung: die maskierte Min/Max-Faltung über die
+Kinderfächer des BV32-Wurzelknotens, das Ecken-Bitmuster (ein GESETZTES Bit wählt das
+MINIMUM, cu:1479), `vertex2Shape`, `aToB`, die Anfangsrichtung, das Konvergenzverhältnis und
+den DISTANT-Test. Und `npTriTriOverlap.slang` hat seine **eigene fünfhundertzeilige Kopie des
+GJK-Treibers verloren**: sie importiert `pxgSlangGjk`, das jeder Deformable-gegen-Convex-
+Kontaktgenerator dieses Baums ohnehin schon fährt. Die Fixture lief über die Umstellung
+hinweg **bit-exakt** weiter — das ist der Beleg, dass die beiden Kopien noch nicht
+auseinandergedriftet waren, kein Grund, sie behalten zu haben.
+
+Neu ist nur der Klebstoff: der Contact-Manager-Load (**ohne Swap** — beide Shapes SIND
+Meshes), der Lauf durch den gebackenen Blob zum BV32-Wurzelknoten, und der Byte-Speicher.
+
+### Vier Paare teilen sich ein Wort
+
+`gpuIntermOverlap` ist `allocateAligned(256, numTests * 1)` — **ein Byte pro Contact Manager,
+nicht genullt**. Dieses Gerät hat keine 8-Bit-Speicherung, also muss der Store durch das
+enthaltende 32-Bit-Wort, und vier Paare — vier verschiedene Warps, womöglich vier
+verschiedene Blöcke — teilen sich jedes davon. Ein Read-Modify-Write verliert drei von vier
+Flags; ein OR ohne vorheriges Löschen lässt jedes falsche Flag als stehengebliebenes 0xFF
+zurück, und ein Byte ungleich null ist `true`. Verwendet wird das Paar, das `abStoreU8`
+(pxgSlangArticulationBlocks) schon dokumentiert: `InterlockedAnd` auf die eigene Bahn,
+dann `InterlockedOr`.
+
+### Ein Warp pro Paar, und das Gitter kommt aus dem Block
+
+Dieser Launcher ist **nicht** die Ein-Block-pro-Paar-Form von `triPlaneNpBda`:
+`numBlocks = ceil(numTests / NP_TRIMESH_WARPS_PER_BLOCK)` mit Block `(32, 2, 1)`. Genau die
+Form, für die P9.68s Prüfer existiert — eine kleinere `[numthreads]` erreicht für immer einen
+festen Bruchteil der Arbeit. Also steht hier der Block des Hosts wörtlich.
+
+### Was die Sweeps gesagt haben
+
+**Modul: 24 von 25 tot.** Der Überlebende ersetzte `ret != GJK_DISTANT` durch
+`ret == GJK_OVERLAP`. `GjkResult` hat DREI Werte, und `CLOSE` — die Boxen schneiden sich
+nicht, liegen aber innerhalb `minSep` — zählt als Überlappung. Genau dafür wird
+`contactDistance` überhaupt an das GJK gereicht. Jedes wahre Paar der Fixture war ein tiefer
+Durchdringungsfall, jedes falsche vierzehn Einheiten entfernt: **das Band, über das die
+beiden Schreibweisen uneins sind, wurde nie betreten**. Paar 5 betritt es jetzt, und die
+Fixture behauptet nicht bloß „überlappend", sondern prüft, dass der CPU-Spiegel genau
+`GJK_CLOSE` liefert — ein Observable, das unter der Nullhypothese wahr ist, misst nichts.
+
+**Klebstoff: zuerst 14 von 19 tot.** Vier der fünf Überlebenden sind **ein** Befund: ein
+Boolean pro Paar kann die beiden Operanden nicht auseinanderhalten, solange die Geometrie
+weit von der Entscheidungsgrenze liegt. Drei neue Paare beheben das so, dass die Antwort des
+Mutanten sich **unterscheidet**, nicht bloß ungenauer wird:
+
+- Paar 11: ein Fast-Punkt-Mesh gegen eine Platte, die nur in +x von ihrem Ursprung reicht.
+  Korrekt liegt der Punkt in der Reichweite [0,4] → wahr; beide Operanden der Punkt → zwei
+  Punkte 1,9 auseinander → falsch; beide Meshes → dasselbe; Posen getauscht → Punkt bei 0,
+  Platte jetzt [1,9; 5,9] → falsch. **Ein Paar, drei Mutanten, nirgends eine Toleranz.**
+- Paare 12/13: Kontaktabstand 0,05 + 1,20 (und gespiegelt) mit einer Lücke von ~0,6 — die
+  echte Summe lässt zu, eine verdoppelte Hälfte nicht. Zweimal, weil eine Asymmetrie nur
+  eine Richtung einschränkt.
+
+**N 14 → 15, und die ungerade Zahl trägt Last.** Bei geradem N füllt das Gitter jeden Warp
+und **keine** Invocation trägt je `pairIdx == numWorkItems` — der einzige Index, an dem `>=`
+und `>` sich unterscheiden. Der Work-Guard-Mutant war bei N=11 tot, bei N=14 lebendig und ist
+bei N=15 wieder tot.
+
+### Der letzte Überlebende wurde ein Prüfer, kein Ausrede-Absatz
+
+`store-rmw-not-atomic` überlebt **zu Recht**: das verlorene Update braucht zwei Workgroups
+gleichzeitig im selben Wort, llvmpipe darf sie hintereinander ausführen, und ein Test, der
+nur scheitert, wenn ein Rennen zufällig auftritt, ist ein flakiger Test und keine Messung.
+Die **Form** des Schreibzugriffs ist dagegen durch Lesen entscheidbar — dafür gibt es
+statische Regeln.
+
+`tools/check_subword_store.py`, der **SIEBZEHNTE** Prüfer und der erste, der geschrieben
+wurde, weil ein Mutant überlebt hat statt weil ein Defekt ausgeliefert wurde. Zwei Regeln,
+**beide vor der Registrierung durch Mutation verifiziert**. Elf Sub-Wort-Stellen im Korpus:
+sieben schon atomar, zwei reine Wert-Falter (`s3`) und damit gar keine Stores, zwei
+Read-Modify-Writes auf der Liste.
+
+**Der Schlüssel ist `datei::funktion`, und auch das wurde gemessen.** Der erste Entwurf
+schlüsselte auf die Zeilennummer; das Korrigieren eines Kommentars zehn Zeilen über
+`femClothStepBda::storeByte` brach den Eintrag sofort. Ein Eintrag, der bei einer Änderung
+bricht, die unmöglich beeinflussen kann, wer das Wort schreibt, ist ein Eintrag, der
+abgenickt wird — schlimmer als gar keine Ratsche.
+
+**Das Lesen der zwei erlaubten Stellen hat eine davon korrigiert.** `femClothStepBda`s eigene
+Notiz sagte, „die zwei Schreiber dieses Kernels sind beide single-threaded und durch eine
+Barriere getrennt". Der `!adaptive`-Schreiber ist es; der `adaptive`-Schreiber feuert auf
+`gtid.x == 0` **jeder** Gruppe, die einen ungültigen Kontakt gesehen hat. Sicher ist er durch
+**Idempotenz** — alle schreiben dieselbe 1 in dasselbe Byte eines dedizierten Ein-Byte-Puffers
+—, nicht durch Exklusivität. Die Schlussfolgerung hielt, die genannte Begründung nicht; das
+ist die P9.76a-Form.
+
+### Was die Szene jetzt sagt
+
+Die Ruhehöhen von `sdfmesh` sind **unverändert** — das Overlap-Byte ist nur die Eingabe des
+zweiten Kernels, also kann nichts, was es entscheidet, schon einen Kontakt erreichen. Geändert
+hat sich die Wächterzeile, und das ist genau das Observable, auf das diese Tranche Anspruch
+hat:
+
+```
+vorher   [pxg-unmapped] triangleTriangleOverlaps  launched 10x, SKIPPED
+         [pxg-unmapped] triangleTriangleCollision launched 10x, SKIPPED
+nachher  [pxg-unmapped] triangleTriangleCollision launched 10x, SKIPPED
+         [unmapped] 1 kernel(s) ... silently skipped
+```
+
+Das wird aufgeschrieben, **weil** die Ruhehöhen gleich aussehen: eine Tranche, deren einziger
+sichtbarer Effekt in einer Zeile Diagnose steht, ist sonst nicht von einer Tranche ohne Effekt
+zu unterscheiden.
+
+Suite **866/866 in beiden Speichermodi**, Szenen **55/55**. Manifest **419 → 420**,
+engine-erreichbar unmapped **13 → 12**. `sdfmesh` bleibt in der Liste der offenen Arbeit:
+`triangleTriangleCollision` ist die andere Hälfte und ist P9.83b.
 
 ## P9.81 — der Softbody-gegen-Heightfield-Kontaktgenerator, und eine FÜNFTE Art von Totheit
 
