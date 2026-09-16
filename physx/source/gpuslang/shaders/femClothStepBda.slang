@@ -82,9 +82,18 @@
 //     InterlockedOr, since llvmpipe has no 8-bit shared storage in these shaders;
 //   - `*updateContactPairs` is a PxU8*.  A one-byte store is not available either, so the
 //     containing 32-bit word is read-modify-written -- and this is SAFE here in a way it would
-//     not generally be: the buffer is `mUpdateClothContactPairs`, one byte per scene that no
-//     other kernel writes concurrently (PxgFEMClothCore.cpp:1492), and the two writers in this
-//     kernel are both single-threaded and separated by a barrier.
+//     not generally be.  CORRECTED IN P9.83a: this note used to say "the two writers in this
+//     kernel are both single-threaded and separated by a barrier", and the second half of that
+//     is false.  The !adaptive writer IS single-threaded across the whole dispatch
+//     (globalThreadIndex == 0 && gid.y == 0).  The adaptive one fires on `gtid.x == 0` of
+//     EVERY group that saw an invalid contact, which is many invocations.  What makes it safe
+//     is IDEMPOTENCE, not exclusivity: every one of those writers stores the same value 1 into
+//     the same byte, so concurrent read-modify-writes all read the same word, compute the same
+//     result and store it.  The two arms are mutually exclusive on the kernel-wide `adaptive`
+//     flag, and the buffer is a dedicated one-byte PxgCudaBuffer
+//     (PxgFEMClothCore.cpp:1492) whose word's other three bytes are unused padding inside the
+//     same allocation, so nothing else can lose an update to the collateral rewrite.
+//     tools/check_subword_store.py carries the site with that reason.
 //
 // THE GRID: gridDim.x = ceil(maxClothVerts / CLOTH_STEP), gridDim.y = nbActiveFEMCloths, with
 // blockDim CLOTH_STEP = 1024.  The bridge forwards gridDimX/Y and DROPS blockDim, so the group

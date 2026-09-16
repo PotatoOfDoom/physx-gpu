@@ -818,7 +818,7 @@ PXG_TEST(triTriOverlapEngineAbi)
         bool identityPose;
         float cd0, cd1;
     };
-    const PairDef pdef[14] = {
+    const PairDef pdef[15] = {
         { 0, 1,  0,  1,  0.30f, true,  false, false, 0.0f,  0.0f  },
         { 1, 2,  2,  3, 14.00f, false, false, false, 0.0f,  0.0f  },
         { 2, 3,  4,  5, 15.50f, false, false, false, 0.0f,  0.0f  },
@@ -833,15 +833,23 @@ PXG_TEST(triTriOverlapEngineAbi)
         { 8, 9, 22, 23,  1.90f, true,  false, true,  0.0f,  0.0f  },  // operand asymmetry
         { 0, 1, 24, 25,  3.00f, true,  true,  false, 0.05f, 1.20f },  // cd asymmetry, slot 0 small
         { 0, 1, 26, 27,  3.00f, true,  true,  false, 1.20f, 0.05f },  // cd asymmetry, slot 1 small
+        { 9, 8, 28, 29, -1.90f, true,  false, true,  0.0f,  0.0f  },  // asymmetry, operands reversed
     };
-    const uint32_t N = 14;
+    // FIFTEEN, AND THE ODD COUNT IS LOAD-BEARING.  The host grid is
+    // ceil(N / 2) groups of two warps, so an EVEN N fills every warp and no
+    // invocation ever carries `pairIdx == numWorkItems` -- which is the only
+    // index at which `>=` and `>` differ.  At N = 14 the work-guard mutant
+    // survived for exactly that reason, having been killed at N = 11.  Fifteen
+    // pairs means eight groups, sixteen warps, and one spare that must write
+    // nothing.
+    const uint32_t N = 15;
 
     // ---- transforms: 22 entries, every one of them ROTATED ----------------
     // aToB is conj(q1)*q0 with rotInv(q1, p0 - p1); with q1 the identity the
     // conjugate is a no-op and the translation needs no rotating, so three
     // separate mistakes would become invisible.
-    std::vector<float> xf(28 * 8, 0.0f);
-    std::vector<float> cdist(28, 0.0f);
+    std::vector<float> xf(30 * 8, 0.0f);
+    std::vector<float> cdist(30, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
         const PairDef& d = pdef[i];
@@ -952,7 +960,11 @@ PXG_TEST(triTriOverlapEngineAbi)
     // ---- run ---------------------------------------------------------------
     // Sixteen bytes for eleven pairs: bytes 11..15 are the tail trap.  0xFF is
     // what a fresh mIntermStackAlloc allocation hands the CUDA.
-    std::vector<uint32_t> overlapInit(4, 0xFFFFFFFFu);
+    // Twenty-four bytes for fifteen pairs.  Bytes 15..23 are the tail trap, and
+    // byte 15 does double duty: it shares word 3 with pairs 12..14, so a store
+    // that writes whole words clobbers it, and it is also the byte the spare
+    // sixteenth warp would reach if the work guard were `>` instead of `>=`.
+    std::vector<uint32_t> overlapInit(6, 0xFFFFFFFFu);
     std::vector<uint32_t> cmOutputs(N * 12, 0x5A5A5A5Au);   // pushed, never read
 
     PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
@@ -983,7 +995,7 @@ PXG_TEST(triTriOverlapEngineAbi)
         dev->flush();
     }
 
-    const auto gotWords = downloadBuffer<uint32_t>(dev, bOv, 4);
+    const auto gotWords = downloadBuffer<uint32_t>(dev, bOv, 6);
     const uint8_t* got = reinterpret_cast<const uint8_t*>(gotWords.data());
 
     size_t mm = 0;
@@ -1003,7 +1015,7 @@ PXG_TEST(triTriOverlapEngineAbi)
     PXG_CHECK_MSG(mm == 0, "triTriOverlapEngineAbi: %zu overlap byte(s) wrong", mm);
 
     size_t tail = 0;
-    for (uint32_t b = N; b < 16; ++b)
+    for (uint32_t b = N; b < 24; ++b)
         if (got[b] != POISON_SLOT_LO) { ++tail; std::printf("  tail byte %u: 0x%02x\n", b, got[b]); }
     PXG_CHECK_MSG(tail == 0,
                   "triTriOverlapEngineAbi: %zu byte(s) past numWorkItems were overwritten -- "

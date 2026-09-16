@@ -2618,6 +2618,30 @@ add_test(NAME gpuslang.lengthIntrinsic
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_length_intrinsic.py)
 
 # ---------------------------------------------------------------------------
+# A sub-word store must be atomic unless one invocation owns the whole word
+# (P9.83a).  The SEVENTEENTH static checker, and the first written because a
+# MUTANT SURVIVED rather than because a defect shipped.
+#
+# This device enables no 8-bit storage, so every PxU8 the engine's buffers hold
+# is written through the 32-bit word containing it, and four PxU8 lanes share a
+# word.  A plain read-modify-write is then a lost update whenever two invocations
+# own two different bytes -- which is the NORMAL case, not a corner one.
+#
+# P9.83a's sweep replaced triTriOverlapBda's InterlockedAnd/InterlockedOr pair
+# with the plain form and the mutant survived, on merit: the race needs two
+# groups inside the same word at the same instant, llvmpipe may serialize them,
+# and a fixture that fails only when a race happens to manifest is a flaky test
+# rather than a measurement.  Every other survivor in that sweep was answered by
+# strengthening the fixture; this one could not be, because the defect is not a
+# function of the input.  Its SHAPE, though, is decidable by reading it.
+#
+# Both rules were verified by mutation before the checker was registered: the
+# plain read-modify-write is reported, and so is an InterlockedAnd whose matching
+# InterlockedOr has been deleted.
+add_test(NAME gpuslang.subwordStore
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_subword_store.py)
+
+# ---------------------------------------------------------------------------
 # A mapped kernel must have a launch-ABI row, or the engine cannot run it
 # (P9.48d).  The EIGHTH static checker, and the only one written because the
 # defect had already happened.

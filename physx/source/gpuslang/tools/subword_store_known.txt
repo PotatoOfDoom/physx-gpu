@@ -1,0 +1,45 @@
+# subword_store_known.txt -- the P9.83a ratchet (check_subword_store.py).
+#
+# Each line is a sub-word store spelled as a plain read-modify-write through the
+# containing 32-bit word, together with the MEASURED reason why that is safe:
+#
+#     <file>::<function>    <reason>
+#
+# The key is the ENCLOSING FUNCTION, not the line.  The first draft keyed on the
+# line number; correcting a comment ten lines above femClothStepBda's storeByte
+# broke the entry immediately, and an entry that breaks on an edit which cannot
+# change who writes the word is an entry that gets rubber-stamped back.
+#
+# THE REASONS ARE READ OUT OF THE CALL SITES, NOT OUT OF THE HELPER'S COMMENT.
+# One of the two entries below had a comment claiming more than was true, and it
+# has been corrected in the shader rather than copied here (see femClothStepBda).
+#
+# The list may SHRINK and must not grow.  Anything new is either the atomic pair
+#     InterlockedAnd(w[0], ~(0xFFu << shift), prev);
+#     if (value) InterlockedOr(w[0], value << shift, prev);
+# or a line here with its own measurement.
+
+# ONE INVOCATION PER RECORD, verified at all four call sites:
+#   artiJcalcPhaseA is [numthreads(1,1,1)] over a SINGLE articulation handed in
+#     through the push constant (npArtiJointFrame.slang:437-448), so the writes to
+#     that articulation's byte 27 and to each joint record's jCalcUpdateFrames are
+#     all made by the same one invocation, sequentially;
+#   updateArticulationsBda.slang:397-401 guards both stores with `lane == 0u` of
+#     the warp that owns that articulation -- and they are bytes 26 and 27, which
+#     SHARE a word, so they would be a lost update if the two were made by two
+#     different threads.  They are not; they are two statements in one thread.
+# Articulation records are hundreds of bytes apart, so no two records share a word.
+pxgSlangArticulationDesc.slang::artiStoreU8Field    single writer per record: artiJcalcPhaseA is one invocation per articulation, updateArticulationsBda stores from lane 0
+
+# NOT single-writer -- IDEMPOTENT, which is a weaker claim and the accurate one.
+# `mUpdateClothContactPairs` is a dedicated one-byte PxgCudaBuffer
+# (PxgFEMClothCore.cpp:1492), so the other three bytes of its word are unused
+# padding inside the same allocation and nothing writes them at all.  The kernel's
+# two writers are mutually exclusive on the kernel-wide `adaptive` flag:
+#   the !adaptive arm is genuinely single-threaded (globalThreadIndex == 0 && gid.y == 0);
+#   the adaptive arm fires on `gtid.x == 0` of EVERY group that saw an invalid
+#     contact -- many invocations, all storing the SAME value 1 into the SAME byte.
+# Concurrent identical read-modify-writes converge: every writer reads the same
+# word, computes the same result and stores it.  The shader's own note used to say
+# both writers were single-threaded, which is false for the second; corrected.
+femClothStepBda.slang::storeByte             idempotent: a dedicated one-byte buffer, and every writer of the adaptive arm stores the same 1 into the same byte
