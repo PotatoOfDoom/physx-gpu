@@ -1935,6 +1935,104 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-3 — sieben Abschriften statt vier, ein fehlender CUDA-Zweig, und ein „bewiesener" Beweis, der falsch war
+
+**Die Zählung war falsch.** Der Modulkopf und die Commits 3/n und 4/n sprachen von
+VIER seriellen Abschriften von `contactReduceShared`. Es sind SIEBEN:
+
+| Abschrift | Instanz | Status |
+|---|---|---|
+| `pxgSlangTriPlane::contactReduce6` | `<true, true, 6, false>` | eingefaltet (3/n) |
+| `npCvxCorrelate::contactReduce6` | `<true, false, 6, false>` | eingefaltet (3/n) |
+| `npTriHfNp::contactReduce6Dupe` | `<true, true, 6, true>` | eingefaltet (4/n) |
+| `npCvxTriEmit::contactReduce5` | `<false, true, 5, true>` | eingefaltet (5/n) |
+| `pxgSlangConvexTriCloth::contactReduce5` | `<false, true, 5, true>` | eingefaltet (5/n) |
+| `contactReduce.slang` | alle vier Flags zur Laufzeit | Fixture-Shader |
+| `pxgSlangContactReduce::crContactReduce6Cluster` | Warp-Form mit Barrieren | **nicht faltbar** ohne Umbau der Aufrufer |
+
+**Dem Modul fehlte CUDAs `TClustering=false`-Schwanz.** `contactReduction.cuh:159-165`
+füllt bei abgeschaltetem Clustering auf `TMaxPoints` mit den tiefsten nicht
+gewählten Kontakten auf; `crsReduceShared` hatte ein `if (cfg.clustering)` **ohne
+else**. Das sah vollständig aus, weil alle drei bis dahin eingefalteten Aufrufer
+clustern. Die beiden hier eingefalteten tun es NICHT — und beide hatten die
+Auffüllschleife in ihrem eigenen Rumpf korrekt.
+
+**Korrektur am eigenen Commit (6/n):** 5/n behauptete, eine Faltung auf das Modul
+ohne diesen Zweig hätte die Auffüllung stillschweigend verloren und ein zu kurzes
+Manifold geliefert. **Das ist falsch.** Bei `<false, true, 5, true>` — und das
+sind BEIDE eingefalteten Aufrufer — ist die Schleife nachweislich unerreichbar:
+`i0`, `i1`, `f`, `g` werden je aus `allMask & ~mask` gezogen, also ist
+`countbits(mask)` exakt 4; damit greifen `keepDeepestForPCM && countbits == 4 &&
+maxPoints > 4` sämtlich, der PCM-Griff feuert immer und hebt auf 5; `count == 5 ==
+maxPoints`, die Schleife läuft null Mal. **Gemessen** über 299920 Reduktionen, die
+den Schwanz erreichten: Ankermenge immer 4, PCM-Griff immer gefeuert,
+Schleifenrumpf **null** Durchläufe. Zwei überlebende Mutanten bestätigen es von
+der anderen Seite (`nocluster-fill-dropped`, `nocluster-fill-argmax`) — sie
+überleben, weil das hier toter Upstream-Code ist, nicht weil die Fixture blind ist.
+
+Der Zweig gehört trotzdem ins Modul: er steht in der CUDA und wird lebendig, sobald
+ein Aufrufer `maxPoints > 5` oder `keepDeepestForPCM = false` verlangt. Ein
+gemeinsamer Rumpf, der auf die heutigen Aufrufer spezialisiert ist, ist genau der
+Weg, auf dem die sieben Kopien überhaupt auseinandergelaufen sind. Aber die
+Begründung in 5/n war falsch, und die Faltung war ohnehin sicher.
+
+**`earlyout-strict` ist KEIN äquivalenter Mutant.** Commit 3/n enthielt einen
+Beweis: bei `newCount == maxPoints` ziehe die Reduktion genau `maxPoints`
+verschiedene Lanes aus einem Pool von genau `maxPoints` und liefere so in beiden
+Fällen `allMask`. Der Beweis setzte voraus, dass **jeder Cluster nicht leer ist**.
+CUDAs eigener Kommentar bei `:150` sagt das Gegenteil — *„clusters can be empty if
+all input points are equal"* —, und bei koinzidenten Punkten ist ein späterer
+Cluster leer: der volle Durchlauf liefert dann WENIGER als `maxPoints` Bits, und
+die triviale Rückgabe wird nicht reproduziert. Am Spiegel gemessen: `<=` und `<`
+weichen auf **39970 von 200000** Randfällen ab, und **alle 39970** hatten einen
+leeren Cluster. Der Mutant wird jetzt von den gepflanzten Duplikaten getötet, nicht
+entschuldigt. Ein Überlebender, den man zu einem Beweis erklärt, ist die teuerste
+Art, eine Lücke zu schließen.
+
+**Koinzidenz ist nicht transitiv.** Zwei Mutanten überlebten den ersten Durchlauf —
+`dupe-applied-in-place` und `dupe-scan-post-cull`, beide machen aus CUDAs einem
+`__ballot_sync` über die VOR-Cull-Maske eine sequentielle Auslese. Keiner ist
+äquivalent: auf einer Kette a~b~c mit a!~c und `sep[a] < sep[b] < sep[c]` stirbt
+simultan b an a und c an b, es bleibt `{a}`; sequentiell wird b zuerst entfernt,
+dann hat c keinen koinzidenten Partner mehr und überlebt. Numerisch verifiziert,
+**bevor** die Fixture angefasst wurde.
+
+Die Kette liegt jetzt auf einem Drittel der Fälle — und nur auf einem Drittel, mit
+Grund. Spalten 1 und 2 cullen nicht, also erreichen drei 7e-5 auseinanderliegende
+Lanes ihr Clustering unversehrt, wo `d < tbest[j]` zwei durch Auslöschung
+entstandene Quadratabstände von ~5e-9 vergleicht. Dort weichen ein FMA-`dot()` und
+das `-ffp-contract=off`-`dot()` des Spiegels legitim voneinander ab: 7 von 3000
+Fällen taten es. Die Kette nach `|p| ~ 0.02` zu verschieben, um die Auslöschung zu
+verkürzen, machte daraus **30**, weil ein isoliertes enges Tripel MEHR Anker
+liefert, nicht weniger. Also wird ein Kettenfall nur den Spalten gestellt, die
+cullen.
+
+**Die NoContraction-Notiz dieser Datei war falsch.** Sie behauptete, die übrigen
+Aufrufer des Moduls seien „bereits über ihre Engine-Aufrufer gestempelt".
+`npTriPlaneNp`, `npTriHfNp`, `npCvxCorrelate` und `triPlaneNpBda` fehlen alle in
+`PXG_NOCONTRACT_SHADERS`. Nur die Fixture zu stempeln hätte einen Build des Moduls
+zertifiziert, den die Engine nie ausführt.
+
+`gpuslang.npCrsWrapper2` fährt jetzt VIER Spalten: Wrapper 1, Wrapper 2, Wrapper 1
+mit Dupe-Cull und `<false,true,5,true>`. 3000 Fälle; die Wrapper widersprechen sich
+auf 990, der Cull ändert die Maske auf 2072, der Nicht-Cluster-Schwanz weicht auf
+2564 ab, und 854 tragen eine Kette.
+
+**Mutations-Durchlauf: 33 von 39 getötet.** Sechs Überlebende, alle belegt:
+`i1-anchor-order`, `dir-cross-order`, `dval-origin` (beweisbar äquivalent),
+`cluster-strict-vs-loose` (äquivalent auf jeder Eingabe, die eine Float-Fixture
+bauen kann) und die beiden `nocluster-fill-*` (toter Upstream-Code, oben belegt).
+`earlyout-strict`, `dupe-applied-in-place` und `dupe-scan-post-cull` sind jetzt
+getötet — alle drei waren zuvor als äquivalent eingestuft.
+
+**Die Lehre, und sie ist teuer bezahlt:** in dieser Tranche wurden drei Mutanten
+zu Unrecht für äquivalent erklärt, zweimal mit einem geschriebenen „Beweis". Jeder
+der drei fiel, sobald die Eingabe tatsächlich gesucht statt vorgestellt wurde — und
+jedes Mal waren es drei Zeilen Host-Code. Die stehende Regel für die
+Überlebendenliste dieses Moduls lautet jetzt: **ein Überlebender ist eine
+Fixture-Lücke, bis ein Argument den Versuch überlebt, die Eingabe zu finden, die es
+bricht — und der Versuch wird ausgeführt, nicht gedacht.**
+
 ## P9.83b-2 — eine CUDA-Vorlage, vier Abschriften, und der Wrapper, den nichts geprüft hat
 
 `contactReduceShared` (`contactReduction.cuh:55-165`) ist **eine** CUDA-Vorlage. Dieser

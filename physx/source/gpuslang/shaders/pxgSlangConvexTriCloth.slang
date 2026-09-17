@@ -495,12 +495,15 @@ bool computeBarycentric(float3 a, float3 b, float3 c, float3 p, out float4 baryc
 // = 0, initial criterion = separation (contactReduction.cuh :172).
 //
 // P9.83b-3: THE BODY MOVED OUT to pxgSlangContactReduceSerial.  This is the
-// clustering=FALSE instantiation, and folding it is what forced the module to
-// grow CUDA's `else` tail (contactReduction.cuh:159-165): the module had an `if
-// (cfg.clustering)` with no else, which looked complete only because every
-// caller folded in before this one clusters.  Folding this body onto the module
-// as it stood would have silently dropped the fill-out loop and emitted a short
-// manifold -- the shared body less complete than the copy it replaced.
+// clustering=FALSE instantiation, and folding it is what made the module grow
+// CUDA's `else` tail (contactReduction.cuh:159-165), which it had been missing.
+//
+// It was NOT, however, a latent short manifold here, as 5/n claimed: at
+// <false, true, 5, true> the fill-out loop the module was missing is provably
+// unreachable -- the anchor set is always 4, the PCM pick always fires and
+// takes it to 5, and 5 == maxPoints.  Measured over 299920 reductions: zero
+// iterations.  The tail belongs in the module for faithfulness, not because
+// this call site needs it.  See the note on that else branch.
 uint contactReduce5(float3 ptRaw[32], float sep[32], float3 normal, uint allMask)
 {
     return crsContactReduce(ptRaw, sep, normal, allMask, 0.0f,

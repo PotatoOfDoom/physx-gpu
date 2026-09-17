@@ -95,17 +95,35 @@
 // a caller may run it on one thread -- which is what triPlaneNpBda already does
 // and what the mesh-mesh kernel will do.
 // ---------------------------------------------------------------------------
-// FIVE MUTANTS SURVIVE THIS MODULE'S SWEEP, AND FOUR OF THEM PROVABLY MUST
+// SIX MUTANTS SURVIVE THIS MODULE'S SWEEP; A SEVENTH IS LISTED AS A WARNING
 // ---------------------------------------------------------------------------
-// P9.83b-2's sweep killed 20 of 25.  All five survivors are recorded here with
-// their arguments, so a later sweep does not re-investigate them and -- more
+// P9.83b-3's sweep killed 33 of 39.  The six survivors are recorded here with
+// their arguments -- three provably equivalent, one equivalent on every input a
+// float fixture can build, two dead upstream code -- so a later sweep does not
+// re-investigate them and -- more
 // importantly -- so nobody "simplifies" the CUDA's spelling on the grounds that no
 // test objects.  The spellings below are kept because they are the ENGINE's, not
 // because a fixture can tell.
 //
-// FOUR ARE PROVABLY EQUIVALENT AND ONE IS EQUIVALENT ON EVERY REACHABLE INPUT.
-// The fifth was first diagnosed as a fixture gap and it was not; see
-// earlyout-strict below, which is the one worth reading.
+// THE RECORD OF THIS LIST IS NOT GOOD, AND THAT IS THE POINT OF KEEPING IT.
+// P9.83b-2 listed FIVE survivors and called four of them provably equivalent.
+// Three of those proofs held.  The other two did not:
+//
+//   earlyout-strict was "proved" equivalent on the assumption that every
+//   cluster is non-empty.  CUDA's own comment at :150 says otherwise, and with
+//   coincident points the full run returns FEWER than maxPoints bits.  Measured:
+//   <= and < differ on 39970 of 200000 boundary cases, all 39970 with an empty
+//   cluster.  It is now KILLED by the planted duplicates.
+//
+//   dupe-applied-in-place and dupe-scan-post-cull were not on the list yet --
+//   they appeared with the cull -- and the first instinct was again to call them
+//   equivalent.  COINCIDENCE IS NOT TRANSITIVE: on a chain a~b~c with a!~c, a
+//   sequential cull keeps c that CUDA's simultaneous one kills.  Both are now
+//   KILLED by the planted chain.
+//
+// So the standing rule for this list: a survivor is a fixture gap until an
+// argument survives an attempt to find the input that breaks it, and the
+// attempt is run, not imagined.  The six below have each had that attempt.
 //
 //   i1-anchor-order   `point[i0] - point[j]`  ->  `point[j] - point[i0]`
 //       Only the MAGNITUDE of that difference is used.  IEEE subtraction gives
@@ -132,6 +150,28 @@
 //       distance.  The CUDA writes `<` (contactReduction.cuh:147) and so does
 //       this; no random-float fixture will separate them.
 //
+//   nocluster-fill-dropped    the TClustering=false fill-out loop removed
+//   nocluster-fill-argmax     its `crsArgMin(sep, ...)`  ->  `crsArgMax(sep, ...)`
+//       Both survive because the loop is UNREACHABLE for every instantiation
+//       this corpus has.  At <false, true, 5, true> -- the only clustering=false
+//       shape here, and both of its callers use it -- i0, i1, f and g are each
+//       drawn from `allMask & ~mask`, so countbits(mask) == 4 exactly; then
+//       keepDeepestForPCM && countbits == 4 && maxPoints > 4 all hold, the PCM
+//       pick fires, and countbits becomes 5 == maxPoints; so `for (i = count;
+//       i < maxPoints; ++i)` runs zero times.  Measured over 299920 reductions
+//       that reached the tail: the anchor set was 4 every time, the PCM pick
+//       fired every time, the loop body ran ZERO times.
+//
+//       The loop is transcribed anyway.  It goes live for maxPoints > 5, or for
+//       keepDeepestForPCM = false, and a shared body specialised to today's
+//       callers is exactly how the seven copies came to differ.
+//
+//       P9.83b-3's 5/n commit claimed the opposite -- that folding the two
+//       clustering=false callers onto a module without this loop would have
+//       "silently dropped the fill-out and emitted a short manifold".  It would
+//       not have; the fold was safe either way.  The branch is right to have and
+//       the reason given for it was wrong.
+//
 //   earlyout-strict   `newCount <= maxPoints`  ->  `newCount < maxPoints`
 //       DIAGNOSED WRONG THE FIRST TIME, and the correction is the interesting
 //       part.  It was called a fixture gap: the two spellings differ only at
@@ -140,14 +180,24 @@
 //       in seven was given exactly six live lanes -- and the mutant survived
 //       ANYWAY, which is the answer.
 //
-//       At newCount == maxPoints the reduction cannot do anything but return the
-//       live set.  It picks i0, i1, f, g (four distinct lanes), possibly i4 (a
-//       fifth), then labels every lane with its nearest anchor and takes one lane
-//       per cluster -- clusters are disjoint, so those picks are distinct -- and
-//       finally fills `for i in nbClusters..maxPoints` with one new lane each.
-//       The total is exactly maxPoints lanes drawn from a pool of exactly
-//       maxPoints, so the result IS allMask.  The early-out is a shortcut, not a
-//       behaviour, and the two spellings are provably equivalent.
+//       AND DIAGNOSED WRONG THE SECOND TIME TOO.  The reasoning above was
+//       replaced by a PROOF of equivalence: at newCount == maxPoints the
+//       reduction picks i0, i1, f, g, then i4, then one lane per cluster, then
+//       fills to maxPoints -- exactly maxPoints distinct lanes from a pool of
+//       exactly maxPoints, so the result IS allMask.
+//
+//       That proof assumed EVERY CLUSTER IS NON-EMPTY.  CUDA's own comment at
+//       :150 says it is not -- "clusters can be empty if all input points are
+//       equal" -- and with coincident points a later cluster IS empty, so the
+//       full run returns FEWER than maxPoints bits and the trivial return is not
+//       reproduced.  Measured on the mirror: <= and < differ on 39970 of 200000
+//       boundary cases, and all 39970 had an empty cluster.
+//
+//       THE MUTANT IS NOW KILLED, by the planted duplicates.  It is left in this
+//       list only as the record of two wrong diagnoses in a row: the first
+//       called a gap what was not one, the second called a proof what was not
+//       one.  The input that settles it was three lines of host code away both
+//       times.
 //
 //       The boundary cases stay.  They no longer kill a mutant, but they assert
 //       the trivial-return contract of contactReduction.cuh:85 directly, for both
@@ -334,16 +384,34 @@ public uint crsReduceShared(float3 ptRaw[32], float sep[32], float3 normal,
     }
     else
     {
-        // contactReduction.cuh:159-165.  THIS BRANCH WAS MISSING FOR TWO
-        // COMMITS and the omission was invisible, because all three callers
-        // folded in so far pass TClustering = true.  It bites the moment a
-        // clustering=false caller is folded -- npCvxTriEmit::contactReduce5 and
-        // pxgSlangConvexTriCloth::contactReduce5, which are <false,true,5,true>
-        // and BOTH implement this loop correctly in their own bodies.  Folding
-        // them onto the module as it stood would have silently dropped the
-        // fill-out and emitted a short manifold: the shared body less complete
-        // than the copies it replaced, which is the failure mode consolidation
-        // is supposed to remove rather than centralise.
+        // contactReduction.cuh:159-165.  This branch was missing until P9.83b-3.
+        //
+        // CORRECTION (P9.83b-3, 6/n): the commit that added it claimed folding
+        // the two clustering=false callers without it "would have silently
+        // dropped the fill-out and emitted a short manifold".  THAT IS FALSE.
+        // For <false, true, 5, true> -- which is what BOTH of them are -- the
+        // loop is unreachable:
+        //
+        //   i0, i1, f and g are each drawn from `allMask & ~mask`, so all four
+        //   are distinct and countbits(mask) == 4 exactly;
+        //   keepDeepestForPCM && countbits == 4 && maxPoints > 4 is then all
+        //   true, so the PCM pick always fires and countbits becomes 5;
+        //   count == 5 == maxPoints, so `for (i = count; i < maxPoints; ++i)`
+        //   runs zero times.
+        //
+        // Measured, not argued: over 299920 reductions that reached this tail
+        // the anchor set was 4 every time, the PCM pick fired every time, and
+        // the loop body executed ZERO times.  Two mutants confirm it from the
+        // other side -- nocluster-fill-dropped and nocluster-fill-argmax both
+        // survive the sweep, and they survive because this is dead upstream
+        // code for every instantiation the corpus has, not because the fixture
+        // is blind.
+        //
+        // It is transcribed anyway because it is in the CUDA and because the
+        // module is shared: it goes live the moment a caller asks for
+        // maxPoints > 5, or for keepDeepestForPCM = false (then count stays 4
+        // and it fills one).  A body specialised to today's callers is how the
+        // seven copies came to differ in the first place.
         //
         // The fill uses the RAW separation, not the cluster-biased sepB -- sepB
         // does not exist on this path at all.
