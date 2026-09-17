@@ -1952,14 +1952,34 @@ deklariert CUDAs neun Shared-Puffer eins zu eins — `patchesS[128]`,
 `anyKeepS` — lässt `gPxgWarpScratch` weg, rechnet **nichts** und wird von
 `gpuslang.groupshared` aus dem übersetzten SPIR-V ausgelesen.
 
-**Ergebnis: 30168 Bytes.** Der Kernel **passt** als EIN Entry Point. Das Argument
+**Ergebnis: 30300 Bytes.** Der Kernel **passt** als EIN Entry Point. Das Argument
 war richtig; es ist jetzt eine Messung.
 
-Er passt mit **2600 Bytes Luft**, also bei 92,1 % des Limits — und genau deshalb
+**Die erste Zahl war 30168 und war eine Teilmessung.** Sie zählte die neun Puffer,
+die `doTriangleTriangleCollision` selbst deklariert, und übersah zwei, die die
+aufgerufenen Helfer **selbst allozieren**: `offset` in `findInterestingTrianglesA`
+(sdfCollision.cuh:624) und `perWarpCountS[32]` in der zweiargumentigen
+`threadBlockScanExclusive<32>` (reduction.cuh:628) — genau die Überladung, die
+`addIndexToBuffer` aufruft. +132 Bytes. Eine Sonde, die neun von elf Puffern misst,
+liest sich exakt wie eine, die elf misst; deshalb speichert das Ratchet eine **Zahl**
+und kein Urteil — und die Zahl hat den Zuwachs gefangen.
+
+Er passt mit **2468 Bytes Luft**, also bei 92,5 % des Limits — und genau deshalb
 steht er im Ratchet. Ein einziger Modul-Import mit Workgroup-Speicher, ein weiteres
 Feld an `SparseSdfTexture` oder `MAX_MESH_MESH_PATCHES` abseits von 128, und die
 Pipeline lässt sich nicht mehr erzeugen. Allein `patchesS[128]` sind 16384 der
-30168 Bytes.
+30300 Bytes.
+
+**Ein konkreter Beinahe-Treffer ist schon gefunden:** `pxgSlangSdfFind.slang` hält
+den Slang-Port von `findInterestingTriangles`/`addIndexToBuffer` und deklariert
+**eigene** Workgroup-Puffer auf Modulebene — `gSdfIndices[1024]` (4096 B),
+`gSdfIndices2[1024]` (8192 B), `gSdfPerWarpCount[32]`, `gSdfOffset`,
+`gSdfGlobalOffset`, zusammen ~12424 B. Ihn wiederzuverwenden ist der naheliegende
+Zug und nur dann bezahlbar, wenn der Entry Point die uint-Variante `gSdfIndices`
+**nie** anfasst: `gSdfIndices2` **ersetzt** das eigene `triangleIndicesS` dieses
+Kernels, addiert sich also nicht dazu. Fasst er beide an, sind es 34396 Bytes und
+die Pipeline ist nicht mehr erzeugbar. Das ist beim Verdrahten zu **messen**, nicht
+zu überlegen.
 
 Jede Deklaration der Sonde wird gelesen UND geschrieben: P9.83b-1 hatte belegt, dass
 eine UNGENUTZTE Workgroup-Variable nichts kostet (SPIR-V listet sie dann nicht in

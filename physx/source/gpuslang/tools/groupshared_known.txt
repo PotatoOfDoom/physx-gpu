@@ -30,12 +30,32 @@ solverTGS:solveWholeIslandTGS    31744
 # and the answer is 30168 -- so the argument was right, and it is now a
 # measurement instead of an argument.  The kernel FITS.
 #
-# IT FITS BY 2600 BYTES, which is 92.1% of the limit.  That is the entire point of
+# THE FIRST NUMBER HERE WAS 30168, AND IT WAS A PARTIAL MEASUREMENT.  It counted
+# the nine buffers doTriangleTriangleCollision declares itself and missed two that
+# the helpers it calls SELF-ALLOCATE: `offset` in findInterestingTrianglesA
+# (sdfCollision.cuh:624) and `perWarpCountS[32]` in the two-argument
+# threadBlockScanExclusive<32> (reduction.cuh:628), which is the overload
+# addIndexToBuffer actually calls.  +132 bytes.  A probe that measures nine of
+# eleven buffers reads exactly like one that measures eleven, which is the whole
+# reason this ratchet stores a number instead of a verdict -- it is what caught
+# the growth.
+#
+# IT FITS BY 2468 BYTES, which is 92.5% of the limit.  That is the entire point of
 # the entry: one module import carrying Workgroup storage, one more field on
 # SparseSdfTexture, or MAX_MESH_MESH_PATCHES moving off 128, and the pipeline stops
-# being creatable.  16384 of the 30168 is patchesS[128] alone.
+# being creatable.  16384 of the 30300 is patchesS[128] alone.
+#
+# A CONCRETE NEAR MISS, already found: pxgSlangSdfFind.slang holds the Slang port
+# of findInterestingTriangles/addIndexToBuffer and declares its OWN module-level
+# Workgroup buffers -- gSdfIndices[1024] (4096 B), gSdfIndices2[1024] (8192 B),
+# gSdfPerWarpCount[32], gSdfOffset, gSdfGlobalOffset, ~12424 B in total.  Reusing
+# it is the obvious move and is affordable ONLY if the entry point never touches
+# the uint-variant gSdfIndices, since gSdfIndices2 replaces this kernel's own
+# triangleIndicesS rather than adding to it.  Touch both and the budget is 34396
+# and the pipeline cannot be created.  That is a measurement to take, not to
+# reason about, when the kernel is wired.
 #
 # THIS ENTRY IS TEMPORARY.  When the real kernel lands it supersedes the probe,
 # and the probe -- along with this entry and its pxg_compile_shader line -- is to
 # be DELETED, not left behind measuring a budget nothing spends.
-npTriTriSharedProbe:triTriSharedProbe    30168
+npTriTriSharedProbe:triTriSharedProbe    30300

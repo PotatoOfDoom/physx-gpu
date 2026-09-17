@@ -54,6 +54,14 @@
 //   char     sSdfTexture[sizeof(SparseSDFTexture)]
 //   bool     anyKeepS
 //
+// plus two that doTriangleTriangleCollision does NOT declare, because the
+// helpers it calls SELF-ALLOCATE them -- and reading only the kernel's own
+// declarations therefore undercounts:
+//
+//   PxU32    offset            findInterestingTrianglesA, sdfCollision.cuh:624
+//   PxU32    perWarpCountS[32] threadBlockScanExclusive<32>, reduction.cuh:628,
+//                              which is the overload addIndexToBuffer calls
+//
 // NOT declared here, deliberately: gPxgWarpScratch.  Its absence is the whole
 // claim under test -- it is what the warp-emulated reduction needs and the serial
 // one does not.
@@ -83,6 +91,21 @@ groupshared uint2 gTrianglesToSubdivide[256];
 groupshared uint gNumTrianglesToSubdivide;
 groupshared SparseSdfTexture gSdfTexture;
 groupshared uint gAnyKeep;
+
+// TWO MORE BUFFERS THAT ARE NOT DECLARED IN doTriangleTriangleCollision, and
+// that the first version of this probe therefore missed.  They are SELF-ALLOCATED
+// inside the helpers it calls, which is exactly why reading only the kernel's own
+// declarations undercounts:
+//
+//   findInterestingTrianglesA (sdfCollision.cuh:624)  `__shared__ PxU32 offset;`
+//   threadBlockScanExclusive<32> (reduction.cuh:628)  `__shared__ PxU32
+//       perWarpCountS[NbWarps];` -- the two-argument overload allocates its own,
+//       and addIndexToBuffer calls exactly that one (sdfCollision.cuh:502).
+//
+// A probe that measures nine of eleven buffers is the kind of partial measurement
+// that reads like a complete one.
+groupshared uint gFindOffset;
+groupshared uint gScanPerWarpCount[32];
 
 struct ProbeParams
 {
@@ -122,7 +145,8 @@ void triTriSharedProbe(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupTh
         gSdfTexture.subgridsSdfValueRange = 1.0f;
     }
 
-    if (t < 32u) { gCounters[t] = t; gMinSep[t] = float(t); }
+    if (t == 0u) gFindOffset = 0u;
+    if (t < 32u) { gCounters[t] = t; gMinSep[t] = float(t); gScanPerWarpCount[t] = t; }
     for (uint p = t; p < MAX_MESH_MESH_PATCHES2; p += 1024u)
     {
         for (uint k = 0; k < MESH_MESH_CONTACT_LIMIT; ++k)
@@ -143,6 +167,7 @@ void triTriSharedProbe(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupTh
     {
         uint acc = gCounters[t & 31u] + uint(gMinSep[t & 31u])
                  + gTriangleIndices[t].x + gNumTrianglesToSubdivide + gAnyKeep
+                 + gFindOffset + gScanPerWarpCount[t & 31u]
                  + uint(gPatches[t & 127u].keepPoints[0].x)
                  + uint(gPatches[t & 127u].normal.y) + uint(gPatches[t & 127u].deepest)
                  + gPatches[t & 127u].pointCount
