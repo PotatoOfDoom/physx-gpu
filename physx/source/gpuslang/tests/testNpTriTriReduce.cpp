@@ -260,7 +260,7 @@ PXG_TEST(npTriTriReduce_stream)
 
     std::vector<TtrCase> in(N);
     std::vector<RefResult> ref(N);
-    size_t totalPasses = 0, multiPass = 0, fullBuffer = 0, shortTail = 0;
+    size_t totalPasses = 0, multiPass = 0, fullBuffer = 0, shortTail = 0, withDupes = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -295,8 +295,33 @@ PXG_TEST(npTriTriReduce_stream)
         {
             pts[j] = { centre.x + rf(-2, 2), centre.y + rf(-2, 2), centre.z + rf(-2, 2),
                        rf(-0.4f, 0.25f) };
-            c.pts[j] = pts[j];
         }
+
+        // COINCIDENT STAGING POINTS, because the real buffer has them and a random
+        // cloud never does.  tryToAssignContactToExistingPatch copies the existing
+        // patch's KeepPoints into tempPointsS[0..PointCount) (:832-833) and then
+        // appends this round's contacts after them (:839) -- so a contact that has
+        // barely moved since the previous round lands in the same buffer as its own
+        // kept copy, at a distance of zero.
+        //
+        // The sweep found this: `reduce-cfg-dupetest`, which flips the config from
+        // TDoDupeTest=false to true, survived.  The CUDA passes false at :472 and
+        // the difference is only visible on coincident input, so without planted
+        // duplicates this column could not tell the two apart.
+        if (total >= 12u)
+        {
+            const uint32_t a = rng() % (total / 2u);
+            const uint32_t b = total / 2u + (rng() % (total - total / 2u));
+            pts[b] = pts[a];                              // exact duplicate
+            const uint32_t d = rng() % (total / 2u);
+            const uint32_t e = total / 2u + (rng() % (total - total / 2u));
+            pts[e] = pts[d];
+            pts[e].w = pts[d].w + 0.01f;                  // coincident, shallower
+            ++withDupes;
+        }
+
+        for (uint32_t j = 0; j < 198u; ++j)
+            c.pts[j] = pts[j];
 
         in[i] = c;
         ref[i] = refReduce(pts.data(), total, n, bias);
@@ -311,6 +336,11 @@ PXG_TEST(npTriTriReduce_stream)
                   "npTriTriReduce_stream: only %zu of %u cases needed more than one "
                   "refill pass -- the streaming loop is what this fixture exists to "
                   "test, and it is not being exercised", multiPass, N);
+    PXG_CHECK_MSG(withDupes > N / 2,
+                  "npTriTriReduce_stream: only %zu of %u cases carry coincident staging "
+                  "points -- without them TDoDupeTest=false and =true are "
+                  "indistinguishable, and the CUDA passes false deliberately",
+                  withDupes, N);
     PXG_CHECK_MSG(fullBuffer > N / 10 && shortTail > N / 10,
                   "npTriTriReduce_stream: %zu full-buffer and %zu short-tail cases; "
                   "both shapes are needed (the short tail is the only input where "
@@ -378,8 +408,10 @@ PXG_TEST(npTriTriReduce_stream)
     PXG_CHECK_MSG(mmPts == 0, "npTriTriReduce_stream: %zu keepPoint mismatches", mmPts);
 
     std::printf("  npTriTriReduce_stream: %u cases, %.2f refill passes on average, "
-                "%zu needed more than one; %zu full-buffer, %zu short-tail\n",
-                N, double(totalPasses) / double(N), multiPass, fullBuffer, shortTail);
+                "%zu needed more than one; %zu full-buffer, %zu short-tail, "
+                "%zu with coincident staging points\n",
+                N, double(totalPasses) / double(N), multiPass, fullBuffer, shortTail,
+                withDupes);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

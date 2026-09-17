@@ -118,6 +118,63 @@
 // transcriptions of contactReduceShared all collapse f and g onto one array,
 // which is correct only while the adjustment is zero.  Under wrapper 2 it is not.
 
+// ---------------------------------------------------------------------------
+// THE SWEEP: 13 KILLED, 3 SURVIVE, 1 INERT
+// ---------------------------------------------------------------------------
+// The three survivors are recorded with the argument that survived an attempt to
+// break it -- the attempt RUN, not imagined.  That rule is the one P9.83b-3 paid
+// for: three mutants were called equivalent there and all three fell, twice with
+// a written proof.
+//
+//   deepest-ignores-mask   drop the mask test in the `deepest` loop
+//       PROVABLY EQUIVALENT, and not for the reason first guessed.  The first
+//       guess was that lanes outside the mask hold CRS_FLT_MAX -- false: 195901
+//       of 200000 measured cases have a lane outside the mask holding a FINITE
+//       separation, because a lane culled on the final pass keeps the point it
+//       loaded.  The real reason is that the deepest lane is ALWAYS a survivor:
+//       contactReduction.cuh:126's PCM pick is `minIndex(separation, ...)` on the
+//       RAW separation and always fires here (i0, i1, f and g are drawn from
+//       allMask & ~mask in turn, so popc(mask) == 4 exactly, and maxPoints 6 > 4),
+//       so the deepest lane is in the anchor set; :136 then gives every anchor the
+//       clusterBias discount, so the deepest lane has the globally minimal sepB
+//       and wins whichever cluster it lands in.  min over the mask therefore
+//       equals min over everything.  Measured at bias 1e-5..5e-3 (the engine
+//       passes 1e-5 * toleranceLength, PxgNarrowphaseCore.cpp:1371) and again at
+//       0.01..0.30, which is the whole separation range: 0 differences in 400000
+//       cases.
+//
+//   compact-descending     iterate lanes 31..0 instead of 0..31
+//       PROVABLY EQUIVALENT.  The destination slot is
+//       `countbits(mask & ((1 << l) - 1))` -- a pure function of the lane and the
+//       mask, not of the iteration order.  Every lane writes the same slot either
+//       way.  (The CUDA has no loop at all here: each lane computes its own offset
+//       and stores, which is what makes order irrelevant in the first place.)
+//
+//   counter-incremented-at-end   `++counter2` -> no increment, so the 100-pass
+//                                bound never trips
+//       UNREACHABLE, not equivalent.  `c` advances by popcount(readMask) =
+//       32 - popcount(currentContactMask) per pass, and the reduce caps the
+//       survivor count at 6, so c gains at least 26 per pass after the first
+//       (which gains 32).  totalContacts is at most 198 (the buffer bound the
+//       CUDA asserts at :825), so the loop ends within 8 passes -- a factor of 12
+//       below the bound.  maxCounter is load-bearing as a VALUE (maxcounter-one is
+//       killed) and unreachable at 100.  It stays: it is the engine's, and a bound
+//       that is unreachable today is reachable the moment the buffer grows.
+//
+//   readmask-is-hasmask    `~currentContactMask` -> `~hasMask`   (INERT)
+//       The compiler emitted byte-identical SPIR-V, twice, including after a
+//       forced rebuild with the .spv deleted.  That is a MACHINE-CHECKED proof of
+//       the invariant this file's patchCreationMode argument rests on: hasMask and
+//       currentContactMask are equal at the top of every pass.  Recorded as
+//       evidence, not as a gap.
+//
+// AND ONE SURVIVOR WAS A REAL FIXTURE GAP: reduce-cfg-dupetest (TDoDupeTest false
+// -> true) survived the first sweep because the staging buffer held no coincident
+// points.  The real one does -- tryToAssignContactToExistingPatch copies the
+// existing patch's KeepPoints into tempPointsS and then appends this round's
+// contacts after them, so a contact that has barely moved lands beside its own
+// kept copy at distance zero.  The fixture now plants them (991 of 1200 cases).
+
 import pxgSlangContactReduceSerial;
 
 public static const uint TTP_MESH_MESH_CONTACT_LIMIT = 6u;
