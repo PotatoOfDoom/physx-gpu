@@ -90,14 +90,17 @@
 // a caller may run it on one thread -- which is what triPlaneNpBda already does
 // and what the mesh-mesh kernel will do.
 // ---------------------------------------------------------------------------
-// FOUR MUTANTS SURVIVE THIS MODULE'S SWEEP, AND THREE OF THEM PROVABLY MUST
+// FIVE MUTANTS SURVIVE THIS MODULE'S SWEEP, AND FOUR OF THEM PROVABLY MUST
 // ---------------------------------------------------------------------------
-// P9.83b-2's sweep killed 20 of 25.  One survivor was a real fixture gap (the
-// maxPoints boundary, now covered).  The other four are recorded here with their
-// arguments, so a later sweep does not re-investigate them and -- more importantly
-// -- so nobody "simplifies" the CUDA's spelling on the grounds that no test
-// objects.  The spellings below are kept because they are the ENGINE's, not
+// P9.83b-2's sweep killed 20 of 25.  All five survivors are recorded here with
+// their arguments, so a later sweep does not re-investigate them and -- more
+// importantly -- so nobody "simplifies" the CUDA's spelling on the grounds that no
+// test objects.  The spellings below are kept because they are the ENGINE's, not
 // because a fixture can tell.
+//
+// FOUR ARE PROVABLY EQUIVALENT AND ONE IS EQUIVALENT ON EVERY REACHABLE INPUT.
+// The fifth was first diagnosed as a fixture gap and it was not; see
+// earlyout-strict below, which is the one worth reading.
 //
 //   i1-anchor-order   `point[i0] - point[j]`  ->  `point[j] - point[i0]`
 //       Only the MAGNITUDE of that difference is used.  IEEE subtraction gives
@@ -124,10 +127,26 @@
 //       distance.  The CUDA writes `<` (contactReduction.cuh:147) and so does
 //       this; no random-float fixture will separate them.
 //
-// A fifth, `earlyout-strict` (`newCount <= maxPoints` -> `<`), DID survive the
-// first sweep and was NOT equivalent: the fixture had been built to give every
-// case more than maxPoints live lanes, which excluded the only inputs at which
-// the two spellings differ.  One case in seven now sits exactly on the boundary.
+//   earlyout-strict   `newCount <= maxPoints`  ->  `newCount < maxPoints`
+//       DIAGNOSED WRONG THE FIRST TIME, and the correction is the interesting
+//       part.  It was called a fixture gap: the two spellings differ only at
+//       newCount == maxPoints, and the fixture had been built to give every case
+//       MORE than maxPoints live lanes, so nothing touched the boundary.  One case
+//       in seven was given exactly six live lanes -- and the mutant survived
+//       ANYWAY, which is the answer.
+//
+//       At newCount == maxPoints the reduction cannot do anything but return the
+//       live set.  It picks i0, i1, f, g (four distinct lanes), possibly i4 (a
+//       fifth), then labels every lane with its nearest anchor and takes one lane
+//       per cluster -- clusters are disjoint, so those picks are distinct -- and
+//       finally fills `for i in nbClusters..maxPoints` with one new lane each.
+//       The total is exactly maxPoints lanes drawn from a pool of exactly
+//       maxPoints, so the result IS allMask.  The early-out is a shortcut, not a
+//       behaviour, and the two spellings are provably equivalent.
+//
+//       The boundary cases stay.  They no longer kill a mutant, but they assert
+//       the trivial-return contract of contactReduction.cuh:85 directly, for both
+//       wrappers, which nothing else did.
 module pxgSlangContactReduceSerial;
 
 public static const float CRS_FLT_MAX = 3.402823466e38f;
