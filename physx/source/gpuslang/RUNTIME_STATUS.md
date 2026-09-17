@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **868/868** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **869/869** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.83b-2 added `gpuslang.npCrsWrapper2`, which certifies BOTH wrappers of
 contactReduceShared over one shared serial body -- and asserts they DISAGREE (1523 of 3000
 cases), because a fixture that only checked wrapper 2 against its own mirror would pass
@@ -1934,6 +1934,84 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-5 — die Patch-Maschinerie, erster Teil: `reduceContactsSingleWarp` seriell, und ein toter Parameter
+
+`reduceContactsSingleWarp` (convexMeshMidphase.cu:440-503) wird an :842-843 und
+:950-951 aufgerufen, **beide Male unter `if (warpIndex == 0)`**. Sein Rumpf enthält
+keine Block-Barriere — jedes Kollektiv darin ist warp-lokal —, und in Slang wird
+jedes davon zu `GroupMemoryBarrierWithGroupSync`. Eine 1:1-Abschrift setzt also
+Tausende **Workgroup**-Barrieren unter eine warp-variante Bedingung in einem
+1024-Thread-Block, und llvmpipe hängt. `ttpReduceContactsSerial` hat gar keine
+Barrieren; ein Thread darf ihn ausführen.
+
+**`patchCreationMode` ist ein toter Parameter.** :458 ist seine einzige Lesestelle:
+
+```
+bool needsContact = patchCreationMode ? readMask & (1 << threadIdx.x) : !hasContact;
+```
+
+Mit `readMask = ~currentContactMask` (:457) und, am Ende jeder Iteration,
+`hasContact = currentContactMask & (1 << threadIdx.x)` (:473) gilt die Invariante
+`hasContact == Bit(currentContactMask, lane)` bei jedem Durchlauf — und beim
+Eintritt ebenfalls. Beide Zweige sind dieselbe Bedingung. :843 übergibt `false`,
+:951 `true`, und sie tun dasselbe. Dieser Port hat **einen** Pfad; zwei zu
+schreiben hieße, eine Verzweigung zu erfinden, die die Engine nicht hat — der
+teurere Fehler, weil eine Fixture, die beide ausführt, sie bestätigen würde.
+
+**Maschinell bestätigt:** der Mutant `readmask-is-hasmask` (`~currentContactMask`
+→ `~hasMask`) erzeugte **byte-identisches SPIR-V**, auch nach erzwungenem Neubau
+mit gelöschter `.spv`. Der Compiler hat genau diese Invariante bewiesen.
+
+**Die Fixture prüft die Nachfüll-Disziplin, nicht die Reduktion.**
+`crsContactReduce2` ist durch `gpuslang.npCrsWrapper2` bereits zertifiziert. Neu
+ist die Schleife darum: welchen Staging-Slot jede freie Lane bekommt, dass
+`c += __popc(readMask)` um die **angebotenen** Lanes vorrückt statt um die
+genommenen (:469 — auf dem ersten Durchlauf springt `c` um 32, auch bei drei
+Kontakten), dass der Kompaktierungs-Scan bei :492 über `currentContactMask` läuft
+und der bei :459 über `readMask`, und dass die 100-Durchlauf-Schranke real ist.
+Eine Fallmenge, die stets in einem Durchlauf fertig ist, hätte davon nichts
+geprüft — also zählt die Fixture Durchläufe und schlägt unterhalb einer Schwelle
+fehl: 1200 Fälle, **3,95** Nachfüll-Durchläufe im Mittel, 916 mit mehr als einem,
+200 mit vollem Puffer (198) und 400 mit kurzem Rest.
+
+**Mutations-Durchlauf: 13 getötet, 3 überlebt, 1 inert.**
+
+Ein Überlebender war eine **echte Lücke**: `reduce-cfg-dupetest` (TDoDupeTest
+`false` → `true`) überlebte, weil der Staging-Puffer keine koinzidenten Punkte
+enthielt. Der echte enthält sie —
+`tryToAssignContactToExistingPatch` kopiert die `KeepPoints` des bestehenden
+Patches nach `tempPointsS[0..PointCount)` (:832-833) und hängt die Kontakte dieser
+Runde dahinter (:839); ein Kontakt, der sich kaum bewegt hat, landet also neben
+seiner eigenen aufbewahrten Kopie, im Abstand null. Die Fixture pflanzt sie jetzt
+(991 von 1200 Fällen), und der Mutant ist tot.
+
+Die drei verbleibenden sind belegt, jeder mit einem Versuch, ihn zu brechen — dem
+**ausgeführten**, nicht dem gedachten:
+
+- **`deepest-ignores-mask`** — äquivalent, aber **nicht aus dem naheliegenden
+  Grund**. Die erste Vermutung war, Lanes außerhalb der Maske trügen
+  `CRS_FLT_MAX`. Falsch: **195901 von 200000** gemessenen Fällen haben eine Lane
+  außerhalb der Maske mit **endlicher** Separation, denn eine im letzten Durchlauf
+  gecullte Lane behält ihren geladenen Punkt. Der wirkliche Grund: die tiefste
+  Lane überlebt **immer**. Der PCM-Griff (contactReduction.cuh:126) ist ein
+  `minIndex` auf der **rohen** Separation und feuert hier stets (i0, i1, f, g
+  werden je aus `allMask & ~mask` gezogen, also ist `popc(mask)` exakt 4, und
+  maxPoints 6 > 4); damit ist die tiefste Lane im Ankersatz, und :136 gibt jedem
+  Anker den `clusterBias`-Rabatt — sie hat also das global kleinste `sepB` und
+  gewinnt ihren Cluster. Gemessen im Bias-Bereich der Engine (`1e-5 *
+  toleranceLength`, PxgNarrowphaseCore.cpp:1371) **und** bei 0,01…0,30, also über
+  die gesamte Separationsspanne: **0 Abweichungen in 400000 Fällen.**
+- **`compact-descending`** — äquivalent: der Zielslot ist
+  `countbits(mask & ((1 << l) - 1))`, eine reine Funktion von Lane und Maske, nicht
+  von der Iterationsreihenfolge. Die CUDA hat hier gar keine Schleife.
+- **`counter-incremented-at-end`** — **unerreichbar**, nicht äquivalent. `c` wächst
+  je Durchlauf um `32 − popcount(currentContactMask)`, und die Reduktion deckelt
+  die Überlebenden bei 6; nach dem ersten Durchlauf also um mindestens 26. Bei
+  `totalContacts ≤ 198` endet die Schleife binnen **8** Durchläufen gegen eine
+  Schranke von 100. Als **Wert** ist die Schranke tragend (`maxcounter-one` wird
+  getötet) und bleibt: sie ist die der Engine, und eine heute unerreichbare
+  Schranke wird erreichbar, sobald der Puffer wächst.
 
 ## P9.83b-4 — der Groupshared-Etat der Mesh-gegen-Mesh-Kollision, gemessen statt hochgerechnet
 
