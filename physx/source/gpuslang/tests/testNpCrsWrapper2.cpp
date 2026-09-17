@@ -224,7 +224,7 @@ PXG_TEST(npCrsWrapper2_pair)
 
     std::vector<CrsCase> in(N);
     std::vector<uint32_t> ref1(N), ref2(N);
-    size_t nDiffer = 0, nTrivial = 0;
+    size_t nDiffer = 0, nBoundary = 0, nBoundaryWrong = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -256,15 +256,35 @@ PXG_TEST(npCrsWrapper2_pair)
         for (uint32_t j = 0; j < 32; ++j)
             (&c.sep8[j >> 2].x)[j & 3] = seps[j];
 
-        // A live-lane mask with more than maxPoints bits, or the body returns
-        // allMask unchanged and nothing is reduced at all.
+        // THE LIVE-LANE COUNT, AND THE BOUNDARY THE FIRST DRAFT EXCLUDED.
+        // The body returns allMask unchanged when `newCount <= maxPoints`
+        // (contactReduction.cuh:85).  The first draft insisted on bits > 6 for
+        // EVERY case, reasoning that a trivial return reduces nothing -- and in
+        // doing so it excluded the only inputs at which `<=` and `<` differ.  The
+        // mutation sweep said so: `earlyout-strict` survived.
+        //
+        // So one case in seven now has EXACTLY six live lanes, and those cases
+        // assert the trivial return explicitly.  A boundary no input touches is a
+        // boundary no fixture is testing.
+        const bool atBoundary = (i % 7u) == 3u;
         uint32_t mask = 0;
         while (true)
         {
             mask = rng();
             uint32_t bits = 0;
             for (uint32_t j = 0; j < 32; ++j) bits += (mask >> j) & 1u;
-            if (bits > 6) break;
+            if (atBoundary)
+            {
+                while (bits > 6)                    // trim to exactly six
+                {
+                    uint32_t top = 31;
+                    while (((mask >> top) & 1u) == 0u) --top;
+                    mask &= ~(1u << top);
+                    --bits;
+                }
+                if (bits == 6) break;
+            }
+            else if (bits > 6) break;
         }
         c.misc[0] = mask;
         c.bias = V4{ rf(1e-5f, 5e-3f), 0, 0, 0 };
@@ -275,11 +295,22 @@ PXG_TEST(npCrsWrapper2_pair)
         if (ref1[i] != ref2[i]) ++nDiffer;
         uint32_t bits = 0;
         for (uint32_t j = 0; j < 32; ++j) bits += (mask >> j) & 1u;
-        if (bits <= 6) ++nTrivial;
+        if (bits <= 6)
+        {
+            ++nBoundary;
+            // At or below maxPoints the body must hand allMask straight back --
+            // for BOTH wrappers, since the early-out precedes every criterion.
+            if (ref1[i] != mask || ref2[i] != mask) ++nBoundaryWrong;
+        }
     }
 
-    PXG_CHECK_MSG(nTrivial == 0, "npCrsWrapper2_pair: %zu case(s) have <= 6 live lanes and "
-                                 "return allMask without reducing", nTrivial);
+    PXG_CHECK_MSG(nBoundaryWrong == 0,
+                  "npCrsWrapper2_pair: %zu boundary case(s) did not return allMask unchanged "
+                  "-- the CPU mirror disagrees with contactReduction.cuh:85", nBoundaryWrong);
+    PXG_CHECK_MSG(nBoundary > N / 10,
+                  "npCrsWrapper2_pair: only %zu of %u cases sit at the maxPoints boundary, "
+                  "which is the only place `newCount <= maxPoints` and `<` differ",
+                  nBoundary, N);
     // THE GUARD THAT MAKES THE REST MEAN ANYTHING.  If the two wrappers agreed on
     // every case, this fixture would pass against an implementation in which
     // wrapper 2 simply IS wrapper 1 -- which is exactly the shape the four
@@ -326,8 +357,9 @@ PXG_TEST(npCrsWrapper2_pair)
     // Printed on SUCCESS, not only on failure: the margin above N/4 is the
     // fixture's own strength, and a number that only appears when the test breaks
     // is a number nobody ever reads.
-    std::printf("  npCrsWrapper2_pair: %u cases, the two wrappers disagree on %zu (%.1f%%)\n",
-                N, nDiffer, 100.0 * double(nDiffer) / double(N));
+    std::printf("  npCrsWrapper2_pair: %u cases, the two wrappers disagree on %zu (%.1f%%), "
+                "%zu at the maxPoints boundary\n",
+                N, nDiffer, 100.0 * double(nDiffer) / double(N), nBoundary);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

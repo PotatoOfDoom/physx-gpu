@@ -89,6 +89,45 @@
 // exists to catch exactly that shape.  The serial body has no barriers at all, so
 // a caller may run it on one thread -- which is what triPlaneNpBda already does
 // and what the mesh-mesh kernel will do.
+// ---------------------------------------------------------------------------
+// FOUR MUTANTS SURVIVE THIS MODULE'S SWEEP, AND THREE OF THEM PROVABLY MUST
+// ---------------------------------------------------------------------------
+// P9.83b-2's sweep killed 20 of 25.  One survivor was a real fixture gap (the
+// maxPoints boundary, now covered).  The other four are recorded here with their
+// arguments, so a later sweep does not re-investigate them and -- more importantly
+// -- so nobody "simplifies" the CUDA's spelling on the grounds that no test
+// objects.  The spellings below are kept because they are the ENGINE's, not
+// because a fixture can tell.
+//
+//   i1-anchor-order   `point[i0] - point[j]`  ->  `point[j] - point[i0]`
+//       Only the MAGNITUDE of that difference is used.  IEEE subtraction gives
+//       exactly opposite signs, so the squares and their sum are bit-identical.
+//       Provably equivalent.
+//
+//   dir-cross-order   `cross(normal, p1 - p0)`  ->  `cross(p1 - p0, normal)`
+//       Negates `dir`, hence every dval.  argmax(-d + a) is argmin(d - a) and
+//       argmin(-d - a) is argmax(d + a), so f and g simply SWAP and the mask is
+//       the same set.  Equivalent except where f and g would be the SAME lane (a
+//       total tie in dval), where the pick order decides which lane the second
+//       draw excludes.  Random float inputs do not produce that tie.
+//
+//   dval-origin       `point[j] - point[i0]`  ->  `point[j] - point[i1]`
+//       Adds the SAME constant dot(dir, point[i1] - point[i0]) to every lane's
+//       dval.  A constant added to all lanes preserves every argmax and argmin
+//       over dval +/- adj, so both picks are unchanged.  (Mathematically that
+//       constant is zero -- dir is perpendicular to p1 - p0 by construction -- but
+//       the equivalence does not depend on that; it only needs the shift to be
+//       uniform, which it is even with the cross product rounded.)
+//
+//   cluster-strict-vs-loose   `d < tbest[j]`  ->  `d <= tbest[j]`
+//       Changes which anchor claims a lane only on an EXACT tie of squared
+//       distance.  The CUDA writes `<` (contactReduction.cuh:147) and so does
+//       this; no random-float fixture will separate them.
+//
+// A fifth, `earlyout-strict` (`newCount <= maxPoints` -> `<`), DID survive the
+// first sweep and was NOT equivalent: the fixture had been built to give every
+// case more than maxPoints live lanes, which excluded the only inputs at which
+// the two spellings differ.  One case in seven now sits exactly on the boundary.
 module pxgSlangContactReduceSerial;
 
 public static const float CRS_FLT_MAX = 3.402823466e38f;
