@@ -104,5 +104,14 @@ void crsWrapperPair(uint3 dtid : SV_DispatchThreadID)
     const CrsConfig cfgDupe = crsConfig(true, true, 6, true);
     const uint m3 = crsContactReduce(pt, sep, c.normal.xyz, c.misc.x, c.bias.x, cfgDupe);
 
-    gOut[t] = uint4(m1, m2, m3, 0u);
+    // The FOURTH column is <clustering=FALSE, keepDeepestPCM=true, maxPoints=5,
+    // dupeTest=true> -- the instantiation npCvxTriEmit::contactReduce5 and
+    // pxgSlangConvexTriCloth::contactReduce5 use.  It is the only column that
+    // takes the TClustering=false tail (contactReduction.cuh:159-165), which the
+    // module did not have at all until this commit: every caller folded in
+    // before this one clusters, so an `if` with no `else` looked complete.
+    const CrsConfig cfgNoCluster = crsConfig(false, true, 5, true);
+    const uint m4 = crsContactReduce(pt, sep, c.normal.xyz, c.misc.x, c.bias.x, cfgNoCluster);
+
+    gOut[t] = uint4(m1, m2, m3, m4);
 }

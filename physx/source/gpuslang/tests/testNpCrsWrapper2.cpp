@@ -106,7 +106,7 @@ static uint32_t argMin(const float* vals, uint32_t mask, float& best)
 static uint32_t reduceShared(const V3* ptRaw, const float* sep, V3 normal,
                              uint32_t allMask, float clusterBias,
                              const float* adj, const float* initial, int maxPoints,
-                             bool dupeTest)
+                             bool dupeTest, bool clustering)
 {
     // contactReduction.cuh:65-79, transcribed from the CUDA and not from the
     // Slang.  In CUDA every lane runs this against every set bit of allMask and
@@ -177,7 +177,8 @@ static uint32_t reduceShared(const V3* ptRaw, const float* sep, V3 normal,
         mask |= 1u << i4;
     }
 
-    {                                                                     // :135-165
+    if (clustering)                                                       // :135-158
+    {
         float sepB[32];
         for (uint32_t j = 0; j < 32; ++j)
             sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
@@ -214,6 +215,14 @@ static uint32_t reduceShared(const V3* ptRaw, const float* sep, V3 normal,
         for (int i = nbClusters; i < maxPoints; ++i)
             mask |= 1u << argMin(sepB, allMask & ~mask, v);
     }
+    else                                                              // :159-165
+    {
+        // The fill uses the RAW separation; sepB does not exist on this path.
+        uint32_t count = 0;
+        for (uint32_t j = 0; j < 32; ++j) count += (mask >> j) & 1u;
+        for (uint32_t i = count; i < uint32_t(maxPoints); ++i)
+            mask |= 1u << argMin(sep, allMask & ~mask, v);
+    }
     return mask;
 }
 
@@ -222,7 +231,7 @@ static uint32_t refWrapper1(const V3* pt, const float* sep, V3 n, uint32_t allMa
 {
     float adj[32], initial[32];
     for (uint32_t j = 0; j < 32; ++j) { adj[j] = 0.0f; initial[j] = sep[j]; }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false);
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false, true);
 }
 
 // wrapper 1 with the DEFAULT TDoDupeTest = true -- npTriHfNp's instantiation.
@@ -230,7 +239,7 @@ static uint32_t refWrapper1Dupe(const V3* pt, const float* sep, V3 n, uint32_t a
 {
     float adj[32], initial[32];
     for (uint32_t j = 0; j < 32; ++j) { adj[j] = 0.0f; initial[j] = sep[j]; }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, true);
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, true, true);
 }
 
 // wrapper 2 (contactReduction.cuh:180-188): adj = -separation,
@@ -244,7 +253,16 @@ static uint32_t refWrapper2(const V3* pt, const float* sep, V3 n, uint32_t allMa
         adj[j] = -sep[j];
         initial[j] = mag3(p);
     }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false);
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false, true);
+}
+
+// <clustering=FALSE, keepAnotherDeepestForPCM=true, maxPoints=5, dupeTest=true>
+// -- npCvxTriEmit::contactReduce5 and pxgSlangConvexTriCloth::contactReduce5.
+static uint32_t refNoCluster5(const V3* pt, const float* sep, V3 n, uint32_t allMask, float bias)
+{
+    float adj[32], initial[32];
+    for (uint32_t j = 0; j < 32; ++j) { adj[j] = 0.0f; initial[j] = sep[j]; }
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 5, true, false);
 }
 
 struct CrsParams { uint32_t numCases, pad0, pad1, pad2; };
@@ -271,9 +289,10 @@ PXG_TEST(npCrsWrapper2_pair)
     { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
 
     std::vector<CrsCase> in(N);
-    std::vector<uint32_t> ref1(N), ref2(N), ref3(N);
+    std::vector<uint32_t> ref1(N), ref2(N), ref3(N), ref4(N);
+    std::vector<uint8_t> isChain(N, 0);
     size_t nDiffer = 0, nBoundary = 0, nBoundaryWrong = 0;
-    size_t nDupeDiffer = 0, nPlanted = 0;
+    size_t nDupeDiffer = 0, nPlanted = 0, nChain = 0, nNoClusterDiffer = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -385,6 +404,63 @@ PXG_TEST(npCrsWrapper2_pair)
             planted = 3;
         }
 
+        // ---- THE COINCIDENCE CHAIN -----------------------------------------
+        // COINCIDENCE IS NOT TRANSITIVE.  a~b and b~c does not give a~c, and
+        // that is the whole difference between CUDA's cull and a sequential
+        // one.  With sep[a] < sep[b] < sep[c] along a chain:
+        //   simultaneous (CUDA): b dies to a, c dies to b, a lives   -> {a}
+        //   sequential:          b dies and is REMOVED, so c has no
+        //                        coincident partner left and lives   -> {a,c}
+        // Two mutants survived the sweep on exactly this blind spot
+        // (dupe-applied-in-place, dupe-scan-post-cull).  Neither is equivalent;
+        // the fixture simply had no chain in it.  Three collinear lanes one
+        // STEP apart give d(a,b)^2 = d(b,c)^2 = 4.9e-9 (inside 1e-8) and
+        // d(a,c)^2 = 1.96e-8 (outside) -- both margins a factor of two, and
+        // ~90x the rounding of a coordinate of this magnitude.
+        // ---- THE COINCIDENCE CHAIN, ON ITS OWN THIRD OF THE CASES --------
+        // A chain case is only an input for the columns that CULL, and that is
+        // why it gets its own slice rather than being added to every case.
+        //
+        // Columns 1 and 2 pass dupeTest=false, so three lanes 7e-5 apart reach
+        // their clustering intact, where `d < tbest[j]` compares two squared
+        // distances of ~5e-9 built by cancellation from coordinates of
+        // magnitude ~8.  At ~1.4% error on those, an FMA'd dot() and the
+        // mirror's -ffp-contract=off dot() legitimately disagree: 7 of 3000
+        // cases did, and moving the chain to |p| ~ 0.02 to shorten the
+        // cancellation made it 30, because an isolated tight triple is MORE
+        // likely to supply several anchors, not fewer.  The answer those two
+        // columns give on a chain case is ill-conditioned, full stop.
+        //
+        // Stamping this entry NoContraction would hide that, and would be
+        // wrong for an unrelated reason: none of the module's other callers is
+        // stamped (npTriPlaneNp, npTriHfNp, npCvxCorrelate and triPlaneNpBda
+        // are all absent from PXG_NOCONTRACT_SHADERS), so it would certify a
+        // build of the module the engine never runs.  The note this file used
+        // to carry, claiming they were "already stamped through their engine
+        // callers", was simply wrong.
+        //
+        // So: a third of the cases carry a chain and assert the two culling
+        // columns; the rest carry no chain and assert all four.  Every column
+        // is asserted on more than a thousand cases either way, and no case is
+        // asked a question its instantiation cannot answer.
+        const bool chainCase = (i % 3u) == 1u && nLive >= 9;
+        if (chainCase)
+        {
+            const float STEP = 7e-5f;
+            V3 u{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+            const float ul = mag3(u);
+            u = ul > 1e-3f ? scale3(u, 1.0f / ul) : V3{ 0.5773503f, 0.5773503f, 0.5773503f };
+            const uint32_t ca = live[6], cb = live[7], cc2 = live[8];
+            pts[cb]  = add(pts[ca], scale3(u, STEP));
+            pts[cc2] = add(pts[ca], scale3(u, 2.0f * STEP));
+            // sep[a] < sep[b] < sep[c] along the chain: simultaneously b dies to
+            // a and c dies to b, leaving {a}; sequentially b is removed first and
+            // c then has no coincident partner left, leaving {a, c}.
+            seps[ca] = -0.30f; seps[cb] = -0.20f; seps[cc2] = -0.10f;
+            ++nChain;
+        }
+        isChain[i] = chainCase;
+
         for (uint32_t j = 0; j < 32; ++j)
         {
             c.pt[j] = V4{ pts[j].x, pts[j].y, pts[j].z, 0 };
@@ -396,8 +472,10 @@ PXG_TEST(npCrsWrapper2_pair)
         ref1[i] = refWrapper1(pts, seps, n, mask, c.bias.x);
         ref2[i] = refWrapper2(pts, seps, n, mask, c.bias.x);
         ref3[i] = refWrapper1Dupe(pts, seps, n, mask, c.bias.x);
-        if (ref1[i] != ref2[i]) ++nDiffer;
+        ref4[i] = refNoCluster5(pts, seps, n, mask, c.bias.x);
+        if (!chainCase && ref1[i] != ref2[i]) ++nDiffer;
         if (ref1[i] != ref3[i]) ++nDupeDiffer;
+        if (ref3[i] != ref4[i]) ++nNoClusterDiffer;
         uint32_t bits = 0;
         for (uint32_t j = 0; j < 32; ++j) bits += (mask >> j) & 1u;
         if (bits <= 6)
@@ -420,7 +498,7 @@ PXG_TEST(npCrsWrapper2_pair)
     // every case, this fixture would pass against an implementation in which
     // wrapper 2 simply IS wrapper 1 -- which is exactly the shape the four
     // pre-existing transcriptions had.
-    PXG_CHECK_MSG(nDiffer > N / 4,
+    PXG_CHECK_MSG(nDiffer > N / 5,
                   "npCrsWrapper2_pair: the two wrappers differ on only %zu of %u cases -- "
                   "the inputs cannot distinguish adj=0 from adj=-sep, so this fixture "
                   "would pass with both wrappers implemented identically",
@@ -437,6 +515,18 @@ PXG_TEST(npCrsWrapper2_pair)
                   "cases -- the inputs cannot distinguish TDoDupeTest true from false, "
                   "so this column would pass with the cull not implemented",
                   nDupeDiffer, N);
+    PXG_CHECK_MSG(nChain > N / 5,
+                  "npCrsWrapper2_pair: only %zu of %u cases carry a coincidence CHAIN "
+                  "(they need nine live lanes) -- without one, a sequential cull is "
+                  "indistinguishable from CUDA's simultaneous one", nChain, N);
+    // And the same guard for the fourth column: it differs from the third only
+    // in the TClustering tail and in maxPoints, so if the two never disagreed it
+    // would pass against a module with no else branch at all -- which is exactly
+    // what the module had until this commit.
+    PXG_CHECK_MSG(nNoClusterDiffer > N / 4,
+                  "npCrsWrapper2_pair: the clustering and non-clustering tails agree on "
+                  "all but %zu of %u cases -- this column cannot see a missing "
+                  "TClustering=false branch", nNoClusterDiffer, N);
 
     PxgSlangComputeDevice* dev = testDevice();
     std::vector<uint32_t> outInit(size_t(N) * 4, 0xDEADBEEFu);
@@ -451,17 +541,17 @@ PXG_TEST(npCrsWrapper2_pair)
 
     const auto got = downloadBuffer<uint32_t>(dev, bOut, size_t(N) * 4);
 
-    size_t mm1 = 0, mm2 = 0, mm3 = 0;
+    size_t mm1 = 0, mm2 = 0, mm3 = 0, mm4 = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
-        if (got[i * 4 + 0] != ref1[i])
+        if (!isChain[i] && got[i * 4 + 0] != ref1[i])
         {
             if (mm1 < 4)
                 std::printf("  wrapper1 case %u: got 0x%08x want 0x%08x\n",
                             i, got[i * 4 + 0], ref1[i]);
             ++mm1;
         }
-        if (got[i * 4 + 1] != ref2[i])
+        if (!isChain[i] && got[i * 4 + 1] != ref2[i])
         {
             if (mm2 < 4)
                 std::printf("  wrapper2 case %u: got 0x%08x want 0x%08x\n",
@@ -475,18 +565,28 @@ PXG_TEST(npCrsWrapper2_pair)
                             i, got[i * 4 + 2], ref3[i]);
             ++mm3;
         }
+        if (got[i * 4 + 3] != ref4[i])
+        {
+            if (mm4 < 4)
+                std::printf("  noCluster5 case %u: got 0x%08x want 0x%08x\n",
+                            i, got[i * 4 + 3], ref4[i]);
+            ++mm4;
+        }
     }
     PXG_CHECK_MSG(mm1 == 0, "npCrsWrapper2_pair: %zu wrapper-1 mask mismatches", mm1);
     PXG_CHECK_MSG(mm2 == 0, "npCrsWrapper2_pair: %zu wrapper-2 mask mismatches", mm2);
     PXG_CHECK_MSG(mm3 == 0, "npCrsWrapper2_pair: %zu wrapper-1+dupeTest mask mismatches", mm3);
+    PXG_CHECK_MSG(mm4 == 0, "npCrsWrapper2_pair: %zu <false,true,5,true> mask mismatches", mm4);
     // Printed on SUCCESS, not only on failure: the margin above N/4 is the
     // fixture's own strength, and a number that only appears when the test breaks
     // is a number nobody ever reads.
     std::printf("  npCrsWrapper2_pair: %u cases, the two wrappers disagree on %zu (%.1f%%), "
                 "%zu at the maxPoints boundary; the dupe cull changes the mask on "
-                "%zu (%.1f%%)\n",
+                "%zu (%.1f%%); %zu carry a coincidence chain; the non-clustering "
+                "tail differs on %zu (%.1f%%)\n",
                 N, nDiffer, 100.0 * double(nDiffer) / double(N), nBoundary,
-                nDupeDiffer, 100.0 * double(nDupeDiffer) / double(N));
+                nDupeDiffer, 100.0 * double(nDupeDiffer) / double(N), nChain,
+                nNoClusterDiffer, 100.0 * double(nNoClusterDiffer) / double(N));
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

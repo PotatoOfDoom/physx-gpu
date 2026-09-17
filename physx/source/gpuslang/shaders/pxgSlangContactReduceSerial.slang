@@ -332,6 +332,25 @@ public uint crsReduceShared(float3 ptRaw[32], float sep[32], float3 normal,
         for (int i = nbClusters; i < cfg.maxPoints; ++i)
             mask |= 1u << crsArgMin(sepB, allMask & ~mask, v);
     }
+    else
+    {
+        // contactReduction.cuh:159-165.  THIS BRANCH WAS MISSING FOR TWO
+        // COMMITS and the omission was invisible, because all three callers
+        // folded in so far pass TClustering = true.  It bites the moment a
+        // clustering=false caller is folded -- npCvxTriEmit::contactReduce5 and
+        // pxgSlangConvexTriCloth::contactReduce5, which are <false,true,5,true>
+        // and BOTH implement this loop correctly in their own bodies.  Folding
+        // them onto the module as it stood would have silently dropped the
+        // fill-out and emitted a short manifold: the shared body less complete
+        // than the copies it replaced, which is the failure mode consolidation
+        // is supposed to remove rather than centralise.
+        //
+        // The fill uses the RAW separation, not the cluster-biased sepB -- sepB
+        // does not exist on this path at all.
+        uint count = countbits(mask);
+        for (uint i = count; i < uint(cfg.maxPoints); ++i)
+            mask |= 1u << crsArgMin(sep, allMask & ~mask, v);
+    }
     return mask;
 }
 

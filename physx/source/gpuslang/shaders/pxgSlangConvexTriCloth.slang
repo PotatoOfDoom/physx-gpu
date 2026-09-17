@@ -83,6 +83,7 @@
 // u8[2*nbEdges], facesByVertices u8[3*nbVerts], vertexData8 u8[].
 
 import pxgSlangCommon;
+import pxgSlangContactReduceSerial;
 // P9.15c: the hull is read through the SHARED BDA accessors instead of a bound
 // StructuredBuffer.  pxgSlangConvexHull already decodes this exact blob for the
 // particle-vs-hull path (P9.14b), and its section offsets were verified to match
@@ -489,94 +490,21 @@ bool computeBarycentric(float3 a, float3 b, float3 c, float3 p, out float4 baryc
 }
 
 // ---- contactReduce<false, true, 5, true> (contactReduction.cuh; tranche 82)
-uint lowestArgMax(float vals[32], uint mask, out float best)
-{
-    best = -PXG_MAX_F32;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-uint lowestArgMin(float vals[32], uint mask, out float best)
-{
-    best = PXG_MAX_F32;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-// clustering = false, keepAnotherDeepestForPCM = true, maxPoints = 5,
-// dupeTest = true, distanceAdjustment = 0, initial criterion = separation
+// contactReduce<clustering=false, keepAnotherDeepestForPCM=true, maxPoints=5,
+// dupeTest=true>(pointRaw, separation, normal, allMask, 0) -- distanceAdjustment
+// = 0, initial criterion = separation (contactReduction.cuh :172).
+//
+// P9.83b-3: THE BODY MOVED OUT to pxgSlangContactReduceSerial.  This is the
+// clustering=FALSE instantiation, and folding it is what forced the module to
+// grow CUDA's `else` tail (contactReduction.cuh:159-165): the module had an `if
+// (cfg.clustering)` with no else, which looked complete only because every
+// caller folded in before this one clusters.  Folding this body onto the module
+// as it stood would have silently dropped the fill-out loop and emitted a short
+// manifold -- the shared body less complete than the copy it replaced.
 uint contactReduce5(float3 ptRaw[32], float sep[32], float3 normal, uint allMask)
 {
-    const int maxPoints = 5;
-
-    float3 point[32];
-    for (uint j = 0; j < 32; ++j)
-        point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);
-
-    // duplicate cull
-    {
-        uint dupeBallot = 0;
-        for (uint j = 0; j < 32; ++j)
-        {
-            if (((allMask >> j) & 1) == 0) continue;
-            bool imADupe = false;
-            for (uint i = 0; i < 32; ++i)
-            {
-                if (((allMask >> i) & 1) == 0) continue;
-                const float3 dv = ptRaw[i] - ptRaw[j];
-                const float d = dot(dv, dv);
-                if (d < 1e-8f && (sep[i] < sep[j] || (sep[i] == sep[j] && i > j)))
-                    imADupe = true;
-            }
-            if (imADupe) dupeBallot |= 1u << j;
-        }
-        allMask &= ~dupeBallot;
-    }
-
-    if (countbits(allMask) <= uint(maxPoints))
-        return allMask;
-
-    float v;
-    float vals[32];
-
-    for (uint j = 0; j < 32; ++j) vals[j] = sep[j];
-    const uint i0 = lowestArgMax(vals, allMask, v);
-    uint mask = 1u << i0;
-
-    // P9.47: contactReduction.cuh:93 is `(shuffle(point, i0) - point).magnitude()`.
-    for (uint j = 0; j < 32; ++j)
-    {
-        const float3 d0 = point[i0] - point[j];
-        vals[j] = sqrt(dot(d0, d0));
-    }
-    const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const float3 dir = cross(normal, point[i1] - point[i0]);
-    float dval[32];
-    for (uint j = 0; j < 32; ++j) dval[j] = dot(dir, point[j] - point[i0]);
-
-    const uint f = lowestArgMax(dval, allMask & ~mask, v);
-    mask |= 1u << f;
-    const uint g = lowestArgMin(dval, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    // one extra deepest contact for PCM
-    if (countbits(mask) == 4)
-    {
-        const uint i4 = lowestArgMin(sep, allMask & ~mask, v);
-        mask |= 1u << i4;
-    }
-
-    // fill with the deepest unselected contacts
-    for (uint i = countbits(mask); i < uint(maxPoints); ++i)
-        mask |= 1u << lowestArgMin(sep, allMask & ~mask, v);
-
-    return mask;
+    return crsContactReduce(ptRaw, sep, normal, allMask, 0.0f,
+                            crsConfig(false, true, 5, true));
 }
 
 // ---- writeRigidVsDeformableContact (PxgFEMCore.h) ---------------------------
