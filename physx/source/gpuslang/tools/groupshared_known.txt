@@ -1,0 +1,19 @@
+# groupshared_known.txt -- the P9.83b-1 ratchet (check_groupshared.py).
+#
+#     <shader stem>:<entry point>    <measured bytes>
+#
+# Entry points above the 24576-byte watermark (75% of llvmpipe's measured
+# maxComputeSharedMemorySize of 32768).  Being here is not a failure.  It is the
+# statement that this entry point is close enough to the limit that the next
+# module import could push it over -- and the person who adds that import will not
+# be looking here, so the number may not grow without being re-read.
+#
+# THE LIMIT WAS MEASURED, NOT ASSUMED: `vulkaninfo | grep maxComputeSharedMemorySize`
+# on this device reports 32768, which matches the figure RUNTIME_STATUS.md recorded
+# when P5 had to cap solveWholeIslandTGS's staging 944 -> 640.
+#
+# ONE ENTRY POINT IN 171 IS ABOVE THE WATERMARK, and it is that same one.  At 31744
+# it sits 1024 bytes under a hard pipeline-creation failure -- 96.9% -- which is
+# the P5 cap having landed only just inside.  Four float3[640] staging arrays are
+# 30720 of it.  Nothing was watching that margin until this checker existed.
+solverTGS:solveWholeIslandTGS    31744

@@ -7,7 +7,16 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **866/866** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **867/867** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-1 added `gpuslang.groupshared`, the EIGHTEENTH static checker and the THIRD written
+because its defect had already happened: P5 capped solveWholeIslandTGS's shared staging
+944 -> 640 entries after a pipeline-creation failure, found by hand and late.  It measures
+Workgroup storage out of the compiled SPIR-V, PER ENTRY POINT (Vulkan applies the limit per
+pipeline, and one .spv here carries eleven entries), against llvmpipe's measured
+maxComputeSharedMemorySize of 32768.  One entry point in 171 is above the 75% watermark --
+that same solveWholeIslandTGS, at 31744, which is 1024 bytes from a hard failure.  It also
+REFUTED the P9.83b audit's claim that a dead-on-this-path groupshared declaration still
+costs budget: it does not, and that is 4096 bytes of the projection that blocked P9.83b.
 P9.83a added `gpuslang.subwordStore`, the SEVENTEENTH static checker and the first written
 because a MUTANT SURVIVED rather than because a defect shipped: a plain read-modify-write of
 a sub-word store is a lost update whenever two of the four byte lanes in a word have
@@ -1920,6 +1929,108 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-1 — der achtzehnte Prüfer misst den Groupshared-Verbrauch, und der TGS-Solver steht 1 KB vor der Wand
+
+Blocker 1 aus dem P9.83b-Audit lautete: „der Port passt nicht in 32 KiB, Projektion
+~38,9 KB". Davor hatte **meine eigene Handrechnung** ~29,2 KB ergeben und
+geschlossen „passt". Zwei Zahlen, beide Arithmetik auf den CUDA-Deklarationen, beide
+falsch. Diese Tranche baut stattdessen eine **Messung**.
+
+### Warum die Handrechnung prinzipiell danebengeht
+
+Zwei Effekte, die der Quelltext nicht zeigen kann:
+
+* **Struct-Padding.** SPIR-V legt Workgroup-Structs nach der Ausrichtung ihrer
+  Mitglieder aus. `struct Patch` ist in CUDA 116 Byte und in Workgroup-Storage
+  **128**, weil das `float4`-Array 16-Byte-Ausrichtung auf den ganzen Datensatz
+  erzwingt. Über ein Array von 128 sind das 1.536 Byte, die niemand aufgeschrieben
+  hat.
+* **Importierte Module bringen eigenen Groupshared mit.** `pxgSlangSdfFind` allein
+  steuert 8192 + 4096 + 136 bei.
+
+Also muss die Zahl aus dem kompilierten `.spv` kommen. `tools/check_groupshared.py`
+liest sie da heraus — es gibt kein `spirv-dis` in diesem Baum und es braucht auch
+keins, `tools/spv_nocontract.py` parst SPIR-V längst von Hand.
+
+### Der erste Entwurf war falsch, und zwar auf lehrreiche Weise
+
+Erster Lauf: `solverTGS` mit **34.176 Byte, über dem Limit um 1.408** — bei einem
+Shader, dessen ctest grün ist und dessen Szenen Kisten korrekt ablegen. Der Shader
+war in Ordnung; der **Prüfer** summierte über alle Workgroup-Variablen des Moduls.
+Eine `.spv` hier trägt **elf** Entry Points (`tests/CMakeLists.txt:180`), und Vulkan
+wendet `maxComputeSharedMemorySize` **pro Pipeline** an. Slang emittiert SPIR-V 1.5,
+wo die Interface-Liste von `OpEntryPoint` jede global benutzte Variable nennen muss,
+Workgroup eingeschlossen — die Zuordnung steht also im Binärformat und muss nicht
+aus einem Aufrufgraphen geraten werden.
+
+**Das Limit selbst ist gemessen, nicht angenommen**: `vulkaninfo` meldet auf diesem
+Gerät 32768.
+
+### Was die Messung gefunden hat
+
+Von 171 Entry Points mit Groupshared liegt **einer** über der 75-%-Marke:
+
+```
+31744   96.9%  solverTGS:solveWholeIslandTGS      <- 1024 Byte vor dem harten Ausfall
+21896   66.8%  rigidDeltaAccumBda:accumulateDeltaVRigidSecondLaunchMultiStage2
+21896   66.8%  rigidDeltaAccumBda:accumulateDeltaVRigidSecondLaunchMultiStage1
+21808   66.6%  rigidDeltaAccumBda:accumulateDeltaVRigidFirstLaunch
+12424   37.9%  femClothSdfMeshCgBda:cloth_sdfMeshContactGenLaunch
+```
+
+Vier `float3[640]`-Staging-Arrays sind 30.720 davon. Das ist **genau die Kappung, die
+P5 von Hand vornehmen musste** (944 → 640) — und sie ist nur knapp innen gelandet.
+Diese Marge hat bis jetzt niemand beobachtet. Der Eintrag steht jetzt auf einer
+Ratsche, die schrumpfen darf und nicht wachsen.
+
+Beide Regeln wurden **vor der Registrierung durch Mutation verifiziert**: ein absichtlich
+aufgeblähtes `groupshared float4[2100]` in `triTriOverlapBda` wurde mit 33.600 Byte
+und dem Überhang gemeldet.
+
+### Und das Audit wird korrigiert
+
+Das Audit behauptete, eine auf dem Aufruferpfad **tote** Deklaration belege den
+Etat trotzdem, „weil SPIR-V das `OpVariable` behält". Gemessen ist das für diesen
+Compiler **falsch**:
+
+```
+femClothSdfMeshCgBda:cloth_sdfMeshContactGenLaunch   12424 B   gSdfIndices2, KEIN gSdfIndices
+softBodySdfMidphaseBda:sb_sdfMeshMidphase...          8328 B   gSdfIndices,  KEIN gSdfIndices2
+```
+
+`pxgSlangSdfFind` deklariert beide; jeder Aufrufer trägt nur die, die er benutzt. Eine
+ungenutzte Workgroup-Variable aus einer eingebundenen Datei kostet **nichts**.
+
+### Der neue, gemessene Etat für P9.83b
+
+```
+Sammel-Maschinerie, am Geschwister gemessen        12.424   (gSdfIndices2 = triangleIndicesS)
+patchesS[128], SPIR-V-gepolstert                   16.384   (handgepackt 14.848)
+tempPointsS[198] float4                             3.168
+trianglesToSubdivideS[256] uint2                    2.048
+countersS[32] + shMinSepS[32]                         256
+patchStartIndexS[128]                                 512
+Skalare                                                24
+                                                   ------
+                                                   34.816   -> 2.048 zu viel
+handgepackter Patch                                33.280   ->   512 zu viel
+```
+
+**Und hier treffen sich Blocker 1 und Blocker 2.** `gPxgWarpScratch` (4.096) existiert
+nur, weil der Port Warp-Intrinsics über Groupshared emuliert. Blocker 2 verlangt
+ohnehin, `reduceContactsSingleWarp` **auf einen Thread zu serialisieren** statt es
+unter `if (warpIndex == 0)` mit Block-Barrieren laufen zu lassen — genau das, was
+`triPlaneNpBda` schon tut. Fällt die Warp-Emulation aus dem heißen Pfad, fällt auch
+ihr Scratch:
+
+```
+34.816 - 4.096 = 30.720   passt, 2 KB Luft
+33.280 - 4.096 = 29.184   passt, 3,5 KB Luft
+```
+
+Die beiden Blocker sind derselbe Blocker. Das ist die Struktur, nach der P9.83b
+gebaut wird, und sie steht fest, bevor die erste Zeile Kernel geschrieben ist.
 
 ## P9.83b-pre — der Beobachter für die Mesh-gegen-Mesh-Kollision, und zwei harte Blocker, die ein Audit vor dem ersten Codezeile gefunden hat
 

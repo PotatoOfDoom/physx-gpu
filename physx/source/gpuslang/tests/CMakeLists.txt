@@ -2642,6 +2642,31 @@ add_test(NAME gpuslang.subwordStore
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_subword_store.py)
 
 # ---------------------------------------------------------------------------
+# No entry point may declare more Workgroup storage than the device allows
+# (P9.83b-1).  The EIGHTEENTH static checker, and the THIRD written because its
+# defect had already happened: P5 had to cap solveWholeIslandTGS's shared staging
+# 944 -> 640 entries after a pipeline-creation failure, found by hand and late.
+#
+# llvmpipe reports maxComputeSharedMemorySize = 32768 (measured with vulkaninfo,
+# not assumed).  Past it, vkCreateComputePipelines fails, the kernel is never
+# dispatched, and on this port an undispatched kernel is SILENT -- the same
+# failure mode the [pxg-unmapped] guards exist for.
+#
+# THE NUMBER COMES OUT OF THE COMPILED .spv, not out of arithmetic on the source,
+# because two effects the source cannot show move it: SPIR-V pads Workgroup
+# structs to their members' alignment, and an import brings its module's
+# groupshared along.  P9.83b's projection for triangleTriangleCollision was done
+# both ways by hand and came out 29.2 KB one time and 38.9 KB the other.
+#
+# It found one entry point in 171 above the 75% watermark -- solveWholeIslandTGS,
+# at 31744 of 32768, which is 1024 bytes from a hard failure.  That margin was
+# unwatched until this existed.  Verified by mutation before registering: a
+# deliberately bloated groupshared array in triTriOverlapBda was reported at 33600
+# with the overage named.
+add_test(NAME gpuslang.groupshared
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_groupshared.py ${SHADER_OUT_DIR})
+
+# ---------------------------------------------------------------------------
 # A mapped kernel must have a launch-ABI row, or the engine cannot run it
 # (P9.48d).  The EIGHTH static checker, and the only one written because the
 # defect had already happened.
