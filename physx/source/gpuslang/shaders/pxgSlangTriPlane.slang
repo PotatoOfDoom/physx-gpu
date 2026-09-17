@@ -53,6 +53,7 @@ module pxgSlangTriPlane;
 
 import pxgSlangCommon;
 import pxgSlangPcmManifold;
+import pxgSlangContactReduceSerial;   // P9.83b-2: the reduction body, shared
 
 public static const uint PLANE_TRI_MAX_CONTACTS = 6u;
 public static const float MESH_MANIFOLD_EPSILON = 0.05f;
@@ -70,111 +71,33 @@ public float calculatePCMConvexMargin(float3 extents_, float3 scale, float toler
     return min(mn * BOX_MARGIN_RATIO, toleranceLength * MESH_MANIFOLD_EPSILON);
 }
 
-// NOTE: with an empty mask (or all masked values at the sentinel) these
-// return idx 0, unlike CUDA maxIndex/minIndex (lowest MASKED index); every
-// call site below provably passes a nonempty mask with finite values
+// P9.83b-2: these moved into pxgSlangContactReduceSerial with the reduction body
+// that uses them, and are re-exported here because npTriPlaneNp and triPlaneNpBda
+// name them.  Thin forwarders, not a second implementation.
 public uint lowestArgMax(float vals[32], uint mask, out float best)
 {
-    best = -FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
+    return crsArgMax(vals, mask, best);
 }
 public uint lowestArgMin(float vals[32], uint mask, out float best)
 {
-    best = FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
+    return crsArgMin(vals, mask, best);
 }
 
 // contactReduce<clustering=true, keepDeepestPCM=true, maxPoints=6, dupeTest=false>
-// (contactReduction.cuh via the tranche-82 transcription), on lane arrays
+// (contactReduction.cuh, wrapper 1), on lane arrays.
+//
+// P9.83b-2: THE BODY MOVED OUT.  It is contactReduceShared, which is ONE CUDA
+// template that this corpus had transcribed four times -- once per instantiation
+// -- and a fifth was about to be written for triangleTriangleCollision's
+// contactReduce2 wrapper.  pxgSlangContactReduceSerial now holds it once, with
+// the template arguments as a CrsConfig and the wrapper's two inputs as
+// parameters.  This is a thin adapter; its two fixtures re-ran bit-exactly across
+// the move, which is the evidence the transcription was faithful, not a reason to
+// have kept it here.
 public uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask, float clusterBias)
 {
-    const int maxPoints = int(PLANE_TRI_MAX_CONTACTS);
-    float3 point[32];
-    for (uint j = 0; j < 32; ++j)
-        point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);
-
-    const uint newCount = countbits(allMask);
-    if (newCount <= uint(maxPoints))
-        return allMask;
-
-    float v;
-    float vals[32];
-
-    for (uint j = 0; j < 32; ++j) vals[j] = sep[j];
-    const uint i0 = lowestArgMax(vals, allMask, v);
-    uint mask = 1u << i0;
-
-    for (uint j = 0; j < 32; ++j)
-    {
-        const float3 d = point[i0] - point[j];
-        vals[j] = sqrt(dot(d, d)); // PxVec3::magnitude(); sqrt(dot) keeps the
-                                   // IEEE-sqrt assumption minimal vs OpLength
-    }
-    const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const float3 dir = cross(normal, point[i1] - point[i0]);
-    float dval[32];
-    for (uint j = 0; j < 32; ++j) dval[j] = dot(dir, point[j] - point[i0]);
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint f = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << f;
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint g = lowestArgMin(vals, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    if (countbits(mask) == 4 && maxPoints > 4)
-    {
-        const uint i4 = lowestArgMin(sep, allMask & ~mask, v);
-        mask |= 1u << i4;
-    }
-
-    // clustering
-    {
-        float sepB[32];
-        for (uint j = 0; j < 32; ++j)
-            sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
-
-        int label[32];
-        int nbClusters = 0;
-        {
-            uint m = mask;
-            float tbest[32];
-            for (uint j = 0; j < 32; ++j) { tbest[j] = FLT_MAX_LOCAL; label[j] = -1; }
-            for (; m != 0; ++nbClusters, m &= (m - 1))
-            {
-                const uint anchor = firstbitlow(m);
-                for (uint j = 0; j < 32; ++j)
-                {
-                    const float3 dv = point[j] - point[anchor];
-                    const float d = dot(dv, dv);
-                    if (d < tbest[j]) { tbest[j] = d; label[j] = nbClusters; }
-                }
-            }
-        }
-
-        mask = 0;
-        for (int i = 0; i < nbClusters; ++i)
-        {
-            uint cluster = 0;
-            for (uint j = 0; j < 32; ++j)
-                if (label[j] == i) cluster |= 1u << j;
-            cluster &= allMask;
-            if (cluster != 0)
-                mask |= 1u << lowestArgMin(sepB, cluster, v);
-        }
-        for (int i = nbClusters; i < maxPoints; ++i)
-            mask |= 1u << lowestArgMin(sepB, allMask & ~mask, v);
-    }
-    return mask;
+    return crsContactReduce(ptRaw, sep, normal, allMask, clusterBias,
+                            crsConfig(true, true, int(PLANE_TRI_MAX_CONTACTS)));
 }
 
 
