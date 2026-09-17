@@ -17,3 +17,25 @@
 # the P5 cap having landed only just inside.  Four float3[640] staging arrays are
 # 30720 of it.  Nothing was watching that margin until this checker existed.
 solverTGS:solveWholeIslandTGS    31744
+
+# P9.83b-4: the MEASURED budget for doTriangleTriangleCollision
+# (convexMeshMidphase.cu:972-1231), taken from a probe that computes nothing --
+# npTriTriSharedProbe.slang -- because the answer decides whether that kernel can
+# be ONE entry point at all, and it was needed before the kernel was written.
+#
+# P9.83b-pre PROJECTED 34816 and called the kernel blocked.  P9.83b-2 argued the
+# blocker dissolves once the reduction is serial, because the warp-emulated
+# form's gPxgWarpScratch (4096 B) goes away: 34816 - 4096 = 30720.  The probe
+# declares the CUDA's nine shared buffers one for one and omits gPxgWarpScratch,
+# and the answer is 30168 -- so the argument was right, and it is now a
+# measurement instead of an argument.  The kernel FITS.
+#
+# IT FITS BY 2600 BYTES, which is 92.1% of the limit.  That is the entire point of
+# the entry: one module import carrying Workgroup storage, one more field on
+# SparseSdfTexture, or MAX_MESH_MESH_PATCHES moving off 128, and the pipeline stops
+# being creatable.  16384 of the 30168 is patchesS[128] alone.
+#
+# THIS ENTRY IS TEMPORARY.  When the real kernel lands it supersedes the probe,
+# and the probe -- along with this entry and its pxg_compile_shader line -- is to
+# be DELETED, not left behind measuring a budget nothing spends.
+npTriTriSharedProbe:triTriSharedProbe    30168

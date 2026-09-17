@@ -1935,6 +1935,40 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-4 — der Groupshared-Etat der Mesh-gegen-Mesh-Kollision, gemessen statt hochgerechnet
+
+Der Kernel `doTriangleTriangleCollision` (convexMeshMidphase.cu:972-1231) war seit
+P9.83b-pre an einer **Hochrechnung** blockiert: 34816 Bytes Workgroup-Speicher gegen
+llvmpipes gemessene `maxComputeSharedMemorySize` von 32768, die Vulkan **pro
+Pipeline** anwendet. P9.83b-2 argumentierte, der Blocker löse sich auf, sobald die
+Kontaktreduktion seriell ist, weil `gPxgWarpScratch` (4096 B) der Warp-Form
+entfällt: 34816 − 4096 = 30720.
+
+Das war ein **Argument**. In dieser Tranche sind drei Argumente gefallen, zwei davon
+mit ausgeschriebenem „Beweis". Also wurde gemessen: `npTriTriSharedProbe.slang`
+deklariert CUDAs neun Shared-Puffer eins zu eins — `patchesS[128]`,
+`tempPointsS[198]`, `countersS[32]`, `shMinSepS[32]`, `triangleIndicesS[1024]`,
+`trianglesToSubdivideS[256]`, `numTrianglesToSubdivideS`, `SparseSdfTexture`,
+`anyKeepS` — lässt `gPxgWarpScratch` weg, rechnet **nichts** und wird von
+`gpuslang.groupshared` aus dem übersetzten SPIR-V ausgelesen.
+
+**Ergebnis: 30168 Bytes.** Der Kernel **passt** als EIN Entry Point. Das Argument
+war richtig; es ist jetzt eine Messung.
+
+Er passt mit **2600 Bytes Luft**, also bei 92,1 % des Limits — und genau deshalb
+steht er im Ratchet. Ein einziger Modul-Import mit Workgroup-Speicher, ein weiteres
+Feld an `SparseSdfTexture` oder `MAX_MESH_MESH_PATCHES` abseits von 128, und die
+Pipeline lässt sich nicht mehr erzeugen. Allein `patchesS[128]` sind 16384 der
+30168 Bytes.
+
+Jede Deklaration der Sonde wird gelesen UND geschrieben: P9.83b-1 hatte belegt, dass
+eine UNGENUTZTE Workgroup-Variable nichts kostet (SPIR-V listet sie dann nicht in
+`OpEntryPoint`), und eine Sonde, die sich darauf verlässt, misst nichts.
+
+**Die Sonde ist temporär.** Sobald der echte Kernel steht, ersetzt er sie; Sonde,
+Ratchet-Eintrag und `pxg_compile_shader`-Zeile werden dann gelöscht, statt einen
+Etat weiterzumessen, den niemand mehr ausgibt.
+
 ## P9.83b-3 — sieben Abschriften statt vier, ein fehlender CUDA-Zweig, und ein „bewiesener" Beweis, der falsch war
 
 **Die Zählung war falsch.** Der Modulkopf und die Commits 3/n und 4/n sprachen von
