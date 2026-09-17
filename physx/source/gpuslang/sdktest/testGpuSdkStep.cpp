@@ -392,6 +392,43 @@ void buildSdfMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     PxRigidDynamic* b = addDynamic(physics, scene, material,
                                    PxTriangleMeshGeometry(sdfBox), inertia, 5.0f, 4.0f);
     targets.push_back({ b, 5.0f, 2.0f + H, "sdfBoxOnMesh" });
+
+    // ---- the STACK, and why it is not decoration (P9.83b) -----------------------------
+    // Everything above this line puts a dynamic SDF mesh against a shape that has NO SDF:
+    // the plane, and the shelf, which is cooked deliberately without one (see :366).  That
+    // reaches exactly ONE of triangleTriangleCollision's two arms and ONE of its two passes:
+    //
+    //   * convexMeshMidphase.cu:1100 and :1120 branch on `mesh0.mTexObject == NULL` -- the
+    //     "only one object has an SDF" path, which THROWS THE SDF GRADIENT AWAY and
+    //     substitutes the triangle normal, sign-corrected by triangleNormalSign.  With the
+    //     shelf SDF-less, every contact of sdfBoxOnMesh takes that arm.  The genuine
+    //     two-SDF gradient is never executed by any scene in this tree.
+    //   * the outer loop's second pass is entered only `if (mesh0.mTexObject)`
+    //     (convexMeshMidphase.cu:1045-1055), else it breaks.  With one SDF in the pair the
+    //     loop breaks after pass 0, so the whole `outer == 1` arm -- which reverses the
+    //     roles, gathers with aToB.getInverse() and applies the OTHER shape's scale, and
+    //     whose tail NEGATES the normal where pass 0 does not -- is dead.
+    //
+    // Two dynamic SDF boxes stacked put an SDF on BOTH sides of one contact manager, which
+    // is the smallest change that opens both.  No new cooking: they are the same sdfBox.
+    //
+    // THE RED PREDICTION, which is what makes this an observable rather than a hope: with
+    // triangleTriangleCollision unmapped the top box cannot see the bottom one at all, falls
+    // straight through it and settles on the plane at 0.5 instead of 1.5.  The bottom box is
+    // unaffected either way -- it rests on the plane through trimeshPlaneNarrowphase, which
+    // P9.82 mapped -- so a failure here cannot be blamed on the plane path.
+    // BOTH BOXES HAVE TO FALL.  The first draft spawned the bottom one AT its resting
+    // height and the harness rejected it -- "did not begin falling" -- which is the right
+    // answer: a body that never moves cannot distinguish working physics from none, and
+    // that check exists so a scene cannot accidentally score a control.  The bottom drops
+    // 1.5 m and is settled in about a third of a second; the top drops the same 4.5 m as
+    // sdfBoxOnPlane, so it arrives long after.
+    PxRigidDynamic* c = addDynamic(physics, scene, material,
+                                   PxTriangleMeshGeometry(sdfBox), inertia, 2.0f, 0.0f);
+    targets.push_back({ c, 2.0f, H, "sdfBoxStackBottom" });
+    PxRigidDynamic* d = addDynamic(physics, scene, material,
+                                   PxTriangleMeshGeometry(sdfBox), inertia, 6.0f, 0.0f);
+    targets.push_back({ d, 6.0f, 3.0f * H, "sdfBoxStackTop" });
 }
 
 // A cooked TRIANGLE MESH floor at y = 0: two triangles wound so the normals point

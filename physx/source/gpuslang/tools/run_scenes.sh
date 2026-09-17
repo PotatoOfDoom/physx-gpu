@@ -191,6 +191,19 @@ if [ "${1:-}" = "--diagnostics" ]; then
     #   sdfBoxOnPlane  5.0000 -> 0.5000 (rest 0.500)  CAUGHT
     #   sdfBoxOnMesh   5.0000 -> 0.5000 (rest 2.500)  falls THROUGH the raised mesh
     #                                                 and lands on the plane instead
+    # P9.83b-pre ADDED THE STACK ARM, because the scene above it could reach only ONE
+    # of the kernel's two SDF arms and ONE of its two passes.  The plane has no SDF and
+    # the shelf is cooked without one, so every contact took the "only one object has an
+    # SDF" branch (convexMeshMidphase.cu:1100/:1120), which throws the SDF gradient away
+    # and substitutes the triangle normal -- and the outer loop's second pass is entered
+    # only `if (mesh0.mTexObject)` (:1045-1055), so it broke after pass 0 every time.
+    # Two dynamic SDF boxes stacked put an SDF on BOTH sides of one contact manager.
+    # Measured with the kernel still unmapped:
+    #   sdfBoxStackBottom  2.0000 -> 0.5000 (rest 0.500)  PASSES -- the control, and it
+    #                      rests through the PLANE kernel P9.82 mapped, so a failure of
+    #                      the row below cannot be blamed on the plane path
+    #   sdfBoxStackTop     6.0000 -> 0.5000 (rest 1.500)  falls THROUGH the bottom box
+    #   triangleTriangleCollision launched 10x -> 44x     (the new pair really reaches it)
     # P9.83a mapped triangleTriangleOverlaps, the FIRST of the two mesh-vs-mesh
     # kernels.  The heights are unchanged -- the overlap byte is only the input to
     # the second kernel, so nothing it decides can reach a contact yet -- but the

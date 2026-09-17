@@ -1921,6 +1921,115 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-pre — der Beobachter für die Mesh-gegen-Mesh-Kollision, und zwei harte Blocker, die ein Audit vor dem ersten Codezeile gefunden hat
+
+Diese Tranche portiert **nichts**. Sie baut den Beobachter und schreibt auf, was ein
+achtfach gefächertes Lese-Audit von `triangleTriangleCollision` (convexMeshMidphase.cu
+:1290-1377 plus `doTriangleTriangleCollision` :972-1232) zutage gefördert hat — zwei
+davon sind **harte Blocker**, die einen naiven Port mitten hinein laufen ließen.
+
+### Der Beobachter kommt zuerst, und er konnte die Hälfte des Kernels nicht sehen
+
+`PXG_SCENE=sdfmesh` (P9.82a) stellte eine dynamische SDF-Kiste gegen eine Ebene und
+gegen ein Regal. **Beide Gegenstücke haben kein SDF** — das Regal absichtlich, siehe den
+Kommentar bei `testGpuSdkStep.cpp:366`. Folge:
+
+* `convexMeshMidphase.cu:1100` und `:1120` verzweigen auf `mesh0.mTexObject == NULL` —
+  den Pfad „nur ein Objekt hat ein SDF", der **den SDF-Gradienten wegwirft** und die
+  Dreiecksnormale einsetzt, vorzeichenkorrigiert durch `triangleNormalSign`. Jeder
+  Kontakt der Szene nahm diesen Zweig. Der echte Zwei-SDF-Gradient wurde von **keiner
+  Szene dieses Baums** je ausgeführt.
+* Der zweite Durchlauf der äußeren Schleife wird nur betreten `if (mesh0.mTexObject)`
+  (`:1045-1055`), sonst `break`. Mit einem SDF im Paar brach sie nach Durchlauf 0 ab —
+  der ganze `outer == 1`-Arm, der die Rollen tauscht, mit `aToB.getInverse()` sammelt,
+  die Skalierung der **anderen** Shape anwendet und dessen Schwanz die Normale
+  **negiert**, wo Durchlauf 0 das nicht tut, war tot.
+
+Zwei gestapelte dynamische SDF-Kisten legen ein SDF auf **beide** Seiten eines Contact
+Managers. Kein neues Backen — es ist dieselbe `sdfBox`. Gemessen, Kernel weiterhin
+unmapped:
+
+```
+sdfBoxStackBottom  2.0000 -> 0.5000 (Ruhe 0.500)  BESTEHT  — die Kontrolle
+sdfBoxStackTop     6.0000 -> 0.5000 (Ruhe 1.500)  fällt DURCH die untere Kiste
+triangleTriangleCollision  10x -> 44x gestartet, alle übersprungen
+```
+
+Die Kontrolle ruht über den **Ebenen**-Kernel, den P9.82 gemappt hat — ein Fehlschlag der
+Zeile darunter kann also nicht dem Ebenen-Pfad angelastet werden. Der erste Entwurf
+setzte die untere Kiste genau auf Ruhehöhe; der Harness lehnte das mit „did not begin
+falling" ab, und das ist die richtige Antwort: ein Körper, der sich nie bewegt, kann
+funktionierende Physik nicht von gar keiner unterscheiden.
+
+### BLOCKER 1 — der Port passt nicht in 32 KiB
+
+Meine eigene, vorab gerechnete Schätzung lag bei ~29,2 KB und damit knapp unter dem
+Limit. **Sie war falsch**, aus zwei Gründen, die das Audit gemessen hat:
+
+* SPIR-V polstert `Patch` in Workgroup-Storage von 116 auf **128** Bytes je Eintrag
+  (`float4`/`float3` sind 16-Byte-ausgerichtet), also `patchesS[128]` = 16.384 statt
+  14.848;
+* die Module, die der Port importieren müsste, deklarieren **eigenen** Groupshared:
+  `gPxgWarpScratch[1024]` = 4.096 B, `gSdfIndices[1024]` = 4.096 B (auf dem Dreieckspfad
+  tot, aber deklariert), `gSdfIndices2[1024]` = 8.192 B.
+
+Gemessene SPIR-V-Projektion: **~38,9 KB gegen 32.768**. Das ist kein Feinschliff, das ist
+ein Neuentwurf des Speicherplans. Die naheliegende Abhilfe — `MAX_MESH_MESH_PATCHES`
+von 128 senken — ist **eine Physikänderung**, keine Speicheroptimierung: der Deckel
+entscheidet, welche Kontakte auf einem dichten Mesh-Paar überleben. Wenn er sinkt, dann
+als dokumentierte Abweichung mit einer Fixture, die den Schnitt zeigt.
+
+### BLOCKER 2 — `if (warpIndex == 0)` über einer Block-Barriere
+
+`reduceContactsSingleWarp` wird an zwei Stellen unter `if (warpIndex == 0)` gerufen
+(`:842-843`, `:950-951`). In CUDA ist das harmlos: der Aufgerufene benutzt nur
+`__shfl_sync`/`__ballot_sync`, die Warp-Konvergenz brauchen und sonst nichts. **In Slang
+ist jede dieser Primitiven ein `GroupMemoryBarrierWithGroupSync`**
+(`pxgSlangWarpInc.slang:120-124`, `pxgSlangContactReduce.slang:84-86`). Eine
+1:1-Abschrift setzt damit tausende Workgroup-Barrieren unter einen warp-varianten
+Wächter in einem 1024-Thread-Block. `check_barrier_uniformity.py` Durchlauf 3 fängt das —
+und wer es stattdessen auf die Ausnahmeliste setzt, bekommt einen llvmpipe-Hänger.
+
+### Was das Audit sonst widerlegt hat
+
+* **Die fünf benannten PTX-Barrieren sind KEIN Problem.** `bar.sync N;` ohne
+  Thread-Zahl ist eine Alle-Threads-Barriere; nur `bar.sync N, count;` ist partiell, und
+  keine der fünf trägt eine Zahl. Alle fünf werden block-uniform erreicht. Wer
+  „benannte Barriere" liest und zu Subgroup-Tricks oder einem Spin-Wait greift, baut
+  Maschinerie für ein Problem, das es nicht gibt — und die Maschinerie wird der Fehler.
+  Was die IDs **tatsächlich** kaufen, geht im Port verloren: mit fünf IDs *verklemmt* sich
+  eine Divergenz, mit einer einzigen Barriere läuft sie still falsch weiter.
+* **`contactReduce2<true,true,6,false>` gibt es im Korpus nicht.** Alle fünf vorhandenen
+  Slang-Reduktionen sind `contactReduce`-Instanzen mit `distanceAdjustment = 0` und
+  `initialPointCriteria = separation`. `contactReduce2` setzt `-separation` und
+  `|projizierter Punkt|` — vier andere argmax/argmin-Kriterien, **mit einem
+  Vorzeichenwechsel zwischen `f` und `g`** (`contactReduction.cuh:107` vs `:110`). Jede
+  bestehende Slang-Reduktion benutzt dort dasselbe Array zweimal, weil unter
+  `contactReduce` die Anpassung 0 ist. Abschreiben ergibt einen plausibel aussehenden
+  6-Punkt-Patch mit dem falschen p3-Anker.
+* **`sdfFindInterestingTriangles` ist hier NICHT wiederverwendbar.**
+  `pxgSlangSdfFind.slang:326-332` hält fest: „T3. THE SUBDIVISION MACHINERY IS DEAD" —
+  richtig für `femClothPrimitives.cu`, wo `SUPPORT_SUBDIVISION` 0 ist.
+  `convexMeshMidphase.cu:1078-1084` ruft dieselbe Vorlage mit **lebendigen**
+  Subdivision-Argumenten und ohne jedes `#if`. Der Aufruf kompiliert, läuft, sammelt eine
+  plausible Dreiecksliste — und verfeinert nie ein einziges großes Dreieck.
+* **Eine Korrektur an meiner eigenen Vorarbeit.** Ich hatte unabhängig hergeleitet, die
+  ABI-Zeile sei byte-identisch mit `kTriPlaneCore` (stimmt, 144 Bytes) und „die Slots
+  stimmen eins zu eins" (**falsch**). Nur die *Größen* stimmen; die Bedeutungen sind
+  permutiert — `cmOutputs` steht bei der Ebene auf Slot 2 und hier auf Slot 5,
+  `transformCache` auf 4 statt 2, und die Ebene trägt ein `multiManifold`, wo hier
+  `gpuIntermOverlap` steht. Die Zeile darf kopiert werden, die Push-Struktur **nicht** —
+  und `triangleTriangleCollision` bekommt ein eigenes benanntes Array, weil zwei Kernel,
+  die sich eines teilen, damit behaupten, ihre Packs seien gleich.
+
+### Warum das eine eigene Tranche ist
+
+Ein Port, der mit diesen beiden Blockern beginnt, läuft entweder in einen
+Compile-Fehler über dem Groupshared-Limit oder — schlimmer — in einen llvmpipe-Hänger,
+und beides mitten in einem 1500-Zeilen-Diff. Das Audit hat 1,19 Mio. Token gekostet und
+etwa eine halbe Stunde; es aufzuschreiben ist billiger, als es noch einmal zu machen.
+Der Port selbst ist P9.83b.
+
 ## P9.83a-6 — der ABI-Pack-Prüfer bekommt Funktions-Scope, und 64 nie verglichene Zeilen werden verglichen
 
 `check_launch_abi_pack.py` löste einen Namen über den **flachen Text** der ganzen `.cpp`
