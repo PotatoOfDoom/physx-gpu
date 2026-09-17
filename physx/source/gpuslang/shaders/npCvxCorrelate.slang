@@ -67,6 +67,8 @@
 // path.  count == CONVEX_TRIMESH_CACHED (0xFFFFFFFF) returns with NOTHING
 // written (both slots keep their 0xFFFFFFFF sentinel here).
 
+import pxgSlangContactReduceSerial;   // P9.83b-2: the reduction body, shared
+
 static const float PX_MAX_F32 = 3.4028235e38f;
 static const float PATCH_ACCEPTANCE_EPS = 0.996194698f;
 static const uint CONVEX_TRIMESH_CACHED = 0xFFFFFFFFu;
@@ -123,96 +125,22 @@ float3 quatRotate(float4 q, float3 v)
                   vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
                   vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2);
 }
-
-uint lowestArgMax(float vals[32], uint mask, out float best)
-{
-    best = -PX_MAX_F32;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-uint lowestArgMin(float vals[32], uint mask, out float best)
-{
-    best = PX_MAX_F32;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-// contactReduce<TClustering=true, TKeepAnotherDeepestForPCM=false,
-// TMaxPoints=6, TDupeTest=false> -- specialization of the tranche-82 port
-// (initial criterion = separation, distanceAdjustment = 0)
+// P9.83b-2: THE BODY AND ITS TWO ARGMAX/ARGMIN HELPERS MOVED OUT.
+// contactReduceShared is one CUDA template and this file carried the
+// <true, false, 6, false> instantiation of it as its own transcription.
+// pxgSlangContactReduceSerial holds the body once, with the template arguments as
+// a CrsConfig; this is now a thin adapter and its fixture certifies the shared
+// body rather than a private copy of it.
+//
+// THE EARLY-OUT IS NEW HERE AND IS A NO-OP.  The shared body returns allMask when
+// newCount <= maxPoints (contactReduction.cuh:85); this file's transcription had
+// omitted it, which is safe because the CALL SITE hoists exactly that test
+// (`if (countbits(currentContactMask) > SUBMANIFOLD_MAX_CONTACTS)`, :412).  The
+// test now happens twice and can never fire the second time.
 uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask, float clusterBias)
 {
-    float3 point[32];
-    for (uint j = 0; j < 32; ++j)
-        point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);
-
-    float v;
-    float vals[32];
-
-    for (uint j = 0; j < 32; ++j) vals[j] = sep[j];
-    const uint i0 = lowestArgMax(vals, allMask, v);
-    uint mask = 1u << i0;
-
-    // P9.47: contactReduction.cuh:93 is `(shuffle(point, i0) - point).magnitude()`.
-    for (uint j = 0; j < 32; ++j)
-    {
-        const float3 d0 = point[i0] - point[j];
-        vals[j] = sqrt(dot(d0, d0));
-    }
-    const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const float3 dir = cross(normal, point[i1] - point[i0]);
-    float dval[32];
-    for (uint j = 0; j < 32; ++j) dval[j] = dot(dir, point[j] - point[i0]);
-
-    const uint f = lowestArgMax(dval, allMask & ~mask, v);
-    mask |= 1u << f;
-    const uint g = lowestArgMin(dval, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    // clustering fill
-    float sepB[32];
-    for (uint j = 0; j < 32; ++j)
-        sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
-
-    int label[32];
-    int nbClusters = 0;
-    {
-        uint m = mask;
-        float tbest[32];
-        for (uint j = 0; j < 32; ++j) { tbest[j] = PX_MAX_F32; label[j] = -1; }
-        for (; m != 0; ++nbClusters, m &= (m - 1))
-        {
-            const uint anchor = firstbitlow(m);
-            for (uint j = 0; j < 32; ++j)
-            {
-                const float3 dv = point[j] - point[anchor];
-                const float d = dot(dv, dv);
-                if (d < tbest[j]) { tbest[j] = d; label[j] = nbClusters; }
-            }
-        }
-    }
-
-    mask = 0;
-    for (int i = 0; i < nbClusters; ++i)
-    {
-        uint cluster = 0;
-        for (uint j = 0; j < 32; ++j)
-            if (label[j] == i) cluster |= 1u << j;
-        cluster &= allMask;
-        if (cluster != 0)
-            mask |= 1u << lowestArgMin(sepB, cluster, v);
-    }
-    for (int i = nbClusters; i < int(SUBMANIFOLD_MAX_CONTACTS); ++i)
-        mask |= 1u << lowestArgMin(sepB, allMask & ~mask, v);
-
-    return mask;
+    return crsContactReduce(ptRaw, sep, normal, allMask, clusterBias,
+                            crsConfig(true, false, int(SUBMANIFOLD_MAX_CONTACTS), false));
 }
 
 // nputils binarySearch: last index with data[idx] <= value (0 if none)

@@ -91,9 +91,18 @@ void crsWrapperPair(uint3 dtid : SV_DispatchThreadID)
         sep[j] = (k == 0u) ? s.x : (k == 1u) ? s.y : (k == 2u) ? s.z : s.w;
     }
 
-    const CrsConfig cfg = crsConfig(true, true, 6);
+    const CrsConfig cfg = crsConfig(true, true, 6, false);
     const uint m1 = crsContactReduce(pt, sep, c.normal.xyz, c.misc.x, c.bias.x, cfg);
     const uint m2 = crsContactReduce2(pt, sep, c.normal.xyz, c.misc.x, c.bias.x, cfg);
 
-    gOut[t] = uint4(m1, m2, 0u, 0u);
+    // The THIRD column is wrapper 1 with TDoDupeTest = true -- npTriHfNp's
+    // instantiation, and the only one of the four that culls.  It is here rather
+    // than left to gpuslang.npTriHfNp because that fixture's inputs are mesh
+    // vertices against a plane: coincident points occur there only by accident,
+    // at no controlled distance and never with exactly equal separations, so it
+    // can reach the cull but cannot aim at it.  The host plants the coincidences.
+    const CrsConfig cfgDupe = crsConfig(true, true, 6, true);
+    const uint m3 = crsContactReduce(pt, sep, c.normal.xyz, c.misc.x, c.bias.x, cfgDupe);
+
+    gOut[t] = uint4(m1, m2, m3, 0u);
 }

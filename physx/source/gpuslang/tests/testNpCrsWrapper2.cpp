@@ -43,6 +43,16 @@
 // while the adjustment is zero).  So `nDiffer` is asserted to be a healthy
 // fraction of the cases: an observable that is true under the null hypothesis
 // measures nothing.
+//
+// A THIRD COLUMN covers TDoDupeTest, the one template argument that differs
+// between the four serial instantiations in a way no other fixture aims at.
+// npTriHfNp is the only caller that passes true and its own fixture reaches the
+// cull, but only incidentally: its inputs are mesh vertices against a plane, so
+// coincident points arrive at no chosen distance and never at exactly equal
+// separations.  Here they are PLANTED -- an exact duplicate at an exact
+// separation tie, one pair just inside the 1e-8 threshold and one just outside --
+// and `nDupeDiffer` guards that column the same way `nDiffer` guards the other
+// two.
 
 #include "pxgTestFramework.h"
 
@@ -60,6 +70,7 @@ struct V3 { float x, y, z; };
 struct V4 { float x, y, z, w; };
 
 static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static V3 cross3(V3 a, V3 b)
 {
@@ -91,11 +102,40 @@ static uint32_t argMin(const float* vals, uint32_t mask, float& best)
 }
 
 // contactReduceShared<TClustering=true, TKeepAnotherDeepestForPCM=true,
-//                     TMaxPoints=6, TDoDupeTest=false>  (contactReduction.cuh:55-165)
+//                     TMaxPoints=6, TDoDupeTest=dupeTest>  (contactReduction.cuh:55-165)
 static uint32_t reduceShared(const V3* ptRaw, const float* sep, V3 normal,
                              uint32_t allMask, float clusterBias,
-                             const float* adj, const float* initial, int maxPoints)
+                             const float* adj, const float* initial, int maxPoints,
+                             bool dupeTest)
 {
+    // contactReduction.cuh:65-79, transcribed from the CUDA and not from the
+    // Slang.  In CUDA every lane runs this against every set bit of allMask and
+    // the verdicts are collected with __ballot_sync, so the cull is simultaneous:
+    // the mask a lane tests against is the PRE-cull mask, not one thinned by
+    // earlier verdicts.  That is why the verdicts are accumulated here and applied
+    // only afterwards -- culling in place would let a lane be saved by the death
+    // of the lane that killed it.
+    if (dupeTest)
+    {
+        uint32_t dupes = 0;
+        for (uint32_t l = 0; l < 32; ++l)                       // threadIndexInWarp
+        {
+            if (((allMask >> l) & 1) == 0) continue;
+            bool imADupe = false;
+            for (uint32_t m = allMask; m; m &= (m - 1))
+            {
+                uint32_t i = 0;
+                while (((m >> i) & 1u) == 0u) ++i;              // lowestSetIndex
+                const V3 dv = sub(ptRaw[i], ptRaw[l]);          // RAW points, :71
+                const float d = dot3(dv, dv);                   // magnitudeSquared
+                if (d < 1e-8f && (sep[i] < sep[l] || (sep[i] == sep[l] && i > l)))
+                    imADupe = true;
+            }
+            if (imADupe) dupes |= 1u << l;
+        }
+        allMask &= ~dupes;                                      // :78
+    }
+
     V3 point[32];
     for (uint32_t j = 0; j < 32; ++j)
         point[j] = sub(ptRaw[j], scale3(normal, dot3(ptRaw[j], normal)));
@@ -182,7 +222,15 @@ static uint32_t refWrapper1(const V3* pt, const float* sep, V3 n, uint32_t allMa
 {
     float adj[32], initial[32];
     for (uint32_t j = 0; j < 32; ++j) { adj[j] = 0.0f; initial[j] = sep[j]; }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6);
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false);
+}
+
+// wrapper 1 with the DEFAULT TDoDupeTest = true -- npTriHfNp's instantiation.
+static uint32_t refWrapper1Dupe(const V3* pt, const float* sep, V3 n, uint32_t allMask, float bias)
+{
+    float adj[32], initial[32];
+    for (uint32_t j = 0; j < 32; ++j) { adj[j] = 0.0f; initial[j] = sep[j]; }
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, true);
 }
 
 // wrapper 2 (contactReduction.cuh:180-188): adj = -separation,
@@ -196,7 +244,7 @@ static uint32_t refWrapper2(const V3* pt, const float* sep, V3 n, uint32_t allMa
         adj[j] = -sep[j];
         initial[j] = mag3(p);
     }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6);
+    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6, false);
 }
 
 struct CrsParams { uint32_t numCases, pad0, pad1, pad2; };
@@ -223,8 +271,9 @@ PXG_TEST(npCrsWrapper2_pair)
     { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
 
     std::vector<CrsCase> in(N);
-    std::vector<uint32_t> ref1(N), ref2(N);
+    std::vector<uint32_t> ref1(N), ref2(N), ref3(N);
     size_t nDiffer = 0, nBoundary = 0, nBoundaryWrong = 0;
+    size_t nDupeDiffer = 0, nPlanted = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -251,10 +300,9 @@ PXG_TEST(npCrsWrapper2_pair)
             // Separations straddle zero -- penetrating and separated both occur,
             // which matters because adj = -sep flips sign with them.
             seps[j] = rf(-0.4f, 0.25f);
-            c.pt[j] = V4{ pts[j].x, pts[j].y, pts[j].z, 0 };
         }
-        for (uint32_t j = 0; j < 32; ++j)
-            (&c.sep8[j >> 2].x)[j & 3] = seps[j];
+        // c.pt / c.sep8 are filled AFTER the mask is drawn, because the planted
+        // coincidences below need to know which lanes are live.
 
         // THE LIVE-LANE COUNT, AND THE BOUNDARY THE FIRST DRAFT EXCLUDED.
         // The body returns allMask unchanged when `newCount <= maxPoints`
@@ -289,10 +337,67 @@ PXG_TEST(npCrsWrapper2_pair)
         c.misc[0] = mask;
         c.bias = V4{ rf(1e-5f, 5e-3f), 0, 0, 0 };
 
+        // ---- THE PLANTED COINCIDENCES (for the third column) ----------------
+        // The cull has three decisions and a random cloud aims at none of them:
+        // two of these points land within 1e-4 of each other with probability
+        // ~0, and at EXACTLY equal separation with probability 0.  So three
+        // pairs are planted among the live lanes, each pointed at one decision:
+        //
+        //   A  exact duplicate, EXACTLY equal separation -- neither depth test
+        //      decides, so only the index tie-break does, and the HIGHER index
+        //      is the survivor.  Without this pair, `i > l` could be `i < l` or
+        //      absent and nothing would notice.
+        //   B  6e-5 apart (squared 3.6e-9: inside 1e-8, outside 1e-10) with the
+        //      second lane strictly shallower -- dies by depth, and pins the
+        //      threshold from BELOW.
+        //   C  4e-4 apart (squared 1.6e-7: outside 1e-8, inside 1e-6) with
+        //      different separations -- must NOT be culled, pinning the
+        //      threshold from ABOVE.
+        //
+        // The two offsets are far larger than the ~3e-6 rounding of a
+        // coordinate of this magnitude, so every one of these verdicts is
+        // decided identically on both sides; and far enough from 1e-8 that no
+        // reasonable contraction of dot() can move one across it.
+        uint32_t live[32], nLive = 0;
+        for (uint32_t j = 0; j < 32; ++j) if ((mask >> j) & 1u) live[nLive++] = j;
+        for (uint32_t j = nLive; j > 1; --j)                 // Fisher-Yates
+        {
+            const uint32_t k = rng() % j;
+            const uint32_t t = live[j - 1]; live[j - 1] = live[k]; live[k] = t;
+        }
+        size_t planted = 0;
+        if (nLive >= 6)
+        {
+            auto unitDir = [&]() {
+                V3 d{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+                const float l = mag3(d);
+                return l > 1e-3f ? scale3(d, 1.0f / l) : V3{ 0.5773503f, 0.5773503f, 0.5773503f };
+            };
+            const uint32_t a = live[0], b = live[1];
+            pts[b] = pts[a];                                  // exact duplicate
+            seps[b] = seps[a];                                // exact tie
+            const uint32_t cc = live[2], d = live[3];
+            pts[d] = add(pts[cc], scale3(unitDir(), 6e-5f));
+            seps[d] = seps[cc] + 0.01f;                       // d is shallower
+            const uint32_t e = live[4], f = live[5];
+            pts[f] = add(pts[e], scale3(unitDir(), 4e-4f));
+            seps[f] = seps[e] + 0.01f;                        // shallower, but far
+            planted = 3;
+        }
+
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            c.pt[j] = V4{ pts[j].x, pts[j].y, pts[j].z, 0 };
+            (&c.sep8[j >> 2].x)[j & 3] = seps[j];
+        }
+        if (planted) ++nPlanted;
+
         in[i] = c;
         ref1[i] = refWrapper1(pts, seps, n, mask, c.bias.x);
         ref2[i] = refWrapper2(pts, seps, n, mask, c.bias.x);
+        ref3[i] = refWrapper1Dupe(pts, seps, n, mask, c.bias.x);
         if (ref1[i] != ref2[i]) ++nDiffer;
+        if (ref1[i] != ref3[i]) ++nDupeDiffer;
         uint32_t bits = 0;
         for (uint32_t j = 0; j < 32; ++j) bits += (mask >> j) & 1u;
         if (bits <= 6)
@@ -320,6 +425,18 @@ PXG_TEST(npCrsWrapper2_pair)
                   "the inputs cannot distinguish adj=0 from adj=-sep, so this fixture "
                   "would pass with both wrappers implemented identically",
                   nDiffer, N);
+    // THE SAME GUARD FOR THE CULL.  Column 3 is column 1 with TDoDupeTest = true,
+    // so if the planted coincidences never changed the answer the column would
+    // pass against a body that ignores the flag entirely -- the exact silent
+    // failure the flag was withheld for one commit to prevent.
+    PXG_CHECK_MSG(nPlanted > N - N / 10,
+                  "npCrsWrapper2_pair: only %zu of %u cases could take the planted "
+                  "coincidences (they need six live lanes)", nPlanted, N);
+    PXG_CHECK_MSG(nDupeDiffer > N / 4,
+                  "npCrsWrapper2_pair: the dupe cull changes the mask on only %zu of %u "
+                  "cases -- the inputs cannot distinguish TDoDupeTest true from false, "
+                  "so this column would pass with the cull not implemented",
+                  nDupeDiffer, N);
 
     PxgSlangComputeDevice* dev = testDevice();
     std::vector<uint32_t> outInit(size_t(N) * 4, 0xDEADBEEFu);
@@ -334,7 +451,7 @@ PXG_TEST(npCrsWrapper2_pair)
 
     const auto got = downloadBuffer<uint32_t>(dev, bOut, size_t(N) * 4);
 
-    size_t mm1 = 0, mm2 = 0;
+    size_t mm1 = 0, mm2 = 0, mm3 = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         if (got[i * 4 + 0] != ref1[i])
@@ -351,15 +468,25 @@ PXG_TEST(npCrsWrapper2_pair)
                             i, got[i * 4 + 1], ref2[i]);
             ++mm2;
         }
+        if (got[i * 4 + 2] != ref3[i])
+        {
+            if (mm3 < 4)
+                std::printf("  wrapper1+dupe case %u: got 0x%08x want 0x%08x\n",
+                            i, got[i * 4 + 2], ref3[i]);
+            ++mm3;
+        }
     }
     PXG_CHECK_MSG(mm1 == 0, "npCrsWrapper2_pair: %zu wrapper-1 mask mismatches", mm1);
     PXG_CHECK_MSG(mm2 == 0, "npCrsWrapper2_pair: %zu wrapper-2 mask mismatches", mm2);
+    PXG_CHECK_MSG(mm3 == 0, "npCrsWrapper2_pair: %zu wrapper-1+dupeTest mask mismatches", mm3);
     // Printed on SUCCESS, not only on failure: the margin above N/4 is the
     // fixture's own strength, and a number that only appears when the test breaks
     // is a number nobody ever reads.
     std::printf("  npCrsWrapper2_pair: %u cases, the two wrappers disagree on %zu (%.1f%%), "
-                "%zu at the maxPoints boundary\n",
-                N, nDiffer, 100.0 * double(nDiffer) / double(N), nBoundary);
+                "%zu at the maxPoints boundary; the dupe cull changes the mask on "
+                "%zu (%.1f%%)\n",
+                N, nDiffer, 100.0 * double(nDiffer) / double(N), nBoundary,
+                nDupeDiffer, 100.0 * double(nDupeDiffer) / double(N));
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

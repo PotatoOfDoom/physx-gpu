@@ -41,6 +41,11 @@
 //   npTriHfNp::contactReduce6Dupe          <true,  true,  6, true >  serial
 //   pxgSlangContactReduce (the warp form)  <false, true,  5, true >  barriers
 //
+// The three SERIAL ones are now thin adapters to this body.  The warp form is
+// not, and cannot be without restructuring its callers: its calling convention is
+// per-lane with barriers inside, so it is a different shape, not a different
+// instantiation.  See the note at the end of this header.
+//
 // Template instantiations of one body ARE one body -- that is precisely the case
 // this port's sharing rule names -- and a fifth was about to be written, because
 // triangleTriangleCollision needs `contactReduce2<true, true, 6, false>`, which
@@ -181,32 +186,28 @@ public struct CrsConfig
     public bool clustering;        // TClustering
     public bool keepDeepestForPCM; // TKeepAnotherDeepestForPCM
     public int maxPoints;          // TMaxPoints
+    public bool dupeTest;          // TDoDupeTest
 }
 
-public CrsConfig crsConfig(bool clustering, bool keepDeepestForPCM, int maxPoints)
+public CrsConfig crsConfig(bool clustering, bool keepDeepestForPCM, int maxPoints, bool dupeTest)
 {
     CrsConfig c;
     c.clustering = clustering;
     c.keepDeepestForPCM = keepDeepestForPCM;
     c.maxPoints = maxPoints;
+    c.dupeTest = dupeTest;
     return c;
 }
 
-// *** TDoDupeTest IS DELIBERATELY NOT A FIELD HERE. ***
-// contactReduceShared's fourth template argument guards a fifteen-line duplicate
-// cull (contactReduction.cuh:65-79) that only ONE instantiation in this corpus
-// turns on: npTriHfNp::contactReduce6Dupe, <true, true, 6, TRUE>.  That body is
-// still its own transcription and is NOT folded in here yet.
-//
-// The tempting shape was a fourth bool that this body ignores.  A config field
-// that is accepted and silently does nothing is exactly the failure this module
-// exists to end: a future caller would pass `true`, get no dupe cull, and have
-// every reason to believe it had one.  So the field does not exist, and a caller
-// that needs the dupe test cannot express it -- which is a compile error rather
-// than a wrong manifold.
-//
-// Folding npTriHfNp in is the remaining half of this consolidation and needs its
-// fixture to prove the dupe arm, not just the arms it shares.
+// TDoDupeTest IS A FIELD, AND FOR ONE COMMIT IT DELIBERATELY WAS NOT.
+// When this module first landed the dupe cull was not implemented, and the
+// tempting shape was a fourth bool the body would accept and ignore.  That is the
+// precise failure the module exists to end -- a caller would pass `true`, get no
+// cull, and have every reason to believe it had one -- so the field was left OUT
+// and asking for the cull was a compile error rather than a wrong manifold.
+// Now the cull is implemented (contactReduction.cuh:65-79) and the field is back.
+// The sequence is recorded because "add the flag now, implement it later" is the
+// shape that produces the silent version.
 
 // ---------------------------------------------------------------------------
 // The shared body (contactReduction.cuh:55-165), serial.
@@ -219,6 +220,32 @@ public uint crsReduceShared(float3 ptRaw[32], float sep[32], float3 normal,
                             uint allMask, float clusterBias,
                             float adj[32], float initial[32], CrsConfig cfg)
 {
+    // THE DUPE CULL RUNS FIRST, BEFORE newCount (contactReduction.cuh:65-79).
+    // A lane dies to a COINCIDENT lane (squared distance < 1e-8f on the RAW
+    // points, not the projected ones) that is either strictly deeper, or equally
+    // deep with a HIGHER index.  The index tie-break is what makes it
+    // deterministic: without it two exactly-coincident, exactly-equal contacts
+    // would each cull the other and both would vanish.
+    if (cfg.dupeTest)
+    {
+        uint dupes = 0;
+        for (uint l = 0; l < 32; ++l)
+        {
+            if (((allMask >> l) & 1) == 0) continue;
+            bool imADupe = false;
+            for (uint m = allMask; m != 0; m &= (m - 1))
+            {
+                const uint i = firstbitlow(m);
+                const float3 dv = ptRaw[i] - ptRaw[l];
+                const float d = dot(dv, dv);
+                if (d < 1e-8f && (sep[i] < sep[l] || (sep[i] == sep[l] && i > l)))
+                    imADupe = true;
+            }
+            if (imADupe) dupes |= 1u << l;
+        }
+        allMask &= ~dupes;
+    }
+
     float3 point[32];
     for (uint j = 0; j < 32; ++j)
         point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);

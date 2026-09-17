@@ -97,7 +97,7 @@ public uint lowestArgMin(float vals[32], uint mask, out float best)
 public uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask, float clusterBias)
 {
     return crsContactReduce(ptRaw, sep, normal, allMask, clusterBias,
-                            crsConfig(true, true, int(PLANE_TRI_MAX_CONTACTS)));
+                            crsConfig(true, true, int(PLANE_TRI_MAX_CONTACTS), false));
 }
 
 

@@ -85,6 +85,7 @@
 // upstream body (no margins without the manifold gate).
 
 import pxgSlangCommon;
+import pxgSlangContactReduceSerial;
 
 static const uint PLANE_TRI_MAX_CONTACTS = 6u;
 static const float FLT_MAX_LOCAL = 3.402823466e38f;
@@ -126,134 +127,27 @@ float3 vertex2Shape(float3 v, float3 scale, float4 rot)
     return quatRotateInv(rot, quatRotate(rot, v) * scale);
 }
 
-// NOTE: with an empty mask (or all masked values at the sentinel) these
-// return idx 0, unlike CUDA maxIndex/minIndex (lowest MASKED index); every
-// call site below provably passes a nonempty mask with finite values
-uint lowestArgMax(float vals[32], uint mask, out float best)
-{
-    best = -FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
-}
-uint lowestArgMin(float vals[32], uint mask, out float best)
-{
-    best = FLT_MAX_LOCAL;
-    uint idx = 0;
-    for (uint j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
-}
+// P9.83b-2: lowestArgMax/lowestArgMin ARE GONE from this file.  They existed
+// only for the reduction body, which now lives in pxgSlangContactReduceSerial as
+// crsArgMax/crsArgMin -- including the documented divergence from CUDA
+// maxIndex/minIndex on an empty mask.  No forwarder is kept: a forwarder whose
+// only caller has moved out is a name with nothing behind it.
 
 // contactReduce<clustering=true, keepDeepestPCM=true, maxPoints=6,
-// dupeTest=TRUE (default)> (contactReduction.cuh), on lane arrays
+// dupeTest=TRUE (default)> (contactReduction.cuh), on lane arrays.
+//
+// P9.83b-2: THE BODY MOVED OUT, and this was the transcription that made the
+// move worth doing.  It is the ONLY one of the four serial copies with
+// TDoDupeTest = true, so for one commit pxgSlangContactReduceSerial deliberately
+// had no dupeTest field at all -- a caller could not ask for a cull the shared
+// body did not yet have.  The cull is implemented there now
+// (contactReduction.cuh:65-79) and this is a thin adapter.  Its fixture re-ran
+// bit-exactly across the move; that is the evidence the transcription was
+// faithful, not a reason to have kept a fourth copy of it here.
 uint contactReduce6Dupe(float3 ptRaw[32], float sep[32], float3 normal, uint allMask, float clusterBias)
 {
-    const int maxPoints = int(PLANE_TRI_MAX_CONTACTS);
-
-    // duplicate pre-cull on the RAW points: lane l dies to a strictly
-    // deeper coincident lane, or to an equal-separation coincident lane
-    // with a HIGHER index
-    {
-        uint dupes = 0;
-        for (uint l = 0; l < 32; ++l)
-        {
-            if (((allMask >> l) & 1) == 0) continue;
-            bool imADupe = false;
-            for (uint m = allMask; m != 0; m &= (m - 1))
-            {
-                const uint i = firstbitlow(m);
-                const float3 dv = ptRaw[i] - ptRaw[l];
-                const float d = dot(dv, dv);
-                if (d < 1e-8f && (sep[i] < sep[l] || (sep[i] == sep[l] && i > l)))
-                    imADupe = true;
-            }
-            if (imADupe) dupes |= 1u << l;
-        }
-        allMask &= ~dupes;
-    }
-
-    float3 point[32];
-    for (uint j = 0; j < 32; ++j)
-        point[j] = ptRaw[j] - normal * dot(ptRaw[j], normal);
-
-    const uint newCount = countbits(allMask);
-    if (newCount <= uint(maxPoints))
-        return allMask;
-
-    float v;
-    float vals[32];
-
-    for (uint j = 0; j < 32; ++j) vals[j] = sep[j];
-    const uint i0 = lowestArgMax(vals, allMask, v);
-    uint mask = 1u << i0;
-
-    for (uint j = 0; j < 32; ++j)
-    {
-        const float3 d = point[i0] - point[j];
-        vals[j] = sqrt(dot(d, d)); // PxVec3::magnitude(); sqrt(dot) keeps the
-                                   // IEEE-sqrt assumption minimal vs OpLength
-    }
-    const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const float3 dir = cross(normal, point[i1] - point[i0]);
-    float dval[32];
-    for (uint j = 0; j < 32; ++j) dval[j] = dot(dir, point[j] - point[i0]);
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint f = lowestArgMax(vals, allMask & ~mask, v);
-    mask |= 1u << f;
-
-    for (uint j = 0; j < 32; ++j) vals[j] = dval[j];
-    const uint g = lowestArgMin(vals, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    if (countbits(mask) == 4 && maxPoints > 4)
-    {
-        const uint i4 = lowestArgMin(sep, allMask & ~mask, v);
-        mask |= 1u << i4;
-    }
-
-    // clustering
-    {
-        float sepB[32];
-        for (uint j = 0; j < 32; ++j)
-            sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
-
-        int label[32];
-        int nbClusters = 0;
-        {
-            uint m = mask;
-            float tbest[32];
-            for (uint j = 0; j < 32; ++j) { tbest[j] = FLT_MAX_LOCAL; label[j] = -1; }
-            for (; m != 0; ++nbClusters, m &= (m - 1))
-            {
-                const uint anchor = firstbitlow(m);
-                for (uint j = 0; j < 32; ++j)
-                {
-                    const float3 dv = point[j] - point[anchor];
-                    const float d = dot(dv, dv);
-                    if (d < tbest[j]) { tbest[j] = d; label[j] = nbClusters; }
-                }
-            }
-        }
-
-        mask = 0;
-        for (int i = 0; i < nbClusters; ++i)
-        {
-            uint cluster = 0;
-            for (uint j = 0; j < 32; ++j)
-                if (label[j] == i) cluster |= 1u << j;
-            cluster &= allMask;
-            if (cluster != 0)
-                mask |= 1u << lowestArgMin(sepB, cluster, v);
-        }
-        for (int i = nbClusters; i < maxPoints; ++i)
-            mask |= 1u << lowestArgMin(sepB, allMask & ~mask, v);
-    }
-    return mask;
+    return crsContactReduce(ptRaw, sep, normal, allMask, clusterBias,
+                            crsConfig(true, true, int(PLANE_TRI_MAX_CONTACTS), true));
 }
 
 // ---------------------------------------------------------------------------
