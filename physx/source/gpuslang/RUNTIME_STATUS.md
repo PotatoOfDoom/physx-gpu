@@ -2013,6 +2013,38 @@ Die drei verbleibenden sind belegt, jeder mit einem Versuch, ihn zu brechen — 
   getötet) und bleibt: sie ist die der Engine, und eine heute unerreichbare
   Schranke wird erreichbar, sobald der Puffer wächst.
 
+## P9.83b-4 (3/n) — die Warp-Staging-Frage, die P9.83b-2 nicht gestellt hat
+
+**Korrektur an eigener Arbeit.** P9.83b-2 argumentierte, der 34816-Byte-Blocker löse
+sich auf, sobald die Kontaktreduktion seriell ist. Das deckt **eine von drei**
+`contactReduce2`-Aufrufstellen ab:
+
+| Stelle | Kontext | Status |
+|---|---|---|
+| `:472` | in `reduceContactsSingleWarp`, unter `if (warpIndex == 0)` | seriell ersetzt (P9.83b-5) |
+| `:810` | in `if (anyKeepS)`, blockuniform, **alle 32 Warps** | offen |
+| `:931` | in `if (countersS[minIBlock] != 0)`, blockuniform, **alle 32 Warps** | offen |
+
+Die letzten beiden brauchen weiterhin eine **warpweise** Reduktion, und eine
+serielle davon braucht die 32 Lanes des Warps irgendwo adressierbar. Zwei Schemata,
+**beide gemessen** statt überlegt — als zwei Entry Points über demselben
+Sondenrumpf:
+
+```
+alle 32 Warps gleichzeitig  (32*32*16 B)   46684 Bytes  — ÜBER dem Limit um 13916
+ein Warp nach dem anderen   (32*16 B)      30812 Bytes  — passt, 1956 Bytes Luft
+```
+
+**Das Design ist damit erzwungen, nicht gewählt:** 32 sequentielle warpweise
+Reduktionen je Aufrufstelle, über einen 512-Byte-Puffer. Der breite Entry Point
+wurde nach der Messung **gelöscht** — ein Entry Point, der konstruktionsbedingt über
+dem Limit liegt, lässt `gpuslang.groupshared` für das ganze Korpus fehlschlagen, und
+eine Zahl gehört in die Ratchet-Datei, nicht in einen Shader, den niemand übersetzen
+kann.
+
+Damit bleibt der Etat bei **30812 von 32768** — die Aussage „der Kernel passt" hält,
+aber sie hält knapper als P9.83b-4 (2/n) sie aufgeschrieben hatte.
+
 ## P9.83b-4 — der Groupshared-Etat der Mesh-gegen-Mesh-Kollision, gemessen statt hochgerechnet
 
 Der Kernel `doTriangleTriangleCollision` (convexMeshMidphase.cu:972-1231) war seit

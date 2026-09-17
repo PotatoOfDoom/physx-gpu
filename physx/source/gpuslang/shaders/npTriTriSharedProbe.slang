@@ -120,9 +120,7 @@ RWStructuredBuffer<uint> gOut;   // binding 0
 // interface list will not name it and the measurement will read low.  P9.83b-1
 // established that an UNUSED Workgroup variable costs nothing; this probe would
 // be worthless if it accidentally relied on that.
-[shader("compute")]
-[numthreads(1024, 1, 1)]
-void triTriSharedProbe(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+void probeBody(uint3 dtid, uint3 gtid)
 {
     const uint t = gtid.x;
 
@@ -182,4 +180,58 @@ void triTriSharedProbe(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupTh
                  + uint(gSdfTexture.subgridsSdfValueRange);
         gOut[dtid.x] = acc;
     }
+}
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void triTriSharedProbe(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    probeBody(dtid, gtid);
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-4 (3/n): THE WARP-STAGING QUESTION P9.83b-2 DID NOT ASK
+// ---------------------------------------------------------------------------
+// P9.83b-2 argued the 34816-byte blocker dissolves once the contact reduction is
+// serial, because the warp-emulated form's gPxgWarpScratch goes away.  That
+// covers ONE of the THREE contactReduce2 call sites.
+//
+//   :472  inside reduceContactsSingleWarp, under `if (warpIndex == 0)` -- one
+//         warp, so the serial body of P9.83b-5 replaces it outright.
+//   :810  inside `if (anyKeepS)`, block-uniform, called by ALL 32 WARPS, each on
+//         its own 32 lanes.
+//   :931  inside `if (countersS[minIBlock] != 0)`, same shape.
+//
+// The last two still need a per-warp reduction, and a serial one needs the warp's
+// 32 lanes somewhere addressable.  Two schemes, and the difference decides the
+// design, so both are measured rather than reasoned about:
+//
+//   ALL WARPS AT ONCE   32 warps * 32 lanes * 16 B  -- every warp reduces in
+//                       parallel, one barrier per call site
+//   ONE WARP AT A TIME  32 lanes * 16 B             -- 32 sequential reduces per
+//                       call site, 32 barriers, but a tiny buffer
+//
+// BOTH WERE MEASURED, as two entry points over the same probe body:
+//
+//   triTriSharedProbeWideStage     46684 bytes -- OVER THE LIMIT BY 13916
+//   triTriSharedProbeNarrowStage   30812 bytes -- fits, 1956 bytes of headroom
+//
+// So the design is FORCED: the two warp-parallel reduce sites must be serialised
+// one warp at a time.  The wide entry point has been DELETED rather than left
+// here, because an entry point that is over the limit by construction makes
+// gpuslang.groupshared fail for the whole corpus; its number is recorded above
+// and in tools/groupshared_known.txt, which is where a number belongs.
+// ---------------------------------------------------------------------------
+
+groupshared float4 gWarpStageSmall[32];          // one warp at a time
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void triTriSharedProbeNarrowStage(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    probeBody(dtid, gtid);
+    if (gtid.x < 32u) gWarpStageSmall[gtid.x] = float4(float(gtid.x), 0, 0, 0);
+    GroupMemoryBarrierWithGroupSync();
+    if (dtid.x < gP.numItems)
+        gOut[dtid.x] += uint(gWarpStageSmall[gtid.x & 31u].x);
 }

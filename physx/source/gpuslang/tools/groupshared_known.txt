@@ -58,4 +58,19 @@ solverTGS:solveWholeIslandTGS    31744
 # THIS ENTRY IS TEMPORARY.  When the real kernel lands it supersedes the probe,
 # and the probe -- along with this entry and its pxg_compile_shader line -- is to
 # be DELETED, not left behind measuring a budget nothing spends.
+# P9.83b-4 (3/n): THE WARP-STAGING QUESTION, AND A CORRECTION TO P9.83b-2.
+# That tranche argued the 34816-byte blocker dissolves once the contact reduction
+# is serial.  It covers ONE of the THREE contactReduce2 call sites -- :472, inside
+# reduceContactsSingleWarp under `if (warpIndex == 0)`.  The other two, :810 and
+# :931, are block-uniform and called by ALL 32 WARPS, each on its own 32 lanes,
+# and a serial per-warp reduce needs those lanes somewhere addressable.  Measured:
+#
+#   all 32 warps staged at once (32*32*16 B)   46684 bytes -- OVER BY 13916
+#   one warp at a time         (32*16 B)       30812 bytes -- fits, 1956 spare
+#
+# So the design is forced, not chosen: 32 sequential per-warp reduces per call
+# site.  The wide entry point was deleted after it was measured -- an entry point
+# over the limit by construction fails this checker for the whole corpus, and a
+# number belongs in this file, not in a shader nobody can compile.
 npTriTriSharedProbe:triTriSharedProbe    30300
+npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812
