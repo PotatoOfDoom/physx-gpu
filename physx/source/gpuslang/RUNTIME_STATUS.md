@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **867/867** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **868/868** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-2 added `gpuslang.npCrsWrapper2`, which certifies BOTH wrappers of
+contactReduceShared over one shared serial body -- and asserts they DISAGREE (1523 of 3000
+cases), because a fixture that only checked wrapper 2 against its own mirror would pass
+with wrapper 2 implemented as wrapper 1, which is what all four pre-existing
+transcriptions were.
 P9.83b-1 added `gpuslang.groupshared`, the EIGHTEENTH static checker and the THIRD written
 because its defect had already happened: P5 capped solveWholeIslandTGS's shared staging
 944 -> 640 entries after a pipeline-creation failure, found by hand and late.  It measures
@@ -1929,6 +1934,85 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-2 — eine CUDA-Vorlage, vier Abschriften, und der Wrapper, den nichts geprüft hat
+
+`contactReduceShared` (`contactReduction.cuh:55-165`) ist **eine** CUDA-Vorlage. Dieser
+Korpus hatte sie **viermal** abgeschrieben, einmal je Instanz:
+
+```
+pxgSlangTriPlane::contactReduce6       <true,  true,  6, false>   seriell
+npCvxCorrelate::contactReduce6         <true,  false, 6, false>   seriell
+npTriHfNp::contactReduce6Dupe          <true,  true,  6, true >   seriell
+pxgSlangContactReduce (Warp-Form)      <false, true,  5, true >   Barrieren
+```
+
+— und eine **fünfte** stand an, weil `triangleTriangleCollision`
+`contactReduce2<true,true,6,false>` braucht: derselbe Körper durch den **anderen**
+Wrapper. Template-Instanzen eines Körpers *sind* ein Körper; genau diesen Fall benennt
+die Teilungsregel dieses Ports.
+
+`pxgSlangContactReduceSerial` hält ihn jetzt einmal, mit den Template-Argumenten als
+`CrsConfig`-Wert und den beiden Wrapper-Eingaben als Parameter. `contactReduce6` ist ein
+dünner Adapter darauf, und seine Fixture lief über die Verschiebung **bit-exakt** weiter.
+
+### Der Unterschied, den jede vorhandene Kopie ausradiert hatte
+
+`distanceAdjustment` betritt den Körper an vier Stellen, und **die vierte wird
+subtrahiert, wo die ersten drei addiert werden** (`:91`, `:94`, `:107` addieren, `:110`
+subtrahiert). Unter Wrapper 1 ist die Anpassung null, also fallen alle vier zusammen —
+und jede Abschrift hier benutzt auf dieser Grundlage *ein* Array für `f` und `g`. Unter
+Wrapper 2 (`adj = -separation`) sind es zwei verschiedene Kriterien:
+`f = argmax(d - sep)`, `g = argmin(d + sep)`. Und `p0` wird `argmax(|projizierter Punkt| - sep)`
+— der **extremste** Kontakt, wo Wrapper 1 den **tiefsten** nimmt. Der Kommentar bei
+`contactReduction.cuh:43` („ALGORITHM BELOW TAKES DEEPEST CONTACT AS p0") beschreibt nur
+Wrapper 1.
+
+**`TDoDupeTest` ist absichtlich kein Feld.** Nur `npTriHfNp` schaltet ihn ein, dieser
+Körper ist noch nicht eingefaltet, und ein Konfigurationsflag, das dieser Körper annehmen
+und still ignorieren würde, ist genau das Versagen, das dieses Modul beenden soll. Ein
+Aufrufer, der ihn braucht, bekommt jetzt einen Compile-Fehler statt eines falschen
+Manifolds.
+
+### Die Fixture prüft, dass die beiden Wrapper sich **unterscheiden**
+
+Eine, die Wrapper 2 nur gegen seinen eigenen Spiegel hält, bestünde auch dann, wenn
+Wrapper 2 *als* Wrapper 1 implementiert wäre — und genau das sind alle vier
+vorbestehenden Kopien. Gemessen: **1523 von 3000 Fällen (50,8 %)** weichen ab, und die
+Zahl wird bei **Erfolg** gedruckt, denn eine Zahl, die nur beim Scheitern erscheint,
+liest niemand. Zwei Eingabeentscheidungen tragen Last und stehen so im Kommentar: die
+Punktwolke ist bis zu 6 Einheiten **außermittig** (`|projizierter Punkt|` ist ein Abstand
+vom **Ursprung**, eine zentrierte Wolke macht alle Lane-Kriterien fast gleich — Klasse D),
+und die Normale ist nie eine Achse.
+
+### Der neue ctest ist beim ersten Volllauf **zu Recht** durchgefallen
+
+`ctest` ruft `gpuslang-tests <suite>`, und der Filter in `main.cpp` ist ein
+**Teilstring**-Vergleich. Ein Test namens `crsWrapperPair` unter einer Suite namens
+`npCrsWrapper2` lief also **nichts** — und `main.cpp` wertet `ran == 0` als Fehlschlag.
+Das ist die richtige Entscheidung und der Grund, warum die Namensdiskrepanz in Sekunden
+auffiel statt als grüne leere Suite weiterzuleben.
+
+### Fünf Überlebende, vier beweisbar äquivalent — und eine Fehldiagnose von mir
+
+Der Sweep tötete 20 von 25. Vier Überlebende sind Äquivalenzen mit Beweis (Magnitude ist
+vorzeichensymmetrisch; ein negiertes `dir` vertauscht nur `f` und `g`; eine uniforme
+Verschiebung aller `dval` erhält jedes argmax/argmin; `<` gegen `<=` auf Quadratabständen
+trennt nur exakte Gleichstände).
+
+Den fünften, `earlyout-strict`, habe ich **falsch diagnostiziert** — als Fixture-Lücke.
+Ich habe 429 Grenzfälle mit genau `maxPoints` lebenden Lanes eingebaut, und der Mutant hat
+**trotzdem** überlebt. Das ist die Antwort: bei `newCount == maxPoints` kann die Reduktion
+gar nichts anderes tun, als die lebende Menge zurückzugeben. Sie wählt `i0`, `i1`, `f`,
+`g`, eventuell `i4`, dann eine Lane je Cluster (Cluster sind disjunkt, die Wahlen also
+verschieden), dann füllt sie bis `maxPoints` mit je einer **neuen** Lane auf — genau
+`maxPoints` Lanes aus einem Pool von genau `maxPoints`, also `allMask`. Beide
+Schreibweisen unterscheiden sich nur bei diesem Zählerstand, und dort stimmen sie überein.
+
+**Die Grenzfälle bleiben.** Sie töten keinen Mutanten mehr, aber sie prüfen den
+Trivialrückgabe-Vertrag aus `contactReduction.cuh:85` direkt und für beide Wrapper — das
+tat vorher nichts in der Suite. Ein Test, der einen Vertrag festhält, ist auch dann
+erhaltenswert, wenn der Mutant, auf den er gezielt hat, sich als äquivalent erweist.
 
 ## P9.83b-1 — der achtzehnte Prüfer misst den Groupshared-Verbrauch, und der TGS-Solver steht 1 KB vor der Wand
 
