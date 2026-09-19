@@ -1935,6 +1935,56 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-5 (4-5/n) — die zwei Akzeptanztests, eine Bindungs-Kollision und vier Schwellen ohne Eingabe
+
+**Die beiden Akzeptanztests sind nicht dieselben drei Zeilen**, obwohl sie sich so
+lesen — ein Skalarprodukt gegen zwei Epsilons:
+
+| Stelle | Form |
+|---|---|
+| `:779-783` `tryToAssign…` | **ungated**. Ein stillgelegter Kontakt hat `normal == (0,0,0)` (markAsProcessed), also `proj == 0` — beide Tests scheitern von selbst. **Die Null-Normale ist das Gate, kein `if`.** `contact.pos` wird *nicht* gelöscht und erreicht weiterhin die Reduktion; nur das Ballot hält ihn draußen. |
+| `:921-925` `createNewPatches` | **gated** auf `candidateContact`, und `accept` trägt zusätzlich `\|\| myNormal`. Der Disjunkt existiert, weil `proj` für den Seed `\|contact.normal\|²` ist und Normalen nur unter `if (m > 0.0f)` normiert werden (:1139, :1180) — eine degenerierte Normale ließe einen Patch sonst seinen **eigenen Seed** ablehnen. |
+
+Und `accept`/`accept2` ist keine Verfeinerung eines Tests: `accept` (0,9995) entscheidet,
+wer in die **Reduktion** kommt; `accept2` (0,85) entscheidet, wer **verbraucht** wird.
+Ein Kontakt im Band dazwischen wird gefressen und trägt nichts bei — absichtlich:
+:785-786 sagt, die Definition auf `accept2` umzustellen „will cause artificial friction".
+
+**`ttpMinIndex` ist nicht `crsArgMin`.** Bei leerer Maske liefert CUDA
+`lowestSetIndex(0) = __ffs(0) − 1 = 0xFFFFFFFF`, und dieser Wert ist tragend: bei :908
+wird er gegen `threadIndexInWarp` verglichen, passt auf keine Lane, und **nichts seedet
+den Patch**. `crsArgMin`s 0 würde stillschweigend Lane 0 wählen.
+
+**Eine Bindungs-Kollision hat einen fremden Test zum Absturz gebracht.** Der erste
+Versuch legte den Akzeptanz-Entry neben `ttrReduce` in dieselbe Datei — **Segfault der
+ganzen Suite**, inklusive des vorher grünen `ttrReduce`. Slang vergibt
+`RWStructuredBuffer`-Bindings in Deklarationsreihenfolge **über die ganze Datei**, nicht
+je Entry Point; die Puffer des zweiten Entry lagen also auf 2, 3, 4, während der Harness
+0, 1, 2 band. Weder Shader noch C++ sagen das, und das einzige Symptom ist ein Absturz
+woanders. Der Entry hat jetzt eine eigene Datei, mit dem Grund im Kopf.
+
+**Mutations-Durchlauf: erst 7 von 13, jetzt 11 von 13.** Vier der sechs Überlebenden
+waren **dieselbe Lücke in vier Kostümen — Schwellen, in deren Nähe keine Eingabe lag**:
+
+- `eps3-value`: kein Kontakt projizierte zwischen 0,999 und 0,99968, also klassifizierten
+  0,9995 und 0,999 jede Lane gleich;
+- `eps-nonstrict-existing`: `>` gegen `>=` braucht `proj` **exakt** 0,9995f;
+- `minindex-highest-tie`: braucht zwei **maskierte** Lanes mit demselben Minimum;
+- `minindex-ballot-unmasked`: braucht eine **unmaskierte** Lane mit **niedrigerem Index**,
+  deren Wert dem maskierten Minimum gleicht.
+
+Alle vier sind jetzt gepflanzt und tot. Zufällige Floats erzeugen keine davon — die
+allgemeine Lehre: **ein Vergleich wird von Eingaben AUF ihm geprüft, und eine
+Gleichverteilung ist eine Stichprobe von überall außer der Grenze.**
+
+**Ein fünfter Überlebender war mein eigener Fehl-Mutant.** `existing-form-gated` fügte
+`if (acceptMask Bit l) continue;` ein — Lane `l`s Bit wird erst in Iteration `l` gesetzt,
+der Guard kann also nie feuern. Ein Mutant, der nichts ändern kann, beweist durch
+Überleben nichts, und er stand einen ganzen Durchlauf lang wie eine Lücke in der Liste.
+In seiner korrigierten Form überspringt er Lanes mit Null-Normale — und überlebt
+**zu Recht**: genau das ist die Aussage, dass die Null-Normale selbst das Gate ist,
+jetzt per Mutation geprüft statt behauptet.
+
 ## P9.83b-5 — die Patch-Maschinerie, erster Teil: `reduceContactsSingleWarp` seriell, und ein toter Parameter
 
 `reduceContactsSingleWarp` (convexMeshMidphase.cu:440-503) wird an :842-843 und

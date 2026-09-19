@@ -396,3 +396,43 @@ public uint ttpWarpSeed(float sep[32], uint candidateMask, out float minSep)
 {
     return ttpMinIndex(sep, candidateMask, minSep);
 }
+
+// ---------------------------------------------------------------------------
+// THE ACCEPTANCE SWEEP: 11 KILLED, 2 SURVIVE -- AND BOTH SURVIVORS ARE EVIDENCE
+// ---------------------------------------------------------------------------
+// The first run killed 7 of 13.  Four of the six survivors were thresholds with
+// no input near them, which is the same failure in four costumes:
+//
+//   eps3-value               no contact projected between 0.999 and 0.99968, so
+//                            0.9995 and 0.999 classified every lane alike
+//   eps-nonstrict-existing   `>` vs `>=` needs proj EXACTLY 0.9995f
+//   minindex-highest-tie     needs two MASKED lanes sharing the minimum
+//   minindex-ballot-unmasked needs an UNMASKED lane at a LOWER index equal to the
+//                            masked minimum
+//
+// All four are now planted and all four are dead.  Random floats produce none of
+// them, which is the general lesson: a comparison is tested by inputs ON it, and
+// a uniform sample is a sample of everywhere except the boundary.
+//
+// THE TWO THAT REMAIN ARE EQUIVALENT, and each confirms something this file says.
+//
+//   existing-form-gated   skip lanes whose normal is exactly zero
+//       EQUIVALENT, and that is the point.  A retired contact's normal is
+//       PxVec3(0.f) (markAsProcessed, :760-765), so proj == 0 and it fails both
+//       `> 0.85` and `> 0.9995` on its own.  Adding the guard changes nothing --
+//       which is exactly the header's claim that the zero normal IS the gate at
+//       :779-783, now checked by mutation rather than asserted.
+//       (The FIRST version of this mutant was a no-op dressed as a test: it
+//       skipped lanes already in acceptMask, and lane l's bit is only set at
+//       iteration l.  A mutant that cannot change anything proves nothing by
+//       surviving, and it sat in the results for a full run looking like a gap.)
+//
+//   minindex-empty-returns-zero   drop the `ballot == 0 ? 0xFFFFFFFF :` guard
+//       EQUIVALENT ON THIS TOOLCHAIN, proven by the fixture's own coverage: it
+//       has 118 cases with an empty candidate mask that expect 0xFFFFFFFF, and
+//       they pass, so Slang's firstbitlow(0) already returns 0xFFFFFFFF.
+//       THE TERNARY STAYS.  The value is a contract the CUDA depends on at :908,
+//       where it is compared against a lane index and must match none; leaving
+//       that to an intrinsic's corner case is how a compiler update silently
+//       elects lane 0 to seed a patch.
+
