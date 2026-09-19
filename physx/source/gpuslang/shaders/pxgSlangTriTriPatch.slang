@@ -290,3 +290,109 @@ public TtpReduceResult ttpReduceContactsSerial(float4 tempPoints[198], uint tota
 
     return r;
 }
+
+// ---------------------------------------------------------------------------
+// THE TWO ACCEPTANCE TESTS, AND WHY THEY ARE NOT THE SAME TEST
+// ---------------------------------------------------------------------------
+// Both sites project the contact normal onto the patch normal and compare against
+// two epsilons, and a transcription that treats them as one function gets the
+// mesh-mesh manifold subtly wrong in two different ways.
+//
+//   tryToAssignContactToExistingPatch (:779-783)
+//       PxReal proj = contact.normal.dot(patch.Normal);
+//       bool accept2 = proj > PATCH_ACCEPTANCE_EPS2;      // 0.85
+//       bool accept  = proj > PATCH_ACCEPTANCE_EPS3;      // 0.9995
+//     UNGATED.  A retired contact has normal == (0,0,0) after markAsProcessed
+//     (:760-765), so proj == 0 and both tests fail on their own.  The gate is the
+//     zero normal, not an `if`.  contact.pos is NOT cleared by markAsProcessed and
+//     is still handed to the reduce -- only the ballot keeps it out.
+//
+//   createNewPatches (:921-925)
+//       if (contact.candidateContact)
+//       {
+//           PxReal proj = contact.normal.dot(patch.Normal);
+//           accept2 = proj > PATCH_ACCEPTANCE_EPS2;
+//           accept  = proj > PATCH_ACCEPTANCE_EPS3 || myNormal;
+//       }
+//     GATED, and `accept` carries an extra disjunct.  `myNormal` is true for the
+//     single thread that donated this patch's normal at :908-912.  Without it a
+//     patch could reject its own seed: proj there is |contact.normal|^2, and
+//     contact normals are normalised only under `if (m > 0.0f)` (:1139-1144,
+//     :1180-1185), so a degenerate normal gives proj <= 0.9995 -- and the seed is
+//     the one contact that must be in the patch.
+//
+// THE ACCEPT/ACCEPT2 SPLIT IS NOT A REFINEMENT OF ONE TEST EITHER.  accept (tight)
+// decides who enters the REDUCTION; accept2 (loose) decides who is CONSUMED --
+// counted into nbUsed (:812) and retired by markAsProcessed (:845, :959).  So a
+// contact whose normal is within 0.85 but not within 0.9995 of the patch normal is
+// eaten and contributes nothing, deliberately: the comment at :785-786 says moving
+// the definition to work on accept2 "will cause artificial friction".
+//
+// And the consumed set is strictly LARGER than that band: markAsProcessed has no
+// threadEmitsElement guard, so a contact that passed the tight test, entered the
+// ballot and was then culled by the reduce is also consumed.
+
+public static const float TTP_PATCH_ACCEPTANCE_EPS2 = 0.85f;
+public static const float TTP_PATCH_ACCEPTANCE_EPS3 = 0.9995f;
+
+// nputils.cuh:152-163.  NOT crsArgMin: on an EMPTY mask CUDA returns
+// lowestSetIndex(0) = __ffs(0) - 1 = 0xFFFFFFFF, and that value is load-bearing.
+// At :908 it is compared against threadIndexInWarp, where 0xFFFFFFFF matches no
+// lane and so nothing seeds the patch; crsArgMin's 0 would silently elect lane 0.
+//
+// UPSTREAM HAZARD, documented not fixed: the block-level result is used as an
+// ARRAY INDEX at :902 (`countersS[minIBlock]`) with no guard.  It is 0xFFFFFFFF
+// only when no lane satisfies `minV == v`, which needs NaN -- fminf propagates the
+// non-NaN operand, so an all-NaN input leaves the ballot empty.  Reachable only
+// with a NaN separation, which needs a NaN contact.
+public uint ttpMinIndex(float v[32], uint mask, out float minV)
+{
+    minV = CRS_FLT_MAX;
+    for (uint j = 0; j < 32u; ++j)
+        if (((mask >> j) & 1u) != 0u && v[j] < minV) minV = v[j];
+
+    uint ballot = 0u;
+    for (uint j = 0; j < 32u; ++j)
+        if (v[j] == minV) ballot |= 1u << j;
+    ballot &= mask;
+
+    return ballot == 0u ? 0xFFFFFFFFu : firstbitlow(ballot);
+}
+
+// tryToAssignContactToExistingPatch's tests (:779-783), one warp's 32 lanes.
+public void ttpAcceptExisting(float3 cn[32], float3 patchNormal,
+                              out uint acceptMask, out uint accept2Mask)
+{
+    acceptMask = 0u;
+    accept2Mask = 0u;
+    for (uint l = 0; l < 32u; ++l)
+    {
+        const float proj = dot(cn[l], patchNormal);
+        if (proj > TTP_PATCH_ACCEPTANCE_EPS2) accept2Mask |= 1u << l;
+        if (proj > TTP_PATCH_ACCEPTANCE_EPS3) acceptMask |= 1u << l;
+    }
+}
+
+// createNewPatches' tests (:921-925), one warp's 32 lanes.  `seedLane` is the lane
+// that donated the patch normal, or 0xFFFFFFFF if this warp did not donate it.
+public void ttpAcceptNew(float3 cn[32], uint candidateMask, float3 patchNormal, uint seedLane,
+                         out uint acceptMask, out uint accept2Mask)
+{
+    acceptMask = 0u;
+    accept2Mask = 0u;
+    for (uint l = 0; l < 32u; ++l)
+    {
+        if (((candidateMask >> l) & 1u) == 0u) continue;   // :921, the gate
+        const float proj = dot(cn[l], patchNormal);
+        if (proj > TTP_PATCH_ACCEPTANCE_EPS2) accept2Mask |= 1u << l;
+        if (proj > TTP_PATCH_ACCEPTANCE_EPS3 || l == seedLane) acceptMask |= 1u << l;
+    }
+}
+
+// createNewPatches' per-warp seed pick (:879-885).  Returns the lane index
+// (0xFFFFFFFF when the warp has no candidate) and, through minSep, the warp's
+// deepest candidate separation -- which is what goes into shMinSepS.
+public uint ttpWarpSeed(float sep[32], uint candidateMask, out float minSep)
+{
+    return ttpMinIndex(sep, candidateMask, minSep);
+}

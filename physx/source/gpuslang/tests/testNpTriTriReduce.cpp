@@ -416,4 +416,229 @@ PXG_TEST(npTriTriReduce_stream)
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 
+// ---------------------------------------------------------------------------
+// The acceptance and seed tests (convexMeshMidphase.cu:779-783, :879-885,
+// :921-925), mirrored from the CUDA.
+//
+// THE TWO ACCEPTANCE FORMS DIFFER, and the fixture asserts they do.  If they
+// agreed on every case, this test would pass against a port that used the
+// tryToAssign form at both sites -- which is exactly the shape the two tests
+// invite, since they look like the same three lines.
+// ---------------------------------------------------------------------------
+
+static const float PATCH_ACCEPTANCE_EPS2 = 0.85f;
+static const float PATCH_ACCEPTANCE_EPS3 = 0.9995f;
+
+// nputils.cuh:152-163.  lowestSetIndex(0) = __ffs(0) - 1 = 0xFFFFFFFF.
+static uint32_t refMinIndex(const float* v, uint32_t mask, float& minV)
+{
+    minV = FLT_MAX_LOCAL;
+    for (uint32_t j = 0; j < 32; ++j)
+        if (((mask >> j) & 1u) != 0u && v[j] < minV) minV = v[j];
+    uint32_t ballot = 0;
+    for (uint32_t j = 0; j < 32; ++j)
+        if (v[j] == minV) ballot |= 1u << j;
+    ballot &= mask;
+    if (ballot == 0u) return 0xFFFFFFFFu;
+    uint32_t i = 0; while (((ballot >> i) & 1u) == 0u) ++i;
+    return i;
+}
+
+static void refAcceptExisting(const V3* cn, V3 pn, uint32_t& acceptMask, uint32_t& accept2Mask)
+{
+    acceptMask = 0; accept2Mask = 0;
+    for (uint32_t l = 0; l < 32; ++l)                       // :779-783, UNGATED
+    {
+        const float proj = dot3(cn[l], pn);
+        if (proj > PATCH_ACCEPTANCE_EPS2) accept2Mask |= 1u << l;
+        if (proj > PATCH_ACCEPTANCE_EPS3) acceptMask |= 1u << l;
+    }
+}
+
+static void refAcceptNew(const V3* cn, uint32_t candidateMask, V3 pn, uint32_t seedLane,
+                         uint32_t& acceptMask, uint32_t& accept2Mask)
+{
+    acceptMask = 0; accept2Mask = 0;
+    for (uint32_t l = 0; l < 32; ++l)
+    {
+        if (((candidateMask >> l) & 1u) == 0u) continue;    // :921, the gate
+        const float proj = dot3(cn[l], pn);
+        if (proj > PATCH_ACCEPTANCE_EPS2) accept2Mask |= 1u << l;
+        if (proj > PATCH_ACCEPTANCE_EPS3 || l == seedLane) acceptMask |= 1u << l;  // :925
+    }
+}
+
+struct TtaParams { uint32_t numCases, pad0, pad1, pad2; };
+struct TtaCase
+{
+    V4 cn[32];
+    V4 sep8[8];
+    V4 patchNormal;
+    uint32_t misc[4];
+};
+
+PXG_TEST(npTriTriReduce_accept)
+{
+    std::mt19937 rng(220417);
+    const uint32_t N = 2000;
+    auto rf = [&](float lo, float hi)
+    { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+
+    std::vector<TtaCase> in(N);
+    std::vector<uint32_t> ra1(N), ra2(N), rb1(N), rb2(N), rseed(N);
+    std::vector<float> rmin(N);
+    size_t formsDiffer = 0, bandCases = 0, seedRescued = 0, emptyCandidate = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        TtaCase c{};
+
+        V3 pn{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+        const float pl = mag3(pn);
+        pn = pl > 1e-4f ? scale3(pn, 1.0f / pl) : V3{ 0.371391f, 0.557086f, 0.742781f };
+        c.patchNormal = { pn.x, pn.y, pn.z, 0 };
+
+        // THE NORMALS MUST STRADDLE BOTH EPSILONS.  Random directions in 3D are
+        // almost never within 0.9995 of a given one (that is a 1.8-degree cone),
+        // so a uniform sample would put every lane below both thresholds and the
+        // two masks would be zero -- an observable true under the null hypothesis.
+        // So each lane is a small perturbation of the patch normal, with the
+        // perturbation scale chosen to land across the interesting band.
+        V3 cn[32];
+        float sep[32];
+        for (uint32_t l = 0; l < 32; ++l)
+        {
+            const uint32_t bucket = l % 4u;
+            //  0: inside 0.9995   1: in the (0.85, 0.9995] band
+            //  2: below 0.85      3: a retired contact -- the ZERO normal
+            float ang;
+            if (bucket == 0u) ang = rf(0.0f, 0.025f);        // cos > 0.9996
+            else if (bucket == 1u) ang = rf(0.05f, 0.5f);    // cos in (0.877, 0.9987)
+            else ang = rf(0.6f, 2.0f);                       // cos < 0.825
+            V3 perp{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+            const float d = dot3(perp, pn);
+            perp = sub(perp, scale3(pn, d));
+            const float pm = mag3(perp);
+            perp = pm > 1e-5f ? scale3(perp, 1.0f / pm) : V3{ 0, 0, 0 };
+            if (bucket == 3u) cn[l] = { 0, 0, 0 };           // markAsProcessed
+            else cn[l] = { pn.x * std::cos(ang) + perp.x * std::sin(ang),
+                           pn.y * std::cos(ang) + perp.y * std::sin(ang),
+                           pn.z * std::cos(ang) + perp.z * std::sin(ang) };
+            c.cn[l] = { cn[l].x, cn[l].y, cn[l].z, 0 };
+            sep[l] = rf(-0.4f, 0.25f);
+        }
+        for (uint32_t l = 0; l < 32; ++l) (&c.sep8[l >> 2].x)[l & 3] = sep[l];
+
+        uint32_t candidateMask = rng();
+        if ((i % 17u) == 5u) { candidateMask = 0; ++emptyCandidate; }  // the 0xFFFFFFFF return
+        c.misc[0] = candidateMask;
+
+        // The seed lane: usually a real candidate, sometimes 0xFFFFFFFF (this warp
+        // did not donate the normal).  A DEGENERATE seed normal is planted in one
+        // case in nine, because `|| myNormal` only matters when the seed's own
+        // projection fails -- and the seed normal is contact.normal copied verbatim,
+        // so proj == |normal|^2, which is below 0.9995 exactly when the normal is
+        // short.  Contact normals are normalised only under `if (m > 0.0f)`.
+        uint32_t seedLane = 0xFFFFFFFFu;
+        if (candidateMask != 0u && (i % 3u) != 0u)
+        {
+            uint32_t k = rng() % 32u;
+            while (((candidateMask >> k) & 1u) == 0u) k = (k + 1u) % 32u;
+            seedLane = k;
+            if ((i % 9u) == 2u)
+            {
+                const float shrink = 0.9f;                  // |n|^2 = 0.81 < 0.85
+                cn[k] = scale3(pn, shrink);
+                c.cn[k] = { cn[k].x, cn[k].y, cn[k].z, 0 };
+            }
+        }
+        c.misc[1] = seedLane;
+
+        in[i] = c;
+        refAcceptExisting(cn, pn, ra1[i], ra2[i]);
+        refAcceptNew(cn, candidateMask, pn, seedLane, rb1[i], rb2[i]);
+        rseed[i] = refMinIndex(sep, candidateMask, rmin[i]);
+
+        // NOT `ra1 != rb1`: that is true on nearly every case merely because the
+        // new form is gated on candidateContact, so it would be an observable true
+        // under the null hypothesis.  `rb1 & ~ra1` is a lane the NEW form accepts
+        // that the EXISTING form rejects, and with the same normals and the same
+        // epsilons the ONLY thing that can produce one is the `|| myNormal`
+        // disjunct at :925.
+        if ((rb1[i] & ~ra1[i]) != 0u) ++formsDiffer;
+        if ((ra2[i] & ~ra1[i]) != 0u) ++bandCases;
+        if (seedLane != 0xFFFFFFFFu && ((rb1[i] >> seedLane) & 1u) != 0u
+            && dot3(cn[seedLane], pn) <= PATCH_ACCEPTANCE_EPS3) ++seedRescued;
+    }
+
+    PXG_CHECK_MSG(formsDiffer > N / 20,
+                  "npTriTriReduce_accept: only %zu of %u cases have a lane the NEW "
+                  "acceptance form takes and the EXISTING one does not -- that "
+                  "difference is `|| myNormal` and nothing else, and without it this "
+                  "fixture would pass against a port that dropped the disjunct",
+                  formsDiffer, N);
+    PXG_CHECK_MSG(bandCases > N / 2,
+                  "npTriTriReduce_accept: only %zu of %u cases have a contact in the "
+                  "(0.85, 0.9995] band -- that band is the whole point of the "
+                  "accept/accept2 split (consumed but not reduced)", bandCases, N);
+    PXG_CHECK_MSG(seedRescued > N / 20,
+                  "npTriTriReduce_accept: only %zu of %u cases have a seed rescued by "
+                  "`|| myNormal` -- without those, dropping that disjunct is invisible",
+                  seedRescued, N);
+    PXG_CHECK_MSG(emptyCandidate > N / 40,
+                  "npTriTriReduce_accept: only %zu of %u cases have an EMPTY candidate "
+                  "mask, which is the only input where minIndex returns 0xFFFFFFFF",
+                  emptyCandidate, N);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> outA(size_t(N) * 4, 0xDEADBEEFu);
+    std::vector<uint32_t> outS(size_t(N) * 4, 0xDEADBEEFu);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bA = createBufferFrom(dev, outA);
+    PxgBufferHandle bS = createBufferFrom(dev, outS);
+
+    TtaParams prm{ N, 0, 0, 0 };
+    Kernel k("npTriTriAccept.spv", "ttrAccept",
+             { (uint32_t)sizeof(TtaCase), 16u, 16u }, sizeof(TtaParams));
+    k.dispatch((N + 63) / 64, { bIn, bA, bS }, prm);
+    dev->flush();
+
+    const auto gotA = downloadBuffer<uint32_t>(dev, bA, size_t(N) * 4);
+    const auto gotS = downloadBuffer<uint32_t>(dev, bS, size_t(N) * 4);
+
+    size_t mmA = 0, mmSeed = 0, mmMin = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (gotA[i * 4 + 0] != ra1[i] || gotA[i * 4 + 1] != ra2[i] ||
+            gotA[i * 4 + 2] != rb1[i] || gotA[i * 4 + 3] != rb2[i])
+        {
+            if (mmA < 4)
+                std::printf("  case %u: got (%08x %08x %08x %08x) want (%08x %08x %08x %08x)\n",
+                            i, gotA[i*4+0], gotA[i*4+1], gotA[i*4+2], gotA[i*4+3],
+                            ra1[i], ra2[i], rb1[i], rb2[i]);
+            ++mmA;
+        }
+        if (gotS[i * 4 + 0] != rseed[i])
+        {
+            if (mmSeed < 4)
+                std::printf("  case %u: seed got 0x%08x want 0x%08x\n", i, gotS[i*4+0], rseed[i]);
+            ++mmSeed;
+        }
+        float gm; std::memcpy(&gm, &gotS[i * 4 + 1], 4);
+        if (gm != rmin[i]) ++mmMin;
+    }
+
+    PXG_CHECK_MSG(mmA == 0, "npTriTriReduce_accept: %zu acceptance-mask mismatches", mmA);
+    PXG_CHECK_MSG(mmSeed == 0, "npTriTriReduce_accept: %zu seed-lane mismatches", mmSeed);
+    PXG_CHECK_MSG(mmMin == 0, "npTriTriReduce_accept: %zu minSep mismatches", mmMin);
+
+    std::printf("  npTriTriReduce_accept: %u cases, the new form takes a lane the "
+                "existing one rejects on %zu, "
+                "%zu have a contact in the (0.85, 0.9995] band, %zu have a seed "
+                "rescued by `|| myNormal`, %zu have an empty candidate mask\n",
+                N, formsDiffer, bandCases, seedRescued, emptyCandidate);
+
+    for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
+}
+
 } // namespace
