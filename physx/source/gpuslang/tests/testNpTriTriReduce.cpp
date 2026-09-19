@@ -488,6 +488,7 @@ PXG_TEST(npTriTriReduce_accept)
     std::vector<uint32_t> ra1(N), ra2(N), rb1(N), rb2(N), rseed(N);
     std::vector<float> rmin(N);
     size_t formsDiffer = 0, bandCases = 0, seedRescued = 0, emptyCandidate = 0;
+    size_t tieCases = 0, unmaskedTie = 0, exactEps = 0, straddle = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -508,13 +509,21 @@ PXG_TEST(npTriTriReduce_accept)
         float sep[32];
         for (uint32_t l = 0; l < 32; ++l)
         {
-            const uint32_t bucket = l % 4u;
-            //  0: inside 0.9995   1: in the (0.85, 0.9995] band
-            //  2: below 0.85      3: a retired contact -- the ZERO normal
+            const uint32_t bucket = l % 5u;
+            //  0: inside 0.9995          1: in the (0.85, 0.9995] band
+            //  2: STRADDLING 0.9995      3: a retired contact -- the ZERO normal
+            //  4: below 0.85
             float ang;
-            if (bucket == 0u) ang = rf(0.0f, 0.025f);        // cos > 0.9996
-            else if (bucket == 1u) ang = rf(0.05f, 0.5f);    // cos in (0.877, 0.9987)
+            if (bucket == 0u) ang = rf(0.0f, 0.025f);        // cos > 0.99968
+            else if (bucket == 1u) ang = rf(0.05f, 0.5f);    // cos in (0.877, 0.99875)
+            else if (bucket == 2u) ang = rf(0.025f, 0.05f);  // cos in (0.99875, 0.99968)
             else ang = rf(0.6f, 2.0f);                       // cos < 0.825
+            // BUCKET 2 IS THE ONE THE SWEEP ASKED FOR.  The first draft had only
+            // buckets 0 and 1, whose cosines are 0.99968-and-up and 0.99875-and-
+            // down -- so NOTHING landed between them, and `eps3-value` (0.9995 ->
+            // 0.999) survived because both thresholds classified every lane the
+            // same way.  A threshold with no input near it is a threshold no
+            // fixture is testing.
             V3 perp{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
             const float d = dot3(perp, pn);
             perp = sub(perp, scale3(pn, d));
@@ -527,11 +536,49 @@ PXG_TEST(npTriTriReduce_accept)
             c.cn[l] = { cn[l].x, cn[l].y, cn[l].z, 0 };
             sep[l] = rf(-0.4f, 0.25f);
         }
-        for (uint32_t l = 0; l < 32; ++l) (&c.sep8[l >> 2].x)[l & 3] = sep[l];
-
         uint32_t candidateMask = rng();
         if ((i % 17u) == 5u) { candidateMask = 0; ++emptyCandidate; }  // the 0xFFFFFFFF return
         c.misc[0] = candidateMask;
+
+        // ---- THREE PLANTED EXACT COINCIDENCES, ALL ASKED FOR BY THE SWEEP ----
+        // Random floats never produce an exact tie, so three mutants survived the
+        // first run on inputs that cannot occur by chance:
+        //
+        //  eps-nonstrict-existing  `>` vs `>=` differs only at proj EXACTLY
+        //      0.9995f.  Constructible: make the patch normal an exact axis and
+        //      set a lane's normal to (EPS3, 0, 0), so the dot product is EPS3
+        //      bit-for-bit on both sides.
+        //  minindex-highest-tie    firstbitlow vs firstbithigh differs only when
+        //      TWO masked lanes share the minimum.
+        //  minindex-ballot-unmasked  dropping `ballot &= mask` matters only when
+        //      an UNMASKED lane at a LOWER index holds a value equal to the masked
+        //      minimum.
+        if ((i % 6u) == 1u && candidateMask != 0u)
+        {
+            uint32_t a = 0; while (((candidateMask >> a) & 1u) == 0u) ++a;
+            uint32_t b = a + 1u;
+            while (b < 32u && ((candidateMask >> b) & 1u) == 0u) ++b;
+            if (b < 32u) { sep[a] = -0.39f; sep[b] = -0.39f; ++tieCases; }   // exact tie
+        }
+        if ((i % 6u) == 3u && candidateMask != 0u && (candidateMask & 1u) == 0u)
+        {
+            float mn = FLT_MAX_LOCAL;
+            for (uint32_t l = 0; l < 32; ++l)
+                if (((candidateMask >> l) & 1u) != 0u && sep[l] < mn) mn = sep[l];
+            sep[0] = mn;                      // lane 0 is OUTSIDE the mask
+            ++unmaskedTie;
+        }
+        if ((i % 6u) == 5u)
+        {
+            pn = V3{ 1.0f, 0.0f, 0.0f };      // an EXACT axis
+            c.patchNormal = { 1.0f, 0.0f, 0.0f, 0 };
+            const uint32_t l = 7u;
+            cn[l] = { PATCH_ACCEPTANCE_EPS3, 0.0f, 0.0f };   // dot == EPS3 exactly
+            c.cn[l] = { cn[l].x, cn[l].y, cn[l].z, 0 };
+            ++exactEps;
+        }
+
+        for (uint32_t l = 0; l < 32; ++l) (&c.sep8[l >> 2].x)[l & 3] = sep[l];
 
         // The seed lane: usually a real candidate, sometimes 0xFFFFFFFF (this warp
         // did not donate the normal).  A DEGENERATE seed normal is planted in one
@@ -567,6 +614,11 @@ PXG_TEST(npTriTriReduce_accept)
         // disjunct at :925.
         if ((rb1[i] & ~ra1[i]) != 0u) ++formsDiffer;
         if ((ra2[i] & ~ra1[i]) != 0u) ++bandCases;
+        for (uint32_t l = 0; l < 32; ++l)
+        {
+            const float pj = dot3(cn[l], pn);
+            if (pj > 0.999f && pj < 0.99968f) { ++straddle; break; }
+        }
         if (seedLane != 0xFFFFFFFFu && ((rb1[i] >> seedLane) & 1u) != 0u
             && dot3(cn[seedLane], pn) <= PATCH_ACCEPTANCE_EPS3) ++seedRescued;
     }
@@ -585,6 +637,15 @@ PXG_TEST(npTriTriReduce_accept)
                   "npTriTriReduce_accept: only %zu of %u cases have a seed rescued by "
                   "`|| myNormal` -- without those, dropping that disjunct is invisible",
                   seedRescued, N);
+    PXG_CHECK_MSG(straddle > N / 4,
+                  "npTriTriReduce_accept: only %zu of %u cases have a contact whose "
+                  "projection lands between 0.999 and 0.99968 -- without one, moving "
+                  "PATCH_ACCEPTANCE_EPS3 off 0.9995 is invisible", straddle, N);
+    PXG_CHECK_MSG(tieCases > N / 20 && unmaskedTie > N / 40 && exactEps > N / 10,
+                  "npTriTriReduce_accept: planted coincidences are thin (%zu masked "
+                  "ties, %zu unmasked ties, %zu exact-epsilon lanes) -- each is the "
+                  "only input that distinguishes one of the minIndex/epsilon mutants",
+                  tieCases, unmaskedTie, exactEps);
     PXG_CHECK_MSG(emptyCandidate > N / 40,
                   "npTriTriReduce_accept: only %zu of %u cases have an EMPTY candidate "
                   "mask, which is the only input where minIndex returns 0xFFFFFFFF",
@@ -635,8 +696,11 @@ PXG_TEST(npTriTriReduce_accept)
     std::printf("  npTriTriReduce_accept: %u cases, the new form takes a lane the "
                 "existing one rejects on %zu, "
                 "%zu have a contact in the (0.85, 0.9995] band, %zu have a seed "
-                "rescued by `|| myNormal`, %zu have an empty candidate mask\n",
-                N, formsDiffer, bandCases, seedRescued, emptyCandidate);
+                "rescued by `|| myNormal`, %zu have an empty candidate mask; "
+                "planted: %zu masked ties, %zu unmasked ties, %zu exact-epsilon, "
+                "%zu straddling 0.9995\n",
+                N, formsDiffer, bandCases, seedRescued, emptyCandidate,
+                tieCases, unmaskedTie, exactEps, straddle);
 
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }
