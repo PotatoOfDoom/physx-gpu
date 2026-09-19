@@ -105,3 +105,44 @@ void ttrAccept(uint3 dtid : SV_DispatchThreadID)
     const uint seed = ttpWarpSeed(sep, candidateMask, minSep);
     gOutSeed[t] = uint4(seed, asuint(minSep), 0u, 0u);
 }
+
+// ---------------------------------------------------------------------------
+// The reservation entry.  Shares this file's bindings deliberately: the earlier
+// segfault came from adding an entry with its OWN buffers to a file that already
+// had some, and the fix is either a new file or REUSING the existing bindings.
+// This entry reuses gInA/gOutA/gOutSeed by reinterpreting them, so the binding
+// layout is unchanged and the harness binds the same three slots.
+// ---------------------------------------------------------------------------
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void ttrReserve(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint t = dtid.x;
+    if (t >= gPA.numCases) return;
+
+    // The case is packed into the existing TtaCase: misc carries the counts, and
+    // the first two float4 of cn[] carry the six 32-bit inputs as raw bits.
+    const uint oldAllFlags   = asuint(gInA[t].cn[0].x);
+    const uint numPatches    = asuint(gInA[t].cn[0].y);
+    const uint totalContacts = asuint(gInA[t].cn[0].z);
+    const uint patchAdd      = asuint(gInA[t].cn[0].w);
+    const uint contactAdd    = asuint(gInA[t].cn[1].x);
+    const uint forceAdd      = asuint(gInA[t].cn[1].y);
+    const uint patchLimit    = asuint(gInA[t].cn[1].z);
+    const uint contactLimit  = asuint(gInA[t].cn[1].w);
+    const uint forceLimit    = asuint(gInA[t].cn[2].x);
+
+    const TtpReservation r = ttpReserveBlock(oldAllFlags, numPatches, totalContacts,
+                                             patchAdd, contactAdd, forceAdd,
+                                             patchLimit, contactLimit, forceLimit);
+
+    gOutA[t] = uint4(r.patchByteOffset, r.contactByteOffset, r.forceByteOffset, r.allFlagsWord);
+    gOutSeed[t] = uint4(r.numPatchesOut | (r.numContactsOut << 16u),
+                        r.touchChange | (r.patchChange << 1u)
+                            | (r.overflow ? 4u : 0u)
+                            | (r.writerPatchesNull ? 8u : 0u)
+                            | (r.writerContactsNull ? 16u : 0u),
+                        r.overflowBits, r.statusFlags);
+}
+

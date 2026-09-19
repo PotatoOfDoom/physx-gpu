@@ -436,3 +436,156 @@ public uint ttpWarpSeed(float sep[32], uint candidateMask, out float minSep)
 //       that to an intrinsic's corner case is how a compiler update silently
 //       elects lane 0 to seed a patch.
 
+
+// ---------------------------------------------------------------------------
+// createPatchWriterFullThreadBlock (:504-641): THE BLOCK-WIDE RESERVATION
+// ---------------------------------------------------------------------------
+// This is NOT the tail pxgSlangNpPatchTail already has.  That one
+// (nptReserveContacts/nptRegisterContactPatch) reserves for ONE pair with ONE
+// patch, and its overflow test is deliberately `offset + ONE RECORD > limit` --
+// a faithful upstream quirk its own header records.  This one reserves N PATCHES
+// and M CONTACTS for a whole thread block in three atomics, and tests the WHOLE
+// RESERVATION.  Two tails in one engine with different overflow semantics;
+// documented, not reconciled.
+//
+// THREE THINGS A TRANSCRIPTION GETS WRONG HERE.
+//
+// 1. THE CHECKS ARE 64-BIT, THE RESERVATIONS ARE NOT.  `sizeof(...)` is size_t,
+//    so `patchByteOffsetS + sizeof(PxContactPatch) * numPatchesToKeep >
+//    patchBytesLimit` (:560) promotes the whole comparison to 64 bits and cannot
+//    wrap.  The atomicAdd arguments are the same expressions narrowed back to
+//    unsigned by the atomicAdd signature, so the ADD is 32-bit and wraps.  Doing
+//    the comparison in 32-bit -- the natural choice in Slang -- changes behaviour
+//    once an offset is large.
+//
+// 2. THE FORCE CHECK RESERVES N AND TESTS 2N.  :558 adds
+//    `sizeof(PxU32) * totalNumContacts`; :573 tests
+//    `offset + sizeof(PxU32) * totalNumContacts * 2 > forceBytesLimit`.  The
+//    buffer is "forceAndIndice", so the doubling is presumably the indices --
+//    but only one stride is ever reserved.  Transcribed as written.
+//
+// 3. THE ZERO-CONTACT PATH PUBLISHES base + 0xFFFFFFFF, NOT NULL.  The three
+//    atomics are gated on `if (totalNumContacts)` (:554), so a block that
+//    produced nothing leaves all three offsets at their 0xFFFFFFFF init AND
+//    leaves `overflow` false -- and thread 0 then takes the `!overflow` arm
+//    (:607) and writes `startContactPoints + 0xFFFFFFFF` into the output.  The
+//    OVERFLOW arm writes zeros.  Harmless only because nbContacts is 0 and
+//    eHAS_NO_TOUCH is set, and asymmetric with the returned writer, whose members
+//    DO become null for the same sentinel (:625-626).
+//    A port will "fix" this to null without noticing.  This one does not.
+//
+// The atomic RESULTS are parameters rather than performed here, so the decision
+// logic is testable without a race -- the same reason the reduce took lane arrays.
+
+public struct TtpReservation
+{
+    public uint patchByteOffset;     // 0xFFFFFFFF when unreserved or overflowed
+    public uint contactByteOffset;
+    public uint forceByteOffset;
+    public uint numPatchesOut;       // zeroed by overflow (:582)
+    public uint numContactsOut;
+    public uint statusFlags;
+    public uint allFlagsWord;
+    public uint touchChange;
+    public uint patchChange;
+    public uint overflowBits;        // which limits were hit
+    public bool overflow;
+    public bool writerPatchesNull;   // the :625-626 asymmetry, made explicit
+    public bool writerContactsNull;
+}
+
+public static const uint TTP_PATCH_SIZE = 64u;    // sizeof(PxContactPatch)
+public static const uint TTP_CONTACT_SIZE = 16u;  // sizeof(PxContact)
+public static const uint TTP_FORCE_SIZE = 4u;     // sizeof(PxU32)
+
+public static const uint TTP_FLAG_HAS_NO_TOUCH = 1u;
+public static const uint TTP_FLAG_HAS_TOUCH = 2u;
+public static const uint TTP_FLAG_TOUCH_KNOWN = 3u;
+
+public static const uint TTP_OVERFLOW_PATCH = 4u;
+public static const uint TTP_OVERFLOW_CONTACT = 1u;
+public static const uint TTP_OVERFLOW_FORCE = 2u;
+
+public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, uint totalNumContacts,
+                                      uint patchAdd, uint contactAdd, uint forceAdd,
+                                      uint patchBytesLimit, uint contactBytesLimit,
+                                      uint forceBytesLimit)
+{
+    TtpReservation r;
+    r.patchByteOffset = 0xFFFFFFFFu;      // :525-529
+    r.contactByteOffset = 0xFFFFFFFFu;
+    r.forceByteOffset = 0xFFFFFFFFu;
+    r.overflowBits = 0u;
+    r.overflow = false;
+
+    const uint oldStatusFlags = (oldAllFlags >> 16u) & 0xFFu;
+    const uint prevPatches = (oldAllFlags >> 24u) & 0xFFu;
+
+    // :540-545.  The mask clears ONLY bits 0-1; eREQUEST_CONSTRAINTS,
+    // eHAS_CCD_RETOUCH, eDIRTY_MANAGER and eSTATIC_OR_KINEMATIC ride through.
+    uint statusFlags = oldStatusFlags & (~TTP_FLAG_TOUCH_KNOWN);
+    if (numPatchesToKeep != 0u) statusFlags |= TTP_FLAG_HAS_TOUCH;
+    else                        statusFlags |= TTP_FLAG_HAS_NO_TOUCH;
+
+    uint nPatches = numPatchesToKeep;
+    uint nContacts = totalNumContacts;
+
+    if (totalNumContacts != 0u)           // :554 -- the gate
+    {
+        r.patchByteOffset = patchAdd;
+        r.contactByteOffset = contactAdd;
+        r.forceByteOffset = forceAdd;
+
+        // 64-BIT, as the CUDA's size_t arithmetic makes them.
+        if (uint64_t(r.patchByteOffset) + uint64_t(TTP_PATCH_SIZE) * uint64_t(numPatchesToKeep)
+            > uint64_t(patchBytesLimit))
+        {
+            r.overflowBits |= TTP_OVERFLOW_PATCH;
+            r.patchByteOffset = 0xFFFFFFFFu;
+            r.overflow = true;
+        }
+        if (uint64_t(r.contactByteOffset) + uint64_t(TTP_CONTACT_SIZE) * uint64_t(totalNumContacts)
+            > uint64_t(contactBytesLimit))
+        {
+            r.overflowBits |= TTP_OVERFLOW_CONTACT;
+            r.contactByteOffset = 0xFFFFFFFFu;
+            r.overflow = true;
+        }
+        // THE *2 IS THE CUDA'S (:573) -- it reserves one stride and tests two.
+        if (uint64_t(r.forceByteOffset) + uint64_t(TTP_FORCE_SIZE) * uint64_t(totalNumContacts) * 2UL
+            > uint64_t(forceBytesLimit))
+        {
+            r.overflowBits |= TTP_OVERFLOW_FORCE;
+            r.forceByteOffset = 0xFFFFFFFFu;
+            r.overflow = true;
+        }
+
+        if (r.overflow)                   // :580-586
+        {
+            nPatches = 0u;
+            nContacts = 0u;
+            statusFlags = (statusFlags & (~TTP_FLAG_TOUCH_KNOWN)) | TTP_FLAG_HAS_NO_TOUCH;
+        }
+    }
+
+    // :592-600
+    const bool previouslyHadTouch = (oldStatusFlags & TTP_FLAG_HAS_TOUCH) != 0u;
+    const bool prevTouchKnown = (oldStatusFlags & TTP_FLAG_TOUCH_KNOWN) != 0u;
+    const bool currentlyHasTouch = nPatches != 0u;
+    r.touchChange = ((previouslyHadTouch != currentlyHasTouch) || (!prevTouchKnown)) ? 1u : 0u;
+    r.patchChange = (prevPatches != nPatches) ? 1u : 0u;
+
+    // :603-605.  merge(merge(prevPatches, statusFlags), merge(numPatchesToKeep, 0))
+    r.allFlagsWord = (prevPatches << 24u) | (statusFlags << 16u) | (nPatches << 8u);
+
+    r.statusFlags = statusFlags;
+    r.numPatchesOut = nPatches;
+    r.numContactsOut = nContacts;
+
+    // :624-626.  The writer is null on the SENTINEL, which the zero-contact path
+    // also produces -- while the output pointers above took the !overflow arm.
+    r.writerPatchesNull = (r.patchByteOffset == 0xFFFFFFFFu);
+    r.writerContactsNull = (r.contactByteOffset == 0xFFFFFFFFu);
+
+    return r;
+}

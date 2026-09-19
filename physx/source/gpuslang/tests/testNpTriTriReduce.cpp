@@ -705,4 +705,211 @@ PXG_TEST(npTriTriReduce_accept)
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }
 
+// ---------------------------------------------------------------------------
+// createPatchWriterFullThreadBlock's decisions (:504-641), mirrored from the CUDA.
+//
+// The three atomicAdd RESULTS are inputs here rather than performed, so the logic
+// is testable without a race.  What is being checked is the arithmetic and the
+// two asymmetries a transcription smooths over:
+//   - the checks are 64-bit and the reservations are 32-bit (:560, :567, :573);
+//   - the force check tests 2N where the reservation added N (:558 vs :573);
+//   - the zero-contact path leaves all three offsets at 0xFFFFFFFF with
+//     `overflow` FALSE, so the output pointers become base + 0xFFFFFFFF while the
+//     writer members become null (:607-611 vs :625-626).
+// ---------------------------------------------------------------------------
+
+static const uint32_t TTP_PATCH_SIZE = 64, TTP_CONTACT_SIZE = 16, TTP_FORCE_SIZE = 4;
+static const uint32_t FLAG_HAS_NO_TOUCH = 1, FLAG_HAS_TOUCH = 2, FLAG_TOUCH_KNOWN = 3;
+static const uint32_t OVF_PATCH = 4, OVF_CONTACT = 1, OVF_FORCE = 2;
+
+struct RefRes
+{
+    uint32_t patchOfs, contactOfs, forceOfs, allFlags;
+    uint32_t nPatches, nContacts, statusFlags, ovfBits;
+    bool touchChange, patchChange, overflow, wPatchNull, wContactNull;
+};
+
+static RefRes refReserve(uint32_t oldAllFlags, uint32_t numPatchesToKeep, uint32_t totalNumContacts,
+                         uint32_t patchAdd, uint32_t contactAdd, uint32_t forceAdd,
+                         uint32_t patchLimit, uint32_t contactLimit, uint32_t forceLimit)
+{
+    RefRes r{};
+    r.patchOfs = r.contactOfs = r.forceOfs = 0xFFFFFFFFu;
+    r.ovfBits = 0; r.overflow = false;
+
+    const uint32_t oldStatus = (oldAllFlags >> 16) & 0xFFu;
+    const uint32_t prevPatches = (oldAllFlags >> 24) & 0xFFu;
+
+    uint32_t statusFlags = oldStatus & (~FLAG_TOUCH_KNOWN);
+    if (numPatchesToKeep != 0) statusFlags |= FLAG_HAS_TOUCH;
+    else                       statusFlags |= FLAG_HAS_NO_TOUCH;
+
+    uint32_t nP = numPatchesToKeep, nC = totalNumContacts;
+
+    if (totalNumContacts != 0)                                       // :554
+    {
+        r.patchOfs = patchAdd; r.contactOfs = contactAdd; r.forceOfs = forceAdd;
+        if ((uint64_t)r.patchOfs + (uint64_t)TTP_PATCH_SIZE * numPatchesToKeep > (uint64_t)patchLimit)
+        { r.ovfBits |= OVF_PATCH; r.patchOfs = 0xFFFFFFFFu; r.overflow = true; }
+        if ((uint64_t)r.contactOfs + (uint64_t)TTP_CONTACT_SIZE * totalNumContacts > (uint64_t)contactLimit)
+        { r.ovfBits |= OVF_CONTACT; r.contactOfs = 0xFFFFFFFFu; r.overflow = true; }
+        if ((uint64_t)r.forceOfs + (uint64_t)TTP_FORCE_SIZE * totalNumContacts * 2 > (uint64_t)forceLimit)
+        { r.ovfBits |= OVF_FORCE; r.forceOfs = 0xFFFFFFFFu; r.overflow = true; }
+        if (r.overflow)                                              // :580-586
+        {
+            nP = 0; nC = 0;
+            statusFlags = (statusFlags & (~FLAG_TOUCH_KNOWN)) | FLAG_HAS_NO_TOUCH;
+        }
+    }
+
+    const bool prevHadTouch = (oldStatus & FLAG_HAS_TOUCH) != 0;
+    const bool prevKnown = (oldStatus & FLAG_TOUCH_KNOWN) != 0;
+    const bool nowHasTouch = nP != 0;
+    r.touchChange = (prevHadTouch != nowHasTouch) || (!prevKnown);
+    r.patchChange = (prevPatches != nP);
+    r.allFlags = (prevPatches << 24) | (statusFlags << 16) | (nP << 8);
+    r.statusFlags = statusFlags;
+    r.nPatches = nP; r.nContacts = nC;
+    r.wPatchNull = (r.patchOfs == 0xFFFFFFFFu);
+    r.wContactNull = (r.contactOfs == 0xFFFFFFFFu);
+    return r;
+}
+
+PXG_TEST(npTriTriReduce_reserve)
+{
+    std::mt19937 rng(771903);
+    const uint32_t N = 3000;
+
+    std::vector<TtaCase> in(N);
+    std::vector<RefRes> ref(N);
+    size_t zeroContact = 0, ovfPatch = 0, ovfContact = 0, ovfForce = 0;
+    size_t forceOnlyByDoubling = 0, sentinelNotNull = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        TtaCase c{};
+        const uint32_t oldAllFlags = rng();
+        uint32_t nP, nC;
+
+        const uint32_t shape = i % 8u;
+        if (shape == 0u) { nP = 0; nC = 0; ++zeroContact; }          // the sentinel path
+        else if (shape == 1u) { nP = 1 + rng() % 128u; nC = 0; ++zeroContact; }
+        else { nP = 1 + rng() % 128u; nC = 1 + rng() % 768u; }
+
+        const uint32_t patchAdd = rng() % 400000u;
+        const uint32_t contactAdd = rng() % 400000u;
+        const uint32_t forceAdd = rng() % 400000u;
+
+        // EVERY LIMIT IS PLACED RELATIVE TO ITS OWN RESERVATION, not at an absolute
+        // address.  The first draft used absolute limits near the top of the offset
+        // range and the coverage guard caught it: 27 patch and 31 contact overflows
+        // in 3000 cases, because overflow then needs the random offset to land in a
+        // narrow band.  Each limit now sits just below or just above `offset +
+        // reservation`, so roughly half of each kind overflows by construction.
+        auto straddle = [&](uint64_t need) -> uint32_t {
+            const uint64_t slack = 1u + (rng() % 4096u);
+            const uint64_t lim = (rng() & 1u) ? (need + slack)
+                                              : (need > slack ? need - slack : 0u);
+            return (uint32_t)(lim > 0xFFFFFFFFull ? 0xFFFFFFFFull : lim);
+        };
+        const uint32_t patchLimit = straddle((uint64_t)patchAdd + (uint64_t)TTP_PATCH_SIZE * nP);
+        const uint32_t contactLimit = straddle((uint64_t)contactAdd + (uint64_t)TTP_CONTACT_SIZE * nC);
+        // THE FORCE LIMIT ALSO STRADDLES THE DOUBLING.  A limit that clears 2N or
+        // fails N alike would never distinguish the CUDA's `* 2` from its absence,
+        // so one case in three is placed strictly between N and 2N.
+        const uint32_t forceLimit = ((i % 3u) == 0u)
+            ? (uint32_t)((uint64_t)forceAdd + TTP_FORCE_SIZE * nC + (TTP_FORCE_SIZE * (uint64_t)nC) / 2u)
+            : straddle((uint64_t)forceAdd + (uint64_t)TTP_FORCE_SIZE * nC * 2);
+
+        c.cn[0] = { 0, 0, 0, 0 };
+        std::memcpy(&c.cn[0].x, &oldAllFlags, 4);
+        std::memcpy(&c.cn[0].y, &nP, 4);
+        std::memcpy(&c.cn[0].z, &nC, 4);
+        std::memcpy(&c.cn[0].w, &patchAdd, 4);
+        std::memcpy(&c.cn[1].x, &contactAdd, 4);
+        std::memcpy(&c.cn[1].y, &forceAdd, 4);
+        std::memcpy(&c.cn[1].z, &patchLimit, 4);
+        std::memcpy(&c.cn[1].w, &contactLimit, 4);
+        std::memcpy(&c.cn[2].x, &forceLimit, 4);
+
+        in[i] = c;
+        ref[i] = refReserve(oldAllFlags, nP, nC, patchAdd, contactAdd, forceAdd,
+                            patchLimit, contactLimit, forceLimit);
+
+        if (ref[i].ovfBits & OVF_PATCH) ++ovfPatch;
+        if (ref[i].ovfBits & OVF_CONTACT) ++ovfContact;
+        if (ref[i].ovfBits & OVF_FORCE) ++ovfForce;
+        // Cases where the force check fails ONLY because of the *2.
+        if (nC != 0 &&
+            (uint64_t)forceAdd + (uint64_t)TTP_FORCE_SIZE * nC * 2 > (uint64_t)forceLimit &&
+            (uint64_t)forceAdd + (uint64_t)TTP_FORCE_SIZE * nC <= (uint64_t)forceLimit)
+            ++forceOnlyByDoubling;
+        // The zero-contact path: sentinels held, but NOT flagged as overflow --
+        // which is what makes the CUDA publish base + 0xFFFFFFFF.
+        if (nC == 0 && !ref[i].overflow && ref[i].patchOfs == 0xFFFFFFFFu) ++sentinelNotNull;
+    }
+
+    PXG_CHECK_MSG(ovfPatch > N / 20 && ovfContact > N / 20 && ovfForce > N / 20,
+                  "npTriTriReduce_reserve: overflow coverage is thin (%zu patch, %zu "
+                  "contact, %zu force) -- a limit always above the offset makes the "
+                  "checks unobservable", ovfPatch, ovfContact, ovfForce);
+    PXG_CHECK_MSG(forceOnlyByDoubling > N / 40,
+                  "npTriTriReduce_reserve: only %zu of %u cases fail the force check "
+                  "SOLELY because of the `* 2` at :573 -- without those, dropping the "
+                  "doubling is invisible", forceOnlyByDoubling, N);
+    PXG_CHECK_MSG(sentinelNotNull > N / 20,
+                  "npTriTriReduce_reserve: only %zu of %u cases take the zero-contact "
+                  "path that leaves the sentinel WITHOUT setting overflow -- that "
+                  "combination is the base+0xFFFFFFFF publish", sentinelNotNull, N);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> outA(size_t(N) * 4, 0xDEADBEEFu);
+    std::vector<uint32_t> outS(size_t(N) * 4, 0xDEADBEEFu);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bA = createBufferFrom(dev, outA);
+    PxgBufferHandle bS = createBufferFrom(dev, outS);
+
+    TtaParams prm{ N, 0, 0, 0 };
+    Kernel k("npTriTriAccept.spv", "ttrReserve",
+             { (uint32_t)sizeof(TtaCase), 16u, 16u }, sizeof(TtaParams));
+    k.dispatch((N + 63) / 64, { bIn, bA, bS }, prm);
+    dev->flush();
+
+    const auto gA = downloadBuffer<uint32_t>(dev, bA, size_t(N) * 4);
+    const auto gS = downloadBuffer<uint32_t>(dev, bS, size_t(N) * 4);
+
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const RefRes& w = ref[i];
+        const uint32_t counts = w.nPatches | (w.nContacts << 16);
+        const uint32_t bits = (w.touchChange ? 1u : 0u) | (w.patchChange ? 2u : 0u)
+                            | (w.overflow ? 4u : 0u) | (w.wPatchNull ? 8u : 0u)
+                            | (w.wContactNull ? 16u : 0u);
+        if (gA[i*4+0] != w.patchOfs || gA[i*4+1] != w.contactOfs ||
+            gA[i*4+2] != w.forceOfs || gA[i*4+3] != w.allFlags ||
+            gS[i*4+0] != counts || gS[i*4+1] != bits ||
+            gS[i*4+2] != w.ovfBits || gS[i*4+3] != w.statusFlags)
+        {
+            if (mm < 4)
+                std::printf("  case %u: got (%08x %08x %08x %08x | %08x %08x %08x %08x) "
+                            "want (%08x %08x %08x %08x | %08x %08x %08x %08x)\n", i,
+                            gA[i*4+0], gA[i*4+1], gA[i*4+2], gA[i*4+3],
+                            gS[i*4+0], gS[i*4+1], gS[i*4+2], gS[i*4+3],
+                            w.patchOfs, w.contactOfs, w.forceOfs, w.allFlags,
+                            counts, bits, w.ovfBits, w.statusFlags);
+            ++mm;
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "npTriTriReduce_reserve: %zu reservation mismatches", mm);
+
+    std::printf("  npTriTriReduce_reserve: %u cases; %zu zero-contact, %zu patch / "
+                "%zu contact / %zu force overflows, %zu fail the force check only "
+                "because of the *2, %zu publish base+0xFFFFFFFF\n",
+                N, zeroContact, ovfPatch, ovfContact, ovfForce,
+                forceOnlyByDoubling, sentinelNotNull);
+
+    for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
+}
+
 } // namespace
