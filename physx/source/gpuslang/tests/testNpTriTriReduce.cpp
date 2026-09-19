@@ -783,7 +783,7 @@ PXG_TEST(npTriTriReduce_reserve)
     std::vector<TtaCase> in(N);
     std::vector<RefRes> ref(N);
     size_t zeroContact = 0, ovfPatch = 0, ovfContact = 0, ovfForce = 0;
-    size_t forceOnlyByDoubling = 0, sentinelNotNull = 0;
+    size_t forceOnlyByDoubling = 0, sentinelNotNull = 0, exactLimit = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -806,10 +806,20 @@ PXG_TEST(npTriTriReduce_reserve)
         // in 3000 cases, because overflow then needs the random offset to land in a
         // narrow band.  Each limit now sits just below or just above `offset +
         // reservation`, so roughly half of each kind overflows by construction.
+        // ONE DRAW IN FOUR LANDS EXACTLY ON `need`.  The first version always
+        // offset by at least 1, so `offset + reservation == limit` never occurred
+        // and `patch-check-nonstrict` (`>` vs `>=`) survived the sweep: the two
+        // spellings differ on that single point and nowhere else.  The same
+        // exactness now covers all three checks' strictness.
         auto straddle = [&](uint64_t need) -> uint32_t {
-            const uint64_t slack = 1u + (rng() % 4096u);
-            const uint64_t lim = (rng() & 1u) ? (need + slack)
-                                              : (need > slack ? need - slack : 0u);
+            const uint32_t pick = rng() % 4u;
+            uint64_t lim;
+            if (pick == 0u) { lim = need; ++exactLimit; }      // the boundary itself
+            else
+            {
+                const uint64_t slack = 1u + (rng() % 4096u);
+                lim = (pick == 1u) ? (need + slack) : (need > slack ? need - slack : 0u);
+            }
             return (uint32_t)(lim > 0xFFFFFFFFull ? 0xFFFFFFFFull : lim);
         };
         const uint32_t patchLimit = straddle((uint64_t)patchAdd + (uint64_t)TTP_PATCH_SIZE * nP);
@@ -857,6 +867,10 @@ PXG_TEST(npTriTriReduce_reserve)
                   "npTriTriReduce_reserve: only %zu of %u cases fail the force check "
                   "SOLELY because of the `* 2` at :573 -- without those, dropping the "
                   "doubling is invisible", forceOnlyByDoubling, N);
+    PXG_CHECK_MSG(exactLimit > N / 10,
+                  "npTriTriReduce_reserve: only %zu limits land EXACTLY on "
+                  "`offset + reservation` -- that single point is the only place "
+                  "`>` and `>=` differ in all three overflow checks", exactLimit, N);
     PXG_CHECK_MSG(sentinelNotNull > N / 20,
                   "npTriTriReduce_reserve: only %zu of %u cases take the zero-contact "
                   "path that leaves the sentinel WITHOUT setting overflow -- that "
@@ -905,9 +919,10 @@ PXG_TEST(npTriTriReduce_reserve)
 
     std::printf("  npTriTriReduce_reserve: %u cases; %zu zero-contact, %zu patch / "
                 "%zu contact / %zu force overflows, %zu fail the force check only "
-                "because of the *2, %zu publish base+0xFFFFFFFF\n",
+                "because of the *2, %zu publish base+0xFFFFFFFF, %zu limits sit "
+                "exactly on the boundary\n",
                 N, zeroContact, ovfPatch, ovfContact, ovfForce,
-                forceOnlyByDoubling, sentinelNotNull);
+                forceOnlyByDoubling, sentinelNotNull, exactLimit);
 
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }
