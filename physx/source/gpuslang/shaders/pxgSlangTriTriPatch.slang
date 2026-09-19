@@ -589,3 +589,36 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 
     return r;
 }
+
+// ---------------------------------------------------------------------------
+// THE RESERVATION SWEEP: 16 KILLED, 0 SURVIVE
+// ---------------------------------------------------------------------------
+// Clean, on the second run.  The first found one survivor -- patch-check-nonstrict
+// (`>` vs `>=`) -- because the fixture's limits were always at least one byte off
+// `offset + reservation`, and that single point is the only place the two
+// spellings differ.  One limit in four now lands exactly on it, and the contact
+// and force checks got the same mutant rather than only the one that happened to
+// be noticed.
+//
+// ---------------------------------------------------------------------------
+// A STANDING RULE, PAID FOR FOUR TIMES IN THIS TRANCHE
+// ---------------------------------------------------------------------------
+// Every one of these was the same defect wearing a different hat -- a comparison
+// with no input ON it:
+//
+//   eps3-value               no projection between 0.999 and 0.99968
+//   eps-nonstrict-existing   no projection exactly 0.9995f
+//   minindex-highest-tie     no two masked lanes sharing the minimum
+//   minindex-ballot-unmasked no unmasked lane equal to the masked minimum
+//   patch-check-nonstrict    no limit exactly on offset + reservation
+//
+// A uniform sample covers everywhere except the place a comparison is decided,
+// because the decision boundary is a measure-zero set and random inputs miss it
+// with probability one.  So: FOR EVERY COMPARISON IN A PORTED BODY, THE FIXTURE
+// MUST CONTAIN AN INPUT THAT SITS ON IT -- constructed, not sampled.  Strict vs
+// non-strict needs equality; an argmin tie-break needs a tie; a threshold needs a
+// value between it and its plausible neighbours.
+//
+// This is not a checker, because nothing static can see whether a fixture's
+// generator reaches a boundary.  It is a rule for whoever writes the next one.
+

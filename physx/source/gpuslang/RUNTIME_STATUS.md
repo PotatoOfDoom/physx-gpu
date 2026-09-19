@@ -1935,6 +1935,63 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-5 (7-8/n) — die blockweite Reservierung, und eine Regel, die diese Tranche viermal bezahlt hat
+
+`createPatchWriterFullThreadBlock` (:504-641) als **reine Entscheidungsfunktion**: die
+drei `atomicAdd`-**Ergebnisse** sind Parameter statt ausgeführt, damit die Arithmetik
+ohne Race prüfbar ist — dieselbe Form, die die Reduktion für Lane-Arrays benutzt.
+
+**Es ist nicht der Tail, den das Korpus schon hat.** `pxgSlangNpPatchTail` reserviert
+für **ein** Paar mit **einem** Patch, und sein Overflow-Test lautet bewusst
+`offset + EIN RECORD > limit`. Dieser hier reserviert **N Patches und M Kontakte** für
+einen ganzen Block in drei Atomics und testet die **gesamte Reservierung**. Zwei Tails
+in einer Engine mit unterschiedlicher Overflow-Semantik — dokumentiert, nicht
+vereinheitlicht.
+
+Drei Asymmetrien, alle wie geschrieben übernommen:
+
+- **Die Prüfungen sind 64-bittig, die Reservierungen nicht.** `sizeof(...)` ist
+  `size_t`, also können :560, :567 und :573 nicht überlaufen, während die
+  `atomicAdd`-Argumente auf `unsigned` verengt werden und es tun.
+- **Die Kraft-Prüfung reserviert N und testet 2N** (:558 gegen :573).
+- **Der Null-Kontakt-Pfad publiziert `base + 0xFFFFFFFF`, nicht NULL.** Die Atomics
+  hängen an `if (totalNumContacts)` (:554); ein Block ohne Kontakte behält alle drei
+  Sentinels **und** lässt `overflow` falsch — Thread 0 nimmt also den `!overflow`-Zweig
+  und schreibt `startContactPoints + 0xFFFFFFFF`. Der Overflow-Zweig schreibt Nullen.
+  Asymmetrisch zum zurückgegebenen Writer, dessen Member beim **selben** Sentinel sehr
+  wohl NULL werden (:625-626).
+
+**Der Deckungs-Guard hat die eigene Fixture gefangen.** Der erste Entwurf legte die
+Limits auf absolute Adressen; Overflow brauchte dann einen Zufalls-Offset in einem
+schmalen Band: **27** Patch- und **31** Kontakt-Overflows in 3000 Fällen — und der Guard
+ließ den Test **fehlschlagen**, statt auf dünner Evidenz durchzugehen.
+
+**Mutations-Durchlauf: erst 13 von 14, dann 16 von 16 — sauber.**
+
+### Die Regel, viermal bezahlt
+
+Jeder dieser Überlebenden war **derselbe Defekt mit anderem Hut — ein Vergleich, auf
+dem keine Eingabe liegt**:
+
+| Mutant | fehlende Eingabe |
+|---|---|
+| `eps3-value` | keine Projektion zwischen 0,999 und 0,99968 |
+| `eps-nonstrict-existing` | keine Projektion **exakt** 0,9995f |
+| `minindex-highest-tie` | keine zwei maskierten Lanes mit gleichem Minimum |
+| `minindex-ballot-unmasked` | keine unmaskierte Lane auf dem maskierten Minimum |
+| `patch-check-nonstrict` | kein Limit **exakt** auf `offset + reservation` |
+
+Eine Gleichverteilung deckt alles ab **außer** der Stelle, an der ein Vergleich
+entschieden wird — die Entscheidungsgrenze ist eine Nullmenge, zufällige Eingaben
+verfehlen sie mit Wahrscheinlichkeit eins. Also: **für jeden Vergleich in einem
+portierten Rumpf muss die Fixture eine Eingabe enthalten, die AUF ihm liegt —
+konstruiert, nicht gezogen.** Strikt gegen nicht-strikt braucht Gleichheit; ein
+Argmin-Tie-Break braucht einen Gleichstand; eine Schwelle braucht einen Wert zwischen
+ihr und ihren plausiblen Nachbarn.
+
+Das ist **kein Prüfer** — statisch ist nicht sichtbar, ob ein Generator eine Grenze
+erreicht. Es ist eine Regel für den, der die nächste Fixture schreibt.
+
 ## P9.83b-5 (4-5/n) — die zwei Akzeptanztests, eine Bindungs-Kollision und vier Schwellen ohne Eingabe
 
 **Die beiden Akzeptanztests sind nicht dieselben drei Zeilen**, obwohl sie sich so
