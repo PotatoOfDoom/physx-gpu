@@ -72,65 +72,57 @@ RWStructuredBuffer<MaterialData> gMaterials;   // binding 0
 RWStructuredBuffer<PatchWork> gWork;           // binding 1
 RWStructuredBuffer<uint> gPatchStream;         // binding 2  (word view)
 
+import pxgSlangNpPatchTail;
+
 static const uint MODE_AVERAGE = 0u, MODE_MIN = 1u, MODE_MULTIPLY = 2u, MODE_MAX = 3u;
 static const uint FLAG_DISABLE_FRICTION = 1u, FLAG_DISABLE_STRONG_FRICTION = 2u, FLAG_COMPLIANT_ACC_SPRING = 16u;
 static const uint INVALID = 0xffffffffu;
 
-float combineScalars(float a, float b, uint mode)
-{
-    if (mode == MODE_AVERAGE) return 0.5f * (a + b);
-    if (mode == MODE_MIN) return min(a, b);
-    if (mode == MODE_MULTIPLY) return a * b;
-    if (mode == MODE_MAX) return max(a, b);
-    return 0.0f;
-}
-
-// mirrors PxsCombineMaterials -> (staticFriction, dynamicFriction, restitution, damping, flags)
+// P9.83b-7: THE COMBINE WAS A SECOND TRANSCRIPTION AND IS NOW A CALL.
+//
+// This file used to carry its own full copy of combineScalars + combineMaterials
+// and import nothing.  So this fixture -- 5000 cases with every patch field
+// compared against a C++ reference -- certified THAT copy, while the body the
+// engine actually runs (pxgSlangNpPatchTail, reached from triPlaneNpBda and
+// npCvxPlaneNphase) was covered only indirectly by scenes.  The two were
+// equivalent when compared line by line; the point is that nothing would have
+// noticed if they had stopped being so.
+//
+// The layouts still differ -- PxsMaterialDataGpu packs the flags and the friction
+// and restitution modes into flagsModes0 and the damping mode into modes1, while
+// this fixture carries them unpacked -- so the shared body takes UNPACKED
+// scalars and the module's BDA entry unpacks and delegates to it.  This fixture
+// now feeds that same body, which is what makes gpuslang.npInsertPatch evidence
+// about the engine rather than about a copy.
 void combineMaterials(MaterialData m0, MaterialData m1, out float sta, out float dyn,
                       out float rest, out float damping, out uint flags)
 {
-    const float r0 = m0.restitution, r1 = m1.restitution;
-    const bool compliant0 = r0 < 0.0f, compliant1 = r1 < 0.0f;
-    const bool exactlyOneCompliant = compliant0 != compliant1;
-    const bool bothCompliant = compliant0 && compliant1;
-    const bool cAcc0 = (m0.flags & FLAG_COMPLIANT_ACC_SPRING) != 0u;
-    const bool cAcc1 = (m1.flags & FLAG_COMPLIANT_ACC_SPRING) != 0u;
-    const bool exactlyOneAcc = cAcc0 != cAcc1;
+    NptMaterialIn a;
+    a.dynamicFriction = m0.dynamicFriction;
+    a.staticFriction = m0.staticFriction;
+    a.restitution = m0.restitution;
+    a.damping = m0.damping;
+    a.flags = m0.flags;
+    a.fricCombineMode = m0.fricCombineMode;
+    a.restCombineMode = m0.restCombineMode;
+    a.dampingCombineMode = m0.dampingCombineMode;
 
-    if (bothCompliant && exactlyOneAcc)
-        rest = cAcc0 ? r0 : r1;
-    else
-    {
-        const uint mode = exactlyOneCompliant ? MODE_MIN : max(m0.restCombineMode, m1.restCombineMode);
-        const float flip = (bothCompliant && (mode == MODE_MULTIPLY)) ? -1.0f : 1.0f;
-        rest = flip * combineScalars(r0, r1, mode);
-    }
+    NptMaterialIn b;
+    b.dynamicFriction = m1.dynamicFriction;
+    b.staticFriction = m1.staticFriction;
+    b.restitution = m1.restitution;
+    b.damping = m1.damping;
+    b.flags = m1.flags;
+    b.fricCombineMode = m1.fricCombineMode;
+    b.restCombineMode = m1.restCombineMode;
+    b.dampingCombineMode = m1.dampingCombineMode;
 
-    if (bothCompliant && exactlyOneAcc)
-        damping = cAcc0 ? m0.damping : m1.damping;
-    else
-    {
-        const uint mode = exactlyOneCompliant ? MODE_MAX : max(m0.dampingCombineMode, m1.dampingCombineMode);
-        damping = combineScalars(m0.damping, m1.damping, mode);
-    }
-
-    const uint combineFlags = m0.flags | m1.flags;
-    if ((combineFlags & FLAG_DISABLE_FRICTION) == 0u)
-    {
-        const uint fm = max(m0.fricCombineMode, m1.fricCombineMode);
-        const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
-        const float staF = combineScalars(m0.staticFriction, m1.staticFriction, fm);
-        const float fDyn = max(dynF, 0.0f);
-        dyn = fDyn;
-        sta = (staF - fDyn) >= 0.0f ? staF : fDyn;
-        flags = combineFlags;
-    }
-    else
-    {
-        flags = combineFlags | FLAG_DISABLE_STRONG_FRICTION;
-        dyn = 0.0f;
-        sta = 0.0f;
-    }
+    const NptCombinedMaterial c = nptCombineMaterialsRaw(a, b);
+    sta = c.staticFriction;
+    dyn = c.dynamicFriction;
+    rest = c.restitution;
+    damping = c.damping;
+    flags = c.materialFlags;
 }
 
 [shader("compute")]

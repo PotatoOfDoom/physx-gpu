@@ -216,24 +216,46 @@ public struct NptCombinedMaterial
     public uint materialFlags;
 }
 
-public NptCombinedMaterial nptCombineMaterials(uint64_t materialsAddr, uint mi0, uint mi1)
+// THE UNPACKED FORM IS THE BODY; THE BDA FORM IS AN ADAPTER (P9.83b-7).
+//
+// A SECOND full transcription of this combine lived in npInsertPatch.slang, which
+// imported nothing -- so gpuslang.npInsertPatch, 5000 cases with every field
+// compared against a C++ reference, certified THAT copy while the body the engine
+// runs (reached from triPlaneNpBda and npCvxPlaneNphase) was covered only by
+// scenes.  A fixture that passes while testing a different body is the failure
+// this port paid for once already with contactReduceShared.
+//
+// The two could not simply share an entry point because the LAYOUTS differ:
+// PxsMaterialDataGpu packs the 16-bit flags and the friction and restitution
+// modes into flagsModes0 and the damping mode into modes1, while the fixture
+// carries them as separate fields.  So the pure combine takes UNPACKED scalars
+// and the BDA entry unpacks and delegates.  Now both reach the same body.
+public struct NptMaterialIn
 {
-    Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(materialsAddr);
-    const PxsMaterialDataGpu m0 = materials[mi0];
-    const PxsMaterialDataGpu m1 = materials[mi1];
+    public float dynamicFriction;
+    public float staticFriction;
+    public float restitution;
+    public float damping;
+    public uint flags;                // the 16-bit material flags
+    public uint fricCombineMode;
+    public uint restCombineMode;
+    public uint dampingCombineMode;
+}
 
+public NptCombinedMaterial nptCombineMaterialsRaw(NptMaterialIn m0, NptMaterialIn m1)
+{
     const float r0f = m0.restitution, r1f = m1.restitution;
     const bool compliant0 = r0f < 0.0f, compliant1 = r1f < 0.0f;
     const bool exactlyOneCompliant = compliant0 != compliant1;
     const bool bothCompliant = compliant0 && compliant1;
-    const uint m0flags = m0.flagsModes0 & 0xFFFFu;
-    const uint m1flags = m1.flagsModes0 & 0xFFFFu;
-    const uint m0fric = (m0.flagsModes0 >> 16u) & 0xFFu;
-    const uint m1fric = (m1.flagsModes0 >> 16u) & 0xFFu;
-    const uint m0rest = (m0.flagsModes0 >> 24u) & 0xFFu;
-    const uint m1rest = (m1.flagsModes0 >> 24u) & 0xFFu;
-    const uint m0damp = m0.modes1 & 0xFFu;
-    const uint m1damp = m1.modes1 & 0xFFu;
+    const uint m0flags = m0.flags;
+    const uint m1flags = m1.flags;
+    const uint m0fric = m0.fricCombineMode;
+    const uint m1fric = m1.fricCombineMode;
+    const uint m0rest = m0.restCombineMode;
+    const uint m1rest = m1.restCombineMode;
+    const uint m0damp = m0.dampingCombineMode;
+    const uint m1damp = m1.dampingCombineMode;
     const bool cAcc0 = (m0flags & NPT_MAT_COMPLIANT_ACC_SPRING) != 0u;
     const bool cAcc1 = (m1flags & NPT_MAT_COMPLIANT_ACC_SPRING) != 0u;
     const bool exactlyOneAcc = cAcc0 != cAcc1;
@@ -281,6 +303,36 @@ public NptCombinedMaterial nptCombineMaterials(uint64_t materialsAddr, uint mi0,
     out.damping = damping;
     out.materialFlags = matFlags;
     return out;
+}
+
+// The BDA adapter: read two PxsMaterialDataGpu, unpack, delegate.
+public NptCombinedMaterial nptCombineMaterials(uint64_t materialsAddr, uint mi0, uint mi1)
+{
+    Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(materialsAddr);
+    const PxsMaterialDataGpu p0 = materials[mi0];
+    const PxsMaterialDataGpu p1 = materials[mi1];
+
+    NptMaterialIn a;
+    a.dynamicFriction = p0.dynamicFriction;
+    a.staticFriction = p0.staticFriction;
+    a.restitution = p0.restitution;
+    a.damping = p0.damping;
+    a.flags = p0.flagsModes0 & 0xFFFFu;
+    a.fricCombineMode = (p0.flagsModes0 >> 16u) & 0xFFu;
+    a.restCombineMode = (p0.flagsModes0 >> 24u) & 0xFFu;
+    a.dampingCombineMode = p0.modes1 & 0xFFu;
+
+    NptMaterialIn b;
+    b.dynamicFriction = p1.dynamicFriction;
+    b.staticFriction = p1.staticFriction;
+    b.restitution = p1.restitution;
+    b.damping = p1.damping;
+    b.flags = p1.flagsModes0 & 0xFFFFu;
+    b.fricCombineMode = (p1.flagsModes0 >> 16u) & 0xFFu;
+    b.restCombineMode = (p1.flagsModes0 >> 24u) & 0xFFu;
+    b.dampingCombineMode = p1.modes1 & 0xFFu;
+
+    return nptCombineMaterialsRaw(a, b);
 }
 
 public void nptInsertIntoPatchStream(uint64_t materialsAddr, uint64_t patchStreamAddr,
