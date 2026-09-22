@@ -193,13 +193,31 @@ public uint nptRegisterContactPatch(uint64_t countersAddr, uint64_t cmOutputsAdd
 }
 
 // insertIntoPatchStream: combine the two materials and write the 64-byte patch.
-public void nptInsertIntoPatchStream(uint64_t materialsAddr, uint64_t patchStreamAddr,
-                                     uint mi0, uint mi1, uint patchIndex,
-                                     float3 worldNormal, uint nbContacts)
+// ---------------------------------------------------------------------------
+// THE MATERIAL COMBINE, FACTORED OUT (P9.83b-5).
+//
+// It used to live inside nptInsertIntoPatchStream, which hardcodes
+// startContactIndex = 0 because its CUDA sibling (contactPatchUtils.cuh:163)
+// does.  The mesh-mesh writer needs the SAME combine with a REAL
+// startContactIndex (convexMeshMidphase.cu:656, `patchStartIndexS[threadIdx.x]`),
+// so the choice was one body with a parameter or two bodies that drift.  This
+// port has already paid for the second option once: contactReduceShared had
+// SEVEN transcriptions before P9.83b-3 folded six of them, and two had quietly
+// come to differ.
+//
+// materialCombiner.cuh's combineMaterials is what both sides transcribe.
+// ---------------------------------------------------------------------------
+public struct NptCombinedMaterial
 {
-    if (patchIndex == NPT_INVALID)
-        return;
+    public float restitution;
+    public float dynamicFriction;
+    public float staticFriction;
+    public float damping;
+    public uint materialFlags;
+}
 
+public NptCombinedMaterial nptCombineMaterials(uint64_t materialsAddr, uint mi0, uint mi1)
+{
     Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(materialsAddr);
     const PxsMaterialDataGpu m0 = materials[mi0];
     const PxsMaterialDataGpu m1 = materials[mi1];
@@ -255,6 +273,29 @@ public void nptInsertIntoPatchStream(uint64_t materialsAddr, uint64_t patchStrea
         matFlags = combineFlags | NPT_MAT_DISABLE_STRONG_FRICTION;
         dyn = 0.0f; sta = 0.0f;
     }
+
+    NptCombinedMaterial out;
+    out.restitution = rest;
+    out.dynamicFriction = dyn;
+    out.staticFriction = sta;
+    out.damping = damping;
+    out.materialFlags = matFlags;
+    return out;
+}
+
+public void nptInsertIntoPatchStream(uint64_t materialsAddr, uint64_t patchStreamAddr,
+                                     uint mi0, uint mi1, uint patchIndex,
+                                     float3 worldNormal, uint nbContacts)
+{
+    if (patchIndex == NPT_INVALID)
+        return;
+
+    const NptCombinedMaterial cm = nptCombineMaterials(materialsAddr, mi0, mi1);
+    const float rest = cm.restitution;
+    const float dyn = cm.dynamicFriction;
+    const float sta = cm.staticFriction;
+    const float damping = cm.damping;
+    const uint matFlags = cm.materialFlags;
 
     Ptr<uint> patchBase = Ptr<uint>(patchStreamAddr + uint64_t(patchIndex));
     const uint one = asuint(1.0f);

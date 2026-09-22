@@ -176,6 +176,7 @@
 // kept copy at distance zero.  The fixture now plants them (991 of 1200 cases).
 
 import pxgSlangContactReduceSerial;
+import pxgSlangNpPatchTail;   // nptCombineMaterials -- ONE combine, two writers
 
 public static const uint TTP_MESH_MESH_CONTACT_LIMIT = 6u;
 public static const uint TTP_MAX_MESH_MESH_PATCHES = 128u;
@@ -621,4 +622,83 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 //
 // This is not a checker, because nothing static can see whether a fixture's
 // generator reaches a boundary.  It is a rule for whoever writes the next one.
+
+// ---------------------------------------------------------------------------
+// writeContactPatch (:649-672): the 64-byte header, and the two words the CUDA
+// fills from an UNINITIALISED struct.
+// ---------------------------------------------------------------------------
+// THE LAYOUT, as words (PxContact.h), identical to the one
+// nptInsertIntoPatchStream already writes:
+//
+//   0-3   mMassModification, all 1.0f
+//   4-6   normal
+//   7     restitution      8  dynamicFriction    9  staticFriction   10 damping
+//   11    startContactIndex (bits 0-15) | nbContacts (16-23) | materialFlags (24-31)
+//   12    internalFlags (0-15) | materialIndex0 (16-31)
+//   13    materialIndex1 (0-15) | pad[0] (16-31)
+//   14-15 pad[1..4] -- NEVER WRITTEN by either writer
+//
+// TWO DIFFERENCES FROM THE SIBLING, and one of them is a defect.
+//
+// 1. startContactIndex IS REAL HERE.  contactPatchUtils.cuh:163 writes 0 and
+//    nptInsertIntoPatchStream reproduces that by leaving word 11's low half
+//    clear.  convexMeshMidphase.cu:656 writes `patchStartIndexS[threadIdx.x]`,
+//    the block-wide scan of per-patch contact counts.  The narrowing to PxU16 is
+//    the CUDA's (:657) and is safe here: numPatchesToKeep <= 128 and each
+//    PointCount <= 6, so the scan cannot exceed 768.
+//
+// 2. materialIndex0 AND materialIndex1 ARE READ FROM AN UNINITIALISED LOCAL.
+//    :728 declares `PxgContactMaterialProperties contactMaterialProperties;`
+//    with no initialiser.  getContactMaterialProperties (:642-647) forwards to
+//    combineMaterials(materials, shape0.materialIndex, shape1.materialIndex,
+//    materialFlags, staticFriction, dynamicFriction, combinedRestitution,
+//    damping) -- eight parameters, NONE of them an output material index.  Then
+//    :662-663 store cmp.materialIndex0 and cmp.materialIndex1 into the patch.
+//    Every contact patch this kernel emits carries two indeterminate words.
+//
+//    The sibling gets it right: contactPatchUtils.cuh:149-150 reads them from the
+//    shapes and :170-171 stores them, which is what makes this a defect rather
+//    than a convention.
+//
+//    THIS PORT WRITES THE WELL-DEFINED VALUES -- materialIndex0 =
+//    shape0.materialIndex, materialIndex1 = shape1.materialIndex -- following the
+//    npTriHfNp precedent for upstream undefined behaviour: a deterministic port
+//    cannot reproduce an uninitialised read, so it implements the reading the
+//    rest of the engine assumes and says so loudly.  The solver consumes these
+//    indices; emitting garbage deterministically would be no better than
+//    emitting it nondeterministically.
+//
+// The combine itself is nptCombineMaterials, shared with the sibling writer
+// rather than transcribed again.
+
+public void ttpWriteContactPatch(uint64_t patchStreamAddr, uint patchByteOffset,
+                                 uint patchIndex, uint startContactIndex,
+                                 float3 patchNormal, uint nbContactPoints,
+                                 uint64_t materialsAddr, uint materialIndex0, uint materialIndex1)
+{
+    if (patchByteOffset == 0xFFFFFFFFu)   // :651, `if (writer.patches)`
+        return;
+
+    const NptCombinedMaterial cm = nptCombineMaterials(materialsAddr, materialIndex0, materialIndex1);
+
+    Ptr<uint> w = Ptr<uint>(patchStreamAddr + uint64_t(patchByteOffset)
+                            + uint64_t(patchIndex) * uint64_t(TTP_PATCH_SIZE));
+
+    const uint one = asuint(1.0f);
+    w[0] = one; w[1] = one; w[2] = one; w[3] = one;   // :665-668
+    w[4] = asuint(patchNormal.x);
+    w[5] = asuint(patchNormal.y);
+    w[6] = asuint(patchNormal.z);
+    w[7] = asuint(cm.restitution);
+    w[8] = asuint(cm.dynamicFriction);
+    w[9] = asuint(cm.staticFriction);
+    w[10] = asuint(cm.damping);
+    w[11] = (startContactIndex & 0xFFFFu)
+          | ((nbContactPoints & 0xFFu) << 16u)
+          | ((cm.materialFlags & 0xFFu) << 24u);
+    // internalFlags = 0 (:669), materialIndex0 in the high half.
+    w[12] = (materialIndex0 & 0xFFFFu) << 16u;
+    w[13] = (materialIndex1 & 0xFFFFu);
+    // w[14], w[15] are pad[1..4] and are NOT written, matching both CUDA writers.
+}
 
