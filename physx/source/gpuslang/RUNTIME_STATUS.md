@@ -1935,6 +1935,46 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-7 — die Material-Kombination hatte zwei Rümpfe, und die Fixture zertifizierte den falschen
+
+`npInsertPatch.slang` trug eine **vollständige zweite Abschrift** von
+`combineScalars` + `combineMaterials` und importierte nichts. `gpuslang.npInsertPatch`
+— 5000 Fälle, jedes Patch-Feld gegen eine C++-Referenz verglichen — war damit Evidenz
+über **diese Kopie**, während der Rumpf, den die Engine ausführt
+(`pxgSlangNpPatchTail`, erreicht über `triPlaneNpBda` und `npCvxPlaneNphase`), nur
+indirekt über Szenen abgedeckt war.
+
+Zeile für Zeile verglichen waren die beiden **gleich**: der Compliant-Tie-Break, die
+MIN/MAX-Modus-Überschreibungen, der Vorzeichenwechsel bei MULTIPLY, die
+`staticFriction`-Klemmung und der DISABLE_FRICTION-Zweig. Genau deshalb war jetzt der
+Zeitpunkt zu falten — **niemand hätte es bemerkt, wenn sie aufgehört hätten,
+gleich zu sein**, und diese Rechnung hat der Port mit `contactReduceShared`' sieben
+Abschriften schon einmal bezahlt.
+
+**Die Layouts sind der Grund, warum sie sich keinen Entry Point teilen konnten:**
+`PxsMaterialDataGpu` packt die 16-Bit-Flags sowie Reibungs- und Restitutionsmodus in
+`flagsModes0` und den Dämpfungsmodus in `modes1`; die Fixture trägt sie entpackt.
+Die Kombination lebt jetzt einmal als `nptCombineMaterialsRaw` auf **entpackten
+Skalaren**, und der BDA-Eingang `nptCombineMaterials` entpackt und delegiert.
+
+**Der Beweis, dass die Faltung wirkt:** zehn Mutanten des Engine-Rumpfs, getrieben
+durch `gpuslang.npInsertPatch` — **9 sofort getötet**. Vor der Faltung hätte
+**jeder einzelne überlebt**, weil die Fixture diesen Rumpf nie ausgeführt hat.
+
+### Ein Mutant, dessen mutierte Form UB ist, prüft nichts
+
+Der zehnte — „lösche `dyn = 0; sta = 0;` im DISABLE_FRICTION-Zweig" — überlebte und
+war ein **fehlgeformter Mutant**, kein Befund: das Löschen lässt die beiden Lokalen
+**uninitialisiert**, das mutierte Programm ist also undefiniert, und sein Überleben
+sagt nichts über das Original. Ersetzt man das Löschen durch einen **Sentinel**
+(`dyn = sta = 0.25f`, und separat `sta = 0.5f`), wird er **beide Male getötet** — die
+Zuweisung ist also tragend.
+
+Das ist der **zweite** fehlgeformte Mutant dieser Tranche; der erste übersprang Lanes,
+deren Bit noch gar nicht gesetzt sein konnte. Beide standen in einer Ergebnisliste und
+sahen aus wie Deckungslücken. **Mutiere zu einem anderen definierten Wert, nie zu einem
+abwesenden.**
+
 ## P9.83b-5 (7-8/n) — die blockweite Reservierung, und eine Regel, die diese Tranche viermal bezahlt hat
 
 `createPatchWriterFullThreadBlock` (:504-641) als **reine Entscheidungsfunktion**: die

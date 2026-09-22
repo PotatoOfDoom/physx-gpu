@@ -216,6 +216,23 @@ public struct NptCombinedMaterial
     public uint materialFlags;
 }
 
+// P9.83b-7's SWEEP, AND WHAT IT PROVED.  Ten mutants of this combine, driven
+// through gpuslang.npInsertPatch: 9 killed outright.  Before the fold every one
+// of them would have SURVIVED, because that fixture executed its own copy and
+// never this body -- which is the whole point of folding it.
+//
+// The tenth, "delete `dyn = 0; sta = 0;` in the DISABLE_FRICTION arm", survived
+// and was a MALFORMED MUTANT, not a finding: deleting the assignment leaves the
+// two locals uninitialised, so the mutated program is undefined and its survival
+// says nothing about the original.  Replacing the deletion with a SENTINEL
+// (dyn = sta = 0.25f, and separately sta = 0.5f) kills it both ways, so the
+// assignment is load-bearing.
+//
+// A MUTANT WHOSE MUTATED FORM IS UNDEFINED BEHAVIOUR TESTS NOTHING.  This is the
+// second one this tranche -- the first skipped lanes whose bit could not yet be
+// set -- and both sat in a results list looking like coverage gaps.  Mutate to a
+// DIFFERENT DEFINED VALUE, never to an absent one.
+//
 // THE UNPACKED FORM IS THE BODY; THE BDA FORM IS AN ADAPTER (P9.83b-7).
 //
 // A SECOND full transcription of this combine lived in npInsertPatch.slang, which
