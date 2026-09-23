@@ -8,6 +8,14 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **871/871** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-5 (14/n) added `npTriTriBlock_warpReduce` inside the same suite (no new ctest row):
+contactReduce2 at :810/:931 run one warp at a time, 1024 threads per case, every thread
+reporting.  Its sweep killed 14 of 16 -- one of them only after the fixture was given
+two masked lanes at the SAME position, without which "dupe test on" and "off" agree on
+every input -- and the two survivors are removed barriers whose races llvmpipe's fixed
+execution order hides.  The same entry corrects two claims of 11/n and 12/n about the
+Workgroup budget: one reclamation was a race in the CUDA's shape, and the spill was
+"forced" only among the options then considered.
 P9.83b-5 (13/n) added `gpuslang.npTriTriBlock`, the first fixture in this port to run
 ONE WORKGROUP OF 1024 THREADS PER CASE -- the four block collectives it drives are
 collectives, and a 64-thread fixture would certify a block shape the kernel never
@@ -1948,6 +1956,157 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-5 (14/n) — `contactReduce2` bei `:810`/`:931`, Warp für Warp, und ein Host-Orakel statt drei
+
+Neu in `pxgSlangTriTriBlock.slang`: `ttbWarpReduceSerial`, der Ersatz für die beiden
+warp-skopierten `contactReduce2<true, true, 6, false>`-Aufrufe (convexMeshMidphase.cu:810
+und :931). In der CUDA reduzieren alle 32 Warps gleichzeitig, jeder auf seinen eigenen 32
+Lanes, und bekommen die Maske in die Register ihrer eigenen Lanes zurück. Hier geht das
+nicht: eine 1:1-Abschrift macht jeden Shuffle darin zu einer **Workgroup**-Barriere unter
+einer warp-varianten Bedingung (die Form, die llvmpipe aufhängt, P9.83b-2), und alle 32
+Warps gleichzeitig zu stagen wurde in 3/n mit **46684 Bytes** gemessen.
+
+```
+  für w = 0..31:   Barriere; Warp w legt seine 32 Lanes in gTtbWarpStage[32];
+                   Barriere; Thread 0 rechnet crsContactReduce2 seriell und
+                   schreibt die Maske nach gTtbReduceMask[w]
+  danach:          Barriere; jede Lane liest gTtbReduceMask[warp]; Barriere
+```
+
+Zwei Dinge daran sind Entscheidungen und keine Abschrift:
+
+**Die Eingabemaske reist durch denselben Slot wie das Ergebnis.** Lane 0 jedes Warps
+legt die Maske seines Warps vor der ersten Runde in `gTtbReduceMask[warp]`; Thread 0 liest
+Slot w in Runde w und überschreibt ihn dort. Jeder Slot wird genau einmal von seinem Warp
+und genau einmal in seiner eigenen Runde geschrieben — keine Runde liest einen Slot, den
+eine andere schon umgeschrieben hat.
+
+**Die abschließende Barriere steht nicht in der CUDA und ist hier nicht optional.** In
+der CUDA ist das Ergebnis ein Register. Hier ist es geteilter Speicher: ohne Barriere nach
+dem Lesen kann das Lane-0-Publish der **nächsten** Eingabemaske landen, bevor ein
+langsamerer Thread desselben Warps das **alte** Ergebnis gelesen hat. Der Kernel hat
+zwischen den beiden Aufrufstellen zufällig andere Barrieren — eine Funktion, deren
+Korrektheit davon abhängt, was ihr Aufrufer als Nächstes tut, bricht, wenn der Aufrufer
+sich ändert.
+
+Etat: `ttbReduceProbe` **640 Bytes** (Stage 512 + Masken 128), **ohne** Warp-Scratch —
+die serielle Reduktion hat keine Warp-Operation. `ttbProbe` unverändert bei 4352.
+
+### Ein Host-Orakel statt drei
+
+`testNpCrsWrapper2.cpp` und `testNpTriTriReduce.cpp` trugen je ein eigenes
+`reduceShared`. Ausdruck für Ausdruck auf dem gemeinsamen Pfad verglichen sind sie
+identisch; das zweite war die Teilmenge `<clustering, !dupe, 6>` des ersten. Das
+vollständige zieht **wörtlich** nach `tests/pxgCrsRef.h` um (`static` → `inline`), beide
+Fixtures benutzen es, und der neue Warp-Reduce-Test auch — statt die dritte Kopie zu
+werden. Beleg, dass der Umzug nichts geändert hat: `gpuslang.npCrsWrapper2` und
+`gpuslang.npTriTriReduce` laufen danach unverändert grün, bit-exakt gegen dieselben
+Zahlen wie vorher.
+
+### Die Fixture: 1024 Threads pro Fall, und jeder Thread meldet
+
+`npTriTriBlock_warpReduce`, 48 Blöcke. `ttbReduceProbe` ruft `ttbWarpReduceSerial`
+**zweimal hintereinander** mit verschiedenen Masken und lässt **jeden** der 1024 Threads
+seine Kopie der Antwort schreiben: die geprüfte Eigenschaft ist, dass das Ergebnis von
+Warp w bei **allen 32 Lanes** von Warp w ankommt — nicht nur bei Lane 0, die es in der
+CUDA ohnehin nie gab.
+
+### Der Sweep: 16 Mutanten, 14 getötet, zwei Race-Mutanten überlebt
+
+**Erste Runde: 13 getötet, 3 überlebt.** `config-dupe-on` (`TDoDupeTest` an statt aus)
+überlebte, weil zufällige Punktwolken nie zwei Punkte näher als 1e-4 legen
+(contactReduction.cuh:65-79: `magnitudeSquared < 1e-8`) — dann stimmen beide
+Konfigurationen auf **jeder** Eingabe überein. Das ist keine Äquivalenz, sondern eine
+Deckungslücke: die Fixture legt jetzt in jedem ungeraden Warp zwei maskierte Lanes auf
+**dieselbe** Position (bei jedem dritten auch mit gleicher Separation, für den
+Tie-Break-Arm, der die **niedrigere** Lane verwirft), und eine Deckungsprüfung verlangt,
+dass der Dupe-Test auf mehr als 1/20 der Warps die Antwort ändert. Gemessen **137 von
+1536**. Der erste Versuch mit jedem vierten Warp kam auf 65 und lag unter der eigenen
+Schwelle — also mehr Plants, nicht eine niedrigere Schwelle.
+
+Die Plants **verändern** bestehende Eingaben, statt nur neue hinzuzufügen; ein vorher
+tötender Fall könnte dabei verloren gehen. Deshalb lief der **ganze** Sweep neu:
+**14 getötet**, `config-dupe-on` darunter.
+
+**Die zwei Überlebenden sind entfernte Barrieren** — `no-round-leading-barrier` und
+`no-final-read-barrier`. Für Race-Mutanten gilt die Regel: ein Kill ist Beleg, ein
+Überleben sagt nichts. Aber die Diagnose steht trotzdem hier, weil **ein** Modell alle
+vier Barrieren-Mutanten erklärt: llvmpipe führt die Invocation-Gruppen eines Workgroups
+nach jeder Barriere in aufsteigender Reihenfolge aus, Thread 0 zuerst.
+
+| Mutant | die zwei Seiten | Soll | auf llvmpipe zuerst | Ergebnis |
+|---|---|---|---|---|
+| `no-round-stage-barrier` | Warp w schreibt die Stage, Thread 0 liest sie | Schreiben | Thread 0, der **Leser** | getötet |
+| `no-trailing-barrier` | Lanes 1-31 von Warp 0 lesen das Ergebnis, Lane 0 (= Thread 0) publiziert die nächste Eingabemaske in denselben Slot | Lesen | Thread 0, der **Schreiber** | getötet |
+| `no-round-leading-barrier` | Thread 0 liest die Stage von Runde w, Warp w+1 überschreibt sie | Lesen | Thread 0, der **Leser** | überlebt |
+| `no-final-read-barrier` | Thread 0 schreibt `gTtbReduceMask[31]` in Runde 31, Warp 31 liest ihn | Schreiben | Thread 0, der **Schreiber** | überlebt |
+
+Getötet wird genau dann, wenn die feste Reihenfolge die beiden Seiten **gegen** die
+Soll-Reihenfolge laufen lässt. Das Modell ist **nach** den Ergebnissen formuliert, nicht vorher — eine
+Erklärung, kein Beweis. Die beiden Barrieren bleiben: ohne sie besteht ein echter Race,
+den nur diese eine Ausführungsreihenfolge verdeckt, und auf llvmpipe kann ihn keine
+Fixture sichtbar machen.
+
+**Nachtrag zu 13/n:** die beiden `…-plus-one`-Gegenmutanten dort haben **zwei** Schreiber
+auf einen Slot und sind damit selbst Race-Mutanten. Verwendet wurde ihr **Kill** — der
+ist Beleg, dass die Fixture den Slot sieht. Hätten sie überlebt, hätte das nichts
+bewiesen.
+
+### Szenen
+
+Nicht neu gelaufen, und das ist eine Entscheidung, keine Auslassung: kein von der Engine
+erreichbarer Shader und kein Host-Code der Engine hat sich geändert — neu sind ein
+Fixture-Entry, ein noch nicht angeschlossenes Modul und Kommentare (in
+`testGpuSdkStep.cpp` nur ein Kommentar). Der nächste Szenenlauf gehört zu P9.84, das
+Engine-Host-Code ändert.
+
+### Korrekturen an eigenem, schon committetem Text
+
+**1. Rückgewinnung #3 aus 11/n ist ein Race — in der CUDA-Form.** Dort stand:
+„`gScanPerWarpCount` 128 → 0, weil der Scan in `findInterestingTrianglesA` fertig ist,
+bevor `countersS` in derselben Iteration zum ersten Mal benutzt wird." Für **diesen**
+Scan stimmt das. Aber die Zwei-Argument-Überladung `threadBlockScanExclusive<32>(bool,
+total)` (reduction.cuh:625-630) alloziert **ein** statisches `perWarpCountS` pro
+Instanziierung, und dieselbe Instanziierung erreicht auch `addToRefinementBuffer`
+(sdfCollision.cuh:750) — aufgerufen bei `:1198`, **unmittelbar** vor
+`threadBlockCountAndBroadcast(…, countersS)` bei `:1202`. Der Scan liest alle 32 Slots
+nach seiner einzigen Barriere (reduction.cuh:612) bei `:614` und `:618` und hat keine
+abschließende; das
+Count-and-Broadcast schreibt `sharedMem[warpIndex]` aus Lane 0 (reduction.cuh:583-584)
+und hat keine vorangehende. Liegen beide auf demselben Speicher, überschreibt ein Warp,
+der den Scan früh verlässt, Slot w, während ein anderer Warp ihn noch als
+`perWarpCountS[w]` liest.
+
+Im **Port** wäre die Überlappung zufällig geordnet: die Ballot-Emulation in
+`warpCountAndBroadcast` ist selbst eine Workgroup-Barriere und steht vor dem Schreiben.
+Das ist Sicherheit, die von der Emulation **geliehen** ist und mit einem nativen
+Subgruppen-Pfad verschwindet — keine Eigenschaft des Algorithmus. Die Byte-Zahl 32732
+bleibt als Messung richtig (eine Barriere kostet kein Byte, und mit einer zusätzlichen
+zwischen `:1198` und `:1202` wäre die Rückgewinnung gültig); falsch war die Begründung
+„race-frei, weil fertig". Korrigiert in `npTriTriSharedProbe.slang`,
+`tools/groupshared_known.txt` und unten in 11/n.
+
+**2. „Damit ist die Auslagerung erzwungen" (12/n) war zu stark.** Erzwungen war sie
+**unter den damals betrachteten** Rückgewinnungen. Eine vierte wurde nicht betrachtet:
+`triangleIndicesS` (8192 Bytes) wird nur bei `:1073`/`:1078` geschrieben und nur bei
+`:1082-1083` (eigener Slot) gelesen, ist also während `tryToAssign`/`createNewPatches`
+tot und könnte deren Scratch aufnehmen. Rechnerisch etwa 31228 Bytes — **ungemessen**;
+das ist 15a/n, und bis dahin steht hier keine Entscheidung.
+
+**3. Die Negation in Durchlauf 0/1 stand umgekehrt.** `testGpuSdkStep.cpp` und der
+Status-Text zu P9.82 sagten, der Schwanz von `outer == 1` **negiere** die Normale, wo
+Durchlauf 0 es nicht tut. Es ist umgekehrt: Durchlauf 0 schreibt `-dir` (`:1151`),
+Durchlauf 1 `aToB.rotate(dir)` (`:1192`). Per Lesen der beiden Zeilen korrigiert.
+
+**4. Zeilenzitate** in eigenen Modulen, jedes gegen die Quelle nachgeprüft:
+`reduceContactsSingleWarp` endet bei `:496` (nicht `:503`); `countersS`/`shMinSepS` stehen
+bei `:1003`/`:1006` (nicht `:1005-1010`); die Barriere in
+`threadBlockCountAndBroadcast` ist reduction.cuh:586 (nicht `:584`); der Scan in
+`createNewPatches` ist `:936` (nicht `:938`); der zweite Durchlauf beginnt bei `:1048`.
+
+Suite **871/871** in **beiden** Speichermodi (der Warp-Reduce-Test liegt in der Suite
+`npTriTriBlock`, also keine neue ctest-Zeile), 461 `.spv`.
+
 ## P9.83b-5 (13/n) — die Block-Kollektive, und eine Äquivalenz, die mein eigener Kommentar behauptet hat und die keine ist
 
 Neu: `pxgSlangTriTriBlock.slang` mit den vier Block-Stücken, auf denen
@@ -2079,6 +2238,10 @@ Notlösung danach. Ihr Preis ist benannt: jede `__syncthreads`-Stelle, die
 `patchesS` überspannt, wird von `GroupMemoryBarrierWithGroupSync` zu
 `AllMemoryBarrierWithGroupSync`.
 
+*(14/n: die dritte Rückgewinnung ist in der CUDA-Form ein **Race** — `addToRefinementBuffer`
+bei `:1198` benutzt dasselbe statische `perWarpCountS`, und `:1202` schreibt ohne
+vorangehende Barriere. Siehe P9.83b-5 (14/n), Korrektur 1.)*
+
 Der Entry Point über dem Limit ist **gelöscht** — genau wie der Wide-Stage-Entry
 aus 4/n: ein Entry, der konstruktionsbedingt über dem Limit liegt, lässt
 `gpuslang.groupshared` für das **ganze** Korpus fehlschlagen. Seine Zahl steht in
@@ -2109,6 +2272,10 @@ hätte das nie gezeigt.
 erzwungen war: nicht gewählt, weil sie ordentlicher ist, sondern weil die
 Alternative gebaut, gemessen und zu groß war. Beide Entry Points über dem Limit
 sind gelöscht, beide Zahlen stehen im Ratchet.
+
+*(14/n: zu stark — erzwungen unter den **damals betrachteten** Rückgewinnungen; das
+während der Zuordnung tote `triangleIndicesS` wurde nicht betrachtet. Siehe P9.83b-5
+(14/n), Korrektur 2.)*
 
 **Der Preis der Auslagerung ist benannt und nicht klein:** `patchesS` wird von
 **einem** Warp geschrieben und von **allen** gelesen, also wird jede
@@ -2363,7 +2530,7 @@ jetzt per Mutation geprüft statt behauptet.
 
 ## P9.83b-5 — die Patch-Maschinerie, erster Teil: `reduceContactsSingleWarp` seriell, und ein toter Parameter
 
-`reduceContactsSingleWarp` (convexMeshMidphase.cu:440-503) wird an :842-843 und
+`reduceContactsSingleWarp` (convexMeshMidphase.cu:440-496) wird an :842-843 und
 :950-951 aufgerufen, **beide Male unter `if (warpIndex == 0)`**. Sein Rumpf enthält
 keine Block-Barriere — jedes Kollektiv darin ist warp-lokal —, und in Slang wird
 jedes davon zu `GroupMemoryBarrierWithGroupSync`. Eine 1:1-Abschrift setzt also
@@ -2823,10 +2990,12 @@ Kommentar bei `testGpuSdkStep.cpp:366`. Folge:
   Kontakt der Szene nahm diesen Zweig. Der echte Zwei-SDF-Gradient wurde von **keiner
   Szene dieses Baums** je ausgeführt.
 * Der zweite Durchlauf der äußeren Schleife wird nur betreten `if (mesh0.mTexObject)`
-  (`:1045-1055`), sonst `break`. Mit einem SDF im Paar brach sie nach Durchlauf 0 ab —
+  (`:1048-1055`), sonst `break`. Mit einem SDF im Paar brach sie nach Durchlauf 0 ab —
   der ganze `outer == 1`-Arm, der die Rollen tauscht, mit `aToB.getInverse()` sammelt,
   die Skalierung der **anderen** Shape anwendet und dessen Schwanz die Normale
-  **negiert**, wo Durchlauf 0 das nicht tut, war tot.
+  **nicht** negiert, wo Durchlauf 0 es tut (`:1151` `-dir` gegen `:1192`
+  `aToB.rotate(dir)`), war tot.  *(P9.83b-5, 14/n: hier stand es umgekehrt — die
+  Negation gehört zu Durchlauf 0; per Lesen der beiden Zeilen korrigiert.)*
 
 Zwei gestapelte dynamische SDF-Kisten legen ein SDF auf **beide** Seiten eines Contact
 Managers. Kein neues Backen — es ist dieselbe `sdfBox`. Gemessen, Kernel weiterhin

@@ -28,7 +28,7 @@
 //
 //   The patch machinery of doTriangleTriangleCollision (convexMeshMidphase.cu),
 //   starting with the piece everything else waits on: reduceContactsSingleWarp
-//   (:440-503), here as a SERIAL body.
+//   (:440-496), here as a SERIAL body.
 //
 // ---------------------------------------------------------------------------
 // WHY SERIAL, AND WHY THAT IS THE WHOLE REASON THIS FILE EXISTS
@@ -199,7 +199,7 @@ public struct TtpPatch
 }
 
 // ---------------------------------------------------------------------------
-// reduceContactsSingleWarp (convexMeshMidphase.cu:440-503), serialised.
+// reduceContactsSingleWarp (convexMeshMidphase.cu:440-496), serialised.
 //
 // `tempPoints` is the caller's staging buffer; `lane` arrays are local, so this
 // runs on ONE thread and takes no barrier.  Returns the survivor mask; the caller

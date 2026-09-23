@@ -96,6 +96,13 @@ solverTGS:solveWholeIslandTGS    31744
 # first use follows findInterestingTrianglesA in the same iteration.  36 bytes of
 # headroom is not a margin anybody should build on, which is why the spill is
 # measured beside them rather than after them.
+# CORRECTION (14/n): the third reclamation is a RACE in the CUDA's shape.  The
+# two-argument scan's static perWarpCountS is shared with addToRefinementBuffer at
+# :1198, whose reads (reduction.cuh:614/:618, no trailing barrier) are followed at
+# :1202 by threadBlockCountAndBroadcast writing countersS (:583-584, no leading
+# barrier).  Only the port's ballot emulation, itself a workgroup barrier, would
+# order them.  The byte count stands; an extra barrier at :1198/:1202 would make it
+# valid.  See npTriTriSharedProbe.slang.
 #
 # P9.83b-5 (12/n): THE PACKING ANSWER WAS BUILT, AND IT IS ALSO OVER.
 # Adding 1536 + 512 + 128 off three separate measurements is not a measurement, so
@@ -111,6 +118,10 @@ solverTGS:solveWholeIslandTGS    31744
 # per-warp reduce computes it on one thread, so it must reach that warp's 32 lanes
 # through memory -- 128 bytes, and 36 was never a margin.  The spill is forced, the
 # same way the narrow staging was.
+# CORRECTION (14/n): forced AMONG THE RECLAMATIONS THEN CONSIDERED.  A fourth was
+# not: triangleIndicesS (8192 bytes) is written only at :1073/:1078 and read only at
+# :1082-1083, so it is dead during tryToAssign/createNewPatches and could hold their
+# scratch.  About 31228 bytes by arithmetic -- NOT measured; that is 15a/n.
 #
 # Both over-limit entry points were deleted, same as the wide-stage one.
 npTriTriSharedProbe:triTriSharedProbe    30300

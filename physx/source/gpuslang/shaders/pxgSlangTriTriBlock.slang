@@ -51,7 +51,7 @@
 // ---------------------------------------------------------------------------
 // THE TWO SHARED ARRAYS ARE THE KERNEL'S, DECLARED HERE ONCE
 // ---------------------------------------------------------------------------
-// convexMeshMidphase.cu:1005-1010 declares `countersS[32]` and `shMinSepS[32]`,
+// convexMeshMidphase.cu:1003 and :1006 declare `countersS[32]` and `shMinSepS[32]`,
 // and every helper below is passed one or both of them in the CUDA.  Slang has no
 // portable way to pass groupshared by reference, so they are declared here and
 // used by name.  An including file must NOT declare its own: the sizes are the
@@ -106,7 +106,7 @@ static const float TTB_FLT_MAX = 3.402823466e+38f;
 // a 16-warp caller reads; this kernel launches 32 warps, and the difference is
 // recorded rather than removed.
 //
-// The __syncthreads() at :584 is INSIDE.  Its caller at convexMeshMidphase.cu:813
+// The __syncthreads() at :586 is INSIDE.  Its caller at convexMeshMidphase.cu:813
 // then issues a SECOND one "for countersS reuse" -- that one is the caller's and
 // is not folded in here.
 uint ttbBlockCountAndBroadcast(uint tid, bool threadContributesElement)
@@ -129,7 +129,7 @@ uint ttbBlockCountAndBroadcast(uint tid, bool threadContributesElement)
 // ---------------------------------------------------------------------------
 // threadBlockScanExclusive<32>(bool, totalSum, perWarpCountS)
 // (reduction.cuh:598-621), the THREE-argument overload -- the one
-// convexMeshMidphase.cu:820 and :938 call with countersS.
+// convexMeshMidphase.cu:820 and :936 call with countersS.
 // ---------------------------------------------------------------------------
 // The two-argument overload allocates its own perWarpCountS and is what
 // addIndexToBuffer reaches through; that one is a different array and is measured
@@ -323,6 +323,14 @@ TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint
 //
 // No dupe test, maxPoints 6, clustering on: <true, true, MESH_MESH_CONTACT_LIMIT,
 // false>, as at both call sites.
+//
+// SWEPT (14/n): 16 mutants, 14 killed.  `config-dupe-on` survived the first round
+// -- random clouds never put two points 1e-4 apart -- and died once the fixture
+// planted coincident masked lanes.  The two survivors are REMOVED BARRIERS (the
+// round's leading one, and the one before the final read).  Both remove a real
+// race; on llvmpipe the side that must go first happens to be thread 0, which runs
+// first after every barrier, so no fixture there can show it.  A racy mutant's
+// survival is uninformative; the barriers stay.
 groupshared float4 gTtbWarpStage[32];
 groupshared uint gTtbReduceMask[32];
 

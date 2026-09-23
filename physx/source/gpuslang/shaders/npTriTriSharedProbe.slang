@@ -297,6 +297,22 @@ void triTriSharedProbeNarrowStage(uint3 dtid : SV_DispatchThreadID, uint3 gtid :
 //   gScanPerWarpCount 128 -> 0 findInterestingTrianglesA's scan finishes before
 //                             countersS is first used in the same iteration
 //
+// CORRECTION (P9.83b-5, 14/n): the third one is a RACE in the CUDA's shape, and
+// "finishes before" was the wrong test.  The two-argument scan overload
+// (reduction.cuh:625-630) owns ONE static perWarpCountS per instantiation, and
+// the same instantiation is reached by addToRefinementBuffer
+// (sdfCollision.cuh:750), called at :1198 -- directly before
+// threadBlockCountAndBroadcast(.., countersS) at :1202.  The scan reads all 32
+// slots after its only barrier (reduction.cuh:612, reads :614/:618) and has no
+// trailing one; the count writes sharedMem[warpIndex] from lane 0 (:583-584) with
+// no barrier before it.  Aliased, a warp that leaves the scan early overwrites a
+// slot another warp is still reading.  In THIS port the ballot emulation inside
+// warpCountAndBroadcast is itself a workgroup barrier and would order the two --
+// safety borrowed from the emulation, gone with a native subgroup path.  The
+// 32732 below stays a correct byte count (one extra barrier between :1198 and
+// :1202 would make the reclamation valid and costs no bytes); the reasoning was
+// what was wrong.
+//
 // This entry point measures the OTHER answer: leave every buffer alone and put
 // patchesS in a device-side per-workgroup scratch allocation instead.  It is the
 // CUDA's largest shared array by a factor of two and the only one that is written

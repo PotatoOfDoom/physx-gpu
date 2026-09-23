@@ -27,7 +27,7 @@
 // npTriTriReduce.slang -- P9.83b-5.
 //
 //   Fixture entry for ttpReduceContactsSerial, the serial replacement for
-//   reduceContactsSingleWarp (convexMeshMidphase.cu:440-503).
+//   reduceContactsSingleWarp (convexMeshMidphase.cu:440-496).
 //
 // The property under test is the STREAMING loop, not the reduction it calls --
 // crsContactReduce2 is already certified by gpuslang.npCrsWrapper2, which

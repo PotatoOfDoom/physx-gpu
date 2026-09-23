@@ -404,10 +404,12 @@ void buildSdfMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     //     shelf SDF-less, every contact of sdfBoxOnMesh takes that arm.  The genuine
     //     two-SDF gradient is never executed by any scene in this tree.
     //   * the outer loop's second pass is entered only `if (mesh0.mTexObject)`
-    //     (convexMeshMidphase.cu:1045-1055), else it breaks.  With one SDF in the pair the
+    //     (convexMeshMidphase.cu:1048-1055), else it breaks.  With one SDF in the pair the
     //     loop breaks after pass 0, so the whole `outer == 1` arm -- which reverses the
     //     roles, gathers with aToB.getInverse() and applies the OTHER shape's scale, and
-    //     whose tail NEGATES the normal where pass 0 does not -- is dead.
+    //     whose tail does NOT negate the normal where pass 0 does (:1151 `-dir` against
+    //     :1192 `aToB.rotate(dir)`; this comment had it backwards until P9.83b-5 14/n) --
+    //     is dead.
     //
     // Two dynamic SDF boxes stacked put an SDF on BOTH sides of one contact manager, which
     // is the smallest change that opens both.  No new cooking: they are the same sdfBox.

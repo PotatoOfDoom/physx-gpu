@@ -426,6 +426,21 @@ PXG_TEST(npTriTriBlock_warpReduce)
     std::vector<uint32_t> want1(size_t(N) * 32), want2(size_t(N) * 32);
 
     size_t reductionsRun = 0, earlyOut = 0, emptyMask = 0, callsDiffer = 0, answerNotInput = 0;
+    size_t dupePlants = 0, dupeMatters = 0;
+
+    // The same reduction with TDoDupeTest = true -- NOT what the engine runs; it
+    // exists only to count the warps on which the plant above makes the two
+    // configurations disagree.
+    auto refWrapper2DupeOn = [](const V3* pt, const float* sep, V3 nn, uint32_t allMask, float bias) {
+        float adj[32], initial[32];
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            const V3 p = sub(pt[j], scale3(nn, dot3(pt[j], nn)));
+            adj[j] = -sep[j];
+            initial[j] = mag3(p);
+        }
+        return reduceShared(pt, sep, nn, allMask, bias, adj, initial, 6, true, true);
+    };
 
     auto pickMask = [&](uint32_t k) -> uint32_t {
         switch (k % 8)
@@ -456,6 +471,33 @@ PXG_TEST(npTriTriBlock_warpReduce)
                                         centre.z + rf(-2, 2), rf(-0.4f, 0.25f) };
             c.masks[w] = pickMask(rng());
             c.masks2[w] = pickMask(rng());
+
+            // PLANT (added after the 14/n sweep, where config-dupe-on SURVIVED): two
+            // masked lanes at the SAME position.  :810 and :931 instantiate
+            // contactReduce2 with TDoDupeTest = false, so both copies stay
+            // candidates.  A port with the test on drops one of them
+            // (contactReduction.cuh:65-79: magnitudeSquared < 1e-8, the shallower
+            // goes; on equal separation the LOWER lane, since i > threadIndexInWarp
+            // marks the lane being tested).  Random clouds never put two points
+            // 1e-4 apart, so without this the two configurations agree on every
+            // case and the mutant's survival says nothing.
+            if ((w & 1u) == 1u && popcount32(c.masks[w]) >= 2u)
+            {
+                uint32_t m = c.masks[w];
+                uint32_t a = 0;
+                while (((m >> a) & 1u) == 0u) ++a;
+                m &= m - 1u;
+                uint32_t b = 0;
+                while (((m >> b) & 1u) == 0u) ++b;
+                const V4 pa = c.pts[w * 32 + a];
+                V4& pb = c.pts[w * 32 + b];
+                pb.x = pa.x;
+                pb.y = pa.y;
+                pb.z = pa.z;
+                if (w % 3u == 0u)
+                    pb.w = pa.w;                                    // the tie-break arm
+                ++dupePlants;
+            }
         }
 
         for (uint32_t w = 0; w < 32; ++w)
@@ -476,6 +518,7 @@ PXG_TEST(npTriTriBlock_warpReduce)
             if (popcount32(c.masks[w]) > 6) ++reductionsRun; else if (c.masks[w]) ++earlyOut; else ++emptyMask;
             if (a != b) ++callsDiffer;
             if (a != c.masks[w]) ++answerNotInput;
+            if (refWrapper2DupeOn(pt, sp, n, c.masks[w], bias) != a) ++dupeMatters;
         }
     }
 
@@ -494,6 +537,10 @@ PXG_TEST(npTriTriBlock_warpReduce)
     PXG_CHECK_MSG(answerNotInput > warps / 3,
                   "npTriTriBlock_warpReduce: only %zu answers differ from their input "
                   "mask -- a reduce that returned its input would pass", answerNotInput);
+    PXG_CHECK_MSG(dupeMatters > warps / 20,
+                  "npTriTriBlock_warpReduce: the dupe test changes the answer on only %zu "
+                  "of %zu warps (%zu coincident-pair plants) -- a port with TDoDupeTest "
+                  "on would pass", dupeMatters, warps, dupePlants);
 
     PxgSlangComputeDevice* dev = testDevice();
     std::vector<uint32_t> outInit(size_t(N) * 2048, 0xDEADBEEFu);
@@ -543,8 +590,10 @@ PXG_TEST(npTriTriBlock_warpReduce)
 
     std::printf("  npTriTriBlock_warpReduce: %u blocks, %zu warps per call; %zu reductions run, "
                 "%zu early-out, %zu empty; the two calls differ on %zu warps, %zu answers "
-                "differ from their input\n",
-                N, warps, reductionsRun, earlyOut, emptyMask, callsDiffer, answerNotInput);
+                "differ from their input; %zu coincident-pair plants, dupe test decisive "
+                "on %zu warps\n",
+                N, warps, reductionsRun, earlyOut, emptyMask, callsDiffer, answerNotInput,
+                dupePlants, dupeMatters);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

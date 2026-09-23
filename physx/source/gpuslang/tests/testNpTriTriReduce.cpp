@@ -25,7 +25,7 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of ttpReduceContactsSerial (pxgSlangTriTriPatch.slang) against a
-// CPU mirror of reduceContactsSingleWarp (convexMeshMidphase.cu:440-503).
+// CPU mirror of reduceContactsSingleWarp (convexMeshMidphase.cu:440-496).
 //
 // THE MIRROR IS WRITTEN FROM THE CUDA.  In particular:
 //   :457  readMask = ~currentContactMask            -- FULL 32-bit complement
@@ -72,7 +72,7 @@ struct RefResult
     uint32_t passes;
 };
 
-// reduceContactsSingleWarp (convexMeshMidphase.cu:440-503), serialised.
+// reduceContactsSingleWarp (convexMeshMidphase.cu:440-496), serialised.
 static RefResult refReduce(const V4* tempPoints, uint32_t totalContacts, V3 nor, float clusterBias)
 {
     V3 pA[32];
