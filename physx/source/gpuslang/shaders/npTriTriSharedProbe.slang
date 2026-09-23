@@ -362,3 +362,46 @@ void triTriSharedProbeSpilled(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_
                      + pxgPopc(ballot) + rank;
     }
 }
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (12/n): THE THREE RECLAMATIONS, BUILT RATHER THAN ADDED UP -- AND
+// THEN OVER THE LIMIT ANYWAY
+// ---------------------------------------------------------------------------
+// 2176 against a 2140-byte deficit is arithmetic on three numbers each read off a
+// different measurement, and this tranche had already been wrong twice about what
+// a shader costs.  So the packing answer was BUILT as its own entry point and the
+// checker read it out of the SPIR-V:
+//
+//   1. Patch loses pointCount.  6*float4 + float4 is 112 and needs no rounding;
+//      with pointCount inside, 120 rounds up to 128.  The counts move to their own
+//      uint[128].  16384 -> 14848.
+//   2. The per-warp reduce stage becomes the first 32 slots of tempPointsS.  Legal
+//      because the stage is dead before tempPointsS is first written -- :810 runs
+//      the reduce, :828-835 fill tempPointsS.  512 -> 0.
+//   3. threadBlockScanExclusive's self-allocated perWarpCountS becomes countersS.
+//      findInterestingTrianglesA's scan finishes before countersS is first used in
+//      the same iteration.  128 -> 0.
+//
+//   triTriSharedProbePacked   32732 bytes -- fits, 36 bytes spare
+//
+// AND THEN IT DOES NOT FIT, because 36 bytes is smaller than the port's OWN
+// requirement.  contactReduce2 at :810 and :931 is a WARP-scoped call: each of the
+// 32 warps gets its reduceMask back in its own lanes' registers.  A serialised
+// per-warp reduce computes that mask on ONE thread, so it has to reach the warp's
+// 32 lanes through memory -- one uint per warp, 128 bytes that the CUDA does not
+// need and the port cannot do without.  Measured with it:
+//
+//   triTriSharedProbePacked   32860 bytes -- OVER THE LIMIT BY 92
+//
+// So the spill is FORCED, the same way the narrow staging was forced in 4/n: not
+// chosen because it is tidier, but because the alternative was built and measured
+// and does not fit.  The 36-byte margin was never a margin -- it was smaller than
+// the first buffer the port had to add to it, and adding numbers from three
+// measurements would never have shown that.
+//
+// Both entry points are DELETED.  The packed one is over the limit by
+// construction, which fails gpuslang.groupshared for the whole corpus; the
+// 32732-byte variant without gReduceMask is not worth keeping either, because it
+// measures a design that cannot be finished.  The numbers are in
+// tools/groupshared_known.txt.
+// ---------------------------------------------------------------------------

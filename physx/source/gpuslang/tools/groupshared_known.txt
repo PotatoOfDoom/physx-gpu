@@ -97,6 +97,21 @@ solverTGS:solveWholeIslandTGS    31744
 # headroom is not a margin anybody should build on, which is why the spill is
 # measured beside them rather than after them.
 #
-# The over-limit entry point was deleted, same as the wide-stage one.
+# P9.83b-5 (12/n): THE PACKING ANSWER WAS BUILT, AND IT IS ALSO OVER.
+# Adding 1536 + 512 + 128 off three separate measurements is not a measurement, so
+# the three reclamations got an entry point and the checker read the number:
+#
+#   with all three, as the CUDA's algorithm needs it
+#                                              32732 bytes -- fits, 36 spare
+#   plus the ONE buffer the PORT needs and the CUDA does not
+#                                              32860 bytes -- OVER BY 92
+#
+# That buffer is gReduceMask[32].  contactReduce2 at :810 and :931 is WARP-scoped:
+# each of the 32 warps gets its mask back in its own lanes' registers.  A serialised
+# per-warp reduce computes it on one thread, so it must reach that warp's 32 lanes
+# through memory -- 128 bytes, and 36 was never a margin.  The spill is forced, the
+# same way the narrow staging was.
+#
+# Both over-limit entry points were deleted, same as the wide-stage one.
 npTriTriSharedProbe:triTriSharedProbe    30300
 npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812

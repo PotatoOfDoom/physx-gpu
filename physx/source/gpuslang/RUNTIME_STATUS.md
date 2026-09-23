@@ -2006,6 +2006,38 @@ aus 4/n: ein Entry, der konstruktionsbedingt über dem Limit liegt, lässt
 `gpuslang.groupshared` für das **ganze** Korpus fehlschlagen. Seine Zahl steht in
 `tools/groupshared_known.txt`, wo eine Zahl hingehört.
 
+### 12/n — die Packungs-Antwort wurde gebaut, und sie ist auch darüber
+
+1536 + 512 + 128 aus drei verschiedenen Messungen zu addieren **ist keine
+Messung**. Also bekamen die drei Rückgewinnungen einen eigenen Entry Point, und
+der Prüfer las die Zahl aus dem SPIR-V:
+
+```
+  mit allen dreien, wie der CUDA-Algorithmus sie braucht
+                              32732 Bytes  -- passt, 36 Bytes frei
+  plus der EINE Puffer, den der PORT braucht und die CUDA nicht
+                              32860 Bytes  -- ÜBER DEM LIMIT UM 92
+```
+
+Dieser Puffer ist `gReduceMask[32]`. `contactReduce2` bei `:810` und `:931` ist
+**warp-skopiert**: jeder der 32 Warps bekommt seine Maske in den Registern der
+eigenen Lanes zurück. Eine serialisierte Per-Warp-Reduktion rechnet sie auf
+**einem** Thread aus, also muss sie die 32 Lanes dieses Warps über den Speicher
+erreichen — 128 Bytes, und **36 waren nie eine Marge**. Sie waren kleiner als der
+erste Puffer, den der Port dazulegen musste; eine Addition aus drei Messungen
+hätte das nie gezeigt.
+
+**Damit ist die Auslagerung erzwungen**, genau wie das schmale Staging in 4/n
+erzwungen war: nicht gewählt, weil sie ordentlicher ist, sondern weil die
+Alternative gebaut, gemessen und zu groß war. Beide Entry Points über dem Limit
+sind gelöscht, beide Zahlen stehen im Ratchet.
+
+**Der Preis der Auslagerung ist benannt und nicht klein:** `patchesS` wird von
+**einem** Warp geschrieben und von **allen** gelesen, also wird jede
+`__syncthreads`-Stelle, die es überspannt, von `GroupMemoryBarrierWithGroupSync`
+zu `AllMemoryBarrierWithGroupSync`, und der Kernel braucht eine
+gerätesetzige Per-Workgroup-Allokation, die die CUDA nicht hat.
+
 ## P9.83b-5 (9/n) — der Schreib-Schwanz der Mesh-gegen-Mesh-Kollision, und eine Vertauschung, die nur zwei Worte sehen können
 
 `writePatchesAndContacts` (convexMeshMidphase.cu:673-751) ist portiert: der
