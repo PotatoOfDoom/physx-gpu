@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace physx
 {
@@ -203,6 +204,83 @@ PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWor
 
 // ---- launch ----
 
+// ---- P9.84: which engine pipelines need the device-wide texture set ----
+//
+// Until P9.84 this function never built a bindless pipeline.  Three MAPPED engine
+// kernels declare the SDF texture set -- cloth_sdfMeshContactGenLaunch,
+// ps_sdfMeshCollisonLaunch and sb_sdfMeshMidphaseGeneratePairsLaunch -- and the
+// engine uploads its SDFs into it (bridge cuTexObjectCreate -> createTexture3DFmt,
+// bindless).  But createPipeline builds a layout with set 0 only, and a shader
+// that uses set 1 against that layout is invalid: MEASURED (gpuslang.shimBindless,
+// before this fix) llvmpipe SEGFAULTS inside vkCreateComputePipelines, on the
+// first launch.  Not wrong samples -- the process dies.  No scene reached any of
+// the three with a real SDF, so nothing ever launched them; P9.12a's fixture
+// built its pipeline with createPipelineBindless directly, which is not the
+// engine's door.
+//
+// PxgKernelDef has no field saying a kernel samples the bindless set, and the
+// manifest is generated from kernel NAMES, so a hand-maintained flag would be one
+// more thing that can drift from the shader it describes.  The SPIR-V already
+// says it: a kernel that samples declares its image array and sampler with
+// `DescriptorSet 1` (pxgSlangTex3d.slang).  So pipelineFor reads that off the blob
+// it is about to compile, and nothing has to be remembered.
+//
+// PER ENTRY POINT, not per module.  From SPIR-V 1.4 on, an OpEntryPoint's
+// interface list names EVERY global variable the entry statically uses, not only
+// its Input/Output ones -- and Slang emits 1.5.  So the answer is "does this
+// entry's interface contain a variable decorated DescriptorSet 1", and a
+// non-sampling entry that shares a module with sampling ones (npSdfCollision's
+// sdfCollBaryClamp, npSdfTexture's sdfTexProbe: measured) keeps its plain layout.
+// Below 1.4 the interface list cannot answer that, and the test falls back to
+// "the module declares the set anywhere" -- conservative: an entry that never
+// samples then gets a set it does not use, which Vulkan permits.
+bool pxgSpirvEntryUsesDescriptorSet(const std::vector<uint8_t>& blob, const char* entry, uint32_t set)
+{
+    if (blob.size() < 20 || (blob.size() & 3u) != 0 || !entry)
+        return false;
+    const size_t n = blob.size() / 4;
+    std::vector<uint32_t> w(n);
+    std::memcpy(w.data(), blob.data(), n * 4);
+    if (w[0] != 0x07230203u)                    // SPIR-V magic
+        return false;
+    const bool interfaceListsAllGlobals = w[1] >= 0x00010400u;
+
+    const uint32_t kOpEntryPoint = 15u, kOpDecorate = 71u, kDecorationDescriptorSet = 34u;
+    std::vector<uint32_t> inSet;                // ids decorated DescriptorSet `set`
+    size_t epIface = 0, epEnd = 0;              // [begin, end) of the entry's interface ids
+    const size_t entryLen = std::strlen(entry);
+    for (size_t i = 5; i < n;)                  // 5-word header
+    {
+        const uint32_t wordCount = w[i] >> 16, opcode = w[i] & 0xFFFFu;
+        if (wordCount == 0 || i + wordCount > n)
+            break;
+        if (opcode == kOpDecorate && wordCount >= 4 && w[i + 2] == kDecorationDescriptorSet && w[i + 3] == set)
+            inSet.push_back(w[i + 1]);
+        if (opcode == kOpEntryPoint && wordCount >= 4)
+        {
+            // word 3 on: the name, NUL-terminated and padded to a word boundary.
+            const char* name = reinterpret_cast<const char*>(&w[i + 3]);
+            const size_t maxBytes = size_t(wordCount - 3) * 4;
+            const size_t len = strnlen(name, maxBytes);
+            if (len < maxBytes && len == entryLen && std::memcmp(name, entry, len) == 0)
+            {
+                epIface = i + 3 + (len + 4) / 4;
+                epEnd = i + wordCount;
+            }
+        }
+        i += wordCount;
+    }
+    if (inSet.empty())
+        return false;
+    if (!interfaceListsAllGlobals || epEnd == 0)
+        return true;                            // cannot tell per entry: conservative
+    for (size_t k = epIface; k < epEnd; ++k)
+        for (uint32_t id : inSet)
+            if (w[k] == id)
+                return true;
+    return false;
+}
+
 PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
 {
     auto it = mPipelines.find(id);
@@ -212,9 +290,20 @@ PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
     const PxgKernelDef& def = mManifest[id];
     const std::vector<uint8_t> blob = mLoader(def.spirvFile);
     PxgPipelineHandle pipe = 0;
+    // No ENGINE row reaches this first branch: the bridge builds every row with
+    // numTextures = 0 (bridge/PhysXGpuVulkan.cpp:215-218), and no fixture launches
+    // a textured row through the shim either -- which is why removing it survives
+    // the P9.84 host sweep.  It predates the bindless set and is kept for callers
+    // that bind textures per pipeline.
     if (def.numTextures > 0)
         pipe = mDevice->createPipelineTex(blob.data(), blob.size(), def.entry, 0, nullptr,
                                           def.pushConstantSize, def.numTextures);
+    else if (pxgSpirvEntryUsesDescriptorSet(blob, def.entry, 1u))
+        // Returns 0 on a device without descriptor indexing, and launchKernel then
+        // refuses the launch (NotFound) -- a refusal, where building it with
+        // createPipeline would crash.
+        pipe = mDevice->createPipelineBindless(blob.data(), blob.size(), def.entry, 0, nullptr,
+                                               def.pushConstantSize);
     else
         // Zero storage-buffer bindings: every buffer argument travels as a
         // device address inside the parameter blob (BDA model).
@@ -365,7 +454,7 @@ PxgResult PxgCudaShim::streamWaitEvent(PxgStreamId stream, uint32_t event)
 //
 // The split between "the array" and "the texture object" is CUDA's, and it is
 // kept rather than collapsed because the ENGINE's call sequence has that shape:
-// PxgGeometryManager.cpp:733-769 creates the array, copies into it, and only
+// PxgGeometryManager.cpp:732-770 creates the array, copies into it, and only
 // then builds the object.  Collapsing the three into one entry point would
 // force the driver shim to guess which of them the engine is in the middle of.
 

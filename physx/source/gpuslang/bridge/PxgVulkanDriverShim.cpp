@@ -92,7 +92,7 @@ extern "C" CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, s
 // --- Texture-object / CUDA-array API: the SDF 3D-texture upload path (P9.12b).
 //
 // The engine's sequence is cuArray3DCreate -> cuMemcpy3DAsync -> cuTexObjectCreate
-// (PxgGeometryManager.cpp:733-769), and it is translated onto the shim's bindless
+// (PxgGeometryManager.cpp:732-770), and it is translated onto the shim's bindless
 // texture layer rather than being reimplemented here: a CUarray is a host staging
 // record and the Vulkan image is created at cuTexObjectCreate, the first moment
 // dimensions, format AND contents are all known.

@@ -230,6 +230,13 @@ private:
     uint64_t mLastLaunchTicket = 0;                   // ticket of the last submitted work
 };
 
+// P9.84: true when `entry` in the SPIR-V `blob` uses a variable decorated
+// DescriptorSet `set` (per entry point from SPIR-V 1.4 on; below that, whenever
+// the module declares the set at all).  pipelineFor uses it to decide which
+// engine kernels need the bindless SDF set; exposed so a fixture can check the
+// classification on real blobs.
+bool pxgSpirvEntryUsesDescriptorSet(const std::vector<uint8_t>& blob, const char* entry, uint32_t set);
+
 } // namespace gpuslang
 } // namespace physx
 

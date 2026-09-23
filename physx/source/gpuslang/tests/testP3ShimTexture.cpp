@@ -33,7 +33,7 @@
 //
 //     cuArray3DCreate(&arr, {W, H, D, format, 1 channel, 0})     :739
 //     cuMemcpy3DAsync({HOST -> ARRAY, tightly packed}, stream)   :755
-//     cuTexObjectCreate(&tex, {ARRAY, arr}, {clamp x3, linear})  :769
+//     cuTexObjectCreate(&tex, {ARRAY, arr}, {clamp x3, linear})  :770
 //
 // -- produces a CUtexObject the shader can sample, and that the translation layer
 // refuses everything it cannot faithfully represent instead of approximating it.

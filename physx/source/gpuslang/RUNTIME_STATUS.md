@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **871/871** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **872/872** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.84 added `gpuslang.shimBindless`: the first launch of a set-1 (SDF-sampling) kernel
+through the ENGINE's pipeline door, PxgCudaShim.  Before the fix that door built a set-0
+layout and llvmpipe SEGFAULTED in vkCreateComputePipelines -- the first launch of any of
+the three mapped SDF kernels would have killed the process.  pipelineFor now reads the
+answer off the entry's SPIR-V interface list, and the fixture pins the classification
+over all 420 mapped engine rows: exactly the three SDF kernels use the set.
 P9.83b-5 (14/n) added `npTriTriBlock_warpReduce` inside the same suite (no new ctest row):
 contactReduce2 at :810/:931 run one warp at a time, 1024 threads per case, every thread
 reporting.  Its sweep killed 14 of 16 -- one of them only after the fixture was given
@@ -1955,6 +1961,138 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.84 — der Engine-Pfad hat das SDF-Textur-Set nie gebunden, und vor dem Fix stirbt der Prozess
+
+P9.12a hat das geräteweite bindless Textur-Set (Set 1) gebaut und mit
+`gpuslang.npTex3dBindless` zertifiziert. Diese Fixture baut ihre Pipeline aber mit
+`Kernel(Kernel::Bindless{}, …)`, also über `createPipelineBindless` — eine Tür, durch die
+die **Engine** nie geht. `PxgCudaShim::pipelineFor`, das **jede** Engine-Pipeline baut,
+rief nur `createPipeline` (Layout mit Set 0) oder `createPipelineTex` auf.
+
+Gleichzeitig deklarieren drei **gemappte** Engine-Kernel Set 1 in ihrem SPIR-V —
+`cloth_sdfMeshContactGenLaunch`, `ps_sdfMeshCollisonLaunch`,
+`sb_sdfMeshMidphaseGeneratePairsLaunch` —, und die Engine lädt ihre SDFs genau **dort**
+hinein (Bridge `cuTexObjectCreate` → `createTexture3DFmt`, bindless). Die Kombination —
+eine von der Engine gebaute Pipeline, die eine von der Engine hochgeladene Textur sampelt
+— hat nie jemand ausgeführt: keine Szene erreicht einen der drei.
+
+### Erst gemessen, dann repariert
+
+`gpuslang.shimBindless` (neu, Suite **871 → 872**) startet den zertifizierten Entry
+`tex3dBindlessSample` über **`PxgCudaShim::launchKernel`**, mit einer Manifestzeile
+`numTextures = 0` wie jede Engine-Zeile, und lädt die Textur über die Upload-Folge des
+Shims (`arrayCreate3D` → `arrayUpload` → `textureObjectCreate`, PxgGeometryManager.cpp:732-770).
+Gesampelt wird an Texelzentren, erwartet wird der gespeicherte Wert bit-genau.
+
+**Vor dem Fix: SIGSEGV** — nicht in einem Shader, sondern in `vkCreateComputePipelines`:
+
+```
+  #6  PxgVulkanComputeDevice::createPipelineInternal
+  #7  PxgVulkanComputeDevice::createPipeline
+  #8  PxgCudaShim::pipelineFor
+  #9  PxgCudaShim::launchKernel
+```
+
+Ein Shader, der Set 1 benutzt, gegen ein Layout ohne Set 1 ist ungültige Verwendung, und
+llvmpipe beantwortet sie mit einem toten Prozess. Das heißt: **der erste Start eines der
+drei Kernel hätte die Anwendung beendet** — nicht falsche Kontakte geliefert.
+
+**Nach dem Fix:** 105 Texelzentren, **0** Wert- und **0** Ausdehnungsabweichungen, in
+beiden Speichermodi.
+
+### Der Fix: `pipelineFor` liest die Antwort aus dem SPIR-V
+
+`PxgKernelDef` hat kein Feld „sampelt das bindless Set", und das Manifest wird aus
+Kernel-**Namen** erzeugt (und nur von Hand editiert) — ein gepflegtes Flag wäre eine
+weitere Stelle, die vom Shader abdriften kann. Das SPIR-V sagt es schon: ein samplender
+Kernel dekoriert sein Bild-Array und seinen Sampler mit `DescriptorSet 1`. Also:
+`numTextures > 0` → `createPipelineTex` (unverändert); sonst, wenn der Entry Set 1
+benutzt → `createPipelineBindless`; sonst `createPipeline`. Auf einem Gerät ohne
+Descriptor Indexing liefert `createPipelineBindless` 0, und `launchKernel` **verweigert**
+den Start (`NotFound`) — wo `createPipeline` abstürzen würde.
+
+**Pro Entry Point, nicht pro Modul — gemessen, bevor es so gebaut wurde.** Ab SPIR-V 1.4
+nennt die Interface-Liste eines `OpEntryPoint` **jede** globale Variable, die der Entry
+statisch benutzt, nicht nur Input/Output; Slang emittiert 1.5. Ein Scan aller 461 `.spv`:
+acht Module deklarieren Set 1, und zwei davon mischen samplende und nicht samplende
+Entries — `npSdfCollision` (`sdfCollBaryClamp`, `sdfCollTetClamp` benutzen es nicht) und
+`npSdfTexture` (`sdfTexProbe`). Eine Modul-weite Antwort hätte diesen Entries ein Set
+gegeben, das sie nicht benutzen. Unter 1.4 fällt der Test auf die Modul-weite Antwort
+zurück (konservativ: ein unbenutztes Set ist erlaubt), ebenso, wenn der Entry im Modul
+nicht existiert.
+
+### Was die Klassifikation festnagelt
+
+`shimBindless_classify` prüft `pxgSpirvEntryUsesDescriptorSet` (jetzt in
+`PxgCudaShim.h`) an **echten** Blobs:
+
+* über **alle 420 gemappten Zeilen** des Engine-Manifests (190 Module): die Entries, die
+  Set 1 benutzen, sind **genau** die drei SDF-Kernel. Wenn P9.83b-8
+  `triangleTriangleCollision` mappt, muss diese Liste absichtlich um einen wachsen;
+* 14 Einzelfälle: die gemischten Module Entry für Entry; die **Set-Nummer** zählt, nicht
+  „irgendein Deskriptor" (`npTex3d` hat seine Textur in Set 0, mit `Binding 1` am Sampler);
+  ein fehlender Entry gibt die konservative Antwort; ein gespeicherter Name, der
+  **Präfix** der Anfrage ist, passt nicht (`sdfTexProbe` gegen `sdfTexProbeX`);
+* dasselbe Blob mit auf **1.3** gesenkter Version fällt auf die Modul-Antwort zurück, mit
+  genau **1.4** bleibt es pro Entry;
+* handgebaute Blobs für die beiden **Enden** der Interface-Liste (die Set-1-Variable als
+  einzige und als letzte ID, hinter einem Namen der Länge 3 mod 4), eine Set-1-Variable
+  **außerhalb** der Interface-Liste, und `Binding 1` neben `DescriptorSet 0`;
+* abgeschnittene, falsch-magische und nicht wortausgerichtete Blobs sowie ein Null-Entry
+  sind „nein", nie ein Lesen hinter das Ende.
+
+### Der Sweep
+
+`tools/run_mutation_sweep.sh` mutiert Shader. Für Host-Code gab es keinen Sweep, also lief
+einer in derselben Disziplin (jetzt `tools/run_host_mutation_sweep.py`, gleiches Mutanten-Format wie der Shader-Sweep; zweimal gelaufen, als Einweg-Skript und als Werkzeug, mit Mutant für Mutant identischem Ergebnis): unberührte Kopie, grüne Baseline
+vorher **und** nachher, Neubau nach jedem Mutanten und nach dem Zurücksetzen, eindeutige
+Anker, Laufzeitgrenze. Gegen `shimBindless`, `p3ShimTexture3d` und `p3Shim`:
+**19 Mutanten, 17 getötet**, vier davon als Absturz: der zurückgenommene Fix, Set 0 statt
+Set 1 abgefragt und Dekorationen mit 5 statt 4 Worten landen alle drei wieder bei
+`createPipeline` und stürzen genau so ab, wie der Test es vor dem Fix gemessen hat; der
+vierte (Null-Entry ungeprüft) stürzt am `strlen(nullptr)` des Klassifizierers.
+
+Zwei Überlebende, beide diagnostiziert:
+
+* `iface-start-minus-one` (`(len + 3) / 4` statt `(len + 4) / 4`) ist **äquivalent auf
+  jedem gültigen SPIR-V**. Die beiden Ausdrücke unterscheiden sich nur bei einer
+  Namenslänge ≡ 0 mod 4, und dann ist das zusätzlich gelesene Wort das reine
+  Terminator-Wort — vier NUL-Bytes, also die ID 0, die SPIR-V nie vergibt und die daher
+  nie das Ziel einer `DescriptorSet`-Dekoration ist. (Der Gegen-Mutant `+5` ist getötet:
+  ein Wort zu spät überspringt eine echte ID.)
+* `tex-path-first-lost` (der `numTextures > 0`-Zweig entfernt) ist **unerreichbar**: die
+  Bridge baut **jede** Engine-Zeile mit `numTextures = 0u` (bridge/PhysXGpuVulkan.cpp:
+  215-218, die einzige Stelle, an der Engine-`PxgKernelDef`s entstehen), und keine Fixture
+  startet eine texturierte Zeile über den Shim. Der Zweig stammt aus der Zeit vor dem
+  bindless Set. Das steht jetzt als Kommentar an ihm, statt stillschweigend in der
+  Überlebendenliste.
+
+### Nebenbei
+
+Das Zitat der Upload-Folge `PxgGeometryManager.cpp:733-769` stand an drei Stellen
+(`PxgCudaShim.cpp`, `PxgVulkanDriverShim.cpp`, der neue Test) und traf die Aufrufe nicht:
+`cuArray3DCreate` steht bei `:739`, `cuMemcpy3DAsync` bei `:755`, `cuTexObjectCreate` bei
+**`:770`**, der Deskriptor beginnt bei `:732`. Jetzt `:732-770`; in `testP3ShimTexture.cpp`
+`:769` → `:770`.
+
+### Suite und Szenen
+
+Suite **872/872** in **beiden** Speichermodi. Szenen **55/55** — unverändert, und das ist
+die erwartete Aussage, keine beruhigende: keine Szene startet einen der drei Kernel, und
+genau deshalb ist der Absturz nie aufgefallen. Wer als Erster ein SDF-Mesh gegen Cloth,
+Partikel oder einen Softbody legt, bekommt jetzt einen Kernel statt eines toten Prozesses.
+
+### Nebenbei gefunden, eigener Eintrag: P9.85
+
+Beim Nachlesen des Dispatch-Pfads für diesen Fix: `PxgCudaShim::launchKernel` →
+`dispatch` zeichnet **keine** Compute-zu-Compute-Barriere auf, und weder Shim noch Bridge
+rufen `barrier()` je auf — nur die Fixtures tun es selbst. RUNTIME_PLAN.md sieht die
+globale Barriere ausdrücklich als Default vor („matches stream-ordered CUDA semantics").
+Aufeinanderfolgende Engine-Kernel haben damit keine Speicherabhängigkeit; llvmpipe führt
+Dispatches seriell aus und verdeckt das. Nicht hier behoben, weil es gemessen werden muss,
+bevor es repariert wird — die Khronos-Validierungsschicht ist nicht installiert, das Paket
+aber verfügbar.
 
 ## P9.83b-5 (14/n) — `contactReduce2` bei `:810`/`:931`, Warp für Warp, und ein Host-Orakel statt drei
 
