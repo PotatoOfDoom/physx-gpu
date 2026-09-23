@@ -131,7 +131,7 @@ PXG_TEST(npTriTriBlock_collectives)
 
     size_t sawEmptyWarp = 0, sawAllEmpty = 0, sawBlockTie = 0, sawUnmaskedEqual = 0;
     size_t sawAllTrueA = 0, sawAllFalseA = 0, sawAllTrueB = 0, sawAllFalseB = 0;
-    size_t sawSentinelMinI = 0;
+    size_t sawSentinelMinI = 0, sawFltMaxCandidate = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -156,21 +156,48 @@ PXG_TEST(npTriTriBlock_collectives)
         const bool allEmpty = (i % 30 == 4);
         if (allEmpty) ++sawAllEmpty;
 
-        for (int w = 0; w < 32; ++w)
+        // PLANT 0: A WARP THAT HAS CANDIDATES AND STILL PUBLISHES FLT_MAX.
+        // This is the input that tells `countersS[minIBlock] != 0` from "any warp
+        // has candidates", and the first version of this fixture did not contain
+        // it -- the separation alphabet is finite, so a warp with candidates
+        // always published something below FLT_MAX and the two spellings agreed
+        // on every case.  Construct it: warp 5 has candidates whose separations
+        // are all exactly FLT_MAX, every other warp is empty.  Then all 32 warp
+        // minima are FLT_MAX, the block minIndex breaks the tie on the LOWEST
+        // index and picks warp 0, which has a zero count -- so the CUDA's gate is
+        // FALSE while "any warp has candidates" is TRUE.
+        const bool fltMaxCandidate = (i % 30 == 5);
+        if (fltMaxCandidate)
         {
-            uint32_t m;
-            if (allEmpty) m = 0u;
-            else if ((rng() % 8) == 0) m = 0u;          // one warp in eight has none
-            else m = uint32_t(rng()) | (1u << (rng() % 32));
-            c.bitsC[w] = m;
-            if (m == 0u) ++sawEmptyWarp;
+            for (int w = 0; w < 32; ++w)
+            {
+                c.bitsC[w] = (w == 5) ? 0x0000FF00u : 0u;
+                for (int l = 0; l < 32; ++l)
+                    c.sep[w * 32 + l] = (w == 5 && ((c.bitsC[w] >> l) & 1u))
+                                        ? FLT_MAX_LOCAL : ALPHABET[rng() % 8];
+            }
+            ++sawFltMaxCandidate;
+            for (int w = 0; w < 32; ++w) if (c.bitsC[w] == 0u) ++sawEmptyWarp;
+        }
+        else
+        {
+            for (int w = 0; w < 32; ++w)
+            {
+                uint32_t m;
+                if (allEmpty) m = 0u;
+                else if ((rng() % 8) == 0) m = 0u;      // one warp in eight has none
+                else m = uint32_t(rng()) | (1u << (rng() % 32));
+                c.bitsC[w] = m;
+                if (m == 0u) ++sawEmptyWarp;
 
-            for (int l = 0; l < 32; ++l)
-                c.sep[w * 32 + l] = ALPHABET[rng() % 8];
+                for (int l = 0; l < 32; ++l)
+                    c.sep[w * 32 + l] = ALPHABET[rng() % 8];
+            }
         }
 
         // PLANT 1: an UNMASKED lane whose separation equals its warp's masked
         // minimum.  Warp 3, if it has both a masked and an unmasked lane.
+        if (!fltMaxCandidate)
         {
             const int w = 3;
             uint32_t m = c.bitsC[w];
@@ -195,7 +222,7 @@ PXG_TEST(npTriTriBlock_collectives)
 
         // PLANT 2: TWO WARPS sharing the block minimum, so the second minIndex has
         // a tie and the lowest-index rule is the thing that decides.
-        if (!allEmpty && (i % 3 == 0))
+        if (!allEmpty && !fltMaxCandidate && (i % 3 == 0))
         {
             int wa = -1, wb = -1;
             for (int w = 0; w < 32 && wb < 0; ++w)
@@ -262,6 +289,11 @@ PXG_TEST(npTriTriBlock_collectives)
                   "npTriTriBlock: only %zu cases plant an unmasked lane equal to the "
                   "masked minimum -- that is the only input that tells `ballot & mask` "
                   "from `ballot`", sawUnmaskedEqual);
+    PXG_CHECK_MSG(sawFltMaxCandidate >= 4,
+                  "npTriTriBlock: %zu cases with a warp that HAS candidates and still "
+                  "publishes FLT_MAX -- that is the only input that tells the CUDA's gate "
+                  "(countersS[minIBlock] != 0) from \"any warp has candidates\"",
+                  sawFltMaxCandidate);
     PXG_CHECK_MSG(sawAllTrueA >= 4 && sawAllFalseA >= 4 && sawAllTrueB >= 4 && sawAllFalseB >= 4,
                   "npTriTriBlock: predicate ends not covered (%zu/%zu all-true, "
                   "%zu/%zu all-false)", sawAllTrueA, sawAllTrueB, sawAllFalseA, sawAllFalseB);
@@ -344,8 +376,9 @@ PXG_TEST(npTriTriBlock_collectives)
 
     std::printf("  npTriTriBlock: %u blocks of 1024 threads; %zu empty warps "
                 "(%zu sentinel minI), %zu all-empty blocks, %zu block-minimum ties, "
-                "%zu unmasked-equal plants\n",
-                N, sawEmptyWarp, sawSentinelMinI, sawAllEmpty, sawBlockTie, sawUnmaskedEqual);
+                "%zu unmasked-equal plants, %zu FLT_MAX-candidate plants\n",
+                N, sawEmptyWarp, sawSentinelMinI, sawAllEmpty, sawBlockTie, sawUnmaskedEqual,
+                sawFltMaxCandidate);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

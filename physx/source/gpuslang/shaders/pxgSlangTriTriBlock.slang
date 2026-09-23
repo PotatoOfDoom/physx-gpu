@@ -68,6 +68,35 @@ groupshared float gTtbMinSep[32];
 static const float TTB_FLT_MAX = 3.402823466e+38f;
 
 // ---------------------------------------------------------------------------
+// THE SWEEP: 19 + 6 MUTANTS, 19 KILLED, 3 EQUIVALENT AND PROVED SO
+// ---------------------------------------------------------------------------
+// The three survivors are all the same shape -- `if (lane == 0u)` moved to lane 1,
+// or removed so all 32 lanes write -- and they survive because the value being
+// published is LANE-INVARIANT: pxgBallotSync computes the same ballot in every
+// lane of the warp, so popc of it is the same number everywhere, and the guard
+// reduces 32 identical writes to one rather than selecting a value.
+//
+// THAT ARGUMENT IS NOT WHY THEY ARE RECORDED AS EQUIVALENT.  The same argument
+// would be made by a fixture that simply could not see gTtbCounters at all, so it
+// was checked the other way: `count-lane1-publishes-plus-one` and
+// `scan-lane1-publishes-plus-one` leave the lane-0 write in place and add a
+// SECOND write of `perWarpCount + 1u` from lane 1.  Both are KILLED.  The fixture
+// therefore does see the slot, and moving which lane writes it does not change
+// what lands there.
+//
+// The guard is still worth keeping: it is the CUDA's, and it matters the moment
+// the warp is not full -- with lane 0 inactive, `if (lane == 0)` writes nothing
+// and the slot keeps a stale value, while the unguarded form writes from whoever
+// is live.  Both helpers are documented "must be called by full warps", so the
+// difference is unreachable here and is not a licence to drop the guard.
+//
+// The nineteenth mutant, `seed-gate-any-warp`, SURVIVED the first sweep and was
+// killed by the second after the fixture was given the input it was missing.  See
+// the note on the seed pick below: that survival was a fixture gap wearing the
+// costume of an equivalence, and it had a comment above it asserting the
+// equivalence as fact.
+//
+// ---------------------------------------------------------------------------
 // threadBlockCountAndBroadcast (reduction.cuh:576-589)
 // ---------------------------------------------------------------------------
 // NOTE THE ASYMMETRY WITH THE SCAN BELOW: this one reads sharedMem[lane] with NO
@@ -189,14 +218,30 @@ uint ttbWarpMinIndex(uint tid, float v, uint mask, out float minV)
 // index is `threadIndexInWarp`, so lane L of every warp reads warp L's minimum --
 // and runs minIndex over them with FULL_MASK to find the deepest warp.
 //
-// THE GATE IS `countersS[minIBlock] != 0`, NOT "any warp has candidates".  They
-// are the same predicate and the CUDA does not spell it the short way: a warp
-// with no candidates published FLT_MAX (minIndex over an empty mask leaves every
-// lane at FLT_MAX), so the winner of the second minIndex is a warp with real
-// candidates whenever one exists.  Only when EVERY warp published FLT_MAX does
-// the winner have a zero count -- and then the tie-break decides which index, and
-// the count is zero whichever it picks.  Transcribed as written, because the
-// equality is an argument and the spelling is the engine.
+// THE GATE IS `countersS[minIBlock] != 0`, AND IT IS **NOT** THE SAME PREDICATE
+// AS "any warp has candidates".  This comment said it was; the claim was written
+// down, mutated, and KILLED, and the correction is the useful part.
+//
+// The argument that looked convincing: a warp with no candidates publishes
+// FLT_MAX, because minIndex over an empty mask leaves every lane at FLT_MAX.  So
+// the winner of the second minIndex is a warp with real candidates whenever one
+// exists, and only an all-empty block reaches a zero count.
+//
+// WHAT IT MISSES: a warp can have candidates AND publish FLT_MAX, if its
+// candidates' separations are FLT_MAX.  Then every warp minimum is FLT_MAX, the
+// block minIndex breaks the tie on the LOWEST index, and it can land on an EMPTY
+// warp -- zero count, gate false -- while "any warp has candidates" is true.
+// Constructed in testNpTriTriBlock.cpp (warp 5 has candidates at FLT_MAX, every
+// other warp is empty) and the `seed-gate-any-warp` mutant dies on it.  The first
+// version of that fixture drew separations from a finite alphabet, so a warp with
+// candidates always published below FLT_MAX and the two spellings agreed on every
+// one of its 240 cases; the mutant survived, and surviving is what made the claim
+// look proven.
+//
+// ON THE ENGINE'S INPUTS THE TWO DO COINCIDE, because a candidate's separation
+// passed `sep < contactDistance` and is finite.  That is a precondition of the
+// CALLER, not a property of this function -- so this function transcribes the
+// CUDA's spelling and is correct without it.
 //
 // `minI` is the seeding LANE inside the winning warp and comes from the FIRST
 // minIndex; it is NOT recomputed here.  The caller pairs it with minIBlock at

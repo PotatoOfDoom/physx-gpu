@@ -7,7 +7,16 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **870/870** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **871/871** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-5 (13/n) added `gpuslang.npTriTriBlock`, the first fixture in this port to run
+ONE WORKGROUP OF 1024 THREADS PER CASE -- the four block collectives it drives are
+collectives, and a 64-thread fixture would certify a block shape the kernel never
+launches.  Its sweep killed 19 of 25, proved the three lane-guard survivors equivalent
+by a +1 counter-mutant rather than by argument, and killed a fourth survivor only after
+the fixture was given the input it was missing -- a warp that HAS candidates and still
+publishes FLT_MAX, which is what tells `countersS[minIBlock] != 0` from "any warp has
+candidates".  A comment in this port asserted those two were the same predicate.  They
+are not.
 P9.83b-5 (9/n) added `gpuslang.npTriTriWrite`, which drives the tail of
 `writePatchesAndContacts` -- the zero-padded block scan, the 64-byte header and the point
 write -- and compares BOTH streams whole against a poison fill, so a port that writes more
@@ -1938,6 +1947,75 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-5 (13/n) — die Block-Kollektive, und eine Äquivalenz, die mein eigener Kommentar behauptet hat und die keine ist
+
+Neu: `pxgSlangTriTriBlock.slang` mit den vier Block-Stücken, auf denen
+`doTriangleTriangleCollision` steht, und `gpuslang.npTriTriBlock` als Fixture —
+Suite **870 → 871** in beiden Speichermodi, 460 → **461** `.spv`.
+
+```
+  threadBlockCountAndBroadcast   reduction.cuh:576-589
+  threadBlockScanExclusive<32>   reduction.cuh:598-621, die DREI-Argument-
+                                 Überladung -- die, die :820 und :938 mit
+                                 countersS aufrufen, nicht die selbst-allozierende
+  minIndex                       nputils.cuh:151-164, in WARP-SHUFFLE-Form
+  der warpübergreifende Seed-Pick  convexMeshMidphase.cu:879-901
+```
+
+**Die Datei ist ein textueller `#include`, kein `import`.** Sie braucht
+`pxgSlangWarpInc`, dessen Emulation `groupshared uint gPxgWarpScratch[PXG_WARP_BLOCK]`
+deklariert — und `PXG_WARP_BLOCK` ist die Blockgröße des **Kernels**, nicht der
+Bibliothek. Ein Slang-`import` übersetzt mit eigenem Präprozessor-Zustand, kann
+den Define also nicht vom Importeur übernehmen, und zwei solche Module trügen je
+ein eigenes Scratch-Array. `npSdfFind.slang` hat diese Form schon festgelegt.
+
+**Eine Workgroup zu 1024 Threads pro Fall.** Alles bisherige in P9.83b war ein
+serieller Rumpf auf unabhängigen Lanes; diese vier sind **Kollektive**, deren
+Antwort von den anderen 1023 Threads abhängt. Auf 64 Threads geprüft hätte die
+Fixture eine Blockform zertifiziert, die der Kernel nie startet — und genau die
+Fehler versteckt, die zu finden sind: ein Per-Warp-Fehler ist unsichtbar, wenn es
+nur einen Warp gibt.
+
+### Der Sweep: 19 + 6 Mutanten, 19 getötet, 3 äquivalent — und alle drei bewiesen
+
+Drei Überlebende der ersten Runde hatten dieselbe Form: `if (lane == 0u)` nach
+Lane 1 verschoben, oder ganz entfernt, sodass alle 32 Lanes schreiben. Das
+Argument dafür ist schnell gesagt — der veröffentlichte Wert ist
+**lane-invariant**, weil `pxgBallotSync` in jeder Lane dieselbe Ballot rechnet.
+
+**Dieses Argument ist nicht der Grund, warum sie als äquivalent verbucht sind.**
+Dieselbe Erklärung würde eine Fixture abgeben, die `gTtbCounters` überhaupt nicht
+sehen kann. Also die Gegenprobe: `count-lane1-publishes-plus-one` und
+`scan-lane1-publishes-plus-one` lassen den Lane-0-Schreibvorgang stehen und legen
+einen **zweiten** mit `perWarpCount + 1u` aus Lane 1 dazu. **Beide werden
+getötet.** Die Fixture sieht den Slot also; welche Lane ihn schreibt, ändert
+nichts daran, was darin landet.
+
+### Der vierte Überlebende war eine Deckungslücke im Kostüm einer Äquivalenz
+
+`seed-gate-any-warp` überlebte — und über ihm stand ein Kommentar von mir, der
+die Äquivalenz **als Tatsache behauptete**: „das Gatter `countersS[minIBlock] != 0`
+ist dasselbe Prädikat wie ‚irgendein Warp hat Kandidaten'". Das Argument: ein
+leerer Warp veröffentlicht `FLT_MAX`, also gewinnt die zweite `minIndex` immer
+einen Warp mit echten Kandidaten, solange es einen gibt.
+
+**Was es übersieht:** ein Warp kann Kandidaten haben **und** `FLT_MAX`
+veröffentlichen — wenn deren Separationen `FLT_MAX` sind. Dann sind alle 32
+Warp-Minima `FLT_MAX`, die Block-`minIndex` bricht den Gleichstand auf dem
+**niedrigsten** Index, und der kann ein **leerer** Warp sein: Zähler null, Gatter
+falsch — während „irgendein Warp hat Kandidaten" wahr ist.
+
+Die erste Fassung der Fixture zog Separationen aus einem endlichen Alphabet, ein
+Warp mit Kandidaten veröffentlichte also immer etwas unter `FLT_MAX`, und die
+beiden Schreibweisen stimmten auf allen 240 Fällen überein. **Der Mutant überlebte,
+und das Überleben ließ die Behauptung bewiesen aussehen.** Mit dem konstruierten
+Fall (Warp 5 hat Kandidaten bei `FLT_MAX`, alle anderen sind leer) **stirbt er**.
+
+Auf den Eingaben der **Engine** fallen die beiden zusammen, weil die Separation
+eines Kandidaten `sep < contactDistance` bestanden hat und endlich ist. Das ist
+eine Vorbedingung des **Aufrufers**, keine Eigenschaft dieser Funktion — der Port
+schreibt deshalb die CUDA-Schreibweise und ist ohne sie korrekt.
 
 ## P9.83b-5 (10-11/n) — der Etat war zweimal unvollständig gemessen, und die Regel darüber war falsch
 
