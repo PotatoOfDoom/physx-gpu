@@ -411,7 +411,11 @@ void triTriSharedProbeSpilled(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_
 //
 // So the spill is FORCED, the same way the narrow staging was forced in 4/n: not
 // chosen because it is tidier, but because the alternative was built and measured
-// and does not fit.  The 36-byte margin was never a margin -- it was smaller than
+// and does not fit.
+// (15a/n: forced only among the reclamations considered THEN -- the fourth, the
+// assignment scratch inside the dead triangleIndicesS, is triTriSharedProbeAliased
+// below, and it fits.  Reclamation 3 above is also a race in the CUDA's shape; see
+// the 14/n correction under the 11/n note.)  The 36-byte margin was never a margin -- it was smaller than
 // the first buffer the port had to add to it, and adding numbers from three
 // measurements would never have shown that.
 //
@@ -421,3 +425,137 @@ void triTriSharedProbeSpilled(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_
 // measures a design that cannot be finished.  The numbers are in
 // tools/groupshared_known.txt.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (15a/n): THE FOURTH RECLAMATION, BUILT -- the assignment scratch
+// inside triangleIndicesS
+// ---------------------------------------------------------------------------
+// 12/n called the spill "forced".  It was forced among the reclamations then
+// considered.  A fourth was not considered: triangleIndicesS (8192 bytes) is
+// written only by the gather (:1073/:1078) and read only at :1082-1083, each
+// thread its own slot, before the per-thread contact body runs.  tryToAssign and
+// createNewPatches run AFTER that read and BEFORE the next iteration's gather, so
+// for their whole lifetime the 8192 bytes are dead -- and they are exactly the
+// window in which tempPointsS (3168), the one-warp stage (512) and the per-warp
+// reduce masks (128) are live.  None of the three is live across a gather:
+// tempPointsS is consumed by reduceContactsSingleWarp before :953/:838's barrier,
+// the stage and the masks inside ttbWarpReduceSerial, which ends on a barrier.
+//
+// NOT aliased, deliberately:
+//   * trianglesToSubdivideS -- written at :1198 and read by the NEXT gather
+//     (sdfCollision.cuh:635-647), so it is live ACROSS the assignment;
+//   * anyKeepS -- its entry value must survive from one tryAssign to the next;
+//   * the patches -- live across iterations, which is the whole point of them.
+//
+// Slang cannot reinterpret one groupshared array as another type, so the index
+// buffer is declared as uint4[512] and the three tenants are views into it:
+//   tempPoint q     slot q            (0..197)   asfloat
+//   stage lane l    slot 198 + l      (198..229) asfloat
+//   reduce mask w   slot 230 + w/4, component w%4  (230..237)
+// and triangle index i is slot i/2, .xy or .zw.
+//
+// Everything else is the WarpEmu layout of 11/n (which measured 34908): the
+// patches in full 128-byte records, countersS, shMinSepS, the subdivision
+// buffer, the SDF record, anyKeepS, offset, the scan's own perWarpCountS (NOT
+// folded into countersS -- that reclamation is a race in the CUDA's shape, 14/n),
+// and the warp scratch, reached through a real ballot and scan.
+//
+// Arithmetic said 34908 - 3168 - 512 = 31228 (the masks cost nothing inside the
+// alias).  MEASURED:
+//
+//   triTriSharedProbeAliased   31228 bytes -- fits, 1540 bytes spare
+//
+// The number is this ENTRY's.  A write tail that keeps the CUDA's thread mapping
+// adds patchStartIndexS[128] (512 B, :697) and createPatchWriterFullThreadBlock's
+// three offsets (12 B, :521-523); shape/transform/mesh staging as the CUDA does it
+// (:1329-1334) adds a few hundred more -- roughly 600 bytes spare in the worst
+// case.  The serial tail (ttpPatchStartIndices on thread 0) needs no
+// patchStartIndexS in Workgroup storage.  The real entry is measured in P9.83b-8.
+//
+// Why this replaces the spill, beyond fitting: the spill had no way to receive its
+// address (the push blob is exactly the CUDA's kernel parameters, and the shim
+// refuses any other size), a per-workgroup region keyed by WorkGroupID would be
+// exclusive only because llvmpipe runs dispatches in order, and thread-0 ownership
+// of a non-coherent BDA array would have had to reach into the write tail, which
+// the CUDA reads from up to 768 threads.  In Workgroup storage none of that exists.
+groupshared uint4 gTriIdxAlias[512];
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void triTriSharedProbeAliased(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    const uint t = gtid.x;
+
+    if (t == 0u)
+    {
+        gNumTrianglesToSubdivide = 0u;
+        gAnyKeep = 0u;
+        gFindOffset = 0u;
+        gSdfTexture.sdfBoxLower = float3(0, 0, 0);
+        gSdfTexture.sdfDx = 1.0f;
+        gSdfTexture.sdfBoxHigher = float3(1, 1, 1);
+        gSdfTexture.invSdfDx = 1.0f;
+        gSdfTexture.texture = 0u;
+        gSdfTexture.textureSubgrids = 0u;
+        gSdfTexture.coarseSize = uint3(1, 1, 1);
+        gSdfTexture.subgridSize = 0u;
+        gSdfTexture.subgridStartSlots = 0UL;
+        gSdfTexture.fineToCoarse = 1.0f;
+        gSdfTexture.sdfDims = uint4(1, 1, 1, 0);
+        gSdfTexture.subgridsMinSdfValue = 0.0f;
+        gSdfTexture.subgridsSdfValueRange = 1.0f;
+    }
+    if (t < 32u) { gCounters[t] = t; gMinSep[t] = float(t); gScanPerWarpCount[t] = t; }
+    for (uint p = t; p < MAX_MESH_MESH_PATCHES2; p += 1024u)
+    {
+        for (uint k = 0; k < MESH_MESH_CONTACT_LIMIT; ++k)
+            gPatches[p].keepPoints[k] = float4(float(k), 0, 0, 0);
+        gPatches[p].normal = float3(0, 1, 0);
+        gPatches[p].deepest = 0.0f;
+        gPatches[p].pointCount = 0u;
+    }
+    // The gather's view: triangle index t, two per slot.
+    if ((t & 1u) == 0u) gTriIdxAlias[t >> 1].xy = uint2(t, 0u);
+    else                gTriIdxAlias[t >> 1].zw = uint2(t, 0u);
+    for (uint r = t; r < 256u; r += 1024u)
+        gTrianglesToSubdivide[r] = uint2(r, 0u);
+
+    GroupMemoryBarrierWithGroupSync();
+    const uint tri = ((t & 1u) == 0u) ? gTriIdxAlias[t >> 1].x : gTriIdxAlias[t >> 1].z;
+    GroupMemoryBarrierWithGroupSync();
+
+    // The assignment's views, written only after every thread has read its index.
+    for (uint q = t; q < 33u * MESH_MESH_CONTACT_LIMIT; q += 1024u)
+        gTriIdxAlias[q] = asuint(float4(float(q), 0, 0, 0));                  // tempPointsS
+    if (t < 32u)
+        gTriIdxAlias[198u + t] = asuint(float4(float(t), 0, 0, 0));           // one-warp stage
+    if (t < 32u)
+        gTriIdxAlias[230u + (t >> 2)][t & 3u] = t;                              // reduce masks
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint ballot = pxgBallotSync(PXG_FULL_MASK, t, (t & 3u) == 0u);
+    const uint rank = pxgWarpScanAddInclusiveU(PXG_FULL_MASK, t, ballot & 1u, 5u);
+
+    if (dtid.x < gP.numItems)
+    {
+        gOut[dtid.x] = gCounters[t & 31u] + uint(gMinSep[t & 31u])
+                     + tri + gNumTrianglesToSubdivide + gAnyKeep
+                     + gFindOffset + gScanPerWarpCount[t & 31u]
+                     + uint(gPatches[t & 127u].keepPoints[0].x)
+                     + uint(gPatches[t & 127u].normal.y) + uint(gPatches[t & 127u].deepest)
+                     + gPatches[t & 127u].pointCount
+                     + uint(asfloat(gTriIdxAlias[t % 198u].x))
+                     + uint(asfloat(gTriIdxAlias[198u + (t & 31u)].x))
+                     + gTriIdxAlias[230u + ((t & 31u) >> 2)][t & 3u]
+                     + gTrianglesToSubdivide[t & 255u].x
+                     + uint(gSdfTexture.sdfBoxLower.x) + uint(gSdfTexture.sdfDx)
+                     + uint(gSdfTexture.sdfBoxHigher.x) + uint(gSdfTexture.invSdfDx)
+                     + gSdfTexture.texture + gSdfTexture.textureSubgrids
+                     + gSdfTexture.coarseSize.x + gSdfTexture.subgridSize
+                     + uint(gSdfTexture.subgridStartSlots) + uint(gSdfTexture.fineToCoarse)
+                     + gSdfTexture.sdfDims.x + uint(gSdfTexture.subgridsMinSdfValue)
+                     + uint(gSdfTexture.subgridsSdfValueRange)
+                     + pxgPopc(ballot) + rank;
+    }
+}

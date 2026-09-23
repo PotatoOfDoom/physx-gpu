@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **872/872** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-5 (15a/n) built the fourth Workgroup reclamation for the mesh-mesh kernel --
+tempPointsS, the one-warp stage and the reduce masks inside the dead triangleIndicesS --
+and measured it at 31228 bytes (1540 spare).  The patches stay in Workgroup storage; the
+spill, which had no way to receive its address, is off the table.
 P9.84 added `gpuslang.shimBindless`: the first launch of a set-1 (SDF-sampling) kernel
 through the ENGINE's pipeline door, PxgCudaShim.  Before the fix that door built a set-0
 layout and llvmpipe SEGFAULTED in vkCreateComputePipelines -- the first launch of any of
@@ -1961,6 +1965,94 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-5 (15a/n) — die vierte Rückgewinnung, gebaut und gemessen: 31228 Bytes, und die Auslagerung ist vom Tisch
+
+14/n hat festgehalten, dass die Auslagerung von `patchesS` (12/n) nur unter den **damals
+betrachteten** Rückgewinnungen erzwungen war. Die vierte ist jetzt ein Entry Point,
+`triTriSharedProbeAliased`, und der Prüfer liest die Zahl aus dem SPIR-V:
+
+```
+  triTriSharedProbeAliased   31228 Bytes  -- passt, 1540 Bytes frei
+```
+
+Genau die Rechnung (34908 − 3168 − 512; die Reduce-Masken kosten im Alias nichts) — und
+diesmal ist die Übereinstimmung eine Messung, weil der Entry **alle** Puffer des
+WarpEmu-Layouts aus 11/n trägt, den Warp-Scratch über ein echtes Ballot und einen echten
+Scan erreicht und das eigene `perWarpCountS` des Scans **behält** (dessen Faltung in
+`countersS` ist in der CUDA-Form ein Race, 14/n).
+
+### Was im toten Index-Puffer wohnt, und warum es dort sein darf
+
+`triangleIndicesS` (8192 Bytes) wird nur vom Gather geschrieben (`:1073`/`:1078`) und nur
+bei `:1082-1083` gelesen, jeder Thread seinen eigenen Slot, bevor der Kontaktrumpf läuft.
+`tryToAssign` und `createNewPatches` laufen **danach** und **vor** dem nächsten Gather —
+während ihrer ganzen Lebenszeit sind die 8192 Bytes tot, und genau in diesem Fenster leben:
+
+| Mieter | Bytes | Lebenszeit |
+|---|---|---|
+| `tempPointsS` | 3168 | gefüllt bei `:829`/`:835` bzw. `:942`, verbraucht von `reduceContactsSingleWarp` (`:843`/`:951`) vor der Barriere `:858`/`:953` |
+| Ein-Warp-Stage | 512 | innerhalb `ttbWarpReduceSerial`, das mit einer Barriere endet |
+| Per-Warp-Reduce-Masken | 128 | dito |
+
+Slang kann ein Groupshared-Array nicht als anderen Typ lesen, also ist der Puffer
+`uint4[512]` und die Mieter sind Sichten darauf.
+
+**Ausdrücklich NICHT im Alias:** `trianglesToSubdivideS` — bei `:1198` geschrieben und vom
+**nächsten** Gather gelesen (sdfCollision.cuh:635-647), also **über** die Zuordnung hinweg
+lebendig; `anyKeepS` — sein Eintrittswert muss von einem `tryAssign` zum nächsten
+überleben; und die Patches selbst, die über Iterationen leben.
+
+### Warum das die Auslagerung ablöst — nicht nur, weil es passt
+
+Das Review des 15/n-Entwurfs (vier Linsen plus Skeptiker) hat an der Auslagerung drei
+Dinge gefunden, die der Alias nicht hat:
+
+1. **Es gibt keinen Weg, der Auslagerung ihre Adresse zu geben.** Die Bridge baut den
+   Push-Blob nur aus den Kernel-Parametern der CUDA (PxgNarrowphaseCore.cpp:1422-1450,
+   PxgVulkanCudaContext.cpp:443-456), und der Shim verweigert jeden Blob, dessen Größe
+   nicht der Manifestzeile entspricht. Ein zusätzlicher Zeiger bräuchte Engine-Code oder
+   einen Bridge-eigenen Puffer — beides gibt es nicht.
+2. **Eine persistente Region pro Workgroup wäre nur auf llvmpipe exklusiv.** Der
+   Engine-Pfad zeichnet Dispatches ohne Compute-zu-Compute-Barriere dazwischen auf; eine
+   nach `WorkGroupID` geschlüsselte Region gehört einer Workgroup nur, weil llvmpipe
+   Dispatches der Reihe nach ausführt.
+3. **Thread-0-Besitz müsste bis in den Schreib-Schwanz reichen**, den die CUDA aus bis zu
+   768 Threads liest (`:700-701`, `:726-734`, `:736-745`) — über nicht-kohärente BDA-Zeiger.
+
+Mit den Patches im Workgroup-Speicher fällt alles drei weg: die CUDA-Threadabbildung darf
+bleiben, `GroupMemoryBarrierWithGroupSync` ordnet alles, und der 15/n-Entwurf verliert
+seine Broadcast-Slots.
+
+### Die Reserve ist kleiner, als die Zahl aussieht
+
+1540 Bytes gelten für das Layout **dieses** Entries. Behält der Schreib-Schwanz die
+CUDA-Abbildung, kommen `patchStartIndexS[128]` (512 Bytes, `:697`) und die drei Offsets
+von `createPatchWriterFullThreadBlock` (12 Bytes, `:521-523`) dazu; staged der Kernel
+Shapes, Transforms und Meshes wie die CUDA (`:1329-1334`), noch einmal einige hundert.
+Das Review schätzt ~32168 — **etwa 600 Bytes** Reserve. Der serielle Schwanz
+(`ttpPatchStartIndices` auf Thread 0) braucht `patchStartIndexS` nicht im Workgroup-Speicher,
+und `triTriOverlapBda` staged nichts. Gemessen wird am echten Entry, in P9.83b-8.
+
+### Und eine Folge für P9.83b-8, die hier zuerst sichtbar wurde
+
+Der vorhandene Gather `sdfFindInterestingTrianglesEx` hat **keinen** Unterteilungsstrom
+(pxgSlangSdfFind.slang:403-438) — für `femCloth` richtig, dort ist Unterteilung tot. In
+`doTriangleTriangleCollision` ist sie **lebendig**: ein Mesh ohne SDF setzt
+`needsRefinement`, `addToRefinementBuffer` füllt `trianglesToSubdivideS` (`:1198`), und der
+nächste Gather muss es lesen. Mit dem vorhandenen Gather würden diese Unterdreiecke nie
+getestet. P9.83b-8 braucht also eine **neue** Gather-Variante, und deren Index-Puffer ist
+der Alias.
+
+Neuer Ratchet-Eintrag `npTriTriSharedProbe:triTriSharedProbeAliased 31228` — und
+gegengeprüft: ohne die Zeile schlägt `gpuslang.groupshared` fehl (`NEW … 31228`), mit ihr
+ist er grün. Dieselbe Zahl kam vorher aus einer Übersetzung außerhalb des Baums (gleicher
+`slangc`, gleiche Flags), und die drei bestehenden Entries reproduzierten dabei ihre
+eingetragenen Werte.
+
+Kein Mutations-Sweep: der Probe rechnet nichts, seine einzige Aussage ist die Byte-Zahl,
+und die bewacht der Ratchet. Keine Szenen: kein Engine-Code, kein Engine-Shader. Suite
+**872/872** in **beiden** Speichermodi, 461 `.spv`.
 
 ## P9.84 — der Engine-Pfad hat das SDF-Textur-Set nie gebunden, und vor dem Fix stirbt der Prozess
 

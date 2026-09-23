@@ -126,3 +126,10 @@ solverTGS:solveWholeIslandTGS    31744
 # Both over-limit entry points were deleted, same as the wide-stage one.
 npTriTriSharedProbe:triTriSharedProbe    30300
 npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812
+# P9.83b-5 (15a/n): the fourth reclamation, BUILT -- tempPointsS, the one-warp
+# stage and the per-warp reduce masks inside the 8192-byte triangleIndicesS, which
+# is dead for the whole of tryToAssign/createNewPatches (written :1073/:1078, read
+# :1082-1083).  Everything else is the WarpEmu layout of 11/n, warp scratch and the
+# scan's own perWarpCountS included.  Fits with 1540 spare; the write tail and any
+# shape staging would take up to ~950 of that -- measured on the real entry later.
+npTriTriSharedProbe:triTriSharedProbeAliased    31228
