@@ -66,6 +66,13 @@
 // claim under test -- it is what the warp-emulated reduction needs and the serial
 // one does not.
 
+// P9.83b-5 (11/n): the warp-emulation scratch, at this kernel's block size.  The
+// third entry point below is the only one that calls into it, so the first two
+// measurements are unchanged -- Workgroup storage is charged per entry point by
+// reachability, which P9.83b-5 (10/n) measured directly.
+#define PXG_WARP_BLOCK 1024
+#include "pxgSlangWarpInc.slang"
+
 import pxgSlangSdfTexture;
 
 static const uint MAX_MESH_MESH_PATCHES2 = 128u;
@@ -234,4 +241,124 @@ void triTriSharedProbeNarrowStage(uint3 dtid : SV_DispatchThreadID, uint3 gtid :
     GroupMemoryBarrierWithGroupSync();
     if (dtid.x < gP.numItems)
         gOut[dtid.x] += uint(gWarpStageSmall[gtid.x & 31u].x);
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (11/n): THE BUFFER THE FIRST TWO MEASUREMENTS STILL DID NOT CARRY
+// ---------------------------------------------------------------------------
+// The note at the head of this file says gPxgWarpScratch is left out deliberately,
+// "because it is what the warp-emulated reduction needs and the serial one does
+// not".  That is true of the REDUCTION and FALSE OF THE KERNEL.
+// doTriangleTriangleCollision has block collectives that have nothing to do with
+// contactReduce2, and every one of them goes through the emulation:
+//
+//   :786   __ballot_sync(FULL_MASK, accept)
+//   :812   threadBlockCountAndBroadcast(accept2, countersS)
+//   :820   threadBlockScanExclusive<32>(threadEmitsElement, ...)
+//   :890   __ballot_sync(FULL_MASK, contact.candidateContact)
+//   :894   minIndex(minSep, candidateMask, minSep)        -- five shuffles
+//   :899   minIndex(minSep, FULL_MASK, minSep)            -- five more
+//   :1203  threadBlockCountAndBroadcast(contact.candidateContact, countersS)
+//
+// They are all block-uniform, so the emulation is legal -- and its scratch is
+// sized by PXG_WARP_BLOCK, which for this 1024-thread block is 1024 uints.  The
+// native subgroup path would make it vanish, and it is NOT available here:
+// npWarpNative.slang records that CI's llvmpipe has a fixed subgroup size of 8,
+// while the 32-lane CUDA semantics need requiredSubgroupSize == 32.  On this
+// device the 4096 bytes are not optional.
+//
+// MEASURED, as an entry point that calls a warp primitive so the scratch lands in
+// its SPIR-V interface list:
+//
+//   triTriSharedProbeWarpEmu   34908 bytes -- OVER THE LIMIT BY 2140
+//
+// The entry point has been DELETED for the same reason the wide-stage one was: an
+// entry that is over the limit by construction makes gpuslang.groupshared fail for
+// the whole corpus, so its number belongs in this note and in
+// tools/groupshared_known.txt rather than in a shader that cannot be built into a
+// pipeline.  Leaving gPxgWarpScratch out of the first two measurements was the
+// same kind of partial measurement P9.83b-4 already corrected once, when it found
+// `offset` and `perWarpCountS` missing: a probe that measures eleven of twelve
+// buffers reads exactly like a complete one.
+//
+// ---------------------------------------------------------------------------
+// P9.83b-5 (11/n): THE SPILL, MEASURED BESIDE THE PACKING TRICKS
+// ---------------------------------------------------------------------------
+// triTriSharedProbeWarpEmu is OVER the limit, so something has to go.  The three
+// reclamations that keep every buffer in Workgroup storage were added up before
+// they were measured, and together they are 2176 against a 2140-byte deficit --
+// 36 bytes of headroom, which is a number nobody should build on:
+//
+//   gPatches 16384 -> 14848   pointCount out of the struct, so 6*float4 + float4
+//                             lands exactly on 112 instead of rounding 120 to 128
+//   gWarpStageSmall 512 -> 0  the per-warp stage is live strictly BEFORE
+//                             tempPointsS is written (:810 vs :828), so it can be
+//                             the first 32 slots of gTempPoints
+//   gScanPerWarpCount 128 -> 0 findInterestingTrianglesA's scan finishes before
+//                             countersS is first used in the same iteration
+//
+// This entry point measures the OTHER answer: leave every buffer alone and put
+// patchesS in a device-side per-workgroup scratch allocation instead.  It is the
+// CUDA's largest shared array by a factor of two and the only one that is written
+// by one warp and read by all -- so it is also the one whose move costs a
+// barrier upgrade, from GroupMemoryBarrierWithGroupSync to
+// AllMemoryBarrierWithGroupSync, at every point where the CUDA has __syncthreads.
+// That upgrade is the price, and it is a real one: it is stated here so the choice
+// is made on two measured numbers rather than on which trick was thought of first.
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void triTriSharedProbeSpilled(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    const uint t = gtid.x;
+
+    if (t == 0u)
+    {
+        gNumTrianglesToSubdivide = 0u;
+        gAnyKeep = 0u;
+        gFindOffset = 0u;
+        gSdfTexture.sdfBoxLower = float3(0, 0, 0);
+        gSdfTexture.sdfDx = 1.0f;
+        gSdfTexture.sdfBoxHigher = float3(1, 1, 1);
+        gSdfTexture.invSdfDx = 1.0f;
+        gSdfTexture.texture = 0u;
+        gSdfTexture.textureSubgrids = 0u;
+        gSdfTexture.coarseSize = uint3(1, 1, 1);
+        gSdfTexture.subgridSize = 0u;
+        gSdfTexture.subgridStartSlots = 0UL;
+        gSdfTexture.fineToCoarse = 1.0f;
+        gSdfTexture.sdfDims = uint4(1, 1, 1, 0);
+        gSdfTexture.subgridsMinSdfValue = 0.0f;
+        gSdfTexture.subgridsSdfValueRange = 1.0f;
+    }
+    if (t < 32u) { gCounters[t] = t; gMinSep[t] = float(t); gScanPerWarpCount[t] = t; }
+    for (uint q = t; q < 33u * MESH_MESH_CONTACT_LIMIT; q += 1024u)
+        gTempPoints[q] = float4(float(q), 0, 0, 0);
+    gTriangleIndices[t] = uint2(t, 0u);
+    for (uint r = t; r < 256u; r += 1024u)
+        gTrianglesToSubdivide[r] = uint2(r, 0u);
+    if (t < 32u) gWarpStageSmall[t] = float4(float(t), 0, 0, 0);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint ballot = pxgBallotSync(PXG_FULL_MASK, t, (t & 3u) == 0u);
+    const uint rank = pxgWarpScanAddInclusiveU(PXG_FULL_MASK, t, ballot & 1u, 5u);
+
+    if (dtid.x < gP.numItems)
+    {
+        gOut[dtid.x] = gCounters[t & 31u] + uint(gMinSep[t & 31u])
+                     + gTriangleIndices[t].x + gNumTrianglesToSubdivide + gAnyKeep
+                     + gFindOffset + gScanPerWarpCount[t & 31u]
+                     + uint(gTempPoints[t % 198u].x)
+                     + gTrianglesToSubdivide[t & 255u].x
+                     + uint(gWarpStageSmall[t & 31u].x)
+                     + uint(gSdfTexture.sdfBoxLower.x) + uint(gSdfTexture.sdfDx)
+                     + uint(gSdfTexture.sdfBoxHigher.x) + uint(gSdfTexture.invSdfDx)
+                     + gSdfTexture.texture + gSdfTexture.textureSubgrids
+                     + gSdfTexture.coarseSize.x + gSdfTexture.subgridSize
+                     + uint(gSdfTexture.subgridStartSlots) + uint(gSdfTexture.fineToCoarse)
+                     + gSdfTexture.sdfDims.x + uint(gSdfTexture.subgridsMinSdfValue)
+                     + uint(gSdfTexture.subgridsSdfValueRange)
+                     + pxgPopc(ballot) + rank;
+    }
 }

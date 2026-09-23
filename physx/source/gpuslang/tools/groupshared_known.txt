@@ -72,5 +72,31 @@ solverTGS:solveWholeIslandTGS    31744
 # site.  The wide entry point was deleted after it was measured -- an entry point
 # over the limit by construction fails this checker for the whole corpus, and a
 # number belongs in this file, not in a shader nobody can compile.
+#
+# P9.83b-5 (11/n): AND NEITHER OF THE TWO NUMBERS ABOVE CARRIES gPxgWarpScratch.
+# The note above leaves it out "because the serial reduction does not need it".
+# True of the reduction, false of the kernel: doTriangleTriangleCollision has seven
+# block collectives that have nothing to do with contactReduce2 (two ballots, two
+# minIndex calls at five shuffles each, two threadBlockCountAndBroadcast, one
+# threadBlockScanExclusive), and in Slang every one of them goes through the
+# emulation, whose scratch is PXG_WARP_BLOCK uints -- 4096 bytes at this block
+# size.  The native subgroup path would remove it and is not available: CI's
+# llvmpipe has a fixed subgroup size of 8 and the 32-lane CUDA semantics need 32.
+#
+#   with gPxgWarpScratch, every CUDA buffer in Workgroup storage
+#                                              34908 bytes -- OVER BY 2140
+#   with patchesS spilled to a device-side per-workgroup allocation
+#                                              18524 bytes -- 14244 spare
+#
+# Three reclamations that would keep everything in Workgroup storage come to 2176
+# against the 2140 deficit -- gPatches 16384 -> 14848 by moving pointCount out of
+# the struct so 6*float4 + float4 lands exactly on 112; gWarpStageSmall 512 -> 0 by
+# reusing the first 32 slots of tempPointsS, which is written only AFTER the stage
+# is dead (:810 vs :828); gScanPerWarpCount 128 -> 0 by sharing countersS, whose
+# first use follows findInterestingTrianglesA in the same iteration.  36 bytes of
+# headroom is not a margin anybody should build on, which is why the spill is
+# measured beside them rather than after them.
+#
+# The over-limit entry point was deleted, same as the wide-stage one.
 npTriTriSharedProbe:triTriSharedProbe    30300
 npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812

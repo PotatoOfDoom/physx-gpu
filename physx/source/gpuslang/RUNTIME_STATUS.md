@@ -1939,6 +1939,73 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-5 (10-11/n) — der Etat war zweimal unvollständig gemessen, und die Regel darüber war falsch
+
+Zwei Messungen, beide entscheiden die Form des restlichen Ports.
+
+### 10/n — ein Modul **darf** Groupshared besitzen
+
+Der Kopf von `pxgSlangTriTriPatch` behauptete, ein Modul, das Groupshared
+deklariert, lasse **jeden Importeur** dafür zahlen, und bei 30300 von 32768 Bytes
+sei damit entschieden, dass der Mesh-gegen-Mesh-Kernel nicht übersetzbar ist.
+**Beide Hälften sind falsch.** Gemessen, nicht argumentiert: ein 4096-Byte-Array
+im Modul hinter einer öffentlichen Funktion, `npTriTriWrite` zweimal übersetzt —
+
+| | `ttrScan` | `ttrWrite` |
+|---|---|---|
+| niemand ruft sie auf | 0 | 0 |
+| `ttrScan` ruft sie auf | **4096** | **0** |
+
+Workgroup-Speicher wird **pro Entry Point nach Erreichbarkeit** verrechnet — nicht
+pro Modul, nicht einmal pro Datei: zwei Entry Points in **einer** `.spv` zahlen
+verschieden für dieselbe Deklaration. Damit dürfen der Blockscan und der
+Warp-Staging-Puffer im Modul leben.
+
+### 11/n — und der Etat trug den Puffer nicht, den die Emulation braucht
+
+Die Notiz im Probe sagt, `gPxgWarpScratch` werde absichtlich weggelassen, „weil
+die serielle Reduktion ihn nicht braucht". Das stimmt für die **Reduktion** und
+ist **falsch für den Kernel**. `doTriangleTriangleCollision` hat sieben
+Block-Kollektive, die mit `contactReduce2` nichts zu tun haben — zwei Ballots
+(`:786`, `:890`), zwei `minIndex` zu je fünf Shuffles (`:894`, `:899`), zwei
+`threadBlockCountAndBroadcast` (`:812`, `:1203`) und einen
+`threadBlockScanExclusive` (`:820`). Alle sind blockuniform, dürfen die Emulation
+also benutzen — und deren Scratch ist `PXG_WARP_BLOCK` uints, bei diesem Block
+**4096 Bytes**. Der native Subgruppen-Pfad würde ihn verschwinden lassen und steht
+hier nicht zur Verfügung: `npWarpNative.slang` hält fest, dass llvmpipe eine feste
+Subgruppengröße von **8** hat, während die 32-Lane-CUDA-Semantik 32 verlangt.
+
+Gemessen, als Entry Point, der ein Warp-Primitiv aufruft (sonst steht der Scratch
+nicht in der SPIR-V-Interface-Liste):
+
+```
+  triTriSharedProbeWarpEmu    34908 Bytes  -- ÜBER DEM LIMIT UM 2140
+  triTriSharedProbeSpilled    18524 Bytes  -- 14244 frei
+```
+
+Das ist **dieselbe Art unvollständiger Messung**, die P9.83b-4 schon einmal
+korrigiert hat, als `offset` und `perWarpCountS` fehlten: ein Probe, der elf von
+zwölf Puffern misst, liest sich genau wie ein vollständiger.
+
+**Die Alternative wurde daneben gemessen, nicht danach.** Drei Rückgewinnungen,
+die alles im Workgroup-Speicher lassen, ergeben zusammen 2176 gegen ein Defizit
+von 2140 — `gPatches` 16384 → 14848 (`pointCount` aus der Struktur, damit
+6×`float4` + `float4` exakt auf 112 fällt statt 120 auf 128 zu runden),
+`gWarpStageSmall` 512 → 0 (die Staging-Slots sind tot, bevor `tempPointsS`
+geschrieben wird, `:810` gegen `:828`), `gScanPerWarpCount` 128 → 0 (der Scan in
+`findInterestingTrianglesA` ist fertig, bevor `countersS` in derselben Iteration
+zum ersten Mal benutzt wird). **36 Bytes Reserve** ist keine Marge, auf der
+jemand bauen sollte — deshalb steht die Auslagerung von `patchesS` in eine
+gerätesetzige Per-Workgroup-Allokation als gemessene Zahl daneben und nicht als
+Notlösung danach. Ihr Preis ist benannt: jede `__syncthreads`-Stelle, die
+`patchesS` überspannt, wird von `GroupMemoryBarrierWithGroupSync` zu
+`AllMemoryBarrierWithGroupSync`.
+
+Der Entry Point über dem Limit ist **gelöscht** — genau wie der Wide-Stage-Entry
+aus 4/n: ein Entry, der konstruktionsbedingt über dem Limit liegt, lässt
+`gpuslang.groupshared` für das **ganze** Korpus fehlschlagen. Seine Zahl steht in
+`tools/groupshared_known.txt`, wo eine Zahl hingehört.
+
 ## P9.83b-5 (9/n) — der Schreib-Schwanz der Mesh-gegen-Mesh-Kollision, und eine Vertauschung, die nur zwei Worte sehen können
 
 `writePatchesAndContacts` (convexMeshMidphase.cu:673-751) ist portiert: der

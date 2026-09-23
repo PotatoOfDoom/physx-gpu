@@ -285,7 +285,7 @@ pxg_compile_shader(npTriTriOverlap triTriOverlap)
 # pass with both implemented identically, which is what the four pre-existing
 # transcriptions of contactReduceShared all were.
 pxg_compile_shader(npCrsWrapper2 crsWrapperPair)
-pxg_compile_shader(npTriTriSharedProbe triTriSharedProbe triTriSharedProbeNarrowStage)
+pxg_compile_shader(npTriTriSharedProbe triTriSharedProbe triTriSharedProbeNarrowStage triTriSharedProbeSpilled)
 pxg_compile_shader(npTriTriReduce ttrReduce)
 pxg_compile_shader(npTriTriAccept ttrAccept ttrReserve)
 pxg_compile_shader(npTriTriWrite ttrScan ttrWrite)
