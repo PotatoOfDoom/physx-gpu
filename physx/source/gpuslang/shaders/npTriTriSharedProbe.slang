@@ -252,13 +252,13 @@ void triTriSharedProbeNarrowStage(uint3 dtid : SV_DispatchThreadID, uint3 gtid :
 // doTriangleTriangleCollision has block collectives that have nothing to do with
 // contactReduce2, and every one of them goes through the emulation:
 //
-//   :786   __ballot_sync(FULL_MASK, accept)
+//   :788   __ballot_sync(FULL_MASK, accept)
 //   :812   threadBlockCountAndBroadcast(accept2, countersS)
 //   :820   threadBlockScanExclusive<32>(threadEmitsElement, ...)
-//   :890   __ballot_sync(FULL_MASK, contact.candidateContact)
-//   :894   minIndex(minSep, candidateMask, minSep)        -- five shuffles
+//   :881   __ballot_sync(FULL_MASK, contact.candidateContact)
+//   :885   minIndex(minSep, candidateMask, minSep)        -- five shuffles
 //   :899   minIndex(minSep, FULL_MASK, minSep)            -- five more
-//   :1203  threadBlockCountAndBroadcast(contact.candidateContact, countersS)
+//   :1202  threadBlockCountAndBroadcast(contact.candidateContact, countersS)
 //
 // They are all block-uniform, so the emulation is legal -- and its scratch is
 // sized by PXG_WARP_BLOCK, which for this 1024-thread block is 1024 uints.  The

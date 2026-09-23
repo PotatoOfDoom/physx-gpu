@@ -53,6 +53,10 @@
 //
 // No NoContraction stamp, for the reason in testNpCrsWrapper2.cpp.
 
+// ttbWarpReduceSerial calls crsContactReduce2, which lives in this MODULE; the
+// block file is a textual include and cannot import it on its includer's behalf.
+import pxgSlangContactReduceSerial;
+
 #define PXG_WARP_BLOCK 1024
 #include "pxgSlangWarpInc.slang"
 #include "pxgSlangTriTriBlock.slang"
@@ -103,7 +107,7 @@ void ttbProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     const uint offset = ttbBlockScanExclusive(tid, bitB, totalSum);
     GroupMemoryBarrierWithGroupSync();
 
-    // :890 -- candidateMask, then the seed pick.
+    // :881 -- candidateMask, then the seed pick.
     const uint candidateMask = pxgBallotSync(PXG_FULL_MASK, tid, bitC);
     uint minI;
     const TtbSeed seed = ttbBlockSeedSelect(tid, sep, candidateMask, minI);
@@ -126,4 +130,47 @@ void ttbProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         o[70u + warp] = candidateMask;
     }
     o[102u + tid] = offset;
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (14/n): ttbWarpReduceSerial, the per-warp contactReduce2 of :810/:931.
+// ---------------------------------------------------------------------------
+// Same push struct, its own case layout (16656 bytes):
+//   @0      float4 pts[1024]    xyz = position, w = separation
+//   @16384  uint   masks[32]    first call's per-warp input mask
+//   @16512  uint   masks2[32]   second call's per-warp input mask
+//   @16640  float4 normalBias   xyz = patch normal, w = clusterBias
+//
+// TWO CALLS BACK TO BACK, with different masks.  The first exercises the staging;
+// the second exists for the trailing barrier and the slot reuse -- the result of
+// call one and the input of call two travel through the same gTtbReduceMask slot.
+//
+// EVERY THREAD writes its own copy of the result, not lane 0 alone: the property
+// under test is that warp w's answer reaches all 32 of warp w's lanes, and a
+// fixture that read one lane per warp would pass a broadcast that reached one.
+static const uint TTB_RED_CASE_STRIDE = 16656u;
+static const uint TTB_RED_OUT_STRIDE = 2048u;   // uints
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void ttbReduceProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    const uint c = gid.x;
+    if (c >= gTb.numCases) return;
+
+    const uint tid = gtid.x;
+    const uint warp = tid >> 5;
+
+    const uint64_t base = gTb.cases + uint64_t(c) * uint64_t(TTB_RED_CASE_STRIDE);
+    const float4 p = Ptr<float4>(base)[tid];
+    const uint mask1 = Ptr<uint>(base + 16384UL)[warp];
+    const uint mask2 = Ptr<uint>(base + 16512UL)[warp];
+    const float4 nb = Ptr<float4>(base + 16640UL)[0];
+
+    const uint r1 = ttbWarpReduceSerial(tid, p.xyz, p.w, nb.xyz, mask1, nb.w);
+    const uint r2 = ttbWarpReduceSerial(tid, p.xyz, p.w, nb.xyz, mask2, nb.w);
+
+    Ptr<uint> o = Ptr<uint>(gTb.out + uint64_t(c) * uint64_t(TTB_RED_OUT_STRIDE) * 4UL);
+    o[tid] = r1;
+    o[1024u + tid] = r2;
 }

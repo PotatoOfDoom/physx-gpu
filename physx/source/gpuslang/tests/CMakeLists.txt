@@ -289,7 +289,7 @@ pxg_compile_shader(npTriTriSharedProbe triTriSharedProbe triTriSharedProbeNarrow
 pxg_compile_shader(npTriTriReduce ttrReduce)
 pxg_compile_shader(npTriTriAccept ttrAccept ttrReserve)
 pxg_compile_shader(npTriTriWrite ttrScan ttrWrite)
-pxg_compile_shader(npTriTriBlock ttbProbe)
+pxg_compile_shader(npTriTriBlock ttbProbe ttbReduceProbe)
 pxg_compile_shader(npCvxTriNpSetup cvxTriNpSetup)
 pxg_compile_shader(npCvxHfNpSetup cvxHfNpSetup)
 pxg_compile_shader(npCvxCoreOut ccoWriteContacts ccoWriteContact)

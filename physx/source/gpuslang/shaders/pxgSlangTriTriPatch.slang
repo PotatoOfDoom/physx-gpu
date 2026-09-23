@@ -339,7 +339,7 @@ public TtpReduceResult ttpReduceContactsSerial(float4 tempPoints[198], uint tota
 //
 // THE ACCEPT/ACCEPT2 SPLIT IS NOT A REFINEMENT OF ONE TEST EITHER.  accept (tight)
 // decides who enters the REDUCTION; accept2 (loose) decides who is CONSUMED --
-// counted into nbUsed (:812) and retired by markAsProcessed (:845, :959).  So a
+// counted into nbUsed (:812) and retired by markAsProcessed (:845-846, :959-960).  So a
 // contact whose normal is within 0.85 but not within 0.9995 of the patch normal is
 // eaten and contributes nothing, deliberately: the comment at :785-786 says moving
 // the definition to work on accept2 "will cause artificial friction".
@@ -725,13 +725,13 @@ public void ttpWriteContactPatch(uint64_t patchStreamAddr, uint patchByteOffset,
 // FOUR THINGS IN THE CUDA ARE NOT OBVIOUS, AND ALL FOUR ARE TRANSCRIBED HERE.
 //
 // 1. THE SCAN IS OVER THE BLOCK, NOT OVER THE PATCHES.
-//    :703 runs threadBlockScanExclusive<NbWarps> over every thread, with
-//    count = 0 for threadIdx.x >= numPatchesToKeep (:698-700).  A zero-padded
+//    :706 runs threadBlockScanExclusive<NbWarps> over every thread, with
+//    count = 0 for threadIdx.x >= numPatchesToKeep (:699-701).  A zero-padded
 //    exclusive scan has the same prefix on its live prefix as a scan of the live
 //    entries alone, so ttpPatchStartIndices computes the short one and returns the
 //    same totalSum.  Entries at or past numPatchesToKeep hold totalSum and are
 //    never read -- both write loops are guarded by `< numPatchesToKeep`.
-//    The CUDA stores only the first MAX_MESH_MESH_PATCHES2 lanes (:704-705); the
+//    The CUDA stores only the first MAX_MESH_MESH_PATCHES2 lanes (:707-708); the
 //    rest of the block's ids are discarded, which is why the padding is free.
 //
 // 2. THE POINT WRITE HAS NO LOOP, SO IT IS A blockDim CONSTRAINT.

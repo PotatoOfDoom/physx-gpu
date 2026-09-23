@@ -28,7 +28,7 @@
 //
 //   The BLOCK collectives of doTriangleTriangleCollision: the two reduction.cuh
 //   helpers it calls, the warp minIndex its patch seeding is built on, and the
-//   cross-warp seed pick at convexMeshMidphase.cu:886-899.
+//   cross-warp seed pick at convexMeshMidphase.cu:879-902.
 //
 // ---------------------------------------------------------------------------
 // THIS FILE IS #included, NOT imported, AND THAT IS NOT A STYLE CHOICE
@@ -169,7 +169,7 @@ uint ttbBlockScanExclusive(uint tid, bool threadContributesElement, out uint tot
 // pxgSlangTriTriPatch already carries ttpMinIndex, which is the same function
 // written over a 32-element ARRAY for the serial reduce.  This is the same
 // function over a warp's lanes, and both are needed: the reduce runs on one
-// thread and takes an array, while :894 and :899 run on all 1024 threads and take
+// thread and takes an array, while :885 and :899 run on all 1024 threads and take
 // a lane value.  They are kept as two spellings of one body rather than one
 // spelling plus a staging buffer, because staging would add a barrier inside a
 // function the CUDA calls with none.
@@ -182,8 +182,8 @@ uint ttbBlockScanExclusive(uint tid, bool threadContributesElement, out uint tot
 //      it is what removes it.  Swapping the two would change nothing; dropping
 //      the mask would.
 //   2. lowestSetIndex(0) is __ffs(0) - 1 = 0xFFFFFFFF, and an EMPTY mask reaches
-//      it: :894 is called with candidateMask, which is 0 in a warp with no
-//      candidates.  The caller at :899 then indexes countersS with the result of
+//      it: :885 is called with candidateMask, which is 0 in a warp with no
+//      candidates.  The caller at :902 then indexes countersS with the result of
 //      a SECOND minIndex, never with this one, so the sentinel is never used as
 //      an index -- but it is returned and it is load-bearing.
 //
@@ -210,7 +210,7 @@ uint ttbWarpMinIndex(uint tid, float v, uint mask, out float minV)
 }
 
 // ---------------------------------------------------------------------------
-// The cross-warp seed pick, createNewPatches (convexMeshMidphase.cu:879-901).
+// The cross-warp seed pick, createNewPatches (convexMeshMidphase.cu:879-902).
 // ---------------------------------------------------------------------------
 // Each warp reduces its own candidates to (minSep, minI) and publishes minSep to
 // shMinSepS[warpIndex] and its candidate COUNT to countersS[warpIndex].  After
@@ -253,7 +253,7 @@ struct TtbSeed
     uint minIBlock;      // winning WARP index
     float minSep;        // the block-wide minimum separation
     uint winnerCount;    // countersS[minIBlock]
-    bool hasCandidates;  // the :901 gate
+    bool hasCandidates;  // the :902 gate
 };
 
 TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint minI)
@@ -262,24 +262,103 @@ TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint
     const uint warp = tid >> 5;
 
     float warpMinSep;
-    minI = ttbWarpMinIndex(tid, laneSep, candidateMask, warpMinSep);   // :894
+    minI = ttbWarpMinIndex(tid, laneSep, candidateMask, warpMinSep);   // :885
 
-    if (lane == 0u)                                                    // :896-900
+    if (lane == 0u)                                                    // :887-891
     {
         gTtbMinSep[warp] = warpMinSep;
         gTtbCounters[warp] = pxgPopc(candidateMask);
     }
 
-    GroupMemoryBarrierWithGroupSync();                                 // bar.sync 3 (:903)
+    GroupMemoryBarrierWithGroupSync();                                 // bar.sync 3 (:894)
 
-    // :906 -- indexed by LANE, so lane L holds warp L's minimum.
+    // :897 -- indexed by LANE, so lane L holds warp L's minimum.
     const float blockSep = gTtbMinSep[lane];
 
     TtbSeed s;
     float chosen;
-    s.minIBlock = ttbWarpMinIndex(tid, blockSep, PXG_FULL_MASK, chosen);   // :908
+    s.minIBlock = ttbWarpMinIndex(tid, blockSep, PXG_FULL_MASK, chosen);   // :899
     s.minSep = chosen;
     s.winnerCount = gTtbCounters[s.minIBlock];
     s.hasCandidates = s.winnerCount != 0u;
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// contactReduce2 at :810 and :931, SERIALISED ONE WARP AT A TIME (14/n)
+// ---------------------------------------------------------------------------
+// Both call sites are block-uniform and called by ALL 32 warps, each on its own
+// 32 lanes, each with its own mask.  In CUDA every warp reduces in parallel and
+// gets its answer back in its own lanes' registers.  Here that cannot be done:
+//
+//   * a 1:1 transcription lowers every shuffle inside contactReduce2 to a
+//     WORKGROUP barrier, and 32 warps each running their own reduce is exactly
+//     the warp-varying-barrier shape that hangs llvmpipe (P9.83b-2);
+//   * staging all 32 warps at once is 32*32*16 B and was MEASURED over the limit
+//     at 46684 bytes (P9.83b-4, 3/n).
+//
+// So warp w stages its 32 lanes into gTtbWarpStage, thread 0 runs the serial
+// crsContactReduce2 on them, and the mask comes back to warp w through
+// gTtbReduceMask[w].  32 rounds, two barriers each.  That gTtbReduceMask is a
+// buffer the CUDA does not have is what made the Workgroup-only budget
+// impossible (P9.83b-5, 12/n: 32732 -> 32860 with it).
+//
+// REQUIREMENT ON THE INCLUDER: crsContactReduce2 lives in the MODULE
+// pxgSlangContactReduceSerial, and this file is a textual include, so the
+// including file must `import pxgSlangContactReduceSerial;`.
+//
+// THE INPUT MASK TRAVELS THROUGH THE SAME SLOT AS THE RESULT.  Lane 0 of each warp
+// publishes its warp's mask into gTtbReduceMask[warp] before the first round;
+// thread 0 reads slot w and overwrites it in round w.  Each slot is written once
+// by its warp before any round and once by thread 0 in its own round, so no round
+// reads a slot another round has already rewritten.
+//
+// THE TRAILING BARRIER IS NOT IN THE CUDA AND IS NOT OPTIONAL HERE.  In CUDA the
+// result is a register and the next call cannot disturb it.  Here it is shared
+// memory: without a barrier after the read, a second call's lane-0 publish of a
+// NEW input mask could land before a slower thread of the same warp has read the
+// OLD result.  The kernel happens to put other barriers between the two call
+// sites, but a function whose correctness depends on what its caller does next
+// is a function that breaks when the caller changes.
+//
+// No dupe test, maxPoints 6, clustering on: <true, true, MESH_MESH_CONTACT_LIMIT,
+// false>, as at both call sites.
+groupshared float4 gTtbWarpStage[32];
+groupshared uint gTtbReduceMask[32];
+
+uint ttbWarpReduceSerial(uint tid, float3 pos, float sep, float3 patchNormal,
+                         uint warpMask, float clusterBias)
+{
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5;
+
+    if (lane == 0u)
+        gTtbReduceMask[warp] = warpMask;
+
+    for (uint w = 0u; w < 32u; ++w)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (warp == w)
+            gTtbWarpStage[lane] = float4(pos, sep);
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid == 0u)
+        {
+            float3 pts[32];
+            float seps[32];
+            for (uint l = 0u; l < 32u; ++l)
+            {
+                const float4 s = gTtbWarpStage[l];
+                pts[l] = s.xyz;
+                seps[l] = s.w;
+            }
+            gTtbReduceMask[w] = crsContactReduce2(pts, seps, patchNormal, gTtbReduceMask[w],
+                                                  clusterBias, crsConfig(true, true, 6, false));
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    const uint result = gTtbReduceMask[warp];
+    GroupMemoryBarrierWithGroupSync();   // see THE TRAILING BARRIER above
+    return result;
 }

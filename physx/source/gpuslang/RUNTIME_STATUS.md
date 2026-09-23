@@ -1960,7 +1960,7 @@ Suite **870 → 871** in beiden Speichermodi, 460 → **461** `.spv`.
                                  Überladung -- die, die :820 und :938 mit
                                  countersS aufrufen, nicht die selbst-allozierende
   minIndex                       nputils.cuh:151-164, in WARP-SHUFFLE-Form
-  der warpübergreifende Seed-Pick  convexMeshMidphase.cu:879-901
+  der warpübergreifende Seed-Pick  convexMeshMidphase.cu:879-902
 ```
 
 **Die Datei ist ein textueller `#include`, kein `import`.** Sie braucht
@@ -2407,8 +2407,8 @@ Ein Überlebender war eine **echte Lücke**: `reduce-cfg-dupetest` (TDoDupeTest
 `false` → `true`) überlebte, weil der Staging-Puffer keine koinzidenten Punkte
 enthielt. Der echte enthält sie —
 `tryToAssignContactToExistingPatch` kopiert die `KeepPoints` des bestehenden
-Patches nach `tempPointsS[0..PointCount)` (:832-833) und hängt die Kontakte dieser
-Runde dahinter (:839); ein Kontakt, der sich kaum bewegt hat, landet also neben
+Patches nach `tempPointsS[0..PointCount)` (:828-829) und hängt die Kontakte dieser
+Runde dahinter (:834-835); ein Kontakt, der sich kaum bewegt hat, landet also neben
 seiner eigenen aufbewahrten Kopie, im Abstand null. Die Fixture pflanzt sie jetzt
 (991 von 1200 Fällen), und der Mutant ist tot.
 
@@ -2448,8 +2448,8 @@ sich auf, sobald die Kontaktreduktion seriell ist. Das deckt **eine von drei**
 | Stelle | Kontext | Status |
 |---|---|---|
 | `:472` | in `reduceContactsSingleWarp`, unter `if (warpIndex == 0)` | seriell ersetzt (P9.83b-5) |
-| `:810` | in `if (anyKeepS)`, blockuniform, **alle 32 Warps** | offen |
-| `:931` | in `if (countersS[minIBlock] != 0)`, blockuniform, **alle 32 Warps** | offen |
+| `:810` | in `if (anyKeepS)`, blockuniform, **alle 32 Warps** | offen — seit P9.83b-5 (14/n) `ttbWarpReduceSerial` |
+| `:931` | in `if (countersS[minIBlock] != 0)`, blockuniform, **alle 32 Warps** | offen — seit P9.83b-5 (14/n) `ttbWarpReduceSerial` |
 
 Die letzten beiden brauchen weiterhin eine **warpweise** Reduktion, und eine
 serielle davon braucht die 32 Lanes des Warps irgendwo adressierbar. Zwei Schemata,

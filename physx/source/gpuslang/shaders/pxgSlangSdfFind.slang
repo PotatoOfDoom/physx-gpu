@@ -150,6 +150,26 @@ groupshared uint gSdfIndices[SDFF_TARGET_COUNT];
 groupshared uint2 gSdfIndices2[SDFF_TARGET_COUNT];
 groupshared uint gSdfOffset;
 
+// TWO SLOTS HERE STAND FOR SEVERAL IN THE CUDA, AND BOTH ARE SAFE -- checked, not
+// assumed (P9.83b-5, 14/n; flagged by a read-only map of the mesh-mesh kernel).
+//
+//   gSdfOffset is the tet, triangle AND vertex gathers' resume slot, where the
+//   CUDA has three separate `__shared__ PxU32 offset` (sdfCollision.cuh:569, :624,
+//   :695).  Every engine includer runs exactly one gather kind
+//   (femClothSdfMeshCgBda: triangles, psSdfMidphaseBda: vertices,
+//   softBodySdfMidphaseBda: tets), and each gather seeds the slot from startIndex
+//   before its first use, so no two resume points are ever live together.
+//
+//   gSdfPerWarpCount is both the two-argument scan's perWarpCountS
+//   (reduction.cuh:628) and sdfGlobalScanExclusive's, where the CUDA gives the
+//   global scan its own (reduction.cuh:674).  The writes are ordered anyway: the
+//   gathers put a barrier before every sdfAddIndexToBuffer* call, and
+//   sdfGlobalScanExclusive opens and closes with one, so no lane-0 write to a slot
+//   can land while another warp is still reading the previous scan's value.
+//
+// A kernel that ran two gather kinds, or called a scan without a barrier after a
+// previous one's reads, would break either argument.  None does today.
+
 // ---------------------------------------------------------------------------
 // threadBlockScanExclusive<NbWarps>(bool, totalSum, perWarpCountS)
 // reduction.cuh:597-623.

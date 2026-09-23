@@ -44,6 +44,7 @@
 // average is not well above one.
 
 #include "pxgTestFramework.h"
+#include "pxgCrsRef.h"
 
 #include <cmath>
 #include <cstdint>
@@ -56,130 +57,11 @@ namespace
 {
 using namespace pxgtest;
 
-struct V3 { float x, y, z; };
-struct V4 { float x, y, z, w; };
-
-static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 cross3(V3 a, V3 b)
-{
-    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
-}
-static V3 scale3(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static float mag3(V3 a) { return std::sqrt(dot3(a, a)); }
-
-static const float FLT_MAX_LOCAL = 3.402823466e38f;
-static uint32_t popcount32(uint32_t v) { uint32_t c = 0; while (v) { c += v & 1u; v >>= 1; } return c; }
-
-static uint32_t argMax(const float* vals, uint32_t mask, float& best)
-{
-    best = -FLT_MAX_LOCAL;
-    uint32_t idx = 0;
-    for (uint32_t j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] > best) { best = vals[j]; idx = j; }
-    return idx;
-}
-static uint32_t argMin(const float* vals, uint32_t mask, float& best)
-{
-    best = FLT_MAX_LOCAL;
-    uint32_t idx = 0;
-    for (uint32_t j = 0; j < 32; ++j)
-        if (((mask >> j) & 1) != 0 && vals[j] < best) { best = vals[j]; idx = j; }
-    return idx;
-}
-
-// contactReduceShared<true, true, 6, false> (contactReduction.cuh:55-165), the
-// clustering arm only -- this instantiation always clusters.
-static uint32_t reduceShared(const V3* ptRaw, const float* sep, V3 normal,
-                             uint32_t allMask, float clusterBias,
-                             const float* adj, const float* initial, int maxPoints)
-{
-    V3 point[32];
-    for (uint32_t j = 0; j < 32; ++j)
-        point[j] = sub(ptRaw[j], scale3(normal, dot3(ptRaw[j], normal)));
-
-    if (popcount32(allMask) <= uint32_t(maxPoints))
-        return allMask;
-
-    float v, vals[32];
-    for (uint32_t j = 0; j < 32; ++j) vals[j] = initial[j] + adj[j];       // :91
-    const uint32_t i0 = argMax(vals, allMask, v);
-    uint32_t mask = 1u << i0;
-
-    for (uint32_t j = 0; j < 32; ++j)                                      // :93-94
-        vals[j] = mag3(sub(point[i0], point[j])) + adj[j];
-    const uint32_t i1 = argMax(vals, allMask & ~mask, v);
-    mask |= 1u << i1;
-
-    const V3 dir = cross3(normal, sub(point[i1], point[i0]));              // :105
-    float dval[32];
-    for (uint32_t j = 0; j < 32; ++j) dval[j] = dot3(dir, sub(point[j], point[i0]));
-
-    for (uint32_t j = 0; j < 32; ++j) vals[j] = dval[j] + adj[j];          // :107
-    const uint32_t f = argMax(vals, allMask & ~mask, v);
-    mask |= 1u << f;
-
-    for (uint32_t j = 0; j < 32; ++j) vals[j] = dval[j] - adj[j];          // :110 SIGN FLIP
-    const uint32_t g = argMin(vals, allMask & ~mask, v);
-    mask |= 1u << g;
-
-    if (popcount32(mask) == 4 && maxPoints > 4)                            // :121-128
-    {
-        const uint32_t i4 = argMin(sep, allMask & ~mask, v);
-        mask |= 1u << i4;
-    }
-
-    {                                                                      // :135-158
-        float sepB[32];
-        for (uint32_t j = 0; j < 32; ++j)
-            sepB[j] = sep[j] - (((mask >> j) & 1) != 0 ? clusterBias : 0.0f);
-
-        int label[32];
-        int nbClusters = 0;
-        {
-            uint32_t m = mask;
-            float tbest[32];
-            for (uint32_t j = 0; j < 32; ++j) { tbest[j] = FLT_MAX_LOCAL; label[j] = -1; }
-            for (; m != 0; ++nbClusters, m &= (m - 1))
-            {
-                uint32_t a = 0;
-                while (((m >> a) & 1u) == 0u) ++a;
-                for (uint32_t j = 0; j < 32; ++j)
-                {
-                    const V3 dv = sub(point[j], point[a]);
-                    const float d = dot3(dv, dv);
-                    if (d < tbest[j]) { tbest[j] = d; label[j] = nbClusters; }
-                }
-            }
-        }
-
-        mask = 0;
-        for (int i = 0; i < nbClusters; ++i)
-        {
-            uint32_t cl = 0;
-            for (uint32_t j = 0; j < 32; ++j) if (label[j] == i) cl |= 1u << j;
-            cl &= allMask;
-            if (cl) mask |= 1u << argMin(sepB, cl, v);
-        }
-        for (int i = nbClusters; i < maxPoints; ++i)
-            mask |= 1u << argMin(sepB, allMask & ~mask, v);
-    }
-    return mask;
-}
-
-// contactReduce2 (contactReduction.cuh:180-188): adj = -separation,
-// initial = |pointRaw projected onto the normal plane|.
-static uint32_t contactReduce2(const V3* pt, const float* sep, V3 n, uint32_t allMask, float bias)
-{
-    float adj[32], initial[32];
-    for (uint32_t j = 0; j < 32; ++j)
-    {
-        const V3 p = sub(pt[j], scale3(n, dot3(pt[j], n)));
-        adj[j] = -sep[j];
-        initial[j] = mag3(p);
-    }
-    return reduceShared(pt, sep, n, allMask, bias, adj, initial, 6);
-}
+// V3/V4, the vector helpers and contactReduce2 (as refWrapper2) live in
+// pxgCrsRef.h since P9.83b-5 (14/n).  This file carried a reduced copy of
+// reduceShared -- the <clustering, !dupe, 6> path only -- which was compared
+// against the full one expression by expression before it was deleted.
+using namespace pxgtest::crsref;
 
 struct RefResult
 {
@@ -218,7 +100,7 @@ static RefResult refReduce(const V4* tempPoints, uint32_t totalContacts, V3 nor,
         }
         c += popcount32(readMask);                         // :469, LANES OFFERED
         currentContactMask = hasMask;                      // :471
-        currentContactMask = contactReduce2(pA, sep, nor, currentContactMask, clusterBias); // :472
+        currentContactMask = refWrapper2(pA, sep, nor, currentContactMask, clusterBias); // :472
         hasMask = currentContactMask;                      // :473
     }
 
@@ -868,7 +750,7 @@ PXG_TEST(npTriTriReduce_reserve)
                   "SOLELY because of the `* 2` at :573 -- without those, dropping the "
                   "doubling is invisible", forceOnlyByDoubling, N);
     PXG_CHECK_MSG(exactLimit > N / 10,
-                  "npTriTriReduce_reserve: only %zu limits land EXACTLY on "
+                  "npTriTriReduce_reserve: only %zu of %u limits land EXACTLY on "
                   "`offset + reservation` -- that single point is the only place "
                   "`>` and `>=` differ in all three overflow checks", exactLimit, N);
     PXG_CHECK_MSG(sentinelNotNull > N / 20,

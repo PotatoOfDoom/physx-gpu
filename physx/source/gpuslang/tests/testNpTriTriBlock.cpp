@@ -28,7 +28,7 @@
 // threadBlockCountAndBroadcast (reduction.cuh:576-589),
 // threadBlockScanExclusive<32> (reduction.cuh:598-621), minIndex
 // (nputils.cuh:151-164) and the cross-warp seed pick
-// (convexMeshMidphase.cu:879-901).
+// (convexMeshMidphase.cu:879-902).
 //
 // ONE WORKGROUP OF 1024 THREADS PER CASE.  Everything in P9.83b so far has been a
 // serial body run on independent 64-thread lanes; these four are COLLECTIVES,
@@ -46,6 +46,7 @@
 // `ballot & mask` from `ballot`.
 
 #include "pxgTestFramework.h"
+#include "pxgCrsRef.h"
 
 #include <algorithm>
 #include <cmath>
@@ -58,8 +59,7 @@
 namespace
 {
 using namespace pxgtest;
-
-const float FLT_MAX_LOCAL = 3.402823466e+38f;
+using namespace pxgtest::crsref;   // FLT_MAX_LOCAL, V3/V4, refWrapper2 -- P9.83b-5 (14/n)
 const uint32_t NO_INDEX = 0xFFFFFFFFu;
 
 struct TtbCaseH
@@ -379,6 +379,172 @@ PXG_TEST(npTriTriBlock_collectives)
                 "%zu unmasked-equal plants, %zu FLT_MAX-candidate plants\n",
                 N, sawEmptyWarp, sawSentinelMinI, sawAllEmpty, sawBlockTie, sawUnmaskedEqual,
                 sawFltMaxCandidate);
+
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (14/n): ttbWarpReduceSerial -- contactReduce2 at :810 and :931, one
+// warp at a time through a 32-slot stage and a per-warp result slot.
+// ---------------------------------------------------------------------------
+// THE REDUCTION IS NOT WHAT THIS TESTS.  crsContactReduce2 is certified by
+// gpuslang.npCrsWrapper2 against the same oracle this uses (pxgCrsRef.h).  What
+// is new is the plumbing around it, and every way it can go wrong is a MIXUP:
+// warp w's lanes staged as warp w', warp w's mask read from another slot, the
+// answer reaching lane 0 but not lanes 1-31, the second call reading the first
+// call's leftovers.  So the case set is built to make mixups VISIBLE:
+//
+//   * every warp gets its OWN point cloud and its own mask, so swapping two
+//     warps' data changes both answers;
+//   * most masks carry more than six bits, so the reduction actually runs and the
+//     answer is not simply the input mask handed back;
+//   * the second call's masks differ from the first call's, and the fixture
+//     asserts that the two ANSWERS differ for most warps -- if they did not, a
+//     second call that returned the first call's slot would pass;
+//   * every one of the 1024 threads reports, so a broadcast that reached one lane
+//     per warp fails.
+namespace
+{
+struct TtbRedCaseH
+{
+    V4 pts[1024];
+    uint32_t masks[32];
+    uint32_t masks2[32];
+    V4 normalBias;
+};
+static_assert(sizeof(TtbRedCaseH) == 16656, "reduce case stride");
+}
+
+PXG_TEST(npTriTriBlock_warpReduce)
+{
+    std::mt19937 rng(77002);
+    const uint32_t N = 48;
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 100000) / 100000.f); };
+
+    std::vector<TtbRedCaseH> in(N);
+    std::memset(in.data(), 0, in.size() * sizeof(TtbRedCaseH));
+    std::vector<uint32_t> want1(size_t(N) * 32), want2(size_t(N) * 32);
+
+    size_t reductionsRun = 0, earlyOut = 0, emptyMask = 0, callsDiffer = 0, answerNotInput = 0;
+
+    auto pickMask = [&](uint32_t k) -> uint32_t {
+        switch (k % 8)
+        {
+        case 0: return 0u;                                          // an empty warp
+        case 1: return 0xFFFFFFFFu;                                 // every lane
+        case 2: return uint32_t(rng()) & 0x0000003Fu;               // <= 6 bits: early-out
+        default: return uint32_t(rng()) | uint32_t(rng());          // dense: reduction runs
+        }
+    };
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        TtbRedCaseH& c = in[i];
+
+        V3 n{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+        const float nl = mag3(n);
+        n = scale3(n, nl > 1e-4f ? 1.0f / nl : 1.0f);
+        const float bias = rf(1e-5f, 5e-3f);
+        c.normalBias = V4{ n.x, n.y, n.z, bias };
+
+        for (uint32_t w = 0; w < 32; ++w)
+        {
+            // Each warp its own cloud: a different centre per warp.
+            const V3 centre{ rf(-6, 6), rf(-6, 6), rf(-6, 6) };
+            for (uint32_t l = 0; l < 32; ++l)
+                c.pts[w * 32 + l] = V4{ centre.x + rf(-2, 2), centre.y + rf(-2, 2),
+                                        centre.z + rf(-2, 2), rf(-0.4f, 0.25f) };
+            c.masks[w] = pickMask(rng());
+            c.masks2[w] = pickMask(rng());
+        }
+
+        for (uint32_t w = 0; w < 32; ++w)
+        {
+            V3 pt[32];
+            float sp[32];
+            for (uint32_t l = 0; l < 32; ++l)
+            {
+                const V4& q = c.pts[w * 32 + l];
+                pt[l] = V3{ q.x, q.y, q.z };
+                sp[l] = q.w;
+            }
+            const uint32_t a = refWrapper2(pt, sp, n, c.masks[w], bias);
+            const uint32_t b = refWrapper2(pt, sp, n, c.masks2[w], bias);
+            want1[size_t(i) * 32 + w] = a;
+            want2[size_t(i) * 32 + w] = b;
+
+            if (popcount32(c.masks[w]) > 6) ++reductionsRun; else if (c.masks[w]) ++earlyOut; else ++emptyMask;
+            if (a != b) ++callsDiffer;
+            if (a != c.masks[w]) ++answerNotInput;
+        }
+    }
+
+    const size_t warps = size_t(N) * 32;
+    PXG_CHECK_MSG(reductionsRun > warps / 2,
+                  "npTriTriBlock_warpReduce: only %zu of %zu first-call masks exceed six "
+                  "bits -- below that the reduction hands the mask back unchanged and "
+                  "the staging is not exercised", reductionsRun, warps);
+    PXG_CHECK_MSG(earlyOut > warps / 20 && emptyMask > warps / 20,
+                  "npTriTriBlock_warpReduce: %zu early-out and %zu empty masks; both "
+                  "ends of the mask are real inputs", earlyOut, emptyMask);
+    PXG_CHECK_MSG(callsDiffer > warps / 2,
+                  "npTriTriBlock_warpReduce: the two calls' answers differ for only %zu "
+                  "of %zu warps -- a second call that returned the first call's slot "
+                  "would pass", callsDiffer, warps);
+    PXG_CHECK_MSG(answerNotInput > warps / 3,
+                  "npTriTriBlock_warpReduce: only %zu answers differ from their input "
+                  "mask -- a reduce that returned its input would pass", answerNotInput);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> outInit(size_t(N) * 2048, 0xDEADBEEFu);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    TtbPushH push{};
+    push.cases = dev->getBufferDeviceAddress(bIn);
+    push.out = dev->getBufferDeviceAddress(bOut);
+    push.numCases = N;
+
+    Kernel k("npTriTriBlock.spv", "ttbReduceProbe", {}, sizeof(TtbPushH));
+    k.dispatch(N, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto got = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+
+    size_t mm1 = 0, mm2 = 0, laneOnly = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        for (uint32_t t = 0; t < 1024; ++t)
+        {
+            const uint32_t w = t >> 5;
+            const uint32_t g1 = got[size_t(i) * 2048 + t];
+            const uint32_t g2 = got[size_t(i) * 2048 + 1024 + t];
+            const uint32_t e1 = want1[size_t(i) * 32 + w];
+            const uint32_t e2 = want2[size_t(i) * 32 + w];
+            if (g1 != e1)
+            {
+                if (mm1 < 6)
+                    std::printf("  case %u thread %u (warp %u): call 1 got 0x%08x want 0x%08x\n",
+                                i, t, w, g1, e1);
+                ++mm1;
+                if ((t & 31u) != 0u && got[size_t(i) * 2048 + (w << 5)] == e1) ++laneOnly;
+            }
+            if (g2 != e2)
+            {
+                if (mm2 < 6)
+                    std::printf("  case %u thread %u (warp %u): call 2 got 0x%08x want 0x%08x\n",
+                                i, t, w, g2, e2);
+                ++mm2;
+            }
+        }
+
+    PXG_CHECK_MSG(mm1 == 0, "npTriTriBlock_warpReduce: %zu call-1 mismatches (%zu of them in a "
+                            "lane whose warp's lane 0 was right -- a broadcast gap)", mm1, laneOnly);
+    PXG_CHECK_MSG(mm2 == 0, "npTriTriBlock_warpReduce: %zu call-2 mismatches", mm2);
+
+    std::printf("  npTriTriBlock_warpReduce: %u blocks, %zu warps per call; %zu reductions run, "
+                "%zu early-out, %zu empty; the two calls differ on %zu warps, %zu answers "
+                "differ from their input\n",
+                N, warps, reductionsRun, earlyOut, emptyMask, callsDiffer, answerNotInput);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
