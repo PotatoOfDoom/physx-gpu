@@ -163,6 +163,14 @@ public:
     // (the ordering CUDA guarantees implicitly on a single stream).
     virtual void barrier() = 0;
 
+    // P9.85: how many dispatches were recorded while the PREVIOUS dispatch of the
+    // same batch had no barrier() after it -- i.e. pairs the device is free to
+    // overlap.  A submit boundary counts as ordered (each batch waits on the one
+    // before it).  Per-buffer transfer barriers do not count: they order one
+    // VkBuffer, and a BDA kernel reaches others.  Diagnostic only; with
+    // PXG_SYNC_STATS=1 the Vulkan device also prints it on destruction.
+    virtual uint64_t unorderedDispatchCount() const { return 0; }
+
     // Submits all recorded work and waits for completion.  Equivalent to
     // wait(submit()).
     virtual void flush() = 0;

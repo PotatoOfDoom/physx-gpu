@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **872/872** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **873/873** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.85 added `gpuslang.shimOrdering`: the engine's launch path never called barrier(), so
+successive engine kernels -- which CUDA runs in stream order -- were recorded with no
+compute->compute dependency.  Measured as a count of the recorded stream (5228 of the box
+scene's 6238 dispatches unordered), fixed with one barrier after every launch (0), and
+invisible in every value because llvmpipe executes a command buffer serially.
 P9.83b-5 (15a/n) built the fourth Workgroup reclamation for the mesh-mesh kernel --
 tempPointsS, the one-warp stage and the reduce masks inside the dead triangleIndicesS --
 and measured it at 31228 bytes (1540 spare).  The patches stay in Workgroup storage; the
@@ -1965,6 +1970,83 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.85 — Engine-Kernel liefen ohne Ordnung zwischen Dispatches, und nur llvmpipe hat es verdeckt
+
+CUDA führt die Kernel eines Streams der Reihe nach aus, und jeder Engine-Kernel, der liest,
+was der vorige geschrieben hat, verlässt sich darauf. Das Device-Interface benennt das
+Vulkan-Gegenstück ausdrücklich (PxgSlangComputeDevice.h): „dispatch() records work;
+barrier() orders successive dispatches (equivalent to work on a single CUDA stream)",
+und RUNTIME_PLAN.md macht die globale Compute-zu-Compute-Barriere zum Default.
+`PxgCudaShim::launchKernel` ist der einzige Startpfad der Engine — und **rief `barrier()`
+nie auf**. Weder Shim noch Bridge taten es; nur die Fixtures, die das Device direkt
+treiben, rufen es selbst. Gefunden beim Nachlesen des Dispatch-Pfads für P9.84.
+
+### Warum es nie auffiel, und was sich trotzdem messen lässt
+
+llvmpipe führt die Dispatches eines Command Buffers **nacheinander** aus. Ein fehlendes
+`barrier()` erzeugt hier also nie einen falschen **Wert**. Die Sync-Validierung sieht es
+ebenfalls nicht (die Khronos-Schicht ist hier nicht einmal installiert): sie verfolgt
+Deskriptor-gebundene Ressourcen, und Engine-Kernel greifen nur über Buffer-Device-Adressen
+zu. Messbar ist der **aufgezeichnete Command-Stream**. Das Device zählt jetzt Dispatches,
+die aufgezeichnet werden, während nach dem vorigen Dispatch desselben Batches keine
+Barriere liegt (`unorderedDispatchCount`). Eine Submit-Grenze zählt als geordnet, weil
+jeder Batch per Timeline-Semaphor auf den vorigen wartet bzw. blockierend eingereicht
+wird. Pro-Puffer-Transferbarrieren zählen **nicht**: sie ordnen einen `VkBuffer`, und ein
+BDA-Kernel erreicht andere.
+
+**Vor dem Fix**, mit `PXG_SYNC_STATS=1` (Ausgabe beim Prozessende):
+
+```
+  box        5228 von  6238 Dispatches ungeordnet   (84 %)
+  cloth     12387 von 14257
+  particle  17765 von 22131
+```
+
+und `gpuslang.shimOrdering` (neu, Suite **872 → 873**): zwei abhängige Launches über den
+Shim (`out1 = 2x + y`, dann `out2 = 3·out1 + y`) — **1 ungeordnet, 0 falsche Werte**, in
+beiden Speichermodi. Genau die Signatur eines Defekts, den nur die Ausführungsreihenfolge
+dieses Geräts verdeckt.
+
+### Der Fix
+
+`launchKernel` ruft nach jedem Dispatch `mDevice->barrier()`. **Danach**, nicht davor:
+so ordnet die Barriere alles, was der Stream als Nächstes aufzeichnet, und eine
+Batch-Grenze ist ohnehin geordnet.
+
+**Nach dem Fix:** 0 von 6238, 0 von 14257, 0 von 22131 — dieselben Dispatch-Zahlen wie
+vorher, also dieselbe Arbeit; `shimOrdering` 0 ungeordnet, in beiden Modi.
+
+### Die Positivkontrolle, die der Sweep verlangt hat
+
+Der erste Host-Sweep (Werkzeug aus P9.84) über den Zähler ließ **drei von vier** Mutanten
+überleben — `count-never-increments`, `flag-never-set`, `submit-keeps-flag`. Kein
+Rätsel: ein Test, der nur „== 0" prüft, besteht auch mit einem Zähler, der nie zählt.
+`shimOrdering_counter` zeichnet deshalb direkt am Device auf, wo die Antwort bekannt und
+**nicht** null ist: zwei Dispatches ohne Barriere sind **+1**, nach `barrier()` **+0**,
+über einen Submit hinweg **+0**. Danach frisch neu gesweept:
+
+```
+  PxgVulkanComputeDevice.cpp (der Zähler)   4 Mutanten, 4 getötet
+  PxgCudaShim.cpp (der Fix)                 3 Mutanten, 2 getötet
+```
+
+`barrier-removed` und `barrier-only-textured` sterben an `shimOrdering_backToBack`. Der
+Überlebende `barrier-before-dispatch` (Barriere **vor** statt nach jedem Dispatch) ist
+**äquivalent**: `barrier()` ist ohne laufende Aufzeichnung ein No-op, also bekommt jeder
+Dispatch außer dem ersten eines Batches eine Barriere vor sich — das ordnet jedes
+Dispatch-Paar eines Batches genauso; Transfers nach einem Dispatch haben ihre eigene
+Pro-Puffer-Barriere und berühren nur diesen Puffer; und der letzte Dispatch eines Batches
+ist durch das Warten des nächsten Batches geordnet. „Danach" bleibt, weil es die Aussage
+„dieser Launch ist abgeschlossen, bevor irgendetwas Späteres beginnt" lokal macht.
+
+### Suite und Szenen
+
+Suite **873/873** in **beiden** Speichermodi. Szenen **55/55** — auch das die erwartete
+Aussage, keine beruhigende: llvmpipe führt ohnehin seriell aus, an den Werten konnte sich
+nichts ändern. Geändert hat sich der aufgezeichnete Command-Stream, von 5228 / 12387 / 17765
+ungeordneten Dispatches auf 0. Die Laufzeitkosten einer Barriere pro Dispatch sind hier
+**nicht** gemessen.
 
 ## P9.83b-5 (15a/n) — die vierte Rückgewinnung, gebaut und gemessen: 31228 Bytes, und die Auslagerung ist vom Tisch
 

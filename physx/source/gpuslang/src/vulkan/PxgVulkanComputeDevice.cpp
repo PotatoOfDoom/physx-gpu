@@ -50,6 +50,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -1235,6 +1236,7 @@ public:
         if (pushConstantSize > 0)
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
 
+        noteDispatch();
         vkCmdDispatch(mCommandBuffer, gridX, gridY, gridZ);
     }
 
@@ -1326,8 +1328,38 @@ public:
         if (pushConstantSize > 0)
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
 
+        noteDispatch();
         vkCmdDispatchIndirect(mCommandBuffer, arg.buffer, argOffset);
     }
+
+    // P9.85 bookkeeping for unorderedDispatchCount().  With PXG_SYNC_STATS=1 the
+    // process-wide total is printed at exit -- from a static object, because the
+    // engine's device is not necessarily destroyed before the process ends.
+    struct SyncStatsReport
+    {
+        uint64_t unordered = 0, dispatches = 0;
+        ~SyncStatsReport()
+        {
+            std::fprintf(stderr, "[pxg-sync] %llu of %llu dispatch(es) recorded with no compute->compute "
+                                 "barrier after the previous dispatch of their batch\n",
+                         (unsigned long long)unordered, (unsigned long long)dispatches);
+        }
+    };
+    void noteDispatch()
+    {
+        static const bool stats = std::getenv("PXG_SYNC_STATS") != nullptr;
+        if (stats)
+        {
+            static SyncStatsReport report;   // destroyed -- and printed -- at exit
+            report.dispatches += 1;
+            report.unordered += mDispatchSinceBarrier ? 1u : 0u;
+        }
+        if (mDispatchSinceBarrier)
+            ++mUnorderedDispatches;
+        mDispatchSinceBarrier = true;
+    }
+
+    uint64_t unorderedDispatchCount() const override { return mUnorderedDispatches; }
 
     void barrier() override
     {
@@ -1340,6 +1372,7 @@ public:
 
         vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+        mDispatchSinceBarrier = false;
     }
 
     uint64_t submit() override
@@ -1392,6 +1425,7 @@ public:
 
         ++mSubmitCount;
         mRecording = false;
+        mDispatchSinceBarrier = false;   // the next batch waits on this one
         return mLastTicket;
     }
 
@@ -1689,6 +1723,8 @@ private:
     float mTimestampPeriod = 0.0f;
 
     bool mRecording = false;
+    bool mDispatchSinceBarrier = false;   // P9.85
+    uint64_t mUnorderedDispatches = 0;    // P9.85
     bool mHasShaderInt64 = false;
     bool mHasBufferDeviceAddress = false;
     // VK_EXT_shader_atomic_float / shaderBufferFloat32AtomicAdd.  Kernels that

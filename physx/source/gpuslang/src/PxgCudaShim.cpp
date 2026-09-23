@@ -347,6 +347,18 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
     else
         mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
 
+    // P9.85: CUDA runs the kernels of one stream in order, and the device
+    // interface's equivalent is barrier() -- "orders successive dispatches"
+    // (PxgSlangComputeDevice.h).  Until P9.85 nothing on the engine path called
+    // it: MEASURED with PXG_SYNC_STATS=1, 5228 of the box scene's 6238 dispatches
+    // were recorded with no barrier after their predecessor, and
+    // gpuslang.shimOrdering caught two dependent launches unordered.  llvmpipe
+    // runs a command buffer's dispatches one at a time, which is the only reason
+    // no value was ever wrong.  AFTER the dispatch, so it also orders whatever the
+    // stream records next -- and a batch boundary is already ordered (each
+    // submission waits on the one before it).
+    mDevice->barrier();
+
     // PXG_SYNC_EACH=1: drain the queue after every dispatch so a shader-side
     // fault (e.g. a stray BDA dereference) is attributed to the exact kernel
     // that produced it — the launch trace's last line becomes the culprit
