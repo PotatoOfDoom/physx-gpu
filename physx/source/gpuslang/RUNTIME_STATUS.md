@@ -7,7 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **869/869** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **870/870** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-5 (9/n) added `gpuslang.npTriTriWrite`, which drives the tail of
+`writePatchesAndContacts` -- the zero-padded block scan, the 64-byte header and the point
+write -- and compares BOTH streams whole against a poison fill, so a port that writes more
+than the CUDA fails on the extra word rather than passing on the expected ones.
 P9.83b-2 added `gpuslang.npCrsWrapper2`, which certifies BOTH wrappers of
 contactReduceShared over one shared serial body -- and asserts they DISAGREE (1523 of 3000
 cases), because a fixture that only checked wrapper 2 against its own mirror would pass
@@ -1934,6 +1938,104 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-5 (9/n) — der Schreib-Schwanz der Mesh-gegen-Mesh-Kollision, und eine Vertauschung, die nur zwei Worte sehen können
+
+`writePatchesAndContacts` (convexMeshMidphase.cu:673-751) ist portiert: der
+blockweite Scan (`ttpPatchStartIndices`), der 64-Byte-Header und die bis zu sechs
+Punkte pro Patch (`ttpWritePatchAndContacts`). Neue Fixture
+`gpuslang.npTriTriWrite` mit zwei Fällen (`_scan`, `_patch`), Suite **869 → 870**
+in **beiden** Speichermodi, 459 → **460** `.spv`.
+
+### Vier Dinge, die die CUDA nicht ausspricht
+
+**1. Der Scan läuft über den BLOCK, nicht über die Patches.** `:703` scannt jeden
+Thread, mit `count = 0` für `threadIdx.x >= numPatchesToKeep` (`:698-700`). Ein
+null-gepolsterter Exklusiv-Scan hat auf seinem lebenden Präfix dasselbe Präfix wie
+ein Scan nur der lebenden Einträge — deshalb rechnet der Port den kurzen und liefert
+dieselbe Summe. Die Fixture füllt die Zählungen **hinter** `numPatchesToKeep`
+absichtlich mit Nicht-Null: ein Port, der das rohe Array scannt, stimmt sonst mit
+einem Spiegel überein, der es auch tut.
+
+**2. Der Punkt-Schreibvorgang hat KEINE Schleife — also ist er eine
+`blockDim`-Bedingung.** `:736` bildet Thread auf Patch als
+`threadIdx.x / MESH_MESH_CONTACT_LIMIT` ab und hört dort auf; das deckt
+`blockDim/6` Patches. Die Engine startet mit 1024 Threads, also 170 ≥ 128 — exakt
+sicher, **aber nur dort**. Ein Workgroup unter 768 schreibt jeden Patch-**Header**
+(`:727` ist durch `numPatchesToKeep ≤ 128` gedeckt) und lässt die **Punkte** jedes
+Patches ab `blockDim/6` fallen: ein Manifold, der sechs Kontakte behauptet und
+keinen liefert. Lautlos. Der serialisierte Port schleift über `numPatchesToKeep`
+und hat deshalb **gar keine** Workgroup-Abhängigkeit; er stimmt beim Start der
+Engine exakt überein und ist darunter eine Obermenge. Das ist die einzige Stelle in
+dieser Datei, an der eine Thread-Abbildung absichtlich nicht nachgebildet wird —
+weil sie eine Startannahme kodiert, keine Entscheidung.
+
+**3. Die beiden Schreibvorgänge sind unabhängig gesichert, und die Wächter können
+sich widersprechen.** `writeContactPatch` kehrt bei Null-Patch-Zeiger zurück
+(`:651`); der Punkt-Schreibvorgang prüft `if (patchWriter.contacts)` bei `:746` —
+der **innerste** Wächter. `ttpReserveBlock` setzt jedem Strom seinen eigenen
+Sentinel, also schreibt ein Patch-Überlauf allein **Punkte ohne Header** und ein
+Kontakt-Überlauf allein **Header, die ins Leere zeigen**. Die Fixture konstruiert
+alle drei Kombinationen (je 375 von 3000).
+
+**4. Die Material-Vertauschung hebt die des Kernels auf.** `:1365` ruft
+`doTriangleTriangleCollision(transform1, transform0, mesh1, mesh0, shape1, shape0,
+…, isFlipped = true)` — die Argumente sind **bereits** getauscht, `shape0` ist hier
+drinnen also die `shape1` der Engine. `:729` fragt dann nach
+`isFlipped ? shape1 : shape0`, was im geflippten Zweig wieder die `shape0` der
+Engine ist. Das Paar kommt bei `getContactMaterialProperties` auf **beiden** Zweigen
+in Engine-Reihenfolge an; der Tausch existiert, um den am Aufrufort zu annullieren.
+Portiert man nur einen der beiden, tauschen auf exakt der Hälfte aller
+Mesh-gegen-Mesh-Paare dynamische und statische Reibung die Plätze.
+
+Das `isFlipped ? normal : -normal` bei `:733` ist **nicht** dieselbe Annullierung:
+die Patch-Normale wird auf beiden Zweigen im lokalen `mesh1`-Rahmen berechnet und
+muss am Ende von `shape0` nach `shape1` der Engine zeigen, also negiert ein Zweig.
+Zwei Bedingungen über dasselbe Prädikat mit verschiedenen Aufgaben.
+
+### Die Kombination ist symmetrisch — die Vertauschung ist in zwei Worten sichtbar
+
+Jeder Zweig von `PxsCombineMaterials` ist **symmetrisch** in seinen zwei
+Argumenten: MIN, MAX, Mittelwert und Produkt sind es, und die beiden
+Compliant-Acc-Spring-Auswahlen wählen nach Flag, nicht nach Position. Die
+Header-Worte **7…11 sind also gegen den Tausch invariant**, und
+`materialIndex0/1` (Worte **12 und 13**) sind das **einzige** Observable. Deshalb
+fällt `swap-dropped` ausschließlich über diese zwei Worte — und deshalb steht es
+im Fixture-Kopf, statt entdeckt zu werden.
+
+### Der Strom wird ganz geprüft, nicht an den geschriebenen Worten
+
+Beide Puffer starten mit einem Giftwort, und **jedes** Wort wird verglichen: ein
+Wort, das der Spiegel als unberührt ausweist, muss noch Gift sein. Nur an den
+erwarteten Adressen zu prüfen ließe einen Port durch, der doppelt so viel schreibt —
+und die zwei plausibelsten Fehler hier haben genau diese Form
+(`point-loop-full`, `pad14-written`). Beide sind getötet, der zweite **nur**
+deshalb.
+
+### Der Sweep: 29 Mutanten, 29 getötet — und eine Tötung ist keine Evidenz
+
+`contact-guard-is-patch-guard` ersetzt den Kontakt-Sentinel-Test durch den
+Patch-Test; ein Fall mit lebendem Patch- und totem Kontakt-Offset schreibt dann nach
+`contactStreamAddr + 0xFFFFFFFF`. Er stürzte **4 von 4** Versuchen ab — aber der
+Absturz kommt von der **Adresse**, nicht vom Vergleich. Nach der Regel dieser
+Tranche (ein Mutant, dessen mutierte Form UB ist, prüft nichts) sagt sein Urteil
+in **keine** Richtung etwas, und er ist als solcher benannt, damit die 29 nicht
+als 29 Belege gelesen wird.
+
+**Die enge Richtung dieses Wächters ist ohne UB nicht prüfbar**, und das ist eine
+Eigenschaft des Codes, nicht der Fixture: der Sentinel **ist** eine Adresse, die
+nicht dereferenziert werden darf, also ist jeder Mutant, der eine durchlässt,
+undefiniert. Prüfbar ist die **weite** Richtung — ein Wächter, der feuert, wo er
+nicht soll — und `contact-guard-either` fällt über die 375 Fälle mit totem
+Patch-Strom. Zusammen steht damit fest, dass das Prädikat genau der
+Kontakt-Sentinel ist.
+
+Weitere benannte Tötungen: `normal-translated` gegen `point-not-translated` (die
+Normale wird nur rotiert, `:732`, der Punkt rotiert **und** verschoben, `:745` —
+beide Richtungen fallen, was die Nicht-Null-Translation kauft) und
+`writeindex-from-patch-index` (`patchIndex * 6 + idx` statt des gescannten Starts),
+getötet von den 2415 Fällen, deren Startindex **kein** Vielfaches von sechs ist.
+Eine Fixture, die jedes Mal ein volles Manifold scannt, hätte ihn durchgelassen.
 
 ## P9.83b-7 — die Material-Kombination hatte zwei Rümpfe, und die Fixture zertifizierte den falschen
 

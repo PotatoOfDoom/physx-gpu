@@ -177,6 +177,7 @@
 
 import pxgSlangContactReduceSerial;
 import pxgSlangNpPatchTail;   // nptCombineMaterials -- ONE combine, two writers
+import pxgSlangCommon;        // quatRotate
 
 public static const uint TTP_MESH_MESH_CONTACT_LIMIT = 6u;
 public static const uint TTP_MAX_MESH_MESH_PATCHES = 128u;
@@ -702,3 +703,149 @@ public void ttpWriteContactPatch(uint64_t patchStreamAddr, uint patchByteOffset,
     // w[14], w[15] are pad[1..4] and are NOT written, matching both CUDA writers.
 }
 
+
+// ---------------------------------------------------------------------------
+// writePatchesAndContacts (convexMeshMidphase.cu:673-751): the tail that joins
+// the reservation, the header write and the point write.
+// ---------------------------------------------------------------------------
+// FOUR THINGS IN THE CUDA ARE NOT OBVIOUS, AND ALL FOUR ARE TRANSCRIBED HERE.
+//
+// 1. THE SCAN IS OVER THE BLOCK, NOT OVER THE PATCHES.
+//    :703 runs threadBlockScanExclusive<NbWarps> over every thread, with
+//    count = 0 for threadIdx.x >= numPatchesToKeep (:698-700).  A zero-padded
+//    exclusive scan has the same prefix on its live prefix as a scan of the live
+//    entries alone, so ttpPatchStartIndices computes the short one and returns the
+//    same totalSum.  Entries at or past numPatchesToKeep hold totalSum and are
+//    never read -- both write loops are guarded by `< numPatchesToKeep`.
+//    The CUDA stores only the first MAX_MESH_MESH_PATCHES2 lanes (:704-705); the
+//    rest of the block's ids are discarded, which is why the padding is free.
+//
+// 2. THE POINT WRITE HAS NO LOOP, SO IT IS A blockDim CONSTRAINT.
+//    :736 maps thread -> patch as `threadIdx.x / MESH_MESH_CONTACT_LIMIT` and
+//    stops.  That covers blockDim/6 patches.  The engine launches this kernel
+//    with 1024 threads, so it covers 170 >= MAX_MESH_MESH_PATCHES2 = 128 and is
+//    exactly safe -- but only there.  A workgroup below 768 still writes every
+//    patch HEADER (:727 is guarded by numPatchesToKeep <= 128) while DROPPING THE
+//    POINTS of every patch at or past blockDim/6: a manifold that claims six
+//    contacts and supplies none.  This would be silent.
+//    The serial port loops over numPatchesToKeep instead, so it has no dependency
+//    on a workgroup size at all.  It agrees with the CUDA exactly at the engine's
+//    launch and is a superset below it.  That is the one place this file
+//    deliberately does not reproduce a thread mapping, and the reason is that the
+//    mapping encodes a launch assumption rather than a decision.
+//
+// 3. THE TWO WRITES ARE INDEPENDENTLY GATED, AND THE GATES CAN DISAGREE.
+//    writeContactPatch returns on a null patch pointer (:651); the point write
+//    tests `if (patchWriter.contacts)` at :746 -- the INNERMOST guard, inside both
+//    the patch-index and the point-index tests.  ttpReserveBlock sentinels each
+//    stream's offset on its own limit, so a patch-buffer overflow alone writes
+//    POINTS WITH NO HEADERS and a contact-buffer overflow alone writes HEADERS
+//    THAT POINT AT NOTHING.  Neither arm suppresses the other, and the overflow
+//    flag that zeroes the COUNTS (:580-586) does not reach either pointer.
+//
+// 4. THE MATERIAL SWAP UNDOES THE KERNEL'S SWAP.
+//    :1365 calls doTriangleTriangleCollision(transform1, transform0, mesh1, mesh0,
+//    shape1, shape0, ..., isFlipped = true) -- the arguments are already
+//    exchanged, so inside this function `shape0` IS the engine's shape1.  :729
+//    then asks for `isFlipped ? shape1 : shape0` as the first material, which in
+//    the flipped arm is the local shape1, i.e. the engine's shape0.  The pair
+//    handed to getContactMaterialProperties is therefore in ENGINE order on both
+//    arms; the swap exists to cancel the one at the call site, not to express a
+//    preference.  Porting only one of the two swaps silently exchanges dynamic
+//    and static friction on exactly half the mesh-mesh pairs.
+//    The normal's `isFlipped ? normal : -normal` (:733) is NOT the same cancelling
+//    -- the patch normal is computed in the local mesh1 frame in both arms and
+//    must end up pointing from the engine's shape0 to its shape1, so one arm
+//    negates.  Two conditionals on the same predicate, doing different jobs.
+
+// ---------------------------------------------------------------------------
+// THE WRITE SWEEP: 29 MUTANTS, 29 KILLED, 0 SURVIVE -- AND ONE OF THE KILLS IS
+// NOT EVIDENCE
+// ---------------------------------------------------------------------------
+// 28 fell on the fixture's oracle.  The 29th, `contact-guard-is-patch-guard`,
+// SEGFAULTED on all four attempts, and that is a kill the fixture did not earn:
+// the mutant replaces the contact sentinel test with the patch one, so a case with
+// a live patch offset and a dead contact offset writes to
+// contactStreamAddr + 0xFFFFFFFF.  The crash comes from the ADDRESS, not from the
+// comparison.  By the rule this tranche wrote down -- a mutant whose mutated form
+// is undefined behaviour tests nothing -- its verdict says nothing either way, and
+// it is listed here so the 29 is not read as 29 pieces of evidence.
+//
+// THE NARROW DIRECTION OF THAT GUARD CANNOT BE TESTED WITHOUT UB, and that is a
+// property of the code, not of the fixture: the sentinel IS an address that must
+// not be dereferenced, so every mutant that lets one through is undefined.  What
+// can be tested is the WIDE direction -- a guard that fires when it should not --
+// and `contact-guard-either` (skip the points whenever the PATCH stream is dead)
+// is killed by the 375 patch-sentinel-only cases.  Between the two, what is
+// established is that the guard's predicate is the contact sentinel alone.
+//
+// The mutants worth naming among the 28:
+//
+//   swap-dropped / swap-always / swap-half   the :729 material exchange, in its
+//       three broken forms.  All three are killed ONLY by header words 12 and 13,
+//       because every branch of the combine is symmetric in its arguments -- see
+//       the note at the head of testNpTriTriWrite.cpp.
+//   normal-translated                        rotate-and-translate where the CUDA
+//       rotates; the mirror of point-not-translated, which does the reverse.  Both
+//       are killed, which is what a non-zero translation buys.
+//   writeindex-from-patch-index              patchIndex * 6 + idx instead of the
+//       scanned start.  Killed by the 2415 cases whose start index is not a
+//       multiple of six; with a fixture that scanned a full manifold every time it
+//       would have survived.
+//   pad14-written                            one extra word into pad[1..4].  Killed
+//       only because the fixture compares the WHOLE stream against a poison fill,
+//       not just the words it expects.
+
+// The zero-padded block scan of 1, reduced to its live prefix.  Returns the total.
+public uint ttpPatchStartIndices(uint pointCounts[TTP_MAX_MESH_MESH_PATCHES],
+                                 uint numPatchesToKeep,
+                                 out uint startIndex[TTP_MAX_MESH_MESH_PATCHES])
+{
+    uint running = 0u;
+    for (uint i = 0u; i < TTP_MAX_MESH_MESH_PATCHES; ++i)
+    {
+        startIndex[i] = running;
+        if (i < numPatchesToKeep)
+            running += pointCounts[i];
+    }
+    return running;
+}
+
+// One patch: the 64-byte header (:727-734) and its up-to-six points (:736-750).
+// `rotQ`/`rotP` are the LOCAL transform1 -- the second argument as this function
+// sees it, which the kernel may already have exchanged.  See note 4.
+public void ttpWritePatchAndContacts(uint64_t patchStreamAddr, uint patchByteOffset,
+                                     uint64_t contactStreamAddr, uint contactByteOffset,
+                                     uint64_t materialsAddr,
+                                     uint patchIndex, uint patchStartIndex,
+                                     TtpPatch p,
+                                     float4 rotQ, float3 rotP, bool isFlipped,
+                                     uint shapeMaterialIndex0, uint shapeMaterialIndex1)
+{
+    // :729 -- the swap that cancels the kernel's.
+    const uint mi0 = isFlipped ? shapeMaterialIndex1 : shapeMaterialIndex0;
+    const uint mi1 = isFlipped ? shapeMaterialIndex0 : shapeMaterialIndex1;
+
+    // :732-733.  rotate only: a normal carries no translation.
+    const float3 normal = quatRotate(rotQ, p.normal);
+    ttpWriteContactPatch(patchStreamAddr, patchByteOffset,
+                         patchIndex, patchStartIndex,
+                         isFlipped ? normal : -normal, p.pointCount,
+                         materialsAddr, mi0, mi1);
+
+    if (contactByteOffset == 0xFFFFFFFFu)   // :746, `if (patchWriter.contacts)`
+        return;
+
+    Ptr<float4> c = Ptr<float4>(contactStreamAddr + uint64_t(contactByteOffset));
+
+    const uint n = min(p.pointCount, TTP_MESH_MESH_CONTACT_LIMIT);
+    for (uint idx = 0u; idx < n; ++idx)     // :741, `if (idx < patch.PointCount)`
+    {
+        const uint writeIndex = patchStartIndex + idx;      // :743
+        const float4 pt = p.keepPoints[idx];
+        // :745 -- full transform here, unlike the normal.
+        const float3 pos = quatRotate(rotQ, pt.xyz) + rotP;
+        // :748 -- separation rides through untouched.
+        c[writeIndex] = float4(pos, pt.w);
+    }
+}
