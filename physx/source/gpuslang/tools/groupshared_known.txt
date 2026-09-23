@@ -133,3 +133,10 @@ npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812
 # scan's own perWarpCountS included.  Fits with 1540 spare; the write tail and any
 # shape staging would take up to ~950 of that -- measured on the real entry later.
 npTriTriSharedProbe:triTriSharedProbeAliased    31228
+# P9.83b-5 (15/n): the FIXTURE entry for tryToAssign/createNewPatches -- the real
+# assignment storage (patches in Workgroup storage, the scratch in the 8192-byte
+# alias, the warp scratch, countersS/shMinSepS, anyKeepS) plus one guard record.
+# 29060 - 128 (guard) + 2296 (the gather's subdivision buffer, the SDF record,
+# offset, the scan's perWarpCountS, the subdivision count) = 31228, the 15a/n
+# number: the fixture and the probe agree buffer for buffer.
+npTriTriBlock:ttbAssignProbe    29060

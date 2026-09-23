@@ -56,9 +56,16 @@
 // ttbWarpReduceSerial calls crsContactReduce2, which lives in this MODULE; the
 // block file is a textual include and cannot import it on its includer's behalf.
 import pxgSlangContactReduceSerial;
+// P9.83b-5 (15/n): the assignment part uses TtpPatch, the serial reduce and the
+// acceptance constants from this module.
+import pxgSlangTriTriPatch;
 
 #define PXG_WARP_BLOCK 1024
 #include "pxgSlangWarpInc.slang"
+// One poisoned patch record past the CUDA's 128, so a mutant that writes record
+// 128 is a visible kill rather than undefined behaviour (the rule at
+// pxgSlangTriTriPatch.slang's sweep notes: a kill by UB proves nothing).
+#define TTB_PATCH_GUARD 1
 #include "pxgSlangTriTriBlock.slang"
 
 struct TtbPush
@@ -143,7 +150,7 @@ void ttbProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 //
 // TWO CALLS BACK TO BACK, with different masks.  The first exercises the staging;
 // the second exists for the trailing barrier and the slot reuse -- the result of
-// call one and the input of call two travel through the same gTtbReduceMask slot.
+// call one and the input of call two travel through the same mask slot.
 //
 // EVERY THREAD writes its own copy of the result, not lane 0 alone: the property
 // under test is that warp w's answer reaches all 32 of warp w's lanes, and a
@@ -173,4 +180,93 @@ void ttbReduceProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     Ptr<uint> o = Ptr<uint>(gTb.out + uint64_t(c) * uint64_t(TTB_RED_OUT_STRIDE) * 4UL);
     o[tid] = r1;
     o[1024u + tid] = r2;
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (15/n): the assignment -- tryToAssign over the existing patches, then
+// createNewPatches -- exactly as the kernel runs it each iteration (:1207-1220).
+// ---------------------------------------------------------------------------
+// Same push struct, its own case layout (49296 bytes):
+//   @0      float4 posSep[1024]      xyz = contact.pos, w = contact.separation
+//   @16384  uint4  normalCand[1024]  xyz = asuint(contact.normal), w = candidate
+//   @32768  patch records[129]       128 bytes each: keepPoints[6] @0, normal @96,
+//                                    deepest @108, pointCount @112; record 128 is
+//                                    the GUARD (TTB_PATCH_GUARD), never legally
+//                                    touched
+//   @49280  uint numPatchesToKeep, int generatedThisIter, float clusterBias, pad
+//
+// Out (65664 bytes): the 129 records after the call, then per thread
+// uint4 posSep, uint4 normalCand, uint4 (numPatchesToKeep, remaining, 0, 0) --
+// EVERY thread reports its own count, because numPatchesToKeep is a per-thread
+// register in the CUDA and a non-uniform increment would show up as threads that
+// disagree.
+static const uint TTB_ASG_CASE_STRIDE = 49296u;
+static const uint TTB_ASG_OUT_STRIDE = 65664u;
+static const uint TTB_ASG_RECORDS = TTP_MAX_MESH_MESH_PATCHES + TTB_PATCH_GUARD;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void ttbAssignProbe(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    const uint cs = gid.x;
+    if (cs >= gTb.numCases) return;
+    const uint tid = gtid.x;
+
+    const uint64_t base = gTb.cases + uint64_t(cs) * uint64_t(TTB_ASG_CASE_STRIDE);
+    const uint64_t recs = base + 32768UL;
+
+    for (uint i = tid; i < TTB_ASG_RECORDS * 8u; i += 1024u)
+    {
+        const uint r = i >> 3;
+        const uint k = i & 7u;
+        const uint4 v = Ptr<uint4>(recs + uint64_t(r) * 128UL + uint64_t(k) * 16UL)[0];
+        if (k < 6u)
+            gTtbPatches[r].keepPoints[k] = asfloat(v);
+        else if (k == 6u)
+        {
+            gTtbPatches[r].normal = asfloat(v.xyz);
+            gTtbPatches[r].deepest = asfloat(v.w);
+        }
+        else
+            gTtbPatches[r].pointCount = v.x;
+    }
+
+    TtbContact c;
+    const float4 ps = Ptr<float4>(base)[tid];
+    const uint4 nc = Ptr<uint4>(base + 16384UL)[tid];
+    c.pos = ps.xyz;
+    c.separation = ps.w;
+    c.normal = asfloat(nc.xyz);
+    c.candidate = nc.w != 0u;
+
+    const uint4 hdr = Ptr<uint4>(base + 49280UL)[0];
+    uint numPatchesToKeep = hdr.x;
+    const int generatedThisIter = int(hdr.y);
+    const float clusterBias = asfloat(hdr.z);
+
+    ttbInitAssignState(tid);                       // the kernel's :1024-1025
+    GroupMemoryBarrierWithGroupSync();
+
+    const int remaining = ttbAssignContacts(tid, c, clusterBias, generatedThisIter, numPatchesToKeep);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint64_t out = gTb.out + uint64_t(cs) * uint64_t(TTB_ASG_OUT_STRIDE);
+    for (uint i = tid; i < TTB_ASG_RECORDS * 8u; i += 1024u)
+    {
+        const uint r = i >> 3;
+        const uint k = i & 7u;
+        uint4 v;
+        if (k < 6u)
+            v = asuint(gTtbPatches[r].keepPoints[k]);
+        else if (k == 6u)
+            v = uint4(asuint(gTtbPatches[r].normal), asuint(gTtbPatches[r].deepest));
+        else
+            v = uint4(gTtbPatches[r].pointCount, 0u, 0u, 0u);
+        Ptr<uint4>(out + uint64_t(r) * 128UL + uint64_t(k) * 16UL)[0] = v;
+    }
+    const uint64_t th = out + 16512UL + uint64_t(tid) * 48UL;
+    Ptr<uint4>(th)[0] = asuint(float4(c.pos, c.separation));
+    Ptr<uint4>(th + 16UL)[0] = uint4(asuint(c.normal), c.candidate ? 1u : 0u);
+    Ptr<uint4>(th + 32UL)[0] = uint4(numPatchesToKeep, uint(remaining), 0u, 0u);
 }

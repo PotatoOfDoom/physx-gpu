@@ -45,6 +45,7 @@
 
 #include "pxgTestFramework.h"
 #include "pxgCrsRef.h"
+#include "pxgTriTriRef.h"
 
 #include <cmath>
 #include <cstdint>
@@ -62,68 +63,10 @@ using namespace pxgtest;
 // reduceShared -- the <clustering, !dupe, 6> path only -- which was compared
 // against the full one expression by expression before it was deleted.
 using namespace pxgtest::crsref;
+using namespace pxgtest::tritriref;   // refReduce, refMinIndex, the EPS constants -- 15/n
 
-struct RefResult
-{
-    V4 keepPoints[6];
-    uint32_t pointCount;
-    float deepest;
-    uint32_t survivorMask;
-    uint32_t passes;
-};
-
-// reduceContactsSingleWarp (convexMeshMidphase.cu:440-496), serialised.
-static RefResult refReduce(const V4* tempPoints, uint32_t totalContacts, V3 nor, float clusterBias)
-{
-    V3 pA[32];
-    float sep[32];
-    for (uint32_t j = 0; j < 32; ++j) { pA[j] = { 0, 0, 0 }; sep[j] = FLT_MAX_LOCAL; }
-
-    uint32_t currentContactMask = 0, hasMask = 0;
-    const uint32_t maxCounter = 100;
-    uint32_t counter2 = 0;
-
-    for (uint32_t c = 0; c < totalContacts && counter2 < maxCounter; )
-    {
-        ++counter2;                                        // :455
-        const uint32_t readMask = ~currentContactMask;     // :457
-        for (uint32_t l = 0; l < 32; ++l)
-        {
-            const bool needsContact = ((readMask >> l) & 1u) != 0u;   // :458, both arms
-            const uint32_t readIndex = c + popcount32(readMask & ((1u << l) - 1u));  // :459
-            if (needsContact && readIndex < totalContacts)  // :461
-            {
-                pA[l] = { tempPoints[readIndex].x, tempPoints[readIndex].y, tempPoints[readIndex].z };
-                sep[l] = tempPoints[readIndex].w;
-                hasMask |= 1u << l;                        // :466
-            }
-        }
-        c += popcount32(readMask);                         // :469, LANES OFFERED
-        currentContactMask = hasMask;                      // :471
-        currentContactMask = refWrapper2(pA, sep, nor, currentContactMask, clusterBias); // :472
-        hasMask = currentContactMask;                      // :473
-    }
-
-    RefResult r{};
-    r.passes = counter2;
-
-    float deepest = FLT_MAX_LOCAL;                         // :477-478
-    for (uint32_t j = 0; j < 32; ++j)
-        if (((currentContactMask >> j) & 1u) != 0u && sep[j] < deepest) deepest = sep[j];
-    r.deepest = deepest;
-
-    r.pointCount = popcount32(currentContactMask);         // :481
-    r.survivorMask = currentContactMask;
-    for (uint32_t k = 0; k < 6; ++k) r.keepPoints[k] = { 0, 0, 0, 0 };
-
-    for (uint32_t l = 0; l < 32; ++l)                      // :491-495
-    {
-        if (((currentContactMask >> l) & 1u) == 0u) continue;
-        const uint32_t off = popcount32(currentContactMask & ((1u << l) - 1u));
-        if (off < 6) r.keepPoints[off] = { pA[l].x, pA[l].y, pA[l].z, sep[l] };
-    }
-    return r;
-}
+// RefResult and refReduce (reduceContactsSingleWarp, serialised) moved VERBATIM to
+// tests/pxgTriTriRef.h in P9.83b-5 (15/n), where the block mirror uses them too.
 
 struct TtrParams { uint32_t numCases, pad0, pad1, pad2; };
 struct TtrCase
@@ -308,23 +251,8 @@ PXG_TEST(npTriTriReduce_stream)
 // invite, since they look like the same three lines.
 // ---------------------------------------------------------------------------
 
-static const float PATCH_ACCEPTANCE_EPS2 = 0.85f;
-static const float PATCH_ACCEPTANCE_EPS3 = 0.9995f;
-
-// nputils.cuh:152-163.  lowestSetIndex(0) = __ffs(0) - 1 = 0xFFFFFFFF.
-static uint32_t refMinIndex(const float* v, uint32_t mask, float& minV)
-{
-    minV = FLT_MAX_LOCAL;
-    for (uint32_t j = 0; j < 32; ++j)
-        if (((mask >> j) & 1u) != 0u && v[j] < minV) minV = v[j];
-    uint32_t ballot = 0;
-    for (uint32_t j = 0; j < 32; ++j)
-        if (v[j] == minV) ballot |= 1u << j;
-    ballot &= mask;
-    if (ballot == 0u) return 0xFFFFFFFFu;
-    uint32_t i = 0; while (((ballot >> i) & 1u) == 0u) ++i;
-    return i;
-}
+// PATCH_ACCEPTANCE_EPS2/3 and refMinIndex (nputils.cuh:151-164) moved to
+// tests/pxgTriTriRef.h in P9.83b-5 (15/n).
 
 static void refAcceptExisting(const V3* cn, V3 pn, uint32_t& acceptMask, uint32_t& accept2Mask)
 {

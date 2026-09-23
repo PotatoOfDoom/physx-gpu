@@ -1971,6 +1971,209 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.83b-5 (15/n) — tryToAssign und createNewPatches als Block-Logik, auf dem gemessenen Speicher
+
+Neu in `pxgSlangTriTriBlock.slang`: `ttbTryAssignExisting` (convexMeshMidphase.cu:768-858),
+`ttbCreateNewPatches` (:860-970) und `ttbAssignContacts` (:1207-1220) — die beiden Pässe,
+die der Kernel in jeder Iteration fährt. Fixture `npTriTriBlock_assign` in der Suite
+`npTriTriBlock` (keine neue ctest-Zeile), 37 Fälle zu je 1024 Threads, bit-exakt gegen
+einen Block-Spiegel, der aus der CUDA geschrieben ist.
+
+### Der Speicher ist der, den 15a/n gemessen hat
+
+Die Patches liegen im **Workgroup-Speicher** (`gTtbPatches[128]`, 128-Byte-`TtpPatch`),
+und `tempPointsS`, die Ein-Warp-Stage und die Per-Warp-Masken wohnen als Sichten in
+**`gTtbScratch[512]`** — den 8192 Bytes, die sonst der Index-Puffer des Gathers sind. Die
+14/n-Arrays `gTtbWarpStage`/`gTtbReduceMask` gibt es nicht mehr; `ttbWarpReduceSerial`
+liest und schreibt über `ttbStageSet/Get` und `ttbMaskSet/Get`.
+
+Der Fixture-Entry `ttbAssignProbe` trägt genau diese Puffer: **29060 Bytes** (neue
+Ratchet-Zeile). Minus der eine Guard-Record (128), plus was nur der echte Kernel braucht —
+Unterteilungspuffer, SDF-Record, `offset`, das eigene `perWarpCountS` des Scans, der
+Unterteilungszähler (2296) — ergibt **31228**, die Zahl aus 15a/n. Fixture und Probe
+stimmen Puffer für Puffer überein.
+
+Weil die Patches im Workgroup-Speicher liegen, bleibt die **Threadabbildung der CUDA**:
+jeder Thread liest `patchesS[p]` direkt nach einer Barriere, die Seed-Lane schreibt die
+Normale des neuen Patches selbst (`:911`), Threads `< PointCount` kopieren die gehaltenen
+Punkte (`:828-829`). Nur `reduceContactsSingleWarp` läuft auf einem Thread — der serielle
+Rumpf aus P9.83b-5 — und schreibt den Record zurück. Die Broadcast-Slots und die
+„Port-Barriere" des Auslagerungs-Entwurfs sind weg.
+
+### Drei Entscheidungen, die nicht in der CUDA stehen
+
+**`anyKeepS` initialisiert der Kernel, nicht die Funktion.** Die CUDA setzt es einmal beim
+Kernelstart (`:1024-1025`) und am Ende jedes Aufrufs zurück (`:853-854`).
+Workgroup-Speicher ist zu Dispatch-Beginn undefiniert; ein erster Aufruf mit Müll darin
+nähme den `:808`-Zweig und würde das Band (0.85, 0.9995] zählen und aussortieren
+(15/n-Review). `ttbInitAssignState` ist die benannte Pflicht des Kernels; der Fixture-Entry
+ruft sie. Ein Fixture, das initialisiert, kann nicht sehen, ob der Kernel es vergisst — das
+prüft erst die Kernel-Fixture in P9.83b-8.
+
+**Nur die überlebenden KeepPoints werden geschrieben.** `:491-495` schreibt nur Lanes der
+Endmaske; ein von 6 auf 4 reduzierter Patch behält seine alten Punkte in den Slots 4-5.
+Niemand liest sie (`:741`, `:828` enden bei PointCount) — aber die Fixture vergleicht ganze
+Records, und das Nullen, das der Entwurf zuerst hatte, wäre ein sichtbarer Unterschied
+gewesen.
+
+**Ein Guard-Record hinter dem 128sten** (`TTB_PATCH_GUARD 1` nur im Fixture), damit ein
+Mutant, der Record 128 schreibt, ein sichtbarer Kill ist und nicht undefiniertes Verhalten.
+
+### Die Fälle, und warum jeder da ist
+
+Aus dem Fixture-Plan des Reviews, jede Familie mit dem Mutanten, den sie töten soll:
+
+* **generisch** (16), engine-konsistent;
+* **OFF-ENGINE `remaining < live`** (4): `generatedThisIter` = accept2-Zahl von Patch 0,
+  bzw. 0 — sonst sind das Dekrement `:815`, die accept/accept2-Vertauschung bei `:812` und
+  die Gates `:1213`/`:872` unsichtbar, weil `remaining` in der Engine immer die Zahl der
+  lebenden Kandidaten ist;
+* **Null-Normalen-Seed** (Upstream-Kandidat B) ab 0, 125 und 127 — füllt bis zur Kappe;
+* **`(0.9375, 0, 0)`-Seed** (off-engine): der nicht hängende Kill für ein fehlendes
+  `|| myNormal`;
+* **exakt auf den Schwellen**: die einzige nahe Lane bei genau 0.9995f; ≤ 6 Akzeptanzen mit
+  0.9995f, 0.9993f, 0.85f und 0.8501f; accept2 ohne ein einziges accept;
+* **anyKeep aus nur einem Warp** — dem ersten, dann dem letzten;
+* **Kapazität 198**: 6 gehaltene + 6 Emitter in jedem der 32 Warps, der tiefste Punkt als
+  letzter Emitter von Warp 31;
+* **die Kappe**: Eintritt bei 128, 127, 126, der Guard-Record von allen akzeptiert;
+* **Gleichstände** im Seed-Warp und über Warps hinweg.
+
+**FMA-Parität per Konstruktion:** jede Normale hat genau eine von null verschiedene
+Komponente — jede Projektion ist dann ein einzelnes Produkt, das fusioniert wie unfusioniert
+gleich rundet; Positionen auf einem 2⁻⁴-Raster, Separationen auf 2⁻¹⁰. Nicht-einheitliche
+Achsennormalen erscheinen nur dort, wo der Reduce, den sie speisen, den ≤ 6-Punkte-Ausstieg
+nimmt.
+
+Gedeckt, und die Fixture verlangt es: aussortiert in 33, neue Patches in 31, ein
+bestehender Patch geändert in 24, die Kappe erreicht in 8 der 37 Fälle.
+
+### Konsolidierung
+
+`refReduce` und `refMinIndex` ziehen **wörtlich** nach `tests/pxgTriTriRef.h`; die zweite
+Kopie von `minIndex` in `testNpTriTriBlock.cpp` ist jetzt ein Weiterreicher auf dieselbe
+Funktion. `npTriTriReduce` läuft danach unverändert grün.
+
+### Der Sweep
+
+50 Mutanten: die 14/n-Menge, neu verankert auf den Scratch-Sichten, plus 36 neue.
+
+**Erste Runde: 43 getötet, 7 überlebt — und ein Kill durch UB.** Zwei Überlebende waren
+Deckungslücken, keine Äquivalenzen:
+
+* `ta-accept2-ge` (`>=` bei `:781`): jede Lane bei genau 0.85 lag bisher in
+  `createNewPatches`; in `tryToAssign` zählt `accept2` nur **innerhalb** eines Aufrufs mit
+  gesetztem anyKeep. Neuer Fall: eine 0.85-Lane neben strikten Treffern.
+* `ta-no-reset` (das Zurücksetzen bei `:853-854` fehlt): es gab keinen zweiten Patch, zu dem
+  ein hängengebliebenes Flag hätte durchsickern können. Neuer Fall: Patch 0 setzt anyKeep,
+  Patch 1 hat nur Lanes im Band (0.85, 0.9995].
+
+Und `drv-p-le` starb als **Absturz**: der Giftrecord hinter `numPatchesToKeep` trug
+`pointCount = 0xDEAD`, `keepPoints[tid]` las weit hinter das Array — ein Kill durch UB, der
+nichts beweist. Das Gift hat jetzt ein gültiges `pointCount` (5). Ein Mini-Sweep der drei
+bestätigte alle drei Kills (`drv-p-le` jetzt als gewöhnlicher Kill), dann lief der **ganze**
+Sweep neu — einmal vom Container-Neustart abgebrochen, die Quelle danach als unmutiert
+geprüft (alle 50 Anker genau einmal), neu gebaut, neu gestartet:
+
+**45 getötet** (5 durch Hang, 1 durch Absturz), **5 überlebt**, alle diagnostiziert:
+
+| Mutant | Befund |
+|---|---|
+| `stage-into-temp` | äquivalent: Stage und `tempPointsS` leben nie gleichzeitig — die Stage ist tot, bevor `tempPointsS` geschrieben wird, und `tempPointsS` vor der nächsten Stage; selbst überlappende Slots halten nie zwei lebende Werte |
+| `cn-no-candidate-gate` | äquivalent auf Engine-Eingaben: ein Nicht-Kandidat hat die Normale 0 |
+| `cn-no-total-gate` | äquivalent: der Seed wird immer akzeptiert, also mindestens ein Punkt |
+| `cn-no-count-gate` | äquivalent: ebenso PointCount ≥ 1 |
+| `init-removed` | hier unbeobachtbar: ein fehlendes Init ist nicht von Workgroup-Speicher zu unterscheiden, der zufällig 0 hält — das muss die Kernel-Fixture prüfen |
+
+Drei Kills kamen nur über einen **Hang** (`cn-drop-mynormal`, `cn-incr-gate-inverted`,
+`cn-has-not-reset`): der Fall mit Nullnormale hängt vor dem nicht hängenden
+`(0.9375, 0, 0)`-Kill. Ein Hang ist ein Kill; festgehalten, weil er alle anderen Prüfungen
+desselben Laufs verdeckt.
+
+Suite **873/873** in **beiden** Speichermodi, 461 `.spv`. Keine Szenen: kein Engine-Code
+und kein Engine-Shader hat sich geändert — das Modul ist noch nirgends angeschlossen.
+
+## P9.83b-6 — sieben Upstream-Kandidaten aus dem Mesh-gegen-Mesh-Kernel (53 → 60), dokumentiert und keiner gemeldet
+
+Beim Portieren von `doTriangleTriangleCollision` (convexMeshMidphase.cu) sind über die
+Tranchen P9.83b-5 (1/n … 15/n) Stellen aufgefallen, an denen die CUDA selbst fragwürdig
+ist. Sie standen bisher verstreut in Modulkommentaren und Tranchen-Einträgen; hier sind sie
+an einer Stelle, jede mit ihrer **Beleglage**. Die Regel dieses Ports gilt unverändert:
+**dokumentiert, nicht gemeldet**, und der Port bleibt der CUDA treu, wo er kann.
+
+| # | Stelle | Was | Beleglage |
+|---|---|---|---|
+| 54 | `:728`, `:642-647`, `:662-663` | `materialIndex0/1` jedes Patches aus einer **uninitialisierten** Lokalen | gelesen; Geschwister-Schreiber als Gegenbeleg |
+| 55 | `:527-529`, `:554`, `:609-611` | ein Block ohne Kontakte publiziert `base + 0xFFFFFFFF` statt NULL | gelesen; Fixture `npTriTriReduce_reserve` (750 Fälle) |
+| 56 | `:558` gegen `:573` | Kraftpuffer: reserviert N, prüft 2N | gelesen; Fixture (1054 Fälle scheitern nur an der ×2) |
+| 57 | `:736-745` | Punkt-Schreiben ohne Schleife: nur `blockDim/6` Patches bekommen Punkte | gelesen; latent (Engine startet 1024 Threads) |
+| 58 | `:902-960`, sdfCollision.cuh:488 | ein Seed, dessen Normale ihn nicht selbst aussortiert, füllt bis 128 Ein-Punkt-Patches | **gemessen** (15/n-Fixture) |
+| 59 | `:899`, `:902` | `countersS[minIBlock]` ohne Wächter; `minIBlock = 0xFFFFFFFF` bei NaN | gelesen; nur mit NaN erreichbar |
+| 60 | sdfCollision.cuh:512-516, `:637-647`, `:681-686` | der Handschlag „letzter Slot setzt `offset`" mit Unterteilungseinträgen | **unbestätigt** — nur Überlegung |
+
+**54 — `materialIndex0/1` aus einer uninitialisierten Lokalen.** `:728` deklariert
+`PxgContactMaterialProperties contactMaterialProperties;` ohne Initialisierer.
+`getContactMaterialProperties` (`:642`) reicht an `combineMaterials(materials,
+shape0.materialIndex, shape1.materialIndex, …)` (`:644`) weiter — acht Parameter, **keiner**
+davon ein ausgehender Materialindex. `:662-663` speichern dann
+`cmp.materialIndex0/1` in den Patch. Jeder Patch dieses Kernels trägt damit zwei
+unbestimmte Worte. Der Geschwister-Schreiber macht es richtig
+(contactPatchUtils.cuh:149-150 liest sie aus den Shapes, `:170-171` speichert sie) — das
+macht es zu einem Defekt statt zu einer Konvention. Der Port schreibt die wohldefinierten
+Werte (nach dem npTriHfNp-Präzedenzfall für Upstream-UB) und sagt es laut
+(pxgSlangTriTriPatch.slang).
+
+**55 — der Null-Kontakt-Pfad publiziert `base + 0xFFFFFFFF`.** Die drei Offsets starten
+als Sentinel `0xFFFFFFFF` (`:527-529`), die Atomics hängen an `if (totalNumContacts)`
+(`:554`), und ein Block ohne Kontakte lässt `overflow` falsch — Thread 0 nimmt also den
+`!overflow`-Zweig und schreibt `startContactForces/Patches/Points + 0xFFFFFFFF`
+(`:609-611`). Der Overflow-Zweig schreibt Nullen; der zurückgegebene Writer macht aus
+demselben Sentinel NULL (`:625-626`). Ungefährlich, solange niemand über `nbContacts = 0`
+hinaus liest — aber asymmetrisch zu beiden Nachbarn.
+
+**56 — Kraftpuffer: reserviert N, prüft 2N.** `:558` reserviert `sizeof(PxU32) *
+totalNumContacts`, `:573` prüft `… * totalNumContacts * 2`. Entweder ist die Reservierung
+zu klein oder die Prüfung zu streng; beides zugleich kann nicht gemeint sein. Dazu die
+Breiten: die Prüfungen sind `size_t` und können nicht überlaufen, die `atomicAdd`-Argumente
+werden auf `unsigned` verengt und können es.
+
+**57 — `blockDim ≥ 768` ist eine stille Bedingung.** `:736` bildet Thread auf Patch als
+`threadIdx.x / 6` ab und schreibt ohne Schleife; das deckt `blockDim/6` Patches. Bei 1024
+Threads sind das 170 ≥ 128 — sicher, **aber nur dort**: unter 768 Threads bekäme jeder Patch
+seinen Header und ab `blockDim/6` keine Punkte mehr, ein Manifold, der sechs Kontakte
+behauptet und keinen liefert. Latent; der Port schleift und hat keine Abhängigkeit.
+
+**58 — ein Seed, der sich nicht selbst aussortiert, füllt die Patchliste.** In
+`createNewPatches` wird der Seed über `|| myNormal` akzeptiert (`:925`), aussortiert aber nur
+über `accept2 = proj > 0.85` (`:924`, `:959-960`) — und `proj` ist die Projektion seiner
+**eigenen** Normale auf sich selbst, `|n|²`. Ist `|n|² ≤ 0.85`, bleibt der Seed Kandidat,
+wird im nächsten Durchlauf wieder Seed, und so fort: ein Ein-Punkt-Patch pro Durchlauf,
+bis `numPatchesToKeep` 128 erreicht; danach wird jeder spätere Kontakt verworfen.
+Erreichbar ist das mit der **Nullnormale**: der letzte Gradient `sdfGradient =
+PxVolumeGrad(…)` (sdfCollision.cuh:488) ist ungeschützt, `getNormalized` liefert für
+Betrag 0 die Null, und ein Punkt mit `diff == 0` im SDF-Kasten erhält `dir = 0`. Eine echte
+Normale hat Betrag 1, also ist die Nullnormale der Engine-Fall; die 15/n-Fixture pflanzt sie
+(ab 0, 125 und 127 Patches) und findet dieselbe Füllung für eine Normale vom Betrag 0.85
+(off-engine). **Gemessen**: der Port und der Spiegel aus der CUDA füllen beide bis 128.
+
+**59 — `countersS[minIBlock]` ohne Wächter.** Die Block-`minIndex` (`:899`) liefert
+`0xFFFFFFFF`, wenn kein Warp-Minimum gleich dem Minimum ist — das braucht NaN, weil
+`fminf` den Nicht-NaN-Operanden durchreicht. `:902` indiziert damit ungeprüft. Nur mit einer
+NaN-Separation erreichbar, also mit einem NaN-Kontakt.
+
+**60 — UNBESTÄTIGT: der Letzter-Slot-Handschlag mit Unterteilungseinträgen.** In
+`findInterestingTrianglesA` setzt der Thread, der Slot `TargetCount - 1` füllt, `offset =
+index.x + 1` (sdfCollision.cuh:512-516), und der Aufrufer macht daraus den nächsten
+`startIndex` (`:681-686`). Für einen **Unterteilungs**eintrag (`threadIdx.x < 4 *
+nbSubdivisionIndices`, `:637-643`) ist `index.x` aber der Index des **Eltern**dreiecks aus
+einer früheren Runde, nicht die Position im Primitivstrom — der nächste Aufruf würde dann
+von dort neu beginnen, Dreiecke doppelt sammeln oder überspringen. Ob die Pufferfüllung je
+genau auf einem Unterteilungsthread endet, ist nicht konstruiert und nicht gemessen; das
+steht hier als **Überlegung**, nicht als Befund, und wird geprüft, wenn P9.83b-8 den
+unterteilungsfähigen Gather baut.
+
+**Damit stehen 60 Upstream-Kandidaten, dokumentiert und keiner gemeldet.**
+
 ## P9.85 — Engine-Kernel liefen ohne Ordnung zwischen Dispatches, und nur llvmpipe hat es verdeckt
 
 CUDA führt die Kernel eines Streams der Reihe nach aus, und jeder Engine-Kernel, der liest,

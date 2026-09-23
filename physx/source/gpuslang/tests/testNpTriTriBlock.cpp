@@ -47,6 +47,7 @@
 
 #include "pxgTestFramework.h"
 #include "pxgCrsRef.h"
+#include "pxgTriTriRef.h"
 
 #include <algorithm>
 #include <cmath>
@@ -82,25 +83,12 @@ const uint32_t OUT_STRIDE = 1152;
 static uint32_t popc(uint32_t v) { uint32_t c = 0; while (v) { c += v & 1u; v >>= 1; } return c; }
 static uint32_t bits32(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
-// minIndex (nputils.cuh:151-164) over one warp's 32 lanes.  Written from the
-// CUDA: the ballot compares against the lane's ORIGINAL value and the mask is
-// applied AFTER it, so an unmasked lane equal to the masked minimum sets a bit
-// that only the `& mask` removes.
+// minIndex (nputils.cuh:151-164) is tritriref::refMinIndex (pxgTriTriRef.h) since
+// P9.83b-5 (15/n): this file's own copy and testNpTriTriReduce.cpp's were the same
+// function twice, and they are one now.
 static uint32_t minIndexRef(const float* v, uint32_t mask, float& minV)
 {
-    minV = FLT_MAX_LOCAL;
-    for (uint32_t l = 0; l < 32; ++l)
-        if (((mask >> l) & 1u) != 0u && v[l] < minV) minV = v[l];
-
-    uint32_t ballot = 0;
-    for (uint32_t l = 0; l < 32; ++l)
-        if (v[l] == minV) ballot |= 1u << l;
-    ballot &= mask;
-
-    if (ballot == 0u) return NO_INDEX;
-    uint32_t idx = 0;
-    while (((ballot >> idx) & 1u) == 0u) ++idx;
-    return idx;
+    return pxgtest::tritriref::refMinIndex(v, mask, minV);
 }
 
 } // namespace
@@ -594,6 +582,469 @@ PXG_TEST(npTriTriBlock_warpReduce)
                 "on %zu warps\n",
                 N, warps, reductionsRun, earlyOut, emptyMask, callsDiffer, answerNotInput,
                 dupePlants, dupeMatters);
+
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (15/n): the assignment -- tryToAssign over the existing patches, then
+// createNewPatches -- as the kernel runs it each iteration (:1207-1220).
+// ---------------------------------------------------------------------------
+// The oracle is pxgTriTriRef.h's block mirror, written from the CUDA.  The case
+// set is built from the 15/n review's fixture plan; every family names what it is
+// there to kill, because a mutant that survives without its input is a coverage
+// gap, not an equivalence.
+//
+// FMA PARITY, by construction rather than by luck.  llvmpipe fuses dot() and the
+// unstamped reduce; the mirror is built with -ffp-contract=off.  So every NORMAL
+// here has exactly one nonzero component: every projection is then one product,
+// which rounds the same fused or not.  Positions sit on a 2^-4 grid within +-8
+// and separations on a 2^-10 grid, so with an axis normal every projection,
+// difference, cross and dot inside the reduce is exact.  Non-unit axis normals
+// (0.9995f, 0.85f, 0.9375f ...) appear only where the reduce they feed takes the
+// <= 6-point early-out, which makes no float decision.
+//
+// OFF-ENGINE INPUTS ARE MARKED.  In the engine remainingContacts equals the live
+// candidate count and a non-candidate has a zero normal (:753-766, :1146-1152,
+// :1202).  Two families break the first on purpose, because the gates at :1213 and
+// :872 and the decrement at :815 are invisible otherwise.
+namespace
+{
+using namespace pxgtest::tritriref;
+
+struct AsgCaseH
+{
+    V4 posSep[1024];
+    uint32_t normalCand[1024][4];
+    uint32_t rec[129][32];          // 128-byte records
+    uint32_t numPatchesToKeep;
+    int32_t generatedThisIter;
+    float clusterBias;
+    uint32_t pad;
+};
+static_assert(sizeof(AsgCaseH) == 49296, "assign case stride");
+
+static uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float bitsf(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+static void packRecord(uint32_t* r, const RefPatch& p)
+{
+    for (uint32_t k = 0; k < 6; ++k)
+    {
+        r[k * 4 + 0] = fbits(p.keepPoints[k].x);
+        r[k * 4 + 1] = fbits(p.keepPoints[k].y);
+        r[k * 4 + 2] = fbits(p.keepPoints[k].z);
+        r[k * 4 + 3] = fbits(p.keepPoints[k].w);
+    }
+    r[24] = fbits(p.normal.x);
+    r[25] = fbits(p.normal.y);
+    r[26] = fbits(p.normal.z);
+    r[27] = fbits(p.deepest);
+    r[28] = p.pointCount;
+    r[29] = r[30] = r[31] = 0;
+}
+
+static RefPatch unpackRecord(const uint32_t* r)
+{
+    RefPatch p;
+    for (uint32_t k = 0; k < 6; ++k)
+        p.keepPoints[k] = { bitsf(r[k * 4]), bitsf(r[k * 4 + 1]), bitsf(r[k * 4 + 2]), bitsf(r[k * 4 + 3]) };
+    p.normal = { bitsf(r[24]), bitsf(r[25]), bitsf(r[26]) };
+    p.deepest = bitsf(r[27]);
+    p.pointCount = r[28];
+    return p;
+}
+
+// One case under construction: contacts, patches, header -- and the families
+// the builder planted, for the coverage assertions.
+struct AsgBuild
+{
+    RefContact c[1024];
+    RefPatch patches[129];
+    uint32_t numPatchesToKeep = 0;
+    int32_t generatedThisIter = 0;
+    bool consistent = true;         // generatedThisIter == live candidate count
+    float clusterBias = 1.0f / 1024.0f;
+};
+
+} // namespace
+
+PXG_TEST(npTriTriBlock_assign)
+{
+    std::mt19937 rng(77015);
+    auto gridPos = [&]() { return float(int(rng() % 257u) - 128) / 16.0f; };       // 2^-4, +-8
+    auto gridSep = [&]() { return float(int(rng() % 769u) - 512) / 1024.0f; };     // 2^-10
+    const V3 AXES[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+
+    // Poison for everything the kernel must not have written.
+    RefPatch poison;
+    for (uint32_t k = 0; k < 6; ++k) poison.keepPoints[k] = { bitsf(0x7FC0DEADu), -777.0f, 555.0f, bitsf(0xFFBADBADu) };
+    poison.normal = { 3.0f, -5.0f, 7.0f };
+    poison.deepest = -12345.0f;
+    // A VALID count (<= 6): a mutant that reads a record past numPatchesToKeep must
+    // do something defined with it, or its kill is undefined behaviour and proves
+    // nothing -- the first sweep's `drv-p-le` crashed on keepPoints[tid] with a count
+    // of 0xDEAD, which is exactly that.
+    poison.pointCount = 5u;
+
+    auto freshCase = [&](AsgBuild& b) {
+        for (uint32_t t = 0; t < 1024; ++t)
+        {
+            b.c[t].pos = { gridPos(), gridPos(), gridPos() };
+            b.c[t].separation = FLT_MAX_LOCAL;
+            b.c[t].normal = { 0, 0, 0 };
+            b.c[t].candidate = false;
+        }
+        for (uint32_t r = 0; r < 129; ++r) b.patches[r] = poison;
+        b.numPatchesToKeep = 0;
+        b.generatedThisIter = 0;
+        b.consistent = true;
+        b.clusterBias = float(1 + rng() % 8u) / 1024.0f;
+    };
+    auto makeCandidate = [&](RefContact& c, V3 n) {
+        c.candidate = true;
+        c.separation = gridSep();
+        c.normal = n;
+    };
+    auto existingPatch = [&](AsgBuild& b, uint32_t r, V3 n, uint32_t count) {
+        RefPatch& p = b.patches[r];
+        p.normal = n;
+        p.pointCount = count;
+        float deepest = FLT_MAX_LOCAL;
+        for (uint32_t k = 0; k < 6; ++k)
+        {
+            p.keepPoints[k] = { gridPos(), gridPos(), gridPos(), gridSep() };
+            if (k < count && p.keepPoints[k].w < deepest) deepest = p.keepPoints[k].w;
+        }
+        p.deepest = deepest;
+    };
+    auto liveCount = [](const AsgBuild& b) {
+        int32_t n = 0;
+        for (uint32_t t = 0; t < 1024; ++t) n += b.c[t].candidate ? 1 : 0;
+        return n;
+    };
+
+    std::vector<AsgBuild> cases;
+    std::vector<const char*> family;
+
+    // ---- A: generic, engine-consistent ----------------------------------------
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = rng() % 7u;
+        for (uint32_t r = 0; r < b.numPatchesToKeep; ++r)
+            existingPatch(b, r, AXES[rng() % 6u], 1 + rng() % 6u);
+        const uint32_t density = 20 + rng() % 70u;          // percent of threads that are candidates
+        for (uint32_t t = 0; t < 1024; ++t)
+            if (rng() % 100u < density)
+                makeCandidate(b.c[t], AXES[rng() % 6u]);
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("generic");
+    }
+
+    // ---- B: OFF-ENGINE remaining < live (kills the :815 decrement, the accept /
+    // accept2 swap at :812, and the > 0 gates at :1213 / :872) -------------------
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = 2;
+        existingPatch(b, 0, { 1, 0, 0 }, 3);
+        existingPatch(b, 1, { 0, 1, 0 }, 2);
+        int32_t acc2 = 0;
+        for (uint32_t t = 0; t < 1024; ++t)
+        {
+            const uint32_t k = rng() % 10u;
+            if (k == 0) { makeCandidate(b.c[t], { 1, 0, 0 }); ++acc2; }            // patch 0, strict accept
+            else if (k == 1) { makeCandidate(b.c[t], { 0.9f, 0, 0 }); ++acc2; }    // patch 0, accept2 only
+            else if (k == 2) makeCandidate(b.c[t], { 0, 1, 0 });                   // would join patch 1
+            else if (k == 3) makeCandidate(b.c[t], { 0, 0, 1 });                   // would seed a new patch
+        }
+        b.generatedThisIter = (i & 1u) ? 0 : acc2;
+        b.consistent = false;
+        cases.push_back(b);
+        family.push_back(i & 1u ? "offengine-zero" : "offengine-patch0-only");
+    }
+
+    // ---- C: the zero-normal seed (upstream candidate B), refilling to the cap -----
+    for (uint32_t start : { 0u, 125u, 127u })
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = start;
+        for (uint32_t r = 0; r < start; ++r)
+            existingPatch(b, r, AXES[r % 6u], 1 + r % 6u);
+        for (uint32_t t = 0; t < 1024; t += 7)
+            makeCandidate(b.c[t], AXES[rng() % 6u]);
+        b.c[513].candidate = true;
+        b.c[513].normal = { 0, 0, 0 };
+        b.c[513].separation = -0.75f;                 // the deepest: it seeds
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("zero-normal-seed");
+    }
+
+    // ---- D: a non-hanging kill for dropping `|| myNormal` (OFF-ENGINE normal) -------
+    {
+        AsgBuild b;
+        freshCase(b);
+        for (uint32_t t = 0; t < 1024; t += 5)
+            makeCandidate(b.c[t], { 1, 0, 0 });
+        b.c[300].normal = { 0.9375f, 0, 0 };          // |n|^2 = 0.87890625: accept2 for all, accept for none
+        b.c[300].separation = -0.9f;
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("seed-only-by-myNormal");
+    }
+
+    // ---- E: the thresholds, exactly on them ------------------------------------------
+    {
+        AsgBuild b;   // tryAssign: the ONLY near lane is exactly 0.9995f -> no anyKeep
+        freshCase(b);
+        b.numPatchesToKeep = 1;
+        existingPatch(b, 0, { 1, 0, 0 }, 4);
+        makeCandidate(b.c[77], { 0.9995f, 0, 0 });
+        for (uint32_t t = 128; t < 1024; t += 9) makeCandidate(b.c[t], { 0, 0, 1 });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("exact-eps3-only-near");
+    }
+    {
+        AsgBuild b;   // createNewPatches: <= 6 accepts, one exactly 0.9995f and one exactly 0.85f
+        freshCase(b);
+        makeCandidate(b.c[10], { 1, 0, 0 });  b.c[10].separation = -0.5f;       // the seed
+        makeCandidate(b.c[40], { 0.9995f, 0, 0 });
+        makeCandidate(b.c[41], { 0.9993f, 0, 0 });                               // inside (0.999, 0.9995]
+        makeCandidate(b.c[700], { 0.85f, 0, 0 });
+        makeCandidate(b.c[701], { 0.8501f, 0, 0 });
+        makeCandidate(b.c[900], { 0, 1, 0 });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("exact-thresholds-new");
+    }
+    {
+        AsgBuild b;   // accept2 somewhere, accept NOWHERE: no anyKeep, nothing retired
+        freshCase(b);
+        b.numPatchesToKeep = 1;
+        existingPatch(b, 0, { 0, 0, -1 }, 5);
+        for (uint32_t t = 0; t < 1024; t += 3) makeCandidate(b.c[t], { 0, 0, -0.95f });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("accept2-without-accept");
+    }
+
+    {
+        AsgBuild b;   // tryAssign WITH anyKeep and a lane at exactly 0.85f: counted and
+        freshCase(b); // retired only by a `>=` -- the first sweep's ta-accept2-ge survived
+        b.numPatchesToKeep = 1;   // without this, since every 0.85 lane sat in createNewPatches
+        existingPatch(b, 0, { 1, 0, 0 }, 3);
+        for (uint32_t t = 0; t < 1024; t += 11) makeCandidate(b.c[t], { 1, 0, 0 });
+        makeCandidate(b.c[333], { 0.85f, 0, 0 });
+        makeCandidate(b.c[334], { 0.9f, 0, 0 });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("exact-085-in-tryassign");
+    }
+    {
+        AsgBuild b;   // anyKeep raised for patch 0, NOT for patch 1, whose only lanes are
+        freshCase(b); // in the accept2 band: a missing :853-854 reset would carry patch 0's
+        b.numPatchesToKeep = 2;   // flag into patch 1, retire them and count them (ta-no-reset)
+        existingPatch(b, 0, { 1, 0, 0 }, 2);
+        existingPatch(b, 1, { 0, 0, 1 }, 4);
+        for (uint32_t t = 0; t < 1024; t += 13) makeCandidate(b.c[t], { 1, 0, 0 });
+        for (uint32_t t = 5; t < 1024; t += 17) makeCandidate(b.c[t], { 0, 0, 0.95f });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("anykeep-must-reset");
+    }
+
+    // ---- G: anyKeep raised by ONE warp only -- the first, then the last --------------
+    for (uint32_t w : { 0u, 31u })
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = 1;
+        existingPatch(b, 0, { 0, 1, 0 }, 2);
+        for (uint32_t t = 0; t < 1024; t += 4) makeCandidate(b.c[t], { 1, 0, 0 });
+        makeCandidate(b.c[w * 32 + 17], { 0, 1, 0 });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back(w == 0 ? "anykeep-warp0-only" : "anykeep-warp31-only");
+    }
+
+    // ---- H: capacity -- 6 kept + 6 emitters in each of 32 warps = 198 staged -----------
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = 1;
+        existingPatch(b, 0, { 0, 0, 1 }, 6);
+        for (uint32_t w = 0; w < 32; ++w)
+            for (uint32_t l = 0; l < 6; ++l)
+            {
+                RefContact& c = b.c[w * 32 + l * 5];
+                makeCandidate(c, { 0, 0, 1 });
+                c.separation = float(int(w * 6 + l)) / 1024.0f - 0.1f;
+            }
+        b.c[31 * 32 + 25].separation = -0.95f;       // the global deepest: the LAST emitter of warp 31
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("capacity-198");
+    }
+
+    // ---- I: the cap -- entering at 128, 127, 126 -------------------------------------
+    for (uint32_t start : { 128u, 127u, 126u })
+    {
+        AsgBuild b;
+        freshCase(b);
+        b.numPatchesToKeep = start;
+        for (uint32_t r = 0; r < start; ++r)
+            existingPatch(b, r, { 0, -1, 0 }, 1 + r % 6u);
+        // The guard record, 128, is accepted by every live contact: a `p <= n` or
+        // `n <= 128` mutant that reads or writes it changes something visible.
+        b.patches[128].normal = { 1, 0, 0 };
+        for (uint32_t t = 0; t < 1024; t += 3)
+            makeCandidate(b.c[t], (t % 2u) ? V3{ 1, 0, 0 } : V3{ 0, 0, 1 });
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back(start == 128 ? "cap-128" : start == 127 ? "cap-127" : "cap-126");
+    }
+
+    // ---- J/K: seed ties, and a winning warp that is not the last one with candidates --
+    {
+        AsgBuild b;   // two lanes of one warp tied at the minimum, different normals
+        freshCase(b);
+        for (uint32_t t = 0; t < 1024; t += 6) makeCandidate(b.c[t], { 0, 1, 0 });
+        makeCandidate(b.c[200], { 1, 0, 0 });  b.c[200].separation = -0.8f;
+        makeCandidate(b.c[205], { 0, 0, 1 });  b.c[205].separation = -0.8f;
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("tie-in-warp");
+    }
+    {
+        AsgBuild b;   // two warps tied; the LOWER warp must seed; later warps also have candidates
+        freshCase(b);
+        for (uint32_t t = 0; t < 1024; t += 6) makeCandidate(b.c[t], { 0, -1, 0 });
+        makeCandidate(b.c[3 * 32 + 4], { 1, 0, 0 });   b.c[3 * 32 + 4].separation = -0.6f;
+        makeCandidate(b.c[20 * 32 + 9], { 0, 0, -1 }); b.c[20 * 32 + 9].separation = -0.6f;
+        b.generatedThisIter = liveCount(b);
+        cases.push_back(b);
+        family.push_back("tie-across-warps");
+    }
+
+    const uint32_t N = uint32_t(cases.size());
+
+    // ---- the oracle, and the upload ------------------------------------------------
+    std::vector<AsgCaseH> in(N);
+    std::memset(in.data(), 0, in.size() * sizeof(AsgCaseH));
+    std::vector<AsgBuild> want = cases;
+    std::vector<int> wantRemaining(N);
+    size_t sawRetired = 0, sawNewPatches = 0, sawTryAssignHit = 0, sawCapReached = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const AsgBuild& b = cases[i];
+        AsgCaseH& h = in[i];
+        for (uint32_t t = 0; t < 1024; ++t)
+        {
+            h.posSep[t] = { b.c[t].pos.x, b.c[t].pos.y, b.c[t].pos.z, b.c[t].separation };
+            h.normalCand[t][0] = fbits(b.c[t].normal.x);
+            h.normalCand[t][1] = fbits(b.c[t].normal.y);
+            h.normalCand[t][2] = fbits(b.c[t].normal.z);
+            h.normalCand[t][3] = b.c[t].candidate ? 1u : 0u;
+        }
+        for (uint32_t r = 0; r < 129; ++r) packRecord(h.rec[r], b.patches[r]);
+        h.numPatchesToKeep = b.numPatchesToKeep;
+        h.generatedThisIter = b.generatedThisIter;
+        h.clusterBias = b.clusterBias;
+
+        AsgBuild& w = want[i];
+        const uint32_t n0 = w.numPatchesToKeep;
+        wantRemaining[i] = refAssignContacts(w.c, w.patches, w.clusterBias, w.generatedThisIter, w.numPatchesToKeep);
+        size_t retired = 0;
+        for (uint32_t t = 0; t < 1024; ++t) retired += (b.c[t].candidate && !w.c[t].candidate) ? 1u : 0u;
+        if (retired) ++sawRetired;
+        if (w.numPatchesToKeep > n0) ++sawNewPatches;
+        if (w.numPatchesToKeep == MAX_PATCHES) ++sawCapReached;
+        for (uint32_t r = 0; r < n0; ++r)
+            if (std::memcmp(&w.patches[r], &b.patches[r], sizeof(RefPatch)) != 0) { ++sawTryAssignHit; break; }
+    }
+    PXG_CHECK_MSG(sawRetired > N / 2 && sawNewPatches > N / 3 && sawTryAssignHit > N / 4 && sawCapReached >= 3,
+                  "npTriTriBlock_assign: the case set does not exercise the machinery (retired %zu, new "
+                  "patches %zu, existing patch changed %zu, cap reached %zu of %u)",
+                  sawRetired, sawNewPatches, sawTryAssignHit, sawCapReached, N);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> outInit(size_t(N) * (65664 / 4), 0xDEADBEEFu);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    TtbPushH push{};
+    push.cases = dev->getBufferDeviceAddress(bIn);
+    push.out = dev->getBufferDeviceAddress(bOut);
+    push.numCases = N;
+    Kernel k("npTriTriBlock.spv", "ttbAssignProbe", {}, sizeof(TtbPushH));
+    k.dispatch(N, {}, push, 1u, 1u);
+    dev->flush();
+    const auto got = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+
+    size_t mmRec = 0, mmContact = 0, mmCount = 0, mmRemaining = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint32_t* o = &got[size_t(i) * (65664 / 4)];
+        const AsgBuild& w = want[i];
+        for (uint32_t r = 0; r < 129; ++r)
+        {
+            uint32_t expect[32];
+            packRecord(expect, w.patches[r]);
+            if (std::memcmp(expect, o + r * 32, 29 * 4) != 0)   // words 29-31 are not stored
+            {
+                if (mmRec < 6)
+                    std::printf("  case %u (%s) record %u: count got %u want %u, normal.x got %g want %g\n",
+                                i, family[i], r, o[r * 32 + 28], expect[28], bitsf(o[r * 32 + 24]),
+                                w.patches[r].normal.x);
+                ++mmRec;
+            }
+        }
+        const uint32_t* th = o + 16512 / 4;
+        for (uint32_t t = 0; t < 1024; ++t)
+        {
+            const uint32_t* q = th + t * 12;
+            const RefContact& c = w.c[t];
+            const bool same = q[0] == fbits(c.pos.x) && q[1] == fbits(c.pos.y) && q[2] == fbits(c.pos.z) &&
+                              q[3] == fbits(c.separation) && q[4] == fbits(c.normal.x) &&
+                              q[5] == fbits(c.normal.y) && q[6] == fbits(c.normal.z) &&
+                              q[7] == (c.candidate ? 1u : 0u);
+            if (!same)
+            {
+                if (mmContact < 6)
+                    std::printf("  case %u (%s) thread %u: contact state differs (candidate got %u want %u)\n",
+                                i, family[i], t, q[7], c.candidate ? 1u : 0u);
+                ++mmContact;
+            }
+            if (q[8] != w.numPatchesToKeep)
+            {
+                if (mmCount < 6)
+                    std::printf("  case %u (%s) thread %u: numPatchesToKeep got %u want %u\n",
+                                i, family[i], t, q[8], w.numPatchesToKeep);
+                ++mmCount;
+            }
+            if (int32_t(q[9]) != wantRemaining[i])
+            {
+                if (mmRemaining < 6)
+                    std::printf("  case %u (%s) thread %u: remaining got %d want %d\n",
+                                i, family[i], t, int32_t(q[9]), wantRemaining[i]);
+                ++mmRemaining;
+            }
+        }
+    }
+    PXG_CHECK_MSG(mmRec == 0, "npTriTriBlock_assign: %zu patch-record mismatches", mmRec);
+    PXG_CHECK_MSG(mmContact == 0, "npTriTriBlock_assign: %zu contact-state mismatches", mmContact);
+    PXG_CHECK_MSG(mmCount == 0, "npTriTriBlock_assign: %zu per-thread numPatchesToKeep mismatches", mmCount);
+    PXG_CHECK_MSG(mmRemaining == 0, "npTriTriBlock_assign: %zu remainingContacts mismatches", mmRemaining);
+
+    std::printf("  npTriTriBlock_assign: %u cases; retired in %zu, new patches in %zu, an existing patch "
+                "changed in %zu, the cap reached in %zu\n",
+                N, sawRetired, sawNewPatches, sawTryAssignHit, sawCapReached);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

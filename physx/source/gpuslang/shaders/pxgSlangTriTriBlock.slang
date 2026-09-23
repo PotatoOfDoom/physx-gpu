@@ -297,9 +297,9 @@ TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint
 //   * staging all 32 warps at once is 32*32*16 B and was MEASURED over the limit
 //     at 46684 bytes (P9.83b-4, 3/n).
 //
-// So warp w stages its 32 lanes into gTtbWarpStage, thread 0 runs the serial
+// So warp w stages its 32 lanes into the stage, thread 0 runs the serial
 // crsContactReduce2 on them, and the mask comes back to warp w through
-// gTtbReduceMask[w].  32 rounds, two barriers each.  That gTtbReduceMask is a
+// warp w's mask slot.  32 rounds, two barriers each.  That the mask slots are a
 // buffer the CUDA does not have is what made the Workgroup-only budget
 // impossible (P9.83b-5, 12/n: 32732 -> 32860 with it).
 //
@@ -308,7 +308,7 @@ TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint
 // including file must `import pxgSlangContactReduceSerial;`.
 //
 // THE INPUT MASK TRAVELS THROUGH THE SAME SLOT AS THE RESULT.  Lane 0 of each warp
-// publishes its warp's mask into gTtbReduceMask[warp] before the first round;
+// publishes its warp's mask into its warp's slot before the first round;
 // thread 0 reads slot w and overwrites it in round w.  Each slot is written once
 // by its warp before any round and once by thread 0 in its own round, so no round
 // reads a slot another round has already rewritten.
@@ -331,8 +331,23 @@ TtbSeed ttbBlockSeedSelect(uint tid, float laneSep, uint candidateMask, out uint
 // race; on llvmpipe the side that must go first happens to be thread 0, which runs
 // first after every barrier, so no fixture there can show it.  A racy mutant's
 // survival is uninformative; the barriers stay.
-groupshared float4 gTtbWarpStage[32];
-groupshared uint gTtbReduceMask[32];
+//
+// P9.83b-5 (15/n): the stage and the masks are no longer arrays of their own.
+// They live in gTtbScratch, the 8192-byte buffer that is the kernel's gather index
+// buffer the rest of the time (triangleIndicesS) and is dead for the whole of the
+// assignment -- see THE ASSIGNMENT SCRATCH below, and 15a/n for the measurement.
+// Stage lane l is slot TTB_SCRATCH_STAGE + l; warp w's mask is component w & 3 of
+// slot TTB_SCRATCH_MASK + (w >> 2).
+groupshared uint4 gTtbScratch[512];
+
+static const uint TTB_SCRATCH_TEMP = 0u;     // [0, 198)    tempPointsS
+static const uint TTB_SCRATCH_STAGE = 198u;  // [198, 230)  the one-warp stage
+static const uint TTB_SCRATCH_MASK = 230u;   // [230, 238)  the per-warp masks
+
+void ttbStageSet(uint l, float4 v) { gTtbScratch[TTB_SCRATCH_STAGE + l] = asuint(v); }
+float4 ttbStageGet(uint l) { return asfloat(gTtbScratch[TTB_SCRATCH_STAGE + l]); }
+void ttbMaskSet(uint w, uint m) { gTtbScratch[TTB_SCRATCH_MASK + (w >> 2)][w & 3u] = m; }
+uint ttbMaskGet(uint w) { return gTtbScratch[TTB_SCRATCH_MASK + (w >> 2)][w & 3u]; }
 
 uint ttbWarpReduceSerial(uint tid, float3 pos, float sep, float3 patchNormal,
                          uint warpMask, float clusterBias)
@@ -341,13 +356,13 @@ uint ttbWarpReduceSerial(uint tid, float3 pos, float sep, float3 patchNormal,
     const uint warp = tid >> 5;
 
     if (lane == 0u)
-        gTtbReduceMask[warp] = warpMask;
+        ttbMaskSet(warp, warpMask);
 
     for (uint w = 0u; w < 32u; ++w)
     {
         GroupMemoryBarrierWithGroupSync();
         if (warp == w)
-            gTtbWarpStage[lane] = float4(pos, sep);
+            ttbStageSet(lane, float4(pos, sep));
         GroupMemoryBarrierWithGroupSync();
 
         if (tid == 0u)
@@ -356,17 +371,302 @@ uint ttbWarpReduceSerial(uint tid, float3 pos, float sep, float3 patchNormal,
             float seps[32];
             for (uint l = 0u; l < 32u; ++l)
             {
-                const float4 s = gTtbWarpStage[l];
+                const float4 s = ttbStageGet(l);
                 pts[l] = s.xyz;
                 seps[l] = s.w;
             }
-            gTtbReduceMask[w] = crsContactReduce2(pts, seps, patchNormal, gTtbReduceMask[w],
-                                                  clusterBias, crsConfig(true, true, 6, false));
+            ttbMaskSet(w, crsContactReduce2(pts, seps, patchNormal, ttbMaskGet(w),
+                                            clusterBias, crsConfig(true, true, 6, false)));
         }
     }
 
     GroupMemoryBarrierWithGroupSync();
-    const uint result = gTtbReduceMask[warp];
+    const uint result = ttbMaskGet(warp);
     GroupMemoryBarrierWithGroupSync();   // see THE TRAILING BARRIER above
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// P9.83b-5 (15/n): tryToAssignContactToExistingPatch and createNewPatches as
+// BLOCK logic -- patches in Workgroup storage, scratch in the dead index buffer
+// ---------------------------------------------------------------------------
+// REQUIREMENT ON THE INCLUDER, in addition to the ones above: this part uses
+// TtpPatch, TtpReduceResult, ttpReduceContactsSerial and the acceptance
+// constants from the MODULE pxgSlangTriTriPatch, so the including file must also
+// `import pxgSlangTriTriPatch;`.
+//
+// STORAGE (P9.83b-5 15a/n measured the layout this implements at 31228 bytes):
+//
+//   gTtbPatches[128]   patchesS, 128-byte TtpPatch records, in Workgroup storage.
+//                      A fixture may define TTB_PATCH_GUARD 1 before including to
+//                      get one poisoned record past the end, so a mutant that
+//                      writes record 128 is a visible kill instead of undefined
+//                      behaviour.
+//   gTtbScratch[512]   8192 bytes: the kernel's GATHER INDEX BUFFER
+//                      (triangleIndicesS, :1007), dead from the :1082-1083 read
+//                      until the next gather -- which is exactly the lifetime of
+//                      the assignment.  Three tenants, as views:
+//                        [0, 198)    tempPointsS (:1000), asfloat
+//                        [198, 230)  the one-warp reduce stage (14/n)
+//                        [230, 238)  the per-warp reduce masks, 4 per slot
+//                      The kernel's gather variant (P9.83b-8) must use THIS array
+//                      as its index buffer, two uint2 per slot.
+//   gTtbAnyKeep        anyKeepS.  NOT in the alias: its entry value must survive
+//                      from one tryAssign to the next.  The kernel initialises it
+//                      once (ttbInitAssignState, CUDA :1024-1025); the function
+//                      below resets it at its end (:853-854) and nowhere else.
+//
+// With the patches in Workgroup storage the CUDA's thread mapping stays: every
+// thread reads patchesS[p] directly after a workgroup barrier, the seed lane
+// writes the new patch's normal itself (:911), and threads < PointCount copy the
+// kept points (:828-829).  Only reduceContactsSingleWarp is one thread -- that is
+// P9.83b-5's serial body, and it writes the record back.
+
+// SWEPT (15/n): 50 mutants (the 14/n set re-anchored on the scratch views plus 36
+// new), 45 killed -- 5 by hang, 1 by crash.  The first round left two coverage
+// gaps (ta-accept2-ge: no lane at exactly 0.85 inside an anyKeep call;
+// ta-no-reset: no second patch for a leaked flag to reach) and one kill by
+// undefined behaviour (drv-p-le read a poison record with pointCount 0xDEAD); all
+// three were fixed in the fixture and the sweep re-run from scratch.  Survivors:
+//   stage-into-temp       equivalent: the stage is dead before tempPointsS is
+//                         written and tempPointsS before the next stage, so even
+//                         overlapping slots never hold two live values
+//   cn-no-candidate-gate  equivalent on engine inputs: a non-candidate's normal is 0
+//   cn-no-total-gate      equivalent: the seed is always accepted, so >= 1 point
+//   cn-no-count-gate      equivalent: ditto, PointCount >= 1
+//   init-removed          unobservable here: the fixture cannot tell a missing init
+//                         from Workgroup storage that happens to hold 0 -- the
+//                         kernel fixture (P9.83b-8) has to check ttbInitAssignState
+#ifndef TTB_PATCH_GUARD
+#define TTB_PATCH_GUARD 0
+#endif
+
+groupshared TtpPatch gTtbPatches[TTP_MAX_MESH_MESH_PATCHES + TTB_PATCH_GUARD];
+groupshared uint gTtbAnyKeep;
+// gTtbScratch and its three views are declared above ttbWarpReduceSerial, which
+// is the first user.
+
+float4 ttbTempPointGet(uint q) { return asfloat(gTtbScratch[TTB_SCRATCH_TEMP + q]); }
+void ttbTempPointSet(uint q, float4 v) { gTtbScratch[TTB_SCRATCH_TEMP + q] = asuint(v); }
+
+// The kernel calls this once, before its first iteration (convexMeshMidphase.cu
+// :1024-1025), followed by a barrier.  Workgroup storage is undefined at dispatch
+// start; a first tryAssign that found garbage here would take the :808 branch
+// with nothing to keep, count and retire the (0.85, 0.9995] band, and lose those
+// contacts for createNewPatches (15/n review).
+void ttbInitAssignState(uint tid)
+{
+    if (tid == 0u)
+        gTtbAnyKeep = 0u;
+}
+
+// convexMeshMidphase.cu:753-766
+struct TtbContact
+{
+    float3 pos;          // = PxVec3(0.f)
+    float separation;    // = PX_MAX_F32
+    float3 normal;       // = PxVec3(0.f)
+    bool candidate;      // = false
+};
+
+// markAsProcessed (:760-765).  pos is NOT reset -- the CUDA leaves it.
+void ttbMarkProcessed(inout TtbContact c)
+{
+    c.candidate = false;
+    c.separation = TTB_FLT_MAX;
+    c.normal = float3(0, 0, 0);
+}
+
+// Thread 0 only: reduceContactsSingleWarp (:440-496) over the staged points, and
+// its three writes into patches[index] -- Deepest (:479), PointCount (:486-489),
+// KeepPoints (:491-495).  Normal is not touched, and neither are the KeepPoints
+// slots behind the survivors: the CUDA writes only lanes in the final mask, so a
+// patch reduced from 6 points to 4 keeps its old points in slots 4-5.  Nothing
+// reads them (every reader stops at PointCount, :741/:828), but the fixture
+// compares whole records, and a zero-fill would be a difference it could see.
+void ttbReduceIntoPatch(uint p, uint totalContacts, float3 nor, float clusterBias)
+{
+    float4 tp[198];
+    for (uint j = 0u; j < 198u; ++j)
+        tp[j] = ttbTempPointGet(j);
+    const TtpReduceResult r = ttpReduceContactsSerial(tp, totalContacts, nor, clusterBias);
+    for (uint k = 0u; k < r.pointCount && k < TTP_MESH_MESH_CONTACT_LIMIT; ++k)
+        gTtbPatches[p].keepPoints[k] = r.keepPoints[k];   // survivors only, as :491-495
+    gTtbPatches[p].deepest = r.deepest;
+    gTtbPatches[p].pointCount = r.pointCount;
+}
+
+// ---------------------------------------------------------------------------
+// tryToAssignContactToExistingPatch (convexMeshMidphase.cu:768-858)
+// ---------------------------------------------------------------------------
+// NOT ported, because it is not code: the block commented out at :798-804
+// (`accept2 = accept || contact.separation > patch.Deepest`).  Recorded here so
+// nobody "restores" it.  :787 warns against building the ballot and anyKeepS on
+// accept2 ("it will cause artificial friction") -- which is why :788 ballots
+// `accept`, the STRICT test, while :812 counts `accept2` and :845 consumes it.
+// Two thresholds, two jobs.
+//
+// accept2 at :781 is NOT gated on candidateContact, unlike createNewPatches' at
+// :921-926.  It does not need to be: a non-candidate has normal (0,0,0) (never
+// set, or reset by markAsProcessed), so proj is 0 and fails both tests.  That is
+// an invariant of the Contact lifecycle; the transcription keeps the ungated form
+// so the invariant stays the thing that makes it safe.
+void ttbTryAssignExisting(uint tid, uint p, inout TtbContact c, float clusterBias,
+                          inout int remainingContacts)
+{
+    const uint lane = tid & 31u;
+
+    const float3 patchNormal = gTtbPatches[p].normal;
+    const float proj = dot(c.normal, patchNormal);                         // :778
+    const bool accept2 = proj > TTP_PATCH_ACCEPTANCE_EPS2;                 // :781
+    const bool accept = proj > TTP_PATCH_ACCEPTANCE_EPS3;                  // :782
+
+    uint reduceMask = pxgBallotSync(PXG_FULL_MASK, tid, accept);           // :788
+
+    if (lane == 0u && reduceMask != 0u)                                    // :790-793
+        gTtbAnyKeep = 1u;
+
+    GroupMemoryBarrierWithGroupSync();                                     // bar.sync 1 (:796)
+
+    if (gTtbAnyKeep != 0u)                                                 // :808
+    {
+        reduceMask = ttbWarpReduceSerial(tid, c.pos, c.separation, patchNormal,
+                                         reduceMask, clusterBias);         // :810
+
+        const uint nbUsed = ttbBlockCountAndBroadcast(tid, accept2);       // :812
+        GroupMemoryBarrierWithGroupSync();                                 // :813
+
+        remainingContacts -= int(nbUsed);                                  // :815
+
+        uint totalContacts;
+        const bool threadEmitsElement = ((reduceMask >> lane) & 1u) != 0u;  // :818
+        uint offset = ttbBlockScanExclusive(tid, threadEmitsElement, totalContacts);  // :820
+
+        const uint pointCount = gTtbPatches[p].pointCount;
+        if (tid < pointCount)                                              // :828-829
+            ttbTempPointSet(tid, gTtbPatches[p].keepPoints[tid]);
+
+        offset += pointCount;                                              // :832
+
+        if (threadEmitsElement)                                            // :834-835
+            ttbTempPointSet(offset, float4(c.pos, c.separation));
+
+        totalContacts += pointCount;                                       // :837
+
+        GroupMemoryBarrierWithGroupSync();                                 // :838
+
+        if (tid == 0u)                                                     // :842-843
+            ttbReduceIntoPatch(p, totalContacts, patchNormal, clusterBias);
+
+        if (accept2)                                                       // :845-846
+            ttbMarkProcessed(c);
+    }
+
+    GroupMemoryBarrierWithGroupSync();                                     // bar.sync 2 (:851)
+
+    if (tid == 0u)                                                         // :853-854
+        gTtbAnyKeep = 0u;
+
+    GroupMemoryBarrierWithGroupSync();                                     // :858
+}
+
+// ---------------------------------------------------------------------------
+// createNewPatches (convexMeshMidphase.cu:860-970)
+// ---------------------------------------------------------------------------
+// remainingContacts is READ here (the entry gate at :872) and never decremented;
+// the loop is driven by hasAnyContacts and bounded by MAX_MESH_MESH_PATCHES2.
+//
+// THE `totalContacts != 0` GATE (:939) AND THE `PointCount != 0` GATE (:955) ARE
+// ALWAYS TRUE ON THIS PATH, and are transcribed anyway.  The seed lane is a
+// candidate (minI came from candidateMask, and the :902 gate guarantees its warp
+// has one), it sets myNormal, so `accept` is true for it (:925), so its warp's
+// reduceMask is non-empty, so contactReduce2 keeps at least one lane, so the scan
+// total is at least one and the serial reduce leaves PointCount at least one.
+// That chain is an argument about the CALLER's invariants; the gates are the
+// engine's, and they cost nothing.
+void ttbCreateNewPatches(uint tid, inout TtbContact c, float clusterBias,
+                         int remainingContacts, inout uint numPatchesToKeep)
+{
+    const uint lane = tid & 31u;
+    const uint warp = tid >> 5;
+
+    bool hasAnyContacts = remainingContacts > 0;                           // :872
+
+    while (hasAnyContacts && (numPatchesToKeep < TTP_MAX_MESH_MESH_PATCHES))  // :874
+    {
+        hasAnyContacts = false;                                            // :876
+
+        const uint candidateMask = pxgBallotSync(PXG_FULL_MASK, tid, c.candidate);  // :881
+        uint minI;
+        const TtbSeed seed = ttbBlockSeedSelect(tid, c.separation, candidateMask, minI);  // :879-899, bar.sync 3 at :894
+
+        if (seed.hasCandidates)                                            // :902
+        {
+            hasAnyContacts = true;                                         // :906
+            bool myNormal = false;
+            if (warp == seed.minIBlock && lane == minI)                    // :908-912
+            {
+                myNormal = true;
+                gTtbPatches[numPatchesToKeep].normal = c.normal;
+            }
+
+            GroupMemoryBarrierWithGroupSync();                             // bar.sync 4 (:915)
+
+            const float3 patchNormal = gTtbPatches[numPatchesToKeep].normal;
+
+            bool accept = false;                                           // :919-926
+            bool accept2 = false;
+            if (c.candidate)
+            {
+                const float proj = dot(c.normal, patchNormal);
+                accept2 = proj > TTP_PATCH_ACCEPTANCE_EPS2;
+                accept = proj > TTP_PATCH_ACCEPTANCE_EPS3 || myNormal;
+            }
+
+            uint reduceMask = pxgBallotSync(PXG_FULL_MASK, tid, accept);   // :930
+            reduceMask = ttbWarpReduceSerial(tid, c.pos, c.separation, patchNormal,
+                                             reduceMask, clusterBias);     // :931
+
+            uint totalContacts;
+            const bool threadEmitsElement = ((reduceMask >> lane) & 1u) != 0u;  // :935
+            const uint offset = ttbBlockScanExclusive(tid, threadEmitsElement, totalContacts);  // :936
+
+            if (totalContacts != 0u)                                       // :939
+            {
+                if (threadEmitsElement)                                    // :941-942
+                    ttbTempPointSet(offset, float4(c.pos, c.separation));
+
+                GroupMemoryBarrierWithGroupSync();                         // :944
+
+                if (tid == 0u)                                             // :950-951
+                    ttbReduceIntoPatch(numPatchesToKeep, totalContacts, patchNormal, clusterBias);
+
+                GroupMemoryBarrierWithGroupSync();                         // :953
+
+                if (gTtbPatches[numPatchesToKeep].pointCount != 0u)        // :955-956
+                    numPatchesToKeep++;
+            }
+
+            if (accept2)                                                   // :959-960
+                ttbMarkProcessed(c);
+        }
+
+        GroupMemoryBarrierWithGroupSync();                                 // bar.sync 5 (:968)
+    }
+}
+
+// convexMeshMidphase.cu:1207-1220 -- the two passes, in the order the kernel runs
+// them each iteration: existing patches first, then new ones.  remainingContacts
+// starts at generatedThisIter (:1207), which the kernel computes at :1202, and is
+// returned only so a fixture can see it -- the kernel does not use it afterwards.
+int ttbAssignContacts(uint tid, inout TtbContact c, float clusterBias,
+                      int generatedThisIter, inout uint numPatchesToKeep)
+{
+    int remainingContacts = generatedThisIter;                             // :1207
+
+    for (uint p = 0u; (p < numPatchesToKeep) && (remainingContacts > 0); ++p)  // :1213
+        ttbTryAssignExisting(tid, p, c, clusterBias, remainingContacts);
+
+    ttbCreateNewPatches(tid, c, clusterBias, remainingContacts, numPatchesToKeep);  // :1219
+    return remainingContacts;
 }
