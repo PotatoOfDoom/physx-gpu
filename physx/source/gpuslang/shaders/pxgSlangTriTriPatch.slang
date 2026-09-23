@@ -206,11 +206,25 @@ public struct TtpPatch
 // stores it, because the two call sites write into different patch slots.
 //
 // The CUDA writes its results into patches[index] itself.  This returns them
-// instead: a module that reached into the caller's groupshared would have to
-// declare that groupshared, and every importer would then pay for it whether it
-// used the machinery or not.  P9.83b-4 measured the budget at 30300 of 32768 --
-// 2468 bytes of headroom -- so a module that hands out Workgroup storage is a
-// module that decides the kernel cannot be compiled.
+// instead, so the caller decides where they land -- the two call sites write into
+// different patch slots, and a body that reached into one fixed groupshared array
+// could not serve both.
+//
+// THE REASON THIS NOTE USED TO GIVE WAS WRONG, AND IT WAS MEASURED, NOT ARGUED.
+// It said a module that declares groupshared makes every importer pay for it, and
+// that at 30300 of 32768 bytes the kernel would then not compile.  Both halves are
+// false.  P9.83b-5 (10/n) put a 4096-byte groupshared array in THIS module behind a
+// public function and compiled npTriTriWrite, which imports it:
+//
+//     nothing calls it            ttrScan 0      ttrWrite 0
+//     ttrScan calls it            ttrScan 4096   ttrWrite 0
+//
+// Workgroup storage is charged PER ENTRY POINT BY REACHABILITY -- not per module,
+// not even per file: two entries in ONE .spv pay different amounts for the same
+// declaration.  That is the same finding P9.83b-1's checker made when it refuted
+// the audit's 4096-byte projection, and it is restated here because this file is
+// where the next person will look before deciding whether the block scan and the
+// warp staging buffer may live in the module.  They may.
 // ---------------------------------------------------------------------------
 public struct TtpReduceResult
 {
