@@ -118,7 +118,9 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # mul+add chains must not fuse on the GPU side either.  The mesh-mesh kernel
     # that imports the same module joins this list when it is wired, so the stamp
     # does not certify a build the engine never runs.
-    npTriTriGeom)
+    npTriTriGeom
+    # P9.83b-8 (2/n): the contact-body fixture, for the same reason.
+    npTriTriBody)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -300,6 +302,9 @@ pxg_compile_shader(npTriTriBlock ttbProbe ttbReduceProbe ttbAssignProbe)
 # sub-index, the two radii, PxMax, and the two PxTransform inverses.  Serial lanes;
 # the host oracle is the engine's own GuTriangleRefinement.h / PxTransform.h.
 pxg_compile_shader(npTriTriGeom ttgSubdivProbe ttgVertsProbe ttgMathProbe)
+# P9.83b-8 (2/n): pxgSlangTriTriBody -- the per-thread contact body of both passes,
+# split around the (already certified) SDF call into texture-free halves.
+pxg_compile_shader(npTriTriBody ttcVertsProbe ttcPostProbe)
 pxg_compile_shader(npCvxTriNpSetup cvxTriNpSetup)
 pxg_compile_shader(npCvxHfNpSetup cvxHfNpSetup)
 pxg_compile_shader(npCvxCoreOut ccoWriteContacts ccoWriteContact)
@@ -1629,6 +1634,7 @@ add_executable(gpuslang-tests
     testNpTriTriWrite.cpp
     testNpTriTriBlock.cpp
     testNpTriTriGeom.cpp
+    testNpTriTriBody.cpp
     testNpCvxTriNpSetup.cpp
     testNpCvxHfNpSetup.cpp
     testNpCvxCoreOut.cpp
@@ -2119,7 +2125,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integration updateBounds frozenHistogram memCopy clamp skinning
-        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS npCrsWrapper2 npTriTriReduce npTriTriWrite npTriTriBlock npTriTriGeom
+        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS npCrsWrapper2 npTriTriReduce npTriTriWrite npTriTriBlock npTriTriGeom npTriTriBody
         constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npConvexEdgeSat npConvexFeature npConvexTriOut npConvexPolyClip npCvxTriEmit npCvxTriFind npCvxTriPurge npCvxTriWorldNormal npGjkSupport npGjkNewPoint npGjkBarycentric npHfTriFlags npWarpVec npGjkSimplex npGjkClosestTri npGjkClosestTet npGjkClosestSeg npGjkOutput npGjkPermute npGjkSupportStep npGjkWarmStart npGjk npEpaStart4 npEpaStart123 npEpa npGjkWarm npCvxCvxEE npCvxRayPoly npCvxFaceContacts npCvxReduceManifold npCvxWitnessPoly npCvxLocalNormal npCvxAddManifold npCvxBlob npCvxBlobRead npCvxEEDriver npCvxRefFrame npCvxPolyClip npCvxClipEmit npCvxContactDecide npCvxCollidePrep npCvxCollideDecide npCvxLostFound npCvxWriteStream npCvxFinishContacts npCvxStage1Refresh npCvxStage2Setup cvxCollide npCvxPlanePolyIndex npCvxPlaneRefresh npCvxPlaneGen npCvxPlaneOut npCvxCorrelate npCvxPostProcess npCvxTrimeshOut npTriTriOverlap npCvxTriNpSetup npCvxHfNpSetup npCvxCoreOut npCvxCoreSetup npCvxCoreSupport npCvxCoreFace npCvxCorePtsFace npCvxCoreClip npCvxCoreContact npCvxCoreGjk npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npCvxBvhGlue npCvxCoreWarpAcc npD6JointPrep npRemapIndex npContactPrePrep npRigidSumBatches npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npSlabRefCount npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiBitfield npArtiSpatialMatMat npArtiConstructSM npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npGridIndex npJacobiRotate npClothAtan npAnisoHelpers npSparseGridHash npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridLookup npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npDefFilterBda softBodyPsContactGen softBodyPsPrepare npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal particleSim femClothSim cvxCoreClothNp softBodySim particleContactSort femContactSort pcmManifold convexTrimeshMidphase convexHfMidphase midphaseAlloc triFeature deferContact initManifolds pairMgmt polyClip convexHull convexSat convexSelect particleGrid contactReduce cvxTriEmit cvxTriSetup sphereTriNp cvxHfSetup cvxHfPostProcess sphereHfCore hfTriFlagsBda segTriangleBda capTriangleBda capsuleHfCore radixWarp sortTriIndices cvxTriPostProcess cvxTriCorrelate cvxTriFinish npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psContactGen psContactSort psContactSolve psContactSolveTgs psContactSolveRigid psRigidAttachPrepare psRigidAttachSolve directApiRigidGet directApiD6JointGet directApiRadixCopy2 directApiMergeAabb directApiUpdateBodies psVolumeBound psShapeMatch rigidDeltaAccum psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide fcPrim2 npPolyClip4 fcConvexTri fcVertexConvex fcStaticTriCloth fcMidphase npSbPrim npSbRemap npCvxHfMid npTriPlaneNp npTriHfNp npCvxMeshNp npCvxHfNp npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce boxBoxNphase sphereNphase convexPlaneNphase broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram

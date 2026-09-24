@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **874/874** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **875/875** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 (2/n) added `gpuslang.npTriTriBody`: the mesh-mesh kernel's per-thread contact body,
+split around the already-certified SDF call into texture-free halves, bitwise against the
+CUDA transcribed over the engine's own PxVec3/PxQuat/PxTransform/PxMath.  Its sweep gave
+run_mutation_sweep.sh MUTATION_SWEEP_SPV_ONLY=1 (one .spv per mutant, 0.5 s instead of
+minutes), after a container restart left a module mutant in the tree mid-sweep.
 P9.83b-8 (1/n) added `gpuslang.npTriTriGeom`: the mesh-mesh kernel's geometry helpers
 (subdivision, getTriangleVertices with a sub-index, the two radii, PxMax, the two
 PxTransform inverses), checked bit for bit against the engine's OWN GuTriangleRefinement.h
@@ -1979,6 +1984,110 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 (2/n) — der Kontakt-Körper je Thread, um den SDF-Abstieg herum geteilt
+
+Das neue Modul `pxgSlangTriTriBody.slang` enthält, was ein Thread von
+`doTriangleTriangleCollision` mit seinem (Teil-)Dreieck tut (convexMeshMidphase.cu:1085-1195),
+und zwar für **beide** Durchgänge.
+
+**Die Teilung.** Jeder Durchgang besteht aus Vertices, dann `doTriangleSDFCollision`, dann der
+Nachbearbeitung. Das Mittelstück ist `sdfDoTriangleCollision` aus pxgSlangSdfCollision. Es ist
+bereits gegen seine eigene Spur zertifiziert (`gpuslang.sdfTriangleCollision`) und der einzige
+Teil, der eine Textur abtastet. Der Port zerlegt jeden Durchgang deshalb in zwei **texturfreie**
+Funktionen, und der spätere Treiber setzt sie zusammen:
+
+- `ttcPass0Vertices` / `ttcPass0Post` (:1090-1154)
+- `ttcPass1Vertices` / `ttcPass1Post` (:1158-1194)
+
+So spiegelt der Host jede Operation aus der Engine (`PxVec3` / `PxQuat` / `PxTransform` /
+`PxMath` und die gemeinsamen Spiegel in `pxgTriTriGeomRef.h`), ohne den Sampler von llvmpipe
+nachbauen zu müssen. Die Kontaktfelder gehen einzeln hinein, nicht als `TtbContact`: Diese
+Struktur lebt in `pxgSlangTriTriBlock`, das wegen seines Workgroup-Speichers per `#include`
+eingebunden wird und daher nicht importierbar ist.
+
+**Die Fallen**, jede mit einer Fallfamilie in der neuen Suite `gpuslang.npTriTriBody`:
+
+- **T1 — das uninitialisierte `dir`** (:1096, :1163). `PxSdfSampleWithGrad` schreibt `dir`
+  nur unter der Toleranz. Sonst liefert es `PX_MAX_F32`, und `PX_MAX_F32 < cullScale` gilt nur
+  für `cullScale = +∞`. Der Treiber übergibt dann 0. Die Fixture macht diesen Pfad mit
+  `contactDistance = +∞` zum **Kandidaten** (154 Fälle), damit die Null tatsächlich bis in
+  die Normale und in `separation = PX_MAX_F32` fließt. Der erste Entwurf setzte nur
+  `cullScale = +∞`; dann ist der Pfad nie Kandidat, und die Familie prüfte nichts
+  (Review-Befund).
+- **T2 — `m` wird wiederverwendet** (:1118, :1135, :1139-1144). Die Boden-Zweig-Richtung
+  `dir2 * PxSqrt(m)` wird mit **demselben** `m` normiert, nicht mit der neuen Länge. Das
+  unterscheidet 195 Fälle.
+- **T3 — `normalize()` ist ein Reziprok-Multiplizieren** (PxVec3.h:260-265).
+- **T4 — `PxSign` ist `a >= 0 ? 1 : -1`.** Also gilt +1 für +0 **und** −0 und −1 für NaN.
+  - **−0:** Box-Zentrum 0 und n = (−1, −2, −6) ergeben `dot = −0`. Das trennt die Engine
+    von einem Vorzeichenbit-Test (51 Fälle; Review-Befund).
+  - **NaN bei endlichem n:** Mit einer Box bei +∞ und einem Dreieck in einer z-Ebene wird
+    `dot = ∞·0`. Das ist der einzige Weg, auf dem `PxSign(NaN)` eine Ausgabe erreicht
+    (19 Fälle). Ein NaN in n selbst macht auch dir2 zu NaN und verschluckt das Vorzeichen.
+- **T5 — `dot` und `cross` sind ausgeschrieben,** weil SPIR-V die Reihenfolge in `OpDot` und
+  in `GLSL.std.450 Cross` dem Treiber überlässt.
+- **T6 — `needsRefinement` wird vor und unabhängig von `sep < cullScale` bestimmt,** im
+  Vertex-Raum der SDF und mit striktem `>`. Beide Seiten der Grenze sind exakt getroffen:
+  2·256 = 512 = 16² + 16².
+- **T7 — `contact.pos` wird auf jedem Pfad neu geschrieben.**
+- **T8 — Pass 0 speichert `-dir`, Pass 1 `aToB.rotate(dir)`, und zwar nicht negiert.**
+- **T9 — Pass 1 bewegt die Vertices mit `transformInv`** und nicht mit
+  `getInverse().transform`. Das unterscheidet 1708 von 2048 Fällen.
+- **Die Schwelle `> 1e-8f` liegt genau auf der Grenze.** Mit n = (0, −q, p), p =
+  6.00099993e-05 und q = 7.99924965e-05 gilt `|n|² == 1e-8f` bitgenau (per Host-Suche
+  gefunden; ein einzelnes Quadrat trifft den Wert nicht). Das trennt `>` von `>=`
+  (51 Fälle; Review-Befund).
+- **NaN in `sep` und in `dir`** macht jeden Vergleich falsch. Hinter dem Cull-Test entsteht
+  ein NaN nur über `sep = −∞` und ein überlaufendes `|dir|²` (`m = 1/√∞ = 0`, `−∞·0 = NaN`);
+  dafür gibt es eine eigene Familie (Review-Befund).
+
+**Review.** Ein Workflow hat drei Dimensionen geprüft und jeden Befund adversarial
+gegengeprüft.
+
+- **Bitweise Defekte:** keiner.
+- **Bestätigt:** sieben Fixture-Lücken, alle behoben. Das sind die vakuumische T1-Familie, die
+  Grenze `1e-8`, das −0 in `PxSign`, die NaN-Vergleiche, ein tautologischer Diskriminator
+  `differs(n, -n)` (entfernt) sowie der Hinweis, dass ein `dot()` statt `ttcDot` hier nicht
+  beobachtbar ist (siehe unten).
+- **Widerlegt:** zwei.
+
+**Werkzeug:** `run_mutation_sweep.sh` bekommt `MUTATION_SWEEP_SPV_ONLY=1`.
+
+- **Warum:** Jeder Shader hängt über den Glob `SHADER_COMMON_DEPS` an jedem Modul. Eine
+  Modul-Mutation baute deshalb alle rund 460 Shader neu, also 3–4 Minuten pro Mutant. Der
+  erste Sweep dieses Moduls wurde nach vier Mutanten von einem **Container-Neustart**
+  abgebrochen und ließ den Mutanten `p0-refine-gated-by-sep` im Baum zurück. Er wurde gegen
+  den Vor-Sweep-Schnappschuss erkannt und zurückgesetzt.
+- **Was die Option tut:** Sie baut je Mutant nur die eine `.spv` über die Make-Regel des
+  Shader-Targets. Das dauert 0,5 s, bei bitgleichem Ergebnis (gemessen).
+- **Wann sie gültig ist:** nur, wenn die Suite keinen anderen Importeur des Moduls lädt. Das
+  gilt für eine Fixture über ihre eigene `.spv`.
+- **Wiederherstellung:** `restore()` baut weiterhin voll.
+- **Gegenprobe:** Die ersten vier Mutanten des abgebrochenen vollen Laufs und des schnellen
+  Laufs geben dasselbe Urteil.
+
+**Die Mutations-Sweeps**, erzwungen frisch, Quelle `pxgSlangTriTriBody`:
+
+- **Voller Lauf:** 50 Mutanten, 42 getötet, 4 überlebt. Vier Mutanten waren NOCOMPILE, weil
+  der Anker mitten in einem Kommentar endete (`// T2: …`, `// T8: …`) und der Rest als Code
+  stehen blieb.
+- **Mini-Lauf:** die vier korrigierten Mutanten, `p1-cand-nan-inverted` und das neue
+  `p0-cand-nan-inverted`. Alle 6 wurden getötet, nachdem die Familie „NaN hinter dem Cull"
+  dazukam. Zusätzliche Fälle können nur zusätzliche Kills bringen, deshalb genügte der
+  Mini-Lauf.
+
+**Bilanz:** 51 Mutanten, 48 getötet, 3 überlebt, alle diagnostiziert:
+
+| Mutant | Befund |
+|---|---|
+| `p0-dot-builtin`, `p0-cross-builtin` | äquivalent **auf llvmpipe**: Das gestempelte `OpDot` und die GLSL-`Cross` werden nicht fusioniert. Dasselbe Bild wie `mag-dot` in (1/n); SPIR-V legt beides nicht fest. |
+| `p0-cull-nan-inverted` | äquivalent für jeden Treiber: Ein NaN-`sep` im Block fällt am Kandidaten-Test durch, und sonst wird im Block nichts geschrieben. |
+
+**Suite:** 875/875 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriBody`).
+
+**Szenen:** nicht nötig. Das Modul hängt an keinem Engine-Kernel. Geändert sind neue Dateien,
+die Fixture-Registrierung und ein Test-Werkzeug; kein Engine-Pfad wird berührt.
 
 ## P9.83b-8 (1/n) — die Geometrie-Hilfen des Mesh-gegen-Mesh-Kernels, geprüft gegen die Engine selbst
 

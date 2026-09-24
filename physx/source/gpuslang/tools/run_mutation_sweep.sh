@@ -48,6 +48,19 @@
 # (test exceeded MUTATION_SWEEP_TIMEOUT, default 300s) -- all three are kills, counted
 # separately -- plus SURVIVED, NOCOMPILE (not a kill) and ANCHOR-FAIL (not a kill).
 #
+# MUTATION_SWEEP_SPV_ONLY=1 (added in P9.83b-8): rebuild ONLY <shader-stem>.spv per
+# mutant, through the shader target's own per-output make rule, instead of the whole
+# gpuslang-shaders target.  WHY: every shader depends on every pxgSlang*.slang module
+# (the SHADER_COMMON_DEPS glob), so a mutant in a shared module rebuilt all ~460 shaders
+# -- 3-4 minutes per mutant, a 44-mutant sweep past two hours, and one container restart
+# in that window left a mutant in the tree (P9.83b-8 (2/n)).  The single rule takes
+# about half a second and produced a bit-identical .spv when measured.  It is SOUND only
+# when the suite under test loads no other importer of the mutated module -- true for a
+# fixture suite over its own .spv -- because the other importers are never rebuilt
+# against the mutant.  restore() still does the FULL build, so the tree is left
+# consistent either way.  Unix Makefiles only; with another generator the full build is
+# used and a note says so.
+#
 # The BASELINE run is bounded by the same timeout: if the clean suite cannot finish
 # inside it, every mutant would be reported as a hang, so that is refused up front.
 
@@ -71,11 +84,24 @@ BAK="$(mktemp)"
 
 cp "$SRC" "$BAK"
 
-rebuild() {
+rebuild_full() {
     rm -f "$SPV"
     ( cd "$ROOT" && cmake --build build-gpuslang -j"$(nproc)" --target gpuslang-shaders ) >/dev/null 2>&1
 }
-restore() { cp "$BAK" "$SRC"; rebuild; }
+SHADER_MAKEFILE="$BUILD/CMakeFiles/gpuslang-shaders.dir/build.make"
+if [ "${MUTATION_SWEEP_SPV_ONLY:-0}" = 1 ] && [ ! -f "$SHADER_MAKEFILE" ]; then
+    echo "note: MUTATION_SWEEP_SPV_ONLY ignored -- no $SHADER_MAKEFILE (not Unix Makefiles?)" >&2
+    MUTATION_SWEEP_SPV_ONLY=0
+fi
+rebuild() {
+    if [ "${MUTATION_SWEEP_SPV_ONLY:-0}" = 1 ]; then
+        rm -f "$SPV"
+        ( cd "$BUILD" && make -s -f "$SHADER_MAKEFILE" "shaders/$STEM.spv" ) >/dev/null 2>&1
+    else
+        rebuild_full
+    fi
+}
+restore() { cp "$BAK" "$SRC"; rebuild_full; }
 
 # The invariant, enforced rather than remembered: however this script exits, the tree
 # is left with the pristine source AND a .spv built from it.
