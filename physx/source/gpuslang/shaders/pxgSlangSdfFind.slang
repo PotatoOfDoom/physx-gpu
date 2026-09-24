@@ -339,7 +339,11 @@ uint sdfFindInterestingVertices(uint tid, uint nbVertices, uint64_t positions,
 //          distance(centroid) < boundingSphereRadius / min(scale) + tolerance
 //      where the radius is `sqrt(max(|v0-c|^2, max(|v1-c|^2, |v2-c|^2)))` -- the
 //      same nested-max-then-one-sqrt shape as doTriangleSDFCollision's
-//      `difference`, and wrong if spelled as a max of three lengths.  The DIVISION
+//      `difference`.  (CORRECTED in P9.83b-8, 3/n: this note used to say a max of
+//      three lengths would be wrong.  It is the same number -- sqrt is monotone and
+//      correctly rounded, so it selects the same element and rounds it once, the
+//      same way -- and gpuslang.npTriTriFind asserts that over 3000 cases.  The
+//      one-sqrt spelling is kept for fidelity, not for the bits.)  The DIVISION
 //      by the smallest scale component happens to the radius alone, before the
 //      tolerance is added.
 //

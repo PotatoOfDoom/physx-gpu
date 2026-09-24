@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **875/875** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **876/876** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 (3/n) added `gpuslang.npTriTriFind`: the subdivision-aware triangle gather and the
+refinement buffer, one 1024-thread workgroup per case driving the kernel's inner loop, bitwise
+against a host mirror written from the CUDA.  It CONSTRUCTS upstream candidate 60: 256
+refinement entries whose 1024 children all pass make a child write slot 1023, and the next
+start index becomes its parent + 1 -- a rewind, a skip, or a forward jump, measured on both.
 P9.83b-8 (2/n) added `gpuslang.npTriTriBody`: the mesh-mesh kernel's per-thread contact body,
 split around the already-certified SDF call into texture-free halves, bitwise against the
 CUDA transcribed over the engine's own PxVec3/PxQuat/PxTransform/PxMath.  Its sweep gave
@@ -1984,6 +1989,100 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 (3/n) — der unterteilungsfähige Gather und der Verfeinerungspuffer; Upstream-Kandidat 60 ist jetzt konstruiert
+
+Neu ist die Include-Datei `pxgSlangTriTriFind.slang`. Sie ist textuell eingebunden, weil sie
+Workgroup-Speicher deklariert, und enthält die Verfeinerungshälfte, die der Cloth-Port
+derselben Funktion als tot weggelassen hatte (T3 in pxgSlangSdfFind):
+
+- `ttfFindInterestingTriangles` — `findInterestingTrianglesA<32,1024>` (sdfCollision.cuh:619-687)
+  **mit** dem Verfeinerungseingang.
+- `ttfAddIndexToBuffer` — `addIndexToBuffer<uint2,32,1024>` (:498-520).
+- `ttfTriangleCullSphere` — die texturfreie Hälfte des Culls, auf dem **Teil**dreieck.
+- `ttfAddToRefinementBuffer` — `addToRefinementBuffer<32,256>` (:741-763).
+
+**Speicher.** `triangleIndicesS` ist die in 15a/n gemessene Alias-Ansicht `gTtbScratch`:
+Eintrag k liegt in den Komponenten 2(k&1) und 2(k&1)+1 von `gTtbScratch[k >> 1]`. Die beiden
+Hälften schreiben **verschiedene** Threads (k und k^1). Deshalb wird Komponente für Komponente
+skalar gespeichert; im SPIR-V ist nachgezählt, dass es zwei skalare Stores und kein
+Vektor-Store sind. Ein Lese-Ändere-Schreibe des ganzen `uint4` würde eine Hälfte verlieren.
+`trianglesToSubdivideS[256]` und der Zähler sind neu (`gTtfSubdivide`, `gTtfNumSubdivide`).
+Resume-Slot und Scan-Zähler teilen sich `gSdfOffset` und `gSdfPerWarpCount` mit
+pxgSlangSdfFind, genau wie die CUDA `perWarpCountS` zwischen den beiden Scans teilt.
+
+**Der SDF-Abtastwert ist ein Haken.** `TTF_SDF_DISTANCE(t, ind, sub, p)` ist standardmäßig
+`sdfDistance(t, p)`, und `sdfDistance` ist bereits zertifiziert. Die Fixture ersetzt den Haken
+auf zwei Arten:
+
+- durch einen Hash über (ind, sub), der die Kontrolllogik in jede Ecke treibt,
+- durch eine analytische Ebene, deren Arithmetik der Host bitgenau spiegelt; damit wird der
+  Abtastpunkt geprüft.
+
+Die Default-Zeile selbst ist Pflicht der Kernel-Fixture (15).
+
+**Neue Suite `gpuslang.npTriTriFind`:**
+
+- **`ttfRounds`:** eine Workgroup mit 1024 Threads pro Fall. Sie treibt die innere Schleife des
+  Kernels genau wie cu:1062-1209 und protokolliert jede Runde vollständig: Anzahl, Start vorher
+  und nachher, den ganzen Indexpuffer und den ganzen Verfeinerungspuffer. Dazu kommt ein
+  Host-Spiegel aus der CUDA, in dem der Block-Scan ein Zähler in Thread-Reihenfolge ist.
+- **Umfang:** 26 Fälle, 180 Runden, alle bitgleich. Gezählt wurden:
+  - 23-mal schreibt ein Kind den letzten Slot,
+  - 119 gemischte Pässe (Kinder neben dem Sweep),
+  - 35 Überläufe der 256er-Grenze,
+  - 5514 an der Levelgrenze verworfene Anfragen,
+  - 62 393 Kind-Einträge,
+  - 3 Treffer **exakt** auf der Grenze des strikten Culls.
+- **Die Grenze** wird nach dem Sterbenz-Lemma konstruiert: Die Ebene wird so verschoben, dass
+  `d ≈ 1,25·r` gilt. Dann ist `tol = d − r` exakt, und `fl(r + tol) == d` gilt ohne Suche.
+  Der erste Versuch suchte `tol` in ulp-Schritten und sprang über `d` hinweg, sobald
+  `|tol| ≫ |d|` war.
+- **`ttfCullProbe`:** Kugel-Radius und Abtastpunkt, 3000 Fälle, bitgleich.
+
+**Upstream-Kandidat 60 — jetzt konstruiert, nicht mehr nur erwogen.** Ausgangslage: 256
+Verfeinerungseinträge, deren 1024 Kinder alle den Cull bestehen. Dann ist der Stride 0,
+ein Kind schreibt Slot 1023 und setzt `offset = Elter + 1`. Mit den Eltern 3k+7 ist der
+letzte Elter 772. Port und CUDA-Spiegel zeigen alle drei Folgen:
+
+| Start vorher | Start nachher | Folge |
+|---|---|---|
+| 2000 (Sweep fertig) | **773** | **Rücksprung**: Der Rest des Meshes wird noch einmal gesammelt |
+| 773 (= Elter + 1) | **2000** | `offset == startIndex` gilt als „kein Überlauf“; der Rest des Meshes wird **übersprungen** |
+| 100 (mitten im Sweep) | **773** | Sprung nach vorn; die Dreiecke 100 bis 772 werden nie gesammelt |
+
+Das ist die Folge des CUDA-Codes, gemessen am Port und an seinem Spiegel. Ob der Zustand
+im echten Kernel erreichbar ist, klärt die laufende Review (256 volle Anfragen und alle Kinder
+im Cull). **Dokumentiert, nicht gemeldet.**
+
+**Korrigierte Behauptung.** Der T2-Hinweis in pxgSlangSdfFind sagte, ein Maximum dreier Längen
+statt einer Wurzel aus dem Maximum der Quadrate sei falsch. Das stimmt nicht: `sqrt` ist
+monoton und korrekt gerundet, beide Schreibweisen geben dieselbe Zahl. Die Fixture assertiert
+das über 3000 Fälle, und der Mutant überlebt als Äquivalent. Der Hinweis ist korrigiert.
+
+**Mutations-Sweep**, erzwungen frisch, schneller Modus: 39 Mutanten, **35 getötet** (einer
+davon als Hang). Die Überlebenden:
+
+| Mutant | Befund |
+|---|---|
+| `loop-no-count-guard` | äquivalent: Ein voller Puffer schreibt nichts mehr, und der Handschlag feuert nicht zweimal (vgl. T1 in pxgSlangSdfFind) |
+| `sphere-max-of-lengths` | äquivalent, siehe oben |
+| `final-barrier-removed`, `pass-barrier-removed` | rennbehaftet; unter der festen Reihenfolge von llvmpipe ist Überleben nicht aussagekräftig |
+
+`cull-le` überlebte den ersten Lauf, weil kein Fall auf der Grenze lag. Nach den
+Sterbenz-Fällen wurde es im Mini-Lauf getötet.
+
+**Checker.** `barrierUniformity` meldete die Schleife des Fixture-Treibers. Sie ist
+block-uniform: Der Zähler wird nach der Barriere von jedem Thread gelesen, `startIndex` nach
+der Schlussbarriere des Gathers (die Argumentation der Refine-Karte zu cu:1064). Die
+Waiver-Zeilen trafen zunächst nicht, weil der Parser an `|` trennte und der Guard `||` enthält.
+Der Parser trennt jetzt nur an einer Pipe mit Leerraum auf beiden Seiten; die beiden
+bestehenden Waiver werden unverändert gelesen (nachgezählt).
+
+**Suite:** 876/876 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriFind`).
+
+**Szenen:** nicht nötig. Nichts auf der Engine-Seite ist verdrahtet. Geändert sind neue Dateien,
+die Fixture-Registrierung, ein Kommentar in pxgSlangSdfFind und der Waiver-Parser.
 
 ## P9.83b-8 (2/n) — der Kontakt-Körper je Thread, um den SDF-Abstieg herum geteilt
 

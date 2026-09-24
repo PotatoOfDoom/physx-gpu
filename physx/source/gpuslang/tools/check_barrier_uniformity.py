@@ -767,7 +767,11 @@ def load_waivers():
         line = raw.strip()
         if not line or line.startswith('#'):
             continue
-        parts = line.split('|')
+        # Fields are separated by a pipe with whitespace on BOTH sides, so a guard
+        # that contains `||` (P9.83b-8: the mesh-mesh loop's
+        # `i < nbTriangles || numTrianglesToSubdivideS > 0`) survives intact.  A
+        # bare split('|') cut such a guard in two and the waiver never matched.
+        parts = re.split(r'\s+\|\s+', line, maxsplit=3)
         if len(parts) < 4:
             continue
         key = (parts[0].strip(), parts[1].strip(), ' '.join(parts[2].split()))

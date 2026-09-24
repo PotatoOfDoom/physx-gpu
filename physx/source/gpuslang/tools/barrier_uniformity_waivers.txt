@@ -30,3 +30,14 @@
 # warp-max would make all three sites real.
 psPrimCollide.slang | scope | for (uint ind = 0; ind < range; ++ind) | last write before the loop is the warp-max broadcast of range (sRange[lane] -> max over 0..31), so the trip count is warp-uniform; see the file header, line 61
 psPrimCollide.slang | call  | for (uint ind = 0; ind < range; ++ind) | same warp-max broadcast: ballot32 is reached with the same trip count in every lane
+
+# --- npTriTriFind.slang (P9.83b-8, 3/n) ------------------------------------
+# The fixture's copy of the mesh-mesh kernel's inner loop (convexMeshMidphase.cu:1064),
+# tested on the REGISTER copy of the refinement count exactly as the P9.83b-8 refine
+# map derived for the CUDA.  Both terms are block-uniform: numTrianglesToSubdividePerThread
+# is read from gTtfNumSubdivide by every thread AFTER the barrier that follows thread 0's
+# write (and is 0 or the seed read after the prologue barrier), and startIndex is
+# written by ttfFindInterestingTriangles from gSdfOffset, which every thread reads after
+# the function's final barrier.  round and maxRounds are uniform by construction.
+npTriTriFind.slang | scope | while ((startIndex < nbTriangles || numTrianglesToSubdividePerThread > 0u) && round < maxRounds) | numTrianglesToSubdividePerThread is every thread's read of gTtfNumSubdivide after the barrier that follows thread 0's publish; startIndex is every thread's read of gSdfOffset after ttfFindInterestingTriangles' final barrier -- the cu:1064 argument of the P9.83b-8 refine map
+npTriTriFind.slang | call | while ((startIndex < nbTriangles || numTrianglesToSubdividePerThread > 0u) && round < maxRounds) | same loop, same two block-uniform reads: every thread calls the gather and addToRefinementBuffer the same number of times
