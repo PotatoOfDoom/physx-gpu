@@ -534,8 +534,16 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
     r.overflowBits = 0u;
     r.overflow = false;
 
+    // :537 u16Low(u32High(allflags)) = byte 2, the status byte.
+    // :547 u16High(u32Low(allflags)) = byte 1 -- nbPatches, the pair's CURRENT
+    // patch count, which the store below carries forward into byte 3 as next
+    // frame's prevPatches (the sibling writers say so: cudaGJKEPA.cu:2076,
+    // contactPatchUtils.cuh:91).  P9.83b-8 T0 FIXED THIS: the first port read byte
+    // 3 (`>> 24`), the stored prevPatches itself, so prevPatches never advanced
+    // and patchChange compared against the wrong count -- and the oracle read the
+    // same wrong byte, which is why the reservation sweep could not see it.
     const uint oldStatusFlags = (oldAllFlags >> 16u) & 0xFFu;
-    const uint prevPatches = (oldAllFlags >> 24u) & 0xFFu;
+    const uint prevPatches = ((oldAllFlags & 0xFFFFu) >> 8u) & 0xFFu;
 
     // :540-545.  The mask clears ONLY bits 0-1; eREQUEST_CONSTRAINTS,
     // eHAS_CCD_RETOUCH, eDIRTY_MANAGER and eSTATIC_OR_KINEMATIC ride through.
@@ -607,7 +615,7 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 }
 
 // ---------------------------------------------------------------------------
-// THE RESERVATION SWEEP: 16 KILLED, 0 SURVIVE
+// THE RESERVATION SWEEP: 16 KILLED, 0 SURVIVE -- AND A DEFECT STILL SHIPPED
 // ---------------------------------------------------------------------------
 // Clean, on the second run.  The first found one survivor -- patch-check-nonstrict
 // (`>` vs `>=`) -- because the fixture's limits were always at least one byte off
@@ -615,6 +623,16 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 // spellings differ.  One limit in four now lands exactly on it, and the contact
 // and force checks got the same mutant rather than only the one that happened to
 // be noticed.
+//
+// A clean sweep did not make the body right.  prevPatches read byte 3 in the port
+// AND in its oracle, so every mutant was judged against a reference that shared
+// the defect; a sweep measures the fixture's power to tell the port from its
+// oracle, never the oracle's fidelity to the CUDA.  The critic pass of P9.83b-8
+// found it by re-reading :547 against the sibling writers.  After the fix (T0) the
+// oracle spells the read with the CUDA's own u16High(u32Low()), the fixture puts
+// byte 1 ON the new count (patchChange = 0, which only byte 1 produces) and byte
+// 3 on it elsewhere, and a mini sweep of four wrong-byte reads -- byte 3 restored,
+// byte 0, byte 2, bytes 1-2 as 16 bits -- killed all four.
 //
 // ---------------------------------------------------------------------------
 // A STANDING RULE, PAID FOR FOUR TIMES IN THIS TRANCHE

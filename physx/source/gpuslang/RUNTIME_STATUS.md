@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **876/876** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 T0 fixed a port defect its oracle shared: ttpReserveBlock read prevPatches from
+byte 3 of the flags word (the stored field) instead of byte 1 (nbPatches; cu:547
+u16High(u32Low)), so the count would never have advanced.  A clean 16/16 sweep could not see
+it -- a sweep measures the port against its oracle, not the oracle against the CUDA.  The
+oracle now reads through the CUDA's own helpers, and four wrong-byte mutants die.
 P9.83b-8 (3/n) added `gpuslang.npTriTriFind`: the subdivision-aware triangle gather and the
 refinement buffer, one 1024-thread workgroup per case driving the kernel's inner loop, bitwise
 against a host mirror written from the CUDA.  It CONSTRUCTS upstream candidate 60: 256
@@ -1990,6 +1995,90 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 T0 — `ttpReserveBlock` las `prevPatches` aus Byte 3 statt aus Byte 1 (Port-Defekt, das Orakel teilte ihn)
+
+**Befund.** Der Kritiker-Durchgang des Plan-Workflows zu P9.83b-8 hat `convexMeshMidphase.cu:547`
+gegen die Schwester-Schreiber gelesen:
+
+- Die CUDA liest `prevPatches = u16High(u32Low(allflags))`. Das sind die Bits 8..15, also
+  Byte 1 des Flag-Worts von `PxsContactManagerOutput`. Die Byte-Belegung:
+
+  | Byte | Feld |
+  |---|---|
+  | 0 | `allflagsStart` |
+  | 1 | `nbPatches` |
+  | 2 | `statusFlag` |
+  | 3 | `prevPatches` |
+
+- Gelesen wird also die **aktuelle** Patch-Anzahl des Paares. Der Store bei cu:603
+  (`merge(merge(prevPatches, statusFlags), merge(numPatchesToKeep, 0))`) trägt sie als
+  nächstes `prevPatches` nach Byte 3. Die Schwestern sagen es im Kommentar
+  (cudaGJKEPA.cu:2076, contactPatchUtils.cuh:91): „Get out the current number of patches to
+  store as the previous frame's number of patches".
+- Der Port las `(oldAllFlags >> 24u) & 0xFFu`, also das gespeicherte `prevPatches` selbst.
+  Im Kernel hätte das zwei Folgen gehabt:
+  - Byte 3 schreitet nie fort, sondern behält seinen Anfangswert.
+  - `patchChangeFlags` vergleicht gegen die falsche Anzahl.
+
+  Die Konsumenten wären unter anderem die Partitionierung des GPU-Solvers und die
+  Lost/Found-Kompaktierung gewesen. Erreicht hat der Defekt nichts: `ttpReserveBlock` ist
+  noch nicht an die Engine verdrahtet, der einzige Aufrufer ist die Fixture.
+
+**Warum die Suite es nicht sah.** Das Orakel in `testNpTriTriReduce.cpp` las dasselbe falsche
+Byte. Der Reservierungs-Sweep (16 von 16 getötet) misst, ob die Fixture den Port von seinem
+Orakel unterscheiden kann. Ob das Orakel der CUDA treu ist, misst er nicht. Ein Defekt, den
+beide teilen, ist für jeden Sweep unsichtbar. Gefunden hat ihn nur das erneute Lesen der
+CUDA-Zeile.
+
+**Fix, Port und Orakel zusammen:**
+
+- Port (`pxgSlangTriTriPatch.slang`): `((oldAllFlags & 0xFFFFu) >> 8u) & 0xFFu`.
+- Orakel: Es liest jetzt über die transkribierten cutil_math-Helfer
+  `u16High(u32Low(oldAllFlags))`, in der Schreibweise der CUDA.
+
+**Konstruierte Fälle.** Ein zufälliges Wort hat fast nie Byte 1 gleich der neuen Anzahl, also
+wäre `patchChange` überall 1. Deshalb:
+
+- In jedem vierten Fall trägt Byte 1 die neue Anzahl. Dann ist `patchChange = 0`, und das
+  liefert nur Byte 1.
+- Die Hälfte dieser Fälle wird unter allen drei Grenzen gehalten, denn ein Überlauf nullt die
+  Anzahl. Jede Grenze wird dafür auf ihren eigenen Bedarf **angehoben**, nie gesenkt. Die
+  Zufallsziehungen und die Treffer genau auf der Grenze bleiben so, wie sie waren.
+- In jedem achten Fall trägt stattdessen Byte 3 die neue Anzahl.
+
+Neue Abdeckungsprüfung:
+
+- 2987 Fälle mit Byte 1 ≠ Byte 3,
+- 415 Fälle ohne Patch-Wechsel,
+- 1721 Überläufe mit einer von null verschiedenen Vorzahl.
+
+Der erste Lauf zählte nur 65 Fälle ohne Patch-Wechsel, weil die meisten konstruierten Fälle
+überliefen. Die Prüfung schlug an, erst danach kam das Anheben der Grenzen.
+
+**Mini-Sweep**, erzwungen frisch, schneller Modus. Neu gebaut wird nur `npTriTriAccept.spv`,
+den einzigen Aufrufer von `ttpReserveBlock`; `npTriTriReduce.spv` importiert das Modul, ruft
+die Funktion aber nicht. **4 Mutanten, 4 getötet**, alle als falsches Byte:
+
+- Byte 3 wiederhergestellt,
+- Byte 0,
+- Byte 2,
+- Bytes 1–2 als 16 Bit.
+
+Die Sweep-Notiz im Modul erklärt jetzt, warum ein sauberer Sweep diesen Defekt nicht sehen
+konnte.
+
+**Die übrigen Leser des Flag-Worts** lesen Byte 1: boxBox, Sphere, CvxCore, CvxCore32,
+CvxTrimesh, CvxPlane, CvxFinish, cvxTriFinish, NpPatchTail und npContactPatch.
+`npCvxLostFound.slang` liest Byte 3 mit Absicht, denn es kopiert das **gespeicherte** Feld in
+`PxsContactManagerOutputCounts`.
+
+**Einordnung:** ein Port-Defekt, **kein** Upstream-Kandidat. Die CUDA ist richtig.
+
+**Suite:** 876/876 in beiden Speichermodi.
+
+**Szenen:** nicht nötig. `ttpReserveBlock` erreicht noch keine Engine-Ausführung; geändert sind
+nur eine Zeile im Modul, eine Notiz und die Fixture.
 
 ## P9.83b-8 (3/n) — der unterteilungsfähige Gather und der Verfeinerungspuffer; Upstream-Kandidat 60 ist jetzt konstruiert
 
