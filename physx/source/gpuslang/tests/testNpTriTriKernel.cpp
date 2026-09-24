@@ -79,7 +79,10 @@
 //   * a gather over more than one round (the resume handshake);
 //   * scaled and scale-rotated meshes in BOTH arms and on the floor branch's SDF
 //     side, rotated poses;
-//   * the cull bands and the 128-patch cap;
+//   * the cull bands -- including a pass-1-only case whose EVERY contact lies in
+//     the carried band, because band contacts next to deeper ones are consumed by
+//     the patch without being kept (the first sweep's cullscale-carried survivor)
+//     -- and the 128-patch cap;
 //   * generateContacts false, and a pair with the flag set and nothing found;
 //   * a patch, a contact and a force overflow, each limit with its own slack;
 //   * nine pairs of distinct content, transforms and contact distances at indices
@@ -909,6 +912,16 @@ PXG_TEST(npTriTriKernel_pairs)
     add(PairSpec{ "pass 1 alone, flipped: far fine box first", FARBOXFINE, BOX, ONE, ONE, I, I, 6, 3,
                   PxTransform(PxVec3(0.02f, 0.94f, 0.03f), tilt2), PxTransform(PxVec3(0.f, 0.f, 0.f), tilt),
                   0.03f, 0.02f, true, 64u * 3u, 16u * 2u, 4u * 7u, 0u, 0u });
+    // EVERY pass-1 contact in the carried band.  The sweep showed that band contacts
+    // mixed with deeper ones are consumed by the patch and never kept, so a carried
+    // cullScale (cd / 1.25 = 0.08 instead of 0.1) changed nothing.  Here pass 0 is
+    // empty (far SDF on mesh1), the far box is scaled 1.25 and hovers UNTILTED 0.09
+    // below the fine box: every pass-1 separation is 0.09, in [0.08, 0.1), so the
+    // mutant loses every contact.
+    add(PairSpec{ "pass 1 alone, every contact in the carried band", BOXFINE, FARBOXFINE,
+                  ONE, PxVec3(1.25f, 1.25f, 1.25f), I, I, 2, 6,
+                  PxTransform(PxVec3(0.f, 1.215f, 0.f), I), PxTransform(PxVec3(0.f, 0.f, 0.f), I),
+                  0.05f, 0.05f, true, 64u * 3u, 16u * 3u, 4u * 3u, 0u, 0u });
     // The operand exchange of the scale frames: flipped (numVerts), both sides scaled
     // non-uniformly with their own scale rotations.
     add(PairSpec{ "flipped, both sides scaled and scale-rotated", BOXFINE, BOX,
@@ -970,7 +983,7 @@ PXG_TEST(npTriTriKernel_pairs)
     uint32_t cullBand1 = 0, cullBand0 = 0, candBand0 = 0, ratioBand = 0, level7 = 0, capDrops = 0;
     size_t fullPatchCases = 0, noSdfAloneCases = 0, refineOverflow = 0, childLastSlot = 0;
     size_t pass1AloneUnflipped = 0, pass1AloneFlipped = 0, flippedScaled = 0, scaledFloor = 0;
-    size_t touchSeedCases = 0, noTouchSeedCases = 0;
+    size_t touchSeedCases = 0, noTouchSeedCases = 0, carriedAllBand = 0;
     size_t doFirstKill[5] = { 0, 0, 0, 0, 0 };
     const char* doFirstMutant[5] = { "the SDF guard dropped", "the no-SDF term dropped", "`!mesh0 flag` dropped",
                                      "the flag equality dropped", "numTris for numVerts" };
@@ -1207,6 +1220,7 @@ PXG_TEST(npTriTriKernel_pairs)
         if (R.doFirst && R.st.doFirstByNoSdfAlone) ++noSdfAloneCases;
         const bool pass1Alone = R.N > 0u && R.st.candPass[0] == 0u && R.st.candPass[1] > 0u;
         if (pass1Alone) ++(R.doFirst ? pass1AloneFlipped : pass1AloneUnflipped);
+        if (pass1Alone && R.st.cullBandPass1 == R.st.candPass[1]) ++carriedAllBand;
         if (R.doFirst && R.N > 0u && ps.s0 != ONE && ps.s1 != ONE && !ps.r0.isIdentity() && !ps.r1.isIdentity()) ++flippedScaled;
         if (R.N > 0u && !meshes[R.doFirst ? ps.m1 : ps.m0].sdf && (R.doFirst ? ps.s0 : ps.s1) != ONE) ++scaledFloor;
         if (R.N > 0u && (seedStatus & tr::FLAG_HAS_TOUCH) != 0u && (seedStatus & tr::FLAG_HAS_NO_TOUCH) == 0u)
@@ -1255,12 +1269,13 @@ PXG_TEST(npTriTriKernel_pairs)
                   cullBand1, cullBand0, candBand0, ratioBand, level7, capDrops, fullPatchCases, noSdfAloneCases);
     PXG_CHECK_MSG(refineOverflow > 0 && childLastSlot > 0 && contactOvfCases >= 1 && forceOvfCases >= 1 &&
                   pass1AloneUnflipped >= 1 && pass1AloneFlipped >= 1 && flippedScaled >= 1 && scaledFloor >= 1 &&
-                  touchSeedCases >= 1 && noTouchSeedCases >= 1,
+                  touchSeedCases >= 1 && noTouchSeedCases >= 1 && carriedAllBand >= 1,
                   "npTriTriKernel_pairs: a discriminator is empty -- refinement overflows %zu, child in the last slot "
                   "%zu, contact overflows %zu, force overflows %zu, pass 1 alone %zu unflipped / %zu flipped, flipped "
-                  "and scaled %zu, scaled floor %zu, prior touch %zu, prior no-touch %zu",
+                  "and scaled %zu, scaled floor %zu, prior touch %zu, prior no-touch %zu, pass 1 wholly in the "
+                  "carried band %zu",
                   refineOverflow, childLastSlot, contactOvfCases, forceOvfCases, pass1AloneUnflipped, pass1AloneFlipped,
-                  flippedScaled, scaledFloor, touchSeedCases, noTouchSeedCases);
+                  flippedScaled, scaledFloor, touchSeedCases, noTouchSeedCases, carriedAllBand);
     for (uint32_t m = 0; m < 5u; ++m)
         PXG_CHECK_MSG(doFirstKill[m] > 0, "npTriTriKernel_pairs: no case with contacts tells doFirst from its "
                       "mutant (%s)", doFirstMutant[m]);

@@ -82,6 +82,70 @@
 //     platform, so the vertex reads take `ind < nb ? ind : 0`.
 //
 // ---------------------------------------------------------------------------
+// MUTATION SWEEP (P9.83b-8 (4/n)), forced fresh, against npTriTriKernel_pairs:
+// 49 mutants -- 35 killed, 4 killed only by a crash, 10 survived; after the
+// all-band pass-1 case, a re-sweep of the 10 left 9, each diagnosed below.
+// ---------------------------------------------------------------------------
+// KILLED BY A CRASH -- NOT EVIDENCE, AND FOR THREE OF THEM NO OTHER KILL EXISTS:
+//   dofirst-no-notex-term, dofirst-no-sdf-guard, pass1-no-break-UB
+//       each makes the kernel sample the SDF of a mesh that has none (texture
+//       handle 0, spacing 0 -> invSdfDx = inf, f = NaN).  That is what the SDF
+//       guard, the no-SDF term and the K4 break exist to prevent, so the only
+//       difference they can make is undefined behaviour.  The host-counted
+//       doFirst discriminator still requires each term to decide a case with
+//       contacts; the crash is what that decision looks like on this device.
+//   mesh-bv32-stride-1152
+//       reads the vertices from inside the BV32 tree: garbage indices, a crash.
+//       The stride is sizeof(Gu::BV32DataPacked) = 1168, checked by hand
+//       (GuBV32.h:88-111) and by every case reading correct geometry.
+//
+// SURVIVED, EQUIVALENT:
+//   atob-p-rotateinv-EQUIV      quatRotate(conj(q), v) and quatRotateInv(q, v)
+//                               differ only by exact negations (of x, y, z in
+//                               the cross term and of dot2 against -x), so they
+//                               are bitwise equal on a stamped build.
+//   minscale-builtin-EQUIV      FMin and `a < b ? a : b` differ only on NaN (and
+//                               on the sign of equal zeros); scales are positive.
+//   contact-sep-zero            a non-candidate's separation is never read: the
+//                               patch code gates on candidateContact first.
+//   dir-seed-nonzero            the post reads `dir` only when sep < cullScale;
+//                               the descent leaves `dir` unwritten only when the
+//                               sample is >= its tolerance, and then returns
+//                               PX_MAX_F32.  Both at once need an infinite
+//                               sample AND an infinite cullScale (Body T1).
+//   safeind-removed-EQUIV       the clamp is behind `ind < nb`; llvmpipe issues no
+//                               masked read for inactive lanes (measured 5/5).
+//                               The clamp stays: that is a platform fact, not a
+//                               language guarantee.
+//   subdiv-init-removed-EQUIV   the init is dead, in the CUDA too (:1016): every
+//                               iteration writes the shared count (:1199-1200)
+//                               before the barrier and the read (:1204, :1209),
+//                               and the loop starts from the register copy 0
+//                               (:1062), not from the shared one.
+//   count-every-thread          the count only gates the assignment loops; with
+//                               no live candidate createNewPatches finds no seed
+//                               and exits, and tryAssign is a no-op.
+//   refine-passes-ind-unclamped-EQUIV
+//                               only threads with needsRefinement contribute an
+//                               index, and those have ind < nb.
+//   btoa-direct                 bToA as t0.transformInv(t1) instead of
+//                               aToB.getInverse(): an ulp-level respelling.  bToA
+//                               feeds only the pass-1 gather's `d < r + tol`,
+//                               and for a 1-Lipschitz field a triangle on that
+//                               boundary has sep >= d - r = cullScale, so it can
+//                               never become a candidate.  Invisible by
+//                               construction; the spelling is the CUDA's
+//                               (:1078, PxTransform::getInverse) by review.
+//
+// KILLED ONLY AFTER A CASE WAS BUILT FOR IT:
+//   cullscale-carried           survived the first sweep with 6 triangles in its
+//                               band: shallow band contacts next to deeper ones
+//                               are consumed by the patch and never kept.  The
+//                               case "pass 1 alone, every contact in the carried
+//                               band" puts all 18 pass-1 contacts at sep 0.09 in
+//                               [0.08, 0.1).
+//
+// ---------------------------------------------------------------------------
 // STORAGE: 0 bytes of staging.  The CUDA stages the shapes, transforms and meshes
 // in shared memory (:1329-1354) and the SDF texture too (:1013-1014); here every
 // thread holds its own copy, as triTriOverlapBda and the cloth SDF kernel do.

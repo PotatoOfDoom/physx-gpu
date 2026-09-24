@@ -7,7 +7,16 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **877/877** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **878/878** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 (4/n) added `gpuslang.npTriTriKernel`: triangleTriangleCollision itself
+(triTriCollisionBda.slang, 31116 Workgroup bytes), bitwise against a HOST REPLAY of the kernel
+over the certified mirrors, with the two texture values measured by certified probes on
+host-derived inputs.  31 cases, nine pairs of distinct content, every coverage claim behind a
+host-counted discriminator; the 128-patch cap is reachable only through zero normals (a
+patch eats a 31.8-degree cone, so unit normals fit ~44), built with a flat SDF.  A review
+workflow found 12 real gaps, all closed, and one port defect two oracles shared: the patch
+header zeroed pad[0], which the CUDA's PxU16 store leaves (now a read-modify-write).  The
+container's disk began returning I/O errors mid-tranche; .git was re-cloned from the remote.
 P9.83b-8 T2 added `gpuslang.npTriTriTail`: the mesh-mesh kernel's output tail as ONE block
 function on thread 0 (0 Workgroup bytes), run per case against real counters, a real
 contact-manager record, flag words, streams and DECOY start bases, whole buffers bitwise
@@ -2007,6 +2016,199 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 (4/n) — der Kernel triangleTriangleCollision selbst, gegen eine Wiederholung auf dem Host
+
+Neu ist `triTriCollisionBda.slang` mit dem Einstieg `triangleTriangleCollision`: eine
+1024-Thread-Workgroup pro Paar, Push-Block 144 Byte (die CUDA-Parameterliste,
+convexMeshMidphase.cu:1290-1311). Jede Rechnung und jede Blockoperation darin ist ein bereits
+zertifiziertes Stück (Geom, Body, SDF-Abstieg, Find, Block, Tail). Neu ist nur der Leim:
+
+- der Leser der Netzgeometrie,
+- das Overlap-Byte,
+- doFirst und der einmalige Operandentausch,
+- aToB und seine materialisierte Inverse,
+- ein frischer Kontakt pro Iteration,
+- cullScale pro Pass,
+- die Index-Klemme an den Lesezugriffen des Bodys.
+
+Die neun Fallen stehen als K1–K9 im Kopf der Datei. Der Workgroup-Speicher ist **31 116 Byte**,
+am echten Einstieg gemessen (groupshared_known). Die Schleife testet die Registerkopie; das
+steht mit Begründung als Waiver in barrier_uniformity_waivers.txt (K8).
+
+**Das Orakel ist eine Wiederholung des Kernels auf dem Host**, über die zertifizierten Spiegel:
+
+- Gather → `pxgTriTriFindRef.h`
+- Body → `pxgTriTriBodyRef.h`
+- Patches und Tail → `pxgTriTriRef.h`
+
+Beide Header wurden aus den Fixtures dorthin verschoben. Nicht spiegeln lässt sich die
+SDF-Textur. Die zwei texturabhängigen Werte kommen deshalb von **zertifizierten
+Geräte-Einstiegen**: `npSdfCollision:sdfCollDistance` und `sdfCollTriangle`. Gefüttert werden
+sie mit Eingaben, die der **Host** berechnet hat. Das funktioniert so:
+
+- Die Werte werden nach Eingabebits gecacht.
+- Ein fehlender Schlüssel antwortet „kein Kontakt“ und wird in einem Stapel pro Netz gemessen.
+- Die Wiederholung läuft erneut, bis nichts mehr fehlt; 146 Probe-Dispatches für 31 Fälle.
+- Ein Probe, der sein Ausgabewort nicht geschrieben hat (Füllwert −4242), bricht laut ab,
+  statt als Messwert gecacht zu werden.
+
+**Neue Suite `gpuslang.npTriTriKernel`** mit zwei Tests:
+
+- `_structure` prüft `ttbInitAssignState` samt Barriere vor der äußeren Schleife und dass
+  keine Fixture-Hooks definiert sind.
+- `_pairs` fährt 31 Fälle mit ganzen Puffern bitweise: Zähler, Datensätze, beide Flag-Arrays,
+  Patch- und Kontakt-Stream, Köder. **Alle 31 Fälle sind bitgleich.**
+
+Der Aufbau jedes Falls:
+
+- Neun Paare, numWorkItems = 8, neun Workgroups. Das echte Paar liegt auf pairIdx 5, also
+  Overlap-**Wort 1**, Byte 1, mit Flagwerten 0x02 bzw. 0x80 (Bit 0 frei).
+- Jedes andere Paar ist ein **Köder mit eigenem Inhalt**: verschobene Pose, Skalierung,
+  Material und contactDistance.
+- Transformationen und Abstände liegen auf `transformCacheRef = shapeRef + 18`; an der
+  jeweils **anderen** Referenz liegt ein Köder.
+- Das Paar auf pairIdx = numWorkItems ist voll gültig, hat die Flagge gesetzt und muss
+  unberührt bleiben. Kein Lesezugriff außerhalb der Puffer entscheidet mehr über den
+  frühen Rücksprung.
+- Status-Bytes werden variiert (touch; no-touch plus Bit 6; unbekannt; beide), Byte 0 ist
+  ungleich null, und in jedem dritten Fall ist der alte Patchzähler gleich dem neuen.
+
+**Jede Behauptung hat einen hostgezählten Diskriminator**, und der Test verlangt ihn ungleich
+null:
+
+- beide Arme; Pass 1 in beiden Armen, auch **Pass 1 allein** (2 + 1 Fälle). Ein flaches,
+  fernes SDF (+10) auf der mesh1-Seite leert Pass 0.
+- doFirst gegen fünf mutierte Schreibweisen, jede in einem Fall mit Kontakten unterschieden
+  (4/1/1/1/1). Dazu kommen die Netze BOXFINEP (Flag, 96 Vertices) und BOX8 (8 geteilte
+  Ecken, 12 Dreiecke; numVerts ≠ numTris).
+- Cull-Bänder: pass0 6, pass1 6, Kandidatenband 11.
+- Refinement: Verhältnisband 169, Level-7-Anfragen 48, Cap-Drops 140; **über 256
+  Refinement-Einträge** (1) mit einem **Kind im letzten Slot** (1, Kandidat 60). Das kommt
+  vom Gitter GRIDREF, 11 × 13 Zellen im flachen SDF.
+- die **128-Patch-Grenze** (2 Fälle), Patch-, Kontakt- und Force-Überlauf (je ≥ 1), jede
+  Grenze mit eigenem Spielraum.
+- gespiegelt **und** beidseitig skaliert und skalierungsrotiert; die Floor-Seite mit
+  skaliertem, rotiertem SDF.
+
+**Drei Einsichten beim Bau der Fälle:**
+
+1. **Ein mutiertes Cull-Toleranzmaß ist nur sichtbar, wenn es SCHRUMPFT.** Ein Dreieck mit
+   roher Separation ≥ cd/minScale hat normiert mindestens cd und kann kein Kandidat sein. Die
+   Schwebe-Fälle legen deshalb eine Skalierung **über 1** auf die Seite, durch die die Mutante
+   fälschlich teilt, und kippen die Box um 0,05 rad, damit die Spalte das Band [0,8·cd, cd)
+   füllen.
+2. **Mit Einheitsnormalen ist die 128-Patch-Grenze unerreichbar.** Ein Patch verbraucht jeden
+   Kontakt mit dot > 0,85 (31,8°). Patchnormalen liegen also paarweise mehr als 31,8°
+   auseinander, und auf der Kugel passen höchstens etwa 44 (Tammes). Die Kugel in der Box
+   liefert 29. Die Grenze erreichen nur **Nullnormalen**: In einem konstanten SDF ist der
+   Gradient exakt 0, und innerhalb des Trägers ist diff = 0. PxSdfSampleWithGrad gibt dann
+   `dir = (0·|d| + 0).getNormalized() = 0`, und jeder Kontakt begründet einen eigenen Patch.
+3. **Der Gather ist schwächer als der Abstieg.** Sein Sample speist nur `d < r + tol`. Bei
+   einem 1-Lipschitz-SDF kann ein Dreieck an der Gather-Grenze keinen Kandidaten liefern
+   (sep ≥ d − r = cullScale). Eine ulp-weise andere Schreibweise von bToA ist hier also
+   prinzipiell unsichtbar. Der Kopf der Fixture sagt das jetzt so, statt es zu behaupten.
+
+**Zwei Upstream-Kandidaten sind jetzt am echten Kernel erreicht** (Tabelle aktualisiert):
+
+- **58:** 720 Kontakte mit Nullnormale füllen 128 Ein-Punkt-Patches.
+- **60:** Nach dem Kind in Slot 1023 springt der Gather auf Primitiv 256 zurück. Die Dreiecke
+  256–285 laufen ein zweites Mal durch und liefern ihre Kontakte doppelt: 1460 gefunden =
+  286 + 1024 + 30 + 120.
+
+Port und Wiederholung stimmen dabei bitweise überein. Beide Zustände entstehen aus Daten, die
+kein echtes Distanzfeld sind (ein konstantes SDF); ob Engine-Geometrie sie erreicht, bleibt
+offen.
+
+**Ein Portfehler, den zwei Orakel mittrugen: pad[0] im Patch-Header.** `writeContactPatch`
+schreibt feldweise in den Stream. materialIndex1 ist ein PxU16-Store (:663), pad[0] (Bytes
+54–55) bleibt also unberührt. `ttpWriteContactPatch` schrieb das ganze Wort 13 und nullte
+pad[0]; die Orakel der Write- und Tail-Fixture erwarteten diese Null. Jetzt ist es ein
+Read-Modify-Write (kein anderer Thread schreibt diese Bytes), und die Orakel erwarten das Gift
+in der oberen Hälfte (`refStorePatchHeader`). Physikalisch folgenlos, da niemand pad liest,
+aber es war ein Streambyte, das die Fixture **erzwang**. Ob die Geschwister-Schreiber
+(nptInsertIntoPatchStream, npCvxTrimeshOut) dieselbe Klasse haben, ist P9.87.
+
+**Review.** Ein Workflow mit vier Dimensionen und adversarialer Verifikation (29 Agenten) prüfte:
+
+- Treiber-Treue gegen die CUDA,
+- Unabhängigkeit des Orakels,
+- Tail-Treue,
+- die Verschiebungen der Spiegel.
+
+Er lieferte **12 bestätigte** Befunde, alle umgesetzt. Die 13 widerlegten waren größtenteils
+durch die Korrekturen bereits überholt.
+
+- **hoch:** Pass 1 wurde nur betreten, nicht gemessen → die Fälle mit Pass 1 allein.
+  **hoch:** Alle Paare waren identisch und shapeRef == transformCacheRef → Köder und getrennte
+  Referenzen.
+- **mittel:** Das Overlap-Wort war immer 0 und das Byte genau 1 → Wort 1 und Bit 0 frei.
+- **niedrig:**
+  - zwei Tötungen hingen an undefiniertem Verhalten → gültiges Paar hinter numWorkItems;
+    `pass1-no-break` wird als UB geführt;
+  - kein PointCount > 6 → Tail-Fälle bis 455 (nur funktional; die CUDA asserted ≤ 6), 24
+    geschrieben, 9 über 255;
+  - zwei Grenzzähler zählten verschobene Grenzen (Tail `sawExact`, Reduce `exactLimit`) →
+    jetzt auf den endgültigen Grenzen gezählt;
+  - der wrap32-Wächter der Reduce-Fixture zählte Reservierungen über 2³² statt Fälle, in
+    denen die 32-Bit-Schreibweise **abweicht** → jetzt 186/188/124 unterscheidende Fälle;
+  - Kommentare: K1, K2 (Gruppierung), `.w` = nbPackedNodes, PxTransform.h:167-168,
+    sdfReadMesh (sdfDims bleibt gesetzt), die ABI-Zeile (kommt mit T6), der Einzelstrom-Satz
+    der Tail-Fixture, „wörtlich verschoben“ im FindRef-Header.
+
+**Mutations-Sweeps**, erzwungen frisch, schneller Modus:
+
+- **Kernel: 49 Mutanten, 35 getötet, 4 nur per Absturz, 10 überlebt.**
+  - **Nur per Absturz:** Das gilt nicht als Beleg, und für drei davon gibt es keinen anderen
+    Weg. `dofirst-no-notex-term`, `dofirst-no-sdf-guard` und `pass1-no-break-UB` lassen den
+    Kernel das SDF eines Netzes ohne SDF abtasten (Handle 0, invSdfDx = inf). Genau das
+    verhindern die Terme; ihr einziger möglicher Unterschied ist undefiniertes Verhalten. Der
+    hostgezählte doFirst-Diskriminator verlangt trotzdem, dass jeder Term einen Fall mit
+    Kontakten entscheidet. `mesh-bv32-stride-1152` liest Müll-Indizes.
+  - **Echt überlebt hat `cullscale-carried`**, obwohl sein Band 6 Dreiecke zählte. Flache
+    Band-Kontakte neben tieferen werden vom Patch verbraucht, aber nie als Punkte behalten.
+    Der neue Fall „pass 1 alone, every contact in the carried band“ legt alle 18
+    Pass-1-Kontakte auf sep 0,09 in [0,08, 0,1); der Wächter verlangt einen solchen Fall.
+    Im Nach-Sweep der 10 stirbt er; die übrigen 9 bleiben, wie erwartet.
+  - **Äquivalent (9, im Kernel-Kopf einzeln begründet):**
+    - `atob-p-rotateinv` (nur exakte Negationen),
+    - `minscale-builtin` (nur NaN),
+    - `contact-sep-zero`,
+    - `dir-seed-nonzero` (braucht ein unendliches Sample und ein unendliches cullScale),
+    - `safeind-removed` (Plattformfakt, die Klemme bleibt),
+    - `subdiv-init-removed` (die Initialisierung ist auch in der CUDA tot),
+    - `count-every-thread`,
+    - `refine-passes-ind-unclamped`,
+    - `btoa-direct`: Lipschitz-Argument; ein Dreieck am Gather-Rand kann kein Kandidat
+      werden.
+  - Von den 18 neuen Mutanten aus dem Review sind 15 getötet, 2 nur per Absturz (siehe
+    oben), und `btoa-direct` ist äquivalent. Getötet wurden:
+    - Indizierung: cmInputs[0], Transformation/Abstand/Shape über die falsche Referenz;
+    - Overlap: Wort-Index, Bit 0;
+    - früher Rücksprung `>`;
+    - doFirst: Teilterme, numTris;
+    - Skalierungsrahmen in Motor-Reihenfolge, ttcPass0Post mit s0/r0;
+    - vertauschte Grenzen;
+    - Pass 1 übersprungen.
+- **Patch-Modul (pad[0]):** via Write 3 Mutanten, 2 getötet. `count-byte-unmasked` überlebt
+  dort, weil Write nur Zählungen bis 6 zieht; via Tail wird er getötet, ebenso
+  `points-unclamped`.
+
+**Git und die Platte.** Mitten im Tranche meldete ein Review-Agent SIGBUS bei `git diff HEAD`.
+Ursache sind E/A-Fehler der Platte (dmesg: `I/O error, dev vda`): Der größte Teil des Git-Packs
+vom Klon im August war unlesbar, neu geschriebene Dateien dagegen nicht betroffen. `.git` wurde
+durch einen frischen Klon vom Remote ersetzt. HEAD ist gleich origin (369eb4f), der lokale
+Zweig 7z3gda steht auf demselben Commit wie vorher, und das alte `.git` liegt ausgeschlossen
+als `.git.corrupt-20260924`. `git status` hat danach jede Datei des Arbeitsbaums fehlerfrei
+gelesen.
+
+**Checker:** Alle 18 statischen Checker sind grün. Der Kernel-Eintrag in groupshared_known steht mit
+31 116 Byte, am echten Einstieg gemessen, und barrierUniformity trägt den K8-Waiver mit Begründung.
+
+**Suite:** 878/878 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriKernel`).
+
+**Szenen:** nicht nötig. Der Kernel ist noch nicht verdrahtet (Manifest-Zeile `nullptr`); das
+ist T6, danach kommt `sdfmesh` in die Szenenliste.
 
 ## P9.83b-8 T2 — der Block-Tail: Reservierung, Datensatz, Flags und Streams als eine Blockfunktion
 
