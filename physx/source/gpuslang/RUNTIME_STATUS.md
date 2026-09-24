@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **873/873** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **874/874** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 (1/n) added `gpuslang.npTriTriGeom`: the mesh-mesh kernel's geometry helpers
+(subdivision, getTriangleVertices with a sub-index, the two radii, PxMax, the two
+PxTransform inverses), checked bit for bit against the engine's OWN GuTriangleRefinement.h
+and PxTransform.h, with a host-counted discriminator behind every order claim.  Its second
+sweep also measured that llvmpipe drops the sign of zero in CONSTANT-zero arithmetic
+(0 - x, x + 0, 0 * x) even under NoContraction -- open as P9.86.
 P9.85 added `gpuslang.shimOrdering`: the engine's launch path never called barrier(), so
 successive engine kernels -- which CUDA runs in stream order -- were recorded with no
 compute->compute dependency.  Measured as a count of the recorded stream (5228 of the box
@@ -326,6 +332,9 @@ figure.  It is now the number `ctest` prints.)*
 subgroup 8/8/8 fixed (required-32 impossible → emulation on CI); BDA yes;
 timelineSemaphore yes; VK_EXT_shader_atomic_float (buffer+shared) yes;
 shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
+signed zeros: arithmetic with a CONSTANT zero operand does not preserve the sign of zero,
+NoContraction or not -- 0 - (+0) = -0, (-0) + 0 = -0, 0 + (-0) = -0, 0 * (-0) = +0
+(P9.83b-8 (1/n), probe; open as P9.86).  Runtime-operand arithmetic is IEEE.
 
 ## Open
 
@@ -1970,6 +1979,136 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 (1/n) — die Geometrie-Hilfen des Mesh-gegen-Mesh-Kernels, geprüft gegen die Engine selbst
+
+Erster Schritt des Kernels `triangleTriangleCollision`. Das neue Modul
+`pxgSlangTriTriGeom.slang` enthält die Geometrie, auf der `doTriangleTriangleCollision`
+steht und die noch kein Modul hatte:
+
+- die rekursive Dreiecks-Unterteilung (GuTriangleRefinement.h:43-117),
+- `getTriangleVertices` **mit** Unter-Index (sdfCollision.cuh:522-550),
+- `triangleRadiusSquared` / `sdfRadiusSquared` (:729-739),
+- `PxMax(float)` sowie die beiden Inversen `transformInv` und `getInverse` (PxTransform.h:114-118, :134-138).
+
+Die neue Suite `gpuslang.npTriTriGeom` hat drei Tests mit seriellen Lanes. Ihr Orakel ist
+**die Engine selbst**: `GuTriangleRefinement.h`, `PxTransform.h` und `PxMath.h` werden
+eingebunden, nicht abgeschrieben, und mit `-ffp-contract=off` übersetzt. Nur die drei
+`__device__`-Funktionen sind transkribiert, jeweils neben ihrer CUDA-Zeile, im neuen
+gemeinsamen Header `tests/pxgTriTriGeomRef.h`, den (2/n) wiederverwendet. Die Fixture
+ist NoContraction-gestempelt, und jeder Vergleich ist bitweise; NaN gleicht NaN,
+das Vorzeichen der Null zählt.
+
+**Die Regel dieser Fixture:** Eine Reihenfolge-Behauptung gilt nur als geprüft, wenn der Host
+zählt, wie viele Fälle die falsche Reihenfolge verändert hätte. Ist dieser Diskriminator 0,
+schlägt der Test fehl, statt zu bestehen.
+
+**Was die Portierung zu beachten hatte:**
+
+1. **Der Kommentar der Kodierung ist falsch.** `encodeSubdivisionId` schreibt „4 bits for
+   subdivision level", verschiebt aber um `30 - 4 = 26`. Das Level hat also **sechs** Bits.
+   Die Lesart des Kommentars (`& 15`) unterscheidet sich erst ab Level-Feld 16. Deshalb
+   bekommt das Integer-Trio decode/encode/elevate ein **eigenes** Id-Feld, das den ganzen
+   uint-Bereich abdeckt (404 Fälle mit Level-Feld ≥ 16). Mit nur einem Feld wäre der
+   Kommentar-Mutant unsichtbar gewesen: Die Unterteilung selbst ist ab Level 17 UB
+   (Shift ≥ 32) und bleibt in der Fixture bei 0..13. Die Engine überschreitet Level 8 nie
+   (`maxRefinementLevel`, cu:1059).
+2. **Reihenfolge `vertex2Shape` → `aToB.transform` → Unterteilung.** Die Mittelpunkte
+   entstehen im Shape-Raum des **anderen** Meshes. Unterteilen vor dem Transformieren ist
+   nur exakt gleich; in float unterscheiden sich 3069 von 3072 unterteilten Fällen.
+3. **Mittelpunkt `0.5f * (a + b)`.** Die ausmultiplizierte Form `0.5f*a + 0.5f*b` ist
+   bitgleich, solange `a + b` nicht überläuft, denn Halbieren ist exakt. Der einzige Zeuge
+   ist ein Überlauf: Die Engine liefert `0.5f * inf = inf`, die andere Form einen endlichen
+   Wert. Dafür gibt es Ecken bei ±3e38 (17 unterscheidende Fälle).
+4. **`triangleRadiusSquared` ist das größte Kanten-Quadrat, kein Radius.** Sein `center`
+   ist toter Code. Für die Verschachtelung `PxMax(PxMax(e01, e12), e20)` gilt:
+   - **Beobachtbar** ist nur, welche Kante im **äußeren** Slot steht (512 Fälle, alle mit
+     nicht-endlichen Ecken).
+   - **Äquivalent** sind die Umklammerung und das Vertauschen des inneren Paars. Ein NaN
+     in e12 (bzw. ein einzelnes NaN im inneren Paar) erzwingt ein NaN in einer der anderen
+     Kanten oder ∞ in beiden. Das ist bewiesen, per Brute-Force über 10⁶
+     Zwei-Komponenten-Dreiecke bestätigt und wird pro Fall assertiert.
+5. **Vorzeichen der Null in den Inversen.** Ohne `tp = 0` und `v = tp` war keine
+   Ausgabekomponente je Null. Drei Schreibweisen, die sich nur darin unterscheiden, wären
+   durchgekommen: `-rotateInv(p)`, `transformInv(0)` als `getInverse().p` und die
+   `getConjugate().rotate`-Form aus PxTransform.h:167-168. Jetzt diskriminieren 128, 256
+   und 212 Fälle.
+6. **`getVertex` ist engine-weit tot und wird nicht portiert.** Sein einziger Aufrufer ist
+   der `if (useVertices)`-Arm von `findInterestingTrianglesA` (sdfCollision.cuh:655). Alle
+   drei Instanziierungen (cu:1072, cu:1077, femClothPrimitives.cu:2434) nehmen den Default
+   `false` (:619). Der erste Entwurf trug die Funktion samt Fixture-Spalte.
+7. **`dot()` bei gestempelten Shadern.** `OpDot` steht seit P9.1d in der Liste von
+   `spv_nocontract.py` (:35). Der Mutant `dot(v, v)` statt der ausgeschriebenen Summe
+   überlebt jeden Fall: llvmpipe summiert das gestempelte `OpDot` von links nach rechts
+   ohne Fusion. Das ist eine Eigenschaft **dieses Treibers**, nicht von SPIR-V, das die
+   Summationsreihenfolge offenlässt; die ausgeschriebene Summe bleibt deshalb. Die
+   dot()/cross()-Regel dieses Dokuments wird damit **nicht** widerlegt, denn sie wurde an
+   einem anderen Modul gemessen. `cross()` ist `GLSL.std.450 Cross`, ein `OpExtInst`,
+   das der Pass gar nicht dekoriert.
+
+8. **llvmpipe ignoriert das Vorzeichen der Null bei KONSTANTEN Nullen**, auch mit
+   NoContraction. Gemessen mit einer Probe im Scratchpad (Fixture-Variante, eigenes
+   `PXG_SHADER_DIR`, Eingabe `tp = +0` zur Laufzeit). Das SPIR-V enthält nachweislich ein
+   echtes `OpFSub(+0, x)` mit NoContraction; slangc faltet also nicht.
+
+   | Ausdruck | IEEE | llvmpipe |
+   |---|---|---|
+   | `0 - (+0)` (Vektor und Skalar) | +0 | **−0** |
+   | `(−0) + 0` | +0 | **−0** |
+   | `0 + (−0)` | +0 | **−0** |
+   | `0 · (−0)` | −0 | **+0** |
+   | `−1 · (+0)` | −0 | −0 |
+   | `(−0) − 0` | −0 | −0 |
+
+   Das sind die klassischen algebraischen Vereinfachungen `a + 0 → a`, `0 − a → −a` und
+   `a · 0 → 0`, die nur ohne Vorzeichen-der-Null-Garantie gelten. Arithmetik mit
+   **Laufzeit**-Operanden bleibt IEEE-treu (die Inversen mit `tp = 0` stimmen bitgenau).
+   Folge hier: Der Mutant `getInverse().p = transformInv(0)` rechnet auf llvmpipe genau
+   die Bits der Engine und ist **hier** nicht tötbar; auf einem IEEE-treuen Treiber tötet
+   ihn die Fixture (256 unterscheidende Fälle). Für den ganzen Port heißt das: Eine
+   Konstanten-Null-Operation auf einem bitgenauen Pfad kann auf llvmpipe das Vorzeichen
+   einer Null anders liefern als CUDA. Ob die Ausführungsart `SignedZeroInfNanPreserve`
+   (float_controls) das abstellt und wo im Korpus solche Operationen ein Ergebnis
+   erreichen, ist als **P9.86** offen.
+
+**Review.** Ein Workflow hat parallel drei Dimensionen geprüft (CUDA-Treue,
+Fixture-Tauglichkeit, Eignung für den Kernel) und jeden Befund adversarial
+gegengeprüft.
+
+- **Bitweise Defekte:** keiner.
+- **Bestätigt, alle „low" und alle behoben:** fünf Befunde, nämlich der Mittelpunkt
+  ohne Diskriminator, die Vorzeichen-Null-Lücke, ein tautologischer Engine-gegen-Engine-Check
+  (entfernt), das tote `getVertex` und fünf verrutschte Zeilenzitate (:528/:549 → :529/:548,
+  :86/:93 → :88/:94, :521-552 → :522-550, :540-552 → :540-550, :747-748 → :747).
+- **Widerlegt:** drei.
+
+**Mutationen**, erzwungen frisch, Quelle `pxgSlangTriTriGeom`:
+
+- **Lauf 1 (vor dem Review):** 41 Mutanten, 36 getötet, 5 überlebt.
+- **Lauf 2 (nach dem Review):** 43 Mutanten, 38 getötet, 5 überlebt.
+  Neu dabei sind `mid-bc-split` und die drei Vorzeichen-Null-Mutanten. Beide
+  Split-Mutanten sind jetzt tot.
+
+Die Überlebenden sind diagnostiziert:
+
+| Mutant | Befund |
+|---|---|
+| `gtv-gate-removed` | äquivalent: `decode(0)` ist Level 0, `getSubTriangle` macht null Schritte |
+| `tri-reassoc`, `tri-inner-swap` | äquivalent, siehe Punkt 4 |
+| `mag-dot` | äquivalent **auf llvmpipe**, siehe Punkt 7 |
+| `mid-ab-split` | Lauf 1: überlebt, weil kein Fall überlief; Lauf 2: **getötet** durch die ±3e38-Ecken |
+| `ginv-p-as-transformInv-origin` | äquivalent **auf llvmpipe**, siehe Punkt 8: `0 - tp` wird zu `-tp` gefaltet, und das ist genau die Schreibweise der Engine |
+
+**Suite:** 874/874 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriGeom`).
+
+**Szenen:** nicht nötig. Das Modul hängt an keinem Engine-Kernel. Geändert sind nur neue
+Dateien und die Fixture-Registrierung in tests/CMakeLists.txt; kein Engine-Pfad wird
+berührt.
+
+**Nächster Schritt (2/n):** der Kontakt-Körper je Thread (cu:1085-1195). Er wird um den
+bereits zertifizierten SDF-Abstieg herum in texturfreie Hälften geteilt (Pre: Vertices in
+den SDF-Raum; Post: Normale, Separation, Kandidat, Verfeinerung), damit der Host jede
+Operation aus der Engine spiegeln kann.
 
 ## P9.83b-5 (15/n) — tryToAssign und createNewPatches als Block-Logik, auf dem gemessenen Speicher
 
