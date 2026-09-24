@@ -12,7 +12,8 @@ P9.83b-8 (3/n) added `gpuslang.npTriTriFind`: the subdivision-aware triangle gat
 refinement buffer, one 1024-thread workgroup per case driving the kernel's inner loop, bitwise
 against a host mirror written from the CUDA.  It CONSTRUCTS upstream candidate 60: 256
 refinement entries whose 1024 children all pass make a child write slot 1023, and the next
-start index becomes its parent + 1 -- a rewind, a skip, or a forward jump, measured on both.
+start index becomes its parent + 1 -- a rewind or a skip, measured on both (a forward jump
+needs a buffer the kernel never produces).
 P9.83b-8 (2/n) added `gpuslang.npTriTriBody`: the mesh-mesh kernel's per-thread contact body,
 split around the already-certified SDF call into texture-free halves, bitwise against the
 CUDA transcribed over the engine's own PxVec3/PxQuat/PxTransform/PxMath.  Its sweep gave
@@ -2027,50 +2028,91 @@ Die Default-Zeile selbst ist Pflicht der Kernel-Fixture (15).
   Kernels genau wie cu:1062-1209 und protokolliert jede Runde vollständig: Anzahl, Start vorher
   und nachher, den ganzen Indexpuffer und den ganzen Verfeinerungspuffer. Dazu kommt ein
   Host-Spiegel aus der CUDA, in dem der Block-Scan ein Zähler in Thread-Reihenfolge ist.
-- **Umfang:** 26 Fälle, 180 Runden, alle bitgleich. Gezählt wurden:
+- **Umfang:** 29 Fälle, 188 Runden, alle bitgleich. Gezählt wurden:
   - 23-mal schreibt ein Kind den letzten Slot,
   - 119 gemischte Pässe (Kinder neben dem Sweep),
   - 35 Überläufe der 256er-Grenze,
   - 5514 an der Levelgrenze verworfene Anfragen,
-  - 62 393 Kind-Einträge,
-  - 3 Treffer **exakt** auf der Grenze des strikten Culls.
+  - 62 622 Kind-Einträge,
+  - 6 Treffer **exakt** auf der Grenze des strikten Culls, drei davon mit abrundender Summe.
 - **Die Grenze** wird nach dem Sterbenz-Lemma konstruiert: Die Ebene wird so verschoben, dass
   `d ≈ 1,25·r` gilt. Dann ist `tol = d − r` exakt, und `fl(r + tol) == d` gilt ohne Suche.
   Der erste Versuch suchte `tol` in ulp-Schritten und sprang über `d` hinweg, sobald
-  `|tol| ≫ |d|` war.
+  `|tol| ≫ |d|` war. Weil die Sterbenz-Summe exakt ist, ließ sie `d − r < tol` statt
+  `d < r + tol` überleben (Review-Befund). Drei weitere Fälle setzen `tol` ein ulp über
+  `d − r`: Die wahre Summe liegt dann weniger als ein halbes ulp über `d` und rundet auf `d`
+  ab. Die CUDA verwirft, die umgestellte Form nimmt auf.
 - **`ttfCullProbe`:** Kugel-Radius und Abtastpunkt, 3000 Fälle, bitgleich.
 
 **Upstream-Kandidat 60 — jetzt konstruiert, nicht mehr nur erwogen.** Ausgangslage: 256
 Verfeinerungseinträge, deren 1024 Kinder alle den Cull bestehen. Dann ist der Stride 0,
 ein Kind schreibt Slot 1023 und setzt `offset = Elter + 1`. Mit den Eltern 3k+7 ist der
-letzte Elter 772. Port und CUDA-Spiegel zeigen alle drei Folgen:
+letzte Elter 772. Port und CUDA-Spiegel zeigen:
 
-| Start vorher | Start nachher | Folge |
-|---|---|---|
-| 2000 (Sweep fertig) | **773** | **Rücksprung**: Der Rest des Meshes wird noch einmal gesammelt |
-| 773 (= Elter + 1) | **2000** | `offset == startIndex` gilt als „kein Überlauf“; der Rest des Meshes wird **übersprungen** |
-| 100 (mitten im Sweep) | **773** | Sprung nach vorn; die Dreiecke 100 bis 772 werden nie gesammelt |
+| Start vorher | Start nachher | Folge | im Kernel |
+|---|---|---|---|
+| 2000 (Sweep fertig) | **773** | **Rücksprung**: Die Level-0-Dreiecke dazwischen werden noch einmal gesammelt | erreichbar |
+| 773 (= Elter + 1) | **2000** | `offset == startIndex` gilt als „kein Überlauf"; der Rest des Meshes wird **übersprungen** | erreichbar |
+| 100 | **773** | Sprung nach vorn | **unerreichbar**, nur Funktionsäquivalenz |
 
-Das ist die Folge des CUDA-Codes, gemessen am Port und an seinem Spiegel. Ob der Zustand
-im echten Kernel erreichbar ist, klärt die laufende Review (256 volle Anfragen und alle Kinder
-im Cull). **Dokumentiert, nicht gemeldet.**
+**Warum der Sprung nach vorn unerreichbar ist** (Review-Befund, als Induktion über die
+CUDA bewiesen):
+
+- Im Kernel liegt jeder Verfeinerungseintrag **unter** `startIndex`, und der Puffer ist
+  nach Index sortiert.
+- Die Kinder füllen den Indexpuffer zuerst, in Pufferreihenfolge; die Sweep-Einträge folgen
+  aufsteigend.
+- Deshalb gilt stets `Elter + 1 ≤ startIndex`, und es bleiben nur Rücksprung oder
+  Überspringen.
+
+**Was das im Kernel kostet:**
+
+- **Überspringen:** Die Kontakte des übersprungenen Rests gehen verloren. Ohne SDF auf mesh0
+  gibt es keinen zweiten Durchgang, der sie zurückholt.
+- **Rücksprung:** Die Level-0-Dreiecke dazwischen werden noch einmal gesammelt. Ihre Kontakte
+  sind doppelt, und nichts filtert sie, denn die Mesh-Mesh-Reduktion läuft ohne Duplikattest.
+  Nebenbei werden die Verfeinerungsanfragen neu gestellt, die der 256er-Deckel für diese
+  Dreiecke verworfen hatte.
+- **Ketten:** Aufeinanderfolgende Kinder-Runden können Rücksprünge und Überspringen verketten,
+  bevor wieder ein Sweep läuft.
+
+„Alles verfeinern" erreicht den Handschlag aus dem **eigenen** Startzustand des Kernels (Start
+0, keine Verfeinerung) und springt Runde für Runde zurück. Die Cull- und
+Verfeinerungsentscheidungen sind dort aber Hashes. Ob echte Geometrie 256 volle Anfragen mit
+allen 1024 Kindern im Cull erzeugt, bleibt **offen**. **Dokumentiert, nicht gemeldet.**
 
 **Korrigierte Behauptung.** Der T2-Hinweis in pxgSlangSdfFind sagte, ein Maximum dreier Längen
 statt einer Wurzel aus dem Maximum der Quadrate sei falsch. Das stimmt nicht: `sqrt` ist
 monoton und korrekt gerundet, beide Schreibweisen geben dieselbe Zahl. Die Fixture assertiert
 das über 3000 Fälle, und der Mutant überlebt als Äquivalent. Der Hinweis ist korrigiert.
 
-**Mutations-Sweep**, erzwungen frisch, schneller Modus: 39 Mutanten, **35 getötet** (einer
-davon als Hang). Die Überlebenden:
+**Mutations-Sweep**, erzwungen frisch, schneller Modus: 43 Mutanten, **37 getötet** (einer
+davon als Hang), davon 4 im Mini-Lauf nach der Review. Die Überlebenden:
 
 | Mutant | Befund |
 |---|---|
 | `loop-no-count-guard` | äquivalent: Ein voller Puffer schreibt nichts mehr, und der Handschlag feuert nicht zweimal (vgl. T1 in pxgSlangSdfFind) |
 | `sphere-max-of-lengths` | äquivalent, siehe oben |
+| `sphere-min-order` | äquivalent auf jeder gültigen Skala: Die Reihenfolge von selectMin zeigt sich nur bei NaN oder einem ±0-Paar |
+| `refine-nbelements-dropped` | äquivalent an jeder Aufrufstelle, die alle 0 übergeben; von der Fixture nicht zu sehen |
 | `final-barrier-removed`, `pass-barrier-removed` | rennbehaftet; unter der festen Reihenfolge von llvmpipe ist Überleben nicht aussagekräftig |
 
 `cull-le` überlebte den ersten Lauf, weil kein Fall auf der Grenze lag. Nach den
-Sterbenz-Fällen wurde es im Mini-Lauf getötet.
+Sterbenz-Fällen wurde es im Mini-Lauf getötet; `cull-diff-form` (`d − r < tol`) erst nach den
+Fällen mit abrundender Summe.
+
+**Review.** Ein Workflow hat drei Dimensionen geprüft (CUDA-Treue, Fixture,
+Kandidat 60) und jeden Befund adversarial gegengeprüft.
+
+- **Bitweise Defekte:** keiner.
+- **Bestätigt:** acht Befunde, alle behoben:
+  - der unerreichbare Sprung nach vorn und die genauere Beschreibung der Kernel-Folgen
+    (siehe oben),
+  - die exakte Sterbenz-Summe, die `d − r < tol` nicht sah,
+  - vier falsche oder veraltete Kommentare: F6 (die gedeckelte Anzahl ist **immer** die
+    Belegung), die Min-Reihenfolge, das Layout von `TtfCullCase` und die Suchbeschreibung,
+  - der ungeprüfte Parameter `nbElementsInBuffer`, jetzt als äquivalent dokumentiert.
+- **Widerlegt:** drei.
 
 **Checker.** `barrierUniformity` meldete die Schleife des Fixture-Treibers. Sie ist
 block-uniform: Der Zähler wird nach der Barriere von jedem Thread gelesen, `startIndex` nach
@@ -2079,7 +2121,8 @@ Waiver-Zeilen trafen zunächst nicht, weil der Parser an `|` trennte und der Gua
 Der Parser trennt jetzt nur an einer Pipe mit Leerraum auf beiden Seiten; die beiden
 bestehenden Waiver werden unverändert gelesen (nachgezählt).
 
-**Suite:** 876/876 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriFind`).
+**Suite:** 876/876 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriFind`), auch nach den
+Review-Änderungen.
 
 **Szenen:** nicht nötig. Nichts auf der Engine-Seite ist verdrahtet. Geändert sind neue Dateien,
 die Fixture-Registrierung, ein Kommentar in pxgSlangSdfFind und der Waiver-Parser.
@@ -2456,7 +2499,7 @@ an einer Stelle, jede mit ihrer **Beleglage**. Die Regel dieses Ports gilt unver
 | 57 | `:736-745` | Punkt-Schreiben ohne Schleife: nur `blockDim/6` Patches bekommen Punkte | gelesen; latent (Engine startet 1024 Threads) |
 | 58 | `:902-960`, sdfCollision.cuh:488 | ein Seed, dessen Normale ihn nicht selbst aussortiert, füllt bis 128 Ein-Punkt-Patches | **gemessen** (15/n-Fixture) |
 | 59 | `:899`, `:902` | `countersS[minIBlock]` ohne Wächter; `minIBlock = 0xFFFFFFFF` bei NaN | gelesen; nur mit NaN erreichbar |
-| 60 | sdfCollision.cuh:512-516, `:637-647`, `:681-686` | der Handschlag „letzter Slot setzt `offset`" mit Unterteilungseinträgen | **unbestätigt** — nur Überlegung |
+| 60 | sdfCollision.cuh:512-516, `:637-647`, `:681-686` | der Handschlag „letzter Slot setzt `offset`" mit Unterteilungseinträgen | **konstruiert** in P9.83b-8 (3/n): Rücksprung und Überspringen an Port und CUDA-Spiegel; ob echte Geometrie den Zustand erreicht, ist offen |
 
 **54 — `materialIndex0/1` aus einer uninitialisierten Lokalen.** `:728` deklariert
 `PxgContactMaterialProperties contactMaterialProperties;` ohne Initialisierer.
@@ -2517,7 +2560,8 @@ einer früheren Runde, nicht die Position im Primitivstrom — der nächste Aufr
 von dort neu beginnen, Dreiecke doppelt sammeln oder überspringen. Ob die Pufferfüllung je
 genau auf einem Unterteilungsthread endet, ist nicht konstruiert und nicht gemessen; das
 steht hier als **Überlegung**, nicht als Befund, und wird geprüft, wenn P9.83b-8 den
-unterteilungsfähigen Gather baut.
+unterteilungsfähigen Gather baut. **Nachtrag P9.83b-8 (3/n):** konstruiert, siehe dort — nur
+Rücksprung und Überspringen sind im Kernel erreichbar, ein Sprung nach vorn nicht.
 
 **Damit stehen 60 Upstream-Kandidaten, dokumentiert und keiner gemeldet.**
 

@@ -221,7 +221,8 @@ void ttfRounds(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 }
 
 // ---- the cull sphere, serial lanes -------------------------------------------
-// case (uint4 x = ind, y = subInd) followed by the six float4 transforms: 112 B
+// case: six float4 transforms (scale0, rot0, scale1, rot1, aToBp, aToBq) @0..95,
+//       then uint4 misc (x = ind, y = subInd) @96: 112 B
 // out: float4 (centroidVtx, radius)
 struct TtfCullCase
 {

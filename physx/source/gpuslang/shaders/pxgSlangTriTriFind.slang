@@ -94,16 +94,30 @@
 //     sets offset = index.x + 1 -- and for a CHILD, index.x is its PARENT's index
 //     from an earlier round, not a position in the sweep.  It can only happen when
 //     n == 256 and all 1024 children pass, but then the next start index is
-//     parent + 1: a rewind (the sweep re-gathers everything after the parent), or,
-//     when parent + 1 happens to equal startIndex, "no overflow" and startIndex =
-//     nbPrimitives (the rest of the mesh is skipped).  The port reproduces it, and
-//     the fixture constructs both.
+//     parent + 1.  In the kernel every refinement entry is BELOW startIndex and the
+//     buffer is sorted by index (children fill the index buffer first, in buffer
+//     order, and sweep entries follow in ascending order), so parent + 1 <=
+//     startIndex and only two outcomes exist: a REWIND to parent + 1 < startIndex
+//     (the level-0 triangles in between are gathered again -- their contacts are
+//     duplicated, and the refinement requests the 256 cap dropped for them are
+//     issued again), or, when parent + 1 == startIndex, "no overflow" and
+//     startIndex = nbPrimitives (the rest of the mesh is SKIPPED, its contacts
+//     lost; with no SDF on mesh0 there is no second pass to recover them).
+//     Consecutive all-children rounds can chain rewinds and skips before any sweep
+//     runs.  A forward jump would need an entry at or above startIndex, which the
+//     kernel never produces.  The port reproduces the handshake; the fixture
+//     constructs the rewind, the skip, and (as a function-level check on an input
+//     the kernel cannot produce) the jump.
 // F5  addToRefinementBuffer drops requests at level >= maxRefinementLevel BEFORE
 //     the scan, stores the sub-id UN-elevated (the gather elevates on the way
 //     out), rebuilds from 0 every round, and saturates at 256 with no resume:
 //     requests beyond 256 are silently lost.
-// F6  The count, `min(total + n, TargetCount)`, is the scan's total, not the
-//     number of slots actually written -- the two differ only after saturation.
+// F6  The count is `min(total + n, TargetCount)`, and that clamped value is
+//     always exactly the buffer's occupancy -- every emitter below TargetCount
+//     writes its slot.  Only the UNCLAMPED `total + n` runs past the slots written
+//     (after saturation), which is why the min is there (compare S5 in
+//     pxgSlangSdfFind).  (Corrected in review: this note first said the clamped
+//     count and the slots written could differ.)
 
 #ifndef PXG_SLANG_TRI_TRI_FIND
 #define PXG_SLANG_TRI_TRI_FIND
@@ -239,7 +253,10 @@ uint ttfFindInterestingTriangles(uint tid, uint nbPrimitives, uint64_t meshInd, 
 }
 
 // ---- addToRefinementBuffer<32, 256> (sdfCollision.cuh:741-763) ----------------
-// nbElementsInBuffer is 0 at the one call site (cu:1198).  F5.
+// nbElementsInBuffer is 0 at every call site (cu:1198; femClothPrimitives.cu:2537
+// compiles the refinement out), so dropping it from the write offset or the count
+// is equivalent everywhere the engine calls this -- and the fixture, which passes 0
+// too, cannot see such a mutant.  F5.
 uint ttfAddToRefinementBuffer(uint tid, bool addToBuffer, uint ind, uint subInd, uint nbElementsInBuffer,
                               uint maxRefinementLevel)
 {

@@ -41,8 +41,17 @@
 //
 // UPSTREAM CANDIDATE 60 is constructed, not argued: 256 refinement entries whose
 // 1024 children all pass make a child write slot 1023, and the start index after
-// that round is its PARENT + 1.  Two cases pin both consequences -- a rewind when
-// the sweep had finished, and a silent skip when parent + 1 equals the start.
+// that round is its PARENT + 1.  Two cases pin the two outcomes the kernel can
+// reach -- a rewind when the sweep had finished, and a silent skip when parent + 1
+// equals the start -- and "refine everything" reaches it from the kernel's OWN
+// starting state (start 0, no refinement), chaining rewinds round after round.  A
+// third case (the forward jump) starts from a buffer the kernel cannot produce:
+// in the kernel every entry is below startIndex and the buffer is sorted.  It is
+// kept as a function-level equivalence check and labelled as such.
+//
+// The randomly seeded cases are function-level too: their seed buffers are
+// unsorted and may hold entries at or above startIndex, which is fine for
+// comparing the port with the mirror and says nothing about kernel states.
 
 #include "pxgTestFramework.h"
 #include "pxgTriTriGeomRef.h"
@@ -138,7 +147,7 @@ bool refRefineDecision(const TtfCase& c, uint32_t ind, uint32_t sub)
     return (ttfHash(ind, sub, c.cfg2.x ^ 0x5EEDu) % 1000u) < c.cfg1.w;
 }
 
-struct Stats { size_t childLastSlot = 0, mixedPasses = 0, refineOverflow = 0, levelCapDrops = 0, childEntries = 0, boundaryHits = 0; };
+struct Stats { size_t childLastSlot = 0, mixedPasses = 0, refineOverflow = 0, levelCapDrops = 0, childEntries = 0, boundaryHits = 0, roundedBoundaryHits = 0; };
 
 // findInterestingTrianglesA<32, 1024> with addIndexToBuffer inlined, one block.
 uint32_t refFind(const Mesh& m, const TtfCase& c, uint32_t nbPrimitives, uint32_t& startIndex,
@@ -179,6 +188,7 @@ uint32_t refFind(const Mesh& m, const TtfCase& c, uint32_t nbPrimitives, uint32_
                 const float d = refDistance(c, ind[t], sub[t], cv);
                 add[t] = d < (r + tolerance);
                 if (d == (r + tolerance)) ++st.boundaryHits;   // `<` and `<=` disagree here
+                if (d == (r + tolerance) && double(r) + double(tolerance) > double(d)) ++st.roundedBoundaryHits;
             }
         }
 
@@ -357,7 +367,7 @@ PXG_TEST(npTriTriFind_rounds)
     };
     cand60(2000, "candidate 60: sweep done -> REWIND to 773");
     cand60(773, "candidate 60: start == parent + 1 -> SKIP the rest");
-    cand60(100, "candidate 60: mid-sweep -> jump forward to 773");
+    cand60(100, "candidate 60 (UNREACHABLE input, function-level): jump forward to 773");
 
     // Plane mode: the cull's geometry decides, mirrored bit for bit.
     for (uint32_t k = 0; k < 8; ++k)
@@ -373,16 +383,20 @@ PXG_TEST(npTriTriFind_rounds)
         push(c, "plane cull");
     }
     // The strict cull test ON its boundary: pick a triangle (and in two cases a
-    // child), and search the tolerance ulp by ulp until fl(r + tol) == dist exactly.
-    for (uint32_t k = 0; k < 3; ++k)
+    // child) and put its distance exactly on r + tol.  k < 3: r + tol is EXACT
+    // (Sterbenz), which pins `<` against `<=`.  k >= 3: r + tol ROUNDS DOWN onto d
+    // (tol one ulp above d - r, whose ulp is a quarter of d's), which also pins the
+    // CUDA's rounded sum against the rearranged `d - r < tol` -- the latter subtracts
+    // exactly and sees d below the true sum.
+    for (uint32_t k = 0; k < 6; ++k)
     {
         TtfCase c = base(NT, 0, k == 0 ? 0u : 64u);
         c.plane = F4{ 0.48f, -0.6f, 0.64f, 0.1f };
         c.cfg1 = U4{ 1u, 0, 0, 0u };
-        if (k == 2) { c.scale1 = F4{ 1.5f, 0.75f, 2.f, 0 }; c.rot1 = rng.unitQuat(); c.aToBp = rng.point(0.5f); c.aToBq = rng.unitQuat(); }
-        // k == 0: triangle 11 itself; k >= 1: child 2 of the first seeded entry.
+        if (k % 3u == 2u) { c.scale1 = F4{ 1.5f, 0.75f, 2.f, 0 }; c.rot1 = rng.unitQuat(); c.aToBp = rng.point(0.5f); c.aToBq = rng.unitQuat(); }
+        // k % 3 == 0: triangle 11 itself; otherwise child 2 of the first seeded entry.
         uint32_t ind = 11u, sub = 0u;
-        if (k >= 1) { ind = c.seedSub[0].x; sub = physx::Gu::elevateSubdivisionId(c.seedSub[0].y, 2u); }
+        if (k % 3u != 0u) { ind = c.seedSub[0].x; sub = physx::Gu::elevateSubdivisionId(c.seedSub[0].y, 2u); }
         // Sterbenz: move the plane so d lands in [r/2, 2r]; then tol = d - r is EXACT
         // and fl(r + tol) == d with no search.  (Searching tol by ulps fails whenever
         // |tol| >> |d|: its steps jump over d.)
@@ -391,11 +405,13 @@ PXG_TEST(npTriTriFind_rounds)
         const float dotN = cv.x * c.plane.x + cv.y * c.plane.y + cv.z * c.plane.z;
         c.plane.w = dotN - 1.25f * r;
         const float d = refDistance(c, ind, sub, cv);
-        const float tol = d - r;
-        const bool hit = d >= 0.5f * r && d <= 2.f * r && (r + tol) == d;
-        PXG_CHECK_MSG(hit, "case %u is not exactly on the cull boundary (r %.9g, d %.9g, tol %.9g)", k, r, d, tol);
+        float tol = d - r;
+        if (k >= 3u) tol = std::nextafter(tol, 1e30f);   // the exact sum is now d + ulp(tol) < d + ulp(d)/2
+        const bool rounded = double(r) + double(tol) > double(d);
+        const bool hit = d >= 0.5f * r && d <= 2.f * r && (r + tol) == d && (rounded == (k >= 3u));
+        PXG_CHECK_MSG(hit, "case %u is not on the cull boundary as intended (r %.9g, d %.9g, tol %.9g)", k, r, d, tol);
         c.cfg2.z = bitsOf(tol);
-        push(c, "cull boundary");
+        push(c, k >= 3u ? "cull boundary, rounded sum" : "cull boundary, exact sum");
     }
     const uint32_t N = uint32_t(cs.size());
 
@@ -461,7 +477,7 @@ PXG_TEST(npTriTriFind_rounds)
 
     // Candidate 60, stated as outcomes rather than as a mirror match.
     auto find = [&](const char* prefix) { for (uint32_t c = 0; c < N; ++c) if (std::strncmp(names[c], prefix, std::strlen(prefix)) == 0) return c; return N; };
-    const uint32_t cRewind = find("candidate 60: sweep done"), cSkip = find("candidate 60: start =="), cJump = find("candidate 60: mid-sweep");
+    const uint32_t cRewind = find("candidate 60: sweep done"), cSkip = find("candidate 60: start =="), cJump = find("candidate 60 (UNREACHABLE");
     const uint32_t* oR = &got[size_t(cRewind) * OUT_STRIDE];
     const uint32_t* oS = &got[size_t(cSkip) * OUT_STRIDE];
     const uint32_t* oJ = &got[size_t(cJump) * OUT_STRIDE];
@@ -472,12 +488,12 @@ PXG_TEST(npTriTriFind_rounds)
     PXG_CHECK_MSG(oS[0] == TARGET && oS[1] == 773u && oS[2] == 2000u,
                   "candidate 60 skip: offset == startIndex reads as 'no overflow' and ends the sweep");
     PXG_CHECK_MSG(oJ[0] == TARGET && oJ[1] == 100u && oJ[2] == 773u,
-                  "candidate 60 jump: triangles 100..772 are never gathered");
+                  "handshake on an unreachable buffer (entries above startIndex): the port still follows the CUDA");
 
     std::printf("  rounds: %u cases, %zu rounds; child in last slot %zu, mixed passes %zu, refinement overflow %zu, "
-                "level-cap drops %zu, child entries %zu, cull-boundary hits %zu\n",
+                "level-cap drops %zu, child entries %zu, cull-boundary hits %zu (rounded sum %zu)\n",
                 N, totalRounds, st.childLastSlot, st.mixedPasses, st.refineOverflow, st.levelCapDrops, st.childEntries,
-                st.boundaryHits);
+                st.boundaryHits, st.roundedBoundaryHits);
     PXG_CHECK_MSG(mmHdr == 0, "%zu round-header mismatches", mmHdr);
     PXG_CHECK_MSG(mmIdx == 0, "%zu index-buffer mismatches", mmIdx);
     PXG_CHECK_MSG(mmSub == 0, "%zu refinement-buffer mismatches", mmSub);
@@ -487,7 +503,8 @@ PXG_TEST(npTriTriFind_rounds)
     PXG_CHECK_MSG(st.refineOverflow >= 5, "the 256 cap overflowed only %zu times", st.refineOverflow);
     PXG_CHECK_MSG(st.levelCapDrops >= 100, "the level cap dropped only %zu requests", st.levelCapDrops);
     PXG_CHECK_MSG(st.childEntries >= 2000, "only %zu child entries gathered", st.childEntries);
-    PXG_CHECK_MSG(st.boundaryHits >= 3, "the strict cull test met its boundary only %zu times", st.boundaryHits);
+    PXG_CHECK_MSG(st.boundaryHits >= 6, "the strict cull test met its boundary only %zu times", st.boundaryHits);
+    PXG_CHECK_MSG(st.roundedBoundaryHits >= 3, "a ROUNDED r + tol met d only %zu times", st.roundedBoundaryHits);
     for (PxgBufferHandle h : { bIn, bOut, bInd, bVert }) dev->destroyBuffer(h);
 }
 
@@ -504,8 +521,10 @@ PXG_TEST(npTriTriFind_cullSphere)
         s.scale0 = F4{ rng.f(0.3f, 3.f), rng.f(0.3f, 3.f), rng.f(0.3f, 3.f), 0 }; s.rot0 = rng.unitQuat();
         s.scale1 = F4{ rng.f(0.3f, 3.f), rng.f(0.3f, 3.f), rng.f(0.3f, 3.f), 0 }; s.rot1 = rng.unitQuat();
         s.aToBp = rng.point(4.f); s.aToBq = rng.unitQuat();
-        // PxMin's order: every permutation of which scale1 component is smallest,
-        // including ties, so a min spelled in another order shows.
+        // Which scale1 component is smallest, in every position, so a min that drops
+        // or misreads a component shows.  The ORDER and NESTING of the two selectMins
+        // cannot show: on finite positive scales every order returns the same bits
+        // (only NaN or a +0/-0 pair tells them apart, and a PxMeshScale has neither).
         switch (i % 6u)
         {
         case 0: s.scale1.x = 0.25f; break;
