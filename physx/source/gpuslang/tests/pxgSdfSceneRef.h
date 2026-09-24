@@ -201,8 +201,15 @@ struct BlobLayout
     size_t sdfDimsOffset = 0;
 };
 
-inline BlobLayout layOutBlob(const SdfScene& s, uint32_t numVerts, uint32_t numTris,
-                             uint32_t nbPackedNodes, uint32_t projectionFlag, uint32_t junkSparseHandle)
+// P9.83b-8 (4/n): the same writer with REAL vertices and triangles -- the mesh-mesh
+// kernel reads the geometry half too -- and optionally NO SDF.  `s == nullptr`
+// writes sdfDims = (0, 0, 0, projectionFlag) and ends the blob there, which is what
+// the engine does for a mesh without one; the projection flag is written either
+// way because doFirst reads it (convexMeshMidphase.cu:1358-1360).  A null
+// vertBytes / triBytes keeps the junk fill, so layOutBlob below is unchanged.
+inline BlobLayout layOutBlobEx(const SdfScene* s, uint32_t numVerts, uint32_t numTris,
+                               uint32_t nbPackedNodes, uint32_t projectionFlag, uint32_t junkSparseHandle,
+                               const void* vertBytes, const void* triBytes)
 {
     BlobLayout b;
     auto put32 = [&b](uint32_t v) { const size_t o = b.bytes.size(); b.bytes.resize(o + 4); std::memcpy(&b.bytes[o], &v, 4); };
@@ -212,8 +219,10 @@ inline BlobLayout layOutBlob(const SdfScene& s, uint32_t numVerts, uint32_t numT
 
     put32(numVerts); put32(numTris); put32(0xABCDEF01u); put32(nbPackedNodes);  // .z is NOT the node count
     junk(size_t(nbPackedNodes) * BV32_STRIDE, 0x11);   // BV32 tree
-    junk(size_t(numVerts) * 16, 0x22);                 // float4 verts
-    junk(size_t(numTris) * 16, 0x33);                  // uint4 indices
+    auto raw = [&b](const void* src, size_t n) { const size_t o = b.bytes.size(); b.bytes.resize(o + n);
+                                                 std::memcpy(&b.bytes[o], src, n); };
+    if (vertBytes) raw(vertBytes, size_t(numVerts) * 16); else junk(size_t(numVerts) * 16, 0x22);   // float4 verts
+    if (triBytes) raw(triBytes, size_t(numTris) * 16); else junk(size_t(numTris) * 16, 0x33);       // uint4 indices
     junk(size_t(numTris) * 16, 0x44);                  // uint4 adjacencies
     junk(size_t(numTris) * 4, 0x55);                   // uint32 faceRemap
     junk(size_t(numVerts + 1) * 4, 0x66);              // accumulatedTrianglesRef -- numVerts+1
@@ -222,9 +231,14 @@ inline BlobLayout layOutBlob(const SdfScene& s, uint32_t numVerts, uint32_t numT
         b.bytes.push_back(0x99);
 
     b.sdfDimsOffset = b.bytes.size();
-    put32(s.dx); put32(s.dy); put32(s.dz); put32(projectionFlag);
-    putF(s.meshLower.x); putF(s.meshLower.y); putF(s.meshLower.z); putF(s.spacing);
-    put32(s.sg); put32(f2u(s.smin)); put32(f2u(s.smax)); put32(uint32_t(s.starts.size()));
+    if (!s)
+    {
+        put32(0u); put32(0u); put32(0u); put32(projectionFlag);
+        return b;
+    }
+    put32(s->dx); put32(s->dy); put32(s->dz); put32(projectionFlag);
+    putF(s->meshLower.x); putF(s->meshLower.y); putF(s->meshLower.z); putF(s->spacing);
+    put32(s->sg); put32(f2u(s->smin)); put32(f2u(s->smax)); put32(uint32_t(s->starts.size()));
 
     b.texObjOffset = b.bytes.size();
     put32(0u); put32(0u);                              // mTexObject, filled after upload
@@ -234,9 +248,15 @@ inline BlobLayout layOutBlob(const SdfScene& s, uint32_t numVerts, uint32_t numT
     // port to read exactly it, which proves the field is read at the right offset
     // without pretending the engine zeroes it.
     put32(junkSparseHandle); put32(0u);
-    for (uint32_t v : s.starts)
+    for (uint32_t v : s->starts)
         put32(v);
     return b;
+}
+
+inline BlobLayout layOutBlob(const SdfScene& s, uint32_t numVerts, uint32_t numTris,
+                             uint32_t nbPackedNodes, uint32_t projectionFlag, uint32_t junkSparseHandle)
+{
+    return layOutBlobEx(&s, numVerts, numTris, nbPackedNodes, projectionFlag, junkSparseHandle, nullptr, nullptr);
 }
 
 // Uploads a volume through the ENGINE's own call sequence, so every fixture over

@@ -624,8 +624,11 @@ PXG_TEST(npTriTriReduce_reserve)
         // 32-bit check -- the natural Slang spelling -- agreed on every case and the
         // trap the header names was never exercised.  One case in sixteen per stream
         // puts that stream's offset within one reservation of 2^32 (no extra draws,
-        // so every other case is unchanged): the 64-bit sum overflows any limit, the
-        // wrapped 32-bit one would pass.
+        // so every other case is unchanged): the 64-bit sum exceeds every 32-bit
+        // limit, while the wrapped 32-bit sum is small and usually passes.  Not
+        // always -- a force limit placed between N and 2N wraps too (to 6N - 4k) and
+        // fails both spellings -- so the guard below counts the cases where the two
+        // spellings DISAGREE, not the reservations that reach past 2^32.
         if (i % 16u == 5u) patchAdd = 0u - 64u * (1u + i % 7u);
         if (i % 16u == 7u) contactAdd = 0u - 16u * (1u + i % 7u);
         if (i % 16u == 13u) forceAdd = 0u - 4u * (1u + i % 7u);
@@ -644,7 +647,7 @@ PXG_TEST(npTriTriReduce_reserve)
         auto straddle = [&](uint64_t need) -> uint32_t {
             const uint32_t pick = rng() % 4u;
             uint64_t lim;
-            if (pick == 0u) { lim = need; ++exactLimit; }      // the boundary itself
+            if (pick == 0u) lim = need;                         // the boundary itself
             else
             {
                 const uint64_t slack = 1u + (rng() % 4096u);
@@ -673,6 +676,17 @@ PXG_TEST(npTriTriReduce_reserve)
             patchLimit = fit(patchLimit, (uint64_t)patchAdd + (uint64_t)TTP_PATCH_SIZE * nP);
             contactLimit = fit(contactLimit, (uint64_t)contactAdd + (uint64_t)TTP_CONTACT_SIZE * nC);
             forceLimit = fit(forceLimit, (uint64_t)forceAdd + (uint64_t)TTP_FORCE_SIZE * nC * 2);
+        }
+
+        // On the FINAL limits: a need past 2^32 is clamped off it, and fit() puts
+        // others on it.
+        {
+            const uint64_t need[3] = { (uint64_t)patchAdd + (uint64_t)TTP_PATCH_SIZE * nP,
+                                       (uint64_t)contactAdd + (uint64_t)TTP_CONTACT_SIZE * nC,
+                                       (uint64_t)forceAdd + (uint64_t)TTP_FORCE_SIZE * nC * 2 };
+            const uint32_t lim[3] = { patchLimit, contactLimit, forceLimit };
+            for (uint32_t s = 0; s < 3u; ++s)
+                if (need[s] <= 0xFFFFFFFFull && (uint64_t)lim[s] == need[s]) ++exactLimit;
         }
 
         c.cn[0] = { 0, 0, 0, 0 };
@@ -704,9 +718,14 @@ PXG_TEST(npTriTriReduce_reserve)
         if (((oldAllFlags >> 8) & 0xFFu) != ((oldAllFlags >> 24) & 0xFFu)) ++byte1NeByte3;
         if (nC != 0)
         {
-            if (uint64_t(patchAdd) + uint64_t(TTP_PATCH_SIZE) * nP > 0xFFFFFFFFull) ++wrap32[0];
-            if (uint64_t(contactAdd) + uint64_t(TTP_CONTACT_SIZE) * nC > 0xFFFFFFFFull) ++wrap32[1];
-            if (uint64_t(forceAdd) + uint64_t(TTP_FORCE_SIZE) * nC * 2 > 0xFFFFFFFFull) ++wrap32[2];
+            // The 64-bit check against its wrapped 32-bit respelling: count only where
+            // they disagree.
+            auto disagree = [](uint32_t add, uint64_t res, uint32_t lim) {
+                return ((uint64_t)add + res > (uint64_t)lim) != ((uint32_t)(add + (uint32_t)res) > lim);
+            };
+            if (disagree(patchAdd, uint64_t(TTP_PATCH_SIZE) * nP, patchLimit)) ++wrap32[0];
+            if (disagree(contactAdd, uint64_t(TTP_CONTACT_SIZE) * nC, contactLimit)) ++wrap32[1];
+            if (disagree(forceAdd, uint64_t(TTP_FORCE_SIZE) * nC * 2, forceLimit)) ++wrap32[2];
         }
         if (!ref[i].patchChange) ++noPatchChange;
         if (ref[i].overflow && ((oldAllFlags >> 8) & 0xFFu) != 0u) ++ovfWithPrev;
@@ -717,8 +736,8 @@ PXG_TEST(npTriTriReduce_reserve)
                   byte1NeByte3, noPatchChange, ovfWithPrev);
 
     PXG_CHECK_MSG(wrap32[0] > N / 40 && wrap32[1] > N / 40 && wrap32[2] > N / 40,
-                  "npTriTriReduce_reserve: only %zu / %zu / %zu reservations reach past 2^32 -- "
-                  "without them a 32-bit check agrees with the CUDA's 64-bit one everywhere",
+                  "npTriTriReduce_reserve: only %zu / %zu / %zu cases where a wrapped 32-bit check "
+                  "disagrees with the CUDA's 64-bit one -- without them the respelling is invisible",
                   wrap32[0], wrap32[1], wrap32[2]);
     PXG_CHECK_MSG(ovfPatch > N / 20 && ovfContact > N / 20 && ovfForce > N / 20,
                   "npTriTriReduce_reserve: overflow coverage is thin (%zu patch, %zu "
@@ -782,7 +801,7 @@ PXG_TEST(npTriTriReduce_reserve)
                 "%zu contact / %zu force overflows, %zu fail the force check only "
                 "because of the *2, %zu publish base+0xFFFFFFFF, %zu limits sit "
                 "exactly on the boundary; prevPatches: %zu byte1!=byte3, %zu without a patch change, "
-                "%zu overflows with a previous count; past 2^32 %zu/%zu/%zu\n",
+                "%zu overflows with a previous count; 32-bit respelling told apart %zu/%zu/%zu\n",
                 N, zeroContact, ovfPatch, ovfContact, ovfForce,
                 forceOnlyByDoubling, sentinelNotNull, exactLimit, byte1NeByte3, noPatchChange, ovfWithPrev,
                 wrap32[0], wrap32[1], wrap32[2]);

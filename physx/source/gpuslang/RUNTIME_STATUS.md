@@ -2792,9 +2792,9 @@ an einer Stelle, jede mit ihrer **Beleglage**. Die Regel dieses Ports gilt unver
 | 55 | `:527-529`, `:554`, `:609-611` | ein Block ohne Kontakte publiziert `base + 0xFFFFFFFF` statt NULL | gelesen; Fixture `npTriTriReduce_reserve` (750 Fälle) |
 | 56 | `:558` gegen `:573` | Kraftpuffer: reserviert N, prüft 2N | gelesen; Fixture (1054 Fälle scheitern nur an der ×2) |
 | 57 | `:736-745` | Punkt-Schreiben ohne Schleife: nur `blockDim/6` Patches bekommen Punkte | gelesen; latent (Engine startet 1024 Threads) |
-| 58 | `:902-960`, sdfCollision.cuh:488 | ein Seed, dessen Normale ihn nicht selbst aussortiert, füllt bis 128 Ein-Punkt-Patches | **gemessen** (15/n-Fixture) |
+| 58 | `:902-960`, sdfCollision.cuh:488 | ein Seed, dessen Normale ihn nicht selbst aussortiert, füllt bis 128 Ein-Punkt-Patches | **gemessen** (15/n-Fixture); **am Kernel erreicht** in P9.83b-8 (4/n): ein konstantes SDF gibt jedem Kontakt die Nullnormale (Gradient 0, diff 0), 720 Kontakte füllen 128 Ein-Punkt-Patches. Mit Einheitsnormalen unerreichbar: höchstens etwa 44 Patches (Tammes bei 31,8°) |
 | 59 | `:899`, `:902` | `countersS[minIBlock]` ohne Wächter; `minIBlock = 0xFFFFFFFF` bei NaN | gelesen; nur mit NaN erreichbar |
-| 60 | sdfCollision.cuh:512-516, `:637-647`, `:681-686` | der Handschlag „letzter Slot setzt `offset`" mit Unterteilungseinträgen | **konstruiert** in P9.83b-8 (3/n): Rücksprung und Überspringen an Port und CUDA-Spiegel; ob echte Geometrie den Zustand erreicht, ist offen |
+| 60 | sdfCollision.cuh:512-516, `:637-647`, `:681-686` | der Handschlag „letzter Slot setzt `offset`" mit Unterteilungseinträgen | **konstruiert** in P9.83b-8 (3/n): Rücksprung und Überspringen an Port und CUDA-Spiegel; **am Kernel erreicht** in (4/n): 286 verfeinerbare Dreiecke in einem flachen SDF, 256 Einträge, 1024 Kinder, Kind in Slot 1023, Rücksprung auf Primitiv 256 — die Dreiecke 256–285 laufen ein zweites Mal durch und liefern ihre Kontakte doppelt (1460 = 286 + 1024 + 30 + 120 gefunden). Ob ein echtes Distanzfeld den Zustand erreicht, ist offen |
 
 **54 — `materialIndex0/1` aus einer uninitialisierten Lokalen.** `:728` deklariert
 `PxgContactMaterialProperties contactMaterialProperties;` ohne Initialisierer.

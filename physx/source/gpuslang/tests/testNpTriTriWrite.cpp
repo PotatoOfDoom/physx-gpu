@@ -327,7 +327,8 @@ PXG_TEST(npTriTriWrite_patch)
         r.headerWord[11] = (patchStartIndex & 0xFFFFu) | ((pointCount & 0xFFu) << 16)
                          | ((cm.flags & 0xFFu) << 24);
         r.headerWord[12] = (emi0 & 0xFFFFu) << 16;
-        r.headerWord[13] = (emi1 & 0xFFFFu);
+        // :663 stores materialIndex1 as a PxU16: pad[0] (bits 16-31) keeps the stream's word.
+        r.headerWord[13] = (POISON & 0xFFFF0000u) | (emi1 & 0xFFFFu);
         r.headerWord[14] = POISON;   // pad[1..4] -- NEVER written
         r.headerWord[15] = POISON;
 

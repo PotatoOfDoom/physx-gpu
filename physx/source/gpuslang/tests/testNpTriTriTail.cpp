@@ -43,8 +43,9 @@
 //   * EACH STREAM OVERFLOWING ALONE.  The CUDA's writes are gated per stream
 //     (:651, :746) while the counts are zeroed for all (:580-586): a patch-only
 //     overflow still writes the points, a contact-only overflow still writes the
-//     headers.  Only single-stream overflows separate the caller's N from the
-//     zeroed one.
+//     headers.  Every overflow that spares the patch or the contact stream writes
+//     under the caller's N while the record says 0 -- the single-stream ones are
+//     the CONSTRUCTED cases; only an overflow of both streams writes nothing.
 //   * LIMITS EXACTLY ON `offset + reservation`, per stream, and force limits
 //     strictly between N and 2N (candidate 56).
 //   * RESERVATIONS PAST 2^32.  A counter within one reservation of 2^32: the
@@ -65,6 +66,12 @@
 //     produce it (createNewPatches keeps a patch only with a nonzero count, :955),
 //     but it is the only input that tells the CUDA's gate on the scan TOTAL (:554)
 //     from a gate on N.
+//   * FUNCTION-LEVEL ONLY: point counts above 6, up to 455.  The CUDA asserts
+//     count <= 6 (:483, :703), but its code is defined past that: the scan takes
+//     the raw count (:700-701), the point writes stop at idx = tid % 6 (:740-741)
+//     and the header keeps the count's low byte (PxU8, :656).  The port's
+//     min(pointCount, 6) (pxgSlangTriTriPatch) and `& 0xFF` are those three
+//     readings, and without a count past 6 neither was ever exercised.
 
 #include "pxgTestFramework.h"
 #include "pxgTriTriRef.h"
@@ -161,7 +168,7 @@ PXG_TEST(npTriTriTail_block)
     size_t sawZeroN = 0, sawFull = 0, sawOne = 0, sawZeroTotal = 0;
     size_t sawOvfOnly[3] = { 0, 0, 0 }, sawExact[3] = { 0, 0, 0 }, sawWrap[3] = { 0, 0, 0 };
     size_t sawNoOvfWritten = 0, sawForceBetween = 0, sawByte1 = 0, sawErrPreset = 0;
-    size_t sawFlipped = 0, sawCounterWrap = 0, sawNoPatchChange = 0;
+    size_t sawFlipped = 0, sawCounterWrap = 0, sawNoPatchChange = 0, sawOverCount = 0, sawByteWrap = 0;
 
     for (uint32_t i = 0; i < NC; ++i)
     {
@@ -173,7 +180,9 @@ PXG_TEST(npTriTriTail_block)
         if (shape == 0u) N = 0;
         else if (shape == 1u) N = 128;
         else if (shape == 2u) N = 1;
+        else if (shape == 12u) N = ((i / 16u) % 3u == 0u) ? 1u : 1u + rng() % 32u;   // <= 768 points
         else N = 1 + rng() % 128u;
+        const bool overCount = shape == 12u;              // FUNCTION-LEVEL: counts past 6
 
         for (uint32_t pi = 0; pi < 129; ++pi)
         {
@@ -187,12 +196,20 @@ PXG_TEST(npTriTriTail_block)
             p.normal[0] = rf(-1.f, 1.f); p.normal[1] = rf(-1.f, 1.f); p.normal[2] = rf(-1.f, 1.f);
             p.normal[3] = rf(-1.f, 0.f);
             if (!live) p.pointCount = 5u;                      // poison: a live-looking count
+            else if (overCount && N == 1u) p.pointCount = 256u + rng() % 200u;   // the PxU8 header byte
+            else if (overCount) p.pointCount = (pi % 2u == 0u) ? 7u + rng() % 18u : 1u + rng() % 6u;
             else if (shape == 1u) p.pointCount = 6u;
             else if (shape == 3u) p.pointCount = 0u;           // FUNCTION-LEVEL ONLY (see header)
             else p.pointCount = 1u + rng() % 6u;
         }
         uint32_t total = 0;
-        for (uint32_t pi = 0; pi < N; ++pi) total += c.patches[pi].pointCount;
+        bool hasOver = false, hasByteWrap = false;
+        for (uint32_t pi = 0; pi < N; ++pi)
+        {
+            total += c.patches[pi].pointCount;
+            hasOver |= c.patches[pi].pointCount > 6u;
+            hasByteWrap |= c.patches[pi].pointCount > 255u;
+        }
         if (N == 0) ++sawZeroN;
         if (N == 128 && total == 768) ++sawFull;
         if (N == 1) ++sawOne;
@@ -219,7 +236,8 @@ PXG_TEST(npTriTriTail_block)
         auto place = [&](uint64_t need, uint32_t which) -> uint32_t {
             const uint32_t pick = rng() % 10u;
             uint64_t lim;
-            if (pick < 3u) { lim = need; if (need <= 0xFFFFFFFFull) ++sawExact[which]; }
+            (void)which;
+            if (pick < 3u) lim = need;
             else if (pick < 8u) lim = need + 1u + rng() % 4096u;
             else { const uint64_t s = 1u + rng() % 4096u; lim = need > s ? need - s : 0u; }
             return uint32_t(lim > 0xFFFFFFFFull ? 0xFFFFFFFFull : lim);
@@ -244,6 +262,11 @@ PXG_TEST(npTriTriTail_block)
         // patchChange = 0, which only the byte-1 read produces -- is not erased by an
         // overflow zeroing it (the first draft kept 22 such cases).
         if (shape == 2u || shape == 14u) fitAll();
+        // Counted on the FINAL limits: the overrides above move some placed limits off
+        // their need, and fitAll puts others on it.
+        if (needP <= 0xFFFFFFFFull && limP == uint32_t(needP)) ++sawExact[0];
+        if (needC <= 0xFFFFFFFFull && limC == uint32_t(needC)) ++sawExact[1];
+        if (needF <= 0xFFFFFFFFull && limF == uint32_t(needF)) ++sawExact[2];
 
         // ---- the record and its flag word ----
         const uint32_t pairIndex = rng() % RECORDS_PER_CASE;
@@ -293,6 +316,8 @@ PXG_TEST(npTriTriTail_block)
                 if (r.ovfBits & OVF_FORCE) ++sawOvfOnly[2];
             }
             if (!r.overflow) ++sawNoOvfWritten;
+            if (hasOver && r.contactOfs != SENTINEL) ++sawOverCount;
+            if (hasByteWrap && r.patchOfs != SENTINEL) ++sawByteWrap;
             if (needP > 0xFFFFFFFFull) ++sawWrap[0];
             if (needC > 0xFFFFFFFFull) ++sawWrap[1];
             if (needF > 0xFFFFFFFFull) ++sawWrap[2];
@@ -307,8 +332,11 @@ PXG_TEST(npTriTriTail_block)
                   sawZeroN, sawFull, sawOne, sawZeroTotal);
     PXG_CHECK_MSG(sawOvfOnly[0] > 20 && sawOvfOnly[1] > 20 && sawOvfOnly[2] > 20,
                   "npTriTriTail_block: single-stream overflows %zu patch / %zu contact / %zu force -- "
-                  "only these separate the caller's N from the zeroed one",
+                  "the constructed cases that write under the caller's N while the record says 0",
                   sawOvfOnly[0], sawOvfOnly[1], sawOvfOnly[2]);
+    PXG_CHECK_MSG(sawOverCount > 10 && sawByteWrap > 3,
+                  "npTriTriTail_block: point counts past 6 written %zu times, past 255 %zu times",
+                  sawOverCount, sawByteWrap);
     PXG_CHECK_MSG(sawExact[0] > 50 && sawExact[1] > 50 && sawExact[2] > 50,
                   "npTriTriTail_block: limits exactly on the need %zu / %zu / %zu",
                   sawExact[0], sawExact[1], sawExact[2]);
@@ -436,8 +464,7 @@ PXG_TEST(npTriTriTail_block)
                 uint32_t word[14];
                 refPatchHeader(mats.data(), c.b[0], c.b[1], isFlipped, q,
                                V3{ p.normal[0], p.normal[1], p.normal[2] }, p.pointCount, starts[pi], word);
-                uint32_t* h = &wPatch[size_t(i) * PATCH_WORDS_PER_CASE + size_t(pi) * 16];
-                for (uint32_t w = 0; w < 14; ++w) h[w] = word[w];
+                refStorePatchHeader(&wPatch[size_t(i) * PATCH_WORDS_PER_CASE + size_t(pi) * 16], word);
             }
             if (r.contactOfs != SENTINEL)
             {
@@ -484,10 +511,12 @@ PXG_TEST(npTriTriTail_block)
     std::printf("  npTriTriTail_block: %u cases; N=0 %zu, full %zu, N=1 %zu, N>0 without points %zu; "
                 "single-stream overflows %zu/%zu/%zu, exact limits %zu/%zu/%zu, past 2^32 %zu/%zu/%zu "
                 "(counter wraps %zu); %zu written without overflow, %zu force limits in (N, 2N), "
-                "%zu byte-1 cases (%zu keep the count), %zu preset error words, %zu flipped\n",
+                "%zu byte-1 cases (%zu keep the count), %zu preset error words, %zu flipped; point counts "
+                "past 6 written %zu times, past 255 %zu times\n",
                 NC, sawZeroN, sawFull, sawOne, sawZeroTotal, sawOvfOnly[0], sawOvfOnly[1], sawOvfOnly[2],
                 sawExact[0], sawExact[1], sawExact[2], sawWrap[0], sawWrap[1], sawWrap[2], sawCounterWrap,
-                sawNoOvfWritten, sawForceBetween, sawByte1, sawNoPatchChange, sawErrPreset, sawFlipped);
+                sawNoOvfWritten, sawForceBetween, sawByte1, sawNoPatchChange, sawErrPreset, sawFlipped,
+                sawOverCount, sawByteWrap);
 
     for (PxgBufferHandle h : { bIn, bMat, bCnt, bRec, bTouch, bPFlag, bPatch, bContact, bDecoy })
         dev->destroyBuffer(h);

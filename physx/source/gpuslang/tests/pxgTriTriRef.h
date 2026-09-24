@@ -505,7 +505,10 @@ inline uint32_t bitsOfF(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u;
 
 // writeContactPatch (:649-672) through writePatchesAndContacts' :727-734: the
 // fourteen words one header receives.  Words 14 and 15 (pad[1..4]) are never
-// written.  mi0/mi1 are the LOCAL shapes' indices; the :729 swap happens here.
+// written, and word 13 only HALF: :663 stores materialIndex1 as a PxU16, so bits
+// 16-31 (pad[0]) keep the stream's content -- word[13] here carries bits 0-15
+// only, and refStorePatchHeader merges it.  mi0/mi1 are the LOCAL shapes' indices;
+// the :729 swap happens here.
 inline void refPatchHeader(const MaterialH* mats, uint32_t mi0, uint32_t mi1, bool isFlipped,
                            V4 q, V3 nLocal, uint32_t pointCount, uint32_t startIndex,
                            uint32_t word[14])
@@ -529,6 +532,14 @@ inline void refPatchHeader(const MaterialH* mats, uint32_t mi0, uint32_t mi1, bo
     word[11] = (startIndex & 0xFFFFu) | ((pointCount & 0xFFu) << 16) | ((cm.flags & 0xFFu) << 24);
     word[12] = (emi0 & 0xFFFFu) << 16;
     word[13] = (emi1 & 0xFFFFu);
+}
+
+// Stores refPatchHeader's words over a stream header the way the CUDA does: words
+// 0-12 whole, word 13's low half only (pad[0] untouched), words 14-15 not at all.
+inline void refStorePatchHeader(uint32_t* dst, const uint32_t word[14])
+{
+    for (uint32_t w = 0; w < 13u; ++w) dst[w] = word[w];
+    dst[13] = (dst[13] & 0xFFFF0000u) | (word[13] & 0xFFFFu);
 }
 
 // :745-748: a point is rotated AND translated; the separation rides through.

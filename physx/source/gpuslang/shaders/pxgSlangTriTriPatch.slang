@@ -690,8 +690,16 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 //   7     restitution      8  dynamicFriction    9  staticFriction   10 damping
 //   11    startContactIndex (bits 0-15) | nbContacts (16-23) | materialFlags (24-31)
 //   12    internalFlags (0-15) | materialIndex0 (16-31)
-//   13    materialIndex1 (0-15) | pad[0] (16-31)
+//   13    materialIndex1 (0-15) | pad[0] (16-31) -- only the LOW HALF is written
 //   14-15 pad[1..4] -- NEVER WRITTEN by either writer
+//
+// Word 13 is a read-modify-write.  The CUDA assigns field by field into the
+// stream (:654-669), and :663 is a PxU16 store, so pad[0] keeps whatever the
+// stream held.  This writer used to store the whole word, zeroing pad[0], and the
+// Write and Tail fixtures' oracles expected that zero -- they followed the port,
+// not the CUDA (review of P9.83b-8 (4/n)).  No other thread writes these bytes,
+// so the plain RMW is exact.  (Whether the sibling writers share the slip is
+// P9.87.)
 //
 // TWO DIFFERENCES FROM THE SIBLING, and one of them is a defect.
 //
@@ -753,7 +761,7 @@ public void ttpWriteContactPatch(uint64_t patchStreamAddr, uint patchByteOffset,
           | ((cm.materialFlags & 0xFFu) << 24u);
     // internalFlags = 0 (:669), materialIndex0 in the high half.
     w[12] = (materialIndex0 & 0xFFFFu) << 16u;
-    w[13] = (materialIndex1 & 0xFFFFu);
+    w[13] = (w[13] & 0xFFFF0000u) | (materialIndex1 & 0xFFFFu);   // :663, a PxU16 store
     // w[14], w[15] are pad[1..4] and are NOT written, matching both CUDA writers.
 }
 

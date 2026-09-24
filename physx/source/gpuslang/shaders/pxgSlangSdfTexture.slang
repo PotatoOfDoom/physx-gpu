@@ -167,7 +167,10 @@ struct PxgSdfMesh
 };
 
 // Walks the cooked blob to its SDF tail.  Returns false when the mesh carries no
-// SDF, with every field zeroed (B4).
+// SDF, with every field zeroed (B4) EXCEPT sdfDims, which holds the blob's value:
+// readTriangleMesh stores sdfDims before it tests numSdfs (triangleMesh.cuh:157-162),
+// so .w -- the projection flag -- is set even for an SDF-less mesh, and the
+// mesh-mesh kernel's doFirst (triTriCollisionBda K2) reads it there.
 bool sdfReadMesh(uint64_t meshPtr, out PxgSdfMesh m)
 {
     m.sdfDims = uint4(0u, 0u, 0u, 0u);

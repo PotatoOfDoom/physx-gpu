@@ -140,3 +140,8 @@ npTriTriSharedProbe:triTriSharedProbeAliased    31228
 # offset, the scan's perWarpCountS, the subdivision count) = 31228, the 15a/n
 # number: the fixture and the probe agree buffer for buffer.
 npTriTriBlock:ttbAssignProbe    29060
+# P9.83b-8: triangleTriangleCollision, MEASURED on the real entry: 31116, exactly the
+# driver map's prediction -- the aliased probe's 31228 minus the 112-byte SDF record
+# this kernel does not keep in Workgroup storage (the texture is per thread), and the
+# serial tail adds nothing (pxgSlangTriTriTail, design A).  1652 bytes spare.
+triTriCollisionBda:triangleTriangleCollision    31116

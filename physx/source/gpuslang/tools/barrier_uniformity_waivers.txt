@@ -41,3 +41,14 @@ psPrimCollide.slang | call  | for (uint ind = 0; ind < range; ++ind) | same warp
 # the function's final barrier.  round and maxRounds are uniform by construction.
 npTriTriFind.slang | scope | while ((startIndex < nbTriangles || numTrianglesToSubdividePerThread > 0u) && round < maxRounds) | numTrianglesToSubdividePerThread is every thread's read of gTtfNumSubdivide after the barrier that follows thread 0's publish; startIndex is every thread's read of gSdfOffset after ttfFindInterestingTriangles' final barrier -- the cu:1064 argument of the P9.83b-8 refine map
 npTriTriFind.slang | call | while ((startIndex < nbTriangles || numTrianglesToSubdividePerThread > 0u) && round < maxRounds) | same loop, same two block-uniform reads: every thread calls the gather and addToRefinementBuffer the same number of times
+
+# --- triTriCollisionBda.slang (P9.83b-8) ---------------------------------------
+# The kernel's own cu:1064 loop, the same shape as the gather fixture's above.
+# numTrianglesToSubdividePerThread is every thread's read of gTtfNumSubdivide after
+# the :1204 barrier that follows thread 0's publish of the refinement count; i is
+# every thread's read of gSdfOffset after ttfFindInterestingTriangles' final barrier
+# (the function returns it through its inout startIndex); nbTriangles is the pass's
+# mesh triangle count, read from pairIdx-indexed memory.  The checker demotes both to
+# WARP because they come out of collectives that take tid.
+triTriCollisionBda.slang | scope | while (i < nbTriangles || numTrianglesToSubdividePerThread > 0u) | numTrianglesToSubdividePerThread is every thread's read of gTtfNumSubdivide after the :1204 barrier that follows thread 0's publish; i is every thread's read of gSdfOffset after the gather's final barrier -- the cu:1064 argument of the P9.83b-8 refine map, as for npTriTriFind
+triTriCollisionBda.slang | call | while (i < nbTriangles || numTrianglesToSubdividePerThread > 0u) | same loop, same two block-uniform reads: every thread calls the gather, addToRefinementBuffer, the count and the assignment the same number of times

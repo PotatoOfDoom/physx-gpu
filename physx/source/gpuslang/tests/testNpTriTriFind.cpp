@@ -54,7 +54,7 @@
 // comparing the port with the mirror and says nothing about kernel states.
 
 #include "pxgTestFramework.h"
-#include "pxgTriTriGeomRef.h"
+#include "pxgTriTriFindRef.h"
 
 #include <algorithm>
 #include <cmath>
@@ -68,6 +68,7 @@ namespace
 {
 using namespace pxgtest;
 using namespace pxgtest::tritrigeomref;
+using namespace pxgtest::tritrifindref;   // the gather mirror -- P9.83b-8 (4/n) moved it there
 
 struct TtfPush
 {
@@ -75,8 +76,6 @@ struct TtfPush
     uint32_t numCases, pad0, pad1, pad2;
 };
 static_assert(sizeof(TtfPush) == 48, "TtfPush layout");
-
-struct U2 { uint32_t x, y; };
 
 struct TtfCase
 {
@@ -114,21 +113,21 @@ struct Mesh
     std::vector<U4> inds;
 };
 
-// sdfCollision.cuh:661-670, the texture-free half.
+// The case's gather geometry, for the shared mirror in pxgTriTriFindRef.h.
+GatherGeom caseGeom(const Mesh& m, const TtfCase& c)
+{
+    GatherGeom g;
+    g.inds = &m.inds; g.verts = &m.verts;
+    g.scale0 = v3(c.scale0); g.rot0 = q4(c.rot0);
+    g.scale1 = v3(c.scale1); g.rot1 = q4(c.rot1);
+    g.aToB = PxTransform(v3(c.aToBp), q4(c.aToBq));
+    g.tolerance = floatOf(c.cfg2.z);
+    return g;
+}
+
 float refCullSphere(const Mesh& m, const TtfCase& c, uint32_t ind, uint32_t sub, PxVec3& centroidVtx)
 {
-    const PxTransform aToB(v3(c.aToBp), q4(c.aToBq));
-    PxVec3 v0, v1, v2;
-    refGetTriangleVertices(m.inds, m.verts, v3(c.scale0), q4(c.rot0), aToB, ind, sub, v0, v1, v2);
-
-    const physx::PxReal third = 1.f / 3.f;
-    PxVec3 centroid = (v0 + v1 + v2) * third;
-
-    centroidVtx = refShape2Vertex(centroid, v3(c.scale1), q4(c.rot1));
-    physx::PxReal boundingSphereRadius = physx::PxSqrt(physx::PxMax((v0 - centroid).magnitudeSquared(),
-        physx::PxMax((v1 - centroid).magnitudeSquared(), (v2 - centroid).magnitudeSquared())));
-    boundingSphereRadius /= physx::PxMin(c.scale1.x, physx::PxMin(c.scale1.y, c.scale1.z));
-    return boundingSphereRadius;
+    return tritrifindref::refCullSphere(caseGeom(m, c), ind, sub, centroidVtx);
 }
 
 float refDistance(const TtfCase& c, uint32_t ind, uint32_t sub, const PxVec3& p)
@@ -147,89 +146,14 @@ bool refRefineDecision(const TtfCase& c, uint32_t ind, uint32_t sub)
     return (ttfHash(ind, sub, c.cfg2.x ^ 0x5EEDu) % 1000u) < c.cfg1.w;
 }
 
-struct Stats { size_t childLastSlot = 0, mixedPasses = 0, refineOverflow = 0, levelCapDrops = 0, childEntries = 0, boundaryHits = 0, roundedBoundaryHits = 0; };
+using Stats = FindStats;
 
-// findInterestingTrianglesA<32, 1024> with addIndexToBuffer inlined, one block.
 uint32_t refFind(const Mesh& m, const TtfCase& c, uint32_t nbPrimitives, uint32_t& startIndex,
                  uint32_t nbSubdivisionIndices, const U2* subBuf, U2* idxBuf, Stats& st)
 {
-    uint32_t offset = startIndex;   // :626-627
-    const float tolerance = floatOf(c.cfg2.z);
-    uint32_t sharedIndicesCount = 0;
-    for (uint32_t i = startIndex; (i < nbPrimitives || nbSubdivisionIndices > 0) && sharedIndicesCount < TARGET; )
-    {
-        std::vector<uint32_t> ind(BLOCK), sub(BLOCK);
-        std::vector<uint8_t> add(BLOCK, 0);
-        const uint32_t childThreads = std::min(TARGET, 4u * nbSubdivisionIndices);
-        if (nbSubdivisionIndices > 0 && childThreads < BLOCK) ++st.mixedPasses;
-        for (uint32_t t = 0; t < BLOCK; ++t)
-        {
-            if (t < 4u * nbSubdivisionIndices)
-            {
-                const U2 v = subBuf[t >> 2];
-                ind[t] = v.x;
-                sub[t] = physx::Gu::elevateSubdivisionId(v.y, t & 3u);
-            }
-            else
-            {
-                ind[t] = i + t - childThreads;
-                sub[t] = 0;
-            }
-        }
-        i += BLOCK - childThreads;
-        nbSubdivisionIndices = 0;
-
-        for (uint32_t t = 0; t < BLOCK; ++t)
-        {
-            if (ind[t] < nbPrimitives)
-            {
-                PxVec3 cv;
-                const float r = refCullSphere(m, c, ind[t], sub[t], cv);
-                const float d = refDistance(c, ind[t], sub[t], cv);
-                add[t] = d < (r + tolerance);
-                if (d == (r + tolerance)) ++st.boundaryHits;   // `<` and `<=` disagree here
-                if (d == (r + tolerance) && double(r) + double(tolerance) > double(d)) ++st.roundedBoundaryHits;
-            }
-        }
-
-        // addIndexToBuffer: the block scan in thread order.
-        uint32_t excl = 0;
-        for (uint32_t t = 0; t < BLOCK; ++t)
-        {
-            if (!add[t]) continue;
-            const uint32_t w = sharedIndicesCount + excl;
-            if (w < TARGET) { idxBuf[w] = U2{ ind[t], sub[t] }; if (sub[t] != 0) ++st.childEntries; }
-            if (w == TARGET - 1u)
-            {
-                offset = ind[t] + 1u;
-                if (sub[t] != 0 && t < childThreads) ++st.childLastSlot;
-            }
-            ++excl;
-        }
-        sharedIndicesCount = std::min(excl + sharedIndicesCount, TARGET);
-    }
-
-    if (startIndex != offset) startIndex = offset;   // :681-684
-    else startIndex = nbPrimitives;
-    return sharedIndicesCount;
-}
-
-uint32_t refAddToRefinement(const std::vector<uint8_t>& want, const std::vector<uint32_t>& ind,
-                            const std::vector<uint32_t>& sub, uint32_t maxLevel, U2* subBuf, Stats& st)
-{
-    uint32_t excl = 0;
-    for (uint32_t t = 0; t < BLOCK; ++t)
-    {
-        uint32_t level, idx;
-        physx::Gu::decodeSubdivisionId(sub[t], level, idx);
-        const bool add = want[t] && level < maxLevel;
-        if (want[t] && !add) ++st.levelCapDrops;
-        if (!add) continue;
-        if (excl < SUBCAP) subBuf[excl] = U2{ ind[t], sub[t] };
-        ++excl;
-    }
-    if (excl > SUBCAP) ++st.refineOverflow;
-    return std::min(excl, SUBCAP);
+    return tritrifindref::refFind(caseGeom(m, c), nbPrimitives, startIndex, nbSubdivisionIndices, subBuf, idxBuf,
+                                  [&](uint32_t ind, uint32_t sub, const PxVec3& p) { return refDistance(c, ind, sub, p); },
+                                  st);
 }
 
 struct RefRun
