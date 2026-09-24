@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **876/876** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **877/877** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 T2 added `gpuslang.npTriTriTail`: the mesh-mesh kernel's output tail as ONE block
+function on thread 0 (0 Workgroup bytes), run per case against real counters, a real
+contact-manager record, flag words, streams and DECOY start bases, whole buffers bitwise
+against an oracle composed from the reservation and writer mirrors.  It also closed a trap the
+reservation fixture only named: its offsets never came near 2^32, so a 32-bit check agreed
+with the CUDA's 64-bit one everywhere; three `check-32bit-*` mutants now die.
 P9.83b-8 T1 stamped the five tri-tri fixtures NoContraction (every engine build of their
 modules is stamped; the notes saying otherwise were stale).  Stamped, npCrsWrapper2's
 clustering columns become bitwise decidable on the coincidence chain (4 of 854 chain cases
@@ -2001,6 +2007,106 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 T2 — der Block-Tail: Reservierung, Datensatz, Flags und Streams als eine Blockfunktion
+
+Neu ist die Include-Datei `pxgSlangTriTriTail.slang` mit `ttbWritePatchesAndContacts`. Sie
+fasst zwei CUDA-Stücke zusammen: `writePatchesAndContacts<32>` (convexMeshMidphase.cu:673-751)
+und die blockweite Reservierung `createPatchWriterFullThreadBlock` (:504-629). Die Datei ist
+textuell eingebunden, weil sie `gTtbPatches` liest.
+
+**Design A: der ganze Tail auf Thread 0.** Die CUDA verteilt den Tail über den Block:
+
+- ein Block-Scan der Punktzahlen mit eigenem `perWarpCountS` (reduction.cuh:658-663 → :634-656),
+- `patchStartIndexS[128]`,
+- drei geteilte Offsets und zwei Barrieren (:532, :622),
+- ein Header pro Thread und ein Punkt pro Thread.
+
+Alles, was diese Barrieren veröffentlichen, entsteht auf Thread 0 oder speist nur die
+Schreibzugriffe. Also macht Thread 0 alles aus Registern, mit den bereits zertifizierten
+Teilen: dem seriellen Scan (ttrScan), der Reservierung (ttrReserve) und dem Schreiber
+(ttrWrite). Das kostet **0 Byte** Workgroup-Speicher; Design C, CUDA-treu, hätte 652 Byte
+gekostet.
+
+**Eine Barriere, B0, am Eingang, und die CUDA hat sie nicht.** Im Kernel ist sie redundant,
+denn die Blockfunktionen enden bereits mit Barrieren. Sie steht dort, damit die Funktion nicht
+davon abhängt, was ihr Aufrufer zuletzt getan hat.
+
+Der Tail läuft auch bei `generateContacts == false`. cu:1034 überspringt nur die
+Kontaktschleife; eHAS_NO_TOUCH, beide Flags, `nbContacts = 0` und die
+base+0xFFFFFFFF-Zeiger werden trotzdem geschrieben.
+
+**Fünf Fallen (TT1-TT5, im Modul dokumentiert):**
+
+- **TT1:** Die Atomics hängen an der **Scan-Summe**, nicht an N (:554).
+- **TT2:** Der Überlauf-Fehler ist ein atomares **OR** (cudaNpCommon.h:103-110), kein Store.
+- **TT3:** Die Schreibschleifen nutzen das N **des Aufrufers**. Das Nullen bei Überlauf trifft
+  nur die Kopie in createPatchWriterFullThreadBlock. Ein Überlauf nur eines Streams schreibt
+  den anderen also trotzdem.
+- **TT4:** `nbContacts` ist ein PxU16. Ein Read-Modify-Write erhält das `flags`-Halbwort.
+- **TT5:** Die veröffentlichten Zeiger kommen von den **Start**-Basen (@104/@112/@120), der
+  Schreiber nutzt die **Stream**-Basen (@72/@64).
+
+**Das Orakel ist zusammengesetzt, nicht neu.** `refReserve` (aus testNpTriTriReduce.cpp) und
+der Header-/Punkt-Spiegel (Combine und Rotation aus testNpTriTriWrite.cpp) liegen jetzt
+wörtlich in `pxgTriTriRef.h`, dazu `refPatchHeader` und `refPatchPoint`. Beide alten Fixtures
+nutzen den Header und sind unverändert grün.
+
+**Neue Suite `gpuslang.npTriTriTail`.** Eine 1024-Thread-Workgroup pro Fall, 480 Fälle. Jeder
+Fall besitzt eigene Zähler, einen Block aus vier Datensätzen, Flag-Wörter und Stream-Regionen.
+Verglichen werden **ganze** Puffer gegen ihr Gift:
+
+- Zähler, Datensätze, beide Flag-Arrays,
+- Patch- und Kontakt-Stream,
+- und die **Köder**: Die Start-Basen sind echte, getrennte Puffer. Ein Schreiben durch sie wäre
+  ein sichtbarer Streuschreibzugriff statt undefinierten Verhaltens.
+
+Die Patches werden **ohne** eigene Barriere geladen. B0 ist die einzige Barriere zwischen diesen
+Schreibzugriffen und dem Lesen durch Thread 0; nur hier ist ihr Zweck beobachtbar.
+
+Konstruierte Fälle und ihre Anzahl:
+
+- **N:** N = 0 (30), N = 1 (33), N = 128 mit 768 Punkten (30).
+- **Nur funktional:** N > 0 ohne Punkte (30). Der Kernel erzeugt das nicht (:955), aber nur
+  diese Eingabe trennt TT1.
+- **Überläufe eines einzelnen Streams:** 64 / 59 / 89.
+- **Grenzen genau auf dem Bedarf:** 132 / 121 / 139.
+- **Reservierungen über 2³²:** 30 / 30 / 30; der Zähler selbst läuft 90-mal über.
+- **Kraftgrenzen zwischen N und 2N:** 60 (Kandidat 56).
+- **Flag-Wort:** Byte 1 = N in 120 Fällen, 60 davon ohne Patch-Wechsel.
+- **Fehlerwort:** 154 Fälle mit vorbelegten Fehlerbits, die das OR erhalten muss.
+- **isFlipped:** beidseitig (240 geflippt), jeweils mit verschiedenen Materialien.
+- **pairIndex** liegt irgendwo in einem Block aus vier Datensätzen; die Nachbarn sind vergiftet.
+
+Ergebnis: **alle Puffer bitgleich**.
+
+**Die 2³²-Falle der Reservierung war nie ausgeübt.** Die Patch-Notiz nennt die 64-Bit-Prüfung
+als Falle. Die Reservierungs-Fixture zog aber nur Offsets unter 400000, also stimmte eine
+32-Bit-Prüfung überall mit der CUDA überein. Jeder sechzehnte Fall pro Stream liegt jetzt eine
+Reservierung unter 2³², ohne zusätzliche Zufallsziehungen (186 / 188 / 185 Fälle).
+
+**Mutations-Sweeps**, erzwungen frisch, schneller Modus:
+
+- **Tail: 23 Mutanten, 21 getötet.** Die beiden Überlebenden sind beweisbar äquivalent:
+  - `tt2-or-ungated`: Ein OR mit 0 ändert das Wort nicht.
+  - `counts-unguarded`: `ttpPatchStartIndices` prüft `i < N` selbst.
+
+  Getötet wurden unter anderem:
+  - `b0-removed`, über das Laden ohne Barriere;
+  - `tt1-gate-on-N`, nur durch die funktionalen N>0-ohne-Punkte-Fälle;
+  - beide `tt5-*-from-start`, über die Köder;
+  - `tt4-nbcontacts-whole-word`, über die zufällige obere Worthälfte.
+- **Reservierung: 3 Mutanten `check-32bit-*`, alle getötet.** Vor den 2³²-Fällen hätten alle
+  drei überlebt.
+
+**Checker:** Alle 18 statischen Checker sind grün. Der neue Eintrag liegt mit 16 512 Byte unter
+der Groupshared-Warnschwelle, `subwordStore` braucht keine Zeile (Schreibweise wie NpPatchTail),
+und `pushBlock` liest alle Felder einzeln.
+
+**Suite:** 877/877 in beiden Speichermodi (+1 Suite `gpuslang.npTriTriTail`).
+
+**Szenen:** nicht nötig. Der Tail ist noch an keinen Engine-Kernel angeschlossen; das kommt mit
+T4/T6.
 
 ## P9.83b-8 T1 — die Tri-Tri-Fixtures gestempelt, die Assoziation der Projektion gemessen, eine Klemme im Gather
 

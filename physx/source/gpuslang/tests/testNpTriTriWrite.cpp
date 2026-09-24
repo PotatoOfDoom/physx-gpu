@@ -43,6 +43,7 @@
 // decides what kills the `swap-dropped` mutant: nothing but those two words can.
 
 #include "pxgTestFramework.h"
+#include "pxgTriTriRef.h"
 
 #include <algorithm>
 #include <cmath>
@@ -56,97 +57,9 @@ namespace
 {
 using namespace pxgtest;
 
-struct V3 { float x, y, z; };
-struct V4 { float x, y, z, w; };
+using namespace pxgtest::tritriref;   // quatRotatePx, MaterialH, combine -- P9.83b-8 T2
 
-// PxQuat::rotate (PxQuat.h:286-295), the expression pxgSlangCommon::quatRotate
-// transcribes.  NOT npref::quatRotate, which uses the `w*w - u.u` spelling: the
-// two agree algebraically on unit quaternions and not bitwise, and the oracle has
-// to be written from the same upstream line the shader was.
-static V3 quatRotatePx(V4 q, V3 v)
-{
-    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
-    const float w2 = q.w * q.w - 0.5f;
-    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
-    return { vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
-             vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
-             vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2 };
-}
-
-// ---------------------------------------------------------------------------
-// PxsCombineMaterials, transcribed for the header words.  Already the oracle in
-// testNpInsertPatch.cpp against the same shader body (P9.83b-7 folded that
-// fixture onto pxgSlangNpPatchTail), so a mistake here would show there first --
-// this copy exists because the header cannot be compared without it, not because
-// the combine is what this fixture tests.
-// ---------------------------------------------------------------------------
-struct MaterialH
-{
-    float dynamicFriction, staticFriction, restitution, damping;
-    uint32_t flagsModes0, modes1;
-};
-static_assert(sizeof(MaterialH) == 24, "PxsMaterialDataGpu is 24 bytes");
-
-const uint32_t MODE_MIN = 1, MODE_MULTIPLY = 2, MODE_MAX = 3;
-const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2;
-const uint32_t FLAG_COMPLIANT_ACC_SPRING = 16;
-
-static float combineScalars(float a, float b, uint32_t mode)
-{
-    switch (mode)
-    {
-    case 0: return 0.5f * (a + b);
-    case 1: return std::min(a, b);
-    case 2: return a * b;
-    case 3: return std::max(a, b);
-    }
-    return 0.f;
-}
-
-struct CombinedH { float sta, dyn, rest, damping; uint32_t flags; };
-
-static CombinedH combine(const MaterialH& p0, const MaterialH& p1)
-{
-    const uint32_t f0 = p0.flagsModes0 & 0xFFFFu, f1 = p1.flagsModes0 & 0xFFFFu;
-    const uint32_t fric0 = (p0.flagsModes0 >> 16) & 0xFFu, fric1 = (p1.flagsModes0 >> 16) & 0xFFu;
-    const uint32_t rest0 = (p0.flagsModes0 >> 24) & 0xFFu, rest1 = (p1.flagsModes0 >> 24) & 0xFFu;
-    const uint32_t damp0 = p0.modes1 & 0xFFu, damp1 = p1.modes1 & 0xFFu;
-
-    CombinedH c{};
-    const float r0 = p0.restitution, r1 = p1.restitution;
-    const bool c0 = r0 < 0.f, c1 = r1 < 0.f, one = c0 != c1, both = c0 && c1;
-    const bool a0 = (f0 & FLAG_COMPLIANT_ACC_SPRING) != 0, a1 = (f1 & FLAG_COMPLIANT_ACC_SPRING) != 0;
-    const bool oneAcc = a0 != a1;
-
-    if (both && oneAcc) c.rest = a0 ? r0 : r1;
-    else
-    {
-        const uint32_t m = one ? MODE_MIN : std::max(rest0, rest1);
-        const float f = (both && m == MODE_MULTIPLY) ? -1.f : 1.f;
-        c.rest = f * combineScalars(r0, r1, m);
-    }
-    if (both && oneAcc) c.damping = a0 ? p0.damping : p1.damping;
-    else
-    {
-        const uint32_t m = one ? MODE_MAX : std::max(damp0, damp1);
-        c.damping = combineScalars(p0.damping, p1.damping, m);
-    }
-    const uint32_t cf = f0 | f1;
-    if ((cf & FLAG_DISABLE_FRICTION) == 0)
-    {
-        const uint32_t fm = std::max(fric0, fric1);
-        const float d = combineScalars(p0.dynamicFriction, p1.dynamicFriction, fm);
-        const float s = combineScalars(p0.staticFriction, p1.staticFriction, fm);
-        const float fd = std::max(d, 0.f);
-        c.dyn = fd;
-        c.sta = (s - fd) >= 0.f ? s : fd;
-        c.flags = cf;
-    }
-    else { c.flags = cf | FLAG_DISABLE_STRONG_FRICTION; c.dyn = 0.f; c.sta = 0.f; }
-    return c;
-}
-
-static uint32_t bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static uint32_t bits(float f) { return bitsOfF(f); }
 
 // ---------------------------------------------------------------------------
 // The case record, 704 bytes, matching npTriTriWrite.slang's explicit offsets.

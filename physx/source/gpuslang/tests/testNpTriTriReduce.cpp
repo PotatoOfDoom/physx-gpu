@@ -579,83 +579,9 @@ PXG_TEST(npTriTriReduce_accept)
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }
 
-// ---------------------------------------------------------------------------
-// createPatchWriterFullThreadBlock's decisions (:504-641), mirrored from the CUDA.
-//
-// The three atomicAdd RESULTS are inputs here rather than performed, so the logic
-// is testable without a race.  What is being checked is the arithmetic and the
-// two asymmetries a transcription smooths over:
-//   - the checks are 64-bit and the reservations are 32-bit (:560, :567, :573);
-//   - the force check tests 2N where the reservation added N (:558 vs :573);
-//   - the zero-contact path leaves all three offsets at 0xFFFFFFFF with
-//     `overflow` FALSE, so the output pointers become base + 0xFFFFFFFF while the
-//     writer members become null (:607-611 vs :625-626).
-// ---------------------------------------------------------------------------
-
-static const uint32_t TTP_PATCH_SIZE = 64, TTP_CONTACT_SIZE = 16, TTP_FORCE_SIZE = 4;
-static const uint32_t FLAG_HAS_NO_TOUCH = 1, FLAG_HAS_TOUCH = 2, FLAG_TOUCH_KNOWN = 3;
-static const uint32_t OVF_PATCH = 4, OVF_CONTACT = 1, OVF_FORCE = 2;
-
-struct RefRes
-{
-    uint32_t patchOfs, contactOfs, forceOfs, allFlags;
-    uint32_t nPatches, nContacts, statusFlags, ovfBits;
-    bool touchChange, patchChange, overflow, wPatchNull, wContactNull;
-};
-
-// cutil_math.h:765-788, transcribed: the CUDA reads the flag bytes through these.
-static uint32_t u32High(uint32_t v) { return (v >> 16) & 0xFFFFu; }
-static uint32_t u32Low(uint32_t v) { return v & ((1u << 16u) - 1u); }
-static uint32_t u16High(uint32_t v) { return (v >> 8) & 0xFFu; }
-static uint32_t u16Low(uint32_t v) { return v & ((1u << 8u) - 1u); }
-
-static RefRes refReserve(uint32_t oldAllFlags, uint32_t numPatchesToKeep, uint32_t totalNumContacts,
-                         uint32_t patchAdd, uint32_t contactAdd, uint32_t forceAdd,
-                         uint32_t patchLimit, uint32_t contactLimit, uint32_t forceLimit)
-{
-    RefRes r{};
-    r.patchOfs = r.contactOfs = r.forceOfs = 0xFFFFFFFFu;
-    r.ovfBits = 0; r.overflow = false;
-
-    // :537 and :547, in the CUDA's own spelling.  P9.83b-8 T0: this oracle used to
-    // read byte 3 (`>> 24`), agreeing with the port's defect instead of the CUDA.
-    const uint32_t oldStatus = u16Low(u32High(oldAllFlags));
-    const uint32_t prevPatches = u16High(u32Low(oldAllFlags));
-
-    uint32_t statusFlags = oldStatus & (~FLAG_TOUCH_KNOWN);
-    if (numPatchesToKeep != 0) statusFlags |= FLAG_HAS_TOUCH;
-    else                       statusFlags |= FLAG_HAS_NO_TOUCH;
-
-    uint32_t nP = numPatchesToKeep, nC = totalNumContacts;
-
-    if (totalNumContacts != 0)                                       // :554
-    {
-        r.patchOfs = patchAdd; r.contactOfs = contactAdd; r.forceOfs = forceAdd;
-        if ((uint64_t)r.patchOfs + (uint64_t)TTP_PATCH_SIZE * numPatchesToKeep > (uint64_t)patchLimit)
-        { r.ovfBits |= OVF_PATCH; r.patchOfs = 0xFFFFFFFFu; r.overflow = true; }
-        if ((uint64_t)r.contactOfs + (uint64_t)TTP_CONTACT_SIZE * totalNumContacts > (uint64_t)contactLimit)
-        { r.ovfBits |= OVF_CONTACT; r.contactOfs = 0xFFFFFFFFu; r.overflow = true; }
-        if ((uint64_t)r.forceOfs + (uint64_t)TTP_FORCE_SIZE * totalNumContacts * 2 > (uint64_t)forceLimit)
-        { r.ovfBits |= OVF_FORCE; r.forceOfs = 0xFFFFFFFFu; r.overflow = true; }
-        if (r.overflow)                                              // :580-586
-        {
-            nP = 0; nC = 0;
-            statusFlags = (statusFlags & (~FLAG_TOUCH_KNOWN)) | FLAG_HAS_NO_TOUCH;
-        }
-    }
-
-    const bool prevHadTouch = (oldStatus & FLAG_HAS_TOUCH) != 0;
-    const bool prevKnown = (oldStatus & FLAG_TOUCH_KNOWN) != 0;
-    const bool nowHasTouch = nP != 0;
-    r.touchChange = (prevHadTouch != nowHasTouch) || (!prevKnown);
-    r.patchChange = (prevPatches != nP);
-    r.allFlags = (prevPatches << 24) | (statusFlags << 16) | (nP << 8);
-    r.statusFlags = statusFlags;
-    r.nPatches = nP; r.nContacts = nC;
-    r.wPatchNull = (r.patchOfs == 0xFFFFFFFFu);
-    r.wContactNull = (r.contactOfs == 0xFFFFFFFFu);
-    return r;
-}
+// createPatchWriterFullThreadBlock's decisions (:504-641): refReserve and the
+// flag-byte helpers live in pxgTriTriRef.h since P9.83b-8 T2, where the block-tail
+// fixture composes them with the writer mirror.
 
 PXG_TEST(npTriTriReduce_reserve)
 {
@@ -667,6 +593,7 @@ PXG_TEST(npTriTriReduce_reserve)
     size_t zeroContact = 0, ovfPatch = 0, ovfContact = 0, ovfForce = 0;
     size_t forceOnlyByDoubling = 0, sentinelNotNull = 0, exactLimit = 0;
     size_t byte1NeByte3 = 0, noPatchChange = 0, ovfWithPrev = 0;
+    size_t wrap32[3] = { 0, 0, 0 };
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -689,9 +616,19 @@ PXG_TEST(npTriTriReduce_reserve)
         if (i % 4u == 2u) oldAllFlags = (oldAllFlags & ~0x0000FF00u) | ((nP & 0xFFu) << 8);
         else if (i % 8u == 3u) oldAllFlags = (oldAllFlags & ~0xFF000000u) | ((nP & 0xFFu) << 24);
 
-        const uint32_t patchAdd = rng() % 400000u;
-        const uint32_t contactAdd = rng() % 400000u;
-        const uint32_t forceAdd = rng() % 400000u;
+        uint32_t patchAdd = rng() % 400000u;
+        uint32_t contactAdd = rng() % 400000u;
+        uint32_t forceAdd = rng() % 400000u;
+        // RESERVATIONS PAST 2^32 (P9.83b-8 T2).  The checks are 64-bit (:560, :567,
+        // :573) and every draw above keeps offset + reservation far below 2^32, so a
+        // 32-bit check -- the natural Slang spelling -- agreed on every case and the
+        // trap the header names was never exercised.  One case in sixteen per stream
+        // puts that stream's offset within one reservation of 2^32 (no extra draws,
+        // so every other case is unchanged): the 64-bit sum overflows any limit, the
+        // wrapped 32-bit one would pass.
+        if (i % 16u == 5u) patchAdd = 0u - 64u * (1u + i % 7u);
+        if (i % 16u == 7u) contactAdd = 0u - 16u * (1u + i % 7u);
+        if (i % 16u == 13u) forceAdd = 0u - 4u * (1u + i % 7u);
 
         // EVERY LIMIT IS PLACED RELATIVE TO ITS OWN RESERVATION, not at an absolute
         // address.  The first draft used absolute limits near the top of the offset
@@ -765,6 +702,12 @@ PXG_TEST(npTriTriReduce_reserve)
         // which is what makes the CUDA publish base + 0xFFFFFFFF.
         if (nC == 0 && !ref[i].overflow && ref[i].patchOfs == 0xFFFFFFFFu) ++sentinelNotNull;
         if (((oldAllFlags >> 8) & 0xFFu) != ((oldAllFlags >> 24) & 0xFFu)) ++byte1NeByte3;
+        if (nC != 0)
+        {
+            if (uint64_t(patchAdd) + uint64_t(TTP_PATCH_SIZE) * nP > 0xFFFFFFFFull) ++wrap32[0];
+            if (uint64_t(contactAdd) + uint64_t(TTP_CONTACT_SIZE) * nC > 0xFFFFFFFFull) ++wrap32[1];
+            if (uint64_t(forceAdd) + uint64_t(TTP_FORCE_SIZE) * nC * 2 > 0xFFFFFFFFull) ++wrap32[2];
+        }
         if (!ref[i].patchChange) ++noPatchChange;
         if (ref[i].overflow && ((oldAllFlags >> 8) & 0xFFu) != 0u) ++ovfWithPrev;
     }
@@ -773,6 +716,10 @@ PXG_TEST(npTriTriReduce_reserve)
                   "byte 3, %zu with no patch change, %zu overflows with a previous count)",
                   byte1NeByte3, noPatchChange, ovfWithPrev);
 
+    PXG_CHECK_MSG(wrap32[0] > N / 40 && wrap32[1] > N / 40 && wrap32[2] > N / 40,
+                  "npTriTriReduce_reserve: only %zu / %zu / %zu reservations reach past 2^32 -- "
+                  "without them a 32-bit check agrees with the CUDA's 64-bit one everywhere",
+                  wrap32[0], wrap32[1], wrap32[2]);
     PXG_CHECK_MSG(ovfPatch > N / 20 && ovfContact > N / 20 && ovfForce > N / 20,
                   "npTriTriReduce_reserve: overflow coverage is thin (%zu patch, %zu "
                   "contact, %zu force) -- a limit always above the offset makes the "
@@ -835,9 +782,10 @@ PXG_TEST(npTriTriReduce_reserve)
                 "%zu contact / %zu force overflows, %zu fail the force check only "
                 "because of the *2, %zu publish base+0xFFFFFFFF, %zu limits sit "
                 "exactly on the boundary; prevPatches: %zu byte1!=byte3, %zu without a patch change, "
-                "%zu overflows with a previous count\n",
+                "%zu overflows with a previous count; past 2^32 %zu/%zu/%zu\n",
                 N, zeroContact, ovfPatch, ovfContact, ovfForce,
-                forceOnlyByDoubling, sentinelNotNull, exactLimit, byte1NeByte3, noPatchChange, ovfWithPrev);
+                forceOnlyByDoubling, sentinelNotNull, exactLimit, byte1NeByte3, noPatchChange, ovfWithPrev,
+                wrap32[0], wrap32[1], wrap32[2]);
 
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }

@@ -649,6 +649,13 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 // 3 on it elsewhere, and a mini sweep of four wrong-byte reads -- byte 3 restored,
 // byte 0, byte 2, bytes 1-2 as 16 bits -- killed all four.
 //
+// AND A TRAP THIS FILE NAMED WAS NEVER EXERCISED (P9.83b-8 T2).  Note 1 above says
+// the checks are 64-bit; every offset the fixture drew kept offset + reservation
+// far below 2^32, so a 32-bit check agreed with the CUDA everywhere.  One case in
+// sixteen per stream now sits within one reservation of 2^32, and the three
+// `check-32bit-*` mutants are killed.  The block-tail fixture reaches the same
+// boundary through real counters, where the counter itself wraps.
+//
 // ---------------------------------------------------------------------------
 // A STANDING RULE, PAID FOR FOUR TIMES IN THIS TRANCHE
 // ---------------------------------------------------------------------------
