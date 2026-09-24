@@ -451,6 +451,21 @@ public uint ttpWarpSeed(float sep[32], uint candidateMask, out float minSep)
 //       where it is compared against a lane index and must match none; leaving
 //       that to an intrinsic's corner case is how a compiler update silently
 //       elects lane 0 to seed a patch.
+//
+// P9.83b-8 T1 ADDED TWO, AND ONE OF THEM FOUND A GAP.  PxVec3::dot is
+// (x*x' + y*y') + z*z'; this file writes dot(), i.e. OpDot, whose order is the
+// driver's.  The exact-epsilon lane has ONE nonzero product, so the order was
+// invisible, and `accept-existing-dot-rl` (x + (y + z)) survived.  The fixture now
+// plants, in one case in eight, a lane whose projection falls on OPPOSITE sides of
+// EPS3 in the two orders and another for EPS2 (470 lanes, found by stepping one
+// component an ulp at a time).  The mutant is killed, and
+//
+//   accept-existing-dot-lr   dot() spelled out in the CUDA's order
+//       EQUIVALENT, MEASURED: the port calls dot() and passes on all 470 lanes,
+//       so this driver evaluates OpDot as (x + y) + z -- the CUDA's order.  That
+//       is a property of the OpDot lowering, not of this call site, so it holds
+//       wherever the tri-tri modules call dot() (see pxgSlangContactReduceSerial's
+//       cluster-dot entries).
 
 
 // ---------------------------------------------------------------------------

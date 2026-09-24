@@ -122,7 +122,19 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # P9.83b-8 (2/n): the contact-body fixture, for the same reason.
     npTriTriBody
     # P9.83b-8 (3/n): the gather fixture -- its plane-mode cull is compared bit for bit.
-    npTriTriFind)
+    npTriTriFind
+    # P9.83b-8 T1: the five fixtures that certify the patch, block and serial-reduce
+    # modules join, TOGETHER, because the builds the engine runs of those modules are
+    # stamped.  Their notes said the opposite -- "none of the module's other callers
+    # is stamped, so stamping only the fixture certifies a build the engine never
+    # runs" -- and that was stale everywhere it appeared: triPlaneNpBda (stamped,
+    # above) imports pxgSlangTriPlane, which calls crsContactReduce from
+    # pxgSlangContactReduceSerial; the stamped cloth kernels reach the same module
+    # through pxgSlangConvexTriCloth; and the mesh-mesh kernel that imports
+    # pxgSlangTriTriPatch/Block will be stamped like the Geom, Body and Find
+    # fixtures.  Every ENGINE importer is stamped, so an unstamped fixture was the
+    # one certifying a build nobody runs.
+    npTriTriBlock npTriTriReduce npTriTriAccept npTriTriWrite npCrsWrapper2)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

@@ -51,6 +51,16 @@
 // fields in; they arrive in the CUDA's fresh `Contact contact;` state (:1066,
 // :755-758) with pos overwritten by the SDF call's `point`.
 //
+// THE CALLER CLAMPS THE INDEX (P9.83b-8 T1, F7 in pxgSlangTriTriFind).  cu:1082
+// gives every idle thread ind = nbTriangles and guards the body with `ind <
+// nbTriangles`, which this platform compiles to a mask.  If the Vertices functions'
+// reads are issued for masked lanes, they read at 3*nbTriangles in the index buffer
+// -- the first adjacency words, whose flag bits then address vertices far outside
+// the mesh.  The gather's identical shape did NOT fault when measured (F7 there),
+// but whether a masked read is issued is the driver's choice.  So the driver passes
+// `ind < nb ? ind : 0` to ttcPass0Vertices/ttcPass1Vertices and keeps the guard for
+// everything the value decides.
+//
 // ---------------------------------------------------------------------------
 // TRAPS, each one a line the fixture pins
 // ---------------------------------------------------------------------------

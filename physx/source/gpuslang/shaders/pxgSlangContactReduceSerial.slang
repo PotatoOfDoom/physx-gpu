@@ -95,7 +95,8 @@
 // a caller may run it on one thread -- which is what triPlaneNpBda already does
 // and what the mesh-mesh kernel will do.
 // ---------------------------------------------------------------------------
-// SIX MUTANTS SURVIVE THIS MODULE'S SWEEP; A SEVENTH IS LISTED AS A WARNING
+// SIX MUTANTS SURVIVED THIS MODULE'S SWEEP (ONE IS KILLED SINCE P9.83b-8 T1);
+// A SEVENTH IS LISTED AS A WARNING
 // ---------------------------------------------------------------------------
 // P9.83b-3's sweep killed 33 of 39.  The six survivors are recorded here with
 // their arguments -- three provably equivalent, one equivalent on every input a
@@ -146,9 +147,27 @@
 //       uniform, which it is even with the cross product rounded.)
 //
 //   cluster-strict-vs-loose   `d < tbest[j]`  ->  `d <= tbest[j]`
-//       Changes which anchor claims a lane only on an EXACT tie of squared
-//       distance.  The CUDA writes `<` (contactReduction.cuh:147) and so does
-//       this; no random-float fixture will separate them.
+//       KILLED SINCE P9.83b-8 T1 -- kept here to say why it ever survived.  It
+//       changes which anchor claims a lane only on an EXACT tie of squared
+//       distance, and "no random-float fixture will separate them" was true of
+//       the random cases and false of the fixture: the planted coincidence chain
+//       (three collinear lanes one step apart) puts the middle lane exactly as far
+//       from both ends, component for component.  The chain was asserted only on
+//       the culling columns, because the clustering columns disagreed with the
+//       -ffp-contract=off mirror while the GPU contracted dot() into fmas.  T1
+//       stamped npCrsWrapper2, the clustering columns became bitwise decidable,
+//       and wrapper 1 now fails on two chain cases (2179, 2986) under this mutant.
+//
+//   cluster-dot-lr / cluster-dot-rl   `dot(dv, dv)` spelled (x + y) + z / x + (y + z)
+//       Added in P9.83b-8 T1; both survive.  lr is EQUIVALENT: this driver
+//       evaluates OpDot as (x + y) + z, measured in npTriTriReduce_accept on 470
+//       lanes planted to straddle a threshold between the two orders.  rl
+//       differs from the CUDA only where rounding flips a comparison of two
+//       squared distances, and the only exact ties this fixture builds -- the
+//       chain's -- are ties under EVERY order, since the two differences are
+//       exact negatives of each other.  A near-tie that one order breaks and the
+//       other keeps would be the input; it is not planted, because the order it
+//       would pin is the OpDot lowering, already pinned where it is decidable.
 //
 //   nocluster-fill-dropped    the TClustering=false fill-out loop removed
 //   nocluster-fill-argmax     its `crsArgMin(sep, ...)`  ->  `crsArgMax(sep, ...)`

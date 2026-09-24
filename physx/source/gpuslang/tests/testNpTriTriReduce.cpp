@@ -278,6 +278,38 @@ static void refAcceptNew(const V3* cn, uint32_t candidateMask, V3 pn, uint32_t s
     }
 }
 
+// THE ASSOCIATION OF THE PROJECTION (P9.83b-8 T1).  PxVec3::dot is
+// (x*x' + y*y') + z*z'; the port spells it dot(), i.e. OpDot, whose order is the
+// driver's.  This finds a lane normal whose projection on `pn` falls on OPPOSITE
+// sides of `eps` in the CUDA's order and in the reversed one, x*x' + (y*y' + z*z'):
+// jump the component with the largest |pn| analytically close to the crossing,
+// then step it one ulp at a time through it.  Deterministic; returns false if a
+// trial budget runs out, which the caller counts.
+static bool plantAssociation(std::mt19937& rng, V3 pn, float eps, V3& out, bool& cudaAbove)
+{
+    auto lr = [](V3 a, V3 b) { return (a.x * b.x + a.y * b.y) + a.z * b.z; };
+    auto rl = [](V3 a, V3 b) { return a.x * b.x + (a.y * b.y + a.z * b.z); };
+    auto noise = [&]() { return (float(rng() % 2000001u) / 1000000.f - 1.f) * 1e-3f; };
+    float* comp[3];
+    for (uint32_t trial = 0; trial < 20000u; ++trial)
+    {
+        V3 v{ pn.x * eps + noise(), pn.y * eps + noise(), pn.z * eps + noise() };
+        comp[0] = &v.x; comp[1] = &v.y; comp[2] = &v.z;
+        const float pc[3] = { pn.x, pn.y, pn.z };
+        uint32_t k = 0;
+        for (uint32_t j = 1; j < 3; ++j) if (std::fabs(pc[j]) > std::fabs(pc[k])) k = j;
+        *comp[k] += (eps - lr(v, pn)) / pc[k];
+        const bool up = (lr(v, pn) <= eps) == (pc[k] > 0.f);   // the direction that raises lr
+        for (uint32_t s = 0; s < 64u; ++s)
+        {
+            const bool a = lr(v, pn) > eps, b = rl(v, pn) > eps;
+            if (a != b) { out = v; cudaAbove = a; return true; }
+            *comp[k] = std::nextafter(*comp[k], up ? 1e30f : -1e30f);
+        }
+    }
+    return false;
+}
+
 struct TtaParams { uint32_t numCases, pad0, pad1, pad2; };
 struct TtaCase
 {
@@ -299,6 +331,7 @@ PXG_TEST(npTriTriReduce_accept)
     std::vector<float> rmin(N);
     size_t formsDiffer = 0, bandCases = 0, seedRescued = 0, emptyCandidate = 0;
     size_t tieCases = 0, unmaskedTie = 0, exactEps = 0, straddle = 0;
+    size_t assocEps3 = 0, assocEps2 = 0, assocCudaAbove = 0, assocMissed = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -411,6 +444,31 @@ PXG_TEST(npTriTriReduce_accept)
         }
         c.misc[1] = seedLane;
 
+        // ---- THE ASSOCIATION, ON BOTH THRESHOLDS ----
+        // The exact-epsilon lane above has ONE nonzero product, so the order of the
+        // three is invisible there, and the T1 sweep's `accept-existing-dot-rl`
+        // survived.  One case in eight plants a lane whose projection straddles
+        // EPS3 between the two orders, and another that straddles EPS2; both lanes
+        // are made candidates so the NEW form sees them too.  Because the port calls
+        // dot(), these lanes also MEASURE the order this driver gives OpDot: the
+        // mirror uses the CUDA's, so a reversed OpDot fails here.
+        if ((i % 8u) == 6u && candidateMask != 0u)
+        {
+            const uint32_t l3 = (seedLane == 11u) ? 12u : 11u;
+            const uint32_t l2 = (seedLane == 13u) ? 14u : 13u;
+            bool above = false;
+            if (plantAssociation(rng, pn, PATCH_ACCEPTANCE_EPS3, cn[l3], above))
+            { ++assocEps3; if (above) ++assocCudaAbove; }
+            else ++assocMissed;
+            if (plantAssociation(rng, pn, PATCH_ACCEPTANCE_EPS2, cn[l2], above))
+            { ++assocEps2; if (above) ++assocCudaAbove; }
+            else ++assocMissed;
+            c.cn[l3] = { cn[l3].x, cn[l3].y, cn[l3].z, 0 };
+            c.cn[l2] = { cn[l2].x, cn[l2].y, cn[l2].z, 0 };
+            candidateMask |= (1u << l3) | (1u << l2);
+            c.misc[0] = candidateMask;
+        }
+
         in[i] = c;
         refAcceptExisting(cn, pn, ra1[i], ra2[i]);
         refAcceptNew(cn, candidateMask, pn, seedLane, rb1[i], rb2[i]);
@@ -456,6 +514,12 @@ PXG_TEST(npTriTriReduce_accept)
                   "ties, %zu unmasked ties, %zu exact-epsilon lanes) -- each is the "
                   "only input that distinguishes one of the minIndex/epsilon mutants",
                   tieCases, unmaskedTie, exactEps);
+    PXG_CHECK_MSG(assocEps3 > N / 10 && assocEps2 > N / 10 && assocMissed == 0 &&
+                  assocCudaAbove > 0 && assocCudaAbove < assocEps3 + assocEps2,
+                  "npTriTriReduce_accept: %zu EPS3 and %zu EPS2 lanes straddle the threshold between "
+                  "the CUDA's (x + y) + z and the reversed x + (y + z), %zu with the CUDA order above, "
+                  "%zu searches failed -- without them the association of the projection is invisible",
+                  assocEps3, assocEps2, assocCudaAbove, assocMissed);
     PXG_CHECK_MSG(emptyCandidate > N / 40,
                   "npTriTriReduce_accept: only %zu of %u cases have an EMPTY candidate "
                   "mask, which is the only input where minIndex returns 0xFFFFFFFF",
@@ -508,9 +572,9 @@ PXG_TEST(npTriTriReduce_accept)
                 "%zu have a contact in the (0.85, 0.9995] band, %zu have a seed "
                 "rescued by `|| myNormal`, %zu have an empty candidate mask; "
                 "planted: %zu masked ties, %zu unmasked ties, %zu exact-epsilon, "
-                "%zu straddling 0.9995\n",
+                "%zu straddling 0.9995; association straddles %zu EPS3 / %zu EPS2 (%zu CUDA-above)\n",
                 N, formsDiffer, bandCases, seedRescued, emptyCandidate,
-                tieCases, unmaskedTie, exactEps, straddle);
+                tieCases, unmaskedTie, exactEps, straddle, assocEps3, assocEps2, assocCudaAbove);
 
     for (PxgBufferHandle h : { bIn, bA, bS }) dev->destroyBuffer(h);
 }

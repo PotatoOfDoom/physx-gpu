@@ -45,9 +45,11 @@
 // `|| myNormal` disjunct.  A fixture that ran one of them would pass against a
 // port that used it at both sites.
 //
-// No NoContraction stamp, for the reason in testNpCrsWrapper2.cpp: none of the
-// module's other callers is stamped, so stamping only the fixture would certify a
-// build the engine never runs.
+// STAMPED NoContraction since P9.83b-8 T1.  Every engine build of the modules this
+// drives is stamped -- the mesh-mesh kernel will be, and the serial reduce's
+// other engine callers (triPlaneNpBda, the cloth kernels) already are -- and the
+// mirror is built with -ffp-contract=off.  The note this replaced said the
+// opposite and had gone stale; tests/CMakeLists.txt has the list.
 
 import pxgSlangTriTriPatch;
 

@@ -118,6 +118,30 @@
 //     (after saturation), which is why the min is there (compare S5 in
 //     pxgSlangSdfFind).  (Corrected in review: this note first said the clamped
 //     count and the slots written could differ.)
+// F7  THE INDEX IS CLAMPED BEFORE THE READS, AND THE CUDA HAS NO CLAMP (P9.83b-8
+//     T1).  The sweep threads past the end have ind >= nbPrimitives, and on this
+//     platform `if (ind < nbPrimitives)` is a MASK, not a branch: the loads inside
+//     are issued for every lane and only their values are discarded (P9.22,
+//     check_speculated_loads.py).  Here that is a two-level read -- three indices
+//     at 3*ind, up to ~12 KB past the index buffer, then vertices AT THOSE
+//     INDICES.  Past the triangles lie the adjacency words, whose flag bits make
+//     them vertex indices far outside the mesh (P9.83b-8's critic, N7), so a
+//     speculated second read would have unbounded reach.  The speculated-loads
+//     checker cannot see it: the reads sit in ttgGetTriangleVertices, whose index is
+//     a parameter, and the guard sits here.  So the reads take `safeInd`, clamped to
+//     0 past the end exactly as pxgSlangSdfFind does at each of its three culls; the
+//     guard still decides addToBuffer, so no emitted value changes.  A child thread
+//     reads gTtfSubdivide, which only ever holds indices below nbPrimitives, and
+//     passes the clamp unchanged.
+//     MEASURED, AND THE HAZARD DID NOT MATERIALISE HERE.  The fixture's index buffer
+//     carries 1024 poison entries past the mesh (vertex indices near 2^31, ~32 GiB
+//     past the vertex buffer).  A build WITHOUT the clamp passed 5 runs of 5: on this
+//     llvmpipe these reads are not issued for inactive lanes -- whether as masked
+//     gathers or by skipping an all-inactive body was not read off the JIT code.
+//     Unlike P9.49's sites, this body holds no barrier.  The clamp stays anyway:
+//     whether a masked read is issued is the driver's choice, not the code's, and
+//     the same shape did fault where the index was uniform (P9.22).  A mutant that
+//     removes it survives, and that is the measurement above, not a gap.
 
 #ifndef PXG_SLANG_TRI_TRI_FIND
 #define PXG_SLANG_TRI_TRI_FIND
@@ -228,12 +252,13 @@ uint ttfFindInterestingTriangles(uint tid, uint nbPrimitives, uint64_t meshInd, 
         nbSubdivisionIndices = 0u;
 
         bool addToBuffer = false;
+        const uint safeInd = ind < nbPrimitives ? ind : 0u;   // F7
         if (ind < nbPrimitives)
         {
             float3 centroidVtx;
             const float radius = ttfTriangleCullSphere(meshInd, meshVerts, scale0, scale0Rot, aToBp, aToBq,
-                                                       ind, subdivisionLevel, scale1, scale1Rot, centroidVtx);
-            const float distInSDFSpace1 = TTF_SDF_DISTANCE(sdfMesh1, ind, subdivisionLevel, centroidVtx);
+                                                       safeInd, subdivisionLevel, scale1, scale1Rot, centroidVtx);
+            const float distInSDFSpace1 = TTF_SDF_DISTANCE(sdfMesh1, safeInd, subdivisionLevel, centroidVtx);
             addToBuffer = distInSDFSpace1 < (radius + tolerance);   // F3: strict
         }
 

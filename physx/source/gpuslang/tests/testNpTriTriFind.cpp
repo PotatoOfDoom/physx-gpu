@@ -299,12 +299,22 @@ struct Rng
 const F4 IDQ{ 0, 0, 0, 1 };
 const F4 ONE3{ 1, 1, 1, 0 };
 
+// THE POISON TAIL (P9.83b-8 T1, F7 in pxgSlangTriTriFind).  One sweep pass reaches
+// 1023 entries past the last triangle, and on this platform the guard on those
+// threads is a mask, not a branch.  So the index buffer carries 1024 entries past
+// the mesh whose "vertex indices" sit near 2^31: a speculated read of one of them
+// would fetch a vertex ~32 GiB past the vertex buffer instead of landing quietly in
+// whatever follows the allocation.  The clamp keeps every such read at triangle 0.
+// Measured without the clamp: 5 runs of 5 pass, so this llvmpipe does not issue
+// those reads today; the tail is a tripwire for the day it does.
+static const uint32_t POISON_TAIL = 1024u;
+
 Mesh makeMesh(Rng& rng, uint32_t nv, uint32_t nt)
 {
     Mesh m;
     m.verts.resize(nv);
     for (uint32_t v = 0; v < nv; ++v) { m.verts[v] = rng.point(3.f); m.verts[v].w = 99.f; }
-    m.inds.resize(nt);
+    m.inds.resize(nt + POISON_TAIL);
     for (uint32_t t = 0; t < nt; ++t)
     {
         uint32_t x = rng.u() % nv, y, z;
@@ -312,6 +322,8 @@ Mesh makeMesh(Rng& rng, uint32_t nv, uint32_t nt)
         do z = rng.u() % nv; while (z == x || z == y);
         m.inds[t] = U4{ x, y, z, (x + 1u) % nv };
     }
+    for (uint32_t t = nt; t < nt + POISON_TAIL; ++t)
+        m.inds[t] = U4{ 0x7FFFFFF0u + (t & 7u), 0x7FFFFFF8u, 0x7FFFFFFCu, 0xFFFFFFFFu };
     return m;
 }
 

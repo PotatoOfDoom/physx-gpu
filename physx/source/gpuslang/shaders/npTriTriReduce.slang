@@ -42,10 +42,11 @@
 // seven refills.  A case set that only ever fit in one pass would certify the
 // reduction a second time and the loop not at all.
 //
-// No NoContraction stamp: the module's other callers are not stamped either, and
-// stamping only the fixture certifies a build of the module the engine never
-// runs.  See the note in testNpCrsWrapper2.cpp, where that mistake was nearly
-// made for the same module.
+// STAMPED NoContraction since P9.83b-8 T1.  Every engine build of the modules this
+// drives is stamped -- the mesh-mesh kernel will be, and the serial reduce's
+// other engine callers (triPlaneNpBda, the cloth kernels) already are -- and the
+// mirror is built with -ffp-contract=off.  The note this replaced said the
+// opposite and had gone stale; tests/CMakeLists.txt has the list.
 
 import pxgSlangTriTriPatch;
 

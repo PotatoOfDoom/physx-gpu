@@ -237,18 +237,22 @@ PXG_TEST(npCrsWrapper2_pair)
         // likely to supply several anchors, not fewer.  The answer those two
         // columns give on a chain case is ill-conditioned, full stop.
         //
-        // Stamping this entry NoContraction would hide that, and would be
-        // wrong for an unrelated reason: none of the module's other callers is
-        // stamped (npTriPlaneNp, npTriHfNp, npCvxCorrelate and triPlaneNpBda
-        // are all absent from PXG_NOCONTRACT_SHADERS), so it would certify a
-        // build of the module the engine never runs.  The note this file used
-        // to carry, claiming they were "already stamped through their engine
-        // callers", was simply wrong.
+        // ILL-CONDITIONED IS NOT UNDECIDABLE.  The disagreement came from the
+        // GPU CONTRACTING the chain's dot() into fmas while the mirror did not.
+        // P9.83b-8 T1 stamped this entry NoContraction, because every engine
+        // build of the module is stamped (triPlaneNpBda, the cloth kernels, and
+        // the mesh-mesh kernel to come) -- the reason this note used to give
+        // against the stamp, "none of the module's other callers is stamped",
+        // had gone stale when triPlaneNpBda joined the list.  With both sides
+        // evaluating the same IEEE operations in the same order, the chain
+        // columns are bitwise decidable after all, and measured so:
         //
-        // So: a third of the cases carry a chain and assert the two culling
-        // columns; the rest carry no chain and assert all four.  Every column
-        // is asserted on more than a thousand cases either way, and no case is
-        // asked a question its instantiation cannot answer.
+        //     unstamped   4 of 854 chain cases disagree on wrapper 1, 0 on 2
+        //     stamped     0 of 854 on either
+        //
+        // So every column is asserted on every case.  The chain still gets its
+        // own third of the cases, because it is only an input for the columns
+        // that CULL, and the wrappers-differ count below excludes it.
         const bool chainCase = (i % 3u) == 1u && nLive >= 9;
         if (chainCase)
         {
@@ -350,14 +354,14 @@ PXG_TEST(npCrsWrapper2_pair)
     size_t mm1 = 0, mm2 = 0, mm3 = 0, mm4 = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
-        if (!isChain[i] && got[i * 4 + 0] != ref1[i])
+        if (got[i * 4 + 0] != ref1[i])
         {
             if (mm1 < 4)
                 std::printf("  wrapper1 case %u: got 0x%08x want 0x%08x\n",
                             i, got[i * 4 + 0], ref1[i]);
             ++mm1;
         }
-        if (!isChain[i] && got[i * 4 + 1] != ref2[i])
+        if (got[i * 4 + 1] != ref2[i])
         {
             if (mm2 < 4)
                 std::printf("  wrapper2 case %u: got 0x%08x want 0x%08x\n",

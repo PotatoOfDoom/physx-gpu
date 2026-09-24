@@ -51,7 +51,11 @@
 //   * An all-true and an all-false predicate for the count and the scan, so the
 //     0 and 1024 ends of both are real inputs.
 //
-// No NoContraction stamp, for the reason in testNpCrsWrapper2.cpp.
+// STAMPED NoContraction since P9.83b-8 T1.  Every engine build of the modules this
+// drives is stamped -- the mesh-mesh kernel will be, and the serial reduce's
+// other engine callers (triPlaneNpBda, the cloth kernels) already are -- and the
+// mirror is built with -ffp-contract=off.  The note this replaced said the
+// opposite and had gone stale; tests/CMakeLists.txt has the list.
 
 // ttbWarpReduceSerial calls crsContactReduce2, which lives in this MODULE; the
 // block file is a textual include and cannot import it on its includer's behalf.

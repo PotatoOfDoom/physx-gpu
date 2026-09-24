@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **876/876** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 T1 stamped the five tri-tri fixtures NoContraction (every engine build of their
+modules is stamped; the notes saying otherwise were stale).  Stamped, npCrsWrapper2's
+clustering columns become bitwise decidable on the coincidence chain (4 of 854 chain cases
+disagreed unstamped, 0 stamped), which kills `cluster-strict-vs-loose`, a documented survivor
+since P9.83b-3.  A new accept discriminator plants 470 lanes whose projection straddles a
+threshold between (x+y)+z and x+(y+z): llvmpipe evaluates OpDot in the CUDA's order.
 P9.83b-8 T0 fixed a port defect its oracle shared: ttpReserveBlock read prevPatches from
 byte 3 of the flags word (the stored field) instead of byte 1 (nbPatches; cu:547
 u16High(u32Low)), so the count would never have advanced.  A clean 16/16 sweep could not see
@@ -1995,6 +2001,100 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 T1 — die Tri-Tri-Fixtures gestempelt, die Assoziation der Projektion gemessen, eine Klemme im Gather
+
+**Stempeln (N2 des Kritikers).** Fünf Fixtures sind jetzt in `PXG_NOCONTRACT_SHADERS`:
+npTriTriBlock, npTriTriReduce, npTriTriAccept, npTriTriWrite und npCrsWrapper2.
+
+- **Die alte Begründung war veraltet.** Die Notizen sagten „keiner der anderen Aufrufer des
+  Moduls ist gestempelt, also zertifiziert ein gestempeltes Fixture einen Build, den die Engine
+  nie fährt". Tatsächlich ist jeder **Engine**-Importeur gestempelt:
+  - triPlaneNpBda erreicht `crsContactReduce` über pxgSlangTriPlane,
+  - die Cloth-Kernel erreichen es über pxgSlangConvexTriCloth,
+  - der Mesh-Mesh-Kernel wird gestempelt, wie schon die Fixtures Geom, Body und Find.
+- **Ungestempelt bleiben nur Phase-1-Fixtures** mit eigenen Spiegeln: npCvxCorrelate,
+  npCvxTriEmit, npTriHfNp, npTriPlaneNp. Keine davon steht im Manifest, und kein Differential
+  vergleicht sie bitweise mit diesen Einträgen.
+- **Nachgezählt im SPIR-V** (NoContraction-Dekorationen): Block 44, Reduce 21, Accept 2,
+  Write 40, CrsWrapper2 21. Alle fünf Fixtures sind gestempelt grün.
+- Die fünf veralteten Notizen sind ersetzt.
+
+**CrsWrapper2 prüft jetzt jede Spalte an jedem Fall.** Die Kettenfälle wurden in den clusternden
+Spalten 1 und 2 bisher nicht geprüft, weil die GPU `dot()` zu FMAs kontrahierte und damit vom
+Spiegel (`-ffp-contract=off`) abwich. Gemessen mit einem ungestempelten Build derselben Quelle:
+
+| Build | Kettenfälle mit Abweichung (Wrapper 1 / Wrapper 2) |
+|---|---|
+| ungestempelt | 4 / 0 von 854 |
+| gestempelt | 0 / 0 von 854 |
+
+Schlecht konditioniert heißt nicht unentscheidbar: Bei gleichen IEEE-Operationen in gleicher
+Reihenfolge sind die Spalten bitweise entscheidbar. Die Folge im Sweep:
+`cluster-strict-vs-loose` (`<` → `<=`) war seit P9.83b-3 als Überlebender dokumentiert, „nur
+bei exaktem Gleichstand, den keine Zufalls-Fixture baut". Er wird **jetzt getötet**, in
+Wrapper 1 an den Kettenfällen 2179 und 2986. Die gepflanzte Kette erzeugt nämlich genau solche
+Gleichstände: Die mittlere Lane liegt komponentenweise gleich weit von beiden Enden entfernt.
+
+**Die Assoziation der Projektion, gemessen.** PxVec3::dot rechnet (x·x′ + y·y′) + z·z′. Der
+Port schreibt `dot()`, also `OpDot`, und dessen Reihenfolge bestimmt der Treiber.
+
+- **Die Lücke.** Die exakte EPS3-Lane der Accept-Fixture hat nur **ein** Produkt ungleich null,
+  dort ist die Reihenfolge unsichtbar. Der neue Mutant `accept-existing-dot-rl`, also
+  x + (y + z), überlebte deshalb.
+- **Der Diskriminator.** Jeder achte Fall pflanzt eine Lane, deren Projektion in den beiden
+  Reihenfolgen auf **verschiedenen** Seiten von EPS3 liegt, und eine zweite für EPS2. Gefunden
+  werden sie, indem eine Komponente ulp für ulp durch die Schwelle geschoben wird. Das ergibt
+  470 Lanes, 241 davon mit der CUDA-Reihenfolge oberhalb.
+- **Ergebnis.** `dot-rl` wird getötet. `dot-lr` überlebt als **gemessenes Äquivalent**: Der Port
+  besteht alle 470 Lanes, also rechnet llvmpipe `OpDot` als (x + y) + z, in der Reihenfolge der
+  CUDA. Das ist eine Eigenschaft der OpDot-Absenkung, nicht der Aufrufstelle.
+- **Dieselben beiden Mutanten im Cluster-Abstand von CrsWrapper2 überleben.** `lr` ist aus
+  demselben Grund äquivalent. `rl` fiele nur bei einem Beinahe-Gleichstand auf, den eine
+  Reihenfolge bricht und die andere nicht. Die Gleichstände der Kette gelten in **jeder**
+  Reihenfolge, denn die beiden Differenzen sind exakt negativ zueinander. Einen solchen
+  Beinahe-Gleichstand zu pflanzen würde nur die OpDot-Reihenfolge festnageln, und die ist dort
+  festgenagelt, wo sie entscheidbar ist.
+- Beide Befunde stehen in den Notizen von pxgSlangTriTriPatch und pxgSlangContactReduceSerial.
+
+**G2: die Klemme im Gather (F7), gemessen statt behauptet.**
+
+- **Die Gefahr.** Sweep-Threads hinter dem Mesh haben `ind >= nbPrimitives`, und
+  `if (ind < nbPrimitives)` ist auf dieser Plattform eine Maske, kein Sprung (P9.22). Würden die
+  Lesezugriffe für maskierte Lanes trotzdem ausgeführt, läsen sie Adjazenzwörter als
+  Vertex-Indizes, mit unbeschränkter Reichweite. Der Speculated-Loads-Checker sieht das nicht:
+  Der Lesezugriff sitzt in ttgGetTriangleVertices, der Guard eine Ebene darüber.
+- **Die Messung.** Der Indexpuffer der Fixture trägt jetzt 1024 Gift-Einträge hinter dem Mesh
+  (Vertex-Indizes nahe 2³¹, etwa 32 GiB hinter dem Vertexpuffer). Ein Build **ohne** Klemme
+  bestand 5 von 5 Läufen. llvmpipe führt diese Lesezugriffe für inaktive Lanes also nicht aus;
+  ob als maskierter Gather oder durch Überspringen, ist nicht aus dem JIT-Code gelesen. Anders als
+  bei P9.49 hält dieser Rumpf keine Barriere.
+- **Die Klemme bleibt trotzdem,** wie in pxgSlangSdfFind an allen drei Culls. Ob ein maskierter
+  Lesezugriff ausgeführt wird, entscheidet der Treiber, nicht der Code. Das Gift-Ende ist ein
+  Stolperdraht für den Tag, an dem er es tut.
+- Der Mutant `clamp-removed` überlebt; genau das ist die Messung, keine Lücke.
+- Für die Body-Aufrufe des Treibers steht die Klemme als Pflicht des Aufrufers in
+  pxgSlangTriTriBody; sie kommt mit dem Treiber (T3).
+
+**Mutations-Sweeps**, erzwungen frisch, schneller Modus:
+
+| Modul (über Fixture) | Mutanten | getötet | überlebt |
+|---|---|---|---|
+| TriTriFind (npTriTriFind) | 1 | 0 | `clamp-removed` (gemessen, siehe oben) |
+| ContactReduceSerial (npCrsWrapper2) | 5 | 3, darunter `cluster-strict-vs-loose` **neu** | `cluster-dot-lr`, `cluster-dot-rl` (diagnostiziert, siehe oben) |
+| TriTriPatch/Accept (npTriTriReduce_accept) | 2 | 1 (`dot-rl`, nach dem Diskriminator) | `dot-lr` (gemessenes Äquivalent) |
+| TriTriPatch/Write (npTriTriWrite), alte Liste | 29 | 28 + 1 per Fault | — |
+| TriTriBlock (npTriTriBlock), alte Liste 15/n | 50 | 40 + 1 per Fault + 4 per Hang | dieselben 5 wie in 15/n, dort diagnostiziert |
+
+- Der Fault bei Write ist `contact-guard-is-patch-guard`, wie in 15/n: Der Mutant schreibt an
+  base + 0xFFFFFFFF. Er ist undefiniertes Verhalten, also kein Beleg.
+- Bei Block ist `mask-slot-collide` jetzt ein gewöhnlicher Kill statt eines Hangs.
+- Die Quellen sind nach jedem Sweep bitgleich zum Schnappschuss (nachgezählt).
+
+**Suite:** 876/876 in beiden Speichermodi.
+
+**Szenen:** nicht nötig. Das Stempeln betrifft nur Fixtures. Die Klemme sitzt in einem Modul,
+das noch kein Engine-Kernel importiert. Die übrigen Änderungen sind Notizen und Fixtures.
 
 ## P9.83b-8 T0 — `ttpReserveBlock` las `prevPatches` aus Byte 3 statt aus Byte 1 (Port-Defekt, das Orakel teilte ihn)
 

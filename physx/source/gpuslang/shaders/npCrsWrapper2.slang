@@ -41,11 +41,15 @@
 // two masks DIFFER and fails if that count is small: an observable that is true
 // under the null hypothesis measures nothing.
 //
-// No NoContraction stamp is needed and none is applied: the fixture compares the
-// shader against a CPU mirror built with -ffp-contract=off, and the module this
-// drives is already stamped through its engine callers.  If this entry is ever
-// added to PXG_NOCONTRACT_SHADERS, the module's other callers must go with it --
-// see the fcConvexTri note in tests/CMakeLists.txt.
+// STAMPED NoContraction since P9.83b-8 T1, like every ENGINE build of the module:
+// triPlaneNpBda reaches it through pxgSlangTriPlane, the stamped cloth kernels
+// through pxgSlangConvexTriCloth, and the mesh-mesh kernel will be stamped.  The
+// mirror is built with -ffp-contract=off, so the stamp also makes the chain
+// cases' ill-conditioned clustering columns bitwise decidable (the note in the
+// test).  The remaining unstamped importers (npCvxCorrelate, npCvxTriEmit,
+// npTriHfNp, npTriPlaneNp) are Phase-1 fixtures with their own mirrors, and no
+// differential compares one of them with this entry bit for bit -- the
+// fcConvexTri situation in tests/CMakeLists.txt does not arise.
 
 import pxgSlangContactReduceSerial;
 
