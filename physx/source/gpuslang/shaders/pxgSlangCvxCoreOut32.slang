@@ -75,9 +75,16 @@
 // be wrong in five separate places, which is why it is not parameterised:
 //
 //  1. TOUCH GATES ON numPatches, NOT numPoints.  `currentlyHasTouch = numPatches > 0`
-//     (:374).  The single-patch tail writes `nbContacts > 0` because there the two
-//     are the same quantity.  Here they are not: a contact can hold points in a
-//     patch that was dropped by the patch reducer.
+//     (:374).  The single-patch tail writes `nbContacts > 0`.  P9.87 CORRECTED the
+//     reason this note used to give ("a contact can hold points in a patch that was
+//     dropped"): Contact32 keeps mNumPoints == the sum of its patches' counts --
+//     findCreatePatch opens or resets a patch at 0 points and the same addPoints
+//     round fills it with at least the deepest point (unit normals put that lane in
+//     sameNormalMask), a reset patch's points are subtracted first (cu:899-900), and
+//     dropped points are never added.  So numPatches > 0 and numPoints > 0 are the
+//     SAME predicate on every state the accumulator reaches, and the mutant that
+//     swaps them survives testCvxCoreTailBda as an equivalent.  Transcribed as the
+//     CUDA spells it anyway.
 //  2. patchChange COMPARES prevPatches AGAINST numPatches (:378), not against 1.
 //  3. THE STREAM IS WRITTEN PATCH-MAJOR (:340-347): for each patch, for each of
 //     ITS points, in patch order -- `baseContactStream++` walks a single cursor.
@@ -189,7 +196,8 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
     const uint prevPatches = (allflags >> 8u) & 0xFFu;
     const bool previouslyHadTouch = (oldStatusFlags & FLAG_HAS_TOUCH) != 0u;
     const bool prevTouchKnown = (oldStatusFlags & FLAG_TOUCH_KNOWN) != 0u;
-    // ...but the touch CHANGE gates on numPatches (:374).  Difference 1.
+    // ...but the touch CHANGE gates on numPatches (:374).  Difference 1 (equivalent
+    // under Contact32's invariant; see the header).
     const bool currentlyHasTouch = numPatches > 0u;
     const bool change = (previouslyHadTouch != currentlyHasTouch) || (!prevTouchKnown);
 

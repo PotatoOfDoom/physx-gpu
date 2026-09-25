@@ -57,6 +57,11 @@
 //   * (multi) junk patch counts ABOVE numPatches in half the cases: the CUDA reads
 //     numPatchPoints(i) only for i < numPatches (:340-347, :421-443), so a tail that
 //     walked all MAX_PATCHES would write extra points and headers.
+//
+// numPoints IS ALWAYS THE SUM OF THE KEPT COUNTS, each 1..4, because that is the only
+// state Contact32 produces (pxgSlangCvxCoreOut32.slang, difference 1).  One mutant is
+// therefore equivalent here by construction: gating the touch change on numPoints
+// instead of numPatches (out32-touch-gates-points).
 
 #include "pxgTestFramework.h"
 #include "pxgTriTriRef.h"
