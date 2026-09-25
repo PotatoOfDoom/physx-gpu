@@ -8,6 +8,9 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **879/879** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.87b: the sphere/boxBox/convexPlane priors never set the status byte (the 3 and 1 in 0x203/0x1
+sit in allflagsStart), and their oracles dropped the carried status bits; both fixed, 15/15
+status-logic mutants that were equivalent on the old priors now die.
 P9.87 fixed the PxContactPatch pad bytes in seven writers: the CUDA stores the header field by
 field (materialIndex1 is a PxU16 store, pad never named) into a stream the engine never clears,
 but six ports stored word 13 whole (zeroing pad[0]) and cvxTriFinish also zeroed words 14-15.
@@ -2055,7 +2058,7 @@ getötet**: Status-Bits verworfen, eTOUCH_KNOWN nicht gelöscht, previouslyHadTo
 prevTouchKnown über eHAS_TOUCH, Status aus Byte 3 gelesen. Auf den alten Vorzuständen war
 jeder davon äquivalent (Status-Byte 0 und Byte 3 = 0 machen alle fünf Schreibweisen gleich).
 
-**Suite:** Lauf in beiden Modi ausstehend (wird nachgetragen).
+**Suite:** **879/879** in beiden Speichermodi.
 **Szenen:** nicht nötig, nur Fixtures geändert (die Engine-Shader sind unverändert seit P9.87,
 56/56).
 
