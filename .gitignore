@@ -1,5 +1,7 @@
 # gpuslang verification-suite build output (CMake + ctest scratch tree)
 /build-gpuslang/
+# P9.86 strict-signed-zero measurement build (a second build of the same suite)
+/build-strict/
 # full-SDK integration test build output (P5)
 /build-sdk/
 # Claude Code local session state (agent worktrees, task tracking) — never project content
