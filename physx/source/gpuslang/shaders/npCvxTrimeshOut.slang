@@ -325,7 +325,7 @@ void cvxTrimeshOut(uint3 dtid : SV_DispatchThreadID)
             {
                 // writeCompressedContact (cu L50-82)
                 uint matFlags; float staF, dynF, rest, damp;
-                combineMaterialsFn(gMat[materialIndex0], gMat[materialIndex1], matFlags, staF, dynF, rest, damp);
+                combineMaterialsFn(gMat[materialIndex0 & 0xFFFFu], gMat[materialIndex1 & 0xFFFFu], matFlags, staF, dynF, rest, damp);   // P9.88: cu:61 PxU16
                 const float3 pn = flip ? -worldNormal : worldNormal;
                 const uint pb = mIdx * 4u;
                 r.patches[pb + 0] = uint4(asuint(1.0f), asuint(1.0f), asuint(1.0f), asuint(1.0f));

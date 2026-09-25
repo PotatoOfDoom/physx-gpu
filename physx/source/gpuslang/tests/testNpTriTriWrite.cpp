@@ -216,6 +216,22 @@ PXG_TEST(npTriTriWrite_patch)
         mats[i].flagsModes0 = flags | ((i % 4) << 16) | (((i + 1) % 4) << 24);
         mats[i].modes1 = (i + 2) % 4;
     }
+    // P9.88: a second bank at [0x10000 + i] with DIFFERENT materials, so an index k | 0x10000
+    // tells a lookup that narrows to PxU16 first (materialCombiner.cuh:35) from one that does
+    // not, and both stay in bounds.
+    mats.resize(0x10000u + nbMaterials);
+    for (uint32_t i = 0; i < nbMaterials; ++i)
+    {
+        MaterialH& m = mats[0x10000u + i];
+        m.dynamicFriction = rf(-0.2f, 1.5f);
+        m.staticFriction = rf(-0.2f, 1.5f);
+        m.restitution = (i % 3 == 1) ? rf(-4.0f, -0.01f) : rf(0.f, 1.f);
+        m.damping = rf(0.f, 40.f);
+        const uint32_t flags = ((i % 5 == 2) ? FLAG_DISABLE_FRICTION : 0u)
+                             | ((i % 4 == 1) ? FLAG_COMPLIANT_ACC_SPRING : 0u);
+        m.flagsModes0 = flags | (((i + 2) % 4) << 16) | (((i + 3) % 4) << 24);
+        m.modes1 = (i + 1) % 4;
+    }
 
     std::vector<TtwCaseH> in(N);
     std::memset(in.data(), 0, in.size() * sizeof(TtwCaseH));
@@ -263,6 +279,8 @@ PXG_TEST(npTriTriWrite_patch)
         uint32_t mi1 = rng() % nbMaterials;
         // One case in twelve uses the SAME material on both sides: the swap is
         // invisible there, so those cases are the control, not the evidence.
+        if (rng() % 4 == 0) mi0 |= 0x10000u;   // P9.88: second bank
+        if (rng() % 4 == 0) mi1 |= 0x10000u;
         if (i % 12 == 0) { mi1 = mi0; ++sawSameMaterial; }
 
         c.a[0] = pointCount; c.a[1] = patchIndex; c.a[2] = patchStartIndex;
@@ -310,7 +328,7 @@ PXG_TEST(npTriTriWrite_patch)
         // :729 -- the swap that cancels the kernel's argument exchange.
         const uint32_t emi0 = isFlipped ? mi1 : mi0;
         const uint32_t emi1 = isFlipped ? mi0 : mi1;
-        const CombinedH cm = combine(mats[emi0], mats[emi1]);
+        const CombinedH cm = combine(mats[emi0 & 0xFFFFu], mats[emi1 & 0xFFFFu]);   // P9.88
 
         V3 nWorld = quatRotatePx(q, nLocal);
         if (!isFlipped) nWorld = { -nWorld.x, -nWorld.y, -nWorld.z };

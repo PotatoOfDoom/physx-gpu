@@ -106,9 +106,13 @@ PXG_TEST(npInsertPatch_write)
     const uint32_t N = 5000;
     auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 100000) / 100000.f); };
 
-    std::vector<MaterialData> mats(nbMaterials);
-    for (auto& m : mats)
+    // P9.88: the table is 0x10000 + nbMaterials long and the second bank [0x10000 + k] holds
+    // DIFFERENT materials, so an index k | 0x10000 tells a lookup that narrows to PxU16 first
+    // (materialCombiner.cuh:35) from one that does not -- and both stay in bounds.
+    std::vector<MaterialData> mats(0x10000u + nbMaterials);
+    for (uint32_t mIdx = 0; mIdx < 0x10000u + nbMaterials; mIdx = (mIdx + 1 == nbMaterials) ? 0x10000u : mIdx + 1)
     {
+        MaterialData& m = mats[mIdx];
         m.dynamicFriction = rf(0.f, 1.5f); m.staticFriction = rf(0.f, 1.5f);
         m.restitution = (rng() % 4 == 0) ? rf(-1.f, 0.f) : rf(0.f, 1.f);
         m.damping = rf(0.f, 40.f);
@@ -123,6 +127,8 @@ PXG_TEST(npInsertPatch_write)
     {
         PatchWork w{};
         w.materialIndex0 = rng() % nbMaterials; w.materialIndex1 = rng() % nbMaterials;
+        if (rng() % 4 == 0) w.materialIndex0 |= 0x10000u;
+        if (rng() % 4 == 0) w.materialIndex1 |= 0x10000u;
         // One item in sixteen past 255: nbContacts is a PxU8 field (:163), so the
         // CUDA keeps the low byte -- the `& 0xff` of word 11 needs an input above it.
         w.nbContacts = (rng() % 16 == 0) ? 0x100u + rng() % 0x300u : 1 + rng() % 6;
@@ -153,13 +159,14 @@ PXG_TEST(npInsertPatch_write)
 
     // The expected image: the upload, with exactly the CUDA's assignments overlaid.
     std::vector<uint32_t> want(streamInit);
-    size_t wideCounts = 0;
+    size_t wideCounts = 0, hiBit = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         if (work[i].patchIndex == 0xffffffffu) continue;
         uint32_t* d = &want[work[i].patchIndex / 4];
         float sta, dyn, rest, damping; uint32_t flags;
-        combine(mats[work[i].materialIndex0], mats[work[i].materialIndex1], sta, dyn, rest, damping, flags);
+        combine(mats[work[i].materialIndex0 & 0xffffu], mats[work[i].materialIndex1 & 0xffffu], sta, dyn, rest, damping, flags);
+        if ((work[i].materialIndex0 | work[i].materialIndex1) & 0x10000u) ++hiBit;
         const uint32_t one = bitsOf(1.f);
         d[0] = one; d[1] = one; d[2] = one; d[3] = one;
         d[4] = bitsOf(work[i].nx); d[5] = bitsOf(work[i].ny); d[6] = bitsOf(work[i].nz);
@@ -183,6 +190,7 @@ PXG_TEST(npInsertPatch_write)
                   mm, patchStreamWords, padBad);
     PXG_CHECK_MSG(wideCounts > 50, "only %zu items with nbContacts past 255 -- the PxU8 truncation is unexercised",
                   wideCounts);
+    PXG_CHECK_MSG(hiBit > N / 8, "only %zu written patches with a material index past 0xFFFF", hiBit);
     PXG_CHECK_MSG(nbActive > N / 2 && nbSkip > N / 50, "activity mix under-exercised (active=%u skip=%u)", nbActive, nbSkip);
 
     for (PxgBufferHandle h : { bMat, bWork, bStream }) dev->destroyBuffer(h);

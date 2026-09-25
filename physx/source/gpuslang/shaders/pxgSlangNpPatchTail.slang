@@ -335,8 +335,12 @@ public NptCombinedMaterial nptCombineMaterialsRaw(NptMaterialIn m0, NptMaterialI
 public NptCombinedMaterial nptCombineMaterials(uint64_t materialsAddr, uint mi0, uint mi1)
 {
     Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(materialsAddr);
-    const PxsMaterialDataGpu p0 = materials[mi0];
-    const PxsMaterialDataGpu p1 = materials[mi1];
+    // P9.88: combineMaterials (materialCombiner.cuh:35) takes PxU16 index0/index1, and
+    // every CUDA caller hands it the PxU32 PxgShape::materialIndex (contactPatchUtils.cuh
+    // :149-150 explicitly, convexMeshMidphase.cu:644 implicitly), so the lookup is by the
+    // low 16 bits.  One mask here covers convexPlane, trimeshPlane and triangleTriangle.
+    const PxsMaterialDataGpu p0 = materials[mi0 & 0xFFFFu];
+    const PxsMaterialDataGpu p1 = materials[mi1 & 0xFFFFu];
 
     NptMaterialIn a;
     a.dynamicFriction = p0.dynamicFriction;

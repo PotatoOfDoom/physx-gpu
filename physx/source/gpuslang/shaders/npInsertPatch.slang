@@ -137,7 +137,7 @@ void insertIntoPatchStream(uint3 dtid : SV_DispatchThreadID)
 
     float sta, dyn, rest, damping;
     uint materialFlags;
-    combineMaterials(gMaterials[w.materialIndex0], gMaterials[w.materialIndex1],
+    combineMaterials(gMaterials[w.materialIndex0 & 0xffffu], gMaterials[w.materialIndex1 & 0xffffu],   // P9.88: cuh:149-150 PxU16
                      sta, dyn, rest, damping, materialFlags);
 
     const uint base = w.patchIndex / 4u; // byte offset -> word index

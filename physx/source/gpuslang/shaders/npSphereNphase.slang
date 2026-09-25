@@ -378,8 +378,10 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
     // --- insertIntoPatchStream ---
     if (patchIndex != INVALID)
     {
-        const uint mi0 = shape0.materialIndex;
-        const uint mi1 = shape1.materialIndex;
+        // P9.88: PxU16 materialIndex0/1 = shapeN.materialIndex (contactPatchUtils.cuh:149-150);
+        // the narrowed value indexes materials[] (materialCombiner.cuh:35, :43-44).
+        const uint mi0 = shape0.materialIndex & 0xffffu;
+        const uint mi1 = shape1.materialIndex & 0xffffu;
         const PxsMaterialData m0 = materials[mi0];
         const PxsMaterialData m1 = materials[mi1];
 

@@ -82,8 +82,9 @@ void combineMaterials(uint3 dtid : SV_DispatchThreadID)
     if (i >= gParams.numPairs) return;
 
     const uint2 pair = gPairs[i];
-    const MaterialData m0 = gMaterials[pair.x];
-    const MaterialData m1 = gMaterials[pair.y];
+    // P9.88: combineMaterials takes PxU16 index0/index1 (materialCombiner.cuh:35).
+    const MaterialData m0 = gMaterials[pair.x & 0xFFFFu];
+    const MaterialData m1 = gMaterials[pair.y & 0xFFFFu];
 
     const float r0 = m0.restitution;
     const float r1 = m1.restitution;

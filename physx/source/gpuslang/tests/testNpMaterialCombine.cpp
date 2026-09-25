@@ -118,9 +118,13 @@ PXG_TEST(npMaterialCombine_combine)
     const uint32_t N = 8000;
     auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 100000) / 100000.f); };
 
-    std::vector<MaterialData> mats(nbMaterials);
-    for (auto& m : mats)
+    // P9.88: the table is 0x10000 + nbMaterials long and the second bank [0x10000 + k] holds
+    // DIFFERENT materials, so an index k | 0x10000 tells a lookup that narrows to PxU16 first
+    // (materialCombiner.cuh:35) from one that does not -- and both stay in bounds.
+    std::vector<MaterialData> mats(0x10000u + nbMaterials);
+    for (uint32_t mIdx = 0; mIdx < 0x10000u + nbMaterials; mIdx = (mIdx + 1 == nbMaterials) ? 0x10000u : mIdx + 1)
     {
+        MaterialData& m = mats[mIdx];
         m.dynamicFriction = rf(0.f, 1.5f);
         m.staticFriction = rf(0.f, 1.5f);
         m.restitution = (rng() % 4 == 0) ? rf(-1.0f, 0.f) : rf(0.f, 1.0f); // ~1/4 compliant (negative)
@@ -136,15 +140,22 @@ PXG_TEST(npMaterialCombine_combine)
     }
 
     std::vector<uint32_t> pairsFlat(2 * N);
-    for (uint32_t i = 0; i < N; ++i) { pairsFlat[2 * i] = rng() % nbMaterials; pairsFlat[2 * i + 1] = rng() % nbMaterials; }
+    size_t hiBit = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        pairsFlat[2 * i] = rng() % nbMaterials; pairsFlat[2 * i + 1] = rng() % nbMaterials;
+        if (rng() % 4 == 0) pairsFlat[2 * i] |= 0x10000u;
+        if (rng() % 4 == 0) pairsFlat[2 * i + 1] |= 0x10000u;
+        if ((pairsFlat[2 * i] | pairsFlat[2 * i + 1]) & 0x10000u) ++hiBit;
+    }
 
     std::vector<F4> refFric(N);
     std::vector<uint32_t> refFlags(N);
     size_t nCompliant = 0, nDisable = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
-        const MaterialData& m0 = mats[pairsFlat[2 * i]];
-        const MaterialData& m1 = mats[pairsFlat[2 * i + 1]];
+        const MaterialData& m0 = mats[pairsFlat[2 * i] & 0xffffu];
+        const MaterialData& m1 = mats[pairsFlat[2 * i + 1] & 0xffffu];
         refCombine(m0, m1, refFric[i], refFlags[i]);
         if (m0.restitution < 0.f && m1.restitution < 0.f) ++nCompliant;
         if ((m0.flags | m1.flags) & FLAG_DISABLE_FRICTION) ++nDisable;
@@ -177,6 +188,7 @@ PXG_TEST(npMaterialCombine_combine)
             ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "combineMaterials: %zu mismatches", mm);
+    PXG_CHECK_MSG(hiBit > N / 4, "combineMaterials: only %zu pairs with bit 16 set", hiBit);
     PXG_CHECK_MSG(nCompliant > N / 50 && nDisable > N / 50, "material combine: branches under-exercised (compliant=%zu disable=%zu)", nCompliant, nDisable);
 
     for (PxgBufferHandle h : { bMat, bPairs, bFric, bFlags }) dev->destroyBuffer(h);

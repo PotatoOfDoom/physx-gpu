@@ -277,8 +277,11 @@ void finishContactsKernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThread
                 // tidInGroup == 0: scratch material indices — the CUDA reads
                 // them BEFORE the flip swap (which swaps types/scales/refs
                 // only), so they are always the UNSWAPPED shape0/shape1 values
-                scrMatIndex0[baseOffs + g] = shape0.materialIndex;
-                scrMatIndex1[baseOffs + g] = shape1.materialIndex;
+                // P9.88: the CUDA stores them into PxU16 fields (MaterialParams::materialIndex0,
+                // MaterialParams2::materialIndex1, cudaGJKEPA.cu:1573/1578, :1694-1695), and
+                // those narrowed values index materials[] (:2145-2146, materialCombiner.cuh:35).
+                scrMatIndex0[baseOffs + g] = shape0.materialIndex & 0xFFFFu;
+                scrMatIndex1[baseOffs + g] = shape1.materialIndex & 0xFFFFu;
 
                 // manifold mNbContacts: clear the invalidation bit in memory
                 Ptr<PxgPersistentContactManifoldGpu> manifold =

@@ -248,7 +248,7 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
         if (ti == 0)
         {
             uint32_t mf; float staF, dynF, rest, damp;
-            combineMats(mats[mi0], mats[mi1], mf, staF, dynF, rest, damp);
+            combineMats(mats[mi0 & 0xFFFFu], mats[mi1 & 0xFFFFu], mf, staF, dynF, rest, damp);   // P9.88: cu:61 PxU16
             const V3 pn = flip ? V3{ -wn.x, -wn.y, -wn.z } : wn;
             const uint32_t pb = m * 4;
             o.patches[pb + 0] = U4{ f2u(1.f), f2u(1.f), f2u(1.f), f2u(1.f) };
@@ -315,6 +315,22 @@ PXG_TEST(npCvxTrimeshOut_finish)
         m.flags = (rng() % 4 == 0 ? 1u : 0u) | (rng() % 3 == 0 ? 16u : 0u) | (rng() % 5 == 0 ? 256u : 0u);
         m.fricMode = rng() % 4; m.restMode = rng() % 4; m.dampMode = rng() % 4;
     }
+    // P9.88: a second bank at [0x10000 + i] with DIFFERENT materials (its own generator, so the
+    // case stream is unchanged), so an index k | 0x10000 tells a lookup that narrows to PxU16
+    // first (cu:61 static_cast<PxU16>) from one that does not; both stay in bounds.
+    {
+        std::mt19937 rng2(88001);
+        auto rf2 = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng2() % 1000000) / 1000000.f); };
+        mats.resize(0x10000u + NMAT);
+        for (uint32_t i = 0; i < NMAT; ++i)
+        {
+            MaterialData& m = mats[0x10000u + i];
+            m.dynamicFriction = rf2(0, 1.5f); m.staticFriction = rf2(0, 2.f);
+            m.restitution = rf2(-1.f, 1.f); m.damping = rf2(0, 2.f);
+            m.flags = (rng2() % 4 == 0 ? 1u : 0u) | (rng2() % 3 == 0 ? 16u : 0u) | (rng2() % 5 == 0 ? 256u : 0u);
+            m.fricMode = rng2() % 4; m.restMode = rng2() % 4; m.dampMode = rng2() % 4;
+        }
+    }
 
     std::vector<TmoIn> in(N);
     std::vector<TmoOut> ref(N);
@@ -340,7 +356,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
 
         const bool flip = rng() & 1;
         const uint32_t other = (rng() % 3 == 0) ? T_SPHERE : ((rng() % 2) ? T_CAPSULE : T_CONVEX);
-        s.shapeInfo = U4{ flip ? T_TRIMESH : other, flip ? other : T_TRIMESH, uint32_t(rng() % NMAT), uint32_t(rng() % NMAT) };
+        s.shapeInfo = U4{ flip ? T_TRIMESH : other, flip ? other : T_TRIMESH, uint32_t(rng() % NMAT) | ((i % 4 == 1) ? 0x10000u : 0u), uint32_t(rng() % NMAT) | ((i % 5 == 2) ? 0x10000u : 0u) };   // P9.88
         s.scaleA = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
         s.scaleB = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
         s.tAq = randQuat(); s.tAp = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), 0 };
@@ -495,6 +511,22 @@ PXG_TEST(cvxTriFinish)
         m.flags = (rng() % 4 == 0 ? 1u : 0u) | (rng() % 3 == 0 ? 16u : 0u) | (rng() % 5 == 0 ? 256u : 0u);
         m.fricMode = rng() % 4; m.restMode = rng() % 4; m.dampMode = rng() % 4;
     }
+    // P9.88: a second bank at [0x10000 + i] with DIFFERENT materials (its own generator, so the
+    // case stream is unchanged), so an index k | 0x10000 tells a lookup that narrows to PxU16
+    // first (cu:61 static_cast<PxU16>) from one that does not; both stay in bounds.
+    {
+        std::mt19937 rng2(88001);
+        auto rf2 = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng2() % 1000000) / 1000000.f); };
+        mats.resize(0x10000u + NMAT);
+        for (uint32_t i = 0; i < NMAT; ++i)
+        {
+            MaterialData& m = mats[0x10000u + i];
+            m.dynamicFriction = rf2(0, 1.5f); m.staticFriction = rf2(0, 2.f);
+            m.restitution = rf2(-1.f, 1.f); m.damping = rf2(0, 2.f);
+            m.flags = (rng2() % 4 == 0 ? 1u : 0u) | (rng2() % 3 == 0 ? 16u : 0u) | (rng2() % 5 == 0 ? 256u : 0u);
+            m.fricMode = rng2() % 4; m.restMode = rng2() % 4; m.dampMode = rng2() % 4;
+        }
+    }
 
     std::vector<TmoIn> in(N);
     std::vector<TmoOut> ref(N);
@@ -523,7 +555,7 @@ PXG_TEST(cvxTriFinish)
         const bool flip = rng() & 1;
         const uint32_t other = (rng() % 3 == 0) ? T_SPHERE : ((rng() % 2) ? T_CAPSULE : T_CONVEX);
         s.shapeInfo = U4{ flip ? T_TRIMESH : other, flip ? other : T_TRIMESH,
-                          uint32_t(rng() % NMAT), uint32_t(rng() % NMAT) };
+                          uint32_t(rng() % NMAT) | ((i % 4 == 1) ? 0x10000u : 0u), uint32_t(rng() % NMAT) | ((i % 5 == 2) ? 0x10000u : 0u) };   // P9.88
         s.scaleA = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
         s.scaleB = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
         s.tAq = randQuat(); s.tAp = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), 0 };
@@ -597,9 +629,9 @@ PXG_TEST(cvxTriFinish)
         for (uint32_t w = 0; w < STREAM / 4; ++w) patchStream[i * (STREAM / 4) + w] = patchPoison(w);
     std::vector<uint32_t> contactStream(N * (STREAM / 4), 0u);
     std::vector<uint32_t> forceStream(N * (STREAM / 4), 0u);
-    std::vector<uint32_t> matBuf(NMAT * 6, 0u);        // PxsMaterialData, 24 B
+    std::vector<uint32_t> matBuf(mats.size() * 6, 0u);   // PxsMaterialData, 24 B (both banks)
 
-    for (uint32_t m = 0; m < NMAT; ++m)
+    for (uint32_t m = 0; m < uint32_t(mats.size()); m = (m + 1 == NMAT) ? 0x10000u : m + 1)
     {
         uint32_t* w = &matBuf[m * 6];
         std::memcpy(&w[0], &mats[m].dynamicFriction, 4);

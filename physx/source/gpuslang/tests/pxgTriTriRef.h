@@ -515,7 +515,9 @@ inline void refPatchHeader(const MaterialH* mats, uint32_t mi0, uint32_t mi1, bo
 {
     const uint32_t emi0 = isFlipped ? mi1 : mi0;
     const uint32_t emi1 = isFlipped ? mi0 : mi1;
-    const CombinedH cm = combine(mats[emi0], mats[emi1]);
+    // P9.88: combineMaterials takes PxU16 index0/index1 (materialCombiner.cuh:35); the
+    // PxU32 shape index is narrowed on the way in (convexMeshMidphase.cu:644).
+    const CombinedH cm = combine(mats[emi0 & 0xFFFFu], mats[emi1 & 0xFFFFu]);
 
     V3 nWorld = quatRotatePx(q, nLocal);
     if (!isFlipped) nWorld = { -nWorld.x, -nWorld.y, -nWorld.z };

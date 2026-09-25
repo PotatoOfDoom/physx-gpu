@@ -388,7 +388,7 @@ void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
             {
                 Ptr<PxsMaterialDataGpu> materials = Ptr<PxsMaterialDataGpu>(gCf.materials);
                 uint matFlags; float staF, dynF, rest, damp;
-                cfCombineMaterials(materials[materialIndices.x], materials[materialIndices.y],
+                cfCombineMaterials(materials[materialIndices.x & 0xFFFFu], materials[materialIndices.y & 0xFFFFu],   // P9.88: cu:61 static_cast<PxU16>
                                    matFlags, staF, dynF, rest, damp);
 
                 const float3 pn = flip ? -worldNormal : worldNormal;

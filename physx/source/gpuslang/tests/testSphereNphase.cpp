@@ -375,13 +375,23 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     using namespace physx::gpuslang;
     const uint32_t n = uint32_t(cfgs.size());
 
-    std::vector<HMaterial> materials(8);
-    for (uint32_t i = 0; i < materials.size(); ++i)
+    std::vector<HMaterial> materials(0x10000u + 8u);
+    for (uint32_t i = 0; i < 8u; ++i)
     {
         const float f = 0.2f + 0.1f * i;
         materials[i] = { f, f + 0.3f, (i % 3 == 2) ? -0.5f : 0.4f, 0.05f * i,
                          uint32_t((i & 1) * 16u) | (uint32_t(i % 4) << 16) | (uint32_t((i + 1) % 4) << 24),
                          uint32_t((i + 2) % 4) };
+    }
+    // P9.88: a second bank at [0x10000 + i] holds DIFFERENT materials, so an index k | 0x10000
+    // tells a lookup that narrows to PxU16 first (contactPatchUtils.cuh:149-150,
+    // materialCombiner.cuh:35) from one that does not; both stay in bounds.
+    for (uint32_t i = 0; i < 8u; ++i)
+    {
+        const float g = 1.1f - 0.07f * i;
+        materials[0x10000u + i] = { g, g + 0.15f, (i % 3 == 1) ? -0.3f : 0.1f + 0.05f * i, 0.9f - 0.1f * i,
+                                    uint32_t(((i + 1) & 1) * 16u) | (uint32_t((i + 3) % 4) << 16) | (uint32_t((i + 2) % 4) << 24),
+                                    uint32_t((i + 1) % 4) };
     }
 
     std::vector<HCachedTransform> xcache(2 * n);
@@ -549,7 +559,7 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch normal gpu=(%g,%g,%g) ref=(%g,%g,%g)\n", label, i, pf[4], pf[5], pf[6], R.normal.x, R.normal.y, R.normal.z); }
 
         float sta, dyn, rest, damping; uint32_t mflags;
-        combineMaterials(materials[cfgs[i].mat0], materials[cfgs[i].mat1], sta, dyn, rest, damping, mflags);
+        combineMaterials(materials[cfgs[i].mat0 & 0xffffu], materials[cfgs[i].mat1 & 0xffffu], sta, dyn, rest, damping, mflags);
         if (!almostEqual(pf[7], rest, 2e-5f, 2e-6f)) ++bad;
         if (!almostEqual(pf[8], dyn, 2e-5f, 2e-6f)) ++bad;
         if (!almostEqual(pf[9], sta, 2e-5f, 2e-6f)) ++bad;
@@ -642,6 +652,15 @@ PXG_TEST(sphereNphase_allSubCases)
     checkSphere(cfgs, 0x00020103u, false, "subCases/priorKnownTouch");    // eHAS_TOUCH, 1 patch
     checkSphere(cfgs, 0x00010000u, false, "subCases/priorKnownNoTouch");  // eHAS_NO_TOUCH, 0 patches
     checkSphere(cfgs, 0x7C4A0200u, false, "subCases/priorHighBits");      // status 0x4A: bits 3 and 6 must survive
+
+    // P9.88: bit 16 on mat0 of even pairs and on mat1 of every third.
+    std::vector<PairCfg> hi = cfgs;
+    for (size_t i = 0; i < hi.size(); ++i)
+    {
+        if (i % 2 == 0) hi[i].mat0 |= 0x10000u;
+        if (i % 3 == 0) hi[i].mat1 |= 0x10000u;
+    }
+    checkSphere(hi, 0x00000000u, false, "subCases/matHi");
 }
 
 PXG_TEST(sphereNphase_mutation)

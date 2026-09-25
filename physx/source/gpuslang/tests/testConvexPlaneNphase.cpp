@@ -270,14 +270,20 @@ static void poisonPatchStream(PxgCudaShim& shim, const DeviceScene& d)
 }
 
 // Materials palette (indexed by shape.materialIndex).
+// P9.88: a second bank at [0x10000 + i] holds DIFFERENT materials, so a scene with index
+// k | 0x10000 tells a lookup that narrows to PxU16 (contactPatchUtils.cuh:149-150) from one
+// that does not, and both stay in bounds.
 static std::vector<HMaterial> makeMaterials()
 {
-    std::vector<HMaterial> m(8);
-    for (uint32_t i = 0; i < m.size(); ++i)
+    std::vector<HMaterial> m(0x10000u + 8u);
+    for (uint32_t i = 0; i < 8u; ++i)
     {
         const float f = 0.2f + 0.1f * i;
         m[i] = { f, f + 0.3f, 0.4f, 0.05f * i,
                  uint32_t(uint32_t(i % 4) << 16) | (uint32_t((i + 1) % 4) << 24), uint32_t((i + 2) % 4) };
+        const float g = 1.1f - 0.07f * i;
+        m[0x10000u + i] = { g, g + 0.15f, 0.1f + 0.05f * i, 0.9f - 0.1f * i,
+                            uint32_t(uint32_t((i + 3) % 4) << 16) | (uint32_t((i + 2) % 4) << 24), uint32_t((i + 1) % 4) };
     }
     return m;
 }
@@ -521,6 +527,14 @@ PXG_TEST(convexPlaneNphase_restingBox)
     // slightly translated resting box (offset in the plane) still 4 contacts
     PlaneScene c = { V3{ 1, 1, 1 }, kPlaneUpQ, V3{ 0, 0, 0 }, kIdentityQ, V3{ 0.7f, 0.99f, -0.4f }, 0.1f, 3, 6 };
     checkResting(c, 0x00000001u, false, false, "up/translated");
+
+    // P9.88: material indices with bit 16 set -- the plane's, the convex's, and both.
+    PlaneScene h0 = a; h0.matPlane = 0x10000u | a.matPlane;
+    checkResting(h0, 0x00000000u, false, false, "up/matPlaneHi");
+    PlaneScene h1 = a; h1.matConvex = 0x10000u | a.matConvex;
+    checkResting(h1, 0x00000000u, false, false, "up/matConvexHi");
+    PlaneScene h2 = c; h2.matPlane |= 0x10000u; h2.matConvex |= 0x10000u;
+    checkResting(h2, 0x00000000u, false, false, "up/matBothHi");
 }
 
 PXG_TEST(convexPlaneNphase_separated)

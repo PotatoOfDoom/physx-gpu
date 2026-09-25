@@ -202,8 +202,8 @@ static void refFinish(const std::vector<Pair>& pr, uint32_t numTests, bool inser
                 if (type0 == 0 || type0 == 2) radius[g] = sc0.y;
                 t1q[g] = tq1; t1p[g] = tp1;
                 cd[g] = p.cd0 + p.cd1;
-                scrMat0[baseOffs + g] = p.mat0; // UNSWAPPED
-                scrMat1[baseOffs + g] = p.mat1;
+                scrMat0[baseOffs + g] = p.mat0 & 0xFFFFu; // UNSWAPPED; PxU16 fields (cu:1573/1578)
+                scrMat1[baseOffs + g] = p.mat1 & 0xFFFFu;
                 uint32_t raw = p.rawNb;
                 uint32_t nb = raw & ~0x80000000u;
                 if (raw & 0x80000000u) nb = 0;
@@ -424,8 +424,24 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
         m.flags = (rng() % 4 == 0 ? 1u : 0u) | (rng() % 3 == 0 ? 16u : 0u) | (rng() % 5 == 0 ? 256u : 0u);
         m.fricMode = rng() % 4; m.restMode = rng() % 4; m.dampMode = rng() % 4;
     }
-    std::vector<PxsMaterialData> matData(NMAT);
-    for (uint32_t i = 0; i < NMAT; ++i)
+    // P9.88: a second bank at [0x10000 + i] with DIFFERENT materials (its own generator, so the
+    // case stream is unchanged).  The CUDA stores the index into PxU16 fields
+    // (cudaGJKEPA.cu:1573/1578, :1694-1695) before the lookup, so an index k | 0x10000 must
+    // read bank 0; an unnarrowed lookup reads bank 1, in bounds.
+    {
+        std::mt19937 rng2(88002);
+        auto rf2 = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng2() % 1000000) / 1000000.f); };
+        mats.resize(0x10000u + NMAT);
+        for (uint32_t i = 0; i < NMAT; ++i)
+        {
+            MatRef& m = mats[0x10000u + i];
+            m.dyn = rf2(0, 1.5f); m.sta = rf2(0, 2.f); m.rest = rf2(-1.f, 1.f); m.damp = rf2(0, 2.f);
+            m.flags = (rng2() % 4 == 0 ? 1u : 0u) | (rng2() % 3 == 0 ? 16u : 0u) | (rng2() % 5 == 0 ? 256u : 0u);
+            m.fricMode = rng2() % 4; m.restMode = rng2() % 4; m.dampMode = rng2() % 4;
+        }
+    }
+    std::vector<PxsMaterialData> matData(mats.size());
+    for (uint32_t i = 0; i < uint32_t(mats.size()); i = (i + 1 == NMAT) ? 0x10000u : i + 1)
     {
         matData[i].dynamicFriction = mats[i].dyn; matData[i].staticFriction = mats[i].sta;
         matData[i].restitution = mats[i].rest; matData[i].damping = mats[i].damp;
@@ -446,7 +462,7 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     shim.memAlloc(&dCache, 64 * sizeof(PxsCachedTransform));
     shim.memAlloc(&dCd, 64 * 4);
     shim.memAlloc(&dMf, 32 * sizeof(PxgPersistentContactManifold));
-    shim.memAlloc(&dMat, NMAT * sizeof(PxsMaterialData));
+    shim.memAlloc(&dMat, matData.size() * sizeof(PxsMaterialData));
     shim.memAlloc(&dPoints, BUF);
     shim.memAlloc(&dPatch, BUF);
     shim.memAlloc(&dForce, BUF);
@@ -454,9 +470,10 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     shim.memAlloc(&dTouch, 32 * 4);
     shim.memAlloc(&dPatchCh, 32 * 4);
     shim.memAlloc(&dCmOut, 32 * sizeof(PxsContactManagerOutput));
-    shim.memcpyHtoD(dMat, matData.data(), NMAT * sizeof(PxsMaterialData));
+    shim.memcpyHtoD(dMat, matData.data(), matData.size() * sizeof(PxsMaterialData));
 
     const uint32_t NLAUNCH = 140;
+    uint32_t hiSel = 0;
     size_t cOvf = 0, cPatchOvf = 0, cInval = 0, cAvg = 0, cInvalid = 0, cEmpty = 0;
     size_t mmMf = 0, mmOut = 0, mmFlags = 0, mmCnt = 0, mmPoints = 0, mmPatch = 0;
 
@@ -474,6 +491,9 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
             const uint32_t kinds[4] = { 0u, 2u, 3u, 5u };
             p.type0 = kinds[rng() % 4]; p.type1 = kinds[rng() % 4];
             p.mat0 = rng() % NMAT; p.mat1 = rng() % NMAT;
+            ++hiSel;   // P9.88: bit 16 on some indices, chosen without touching the rng stream
+            if (hiSel % 4 == 1) p.mat0 |= 0x10000u;
+            if (hiSel % 5 == 2) p.mat1 |= 0x10000u;
             p.scale0 = V3{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2) };
             p.scale1 = V3{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2) };
             p.t0q = randQuat(); p.t1q = randQuat();

@@ -148,6 +148,22 @@ PXG_TEST(npTriTriTail_block)
         mats[i].flagsModes0 = flags | ((i % 4) << 16) | (((i + 1) % 4) << 24);
         mats[i].modes1 = (i + 2) % 4;
     }
+    // P9.88: a second bank at [0x10000 + i] with DIFFERENT materials, so an index k | 0x10000
+    // tells a lookup that narrows to PxU16 first (materialCombiner.cuh:35) from one that does
+    // not, and both stay in bounds.
+    mats.resize(0x10000u + nbMaterials);
+    for (uint32_t i = 0; i < nbMaterials; ++i)
+    {
+        MaterialH& m = mats[0x10000u + i];
+        m.dynamicFriction = rf(-0.2f, 1.5f);
+        m.staticFriction = rf(-0.2f, 1.5f);
+        m.restitution = (i % 3 == 1) ? rf(-4.0f, -0.01f) : rf(0.f, 1.f);
+        m.damping = rf(0.f, 40.f);
+        const uint32_t flags = ((i % 5 == 2) ? FLAG_DISABLE_FRICTION : 0u)
+                             | ((i % 4 == 1) ? FLAG_COMPLIANT_ACC_SPRING : 0u);
+        m.flagsModes0 = flags | (((i + 2) % 4) << 16) | (((i + 3) % 4) << 24);
+        m.modes1 = (i + 1) % 4;
+    }
 
     std::vector<TttCaseH> cs(NC);
     std::memset(cs.data(), 0, cs.size() * sizeof(TttCaseH));
@@ -286,6 +302,8 @@ PXG_TEST(npTriTriTail_block)
         if (isFlipped) ++sawFlipped;
         uint32_t mi0 = rng() % nbMaterials, mi1 = rng() % nbMaterials;
         if (mi1 == mi0) mi1 = (mi0 + 1u) % nbMaterials;
+        if (rng() % 4 == 0) mi0 |= 0x10000u;   // P9.88: second bank
+        if (rng() % 4 == 0) mi1 |= 0x10000u;
         const float ang = rf(0.4f, 2.8f);
         V3 axis = { rf(-1.f, 1.f), rf(-1.f, 1.f), rf(-1.f, 1.f) };
         float al = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);

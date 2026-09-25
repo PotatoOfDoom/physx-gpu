@@ -403,13 +403,23 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     // materials (indexed by shape.materialIndex).  0x1235 entries so a pair can carry indices with
     // non-zero high bytes (0x0123/0x1234): words 12/13 store the full PxU16 (contactPatchUtils.cuh:149-150,
     // :170-171), which indices 0..7 cannot tell from an 8-bit mask.
-    std::vector<HMaterial> materials(0x1235);
-    for (uint32_t i = 0; i < materials.size(); ++i)
+    std::vector<HMaterial> materials(0x10000u + 8u);
+    for (uint32_t i = 0; i < 0x1235u; ++i)
     {
         const float f = 0.2f + 0.1f * i;
         materials[i] = { f, f + 0.3f, (i % 3 == 2) ? -0.5f : 0.4f, 0.05f * i,
                          uint32_t((i & 1) * 16u) | (uint32_t(i % 4) << 16) | (uint32_t((i + 1) % 4) << 24),
                          uint32_t((i + 2) % 4) };
+    }
+    // P9.88: a second bank at [0x10000 + i] holds DIFFERENT materials, so an index k | 0x10000
+    // tells a lookup that narrows to PxU16 first (contactPatchUtils.cuh:149-150,
+    // materialCombiner.cuh:35) from one that does not; both stay in bounds.
+    for (uint32_t i = 0; i < 8u; ++i)
+    {
+        const float g = 1.1f - 0.07f * i;
+        materials[0x10000u + i] = { g, g + 0.15f, (i % 3 == 1) ? -0.3f : 0.1f + 0.05f * i, 0.9f - 0.1f * i,
+                                    uint32_t(((i + 1) & 1) * 16u) | (uint32_t((i + 3) % 4) << 16) | (uint32_t((i + 2) % 4) << 24),
+                                    uint32_t((i + 1) % 4) };
     }
 
     // transform cache + contact distances (2 refs per pair)
@@ -597,7 +607,7 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch normal gpu=(%g,%g,%g) ref=(%g,%g,%g)\n", label, i, pf[4], pf[5], pf[6], R.normal.x, R.normal.y, R.normal.z); }
 
         float sta, dyn, rest, damping; uint32_t mflags;
-        combineMaterials(materials[cfgs[i].mat0], materials[cfgs[i].mat1], sta, dyn, rest, damping, mflags);
+        combineMaterials(materials[cfgs[i].mat0 & 0xffffu], materials[cfgs[i].mat1 & 0xffffu], sta, dyn, rest, damping, mflags);
         if (!almostEqual(pf[7], rest, 2e-5f, 2e-6f)) ++bad;   // restitution
         if (!almostEqual(pf[8], dyn, 2e-5f, 2e-6f)) ++bad;    // dynamicFriction
         if (!almostEqual(pf[9], sta, 2e-5f, 2e-6f)) ++bad;    // staticFriction
@@ -668,6 +678,13 @@ PXG_TEST(boxBoxNphase_axisAligned)
     checkBoxBox(cfgs, 0x00020103u, false, "axisAligned/priorKnownTouch");    // eHAS_TOUCH, 1 patch
     checkBoxBox(cfgs, 0x00010000u, false, "axisAligned/priorKnownNoTouch");  // eHAS_NO_TOUCH, 0 patches
     checkBoxBox(cfgs, 0x7C4A0200u, false, "axisAligned/priorHighBits");      // status 0x4A: bits 3 and 6 must survive
+
+    // P9.88: bit 16 on the material indices (k < 8 so the second bank is hit).
+    std::vector<PairCfg> hi;
+    hi.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(1.8f, 0, 0), 0.02f, 0x10001u, 2 });
+    hi.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(1.8f, 0, 0), 0.02f, 3, 0x10006u });
+    hi.push_back({ Vec3(1.5f, 1, 0.8f), Vec3(0.6f, 0.7f, 1.2f), xfT(0, 0, 0), xfT(0.3f, 1.5f, 0.2f), 0.05f, 0x10004u, 0x10005u });
+    checkBoxBox(hi, 0x00000000u, false, "axisAligned/matHi");
 }
 
 PXG_TEST(boxBoxNphase_rotated)
