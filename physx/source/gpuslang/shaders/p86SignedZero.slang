@@ -77,4 +77,14 @@ void szProbe(uint3 dtid : SV_DispatchThreadID)
     float3 e = float3(0.0f, 0.0f, 0.0f);
     if (asuint(m1) != 0u) e -= v;
     o[18] = asuint(e.x);                   // +0
+    // P9.86 (2): a literal zero LANE of a vector add, and a literal zero SEED forwarded
+    // into the first add of an unrolled constant-trip loop -- llvmpipe folds both, stamp
+    // or not.  The ellipsoid's `x + 0*y` (a COMPUTED zero) and the select spelling hold.
+    o[19] = asuint((float3(m1, 0.0f, 0.0f) + float3(0.0f, nz, nz)).y);   // +0
+    float acc = 0.0f;
+    for (uint k = 0u; k < 2u; ++k)
+        acc += (k == 0u) ? nz : i[1];                                      // both -0
+    o[20] = asuint(acc);                                                   // +0
+    o[21] = asuint(nz + 0.0f * pz);                                        // +0
+    o[22] = asuint((nz == 0.0f) ? 0.0f : nz);                              // +0
 }

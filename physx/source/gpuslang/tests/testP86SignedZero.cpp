@@ -40,13 +40,14 @@ using namespace pxgtest;
 struct SzPushH { uint64_t inp, outp; };
 
 const uint32_t P0 = 0x00000000u, N0 = 0x80000000u;
-const uint32_t NOUT = 19;
+const uint32_t NOUT = 23;
 // IEEE-754 results, which is what the CUDA computes.
-const uint32_t kIeee[NOUT] = { P0, P0, P0, N0, P0, N0,  P0, P0, P0, N0, N0,  0, 0, N0, N0,  P0, P0, N0, P0 };
+const uint32_t kIeee[NOUT] = { P0, P0, P0, N0, P0, N0,  P0, P0, P0, N0, N0,  0, 0, N0, N0,  P0, P0, N0, P0,  P0, P0, P0, P0 };
 const char* const kName[NOUT] = { "0 - (+0)", "(-0) + 0", "0 + (-0)", "0 * (-0)", "(0,0,0) - v", "(-0) - 0",
                                   "rz - (+0)", "(-0) + rz", "rz + (-0)", "rz * (-0)", "-1 * (+0)",
                                   "min(+0,-0)", "max(-0,+0)", "PxMin(+0,-0)", "PxMax(+0,-0)",
-                                  "(-0) + pz", "pz - (+0)", "(0,0,0) * -1", "e=0; e -= +0" };
+                                  "(-0) + pz", "pz - (+0)", "(0,0,0) * -1", "e=0; e -= +0",
+                                  "(a,0,0)+(0,-0,..)", "unrolled 0 seed", "-0 + 0*pz", "select +0" };
 
 std::vector<uint32_t> run(const char* spv)
 {
@@ -82,6 +83,9 @@ PXG_TEST(p86SignedZero)
     // the mode stops the driver folding x * 0 and x +/- a PROVEN zero.  It does NOT stop
     // OpFSub(constant 0, x) -> -x (rows 0, 4, 18) -- the port spells those as selects -- and
     // rows 1-2 are slangc's own folds, never reaching the driver.
-    for (uint32_t k : { 3u, 15u, 16u, 17u })
+    for (uint32_t k : { 3u, 15u, 16u, 17u, 21u })
         PXG_CHECK_MSG(sz[k] == kIeee[k], "%s: SignedZeroInfNanPreserve no longer honoured", kName[k]);
+    // The select spelling the port uses for the folds the mode does not stop (rows 0, 4,
+    // 18, 19, 20): IEEE in both builds, whatever the driver does.
+    PXG_CHECK_MSG(plain[22] == kIeee[22] && sz[22] == kIeee[22], "select spelling lost the sign of zero");
 }
