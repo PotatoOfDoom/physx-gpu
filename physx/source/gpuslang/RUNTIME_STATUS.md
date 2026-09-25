@@ -2033,6 +2033,32 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.87b — Das Status-Byte der Vorzustände war nie gesetzt, und die Orakel verwarfen es
+
+`registerContactPatch` (contactPatchUtils.cuh:81-89) übernimmt das alte Status-Byte, löscht
+eTOUCH_KNOWN und setzt dann eHAS_TOUCH oder eHAS_NO_TOUCH. Die Orakel von Sphere, BoxBox und
+ConvexPlane setzten nur 2 bzw. 1. Aufgefallen ist das nie, weil **jeder** Vorzustand, mit dem
+sie liefen (0x0, 0x203, 0x1), das Status-Byte 0 hatte: allflags ist allflagsStart (Byte 0) |
+nbPatches (Byte 1) | statusFlag (Byte 2) | prevPatches (Byte 3). Die 3 bzw. 1 lagen in Byte 0,
+auch wenn der Kommentar „statusFlag=eTOUCH_KNOWN“ sagte. prevHadTouch und prevTouchKnown waren
+also nie wahr, und der Zweig über previouslyHadTouch lief nie.
+
+- Die Orakel übernehmen jetzt `(oldStatus & ~3) | (nb ? 2 : 1)` wie die CUDA.
+- Jede der drei Fixtures läuft zusätzlich mit den Vorzuständen 0x00020103 (eHAS_TOUCH,
+  1 Patch), 0x00010000 (eHAS_NO_TOUCH, 0 Patches) und 0x7C4A0200 (Status 0x4A: Bit 3 und 6
+  müssen überleben; Müll im alten prevPatches-Byte). ConvexPlane fährt sie auch im getrennten
+  Fall, also mit verlorenem Touch.
+- Die Ports waren richtig; nur die Fixtures waren blind.
+
+**Sweep:** 15 Mutanten (je 5 in pxgSlangNpPatchTail, npSphereNphase, boxBoxNphase), **alle
+getötet**: Status-Bits verworfen, eTOUCH_KNOWN nicht gelöscht, previouslyHadTouch = false,
+prevTouchKnown über eHAS_TOUCH, Status aus Byte 3 gelesen. Auf den alten Vorzuständen war
+jeder davon äquivalent (Status-Byte 0 und Byte 3 = 0 machen alle fünf Schreibweisen gleich).
+
+**Suite:** Lauf in beiden Modi ausstehend (wird nachgetragen).
+**Szenen:** nicht nötig, nur Fixtures geändert (die Engine-Shader sind unverändert seit P9.87,
+56/56).
+
 ## P9.87 — Pad-Bytes im Patch-Header: sieben Ports schrieben Bytes, die die CUDA stehen lässt
 
 **Der Befund.** `PxContactPatch` (include/PxContact.h:56-134) ist 64 Byte groß; Wort 13 trägt
