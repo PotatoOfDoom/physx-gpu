@@ -2080,8 +2080,9 @@ npCvxFinishContacts, npInsertPatch und npMaterialCombine.
 getötet**; der gemeinsame Tail wurde dreimal geprüft, über convexPlane, npTriTriWrite und
 npTriTriTail.
 
-**Suite:** Lauf ausstehend.
-**Szenen:** Lauf ausstehend.
+**Suite:** **879/879** in beiden Speichermodi.
+**Szenen:** **56/56** (die Engine-Shader von sphere, boxBox, convexPlane, trimeshPlane,
+triangleTriangle, cvxTriFinish und finishContacts haben sich geändert).
 
 ## P9.87b — Das Status-Byte der Vorzustände war nie gesetzt, und die Orakel verwarfen es
 
