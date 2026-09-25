@@ -215,11 +215,13 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
                       ? (maxVel / sqrt(velMagSq)) * vel
                       : vel;
 
-            float3 delta = float3(0.0f, 0.0f, 0.0f);
-            if (!isTGS)
-            {
-                delta += vel * gPre.dt;
-            }
+            // PxVec3 delta(0.f); if (!isTGS) delta += vel * dt; (softBodyGM.cu:182-185).
+            // slangc compiles the zero-seeded add as `delta = vel * dt` (P9.86: it folds
+            // 0 + x, dropping IEEE's -0 -> +0), so the add is spelled as a select.
+            const float3 dv = vel * gPre.dt;
+            const float3 delta = !isTGS
+                ? float3((dv.x == 0.0f) ? 0.0f : dv.x, (dv.y == 0.0f) ? 0.0f : dv.y, (dv.z == 0.0f) ? 0.0f : dv.z)
+                : float3(0.0f, 0.0f, 0.0f);
 
             const float3 pos = oldPos + delta;
             // The positions are still moved when gravity is applied every substep so

@@ -530,11 +530,12 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
             const float resp0 = angD0 * dot(raXnI, raXnI);
             const float resp1 = angD1 * dot(rbXnI, rbXnI);
 
-            float targetVelF = 0.0f;
-            if (isKinematic0)
-                targetVelF += dot(normal, angVel0);
-            if (isKinematic1)
-                targetVelF -= dot(normal, angVel1);
+            // PxReal targetVel = 0.f; if (k0) targetVel += ...; if (k1) targetVel -= ...;
+            // (contactConstraintBlockPrep.cuh:1138-1142) -- zero-seeded, see tgsPlusZero.
+            const float tv0 = isKinematic0 ? tgsPlusZero(dot(normal, angVel0)) : 0.0f;
+            const float targetVelF = isKinematic1
+                ? (isKinematic0 ? tv0 - dot(normal, angVel1) : tgsZeroMinus(dot(normal, angVel1)))
+                : tv0;
 
             const float frictionError = 0.0f;
 
@@ -550,6 +551,13 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
 // mirrors contactConstraintBlockPrepareParallelLaunchTGS() on the ENGINE ABI:
 // warpIndex = blockIdx.x * (blockDim/32) + threadIdx.x/32 selects the batch,
 // nbContactBatches = numContactBatches + numStaticContactBatches from the desc.
+// IEEE `0 + x` / `0 - x` as selects (P9.86): +0 for either zero, x / -x otherwise.  A
+// zero-seeded `v = 0; if (c) v += x;` is compiled by slangc as `v = x` (it folds 0 + x even
+// with -fp-mode precise, dropping IEEE's -0 -> +0), and `v -= x` from a known zero becomes
+// OpFSub(0, x), which llvmpipe rewrites to -x under SignedZeroInfNanPreserve too.
+float tgsPlusZero(float x) { return (x == 0.0f) ? 0.0f : x; }
+float tgsZeroMinus(float x) { return (x == 0.0f) ? 0.0f : -x; }
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void contactConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_GroupThreadID,

@@ -186,6 +186,13 @@ float3 basisVector2Q(float4 q)
 }
 
 // columns of PxMat33(quat) (PxMat33.h L136-163)
+// IEEE `0 - a` per component: +0 for either zero, -a otherwise (P9.86, see the
+// errorVector in prepareLockedAxes).
+float3 d6ZeroMinus(float3 a)
+{
+    return float3((a.x == 0.0f) ? 0.0f : -a.x, (a.y == 0.0f) ? 0.0f : -a.y, (a.z == 0.0f) ? 0.0f : -a.z);
+}
+
 void quatToMat33(float4 q, out float3 c0, out float3 c1, out float3 c2)
 {
     const float x = q.x, y = q.y, z = q.z, w = q.w;
@@ -747,10 +754,18 @@ void d6SolveQ(const D6In s, uint useExtendedLimits, inout RowBuf buf, inout uint
         {
             float3 axc0, axc1, axc2;
             quatToMat33(cA2wq, axc0, axc1, axc2);
-            float3 errorVector = float3(0, 0, 0);
-            if ((lin & 1u) != 0u) errorVector -= axc0 * cB2cAp.x;
-            if ((lin & 2u) != 0u) errorVector -= axc1 * cB2cAp.y;
-            if ((lin & 4u) != 0u) errorVector -= axc2 * cB2cAp.z;
+            // P9.86: `PxVec3 errorVector(0); errorVector -= ...` (PxgConstraintHelper.h:176-178).
+            // Spelled literally, slangc emits the first subtraction as OpFSub(0, a), which
+            // llvmpipe rewrites to -a even under SignedZeroInfNanPreserve -- so a = +0 (a
+            // zero offset, the common joint) gave -0 where IEEE gives +0.  The first term
+            // goes through d6ZeroMinus (a select: no arithmetic identity to exploit); an
+            // unlocked axis contributes +0, and x - (+0) is the identity for every x.
+            const float3 t0 = ((lin & 1u) != 0u) ? axc0 * cB2cAp.x : float3(0, 0, 0);
+            const float3 t1 = ((lin & 2u) != 0u) ? axc1 * cB2cAp.y : float3(0, 0, 0);
+            const float3 t2 = ((lin & 4u) != 0u) ? axc2 * cB2cAp.z : float3(0, 0, 0);
+            float3 errorVector = d6ZeroMinus(t0);
+            errorVector -= t1;
+            errorVector -= t2;
             ra += errorVector;
             if ((lin & 1u) != 0u)
             {

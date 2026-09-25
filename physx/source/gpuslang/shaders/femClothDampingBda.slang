@@ -123,6 +123,17 @@ struct ApplyDampParams
 [[vk::push_constant]]
 ConstantBuffer<ApplyDampParams> gApply;
 
+// IEEE `0 + x` and `0 - x` per component, as selects (P9.86): +0 for either zero,
+// x / -x otherwise.  No arithmetic identity for slangc or the driver to fold.
+float3 cdPlusZero3(float3 x)
+{
+    return float3((x.x == 0.0f) ? 0.0f : x.x, (x.y == 0.0f) ? 0.0f : x.y, (x.z == 0.0f) ? 0.0f : x.z);
+}
+float3 cdZeroMinus3(float3 x)
+{
+    return float3((x.x == 0.0f) ? 0.0f : -x.x, (x.y == 0.0f) ? 0.0f : -x.y, (x.z == 0.0f) ? 0.0f : -x.z);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)] // SB_SOLVETETRA
 void cloth_applyAccumulatedDeltaVelocity(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
@@ -401,15 +412,17 @@ void cloth_accumulateBendingDampingDeltaVelocity(uint3 gtid : SV_GroupThreadID,
     // rotate the whole pair instead of damping its fold.
     float3 deltaVelTip1 = deltaRotVelDamp * distanceToTip1 * tip1Dir;
     float3 deltaVelTip2 = -deltaRotVelDamp * distanceToTip2 * tip2Dir;
-    float3 deltaVelA = float3(0.0f, 0.0f, 0.0f);
-    float3 deltaVelB = float3(0.0f, 0.0f, 0.0f);
-
     const float weightFactor = 1.0f / (invMassA + invMassB + invMassC + invMassC2);
 
     // D8's twin: the mean of FOUR deltas, removed before the mass weighting.
-    const float3 deltaAvg = (deltaVelA + deltaVelB + deltaVelTip1 + deltaVelTip2) * 0.25f;
-    deltaVelA -= deltaAvg;
-    deltaVelB -= deltaAvg;
+    // P9.86: deltaVelA and deltaVelB are PxVec3(0) (FEMCloth.cu:1131-1132), so the CUDA
+    // computes ((+0 + +0) + tip1) + tip2 and then 0 - deltaAvg.  Spelled literally,
+    // slangc folds the first add to `tip1` (it drops IEEE's -0 -> +0 on 0 + x, even
+    // with -fp-mode precise) and emits the subtraction as OpFSub(0, x), which llvmpipe
+    // rewrites to -x under SignedZeroInfNanPreserve too.  Both are spelled as selects.
+    const float3 deltaAvg = (cdPlusZero3(deltaVelTip1) + deltaVelTip2) * 0.25f;
+    float3 deltaVelA = cdZeroMinus3(deltaAvg);
+    float3 deltaVelB = cdZeroMinus3(deltaAvg);
     deltaVelTip1 -= deltaAvg;
     deltaVelTip2 -= deltaAvg;
 

@@ -208,6 +208,10 @@ ConstantBuffer<SiParams> gSi;
 static const uint SI_IO_STRIDE = 24u;
 static const uint SI_IO_OUT_BASE = 32u * 24u;
 
+// IEEE `x + 0` as a select (P9.86): slangc folds a literal-zero add away even with
+// -fp-mode precise, which keeps a -0 the CUDA turns into +0.
+float isPlusZero(float x) { return (x == 0.0f) ? 0.0f : x; }
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void siStaticTest(uint3 groupThreadId : SV_GroupThreadID)
@@ -372,7 +376,10 @@ public void siSolveDofConstraints(
             if (!newFrictionModel)
             {
                 const float appliedFriction = 0.0f;
-                const float frictionForce = adPClamp(-jointV * recipResponse + appliedFriction, -maxFrictionForce, maxFrictionForce);
+                // `+ appliedFriction` with appliedFriction == 0 (internalConstraints2.cu:1796-1798,
+                // isTGS): nvcc keeps the add, which turns a -0 into +0; slangc folds it away
+                // (P9.86), so it is spelled as the select it amounts to.
+                const float frictionForce = adPClamp(isPlusZero(-jointV * recipResponse), -maxFrictionForce, maxFrictionForce);
                 abStoreF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane, frictionForce);
                 frictionDeltaF = frictionForce - appliedFriction;
                 jointV += frictionDeltaF * response;
