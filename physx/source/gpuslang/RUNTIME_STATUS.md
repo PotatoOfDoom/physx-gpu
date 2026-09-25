@@ -8,6 +8,9 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **879/879** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.88 narrows rigid material indices to PxU16 before the lookup, as combineMaterials' PxU16
+parameters do (nptCombineMaterials, sphere, boxBox, cvxTriFinish, finishContacts, test copies);
+fixtures get a second material bank at 0x10000+k; 20/20 mutants killed.  Engine-latent.
 P9.87b: the sphere/boxBox/convexPlane priors never set the status byte (the 3 and 1 in 0x203/0x1
 sit in allflagsStart), and their oracles dropped the carried status bits; both fixed, 15/15
 status-logic mutants that were equivalent on the old priors now die.
@@ -2035,6 +2038,50 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.88 — Materialindizes werden vor dem Nachschlagen auf PxU16 gekürzt
+
+`combineMaterials` (materialCombiner.cuh:35) nimmt `PxU16 index0, PxU16 index1`, und jeder
+CUDA-Aufrufer übergibt den PxU32 `PxgShape::materialIndex` (PxgConvexConvexShape.h:53) –
+explizit (`PxU16 materialIndex0 = shape0.materialIndex;`, contactPatchUtils.cuh:149-150;
+`static_cast<PxU16>`, convexMeshOutput.cu:61; die PxU16-Felder von MaterialParams,
+cudaGJKEPA.cu:1573/1578) oder implizit über die Parameter (convexMeshMidphase.cu:644).
+`materials[]` wird also mit den unteren 16 Bit indiziert. Die Ports nahmen alle 32:
+
+| Stelle | Engine-Kernel |
+|---|---|
+| `nptCombineMaterials` (pxgSlangNpPatchTail) | convexPlane, trimeshPlane, triangleTriangle – eine Maske für alle |
+| npSphereNphase, boxBoxNphase | sphere, boxBox |
+| cvxTriFinishBda | convexTrimesh/HF-Finish |
+| npCvxFinishContacts (Speicherung in die Scratch-Felder) | finishContacts |
+| npInsertPatch, npCvxTrimeshOut, npMaterialCombine | nur Tests |
+
+Die Convex-Core-Tails kürzten schon (P9.70c). Engine-latent: mapMaterialIndex liefert PxU16
+(PxgNarrowphaseCore.cpp:7769), also kann die Engine keinen Index ≥ 0x10000 erzeugen. Es ist
+trotzdem eine Abweichung, und „unerreichbar“ ist kein Grund zu divergieren.
+
+**Gefunden hat die Stellen ein Workflow**, der jeden Material-Lookup in den Shadern aufzählt
+und gegen seinen eigenen CUDA-Zwilling prüft. Alle Tabellen von Partikeln, FEM-Cloth und
+Softbody (PBD-Material, Deformable-Material, phaseToMat) sind **treu**: Ihre CUDA-Indizes sind
+selbst PxU32 oder werden identisch gekürzt (etwa `rigidMatInd & ~0x80000000`). Die zweite
+Hälfte des Workflows, die adversariale Gegenprüfung, fiel einem Nutzungslimit zum Opfer.
+Ersetzt wird sie hier durch das, was die Gegenprüfung hätte leisten sollen: Jede gemeldete
+Stelle wurde am Code nachgelesen, und jede Korrektur ist durch einen Mutanten belegt.
+
+**Die Fixtures** bekommen eine **zweite Materialbank** bei 0x10000 + k mit **anderen** Werten
+(bei den zufallsbasierten Fixtures mit eigenem Generator, damit der Fallstrom gleich bleibt)
+und Indizes k | 0x10000. Eine nicht gekürzte Suche liest dann ein anderes, gültiges Material,
+statt außerhalb des Puffers. Orakel: `mats[idx & 0xFFFF]` (auch der gemeinsame
+`refPatchHeader` in pxgTriTriRef.h). Betroffen sind convexPlane (drei neue Szenen: Ebene,
+Convex, beide), sphere, boxBox, npTriTriWrite, npTriTriTail, cvxTriFinish, npCvxTrimeshOut,
+npCvxFinishContacts, npInsertPatch und npMaterialCombine.
+
+**Sweep:** 20 Mutanten (je ein fehlendes `& 0xFFFF` für Index 0 und Index 1), **alle
+getötet**; der gemeinsame Tail wurde dreimal geprüft, über convexPlane, npTriTriWrite und
+npTriTriTail.
+
+**Suite:** Lauf ausstehend.
+**Szenen:** Lauf ausstehend.
 
 ## P9.87b — Das Status-Byte der Vorzustände war nie gesetzt, und die Orakel verwarfen es
 
