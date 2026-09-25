@@ -467,7 +467,9 @@ static void checkResting(const PlaneScene& s, uint32_t priorAllflags, bool mutat
     // status word + change flags
     const uint32_t oldStatus = (priorAllflags >> 16) & 0xffu, oldPrevPatches = (priorAllflags >> 8) & 0xffu;
     const bool prevHadTouch = (oldStatus & 2u) != 0u, prevKnown = (oldStatus & 3u) != 0u;
-    const uint32_t status = nb ? 2u : 1u, numPatches = nb ? 1u : 0u;
+    // registerContactPatch (contactPatchUtils.cuh:81-89): the old status byte survives with
+    // eTOUCH_KNOWN cleared, then eHAS_TOUCH or eHAS_NO_TOUCH is set.
+    const uint32_t status = (oldStatus & ~3u) | (nb ? 2u : 1u), numPatches = nb ? 1u : 0u;
     const uint32_t expAllflags = (oldPrevPatches << 24) | (status << 16) | (numPatches << 8);
     if (gOut.allflagsWord != expAllflags) { if (!mutate) std::printf("  [%s] allflags gpu=%08x ref=%08x\n", label, gOut.allflagsWord, expAllflags); ++bad; }
     const bool curTouch = nb > 0;
@@ -502,8 +504,15 @@ PXG_TEST(convexPlaneNphase_restingBox)
 {
     // plane up (+y), unit box resting with 2 cm penetration -> 4 face contacts
     PlaneScene a = { V3{ 1, 1, 1 }, kPlaneUpQ, V3{ 0, 0, 0 }, kIdentityQ, V3{ 0, 0.98f, 0 }, 0.1f, 2, 5 };
+    // The prior allflags word is allflagsStart(byte 0) | nbPatches(byte 1) | statusFlag(byte 2)
+    // | prevPatches(byte 3) (PxsContactManagerState.h:74-77; the CUDA reads the status with
+    // u16Low(u32High(allflags)), contactPatchUtils.cuh:81).  0x00000203 and 0x00000001 put
+    // 3 / 1 in byte 0, NOT in the status: the status-byte priors are the three below.
     checkResting(a, 0x00000000u, false, false, "up/prior0");
-    checkResting(a, 0x00000203u, false, false, "up/priorTouch");
+    checkResting(a, 0x00000203u, false, false, "up/prior203");
+    checkResting(a, 0x00020103u, false, false, "up/priorKnownTouch");
+    checkResting(a, 0x00010000u, false, false, "up/priorKnownNoTouch");
+    checkResting(a, 0x7C4A0200u, false, false, "up/priorHighBits");
 
     // plane along +x (identity plane quat), box resting along -x
     PlaneScene b = { V3{ 1.2f, 0.8f, 1.0f }, kIdentityQ, V3{ 0, 0, 0 }, kIdentityQ, V3{ 1.18f, 0.3f, -0.2f }, 0.08f, 1, 4 };
@@ -518,7 +527,10 @@ PXG_TEST(convexPlaneNphase_separated)
 {
     // box lifted clear of contactDistance -> zero contacts, eHAS_NO_TOUCH
     PlaneScene s = { V3{ 1, 1, 1 }, kPlaneUpQ, V3{ 0, 0, 0 }, kIdentityQ, V3{ 0, 1.4f, 0 }, 0.1f, 2, 5 };
-    checkResting(s, 0x00000203u, false, true, "separated/priorTouch");
+    checkResting(s, 0x00000203u, false, true, "separated/prior203");
+    checkResting(s, 0x00020103u, false, true, "separated/priorKnownTouch");     // touch lost: change
+    checkResting(s, 0x00010000u, false, true, "separated/priorKnownNoTouch");   // still no touch: no change
+    checkResting(s, 0x7C4A0200u, false, true, "separated/priorHighBits");
 }
 
 PXG_TEST(convexPlaneNphase_mutation)

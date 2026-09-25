@@ -498,7 +498,9 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         if (gNb != nb) { ++bad; if (bad < 12) std::printf("  [%s] pair %u nbContacts gpu=%u ref=%u\n", label, i, gNb, nb); continue; }
         if ((gOut[i].nbContacts_flags >> 16) != 0xAAAAu) ++bad;
 
-        const uint32_t status = (nb ? 2u : 1u);
+        // registerContactPatch (contactPatchUtils.cuh:81-89): the old status byte survives with
+        // eTOUCH_KNOWN cleared, then eHAS_TOUCH or eHAS_NO_TOUCH is set.
+        const uint32_t status = (oldStatus & ~3u) | (nb ? 2u : 1u);
         const uint32_t numPatches = nb ? 1u : 0u;
         const uint32_t expAllflags = (oldPrevPatches << 24) | (status << 16) | (numPatches << 8);
         if (gOut[i].allflagsWord != expAllflags) { ++bad; if (bad < 12) std::printf("  [%s] pair %u allflags gpu=%08x ref=%08x\n", label, i, gOut[i].allflagsWord, expAllflags); }
@@ -630,9 +632,16 @@ static std::vector<PairCfg> buildCases()
 PXG_TEST(sphereNphase_allSubCases)
 {
     const std::vector<PairCfg> cfgs = buildCases();
+    // The prior allflags word is allflagsStart(byte 0) | nbPatches(byte 1) | statusFlag(byte 2)
+    // | prevPatches(byte 3) (PxsContactManagerState.h:74-77; the CUDA reads the status with
+    // u16Low(u32High(allflags)), contactPatchUtils.cuh:81).  0x00000203 and 0x00000001 put
+    // 3 / 1 in byte 0, NOT in the status: the status-byte priors are the three below.
     checkSphere(cfgs, 0x00000000u, false, "subCases/prior0");
-    checkSphere(cfgs, 0x00000203u, false, "subCases/priorTouch"); // prevPatches=2, statusFlag=eTOUCH_KNOWN|...
-    checkSphere(cfgs, 0x00000001u, false, "subCases/priorNoTouch");
+    checkSphere(cfgs, 0x00000203u, false, "subCases/prior203");   // nbPatches=2 -> prevPatches=2; status 0
+    checkSphere(cfgs, 0x00000001u, false, "subCases/prior1");     // allflagsStart=1; status 0
+    checkSphere(cfgs, 0x00020103u, false, "subCases/priorKnownTouch");    // eHAS_TOUCH, 1 patch
+    checkSphere(cfgs, 0x00010000u, false, "subCases/priorKnownNoTouch");  // eHAS_NO_TOUCH, 0 patches
+    checkSphere(cfgs, 0x7C4A0200u, false, "subCases/priorHighBits");      // status 0x4A: bits 3 and 6 must survive
 }
 
 PXG_TEST(sphereNphase_mutation)

@@ -537,7 +537,9 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         if ((gOut[i].nbContacts_flags >> 16) != 0xAAAAu) ++bad;
 
         // packed status word
-        const uint32_t status = (nb ? 2u : 1u); // eHAS_TOUCH / eHAS_NO_TOUCH (TOUCH_KNOWN cleared then set)
+        // registerContactPatch (contactPatchUtils.cuh:81-89): the old status byte survives with
+        // eTOUCH_KNOWN cleared, then eHAS_TOUCH or eHAS_NO_TOUCH is set.
+        const uint32_t status = (oldStatus & ~3u) | (nb ? 2u : 1u);
         const uint32_t numPatches = nb ? 1u : 0u;
         const uint32_t expAllflags = (oldPrevPatches << 24) | (status << 16) | (numPatches << 8);
         if (gOut[i].allflagsWord != expAllflags) { ++bad; if (bad < 12) std::printf("  [%s] pair %u allflags gpu=%08x ref=%08x\n", label, i, gOut[i].allflagsWord, expAllflags); }
@@ -657,8 +659,15 @@ PXG_TEST(boxBoxNphase_axisAligned)
     }
     // touching pair whose material indices have non-zero high bytes (full PxU16 in words 12/13)
     cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(1.8f, 0, 0), 0.02f, 0x0123u, 0x1234u });
+    // The prior allflags word is allflagsStart(byte 0) | nbPatches(byte 1) | statusFlag(byte 2)
+    // | prevPatches(byte 3) (PxsContactManagerState.h:74-77; the CUDA reads the status with
+    // u16Low(u32High(allflags)), contactPatchUtils.cuh:81).  0x00000203 and 0x00000001 put
+    // 3 / 1 in byte 0, NOT in the status: the status-byte priors are the three below.
     checkBoxBox(cfgs, 0x00000000u, false, "axisAligned/prior0");
-    checkBoxBox(cfgs, 0x00000203u, false, "axisAligned/priorTouch"); // prevPatches=2, statusFlag=eTOUCH_KNOWN|... (0x03), nbPatches=2
+    checkBoxBox(cfgs, 0x00000203u, false, "axisAligned/prior203");   // nbPatches=2 -> prevPatches=2; status 0
+    checkBoxBox(cfgs, 0x00020103u, false, "axisAligned/priorKnownTouch");    // eHAS_TOUCH, 1 patch
+    checkBoxBox(cfgs, 0x00010000u, false, "axisAligned/priorKnownNoTouch");  // eHAS_NO_TOUCH, 0 patches
+    checkBoxBox(cfgs, 0x7C4A0200u, false, "axisAligned/priorHighBits");      // status 0x4A: bits 3 and 6 must survive
 }
 
 PXG_TEST(boxBoxNphase_rotated)
