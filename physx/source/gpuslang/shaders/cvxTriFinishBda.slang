@@ -51,6 +51,12 @@
 //   * `flip` is `type(shapeRef0) == eTRIANGLEMESH`; it swaps the shape and
 //     transform refs and negates the patch normal, but NOT the per-contact
 //     world point.
+//   * THE PATCH HEADER IS WRITTEN FIELD BY FIELD in the CUDA (cu:65-81):
+//     bytes 54-63 (pad[0..4]) are never stored and keep the stream's content.
+//     So word 12 is stored whole, word 13 is a read-modify-write of its low
+//     half (cu:75, a PxU16 store), and words 14-15 are not touched.  P9.87:
+//     this used to be one uint4 store that zeroed all ten pad bytes, and the
+//     fixture's zero-filled stream and zero-expecting oracle agreed with it.
 
 // ===========================================================================
 // THE ONE SWEEP SURVIVOR, AND WHY IT IS UNREACHABLE
@@ -391,9 +397,12 @@ void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
                 Ptr<float4>(pb + 16UL)[0] = float4(pn, rest);
                 Ptr<float4>(pb + 32UL)[0] = float4(dynF, staF, damp,
                     asfloat((writeIndex & 0xFFFFu) | ((numContacts & 0xFFu) << 16u) | ((matFlags & 0xFFu) << 24u)));
-                Ptr<uint4>(pb + 48UL)[0] = uint4(
-                    1u /* PxContactPatch::eHAS_FACE_INDICES */ | ((materialIndices.x & 0xFFFFu) << 16u),
-                    materialIndices.y & 0xFFFFu, 0u, 0u);
+                // Word 12 whole: internalFlags (cu:81) | materialIndex0 (cu:74).  Word 13
+                // only its low half (cu:75); single writer -- lane tIdx == 0 of manifold
+                // mIdx, inside this pair's own InterlockedAdd reservation.
+                Ptr<uint> pw = Ptr<uint>(pb);
+                pw[12] = 1u /* PxContactPatch::eHAS_FACE_INDICES */ | ((materialIndices.x & 0xFFFFu) << 16u);
+                pw[13] = (pw[13] & 0xFFFF0000u) | (materialIndices.y & 0xFFFFu);
             }
 
             float3 worldPt;

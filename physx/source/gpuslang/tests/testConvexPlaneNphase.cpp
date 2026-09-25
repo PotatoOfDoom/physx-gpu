@@ -52,6 +52,7 @@
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
+#include "pxgTriTriRef.h"
 
 #include <cmath>
 #include <cstdint>
@@ -67,6 +68,15 @@ using physx::gpuslang::PxgDevicePtr;
 using physx::gpuslang::PxgResult;
 
 static const uint32_t INVALID = 0xffffffffu;
+
+// P9.87: THE PATCH STREAM IS POISONED, AND NOT UNIFORMLY.  insertIntoPatchStream
+// (contactPatchUtils.cuh:161-178) assigns the header field by field: words 0-12
+// whole, word 13 only its low half (:171, a PxU16 store), words 14-15 never.  A
+// zero-filled stream cannot tell "left alone" from "stored 0", which is how the
+// shared tail zeroed pad[0] unnoticed.  The poison differs per word position so an
+// RMW that reads the WRONG word (14 or 15 instead of 13) is visible too.
+static const uint32_t POISON = 0xCDCDCDCDu;
+static uint32_t poisonWord(uint64_t k) { return POISON ^ (uint32_t(k) * 0x00010001u); }
 
 // ---------------------------------------------------------------------------
 // Host mirrors of the engine element structs (byte-exact vs the C++ headers).
@@ -252,6 +262,13 @@ struct EngineBlob
 };
 static_assert(sizeof(EngineBlob) == 144, "convexPlaneNphase engine blob is 144 bytes");
 
+static void poisonPatchStream(PxgCudaShim& shim, const DeviceScene& d)
+{
+    std::vector<uint32_t> w(d.patchLimit / 4);
+    for (size_t k = 0; k < w.size(); ++k) w[k] = poisonWord(k);
+    shim.memcpyHtoD(d.dPStream, w.data(), w.size() * 4);
+}
+
 // Materials palette (indexed by shape.materialIndex).
 static std::vector<HMaterial> makeMaterials()
 {
@@ -310,7 +327,7 @@ static void buildDevice(PxgCudaShim& shim, const PlaneScene& s, const HManifold&
     shim.memcpyHtoD(d.dCd, cd.data(), cd.size() * sizeof(float));
     shim.memcpyHtoD(d.dMat, materials.data(), materials.size() * sizeof(HMaterial));
     shim.memsetD32(d.dCStream, 0, d.contactLimit / 4);
-    shim.memsetD32(d.dPStream, 0, d.patchLimit / 4);
+    poisonPatchStream(shim, d);
     shim.memcpyHtoD(d.dCounters, &counters, sizeof(HCounters));
     shim.memcpyHtoD(d.dTouch, &touch, 4);
     shim.memcpyHtoD(d.dPatch, &patch, 4);
@@ -378,10 +395,33 @@ static size_t compareContacts(PxgCudaShim& shim, const DeviceScene& d, const HOu
     if (!(almostEqual(pf[4], worldN.x, 2e-4f, 2e-5f) && almostEqual(pf[5], worldN.y, 2e-4f, 2e-5f) &&
           almostEqual(pf[6], worldN.z, 2e-4f, 2e-5f)))
     { if (!quiet) std::printf("  [%s] patch normal gpu=(%g %g %g) ref=(%g %g %g)\n", label, pf[4], pf[5], pf[6], worldN.x, worldN.y, worldN.z); ++bad; }
+    // ALL SIXTEEN WORDS (P9.87).  insertIntoPatchStream (contactPatchUtils.cuh:161-178):
+    // words 0-12 whole, word 13 its LOW half only (:171 PxU16), words 14-15 never --
+    // so bytes 54-63 must come back as the per-word poison this slot was uploaded with.
     const uint32_t* pu = reinterpret_cast<const uint32_t*>(pf);
-    if (pu[12] != ((matPlane & 0xffffu) << 16)) ++bad;   // materialIndex0 = plane
-    if ((pu[13] & 0xffffu) != (matConvex & 0xffffu)) ++bad; // materialIndex1 = convex
-    (void)materials;
+    auto toH = [](const HMaterial& h) {
+        return tritriref::MaterialH{ h.dyn, h.sta, h.rest, h.damp, h.packedFlags, h.packedDamp };
+    };
+    const tritriref::CombinedH cm = tritriref::combine(toH(materials[matPlane & 0xffffu]),
+                                                       toH(materials[matConvex & 0xffffu]));
+    const uint64_t sw = pOff / 4u;   // first stream word of this slot
+    uint32_t exp[16] = {};
+    exp[0] = exp[1] = exp[2] = exp[3] = tritriref::bitsOfF(1.0f);
+    exp[7] = tritriref::bitsOfF(cm.rest);  exp[8] = tritriref::bitsOfF(cm.dyn);
+    exp[9] = tritriref::bitsOfF(cm.sta);   exp[10] = tritriref::bitsOfF(cm.damping);
+    exp[11] = ((nb & 0xffu) << 16) | ((cm.flags & 0xffu) << 24);               // startContactIndex = 0
+    exp[12] = (matPlane & 0xffffu) << 16;                                      // internalFlags = 0
+    exp[13] = (poisonWord(sw + 13) & 0xffff0000u) | (matConvex & 0xffffu);   // pad[0] untouched
+    exp[14] = poisonWord(sw + 14); exp[15] = poisonWord(sw + 15);              // pad[1..4] untouched
+    for (uint32_t w = 0; w < 16u; ++w)
+    {
+        if (w >= 4u && w <= 6u) continue;   // the normal: tolerance-checked above
+        if (pu[w] != exp[w])
+        {
+            if (!quiet) std::printf("  [%s] patch word %u gpu=%08x ref=%08x\n", label, w, pu[w], exp[w]);
+            ++bad;
+        }
+    }
     return bad;
 }
 
@@ -539,6 +579,7 @@ PXG_TEST(convexPlaneNphase_refreshReload)
     shim.memcpyHtoD(d.dOut, &out, sizeof(HOutput));
     shim.memcpyHtoD(d.dCounters, &counters, sizeof(HCounters));
     shim.memsetD32(d.dCStream, 0, d.contactLimit / 4);
+    poisonPatchStream(shim, d);   // invocation 2's pad expectation must not depend on invocation 1
     shim.memcpyHtoD(d.dTouch, &seven, 4);
     shim.memcpyHtoD(d.dPatch, &seven, 4);
 

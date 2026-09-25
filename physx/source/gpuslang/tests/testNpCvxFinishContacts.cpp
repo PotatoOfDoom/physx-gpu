@@ -156,13 +156,23 @@ struct FinishRef
     std::vector<uint8_t> patch;
 };
 
+// Prior content of the contact and patch streams, by word index.  The engine never clears either
+// stream, so every byte the CUDA does not store must come back as uploaded; the value varies per word
+// so a store that copies ANOTHER word is visible, not just one that zeroes (P9.87).
+static uint32_t finPoison(size_t word) { return 0xCDCDCDCDu ^ uint32_t(word * 0x00010001u); }
+static void fillPoison(std::vector<uint8_t>& v, size_t bytes)
+{
+    v.resize(bytes);
+    for (size_t w = 0; w < bytes / 4; ++w) { const uint32_t p = finPoison(w); std::memcpy(&v[w * 4], &p, 4); }
+}
+
 static void refFinish(const std::vector<Pair>& pr, uint32_t numTests, bool insertAvg,
                       uint32_t initContacts, uint32_t initForce, uint32_t initPatch,
                       uint32_t contactLimit, uint32_t forceLimit, uint32_t patchLimit,
                       const std::vector<MatRef>& mats, size_t bufBytes, FinishRef& o)
 {
-    o.points.assign(bufBytes, 0);
-    o.patch.assign(bufBytes, 0);
+    fillPoison(o.points, bufBytes);
+    fillPoison(o.patch, bufBytes);
     uint32_t contactsBytes = initContacts, forceBytes = initForce, patchesBytes = initPatch, ovf = 0;
 
     float scrNormX[32] = {}, scrNormY[32] = {}, scrNormZ[32] = {};
@@ -374,7 +384,11 @@ static void refFinish(const std::vector<Pair>& pr, uint32_t numTests, bool inser
             const size_t base = size_t(patchIndex) + size_t(slot) * 64;
             const uint32_t contactUnion = ((scrNb[L] & 0xFFu) << 16) | (mfL[L] << 24);
             const uint32_t materialUnion = (scrMat0[L] & 0xFFFFu) << 16;
+            // Bytes 54-55: the CUDA stores MaterialParams2::pad (cudaGJKEPA.cu:1579), never written in
+            // the .cu -> indeterminate __shared__; pinned to the port's documented 0.
             const uint32_t materialUnion2 = scrMat1[L] & 0xFFFFu;
+            // The CUDA stores the WHOLE struct (cudaGJKEPA.cu:2003-2004): words 14-15 are
+            // patchConstants[14..15] = 0.0f (:1912-1913), a real store of 0 -- NOT the prior content.
             uint32_t w[16] = { ONE, ONE, ONE, ONE,
                                f2u(scrNormX[L]), f2u(scrNormY[L]), f2u(scrNormZ[L]), f2u(restL[L]),
                                f2u(dynL[L]), f2u(staL[L]), f2u(dampL[L]), contactUnion,
@@ -422,6 +436,8 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     }
 
     const size_t BUF = 8192;
+    std::vector<uint8_t> poisonImg;
+    fillPoison(poisonImg, BUF);
     PxgDevicePtr dCmIn = 0, dShapes = 0, dCache = 0, dCd = 0, dMf = 0, dMat = 0;
     PxgDevicePtr dPoints = 0, dPatch = 0, dForce = 0, dCounters = 0, dTouch = 0, dPatchCh = 0, dCmOut = 0;
     if (shim.memAlloc(&dCmIn, 32 * sizeof(PxgContactManagerInput)) != PxgResult::Success || !dCmIn)
@@ -537,8 +553,8 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
         shim.memcpyHtoD(dMf, mf.data(), 32 * sizeof(PxgPersistentContactManifold));
         shim.memcpyHtoD(dCmOut, cmOut.data(), 32 * sizeof(PxsContactManagerOutput));
         shim.memcpyHtoD(dCounters, &ctr, sizeof(ctr));
-        shim.memsetD32(dPoints, 0, BUF / 4);
-        shim.memsetD32(dPatch, 0, BUF / 4);
+        shim.memcpyHtoD(dPoints, poisonImg.data(), BUF);   // prior content (refFinish expects it)
+        shim.memcpyHtoD(dPatch, poisonImg.data(), BUF);
         shim.memsetD32(dTouch, 0xEEEEEEEE, 32);
         shim.memsetD32(dPatchCh, 0xEEEEEEEE, 32);
 
@@ -607,11 +623,13 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
         {
             const uint32_t* r = reinterpret_cast<const uint32_t*>(&ref.patch[off]);
             const uint32_t* g = reinterpret_cast<const uint32_t*>(&gPatch[off]);
-            bool rzero = true;
-            for (int k = 0; k < 16; ++k) if (r[k]) { rzero = false; break; }
-            if (rzero)
+            // A chunk no patch covers must come back exactly as uploaded.  A written patch can never
+            // look like the poison: word 0 is 1.0f.
+            bool untouched = true;
+            for (int k = 0; k < 16; ++k) if (r[k] != finPoison(off / 4 + k)) { untouched = false; break; }
+            if (untouched)
             {
-                for (int k = 0; k < 16; ++k) if (g[k]) { ++mmPatch; break; }
+                if (std::memcmp(r, g, 64) != 0) ++mmPatch;
                 continue;
             }
             bool bad = false;

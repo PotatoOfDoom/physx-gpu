@@ -261,7 +261,7 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     //   normal, nbContacts) -- inlined, as npCvxPlaneNphase inlines it.
     if (patchIndex != INVALID)
     {
-        // PxU16 materialIndex0 = shape0.materialIndex; (cu:415-416).  PxgShape's
+        // PxU16 materialIndex0 = shape0.materialIndex; (contactPatchUtils.cuh:149-150).  PxgShape's
         // field is a PxU32 (PxgConvexConvexShape.h:53), and the CUDA narrows it
         // BEFORE it is used -- so the truncated value is what indexes materials[],
         // not just what is stored in the patch.  P9.70c: both tails passed the full
@@ -286,6 +286,10 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
         patchBase[10] = asuint(damping);
         patchBase[11] = ((nbContacts & 0xFFu) << 16u) | ((matFlags & 0xFFu) << 24u);
         patchBase[12] = (mi0 & 0xFFFFu) << 16u;
-        patchBase[13] = (mi1 & 0xFFFFu);
+        // P9.87: contactPatchUtils.cuh:171 is a PxU16 store, so pad[0] (bytes 54-55)
+        // keeps the stream's content.  Single writer: the slot is this invocation's own
+        // InterlockedAdd(PATCH_SIZE) reservation.
+        patchBase[13] = (patchBase[13] & 0xFFFF0000u) | (mi1 & 0xFFFFu);
+        // patchBase[14], patchBase[15] are pad[1..4] and are NOT written, matching insertIntoPatchStream (:161-178).
     }
 }

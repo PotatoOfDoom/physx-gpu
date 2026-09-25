@@ -895,7 +895,12 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
             patchBase[10] = asuint(damping);
             patchBase[11] = ((nbContacts & 0xffu) << 16u) | ((matFlags & 0xffu) << 24u);
             patchBase[12] = (mi0 & 0xffffu) << 16u;
-            patchBase[13] = (mi1 & 0xffffu);
+            // P9.87: materialIndex1 is a PxU16 store (contactPatchUtils.cuh:171): bytes
+            // 52-53 only.  pad[0] (bytes 54-55) keeps whatever the stream held.  patchIndex
+            // is a fresh 64-byte slot from InterlockedAdd and only lane 3 writes it, so
+            // the plain read-modify-write cannot lose an update.
+            patchBase[13] = (patchBase[13] & 0xffff0000u) | (mi1 & 0xffffu);
+            // patchBase[14], patchBase[15] are pad[1..4] and are NOT written (CUDA never stores them).
         }
     }
 

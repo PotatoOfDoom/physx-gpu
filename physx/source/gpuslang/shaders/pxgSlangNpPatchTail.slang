@@ -26,9 +26,18 @@
 
 // pxgSlangNpPatchTail.slang -- P9.82.
 //
-// registerContactPatch (contactPatch.cuh) and insertIntoPatchStream
-// (insertPatch.cuh) on the engine's BDA ABI -- the output tail every in-kernel
-// rigid narrowphase shares.
+// registerContactPatch and insertIntoPatchStream (contactPatchUtils.cuh:76 and
+// :139) on the engine's BDA ABI -- the output tail every in-kernel rigid
+// narrowphase shares.
+//
+// WORD 13 IS HALF A STORE (P9.87).  insertIntoPatchStream assigns the header
+// FIELD BY FIELD through a PxContactPatch* into the stream (:161-178): words 0-12
+// whole, materialIndex1 a PxU16 store (:171, bytes 52-53), and pad[0..4] (bytes
+// 54-63) never.  This tail stored word 13 whole and so zeroed pad[0]; its
+// fixture could not tell, because the stream was zero-filled and word 13 was
+// compared through a 16-bit mask.  Word 13 is now a read-modify-write and words
+// 14-15 stay unwritten; testConvexPlaneNphase poisons the stream per word and
+// compares all sixteen.
 //
 // WHY A MODULE.  Five CUDA kernels end with this exact pair: boxBoxNphase,
 // sphereNphase, convexPlaneNphase, trimeshPlaneNarrowphase and
@@ -378,5 +387,11 @@ public void nptInsertIntoPatchStream(uint64_t materialsAddr, uint64_t patchStrea
     patchBase[10] = asuint(damping);
     patchBase[11] = ((nbContacts & 0xFFu) << 16u) | ((matFlags & 0xFFu) << 24u);
     patchBase[12] = (mi0 & 0xFFFFu) << 16u;
-    patchBase[13] = (mi1 & 0xFFFFu);
+    // materialIndex1 is a PxU16 store (contactPatchUtils.cuh:171): pad[0] (bits
+    // 16-31) keeps the stream's content.  A plain read-modify-write is exact: the
+    // 64-byte slot is this pair's own InterlockedAdd reservation (nptRegisterContactPatch)
+    // and both engine callers run the tail on one invocation (npCvxPlaneNphase
+    // tid.x == 0, triPlaneNpBda gtid.x == 0).  Same form as pxgSlangTriTriPatch.
+    patchBase[13] = (patchBase[13] & 0xFFFF0000u) | (mi1 & 0xFFFFu);
+    // patchBase[14], patchBase[15] are pad[1..4] and are NOT written: the CUDA never assigns pad.
 }

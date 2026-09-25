@@ -405,7 +405,13 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
 
     HCounters counters = { 0, 0, 0, 0 };
     const uint32_t CONTACT_LIMIT = 1u << 20, FORCE_LIMIT = 1u << 20, PATCH_LIMIT = 1u << 20;
-    std::vector<uint8_t> contactStream(CONTACT_LIMIT, 0), patchStream(PATCH_LIMIT, 0), forceStream(FORCE_LIMIT, 0);
+    std::vector<uint8_t> contactStream(CONTACT_LIMIT, 0), patchStream(PATCH_LIMIT), forceStream(FORCE_LIMIT, 0);
+    // Poisoned: insertIntoPatchStream (contactPatchUtils.cuh:161-178) stores field by field and never
+    // writes pad bytes 54-63, and the engine's patch stream (mCompressedPatches) is never cleared, so
+    // those bytes must come back exactly as uploaded.  The fill varies by byte, not a uniform 0xCD, so a
+    // store that copies ANOTHER poisoned word into the pad is visible too.  The host vector is not
+    // modified after the upload, so it is the expectation for every byte the kernel must not write.
+    for (uint32_t k = 0; k < PATCH_LIMIT; ++k) patchStream[k] = uint8_t(0xCDu ^ (k * 37u));
     std::vector<uint32_t> touchFlags(n, 7u), patchFlags(n, 7u);
 
     PxgSlangComputeDevice* dev = testDevice();
@@ -549,8 +555,22 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         const uint32_t word11 = ((nb & 0xffu) << 16) | ((mflags & 0xffu) << 24);
         if (pu[11] != word11) ++bad;
         if (pu[12] != ((cfgs[i].mat0 & 0xffffu) << 16)) ++bad;
-        if ((pu[13] & 0xffffu) != (cfgs[i].mat1 & 0xffffu)) ++bad;
+        // mMassModification = 1.0f x4 (contactPatchUtils.cuh:175-178).
+        for (uint32_t w = 0; w < 4u; ++w)
+            if (pu[w] != 0x3f800000u) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=3f800000\n", label, i, w, pu[w]); }
+        uint32_t init[16];
+        std::memcpy(init, &patchStream[pOff], 64);   // the header's bytes as uploaded
+        // :171 is a PxU16 store: pad[0] (bytes 54-55) keeps the upload; pad[1..4] (words 14-15) are
+        // never written (P9.87).
+        const uint32_t expW13 = (init[13] & 0xffff0000u) | (cfgs[i].mat1 & 0xffffu);
+        if (pu[13] != expW13) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word 13 gpu=%08x ref=%08x\n", label, i, pu[13], expW13); }
+        if (pu[14] != init[14] || pu[15] != init[15])
+        { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch pad words gpu=%08x,%08x ref=%08x,%08x\n", label, i, pu[14], pu[15], init[14], init[15]); }
     }
+
+    // Nothing past the reserved patches may be written.
+    for (size_t k = std::min<size_t>(gCnt.patchesBytes, gPStream.size()); k < gPStream.size(); ++k)
+        if (gPStream[k] != patchStream[k]) { ++bad; std::printf("  [%s] patch stream byte %zu written past patchesBytes\n", label, k); break; }
 
     if (gCnt.contactsBytes != expTotalContacts * 16u) { ++bad; std::printf("  [%s] contactsBytes gpu=%u ref=%u\n", label, gCnt.contactsBytes, expTotalContacts * 16u); }
     if (gCnt.patchesBytes != expTotalPatches * 64u) { ++bad; std::printf("  [%s] patchesBytes gpu=%u ref=%u\n", label, gCnt.patchesBytes, expTotalPatches * 64u); }

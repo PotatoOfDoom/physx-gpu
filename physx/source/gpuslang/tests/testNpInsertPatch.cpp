@@ -24,17 +24,23 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of npInsertPatch.slang: insertIntoPatchStream.  The written
-// PxContactPatch headers are overlaid on the downloaded patch-stream bytes using
-// a struct whose byte layout is pinned (static_assert) to the real PxContactPatch,
-// and every field is compared against a C++ reference combining the materials.
-// Skipped (0xffffffff) work items must leave their slots untouched.
+// Verification of npInsertPatch.slang: insertIntoPatchStream.  THE WHOLE STREAM
+// IS COMPARED BITWISE (P9.87) against an image that starts as the upload and
+// overlays exactly the bytes contactPatchUtils.cuh:161-178 assigns: words 0-12
+// whole, word 13 its LOW half only (:171, a PxU16 store), words 14-15 never.  So
+// pad[0..4] of every written slot, and the four slack slots, must come back as
+// uploaded.  The upload differs per word position, so a store that copies another
+// poisoned word into the pad is visible too.  (Before P9.87 the fixture overlaid
+// named fields only, and the shader's whole-word store of word 13 -- which zeroed
+// pad[0] under a comment saying the CUDA leaves it -- passed.)  Skipped
+// (0xffffffff) work items have no slot at all.
 
 #include "pxgTestFramework.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -66,6 +72,9 @@ static_assert(offsetof(TestContactPatch, restitution) == 28, "restitution offset
 static_assert(offsetof(TestContactPatch, startContactIndex) == 44, "startContactIndex offset");
 static_assert(offsetof(TestContactPatch, internalFlags) == 48, "internalFlags offset");
 static_assert(offsetof(TestContactPatch, materialIndex1) == 52, "materialIndex1 offset");
+static_assert(offsetof(TestContactPatch, pad) == 54, "pad offset");
+
+uint32_t bitsOf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 const uint32_t MODE_MIN = 1, MODE_MULTIPLY = 2, MODE_MAX = 3;
 const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2, FLAG_COMPLIANT_ACC_SPRING = 16;
@@ -114,7 +123,9 @@ PXG_TEST(npInsertPatch_write)
     {
         PatchWork w{};
         w.materialIndex0 = rng() % nbMaterials; w.materialIndex1 = rng() % nbMaterials;
-        w.nbContacts = 1 + rng() % 6;
+        // One item in sixteen past 255: nbContacts is a PxU8 field (:163), so the
+        // CUDA keeps the low byte -- the `& 0xff` of word 11 needs an input above it.
+        w.nbContacts = (rng() % 16 == 0) ? 0x100u + rng() % 0x300u : 1 + rng() % 6;
         w.nx = rf(-1, 1); w.ny = rf(-1, 1); w.nz = rf(-1, 1); w.nw = 0;
         if (rng() % 10 == 0) { w.patchIndex = 0xffffffffu; ++nbSkip; }
         else { w.patchIndex = nextSlot * 64u; ++nextSlot; ++nbActive; }
@@ -122,8 +133,10 @@ PXG_TEST(npInsertPatch_write)
     }
     const uint32_t patchStreamWords = (nextSlot + 4) * 16; // + slack
 
-    // patch stream pre-filled with a sentinel so skipped slots / pad stay detectable
-    std::vector<uint32_t> streamInit(patchStreamWords, 0xabcddcbau);
+    // patch stream pre-filled with a per-word sentinel so pad and slack stay detectable,
+    // and so pad words 13, 14 and 15 of one slot all differ
+    std::vector<uint32_t> streamInit(patchStreamWords);
+    for (uint32_t k = 0; k < patchStreamWords; ++k) streamInit[k] = 0xabcddcbau ^ (k * 0x00010001u);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 255) / 256;
@@ -138,27 +151,38 @@ PXG_TEST(npInsertPatch_write)
 
     const auto gStream = downloadBuffer<uint32_t>(dev, bStream, patchStreamWords);
 
-    size_t mm = 0;
+    // The expected image: the upload, with exactly the CUDA's assignments overlaid.
+    std::vector<uint32_t> want(streamInit);
+    size_t wideCounts = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         if (work[i].patchIndex == 0xffffffffu) continue;
-        const uint32_t base = work[i].patchIndex / 4;
-        TestContactPatch patch;
-        std::memcpy(&patch, &gStream[base], 64);
-
+        uint32_t* d = &want[work[i].patchIndex / 4];
         float sta, dyn, rest, damping; uint32_t flags;
         combine(mats[work[i].materialIndex0], mats[work[i].materialIndex1], sta, dyn, rest, damping, flags);
-
-        bool ok = patch.mm[0] == 1.f && patch.mm[1] == 1.f && patch.mm[2] == 1.f && patch.mm[3] == 1.f &&
-                  patch.normal[0] == work[i].nx && patch.normal[1] == work[i].ny && patch.normal[2] == work[i].nz &&
-                  patch.restitution == rest && patch.dynamicFriction == dyn && patch.staticFriction == sta &&
-                  patch.damping == damping && patch.startContactIndex == 0 &&
-                  patch.nbContacts == uint8_t(work[i].nbContacts) && patch.materialFlags == uint8_t(flags) &&
-                  patch.internalFlags == 0 && patch.materialIndex0 == uint16_t(work[i].materialIndex0) &&
-                  patch.materialIndex1 == uint16_t(work[i].materialIndex1);
-        if (!ok) ++mm;
+        const uint32_t one = bitsOf(1.f);
+        d[0] = one; d[1] = one; d[2] = one; d[3] = one;
+        d[4] = bitsOf(work[i].nx); d[5] = bitsOf(work[i].ny); d[6] = bitsOf(work[i].nz);
+        d[7] = bitsOf(rest); d[8] = bitsOf(dyn); d[9] = bitsOf(sta); d[10] = bitsOf(damping);
+        d[11] = ((work[i].nbContacts & 0xffu) << 16) | ((flags & 0xffu) << 24);   // startContactIndex = 0
+        d[12] = (work[i].materialIndex0 & 0xffffu) << 16;                        // internalFlags = 0
+        d[13] = (d[13] & 0xffff0000u) | (work[i].materialIndex1 & 0xffffu);      // pad[0] kept (:171)
+        // d[14], d[15]: pad[1..4], never written
+        if (work[i].nbContacts > 0xffu) ++wideCounts;
     }
-    PXG_CHECK_MSG(mm == 0, "insertIntoPatchStream: %zu / %u patch mismatches", mm, nbActive);
+    size_t mm = 0, padBad = 0;
+    for (uint32_t w = 0; w < patchStreamWords; ++w)
+        if (gStream[w] != want[w])
+        {
+            if (mm < 6) std::printf("  stream word %u (slot %u word %u): got %08x want %08x\n", w, w / 16u, w % 16u,
+                                    gStream[w], want[w]);
+            ++mm;
+            if ((w % 16u) >= 13u) ++padBad;
+        }
+    PXG_CHECK_MSG(mm == 0, "insertIntoPatchStream: %zu / %u stream words differ (%zu in words 13-15 of a slot)",
+                  mm, patchStreamWords, padBad);
+    PXG_CHECK_MSG(wideCounts > 50, "only %zu items with nbContacts past 255 -- the PxU8 truncation is unexercised",
+                  wideCounts);
     PXG_CHECK_MSG(nbActive > N / 2 && nbSkip > N / 50, "activity mix under-exercised (active=%u skip=%u)", nbActive, nbSkip);
 
     for (PxgBufferHandle h : { bMat, bWork, bStream }) dev->destroyBuffer(h);

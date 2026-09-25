@@ -560,6 +560,11 @@ void finishContactsKernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThread
             patch[0] = uint4(ONE_BITS, ONE_BITS, ONE_BITS, ONE_BITS);
             patch[1] = uint4(asuint(scrNormX[L]), asuint(scrNormY[L]), asuint(scrNormZ[L]), asuint(restL[L]));
             patch[2] = uint4(asuint(dynFL[L]), asuint(staFL[L]), asuint(dampL[L]), contactUnion);
+            // P9.87: a WHOLE-STRUCT store, as cudaGJKEPA.cu:2003-2004 -- do NOT apply the
+            // leave-the-pad read-modify-write here.  Words 14-15 are patchConstants[14..15]
+            // = 0.0f (:1912-1913), a REAL CUDA store of 0; bytes 54-55 are
+            // MaterialParams2::pad (:1579), never written in the .cu, so indeterminate
+            // __shared__ content there and a documented 0 here.
             patch[3] = uint4(materialUnion, materialUnion2, 0u, 0u);
         }
     }

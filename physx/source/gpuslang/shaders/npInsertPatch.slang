@@ -39,8 +39,8 @@
 //   8      dynamicFriction         9  staticFriction   10 damping
 //   11     startContactIndex(0:16) | nbContacts(16:24) | materialFlags(24:32)
 //   12     internalFlags(0)(0:16)  | materialIndex0(16:32)
-//   13     materialIndex1(0:16)    | pad (untouched by the CUDA)
-//   14,15  pad
+//   13     materialIndex1(0:16)    | pad[0](16:32) -- NOT written, the stream's bytes stay
+//   14,15  pad[1..4]                -- NOT written
 
 struct MaterialData
 {
@@ -163,6 +163,9 @@ void insertIntoPatchStream(uint3 dtid : SV_DispatchThreadID)
     gPatchStream[base + 11u] = ((w.nbContacts & 0xffu) << 16) | ((materialFlags & 0xffu) << 24);
     // internalFlags(0) | materialIndex0<<16
     gPatchStream[base + 12u] = (w.materialIndex0 & 0xffffu) << 16;
-    // materialIndex1 (low 16); pad in the high 16 is untouched by the CUDA
-    gPatchStream[base + 13u] = (w.materialIndex1 & 0xffffu);
+    // materialIndex1 (low 16) is a PxU16 store (contactPatchUtils.cuh:171), so pad[0]
+    // in the high 16 keeps the stream's bytes: read-modify-write, exact because this
+    // invocation is the slot's only writer.  Words 14-15 (pad[1..4]) are not written.
+    // (P9.87: this line zeroed pad[0] while its comment said the CUDA leaves it.)
+    gPatchStream[base + 13u] = (gPatchStream[base + 13u] & 0xFFFF0000u) | (w.materialIndex1 & 0xffffu);
 }

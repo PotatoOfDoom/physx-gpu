@@ -400,8 +400,10 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     using namespace physx::gpuslang;
     const uint32_t n = uint32_t(cfgs.size());
 
-    // materials (indexed by shape.materialIndex): a small palette
-    std::vector<HMaterial> materials(8);
+    // materials (indexed by shape.materialIndex).  0x1235 entries so a pair can carry indices with
+    // non-zero high bytes (0x0123/0x1234): words 12/13 store the full PxU16 (contactPatchUtils.cuh:149-150,
+    // :170-171), which indices 0..7 cannot tell from an 8-bit mask.
+    std::vector<HMaterial> materials(0x1235);
     for (uint32_t i = 0; i < materials.size(); ++i)
     {
         const float f = 0.2f + 0.1f * i;
@@ -433,7 +435,13 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
 
     HCounters counters = { 0, 0, 0, 0 };
     const uint32_t CONTACT_LIMIT = 1u << 20, FORCE_LIMIT = 1u << 20, PATCH_LIMIT = 1u << 20;
-    std::vector<uint8_t> contactStream(CONTACT_LIMIT, 0), patchStream(PATCH_LIMIT, 0), forceStream(FORCE_LIMIT, 0);
+    std::vector<uint8_t> contactStream(CONTACT_LIMIT, 0), patchStream(PATCH_LIMIT), forceStream(FORCE_LIMIT, 0);
+    // Poisoned patch stream: insertIntoPatchStream (contactPatchUtils.cuh:161-178) stores field by field
+    // and never writes pad bytes 54-63, and the engine's mCompressedPatches is never cleared, so those
+    // bytes must come back exactly as uploaded.  The fill varies by byte so a store that copies another
+    // poisoned word into the pad is visible; the host vector is not modified after the upload and is
+    // the expectation.
+    for (uint32_t k = 0; k < PATCH_LIMIT; ++k) patchStream[k] = uint8_t(0xCDu ^ (k * 37u));
     std::vector<uint32_t> touchFlags(n, 7u), patchFlags(n, 7u); // seeded with junk
 
     // ---- device ----
@@ -574,10 +582,14 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
             }
         }
 
-        // compare patch header
+        // compare patch header -- all 16 words
         float pf[16];
         std::memcpy(pf, &gPStream[pOff], 64);
         const uint32_t* pu = reinterpret_cast<const uint32_t*>(pf);
+        uint32_t init[16];
+        std::memcpy(init, &patchStream[pOff], 64);   // the header's bytes as uploaded
+        for (uint32_t w = 0; w < 4u; ++w)             // mMassModification = 1.0f x4 (contactPatchUtils.cuh:175-178)
+            if (pu[w] != 0x3f800000u) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=3f800000\n", label, i, w, pu[w]); }
         if (!(almostEqual(pf[4], R.normal.x, 2e-4f, 2e-5f) && almostEqual(pf[5], R.normal.y, 2e-4f, 2e-5f) &&
               almostEqual(pf[6], R.normal.z, 2e-4f, 2e-5f)))
         { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch normal gpu=(%g,%g,%g) ref=(%g,%g,%g)\n", label, i, pf[4], pf[5], pf[6], R.normal.x, R.normal.y, R.normal.z); }
@@ -590,9 +602,19 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         if (!almostEqual(pf[10], damping, 2e-5f, 2e-6f)) ++bad; // damping
         const uint32_t word11 = ((nb & 0xffu) << 16) | ((mflags & 0xffu) << 24);
         if (pu[11] != word11) ++bad;
-        if (pu[12] != ((cfgs[i].mat0 & 0xffffu) << 16)) ++bad;
-        if ((pu[13] & 0xffffu) != (cfgs[i].mat1 & 0xffffu)) ++bad;
+        if (pu[12] != ((cfgs[i].mat0 & 0xffffu) << 16)) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word 12 gpu=%08x ref=%08x\n", label, i, pu[12], (cfgs[i].mat0 & 0xffffu) << 16); }
+        // :171 is a PxU16 store: pad[0] (bytes 54-55) keeps the upload; pad[1..4] (words 14-15) are
+        // never written (P9.87).
+        const uint32_t expW13 = (init[13] & 0xffff0000u) | (cfgs[i].mat1 & 0xffffu);
+        if (pu[13] != expW13) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word 13 gpu=%08x ref=%08x\n", label, i, pu[13], expW13); }
+        if (pu[14] != init[14] || pu[15] != init[15])
+        { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch pad words gpu=%08x,%08x ref=%08x,%08x\n", label, i, pu[14], pu[15], init[14], init[15]); }
     }
+
+    // Patches are packed from offset 0 by the atomic reservation (counters start at 0): nothing past
+    // the last reserved slot may be written.
+    for (size_t b = size_t(expTotalPatches) * 64u; b < gPStream.size(); ++b)
+        if (gPStream[b] != patchStream[b]) { ++bad; std::printf("  [%s] patch stream written past reserved slots at byte %zu\n", label, b); break; }
 
     // counters : deterministic totals (order-independent partition)
     if (gCnt.contactsBytes != expTotalContacts * 16u) { ++bad; std::printf("  [%s] contactsBytes gpu=%u ref=%u\n", label, gCnt.contactsBytes, expTotalContacts * 16u); }
@@ -633,6 +655,8 @@ PXG_TEST(boxBoxNphase_axisAligned)
         cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0),
                          xfQ(QuatV(0, s, 0, c), Vec3(0.0f, 1.5f, 0.0f)), 0.05f, 6, 1 });
     }
+    // touching pair whose material indices have non-zero high bytes (full PxU16 in words 12/13)
+    cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(1.8f, 0, 0), 0.02f, 0x0123u, 0x1234u });
     checkBoxBox(cfgs, 0x00000000u, false, "axisAligned/prior0");
     checkBoxBox(cfgs, 0x00000203u, false, "axisAligned/priorTouch"); // prevPatches=2, statusFlag=eTOUCH_KNOWN|... (0x03), nbPatches=2
 }

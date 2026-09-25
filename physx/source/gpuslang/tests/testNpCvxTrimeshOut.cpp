@@ -134,8 +134,17 @@ static void combineMats(const MaterialData& m0, const MaterialData& m1,
     else { matFlags = cf | 2u; dynF = 0.f; staF = 0.f; }
 }
 
-// returns the double-written faceIndex word to mask (0xFFFFFFFF = none)
-static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& mats, TmoOut& o)
+// The engine test's patch-stream poison, by word index inside a case's slice.  It varies per word so a
+// read-modify-write that reads the WRONG word (14/15, or another slot) is visible, not just one that
+// zeroes: convexMeshOutput.cu:65-81 stores the header field by field and never touches bytes 54-63
+// (PxContactPatch::pad), and the engine never clears its patch stream (P9.87).
+static uint32_t patchPoison(uint32_t sliceWord) { return 0xCDCDCDCDu ^ (sliceWord * 0x00010001u); }
+
+// returns the double-written faceIndex word to mask (0xFFFFFFFF = none).  patchFill, when given, is the
+// patch stream's content before the dispatch (by word index inside the slice); without it the unwritten
+// bytes are expected as 0, which is the record-model shader's zero-initialised record.
+static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& mats, TmoOut& o,
+                              uint32_t (*patchFill)(uint32_t) = nullptr)
 {
     o.res = U4{ 0, 0, 0, 0 };
     o.outputs = U4{ NULLS, NULLS, NULLS, 0 };
@@ -191,6 +200,15 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
     }
     o.counters = U4{ patchesB, contactsB, forceB, ovf };
 
+    // The four compared slots start as the stream's prior content; only the fields cu:66-81 store
+    // replace it below.
+    if (patchFill && !overflow && patchOff != 0xFFFFFFFFu)
+        for (uint32_t j = 0; j < 16; ++j)
+        {
+            const uint32_t w = patchOff / 4 + j * 4;
+            o.patches[j] = U4{ patchFill(w), patchFill(w + 1), patchFill(w + 2), patchFill(w + 3) };
+        }
+
     if (overflow || nbManifolds == 0) { o.outputs.w = 1; return 0xFFFFFFFFu; }
 
     const bool flip = s.shapeInfo.x == T_TRIMESH;
@@ -237,7 +255,10 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
             o.patches[pb + 1] = U4{ f2u(pn.x), f2u(pn.y), f2u(pn.z), f2u(rest) };
             o.patches[pb + 2] = U4{ f2u(dynF), f2u(staF), f2u(damp),
                                     (wI & 0xFFFF) | ((nc & 0xFF) << 16) | ((mf & 0xFF) << 24) };
-            o.patches[pb + 3] = U4{ 1u | ((mi0 & 0xFFFF) << 16), mi1 & 0xFFFF, 0, 0 };
+            // cu:75 is a PxU16 store: pad[0] (bytes 54-55) keeps the stream's content, and
+            // pad[1..4] (words 14-15) are never stored (P9.87).
+            const U4 prior = o.patches[pb + 3];
+            o.patches[pb + 3] = U4{ 1u | ((mi0 & 0xFFFF) << 16), (prior.y & 0xFFFF0000u) | (mi1 & 0xFFFF), prior.z, prior.w };
         }
 
         V3 wp;
@@ -541,7 +562,7 @@ PXG_TEST(cvxTriFinish)
         s.counters = U4{ initP, initC, initF, 0 };
 
         in[i] = s;
-        maskWord[i] = refTrimeshOut(s, mats, ref[i]);
+        maskWord[i] = refTrimeshOut(s, mats, ref[i], &patchPoison);
         const uint32_t f = ref[i].counters.w;
         if (f & 4u) ++cOvfP;
         if (f & 1u) ++cOvfC;
@@ -571,7 +592,9 @@ PXG_TEST(cvxTriFinish)
     const uint32_t OVF_SEED = 8u;   // not one of PATCH/CONTACT/FORCE_OVF
     std::vector<uint32_t> ctrBuf(N * 4, 0u);
     std::vector<uint32_t> touchBuf(N * 2, 0xDEADBEEFu), patchChgBuf(N * 2, 0xDEADBEEFu);
-    std::vector<uint32_t> patchStream(N * (STREAM / 4), 0u);
+    std::vector<uint32_t> patchStream(N * (STREAM / 4));   // poisoned per word (patchPoison)
+    for (uint32_t i = 0; i < N; ++i)
+        for (uint32_t w = 0; w < STREAM / 4; ++w) patchStream[i * (STREAM / 4) + w] = patchPoison(w);
     std::vector<uint32_t> contactStream(N * (STREAM / 4), 0u);
     std::vector<uint32_t> forceStream(N * (STREAM / 4), 0u);
     std::vector<uint32_t> matBuf(NMAT * 6, 0u);        // PxsMaterialData, 24 B
@@ -790,7 +813,7 @@ PXG_TEST(cvxTriFinish)
         if (r.counters.w != 0u)
         {
             for (uint32_t w = 0; w < STREAM / 4; ++w)
-                if (ps[w] != 0u || cs[w] != 0u || fs[w] != 0u) { ++mmPatch; break; }
+                if (ps[w] != patchPoison(w) || cs[w] != 0u || fs[w] != 0u) { ++mmPatch; break; }
         }
 
         if (po != NULLS && po != 0xFFFFFFFFu)
@@ -809,6 +832,18 @@ PXG_TEST(cvxTriFinish)
                     { ++mmPatch; break; }
                 }
             }
+
+        // Nothing else in the slice may be written: this also measures the no-reservation path
+        // (po == 0xFFFFFFFF), which the slot compare above skips.  po <= 448 (initP), so the
+        // compared window po/4 .. po/4+64 stays inside the 512-word slice.
+        {
+            const bool haveP = (po != NULLS && po != 0xFFFFFFFFu);
+            for (uint32_t w = 0; w < STREAM / 4; ++w)
+            {
+                if (haveP && w >= po / 4 && w < po / 4 + 64u) continue;   // compared above
+                if (ps[w] != patchPoison(w)) { ++mmPatch; break; }
+            }
+        }
 
         if (cob != NULLS && cob != 0xFFFFFFFFu)
             for (uint32_t c = 0; c < 24; ++c)

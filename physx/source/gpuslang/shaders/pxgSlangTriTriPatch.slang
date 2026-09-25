@@ -698,8 +698,10 @@ public TtpReservation ttpReserveBlock(uint oldAllFlags, uint numPatchesToKeep, u
 // stream held.  This writer used to store the whole word, zeroing pad[0], and the
 // Write and Tail fixtures' oracles expected that zero -- they followed the port,
 // not the CUDA (review of P9.83b-8 (4/n)).  No other thread writes these bytes,
-// so the plain RMW is exact.  (Whether the sibling writers share the slip is
-// P9.87.)
+// so the plain RMW is exact.  P9.87 found the same slip in six sibling writers
+// (the shared rigid tail, sphere, box-box, both convex-core tails, the convex-
+// trimesh finish) and fixed them the same way; the finish-contacts kernel is the
+// one writer whose CUDA stores the whole struct, pad included.
 //
 // TWO DIFFERENCES FROM THE SIBLING, and one of them is a defect.
 //

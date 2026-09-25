@@ -55,7 +55,16 @@
 // patch word below is the same expression ccoWriteContact computes and
 // testNpCvxCoreOut compares bitwise against its CPU mirror.  What is unverified by
 // that fixture -- and is stated rather than implied -- is the ADDRESSING: which
-// device byte each value lands on.  The scene is what checks that.
+// device byte each value lands on.  Until P9.87 only the scenes checked that (see
+// below).
+//
+// ONE WORD DIFFERS FROM ccoWriteContact ON PURPOSE (P9.87): word 13's high half.
+// ccoWriteContact models a zero-initialised RECORD image (npCvxCoreOut.slang) and
+// writes 0 there; this tail writes into the stream and, like cu:434 (a PxU16
+// store), leaves pad[0] as the stream holds it.  Since P9.87 the ADDRESSING is
+// verified too: cvxCoreTailBda.slang (cctMulti) #includes this tail and
+// tests/testCvxCoreTailBda.cpp runs it over per-word-poisoned streams, cmOutputs and
+// counters, compared whole against a mirror of cu:292-445.
 //
 // ===========================================================================
 // FIVE DIFFERENCES FROM THE SINGLE-PATCH TAIL, ALL OF THEM LOAD-BEARING
@@ -226,7 +235,8 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
     //   w10     damping
     //   w11     startContactIndex(0:16) | nbContacts(16:24) | materialFlags(24:32)
     //   w12     internalFlags(=0)(0:16) | materialIndex0(16:32)
-    //   w13     materialIndex1(0:16);  w14/w15 NOT WRITTEN by the CUDA
+    //   w13     materialIndex1(0:16), pad[0](16:32) NOT WRITTEN (a PxU16 store, cu:434);
+    //   w14/w15 NOT WRITTEN by the CUDA
     if (patchIndex != INVALID)
     {
         // PxU16 materialIndex0 = shape0.materialIndex; (cu:415-416).  PxgShape's
@@ -260,7 +270,11 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
             p[11] = (startContactIndex & 0xFFFFu) | ((nbPatchPoints & 0xFFu) << 16u)
                   | ((matFlags & 0xFFu) << 24u);
             p[12] = (mi0 & 0xFFFFu) << 16u;   // internalFlags = 0 in the low half
-            p[13] = (mi1 & 0xFFFFu);
+            // P9.87: cu:434 is a PxU16 store, so pad[0] (bits 16-31) keeps the stream's
+            // content.  Single writer: lane 0 alone calls this, and patch i is its own
+            // 64-byte slot inside this invocation's InterlockedAdd reservation.
+            p[13] = (p[13] & 0xFFFF0000u) | (mi1 & 0xFFFFu);
+            // p[14], p[15] are pad[1..4] and are NOT written, matching cu:425-441.
             startContactIndex += nbPatchPoints;
         }
     }

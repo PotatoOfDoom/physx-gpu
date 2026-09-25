@@ -399,7 +399,11 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
         patchBase[10] = asuint(damping);
         patchBase[11] = ((nbContacts & 0xffu) << 16u) | ((matFlags & 0xffu) << 24u);
         patchBase[12] = (mi0 & 0xffffu) << 16u;
-        patchBase[13] = (mi1 & 0xffffu);
+        // P9.87: materialIndex1 is a PxU16 store (contactPatchUtils.cuh:171), so pad[0]
+        // (bytes 54-55) keeps the stream's content and words 14-15 (pad[1..4]) are never
+        // written (:161-178).  Single writer: patchIndex is this invocation's own
+        // InterlockedAdd(PATCH_SIZE) reservation.
+        patchBase[13] = (patchBase[13] & 0xffff0000u) | (mi1 & 0xffffu);
     }
 
     // --- write the contact points/penetrations to the contact stream ---
