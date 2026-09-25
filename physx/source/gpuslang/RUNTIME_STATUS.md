@@ -7,7 +7,17 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **878/878** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **879/879** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.87 fixed the PxContactPatch pad bytes in seven writers: the CUDA stores the header field by
+field (materialIndex1 is a PxU16 store, pad never named) into a stream the engine never clears,
+but six ports stored word 13 whole (zeroing pad[0]) and cvxTriFinish also zeroed words 14-15.
+Word 13 is now a single-writer read-modify-write; npCvxFinishContacts keeps its whole-struct
+store, because there the CUDA stores the whole struct.  Every fixture had started from a zeroed
+stream AND expected zero; they now poison per word and compare all 16 words plus stray writes.
+New `gpuslang.cvxCoreTailBda` runs both convexCore emission tails (never run outside scenes
+before) on raw poisoned buffers against a mirror of convexCoreCollision.cu:177-445.  Sweeps
+60/61; the survivor is equivalent (Contact32 keeps numPoints == sum of patch counts), which
+also corrected a wrong claim in the Out32 header.
 P9.83b-8 T6/T7 wired triangleTriangleCollision into the engine (ABI row, manifest 421) and
 scored `sdfmesh`: 56/56 scenes.  The first run was red and the kernel innocent -- the scene's
 cooked box was wound INWARD, so its SDF was positive inside and every contact read +0.025;
@@ -2022,6 +2032,117 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.87 — Pad-Bytes im Patch-Header: sieben Ports schrieben Bytes, die die CUDA stehen lässt
+
+**Der Befund.** `PxContactPatch` (include/PxContact.h:56-134) ist 64 Byte groß; Wort 13 trägt
+materialIndex1 (Bytes 52–53) und pad[0] (Bytes 54–55), die Wörter 14–15 sind pad[1..4].
+Die CUDA-Writer schreiben den Header **Feld für Feld** durch einen Zeiger in den Stream
+(`insertIntoPatchStream`, contactPatchUtils.cuh:161-178; `writeOutput`,
+convexCoreCollision.cu:425-441; `writeCompressedContact`, convexMeshOutput.cu:65-81).
+materialIndex1 ist dort ein PxU16-Store; pad wird nie genannt. Die Engine löscht ihren
+Patch-Stream (mCompressedPatches) nie. Die Bytes 54–63 behalten also, was im Stream stand.
+
+Sechs Ports speicherten Wort 13 ganz und nullten damit pad[0]; `cvxTriFinishBda` schrieb die
+Wörter 12–15 als ein uint4 und nullte zusätzlich die Wörter 14–15:
+
+| Writer | CUDA | Port vorher |
+|---|---|---|
+| pxgSlangNpPatchTail (convexPlane, trimeshPlane) | cuh:171 | Wort 13 ganz |
+| npSphereNphase | cuh:171 | Wort 13 ganz |
+| boxBoxNphase (eigene Inline-Kopie) | cuh:171 | Wort 13 ganz |
+| pxgSlangCvxCoreOut (convexCorePlane, convexCoreConvex) | cuh:171 | Wort 13 ganz |
+| pxgSlangCvxCoreOut32 (convexCoreTrimesh) | cu:434 | Wort 13 ganz |
+| npInsertPatch (Test-Kopie; der Kommentar sagte das Gegenteil) | cuh:171 | Wort 13 ganz |
+| cvxTriFinishBda (convexTrimesh/HF-Finish) | convexMeshOutput.cu:75 | uint4, Wörter 13–15 |
+
+Jetzt ist Wort 13 überall ein Read-Modify-Write, `w13 = (w13 & 0xFFFF0000u) | (mi1 & 0xFFFFu)`,
+und die Wörter 14–15 werden nicht geschrieben. Das RMW ist exakt, weil jeder Slot genau einen
+Schreiber hat (die eigene InterlockedAdd-Reservierung; bei boxBox nur Lane 3, bei Out32 nur
+Lane 0). `check_subword_store.py` meldet die Form nicht (sein RMW-Muster verlangt `& ~(0xFF.. <<`).
+
+**Die Ausnahme ist `npCvxFinishContacts`.** Dort speichert die CUDA den ganzen Header als
+vier uint4 (cudaGJKEPA.cu:2003-2004): Die Wörter 14–15 sind echte Nullen aus
+patchConstants (:1912-1913), und pad[0] kommt aus nie beschriebenem Shared Memory
+(MaterialParams2::pad, :1579). Der Port behält den Ganz-Store mit dokumentierter 0; ein
+Kommentar über der Zeile warnt davor, das Tri-Tri-RMW hier anzuwenden.
+
+**Warum es niemand sah:** Jede Fixture fing mit einem genullten Stream an **und** erwartete 0
+(oder verglich nur die untere Hälfte von Wort 13). „Unberührt“ und „mit 0 beschrieben“ sahen
+gleich aus. Kein Leser liest pad (npContactPrePrep liest cnt2 nie), und keine Szene kann es
+sehen. Es ist also ein reiner Treue-Befund, kein Laufzeitfehler.
+
+**Die Fixtures vergiften jetzt wortweise und vergleichen alle 16 Wörter:**
+
+- `testConvexPlaneNphase`, `testNpInsertPatch`: Gift `0xabcddcba ^ (k·0x00010001)` bzw.
+  POISON pro Wort; Wort 0–3 und 7–15 exakt; npInsertPatch vergleicht jetzt das ganze
+  Stream-Abbild bitweise und hat breite nbContacts-Fälle (0x100–0x3FF) für die PxU8-Kürzung.
+- `testSphereNphase`, `testBoxBoxNphase`: bytevariables Gift `0xCD ^ (k·37)`, Erwartung aus der
+  Host-Kopie; Wörter 0–3 (bisher ungeprüft), 13 und 14–15 exakt; Stray-Check hinter der
+  letzten Reservierung. BoxBox hat ein Paar mit Materialindizes 0x0123/0x1234 (Palette
+  0x1235), damit eine 8-Bit-Maske auf Wort 12/13 sichtbar ist.
+- `testNpCvxTrimeshOut` (cvxTriFinish): Gift pro Wort im Slice, das Orakel bekommt den
+  Vorinhalt als Füllfunktion; Stray-Sweep über den ganzen Slice, auch ohne Reservierung.
+- `testNpCvxFinishContacts`: Kontakt- und Patch-Stream vergiftet; unberührte 64-Byte-Blöcke
+  müssen bitgleich zurückkommen, die Wörter 14–15 erwarten die echte 0 der CUDA.
+
+**Neu: `gpuslang.cvxCoreTailBda`** (cvxCoreTailBda.slang, testCvxCoreTailBda.cpp). Bisher
+lief keiner der beiden Convex-Core-Tails außerhalb der Szenen; npCvxCoreOut ist eine eigene
+Transkription in einen genullten Datensatz. Der neue Shader #includet beide Engine-Tails
+(`cctSingle` → cvxCoreWriteOutput, `cctMulti` → cvxCoreWriteOutput32), rein BDA, mit
+Zählern pro Fall, und vergleicht Patch-Stream, Kontakt-Stream, cmOutputs, beide Flag-Arrays
+und Zähler **ganz** gegen einen Spiegel von convexCoreCollision.cu:177-445. Je 512 Fälle:
+
+- **single:** 336 geschriebene Header, 98 ohne Kontakt; Überläufe Patch 39, Kontakt 47,
+  nur Force 40, Patch+Force 39; 51 Fälle an der Kontaktgrenze Offset+16 mit mehreren Punkten
+  (die CUDA prüft nur **einen** PxContact, :201/:321); 40 exakte Grenzen; 138 geschriebene
+  Header mit Materialindex-Bit 16, 260 mit belegten Bits 8–15; alte Flags bekannt/unbekannt
+  445/67, Touch/kein Touch 135/377.
+- **multi:** 366 geschrieben (347 mit ≥ 2 Patches), 59 ohne Patch; Überläufe 41/44/43/46;
+  51 an der Kontaktgrenze; 48 exakt; Bit 16 157, Bits 8–15 271; 253 Fälle mit Müll in den
+  Zählern **oberhalb** von numPatches (die CUDA liest nur i < numPatches).
+- `materials[k]` und `materials[0x10000 + k]` unterscheiden sich, beide im Puffer: Eine
+  Suche ohne PxU16-Kürzung liest ein anderes, gültiges Material.
+- Die start*-Basen sind Attrappen, verschieden von den Stream-Adressen; das Zählerwort
+  overflowError startet mit Bit 3, das die ORs überleben müssen.
+
+Beide Tails sind bitgleich mit dem Spiegel.
+
+**Sweeps** (erzwungen frisch, SPV_ONLY): **61 Mutanten, 60 getötet:**
+
+| Writer (Suite) | Mutanten | getötet |
+|---|---|---|
+| pxgSlangNpPatchTail (convexPlaneNphase) | 6 | 6 |
+| npInsertPatch | 5 | 5 |
+| npSphereNphase | 4 | 4 |
+| boxBoxNphase | 7 | 7 |
+| cvxTriFinishBda (cvxTriFinish) | 4 | 4 |
+| npCvxFinishContacts (…_engineAbi) | 2 | 2 |
+| pxgSlangCvxCoreOut (cvxCoreTailBda) | 16 | 16 |
+| pxgSlangCvxCoreOut32 (cvxCoreTailBda) | 17 | 16 |
+
+Getötet wurden unter anderem jeweils der alte Ganzwort-Store, ein RMW, das Wort 14 statt 13
+liest (nur das wortweise Gift sieht es), geschriebene Wörter 14–15, fehlendes
+mMassModification, 8-Bit-Masken auf Wort 12/13, die fehlende PxU16-Kürzung vor der Suche
+(beide Tails), und für FinishContacts gerade umgekehrt das Tri-Tri-RMW, das dort falsch wäre.
+
+**Der eine Überlebende ist äquivalent, und der Kommentar, der das Gegenteil sagte, war
+falsch.** `out32-touch-gates-points` lässt die Touch-Änderung an numPoints statt an
+numPatches hängen (cu:374). Der Kopf von Out32 begründete den Unterschied mit „ein Kontakt kann
+Punkte in einem verworfenen Patch halten“. Das stimmt nicht: Contact32 hält mNumPoints gleich der
+Summe der Patchzähler. findCreatePatch öffnet oder setzt einen Patch mit 0 Punkten zurück, und
+dieselbe addPoints-Runde füllt ihn mindestens mit dem tiefsten Punkt (bei Einheitsnormalen
+liegt dessen Lane in sameNormalMask). Die Punkte eines zurückgesetzten Patches werden vorher
+abgezogen (cu:899-900), verworfene Punkte nie addiert. numPatches > 0 und numPoints > 0 sind
+also auf jedem erreichbaren Zustand dasselbe Prädikat. Der Kopf sagt das jetzt; übertragen
+bleibt die CUDA-Schreibweise.
+
+**Suite:** **879/879** in beiden Speichermodi (+1: `cvxCoreTailBda`).
+**Szenen:** **56/56**. Geändert sind nur Shader; die Engine-Writer von Box, Kugel,
+Convex-Ebene, Trimesh-Ebene, Convex-Core (Ebene, Box, Netz, Trimesh, Trog) und
+Convex-Trimesh/HF laufen alle in bewerteten Szenen. Sehen können die Szenen den Befund
+nicht (kein Leser liest pad); sie zeigen, dass das neue Lesen von Wort 13 nichts anderes
+stört.
 
 ## P9.83b-8 T6/T7 — triangleTriangleCollision in der Engine; `sdfmesh` grün, und die Box der Szene war nach innen gewickelt
 
