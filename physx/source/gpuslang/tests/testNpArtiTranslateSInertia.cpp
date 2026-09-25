@@ -46,7 +46,7 @@ struct TsIn { F4 sC0, sC1, sC2, tlC0, tlC1, tlC2, trC0, trC1, trC2, blC0, blC1, 
 struct TsOut { F4 tlC0, tlC1, tlC2, trC0, trC1, trC2, blC0, blC1, blC2; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 struct M3 { float m[3][3]; };  // m[col][row]
 

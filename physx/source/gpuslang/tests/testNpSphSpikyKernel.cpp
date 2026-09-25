@@ -45,7 +45,7 @@ struct SkIn  { F4 in; };
 struct SkOut { F4 out; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static float sqr(float x) { return x * x; }
 static float W(float x, float kSpiky1, float kInvRadius) { return kSpiky1 * sqr(1.0f - x * kInvRadius); }

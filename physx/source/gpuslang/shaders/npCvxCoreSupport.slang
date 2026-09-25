@@ -114,6 +114,16 @@ float3 quatRotInvQ(float4 q, float3 v)
 
 float coreF(SupIn s, uint word) { return asfloat(s.core[word / 4u][word & 3u]); }
 
+// P9.86: `PxVec3(a, 0, 0) + v` (GuConvexSupport.h cylinder/cone localSupport and
+// contactFace rims).  Spelled as that vector add, llvmpipe folds the literal-zero lanes
+// `0 + v.y` / `0 + v.z` to v.y / v.z even under SignedZeroInfNanPreserve (measured), which
+// keeps a -0 the CUDA turns into +0.  The x lane is a real add; the zero lanes are the
+// IEEE `0 + x` spelled as a select.
+float3 ccsAxisPlus(float a, float3 v)
+{
+    return float3(a + v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 float3 supportLocalQ(SupIn s, float3 dir)
 {
     const uint type = s.meta.x;
@@ -132,19 +142,19 @@ float3 supportLocalQ(SupIn s, float3 dir)
     }
     if (type == CORE_ELLIPSOID)
     {
-        // The CUDA form is PxMat33::createDiagonal + transformTranspose/
-        // transform, whose explicit zero terms make the result signed-zero
-        // exact ((rx*dx + 0*dy) + 0*dz: 0*negative = -0, (-0)+(+0) = +0).
-        // That form is UNENFORCEABLE here: slangc/llvmpipe fold the +-0 adds
-        // away (no-signed-zeros), proven live by review-164's fixtures even
-        // with the zero smuggled in as runtime data.  The port therefore
-        // keeps the bare per-component multiply -- identical in every
-        // magnitude bit, differing only in the sign of exact-zero outputs --
-        // the CPU reference carries the true matrix form, and the ellipsoid
-        // compare is zero-sign-insensitive (and ONLY that).
         const float3 radii = float3(coreF(s, 0u), coreF(s, 1u), coreF(s, 2u));
-        const float3 dir1 = getNormalizedQ(float3(radii.x * dir.x, radii.y * dir.y, radii.z * dir.z));
-        return float3(radii.x * dir1.x, radii.y * dir1.y, radii.z * dir1.z);
+        // P9.86: the CUDA's PxMat33::createDiagonal(radii) transformTranspose / transform,
+        // WITH its explicit zero terms: component i is (r_i*v_i + 0*v_j) + 0*v_k
+        // (PxMat33.h L344-353, PxVec3::dot L272-275), so a -0 in v_i gives +0 unless all
+        // three terms are -0.  Every shader is stamped SignedZeroInfNanPreserve, under which
+        // llvmpipe keeps x*0 and x + (computed zero) IEEE (measured, p86SignedZero); slangc
+        // leaves these adds alone because no operand is a literal zero.
+        const float3 dir1 = getNormalizedQ(float3((radii.x * dir.x + 0.0f * dir.y) + 0.0f * dir.z,
+                                                  (0.0f * dir.x + radii.y * dir.y) + 0.0f * dir.z,
+                                                  (0.0f * dir.x + 0.0f * dir.y) + radii.z * dir.z));
+        return float3((radii.x * dir1.x + 0.0f * dir1.y) + 0.0f * dir1.z,
+                      (0.0f * dir1.x + radii.y * dir1.y) + 0.0f * dir1.z,
+                      (0.0f * dir1.x + 0.0f * dir1.y) + radii.z * dir1.z);
     }
     if (type == CORE_CYLINDER)
     {
@@ -153,7 +163,7 @@ float3 supportLocalQ(SupIn s, float3 dir)
         const float3 d = getNormalizedQ(dir);
         const float eps = 1e-5f;
         if (abs(d.y) < eps && abs(d.z) < eps) return float3(pxSign(d.x) * h, r, 0);
-        return float3(pxSign(d.x) * h, 0, 0) + getNormalizedQ(float3(0, d.y, d.z)) * r;
+        return ccsAxisPlus(pxSign(d.x) * h, getNormalizedQ(float3(0, d.y, d.z)) * r);
     }
     if (type == CORE_CONE)
     {
@@ -165,7 +175,7 @@ float3 supportLocalQ(SupIn s, float3 dir)
         const float eps = 1e-5f;
         if (d.x > sinA) return float3(halfH, 0, 0);
         if (abs(d.y) < eps && abs(d.z) < eps) return float3(-halfH, r, 0);
-        return float3(-halfH, 0, 0) + getNormalizedQ(float3(0, d.y, d.z)) * r;
+        return ccsAxisPlus(-halfH, getNormalizedQ(float3(0, d.y, d.z)) * r);
     }
     if (type == CORE_POINTS)
     {

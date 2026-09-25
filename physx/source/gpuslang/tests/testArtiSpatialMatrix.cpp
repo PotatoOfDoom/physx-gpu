@@ -484,10 +484,7 @@ PXG_TEST(artiSpatialMatrix)
             if (bitEq(r[x], g[x]))
                 continue;
             if (signedZeroPair(r[x], g[x]))
-            {
-                ++signedZeros;
-                continue;
-            }
+                ++signedZeros;   // P9.86: no longer tolerated -- counted, and a mismatch
             if (bad < 12)
                 std::printf("MM case %u op %-16s word %zu  ref %.9g (%08x)  gpu %.9g (%08x)\n",
                             i, opName(in[i].op.x), x, r[x], f2u(r[x]), g[x], f2u(g[x]));
@@ -504,7 +501,7 @@ PXG_TEST(artiSpatialMatrix)
                 std::printf("[ info ] op %-16s: %zu/%u cases differ\n", opName(op), perOpBad[op],
                             CASES_PER_OP);
 
-    std::printf("[ info ] smx %u cases x %zu words, +-0 tolerated %zu\n", N, WORDS, signedZeros);
+    std::printf("[ info ] smx %u cases x %zu words, +-0 mismatches %zu\n", N, WORDS, signedZeros);
     PXG_CHECK_MSG(bad == 0, "spatial-matrix algebra bitwise-identical to the engine (mod +-0)");
 
     // A poison word must be exactly what was uploaded: prove the comparison

@@ -551,10 +551,10 @@ public void svxSolveExtContactBlockTGS(
 
         // trap 2: the SYMMETRIC final scale (UnAlignedSpatialVector::scale
         // scales top by the first factor, bottom by the second)
-        impulse0 = asmSVec(imp0.top * (invMass0_1_angDom0_1.x * ref0),
-                           imp0.bottom * (invMass0_1_angDom0_1.z * ref0));
-        impulse1 = asmSVec(imp1.top * (invMass0_1_angDom0_1.y * ref1),
-                           imp1.bottom * (invMass0_1_angDom0_1.w * ref1));
+        impulse0 = asmSVec(asetPlusZero3(imp0.top) * (invMass0_1_angDom0_1.x * ref0),
+                           asetPlusZero3(imp0.bottom) * (invMass0_1_angDom0_1.z * ref0));
+        impulse1 = asmSVec(asetPlusZero3(imp1.top) * (invMass0_1_angDom0_1.y * ref1),
+                           asetPlusZero3(imp1.bottom) * (invMass0_1_angDom0_1.w * ref1));
     }
 }
 
@@ -786,6 +786,17 @@ void svxStoreIo(uint lane, AbSpatialVector vel0, AbSpatialVector vel1,
     f[18] = imp1.top.x; f[19] = imp1.top.y; f[20] = imp1.top.z;
     f[21] = imp1.bottom.x; f[22] = imp1.bottom.y; f[23] = imp1.bottom.z;
     f[24] = err.sumOfSquares; f[25] = float(err.counter); f[26] = err.maxError;
+}
+
+// P9.86: the impulse accumulators start at a literal +0 and only ever += / -= a term;
+// an IEEE chain from +0 never holds -0 (exact cancellation rounds to +0).  llvmpipe
+// unrolls the <= 6-trip loops, forwards the literal seed and rewrites the first
+// `0 - t` to -t and `0 + t` to t, even under SignedZeroInfNanPreserve (measured).
+// The fold only ever changes the sign of a zero, so the finished accumulator is
+// canonicalised (-0 -> +0) before the final scale: bit for bit the engine's value.
+float3 asetPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
 }
 
 [shader("compute")]

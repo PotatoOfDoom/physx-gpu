@@ -46,7 +46,7 @@ struct AtIn  { F4 misc; };
 struct AtOut { F4 res; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static const float FEMCLOTH_PI = 3.14159265358979323846f;
 static const float FEMCLOTH_HALF_PI = 1.57079632679489661923f;

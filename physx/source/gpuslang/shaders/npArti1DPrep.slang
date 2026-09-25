@@ -131,8 +131,17 @@ float3 mulInertiaQ(float4 resp[9], float3 v)
         respAt(resp, 5u, 0u) * v.x + respAt(resp, 5u, 1u) * v.y + respAt(resp, 5u, 2u) * v.z);
 }
 
+// `+0 + x` as the engine's zero-seeded accumulator computes it: x for every x except
+// -0, which IEEE turns into +0 (P9.86).  `result[i] = 0.0f; result[i] += p` reaches
+// SPIR-V as a real store and add, but once llvmpipe unrolls the constant-trip loop and
+// forwards the stored literal, the first add is fadd(+0.0, p) and is folded to p even
+// under SignedZeroInfNanPreserve (measured: a static body's memset response times six
+// negative st gave -0 where the engine gives +0).
+float a1dPlusZero(float x) { return (x == 0.0f) ? 0.0f : x; }
+
 // PxSpatialMatrix::operator* (PxSpatialMatrix.h L57-77): result[i] =
-// sum over j (ascending) of column[j][i] * st[j]
+// sum over j (ascending) of column[j][i] * st[j]; the j = 0 term is the
+// `0.f + column[0][i] * st[0]` seed add, spelled as a1dPlusZero.
 void spatialMulQ(float4 resp[9], float3 vTop, float3 vBot, out float3 oTop, out float3 oBot)
 {
     float st[6];
@@ -141,8 +150,8 @@ void spatialMulQ(float4 resp[9], float3 vTop, float3 vBot, out float3 oTop, out 
     float result[6];
     for (uint i = 0u; i < 6u; ++i)
     {
-        result[i] = 0.0f;
-        for (uint j = 0u; j < 6u; ++j)
+        result[i] = a1dPlusZero(respAt(resp, 0u, i) * st[0]);
+        for (uint j = 1u; j < 6u; ++j)
             result[i] += respAt(resp, j, i) * st[j];
     }
     oTop = float3(result[0], result[1], result[2]);

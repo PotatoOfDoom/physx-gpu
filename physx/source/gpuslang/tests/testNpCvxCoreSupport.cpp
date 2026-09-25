@@ -124,7 +124,9 @@ static V3 supportLocal(const SupIn& s, V3 dir)
         const float eps = 1e-5f;
         if (std::fabs(d.y) < eps && std::fabs(d.z) < eps) return V3{ pxSign(d.x) * h, r, 0 };
         const V3 dr = nrmz(V3{ 0, d.y, d.z });
-        return V3{ pxSign(d.x) * h + dr.x * r, dr.y * r, dr.z * r };
+        // PxVec3(a, 0, 0) + dr * r (GuConvexSupport.h:264): the y/z lanes are 0 + x, which
+        // turns a -0 into +0 (P9.86: the mirror used to drop the `0 +`, as the port did).
+        return V3{ pxSign(d.x) * h + dr.x * r, 0.0f + dr.y * r, 0.0f + dr.z * r };
     }
     if (type == CORE_CONE)
     {
@@ -136,7 +138,7 @@ static V3 supportLocal(const SupIn& s, V3 dir)
         if (d.x > sinA) return V3{ halfH, 0, 0 };
         if (std::fabs(d.y) < eps && std::fabs(d.z) < eps) return V3{ -halfH, r, 0 };
         const V3 dr = nrmz(V3{ 0, d.y, d.z });
-        return V3{ -halfH + dr.x * r, dr.y * r, dr.z * r };
+        return V3{ -halfH + dr.x * r, 0.0f + dr.y * r, 0.0f + dr.z * r };   // :311, as above
     }
     if (type == CORE_POINTS)
     {
@@ -187,12 +189,6 @@ static void refSupport(const SupIn& s, SupOut& o)
 
 static bool eqF4(const F4& a, const F4& b)
 { return f2u(a.x) == f2u(b.x) && f2u(a.y) == f2u(b.y) && f2u(a.z) == f2u(b.z) && f2u(a.w) == f2u(b.w); }
-// ellipsoid only: the reference carries the exact PxMat33 diagonal form whose
-// signed-zero outputs llvmpipe cannot reproduce (NSZ folding) -- every
-// magnitude bit must still match, only the sign of exact zeros is tolerated
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
-static bool eqF4Z(const F4& a, const F4& b)
-{ return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 
 PXG_TEST(npCvxCoreSupport_supportAll)
 {
@@ -315,12 +311,10 @@ PXG_TEST(npCvxCoreSupport_supportAll)
     for (uint32_t i = 0; i < N; ++i)
     {
         const SupOut& r = ref[i]; const SupOut& q = g[i];
-        const bool ell = in[i].meta.x == CORE_ELLIPSOID;
-        const bool okAll = ell
-            ? (eqF4Z(r.supLocal, q.supLocal) && eqF4Z(r.sup, q.sup) &&
-               eqF4Z(r.bmin, q.bmin) && eqF4Z(r.bmax, q.bmax))
-            : (eqF4(r.supLocal, q.supLocal) && eqF4(r.sup, q.sup) &&
-               eqF4(r.bmin, q.bmin) && eqF4(r.bmax, q.bmax));
+        // P9.86: every core compares bitwise, the ellipsoid included -- its PxMat33
+        // diagonal form is kept in the port, and SignedZeroInfNanPreserve keeps it IEEE.
+        const bool okAll = eqF4(r.supLocal, q.supLocal) && eqF4(r.sup, q.sup) &&
+                           eqF4(r.bmin, q.bmin) && eqF4(r.bmax, q.bmax);
         if (!okAll) ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "ccsSupportAll: %zu mismatches", mm);

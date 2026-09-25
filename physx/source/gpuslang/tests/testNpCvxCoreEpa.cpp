@@ -509,7 +509,7 @@ static void refEpa(const EpaTIn& in, EpaTOut& o, RefStats& st)
 }
 
 // bitwise, tolerating only the SIGN of exact zeros (tranche-164 NSZ class)
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 static bool eqF4Z(const F4& a, const F4& b)
 { return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 

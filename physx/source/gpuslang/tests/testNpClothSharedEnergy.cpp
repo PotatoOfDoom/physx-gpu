@@ -53,7 +53,7 @@ struct GsOut { F4 x0, x1, x2, x3, lamMOut, aux; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 const float FEMCLOTH_THRESHOLD = 1.0e-14f;
 const float FEMCLOTH_HALF_PI = 1.57079632679489661923f;

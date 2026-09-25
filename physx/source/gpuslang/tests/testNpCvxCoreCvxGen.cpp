@@ -532,7 +532,7 @@ static void refGjk(const GjkIn& in, GjkOut& o, RefStats& st)
 }
 
 // bitwise, tolerating only the SIGN of exact zeros (tranche-164 NSZ class)
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 static bool eqF4Z(const F4& a, const F4& b)
 { return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 
@@ -1022,7 +1022,7 @@ static void refEpa(const EpaTIn& in, EpaTOut& o, RefStats& st)
 }
 
 // bitwise, tolerating only the SIGN of exact zeros (tranche-164 NSZ class)
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 static bool eqF4Z(const F4& a, const F4& b)
 { return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 
@@ -1911,7 +1911,7 @@ static bool eqF4Bits(const F4& a, const F4& b)
 static bool eqF4Tol(const F4& a, const F4& b)
 { return eqTol(a.x, b.x) && eqTol(a.y, b.y) && eqTol(a.z, b.z) && eqTol(a.w, b.w); }
 
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 
 } // namespace faceref
@@ -1948,7 +1948,7 @@ struct CvxOut
 };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 // Gu::generateContacts(ConvexShape, ConvexShape) (GuConvexSupport.h L1169-1201)
 static void refCvxGen(const CvxIn& s, CvxOut& o)

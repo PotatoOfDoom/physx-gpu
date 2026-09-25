@@ -45,7 +45,7 @@ struct DlIn  { F4 d0, d1, d2, d3, mi, scal, damp; };
 struct DlOut { F4 res; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static const float FEMCLOTH_THRESHOLD = 1.0e-14f;
 static float magSq2(const F4& v) { return v.x * v.x + v.y * v.y; }

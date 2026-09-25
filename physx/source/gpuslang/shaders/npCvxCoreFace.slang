@@ -168,6 +168,16 @@ bool rotatePointsQ(float3 center, float3 refp, float3 normal, inout float3 pts[4
     return true;
 }
 
+// P9.86: `PxVec3(a, 0, 0) + v` (GuConvexSupport.h cylinder/cone localSupport and
+// contactFace rims).  Spelled as that vector add, llvmpipe folds the literal-zero lanes
+// `0 + v.y` / `0 + v.z` to v.y / v.z even under SignedZeroInfNanPreserve (measured), which
+// keeps a -0 the CUDA turns into +0.  The x lane is a real add; the zero lanes are the
+// IEEE `0 + x` spelled as a select.
+float3 ccfAxisPlus(float a, float3 v)
+{
+    return float3(a + v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void ccfContactFace(uint3 dtid : SV_DispatchThreadID)
@@ -286,8 +296,8 @@ void ccfContactFace(uint3 dtid : SV_DispatchThreadID)
         {
             const float3 dr = getNormalizedQ(float3(0, d.y, d.z));
             faceNormal = dr;
-            fp[0] = float3(height * 0.5f, 0, 0) + dr * radius;
-            fp[1] = float3(-height * 0.5f, 0, 0) + dr * radius;
+            fp[0] = ccfAxisPlus(height * 0.5f, dr * radius);
+            fp[1] = ccfAxisPlus(-height * 0.5f, dr * radius);
             numPoints = 2u;
         }
     }
@@ -317,7 +327,7 @@ void ccfContactFace(uint3 dtid : SV_DispatchThreadID)
                     const float3 dr = getNormalizedQ(float3(0, d.y, d.z));
                     faceNormal = getNormalizedQ(float3(radius / height, dr.y, dr.z));
                     fp[0] = float3(height * 0.5f, 0, 0);
-                    fp[1] = float3(-height * 0.5f, 0, 0) + dr * radius;
+                    fp[1] = ccfAxisPlus(-height * 0.5f, dr * radius);
                     numPoints = 2u;
                 }
             }

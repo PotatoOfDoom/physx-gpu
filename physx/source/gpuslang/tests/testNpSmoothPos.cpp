@@ -46,7 +46,7 @@ struct SpIn  { F4 xi, xs, params; };
 struct SpOut { F4 pos; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static float cube(float x) { return x * x * x; }
 static float Wa(float x, float invr) { return 1.0f - cube(x * invr); }

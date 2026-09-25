@@ -49,7 +49,7 @@ struct GlOut { F4 denseLoc; F4 sparseLoc; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static const int MAX_SPARSEGRID_DIM = 1024;
 static const int MIN_SPARSEGRID_ID = -512;

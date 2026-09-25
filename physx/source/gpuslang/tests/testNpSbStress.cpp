@@ -48,7 +48,7 @@ struct StIn  { F4 p0, p1, p2, p3, qc0, qc1, qc2, quat, mat; };
 struct StOut { F4 s0, s1, s2, aux; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 struct V3 { float x, y, z; };
 static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }

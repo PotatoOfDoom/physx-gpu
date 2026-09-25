@@ -615,7 +615,7 @@ static bool eqF4Bits(const F4& a, const F4& b)
 static bool eqF4Tol(const F4& a, const F4& b)
 { return eqTol(a.x, b.x) && eqTol(a.y, b.y) && eqTol(a.z, b.z) && eqTol(a.w, b.w); }
 
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 // Gu::generateContacts(PxPlane, ConvexShape) (GuConvexSupport.cpp L41-75)
 static void refPlaneGen(const PgIn& s, PgOut& o)

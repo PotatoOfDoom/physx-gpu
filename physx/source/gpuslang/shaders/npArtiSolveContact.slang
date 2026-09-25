@@ -138,6 +138,17 @@ void computeContactCoefficients(uint flags, float restitution, float unitRespons
     }
 }
 
+// P9.86: the impulse accumulators start at a literal +0 and only ever += / -= a term;
+// an IEEE chain from +0 never holds -0 (exact cancellation rounds to +0).  llvmpipe
+// unrolls the <= 6-trip loops, forwards the literal seed and rewrites the first
+// `0 - t` to -t and `0 + t` to t, even under SignedZeroInfNanPreserve (measured).
+// The fold only ever changes the sign of a zero, so the finished accumulator is
+// canonicalised (-0 -> +0) before the final scale: bit for bit the engine's value.
+float3 ascPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void asCtPGS(uint3 dtid : SV_DispatchThreadID)
@@ -307,10 +318,10 @@ void asCtPGS(uint3 dtid : SV_DispatchThreadID)
 
     // final impulse stores (cu L315-316): scale(l,a) = (top*l, bottom*a).
     // ASYMMETRIC lane pairing: body0 (angDom0, invMass0), body1 (invMass1, angDom1).
-    o.imp0 = float4(imp0Top * (ref0 * angDom0), 0.0f);
-    o.imp0b = float4(imp0Bot * (ref0 * invMass0), 0.0f);
-    o.imp1 = float4(imp1Top * (ref1 * invMass1), 0.0f);
-    o.imp1b = float4(imp1Bot * (ref1 * angDom1), 0.0f);
+    o.imp0 = float4(ascPlusZero3(imp0Top) * (ref0 * angDom0), 0.0f);
+    o.imp0b = float4(ascPlusZero3(imp0Bot) * (ref0 * invMass0), 0.0f);
+    o.imp1 = float4(ascPlusZero3(imp1Top) * (ref1 * invMass1), 0.0f);
+    o.imp1b = float4(ascPlusZero3(imp1Bot) * (ref1 * angDom1), 0.0f);
 
     o.vel0Top = float4(v0Top, 0.0f);
     o.vel0Bot = float4(v0Bot, 0.0f);

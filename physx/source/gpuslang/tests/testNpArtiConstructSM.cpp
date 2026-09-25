@@ -47,7 +47,7 @@ struct CsIn { F4 isTop, isBot, stiTop, stiBot; };
 struct CsOut { F4 tlC0, tlC1, tlC2, trC0, trC1, trC2, blC0, blC1, blC2; };
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 
 static F4 scale(const F4& v, float s) { return F4{ v.x * s, v.y * s, v.z * s, 0.f }; }
 

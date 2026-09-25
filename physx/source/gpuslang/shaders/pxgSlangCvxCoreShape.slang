@@ -230,6 +230,16 @@ public float3 ptsAt(PtsRef p, uint i, uint stride)
 }
 
 // tranche-164 ConvexShape::supportLocal, margin-less, all seven types
+// P9.86: `PxVec3(a, 0, 0) + v` (GuConvexSupport.h cylinder/cone localSupport and
+// contactFace rims).  Spelled as that vector add, llvmpipe folds the literal-zero lanes
+// `0 + v.y` / `0 + v.z` to v.y / v.z even under SignedZeroInfNanPreserve (measured), which
+// keeps a -0 the CUDA turns into +0.  The x lane is a real add; the zero lanes are the
+// IEEE `0 + x` spelled as a select.
+float3 ccshAxisPlus(float a, float3 v)
+{
+    return float3(a + v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 public float3 supportLocalQ(ShapeRef s, PtsRef pts, float3 dir)
 {
     const uint type = s.type;
@@ -248,8 +258,18 @@ public float3 supportLocalQ(ShapeRef s, PtsRef pts, float3 dir)
     if (type == CORE_ELLIPSOID)
     {
         const float3 radii = float3(asfloat(s.core[0].x), asfloat(s.core[0].y), asfloat(s.core[0].z));
-        const float3 dir1 = getNormalizedQ(float3(radii.x * dir.x, radii.y * dir.y, radii.z * dir.z));
-        return float3(radii.x * dir1.x, radii.y * dir1.y, radii.z * dir1.z);
+        // P9.86: the CUDA's PxMat33::createDiagonal(radii) transformTranspose / transform,
+        // WITH its explicit zero terms: component i is (r_i*v_i + 0*v_j) + 0*v_k
+        // (PxMat33.h L344-353, PxVec3::dot L272-275), so a -0 in v_i gives +0 unless all
+        // three terms are -0.  Every shader is stamped SignedZeroInfNanPreserve, under which
+        // llvmpipe keeps x*0 and x + (computed zero) IEEE (measured, p86SignedZero); slangc
+        // leaves these adds alone because no operand is a literal zero.
+        const float3 dir1 = getNormalizedQ(float3((radii.x * dir.x + 0.0f * dir.y) + 0.0f * dir.z,
+                                                  (0.0f * dir.x + radii.y * dir.y) + 0.0f * dir.z,
+                                                  (0.0f * dir.x + 0.0f * dir.y) + radii.z * dir.z));
+        return float3((radii.x * dir1.x + 0.0f * dir1.y) + 0.0f * dir1.z,
+                      (0.0f * dir1.x + radii.y * dir1.y) + 0.0f * dir1.z,
+                      (0.0f * dir1.x + 0.0f * dir1.y) + radii.z * dir1.z);
     }
     if (type == CORE_CYLINDER)
     {
@@ -258,7 +278,7 @@ public float3 supportLocalQ(ShapeRef s, PtsRef pts, float3 dir)
         const float3 d = getNormalizedQ(dir);
         const float eps = 1e-5f;
         if (abs(d.y) < eps && abs(d.z) < eps) return float3(pxSign(d.x) * h, r, 0);
-        return float3(pxSign(d.x) * h, 0, 0) + getNormalizedQ(float3(0, d.y, d.z)) * r;
+        return ccshAxisPlus(pxSign(d.x) * h, getNormalizedQ(float3(0, d.y, d.z)) * r);
     }
     if (type == CORE_CONE)
     {
@@ -270,7 +290,7 @@ public float3 supportLocalQ(ShapeRef s, PtsRef pts, float3 dir)
         const float eps = 1e-5f;
         if (d.x > sinA) return float3(halfH, 0, 0);
         if (abs(d.y) < eps && abs(d.z) < eps) return float3(-halfH, r, 0);
-        return float3(-halfH, 0, 0) + getNormalizedQ(float3(0, d.y, d.z)) * r;
+        return ccshAxisPlus(-halfH, getNormalizedQ(float3(0, d.y, d.z)) * r);
     }
     if (type == CORE_POINTS)
     {
@@ -529,8 +549,8 @@ public uint contactFaceQ(ShapeRef sh, PtsRef pts, float3 dir, float3 refLocal,
         {
             const float3 dr = getNormalizedQ(float3(0, d.y, d.z));
             faceNormal = dr;
-            fp[0] = float3(height * 0.5f, 0, 0) + dr * radius;
-            fp[1] = float3(-height * 0.5f, 0, 0) + dr * radius;
+            fp[0] = ccshAxisPlus(height * 0.5f, dr * radius);
+            fp[1] = ccshAxisPlus(-height * 0.5f, dr * radius);
             numPoints = 2u;
         }
     }
@@ -560,7 +580,7 @@ public uint contactFaceQ(ShapeRef sh, PtsRef pts, float3 dir, float3 refLocal,
                     const float3 dr = getNormalizedQ(float3(0, d.y, d.z));
                     faceNormal = getNormalizedQ(float3(radius / height, dr.y, dr.z));
                     fp[0] = float3(height * 0.5f, 0, 0);
-                    fp[1] = float3(-height * 0.5f, 0, 0) + dr * radius;
+                    fp[1] = ccshAxisPlus(-height * 0.5f, dr * radius);
                     numPoints = 2u;
                 }
             }

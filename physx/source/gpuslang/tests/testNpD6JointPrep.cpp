@@ -106,7 +106,7 @@ static bool eqTol(float a, float b)
     const float diff = std::fabs(a - b);
     return diff <= 2e-3f + 1e-3f * std::fmax(std::fabs(a), std::fabs(b));
 }
-static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 static bool eqF4FZ(const F4& a, const F4& b)
 { return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 
