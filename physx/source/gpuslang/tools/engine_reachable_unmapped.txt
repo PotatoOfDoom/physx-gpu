@@ -63,7 +63,9 @@ evaluatePointDistancesSDFBatch
 # sphereTrimeshNarrowphase -- MAPPED in P9.66b (sphereTriNpBda.spv).  It was the
 # only unmapped kernel in testSDKSphereTriMeshSATGpu's chain, and it carried two
 # ordinary geometry pairs: sphere-vs-mesh and capsule-vs-mesh.
-triangleTriangleCollision
+# triangleTriangleCollision -- MAPPED in P9.83b-8 (triTriCollisionBda.spv), the SDF
+# mesh-mesh contact generator, driven by PXG_SCENE=sdfmesh (the raised shelf and the
+# two stacked SDF boxes, which reach both SDF arms and both passes).
 # trimeshHeightfieldNarrowphase -- STAYS ON THIS RATCHET, and NOT because it is work.
 # It is UNREACHABLE, and this is a FIFTH kind of deadness, distinct from the four
 # already on record (commented-out caller; never-constructed owner; #if 0 body; a

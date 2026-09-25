@@ -22,6 +22,9 @@ solverTGS:solveWholeIslandTGS    31744
 # (convexMeshMidphase.cu:972-1231), taken from a probe that computes nothing --
 # npTriTriSharedProbe.slang -- because the answer decides whether that kernel can
 # be ONE entry point at all, and it was needed before the kernel was written.
+# The probe was DELETED in P9.83b-8 T6, once the kernel measured itself (31116,
+# at the end of this block); it is in git history (f2f5919 and earlier), and the
+# notes below keep its numbers as the record of how the budget was found.
 #
 # P9.83b-pre PROJECTED 34816 and called the kernel blocked.  P9.83b-2 argued the
 # blocker dissolves once the reduction is serial, because the warp-emulated
@@ -102,7 +105,7 @@ solverTGS:solveWholeIslandTGS    31744
 # :1202 by threadBlockCountAndBroadcast writing countersS (:583-584, no leading
 # barrier).  Only the port's ballot emulation, itself a workgroup barrier, would
 # order them.  The byte count stands; an extra barrier at :1198/:1202 would make it
-# valid.  See npTriTriSharedProbe.slang.
+# valid.  See npTriTriSharedProbe.slang (git history, before P9.83b-8 T6).
 #
 # P9.83b-5 (12/n): THE PACKING ANSWER WAS BUILT, AND IT IS ALSO OVER.
 # Adding 1536 + 512 + 128 off three separate measurements is not a measurement, so
@@ -124,15 +127,14 @@ solverTGS:solveWholeIslandTGS    31744
 # scratch.  About 31228 bytes by arithmetic -- NOT measured; that is 15a/n.
 #
 # Both over-limit entry points were deleted, same as the wide-stage one.
-npTriTriSharedProbe:triTriSharedProbe    30300
-npTriTriSharedProbe:triTriSharedProbeNarrowStage    30812
+# (Measured then: triTriSharedProbe 30300, triTriSharedProbeNarrowStage 30812.)
 # P9.83b-5 (15a/n): the fourth reclamation, BUILT -- tempPointsS, the one-warp
 # stage and the per-warp reduce masks inside the 8192-byte triangleIndicesS, which
 # is dead for the whole of tryToAssign/createNewPatches (written :1073/:1078, read
 # :1082-1083).  Everything else is the WarpEmu layout of 11/n, warp scratch and the
 # scan's own perWarpCountS included.  Fits with 1540 spare; the write tail and any
 # shape staging would take up to ~950 of that -- measured on the real entry later.
-npTriTriSharedProbe:triTriSharedProbeAliased    31228
+# (Measured then: triTriSharedProbeAliased 31228.)
 # P9.83b-5 (15/n): the FIXTURE entry for tryToAssign/createNewPatches -- the real
 # assignment storage (patches in Workgroup storage, the scratch in the 8192-byte
 # alias, the warp scratch, countersS/shMinSepS, anyKeepS) plus one guard record.

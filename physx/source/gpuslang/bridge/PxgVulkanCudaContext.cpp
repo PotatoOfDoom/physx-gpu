@@ -473,7 +473,71 @@ public:
         if (res != PxgResult::Success)
             traceRefusal("sized", id, uint32_t(blob.size()));
         traceLaunch("sized", id, res == PxgResult::Success, gridDimX, gridDimY, gridDimZ);
+        if (res == PxgResult::Success)
+            dumpArgs(id, blob);
         return record(res);
+    }
+
+    // PXG_DUMP_ARGS=<kernel>:<blobOffset>[>inner]:<bytes>[:<blobOffset>[>inner]:<bytes>...]
+    // After every launch of <kernel>, reads <bytes> from the device pointer stored at
+    // <blobOffset> of its push blob and prints them as 32-bit words on stderr; with
+    // `>inner` it first follows the 64-bit pointer stored `inner` bytes into that
+    // buffer (one level, e.g. a shape record's mesh pointer).  A
+    // bring-up probe for the case the launch trace cannot separate: a kernel that
+    // RUNS and whose effect does not arrive.  memcpyDtoH drains the queue first
+    // (P3 serialises on one queue), so the words are what the dispatch wrote.
+    // P9.83b-8 T7 added it for triangleTriangleCollision in PXG_SCENE=sdfmesh.
+    void dumpArgs(PxgKernelId id, const std::vector<uint8_t>& blob)
+    {
+        static const char* spec = std::getenv("PXG_DUMP_ARGS");
+        if (!spec || id >= mManifestCount || !mManifest[id].cudaName)
+            return;
+        const char* name = mManifest[id].cudaName;
+        const char* colon = std::strchr(spec, ':');
+        if (!colon || std::strlen(name) != size_t(colon - spec) || std::strncmp(spec, name, size_t(colon - spec)) != 0)
+            return;
+        const char* p = colon + 1;
+        while (*p)
+        {
+            char* end = nullptr;
+            const unsigned long off = std::strtoul(p, &end, 10);
+            if (end == p)
+                return;
+            long inner = -1;
+            if (*end == '>')
+            {
+                const char* q = end + 1;
+                inner = long(std::strtoul(q, &end, 10));
+                if (end == q)
+                    return;
+            }
+            if (*end != ':')
+                return;
+            p = end + 1;
+            const unsigned long bytes = std::strtoul(p, &end, 10);
+            if (end == p)
+                return;
+            p = (*end == ':') ? end + 1 : end;
+            if (off + 8u > blob.size() || bytes == 0u || bytes > 4096u)
+                continue;
+            uint64_t addr = 0;
+            std::memcpy(&addr, blob.data() + off, 8);
+            if (inner >= 0 && addr)
+            {
+                uint64_t next = 0;
+                if (mShim->memcpyDtoH(&next, PxgDevicePtr(addr + uint64_t(inner)), 8) != PxgResult::Success)
+                    next = 0;
+                addr = next;
+            }
+            std::vector<uint32_t> w((bytes + 3u) / 4u, 0u);
+            const PxgResult r = addr ? mShim->memcpyDtoH(w.data(), PxgDevicePtr(addr), bytes) : PxgResult::InvalidValue;
+            std::fprintf(stderr, "[pxg-dump] %s @%lu addr=0x%llx%s:", name, off, (unsigned long long)addr,
+                         r == PxgResult::Success ? "" : " (unreadable)");
+            if (r == PxgResult::Success)
+                for (size_t i = 0; i < w.size(); ++i)
+                    std::fprintf(stderr, " %08x", w[i]);
+            std::fprintf(stderr, "\n");
+        }
     }
     PxCUresult launchKernel(CUfunction f, PxU32 gridDimX, PxU32 gridDimY, PxU32 gridDimZ,
                             PxU32 /*blockDimX*/, PxU32 /*blockDimY*/, PxU32 /*blockDimZ*/, PxU32 /*sharedMemBytes*/,

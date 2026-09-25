@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 420;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 421;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -97,7 +97,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sphereHeightfieldNarrowphase", "sphereHfNpBda.spv", "sphereHeightfieldNarrowphase" },  // SPHERE_HEIGHTFIELD_CORE (P9.52b-6)
     { "trimeshPlaneNarrowphase", "triPlaneNpBda.spv", "trimeshPlaneNarrowphase" },  // TRIMESH_PLANE_CORE (P9.82)  // TRIMESH_PLANE_CORE (unmapped)
     { "trimeshHeightfieldNarrowphase", nullptr, nullptr },  // TRIMESH_HEIGHTFIELD_CORE (unmapped)
-    { "triangleTriangleCollision", nullptr, nullptr },  // TRIMESH_TRIMESH_CORE (unmapped)
+    { "triangleTriangleCollision", "triTriCollisionBda.spv", "triangleTriangleCollision" },  // TRIMESH_TRIMESH_CORE (P9.83b-8)
     { "triangleTriangleOverlaps", "triTriOverlapBda.spv", "triangleTriangleOverlaps" },  // TRIMESH_TRIMESH_OVERLAP (P9.83)
     { "evaluatePointDistancesSDFBatch", nullptr, nullptr },  // EVALUATE_POINT_DISTANCES_SDF (unmapped)
     { "updateFrictionPatches", "npCompressContacts.spv", "updateFrictionPatches" },  // UPDATE_FRICTION_PATCHES

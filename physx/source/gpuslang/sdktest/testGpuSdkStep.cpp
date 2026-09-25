@@ -301,13 +301,19 @@ PxTriangleMesh* cookSdfBox(PxPhysics* physics, float h)
         PxVec3(-h, -h, -h), PxVec3( h, -h, -h), PxVec3( h, -h,  h), PxVec3(-h, -h,  h),
         PxVec3(-h,  h, -h), PxVec3( h,  h, -h), PxVec3( h,  h,  h), PxVec3(-h,  h,  h)
     };
+    // WOUND OUTWARD: (v1 - v0) x (v2 - v0) points out of the box.  The first
+    // version had every face the other way round (its -y face's normal was +y)
+    // while this comment already said "outward"; the cooker's winding-number sign
+    // then made the whole interior POSITIVE (+0.475 at the centre), which only the
+    // mesh-mesh kernel reads -- the plane kernel uses the triangles -- so nothing
+    // failed until P9.83b-8 T7 mapped it.  The sign is now checked after cooking.
     const PxU32 t[36] = {
-        0, 2, 1,  0, 3, 2,      // -y
-        4, 5, 6,  4, 6, 7,      // +y
-        0, 1, 5,  0, 5, 4,      // -z
-        3, 7, 6,  3, 6, 2,      // +z
-        0, 4, 7,  0, 7, 3,      // -x
-        1, 2, 6,  1, 6, 5       // +x
+        0, 1, 2,  0, 2, 3,      // -y
+        4, 6, 5,  4, 7, 6,      // +y
+        0, 5, 1,  0, 4, 5,      // -z
+        3, 6, 7,  3, 2, 6,      // +z
+        0, 7, 4,  0, 3, 7,      // -x
+        1, 6, 2,  1, 5, 6       // +x
     };
     PxTriangleMeshDesc md;
     md.points.count = 8; md.points.stride = sizeof(PxVec3); md.points.data = v;
@@ -351,6 +357,20 @@ void buildSdfMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     sdfBox->getSDFDimensions(sdx, sdy, sdz);
     std::printf("  sdfmesh: cooked a 12-triangle box with an SDF (dims %u x %u x %u)\n",
                 sdx, sdy, sdz);
+    // The SIGN of the field, checked: the texel nearest the box centre must be
+    // inside, i.e. negative.  P9.83b-8 T7 found this box wound INWARD, and the
+    // winding-number cooker then gave the interior a positive field whose minimum
+    // sat half a cell outside every face -- every triangle-triangle contact read
+    // separation +0.025 however deep the box sank, and the boxes sank through.
+    {
+        const PxReal centre = sdfBox->getSDF()[(size_t(sdz / 2) * sdy + sdy / 2) * sdx + sdx / 2];
+        std::printf("  sdfmesh: SDF at the centre texel %.4f (must be negative)\n", centre);
+        if (!(centre < 0.0f))
+        {
+            std::printf("FAIL: the cooked SDF is not negative inside the box -- the mesh is wound inward\n");
+            return;
+        }
+    }
 
     // ---- the static PLANE, for body A ------------------------------------------------
     PxRigidStatic* plane = physics->createRigidStatic(
@@ -9350,6 +9370,12 @@ int main()
     std::vector<float> yAfterOne(targets.size());
     for (size_t t = 0; t < targets.size(); ++t) yAfterOne[t] = targets[t].startY;
     std::printf("  stepping the GPU scene '%s' (%d x %.4fs)...\n", sceneName, steps, dt);
+    // PXG_REST_TRACE=<n>: every n-th step, each rest target's height and vertical
+    // velocity.  A final height hides the trajectory: a box that rests on a shelf for
+    // fifty steps and then sinks through it ends exactly where one that never touched
+    // the shelf does (P9.83b-8 T7, PXG_SCENE=sdfmesh).
+    const char* restTraceEnv = std::getenv("PXG_REST_TRACE");
+    const int restTraceEvery = restTraceEnv ? std::atoi(restTraceEnv) : 0;
     for (int i = 0; i < steps; ++i)
     {
         scene->simulate(dt);
@@ -9357,6 +9383,14 @@ int main()
         if (i == 0)
             for (size_t t = 0; t < targets.size(); ++t)
                 yAfterOne[t] = targets[t].body->getGlobalPose().p.y;
+        if (restTraceEvery > 0 && i % restTraceEvery == 0)
+        {
+            std::printf("  rest-trace step %3d:", i);
+            for (size_t t = 0; t < targets.size(); ++t)
+                std::printf("  %s y=%.4f vy=%.4f", targets[t].label, targets[t].body->getGlobalPose().p.y,
+                            targets[t].body->getLinearVelocity().y);
+            std::printf("\n");
+        }
     }
 
     // Per-body rest checks: began falling, reached its resting band (restY within a

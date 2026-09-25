@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **878/878** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.83b-8 T6/T7 wired triangleTriangleCollision into the engine (ABI row, manifest 421) and
+scored `sdfmesh`: 56/56 scenes.  The first run was red and the kernel innocent -- the scene's
+cooked box was wound INWARD, so its SDF was positive inside and every contact read +0.025;
+found with two new probes, PXG_DUMP_ARGS (bridge) and PXG_REST_TRACE (scene harness).
 P9.83b-8 (4/n) added `gpuslang.npTriTriKernel`: triangleTriangleCollision itself
 (triTriCollisionBda.slang, 31116 Workgroup bytes), bitwise against a HOST REPLAY of the kernel
 over the certified mirrors, with the two texture values measured by certified probes on
@@ -161,18 +165,20 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **420/501** kernels mapped (P9.82 the rigid trimesh-vs-PLANE narrowphase,
-P9.83a the mesh-vs-mesh OVERLAP marking kernel -- two thirds of the trimesh trio).
-Of the 81 unmapped, **12 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **421/501** kernels mapped (P9.82 the rigid trimesh-vs-PLANE narrowphase,
+P9.83a the mesh-vs-mesh OVERLAP marking kernel, P9.83b-8 the mesh-vs-mesh CONTACT
+generator -- the whole trimesh trio).
+Of the 80 unmapped, **11 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
-are orphans — so "420/501" understates coverage of what this build can actually run.
+are orphans — so "421/501" understates coverage of what this build can actually run.
 (These three figures had drifted: P9.79 moved the manifest to 415 and the reachable
 count to 17 in its own paragraph but left this block saying 412 and 20, and the scene
 line said 50 after `directapi` had made it 51.  A counter block nobody reconciles is a
 counter block nobody can quote, so P9.80 reconciled all four against a measurement --
 `ctest`, `check_manifest`, `check_unmapped_reachability` and `run_scenes.sh` -- rather
 than against the previous paragraph.)
-Scenes: **55/55** -- P9.81 scored the softbody FLOOR MATRIX (mesh, convexcore,
+Scenes: **56/56** -- P9.83b-8 T7 scored `sdfmesh` (the SDF mesh-mesh pair; its box had been
+wound inward, see there), P9.81 scored the softbody FLOOR MATRIX (mesh, convexcore,
 heightfield) that the sweep had been running one arm of, P9.80 added `particlerigid` and
 P9.76 added `particleattach`, the first scene in this tree that
 reaches the particle-vs-rigid ATTACHMENT chain at all; it carries its own control (one
@@ -2016,6 +2022,75 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.83b-8 T6/T7 — triangleTriangleCollision in der Engine; `sdfmesh` grün, und die Box der Szene war nach innen gewickelt
+
+**Verdrahtung (T6):**
+
+- ABI-Zeile `kTriTriCore` = { 4, 8 × 15, 4, 4, 4, 4 } → 144 Byte, direkt nach
+  `kTriTriOverlap`, und registriert.
+- Manifest-Zeile `triangleTriangleCollision` → `triTriCollisionBda.spv`, per Hand;
+  **421/501** gemappt.
+- Die Ratchet `engine_reachable_unmapped.txt` hat den Eintrag durch eine MAPPED-Notiz
+  ersetzt; **11** Engine-erreichbare Kernel sind noch offen.
+- `shimBindless_classify` erwartet jetzt **4** Kernel, die das SDF-Set 1 abtasten.
+- Der Speicher-Probe `npTriTriSharedProbe` aus P9.83b-4 ist gelöscht: Der Kernel misst sich
+  jetzt selbst (31 116 Byte). Die Notizen in groupshared_known und im Block-Modul verweisen
+  mit ihren Zahlen auf die Git-Historie.
+- `launchAbiPack` hat die neue Zeile gegen die Host-Parameterliste
+  (PxgNarrowphaseCore.cpp:1424-1446) geprüft; `pushBlock` ist grün.
+
+**Die erste Messung war rot, und der Kernel war unschuldig.** Nach der Verdrahtung startete
+der Kernel 145-mal, die Warnzeile „SKIPPED“ war weg, aber die Körper auf dem Regal und oben
+auf dem Stapel fielen durch. Zwei neue Werkzeuge haben das aufgelöst:
+
+- **`PXG_DUMP_ARGS`** (Bridge): Nach jedem Start eines benannten Kernels liest es Puffer an
+  Zeigern aus dem Push-Blob zurück, optional über einen weiteren Zeiger. Damit waren Datensatz
+  (1 Patch, 6 Kontakte, eHAS_TOUCH), Zähler, Patch- und Kontakt-Stream sowie der Mesh-Blob
+  der Box in der Engine direkt lesbar.
+- **`PXG_REST_TRACE=<n>`** (Szenen-Harness): Höhe und Vertikalgeschwindigkeit jedes
+  Zielkörpers alle n Schritte.
+
+Die Spur zeigte:
+
+- Körper B wird bei y = 2,52 gefangen, **sinkt dann gleichmäßig mit etwa 0,9 m/s** ein und
+  fällt durch.
+- Der obere Stapelkörper prallt zuerst korrekt ab und sinkt dann genauso.
+- Die Kontakte hatten die richtige Normale (0,1,0) und lagen auf der Regaloberfläche. Die
+  Separation blieb aber **konstant +0,025**, auch 0,2 tief im Körper.
+
+Der Mesh-Blob in der Engine war korrekt: dichtes SDF 24³, Ursprung −0,6, Abstand 0,05,
+Textur-Handle 1. Falsch war das Feld selbst. **Die gekochte Box der Szene war nach innen
+gewickelt** (die −y-Fläche hatte die Normale +y), obwohl der Kommentar „wound outward“ sagte.
+Der Winding-Number-Kocher machte das Innere deshalb **positiv** (+0,475 in der Mitte). Das
+Minimum eines solchen Feldes liegt eine halbe Zelle außerhalb jeder Fläche, also bei 0,025.
+Genau das meldete jeder Kontakt, egal wie tief die Box steckte; der Löser sah immer eine
+Lücke und ließ die Box sie Schritt für Schritt schließen.
+
+Bemerkt hatte das niemand, weil der Ebenen-Kernel die Dreiecke liest und nicht das SDF.
+`sdfmesh` war damit die **erste Szene, die überhaupt ein gekochtes SDF in der Engine
+abtastet**.
+
+Die Box ist jetzt nach außen gewickelt. Die Szene prüft nach dem Kochen das Vorzeichen in der
+Mitte und bricht mit Begründung ab, wenn es nicht negativ ist.
+
+**Grüne Messung:**
+
+| Körper | Ruhehöhe (Soll) | vorher |
+|---|---|---|
+| sdfBoxOnPlane | 0,5000 (0,5) | 0,5000 |
+| sdfBoxOnMesh | **2,5000** (2,5) | 0,5000, durchgefallen |
+| sdfBoxStackBottom | 0,5000 (0,5) | 0,5000 |
+| sdfBoxStackTop | **1,5054** (1,5) | 0,5000, durchgefallen |
+
+Damit sind beide SDF-Arme des Kernels in der Engine bestätigt: Regal ohne SDF (Floor-Zweig,
+nur Pass 0) und zwei SDF-Boxen (beide Pässe).
+
+**`sdfmesh` ist in die bewertete Szenenliste gewandert** (run_scenes.sh), mit der roten
+Messung als Kommentar.
+
+**Suite:** 878/878 in beiden Speichermodi.
+**Szenen:** **56/56** (+1: `sdfmesh`).
 
 ## P9.83b-8 (4/n) — der Kernel triangleTriangleCollision selbst, gegen eine Wiederholung auf dem Host
 

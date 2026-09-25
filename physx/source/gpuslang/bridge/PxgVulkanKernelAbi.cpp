@@ -765,6 +765,21 @@ static const uint8_t kTriPlaneCore[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
 // to say so, or `overlaps` would land on the output array.
 static const uint8_t kTriTriOverlap[] = { 4, 8, 8, 8, 8, 8, 8 };
 
+// gpunarrowphase mesh-vs-mesh CONTACT GENERATION (P9.83b-8):
+//   triangleTriangleCollision(PxU32 numWorkItems, cmInputs*, transformCache*,
+//   contactDistances*, gpuShapes*, cmOutputs*, PxU8* overlaps, materials*,
+//   contactStream*, patchStream*, patchAndContactCounters*, touchChangeFlags*,
+//   patchChangeFlags*, startContactPatches*, startContactPoints*,
+//   startContactForces*, PxU32 patchBytesLimit, PxU32 contactBytesLimit,
+//   PxU32 forceBytesLimit, PxReal clusterBias)
+//   (convexMeshMidphase.cu:1290-1311; launch PxgNarrowphaseCore.cpp:1424-1446,
+//   numTests blocks of 1024 threads).
+// numWorkItems is realigned to @8 by the first pointer, so the blob is 4 + 4 pad +
+// 15 x 8 + 3 x 4 + 4 = 144 bytes -- triTriCollisionBda.slang TriTriCollisionParams.
+// The host passes touchLostFlags / touchFoundFlags in the two flag slots; the
+// names differ, the positions do not.
+static const uint8_t kTriTriCore[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
+
 // gpunarrowphase softbody-vs-HEIGHTFIELD midphase (P8.11 step 1):
 //   sb_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems, PxReal toleranceLength,
 //   cmInputs*, transformCache*, contactDistance*, gpuShapes*, softbodies*,
@@ -2114,6 +2129,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_heightfieldContactGenLaunch", kSbHfContactGen, uint32_t(sizeof(kSbHfContactGen)) },
     { "trimeshPlaneNarrowphase", kTriPlaneCore, uint32_t(sizeof(kTriPlaneCore)) },
     { "triangleTriangleOverlaps", kTriTriOverlap, uint32_t(sizeof(kTriTriOverlap)) },
+    { "triangleTriangleCollision", kTriTriCore, uint32_t(sizeof(kTriTriCore)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
     // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)

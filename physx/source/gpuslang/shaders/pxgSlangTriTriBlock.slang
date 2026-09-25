@@ -55,8 +55,8 @@
 // and every helper below is passed one or both of them in the CUDA.  Slang has no
 // portable way to pass groupshared by reference, so they are declared here and
 // used by name.  An including file must NOT declare its own: the sizes are the
-// CUDA's and the measured budget counts them once (npTriTriSharedProbe's gCounters
-// and gMinSep).
+// CUDA's and the measured budget counts them once (the P9.83b-4 probe's gCounters
+// and gMinSep; the kernel's own entry, triTriCollisionBda, is measured now).
 groupshared uint gTtbCounters[32];
 groupshared float gTtbMinSep[32];
 
@@ -133,7 +133,7 @@ uint ttbBlockCountAndBroadcast(uint tid, bool threadContributesElement)
 // ---------------------------------------------------------------------------
 // The two-argument overload allocates its own perWarpCountS and is what
 // addIndexToBuffer reaches through; that one is a different array and is measured
-// separately (npTriTriSharedProbe's gScanPerWarpCount).  Calling one where the
+// separately (the P9.83b-4 probe's gScanPerWarpCount).  Calling one where the
 // CUDA calls the other would share a buffer the CUDA keeps apart.
 uint ttbBlockScanExclusive(uint tid, bool threadContributesElement, out uint totalSum)
 {

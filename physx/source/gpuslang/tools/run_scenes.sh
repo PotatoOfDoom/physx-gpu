@@ -97,7 +97,8 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
-        particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid"
+        particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
+        sdfmesh"
 
 pass=0; fail=0; missing=0
 
@@ -216,9 +217,11 @@ if [ "${1:-}" = "--diagnostics" ]; then
     # TWO bodies, because a plane is infinite: one over the plane alone and one over a
     # static mesh raised to y = 2, so each kernel family has its own resting height and a
     # single number cannot be credited to the wrong one.
-    echo "    sdfmesh -- the RIGID TRIMESH narrowphase, plane and triangle-triangle."
-    env PXG_SCENE=sdfmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  sdfmesh:|^  \[sdfBox|^FAIL:|^\[ *(OK|FAIL|PARTIAL) *\] gpu-sdk-step' | sed 's/^/    /'
+    # sdfmesh MOVED INTO THE SCORED LIST in P9.83b-8 T7, once triangleTriangleCollision
+    # was mapped -- and once its box was wound OUTWARD: the inward winding had made
+    # the cooked SDF positive inside (+0.475 at the centre), every mesh-mesh contact
+    # read separation +0.025, and both mesh-supported boxes sank through at ~0.9 m/s
+    # after landing.  Green measurement: 0.5000 / 2.5000 / 0.5000 / 1.5054.
     # particlerigid MOVED INTO THE SCORED LIST in P9.80, and its RED measurement is
     # the record of why it was ever here (kept in RUNTIME_STATUS.md, P9.80):
     #   cluster y-extent 1.5000 -> 0.0000  (all 64 particles flat on the floor)
