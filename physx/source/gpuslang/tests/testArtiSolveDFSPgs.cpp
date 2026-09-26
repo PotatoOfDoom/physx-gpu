@@ -35,6 +35,11 @@
 // path, and elapsedTime is live on velocity iterations too (the drive
 // shortcut is TGS-only).  mDeltaMotion stays seeded: the DOF solve reads it
 // (jointDeltaP) even on PGS -- only the STATIC solve's delta reads are gone.
+//
+// P9.86c: six witness lanes (sfpSeedWitness) put a -0 parentDeltaV on an
+// axis-aligned first joint, where the port's folded accumulator is -0; host
+// twins show the isPlusZeroSV call-site wrap is redundant (its revert changes
+// 0 words) while the raw folded accumulator would change deltaVStack.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -130,6 +135,43 @@ struct SfpArena
     std::vector<PxgArticulationBlockResponse> rs;
     std::vector<float> io;
 };
+
+// P9.86c witness lanes (npArtiSolveInternal-c2-pgs, the isPlusZeroSV wrap at the
+// siSolveInternalDFSPgs call of svPropagateAccelDeferred) -- the TGS fixture's
+// sfSeedWitness, same lanes and shapes: link 1 (the root's only child, dofs at
+// jointOffset 0) sees a -0 parentDeltaVIn and an axis-aligned joint whose
+// products sas * jDelta are -0 on several lanes.  Driven (lanes 2, 7, 22, 27):
+// mDeferredQstZ < 0, jDelta < 0, +0 motion entries.  At rest (lanes 12, 17):
+// mDeferredQstZ = +0, jDelta = +0, negative or -0 motion entries.
+static bool sfpWitness(uint32_t lane) { return lane % 5u == 2u; }
+
+static void sfpSeedWitness(SfpArena& B, uint32_t lane)
+{
+    for (uint32_t j = 12; j < 18; ++j)
+        B.io[lane * SFP_IO_STRIDE + j] = -0.0f;
+
+    const bool atRest = ((lane / 10u) % 2u) == 1u;
+    const uint32_t dofs = sfpDofs(1, lane);
+    PX_ASSERT(B.lk[1].mJointOffset[lane] == 0u && B.lk[1].mDofs[lane] == dofs);
+
+    PxgArticulationBlockDofData& D0 = B.df[0];
+    storeSpatialVector(D0.mWorldMotionMatrix,
+                       atRest ? UnAlignedSpatialVector(PxVec3(-1.0f, 0.0f, -0.0f), PxVec3(0.0f, -0.0f, 0.0f))
+                              : UnAlignedSpatialVector(PxVec3(0.0f, -0.0f, 1.0f), PxVec3(-0.0f, 0.0f, 0.0f)),
+                       lane);
+    D0.mDeferredQstZ[lane] = atRest ? 0.0f : -0.25f;
+    D0.mInvStIsT_x[lane] = 0.5f; D0.mInvStIsT_y[lane] = 0.25f; D0.mInvStIsT_z[lane] = 0.125f;
+    if (dofs == 2u)
+    {
+        PxgArticulationBlockDofData& D1 = B.df[1];
+        storeSpatialVector(D1.mWorldMotionMatrix,
+                           atRest ? UnAlignedSpatialVector(PxVec3(-0.0f, -1.0f, 0.0f), PxVec3(0.0f, 0.0f, -1.0f))
+                                  : UnAlignedSpatialVector(PxVec3(0.0f, -0.0f, 0.0f), PxVec3(1.0f, 0.0f, -0.0f)),
+                           lane);
+        D1.mDeferredQstZ[lane] = atRest ? 0.0f : -0.5f;
+        D1.mInvStIsT_x[lane] = 0.25f; D1.mInvStIsT_y[lane] = 0.5f; D1.mInvStIsT_z[lane] = 0.125f;
+    }
+}
 
 static void sfpSeed(SfpArena& B, uint32_t salt)
 {
@@ -308,6 +350,9 @@ static void sfpSeed(SfpArena& B, uint32_t salt)
         // io: storeParentDeltaV, parentImpIn, parentDeltaVIn
         for (uint32_t j = 0; j < 18; ++j)
             B.io[lane * SFP_IO_STRIDE + j] = 0.3f * fv(lane, 3, j, salt);
+
+        if (sfpWitness(lane))
+            sfpSeedWitness(B, lane);
     }
 
     for (uint32_t b = 0; b < SFP_NB_BATCHES; ++b)
@@ -505,15 +550,56 @@ struct SfpParamsHost
 };
 static_assert(sizeof(SfpParamsHost) == 144, "params blob");
 
+// P9.86c witness tallies over every sfpRun (see sfpSeedWitness / gPropAccelVariant)
+static uint32_t gSfpFoldNegZero = 0, gSfpFoldHits = 0;
+static size_t gSfpTwinWrapWords = 0, gSfpTwinBothWords = 0;
+
+template <class T>
+static size_t sfpWordsDiffer(const std::vector<T>& a, const std::vector<T>& b)
+{
+    const size_t n = a.size() * sizeof(T) / 4;
+    size_t d = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (std::memcmp(reinterpret_cast<const uint8_t*>(a.data()) + 4 * i,
+                        reinterpret_cast<const uint8_t*>(b.data()) + 4 * i, 4) != 0)
+            ++d;
+    return d;
+}
+
+static size_t sfpImageWordsDiffer(const SfpArena& a, const SfpArena& b)
+{
+    return sfpWordsDiffer(a.lk, b.lk) + sfpWordsDiffer(a.df, b.df) + sfpWordsDiffer(a.stack, b.stack)
+         + sfpWordsDiffer(a.jf, b.jf) + sfpWordsDiffer(a.bt, b.bt) + sfpWordsDiffer(a.ch, b.ch)
+         + sfpWordsDiffer(a.fh, b.fh) + sfpWordsDiffer(a.cp, b.cp) + sfpWordsDiffer(a.fp, b.fp)
+         + sfpWordsDiffer(a.jh, b.jh) + sfpWordsDiffer(a.jr, b.jr) + sfpWordsDiffer(a.jm, b.jm)
+         + sfpWordsDiffer(a.rs, b.rs) + sfpWordsDiffer(a.io, b.io);
+}
+
 static size_t sfpRun(PxgCudaShim& shim, uint32_t flags, uint32_t salt)
 {
     SfpArena A;
     sfpSeed(A, salt);
 
+    gPropAccelVariant = 0;
+    gPropAccelFoldNegZero = 0;
+    gPropAccelFoldHits = 0;
     SfpArena W = A;
     sfpMirror(W, flags);
     PXG_CHECK_MSG(std::memcmp(W.stack.data(), A.stack.data(),
                               W.stack.size() * sizeof(W.stack[0])) != 0, "vacuous: stack untouched");
+    gSfpFoldNegZero += gPropAccelFoldNegZero;
+    gSfpFoldHits += gPropAccelFoldHits;
+
+    // host twins: the call-site wrap reverted (HEAD's canonicalising helper), and
+    // that revert on top of the helper's own revert (the raw folded accumulator)
+    SfpArena TW = A, TB = A;
+    gPropAccelVariant = 1;
+    sfpMirror(TW, flags);
+    gPropAccelVariant = 2;
+    sfpMirror(TB, flags);
+    gPropAccelVariant = 0;
+    gSfpTwinWrapWords += sfpImageWordsDiffer(TW, W);
+    gSfpTwinBothWords += sfpImageWordsDiffer(TB, W);
 
     std::vector<PxgDevicePtr> bufs;
     auto up = [&](const void* p, size_t n) {
@@ -600,9 +686,20 @@ PXG_TEST(artiSolveDFSPgs)
     PxgCudaShim shim(dev, manifest, 1, &sfpLoader);
 
     size_t bad = 0;
+    gSfpFoldNegZero = 0; gSfpFoldHits = 0; gSfpTwinWrapWords = 0; gSfpTwinBothWords = 0;
     bad += sfpRun(shim, 2u | 4u | 8u | 32u | 64u, 61);       // posIter, doF, BEFORE, static, residual
     bad += sfpRun(shim, 1u | 2u | 4u | 16u | 32u | 64u, 67); // velIter, doF, AFTER, static, residual
     bad += sfpRun(shim, 2u | 4u | 8u | 64u, 71);             // doF, BEFORE, no static
     bad += sfpRun(shim, 4u | 32u, 73);                       // doFriction OFF, static, no residual
+    std::printf("[ info ] P9.86c accel hop (PGS): seedless accumulator lanes -0: %u (on a -0 pDeltaV lane: %u); "
+                "words changed by the wrap revert: %zu, by wrap + helper revert: %zu\n",
+                unsigned(gSfpFoldNegZero), unsigned(gSfpFoldHits), gSfpTwinWrapWords, gSfpTwinBothWords);
+    PXG_CHECK_MSG(gSfpFoldHits > 0,
+                  "the witness lanes must put a -0 folded accumulator lane on a -0 pDeltaV lane");
+    PXG_CHECK_MSG(gSfpTwinBothWords > 0,
+                  "the raw folded accumulator (wrap and helper canonicalisation reverted) must change the image");
+    PXG_CHECK_MSG(gSfpTwinWrapWords == 0,
+                  "reverting the isPlusZeroSV wrap alone must leave the image bit-identical (%zu words)",
+                  gSfpTwinWrapWords);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

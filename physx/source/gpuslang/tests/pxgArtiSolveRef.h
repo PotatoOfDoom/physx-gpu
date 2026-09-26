@@ -54,6 +54,7 @@
 #include "PxgArticulation.h"
 
 #include <cstdint>
+#include <cstring>
 
 namespace pxgtest
 {
@@ -83,6 +84,35 @@ inline physx::Cm::UnAlignedSpatialVector refPropImpulseDeferred(
     return Dy::FeatherstoneArticulation::translateSpatialVector(c2p, temp);
 }
 
+// P9.86c (npArtiSolveInternal c1/c2): witness counters and host twins of the
+// port's literal-seed fold in this hop.  llvmpipe unrolls the port's constant
+// 3-trip loop, forwards the literal +0 seed of jointSpatialDeltaV and folds the
+// first `0 + sas*jDelta` (F3), so the port's raw accumulator is the SEEDLESS
+// sum: equal in value to the CUDA's +0-seeded one (articulationDynamic.cuh:292),
+// but -0 where the CUDA's is +0.  npArtiSolveTendons.slang canonicalises that
+// accumulator (-0 -> +0) before `pDeltaV + J`; the two DFS call sites of
+// npArtiSolveInternal.slang wrap the result once more (isPlusZeroSV).
+// gPropAccelVariant selects what the hop returns:
+//   0  the CUDA (+0 seed) -- the reference every fixture compares against;
+//   1  the seedless accumulator, canonicalised: HEAD's helper with the DFS
+//      call-site wrap reverted (npArtiSolveInternal-c1-tgs / -c2-pgs);
+//   2  the seedless accumulator as is: that revert on top of the helper's own
+//      revert (npArtiSolveTendons-r0).
+// Counted under every variant: gPropAccelFoldNegZero -- accumulator lanes the
+// seedless sum leaves -0 (the CUDA's is +0); gPropAccelFoldHits -- those of
+// them whose pDeltaV lane is -0 as well, i.e. where variant 2 returns -0
+// against the CUDA's +0.
+inline int gPropAccelVariant = 0;
+inline physx::PxU32 gPropAccelFoldNegZero = 0;
+inline physx::PxU32 gPropAccelFoldHits = 0;
+
+inline bool refIsNegZero(float x)
+{
+    uint32_t b;
+    std::memcpy(&b, &x, 4);
+    return b == 0x80000000u;
+}
+
 // propagateAccelerationW_child2ParentPreLoaded<ReadFromDeferredQstZ> (:257)
 inline physx::Cm::UnAlignedSpatialVector refPropAccelDeferred(
     const physx::PxgArticulationBlockDofData* dofs, physx::PxU32 jointOffset,
@@ -107,6 +137,7 @@ inline physx::Cm::UnAlignedSpatialVector refPropAccelDeferred(
     }
 
     Cm::UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
+    Cm::UnAlignedSpatialVector seedless(PxVec3(0.f), PxVec3(0.f));   // the port's folded sum (twins only)
     for (PxU32 ind = 0; ind < 3; ++ind)
     {
         if (ind < dofCount)
@@ -119,8 +150,31 @@ inline physx::Cm::UnAlignedSpatialVector refPropAccelDeferred(
             if (jDeltaOut)
                 jDeltaOut[ind] = jDelta;
             jointSpatialDeltaV += sas * jDelta;
+            seedless = (ind == 0) ? sas * jDelta : seedless + sas * jDelta;
         }
     }
+
+    const float sl[6] = { seedless.top.x, seedless.top.y, seedless.top.z,
+                          seedless.bottom.x, seedless.bottom.y, seedless.bottom.z };
+    const float pd[6] = { pDeltaV.top.x, pDeltaV.top.y, pDeltaV.top.z,
+                          pDeltaV.bottom.x, pDeltaV.bottom.y, pDeltaV.bottom.z };
+    for (PxU32 k = 0; k < 6; ++k)
+        if (refIsNegZero(sl[k]))
+        {
+            ++gPropAccelFoldNegZero;
+            if (refIsNegZero(pd[k]))
+                ++gPropAccelFoldHits;
+        }
+
+    if (gPropAccelVariant == 1)
+    {
+        const Cm::UnAlignedSpatialVector canon(
+            PxVec3(sl[0] == 0.f ? 0.f : sl[0], sl[1] == 0.f ? 0.f : sl[1], sl[2] == 0.f ? 0.f : sl[2]),
+            PxVec3(sl[3] == 0.f ? 0.f : sl[3], sl[4] == 0.f ? 0.f : sl[4], sl[5] == 0.f ? 0.f : sl[5]));
+        return pDeltaV + canon;
+    }
+    if (gPropAccelVariant == 2)
+        return pDeltaV + seedless;
 
     return pDeltaV + jointSpatialDeltaV;
 }
