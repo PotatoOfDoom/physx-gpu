@@ -45,8 +45,11 @@
 // other word bit-exactly against the poison-seeded image.
 //
 // WHAT THE FIXTURE IS SHAPED TO SEE
-//   * 68 articulations over 3 warps (warp 2 partial), numLinks 1..4 (1 = the
-//     loop never runs), maxLinks 4 != maxDofs 10, every count distinct;
+//   * 76 articulations over 3 warps (warp 2 partial), numLinks 1..4 (1 = the
+//     loop never runs), maxLinks 4 != maxDofs 10, every count distinct; the
+//     last 8 are P9.86c witness articulations whose motion matrices have the
+//     real joint shape (angular: bottom +-0, prismatic: top +-0), see the
+//     r0u note above refPropAccel;
 //   * a 9-case joint table: revolute about each axis, revolute_unwrapped,
 //     prismatic (linear path + dofs[0] error), spherical 3-dof with mixed
 //     drives, spherical 2-dof driveless (stale driveError stays dead),
@@ -90,7 +93,10 @@ using physx::gpuslang::PxgResult;
 
 static std::vector<uint8_t> siLoader(const char* file) { return loadShaderBlob(file); }
 
-const uint32_t SI_NB = 68, SI_WARPS = 3, SI_MAX_LINKS = 4, SI_MAX_DOFS = 10;
+// SI_NB_GENERIC hash-seeded articulations, then the P9.86c witness
+// articulations (siWitness) up to SI_NB
+const uint32_t SI_NB_GENERIC = 68, SI_NB = 76, SI_WARPS = 3, SI_MAX_LINKS = 4, SI_MAX_DOFS = 10;
+static bool siWitness(uint32_t a) { return a >= SI_NB_GENERIC; }
 const float SI_STEP_DT = 0.004f, SI_DT = 0.0333f, SI_INV_DT = 250.0f;
 
 // deterministic value soup
@@ -191,6 +197,39 @@ static UnAlignedSpatialVector refPropImpDofAligned(const UnAlignedSpatialVector&
     return Dy::FeatherstoneArticulation::translateSpatialVector(c2p, Z - temp);
 }
 
+// P9.86c: the siPlusZero3 canonicalisation of jointSpatialDeltaV
+// (npArtiSetupInternal.slang, the P9.86 fix) is EQUIVALENT -- its revert r0u
+// survives, and no input can kill it:
+//   * the fold it guards (llvmpipe forwards the literal +0 seed into the
+//     unrolled 3-trip loop and drops `0 + t0`) can only turn a +0 lane of the
+//     accumulator into -0, so HEAD and the revert differ only in the SIGN of a
+//     zero lane J of jointSpatialDeltaV;
+//   * that lane is used exactly once, in pDeltaV + J, and p + (+0) == p + (-0)
+//     bit for bit for every p except p == -0 (NaN, inf and +0 included);
+//   * pDeltaV is never -0: its top is a row of PxSpatialMatrix::operator*
+//     (asmM6MulVec: a select seed that is never -0, then five adds of computed
+//     operands, IEEE under the SZINP stamp) and its bottom is such a row plus a
+//     cross product -- and in round-to-nearest x + y is -0 only when x and y
+//     both are.  A -0 pDeltaV would need a flushed negative denormal, which is
+//     not the reference (the mirror is IEEE C++) and would already turn this
+//     fixture's HEAD baseline red on that lane (mDeltaVA.top is pDeltaV.top,
+//     and mDeltaVB = pDeltaV + J would hold +0 where the mirror keeps the
+//     denormal).
+// The equivalence rests on asmM6MulVec's own P9.86 select seed: without it a
+// row of six -0 products folds to pDeltaV = -0 and r0u becomes killable.
+// gSiJointAccFold is the revert's twin (the accumulator seeded by the first
+// term instead of `+0 + term`); the witness articulations (siWitness) give
+// angular dofs a +-0 world-motion bottom and prismatic dofs a +-0 top, so the
+// twin's accumulator really holds -0 where the CUDA's holds +0
+// (gSiFoldNegZeroLanes), while the twin's output image must equal the
+// mirror's word for word and no pDeltaV lane may be -0 (gSiPdNegZeroLanes).
+static int gSiJointAccFold = 0;
+static size_t gSiFoldNegZeroLanes = 0;
+static size_t gSiPdNegZeroLanes = 0;
+
+static bool siIsNegZero(PxReal v) { return v == 0.f && std::signbit(v); }
+static bool siIsPosZero(PxReal v) { return v == 0.f && !std::signbit(v); }
+
 static UnAlignedSpatialVector refPropAccel(const PxVec3& c2p,
                                            const PxgArticulationBlockDofData* dofs,
                                            const UnAlignedSpatialVector& parentDeltaV,
@@ -205,6 +244,9 @@ static UnAlignedSpatialVector refPropAccel(const PxVec3& c2p,
     // propagateAccelerationW_child2ParentPreLoaded (articulationDynamic.cuh:257-313):
     // the joint terms accumulate into their own +0-seeded vector, added last
     UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
+    // the r0u twin: the same sum with the `+0 + term` seed add folded away
+    UnAlignedSpatialVector folded(PxVec3(0.f), PxVec3(0.f));
+    bool first = true;
     for (PxU32 ind = 0; ind < 3; ++ind)
     {
         if (ind < dofCount)
@@ -212,10 +254,33 @@ static UnAlignedSpatialVector refPropAccel(const PxVec3& c2p,
             const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
                                 + dofs[ind].mInvStIsT_y[lane] * t[1]
                                 + dofs[ind].mInvStIsT_z[lane] * t[2];
-            jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+            const UnAlignedSpatialVector term =
+                loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+            jointSpatialDeltaV += term;
+            if (first)
+                folded = term;
+            else
+                folded += term;
+            first = false;
         }
     }
-    return pDeltaV + jointSpatialDeltaV;
+    if (!gSiJointAccFold)
+    {
+        const PxReal jv[6] = { jointSpatialDeltaV.top.x, jointSpatialDeltaV.top.y, jointSpatialDeltaV.top.z,
+                               jointSpatialDeltaV.bottom.x, jointSpatialDeltaV.bottom.y, jointSpatialDeltaV.bottom.z };
+        const PxReal fv6[6] = { folded.top.x, folded.top.y, folded.top.z,
+                                folded.bottom.x, folded.bottom.y, folded.bottom.z };
+        const PxReal pv[6] = { pDeltaV.top.x, pDeltaV.top.y, pDeltaV.top.z,
+                               pDeltaV.bottom.x, pDeltaV.bottom.y, pDeltaV.bottom.z };
+        for (int k = 0; k < 6; ++k)
+        {
+            if (siIsPosZero(jv[k]) && siIsNegZero(fv6[k]))
+                ++gSiFoldNegZeroLanes;
+            if (siIsNegZero(pv[k]))
+                ++gSiPdNegZeroLanes;
+        }
+    }
+    return pDeltaV + (gSiJointAccFold ? folded : jointSpatialDeltaV);
 }
 
 // the mirror of setupInternalConstraints itself; marks the words that flowed
@@ -420,6 +485,17 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
     }
 }
 
+static size_t siCountWordDiffs(const std::vector<PxgArticulationBlockDofData>& x,
+                               const std::vector<PxgArticulationBlockDofData>& y)
+{
+    const uint32_t* xw = reinterpret_cast<const uint32_t*>(x.data());
+    const uint32_t* yw = reinterpret_cast<const uint32_t*>(y.data());
+    size_t n = 0;
+    for (size_t k = 0; k < x.size() * sizeof(x[0]) / 4; ++k)
+        n += xw[k] != yw[k];
+    return n;
+}
+
 static int32_t ulpDiff(float a, float b)
 {
     int32_t ia, ib;
@@ -519,11 +595,25 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
                 dd.mDofIds[lane] = j.dofIds[i];
                 dd.mJointPositions[lane] = 0.8f * fv(a, linkID, i, 11);
                 // local/world motion vectors + response inputs
-                const PxVec3 axT(fv(a, linkID, i, 12), fv(a, linkID, i + 3, 12), fv(a, linkID, i + 6, 12));
-                const PxVec3 axB(fv(a, linkID, i, 13), fv(a, linkID, i + 3, 13), fv(a, linkID, i + 6, 13));
+                PxVec3 axT(fv(a, linkID, i, 12), fv(a, linkID, i + 3, 12), fv(a, linkID, i + 6, 12));
+                PxVec3 axB(fv(a, linkID, i, 13), fv(a, linkID, i + 3, 13), fv(a, linkID, i + 6, 13));
+                PxVec3 wT(fv(a, linkID, i, 14), fv(a, linkID, i + 3, 14), fv(a, linkID, i + 6, 14));
+                PxVec3 wB(fv(a, linkID, i, 15), fv(a, linkID, i + 3, 15), fv(a, linkID, i + 6, 15));
+                if (siWitness(a))
+                {
+                    // P9.86c witness: the motion matrices a real joint has -- an
+                    // angular dof moves no point on the axis (bottom = 0), a
+                    // prismatic dof rotates nothing (top = 0) -- with the zero
+                    // signs PxQuat::rotate of a zero vector leaves (hash-chosen
+                    // +0/-0 per lane).  Each s * jDelta term then has +-0 lanes.
+                    const bool lin = j.dofIds[i] >= PxArticulationAxis::eX;
+                    const PxVec3 z(fv(a, linkID, i, 31) < 0.f ? -0.f : 0.f,
+                                   fv(a, linkID, i + 3, 31) < 0.f ? -0.f : 0.f,
+                                   fv(a, linkID, i + 6, 31) < 0.f ? -0.f : 0.f);
+                    if (lin) { axT = z; wT = z; }
+                    else     { axB = z; wB = z; }
+                }
                 storeSpatialVector(dd.mLocalMotionMatrix, UnAlignedSpatialVector(axT, axB), lane);
-                const PxVec3 wT(fv(a, linkID, i, 14), fv(a, linkID, i + 3, 14), fv(a, linkID, i + 6, 14));
-                const PxVec3 wB(fv(a, linkID, i, 15), fv(a, linkID, i + 3, 15), fv(a, linkID, i + 6, 15));
                 storeSpatialVector(dd.mWorldMotionMatrix, UnAlignedSpatialVector(wT, wB), lane);
                 storeSpatialVector(dd.mIsInvDW,
                                    UnAlignedSpatialVector(
@@ -575,11 +665,45 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
     // ---- the mirror ----
     std::vector<PxgArticulationBlockDofData> wDf = df;
     std::vector<uint8_t> sphericalErr(df.size() * 32, 0);
+    gSiJointAccFold = 0;
+    gSiFoldNegZeroLanes = 0;
+    gSiPdNegZeroLanes = 0;
+    size_t witnessFoldNegZero = 0;
     for (uint32_t a = 0; a < SI_NB; ++a)
     {
         const uint32_t w = a / 32, lane = a % 32;
+        const size_t before = gSiFoldNegZeroLanes;
         refSetup(ab[w], &lk[size_t(w) * SI_MAX_LINKS], &wDf[size_t(w) * SI_MAX_DOFS],
                  SI_STEP_DT, SI_DT, isTGS, lane, &sphericalErr[size_t(w) * SI_MAX_DOFS * 32]);
+        if (siWitness(a))
+            witnessFoldNegZero += gSiFoldNegZeroLanes - before;
+    }
+
+    // ---- P9.86c: the r0u twin (jointSpatialDeltaV without the +0 seed add) ----
+    {
+        std::vector<PxgArticulationBlockDofData> fDf = df;
+        gSiJointAccFold = 1;
+        for (uint32_t a = 0; a < SI_NB; ++a)
+        {
+            const uint32_t w = a / 32, lane = a % 32;
+            refSetup(ab[w], &lk[size_t(w) * SI_MAX_LINKS], &fDf[size_t(w) * SI_MAX_DOFS],
+                     SI_STEP_DT, SI_DT, isTGS, lane, nullptr);
+        }
+        gSiJointAccFold = 0;
+        const size_t twinDiff = siCountWordDiffs(fDf, wDf);
+        std::printf("[ info ] si isTGS=%d: r0u twin -- %zu accumulator lanes +0 (CUDA) vs -0 "
+                    "(folded), %zu on witness articulations; %zu output words changed; "
+                    "%zu pDeltaV lanes -0\n",
+                    int(isTGS), gSiFoldNegZeroLanes, witnessFoldNegZero, twinDiff,
+                    gSiPdNegZeroLanes);
+        PXG_CHECK_MSG(witnessFoldNegZero > 0,
+                      "witness coverage: no accumulator lane where the folded seed keeps -0");
+        PXG_CHECK_MSG(twinDiff == 0,
+                      "r0u twin changed %zu output words -- the equivalence argument is wrong",
+                      twinDiff);
+        PXG_CHECK_MSG(gSiPdNegZeroLanes == 0,
+                      "a pDeltaV lane is -0 (%zu) -- the r0u equivalence premise fails",
+                      gSiPdNegZeroLanes);
     }
 
     // ---- device ----
