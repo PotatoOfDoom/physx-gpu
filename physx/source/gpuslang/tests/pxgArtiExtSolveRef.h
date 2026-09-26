@@ -103,6 +103,36 @@ inline float refMinBiasTGS(uint32_t flags, float maxBias)
     return -((flags & DY_FLAG_INEQ) != 0 ? PX_MAX_F32 : maxBias);
 }
 
+// P9.86c: the CUDA's fminf/fmaxf -- IEEE minNum/maxNum (NaN-ignoring) with NVIDIA's zero rule:
+// the zeros are ORDERED (-0 < +0) whatever the operand order, fminf(+0, -0) = fminf(-0, +0) = -0
+// and fmaxf(+0, -0) = fmaxf(-0, +0) = +0.  This is also llvmpipe's GLSL FMin/FMax under the
+// SignedZeroInfNanPreserve stamp (P9.86 F4).  The host's glibc fminf/fmaxf are NOT: they keep the
+// FIRST operand on a +-0 tie (measured with glibc 2.39: fmin(+0, -0) = +0, fmax(-0, +0) = -0).
+inline float refCudaFminf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+inline float refCudaFmaxf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+
+// P9.86c twins of the npArtiSolveExtTGS audit fixes (0 = the CUDA semantics, always the default).
+// gExtTorsClampVariant (the torsional PxClamp, solver.cuh:704): 1 = the reverted Slang clamp(),
+// GLSL FClamp = FMin(FMax(v, lo), hi) with llvmpipe's zero-ordered FMin/FMax.
+inline int gExtTorsClampVariant = 0;
+// gExt1DClampVariant (the 1D fminf(maxImpulse, fmaxf(minImpulse, u)), solverBlockTGS.cuh:1060):
+// 1 = PxMin/PxMax selects (a zero tie keeps the SECOND operand); 2 = the host's glibc
+// std::fmin/std::fmax (the FIRST operand; this oracle's spelling before P9.86c).  Neither is the
+// reverted FMin/FMax: under the stamp that one orders the zeros exactly like the CUDA.
+inline int gExt1DClampVariant = 0;
+
 struct RefError
 {
     float sumOfSquares = 0.f;
@@ -378,8 +408,11 @@ inline void refSolveExtContactTGS(const PxgBlockConstraintBatch& batch,
             const float totalImpulse = tmp10 - normalVel0 * velMultiplier0;
 
             const bool clampIt = PxAbs(totalImpulse) > (maxFrictionImpulse * frictionScale);
-            const float totalClamped = PxClamp(totalImpulse, -maxDynFrictionImpulse * frictionScale,
-                                               maxDynFrictionImpulse * frictionScale);
+            const float torsLo = -maxDynFrictionImpulse * frictionScale;
+            const float torsHi = maxDynFrictionImpulse * frictionScale;
+            const float totalClamped = (gExtTorsClampVariant == 1)
+                                     ? refCudaFminf(refCudaFmaxf(totalImpulse, torsLo), torsHi)
+                                     : PxClamp(totalImpulse, torsLo, torsHi);
             const float newAppliedForce = clampIt ? totalClamped : totalImpulse;
             const float deltaF0 = newAppliedForce - appliedForce0;
             if (error)
@@ -511,7 +544,10 @@ inline void refSolveExt1DTGS(const PxgBlockConstraintBatch& batch,
         const float normalVel = v0 - v1;
 
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
-        const float clampedForce = std::fmin(maxImpulse, std::fmax(minImpulse, unclampedForce));
+        const float clampedForce =
+            (gExt1DClampVariant == 1) ? PxMin(maxImpulse, PxMax(minImpulse, unclampedForce))
+          : (gExt1DClampVariant == 2) ? std::fmin(maxImpulse, std::fmax(minImpulse, unclampedForce))
+                                      : refCudaFminf(maxImpulse, refCudaFmaxf(minImpulse, unclampedForce));
         const float deltaF = clampedForce - appliedForce;
 
         ccon.appliedForce[ti] = clampedForce;

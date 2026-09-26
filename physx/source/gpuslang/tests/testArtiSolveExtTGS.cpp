@@ -49,6 +49,9 @@
 //  * friction clamping both ways (the combined-magnitude sqrt clamp), the
 //    minNormalForce floor, maxImpulse clamping;
 //  * two rounds: refs (1, 1) and refs (0.75, 1.25) — every ref site scales;
+//  * P9.86c signed zeros: a -0 torsional friction scale (clamp bounds lo +0, hi -0) on the six
+//    tf = 3 lanes, and zero-force-limit drive rows (bounds (-0, +0) and (+0, -0)) on the odd
+//    1D lanes, each with a mirror twin of the spelling it separates from the CUDA's;
 //  * the mutated block fields (appliedForce, broken, residual) and the io
 //    outputs (velocities, impulses, error accumulator) compared byte for
 //    byte; untouched block bytes must come back at the seed.
@@ -275,32 +278,105 @@ static size_t svxRunContact(PxgCudaShim& shim, float ref0, float ref1)
                 double(ref0), double(ref1), nTors, nCompliant, nZeroContacts);
     PXG_CHECK_MSG(nTors > 5 && nCompliant > 5 && nZeroContacts > 0, "contact coverage hole");
 
+    // P9.86c (npArtiSolveExtTGS-r0): the torsional PxClamp (solver.cuh:704) with the bounds
+    // (lo +0, hi -0).  The prep writes torsionalFrictionScale = PxMax(y, PxSqrt(PxMax(0.f, -minPen)
+    // * x)) (artiConstraintPrep2.cu:1069), which is -0 for a patch without penetration (minPen
+    // stays +0, :732/:827) and minTorsionalPatchRadius y = 0: selectMax(+0, -0) = -0, PxSqrt(-0)
+    // = -0, selectMax(+0, -0) = -0.  Then lo = -maxDyn * -0 = +0, hi = maxDyn * -0 = -0, and
+    // |t| > maxF * -0 clamps every t != 0.  The CUDA's selects give PxMin(-0, PxMax(+0, t)) = +0
+    // for t < 0 (-0 for t > 0); the reverted FClamp gives FMin(FMax(t, +0), -0) = -0 for either
+    // sign.  The six tf = 3 lanes (l % 6 == 0, torsional row fp[SVX_START_FRICTION + 2]) carry a
+    // torsional impulse of -100 / +100, far above |normalVel0 * velMultiplier0| (about 25 at
+    // most here), so the sign of t is the seeded one; the store counters below pin it.
+    uint32_t nTorsNegScale = 0;
+    for (uint32_t l = 0; l < SVX_LANES; l += 6u)
+    {
+        fh[0].torsionalFrictionScale[l] = -0.0f;
+        fp[SVX_START_FRICTION + 2].appliedForce[l] = ((l / 6u) & 1u) ? 100.0f : -100.0f;
+        ++nTorsNegScale;
+    }
+
     SvxIoBuf io;
     io.init(90);
 
-    // mirror
-    std::vector<PxgTGSBlockSolverContactHeader> wCh = ch;
-    std::vector<PxgTGSBlockSolverFrictionHeader> wFh = fh;
-    std::vector<PxgTGSBlockSolverContactPoint> wCp = cp;
-    std::vector<PxgTGSBlockSolverContactFriction> wFp = fp;
-    std::vector<float> wantIo = io.data;
-    for (uint32_t l = 0; l < SVX_LANES; ++l)
+    // mirror; torsVariant selects gExtTorsClampVariant (0 = the CUDA)
+    struct ContactImage
     {
-        LaneIo lio = svxLaneIo(l, 90);
-        UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
-        RefError err;
-        refSolveExtContactTGS(batch, lio.vel0, lio.vel1, lio.d0, lio.d1, l, wCh.data(),
-                              wFh.data(), wCp.data(), wFp.data(), rsp.data(), SVX_ELAPSED,
-                              SVX_MINPEN, imp0, imp1, &err, ref0, ref1);
-        float* o = &wantIo[32 * 32 + l * 32];
-        const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
-        for (int v = 0; v < 4; ++v)
+        std::vector<PxgTGSBlockSolverContactHeader> ch;
+        std::vector<PxgTGSBlockSolverFrictionHeader> fh;
+        std::vector<PxgTGSBlockSolverContactPoint> cp;
+        std::vector<PxgTGSBlockSolverContactFriction> fp;
+        std::vector<float> io;
+    };
+    auto mirror = [&](int torsVariant) {
+        ContactImage w{ ch, fh, cp, fp, io.data };
+        gExtTorsClampVariant = torsVariant;
+        for (uint32_t l = 0; l < SVX_LANES; ++l)
         {
-            o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
-            o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            LaneIo lio = svxLaneIo(l, 90);
+            UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+            RefError err;
+            refSolveExtContactTGS(batch, lio.vel0, lio.vel1, lio.d0, lio.d1, l, w.ch.data(),
+                                  w.fh.data(), w.cp.data(), w.fp.data(), rsp.data(), SVX_ELAPSED,
+                                  SVX_MINPEN, imp0, imp1, &err, ref0, ref1);
+            float* o = &w.io[32 * 32 + l * 32];
+            const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
+            for (int v = 0; v < 4; ++v)
+            {
+                o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
+                o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            }
+            o[24] = err.sumOfSquares; o[25] = float(err.counter); o[26] = err.maxError;
         }
-        o[24] = err.sumOfSquares; o[25] = float(err.counter); o[26] = err.maxError;
+        gExtTorsClampVariant = 0;
+        return w;
+    };
+    const ContactImage want = mirror(0);
+    const std::vector<PxgTGSBlockSolverContactHeader>& wCh = want.ch;
+    const std::vector<PxgTGSBlockSolverFrictionHeader>& wFh = want.fh;
+    const std::vector<PxgTGSBlockSolverContactPoint>& wCp = want.cp;
+    const std::vector<PxgTGSBlockSolverContactFriction>& wFp = want.fp;
+    const std::vector<float>& wantIo = want.io;
+
+    // r0 coverage: the CUDA stores +0 on the three t < 0 lanes and -0 on the three t > 0 lanes
+    auto bitsOf = [](const float& f) { uint32_t b; std::memcpy(&b, &f, 4); return b; };
+    uint32_t torsNegScalePlusZero = 0, torsNegScaleMinusZero = 0;
+    for (uint32_t l = 0; l < SVX_LANES; l += 6u)
+    {
+        const uint32_t b = bitsOf(wFp[SVX_START_FRICTION + 2].appliedForce[l]);
+        const uint32_t expect = ((l / 6u) & 1u) ? 0x80000000u : 0x00000000u;
+        if (b == expect && expect == 0u) ++torsNegScalePlusZero;
+        if (b == expect && expect != 0u) ++torsNegScaleMinusZero;
     }
+    // r0 twin: the reverted FClamp changes exactly the three t < 0 stores, +0 -> -0, and nothing else
+    uint32_t twinFpWords = 0, twinKillWords = 0;
+    bool twinRestSame = false;
+    {
+        const ContactImage twin = mirror(1);
+        const size_t nWords = wFp.size() * sizeof(wFp[0]) / 4u;
+        const uint8_t* pw = reinterpret_cast<const uint8_t*>(wFp.data());
+        const uint8_t* pt = reinterpret_cast<const uint8_t*>(twin.fp.data());
+        for (size_t k = 0; k < nWords; ++k)
+            if (std::memcmp(pw + 4u * k, pt + 4u * k, 4u) != 0) ++twinFpWords;
+        for (uint32_t l = 0; l < SVX_LANES; l += 12u)   // lanes 0, 12, 24
+            if (bitsOf(wFp[SVX_START_FRICTION + 2].appliedForce[l]) == 0x00000000u &&
+                bitsOf(twin.fp[SVX_START_FRICTION + 2].appliedForce[l]) == 0x80000000u)
+                ++twinKillWords;
+        twinRestSame = std::memcmp(twin.ch.data(), wCh.data(), sizeof(wCh[0])) == 0 &&
+                       std::memcmp(twin.fh.data(), wFh.data(), sizeof(wFh[0])) == 0 &&
+                       std::memcmp(twin.cp.data(), wCp.data(), wCp.size() * sizeof(wCp[0])) == 0 &&
+                       std::memcmp(twin.io.data(), wantIo.data(), wantIo.size() * 4u) == 0;
+    }
+    std::printf("[ info ] svx contact(ref %g/%g): -0 torsional scale %u lanes: +0 store %u, -0 store %u;"
+                " FClamp twin: %u frictionPoints words differ, %u of them +0 -> -0, rest %s\n",
+                double(ref0), double(ref1), nTorsNegScale, torsNegScalePlusZero,
+                torsNegScaleMinusZero, twinFpWords, twinKillWords, twinRestSame ? "same" : "DIFFERS");
+    PXG_CHECK_MSG(nTorsNegScale == 6u && torsNegScalePlusZero == 3u && torsNegScaleMinusZero == 3u,
+                  "P9.86c r0: the -0 torsional-scale lanes lost their clamp coverage (+0 %u, -0 %u)",
+                  torsNegScalePlusZero, torsNegScaleMinusZero);
+    PXG_CHECK_MSG(twinFpWords == 3u && twinKillWords == 3u && twinRestSame,
+                  "P9.86c r0: the FClamp twin does not change exactly the three t < 0 torsional stores"
+                  " (%u words, %u +0 -> -0)", twinFpWords, twinKillWords);
 
     // device
     std::vector<PxgDevicePtr> bufs;
@@ -422,28 +498,96 @@ static size_t svxRun1D(PxgCudaShim& shim, float ref0, float ref1)
     PXG_CHECK_MSG(nHard > 5 && nIneq > 5 && nSpring > 5 && nAccel > 5 && nBounce > 5,
                   "1d row-mode coverage hole");
 
+    // P9.86c (npArtiSolveExtTGS-r1, equivalent): witness drive rows with a zero force limit.
+    // addDrive (PxgConstraintHelper.h:305-306) sets the bounds (-forceLimit, +forceLimit) (times
+    // a positive driveScale), so forceLimit +0 gives (-0, +0) and forceLimit -0.0f (it passes
+    // PxD6JointDrive::isValid, forceLimit >= 0) gives (+0, -0); the prep starts appliedForce at +0
+    // (artiConstraintPrep2.cu:1589).  The CUDA's fminf(maxImpulse, fmaxf(minImpulse, u))
+    // (solverBlockTGS.cuh:1060) orders the zeros: (-0, +0) stores -0 for u < 0, where the host's
+    // glibc fminf(+0, -0) keeps +0; (+0, -0) stores -0 for every u, where PxMin/PxMax selects give
+    // +0 for u <= 0.  HEAD's explicit zero-pair selects and the reverted FMin/FMax (zero-ordered
+    // under the SZINP stamp) both store the CUDA's value; the device must match on every row.
+    uint32_t nZeroLimitRows = 0;
+    for (uint32_t l = 1; l < SVX_LANES; l += 2u)
+    {
+        const uint32_t rc = (l * 5 + 1) % (SVX_MAX_ROWS + 1);
+        for (uint32_t i = 0; i < rc; ++i)
+        {
+            const uint32_t mode = (l + i) % 5u;
+            if (mode != 2u && mode != 3u)
+                continue;   // a drive is a spring row
+            PxgTGSBlockSolverConstraint1DCon& c = rows[SVX_START_CONSTRAINT + i];
+            const bool negLimit = (((l >> 1) + i) & 1u) != 0u;
+            c.minImpulse[l] = negLimit ? 0.0f : -0.0f;
+            c.maxImpulse[l] = negLimit ? -0.0f : 0.0f;
+            c.appliedForce[l] = 0.0f;
+            ++nZeroLimitRows;
+        }
+    }
+
     SvxIoBuf io;
     io.init(91);
 
-    // mirror
-    std::vector<PxgTGSBlockSolverConstraint1DCon> wRows = rows;
-    std::vector<float> wantIo = io.data;
-    for (uint32_t l = 0; l < SVX_LANES; ++l)
-    {
-        LaneIo lio = svxLaneIo(l, 91);
-        UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
-        refSolveExt1DTGS(batch, lio.vel0, lio.vel1, lio.d0, lio.d1, l, hd.data(),
-                         wRows.data(), rsp.data(), lio.dq0, lio.dq1, SVX_ELAPSED, imp0, imp1,
-                         true, ref0, ref1);
-        float* o = &wantIo[32 * 32 + l * 32];
-        const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
-        for (int v = 0; v < 4; ++v)
+    // mirror; clampVariant selects gExt1DClampVariant (0 = the CUDA)
+    auto mirror = [&](int clampVariant, std::vector<float>& outIo) {
+        std::vector<PxgTGSBlockSolverConstraint1DCon> w = rows;
+        outIo = io.data;
+        gExt1DClampVariant = clampVariant;
+        for (uint32_t l = 0; l < SVX_LANES; ++l)
         {
-            o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
-            o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            LaneIo lio = svxLaneIo(l, 91);
+            UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+            refSolveExt1DTGS(batch, lio.vel0, lio.vel1, lio.d0, lio.d1, l, hd.data(),
+                             w.data(), rsp.data(), lio.dq0, lio.dq1, SVX_ELAPSED, imp0, imp1,
+                             true, ref0, ref1);
+            float* o = &outIo[32 * 32 + l * 32];
+            const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
+            for (int v = 0; v < 4; ++v)
+            {
+                o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
+                o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            }
+            o[24] = 0.f; o[25] = 0.f; o[26] = 0.f;   // the 1D entry writes a zero error
         }
-        o[24] = 0.f; o[25] = 0.f; o[26] = 0.f;   // the 1D entry writes a zero error
+        gExt1DClampVariant = 0;
+        return w;
+    };
+    std::vector<float> wantIo;
+    const std::vector<PxgTGSBlockSolverConstraint1DCon> wRows = mirror(0, wantIo);
+
+    // r1 witness coverage: the zero-limit rows' CUDA stores, and the rows on which each of the
+    // two non-CUDA spellings (selects, glibc) would store the other zero
+    auto bitsOf = [](const float& f) { uint32_t b; std::memcpy(&b, &f, 4); return b; };
+    uint32_t zeroLimitNegStore = 0, selectsDiffer = 0, glibcDiffer = 0;
+    {
+        std::vector<float> ioSel, ioGlibc;
+        const std::vector<PxgTGSBlockSolverConstraint1DCon> rSel = mirror(1, ioSel);
+        const std::vector<PxgTGSBlockSolverConstraint1DCon> rGlibc = mirror(2, ioGlibc);
+        for (uint32_t l = 1; l < SVX_LANES; l += 2u)
+        {
+            const uint32_t rc = (l * 5 + 1) % (SVX_MAX_ROWS + 1);
+            for (uint32_t i = 0; i < rc; ++i)
+            {
+                const uint32_t mode = (l + i) % 5u;
+                if (mode != 2u && mode != 3u)
+                    continue;
+                const uint32_t r = SVX_START_CONSTRAINT + i;
+                const uint32_t b = bitsOf(wRows[r].appliedForce[l]);
+                if (b == 0x80000000u) ++zeroLimitNegStore;
+                if (bitsOf(rSel[r].appliedForce[l]) != b) ++selectsDiffer;
+                if (bitsOf(rGlibc[r].appliedForce[l]) != b) ++glibcDiffer;
+            }
+        }
     }
+    std::printf("[ info ] svx 1d(ref %g/%g): %u zero-limit drive rows, %u store -0; the selects"
+                " spelling differs on %u, the glibc spelling on %u\n",
+                double(ref0), double(ref1), nZeroLimitRows, zeroLimitNegStore, selectsDiffer,
+                glibcDiffer);
+    PXG_CHECK_MSG(nZeroLimitRows == 20u && zeroLimitNegStore >= 10u && selectsDiffer >= 5u &&
+                      glibcDiffer >= 5u,
+                  "P9.86c r1: the zero-limit drive rows lost their zero-tie coverage (%u rows, %u -0,"
+                  " selects %u, glibc %u)", nZeroLimitRows, zeroLimitNegStore, selectsDiffer,
+                  glibcDiffer);
 
     std::vector<PxgDevicePtr> bufs;
     auto up = [&](const void* p, size_t n) {
