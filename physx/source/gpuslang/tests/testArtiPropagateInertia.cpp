@@ -688,6 +688,16 @@ static uint32_t loopTotalDofs(uint32_t k, uint32_t numLinks)
 
 static size_t gClampFires = 0;   // how often PxMax(0, .) actually changed a value
 
+// P9.86c: the clamp's own mutant twin.  0 = the CUDA's PxMax<float>, i.e. the float
+// specialisation `intrinsics::selectMax` = `a > b ? a : b` (PxMath.h:82,
+// PxUnixMathIntrinsics.h:122), which for PxMax(0, x) RETURNS x = -0 as -0.
+// 1 = PxMath.h's generic template `a < b ? b : a`, the port's pre-P9.86 spelling
+// (the revert r7), which turns x = -0 into +0.  Only the directed test below sets it.
+static int gClampVariant = 0;
+// clamp input exactly -0 over a parent diagonal of exactly -0: the only shape in
+// which the clamp's sign of zero reaches the stored `parent + W`
+static size_t gClampNegZeroSeen = 0;
+
 // ---------------------------------------------------------------------------
 // The loop mirror: the CUDA's control flow around apiMirror
 // ---------------------------------------------------------------------------
@@ -737,15 +747,21 @@ static void apiLoopMirror(PxgArticulationBlockLinkData* lk, PxgArticulationBlock
 
         refTranslateInertia(refSkewSymmetric(rw.x, rw.y, rw.z), spatialInertiaW);
 
+        const float parentDiag[3] = { parentInertia.bottomLeft.column0.x,
+                                      parentInertia.bottomLeft.column1.y,
+                                      parentInertia.bottomLeft.column2.z };
         float* diag[3] = { &spatialInertiaW.bottomLeft.column0.x,
                            &spatialInertiaW.bottomLeft.column1.y,
                            &spatialInertiaW.bottomLeft.column2.z };
         for (uint32_t c = 0; c < 3; ++c)
         {
             const float before = *diag[c];
-            *diag[c] = PxMax(0.f, before);
+            // PxMax<float> is selectMax -- the CUDA semantics; the twin is the revert
+            *diag[c] = gClampVariant ? ((0.f < before) ? before : 0.f) : PxMax(0.f, before);
             if (f2u(*diag[c]) != f2u(before))
                 ++gClampFires;
+            if (f2u(before) == 0x80000000u && f2u(parentDiag[c]) == 0x80000000u)
+                ++gClampNegZeroSeen;
         }
 
         storeSpatialMatrix(lk[parent].mSpatialArticulatedInertia, lane,
@@ -950,6 +966,206 @@ PXG_TEST(artiArticulatedInertia)
     PXG_CHECK_MSG(gClampFires > 0,
                   "PxMax(0, .) must actually clamp something, or the guard is untested");
     PXG_CHECK_MSG(bad == 0, "the leaf-to-root sweep matches the engine-built mirror");
+
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
+    shim.memFree(dJf);
+}
+
+// ===========================================================================
+// P9.86c: the clamp keeps the CUDA's -0 (PxMax<float> is selectMax)
+// ===========================================================================
+//
+// forwardDynamic2.cu:1641-1649 clamps the three translated bottomLeft diagonals with
+// `PxMax(minPropagatedInertia = 0.f, x)` and stores `parent + W`.  On a float that is
+// the specialisation selectMax, `0 > x ? 0 : x`, which returns x = -0 AS -0.  The
+// port's pre-P9.86 spelling (PxMath.h's generic `a < b ? b : a`, revert r7) returns
+// +0 there.  The store `p + W` absorbs that for every p except p = -0:
+// (-0) + (-0) = -0 against (-0) + (+0) = +0.  The loop fixtures above never make
+// either value, so r7 survived them.
+//
+// ONE directed lane builds both, all finite:
+//   * a fixed-base 2-link articulation whose child is eFIX (no dofs, the propagate
+//     term is SpatialMatrix(PxZero), so W is the child's own inertia) at a ZERO
+//     offset rw = (+0, +0, +0) -- +0, because -0 components flip the skew's signs;
+//   * the skew of +0 has rows (+0,-0,+0), (+0,+0,-0), (-0,+0,+0), so every product
+//     sTod[j][k] * TL[k][j] of the translated diagonal is a signed zero.  The child
+//     topLeft is sign-patterned so that ALL of them are -0; `br = sTod*TR + TL^T` is
+//     then exactly TL^T and (br * dTos)[j][j] is the same three -0 products.  With a
+//     -0 child bottomLeft diagonal every term is -0 and the pre-clamp diagonal is
+//     -0 (and stays -0 if any `0 * x` were folded, since every remaining term is -0);
+//   * the parent's bottomLeft diagonal is -0 as well.
+// Every other word of the lane is a nonzero sum (checked by the twin: exactly the
+// three parent diagonal words move).
+//
+// THE DATA IS DELIBERATELY NOT A PHYSICAL (PSD) INERTIA, and it cannot be: an
+// engine-seeded inertia (transformInertiaTensor's (d*M)*M terms) never has a -0
+// diagonal, and a point mass (TL = 0, TR = m*I) makes br all +0 and the translated
+// diagonal +0.  The kernel accepts any finite articulated inertia, and the loop
+// fixtures above already feed dense, non-symmetric, sign-mixed ones -- the clamp
+// exists precisely because the propagated diagonal is not guaranteed positive.  A
+// fixed base keeps invertInertia off this degenerate root.
+PXG_TEST(artiArticulatedInertiaClampNegZero)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npArtiPropagateInertia.spv", "artiArticulatedInertia", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiPropagateLoader);
+
+    std::vector<PxgArticulationBlockLinkData> lkImg(LMAX_LINKS);
+    std::vector<PxgArticulationBlockDofData> dfImg(LMAX_DOFS);
+    std::vector<PxgArticulationBlockData> abImg(1);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(PxgArticulationBlockData));
+
+    const uint32_t lane = 0;
+    const float nz = -0.0f;
+    abImg[0].mNumLinks[lane] = 2;
+    abImg[0].mFlags[lane] = PxU32(PxArticulationFlag::eFIX_BASE);
+
+    // PxMat33(col0, col1, col2)
+    const SpatialMatrix parentM(
+        PxMat33(PxVec3(0.5f, -0.25f, 0.125f), PxVec3(0.375f, 0.625f, -0.75f),
+                PxVec3(-0.875f, 0.25f, 1.0f)),
+        PxMat33(PxVec3(2.0f, 0.125f, -0.25f), PxVec3(0.375f, 2.0f, 0.5f),
+                PxVec3(-0.625f, 0.75f, 2.0f)),
+        PxMat33(PxVec3(nz, 1.25f, -0.5f), PxVec3(1.25f, nz, 0.75f), PxVec3(-0.5f, 0.75f, nz)));
+    // child topLeft sign pattern: col0 (-,+,-), col1 (-,-,+), col2 (+,-,-) -- the
+    // opposite of the +0 skew's sign in every product of the translated diagonal
+    const SpatialMatrix childM(
+        PxMat33(PxVec3(-1.5f, 0.75f, -1.25f), PxVec3(-0.5f, -1.75f, 0.625f),
+                PxVec3(1.125f, -0.875f, -2.5f)),
+        PxMat33(PxVec3(1.5f, 0.25f, -0.375f), PxVec3(0.125f, 1.5f, 0.5f),
+                PxVec3(-0.25f, 0.375f, 1.5f)),
+        PxMat33(PxVec3(nz, 0.25f, -0.125f), PxVec3(0.25f, nz, 0.375f),
+                PxVec3(-0.125f, 0.375f, nz)));
+
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        PxgArticulationBlockLinkData& b = lkImg[i];
+        const float o = 0.5f * float(i);
+        b.mParents[lane] = 0;
+        b.mDofs[lane] = 0;
+        b.mJointType[lane] = uint8_t(J_FIX);
+        b.mJointOffset[lane] = 0;
+        b.mRw_x[lane] = 0.0f;   // +0: a zero offset
+        b.mRw_y[lane] = 0.0f;
+        b.mRw_z[lane] = 0.0f;
+        storeSpatialMatrix(b.mSpatialArticulatedInertia, lane, i == 0 ? parentM : childM);
+        storeSpatialVector(b.mCoriolis,
+                           UnAlignedSpatialVector(PxVec3(0.5f + o, -0.25f, 0.75f),
+                                                  PxVec3(-1.0f, 0.375f + o, 0.625f)), lane);
+        storeSpatialVector(b.mZAVector,
+                           UnAlignedSpatialVector(PxVec3(0.25f, 0.5f + o, -0.75f),
+                                                  PxVec3(1.25f, -1.5f, 0.875f + o)), lane);
+        storeSpatialVector(b.mZAIntVector,
+                           UnAlignedSpatialVector(PxVec3(-0.375f + o, 0.125f, 1.0f),
+                                                  PxVec3(0.5f, -0.625f, 0.25f + o)), lane);
+    }
+
+    // eFIX reads no joint force; the slice is there so the pointer arithmetic is real
+    std::vector<float> jointForces(LOOP_JF_PER_LANE, 0.75f);
+
+    // ---- the mirror (CUDA semantics) and its twin (the revert) ----
+    std::vector<PxgArticulationBlockLinkData> wantLk = lkImg;
+    std::vector<PxgArticulationBlockDofData> wantDf = dfImg;
+    std::vector<PxgArticulationBlockData> wantAb = abImg;
+    gClampNegZeroSeen = 0;
+    gClampVariant = 0;
+    apiLoopMirror(wantLk.data(), wantDf.data(), wantAb[0], jointForces.data(), false, 2, lane);
+    const size_t seen = gClampNegZeroSeen;
+
+    std::vector<PxgArticulationBlockLinkData> twinLk = lkImg;
+    std::vector<PxgArticulationBlockDofData> twinDf = dfImg;
+    std::vector<PxgArticulationBlockData> twinAb = abImg;
+    gClampVariant = 1;
+    apiLoopMirror(twinLk.data(), twinDf.data(), twinAb[0], jointForces.data(), false, 2, lane);
+    gClampVariant = 0;
+
+    size_t twinDiff = 0, twinFlip = 0;
+    {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(wantLk.data());
+        const uint32_t* t = reinterpret_cast<const uint32_t*>(twinLk.data());
+        for (size_t x = 0; x < wantLk.size() * sizeof(PxgArticulationBlockLinkData) / 4; ++x)
+        {
+            if (w[x] == t[x])
+                continue;
+            ++twinDiff;
+            if (w[x] == 0x80000000u && t[x] == 0u)
+                ++twinFlip;
+        }
+    }
+    std::printf("[ info ] clamp -0: seen %zu, twin differs in %zu link words (%zu are -0 -> +0)\n",
+                seen, twinDiff, twinFlip);
+    PXG_CHECK_MSG(seen == 3,
+                  "all three child pre-clamp diagonals must be -0 over a -0 parent diagonal "
+                  "(got %zu)", seen);
+    PXG_CHECK_MSG(twinDiff == 3 && twinFlip == 3,
+                  "the revert twin must move exactly the parent's three bottomLeft diagonal "
+                  "words from -0 to +0 (differs %zu, flips %zu)", twinDiff, twinFlip);
+    PXG_CHECK_MSG(std::memcmp(wantDf.data(), twinDf.data(),
+                              wantDf.size() * sizeof(PxgArticulationBlockDofData)) == 0 &&
+                      std::memcmp(wantAb.data(), twinAb.data(),
+                                  wantAb.size() * sizeof(PxgArticulationBlockData)) == 0,
+                  "the clamp twin touches only the parent link's inertia");
+
+    // ---- the GPU ----
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0, dJf = 0;
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(PxgArticulationBlockData));
+    shim.memAlloc(&dJf, jointForces.size() * sizeof(float));
+    if (!dLk || !dDf || !dAb || !dJf)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dJf, jointForces.data(), jointForces.size() * sizeof(float));
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(PxgArticulationBlockData));
+
+    struct Params
+    {
+        uint64_t linkBlocks, dofBlocks, artiBlock, jointForces;
+        uint32_t nbLanes, extEveryIter, pad0, pad1;
+    } prm = { uint64_t(dLk), uint64_t(dDf), uint64_t(dAb), uint64_t(dJf), 1u, 0u, 0u, 0u };
+    PXG_CHECK_MSG(sizeof(prm) == 48, "push-constant blob is %zu bytes", sizeof(prm));
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch artiArticulatedInertia");
+    shim.streamSynchronize();
+
+    std::vector<PxgArticulationBlockLinkData> gotLk(lkImg.size());
+    std::vector<PxgArticulationBlockDofData> gotDf(dfImg.size());
+    std::vector<PxgArticulationBlockData> gotAb(abImg.size());
+    shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(PxgArticulationBlockDofData));
+    shim.memcpyDtoH(gotAb.data(), dAb, gotAb.size() * sizeof(PxgArticulationBlockData));
+
+    size_t bad = 0, signedZeros = 0;
+    auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+        for (size_t x = 0; x < bytes / 4; ++x)
+        {
+            if (w[x] == g[x])
+                continue;
+            if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
+                ++signedZeros;   // counted for the message, never forgiven
+            if (bad < 12)
+                std::printf("MM %s word %zu  ref %08x  gpu %08x\n", what, x, w[x], g[x]);
+            ++bad;
+        }
+    };
+    cmp("link", wantLk.data(), gotLk.data(), wantLk.size() * sizeof(PxgArticulationBlockLinkData));
+    cmp("dof", wantDf.data(), gotDf.data(), wantDf.size() * sizeof(PxgArticulationBlockDofData));
+    cmp("arti", wantAb.data(), gotAb.data(), wantAb.size() * sizeof(PxgArticulationBlockData));
+
+    std::printf("[ info ] clamp -0: +-0 mismatches %zu, mismatches %zu\n", signedZeros, bad);
+    PXG_CHECK_MSG(bad == 0, "the clamp keeps the CUDA's -0 (selectMax), bit for bit");
 
     shim.memFree(dLk);
     shim.memFree(dDf);
