@@ -49,10 +49,13 @@ const char* const kName[NOUT] = { "0 - (+0)", "(-0) + 0", "0 + (-0)", "0 * (-0)"
                                   "(-0) + pz", "pz - (+0)", "(0,0,0) * -1", "e=0; e -= +0",
                                   "(a,0,0)+(0,-0,..)", "unrolled 0 seed", "-0 + 0*pz", "select +0" };
 
-std::vector<uint32_t> run(const char* spv)
+// in[0] = pz, in[1] = nz: the probe's +0 / -0.  `swapZeros` loads them the other way
+// round (pz = -0, nz = +0), which turns row 11 into min(-0,+0) and row 12 into
+// max(+0,-0) without touching the shader; the other rows are then not meaningful.
+std::vector<uint32_t> run(const char* spv, bool swapZeros = false)
 {
     PxgSlangComputeDevice* dev = testDevice();
-    const std::vector<float> in = { 0.0f, -0.0f, -1.0f, 0.0f };
+    const std::vector<float> in = { swapZeros ? -0.0f : 0.0f, swapZeros ? 0.0f : -0.0f, -1.0f, 0.0f };
     const std::vector<uint32_t> outInit(NOUT, 0xDEADBEEFu);
     PxgBufferHandle bIn = createBufferFrom(dev, in);
     PxgBufferHandle bOut = createBufferFrom(dev, outInit);
@@ -88,4 +91,25 @@ PXG_TEST(p86SignedZero)
     // The select spelling the port uses for the folds the mode does not stop (rows 0, 4,
     // 18, 19, 20): IEEE in both builds, whatever the driver does.
     PXG_CHECK_MSG(plain[22] == kIeee[22] && sz[22] == kIeee[22], "select spelling lost the sign of zero");
+
+    // P9.86c F4: in a stamped shader llvmpipe orders the zeros of FMin/FMax -0 < +0 in
+    // EITHER operand order -- NIR's fmin/fmax are commutative with fmin(+-0,-+0) = -0,
+    // and llvmpipe (lower_fminmax_signed_zero, lp_screen.c) has nir_lower_alu rewrite
+    // every signed-zero-preserving fmin/fmax to feq(a,b) ? imin/imax(bits) : fmin/fmax,
+    // before gallivm picks an operand order.  That is NVIDIA's fminf/fmaxf zero rule,
+    // and the EQUIVALENT verdict of npCvxCollide-r0 (epaCore's triangle-distance scan as
+    // a plain min() chain, npCvxCollide.slang ~:744 vs epa.cuh:430-436) rests on it.
+    // Pin both orders in the stamped build; the unstamped build (no lowering, x86 minps
+    // /maxps keep the second operand on a tie) is only printed.
+    const std::vector<uint32_t> plainSw = run("p86SignedZero.spv", true);
+    const std::vector<uint32_t> szSw = run("p86SignedZeroSz.spv", true);
+    std::printf("  %-18s %-10s %-10s %-10s\n", "F4 zero tie", "NVIDIA", "plain", "SZINP");
+    std::printf("  %-18s %08x   %08x   %08x\n", "min(+0,-0)", N0, plain[11], sz[11]);
+    std::printf("  %-18s %08x   %08x   %08x\n", "min(-0,+0)", N0, plainSw[11], szSw[11]);
+    std::printf("  %-18s %08x   %08x   %08x\n", "max(-0,+0)", P0, plain[12], sz[12]);
+    std::printf("  %-18s %08x   %08x   %08x\n", "max(+0,-0)", P0, plainSw[12], szSw[12]);
+    PXG_CHECK_MSG(sz[11] == N0 && szSw[11] == N0,
+                  "FMin zero tie no longer -0 in both orders (%08x / %08x) -- npCvxCollide-r0 needs a kill", sz[11], szSw[11]);
+    PXG_CHECK_MSG(sz[12] == P0 && szSw[12] == P0,
+                  "FMax zero tie no longer +0 in both orders (%08x / %08x)", sz[12], szSw[12]);
 }
