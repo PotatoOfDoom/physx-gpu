@@ -46,6 +46,13 @@
 //     must survive into mPreTransform, the others' must become 0.  A port that
 //     unifies the two paths fails on one or the other.
 //  4. rootPreMotionVelocity is written through the RECORD, not the block.
+//  5. (P9.86c) THE CLAMP IS PxMin<float> = selectMin, `a < b ? a : b`
+//     (forwardDynamic2.cu:995, PxUnixMathIntrinsics.h:116-119): on a +-0 tie the
+//     SECOND operand survives, so PxMin(-0, +0) = +0.  GLSL FMin as llvmpipe runs it
+//     gives -0 there.  Lanes 5-7 carry +-0 velocity limits (setMaxJointVelocity is
+//     unvalidated; forwardDynamic2.cu:538/717 copy it verbatim), so pass one meets
+//     the tie, and the sign of the resulting zero ratio shows in EVERY stored joint
+//     velocity (jVel * ratio).  Mutant twins of the clamp must change the image.
 //
 // The link loop is strictly sequential -- link 3's parent is link 2, whose motion
 // velocity was written one iteration earlier -- so the host expectation replays it
@@ -72,10 +79,31 @@ using physx::gpuslang::PxgResult;
 
 static std::vector<uint8_t> jcalcVelLoader(const char* file) { return loadShaderBlob(file); }
 
-static const uint32_t LANES = 5;
+static const uint32_t LANES = 8;       // 5 generic + 3 signed-zero-limit lanes (note 5)
 static const uint32_t NB_LINKS = 4;
 static const uint32_t DOF_BLOCKS = 7;   // 6 used + 1 spare; distinct from LANES/NB_LINKS
 static const uint32_t GUARD = 128;
+
+// P9.86c twins of the pass-one clamp.  0 = the CUDA: PxMin<float> = selectMin
+// (forwardDynamic2.cu:995, PxUnixMathIntrinsics.h:116-119), b survives a +-0 tie and a
+// NaN.  1 = GLSL FMin as llvmpipe runs it (F4: -0 wins a +-0 tie in either order, a NaN
+// operand is ignored).  2 = a min that keeps the FIRST operand on a tie.
+static int gRatioMinVariant = 0;
+static uint32_t ratioBitsOf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float ratioMin(float a, float b)
+{
+    if (gRatioMinVariant == 1)
+    {
+        if (b != b) return a;
+        if (a != a) return b;
+        if (a == 0.0f && b == 0.0f)
+            return ((ratioBitsOf(a) | ratioBitsOf(b)) >> 31) ? -0.0f : 0.0f;
+        return (a < b) ? a : b;
+    }
+    if (gRatioMinVariant == 2)
+        return (a <= b) ? a : b;
+    return physx::PxMin(a, b);
+}
 
 PXG_TEST(artiJcalcLinkVel)
 {
@@ -138,6 +166,20 @@ PXG_TEST(artiJcalcLinkVel)
         dofIn[size_t(L) * DOF_BLOCKS + 1].jVel = 0.0f;
         dofIn[size_t(L) * DOF_BLOCKS + 1].maxJVel = 0.0f;
     }
+
+    // Signed-zero velocity limits (note 5).  setMaxJointVelocity is unvalidated and
+    // forwardDynamic2.cu:538/717 copy the limit verbatim; with jVel != 0 the quotient
+    // is a zero carrying the limit's sign, so pass one meets PxMin's +-0 tie.
+    const uint32_t ZL_NEGPOS = 5, ZL_POSNEG = 6, ZL_MID = 7;
+    auto dofAt = [&](uint32_t L, uint32_t d) -> DofIn& { return dofIn[size_t(L) * DOF_BLOCKS + d]; };
+    dofAt(ZL_NEGPOS, 0).maxJVel = -0.0f;                  // ratio 1 -> -0
+    dofAt(ZL_NEGPOS, USED_DOFS - 1).maxJVel = 0.0f;       // PxMin(-0, +0) = +0
+    dofAt(ZL_POSNEG, 0).maxJVel = 0.0f;                   // ratio 1 -> +0
+    dofAt(ZL_POSNEG, USED_DOFS - 1).maxJVel = -0.0f;      // PxMin(+0, -0) = -0
+    dofAt(ZL_MID, 3).jVel = -dofAt(ZL_MID, 3).jVel;       // |jVel| exercised
+    dofAt(ZL_MID, 3).maxJVel = -0.0f;                     // -0 picked up mid-way
+    dofAt(ZL_MID, USED_DOFS - 1).jVel = -dofAt(ZL_MID, USED_DOFS - 1).jVel;
+    dofAt(ZL_MID, USED_DOFS - 1).maxJVel = 0.0f;          // PxMin(-0, +0) = +0
 
     const size_t LINK_BLOCK = sizeof(PxgArticulationBlockLinkData);
     const size_t DOF_BLOCK = sizeof(PxgArticulationBlockDofData);
@@ -232,97 +274,137 @@ PXG_TEST(artiJcalcLinkVel)
     shim.streamSynchronize();
 
     // ---- the ORACLE: the engine's own arithmetic, on the host ----
-    std::vector<uint8_t> wLink = linkImg, wDof = dofImg, wRPMV = rpmvImg;
+    // Built as a function of the clamp variant (note 5): 0 is the CUDA and is what the
+    // device must match; 1 and 2 are mutant twins that must produce a different image.
+    uint32_t negPosTie = 0, posNegTie = 0;   // coverage, counted for variant 0 only
+    std::vector<uint32_t> ratioBits(LANES, 0xFFFFFFFFu);
+    auto buildExpected = [&](int variant, std::vector<uint8_t>& wLink, std::vector<uint8_t>& wDof,
+                             std::vector<uint8_t>& wRPMV) {
+        wLink = linkImg;
+        wDof = dofImg;
+        wRPMV = rpmvImg;
+        gRatioMinVariant = variant;
 
-    for (uint32_t L = 0; L < LANES; ++L)
-    {
-        const LinkIn& root = linkIn[size_t(L) * NB_LINKS];
-
-        // the root's pre-transform: a RAW copy, p.w included
-        const size_t rpt = offsetof(LK, mPreTransform);
-        putF(wLink, rpt + 0 + size_t(L) * 16 + 0, root.q.x);
-        putF(wLink, rpt + 0 + size_t(L) * 16 + 4, root.q.y);
-        putF(wLink, rpt + 0 + size_t(L) * 16 + 8, root.q.z);
-        putF(wLink, rpt + 0 + size_t(L) * 16 + 12, root.q.w);
-        putF(wLink, rpt + 512 + size_t(L) * 16 + 0, root.p.x);
-        putF(wLink, rpt + 512 + size_t(L) * 16 + 4, root.p.y);
-        putF(wLink, rpt + 512 + size_t(L) * 16 + 8, root.p.z);
-        putF(wLink, rpt + 512 + size_t(L) * 16 + 12, root.pw);
-
-        // pass one: the clamp ratio, over every dof, engine PxMin/PxAbs
-        PxReal ratio = 1.0f;
+        for (uint32_t L = 0; L < LANES; ++L)
         {
-            uint32_t cursor = 0;
-            for (uint32_t l = 1; l < NB_LINKS; ++l)
-                for (uint32_t ind = 0; ind < dofCount[l]; ++ind)
-                {
-                    const DofIn& in = dofIn[size_t(L) * DOF_BLOCKS + cursor];
-                    if (in.jVel != 0.0f)
-                        ratio = PxMin(ratio, in.maxJVel / PxAbs(in.jVel));
-                    ++cursor;
-                }
-        }
+            const LinkIn& root = linkIn[size_t(L) * NB_LINKS];
 
-        // the root's pre-motion velocity, through the record
-        {
-            const size_t off = size_t(L) * sizeof(Cm::UnAlignedSpatialVector);
-            putF(wRPMV, off + 0, root.mv.top.x);
-            putF(wRPMV, off + 4, root.mv.top.y);
-            putF(wRPMV, off + 8, root.mv.top.z);
-            putF(wRPMV, off + 12, root.mv.bottom.x);
-            putF(wRPMV, off + 16, root.mv.bottom.y);
-            putF(wRPMV, off + 20, root.mv.bottom.z);
-        }
+            // the root's pre-transform: a RAW copy, p.w included
+            const size_t rpt = offsetof(LK, mPreTransform);
+            putF(wLink, rpt + 0 + size_t(L) * 16 + 0, root.q.x);
+            putF(wLink, rpt + 0 + size_t(L) * 16 + 4, root.q.y);
+            putF(wLink, rpt + 0 + size_t(L) * 16 + 8, root.q.z);
+            putF(wLink, rpt + 0 + size_t(L) * 16 + 12, root.q.w);
+            putF(wLink, rpt + 512 + size_t(L) * 16 + 0, root.p.x);
+            putF(wLink, rpt + 512 + size_t(L) * 16 + 4, root.p.y);
+            putF(wLink, rpt + 512 + size_t(L) * 16 + 8, root.p.z);
+            putF(wLink, rpt + 512 + size_t(L) * 16 + 12, root.pw);
 
-        // pass two, replayed in order -- link 3 reads link 2's freshly written velocity
-        std::vector<Cm::UnAlignedSpatialVector> mv(NB_LINKS);
-        mv[0] = root.mv;
-        uint32_t cursor = 0;
-        for (uint32_t l = 1; l < NB_LINKS; ++l)
-        {
-            const LinkIn& in = linkIn[size_t(L) * NB_LINKS + l];
-            const LinkIn& pin = linkIn[size_t(L) * NB_LINKS + parents[l]];
-            const size_t blk = size_t(l) * LINK_BLOCK;
-
-            const PxTransform body2World(in.p, in.q);
-            Cm::UnAlignedSpatialVector v = mv[parents[l]];
-
-            // the link's pre-transform goes through storeSpatialTransform: p.w = 0
-            const size_t pt = blk + offsetof(LK, mPreTransform);
-            putF(wLink, pt + 0 + size_t(L) * 16 + 0, in.q.x);
-            putF(wLink, pt + 0 + size_t(L) * 16 + 4, in.q.y);
-            putF(wLink, pt + 0 + size_t(L) * 16 + 8, in.q.z);
-            putF(wLink, pt + 0 + size_t(L) * 16 + 12, in.q.w);
-            putF(wLink, pt + 512 + size_t(L) * 16 + 0, in.p.x);
-            putF(wLink, pt + 512 + size_t(L) * 16 + 4, in.p.y);
-            putF(wLink, pt + 512 + size_t(L) * 16 + 8, in.p.z);
-            putF(wLink, pt + 512 + size_t(L) * 16 + 12, 0.0f);   // NOT in.pw
-
-            const PxVec3 rw = in.p - pin.p;
-            putF(wLink, blk + offsetof(LK, mRw_x) + size_t(L) * 4, rw.x);
-            putF(wLink, blk + offsetof(LK, mRw_y) + size_t(L) * 4, rw.y);
-            putF(wLink, blk + offsetof(LK, mRw_z) + size_t(L) * 4, rw.z);
-
-            v.bottom += (-rw).cross(v.top);   // translateSpatialVectorInPlace
-
-            for (uint32_t ind = 0; ind < dofCount[l]; ++ind)
+            // pass one: the clamp ratio, over every dof, engine PxMin/PxAbs
+            PxReal ratio = 1.0f;
             {
-                const DofIn& din = dofIn[size_t(L) * DOF_BLOCKS + cursor];
-                const size_t db = size_t(cursor) * DOF_BLOCK;
+                uint32_t cursor = 0;
+                for (uint32_t l = 1; l < NB_LINKS; ++l)
+                    for (uint32_t ind = 0; ind < dofCount[l]; ++ind)
+                    {
+                        const DofIn& in = dofIn[size_t(L) * DOF_BLOCKS + cursor];
+                        if (in.jVel != 0.0f)
+                        {
+                            const PxReal r = in.maxJVel / PxAbs(in.jVel);
+                            if (variant == 0 && ratio == 0.0f && r == 0.0f)
+                            {
+                                const uint32_t sa = ratioBitsOf(ratio) >> 31, sb = ratioBitsOf(r) >> 31;
+                                if (sa && !sb) ++negPosTie;   // (-0,+0): select keeps +0, FMin gives -0
+                                if (!sa && sb) ++posNegTie;   // (+0,-0): select keeps -0, keep-first gives +0
+                            }
+                            ratio = ratioMin(ratio, r);   // variant 0: the engine's PxMin
+                        }
+                        ++cursor;
+                    }
+            }
+            if (variant == 0)
+                ratioBits[L] = ratioBitsOf(ratio);
 
-                // THE ENGINE'S OWN rotate
-                const Cm::UnAlignedSpatialVector worldCol = din.lmm.rotate(body2World);
-                const PxReal jVel = din.jVel * ratio;
-                v += worldCol * jVel;
-
-                putF(wDof, db + offsetof(DF, mJointVelocities) + size_t(L) * 4, jVel);
-                putSV(wDof, db, offsetof(DF, mWorldMotionMatrix), L, worldCol);
-                ++cursor;
+            // the root's pre-motion velocity, through the record
+            {
+                const size_t off = size_t(L) * sizeof(Cm::UnAlignedSpatialVector);
+                putF(wRPMV, off + 0, root.mv.top.x);
+                putF(wRPMV, off + 4, root.mv.top.y);
+                putF(wRPMV, off + 8, root.mv.top.z);
+                putF(wRPMV, off + 12, root.mv.bottom.x);
+                putF(wRPMV, off + 16, root.mv.bottom.y);
+                putF(wRPMV, off + 20, root.mv.bottom.z);
             }
 
-            putSV(wLink, blk, offsetof(LK, mMotionVelocity), L, v);
-            mv[l] = v;
+            // pass two, replayed in order -- link 3 reads link 2's freshly written velocity
+            std::vector<Cm::UnAlignedSpatialVector> mv(NB_LINKS);
+            mv[0] = root.mv;
+            uint32_t cursor = 0;
+            for (uint32_t l = 1; l < NB_LINKS; ++l)
+            {
+                const LinkIn& in = linkIn[size_t(L) * NB_LINKS + l];
+                const LinkIn& pin = linkIn[size_t(L) * NB_LINKS + parents[l]];
+                const size_t blk = size_t(l) * LINK_BLOCK;
+
+                const PxTransform body2World(in.p, in.q);
+                Cm::UnAlignedSpatialVector v = mv[parents[l]];
+
+                // the link's pre-transform goes through storeSpatialTransform: p.w = 0
+                const size_t pt = blk + offsetof(LK, mPreTransform);
+                putF(wLink, pt + 0 + size_t(L) * 16 + 0, in.q.x);
+                putF(wLink, pt + 0 + size_t(L) * 16 + 4, in.q.y);
+                putF(wLink, pt + 0 + size_t(L) * 16 + 8, in.q.z);
+                putF(wLink, pt + 0 + size_t(L) * 16 + 12, in.q.w);
+                putF(wLink, pt + 512 + size_t(L) * 16 + 0, in.p.x);
+                putF(wLink, pt + 512 + size_t(L) * 16 + 4, in.p.y);
+                putF(wLink, pt + 512 + size_t(L) * 16 + 8, in.p.z);
+                putF(wLink, pt + 512 + size_t(L) * 16 + 12, 0.0f);   // NOT in.pw
+
+                const PxVec3 rw = in.p - pin.p;
+                putF(wLink, blk + offsetof(LK, mRw_x) + size_t(L) * 4, rw.x);
+                putF(wLink, blk + offsetof(LK, mRw_y) + size_t(L) * 4, rw.y);
+                putF(wLink, blk + offsetof(LK, mRw_z) + size_t(L) * 4, rw.z);
+
+                v.bottom += (-rw).cross(v.top);   // translateSpatialVectorInPlace
+
+                for (uint32_t ind = 0; ind < dofCount[l]; ++ind)
+                {
+                    const DofIn& din = dofIn[size_t(L) * DOF_BLOCKS + cursor];
+                    const size_t db = size_t(cursor) * DOF_BLOCK;
+
+                    // THE ENGINE'S OWN rotate
+                    const Cm::UnAlignedSpatialVector worldCol = din.lmm.rotate(body2World);
+                    const PxReal jVel = din.jVel * ratio;
+                    v += worldCol * jVel;
+
+                    putF(wDof, db + offsetof(DF, mJointVelocities) + size_t(L) * 4, jVel);
+                    putSV(wDof, db, offsetof(DF, mWorldMotionMatrix), L, worldCol);
+                    ++cursor;
+                }
+
+                putSV(wLink, blk, offsetof(LK, mMotionVelocity), L, v);
+                mv[l] = v;
+            }
         }
+        gRatioMinVariant = 0;
+    };
+
+    std::vector<uint8_t> wLink, wDof, wRPMV;
+    buildExpected(0, wLink, wDof, wRPMV);
+    PXG_CHECK_MSG(negPosTie == 2 && posNegTie == 1,
+                  "zero-limit lanes: %u (-0,+0) and %u (+0,-0) PxMin ties, want 2 and 1",
+                  negPosTie, posNegTie);
+    PXG_CHECK_MSG(ratioBits[ZL_NEGPOS] == 0x00000000u && ratioBits[ZL_POSNEG] == 0x80000000u &&
+                      ratioBits[ZL_MID] == 0x00000000u,
+                  "zero-limit ratios %08x %08x %08x, want +0 -0 +0", ratioBits[ZL_NEGPOS],
+                  ratioBits[ZL_POSNEG], ratioBits[ZL_MID]);
+    for (int v = 1; v <= 2; ++v)
+    {
+        std::vector<uint8_t> tl, td, tr;
+        buildExpected(v, tl, td, tr);
+        PXG_CHECK_MSG(td != wDof,
+                      "ratio twin %d gives the same dof image -- the zero-limit lanes do not "
+                      "observe PxMin's +-0 tie", v);
     }
 
     // ---- compare ----
@@ -355,10 +437,11 @@ PXG_TEST(artiJcalcLinkVel)
     shim.memFree(dRPMV);
 
     PXG_CHECK_MSG(bad == 0, "%zu byte(s) wrong", bad);
-    std::printf("  jcalc link velocities: 5 articulations, 4 links (branch + chain), dofs "
+    std::printf("  jcalc link velocities: 8 articulations (3 with +-0 velocity limits: %u "
+                "(-0,+0) and %u (+0,-0) PxMin ties), 4 links (branch + chain), dofs "
                 "2/1/3 -- bit-exact against the engine's own rotate and cross; the clamp "
                 "ratio set by the last dof; the root's pre-transform p.w preserved and the "
-                "links' zeroed\n");
+                "links' zeroed\n", negPosTie, posNegTie);
 }
 
 } // namespace

@@ -961,7 +961,8 @@ PXG_TEST(artiUnconstrainedVel)
 
             const float jv = fval(k, 101);
             const float mx = fval(k, 84);
-            const float ratio = (jv != 0.0f && (mx / PxAbs(jv)) < 1.0f) ? (mx / PxAbs(jv)) : 1.0f;
+            // forwardDynamic2.cu:995 verbatim: PxMin<float> = selectMin (b on a tie / NaN)
+            const float ratio = (jv != 0.0f) ? PxMin(1.0f, mx / PxAbs(jv)) : 1.0f;
             const uint32_t gotJv =
                 getU32(df, dfB + offsetof(PxgArticulationBlockDofData, mJointVelocities) + lane * 4);
             if (gotJv != bits(jv * ratio)) fail("dof0 mJointVelocities", k, gotJv, bits(jv * ratio));
