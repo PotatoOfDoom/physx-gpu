@@ -178,6 +178,47 @@ PXG_TEST(constraintPrepPGS_contact)
 
     std::mt19937 rng(4100);
     ContactSetup cs = buildContactSetup(rng);
+    // P9.86c: signed-zero directed lanes in the even batches (no rng consumed; compared
+    // bitwise below).
+    //  * maxContactImpulse zero ties: contactConstraintBlockPrep.cuh:402 and :513 are PxMin
+    //    = selectMin (a < b ? a : b; a +-0 tie keeps b), not FMin (min(-0,+0) = -0 on llvmpipe).
+    //    setMaxContactImpulse(-0.0f) passes the API's `maxImpulse >= 0.f` check
+    //    (NpRigidBodyTemplate.h:820) and preIntegration copies it raw; a contact ignored by
+    //    contact modification has maxImpulse +0 (PxContactSet::ignore).
+    //  * a resting pair (all velocities +0) with a zero target velocity and an all-negative
+    //    normal: cTargetVel = n . (0,0,0) = -0, vrel = +0, no bounce, so the CUDA's
+    //    `cTargetVel + 0.f` (cuh:480) stores targetVelocity (+0) - (+0) = +0.
+    cs.bodyData[2].maxImpulse = -0.0f;
+    cs.bodyData[4].maxImpulse = 0.0f; // body 5 keeps its random 100..1000
+    for (uint32_t rb : { 6u, 7u })
+    {
+        Float4& lv = cs.bodyData[rb].initialLinVelXYZ_invMassW;
+        Float4& av = cs.bodyData[rb].initialAngVelXYZ_penBiasClamp;
+        lv = Float4{ 0.f, 0.f, 0.f, lv.w };
+        av = Float4{ 0.f, 0.f, 0.f, av.w };
+    }
+    const float negN = -1.f / std::sqrt(3.f);
+    for (uint32_t k = 0; k < cs.numBatches; k += 2) // descStride >= 4: lanes 0..3 always run
+    {
+        Batch& b = cs.batches[k];
+        // lane 0: (A +0, B -0) -> PxMin(+0,-0) = -0 in every row (pins the operand order)
+        b.bodyAIndex[0] = 4; b.bodyBIndex[0] = 2;
+        // lane 1: (A -0, B +0) -> PxMin(-0,+0) = +0; every point limit is 50..100 > 0
+        b.bodyAIndex[1] = 2; b.bodyBIndex[1] = 4;
+        // lane 3: (A -0, B positive) -> maxImpulse -0; contact 0 ignored (w = +0) -> PxMin(-0,+0) = +0
+        b.bodyAIndex[3] = 2; b.bodyBIndex[3] = 5;
+        cs.cpoints[b.blockContactIndex].targetVel_maxImpulseW[3].w = 0.0f;
+        // lane 2: the resting pair, restitution 0, restDistance 0, separations +-0
+        b.bodyAIndex[2] = 6; b.bodyBIndex[2] = 7;
+        cs.cdata[k].normal_restitutionW[2] = Float4{ negN, negN, negN, 0.f };
+        cs.cdata[k].contactData[2].x = 0.f;
+        for (uint32_t i = 0; i < cs.rowsPerBatch; ++i)
+        {
+            BlockContactPoint& cp = cs.cpoints[b.blockContactIndex + i];
+            cp.targetVel_maxImpulseW[2] = Float4{ 0.f, 0.f, 0.f, cp.targetVel_maxImpulseW[2].w };
+            cp.point_separationW[2].w = (i & 1u) ? 0.0f : -0.0f;
+        }
+    }
 
     const float dt = 1.f / 60.f, invDt = 60.f;
     const float bounceThreshold = -2.f, frictionOffsetThreshold = 0.04f, correlationDistance = 0.025f;
@@ -385,6 +426,16 @@ PXG_TEST(constraintPrepPGS_contact)
         }
     PXG_CHECK_MSG(mism == 0, "%zu header/patch mismatches", mism);
 
+    // P9.86c: rbXn_maxImpulse.w is a pure selection of input floats (two PxMin selects), so
+    // it is compared BITWISE on every row; so are targetVelocity/coeff0/coeff1 of the resting
+    // lane, whose values are exact signed zeros.  The twins model the old port spellings.
+    auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    auto selMin = [](float a, float b) { return (a < b) ? a : b; }; // PxMin<float>
+    auto lpFMin = [](float a, float b) {                               // llvmpipe FMin (F4)
+        return (a == 0.f && b == 0.f) ? (std::signbit(a) ? a : b) : ((a < b) ? a : b);
+    };
+    size_t maxImpBits = 0, bodyTieRows = 0, pointTieRows = 0, orderTieRows = 0;
+    size_t restBits = 0, restNegZeroRows = 0;
     mism = 0;
     for (uint32_t k = 0; k < cs.numBatches; ++k)
         for (uint32_t l = 0; l < cs.batches[k].descStride; ++l)
@@ -399,6 +450,25 @@ PXG_TEST(constraintPrepPGS_contact)
                 if (!eq(gCP[r].resp1[l], refCP[r].resp1[l])) ++mism;
                 if (!eq(gCP[r].coeff0[l], refCP[r].coeff0[l])) ++mism;
                 if (!eq(gCP[r].coeff1[l], refCP[r].coeff1[l])) ++mism;
+
+                const uint32_t rw = bitsOf(refCP[r].rbXn_maxImpulse[l].w);
+                if (bitsOf(gCP[r].rbXn_maxImpulse[l].w) != rw) ++maxImpBits;
+                const float d0 = cs.bodyData[cs.batches[k].bodyAIndex[l]].maxImpulse;
+                const float d1 = cs.bodyData[cs.batches[k].bodyBIndex[l]].maxImpulse;
+                const Float4 tv4 = cs.cpoints[cs.batches[k].blockContactIndex + i].targetVel_maxImpulseW[l];
+                if (bitsOf(selMin(lpFMin(d0, d1), tv4.w)) != rw) ++bodyTieRows;  // old min() at :258 (cuh:402)
+                if (bitsOf(lpFMin(selMin(d0, d1), tv4.w)) != rw) ++pointTieRows; // old min() at :358 (cuh:513)
+                if (bitsOf(selMin(selMin(d1, d0), tv4.w)) != rw) ++orderTieRows; // operands swapped
+                if (k % 2u == 0u && l == 2u) // the resting lane
+                {
+                    if (bitsOf(gCP[r].raXn_targetVelocity[l].w) != bitsOf(refCP[r].raXn_targetVelocity[l].w)) ++restBits;
+                    if (bitsOf(gCP[r].coeff0[l]) != bitsOf(refCP[r].coeff0[l])) ++restBits;
+                    if (bitsOf(gCP[r].coeff1[l]) != bitsOf(refCP[r].coeff1[l])) ++restBits;
+                    const Float4 n4 = cs.cdata[k].normal_restitutionW[l];
+                    const float cTargetVel = n4.x * tv4.x + n4.y * tv4.y + n4.z * tv4.z;
+                    if (bitsOf(cTargetVel) == 0x80000000u && bitsOf(refCP[r].raXn_targetVelocity[l].w) == 0u)
+                        ++restNegZeroRows;
+                }
             }
             const uint32_t nf = refFH[k].numFrictionConstr[l];
             for (uint32_t i = 0; i < nf; ++i)
@@ -411,6 +481,15 @@ PXG_TEST(constraintPrepPGS_contact)
             }
         }
     PXG_CHECK_MSG(mism == 0, "%zu contact/friction row mismatches", mism);
+    std::printf("[ info ] PGS rbXn_maxImpulse.w: body-tie rows %zu, point-tie rows %zu, order rows %zu, "
+                "bit mismatches %zu; resting rows (cTargetVel -0 -> +0) %zu, bit mismatches %zu\n",
+                bodyTieRows, pointTieRows, orderTieRows, maxImpBits, restNegZeroRows, restBits);
+    PXG_CHECK_MSG(maxImpBits == 0, "%zu rbXn_maxImpulse.w words differ bitwise", maxImpBits);
+    PXG_CHECK_MSG(bodyTieRows > 0 && pointTieRows > 0 && orderTieRows > 0,
+                  "the fixture must reach every PxMin zero-tie shape (%zu, %zu, %zu)", bodyTieRows,
+                  pointTieRows, orderTieRows);
+    PXG_CHECK_MSG(restBits == 0, "%zu resting-lane targetVelocity/coeff words differ bitwise", restBits);
+    PXG_CHECK_MSG(restNegZeroRows > 0, "the fixture must reach cTargetVel = -0 on a resting pair");
 
     mism = 0;
     for (uint32_t k = 0; k < cs.numBatches; ++k)

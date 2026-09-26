@@ -236,7 +236,9 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         return;
     }
 
-    const float maxImpulse = std::fmin(d0.maxImpulse, d1.maxImpulse);
+    // PxMin<float> is intrinsics::selectMin (a < b ? a : b; a +-0 tie keeps b), not fmin
+    // (contactConstraintBlockPrep.cuh:402)
+    const float maxImpulse = (d0.maxImpulse < d1.maxImpulse) ? d0.maxImpulse : d1.maxImpulse;
     ch.forceWritebackOffset[lane] = forceWritebackOffset;
     ch.flags[lane] = flags;
     ch.invMass0_1_angDom0_1[lane] = Float4{ invMass0D0, invMass1D1, ims.y, ims.w };
@@ -263,7 +265,8 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         const Vec3 ra = point - bf0p, rb = point - bf1p;
         Vec3 raXn = ra.cross(normal), rbXn = rb.cross(normal);
         const float angNorVel = raXn.dot(angVel0) - rbXn.dot(angVel1);
-        const float slop = solverOffsetSlop * std::fmax(linNorVel == 0.f ? 1.f : angNorVel / linNorVel, 1.f);
+        const float slopRatio = linNorVel == 0.f ? 1.f : angNorVel / linNorVel;
+        const float slop = solverOffsetSlop * ((slopRatio > 1.f) ? slopRatio : 1.f); // PxMax = selectMax (cuh:448)
         raXn.x = std::fabs(raXn.x) < slop ? 0.f : raXn.x;
         raXn.y = std::fabs(raXn.y) < slop ? 0.f : raXn.y;
         raXn.z = std::fabs(raXn.z) < slop ? 0.f : raXn.z;
@@ -297,15 +300,16 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
                 scaledBias = 0.f;
             float unbiasedErr = targetVelocity;
             const float biasedErr = unbiasedErr - scaledBias;
-            if (!isGreater2)
-                unbiasedErr -= std::fmax(0.f, scaledBias);
+            if (!isGreater2) // PxMax(0.f, scaledBias) = selectMax: keeps a -0 scaledBias (cuh:506)
+                unbiasedErr -= (0.f > scaledBias) ? 0.f : scaledBias;
             coeff0 = biasedErr;
             coeff1 = unbiasedErr;
         }
 
         BlockSolverContactPoint& sc = cpoints[outCBase + j];
         sc.raXn_targetVelocity[lane] = Float4{ raI.x, raI.y, raI.z, targetVelocity };
-        sc.rbXn_maxImpulse[lane] = Float4{ rbI.x, rbI.y, rbI.z, std::fmin(maxImpulse, tv4.w) };
+        // PxMin = selectMin (contactConstraintBlockPrep.cuh:513): PxMin(-0, +0) = +0
+        sc.rbXn_maxImpulse[lane] = Float4{ rbI.x, rbI.y, rbI.z, (maxImpulse < tv4.w) ? maxImpulse : tv4.w };
         sc.resp0[lane] = resp0;
         sc.resp1[lane] = resp1;
         sc.coeff0[lane] = coeff0;
