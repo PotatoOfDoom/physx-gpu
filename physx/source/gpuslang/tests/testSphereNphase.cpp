@@ -299,14 +299,39 @@ static RC refCapsuleCapsule(TransformV t0, TransformV t1, float r0, float hh0, f
     return R;
 }
 
-// PxsCombineMaterials (mirrors npInsertPatch combineMaterials)
+static uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// GLSL.std.450 FMin/FMax as llvmpipe evaluates them under the SignedZeroInfNanPreserve stamp
+// (P9.86 F4; nir_lower_alu with lower_fminmax_signed_zero: feq(a,b) ? imin/imax(bits) : fmin/fmax):
+// ordered min/max, and on a +-0 tie min gives -0 and max +0 in either operand order.
+static float fminLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fmaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
+
+// P9.86c mutant twins of the combine below (0 = the CUDA): 1 replays PxMin as FMin
+// (npSphereNphase-r0), 2 PxMax as FMax (npSphereNphase-r1), both as llvmpipe evaluates them.
+// sphereNphase_materialZeroSign requires each twin to change the expected patch words.
+// There is deliberately NO twin for the fDynFriction clamp (npSphereNphase-r2,
+// `max(dynF, 0.0f)`): FMax with a literal +0 source is lowered by nir_lower_alu
+// (lower_fminmax_signed_zero, constant pos_zero && max branch) to bcsel(flt(+0, dynF), dynF, +0),
+// which is the select `dynF > 0 ? dynF : 0` itself, so that revert is equivalent on this
+// driver for every 32-bit dynF.  The case still delivers dynFriction = -0 to the clamp.
+static int gMatVariant = 0;
+
+// PxsCombineMaterials (PxsMaterialCombiner.h:36-170, reached through materialCombiner.cuh:46 from
+// insertIntoPatchStream, contactPatchUtils.cuh:149-159, with the UNSWAPPED shape0/shape1).
+// PxMin/PxMax<float> are intrinsics::selectMin/selectMax (PxMath.h:82-101,
+// PxUnixMathIntrinsics.h:116-125): `a < b ? a : b` / `a > b ? a : b`, so a +-0 tie keeps b --
+// NOT std::fmin/std::fmax, whose zero sign is unspecified.
 static void combineMaterials(const HMaterial& m0, const HMaterial& m1, float& sta, float& dyn,
-                             float& rest, float& damping, uint32_t& flags)
+                             float& rest, float& damping, uint32_t& flags, float* dynRaw = nullptr)
 {
     const uint32_t DISABLE_FRICTION = 1u, DISABLE_STRONG = 2u, ACC_SPRING = 16u;
     auto combine = [](float a, float b, uint32_t mode) -> float {
-        if (mode == 0) return 0.5f * (a + b); if (mode == 1) return std::fmin(a, b);
-        if (mode == 2) return a * b; if (mode == 3) return std::fmax(a, b); return 0.f; };
+        if (mode == 0) return 0.5f * (a + b);                                                // :41/:57
+        if (mode == 1) return (gMatVariant == 1) ? fminLp(a, b) : ((a < b) ? a : b);        // :43/:60
+        if (mode == 2) return a * b;                                                         // :45/:62
+        if (mode == 3) return (gMatVariant == 2) ? fmaxLp(a, b) : ((a > b) ? a : b);        // :47/:64
+        return 0.f; };
     const uint32_t f0 = m0.packedFlags & 0xffffu, f1 = m1.packedFlags & 0xffffu;
     const uint32_t fr0 = (m0.packedFlags >> 16) & 0xffu, fr1 = (m1.packedFlags >> 16) & 0xffu;
     const uint32_t re0 = (m0.packedFlags >> 24) & 0xffu, re1 = (m1.packedFlags >> 24) & 0xffu;
@@ -319,8 +344,15 @@ static void combineMaterials(const HMaterial& m0, const HMaterial& m1, float& st
     if (both && exactlyOneAcc) damping = a0 ? m0.damp : m1.damp;
     else { const uint32_t mode = exactlyOne ? 3u : std::max(dm0, dm1); damping = combine(m0.damp, m1.damp, mode); }
     const uint32_t cf = f0 | f1;
-    if ((cf & DISABLE_FRICTION) == 0) { const uint32_t fm = std::max(fr0, fr1); const float d = combine(m0.dyn, m1.dyn, fm), s = combine(m0.sta, m1.sta, fm); const float fd = std::fmax(d, 0.f); dyn = fd; sta = (s - fd) >= 0.f ? s : fd; flags = cf; }
-    else { flags = cf | DISABLE_STRONG; dyn = 0.f; sta = 0.f; }
+    if ((cf & DISABLE_FRICTION) == 0)
+    {
+        const uint32_t fm = std::max(fr0, fr1);
+        const float d = combine(m0.dyn, m1.dyn, fm), s = combine(m0.sta, m1.sta, fm);
+        const float fd = (d > 0.f) ? d : 0.f;          // :161 PxMax(dynFriction, 0.0f) = selectMax
+        if (dynRaw) *dynRaw = d;
+        dyn = fd; sta = (s - fd) >= 0.f ? s : fd; flags = cf;   // :164 (CUDA branch)
+    }
+    else { flags = cf | DISABLE_STRONG; dyn = 0.f; sta = 0.f; if (dynRaw) *dynRaw = 0.f; }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +402,31 @@ static HShape makeShape(const Vec3& scale, uint32_t mat, uint32_t type)
 
 static std::vector<uint8_t> sphereShimLoader(const char* file) { return loadShaderBlob(file); }
 
+// P9.86c signed-zero material bank at ZS_BANK + k (below 0x10000, clear of bank 1 at 0..7 and
+// bank 2 at 0x10000..7).  Every value is one PxMaterial accepts: NpMaterial.cpp:110/:125 check only
+// PxIsFinite (friction), :140-141 finite and <= 1 (restitution; -0 < 0 is false, so -0 is a
+// rigid, non-compliant material), :161 finite and >= 0 (damping; -0 >= 0 holds).  Combine modes:
+// packedFlags bits 16-23 friction, 24-31 restitution, packedDamp bits 0-7 damping
+// (eAVERAGE 0, eMIN 1, eMULTIPLY 2, eMAX 3).
+static const uint32_t ZS_BANK = 0x2000u;
+static const uint32_t ZS_COUNT = 8u;
+static HMaterial zeroSignMaterial(uint32_t k)
+{
+    const float pz = 0.0f, nz = -0.0f;
+    auto modes = [](uint32_t fric, uint32_t restm) { return (fric << 16) | (restm << 24); };
+    switch (k)
+    {
+    case 0: return { pz, pz, pz, pz, modes(1, 1), 1u };          // +0 everywhere, eMIN
+    case 1: return { nz, nz, nz, nz, modes(1, 1), 1u };          // -0 everywhere, eMIN
+    case 2: return { pz, pz, pz, pz, modes(3, 3), 3u };          // +0 everywhere, eMAX
+    case 3: return { nz, nz, nz, nz, modes(3, 3), 3u };          // -0 everywhere, eMAX
+    case 4: return { 0.3f, 0.5f, -0.5f, pz, modes(0, 0), 0u };   // compliant (rest < 0), damping +0
+    case 5: return { 0.3f, 0.5f, 0.4f, nz, modes(0, 0), 0u };    // rigid, damping -0
+    case 6: return { -0.5f, -0.25f, nz, 0.2f, modes(2, 2), 2u }; // eMULTIPLY, negative friction
+    default: return { pz, 0.3f, 0.5f, nz, modes(2, 2), 2u };     // eMULTIPLY, zero dynamic friction
+    }
+}
+
 static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label)
 {
     using namespace physx::gpuslang;
@@ -393,6 +450,7 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
                                     uint32_t(((i + 1) & 1) * 16u) | (uint32_t((i + 3) % 4) << 16) | (uint32_t((i + 2) % 4) << 24),
                                     uint32_t((i + 1) % 4) };
     }
+    for (uint32_t k = 0; k < ZS_COUNT; ++k) materials[ZS_BANK + k] = zeroSignMaterial(k);
 
     std::vector<HCachedTransform> xcache(2 * n);
     std::vector<float> cdist(2 * n);
@@ -560,10 +618,15 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
 
         float sta, dyn, rest, damping; uint32_t mflags;
         combineMaterials(materials[cfgs[i].mat0 & 0xffffu], materials[cfgs[i].mat1 & 0xffffu], sta, dyn, rest, damping, mflags);
-        if (!almostEqual(pf[7], rest, 2e-5f, 2e-6f)) ++bad;
-        if (!almostEqual(pf[8], dyn, 2e-5f, 2e-6f)) ++bad;
-        if (!almostEqual(pf[9], sta, 2e-5f, 2e-6f)) ++bad;
-        if (!almostEqual(pf[10], damping, 2e-5f, 2e-6f)) ++bad;
+        // P9.86c: the combine is exact IEEE arithmetic plus selects (0.5f * (a + b), a * b, flip * x,
+        // PxMin/PxMax, the :161/:164 clamps), so words 7-10 (restitution, dynamicFriction,
+        // staticFriction, damping) are compared BITWISE, the sign of zero included.
+        {
+            const float want[4] = { rest, dyn, sta, damping };
+            for (uint32_t w = 0; w < 4u; ++w)
+                if (pu[7 + w] != fbits(want[w]))
+                { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=%08x\n", label, i, 7 + w, pu[7 + w], fbits(want[w])); }
+        }
         const uint32_t word11 = ((nb & 0xffu) << 16) | ((mflags & 0xffu) << 24);
         if (pu[11] != word11) ++bad;
         if (pu[12] != ((cfgs[i].mat0 & 0xffffu) << 16)) ++bad;
@@ -661,6 +724,113 @@ PXG_TEST(sphereNphase_allSubCases)
         if (i % 3 == 0) hi[i].mat1 |= 0x10000u;
     }
     checkSphere(hi, 0x00000000u, false, "subCases/matHi");
+}
+
+// P9.86c: the material combine on signed zeros.  PxsCombineMaterials (PxsMaterialCombiner.h)
+// combines with PxMin/PxMax = selectMin/selectMax (b on a tie) and clamps
+// fDynFriction = PxMax(dynFriction, 0.0f) (:161); the port spells all three as selects
+// (npSphereNphase.slang combineScalars, fDyn).  The regular material banks never produce a +-0
+// tie, so these touching sphere pairs (one contact, one patch each) combine the ZS_BANK
+// materials: +-0 ties under eMIN/eMAX in both material orders, the damping forced to eMAX by
+// exactly one compliant material, eMULTIPLY giving dynFriction = -0, and the box-vs-sphere flip
+// path (cudaSphere.cu:108-111), which still combines the UNSWAPPED shape0/shape1 materials
+// (cudaSphere.cu:215 -> contactPatchUtils.cuh:149-159).  checkSphere compares patch words 7-10
+// bitwise against the CUDA mirror; each mutant twin of the mirror (gMatVariant) must change the
+// expected words, so the case keeps observing both select fixes.
+PXG_TEST(sphereNphase_materialZeroSign)
+{
+    struct MatPair { uint32_t a, b; bool flip; uint32_t img[4]; };   // img = CUDA words 7-10
+    const MatPair mp[] = {
+        // eMIN (-0,+0): PxMin keeps b = +0; FMin gives -0 (restitution, staticFriction, damping)
+        { 1, 0, false, { 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u } },
+        // eMIN (+0,-0): -0 either way; dynFriction -0 reaches the :161 clamp
+        { 0, 1, false, { 0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u } },
+        // eMAX (+0,-0): PxMax keeps b = -0; FMax gives +0; dynFriction -0 reaches :161
+        { 2, 3, false, { 0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u } },
+        // eMAX (-0,+0): +0 either way
+        { 3, 2, false, { 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u } },
+        // exactly one compliant: restitution forced eMIN(-0.5, 0.4), damping forced eMAX(+0,-0) = -0
+        { 4, 5, false, { 0xBF000000u, 0x3E99999Au, 0x3F000000u, 0x80000000u } },
+        // forced eMAX(-0,+0) = +0
+        { 5, 4, false, { 0xBF000000u, 0x3E99999Au, 0x3F000000u, 0x00000000u } },
+        // eMULTIPLY: dynFriction -0.5 * +0 = -0; staF -0.075 < fDyn, so sta = fDyn = +0
+        { 6, 7, false, { 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u } },
+        // eMULTIPLY: dynFriction +0 * -0.5 = -0
+        { 7, 6, false, { 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u } },
+        // flip path (box shape0, sphere shape1): eMIN (-0,+0) and eMAX (+0,-0), unswapped order
+        { 1, 0, true,  { 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u } },
+        { 2, 3, true,  { 0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u } },
+    };
+    const uint32_t np = uint32_t(sizeof(mp) / sizeof(mp[0]));
+
+    std::vector<PairCfg> cfgs;
+    for (uint32_t p = 0; p < np; ++p)
+    {
+        if (mp[p].flip)
+            cfgs.push_back({ GT_BOX, Vec3(1, 1, 1), xfT(0, 0, 0), GT_SPHERE, Vec3(0.5f, 0.5f, 0.5f), xfT(0, 0, 0.9f),
+                             0.02f, ZS_BANK + mp[p].a, ZS_BANK + mp[p].b });
+        else
+            cfgs.push_back({ GT_SPHERE, Vec3(1, 1, 1), xfT(0, 0, 0), GT_SPHERE, Vec3(1, 1, 1), xfT(1.5f, 0, 0),
+                             0.02f, ZS_BANK + mp[p].a, ZS_BANK + mp[p].b });
+    }
+
+    // Coverage: the mirror must reproduce the hand-derived CUDA image; the FMin twin must change
+    // restitution, staticFriction and damping (pair 0 and its flip twin), the FMax twin the same
+    // words (pair 2, its flip twin) plus the forced-eMAX damping (pair 4); dynFriction = -0 must
+    // reach the clamp, including the eMULTIPLY pairs where staticFriction falls back to fDyn.
+    uint32_t imageBad = 0, twinWord[3][4] = {}, twinPairs[3] = {}, flipTwin[3] = {};
+    uint32_t forcedMaxTie = 0, dynNegZero = 0, staFromClamp = 0;
+    for (uint32_t p = 0; p < np; ++p)
+    {
+        const HMaterial m0 = zeroSignMaterial(mp[p].a), m1 = zeroSignMaterial(mp[p].b);
+        uint32_t fl;
+        float w0[4], d0;
+        combineMaterials(m0, m1, w0[2], w0[1], w0[0], w0[3], fl, &d0);   // w = { rest, dyn, sta, damping }
+        for (uint32_t w = 0; w < 4u; ++w)
+            if (fbits(w0[w]) != mp[p].img[w])
+            {
+                ++imageBad;
+                std::printf("  [materialZeroSign] pair %u word %u mirror=%08x cuda=%08x\n", p, 7 + w, fbits(w0[w]), mp[p].img[w]);
+            }
+        if (fbits(d0) == 0x80000000u)
+        {
+            ++dynNegZero;
+            if (fbits(w0[2]) == fbits(w0[1])) ++staFromClamp;   // sta = fDyn (:164 fallback)
+        }
+        for (int v = 1; v <= 2; ++v)
+        {
+            float wv[4];
+            gMatVariant = v;
+            combineMaterials(m0, m1, wv[2], wv[1], wv[0], wv[3], fl);
+            gMatVariant = 0;
+            bool changed = false;
+            for (uint32_t w = 0; w < 4u; ++w)
+                if (fbits(wv[w]) != fbits(w0[w])) { ++twinWord[v][w]; changed = true; }
+            if (changed) { ++twinPairs[v]; if (mp[p].flip) ++flipTwin[v]; }
+            if (v == 2 && ((m0.rest < 0.f) != (m1.rest < 0.f)) && fbits(m0.damp) == 0u &&
+                fbits(m1.damp) == 0x80000000u && fbits(wv[3]) != fbits(w0[3]))
+                ++forcedMaxTie;
+        }
+    }
+    std::printf("  [materialZeroSign] FMin twin: pairs=%u words(7..10)=%u,%u,%u,%u flip=%u; "
+                "FMax twin: pairs=%u words=%u,%u,%u,%u flip=%u; forced-eMAX tie=%u; "
+                "dynFriction -0 at clamp=%u (sta=fDyn %u)\n",
+                twinPairs[1], twinWord[1][0], twinWord[1][1], twinWord[1][2], twinWord[1][3], flipTwin[1],
+                twinPairs[2], twinWord[2][0], twinWord[2][1], twinWord[2][2], twinWord[2][3], flipTwin[2],
+                forcedMaxTie, dynNegZero, staFromClamp);
+    PXG_CHECK_MSG(imageBad == 0u, "the CUDA mirror differs from the hand-derived CUDA image in %u words", imageBad);
+    PXG_CHECK_MSG(twinWord[1][0] && twinWord[1][2] && twinWord[1][3],
+                  "FMin twin (npSphereNphase-r0) must change restitution, staticFriction and damping");
+    PXG_CHECK_MSG(twinWord[2][0] && twinWord[2][2] && twinWord[2][3],
+                  "FMax twin (npSphereNphase-r1) must change restitution, staticFriction and damping");
+    PXG_CHECK_MSG(flipTwin[1] >= 1u && flipTwin[2] >= 1u, "the flip path must observe both twins (%u, %u)",
+                  flipTwin[1], flipTwin[2]);
+    PXG_CHECK_MSG(forcedMaxTie >= 1u, "forced-eMAX damping tie (+0,-0) not observed by the FMax twin (%u)", forcedMaxTie);
+    PXG_CHECK_MSG(dynNegZero >= 5u && staFromClamp >= 2u,
+                  "dynFriction -0 reached the :161 clamp on %u pairs (expected 5), sta = fDyn on %u (expected 2)",
+                  dynNegZero, staFromClamp);
+
+    checkSphere(cfgs, 0x00000000u, false, "materialZeroSign");
 }
 
 PXG_TEST(sphereNphase_mutation)
