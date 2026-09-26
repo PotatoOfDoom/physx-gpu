@@ -35,6 +35,8 @@
 // rewrite); manifold floats to tolerance, counts/flags exact, keep/
 // invalidate near-ties margin-skipped.  The last GUARD pairs sit beyond
 // numTests: their manifolds and keep slots must keep their sentinels.
+// P9.86c: three directed fresh-manifold pairs (kDirZ) pin the SIGN of the
+// zero mRelativePos word that aToB = t1.transformInv(t0) stores, bitwise.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -93,7 +95,12 @@ static const float qthS[3] = { 0.9995f, 0.9999f, 0.9997f };
 
 static float pcmMargin(const V3& e, float tol) { return std::fmin(std::fmin(std::fmin(e.x, e.y), e.z) * 0.25f, tol * 0.05f); }
 
-// CUDA transcription (unchanged from the bound-buffer tranche).
+// P9.86c mutant twin: true selects the port's PRE-FIX aToB.p spelling q.rotateInv(v) instead
+// of the CUDA's t1.transformInv(t0) = q.getConjugate().rotate(v).  Used only to prove that the
+// directed zero-sign pairs below separate the two forms.
+static bool gAToBRotInvVariant = false;
+
+// CUDA transcription (bound-buffer tranche; aToB.p corrected in P9.86c).
 static void refStage1(const S1In& s, float tol, S1Out& o, bool& marg)
 {
     uint32_t type0 = s.meta.x, type1 = s.meta.y;
@@ -116,7 +123,11 @@ static void refStage1(const S1In& s, float tol, S1Out& o, bool& marg)
 
     const F4 t1qc{ -t1q.x, -t1q.y, -t1q.z, t1q.w };
     const F4 aToBq = qMul(t1qc, t0q);
-    const V3 aToBp = qRotInv(t1q, sub(t0p, t1p));
+    // cudaGJKEPA.cu:2238 aToB = t1.transformInv(t0) -> PxTransform.h:162-168 qinv = q.getConjugate();
+    // qinv.rotate(src.p - p).  NOT q.rotateInv(src.p - p): same bits for every nonzero value, but a
+    // component that is a sum of exact zeros can take the other sign (the pre-P9.86c mirror shared
+    // the port's old rotateInv form and so could never see the difference).
+    const V3 aToBp = gAToBRotInvVariant ? qRotInv(t1q, sub(t0p, t1p)) : qRot(t1qc, sub(t0p, t1p));
 
     const uint32_t initNb = s.md3.x;
 
@@ -184,6 +195,20 @@ static void refStage1(const S1In& s, float tol, S1Out& o, bool& marg)
     o.result = U4{ bRun ? 1u : 0u, newNb, 0, 0 };
 }
 
+static uint32_t u4w(const U4& u, int k) { return k == 0 ? u.x : k == 1 ? u.y : k == 2 ? u.z : u.w; }
+
+// P9.86c directed zero-sign pairs for aToB.p (fresh manifold, so bRunNarrowphase stores it):
+//   D0 (i=7):  t1 = PxQuat(PxHalfPi, x) = (s,+0,+0,s) at (0,3,0), t0 identity at the origin.
+//              qinv = (-s,-0,-0,s), v = (+0,-3,+0): CUDA x = -0 + -0 + (-s)(+0) = -0;
+//              rotateInv(q) gives (-0 - +0) + s(+0) = +0.
+//   D1 (i=17): t1 = PxQuat(-PxHalfPi, z) = (-0,-0,-s,s), same positions: CUDA z = +0, rotateInv -0.
+//   D2 (i=27): D0 through the flip path (meta {5,3}; the kernel swaps the cache refs).
+// Every term of the diverging component is an exact zero product and w*w-0.5 < 0 fused or not,
+// so the sign is contraction-invariant on both sides (the shader is not NoContraction-stamped).
+struct DirZ { uint32_t idx; int word; uint32_t cudaBits; };
+static const DirZ kDirZ[3] = { { 7u, 0, 0x80000000u }, { 17u, 2, 0x00000000u }, { 27u, 0, 0x80000000u } };
+static int dirZIndex(uint32_t i) { for (int k = 0; k < 3; ++k) if (i == kDirZ[k].idx) return k; return -1; }
+
 static bool eqF4(const F4& a, const F4& b) { return almostEqual(a.x, b.x, 2e-4f, 2e-5f) && almostEqual(a.y, b.y, 2e-4f, 2e-5f) && almostEqual(a.z, b.z, 2e-4f, 2e-5f) && almostEqual(a.w, b.w, 2e-4f, 2e-4f); }
 static bool eqU4f(const U4& a, const U4& b)
 { return almostEqual(u2f(a.x), u2f(b.x), 2e-4f, 2e-5f) && almostEqual(u2f(a.y), u2f(b.y), 2e-4f, 2e-5f) && almostEqual(u2f(a.z), u2f(b.z), 2e-4f, 2e-5f); }
@@ -211,6 +236,8 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
     const uint32_t GUARD = 5;  // beyond numTests: must stay untouched
 
     size_t nSkip = 0, cRun = 0, cNoRun = 0, cInvalPath = 0, cSphere = 0;
+    size_t cZeroSignAToB = 0; // directed pairs on which the CUDA form and the rotateInv twin disagree in the stored zero word
+    const float kS45 = u2f(0x3F3504F3u); // sin/cos(PxHalfPi * 0.5f) = 0.70710677f (PxQuat(PxHalfPi, axis))
 
     for (uint32_t launch = 0; launch < 3; ++launch)
     {
@@ -290,12 +317,37 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
                 s.md2 = U4{ f2u(qb.x), f2u(qb.y), f2u(qb.z), f2u(qb.w) };
             }
             s.md3 = U4{ nb, rng() % 5, rng(), rng() };
+
+            // P9.86c directed zero-sign pairs (see kDirZ): consume no RNG, so every other pair keeps its bits.
+            // A fresh manifold as PxgPersistentContactManifold::clear() leaves it (mRelativePos = PX_MAX_REAL,
+            // identity quats, no contacts) forces bRunNarrowphase, so aToB.p is stored into mRelativePos.
+            const int dz = dirZIndex(i);
+            if (dz >= 0)
+            {
+                const F4 qI{ 0.f, 0.f, 0.f, 1.f };
+                const F4 qR = (dz == 1) ? F4{ -0.f, -0.f, -kS45, kS45 } : F4{ kS45, 0.f, 0.f, kS45 };
+                const F4 pO{ 0.f, 0.f, 0.f, 0.f }, pU{ 0.f, 3.f, 0.f, 0.f };
+                if (dz == 2) { s.meta = U4{ 5u, 3u, 0, 0 }; s.t0q = qR; s.t0p = pU; s.t1q = qI; s.t1p = pO; }
+                else         { s.meta = U4{ 3u, 5u, 0, 0 }; s.t0q = qI; s.t0p = pO; s.t1q = qR; s.t1p = pU; }
+                s.md0 = U4{ 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu };
+                s.md1 = s.md2 = U4{ 0u, 0u, 0u, 0x3F800000u };
+                s.md3 = U4{ 0u, 0u, s.md3.z, s.md3.w };
+            }
             in[i] = s;
 
             if (i < numTests)
             {
                 bool marg = false;
                 refStage1(s, tol, ref[i], marg);
+                if (dz >= 0)
+                {
+                    S1Out tw; bool m2 = false;
+                    gAToBRotInvVariant = true; refStage1(s, tol, tw, m2); gAToBRotInvVariant = false;
+                    const int w = kDirZ[dz].word; const uint32_t b = kDirZ[dz].cudaBits;
+                    if (!marg && !m2 && ref[i].result.x == 1u && tw.result.x == 1u &&
+                        u4w(ref[i].md0, w) == b && u4w(tw.md0, w) == (b ^ 0x80000000u))
+                        ++cZeroSignAToB;
+                }
                 skip[i] = marg ? 1u : 0u;
                 if (marg) { ++nSkip; continue; }
                 if (ref[i].result.x) ++cRun; else ++cNoRun;
@@ -397,7 +449,7 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
         shim.memcpyDtoH(gMf.data(), dMf, gMf.size() * sizeof(PxgPersistentContactManifold));
         shim.memcpyDtoH(gKeep.data(), dKeep, N * 4);
 
-        size_t mmM = 0, mmD = 0, mmR = 0, mmG = 0;
+        size_t mmM = 0, mmD = 0, mmR = 0, mmG = 0, mmZ = 0;
         for (uint32_t i = 0; i < numTests; ++i)
         {
             if (skip[i]) continue;
@@ -413,6 +465,16 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
             std::memcpy(&got.md1, &g.mQuatA, 16);
             std::memcpy(&got.md2, &g.mQuatB, 16);
             got.md3 = U4{ g.mNbContacts, g.mNbWarmStartPoints, g.mWarmStartA, g.mWarmStartB };
+
+            // P9.86c: the directed pairs' stored zero word of mRelativePos, BITWISE (sign included),
+            // against both the corrected mirror and the hard-coded CUDA bits.  The rest of md0 stays
+            // tolerant: the shader is not NoContraction-stamped, so nonzero words may drift an ulp.
+            const int dz = dirZIndex(i);
+            if (dz >= 0)
+            {
+                const int w = kDirZ[dz].word;
+                if (u4w(got.md0, w) != u4w(ref[i].md0, w) || u4w(got.md0, w) != kDirZ[dz].cudaBits) ++mmZ;
+            }
 
             if (gKeep[i] != ref[i].result.x) { ++mmR; continue; }
             for (int j = 0; j < 4; ++j)
@@ -439,6 +501,7 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
         PXG_CHECK_MSG(mmM == 0, "stage1 launch %u: %zu manifold mismatches", launch, mmM);
         PXG_CHECK_MSG(mmD == 0, "stage1 launch %u: %zu moreData mismatches", launch, mmD);
         PXG_CHECK_MSG(mmG == 0, "stage1 launch %u: %zu guard-tail violations", launch, mmG);
+        PXG_CHECK_MSG(mmZ == 0, "stage1 launch %u: %zu aToB zero-sign words differ (transformInv = getConjugate().rotate, cudaGJKEPA.cu:2238)", launch, mmZ);
 
         for (PxgDevicePtr pfree : { dBlobs, dCmIn, dShapes, dCache, dMf, dKeep })
             shim.memFree(pfree);
@@ -448,6 +511,7 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
     PXG_CHECK_MSG(nSkip < total / 3, "stage1: too many marginal (%zu/%zu)", nSkip, total);
     PXG_CHECK_MSG(cRun > total / 10 && cNoRun > total / 10 && cInvalPath > total / 20 && cSphere > total / 8,
                   "stage1: coverage thin (run %zu noRun %zu inval %zu sphere %zu)", cRun, cNoRun, cInvalPath, cSphere);
+    PXG_CHECK_MSG(cZeroSignAToB == 9, "stage1: aToB zero-sign directed pairs lost (%zu/9)", cZeroSignAToB);
 }
 
 } // namespace
