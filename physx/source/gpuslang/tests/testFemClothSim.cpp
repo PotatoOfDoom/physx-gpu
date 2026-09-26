@@ -11373,6 +11373,34 @@ static bool validBary(float v, float w)
     return (v >= zero && v <= one) && (w >= zero && w <= one) && ((v + w) <= one);
 }
 
+// PxClamp<float>(x, 0, 1) = PxMin(1, PxMax(0, x)) with the float specialisations
+// selectMin/selectMax (PxMath.h:80-101, :142-146; PxUnixMathIntrinsics.h:116-125):
+// a -0 (and a NaN) passes through unchanged.
+static float pxClamp01(float x)
+{
+    const float lo = (0.0f > x) ? 0.0f : x;     // selectMax(0, x)
+    return (1.0f < lo) ? 1.0f : lo;             // selectMin(1, lo)
+}
+
+// P9.86c mutant twins of the three clamps in segSeg (0 = the CUDA).  Variant k+1
+// replays the port's pre-P9.86 spelling of site k -- Slang clamp(), i.e. GLSL FClamp,
+// which llvmpipe evaluates as maxps/minps: fmax(x, +0) = (x > 0) ? x : +0, so a -0
+// (and a NaN) comes out +0.  Sites: 0 = s0 (distanceSegmentSegment.cuh:63), 1 = t2
+// (:76), 2 = s (:81).  gSegSegNegZeroIn[k] counts the -0 arguments site k consumed;
+// femClothSimCapsuleTriClampZeroSign requires every twin to change its image.
+static int gSegSegClampVariant = 0;
+static uint32_t gSegSegNegZeroIn[3] = { 0u, 0u, 0u };
+static float segClamp(int site, float x, bool used)
+{
+    if (used && x == 0.0f && std::signbit(x)) ++gSegSegNegZeroIn[site];
+    if (gSegSegClampVariant == site + 1)
+    {
+        const float lo = (x > 0.0f) ? x : 0.0f;  // FMax on llvmpipe: -0 and NaN -> +0
+        return (lo < 1.0f) ? lo : 1.0f;
+    }
+    return pxClamp01(x);
+}
+
 static void segSeg(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
 {
     const float eps = 1e-6f;
@@ -11383,12 +11411,12 @@ static void segSeg(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
     const float f = dot(d2, r);
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
-    const float s0 = std::min(std::max(temp / denom, 0.0f), 1.0f);
+    const float s0 = segClamp(0, temp / denom, !(eps > denom));   // s0 is dead when parallel
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = std::min(std::max(tTmp, 0.0f), 1.0f);
+    const float t2 = segClamp(1, tTmp, true);
     const float comp = (b * t2 - c) * aRecip;
-    s = std::min(std::max(comp, 0.0f), 1.0f);
+    s = segClamp(2, comp, true);
     t = t2;
 }
 
@@ -12027,6 +12055,259 @@ PXG_TEST(femClothSimSphereTriContactGen)
     destroyWriter(dev, w);
     for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bRd.h, bRemap.h, bFilters.h, bStack.h, bNum.h, bNeeded.h })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.86c -- the three PxClamp(., 0, 1) of distanceSegmentSegmentSquared
+// (distanceSegmentSegment.cuh:63/:76/:81) fed a -0.
+//
+// PxClamp<float> is selectMin(1, selectMax(0, v)) and passes a -0 through.  The port
+// once spelled all three as Slang clamp() -- GLSL FClamp, which llvmpipe evaluates
+// with maxps/minps, so fmax(-0, +0) = +0.  femClothSimSphereTriContactGen compares
+// bit-exactly but its capsule pose and triangles are generic: none of the three
+// clamps ever sees a -0 there, and reverting each select survived the P9.86c sweep.
+//
+// Here: ONE capsule at rest on the world axes, its pose carrying -0 in the z lanes
+// (q = (0,0,-0,1), p = (-0.5,-0.5,-0)).  Basis vector 0 is then (1, +0, -0), so the
+// segment runs from p = (+0,-0.5,-0) to q = (-1,-0.5,+0), pq = (-1,+0,+0).  Two cloth
+// triangles lie in the plane y = 0, 0.5 above it (radius 0.375 + contact 0.25):
+//   A  a=(0,0,-1) b=(0,0,-0) c=(-1,0,-1).  p projects onto vertex b; edges ab and bc
+//      tie at b (0.25 each), bc wins the strict `>` chain, and the con0 test ties with
+//      it (0.25 > 0.25 is false), so the EDGE result is kept.  On bc, c = +0, f = -0 and
+//      b = 1, so temp = -0 -> s0 = -0 -> tTmp = -0 -> t2 = -0 -> comp = -0:
+//      bary.z = t11 = -0 and normal.z = (+0) - (-0) = +0.  With s0 OR t2 through FClamp
+//      both parameters come out +0: bary.z = +0, normal.z = (-0) - (+0) = -0.
+//   B  a=(0,0,-0) b=(1,0,-0) c=(1,0,-1).  p projects onto vertex a; edges ab and ac
+//      tie, ac wins.  On ac, comp = (-1)(+0) - (+0) = -0 = t02, so pointOnSegment.z =
+//      -0 + (+0)(-0) = -0 and normal.z = (-0) - (-0) = +0.  With s through FClamp,
+//      pointOnSegment.z = +0 and normal.z = (-0) - (+0) = -0.
+// Every product on these paths is exact, so fma contraction (CUDA) or its absence
+// (llvmpipe, the host) cannot move a zero's sign.  The mirror is pinned against the
+// hand-derived CUDA bits as well, so it cannot drift to the port's old behaviour.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimCapsuleTriClampZeroSign)
+{
+    using namespace p816dc;
+    using namespace p929st;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u;
+    const float CD_CLOTH = 0.125f, CD_CAPSULE = 0.125f, REST = 0.0625f;
+    const uint32_t MAT_CAPSULE = 0x35u;
+    const uint64_t NODE_CAPSULE = 0x0000000200000019ull;
+    const float CAP_HALF = 0.5f, CAP_RADIUS = 0.375f;
+
+    // The -0 lanes are ASSIGNED, and their sign is checked, so no initializer rewrite
+    // can quietly turn the case into a +0 one.
+    float capQ[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    capQ[2] = -0.0f;
+    V3 capP{ -0.5f, -0.5f, 0.0f };
+    capP.z = -0.0f;
+
+    std::vector<F4> cv = {
+        F4{ 0.0f, 0.0f, -1.0f, 1.0f }, F4{ 0.0f, 0.0f, 0.0f, 1.0f }, F4{ -1.0f, 0.0f, -1.0f, 1.0f },  // A
+        F4{ 0.0f, 0.0f, 0.0f, 1.0f },  F4{ 1.0f, 0.0f, 0.0f, 1.0f }, F4{ 1.0f, 0.0f, -1.0f, 1.0f },   // B
+    };
+    cv[1].z = -0.0f;                          // A.b: makes r.z = (-0) - (-0) = +0, so f = -0
+    cv[3].z = -0.0f; cv[4].z = -0.0f;         // B.a, B.b: pointOnTriangle.z = -0
+    PXG_CHECK_MSG(std::signbit(capQ[2]) && std::signbit(capP.z) && std::signbit(cv[1].z) &&
+                  std::signbit(cv[3].z) && std::signbit(cv[4].z),
+                  "a -0 input lane lost its sign before the test ran");
+    std::vector<TriIdx4> ci = { TriIdx4{ 0u, 1u, 2u, 0u }, TriIdx4{ 3u, 4u, 5u, 0u } };
+    const uint32_t NB_TRIS = 2u;
+
+    // ---- the mirror, the CUDA image, and the twins ------------------------------------
+    struct Img { uint32_t f[12]; };
+    auto image = [](const Hit& h) {
+        Img m;
+        const float src[12] = { h.point.x, h.point.y, h.point.z, h.point.w,
+                                h.normalPen.x, h.normalPen.y, h.normalPen.z, h.normalPen.w,
+                                h.bary.x, h.bary.y, h.bary.z, h.bary.w };
+        for (int j = 0; j < 12; ++j) m.f[j] = f2u(src[j]);
+        return m;
+    };
+    auto runMirror = [&](int variant, Img out[2], int exits[2]) {
+        bool all = true;
+        gSegSegClampVariant = variant;
+        for (uint32_t t = 0; t < NB_TRIS; ++t)
+        {
+            const V3 a{ cv[t * 3 + 0].x, cv[t * 3 + 0].y, cv[t * 3 + 0].z };
+            const V3 b{ cv[t * 3 + 1].x, cv[t * 3 + 1].y, cv[t * 3 + 1].z };
+            const V3 c{ cv[t * 3 + 2].x, cv[t * 3 + 2].y, cv[t * 3 + 2].z };
+            Hit h{};
+            const bool hit = triCapsule(capQ, capP, CAP_HALF, CAP_RADIUS, a, b, c,
+                                        CD_CLOTH + CD_CAPSULE, h);
+            exits[t] = gSegTriExit;
+            h.point.w = REST;
+            out[t] = image(h);
+            all = all && hit;
+        }
+        gSegSegClampVariant = 0;
+        return all;
+    };
+
+    for (int k = 0; k < 3; ++k) gSegSegNegZeroIn[k] = 0u;
+    Img want[2];
+    int exits[2];
+    const bool bothHit = runMirror(0, want, exits);
+    uint32_t negZeroIn[3];                    // snapshot BEFORE any twin run adds to it
+    for (int k = 0; k < 3; ++k) negZeroIn[k] = gSegSegNegZeroIn[k];
+
+    PXG_CHECK_MSG(bothHit, "the mirror reports no contact for one of the two triangles");
+    PXG_CHECK_MSG(exits[0] == EXIT_CON0_EDGE && exits[1] == EXIT_CON0_EDGE,
+                  "segTriSq exits %d/%d, both cases are built for the con0 branch (%d)",
+                  exits[0], exits[1], int(EXIT_CON0_EDGE));
+    // Coverage: s0 = -0 on A.bc and B.ac, t2 = -0 on A.bc, s = -0 on A.bc, B.ab, B.ac.
+    PXG_CHECK_MSG(negZeroIn[0] == 2u && negZeroIn[1] == 1u && negZeroIn[2] == 3u,
+                  "-0 reached the clamps %u/%u/%u times (s0/t2/s), expected 2/1/3 -- the "
+                  "rig no longer exercises the P9.86 select spellings",
+                  negZeroIn[0], negZeroIn[1], negZeroIn[2]);
+
+    // The CUDA's bits, derived by hand (see the banner).  The edge sub-exit (not the
+    // con0 vertex one) is what puts t11 = -0 into A's bary.z, so this pins that tie too.
+    static const uint32_t CUDA_IMG[2][12] = {
+        { 0x00000000u, 0xBE000000u, 0x00000000u, 0x3D800000u,     // point, rest
+          0x00000000u, 0x3F800000u, 0x00000000u, 0x3E000000u,     // normal, pen 0.125
+          0x00000000u, 0x3F800000u, 0x80000000u, 0x00000000u },   // bary (w, u, v = -0)
+        { 0x00000000u, 0xBE000000u, 0x00000000u, 0x3D800000u,
+          0x00000000u, 0x3F800000u, 0x00000000u, 0x3E000000u,
+          0x3F800000u, 0x00000000u, 0x00000000u, 0x00000000u },
+    };
+    static const char* const FIELD[12] = {
+        "point.x", "point.y", "point.z", "point.w(rest)", "normal.x", "normal.y", "normal.z",
+        "penetration", "bary.x", "bary.y", "bary.z", "bary.w" };
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+        for (int j = 0; j < 12; ++j)
+            PXG_CHECK_MSG(want[t].f[j] == CUDA_IMG[t][j],
+                          "mirror tri %c %s = 0x%08X, the CUDA gives 0x%08X", 'A' + char(t),
+                          FIELD[j], want[t].f[j], CUDA_IMG[t][j]);
+
+    // Each twin must change exactly the fields its revert changes, and nothing else.
+    //   v1 (s0) and v2 (t2): A's normal.z -> 0x80000000 and bary.z -> 0x00000000; B intact.
+    //   v3 (s):              B's normal.z -> 0x80000000; A intact (on A.bc it moves t01
+    //                        alone, and p + pq*t01 absorbs it: normal.z stays +0).
+    for (int v = 1; v <= 3; ++v)
+    {
+        Img twin[2];
+        int twinExits[2];
+        runMirror(v, twin, twinExits);
+        for (uint32_t t = 0; t < NB_TRIS; ++t)
+        {
+            Img expect = want[t];
+            if (v <= 2 && t == 0u) { expect.f[6] = 0x80000000u; expect.f[10] = 0x00000000u; }
+            if (v == 3 && t == 1u) { expect.f[6] = 0x80000000u; }
+            for (int j = 0; j < 12; ++j)
+                PXG_CHECK_MSG(twin[t].f[j] == expect.f[j],
+                              "mutant twin %d, tri %c %s = 0x%08X, expected 0x%08X", v,
+                              'A' + char(t), FIELD[j], twin[t].f[j], expect.f[j]);
+        }
+    }
+
+    // ---- the kernel ---------------------------------------------------------------------
+    DevBuf bCv = makeDev(dev, cv);
+    if (!bCv.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bCv.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mNbTriangles = NB_TRIS;
+    cloth.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // shapes: 0 = cloth, 1 = capsule
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0] = makeClothShape(CLOTH_ID);
+    shapes[1].type = GEOM_CAPSULE_H; shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[1].sx = CAP_HALF; shapes[1].sy = CAP_RADIUS; shapes[1].sz = 0.13f;
+    shapes[1].srw = 1.0f; shapes[1].materialIndex = MAT_CAPSULE;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;                                     // cloth pose: identity, at the origin
+    for (int k = 0; k < 4; ++k) xf[8 + k] = capQ[k];
+    xf[12] = capP.x; xf[13] = capP.y; xf[14] = capP.z;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { CD_CLOTH, CD_CAPSULE };
+    std::vector<float> rd = { REST };
+    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+    std::vector<uint64_t> remap = { 0ull, NODE_CAPSULE };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    std::vector<uint32_t> stack = { 0u, 0u, 0u, 0u, 0u, 1u, 0u, 0u };   // (cm 0, tri 0/1)
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> nFound = { NB_TRIS };
+    DevBuf bNum = makeDev(dev, nFound);
+    std::vector<uint32_t> zeroNeeded = { 0u };
+    DevBuf bNeeded = makeDev(dev, zeroNeeded);
+
+    const uint32_t MAXC = 8u;
+    WriterBufs w = makeWriter(dev, MAXC);
+
+    ClothSphereTriPush p = {};
+    p.toleranceLength = 1.0f;
+    p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
+    p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+    p.gpuShapes = bShapes.addr; p.femClothes = bDesc.addr;
+    p.shapeToRigidRemapTable = bRemap.addr;
+    p.stackSizeBytes = NB_TRIS * 16u;
+    p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+    p.filterPairs = 0ull; p.nbFilterPairs = 0u;
+    p.stackSizeNeededOnDevice = bNeeded.addr;
+    p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr;
+    p.wBary = w.barycentric.addr; p.wInfo = w.info.addr; p.wCount = w.count.addr;
+    p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
+    p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+    p.wMaxContacts = MAXC;
+
+    Kernel k("femClothContactGenBda.spv", "cloth_SphereContactGenLaunch",
+             {}, sizeof(ClothSphereTriPush));
+    k.dispatch(1024u, {}, p, 1u, 1u);      // PxgNarrowphaseCore.cpp:5760
+    dev->flush();
+
+    const uint32_t got = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(got == NB_TRIS, "contact COUNT %u, expected one per triangle (%u)", got, NB_TRIS);
+
+    const auto pt = downloadBuffer<F4>(dev, w.point.h, MAXC);
+    const auto np = downloadBuffer<F4>(dev, w.normalPen.h, MAXC);
+    const auto ba = downloadBuffer<F4>(dev, w.barycentric.h, MAXC);
+    const auto info = downloadBuffer<uint32_t>(dev, w.info.h, MAXC * 4u);
+    uint32_t seen[2] = { 0u, 0u };
+    for (uint32_t i = 0; i < got && i < MAXC; ++i)
+    {
+        const uint32_t pairInd1 = info[i * 4 + 2];
+        const uint32_t tri = pairInd1 & ((1u << 20) - 1u);
+        PXG_CHECK_MSG(tri < NB_TRIS && (pairInd1 >> 20) == CLOTH_ID,
+                      "contact %u names pairInd1 0x%08X", i, pairInd1);
+        if (tri >= NB_TRIS) continue;
+        ++seen[tri];
+        PXG_CHECK_MSG(info[i * 4 + 0] == uint32_t(NODE_CAPSULE & 0xffffffffull) &&
+                      info[i * 4 + 1] == uint32_t(NODE_CAPSULE >> 32) &&
+                      info[i * 4 + 3] == (MAT_CAPSULE & 0x7fffffffu),
+                      "tri %c info record %08X %08X / mat %08X", 'A' + char(tri),
+                      info[i * 4 + 1], info[i * 4 + 0], info[i * 4 + 3]);
+        const Hit gh{ pt[i], np[i], ba[i] };
+        const Img g = image(gh);
+        for (int j = 0; j < 12; ++j)
+            PXG_CHECK_MSG(g.f[j] == want[tri].f[j],
+                          "GPU tri %c %s = 0x%08X, the CUDA (mirror) gives 0x%08X",
+                          'A' + char(tri), FIELD[j], g.f[j], want[tri].f[j]);
+    }
+    PXG_CHECK_MSG(seen[0] == 1u && seen[1] == 1u,
+                  "contacts per triangle %u/%u, expected exactly one each", seen[0], seen[1]);
+
+    destroyWriter(dev, w);
+    for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bRd.h, bRemap.h, bStack.h, bNum.h, bNeeded.h })
         dev->destroyBuffer(h);
 }
 
