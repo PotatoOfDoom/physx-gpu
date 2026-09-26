@@ -55,6 +55,14 @@
 //  * after the getVelocity dispatch every input buffer must be UNTOUCHED
 //    (it is a pure read), checked byte for byte; after applyImpulses the
 //    whole arena is compared against the mirror byte for byte.
+//
+// P9.86c: articulations AT REST (svRestOverrides) where the port's literal-seed
+// folds leave a -0 the CUDA's +0-seeded accumulators never hold -- getVelocity
+// lanes 6/65/67 (-0 root deltaV and velocities, folded -0 J lanes:
+// npArtiSolveTendons-r0) and a separate applyImpulses dispatch (a -0 joint
+// impulse at the common link onto a -0 mRootDeferredZ: npArtiSolveTendons-r1).
+// Host twins of both reverts (gPropAccelVariant = 2, gJiCommonVariant = 1) must
+// change the compared image, so the inputs cannot drift off the fold sites.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -218,6 +226,68 @@ static void svSeed(SvArena& B)
     }
 }
 
+// P9.86c (npArtiSolveTendons-r0/-r1): lane `a` becomes a free-base articulation AT
+// REST, the state in which the port's literal-seed folds leave a -0 the CUDA's
+// +0-seeded accumulators never hold:
+//  * nothing deferred yet: mRootDeferredZ +0 (the reset, forwardDynamic2.cu:91) or
+//    -0 (artiPushImpulse stores `mat * -scratchImpulse`, forwardDynamic2.cu:4201-4203,
+//    which is -0 in every lane for a zero scratch and a response with no negative
+//    entry);
+//  * the root response is axis-aligned with no negative entry (COM at the root
+//    origin), so M * -(+0) is -0 in all six lanes;
+//  * every link's velocity lanes are -0 (a negated zero), mSolverSpatialImpulse +0;
+//  * every joint is a revolute about a unit axis through (0,0,0.5) -- motion matrix
+//    (axis, axis x r) -- decoupled (mInvStIsT row d = 0.5 e_d), with mDeferredQstZ
+//    and the joint speed +0, so every jDelta is +0 and every term sas * jDelta
+//    carries the sign of -sas: -0 on the negative axis lanes.
+// mIsW and mIsInvDW keep their seeded values (only their products with zeros matter).
+static void svRestOverrides(SvArena& B, uint32_t a, bool negZeroRootZ)
+{
+    const uint32_t w = a / 32, lane = a % 32;
+    PxgArticulationBlockData& AB = B.ab[w];
+    PxgArticulationBlockLinkData* L = &B.lk[size_t(w) * SV_MAX_LINKS];
+    PxgArticulationBlockDofData* D = &B.df[size_t(w) * SV_MAX_DOFS];
+    const PxVec3 nz(-0.0f, -0.0f, -0.0f), pz(0.0f, 0.0f, 0.0f);
+
+    storeSpatialVector(AB.mRootDeferredZ,
+                       negZeroRootZ ? UnAlignedSpatialVector(nz, nz) : UnAlignedSpatialVector(pz, pz),
+                       lane);
+    {
+        Dy::SpatialMatrix m;
+        m.topLeft = PxMat33(PxZero);
+        m.topRight = PxMat33::createDiagonal(PxVec3(0.9f, 1.1f, 1.3f));
+        m.bottomLeft = PxMat33::createDiagonal(PxVec3(0.7f, 0.7f, 0.7f));
+        storeSpatialMatrix(AB.mInvSpatialArticulatedInertia, lane, m);
+    }
+
+    // unit axes and axis x (0,0,0.5)
+    static const PxVec3 axes[3] = { PxVec3(-0.6f, -0.8f, 0.0f), PxVec3(-0.8f, 0.6f, 0.0f),
+                                    PxVec3(0.0f, 0.0f, -1.0f) };
+    static const PxVec3 lin[3] = { PxVec3(-0.4f, 0.3f, 0.0f), PxVec3(0.3f, 0.4f, 0.0f),
+                                   PxVec3(0.0f, 0.0f, 0.0f) };
+    for (uint32_t l = 0; l < svNumLinks(a); ++l)
+    {
+        storeSpatialVector(L[l].mMotionVelocity, UnAlignedSpatialVector(nz, nz), lane);
+        storeSpatialVector(L[l].mSolverSpatialImpulse, UnAlignedSpatialVector(pz, pz), lane);
+        if (l == 0)
+            continue;
+        for (uint32_t d = 0; d < L[l].mDofs[lane]; ++d)
+        {
+            PxgArticulationBlockDofData& dd = D[L[l].mJointOffset[lane] + d];
+            storeSpatialVector(dd.mWorldMotionMatrix, UnAlignedSpatialVector(axes[d], lin[d]), lane);
+            dd.mInvStIsT_x[lane] = d == 0 ? 0.5f : 0.0f;
+            dd.mInvStIsT_y[lane] = d == 1 ? 0.5f : 0.0f;
+            dd.mInvStIsT_z[lane] = d == 2 ? 0.5f : 0.0f;
+            dd.mDeferredQstZ[lane] = 0.0f;
+            dd.mJointVelocities[lane] = 0.0f;
+        }
+    }
+}
+
+// the getVelocity rest lanes: 6 (links 1 and 3 have 2 dofs, link 2 one) and 65, 67
+// (links 1 and 3 one dof, link 2 two); the rest of the fleet keeps its dense data
+static const uint32_t SV_VEL_REST_LANES[] = { 6u, 65u, 67u };
+
 // ---- cases ----
 
 // getVelocity: linkID | wantSpeeds<<8 | fixBase<<9
@@ -241,6 +311,23 @@ static const uint32_t SV_IMP_CASES[][2] = {
 };
 const uint32_t SV_NUM_IMP_CASES = 5;
 
+// P9.86c (npArtiSolveTendons-r1): the mimic shape at rest in its own dispatch over
+// svRestOverrides(.., negZeroRootZ = true) lanes -- linkID0 IS the common link (link
+// 1), zero spatial impulses, and a joint impulse lambda = -(b + Jv) * eff = -0 on dof
+// 0 (DyCpuGpuArticulation.h:723 for a joint at rest).  ONE case: a second one would
+// overwrite the -0 mRootDeferredZ the first leaves the difference in.
+static const uint32_t SV_IMP_REST_CASES[][2] = {
+    { 1u | 0x100u, 1u },
+};
+const uint32_t SV_NUM_IMP_REST_CASES = 1;
+
+// P9.86c coverage, filled by the host passes (before any device work)
+static uint32_t gSvGetVelFoldHits = 0;     // hops: folded J lane -0 on a -0 pDeltaV lane
+static size_t gSvGetVelFoldWords = 0;      // getVelocity words the r0 twin changes
+static size_t gSvGetVelFoldSlotsMissed = 0; // directed slots the r0 twin leaves alone
+static uint32_t gSvJiCommonNegZero = 0;    // folded jiCommon entries that are -0
+static size_t gSvJiCommonFoldBytes = 0;    // arena bytes the r1 twin changes
+
 struct SvParamsHost
 {
     uint64_t ab, lk, df, bf, scratch;
@@ -252,26 +339,56 @@ static size_t svRunGetVel(PxgCudaShim& shim)
 {
     SvArena A;
     svSeed(A);
+    // P9.86c (npArtiSolveTendons-r0): the rest lanes -- root deltaV = M * -(+0) is -0
+    // in all six lanes, and every hop's folded J is -0 on the negative axis lanes
+    for (uint32_t a : SV_VEL_REST_LANES)
+        svRestOverrides(A, a, /*negZeroRootZ=*/false);
 
     // mirror
-    std::vector<float> want(size_t(SV_NUM_VEL_CASES) * SV_NB * 9, -555.f);
-    for (uint32_t c = 0; c < SV_NUM_VEL_CASES; ++c)
-        for (uint32_t a = 0; a < SV_NB; ++a)
+    auto mirror = [&](std::vector<float>& out) {
+        out.assign(size_t(SV_NUM_VEL_CASES) * SV_NB * 9, -555.f);
+        for (uint32_t c = 0; c < SV_NUM_VEL_CASES; ++c)
+            for (uint32_t a = 0; a < SV_NB; ++a)
+            {
+                const uint32_t w = a / 32, lane = a % 32;
+                const uint32_t spec = SV_VEL_CASES[c];
+                const uint32_t linkID = spec & 0xFF;
+                const bool wantSpeeds = (spec & 0x100u) != 0;
+                const bool fixBase = (spec & 0x200u) != 0;
+                PxReal speeds[3] = { -777.f, -777.f, -777.f };
+                const UnAlignedSpatialVector v = refGetVelocity(
+                    A.ab[w], &A.lk[size_t(w) * SV_MAX_LINKS], &A.df[size_t(w) * SV_MAX_DOFS],
+                    &A.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
+                    SV_WORDSIZE, linkID, fixBase, wantSpeeds ? speeds : NULL, lane);
+                float* o = &out[(size_t(c) * SV_NB + a) * 9];
+                o[0] = v.top.x; o[1] = v.top.y; o[2] = v.top.z;
+                o[3] = v.bottom.x; o[4] = v.bottom.y; o[5] = v.bottom.z;
+                o[6] = speeds[0]; o[7] = speeds[1]; o[8] = speeds[2];
+            }
+    };
+    std::vector<float> want, wantFold;
+    gSvGetVelFoldWords = 0;
+    gSvGetVelFoldSlotsMissed = 0;
+    gPropAccelVariant = 0;
+    gPropAccelFoldHits = 0;
+    mirror(want);
+    gSvGetVelFoldHits = gPropAccelFoldHits;
+
+    // host twin of the r0 revert: the hop returns pDeltaV + the SEEDLESS accumulator
+    gPropAccelVariant = 2;
+    mirror(wantFold);
+    gPropAccelVariant = 0;
+    for (size_t i = 0; i < want.size(); ++i)
+        if (std::memcmp(&want[i], &wantFold[i], 4) != 0)
+            ++gSvGetVelFoldWords;
+    // pinned: v.top.x of link 3 (case 4, path 0->1->3) and of link 2 (case 2, path
+    // 0->1->2) in every rest lane -- CUDA -0 + (+0) = +0, the revert -0 + (-0) = -0
+    for (uint32_t a : SV_VEL_REST_LANES)
+        for (uint32_t c : { 2u, 4u })
         {
-            const uint32_t w = a / 32, lane = a % 32;
-            const uint32_t spec = SV_VEL_CASES[c];
-            const uint32_t linkID = spec & 0xFF;
-            const bool wantSpeeds = (spec & 0x100u) != 0;
-            const bool fixBase = (spec & 0x200u) != 0;
-            PxReal speeds[3] = { -777.f, -777.f, -777.f };
-            const UnAlignedSpatialVector v = refGetVelocity(
-                A.ab[w], &A.lk[size_t(w) * SV_MAX_LINKS], &A.df[size_t(w) * SV_MAX_DOFS],
-                &A.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
-                SV_WORDSIZE, linkID, fixBase, wantSpeeds ? speeds : NULL, lane);
-            float* o = &want[(size_t(c) * SV_NB + a) * 9];
-            o[0] = v.top.x; o[1] = v.top.y; o[2] = v.top.z;
-            o[3] = v.bottom.x; o[4] = v.bottom.y; o[5] = v.bottom.z;
-            o[6] = speeds[0]; o[7] = speeds[1]; o[8] = speeds[2];
+            const size_t i = (size_t(c) * SV_NB + a) * 9 + 0;
+            if (std::memcmp(&want[i], &wantFold[i], 4) == 0)
+                ++gSvGetVelFoldSlotsMissed;
         }
 
     std::vector<PxgDevicePtr> bufs;
@@ -347,41 +464,69 @@ static size_t svRunGetVel(PxgCudaShim& shim)
     return bad;
 }
 
-static size_t svRunApplyImp(PxgCudaShim& shim)
+template <class T>
+static size_t svBytesDiffer(const std::vector<T>& a, const std::vector<T>& b)
+{
+    const uint8_t* pa = reinterpret_cast<const uint8_t*>(a.data());
+    const uint8_t* pb = reinterpret_cast<const uint8_t*>(b.data());
+    size_t d = 0;
+    for (size_t i = 0; i < a.size() * sizeof(T); ++i)
+        if (pa[i] != pb[i])
+            ++d;
+    return d;
+}
+
+// `rest`: every lane through svRestOverrides(.., negZeroRootZ = true), the r1 kill
+// (see SV_IMP_REST_CASES); the r1 host twin then runs as well (before device work)
+static size_t svRunApplyImp(PxgCudaShim& shim, const uint32_t (*cases)[2], uint32_t numCases,
+                            const std::vector<float>& impTable, bool rest)
 {
     SvArena A;
     svSeed(A);
-
-    // the per-case impulse table (also the shader's input)
-    std::vector<float> impTable(size_t(SV_NUM_IMP_CASES) * 18);
-    for (uint32_t c = 0; c < SV_NUM_IMP_CASES; ++c)
-        for (uint32_t k = 0; k < 18; ++k)
-            impTable[c * 18 + k] = 0.8f * fv(900 + c, k, 0, 98);
+    if (rest)
+        for (uint32_t a = 0; a < SV_NB; ++a)
+            svRestOverrides(A, a, /*negZeroRootZ=*/true);
 
     // mirror: same case order, same per-lane scaling as the shader entry
-    SvArena W = A;
-    for (uint32_t a = 0; a < SV_NB; ++a)
-    {
-        const uint32_t w = a / 32, lane = a % 32;
-        for (uint32_t c = 0; c < SV_NUM_IMP_CASES; ++c)
+    auto mirror = [&](SvArena& W) {
+        for (uint32_t a = 0; a < SV_NB; ++a)
         {
-            const uint32_t spec0 = SV_IMP_CASES[c][0], spec1 = SV_IMP_CASES[c][1];
-            const float* f = &impTable[c * 18];
-            const PxVec3 linear0 = PxVec3(f[0], f[1], f[2]) * (1.0f + float(a) * 0.03125f);
-            const PxVec3 angular0(f[3], f[4], f[5]);
-            const PxReal ji0[3] = { f[6], f[7], f[8] };
-            const PxVec3 linear1(f[9], f[10], f[11]);
-            const PxVec3 angular1 = PxVec3(f[12], f[13], f[14])
-                                  * (1.0f - float(a) * 0.015625f);
-            const PxReal ji1[3] = { f[15], f[16], f[17] };
-            refApplyImpulses(W.ab[w], &W.lk[size_t(w) * SV_MAX_LINKS],
-                             &W.df[size_t(w) * SV_MAX_DOFS],
-                             &W.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
-                             SV_WORDSIZE, spec0 & 0xFF, linear0, angular0,
-                             (spec0 & 0x100u) ? ji0 : NULL,
-                             spec1 & 0xFF, linear1, angular1,
-                             (spec1 & 0x100u) ? ji1 : NULL, lane);
+            const uint32_t w = a / 32, lane = a % 32;
+            for (uint32_t c = 0; c < numCases; ++c)
+            {
+                const uint32_t spec0 = cases[c][0], spec1 = cases[c][1];
+                const float* f = &impTable[c * 18];
+                const PxVec3 linear0 = PxVec3(f[0], f[1], f[2]) * (1.0f + float(a) * 0.03125f);
+                const PxVec3 angular0(f[3], f[4], f[5]);
+                const PxReal ji0[3] = { f[6], f[7], f[8] };
+                const PxVec3 linear1(f[9], f[10], f[11]);
+                const PxVec3 angular1 = PxVec3(f[12], f[13], f[14])
+                                      * (1.0f - float(a) * 0.015625f);
+                const PxReal ji1[3] = { f[15], f[16], f[17] };
+                refApplyImpulses(W.ab[w], &W.lk[size_t(w) * SV_MAX_LINKS],
+                                 &W.df[size_t(w) * SV_MAX_DOFS],
+                                 &W.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
+                                 SV_WORDSIZE, spec0 & 0xFF, linear0, angular0,
+                                 (spec0 & 0x100u) ? ji0 : NULL,
+                                 spec1 & 0xFF, linear1, angular1,
+                                 (spec1 & 0x100u) ? ji1 : NULL, lane);
+            }
         }
+    };
+    SvArena W = A;
+    gJiCommonVariant = 0;
+    gJiCommonFoldNegZero = 0;
+    mirror(W);
+    if (rest)
+    {
+        gSvJiCommonNegZero += gJiCommonFoldNegZero;
+        // host twin of the r1 revert: the common hop is handed the SEEDLESS sum
+        SvArena V = A;
+        gJiCommonVariant = 1;
+        mirror(V);
+        gJiCommonVariant = 0;
+        gSvJiCommonFoldBytes += svBytesDiffer(W.ab, V.ab) + svBytesDiffer(W.lk, V.lk)
+                              + svBytesDiffer(W.df, V.df);
     }
 
     std::vector<PxgDevicePtr> bufs;
@@ -396,8 +541,8 @@ static size_t svRunApplyImp(PxgCudaShim& shim)
     PxgDevicePtr dLk = up(A.lk.data(), A.lk.size() * sizeof(A.lk[0]));
     PxgDevicePtr dDf = up(A.df.data(), A.df.size() * sizeof(A.df[0]));
     PxgDevicePtr dBf = up(A.bf.data(), A.bf.size() * 8);
-    PxgDevicePtr dImp = up(impTable.data(), impTable.size() * 4);
-    PxgDevicePtr dCases = up(SV_IMP_CASES, sizeof(SV_IMP_CASES));
+    PxgDevicePtr dImp = up(impTable.data(), size_t(numCases) * 18 * 4);
+    PxgDevicePtr dCases = up(cases, size_t(numCases) * 2 * 4);
     if (!dAb || !dLk || !dDf || !dBf || !dImp || !dCases)
     {
         std::printf("  NOTE: no BDA -> skip\n");
@@ -407,7 +552,7 @@ static size_t svRunApplyImp(PxgCudaShim& shim)
 
     SvParamsHost prm = { uint64_t(dAb), uint64_t(dLk), uint64_t(dDf), uint64_t(dBf),
                          uint64_t(dImp), SV_NB, SV_MAX_LINKS, SV_MAX_DOFS,
-                         SV_NUM_IMP_CASES, uint64_t(dCases) };
+                         numCases, uint64_t(dCases) };
     PXG_CHECK_MSG(shim.launchKernel(1, SV_WARPS, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch svApplyImpTest");
     shim.streamSynchronize();
@@ -447,7 +592,35 @@ PXG_TEST(artiSolveVelImp)
     PxgCudaShim shim(dev, manifest, 2, &svLoader);
 
     size_t bad = 0;
+    gSvJiCommonNegZero = 0;
+    gSvJiCommonFoldBytes = 0;
     bad += svRunGetVel(shim);
-    bad += svRunApplyImp(shim);
+    {
+        // the per-case impulse table (also the shader's input)
+        std::vector<float> impTable(size_t(SV_NUM_IMP_CASES) * 18);
+        for (uint32_t c = 0; c < SV_NUM_IMP_CASES; ++c)
+            for (uint32_t k = 0; k < 18; ++k)
+                impTable[c * 18 + k] = 0.8f * fv(900 + c, k, 0, 98);
+        bad += svRunApplyImp(shim, SV_IMP_CASES, SV_NUM_IMP_CASES, impTable, false);
+    }
+    {
+        // P9.86c: the rest dispatch -- zero spatial impulses, ji0 = (-0, +0, +0)
+        std::vector<float> restImp(size_t(SV_NUM_IMP_REST_CASES) * 18, 0.0f);
+        restImp[6] = -0.0f;
+        bad += svRunApplyImp(shim, SV_IMP_REST_CASES, SV_NUM_IMP_REST_CASES, restImp, true);
+    }
+
+    // P9.86c coverage: each directed input must keep reaching its fold site
+    std::printf("[ info ] getVelocity: %u hops with a folded -0 J lane on a -0 pDeltaV lane;"
+                " %zu words the r0 twin changes, %zu pinned slots missed\n",
+                gSvGetVelFoldHits, gSvGetVelFoldWords, gSvGetVelFoldSlotsMissed);
+    std::printf("[ info ] applyImpulses: %u folded jiCommon entries -0; %zu arena bytes the r1"
+                " twin changes\n", gSvJiCommonNegZero, gSvJiCommonFoldBytes);
+    PXG_CHECK_MSG(gSvGetVelFoldHits > 0 && gSvGetVelFoldWords > 0 && gSvGetVelFoldSlotsMissed == 0,
+                  "the rest lanes must reach pDeltaV(-0) + J(folded -0) in svPropagateAccelDeferred"
+                  " and change v.top.x of links 2 and 3 (npArtiSolveTendons-r0)");
+    PXG_CHECK_MSG(gSvJiCommonNegZero > 0 && gSvJiCommonFoldBytes > 0,
+                  "the rest dispatch must carry a folded -0 joint impulse at the common link onto"
+                  " a -0 mRootDeferredZ (npArtiSolveTendons-r1)");
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

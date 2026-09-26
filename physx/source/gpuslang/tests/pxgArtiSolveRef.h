@@ -234,6 +234,22 @@ inline physx::Cm::UnAlignedSpatialVector refGetVelocity(
     return motionVelocity + deltaV;
 }
 
+// P9.86c (npArtiSolveTendons-r1): witness counter and host twin of the port's
+// literal-seed fold of jointImpulseToApplyAtCommonLink.  The CUDA seeds it {0,0,0}
+// and only ever += the joint impulses of the ends that ARE the common link
+// (internalConstraints2.cu:2269/2283), so in IEEE it is never -0 (+0 + -0 = +0).
+// The port's loops have a constant trip count of 3; llvmpipe unrolls them, forwards
+// the literal seed and folds the first `0 + ji` (F3), so its raw array is the
+// SEEDLESS sum -- equal in value, but -0 where the CUDA's is +0.
+// npArtiSolveTendons.slang canonicalises it (-0 -> +0).
+// gJiCommonVariant selects what the common-link hop is handed:
+//   0  the CUDA (+0 seed) -- the reference every fixture compares against;
+//   1  the seedless sum as is (npArtiSolveTendons-r1, the canonicalisation reverted).
+// Counted under every variant: gJiCommonFoldNegZero -- entries the seedless sum
+// leaves -0 (the CUDA's is +0).
+inline int gJiCommonVariant = 0;
+inline physx::PxU32 gJiCommonFoldNegZero = 0;
+
 // pxcFsApplyImpulses (internalConstraints2.cu:2190)
 inline void refApplyImpulses(
     physx::PxgArticulationBlockData& ab, physx::PxgArticulationBlockLinkData* lk,
@@ -294,11 +310,26 @@ inline void refApplyImpulses(
         const PxU32 dofCountAtCommon = lk[commonLink].mDofs[lane];
         const PxU32 linkIndices[2] = { linkID0, linkID1 };
         const PxReal* jis[2] = { ji0, ji1 };
+        PxReal seedless[3] = { 0.f, 0.f, 0.f };   // the port's folded sum (twin only)
+        bool seeded = false;
         for (PxU32 k = 0; k < 2; ++k)
         {
             if ((linkIndices[k] == commonLink) && jis[k])
+            {
                 for (PxU32 i = 0; i < dofCountAtCommon; ++i)
+                {
                     jiCommon[i] += jis[k][i];
+                    seedless[i] = seeded ? seedless[i] + jis[k][i] : jis[k][i];
+                }
+                seeded = true;
+            }
+        }
+        for (PxU32 i = 0; i < dofCountAtCommon; ++i)
+        {
+            if (refIsNegZero(seedless[i]))
+                ++gJiCommonFoldNegZero;
+            if (gJiCommonVariant == 1)
+                jiCommon[i] = seedless[i];
         }
     }
 
