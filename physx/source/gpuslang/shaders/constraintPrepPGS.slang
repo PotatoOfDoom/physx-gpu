@@ -254,7 +254,8 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
         return;
     }
 
-    const float maxImpulse = min(data0.maxImpulse, data1.maxImpulse);
+    // P9.86: PxMin is a select (a < b ? a : b), not FMin (contactConstraintBlockPrep.cuh:402)
+    const float maxImpulse = (data0.maxImpulse < data1.maxImpulse) ? data0.maxImpulse : data1.maxImpulse;
 
     gContactHeaders[headerIndex].forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     gContactHeaders[headerIndex].flags[threadIndex] = flags;
@@ -353,7 +354,8 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
 
         gContactPoints[outContactBase + j].raXn_targetVelocity[threadIndex] = float4(raXnSqrtInertia, targetVelocity);
         gContactPoints[outContactBase + j].rbXn_maxImpulse[threadIndex] =
-            float4(rbXnSqrtInertia, min(maxImpulse, targetVel4_maxImpulseW.w));
+            // P9.86: PxMin is a select (a < b ? a : b), not FMin (contactConstraintBlockPrep.cuh:513)
+            float4(rbXnSqrtInertia, (maxImpulse < targetVel4_maxImpulseW.w) ? maxImpulse : targetVel4_maxImpulseW.w);
         gContactPoints[outContactBase + j].resp0[threadIndex] = resp0;
         gContactPoints[outContactBase + j].resp1[threadIndex] = resp1;
         gContactPoints[outContactBase + j].coeff0[threadIndex] = coeff0;

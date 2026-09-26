@@ -366,10 +366,14 @@ void convexCoreTrimeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
         // pair-midpoint recentring the convex-vs-convex kernel does: there the two
         // convexes are posed about their shared midpoint, here the whole problem is
         // moved into the MESH's frame, which is the frame the BVH's boxes are in.
-        // PxTransform::transformInv: q = getConjugate() * src.q, p = rotateInv(src.p - p).
+        // PxTransform::transformInv (PxTransform.h:167-168): qinv = getConjugate();
+        // q = qinv * src.q, p = qinv.rotate(src.p - p).  P9.86: rotate by the
+        // CONJUGATE, not rotateInv(q1): the two agree on every non-zero value but not
+        // on the sign of a zero component (e.g. q1 = PxQuat(-PxHalfPi, X), v = (0,1,-2):
+        // CUDA +0, rotateInv -0).  CUDA twin: convexCoreCollision.cu:980.
         const float4 conjQ1 = float4(-q1.x, -q1.y, -q1.z, q1.w);
         const float4 aToBq = npAbiQuatMul(conjQ1, q0);
-        const float3 aToBp = npAbiQuatRotateInv(q1, p0 - p1);
+        const float3 aToBp = npAbiQuatRotate(conjQ1, p0 - p1);
 
         ShapeRef convex;
         float convexMargin;

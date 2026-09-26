@@ -701,6 +701,13 @@ void d6SolveQ(const D6In s, uint useExtendedLimits, inout RowBuf buf, inout uint
                     limitDir += col * pc;
                 }
             }
+            // P9.86: `PxVec3 limitDir(0); limitDir += cA2w_m[i] * cB2cA.p[i]` (constraintBlockPrePrep.cu:683-689)
+            // is only ever += from a +0 seed, so no IEEE lane can be -0.  llvmpipe unrolls the constant-trip
+            // loop and folds the forwarded seed into the first add, so a -0 product (+0 * negative cB2cAp.x)
+            // survived.  Canonicalise -0 -> +0 with a select (identity for every nonzero, NaN, inf).
+            limitDir = float3((limitDir.x == 0.0f) ? 0.0f : limitDir.x,
+                              (limitDir.y == 0.0f) ? 0.0f : limitDir.y,
+                              (limitDir.z == 0.0f) ? 0.0f : limitDir.z);
             const float distance = magQ(limitDir);
             if (distance > s.linVel.w)  // distanceMinDist
                 chLinearLimit(buf, mRa, mRb, limitDir * (1.0f / distance), distance, s.distV.x,

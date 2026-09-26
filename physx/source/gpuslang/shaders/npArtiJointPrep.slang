@@ -217,7 +217,7 @@ void artiTGSJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_G
 
     // ---- setUpArti1DConstraintBlock, TGS (:1594) ----
     const float erp = 0.5f * biasCoefficient;   // trap 8
-    const float cfm = max(b0.cfm, b1.cfm);
+    const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // P9.86: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:1828); FMax gives +0 for (+0,-0)
     const float4 imsRow = cdata[cdi].mInvMassScale[lane];
 
     uint outCount = 0u;
@@ -537,7 +537,7 @@ void artiJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_Grou
                       ((raWorld_linBreakForce.w != PREP_PX_MAX_F32)
                        || (angBreakForce != PREP_PX_MAX_F32)) ? 1u : 0u);
 
-    const float cfm = max(b0.cfm, b1.cfm);   // trap P7: header-live, row-dead
+    const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // trap P7: header-live, row-dead; P9.86: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:1758); FMax loses zero sign / NaN order
     headers[hdi].cfm[lane] = cfm;
 
     // ---- preprocessRowsBlock (:1396), shared spelling with the TGS twin ----

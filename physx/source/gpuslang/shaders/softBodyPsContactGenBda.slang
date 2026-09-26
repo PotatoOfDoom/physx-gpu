@@ -202,6 +202,17 @@ uint surfaceHint(uint64_t hintBase, uint primIdx)
     return (word >> shift) & 0xffu;
 }
 
+// P9.86: PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146), and the float
+// PxMax/PxMin are the selects `a > b ? a : b` / `a < b ? a : b`
+// (PxUnixMathIntrinsics.h:116-125).  Slang's clamp is GLSL.std.450 FClamp, which
+// llvmpipe lowers to maxps(t, +0): +0 for t = -0 (and 0 for NaN), where the CUDA
+// keeps -0 (and NaN).  Identical to FClamp for every other input.
+float sbPsPxClamp01(float t)
+{
+    const float lo = (0.0f > t) ? 0.0f : t;   // PxMax(0, t)
+    return (1.0f < lo) ? 1.0f : lo;           // PxMin(1, lo)
+}
+
 // deformableCollision.cuh:96.  Four SEPARATE divisions by detBcd -- the engine writes
 // `detPcd / detBcd` three times over and never forms a reciprocal, so this is one of
 // the few places a divide is faithful.  The sum is `((1 - v) - w) - x`, left to right.
@@ -217,8 +228,8 @@ bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
     const float w = dot(ba, cross(pa, da)) / detBcd;
     const float x = dot(ba, cross(ca, pa)) / detBcd;
     const float u = 1.0f - v - w - x;
-    barycentric = float4(clamp(u, 0.0f, 1.0f), clamp(v, 0.0f, 1.0f),
-                         clamp(w, 0.0f, 1.0f), clamp(x, 0.0f, 1.0f));
+    barycentric = float4(sbPsPxClamp01(u), sbPsPxClamp01(v),
+                         sbPsPxClamp01(w), sbPsPxClamp01(x));   // P9.86: PxClamp (deformableCollision.cuh:133-136)
     return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
            (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
 }

@@ -196,6 +196,11 @@ ConstantBuffer<TgsPrepLaunch> gTgsPrepLaunch;
 // The Ptr-typed correlation helpers moved to pxgSlangPrepCommon.slang
 // (P8.102b hoist: the arti contact prep is the second BDA user).
 
+// P9.86: PxMin/PxMax (PxMath.h, float) are selects, not GLSL FMin/FMax (whose zero sign
+// and NaN handling differ): PxMin(a,b) = a < b ? a : b, PxMax(a,b) = a > b ? a : b.
+float tgsPxMin(float a, float b) { return (a < b) ? a : b; }
+float tgsPxMax(float a, float b) { return (a > b) ? a : b; }
+
 void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPrepData,
                                             Ptr<PxgBlockContactPoint> gContactPrepPoints,
                                             Ptr<PxgBlockFrictionPatch> gCurrFrictionPatches,
@@ -257,7 +262,7 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         return;
     }
 
-    const float maxImpulse = min(data0.maxImpulse, data1.maxImpulse);
+    const float maxImpulse = tgsPxMin(data0.maxImpulse, data1.maxImpulse); // P9.86: PxMin select (cuh:846)
 
     gContactHeaders[headerIndex].forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     gContactHeaders[headerIndex].flags[threadIndex] = flags;
@@ -352,11 +357,14 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         gContactPoints[outContactBase + j].resp0[threadIndex] = resp0;
         gContactPoints[outContactBase + j].resp1[threadIndex] = resp1;
 
-        maxPenetration = min(penetration, maxPenetration);
+        // P9.86: PxMin select (cuh:947) keeps the old value on a zero tie; FMin returns -0 for (+0,-0).
+        maxPenetration = tgsPxMin(penetration, maxPenetration);
 
         const bool isGreater2 = ((restitution > 0.0f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
 
-        float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
+        // P9.86: CUDA (cuh:951) adds the selected +0 when !isGreater2 (cTargetVel -0 -> +0); spelled as a select.
+        const float bounceVel = isGreater2 ? (-vrel) * restitution : 0.0f;
+        float targetVelocity = isGreater2 ? (cTargetVel + bounceVel) : tgsPlusZero(cTargetVel);
 
         if (isKinematic0)
             targetVelocity -= (norVel0 + angNorVel0);
@@ -372,7 +380,8 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         gContactPoints[outContactBase + j].raXn_extraCoeff[threadIndex] = float4(raXnSqrtInertia, contactCoeff);
         gContactPoints[outContactBase + j].rbXn_targetVelW[threadIndex] = float4(rbXnSqrtInertia, targetVelocity);
         gContactPoints[outContactBase + j].separation[threadIndex] = penetration;
-        gContactPoints[outContactBase + j].maxImpulse[threadIndex] = min(maxImpulse, targetVel4_maxImpulseW.w);
+        // P9.86: PxMin select (cuh:969): PxMin(-0,+0) = +0, PxMin(x,NaN) = NaN; FMin differs.
+        gContactPoints[outContactBase + j].maxImpulse[threadIndex] = tgsPxMin(maxImpulse, targetVel4_maxImpulseW.w);
         gContactPoints[outContactBase + j].appliedForce[threadIndex] = 0.0f;
         gContactPoints[outContactBase + j].biasCoefficient[threadIndex] = scaledBias;
     }
@@ -519,8 +528,11 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
             const float torsionalPatchRadius = torsionalFrictionData.x;
             const float minTorsionalPatchRadius = torsionalFrictionData.y;
 
+            // P9.86: PxMax = selectMax (a > b ? a : b), contactConstraintBlockPrep.cuh:1128;
+            // FMax differs for (+0,-0) and NaN (touching contact, maxPenetration=+0 with
+            // minTorsionalPatchRadius=+0 -> CUDA stores -0).
             const float torsionalFriction =
-                max(minTorsionalPatchRadius, sqrt(max(0.0f, -maxPenetration) * torsionalPatchRadius));
+                tgsPxMax(minTorsionalPatchRadius, sqrt(tgsPxMax(0.0f, -maxPenetration) * torsionalPatchRadius));
 
             gFrictionHeaders[headerIndex].torsionalFrictionScale[threadIndex] = torsionalFriction;
 

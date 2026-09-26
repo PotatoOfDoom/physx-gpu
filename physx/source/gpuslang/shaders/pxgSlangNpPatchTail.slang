@@ -94,9 +94,12 @@ public static const uint NPT_MAT_DISABLE_FRICTION = 1u,
 public float nptCombineScalars(float a, float b, uint mode)
 {
     if (mode == NPT_MODE_AVERAGE) return 0.5f * (a + b);
-    if (mode == NPT_MODE_MIN) return min(a, b);
+    // P9.86: PxMin/PxMax(float) = selectMin/selectMax (PxUnixMathIntrinsics.h:116/122,
+    // via PxsMaterialCombiner.h:43/47/60/64): selects returning b on a zero tie / any NaN;
+    // OpFMin/OpFMax are sign-aware under SZINP.
+    if (mode == NPT_MODE_MIN) return (a < b) ? a : b;
     if (mode == NPT_MODE_MULTIPLY) return a * b;
-    if (mode == NPT_MODE_MAX) return max(a, b);
+    if (mode == NPT_MODE_MAX) return (a > b) ? a : b;
     return 0.0f;
 }
 

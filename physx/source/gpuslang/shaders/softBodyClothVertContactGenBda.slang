@@ -173,6 +173,11 @@ void loadSoftbodyClothPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheRef
     clothShape = shapes[sRefCl]; clothCacheRef = cRefCl;
 }
 
+// P9.86: PxClamp(v, 0, 1) = PxMin(1, PxMax(0, v)) with the select intrinsics
+// (PxMath.h:142, PxUnixMathIntrinsics.h:116-125): keeps -0 as -0 and passes NaN through,
+// unlike GLSL FClamp.
+float sbcvPxClamp01(float v) { const float t = (0.0f > v) ? 0.0f : v; return (1.0f < t) ? 1.0f : t; }
+
 // computeTetBarycentric (deformableCollision.cuh:96).  The .cu here ignores the bool -- the
 // coordinates are stored whatever the window says -- so only the clamped float4 is produced.
 float4 computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point)
@@ -183,8 +188,9 @@ float4 computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 poin
     const float w = dot(ba, cross(pa, da)) / detBcd;
     const float x = dot(ba, cross(ca, pa)) / detBcd;
     const float u = 1.0f - v - w - x;
-    return float4(clamp(u, 0.0f, 1.0f), clamp(v, 0.0f, 1.0f),
-                  clamp(w, 0.0f, 1.0f), clamp(x, 0.0f, 1.0f));
+    // P9.86: select PxClamp (deformableCollision.cuh:132-135), not FClamp.
+    return float4(sbcvPxClamp01(u), sbcvPxClamp01(v),
+                  sbcvPxClamp01(w), sbcvPxClamp01(x));
 }
 
 // ===========================================================================

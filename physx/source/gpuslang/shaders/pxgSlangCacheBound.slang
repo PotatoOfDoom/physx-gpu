@@ -168,8 +168,15 @@ public void updateBoundsBda(PxgShapeSim shapeSim, Ptr<PxgShapeGpu> convexShapes,
             {
                 const float4 vf = pVertices[i];
                 const float3 vertexV = mat33Transform(rot, vf.xyz);
-                minV = min(minV, vertexV);
-                maxV = max(maxV, vertexV);
+                // P9.86: updateCacheAndBound.cuh:134-135 PxVec3::minimum/maximum = componentwise
+                // PxMin/PxMax = selectMin/selectMax (a < b ? a : b / a > b ? a : b): keep the NEW
+                // vertex on a +-0 tie (and on NaN). GLSL FMin/FMax give an implementation-defined zero sign.
+                minV = float3(minV.x < vertexV.x ? minV.x : vertexV.x,
+                              minV.y < vertexV.y ? minV.y : vertexV.y,
+                              minV.z < vertexV.z ? minV.z : vertexV.z);
+                maxV = float3(maxV.x > vertexV.x ? maxV.x : vertexV.x,
+                              maxV.y > vertexV.y ? maxV.y : vertexV.y,
+                              maxV.z > vertexV.z ? maxV.z : vertexV.z);
             }
 
             outMin = minV + pose.p();

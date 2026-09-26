@@ -139,14 +139,23 @@ public void storeF3(uint64_t a, float3 v)
 
 // ---------------------------------------------------------------------------
 // quatRotate / quatDot — the two quaternion operations the gate needs.
-// PxQuat stores (x, y, z, w); the rotation is the standard
-//   v + 2w(q x v) + 2(q x (q x v))  form PxQuat::rotate() uses.
+// PxQuat stores (x, y, z, w).  Transcribed from PxQuat::rotate (PxQuat.h:286-294),
+// the same spelling as pxgSlangCommon.quatRotate.  NOT the algebraically equal
+// v + w*t + q x t (t = 2 q x v) form: that rounds differently for any
+// non-identity rotation, and penNew is stored.
+// P9.86: CUDA manifold.cuh:74 aToB.transform -> PxQuat::rotate, verbatim.
 // ---------------------------------------------------------------------------
 public float3 pcmQuatRotate(float4 q, float3 v)
 {
-    const float3 qv = float3(q.x, q.y, q.z);
-    const float3 t = 2.0f * cross(qv, v);
-    return v + q.w * t + cross(qv, t);
+    const float vx = 2.0f * v.x;
+    const float vy = 2.0f * v.y;
+    const float vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3(
+        (vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+        (vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+        (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
 }
 
 // aToB.transform(p) for a PxTransform { PxQuat q; PxVec3 p; }.

@@ -498,7 +498,8 @@ public AbMat33 asmTranslateInertiaMass(AbMat33 inertia, float mass, float3 t)
 // which is P8.87's driver-fold shape: if every one of the six products is a
 // negative zero the engine's C++ yields `+0` and the folded form yields `-0`.
 // That needs an entirely zero result row against an all-negative input, which the
-// fixture builds on purpose -- see testArtiSpatialMatrix.cpp's lane 3.
+// fixture builds on purpose -- see testArtiSpatialMatrix.cpp's lane 3.  P9.86: the
+// seed add is now spelled as a select below, so the port gives the engine's +0.
 public AbSpatialVector asmM6MulVec(AbMatrix6x6 m, AbSpatialVector s)
 {
     float st[6];
@@ -508,8 +509,13 @@ public AbSpatialVector asmM6MulVec(AbMatrix6x6 m, AbSpatialVector s)
     float result[6];
     for (uint i = 0u; i < 6u; ++i)
     {
-        result[i] = 0.0f;
-        for (uint j = 0u; j < 6u; ++j)
+        // P9.86: the engine's `0.f + column[0][i] * st[0]` seed add (PxSpatialMatrix.h:58-77),
+        // spelled as the select IEEE makes of it (+0 for either zero, the product
+        // otherwise). llvmpipe unrolls this constant-trip loop, forwards the literal
+        // seed and folds fadd(+0, p) to p (same fix as npArtiExtBody / npArti1DPrep).
+        const float p0 = abM6Get(m, 0u, i) * st[0];
+        result[i] = (p0 == 0.0f) ? 0.0f : p0;
+        for (uint j = 1u; j < 6u; ++j)
             result[i] = result[i] + abM6Get(m, j, i) * st[j];
     }
 

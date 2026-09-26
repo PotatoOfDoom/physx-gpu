@@ -135,6 +135,14 @@ AbSpatialVector siPropagateImpulseDofAligned(AbSpatialVector isInvD, float3 chil
     return adTranslateSpatialVector(childToParent, asmSVecSub(Z, temp));
 }
 
+// P9.86: IEEE `+0 + x` per component as a select -- x for every x except -0,
+// which becomes +0 (slangc/llvmpipe fold a literal-zero seed add away even
+// under SignedZeroInfNanPreserve).
+float3 siPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 // getImpulseSelfResponseDofAligned (internalConstraints2.cu:64).  `dofBase` is
 // the FIRST dof of the link (the CUDA's `dofs`), `thisDof` = dofBase + i.
 void siGetImpulseSelfResponseDofAligned(AbSpatialVector impulse0, AbSpatialVector impulse1,
@@ -178,12 +186,42 @@ void siGetImpulseSelfResponseDofAligned(AbSpatialVector impulse0, AbSpatialVecto
         }
     }
 
-    // the CUDA passes `childToParent` into a parameter NAMED parentToChild and
-    // the body negates it -- adPropagateAccelerationW does the same, so the
-    // value passes through unchanged (mRw is the parent-to-child offset; the
-    // engine's local name `child2Parent` is the misleading one)
-    deltaV1 = adPropagateAccelerationW(childToParent, invStIsT, motionMatrix, deltaV0W,
-                                       dofCount, isW, qstZ);
+    // propagateAccelerationW_child2ParentPreLoaded<ReadFromProvidedQstZ>
+    // (articulationDynamic.cuh:257), NOT adPropagateAccelerationW (the
+    // everythingPreLoaded order): the per-dof terms go into a SEPARATE
+    // jointSpatialDeltaV seeded with PxVec3(0) and are added to pDeltaV at the
+    // END -- pd + ((a + b) + c) versus ((pd + a) + b) + c, 1-2 ULP apart on
+    // multi-dof joints (the P8.98a lesson, cf. svPropagateAccelDeferred).
+    // The CUDA passes `childToParent` into the parameter NAMED parentToChild
+    // and the body negates it (mRw is the parent-to-child offset).
+    const AbSpatialVector pDeltaV = adTranslateSpatialVector(-childToParent, deltaV0W);
+    float tJointDelta[3] = { 0.0f, 0.0f, 0.0f };
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+            tJointDelta[ind] = qstZ[ind] - asmInnerProduct(isW[ind], pDeltaV);
+    }
+    AbSpatialVector jointSpatialDeltaV =
+        asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float3 iStIsTi = invStIsT[ind];
+            const float jDelta = iStIsTi.x * tJointDelta[0]
+                               + iStIsTi.y * tJointDelta[1]
+                               + iStIsTi.z * tJointDelta[2];
+            jointSpatialDeltaV = asmSVecAdd(jointSpatialDeltaV,
+                                            asmSVecScale(motionMatrix[ind], jDelta));
+        }
+    }
+    // P9.86: the accumulator starts at a literal +0 and is only ever +=, so in
+    // IEEE it is never -0 (articulationDynamic.cuh:292/309); llvmpipe unrolls
+    // the 3-trip loop, forwards the seed and folds the first add (0 + t -> t),
+    // which can keep a -0 -- canonicalise.
+    jointSpatialDeltaV = asmSVec(siPlusZero3(jointSpatialDeltaV.top),
+                                 siPlusZero3(jointSpatialDeltaV.bottom));
+    deltaV1 = asmSVecAdd(pDeltaV, jointSpatialDeltaV);
 
     deltaV0 = deltaV0W;
 }

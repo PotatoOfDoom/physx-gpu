@@ -103,9 +103,17 @@ void distanceSegmentSegmentSquared(float3 p1, float3 d1, float3 p2, float3 d2, o
     const float s0 = clamp(temp / denom, 0.0f, 1.0f);
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = clamp(tTmp, 0.0f, 1.0f);
+    // P9.86: distanceSegmentSegment.cuh:76 PxClamp(tTmp, 0, 1) = PxMin(1, PxMax(0, tTmp)) with the
+    // float selects (selectMax = a > b ? a : b, selectMin = a < b ? a : b): tTmp = -0 (eRecip == 0,
+    // negative bracket) stays -0 as in the CUDA, where FClamp would give +0.
+    const float t2Lo = (0.0f > tTmp) ? 0.0f : tTmp;
+    const float t2 = (1.0f < t2Lo) ? 1.0f : t2Lo;
     const float comp = (b * t2 - c) * aRecip;
-    const float s2 = clamp(comp, 0.0f, 1.0f);
+    // P9.86: distanceSegmentSegment.cuh:81 PxClamp(comp, 0.f, 1.f) = PxMin(1, PxMax(0, comp)) with the
+    // selects of PxUnixMathIntrinsics.h:116-125 -- keeps comp = -0 (aRecip = 0 and a negative
+    // bracket) and NaN, which FClamp on llvmpipe turns into +0 / 0.
+    const float s2Lo = (0.0f > comp) ? 0.0f : comp;
+    const float s2 = (1.0f < s2Lo) ? 1.0f : s2Lo;
     s = s2;
     t = t2;
 }

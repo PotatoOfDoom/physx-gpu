@@ -1735,7 +1735,12 @@ void jcalcComputeLinkVelocities(uint64_t a, uint64_t linkBlocks, uint64_t dofBlo
                         abF32(d + PXG_AB_DOF_mConstraintData, PXG_AB_IC_mMaxJointVelocity, lane);
                     const float jVel = abF32(d, PXG_AB_DOF_mJointVelocities, lane);
                     if (jVel != 0.0f)
-                        ratio = min(ratio, maxJVelocity / abs(jVel));
+                    {
+                        // P9.86: PxMin(float) is selectMin, `a < b ? a : b` (forwardDynamic2.cu:995, PxUnixMathIntrinsics.h:118):
+                        // b on a signed-zero tie (PxMin(-0,+0) = +0) and b when either is NaN -- FMin is neither.
+                        const float r = maxJVelocity / abs(jVel);
+                        ratio = (ratio < r) ? ratio : r;
+                    }
                     ++cursor;
                 }
             }

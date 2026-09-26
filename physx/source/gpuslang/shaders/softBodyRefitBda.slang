@@ -192,6 +192,27 @@ uint ballot32(bool pred, uint idx)
     return sMask;
 }
 
+// P9.86: warpShuffleMin/Max (shuffle.cuh:49/62) combine with fminf/fmaxf, NOT PxMin/PxMax.
+// NVIDIA min/max.f32: a NaN operand is dropped (NaN,NaN -> canonical 0x7FFFFFFF) and a
+// zero tie orders -0 < +0 regardless of operand order (so the butterfly is order-free).
+// The PxMin select keeps b on a tie -> the serial scan returned the LAST tied lane's sign.
+float sbrCuFminf(float a, float b)
+{
+    if (isnan(a)) return isnan(b) ? asfloat(0x7FFFFFFFu) : b;
+    if (isnan(b)) return a;
+    if (a == b) return asfloat(asuint(a) | asuint(b));   // +-0 tie -> -0; equal non-zero: same bits
+    return a < b ? a : b;
+}
+float sbrCuFmaxf(float a, float b)
+{
+    if (isnan(a)) return isnan(b) ? asfloat(0x7FFFFFFFu) : b;
+    if (isnan(b)) return a;
+    if (a == b) return asfloat(asuint(a) & asuint(b));   // +-0 tie -> +0; equal non-zero: same bits
+    return a > b ? a : b;
+}
+float3 sbrCuFminf3(float3 a, float3 b) { return float3(sbrCuFminf(a.x, b.x), sbrCuFminf(a.y, b.y), sbrCuFminf(a.z, b.z)); }
+float3 sbrCuFmaxf3(float3 a, float3 b) { return float3(sbrCuFmaxf(a.x, b.x), sbrCuFmaxf(a.y, b.y), sbrCuFmaxf(a.z, b.z)); }
+
 // warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62).
 void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
 {
@@ -203,8 +224,8 @@ void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
     float3 rx = float3(sRedMax[0], sRedMax[1], sRedMax[2]);
     for (uint i = 1u; i < WARP; ++i)
     {
-        rn = pxMin3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));
-        rx = pxMax3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));
+        rn = sbrCuFminf3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));   // P9.86: fminf, shuffle.cuh:53-55
+        rx = sbrCuFmaxf3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));   // P9.86: fmaxf, shuffle.cuh:66-68
     }
     GroupMemoryBarrierWithGroupSync();
     mn = rn; mx = rx;

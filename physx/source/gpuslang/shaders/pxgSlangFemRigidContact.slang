@@ -486,7 +486,12 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
     const float unitResponse = rigidRefCount * raXn_resp.w + deformableInvMass_massSplitting;
     const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
 
-    r.deltaLambdaN = max(-CN * invDenom, -r.accumulatedDeltaLambdaN);
+    // P9.86: PxMax(float) = intrinsics::selectMax = `a > b ? a : b` (deformableUtils.cuh:374,
+    // PxUnixMathIntrinsics.h:122), which keeps b = -acc = -0 on the (+0, -0) tie; OpFMax
+    // returns +0 there on llvmpipe (and a, not b, for a NaN b).
+    const float dLNa = -CN * invDenom;
+    const float dLNb = -r.accumulatedDeltaLambdaN;
+    r.deltaLambdaN = (dLNa > dLNb) ? dLNa : dLNb;
     r.accumulatedDeltaLambdaN += r.deltaLambdaN;
 
     // Friction constraint in the tangent direction (null-material path -> combinedFriction 0).

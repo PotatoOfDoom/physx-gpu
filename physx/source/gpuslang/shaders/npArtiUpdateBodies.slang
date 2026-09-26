@@ -285,9 +285,10 @@ void updateBodiesLaunch_Part2(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
 // Same arg pack as the other two stages ({8, 4, 1}); dt and integrate are
 // declared and ignored by the .cu, so they are not read here.
 //
-//  1. PxMax(lwc, maxWc) is the TERNARY (lwc < maxWc) ? maxWc : lwc (PxMath.h:75),
-//     not max(): on a tie -- signed zeros -- the FIRST operand survives, so an
-//     articulation whose counters are all -0.0 ends with -0.0 bits.
+//  1. PxMax(lwc, maxWc) on float is selectMax = (lwc > maxWc) ? lwc : maxWc
+//     (PxMath.h:81 -> PxUnixMathIntrinsics.h:122), not max(): on a tie -- signed
+//     zeros -- the SECOND operand (the +0-seeded running max) survives, so an
+//     articulation whose counters are all -0.0 ends with +0 bits (P9.86).
 //  2. The transition test is on FLOATS: -0.0 counts as zero either way.
 //  3. The load of linkWakeCounters[0] sits inside the loop, never hoisted: a
 //     zero-link articulation may carry a null array.
@@ -324,7 +325,7 @@ void updateBodiesLaunch_Part3(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
     for (uint linkID = 0; linkID < linkCount; ++linkID)
     {
         const float lwc = linkWakeCounters[linkID];
-        maxWc = (lwc < maxWc) ? maxWc : lwc; // PxMax(lwc, maxWc) (trap 1)
+        maxWc = (lwc > maxWc) ? lwc : maxWc; // P9.86: PxMax<float> = selectMax(a,b) = a > b ? a : b (PxUnixMathIntrinsics.h:122, forwardDynamic2.cu:3236): a tie keeps maxWc, so the +0 seed survives -0 counters (trap 1)
     }
 
     uint newFlags = old.y & ~(PXG_BODY_ACTIVATE_THIS_FRAME | PXG_BODY_DEACTIVATE_THIS_FRAME);

@@ -595,7 +595,8 @@ StArmOut stCapsuleArm(uint globalThreadIndex,
                     const float3 c = ctQuatRotate(meshToCapQ, cc.pt[i]) + meshToCapP;
                     if (i == 0u) { o.contact0 = c; o.sep0 = cc.sep[i]; }
                     else         { o.contact1 = c; o.sep1 = cc.sep[i]; }
-                    separation = min(separation, cc.sep[i]);
+                    // P9.86: convexMesh.cu:575 PxMin is selectMin (a < b ? a : b), so a tie keeps pen: PxMin(-0,+0) = +0.  GLSL FMin on llvmpipe returns -0 in either order.
+                    separation = stMin(separation, cc.sep[i]);
                 }
             }
         }

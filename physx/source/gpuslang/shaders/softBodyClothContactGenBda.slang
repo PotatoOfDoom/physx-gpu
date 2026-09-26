@@ -198,6 +198,11 @@ float3 cgQuatRotate(float4 q, float3 v)
 
 // computeTetBarycentric (deformableCollision.cuh:96): the eps window is tested on the
 // UNCLAMPED values and the clamp is applied afterwards.
+// P9.86: PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) = selectMin(1, selectMax(0, t))
+// (deformableCollision.cuh:131-134). The selects keep t = -0 (0 > -0 is false) and pass
+// NaN through; GLSL FClamp (fmin(fmax(t, 0), 1)) returns +0 for -0 on llvmpipe.
+float sbClothPxClamp01(float t) { const float m = (0.0f > t) ? 0.0f : t; return (1.0f < m) ? 1.0f : m; }
+
 bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
                            out float4 barycentric)
 {
@@ -210,8 +215,8 @@ bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
     const float w = dot(ba, cross(pa, da)) / detBcd;
     const float x = dot(ba, cross(ca, pa)) / detBcd;
     const float u = 1.0f - v - w - x;
-    barycentric = float4(clamp(u, 0.0f, 1.0f), clamp(v, 0.0f, 1.0f),
-                         clamp(w, 0.0f, 1.0f), clamp(x, 0.0f, 1.0f));
+    barycentric = float4(sbClothPxClamp01(u), sbClothPxClamp01(v),
+                         sbClothPxClamp01(w), sbClothPxClamp01(x));   // P9.86: select PxClamp
     return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
            (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
 }

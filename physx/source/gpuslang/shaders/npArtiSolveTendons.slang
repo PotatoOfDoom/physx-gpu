@@ -186,6 +186,15 @@ public AbSpatialVector svPropagateAccelDeferred(float3 parentToChild, uint64_t d
         }
     }
 
+    // P9.86: CUDA jointSpatialDeltaV starts at +0 and is only ever += (IEEE 0 + t,
+    // articulationDynamic.cuh:292-313), so it is never -0; llvmpipe unrolls the 3-trip
+    // loop and folds the seed add, keeping a -0 that survives `pDeltaV(-0) + J`.
+    // Canonicalise (-0 -> +0) before the final add; nonzero/NaN/inf pass unchanged.
+    const float3 jTop = jointSpatialDeltaV.top;
+    const float3 jBot = jointSpatialDeltaV.bottom;
+    jointSpatialDeltaV = asmSVec(
+        float3((jTop.x == 0.0f) ? 0.0f : jTop.x, (jTop.y == 0.0f) ? 0.0f : jTop.y, (jTop.z == 0.0f) ? 0.0f : jTop.z),
+        float3((jBot.x == 0.0f) ? 0.0f : jBot.x, (jBot.y == 0.0f) ? 0.0f : jBot.y, (jBot.z == 0.0f) ? 0.0f : jBot.z));
     return asmSVecAdd(pDeltaV, jointSpatialDeltaV);
 }
 
@@ -389,6 +398,11 @@ public void svApplyImpulses(uint64_t artiBlock, uint64_t linkBase, uint64_t dofB
             for (uint i = 0u; i < 3u; ++i)
                 if (i < dofCountAtCommon) jiCommon[i] += jointImpulse1[i];
         }
+        // P9.86: jointImpulseToApplyAtCommonLink starts at +0 and is only ever +=
+        // (internalConstraints2.cu:2268/2283), so IEEE never leaves it -0; the zero-seed
+        // add folds away (slangc / unrolled llvmpipe), so canonicalise (-0 -> +0).
+        for (uint i = 0u; i < 3u; ++i)
+            jiCommon[i] = (jiCommon[i] == 0.0f) ? 0.0f : jiCommon[i];
     }
 
     // trap 6: does not run when commonLink == 0

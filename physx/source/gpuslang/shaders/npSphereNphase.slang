@@ -147,9 +147,9 @@ ConstantBuffer<SphereNphaseParams> gParams;
 float combineScalars(float a, float b, uint mode)
 {
     if (mode == MODE_AVERAGE) return 0.5f * (a + b);
-    if (mode == MODE_MIN) return min(a, b);
+    if (mode == MODE_MIN) return (a < b) ? a : b;   // P9.86: PxMin = select a<b?a:b (PxsMaterialCombiner.h:43); FMin zero sign/NaN undefined
     if (mode == MODE_MULTIPLY) return a * b;
-    if (mode == MODE_MAX) return max(a, b);
+    if (mode == MODE_MAX) return (a > b) ? a : b;   // P9.86: PxMax = select a>b?a:b (PxsMaterialCombiner.h:47)
     return 0.0f;
 }
 
@@ -195,7 +195,7 @@ void combineMaterials(PxsMaterialData m0, PxsMaterialData m1,
         const uint fm = max(m0fric, m1fric);
         const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
         const float staF = combineScalars(m0.staticFriction, m1.staticFriction, fm);
-        const float fDyn = max(dynF, 0.0f);
+        const float fDyn = (dynF > 0.0f) ? dynF : 0.0f; // P9.86: PxMax(dyn,0) = select (PxsMaterialCombiner.h:161); FMax may give -0
         dyn = fDyn;
         sta = (staF - fDyn) >= 0.0f ? staF : fDyn;
         matFlags = combineFlags;

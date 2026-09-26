@@ -174,7 +174,8 @@ float infBlockReduceAdd(uint tid, float value, float initialValue)
 }
 
 // I7: no SPIR-V cube root; the argument is guaranteed non-negative by PxMax.
-float infCbrt(float x) { return pow(x, 1.0f / 3.0f); }
+// P9.86: cbrtf(+-0) = +-0 (CUDA keeps the sign; particlesystem.cu:4995); llvmpipe's pow(-0, 1/3) returns +0.
+float infCbrt(float x) { return (x == 0.0f) ? x : pow(x, 1.0f / 3.0f); }
 
 float infMax(float a, float b) { return a > b ? a : b; }
 float infMin(float a, float b) { return a < b ? a : b; }

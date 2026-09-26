@@ -175,6 +175,15 @@ float getSpecVolume(out float3 cVolumePos, float3 currentPos, float3 predictedPo
     return sqrt(dot(cVolumeOffset, cVolumeOffset)) + contactDist;
 }
 
+// P9.86: PxVec3::minimum/maximum (particlesystem.cu:506-507/:513-514, PxVec3.h:339-358)
+// are PxMin/PxMax = selectMin/selectMax (a < b ? a : b / a > b ? a : b): on a
+// signed-zero tie the SECOND operand survives.  FMin/FMax (Slang min/max) are
+// symmetric on llvmpipe (min -> -0, max -> +0), so spell the select.
+float psbSelMin(float a, float b) { return (a < b) ? a : b; }
+float psbSelMax(float a, float b) { return (a > b) ? a : b; }
+float3 psbSelMin3(float3 a, float3 b) { return float3(psbSelMin(a.x, b.x), psbSelMin(a.y, b.y), psbSelMin(a.z, b.z)); }
+float3 psbSelMax3(float3 a, float3 b) { return float3(psbSelMax(a.x, b.x), psbSelMax(a.y, b.y), psbSelMax(a.z, b.z)); }
+
 // ---------------------------------------------------------------------------
 // Portable full-block min/max reduction (llvmpipe guard: no 32-lane subgroup).
 // ---------------------------------------------------------------------------
@@ -279,13 +288,13 @@ void ps_updateBoundFirstPassLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
                 const float3 currentPos = currentDiffusePositions[globalThreadIndex].xyz;
                 float3 cVolumePos;
                 const float cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, 0.0f, true, isTGS);
-                minPos = min(minPos, cVolumePos - float3(cVolumeRadius, cVolumeRadius, cVolumeRadius));
-                maxPos = max(maxPos, cVolumePos + float3(cVolumeRadius, cVolumeRadius, cVolumeRadius));
+                minPos = psbSelMin3(minPos, cVolumePos - float3(cVolumeRadius, cVolumeRadius, cVolumeRadius));   // P9.86: PxVec3::minimum (select), particlesystem.cu:506
+                maxPos = psbSelMax3(maxPos, cVolumePos + float3(cVolumeRadius, cVolumeRadius, cVolumeRadius));   // P9.86: PxVec3::maximum (select), particlesystem.cu:507
             }
             else
             {
-                minPos = min(minPos, predictedPos);
-                maxPos = max(maxPos, predictedPos);
+                minPos = psbSelMin3(minPos, predictedPos);   // P9.86: PxVec3::minimum (select, tie -> predictedPos), particlesystem.cu:513
+                maxPos = psbSelMax3(maxPos, predictedPos);   // P9.86: PxVec3::maximum (select, tie -> predictedPos), particlesystem.cu:514
             }
         }
     }

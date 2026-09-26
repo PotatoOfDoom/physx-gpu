@@ -239,15 +239,15 @@ void mmWarpCopyU(uint64_t dst, uint value, uint totalBytes, uint lane)
 // unification P8.88 recorded).
 //
 // ---------------------------------------------------------------------------
-// The signed-zero seed, and why it is the CALLER's problem
+// The signed-zero seed, and why the CALLER fixes it
 // ---------------------------------------------------------------------------
 //
 // `PxReal qstZ[3] = { 0.f, 0.f, 0.f }` is the literal-zero accumulator P8.87
 // identified: `adPropagateImpulseW` does `qstZ[ind] = qstZ[ind] + stZ`, so with a
 // single accumulated term the driver's `x + 0.0` fold makes a `-0` term survive
 // as `-0` where the engine's C++ returns `+0`.  `pxgSlangArticulationDynamic`'s
-// header says this is the caller's fixture problem; this is that caller, and the
-// fixture carries the scoped tolerance with its count printed and bounded.
+// header leaves this to the caller (its other callers seed differently); P9.86
+// canonicalises qstZ with a select right after the call in the link loop below.
 
 // Load the six per-dof quantities the link path needs.  `dof` is a PxU8 in the
 // block and is read as one -- a word read here picks up `mDisableGravity` and
@@ -308,9 +308,13 @@ void mmSetColumn(inout AbMatrix6x6 m, uint i, AbSpatialVector r)
     m.e[i * 6u + 5u] = r.bottom.z;
 }
 
-// PxMax (PxMath.h): `a < b ? b : a`.  Spelled out because the nesting order is
-// transcribed and `max()` would be the tidy version of a different expression.
-float mmPxMax(float a, float b) { return a < b ? b : a; }
+// PxMax (PxMath.h:82): the FLOAT specialisation, intrinsics::selectMax
+// (PxUnixMathIntrinsics.h:122) `a > b ? a : b` -- NOT the generic template's
+// `a < b ? b : a`, which keeps the OTHER operand on a +-0 tie and on NaN.
+// P9.86: a fixed-base link whose COM cannot translate has an all-zero response
+// diagonal of mixed zero signs, and the CUDA's nesting keeps the LAST one.
+// Spelled out because `max()` (FMax) would be a third answer on the tie.
+float mmPxMax(float a, float b) { return a > b ? a : b; }
 
 // The whole kernel body, with the block bases and the record pointers resolved.
 // Split out from the entry point so the fixture can drive it with hand-fed bases
@@ -460,7 +464,17 @@ void mmComputeMassMatrix(uint64_t artiBlock, uint64_t linkBlocks, uint64_t dofBl
                 const AbSpatialVector Zp =
                     adPropagateImpulseW(d.isInvD, rw, d.motionV, vec, dof, qstZ);
 
+                // P9.86: each qstZ[k] is `+0 + stZ` (one add from the literal +0 seed,
+                // articulationDynamic.cuh:178), which IEEE never leaves at -0; llvmpipe
+                // forwards the seed and folds the add, so canonicalise -0 -> +0 as a
+                // select (every non-zero, inf and NaN passes through unchanged).
+                qstZ[0] = (qstZ[0] == 0.0f) ? 0.0f : qstZ[0];
+                qstZ[1] = (qstZ[1] == 0.0f) ? 0.0f : qstZ[1];
+                qstZ[2] = (qstZ[2] == 0.0f) ? 0.0f : qstZ[2];
+
                 // (2) the parent's deltaV response, negated, propagated back down
+                // (forwardDynamic2.cu:1910).  P9.86: the product's zero-seeded rows
+                // (PxSpatialMatrix.h:64-70) are canonicalised inside asmM6MulVec itself.
                 const AbSpatialVector Zr = asmSVecScale(asmM6MulVec(parentResponse, Zp), -1.0f);
                 const AbSpatialVector deltaV =
                     adPropagateAccelerationW(rw, d.invStIsT, d.motionV, Zr, dof, d.isW, qstZ);

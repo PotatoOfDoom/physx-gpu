@@ -1182,7 +1182,9 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
         {
             ThresholdStreamElement elt;
             elt.normalForce = normalForce;
-            elt.threshold = min(reportThreshold0, reportThreshold1);
+            // P9.86: solverBlock.cuh:781 PxMin<float> = `a < b ? a : b` (b on a tie, NaN in b propagates); the
+            // builtin min (GLSL FMin) has an implementation-defined zero sign and NaN result; CUDA gives +0 for (-0,+0).
+            elt.threshold = (reportThreshold0 < reportThreshold1) ? reportThreshold0 : reportThreshold1;
             uint2 nodeA = solverBodyData[bodyAIndex].islandNodeIndex;
             uint2 nodeB = solverBodyData[bodyBIndex].islandNodeIndex;
             // PxOrder(): swap so nodeIndexA < nodeIndexB

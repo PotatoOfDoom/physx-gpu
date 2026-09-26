@@ -468,7 +468,13 @@ bool particlePrimitiveCollision(float3 particlePos, float3 cVolumePos, float cVo
     case GEOM_PLANE:
     {
         const float3 pn = quatRotate(shapeQ, float3(1, 0, 0));
-        const float pdd = -dot(pn, shapeP);
+        // P9.86: PxPlane(1,0,0,0).transform (PxPlane.h:137, cudaParticleSystem.cu:285) is
+        // `d - p.dot(n)` with d a literal 0, i.e. IEEE `0 - x`: +0 for EITHER zero.  Unary
+        // minus turns the +0 dot of a plane through the origin into -0, and dist = dot + pdd
+        // then keeps a -0 dot (particle exactly on the plane) that the CUDA's +0 pdd turns
+        // into +0 -- stored as normal_pen.w when restDistance == +0.
+        const float pdot = dot(pn, shapeP);
+        const float pdd = (pdot == 0.0f) ? 0.0f : -pdot;
         dist = dot(pn, cVolumePos) + pdd;
         if (dist <= cVolumeRadius)
         {

@@ -383,11 +383,15 @@ public void queryReduced1dConstraintSolverConstantsTGS(uint constraintFlags, flo
 public void computeJointSpeedTGS(float normalVel0, bool isKinematic0, float normalVel1, bool isKinematic1,
                                  out float jointSpeedForRestitutionBounce, out float initJointSpeed)
 {
+    // P9.86: CUDA (DyCpuGpu1dConstraint.h:391-395) does IEEE 0 - v0 then + v1 from a +0 seed,
+    // which can never give -0; slangc folds 0 + v1 -> v1 and llvmpipe rewrites OpFSub(0, v0)
+    // -> -v0, so spell 0 - v0 as a select and canonicalise the accumulator's zero to +0.
     initJointSpeed = 0.0f;
     if (isKinematic0)
-        initJointSpeed -= normalVel0;
+        initJointSpeed = (normalVel0 == 0.0f) ? 0.0f : -normalVel0;
     if (isKinematic1)
         initJointSpeed += normalVel1;
+    initJointSpeed = (initJointSpeed == 0.0f) ? 0.0f : initJointSpeed;
     jointSpeedForRestitutionBounce = normalVel0 - normalVel1;
 }
 

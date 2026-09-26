@@ -40,13 +40,17 @@
 // ===========================================================================
 //
 // `PxClamp(v, lo, hi)` is `PxMin(hi, PxMax(lo, v))` (PxMath.h:142-146), and both
-// halves are written as a comparison-and-select: `PxMax(a, b)` is `a < b ? b : a`
-// and `PxMin(a, b)` is `a < b ? a : b` (:75-94).  That pins the NaN answer: with
-// v = NaN, `lo < NaN` is false, so PxMax yields `lo`, and PxClamp yields `lo`.
+// halves are written as a comparison-and-select: for float, `PxMax(a, b)` is
+// selectMax `a > b ? a : b` and `PxMin(a, b)` is selectMin `a < b ? a : b`
+// (PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125).  That pins the NaN answer:
+// with v = NaN, `lo > NaN` is false, so PxMax yields NaN, and PxClamp yields NaN
+// (P9.86: corrected; the generic template `a < b ? b : a` is not the float path).
 //
 // Slang's `clamp` lowers to GLSL.std.450 FClamp/NClamp, whose result the Vulkan
-// environment spec leaves UNDEFINED when an operand is NaN.  So the two spellings
-// agree on every ordinary input and are not the same function.
+// environment spec leaves UNDEFINED when an operand is NaN, and whose zero sign
+// on a +0/-0 tie is implementation-defined (P9.86: PxClamp(-0, 0, 1) is -0).  So
+// the two spellings agree on every non-zero, non-NaN input and are not the same
+// function.
 //
 // At the three sites below a NaN provably cannot arrive:
 //   * `s0` is computed from `temp / denom` and is DISCARDED whenever
@@ -126,9 +130,11 @@
 // The three survivors are equivalences:
 //
 //   S14-clamp-is-builtin        PxClamp against the library clamp.  They differ
-//       only on NaN, and the header above proves NaN cannot reach any of the three
-//       sites.  This survivor is the measurement behind that proof, not a gap --
-//       and the module keeps the explicit spelling regardless.
+//       on NaN, which the header above proves cannot reach any of the three
+//       sites, and (P9.86) on the sign of a zero result, which can: `comp` is -0
+//       when aRecip == 0.  This survivor predates the -0 fixture cases and is no
+//       longer an equivalence under a sign-of-zero comparison -- the module keeps
+//       the explicit spelling for that reason.
 //   T10-closestP31-sign         `p - n*dist3` against `p + n*dist3`.
 //   T11-closestP41-uses-dist3   `q - n*dist4` against `q - n*dist3`.
 //       Both displace the projected point ALONG n, and the only things read from
@@ -144,7 +150,11 @@ static const float ST_MAX_F32 = 3.4028234663852886e+38f;   // PX_MAX_F32
 
 // PxMath.h:75-94 and :142-146, transcribed as comparisons rather than delegated
 // to an intrinsic -- see the header.
-public float stMax(float a, float b) { return a < b ? b : a; }
+// P9.86: PxMax<float> is the specialisation intrinsics::selectMax (PxMath.h:81-85 ->
+// PxUnixMathIntrinsics.h:122), `a > b ? a : b`, NOT the generic `a < b ? b : a`:
+// PxMax(+0, -0) = -0 and a NaN returns b, so PxClamp(-0,0,1) = -0, PxClamp(NaN,0,1) = NaN
+// (distanceSegmentSegment.cuh:63/76/81).
+public float stMax(float a, float b) { return a > b ? a : b; }
 public float stMin(float a, float b) { return a < b ? a : b; }
 public float stClamp(float v, float lo, float hi) { return stMin(hi, stMax(lo, v)); }
 

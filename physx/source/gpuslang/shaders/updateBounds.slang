@@ -194,8 +194,15 @@ void updateBounds(PxgShapeSim shapeSim, PxgTransform28 pose, uint index)
                     asfloat(gGeometryBlob[verticesBase + i * 4 + 1]),
                     asfloat(gGeometryBlob[verticesBase + i * 4 + 2]));
                 const float3 vertexV = mat33Transform(rot, v);
-                minV = min(minV, vertexV);
-                maxV = max(maxV, vertexV);
+                // P9.86: updateCacheAndBound.cuh:134-135 PxVec3::minimum/maximum are
+                // PxMin/PxMax selects (a<b?a:b / a>b?a:b); GLSL FMin/FMax differ on
+                // +0/-0 ties and NaN.
+                minV = float3(minV.x < vertexV.x ? minV.x : vertexV.x,
+                              minV.y < vertexV.y ? minV.y : vertexV.y,
+                              minV.z < vertexV.z ? minV.z : vertexV.z);
+                maxV = float3(maxV.x > vertexV.x ? maxV.x : vertexV.x,
+                              maxV.y > vertexV.y ? maxV.y : vertexV.y,
+                              maxV.z > vertexV.z ? maxV.z : vertexV.z);
             }
 
             outMin = minV + pose.p();

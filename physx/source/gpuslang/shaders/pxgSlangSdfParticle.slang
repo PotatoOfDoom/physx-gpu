@@ -85,7 +85,8 @@
 //      non-finite.  See the candidate note at the bottom.
 // B11. The CCD re-cast applies particleToTrimeshTransform to `pt`, which is
 //      ALREADY in that transform's output space.  See the candidate note.
-// B12. PxMax is `a < b ? b : a` and getNormalized is
+// B12. PxMax(float) is intrinsics::selectMax `a > b ? a : b` (P9.86, see
+//      pxgSlangSdfCollision sdfcMax) and getNormalized is
 //      `magSq > 0 ? v * (1/sqrt(magSq)) : 0` -- the P9.12d spellings, reused
 //      from pxgSlangSdfCollision rather than respelled.
 //

@@ -395,7 +395,11 @@ void sb_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         // computed from the unflipped n and is NOT negated with it.
         const float3 wA = o.closestPointA.xyz;
         const float3 wB = o.closestPointB.xyz;
-        const float pen = dot(wB - wA, n);
+        // P9.86: the CUDA sums the three lanes and then adds penOffset, a literal 0 here
+        // (softbodyPrimitives.cu:339, :1136).  That IEEE `x + 0` turns a -0 into +0, and
+        // slangc/llvmpipe would drop it, so it is spelled as a select.
+        const float penSum = dot(wB - wA, n);
+        const float pen = (penSum == 0.0f) ? 0.0f : penSum;
 
         uint index;
         InterlockedAdd(Ptr<uint>(gHc.w_totalContactCount)[0], 1u, index);

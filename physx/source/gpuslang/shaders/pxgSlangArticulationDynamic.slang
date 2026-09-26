@@ -96,9 +96,10 @@ public AbSpatialVector adTranslateSpatialVector(float3 offset, AbSpatialVector v
 //
 // `qstZ` ACCUMULATES — the caller's value is added to, not replaced.  In
 // `computeMassMatrix1T` the caller seeds it with a literal `{0, 0, 0}` and the
-// engine's C++ performs the add, which is the P8.84 signed-zero shape; that is
-// the caller's fixture problem, not this function's, and the caller's note says
-// so.
+// engine's C++ performs the add, which is the P8.84 signed-zero shape.  A caller
+// that seeds a literal zero canonicalises afterwards (P9.86: llvmpipe folds the
+// literal seed into the first add; computeMassMatrix1T does `(q == 0) ? 0 : q`);
+// here the add stays, because runtime-seeded callers need IEEE `-0 + -0 = -0`.
 public AbSpatialVector adPropagateImpulseW(AbSpatialVector isInvD[3], float3 childToParent,
                                            AbSpatialVector motionMatrix[3], AbSpatialVector Z,
                                            uint dofCount, inout float qstZ[3])

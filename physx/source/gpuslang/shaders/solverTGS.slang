@@ -452,8 +452,13 @@ void solveContactBlockTGS(uint batchIndex, inout float3 linVel0, inout float3 an
                 const float totalImpulse = tmp10 - normalVel0 * velMultiplier0;
 
                 const bool clampImpulse = abs(totalImpulse) > (maxFrictionImpulse * frictionScale);
-                const float totalClamped = clamp(totalImpulse, -maxDynFrictionImpulse * frictionScale,
-                                                 maxDynFrictionImpulse * frictionScale);
+                // P9.86: PxClamp(v, lo, hi) = PxMin(hi, PxMax(lo, v)) = selectMin(hi, selectMax(lo, v))
+                // (solverBlockTGS.cuh:473). FClamp orders signed zeros under SZINP: (lo, hi) = (+0, -0)
+                // with v < 0 gives -0 where the CUDA gives +0.
+                const float torsLo = -maxDynFrictionImpulse * frictionScale;
+                const float torsHi = maxDynFrictionImpulse * frictionScale;
+                const float torsMax = (torsLo > totalImpulse) ? torsLo : totalImpulse;
+                const float totalClamped = (torsHi < torsMax) ? torsHi : torsMax;
                 const float newAppliedForce = clampImpulse ? totalClamped : totalImpulse;
 
                 const float deltaF = newAppliedForce - appliedForce0;
@@ -605,7 +610,15 @@ void solve1DBlockTGS(uint batchIndex, inout float3 linVel0, inout float3 angVel0
         const float normalVel = v0 - v1;
 
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
-        const float clampedForce = min(maxImpulse, max(minImpulse, unclampedForce));
+        // P9.86: CUDA fminf(maxImpulse, fmaxf(minImpulse, u)) (solverBlockTGS.cuh:907) orders the zeros
+        // (fmaxf(+-0) = +0 unless both -0, fminf(+-0) = -0 unless both +0); llvmpipe FMax/FMin return the
+        // second operand on a zero tie. Zero ties are spelled as selects; all else keeps max/min.
+        const float maxedForce = (minImpulse == 0.0f && unclampedForce == 0.0f)
+                                     ? ((asuint(minImpulse) == 0u) ? minImpulse : unclampedForce)
+                                     : max(minImpulse, unclampedForce);
+        const float clampedForce = (maxImpulse == 0.0f && maxedForce == 0.0f)
+                                       ? ((asuint(maxImpulse) != 0u) ? maxImpulse : maxedForce)
+                                       : min(maxImpulse, maxedForce);
         const float deltaF = clampedForce - appliedForce;
 
         gJointRowsCon[r].appliedForce[threadIndex] = clampedForce;
@@ -1012,7 +1025,9 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
         {
             ThresholdStreamElement elt;
             elt.normalForce = normalForce;
-            elt.threshold = min(reportThreshold0, reportThreshold1);
+            // P9.86: CUDA PxMin<float> = selectMin (a < b ? a : b; tie/NaN -> b) (solverBlockTGS.cuh:722).
+            // GLSL.std.450 FMin's tie rule for +-0 (and NaN result) differs: spell the select.
+            elt.threshold = (reportThreshold0 < reportThreshold1) ? reportThreshold0 : reportThreshold1;
             uint2 nodeA = solverBodyData[bodyAIndex].islandNodeIndex;
             uint2 nodeB = solverBodyData[bodyBIndex].islandNodeIndex;
             // PxOrder(): swap so nodeIndexA < nodeIndexB
@@ -1925,8 +1940,13 @@ void solveContactBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchInd
                 const float totalImpulse = tmp10 - normalVel0 * velMultiplier0;
 
                 const bool clampImpulse = abs(totalImpulse) > (maxFrictionImpulse * frictionScale);
-                const float totalClamped = clamp(totalImpulse, -maxDynFrictionImpulse * frictionScale,
-                                                 maxDynFrictionImpulse * frictionScale);
+                // P9.86: PxClamp(v, lo, hi) = PxMin(hi, PxMax(lo, v)) = selectMin(hi, selectMax(lo, v))
+                // (solverBlockTGS.cuh:473). FClamp orders signed zeros under SZINP: (lo, hi) = (+0, -0)
+                // with v < 0 gives -0 where the CUDA gives +0.
+                const float torsLo = -maxDynFrictionImpulse * frictionScale;
+                const float torsHi = maxDynFrictionImpulse * frictionScale;
+                const float torsMax = (torsLo > totalImpulse) ? torsLo : totalImpulse;
+                const float totalClamped = (torsHi < torsMax) ? torsHi : torsMax;
                 const float newAppliedForce = clampImpulse ? totalClamped : totalImpulse;
 
                 const float deltaF = newAppliedForce - appliedForce0;
@@ -2085,7 +2105,15 @@ void solve1DBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
         const float normalVel = v0 - v1;
 
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
-        const float clampedForce = min(maxImpulse, max(minImpulse, unclampedForce));
+        // P9.86: CUDA fminf(maxImpulse, fmaxf(minImpulse, u)) (solverBlockTGS.cuh:907) orders the zeros
+        // (fmaxf(+-0) = +0 unless both -0, fminf(+-0) = -0 unless both +0); llvmpipe FMax/FMin return the
+        // second operand on a zero tie. Zero ties are spelled as selects; all else keeps max/min.
+        const float maxedForce = (minImpulse == 0.0f && unclampedForce == 0.0f)
+                                     ? ((asuint(minImpulse) == 0u) ? minImpulse : unclampedForce)
+                                     : max(minImpulse, unclampedForce);
+        const float clampedForce = (maxImpulse == 0.0f && maxedForce == 0.0f)
+                                       ? ((asuint(maxImpulse) != 0u) ? maxImpulse : maxedForce)
+                                       : min(maxImpulse, maxedForce);
         const float deltaF = clampedForce - appliedForce;
 
         jointRowsCon[r].appliedForce[threadIndex] = clampedForce;

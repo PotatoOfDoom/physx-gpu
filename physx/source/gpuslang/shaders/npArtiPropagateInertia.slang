@@ -110,6 +110,10 @@
 //     CUDA spells them, and the divergence is handled where P8.84 also ended up
 //     handling it: a comparison tolerance scoped to `0x00000000` vs `0x80000000`,
 //     with the count printed so it cannot drift.
+//     P9.86 SUPERSEDES THIS: the fold only ever turns the CUDA's `+0` into `-0`,
+//     so `isID` and the six columns are canonicalised after accumulation with the
+//     select `apiPlusZero3` ((x == 0) ? 0 : x), which is the CUDA value bit for
+//     bit.  The test's signed-zero tolerance on lane 10 is now obsolete.
 //  2. **The seed's sign is almost always washed out, which is why this is hard to
 //     see at all.**  IEEE gives `(-0) + (+0) = +0`, so a single ordinary term
 //     erases it.  A three-dof spherical joint with a diagonal `invStIs` — the
@@ -162,6 +166,14 @@ float apiMatAt(AbMat33 m, uint col, uint row)
 {
     const float3 c = (col == 0u) ? m.c0 : ((col == 1u) ? m.c1 : m.c2);
     return (row == 0u) ? c.x : ((row == 1u) ? c.y : c.z);
+}
+
+// IEEE `+0 + x` per component, as a select (P9.86): +0 for either zero, x otherwise
+// (NaN and inf pass through, NaN == 0 is false).
+float3 apiPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y,
+                  (v.z == 0.0f) ? 0.0f : v.z);
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +337,9 @@ public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint6
             }
         }
 
-        // literal zeros, exactly as the CUDA spells them.  The header records why
-        // there is no workaround here: the fold is the driver's and a runtime-zero
-        // seed changes nothing, measured.
+        // literal zeros, exactly as the CUDA spells them.  The header records why a
+        // runtime-zero seed does not help (the fold is the driver's); P9.86 instead
+        // canonicalises the finished accumulators with apiPlusZero3, below.
         const float3 z3 = float3(0.0f, 0.0f, 0.0f);
         AbSpatialVector columns[6];
         for (uint k = 0u; k < 6u; ++k)
@@ -346,6 +358,12 @@ public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint6
                                           asmSVecScale(msIs[ind2], apiMatAt(invStIs, ind, ind2)));
                 }
 
+                // P9.86: isID starts at a literal +0 and only ever += a term, so the CUDA's
+                // IEEE chain (forwardDynamic2.cu:1511/1518) never holds -0.  llvmpipe unrolls
+                // the trip-3 loop, forwards the seed and folds the first `0 + t` to t, keeping
+                // a -0 term.  Canonicalised: bit for bit the engine's value.
+                isID = asmSVec(apiPlusZero3(isID.top), apiPlusZero3(isID.bottom));
+
                 // BOTTOM first, then top -- the one-dof case's stI swap, spelled
                 // over six columns
                 columns[0] = asmSVecAdd(columns[0], asmSVecScale(isID, msIs[ind].bottom.x));
@@ -362,6 +380,14 @@ public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint6
                 ZAInt = asmSVecAdd(ZAInt, asmSVecScale(isID, qstZIcIntG[ind]));
             }
         }
+
+        // P9.86: every column starts at a literal +0 and only ever += a term, so the
+        // CUDA's IEEE chain (forwardDynamic2.cu:1499-1527) never holds -0.  llvmpipe
+        // unrolls the 3-trip loop, forwards the seed and folds the first `+0 + t` to t,
+        // so an all -0 column survives as -0.  The fold only changes the sign of a
+        // zero, so canonicalising the finished columns is the engine's value bit for bit.
+        for (uint k = 0u; k < 6u; ++k)
+            columns[k] = asmSVec(apiPlusZero3(columns[k].top), apiPlusZero3(columns[k].bottom));
 
         return asmConstructFromColumns(columns);
     }
@@ -525,19 +551,22 @@ void artiPropagateInertia(uint3 groupThreadId : SV_GroupThreadID)
 // THE CLAMP IS PxMax, NOT max
 // ---------------------------------------------------------------------------
 //
-// `PxMax(0.f, x)` is `a < b ? b : a` (PxMath.h), i.e. `0 < x ? x : 0` — which
-// returns 0 for a NaN, because the comparison is false.  Slang's `max` lowers to
-// `OpFMax`, whose NaN behaviour is the other way round on most drivers.  The
-// engine's spelling is kept verbatim.
+// `PxMax(0.f, x)` on a float is the specialisation `intrinsics::selectMax` =
+// `a > b ? a : b` (PxMath.h:82), i.e. `0 > x ? 0 : x` — which returns x itself
+// (NaN, -0) whenever the comparison is false.  Slang's `max` lowers to `OpFMax`,
+// whose NaN / signed-zero behaviour differs.  The engine's spelling is kept verbatim.
 //
 // It exists because a propagated inertia can go slightly negative on the
 // principal axes through rounding, and a negative diagonal there makes the root
 // inverse meaningless.
 
-// PxMax(a, b) -- PxMath.h's `a < b ? b : a`, not the intrinsic
+// PxMax(a, b) -- PxMath.h's FLOAT specialisation (PxMath.h:82), i.e.
+// intrinsics::selectMax (PxUnixMathIntrinsics.h:122): `a > b ? a : b`.
+// P9.86: NOT the generic template's `a < b ? b : a`, which for PxMax(0, x)
+// returned +0 for x = -0 and 0 for x = NaN where the CUDA returns x itself.
 float apiPxMax(float a, float b)
 {
-    return (a < b) ? b : a;
+    return (a > b) ? a : b;
 }
 
 public void apiComputeArticulatedSpatialInertiaW(uint numLinks, uint64_t linkBlocks,

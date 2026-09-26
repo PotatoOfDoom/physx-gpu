@@ -221,6 +221,16 @@ float3 guClosestPtPointTetrahedron(float3 p, float3 a, float3 b, float3 c, float
     return bestClosestPt;
 }
 
+// P9.86: PxClamp(t, 0.f, 1.f) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146), whose float
+// overloads (PxMath.h:82-100) are the selects selectMax/selectMin
+// (PxUnixMathIntrinsics.h:116-125).  Slang clamp() is GLSL FClamp, whose zero sign (and
+// NaN result) is implementation-defined; the selects keep -0 and NaN, as CUDA does.
+float sbcrPxClamp01(float t)
+{
+    const float m = (0.0f > t) ? 0.0f : t;
+    return (1.0f < m) ? 1.0f : m;
+}
+
 // computeTetBarycentric (deformableCollision.cuh :96)
 bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
                            out float4 barycentric)
@@ -241,8 +251,9 @@ bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
     const float detBcp = dot(ba, cross(ca, pa));
     const float x = detBcp / detBcd;
     const float u = 1.0f - v - w - x;
-    barycentric = float4(clamp(u, 0.0f, 1.0f), clamp(v, 0.0f, 1.0f),
-                         clamp(w, 0.0f, 1.0f), clamp(x, 0.0f, 1.0f));
+    // P9.86: PxClamp selects (deformableCollision.cuh:133-136), not FClamp -- keeps -0/NaN.
+    barycentric = float4(sbcrPxClamp01(u), sbcrPxClamp01(v),
+                         sbcrPxClamp01(w), sbcrPxClamp01(x));
     return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
            (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
 }
@@ -445,7 +456,11 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
             //     it is what makes the clamp redundant here rather than merely unexercised.
             // Deliberately not removed: it costs nothing, and the day computeTetBarycentric is
             // re-synced to a version without the internal clamp, this is the backstop.
-            const float4 bary = clamp(laneBary[winner], float4(0, 0, 0, 0), float4(1, 1, 1, 1));
+            // P9.86: PxClamp per component (softbodyPrimitives.cu:2261-2264) as selects, not
+            // FClamp: value-wise still a no-op, but FClamp would turn the helper's -0 into +0.
+            const float4 lb = laneBary[winner];
+            const float4 bary = float4(sbcrPxClamp01(lb.x), sbcrPxClamp01(lb.y),
+                                       sbcrPxClamp01(lb.z), sbcrPxClamp01(lb.w));
             Ptr<uint>(ciBase + 8UL)[0] = encodeSoftBody(softbodyId, laneSimTet[winner]);
             Ptr<float4>(gRm.outBarycentric)[contactIndex] = bary;
         }

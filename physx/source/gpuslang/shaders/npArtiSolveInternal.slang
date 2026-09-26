@@ -212,6 +212,13 @@ static const uint SI_IO_OUT_BASE = 32u * 24u;
 // -fp-mode precise, which keeps a -0 the CUDA turns into +0.
 float isPlusZero(float x) { return (x == 0.0f) ? 0.0f : x; }
 
+// isPlusZero per component of a spatial vector (P9.86).
+AbSpatialVector isPlusZeroSV(AbSpatialVector v)
+{
+    return asmSVec(float3(isPlusZero(v.top.x), isPlusZero(v.top.y), isPlusZero(v.top.z)),
+                   float3(isPlusZero(v.bottom.x), isPlusZero(v.bottom.y), isPlusZero(v.bottom.z)));
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void siStaticTest(uint3 groupThreadId : SV_GroupThreadID)
@@ -649,7 +656,10 @@ public AbSpatialVector siSolveInternalDFS(
             const AbSpatialVector parentDelta = svLoadSV(parentLink, PXG_AB_LINK_mDeltaMotion, lane);
 
             float dsp[3] = { 0.0f, 0.0f, 0.0f };
-            AbSpatialVector deltaV = svPropagateAccelDeferred(c2p, dofBlocks, jointOffset, dofCount, parentDeltaV, lane, dsp, false);
+            // P9.86: the CUDA (internalConstraints2.cu:1738, articulationDynamic.cuh:292-316) returns
+            // pDeltaV + a +0-seeded, +='d-only accumulator, so deltaV is never -0. The helper now
+            // canonicalises that accumulator itself; this (-0 -> +0) is a no-op kept as a guard.
+            AbSpatialVector deltaV = isPlusZeroSV(svPropagateAccelDeferred(c2p, dofBlocks, jointOffset, dofCount, parentDeltaV, lane, dsp, false));
 
             AbSpatialVector childV = asmSVecAdd(deltaV, svLoadSV(link, PXG_AB_LINK_mMotionVelocity, lane));
 
@@ -1554,7 +1564,10 @@ public AbSpatialVector siSolveInternalDFSPgs(
             const AbSpatialVector parentDelta = svLoadSV(parentLink, PXG_AB_LINK_mDeltaMotion, lane);
 
             float dsp[3] = { 0.0f, 0.0f, 0.0f };
-            AbSpatialVector deltaV = svPropagateAccelDeferred(c2p, dofBlocks, jointOffset, dofCount, parentDeltaV, lane, dsp, false);
+            // P9.86: the CUDA (internalConstraints2.cu:1738, articulationDynamic.cuh:292-316) returns
+            // pDeltaV + a +0-seeded, +='d-only accumulator, so deltaV is never -0. The helper now
+            // canonicalises that accumulator itself; this (-0 -> +0) is a no-op kept as a guard.
+            AbSpatialVector deltaV = isPlusZeroSV(svPropagateAccelDeferred(c2p, dofBlocks, jointOffset, dofCount, parentDeltaV, lane, dsp, false));
 
             AbSpatialVector childV = asmSVecAdd(deltaV, svLoadSV(link, PXG_AB_LINK_mMotionVelocity, lane));
 

@@ -119,7 +119,13 @@ float3 invInertiaMul(Mat33 m, float3 v)
                                   invDet *  (c0.x * c1.y - c1.x * c0.y));
         return ic0 * v.x + ic1 * v.y + ic2 * v.z;
     }
-    return v; // identity * v
+    // P9.86: PxMat33(PxIdentity) * v (PxMat33.h:240, transform :346; solverMultiBlockTGS.cu:1592)
+    // keeps its zero terms: lane i is (1*v_i + 0*v_j) + 0*v_k, so a -0 in v_i becomes +0 unless
+    // all three terms are -0, and an inf/NaN in v_j gives NaN.  Under the SignedZeroInfNanPreserve
+    // stamp x*0 and x + (computed zero) stay IEEE; slangc leaves these adds alone (no literal-zero operand).
+    return float3((v.x + 0.0f * v.y) + 0.0f * v.z,
+                  (0.0f * v.x + v.y) + 0.0f * v.z,
+                  (0.0f * v.x + 0.0f * v.y) + v.z);
 }
 
 void applyAcceleration(uint bodyIndex, float3 gravityTimesDt, float stepDt,

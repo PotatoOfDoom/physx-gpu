@@ -157,7 +157,10 @@ void convexConvexNphase_stage1Kernel(uint3 groupID : SV_GroupID, uint3 tid : SV_
 
     // aToB = t1.transformInv(t0)
     const float4 aToBq = npAbiQuatMul(float4(-t1q.x, -t1q.y, -t1q.z, t1q.w), t0q);
-    const float3 aToBp = npAbiQuatRotateInv(t1q, t0p - t1p);
+    // P9.86: cudaGJKEPA.cu:2238 t1.transformInv(t0) is PxTransform.h:162-168 q.getConjugate().rotate(src.p - p),
+    // NOT q.rotateInv(src.p - p): same bits for every nonzero value, but a zero result can take the
+    // other sign (t1q = PxQuat(PxHalfPi, x), t0p - t1p = (0,-3,0): CUDA x = -0, rotateInv +0).
+    const float3 aToBp = npAbiQuatRotate(float4(-t1q.x, -t1q.y, -t1q.z, t1q.w), t0p - t1p);
 
     Ptr<PxgPersistentContactManifoldGpu> manifold =
         Ptr<PxgPersistentContactManifoldGpu>(gS1.cmManifolds + uint64_t(globalElementIndex) * 256u);

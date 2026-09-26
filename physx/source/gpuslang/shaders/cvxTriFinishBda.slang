@@ -160,9 +160,11 @@ float3 cfNormalized(float3 v)
 float cfCombineScalars(float a, float b, uint mode)
 {
     if (mode == 0u) return 0.5f * (a + b);
-    if (mode == 1u) return min(a, b);
+    // P9.86: PxMin/PxMax(float) are selects (PxUnixMathIntrinsics.h:116-125, via
+    // PxsMaterialCombiner.h:43/47); FMin/FMax zero signs are impl-defined, the selects return b on ties.
+    if (mode == 1u) return (a < b) ? a : b;
     if (mode == 2u) return a * b;
-    if (mode == 3u) return max(a, b);
+    if (mode == 3u) return (a > b) ? a : b;
     return 0.0f;
 }
 

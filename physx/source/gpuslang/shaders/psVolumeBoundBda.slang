@@ -65,9 +65,10 @@
 // CUDA butterfly cannot be assumed.  That substitution is safe HERE and would not
 // be safe for a sum: min and max of a finite float set are associative and
 // introduce no rounding, so the reduced AABB is BIT-IDENTICAL whatever the
-// association order.  (ps_solveShapes in psShapeMatchBda.slang sums, and there
-// the butterfly IS reproduced exactly, because float addition is not
-// associative.)
+// association order.  (P9.86: only with the fminf/fmaxf total order below --
+// GLSL min/max is not bit-exact for +/-0 ties or NaN.)  (ps_solveShapes in
+// psShapeMatchBda.slang sums, and there the butterfly IS reproduced exactly,
+// because float addition is not associative.)
 //
 // The CUDA's 2D block (32, 32) becomes a 1D block of 1024: the CUDA's
 // warpIndex = threadIdx.y and threadIndexInWarp = threadIdx.x linearise to
@@ -114,6 +115,23 @@ ConstantBuffer<PsVolumeBoundParams> gVB;
 groupshared float sVbMin[UPDATEBOUND];
 groupshared float sVbMax[UPDATEBOUND];
 
+// P9.86: warpReduction<MinOpFloat>/<MaxOpFloat> (reduction.cuh:53/:83) is NVIDIA
+// fminf/fmaxf: a NaN operand yields the other, two NaNs the canonical NaN, and
+// -0 < +0 in either operand order (fminf(+/-0) = -0, fmaxf(+/-0) = +0).  GLSL
+// FMin/FMax (Slang min/max) are not that, so the tree must not use them.
+float vbFminf(float a, float b)
+{
+    if (isnan(a)) return isnan(b) ? asfloat(0x7fffffffu) : b;
+    if (isnan(b)) return a;
+    return (a < b) ? a : ((b < a) ? b : ((asuint(a) >> 31) != 0u ? a : b));
+}
+float vbFmaxf(float a, float b)
+{
+    if (isnan(a)) return isnan(b) ? asfloat(0x7fffffffu) : b;
+    if (isnan(b)) return a;
+    return (a > b) ? a : ((b > a) ? b : ((asuint(a) >> 31) == 0u ? a : b));
+}
+
 float vbBlockMin(uint tid, float v)
 {
     sVbMin[tid] = v;
@@ -121,7 +139,7 @@ float vbBlockMin(uint tid, float v)
     for (uint s = UPDATEBOUND / 2u; s > 0u; s >>= 1)
     {
         if (tid < s)
-            sVbMin[tid] = min(sVbMin[tid], sVbMin[tid + s]);
+            sVbMin[tid] = vbFminf(sVbMin[tid], sVbMin[tid + s]);   // P9.86: fminf
         GroupMemoryBarrierWithGroupSync();
     }
     const float r = sVbMin[0];
@@ -136,7 +154,7 @@ float vbBlockMax(uint tid, float v)
     for (uint s = UPDATEBOUND / 2u; s > 0u; s >>= 1)
     {
         if (tid < s)
-            sVbMax[tid] = max(sVbMax[tid], sVbMax[tid + s]);
+            sVbMax[tid] = vbFmaxf(sVbMax[tid], sVbMax[tid + s]);   // P9.86: fmaxf
         GroupMemoryBarrierWithGroupSync();
     }
     const float r = sVbMax[0];
@@ -194,8 +212,14 @@ void ps_update_volume_bound(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
     for (uint workIndex = tid; workIndex < numParticles; workIndex += UPDATEBOUND)
     {
         const float3 pos = posInvMass[offset + workIndex].xyz;
-        minPos = min(minPos, pos);
-        maxPos = max(maxPos, pos);
+        // P9.86: PxMin/PxMax are selectMin/selectMax (PxUnixMathIntrinsics.h:116-125),
+        // so a +/-0 tie or a NaN pos yields pos, the LATER operand; GLSL FMin/FMax do not.
+        minPos = float3(minPos.x < pos.x ? minPos.x : pos.x,
+                        minPos.y < pos.y ? minPos.y : pos.y,
+                        minPos.z < pos.z ? minPos.z : pos.z);
+        maxPos = float3(maxPos.x > pos.x ? maxPos.x : pos.x,
+                        maxPos.y > pos.y ? maxPos.y : pos.y,
+                        maxPos.z > pos.z ? maxPos.z : pos.z);
     }
 
     const float mnx = vbBlockMin(tid, minPos.x);

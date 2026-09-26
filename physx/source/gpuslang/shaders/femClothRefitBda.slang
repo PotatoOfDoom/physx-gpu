@@ -223,9 +223,27 @@ uint ballot32(bool pred, uint idx)
     return sMask;
 }
 
+// P9.86: warpShuffleMin/Max (shuffle.cuh:48-70) reduce with CUDA fminf/fmaxf, NOT the
+// PxMin/PxMax selects: NaN-ignoring minNum/maxNum with -0 < +0 (fminf(+0,-0) = -0,
+// fmaxf(+0,-0) = +0) regardless of operand order; both-NaN -> canonical NaN.  Spelled
+// as selects so neither slangc nor llvmpipe's FMin/FMax semantics apply.
+float fcrFminf(float a, float b)
+{
+    if (isnan(a) && isnan(b)) return asfloat(0x7FFFFFFFu);
+    return isnan(a) ? b : (isnan(b) ? a : ((a == b) ? asfloat(asuint(a) | asuint(b)) : (a < b ? a : b)));
+}
+float fcrFmaxf(float a, float b)
+{
+    if (isnan(a) && isnan(b)) return asfloat(0x7FFFFFFFu);
+    return isnan(a) ? b : (isnan(b) ? a : ((a == b) ? asfloat(asuint(a) & asuint(b)) : (a > b ? a : b)));
+}
+float3 fcrFmin3(float3 a, float3 b) { return float3(fcrFminf(a.x, b.x), fcrFminf(a.y, b.y), fcrFminf(a.z, b.z)); }
+float3 fcrFmax3(float3 a, float3 b) { return float3(fcrFmaxf(a.x, b.x), fcrFmaxf(a.y, b.y), fcrFmaxf(a.z, b.z)); }
+
 // warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62): both reduce over
-// all 32 lanes and leave the result in EVERY lane.  min/max are exact + associative +
-// commutative, so the linear scan below is bit-identical to CUDA's XOR butterfly.
+// all 32 lanes and leave the result in EVERY lane.  fminf/fmaxf (fcrFmin3/fcrFmax3) are
+// exact + associative + commutative (incl. +/-0 and NaN), so the linear scan below is
+// bit-identical to CUDA's XOR butterfly.
 void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
 {
     GroupMemoryBarrierWithGroupSync();
@@ -236,8 +254,9 @@ void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
     float3 rx = float3(sRedMax[0], sRedMax[1], sRedMax[2]);
     for (uint i = 1u; i < WARP; ++i)
     {
-        rn = pxMin3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));
-        rx = pxMax3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));
+        // P9.86: CUDA fminf/fmaxf (shuffle.cuh:48-70, FEMCloth.cu:469-470/487-488), not PxMin/PxMax.
+        rn = fcrFmin3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));
+        rx = fcrFmax3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));
     }
     GroupMemoryBarrierWithGroupSync();
     mn = rn; mx = rx;

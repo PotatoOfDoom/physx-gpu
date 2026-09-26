@@ -141,28 +141,44 @@ void updateAggregateBounds(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID
                 const uint idx = gBoundIndices[base + id];
                 const uint b = idx * 6u;
                 const float inflate = gContactDist[idx];
-                mnx = min(mnx, gBounds[b + 0u] - inflate);
-                mny = min(mny, gBounds[b + 1u] - inflate);
-                mnz = min(mnz, gBounds[b + 2u] - inflate);
-                mxx = max(mxx, gBounds[b + 3u] + inflate);
-                mxy = max(mxy, gBounds[b + 4u] + inflate);
-                mxz = max(mxz, gBounds[b + 5u] + inflate);
+                // P9.86: PxVec3::minimum/maximum are PxMin/PxMax selects (acc < v ? acc : v,
+                // acc > v ? acc : v: the NEW value on a +-0 tie and on NaN; aggregate.cu:204-205).
+                // llvmpipe's stamped FMin/FMax order the zeros and return the other on NaN.
+                const float vnx = gBounds[b + 0u] - inflate;
+                const float vny = gBounds[b + 1u] - inflate;
+                const float vnz = gBounds[b + 2u] - inflate;
+                const float vxx = gBounds[b + 3u] + inflate;
+                const float vxy = gBounds[b + 4u] + inflate;
+                const float vxz = gBounds[b + 5u] + inflate;
+                mnx = (mnx < vnx) ? mnx : vnx;
+                mny = (mny < vny) ? mny : vny;
+                mnz = (mnz < vnz) ? mnz : vnz;
+                mxx = (mxx > vxx) ? mxx : vxx;
+                mxy = (mxy > vxy) ? mxy : vxy;
+                mxz = (mxz > vxz) ? mxz : vxz;
             }
 
             sMinX[lane] = mnx; sMinY[lane] = mny; sMinZ[lane] = mnz;
             sMaxX[lane] = mxx; sMaxY[lane] = mxy; sMaxZ[lane] = mxz;
             GroupMemoryBarrierWithGroupSync();
 
-            for (uint s = AGG_WARP / 2u; s > 0u; s >>= 1)
+            // P9.86: the CUDA reduces with a butterfly `PxMin(__shfl_xor_sync(.., v, r), v)` /
+            // `PxMax(..)` (aggregate.cu:209-216): selects that keep the lane's OWN value on a
+            // tie, so lane 0's result is the adjacent-pair tree r = 1,2,4,8,16 in which the
+            // LOWER half wins a +0/-0 tie (and the NaN operand order is fixed).  GLSL min/max
+            // on a lane+s tree picks the other zero (llvmpipe min(+0,-0) = -0), so replay
+            // that exact tree with the PxMin/PxMax select spellings.
+            for (uint r = 1u; r < AGG_WARP; r <<= 1)
             {
-                if (lane < s)
+                if ((lane & (2u * r - 1u)) == 0u)
                 {
-                    sMinX[lane] = min(sMinX[lane], sMinX[lane + s]);
-                    sMinY[lane] = min(sMinY[lane], sMinY[lane + s]);
-                    sMinZ[lane] = min(sMinZ[lane], sMinZ[lane + s]);
-                    sMaxX[lane] = max(sMaxX[lane], sMaxX[lane + s]);
-                    sMaxY[lane] = max(sMaxY[lane], sMaxY[lane + s]);
-                    sMaxZ[lane] = max(sMaxZ[lane], sMaxZ[lane + s]);
+                    const uint p = lane + r;
+                    sMinX[lane] = (sMinX[p] < sMinX[lane]) ? sMinX[p] : sMinX[lane];
+                    sMinY[lane] = (sMinY[p] < sMinY[lane]) ? sMinY[p] : sMinY[lane];
+                    sMinZ[lane] = (sMinZ[p] < sMinZ[lane]) ? sMinZ[p] : sMinZ[lane];
+                    sMaxX[lane] = (sMaxX[p] > sMaxX[lane]) ? sMaxX[p] : sMaxX[lane];
+                    sMaxY[lane] = (sMaxY[p] > sMaxY[lane]) ? sMaxY[p] : sMaxY[lane];
+                    sMaxZ[lane] = (sMaxZ[p] > sMaxZ[lane]) ? sMaxZ[p] : sMaxZ[lane];
                 }
                 GroupMemoryBarrierWithGroupSync();
             }

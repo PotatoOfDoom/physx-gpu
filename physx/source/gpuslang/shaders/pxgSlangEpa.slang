@@ -348,7 +348,10 @@ public uint epaRun(float input[32], uint size, float releps, GjkCloud a, GjkClou
     {
         // shortest-distance live triangle
         float e = EPA_MAX_F32;
-        for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : EPA_MAX_F32; e = min(e, tv); }
+        // P9.86: CUDA epa.cuh:430-436 reduces with an fminf butterfly; NVIDIA fminf(+0,-0) = fminf(-0,+0) = -0
+        // independent of order, llvmpipe FMin is not.  Select spelling: identical to fminf for
+        // non-zero/inf/NaN tv (e is never NaN), and -0 wins for equal zeros.
+        for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : EPA_MAX_F32; e = ((tv < e) || ((tv == 0.0f) && (e == 0.0f) && (asuint(tv) != 0u))) ? tv : e; }
         uint f = 0u;
         for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : EPA_MAX_F32; if (e == tv) f |= (1u << tI); }
         const uint triIndex = firstbitlow(f);

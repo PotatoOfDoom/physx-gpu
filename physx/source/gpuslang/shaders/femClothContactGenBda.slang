@@ -1622,12 +1622,21 @@ void stSegSeg(float3 p1, float3 d1, float3 p2, float3 d2, out float s, out float
 
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
-    const float s0 = clamp(temp / denom, 0.0f, 1.0f);
+    // P9.86: PxClamp(v, 0, 1) = selectMin(1, selectMax(0, v)) (distanceSegmentSegment.cuh:63,
+    // PxMath.h:142, PxUnixMathIntrinsics.h:116-125) -- selects keep a -0 quotient (and NaN);
+    // GLSL clamp's FMax gives max(-0, +0) = +0 on llvmpipe.
+    const float sQuot = temp / denom;
+    const float s0Lo = (0.0f > sQuot) ? 0.0f : sQuot;
+    const float s0 = (1.0f < s0Lo) ? 1.0f : s0Lo;
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = clamp(tTmp, 0.0f, 1.0f);
+    // P9.86: PxClamp(tTmp, 0, 1) as selects (distanceSegmentSegment.cuh:76) -- keeps tTmp == -0.
+    const float tLo = (0.0f > tTmp) ? 0.0f : tTmp;   // PxMax(0.f, tTmp) = selectMax
+    const float t2 = (1.0f < tLo) ? 1.0f : tLo;      // PxMin(1.f, .)    = selectMin
     const float comp = (b * t2 - c) * aRecip;
-    s = clamp(comp, 0.0f, 1.0f);
+    // P9.86: PxClamp(comp, 0, 1) as selects (distanceSegmentSegment.cuh:81) -- keeps comp == -0.
+    const float sLo = (0.0f > comp) ? 0.0f : comp;
+    s = (1.0f < sLo) ? 1.0f : sLo;
     t = t2;
 }
 

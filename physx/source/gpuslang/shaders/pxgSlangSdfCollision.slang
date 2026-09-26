@@ -60,10 +60,12 @@
 //      decides which end wins, and nothing in the engine validates the box.
 //      Transcribed in the engine's order.
 //  C2. PxVec3::maximum/minimum are PxMax/PxMin, which are TERNARIES --
-//      `a < b ? b : a` and `a < b ? a : b` (PxMath.h) -- not min()/max()
-//      intrinsics.  They differ on NaN (the ternary returns the SECOND operand
-//      for PxMax(NaN, b) ... i.e. b, since NaN < b is false gives a) and on
-//      signed zero.  npSdfBoxDist.slang made the same call in Phase 1.
+//      `a > b ? a : b` and `a < b ? a : b` (float specialisations ->
+//      intrinsics::selectMax/selectMin, P9.86) -- not min()/max()
+//      intrinsics.  They differ on NaN (both selects return the SECOND operand
+//      whenever a compare involves NaN: PxMax(NaN, b) = b, PxMax(a, NaN) = NaN)
+//      and on signed zero (on a +0/-0 tie the second operand wins).
+//      npSdfBoxDist.slang made the same call in Phase 1.
 //  C3. PxSdfDistance ADDS the outside distance: `Sample(f) + diffMag`, with
 //      diffMag = |localPos - clampedGridPt| >= 0 always.  Outside the box the
 //      reported distance GROWS.  Subtracting, or dropping the term, is right
@@ -142,7 +144,7 @@ static const float3 SDFC_DISCONTINUITY_DIR = float3(0.5448762f, 0.672269f, 0.398
 
 // C2: PxMin / PxMax as PxMath.h spells them.
 float sdfcMin(float a, float b) { return a < b ? a : b; }
-float sdfcMax(float a, float b) { return a < b ? b : a; }
+float sdfcMax(float a, float b) { return a > b ? a : b; }   // P9.86: PxMax<float> is intrinsics::selectMax (PxUnixMathIntrinsics.h:122) -- b wins ties (either zero sign) and any NaN compare
 
 // PxVec3::magnitudeSquared / magnitude (PxVec3.h:171 / :179), spelled out so the
 // summation order is the engine's and NoContraction can forbid the fma.

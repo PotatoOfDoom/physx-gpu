@@ -72,9 +72,13 @@ static const uint MAT_DISABLE_FRICTION = 1u, MAT_DISABLE_STRONG_FRICTION = 2u, M
 float combineScalars(float a, float b, uint mode)
 {
     if (mode == MODE_AVERAGE) return 0.5f * (a + b);
-    if (mode == MODE_MIN) return min(a, b);
+    // P9.86: PxMin/PxMax(float) (PxsMaterialCombiner.h:43/47 combineScalars, 60/64
+    // PxsCombinePxReal -> PxMath.h:98-101/82-85,
+    // selectMin/selectMax PxUnixMathIntrinsics.h:116-125) are selects that return b on a
+    // tie or NaN; FMin/FMax give implementation-defined zero signs, so spell the selects.
+    if (mode == MODE_MIN) return (a < b) ? a : b;
     if (mode == MODE_MULTIPLY) return a * b;
-    if (mode == MODE_MAX) return max(a, b);
+    if (mode == MODE_MAX) return (a > b) ? a : b;
     return 0.0f;
 }
 

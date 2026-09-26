@@ -738,7 +738,10 @@ uint epaCore(inout CollideScratch cs, float releps)
     {
         // shortest-distance live triangle
         float e = PXG_MAX_F32;
-        for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : PXG_MAX_F32; e = min(e, tv); }
+        // P9.86: CUDA fminf (FMNMX) butterfly (epa.cuh:430-436) orders -0 < +0, so a mixed
+        // {+0,-0} zero tie reduces to -0 whatever the lane order; GLSL min() keeps one operand
+        // on a zero tie (llvmpipe: the second).  Resolve the zero tie as a select, min() otherwise.
+        for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : PXG_MAX_F32; e = (e == 0.0f && tv == 0.0f) ? ((asuint(tv) == 0x80000000u) ? tv : e) : min(e, tv); }
         uint f = 0u;
         for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : PXG_MAX_F32; if (e == tv) f |= (1u << tI); }
         const uint triIndex = firstbitlow(f);

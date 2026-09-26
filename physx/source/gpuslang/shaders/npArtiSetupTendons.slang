@@ -37,9 +37,12 @@
 // tendon-joint / tendon blocks are P8.77/78's maps, the ITC output block and
 // the two descriptor pointers were generated and pinned in the groundwork,
 // and the propagate algebra is P8.90's module (WriteToTempQstZ/
-// ReadFromTempQstZ become a load of mTmpQstZ into the qstZ[3] array around
-// the SAME ad* calls -- the .cuh policies accumulate the identical
-// jf - innerProduct term, verified against articulationDynamic.cuh:47/129).
+// ReadFromTempQstZ become a load of mTmpQstZ into the qstZ[3] array; the .cuh
+// policies accumulate the identical jf - innerProduct term, verified against
+// articulationDynamic.cuh:47/129).  P9.86: the template call sites pass
+// jointForce NULL (stZ = 0 - dot, not -dot) and read back through
+// child2ParentPreLoaded (separate +0-seeded sum), so the slow-path hops use
+// the local stPropagateImpulseTempQstZ loop / stPropagateAccelC2P.
 //
 // TRAPS, from the reading (each a fixture case / mutant):
 //  1. The bit-stack DFS: child = 63 - clz64(bitStack) (HIGHEST set bit
@@ -123,6 +126,56 @@ PxgTransform28 stLoadPose(uint64_t link, uint fieldOffset, uint lane)
     return makeTransform28(q, float3(p.x, p.y, p.z));
 }
 
+// P9.86: IEEE `+0 + x` per component, as a select: +0 for either zero, x otherwise.
+float3 stPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
+// propagateAccelerationW_child2ParentPreLoaded (articulationDynamic.cuh:257-313) with the
+// Q-stZ array supplied by the caller (ReadFromProvidedQstZ / ReadFromTempQstZ) and no
+// joint speeds.  NOT adPropagateAccelerationW (the everythingPreLoaded order): the per-dof
+// terms go into a SEPARATE jointSpatialDeltaV seeded with PxVec3(0.f), and pDeltaV is added
+// once at the end -- pd + (a + b), not (pd + a) + b (1-2 ULP, cf. svPropagateAccelDeferred).
+// P9.86: the +0 seed is folded on the device (slangc / llvmpipe unroll), and pd may carry an
+// upstream -0; the engine's `pDeltaV + (+0-seeded chain)` is never -0, and the port's sum
+// differs from it only in the sign of a zero, so the finished sum is canonicalised with a
+// select: bit for bit the engine's value (dofCount == 0 included: pd + 0).
+AbSpatialVector stPropagateAccelC2P(float3 parentToChild, float3 invStIsT[3],
+                                    AbSpatialVector motionMatrix[3], AbSpatialVector parentDeltaV,
+                                    uint dofCount, AbSpatialVector isW[3], float qstZ[3])
+{
+    const AbSpatialVector pDeltaV = adTranslateSpatialVector(-parentToChild, parentDeltaV);
+
+    float tJointDelta[3] = { 0.0f, 0.0f, 0.0f };
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float temp = asmInnerProduct(isW[ind], pDeltaV);
+            tJointDelta[ind] = qstZ[ind] - temp;
+        }
+    }
+
+    AbSpatialVector jointSpatialDeltaV =
+        asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float3 iStIsTi = invStIsT[ind];
+            const float jDelta = iStIsTi.x * tJointDelta[0]
+                               + iStIsTi.y * tJointDelta[1]
+                               + iStIsTi.z * tJointDelta[2];
+            jointSpatialDeltaV = asmSVecAdd(jointSpatialDeltaV,
+                                            asmSVecScale(motionMatrix[ind], jDelta));
+        }
+    }
+
+    const AbSpatialVector s = asmSVecAdd(pDeltaV, jointSpatialDeltaV);
+    return asmSVec(stPlusZero3(s.top), stPlusZero3(s.bottom));
+}
+
 // getImpulseSelfResponse (internalConstraints2.cu:95): the all-dof fast path
 // for a direct parent-child pair.  dofBase = the CHILD link's first dof.
 void stImpulseSelfResponseFast(AbSpatialVector impulse0, AbSpatialVector impulse1,
@@ -154,21 +207,37 @@ void stImpulseSelfResponseFast(AbSpatialVector impulse0, AbSpatialVector impulse
         }
     }
 
+    // P9.86: propagateImpulseW<WriteToProvidedQstZ> with jointForce NULL
+    // (internalConstraints2.cu:111, articulationDynamic.cuh:143-146): stZ = 0.0f - dot,
+    // never -0, and qstZ[ind] = +0 + stZ = stZ exactly.  The preloaded variant
+    // (adPropagateImpulseW, stZ = -dot) gives -0 at dot == +0, and llvmpipe folds the
+    // literal +0 seed of qstZ anyway -- so the hop is spelled out with the select.
     float qstZ[3] = { 0.0f, 0.0f, 0.0f };
-    const AbSpatialVector Z0W =
-        adPropagateImpulseW(isInvD, childToParent, motionMatrix, Z1W, dofCount, qstZ);
+    AbSpatialVector z0Temp = Z1W;
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float ip = asmInnerProduct(motionMatrix[ind], Z1W);
+            const float stZ = (ip == 0.0f) ? 0.0f : -ip;
+            qstZ[ind] = stZ;
+            z0Temp = asmSVecAdd(z0Temp, asmSVecScale(isInvD[ind], stZ));
+        }
+    }
+    const AbSpatialVector Z0W = adTranslateSpatialVector(childToParent, z0Temp);
 
     const AbSpatialVector impulseDifW = asmSVecSub(impulse0, Z0W);
     const AbSpatialVector deltaV0W = asmM6MulVec(parentResponse, impulseDifW);
 
-    deltaV1 = adPropagateAccelerationW(childToParent, invStIsT, motionMatrix, deltaV0W,
-                                       dofCount, isW, qstZ);
+    // P9.86: child2ParentPreLoaded<ReadFromProvidedQstZ> (internalConstraints2.cu:117)
+    deltaV1 = stPropagateAccelC2P(childToParent, invStIsT, motionMatrix, deltaV0W,
+                                  dofCount, isW, qstZ);
     deltaV0 = deltaV0W;
 }
 
-// one hop of propagateImpulseW<WriteToTempQstZ>: the ad* call accumulates
+// one hop of propagateImpulseW<WriteToTempQstZ>: the loop below accumulates
 // into a local array seeded from mTmpQstZ, stored back after -- the same
-// jf(=0) - innerProduct term the .cuh policy adds
+// jf(=0) - innerProduct term the .cuh policy adds (P9.86: spelled as a select)
 AbSpatialVector stPropagateImpulseTempQstZ(uint64_t linkBase, uint64_t dofBlocks, uint linkID,
                                            AbSpatialVector Z, uint lane)
 {
@@ -196,8 +265,22 @@ AbSpatialVector stPropagateImpulseTempQstZ(uint64_t linkBase, uint64_t dofBlocks
         }
     }
 
-    const AbSpatialVector outZ =
-        adPropagateImpulseW(isInvD, childToParent, motionMatrix, Z, dofCount, qstZ);
+    // P9.86: propagateImpulseW<WriteToTempQstZ> is called with jointForce NULL
+    // (internalConstraints2.cu:717/733), so stZ = 0.0f - innerProduct
+    // (articulationDynamic.cuh:143-144): +0 for a zero dot, where the preloaded
+    // variant's -innerProduct gives -0 at dot == +0.  IEEE `0 - x` as a select.
+    AbSpatialVector temp = Z;
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float ip = asmInnerProduct(motionMatrix[ind], Z);
+            const float stZ = (ip == 0.0f) ? 0.0f : -ip;
+            qstZ[ind] = qstZ[ind] + stZ;
+            temp = asmSVecAdd(temp, asmSVecScale(isInvD[ind], stZ));
+        }
+    }
+    const AbSpatialVector outZ = adTranslateSpatialVector(childToParent, temp);
 
     for (uint ind = 0u; ind < 3u; ++ind)
         if (ind < dofCount)
@@ -242,8 +325,9 @@ AbSpatialVector stPropagateAccelTempQstZ(uint64_t linkBase, uint64_t dofBlocks, 
         }
     }
 
-    return adPropagateAccelerationW(childToParent, invStIsT, motionMatrix, deltaV,
-                                    dofCount, isW, qstZ);
+    // P9.86: child2ParentPreLoaded<ReadFromTempQstZ> (internalConstraints2.cu:760/776)
+    return stPropagateAccelC2P(childToParent, invStIsT, motionMatrix, deltaV,
+                               dofCount, isW, qstZ);
 }
 
 // getImpulseSelfResponseSlow (internalConstraints2.cu:658)

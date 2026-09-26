@@ -416,7 +416,7 @@ public uint acpSetupFinalizeExtTGS(
         return 0u;
     }
 
-    const float maxImpulse = min(b0.maxImpulse, b1.maxImpulse);
+    const float maxImpulse = (b0.maxImpulse < b1.maxImpulse) ? b0.maxImpulse : b1.maxImpulse;   // P9.86: PxMin select (artiConstraintPrep2.cu:700, NaN parity)
 
     contactHeader[chi].forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     contactHeader[chi].flags[threadIndex] = flags;
@@ -513,7 +513,9 @@ public uint acpSetupFinalizeExtTGS(
         contactPoints[cpBase + j].resp0[threadIndex] = resp0;
         contactPoints[cpBase + j].resp1[threadIndex] = resp1;
 
-        minPen = min(penetration, minPen);
+        // P9.86: PxMin = selectMin a < b ? a : b, tie keeps the +0 seed (artiConstraintPrep2.cu:827);
+        // stamped FMin returns -0 for (-0, +0).
+        minPen = (penetration < minPen) ? penetration : minPen;
 
         // trap 13: the precedence quirk and the 1e-5 threshold, as found
         const bool isGreater2 = ((restitution > 1e-5f) && (bounceThreshold > vrel))
@@ -543,8 +545,10 @@ public uint acpSetupFinalizeExtTGS(
         contactPoints[cpBase + j].rbXn_targetVelW[threadIndex] =
             float4(-response1.top, targetVelocity);
         contactPoints[cpBase + j].appliedForce[threadIndex] = 0.0f;
+        // P9.86: PxMin is the select a < b ? a : b (keeps b on a +0/-0 tie, artiConstraintPrep2.cu:856);
+        // llvmpipe's FMin returns -0 for either order, so PxMin(-0 body, +0 ignore()) would differ.
         contactPoints[cpBase + j].maxImpulse[threadIndex] =
-            min(maxImpulse, targetVel4_maxImpulseW.w);
+            (maxImpulse < targetVel4_maxImpulseW.w) ? maxImpulse : targetVel4_maxImpulseW.w;
         contactPoints[cpBase + j].separation[threadIndex] = totalError;
         contactPoints[cpBase + j].biasCoefficient[threadIndex] = scaledBias;
 
@@ -740,8 +744,14 @@ public uint acpSetupFinalizeExtTGS(
         {
             const uint f0i = frBase + 2u;
 
-            const float torsionalScale = max(torsionalFrictionData.y,
-                                             sqrt(max(0.0f, -minPen) * torsionalFrictionData.x));
+            // P9.86: PxMax(float) = selectMax (a > b ? a : b), tie -> b (artiConstraintPrep2.cu:1069):
+            // with no penetrating contact minPen stays +0, so PxMax(0, -0) = -0, sqrt(-0 * x) = -0
+            // (x >= 0), and the CUDA stores -0 whenever torsionalFrictionData.y is +/-0.
+            const float negMinPen = -minPen;
+            const float torsionalPen = (0.0f > negMinPen) ? 0.0f : negMinPen;
+            const float torsionalSqrt = sqrt(torsionalPen * torsionalFrictionData.x);
+            const float torsionalScale = (torsionalFrictionData.y > torsionalSqrt)
+                                       ? torsionalFrictionData.y : torsionalSqrt;
             frictionHeader[fhi].torsionalFrictionScale[threadIndex] = torsionalScale;
 
             const AbSpatialVector response0 =
@@ -1279,7 +1289,7 @@ uint acpSetupFinalizeExtPGS(
         return 0u;
     }
 
-    const float maxImpulse = min(b0.maxImpulse, b1.maxImpulse);
+    const float maxImpulse = (b0.maxImpulse < b1.maxImpulse) ? b0.maxImpulse : b1.maxImpulse;   // P9.86: PxMin select (artiConstraintPrep2.cu:249, NaN parity)
 
     contactHeader[chi].forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     contactHeader[chi].flags[threadIndex] = flags;
@@ -1413,8 +1423,9 @@ uint acpSetupFinalizeExtPGS(
         // trap 39: the PGS row layout
         contactPoints[cpBase + j].raXn_targetVelocity[threadIndex] =
             float4(response0.top, targetVelocity);
+        // P9.86: PxMin as its select (artiConstraintPrep2.cu:397; see the TGS twin)
         contactPoints[cpBase + j].rbXn_maxImpulse[threadIndex] =
-            float4(-response1.top, min(maxImpulse, targetVel4_maxImpulseW.w));
+            float4(-response1.top, (maxImpulse < targetVel4_maxImpulseW.w) ? maxImpulse : targetVel4_maxImpulseW.w);
         contactPoints[cpBase + j].resp0[threadIndex] = resp0;
         contactPoints[cpBase + j].resp1[threadIndex] = resp1;
         contactPoints[cpBase + j].coeff0[threadIndex] = coeff0;

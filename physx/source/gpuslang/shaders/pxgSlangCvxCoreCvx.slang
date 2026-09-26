@@ -407,7 +407,12 @@ void gjkDistanceQ(ShapeRef sA, ShapeRef sB, PtsRef poolA, PtsRef poolB, float ma
                 pA += cA.verts[verts[i].aI] * verts[i].s;
                 pB += cB.verts[verts[i].bI] * verts[i].s;
             }
-            pointA = pA; pointB = pB;
+            // P9.86: GuRefGjkEpa.h:353-360 computePoints: pA/pB start at a literal +0 and only ever
+            // += a term; an IEEE chain from +0 never holds -0.  llvmpipe partially unrolls this loop
+            // (NIR guesses the trip count from verts[4]), forwards the seed and drops the first `0 + t`
+            // (measured), so a -0 term survives.  The fold only changes the sign of a zero: canonicalise it.
+            pointA = float3((pA.x == 0.0f) ? 0.0f : pA.x, (pA.y == 0.0f) ? 0.0f : pA.y, (pA.z == 0.0f) ? 0.0f : pA.z);
+            pointB = float3((pB.x == 0.0f) ? 0.0f : pB.x, (pB.y == 0.0f) ? 0.0f : pB.y, (pB.z == 0.0f) ? 0.0f : pB.z);
             axis = -dir;
             retVal = closestDist;
             tag = 1u;

@@ -158,6 +158,13 @@ public void areaConstraint2D(inout float lambda, inout float2 dx0, inout float2 
     dx2 = dx2 + massInv2 * deltaLambda * grad2;
 }
 
+// P9.86: IEEE +0 + t as a select (-0 -> +0; nonzero/NaN/inf unchanged).  Used to
+// canonicalise membraneSolve's +0-seeded, add-only dx accumulators (FEMClothUtil.cuh:464).
+float2 clothMembranePlusZero2(float2 v)
+{
+    return float2((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y);
+}
+
 // membraneEnergySolvePerTriangle (L436-527); slot models the per-triangle lambda
 // float2.  VERBATIM from npClothSharedEnergy.slang's membraneSolve.
 public void membraneSolve(inout float4 xx0, inout float4 xx1, inout float4 xx2,
@@ -204,6 +211,11 @@ public void membraneSolve(inout float4 xx0, inout float4 xx1, inout float4 xx2,
 
     arapConstraint2D(lambda0, dx0, dx1, dx2, alphaTilde0, QInv, xp01, xp02,
                      vertexScale0 * xx0.w, vertexScale1 * xx1.w, vertexScale2 * xx2.w);
+    // P9.86: CUDA dx_i = PxVec2(0) += massInv*deltaLambda*grad (FEMClothUtil.cuh:364-366,464) is never -0;
+    // the literal-zero seed add is folded here, so restore the +0 as a select.
+    dx0 = clothMembranePlusZero2(dx0);
+    dx1 = clothMembranePlusZero2(dx1);
+    dx2 = clothMembranePlusZero2(dx2);
 
     if (poissons > FEMCLOTH_THRESHOLD)
     {
@@ -219,6 +231,10 @@ public void membraneSolve(inout float4 xx0, inout float4 xx1, inout float4 xx2,
 
         areaConstraint2D(lambda1, dx0, dx1, dx2, alphaTilde1, xp01, xp02,
                          vertexScale0 * xx0.w, vertexScale1 * xx1.w, vertexScale2 * xx2.w, area);
+        // P9.86: same +0-seeded accumulator (FEMClothUtil.cuh:416-418); the L156-158 add may see the literal seed.
+        dx0 = clothMembranePlusZero2(dx0);
+        dx1 = clothMembranePlusZero2(dx1);
+        dx2 = clothMembranePlusZero2(dx2);
     }
 
     x0 += dx0.x * axis0 + dx0.y * axis1;

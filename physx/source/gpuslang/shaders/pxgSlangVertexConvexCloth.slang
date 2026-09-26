@@ -186,7 +186,12 @@ float3 fvcDistancePointSegment(float3 a, float3 b, float3 p)
     const float3 ab = b - a;
     const float nom = dot(ap, ab);
     const float denom = dot(ab, ab);
-    const float tValue = clamp(nom / denom, 0.0f, 1.0f);
+    // P9.86: PxClamp(v, 0, 1) = PxMin(1, PxMax(0, v)) (femClothPrimitives.cu:1970), spelled
+    // as the CUDA's selects (PxMath.h:142-146, PxUnixMathIntrinsics.h:116-125).  FClamp
+    // returns +0 for v = -0 where selectMax(0, -0) keeps -0; NaN passes through as in the CUDA.
+    const float tRaw = nom / denom;
+    const float tLo = (0.0f > tRaw) ? 0.0f : tRaw;       // selectMax(0, v)
+    const float tValue = (1.0f < tLo) ? 1.0f : tLo;      // selectMin(1, .)
     const float t = denom > 0.0f ? tValue : 0.0f;
     return a + ab * t;
 }
@@ -351,7 +356,15 @@ public float4 fcClothVertexConvexContactGen(FvcCase cs, uint64_t hull, FvcWriter
     {
         dbg.w = 1.0f;
         float best = -PXG_MAX_F32;
-        for (uint lane = 0; lane < 32; ++lane) best = max(best, laneMax[lane]);
+        // P9.86: warpReduction<MaxOpFloat> (femClothPrimitives.cu:2128, reduction.cuh:72/83) is an
+        // fmaxf butterfly, and NVIDIA's max orders -0 < +0, so a +0/-0 tie gives +0 in any lane
+        // order.  Slang max() is GLSL FMax, which llvmpipe lowers so the SECOND operand wins a
+        // zero tie -- so it is spelled as the select fmaxf is.
+        for (uint lane = 0; lane < 32; ++lane)
+        {
+            const float v = laneMax[lane];
+            best = (v > best || best != best || (v == best && asuint(v) == 0u)) ? v : best;
+        }
         uint winner = 0;
         for (uint lane = 0; lane < 32; ++lane)
             if (laneMax[lane] == best) { winner = lane; break; }

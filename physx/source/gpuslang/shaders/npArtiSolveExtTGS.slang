@@ -511,9 +511,13 @@ public void svxSolveExtContactBlockTGS(
 
                 const bool doClamp = abs(totalImpulse) > (maxFrictionImpulse * frictionScale);
 
-                const float totalClamped = clamp(totalImpulse,
-                                                 -maxDynFrictionImpulse * frictionScale,
-                                                 maxDynFrictionImpulse * frictionScale);
+                // P9.86: PxClamp(v,lo,hi) = PxMin(hi, PxMax(lo, v)) -- selectMin/selectMax (solver.cuh:704).
+                // A zero normal impulse (or torsional scale) makes the bounds exactly (-0, +0);
+                // FClamp's fmin(-0, +0) tie is driver-defined, the CUDA's selects keep -0 for v < 0.
+                const float lo = -maxDynFrictionImpulse * frictionScale;
+                const float hi = maxDynFrictionImpulse * frictionScale;
+                const float pxMaxLoV = (lo > totalImpulse) ? lo : totalImpulse;   // selectMax(lo, v)
+                const float totalClamped = (hi < pxMaxLoV) ? hi : pxMaxLoV;      // selectMin(hi, m)
 
                 const float newAppliedForce = doClamp ? totalClamped : totalImpulse;
 
@@ -684,7 +688,18 @@ public void svxSolveExt1DBlockTGS(
         const float normalVel = v0 - v1;
 
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
-        const float clampedForce = min(maxImpulse, max(minImpulse, unclampedForce));
+        // P9.86: the CUDA's fminf/fmaxf (solverBlockTGS.cuh:1060) are PTX min/max, which order
+        // the zeros (+0 > -0): fmaxf(+0, -0) = +0 and fminf(-0, +0) = -0 in either operand order.
+        // llvmpipe's FMax/FMin are x86 maxps/minps and return the SECOND operand on a zero tie
+        // (e.g. a drive with forceLimit -0.0f: minImpulse +0, maxImpulse -0).  Only a pair of
+        // zeros is re-spelled, as a select; every other input, inf and NaN included, still goes
+        // through max/min unchanged.
+        const float loForce = (minImpulse == 0.0f && unclampedForce == 0.0f)
+                            ? ((asuint(minImpulse) == 0u) ? minImpulse : unclampedForce)
+                            : max(minImpulse, unclampedForce);
+        const float clampedForce = (maxImpulse == 0.0f && loForce == 0.0f)
+                                 ? ((asuint(maxImpulse) != 0u) ? maxImpulse : loForce)
+                                 : min(maxImpulse, loForce);
         const float deltaF = clampedForce - appliedForce;
 
         rowsCon[r].appliedForce[threadIndex] = clampedForce;

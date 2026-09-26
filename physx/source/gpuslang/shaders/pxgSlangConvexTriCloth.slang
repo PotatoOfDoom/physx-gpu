@@ -240,6 +240,12 @@ Mat33 findRotationMatrixFromZ(float3 to)
         float3 col0 = u * c3v.x + v * c2v.x + u * c1u.x; col0.x += 1.0f;
         float3 col1 = u * c3v.y + v * c2v.y + u * c1u.y; col1.y += 1.0f;
         float3 col2 = u * c3v.z + v * c2v.z + u * c1u.z; col2.z += 1.0f;
+        // P9.86: u * c1u.x is the literal (-0, -0, +0) and u * c1u.z the literal (+0, 1, -1);
+        // llvmpipe folds their +0 lanes away, but femClothPrimitives.cu:1031/1046 really add
+        // them (IEEE (-0) + (+0) = +0): spell those adds as the select they amount to.
+        // (The -0 lanes are exact no-ops, x + (-0) == x, so they need nothing.)
+        col0.z = (col0.z == 0.0f) ? 0.0f : col0.z;
+        col2.x = (col2.x == 0.0f) ? 0.0f : col2.x;
         m.col0 = col0; m.col1 = col1; m.col2 = col2;
     }
     return m;

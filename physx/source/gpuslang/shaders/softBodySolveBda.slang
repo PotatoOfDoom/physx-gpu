@@ -167,11 +167,18 @@ void sb_gm_applyExternalDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 
         const float4 newVel = vel + delta * gApply.invDt;
 
-        curPositions[vertIdx] = pos + delta;
+        // P9.86: the CUDA's w lanes are IEEE `pos.w + 0.f` / `deltaPos.w + 0.f`
+        // (softBodyGM.cu:2652/2656), which turn a -0 inverse mass into +0; llvmpipe folds the
+        // literal-zero w lane of these vector adds, so the w lane's `0 + x` is a select.
+        float4 newPos = pos + delta;
+        newPos.w = (newPos.w == 0.0f) ? 0.0f : newPos.w;
+        curPositions[vertIdx] = newPos;
 
         vels[vertIdx] = newVel;
 
-        simDeltaPos[vertIdx] = simDeltaPos[vertIdx] + delta;
+        float4 newDeltaPos = simDeltaPos[vertIdx] + delta;
+        newDeltaPos.w = (newDeltaPos.w == 0.0f) ? 0.0f : newDeltaPos.w;
+        simDeltaPos[vertIdx] = newDeltaPos;
 
         // clear delta
         simDelta[vertIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -610,6 +617,12 @@ SbMat33 sbComputeDCdx(SbMat33 dCdF, SbMat33 DmInv)
                    float3(sbDot3(r.c2, p.c0), sbDot3(r.c2, p.c1), sbDot3(r.c2, p.c2)));
 }
 
+// IEEE `0 + x` per component as a select (P9.86): +0 for either zero, x otherwise.
+float3 sbPlusZero3(float3 v)
+{
+    return float3((v.x == 0.0f) ? 0.0f : v.x, (v.y == 0.0f) ? 0.0f : v.y, (v.z == 0.0f) ? 0.0f : v.z);
+}
+
 // --- compute_deltaLambdaXgradC (softBodyGM.cu:554) ------------------------------------
 // Accumulates deltaLambda * dCdx into deltaLambdaXgradC and advances lambda.
 void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
@@ -656,9 +669,13 @@ void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
     lambda += deltaLambda;
 
     // return: deltaLambda * dCdx  (ACCUMULATES — the caller may already hold a term)
-    dl.c0 += deltaLambda * dCdx1;
-    dl.c1 += deltaLambda * dCdx2;
-    dl.c2 += deltaLambda * dCdx3;
+    // P9.86: the CUDA accumulator starts at PxMat33(PxZero) (softBodyGM.cu:1122/1181, reset
+    // at :588) and is only ever += a term (:601-603), so in IEEE it never holds -0.  After
+    // inlining, the +0 seed reaches the ARAP add and llvmpipe folds `0 + x` to x, keeping a
+    // -0 product; canonicalise -0 -> +0 (no-op for nonzero/inf/NaN): bit for bit the CUDA.
+    dl.c0 = sbPlusZero3(dl.c0 + deltaLambda * dCdx1);
+    dl.c1 = sbPlusZero3(dl.c1 + deltaLambda * dCdx2);
+    dl.c2 = sbPlusZero3(dl.c2 + deltaLambda * dCdx3);
 }
 
 // --- ARAP_constraint (softBodyGM.cu:722) ----------------------------------------------
@@ -1253,10 +1270,17 @@ void sb_gm_applyDeformationDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, 
 
         const float4 newVel = vel + delta * gDeform.invDt;
 
-        curPositions[vertIdx] = pos + delta;
+        // P9.86: as in sb_gm_applyExternalDeltasLaunch -- the CUDA's w lanes are IEEE
+        // `pos.w + 0.f` / `deltaPos.w + 0.f` (softBodyGM.cu:2707/2710), -0 -> +0; llvmpipe
+        // folds the literal-zero w lane, so the w lane's `0 + x` is a select.
+        float4 newPos = pos + delta;
+        newPos.w = (newPos.w == 0.0f) ? 0.0f : newPos.w;
+        curPositions[vertIdx] = newPos;
         vels[vertIdx] = newVel;
 
-        simDeltaPos[vertIdx] = simDeltaPos[vertIdx] + delta;
+        float4 newDeltaPos = simDeltaPos[vertIdx] + delta;
+        newDeltaPos.w = (newDeltaPos.w == 0.0f) ? 0.0f : newDeltaPos.w;
+        simDeltaPos[vertIdx] = newDeltaPos;
 
         // clear delta
         simDelta[vertIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);

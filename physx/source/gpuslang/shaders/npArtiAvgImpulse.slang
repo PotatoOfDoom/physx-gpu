@@ -62,10 +62,11 @@
 //
 // `static __device__`, so this is the P8.73-P8.80 arrangement: the mirror is
 // control flow over engine primitives.  The algebra underneath —
-// `propagateImpulseW`'s body — is P8.90's `adPropagateImpulseW`, already
-// fixtured and swept, and it is CALLED here rather than transcribed again:
-// seeding its `inout qstZ` from `mDeferredQstZ` and writing the result back is
-// exactly the `+=` the engine's `WriteToDeferredQstZ` performs.
+// `propagateImpulseW`'s body — is P8.90's `adPropagateImpulseW` except for
+// the null-joint-force `stZ = 0.0f - dot` (P9.86: `aiPropagateImpulseWNullJf`
+// below spells that `0 - x` as a select); seeding its `inout qstZ` from
+// `mDeferredQstZ` and writing the result back is exactly the `+=` the
+// engine's `WriteToDeferredQstZ` performs.
 //
 // ===========================================================================
 // THE TRAPS
@@ -157,6 +158,32 @@ AbSpatialVector aiLoadSV(uint64_t base, uint fieldOffset, uint lane)
 void aiStoreSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
 {
     abStoreSpatialVector(base, fieldOffset, lane, v.top, v.bottom);
+}
+
+// P9.86: propagateImpulseW<WriteToDeferredQstZ> with jointForce == NULL
+// (articulationDynamic.cuh:145-146) is stZ = 0.0f - innerProduct: +0 for EITHER
+// zero, where adPropagateImpulseW's preloaded `-dot` gives -0 at a +0 dot.  IEEE
+// `0 - x` spelled as a select (a literal-zero OpFSub is rewritten to -x by
+// llvmpipe, including via adPropagateImpulseWJf's inlined hasJf = false).
+// Otherwise adPropagateImpulseW's body, expression for expression.
+float aiZeroMinus(float x) { return (x == 0.0f) ? 0.0f : -x; }
+
+AbSpatialVector aiPropagateImpulseWNullJf(AbSpatialVector isInvD[3], float3 childToParent,
+                                          AbSpatialVector motionMatrix[3], AbSpatialVector Z,
+                                          uint dofCount, inout float qstZ[3])
+{
+    AbSpatialVector temp = Z;
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            // against Z, NOT against temp
+            const float stZ = aiZeroMinus(asmInnerProduct(motionMatrix[ind], Z));
+            qstZ[ind] = qstZ[ind] + stZ;
+            temp = asmSVecAdd(temp, asmSVecScale(isInvD[ind], stZ));
+        }
+    }
+    return adTranslateSpatialVector(childToParent, temp);
 }
 
 // averageLinkImpulsesAndPropagate (articulationImpulseResponse.cuh:114).  The
@@ -292,9 +319,9 @@ public void aiAverageAndPropagateEx(uint64_t isSlabDirty, uint64_t impulses, uin
                 }
             }
 
-            const AbSpatialVector propagatedZ =
-                adPropagateImpulseW(isInvD, float3(c2px, c2py, c2pz), motionMatrix, Z, dofCount,
-                                    qstZ);
+            const AbSpatialVector propagatedZ =   // P9.86: the CUDA's `0.0f - dot` (articulationImpulseResponse.cuh:236)
+                aiPropagateImpulseWNullJf(isInvD, float3(c2px, c2py, c2pz), motionMatrix, Z,
+                                          dofCount, qstZ);
 
             for (uint ind = 0u; ind < 3u; ++ind)
                 if (ind < dofCount)
@@ -489,9 +516,9 @@ public void aiAverageAndPropagate2(uint64_t isSlabDirty, uint64_t impulses, uint
                     }
                 }
 
-                const AbSpatialVector propagatedZ =
-                    adPropagateImpulseW(isInvD, float3(c2px, c2py, c2pz), motionMatrix, Z,
-                                        dofCount, qstZ);
+                const AbSpatialVector propagatedZ =   // P9.86: the CUDA's `0.0f - dot` (articulationImpulseResponse.cuh:359)
+                    aiPropagateImpulseWNullJf(isInvD, float3(c2px, c2py, c2pz), motionMatrix, Z,
+                                              dofCount, qstZ);
 
                 for (uint ind = 0u; ind < 3u; ++ind)
                     if (ind < dofCount)
