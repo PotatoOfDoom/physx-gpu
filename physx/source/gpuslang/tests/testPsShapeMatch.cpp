@@ -68,8 +68,11 @@
 //     sin/cos have no cross-backend rounding guarantee, so these are compared to
 //     a TOLERANCE and the fixture says so rather than pretending otherwise.
 //
-// ps_update_volume_bound is compared bit-exactly throughout: min and max of a
-// finite float set are associative and rounding-free.
+// ps_update_volume_bound is compared bit-exactly throughout, against vbOracle,
+// which carries the CUDA's two rules: select per thread (PxMin/PxMax), then
+// fminf/fmaxf across the block.  Min and max are association-free only under
+// fminf/fmaxf's total order (-0 < +0, NaN ignored, two NaNs -> 0x7fffffff);
+// psVolumeBoundZeroSign supplies the +/-0 and NaN inputs where the rules matter.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -268,6 +271,196 @@ static F4 extractRotation(V3 a0, V3 a1, V3 a2, F4 q, int maxIter)
     return q;
 }
 
+// ===========================================================================
+// P9.86c: ps_update_volume_bound's two min/max rules, transcribed, with twins.
+//
+// The kernel (particlesystem.cu:683-777) uses TWO different operations:
+//
+//   * per thread (:725-737), seeded with +/-PX_MAX_F32, PxMin/PxMax<float>.
+//     Those are intrinsics::selectMin/selectMax (PxMath.h:82/:98,
+//     PxUnixMathIntrinsics.h:116-125): `a < b ? a : b` / `a > b ? a : b`.  On a
+//     +/-0 tie OR a NaN pos they return pos, the LATER operand, so a thread keeps
+//     the sign of the last zero it met and a NaN in its last particle replaces
+//     whatever it had.
+//   * across the block (:740-746, :765-775), warpReduction<MinOpFloat/MaxOpFloat>
+//     = fminf/fmaxf (reduction.cuh:53/:83).  On NVIDIA those are minNum/maxNum:
+//     a NaN operand yields the other, -0 < +0 in either operand order, and two
+//     NaNs give the canonical NaN 0x7fffffff.  C leaves the zero tie and the
+//     NaN/NaN payload unspecified; the project takes NVIDIA's rule for both, as
+//     psVolumeBoundBda.slang's vbFminf/vbFmaxf do with a CONSTANT
+//     asfloat(0x7fffffffu) -- so pinning that payload pins the port's own
+//     constant, not a NaN the driver produced (contrast testFemClothSim's 0/0
+//     normal, where the payload is the driver's and is compared as "both NaN").
+//
+// GLSL.std.450 FMin/FMax (Slang min/max) on llvmpipe, which the pre-P9.86 port
+// used at both levels: lp_screen sets lower_fminmax_signed_zero, so
+// nir_lower_alu makes them bcsel(feq(a,b), imin/imax(bits), fmin/fmax_nsz(a,b))
+// -- a +/-0 tie gives -0 / +0 in EITHER order (P9.86 F4, pinned both ways by
+// p86SignedZero) -- and gallivm's fmin_nsz returns the non-NaN operand of a
+// one-NaN pair and an INPUT NaN for two.  So the tree reverts differ from
+// fminf/fmaxf only on a NaN/NaN pair, and the per-thread revert only on a
+// mixed-sign zero tie (select keeps the later sign) and on a NaN pos.
+// ===========================================================================
+static const float VB_MAX_F32 = 3.4028235e38f;
+static uint32_t vbBits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float vbFromBits(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+// NVIDIA fminf/fmaxf (PTX min.f32 / max.f32).
+static float nvFminf(float a, float b)
+{
+    if (std::isnan(a)) return std::isnan(b) ? vbFromBits(0x7fffffffu) : b;
+    if (std::isnan(b)) return a;
+    if (a < b) return a;
+    if (b < a) return b;
+    return std::signbit(a) ? a : b;     // equal: -0 wins a +/-0 tie
+}
+static float nvFmaxf(float a, float b)
+{
+    if (std::isnan(a)) return std::isnan(b) ? vbFromBits(0x7fffffffu) : b;
+    if (std::isnan(b)) return a;
+    if (a > b) return a;
+    if (b > a) return b;
+    return std::signbit(a) ? b : a;     // equal: +0 wins a +/-0 tie
+}
+// llvmpipe FMin/FMax (see above).  Two NaNs give src0; every NaN in this fixture
+// carries one payload, so which input NaN comes back is moot.
+static float lpFMin(float a, float b)
+{
+    if (std::isnan(b)) return a;
+    if (std::isnan(a)) return b;
+    if (a == b) return std::signbit(a) ? a : b;
+    return (a < b) ? a : b;
+}
+static float lpFMax(float a, float b)
+{
+    if (std::isnan(b)) return a;
+    if (std::isnan(a)) return b;
+    if (a == b) return std::signbit(a) ? b : a;
+    return (a > b) ? a : b;
+}
+
+// Mutant twins of the port (0 = the CUDA):
+//   1 tree min as FMin            (psVolumeBoundBda-r2, half of -r1-uses)
+//   2 tree max as FMax            (psVolumeBoundBda-r3, half of -r1-uses)
+//   3 per-thread PxMin/PxMax as FMin/FMax  (psVolumeBoundBda-r4)
+//   4 tree fminf/fmaxf keeps the FIRST operand of a +/-0 tie  (helper-body guard)
+//   5 tree fminf/fmaxf keeps the SECOND operand of a +/-0 tie (helper-body guard)
+// Twins run in the PORT's tree order (vbBlockMin: s = 512..1, v[t] = op(v[t], v[t+s]))
+// because that is the order a mutated port would run in.
+static int gVbVariant = 0;
+struct VbCounters
+{
+    uint32_t laterZeroWins;   // non-NaN per-thread steps where the select != FMin/FMax
+    uint32_t nanDropped;      // per-thread steps where a NaN pos replaced a real particle value
+    uint32_t nanPairs;        // tree fminf/fmaxf steps whose two operands are both NaN
+    uint32_t treeZeroTies;    // tree steps on a mixed-sign +/-0 pair
+    uint32_t orderMismatch;   // CUDA butterfly order and port tree order disagree (must be 0)
+};
+static VbCounters gVbCnt = {};
+
+static float vbTreeMin(float a, float b)
+{
+    if (std::isnan(a) && std::isnan(b)) ++gVbCnt.nanPairs;
+    const bool tie = !std::isnan(a) && a == b && vbBits(a) != vbBits(b);
+    if (tie) ++gVbCnt.treeZeroTies;
+    if (gVbVariant == 1) return lpFMin(a, b);
+    if (tie && gVbVariant == 4) return a;
+    if (tie && gVbVariant == 5) return b;
+    return nvFminf(a, b);
+}
+static float vbTreeMax(float a, float b)
+{
+    if (std::isnan(a) && std::isnan(b)) ++gVbCnt.nanPairs;
+    const bool tie = !std::isnan(a) && a == b && vbBits(a) != vbBits(b);
+    if (tie) ++gVbCnt.treeZeroTies;
+    if (gVbVariant == 2) return lpFMax(a, b);
+    if (tie && gVbVariant == 4) return a;
+    if (tie && gVbVariant == 5) return b;
+    return nvFmaxf(a, b);
+}
+
+// The port's single 1024-entry tree (psVolumeBoundBda.slang vbBlockMin/Max).
+static float vbPortTree(std::vector<float> v, bool isMax)
+{
+    for (uint32_t s = 512u; s > 0u; s >>= 1)
+        for (uint32_t t = 0; t < s; ++t)
+            v[t] = isMax ? vbTreeMax(v[t], v[t + s]) : vbTreeMin(v[t], v[t + s]);
+    return v[0];
+}
+
+// The CUDA's two levels: a 32-lane xor butterfly per warp, radius 16..1
+// (reduction.cuh:188-200), lane 31 of warp w stored to s[c][w] (:748-757), then
+// warp c reduces those 32 entries with the same butterfly, lane 31's result
+// (:765-775).  CUDA operators only -- this is what variant 0 returns.
+static float vbCudaTree(const std::vector<float>& leaves, bool isMax)
+{
+    auto butterfly = [&](float* lanes)
+    {
+        for (uint32_t r = 16u; r > 0u; r >>= 1)
+        {
+            float next[32];
+            for (uint32_t l = 0; l < 32u; ++l)
+                next[l] = isMax ? nvFmaxf(lanes[l], lanes[l ^ r]) : nvFminf(lanes[l], lanes[l ^ r]);
+            std::memcpy(lanes, next, sizeof(next));
+        }
+        return lanes[31];
+    };
+    float perWarp[32];
+    for (uint32_t w = 0; w < 32u; ++w)
+    {
+        float lanes[32];
+        for (uint32_t l = 0; l < 32u; ++l) lanes[l] = leaves[w * 32u + l];
+        perWarp[w] = butterfly(lanes);
+    }
+    return butterfly(perWarp);
+}
+
+// ps_update_volume_bound over the slice [offset, offset + n) of a float4 array:
+// thread t of 1024 folds workIndex t, t+1024, ... (:725-737), then the block
+// reduction.  For variant 0 the result is the CUDA two-level butterfly, and the
+// port's tree order is computed alongside and must give the same bits (fminf/
+// fmaxf with NVIDIA's rules are a total order with NaN as identity, so they are
+// associative and commutative -- counted, not assumed: orderMismatch).
+static void vbOracle(const std::vector<float>& pos4, uint32_t offset, uint32_t n, float* mn, float* mx)
+{
+    for (int c = 0; c < 3; ++c)
+    {
+        std::vector<float> leafMin(1024u), leafMax(1024u);
+        for (uint32_t t = 0; t < 1024u; ++t)
+        {
+            float m = VB_MAX_F32, M = -VB_MAX_F32;
+            for (uint32_t w = t; w < n; w += 1024u)
+            {
+                const float x = pos4[(size_t(offset) + w) * 4u + size_t(c)];
+                const float sMin = (m < x) ? m : x;      // PxMin = selectMin
+                const float sMax = (M > x) ? M : x;      // PxMax = selectMax
+                if (!std::isnan(m) && !std::isnan(x) && vbBits(sMin) != vbBits(lpFMin(m, x))) ++gVbCnt.laterZeroWins;
+                if (!std::isnan(M) && !std::isnan(x) && vbBits(sMax) != vbBits(lpFMax(M, x))) ++gVbCnt.laterZeroWins;
+                if (w != t && std::isnan(x) && !std::isnan(m)) ++gVbCnt.nanDropped;
+                if (w != t && std::isnan(x) && !std::isnan(M)) ++gVbCnt.nanDropped;
+                m = (gVbVariant == 3) ? lpFMin(m, x) : sMin;
+                M = (gVbVariant == 3) ? lpFMax(M, x) : sMax;
+            }
+            leafMin[t] = m;
+            leafMax[t] = M;
+        }
+        const float pMin = vbPortTree(leafMin, false);
+        const float pMax = vbPortTree(leafMax, true);
+        if (gVbVariant == 0)
+        {
+            mn[c] = vbCudaTree(leafMin, false);
+            mx[c] = vbCudaTree(leafMax, true);
+            if (vbBits(mn[c]) != vbBits(pMin)) ++gVbCnt.orderMismatch;
+            if (vbBits(mx[c]) != vbBits(pMax)) ++gVbCnt.orderMismatch;
+        }
+        else
+        {
+            mn[c] = pMin;
+            mx[c] = pMax;
+        }
+    }
+}
+
 } // namespace
 
 // ===========================================================================
@@ -439,6 +632,7 @@ PXG_TEST(psVolumeBound)
     dev->flush();
 
     // read every volume back and compare against a host AABB over the same slice
+    gVbCnt = VbCounters{};
     size_t vh = 0;
     int checked = 0;
     for (uint32_t s = 0; s < NB_SYS; ++s)
@@ -471,15 +665,14 @@ PXG_TEST(psVolumeBound)
                 PXG_CHECK_MSG(sp != nullptr, "missing spec for sys %u buf %u vol %u", s, b, v);
                 if (!sp) continue;
 
-                float refMin[3] = { 3.4028235e38f, 3.4028235e38f, 3.4028235e38f };
-                float refMax[3] = { -3.4028235e38f, -3.4028235e38f, -3.4028235e38f };
-                for (uint32_t i = 0; i < sp->count; ++i)
-                    for (int c = 0; c < 3; ++c)
-                    {
-                        const float x = positions[(size_t(sp->offset) + i) * 4u + size_t(c)];
-                        if (x < refMin[c]) refMin[c] = x;
-                        if (x > refMax[c]) refMax[c] = x;
-                    }
+                // P9.86c: the CUDA's rules (select per thread, then fminf/fmaxf), not
+                // a serial `if (x < ref) ref = x`, which keeps the FIRST of equal
+                // values and never takes a NaN.  This data has neither -0 nor NaN, so
+                // the expected bits are the same; psVolumeBoundZeroSign has the inputs
+                // where the rules matter.
+                float refMin[3], refMax[3];
+                gVbVariant = 0;
+                vbOracle(positions, sp->offset, sp->count, refMin, refMax);
 
                 float gotMin[3], gotMax[3];
                 std::memcpy(gotMin, got.data() + size_t(v) * SZ_VOLUME, 12);
@@ -522,6 +715,184 @@ PXG_TEST(psVolumeBound)
     for (PxgBufferHandle h : all) dev->destroyBuffer(h);
     // system 0 has 2 buffers carrying 1+2 volumes, system 1 has 3 carrying 1+2+3.
     PXG_CHECK_MSG(checked == 9, "expected 9 volumes across the two systems, checked %d", checked);
+    PXG_CHECK_MSG(gVbCnt.orderMismatch == 0u,
+                  "vbOracle: the CUDA butterfly and the port's tree order disagree on %u reductions",
+                  gVbCnt.orderMismatch);
+}
+
+// ===========================================================================
+// ps_update_volume_bound: the sign of zero and NaN (P9.86c)
+//
+// psVolumeBound's positions come from sin/cos/linear formulas: their only exact
+// zeros are +0 and they contain no NaN, so neither of the kernel's two min/max
+// rules is ever decisive there, and all four P9.86 audit-fix reverts in
+// psVolumeBoundBda.slang survived it.  Five volumes of one buffer, each built for
+// one rule:
+//
+//   V0 (1536 particles, invMass 0 -- never integrated, so the zero signs the user
+//      gave stay): x > 0 and y < 0 everywhere except resting zeros.  Thread 5
+//      reads x = -0 (slice 5) then +0 (slice 1029); thread 7 reads y = +0 (slice
+//      7) then -0 (slice 1031).  PxMin keeps the LATER zero: min.x = +0, and
+//      PxMax: max.y = -0.  FMin/FMax per thread (-r4) give -0 / +0.  Finite data.
+//   V1 (1024 particles, one per thread): every x is the quiet NaN 0x7fc00000, so
+//      every thread ends on it and the tree only ever combines two NaNs:
+//      fminf/fmaxf give the canonical 0x7fffffff (the port's constant), tree
+//      FMin/FMax (-r2 / -r3 / -r1-uses) hand back the input NaN, and per-thread
+//      FMin/FMax (-r4) ignore it and keep the +/-PX_MAX_F32 seeds.
+//   V2, V3 (1024 particles): +/-0 ties INSIDE the tree, in both operand orders of
+//      the port's final step (slices 0 and 1).  fminf/fmaxf are sign-aware in
+//      either order, so llvmpipe's FMin/FMax cannot be told from them here; these
+//      pin the tie branch of vbFminf/vbFmaxf (twins 4/5).
+//   V4 (2048 particles): thread 700 reads x = -50 (the unique minimum) then NaN,
+//      thread 11 reads y = +50 (the unique maximum) then NaN.  The select takes the
+//      NaN, and fminf/fmaxf drop it: -50 and +50 never reach the bound.  FMin/FMax
+//      per thread (-r4) keep them.
+// ===========================================================================
+PXG_TEST(psVolumeBoundZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<PxgBufferHandle> all;
+    auto mk = [&](auto const& vec) { PxgBufferHandle h = createBufferFrom(dev, vec); all.push_back(h); return h; };
+
+    const uint32_t NV = 5u;
+    const uint32_t cnts[NV] = { 1536u, 1024u, 1024u, 1024u, 2048u };
+    uint32_t offs[NV];
+    uint32_t total = 0u;
+    for (uint32_t v = 0; v < NV; ++v) { offs[v] = total; total += cnts[v]; }
+    const uint32_t QNAN = 0x7fc00000u;
+    const float qnan = vbFromBits(QNAN);
+
+    std::vector<float> pos(size_t(total) * 4u);
+    auto P = [&](uint32_t v, uint32_t i, int c) -> float& { return pos[(size_t(offs[v]) + i) * 4u + size_t(c)]; };
+    for (uint32_t v = 0; v < NV; ++v)
+        for (uint32_t i = 0; i < cnts[v]; ++i)
+        {
+            // x > 0, y < 0, z of mixed sign and never zero (0.5*k - 4.25)
+            P(v, i, 0) = 0.25f + 0.001f * float(i);
+            P(v, i, 1) = -0.25f - 0.001f * float(i);
+            P(v, i, 2) = 0.5f * float(i % 17u) - 4.25f;
+            P(v, i, 3) = (v == 0u) ? 0.0f : 1.0f;
+        }
+    // V0: resting zeros; the -0 is a negated zero coordinate
+    P(0, 5u, 0) = -0.0f;  P(0, 5u + 1024u, 0) = 0.0f;
+    P(0, 7u, 1) = 0.0f;   P(0, 7u + 1024u, 1) = -0.0f;
+    // V1: every x the one quiet NaN
+    for (uint32_t i = 0; i < cnts[1]; ++i) P(1, i, 0) = qnan;
+    // V2: min.x tie (-0, +0), min.z tie (+0, -0), max.y tie (+0, -0) at the port's
+    // final step v[0] = op(v[0], v[1]); z made positive so its zeros are the minimum
+    for (uint32_t i = 0; i < cnts[2]; ++i) P(2, i, 2) = 0.5f + 0.002f * float(i);
+    P(2, 0u, 0) = -0.0f;  P(2, 1u, 0) = 0.0f;
+    P(2, 0u, 2) = 0.0f;   P(2, 1u, 2) = -0.0f;
+    P(2, 0u, 1) = 0.0f;   P(2, 1u, 1) = -0.0f;
+    // V3: max.y tie (-0, +0)
+    P(3, 0u, 1) = -0.0f;  P(3, 1u, 1) = 0.0f;
+    // V4: a NaN in the thread's LAST particle drops its extreme
+    P(4, 700u, 0) = -50.0f;  P(4, 700u + 1024u, 0) = qnan;
+    P(4, 11u, 1) = 50.0f;    P(4, 11u + 1024u, 1) = qnan;
+
+    PxgBufferHandle bPos = mk(pos);
+    if (!addrOf(dev, bPos)) { std::printf("  NOTE: no BDA -> skip\n"); for (PxgBufferHandle h : all) dev->destroyBuffer(h); return; }
+
+    const float POISON = -999.0f;
+    std::vector<uint8_t> vols(size_t(NV) * SZ_VOLUME, 0u);
+    for (uint32_t v = 0; v < NV; ++v)
+    {
+        for (uint32_t c = 0; c < 6u; ++c) std::memcpy(vols.data() + size_t(v) * SZ_VOLUME + c * 4u, &POISON, 4);
+        putU32(vols, size_t(v) * SZ_VOLUME + 24u, offs[v]);
+        putU32(vols, size_t(v) * SZ_VOLUME + 28u, cnts[v]);
+    }
+    PxgBufferHandle bVols = mk(vols);
+    std::vector<uint8_t> simBufs(SZ_SIMBUF, 0u);
+    putU64(simBufs, SB_VOLUMES, addrOf(dev, bVols));
+    putU32(simBufs, SB_NUM_VOLUMES, NV);
+    PxgBufferHandle bSimBufs = mk(simBufs);
+    PxgBufferHandle bRunsum = mk(std::vector<uint32_t>{ 0u });
+    std::vector<uint8_t> systems(SZ_PSYS, 0u);
+    putU64(systems, PS_UNSORTED_POS, addrOf(dev, bPos));
+    putU32(systems, PS_NUM_BUFFERS, 1u);
+    putU64(systems, PS_SIM_BUFFERS, addrOf(dev, bSimBufs));
+    putU64(systems, PS_BUFFER_RUNSUM, addrOf(dev, bRunsum));
+    PxgBufferHandle bSystems = mk(systems);
+    PxgBufferHandle bActive = mk(std::vector<uint32_t>{ 0u });
+
+    PsVolumeBoundPush p{};
+    p.particleSystems = addrOf(dev, bSystems);
+    p.activeParticleSystemIndices = addrOf(dev, bActive);
+    {
+        Kernel k("psVolumeBoundBda.spv", "ps_update_volume_bound", {}, sizeof(PsVolumeBoundPush));
+        k.dispatch(NV, {}, p, 1u, 1u);
+    }
+    dev->flush();
+
+    // img[variant][volume][0..2 = min xyz, 3..5 = max xyz]
+    const int NVAR = 6;
+    float img[NVAR][NV][6];
+    VbCounters cnt = {};
+    for (int variant = 0; variant < NVAR; ++variant)
+    {
+        gVbVariant = variant;
+        gVbCnt = VbCounters{};
+        for (uint32_t v = 0; v < NV; ++v) vbOracle(pos, offs[v], cnts[v], &img[variant][v][0], &img[variant][v][3]);
+        if (variant == 0) cnt = gVbCnt;
+    }
+    gVbVariant = 0;
+
+    // coverage: every directed input still reaches its rule
+    PXG_CHECK_MSG(cnt.laterZeroWins >= 2u,
+                  "the +/-0 per-thread tie where PxMin/PxMax keep the LATER zero was met %u times (need 2)", cnt.laterZeroWins);
+    PXG_CHECK_MSG(cnt.nanPairs >= 2u, "fminf/fmaxf never combined two NaNs (%u)", cnt.nanPairs);
+    PXG_CHECK_MSG(cnt.treeZeroTies >= 4u, "the tree met %u mixed-sign +/-0 pairs (need 4)", cnt.treeZeroTies);
+    PXG_CHECK_MSG(cnt.nanDropped >= 2u, "a NaN pos replaced a real per-thread value %u times (need 2)", cnt.nanDropped);
+    PXG_CHECK_MSG(cnt.orderMismatch == 0u, "the CUDA butterfly and the port tree order disagree (%u)", cnt.orderMismatch);
+
+    // the CUDA's bits for the directed outputs, pinned
+    auto B = [&](int var, uint32_t v, int f) { return vbBits(img[var][v][f]); };
+    PXG_CHECK_MSG(B(0, 0, 0) == 0x00000000u, "V0 min.x must be thread 5's LATER +0, oracle %08x", B(0, 0, 0));
+    PXG_CHECK_MSG(B(0, 0, 4) == 0x80000000u, "V0 max.y must be thread 7's LATER -0, oracle %08x", B(0, 0, 4));
+    PXG_CHECK_MSG(B(0, 1, 0) == 0x7fffffffu && B(0, 1, 3) == 0x7fffffffu,
+                  "V1 min.x/max.x must be the canonical NaN, oracle %08x/%08x", B(0, 1, 0), B(0, 1, 3));
+    PXG_CHECK_MSG(B(0, 2, 0) == 0x80000000u && B(0, 2, 2) == 0x80000000u && B(0, 2, 4) == 0x00000000u,
+                  "V2 min.x/min.z/max.y must be -0/-0/+0, oracle %08x/%08x/%08x", B(0, 2, 0), B(0, 2, 2), B(0, 2, 4));
+    PXG_CHECK_MSG(B(0, 3, 4) == 0x00000000u, "V3 max.y must be +0, oracle %08x", B(0, 3, 4));
+    PXG_CHECK_MSG(img[0][4][0] == P(4, 0u, 0) && img[0][4][4] == P(4, 0u, 1),
+                  "V4: the NaN must drop -50/+50, oracle min.x %.9g max.y %.9g",
+                  double(img[0][4][0]), double(img[0][4][4]));
+
+    // each twin changes the image it is meant to change
+    PXG_CHECK_MSG(B(1, 1, 0) != B(0, 1, 0), "twin 1 (tree FMin, -r2) leaves V1 min.x unchanged");
+    PXG_CHECK_MSG(B(2, 1, 3) != B(0, 1, 3), "twin 2 (tree FMax, -r3) leaves V1 max.x unchanged");
+    PXG_CHECK_MSG(B(3, 0, 0) != B(0, 0, 0) && B(3, 0, 4) != B(0, 0, 4),
+                  "twin 3 (per-thread FMin/FMax, -r4) leaves V0 min.x/max.y unchanged");
+    PXG_CHECK_MSG(B(3, 4, 0) != B(0, 4, 0) && B(3, 4, 4) != B(0, 4, 4),
+                  "twin 3 (per-thread FMin/FMax, -r4) leaves V4 min.x/max.y unchanged");
+    PXG_CHECK_MSG(B(4, 2, 2) != B(0, 2, 2) && B(4, 3, 4) != B(0, 3, 4),
+                  "twin 4 (tree tie keeps the first operand) leaves V2 min.z / V3 max.y unchanged");
+    PXG_CHECK_MSG(B(5, 2, 0) != B(0, 2, 0) && B(5, 2, 4) != B(0, 2, 4),
+                  "twin 5 (tree tie keeps the second operand) leaves V2 min.x / max.y unchanged");
+
+    // the device against the CUDA, bitwise, every bound float of every volume
+    const std::vector<uint8_t> got = downloadBuffer<uint8_t>(dev, bVols, size_t(NV) * SZ_VOLUME);
+    uint32_t bad = 0u;
+    for (uint32_t v = 0; v < NV; ++v)
+    {
+        for (uint32_t f = 0; f < 6u; ++f)
+        {
+            float g; std::memcpy(&g, got.data() + size_t(v) * SZ_VOLUME + f * 4u, 4);
+            if (vbBits(g) != B(0, v, int(f)))
+            {
+                ++bad;
+                std::printf("    vol %u bound float %u: device %08x, the CUDA %08x\n", v, f, vbBits(g), B(0, v, int(f)));
+            }
+        }
+        uint32_t offBack = 0, cntBack = 0;
+        std::memcpy(&offBack, got.data() + size_t(v) * SZ_VOLUME + 24u, 4);
+        std::memcpy(&cntBack, got.data() + size_t(v) * SZ_VOLUME + 28u, 4);
+        PXG_CHECK_MSG(offBack == offs[v] && cntBack == cnts[v], "vol %u offset/count overwritten", v);
+    }
+    PXG_CHECK_MSG(bad == 0u, "%u bound floats differ bitwise from the CUDA", bad);
+    std::printf("    [ note ] laterZeroWins=%u nanPairs=%u treeZeroTies=%u nanDropped=%u\n",
+                cnt.laterZeroWins, cnt.nanPairs, cnt.treeZeroTies, cnt.nanDropped);
+    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
 }
 
 // ===========================================================================
