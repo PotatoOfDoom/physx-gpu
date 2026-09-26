@@ -208,6 +208,22 @@ static float selMax(float a, float b) { return a > b ? a : b; }
 static V2 add2(V2 a, V2 b) { return V2{ a.x + b.x, a.y + b.y }; }
 static V2 sub2(V2 a, V2 b) { return V2{ a.x - b.x, a.y - b.y }; }
 static V2 muls2(V2 a, float s) { return V2{ a.x * s, a.y * s }; }
+
+// P9.86c: mutant twin of membraneSolve's +0-seeded dx accumulators (FEMClothUtil.cuh:464,
+// PxVec2 dx0(0.0f) ... then dx += massInv*deltaLambda*grad at :364-366 / :416-418).
+//   0 = the CUDA: dx = +0 + term, so a -0 term lane lands +0.
+//   1 = the port with its post-ARAP select (pxgSlangClothMembrane.slang, P9.86) reverted:
+//       llvmpipe folds the forwarded literal seed, dx = term; the post-area select is kept.
+//   2 = the P9.86 audit's hypothesised AREA-side fold without the post-area select: the
+//       ARAP branch left dx at the seed and the area add folds against it, dx = term.
+//       Meaningful only while the ARAP branch is not taken (the fixture asserts that).
+// femClothSimSolveNonSharedZeroSign* / *RestZeroSign* require their twin to change the
+// stored image.
+static int gMembraneSeedVariant = 0;
+static unsigned gMembraneNegZeroTermLanes = 0;       // coverage: -0 lanes among the ARAP terms
+static unsigned gMembraneArapTaken = 0;              // coverage: ARAP C > threshold branch entries
+static unsigned gMembraneNegZeroAreaTermLanes = 0;   // coverage: -0 lanes among the area terms
+static V2 plusZero2(V2 v) { return V2{ v.x == 0.f ? 0.f : v.x, v.y == 0.f ? 0.f : v.y }; }
 static V2 neg2(V2 a) { return V2{ -a.x, -a.y }; }
 static float dot2(V2 a, V2 b) { return a.x * b.x + a.y * b.y; }
 static float magSq2(V2 v) { return v.x * v.x + v.y * v.y; }
@@ -287,9 +303,17 @@ static void arapConstraint2D(float& lambda, V2& dx0, V2& dx1, V2& dx2, float alp
         const float deltaLambda = queryDeltaLambda3(C, grad0, grad1, grad2, alphaTilde, lambda, m0, m1, m2);
         lambda = lambda + deltaLambda;
 
-        dx0 = add2(dx0, muls2(grad0, m0 * deltaLambda));
-        dx1 = add2(dx1, muls2(grad1, m1 * deltaLambda));
-        dx2 = add2(dx2, muls2(grad2, m2 * deltaLambda));
+        ++gMembraneArapTaken;
+        const V2 t0 = muls2(grad0, m0 * deltaLambda);
+        const V2 t1 = muls2(grad1, m1 * deltaLambda);
+        const V2 t2 = muls2(grad2, m2 * deltaLambda);
+        const float lanes[6] = { t0.x, t0.y, t1.x, t1.y, t2.x, t2.y };
+        for (float l : lanes)
+            if (f2u(l) == 0x80000000u)
+                ++gMembraneNegZeroTermLanes;
+        // refMembrane calls this on the +0 seed, so variant 1 is exactly the folded `0 + term`.
+        if (gMembraneSeedVariant == 1) { dx0 = t0; dx1 = t1; dx2 = t2; }
+        else { dx0 = add2(dx0, t0); dx1 = add2(dx1, t1); dx2 = add2(dx2, t2); }
     }
 }
 
@@ -308,9 +332,16 @@ static void areaConstraint2D(float& lambda, V2& dx0, V2& dx1, V2& dx2, float alp
     const float deltaLambda = queryDeltaLambda3(C, grad0, grad1, grad2, alphaTilde, lambda, m0, m1, m2);
     lambda = lambda + deltaLambda;
 
-    dx0 = add2(dx0, muls2(grad0, m0 * deltaLambda));
-    dx1 = add2(dx1, muls2(grad1, m1 * deltaLambda));
-    dx2 = add2(dx2, muls2(grad2, m2 * deltaLambda));
+    const V2 t0 = muls2(grad0, m0 * deltaLambda);
+    const V2 t1 = muls2(grad1, m1 * deltaLambda);
+    const V2 t2 = muls2(grad2, m2 * deltaLambda);
+    const float lanes[6] = { t0.x, t0.y, t1.x, t1.y, t2.x, t2.y };
+    for (float l : lanes)
+        if (f2u(l) == 0x80000000u)
+            ++gMembraneNegZeroAreaTermLanes;
+    // Variant 2: dx is still the literal seed (ARAP branch not taken), the add folds.
+    if (gMembraneSeedVariant == 2) { dx0 = t0; dx1 = t1; dx2 = t2; }
+    else { dx0 = add2(dx0, t0); dx1 = add2(dx1, t1); dx2 = add2(dx2, t2); }
 }
 
 // membraneEnergySolvePerTriangle (FEMClothUtil.cuh L436-527).
@@ -372,6 +403,7 @@ static void refMembrane(F4& xx0, F4& xx1, F4& xx2, float dt, float youngs, float
 
         areaConstraint2D(lambda1, dx0, dx1, dx2, alphaTilde1, xp01, xp02,
                          vs0 * xx0.w, vs1 * xx1.w, vs2 * xx2.w, area);
+        if (gMembraneSeedVariant == 1) { dx0 = plusZero2(dx0); dx1 = plusZero2(dx1); dx2 = plusZero2(dx2); }
     }
 
     x0 = add3(x0, add3(muls3(axis0, dx0.x), muls3(axis1, dx0.y)));
@@ -962,8 +994,29 @@ PXG_TEST(femClothSimSleeping)
 // non-shared partition [0,1); dispatch, then bit-exact compare positions /
 // velocities / accumulated-delta / lambdas vs a CPU transcription of
 // updateNonSharedTriangle (FEMCloth.cu:610) driving the verified refMembrane.
+//
+// P9.86c zero-sign cases -- the +0-seeded dx accumulators of pxgSlangClothMembrane
+// (CUDA FEMClothUtil.cuh:464 PxVec2 dx0(0.0f), then dx += massInv*deltaLambda*grad).
+//
+// ZS_STRETCHED: the same triangle lying in the z = -0 plane, with poissons = 0.
+// x01.z = x02.z = -0 - -0 = +0, so the whole ARAP solve is bit-identical to the plain
+// case, and its terms (massInv*deltaLambda)*grad carry -0 in t1.y, t2.x and t2.y
+// (deltaLambda < 0 against grad1.y = grad2 = +0).  The CUDA adds them to the +0 seed
+// (:364-366), so dx1.y = dx2 = +0 and x1.z = x2.z = -0 + +0 = +0.  Without
+// pxgSlangClothMembrane's post-ARAP select the seed add folds (dx = term), the -0 lanes
+// reach x_i += dx.x*axis0 + dx.y*axis1 (:506-508) and x1.z = x2.z stay -0.  poissons = 0
+// skips the area step (:488), whose own select would otherwise re-canonicalise.
+//
+// ZS_REST: an obtuse triangle AT REST in the z = -0 plane (x2 = (-0.5, 1, -0), QInv from
+// that rest pose), poissons 0.3.  F = I exactly, so the ARAP branch is NOT taken and dx
+// reaches the area step still holding the seed.  The area C is +0 with lambda 0, so
+// deltaLambda = -0 and t1 = -0*(1, 0.5) = (-0, -0): the CUDA's +0 + t1 keeps dx1 = +0
+// and x1.z = -0 + +0 = +0.  This is the input on which the P9.86 audit's hypothesised
+// AREA-side fold (the L156 add seeing the literal seed) would leave x1.z at -0; it keeps
+// the post-area select's revert honest (its survival is the EQUIVALENT verdict, observed).
 // ---------------------------------------------------------------------------
-static void runSolveNonShared(bool isTGS)
+enum { ZS_NONE = 0, ZS_STRETCHED = 1, ZS_REST = 2 };
+static void runSolveNonShared(bool isTGS, int zeroSign = ZS_NONE)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t N = 3;                 // one triangle
@@ -974,11 +1027,17 @@ static void runSolveNonShared(bool isTGS)
     struct U4 { uint32_t x, y, z, w; };
 
     // Stretched current positions (rest edges are unit; x01 pulled to 1.5).
+    const float zPlane = zeroSign != ZS_NONE ? -0.0f : 0.0f;   // -0: the flat cloth lies in the z = -0 plane
     std::vector<F4> positions = {
-        { 0.0f, 0.0f, 0.0f, 1.0f },
-        { 1.5f, 0.0f, 0.0f, 1.0f },
-        { 0.0f, 1.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, zPlane, 1.0f },
+        { 1.5f, 0.0f, zPlane, 1.0f },
+        { 0.0f, 1.0f, zPlane, 1.0f },
     };
+    if (zeroSign == ZS_REST)
+    {
+        positions[1].x = 1.0f;     // x01 = (1, 0, +0): unstretched
+        positions[2].x = -0.5f;    // x02 = (-0.5, 1, +0): obtuse at vertex 0 -> grad1.y = 0.5 > 0
+    }
     std::vector<F4> vels = {
         { 0.10f, -0.20f, 0.05f, 0.0f },
         { -0.03f, 0.07f, -0.11f, 0.0f },
@@ -991,6 +1050,10 @@ static void runSolveNonShared(bool isTGS)
     };
     // Rest-pose inverse: Q = [[1,0],[0,1]] -> QInv = (1,0,0,1); det=1, area=0.5.
     std::vector<F4> qinv = { { 1.0f, 0.0f, 0.0f, 1.0f } };
+    // ZS_REST: Q = [u01 u02] = [[1,-0.5],[0,1]] -> QInv = [[1,0.5],[0,1]], stored (Qi00, Qi10,
+    // Qi01, Qi11) as queryDeformationGradient_F2x2 reads it: f0 = x01, f1 = 0.5*x01 + x02 = (+0, 1).
+    if (zeroSign == ZS_REST)
+        qinv[0] = { 1.0f, 0.0f, 0.5f, 1.0f };
     std::vector<F2> lambdas = { { 0.0f, 0.0f } };
     std::vector<U4> triVtx = { { 0u, 1u, 2u, 0u } };   // verts (0,1,2), triIndex 0
     std::vector<uint32_t> matIdx = { 0u };              // mMaterialIndices[0] = 0
@@ -999,7 +1062,7 @@ static void runSolveNonShared(bool isTGS)
     PxsDeformableSurfaceMaterialData mat;
     std::memset(&mat, 0, sizeof(mat));
     mat.youngs = 1.0e5f;
-    mat.poissons = 0.3f;
+    mat.poissons = zeroSign == ZS_STRETCHED ? 0.0f : 0.3f;   // 0 skips the area step (FEMClothUtil.cuh:488)
     mat.thickness = 0.01f;
     std::vector<PxsDeformableSurfaceMaterialData> mats = { mat };
 
@@ -1053,9 +1116,63 @@ static void runSolveNonShared(bool isTGS)
     const p71ref::F4 rQ = { qinv[0].x, qinv[0].y, qinv[0].z, qinv[0].w };
     float slotX = isTGS ? 0.0f : lambdas[0].x;
     float slotY = isTGS ? 0.0f : lambdas[0].y;
+    const float slotX0 = slotX, slotY0 = slotY;
 
+    p71ref::gMembraneNegZeroTermLanes = 0;
+    p71ref::gMembraneArapTaken = 0;
+    p71ref::gMembraneNegZeroAreaTermLanes = 0;
     p71ref::refMembrane(rx0, rx1, rx2, dt, mat.youngs, mat.poissons, mat.thickness, rQ,
                         1.0f, 1.0f, 1.0f, slotX, slotY, isTGS);
+
+    if (zeroSign == ZS_STRETCHED)
+    {
+        // Coverage: the ARAP terms must carry exactly the three -0 lanes t1.y, t2.x, t2.y.
+        // (Checked before the twin below, which re-enters arapConstraint2D.)
+        PXG_CHECK_MSG(p71ref::gMembraneNegZeroTermLanes == 3u,
+                      "zeroSign: %u -0 ARAP term lanes (want 3: t1.y, t2.x, t2.y), isTGS=%d",
+                      p71ref::gMembraneNegZeroTermLanes, int(isTGS));
+        // The CUDA (+0 seed add) lands both z coordinates on +0.
+        PXG_CHECK_MSG(f2u(rx1.z) == 0u && f2u(rx2.z) == 0u,
+                      "zeroSign: CUDA x1.z/x2.z %08x %08x, want +0, isTGS=%d", f2u(rx1.z), f2u(rx2.z), int(isTGS));
+        // The folded-seed twin (the port without its post-ARAP select) must keep them at -0,
+        // or this case no longer observes the fold.
+        p71ref::F4 tw0 = { positions[0].x, positions[0].y, positions[0].z, positions[0].w };
+        p71ref::F4 tw1 = { positions[1].x, positions[1].y, positions[1].z, positions[1].w };
+        p71ref::F4 tw2 = { positions[2].x, positions[2].y, positions[2].z, positions[2].w };
+        float tx = slotX0, ty = slotY0;
+        p71ref::gMembraneSeedVariant = 1;
+        p71ref::refMembrane(tw0, tw1, tw2, dt, mat.youngs, mat.poissons, mat.thickness, rQ,
+                            1.0f, 1.0f, 1.0f, tx, ty, isTGS);
+        p71ref::gMembraneSeedVariant = 0;
+        PXG_CHECK_MSG(f2u(tw1.z) == 0x80000000u && f2u(tw2.z) == 0x80000000u,
+                      "zeroSign twin: x1.z/x2.z %08x %08x, want -0 -- the case no longer observes the "
+                      "folded ARAP seed, isTGS=%d", f2u(tw1.z), f2u(tw2.z), int(isTGS));
+    }
+    else if (zeroSign == ZS_REST)
+    {
+        // Coverage (before the twin re-enters the mirror): the ARAP branch must stay untaken so
+        // dx reaches the area step as the seed, and the area terms must carry -0 in t1.x, t1.y
+        // (deltaLambda = -0 against grad1 = (1, 0.5)) and t2.y (against grad2.y = 1).
+        PXG_CHECK_MSG(p71ref::gMembraneArapTaken == 0u,
+                      "restZeroSign: the ARAP branch ran %u time(s) -- the rest pose is no longer exact, isTGS=%d",
+                      p71ref::gMembraneArapTaken, int(isTGS));
+        PXG_CHECK_MSG(p71ref::gMembraneNegZeroAreaTermLanes == 3u,
+                      "restZeroSign: %u -0 area term lanes (want 3: t1.x, t1.y, t2.y), isTGS=%d",
+                      p71ref::gMembraneNegZeroAreaTermLanes, int(isTGS));
+        PXG_CHECK_MSG(f2u(rx1.z) == 0u, "restZeroSign: CUDA x1.z %08x, want +0, isTGS=%d", f2u(rx1.z), int(isTGS));
+        // The audit's hypothesised area-side fold (no post-area select) must leave x1.z at -0.
+        p71ref::F4 tw0 = { positions[0].x, positions[0].y, positions[0].z, positions[0].w };
+        p71ref::F4 tw1 = { positions[1].x, positions[1].y, positions[1].z, positions[1].w };
+        p71ref::F4 tw2 = { positions[2].x, positions[2].y, positions[2].z, positions[2].w };
+        float tx = slotX0, ty = slotY0;
+        p71ref::gMembraneSeedVariant = 2;
+        p71ref::refMembrane(tw0, tw1, tw2, dt, mat.youngs, mat.poissons, mat.thickness, rQ,
+                            1.0f, 1.0f, 1.0f, tx, ty, isTGS);
+        p71ref::gMembraneSeedVariant = 0;
+        PXG_CHECK_MSG(f2u(tw1.z) == 0x80000000u,
+                      "restZeroSign twin: x1.z %08x, want -0 -- the case no longer observes an area-side "
+                      "seed fold, isTGS=%d", f2u(tw1.z), int(isTGS));
+    }
 
     std::vector<F4> refPos = positions, refVel = vels, refAcc = accum;
     const p71ref::F4 nx[3] = { rx0, rx1, rx2 };
@@ -1075,9 +1192,11 @@ static void runSolveNonShared(bool isTGS)
     const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
     const auto gLam = downloadBuffer<F2>(dev, bLam.h, 1);
 
-    // The solve must actually move the stretched vertex (teeth: not a no-op).
-    PXG_CHECK_MSG(f2u(gPos[1].x) != f2u(positions[1].x),
-                  "energy solve should correct the stretched triangle (x1.x moved)");
+    // The solve must actually move the stretched vertex (teeth: not a no-op).  ZS_REST is at
+    // rest by construction; its teeth are the coverage checks above.
+    if (zeroSign != ZS_REST)
+        PXG_CHECK_MSG(f2u(gPos[1].x) != f2u(positions[1].x),
+                      "energy solve should correct the stretched triangle (x1.x moved)");
 
     size_t mm = 0;
     auto cmp4 = [&](const char* nm, uint32_t i, const F4& r, const F4& g) {
@@ -1105,6 +1224,11 @@ static void runSolveNonShared(bool isTGS)
 
 PXG_TEST(femClothSimSolveNonSharedPGS) { runSolveNonShared(/*isTGS*/ false); }
 PXG_TEST(femClothSimSolveNonSharedTGS) { runSolveNonShared(/*isTGS*/ true); }
+// P9.86c: pxgSlangClothMembrane's +0-seeded ARAP dx accumulators -- flat cloth at z = -0.
+PXG_TEST(femClothSimSolveNonSharedZeroSignPGS) { runSolveNonShared(/*isTGS*/ false, ZS_STRETCHED); }
+PXG_TEST(femClothSimSolveNonSharedZeroSignTGS) { runSolveNonShared(/*isTGS*/ true, ZS_STRETCHED); }
+PXG_TEST(femClothSimSolveNonSharedRestZeroSignPGS) { runSolveNonShared(/*isTGS*/ false, ZS_REST); }
+PXG_TEST(femClothSimSolveNonSharedRestZeroSignTGS) { runSolveNonShared(/*isTGS*/ true, ZS_REST); }
 
 // ---------------------------------------------------------------------------
 // P7.1 tranche 2: cloth_solveTrianglePairEnergyLaunch (+ cluster twin) +
