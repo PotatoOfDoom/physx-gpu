@@ -96,6 +96,138 @@ AggSet genAggSet(std::mt19937& rng, uint32_t nbAgg, uint32_t nbShapes)
 
 bool valid(uint32_t size, uint32_t mIndex) { return size > 0 && mIndex != INVALID; }
 
+// ---------------------------------------------------------------------------
+// CUDA-exact mirror of updateAggregateBounds (aggregate.cu:193-225), P9.86c.
+//
+// Per lane: aggBounds.setEmpty(), then for id = lane, lane+32, ... the member bound is
+// folded with PxVec3::minimum/maximum = PxMin/PxMax<float> = intrinsics::selectMin(acc,v)
+// = acc < v ? acc : v and selectMax(acc,v) = acc > v ? acc : v (PxVec3.h:339-358,
+// PxMath.h:82-100, PxUnixMathIntrinsics.h:116-124): the NEW value survives a +-0 tie.
+// Then a warp butterfly for r = 1,2,4,8,16: v = PxMin(__shfl_xor_sync(v, r), v) --
+// the lane keeps its OWN value on a tie -- and lane 0 stores (aggregate.cu:209-225).
+//
+// The old mirror was a serial std::min/std::max fold, which keeps the ACCUMULATOR on a
+// tie and ignores the lane/butterfly order: neither CUDA rule.
+//
+// gAggVariant selects mutant twins of the shader's two P9.86 fixes, so the directed
+// test below can prove that each of its cases actually separates the CUDA from the
+// pre-fix spellings (llvmpipe's stamped FMin/FMax order the zeros in either operand
+// order -- min -> -0, max -> +0 -- and return the other operand on NaN; P9.86 F4):
+//   0 = CUDA;
+//   1 = per-lane fold with FMin/FMax (revert of the fold fix), CUDA butterfly;
+//   2 = pre-fix lane+s tree (s = 16..1) with FMin/FMax (revert of the tree fix);
+//   3 = lane+s tree with keep-own selects (topology-only half revert);
+//   4 = adjacent tree with FMin/FMax (operator-only half revert).
+// ---------------------------------------------------------------------------
+int gAggVariant = 0;
+struct AggCov
+{
+    uint32_t foldMinNegThenPos;  // lane fold: acc = -0 meets v = +0 on the min side
+    uint32_t foldMaxPosThenNeg;  // lane fold: acc = +0 meets v = -0 on the max side
+    uint32_t treeMinTie;         // butterfly at lane 0: mixed +-0 pair on the min side
+    uint32_t treeMaxTie;         // butterfly at lane 0: mixed +-0 pair on the max side
+};
+AggCov gAggCov = {};
+
+inline float pxMinF(float a, float b) { return a < b ? a : b; } // intrinsics::selectMin
+inline float pxMaxF(float a, float b) { return a > b ? a : b; } // intrinsics::selectMax
+inline bool mixedZeros(float a, float b)
+{
+    return a == 0.0f && b == 0.0f && std::signbit(a) != std::signbit(b);
+}
+// llvmpipe GLSL.std.450 FMin/FMax under SignedZeroInfNanPreserve (P9.86 F4).
+inline float lpFMin(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+inline float lpFMax(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+
+void aggBoundsRef(const uint32_t* inds, uint32_t size, const std::vector<float>& bounds,
+                  const std::vector<float>& cd, float out[6])
+{
+    const bool count = (gAggVariant == 0);
+    float v[32][6];
+    for (uint32_t l = 0; l < 32; ++l)
+    {
+        for (uint32_t c = 0; c < 3; ++c) { v[l][c] = MAX_BOUNDS_EXTENTS; v[l][3 + c] = -MAX_BOUNDS_EXTENTS; }
+        for (uint32_t id = l; id < size; id += 32)
+        {
+            const uint32_t idx = inds[id];
+            const float infl = cd[idx];
+            for (uint32_t c = 0; c < 3; ++c)
+            {
+                const float vn = bounds[idx * 6 + c] - infl;
+                const float vx = bounds[idx * 6 + 3 + c] + infl;
+                if (count && mixedZeros(v[l][c], vn) && std::signbit(v[l][c])) ++gAggCov.foldMinNegThenPos;
+                if (count && mixedZeros(v[l][3 + c], vx) && !std::signbit(v[l][3 + c])) ++gAggCov.foldMaxPosThenNeg;
+                v[l][c] = (gAggVariant == 1) ? lpFMin(v[l][c], vn) : pxMinF(v[l][c], vn);
+                v[l][3 + c] = (gAggVariant == 1) ? lpFMax(v[l][3 + c], vx) : pxMaxF(v[l][3 + c], vx);
+            }
+        }
+    }
+
+    if (gAggVariant == 0 || gAggVariant == 1)
+    {
+        // aggregate.cu:209-216, every lane of the xor butterfly.
+        for (uint32_t r = 1; r < 32; r <<= 1)
+        {
+            float t[32][6];
+            for (uint32_t l = 0; l < 32; ++l)
+            {
+                const uint32_t q = l ^ r;
+                for (uint32_t c = 0; c < 3; ++c)
+                {
+                    if (count && l == 0 && mixedZeros(v[q][c], v[l][c])) ++gAggCov.treeMinTie;
+                    if (count && l == 0 && mixedZeros(v[q][3 + c], v[l][3 + c])) ++gAggCov.treeMaxTie;
+                    t[l][c] = pxMinF(v[q][c], v[l][c]);
+                    t[l][3 + c] = pxMaxF(v[q][3 + c], v[l][3 + c]);
+                }
+            }
+            std::memcpy(v, t, sizeof(v));
+        }
+    }
+    else if (gAggVariant == 2 || gAggVariant == 3)
+    {
+        for (uint32_t s = 16; s > 0; s >>= 1)
+            for (uint32_t l = 0; l < s; ++l)
+                for (uint32_t c = 0; c < 3; ++c)
+                {
+                    if (gAggVariant == 2)
+                    {
+                        v[l][c] = lpFMin(v[l][c], v[l + s][c]);
+                        v[l][3 + c] = lpFMax(v[l][3 + c], v[l + s][3 + c]);
+                    }
+                    else
+                    {
+                        v[l][c] = pxMinF(v[l + s][c], v[l][c]);
+                        v[l][3 + c] = pxMaxF(v[l + s][3 + c], v[l][3 + c]);
+                    }
+                }
+    }
+    else
+    {
+        for (uint32_t r = 1; r < 32; r <<= 1)
+            for (uint32_t l = 0; l < 32; l += 2 * r)
+                for (uint32_t c = 0; c < 3; ++c)
+                {
+                    v[l][c] = lpFMin(v[l][c], v[l + r][c]);
+                    v[l][3 + c] = lpFMax(v[l][3 + c], v[l + r][3 + c]);
+                }
+    }
+    for (uint32_t k = 0; k < 6; ++k) out[k] = v[0][k];
+}
+
+inline uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
 PXG_TEST(broadphaseAggregateBounds_bitmap)
 {
     std::mt19937 rng(24010);
@@ -165,26 +297,15 @@ PXG_TEST(broadphaseAggregateBounds_bounds)
         for (uint32_t c = 0; c < 6; ++c) bounds[i * 6 + c] = 12345.678f + float(i) + float(c);
     }
 
-    // reference
+    // reference: the CUDA-exact lane fold + xor butterfly (aggregate.cu:193-225).
     std::vector<float> rBounds = bounds;
     for (uint32_t a = 0; a < nbAgg; ++a)
     {
         if (!valid(s.size[a], s.mIndex[a])) continue;
-        float mn[3] = { MAX_BOUNDS_EXTENTS, MAX_BOUNDS_EXTENTS, MAX_BOUNDS_EXTENTS };
-        float mx[3] = { -MAX_BOUNDS_EXTENTS, -MAX_BOUNDS_EXTENTS, -MAX_BOUNDS_EXTENTS };
-        for (uint32_t i = 0; i < s.size[a]; ++i)
-        {
-            const uint32_t idx = s.boundIndices[s.boundBase[a] + i];
-            const float infl = contactDist[idx];
-            for (uint32_t c = 0; c < 3; ++c)
-            {
-                mn[c] = std::min(mn[c], bounds[idx * 6 + c] - infl);
-                mx[c] = std::max(mx[c], bounds[idx * 6 + 3 + c] + infl);
-            }
-        }
+        float out[6];
+        aggBoundsRef(&s.boundIndices[s.boundBase[a]], s.size[a], bounds, contactDist, out);
         const uint32_t o = s.mIndex[a] * 6;
-        rBounds[o + 0] = mn[0]; rBounds[o + 1] = mn[1]; rBounds[o + 2] = mn[2];
-        rBounds[o + 3] = mx[0]; rBounds[o + 4] = mx[1]; rBounds[o + 5] = mx[2];
+        for (uint32_t k = 0; k < 6; ++k) rBounds[o + k] = out[k];
     }
 
     PxgSlangComputeDevice* dev = testDevice();
@@ -214,6 +335,146 @@ PXG_TEST(broadphaseAggregateBounds_bounds)
         }
     }
     PXG_CHECK_MSG(mism == 0, "%zu aggregate-bounds mismatches (maxAbsDiff=%g)", mism, maxDiff);
+    for (PxgBufferHandle h : { bMI, bSz, bBase, bIdx, bUDummy, bBounds, bCD }) dev->destroyBuffer(h);
+}
+
+// P9.86c: the sign of a zero aggregate bound.  The random test above never produces an
+// exact +-0 member value, so neither P9.86 fix of updateAggregateBounds (the per-lane
+// PxMin/PxMax select fold, and the CUDA butterfly tree with keep-own selects) was
+// observable there.  Every member value below is exact; the zeros come from
+// (-0) - (+0) = -0, 0.5 - 0.5 = +0, (-0.5) + 0.5 = +0 and (-0) + (-0) = -0, i.e. member
+// bounds with a -0 coordinate (a flat shape at a -0 plane) and contactOffset +0 or -0
+// (both pass NpShape.cpp:595-596 with a negative restOffset).
+//
+//   A = [Zmn, P x31, Zmp]  lane 0 folds min -0 then +0: PxMin(-0,+0) = +0 (FMin: -0)
+//   B = [ZMp, N x31, ZMn]  lane 0 folds max +0 then -0: PxMax(+0,-0) = -0 (FMax: +0)
+//   C = [Zmp, Zmn]         lanes 0/1 min +0/-0: butterfly keeps lane 0's +0
+//   D = [ZMn, ZMp]         lanes 0/1 max -0/+0: butterfly keeps lane 0's -0
+//   E = [P, Zmn, Zmp]      min 0.75/-0/+0: adjacent tree -0 (lane+s tree with selects: +0)
+//   F = [Zmp, P, Zmn]      min +0/0.75/-0: adjacent tree +0 (lane+s tree with FMin: -0)
+PXG_TEST(broadphaseAggregateBounds_boundsZeroSign)
+{
+    struct Kind { float mn, mx, cd; };
+    const Kind P = { 1.0f, 2.0f, 0.25f };      // vn  0.75, vx  2.25
+    const Kind N = { -2.0f, -1.0f, 0.25f };    // vn -2.25, vx -0.75
+    const Kind Zmn = { -0.0f, 1.0f, 0.0f };    // vn -0,    vx  1
+    const Kind Zmp = { 0.5f, 1.0f, 0.5f };     // vn +0,    vx  1.5
+    const Kind ZMp = { -1.0f, -0.5f, 0.5f };   // vn -1.5,  vx +0
+    const Kind ZMn = { -1.0f, -0.0f, -0.0f };  // vn -1,    vx -0
+
+    std::vector<std::vector<Kind>> aggs(6);
+    aggs[0].push_back(Zmn); for (int i = 0; i < 31; ++i) aggs[0].push_back(P); aggs[0].push_back(Zmp);
+    aggs[1].push_back(ZMp); for (int i = 0; i < 31; ++i) aggs[1].push_back(N); aggs[1].push_back(ZMn);
+    aggs[2] = { Zmp, Zmn };
+    aggs[3] = { ZMn, ZMp };
+    aggs[4] = { P, Zmn, Zmp };
+    aggs[5] = { Zmp, P, Zmn };
+
+    const uint32_t nbAgg = uint32_t(aggs.size());
+    AggSet s;
+    s.nbAgg = nbAgg;
+    std::vector<Kind> members;
+    for (uint32_t a = 0; a < nbAgg; ++a)
+    {
+        s.boundBase.push_back(uint32_t(members.size()));
+        s.size.push_back(uint32_t(aggs[a].size()));
+        for (const Kind& k : aggs[a])
+        {
+            s.boundIndices.push_back(uint32_t(members.size()));
+            members.push_back(k);
+        }
+    }
+    s.nbShapes = uint32_t(members.size());   // 76 member slots, then 6 aggregate slots
+    s.nbSlots = s.nbShapes + nbAgg;
+    for (uint32_t a = 0; a < nbAgg; ++a) s.mIndex.push_back(s.nbShapes + a);
+
+    std::vector<float> bounds(s.nbSlots * 6, 0.f);
+    std::vector<float> contactDist(s.nbSlots, 0.f);
+    for (uint32_t i = 0; i < s.nbShapes; ++i)
+    {
+        for (uint32_t c = 0; c < 3; ++c) { bounds[i * 6 + c] = members[i].mn; bounds[i * 6 + 3 + c] = members[i].mx; }
+        contactDist[i] = members[i].cd;
+    }
+    for (uint32_t i = s.nbShapes; i < s.nbSlots; ++i)
+        for (uint32_t c = 0; c < 6; ++c) bounds[i * 6 + c] = 12345.678f + float(i) + float(c);
+
+    auto reference = [&](int variant) {
+        std::vector<float> r = bounds;
+        gAggVariant = variant;
+        for (uint32_t a = 0; a < nbAgg; ++a)
+        {
+            float out[6];
+            aggBoundsRef(&s.boundIndices[s.boundBase[a]], s.size[a], bounds, contactDist, out);
+            for (uint32_t k = 0; k < 6; ++k) r[s.mIndex[a] * 6 + k] = out[k];
+        }
+        gAggVariant = 0;
+        return r;
+    };
+    gAggCov = {};
+    const std::vector<float> want = reference(0);
+
+    // coverage: the inputs must keep producing the ties the fixes are about
+    PXG_CHECK_MSG(gAggCov.foldMinNegThenPos == 3 && gAggCov.foldMaxPosThenNeg == 3,
+                  "lane-fold ties: min -0->+0 %u (want 3), max +0->-0 %u (want 3)",
+                  gAggCov.foldMinNegThenPos, gAggCov.foldMaxPosThenNeg);
+    PXG_CHECK_MSG(gAggCov.treeMinTie == 9 && gAggCov.treeMaxTie == 3,
+                  "butterfly lane-0 ties: min %u (want 9), max %u (want 3)",
+                  gAggCov.treeMinTie, gAggCov.treeMaxTie);
+
+    // the CUDA answers, spelled out (x = y = z)
+    struct Expect { uint32_t agg, comp; uint32_t bits; };
+    const Expect ex[] = {
+        { 0, 0, 0x00000000u }, { 1, 3, 0x80000000u }, { 2, 0, 0x00000000u },
+        { 3, 3, 0x80000000u }, { 4, 0, 0x80000000u }, { 5, 0, 0x00000000u },
+    };
+    for (const Expect& e : ex)
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+            const uint32_t b = fbits(want[s.mIndex[e.agg] * 6 + e.comp + c]);
+            PXG_CHECK_MSG(b == e.bits, "mirror: aggregate %u component %u bits %08x, CUDA %08x",
+                          e.agg, e.comp + c, b, e.bits);
+        }
+
+    // each mutant twin must change the image in exactly the floats it is built to change
+    const size_t wantDiff[5] = { 0, 6, 9, 3, 9 };
+    for (int variant = 1; variant <= 4; ++variant)
+    {
+        const std::vector<float> m = reference(variant);
+        size_t diff = 0;
+        for (size_t i = 0; i < m.size(); ++i) if (fbits(m[i]) != fbits(want[i])) ++diff;
+        PXG_CHECK_MSG(diff == wantDiff[variant], "mutant twin %d changes %zu floats (want %zu)",
+                      variant, diff, wantDiff[variant]);
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> udummy(16, 0);
+    PxgBufferHandle bMI = createBufferFrom(dev, s.mIndex);
+    PxgBufferHandle bSz = createBufferFrom(dev, s.size);
+    PxgBufferHandle bBase = createBufferFrom(dev, s.boundBase);
+    PxgBufferHandle bIdx = createBufferFrom(dev, s.boundIndices);
+    PxgBufferHandle bUDummy = createBufferFrom(dev, udummy);
+    PxgBufferHandle bBounds = createBufferFrom(dev, bounds);
+    PxgBufferHandle bCD = createBufferFrom(dev, contactDist);
+
+    AggBoundsParams p = { nbAgg };
+    const std::vector<uint32_t> strides(7, 4);
+    Kernel k("broadphaseAggregateBounds.spv", "updateAggregateBounds", strides, sizeof(AggBoundsParams));
+    k.dispatch(nbAgg, { bMI, bSz, bBase, bIdx, bUDummy, bBounds, bCD }, p);
+    dev->flush();
+
+    const auto got = downloadBuffer<float>(dev, bBounds, s.nbSlots * 6);
+    size_t mism = 0;
+    for (uint32_t i = 0; i < s.nbSlots * 6; ++i)
+    {
+        if (fbits(got[i]) != fbits(want[i]))
+        {
+            if (mism < 8)
+                PXG_CHECK_MSG(false, "slot %u comp %u: bits %08x, CUDA %08x", i / 6, i % 6,
+                              fbits(got[i]), fbits(want[i]));
+            ++mism;
+        }
+    }
+    PXG_CHECK_MSG(mism == 0, "%zu aggregate-bounds bit mismatches", mism);
     for (PxgBufferHandle h : { bMI, bSz, bBase, bIdx, bUDummy, bBounds, bCD }) dev->destroyBuffer(h);
 }
 
