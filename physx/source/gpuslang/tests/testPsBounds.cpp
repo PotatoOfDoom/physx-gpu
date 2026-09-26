@@ -479,6 +479,471 @@ PXG_TEST(psBounds_updateBoundReduce)
 }
 
 // ---------------------------------------------------------------------------
+// P9.86c: signed-zero ties in ps_updateBound{First,Second}PassLaunch.
+//
+// (1) First pass, per-thread regular/diffuse combine (particlesystem.cu:506-507
+//     speculative CCD, :513-514 plain): minPos.minimum(d) / maxPos.maximum(d) are
+//     PxMin/PxMax<float> = intrinsics::selectMin/selectMax (PxMath.h:82-101,
+//     PxUnixMathIntrinsics.h:116-125), `a < b ? a : b` / `a > b ? a : b`: on a
+//     +-0 tie the SECOND operand (the diffuse value) survives.  GLSL FMin/FMax
+//     (Slang min/max) are symmetric on llvmpipe (-0 < +0), so the P9.86 fix
+//     spells the select (psbSelMin3/psbSelMax3).
+// (2) Second pass, the per-iteration accumulator (particlesystem.cu:646-647):
+//     sMinMax = PxMin(sMinMax, newMin) / PxMax(sMinMax, newMax), selects with the
+//     accumulator FIRST.  It differs from FMin/FMax only when numBounds > 1024
+//     (two or more iterations) and two iterations tie on a +-0.
+// The block reductions themselves are warpReduction<MinOpFloat/MaxOpFloat> =
+// fminf/fmaxf (reduction.cuh:53/83): minNum/maxNum with NVIDIA's zero rule
+// (-0 < +0 in either operand order), the same rule as the port's FMin/FMax
+// tree -- mirrored by nvFminf/nvFmaxf.
+// ---------------------------------------------------------------------------
+namespace psbz
+{
+static const float PXMAX = 3.4028235e38f;
+
+static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+static float selMin(float a, float b) { return a < b ? a : b; } // PxMin<float> = selectMin
+static float selMax(float a, float b) { return a > b ? a : b; } // PxMax<float> = selectMax
+
+// CUDA fminf/fmaxf on NVIDIA: NaN-ignoring, fminf(+-0, -+0) = -0, fmaxf = +0.
+static float nvFminf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+static float nvFmaxf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+
+// Mutant twins: 0 = the CUDA select, 1 = the reverted FMin/FMax (symmetric).
+static int gCombineVariant = 0; // first pass, per-thread regular/diffuse combine
+static int gAccVariant = 0;     // second pass, per-iteration accumulator
+
+struct Ties { uint32_t minTie = 0, maxTie = 0; };
+
+// getParticleSpeculativeContactVolume (gridCal.cuh:122-140) with contactDist 0;
+// scaleInv = 1 (diffuse, PGS) or 2 (TGS), PxVec3::magnitude = sqrt(x*x+y*y+z*z).
+static float specVolume(float c[3], const F4& cur, const F4& pred, bool isDiffuse, bool isTGS)
+{
+    const float scaleInv = isDiffuse ? 1.0f : (isTGS ? 2.0f : 1.0f);
+    const float* pc = &cur.x;
+    const float* pp = &pred.x;
+    float o[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        o[k] = (pp[k] - pc[k]) * scaleInv * 0.5f;
+        c[k] = pc[k] + o[k];
+    }
+    return std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]) + 0.0f;
+}
+
+// ps_updateBoundFirstPassLaunch: one PxBounds3 per 1024-thread block.  Ties
+// counts the per-thread combines where select and FMin/FMax differ (min:
+// regular -0 vs diffuse +0; max: regular +0 vs diffuse -0).
+static std::vector<float> firstPassRef(const std::vector<F4>& rCur, const std::vector<F4>& rPred,
+                                       const std::vector<F4>& dCur, const std::vector<F4>& dPred,
+                                       uint32_t nReg, uint32_t nDiff, uint32_t numBlocks,
+                                       bool ccd, bool isTGS, Ties& ties)
+{
+    std::vector<float> out(numBlocks * 6u);
+    const uint32_t nP = std::max(nReg, nDiff);
+    for (uint32_t b = 0; b < numBlocks; ++b)
+    {
+        float mn[3] = { PXMAX, PXMAX, PXMAX }, mx[3] = { -PXMAX, -PXMAX, -PXMAX };
+        for (uint32_t t = 0; t < 1024u; ++t)
+        {
+            const uint32_t i = b * 1024u + t;
+            float tmn[3] = { PXMAX, PXMAX, PXMAX }, tmx[3] = { -PXMAX, -PXMAX, -PXMAX };
+            if (i < nP)
+            {
+                if (i < nReg)
+                {
+                    if (ccd)
+                    {
+                        float c[3];
+                        const float r = specVolume(c, rCur[i], rPred[i], false, isTGS);
+                        for (int k = 0; k < 3; ++k) { tmn[k] = c[k] - r; tmx[k] = c[k] + r; }
+                    }
+                    else
+                        for (int k = 0; k < 3; ++k) tmn[k] = tmx[k] = (&rPred[i].x)[k];
+                }
+                if (i < nDiff)
+                {
+                    float dmn[3], dmx[3];
+                    if (ccd)
+                    {
+                        float c[3];
+                        const float r = specVolume(c, dCur[i], dPred[i], true, isTGS);
+                        for (int k = 0; k < 3; ++k) { dmn[k] = c[k] - r; dmx[k] = c[k] + r; }
+                    }
+                    else
+                        for (int k = 0; k < 3; ++k) dmn[k] = dmx[k] = (&dPred[i].x)[k];
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        if (fbits(tmn[k]) == 0x80000000u && fbits(dmn[k]) == 0u) ++ties.minTie;
+                        if (fbits(tmx[k]) == 0u && fbits(dmx[k]) == 0x80000000u) ++ties.maxTie;
+                        tmn[k] = gCombineVariant ? nvFminf(tmn[k], dmn[k]) : selMin(tmn[k], dmn[k]);
+                        tmx[k] = gCombineVariant ? nvFmaxf(tmx[k], dmx[k]) : selMax(tmx[k], dmx[k]);
+                    }
+                }
+            }
+            for (int k = 0; k < 3; ++k) { mn[k] = nvFminf(mn[k], tmn[k]); mx[k] = nvFmaxf(mx[k], tmx[k]); }
+        }
+        for (int k = 0; k < 3; ++k) { out[b * 6u + k] = mn[k]; out[b * 6u + 3u + k] = mx[k]; }
+    }
+    return out;
+}
+
+// ps_updateBoundSecondPassLaunch: fminf/fmaxf over each 1024-bound iteration,
+// folded into the accumulator with PxMin/PxMax (accumulator first), then
+// fattened by cd; centre = (max + min) * 0.5 (the __shfl_sync pairing).
+struct Pass2 { float bound[6]; float centre[3]; };
+static Pass2 secondPassRef(const std::vector<float>& bounds, uint32_t numBounds, float cd, Ties& ties)
+{
+    float acc[6] = { PXMAX, PXMAX, PXMAX, -PXMAX, -PXMAX, -PXMAX };
+    const uint32_t iters = (numBounds + 1023u) / 1024u;
+    for (uint32_t it = 0; it < iters; ++it)
+    {
+        float nmn[3] = { PXMAX, PXMAX, PXMAX }, nmx[3] = { -PXMAX, -PXMAX, -PXMAX };
+        for (uint32_t t = 0; t < 1024u; ++t)
+        {
+            const uint32_t e = it * 1024u + t;
+            if (e >= numBounds) continue; // PxBounds3::setEmpty(): the fminf/fmaxf identities
+            for (int k = 0; k < 3; ++k)
+            {
+                nmn[k] = nvFminf(nmn[k], bounds[e * 6u + k]);
+                nmx[k] = nvFmaxf(nmx[k], bounds[e * 6u + 3u + k]);
+            }
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            if (fbits(acc[k]) == 0x80000000u && fbits(nmn[k]) == 0u) ++ties.minTie;
+            if (fbits(acc[3 + k]) == 0u && fbits(nmx[k]) == 0x80000000u) ++ties.maxTie;
+            acc[k] = gAccVariant ? nvFminf(acc[k], nmn[k]) : selMin(acc[k], nmn[k]);
+            acc[3 + k] = gAccVariant ? nvFmaxf(acc[3 + k], nmx[k]) : selMax(acc[3 + k], nmx[k]);
+        }
+    }
+    Pass2 r;
+    for (int k = 0; k < 3; ++k) { r.bound[k] = acc[k] - cd; r.bound[3 + k] = acc[3 + k] + cd; }
+    for (int k = 0; k < 3; ++k) r.centre[k] = (r.bound[3 + k] + r.bound[k]) * 0.5f;
+    return r;
+}
+
+struct Push1 { uint64_t particleSystems; uint32_t id; uint32_t isTGS; uint64_t bounds; };
+struct Push2
+{
+    uint64_t particleSystems; uint32_t id; uint32_t pad12; uint64_t bounds;
+    uint32_t numBounds; uint32_t pad28; uint64_t boundArray; uint64_t contactDists;
+    uint32_t elemIndex; uint32_t pad52;
+};
+
+// Runs the second pass for one elemIndex and compares boundArray[elemIndex] and
+// mData.mBoundCenter bitwise with `want`; returns the mismatch count.
+static size_t runSecondPass(PxgSlangComputeDevice* dev, const DevBuf& bDesc, const DevBuf& bBounds,
+                            uint32_t numBounds, const DevBuf& bBoundArr, uint32_t nElems,
+                            const DevBuf& bCd, uint32_t elemIndex, const Pass2& want, const char* tag,
+                            float* gotBound)
+{
+    Push2 p2 = { bDesc.addr, 0u, 0u, bBounds.addr, numBounds, 0u, bBoundArr.addr, bCd.addr, elemIndex, 0u };
+    Kernel k2("psBoundsBda.spv", "ps_updateBoundSecondPassLaunch", {}, sizeof(Push2));
+    k2.dispatch(1u, {}, p2, 1u, 1u);
+    dev->flush();
+    const auto gB = downloadBuffer<float>(dev, bBoundArr.h, nElems * 6u);
+    const auto gD = downloadBuffer<PxgParticleSystem>(dev, bDesc.h, 1);
+    const float gc[3] = { gD[0].mData.mBoundCenter.x, gD[0].mData.mBoundCenter.y, gD[0].mData.mBoundCenter.z };
+    size_t mm = 0;
+    for (int k = 0; k < 6; ++k)
+    {
+        gotBound[k] = gB[elemIndex * 6u + k];
+        if (fbits(gotBound[k]) != fbits(want.bound[k]))
+        {
+            ++mm;
+            std::printf("  %s boundArray[%u][%d] gpu=%08x ref=%08x\n", tag, elemIndex, k, fbits(gotBound[k]), fbits(want.bound[k]));
+        }
+    }
+    for (int k = 0; k < 3; ++k)
+        if (fbits(gc[k]) != fbits(want.centre[k]))
+        {
+            ++mm;
+            std::printf("  %s boundCenter[%d] gpu=%08x ref=%08x\n", tag, k, fbits(gc[k]), fbits(want.centre[k]));
+        }
+    return mm;
+}
+} // namespace psbz
+
+// First pass: slot I0 holds BOTH a regular and a diffuse particle whose values
+// tie on +-0 in all three axes; every other particle rests in one octant, so
+// the tie is the block extreme of min (positive octant) or max (negative octant).
+//   run 0, plain, min: regular pred = (-0,-0,-0) vs diffuse (+0,+0,+0):
+//                  CUDA select +0, reverted FMin -0.
+//   run 1, plain, max: regular pred = (+0,+0,+0) vs diffuse (-0,-0,-0):
+//                  CUDA select -0, reverted FMax +0.
+//   run 2, speculative CCD, PGS, min: regular cur = (-0,-0,-0), pred = -2^-149
+//                  per axis.  IEEE: o = -2^-150 -> -0 (round to even), c = -0,
+//                  r = +0, so the regular c - r = -0; the diffuse particle rests
+//                  at (+0,+0,+0).  CUDA is built -ftz=true
+//                  (compiler/cmakegpu/CMakeLists.txt:100): there pred flushes, the
+//                  regular value is +0, and the select gives +0 as well -- the
+//                  parity image is model-independent, only the revert
+//                  (FMin(-0, +0) = -0) differs.  (The max half of the CCD line
+//                  cannot tie: r = sqrt(sum of squares) is never -0, so c + r
+//                  never yields -0.)
+//   run 3, PLATFORM probe: the run-2 regular particle alone.  Asserts the device
+//                  does not flush denormal inputs (else run 2 silently stops
+//                  exercising the CCD fix).  Not a CUDA parity check: a flushing
+//                  CUDA gives +0 there.
+// The first-pass PxBounds3 buffer is compared bitwise; the second pass runs on
+// it with contactDists = +0 (elemIndex 0: keeps the min sign, +-0 - +0) and -0
+// (elemIndex 1: keeps the max sign, -0 + -0 = -0), boundArray and mBoundCenter
+// compared bitwise.
+PXG_TEST(psBounds_updateBoundZeroSign)
+{
+    using namespace psbz;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t NREG = 1500u, NDIFF = 700u, MAXDIFF = 1024u, I0 = 17u;
+    // PxgParticleSystemCore.cpp:862: blocks = ceil(max(numParticles, maxDiffuse) / 1024) = 2
+    const uint32_t numBlocks = (std::max(NREG, MAXDIFF) + 1023u) / 1024u;
+    const float MZ = -0.0f;
+    const float DN = u2f(0x80000001u); // -2^-149
+
+    std::mt19937 rng(8612);
+    std::uniform_real_distribution<float> upos(0.5f, 50.f);
+    std::vector<F4> posR(NREG), posD(NDIFF), negR(NREG), negD(NDIFF);
+    for (auto& p : posR) p = F4{ upos(rng), upos(rng), upos(rng), 1.0f };
+    for (auto& p : posD) p = F4{ upos(rng), upos(rng), upos(rng), 2.0f };
+    for (auto& p : negR) p = F4{ -upos(rng), -upos(rng), -upos(rng), 1.0f };
+    for (auto& p : negD) p = F4{ -upos(rng), -upos(rng), -upos(rng), 2.0f };
+
+    Ties tiesRun[3];
+    for (int run = 0; run < 4; ++run)
+    {
+        const bool ccd = run >= 2;
+        const bool probe = run == 3;
+        const bool maxRun = run == 1;
+        const uint32_t nReg = probe ? 1u : NREG;
+        const uint32_t nDiff = probe ? 0u : NDIFF;
+        const uint32_t maxDiff = probe ? 0u : MAXDIFF;
+        const uint32_t nBlk = probe ? 1u : numBlocks;
+
+        // pristine at-rest copies every run (cur == pred everywhere else)
+        std::vector<F4> rPred = maxRun ? negR : posR, dPred = maxRun ? negD : posD;
+        std::vector<F4> rCur = rPred, dCur = dPred;
+        if (probe)
+        {
+            rCur.assign(1, F4{ MZ, MZ, MZ, 1.0f });
+            rPred.assign(1, F4{ DN, DN, DN, 1.0f });
+            dCur.assign(1, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+            dPred = dCur;
+        }
+        else if (run == 0)
+        {
+            rPred[I0] = F4{ MZ, MZ, MZ, 1.0f };       dPred[I0] = F4{ 0.0f, 0.0f, 0.0f, 2.0f };
+            rCur[I0] = rPred[I0];                     dCur[I0] = dPred[I0];
+        }
+        else if (run == 1)
+        {
+            rPred[I0] = F4{ 0.0f, 0.0f, 0.0f, 1.0f }; dPred[I0] = F4{ MZ, MZ, MZ, 2.0f };
+            rCur[I0] = rPred[I0];                     dCur[I0] = dPred[I0];
+        }
+        else
+        {
+            rCur[I0] = F4{ MZ, MZ, MZ, 1.0f };        rPred[I0] = F4{ DN, DN, DN, 1.0f };
+            dCur[I0] = F4{ 0.0f, 0.0f, 0.0f, 2.0f };  dPred[I0] = dCur[I0];
+        }
+
+        Ties probeTies, twinTies;
+        Ties& ties = probe ? probeTies : tiesRun[run];
+        gCombineVariant = 0;
+        const std::vector<float> want = firstPassRef(rCur, rPred, dCur, dPred, nReg, nDiff, nBlk, ccd, false, ties);
+        gCombineVariant = 1;
+        const std::vector<float> twin = firstPassRef(rCur, rPred, dCur, dPred, nReg, nDiff, nBlk, ccd, false, twinTies);
+        gCombineVariant = 0;
+
+        DevBuf bRC = makeDev(dev, rCur), bRP = makeDev(dev, rPred);
+        DevBuf bDC = makeDev(dev, dCur), bDP = makeDev(dev, dPred);
+        std::vector<int32_t> diffCount = { int32_t(nDiff), 0 }; // mNumDiffuseParticles -> int[2]
+        DevBuf bCnt = makeDev(dev, diffCount);
+
+        PxgParticleSystem ps = makeZeroPs();
+        ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bRC.addr));
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bRP.addr));
+        ps.mDiffuseOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bDC.addr));
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bDP.addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bCnt.addr));
+        ps.mCommonData.mNumParticles = nReg;
+        ps.mCommonData.mMaxDiffuseParticles = maxDiff;
+        ps.mData.mFlags = ccd ? 8u : 0u; // PxParticleFlag::eENABLE_SPECULATIVE_CCD (PxPBDParticleSystem.h:185)
+        std::vector<PxgParticleSystem> descArr = { ps };
+        DevBuf bDesc = makeDev(dev, descArr);
+
+        std::vector<float> tempBounds(nBlk * 6u, 123.f);
+        DevBuf bTemp = makeDev(dev, tempBounds);
+
+        Push1 p1 = { bDesc.addr, 0u, 0u /*PGS*/, bTemp.addr };
+        Kernel k1("psBoundsBda.spv", "ps_updateBoundFirstPassLaunch", {}, sizeof(Push1));
+        k1.dispatch(nBlk, {}, p1, 1u, 1u);
+        dev->flush();
+        const auto gTemp = downloadBuffer<float>(dev, bTemp.h, nBlk * 6u);
+
+        if (probe)
+        {
+            size_t live = 0;
+            for (int k = 0; k < 3; ++k)
+                if (fbits(want[k]) == 0x80000000u && fbits(gTemp[k]) == 0x80000000u) ++live;
+            PXG_CHECK_MSG(live == 3u,
+                          "psBounds zero-sign PLATFORM probe: min gpu=%08x/%08x/%08x -- the device flushes "
+                          "denormal inputs, so the CCD tie of run 2 is no longer reachable (a flushing CUDA "
+                          "gives +0 here: liveness probe, not a parity check)",
+                          fbits(gTemp[0]), fbits(gTemp[1]), fbits(gTemp[2]));
+        }
+        else
+        {
+            // the mutant twin must change the first-pass image in every axis
+            const uint32_t o = maxRun ? 3u : 0u;
+            const uint32_t wantBits = maxRun ? 0x80000000u : 0u;
+            for (uint32_t k = 0; k < 3u; ++k)
+                PXG_CHECK_MSG(fbits(want[o + k]) == wantBits && fbits(twin[o + k]) == (wantBits ^ 0x80000000u),
+                              "psBounds zero-sign run %d: tempBounds[%u] twin gives the same image (want=%08x twin=%08x)",
+                              run, o + k, fbits(want[o + k]), fbits(twin[o + k]));
+
+            size_t mm = 0;
+            for (uint32_t j = 0; j < nBlk * 6u; ++j)
+                if (fbits(gTemp[j]) != fbits(want[j]))
+                {
+                    ++mm;
+                    std::printf("  run %d tempBounds[%u] gpu=%08x ref=%08x twin=%08x\n", run, j,
+                                fbits(gTemp[j]), fbits(want[j]), fbits(twin[j]));
+                }
+
+            // second pass on the GPU's own first-pass output (== want when mm == 0)
+            std::vector<float> boundArray(2u * 6u, -123.f);
+            DevBuf bBoundArr = makeDev(dev, boundArray);
+            std::vector<float> contactDists = { 0.0f, MZ };
+            DevBuf bCd = makeDev(dev, contactDists);
+            for (uint32_t e = 0; e < 2u; ++e)
+            {
+                Ties t2, t2twin;
+                const Pass2 w2 = secondPassRef(want, nBlk, contactDists[e], t2);
+                const Pass2 v2 = secondPassRef(twin, nBlk, contactDists[e], t2twin);
+                char tag[32];
+                std::snprintf(tag, sizeof(tag), "run %d cd%s0", run, e ? "-" : "+");
+                float got[6];
+                mm += runSecondPass(dev, bDesc, bTemp, nBlk, bBoundArr, 2u, bCd, e, w2, tag, got);
+                if (e != (maxRun ? 1u : 0u))
+                    continue; // cd = +0 shows the min sign, cd = -0 the max sign
+                for (uint32_t k = 0; k < 3u; ++k)
+                {
+                    PXG_CHECK_MSG(fbits(w2.bound[o + k]) == wantBits && fbits(v2.bound[o + k]) == (wantBits ^ 0x80000000u),
+                                  "psBounds zero-sign %s: boundArray[%u] twin does not differ", tag, o + k);
+                    PXG_CHECK_MSG(fbits(got[o + k]) == wantBits, "psBounds zero-sign %s: boundArray[%u] gpu=%08x, CUDA %08x",
+                                  tag, o + k, fbits(got[o + k]), wantBits);
+                }
+            }
+            PXG_CHECK_MSG(mm == 0, "psBounds zero-sign run %d: %zu bitwise mismatches", run, mm);
+            dev->destroyBuffer(bBoundArr.h); dev->destroyBuffer(bCd.h);
+        }
+
+        dev->destroyBuffer(bRC.h); dev->destroyBuffer(bRP.h); dev->destroyBuffer(bDC.h); dev->destroyBuffer(bDP.h);
+        dev->destroyBuffer(bCnt.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bTemp.h);
+    }
+    PXG_CHECK_MSG(tiesRun[0].minTie >= 3u && tiesRun[1].maxTie >= 3u && tiesRun[2].minTie >= 3u,
+                  "psBounds zero-sign coverage: regular/diffuse +-0 ties not exercised in every axis "
+                  "(plain min=%u, plain max=%u, ccd min=%u)", tiesRun[0].minTie, tiesRun[1].maxTie, tiesRun[2].minTie);
+}
+
+// Second pass alone with numBounds = 1025 (two accumulator iterations), in two
+// bound sets.  MIN set: every bound in the positive octant except bound 0
+// (iteration 0) with min = (-0,-0,-0) and bound 1024 (iteration 1) with
+// min = (+0,+0,+0); CUDA's PxMin(acc, new) keeps the NEW iteration's +0, FMin
+// keeps -0; contactDists = +0 carries the sign into boundArray.  MAX set: every
+// bound in the negative octant except bound 0 with max = (+0,+0,+0) and bound
+// 1024 with max = (-0,-0,-0); PxMax(acc, new) keeps -0, FMax +0; contactDists
+// = -0 carries it (-0 + -0 = -0).  (Engine: more than 1024 first-pass blocks,
+// i.e. more than 1,048,576 particles or max diffuse particles.)
+PXG_TEST(psBounds_updateBoundSecondPassAccZeroSign)
+{
+    using namespace psbz;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t NB = 1025u;
+    const float MZ = -0.0f;
+    std::mt19937 rng(8613);
+    std::uniform_real_distribution<float> ulo(0.5f, 20.f), uext(0.5f, 30.f);
+
+    PxgParticleSystem ps = makeZeroPs();
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<float> contactDists = { 0.0f, MZ };
+    DevBuf bCd = makeDev(dev, contactDists);
+
+    Ties tiesSet[2];
+    for (uint32_t set = 0; set < 2u; ++set)
+    {
+        const bool maxSet = set == 1u;
+        std::vector<float> bounds(NB * 6u);
+        for (uint32_t e = 0; e < NB; ++e)
+        {
+            float* b = &bounds[e * 6u];
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!maxSet) { b[k] = ulo(rng);      b[3 + k] = b[k] + uext(rng); }
+                else         { b[3 + k] = -ulo(rng); b[k] = b[3 + k] - uext(rng); }
+            }
+        }
+        const uint32_t o = maxSet ? 3u : 0u;
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            bounds[0u * 6u + o + k] = maxSet ? 0.0f : MZ;     // iteration 0
+            bounds[1024u * 6u + o + k] = maxSet ? MZ : 0.0f;  // iteration 1
+        }
+        DevBuf bBounds = makeDev(dev, bounds);
+        std::vector<float> boundArray(2u * 6u, -123.f);
+        DevBuf bBoundArr = makeDev(dev, boundArray);
+
+        size_t mm = 0;
+        for (uint32_t e = 0; e < 2u; ++e)
+        {
+            Ties tw, tIgnored;
+            gAccVariant = 0;
+            const Pass2 want = secondPassRef(bounds, NB, contactDists[e], e == set ? tiesSet[set] : tIgnored);
+            gAccVariant = 1;
+            const Pass2 twin = secondPassRef(bounds, NB, contactDists[e], tw);
+            gAccVariant = 0;
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "acc %s cd%s0", maxSet ? "max" : "min", e ? "-" : "+");
+            float got[6];
+            mm += runSecondPass(dev, bDesc, bBounds, NB, bBoundArr, 2u, bCd, e, want, tag, got);
+            if (e != set)
+                continue; // cd = +0 shows the min sign, cd = -0 the max sign
+            const uint32_t wantBits = maxSet ? 0x80000000u : 0u;
+            for (uint32_t k = 0; k < 3u; ++k)
+            {
+                PXG_CHECK_MSG(fbits(want.bound[o + k]) == wantBits && fbits(twin.bound[o + k]) == (wantBits ^ 0x80000000u),
+                              "psBounds %s: boundArray[%u] twin gives the same image (want=%08x twin=%08x)",
+                              tag, o + k, fbits(want.bound[o + k]), fbits(twin.bound[o + k]));
+                PXG_CHECK_MSG(fbits(got[o + k]) == wantBits, "psBounds %s: boundArray[%u] gpu=%08x, CUDA %08x",
+                              tag, o + k, fbits(got[o + k]), wantBits);
+            }
+        }
+        PXG_CHECK_MSG(mm == 0, "psBounds acc zero-sign set %u: %zu bitwise mismatches", set, mm);
+        dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bBoundArr.h);
+    }
+    PXG_CHECK_MSG(tiesSet[0].minTie >= 3u && tiesSet[1].maxTie >= 3u,
+                  "psBounds acc zero-sign coverage: accumulator +-0 ties not exercised in every axis (min=%u max=%u)",
+                  tiesSet[0].minTie, tiesSet[1].maxTie);
+
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCd.h);
+}
+
+// ---------------------------------------------------------------------------
 // ps_primitivesBound{First,Second}PassLaunch — per-pair grid cell-range count +
 // segmented scan through real PxgContactManagerInput / PxgShape / PxBounds3.
 // Verifies the exclusive scan (offsets), the 32 per-block totals and the grand

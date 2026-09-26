@@ -365,12 +365,16 @@ void ps_updateBoundSecondPassLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
             bmx = float3(boundsIn[b + 3u], boundsIn[b + 4u], boundsIn[b + 5u]);
         }
 
-        accMin.x = min(accMin.x, blockReduceMinF(tid, bmn.x));
-        accMin.y = min(accMin.y, blockReduceMinF(tid, bmn.y));
-        accMin.z = min(accMin.z, blockReduceMinF(tid, bmn.z));
-        accMax.x = max(accMax.x, blockReduceMaxF(tid, bmx.x));
-        accMax.y = max(accMax.y, blockReduceMaxF(tid, bmx.y));
-        accMax.z = max(accMax.z, blockReduceMaxF(tid, bmx.z));
+        // P9.86c: particlesystem.cu:646-647 fold each iteration with
+        // PxMin(sMinMax, newMin) / PxMax(sMinMax, newMax) = selectMin/selectMax,
+        // accumulator FIRST: on a +-0 tie between iterations (numBounds > 1024) the
+        // new iteration's zero survives.  FMin/FMax (min/max) are symmetric.
+        accMin.x = psbSelMin(accMin.x, blockReduceMinF(tid, bmn.x));
+        accMin.y = psbSelMin(accMin.y, blockReduceMinF(tid, bmn.y));
+        accMin.z = psbSelMin(accMin.z, blockReduceMinF(tid, bmn.z));
+        accMax.x = psbSelMax(accMax.x, blockReduceMaxF(tid, bmx.x));
+        accMax.y = psbSelMax(accMax.y, blockReduceMaxF(tid, bmx.y));
+        accMax.z = psbSelMax(accMax.z, blockReduceMaxF(tid, bmx.z));
     }
 
     if (tid == 0u)
