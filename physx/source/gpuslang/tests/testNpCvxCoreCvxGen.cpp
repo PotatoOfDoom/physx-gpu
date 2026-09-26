@@ -33,11 +33,21 @@
 // margin pushback, generateContactPatch.  Compare doctrine inherited:
 // counts/normal/non-trig outputs BITWISE (modulo the documented +-0 class),
 // contactFace cap points behind the deterministic trig flags to tolerance.
+//
+// P9.86c adds npCvxCoreCvxGen_triNpAtoBSign at the end of the file: the engine
+// kernel convexCoreTrimeshNphase_Kernel32 (cvxCoreTriNpBda.slang) run end to end
+// against refCvxGen composed with the Contact32 accumulator and the multi-patch
+// tail -- see the block comment there.
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+#include "geometry/PxConvexCoreGeometry.h"
+#include "GuBV32.h"
+
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2237,6 +2247,955 @@ PXG_TEST(npCvxCoreCvxGen_contacts)
                   cNone, cOne, cMulti, cTrig);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.86c -- convexCoreTrimeshNphase_Kernel32 (cvxCoreTriNpBda.slang), the SHIPPED
+// kernel, run END TO END against a host mirror built from the verified layers.
+//
+// WHY IT EXISTS.  Commit 24a7397 changed the kernel's transform0in1 from
+// rotateInv(q1, p0 - p1) to rotate(conj(q1), p0 - p1), which is what the CUDA
+// spells (convexCoreCollision.cu:980 -> PxTransform::transformInv, PxTransform.h:
+// 167-168: `qinv = q.getConjugate(); p = qinv.rotate(src.p - p)`).  The two are
+// equal on every non-zero value (round-to-nearest is symmetric under negation) and
+// differ only in the SIGN OF A ZERO component: rotateInv subtracts the cross term
+// that rotate(conj) adds with its operands negated, so an all-zero component comes
+// out -0 where the CUDA gives +0.  Until this test no bitwise fixture loaded
+// cvxCoreTriNpBda.spv at all, so the revert could not die.
+//
+// HOW THE SIGN REACHES A STORED WORD -- and why the obvious inputs cannot carry it.
+// A point core (sphere) never shows it: GJK's closest point always adds slot 3's
+// (+0)*0 and computePoints starts from +0, and the single clipNone point
+// (point0+point1)*0.5 absorbs a lone signed zero.  What does carry it:
+//   * a SEGMENT core (2-point contact face) that PIERCES the triangle, so EPA
+//     runs and ends on the facet whose three Minkowski points share one y --
+//     its normal's z is then an exact zero and the axis gets z = -0;
+//   * transform0in1 whose rotation is about the mesh z axis with zero x/y
+//     components, so the segment's +len/2 end keeps z = (-0) + aToBp.z = aToBp.z;
+//   * a mesh rotation q1 = PxQuat(-PxHalfPi, (-0,0,1)) = (+0,-0,-h,h) and a mesh
+//     position whose z is -0 (the `+ p1` in addPoints absorbs any other value).
+// The face point of that end then clips unchanged (t0 = +0 exactly, t1 < 0 because
+// the margin 0.5 exceeds the end's height above the plane), survives both
+// reducePoints as the point farthest from the deepest one, and addPoints stores
+// z = -c for c = aToBp.z: 0x80000000 under the CUDA, 0x00000000 under the revert.
+// Everything else is bit-identical.  The directed family below is exactly that
+// geometry; the host mirror is run TWICE (CUDA and revert spelling) and a coverage
+// counter requires the two expected images to differ, so a later edit cannot make
+// the input stop exercising the fix without failing loudly.
+//
+// THE MIRROR is not new arithmetic: generateContacts is refCvxGen above (verified
+// bitwise against the same shape layers by npCvxCoreCvxGen_contacts), the
+// accumulator is testNpCvxCoreWarpAcc.cpp's refWarpAcc verbatim (npCvxCoreWarpAcc
+// verifies it against pxgSlangCvxCoreAcc.slang, which this kernel includes), and
+// the bounds / mesh-scale glue is testNpCvxBvhGlue.cpp's (npCvxBvhGlue).  What is
+// new is the wiring those fixtures cannot see: transform0in1, makeConvexShape's
+// eCONVEXCORE arm, computeBounds + fattenFast, the one-leaf BV32 walk, the lane
+// staging, and the multi-patch tail's stream layout.  A GENERIC set (point / segment
+// / box / ellipsoid cores over a two-triangle quad, rotated and scaled meshes, both
+// slot orders) compares that wiring bitwise too.
+// ===========================================================================
+
+namespace trinpacc {
+
+// Gu::Contact32::addPoints -- testNpCvxCoreWarpAcc.cpp's refWarpAcc, VERBATIM.
+struct F4 { float x, y, z, w; };
+struct U4 { uint32_t x, y, z, w; };
+struct V3 { float x, y, z; };
+
+const uint32_t WARP_SIZE = 32, MAX_PATCHES = 16, MAX_PATCH_POINTS = 4, MAX_CC = 4;
+const uint32_t NOIDX = 0xFFFFFFFFu;
+const float SAME_NORMAL = 0.999f;
+
+struct WIn
+{
+    U4 meta;
+    F4 transformQ, transformP;
+    U4 nums[2][8];
+    F4 pts[2][128];
+    F4 nrm[2][32];
+};
+struct WOut
+{
+    U4 counts;
+    F4 patchN[MAX_PATCHES];
+    F4 pool[MAX_PATCHES * MAX_PATCH_POINTS];
+};
+
+static V3 vadd(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 vsub(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static float vdot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 vcross(V3 a, V3 b)
+{ return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static float vmag(V3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+static V3 qRot(const F4& q, V3 v)
+{
+    const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z;
+    const float w2 = q.w * q.w - 0.5f, d2 = q.x * vx + q.y * vy + q.z * vz;
+    return V3{ vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2,
+               vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
+               vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 };
+}
+static uint32_t popc(uint32_t v) { uint32_t c = 0; while (v) { v &= v - 1; ++c; } return c; }
+
+static uint32_t minIdx(const float v[WARP_SIZE], uint32_t mask, float& best)
+{
+    best = FLT_MAX; uint32_t idx = NOIDX;
+    for (uint32_t l = 0; l < WARP_SIZE; ++l)
+        if ((mask & (1u << l)) && v[l] < best) { best = v[l]; idx = l; }
+    return idx;
+}
+static uint32_t maxIdx(const float v[WARP_SIZE], uint32_t mask, float& best)
+{
+    best = -FLT_MAX; uint32_t idx = NOIDX;
+    for (uint32_t l = 0; l < WARP_SIZE; ++l)
+        if ((mask & (1u << l)) && v[l] > best) { best = v[l]; idx = l; }
+    return idx;
+}
+
+static void refWarpAcc(const WIn& s, WOut& o)
+{
+    std::memset(&o, 0, sizeof(o));
+
+    uint32_t mNumPatches = 0, mNumPoints = 0;
+    V3 patchNormal[MAX_PATCHES];
+    uint32_t patchCount[MAX_PATCHES];
+    F4 mPoints[MAX_PATCHES * MAX_PATCH_POINTS];
+    for (uint32_t i = 0; i < MAX_PATCHES; ++i) { patchNormal[i] = V3{ 0, 0, 0 }; patchCount[i] = 0; }
+    std::memset(mPoints, 0, sizeof(mPoints));
+
+    const uint32_t numCalls = s.meta.x < 2 ? s.meta.x : 2;
+    for (uint32_t call = 0; call < numCalls; ++call)
+    {
+        uint32_t laneNum[WARP_SIZE];
+        for (uint32_t l = 0; l < WARP_SIZE; ++l)
+        {
+            const uint32_t n = (&s.nums[call][l / 4].x)[l & 3];
+            laneNum[l] = n < MAX_CC ? n : MAX_CC;
+        }
+
+        F4 newPts[WARP_SIZE * MAX_CC];
+        V3 newNrm[WARP_SIZE * MAX_CC];
+        for (uint32_t i = 0; i < WARP_SIZE * MAX_CC; ++i)
+        { newPts[i] = F4{ 0, 0, 0, FLT_MAX }; newNrm[i] = V3{ 0, 0, 0 }; }
+
+        uint32_t prefix = 0, totalPoints = 0;
+        for (uint32_t l = 0; l < WARP_SIZE; ++l)
+        {
+            prefix += laneNum[l];
+            const uint32_t off = prefix - laneNum[l];
+            const V3 worldNormal = qRot(s.transformQ, V3{ s.nrm[call][l].x, s.nrm[call][l].y, s.nrm[call][l].z });
+            for (uint32_t j = 0; j < laneNum[l]; ++j)
+            {
+                const F4 lp = s.pts[call][l * MAX_CC + j];
+                const V3 wp = vadd(qRot(s.transformQ, V3{ lp.x, lp.y, lp.z }),
+                                   V3{ s.transformP.x, s.transformP.y, s.transformP.z });
+                newPts[off + j] = F4{ wp.x, wp.y, wp.z, lp.w };
+                newNrm[off + j] = worldNormal;
+            }
+            if (l == WARP_SIZE - 1) totalPoints = prefix;
+        }
+
+        const uint32_t numFullWarps = (totalPoints + WARP_SIZE - 1) / WARP_SIZE;
+        for (uint32_t round = 0; round < numFullWarps; ++round)
+        {
+            F4 lp[WARP_SIZE]; V3 ln[WARP_SIZE];
+            uint32_t allMask = 0;
+            for (uint32_t l = 0; l < WARP_SIZE; ++l)
+            {
+                const uint32_t i = round * WARP_SIZE + l;
+                if (i < totalPoints) { allMask |= (1u << l); lp[l] = newPts[i]; ln[l] = newNrm[i]; }
+                else { lp[l] = F4{ 0, 0, 0, FLT_MAX }; ln[l] = V3{ 0, 0, 0 }; }
+            }
+
+            uint32_t guard = 0;
+            while (allMask != 0 && guard < 40)
+            {
+                ++guard;
+                float dists[WARP_SIZE];
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) dists[l] = lp[l].w;
+                float minDist;
+                const uint32_t minDistThread = minIdx(dists, allMask, minDist);
+                const V3 minDistNormal = ln[minDistThread];
+
+                uint32_t sameNormalMask = 0;
+                for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                    if (vdot(ln[l], minDistNormal) > SAME_NORMAL) sameNormalMask |= (1u << l);
+                sameNormalMask &= allMask;
+
+                float tmpv[WARP_SIZE]; float md;
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = lp[l].w;
+                const uint32_t pi0 = minIdx(tmpv, sameNormalMask, md);
+                const V3 p0{ lp[pi0].x, lp[pi0].y, lp[pi0].z };
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = vmag(vsub(p0, V3{ lp[l].x, lp[l].y, lp[l].z }));
+                const uint32_t pi1 = maxIdx(tmpv, sameNormalMask, md);
+                const V3 p1{ lp[pi1].x, lp[pi1].y, lp[pi1].z };
+                const V3 sideN = vcross(minDistNormal, vsub(p1, p0));
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = vdot(sideN, vsub(V3{ lp[l].x, lp[l].y, lp[l].z }, p0));
+                const uint32_t pi2 = minIdx(tmpv, sameNormalMask, md);
+                const uint32_t pi3 = maxIdx(tmpv, sameNormalMask, md);
+                uint32_t bestPointsMask = (1u << pi0) | (1u << pi1) | (1u << pi2) | (1u << pi3);
+
+                F4 tmpBuffer[8];
+                std::memset(tmpBuffer, 0, sizeof(tmpBuffer));
+                uint32_t count = popc(bestPointsMask);
+                for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                    if (bestPointsMask & (1u << l))
+                        tmpBuffer[popc(bestPointsMask & ((1u << l) - 1))] = lp[l];
+
+                allMask &= ~sameNormalMask;
+
+                uint32_t patchIndex = NOIDX;
+                {
+                    float dots[WARP_SIZE];
+                    for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                    {
+                        const V3 pn = l < mNumPatches ? patchNormal[l] : V3{ 0, 0, 0 };
+                        dots[l] = vdot(minDistNormal, pn);
+                    }
+                    float maxDot;
+                    const uint32_t maxDotThread = maxIdx(dots, 0xFFFFFFFFu, maxDot);
+
+                    if (maxDot > SAME_NORMAL)
+                        patchIndex = maxDotThread;
+                    else if (mNumPatches < MAX_PATCHES)
+                    {
+                        patchNormal[mNumPatches] = minDistNormal;
+                        patchCount[mNumPatches] = 0;
+                        ++mNumPatches;
+                        patchIndex = mNumPatches - 1;
+                    }
+                    else
+                    {
+                        float pMax[WARP_SIZE]; uint32_t pClosest[WARP_SIZE];
+                        for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                        {
+                            const V3 pn = l < mNumPatches ? patchNormal[l] : V3{ 0, 0, 0 };
+                            float patchMaxDot = -FLT_MAX;
+                            uint32_t closestPatchThread = NOIDX;
+                            for (uint32_t i = l + 1; i < MAX_PATCHES; ++i)
+                            {
+                                const float d = vdot(pn, patchNormal[i]);
+                                if (patchMaxDot < d) { patchMaxDot = d; closestPatchThread = i; }
+                            }
+                            pMax[l] = patchMaxDot; pClosest[l] = closestPatchThread;
+                        }
+                        float patchMaxDot;
+                        const uint32_t patchMaxDotThread = maxIdx(pMax, 0xFFFFFFFFu, patchMaxDot);
+
+                        if (patchMaxDot > maxDot)
+                        {
+                            const uint32_t closestPatchThread = pClosest[patchMaxDotThread];
+                            const float dist0 = mPoints[patchMaxDotThread * MAX_PATCH_POINTS].w;
+                            const float dist1 = mPoints[closestPatchThread * MAX_PATCH_POINTS].w;
+                            const uint32_t pi = dist0 > dist1 ? patchMaxDotThread : closestPatchThread;
+                            mNumPoints -= patchCount[pi];
+                            patchCount[pi] = 0;
+                            patchNormal[pi] = minDistNormal;
+                            patchIndex = pi;
+                        }
+                    }
+                }
+
+                if (patchIndex == NOIDX)
+                    continue;
+
+                for (uint32_t j = 0; j < patchCount[patchIndex]; ++j)
+                    tmpBuffer[count + j] = mPoints[patchIndex * MAX_PATCH_POINTS + j];
+                count += patchCount[patchIndex];
+
+                const uint32_t patchPointMask = count >= 32 ? 0xFFFFFFFFu : ((1u << count) - 1);
+                F4 pp[WARP_SIZE];
+                for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                    pp[l] = l < count ? tmpBuffer[l] : F4{ 0, 0, 0, 0 };
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = pp[l].w;
+                float md2;
+                const uint32_t qi0 = minIdx(tmpv, patchPointMask, md2);
+                const uint32_t deepest2 = qi0;
+                const V3 q0{ pp[qi0].x, pp[qi0].y, pp[qi0].z };
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = vmag(vsub(q0, V3{ pp[l].x, pp[l].y, pp[l].z }));
+                const uint32_t qi1 = maxIdx(tmpv, patchPointMask, md2);
+                const V3 q1{ pp[qi1].x, pp[qi1].y, pp[qi1].z };
+                const V3 sideN2 = vcross(minDistNormal, vsub(q1, q0));
+                for (uint32_t l = 0; l < WARP_SIZE; ++l) tmpv[l] = vdot(sideN2, vsub(V3{ pp[l].x, pp[l].y, pp[l].z }, q0));
+                const uint32_t qi2 = minIdx(tmpv, patchPointMask, md2);
+                const uint32_t qi3 = maxIdx(tmpv, patchPointMask, md2);
+                bestPointsMask = (1u << qi0) | (1u << qi1) | (1u << qi2) | (1u << qi3);
+
+                const uint32_t newCount = popc(bestPointsMask);
+                for (uint32_t l = 0; l < WARP_SIZE; ++l)
+                    if (bestPointsMask & (1u << l))
+                        mPoints[patchIndex * MAX_PATCH_POINTS + popc(bestPointsMask & ((1u << l) - 1))] = pp[l];
+
+                const uint32_t dOff = popc(bestPointsMask & ((1u << deepest2) - 1));
+                const F4 tv = mPoints[patchIndex * MAX_PATCH_POINTS];
+                mPoints[patchIndex * MAX_PATCH_POINTS] = mPoints[patchIndex * MAX_PATCH_POINTS + dOff];
+                mPoints[patchIndex * MAX_PATCH_POINTS + dOff] = tv;
+
+                mNumPoints -= patchCount[patchIndex];
+                patchCount[patchIndex] = newCount;
+                mNumPoints += patchCount[patchIndex];
+            }
+        }
+    }
+
+    o.counts = U4{ mNumPatches, mNumPoints, 0, 0 };
+    for (uint32_t i = 0; i < MAX_PATCHES; ++i)
+    {
+        const V3 n = i < mNumPatches ? patchNormal[i] : V3{ 0, 0, 0 };
+        uint32_t c = i < mNumPatches ? patchCount[i] : 0;
+        float cf; std::memcpy(&cf, &c, 4);
+        o.patchN[i] = F4{ n.x, n.y, n.z, cf };
+    }
+    for (uint32_t i = 0; i < MAX_PATCHES * MAX_PATCH_POINTS; ++i)
+    {
+        const uint32_t pi = i / MAX_PATCH_POINTS;
+        const bool live = pi < mNumPatches && (i % MAX_PATCH_POINTS) < patchCount[pi];
+        o.pool[i] = live ? mPoints[i] : F4{ 0, 0, 0, 0 };
+    }
+}
+
+} // namespace trinpacc
+
+namespace trinp {
+
+// The engine ABI rows this kernel reads, mirrored with their sizes pinned.
+struct GpuShape                 // PxgShape, 48 B
+{
+    float sx, sy, sz;           // PxMeshScale::scale -- for eCONVEXCORE the core data
+    float rx, ry, rz, rw;       // PxMeshScale::rotation -- for eCONVEXCORE .w is the margin
+    uint32_t materialIndex;
+    uint32_t hullLo, hullHi;    // eCONVEXCORE: the PxConvexCore::Type; mesh: the blob
+    uint32_t type;
+    uint32_t particleOrSoftbodyId;
+};
+static_assert(sizeof(GpuShape) == 48, "PxgShape mirror");
+struct CmInput { uint32_t shapeRef0, shapeRef1, tcRef0, tcRef1; };
+static_assert(sizeof(CmInput) == 16, "PxgContactManagerInput mirror");
+struct CachedXf { float qx, qy, qz, qw, px, py, pz; uint32_t flags; };
+static_assert(sizeof(CachedXf) == 32, "PxsCachedTransform mirror");
+struct MaterialH { float dyn, sta, rest, damping; uint32_t flagsModes0, modes1; };
+static_assert(sizeof(MaterialH) == 24, "PxsMaterialData mirror");
+
+// cvxCoreTriNpBda.slang's CvxCoreTriParams == the CUDA parameter list (:919-937).
+struct TriPush
+{
+    uint32_t numTests, pad4;
+    uint64_t cmInputs, cmOutputs, shapes, transformCache, contactDistance, materials;
+    uint64_t contactStream, patchStream, counters, touchFlags, patchFlags;
+    uint64_t startPatches, startPoints, startForces;
+    uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit, pad132;
+};
+static_assert(sizeof(TriPush) == 136, "the kCvxCorePlane ABI row is 136 bytes");
+static_assert(offsetof(TriPush, cmInputs) == 8 && offsetof(TriPush, materials) == 48 &&
+              offsetof(TriPush, counters) == 72 && offsetof(TriPush, startForces) == 112 &&
+              offsetof(TriPush, patchBytesLimit) == 120 && offsetof(TriPush, forceBytesLimit) == 128,
+              "CvxCoreTriParams offsets");
+
+const uint32_t CORE_POINT = 0, CORE_SEGMENT = 1, CORE_BOX = 2, CORE_ELLIPSOID = 3;   // PxConvexCore::Type
+const uint32_t MAX_PATCHES = 16, MAX_PATCH_POINTS = 4;
+
+// A cooked mesh, by hand: ONE BV32 node whose child 0 is a leaf holding every
+// triangle (readTriangleMesh, triangleMesh.cuh:68-92).
+struct MeshH
+{
+    std::vector<F4> verts;
+    std::vector<U4> tris;
+    F4 nodeMin, nodeMax;
+};
+
+struct TriCase
+{
+    uint32_t coreType;          // PxConvexCore::Type
+    V3 coreData;                // PxMeshScale::scale bytes (length / extents / radii)
+    float margin;               // PxMeshScale::rotation.w
+    F4 q0; V3 p0;               // the core's pose
+    F4 q1; V3 p1;               // the mesh's pose
+    V3 meshScale; F4 meshRot;   // PxMeshScale of the mesh shape
+    uint32_t mesh;              // index into the mesh list
+    float cd0, cd1;             // contactDistance of the two cache entries
+    bool swapped;               // the pair arrives mesh-first (checkTypes swaps it)
+    uint32_t kind;              // 0 the design case, 1 the directed family, 2 generic
+};
+
+struct TriExpect
+{
+    uint32_t numPatches, numPoints;
+    V3 normal[MAX_PATCHES];
+    uint32_t count[MAX_PATCHES];
+    F4 contacts[MAX_PATCHES * MAX_PATCH_POINTS];   // the contact stream, patch-major
+    // what the directed counters look at
+    F4 aToBq; V3 aToBp;
+    bool intersect;
+    CvxOut gen[4];
+};
+
+static float u2fT(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+static gjkref::V3 toG(V3 v) { return gjkref::V3{ v.x, v.y, v.z }; }
+static V3 fromG(gjkref::V3 v) { return V3{ v.x, v.y, v.z }; }
+static gjkref::F4 toG(F4 q) { return gjkref::F4{ q.x, q.y, q.z, q.w }; }
+
+// PxQuat operator* (PxQuat.h:388-392)
+static F4 quatMul(F4 a, F4 b)
+{
+    return F4{ a.w * b.x + b.w * a.x + a.y * b.z - b.y * a.z,
+               a.w * b.y + b.w * a.y + a.z * b.x - b.z * a.x,
+               a.w * b.z + b.w * a.z + a.x * b.y - b.x * a.y,
+               a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+// PxMeshScale::toMat33 -- testNpCvxBvhGlue.cpp's quatToMat33 / meshScaleMat / matT.
+static void quatToMat33(F4 q, V3& c0, V3& c1, V3& c2)
+{
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    c0 = { 1.0f - yy - zz, xy + zw, xz - yw };
+    c1 = { xy - zw, 1.0f - xx - zz, yz + xw };
+    c2 = { xz + yw, yz - xw, 1.0f - xx - yy };
+}
+static V3 addv(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 subv(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 mulv(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static void meshScaleMat(V3 scale, F4 rot, V3& m0, V3& m1, V3& m2)
+{
+    V3 r0, r1, r2; quatToMat33(rot, r0, r1, r2);
+    const V3 t0 = { r0.x * scale.x, r1.x * scale.x, r2.x * scale.x };
+    const V3 t1 = { r0.y * scale.y, r1.y * scale.y, r2.y * scale.y };
+    const V3 t2 = { r0.z * scale.z, r1.z * scale.z, r2.z * scale.z };
+    m0 = addv(addv(mulv(t0, r0.x), mulv(t1, r0.y)), mulv(t2, r0.z));
+    m1 = addv(addv(mulv(t0, r1.x), mulv(t1, r1.y)), mulv(t2, r1.z));
+    m2 = addv(addv(mulv(t0, r2.x), mulv(t1, r2.y)), mulv(t2, r2.z));
+}
+static V3 matT(V3 m0, V3 m1, V3 m2, V3 v) { return addv(addv(mulv(m0, v.x), mulv(m1, v.y)), mulv(m2, v.z)); }
+
+// The kernel, one test, host side.  `revert` selects the pre-24a7397 spelling of
+// transform0in1's position, rotateInv(q1, p0 - p1); everything else is shared.
+static void refTriNp(const TriCase& c, const MeshH& m, bool revert, TriExpect& e)
+{
+    std::memset(&e, 0, sizeof(e));
+
+    // ---- transform0in1 = transform1.transformInv(transform0) (:980) ----------
+    const F4 conj{ -c.q1.x, -c.q1.y, -c.q1.z, c.q1.w };
+    const F4 aToBq = quatMul(conj, c.q0);
+    const gjkref::V3 v = gjkref::vsub(toG(c.p0), toG(c.p1));
+    const V3 aToBp = fromG(revert ? gjkref::qRotInv(toG(c.q1), v) : gjkref::qRot(toG(conj), v));
+    e.aToBq = aToBq; e.aToBp = aToBp;
+
+    const float contactDist = c.cd0 + c.cd1;
+
+    // ---- makeConvexShape, eCONVEXCORE arm (:120-127): words 0..5 = scale, rot.xyz
+    U4 core[3] = { { f2u(c.coreData.x), f2u(c.coreData.y), f2u(c.coreData.z), 0u },
+                   { 0u, 0u, 0u, 0u }, { 0u, 0u, 0u, 0u } };
+    gjkref::ShapeRefC sA{ c.coreType, reinterpret_cast<const gjkref::U4*>(core), toG(aToBq), toG(aToBp), nullptr };
+
+    // ---- convex.computeBounds() (GuConvexSupport.h:555-561) + fattenFast ------
+    auto support = [&](gjkref::V3 dir) {   // ConvexShape::support (:539-540), WITH the margin
+        return gjkref::vadd(gjkref::poseTf(sA, gjkref::supportLocal(sA, gjkref::qRotInv(sA.poseQ, dir))),
+                            gjkref::vscl(dir, c.margin));
+    };
+    const gjkref::V3 X{ 1, 0, 0 }, Y{ 0, 1, 0 }, Z{ 0, 0, 1 };
+    V3 bmin{ support(gjkref::vneg(X)).x, support(gjkref::vneg(Y)).y, support(gjkref::vneg(Z)).z };
+    V3 bmax{ support(X).x, support(Y).y, support(Z).z };
+    bmin = subv(bmin, V3{ contactDist, contactDist, contactDist });
+    bmax = addv(bmax, V3{ contactDist, contactDist, contactDist });
+
+    // ---- TrimeshBvh::scaleBounds (PxBounds3::transformFast over the inverse scale)
+    V3 im0, im1, im2;
+    meshScaleMat(V3{ 1.0f / c.meshScale.x, 1.0f / c.meshScale.y, 1.0f / c.meshScale.z }, c.meshRot, im0, im1, im2);
+    const V3 center = mulv(addv(bmin, bmax), 0.5f);
+    const V3 extents = mulv(subv(bmax, bmin), 0.5f);
+    const V3 mc = matT(im0, im1, im2, center);
+    const V3 e0 = mulv(im0, extents.x), e1 = mulv(im1, extents.y), e2 = mulv(im2, extents.z);
+    const V3 w{ std::fabs(e0.x) + std::fabs(e1.x) + std::fabs(e2.x),
+                std::fabs(e0.y) + std::fabs(e1.y) + std::fabs(e2.y),
+                std::fabs(e0.z) + std::fabs(e1.z) + std::fabs(e2.z) };
+    const V3 vMin = subv(mc, w), vMax = addv(mc, w);
+    const V3 dims = subv(vMax, vMin);
+    // margin(_bounds.getDimensions().minElement() * 0.0001f) (:570-573); dims > 0 here
+    const float triMargin = std::fmin(dims.x, std::fmin(dims.y, dims.z)) * 0.0001f;
+
+    // ---- bv32TreeTraversal over one root with one leaf child ----------------
+    e.intersect = !(m.nodeMin.x > vMax.x || vMin.x > m.nodeMax.x ||
+                    m.nodeMin.y > vMax.y || vMin.y > m.nodeMax.y ||
+                    m.nodeMin.z > vMax.z || vMin.z > m.nodeMax.z);
+    if (!e.intersect)
+        return;   // no leaf visited: addPoints is never called, Contact32 stays empty
+
+    V3 m0, m1, m2;
+    meshScaleMat(c.meshScale, c.meshRot, m0, m1, m2);
+
+    trinpacc::WIn wi;
+    std::memset(&wi, 0, sizeof(wi));
+    wi.meta = trinpacc::U4{ 1, 0, 0, 0 };      // one leaf -> one addPoints call (:1009)
+    wi.transformQ = trinpacc::F4{ c.q1.x, c.q1.y, c.q1.z, c.q1.w };
+    wi.transformP = trinpacc::F4{ c.p1.x, c.p1.y, c.p1.z, 0 };
+
+    const uint32_t nbPrims = uint32_t(m.tris.size());
+    for (uint32_t lane = 0; lane < nbPrims && lane < 4; ++lane)
+    {
+        const U4 t = m.tris[lane];
+        const V3 rv[3] = { V3{ m.verts[t.x].x, m.verts[t.x].y, m.verts[t.x].z },
+                           V3{ m.verts[t.y].x, m.verts[t.y].y, m.verts[t.y].z },
+                           V3{ m.verts[t.z].x, m.verts[t.z].y, m.verts[t.z].z } };
+        V3 tv[3];
+        for (int k = 0; k < 3; ++k) tv[k] = matT(m0, m1, m2, rv[k]);
+        // getTriNormal (:648-656): (v1 - v0).cross(v2 - v0).getNormalized()
+        const V3 triN = fromG(gjkref::nrmz(gjkref::vcross(gjkref::vsub(toG(tv[1]), toG(tv[0])),
+                                                          gjkref::vsub(toG(tv[2]), toG(tv[0])))));
+
+        CvxIn s;
+        std::memset(&s, 0, sizeof(s));
+        s.metaA = U4{ c.coreType, 0, 0, 0 };
+        std::memcpy(s.coreA, core, sizeof(core));
+        s.poseAq = aToBq;
+        s.poseAp = F4{ aToBp.x, aToBp.y, aToBp.z, c.margin };
+        // createConvex (:628-646): a PointsCore of the three scaled vertices,
+        // S = 1, R = identity, identity pose, the callback's margin
+        s.metaB = U4{ 6, 0, 0, 0 };
+        s.coreB[0] = U4{ 0x30u, 0u, f2u(1.0f), f2u(1.0f) };
+        s.coreB[1] = U4{ f2u(1.0f), f2u(0.0f), f2u(0.0f), f2u(0.0f) };
+        s.coreB[2] = U4{ f2u(1.0f), 3u | (16u << 8), 0u, 0u };
+        s.poseBq = F4{ 0, 0, 0, 1 };
+        s.poseBp = F4{ 0, 0, 0, triMargin };
+        s.cfg = F4{ contactDist, triN.x, triN.y, triN.z };   // cullDir = the triangle normal
+        for (int k = 0; k < 3; ++k) s.ptsB[k] = F4{ tv[k].x, tv[k].y, tv[k].z, 1.0f };
+        CvxOut& g = e.gen[lane];
+        refCvxGen(s, g);
+
+        (&wi.nums[0][lane / 4].x)[lane & 3] = g.counts.x;
+        wi.nrm[0][lane] = trinpacc::F4{ g.normal.x, g.normal.y, g.normal.z, 0 };
+        for (uint32_t j = 0; j < 4; ++j)
+            wi.pts[0][lane * 4 + j] = trinpacc::F4{ g.points[j].x, g.points[j].y, g.points[j].z, g.points[j].w };
+    }
+
+    trinpacc::WOut wo;
+    trinpacc::refWarpAcc(wi, wo);
+    e.numPatches = wo.counts.x;
+    e.numPoints = wo.counts.y;
+    uint32_t slot = 0;
+    for (uint32_t i = 0; i < e.numPatches; ++i)
+    {
+        uint32_t cnt; std::memcpy(&cnt, &wo.patchN[i].w, 4);
+        e.count[i] = cnt;
+        e.normal[i] = V3{ wo.patchN[i].x, wo.patchN[i].y, wo.patchN[i].z };
+        for (uint32_t j = 0; j < cnt; ++j, ++slot)
+            e.contacts[slot] = F4{ wo.pool[i * 4 + j].x, wo.pool[i * 4 + j].y, wo.pool[i * 4 + j].z, wo.pool[i * 4 + j].w };
+    }
+}
+
+// Words that differ between two expected images (contact stream + patch normals);
+// ~0u when the SHAPE of the output differs (counts).
+static uint32_t diffWords(const TriExpect& a, const TriExpect& b, uint32_t& word, uint32_t& aBits, uint32_t& bBits)
+{
+    if (a.numPatches != b.numPatches || a.numPoints != b.numPoints) return ~0u;
+    uint32_t d = 0;
+    for (uint32_t i = 0; i < a.numPatches; ++i)
+    {
+        if (a.count[i] != b.count[i]) return ~0u;
+        const float* na = &a.normal[i].x; const float* nb = &b.normal[i].x;
+        for (uint32_t k = 0; k < 3; ++k)
+            if (f2u(na[k]) != f2u(nb[k])) { ++d; word = 1000 + i * 3 + k; aBits = f2u(na[k]); bBits = f2u(nb[k]); }
+    }
+    for (uint32_t s = 0; s < a.numPoints; ++s)
+    {
+        const float* pa = &a.contacts[s].x; const float* pb = &b.contacts[s].x;
+        for (uint32_t k = 0; k < 4; ++k)
+            if (f2u(pa[k]) != f2u(pb[k])) { ++d; word = s * 4 + k; aBits = f2u(pa[k]); bBits = f2u(pb[k]); }
+    }
+    return d;
+}
+
+static F4 axisAngle(float angle, V3 axis)   // PxQuat(angle, unitAxis)
+{
+    const float a = angle * 0.5f;
+    const float s = std::sin(a);
+    return F4{ axis.x * s, axis.y * s, axis.z * s, std::cos(a) };
+}
+
+static void buildMeshes(std::vector<MeshH>& meshes)
+{
+    meshes.resize(2);
+    // Mesh 0: ONE triangle in the plane y = -0.05, normal +y (the design case).
+    MeshH& a = meshes[0];
+    a.verts = { F4{ -10.0f, -0.05f, -10.0f, 1.0f }, F4{ 0.0f, -0.05f, 10.0f, 1.0f }, F4{ 10.0f, -0.05f, -10.0f, 1.0f } };
+    a.tris = { U4{ 0, 1, 2, 0 } };
+    a.nodeMin = F4{ -10.0f, -0.05f, -10.0f, 0 };
+    a.nodeMax = F4{ 10.0f, -0.05f, 10.0f, 0 };
+    // Mesh 1: a two-triangle quad at y = 0, both normals +y, one leaf of two.
+    MeshH& b = meshes[1];
+    b.verts = { F4{ -4.0f, 0.0f, -4.0f, 1.0f }, F4{ -4.0f, 0.0f, 4.0f, 1.0f },
+                F4{ 4.0f, 0.0f, 4.0f, 1.0f }, F4{ 4.0f, 0.0f, -4.0f, 1.0f } };
+    b.tris = { U4{ 0, 1, 2, 0 }, U4{ 0, 2, 3, 0 } };
+    b.nodeMin = F4{ -4.0f, 0.0f, -4.0f, 0 };
+    b.nodeMax = F4{ 4.0f, 0.0f, 4.0f, 0 };
+}
+
+static void buildCases(std::vector<TriCase>& cases)
+{
+    const float h = 0.70710677f;   // sin/cos(PxHalfPi / 2)
+    // q1 = PxQuat(-PxHalfPi, PxVec3(-0.0f, 0.0f, 1.0f)) = (+0, -0, -h, h): the mesh is
+    // yawed -90 deg about z; the zero components carry the signs the axis gives them.
+    const F4 q1{ 0.0f, -0.0f, -h, h };
+    const V3 p1{ 0.0f, 0.0f, -0.0f };   // a mesh at the origin whose z is -0
+
+    // ---- the design case: 5 deg tilt, length 3, margin 0.5, v = (0.05, -0.05, +0)
+    // q0 = -PxQuat(PxHalfPi - 5 deg, Z): the same rotation as the positive quaternion,
+    // written with w < 0 (both are unit and valid), and x/y = -0.
+    {
+        TriCase c{};
+        c.coreType = CORE_SEGMENT; c.coreData = V3{ 3.0f, 0.0f, 0.0f }; c.margin = 0.5f;
+        c.q0 = F4{ -0.0f, -0.0f, -u2fT(0x3f2cf37bu), -u2fT(0x3f3cbe35u) };   // -sin/-cos(0.741764963)
+        c.p0 = V3{ 0.05f, -0.05f, 0.0f };
+        c.q1 = q1; c.p1 = p1;
+        c.meshScale = V3{ 1, 1, 1 }; c.meshRot = F4{ 0, 0, 0, 1 };
+        c.mesh = 0; c.cd0 = 0.01f; c.cd1 = 0.01f; c.swapped = false; c.kind = 0;
+        cases.push_back(c);
+    }
+    // ---- the directed family: the same construction over tilt, pierce depth, the
+    // core's mesh-frame height and the sign of its mesh-frame x offset.  The
+    // segment's lower end pierces the triangle plane (y = -0.05) by `depth`.
+    const float PxHalfPi = 1.57079632679489661923f;
+    const float degf = 3.14159265358979323846f / 180.0f;
+    for (float tilt : { 3.0f, 5.0f, 7.0f })
+        for (float depth : { 0.01f, 0.03f })
+            for (float vy : { -0.05f, 0.05f })
+                for (uint32_t sw = 0; sw < 2; ++sw)
+                {
+                    const float a = 0.5f * (PxHalfPi - tilt * degf);
+                    TriCase c{};
+                    c.coreType = CORE_SEGMENT; c.coreData = V3{ 3.0f, 0.0f, 0.0f }; c.margin = 0.5f;
+                    c.q0 = F4{ -0.0f, -0.0f, -std::sin(a), -std::cos(a) };
+                    const float y0 = -0.05f + 1.5f * std::sin(tilt * degf) - depth;
+                    c.p0 = V3{ y0, vy, 0.0f };
+                    c.q1 = q1; c.p1 = p1;
+                    c.meshScale = V3{ 1, 1, 1 }; c.meshRot = F4{ 0, 0, 0, 1 };
+                    c.mesh = 0; c.cd0 = 0.01f; c.cd1 = 0.01f; c.swapped = sw != 0; c.kind = 1;
+                    cases.push_back(c);
+                }
+
+    // ---- the generic set: every wiring step, compared bitwise ---------------
+    std::mt19937 rng(986301);
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() {
+        float q[4]; float m2 = 0;
+        for (int k = 0; k < 4; ++k) { q[k] = rf(-1, 1); m2 += q[k] * q[k]; }
+        const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+        return F4{ q[0] * i, q[1] * i, q[2] * i, q[3] * i };
+    };
+    for (uint32_t i = 0; i < 48; ++i)
+    {
+        TriCase c{};
+        c.coreType = i % 4;   // point, segment, box, ellipsoid
+        switch (c.coreType)
+        {
+        case CORE_POINT:     c.coreData = V3{ 0, 0, 0 }; c.margin = rf(0.2f, 0.6f); break;
+        case CORE_SEGMENT:   c.coreData = V3{ rf(0.5f, 2.5f), 0, 0 }; c.margin = rf(0.1f, 0.5f); break;
+        case CORE_BOX:       c.coreData = V3{ rf(0.3f, 1.5f), rf(0.3f, 1.5f), rf(0.3f, 1.5f) };
+                             c.margin = (i % 8 < 4) ? 0.0f : rf(0.02f, 0.2f); break;
+        default:             c.coreData = V3{ rf(0.2f, 0.8f), rf(0.2f, 0.8f), rf(0.2f, 0.8f) }; c.margin = rf(0.0f, 0.1f); break;
+        }
+        // the mesh pose: identity, a quarter turn, or arbitrary
+        const uint32_t mk = (i / 4) % 3;
+        c.q1 = mk == 0 ? F4{ 0, 0, 0, 1 } : (mk == 1 ? axisAngle(PxHalfPi, V3{ 1, 0, 0 }) : randQuat());
+        c.p1 = V3{ rf(-3, 3), rf(-3, 3), rf(-3, 3) };
+        // mesh scale: identity half the time, else non-uniform (positive)
+        if ((i / 12) % 2 == 0) { c.meshScale = V3{ 1, 1, 1 }; c.meshRot = F4{ 0, 0, 0, 1 }; }
+        else { c.meshScale = V3{ rf(0.6f, 1.8f), rf(0.6f, 1.8f), rf(0.6f, 1.8f) };
+               c.meshRot = (i % 3 == 0) ? randQuat() : F4{ 0, 0, 0, 1 }; }
+        // the core, placed in the MESH frame near the quad and moved to world
+        const F4 lq = (i % 5 == 0) ? F4{ 0, 0, 0, 1 } : randQuat();
+        const V3 lp{ rf(-2.5f, 2.5f), rf(-0.2f, 0.7f), rf(-2.5f, 2.5f) };
+        c.q0 = quatMul(c.q1, lq);
+        c.p0 = addv(fromG(gjkref::qRot(toG(c.q1), toG(lp))), c.p1);
+        c.mesh = 1; c.cd0 = rf(0.0f, 0.05f); c.cd1 = rf(0.0f, 0.05f);
+        c.swapped = (i % 7) == 3; c.kind = 2;
+        cases.push_back(c);
+    }
+}
+
+} // namespace trinp
+
+// Build one hand-cooked mesh blob: header (nbVerts, nbTris, 0, nbPackedNodes = 1),
+// ONE BV32DataPacked whose child 0 is a leaf of every triangle, the float4 vertices,
+// the uint4 indices (triangleMesh.cuh:68-92, the layout the kernel reads at :391-398).
+static std::vector<uint8_t> triNpMeshBlob(const trinp::MeshH& m)
+{
+    const uint32_t BV32_STRIDE = uint32_t(sizeof(physx::Gu::BV32DataPacked));
+    std::vector<uint8_t> blob(16 + BV32_STRIDE + m.verts.size() * 16 + m.tris.size() * 16, 0);
+    const uint32_t hdr[4] = { uint32_t(m.verts.size()), uint32_t(m.tris.size()), 0u, 1u };
+    std::memcpy(&blob[0], hdr, 16);
+    uint8_t* node = &blob[16];
+    std::memcpy(node + 0, &m.nodeMin, 16);                        // mMin[0]
+    std::memcpy(node + 512, &m.nodeMax, 16);                      // mMax[0]
+    const uint32_t leaf = (0u << 7) | (uint32_t(m.tris.size()) << 1) | 1u;   // start 0, n prims, leaf
+    std::memcpy(node + 1024, &leaf, 4);                           // mData[0]
+    const uint32_t nbNodes = 1u;
+    std::memcpy(node + 1152, &nbNodes, 4);                        // mNbNodes
+    std::memcpy(&blob[16 + BV32_STRIDE], m.verts.data(), m.verts.size() * 16);
+    std::memcpy(&blob[16 + BV32_STRIDE + m.verts.size() * 16], m.tris.data(), m.tris.size() * 16);
+    return blob;
+}
+
+PXG_TEST(npCvxCoreCvxGen_triNpAtoBSign)
+{
+    using namespace trinp;
+    static_assert(sizeof(physx::Gu::BV32DataPacked) == 1168, "BV32DataPacked (pxgSlangBv32's BV32_STRIDE)");
+    static_assert(uint32_t(physx::PxGeometryType::eCONVEXCORE) == 4u &&
+                  uint32_t(physx::PxGeometryType::eTRIANGLEMESH) == 8u, "PxGeometryType numbering");
+    static_assert(uint32_t(physx::PxConvexCore::ePOINT) == CORE_POINT &&
+                  uint32_t(physx::PxConvexCore::eSEGMENT) == CORE_SEGMENT &&
+                  uint32_t(physx::PxConvexCore::eBOX) == CORE_BOX &&
+                  uint32_t(physx::PxConvexCore::eELLIPSOID) == CORE_ELLIPSOID, "PxConvexCore::Type numbering");
+
+    std::vector<MeshH> meshes; buildMeshes(meshes);
+    std::vector<TriCase> cases; buildCases(cases);
+    const uint32_t N = uint32_t(cases.size());
+
+    // ---- the host mirror, CUDA spelling and the pre-24a7397 twin ------------
+    std::vector<TriExpect> ref(N);
+    size_t atobZeroSign = 0, epaAxisNegZero = 0, carrierStored = 0, twinOther = 0;
+    bool designKilled = false;
+    size_t gContacts = 0, gNone = 0, gMultiPatch = 0, gTwoLanes = 0, gSwapped = 0, gScaled = 0, gMiss = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const TriCase& c = cases[i];
+        TriExpect twin;
+        refTriNp(c, meshes[c.mesh], false, ref[i]);
+        refTriNp(c, meshes[c.mesh], true, twin);
+        const TriExpect& e = ref[i];
+        uint32_t word = 0, bitsCuda = 0, bitsTwin = 0;
+        const uint32_t d = diffWords(e, twin, word, bitsCuda, bitsTwin);
+        if (c.kind != 2)
+        {
+            // transform0in1 as constructed: q = (+0, -0, qz < 0, w < 0), and the two
+            // spellings of p differing in exactly the sign of the zero z
+            const bool q = f2u(e.aToBq.x) == 0x00000000u && f2u(e.aToBq.y) == 0x80000000u &&
+                           e.aToBq.z < 0.0f && e.aToBq.w < 0.0f;
+            const bool p = f2u(e.aToBp.x) == f2u(twin.aToBp.x) && f2u(e.aToBp.y) == f2u(twin.aToBp.y) &&
+                           f2u(e.aToBp.z) == 0x00000000u && f2u(twin.aToBp.z) == 0x80000000u;
+            if (q && p) ++atobZeroSign;
+            // EPA ended on the cap facet (axis z == -0) with the segment's 2-point face
+            if (e.gen[0].counts.x >= 2 && f2u(e.gen[0].normal.z) == 0x80000000u) ++epaAxisNegZero;
+            // THE KILL: the two images differ in exactly one stored word, the carrier's z
+            if (d == 1 && word < 1000u && (word % 4u) == 2u && bitsCuda == 0x80000000u && bitsTwin == 0x00000000u)
+            {
+                ++carrierStored;
+                if (c.kind == 0) designKilled = true;
+            }
+            else if (d != 0)
+                ++twinOther;
+        }
+        else
+        {
+            PXG_CHECK_MSG(d == 0, "generic case %u: the twin differs (%u words) -- the generic set "
+                          "was built with no zero-sign structure", i, d);
+            if (!e.intersect) ++gMiss;
+            if (e.numPoints) ++gContacts; else ++gNone;
+            if (e.numPatches >= 2) ++gMultiPatch;
+            if (e.gen[0].counts.x && e.gen[1].counts.x) ++gTwoLanes;
+            if (e.numPoints && c.swapped) ++gSwapped;
+            if (e.numPoints && (c.meshScale.x != 1.0f || c.meshScale.y != 1.0f || c.meshScale.z != 1.0f)) ++gScaled;
+        }
+    }
+    std::printf("[ info ] triNp cov: atobZeroSign %zu epaAxisNegZero %zu carrierStored %zu (design %d) twinOther %zu | "
+                "generic contacts %zu none %zu miss %zu multiPatch %zu twoLanes %zu swapped %zu scaled %zu\n",
+                atobZeroSign, epaAxisNegZero, carrierStored, designKilled ? 1 : 0, twinOther,
+                gContacts, gNone, gMiss, gMultiPatch, gTwoLanes, gSwapped, gScaled);
+    // The coverage the kill rests on.  If a later edit moves the geometry off the
+    // construction, THESE fail -- the input cannot silently stop exercising the fix.
+    PXG_CHECK_MSG(designKilled, "the design case no longer separates rotate(conj(q1)) from rotateInv(q1) "
+                  "in a stored word");
+    PXG_CHECK_MSG(carrierStored >= 16 && atobZeroSign >= carrierStored && epaAxisNegZero >= carrierStored &&
+                  twinOther == 0,
+                  "directed family: carrierStored %zu atobZeroSign %zu epaAxisNegZero %zu twinOther %zu",
+                  carrierStored, atobZeroSign, epaAxisNegZero, twinOther);
+    PXG_CHECK_MSG(gContacts >= 20 && gNone >= 8 && gMiss >= 1 && gMultiPatch >= 4 && gTwoLanes >= 4 &&
+                  gSwapped >= 2 && gScaled >= 6, "generic coverage thin");
+
+    // ---- the device run ------------------------------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<PxgBufferHandle> meshBufs;
+    std::vector<uint64_t> meshAddr;
+    for (const MeshH& m : meshes)
+    {
+        meshBufs.push_back(createBufferFrom(dev, triNpMeshBlob(m)));
+        meshAddr.push_back(dev->getBufferDeviceAddress(meshBufs.back()));
+    }
+
+    const uint32_t MAT_CORE = 1u, MAT_MESH = 2u;
+    std::vector<MaterialH> mats(3);
+    std::memset(mats.data(), 0, mats.size() * sizeof(MaterialH));
+    mats[MAT_CORE] = MaterialH{ 0.5f, 0.75f, 0.25f, 0.125f, 0u, 0u };   // average combine everywhere
+    mats[MAT_MESH] = MaterialH{ 0.25f, 0.5f, 0.5f, 0.375f, 0u, 0u };
+
+    std::vector<GpuShape> shapes(2 * N);
+    std::vector<CachedXf> xf(2 * N);
+    std::vector<float> cdist(2 * N);
+    std::vector<CmInput> cms(N);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    std::memset(xf.data(), 0, xf.size() * sizeof(CachedXf));
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const TriCase& c = cases[i];
+        GpuShape& s0 = shapes[2 * i];
+        s0.sx = c.coreData.x; s0.sy = c.coreData.y; s0.sz = c.coreData.z;
+        s0.rx = 0.0f; s0.ry = 0.0f; s0.rz = 0.0f; s0.rw = c.margin;
+        s0.materialIndex = MAT_CORE;
+        s0.hullLo = c.coreType; s0.hullHi = 0u;
+        s0.type = uint32_t(physx::PxGeometryType::eCONVEXCORE);
+        GpuShape& s1 = shapes[2 * i + 1];
+        s1.sx = c.meshScale.x; s1.sy = c.meshScale.y; s1.sz = c.meshScale.z;
+        s1.rx = c.meshRot.x; s1.ry = c.meshRot.y; s1.rz = c.meshRot.z; s1.rw = c.meshRot.w;
+        s1.materialIndex = MAT_MESH;
+        s1.hullLo = uint32_t(meshAddr[c.mesh] & 0xffffffffu); s1.hullHi = uint32_t(meshAddr[c.mesh] >> 32);
+        s1.type = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+        xf[2 * i] = CachedXf{ c.q0.x, c.q0.y, c.q0.z, c.q0.w, c.p0.x, c.p0.y, c.p0.z, 0u };
+        xf[2 * i + 1] = CachedXf{ c.q1.x, c.q1.y, c.q1.z, c.q1.w, c.p1.x, c.p1.y, c.p1.z, 0u };
+        cdist[2 * i] = c.cd0; cdist[2 * i + 1] = c.cd1;
+        // checkTypes (:98-108) swaps a mesh-first pair back
+        cms[i] = c.swapped ? CmInput{ 2 * i + 1, 2 * i, 2 * i + 1, 2 * i } : CmInput{ 2 * i, 2 * i + 1, 2 * i, 2 * i + 1 };
+    }
+
+    const uint32_t PATCH_WORDS = 16u * MAX_PATCHES, CONTACT_WORDS = 4u * MAX_PATCHES * MAX_PATCH_POINTS;
+    const uint64_t START_PATCHES = 0x0000100000000000ull, START_POINTS = 0x0000200000000040ull,
+                   START_FORCES = 0x0000300000000080ull;   // never dereferenced by the tail
+    std::vector<uint32_t> patchInit(size_t(N) * PATCH_WORDS, 0u), contactInit(size_t(N) * CONTACT_WORDS, 0xCDCDCDCDu);
+    std::vector<uint32_t> outInit(size_t(N) * 12u, 0u), flagInit(N, 0xFFFFFFFFu), ctrInit(4, 0u);
+
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCms = createBufferFrom(dev, cms);
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bContact = createBufferFrom(dev, contactInit);
+    PxgBufferHandle bPatch = createBufferFrom(dev, patchInit);
+    PxgBufferHandle bCtr = createBufferFrom(dev, ctrInit);
+    PxgBufferHandle bTouch = createBufferFrom(dev, flagInit);
+    PxgBufferHandle bPchg = createBufferFrom(dev, flagInit);
+
+    TriPush push{};
+    push.numTests = N;
+    push.cmInputs = dev->getBufferDeviceAddress(bCms);
+    push.cmOutputs = dev->getBufferDeviceAddress(bOut);
+    push.shapes = dev->getBufferDeviceAddress(bShapes);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.materials = dev->getBufferDeviceAddress(bMat);
+    push.contactStream = dev->getBufferDeviceAddress(bContact);
+    push.patchStream = dev->getBufferDeviceAddress(bPatch);
+    push.counters = dev->getBufferDeviceAddress(bCtr);
+    push.touchFlags = dev->getBufferDeviceAddress(bTouch);
+    push.patchFlags = dev->getBufferDeviceAddress(bPchg);
+    push.startPatches = START_PATCHES;
+    push.startPoints = START_POINTS;
+    push.startForces = START_FORCES;
+    push.patchBytesLimit = N * PATCH_WORDS * 4u;
+    push.contactBytesLimit = N * CONTACT_WORDS * 4u;
+    push.forceBytesLimit = N * 256u;
+
+    // grid = ceil(numTests / 4): one group walks the block's four warps (tests) serially
+    Kernel k("cvxCoreTriNpBda.spv", "convexCoreTrimeshNphase_Kernel32", {}, sizeof(TriPush));
+    k.dispatch((N + 3u) / 4u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gOut = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+    const auto gContact = downloadBuffer<uint32_t>(dev, bContact, contactInit.size());
+    const auto gPatch = downloadBuffer<uint32_t>(dev, bPatch, patchInit.size());
+    const auto gCtr = downloadBuffer<uint32_t>(dev, bCtr, 4);
+    const auto gTouch = downloadBuffer<uint32_t>(dev, bTouch, N);
+    const auto gPchg = downloadBuffer<uint32_t>(dev, bPchg, N);
+
+    // ---- expected tail values that do not depend on the contacts -------------
+    // combine (PxsMaterialCombiner, average mode on both sides), transcribed
+    const MaterialH& m0 = mats[MAT_CORE]; const MaterialH& m1 = mats[MAT_MESH];
+    const float eRest = 1.0f * (0.5f * (m0.rest + m1.rest));
+    const float eDamp = 0.5f * (m0.damping + m1.damping);
+    const float eDyn = 0.5f * (m0.dyn + m1.dyn);
+    const float eStaF = 0.5f * (m0.sta + m1.sta);
+    const float eSta = (eStaF - eDyn) >= 0.0f ? eStaF : eDyn;
+
+    uint64_t sumPoints = 0, sumPatches = 0;
+    size_t mm = 0, carrierChecked = 0;
+    auto bad = [&](uint32_t i, const char* what, uint32_t got, uint32_t want) {
+        if (mm < 12)
+            std::printf("  triNp case %u (kind %u): %s got 0x%08x want 0x%08x\n", i, cases[i].kind, what, got, want);
+        ++mm;
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const TriExpect& e = ref[i];
+        sumPoints += e.numPoints; sumPatches += e.numPatches;
+        const uint32_t* o = &gOut[size_t(i) * 12u];
+        const uint32_t status = e.numPoints ? 2u : 1u;    // eHAS_TOUCH / eHAS_NO_TOUCH, prior 0
+        if (o[8] != ((status << 16) | (e.numPatches << 8))) bad(i, "allflags", o[8], (status << 16) | (e.numPatches << 8));
+        if ((o[9] & 0xFFFFu) != e.numPoints) bad(i, "nbContacts", o[9] & 0xFFFFu, e.numPoints);
+        if (gTouch[i] != 1u) bad(i, "touchChange", gTouch[i], 1u);   // prior touch unknown
+        if (gPchg[i] != (e.numPatches ? 1u : 0u)) bad(i, "patchChange", gPchg[i], e.numPatches ? 1u : 0u);
+
+        const uint64_t cp = uint64_t(o[2]) | (uint64_t(o[3]) << 32);
+        if (e.numPoints == 0)
+        {
+            if (cp != 0) bad(i, "contactPoints (none expected)", uint32_t(cp), 0u);
+            continue;
+        }
+        const uint64_t cOff = cp - START_POINTS;
+        if ((cOff & 15u) != 0 || cOff + 16u * e.numPoints > uint64_t(contactInit.size()) * 4u)
+        { bad(i, "contactPoints offset", uint32_t(cOff), 0u); continue; }
+        for (uint32_t s = 0; s < e.numPoints; ++s)
+            for (uint32_t kk = 0; kk < 4; ++kk)
+            {
+                const uint32_t got = gContact[size_t(cOff / 4u) + s * 4u + kk];
+                const uint32_t want = f2u((&e.contacts[s].x)[kk]);
+                if (got != want) bad(i, "contact word", got, want);
+            }
+        const uint64_t pp = uint64_t(o[0]) | (uint64_t(o[1]) << 32);
+        const uint64_t pOff = pp - START_PATCHES;
+        if ((pOff & 63u) != 0 || pOff + 64u * e.numPatches > uint64_t(patchInit.size()) * 4u)
+        { bad(i, "contactPatches offset", uint32_t(pOff), 0u); continue; }
+        uint32_t start = 0;
+        for (uint32_t pi = 0; pi < e.numPatches; ++pi)
+        {
+            const uint32_t* w = &gPatch[size_t(pOff / 4u) + pi * 16u];
+            const uint32_t want[14] = { f2u(1.0f), f2u(1.0f), f2u(1.0f), f2u(1.0f),
+                                        f2u(e.normal[pi].x), f2u(e.normal[pi].y), f2u(e.normal[pi].z),
+                                        f2u(eRest), f2u(eDyn), f2u(eSta), f2u(eDamp),
+                                        (start & 0xFFFFu) | ((e.count[pi] & 0xFFu) << 16),   // matFlags 0
+                                        MAT_CORE << 16, MAT_MESH };                           // shape0 = the core
+            for (uint32_t kk = 0; kk < 14; ++kk)
+                if (w[kk] != want[kk]) bad(i, "patch word", w[kk], want[kk]);
+            start += e.count[pi];
+        }
+    }
+    // THE DIRECTED CHECK, spelled out: on every family case the mirror marks, the
+    // device's carrier z is the CUDA's -0 (the revert stores +0).
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (cases[i].kind == 2) continue;
+        TriExpect twin;
+        refTriNp(cases[i], meshes[cases[i].mesh], true, twin);
+        uint32_t word = 0, bc = 0, bt = 0;
+        if (diffWords(ref[i], twin, word, bc, bt) != 1u || word >= 1000u) continue;
+        const uint32_t* o = &gOut[size_t(i) * 12u];
+        const uint64_t cOff = (uint64_t(o[2]) | (uint64_t(o[3]) << 32)) - START_POINTS;
+        if (cOff + 16u * ref[i].numPoints > uint64_t(contactInit.size()) * 4u) continue;
+        const uint32_t got = gContact[size_t(cOff / 4u) + word];
+        PXG_CHECK_MSG(got == 0x80000000u, "case %u: carrier contact z = 0x%08x, CUDA (qinv.rotate) gives "
+                      "0x80000000, the pre-24a7397 rotateInv 0x00000000", i, got);
+        ++carrierChecked;
+    }
+    PXG_CHECK_MSG(carrierChecked == carrierStored, "carrier checks %zu of %zu", carrierChecked, carrierStored);
+    PXG_CHECK_MSG(gCtr[0] == 64u * sumPatches && gCtr[1] == 16u * sumPoints && gCtr[2] == 4u * sumPoints && gCtr[3] == 0u,
+                  "counters: patches %u contacts %u forces %u overflow %u (want %llu %llu %llu 0)",
+                  gCtr[0], gCtr[1], gCtr[2], gCtr[3], (unsigned long long)(64u * sumPatches),
+                  (unsigned long long)(16u * sumPoints), (unsigned long long)(4u * sumPoints));
+    PXG_CHECK_MSG(mm == 0, "cvxCoreTriNpBda: %zu mismatching words against the CUDA-semantics mirror", mm);
+
+    for (PxgBufferHandle hb : meshBufs) dev->destroyBuffer(hb);
+    for (PxgBufferHandle hb : { bShapes, bXf, bCd, bCms, bMat, bOut, bContact, bPatch, bCtr, bTouch, bPchg })
+        dev->destroyBuffer(hb);
 }
 
 } // namespace
