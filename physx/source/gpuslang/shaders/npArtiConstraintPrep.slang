@@ -384,7 +384,7 @@ public uint acpSetupFinalizeExtTGS(
     const float3 bodyFrame0p = b0.b2wP;
     const float3 bodyFrame1p = b1.b2wP;
 
-    const float cfm = max(b0.cfm, b1.cfm);
+    const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // P9.86c: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:660); FMax gives +0 for (+0,-0)
     const float maxPenBias = max(b0.penBiasClamp, b1.penBiasClamp);
     const float p8 = min(0.8f, biasCoefficient);
     const float bounceThreshold = bounceThresholdF32;
@@ -1273,7 +1273,7 @@ uint acpSetupFinalizeExtPGS(
     const float3 angVel0 = b0.velocity.top;
     const float3 angVel1 = b1.velocity.top;
 
-    const float cfm = max(b0.cfm, b1.cfm);
+    const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // P9.86c: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:232); FMax gives +0 for (+0,-0)
 
     uint responsesWritten = 0u;
 

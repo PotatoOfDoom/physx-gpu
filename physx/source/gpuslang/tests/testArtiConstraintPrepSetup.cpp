@@ -551,22 +551,17 @@ PXG_TEST(artiConstraintPrepSetup)
                       "launch acpSetupTest");
         shim.streamSynchronize();
 
-        size_t bad = 0, signedZeros = 0;
+        size_t bad = 0;
         auto cmp = [&](PxgDevicePtr dp, const void* wantp, size_t nsz, const char* tag) {
             std::vector<uint32_t> got(nsz / 4);
             shim.memcpyDtoH(got.data(), dp, nsz);
             const uint32_t* w = reinterpret_cast<const uint32_t*>(wantp);
             for (size_t k = 0; k < got.size(); ++k)
+                // BITWISE, the sign of zero included: the P8.86/P8.91a +-0
+                // tolerance (the 6x6 multiply's literal-zero seed fold) is gone
+                // since the P9.86 select spelling of that seed add (P9.86c)
                 if (w[k] != got[k])
                 {
-                    // the P8.86/P8.91a arrangement: +-0 differences from the
-                    // driver's literal-zero fold in the 6x6 multiply are a
-                    // documented platform effect -- tolerated, but COUNTED
-                    if ((w[k] & 0x7FFFFFFFu) == 0u && (got[k] & 0x7FFFFFFFu) == 0u)
-                    {
-                        ++signedZeros;
-                        continue;
-                    }
                     if (bad < 12)
                         std::printf("MM acs r%u %s word %zu (lane %zu)  ref %08x  gpu %08x\n",
                                     round, tag, k, k % 32, w[k], got[k]);
@@ -579,7 +574,6 @@ PXG_TEST(artiConstraintPrepSetup)
         cmp(dFr, wantFr.data(), wantFr.size() * sizeof(wantFr[0]), "frictions");
         cmp(dRs, wantRs.data(), wantRs.size() * sizeof(wantRs[0]), "responses");
         cmp(dIo, wantIo.data(), wantIo.size() * 4, "io");
-        std::printf("  round %u: +-0 tolerated %zu\n", round, signedZeros);
         PXG_CHECK_MSG(bad == 0, "round %u: %zu mismatches", round, bad);
     }
 

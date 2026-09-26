@@ -44,6 +44,8 @@
 #ifndef PXG_ARTI_PREP_REF_H
 #define PXG_ARTI_PREP_REF_H
 
+#include <cmath>
+
 namespace pxgtest
 {
 using namespace physx;
@@ -80,6 +82,47 @@ inline float computeCompliantContactCoefficientsTGS(float stepDt, uint32_t flags
 #ifndef PXG_ARTI_PREP_REF_FLOAT_ONLY
 
 using physx::Cm::UnAlignedSpatialVector;
+
+// ---------------------------------------------------------------------------
+// P9.86c: MUTANT TWINS of the port's pre-P9.86 zero-tie spellings.  The CUDA
+// uses PxMin/PxMax<float> = intrinsics::selectMin/selectMax (a<b?a:b /
+// a>b?a:b, a +-0 tie keeps the SECOND operand); the port once spelled them as
+// Slang min()/max(), i.e. the SignedZeroInfNanPreserve-stamped FMin/FMax,
+// which on llvmpipe return -0 (min) / +0 (max) for {+0,-0} in EITHER order.
+// gAcpZeroVariant = 0 is the CUDA and the only value the expected images are
+// built with; a fixture sets a bit only to prove that its directed lanes see
+// the difference (twin != image), then resets it.
+//   1  maxImpulse = PxMin(b0.maxImpulse, b1.maxImpulse)      (cu:700 / :249)
+//   2  contact maxImpulse = PxMin(maxImpulse, w)               (cu:856 / :397)
+//   4  minPen = PxMin(penetration, minPen)                     (cu:827)
+//   8  torsional PxMax(y, PxSqrt(PxMax(0, -minPen) * x))       (cu:1069)
+//  16  cfm = PxMax(b0.cfm, b1.cfm)                             (cu:660 / :232)
+// ---------------------------------------------------------------------------
+inline int gAcpZeroVariant = 0;
+
+inline float acpLpFMin(float a, float b)
+{
+    if (a == 0.f && b == 0.f)
+        return (std::signbit(a) || std::signbit(b)) ? -0.f : 0.f;
+    return a < b ? a : b;
+}
+
+inline float acpLpFMax(float a, float b)
+{
+    if (a == 0.f && b == 0.f)
+        return (std::signbit(a) && std::signbit(b)) ? -0.f : 0.f;
+    return a > b ? a : b;
+}
+
+inline float acpMin(float a, float b, int bit)
+{
+    return (gAcpZeroVariant & bit) ? acpLpFMin(a, b) : PxMin(a, b);
+}
+
+inline float acpMax(float a, float b, int bit)
+{
+    return (gAcpZeroVariant & bit) ? acpLpFMax(a, b) : PxMax(a, b);
+}
 
 // ---------------------------------------------------------------------------
 // createPxgSolverExtBody (artiConstraintPrep2.cu:55) on the host, over the
@@ -200,7 +243,7 @@ inline uint32_t refSetupExtContactsTGS(
     const PxVec3& bodyFrame0p = b0.body2World.p;
     const PxVec3& bodyFrame1p = b1.body2World.p;
 
-    const PxReal cfm = PxMax(b0.cfm, b1.cfm);
+    const PxReal cfm = acpMax(b0.cfm, b1.cfm, 16);
     const float maxPenBias = PxMax(b0.penBiasClamp, b1.penBiasClamp);
     const float p8 = PxMin(0.8f, biasCoefficient);
     const float bounceThreshold = bounceThresholdF32;
@@ -232,7 +275,7 @@ inline uint32_t refSetupExtContactsTGS(
         return 0;
     }
 
-    const PxReal maxImpulse = PxMin(b0.maxImpulse, b1.maxImpulse);
+    const PxReal maxImpulse = acpMin(b0.maxImpulse, b1.maxImpulse, 1);
 
     contactHeader.forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     contactHeader.flags[threadIndex] = flags;
@@ -329,7 +372,7 @@ inline uint32_t refSetupExtContactsTGS(
         contactPoints[j].resp0[threadIndex] = resp0;
         contactPoints[j].resp1[threadIndex] = resp1;
 
-        minPen = PxMin(penetration, minPen);
+        minPen = acpMin(penetration, minPen, 4);
 
         const bool isGreater2 = ((restitution > 1e-5f) && (bounceThreshold > vrel))
                              && ((-vrel) > penetrationInvDt);
@@ -360,7 +403,7 @@ inline uint32_t refSetupExtContactsTGS(
         contactPoints[j].rbXn_targetVelW[threadIndex] =
             make_float4(-response1.top.x, -response1.top.y, -response1.top.z, targetVelocity);
         contactPoints[j].appliedForce[threadIndex] = 0.f;
-        contactPoints[j].maxImpulse[threadIndex] = PxMin(maxImpulse, targetVel4_maxImpulseW.w);
+        contactPoints[j].maxImpulse[threadIndex] = acpMin(maxImpulse, targetVel4_maxImpulseW.w, 2);
         contactPoints[j].separation[threadIndex] = totalError;
         contactPoints[j].biasCoefficient[threadIndex] = scaledBias;
 
@@ -510,8 +553,9 @@ inline uint32_t refSetupExtContactsTGS(
         {
             PxgTGSBlockSolverContactFriction* f0 = &frictions[2];
 
-            const PxReal torsionalScale = PxMax(torsionalFrictionData.y,
-                                                PxSqrt(PxMax(0.f, -minPen) * torsionalFrictionData.x));
+            const PxReal torsionalScale =
+                acpMax(torsionalFrictionData.y,
+                       PxSqrt(acpMax(0.f, -minPen, 8) * torsionalFrictionData.x), 8);
             frictionHeader.torsionalFrictionScale[threadIndex] = torsionalScale;
 
             const UnAlignedSpatialVector response0 =
@@ -626,7 +670,7 @@ inline uint32_t refSetupExtContactsPGS(
     const PxVec3& angVel0 = b0.velocity.top;
     const PxVec3& angVel1 = b1.velocity.top;
 
-    const PxReal cfm = PxMax(b0.cfm, b1.cfm);
+    const PxReal cfm = acpMax(b0.cfm, b1.cfm, 16);
 
     uint32_t responsesWritten = 0;
 
@@ -642,7 +686,7 @@ inline uint32_t refSetupExtContactsPGS(
         return 0;
     }
 
-    const PxReal maxImpulse = PxMin(b0.maxImpulse, b1.maxImpulse);
+    const PxReal maxImpulse = acpMin(b0.maxImpulse, b1.maxImpulse, 1);
 
     contactHeader.forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
     contactHeader.flags[threadIndex] = flags;
@@ -783,7 +827,7 @@ inline uint32_t refSetupExtContactsPGS(
             make_float4(response0.top.x, response0.top.y, response0.top.z, targetVelocity);
         contactPoints[j].rbXn_maxImpulse[threadIndex] =
             make_float4(-response1.top.x, -response1.top.y, -response1.top.z,
-                        PxMin(maxImpulse, targetVel4_maxImpulseW.w));
+                        acpMin(maxImpulse, targetVel4_maxImpulseW.w, 2));
         contactPoints[j].resp0[threadIndex] = resp0;
         contactPoints[j].resp1[threadIndex] = resp1;
         contactPoints[j].coeff0[threadIndex] = coeff0;

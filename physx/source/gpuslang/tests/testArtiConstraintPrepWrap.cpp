@@ -87,6 +87,11 @@ static std::vector<uint8_t> acwLoader(const char* file) { return loadShaderBlob(
 
 const uint32_t ACW_NB_ARTI = 6;
 const uint32_t ACW_NB_RIGID = 16;
+// P9.86c: two EXTRA dynamic pool entries past the % ACW_NB_RIGID mapping (so no
+// existing lane moves): 16 has maxContactImpulse -0 (setMaxContactImpulse(-0.f)
+// passes the API's >= 0 check), 17 has +0 -- the zero-tie bodies of the
+// directed lanes below
+const uint32_t ACW_NB_RIGID_POOL = ACW_NB_RIGID + 2;
 const uint32_t ACW_REC_SIZE = 544;
 
 const uint32_t ACW_RIGID_OFFSET = 3;      // prepDesc.numBatches
@@ -211,12 +216,12 @@ PXG_TEST(artiConstraintPrepWrap)
         base += acwNumLinks(r);
     }
 
-    std::vector<PxgSolverBodyData> sbd(ACW_NB_RIGID);
-    std::vector<PxgSolverTxIData> txi(ACW_NB_RIGID);
-    std::vector<PxAlignedTransform> frames(ACW_NB_RIGID);
+    std::vector<PxgSolverBodyData> sbd(ACW_NB_RIGID_POOL);
+    std::vector<PxgSolverTxIData> txi(ACW_NB_RIGID_POOL);
+    std::vector<PxAlignedTransform> frames(ACW_NB_RIGID_POOL);
     std::memset(sbd.data(), 0xAB, sbd.size() * sizeof(sbd[0]));
     std::memset(txi.data(), 0xAB, txi.size() * sizeof(txi[0]));
-    for (uint32_t i = 0; i < ACW_NB_RIGID; ++i)
+    for (uint32_t i = 0; i < ACW_NB_RIGID_POOL; ++i)
     {
         const uint32_t kind = i % 4u;   // 0/1 dynamic, 2 static, 3 kinematic
         PxQuat q(av(i, 70), av(i, 71), av(i, 72), 1.0f + 0.3f * av(i, 73));
@@ -294,6 +299,34 @@ PXG_TEST(artiConstraintPrepWrap)
         }
     }
 
+    // ---- P9.86c: the signed-zero tie lanes (warp 0 = desc 1, none of them an
+    // engineered friction-cache lane, a perPoint lane or a disabled lane) ----
+    //   lane  0  link (arti 0, link 1) vs dynamic pool 0, one contact at
+    //            separation +0.02, torsional (0.7, +0): minPen stays the +0 seed
+    //            -> torsionalFrictionScale = PxMax(+0, sqrt(PxMax(0,-0)*x)) = -0
+    //   lane  1  dynamic pool 16 (maxImpulse -0) vs link (arti 2, link 5) whose
+    //            cfm is -0 (cfmScale -0): contactHeader.cfm = PxMax(+0,-0) = -0;
+    //            contact 0 has w = +0 (PxContactSet::ignore()): PxMin(-0,+0) = +0
+    //   lane 21  dynamic pool 16 (-0) vs dynamic pool 17 (+0), B switched from
+    //            its link: maxImpulse = PxMin(-0,+0) = +0
+    //   lane 24  link vs dynamic pool 8, one contact at separation -0 against
+    //            restDistance +0: penetration -0, PxMin(-0,+0) keeps the +0 seed
+    const uint32_t ACW_ZS_LANES[4] = { 0u, 1u, 21u, 24u };
+    sbd[16].maxImpulse = -0.0f;
+    sbd[17].maxImpulse = 0.0f;
+    {
+        PxgBlockConstraintBatch& b0w = batches[ACW_BATCH_IDX[0] + ACW_RIGID_OFFSET];
+        b0w.bodyAIndex[1] = 16u;                      // node 302 stays rigid
+        b0w.bodyAIndex[21] = 16u;                     // node 342 stays rigid
+        b0w.bodyBNodeIndex[21] = PxNodeIndex(343u);   // link -> rigid
+        b0w.bodyBIndex[21] = 17u;
+        const PxNodeIndex nB1 = b0w.bodyBNodeIndex[1];
+        PXG_CHECK_MSG(nB1.isArticulation() && b0w.remappedBodyBIndex[1] == 2u
+                          && nB1.articulationLinkId() == 5u,
+                      "lane 1: B must be (arti 2, link 5)");
+        cfms[linkBases[2] + 5u] = -0.0f;
+    }
+
     // ---- desc-indexed prep pools ----
     std::vector<PxgBlockWorkUnit> workUnits(ACW_NB_PREP);
     std::vector<PxgBlockContactData> cdPool(ACW_NB_PREP);
@@ -345,6 +378,18 @@ PXG_TEST(artiConstraintPrepWrap)
                     make_float4(0.3f * av(l, 334 + j * 8), 0.3f * av(l, 335 + j * 8),
                                 0.3f * av(l, 336 + j * 8), 1.5f + std::fabs(av(l, 337 + j * 8)));
             }
+    }
+
+    // P9.86c: the torsional / ignore()-contact inputs of the zero-tie lanes
+    {
+        const uint32_t cb = ACW_CONTACT_BASE[0];
+        workUnits[1].mTorsionalFrictionData[0] = make_float2(0.7f, 0.0f);
+        cdPool[1].contactData[0].restDistance = 0.0f;
+        contacts[cb + 0].point_separationW[0].w = 0.02f;
+        workUnits[1].mTorsionalFrictionData[24] = make_float2(0.7f, 0.0f);
+        cdPool[1].contactData[24].restDistance = 0.0f;
+        contacts[cb + 0].point_separationW[24].w = -0.0f;
+        contacts[cb + 0].targetVel_maxImpulseW[1].w = 0.0f;
     }
 
     // engineered contact clusters for the friction-cache lanes (warp 0, desc 1)
@@ -676,6 +721,79 @@ PXG_TEST(artiConstraintPrepWrap)
     PXG_CHECK_MSG(inherited1Count == engineeredInherit1, "one-anchor inherit coverage");
     PXG_CHECK_MSG(inheritedCount >= 3, "inherit coverage");
 
+    // ---- P9.86c: zero-tie coverage, asserted through the mirror's own image ----
+    auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    {
+        const uint32_t zsMaxImpTie = (bitsOf(wantCP[0].maxImpulse[21]) == 0x00000000u ? 1u : 0u)
+                                   + (bitsOf(wantCP[1].maxImpulse[21]) == 0x00000000u ? 1u : 0u);
+        const bool zsMaxImpIgnore = bitsOf(wantCP[0].maxImpulse[1]) == 0x00000000u
+                                 && bitsOf(wantCP[1].maxImpulse[1]) == 0x80000000u;
+        const bool zsPenNeg0 = wantP[1].anchorCount[24] == 1u
+                            && bitsOf(wantCP[0].separation[24]) == 0x80000000u;
+        const uint32_t zsTorsNeg0 =
+            (wantP[1].anchorCount[0] == 1u
+             && bitsOf(wantFH[1].torsionalFrictionScale[0]) == 0x80000000u ? 1u : 0u)
+            + (wantP[1].anchorCount[24] == 1u
+               && bitsOf(wantFH[1].torsionalFrictionScale[24]) == 0x80000000u ? 1u : 0u);
+        const bool zsCfmNeg0 = bitsOf(wantCH[1].cfm[1]) == 0x80000000u;
+        std::printf("  acw zero ties: maxImpTie %u  ignore %d  penNeg0 %d  torsNeg0 %u  cfmNeg0 %d\n",
+                    zsMaxImpTie, int(zsMaxImpIgnore), int(zsPenNeg0), zsTorsNeg0, int(zsCfmNeg0));
+        PXG_CHECK_MSG(bitsOf(sbd[16].maxImpulse) == 0x80000000u
+                          && bitsOf(sbd[17].maxImpulse) == 0x00000000u, "zero-tie bodies");
+        PXG_CHECK_MSG(zsMaxImpTie == 2u, "lane 21: PxMin(-0,+0) body maxImpulse tie");
+        PXG_CHECK_MSG(zsMaxImpIgnore, "lane 1: PxMin(-0 body, +0 ignore()) contact tie");
+        PXG_CHECK_MSG(zsPenNeg0, "lane 24: -0 penetration single anchor");
+        PXG_CHECK_MSG(zsTorsNeg0 == 2u, "lanes 0/24: -0 torsionalFrictionScale");
+        PXG_CHECK_MSG(zsCfmNeg0, "lane 1: PxMax(+0,-0) cfm tie");
+    }
+
+    // P9.86c: the mutant twins -- each pre-P9.86 FMin/FMax spelling, re-run
+    // over the directed lanes only, must change the expected image
+    auto twinDiffers = [&](int variant) {
+        std::vector<PxgTGSBlockSolverContactHeader> tCH(wantCH);
+        std::vector<PxgTGSBlockSolverFrictionHeader> tFH(wantFH);
+        std::vector<PxgTGSBlockSolverContactPoint> tCP(wantCP);
+        std::vector<PxgTGSBlockSolverContactFriction> tFR(wantFR);
+        std::vector<PxgArticulationBlockResponse> tRS(wantRS);
+        const PxgBlockConstraintBatch& b = batches[ACW_BATCH_IDX[0] + ACW_RIGID_OFFSET];
+        const uint32_t d = b.mConstraintBatchIndex;
+        gAcpZeroVariant = variant;
+        for (uint32_t lane : ACW_ZS_LANES)
+        {
+            const PxNodeIndex nodeA = b.bodyANodeIndex[lane];
+            const PxNodeIndex nodeB = b.bodyBNodeIndex[lane];
+            const uint32_t biA = nodeA.isArticulation() ? b.remappedBodyAIndex[lane]
+                                                        : b.bodyAIndex[lane];
+            const uint32_t biB = nodeB.isArticulation() ? b.remappedBodyBIndex[lane]
+                                                        : b.bodyBIndex[lane];
+            PxgSolverExtBody2 b0, b1;
+            refCreateExtBody(nodeA, biA, linkBases.data(), b2w.data(), resp.data(), mv.data(),
+                             cfms.data(), links.data(), sbd.data(), txi.data(), frames.data(), b0);
+            refCreateExtBody(nodeB, biB, linkBases.data(), b2w.data(), resp.data(), mv.data(),
+                             cfms.data(), links.data(), sbd.data(), txi.data(), frames.data(), b1);
+            const PxgBlockWorkUnit& wu = workUnits[d];
+            const PxgMaterialContactData& data = cdPool[d].contactData[lane];
+            const float offsetSlop = PxMax(b0.offsetSlop, b1.offsetSlop);
+            refSetupExtContactsTGS(cdPool[d], &contacts[ACW_CONTACT_BASE[0]], data.mNumContacts,
+                                   wantP[d], wantA[d], b0, b1, stepInvDtF, stepDtF, invDtF,
+                                   bounceF, biasF, lane, wu.mWriteback[lane],
+                                   (data.mSolverFlags & 2u) != 0u, tCH[d], tFH[d],
+                                   &tCP[b.startConstraintIndex], &tFR[b.startFrictionIndex],
+                                   &tRS[b.mArticulationResponseIndex], data, offsetSlop,
+                                   wu.mTorsionalFrictionData[lane], dtF);
+        }
+        gAcpZeroVariant = 0;
+        return std::memcmp(tCH.data(), wantCH.data(), tCH.size() * sizeof(tCH[0])) != 0
+            || std::memcmp(tFH.data(), wantFH.data(), tFH.size() * sizeof(tFH[0])) != 0
+            || std::memcmp(tCP.data(), wantCP.data(), tCP.size() * sizeof(tCP[0])) != 0
+            || std::memcmp(tFR.data(), wantFR.data(), tFR.size() * sizeof(tFR[0])) != 0
+            || std::memcmp(tRS.data(), wantRS.data(), tRS.size() * sizeof(tRS[0])) != 0;
+    };
+    PXG_CHECK_MSG(!twinDiffers(0), "the CUDA twin must reproduce the image");
+    for (int v : { 1, 2, 4, 8, 16 })
+        PXG_CHECK_MSG(twinDiffers(v),
+                      "mutant twin %d gives the same image -- the directed lanes do not observe it", v);
+
     // ---- launch: 3 blocks x (32,2,1) = 6 warps, 4 live ----
     struct Params { uint64_t prepDesc, sharedDesc; } prm = { uint64_t(dPrep), uint64_t(dShared) };
     static_assert(sizeof(Params) == 16, "params blob");
@@ -684,19 +802,14 @@ PXG_TEST(artiConstraintPrepWrap)
     shim.streamSynchronize();
 
     // ---- compare ----
-    size_t bad = 0, signedZeros = 0;
+    size_t bad = 0;
     auto cmp = [&](PxgDevicePtr dp, const void* wantp, size_t nsz, const char* tag) {
         std::vector<uint32_t> got(nsz / 4);
         shim.memcpyDtoH(got.data(), dp, nsz);
         const uint32_t* wv = reinterpret_cast<const uint32_t*>(wantp);
         for (size_t k = 0; k < got.size(); ++k)
-            if (wv[k] != got[k])
+            if (wv[k] != got[k])   // BITWISE: the sign of zero included (P9.86c)
             {
-                if ((wv[k] & 0x7FFFFFFFu) == 0u && (got[k] & 0x7FFFFFFFu) == 0u)
-                {
-                    ++signedZeros;
-                    continue;
-                }
                 if (bad < 12)
                     std::printf("MM acw %s word %zu (lane %zu)  ref %08x  gpu %08x\n",
                                 tag, k, k % 32, wv[k], got[k]);
@@ -711,7 +824,6 @@ PXG_TEST(artiConstraintPrepWrap)
     cmp(dCP, wantCP.data(), wantCP.size() * sizeof(wantCP[0]), "contactPoints");
     cmp(dFR, wantFR.data(), wantFR.size() * sizeof(wantFR[0]), "frictions");
     cmp(dRS, wantRS.data(), wantRS.size() * sizeof(wantRS[0]), "responses");
-    std::printf("  acw +-0 tolerated %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 
     for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
