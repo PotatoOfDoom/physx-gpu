@@ -105,6 +105,11 @@ static float distancePointSegmentSquared(Vec3 a, Vec3 b, Vec3 p, float& param)
     return v.dot(v);
 }
 
+// P9.86c coverage for sphereNphase_capsuleCapsuleZeroSign: how often a -0 reaches the two PxClamp
+// selects below (distanceSegmentSegment.cuh:76/:81).  clampf(v, 0, 1) is PxClamp's
+// selectMin(1, selectMax(0, v)) for every float, -0 and NaN included.
+static size_t gSegTTmpNegZero = 0, gSegCompNegZero = 0;
+
 static void distanceSegmentSegmentSquared(Vec3 p1, Vec3 d1, Vec3 p2, Vec3 d2, float& s, float& t)
 {
     const float eps = 1e-6f;
@@ -118,8 +123,10 @@ static void distanceSegmentSegmentSquared(Vec3 p1, Vec3 d1, Vec3 p2, Vec3 d2, fl
     const float s0 = clampf(temp / denom, 0.f, 1.f);
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
+    if (tTmp == 0.f && std::signbit(tTmp)) ++gSegTTmpNegZero;
     const float t2 = clampf(tTmp, 0.f, 1.f);
     const float comp = (b * t2 - c) * aRecip;
+    if (comp == 0.f && std::signbit(comp)) ++gSegCompNegZero;
     s = clampf(comp, 0.f, 1.f);
     t = t2;
 }
@@ -427,7 +434,12 @@ static HMaterial zeroSignMaterial(uint32_t k)
     }
 }
 
-static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label)
+// strictZero (P9.86c): additionally require the exact bits on every contact-point and normal lane
+// whose CUDA-mirror value is +-0 (the sign of zero is an output bit).  Opt-in: only the directed
+// configurations are derived to be exact on their zero lanes (every product reaching them is exact,
+// so fma contraction cannot change them); the other configurations keep the tolerance compare.
+static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label,
+                        bool strictZero = false)
 {
     using namespace physx::gpuslang;
     const uint32_t n = uint32_t(cfgs.size());
@@ -607,6 +619,13 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
                 if (bad < 12) std::printf("  [%s] pair %u contact %u gpu=(%g,%g,%g,%g) ref=(%g,%g,%g,%g)\n",
                                           label, i, k, f4[0], f4[1], f4[2], f4[3], R.pt[k].x, R.pt[k].y, R.pt[k].z, R.pen[k]);
             }
+            if (strictZero)
+            {
+                const float rv[4] = { R.pt[k].x, R.pt[k].y, R.pt[k].z, R.pen[k] };
+                for (uint32_t l = 0; l < 4u; ++l)
+                    if (rv[l] == 0.f && fbits(f4[l]) != fbits(rv[l]))
+                    { ++bad; if (bad < 12) std::printf("  [%s] pair %u contact %u lane %u gpu=%08x ref=%08x\n", label, i, k, l, fbits(f4[l]), fbits(rv[l])); }
+            }
         }
 
         float pf[16];
@@ -615,6 +634,13 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         if (!(almostEqual(pf[4], R.normal.x, 2e-4f, 2e-5f) && almostEqual(pf[5], R.normal.y, 2e-4f, 2e-5f) &&
               almostEqual(pf[6], R.normal.z, 2e-4f, 2e-5f)))
         { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch normal gpu=(%g,%g,%g) ref=(%g,%g,%g)\n", label, i, pf[4], pf[5], pf[6], R.normal.x, R.normal.y, R.normal.z); }
+        if (strictZero)
+        {
+            const float rn[3] = { R.normal.x, R.normal.y, R.normal.z };
+            for (uint32_t l = 0; l < 3u; ++l)
+                if (rn[l] == 0.f && pu[4 + l] != fbits(rn[l]))
+                { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=%08x\n", label, i, 4 + l, pu[4 + l], fbits(rn[l])); }
+        }
 
         float sta, dyn, rest, damping; uint32_t mflags;
         combineMaterials(materials[cfgs[i].mat0 & 0xffffu], materials[cfgs[i].mat1 & 0xffffu], sta, dyn, rest, damping, mflags);
@@ -831,6 +857,44 @@ PXG_TEST(sphereNphase_materialZeroSign)
                   dynNegZero, staFromClamp);
 
     checkSphere(cfgs, 0x00000000u, false, "materialZeroSign");
+}
+
+// P9.86c engine route of npCapsuleCollision_capsuleCapsuleZeroSign: capsule-capsule pairs whose
+// degenerate capsule (halfHeight 2^-13, |d|^2 = 2^-24 < 1e-6, reciprocal = the select's +0) drives
+// tTmp = -0 (capsule1) or comp = -0 (capsule0) into the PxClamp selects of
+// distanceSegmentSegmentSquared (distanceSegmentSegment.cuh:76/:81; npSpherePrimitives.slang t2/s2).
+// capsule0 is turned 180 deg about z, so getBasisVector0 = (-1, +0, -0), and sits at z = -0 with
+// capsule1 at z = +0: the sign of s reaches closestA.z, vv.z and the patch normal word 6
+// (cudaSphere.cu:215, npSphereNphase.slang patchBase[6]).  FClamp would turn each -0 into +0 and flip
+// word 6 (pair 0: +0 -> -0, pairs 1 and 2: -0 -> +0).  Exact binary fractions throughout.
+PXG_TEST(sphereNphase_capsuleCapsuleZeroSign)
+{
+    const float D = 0.50006103515625f;   // 0.5 + 2^-14
+    const float A = 0.499969482421875f;  // 0.5 - 2^-15
+    const float H = 1.220703125e-4f;     // 2^-13
+    const float Z = 0.8660254f;          // q = (0,0,Z,0.5): 120 deg about z
+    const QuatV qz180(0, 0, -1, 0), qId(0, 0, 0, 1), qz120(0, 0, Z, 0.5f);
+    std::vector<PairCfg> cfgs;
+    cfgs.push_back({ GT_CAPSULE, Vec3(1, 1, 0), TransformV(qz180, Vec3(D, 0.75f, -0.0f)),
+                     GT_CAPSULE, Vec3(H, 1, 0), TransformV(qId, Vec3(-D, -0.75f, 0.0f)), 0.0f, 1, 2 });
+    cfgs.push_back({ GT_CAPSULE, Vec3(H, 1, 0), TransformV(qz180, Vec3(1.0f, 0.0f, -0.0f)),
+                     GT_CAPSULE, Vec3(1, 1, 0), TransformV(qId, Vec3(-1.0f, 0.0f, 0.0f)), 0.0f, 3, 4 });
+    cfgs.push_back({ GT_CAPSULE, Vec3(1, 1, 0), TransformV(qz180, Vec3(A, 0.75f, -0.0f)),
+                     GT_CAPSULE, Vec3(H, 1, 0), TransformV(qz120, Vec3(-A, -0.75f, 0.0f)), 0.0f, 5, 6 });
+    const bool tTmpPair[3] = { true, false, true };
+    const uint32_t cudaW6[3] = { 0x00000000u, 0x80000000u, 0x80000000u };   // hand-derived CUDA word 6
+    for (uint32_t i = 0; i < 3u; ++i)
+    {
+        gSegTTmpNegZero = gSegCompNegZero = 0;
+        const RC R = refDispatch(cfgs[i]);
+        const size_t hit = tTmpPair[i] ? gSegTTmpNegZero : gSegCompNegZero;
+        std::printf("  [capsZeroSign] pair %u: %s = -0 seen %zu, normal.z=%08x nb=%d\n", i,
+                    tTmpPair[i] ? "tTmp" : "comp", hit, fbits(R.normal.z), R.nb);
+        PXG_CHECK_MSG(hit != 0u, "pair %u no longer drives %s = -0 into its clamp", i, tTmpPair[i] ? "tTmp" : "comp");
+        PXG_CHECK_MSG(R.nb == 1 && fbits(R.normal.z) == cudaW6[i], "pair %u: mirror normal.z %08x, CUDA %08x",
+                      i, fbits(R.normal.z), cudaW6[i]);
+    }
+    checkSphere(cfgs, 0x00000000u, false, "capsZeroSign", true);
 }
 
 PXG_TEST(sphereNphase_mutation)

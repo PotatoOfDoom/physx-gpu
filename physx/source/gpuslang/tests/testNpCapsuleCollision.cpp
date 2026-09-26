@@ -30,11 +30,15 @@
 // point/penetration/normal/contact-count outputs are compared against a C++
 // reference mirroring sphereCollision.cuh + distanceSegmentSegment.cuh
 // (almostEqual tolerance), with counters asserting each contact-count path fires.
+// npCapsuleCollision_capsuleCapsuleZeroSign adds directed signed-zero cases compared
+// bitwise on every +-0 reference lane (P9.86c, the PxClamp selects of
+// distanceSegmentSegmentSquared).
 
 #include "pxgTestFramework.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -91,6 +95,18 @@ Quat qof(const XformC& t) { return { t.qx, t.qy, t.qz, t.qw }; }
 V3 pof(const XformC& t) { return { t.px, t.py, t.pz }; }
 V3 xformPt(const XformC& t, V3 p) { return add(qrot(qof(t), p), pof(t)); }
 
+uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// P9.86c twins of npSpherePrimitives.slang distanceSegmentSegmentSquared's two PxClamp selects
+// (distanceSegmentSegment.cuh:76 t2, :81 s2).  0 = the CUDA: PxClamp(v, 0, 1) = PxMin(1, PxMax(0, v))
+// with the float selects of PxUnixMathIntrinsics.h:116-125 (a > b ? a : b, a < b ? a : b), which is
+// exactly clampf(v, 0, 1) -- -0 and NaN pass through -- so the mirror needs no correction.
+// 1 = t2 and 2 = s2 through GLSL FClamp as llvmpipe evaluates it (npSpherePrimitives-r0/-r1):
+// FMin(FMax(v, +0), 1) with FMax(+-0, +0) = +0 and NaN -> 0 (P9.86 F4).
+int gSegClampVariant = 0;
+size_t gTTmpNegZero = 0, gCompNegZero = 0;
+float fclampLp01(float v) { const float m = (v > 0.f) ? v : 0.f; return (m < 1.f) ? m : 1.f; }
+
 void distSegSegSq(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
 {
     const float eps = 1e-6f;
@@ -101,9 +117,11 @@ void distSegSegSq(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
     float s0 = clampf(temp / denom, 0.f, 1.f);
     float sTmp = eps > denom ? 0.5f : s0;
     float tTmp = (b * sTmp + f) * eRecip;
-    float t2 = clampf(tTmp, 0.f, 1.f);
+    if (f2u(tTmp) == 0x80000000u) ++gTTmpNegZero;
+    float t2 = (gSegClampVariant == 1) ? fclampLp01(tTmp) : clampf(tTmp, 0.f, 1.f);
     float comp = (b * t2 - c) * aRecip;
-    s = clampf(comp, 0.f, 1.f);
+    if (f2u(comp) == 0x80000000u) ++gCompNegZero;
+    s = (gSegClampVariant == 2) ? fclampLp01(comp) : clampf(comp, 0.f, 1.f);
     t = t2;
 }
 void pcm22(V3 a0, V3 b0, V3 a1, V3 b1, V3 p0, V3 p1, V3 p2, V3 p3,
@@ -312,6 +330,98 @@ PXG_TEST(npCapsuleCollision_capsuleCapsule)
     }
     PXG_CHECK_MSG(mm == 0, "capsuleCapsule: %zu mismatches", mm);
     PXG_CHECK_MSG(c1 > N / 20 && c2 > N / 20, "capsuleCapsule: paths under-exercised (nb1=%zu nb2=%zu)", c1, c2);
+    for (PxgBufferHandle h : { b0, b1, bt, bpp, bn, bnb }) dev->destroyBuffer(h);
+}
+
+// P9.86c: the two PxClamp selects of distanceSegmentSegmentSquared (distanceSegmentSegment.cuh:76/:81,
+// npSpherePrimitives.slang t2/s2) keep a -0 argument, where GLSL FClamp gives +0 on llvmpipe.  A
+// capsule whose half height is 2^-13 has |d|^2 = 2^-24 < 1e-6, so its reciprocal is the select's
+// +0 and tTmp (capsule1) or comp (capsule0) is (negative) * +0 = -0.  capsule0 is turned 180 deg
+// about z (q = (0,0,-1,0)): getBasisVector0 = (-1, +0, -0), so with p0.z = -0 and p1.z = +0
+// s0.z = -0, d0.z = +0 and s1.z = d1.z = +0; closestA.z = s0.z + d0.z * s then carries the sign of
+// s, vv.z = closestA.z - (+0) keeps it, and the stored normal.z = vv.z * rsqrt(|vv|^2) shows it.
+// The degenerate segment makes its dir the zero vector (cos = 0), so the numContacts == 0
+// normalize branch (sphereCollision.cuh:816) always runs.  Every value below is a binary
+// fraction (D = 0.5 + 2^-14, A = 0.5 - 2^-15), so s0.x == s1.x exactly and c = dot(d0, r) = +0:
+//   case 0: b < 0, tTmp = -0.  CUDA t2 = -0, comp = b*(-0) - (+0) = +0, normal.z = +0;
+//           t2 through FClamp (+0) gives comp = -0, normal.z = -0          (npSpherePrimitives-r0)
+//   case 1: capsule0 degenerate, comp = (-c) * (+0) = -0.  CUDA s = -0, normal.z = -0;
+//           s through FClamp gives +0, normal.z = +0                       (npSpherePrimitives-r1)
+//   case 2: b > 0 (capsule1 turned 120 deg about z), tTmp = -0.  CUDA comp = -0, normal.z = -0;
+//           t2 through FClamp gives comp = +0, normal.z = +0                (npSpherePrimitives-r0)
+// All three are valid resting poses (unit quaternions, halfHeight > 0, a -0 position lane).
+PXG_TEST(npCapsuleCollision_capsuleCapsuleZeroSign)
+{
+    const float D = 0.50006103515625f;   // 0.5 + 2^-14
+    const float A = 0.499969482421875f;  // 0.5 - 2^-15
+    const float H = 1.220703125e-4f;     // 2^-13
+    const float Z = 0.8660254f;          // sin 60 deg: q1 = (0,0,Z,0.5) turns capsule1 120 deg about z
+    struct ZCase { XformC x0, x1; CapsuleTest t; int variant; uint32_t cudaNz, twinNz; bool tTmpCase; };
+    const ZCase zc[] = {
+        { { D, 0.75f, -0.0f, 0, 0, 0, -1, 0 }, { -D, -0.75f, 0.0f, 0, 0, 0, 0, 1 },
+          { 1, 1, 1, H, 0, 0, 0, 0 }, 1, 0x00000000u, 0x80000000u, true },
+        { { 1.0f, 0.0f, -0.0f, 0, 0, 0, -1, 0 }, { -1.0f, 0.0f, 0.0f, 0, 0, 0, 0, 1 },
+          { 1, H, 1, 1, 0, 0, 0, 0 }, 2, 0x80000000u, 0x00000000u, false },
+        { { A, 0.75f, -0.0f, 0, 0, 0, -1, 0 }, { -A, -0.75f, 0.0f, 0, 0, 0, Z, 0.5f },
+          { 1, 1, 1, H, 0, 0, 0, 0 }, 1, 0x80000000u, 0x00000000u, true },
+    };
+    const uint32_t N = uint32_t(sizeof(zc) / sizeof(zc[0]));
+    std::vector<XformC> x0(N), x1(N);
+    std::vector<CapsuleTest> tests(N);
+    std::vector<Result> refs(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        x0[i] = zc[i].x0; x1[i] = zc[i].x1; tests[i] = zc[i].t;
+        gTTmpNegZero = gCompNegZero = 0;
+        refs[i] = refCapsuleCapsule(x0[i], x1[i], tests[i]);
+        const size_t hit = zc[i].tTmpCase ? gTTmpNegZero : gCompNegZero;
+        gSegClampVariant = zc[i].variant;
+        const Result twin = refCapsuleCapsule(x0[i], x1[i], tests[i]);
+        gSegClampVariant = 0;
+        std::printf("  [capsuleCapsuleZeroSign] case %u: %s = -0 seen %zu, normal.z cuda=%08x twin%d=%08x (nb %u/%u)\n",
+                    i, zc[i].tTmpCase ? "tTmp" : "comp", hit, f2u(refs[i].normal.z), zc[i].variant,
+                    f2u(twin.normal.z), refs[i].nb, twin.nb);
+        PXG_CHECK_MSG(hit != 0, "case %u no longer drives %s = -0 into its clamp (distanceSegmentSegment.cuh:%d)",
+                      i, zc[i].tTmpCase ? "tTmp" : "comp", zc[i].tTmpCase ? 76 : 81);
+        PXG_CHECK_MSG(refs[i].nb == 1 && twin.nb == 1 && f2u(refs[i].normal.z) == zc[i].cudaNz &&
+                      f2u(twin.normal.z) == zc[i].twinNz,
+                      "case %u: the clamp twin %d no longer flips normal.z (cuda %08x/%08x, twin %08x/%08x)",
+                      i, zc[i].variant, f2u(refs[i].normal.z), zc[i].cudaNz, f2u(twin.normal.z), zc[i].twinNz);
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> outPP(2 * N, F4{ 9, 9, 9, 9 }), outN(N, F4{ 9, 9, 9, 9 });
+    std::vector<uint32_t> outNb(N, 7);
+    PxgBufferHandle b0 = createBufferFrom(dev, x0), b1 = createBufferFrom(dev, x1), bt = createBufferFrom(dev, tests);
+    PxgBufferHandle bpp = createBufferFrom(dev, outPP), bn = createBufferFrom(dev, outN), bnb = createBufferFrom(dev, outNb);
+    struct CapsuleParams { uint32_t numTests; } p = { N };
+    Kernel k("npCapsuleCollision.spv", "capsuleCapsule", { 32, 32, 32, 16, 16, 4 }, sizeof(CapsuleParams));
+    k.dispatch(1, { b0, b1, bt, bpp, bn, bnb }, p); dev->flush();
+    const auto gPP = downloadBuffer<F4>(dev, bpp, 2 * N);
+    const auto gN = downloadBuffer<F4>(dev, bn, N);
+    const auto gNb = downloadBuffer<uint32_t>(dev, bnb, N);
+    // Bitwise wherever the reference is +-0 (every such lane is exact IEEE arithmetic on both
+    // sides, with or without fma contraction), almostEqual elsewhere (rsqrt, sqrt).
+    auto same = [](float g, float r) { return r == 0.f ? f2u(g) == f2u(r) : eq(g, r); };
+    size_t mm = 0, zeroLanes = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const Result& r = refs[i];
+        if (gNb[i] != r.nb) { ++mm; std::printf("  case %u nb gpu=%u ref=%u\n", i, gNb[i], r.nb); continue; }
+        const float gv[7] = { gN[i].x, gN[i].y, gN[i].z, gPP[2 * i].x, gPP[2 * i].y, gPP[2 * i].z, gPP[2 * i].w };
+        const float rv[7] = { r.normal.x, r.normal.y, r.normal.z, r.pt[0].x, r.pt[0].y, r.pt[0].z, r.pen[0] };
+        for (uint32_t l = 0; l < 7; ++l)
+        {
+            if (rv[l] == 0.f) ++zeroLanes;
+            if (!same(gv[l], rv[l]))
+            {
+                ++mm;
+                std::printf("  case %u lane %u gpu=%08x (%g) ref=%08x (%g)\n", i, l, f2u(gv[l]), gv[l], f2u(rv[l]), rv[l]);
+            }
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "capsuleCapsuleZeroSign: %zu mismatches", mm);
+    PXG_CHECK_MSG(zeroLanes >= 3 * N, "capsuleCapsuleZeroSign: only %zu +-0 reference lanes compared bitwise", zeroLanes);
     for (PxgBufferHandle h : { b0, b1, bt, bpp, bn, bnb }) dev->destroyBuffer(h);
 }
 
