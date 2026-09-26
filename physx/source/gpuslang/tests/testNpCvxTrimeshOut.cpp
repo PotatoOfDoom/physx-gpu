@@ -92,12 +92,20 @@ static V3 nrmz(const V3& v)
     return V3{ 0, 0, 0 };
 }
 
+// P9.86: eMIN/eMAX are PxMin/PxMax(float) = intrinsics::selectMin/selectMax (PxsMaterialCombiner.h:43/47/60/64
+// -> PxMath.h:82-101 -> PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand survives.  The oracle
+// spells the selects; std::fmin/std::fmax are not PxMin/PxMax (their zero-tie sign is libm/platform dependent).
+// gCombineVariant is a mutant twin replaying a reverted port: 1 = eMIN as GLSL FMin, 2 = eMAX as FMax, with
+// llvmpipe's zero order under the SZINP stamp (P9.86 F4: FMin(+-0,-+0) = -0, FMax = +0, either operand order).
+static int gCombineVariant = 0;
+static float fminLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fmaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
 static float combineScalars(float a, float b, uint32_t mode)
 {
     if (mode == 0) return 0.5f * (a + b);
-    if (mode == 1) return std::fmin(a, b);
+    if (mode == 1) return (gCombineVariant == 1) ? fminLp(a, b) : ((a < b) ? a : b);   // PxMin = selectMin
     if (mode == 2) return a * b;
-    if (mode == 3) return std::fmax(a, b);
+    if (mode == 3) return (gCombineVariant == 2) ? fmaxLp(a, b) : ((a > b) ? a : b);   // PxMax = selectMax
     return 0.f;
 }
 static void combineMats(const MaterialData& m0, const MaterialData& m1,
@@ -127,7 +135,7 @@ static void combineMats(const MaterialData& m0, const MaterialData& m1,
         const uint32_t mode = std::max(m0.fricMode, m1.fricMode);
         const float d = combineScalars(m0.dynamicFriction, m1.dynamicFriction, mode);
         const float s = combineScalars(m0.staticFriction, m1.staticFriction, mode);
-        const float fd = std::fmax(d, 0.f);
+        const float fd = (d > 0.f) ? d : 0.f;   // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161)
         dynF = fd; staF = (s - fd) >= 0.f ? s : fd;
         matFlags = cf;
     }
@@ -496,7 +504,9 @@ PXG_TEST(cvxTriFinish)
     PxgSlangComputeDevice* dev = testDevice();
 
     std::mt19937 rng(4242001);
-    const uint32_t N = 220, NMAT = 32;
+    // NRAND random cases, then NDIR directed ones (P9.86) that draw nothing from rng, so the random
+    // cases keep their exact inputs.  The directed materials sit at [NMAT, NMAT + NDM).
+    const uint32_t NRAND = 220, NDIR = 6, N = NRAND + NDIR, NMAT = 32, NDM = 7;
     const uint32_t STREAM = 2048;   // per-case slice of each of the three streams
     auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
     auto randQuat = [&]() { float a[4]; float m2 = 0; for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
@@ -528,6 +538,40 @@ PXG_TEST(cvxTriFinish)
         }
     }
 
+    // P9.86 DIRECTED SIGNED-ZERO MATERIALS.  eMIN/eMAX are PxMin/PxMax(float) selects
+    // (PxsMaterialCombiner.h:43/47/60/64, PxUnixMathIntrinsics.h:116-125): a +-0 tie returns the SECOND
+    // operand, so PxMin(-0,+0) = +0 and PxMax(+0,-0) = -0, where GLSL FMin/FMax on llvmpipe give -0 / +0 in
+    // either order (F4).  -0 is a valid material value: NpMaterial only checks finite, <= 1 and >= 0.f, and a
+    // restitution of -0 is rigid (-0 < 0 is false).  The random banks never produce -0 (rf = lo + (hi-lo)*k).
+    // Fields: {dyn, sta, rest, damp, flags, fricMode, restMode, dampMode}; modes 1 = eMIN, 3 = eMAX.
+    {
+        const float PZ = 0.f, NZ = u2f(0x80000000u);
+        const MaterialData dirMats[NDM] = {
+            { PZ, NZ, NZ, NZ, 0, 1, 1, 1 },          // D0  -0 under eMIN
+            { PZ, PZ, PZ, PZ, 0, 1, 1, 1 },          // D1  +0 under eMIN
+            { PZ, PZ, PZ, PZ, 0, 3, 3, 3 },          // D2  +0 under eMAX
+            { PZ, NZ, NZ, NZ, 0, 3, 3, 3 },          // D3  -0 under eMAX
+            { PZ, PZ, -0.5f, PZ, 0, 0, 0, 0 },       // D4  compliant (rest < 0), damping +0
+            { PZ, PZ, NZ, NZ, 0, 0, 0, 0 },          // D5  rigid (rest -0), damping -0
+            { NZ, PZ, PZ, PZ, 0, 0, 0, 0 },          // D6  dynamic friction -0 under eAVERAGE
+        };
+        for (uint32_t j = 0; j < NDM; ++j) mats[NMAT + j] = dirMats[j];
+    }
+    // One no-flip convex/trimesh pair per directed case, one manifold with one contact, counters 0: patch 0
+    // lands at slice word 0, so words 7 / 8 / 9 / 10 are restitution / dynF / staF / damping (cu:70-73).
+    // w7..w10 are the CUDA's bits, computed by hand from PxsCombineMaterials.  killsVariant names the host
+    // twin (gCombineVariant) whose patch image must differ: 1 = the eMIN revert, 2 = the eMAX revert.
+    struct DirCase { uint32_t ma, mb, w7, w8, w9, w10; int killsVariant; };
+    const DirCase dirCases[NDIR] = {
+        { 0, 1, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K0 eMIN(-0,+0): PxMin +0, FMin -0
+        { 2, 3, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K1 eMAX(+0,-0): PxMax -0, FMax +0
+        { 4, 5, 0xBF000000u, 0u, 0x00000000u, 0x80000000u, 2 },   // K2 one compliant: damping forced to eMAX(+0,-0)
+        { 1, 0, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 0 },   // K3 control: eMIN(+0,-0) = -0 in both
+        { 3, 2, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K4 control: eMAX(-0,+0) = +0 in both
+        { 6, 6, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K5 d = 0.5*(-0 + -0) = -0: PxMax(d, 0) keeps dynF +0
+    };
+    size_t cMinTie = 0, cMaxTie = 0;
+
     std::vector<TmoIn> in(N);
     std::vector<TmoOut> ref(N);
     std::vector<uint32_t> maskWord(N, 0xFFFFFFFFu);
@@ -536,6 +580,42 @@ PXG_TEST(cvxTriFinish)
 
     for (uint32_t i = 0; i < N; ++i)
     {
+        if (i >= NRAND)
+        {
+            const DirCase& dc = dirCases[i - NRAND];
+            TmoIn s{};
+            s.hdr = U4{ 1, 0, 0, 0 };
+            s.nbC = U4{ 1, 0, 0, 0 };
+            s.shapeInfo = U4{ T_CONVEX, T_TRIMESH, NMAT + dc.ma, NMAT + dc.mb };
+            s.scaleA = s.scaleB = F4{ 1, 0.5f, 1, 0 };
+            s.tAq = s.tBq = F4{ 0, 0, 0, 1 };
+            s.tAp = F4{ 1, 2, 3, 0 };
+            s.tBp = F4{ 0, 0, 0, 0 };
+            s.contacts[0] = F4{ 0.25f, -0.5f, 1, 0.125f };
+            s.contacts[1] = F4{ 1, 2, -0.5f, u2f(5u) };
+            s.contacts[2] = F4{ 0, 0.6f, 0.8f, 0 };
+            s.cfg = U4{ 64 * 20, 16 * 40, 8 * 40, 0 };
+            s.counters = U4{ 0, 0, 0, 0 };
+            in[i] = s;
+            maskWord[i] = refTrimeshOut(s, mats, ref[i], &patchPoison);
+            PXG_CHECK_MSG(ref[i].outputs.y == 0u && ref[i].patches[1].w == dc.w7 && ref[i].patches[2].x == dc.w8 &&
+                          ref[i].patches[2].y == dc.w9 && ref[i].patches[2].z == dc.w10,
+                          "cvxTriFinish directed %u: oracle rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                          i - NRAND, ref[i].patches[1].w, ref[i].patches[2].x, ref[i].patches[2].y, ref[i].patches[2].z,
+                          dc.w7, dc.w8, dc.w9, dc.w10);
+            for (int v = 1; v <= 2; ++v)
+            {
+                TmoOut tw;
+                gCombineVariant = v;
+                refTrimeshOut(s, mats, tw, &patchPoison);
+                gCombineVariant = 0;
+                const bool differs = std::memcmp(tw.patches, ref[i].patches, sizeof tw.patches) != 0;
+                PXG_CHECK_MSG(differs == (dc.killsVariant == v), "cvxTriFinish directed %u: twin %d %s the image",
+                              i - NRAND, v, differs ? "changes" : "does not change");
+                if (differs) ++(v == 1 ? cMinTie : cMaxTie);
+            }
+            continue;
+        }
         TmoIn s{};
         const uint32_t nbMan = (i % 13 == 0) ? 0u : (1 + rng() % 4);
         const bool insertAvg = (rng() % 5) < 2;
@@ -631,7 +711,7 @@ PXG_TEST(cvxTriFinish)
     std::vector<uint32_t> forceStream(N * (STREAM / 4), 0u);
     std::vector<uint32_t> matBuf(mats.size() * 6, 0u);   // PxsMaterialData, 24 B (both banks)
 
-    for (uint32_t m = 0; m < uint32_t(mats.size()); m = (m + 1 == NMAT) ? 0x10000u : m + 1)
+    for (uint32_t m = 0; m < uint32_t(mats.size()); m = (m + 1 == NMAT + NDM) ? 0x10000u : m + 1)
     {
         uint32_t* w = &matBuf[m * 6];
         std::memcpy(&w[0], &mats[m].dynamicFriction, 4);
@@ -855,12 +935,13 @@ PXG_TEST(cvxTriFinish)
                 const uint32_t* g = &ps[po / 4 + w * 4];
                 if (g[0] != e.x || g[1] != e.y || g[2] != e.z || g[3] != e.w)
                 {
-                    // patch words 1 and 2 carry floats: allow the float slack the
-                    // scalar test allows, exact for the rest.
-                    const bool floaty = (w % 4 == 1) || (w % 4 == 2);
-                    if (!floaty || !eqF(u2f(g[0]), u2f(e.x)) || !eqF(u2f(g[1]), u2f(e.y)) ||
-                        !eqF(u2f(g[2]), u2f(e.z)) ||
-                        ((w % 4 == 1) ? !eqF(u2f(g[3]), u2f(e.w)) : (g[3] != e.w)))
+                    // Only the rotated normal (word 1 xyz) gets the scalar test's float
+                    // slack.  Restitution (1.w) and dynF/staF/damping (2.xyz) come out of
+                    // exact selects, 0.5*(a+b) and a*b, so they compare BITWISE, the sign
+                    // of zero included (P9.86; eqF(+0,-0) would pass either sign).
+                    const bool normalWord = (w % 4 == 1);
+                    if (!normalWord || !eqF(u2f(g[0]), u2f(e.x)) || !eqF(u2f(g[1]), u2f(e.y)) ||
+                        !eqF(u2f(g[2]), u2f(e.z)) || g[3] != e.w)
                     { ++mmPatch; break; }
                 }
             }
@@ -894,6 +975,19 @@ PXG_TEST(cvxTriFinish)
                 if (fs[fo / 4 + w] != e) { ++mmFace; break; }
             }
     }
+
+    // P9.86: the directed cases' material words straight against the CUDA's bits (counters start at 0,
+    // so patch 0 sits at slice word 0), independent of the oracle.
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        const uint32_t* ps = &gPS[(NRAND + k) * (STREAM / 4)];
+        const DirCase& dc = dirCases[k];
+        PXG_CHECK_MSG(ps[7] == dc.w7 && ps[8] == dc.w8 && ps[9] == dc.w9 && ps[10] == dc.w10,
+                      "cvxTriFinish directed %u: rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                      k, ps[7], ps[8], ps[9], ps[10], dc.w7, dc.w8, dc.w9, dc.w10);
+    }
+    PXG_CHECK_MSG(cMinTie == 1 && cMaxTie == 2,
+                  "cvxTriFinish: signed-zero combine coverage thin (minTie %zu maxTie %zu)", cMinTie, cMaxTie);
 
     for (PxgBufferHandle h : { bPairs, bCache, bShapes, bInputs, bOut, bMan, bCtr, bTouch,
                                bPatchChg, bPS, bCS, bFS, bMat })
