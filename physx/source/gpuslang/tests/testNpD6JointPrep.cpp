@@ -117,6 +117,14 @@ namespace d6ref
 // `0 - t0` that llvmpipe folds to a negate).  The fixture searches for inputs on
 // which the two differ, so the -0 the negate produces is actually observed.
 static int gErrVecVariant = 0;
+// P9.86 mutant twin: 1 replays the old port's distance-limit limitDir.  In
+// `limitDir = 0; for (i < 3) if (limited X+i) limitDir += amc[i] * cB2cAp[i]`
+// llvmpipe unrolls the constant-trip loop and forwards the literal +0 seed into
+// the i == 0 add (x + 0 -> x), so a -0 product lane (+0 * negative cB2cAp.x)
+// survives where the CUDA's `PxVec3(0) += ...` (constraintBlockPrePrep.cu:683-689)
+// gives +0.  Only X-limited cases are directed, so the twin models just the
+// i == 0 fold that is certain.
+static int gLimitDirVariant = 0;
 const float FLT_MAXQ = 3.402823466e+38f;
 
 const uint32_t E_SPRING = 1, E_ACCELERATION_SPRING = 2, E_RESTITUTION = 4, E_KEEPBIAS = 8,
@@ -631,7 +639,8 @@ void solverPrep(const D6In& s, D6Out& o)
             for (uint32_t i = 0; i < 3; ++i)
             {
                 if (limited & (1u << i))
-                    limitDir = add(limitDir, mul(am[i], pc[i]));
+                    limitDir = (gLimitDirVariant == 1 && i == 0u) ? mul(am[i], pc[i])
+                                                                  : add(limitDir, mul(am[i], pc[i]));
             }
             const float distance = std::sqrt(dot3(limitDir, limitDir));
             if (distance > s.linVel.w)
@@ -882,9 +891,9 @@ static bool genFixture(std::mt19937& rng, uint32_t i, D6In& s)
 PXG_TEST(npD6JointPrep_prep)
 {
     std::mt19937 rng(174001);
-    const uint32_t D6_ZS_CASES = 24;
-    const uint32_t N = 4000 + D6_ZS_CASES;
-    size_t cZeroMinusSeen = 0;
+    const uint32_t D6_BASE = 4000, D6_ZS_CASES = 24, D6_LD_CASES = 6;
+    const uint32_t N = D6_BASE + D6_ZS_CASES + D6_LD_CASES;
+    size_t cZeroMinusSeen = 0, cLimitDirSeen = 0;
 
     std::vector<D6In> in(N);
     std::vector<D6Out> ref(N);
@@ -895,7 +904,41 @@ PXG_TEST(npD6JointPrep_prep)
     for (uint32_t i = 0; i < N; ++i)
     {
         D6In s{};
-        const bool hard = genFixture(rng, i, s);
+        bool hard = genFixture(rng, i, s);
+        if (i >= D6_BASE + D6_ZS_CASES)
+        {
+            // P9.86 directed (npD6JointPrep.slang limitDir select): an unrotated
+            // frame A gives amc0 = (1,+0,+0), amc1 = (+0,1,+0), amc2 = (+0,+0,1);
+            // B on the negative X side makes the first product's off-axis lanes
+            // +0 * negative = -0.  The CUDA's `PxVec3(0) += ...` gives +0 there;
+            // the folded seed keeps -0, which lin0/lin1 (and ang1 = mRb x axis)
+            // carry into the bitwise-compared rows.  Trig-free, one hard row.
+            //   k 0,1: X limited,   B at (-1, 0.3, 0.2)     -> lanes y, z
+            //   k 2,3: X|Y limited, B at (-1, -0.5, 0.2)    -> lane z (-0 + -0)
+            //   k 4,5: X|Z limited, B at (-0.8, 0.4, -0.6)  -> lane y (-0 + -0)
+            const uint32_t k = i - (D6_BASE + D6_ZS_CASES);
+            static const F4 bB[3] = { { -1.0f, 0.3f, 0.2f, 0 }, { -1.0f, -0.5f, 0.2f, 0 },
+                                      { -0.8f, 0.4f, -0.6f, 0 } };
+            static const uint32_t lim[3] = { 1u, 3u, 5u };
+            const F4 idq{ 0, 0, 0, 1 };
+            s.c2bAq = s.c2bBq = s.bA2wq = s.bB2wq = idq;
+            s.c2bAp = F4{ 0, 0, 0, asF(k & 1u) };          // both extended-limit picks
+            s.c2bBp = F4{ 0, 0, 0, asF(1u) };              // distance limit only
+            s.bA2wp = F4{ 0, 0, 0, asF(0u) };              // nothing locked
+            s.bB2wp = F4{ bB[k / 2].x, bB[k / 2].y, bB[k / 2].z, asF(lim[k / 2]) };
+            s.drvPp.w = asF(0u);                           // nothing driven
+            s.linVel.w = 1e-6f;                            // distanceMinDist
+            s.distP = F4{ 0.0f, 0.5f, 0.0f, 0.0f };        // hard: the row is always emitted
+            s.distV = F4{ (k & 1u) ? 0.5f : 1.5f, 0, 0, 0 };  // both signs of the error
+            hard = true;
+            D6Out a, b;
+            d6ref::solverPrep(s, a);
+            d6ref::gLimitDirVariant = 1;
+            d6ref::solverPrep(s, b);
+            d6ref::gLimitDirVariant = 0;
+            if (a.counts.y == 0 && a.counts.x == 1 && std::memcmp(&a, &b, sizeof(a)) != 0)
+                ++cLimitDirSeen;
+        }
         if (hard) ++cHard; else ++cSoft;
 
         const uint32_t locked = f2u(s.bA2wp.w);
@@ -906,7 +949,7 @@ PXG_TEST(npD6JointPrep_prep)
 
         in[i] = s;
         d6ref::solverPrep(s, ref[i]);
-        if (i >= N - D6_ZS_CASES)
+        if (i >= D6_BASE && i < D6_BASE + D6_ZS_CASES)
         {
             // P9.86 directed cases: signed-zero poses on which `0 - t0` and `-t0`
             // give different bits (see d6ZeroMinus).  Searched on the host with
@@ -1049,6 +1092,10 @@ PXG_TEST(npD6JointPrep_prep)
     // measured: 7 of the 24 directed slots find such a pose within the try budget
     PXG_CHECK_MSG(cZeroMinusSeen >= 4,
                   "too few cases where the errorVector's zero sign is observable: %zu", cZeroMinusSeen);
+    std::printf("[ info ] d6 P9.86 limitDir zero-seed cases (folded seed differs): %zu\n",
+                cLimitDirSeen);
+    PXG_CHECK_MSG(cLimitDirSeen == D6_LD_CASES,
+                  "limitDir zero-seed cases not observable: %zu of %u", cLimitDirSeen, D6_LD_CASES);
     PXG_CHECK_MSG(mm == 0, "d6jPrep: %zu mismatches", mm);
     PXG_CHECK_MSG(unstable <= 8, "d6jPrep: %zu trig-unstable cases (cap 8)", unstable);
     if (unstable)
