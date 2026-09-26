@@ -112,10 +112,23 @@ trap 'echo; echo "!! interrupted -- restoring pristine source and .spv"; restore
 : "${MUTATION_SWEEP_TIMEOUT:=300}"
 TIMEOUT_RC=124   # what GNU coreutils `timeout` exits with when it fires
 
+# <test-suite> may be a COMMA-SEPARATED list of bare PXG_TEST filters (P9.86c): a shader
+# driven by several fixtures is measured against all of them, and a mutant dies if any
+# one fails.  The rc is the worst of the runs (a timeout or crash wins over a failure).
 run_suite() {
-    ( cd "$BUILD" && PXG_SHADER_DIR="$BUILD/shaders" \
-        timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$SUITE" 2>&1 )
+    worst=0
+    for s in $(echo "$SUITE" | tr ',' ' '); do
+        ( cd "$BUILD" && PXG_SHADER_DIR="$BUILD/shaders" \
+            timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$s" 2>&1 )
+        r=$?
+        if [ $r -eq $TIMEOUT_RC ] || [ $r -ge 128 ]; then worst=$r
+        elif [ $r -ne 0 ] && [ $worst -eq 0 ]; then worst=$r; fi
+    done
+    return $worst
 }
+# "N test(s) ran, M failed": green only if no run reports a NON-ZERO M.  (The old
+# `grep "0 failed"` also matched "10 failed" -- a false survivor, never a false kill.)
+all_green() { echo "$1" | grep -q "test(s) ran" && ! echo "$1" | grep -Eq ", [1-9][0-9]* failed"; }
 
 # A CRASH THAT DOES NOT REPRODUCE IS NOT EVIDENCE.  Added in P9.29.
 #
@@ -176,7 +189,7 @@ baseline_ok() {
         echo "   PXG_TEST name, not the ctest name (no 'gpuslang.' prefix)." >&2
         return 1
     fi
-    echo "$out" | grep -q "0 failed" && echo "$out" | grep -q "test(s) ran"
+    all_green "$out"
 }
 
 restore
@@ -224,7 +237,7 @@ PY
         echo "!! '$name' left the suite matching NO test -- aborting rather than" >&2
         echo "   counting an unmeasured mutant as a survivor" >&2
         restore; rm -f "$BAK"; exit 1
-    elif echo "$out" | grep -q "0 failed"; then
+    elif all_green "$out"; then
         echo "SURVIVED      $name"; survived=$((survived+1))
     else
         echo "KILLED        $name"; killed=$((killed+1))
