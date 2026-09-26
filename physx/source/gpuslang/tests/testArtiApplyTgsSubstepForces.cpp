@@ -402,11 +402,9 @@ PXG_TEST(artiApplyTgsSubstepForces)
         {
             if (w[x] == g[x])
                 continue;
+            // STRICT (P9.86c): counted apart for the info line, still a mismatch
             if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-            {
                 ++signedZeros;
-                continue;
-            }
             if (bad < 12)
                 std::printf("MM ats %s word %zu  ref %08x  gpu %08x\n", what, x, w[x], g[x]);
             ++bad;
@@ -418,7 +416,7 @@ PXG_TEST(artiApplyTgsSubstepForces)
     // the records are READ-only for this kernel: byte-identical round trip
     cmp("record", recImg.data(), gotRec.data(), recBytes);
 
-    std::printf("[ info ] ats: signed zeros %zu\n", signedZeros);
+    std::printf("[ info ] ats: signed-zero mismatches %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "the substep forces do not match the mirror bit for bit");
 
     shim.memFree(dAb);

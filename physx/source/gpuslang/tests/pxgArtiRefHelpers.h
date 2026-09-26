@@ -54,6 +54,9 @@
 #include "DyFeatherstoneArticulation.h"
 #include "PxgArticulation.h"
 
+#include <cstdint>
+#include <cstring>
+
 namespace pxgtest
 {
 // constructSkewSymmetricMatrix (forwardDynamic2.cu:1561).  A permutation of r's
@@ -556,6 +559,19 @@ inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
     }
 }
 
+// P9.86c: propagateImpulseW<WriteToDeferredQstZ> with jointForce == NULL is
+// `stZ = 0.0f - sas.innerProduct(Z)` (articulationDynamic.cuh:143-144): +0 for
+// EITHER zero dual product.  gAiNullJfNegDot is the mutant twin -- the preloaded
+// `-dot` of propagateImpulseW_everythingPreLoaded, i.e. the port's pre-P9.86
+// adPropagateImpulseW call in aiAverageAndPropagate{Ex,2} and the pre-P9.86c
+// artiPushImpulse hop (adPropagateImpulseWJf with hasJf = false, whose inlined
+// literal-zero OpFSub llvmpipe rewrites to `-dot`) -- which gives -0 at a
+// +0 dot.  gAiPosZeroDotHits counts the hops whose dual product is exactly +0,
+// the only input on which the two spellings differ.  Defaults keep every user
+// of this hop bit-identical.
+inline bool gAiNullJfNegDot = false;
+inline PxU32 gAiPosZeroDotHits = 0;
+
 inline UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
                                                  physx::PxgArticulationBlockDofData* dofData,
                                                  const UnAlignedSpatialVector& Z, PxU32 dofCount,
@@ -569,7 +585,14 @@ inline UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
             const UnAlignedSpatialVector sas = loadSpatialVector(dofData[ind].mWorldMotionMatrix,
                                                                  lane);
             const UnAlignedSpatialVector isInvD = loadSpatialVector(dofData[ind].mIsInvDW, lane);
-            const PxReal stZ = 0.0f - sas.innerProduct(Z);
+            const PxReal dot = sas.innerProduct(Z);
+            {
+                uint32_t b;
+                std::memcpy(&b, &dot, 4);
+                if (b == 0u)
+                    ++gAiPosZeroDotHits;
+            }
+            const PxReal stZ = gAiNullJfNegDot ? -dot : 0.0f - dot;
             dofData[ind].mDeferredQstZ[lane] += stZ;
             temp += isInvD * stZ;
         }

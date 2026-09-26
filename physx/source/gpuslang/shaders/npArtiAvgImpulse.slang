@@ -606,7 +606,7 @@ void aiAvg2Test(uint3 dispatchThreadId : SV_DispatchThreadID)
 //     order loses every grandchild contribution.
 //  4. The propagate is the TEMPLATE propagateImpulseW<WriteToDeferredQstZ>
 //     with jointForce == NULL, i.e. the `0.0f - dot` spelling
-//     (adPropagateImpulseWJf with hasJf = false), not the preloaded `-dot`.
+//     (aiPropagateImpulseWNullJf since P9.86c), not the preloaded `-dot`.
 //  5. Each link's mScratchImpulse is zeroed AFTER propagating; the parent
 //     target comes from mParents, not index - 1.
 //  6. The root tail runs only for a FREE base (eFIX_BASE is bit 0 with
@@ -673,13 +673,11 @@ void artiPushImpulse(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
         AbSpatialVector isInvD[3];
         AbSpatialVector motionMatrix[3];
         float qstZ[3];
-        float jfNone[3];
         for (uint ind = 0u; ind < 3u; ++ind)
         {
             isInvD[ind] = AI_ZERO;
             motionMatrix[ind] = AI_ZERO;
             qstZ[ind] = 0.0f;
-            jfNone[ind] = 0.0f;
             if (ind < dofCount)
             {
                 const uint64_t dd = dofData + uint64_t(ind) * PXG_AB_DOF_SIZE;
@@ -689,10 +687,14 @@ void artiPushImpulse(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
             }
         }
 
-        // trap 4: the NULL-jointForce template spelling
+        // trap 4: the NULL-jointForce template spelling, `0.0f - dot`
+        // (forwardDynamic2.cu:4184-4186 -> articulationDynamic.cuh:143-144).
+        // P9.86c port fix: adPropagateImpulseWJf(..., hasJf = false) inlines to a
+        // literal-zero OpFSub that llvmpipe rewrites to `-dot` (-0 at a +0 dot;
+        // testArtiPushImpulse's resting fixed-base pair saw it in the root
+        // scratch), so the select-spelled aiPropagateImpulseWNullJf is used.
         const AbSpatialVector propagatedZ =
-            adPropagateImpulseWJf(isInvD, rw, motionMatrix, Z, dofCount, qstZ, jfNone, 1.0f,
-                                  false);
+            aiPropagateImpulseWNullJf(isInvD, rw, motionMatrix, Z, dofCount, qstZ);
 
         for (uint ind = 0u; ind < 3u; ++ind)
             if (ind < dofCount)

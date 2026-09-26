@@ -50,7 +50,17 @@
 //   * mRootDeferredZ seeded with LARGE distinct values (the P8.97c poison
 //     lesson): it must survive fixed-base and clean lanes and be OVERWRITTEN
 //     (not accumulated) on free dirty lanes;
-//   * two warp slices, 40 live articulations, guard lanes past the end.
+//   * two warp slices, 41 live articulations, guard lanes past the end;
+//   * P9.86c, articulation PI_REST_ARTI: a RESTING fixed-base two-link
+//     articulation.  Root and link 1 hold six -0 scratch words (rigidDeltaAccum
+//     .cu:384's `-impulse` for a zero-impulse contact) and link 1 is a 1-dof
+//     revolute joint about world -Z (motion (0,0,-1 | 0,0,0)), so its dual
+//     product against the all -0 Z is exactly +0.  propagateImpulseW with a
+//     NULL jointForce (forwardDynamic2.cu:4184-4186 -> articulationDynamic.cuh
+//     :143-144) gives stZ = 0.0f - (+0) = +0, the preloaded `-dot` gives -0;
+//     isInvD of mixed sign carries that into the root's scratch, which a FIXED
+//     base never zeroes: (+0,-0,+0 | +0,+0,+0) against (-0,+0,-0 | -0,+0,+0).
+//     The host twin pxgref::gAiNullJfNegDot must reproduce that split.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -87,7 +97,8 @@ static std::vector<uint8_t> artiPushLoader(const char* file) { return loadShader
 // The fixture's shape (the P8.105 geometry, new seeds)
 // ---------------------------------------------------------------------------
 
-const uint32_t PI_NB_ARTI = 40;
+const uint32_t PI_NB_ARTI = 41;
+const uint32_t PI_REST_ARTI = 40;   // P9.86c: the resting fixed-base pair (see the header)
 const uint32_t PI_NB_WARPS = 2;
 const uint32_t PI_MAX_LINKS = 7;
 const uint32_t PI_MAX_DOFS = 15;
@@ -101,7 +112,7 @@ const uint32_t PI_D_MAX_LINKS = 248;
 const uint32_t PI_D_MAX_DOFS = 252;
 const uint32_t PI_DESC_SIZE = 360;
 
-static uint32_t piNumLinks(uint32_t k) { return 1u + (k % 7u); }
+static uint32_t piNumLinks(uint32_t k) { return (k == PI_REST_ARTI) ? 2u : 1u + (k % 7u); }
 static bool piFixBase(uint32_t k) { return (k % 3u) == 1u; }
 static uint32_t piDirty(uint32_t k) { return (k + 2u) % 4u; }   // shifted vs P8.105
 static uint32_t piFlags(uint32_t k)
@@ -188,6 +199,23 @@ static void piFill(physx::PxgArticulationBlockData* ab,
             storeSpatialVector(d.mWorldMotionMatrix, piSV(k, 400u + slot * 6u), lane);
             d.mDeferredQstZ[lane] = pi(k, 500u + slot);
         }
+    }
+
+    if (k == PI_REST_ARTI)
+    {
+        const UnAlignedSpatialVector negZero(PxVec3(-0.0f, -0.0f, -0.0f),
+                                             PxVec3(-0.0f, -0.0f, -0.0f));
+        storeSpatialVector(lk[0].mScratchImpulse, negZero, lane);
+        storeSpatialVector(lk[1].mScratchImpulse, negZero, lane);
+        physx::PxgArticulationBlockDofData& d = df[lk[1].mJointOffset[lane]];
+        storeSpatialVector(d.mWorldMotionMatrix,
+                           UnAlignedSpatialVector(PxVec3(0.0f, 0.0f, -1.0f), PxVec3(0.0f, 0.0f, 0.0f)),
+                           lane);
+        storeSpatialVector(d.mIsInvDW,
+                           UnAlignedSpatialVector(PxVec3(0.75f, -0.5f, 0.25f),
+                                                  PxVec3(0.125f, -0.375f, 0.625f)),
+                           lane);
+        d.mDeferredQstZ[lane] = 0.0f;   // freshly zeroed (forwardDynamic2.cu:97)
     }
 
     // the root's 6x6 response matrix, dense and non-symmetric
@@ -279,6 +307,9 @@ PXG_TEST(artiPushImpulse)
         PXG_CHECK_MSG(nSingleDirty > 0, "no dirty single-link lane");
         PXG_CHECK_MSG(nBranch > 2, "no re-parented link");
         PXG_CHECK_MSG(nOffsetDiffers > 8, "the reversed windows collapse onto the cursor");
+        PXG_CHECK_MSG(piFixBase(PI_REST_ARTI) && piDirty(PI_REST_ARTI) != 0u &&
+                          piNumLinks(PI_REST_ARTI) == 2u && piDofs(PI_REST_ARTI, 1) == 1u,
+                      "the resting articulation is not a dirty fixed-base one-dof pair");
     }
 
     const size_t abBytes = size_t(PI_NB_WARPS) * sizeof(physx::PxgArticulationBlockData);
@@ -304,11 +335,55 @@ PXG_TEST(artiPushImpulse)
     std::vector<physx::PxgArticulationBlockData> wantAb = abImg;
     std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
     std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
+    pxgref::gAiPosZeroDotHits = 0;
     for (uint32_t k = 0; k < PI_NB_ARTI; ++k)
     {
         const uint32_t w = k / 32u, lane = k % 32u;
         piMirror(&wantAb[w], &wantLk[size_t(w) * PI_MAX_LINKS], &wantDf[size_t(w) * PI_MAX_DOFS],
                  lane);
+    }
+    const uint32_t posZeroDotHits = pxgref::gAiPosZeroDotHits;
+
+    // P9.86c: the `-dot` twin over the same INPUTS must split the resting
+    // articulation's root scratch exactly as derived in the header.
+    {
+        std::vector<physx::PxgArticulationBlockData> twAb = abImg;
+        std::vector<physx::PxgArticulationBlockLinkData> twLk = lkImg;
+        std::vector<physx::PxgArticulationBlockDofData> twDf = dfImg;
+        pxgref::gAiNullJfNegDot = true;
+        for (uint32_t k = 0; k < PI_NB_ARTI; ++k)
+        {
+            const uint32_t w = k / 32u, lane = k % 32u;
+            piMirror(&twAb[w], &twLk[size_t(w) * PI_MAX_LINKS], &twDf[size_t(w) * PI_MAX_DOFS],
+                     lane);
+        }
+        pxgref::gAiNullJfNegDot = false;
+        size_t twinWords = 0;
+        auto diffWords = [&](const void* a, const void* b, size_t bytes) {
+            const uint32_t* x = reinterpret_cast<const uint32_t*>(a);
+            const uint32_t* y = reinterpret_cast<const uint32_t*>(b);
+            for (size_t i = 0; i < bytes / 4; ++i) twinWords += (x[i] != y[i]) ? 1u : 0u;
+        };
+        diffWords(wantAb.data(), twAb.data(), abBytes);
+        diffWords(wantLk.data(), twLk.data(), lkBytes);
+        diffWords(wantDf.data(), twDf.data(), dfBytes);
+        const uint32_t rw = PI_REST_ARTI / 32u, rl = PI_REST_ARTI % 32u;
+        const UnAlignedSpatialVector a =
+            loadSpatialVector(wantLk[size_t(rw) * PI_MAX_LINKS].mScratchImpulse, rl);
+        const UnAlignedSpatialVector b =
+            loadSpatialVector(twLk[size_t(rw) * PI_MAX_LINKS].mScratchImpulse, rl);
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        std::printf("[ info ] pi: +0 dual products %u; -dot twin changes %zu words; resting root "
+                    "scratch top %08x %08x %08x bottom.x %08x (twin %08x %08x %08x / %08x)\n",
+                    posZeroDotHits, twinWords, bits(a.top.x), bits(a.top.y), bits(a.top.z),
+                    bits(a.bottom.x), bits(b.top.x), bits(b.top.y), bits(b.top.z), bits(b.bottom.x));
+        PXG_CHECK_MSG(posZeroDotHits > 0, "no +0 dual product reached the push hop");
+        PXG_CHECK_MSG(twinWords == 4 && bits(a.top.x) == 0x00000000u && bits(a.top.y) == 0x80000000u &&
+                          bits(a.top.z) == 0x00000000u && bits(a.bottom.x) == 0x00000000u &&
+                          bits(b.top.x) == 0x80000000u && bits(b.top.y) == 0x00000000u &&
+                          bits(b.top.z) == 0x80000000u && bits(b.bottom.x) == 0x80000000u,
+                      "resting articulation no longer separates `0 - dot` from `-dot` (%zu words)",
+                      twinWords);
     }
 
     PxgDevicePtr dAb = 0, dLk = 0, dDf = 0, dDesc = 0;
@@ -353,9 +428,9 @@ PXG_TEST(artiPushImpulse)
     shim.memcpyDtoH(gotLk.data(), dLk, lkBytes);
     shim.memcpyDtoH(gotDf.data(), dDf, dfBytes);
 
-    // bit for bit, with the counted signed-zero pair (P8.84) tolerated: the
-    // 6x6 product accumulates from a literal-zero seed (the P8.86/P8.91a
-    // driver fold)
+    // bit for bit, the sign of zero included (P9.86c: the P8.84 signed-zero
+    // tolerance is gone -- the 6x6 product's literal-zero seed is spelled as
+    // the IEEE select in asmM6MulVec since P9.86)
     size_t bad = 0, signedZeros = 0;
     auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
         const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
@@ -364,11 +439,9 @@ PXG_TEST(artiPushImpulse)
         {
             if (w[x] == g[x])
                 continue;
+            // STRICT (P9.86c): counted apart for the info line, still a mismatch
             if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-            {
                 ++signedZeros;
-                continue;
-            }
             if (bad < 12)
                 std::printf("MM pi %s word %zu  ref %08x  gpu %08x\n", what, x, w[x], g[x]);
             ++bad;
@@ -378,7 +451,7 @@ PXG_TEST(artiPushImpulse)
     cmp("link", wantLk.data(), gotLk.data(), lkBytes);
     cmp("dof", wantDf.data(), gotDf.data(), dfBytes);
 
-    std::printf("[ info ] pi: signed zeros %zu\n", signedZeros);
+    std::printf("[ info ] pi: signed-zero mismatches %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "the pushed impulses do not match the mirror bit for bit");
 
     shim.memFree(dAb);
