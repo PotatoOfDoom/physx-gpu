@@ -310,6 +310,34 @@ PXG_TEST(artiJointPrepPgs)
         }
     }
 
+    // ---- P9.86c: -0 link cfms, the zero tie of cfm = PxMax(b0.cfm, b1.cfm) ----
+    // PxMax<float> (artiConstraintPrep2.cu:1758) is selectMax a>b?a:b: a {+0,-0}
+    // tie keeps b1.  A link with cfmScale -0.0f (setCfmScale checks cfmScale >= 0,
+    // NpArticulationLink.cpp:329, which -0 passes) has cfms[] = invMass * (-0 *
+    // invLengthScale) = -0 (forwardDynamic2.cu:391/394/421/424); a rigid, kinematic
+    // or static b0 has cfm = 0.f (cu:131).  The CUDA stores -0 into
+    // jointHeader->cfm, the pre-P9.86 port's stamped FMax stored +0.  The B link of
+    // every lane < 8 with a rigid A gets -0: links 14, 1 (warp 0) and 0, 26
+    // (warp 3) -> 7 (+0,-0) lanes (warp 0 lanes 1,5,13,17,25; warp 3 lanes 2,6),
+    // plus (-0,+0) and (-0|pos) lanes on which both spellings agree.
+    uint32_t negCfmLinks = 0;
+    for (uint32_t w = 0; w < AJP_LIVE_WARPS; ++w)
+    {
+        const PxgBlockConstraintBatch& b = batches[AJP_BATCH_IDX[w] + AJP_RIGID_OFFSET];
+        for (uint32_t l = 0; l < 8u && l < b.mDescStride; ++l)
+        {
+            const PxNodeIndex nA = b.bodyANodeIndex[l];
+            const PxNodeIndex nB = b.bodyBNodeIndex[l];
+            if (!nA.isArticulation() && nB.isArticulation())
+            {
+                float& c = cfms[linkBases[b.remappedBodyBIndex[l]] + nB.articulationLinkId()];
+                if (!std::signbit(c)) negCfmLinks++;
+                c = -0.0f;   // cfmScale = -0.0f
+            }
+        }
+    }
+    PXG_CHECK_MSG(negCfmLinks == 4u, "-0 cfm links (%u)", negCfmLinks);
+
     // ---- the joint prep pools ----
     std::vector<PxgBlockConstraint1DData> cdata(AJP_NB_PREP);
     std::vector<PxgBlockConstraint1DVelocities> rvel(AJP_NB_PREP * AJP_MAX_ROWS);
@@ -493,6 +521,8 @@ PXG_TEST(artiJointPrepPgs)
     std::memset(wantR.data(), 0xAB, wantR.size() * sizeof(wantR[0]));
 
     uint32_t skippedRows = 0, tieLanes = 0, kinLanes = 0, zeroRowLanes = 0;
+    uint32_t cfmNeg0Lanes = 0, cfmTwinDiffLanes = 0;
+    auto fbits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
     for (uint32_t w = 0; w < AJP_LIVE_WARPS; ++w)
     {
         const PxgBlockConstraintBatch& b = batches[AJP_BATCH_IDX[w] + AJP_RIGID_OFFSET];
@@ -556,7 +586,11 @@ PXG_TEST(artiJointPrepPgs)
 
             // setUpArti1DConstraintBlock PGS (:1424)
             const float erp = 1.0f;
-            const float cfm = PxMax(b0.cfm, b1.cfm);
+            const float cfm = PxMax(b0.cfm, b1.cfm);   // selectMax (cu:1758)
+            // P9.86c: the mutant twin -- the pre-P9.86 port's FMax (llvmpipe: +0 for
+            // any {+0,-0} tie) -- must differ on the directed lanes
+            if (fbits(cfm) == 0x80000000u) cfmNeg0Lanes++;
+            if (fbits(cfm) != fbits(acpLpFMax(b0.cfm, b1.cfm))) cfmTwinDiffLanes++;
             uint32_t outCount = 0;
             for (uint32_t r = 0; r < numRows; ++r)
             {
@@ -694,6 +728,10 @@ PXG_TEST(artiJointPrepPgs)
     PXG_CHECK_MSG(tieLanes >= 1, "solveHint-tie coverage");
     PXG_CHECK_MSG(kinLanes >= 1, "kinematic coverage");
     PXG_CHECK_MSG(zeroRowLanes >= 1, "zero-row coverage");
+    std::printf("  ajpPgs cfm zero tie: -0 lanes %u, FMax-twin lanes %u\n", cfmNeg0Lanes,
+                cfmTwinDiffLanes);
+    PXG_CHECK_MSG(cfmNeg0Lanes == 7u, "cfm PxMax(+0,-0) = -0 coverage (%u lanes)", cfmNeg0Lanes);
+    PXG_CHECK_MSG(cfmTwinDiffLanes == 7u, "cfm FMax-twin coverage (%u lanes)", cfmTwinDiffLanes);
 
     // ---- launch: 3 blocks x 64 = 6 warps, 4 live ----
     struct Params { uint64_t prepDesc, sharedDesc; } prm = { uint64_t(dPrep), uint64_t(dShared) };
@@ -703,19 +741,14 @@ PXG_TEST(artiJointPrepPgs)
     shim.streamSynchronize();
 
     // ---- compare ----
-    size_t bad = 0, signedZeros = 0;
+    size_t bad = 0;
     auto cmp = [&](PxgDevicePtr dp, const void* wantp, size_t nsz, const char* tag) {
         std::vector<uint32_t> got(nsz / 4);
         shim.memcpyDtoH(got.data(), dp, nsz);
         const uint32_t* wv = reinterpret_cast<const uint32_t*>(wantp);
         for (size_t k = 0; k < got.size(); ++k)
-            if (wv[k] != got[k])
+            if (wv[k] != got[k])   // BITWISE: the sign of zero included (P9.86c)
             {
-                if ((wv[k] & 0x7FFFFFFFu) == 0u && (got[k] & 0x7FFFFFFFu) == 0u)
-                {
-                    ++signedZeros;
-                    continue;
-                }
                 if (bad < 12)
                     std::printf("MM ajpPgs %s word %zu (lane %zu)  ref %08x  gpu %08x\n",
                                 tag, k, k % 32, wv[k], got[k]);
@@ -726,7 +759,6 @@ PXG_TEST(artiJointPrepPgs)
     cmp(dC, wantC.data(), wantC.size() * sizeof(wantC[0]), "cons");
     cmp(dM, wantM.data(), wantM.size() * sizeof(wantM[0]), "mods");
     cmp(dR, wantR.data(), wantR.size() * sizeof(wantR[0]), "responses");
-    std::printf("  ajpPgs +-0 tolerated %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 
     for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
