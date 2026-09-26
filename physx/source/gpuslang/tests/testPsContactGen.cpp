@@ -42,6 +42,13 @@
 // NoContraction, so the separately-rounded quatRotate + plane-distance chain is
 // bitwise reproducible).  The six radix staging arrays and the counter are
 // checked too.
+//
+// P9.86c: the same rig also runs particles resting EXACTLY on the plane
+// through the origin, with y = -0 (a negated zero) and restDistance +0.  The
+// CUDA's plane offset is PxPlane::transform's `d - p.dot(n)` with d = 0
+// (PxPlane.h:137, cudaParticleSystem.cu:285), an IEEE `0 - x` that is +0 for
+// either zero, so dist = (-0) + (+0) = +0 and the stored pen is +0.  A unary
+// minus would give -0 + -0 = -0.  The CPU mirror spells the CUDA's `0 - x`.
 
 #include "pxgTestFramework.h"
 #include "pxgGridCalRef.h"
@@ -282,7 +289,13 @@ static float particleY(uint32_t i) { return -0.45f + 0.037f * float(i); }
 static float restDistanceFor(uint32_t j) { return 0.001f * float(j + 1u); }
 } // namespace psgrid
 
-static void runPlaneContact(bool isTGS)
+// particlePosIn / planePIn: the particle's sorted origin position and the plane
+// pose's translation.  approxPen: the tolerant sanity value of the penetration.
+// expectPenBits: 0xffffffff = no pin, otherwise the bits the CUDA-faithful
+// reference pen must have.  *signCases counts runs on which the old port's unary
+// minus (`pdd = -dot(n, p)`) would store a different pen than the CUDA's `0 - x`.
+static void runPlaneContact(bool isTGS, const float particlePosIn[3], const float planePIn[3],
+                            float approxPen, uint32_t expectPenBits, uint32_t* signCases)
 {
     // ---- pin every byte layout the ABI blob + shader bake in ----
     static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
@@ -310,9 +323,9 @@ static void runPlaneContact(bool isTGS)
     const float s = std::sin(0.78539816339744830961f); // pi/4
     const float c = std::cos(0.78539816339744830961f);
     const float planeQ[4] = { 0.0f, 0.0f, s, c };
-    const float planeP[3] = { 0.0f, 0.0f, 0.0f };
+    const float planeP[3] = { planePIn[0], planePIn[1], planePIn[2] };
 
-    const float particlePos[3] = { 0.0f, -0.1f, 0.0f };
+    const float particlePos[3] = { particlePosIn[0], particlePosIn[1], particlePosIn[2] };
     const float contactOffset = 0.3f;
     const float restDistance = 0.0f;
     const uint32_t rigidNodeIndex = 7u;
@@ -321,11 +334,22 @@ static void runPlaneContact(bool isTGS)
     float refN[3];
     const float planeCanonicalNormal[3] = { 1.0f, 0.0f, 0.0f };
     cpuQuatRotate(planeQ, planeCanonicalNormal, refN);
-    const float pdd = -(refN[0] * planeP[0] + refN[1] * planeP[1] + refN[2] * planeP[2]);
+    // P9.86c: PxPlane(1,0,0,0).transform (PxPlane.h:137) is `d - pose.p.dot(n)` with
+    // d = 0 -- an IEEE `0 - x` (+0 for either zero), NOT a unary minus.
+    const float pdd = 0.0f - (refN[0] * planeP[0] + refN[1] * planeP[1] + refN[2] * planeP[2]);
     // no CCD -> cVolumePos == particlePos, cVolumeRadius == contactOffset
     const float refDist = refN[0] * particlePos[0] + refN[1] * particlePos[1] + refN[2] * particlePos[2] + pdd;
     const float refPen = refDist - restDistance;
     PXG_CHECK_MSG(refDist <= contactOffset, "reference: particle must be within the contact offset");
+    // the old port's twin: pdd = -dot(n, p)
+    const float pddPortOld = -(refN[0] * planeP[0] + refN[1] * planeP[1] + refN[2] * planeP[2]);
+    const float refPenPortOld = (refN[0] * particlePos[0] + refN[1] * particlePos[1] +
+                                 refN[2] * particlePos[2] + pddPortOld) - restDistance;
+    if (fbits(refPenPortOld) != fbits(refPen)) ++*signCases;
+    if (expectPenBits != 0xffffffffu)
+        PXG_CHECK_MSG(fbits(refPen) == expectPenBits,
+                      "%s: reference pen %08x != expected %08x (CUDA `0 - x` plane offset)",
+                      isTGS ? "TGS" : "PGS", fbits(refPen), expectPenBits);
 
     // ---- particle system descriptor: 1 cell, 1 particle, no CCD, no filters ----
     std::vector<F4> sortedOrigin = { { particlePos[0], particlePos[1], particlePos[2], 1.0f } };
@@ -480,14 +504,14 @@ static void runPlaneContact(bool isTGS)
     PXG_CHECK_MSG(mm == 0, "%s: contact normal_pen bit-exact vs CPU ePLANE transcription (%zu mismatches)",
                   isTGS ? "TGS" : "PGS", mm);
 
-    // human-readable sanity: normal ~ (0,1,0), penetration ~ -0.1
+    // human-readable sanity: normal ~ (0,1,0), penetration ~ approxPen
     PXG_CHECK_MSG(almostEqual(ct.normal_pen.x, 0.0f, 1e-5f, 1e-6f) &&
                   almostEqual(ct.normal_pen.y, 1.0f, 1e-5f, 1e-6f) &&
                   almostEqual(ct.normal_pen.z, 0.0f, 1e-5f, 1e-6f),
                   "%s: contact normal ~ (0,1,0) (got %g %g %g)", isTGS ? "TGS" : "PGS",
                   ct.normal_pen.x, ct.normal_pen.y, ct.normal_pen.z);
-    PXG_CHECK_MSG(almostEqual(ct.normal_pen.w, -0.1f, 1e-5f, 1e-6f),
-                  "%s: penetration ~ -0.1 (got %g)", isTGS ? "TGS" : "PGS", ct.normal_pen.w);
+    PXG_CHECK_MSG(almostEqual(ct.normal_pen.w, approxPen, 1e-5f, 1e-6f),
+                  "%s: penetration ~ %g (got %g)", isTGS ? "TGS" : "PGS", approxPen, ct.normal_pen.w);
 
     // identities + staging arrays
     PXG_CHECK_MSG(ct.rigidId == uint64_t(rigidNodeIndex), "%s: contact rigidId %llu != %u",
@@ -597,7 +621,8 @@ static void runGridContact(bool isTGS)
         {
             if (!pairReadsParticle(j, i)) continue;
             const float ph = planeHeight(j);
-            const float pdd = -(refN[0] * 0.0f + refN[1] * ph + refN[2] * 0.0f);
+            // PxPlane::transform: `0 - p.dot(n)` (PxPlane.h:137), not a unary minus
+            const float pdd = 0.0f - (refN[0] * 0.0f + refN[1] * ph + refN[2] * 0.0f);
             const float py = particleY(i);
             const float dist = refN[0] * 0.0f + refN[1] * py + refN[2] * 0.0f + pdd;
             if (dist > CONTACT_OFFSET) continue;     // cVolumeRadius == cDistance, no CCD
@@ -778,8 +803,29 @@ static void runGridContact(bool isTGS)
         dev->destroyBuffer(h);
 }
 
-PXG_TEST(psContactGen_planeContactPGS) { runPlaneContact(false); }
-PXG_TEST(psContactGen_planeContactTGS) { runPlaneContact(true); }
+static void runPlaneContactCases(bool isTGS)
+{
+    uint32_t signCases = 0;
+    const float origin[3] = { 0.0f, 0.0f, 0.0f };
+    // the original case: particle 0.1 below the y=0 plane
+    const float deep[3] = { 0.0f, -0.1f, 0.0f };
+    runPlaneContact(isTGS, deep, origin, -0.1f, 0xffffffffu, &signCases);
+    // P9.86c: a particle resting EXACTLY on the plane through the origin, its y a -0
+    // from negating a zero, restDistance +0.  n = (-2^-24, 0x1.fffffep-1, +0), so
+    // n.p = +0 and n.x*(+0) + n.y*(-0) + n.z*(-1) = -0: CUDA pdd = 0 - (+0) = +0,
+    // dist = -0 + +0 = +0, pen = +0; the old port's unary minus stored -0.
+    const float onPlane[3] = { 0.0f, -0.0f, -1.0f };
+    runPlaneContact(isTGS, onPlane, origin, 0.0f, 0x00000000u, &signCases);
+    // The same, with the plane pose at x = -0: n.p = (-2^-24)*(-0) + ... = +0 again,
+    // and a negation pushed into the products ((-n).p) is still -0 here.
+    const float negZeroOrigin[3] = { -0.0f, 0.0f, 0.0f };
+    runPlaneContact(isTGS, onPlane, negZeroOrigin, 0.0f, 0x00000000u, &signCases);
+    PXG_CHECK_MSG(signCases == 2u, "%s: the plane `0 - x` zero-sign case ran %u times (expected 2)",
+                  isTGS ? "TGS" : "PGS", signCases);
+}
+
+PXG_TEST(psContactGen_planeContactPGS) { runPlaneContactCases(false); }
+PXG_TEST(psContactGen_planeContactTGS) { runPlaneContactCases(true); }
 PXG_TEST(psContactGen_gridHashPGS) { runGridContact(false); }
 PXG_TEST(psContactGen_gridHashTGS) { runGridContact(true); }
 

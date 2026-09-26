@@ -514,7 +514,8 @@ static std::vector<Expected> predict()
             // reached every particle, so this line had nothing to say.
             if (!pairReadsParticle(j, i)) continue;
             const float ph = planeHeight(j);
-            const float pdd = -(pn[0] * 0.0f + pn[1] * ph + pn[2] * 0.0f);
+            // PxPlane::transform: `0 - p.dot(n)` (PxPlane.h:137), not a unary minus
+            const float pdd = 0.0f - (pn[0] * 0.0f + pn[1] * ph + pn[2] * 0.0f);
             float dist = pn[0] * 0.0f + pn[1] * cvY + pn[2] * 0.0f + pdd;
             if (dist > cvR) continue;
             // enableCCD -> dist recomputed from the ORIGIN position
