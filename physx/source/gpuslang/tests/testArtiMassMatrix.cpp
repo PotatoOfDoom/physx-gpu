@@ -391,9 +391,26 @@ const uint32_t MMT_MAX_LINKS = 7;    // never equal to a lane index that matters
 const uint32_t MMT_MAX_DOFS = 13;    // distinct from MAX_LINKS and from every count
 const uint32_t MMT_CFM_SLOTS = 9;    // > MMT_MAX_LINKS, so an overrun has room
 
-static uint32_t mmtNumLinks(uint32_t k) { return 1u + ((k * 5u) % 6u); }
+// P9.86c: two DIRECTED fixed-base articulations (both tests pick them up through
+// these helpers; k % 3 == 1 for both, so they are fixed-base already).  Each is a
+// root plus ONE child, so every value on the columns concerned is a pure signed
+// zero whose sign comes only from the chain analysed at mmtFillBlocks' end:
+//   k = 4  -> 1: an eFIX child (dof 0) -- the linear response diagonal is
+//                (+0, +0, -0), a PxMax zero tie (forwardDynamic2.cu:1918);
+//   k = 10 -> 2: a 2-dof spherical child with axis-aligned motion -- impulse
+//                columns 0 and 3 give stZ = -0 for both dofs, so qstZ's `+0 + stZ`
+//                seed add (articulationDynamic.cuh:178) decides the response sign.
+static uint32_t mmtDirected(uint32_t k) { return k == 4u ? 1u : (k == 10u ? 2u : 0u); }
+static uint32_t mmtNumLinks(uint32_t k) { return mmtDirected(k) ? 2u : 1u + ((k * 5u) % 6u); }
 static bool mmtFixBase(uint32_t k) { return (k % 3u) == 1u; }
-static uint8_t mmtDofs(uint32_t k, uint32_t i) { return uint8_t(1u + ((k + i * 2u) % 3u)); }
+static uint8_t mmtDofs(uint32_t k, uint32_t i)
+{
+    if (mmtDirected(k) == 1u)
+        return 0;   // eFIX: the GPU handles it (forwardDynamic2.cu:2648)
+    if (mmtDirected(k) == 2u)
+        return 2;
+    return uint8_t(1u + ((k + i * 2u) % 3u));
+}
 static uint32_t mmtParent(uint32_t i) { return i == 0 ? 0u : (i - 1u); }
 
 static uint32_t mmtTotalDofs(uint32_t k, uint32_t numLinks)
@@ -405,7 +422,9 @@ static uint32_t mmtTotalDofs(uint32_t k, uint32_t numLinks)
 }
 
 // Seed one articulation's slice of the three blocks.  Every value is distinct per
-// articulation, per link and per slot, and none is round.
+// articulation, per link and per slot, and almost none is round (v() is exactly 0
+// where (k*13 + i*7 + f) % 211 == 103) -- EXCEPT on the two directed lanes, whose
+// link 1 is overwritten at the end with round, axis-aligned engine data (P9.86c).
 static void mmtFillBlocks(physx::PxgArticulationBlockLinkData* lk,
                           physx::PxgArticulationBlockDofData* df,
                           physx::PxgArticulationBlockData& ab, uint32_t k, uint32_t numLinks,
@@ -474,6 +493,109 @@ static void mmtFillBlocks(physx::PxgArticulationBlockLinkData* lk,
         }
         cursor += dofs;
     }
+
+    // ---- P9.86c: the directed lanes (see mmtDirected) ----
+    //
+    // Both have a fixed base, so link 0's response is zeroSpatialMatrix (+0,
+    // forwardDynamic2.cu:1793), `parentResponse * Zp` is +0 in every row
+    // (PxSpatialMatrix.h: a +0 seed that only `+=`s) and Zr = -(that) is -0 x6.
+    const uint32_t dir = mmtDirected(k);
+    if (dir == 1u)
+    {
+        // eFIX child: pDeltaV = translateSpatialVector(-rw, Zr), so bottom =
+        // -0 + (-rw) x (-0,-0,-0).  With -rw = (1, -2, -3) the cross product is
+        // (+0, +0, -0), so every column's linear diagonal is (+0, +0, -0) and the
+        // CUDA's PxMax<float> (selectMax `a > b ? a : b`, PxUnixMathIntrinsics.h:122)
+        // nests to the LAST one: cfm = cfmScale * -0.
+        lk[1].mRw_x[lane] = -1.0f;
+        lk[1].mRw_y[lane] = 2.0f;
+        lk[1].mRw_z[lane] = 3.0f;
+    }
+    else if (dir == 2u)
+    {
+        // A 2-dof spherical joint, swing axes +y and -z, the child COM at
+        // r = (0.25, 0, 0) from the anchor (motion bottom = axis x r); mass 4 and a
+        // COM inertia [[1,0,0],[0,1,0.5],[0,0.5,1]], so IsW = (m v, I w) exactly and
+        // the stIs coupling is -0.5.  invStIsT and IsInvDW are derived as the
+        // engine's eSPHERICAL path derives them (forwardDynamic2.cu:1455-1528,
+        // armature 0).
+        //
+        // WHY EACH MOTION VECTOR HAS A NEGATIVE COMPONENT (measured, P9.86c): llvmpipe
+        // rewrites mmAxis's `bcsel(i == k, -1.0, 0.0)` into `fneg(b2f32(i == k))`, so
+        // the port's unit impulse Z carries -0, not +0, in its zero lanes.  At HEAD that
+        // is unobservable (Z only reaches the canonicalised qstZ and Zp, which only
+        // reaches asmM6MulVec's canonicalised rows).  But the reverted fold leaves
+        // qstZ = -(m . Z) itself, and with -0 lanes that is -0 only if some product
+        // m_j * (-0) is +0 -- i.e. only if m has a negative component.  The first
+        // design (swing axes +y/+z, s0 all non-negative) kept qstZ[0] = +0 and the
+        // revert survived; the r3 twins below model both lane conventions.
+        physx::PxgArticulationBlockDofData* d = df + lk[1].mJointOffset[lane];
+        lk[1].mRw_x[lane] = 0.5f;
+        lk[1].mRw_y[lane] = 0.0f;
+        lk[1].mRw_z[lane] = 0.0f;
+
+        const UnAlignedSpatialVector s[2] = {
+            UnAlignedSpatialVector(PxVec3(0.0f, 1.0f, 0.0f), PxVec3(0.0f, 0.0f, -0.25f)),
+            UnAlignedSpatialVector(PxVec3(0.0f, 0.0f, -1.0f), PxVec3(0.0f, -0.25f, 0.0f)) };
+        const UnAlignedSpatialVector isw[2] = {
+            UnAlignedSpatialVector(PxVec3(0.0f, 0.0f, -1.0f), PxVec3(0.0f, 1.0f, 0.5f)),
+            UnAlignedSpatialVector(PxVec3(0.0f, -1.0f, 0.0f), PxVec3(0.0f, -0.5f, -1.0f)) };
+
+        PxMat33 invStIs(physx::PxIdentity);
+        for (PxU32 ind2 = 0; ind2 < 2; ++ind2)
+        {
+            for (PxU32 ind = 0; ind < 2; ++ind)
+                invStIs[ind][ind2] = s[ind2].innerProduct(isw[ind]);
+            invStIs[ind2][ind2] += 0.0f;   // mArmature
+        }
+        invStIs = invStIs.getInverse();
+
+        for (PxU32 ind = 0; ind < 2; ++ind)
+        {
+            UnAlignedSpatialVector isID(PxVec3(0.0f), PxVec3(0.0f));
+            for (PxU32 ind2 = 0; ind2 < 2; ++ind2)
+                isID += isw[ind2] * invStIs[ind][ind2];
+            storeSpatialVector(d[ind].mWorldMotionMatrix, s[ind], lane);
+            storeSpatialVector(d[ind].mIsW, isw[ind], lane);
+            storeSpatialVector(d[ind].mIsInvDW, isID, lane);
+            d[ind].mInvStIsT_x[lane] = invStIs[0][ind];
+            d[ind].mInvStIsT_y[lane] = invStIs[1][ind];
+            d[ind].mInvStIsT_z[lane] = invStIs[2][ind];
+        }
+
+        // The rows the r3 chain needs: (pos, pos, -0) for BOTH dofs.  With qstZ =
+        // tJointDelta = +0 the CUDA's jDelta is +0 + +0 + (-0)(+0) = +0; a -0 qstZ
+        // (the folded seed add) makes every product -0 and jDelta -0.
+        PXG_CHECK_MSG(f2u(d[0].mInvStIsT_z[lane]) == 0x80000000u
+                          && f2u(d[1].mInvStIsT_z[lane]) == 0x80000000u
+                          && d[0].mInvStIsT_x[lane] > 0.0f && d[0].mInvStIsT_y[lane] > 0.0f
+                          && d[1].mInvStIsT_x[lane] > 0.0f && d[1].mInvStIsT_y[lane] > 0.0f,
+                      "directed spherical lane %u: invStIsT rows must be (pos, pos, -0), got "
+                      "(%08x %08x %08x) (%08x %08x %08x)",
+                      k, f2u(d[0].mInvStIsT_x[lane]), f2u(d[0].mInvStIsT_y[lane]),
+                      f2u(d[0].mInvStIsT_z[lane]), f2u(d[1].mInvStIsT_x[lane]),
+                      f2u(d[1].mInvStIsT_y[lane]), f2u(d[1].mInvStIsT_z[lane]));
+    }
+}
+
+// P9.86c: mutant TWINS inside the mirror, so each test can prove its directed
+// input still separates the engine from the port's pre-P9.86 behaviour:
+//   0 = the engine (PxMax<float> = selectMax; qstZ = +0 + stZ, IEEE);
+//   1 = the r2 twin: the generic PxMax template `a < b ? b : a` (PxMath.h:74-77),
+//       which keeps the OTHER operand on a +-0 tie;
+//   2 = the r3 twin AS LLVMPIPE COMPILES IT: qstZ[k] = stZ (the literal `{0,0,0}`
+//       seed forwarded and `+0 + stZ` folded, F3 -- the reverted build's LLVM IR,
+//       GALLIVM_DEBUG=ir, stores `fneg(ip)` with no add), where stZ is formed from
+//       the impulse llvmpipe materialises: mmAxis's `bcsel(i == k, -1.0, 0.0)` is
+//       `fneg(b2f32(i == k))` in its NIR (NIR_DEBUG=print_cs), so every zero lane
+//       is -0;
+//   3 = the plain r3 twin: the same fold against the IEEE impulse (+0 lanes), i.e.
+//       what the revert would do on a driver without that bcsel rewrite.
+static int gMmtVariant = 0;
+
+static PxReal mmtPxMax(PxReal a, PxReal b)
+{
+    return gMmtVariant == 1 ? (a < b ? b : a) : PxMax(a, b);
 }
 
 // The mirror: one articulation, the CUDA's structure, the engine's arithmetic.
@@ -513,8 +635,8 @@ static void mmtMirror(physx::PxgArticulationBlockLinkData* lk,
         storeSpatialMatrix(lk[0].mSpatialResponseMatrix, lane, response);
 
         const PxReal cfmVal =
-            cfmScale[0] * PxMax(inv.bottomLeft.column0.x,
-                                PxMax(inv.bottomLeft.column1.y, inv.bottomLeft.column2.z));
+            cfmScale[0] * mmtPxMax(inv.bottomLeft.column0.x,
+                                   mmtPxMax(inv.bottomLeft.column1.y, inv.bottomLeft.column2.z));
         cfms[0] = cfmVal;
         lk[0].mCfm[lane] = cfmVal;
 
@@ -559,6 +681,16 @@ static void mmtMirror(physx::PxgArticulationBlockLinkData* lk,
             PxReal qstZ[3] = { 0.f, 0.f, 0.f };
             const UnAlignedSpatialVector Zp =
                 refPropagateImpulseW(isInvD, rw, motionV, vec, dof, qstZ);
+            if (gMmtVariant == 2 || gMmtVariant == 3)   // the r3 twins: the folded seed add
+            {
+                UnAlignedSpatialVector z = vec;
+                if (gMmtVariant == 2)
+                    for (PxU32 j = 0; j < 6; ++j)
+                        if (j != i)
+                            z[j] = -0.0f;
+                for (PxU32 k = 0; k < dof; ++k)
+                    qstZ[k] = -motionV[k].innerProduct(z);
+            }
             const UnAlignedSpatialVector Zr = -(parentResponse * Zp);
             const UnAlignedSpatialVector deltaV =
                 refPropagateAccelerationW(rw, invStIsT, motionV, Zr, dof, isW, qstZ);
@@ -573,13 +705,64 @@ static void mmtMirror(physx::PxgArticulationBlockLinkData* lk,
 
         const PxReal cfmVal =
             cfmScale[linkID]
-            * PxMax(response.column[0][3], PxMax(response.column[1][4], response.column[2][5]));
+            * mmtPxMax(response.column[0][3],
+                       mmtPxMax(response.column[1][4], response.column[2][5]));
         cfms[linkID] = cfmVal;
         thisLink.mCfm[lane] = cfmVal;
 
         storeSpatialMatrix(thisLink.mSpatialResponseMatrix, lane, response);
         recordMatrices[linkID] = response;
     }
+}
+
+// P9.86c: re-run a test's expectation builder under a mutant twin and count the
+// 32-bit words of the three output images (link blocks, record matrices, record
+// cfms) that differ from the engine's.
+template <typename Build>
+static size_t mmtTwinDiff(const Build& build, int variant,
+                          const std::vector<physx::PxgArticulationBlockLinkData>& wantLk,
+                          const std::vector<uint32_t>& wantMat, const std::vector<uint32_t>& wantCfm)
+{
+    std::vector<physx::PxgArticulationBlockLinkData> lk;
+    std::vector<uint32_t> mat, cfm;
+    build(variant, lk, mat, cfm);
+    size_t n = 0;
+    auto count = [&n](const void* ap, const void* bp, size_t bytes) {
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(ap);
+        const uint32_t* b = reinterpret_cast<const uint32_t*>(bp);
+        for (size_t x = 0; x < bytes / 4; ++x)
+            n += (a[x] != b[x]) ? 1u : 0u;
+    };
+    count(lk.data(), wantLk.data(), lk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    count(mat.data(), wantMat.data(), mat.size() * 4);
+    count(cfm.data(), wantCfm.data(), cfm.size() * 4);
+    return n;
+}
+
+// P9.86c: pin the engine's values on the directed lanes, so the inputs cannot
+// silently stop producing the signed zeros the two reverts are measured on.
+//   eFIX lane:      cfm = cfmScale * selectMax-nest(+0, +0, -0) = -0, in the record's
+//                   cfms[1] AND the link block's mCfm;
+//   spherical lane: impulse columns 0 and 3, top x/y/z, are +0 (block and record).
+static void mmtCheckDirectedWant(const physx::PxgArticulationBlockLinkData* wantLk,
+                                 const uint32_t* wantMat, const uint32_t* wantCfm,
+                                 uint32_t recFix, uint32_t laneFix, uint32_t recSph,
+                                 uint32_t laneSph, const char* what)
+{
+    PXG_CHECK_MSG(wantCfm[size_t(recFix) * MMT_CFM_SLOTS + 1] == 0x80000000u
+                      && f2u(wantLk[1].mCfm[laneFix]) == 0x80000000u,
+                  "%s: the eFIX lane's link cfm must be -0 (record %08x, block %08x)", what,
+                  wantCfm[size_t(recFix) * MMT_CFM_SLOTS + 1], f2u(wantLk[1].mCfm[laneFix]));
+
+    PxSpatialMatrix blk;
+    loadSpatialMatrix(wantLk[1].mSpatialResponseMatrix, laneSph, blk);
+    const uint32_t* rec = wantMat + (size_t(recSph) * MMT_CFM_SLOTS + 1) * MATRIX_FLOATS;
+    uint32_t zeros = 0;
+    for (uint32_t c = 0; c < 6; c += 3)
+        for (uint32_t row = 0; row < 3; ++row)
+            zeros += (f2u(blk.column[c][row]) == 0u && rec[c * 6 + row] == 0u) ? 1u : 0u;
+    PXG_CHECK_MSG(zeros == 6, "%s: the spherical lane's impulse columns 0/3 top must be +0 in "
+                              "block and record (%u of 6)", what, zeros);
 }
 
 PXG_TEST(artiMassMatrixBody)
@@ -687,18 +870,52 @@ PXG_TEST(artiMassMatrixBody)
     shim.streamSynchronize();
 
     // ---- the expectation ----
-    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
-    std::vector<uint32_t> wantMat = matPoison, wantCfm = cfmPoison;
-    for (uint32_t lane = 0; lane < LIVE; ++lane)
+    // Built by a lambda so the mutant twins (gMmtVariant) re-run the SAME loop.
+    auto buildWant = [&](int variant, std::vector<physx::PxgArticulationBlockLinkData>& wLk,
+                         std::vector<uint32_t>& wMat, std::vector<uint32_t>& wCfm) {
+        gMmtVariant = variant;
+        wLk = lkImg;
+        wMat = matPoison;
+        wCfm = cfmPoison;
+        for (uint32_t lane = 0; lane < LIVE; ++lane)
+        {
+            const uint32_t r = artiIdx[lane];
+            mmtMirror(wLk.data(), dfImg.data(), abImg[0],
+                      reinterpret_cast<PxSpatialMatrix*>(wMat.data())
+                          + size_t(r) * MMT_CFM_SLOTS,
+                      reinterpret_cast<PxReal*>(wCfm.data()) + size_t(r) * MMT_CFM_SLOTS,
+                      cfmScale.data() + size_t(r) * MMT_CFM_SLOTS, mmtNumLinks(lane),
+                      mmtFixBase(lane), lane);
+        }
+        gMmtVariant = 0;
+    };
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk;
+    std::vector<uint32_t> wantMat, wantCfm;
+    buildWant(0, wantLk, wantMat, wantCfm);
+
+    // P9.86c coverage: each twin must change exactly the words its directed lane
+    // was built for, or the input has stopped separating engine from revert.
+    PXG_CHECK_MSG(LIVE > 10 && mmtFixBase(4) && mmtFixBase(10),
+                  "the directed lanes 4 and 10 must be live and fixed-base");
     {
-        const uint32_t r = artiIdx[lane];
-        mmtMirror(wantLk.data(), dfImg.data(), abImg[0],
-                  reinterpret_cast<PxSpatialMatrix*>(wantMat.data())
-                      + size_t(r) * MMT_CFM_SLOTS,
-                  reinterpret_cast<PxReal*>(wantCfm.data()) + size_t(r) * MMT_CFM_SLOTS,
-                  cfmScale.data() + size_t(r) * MMT_CFM_SLOTS, mmtNumLinks(lane),
-                  mmtFixBase(lane), lane);
+        const size_t d = mmtTwinDiff(buildWant, 1, wantLk, wantMat, wantCfm);
+        std::printf("[ info ] mm body: r2 twin (generic PxMax) changes %zu words\n", d);
+        PXG_CHECK_MSG(d == 2, "r2 twin: the eFIX lane's selectMax tie must flip record cfms[1] "
+                              "and link1.mCfm (got %zu words)", d);
     }
+    // Both r3 twins: the fold as llvmpipe compiles it (-0 impulse lanes) and the
+    // plain fold (+0 lanes).  Either way, impulse columns 0 and 3 of the spherical
+    // lane come out with top (-0, -0, +0) where the engine has (+0, +0, +0).
+    for (int variant = 2; variant <= 3; ++variant)
+    {
+        const size_t d = mmtTwinDiff(buildWant, variant, wantLk, wantMat, wantCfm);
+        std::printf("[ info ] mm body: r3 twin %d (folded qstZ seed) changes %zu words\n",
+                    variant, d);
+        PXG_CHECK_MSG(d == 8, "r3 twin %d: the spherical lane's impulse columns 0/3 must flip "
+                              "top x/y in block and record (got %zu words)", variant, d);
+    }
+    mmtCheckDirectedWant(wantLk.data(), wantMat.data(), wantCfm.data(), artiIdx[4], 4u,
+                         artiIdx[10], 10u, "body");
 
     std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
     std::vector<physx::PxgArticulationBlockData> gotAb(abImg.size());
@@ -710,7 +927,10 @@ PXG_TEST(artiMassMatrixBody)
     shim.memcpyDtoH(gotMat.data(), dMat, gotMat.size() * 4);
     shim.memcpyDtoH(gotCfm.data(), dCfm, gotCfm.size() * 4);
 
-    size_t bad = 0, signedZeros = 0;
+    // Fully BITWISE (P9.86c): the +0/-0 forgiveness that stood here for the
+    // caller-side qstZ seed is retired -- P9.86 canonicalises that seed, and the
+    // directed lanes above are what would expose it (and the PxMax tie) if it came back.
+    size_t bad = 0;
     auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
         const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
         const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
@@ -718,12 +938,6 @@ PXG_TEST(artiMassMatrixBody)
         {
             if (w[x] == g[x])
                 continue;
-            // the caller-side literal-zero seed of qstZ -- see the module header
-            if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-            {
-                ++signedZeros;
-                continue;
-            }
             if (bad < 12)
                 std::printf("MM body %s word %zu  ref %08x  gpu %08x\n", what, x, w[x], g[x]);
             ++bad;
@@ -737,7 +951,6 @@ PXG_TEST(artiMassMatrixBody)
     cmp("record matrices", wantMat.data(), gotMat.data(), wantMat.size() * 4);
     cmp("record cfms", wantCfm.data(), gotCfm.data(), wantCfm.size() * 4);
 
-    std::printf("[ info ] mm body: signed zeros forgiven %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "the mass-matrix body matches the engine-built mirror");
 
     shim.memFree(dLk);
@@ -893,17 +1106,48 @@ PXG_TEST(artiMassMatrixLaunch)
                   "launch computeMassMatrix1T");
     shim.streamSynchronize();
 
-    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
-    std::vector<uint32_t> wantMat = matPoison, wantCfm = cfmPoison;
-    for (uint32_t k = 0; k < MMK_NB_ARTI; ++k)
+    auto buildWant = [&](int variant, std::vector<physx::PxgArticulationBlockLinkData>& wLk,
+                         std::vector<uint32_t>& wMat, std::vector<uint32_t>& wCfm) {
+        gMmtVariant = variant;
+        wLk = lkImg;
+        wMat = matPoison;
+        wCfm = cfmPoison;
+        for (uint32_t k = 0; k < MMK_NB_ARTI; ++k)
+        {
+            const uint32_t warp = k / 32u, lane = k % 32u, r = artiIdx[k];
+            mmtMirror(wLk.data() + size_t(warp) * MMT_MAX_LINKS,
+                      dfImg.data() + size_t(warp) * MMT_MAX_DOFS, abImg[warp],
+                      reinterpret_cast<PxSpatialMatrix*>(wMat.data()) + size_t(r) * MMT_CFM_SLOTS,
+                      reinterpret_cast<PxReal*>(wCfm.data()) + size_t(r) * MMT_CFM_SLOTS,
+                      cfmScale.data() + size_t(r) * MMT_CFM_SLOTS, mmtNumLinks(k),
+                      mmtFixBase(k), lane);
+        }
+        gMmtVariant = 0;
+    };
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk;
+    std::vector<uint32_t> wantMat, wantCfm;
+    buildWant(0, wantLk, wantMat, wantCfm);
+
+    // P9.86c coverage: the directed articulations 4 and 10 sit in warp 0.
     {
-        const uint32_t warp = k / 32u, lane = k % 32u, r = artiIdx[k];
-        mmtMirror(wantLk.data() + size_t(warp) * MMT_MAX_LINKS,
-                  dfImg.data() + size_t(warp) * MMT_MAX_DOFS, abImg[warp],
-                  reinterpret_cast<PxSpatialMatrix*>(wantMat.data()) + size_t(r) * MMT_CFM_SLOTS,
-                  reinterpret_cast<PxReal*>(wantCfm.data()) + size_t(r) * MMT_CFM_SLOTS,
-                  cfmScale.data() + size_t(r) * MMT_CFM_SLOTS, mmtNumLinks(k), mmtFixBase(k), lane);
+        const size_t d = mmtTwinDiff(buildWant, 1, wantLk, wantMat, wantCfm);
+        std::printf("[ info ] mm launch: r2 twin (generic PxMax) changes %zu words\n", d);
+        PXG_CHECK_MSG(d == 2, "r2 twin: the eFIX lane's selectMax tie must flip record cfms[1] "
+                              "and link1.mCfm (got %zu words)", d);
     }
+    // Both r3 twins: the fold as llvmpipe compiles it (-0 impulse lanes) and the
+    // plain fold (+0 lanes).  Either way, impulse columns 0 and 3 of the spherical
+    // lane come out with top (-0, -0, +0) where the engine has (+0, +0, +0).
+    for (int variant = 2; variant <= 3; ++variant)
+    {
+        const size_t d = mmtTwinDiff(buildWant, variant, wantLk, wantMat, wantCfm);
+        std::printf("[ info ] mm launch: r3 twin %d (folded qstZ seed) changes %zu words\n",
+                    variant, d);
+        PXG_CHECK_MSG(d == 8, "r3 twin %d: the spherical lane's impulse columns 0/3 must flip "
+                              "top x/y in block and record (got %zu words)", variant, d);
+    }
+    mmtCheckDirectedWant(wantLk.data(), wantMat.data(), wantCfm.data(), artiIdx[4], 4u,
+                         artiIdx[10], 10u, "launch");
 
     std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
     std::vector<physx::PxgArticulationBlockData> gotAb(abImg.size());
@@ -915,7 +1159,8 @@ PXG_TEST(artiMassMatrixLaunch)
     shim.memcpyDtoH(gotMat.data(), dMat, gotMat.size() * 4);
     shim.memcpyDtoH(gotCfm.data(), dCfm, gotCfm.size() * 4);
 
-    size_t bad = 0, signedZeros = 0;
+    // fully BITWISE (P9.86c) -- see the body test
+    size_t bad = 0;
     auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
         const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
         const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
@@ -923,11 +1168,6 @@ PXG_TEST(artiMassMatrixLaunch)
         {
             if (w[x] == g[x])
                 continue;
-            if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-            {
-                ++signedZeros;
-                continue;
-            }
             if (bad < 12)
                 std::printf("MM launch %s word %zu  ref %08x  gpu %08x\n", what, x, w[x], g[x]);
             ++bad;
@@ -940,7 +1180,6 @@ PXG_TEST(artiMassMatrixLaunch)
     cmp("record matrices", wantMat.data(), gotMat.data(), wantMat.size() * 4);
     cmp("record cfms", wantCfm.data(), gotCfm.data(), wantCfm.size() * 4);
 
-    std::printf("[ info ] mm launch: signed zeros forgiven %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "the kernel's whole block and record image matches the mirror");
 
     shim.memFree(dLk);
