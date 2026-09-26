@@ -45,7 +45,10 @@
 //      ULP and not to the bit.  So `lambda` is compared bit-exactly ONLY where the
 //      argument is exactly zero (every implementation returns 0), and with a
 //      relative epsilon otherwise.  Everything kernel 2 derives from lambda
-//      inherits that.
+//      inherits that.  The SIGN of that zero is pinned too (P9.86c): cbrtf(-0) is
+//      -0 in the CUDA and in glibc, while llvmpipe's pow(-0, 1/3) returns +0, so
+//      sysA carries two inflatables whose argument is exactly -0 (restVolume = -0,
+//      volume = +0) and whose stored lambda must come back as 0x80000000.
 //
 // THE BLOCK REDUCTION IS BIT-EXACT and is the load-bearing part of the mirror: it
 // is a fixed XOR butterfly over fixed lanes, so the host can and does reproduce the
@@ -321,6 +324,53 @@ PXG_TEST(psInflatable)
                         for (uint32_t j = 0; j < 3u; ++j)
                             c.tris.push_back(vCursor + OCT[t][j]);
                 }
+                else if (k == 4u)
+                {
+                    // P9.86c npPsInflatable-r0: a DEFLATED PILLOW in the z = 0 plane
+                    // -- two coincident faces of opposite winding over DISJOINT
+                    // vertices (so the normals stay bit-exact).  Every z is exactly
+                    // +0, so every signed tetrahedron volume is a +-0 and the block
+                    // reduction's +0 lanes make volume = +0.  restVolume = -0 is the
+                    // negated +0 the cooker returns for a flat mesh
+                    // (Gu::computeTriangleMeshVolume sums from +0), so the cube-root
+                    // argument PxMax(0, -0*p - (+0)) is -0 and cbrtf(-0) = -0 is
+                    // stored.  llvmpipe's pow(-0, 1/3) would store +0.
+                    inf.numTriangles = 2u;
+                    inf.numVertices = 6u;
+                    inf.startVertexIndex = vCursor;
+                    inf.startTriangleIndex = tCursor;
+                    inf.closed = false;
+                    inf.pressure = 2.25f;
+                    inf.restVolume = -0.0f;
+                    static const float FLAT_XY[6][2] = {
+                        {2.0f, 1.0f}, {3.0f, 1.0f}, {2.0f, 2.0f},
+                        {2.0f, 1.0f}, {2.0f, 2.0f}, {3.0f, 1.0f}
+                    };
+                    const uint32_t off = s.runsum[c.particleBufferIndex];
+                    for (uint32_t j = 0; j < 6u; ++j)
+                    {
+                        F4& p = s.pos[s.unsortedToSorted[vCursor + j + off]];
+                        p.x = FLAT_XY[j][0];
+                        p.y = FLAT_XY[j][1];
+                        p.z = 0.0f;                          // w is kept
+                    }
+                    for (uint32_t t = 0; t < inf.numTriangles; ++t)
+                        for (uint32_t j = 0; j < 3u; ++j)
+                            c.tris.push_back(vCursor + 3u * t + j);
+                }
+                else if (k == 5u)
+                {
+                    // P9.86c npPsInflatable-r0: NO triangles -- numPasses == 0, so
+                    // the volume stays at its +0 seed (comScale = 1/0 is computed
+                    // and never used).  restVolume = -0 again gives the argument -0.
+                    inf.numTriangles = 0u;
+                    inf.numVertices = 3u;
+                    inf.startVertexIndex = vCursor;
+                    inf.startTriangleIndex = tCursor;
+                    inf.closed = false;
+                    inf.pressure = 0.5f;
+                    inf.restVolume = -0.0f;
+                }
                 else
                 {
                     // pressure == 0 -> BOTH kernels early-out; its lambda slot must
@@ -343,14 +393,19 @@ PXG_TEST(psInflatable)
                 tCursor += inf.numTriangles * 3u;
                 c.infl.push_back(inf);
             }
+            PXG_CHECK_MSG(vCursor <= BUFFER_STRIDE && c.infl.size() <= INFL_SLOTS,
+                          "a cloth buffer must fit its particle-buffer stride "
+                          "(%u vertices) and the lambda slots (%zu inflatables)",
+                          vCursor, c.infl.size());
             s.cloths.push_back(c);
         }
         return s;
     };
 
-    // A: two live cloth buffers (3 and 2 inflatables).  DECOY never active.
+    // A: two live cloth buffers (6 and 2 inflatables; slots 4 and 5 of the first
+    // are the P9.86c -0 cube-root cases).  DECOY never active.
     // B: one.  C: two.  Contact distances differ so maxDelta differs per system.
-    Sys sysA = buildSys(100u, 0.40f, { 4u, 2u });
+    Sys sysA = buildSys(100u, 0.40f, { 6u, 2u });
     Sys sysD = buildSys(200u, 9.90f, { 1u, 1u, 1u });
     Sys sysB = buildSys(300u, 0.005f, { 4u });         // tiny -> maxDelta BINDS
     Sys sysC = buildSys(400u, 0.55f, { 3u, 1u });
@@ -456,6 +511,11 @@ PXG_TEST(psInflatable)
     // ---------------------------------------------------------------------
     size_t mm = 0, tolMM = 0;
     size_t nLambdaZero = 0, nLambdaPos = 0, nMaxDeltaBound = 0, nSkipped = 0, nMultiPass = 0;
+    // P9.86c npPsInflatable-r0 coverage: stored lambdas that are exactly -0, the
+    // subset from an inflatable WITH triangles, -0 signed-volume lanes feeding such
+    // a volume, and the cases on which the reverted port's pow(x, 1/3) (llvmpipe
+    // lowers it to select(x == 0, +0, exp2(log2(x)/3))) stores a different word.
+    size_t nLambdaNegZero = 0, nLambdaNegZeroFlat = 0, nNegZeroSvLane = 0, nCbrtPowTwin = 0;
 
     for (Sys* s : order)
     {
@@ -530,6 +590,7 @@ PXG_TEST(psInflatable)
 
                     // pass 2: signed volume + normals
                     float volume = 0.0f;
+                    size_t negZeroSv = 0;
                     for (uint32_t pass = 0; pass < numPasses; ++pass)
                     {
                         float sv[INF_BLOCK];
@@ -553,6 +614,7 @@ PXG_TEST(psInflatable)
                                 V3 nor = cross3(vb - va, vc - va);
                                 signedVolume = dot3(va, nor);
                                 nor = normalize3(nor);
+                                if (f2u(signedVolume) == 0x80000000u) ++negZeroSv;
                                 const uint32_t vs3[3] = { ua, ub, uc };
                                 for (uint32_t j = 0; j < 3u; ++j)
                                 {
@@ -582,6 +644,21 @@ PXG_TEST(psInflatable)
                     lamTol[b][k] = (arg != 0.0f);
                     if (arg == 0.0f) ++nLambdaZero; else ++nLambdaPos;
                     if (stored == maxDelta && lambda > maxDelta) ++nMaxDeltaBound;
+                    if (f2u(stored) == 0x80000000u)
+                    {
+                        ++nLambdaNegZero;
+                        if (inf.numTriangles > 0u)
+                        {
+                            ++nLambdaNegZeroFlat;
+                            nNegZeroSvLane += negZeroSv;
+                        }
+                    }
+                    // Twin of the REVERTED port: pow(x, 1/3) on llvmpipe selects a
+                    // literal +0 for x == 0 and so drops the sign cbrtf keeps.
+                    const float lambdaPow = ((arg == 0.0f) ? 0.0f : std::cbrt(arg))
+                                            * constraintScale * 0.25f;
+                    if (arg == 0.0f && f2u(hMin(lambdaPow, maxDelta)) != f2u(stored))
+                        ++nCbrtPowTwin;
                 }
             }
 
@@ -697,6 +774,11 @@ PXG_TEST(psInflatable)
                   "the cube-root argument must be BOTH zero and positive (zero %zu, pos %zu)",
                   nLambdaZero, nLambdaPos);
     PXG_CHECK_MSG(nMaxDeltaBound > 0, "the maxDelta clamp must BIND somewhere");
+    PXG_CHECK_MSG(nLambdaNegZero >= 2 && nLambdaNegZeroFlat >= 1 && nNegZeroSvLane >= 1
+                      && nCbrtPowTwin >= 2,
+                  "cbrtf(-0) = -0 must reach a bit-exact stored lambda (negZero %zu, "
+                  "with triangles %zu, -0 volume lanes %zu, pow twin differs %zu)",
+                  nLambdaNegZero, nLambdaNegZeroFlat, nNegZeroSvLane, nCbrtPowTwin);
 
     PXG_CHECK_MSG(mm == 0, "the inflatable pair is bit-exact where it can be (%zu mismatches)", mm);
     PXG_CHECK_MSG(tolMM == 0, "the atomic/cbrt region matches within tolerance (%zu)", tolMM);
