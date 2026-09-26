@@ -132,6 +132,34 @@ Mat33 meshScaleToMat33(const Vec3& scale, const QuatV& rotation)
     return rot.getTranspose() * diagTimesRot;
 }
 
+// P9.86c: mutant twin of the convex-hull min/max loop.  The CUDA
+// (updateCacheAndBound.cuh:134-135) folds the hull with PxVec3::minimum/maximum
+// = componentwise PxMin/PxMax = selectMin/selectMax (a < b ? a : b / a > b ? a : b),
+// so on a +-0 tie the NEW vertex's zero survives; that is what Vec3::minimum/
+// maximum of the mirror do.  The pre-P9.86 port used GLSL FMin/FMax, which
+// llvmpipe lowers under SignedZeroInfNanPreserve to bcsel(feq(a,b), imin/imax
+// of the bit patterns, fmin/fmax): a +-0 tie gives -0 (min) / +0 (max) in
+// either operand order.  ubLpFMin/ubLpFMax model that (valid for non-NaN data).
+static float ubLpFMin(float a, float b)
+{
+    if (a == 0.f && b == 0.f)
+        return (std::signbit(a) || std::signbit(b)) ? -0.0f : 0.0f;
+    return a < b ? a : b;
+}
+static float ubLpFMax(float a, float b)
+{
+    if (a == 0.f && b == 0.f)
+        return (std::signbit(a) && std::signbit(b)) ? -0.0f : 0.0f;
+    return a > b ? a : b;
+}
+
+// What the reverted port (FMin/FMax fold) would store for one convex hull.
+struct UbFMinMaxTwin
+{
+    bool valid = false; // the GPU-compatible convex hull path ran
+    Float3 minimum{}, maximum{};
+};
+
 // blobDeviceBase: under the engine ABI Shape::hullOrMeshOffset carries the
 // RAW DEVICE ADDRESS of the cooked hull (exactly what CUDA stores in
 // PxgShape::hullOrMeshPtr); the reference rebases it onto the host copy of
@@ -139,7 +167,7 @@ Mat33 meshScaleToMat33(const Vec3& scale, const QuatV& rotation)
 // plain byte offset (blobDeviceBase = 0).
 void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
                      const std::vector<uint32_t>& geometryBlob, const TransformV& pose, Bounds3& out,
-                     uint64_t blobDeviceBase = 0)
+                     uint64_t blobDeviceBase = 0, UbFMinMaxTwin* twin = nullptr)
 {
     const Vec3 localMin(shapeSim.localBoundsMin);
     const Vec3 localMax(shapeSim.localBoundsMax);
@@ -193,6 +221,8 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
 
             Vec3 minV(3.402823466e+38f);
             Vec3 maxV(-3.402823466e+38f);
+            Vec3 minT(3.402823466e+38f);  // P9.86c twin (FMin/FMax fold)
+            Vec3 maxT(-3.402823466e+38f);
             const uint32_t verticesBase = blobBase + 12;
             for (uint32_t i = 0; i < nbHullVertices; ++i)
             {
@@ -203,9 +233,17 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
                 const Vec3 vertexV = rot.transform(Vec3(vx, vy, vz));
                 minV = minV.minimum(vertexV);
                 maxV = maxV.maximum(vertexV);
+                minT = Vec3(ubLpFMin(minT.x, vertexV.x), ubLpFMin(minT.y, vertexV.y), ubLpFMin(minT.z, vertexV.z));
+                maxT = Vec3(ubLpFMax(maxT.x, vertexV.x), ubLpFMax(maxT.y, vertexV.y), ubLpFMax(maxT.z, vertexV.z));
             }
             out.minimum = (minV + pose.p).toFloat3();
             out.maximum = (maxV + pose.p).toFloat3();
+            if (twin)
+            {
+                twin->valid = true;
+                twin->minimum = (minT + pose.p).toFloat3();
+                twin->maximum = (maxT + pose.p).toFloat3();
+            }
         }
         else
         {
@@ -228,15 +266,19 @@ struct RefOutputs
 
 // Transcription of updateTransformCacheAndBoundArrayLaunch (both branches).
 // artLinkB2W / artLinkB2A: per-articulation link transform arrays, indexed
-// [artId * maxLinks + linkId].
+// [artId * maxLinks + linkId].  twins (optional): per-shape FMin/FMax twin
+// bounds of the convex hull path (P9.86c).
 void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
                      const std::vector<Shape>& shapes, const std::vector<uint32_t>& geometryBlob,
                      const std::vector<BodySim>& bodySims, const std::vector<uint32_t>& bodyDataIndices,
                      const std::vector<SolverBodySleepData>& sleepData,
                      const std::vector<SolverBodySleepData>& artiSleepData,
                      const std::vector<TransformV>& artLinkB2W, const std::vector<TransformV>& artLinkB2A,
-                     uint32_t maxLinks, uint32_t maxNodes, uint64_t blobDeviceBase, RefOutputs& out)
+                     uint32_t maxLinks, uint32_t maxNodes, uint64_t blobDeviceBase, RefOutputs& out,
+                     std::vector<UbFMinMaxTwin>* twins = nullptr)
 {
+    if (twins)
+        twins->assign(numShapes, UbFMinMaxTwin{});
     out.transformCache.assign(numShapes, CachedTransform{});
     out.bounds.assign(numShapes, Bounds3{});
     out.frozen.assign(numShapes, 0);
@@ -292,7 +334,8 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
                 out.transformCache[i].transform = absPos.toTransform28();
                 out.transformCache[i].flags = 0;
                 if (isBPOrSq)
-                    refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase);
+                    refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase,
+                                    twins ? &(*twins)[i] : nullptr);
             }
 
             if (internalFlags & eACTIVATE_THIS_FRAME)
@@ -320,7 +363,8 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
             out.transformCache[i].transform = absPos.toTransform28();
             out.transformCache[i].flags = 0;
             if (isBPOrSq)
-                refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase);
+                refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase,
+                                twins ? &(*twins)[i] : nullptr);
 
             if (internalFlags & eACTIVATE_THIS_FRAME)
                 out.active[bodySimIndex] = 1;
@@ -352,18 +396,24 @@ PXG_TEST(updateBounds_engineAbi)
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-10.f, 10.f);
 
-    const uint32_t numShapes = 600;   // last 40 are articulation shapes
-    const uint32_t numRigidShapes = numShapes - 40;
+    const uint32_t numRandomShapes = 600;  // last 40 are articulation shapes
+    const uint32_t numRigidShapes = numRandomShapes - 40;
+    // P9.86c: two directed convex shapes appended after the random fleet
+    // (600 = the hull whose x minimum is a +-0 tie, 601 = the x maximum tie)
+    const uint32_t numDirShapes = 2;
+    const uint32_t numShapes = numRandomShapes + numDirShapes;
     const uint32_t maxNodes = 256;    // nodes [firstArtNode, firstArtNode+12) are articulation links
-    const uint32_t numHulls = 8;
+    const uint32_t numHulls = 8;      // random hulls (rollGeometry draws from these)
+    const uint32_t numAllHulls = numHulls + numDirShapes;
     const uint32_t nbArts = 3;
     const uint32_t maxLinks = 4;
     const uint32_t firstArtNode = 240;
+    const uint32_t dirNode = 252;     // unused by the fleet (rigid [0,240), links [240,252))
 
     // ---- convex geometry blob: numHulls hulls, header (48 bytes) + up to 64
     // float4 vertices; every hull base is 16-byte aligned (multiple-of-4 uints)
     std::vector<uint32_t> geometryBlob;
-    std::vector<uint64_t> hullByteOffsets(numHulls);
+    std::vector<uint64_t> hullByteOffsets(numAllHulls);
     for (uint32_t h = 0; h < numHulls; ++h)
     {
         const uint32_t base = uint32_t(geometryBlob.size());
@@ -382,9 +432,36 @@ PXG_TEST(updateBounds_engineAbi)
         }
     }
 
+    // ---- P9.86c directed hulls (no rng: the random fleet is unchanged).
+    // Two unit boxes with a face on the local z = 0 plane, every coordinate an
+    // exact +-1 or +0.  Under the directed pose (dirNode below) rot.col0.x =
+    // rot.col1.x = +0 and rot.col2.x = -1, so vertexV.x = ((+0)vx + (+0)vy) + (-1)vz:
+    // on the z = 0 face it is -0 for (-1,-1,0) only and +0 for the other three.
+    //  hull A (z in {-1,0}): the x MINIMUM is that zero; (-1,-1,0) comes FIRST, so
+    //    the CUDA's selectMin keeps the later +0 ties (minX = +0) while an FMin
+    //    fold gives -0.
+    //  hull B (z in {0,1}): the x MAXIMUM is that zero; (-1,-1,0) comes LAST, so
+    //    selectMax keeps -0 (maxX = -0) while an FMax fold gives +0.
+    // pose.p.x = -0 carries the tie's sign into the stored bound (x + -0 = x).
+    static const float dirHullVerts[numDirShapes][8][3] = {
+        { { -1, -1, 0 }, { 1, -1, 0 }, { 1, 1, 0 }, { -1, 1, 0 },
+          { -1, -1, -1 }, { 1, -1, -1 }, { 1, 1, -1 }, { -1, 1, -1 } },
+        { { 1, -1, 0 }, { 1, 1, 0 }, { -1, 1, 0 }, { -1, -1, 0 },
+          { -1, -1, 1 }, { 1, -1, 1 }, { 1, 1, 1 }, { -1, 1, 1 } },
+    };
+    for (uint32_t k = 0; k < numDirShapes; ++k)
+    {
+        const uint32_t base = uint32_t(geometryBlob.size()); // multiple of 4 uints (16-byte aligned)
+        hullByteOffsets[numHulls + k] = uint64_t(base) * 4;
+        geometryBlob.resize(base + 12 + 8 * 4, 0u);
+        geometryBlob[base + 4] = 8u << 8;
+        for (uint32_t v = 0; v < 8; ++v)
+            std::memcpy(&geometryBlob[base + 12 + v * 4], dirHullVerts[k][v], 12);
+    }
+
     // ---- shapes (PxgShape pool: convex hull entries; hullOrMeshOffset is
     // patched to a live device address once the blob is uploaded)
-    std::vector<Shape> shapes(numHulls);
+    std::vector<Shape> shapes(numAllHulls);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(Shape));
     for (uint32_t h = 0; h < numHulls; ++h)
     {
@@ -401,6 +478,12 @@ PXG_TEST(updateBounds_engineAbi)
             s.scaleRotation = q.toQuat();
         }
         s.type = eCONVEXMESH;
+    }
+    for (uint32_t h = numHulls; h < numAllHulls; ++h)
+    {
+        shapes[h].scale = Float3{ 1.f, 1.f, 1.f }; // identity mesh scale: no scale multiply
+        shapes[h].scaleRotation = Quat{ 0, 0, 0, 1 };
+        shapes[h].type = eCONVEXMESH;
     }
 
     // ---- bodies + sleep data
@@ -448,6 +531,18 @@ PXG_TEST(updateBounds_engineAbi)
     artiSleepData[2] = SolverBodySleepData{ 0.125f, eDEACTIVATE_THIS_FRAME };
 
     // per-articulation link transforms
+    // P9.86c directed body: an exact unit quaternion (120 deg axis permutation,
+    // columns (+0,1,+0) / (+0,+0,-1) / (-1,+0,+0)), world position x = -0 (a
+    // negated zero), identity COM frame; active, not frozen.  getAbsPose gives
+    // pose.q = body2World.q and pose.p = rotate(+0 vec) + p = (-0,+0,+0) + (-0,5,5)
+    // = (-0,5,5) in the CUDA, the port and the mirror alike.
+    bodySims[dirNode].body2World.q = Float4{ -0.5f, -0.5f, 0.5f, 0.5f };
+    bodySims[dirNode].body2World.p = Float4{ -0.0f, 5.f, 5.f, 0.f };
+    bodySims[dirNode].body2Actor_maxImpulseW.q = Float4{ 0.f, 0.f, 0.f, 1.f };
+    bodySims[dirNode].body2Actor_maxImpulseW.p = Float4{ 0.f, 0.f, 0.f, 0.f };
+    bodyDataIndices[dirNode] = dirNode;
+    sleepData[dirNode].internalFlags = 0;
+
     std::vector<TransformV> artLinkB2W(nbArts * maxLinks);
     std::vector<TransformV> artLinkB2A(nbArts * maxLinks);
     for (uint32_t k = 0; k < nbArts * maxLinks; ++k)
@@ -499,7 +594,7 @@ PXG_TEST(updateBounds_engineAbi)
 
     std::vector<ShapeSim> shapeSims(numShapes);
     std::memset(shapeSims.data(), 0, shapeSims.size() * sizeof(ShapeSim));
-    for (uint32_t i = 0; i < numShapes; ++i)
+    for (uint32_t i = 0; i < numRandomShapes; ++i)
     {
         ShapeSim& s = shapeSims[i];
         const QuatV q = randomQuat(rng);
@@ -522,6 +617,19 @@ PXG_TEST(updateBounds_engineAbi)
             s.bodySimIndex = makeNodeIndex(firstArtNode + a * maxLinks + l, l, true);
         }
         rollGeometry(s);
+    }
+    // P9.86c directed shapes: identity shape2Actor on dirNode, hull A / hull B
+    for (uint32_t k = 0; k < numDirShapes; ++k)
+    {
+        ShapeSim& s = shapeSims[numRandomShapes + k];
+        s.transform.q = Quat{ 0.f, 0.f, 0.f, 1.f };
+        s.transform.p = Float3{ 0.f, 0.f, 0.f };
+        s.localBoundsMin = Float3{ -1.f, -1.f, -1.f };
+        s.localBoundsMax = Float3{ 1.f, 1.f, 1.f };
+        s.bodySimIndex = makeNodeIndex(dirNode);
+        s.hullDataIndex = numHulls + k;
+        s.shapeFlags = uint16_t(eSIMULATION_SHAPE);
+        s.shapeType = eCONVEXMESH;
     }
 
     // ---- GPU (ENGINE launch ABI through PxgCudaShim) ----
@@ -562,7 +670,7 @@ PXG_TEST(updateBounds_engineAbi)
 
     // hullOrMeshPtr now that the blob has a device address: LIVE device
     // pointer to the cooked hull (the CUDA meaning of PxgShape::hullOrMeshPtr)
-    for (uint32_t h = 0; h < numHulls; ++h)
+    for (uint32_t h = 0; h < numAllHulls; ++h)
         shapes[h].hullOrMeshOffset = dBlob + hullByteOffsets[h];
 
     // raw PxgArticulation pool: 0xEE background, per-articulation link
@@ -623,11 +731,58 @@ PXG_TEST(updateBounds_engineAbi)
 
     // ---- reference (grid-independent) ----
     RefOutputs ref;
+    std::vector<UbFMinMaxTwin> twins;
     referenceUpdate(numShapes, shapeSims, shapes, geometryBlob, bodySims, bodyDataIndices, sleepData,
-                    artiSleepData, artLinkB2W, artLinkB2A, maxLinks, maxNodes, dBlob, ref);
+                    artiSleepData, artLinkB2W, artLinkB2A, maxLinks, maxNodes, dBlob, ref, &twins);
 
-    // engine grid (256 x 256 = one pass over 600 shapes) and a 2-block grid
-    // (512 threads -> the CUDA grid-stride wrap executes)
+    // ---- P9.86c coverage: the directed hulls must make the CUDA's selectMin/
+    // selectMax fold and the FMin/FMax twin store different bounds -- exactly the
+    // x minimum of shape 600 and the x maximum of shape 601, nothing else.
+    {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        uint32_t minDiffers = 0, maxDiffers = 0, otherDiffers = 0;
+        for (uint32_t k = 0; k < numDirShapes; ++k)
+        {
+            const uint32_t i = numRandomShapes + k;
+            PXG_CHECK_MSG(twins[i].valid, "P9.86c coverage: directed shape %u must take the convex hull path", i);
+            const float rw[6] = { ref.bounds[i].minimum.x, ref.bounds[i].minimum.y, ref.bounds[i].minimum.z,
+                                  ref.bounds[i].maximum.x, ref.bounds[i].maximum.y, ref.bounds[i].maximum.z };
+            const float tw[6] = { twins[i].minimum.x, twins[i].minimum.y, twins[i].minimum.z,
+                                  twins[i].maximum.x, twins[i].maximum.y, twins[i].maximum.z };
+            for (int c = 0; c < 6; ++c)
+            {
+                if (bits(rw[c]) == bits(tw[c]))
+                    continue;
+                if (k == 0 && c == 0)
+                    ++minDiffers;
+                else if (k == 1 && c == 3)
+                    ++maxDiffers;
+                else
+                    ++otherDiffers;
+            }
+        }
+        PXG_CHECK_MSG(minDiffers == 1 && maxDiffers == 1 && otherDiffers == 0,
+                      "P9.86c coverage: directed hulls must make PxMin/PxMax differ from FMin/FMax in "
+                      "bounds[600].minX and bounds[601].maxX only (min %u max %u other %u)",
+                      minDiffers, maxDiffers, otherDiffers);
+        // the CUDA image (selectMin/selectMax keep the LAST tied vertex's zero) ...
+        const uint32_t i0 = numRandomShapes, i1 = numRandomShapes + 1;
+        PXG_CHECK_MSG(bits(ref.transformCache[i0].transform.p.x) == 0x80000000u &&
+                          bits(ref.transformCache[i1].transform.p.x) == 0x80000000u,
+                      "P9.86c: directed pose.p.x must be -0 (%08x %08x)", bits(ref.transformCache[i0].transform.p.x),
+                      bits(ref.transformCache[i1].transform.p.x));
+        PXG_CHECK_MSG(bits(ref.bounds[i0].minimum.x) == 0x00000000u && bits(ref.bounds[i1].maximum.x) == 0x80000000u,
+                      "P9.86c: CUDA image minX(600)=+0 maxX(601)=-0 (got %08x %08x)", bits(ref.bounds[i0].minimum.x),
+                      bits(ref.bounds[i1].maximum.x));
+        // ... and the reverted port's image (FMin -> -0, FMax -> +0)
+        PXG_CHECK_MSG(bits(twins[i0].minimum.x) == 0x80000000u && bits(twins[i1].maximum.x) == 0x00000000u,
+                      "P9.86c: FMin/FMax twin image minX(600)=-0 maxX(601)=+0 (got %08x %08x)",
+                      bits(twins[i0].minimum.x), bits(twins[i1].maximum.x));
+    }
+
+    // engine grid (256 x 256 = one pass over 602 shapes) and a 2-block grid
+    // (512 threads -> the CUDA grid-stride wrap executes; threads 88/89 pick
+    // up the directed shapes 600/601)
     const std::vector<CachedTransform> cacheInit(numShapes, CachedTransform{});
     const std::vector<float> boundsInit(numShapes * 6, 0.f);
     const std::vector<uint32_t> zerosShapes(numShapes, 0), zerosNodes(maxNodes, 0);
@@ -648,6 +803,7 @@ PXG_TEST(updateBounds_engineAbi)
         shim.streamSynchronize();
 
         // ---- compare ----
+        uint32_t dirChecked = 0;
         std::vector<CachedTransform> gpuCache(numShapes);
         std::vector<float> gpuBounds(numShapes * 6);
         std::vector<uint32_t> gpuFrozen(numShapes), gpuUnfrozen(numShapes), gpuUpdated(numShapes);
@@ -687,7 +843,24 @@ PXG_TEST(updateBounds_engineAbi)
             for (int c = 0; c < 6; ++c)
                 PXG_CHECK_MSG(almostEqual(gb[c], rb[c], 1e-4f, 1e-3f), "grid %u bounds[%u][%d]: gpu=%g ref=%g",
                               gridDim, i, c, gb[c], rb[c]);
+
+            // P9.86c: the directed shapes are compared BITWISE (almostEqual
+            // treats +0 and -0 as equal): all six bound words and the cache.
+            if (i >= numRandomShapes)
+            {
+                uint32_t gw[6], rw[6];
+                std::memcpy(gw, gb, sizeof(gw));
+                std::memcpy(rw, rb, sizeof(rw));
+                for (int c = 0; c < 6; ++c)
+                    PXG_CHECK_MSG(gw[c] == rw[c], "grid %u directed bounds[%u][%d]: gpu=%08x ref=%08x", gridDim, i,
+                                  c, gw[c], rw[c]);
+                PXG_CHECK_MSG(std::memcmp(&gt, &rt, sizeof(Transform28)) == 0,
+                              "grid %u directed cache[%u] differs bitwise", gridDim, i);
+                ++dirChecked;
+            }
         }
+        PXG_CHECK_MSG(dirChecked == numDirShapes, "P9.86c coverage: grid %u compared %u directed shapes bitwise",
+                      gridDim, dirChecked);
 
         for (uint32_t n = 0; n < maxNodes; ++n)
         {
