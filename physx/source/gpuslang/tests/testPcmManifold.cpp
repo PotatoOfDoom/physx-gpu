@@ -108,13 +108,18 @@ float dot3(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 Vec3 cross3(Vec3 a, Vec3 b)
 { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
 
-// PxQuat::rotate: v + 2w(q x v) + 2(q x (q x v)), q = (x,y,z,w)
+// PxQuat::rotate (PxQuat.h:286-294), verbatim -- manifold.cuh:72 is aToB.transform,
+// i.e. q.rotate(v) + p.  P9.86: this mirror used the algebraically equal
+// v + 2w(q x v) + 2(q x (q x v)) form, as the port did; it rounds differently.
 Vec3 quatRotate(const float q[4], Vec3 v)
 {
-    const Vec3 qv = { q[0], q[1], q[2] };
-    Vec3 t = cross3(qv, v); t = { 2.0f * t.x, 2.0f * t.y, 2.0f * t.z };
-    const Vec3 c = cross3(qv, t);
-    return { v.x + q[3] * t.x + c.x, v.y + q[3] * t.y + c.y, v.z + q[3] * t.z + c.z };
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = w * w - 0.5f;
+    const float dot2 = (x * vx + y * vy + z * vz);
+    return { (vx * w2 + (y * vz - z * vy) * w + x * dot2),
+             (vy * w2 + (z * vx - x * vz) * w + y * dot2),
+             (vz * w2 + (x * vy - y * vx) * w + z * dot2) };
 }
 
 // manifold.cuh:104

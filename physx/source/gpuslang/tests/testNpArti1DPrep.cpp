@@ -155,7 +155,7 @@ static float rProjVel(const RBody& b, const float vTop[3], const float vBot[3])
     return rDot3(b.velTop, vTop) + rDot3(b.velBot, vBot);
 }
 
-static float pxMaxR(float a, float b) { return (a < b) ? b : a; }
+static float pxMaxR(float a, float b) { return (a > b) ? a : b; }   // PxMax<float> = selectMax
 
 // Dy::computeBounceVelocity
 static float rBounceVel(uint32_t flags, float jointSpeed, float bounceThreshold, float restitution,

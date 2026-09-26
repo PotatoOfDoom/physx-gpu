@@ -372,7 +372,7 @@ static void rSlopZero(float* v, float slop)
 {
     for (int k = 0; k < 3; ++k) v[k] = std::fabs(v[k]) < slop ? 0.f : v[k];
 }
-static float pxMaxR(float a, float b) { return (a < b) ? b : a; }
+static float pxMaxR(float a, float b) { return (a > b) ? a : b; }   // PxMax<float> = selectMax
 static float pxMinR(float a, float b) { return (a < b) ? a : b; }
 
 // exact transcription of setupFinalizeExtSolverConstraintsBlock PGS

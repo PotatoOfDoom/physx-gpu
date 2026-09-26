@@ -30,10 +30,12 @@
 // unread members poisoned.
 //
 // The oracle is a transcription of the .cu -- a max over the link counters with
-// PxMax's ternary, two float compares, a masked flags word -- and the comparison is
-// `==` on the raw words of the sleep-data array with NO signed-zero tolerance: the
-// ternary keeps -0.0 where max() would not, and that is exactly the difference this
-// fixture exists to see.  The blocks, the records and the link counters must all
+// PxMax<float>'s select, two float compares, a masked flags word -- and the comparison
+// is `==` on the raw words of the sleep-data array with NO signed-zero tolerance.
+// PxMax<float> is intrinsics::selectMax, `a > b ? a : b` (PxMath.h:81-85,
+// PxUnixMathIntrinsics.h:122), not the generic template `a < b ? b : a` (P9.86: the
+// port and this oracle both used the generic form before): on an all -0.0 record the
+// +0 seed survives, where the generic template would return -0.0.  The blocks, the records and the link counters must all
 // come back byte-identical (the kernel writes eight bytes per articulation and
 // nothing else).
 //
@@ -88,8 +90,8 @@ static uint32_t a3NumLinks(uint32_t a) { return (a % 7u == 6u) ? 0u : 2u + (a % 
 static uint32_t a3ArtiIndex(uint32_t a) { return (a * 29u + 7u) % A3_ARTS; }
 
 // per-link wake counters across the regimes the roll-up must separate: positive,
-// +0.0, -0.0 -- and every ninth record ENTIRELY -0.0, whose maximum the ternary
-// keeps as -0.0 (max() would return +0.0)
+// +0.0, -0.0 -- and every ninth record ENTIRELY -0.0, whose maximum selectMax keeps
+// as the +0 seed (the generic template would return -0.0)
 static float a3Wake(uint32_t rec, uint32_t link)
 {
     if (rec % 9u == 4u) return -0.0f;
@@ -117,7 +119,7 @@ static A3SleepData a3Mirror(const A3SleepData& old, const float* lwc, uint32_t l
     const float oldWc = old.wakeCounter;
     float maxWc = 0.f;
     for (uint32_t linkID = 0; linkID < linkCount; ++linkID)
-        maxWc = (lwc[linkID] < maxWc) ? maxWc : lwc[linkID]; // PxMax(lwc, maxWc), PxMath.h:75-78
+        maxWc = (lwc[linkID] > maxWc) ? lwc[linkID] : maxWc; // PxMax<float>(lwc, maxWc) = selectMax
     uint32_t newFlags = old.internalFlags & ~(A3_ACTIVATE | A3_DEACTIVATE);
     if (oldWc == 0.0f && maxWc != 0.f)
         newFlags |= A3_ACTIVATE;
@@ -210,14 +212,20 @@ PXG_TEST(artiUpdateBodies3_sleepRollup)
         if (f & A3_ACTIVATE) ++nActivate;
         else if (f & A3_DEACTIVATE) ++nDeactivate;
         else ++nNeither;
-        if (a3Bits(want[rec].wakeCounter) == 0x80000000u) ++nNegZero;
+        {
+            // records where the generic template `a < b ? b : a` would differ (-0.0)
+            float g = 0.f;
+            for (uint32_t l = 0; l < a3NumLinks(a); ++l)
+                g = (wake[rec][l] < g) ? g : wake[rec][l];
+            if (a3Bits(g) != a3Bits(want[rec].wakeCounter)) ++nNegZero;
+        }
         if (a3NumLinks(a) == 0u) ++nZeroLinks;
     }
     // the seed covers what the kernel can decide
     PXG_CHECK_MSG(nActivate > 0 && nDeactivate > 0 && nNeither > 0,
                   "seed covers all three flag outcomes (activate %u, deactivate %u, neither %u)", nActivate,
                   nDeactivate, nNeither);
-    PXG_CHECK_MSG(nNegZero > 0, "seed has articulations whose maximum is -0.0 (%u)", nNegZero);
+    PXG_CHECK_MSG(nNegZero > 0, "seed has articulations where selectMax and the generic PxMax differ (%u)", nNegZero);
     PXG_CHECK_MSG(nZeroLinks > 0, "seed has zero-link articulations (%u)", nZeroLinks);
 
     // the arg pack: dt and the bool byte are unread by Part3, so the padding AND the
@@ -263,7 +271,7 @@ PXG_TEST(artiUpdateBodies3_sleepRollup)
     }
     PXG_CHECK_MSG(wakeBad == 0, "the link wake counters are untouched (%zu arrays changed)", wakeBad);
 
-    std::printf("  articulations %u: activate %u, deactivate %u, neither %u; -0.0 maxima %u; zero-link %u\n",
+    std::printf("  articulations %u: activate %u, deactivate %u, neither %u; generic-PxMax -0.0 maxima %u; zero-link %u\n",
                 A3_ARTS, nActivate, nDeactivate, nNeither, nNegZero, nZeroLinks);
 
     for (PxgDevicePtr p : dWake) if (p) shim.memFree(p);

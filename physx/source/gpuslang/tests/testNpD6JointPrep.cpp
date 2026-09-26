@@ -246,7 +246,7 @@ inline V3 ellipseClamp(V3 pt, V3 radii)
     const V3 e2{ radii.x * radii.x, radii.y * radii.y, radii.z * radii.z };
     const V3 eq{ radii.x * q.x, radii.y * q.y, radii.z * q.z };
     const float ty = eq.y - e2.y, tz = eq.z - e2.z;
-    float t = (ty < tz) ? tz : ty;  // PxMax
+    float t = (ty > tz) ? ty : tz;  // PxMax<float> = selectMax
     for (uint32_t i = 0; i < 20; ++i)
     {
         denom = V3{ 0.0f, 1.0f / (t + e2.y), 1.0f / (t + e2.z) };

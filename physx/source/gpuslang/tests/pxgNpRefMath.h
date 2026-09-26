@@ -117,7 +117,7 @@ inline V3 normalized(V3 v)
     return V3{ v.x * r, v.y * r, v.z * r };
 }
 
-inline float pxMax(float a, float b) { return a < b ? b : a; }
+inline float pxMax(float a, float b) { return a > b ? a : b; }   // PxMax<float> = intrinsics::selectMax
 inline float pxMin(float a, float b) { return a < b ? a : b; }
 inline float pxClamp(float v, float lo, float hi) { return pxMin(hi, pxMax(lo, v)); }
 

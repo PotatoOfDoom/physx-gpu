@@ -196,12 +196,15 @@ static UnAlignedSpatialVector refPropAccel(const PxVec3& c2p,
                                            const UnAlignedSpatialVector& parentDeltaV,
                                            PxU32 dofCount, PxU32 lane, const PxReal* qstZ)
 {
-    UnAlignedSpatialVector pDeltaV =
+    const UnAlignedSpatialVector pDeltaV =
         Dy::FeatherstoneArticulation::translateSpatialVector(-c2p, parentDeltaV);
     PxReal t[3] = { 0.f, 0.f, 0.f };
     for (PxU32 ind = 0; ind < 3; ++ind)
         if (ind < dofCount)
             t[ind] = qstZ[ind] - loadSpatialVector(dofs[ind].mIsW, lane).innerProduct(pDeltaV);
+    // propagateAccelerationW_child2ParentPreLoaded (articulationDynamic.cuh:257-313):
+    // the joint terms accumulate into their own +0-seeded vector, added last
+    UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
     for (PxU32 ind = 0; ind < 3; ++ind)
     {
         if (ind < dofCount)
@@ -209,10 +212,10 @@ static UnAlignedSpatialVector refPropAccel(const PxVec3& c2p,
             const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
                                 + dofs[ind].mInvStIsT_y[lane] * t[1]
                                 + dofs[ind].mInvStIsT_z[lane] * t[2];
-            pDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+            jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
         }
     }
-    return pDeltaV;
+    return pDeltaV + jointSpatialDeltaV;
 }
 
 // the mirror of setupInternalConstraints itself; marks the words that flowed

@@ -724,18 +724,12 @@ PXG_TEST(artiSpatialMatrixBlockIo)
             const float g = got[size_t(lane) * FLOATS_PER_LANE + k];
             if (bitEq(want[k], g))
                 continue;
-            // The one tolerated difference, scoped to the six product slots of
-            // the fold lane and to one bit of them: +0 against -0.  See the
-            // FOLD_LANE note above; the count is printed and bounded so it cannot
-            // drift, and required non-zero so the lane cannot silently stop
-            // exercising the hazard.
-            if (k >= 72 && lane == FOLD_LANE &&
-                ((f2u(want[k]) == 0x00000000u && f2u(g) == 0x80000000u) ||
-                 (f2u(want[k]) == 0x80000000u && f2u(g) == 0x00000000u)))
-            {
+            // P9.86: the fold lane's six product slots used to be forgiven +0
+            // against -0 (the driver's `x + 0.0` fold).  With the SZINP stamp and
+            // the select spelling of the seed they are exact; they are counted
+            // separately so a regression names the lane.
+            if (k >= 72 && lane == FOLD_LANE)
                 ++foldZeros;
-                continue;
-            }
             if (bad < 12)
                 std::printf("MM lane %u slot %u  ref %.9g (%08x)  gpu %.9g (%08x)\n", lane, k,
                             want[k], f2u(want[k]), g, f2u(g));
@@ -743,14 +737,8 @@ PXG_TEST(artiSpatialMatrixBlockIo)
         }
     }
 
-    std::printf("[ info ] signed-zero words forgiven: %zu (the driver's `x + 0.0` fold)\n",
-                foldZeros);
-    // Measured: exactly six, one per component of the fold lane's result.  Both
-    // bounds are tripwires -- zero would mean the lane has stopped exercising the
-    // hazard (or the driver has stopped folding, which is worth being told), and
-    // more than six would mean the fold has spread somewhere it was not before.
-    PXG_CHECK_MSG(foldZeros > 0, "the fold lane must actually exercise the `x + 0.0` fold");
-    PXG_CHECK_MSG(foldZeros <= 6, "the signed-zero count has drifted: %zu", foldZeros);
+    std::printf("[ info ] fold-lane product mismatches: %zu (P9.86: must be 0)\n", foldZeros);
+    PXG_CHECK_MSG(foldZeros == 0, "the fold lane's +0 seed must survive: %zu", foldZeros);
     PXG_CHECK_MSG(bad == 0, "block loads identical to loadSpatialMatrix / loadPxMat33");
 
     // asmStoreSpatialMatrix forwards three separate blocks to abStoreSpatialMatrix,

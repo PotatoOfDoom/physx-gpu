@@ -135,7 +135,9 @@ float3 crossQ(float3 a, float3 b)
 float magSqQ(float3 v) { return dot3Q(v, v); }
 float magQ(float3 v) { return sqrt(magSqQ(v)); }
 
-float pxMaxQ(float a, float b) { return (a < b) ? b : a; }
+// P9.86: PxMax<float> is intrinsics::selectMax (PxMath.h:81-85, PxUnixMathIntrinsics.h:122):
+// b wins a +-0 tie and a NaN compare -- not the generic template's `a < b ? b : a`
+float pxMaxQ(float a, float b) { return (a > b) ? a : b; }
 
 // PxVec3::getNormalized: m > 0 ? v * PxRecipSqrt(m) : 0
 float3 getNormalizedQ(float3 v)

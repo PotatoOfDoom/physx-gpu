@@ -136,7 +136,7 @@ static UnAlignedSpatialVector refPropImpulseTemp(PxgArticulationBlockLinkData* l
         {
             const UnAlignedSpatialVector sas = loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane);
             const UnAlignedSpatialVector isInvD = loadSpatialVector(dofs[ind].mIsInvDW, lane);
-            const PxReal stZ = -sas.innerProduct(Z);
+            const PxReal stZ = 0.0f - sas.innerProduct(Z); // jf - s.Z, jf = 0 (cuh:141-142)
             dofs[ind].mTmpQstZ[lane] += stZ;
             temp += isInvD * stZ;
         }
@@ -155,13 +155,16 @@ static UnAlignedSpatialVector refPropAccelTemp(PxgArticulationBlockLinkData* lk,
     const PxVec3 c2p(link.mRw_x[lane], link.mRw_y[lane], link.mRw_z[lane]);
     PxgArticulationBlockDofData* dofs = df + jointOffset;
 
-    UnAlignedSpatialVector pDeltaV =
+    const UnAlignedSpatialVector pDeltaV =
         Dy::FeatherstoneArticulation::translateSpatialVector(-c2p, deltaV);
     PxReal t[3] = { 0.f, 0.f, 0.f };
     for (PxU32 ind = 0; ind < 3; ++ind)
         if (ind < dofCount)
             t[ind] = dofs[ind].mTmpQstZ[lane]
                    - loadSpatialVector(dofs[ind].mIsW, lane).innerProduct(pDeltaV);
+    // child2ParentPreLoaded (articulationDynamic.cuh:293-312): joint terms go into
+    // their own +0-seeded vector, added to pDeltaV last
+    UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
     for (PxU32 ind = 0; ind < 3; ++ind)
     {
         if (ind < dofCount)
@@ -169,10 +172,10 @@ static UnAlignedSpatialVector refPropAccelTemp(PxgArticulationBlockLinkData* lk,
             const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
                                 + dofs[ind].mInvStIsT_y[lane] * t[1]
                                 + dofs[ind].mInvStIsT_z[lane] * t[2];
-            pDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+            jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
         }
     }
-    return pDeltaV;
+    return pDeltaV + jointSpatialDeltaV;
 }
 
 static void refImpulseSelfResponseSlow(uint32_t linkID0, uint32_t linkID1,
@@ -266,7 +269,7 @@ static void refImpulseSelfResponse(uint32_t linkId0, uint32_t linkId1,
                     loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane);
                 const UnAlignedSpatialVector isInvD =
                     loadSpatialVector(dofs[ind].mIsInvDW, lane);
-                const PxReal stZ = -sas.innerProduct(Z1W);
+                const PxReal stZ = 0.0f - sas.innerProduct(Z1W); // jf - s.Z, jf = 0
                 qstZ[ind] += stZ;
                 temp += isInvD * stZ;
             }
@@ -277,13 +280,14 @@ static void refImpulseSelfResponse(uint32_t linkId0, uint32_t linkId1,
         const UnAlignedSpatialVector dV0 = parentResponse * dif;
 
         // acceleration back down (the qstZ-array variant)
-        UnAlignedSpatialVector pDeltaV =
+        const UnAlignedSpatialVector pDeltaV =
             Dy::FeatherstoneArticulation::translateSpatialVector(-c2p, dV0);
         PxReal t[3] = { 0.f, 0.f, 0.f };
         for (PxU32 ind = 0; ind < 3; ++ind)
             if (ind < dofCount)
                 t[ind] = qstZ[ind]
                        - loadSpatialVector(dofs[ind].mIsW, lane).innerProduct(pDeltaV);
+        UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
         for (PxU32 ind = 0; ind < 3; ++ind)
         {
             if (ind < dofCount)
@@ -291,11 +295,11 @@ static void refImpulseSelfResponse(uint32_t linkId0, uint32_t linkId1,
                 const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
                                     + dofs[ind].mInvStIsT_y[lane] * t[1]
                                     + dofs[ind].mInvStIsT_z[lane] * t[2];
-                pDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+                jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
             }
         }
         deltaV0 = dV0;
-        deltaV1 = pDeltaV;
+        deltaV1 = pDeltaV + jointSpatialDeltaV;
     }
     else
     {

@@ -589,12 +589,9 @@ PXG_TEST(artiPropagateInertia)
         shim.memcpyDtoH(gotScratch.data(), dScratch, gotScratch.size() * sizeof(float));
 
         // ---- blocks, byte for byte ----
-        // The ONLY tolerated difference, and it is scoped to one bit of one value:
-        // a word that is +0 on one side and -0 on the other.  See the module
-        // header — the driver folds `x + 0.0` below SPIR-V, which no shader-level
-        // workaround defeats (measured: seeding the accumulators from
-        // `abs(armature) * 0.0f` changes nothing).  The count is printed so it
-        // cannot drift upwards unnoticed.
+        // P9.86: +0 against -0 used to be forgiven here (the driver's `x + 0.0`
+        // fold).  With the SZINP stamp and the select spellings it is exact; such
+        // words are still counted separately so a regression is named as one.
         auto sZero = [](uint32_t a, uint32_t b) {
             return (a == 0x00000000u && b == 0x80000000u) || (a == 0x80000000u && b == 0x00000000u);
         };
@@ -606,10 +603,7 @@ PXG_TEST(artiPropagateInertia)
                 if (w[k] == g[k])
                     continue;
                 if (sZero(w[k], g[k]))
-                {
                     ++signedZeros;
-                    continue;
-                }
                 if (bad < 12)
                     std::printf("MM pass %u %s word %zu  ref %08x  gpu %08x\n", pass, what, k,
                                 w[k], g[k]);
@@ -630,10 +624,7 @@ PXG_TEST(artiPropagateInertia)
                 if (bitEq(wantScratch[x], gotScratch[x]))
                     continue;
                 if (sZero(f2u(wantScratch[x]), f2u(gotScratch[x])))
-                {
                     ++signedZeros;
-                    continue;
-                }
                 if (badScratch < 12)
                     std::printf("MM pass %u scratch lane %u slot %u  ref %.9g (%08x)  "
                                 "gpu %.9g (%08x)\n",
@@ -644,11 +635,8 @@ PXG_TEST(artiPropagateInertia)
         }
     }
 
-    std::printf("[ info ] signed-zero words forgiven: %zu (the driver's `x + 0.0` fold)\n",
-                signedZeros);
-    PXG_CHECK_MSG(signedZeros > 0,
-                  "lane 10 must actually exercise the signed-zero fold (got %zu)", signedZeros);
-    PXG_CHECK_MSG(signedZeros < 40, "the signed-zero count has drifted: %zu", signedZeros);
+    std::printf("[ info ] +-0 mismatches: %zu (P9.86: must be 0)\n", signedZeros);
+    PXG_CHECK_MSG(signedZeros == 0, "lane 10's +0 seeds must survive: %zu", signedZeros);
     PXG_CHECK_MSG(bad == 0, "block image identical to the engine-built mirror");
     PXG_CHECK_MSG(badScratch == 0, "ZA / ZAInt / the returned matrix identical, bit for bit");
 
@@ -943,10 +931,7 @@ PXG_TEST(artiArticulatedInertia)
                 if (w[x] == g[x])
                     continue;
                 if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-                {
-                    ++signedZeros;
-                    continue;
-                }
+                    ++signedZeros;   // P9.86: counted, and a mismatch
                 if (bad < 12)
                     std::printf("MM pass %u %s word %zu  ref %08x  gpu %08x\n", pass, what, x,
                                 w[x], g[x]);
@@ -959,8 +944,9 @@ PXG_TEST(artiArticulatedInertia)
         cmp("arti", wantAb.data(), gotAb.data(), wantAb.size() * sizeof(PxgArticulationBlockData));
     }
 
-    std::printf("[ info ] loop: clamp fired %zu times, signed zeros forgiven %zu\n", gClampFires,
+    std::printf("[ info ] loop: clamp fired %zu times, +-0 mismatches %zu\n", gClampFires,
                 signedZeros);
+    PXG_CHECK_MSG(signedZeros == 0, "+-0 mismatches: %zu", signedZeros);
     PXG_CHECK_MSG(gClampFires > 0,
                   "PxMax(0, .) must actually clamp something, or the guard is untested");
     PXG_CHECK_MSG(bad == 0, "the leaf-to-root sweep matches the engine-built mirror");
@@ -1146,10 +1132,7 @@ PXG_TEST(artiArticulatedInertiaLaunch)
                 if (w[x] == g[x])
                     continue;
                 if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
-                {
-                    ++signedZeros;
-                    continue;
-                }
+                    ++signedZeros;   // P9.86: counted, and a mismatch
                 if (bad < 12)
                     std::printf("MM pass %u %s word %zu  ref %08x  gpu %08x\n", pass, what, x,
                                 w[x], g[x]);
@@ -1162,7 +1145,8 @@ PXG_TEST(artiArticulatedInertiaLaunch)
         cmp("arti", wantAb.data(), gotAb.data(), wantAb.size() * sizeof(PxgArticulationBlockData));
     }
 
-    std::printf("[ info ] launch: signed zeros forgiven %zu\n", signedZeros);
+    std::printf("[ info ] launch: +-0 mismatches %zu\n", signedZeros);
+    PXG_CHECK_MSG(signedZeros == 0, "+-0 mismatches: %zu", signedZeros);
     PXG_CHECK_MSG(bad == 0, "the wrapper's whole block image matches the mirror");
 
     shim.memFree(dIsland);
