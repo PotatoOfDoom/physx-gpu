@@ -64,7 +64,15 @@
 //     constraints; tendon mNumConstraints, tj mConstraintId, and the
 //     mTmpQstZ scratch the slow path leaves behind are all compared (the
 //     scratch is observable state); link/attachment/tendon-joint inputs and
-//     the arti block must come back untouched.
+//     the arti block must come back untouched;
+//   * P9.86c: the last 8 articulations are WITNESSES (stSeedWitness): a fixed
+//     base (link 0's response is the zero matrix, forwardDynamic2.cu:1794) or
+//     a free root with a block-diagonal response, links hanging along -y,
+//     identity poses up to the signs of their zero components, axis-aligned
+//     dofs and y-axis attachments -- the exact-zero dots and +-0 lanes the
+//     P9.86 fixes of this shader are about.
+//     Host twins of the three surviving audit-fix reverts (r1c, r3, r7) run
+//     the mirror over them; see the note above stM6.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -96,7 +104,10 @@ using physx::gpuslang::PxgResult;
 
 static std::vector<uint8_t> stLoader(const char* file) { return loadShaderBlob(file); }
 
-const uint32_t ST_NB = 68, ST_WARPS = 3;
+// ST_NB_GENERIC hash-seeded articulations, then the P9.86c witness
+// articulations (stWitness) up to ST_NB
+const uint32_t ST_NB_GENERIC = 68, ST_NB = 76, ST_WARPS = 3;
+static bool stWitness(uint32_t a) { return a >= ST_NB_GENERIC; }
 const uint32_t ST_MAX_LINKS = 6, ST_MAX_DOFS = 8, ST_MAX_TENDONS = 2, ST_MAX_ELEMS = 6;
 const float ST_STEP_DT = 0.004f, ST_DT = 0.0333f, ST_INV_DT = 250.0f;
 const float ST_MIN_RESPONSE = 1e-12f;
@@ -115,6 +126,127 @@ static PxQuat qv(uint32_t a, uint32_t l, uint32_t salt)
 }
 
 static uint32_t stNumLinks(uint32_t a) { return 4u + (a % 3u); }
+
+// ---- P9.86c: host twins of the surviving audit-fix reverts ----
+//
+// The P9.86 fixes of npArtiSetupTendons.slang that the revert sweep could not
+// kill are EQUIVALENT against HEAD -- no input changes an output bit:
+//   r1c  stPropagateAccelC2P returns asmSVecAdd(pDeltaV, jointSpatialDeltaV)
+//        without the stPlusZero3 select.  llvmpipe forwards the literal +0
+//        seed of jointSpatialDeltaV and folds `0 + term`, so the sum differs
+//        from the CUDA's (articulationDynamic.cuh:292-312) only where a zero
+//        lane of the folded accumulator is -0 -- and pDeltaV + (-0) equals
+//        pDeltaV + (+0) bit for bit unless pDeltaV == -0.  pDeltaV is never
+//        -0: it is translate(-c2p, x) with x an asmM6MulVec row (a select seed
+//        that is never -0, then five IEEE adds) or a previous hop's result
+//        (never -0 by induction), and its bottom adds a cross product to such
+//        a lane; in round-to-nearest x + y is -0 only when both are.
+//   r3   the fast path's propagateImpulseW<WriteToProvidedQstZ> spelled as
+//        adPropagateImpulseW (stZ = -dot, and the literal {0,0,0} qstZ seed
+//        folded): stZ is -0 where the CUDA's 0.0f - dot is +0, at dot == +0
+//        only.  Every consumer is +, -, * (differences stay in the sign of a
+//        zero) until asmM6MulVec, whose select seed and adds of a never--0
+//        partial sum map both zeros to the same bits (deltaV0), and until
+//        pDeltaV + jointSpatialDeltaV with a never--0 pDeltaV (deltaV1).
+//   r7   the slow path's propagateImpulseW<WriteToTempQstZ> spelled the same
+//        way: mTmpQstZ = (runtime +0 from the zeroing loop) + stZ is +0 for
+//        either zero, and Z0/Z1 reach nothing but asmM6MulVec(-(Z0 + Z1)).
+// All three rest on asmM6MulVec's own P9.86 select seed (pxgSlangSpatialMatrix
+// .slang, guarded by artiSpatialMatrixBlockIo's FOLD_LANE) and on IEEE
+// subnormals.  gStTwin replays each revert in the mirror (ST_TW_M6FOLD replays
+// the PRE-P9.86 asmM6MulVec: the +0 seed folded into the first product); the
+// witness articulations are searched so that
+//   * every twin alone leaves the whole image bit-identical (the equivalence),
+//   * r1c and r7 on top of ST_TW_M6FOLD, and r3 on top of ST_TW_M6FOLD |
+//     ST_TW_R1C, change output words (the witnesses do carry the revert's
+//     zero sign up to the absorbers: without asmM6MulVec's seed -- and, for
+//     r3, the pDeltaV + jointSpatialDeltaV canonicalisation -- each revert
+//     would be killable, so the inputs are not vacuous),
+//   * dot == +0 hops occur on both paths, the folded accumulator really holds
+//     -0 lanes, and no pDeltaV lane is ever -0 (the premise of r1c).
+enum : int { ST_TW_R1C = 1, ST_TW_R3 = 2, ST_TW_R7 = 4, ST_TW_M6FOLD = 8 };
+static int gStTwin = 0;
+static bool gStPlain = false;     // the plain mirror run: count the premises
+static bool gStCountWit = false;  // ... and, on witness articulations, the coverage
+static size_t gStFastDotPosZero = 0, gStSlowDotPosZero = 0;
+static size_t gStAccFoldNegZero = 0, gStPdNegZero = 0;
+
+static bool stIsNegZero(PxReal v) { return v == 0.f && std::signbit(v); }
+static bool stIsPosZero(PxReal v) { return v == 0.f && !std::signbit(v); }
+
+// PxSpatialMatrix::operator* (PxSpatialMatrix.h:58-77), or under ST_TW_M6FOLD
+// the product the pre-P9.86 asmM6MulVec gave on llvmpipe (seed folded)
+static UnAlignedSpatialVector stM6(const PxSpatialMatrix& m, const UnAlignedSpatialVector& s)
+{
+    if (!(gStTwin & ST_TW_M6FOLD))
+        return m * s;
+    const PxReal st[6] = { s.top.x, s.top.y, s.top.z, s.bottom.x, s.bottom.y, s.bottom.z };
+    PxReal r[6];
+    for (PxU32 i = 0; i < 6; ++i)
+    {
+        r[i] = m.column[0][i] * st[0];
+        for (PxU32 j = 1; j < 6; ++j)
+            r[i] += m.column[j][i] * st[j];
+    }
+    return UnAlignedSpatialVector(PxVec3(r[0], r[1], r[2]), PxVec3(r[3], r[4], r[5]));
+}
+
+// propagateImpulseW<...> with jointForce NULL: jf - dot = 0.0f - dot
+// (articulationDynamic.cuh:143-144); the r3/r7 twins take the preloaded -dot
+static PxReal stStZ(PxReal ip, bool twin, size_t& posZeroCounter)
+{
+    if (gStCountWit && stIsPosZero(ip))
+        ++posZeroCounter;
+    return twin ? -ip : 0.0f - ip;
+}
+
+// the tail of propagateAccelerationW_child2ParentPreLoaded (cuh:292-312): the
+// joint terms go into their own +0-seeded vector, added to pDeltaV last; the
+// r1c twin adds the accumulator with its seed folded away instead
+static UnAlignedSpatialVector stC2PTail(const UnAlignedSpatialVector& pDeltaV, const PxReal t[3],
+                                        const PxgArticulationBlockDofData* dofs, PxU32 dofCount,
+                                        uint32_t lane)
+{
+    UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
+    UnAlignedSpatialVector folded(PxVec3(0.f), PxVec3(0.f));
+    bool first = true;
+    for (PxU32 ind = 0; ind < 3; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
+                                + dofs[ind].mInvStIsT_y[lane] * t[1]
+                                + dofs[ind].mInvStIsT_z[lane] * t[2];
+            const UnAlignedSpatialVector term =
+                loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
+            jointSpatialDeltaV += term;
+            if (first)
+                folded = term;
+            else
+                folded += term;
+            first = false;
+        }
+    }
+    if (gStPlain)
+    {
+        const PxReal jv[6] = { jointSpatialDeltaV.top.x, jointSpatialDeltaV.top.y, jointSpatialDeltaV.top.z,
+                               jointSpatialDeltaV.bottom.x, jointSpatialDeltaV.bottom.y, jointSpatialDeltaV.bottom.z };
+        const PxReal fw[6] = { folded.top.x, folded.top.y, folded.top.z,
+                               folded.bottom.x, folded.bottom.y, folded.bottom.z };
+        const PxReal pv[6] = { pDeltaV.top.x, pDeltaV.top.y, pDeltaV.top.z,
+                               pDeltaV.bottom.x, pDeltaV.bottom.y, pDeltaV.bottom.z };
+        for (int k = 0; k < 6; ++k)
+        {
+            if (gStCountWit && stIsPosZero(jv[k]) && stIsNegZero(fw[k]))
+                ++gStAccFoldNegZero;
+            if (stIsNegZero(pv[k]))
+                ++gStPdNegZero;
+        }
+    }
+    if (gStTwin & ST_TW_R1C)
+        return first ? pDeltaV : pDeltaV + folded;   // no dof: `pd + 0` folds to pd
+    return pDeltaV + jointSpatialDeltaV;
+}
 
 // ---- host mirrors of the propagate hops over mTmpQstZ ----
 
@@ -136,7 +268,9 @@ static UnAlignedSpatialVector refPropImpulseTemp(PxgArticulationBlockLinkData* l
         {
             const UnAlignedSpatialVector sas = loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane);
             const UnAlignedSpatialVector isInvD = loadSpatialVector(dofs[ind].mIsInvDW, lane);
-            const PxReal stZ = 0.0f - sas.innerProduct(Z); // jf - s.Z, jf = 0 (cuh:141-142)
+            // jf - s.Z, jf = 0 (cuh:143-144)
+            const PxReal stZ = stStZ(sas.innerProduct(Z), (gStTwin & ST_TW_R7) != 0,
+                                     gStSlowDotPosZero);
             dofs[ind].mTmpQstZ[lane] += stZ;
             temp += isInvD * stZ;
         }
@@ -164,18 +298,7 @@ static UnAlignedSpatialVector refPropAccelTemp(PxgArticulationBlockLinkData* lk,
                    - loadSpatialVector(dofs[ind].mIsW, lane).innerProduct(pDeltaV);
     // child2ParentPreLoaded (articulationDynamic.cuh:293-312): joint terms go into
     // their own +0-seeded vector, added to pDeltaV last
-    UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
-                                + dofs[ind].mInvStIsT_y[lane] * t[1]
-                                + dofs[ind].mInvStIsT_z[lane] * t[2];
-            jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
-        }
-    }
-    return pDeltaV + jointSpatialDeltaV;
+    return stC2PTail(pDeltaV, t, dofs, dofCount, lane);
 }
 
 static void refImpulseSelfResponseSlow(uint32_t linkID0, uint32_t linkID1,
@@ -224,7 +347,7 @@ static void refImpulseSelfResponseSlow(uint32_t linkID0, uint32_t linkID1,
     const UnAlignedSpatialVector ZZ = Z0 + Z1;
     PxSpatialMatrix spatialResponse;
     loadSpatialMatrix(lk[common].mSpatialResponseMatrix, lane, spatialResponse);
-    const UnAlignedSpatialVector v = spatialResponse * (-ZZ);
+    const UnAlignedSpatialVector v = stM6(spatialResponse, -ZZ);
 
     UnAlignedSpatialVector dv1 = v;
     for (PxU32 index = i1; (index--) > i0;)
@@ -269,15 +392,20 @@ static void refImpulseSelfResponse(uint32_t linkId0, uint32_t linkId1,
                     loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane);
                 const UnAlignedSpatialVector isInvD =
                     loadSpatialVector(dofs[ind].mIsInvDW, lane);
-                const PxReal stZ = 0.0f - sas.innerProduct(Z1W); // jf - s.Z, jf = 0
-                qstZ[ind] += stZ;
+                // jf - s.Z, jf = 0
+                const PxReal stZ = stStZ(sas.innerProduct(Z1W), (gStTwin & ST_TW_R3) != 0,
+                                         gStFastDotPosZero);
+                if (gStTwin & ST_TW_R3)
+                    qstZ[ind] = stZ;   // the revert's literal {0,0,0} seed, folded
+                else
+                    qstZ[ind] += stZ;
                 temp += isInvD * stZ;
             }
         }
         const UnAlignedSpatialVector Z0W =
             Dy::FeatherstoneArticulation::translateSpatialVector(c2p, temp);
         const UnAlignedSpatialVector dif = impulse0 - Z0W;
-        const UnAlignedSpatialVector dV0 = parentResponse * dif;
+        const UnAlignedSpatialVector dV0 = stM6(parentResponse, dif);
 
         // acceleration back down (the qstZ-array variant)
         const UnAlignedSpatialVector pDeltaV =
@@ -287,19 +415,8 @@ static void refImpulseSelfResponse(uint32_t linkId0, uint32_t linkId1,
             if (ind < dofCount)
                 t[ind] = qstZ[ind]
                        - loadSpatialVector(dofs[ind].mIsW, lane).innerProduct(pDeltaV);
-        UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
-        for (PxU32 ind = 0; ind < 3; ++ind)
-        {
-            if (ind < dofCount)
-            {
-                const PxReal jDelta = dofs[ind].mInvStIsT_x[lane] * t[0]
-                                    + dofs[ind].mInvStIsT_y[lane] * t[1]
-                                    + dofs[ind].mInvStIsT_z[lane] * t[2];
-                jointSpatialDeltaV += loadSpatialVector(dofs[ind].mWorldMotionMatrix, lane) * jDelta;
-            }
-        }
         deltaV0 = dV0;
-        deltaV1 = pDeltaV + jointSpatialDeltaV;
+        deltaV1 = stC2PTail(pDeltaV, t, dofs, dofCount, lane);
     }
     else
     {
@@ -599,6 +716,185 @@ struct StBuffers
     std::vector<PxgArticulationInternalTendonConstraintData> itcF;
 };
 
+// ---- P9.86c witness articulations ----
+//
+// An articulation in an axis-aligned rest geometry: link 0 is a fixed base
+// (its response is the zero matrix, zeroSpatialMatrix, forwardDynamic2.cu:
+// 1794) or a free root body at its COM (a block-diagonal response, every
+// other entry a signed zero); the links hang along -y on the y axis (link
+// poses, mRw and the joint frames have +-0 x/z lanes), every quaternion is
+// the identity up to the signs of its zero components and the double cover
+// (w = +-1), and every dof is an axis-aligned revolute or prismatic joint
+// with a diagonal inertia (world motion e_k with +-0 lanes, IsW = m e_k,
+// IsInvD = e_k, invStIsT = 1/m on the diagonal) -- no prismatic-y dof, so the
+// y-directed tendon forces meet exact-zero dots.  Spatial attachments sit on
+// the y axis; the fixed tendon's root joint is on link 0, one tendon joint on
+// link 1 (the fast path over link 0's response) and one on the deepest link
+// (the slow path, common ancestor link 0).  The choices above, the signs of
+// the zero lanes, the axes and the offsets come from `seed`; the seeds were
+// searched on the host with the twins (every twin alone: 0 words changed;
+// r1c/r7 on top of ST_TW_M6FOLD, r3 on top of ST_TW_M6FOLD | ST_TW_R1C: > 0
+// words changed; teeth found for r1c on witnesses 0 2 4 5 7, r3 on 0 2 4, r7
+// on 1 3 5 6) and are pinned by the coverage checks of the test body.
+static const uint32_t gStWitnessSeeds[ST_NB - ST_NB_GENERIC] = { 13064u, 111u, 3914u, 347u,
+                                                                 674u, 666u, 229u, 4u };
+
+struct StWitnessRng
+{
+    uint32_t s;
+    uint32_t next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+    float z() { return (next() & 1u) ? -0.0f : 0.0f; }   // a signed zero
+    float sg() { return (next() & 1u) ? -1.0f : 1.0f; }
+    bool bit() { return (next() & 1u) != 0u; }
+};
+
+static void stSeedWitness(StBuffers& B, uint32_t a, uint32_t seed)
+{
+    const uint32_t w = a / 32, lane = a % 32;
+    PxgArticulationBlockLinkData* L = &B.lk[size_t(w) * ST_MAX_LINKS];
+    PxgArticulationBlockDofData* D = &B.df[size_t(w) * ST_MAX_DOFS];
+    StWitnessRng r{ seed * 2654435761u + 0x9E3779B9u };
+    for (int k = 0; k < 4; ++k) r.next();
+
+    const uint32_t numLinks = stNumLinks(a);
+    static const float ys[6] = { 0.f, -1.f, -2.f, -3.f, -1.5f, -2.5f };
+    auto parentOf = [](uint32_t l) { return (l == 4) ? 1u : (l == 5 ? 4u : l - 1u); };
+    PxVec3 pos[6];
+    for (uint32_t l = 0; l < numLinks; ++l)
+        pos[l] = PxVec3(r.z(), ys[l], r.z());
+    auto zq = [&]() { return make_float4(r.z(), r.z(), r.z(), r.sg()); };
+
+    uint32_t linkAx[6][2] = {};
+    uint32_t linkNbDofs[6] = {};
+    uint32_t dofCursor = 0;
+    for (uint32_t l = 0; l < numLinks; ++l)
+    {
+        PxgArticulationBlockLinkData& lnk = L[l];
+        lnk.mAccumulatedPose.q[lane] = zq();
+        lnk.mAccumulatedPose.p[lane] = make_float4(pos[l].x, pos[l].y, pos[l].z, 0.f);
+        if (l == 0)
+        {
+            // a fixed base: zeroSpatialMatrix (forwardDynamic2.cu:1794); or a
+            // free root body at its COM with a diagonal inertia: angular velocity
+            // from torque, linear velocity from force, every other entry a
+            // signed zero
+            const bool freeRoot = r.bit();
+            PxSpatialMatrix m;
+            for (uint32_t cI = 0; cI < 6; ++cI)
+                for (uint32_t rI = 0; rI < 6; ++rI)
+                    m.column[cI][rI] = freeRoot ? r.z() : 0.0f;
+            if (freeRoot)
+                for (uint32_t k = 0; k < 3; ++k)
+                {
+                    m.column[3 + k][k] = r.bit() ? 2.0f : 0.5f;   // torque k -> angular k
+                    m.column[k][3 + k] = r.bit() ? 2.0f : 0.5f;   // force k -> linear k
+                }
+            storeSpatialMatrix(lnk.mSpatialResponseMatrix, lane, m);
+            lnk.mParentPose.q[lane] = zq();
+            lnk.mParentPose.p[lane] = make_float4(r.z(), r.z(), r.z(), 0.f);
+            lnk.mChildPose.q[lane] = zq();
+            lnk.mChildPose.p[lane] = make_float4(r.z(), r.z(), r.z(), 0.f);
+            continue;
+        }
+        const uint32_t parent = parentOf(l);
+        const PxVec3 rw = pos[l] - pos[parent];
+        lnk.mRw_x[lane] = rw.x;
+        lnk.mRw_y[lane] = rw.y;
+        lnk.mRw_z[lane] = rw.z;
+        // the joint half way between the two link origins
+        const float half = 0.5f * (ys[l] - ys[parent]);
+        lnk.mParentPose.q[lane] = zq();
+        lnk.mParentPose.p[lane] = make_float4(r.z(), half, r.z(), 0.f);
+        lnk.mChildPose.q[lane] = zq();
+        lnk.mChildPose.p[lane] = make_float4(r.z(), -half, r.z(), 0.f);
+
+        const uint32_t nbDofs = lnk.mDofs[lane];   // as the generic seeding (1 or 2)
+        linkNbDofs[l] = nbDofs;
+        static const uint32_t axPool[5] = { 0u, 1u, 2u, 3u, 5u };   // no eY (4)
+        const uint32_t i0 = r.next() % 5u;
+        const uint32_t i1 = (i0 + 1u + r.next() % 4u) % 5u;   // a different axis
+        linkAx[l][0] = axPool[i0];
+        linkAx[l][1] = axPool[i1];
+        for (uint32_t ax = 0; ax < 6; ++ax)
+            lnk.mInvDofIds[ax][lane] = 0;
+        for (uint32_t d = 0; d < nbDofs; ++d)
+        {
+            const uint32_t ax = linkAx[l][d];
+            lnk.mInvDofIds[ax][lane] = PxU8(d);
+            const float sg = r.sg();
+            const float m = r.bit() ? 2.0f : 0.5f;
+            auto zv = [&]() { return PxVec3(r.z(), r.z(), r.z()); };
+            PxVec3 sT = zv(), sB = zv(), dT = zv(), dB = zv(), wT = zv(), wB = zv();
+            if (ax < 3)
+            {
+                sT[ax] = sg;          // angular: motion top, force-dual bottom
+                dB[ax] = sg;
+                wB[ax] = sg * m;
+            }
+            else
+            {
+                sB[ax - 3] = sg;      // linear: motion bottom, force-dual top
+                dT[ax - 3] = sg;
+                wT[ax - 3] = sg * m;
+            }
+            PxgArticulationBlockDofData& dd = D[dofCursor + d];
+            storeSpatialVector(dd.mWorldMotionMatrix, UnAlignedSpatialVector(sT, sB), lane);
+            storeSpatialVector(dd.mIsInvDW, UnAlignedSpatialVector(dT, dB), lane);
+            storeSpatialVector(dd.mIsW, UnAlignedSpatialVector(wT, wB), lane);
+            PxVec3 inv = zv();
+            inv[d] = 1.0f / m;
+            dd.mInvStIsT_x[lane] = inv.x;
+            dd.mInvStIsT_y[lane] = inv.y;
+            dd.mInvStIsT_z[lane] = inv.z;
+        }
+        dofCursor += nbDofs;
+    }
+
+    // spatial attachments: same tree as the generic seeding, offsets on the y axis
+    PxgArticulationBlockAttachmentData* AT = &B.at[size_t(w) * ST_MAX_TENDONS * ST_MAX_ELEMS];
+    static const float offs[4] = { 0.25f, -0.25f, 0.75f, -0.75f };
+    for (uint32_t t = 0; t < B.ab[w].mNumSpatialTendons[lane]; ++t)
+    {
+        PxgArticulationBlockAttachmentData* T = &AT[t * ST_MAX_ELEMS];
+        const uint32_t n = (t == 0) ? 5u : 2u;
+        for (uint32_t idx = 0; idx < n; ++idx)
+            T[idx].mRelativeOffset[lane] = PxVec3(r.z(), offs[r.next() % 4u], r.z());
+        if (t == 0 && (a & 1u) != 0u)
+        {
+            T[4].mRelativeOffset[lane] = T[0].mRelativeOffset[lane];
+            if ((a % 4u) == 3u)
+                T[4].mRelativeOffset[lane].x += 4e-4f;
+        }
+    }
+
+    // fixed tendon: root on link 0, tj1 on link 1 (fast), tj2 on the deepest link (slow)
+    PxgArticulationBlockTendonJointData* TJ = &B.tj[size_t(w) * ST_MAX_TENDONS * ST_MAX_ELEMS];
+    auto tj = [&](uint32_t idx, uint32_t linkIndex, uint32_t axis, uint32_t parent,
+                  uint64_t children) {
+        TJ[idx].mLinkIndex[lane] = PxU16(linkIndex);
+        TJ[idx].mAxis[lane] = axis;
+        TJ[idx].mParents[lane] = parent;
+        TJ[idx].mChildrens[lane] = children;
+    };
+    const uint32_t deep = numLinks - 1u;
+    const uint32_t ax1 = linkAx[1][r.next() % linkNbDofs[1]];
+    const uint32_t ax2 = linkAx[deep][r.next() % linkNbDofs[deep]];
+    if (r.bit())
+    {
+        tj(0, 0, 0, 0, (1ull << 1) | (1ull << 2));
+        tj(1, 1, ax1, 0, 0);
+        tj(2, deep, ax2, 0, 0);
+    }
+    else
+    {
+        tj(0, 0, 0, 0, 1ull << 1);
+        tj(1, 1, ax1, 0, 1ull << 2);
+        tj(2, deep, ax2, 1, 0);
+    }
+    for (uint32_t idx = 3; idx < ST_MAX_ELEMS; ++idx)
+        tj(idx, 0, 0, 0, 0);
+}
+
 static void stSeed(StBuffers& B)
 {
     B.ab.resize(ST_WARPS);
@@ -788,18 +1084,19 @@ static void stSeed(StBuffers& B)
                 tj(3, 4, 4 % 6, 0, 0);   // link 4 dof 0 axis = (4+0)%6 = 4 -> linear
         }
     }
+
+    for (uint32_t a = ST_NB_GENERIC; a < ST_NB; ++a)
+        stSeedWitness(B, a, gStWitnessSeeds[a - ST_NB_GENERIC]);
 }
 
-static size_t stRun(PxgCudaShim& shim, bool isTGS, bool spatial)
+static void stMirror(StBuffers& W, bool isTGS, bool spatial, int aOnly = -1)
 {
-    StBuffers B;
-    stSeed(B);
-
-    // ---- mirror ----
-    StBuffers W = B;
     for (uint32_t a = 0; a < ST_NB; ++a)
     {
+        if (aOnly >= 0 && a != uint32_t(aOnly))
+            continue;
         const uint32_t w = a / 32, lane = a % 32;
+        gStCountWit = gStPlain && stWitness(a);
         if (spatial)
             refSetupSpatial(W.ab[w], &W.lk[size_t(w) * ST_MAX_LINKS],
                             &W.df[size_t(w) * ST_MAX_DOFS],
@@ -815,6 +1112,91 @@ static size_t stRun(PxgCudaShim& shim, bool isTGS, bool spatial)
                           &W.tj[size_t(w) * ST_MAX_TENDONS * ST_MAX_ELEMS],
                           ST_MAX_ELEMS, ST_STEP_DT, isTGS, lane);
     }
+    gStCountWit = false;
+}
+
+template <class T>
+static size_t stWordDiffs(const std::vector<T>& x, const std::vector<T>& y)
+{
+    const uint32_t* xw = reinterpret_cast<const uint32_t*>(x.data());
+    const uint32_t* yw = reinterpret_cast<const uint32_t*>(y.data());
+    size_t n = 0;
+    for (size_t k = 0; k < x.size() * sizeof(T) / 4; ++k)
+        n += xw[k] != yw[k];
+    return n;
+}
+
+// every word stRun compares against the device
+static size_t stImageDiffs(const StBuffers& X, const StBuffers& Y, bool spatial)
+{
+    size_t n = stWordDiffs(X.ab, Y.ab) + stWordDiffs(X.lk, Y.lk) + stWordDiffs(X.df, Y.df);
+    if (spatial)
+        n += stWordDiffs(X.st, Y.st) + stWordDiffs(X.itcS, Y.itcS) + stWordDiffs(X.at, Y.at);
+    else
+        n += stWordDiffs(X.ft, Y.ft) + stWordDiffs(X.itcF, Y.itcF) + stWordDiffs(X.tj, Y.tj);
+    return n;
+}
+
+static const int ST_TWINS[3] = { ST_TW_R1C, ST_TW_R3, ST_TW_R7 };
+static const char* const ST_TWIN_NAMES[3] = { "r1c", "r3", "r7" };
+
+struct StTwinStats
+{
+    size_t fastDotPosZero = 0, slowDotPosZero = 0, accFoldNegZero = 0, pdNegZero = 0;
+    size_t alone[3] = { 0, 0, 0 };   // twin vs mirror: the equivalence, must be 0
+    size_t teeth[3] = { 0, 0, 0 };   // twin on top of the absorbers' reverts: must be > 0
+    size_t fold = 0;                 // M6FOLD vs mirror
+};
+
+// the plain mirror into W (counting the premises and the coverage), then every
+// twin image of B, accumulated into S
+static void stTwinRun(const StBuffers& B, StBuffers& W, bool isTGS, bool spatial,
+                      StTwinStats& S, int aOnly = -1)
+{
+    W = B;
+    gStFastDotPosZero = gStSlowDotPosZero = gStAccFoldNegZero = gStPdNegZero = 0;
+    gStTwin = 0;
+    gStPlain = true;
+    stMirror(W, isTGS, spatial, aOnly);
+    gStPlain = false;
+    S.fastDotPosZero += gStFastDotPosZero;
+    S.slowDotPosZero += gStSlowDotPosZero;
+    S.accFoldNegZero += gStAccFoldNegZero;
+    S.pdNegZero += gStPdNegZero;
+
+    StBuffers F = B;
+    gStTwin = ST_TW_M6FOLD;
+    stMirror(F, isTGS, spatial, aOnly);
+    S.fold += stImageDiffs(F, W, spatial);
+    StBuffers FR = B;
+    gStTwin = ST_TW_M6FOLD | ST_TW_R1C;
+    stMirror(FR, isTGS, spatial, aOnly);
+    for (int k = 0; k < 3; ++k)
+    {
+        StBuffers X = B;
+        gStTwin = ST_TWINS[k];
+        stMirror(X, isTGS, spatial, aOnly);
+        S.alone[k] += stImageDiffs(X, W, spatial);
+        // teeth: r1c and r7 on top of the folded M6 seed; r3 on top of the
+        // folded seed AND r1c (its only other way out, deltaV1, ends in
+        // pDeltaV + jointSpatialDeltaV)
+        const StBuffers& base = (k == 1) ? FR : F;
+        X = B;
+        gStTwin = ST_TWINS[k] | ST_TW_M6FOLD | ((k == 1) ? ST_TW_R1C : 0);
+        stMirror(X, isTGS, spatial, aOnly);
+        S.teeth[k] += stImageDiffs(X, base, spatial);
+    }
+    gStTwin = 0;
+}
+
+static size_t stRun(PxgCudaShim& shim, bool isTGS, bool spatial, StTwinStats& S)
+{
+    StBuffers B;
+    stSeed(B);
+
+    // ---- mirror (and the P9.86c twins) ----
+    StBuffers W;
+    stTwinRun(B, W, isTGS, spatial, S);
 
     // ---- device ----
     std::vector<PxgDevicePtr> bufs;
@@ -900,12 +1282,39 @@ PXG_TEST(artiSetupTendons)
     };
     PxgCudaShim shim(dev, manifest, 2, &stLoader);
 
+    StTwinStats S;
     size_t bad = 0;
-    bad += stRun(shim, true, true);
-    bad += stRun(shim, false, true);
-    bad += stRun(shim, true, false);
-    bad += stRun(shim, false, false);
+    bad += stRun(shim, true, true, S);
+    bad += stRun(shim, false, true, S);
+    bad += stRun(shim, true, false, S);
+    bad += stRun(shim, false, false, S);
     PXG_CHECK_MSG(bad == 0, "the tendon setups do not match the engine");
+
+    // ---- P9.86c: the twins of the surviving audit-fix reverts ----
+    std::printf("[ info ] st twins: witness coverage -- fast dot +0 %zu, slow dot +0 %zu, "
+                "folded-seed -0 accumulator lanes %zu; pDeltaV -0 lanes %zu; "
+                "M6FOLD alone %zu words\n",
+                S.fastDotPosZero, S.slowDotPosZero, S.accFoldNegZero, S.pdNegZero, S.fold);
+    for (int k = 0; k < 3; ++k)
+    {
+        std::printf("[ info ] st twin %s: %zu words changed alone (must be 0), %zu on top of "
+                    "%s (must be > 0)\n",
+                    ST_TWIN_NAMES[k], S.alone[k], S.teeth[k],
+                    k == 1 ? "M6FOLD+r1c" : "M6FOLD");
+        PXG_CHECK_MSG(S.alone[k] == 0,
+                      "twin %s changed %zu output words -- the equivalence argument is wrong",
+                      ST_TWIN_NAMES[k], S.alone[k]);
+        PXG_CHECK_MSG(S.teeth[k] > 0,
+                      "witness coverage: twin %s never reaches asmM6MulVec's seed", ST_TWIN_NAMES[k]);
+    }
+    PXG_CHECK_MSG(S.fold > 0,
+                  "witness coverage: the pre-P9.86 asmM6MulVec (seed folded) changes nothing");
+    PXG_CHECK_MSG(S.fastDotPosZero > 0, "witness coverage: no fast-path dot == +0");
+    PXG_CHECK_MSG(S.slowDotPosZero > 0, "witness coverage: no slow-path dot == +0");
+    PXG_CHECK_MSG(S.accFoldNegZero > 0,
+                  "witness coverage: no accumulator lane where the folded seed keeps -0");
+    PXG_CHECK_MSG(S.pdNegZero == 0,
+                  "a pDeltaV lane is -0 (%zu) -- the r1c equivalence premise fails", S.pdNegZero);
 }
 
 }  // namespace
