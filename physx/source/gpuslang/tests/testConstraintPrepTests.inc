@@ -544,6 +544,94 @@ PXG_TEST(constraintPrepTGS_contact)
                 n4.x = std::fabs(n4.x); n4.y = std::fabs(n4.y); n4.z = std::fabs(n4.z);
             }
         }
+    // P9.86c: signed-zero directed lanes 1 and 3 (live in every batch: descStride >= 4) and a
+    // bounce lane 5 (where descStride > 5).  No rng consumed; compared bitwise below.
+    //  * max contact impulses -0 (body 4) and +0 (body 5): setMaxContactImpulse(-0.0f) passes
+    //    the API's `maxImpulse >= 0.f` check (NpRigidBodyTemplate.h:820) and preIntegration
+    //    copies it raw.  Lane 1 (A -0, B +0): PxMin(-0,+0) = +0 (cuh:846) and every point
+    //    limit is 50..100.  Lane 3 (A +0, B -0): PxMin(+0,-0) = -0, and every contact of the
+    //    lane is ignored by contact modification (w = +0): PxMin(-0,+0) = +0 (cuh:969).
+    //    FMin gives -0 for both ties.
+    //  * exactly touching contacts, restDistance +0, torsional patch radius 0.05 with the
+    //    default minimum +0 and one anchor: lane 1 has one contact at separation +0, so
+    //    maxPenetration = +0 and PxMax(0, -0) = -0 -> sqrt(-0 * R) = -0 -> PxMax(+0, -0) = -0
+    //    is stored (cuh:1128; FMax gives +0).  Lane 3 has a second contact at the same point
+    //    with separation -0: PxMin(-0, +0) keeps +0 (cuh:947; FMin gives -0 -> +0 stored).
+    //  * both lanes are resting-contact shapes: restitution 0, zero target velocity, an
+    //    all-negative normal (cTargetVel = -0) and two dynamic bodies, so the CUDA's
+    //    `cTargetVel + 0.f` (cuh:951) stores +0.
+    //  * lane 5, a bouncing pair with exact dot products (normal +y, zero angular velocities):
+    //    cTargetVel and vrel are exact, so targetVelocity = cTargetVel + (-vrel) * restitution
+    //    is one rounded product and one rounded add -- the mirror's -ffp-contract=off order.
+    //    The target velocities are picked so that an FMA would round differently; this pins
+    //    the bounce path of cuh:951 bitwise (on llvmpipe even an explicit fma() rounds twice).
+    const uint32_t kImpNeg = 4, kImpPos = 5, kBncA = 7, kBncB = 8;
+    const float kBncNegVrel = 3.25f, kBncRest = 0.3f; // vrel = -1.25 - 2.0
+    cs.bodyData[kImpNeg].maxImpulse = -0.0f;
+    cs.bodyData[kImpPos].maxImpulse = 0.0f;
+    for (uint32_t rb : { kImpNeg, kImpPos, kBncA, kBncB })
+        cs.bodyData[rb].flags &= ~RB_KINEMATIC;
+    {
+        Float4& lA = cs.bodyData[kBncA].initialLinVelXYZ_invMassW;
+        Float4& lB = cs.bodyData[kBncB].initialLinVelXYZ_invMassW;
+        Float4& aA = cs.bodyData[kBncA].initialAngVelXYZ_penBiasClamp;
+        Float4& aB = cs.bodyData[kBncB].initialAngVelXYZ_penBiasClamp;
+        lA = Float4{ 0.25f, -1.25f, 0.5f, lA.w };
+        lB = Float4{ -0.5f, 2.0f, 0.125f, lB.w };
+        aA = Float4{ 0.f, 0.f, 0.f, aA.w };
+        aB = Float4{ 0.f, 0.f, 0.f, aB.w };
+    }
+    auto fmaSensitive = [&](float cT) {
+        const float unf = cT + kBncNegVrel * kBncRest, fus = std::fma(kBncNegVrel, kBncRest, cT);
+        uint32_t a, b; std::memcpy(&a, &unf, 4); std::memcpy(&b, &fus, 4);
+        return a != b;
+    };
+    for (uint32_t k = 0; k < cs.numBatches; ++k)
+    {
+        Batch& b = cs.batches[k];
+        for (uint32_t lane = 1; lane <= 5; lane += 2)
+        {
+            if (lane >= b.descStride)
+                continue;
+            const bool l1 = (lane == 1u), l5 = (lane == 5u);
+            b.bodyAIndex[lane] = l5 ? kBncA : (l1 ? kImpNeg : kImpPos);
+            b.bodyBIndex[lane] = l5 ? kBncB : (l1 ? kImpPos : kImpNeg);
+            Float4& cd = cs.cdata[k].contactData[lane];
+            uint32_t mw; std::memcpy(&mw, &cd.w, 4);
+            const uint32_t fl = ((mw >> 8) & 0xFFu) & ~(SC_DISABLE_FRICTION | SC_PER_POINT_FRICTION);
+            mw = (l5 ? cs.rowsPerBatch : (l1 ? 1u : 2u)) | (fl << 8); // prevFrictionPatchCount 0
+            std::memcpy(&cd.w, &mw, 4);
+            cd.x = 0.0f; // restDistance +0
+            Float4& n4 = cs.cdata[k].normal_restitutionW[lane];
+            BlockContactPoint* cp = &cs.cpoints[b.blockContactIndex];
+            if (l5)
+            {
+                n4 = Float4{ 0.f, 1.f, 0.f, kBncRest };
+                float tvy = 0.1f;
+                for (uint32_t i = 0; i < cs.rowsPerBatch; ++i)
+                {
+                    while (!fmaSensitive(tvy))
+                        tvy += 0.0078125f;
+                    cp[i].point_separationW[lane].w = 0.01f; // -vrel = 3.25 > 0.01 * 60
+                    Float4& tv = cp[i].targetVel_maxImpulseW[lane];
+                    tv = Float4{ 0.f, tvy, 0.f, tv.w };
+                    tvy += 0.0078125f;
+                }
+                continue;
+            }
+            n4 = Float4{ -std::fabs(n4.x), -std::fabs(n4.y), -std::fabs(n4.z), 0.0f }; // restitution 0
+            cs.workUnits[k].mTorsionalFrictionData[lane] = Float2{ 0.05f, 0.0f };
+            const Float4 p0 = cp[0].point_separationW[lane];
+            cp[0].point_separationW[lane] = Float4{ p0.x, p0.y, p0.z, 0.0f };
+            if (!l1)
+                cp[1].point_separationW[lane] = Float4{ p0.x, p0.y, p0.z, -0.0f }; // same point: one anchor
+            for (uint32_t i = 0; i < cs.rowsPerBatch; ++i)
+            {
+                Float4& tv = cp[i].targetVel_maxImpulseW[lane];
+                tv = Float4{ 0.0f, 0.0f, 0.0f, l1 ? tv.w : 0.0f };
+            }
+        }
+    }
 
     const float stepDt = 1.f / 240.f, invStepDt = 240.f, totalDt = 1.f / 60.f, invTotalDt = 60.f;
     const float bounceThreshold = -2.f, frictionOffsetThreshold = 0.04f, correlationDistance = 0.025f;
@@ -711,6 +799,19 @@ PXG_TEST(constraintPrepTGS_contact)
     shim.memcpyDtoH(gFR.data(), dOutFR, gFR.size() * sizeof(TGSFriction));
 
     size_t mism = 0, torsBits = 0, torsPlusNegZero = 0, torsMinusPosZero = 0;
+    // P9.86c: maxImpulse is two PxMin selects of input floats and torsionalFrictionScale is a
+    // select-min over `separation - restDistance`, a negation, two PxMax selects, one multiply
+    // and a correctly rounded sqrt -- no fusable multiply-add -- so both are compared BITWISE
+    // on every row.  The targetVelocity of the directed lanes (1, 3: exact signed zeros; 5:
+    // exact dot products) is compared bitwise too.  The twins model the pre-P9.86 port
+    // spellings: GLSL FMin/FMax as llvmpipe evaluates a mixed +-0 pair (F4: min -> -0,
+    // max -> +0 in either operand order).
+    auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    auto lpFMin = [](float a, float b) { return (a == 0.f && b == 0.f) ? (std::signbit(a) ? a : b) : cpSelMin(a, b); };
+    auto lpFMax = [](float a, float b) { return (a == 0.f && b == 0.f) ? (std::signbit(a) ? b : a) : cpSelMax(a, b); };
+    size_t maxImpBits = 0, maxImpTwin846 = 0, maxImpTwin969 = 0;
+    size_t torsScaleBits = 0, torsTwin947 = 0, torsTwin1128 = 0;
+    size_t tvBits = 0, tvPlusZero = 0, bounceFmaRows = 0;
     for (uint32_t k = 0; k < cs.numBatches && mism < 12; ++k)
         for (uint32_t l = 0; l < cs.batches[k].descStride && mism < 12; ++l)
         {
@@ -743,7 +844,22 @@ PXG_TEST(constraintPrepTGS_contact)
                 if (!eq4(gCP[r].raXn_extraCoeff[l], refCP[r].raXn_extraCoeff[l])) ++mism;
                 if (!eq4(gCP[r].rbXn_targetVelW[l], refCP[r].rbXn_targetVelW[l])) ++mism;
                 if (!eq(gCP[r].separation[l], refCP[r].separation[l])) ++mism;
-                if (!eq(gCP[r].maxImpulse[l], refCP[r].maxImpulse[l])) ++mism;
+                const uint32_t rmi = bitsOf(refCP[r].maxImpulse[l]);
+                if (bitsOf(gCP[r].maxImpulse[l]) != rmi) ++maxImpBits;
+                const float d0 = cs.bodyData[cs.batches[k].bodyAIndex[l]].maxImpulse;
+                const float d1 = cs.bodyData[cs.batches[k].bodyBIndex[l]].maxImpulse;
+                const Float4 tv4 = cs.cpoints[cs.batches[k].blockContactIndex + i].targetVel_maxImpulseW[l];
+                if (bitsOf(cpSelMin(lpFMin(d0, d1), tv4.w)) != rmi) ++maxImpTwin846; // old min() (cuh:846)
+                if (bitsOf(lpFMin(cpSelMin(d0, d1), tv4.w)) != rmi) ++maxImpTwin969; // old min() (cuh:969)
+                if (l == 1u || l == 3u || l == 5u) // the directed lanes (rewritten in every batch they exist)
+                {
+                    const uint32_t rtv = bitsOf(refCP[r].rbXn_targetVelW[l].w);
+                    if (bitsOf(gCP[r].rbXn_targetVelW[l].w) != rtv) ++tvBits;
+                    const Float4 n4 = cs.cdata[k].normal_restitutionW[l];
+                    const float cT = n4.x * tv4.x + n4.y * tv4.y + n4.z * tv4.z;
+                    if (l != 5u && bitsOf(cT) == 0x80000000u && rtv == 0u) ++tvPlusZero; // -0 + 0 = +0 (cuh:951)
+                    if (l == 5u && fmaSensitive(cT) && rtv == bitsOf(cT + kBncNegVrel * kBncRest)) ++bounceFmaRows;
+                }
                 if (!eq(gCP[r].biasCoefficient[l], refCP[r].biasCoefficient[l])) ++mism;
                 if (!eq(gCP[r].resp0[l], refCP[r].resp0[l])) ++mism;
                 if (!eq(gCP[r].resp1[l], refCP[r].resp1[l])) ++mism;
@@ -759,7 +875,22 @@ PXG_TEST(constraintPrepTGS_contact)
             }
             if (refFH[k].numFrictionConstr[l] & 1) // torsional anchor present
             {
-                if (!eq(gFH[k].torsionalFrictionScale[l], refFH[k].torsionalFrictionScale[l])) ++mism;
+                const uint32_t rts = bitsOf(refFH[k].torsionalFrictionScale[l]);
+                if (bitsOf(gFH[k].torsionalFrictionScale[l]) != rts) ++torsScaleBits;
+                {
+                    const Float2 td = cs.workUnits[k].mTorsionalFrictionData[l];
+                    const float restD = cs.cdata[k].contactData[l].x;
+                    float mpSel = PX_MAX_F32, mpLp = PX_MAX_F32;
+                    for (uint32_t j = 0; j < nc; ++j)
+                    {
+                        const float pen = cs.cpoints[cs.batches[k].blockContactIndex + j].point_separationW[l].w - restD;
+                        mpSel = cpSelMin(pen, mpSel);
+                        mpLp = lpFMin(pen, mpLp);
+                    }
+                    // old min() at cuh:947, old max() pair at cuh:1128
+                    if (bitsOf(cpSelMax(td.y, std::sqrt(cpSelMax(0.f, -mpLp) * td.x))) != rts) ++torsTwin947;
+                    if (bitsOf(lpFMax(td.y, std::sqrt(lpFMax(0.f, -mpSel) * td.x))) != rts) ++torsTwin1128;
+                }
                 // P9.86: the torsional targetVel is the CUDA's own float sequence in the
                 // reference, so it is compared BITWISE (the sign of a zero included)
                 const uint32_t r = cs.batches[k].startFrictionIndex + 2;
@@ -787,6 +918,20 @@ PXG_TEST(constraintPrepTGS_contact)
                   "the fixture must reach both zero-seeded targetVel shapes (%zu, %zu)",
                   torsPlusNegZero, torsMinusPosZero);
     PXG_CHECK_MSG(mism == 0, "%zu TGS row mismatches", mism);
+    std::printf("[ info ] TGS maxImpulse: cuh:846 tie rows %zu, cuh:969 tie rows %zu, bit mismatches %zu; "
+                "torsionalFrictionScale: cuh:947 tie rows %zu, cuh:1128 tie rows %zu, bit mismatches %zu; "
+                "targetVelocity: -0+0 rows %zu, FMA-sensitive bounce rows %zu, bit mismatches %zu\n",
+                maxImpTwin846, maxImpTwin969, maxImpBits, torsTwin947, torsTwin1128, torsScaleBits, tvPlusZero,
+                bounceFmaRows, tvBits);
+    PXG_CHECK_MSG(maxImpBits == 0, "%zu maxImpulse words differ bitwise", maxImpBits);
+    PXG_CHECK_MSG(torsScaleBits == 0, "%zu torsionalFrictionScale words differ bitwise", torsScaleBits);
+    PXG_CHECK_MSG(tvBits == 0, "%zu directed-lane targetVelocity words differ bitwise", tvBits);
+    PXG_CHECK_MSG(maxImpTwin846 > 0 && maxImpTwin969 > 0,
+                  "the fixture must reach both maxImpulse PxMin zero ties (%zu, %zu)", maxImpTwin846, maxImpTwin969);
+    PXG_CHECK_MSG(torsTwin947 > 0 && torsTwin1128 > 0,
+                  "the fixture must reach both torsional zero ties (%zu, %zu)", torsTwin947, torsTwin1128);
+    PXG_CHECK_MSG(tvPlusZero > 0, "the fixture must reach cTargetVel = -0 on a resting pair");
+    PXG_CHECK_MSG(bounceFmaRows > 0, "the fixture must reach an FMA-sensitive bounce targetVelocity");
 
     // the current-frame friction patches/anchors are engine-ABI outputs too:
     // spot-check the write-through-desc path (anchor counts + patch indices)

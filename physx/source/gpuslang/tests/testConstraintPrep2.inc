@@ -381,6 +381,14 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
     }
 }
 
+// PxMin<float>/PxMax<float> are intrinsics::selectMin/selectMax (PxMath.h:82-101,
+// PxUnixMathIntrinsics.h:116-125): a < b ? a : b and a > b ? a : b -- a +-0 tie (or a NaN
+// compare) returns the SECOND operand.  std::fmin/std::fmax leave the sign of a zero tie
+// unspecified (glibc's generic fmin keeps the FIRST operand), so the TGS mirror spells the
+// CUDA's PxMin/PxMax with these (P9.86c).
+inline float cpSelMin(float a, float b) { return (a < b) ? a : b; }
+inline float cpSelMax(float a, float b) { return (a > b) ? a : b; }
+
 // setupFinalizeSolverConstraintsBlockTGS
 void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& contacts, uint32_t contactBase,
                  uint32_t contactCount, BlockFrictionPatch& fp, BlockFrictionAnchorPatch& fa, const AFrame& bf0,
@@ -403,7 +411,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
     const Vec3 angVel1(initAng1.x, initAng1.y, initAng1.z);
 
     const float invStepDt = invStepDtF32;
-    const float p8 = std::fmin(0.8f, biasCoefficient);
+    const float p8 = cpSelMin(0.8f, biasCoefficient); // PxMin (contactConstraintBlockPrep.cuh:814)
     const float bounceThreshold = bounceThresholdF32;
     const float invDtp8 = invStepDt * p8;
 
@@ -425,7 +433,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         return;
     }
 
-    const float maxImpulse = std::fmin(d0.maxImpulse, d1.maxImpulse);
+    const float maxImpulse = cpSelMin(d0.maxImpulse, d1.maxImpulse); // PxMin (cuh:846)
     ch.forceWritebackOffset[lane] = forceWritebackOffset;
     ch.flags[lane] = flags;
     ch.maxPenBias[lane] = maxPenBias;
@@ -456,7 +464,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         const Vec3 ra = point - bf0p, rb = point - bf1p;
         Vec3 raXn = ra.cross(normal), rbXn = rb.cross(normal);
         const float angNorVel = raXn.dot(angVel0) - rbXn.dot(angVel1);
-        const float slop = solverOffsetSlop * std::fmax(linNorVel == 0.f ? 1.f : angNorVel / linNorVel, 1.f);
+        const float slop = solverOffsetSlop * cpSelMax(linNorVel == 0.f ? 1.f : angNorVel / linNorVel, 1.f); // cuh:898
         raXn.x = std::fabs(raXn.x) < slop ? 0.f : raXn.x;
         raXn.y = std::fabs(raXn.y) < slop ? 0.f : raXn.y;
         raXn.z = std::fabs(raXn.z) < slop ? 0.f : raXn.z;
@@ -490,8 +498,9 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         }
         cpoints[outCBase + j].resp0[lane] = resp0;
         cpoints[outCBase + j].resp1[lane] = resp1;
-        maxPenetration = std::fmin(penetration, maxPenetration);
+        maxPenetration = cpSelMin(penetration, maxPenetration); // PxMin (cuh:947): a zero tie keeps the old value
         const bool isGreater2 = ((restitution > 0.f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
+        // the CUDA's IEEE add (cuh:951): cTargetVel = -0 plus the selected +0 gives +0
         float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
         if (isKin0)
             targetVelocity -= (norVel0 + angNorVel0);
@@ -505,7 +514,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         cpoints[outCBase + j].raXn_extraCoeff[lane] = Float4{ raI.x, raI.y, raI.z, contactCoeff };
         cpoints[outCBase + j].rbXn_targetVelW[lane] = Float4{ rbI.x, rbI.y, rbI.z, targetVelocity };
         cpoints[outCBase + j].separation[lane] = penetration;
-        cpoints[outCBase + j].maxImpulse[lane] = std::fmin(maxImpulse, tv4.w);
+        cpoints[outCBase + j].maxImpulse[lane] = cpSelMin(maxImpulse, tv4.w); // PxMin (cuh:969): PxMin(-0,+0) = +0
         cpoints[outCBase + j].appliedForce[lane] = 0.f;
         cpoints[outCBase + j].biasCoefficient[lane] = scaledBias;
     }
@@ -582,8 +591,9 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         {
             const float torsionalPatchRadius = torsionalFrictionData.x;
             const float minTorsionalPatchRadius = torsionalFrictionData.y;
+            // PxMax = selectMax twice (cuh:1128): maxPenetration = +0 gives -0 * R -> sqrt(-0) = -0
             const float torsionalFriction =
-                std::fmax(minTorsionalPatchRadius, std::sqrt(std::fmax(0.f, -maxPenetration) * torsionalPatchRadius));
+                cpSelMax(minTorsionalPatchRadius, std::sqrt(cpSelMax(0.f, -maxPenetration) * torsionalPatchRadius));
             fh.torsionalFrictionScale[lane] = torsionalFriction;
             const Vec3 raXnI = si0.transform(normal);
             const Vec3 rbXnI = si1.transform(normal);
