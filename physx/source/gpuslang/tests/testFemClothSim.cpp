@@ -9166,68 +9166,81 @@ static const float PAIR_COEFF[NB_TP][3] = {
 };
 
 // --- cloth_accumulateBendingDampingDeltaVelocity (FEMCloth.cu:1046) ---------
+// one pair of FEMCloth.cu:1046-1165; idx = { iA, iB, iC, iC2 } (D9: A and B are the
+// EDGE, .z/.w; C and C2 the TIPS, .x/.y), pos/vel/im indexed the same way
+// P9.86 mutant twins (0 = the CUDA): 1 replays `deltaVelA/B = -deltaAvg` (the literal
+// `0 - x` llvmpipe folds to a negate), 2 replays `(tip1 + tip2) * 0.25` without the
+// +0 seed (slangc's `0 + x` fold).  femClothSimBendingDampingZeroSign requires both
+// to change its expected image.
+static int gBendVariant = 0;
+static void bendingPairRef(const V3 pos[4], const V3 vel[4], const float im[4],
+                           float stiffness, float damping, float dt, const uint32_t idx[4],
+                           std::vector<float>& delta)
+{
+    const float dampingFactor = clamp01(damping * dt);
+    if (dampingFactor == 0.0f || stiffness == 0.0f) return;
+    const float imA = im[0], imB = im[1], imC = im[2], imC2 = im[3];
+    const V3 velA = vel[0], velB = vel[1], velC = vel[2], velC2 = vel[3];
+    const V3 posA = pos[0], posB = pos[1], posC = pos[2], posC2 = pos[3];
+
+    // D13: the mean of the TWO EDGE velocities, not of all four.
+    const V3 linearVelocity = mul(0.5f, add(velA, velB));
+
+    V3 edgeDir = sub(posB, posA);
+    if (normalize3(edgeDir) < 1e-6f) return;
+
+    const V3 relVelTip1 = sub(velC, linearVelocity);
+    const V3 relVelTip2 = sub(velC2, linearVelocity);
+
+    V3 tip1Dir = cross3(edgeDir, sub(posC, posA));
+    const float d1 = normalize3(tip1Dir);
+    V3 tip2Dir = cross3(edgeDir, sub(posC2, posA));
+    const float d2 = normalize3(tip2Dir);
+
+    const float rot1 = dot3(tip1Dir, relVelTip1) / d1;
+    const float rot2 = dot3(tip2Dir, relVelTip2) / d2;
+    const float deltaRotVelDamp = (rot2 - rot1) * dampingFactor;
+
+    // D14: opposite signs on the two tips.
+    V3 dT1 = mul(deltaRotVelDamp * d1, tip1Dir);
+    V3 dT2 = mul(-deltaRotVelDamp * d2, tip2Dir);
+    V3 dA = v3(0.0f, 0.0f, 0.0f), dB = v3(0.0f, 0.0f, 0.0f);
+
+    const float weightFactor = 1.0f / (imA + imB + imC + imC2);
+    // (deltaVelA + deltaVelB + deltaVelTip1 + deltaVelTip2) * 0.25f, left to right
+    const V3 avg = (gBendVariant == 2) ? mul(0.25f, add(dT1, dT2))
+                                       : mul(0.25f, add(add(add(dA, dB), dT1), dT2));
+    if (gBendVariant == 1) { dA = v3(-avg.x, -avg.y, -avg.z); dB = dA; }
+    else { dA = sub(dA, avg); dB = sub(dB, avg); }
+    dT1 = sub(dT1, avg); dT2 = sub(dT2, avg);
+    // D15: NO second dampingFactor -- it is already inside deltaRotVelDamp.
+    dT1 = mul(imC * weightFactor, dT1);
+    dT2 = mul(imC2 * weightFactor, dT2);
+    dA = mul(imA * weightFactor, dA);
+    dB = mul(imB * weightFactor, dB);
+
+    const V3 dv[4] = { dA, dB, dT1, dT2 };
+    for (int k = 0; k < 4; ++k)
+        if (im[k] != 0.0f)
+        { delta[idx[k] * 4 + 0] += dv[k].x;
+          delta[idx[k] * 4 + 1] += dv[k].y;
+          delta[idx[k] * 4 + 2] += dv[k].z; }
+}
+
 static void bendingRef(float dt, std::vector<float>& delta /* (NB_V+slack)*4 */)
 {
     for (uint32_t t = 0; t < NB_TP; ++t)
     {
-        const float dampingFactor = clamp01(PAIR_COEFF[t][2] * dt);
-        if (dampingFactor == 0.0f || PAIR_COEFF[t][1] == 0.0f) continue;
-
-        // D9: A and B are the EDGE (.z, .w); C and C2 are the TIPS (.x, .y).
-        const uint32_t iA = PAIRS[t][2], iB = PAIRS[t][3];
-        const uint32_t iC = PAIRS[t][0], iC2 = PAIRS[t][1];
-        const float imA = INV_MASS[iA], imB = INV_MASS[iB];
-        const float imC = INV_MASS[iC], imC2 = INV_MASS[iC2];
-
-        const V3 velA = v3(VEL[iA][0], VEL[iA][1], VEL[iA][2]);
-        const V3 velB = v3(VEL[iB][0], VEL[iB][1], VEL[iB][2]);
-        const V3 velC = v3(VEL[iC][0], VEL[iC][1], VEL[iC][2]);
-        const V3 velC2 = v3(VEL[iC2][0], VEL[iC2][1], VEL[iC2][2]);
-        const V3 posA = v3(POS[iA][0], POS[iA][1], POS[iA][2]);
-        const V3 posB = v3(POS[iB][0], POS[iB][1], POS[iB][2]);
-        const V3 posC = v3(POS[iC][0], POS[iC][1], POS[iC][2]);
-        const V3 posC2 = v3(POS[iC2][0], POS[iC2][1], POS[iC2][2]);
-
-        // D13: the mean of the TWO EDGE velocities, not of all four.
-        const V3 linearVelocity = mul(0.5f, add(velA, velB));
-
-        V3 edgeDir = sub(posB, posA);
-        if (normalize3(edgeDir) < 1e-6f) continue;
-
-        const V3 relVelTip1 = sub(velC, linearVelocity);
-        const V3 relVelTip2 = sub(velC2, linearVelocity);
-
-        V3 tip1Dir = cross3(edgeDir, sub(posC, posA));
-        const float d1 = normalize3(tip1Dir);
-        V3 tip2Dir = cross3(edgeDir, sub(posC2, posA));
-        const float d2 = normalize3(tip2Dir);
-
-        const float rot1 = dot3(tip1Dir, relVelTip1) / d1;
-        const float rot2 = dot3(tip2Dir, relVelTip2) / d2;
-        const float deltaRotVelDamp = (rot2 - rot1) * dampingFactor;
-
-        // D14: opposite signs on the two tips.
-        V3 dT1 = mul(deltaRotVelDamp * d1, tip1Dir);
-        V3 dT2 = mul(-deltaRotVelDamp * d2, tip2Dir);
-        V3 dA = v3(0.0f, 0.0f, 0.0f), dB = v3(0.0f, 0.0f, 0.0f);
-
-        const float weightFactor = 1.0f / (imA + imB + imC + imC2);
-        const V3 avg = mul(0.25f, add(add(dA, dB), add(dT1, dT2)));
-        dA = sub(dA, avg); dB = sub(dB, avg); dT1 = sub(dT1, avg); dT2 = sub(dT2, avg);
-        // D15: NO second dampingFactor -- it is already inside deltaRotVelDamp.
-        dT1 = mul(imC * weightFactor, dT1);
-        dT2 = mul(imC2 * weightFactor, dT2);
-        dA = mul(imA * weightFactor, dA);
-        dB = mul(imB * weightFactor, dB);
-
-        const uint32_t idx[4] = { iA, iB, iC, iC2 };
-        const V3 dv[4] = { dA, dB, dT1, dT2 };
-        const float im[4] = { imA, imB, imC, imC2 };
+        const uint32_t idx[4] = { PAIRS[t][2], PAIRS[t][3], PAIRS[t][0], PAIRS[t][1] };
+        V3 pos[4], vel[4];
+        float im[4];
         for (int k = 0; k < 4; ++k)
-            if (im[k] != 0.0f)
-            { delta[idx[k] * 4 + 0] += dv[k].x;
-              delta[idx[k] * 4 + 1] += dv[k].y;
-              delta[idx[k] * 4 + 2] += dv[k].z; }
+        {
+            pos[k] = v3(POS[idx[k]][0], POS[idx[k]][1], POS[idx[k]][2]);
+            vel[k] = v3(VEL[idx[k]][0], VEL[idx[k]][1], VEL[idx[k]][2]);
+            im[k] = INV_MASS[idx[k]];
+        }
+        bendingPairRef(pos, vel, im, PAIR_COEFF[t][1], PAIR_COEFF[t][2], dt, idx, delta);
     }
 }
 } // namespace dmp
@@ -9357,6 +9370,102 @@ PXG_TEST(femClothSimBendingDamping)
                 "%u vertices touched: %u contended, %u single-writer seeded; bit-exact\n",
                 NB_TP, sharedLive, nonSharedLive, NB_TP - sharedLive - nonSharedLive,
                 touched, contended, seeded);
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bSi.h); dev->destroyBuffer(bNsi.h);
+    dev->destroyBuffer(bSc.h); dev->destroyBuffer(bNsc.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.86: the bending damper's two IEEE zero rules, observed.  deltaVelA/B start
+// as PxVec3(0) (FEMCloth.cu:1131-1132): the mean is ((+0 + +0) + tip1) + tip2,
+// which is +0 even when both tips are -0, and A/B become 0 - mean, which is +0
+// for a +0 mean.  One pair, all four velocities zero (so deltaRotVelDamp is +0
+// and the tip deltas are zeros signed by their directions), tips on opposite
+// sides of the hinge so tip1Dir.y < 0 < tip2Dir.y (both tip deltas -0 in y), and
+// every accumulator seeded with -0: -0 + (+0) = +0 but -0 + (-0) = -0, so both
+// spellings the port once had (the folded seed, the folded `0 - x`) change bits.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimBendingDampingZeroSign)
+{
+    using namespace dmp;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 0.1f;
+
+    // tips .x/.y = vertices 2, 3; edge .z/.w = vertices 0, 1
+    const float P[4][3] = { { 0, 0, 0 }, { 1, 0, 0 }, { 0.5f, 1, 0.3f }, { 0.5f, -1, -0.2f } };
+    const float IM[4] = { 0.5f, 2.0f, 1.0f, 0.25f };
+    std::vector<F4> positions(4), vels(4), deltas(4);
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        positions[i] = F4{ P[i][0], P[i][1], P[i][2], IM[i] };
+        vels[i] = F4{ 0.0f, 0.0f, 0.0f, IM[i] };
+        deltas[i] = F4{ -0.0f, -0.0f, -0.0f, 7.5f + float(i) };
+    }
+    const std::vector<F4> deltasIn = deltas;
+    std::vector<uint32_t> sharedIdx = { 2u, 3u, 0u, 1u };
+    std::vector<uint32_t> nonSharedIdx = { 0u, 0u, 0u, 0u };
+    std::vector<F4> sharedCoeff = { F4{ 0.1f, 3.0f, 6.0f, 0.0f } };
+    std::vector<F4> nonSharedCoeff = { F4{ 0, 0, 0, 0 } };
+
+    DevBuf bPos = makeDev(dev, positions), bVel = makeDev(dev, vels);
+    DevBuf bDelta = makeDev(dev, deltas);
+    DevBuf bSi = makeDev(dev, sharedIdx), bNsi = makeDev(dev, nonSharedIdx);
+    DevBuf bSc = makeDev(dev, sharedCoeff), bNsc = makeDev(dev, nonSharedCoeff);
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mAccumulatedDeltaVel = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mOrderedSharedTrianglePairVertexIndices = reinterpret_cast<uint4*>(size_t(bSi.addr));
+    c.mOrderedNonSharedTrianglePairVertexIndices = reinterpret_cast<uint4*>(size_t(bNsi.addr));
+    c.mOrderedSharedRestBendingAngle_flexuralStiffness_damping =
+        reinterpret_cast<float4*>(size_t(bSc.addr));
+    c.mOrderedNonSharedRestBendingAngle_flexuralStiffness_damping =
+        reinterpret_cast<float4*>(size_t(bNsc.addr));
+    c.mNbVerts = 4u;
+    c.mNbTrianglePairs = 1u;
+    c.mNbSharedTrianglePairs = 1u;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    BendingDampPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeIds = bActive.addr;
+    push.dt = dt;
+    Kernel k("femClothDampingBda.spv", "cloth_accumulateBendingDampingDeltaVelocity", {},
+             sizeof(BendingDampPush));
+    k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    auto ref = [&](int variant) {
+        std::vector<float> w(16);
+        for (uint32_t i = 0; i < 4; ++i)
+        { w[i * 4 + 0] = deltasIn[i].x; w[i * 4 + 1] = deltasIn[i].y;
+          w[i * 4 + 2] = deltasIn[i].z; w[i * 4 + 3] = deltasIn[i].w; }
+        const uint32_t idx[4] = { 0u, 1u, 2u, 3u };
+        V3 pos[4], vel[4];
+        for (int q = 0; q < 4; ++q) { pos[q] = v3(P[q][0], P[q][1], P[q][2]); vel[q] = v3(0, 0, 0); }
+        gBendVariant = variant;
+        bendingPairRef(pos, vel, IM, sharedCoeff[0].y, sharedCoeff[0].z, dt, idx, w);
+        gBendVariant = 0;
+        return w;
+    };
+    const std::vector<float> want = ref(0);
+    for (int v = 1; v <= 2; ++v)
+        PXG_CHECK_MSG(std::memcmp(want.data(), ref(v).data(), want.size() * 4) != 0,
+                      "mutant twin %d gives the same image -- the case does not observe it", v);
+
+    const auto got = downloadBuffer<F4>(dev, bDelta.h, 4);
+    for (uint32_t i = 0; i < 4; ++i)
+        PXG_CHECK_MSG(f2u(got[i].x) == f2u(want[i * 4 + 0]) &&
+                      f2u(got[i].y) == f2u(want[i * 4 + 1]) &&
+                      f2u(got[i].z) == f2u(want[i * 4 + 2]) &&
+                      f2u(got[i].w) == f2u(deltasIn[i].w),
+                      "vertex %u delta bits %08x %08x %08x, expected %08x %08x %08x", i,
+                      f2u(got[i].x), f2u(got[i].y), f2u(got[i].z), f2u(want[i * 4 + 0]),
+                      f2u(want[i * 4 + 1]), f2u(want[i * 4 + 2]));
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
     dev->destroyBuffer(bSi.h); dev->destroyBuffer(bNsi.h);
     dev->destroyBuffer(bSc.h); dev->destroyBuffer(bNsc.h);

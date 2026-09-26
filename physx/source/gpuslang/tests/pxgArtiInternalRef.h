@@ -44,11 +44,16 @@
 #include "DyCpuGpuArticulation.h"
 
 #include <cstdint>
+#include <cstring>
 
 namespace pxgtest
 {
 using namespace physx;
 using physx::Cm::UnAlignedSpatialVector;
+
+// P9.86: TGS old-model friction evaluations whose `-jointV * recipResponse` is -0,
+// where the CUDA's `+ appliedFriction` (a literal 0) turns it into the stored +0.
+inline PxU32 gTgsOldFrictionNegZero = 0;
 
 struct DofCov
 {
@@ -118,6 +123,8 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
             {
                 if (cov) ++cov->oldModel;
                 const float appliedFriction = 0.0f;   // TGS
+                { const float p = -jointV * recipResponse; PxU32 pb; std::memcpy(&pb, &p, 4);
+                  if (pb == 0x80000000u) ++gTgsOldFrictionNegZero; }
                 const float frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
                                                     -maxFrictionForce, maxFrictionForce);
                 ic.mAccumulatedFrictionImpulse[lane] = frictionForce;

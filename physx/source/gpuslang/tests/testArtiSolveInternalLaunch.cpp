@@ -126,8 +126,13 @@ const uint32_t SH_SIZE = 224, DESC_SIZE = 360;
 
 const float IL_DT = 0.01f, IL_SCENE_DT = 0.033f, IL_INV_DT = 100.0f, IL_ELAPSED = 0.017f;
 
+// P9.86: articulation IL_REST_ART is entirely at rest -- every value fv draws for it
+// is +0 -- so its old-model friction (a % 3 == 0) sees jointV = +0 and the CUDA's
+// `-jointV * recipResponse + 0` stores +0 where a folded add would store -0.
+const uint32_t IL_REST_ART = 6;
 static float fv(uint32_t a, uint32_t l, uint32_t d, uint32_t salt)
 {
+    if (a == IL_REST_ART && l < 1000u) return 0.0f;
     uint32_t h = a * 2654435761u + l * 40503u + d * 9973u + salt * 733u + 19u;
     h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
     return -1.0f + 2.0f * float(h & 0xFFFFFFu) / float(0x1000000);
@@ -860,6 +865,7 @@ PXG_TEST(artiSolveInternalLaunch)
     PxgCudaShim shim(dev, manifest, 1, &ilLoader);
 
     size_t bad = 0;
+    gTgsOldFrictionNegZero = 0;
     // posIter, residuals on, BEFORE vel-limit, static on, bias 0.9 (erp clamps to 0.7).
     // doFriction deliberately != residualReporting in A and B so a crossed byte
     // read of the flags word cannot pass as a coincidence.
@@ -868,5 +874,9 @@ PXG_TEST(artiSolveInternalLaunch)
     bad += ilRun(shim, true, false, true, true, 2u, true, true, 0.5f, 37);
     // posIter, perSubset (extEvery && !velIter -> dt), no static, no vel-limit, no FDPL
     bad += ilRun(shim, false, true, true, false, 0u, false, true, 0.7f, 41);
+    std::printf("[ info ] old-model friction with -jointV*recipResponse == -0: %u\n",
+                unsigned(gTgsOldFrictionNegZero));
+    PXG_CHECK_MSG(gTgsOldFrictionNegZero > 0,
+                  "the rest articulation must reach the `+ appliedFriction` zero rule");
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

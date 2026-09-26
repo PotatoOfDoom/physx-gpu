@@ -7,7 +7,14 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **879/879** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.86: the sign of zero.  slangc folds `0 + x` at source level and llvmpipe rewrites `0 - x` to
+`-x`, folds literal-zero vector lanes and unrolled zero seeds even under SignedZeroInfNanPreserve
+(new probe p86SignedZero); PxMin/PxMax are selects, not FMin/FMax.  Every shader is now stamped,
+the IEEE ops are spelled as selects, `eqFZ` is bitwise in all fixtures, and an audit of 274
+engine-reached files fixed 99 latent sites in 57.  Eight mirrors had copied the old port (PxQuat
+rotate, child2Parent order, selectMax); corrected.  9/9 select-fix reverts killed; the audit's
+own revert sweep is P9.86c.  Scenes 56/56.
 P9.88 narrows rigid material indices to PxU16 before the lookup, as combineMaterials' PxU16
 parameters do (nptCombineMaterials, sphere, boxBox, cvxTriFinish, finishContacts, test copies);
 fixtures get a second material bank at 0x10000+k; 20/20 mutants killed.  Engine-latent.
@@ -2038,6 +2045,103 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.86 — Das Vorzeichen der Null: SZINP-Stempel, Select-Schreibweisen, strikte Fixtures, latentes Audit
+
+**Der Befund.** IEEE-754 unterscheidet +0 und −0, und die CUDA rechnet es genau aus:
+`0 + (−0) = +0`, `0 − (+0) = +0`, und `PxMin`/`PxMax`/`PxClamp` sind für float **Selects**
+(`intrinsics::selectMin/selectMax`, PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125:
+`a < b ? a : b` bzw. `a > b ? a : b`). Nicht das generische Template `a < b ? b : a`.
+nvcc mit `-use_fast_math` (ftz, fmad, ungenaue div/sqrt) darf `x + 0 → x` und `0 − x → −x`
+**nicht** umschreiben. Unsere Kette tat beides.
+
+**Gemessen** (neue Probe `gpuslang.p86SignedZero`, 23 Zeilen, einmal gestempelt und einmal
+ungestempelt gebaut):
+
+- slangc faltet schon im Quelltext `0 + x`, `x + 0` und einen null-gesäten Akkumulator in
+  geradem Code (`v = 0; if (c) v += x`) zu `x`, auch mit `-fp-mode precise`. `v = 0; v -= x`
+  wird zu `OpFSub(0, x)`.
+- llvmpipe schreibt `OpFSub(Literal 0, x)` zu `−x` um. Das tut es **auch** unter
+  `SignedZeroInfNanPreserve`.
+- llvmpipe faltet Literal-Null-**Lanes** einer Vektoraddition (`float3(a,0,0) + v`) und
+  eine Literal-Null-**Saat**, die nach dem Abrollen einer Schleife mit konstanter
+  Tripzahl weitergereicht wird. Auch das passiert unter dem Modus.
+- Der Modus **stoppt** dagegen `x * 0` und `x ± (berechnete Null)`, also die P9.43b-Klasse.
+- GLSL `FMin`/`FMax` (Slangs `min`/`max`/`clamp`) liefern bei ±0-Gleichstand ein anderes
+  Vorzeichen als die PhysX-Selects.
+
+**Die Abhilfe:**
+
+- Jeder Shader wird mit `SignedZeroInfNanPreserve` gestempelt (`tools/spv_szinp.py`, aus
+  `pxg_compile_shader`). Das sind 467 Shader, nur die Probe bleibt zusätzlich ungestempelt.
+- Die IEEE-Operation wird als Select geschrieben: `plusZero(x) = (x == 0) ? 0 : x` für
+  `0 + x` und `zeroMinus(x) = (x == 0) ? 0 : −x` für `0 − x`.
+- Ein Akkumulator, der nur von einer +0-Saat aus addiert wird, wird vor der Verwendung
+  kanonisiert.
+- `PxMax`/`PxMin` werden als die Selects der CUDA geschrieben.
+
+**Strikte Fixtures.** `eqFZ` verglich ±0 bisher tolerant. Ein strikter Build ließ 4 von 83
+Fixtures scheitern, gestempelt wie ungestempelt:
+
+- Zylinder/Kegel-Support und die Face-Ränder: Literal-Lane.
+- Ellipsoid: Der Port ließ die Nullterme der PxMat33 der CUDA weg.
+- spatialMulQ und die Impulsakkumulatoren der Arti-Kontakte: abgerollte Saat.
+- Ein Spiegel ließ das `0 +` der CUDA weg.
+
+Alle vier sind behoben. `eqFZ` ist jetzt in allen 82 Fixtures bitweise. Die drei
+„Fold-Lanes“ in artiSpatialMatrix(BlockIo) und artiPropagateInertia verlangten bisher
+`> 0` vergebene Wörter. Sie verlangen jetzt **0**, und die Lanes bleiben als Eingaben
+stehen.
+
+**Latentes Audit.** Geprüft wurden alle 274 engine-erreichten Shaderdateien: 12 Finder, ein
+Prüfer pro Kandidat gegen die CUDA. Von 351 Kandidaten waren 99 MATTERS-FIX in 57 Dateien.
+Jede Datei wurde von einem Agenten gepatcht und unabhängig gegen die CUDA reviewt. Der
+schnelle Pfad der Arti-Selbstantwort (`propagateImpulseW<WriteToProvidedQstZ>`,
+`stZ = 0 − s·Z`) wurde von Hand behoben.
+
+Danach waren 8 Suiten rot. Keine davon zeigte einen Port-Fehler: Ihre Spiegel hatten das
+alte Port-Verhalten kopiert.
+
+- pcmManifold: `aToB.transform` ist `PxQuat::rotate` (manifold.cuh:72, PxQuat.h:286-294).
+- artiSetupInternal/-Tendons:
+  - `propagateAccelerationW_child2ParentPreLoaded` sammelt in einem eigenen +0-gesäten
+    `jointSpatialDeltaV` und addiert `pDeltaV + jointSpatialDeltaV` zuletzt
+    (articulationDynamic.cuh:257-313).
+  - `stZ` ist `jf − s·Z` mit `jf = 0`.
+- segTriangleBda, artiUpdateBodies3 und die geteilte `npref::pxMax`: `PxMax<float>` ist
+  `selectMax`. Auf einem Datensatz aus lauter −0 überlebt die +0-Saat.
+- Dieselbe falsche generische Form stand im Port von `PxEllipseClamp` (npD6JointPrep
+  `pxMaxQ`) und in drei Arti-Spiegeln (`pxMaxR`). Alle sind korrigiert.
+
+**Die überlebenden Revert-Mutanten der ersten Select-Fixes sind jetzt getötet.** Keine
+Fixture erzeugte bisher die ±0-Eingaben. Jede bekam einen gezielten Fall und einen
+Abdeckungszähler, der den Mutanten auf dem Host nachrechnet:
+
+- **D6:** Eine Mutanten-Variante des Spiegels (`gErrVecVariant`) sucht 24 Posen mit
+  ±0-Lagen, auf denen `0 − t0` und `−t0` verschiedene Bits ergeben. 7 wurden gefunden,
+  verlangt sind ≥ 4.
+- **femCloth-Biegedämpfung:** Neue Suite-Variante `femClothSimBendingDampingZeroSign`. Ein
+  Paar ruht, und die Spitzen liegen auf beiden Seiten der Kante, sodass beide
+  Spitzen-Deltas in y −0 sind. Alle Akkumulatoren beginnen bei −0. Beide Mutanten-Zwillinge
+  müssen das erwartete Bild ändern.
+- **TGS-Kontaktvorbereitung:** Diese Fixture vergleicht mit 2e-4 Toleranz. Das targetVel
+  der Torsionszeile wird jetzt **bitweise** verglichen, gegen kinematische Körper mit
+  ±0-Winkelgeschwindigkeit und positive Normalen. Gemessen: 4 Zeilen `0+(−0)` und 2 Zeilen
+  `0−(+0)`.
+- **artiSolveInternalLaunch:** Artikulation 6 ruht vollständig (alle `fv` = +0). Die
+  Reibung im alten Modell sieht 6-mal `−jointV·recipResponse = −0`.
+- **softBody preIntegrate:** Die Schwerkraft ist in x/z −0, und Vertex 0 hat eine
+  −0-Geschwindigkeit. `vel·dt = −0` trifft 2-mal auf die +0-Saat.
+
+**Sweeps** (erzwungen frisch, SPV_ONLY): **9/9 getötet** (d6 2, damp 3, tgs 2, arti 1,
+sb 1).
+
+**Offen (P9.86c):** Die 99 Audit-Fixes sind noch nicht per Revert-Mutanten gesweept.
+Vorbereitet sind 112 Hunk-Reverts; 8 Hunks mit doppeltem Anker brauchen Kontext.
+
+**Suite:** **880/880** in beiden Speichermodi (+1: `p86SignedZero`; die neue Bending-Variante
+läuft in `gpuslang.femClothSim`).
+**Szenen:** **56/56** ok (nach allen Shader-Änderungen dieser Tranche).
 
 ## P9.88 — Materialindizes werden vor dem Nachschlagen auf PxU16 gekürzt
 

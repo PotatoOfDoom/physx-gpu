@@ -113,6 +113,10 @@ static bool eqF4FZ(const F4& a, const F4& b)
 // ---- exact CPU transcription (namespace d6ref) ----
 namespace d6ref
 {
+// P9.86 mutant twin: 1 replays the old port's `errorVector = -t0` (the literal
+// `0 - t0` that llvmpipe folds to a negate).  The fixture searches for inputs on
+// which the two differ, so the -0 the negate produces is actually observed.
+static int gErrVecVariant = 0;
 const float FLT_MAXQ = 3.402823466e+38f;
 
 const uint32_t E_SPRING = 1, E_ACCELERATION_SPRING = 2, E_RESTITUTION = 4, E_KEEPBIAS = 8,
@@ -681,7 +685,9 @@ void solverPrep(const D6In& s, D6Out& o)
         V3 ax[3];
         quatToMat33(cA2wq, ax[0], ax[1], ax[2]);
         V3 errorVector{ 0, 0, 0 };
-        if (lin & 1u) errorVector = sub(errorVector, mul(ax[0], cB2cAp.x));
+        if (gErrVecVariant == 1)
+            errorVector = neg((lin & 1u) ? mul(ax[0], cB2cAp.x) : V3{ 0, 0, 0 });
+        else if (lin & 1u) errorVector = sub(errorVector, mul(ax[0], cB2cAp.x));
         if (lin & 2u) errorVector = sub(errorVector, mul(ax[1], cB2cAp.y));
         if (lin & 4u) errorVector = sub(errorVector, mul(ax[2], cB2cAp.z));
         ra = add(ra, errorVector);
@@ -876,7 +882,9 @@ static bool genFixture(std::mt19937& rng, uint32_t i, D6In& s)
 PXG_TEST(npD6JointPrep_prep)
 {
     std::mt19937 rng(174001);
-    const uint32_t N = 4000;
+    const uint32_t D6_ZS_CASES = 24;
+    const uint32_t N = 4000 + D6_ZS_CASES;
+    size_t cZeroMinusSeen = 0;
 
     std::vector<D6In> in(N);
     std::vector<D6Out> ref(N);
@@ -898,6 +906,37 @@ PXG_TEST(npD6JointPrep_prep)
 
         in[i] = s;
         d6ref::solverPrep(s, ref[i]);
+        if (i >= N - D6_ZS_CASES)
+        {
+            // P9.86 directed cases: signed-zero poses on which `0 - t0` and `-t0`
+            // give different bits (see d6ZeroMinus).  Searched on the host with
+            // the mutant twin; trig-free so every row is compared bitwise.
+            static const F4 qs[] = { { 0, 0, 0, 1 }, { 0, 0, 1, 0 }, { 1, 0, 0, 0 },
+                                     { 0, 1, 0, 0 }, { 0, 0, 0, -1 }, { -0.0f, 0, 0, 1 } };
+            std::mt19937 zr(9186u + i * 7919u);
+            for (uint32_t tries = 0; tries < 200000; ++tries)
+            {
+                D6In z = s;
+                auto zs = [&]() { return (zr() & 1u) ? -0.0f : 0.0f; };
+                auto zp = [&]() { return (zr() % 3u) ? zs() : rfS(zr, -0.5f, 0.5f); };
+                z.c2bAq = qs[zr() % 6u]; z.c2bBq = qs[zr() % 6u];
+                z.bA2wq = qs[zr() % 6u]; z.bB2wq = qs[zr() % 6u];
+                z.c2bAp = F4{ zp(), zp(), zp(), s.c2bAp.w };
+                z.c2bBp = F4{ zp(), zp(), zp(), s.c2bBp.w };
+                z.bA2wp = F4{ zp(), zp(), zp(), asF((f2u(s.bA2wp.w) & ~7u) | (1u + zr() % 7u)) };
+                z.bB2wp = F4{ zp(), zp(), zp(), s.bB2wp.w };
+                D6Out a, b;
+                d6ref::solverPrep(z, a);
+                d6ref::gErrVecVariant = 1;
+                d6ref::solverPrep(z, b);
+                d6ref::gErrVecVariant = 0;
+                if (a.counts.y == 0 && std::memcmp(&a, &b, sizeof(a)) != 0)
+                {
+                    s = z; in[i] = s; ref[i] = a; ++cZeroMinusSeen;
+                    break;
+                }
+            }
+        }
 
         const uint32_t trig = ref[i].counts.y;
         if (trig) ++cTrig;
@@ -1006,6 +1045,10 @@ PXG_TEST(npD6JointPrep_prep)
         }
         if (!ok) ++mm;
     }
+    std::printf("[ info ] d6 P9.86 zero-minus cases (0 - t0 differs from -t0): %zu\n", cZeroMinusSeen);
+    // measured: 7 of the 24 directed slots find such a pose within the try budget
+    PXG_CHECK_MSG(cZeroMinusSeen >= 4,
+                  "too few cases where the errorVector's zero sign is observable: %zu", cZeroMinusSeen);
     PXG_CHECK_MSG(mm == 0, "d6jPrep: %zu mismatches", mm);
     PXG_CHECK_MSG(unstable <= 8, "d6jPrep: %zu trig-unstable cases (cap 8)", unstable);
     if (unstable)

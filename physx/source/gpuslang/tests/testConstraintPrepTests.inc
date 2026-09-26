@@ -438,6 +438,33 @@ PXG_TEST(constraintPrepTGS_contact)
 
     std::mt19937 rng(4200);
     ContactSetup cs = buildContactSetup(rng);
+    // P9.86: kinematic bodies at rest, with +0 or -0 angular velocity, so the
+    // torsional row's zero-seeded targetVel (contactConstraintBlockPrep.cuh:1138-1142)
+    // meets `0 + (-0)` and `0 - (+0)`.  Compared bitwise below.
+    cs.bodyData[1].flags &= ~RB_KINEMATIC;
+    for (uint32_t b = 0; b < cs.numBodies; b += 3)
+    {
+        cs.bodyData[b].flags |= RB_KINEMATIC;
+        const float z = (b & 1u) ? -0.0f : 0.0f;
+        Float4& av = cs.bodyData[b].initialAngVelXYZ_penBiasClamp;
+        av = Float4{ z, z, z, av.w };
+    }
+    for (uint32_t k = 0; k < cs.numBatches; ++k)
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            if (lane % 2u == 0u)
+                cs.workUnits[k].mTorsionalFrictionData[lane].x = 0.05f + 0.001f * float(lane);
+            // directed pairs: body 3 is kinematic with -0 angVel, body 0 kinematic with
+            // +0, body 1 dynamic -- lane%4==0: (kin -0, dyn), lane%4==2: (dyn, kin +0)
+            if (lane % 4u == 0u) { cs.batches[k].bodyAIndex[lane] = 3; cs.batches[k].bodyBIndex[lane] = 1; }
+            if (lane % 4u == 2u) { cs.batches[k].bodyAIndex[lane] = 1; cs.batches[k].bodyBIndex[lane] = 0; }
+            // an all-positive normal makes n . (-0,-0,-0) = -0 (every product -0)
+            if (lane % 4u == 0u)
+            {
+                Float4& n4 = cs.cdata[k].normal_restitutionW[lane];
+                n4.x = std::fabs(n4.x); n4.y = std::fabs(n4.y); n4.z = std::fabs(n4.z);
+            }
+        }
 
     const float stepDt = 1.f / 240.f, invStepDt = 240.f, totalDt = 1.f / 60.f, invTotalDt = 60.f;
     const float bounceThreshold = -2.f, frictionOffsetThreshold = 0.04f, correlationDistance = 0.025f;
@@ -604,7 +631,7 @@ PXG_TEST(constraintPrepTGS_contact)
     shim.memcpyDtoH(gCP.data(), dOutCP, gCP.size() * sizeof(TGSContactPoint));
     shim.memcpyDtoH(gFR.data(), dOutFR, gFR.size() * sizeof(TGSFriction));
 
-    size_t mism = 0;
+    size_t mism = 0, torsBits = 0, torsPlusNegZero = 0, torsMinusPosZero = 0;
     for (uint32_t k = 0; k < cs.numBatches && mism < 12; ++k)
         for (uint32_t l = 0; l < cs.batches[k].descStride && mism < 12; ++l)
         {
@@ -652,8 +679,34 @@ PXG_TEST(constraintPrepTGS_contact)
                 if (!eq(gFR[r].resp1[l], refFR[r].resp1[l])) ++mism;
             }
             if (refFH[k].numFrictionConstr[l] & 1) // torsional anchor present
+            {
                 if (!eq(gFH[k].torsionalFrictionScale[l], refFH[k].torsionalFrictionScale[l])) ++mism;
+                // P9.86: the torsional targetVel is the CUDA's own float sequence in the
+                // reference, so it is compared BITWISE (the sign of a zero included)
+                const uint32_t r = cs.batches[k].startFrictionIndex + 2;
+                uint32_t gw, rw;
+                std::memcpy(&gw, &gFR[r].rbXn_targetVelW[l].w, 4);
+                std::memcpy(&rw, &refFR[r].rbXn_targetVelW[l].w, 4);
+                if (gw != rw) ++torsBits;
+                const bool k0 = (cs.bodyData[cs.batches[k].bodyAIndex[l]].flags & RB_KINEMATIC) != 0;
+                const bool k1 = (cs.bodyData[cs.batches[k].bodyBIndex[l]].flags & RB_KINEMATIC) != 0;
+                // the two shapes the port once folded: 0 + (-0) (kin0 only) and 0 - (+0) (kin1 only)
+                if (k0 && !k1 && rw == 0u) {
+                    const Float4 av = cs.bodyData[cs.batches[k].bodyAIndex[l]].initialAngVelXYZ_penBiasClamp;
+                    const Float4 n4 = cs.cdata[k].normal_restitutionW[l];
+                    const float d = n4.x * av.x + n4.y * av.y + n4.z * av.z;
+                    uint32_t dw; std::memcpy(&dw, &d, 4);
+                    if (dw == 0x80000000u) ++torsPlusNegZero;
+                }
+                if (k1 && !k0 && rw == 0u) ++torsMinusPosZero;
+            }
         }
+    std::printf("[ info ] TGS torsional targetVel: 0+(-0) rows %zu, 0-(+0) rows %zu, bit mismatches %zu\n",
+                torsPlusNegZero, torsMinusPosZero, torsBits);
+    PXG_CHECK_MSG(torsBits == 0, "%zu torsional targetVel words differ bitwise", torsBits);
+    PXG_CHECK_MSG(torsPlusNegZero > 0 && torsMinusPosZero > 0,
+                  "the fixture must reach both zero-seeded targetVel shapes (%zu, %zu)",
+                  torsPlusNegZero, torsMinusPosZero);
     PXG_CHECK_MSG(mism == 0, "%zu TGS row mismatches", mism);
 
     // the current-frame friction patches/anchors are engine-ABI outputs too:

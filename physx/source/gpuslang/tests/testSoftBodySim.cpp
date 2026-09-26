@@ -194,7 +194,10 @@ static void runPreIntegrate(bool isTGS)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t N = 8;
     const float dt = 1.0f / 60.0f;
-    const float3 g = { 0.0f, -9.81f, 0.0f };
+    // P9.86: gravity's x and z are -0 and vertex 0's velocity is -0 in x and z, so
+    // vel * dt is -0 there; the CUDA's zero-seeded `delta(0); delta += vel * dt`
+    // (softBodyGM.cu:182-185) makes that +0, a folded seed would keep -0.
+    const float3 g = { -0.0f, -9.81f, -0.0f };
     const float linearDamping = 0.1f;
     const float maxLinVel = PX_MAX_REAL_F;   // default -> clamp dead, no sqrt seam
     const uint32_t actorFlags = 0u;          // gravity enabled
@@ -206,6 +209,7 @@ static void runPreIntegrate(bool isTGS)
         positions[i] = { float(i) * 1.0f, 5.0f + float(i) * 0.25f, -float(i) * 0.5f, w };
         vels[i] = { 0.1f * float(i), -0.2f * float(i), 0.05f * float(i), 0.0f };
     }
+    vels[0].x = -0.0f; vels[0].z = -0.0f;
     std::vector<F4> posDelta(N, { 9.f, 9.f, 9.f, 9.f });
     std::vector<float> speculativeCCD = { 7.0f };
 
@@ -247,6 +251,7 @@ static void runPreIntegrate(bool isTGS)
     // CPU reference (bit-exact expression order, matching softBodyGM.cu:72 else-branch:
     // non-kinematic softbody, no partially-kinematic target).
     std::vector<F4> refPos = positions, refVel = vels, refDelta = posDelta;
+    uint32_t zeroSeedSeen = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         F4 tPos = positions[i];
@@ -275,6 +280,8 @@ static void runPreIntegrate(bool isTGS)
 
         float dx = 0.f, dy = 0.f, dz = 0.f;
         if (!isTGS) { dx += vx * dt; dy += vy * dt; dz += vz * dt; }
+        if (!isTGS && f2u(vx * dt) == 0x80000000u && f2u(dx) == 0u) ++zeroSeedSeen;
+        if (!isTGS && f2u(vz * dt) == 0x80000000u && f2u(dz) == 0u) ++zeroSeedSeen;
 
         refPos[i] = { ox + dx, oy + dy, oz + dz, tPos.w };
         refVel[i] = { vx, vy, vz, tPos.w };
@@ -307,6 +314,8 @@ static void runPreIntegrate(bool isTGS)
 
     PXG_CHECK_MSG(mm == 0, "sb_gm_preIntegrateLaunch (%s) bit-exact vs CPU (%zu mismatches)",
                   isTGS ? "TGS" : "PGS", mm);
+    if (!isTGS)
+        PXG_CHECK_MSG(zeroSeedSeen >= 2, "vel*dt == -0 must meet the +0 delta seed (%u)", zeroSeedSeen);
 
     // Sanity beacons the bit-exact compare already implies, kept human-readable:
     //  - free vertex 0 (invMass != 0) falls: PGS y-position strictly below its start.
