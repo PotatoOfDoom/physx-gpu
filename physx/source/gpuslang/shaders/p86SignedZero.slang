@@ -37,6 +37,8 @@
 // constant zeros are literals in the source, so slangc emits real OpFAdd/OpFSub/
 // OpFMul with a constant operand; any folding is the driver's.
 
+import pxgSlangTriBox;
+
 struct SzPush { uint64_t inp; uint64_t outp; }
 [[vk::push_constant]] ConstantBuffer<SzPush> gSz;
 
@@ -87,4 +89,19 @@ void szProbe(uint3 dtid : SV_DispatchThreadID)
     o[20] = asuint(acc);                                                   // +0
     o[21] = asuint(nz + 0.0f * pz);                                        // +0
     o[22] = asuint((nz == 0.0f) ? 0.0f : nz);                              // +0
+}
+
+// P9.86f: pxgSlangTriBox's AXISTEST/FINDMINMAX selects on NaN.  One thread per case, five float4
+// per case (box centre, extents, tp0, tp1, tp2); writes tbIntersectTriangleBox as 0/1.  Engine
+// consumer convexTrimeshMidphaseBda is NoContraction and SZINP-stamped; so is p86SignedZeroSz.spv,
+// the build this entry is run from, and the directed inputs overflow a*v.y/b*v.z to +-inf, which
+// contraction would move -- the host mirror is -ffp-contract=off to match.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void tbProbe(uint3 dtid : SV_DispatchThreadID)
+{
+    Ptr<float4> i = Ptr<float4>(gSz.inp);
+    Ptr<uint> o = Ptr<uint>(gSz.outp);
+    const uint b = dtid.x * 5u;
+    o[dtid.x] = tbIntersectTriangleBox(i[b].xyz, i[b + 1u].xyz, i[b + 2u].xyz, i[b + 3u].xyz, i[b + 4u].xyz) ? 1u : 0u;
 }

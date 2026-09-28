@@ -122,6 +122,10 @@ static bool planeBoxOverlap(V3 n, float d, V3 maxbox)
     return false;
 }
 
+// P9.86f: AXISTEST_* / FINDMINMAX are intrinsics::selectMin/selectMax (GuIntersectionTriangleBoxRef.h:58-61,
+// :108-156; PxUnixMathIntrinsics.h:116-125): a NaN SECOND operand survives.  std::fmin/std::fmax drop it.
+static float selMin(float a, float b) { return (a < b) ? a : b; }
+static float selMax(float a, float b) { return (a > b) ? a : b; }
 static bool intersectTriangleBox(V3 c, V3 e, V3 tp0, V3 tp1, V3 tp2)
 {
     const V3 v0 = sub3(tp0, c), v1 = sub3(tp1, c), v2 = sub3(tp2, c);
@@ -158,13 +162,13 @@ static bool intersectTriangleBox(V3 c, V3 e, V3 tp0, V3 tp1, V3 tp2)
             pb = ee.y * vv[t.b].x - ee.x * vv[t.b].y;
             rad = fey * e.x + fex * e.y;
         }
-        const float mn = std::fmin(pa, pb), mx = std::fmax(pa, pb);
+        const float mn = selMin(pa, pb), mx = selMax(pa, pb);
         if (mn > rad || mx < -rad) return false;
     }
     // the three AABB axes
-    if (std::fmin(std::fmin(v0.x, v1.x), v2.x) > e.x || std::fmax(std::fmax(v0.x, v1.x), v2.x) < -e.x) return false;
-    if (std::fmin(std::fmin(v0.y, v1.y), v2.y) > e.y || std::fmax(std::fmax(v0.y, v1.y), v2.y) < -e.y) return false;
-    if (std::fmin(std::fmin(v0.z, v1.z), v2.z) > e.z || std::fmax(std::fmax(v0.z, v1.z), v2.z) < -e.z) return false;
+    if (selMin(selMin(v0.x, v1.x), v2.x) > e.x || selMax(selMax(v0.x, v1.x), v2.x) < -e.x) return false;
+    if (selMin(selMin(v0.y, v1.y), v2.y) > e.y || selMax(selMax(v0.y, v1.y), v2.y) < -e.y) return false;
+    if (selMin(selMin(v0.z, v1.z), v2.z) > e.z || selMax(selMax(v0.z, v1.z), v2.z) < -e.z) return false;
     // the triangle plane
     const V3 n = cross3(ed[0], ed[1]);
     return planeBoxOverlap(n, -dot3(n, v0), e);

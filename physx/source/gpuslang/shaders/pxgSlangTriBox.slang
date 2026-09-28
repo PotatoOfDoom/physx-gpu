@@ -68,6 +68,17 @@
 
 module pxgSlangTriBox;
 
+// P9.86f: every AXISTEST_* and FINDMINMAX of GuIntersectionTriangleBoxRef.h:58-61/108-156 is
+// physx::intrinsics::selectMin/selectMax (PxUnixMathIntrinsics.h:116-125) = a<b?a:b / a>b?a:b, in
+// that operand order -- NOT fminf/fmaxf.  GLSL min/max (FMin/FMax, minNum/maxNum on llvmpipe) drop a
+// NaN operand, where the select returns the SECOND operand whenever the compare is false: with the
+// second operand NaN the CUDA gets minimum = maximum = NaN, both `minimum>rad || maximum<-rad`
+// compares are false and the axis does not reject, where FMin/FMax returned the first operand and
+// could reject.  Overflowing world coordinates (|coord| ~ 1e19..1e20, a*v.y and b*v.z both +-inf)
+// reach it; the +-0 tie is irrelevant here (every consumer is a sign-blind compare).
+float tbSelMin(float a, float b) { return (a < b) ? a : b; }   // intrinsics::selectMin
+float tbSelMax(float a, float b) { return (a > b) ? a : b; }   // intrinsics::selectMax
+
 public bool tbPlaneBoxOverlap(float3 normal, float d, float3 maxbox)
 {
     float3 vmin, vmax;
@@ -113,19 +124,19 @@ public bool tbIntersectTriangleBox(float3 boxcenter, float3 extents, float3 tp0,
     // AXISTEST_X01(e0.z, e0.y, fez, fey)
     p0 = e0.z * v0.y - e0.y * v0.z;
     p2 = e0.z * v2.y - e0.y * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
+    minimum = tbSelMin(p0, p2); maximum = tbSelMax(p0, p2);
     rad = fez * extents.y + fey * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Y02(e0.z, e0.x, fez, fex)
     p0 = -e0.z * v0.x + e0.x * v0.z;
     p2 = -e0.z * v2.x + e0.x * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
+    minimum = tbSelMin(p0, p2); maximum = tbSelMax(p0, p2);
     rad = fez * extents.x + fex * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Z12(e0.y, e0.x, fey, fex)
     p1 = e0.y * v1.x - e0.x * v1.y;
     p2 = e0.y * v2.x - e0.x * v2.y;
-    minimum = min(p1, p2); maximum = max(p1, p2);
+    minimum = tbSelMin(p1, p2); maximum = tbSelMax(p1, p2);
     rad = fey * extents.x + fex * extents.y;
     if (minimum > rad || maximum < -rad) return false;
 
@@ -135,19 +146,19 @@ public bool tbIntersectTriangleBox(float3 boxcenter, float3 extents, float3 tp0,
     // AXISTEST_X01(e1.z, e1.y, fez, fey)
     p0 = e1.z * v0.y - e1.y * v0.z;
     p2 = e1.z * v2.y - e1.y * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
+    minimum = tbSelMin(p0, p2); maximum = tbSelMax(p0, p2);
     rad = fez * extents.y + fey * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Y02(e1.z, e1.x, fez, fex)
     p0 = -e1.z * v0.x + e1.x * v0.z;
     p2 = -e1.z * v2.x + e1.x * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
+    minimum = tbSelMin(p0, p2); maximum = tbSelMax(p0, p2);
     rad = fez * extents.x + fex * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Z0(e1.y, e1.x, fey, fex)
     p0 = e1.y * v0.x - e1.x * v0.y;
     p1 = e1.y * v1.x - e1.x * v1.y;
-    minimum = min(p0, p1); maximum = max(p0, p1);
+    minimum = tbSelMin(p0, p1); maximum = tbSelMax(p0, p1);
     rad = fey * extents.x + fex * extents.y;
     if (minimum > rad || maximum < -rad) return false;
 
@@ -157,28 +168,30 @@ public bool tbIntersectTriangleBox(float3 boxcenter, float3 extents, float3 tp0,
     // AXISTEST_X2(e2.z, e2.y, fez, fey)
     p0 = e2.z * v0.y - e2.y * v0.z;
     p1 = e2.z * v1.y - e2.y * v1.z;
-    minimum = min(p0, p1); maximum = max(p0, p1);
+    minimum = tbSelMin(p0, p1); maximum = tbSelMax(p0, p1);
     rad = fez * extents.y + fey * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Y1(e2.z, e2.x, fez, fex)
     p0 = -e2.z * v0.x + e2.x * v0.z;
     p1 = -e2.z * v1.x + e2.x * v1.z;
-    minimum = min(p0, p1); maximum = max(p0, p1);
+    minimum = tbSelMin(p0, p1); maximum = tbSelMax(p0, p1);
     rad = fez * extents.x + fex * extents.z;
     if (minimum > rad || maximum < -rad) return false;
     // AXISTEST_Z12(e2.y, e2.x, fey, fex)
     p1 = e2.y * v1.x - e2.x * v1.y;
     p2 = e2.y * v2.x - e2.x * v2.y;
-    minimum = min(p1, p2); maximum = max(p1, p2);
+    minimum = tbSelMin(p1, p2); maximum = tbSelMax(p1, p2);
     rad = fey * extents.x + fex * extents.y;
     if (minimum > rad || maximum < -rad) return false;
 
-    // AABB axes
-    minimum = min(min(v0.x, v1.x), v2.x); maximum = max(max(v0.x, v1.x), v2.x);
+    // AABB axes: FINDMINMAX (GuIntersectionTriangleBoxRef.h:58-61), selects in the CUDA's nesting.
+    // (FMin/FMax here are equivalent in the RESULT: they differ only for a NaN v1/v2 lane, whose edges
+    // make two normal lanes and d NaN, so the CUDA's plane test below returns false as well.)
+    minimum = tbSelMin(tbSelMin(v0.x, v1.x), v2.x); maximum = tbSelMax(tbSelMax(v0.x, v1.x), v2.x);
     if (minimum > extents.x || maximum < -extents.x) return false;
-    minimum = min(min(v0.y, v1.y), v2.y); maximum = max(max(v0.y, v1.y), v2.y);
+    minimum = tbSelMin(tbSelMin(v0.y, v1.y), v2.y); maximum = tbSelMax(tbSelMax(v0.y, v1.y), v2.y);
     if (minimum > extents.y || maximum < -extents.y) return false;
-    minimum = min(min(v0.z, v1.z), v2.z); maximum = max(max(v0.z, v1.z), v2.z);
+    minimum = tbSelMin(tbSelMin(v0.z, v1.z), v2.z); maximum = tbSelMax(tbSelMax(v0.z, v1.z), v2.z);
     if (minimum > extents.z || maximum < -extents.z) return false;
 
     // plane of the triangle

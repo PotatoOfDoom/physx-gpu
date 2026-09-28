@@ -144,8 +144,12 @@ static bool refTriBox(V3 boxcenter, V3 extents, V3 tp0, V3 tp1, V3 tp2, Slack& s
     const V3 e0 = sub(v1, v0), e1 = sub(v2, v1), e2 = sub(v0, v2);
     float mn, mx, rad, p0, p1, p2;
 
+    // P9.86f: AXISTEST_* / FINDMINMAX are intrinsics::selectMin/selectMax (GuIntersectionTriangleBoxRef.h,
+    // PxUnixMathIntrinsics.h:116-125): a NaN SECOND operand survives.  std::min/std::max drop it.
+    auto selMin = [](float a, float b) { return (a < b) ? a : b; };
+    auto selMax = [](float a, float b) { return (a > b) ? a : b; };
     #define AX(pa, pb, radv) \
-        mn = std::min(pa, pb); mx = std::max(pa, pb); rad = radv; \
+        mn = selMin(pa, pb); mx = selMax(pa, pb); rad = radv; \
         sl.note(mn, rad); sl.note(mx, -rad); \
         if (mn > rad || mx < -rad) return false;
 
@@ -165,13 +169,13 @@ static bool refTriBox(V3 boxcenter, V3 extents, V3 tp0, V3 tp1, V3 tp2, Slack& s
     p1 = e2.y * v1.x - e2.x * v1.y; p2 = e2.y * v2.x - e2.x * v2.y; AX(p1, p2, fey * extents.x + fex * extents.y);
     #undef AX
 
-    mn = std::min(std::min(v0.x, v1.x), v2.x); mx = std::max(std::max(v0.x, v1.x), v2.x);
+    mn = selMin(selMin(v0.x, v1.x), v2.x); mx = selMax(selMax(v0.x, v1.x), v2.x);
     sl.note(mn, extents.x); sl.note(mx, -extents.x);
     if (mn > extents.x || mx < -extents.x) return false;
-    mn = std::min(std::min(v0.y, v1.y), v2.y); mx = std::max(std::max(v0.y, v1.y), v2.y);
+    mn = selMin(selMin(v0.y, v1.y), v2.y); mx = selMax(selMax(v0.y, v1.y), v2.y);
     sl.note(mn, extents.y); sl.note(mx, -extents.y);
     if (mn > extents.y || mx < -extents.y) return false;
-    mn = std::min(std::min(v0.z, v1.z), v2.z); mx = std::max(std::max(v0.z, v1.z), v2.z);
+    mn = selMin(selMin(v0.z, v1.z), v2.z); mx = selMax(selMax(v0.z, v1.z), v2.z);
     sl.note(mn, extents.z); sl.note(mx, -extents.z);
     if (mn > extents.z || mx < -extents.z) return false;
 

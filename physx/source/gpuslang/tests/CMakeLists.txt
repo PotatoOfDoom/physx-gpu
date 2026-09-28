@@ -355,7 +355,7 @@ pxg_compile_shader(npCvxCoreWarpAcc cwaAddPoints)
 # poisoned streams -- the engine's own text, #included; BDA-only (not in the HLSL list).
 pxg_compile_shader(cvxCoreTailBda cctSingle cctMulti)
 # P9.86: the sign-of-zero probe, built twice -- as-is and with SignedZeroInfNanPreserve.
-pxg_compile_shader(p86SignedZero szProbe)
+pxg_compile_shader(p86SignedZero szProbe tbProbe)
 add_custom_command(
     OUTPUT ${SHADER_OUT_DIR}/p86SignedZeroSz.spv
     COMMAND python3 ${GPUSLANG_ROOT}/tools/spv_szinp.py ${SHADER_OUT_DIR}/p86SignedZero.spv ${SHADER_OUT_DIR}/p86SignedZeroSz.spv
