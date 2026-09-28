@@ -2176,6 +2176,84 @@ PXG_TEST(femClothSimApplyExternalDeltas)
     dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
+// P9.86f: the w lanes.  FEMClothExternalSolve.cu:1101-1102 are IEEE `pos.w + 0.f` / `accumDelta.w + 0.f`
+// (delta.w = 0.f just above), which turn a -0 inverse mass into +0; llvmpipe folds the forwarded literal-zero
+// w lane of those float4 adds (F3), so the port spells the lane as a select.  Vertex 0 carries -0 in all
+// three w lanes and a non-zero count; vertex 1 the same with +0 (control).  vel.w's add is `w + 0 * invDt`,
+// a computed zero (IEEE either way).  Compared bitwise, no signed-zero forgiveness.
+PXG_TEST(femClothSimApplyExternalDeltasZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 2;
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+
+    std::vector<F4> positions = { {1.f, 2.f, 3.f, -0.0f}, {4.f, 5.f, 6.f, 0.0f} };
+    std::vector<F4> vels = { {0.1f, 0.2f, 0.3f, -0.0f}, {-0.1f, -0.2f, -0.3f, 0.0f} };
+    std::vector<F4> accum = { {0.5f, 0.5f, 0.5f, -0.0f}, {1.f, 1.f, 1.f, 0.0f} };
+    std::vector<F4> deltaPos = { {0.3f, -0.6f, 0.9f, 2.0f}, {1.5f, 0.3f, -0.9f, 3.0f} };
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bAcc = makeDev(dev, accum);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mNbVerts = N;
+
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ApplyExtPush push = {};
+    push.clothes = bDesc.addr;
+    push.activeClothes = bActive.addr;
+    push.dt = dt;
+
+    Kernel k("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference (FEMClothExternalSolve.cu:1085-1106), IEEE: -0 + 0.f = +0.  The twin is the folded port
+    // (`pos.w + 0` -> `pos.w`), which keeps the input's -0.
+    std::vector<F4> refPos(N), refVel(N), refAcc(N);
+    uint32_t twinKills = 0;
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        const F4 d = deltaPos[v];
+        const float scale = 1.0f / d.w;
+        const F4 sd = { d.x * scale, d.y * scale, d.z * scale, 0.0f };
+        refVel[v] = { vels[v].x + sd.x * invDt, vels[v].y + sd.y * invDt, vels[v].z + sd.z * invDt, vels[v].w + sd.w * invDt };
+        refPos[v] = { positions[v].x + sd.x, positions[v].y + sd.y, positions[v].z + sd.z, positions[v].w + sd.w };
+        refAcc[v] = { accum[v].x + sd.x, accum[v].y + sd.y, accum[v].z + sd.z, accum[v].w + sd.w };
+        if (f2u(refPos[v].w) != f2u(positions[v].w)) ++twinKills;
+        if (f2u(refAcc[v].w) != f2u(accum[v].w)) ++twinKills;
+    }
+    PXG_CHECK_MSG(twinKills == 2 && f2u(refPos[0].w) == 0u && f2u(refAcc[0].w) == 0u,
+                  "applyExternalDeltasZeroSign: the -0 w lanes must reach the CUDA's +0 (%u twin kills)", twinKills);
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
+    auto same = [](const F4& r, const F4& g) {
+        return f2u(r.x) == f2u(g.x) && f2u(r.y) == f2u(g.y) && f2u(r.z) == f2u(g.z) && f2u(r.w) == f2u(g.w);
+    };
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        PXG_CHECK_MSG(same(refPos[v], gPos[v]), "vert %u pos: w ref %08x gpu %08x", v, f2u(refPos[v].w), f2u(gPos[v].w));
+        PXG_CHECK_MSG(same(refVel[v], gVel[v]), "vert %u vel: w ref %08x gpu %08x", v, f2u(refVel[v].w), f2u(gVel[v].w));
+        PXG_CHECK_MSG(same(refAcc[v], gAcc[v]), "vert %u accumDelta: w ref %08x gpu %08x", v, f2u(refAcc[v].w), f2u(gAcc[v].w));
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
 // ===========================================================================
 // P7.1 tranche 4a: cloth-vertex-vs-PRIMITIVE contact GENERATION.
 //   femClothContactGenBda.spv:

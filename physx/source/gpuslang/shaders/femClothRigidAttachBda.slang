@@ -611,8 +611,14 @@ void cloth_applyExternalDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
             delta.w = 0.0f;
 
             vel += delta * invDt;
+            // P9.86f: FEMClothExternalSolve.cu:1101-1102 are IEEE `pos.w + 0.f` / `accumDelta.w + 0.f`
+            // (delta.w = 0.f above), which turn a -0 w (the inverse mass) into +0; llvmpipe folds the
+            // forwarded literal-zero w lane of these float4 adds, so that lane's `x + 0` is a select
+            // (as softBodySolveBda's apply-deltas).  vel.w gets `0 * invDt`, a computed zero: IEEE as is.
             pos += delta;
+            pos.w = (pos.w == 0.0f) ? 0.0f : pos.w;
             accumDelta += delta;
+            accumDelta.w = (accumDelta.w == 0.0f) ? 0.0f : accumDelta.w;
 
             positions[vertIdx] = pos;
             velocities[vertIdx] = vel;
