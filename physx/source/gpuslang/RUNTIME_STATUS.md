@@ -2052,6 +2052,32 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.86e — combineScalars in finishContacts: FMin/FMax statt der PxMin/PxMax-Selects
+
+`finishContactsKernel` (npCvxFinishContacts.slang, von der Engine erreicht) sowie die
+Fixture-Kopien npCvxCoreOut, npCvxTrimeshOut und npMaterialCombine kombinierten eMIN/eMAX mit
+GLSL FMin/FMax. PxMin/PxMax<float> aus PxsCombineMaterials (PxsMaterialCombiner.h:36-50,
+:161) sind Selects: Bei einem ±0-Gleichstand gewinnt der zweite Operand.
+
+**Fix.** Alle vier Shader verwenden jetzt die Selects, auch für die Klemme
+PxMax(dynFriction, 0). Die Host-Spiegel (bisher std::fmin/fmax bzw. std::min/max) folgen
+ebenfalls den CUDA-Selects und haben FMin/FMax-Mutantenzwillinge.
+
+**Fixtures.** Eine gerichtete ±0-Materialbank wird in npCvxFinishContacts_engineAbi und in
+drei neuen `*_materialZeroSign`-Tests bitgenau geprüft:
+
+- eMIN(−0,+0) und eMAX(+0,−0), jeweils in beiden Reihenfolgen;
+- erzwungenes eMAX-Damping;
+- dynF = −0 in die Klemme.
+
+npMaterialCombine_combine vergleicht jetzt bitweise.
+
+**Sweep.** r0/r1 sind in allen vier Shadern getötet. r2, die Klemme als FMax, ist auf
+llvmpipe äquivalent: FMax(−0,+0) = +0, und NaN ist bei gültigen Materialwerten unerreichbar,
+wie bei boxBoxNphase in P9.86c.
+
+**Suite:** 880/880 in beiden Modi. **Szenen:** 56/56.
+
 ## P9.86c/d — Jeder Audit-Fix hat jetzt eine Fixture, die ihn sieht (oder einen Äquivalenzbeweis)
 
 **Der Befund.** Die 99 Audit-Fixes aus P9.86 (57 Shader) wurden hunkweise zurückgedreht und
