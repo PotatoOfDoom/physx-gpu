@@ -972,13 +972,21 @@ PXG_TEST(solverPGS_concludeAndWriteback)
     std::memset(jointRowsMod.data(), 0, jointRowsMod.size() * sizeof(BlockJointRowMod));
     std::memset(frictionPatchBlocks.data(), 0, frictionPatchBlocks.size() * sizeof(BlockFrictionPatch));
 
-    std::vector<SolverBodyData> bodyData(numBodies);
+    // +2: two bodies only the directed threshold lanes below use (the random lanes draw rng() % numBodies).
+    std::vector<SolverBodyData> bodyData(numBodies + 2);
     std::memset(bodyData.data(), 0, bodyData.size() * sizeof(SolverBodyData));
     for (uint32_t b = 0; b < numBodies; ++b)
     {
         bodyData[b].reportThreshold = unit(rng) < 0.5f ? unit(rng) * 5.f : PX_MAX_REAL_F;
         bodyData[b].islandNodeIndex = makeNodeIndex(rng() % 1000);
     }
+    // P9.86: NpRigidDynamic::setContactReportThreshold(-0.0f) is accepted and kept bit for bit
+    // (PxIsFinite(-0), -0 >= 0, `threshold < 0 ? 0 : threshold` keeps -0).
+    const uint32_t bodyNegZero = numBodies, bodyPosZero = numBodies + 1;
+    bodyData[bodyNegZero].reportThreshold = -0.0f;
+    bodyData[bodyNegZero].islandNodeIndex = makeNodeIndex(1001);
+    bodyData[bodyPosZero].reportThreshold = 0.0f;
+    bodyData[bodyPosZero].islandNodeIndex = makeNodeIndex(1002);
 
     const uint32_t numPatches = numAllBatches * 32;
     std::vector<FrictionPatchGPU> patches(numPatches);
@@ -1059,6 +1067,24 @@ PXG_TEST(solverPGS_concludeAndWriteback)
             }
         }
     }
+
+    // P9.86 directed lanes (after every rng() draw, so the random stream is unchanged): a contact lane
+    // with a force threshold, a non-zero normal force and a mixed-sign zero reportThreshold pair.
+    // solverBlock.cuh:781 PxMin<float>(rt0, rt1) = selectMin `a < b ? a : b` returns b on a tie:
+    // (-0,+0) -> +0, (+0,-0) -> -0.  The builtin min() (GLSL FMin) gives -0 for both on llvmpipe.
+    auto plantZeroPair = [&](uint32_t k, uint32_t bodyA, uint32_t bodyB) {
+        BlockConstraintBatch& b = batches[k]; // k odd -> contact batch; descStride >= 1 -> lane 0 runs
+        b.bodyAIndex[0] = bodyA;
+        b.bodyBIndex[0] = bodyB;
+        contactHeaders[k].flags[0] = 1u; // eHAS_FORCE_THRESHOLDS
+        if (contactHeaders[k].numNormalConstr[0] == 0)
+            contactHeaders[k].numNormalConstr[0] = 1; // nf was drawn 0 for nc == 0: stays consistent
+        if (contactHeaders[k].forceWritebackOffset[0] == 0xFFFFFFFFu)
+            contactHeaders[k].forceWritebackOffset[0] = (forceBufCursor += rowsPerBatch) - rowsPerBatch;
+        contactPoints[b.startConstraintIndex].appliedForce[0] = 1.5f; // other rows >= 0 -> normalForce >= 1.5
+    };
+    plantZeroPair(1, bodyNegZero, bodyPosZero); // PxMin(-0,+0) = +0; FMin -> -0
+    plantZeroPair(3, bodyPosZero, bodyNegZero); // PxMin(+0,-0) = -0; pins the tie rule in the other order
 
     // ---- GPU (engine ABI through the shim) ----
     PxgSlangComputeDevice* dev = testDevice();
@@ -1178,6 +1204,7 @@ PXG_TEST(solverPGS_concludeAndWriteback)
     std::vector<float> refForce = forceInit;
     std::vector<ConstraintWriteback> refWb = wbInit;
     size_t refBrokenJoints = 0; // guard against a fixture that never breaks a joint
+    size_t thrMinTieDiffers = 0, thrMinTieAgrees = 0; // (-0,+0) / (+0,-0) reportThreshold pairs
     std::vector<FrictionPatchGPU> refPatches = patches;
     std::vector<ThresholdElement> refStream;
 
@@ -1245,7 +1272,17 @@ PXG_TEST(solverPGS_concludeAndWriteback)
                 {
                     ThresholdElement e = {};
                     e.normalForce = normalForce;
-                    e.threshold = std::fmin(rt0, rt1);
+                    // solverBlock.cuh:781 PxMin<float> -> PxMath.h float specialization ->
+                    // intrinsics::selectMin `a < b ? a : b` (b on a tie), NOT fminf / std::fmin.
+                    e.threshold = (rt0 < rt1) ? rt0 : rt1;
+                    if (rt0 == 0.f && rt1 == 0.f && std::signbit(rt0) != std::signbit(rt1))
+                    {
+                        // twin: builtin min() = GLSL FMin gives -0 for a mixed-sign zero pair (F4)
+                        if (!std::signbit(e.threshold))
+                            ++thrMinTieDiffers; // (-0,+0): PxMin +0 vs FMin -0
+                        else
+                            ++thrMinTieAgrees; // (+0,-0): both -0
+                    }
                     e.nodeIndexA = bodyData[b.bodyAIndex[lane]].islandNodeIndex;
                     e.nodeIndexB = bodyData[b.bodyBIndex[lane]].islandNodeIndex;
                     if (e.nodeIndexB < e.nodeIndexA)
@@ -1323,6 +1360,13 @@ PXG_TEST(solverPGS_concludeAndWriteback)
     // reports a broken joint, so the memcmp below can only see it if the fixture
     // actually breaks one.
     PXG_CHECK_MSG(refBrokenJoints > 0, "writeback fixture breaks no joint (the sign-bit path is untested)");
+    // COVERAGE (P9.86): the threshold stream is memcmp'd below; an FMin revert of the PxMin<float>
+    // select flips exactly the (-0,+0) element ("threshold stream: 1 mismatches", the random
+    // shapeInteraction at offset 0 fixes each element's sort position).
+    PXG_CHECK_MSG(thrMinTieDiffers > 0,
+                  "writeback: no threshold element with (rt0,rt1) = (-0,+0) -- the PxMin<float> tie rule "
+                  "(solverBlock.cuh:781) is untested");
+    PXG_CHECK_MSG(thrMinTieAgrees > 0, "writeback: no threshold element with (rt0,rt1) = (+0,-0)");
 
     size_t mismatches = 0;
     for (size_t i = 0; i < contactPoints.size(); ++i)
