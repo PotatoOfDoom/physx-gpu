@@ -6315,6 +6315,174 @@ static void runClothSelfContactVT()
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
 }
 
+// P9.86f -- the FRICTION clamp of triangleCollisionConstraint (FEMClothExternalSolve.cu:274-275):
+//   deltaLambdaT = PxMax(0.f, CT * invDenom);  deltaLambdaT = -PxMin(deltaLambdaT, fc * |deltaLambdaN|);
+// PxMax/PxMin<float> are selectMax/selectMin (PxUnixMathIntrinsics.h:116-125): a +-0 tie keeps the SECOND
+// operand, where llvmpipe's FMax gives +0 and FMin -0 in either order.  One VT self-contact, every value a
+// binary fraction so no bit depends on rounding:
+//   triangle a=(0,0,0) b=(1,-1,0) c=(1,1,0), vertex p=(-1/16, 2^-17, -0): the closest point is a (s=t=0),
+//   weights (1,-1,-0,-0), disp = (-1/16, 2^-17, -0), |disp| rounds to 1/16, normal = (-1, 2^-13, -0);
+//   prev(p) = (3/16, 2^-17, +0) and the triangle at rest give relDelta = (-1/4, +0, -0), so
+//   tanDir = (+0, -1, +0) (tanMagSq 2^-30) and CT = (-1/4)(+0) + (+0)(-1) + (-0)(+0) = -0.
+// Case A, rest distance 0.1: lim = 0.5 * 0.0375 > 0.  CUDA: PxMax(0,-0) = -0, PxMin(-0, lim) = -0, so
+//   deltaLambdaT = +0 and commonVec.z = (dLN * -0) + (+0 * +0) = +0; the FMax port gives -0 there.
+// Case B, rest distance 1/16 == |disp|: CN = +0, dLN = -0, lim = +0.  CUDA: PxMin(-0, +0) = +0, so
+//   deltaLambdaT = -0 and commonVec.y = (-0 * 2^-13) + (-0 * -1) = +0; the FMin port gives -0 there.
+// mDeltaPos only ever holds +0 or sums in the engine (cleared with make_float4(0), FEMClothExternalSolve.cu:1109,
+// then atomically added to), and +0 + (-0) = +0 -- so there the flipped zero lane of a contact's dx cannot show.
+// The fixture therefore seeds the accumulator with -0, which makes the kernel's per-contact dx bits visible:
+// -0 + dx keeps dx's sign.
+static void runClothSelfContactFrictionZeroSign(float restDistScalar, int killsVariant)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float invMass = 0.5f;
+    const float NZ = -0.0f, E = 7.62939453125e-06f;   // 2^-17
+    std::vector<F4> pos = {
+        { 0.0f, 0.0f, 0.0f, invMass },       // v0 = a
+        { 1.0f, -1.0f, 0.0f, invMass },      // v1 = b
+        { 1.0f, 1.0f, 0.0f, invMass },       // v2 = c
+        { -0.0625f, E, NZ, invMass },        // v3 = the vertex
+    };
+    std::vector<F4> rest = pos;
+    std::vector<F4> prev = pos;
+    prev[3] = F4{ 0.1875f, E, 0.0f, invMass };
+    std::vector<F4> deltaPos(4, F4{ NZ, NZ, NZ, 0.0f });
+    std::vector<float> friction(4, 0.5f);
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
+
+    // ---- host mirror (FEMClothExternalSolve.cu:243 + applyContactDelta), variant twins ----
+    using p72ref::V3;
+    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    float s, t;
+    p72ref::closestPtPointTriangle(v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]), s, t);
+    const float rB = 1.0f - s - t;
+    const float w[4] = { 1.0f, -rB, -s, -t };
+    const V3 xx[4] = { v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]) };
+    const V3 pv[4] = { v3f(prev[3]), v3f(prev[0]), v3f(prev[1]), v3f(prev[2]) };
+    const uint32_t slot[4] = { 3u, 0u, 1u, 2u };
+    const V3 disp = p72solve::dispFromWeights(w, xx[0], xx[1], xx[2], xx[3]);
+    const V3 dl[4] = { p72ref::sub(xx[0], pv[0]), p72ref::sub(xx[1], pv[1]), p72ref::sub(xx[2], pv[2]), p72ref::sub(xx[3], pv[3]) };
+    const V3 relDelta = p72solve::dispFromWeights(w, dl[0], dl[1], dl[2], dl[3]);
+    const float dist = std::sqrt(p72ref::dot(disp, disp));
+    const V3 normal = p72ref::mul(disp, 1.0f / dist);
+    const float restTotal = restDistScalar + restDistScalar;
+    float count[4];
+    for (int i = 0; i < 4; ++i) count[i] = (std::fabs(w[i]) > 1e-3f) ? std::fabs(w[i]) : 0.0f;
+    const float fc = 0.25f * (friction[0] + friction[1] + friction[2] + friction[3]);
+    auto solveRef = [&](int variant, F4 out[4]) {
+        float m[4];
+        for (int i = 0; i < 4; ++i) m[i] = count[i] * invMass;
+        const float CN = p72ref::dot(disp, normal) - restTotal;
+        float denom = m[0] * w[0] * w[0];
+        denom += m[1] * w[1] * w[1];
+        denom += m[2] * w[2] * w[2];
+        denom += m[3] * w[3] * w[3];
+        const float invDenom = 1.0f / denom;
+        const float dLN = -CN * invDenom;
+        V3 cv = p72ref::mul(normal, dLN);
+        V3 tanDir = p72ref::sub(relDelta, p72ref::mul(normal, p72ref::dot(relDelta, normal)));
+        const float tanMagSq = p72ref::dot(tanDir, tanDir);
+        if (fc != 0.0f && tanMagSq > p72solve::THR)
+        {
+            tanDir = p72ref::mul(tanDir, 1.0f / std::sqrt(tanMagSq));
+            const float x = p72ref::dot(relDelta, tanDir) * invDenom;
+            // 0 = the CUDA selects; 1 = llvmpipe FMax at :274; 2 = llvmpipe FMin at :275
+            float d = (variant == 1) ? ((x > 0.0f) ? x : 0.0f) : ((0.0f > x) ? 0.0f : x);
+            const float lim = fc * std::fabs(dLN);
+            d = (variant == 2) ? -((d == lim) ? (std::signbit(d) ? d : lim) : (d < lim ? d : lim))
+                               : -((d < lim) ? d : lim);
+            cv = p72ref::add(cv, p72ref::mul(tanDir, d));
+        }
+        for (int i = 0; i < 4; ++i) out[i] = deltaPos[i];
+        for (int i = 0; i < 4; ++i)
+        {
+            out[slot[i]].w = count[i];
+            if (count[i] > 0.0f)
+            {
+                const V3 dx = p72ref::mul(cv, m[i] * w[i]);
+                out[slot[i]].x = out[slot[i]].x + dx.x;
+                out[slot[i]].y = out[slot[i]].y + dx.y;
+                out[slot[i]].z = out[slot[i]].z + dx.z;
+            }
+        }
+    };
+    F4 ref[4], twin[4];
+    solveRef(0, ref);
+    PXG_CHECK_MSG(s == 0.0f && t == 0.0f && f2u(normal.x) == 0xBF800000u && f2u(normal.z) == 0x80000000u &&
+                  f2u(relDelta.y) == 0u && f2u(relDelta.z) == 0x80000000u,
+                  "friction zero-sign rig drifted (s %g t %g n %08x %08x rd %08x %08x)", s, t,
+                  f2u(normal.x), f2u(normal.z), f2u(relDelta.y), f2u(relDelta.z));
+    for (int v = 1; v <= 2; ++v)
+    {
+        solveRef(v, twin);
+        bool differs = false;
+        for (int i = 0; i < 4; ++i)
+            differs |= f2u(twin[i].x) != f2u(ref[i].x) || f2u(twin[i].y) != f2u(ref[i].y) || f2u(twin[i].z) != f2u(ref[i].z);
+        PXG_CHECK_MSG(differs == (v == killsVariant), "rest %g: the friction-clamp twin %d %s the scattered deltas",
+                      restDistScalar, v, differs ? "changes" : "does not change");
+    }
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bPrev = makeDev(dev, prev);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction);
+    DevBuf bTri = makeDev(dev, tris);
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 4u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<FemFemContactInfoHost> infos(1);
+    infos[0].pairInd0 = (0ull << 20) | 3ull;
+    infos[0].pairInd1 = (0u << 20) | 0u;
+    infos[0].auxInd = 0u;
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { 1u };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = 64u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
+    dev->flush();
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto g = downloadBuffer<F4>(dev, bDelta.h, 4);
+    size_t mm = 0;
+    for (uint32_t v = 0; v < 4; ++v)
+        if (f2u(g[v].x) != f2u(ref[v].x) || f2u(g[v].y) != f2u(ref[v].y) || f2u(g[v].z) != f2u(ref[v].z) || f2u(g[v].w) != f2u(ref[v].w))
+        { ++mm; std::printf("  rest %g mDeltaPos[%u] MM: ref(%08x,%08x,%08x,%08x) got(%08x,%08x,%08x,%08x)\n", restDistScalar, v,
+                            f2u(ref[v].x), f2u(ref[v].y), f2u(ref[v].z), f2u(ref[v].w), f2u(g[v].x), f2u(g[v].y), f2u(g[v].z), f2u(g[v].w)); }
+    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaVT friction zero sign (rest %g): %zu slots differ bitwise from the CUDA selects",
+                  restDistScalar, mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
+}
+
 // cloth_clothContactPrepare -> query -> solve: push a penetrating EE self-contact apart.
 static void runClothSelfContactEE()
 {
@@ -6959,6 +7127,11 @@ PXG_TEST(femClothSimSelfContactRedundancy4) { runClothSelfContactRedundancy(4u);
 
 PXG_TEST(femClothSimSelfContactSolveVT) { runClothSelfContactVT(); }
 PXG_TEST(femClothSimSelfContactSolveEE) { runClothSelfContactEE(); }
+PXG_TEST(femClothSimSelfContactFrictionZeroSign)
+{
+    runClothSelfContactFrictionZeroSign(0.05f, 1);      // case A: the FMax twin (:274)
+    runClothSelfContactFrictionZeroSign(0.03125f, 2);   // case B: the FMin twin (:275)
+}
 
 // cloth_updateClothContactValidityLaunch — snapshot each vertex into
 // mPrevPositionInContactOffset (w = 1) and reset the VT/EE contact counts on an adaptive

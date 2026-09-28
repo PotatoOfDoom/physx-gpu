@@ -457,8 +457,15 @@ bool triangleCollisionConstraint(out float3 dx0, out float3 dx1, out float3 dx2,
         tanDir = tanDir * invTanMag;
         const float CT = dot(relDelta, tanDir);
 
-        float deltaLambdaT = max(0.0f, CT * invDenom);
-        deltaLambdaT = -min(deltaLambdaT, frictionCoefficient * abs(deltaLambdaN));
+        // P9.86f: FEMClothExternalSolve.cu:274-275 PxMax(0.f, CT * invDenom) / PxMin(deltaLambdaT, lim) are
+        // selectMax / selectMin (PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125), the SECOND operand winning
+        // a +-0 tie and a false (NaN) compare.  CT = -0 (relDelta and tanDir with lined-up zero lanes) keeps
+        // -0 through the max, and a -0 against lim = +0 (CN == 0) gives +0 through the min; GLSL FMax/FMin
+        // on llvmpipe give +0 and -0 there, flipping the zero lanes of deltaLambdaT * tanDir.
+        const float ctScaled = CT * invDenom;
+        float deltaLambdaT = (0.0f > ctScaled) ? 0.0f : ctScaled;
+        const float lim = frictionCoefficient * abs(deltaLambdaN);
+        deltaLambdaT = -((deltaLambdaT < lim) ? deltaLambdaT : lim);
 
         commonVec = commonVec + deltaLambdaT * tanDir;
     }
