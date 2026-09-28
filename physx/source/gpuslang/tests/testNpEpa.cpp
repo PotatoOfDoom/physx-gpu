@@ -292,6 +292,28 @@ static bool replaceTriangleR(Scratch& S, Lanes& L, int nbVertices, int triIndex,
     uint32_t failB = 0u; for (uint32_t tI = 0; tI < 32; ++tI) if (fail[tI]) failB |= (1u << tI);
     return failB == 0u;
 }
+// CUDA epa.cuh:427-433 reduces the lane distances with an fminf butterfly.  NVIDIA fminf is
+// minNum with -0 < +0: NaN-ignoring, and a +-0 tie gives -0 in either operand order (std::fmin
+// leaves the zero sign to libm; glibc x86-64 lets the second operand win).  gEpaMinVariant
+// selects mutant twins for npEpa_driverZeroTie: 1 = second operand wins a tie (x86 minps(e,tv)),
+// 2 = first operand wins a tie (GLSL FMin(e,tv) read literally).
+static float nvFminf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? a : b;
+    return (a < b) ? a : b;
+}
+static int gEpaMinVariant = 0;
+static float epaMinStep(float e, float tv)
+{
+    switch (gEpaMinVariant)
+    {
+    case 1: return (e < tv) ? e : tv;
+    case 2: return (tv < e) ? tv : e;
+    default: return nvFminf(e, tv);
+    }
+}
 struct EpaOut { uint32_t result, degenerate, p0, p1; float lowerBound, upperBound, q0, q1; float direction[4], closestPointA[4], closestPointB[4]; };
 static EpaOut epaRef(const float input[32], uint32_t size, const std::vector<float>& VA, const std::vector<float>& VB, uint32_t vbase, uint32_t nbA, uint32_t nbB, float convRatio, float relEpsBase)
 {
@@ -304,7 +326,7 @@ static EpaOut epaRef(const float input[32], uint32_t size, const std::vector<flo
     bool nondegenerate = true;
     while (nondegenerate && (uint32_t)nbVertices < 18u)
     {
-        float e = MAXF; for (uint32_t tI = 0; tI < 32; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : MAXF; e = std::fmin(e, tv); }
+        float e = MAXF; for (uint32_t tI = 0; tI < 32; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : MAXF; e = epaMinStep(e, tv); }
         uint32_t f = 0u; for (uint32_t tI = 0; tI < 32; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : MAXF; if (e == tv) f |= (1u << tI); }
         const uint32_t triIndex = fbl(f); const V3 d = L.normal[triIndex];
         const uint32_t iA = supA(d, VA, vbase, nbA), iB = supA({ -d.x, -d.y, -d.z }, VB, vbase, nbB);
@@ -400,6 +422,87 @@ PXG_TEST(npEpa_driver)
     PXG_CHECK_MSG(mm == 0, "epa driver: %zu mismatches (N=%u)", mm, N);
     PXG_CHECK_MSG(nOverlap > 300 && nSize4 > 100, "epa driver coverage thin (overlap=%zu size4=%zu size3=%zu)", nOverlap, nSize4, nSize3);
 
+    for (PxgBufferHandle h : { bData, bVA, bVB, bS, bOut }) dev->destroyBuffer(h);
+}
+
+
+// P9.86c: signed-zero tie at the EPA distance reduction (pxgSlangEpa.slang epaRun, CUDA
+// epa.cuh:427-433 fminf butterfly).  Two integer cubes touching corner to corner at the origin
+// (zero penetration): A = [0,2]^3, B = [-2,0]^3, A0 = (s,0,s).  GJK returns OVERLAP with a size-1
+// simplex A0-B0 = (s,0,s); epaStart123 builds the double-sided start triangle whose lanes hold
+// dist = n.v0 and -dist, i.e. (-0,+0) for s = -0 (a -0 from negating a zero) and (+0,-0) for
+// s = +0.  The CUDA's fminf gives e = -0 in both cases and the first iteration terminates with
+// lowerBound = e, so o.lowerBound is 0x80000000.  Twins 1/2 (second/first operand wins a tie)
+// must each change exactly one case, otherwise the input no longer reaches the tie.
+PXG_TEST(npEpa_driverZeroTie)
+{
+    const uint32_t MAXV = 32;
+    std::vector<float> Data, VA, VB;
+    std::vector<EpaScalars> S;
+    std::vector<EpaOut> ref;
+    size_t tieNegFirst = 0, tiePosFirst = 0, twinOther = 0, badSetup = 0;
+    for (int k = 0; k < 2; ++k)
+    {
+        const float s = (k == 0) ? -0.0f : 0.0f;
+        const float bv[8][3] = { { 0, 0, 0 }, { -2, 0, 0 }, { 0, -2, 0 }, { -2, -2, 0 }, { 0, 0, -2 }, { -2, 0, -2 }, { 0, -2, -2 }, { -2, -2, -2 } };
+        const float av[8][3] = { { s, 0, s }, { 2, 0, 0 }, { 0, 2, 0 }, { 2, 2, 0 }, { 0, 0, 2 }, { 2, 0, 2 }, { 0, 2, 2 }, { 2, 2, 2 } };
+        std::vector<float> tA(MAXV * 4, 0.0f), tB(MAXV * 4, 0.0f);
+        for (uint32_t v = 0; v < 8; ++v) for (uint32_t c = 0; c < 3; ++c) { tA[v * 4 + c] = av[v][c]; tB[v * 4 + c] = bv[v][c]; }
+        float simplex[32]; int size;
+        const uint32_t r = gjkRun(V3{ 0, 0, 1 }, tA, tB, 0, 8, 8, 0.25f, 0.98f, simplex, size);
+        const uint32_t sx = (k == 0) ? 0x80000000u : 0u;
+        if (r != 2u || size != 1 || asU32(simplex[0]) != sx || asU32(simplex[1]) != 0u || asU32(simplex[2]) != sx) ++badSetup;
+        const uint32_t vbase = (uint32_t)(VA.size() / 4);
+        for (uint32_t v = 0; v < MAXV; ++v) { for (uint32_t c = 0; c < 4; ++c) { VA.push_back(tA[v * 4 + c]); VB.push_back(tB[v * 4 + c]); } }
+        for (uint32_t L = 0; L < 32; ++L) Data.push_back(simplex[L]);
+        EpaScalars sc{}; sc.size = (uint32_t)size; sc.nbA = 8; sc.nbB = 8; sc.convergenceRatio = 0.98f; sc.relEpsBase = 4.0f;
+        S.push_back(sc);
+        gEpaMinVariant = 0;
+        const EpaOut base = epaRef(simplex, (uint32_t)size, VA, VB, vbase, 8, 8, 0.98f, 4.0f);
+        ref.push_back(base);
+        if (asU32(base.lowerBound) != 0x80000000u) ++badSetup;
+        for (int v = 1; v <= 2; ++v)
+        {
+            gEpaMinVariant = v;
+            const EpaOut twin = epaRef(simplex, (uint32_t)size, VA, VB, vbase, 8, 8, 0.98f, 4.0f);
+            gEpaMinVariant = 0;
+            const bool changed = std::memcmp(&twin, &base, sizeof(EpaOut)) != 0;
+            if (changed && v == 1 && k == 0) ++tieNegFirst;
+            else if (changed && v == 2 && k == 1) ++tiePosFirst;
+            else if (changed) ++twinOther;
+        }
+    }
+    PXG_CHECK_MSG(badSetup == 0, "epa zero tie: setup drifted (%zu)", badSetup);
+    PXG_CHECK_MSG(tieNegFirst == 1 && twinOther == 0, "epa zero tie: (-0 lane0, +0 lane1) tie not observed (%zu, other %zu)", tieNegFirst, twinOther);
+    PXG_CHECK_MSG(tiePosFirst == 1 && twinOther == 0, "epa zero tie: (+0 lane0, -0 lane1) tie not observed (%zu, other %zu)", tiePosFirst, twinOther);
+
+    const uint32_t N = (uint32_t)ref.size();
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bData = createBufferFrom(dev, Data);
+    PxgBufferHandle bVA = createBufferFrom(dev, VA);
+    PxgBufferHandle bVB = createBufferFrom(dev, VB);
+    PxgBufferHandle bS = createBufferFrom(dev, S);
+    std::vector<EpaOut> outInit(N); std::memset(outInit.data(), 0xEE, outInit.size() * sizeof(EpaOut));
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    EpaParams prm = { N, MAXV, 0, 0 };
+    Kernel kr("npEpa.spv", "ctEpa", { 4, 16, 16, (uint32_t)sizeof(EpaScalars), (uint32_t)sizeof(EpaOut) }, sizeof(EpaParams));
+    kr.dispatch(1, { bData, bVA, bVB, bS, bOut }, prm);
+    dev->flush();
+    const auto gOut = downloadBuffer<EpaOut>(dev, bOut, N);
+    auto ckv = [&](const float g[4], const float r[4]) { return asU32(g[0]) == asU32(r[0]) && asU32(g[1]) == asU32(r[1]) && asU32(g[2]) == asU32(r[2]); };
+    size_t mm = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const EpaOut& r = ref[t]; const EpaOut& g = gOut[t];
+        if (g.result != r.result) ++mm;
+        if (g.degenerate != r.degenerate) ++mm;
+        if (asU32(g.lowerBound) != asU32(r.lowerBound)) ++mm;
+        if (asU32(g.upperBound) != asU32(r.upperBound)) ++mm;
+        if (!ckv(g.direction, r.direction)) ++mm;
+        if (!ckv(g.closestPointA, r.closestPointA)) ++mm;
+        if (!ckv(g.closestPointB, r.closestPointB)) ++mm;
+    }
+    PXG_CHECK_MSG(mm == 0, "epa zero tie: %zu mismatches (N=%u, lb0 %08x lb1 %08x)", mm, N, N > 0 ? asU32(gOut[0].lowerBound) : 0u, N > 1 ? asU32(gOut[1].lowerBound) : 0u);
     for (PxgBufferHandle h : { bData, bVA, bVB, bS, bOut }) dev->destroyBuffer(h);
 }
 
