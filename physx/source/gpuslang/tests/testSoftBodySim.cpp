@@ -396,6 +396,56 @@ static float fmx(float a, float b) { return a > b ? a : b; }
 static V3 vmin(V3 a, V3 b) { return V3{ fmn(a.x, b.x), fmn(a.y, b.y), fmn(a.z, b.z) }; }
 static V3 vmax(V3 a, V3 b) { return V3{ fmx(a.x, b.x), fmx(a.y, b.y), fmx(a.z, b.z) }; }
 
+// P9.86: the two warp reductions (softBody.cu:259-260 leaf walk, :292-293 node aggregate)
+// are warpShuffleMin/Max (gpucommon/src/CUDA/shuffle.cuh:49-72), a __shfl_xor butterfly
+// combining with fminf/fmaxf -- NOT the PxMin/PxMax select.  NVIDIA's rule: a NaN operand
+// is dropped (NaN,NaN -> canonical NaN) and a zero tie orders -0 < +0 whatever the operand
+// order, so the reduction is a total order and a serial scan is exact.  The per-tet
+// pairwise fold (softBody.cu:224-255) stays PxMin/PxMax = fmn/fmx.
+static float cuFminf(float a, float b)
+{
+    if (a != a) return (b != b) ? u2f(0x7FFFFFFFu) : b;
+    if (b != b) return a;
+    if (a == b) return u2f(f2u(a) | f2u(b));   // +-0 tie -> -0
+    return a < b ? a : b;
+}
+static float cuFmaxf(float a, float b)
+{
+    if (a != a) return (b != b) ? u2f(0x7FFFFFFFu) : b;
+    if (b != b) return a;
+    if (a == b) return u2f(f2u(a) & f2u(b));   // +-0 tie -> +0
+    return a > b ? a : b;
+}
+static V3 cuFmin3(V3 a, V3 b) { return V3{ cuFminf(a.x, b.x), cuFminf(a.y, b.y), cuFminf(a.z, b.z) }; }
+static V3 cuFmax3(V3 a, V3 b) { return V3{ cuFmaxf(a.x, b.x), cuFmaxf(a.y, b.y), cuFmaxf(a.z, b.z) }; }
+
+// Mutant twin: 0 = the CUDA (fminf/fmaxf); 1 = the pre-P9.86 port's PxMin/PxMax select
+// scan (a zero tie keeps the LATER lane's sign).  Tie counters count reductions where the
+// two spellings differ in any bit (incremented only for variant 0).
+static int gRefitReduceVariant = 0;
+static uint32_t gTieLeafMin = 0, gTieLeafMax = 0, gTieAggMin = 0, gTieAggMax = 0;
+
+static bool v3BitsDiffer(V3 a, V3 b)
+{ return f2u(a.x) != f2u(b.x) || f2u(a.y) != f2u(b.y) || f2u(a.z) != f2u(b.z); }
+
+static void warpMinMaxRef(const std::vector<V3>& lmin, const std::vector<V3>& lmax, V3& outMin, V3& outMax,
+                          uint32_t& tieMin, uint32_t& tieMax)
+{
+    V3 cn = lmin[0], cx = lmax[0], sn = lmin[0], sx = lmax[0];
+    for (uint32_t lane = 1; lane < 32u; ++lane)
+    {
+        cn = cuFmin3(cn, lmin[lane]); cx = cuFmax3(cx, lmax[lane]);
+        sn = vmin(sn, lmin[lane]);    sx = vmax(sx, lmax[lane]);
+    }
+    if (gRefitReduceVariant == 0)
+    {
+        if (v3BitsDiffer(cn, sn)) ++tieMin;
+        if (v3BitsDiffer(cx, sx)) ++tieMax;
+    }
+    outMin = (gRefitReduceVariant == 1) ? sn : cn;
+    outMax = (gRefitReduceVariant == 1) ? sx : cx;
+}
+
 struct Bounds { V3 mn, mx; };
 struct TetIdx4 { uint32_t x, y, z, w; };
 struct TreeBlob
@@ -446,8 +496,8 @@ static void refitNodeRef(uint32_t nodeIndex, TreeBlob& tree, std::vector<Bounds>
             tx = fmx(tx, tx2); ty = fmx(ty, ty2); tz = fmx(tz, tz2);
             tMax[lane] = vmax(tMax[lane], V3{ tx, ty, tz });
         }
-        V3 rn = tMin[0], rx = tMax[0];
-        for (uint32_t lane = 1; lane < 32u; ++lane) { rn = vmin(rn, tMin[lane]); rx = vmax(rx, tMax[lane]); }
+        V3 rn, rx;
+        warpMinMaxRef(tMin, tMax, rn, rx, gTieLeafMin, gTieLeafMax);   // softBody.cu:259-260
         for (uint32_t lane = 0; lane < 32u; ++lane) { laneMin[lane] = rn; laneMax[lane] = rx; }
     }
 
@@ -471,14 +521,14 @@ static void refitNodeRef(uint32_t nodeIndex, TreeBlob& tree, std::vector<Bounds>
         tree.w[nw + W_MMAX + lane * 4 + 3] = f2u(0.0f);
     }
 
-    V3 an = laneMin[0], ax = laneMax[0];
-    for (uint32_t lane = 1; lane < 32u; ++lane) { an = vmin(an, laneMin[lane]); ax = vmax(ax, laneMax[lane]); }
+    V3 an, ax;
+    warpMinMaxRef(laneMin, laneMax, an, ax, gTieAggMin, gTieAggMax);   // softBody.cu:292-293
     packed[nodeIndex].mn = an;
     packed[nodeIndex].mx = ax;
 }
 } // namespace p80refit
 
-static void runSbRefitBound(bool speculativeCCD)
+static void runSbRefitBound(bool speculativeCCD, bool zeroSign = false)
 {
     using namespace p80refit;
     PxgSlangComputeDevice* dev = testDevice();
@@ -521,6 +571,49 @@ static void runSbRefitBound(bool speculativeCCD)
         {  4u,  5u,  6u, 14u },   // leaf 6 — w slot min
         {  5u,  6u,  7u, 15u },   // leaf 7 — w slot max
     };
+    // P9.86 zero-sign variant: bound faces at exactly x=0 / y=0 / z=0 with MIXED zero signs
+    // across lanes of one warp reduction (+-0 vertex coordinates: mirrored meshes, IEEE
+    // products like 0 * negative).  Nodes 3 and 4 hold TWO tets in one leaf child (leaf
+    // walk ties, softBody.cu:259-260); nodes 1/2 feed the root aggregate tie
+    // (softBody.cu:292-293 -> mPackedNodeBounds[0] -> boundArray).  Every tet has at most
+    // one zero per channel, so the per-tet PxMin/PxMax select fold is sign-unambiguous.
+    //   (A) root min.x : lane0 (node1) -0, lane1 (node2) +0  -> CUDA fminf -0, select +0
+    //   (B) root max.z : lane0 +0, lane1 -0                  -> CUDA fmaxf +0, select -0
+    //   (C) node3 leaf min.y : tet2 -0, tet3 +0              -> CUDA -0, select +0
+    //   (D) node4 leaf max.y : tet4 +0, tet5 -0              -> CUDA +0, select -0
+    if (zeroSign)
+    {
+        pos = {
+            {  1.0f,    2.0f,   -1.5f,   0.5f },   // 0 g0
+            {  2.0f,    0.5f,   -2.5f,   0.5f },   // 1 g1
+            {  1.5f,    3.0f,   -0.25f,  0.5f },   // 2 g2
+            {  2.5f,    1.0f,   -3.0f,   0.5f },   // 3 g3
+            {  1.0f,   -2.0f,   -1.5f,   0.5f },   // 4 n0
+            {  2.0f,   -0.5f,   -2.5f,   0.5f },   // 5 n1
+            {  1.5f,   -3.0f,   -0.25f,  0.5f },   // 6 n2
+            { -0.0f,    1.25f,   0.0f,   0.5f },   // 7 s0: x -0, z +0
+            {  0.0f,    1.5f,   -0.0f,   0.5f },   // 8 s1: x +0, z -0
+            {  0.75f,  -0.0f,   -1.0f,   0.5f },   // 9 s2: y -0
+            {  0.875f,  0.0f,   -1.25f,  0.5f },   // 10 s3: y +0
+            {  0.625f,  0.0f,   -0.5f,   0.5f },   // 11 s4: y +0
+            {  0.5f,   -0.0f,   -0.75f,  0.5f },   // 12 s5: y -0
+        };
+        tets = {
+            {  7u, 0u, 1u, 2u },   // node 1
+            {  8u, 0u, 1u, 2u },   // node 2
+            {  9u, 0u, 1u, 2u },   // node 3, lane 0
+            { 10u, 0u, 1u, 2u },   // node 3, lane 1
+            { 11u, 4u, 5u, 6u },   // node 4, lane 0
+            { 12u, 4u, 5u, 6u },   // node 4, lane 1
+            // nodes 5..8: the non-zero bulk bound only (permutations of one tet)
+            {  0u, 1u, 2u, 3u }, { 1u, 2u, 3u, 0u }, { 2u, 3u, 0u, 1u }, { 3u, 0u, 1u, 2u },
+        };
+        PXG_CHECK_MSG(f2u(pos[7].x) == 0x80000000u && f2u(pos[8].z) == 0x80000000u &&
+                      f2u(pos[9].y) == 0x80000000u && f2u(pos[12].y) == 0x80000000u,
+                      "host build must keep the -0 vertex coordinates");
+    }
+    static const uint32_t kStart[2][8] = { { 0, 1, 2, 3, 4, 5, 6, 7 }, { 0, 1, 2, 4, 6, 7, 8, 9 } };
+    static const uint32_t kCount[2][8] = { { 1, 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 2, 2, 1, 1, 1, 1 } };
 
     const uint32_t nbNodes = 9u, maxDepth = 2u;   // root + one node per tet
     const float POISON = -7777.0f;
@@ -547,10 +640,11 @@ static void runSbRefitBound(bool speculativeCCD)
         tree.w[tree.nodeWord(0) + W_MDATA + k2] = internalWord(1u + k2);
     tree.w[tree.nodeWord(0) + W_NBNODES] = 8u;
     tree.w[tree.nodeWord(0) + W_DEPTH] = 0u;
-    // nodes 1..8: ONE leaf child each, holding tet (n-1) alone
+    // nodes 1..8: ONE leaf child each, holding tet (n-1) alone (zero-sign variant: nodes
+    // 3 and 4 hold two tets each, see kStart/kCount)
     for (uint32_t n = 1; n <= 8u; ++n)
     {
-        tree.w[tree.nodeWord(n) + W_MDATA + 0] = leafWord(n - 1u, 1u);
+        tree.w[tree.nodeWord(n) + W_MDATA + 0] = leafWord(kStart[zeroSign][n - 1u], kCount[zeroSign][n - 1u]);
         tree.w[tree.nodeWord(n) + W_NBNODES] = 1u;
         tree.w[tree.nodeWord(n) + W_DEPTH] = 1u;
     }
@@ -612,12 +706,41 @@ static void runSbRefitBound(bool speculativeCCD)
     std::vector<Bounds> refPacked(nbNodes);
     for (uint32_t n = 0; n < nbNodes; ++n)
     { refPacked[n].mn = V3{ POISON, POISON, POISON }; refPacked[n].mx = refPacked[n].mn; }
+    gRefitReduceVariant = 0;
+    gTieLeafMin = gTieLeafMax = gTieAggMin = gTieAggMax = 0;
     for (uint32_t i = maxDepth; i > 0u; --i)
     {
         const uint32_t off = refTree.w[wDepthInfo + (i - 1u) * 2u + 0];
         const uint32_t cnt = refTree.w[wDepthInfo + (i - 1u) * 2u + 1];
         for (uint32_t j = 0; j < cnt; ++j)
             refitNodeRef(refTree.w[wRemap + j + off], refTree, refPacked, pos, tets);
+    }
+    if (zeroSign)
+    {
+        const uint32_t tlm = gTieLeafMin, tlx = gTieLeafMax, tam = gTieAggMin, tax = gTieAggMax;
+        // Twin walk with the pre-P9.86 select scan: it must flip all four zero signs.
+        TreeBlob twinTree = tree;
+        std::vector<Bounds> twinPacked(nbNodes);
+        for (uint32_t n = 0; n < nbNodes; ++n)
+        { twinPacked[n].mn = V3{ POISON, POISON, POISON }; twinPacked[n].mx = twinPacked[n].mn; }
+        gRefitReduceVariant = 1;
+        for (uint32_t i = maxDepth; i > 0u; --i)
+        {
+            const uint32_t off = twinTree.w[wDepthInfo + (i - 1u) * 2u + 0];
+            const uint32_t cnt = twinTree.w[wDepthInfo + (i - 1u) * 2u + 1];
+            for (uint32_t j = 0; j < cnt; ++j)
+                refitNodeRef(twinTree.w[wRemap + j + off], twinTree, twinPacked, pos, tets);
+        }
+        gRefitReduceVariant = 0;
+        PXG_CHECK_MSG(tlm == 1u && tlx == 1u && tam == 1u && tax == 1u,
+                      "zero-sign coverage: leaf %u/%u agg %u/%u fminf-vs-select ties (want 1 each)",
+                      tlm, tlx, tam, tax);
+        PXG_CHECK_MSG(f2u(refPacked[0].mn.x) == 0x80000000u && f2u(refPacked[0].mx.z) == 0u &&
+                      f2u(refPacked[3].mn.y) == 0x80000000u && f2u(refPacked[4].mx.y) == 0u,
+                      "CUDA fminf/fmaxf zero rule: root mn.x -0, mx.z +0, node3 mn.y -0, node4 mx.y +0");
+        PXG_CHECK_MSG(f2u(twinPacked[0].mn.x) == 0u && f2u(twinPacked[0].mx.z) == 0x80000000u &&
+                      f2u(twinPacked[3].mn.y) == 0u && f2u(twinPacked[4].mx.y) == 0x80000000u,
+                      "select-scan twin must flip all four zero signs -- the case no longer observes the revert");
     }
 
     const auto gTree = downloadBuffer<uint32_t>(dev, bTree.h, tree.w.size());
@@ -655,8 +778,8 @@ static void runSbRefitBound(bool speculativeCCD)
     for (const TetIdx4& t : tets)
         for (uint32_t vi : { t.x, t.y, t.z, t.w })
         {
-            wholeMin = vmin(wholeMin, V3{ pos[vi].x, pos[vi].y, pos[vi].z });
-            wholeMax = vmax(wholeMax, V3{ pos[vi].x, pos[vi].y, pos[vi].z });
+            wholeMin = cuFmin3(wholeMin, V3{ pos[vi].x, pos[vi].y, pos[vi].z });   // warpShuffle fminf order
+            wholeMax = cuFmax3(wholeMax, V3{ pos[vi].x, pos[vi].y, pos[vi].z });
         }
     PXG_CHECK_MSG(f2u(refPacked[0].mn.x) == f2u(wholeMin.x) && f2u(refPacked[0].mx.z) == f2u(wholeMax.z),
                   "reference root bound must equal the whole-mesh AABB (self-check)");
@@ -696,6 +819,7 @@ static void runSbRefitBound(bool speculativeCCD)
 
 PXG_TEST(softBodySimRefitBound) { runSbRefitBound(/*speculativeCCD*/ false); }
 PXG_TEST(softBodySimRefitBoundCCD) { runSbRefitBound(/*speculativeCCD*/ true); }
+PXG_TEST(softBodySimRefitBoundZeroSign) { runSbRefitBound(/*speculativeCCD*/ false, /*zeroSign*/ true); }
 
 
 // ===========================================================================
