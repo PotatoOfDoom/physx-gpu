@@ -285,6 +285,14 @@ static std::vector<HMaterial> makeMaterials()
         m[0x10000u + i] = { g, g + 0.15f, 0.1f + 0.05f * i, 0.9f - 0.1f * i,
                             uint32_t(uint32_t((i + 3) % 4) << 16) | (uint32_t((i + 2) % 4) << 24), uint32_t((i + 1) % 4) };
     }
+    // P9.86c: +-0 material ties (every value legal: NpMaterial.cpp:110/125/140/161 accept -0).
+    // [8]/[9] -0/+0 with every combine mode eMIN (1), [10]/[11] +0/-0 with eMAX (3).
+    // PxMin/PxMax<float> = selectMin/selectMax keep the SECOND operand on a tie
+    // (PxUnixMathIntrinsics.h:116/122); GLSL FMin/FMax (the reverted port) are sign-aware.
+    m[8]  = { -0.f, -0.f, -0.f, -0.f, (1u << 16) | (1u << 24), 1u };
+    m[9]  = {  0.f,  0.f,  0.f,  0.f, (1u << 16) | (1u << 24), 1u };
+    m[10] = {  0.f,  0.f,  0.f,  0.f, (3u << 16) | (3u << 24), 3u };
+    m[11] = { -0.f, -0.f, -0.f, -0.f, (3u << 16) | (3u << 24), 3u };
     return m;
 }
 
@@ -535,6 +543,29 @@ PXG_TEST(convexPlaneNphase_restingBox)
     checkResting(h1, 0x00000000u, false, false, "up/matConvexHi");
     PlaneScene h2 = c; h2.matPlane |= 0x10000u; h2.matConvex |= 0x10000u;
     checkResting(h2, 0x00000000u, false, false, "up/matBothHi");
+
+    // P9.86c: +-0 material ties.  mi0 is the plane's material (cudaGJKEPA.cu:3180,
+    // npCvxPlaneNphase.slang:525), so combine(M[matPlane], M[matConvex]) is the CUDA order.
+    // eMIN (-0, +0): CUDA words 7/9/10 = +0, FMin gives -0.  eMAX (+0, -0): CUDA -0, FMax +0.
+    PlaneScene zMin = a; zMin.matPlane = 8; zMin.matConvex = 9;
+    checkResting(zMin, 0x00000000u, false, false, "up/zeroTieMin");
+    PlaneScene zMax = a; zMax.matPlane = 10; zMax.matConvex = 11;
+    checkResting(zMax, 0x00000000u, false, false, "up/zeroTieMax");
+    {
+        const std::vector<HMaterial> M = makeMaterials();
+        auto toH = [](const HMaterial& h) {
+            return tritriref::MaterialH{ h.dyn, h.sta, h.rest, h.damp, h.packedFlags, h.packedDamp };
+        };
+        auto sep = [](const tritriref::CombinedH& c, const tritriref::CombinedH& t) {
+            using tritriref::bitsOfF;
+            return (bitsOfF(c.rest) != bitsOfF(t.rest)) + (bitsOfF(c.sta) != bitsOfF(t.sta)) +
+                   (bitsOfF(c.damping) != bitsOfF(t.damping));
+        };
+        const int dMin = sep(tritriref::combine(toH(M[8]), toH(M[9])), tritriref::combine(toH(M[8]), toH(M[9]), 1));
+        const int dMax = sep(tritriref::combine(toH(M[10]), toH(M[11])), tritriref::combine(toH(M[10]), toH(M[11]), 2));
+        PXG_CHECK_MSG(dMin == 3, "zeroTieMin: FMin twin differs in %d of rest/sta/damping, expected 3", dMin);
+        PXG_CHECK_MSG(dMax == 3, "zeroTieMax: FMax twin differs in %d of rest/sta/damping, expected 3", dMax);
+    }
 }
 
 PXG_TEST(convexPlaneNphase_separated)

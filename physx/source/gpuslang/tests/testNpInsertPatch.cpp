@@ -38,6 +38,7 @@
 #include "pxgTestFramework.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -79,9 +80,23 @@ uint32_t bitsOf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 const uint32_t MODE_MIN = 1, MODE_MULTIPLY = 2, MODE_MAX = 3;
 const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2, FLAG_COMPLIANT_ACC_SPRING = 16;
 
+// P9.86c: PxMin/PxMax<float> are intrinsics::selectMin/selectMax (PxMath.h:81-101,
+// PxUnixMathIntrinsics.h:116-125): `a < b ? a : b` / `a > b ? a : b`, the SECOND operand on a
+// +-0 tie.  std::min/std::max keep the first one and are not the CUDA semantics.
+// gCombineVariant: mutant twins for the coverage checks only -- 1 = GLSL FMin, 2 = GLSL FMax
+// as llvmpipe lowers them under SZINP (sign-aware: min -> -0, max -> +0 on a tie, F4).
+static int gCombineVariant = 0;
 float combineScalars(float a, float b, uint32_t mode)
 {
-    switch (mode) { case 0: return 0.5f * (a + b); case 1: return std::min(a, b); case 2: return a * b; case 3: return std::max(a, b); }
+    switch (mode)
+    {
+    case 0: return 0.5f * (a + b);
+    case 1: if (gCombineVariant == 1 && a == 0.f && b == 0.f) return std::signbit(a) ? a : b;
+            return a < b ? a : b;
+    case 2: return a * b;
+    case 3: if (gCombineVariant == 2 && a == 0.f && b == 0.f) return std::signbit(a) ? b : a;
+            return a > b ? a : b;
+    }
     return 0.f;
 }
 
@@ -95,8 +110,31 @@ void combine(const MaterialData& m0, const MaterialData& m1, float& sta, float& 
     if (both && oneAcc) damping = a0 ? m0.damping : m1.damping;
     else { uint32_t m = one ? MODE_MAX : std::max(m0.dampingCombineMode, m1.dampingCombineMode); damping = combineScalars(m0.damping, m1.damping, m); }
     const uint32_t cf = m0.flags | m1.flags;
-    if ((cf & FLAG_DISABLE_FRICTION) == 0) { uint32_t fm = std::max(m0.fricCombineMode, m1.fricCombineMode); float d = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm), s = combineScalars(m0.staticFriction, m1.staticFriction, fm); float fd = std::max(d, 0.f); dyn = fd; sta = (s - fd) >= 0.f ? s : fd; flags = cf; }
+    if ((cf & FLAG_DISABLE_FRICTION) == 0) { uint32_t fm = std::max(m0.fricCombineMode, m1.fricCombineMode); float d = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm), s = combineScalars(m0.staticFriction, m1.staticFriction, fm); float fd = d > 0.f ? d : 0.f; /* PxMax(dyn, 0.0f) = selectMax: +0 for d = -0 (PxsMaterialCombiner.h:161) */ dyn = fd; sta = (s - fd) >= 0.f ? s : fd; flags = cf; }
     else { flags = cf | FLAG_DISABLE_STRONG_FRICTION; dyn = 0.f; sta = 0.f; }
+}
+
+// The expected image: the upload, with exactly the CUDA's assignments overlaid.
+std::vector<uint32_t> overlayPatches(const std::vector<PatchWork>& work, const std::vector<MaterialData>& mats,
+                                     const std::vector<uint32_t>& streamInit)
+{
+    std::vector<uint32_t> want(streamInit);
+    for (const PatchWork& w : work)
+    {
+        if (w.patchIndex == 0xffffffffu) continue;
+        uint32_t* d = &want[w.patchIndex / 4];
+        float sta, dyn, rest, damping; uint32_t flags;
+        combine(mats[w.materialIndex0 & 0xffffu], mats[w.materialIndex1 & 0xffffu], sta, dyn, rest, damping, flags);
+        const uint32_t one = bitsOf(1.f);
+        d[0] = one; d[1] = one; d[2] = one; d[3] = one;
+        d[4] = bitsOf(w.nx); d[5] = bitsOf(w.ny); d[6] = bitsOf(w.nz);
+        d[7] = bitsOf(rest); d[8] = bitsOf(dyn); d[9] = bitsOf(sta); d[10] = bitsOf(damping);
+        d[11] = ((w.nbContacts & 0xffu) << 16) | ((flags & 0xffu) << 24);   // startContactIndex = 0
+        d[12] = (w.materialIndex0 & 0xffffu) << 16;                        // internalFlags = 0
+        d[13] = (d[13] & 0xffff0000u) | (w.materialIndex1 & 0xffffu);      // pad[0] kept (:171)
+        // d[14], d[15]: pad[1..4], never written
+    }
+    return want;
 }
 
 PXG_TEST(npInsertPatch_write)
@@ -157,24 +195,12 @@ PXG_TEST(npInsertPatch_write)
 
     const auto gStream = downloadBuffer<uint32_t>(dev, bStream, patchStreamWords);
 
-    // The expected image: the upload, with exactly the CUDA's assignments overlaid.
-    std::vector<uint32_t> want(streamInit);
+    const std::vector<uint32_t> want = overlayPatches(work, mats, streamInit);
     size_t wideCounts = 0, hiBit = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         if (work[i].patchIndex == 0xffffffffu) continue;
-        uint32_t* d = &want[work[i].patchIndex / 4];
-        float sta, dyn, rest, damping; uint32_t flags;
-        combine(mats[work[i].materialIndex0 & 0xffffu], mats[work[i].materialIndex1 & 0xffffu], sta, dyn, rest, damping, flags);
         if ((work[i].materialIndex0 | work[i].materialIndex1) & 0x10000u) ++hiBit;
-        const uint32_t one = bitsOf(1.f);
-        d[0] = one; d[1] = one; d[2] = one; d[3] = one;
-        d[4] = bitsOf(work[i].nx); d[5] = bitsOf(work[i].ny); d[6] = bitsOf(work[i].nz);
-        d[7] = bitsOf(rest); d[8] = bitsOf(dyn); d[9] = bitsOf(sta); d[10] = bitsOf(damping);
-        d[11] = ((work[i].nbContacts & 0xffu) << 16) | ((flags & 0xffu) << 24);   // startContactIndex = 0
-        d[12] = (work[i].materialIndex0 & 0xffffu) << 16;                        // internalFlags = 0
-        d[13] = (d[13] & 0xffff0000u) | (work[i].materialIndex1 & 0xffffu);      // pad[0] kept (:171)
-        // d[14], d[15]: pad[1..4], never written
         if (work[i].nbContacts > 0xffu) ++wideCounts;
     }
     size_t mm = 0, padBad = 0;
@@ -193,6 +219,79 @@ PXG_TEST(npInsertPatch_write)
     PXG_CHECK_MSG(hiBit > N / 8, "only %zu written patches with a material index past 0xFFFF", hiBit);
     PXG_CHECK_MSG(nbActive > N / 2 && nbSkip > N / 50, "activity mix under-exercised (active=%u skip=%u)", nbActive, nbSkip);
 
+    for (PxgBufferHandle h : { bMat, bWork, bStream }) dev->destroyBuffer(h);
+}
+
+// P9.86c: +-0 material ties through nptCombineScalars (pxgSlangNpPatchTail.slang).  PxMin /
+// PxMax<float> are selects that keep the SECOND operand on a tie; the reverted port's GLSL
+// FMin/FMax are sign-aware on llvmpipe (F4).  Every value is legal (NpMaterial.cpp:110/125/
+// 140/161 accept -0).  Pairs: {0,1} eMIN (-0,+0): CUDA +0, FMin -0 in words 7/9/10;
+// {2,3} eMAX (+0,-0): CUDA -0, FMax +0; {4,5} damping forced to eMAX by exactlyOneCompliant
+// (PxsMaterialCombiner.h:121), damping (+0,-0): word 10; the reversed pairs are controls,
+// {1,0} and {2,3} also feed dynFriction = -0 into PxMax(dyn, 0.0f) (+0 in both).
+PXG_TEST(npInsertPatch_writeZeroTie)
+{
+    const float nz = -0.f;
+    std::vector<MaterialData> mats = {
+        { nz, nz, nz, nz, 0u, MODE_MIN, MODE_MIN, MODE_MIN },
+        { 0.f, 0.f, 0.f, 0.f, 0u, MODE_MIN, MODE_MIN, MODE_MIN },
+        { 0.f, 0.f, 0.f, 0.f, 0u, MODE_MAX, MODE_MAX, MODE_MAX },
+        { nz, nz, nz, nz, 0u, MODE_MAX, MODE_MAX, MODE_MAX },
+        { 0.5f, 0.75f, -0.5f, 0.f, 0u, 0u, 0u, 0u },
+        { 0.5f, 0.75f, 0.25f, nz, 0u, 0u, 0u, 0u },
+    };
+    const uint32_t pairs[6][2] = { { 0, 1 }, { 1, 0 }, { 2, 3 }, { 3, 2 }, { 4, 5 }, { 5, 4 } };
+    const uint32_t N = 6;
+    std::vector<PatchWork> work(N);
+    for (uint32_t i = 0; i < N; ++i)
+        work[i] = { i * 64u, 1u, pairs[i][0], pairs[i][1], 0.f, 1.f, 0.f, 0.f };
+    const uint32_t patchStreamWords = (N + 1) * 16;
+    std::vector<uint32_t> streamInit(patchStreamWords);
+    for (uint32_t k = 0; k < patchStreamWords; ++k) streamInit[k] = 0xabcddcbau ^ (k * 0x00010001u);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    PxgBufferHandle bWork = createBufferFrom(dev, work);
+    PxgBufferHandle bStream = createBufferFrom(dev, streamInit);
+    struct InsertParams { uint32_t numTests; } p = { N };
+    Kernel k("npInsertPatch.spv", "insertIntoPatchStream", { 32, 32, 4 }, sizeof(InsertParams));
+    k.dispatch(1, { bMat, bWork, bStream }, p);
+    dev->flush();
+    const auto gStream = downloadBuffer<uint32_t>(dev, bStream, patchStreamWords);
+
+    gCombineVariant = 0;
+    const std::vector<uint32_t> want = overlayPatches(work, mats, streamInit);
+    // Coverage: the twins must change exactly the words the directed pairs were built for.
+    uint32_t twinDiff[3] = { 0, 0, 0 };
+    for (int v = 1; v <= 2; ++v)
+    {
+        gCombineVariant = v;
+        const std::vector<uint32_t> tw = overlayPatches(work, mats, streamInit);
+        gCombineVariant = 0;
+        for (uint32_t w = 0; w < patchStreamWords; ++w)
+            if (tw[w] != want[w]) ++twinDiff[v];
+    }
+    PXG_CHECK_MSG(twinDiff[1] == 3, "FMin twin differs in %u words, expected 3 (pair {0,1}: words 7,9,10) -- the PxMin zero tie is unexercised", twinDiff[1]);
+    PXG_CHECK_MSG(twinDiff[2] == 4, "FMax twin differs in %u words, expected 4 (pair {2,3}: 7,9,10; pair {4,5}: 10) -- the PxMax zero tie is unexercised", twinDiff[2]);
+    // dynFriction = -0 reaches the PxMax(dyn, 0.0f) clamp in pairs {1,0} (eMIN of +0, -0) and {2,3} (eMAX of +0, -0).
+    uint32_t dynNegZero = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const MaterialData& a = mats[pairs[i][0]]; const MaterialData& b = mats[pairs[i][1]];
+        const uint32_t fm = std::max(a.fricCombineMode, b.fricCombineMode);
+        if (bitsOf(combineScalars(a.dynamicFriction, b.dynamicFriction, fm)) == 0x80000000u) ++dynNegZero;
+    }
+    PXG_CHECK_MSG(dynNegZero == 2, "dynFriction -0 fed to the PxMax(dyn, 0) clamp %u times, expected 2", dynNegZero);
+
+    size_t mm = 0;
+    for (uint32_t w = 0; w < patchStreamWords; ++w)
+        if (gStream[w] != want[w])
+        {
+            if (mm < 8) std::printf("  stream word %u (slot %u word %u): got %08x want %08x\n", w, w / 16u, w % 16u,
+                                    gStream[w], want[w]);
+            ++mm;
+        }
+    PXG_CHECK_MSG(mm == 0, "insertIntoPatchStream zero ties: %zu / %u stream words differ", mm, patchStreamWords);
     for (PxgBufferHandle h : { bMat, bWork, bStream }) dev->destroyBuffer(h);
 }
 
