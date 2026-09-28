@@ -1119,6 +1119,189 @@ PXG_TEST(setRigidDynamicGlobalPose)
     dev->destroyBuffer(gpuIdxBuf);
 }
 
+// ---------------------------------------------------------------------------
+// P9.86c: setRigidDynamicGlobalPose on CONVEX hulls with a +-0 tie at the x
+// extreme (updateBounds.slang updateBounds(), the direct-API copy of
+// updateCacheAndBound.cuh:126-143).  PxVec3::minimum/maximum are the PxMin/
+// PxMax selects (a<b?a:b / a>b?a:b): on a +-0 tie the LAST tied vertex's zero
+// survives.  GLSL FMin/FMax on llvmpipe give min(+0,-0) = -0 and max(+0,-0) =
+// +0 in either order.  The pose: a user global pose rotated 180 degrees about
+// z with p.x = -0 (a negated zero), body COM offset (0,0.5,-0.5), shape offset
+// (0,1,-1) -> absPos = q(+0,+0,1,+0) p(-0,1,2); rot.col0 = (-1,+0,+0),
+// rot.col1 = (+0,-1,+0), so a base vertex (+0,y,z) maps to x' = -0 iff y<0 and
+// z<0, else +0.  pose.p.x = -0 carries the tie's sign into the stored bound.
+//  hull 0 (apex -x -> x' = +1): the x MINIMUM is the zero tie; the -0 vertex
+//    comes FIRST -> CUDA minX = +0, FMin fold -0.
+//  hull 1 (apex +x -> x' = -1): the x MAXIMUM is the zero tie; the -0 vertex
+//    comes LAST -> CUDA maxX = -0, FMax fold +0.
+// All 12 bound words and the cache are compared BITWISE.
+// ---------------------------------------------------------------------------
+PXG_TEST(setRigidDynamicGlobalPose_convexZeroTie)
+{
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+
+    std::vector<BodySim> bodySims(1);
+    std::memset(bodySims.data(), 0, sizeof(BodySim));
+    bodySims[0].body2World.q = Float4{ 0.f, 0.f, 0.f, 1.f };
+    bodySims[0].body2Actor_maxImpulseW.q = Float4{ 0.f, 0.f, 0.f, 1.f };
+    bodySims[0].body2Actor_maxImpulseW.p = Float4{ 0.f, 0.5f, -0.5f, 0.f };
+
+    const uint32_t numShapes = 2;
+    std::vector<ShapeSim> shapeSims(numShapes);
+    std::vector<Shape> shapes(numShapes);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(Shape));
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        ShapeSim sh = {};
+        sh.transform.q = Quat{ 0.f, 0.f, 0.f, 1.f };
+        sh.transform.p = Float3{ 0.f, 1.f, -1.f };
+        sh.localBoundsMin = Float3{ -1.f, -1.f, -1.f };
+        sh.localBoundsMax = Float3{ 1.f, 1.f, 1.f };
+        sh.bodySimIndex = makeNodeIndex(0);
+        sh.hullDataIndex = s;
+        sh.shapeFlags = eSIMULATION_SHAPE;
+        sh.shapeType = eCONVEXMESH;
+        shapeSims[s] = sh;
+
+        shapes[s].scale = Float3{ 1.f, 1.f, 1.f };
+        shapes[s].scaleRotation = Quat{ 0.f, 0.f, 0.f, 1.f };
+        shapes[s].type = eCONVEXMESH;
+        shapes[s].hullOrMeshOffset = uint64_t(s) * 128; // byte offset (bound-buffer path)
+    }
+
+    // two square pyramids with their base on the local x = 0 plane (all +0)
+    static const float hullVerts[2][5][3] = {
+        { { 0.f, -1.f, -1.f }, { 0.f, 1.f, 1.f }, { 0.f, 1.f, -1.f }, { 0.f, -1.f, 1.f }, { -1.f, 0.f, 0.f } },
+        { { 0.f, 1.f, 1.f }, { 0.f, 1.f, -1.f }, { 0.f, -1.f, 1.f }, { 0.f, -1.f, -1.f }, { 1.f, 0.f, 0.f } },
+    };
+    std::vector<uint32_t> geometryBlob(64, 0u);
+    for (uint32_t h = 0; h < 2; ++h)
+    {
+        const uint32_t base = h * 32;
+        geometryBlob[base + 4] = 5u << 8;
+        for (uint32_t v = 0; v < 5; ++v)
+            std::memcpy(&geometryBlob[base + 12 + v * 4], hullVerts[h][v], 12);
+    }
+
+    const std::vector<uint64_t> nodeIndices = { makeNodeIndex(0), makeNodeIndex(0) };
+    const std::vector<uint32_t> shapeIndices = { 0u, 1u };
+    const std::vector<float> poseData = { 0.f, 0.f, 1.f, 0.f, -0.0f, 2.f, 3.f };
+    const std::vector<uint32_t> updateIndices = { 0u };
+    const uint32_t nbUpdates = 1, totalNumShapes = 2;
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+    Kernel kernel("updateBounds.spv", "setRigidDynamicGlobalPose",
+                  { sizeof(ShapeSim), sizeof(Shape), sizeof(BodySim), 4, sizeof(SolverBodySleepData),
+                    sizeof(CachedTransform), 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 4 },
+                  sizeof(UpdateBoundsParams));
+
+    PxgBufferHandle shapeSimBuf = createBufferFrom(dev, shapeSims);
+    PxgBufferHandle shapesBuf = createBufferFrom(dev, shapes);
+    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
+    PxgBufferHandle dummy4a = dev->createBuffer(16);
+    PxgBufferHandle dummySleep = dev->createBuffer(16);
+    std::vector<CachedTransform> cacheInit(numShapes);
+    std::memset(cacheInit.data(), 0, cacheInit.size() * sizeof(CachedTransform));
+    PxgBufferHandle cacheBuf = createBufferFrom(dev, cacheInit);
+    std::vector<float> boundsInit(numShapes * 6, 0.f);
+    PxgBufferHandle boundsBuf = createBufferFrom(dev, boundsInit);
+    std::vector<uint32_t> zerosShapes(numShapes, 0);
+    PxgBufferHandle dummyFrozen = dev->createBuffer(16);
+    PxgBufferHandle dummyUnfrozen = dev->createBuffer(16);
+    PxgBufferHandle updatedBuf = createBufferFrom(dev, zerosShapes);
+    PxgBufferHandle dummyActive = dev->createBuffer(16);
+    PxgBufferHandle dummyDeactivate = dev->createBuffer(16);
+    PxgBufferHandle blobBuf = createBufferFrom(dev, geometryBlob);
+    PxgBufferHandle nodeIdxBuf = createBufferFrom(dev, nodeIndices);
+    PxgBufferHandle shapeIdxBuf = createBufferFrom(dev, shapeIndices);
+    PxgBufferHandle poseBuf = createBufferFrom(dev, poseData);
+    PxgBufferHandle gpuIdxBuf = createBufferFrom(dev, updateIndices);
+
+    const UpdateBoundsParams params = { 0, nbUpdates, totalNumShapes };
+    kernel.dispatch(1,
+                    { shapeSimBuf, shapesBuf, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf, dummyFrozen,
+                      dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, blobBuf, nodeIdxBuf, shapeIdxBuf,
+                      poseBuf, gpuIdxBuf },
+                    params);
+    dev->flush();
+
+    // ---- reference (CUDA semantics) + FMin/FMax twin ----
+    const QuatV inQ(poseData[0], poseData[1], poseData[2], poseData[3]);
+    const Vec3 inP(poseData[4], poseData[5], poseData[6]);
+    const QuatV b2aQ(bodySims[0].body2Actor_maxImpulseW.q);
+    const Vec3 b2aP(bodySims[0].body2Actor_maxImpulseW.p.x, bodySims[0].body2Actor_maxImpulseW.p.y,
+                    bodySims[0].body2Actor_maxImpulseW.p.z);
+    const TransformV body2World(inQ * b2aQ, inQ.rotate(b2aP) + inP);
+    const TransformV body2Actor(b2aQ, b2aP);
+
+    std::vector<Bounds3> refB(numShapes, Bounds3{});
+    std::vector<UbFMinMaxTwin> twins(numShapes);
+    std::vector<Transform28> refCache(numShapes);
+    uint32_t poseNegZeroSeen = 0, zeroTieMinSeen = 0, zeroTieMaxSeen = 0, otherDiffers = 0;
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        const TransformV shape2Actor(shapeSims[s].transform);
+        // the mirror's transformInv uses rotateInv; the CUDA's PxTransform::
+        // transformInv is getConjugate().rotate -- pin that both agree on this input
+        const TransformV t0a = body2Actor.transformInv(shape2Actor);
+        const Vec3 t0bP = b2aQ.getConjugate().rotate(shape2Actor.p - b2aP);
+        PXG_CHECK_MSG(bits(t0a.p.x) == bits(t0bP.x) && bits(t0a.p.y) == bits(t0bP.y) &&
+                          bits(t0a.p.z) == bits(t0bP.z),
+                      "convexZeroTie: rotateInv and conj().rotate must agree on t0.p (shape %u)", s);
+
+        const TransformV absPos = getAbsPose(body2World, shape2Actor, body2Actor);
+        if (absPos.p.x == 0.f && std::signbit(absPos.p.x))
+            ++poseNegZeroSeen;
+        refCache[s] = absPos.toTransform28();
+        refUpdateBounds(shapeSims[s], shapes, geometryBlob, absPos, refB[s], 0, &twins[s]);
+        PXG_CHECK_MSG(twins[s].valid, "convexZeroTie: shape %u must take the convex hull path", s);
+
+        const float rw[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                              refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+        const float tw[6] = { twins[s].minimum.x, twins[s].minimum.y, twins[s].minimum.z,
+                              twins[s].maximum.x, twins[s].maximum.y, twins[s].maximum.z };
+        for (int c = 0; c < 6; ++c)
+        {
+            if (bits(rw[c]) == bits(tw[c]))
+                continue;
+            if (s == 0 && c == 0)
+                ++zeroTieMinSeen;
+            else if (s == 1 && c == 3)
+                ++zeroTieMaxSeen;
+            else
+                ++otherDiffers;
+        }
+    }
+    PXG_CHECK_MSG(poseNegZeroSeen == 2 && zeroTieMinSeen == 1 && zeroTieMaxSeen == 1 && otherDiffers == 0,
+                  "convexZeroTie coverage: poseNegZero %u (2) minTie %u (1) maxTie %u (1) other %u (0)",
+                  poseNegZeroSeen, zeroTieMinSeen, zeroTieMaxSeen, otherDiffers);
+    PXG_CHECK_MSG(bits(refB[0].minimum.x) == 0x00000000u && bits(refB[1].maximum.x) == 0x80000000u,
+                  "convexZeroTie: CUDA image minX(0)=+0 maxX(1)=-0 (got %08x %08x)", bits(refB[0].minimum.x),
+                  bits(refB[1].maximum.x));
+
+    // ---- compare (bitwise) ----
+    const std::vector<CachedTransform> gpuCache = downloadBuffer<CachedTransform>(dev, cacheBuf, numShapes);
+    const std::vector<float> gpuBounds = downloadBuffer<float>(dev, boundsBuf, numShapes * 6);
+    const std::vector<uint32_t> gpuUpdated = downloadBuffer<uint32_t>(dev, updatedBuf, numShapes);
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        PXG_CHECK_MSG(gpuUpdated[s] == 1u, "convexZeroTie updated[%u] = %u", s, gpuUpdated[s]);
+        PXG_CHECK_MSG(std::memcmp(&gpuCache[s].transform, &refCache[s], sizeof(Transform28)) == 0,
+                      "convexZeroTie cache[%u] differs bitwise", s);
+        const float rb[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                              refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+        for (int c = 0; c < 6; ++c)
+            PXG_CHECK_MSG(bits(gpuBounds[s * 6 + c]) == bits(rb[c]), "convexZeroTie bounds[%u][%d]: gpu=%08x ref=%08x",
+                          s, c, bits(gpuBounds[s * 6 + c]), bits(rb[c]));
+    }
+
+    for (PxgBufferHandle h : { shapeSimBuf, shapesBuf, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf,
+                               dummyFrozen, dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, blobBuf,
+                               nodeIdxBuf, shapeIdxBuf, poseBuf, gpuIdxBuf })
+        dev->destroyBuffer(h);
+}
+
 // updateChangedAABBMgrHandlesLaunch on the ENGINE ABI (P5 Step 4 root-cause
 // fix): pack the per-shape "updated" flags into the AABB-manager changed-handle
 // bitmap (bit j of word w = updated[w*32+j] != 0).  Without this the broadphase
