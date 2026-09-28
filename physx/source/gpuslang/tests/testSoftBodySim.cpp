@@ -12885,7 +12885,7 @@ PXG_TEST(softBodySimHeightfieldMidphase)
 // HEIGHTFIELD shape folded with & 0x7fffffff), alternativeWriteMode's side arrays, the stack
 // clamp and the UNCLAMPED stackSizeNeededOnDevice tail.
 //
-// TWO MORE TETRAHEDRA, EACH ADDED BECAUSE A MUTANT SURVIVED WITHOUT IT:
+// THREE MORE TETRAHEDRA, EACH ADDED BECAUSE A MUTANT SURVIVED WITHOUT IT:
 //   * an APEX-DOWN one, whose FOURTH VERTEX is the closest feature.  Every other tet here
 //     points its base at the triangle and its apex away, so replacing v3 with v0 changes
 //     nothing -- the same blind spot P9.73 found in the softbody floor scene, and a mutant
@@ -12894,6 +12894,9 @@ PXG_TEST(softBodySimHeightfieldMidphase)
 //     all.  It was added to test the one surviving mutant (a reversed search seed) on the
 //     branch where a seed is most likely to matter.  It survived that too, which is what
 //     turns "the seed is an initial direction, not an input" from a claim into a measurement.
+//   * a LEVEL one (P9.86), whose apex lies ON the triangle's plane: the only ZERO penetration.
+//     The bare dot(wB - wA, n) is -0 there; the CUDA's `+ penOffset` (0) makes it +0, and a
+//     revert of the port's select survived until normalPen.w was compared bitwise.
 //
 // The triangle is not transcribed a second time: the expectation comes from hfref's
 // getTriangleNoAdj, the same decoder step 1's fixture checks, taken to world through the same
@@ -13055,6 +13058,32 @@ PXG_TEST(softBodySimHeightfieldContactGen)
         tets.push_back({ b, b + 1u, b + 2u, b + 3u });
         return uint32_t(tets.size() - 1u);
     }();
+    // LEVEL (P9.86): the only pair whose penetration is exactly ZERO.  Its apex P sits AT the
+    // triangle's height, 0.001/0.01 short of W1 in x/z and inside W1's Voronoi region, and all
+    // three edges from P run away from W1, so GJK converges on the size-1 simplex {P - W1}:
+    // closestPointA = P, cp.y = 7 - 7 = +0, closestPointDir.y = -0, wB.y = 7 + ub*(-0) = 7.
+    // With this triangle's n = (-0, -1, -0) the three lanes of dot(wB - wA, n) are dx*(-0),
+    // (+0)*(-1), dz*(-0) -- all -0 -- so the bare dot is -0.  The CUDA adds penOffset, a
+    // literal 0 (softbodyPrimitives.cu:339, passed at :1136), which makes it +0; the port's
+    // select at softBodyHfContactGenBda.slang:402 does the same.  Checked BITWISE below.
+    // (addTet with apexDir -1 would NOT do: its v2 at cz + 0.06 leans toward W1 and the closest
+    // point would slide up an edge, making dy nonzero.)
+    const float LVL_DX = 0.001f, LVL_DZ = 0.01f;
+    const F4 P_LEVEL{ W1.x - LVL_DX, W1.y, W1.z - LVL_DZ, 1.0f };
+    const uint32_t T_LEVEL = [&]() {
+        const uint32_t b = uint32_t(tetVerts.size());
+        const float baseY = W1.y + 0.5f;
+        tetVerts.push_back(F4{ P_LEVEL.x - 0.06f, baseY, P_LEVEL.z - 0.06f, 1.0f });
+        tetVerts.push_back(F4{ P_LEVEL.x + 0.06f, baseY, P_LEVEL.z - 0.06f, 1.0f });
+        tetVerts.push_back(F4{ P_LEVEL.x,         baseY, P_LEVEL.z - 0.12f, 1.0f });
+        tetVerts.push_back(P_LEVEL);                                   // the apex, ON the plane
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        return uint32_t(tets.size() - 1u);
+    }();
+    PXG_CHECK_MSG(W1.y == TY && std::signbit(nExp.x) && nExp.x == 0.0f &&
+                  std::signbit(nExp.z) && nExp.z == 0.0f && nExp.y < 0.0f,
+                  "LEVEL needs the triangle normal n = (-0, <0, -0) and W1 on y = TY; got "
+                  "(%a %a %a), W1.y = %a", nExp.x, nExp.y, nExp.z, W1.y);
     DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets);
 
     const uint32_t SB_ID = 2u;
@@ -13110,15 +13139,16 @@ PXG_TEST(softBodySimHeightfieldContactGen)
     DevBuf bRemap = makeDev(dev, remap);
 
     // ---- the pair stack, and the clamp -----------------------------------------------------
-    // FIVE entries are declared in midphasePairsNum but stackSizeBytes only covers FOUR, so the
-    // fifth -- which WOULD emit, being a copy of the first -- must be clamped away, while the
-    // tail still reports the unclamped demand.
-    const uint32_t NB_STACK_ENTRIES = 7u, DECLARED = 6u;
+    // EIGHT entries are declared in midphasePairsNum but stackSizeBytes only covers SEVEN, so
+    // the eighth -- which WOULD emit, being a copy of the first -- must be clamped away, while
+    // the tail still reports the unclamped demand.
+    const uint32_t NB_STACK_ENTRIES = 8u, DECLARED = 7u;
     std::vector<uint32_t> stack;
     auto push = [&](uint32_t tet) {
         stack.push_back(0u); stack.push_back(tet); stack.push_back(TRI); stack.push_back(0u);
     };
-    push(T_ABOVE); push(T_BELOW); push(T_EDGE); push(T_APEX); push(T_DEEP); push(T_FAR);
+    push(T_ABOVE); push(T_BELOW); push(T_EDGE); push(T_APEX); push(T_DEEP); push(T_LEVEL);
+    push(T_FAR);
     push(T_ABOVE);                       // beyond the clamp
     DevBuf bStack = makeDev(dev, stack);
     std::vector<uint32_t> pairNum = { NB_STACK_ENTRIES };
@@ -13184,16 +13214,17 @@ PXG_TEST(softBodySimHeightfieldContactGen)
                     gInfo[i * 4u + 2u] & 0xfffffu, gInfo[i * 4u + 3u]);
 
     // ---- difference (2): BOTH sides of the triangle survive ---------------------------------
-    PXG_CHECK_MSG(gCount == 5u,
-                  "five of the seven stack entries must emit: the tet ABOVE the triangle, the "
-                  "one BELOW it, the one overhanging its EDGE, the APEX-down one and the DEEP "
-                  "penetrating one.  The far tet is outside the contact distance and the seventh "
-                  "entry is beyond the stack clamp.  Got %u -- 4 means the mesh sibling's "
+    PXG_CHECK_MSG(gCount == 6u,
+                  "six of the eight stack entries must emit: the tet ABOVE the triangle, the "
+                  "one BELOW it, the one overhanging its EDGE, the APEX-down one, the DEEP "
+                  "penetrating one and the LEVEL one.  The far tet is outside the contact "
+                  "distance and the eighth entry is beyond the stack clamp.  Got %u -- 4 means the mesh sibling's "
                   "front-face gate was copied in, and this kernel does not have one "
                   "(softbodyPrimitives.cu:1130 vs :878-881)", gCount);
 
     // index the contacts by their tetrahedron, since the emission order is an atomic race
-    int idxAbove = -1, idxBelow = -1, idxEdge = -1, idxApex = -1, idxDeep = -1;
+    int idxAbove = -1, idxBelow = -1, idxEdge = -1, idxApex = -1, idxDeep = -1,
+        idxLevel = -1;
     for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
     {
         const uint32_t tet = gInfo[i * 4u + 2u] & 0xfffffu;
@@ -13202,6 +13233,7 @@ PXG_TEST(softBodySimHeightfieldContactGen)
         else if (tet == T_EDGE) idxEdge = int(i);
         else if (tet == T_APEX) idxApex = int(i);
         else if (tet == T_DEEP) idxDeep = int(i);
+        else if (tet == T_LEVEL) idxLevel = int(i);
         PXG_CHECK_MSG(tet != T_FAR, "the tet ten units above the triangle must not emit: "
                                     "cDistance is 0.023");
     }
@@ -13209,13 +13241,14 @@ PXG_TEST(softBodySimHeightfieldContactGen)
     // these, and a missing contact leaves the index at -1.  The first version read on and
     // SEGFAULTED, which the sweep duly scored as a kill -- but a fixture that crashes instead
     // of printing its diagnosis has thrown away the only thing that makes the kill useful.
-    if (idxAbove < 0 || idxBelow < 0 || idxEdge < 0 || idxApex < 0 || idxDeep < 0)
+    if (idxAbove < 0 || idxBelow < 0 || idxEdge < 0 || idxApex < 0 || idxDeep < 0 ||
+        idxLevel < 0)
     {
         PXG_CHECK_MSG(false,
-                      "the five contacts must be one per tetrahedron (above %d, below %d, edge "
-                      "%d, apex %d, deep %d); a -1 is a tetrahedron that produced nothing and a "
-                      "repeat means the clamped seventh entry was processed",
-                      idxAbove, idxBelow, idxEdge, idxApex, idxDeep);
+                      "the six contacts must be one per tetrahedron (above %d, below %d, edge "
+                      "%d, apex %d, deep %d, level %d); a -1 is a tetrahedron that produced "
+                      "nothing and a repeat means the clamped eighth entry was processed",
+                      idxAbove, idxBelow, idxEdge, idxApex, idxDeep, idxLevel);
         for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h,
                                    bXf.h, bCd.h, bRd.h, bRemap.h, bStack.h, bPairNum.h,
                                    bNeeded.h, bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h,
@@ -13227,9 +13260,9 @@ PXG_TEST(softBodySimHeightfieldContactGen)
     auto near = [](float a, float b, float t) { return std::fabs(a - b) <= t; };
 
     // ---- difference (3): the stored normal is the TRIANGLE normal, negated -----------------
-    const int idxOf[5] = { idxAbove, idxBelow, idxEdge, idxApex, idxDeep };
-    const char* nameOf[5] = { "above", "below", "edge", "apex", "deep" };
-    for (int which = 0; which < 5; ++which)
+    const int idxOf[6] = { idxAbove, idxBelow, idxEdge, idxApex, idxDeep, idxLevel };
+    const char* nameOf[6] = { "above", "below", "edge", "apex", "deep", "level" };
+    for (int which = 0; which < 6; ++which)
     {
         const int i = idxOf[which];
         const char* nm = nameOf[which];
@@ -13288,8 +13321,52 @@ PXG_TEST(softBodySimHeightfieldContactGen)
                   "%.5f -- a different x means the decoded triangle is not where the heightfield "
                   "puts it", W0.x, gPoint[idxEdge].x);
 
+    // ---- LEVEL: a ZERO penetration is +0, never -0 (P9.86) ------------------------------------
+    // BITWISE: near() is fabs(a - b) and cannot see the sign of zero.
+    {
+        const int i = idxLevel;
+        PXG_CHECK_MSG(f2u(gNormalPen[i].x) == 0u && f2u(gNormalPen[i].z) == 0u &&
+                      gNormalPen[i].y > 0.0f,
+                      "level: the stored -n must be (+0, >0, +0), i.e. n = (-0, <0, -0); got "
+                      "(0x%08x 0x%08x 0x%08x)", f2u(gNormalPen[i].x), f2u(gNormalPen[i].y),
+                      f2u(gNormalPen[i].z));
+        PXG_CHECK_MSG(f2u(gPoint[i].y) == f2u(P_LEVEL.y),
+                      "level: the triangle witness must be at the apex's height EXACTLY (dy = +0); "
+                      "got y = %a vs %a", gPoint[i].y, P_LEVEL.y);
+        PXG_CHECK_MSG(gPoint[i].x > P_LEVEL.x && gPoint[i].z > P_LEVEL.z,
+                      "level: the triangle witness lies toward W1, +x/+z of the apex; got "
+                      "(%.6f %.6f) vs apex (%.6f %.6f)", gPoint[i].x, gPoint[i].z, P_LEVEL.x,
+                      P_LEVEL.z);
+        // wA = P: the simplex is size 1.  The twin is the UNFIXED spelling dot(wB - wA, n).
+        const float nx = -gNormalPen[i].x, ny = -gNormalPen[i].y, nz = -gNormalPen[i].z;
+        const float twinRevert = (gPoint[i].x - P_LEVEL.x) * nx + (gPoint[i].y - P_LEVEL.y) * ny +
+                                 (gPoint[i].z - P_LEVEL.z) * nz;
+        const uint32_t penNegZeroSeen =
+            (twinRevert == 0.0f && std::signbit(twinRevert)) ? 1u : 0u;
+        PXG_CHECK_MSG(penNegZeroSeen == 1u,
+                      "coverage: the unfixed spelling dot(wB - wA, n) must be -0 on the LEVEL "
+                      "contact, or this case no longer exercises the P9.86 select; got %a",
+                      twinRevert);
+        const float cudaPen = twinRevert + 0.0f;   // softbodyPrimitives.cu:339, penOffset 0 (:1136)
+        PXG_CHECK_MSG(f2u(cudaPen) == 0u && f2u(gNormalPen[i].w) == f2u(cudaPen),
+                      "level: the CUDA adds penOffset 0, so a zero pen is +0 (0x00000000); got "
+                      "0x%08x -- 0x80000000 means the select at softBodyHfContactGenBda.slang:402 "
+                      "was dropped", f2u(gNormalPen[i].w));
+        uint32_t zeroPenSeen = 0u;
+        for (uint32_t j = 0; j < gCount && j < MAXC; ++j)
+            if (gNormalPen[j].w == 0.0f)
+            {
+                ++zeroPenSeen;
+                PXG_CHECK_MSG(f2u(gNormalPen[j].w) == 0u,
+                              "contact %u: a zero pen must be +0; got 0x%08x", j,
+                              f2u(gNormalPen[j].w));
+            }
+        PXG_CHECK_MSG(zeroPenSeen == 1u, "coverage: exactly one zero-pen contact (LEVEL); got %u",
+                      zeroPenSeen);
+    }
+
     // ---- the rigid-shaped output, shared with the sibling and not allowed to drift ----------
-    for (int which = 0; which < 5; ++which)
+    for (int which = 0; which < 6; ++which)
     {
         const int i = idxOf[which];
         PXG_CHECK_MSG(gInfo[i * 4u + 0u] == uint32_t(RIGID_ID & 0xFFFFFFFFull) &&
@@ -13327,8 +13404,8 @@ PXG_TEST(softBodySimHeightfieldContactGen)
         PXG_CHECK_MSG(gIdxSorted[i] == i,
                       "contactIndexSortedByX is seeded with the identity in BOTH modes; slot "
                       "%u holds %u", i, gIdxSorted[i]);
-    PXG_CHECK_MSG(gPoint[5].x == 0.0f && gNormalPen[5].x == 0.0f && gInfo[5 * 4u] == POISON,
-                  "nothing beyond the five contacts may be touched");
+    PXG_CHECK_MSG(gPoint[6].x == 0.0f && gNormalPen[6].x == 0.0f && gInfo[6 * 4u] == POISON,
+                  "nothing beyond the six contacts may be touched");
 
     // ---- the clamp and the unclamped demand ------------------------------------------------
     PXG_CHECK_MSG(gNeeded == NB_STACK_ENTRIES * 16u,
