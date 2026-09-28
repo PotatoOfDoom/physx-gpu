@@ -7429,6 +7429,296 @@ PXG_TEST(softBodySimFemContactRemap)
 }
 
 // ===========================================================================
+// P9.86c -- the SIGN OF ZERO (and NaN) through the remap's PxClamp.
+// computeTetBarycentric (deformableCollision.cuh:133-136) and the sb_other fallback
+// (softbodyPrimitives.cu:2261-2264) clamp with PxClamp = selectMin(1, selectMax(0, t)),
+// which keeps -0 and NaN; Slang clamp() is GLSL FClamp, which gives +0 / 0 on llvmpipe.
+// The fixtures above only produce +0 and compare with tolerances.  Here a positively
+// oriented T0 and an inverted T1 put the contact (or its closest point) exactly on a
+// vertex, so the ratios are exact signed zeros (-0 in .y, and in .z/.w for T1); the
+// degenerate T2 gives 0/0.  Every output is compared bitwise against a host mirror.
+// ===========================================================================
+namespace sbRemapZref
+{
+using p80refit::TetIdx4;
+struct V3 { float x, y, z; };
+static V3 sub(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 add(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 mul(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }             // PxVec3::dot
+static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 v3(F4 f) { return V3{ f.x, f.y, f.z }; }
+
+// 0 = the CUDA (PxClamp = selectMin(1, selectMax(0, t)) at deformableCollision.cuh:133-136 and
+// softbodyPrimitives.cu:2261-2264); 1 = FClamp twin inside computeTetBarycentric (revert r1);
+// 2 = FClamp twin in the other-remap fallback clamp only (revert r2).
+static int gClampVariant = 0;
+static float pxClamp01(float t) { const float m = (0.0f > t) ? 0.0f : t; return (1.0f < m) ? 1.0f : m; }
+// llvmpipe GLSL FClamp(t, 0, 1) = fmin(fmax(t, +0), 1) with ordered zeros (P9.86 F4): -0 -> +0.
+static float fclampTwin(float t) { if (t != t) return 0.0f; const float m = (t > 0.0f) ? t : 0.0f; return (m < 1.0f) ? m : 1.0f; }
+
+// Gu::closestPtPointTriangle2 (GuDistancePointTriangle.h:44), CUDA association kept.
+static V3 closestPtPointTriangle2(V3 p, V3 a, V3 b, V3 c, V3 ab, V3 ac)
+{
+    const V3 ap = sub(p, a);
+    const float d1 = dot3(ab, ap), d2 = dot3(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;
+    const V3 bp = sub(p, b);
+    const float d3 = dot3(ab, bp), d4 = dot3(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) { const float v = d1 / (d1 - d3); return add(a, mul(ab, v)); }
+    const V3 cp = sub(p, c);
+    const float d5 = dot3(ab, cp), d6 = dot3(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) { const float w = d2 / (d2 - d6); return add(a, mul(ac, w)); }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    {
+        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return add(b, mul(sub(c, b), w));
+    }
+    const float denom = 1.0f / (va + vb + vc);
+    const float v = vb * denom, w = vc * denom;
+    return add(add(a, mul(ab, v)), mul(ac, w));                                            // a + ab*v + ac*w
+}
+// Gu::closestPtPointTetrahedron (GuDistancePointTetrahedron.h:77), strict < keeps the first face.
+static V3 closestPtPointTetrahedron(V3 p, V3 a, V3 b, V3 c, V3 d)
+{
+    const V3 ab = sub(b, a), ac = sub(c, a), ad = sub(d, a), bc = sub(c, b), bd = sub(d, b);
+    V3 best = closestPtPointTriangle2(p, a, b, c, ab, ac);
+    V3 diff = sub(best, p);
+    float bestSq = dot3(diff, diff);
+    const V3 f[3] = { closestPtPointTriangle2(p, a, c, d, ac, ad), closestPtPointTriangle2(p, a, d, b, ad, ab),
+                      closestPtPointTriangle2(p, b, d, c, bd, bc) };
+    for (int i = 0; i < 3; ++i)
+    {
+        diff = sub(f[i], p);
+        const float sq = dot3(diff, diff);
+        if (sq < bestSq) { best = f[i]; bestSq = sq; }
+    }
+    return best;
+}
+// computeTetBarycentric (deformableCollision.cuh:96).
+static bool computeTetBarycentric(V3 a, V3 b, V3 c, V3 d, V3 point, F4& bary)
+{
+    const float eps = 1e-5f, minEps = -eps, maxEps = 1.0f + eps;
+    const V3 ba = sub(b, a), ca = sub(c, a), da = sub(d, a), pa = sub(point, a);
+    const float detBcd = dot3(ba, cross3(ca, da));
+    const float v = dot3(pa, cross3(ca, da)) / detBcd;
+    const float w = dot3(ba, cross3(pa, da)) / detBcd;
+    const float x = dot3(ba, cross3(ca, pa)) / detBcd;
+    const float u = 1.0f - v - w - x;
+    float (*cl)(float) = (gClampVariant == 1) ? fclampTwin : pxClamp01;
+    bary = F4{ cl(u), cl(v), cl(w), cl(x) };
+    return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
+           (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
+}
+static bool isValidTet(V3 a, V3 b, V3 c, V3 d) { return dot3(sub(b, a), cross3(sub(c, a), sub(d, a))) > 1e-9f; }
+
+struct Scene { std::vector<F4> verts; std::vector<TetIdx4> tets; std::vector<uint32_t> remap, accum; };
+struct Out { uint32_t simTet; F4 bary; };
+
+// One warp of sb_other_contact_remap_to_simLaunch (fem == false, softbodyPrimitives.cu:2134) or
+// sb_fem_contact_remap_to_simLaunch (fem == true, :2277) for one contact: 32 lanes in order,
+// ballot + lowestSetIndex, warpReduction<MinOpFloat> with the lowest lane winning ties.
+static Out remapRef(const Scene& sc, V3 contact, uint32_t colTet, bool fem)
+{
+    const uint32_t endInd = sc.accum[colTet];
+    const uint32_t startInd = (colTet != 0u) ? sc.accum[colTet - 1u] : 0u;
+    const uint32_t range = endInd - startInd;
+    uint32_t laneTet[32]; F4 laneBary[32]; float laneSq[32];
+    for (int l = 0; l < 32; ++l) { laneTet[l] = 0xffffffffu; laneBary[l] = F4{ 0, 0, 0, 0 }; laneSq[l] = 3.402823466e38f; }
+    bool hasTet = false;
+    for (uint32_t j = 0; j < (range + 31u) / 32u; ++j)
+    {
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            const uint32_t wi = l + j * 32u;
+            if (wi >= range) continue;
+            const uint32_t st = sc.remap[startInd + wi];
+            const TetIdx4 t = sc.tets[st];
+            const V3 a = v3(sc.verts[t.x]), b = v3(sc.verts[t.y]), c = v3(sc.verts[t.z]), d = v3(sc.verts[t.w]);
+            if (fem && !isValidTet(a, b, c, d)) continue;
+            hasTet = true;
+            F4 tb;
+            if (computeTetBarycentric(a, b, c, d, contact, tb)) return Out{ st, tb };   // lowest hitting lane
+            const V3 cp = closestPtPointTetrahedron(contact, a, b, c, d);
+            const V3 dv = sub(contact, cp);
+            const float sq = dot3(dv, dv);
+            if (sq < laneSq[l]) { laneSq[l] = sq; laneTet[l] = st; computeTetBarycentric(a, b, c, d, cp, laneBary[l]); }
+        }
+    }
+    if (fem && !hasTet) return Out{ 0u, F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
+    float best = 3.402823466e38f;
+    for (int l = 0; l < 32; ++l) best = (laneSq[l] < best) ? laneSq[l] : best;
+    int w = 0;
+    for (int l = 0; l < 32; ++l) if (laneSq[l] == best) { w = l; break; }
+    F4 bb = laneBary[w];
+    if (!fem)   // softbodyPrimitives.cu:2261-2264; the FEM twin (:2427-2430) is commented out
+    {
+        float (*cl)(float) = (gClampVariant == 2) ? fclampTwin : pxClamp01;
+        bb = F4{ cl(bb.x), cl(bb.y), cl(bb.z), cl(bb.w) };
+    }
+    return Out{ laneTet[w], bb };
+}
+// Bitwise, except that any NaN matches any NaN: the CUDA's 0/0 is 0x7fffffff, x86 gives 0xffc00000.
+static bool sameLane(float a, float b) { return (a != a && b != b) || f2u(a) == f2u(b); }
+static bool sameBits(F4 a, F4 b) { return sameLane(a.x, b.x) && sameLane(a.y, b.y) && sameLane(a.z, b.z) && sameLane(a.w, b.w); }
+} // namespace sbRemapZref
+
+PXG_TEST(softBodySimContactRemapZeroSign)
+{
+    namespace Z = sbRemapZref;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    Z::Scene sc;
+    sc.verts = { {  0.0f,  0.0f,  0.0f, 1.0f }, { -1.0f, -1.0f, -1.0f, 1.0f },
+                 {  0.0f,  1.0f, -1.0f, 1.0f }, {  1.0f, -1.0f,  0.0f, 1.0f },    // T0, det +3
+                 {  2.0f,  0.0f,  0.0f, 1.0f }, {  3.0f,  0.0f,  0.0f, 1.0f },
+                 {  2.0f,  0.0f,  1.0f, 1.0f }, {  2.0f,  1.0f,  0.0f, 1.0f },    // T1, det -1
+                 { 20.0f,  0.0f,  0.0f, 1.0f }, { 21.0f,  0.0f,  0.0f, 1.0f },
+                 { 20.0f,  1.0f,  0.0f, 1.0f } };                                 // T2 = {a,b,c,a}, det 0
+    sc.tets = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u }, { 8u, 9u, 10u, 8u } };
+    sc.remap = { 0u, 1u, 2u, 0u };
+    sc.accum = { 1u, 2u, 3u, 3u };   // collision tet c -> {Tc}
+
+    std::vector<F4> vtx = sc.verts;
+    for (int t = 0; t < 4; ++t) vtx.push_back(F4{ 0, 0, 0, 0 });   // trailer, as the sibling fixture
+    DevBuf bSv = makeDev(dev, vtx), bSt = makeDev(dev, sc.tets);
+    DevBuf bRc = makeDev(dev, sc.remap), bAr = makeDev(dev, sc.accum);
+    if (!bSv.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bSt.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSv.addr));
+    sb.mTetsRemapColToSim = reinterpret_cast<PxU32*>(size_t(bRc.addr));
+    sb.mTetsAccumulatedRemapColToSim = reinterpret_cast<PxU32*>(size_t(bAr.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- sb_other_contact_remap_to_simLaunch: r1 via all five, r2 via the three fallbacks ----
+    // Contact 4 is the NaN hedge: the degenerate T2 (no isValidTet gate in this kernel) gives
+    // 0/0 in every lane, which PxClamp keeps and FClamp turns into 0 -- a kill that does not
+    // rest on FClamp's zero sign.
+    const Z::V3 P[5] = { { 0.1f,  0.2f,  0.3f },    // col 0: outside T0, vertex region of a -> FALLBACK
+                         { 0.0f,  0.0f,  0.0f },    // col 0: AT a -> CONTAINED, v = -0
+                         { 1.5f, -0.5f, -0.5f },    // col 1: outside T1, vertex region of a -> FALLBACK
+                         { 2.0f,  0.0f,  0.0f },    // col 1: AT a -> CONTAINED, v = w = x = -0
+                         { 20.2f, 0.2f,  0.5f } };  // col 2: degenerate T2 -> FALLBACK, closest z = 0, all NaN
+    const uint32_t colOf[5] = { 0u, 0u, 1u, 1u, 2u };
+    std::vector<F4> points;
+    for (int i = 0; i < 5; ++i) points.push_back(F4{ P[i].x, P[i].y, P[i].z, 0.0f });
+    std::vector<FemOtherContactInfoHost> infos(5);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    for (uint32_t i = 0; i < 5u; ++i)
+    {
+        infos[i].pairInd0 = 0x100ull + i; infos[i].pairInd1 = colOf[i]; infos[i].rigidMatInd = i;
+    }
+    std::vector<F4> bary(5, F4{ -1, -1, -1, -1 });
+    std::vector<uint32_t> count = { 5u, 0u, 0u, 0u };
+    DevBuf bPt = makeDev(dev, points), bInfo = makeDev(dev, infos);
+    DevBuf bBary = makeDev(dev, bary), bCount = makeDev(dev, count);
+
+    SbRemapPush push = {};
+    push.softbodies = bDesc.addr;
+    push.maxNumContacts = 64u;
+    push.point = bPt.addr;
+    push.outBarycentric = bBary.addr;
+    push.outContactInfo = bInfo.addr;
+    push.totalContactCount = bCount.addr;
+    push.prevContactCount = 0ull;
+    Kernel("softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch", {}, sizeof(SbRemapPush))
+        .dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfo.h, 5);
+    const auto gBary = downloadBuffer<F4>(dev, bBary.h, 5);
+
+    uint32_t negZeroY = 0, nanSeen = 0, r1TwinDiffers = 0, r2TwinDiffers = 0;
+    for (uint32_t i = 0; i < 5u; ++i)
+    {
+        Z::gClampVariant = 1; const Z::Out t1 = Z::remapRef(sc, P[i], colOf[i], /*fem*/ false);
+        Z::gClampVariant = 2; const Z::Out t2 = Z::remapRef(sc, P[i], colOf[i], /*fem*/ false);
+        Z::gClampVariant = 0; const Z::Out e  = Z::remapRef(sc, P[i], colOf[i], /*fem*/ false);
+        if (f2u(e.bary.y) == 0x80000000u) ++negZeroY;
+        for (const float c : { e.bary.x, e.bary.y, e.bary.z, e.bary.w }) if (c != c) ++nanSeen;
+        if (!Z::sameBits(e.bary, t1.bary)) ++r1TwinDiffers;
+        if (!Z::sameBits(e.bary, t2.bary)) ++r2TwinDiffers;
+        PXG_CHECK_MSG((gInfo[i].pairInd1 & 0xfffffu) == e.simTet,
+                      "other remap contact %u -> sim tet %u, CUDA %u", i, gInfo[i].pairInd1 & 0xfffffu, e.simTet);
+        PXG_CHECK_MSG(Z::sameBits(gBary[i], e.bary),
+                      "other remap contact %u: barycentric bits %08x %08x %08x %08x, CUDA %08x %08x %08x %08x "
+                      "(PxClamp keeps -0, FClamp gives +0)", i,
+                      f2u(gBary[i].x), f2u(gBary[i].y), f2u(gBary[i].z), f2u(gBary[i].w),
+                      f2u(e.bary.x), f2u(e.bary.y), f2u(e.bary.z), f2u(e.bary.w));
+    }
+    PXG_CHECK_MSG(negZeroY == 4u, "contacts 0-3 must each carry a -0 barycentric (%u/4)", negZeroY);
+    PXG_CHECK_MSG(nanSeen == 4u, "the degenerate contact 4 must carry four NaN lanes (%u/4)", nanSeen);
+    PXG_CHECK_MSG(r1TwinDiffers == 5u,
+                  "the FClamp-in-computeTetBarycentric twin must change all five contacts (%u/5)", r1TwinDiffers);
+    PXG_CHECK_MSG(r2TwinDiffers == 3u,
+                  "the FClamp-in-fallback twin must change the three FALLBACK contacts (%u/3)", r2TwinDiffers);
+
+    // ---- sb_fem_contact_remap_to_simLaunch: the helper clamp only ----
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+    const Z::V3 Q1[3] = { P[0], P[1], P[0] };   // pairInd1 side, read from outBarycentric1 (y-grid 0)
+    const Z::V3 Q0[3] = { P[1], P[0], P[1] };   // pairInd0 side, read from outBarycentric0 (y-grid 1)
+    const uint32_t fcol[3] = { 0u, 0u, 1u };    // contact 2: only the inverted T1 -> hasTet false control
+    std::vector<FemFemContactInfoHost> finfo(4);
+    std::memset(finfo.data(), 0, finfo.size() * sizeof(FemFemContactInfoHost));
+    std::vector<F4> fb0(4, F4{ -7, -7, -7, -7 }), fb1(4, F4{ -7, -7, -7, -7 });
+    for (uint32_t k = 0; k < 3u; ++k)
+    {
+        finfo[k].pairInd0 = enc(0u, fcol[k]); finfo[k].pairInd1 = enc(0u, fcol[k]); finfo[k].auxInd = 0x5A5A0000u + k;
+        fb1[k] = F4{ Q1[k].x, Q1[k].y, Q1[k].z, 0.0f };
+        fb0[k] = F4{ Q0[k].x, Q0[k].y, Q0[k].z, 0.0f };
+    }
+    std::vector<uint32_t> fcount = { 3u, 0u, 0u, 0u }, fprev = { 0u, 0u, 0u, 0u };
+    DevBuf bFi = makeDev(dev, finfo), bF0 = makeDev(dev, fb0), bF1 = makeDev(dev, fb1);
+    DevBuf bFc = makeDev(dev, fcount), bFp = makeDev(dev, fprev);
+    SbFemRemapPush pf = {};
+    pf.softbodies = bDesc.addr;
+    pf.outBarycentric0 = bF0.addr;
+    pf.outBarycentric1 = bF1.addr;
+    pf.outContactInfo = bFi.addr;
+    pf.totalContactCount = bFc.addr;
+    pf.prevContactCount = bFp.addr;   // the CUDA dereferences it unconditionally (softbodyPrimitives.cu:2301)
+    pf.maxNbContacts = 64u;
+    Kernel("softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch", {}, sizeof(SbFemRemapPush))
+        .dispatch(1024u, {}, pf, 2u, 1u);
+    dev->flush();
+    const auto gFi = downloadBuffer<FemFemContactInfoHost>(dev, bFi.h, 4);
+    const auto g0 = downloadBuffer<F4>(dev, bF0.h, 4);
+    const auto g1 = downloadBuffer<F4>(dev, bF1.h, 4);
+
+    uint32_t femNegZeroY = 0, femR1TwinDiffers = 0;
+    for (uint32_t k = 0; k < 3u; ++k)
+        for (uint32_t side = 0; side < 2u; ++side)   // 0: pairInd1/outBarycentric1, 1: pairInd0/outBarycentric0
+        {
+            const Z::V3 q = (side == 0u) ? Q1[k] : Q0[k];
+            Z::gClampVariant = 1; const Z::Out t1 = Z::remapRef(sc, q, fcol[k], /*fem*/ true);
+            Z::gClampVariant = 0; const Z::Out e  = Z::remapRef(sc, q, fcol[k], /*fem*/ true);
+            if (f2u(e.bary.y) == 0x80000000u) ++femNegZeroY;
+            if (!Z::sameBits(e.bary, t1.bary)) ++femR1TwinDiffers;
+            const F4 got = (side == 0u) ? g1[k] : g0[k];
+            const uint32_t gotTet = ((side == 0u) ? gFi[k].pairInd1 : uint32_t(gFi[k].pairInd0)) & 0xfffffu;
+            PXG_CHECK_MSG(gotTet == e.simTet, "fem remap contact %u side %u -> sim tet %u, CUDA %u",
+                          k, side, gotTet, e.simTet);
+            PXG_CHECK_MSG(Z::sameBits(got, e.bary),
+                          "fem remap contact %u side %u: barycentric bits %08x %08x %08x %08x, CUDA "
+                          "%08x %08x %08x %08x", k, side, f2u(got.x), f2u(got.y), f2u(got.z), f2u(got.w),
+                          f2u(e.bary.x), f2u(e.bary.y), f2u(e.bary.z), f2u(e.bary.w));
+        }
+    PXG_CHECK_MSG(femNegZeroY == 4u, "the four valid-tet FEM writes must carry a -0 barycentric (%u/4)", femNegZeroY);
+    PXG_CHECK_MSG(femR1TwinDiffers == 4u,
+                  "the FClamp-in-computeTetBarycentric twin must change the four FEM writes (%u/4)", femR1TwinDiffers);
+
+    for (DevBuf* b : { &bSv, &bSt, &bRc, &bAr, &bDesc, &bPt, &bInfo, &bBary, &bCount,
+                       &bFi, &bF0, &bF1, &bFc, &bFp })
+        dev->destroyBuffer(b->h);
+}
+
+// ===========================================================================
 // P8.4 tranche b — the SOFTBODY-vs-SOFTBODY constraint prepare and solve.
 //
 // CPU reference.  The two kernels are short but every term is a place a symmetric port can
