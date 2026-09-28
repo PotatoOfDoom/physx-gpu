@@ -568,6 +568,8 @@ static void laFill(physx::PxgArticulationBlockLinkData* lk, physx::PxgArticulati
     }
 }
 
+bool gLaCompoundFoldTwin = false;
+
 // The CUDA's structure, the engine's arithmetic.  `flatVel` is this lane's slice
 // of the flat motion-velocity array.
 static void laMirror(physx::PxgArticulationBlockLinkData* lk,
@@ -669,7 +671,10 @@ static void laMirror(physx::PxgArticulationBlockLinkData* lk,
 
         preMomentum.bottom = inertia * motionVel.top
                            + offset.cross(motionVel.bottom - preRootVel) * mass;
-        compoundInertia += refTranslateInertiaMass(inertia, mass, offset);
+        if (gLaCompoundFoldTwin)   // P9.86f twin: the port's folded `0 + T` (root term taken as T)
+            compoundInertia = refTranslateInertiaMass(inertia, mass, offset);
+        else
+            compoundInertia += refTranslateInertiaMass(inertia, mass, offset);
         motionVel += accel * dt;
         postMomentum.top = motionVel.bottom * mass;
         storeSpatialVector(lk[0].mMotionVelocity, motionVel, lane);
@@ -917,6 +922,134 @@ PXG_TEST(artiLinkAcceleration)
     shim.memFree(dVel);
 }
 
+
+// ---------------------------------------------------------------------------
+// P9.86f: the compound inertia's zero seed (forwardDynamic2.cu:1946/:2111)
+// ---------------------------------------------------------------------------
+// PxMat33(PxZero) += translateInertia(...): the root's term is IEEE `+0 + T`, which turns a -0 element
+// of T into +0.  T has a -0 element only when the isolated inertia has one AND the (s^T s) * mass term
+// is -0 there (mass -0, or mass +0 against a negative (s^T s) element); the sign then reaches the
+// inverse's zero cofactors and, when angRatio is exactly 1, deltaAng's zero lanes -- visible in
+// mMotionVelocity.top where that lane is -0.  Two directed single-link free-base lanes (found by a
+// host search over this mirror): lane 0 with mass -0, lane 1 with mass +0.  invInertia = 0, so both
+// root accelerations are -0 lanes.  gLaCompoundFoldTwin replays the folded port (root term = T); it
+// must change each lane's velocity, and the GPU must match the CUDA mirror BITWISE there (the body
+// test above forgives signed zeros).
+PXG_TEST(artiLinkAcceleration_compoundZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npArtiLinkAccel.spv", "artiLinkAcceleration", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiLinkAccelLoader);
+
+    struct Lane { PxVec3 c0, c1, c2; float mass; PxVec3 com, pos, top, bottom; };
+    const Lane lanes[] = {
+        { PxVec3(-1.f, 1.f, -1.f), PxVec3(-0.f, 1.f, 0.f), PxVec3(-0.f, 1.f, 1.f), -0.f,
+          PxVec3(1.f, -1.f, 2.f), PxVec3(-1.f, 0.f, -0.f), PxVec3(-0.f, 1.f, -1.f), PxVec3(-1.f, -1.f, -1.f) },
+        { PxVec3(0.f, 2.f, 0.f), PxVec3(2.f, -0.f, -0.f), PxVec3(0.f, -1.f, -1.f), 0.f,
+          PxVec3(-0.f, 1.f, 0.5f), PxVec3(1.f, 0.f, -0.f), PxVec3(-0.f, -1.f, -0.f), PxVec3(-0.f, 2.f, 0.f) },
+    };
+    const uint32_t NL = uint32_t(sizeof(lanes) / sizeof(lanes[0]));
+
+    std::vector<physx::PxgArticulationBlockLinkData> lkImg(1);
+    std::vector<physx::PxgArticulationBlockDofData> dfImg(1);
+    std::vector<physx::PxgArticulationBlockData> abImg(1);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+
+    std::vector<uint32_t> numLinks(32, 0u);
+    for (uint32_t lane = 0; lane < NL; ++lane)
+    {
+        numLinks[lane] = 1u;
+        laFill(lkImg.data(), dfImg.data(), abImg[0], /*k*/ 0u, 1u, lane);
+        PXG_CHECK(!laFixBase(0u) && !laMassless(0u));
+        const Lane& L = lanes[lane];
+        abImg[0].mCOM_TotalInvMassW[lane] = make_float4(L.com.x, L.com.y, L.com.z, 0.5f);
+        storeSpatialMatrix(abImg[0].mInvSpatialArticulatedInertia, lane,
+                           physx::Dy::SpatialMatrix(PxMat33(physx::PxZero), PxMat33(physx::PxZero), PxMat33(physx::PxZero)));
+        lkImg[0].mMass[lane] = L.mass;
+        storePxMat33(lkImg[0].mIsolatedInertia, lane, PxMat33(L.c0, L.c1, L.c2));
+        lkImg[0].mAccumulatedPose.p[lane] = make_float4(L.pos.x, L.pos.y, L.pos.z, 0.f);
+        storeSpatialVector(lkImg[0].mMotionVelocity, UnAlignedSpatialVector(L.top, L.bottom), lane);
+        storeSpatialVector(lkImg[0].mZAVector, UnAlignedSpatialVector(PxVec3(1.f), PxVec3(1.f)), lane);
+        storeSpatialVector(lkImg[0].mZAIntVector, UnAlignedSpatialVector(PxVec3(1.f), PxVec3(1.f)), lane);
+    }
+
+    std::vector<uint32_t> velPoison(size_t(32) * LA_VEL_SLOTS * 6);
+    for (size_t j = 0; j < velPoison.size(); ++j)
+        velPoison[j] = 0xAC000000u | uint32_t(j & 0xFFFFFFu);
+
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0, dCounts = 0, dVel = 0;
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memAlloc(&dCounts, numLinks.size() * sizeof(uint32_t));
+    shim.memAlloc(&dVel, velPoison.size() * 4);
+    if (!dLk || !dDf || !dAb || !dCounts || !dVel)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    for (uint32_t lane = 0; lane < 32; ++lane)
+        abImg[0].mMotionVelocitiesPtr[lane] = reinterpret_cast<UnAlignedSpatialVector*>(
+            dVel + PxgDevicePtr(size_t(lane) * LA_VEL_SLOTS * 6 * sizeof(float)));
+
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyHtoD(dCounts, numLinks.data(), numLinks.size() * sizeof(uint32_t));
+    shim.memcpyHtoD(dVel, velPoison.data(), velPoison.size() * 4);
+
+    struct Params
+    {
+        uint64_t artiBlock, linkBlocks, dofBlocks, numLinksPer;
+        float dt;
+        uint32_t nbLanes, pad0, pad1;
+    } prm = { uint64_t(dAb), uint64_t(dLk), uint64_t(dDf), uint64_t(dCounts), LA_DT, NL, 0, 0 };
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch artiLinkAcceleration");
+    shim.streamSynchronize();
+
+    std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
+    std::vector<uint32_t> gotVel(velPoison.size());
+    shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyDtoH(gotVel.data(), dVel, gotVel.size() * 4);
+
+    for (uint32_t lane = 0; lane < NL; ++lane)
+    {
+        UnAlignedSpatialVector want[2], flat[2][LA_VEL_SLOTS];
+        for (int twin = 0; twin < 2; ++twin)
+        {
+            std::vector<physx::PxgArticulationBlockLinkData> wLk = lkImg;
+            std::vector<physx::PxgArticulationBlockDofData> wDf = dfImg;
+            std::vector<physx::PxgArticulationBlockData> wAb = abImg;
+            gLaCompoundFoldTwin = (twin == 1);
+            laMirror(wLk.data(), wDf.data(), wAb[0], flat[twin], 1u, LA_DT, lane);
+            gLaCompoundFoldTwin = false;
+            want[twin] = loadSpatialVector(wLk[0].mMotionVelocity, lane);
+        }
+        PXG_CHECK_MSG(std::memcmp(&want[0], &want[1], sizeof(want[0])) != 0,
+                      "lane %u: the folded-seed twin does not change mMotionVelocity", lane);
+        const UnAlignedSpatialVector got = loadSpatialVector(gotLk[0].mMotionVelocity, lane);
+        const float* w = &want[0].top.x;
+        const float* g = &got.top.x;
+        for (int j = 0; j < 6; ++j)
+            PXG_CHECK_MSG(f2u(w[j]) == f2u(g[j]), "lane %u mMotionVelocity[%d]: gpu %08x cuda %08x (twin %08x)", lane, j,
+                          f2u(g[j]), f2u(w[j]), f2u((&want[1].top.x)[j]));
+        const uint32_t* gv = gotVel.data() + size_t(lane) * LA_VEL_SLOTS * 6;
+        const float* fw = &flat[0][0].top.x;
+        for (int j = 0; j < 6; ++j)
+            PXG_CHECK_MSG(f2u(fw[j]) == gv[j], "lane %u flat vel[%d]: gpu %08x cuda %08x", lane, j, gv[j], f2u(fw[j]));
+    }
+
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
+    shim.memFree(dCounts);
+    shim.memFree(dVel);
+}
 
 // ---------------------------------------------------------------------------
 // P8.92c: the kernel

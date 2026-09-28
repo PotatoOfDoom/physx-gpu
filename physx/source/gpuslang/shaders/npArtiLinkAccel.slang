@@ -455,7 +455,13 @@ public void alaComputeLinkAcceleration(uint64_t artiBlock, uint64_t linkBlocks, 
     const AbSpatialVector zeroSV = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
     AbSpatialVector preMomentum = zeroSV;
     AbSpatialVector postMomentum = zeroSV;
-    AbMat33 compoundInertia = abMat33Zero();
+    // P9.86f: forwardDynamic2.cu:1946/:2111 is PxMat33(PxZero) grown by `+=`, so the root's term is
+    // IEEE `+0 + T` (a -0 element of T becomes +0).  A literal-zero seed reaches asmM33Add's nine
+    // adds straight-line after inlining and llvmpipe folds them (F3), so the seed is a RUNTIME zero
+    // (trap T8, as npArtiUpdateBodies1T's compound inertia; abs(dt) * 0 is asiRuntimeZero).
+    const float alaRz = abs(dt) * 0.0f;
+    const float3 alaRz3 = float3(alaRz, alaRz, alaRz);
+    AbMat33 compoundInertia = asmM33(alaRz3, alaRz3, alaRz3);
 
     // ---- 1. the root's EXTERNAL acceleration ----
     if (!fixBase)
