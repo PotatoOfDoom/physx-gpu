@@ -808,9 +808,15 @@ PXG_TEST(boxBoxNphase_materialZeroSign)
     // Coverage: every twin must change at least one of words 7-10 (FMin on pair 0; FMax on the
     // user eMAX pair 2 AND the forced-eMAX damping pair 4), the forced-eMAX damping must see the
     // (+0,-0) tie, and dynFriction = -0 must reach the clamp.
-    uint32_t twinChanged[4] = { 0, 0, 0, 0 }, dynNegZero = 0, forcedMaxTie = 0;
+    // Words 7-10 are only compared for pairs that write a patch (checkBoxBox skips nb == 0 and fails
+    // any pair whose GPU contact count differs from the reference), so every counter below is credited
+    // only for pairs whose reference produces contacts, and all directed pairs must produce them.
+    uint32_t twinChanged[4] = { 0, 0, 0, 0 }, dynNegZero = 0, forcedMaxTie = 0, patchPairs = 0;
     for (uint32_t p = 0; p < np; ++p)
     {
+        const RefPair R = refBoxBox(cfgs[p].box0e, cfgs[p].box1e, cfgs[p].xf0, cfgs[p].xf1, cfgs[p].cDist);
+        if (R.nbContacts <= 0) continue;
+        ++patchPairs;
         const HMaterial m0 = zeroSignMaterial(mp[p].a), m1 = zeroSignMaterial(mp[p].b);
         uint32_t fl;
         float w0[4], d0;
@@ -828,8 +834,10 @@ PXG_TEST(boxBoxNphase_materialZeroSign)
         }
     }
     std::printf("  [materialZeroSign] twin changes: FMin=%u FMax=%u fDynFMax=%u; forced-MAX ties=%u; "
-                "dynFriction -0 at clamp=%u\n", twinChanged[1], twinChanged[2], twinChanged[3], forcedMaxTie, dynNegZero);
-    const uint32_t minChanged[4] = { 0u, 1u, 2u, 1u };
+                "dynFriction -0 at clamp=%u; patch pairs=%u/%u\n", twinChanged[1], twinChanged[2], twinChanged[3], forcedMaxTie, dynNegZero, patchPairs, np);
+    PXG_CHECK_MSG(patchPairs == np, "materialZeroSign: only %u of %u directed pairs write a patch, words 7-10 unobserved",
+                  patchPairs, np);
+    const uint32_t minChanged[4] = { 0u, 1u, 2u, 4u };
     for (int v = 1; v <= 3; ++v)
         PXG_CHECK_MSG(twinChanged[v] >= minChanged[v],
                       "mutant twin %d changes the patch words of %u pairs, need %u -- the case does not observe it",
