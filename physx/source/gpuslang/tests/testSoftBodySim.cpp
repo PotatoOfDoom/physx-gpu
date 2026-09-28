@@ -1342,6 +1342,12 @@ PXG_TEST(softBodySimApplyExternalDeltas)
                      0.023f * float(i) + 0.013f, ws[i] };
         deltaPos[i] = { 0.101f * float(i), -0.203f * float(i), 0.307f * float(i), 77.0f };
     }
+    // P9.86: vertex 6 is PINNED with a -0 inverse mass (legal: every consumer tests
+    // w != 0 / w > 0, and the user writes the sim position/invMass buffer directly).  The
+    // CUDA's w lanes are IEEE `pos.w + 0.f` / `deltaPos.w + 0.f` (softBodyGM.cu:2652/2656)
+    // -> +0; a folded literal-zero w lane would keep -0.  vel.w = -0 pins the computed-zero
+    // velocity lane (`vel.w + 0*invDt`, +0 on both sides).
+    pos[6].w = -0.0f; deltaPos[6].w = -0.0f; vel[6].w = -0.0f;
 
     DevBuf bPos = makeDev(dev, pos);
     DevBuf bVel = makeDev(dev, vel);
@@ -1373,7 +1379,7 @@ PXG_TEST(softBodySimApplyExternalDeltas)
     for (uint32_t i = 0; i < N; ++i)
     {
         F4 d = delta[i];
-        const float scale = 1.0f / std::fmax(d.w, 1.0f);
+        const float scale = 1.0f / ((d.w > 1.0f) ? d.w : 1.0f);   // PxMax<float> = selectMax (softBodyGM.cu:2644)
         d.x *= scale; d.y *= scale; d.z *= scale;
         d.w = 0.0f;
         refVel[i] = { vel[i].x + d.x * invDt, vel[i].y + d.y * invDt,
@@ -1413,6 +1419,16 @@ PXG_TEST(softBodySimApplyExternalDeltas)
     PXG_CHECK_MSG(f2u(gPos[5].x) == f2u(expectX5),
                   "vertex 5 (delta.w == 0.5) must clamp the divisor to 1: ref %g got %g", expectX5, gPos[5].x);
     PXG_CHECK_MSG(mm == 0, "sb_gm_applyExternalDeltasLaunch bit-exact vs CPU (%zu mismatches)", mm);
+    // P9.86 coverage: exactly one -0 inverse mass meets the literal +0 w lane, and the
+    // IEEE reference turns it into +0.
+    uint32_t negZeroInvMass = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (f2u(pos[i].w) == 0x80000000u && f2u(refPos[i].w) == 0u &&
+            f2u(deltaPos[i].w) == 0x80000000u && f2u(refDeltaPos[i].w) == 0u) ++negZeroInvMass;
+    PXG_CHECK_MSG(negZeroInvMass == 1u, "a -0 inverse mass must meet the literal +0 w lane (%u)", negZeroInvMass);
+    PXG_CHECK_MSG(f2u(gPos[6].w) == 0u && f2u(gDeltaPos[6].w) == 0u && f2u(gVel[6].w) == 0u,
+                  "vertex 6's -0 inverse mass must come back +0 (pos %08x deltaPos %08x vel %08x)",
+                  f2u(gPos[6].w), f2u(gDeltaPos[6].w), f2u(gVel[6].w));
 
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
     dev->destroyBuffer(bDeltaPos.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
@@ -1805,6 +1821,12 @@ static float det3(const M3& m) { float c[3]; cross3(m.c1, m.c2, c); return dot3(
 
 struct Material { float youngs, poissons, elasticityDamping, dampingScale; uint32_t model; };
 
+// P9.86 mutant twin (0 = the CUDA).  1 replays a port whose ARAP-call accumulate lost the
+// IEEE `+0 + x`: the PxMat33(PxZero) seed of tetrahedronsSolveGM (softBodyGM.cu:1122) is
+// forwarded into `dl += deltaLambda*dCdx` (:601-603) and llvmpipe folds the literal-zero
+// add, so a -0 product survives where the CUDA stores +0.
+static int gDlSeedFoldVariant = 0;
+
 static void computeDCdx(const M3& d, const M3& m, float* dCdx1, float* dCdx2, float* dCdx3)
 {
     const float r0[3] = { m.c0[0], m.c1[0], m.c2[0] };
@@ -1820,7 +1842,8 @@ static void computeDCdx(const M3& d, const M3& m, float* dCdx1, float* dCdx2, fl
 
 static void computeDeltaLambdaXGradC(M3& dl, float& lambda, float C, const M3& dCdF, const M3& DmInv,
                                      const F4& v0, const F4& v1, const F4& v2, const F4& v3,
-                                     float alphaTilde, float dtInv, float damping, float scaledDamping)
+                                     float alphaTilde, float dtInv, float damping, float scaledDamping,
+                                     bool seedFold = false)
 {
     float dCdx1[3], dCdx2[3], dCdx3[3];
     computeDCdx(dCdF, DmInv, dCdx1, dCdx2, dCdx3);
@@ -1847,7 +1870,10 @@ static void computeDeltaLambdaXGradC(M3& dl, float& lambda, float C, const M3& d
     }
     lambda += deltaLambda;
     for (int i = 0; i < 3; ++i)
-    { dl.c0[i] += deltaLambda*dCdx1[i]; dl.c1[i] += deltaLambda*dCdx2[i]; dl.c2[i] += deltaLambda*dCdx3[i]; }
+    {
+        if (seedFold) { dl.c0[i] = deltaLambda*dCdx1[i]; dl.c1[i] = deltaLambda*dCdx2[i]; dl.c2[i] = deltaLambda*dCdx3[i]; }
+        else { dl.c0[i] += deltaLambda*dCdx1[i]; dl.c1[i] += deltaLambda*dCdx2[i]; dl.c2[i] += deltaLambda*dCdx3[i]; }
+    }
 }
 
 static void arapConstraint(M3& dl, float& lambda, const F4& v0, const F4& v1, const F4& v2, const F4& v3,
@@ -1860,7 +1886,8 @@ static void arapConstraint(M3& dl, float& lambda, const F4& v0, const F4& v1, co
     const float ARAP_C = std::sqrt(dot3(t.c0,t.c0) + dot3(t.c1,t.c1) + dot3(t.c2,t.c2) + 1.0e-18f);
     const float inv = 1.0f / ARAP_C;
     scale3(t.c0, inv, t.c0); scale3(t.c1, inv, t.c1); scale3(t.c2, inv, t.c2);
-    computeDeltaLambdaXGradC(dl, lambda, ARAP_C, t, DmInv, v0, v1, v2, v3, alphaTilde, dtInv, damping, scaledDamping);
+    computeDeltaLambdaXGradC(dl, lambda, ARAP_C, t, DmInv, v0, v1, v2, v3, alphaTilde, dtInv, damping, scaledDamping,
+                             gDlSeedFoldVariant == 1);
 }
 
 static void volumeConstraint(M3& dl, float& lambda, const F4& v0, const F4& v1, const F4& v2, const F4& v3,
@@ -2262,6 +2289,229 @@ PXG_TEST(softBodySimSolveCorotationalDamped) { runSolveTetraPartition(0u, /*isTG
 PXG_TEST(softBodySimSolveCorotationalTGS) { runSolveTetraPartition(0u, /*isTGS*/ true, /*damping*/ 0.0f); }
 PXG_TEST(softBodySimSolveNeoHookeanPGS) { runSolveTetraPartition(1u, /*isTGS*/ false, /*damping*/ 0.0f); }
 PXG_TEST(softBodySimSolveNeoHookeanTGS) { runSolveTetraPartition(1u, /*isTGS*/ true, /*damping*/ 0.0f); }
+
+// ---------------------------------------------------------------------------
+// P9.86: sb_gm_cp_solveTetrahedronsPartitionLaunch on RESTING unit tets, compared
+// BITWISE.  Co-rotational, TGS, undamped, poissons = 0 (the volume pass is skipped in
+// both the CUDA, softBodyGM.cu:1004, and the port), Qinv = I, tetRot = identity, so
+// F = R = I exactly: every ARAP dCdx lane is an exact +0, C = sqrt(1e-18) and
+// deltaLambda = -C/alphaTilde0 < 0, so every product deltaLambda*dCdx is -0.  The CUDA
+// accumulates it onto the PxMat33(PxZero) seed (softBodyGM.cu:1122, :601-603) and holds
+// +0; a port that folds the literal-zero seed add keeps -0.  The sign reaches the scatter
+// (softBodyGM.cu:1136-1145) through a zero operand of the other sign:
+//   tet 0: +0 coordinates, gathered velocities (-0,-0,-0) (a body damped to rest)
+//          -> the 12 x/y/z velocity lanes of slots 0-3;
+//   tet 1: -0 zero coordinates, velocities +0 -> 9 position lanes of slots 4-7.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimSolveCorotationalRestZeroSign)
+{
+    using namespace p80solve;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t nbTets = 2;
+    const float invDt = 60.0f;
+    const float W[4] = { 1.0f, 0.5f, 2.0f, 0.25f };
+
+    std::vector<F4> unPos(8), unVel(8);
+    const float nz = -0.0f;
+    // tet 0: verts 0-3, +0 coordinates, -0 velocities
+    unPos[0] = { 0.0f, 0.0f, 0.0f, W[0] };
+    unPos[1] = { 1.0f, 0.0f, 0.0f, W[1] };
+    unPos[2] = { 0.0f, 1.0f, 0.0f, W[2] };
+    unPos[3] = { 0.0f, 0.0f, 1.0f, W[3] };
+    for (uint32_t i = 0; i < 4; ++i) unVel[i] = { nz, nz, nz, W[i] };
+    // tet 1: verts 4-7, -0 zero coordinates, +0 velocities
+    unPos[4] = { nz, nz, nz, W[0] };
+    unPos[5] = { 1.0f, nz, nz, W[1] };
+    unPos[6] = { nz, 1.0f, nz, W[2] };
+    unPos[7] = { nz, nz, 1.0f, W[3] };
+    for (uint32_t i = 0; i < 4; ++i) unVel[4 + i] = { 0.0f, 0.0f, 0.0f, W[i] };
+
+    std::vector<F4> cpPos(8, F4{ 777.0f, 777.0f, 777.0f, 777.0f }), cpVel = cpPos;
+    std::vector<p80refit::TetIdx4> pull = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u } };
+    std::vector<p80refit::TetIdx4> remap = pull;
+
+    M3 rest[2];
+    for (uint32_t t = 0; t < nbTets; ++t)
+    {
+        rest[t] = M3{};
+        rest[t].c0[0] = 1.0f; rest[t].c1[1] = 1.0f; rest[t].c2[2] = 1.0f;
+    }
+    std::vector<uint32_t> restWords(MAT33_BLOCK_WORDS, 0u);
+    for (uint32_t t = 0; t < nbTets; ++t)
+    {
+        const uint32_t lane = t & 31u; const M3& m = rest[t];
+        restWords[lane*4+0]=f2u(m.c0[0]); restWords[lane*4+1]=f2u(m.c0[1]);
+        restWords[lane*4+2]=f2u(m.c0[2]); restWords[lane*4+3]=f2u(m.c1[0]);
+        restWords[MAT33_BLOCK_COL1_WORD+lane*4+0]=f2u(m.c1[1]);
+        restWords[MAT33_BLOCK_COL1_WORD+lane*4+1]=f2u(m.c1[2]);
+        restWords[MAT33_BLOCK_COL1_WORD+lane*4+2]=f2u(m.c2[0]);
+        restWords[MAT33_BLOCK_COL1_WORD+lane*4+3]=f2u(m.c2[1]);
+        restWords[MAT33_BLOCK_COL2_WORD+lane]=f2u(m.c2[2]);
+    }
+    std::vector<F4> tetRot(nbTets, F4{ 0.0f, 0.0f, 0.0f, 1.0f });
+    std::vector<uint32_t> mult(SPATIAL_BLOCK_WORDS, 0u);
+
+    std::vector<uint32_t> matWords(8, 0u);
+    const float youngs = 1.0e5f, poissons = 0.0f;
+    const uint16_t dampingScaleU16 = 32768u;
+    matWords[0] = f2u(youngs);
+    matWords[1] = f2u(poissons);
+    matWords[2] = f2u(0.0f);
+    matWords[3] = f2u(0.0f);                     // elasticityDamping
+    matWords[4] = uint32_t(dampingScaleU16) | (0u << 16);   // eCO_ROTATIONAL
+    std::vector<uint16_t> matIdx(4u + 8u, 0u);
+    std::vector<uint32_t> partitions = { nbTets, 0u, 0u, 0u, 0u };
+
+    std::vector<F4> cpPosP = cpPos; cpPosP.resize(cpPos.size() + 64, F4{0,0,0,0});
+    std::vector<F4> cpVelP = cpVel; cpVelP.resize(cpVel.size() + 64, F4{0,0,0,0});
+    std::vector<F4> unPosP = unPos; unPosP.resize(unPos.size() + 64, F4{0,0,0,0});
+    std::vector<F4> unVelP = unVel; unVelP.resize(unVel.size() + 64, F4{0,0,0,0});
+    std::vector<p80refit::TetIdx4> pullP = pull; pullP.resize(pull.size() + 64, {0,0,0,0});
+    std::vector<p80refit::TetIdx4> remapP = remap; remapP.resize(remap.size() + 64, {0,0,0,0});
+    std::vector<uint32_t> restP = restWords; restP.resize(restWords.size() + 512, 0u);
+    std::vector<F4> tetRotP = tetRot; tetRotP.resize(tetRot.size() + 64, F4{0,0,0,1});
+    std::vector<uint32_t> multP = mult; multP.resize(mult.size() + 512, 0u);
+    std::vector<uint32_t> matP = matWords; matP.resize(matWords.size() + 64, 0u);
+    DevBuf bCpPos = makeDev(dev, cpPosP), bCpVel = makeDev(dev, cpVelP);
+    DevBuf bUnPos = makeDev(dev, unPosP), bUnVel = makeDev(dev, unVelP);
+    DevBuf bPull = makeDev(dev, pullP), bRemap = makeDev(dev, remapP);
+    DevBuf bRest = makeDev(dev, restP), bRot = makeDev(dev, tetRotP);
+    DevBuf bMult = makeDev(dev, multP), bMat = makeDev(dev, matP);
+    DevBuf bMatIdx = makeDev(dev, matIdx), bPart = makeDev(dev, partitions);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimPosition_InvMassCP = reinterpret_cast<float4*>(size_t(bCpPos.addr));
+    c.mSimVelocity_invMassCP = reinterpret_cast<float4*>(size_t(bCpVel.addr));
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bUnPos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bUnVel.addr));
+    c.mSimPullIndices = reinterpret_cast<decltype(c.mSimPullIndices)>(size_t(bPull.addr));
+    c.mSimRemapOutputCP = reinterpret_cast<decltype(c.mSimRemapOutputCP)>(size_t(bRemap.addr));
+    c.mSimTetraRestPoses = reinterpret_cast<decltype(c.mSimTetraRestPoses)>(size_t(bRest.addr));
+    c.mSimTetraRotations = reinterpret_cast<float4*>(size_t(bRot.addr));
+    c.mSimTetraMultipliers = reinterpret_cast<decltype(c.mSimTetraMultipliers)>(size_t(bMult.addr));
+    c.mOrderedMaterialIndices = reinterpret_cast<PxU16*>(size_t(bMatIdx.addr));
+    c.mSimAccumulatedPartitionsCP = reinterpret_cast<PxU32*>(size_t(bPart.addr));
+    c.mNumTetsGM = nbTets;
+    c.mNumPartitionsGM = 1u;
+    c.mNumTetsPerElement = 1u;
+    c.mInitialRotation = PxQuat(0.0f, 0.0f, 0.0f, 1.0f);
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    SolveTetraPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.numActiveSoftbodies = 1u;
+    push.invDt = invDt;
+    push.partitionId = 0u;
+    push.flagsWord = 1u;   // TGS, isFirstIteration = false
+    push.materials = bMat.addr;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch", {}, sizeof(SolveTetraPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference (variant 0 = the CUDA, 1 = the seed-fold twin) ------
+    const float invDtSq = invDt * invDt;
+    const Material mat = { youngs, poissons, 0.0f, float(dampingScaleU16) * (1.0f/65535.0f), 0u };
+    auto ref = [&](int variant, std::vector<F4>& rp, std::vector<F4>& rv, Q4 rq[2]) {
+        rp = cpPos; rv = cpVel;
+        for (uint32_t t = 0; t < nbTets; ++t)
+        {
+            const uint32_t pi[4] = { pull[t].x, pull[t].y, pull[t].z, pull[t].w };
+            F4 p[4], v[4];
+            for (uint32_t i = 0; i < 4; ++i) { p[i] = unPos[pi[i]]; v[i] = unVel[pi[i]]; }
+            const float u1[3] = { p[1].x-p[0].x, p[1].y-p[0].y, p[1].z-p[0].z };
+            const float u2[3] = { p[2].x-p[0].x, p[2].y-p[0].y, p[2].z-p[0].z };
+            const float u3[3] = { p[3].x-p[0].x, p[3].y-p[0].y, p[3].z-p[0].z };
+            M3 U; for (int i=0;i<3;++i){ U.c0[i]=u1[i]; U.c1[i]=u2[i]; U.c2[i]=u3[i]; }
+            M3 Fm; mat33Mul(U, rest[t], Fm);
+            Q4 q = { tetRot[t].x, tetRot[t].y, tetRot[t].z, tetRot[t].w };
+            q = p80rot::extractRotation(Fm, q, 4);
+            rq[t] = q;
+
+            float mbyz[2] = { 0.0f, 0.0f };   // read only under PGS
+            gDlSeedFoldVariant = variant;
+            M3 dl;
+            solveGM(dl, u1, u2, u3, v[0], v[1], v[2], v[3], mbyz, invDtSq, invDt, rest[t], q, /*isTGS*/ true, mat);
+            gDlSeedFoldVariant = 0;
+
+            const uint32_t wi[4] = { remap[t].x, remap[t].y, remap[t].z, remap[t].w };
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                float dp[3];
+                if (i == 0) for (int j=0;j<3;++j) dp[j] = -(dl.c0[j] + dl.c1[j] + dl.c2[j]) * p[i].w;
+                else { const float* cc = (i==1)?dl.c0:((i==2)?dl.c1:dl.c2); for (int j=0;j<3;++j) dp[j] = cc[j]*p[i].w; }
+                rp[wi[i]] = { p[i].x+dp[0], p[i].y+dp[1], p[i].z+dp[2], p[i].w };
+                rv[wi[i]] = { v[i].x+dp[0]*invDt, v[i].y+dp[1]*invDt, v[i].z+dp[2]*invDt, v[i].w };
+            }
+        }
+    };
+    std::vector<F4> wantPos, wantVel, twinPos, twinVel;
+    Q4 wantQ[2], twinQ[2];
+    ref(0, wantPos, wantVel, wantQ);
+    ref(1, twinPos, twinVel, twinQ);
+
+    // Coverage: the twin must flip exactly the 12 velocity lanes of tet 0 and the 9
+    // position lanes of tet 1 (everything else identical), and the -0 inputs must be there.
+    uint32_t velFlip = 0, posFlip = 0, otherFlip = 0, negZeroVelIn = 0;
+    for (uint32_t s = 0; s < 8; ++s)
+    {
+        const float wp[3] = { wantPos[s].x, wantPos[s].y, wantPos[s].z };
+        const float tp[3] = { twinPos[s].x, twinPos[s].y, twinPos[s].z };
+        const float wv[3] = { wantVel[s].x, wantVel[s].y, wantVel[s].z };
+        const float tv[3] = { twinVel[s].x, twinVel[s].y, twinVel[s].z };
+        for (int e = 0; e < 3; ++e)
+        {
+            const bool pf = f2u(wp[e]) != f2u(tp[e]), vf = f2u(wv[e]) != f2u(tv[e]);
+            if (s < 4) { velFlip += vf ? 1u : 0u; otherFlip += pf ? 1u : 0u; }
+            else { posFlip += pf ? 1u : 0u; otherFlip += vf ? 1u : 0u; }
+        }
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+        negZeroVelIn += (f2u(unVel[i].x) == 0x80000000u) + (f2u(unVel[i].y) == 0x80000000u) + (f2u(unVel[i].z) == 0x80000000u);
+    PXG_CHECK_MSG(velFlip == 12u && posFlip == 9u && otherFlip == 0u && negZeroVelIn == 12u,
+                  "the seed-fold twin must flip 12 velocity + 9 position lanes (vel %u pos %u other %u, -0 vel in %u)",
+                  velFlip, posFlip, otherFlip, negZeroVelIn);
+
+    const auto gPos = downloadBuffer<F4>(dev, bCpPos.h, cpPos.size());
+    const auto gVel = downloadBuffer<F4>(dev, bCpVel.h, cpVel.size());
+    const auto gRot = downloadBuffer<F4>(dev, bRot.h, nbTets);
+
+    // Precondition: the rotation refresh is exact at the identity (the sin/cos seam of the
+    // tolerance-based cases contributes nothing here).
+    for (uint32_t t = 0; t < nbTets; ++t)
+        PXG_CHECK_MSG(f2u(gRot[t].x) == 0u && f2u(gRot[t].y) == 0u && f2u(gRot[t].z) == 0u &&
+                      f2u(gRot[t].w) == 0x3f800000u && f2u(wantQ[t].x) == 0u && f2u(wantQ[t].y) == 0u &&
+                      f2u(wantQ[t].z) == 0u && f2u(wantQ[t].w) == 0x3f800000u,
+                      "tet %u rotation must stay the exact identity (got %08x %08x %08x %08x)", t,
+                      f2u(gRot[t].x), f2u(gRot[t].y), f2u(gRot[t].z), f2u(gRot[t].w));
+
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+            f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%08x,%08x,%08x,%08x) got(%08x,%08x,%08x,%08x)\n", what, i,
+                            f2u(r.x), f2u(r.y), f2u(r.z), f2u(r.w), f2u(g.x), f2u(g.y), f2u(g.z), f2u(g.w)); } };
+    for (uint32_t s = 0; s < 8; ++s)
+    {
+        cmp("cpPos", s, wantPos[s], gPos[s]);
+        cmp("cpVel", s, wantVel[s], gVel[s]);
+    }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_cp_solveTetrahedronsPartitionLaunch rest tets bit-exact vs CUDA zero rule (%zu)", mm);
+    PXG_CHECK_MSG(f2u(gVel[0].x) == 0x80000000u && f2u(gVel[1].x) == 0u &&
+                  f2u(gPos[4].x) == 0x80000000u && f2u(gPos[5].y) == 0u,
+                  "rest-tet zero signs: vel0.x %08x (want -0) vel1.x %08x (want +0) pos4.x %08x (want -0) pos5.y %08x (want +0)",
+                  f2u(gVel[0].x), f2u(gVel[1].x), f2u(gPos[4].x), f2u(gPos[5].y));
+
+    dev->destroyBuffer(bCpPos.h); dev->destroyBuffer(bCpVel.h); dev->destroyBuffer(bUnPos.h);
+    dev->destroyBuffer(bUnVel.h); dev->destroyBuffer(bPull.h); dev->destroyBuffer(bRemap.h);
+    dev->destroyBuffer(bRest.h); dev->destroyBuffer(bRot.h); dev->destroyBuffer(bMult.h);
+    dev->destroyBuffer(bMat.h); dev->destroyBuffer(bMatIdx.h); dev->destroyBuffer(bPart.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
 
 // MINIMAL REPRO, NOT REGISTERED.  Dispatch only — no CPU reference, no comparison, no
 // downloads, dummy rest poses.  It still SIGSEGVs, which is what proves the tranche-6
@@ -3891,6 +4141,11 @@ PXG_TEST(softBodySimApplyDeformationDeltas)
                      0.023f * float(i) + 0.013f, ws[i] };
         deltaPos[i] = { 0.101f * float(i), -0.203f * float(i), 0.307f * float(i), 77.0f };
     }
+    // P9.86: Jacobi vertex 7 (lane 2) is PINNED with a -0 inverse mass; the CUDA's IEEE
+    // `pos.w + 0.f` / `deltaPos.w + 0.f` (softBodyGM.cu:2707/2710) gives +0.  Vertex 6 is
+    // outside the subset and must keep its -0 bits.
+    pos[7].w = -0.0f; deltaPos[7].w = -0.0f; vel[7].w = -0.0f;
+    pos[6].w = -0.0f; deltaPos[6].w = -0.0f;
 
     DevBuf bPos = makeDev(dev, pos), bVel = makeDev(dev, vel);
     DevBuf bDelta = makeDev(dev, delta), bDeltaPos = makeDev(dev, deltaPos);
@@ -3954,6 +4209,21 @@ PXG_TEST(softBodySimApplyDeformationDeltas)
         cmp("deltaPos", i, refDeltaPos[i], gDeltaPos[i]);
     }
     PXG_CHECK_MSG(mm == 0, "sb_gm_applyDeformationDeltasLaunch bit-exact vs CPU (%zu mismatches)", mm);
+    // P9.86 coverage: exactly one Jacobi vertex carries a -0 inverse mass into the literal
+    // +0 w lane, and the IEEE reference turns it into +0.
+    uint32_t negZeroJacobi = 0;
+    for (uint32_t lane = 0; lane < nbJacobi; ++lane)
+    {
+        const uint32_t v = jacobiIdx[lane];
+        if (f2u(pos[v].w) == 0x80000000u && f2u(refPos[v].w) == 0u &&
+            f2u(deltaPos[v].w) == 0x80000000u && f2u(refDeltaPos[v].w) == 0u) ++negZeroJacobi;
+    }
+    PXG_CHECK_MSG(negZeroJacobi == 1u, "a -0 Jacobi inverse mass must meet the literal +0 w lane (%u)", negZeroJacobi);
+    PXG_CHECK_MSG(f2u(gPos[7].w) == 0u && f2u(gDeltaPos[7].w) == 0u && f2u(gVel[7].w) == 0u,
+                  "Jacobi vertex 7's -0 inverse mass must come back +0 (%08x %08x %08x)",
+                  f2u(gPos[7].w), f2u(gDeltaPos[7].w), f2u(gVel[7].w));
+    PXG_CHECK_MSG(f2u(gPos[6].w) == 0x80000000u && f2u(gDeltaPos[6].w) == 0x80000000u,
+                  "vertex 6 is outside the Jacobi subset and must keep its -0 inverse mass");
 
     // Teeth 1 — mJacobiScale, not 1/max(delta.w,1).  Vertex 2 carries delta.w == 4, so
     // the external-delta rule would scale by 0.25 while this kernel must scale by 0.375.
