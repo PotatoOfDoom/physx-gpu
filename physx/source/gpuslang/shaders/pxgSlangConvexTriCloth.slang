@@ -230,7 +230,11 @@ Mat33 findRotationMatrixFromZ(float3 to)
         const float3 from = float3(0, 0, 1);
         const float3 absFrom = float3(0, 1, 0);
         const float3 u = absFrom - from;
-        const float3 v = absFrom - to;
+        // P9.86c: femClothPrimitives.cu:1016's `absFrom - to` is 0 - to.x in lane x, +0 for
+        // to.x = +0, but llvmpipe rewrites OpFSub(literal 0, x) to -x (F2): spell lane x as the
+        // select it amounts to.  (Lane z is -to.z exactly: |to.z| > 0.9999 in this branch.)
+        float3 v = absFrom - to;
+        v.x = (to.x == 0.0f) ? 0.0f : -to.x;
         const float c1 = -(2.0f / dot(u, u));
         const float c2 = -(2.0f / dot(v, v));
         const float c3 = c1 * c2 * dot(u, v);

@@ -262,6 +262,14 @@ struct M33 { V3 c0, c1, c2; };
 static V3 mT(const M33& m, V3 v) { return add(add(mul(m.c0, v.x), mul(m.c1, v.y)), mul(m.c2, v.z)); }
 static V3 mTT(const M33& m, V3 v) { return { dot3(m.c0, v), dot3(m.c1, v), dot3(m.c2, v) }; }
 
+// P9.86c: mutant twins of the port's findRotationMatrixFromZ as llvmpipe would run it
+// without the P9.86 spellings (see PXG_TEST fcConvexTri_contactGenRotLaneZeroSign).
+// 0 -- the default, and the only value outside that test -- is the CUDA read as IEEE.
+//   1: col2 without the x lane of `+ u * c1u.z` (a literal +0 lane: F3 folds it away)
+//   2: col0 without the z lane of `+ u * c1u.x` (the same fold, the other select)
+//   4: v.x = -to.x instead of 0 - to.x (F2: OpFSub(literal 0, x) becomes -x)
+static int gRotZLaneVariant = 0;
+
 static M33 findRotZ(V3 to, Slack& sl)
 {
     sl.noteSc(std::fabs(to.z), 0.9999f, 1.0f, 21);
@@ -279,14 +287,20 @@ static M33 findRotZ(V3 to, Slack& sl)
     else
     {
         const V3 from = { 0, 0, 1 }, absFrom = { 0, 1, 0 };
-        const V3 u = sub(absFrom, from), v = sub(absFrom, to);
+        const V3 u = sub(absFrom, from);
+        V3 v = sub(absFrom, to);
+        if (gRotZLaneVariant & 4) v.x = -to.x;
         const float c1 = -(2.0f / dot3(u, u));
         const float c2 = -(2.0f / dot3(v, v));
         const float c3 = c1 * c2 * dot3(u, v);
         const V3 c1u = mul(u, c1), c2v = mul(v, c2), c3v = mul(v, c3);
-        V3 col0 = add(add(mul(u, c3v.x), mul(v, c2v.x)), mul(u, c1u.x)); col0.x += 1.0f;
+        V3 col0 = add(add(mul(u, c3v.x), mul(v, c2v.x)), mul(u, c1u.x));
+        if (gRotZLaneVariant & 2) col0.z = u.z * c3v.x + v.z * c2v.x;
+        col0.x += 1.0f;
         V3 col1 = add(add(mul(u, c3v.y), mul(v, c2v.y)), mul(u, c1u.y)); col1.y += 1.0f;
-        V3 col2 = add(add(mul(u, c3v.z), mul(v, c2v.z)), mul(u, c1u.z)); col2.z += 1.0f;
+        V3 col2 = add(add(mul(u, c3v.z), mul(v, c2v.z)), mul(u, c1u.z));
+        if (gRotZLaneVariant & 1) col2.x = u.x * c3v.z + v.x * c2v.z;
+        col2.z += 1.0f;
         m.c0 = col0; m.c1 = col1; m.c2 = col2;
     }
     return m;
@@ -1569,6 +1583,316 @@ PXG_TEST(fcConvexTri_contactGen)
         PXG_CHECK_MSG(leaked == 0,
                       "%zu writer slots at or past the %u-contact cap were written", leaked, SMALL);
     }
+
+    for (PxgBufferHandle h : { bC, bH, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.86c -- THE SIGNED ZEROS OF findRotationMatrixFromZ (femClothPrimitives.cu:988-1050).
+//
+// In the |to.z| > 0.9999 branch the rotation adds two constant vectors with literal
+// zero lanes: col0 gets u * c1u.x = (-0, -0, +0) (:1031) and col2 gets u * c1u.z =
+// (+0, 1, -1) (:1046).  IEEE turns a zero sum into +0 when it adds that +0; llvmpipe
+// drops the +0 lanes (F3), so the port spells col0.z and col2.x as selects.  And
+// v = absFrom - to (:1016) is 0 - to.x in lane x, which llvmpipe rewrites to -to.x
+// (F2): -0 where the CUDA has +0 when to.x = +0.
+//
+// The random battery above never sees any of it.  The rotation's zero lanes are
+// signed differently only when the SAT axis has x = +-0, and even then they reach an
+// output in two narrow ways only -- the rotated points feed comparisons and the
+// segment intersection, whose zero components come out +0:
+//   * the transpose dot  contactPoint = rot^T * pBB  of a phase-3 crossing whose
+//     other terms are zeros as well: a triangle edge ON the rotated x axis (case A);
+//   * a crossing point whose x is -0 because t1 * (rpB.x - rpA.x) underflows to +0:
+//     a triangle vertex at x = -0 within 2^-24 (in t1) of the polygon edge it crosses,
+//     and the edge's other end at x = -FLT_MIN (cases C and D).
+// Every input is a NORMAL float.  The world transform keeps the sign only when its
+// other terms are zeros of the same sign, hence a convexQ with -0 imaginary parts (the
+// conjugate of the identity, or one negated zero) and convexP lanes of -0.
+//
+//   A  box z in [0.05, 2.05]; TRI axis to = (-0, +0.01, -0.99995), the triangle edge
+//      t0-t1 on the local x axis.  CUDA col2.x = +0, -0 without the select: slot 2's
+//      world z flips from -0 to +0.                                     (twin bit 1)
+//   C  box y in [-2, ~2^-11]; TRI axis to = (-0, -0.0078, -0.99997).  CUDA col0.z = +0,
+//      -0 without the select: slot 1's world x flips from +0 to -0.     (twin bit 2)
+//   D  a bottom face tilted about x, normal (+0, s, -c), wins the SAT, so to.x = +0.
+//      CUDA v.x = +0, F2 gives -0: col0.y and col1.x turn +0, triangle vertex t0 =
+//      (-0, +0, -0) rotates to x = +0, and slot 1's world x flips from -0 to +0.
+//      (twin bit 4; the col2.x twin flips it too, through rot * t0)
+// The polygon-edge positions of C and D (their hulls' yhi) sit inside windows of about
+// 2000 ulps where the underflow happens; they were chosen in the middle.
+//
+// Every lane these cases write is compared BITWISE -- the directed inputs are exact,
+// so nothing here needs the battery's tolerances or its firm/soft split.
+// ---------------------------------------------------------------------------
+
+// The box's vertex/face/edge numbering: x in [xlo, xhi], y in [ylo, yhi], top face z =
+// ztop, bottom face (index 5) the plane {nb, wb} with nb.x = 0 (a tilt about x) and its
+// four vertices on it.  nb = (0, 0, -1) is an axis-aligned box.
+static Hull makeRotLaneHull(float xlo, float xhi, float ylo, float yhi, float ztop, V3 nb, float wb)
+{
+    Hull h = makeBox(1, 1, 1); // faces and edgeFaces
+    h.verts.clear();
+    for (int i = 0; i < 8; ++i)
+    {
+        const float y = (i & 2) ? yhi : ylo;
+        h.verts.push_back({ (i & 1) ? xhi : xlo, y, (i & 4) ? ztop : (nb.y * y + wb) / -nb.z });
+    }
+    h.planes = { { 1, 0, 0, -xhi }, { -1, 0, 0, xlo }, { 0, 1, 0, -yhi },
+                 { 0, -1, 0, ylo }, { 0, 0, 1, -ztop }, { nb.x, nb.y, nb.z, wb } };
+    return h;
+}
+
+// The SAT axis the battery's reference derives for a verdict (featureIndex).
+static V3 rotLaneMinNormal(const Hull& H, const FctCase& cs, uint32_t feature)
+{
+    if (feature == TRI_FEAT)
+        return mul(v3f(cs.triNormal), -1.0f);
+    const V3 scale = { cs.convexScale.x, cs.convexScale.y, cs.convexScale.z };
+    const V3 n = v2sNormal({ H.planes[feature].x, H.planes[feature].y, H.planes[feature].z }, scale,
+                           cs.convexScaleRot);
+    const float invMag = 1.0f / std::sqrt(dot3(n, n));
+    return mul(n, invMag);
+}
+
+// The battery's per-face block (plane0, polyClip4, the barycentric gate, the world
+// transform) for a face that emits at most 5 contacts, so contactReduce never runs.
+// Returns false if it would.
+static bool rotLaneFaceContacts(const Hull& H, const FctCase& cs, V3 minNormal, uint32_t face,
+                                std::vector<RefContact>& out)
+{
+    const V3 scale = { cs.convexScale.x, cs.convexScale.y, cs.convexScale.z };
+    const F4 srot = cs.convexScaleRot;
+    const V3 t[3] = { v3f(cs.t0), v3f(cs.t1), v3f(cs.t2) };
+    const V3 nT = v3f(cs.triNormal);
+    const F4 triPlane = { nT.x, nT.y, nT.z, -dot3(t[0], nT) };
+    V3 p0n = v2sNormal({ H.planes[face].x, H.planes[face].y, H.planes[face].z }, scale, srot);
+    float p0d = H.planes[face].w;
+    const float dn = 1.0f / std::sqrt(dot3(p0n, p0n));
+    p0n = mul(p0n, dn);
+    p0d *= dn;
+    const F4 plane0 = { p0n.x, p0n.y, p0n.z, p0d };
+    std::vector<V3> pverts;
+    for (uint32_t idx : H.faces[face])
+        pverts.push_back(vertex2Shape(H.verts[idx], scale, srot));
+    float ct[NUMTMP * 8] = {};
+    Slack sl; // near-ties are inherent to C and D; the GPU compare is the arbiter
+    const uint32_t num = refPolyClip(pverts, (uint32_t)pverts.size(), minNormal, plane0, triPlane, t,
+                                     cs.convexScale.w, ct, sl);
+    std::vector<RefContact> faceCt;
+    for (uint32_t lane = 0; lane < 32 && lane < num; ++lane)
+    {
+        const V3 pa = { ct[8 * lane], ct[8 * lane + 1], ct[8 * lane + 2] };
+        const V3 e0 = sub(t[1], t[0]), e1 = sub(t[2], t[0]), e2 = sub(pa, t[0]);
+        const float d00 = dot3(e0, e0), d01 = dot3(e0, e1), d11 = dot3(e1, e1);
+        const float d20 = dot3(e2, e0), d21 = dot3(e2, e1);
+        const float dnm = d00 * d11 - d01 * d01;
+        const float bv = (d11 * d20 - d01 * d21) / dnm;
+        const float bw = (d00 * d21 - d01 * d20) / dnm;
+        const float bu = 1.0f - bv - bw;
+        if (!(bu >= -1e-4f && bu <= 1.0f + 1e-4f && bv >= -1e-4f && bv <= 1.0f + 1e-4f &&
+              bw >= -1e-4f && bw <= 1.0f + 1e-4f))
+            continue;
+        RefContact rc;
+        rc.p = add(quatRotate(cs.convexQ, pa), v3f(cs.convexP));
+        rc.n = quatRotate(cs.convexQ, { ct[8 * lane + 4], ct[8 * lane + 5], ct[8 * lane + 6] });
+        rc.sep = ct[8 * lane + 3];
+        rc.bary = { bu, bv, bw, 0 };
+        rc.firm = true;
+        faceCt.push_back(rc);
+    }
+    if (faceCt.size() > 5)
+        return false;
+    out.insert(out.end(), faceCt.begin(), faceCt.end());
+    return true;
+}
+
+PXG_TEST(fcConvexTri_contactGenRotLaneZeroSign)
+{
+    using btri::f2u;
+    auto u2f = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+    auto laneOf = [](const V3& v, int l) { return l == 0 ? v.x : (l == 1 ? v.y : v.z); };
+    const uint32_t NC = 3, CAP = 64, CLOTH = 17, POISON = 0xeeeeeeeeu, INFOPOISON = 0xdeadbeefu;
+
+    const V3 nD = getNorm0({ 0.0f, 1.0f / 128.0f, -1.0f });
+    const Hull hulls[NC] = {
+        makeRotLaneHull(-1, 1, -1, 1, 2.05f, { 0, 0, -1 }, 0.05f),                 // A
+        makeRotLaneHull(-1, 1, -2, u2f(0x3a000010u), 1, { 0, 0, -1 }, -1),          // C
+        makeRotLaneHull(-1, 1, -2, u2f(0xb9cccf33u), 2, nD, 0.05f),                  // D
+    };
+    std::vector<uint32_t> blob;
+    uint32_t ofs[NC];
+    for (uint32_t i = 0; i < NC; ++i)
+        hulls[i].serialize(blob, ofs[i]);
+
+    struct Directed
+    {
+        const char* name;
+        V3 t0, t1, t2;
+        F4 convexP, convexQ;
+        U4 dbg;             // expected (isSATPassed, featureIndex, face1, face2)
+        uint32_t minNx;     // minNormal.x the case is built on
+        float minNySign;    // sign of minNormal.y: c3 < 0 iff to.y > 0
+        uint32_t slot;      // the slot whose world point carries the sign
+        int lane;           // ... in this lane
+        uint32_t cudaBits;  // ... with these bits under the CUDA semantics
+        int twin;           // the gRotZLaneVariant bit that flips it
+    };
+    const float fmin = u2f(0x00800000u); // FLT_MIN
+    const Directed dc[NC] = {
+        { "A", { -3, 0, 0 }, { 3, 0, 0 }, { 0, 5, 0.05f }, { 0.25f, -0.5f, -0.0f, 0 }, { -0.0f, -0.0f, -0.0f, 1 },
+          { 1, TRI_FEAT, 5, 2 }, 0x80000000u, 1.0f, 2, 2, 0x80000000u, 1 },
+        { "C", { -0.0f, -0.0f, -1.0625f }, { 4, -4, -1.03125f }, { -fmin, 4, -1.09375f }, { -0.0f, 0.5f, 0.25f, 0 },
+          { -0.0f, 0.0f, 0.0f, 1 }, { 1, TRI_FEAT, 5, 3 }, 0x80000000u, -1.0f, 1, 0, 0x00000000u, 2 },
+        { "D", { -0.0f, 0.0f, -0.0f }, { 1.5f, 0.3f, 0 }, { -fmin, -1, 0.02f }, { -0.0f, 0.5f, 0.25f, 0 },
+          { -0.0f, -0.0f, -0.0f, 1 }, { 1, 5, 5, 0xFFFFFFFFu }, 0x00000000u, 1.0f, 1, 0, 0x80000000u, 4 },
+    };
+    std::vector<FctCase> cases(NC);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const Directed& d = dc[i];
+        FctCase& cs = cases[i];
+        const V3 nT = getNorm0(crossp(sub(d.t1, d.t0), sub(d.t2, d.t0)));
+        cs.convexScale = { 1, 1, 1, 0.1f };
+        cs.convexScaleRot = { 0, 0, 0, 1 };
+        cs.t0 = { d.t0.x, d.t0.y, d.t0.z, 0.01f };
+        cs.t1 = { d.t1.x, d.t1.y, d.t1.z, 0 };
+        cs.t2 = { d.t2.x, d.t2.y, d.t2.z, 0 };
+        cs.triNormal = { nT.x, nT.y, nT.z, 0 };
+        cs.convexP = d.convexP;
+        cs.convexQ = d.convexQ;
+        cs.ids = { 0xA0u + i, 3u, CLOTH, i };
+        cs.ids2 = { 0x40u + i, ofs[i], 0, 0 };
+    }
+
+    // ---- reference: the CUDA semantics, then each case's twin ----
+    auto reference = [&](uint32_t i, std::vector<RefContact>& out) {
+        const V3 mn = rotLaneMinNormal(hulls[i], cases[i], dc[i].dbg.y);
+        bool ok = true;
+        for (uint32_t face : { dc[i].dbg.z, dc[i].dbg.w })
+            if (face != 0xFFFFFFFFu)
+                ok = rotLaneFaceContacts(hulls[i], cases[i], mn, face, out) && ok;
+        return ok;
+    };
+    std::vector<RefContact> ref[NC];
+    uint32_t twinFlips = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const Directed& d = dc[i];
+        const V3 mn = rotLaneMinNormal(hulls[i], cases[i], d.dbg.y);
+        PXG_CHECK_MSG(f2u(mn.x) == d.minNx && std::fabs(mn.z) > 0.9999f && mn.y * d.minNySign > 0.0f,
+                      "case %s: SAT axis (%08x, %g, %g) is not the one the case is built on", d.name,
+                      f2u(mn.x), mn.y, mn.z);
+        PXG_CHECK_MSG(reference(i, ref[i]), "case %s: a face emits more than 5 contacts", d.name);
+        PXG_CHECK_MSG(ref[i].size() > d.slot && f2u(laneOf(ref[i][d.slot].p, d.lane)) == d.cudaBits,
+                      "case %s: the reference no longer puts %08x in slot %u lane %d", d.name, d.cudaBits,
+                      d.slot, d.lane);
+        gRotZLaneVariant = d.twin;
+        std::vector<RefContact> tw;
+        const bool ok = reference(i, tw);
+        gRotZLaneVariant = 0;
+        if (ok && tw.size() == ref[i].size() && tw.size() > d.slot &&
+            f2u(laneOf(tw[d.slot].p, d.lane)) == (d.cudaBits ^ 0x80000000u))
+            ++twinFlips;
+    }
+    PXG_CHECK_MSG(twinFlips == NC,
+                  "only %u of %u directed cases flip their sign under the P9.86 twin -- the inputs no longer "
+                  "exercise the rotation's zero lanes", twinFlips, NC);
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> f4Init(CAP, { -9, -9, -9, -9 });
+    std::vector<U4> infoInit(CAP, { INFOPOISON, INFOPOISON, INFOPOISON, INFOPOISON });
+    std::vector<uint32_t> u1Init(CAP, POISON), u2Init(CAP * 2, POISON), wc0(1, 0);
+    std::vector<U4> dbgInit(NC, { 7, 7, 7, 7 });
+    PxgBufferHandle bC = createBufferFrom(dev, cases);
+    PxgBufferHandle bH = createBufferFrom(dev, blob);
+    PxgBufferHandle bPt = createBufferFrom(dev, f4Init);
+    PxgBufferHandle bNp = createBufferFrom(dev, f4Init);
+    PxgBufferHandle bBc = createBufferFrom(dev, f4Init);
+    PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
+    PxgBufferHandle bWc = createBufferFrom(dev, wc0);
+    PxgBufferHandle bBy = createBufferFrom(dev, u2Init);
+    PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
+    PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
+    PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
+    FctParams prm = {};
+    prm.numCases = NC; prm.maxContacts = CAP;
+    prm.hullAddr = dev->getBufferDeviceAddress(bH);
+    prm.wPoint = dev->getBufferDeviceAddress(bPt);
+    prm.wNormalPen = dev->getBufferDeviceAddress(bNp);
+    prm.wBary = dev->getBufferDeviceAddress(bBc);
+    prm.wInfo = dev->getBufferDeviceAddress(bIn);
+    prm.wCount = dev->getBufferDeviceAddress(bWc);
+    prm.wByX = dev->getBufferDeviceAddress(bBy);
+    prm.wTempByX = dev->getBufferDeviceAddress(bTb);
+    prm.wIdxByX = dev->getBufferDeviceAddress(bIx);
+    Kernel k("fcConvexTri.spv", "ctFcConvexTri", { (uint32_t)sizeof(FctCase), 16 }, sizeof(FctParams));
+    k.dispatch(1, { bC, bDb }, prm);
+    dev->flush();
+    const auto gDbg = downloadBuffer<U4>(dev, bDb, NC);
+    const auto gPt = downloadBuffer<F4>(dev, bPt, CAP);
+    const auto gNp = downloadBuffer<F4>(dev, bNp, CAP);
+    const auto gBc = downloadBuffer<F4>(dev, bBc, CAP);
+    const auto gIn = downloadBuffer<U4>(dev, bIn, CAP);
+    const uint32_t gWc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+
+    size_t refTotal = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        refTotal += ref[i].size();
+        PXG_CHECK_MSG(gDbg[i].x == dc[i].dbg.x && gDbg[i].y == dc[i].dbg.y && gDbg[i].z == dc[i].dbg.z &&
+                      gDbg[i].w == dc[i].dbg.w,
+                      "case %s: SAT/feature verdict (%u, %08x, %u, %08x), expected (%u, %08x, %u, %08x)", dc[i].name,
+                      gDbg[i].x, gDbg[i].y, gDbg[i].z, gDbg[i].w, dc[i].dbg.x, dc[i].dbg.y, dc[i].dbg.z, dc[i].dbg.w);
+    }
+    PXG_CHECK_MSG(gWc == refTotal, "%u contacts written, the reference has %zu", gWc, refTotal);
+
+    // one thread per case: its slots ascend in the reference's order (face 1, then face 2)
+    std::vector<std::vector<uint32_t>> slots(NC);
+    size_t mmInfo = 0;
+    for (uint32_t s = 0; s < std::min(gWc, CAP); ++s)
+    {
+        const uint32_t i = gIn[s].z & 0xFFFFFu;
+        if ((gIn[s].z >> 20) != CLOTH || i >= NC) { ++mmInfo; continue; }
+        slots[i].push_back(s);
+        if (gIn[s].x != cases[i].ids.x || gIn[s].y != cases[i].ids.y || gIn[s].w != (cases[i].ids2.x & 0x7FFFFFFFu))
+            ++mmInfo;
+    }
+    PXG_CHECK_MSG(mmInfo == 0, "%zu contacts carry the wrong pair/material words", mmInfo);
+
+    size_t mmBits = 0;
+    uint32_t signLanes = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const Directed& d = dc[i];
+        std::sort(slots[i].begin(), slots[i].end());
+        PXG_CHECK_MSG(slots[i].size() == ref[i].size(), "case %s: %zu contacts, the reference has %zu", d.name,
+                      slots[i].size(), ref[i].size());
+        for (size_t kk = 0; kk < slots[i].size() && kk < ref[i].size(); ++kk)
+        {
+            const uint32_t s = slots[i][kk];
+            const RefContact& rc = ref[i][kk];
+            const float want[12] = { rc.p.x, rc.p.y, rc.p.z, cases[i].t0.w, rc.n.x, rc.n.y, rc.n.z, rc.sep,
+                                     rc.bary.x, rc.bary.y, rc.bary.z, rc.bary.w };
+            const float got[12] = { gPt[s].x, gPt[s].y, gPt[s].z, gPt[s].w, gNp[s].x, gNp[s].y, gNp[s].z, gNp[s].w,
+                                    gBc[s].x, gBc[s].y, gBc[s].z, gBc[s].w };
+            for (int j = 0; j < 12; ++j)
+                if (f2u(got[j]) != f2u(want[j]))
+                {
+                    if (mmBits < 8)
+                        std::printf("  case %s contact %zu word %d: GPU %08x, reference %08x\n", d.name, kk, j,
+                                    f2u(got[j]), f2u(want[j]));
+                    ++mmBits;
+                }
+            if (kk == d.slot && f2u(laneOf(V3{ gPt[s].x, gPt[s].y, gPt[s].z }, d.lane)) == d.cudaBits)
+                ++signLanes;
+        }
+    }
+    PXG_CHECK_MSG(mmBits == 0, "%zu written words differ bitwise from the reference", mmBits);
+    PXG_CHECK_MSG(signLanes == NC, "only %u of %u directed signed-zero lanes were written as the CUDA has them",
+                  signLanes, NC);
 
     for (PxgBufferHandle h : { bC, bH, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
         dev->destroyBuffer(h);
