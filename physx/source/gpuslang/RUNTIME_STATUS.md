@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.86c/d: every one of the 99 P9.86 audit fixes was reverted and swept; almost all survived
+(no fixture made the +-0 inputs).  Directed cases with mirror twins and coverage checks now
+kill 109 reverts; 20 are proven equivalent; none survive.  The new fixtures found six real
+port bugs (artiPushImpulse and adPropagateImpulseWJf null-jointForce `0 - dot`, arti cfm FMax,
+psBounds second pass, cloth findRotationMatrixFromZ, SDF gradient fallback), all fixed.
+Scenes 56/56.
 P9.86: the sign of zero.  slangc folds `0 + x` at source level and llvmpipe rewrites `0 - x` to
 `-x`, folds literal-zero vector lanes and unrolled zero seeds even under SignedZeroInfNanPreserve
 (new probe p86SignedZero); PxMin/PxMax are selects, not FMin/FMax.  Every shader is now stamped,
@@ -2045,6 +2051,75 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.86c/d — Jeder Audit-Fix hat jetzt eine Fixture, die ihn sieht (oder einen Äquivalenzbeweis)
+
+**Der Befund.** Die 99 Audit-Fixes aus P9.86 (57 Shader) wurden hunkweise zurückgedreht und
+erzwungen frisch gesweept. Fast jeder Revert **überlebte**, nur 6 wurden getötet: Keine
+Fixture erzeugte die ±0-Eingaben, und etliche Spiegel rechneten `PxMin`/`PxMax` als
+`std::fmin`/`std::min` oder verglichen tolerant. Damit war der größte Teil von P9.86
+unbeobachtet.
+
+**Vorgehen.**
+
+- **Design (4 Workflows parallel, nur lesend):** Für jede der 54 Dateien bestimmte ein Agent
+  aus dem CUDA-Zwilling die Eingabe, bei der CUDA und Revert verschiedene Bits liefern. Er
+  verfolgte die Differenz bis zu einer bitweise verglichenen Ausgabe oder schrieb einen
+  Äquivalenzbeweis.
+- **Challenge:** Ein Prüfer versuchte jeden Plan zu widerlegen.
+- **Implementierung (seriell):**
+  - gezielte Fälle im etablierten Muster: Mutanten-Zwilling im Spiegel plus
+    Abdeckungszähler mit `PXG_CHECK_MSG`;
+  - Build, Suiten in beiden Modi, erzwungen frischer Sweep, Commit pro Datei.
+- **Review und Fixup:** Jeder Commit wurde adversarial reviewt; in 5 Fällen folgte ein Fixup
+  (z. B. Abdeckungszähler, die nur auf dem Host zählten).
+- **Werkzeug:** `run_mutation_sweep.sh` nimmt jetzt komma-getrennte Suiten, und „grün“
+  heißt „kein Lauf meldet M > 0 failed“. Das alte `grep "0 failed"` passte auch auf
+  „10 failed“.
+
+**Ergebnis: 54 Dateien, 109 Reverts getötet, 20 als äquivalent bewiesen, kein
+Überlebender.** Die Äquivalenzen haben einen gemeinsamen Grund: Ein ±0 kann an diesen Stellen
+keine Ausgabe erreichen, meist weil der Wert eine mit +0 gestartete, nur addierte Summe ist,
+die nie −0 wird. Beispiele sind npArtiSetupTendons (3), npArtiSolveInternal (3), npCvxCollide,
+pxgSlangEpa und solverTGS (2).
+
+Bei pxgSlangEpa/npCvxCollide ist die Äquivalenz eine Eigenschaft von llvmpipe. Mesa senkt
+das gestempelte FMin über `lower_fminmax_signed_zero` so ab, dass −0 bei Gleichstand in
+beiden Reihenfolgen gewinnt, also genau NVIDIAs `fminf`. Der Select bleibt trotzdem, damit
+der Port nicht vom Treiber abhängt.
+
+**Sechs echte Port-Fehler, gefunden erst durch die neuen Fixtures, alle behoben und durch
+getötete Reverts belegt:**
+
+| Shader | Fehler | CUDA |
+|---|---|---|
+| npArtiAvgImpulse `artiPushImpulse` | `adPropagateImpulseWJf(hasJf=false)` → `-dot` | forwardDynamic2.cu:4184-4186 `0.0f - dot` |
+| npArtiConstraintPrep (TGS :387, PGS :1276) | `cfm = max(...)` (FMax) | PxMax = selectMax |
+| psBoundsBda second pass | Akkumulator-Faltung mit min/max; `setEmpty()`-Leerwerte | particlesystem.cu:601-602, :646-647 |
+| pxgSlangConvexTriCloth `findRotationMatrixFromZ` | `absFrom - to`, Lane x = Literal-`0 - to.x` | femClothPrimitives.cu:1016 |
+| pxgSlangSdfCollision `sdfVolumeGradEx` (Rückfall) | Literal-Null-Lanes in `localPos + (dx,0,0)` | sdfCollision.cuh:190-195 |
+| pxgSlangArticulationDynamic (P9.86d) | `adPropagateImpulseWJf` mit `hasJf = false` → `-dot` | articulationDynamic.cuh:141-142 |
+
+**P9.86d.** Der Fehler aus artiPushImpulse steckt zentral im Modul. `stZ` ist jetzt
+`hasJf ? jf·mult − s·Z : zeroMinus(s·Z)`. An den Aufrufstellen mit literalem `false`
+(DFS-Backprop und Vel-Limit-Hop in npArtiSolveInternal, die Fixed-Tendon-Hops) ist der Revert
+nachweislich äquivalent: Z ist dort nie −0, und mDeferredQstZ wird nur genullt oder
+aufaddiert. Zwei Host-Zeugen sichern das ab:
+
+- artiSolveInternalLaunch: 668 Hops mit +0-Skalarprodukt; der Zwilling ändert 0 Wörter.
+- artiSolveVelImp: ein Ruhe-Dispatch mit −0-Z; der Zwilling ändert 183 Bytes.
+
+**Nebenbefunde (offen, nicht engine-erreicht oder äquivalent):**
+
+- npCvxCoreGjk.slang:590 (Test-Kopie) hat dieselbe Saat-Faltung wie pxgSlangCvxCoreCvx.
+- npCvxFinishContacts `combineScalars` (engine-erreicht) schreibt noch `min/max`; die
+  Test-Kopien npCvxCoreOut, npCvxTrimeshOut und npMaterialCombine ebenso. Folgt als P9.86e.
+- segAABB in boxBoxNphase ist nach Analyse ausgabe-äquivalent.
+- Der Kommentar „llvmpipe FMin is not“ in pxgSlangEpa/npCvxCollide ist sachlich falsch.
+
+**Suite:** **880/880** in beiden Speichermodi. Die neuen Fälle laufen als PXG_TESTs innerhalb
+bestehender ctest-Suiten.
+**Szenen:** **56/56** ok (nach allen Port-Fixes dieser Tranche).
 
 ## P9.86 — Das Vorzeichen der Null: SZINP-Stempel, Select-Schreibweisen, strikte Fixtures, latentes Audit
 
