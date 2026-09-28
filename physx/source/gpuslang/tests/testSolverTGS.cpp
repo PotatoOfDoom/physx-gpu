@@ -38,6 +38,7 @@
 #include "PxgSolverCoreDesc.h"
 #include "PxgIslandContext.h"
 
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -967,6 +968,7 @@ PXG_TEST(solverTGS_contactAndJointBatches)
 
 // Shared engine-ABI test helpers (used by every PxgCudaShim-driven test below).
 static std::vector<uint8_t> solverTgsAbiLoader(const char* file) { return loadShaderBlob(file); }
+static uint32_t f2uTGS(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 // Mirrors the bridge's marshalling: place each argument at the natural
 // alignment inferred from its size, then round the blob to the largest
@@ -1498,6 +1500,16 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         std::vector<Float4> velPool(poolSize);
         for (Float4& v : velPool)
             v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+        // P9.86f DIRECTED -0 delta-position lanes.  The CUDA's curVel1 is make_float4(0.f) with only .x/.y
+        // accumulated, so `curVel1 += vel1` (solverMultiBlockTGS.cu:348/410) turns a -0 vel1.z / vel1.w
+        // into +0 for every body with a reference.  Seeded AFTER the random draws (rng untouched).
+        for (uint32_t bodyId = 1; bodyId < totalBodyCount; bodyId += 2)
+        {
+            Float4& v1 = velPool[bodyOffset + deltaVOffset + bodyId + T];
+            if (bodyId % 4 != 3) v1.z = -0.0f;
+            if (bodyId % 4 != 1) v1.w = -0.0f;
+            if (bodyId % 8 == 5) { v1.z = -0.0f; v1.w = -0.0f; }
+        }
 
         // remapped write slots: unique (r, r+32, r+64) triples per slab slot in
         // the cluster-of-32 pattern, in a dedicated pool region (partitions
@@ -1676,6 +1688,7 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
 
         // average pass (dynamic bodies only)
+        size_t cNegZ = 0, cNegW = 0;   // P9.86f: bodies whose -0 z / w lane the (+0)+ add turns +0
         for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
         {
             const Float4 vel0 = velPool[bodyOffset + deltaVOffset + bodyId];
@@ -1710,8 +1723,13 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
                     refEnc[bodyOffset + bodyId + i * numTotalBodies] = 0;
                 refVel[bodyOffset + deltaVOffset + bodyId] =
                     Float4{ vel0.x + acc[0], vel0.y + acc[1], vel0.z + acc[2], vel0.w + acc[3] };
+                // (+0) + vel1.z / (+0) + vel1.w, the CUDA's untouched curVel1 lanes (P9.86f).
+                // avgZwVariant replays the pre-P9.86f port (lanes passed through): 1 = z, 2 = w.
+                auto plus0 = [](float x) { return (x == 0.f) ? 0.f : x; };
                 refVel[bodyOffset + deltaVOffset + bodyId + T] =
-                    Float4{ vel1.x + acc[4], vel1.y + acc[5], vel1.z, vel1.w };
+                    Float4{ vel1.x + acc[4], vel1.y + acc[5], plus0(vel1.z), plus0(vel1.w) };
+                if (std::signbit(vel1.z) && vel1.z == 0.f) ++cNegZ;
+                if (std::signbit(vel1.w) && vel1.w == 0.f) ++cNegW;
             }
         }
 
@@ -1808,6 +1826,33 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         shim.memcpyDtoH(gpuEnc.data(), dEnc, gpuEnc.size() * 4);
         shim.memcpyDtoH(gpuTxi.data(), dTx, gpuTxi.size() * sizeof(SolverTxIData));
         shim.memcpyDtoH(gpuMotion.data(), dMv, gpuMotion.size() * sizeof(Float4));
+
+        // P9.86f: the averaged deltaV slot's z/w lanes (delta position x/y) are copied, not computed, so
+        // they are compared BITWISE -- in the velocity iteration only: the position iteration's
+        // propagate adds deltaP to them, which washes a zero's sign on both sides.  The pass-through
+        // twin (pre-P9.86f port) must differ on every counted -0 lane; motion velocity = lane * invDt
+        // keeps the sign through writeBackBodiesTGS.
+        PXG_CHECK_MSG(cNegZ >= 4 && cNegW >= 4, "slabs=%u: -0 z/w coverage thin (%zu / %zu)", numSlabs, cNegZ, cNegW);
+        if (isVelocityIteration)
+        {
+            size_t zwMm = 0, zwMotionMm = 0, zwTwinZ = 0, zwTwinW = 0;
+            for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
+            {
+                const size_t i = size_t(bodyOffset) + deltaVOffset + bodyId + T;
+                if (f2uTGS(gpuVel[i].z) != f2uTGS(refVel[i].z) || f2uTGS(gpuVel[i].w) != f2uTGS(refVel[i].w)) ++zwMm;
+                const Float4& m = gpuMotion[bodyOffset + bodyId];
+                const Float4& rm = refMotion[bodyOffset + bodyId];
+                if (f2uTGS(m.x) != f2uTGS(rm.x) || f2uTGS(m.y) != f2uTGS(rm.y)) ++zwMotionMm;
+                // twin: the port without the select would keep the input lane
+                const Float4& in1 = velPool[i];
+                if (f2uTGS(in1.z) != f2uTGS(refVel[i].z)) ++zwTwinZ;
+                if (f2uTGS(in1.w) != f2uTGS(refVel[i].w)) ++zwTwinW;
+            }
+            PXG_CHECK_MSG(zwMm == 0, "slabs=%u: %zu averaged deltaV z/w lanes differ bitwise from the CUDA's (+0)+v", numSlabs, zwMm);
+            PXG_CHECK_MSG(zwMotionMm == 0, "slabs=%u: %zu motion-velocity x/y lanes differ bitwise", numSlabs, zwMotionMm);
+            PXG_CHECK_MSG(zwTwinZ == cNegZ && zwTwinW == cNegW,
+                          "slabs=%u: pass-through twin changes %zu/%zu z/w lanes, want %zu/%zu", numSlabs, zwTwinZ, zwTwinW, cNegZ, cNegW);
+        }
 
         size_t mismatches = 0;
         for (size_t i = 0; i < poolSize; ++i)

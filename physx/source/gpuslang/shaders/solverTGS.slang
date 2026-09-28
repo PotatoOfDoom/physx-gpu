@@ -1372,8 +1372,12 @@ void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
             encodedReferenceCount[bodyOffset + bodyId + i * numTotalBodies] = 0u;
 
         bodyVelocities[bodyOffset + deltaVOffset + bodyId] = vel0 + curVel0;
+        // P9.86f: solverMultiBlockTGS.cu:348/410 accumulates into a float4 curVel1 = make_float4(0.f)
+        // whose .z/.w are never touched, so `curVel1 += vel1` computes (+0) + vel1.z and (+0) + vel1.w:
+        // a -0 delta-position lane comes back +0.  Spelled as the plusZero select (a literal 0 + x would
+        // be folded, F1/F3); NaN and every nonzero value pass through as in the add.
         bodyVelocities[bodyOffset + deltaVOffset + bodyId + totalBodiesIncKinematics] =
-            float4(vel1.xy + curVel1, vel1.z, vel1.w);
+            float4(vel1.xy + curVel1, (vel1.z == 0.0f) ? 0.0f : vel1.z, (vel1.w == 0.0f) ? 0.0f : vel1.w);
     }
 }
 
