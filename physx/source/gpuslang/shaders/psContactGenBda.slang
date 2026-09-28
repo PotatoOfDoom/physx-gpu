@@ -368,7 +368,15 @@ float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
     const float3 ab = b - a;
     const float nom = dot(ap, ab);
     const float denom = dot(ab, ab);
-    const float tValue = clamp(nom / denom, 0.0f, 1.0f);
+    // P9.86f: sphereCollision.cuh:98 PxClamp(nom / denom, 0, 1) = PxMin(1, PxMax(0, .)) with the float
+    // selects of PxUnixMathIntrinsics.h:116-125.  A NaN quotient (a particle at infinity against a
+    // capsule axis lane of 0: inf * 0) stays NaN, so the CUDA's distSegmentSq is NaN, passes the maxDist
+    // gate (NaN > x is false) and reports a contact with normal (1,0,0) and a NaN distance; GLSL FClamp
+    // gave t = 0 and an infinite distance that the gate rejects.  A -0 quotient only reaches 2t - 1 and
+    // a squared lane, so its sign never shows.
+    const float tQ = nom / denom;
+    const float tLo = (0.0f > tQ) ? 0.0f : tQ;
+    const float tValue = (1.0f < tLo) ? 1.0f : tLo;
     const float t = denom > 0.0f ? tValue : 0.0f;
     const float3 v = ap - (ab * t);
     param = t;

@@ -803,6 +803,167 @@ static void runGridContact(bool isTGS)
         dev->destroyBuffer(h);
 }
 
+// P9.86f -- the eCAPSULE branch's distancePointSegmentSquared (sphereCollision.cuh:91-103) clamps its
+// parameter with PxClamp = PxMin(1, PxMax(0, .)) over the float selects, which keep a NaN.  A particle
+// at (0, +inf, 0) against a capsule along x (axis lane y = +0): nom = 0.5*1 + inf*(+0) + 0 = NaN.
+// CUDA: t = NaN, distSegmentSq = NaN, the maxDist gate `NaN > x` is false, normal falls back to
+// (1,0,0), dist = NaN -- ONE contact with a NaN penetration.  GLSL FClamp (the pre-P9.86f port) turns
+// t into 0: distSegmentSq = |ap|^2 = inf and the gate rejects -- no contact.  The 1x1x1 grid puts the
+// particle in cell 0 whatever its position (the same rig as runPlaneContact).
+static bool capsuleRefP86f(bool fclampTwin, float rel[3], float halfHeight, float radius, float maxDist,
+                           float n[3], float& dist)
+{
+    const float axis[3] = { halfHeight, 0.0f, 0.0f };      // capsuleDir (1,0,0) * halfHeight
+    const float a[3] = { -axis[0], -axis[1], -axis[2] };
+    float ap[3], ab[3];
+    for (int k = 0; k < 3; ++k) { ap[k] = rel[k] - a[k]; ab[k] = axis[k] - a[k]; }
+    const float nom = ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2];
+    const float denom = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    const float q = nom / denom;
+    float tv;
+    if (fclampTwin) { const float m = (q > 0.0f) ? q : 0.0f; tv = (m < 1.0f) ? m : 1.0f; }   // FClamp: NaN -> 0
+    else { const float lo = (0.0f > q) ? 0.0f : q; tv = (1.0f < lo) ? 1.0f : lo; }        // PxClamp selects
+    const float t = denom > 0.0f ? tv : 0.0f;
+    float v[3];
+    for (int k = 0; k < 3; ++k) v[k] = ap[k] - ab[k] * t;
+    const float dsSq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    const float mds = maxDist + radius;
+    if (dsSq > mds * mds) return false;
+    const float ds = std::sqrt(dsSq);
+    float dv[3];
+    for (int k = 0; k < 3; ++k) dv[k] = rel[k] - axis[k] * (2.0f * t - 1.0f);
+    for (int k = 0; k < 3; ++k) n[k] = (ds > 1.192092896e-07f) ? dv[k] * (1.0f / ds) : (k == 0 ? 1.0f : 0.0f);
+    dist = ds - radius;
+    return true;
+}
+
+static void runCapsuleNaNContact(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float particlePos[3] = { 0.0f, INFINITY, 0.0f };
+    const float halfHeight = 0.5f, radius = 0.25f, contactOffset = 0.3f;
+    const uint32_t rigidNodeIndex = 7u;
+
+    float rel[3] = { particlePos[0], particlePos[1], particlePos[2] };   // capsule at the origin
+    float refN[3], refDist = 0.0f, twinN[3], twinDist = 0.0f;
+    const bool refHit = capsuleRefP86f(false, rel, halfHeight, radius, contactOffset, refN, refDist);
+    const bool twinHit = capsuleRefP86f(true, rel, halfHeight, radius, contactOffset, twinN, twinDist);
+    PXG_CHECK_MSG(refHit && std::isnan(refDist) && refN[0] == 1.0f && !twinHit,
+                  "capsule NaN rig: CUDA mirror hit %d dist %g n.x %g, FClamp twin hit %d", int(refHit), refDist,
+                  refN[0], int(twinHit));
+
+    std::vector<F4> sortedOrigin = { { particlePos[0], particlePos[1], particlePos[2], 1.0f } };
+    std::vector<F4> sortedPred = sortedOrigin;
+    std::vector<uint32_t> cellStart = { 0u }, cellEnd = { 1u }, sortedToUnsorted = { 0u }, bufferRunsum = { 0u };
+    DevBuf bOrigin = makeDev(dev, sortedOrigin);
+    DevBuf bPred = makeDev(dev, sortedPred);
+    DevBuf bCellStart = makeDev(dev, cellStart);
+    DevBuf bCellEnd = makeDev(dev, cellEnd);
+    DevBuf bS2U = makeDev(dev, sortedToUnsorted);
+    DevBuf bRunsum = makeDev(dev, bufferRunsum);
+    std::vector<PxgParticleSimBuffer> simBuffers(1);
+    std::memset(simBuffers.data(), 0, sizeof(PxgParticleSimBuffer));
+    DevBuf bSimBuf = makeDev(dev, simBuffers);
+
+    PxgParticleSystem ps = makeZeroPs();
+    ps.mCommonData.mGridCellWidth = 1.0f;
+    ps.mCommonData.mGridSizeX = 1u;
+    ps.mCommonData.mGridSizeY = 1u;
+    ps.mCommonData.mGridSizeZ = 1u;
+    ps.mCommonData.mNumParticles = 1u;
+    ps.mCommonData.mNumParticleBuffers = 1u;
+    ps.mData.mFlags = 0u;
+    ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bOrigin.addr));
+    ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPred.addr));
+    ps.mCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+    ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+    ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bS2U.addr));
+    ps.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+    ps.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(bSimBuf.addr));
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::eCAPSULE);
+    shapes[1].scale.scale = PxVec3(halfHeight, radius, 0.0f);   // scale.x = half height, scale.y = radius
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(0.0f, 0.0f, 0.0f), PxQuat(0.0f, 0.0f, 0.0f, 1.0f));
+    DevBuf bTc = makeDev(dev, tcache);
+    // finite pair bounds: on the 1x1x1 grid every work item reads cell 0 anyway
+    std::vector<float> boundsF = { -1, -1, -1, 1, 1, 1,  -1, -1, -1, 1, 1, 1 };
+    DevBuf bBounds = makeDev(dev, boundsF);
+    std::vector<float> contactDist = { contactOffset, 0.0f };
+    DevBuf bCd = makeDev(dev, contactDist);
+    std::vector<float> restDist = { 0.0f };
+    DevBuf bRd = makeDev(dev, restDist);
+    std::vector<uint32_t> materials = { 0u };
+    DevBuf bMat = makeDev(dev, materials);
+    std::vector<uint32_t> startIndices = { 0u };
+    DevBuf bStart = makeDev(dev, startIndices);
+    std::vector<uint32_t> totalPairs = { 1u };
+    DevBuf bTotal = makeDev(dev, totalPairs);
+    std::vector<uint64_t> remap = { 0ull, uint64_t(rigidNodeIndex) };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    const uint32_t MAX_CONTACTS = 64u;
+    std::vector<HostContact> contacts(MAX_CONTACTS);
+    std::memset(contacts.data(), 0, contacts.size() * sizeof(HostContact));
+    std::vector<uint32_t> count = { 0u };
+    std::vector<uint64_t> u64s(MAX_CONTACTS, 0xffffffffffffffffull);
+    std::vector<uint32_t> u32s(MAX_CONTACTS, 0xffffffffu);
+    DevBuf bContacts = makeDev(dev, contacts);
+    DevBuf bCount = makeDev(dev, count);
+    DevBuf bSbP = makeDev(dev, u64s), bTbP = makeDev(dev, u32s), bIbP = makeDev(dev, u32s);
+    DevBuf bBr = makeDev(dev, u64s), bTbr = makeDev(dev, u32s), bIbr = makeDev(dev, u32s);
+
+    PsCollideBlob blob;
+    std::memset(&blob, 0, sizeof(blob));
+    blob.isTGSWord = isTGS ? 1u : 0u;
+    blob.numTests = 1u;
+    blob.toleranceLength = 1.0f;
+    blob.cmInputs = bCin.addr; blob.shapes = bShapes.addr; blob.transformCache = bTc.addr;
+    blob.bounds = bBounds.addr; blob.contactDistance = bCd.addr; blob.restDistances = bRd.addr;
+    blob.materials = bMat.addr; blob.startIndices = bStart.addr; blob.totalNumPairs = bTotal.addr;
+    blob.particleSystems = bDesc.addr; blob.shapeToRigidRemap = bRemap.addr;
+    blob.w_particleContacts = bContacts.addr; blob.w_numTotalContacts = bCount.addr;
+    blob.w_contactSortedByParticle = bSbP.addr; blob.w_tempContactByParticle = bTbP.addr;
+    blob.w_contactIndexSortedByParticle = bIbP.addr; blob.w_contactByRigid = bBr.addr;
+    blob.w_tempContactByRigid = bTbr.addr; blob.w_contactIndexSortedByRigid = bIbr.addr;
+    blob.w_maxContacts = MAX_CONTACTS;
+
+    Kernel k("psContactGenBda.spv", "ps_primitivesCollisionLaunch", {}, sizeof(PsCollideBlob));
+    k.dispatch(1024u, {}, blob, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 1u, "%s: capsule vs particle at infinity emitted %u contacts (CUDA: 1, NaN penetration)",
+                  isTGS ? "TGS" : "PGS", gCount);
+    if (gCount == 1u)
+    {
+        const HostContact ct = downloadBuffer<HostContact>(dev, bContacts.h, 1)[0];
+        PXG_CHECK_MSG(fbits(ct.normal_pen.x) == fbits(refN[0]) && fbits(ct.normal_pen.y) == fbits(refN[1]) &&
+                      fbits(ct.normal_pen.z) == fbits(refN[2]) && std::isnan(ct.normal_pen.w),
+                      "%s: capsule NaN contact normal/pen %08x %08x %08x %08x, CUDA (1,0,0) / NaN", isTGS ? "TGS" : "PGS",
+                      fbits(ct.normal_pen.x), fbits(ct.normal_pen.y), fbits(ct.normal_pen.z), fbits(ct.normal_pen.w));
+        PXG_CHECK_MSG(ct.rigidId == uint64_t(rigidNodeIndex) && ct.particleId == 0ull,
+                      "%s: capsule NaN contact ids %llu / %llu", isTGS ? "TGS" : "PGS",
+                      (unsigned long long)ct.rigidId, (unsigned long long)ct.particleId);
+    }
+    for (PxgBufferHandle h : { bOrigin.h, bPred.h, bCellStart.h, bCellEnd.h, bS2U.h, bRunsum.h, bSimBuf.h,
+                               bDesc.h, bCin.h, bShapes.h, bTc.h, bBounds.h, bCd.h, bRd.h, bMat.h, bStart.h,
+                               bTotal.h, bRemap.h, bContacts.h, bCount.h, bSbP.h, bTbP.h, bIbP.h, bBr.h, bTbr.h, bIbr.h })
+        dev->destroyBuffer(h);
+}
+
 static void runPlaneContactCases(bool isTGS)
 {
     uint32_t signCases = 0;
@@ -828,5 +989,7 @@ PXG_TEST(psContactGen_planeContactPGS) { runPlaneContactCases(false); }
 PXG_TEST(psContactGen_planeContactTGS) { runPlaneContactCases(true); }
 PXG_TEST(psContactGen_gridHashPGS) { runGridContact(false); }
 PXG_TEST(psContactGen_gridHashTGS) { runGridContact(true); }
+PXG_TEST(psContactGen_capsuleNaNPGS) { runCapsuleNaNContact(false); }
+PXG_TEST(psContactGen_capsuleNaNTGS) { runCapsuleNaNContact(true); }
 
 } // namespace
