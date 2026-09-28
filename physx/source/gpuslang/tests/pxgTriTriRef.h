@@ -45,6 +45,7 @@
 #include "pxgCrsRef.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -446,21 +447,32 @@ static const uint32_t MODE_MIN = 1, MODE_MULTIPLY = 2, MODE_MAX = 3;
 static const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2;
 static const uint32_t FLAG_COMPLIANT_ACC_SPRING = 16;
 
-inline float combineScalars(float a, float b, uint32_t mode)
+// P9.86 F4: GLSL FMin/FMax as llvmpipe lowers them (lower_fminmax_signed_zero): a
+// +-0 tie gives -0 for min and +0 for max in either operand order.  Finite operands
+// only.  Mutant twins for the coverage checks, never the oracle.
+inline float glslFMinLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : ((a < b) ? a : b); }
+inline float glslFMaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : ((a > b) ? a : b); }
+
+// PxMin/PxMax<float> are intrinsics::selectMin/selectMax (PxMath.h:98-101/82-85,
+// PxUnixMathIntrinsics.h:116-125): `a < b ? a : b` / `a > b ? a : b`, so on a tie
+// (+0 vs -0 included) the SECOND operand survives.  std::min/std::max return the
+// first one and are not the CUDA semantics.  variant 1 = FMin twin for eMIN,
+// variant 2 = FMax twin for eMAX (the pre-P9.86 port).
+inline float combineScalars(float a, float b, uint32_t mode, int variant = 0)
 {
     switch (mode)
     {
     case 0: return 0.5f * (a + b);
-    case 1: return std::min(a, b);
+    case 1: return (variant == 1) ? glslFMinLp(a, b) : ((a < b) ? a : b);
     case 2: return a * b;
-    case 3: return std::max(a, b);
+    case 3: return (variant == 2) ? glslFMaxLp(a, b) : ((a > b) ? a : b);
     }
     return 0.f;
 }
 
 struct CombinedH { float sta, dyn, rest, damping; uint32_t flags; };
 
-inline CombinedH combine(const MaterialH& p0, const MaterialH& p1)
+inline CombinedH combine(const MaterialH& p0, const MaterialH& p1, int variant = 0)
 {
     const uint32_t f0 = p0.flagsModes0 & 0xFFFFu, f1 = p1.flagsModes0 & 0xFFFFu;
     const uint32_t fric0 = (p0.flagsModes0 >> 16) & 0xFFu, fric1 = (p1.flagsModes0 >> 16) & 0xFFu;
@@ -478,21 +490,23 @@ inline CombinedH combine(const MaterialH& p0, const MaterialH& p1)
     {
         const uint32_t m = one ? MODE_MIN : std::max(rest0, rest1);
         const float f = (both && m == MODE_MULTIPLY) ? -1.f : 1.f;
-        c.rest = f * combineScalars(r0, r1, m);
+        c.rest = f * combineScalars(r0, r1, m, variant);
     }
     if (both && oneAcc) c.damping = a0 ? p0.damping : p1.damping;
     else
     {
         const uint32_t m = one ? MODE_MAX : std::max(damp0, damp1);
-        c.damping = combineScalars(p0.damping, p1.damping, m);
+        c.damping = combineScalars(p0.damping, p1.damping, m, variant);
     }
     const uint32_t cf = f0 | f1;
     if ((cf & FLAG_DISABLE_FRICTION) == 0)
     {
         const uint32_t fm = std::max(fric0, fric1);
-        const float d = combineScalars(p0.dynamicFriction, p1.dynamicFriction, fm);
-        const float s = combineScalars(p0.staticFriction, p1.staticFriction, fm);
-        const float fd = std::max(d, 0.f);
+        const float d = combineScalars(p0.dynamicFriction, p1.dynamicFriction, fm, variant);
+        const float s = combineScalars(p0.staticFriction, p1.staticFriction, fm, variant);
+        // PxMax(dynFriction, 0.0f) (PxsMaterialCombiner.h:161) = selectMax: +0 for d = -0,
+        // where std::max(-0, 0) returns -0.
+        const float fd = (d > 0.f) ? d : 0.f;
         c.dyn = fd;
         c.sta = (s - fd) >= 0.f ? s : fd;
         c.flags = cf;

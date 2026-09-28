@@ -125,8 +125,8 @@ std::vector<MaterialH> makeMaterials(std::mt19937& rng)
     std::vector<MaterialH> mats(NMAT);
     for (auto& m : mats)
     {
-        // Strictly non-zero magnitudes: PxMin/PxMax and the shader's min/max may
-        // differ on +0 vs -0 (P9.86), which is not what this fixture is about.
+        // Strictly non-zero magnitudes here; the +0/-0 ties of PxMin/PxMax (P9.86)
+        // are driven on purpose by cvxCoreTailBda_materialZeroSign's ZS_BANK.
         m.dynamicFriction = rf(0.05f, 1.5f);
         m.staticFriction = rf(0.05f, 1.5f);
         m.restitution = (rng() % 4 == 0) ? rf(-2.0f, -0.1f) : rf(0.05f, 1.0f);
@@ -432,6 +432,31 @@ void checkCoverage(const char* test, const Coverage& c, bool multi)
         PXG_CHECK_MSG(c.multiPatch > N / 4 && c.junkCounts > N / 4, "%s: multi-patch coverage thin", test);
 }
 
+// P9.86 zero-sign bank: +0/-0 material pairs that tie in combineScalars.  All are
+// valid PxMaterial data (NpMaterial.cpp: friction finite only, restitution finite
+// and <= 1, damping finite and >= 0 -- and -0 >= 0 holds; -0 is not compliant).
+const uint32_t ZS_BANK = 0x2A00u, ZS_COUNT = 6u;
+MaterialH zeroSignMaterial(uint32_t k)
+{
+    const float pz = 0.0f, nz = -0.0f;
+    auto modes = [](uint32_t f, uint32_t r) { return (f << 16) | (r << 24); };
+    switch (k)
+    {
+    case 0: return { pz, pz, pz, pz, modes(1, 1), 1u };        // all eMIN, +0
+    case 1: return { nz, nz, nz, nz, modes(1, 1), 1u };        // all eMIN, -0
+    case 2: return { pz, pz, pz, pz, modes(3, 3), 3u };        // all eMAX, +0
+    case 3: return { nz, nz, nz, nz, modes(3, 3), 3u };        // all eMAX, -0
+    case 4: return { pz, pz, -0.5f, pz, modes(0, 0), 0u };     // compliant, damping +0
+    default: return { pz, pz, 0.4f, nz, modes(0, 0), 0u };     // rigid, damping -0
+    }
+}
+struct ZsPair { uint32_t a, b; };
+// (1,0): eMIN(-0,+0) -> +0, FMin gives -0 (words 7, 9, 10).
+// (2,3): eMAX(+0,-0) -> -0, FMax gives +0 (words 7, 9, 10).
+// (4,5): exactly one compliant forces damping to eMAX(+0,-0) -> -0 (word 10).
+// (0,1), (3,2), (5,4): same bits either way (controls).
+const ZsPair ZS_PAIRS[ZS_COUNT] = { { 1, 0 }, { 0, 1 }, { 2, 3 }, { 3, 2 }, { 4, 5 }, { 5, 4 } };
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -564,4 +589,131 @@ PXG_TEST(cvxCoreTailBda_multi)
     const DeviceRun g = runDevice("cctMulti", cases, mats, init);
     compareAll("cvxCoreTailBda_multi", g, e);
     checkCoverage("multi", cov, true);
+}
+
+// ---------------------------------------------------------------------------
+// P9.86: combineScalars' eMIN/eMAX are PxMin/PxMax<float> = selectMin/selectMax
+// (PxsMaterialCombiner.h:43/47, PxMath.h:98-101/82-85, PxUnixMathIntrinsics.h:
+// 116-125): on a +0/-0 tie the SECOND operand survives.  GLSL FMin/FMax (the pre-fix
+// port) give -0 / +0 in either order on llvmpipe.  Directed +-0 material pairs,
+// through both tails, words 7 (restitution), 9 (static friction) and 10 (damping)
+// compared bitwise.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCoreTailBda_materialZeroSign)
+{
+    // (a) host coverage: the twins must change the mirror image of the directed pairs.
+    size_t twinChanged[3] = { 0, 0, 0 }, forcedMaxTie = 0, dynNegZeroAtClamp = 0;
+    for (uint32_t p = 0; p < ZS_COUNT; ++p)
+    {
+        const MaterialH m0 = zeroSignMaterial(ZS_PAIRS[p].a), m1 = zeroSignMaterial(ZS_PAIRS[p].b);
+        const CombinedH c0 = combine(m0, m1);
+        for (int v = 1; v <= 2; ++v)
+        {
+            const CombinedH cv = combine(m0, m1, v);
+            if (bitsOfF(cv.rest) != bitsOfF(c0.rest) || bitsOfF(cv.dyn) != bitsOfF(c0.dyn) ||
+                bitsOfF(cv.sta) != bitsOfF(c0.sta) || bitsOfF(cv.damping) != bitsOfF(c0.damping))
+                ++twinChanged[v];
+        }
+        if ((m0.restitution < 0.f) != (m1.restitution < 0.f) && bitsOfF(m0.damping) == 0x00000000u &&
+            bitsOfF(m1.damping) == 0x80000000u)
+            ++forcedMaxTie;
+        const uint32_t fm = std::max((m0.flagsModes0 >> 16) & 0xFFu, (m1.flagsModes0 >> 16) & 0xFFu);
+        if (bitsOfF(combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm)) == 0x80000000u)
+            ++dynNegZeroAtClamp;
+    }
+    // Mirror self-check: select semantics and the PxMax(d, 0) clamp.
+    const uint32_t restMin = bitsOfF(combine(zeroSignMaterial(1), zeroSignMaterial(0)).rest);
+    const uint32_t restMax = bitsOfF(combine(zeroSignMaterial(2), zeroSignMaterial(3)).rest);
+    const uint32_t dynClamp = bitsOfF(combine(zeroSignMaterial(0), zeroSignMaterial(1)).dyn);
+    std::printf("  [zeroSign] twinChanged FMin %zu FMax %zu forcedMaxTie %zu dynNegZeroAtClamp %zu\n",
+                twinChanged[1], twinChanged[2], forcedMaxTie, dynNegZeroAtClamp);
+    PXG_CHECK_MSG(restMin == 0x00000000u && restMax == 0x80000000u && dynClamp == 0x00000000u,
+                  "mirror: PxMin(-0,+0) 0x%08x PxMax(+0,-0) 0x%08x PxMax(-0,0) 0x%08x", restMin, restMax, dynClamp);
+    PXG_CHECK_MSG(twinChanged[1] >= 1, "FMin twin never changes the image (%zu)", twinChanged[1]);
+    PXG_CHECK_MSG(twinChanged[2] >= 2, "FMax twin changes the image on too few pairs (%zu)", twinChanged[2]);
+    PXG_CHECK_MSG(forcedMaxTie >= 1, "no forced-eMAX damping tie (%zu)", forcedMaxTie);
+    PXG_CHECK_MSG(dynNegZeroAtClamp >= 2, "too few -0 dynamic frictions at the clamp (%zu)", dynNegZeroAtClamp);
+
+    // (b) device: both tails, every case written, the pair cycling with t.
+    for (int multi = 0; multi < 2; ++multi)
+    {
+        std::mt19937 rng(8703 + multi);
+        auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+        std::vector<MaterialH> mats = makeMaterials(rng);
+        for (uint32_t k = 0; k < ZS_COUNT; ++k) mats[ZS_BANK + k] = zeroSignMaterial(k);
+
+        Expected e;
+        initImages(e, rng);
+        const Expected init = e;
+        Coverage cov;
+        size_t written[ZS_COUNT] = { 0, 0, 0, 0, 0, 0 };
+
+        std::vector<CctCaseH> cases(N);
+        std::memset(cases.data(), 0, cases.size() * sizeof(CctCaseH));
+        for (uint32_t t = 0; t < N; ++t)
+        {
+            CctCaseH& c = cases[t];
+            const ZsPair zp = ZS_PAIRS[t % ZS_COUNT];
+            c.hdr[2] = ZS_BANK + zp.a;
+            c.hdr[3] = ZS_BANK + zp.b;
+            c.lim[0] = c.lim[1] = c.lim[2] = 0xF0000000u;   // no overflow: every case writes
+            c.lim[3] = 0;
+            for (uint32_t i = 0; i < 16; ++i)
+                for (uint32_t k = 0; k < 4; ++k) c.patchNormal[i][k] = rf(-1.f, 1.f);
+            for (uint32_t i = 0; i < 64; ++i)
+                for (uint32_t k = 0; k < 4; ++k) c.points[i][k] = rf(-5.f, 5.f);
+            uint32_t numPatches, numPoints = 0;
+            if (multi)
+            {
+                numPatches = 1u + (t / ZS_COUNT) % 3u;
+                for (uint32_t i = 0; i < numPatches; ++i) { c.patchCount[i] = 1u + (t + i) % 4u; numPoints += c.patchCount[i]; }
+                c.hdr[0] = numPatches;
+                c.hdr[1] = numPoints;
+            }
+            else
+            {
+                numPatches = 1u;
+                numPoints = 1u + (t / ZS_COUNT) % 4u;
+                c.hdr[0] = numPoints;
+            }
+
+            // ---- the mirror ----
+            FlagsIn f{ numPoints & 0xFFFFu, numPatches & 0xFFu, true, 64u * numPatches };
+            const FlagsOut o = refOutputAndFlags(t, c, f, e, cov);
+            if (o.contactOff != INVALID)
+            {
+                if (multi)
+                {
+                    uint32_t slot = 0;
+                    for (uint32_t i = 0; i < numPatches; ++i)
+                        for (uint32_t j = 0; j < c.patchCount[i]; ++j, ++slot)
+                            for (uint32_t k = 0; k < 4; ++k)
+                                e.contact[o.contactOff / 4 + slot * 4 + k] = bitsOfF(c.points[i * 4 + j][k]);
+                }
+                else
+                    for (uint32_t i = 0; i < numPoints; ++i)
+                        for (uint32_t k = 0; k < 4; ++k)
+                            e.contact[o.contactOff / 4 + i * 4 + k] = bitsOfF(c.points[i][k]);
+            }
+            if (o.patchIndex != INVALID)
+            {
+                const uint32_t mi0 = c.hdr[2] & 0xFFFFu, mi1 = c.hdr[3] & 0xFFFFu;
+                const CombinedH cm = combine(mats[mi0], mats[mi1]);
+                uint32_t start = 0;
+                for (uint32_t i = 0; i < numPatches; ++i)
+                {
+                    const uint32_t cnt = multi ? c.patchCount[i] : numPoints;
+                    refHeader(e, o.patchIndex + i * 64u, c.patchNormal[i], start, cnt, cm, mi0, mi1);
+                    start += cnt;
+                }
+                ++written[t % ZS_COUNT];
+            }
+        }
+
+        const char* label = multi ? "cvxCoreTailBda_materialZeroSign/multi" : "cvxCoreTailBda_materialZeroSign/single";
+        const DeviceRun g = runDevice(multi ? "cctMulti" : "cctSingle", cases, mats, init);
+        compareAll(label, g, e);
+        for (uint32_t p = 0; p < ZS_COUNT; ++p)
+            PXG_CHECK_MSG(written[p] >= 32, "%s: pair %u written only %zu times", label, p, written[p]);
+    }
 }
