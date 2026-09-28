@@ -10222,9 +10222,23 @@ PXG_TEST(softBodySimClothVertContactGen)
         tetVerts.push_back(F4{ ox,        1.0f, 0.0f, 1.0f });
         tets.push_back({ b, b + 1u, b + 2u, b + 3u });
     }
+    // P9.86c: tet 6 (TET_ZS) is tet 0's shape at ox = 24 with its corners REORDERED so that
+    // a = (25,0,0), b = (24,0,0), c = (24,0,1), d = (24,1,0): detBcd is still +1, but
+    // cross(c-a, d-a) = (-1,-1,-1).  Only the directed sub-run at the end pairs it; the main
+    // stack never names it, so every count above and below is unchanged.
+    const uint32_t TET_ZS = NTET, VTX_ZS = 7u;
+    {
+        const uint32_t b = uint32_t(tetVerts.size());   // 24
+        tetVerts.push_back(F4{ 24.0f, 0.0f, 0.0f, 1.0f });
+        tetVerts.push_back(F4{ 24.0f, 0.0f, 1.0f, 1.0f });
+        tetVerts.push_back(F4{ 25.0f, 0.0f, 0.0f, 1.0f });
+        tetVerts.push_back(F4{ 24.0f, 1.0f, 0.0f, 1.0f });
+        tets.push_back({ b + 2u, b, b + 1u, b + 3u });
+    }
     std::vector<uint32_t> hintWords(2u, 0u);
     for (uint32_t t = 0; t < NTET; ++t)
         reinterpret_cast<uint8_t*>(hintWords.data())[t] = masks[t];
+    reinterpret_cast<uint8_t*>(hintWords.data())[TET_ZS] = 0x1u;   // face (a,b,c), y = 0
     DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets), bHints = makeDev(dev, hintWords);
     if (!bTetVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
@@ -10232,7 +10246,7 @@ PXG_TEST(softBodySimClothVertContactGen)
     sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
     sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
     sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
-    sb.mNumTets = NTET;
+    sb.mNumTets = NTET + 1u;
     sb.mNumVerts = uint32_t(tetVerts.size());
     std::vector<PxgSoftBody> descArr = { sb };
     DevBuf bDesc = makeDev(dev, descArr);
@@ -10271,6 +10285,7 @@ PXG_TEST(softBodySimClothVertContactGen)
         { 12.20f,  0.10f, 0.20f, 1.0f },
         { 16.20f,  0.10f, 0.20f, 1.0f },
         { 21.05f, -0.20f, 0.00f, 1.0f },
+        { 25.0625f, -0.125f, 0.0f, 1.0f },   // v7 -> tet 6, the directed sub-run only
     };
     DevBuf bClothVerts = makeDev(dev, clothVerts);
 
@@ -10502,6 +10517,79 @@ PXG_TEST(softBodySimClothVertContactGen)
                       "an OR, so any one of them is enough.  Expected 3 of the 4 contacts, "
                       "got %u", term, n2);
         dev->destroyBuffer(bF.h); dev->destroyBuffer(bT2.h); dev->destroyBuffer(bI2.h);
+    }
+
+    // ---- P9.86c (softBodyClothVertContactGenBda-r1): the -0 barycentric lane ---------------
+    // computeTetBarycentric (deformableCollision.cuh:96-138) clamps each lane with PxClamp =
+    // selectMin(1, selectMax(0, t)) (PxMath.h:142, PxUnixMathIntrinsics.h:116-125), which keeps
+    // a -0; GLSL FClamp gives +0 on llvmpipe (F4).  v7 = a + (0.0625, -0.125, 0) lies in a's
+    // vertex region of the y = 0 face, so closestPtPointTriangle2 returns a itself and
+    // pa = (+0,+0,+0).  Then v = pa . (ca x da) / detBcd = ((+0)(-1) + (+0)(-1) + (+0)(-1)) / 1
+    // = -0, while w = x = +0 and u = 1: every value is exact, so neither operation order nor
+    // FMA contraction can move the sign.  The CUDA stores barycentric1 = (1, -0, +0, +0).
+    {
+        std::vector<uint32_t> sz = { 0u, VTX_ZS, TET_ZS, 0u };
+        std::vector<uint32_t> pnz = { 1u }, ndz = { 0u }, tz = { 0u };
+        std::vector<F4> poison(4u, F4{ -9, -9, -9, -9 });
+        std::vector<FemFemInfoHost> iz(4u);
+        std::memset(iz.data(), 0xEE, iz.size() * sizeof(FemFemInfoHost));
+        DevBuf bSz = makeDev(dev, sz), bPnz = makeDev(dev, pnz), bNdz = makeDev(dev, ndz);
+        DevBuf bTz = makeDev(dev, tz), bPtz = makeDev(dev, poison), bNpz = makeDev(dev, poison);
+        DevBuf bB0z = makeDev(dev, poison), bB1z = makeDev(dev, poison), bIz = makeDev(dev, iz);
+        SbClothVertCgPush pz = push;
+        pz.stackSizeBytes = 16u;
+        pz.stackPtr = bSz.addr;
+        pz.midphasePairsNum = bPnz.addr;
+        pz.stackSizeNeededOnDevice = bNdz.addr;
+        pz.outPoint = bPtz.addr; pz.outNormalPen = bNpz.addr;
+        pz.outBarycentric0 = bB0z.addr; pz.outBarycentric1 = bB1z.addr;
+        pz.outContactInfo = bIz.addr; pz.totalContactCount = bTz.addr;
+        pz.maxContacts = 4u;
+        Kernel("softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch",
+               {}, sizeof(SbClothVertCgPush)).dispatch(512u, {}, pz, 1u, 1u);
+        dev->flush();
+        const uint32_t nz = downloadBuffer<uint32_t>(dev, bTz.h, 1)[0];
+        const F4 gp = downloadBuffer<F4>(dev, bPtz.h, 1)[0];
+        const F4 gnp = downloadBuffer<F4>(dev, bNpz.h, 1)[0];
+        const F4 gb = downloadBuffer<F4>(dev, bB1z.h, 1)[0];
+        PXG_CHECK_MSG(nz == 1u, "v7 is 0.14 outside tet 6, inside the 0.25 contact distance: one "
+                      "contact, got %u", nz);
+        PXG_CHECK_MSG(f2u(gp.x) == f2u(25.0f) && f2u(gp.y) == 0u && f2u(gp.z) == 0u,
+                      "precondition: the witness is corner a = (25,+0,+0) bit for bit, else pa is "
+                      "not (+0,+0,+0); got %08x %08x %08x", f2u(gp.x), f2u(gp.y), f2u(gp.z));
+        const TetIdx4 ti = tets[TET_ZS];
+        auto v3 = [&](uint32_t i) { return p86cgz::V3z{ tetVerts[i].x, tetVerts[i].y, tetVerts[i].z }; };
+        const p86cgz::V3z wp = { gp.x, gp.y, gp.z };
+        F4 ref, twin;
+        p86cgz::gTetBaryFClampTwin = false;
+        p86cgz::zTetBary(v3(ti.x), v3(ti.y), v3(ti.z), v3(ti.w), wp, ref);
+        p86cgz::gTetBaryFClampTwin = true;
+        p86cgz::zTetBary(v3(ti.x), v3(ti.y), v3(ti.z), v3(ti.w), wp, twin);
+        p86cgz::gTetBaryFClampTwin = false;
+        const uint32_t baryNegZeroSeen =
+            uint32_t(f2u(ref.x) == 0x80000000u && f2u(twin.x) == 0u) +
+            uint32_t(f2u(ref.y) == 0x80000000u && f2u(twin.y) == 0u) +
+            uint32_t(f2u(ref.z) == 0x80000000u && f2u(twin.z) == 0u) +
+            uint32_t(f2u(ref.w) == 0x80000000u && f2u(twin.w) == 0u);
+        PXG_CHECK_MSG(baryNegZeroSeen == 1u,
+                      "coverage: the directed tet must give one -0 barycentric lane that FClamp "
+                      "turns into +0 (%u)", baryNegZeroSeen);
+        PXG_CHECK_MSG(f2u(ref.x) == 0x3f800000u && f2u(ref.y) == 0x80000000u &&
+                      f2u(ref.z) == 0u && f2u(ref.w) == 0u,
+                      "mirror image (1, -0, +0, +0); got %08x %08x %08x %08x",
+                      f2u(ref.x), f2u(ref.y), f2u(ref.z), f2u(ref.w));
+        PXG_CHECK_MSG(f2u(gb.x) == f2u(ref.x) && f2u(gb.y) == f2u(ref.y) &&
+                      f2u(gb.z) == f2u(ref.z) && f2u(gb.w) == f2u(ref.w),
+                      "barycentric1 bitwise: PxClamp keeps v = -0 (deformableCollision.cuh:132-135); "
+                      "got %08x %08x %08x %08x", f2u(gb.x), f2u(gb.y), f2u(gb.z), f2u(gb.w));
+        const float wantPen = std::sqrt(0.01953125f);
+        PXG_CHECK_MSG(std::fabs(gnp.w - wantPen) < 1e-5f &&
+                      std::fabs(gnp.x + 0.0625f / wantPen) < 1e-4f &&
+                      std::fabs(gnp.y - 0.125f / wantPen) < 1e-4f && std::fabs(gnp.z) < 1e-4f,
+                      "v7 is OUTSIDE at distance %.6f from corner a, normal toward the vertex; "
+                      "got (%.5f %.5f %.5f) pen %.6f", wantPen, gnp.x, gnp.y, gnp.z, gnp.w);
+        for (PxgBufferHandle h : { bSz.h, bPnz.h, bNdz.h, bTz.h, bPtz.h, bNpz.h, bB0z.h, bB1z.h, bIz.h })
+            dev->destroyBuffer(h);
     }
 
     for (PxgBufferHandle h : { bTetVerts.h, bTets.h, bHints.h, bDesc.h, bClothVerts.h, bCloth.h,
