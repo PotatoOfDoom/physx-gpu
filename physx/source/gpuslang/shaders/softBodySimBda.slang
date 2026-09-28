@@ -223,6 +223,8 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
                 ? float3((dv.x == 0.0f) ? 0.0f : dv.x, (dv.y == 0.0f) ? 0.0f : dv.y, (dv.z == 0.0f) ? 0.0f : dv.z)
                 : float3(0.0f, 0.0f, 0.0f);
 
+            // P9.86f: in TGS delta is the float3(0) select arm on the runtime isTGS -- not folded by llvmpipe
+            // (p86SignedZero rows 23-25), so this is IEEE `oldPos + 0` as softBodyGM.cu:188.
             const float3 pos = oldPos + delta;
             // The positions are still moved when gravity is applied every substep so
             // that refit bounds of the bvh and the following collision detection do

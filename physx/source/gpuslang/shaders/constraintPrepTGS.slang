@@ -363,6 +363,8 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         const bool isGreater2 = ((restitution > 0.0f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
 
         // P9.86: CUDA (cuh:951) adds the selected +0 when !isGreater2 (cTargetVel -0 -> +0); spelled as a select.
+        // P9.86f: the select is not needed on llvmpipe (a select-arm zero is not folded, p86SignedZero rows 23-25)
+        // but is identical to the CUDA's `cTargetVel + (isGreater2 ? b : 0.f)`, and stays.
         const float bounceVel = isGreater2 ? (-vrel) * restitution : 0.0f;
         float targetVelocity = isGreater2 ? (cTargetVel + bounceVel) : tgsPlusZero(cTargetVel);
 

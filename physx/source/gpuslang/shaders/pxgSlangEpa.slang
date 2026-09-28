@@ -349,7 +349,9 @@ public uint epaRun(float input[32], uint size, float releps, GjkCloud a, GjkClou
         // shortest-distance live triangle
         float e = EPA_MAX_F32;
         // P9.86: CUDA epa.cuh:430-436 reduces with an fminf butterfly; NVIDIA fminf(+0,-0) = fminf(-0,+0) = -0
-        // independent of order, llvmpipe FMin is not.  Select spelling: identical to fminf for
+        // independent of order.  P9.86f correction: so does llvmpipe's FMin in a SignedZeroInfNanPreserve-
+        // stamped shader (Mesa nir_lower_alu, lower_fminmax_signed_zero, pinned by p86SignedZero); only the
+        // unstamped x86 minps is order-dependent.  Select spelling kept: identical to fminf for
         // non-zero/inf/NaN tv (e is never NaN), and -0 wins for equal zeros.
         for (uint tI = 0u; tI < 32u; ++tI) { const float tv = ((liveTriangles & (1u << tI)) != 0u) ? L.dist[tI] : EPA_MAX_F32; e = ((tv < e) || ((tv == 0.0f) && (e == 0.0f) && (asuint(tv) != 0u))) ? tv : e; }
         uint f = 0u;

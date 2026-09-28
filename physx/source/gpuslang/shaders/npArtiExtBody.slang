@@ -584,6 +584,8 @@ void aebFinalizePGS(uint3 dtid : SV_DispatchThreadID)
         const bool isGreater2 = (restitution > 0.0f) && (bounceThreshold > vrel) && collidingWithVrel;
         const bool ccdSeparationCondition = ccdMaxSeparation >= penetration;
 
+        // P9.86f: equivalent as spelled -- the literal 0.0f reaches the add only as a select arm on a
+        // runtime condition, which llvmpipe does not fold (p86SignedZero rows 23-25): IEEE `cTargetVel + 0`, as the CUDA (artiConstraintPrep2.cu:352).
         float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
         const float tvel = targetVelocity;
 

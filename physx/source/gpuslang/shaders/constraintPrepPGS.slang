@@ -326,6 +326,8 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
 
         const bool ccdSeparationCondition = ccdMaxSeparation >= penetration;
 
+        // P9.86f: equivalent as spelled -- the literal 0.0f reaches the add only as a select arm on a
+        // runtime condition, which llvmpipe does not fold (p86SignedZero rows 23-25): IEEE `cTargetVel + 0`, as the CUDA (contactConstraintBlockPrep.cuh:481).
         float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
         targetVelocity = targetVelocity - vrel;
 

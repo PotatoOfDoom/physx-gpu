@@ -251,6 +251,8 @@ void ps_stepParticlesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupI
             const float3 oldPos = float3(tPos.x, tPos.y, tPos.z);
             const float3 delta = vel * gSp.dt;
             const float3 pos = oldPos + delta;
+            // P9.86f: on the first iteration dlta is the float3(0) select arm on the runtime isFirstIteration --
+            // not folded by llvmpipe (p86SignedZero rows 23-25), so this is IEEE `delta + 0` as particlesystem.cu:187.
             const float3 totalDelta = delta + dlta;
 
             if (velChanged)

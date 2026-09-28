@@ -1374,6 +1374,8 @@ uint acpSetupFinalizeExtPGS(
         const bool ccdSeparationCondition = ACP_MAX_F32 >= penetration;
 
         // trap 34: the PARENTHESIZED form -- no precedence quirk in PGS
+        // P9.86f: equivalent as spelled -- the literal 0.0f reaches the add only as a select arm on a
+        // runtime condition, which llvmpipe does not fold (p86SignedZero rows 23-25): IEEE `cTargetVel + 0`, as the CUDA (artiConstraintPrep2.cu:352).
         float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
 
         // trap 38: saved BEFORE the adjust

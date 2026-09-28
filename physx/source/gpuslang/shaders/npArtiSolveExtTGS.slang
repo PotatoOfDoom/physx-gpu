@@ -690,10 +690,12 @@ public void svxSolveExt1DBlockTGS(
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
         // P9.86: the CUDA's fminf/fmaxf (solverBlockTGS.cuh:1060) are PTX min/max, which order
         // the zeros (+0 > -0): fmaxf(+0, -0) = +0 and fminf(-0, +0) = -0 in either operand order.
-        // llvmpipe's FMax/FMin are x86 maxps/minps and return the SECOND operand on a zero tie
-        // (e.g. a drive with forceLimit -0.0f: minImpulse +0, maxImpulse -0).  Only a pair of
-        // zeros is re-spelled, as a select; every other input, inf and NaN included, still goes
-        // through max/min unchanged.
+        // P9.86f correction: in this SignedZeroInfNanPreserve-stamped shader llvmpipe's FMax/FMin
+        // order the zeros the same way (Mesa nir_lower_alu, lower_fminmax_signed_zero, pinned by
+        // p86SignedZero); only unstamped x86 maxps/minps return the SECOND operand on a zero tie.
+        // The zero-pair select below is thus redundant on the stamped build but identical to
+        // fmaxf/fminf (e.g. forceLimit -0.0f: minImpulse +0, maxImpulse -0), and stays; every
+        // other input, inf and NaN included, still goes through max/min unchanged.
         const float loForce = (minImpulse == 0.0f && unclampedForce == 0.0f)
                             ? ((asuint(minImpulse) == 0u) ? minImpulse : unclampedForce)
                             : max(minImpulse, unclampedForce);
