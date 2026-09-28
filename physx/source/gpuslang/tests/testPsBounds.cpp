@@ -611,15 +611,22 @@ static Pass2 secondPassRef(const std::vector<float>& bounds, uint32_t numBounds,
     const uint32_t iters = (numBounds + 1023u) / 1024u;
     for (uint32_t it = 0; it < iters; ++it)
     {
-        float nmn[3] = { PXMAX, PXMAX, PXMAX }, nmx[3] = { -PXMAX, -PXMAX, -PXMAX };
+        // particlesystem.cu:601-602: a lane past numBounds holds bound.setEmpty(),
+        // i.e. +-PX_MAX_BOUNDS_EXTENTS = PX_MAX_REAL * 0.25f = asfloat(0x7e7fffff)
+        // (PxBounds3.h:41/321-325).  Those lanes are real operands of the
+        // fminf/fmaxf reduction (reduction.cuh:53/83), not identities.
+        const float PXBE = u2f(0x7e7fffffu);
+        float nmn[3], nmx[3];
         for (uint32_t t = 0; t < 1024u; ++t)
         {
             const uint32_t e = it * 1024u + t;
-            if (e >= numBounds) continue; // PxBounds3::setEmpty(): the fminf/fmaxf identities
+            const bool real = e < numBounds;
             for (int k = 0; k < 3; ++k)
             {
-                nmn[k] = nvFminf(nmn[k], bounds[e * 6u + k]);
-                nmx[k] = nvFmaxf(nmx[k], bounds[e * 6u + 3u + k]);
+                const float lmn = real ? bounds[e * 6u + k] : PXBE;
+                const float lmx = real ? bounds[e * 6u + 3u + k] : -PXBE;
+                nmn[k] = (t == 0u) ? lmn : nvFminf(nmn[k], lmn);
+                nmx[k] = (t == 0u) ? lmx : nvFmaxf(nmx[k], lmx);
             }
         }
         for (int k = 0; k < 3; ++k)
@@ -940,6 +947,42 @@ PXG_TEST(psBounds_updateBoundSecondPassAccZeroSign)
                   "psBounds acc zero-sign coverage: accumulator +-0 ties not exercised in every axis (min=%u max=%u)",
                   tiesSet[0].minTie, tiesSet[1].maxTie);
 
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCd.h);
+}
+
+// Port-parity probe for the setEmpty() lanes of ps_updateBoundSecondPassLaunch
+// (particlesystem.cu:601-602): lanes past numBounds hold +-PX_MAX_BOUNDS_EXTENTS
+// = asfloat(0x7e7fffff) (PxBounds3.h:41/321-325), not +-PX_MAX_F32.  Only bound
+// coordinates beyond +-PX_MAX_BOUNDS_EXTENTS can see the constant, which is
+// outside the PxBounds3 contract; this is a regression check of the constant,
+// not a signed-zero kill.  numBounds = 1 with min = (1e38, 2e38, 3e38) and
+// max = -min: CUDA folds the empty lanes to 0x7e7fffff / 0xfe7fffff.
+PXG_TEST(psBounds_updateBoundSecondPassEmptyLanes)
+{
+    using namespace psbz;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    PxgParticleSystem ps = makeZeroPs();
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<float> contactDists = { 0.0f };
+    DevBuf bCd = makeDev(dev, contactDists);
+    std::vector<float> bounds = { 1e38f, 2e38f, 3e38f, -1e38f, -2e38f, -3e38f };
+    DevBuf bBounds = makeDev(dev, bounds);
+    std::vector<float> boundArray(6u, -123.f);
+    DevBuf bBoundArr = makeDev(dev, boundArray);
+
+    Ties t;
+    const Pass2 want = secondPassRef(bounds, 1u, 0.0f, t);
+    for (uint32_t k = 0; k < 3u; ++k)
+        PXG_CHECK_MSG(fbits(want.bound[k]) == 0x7e7fffffu && fbits(want.bound[3u + k]) == 0xfe7fffffu,
+                      "psBounds empty lanes: mirror bound[%u] = %08x / %08x, want the PX_MAX_BOUNDS_EXTENTS lanes",
+                      k, fbits(want.bound[k]), fbits(want.bound[3u + k]));
+    float got[6];
+    const size_t mm = runSecondPass(dev, bDesc, bBounds, 1u, bBoundArr, 1u, bCd, 0u, want, "empty lanes", got);
+    PXG_CHECK_MSG(mm == 0, "psBounds empty lanes: %zu bitwise mismatches (gpu min.x=%08x)", mm, fbits(got[0]));
+
+    dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bBoundArr.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCd.h);
 }
 

@@ -355,9 +355,10 @@ void ps_updateBoundSecondPassLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
     {
         const uint elemIndex = tid + i * UPDATEBOUND;
 
-        // PxBounds3::setEmpty()
-        float3 bmn = float3(PX_MAX_F32, PX_MAX_F32, PX_MAX_F32);
-        float3 bmx = float3(-PX_MAX_F32, -PX_MAX_F32, -PX_MAX_F32);
+        // PxBounds3::setEmpty(): +-PX_MAX_BOUNDS_EXTENTS = PX_MAX_REAL * 0.25f
+        // = asfloat(0x7e7fffff) (PxBounds3.h:41/321-325; particlesystem.cu:601-602).
+        float3 bmn = float3(asfloat(0x7e7fffffu), asfloat(0x7e7fffffu), asfloat(0x7e7fffffu));
+        float3 bmx = float3(-asfloat(0x7e7fffffu), -asfloat(0x7e7fffffu), -asfloat(0x7e7fffffu));
         if (elemIndex < numBounds)
         {
             const uint b = elemIndex * BOUNDS_FLOATS;
