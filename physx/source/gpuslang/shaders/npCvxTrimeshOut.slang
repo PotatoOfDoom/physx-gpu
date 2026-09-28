@@ -133,9 +133,12 @@ float3 getNormalizedV(float3 v)
 float combineScalars(float a, float b, uint mode)
 {
     if (mode == 0u) return 0.5f * (a + b);
-    if (mode == 1u) return min(a, b);
+    // P9.86e: PxMin/PxMax<float> (PxsMaterialCombiner.h:43/47, :60/:64) are selectMin/selectMax
+    // (PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand wins.  GLSL
+    // FMin/FMax give min(+0,-0) = -0 / max(+0,-0) = +0 on llvmpipe in either order, so spell the selects.
+    if (mode == 1u) return (a < b) ? a : b;
     if (mode == 2u) return a * b;
-    if (mode == 3u) return max(a, b);
+    if (mode == 3u) return (a > b) ? a : b;
     return 0.0f;
 }
 
@@ -168,7 +171,7 @@ void combineMaterialsFn(MaterialData m0, MaterialData m1,
         const uint mode = max(m0.fricMode, m1.fricMode);
         const float d = combineScalars(m0.dynamicFriction, m1.dynamicFriction, mode);
         const float s2 = combineScalars(m0.staticFriction, m1.staticFriction, mode);
-        const float fd = max(d, 0.0f);
+        const float fd = (d > 0.0f) ? d : 0.0f;   // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161)
         dynF = fd; staF = (s2 - fd) >= 0.0f ? s2 : fd;
         matFlags = cf;
     }

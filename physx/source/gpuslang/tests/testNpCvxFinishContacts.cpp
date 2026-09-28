@@ -79,17 +79,26 @@ static const float FLTMAX = 3.4028235e38f;
 
 static uint32_t popc(uint32_t m) { uint32_t c = 0; while (m) { c += m & 1u; m >>= 1; } return c; }
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
 static V3 qRot(const F4& q, const V3& v) { const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z, w2 = q.w * q.w - 0.5f, d2 = q.x * vx + q.y * vy + q.z * vz; return V3{ vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2, vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2, vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 }; }
 static V3 unit(const V3& a) { float l = std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z); return l > 0 ? V3{ a.x / l, a.y / l, a.z / l } : a; }
 
 struct MatRef { float dyn, sta, rest, damp; uint32_t flags, fricMode, restMode, dampMode; };
 
+// P9.86e: eMIN/eMAX are PxMin/PxMax<float> = intrinsics::selectMin/selectMax (PxsMaterialCombiner.h:43/47/60/64
+// -> PxMath.h:81-101 -> PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand survives.  The oracle
+// spells the selects (std::fmin/std::fmax are not PxMin/PxMax: their zero-tie sign is libm dependent).
+// gCombineVariant is a mutant twin replaying a reverted port: 1 = eMIN as GLSL FMin, 2 = eMAX as FMax, with
+// llvmpipe's zero order under the SZINP stamp (FMin(+-0,-+0) = -0, FMax = +0, either operand order).
+static int gCombineVariant = 0;
+static float fminLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fmaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
 static float combineScalars(float a, float b, uint32_t mode)
 {
     if (mode == 0) return 0.5f * (a + b);
-    if (mode == 1) return std::fmin(a, b);
+    if (mode == 1) return (gCombineVariant == 1) ? fminLp(a, b) : ((a < b) ? a : b);   // PxMin = selectMin
     if (mode == 2) return a * b;
-    if (mode == 3) return std::fmax(a, b);
+    if (mode == 3) return (gCombineVariant == 2) ? fmaxLp(a, b) : ((a > b) ? a : b);   // PxMax = selectMax
     return 0.f;
 }
 static void combineMaterials(const MatRef& m0, const MatRef& m1,
@@ -119,7 +128,7 @@ static void combineMaterials(const MatRef& m0, const MatRef& m1,
         const uint32_t mode = std::max(m0.fricMode, m1.fricMode);
         const float d = combineScalars(m0.dyn, m1.dyn, mode);
         const float s = combineScalars(m0.sta, m1.sta, mode);
-        const float fd = std::fmax(d, 0.f);
+        const float fd = (d > 0.f) ? d : 0.f;   // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161)
         dynF = fd; staF = (s - fd) >= 0.f ? s : fd; matFlags = cf;
     }
     else { matFlags = cf | 2u; dynF = 0.f; staF = 0.f; }
@@ -416,7 +425,9 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     };
     PxgCudaShim shim(dev, manifest, 1, &finLoader);
 
-    const uint32_t NMAT = 64;
+    // NLAUNCH random launches, then ONE directed launch (P9.86e) whose first NDIR pairs carry the +-0
+    // materials at [NMAT, NMAT + NDM); the directed bank draws nothing from rng.
+    const uint32_t NMAT = 64, NDM = 7, NDIR = 8;
     std::vector<MatRef> mats(NMAT);
     for (auto& m : mats)
     {
@@ -440,8 +451,46 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
             m.fricMode = rng2() % 4; m.restMode = rng2() % 4; m.dampMode = rng2() % 4;
         }
     }
+    // P9.86e DIRECTED SIGNED-ZERO MATERIALS.  eMIN/eMAX are PxMin/PxMax<float> selects: a +-0 tie returns
+    // the SECOND operand, so PxMin(-0,+0) = +0 and PxMax(+0,-0) = -0, where GLSL FMin/FMax on llvmpipe give
+    // -0 / +0 in either order.  -0 is a valid material value (NpMaterial checks finite and >= 0.f), and a
+    // restitution of -0 is rigid (-0 < 0 is false).  The random banks never produce -0.
+    // Fields: {dyn, sta, rest, damp, flags, fricMode, restMode, dampMode}; modes 1 = eMIN, 3 = eMAX.
+    {
+        const float PZ = 0.f, NZ = u2f(0x80000000u);
+        const MatRef dirMats[NDM] = {
+            { PZ, NZ, NZ, NZ, 0, 1, 1, 1 },          // D0  -0 under eMIN
+            { PZ, PZ, PZ, PZ, 0, 1, 1, 1 },          // D1  +0 under eMIN
+            { PZ, PZ, PZ, PZ, 0, 3, 3, 3 },          // D2  +0 under eMAX
+            { PZ, NZ, NZ, NZ, 0, 3, 3, 3 },          // D3  -0 under eMAX
+            { PZ, PZ, -0.5f, PZ, 0, 0, 0, 0 },       // D4  compliant (rest < 0), damping +0
+            { PZ, PZ, NZ, NZ, 0, 0, 0, 0 },          // D5  rigid (rest -0), damping -0
+            { NZ, PZ, PZ, PZ, 0, 0, 0, 0 },          // D6  dynamic friction -0 under eAVERAGE
+        };
+        for (uint32_t j = 0; j < NDM; ++j) mats[NMAT + j] = dirMats[j];
+    }
+    // One directed case per pair slot 0..NDIR-1 of the directed launch.  The material order is the
+    // UNSWAPPED shape order (cudaGJKEPA.cu:1573/1578), so (ma, mb) and (mb, ma) are the two shape orders;
+    // flipTypes additionally swaps the shape types (type1 < type0), which must not change the material
+    // order.  w7..w10 are restitution / dynF / staF / damping, the CUDA's bits computed by hand from
+    // PxsCombineMaterials.  killsVariant names the host twin whose patch words must differ.
+    struct DirCase { uint32_t ma, mb; bool flipTypes; uint32_t w7, w8, w9, w10; int killsVariant; };
+    const DirCase dirCases[NDIR] = {
+        { 0, 1, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K0 eMIN(-0,+0): PxMin +0, FMin -0
+        { 2, 3, false, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K1 eMAX(+0,-0): PxMax -0, FMax +0
+        { 4, 5, false, 0xBF000000u, 0u, 0x00000000u, 0x80000000u, 2 },   // K2 one compliant: damping forced to eMAX(+0,-0)
+        { 1, 0, false, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 0 },   // K3 control: eMIN(+0,-0) = -0 in both
+        { 3, 2, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K4 control: eMAX(-0,+0) = +0 in both
+        { 6, 6, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K5 d = 0.5*(-0 + -0) = -0: PxMax(d, 0) keeps dynF +0
+        { 0, 1, true,  0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K6 = K0 with swapped shape types
+        { 2, 3, true,  0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K7 = K1 with swapped shape types
+    };
+    PXG_CHECK_MSG(std::signbit(0.5f * (mats[NMAT + 6].dyn + mats[NMAT + 6].dyn)),
+                  "finishContacts directed: K5 must reach the dynF clamp with -0");
+    size_t cMinTie = 0, cMaxTie = 0, cDirPatch = 0;
+
     std::vector<PxsMaterialData> matData(mats.size());
-    for (uint32_t i = 0; i < uint32_t(mats.size()); i = (i + 1 == NMAT) ? 0x10000u : i + 1)
+    for (uint32_t i = 0; i < uint32_t(mats.size()); i = (i + 1 == NMAT + NDM) ? 0x10000u : i + 1)
     {
         matData[i].dynamicFriction = mats[i].dyn; matData[i].staticFriction = mats[i].sta;
         matData[i].restitution = mats[i].rest; matData[i].damping = mats[i].damp;
@@ -477,8 +526,9 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     size_t cOvf = 0, cPatchOvf = 0, cInval = 0, cAvg = 0, cInvalid = 0, cEmpty = 0;
     size_t mmMf = 0, mmOut = 0, mmFlags = 0, mmCnt = 0, mmPoints = 0, mmPatch = 0;
 
-    for (uint32_t launch = 0; launch < NLAUNCH; ++launch)
+    for (uint32_t launch = 0; launch <= NLAUNCH; ++launch)   // launch == NLAUNCH is the directed one
     {
+        const bool directed = (launch == NLAUNCH);
         const uint32_t numTests = 24 + (rng() % 9);
         const bool insertAvg = (launch % 2 == 0);
         if (insertAvg) ++cAvg;
@@ -524,8 +574,52 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
 
         cInvalid += (32 - numTests);
 
+        if (directed)
+            for (uint32_t k = 0; k < NDIR; ++k)
+            {
+                // One valid, kept contact (pen -0.5 <= cd) so the pair writes a patch; no bit-16 index.
+                Pair& p = pr[k];
+                const DirCase& dc = dirCases[k];
+                p.mat0 = NMAT + dc.ma; p.mat1 = NMAT + dc.mb;
+                p.type0 = dc.flipTypes ? 5u : 3u; p.type1 = dc.flipTypes ? 3u : 5u;
+                p.rawNb = 1;
+                p.normPen[0].w = -0.5f;
+            }
+
         FinishRef ref;
         refFinish(pr, numTests, insertAvg, initC, initF, initP, cLimit, fLimit, pLimit, mats, BUF, ref);
+
+        // Patch words 7..10 (restitution, dynF, staF, damping) of pair k in a patch image.
+        auto patchWords = [&](const std::vector<uint8_t>& img, uint32_t off, uint32_t w[4]) {
+            std::memcpy(w, &img[size_t(off) + 28], 16);
+        };
+        if (directed)
+            for (uint32_t k = 0; k < NDIR; ++k)
+            {
+                const DirCase& dc = dirCases[k];
+                const PairOut& r = ref.pairs[k];
+                PXG_CHECK_MSG(k < numTests && r.patchWritten, "finishContacts directed %u: no patch written", k);
+                if (!(k < numTests && r.patchWritten)) continue;
+                uint32_t w[4];
+                patchWords(ref.patch, r.contactPatchesOff, w);
+                PXG_CHECK_MSG(w[0] == dc.w7 && w[1] == dc.w8 && w[2] == dc.w9 && w[3] == dc.w10,
+                              "finishContacts directed %u: oracle rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                              k, w[0], w[1], w[2], w[3], dc.w7, dc.w8, dc.w9, dc.w10);
+                ++cDirPatch;
+                for (int v = 1; v <= 2; ++v)
+                {
+                    FinishRef tw;
+                    gCombineVariant = v;
+                    refFinish(pr, numTests, insertAvg, initC, initF, initP, cLimit, fLimit, pLimit, mats, BUF, tw);
+                    gCombineVariant = 0;
+                    uint32_t tw4[4];
+                    patchWords(tw.patch, r.contactPatchesOff, tw4);
+                    const bool differs = std::memcmp(tw4, w, sizeof w) != 0;
+                    PXG_CHECK_MSG(differs == (dc.killsVariant == v), "finishContacts directed %u: twin %d %s the patch words",
+                                  k, v, differs ? "changes" : "does not change");
+                    if (differs) ++(v == 1 ? cMinTie : cMaxTie);
+                }
+            }
 
         std::vector<PxgContactManagerInput> cmIn(32);
         std::vector<PxgShape> shapes(64);
@@ -635,10 +729,22 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
         if (gCtr.patchesBytes != ref.patchesBytes || gCtr.contactsBytes != ref.contactsBytes ||
             gCtr.forceAndIndiceBytes != ref.forceBytes || gCtr.overflowError != ref.overflowError) ++mmCnt;
         if (std::memcmp(gPoints.data(), ref.points.data(), BUF) != 0) ++mmPoints;
-        // patch payloads: 64-byte chunks; integer words exact, float words
-        // (norm x/y/z, restitution, dyn/sta friction, damping) to tolerance —
-        // the norm carries a GPU/CPU 1/sqrt whose last bit can differ (mirrors
-        // the writeStream port's tolerance-compared avgNorm).
+        if (directed)
+            for (uint32_t k = 0; k < NDIR; ++k)
+            {
+                const PairOut& r = ref.pairs[k];
+                if (!(k < numTests && r.patchWritten)) continue;
+                uint32_t rw[4], gw[4];
+                patchWords(ref.patch, r.contactPatchesOff, rw);
+                patchWords(gPatch, r.contactPatchesOff, gw);
+                PXG_CHECK_MSG(std::memcmp(rw, gw, sizeof rw) == 0,
+                              "finishContacts directed %u: GPU rest/dynF/staF/damp %08x %08x %08x %08x, oracle %08x %08x %08x %08x",
+                              k, gw[0], gw[1], gw[2], gw[3], rw[0], rw[1], rw[2], rw[3]);
+            }
+        // patch payloads: 64-byte chunks; integer words exact, the norm words 4..6 to tolerance --
+        // the norm carries a GPU/CPU 1/sqrt whose last bit can differ (mirrors the writeStream
+        // port's tolerance-compared avgNorm).  Words 7..10 (restitution, dyn/sta friction, damping)
+        // are pure material-combine results and compare bitwise, sign of zero included (P9.86e).
         for (size_t off = 0; off + 64 <= BUF; off += 64)
         {
             const uint32_t* r = reinterpret_cast<const uint32_t*>(&ref.patch[off]);
@@ -655,7 +761,7 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
             bool bad = false;
             for (int k = 0; k < 16; ++k)
             {
-                const bool floatWord = (k >= 4 && k <= 10); // norm, rest, dyn, sta, damp
+                const bool floatWord = (k >= 4 && k <= 6); // norm only
                 if (floatWord)
                 {
                     float rf2, gf2; std::memcpy(&rf2, &r[k], 4); std::memcpy(&gf2, &g[k], 4);
@@ -673,6 +779,9 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     PXG_CHECK_MSG(mmCnt == 0, "finishContacts: %zu counter mismatches", mmCnt);
     PXG_CHECK_MSG(mmPoints == 0, "finishContacts: %zu contact-stream mismatches", mmPoints);
     PXG_CHECK_MSG(mmPatch == 0, "finishContacts: %zu patch-payload mismatches", mmPatch);
+    PXG_CHECK_MSG(cDirPatch == NDIR && cMinTie == 2 && cMaxTie == 3,
+                  "finishContacts: signed-zero combine coverage thin (dirPatch %zu minTie %zu maxTie %zu)",
+                  cDirPatch, cMinTie, cMaxTie);
     PXG_CHECK_MSG(cOvf > 0 && cPatchOvf > 0 && cInval > NLAUNCH && cAvg > NLAUNCH / 3 && cInvalid > 0 && cEmpty > 0,
                   "finishContacts: coverage thin (cOvf %zu patchOvf %zu inval %zu avg %zu invalid %zu empty %zu)",
                   cOvf, cPatchOvf, cInval, cAvg, cInvalid, cEmpty);

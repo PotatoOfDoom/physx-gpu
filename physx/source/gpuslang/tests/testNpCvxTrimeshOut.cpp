@@ -470,6 +470,114 @@ PXG_TEST(npCvxTrimeshOut_finish)
 }
 
 
+// P9.86e DIRECTED SIGNED-ZERO MATERIALS through the record-model shader (npCvxTrimeshOut.spv); the same
+// directed bank and cases as cvxTriFinish below, which drives the engine BDA twin.  eMIN/eMAX are
+// PxMin/PxMax<float> selects: a +-0 tie returns the SECOND operand, so PxMin(-0,+0) = +0 and
+// PxMax(+0,-0) = -0, where GLSL FMin/FMax on llvmpipe give -0 / +0 in either order.  The random banks of
+// npCvxTrimeshOut_finish never produce -0, so without these cases the patch words are blind to the tie sign.
+PXG_TEST(npCvxTrimeshOut_materialZeroSign)
+{
+    const float PZ = 0.f, NZ = u2f(0x80000000u);
+    // Fields: {dyn, sta, rest, damp, flags, fricMode, restMode, dampMode}; modes 1 = eMIN, 3 = eMAX.
+    const std::vector<MaterialData> mats = {
+        { PZ, NZ, NZ, NZ, 0, 1, 1, 1 },          // D0  -0 under eMIN
+        { PZ, PZ, PZ, PZ, 0, 1, 1, 1 },          // D1  +0 under eMIN
+        { PZ, PZ, PZ, PZ, 0, 3, 3, 3 },          // D2  +0 under eMAX
+        { PZ, NZ, NZ, NZ, 0, 3, 3, 3 },          // D3  -0 under eMAX
+        { PZ, PZ, -0.5f, PZ, 0, 0, 0, 0 },       // D4  compliant (rest < 0), damping +0
+        { PZ, PZ, NZ, NZ, 0, 0, 0, 0 },          // D5  rigid (rest -0), damping -0
+        { NZ, PZ, PZ, PZ, 0, 0, 0, 0 },          // D6  dynamic friction -0 under eAVERAGE
+    };
+    // One convex/trimesh pair per case, one manifold with one contact, counters 0: patch 0 lands at word 0,
+    // so words 7 / 8 / 9 / 10 are restitution / dynF / staF / damping (cu:70-73).  flip puts the trimesh
+    // first (shape types swapped); the material order stays shapeInfo.z / .w.  w7..w10 are the CUDA's bits
+    // computed by hand from PxsCombineMaterials; killsVariant names the host twin whose image must differ.
+    struct DirCase { uint32_t ma, mb; bool flip; uint32_t w7, w8, w9, w10; int killsVariant; };
+    const uint32_t NDIR = 8;
+    const DirCase dc[NDIR] = {
+        { 0, 1, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K0 eMIN(-0,+0): PxMin +0, FMin -0
+        { 2, 3, false, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K1 eMAX(+0,-0): PxMax -0, FMax +0
+        { 4, 5, false, 0xBF000000u, 0u, 0x00000000u, 0x80000000u, 2 },   // K2 one compliant: damping forced to eMAX(+0,-0)
+        { 1, 0, false, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 0 },   // K3 control: eMIN(+0,-0) = -0 in both
+        { 3, 2, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K4 control: eMAX(-0,+0) = +0 in both
+        { 6, 6, false, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K5 d = 0.5*(-0 + -0) = -0: PxMax(d, 0) keeps dynF +0
+        { 0, 1, true,  0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K6 = K0, trimesh first
+        { 2, 3, true,  0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K7 = K1, trimesh first
+    };
+    PXG_CHECK_MSG(std::signbit(0.5f * (mats[6].dynamicFriction + mats[6].dynamicFriction)),
+                  "trimeshOut directed: K5 must reach the dynF clamp with -0");
+
+    std::vector<TmoIn> in(NDIR);
+    std::vector<TmoOut> ref(NDIR);
+    size_t cMinTie = 0, cMaxTie = 0;
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        TmoIn s{};
+        s.hdr = U4{ 1, 0, 0, 0 };
+        s.nbC = U4{ 1, 0, 0, 0 };
+        s.shapeInfo = dc[k].flip ? U4{ T_TRIMESH, T_CONVEX, dc[k].ma, dc[k].mb } : U4{ T_CONVEX, T_TRIMESH, dc[k].ma, dc[k].mb };
+        s.scaleA = s.scaleB = F4{ 1, 0.5f, 1, 0 };
+        s.tAq = s.tBq = F4{ 0, 0, 0, 1 };
+        s.tAp = F4{ 1, 2, 3, 0 };
+        s.tBp = F4{ 0, 0, 0, 0 };
+        s.contacts[0] = F4{ 0.25f, -0.5f, 1, 0.125f };
+        s.contacts[1] = F4{ 1, 2, -0.5f, u2f(5u) };
+        s.contacts[2] = F4{ 0, 0.6f, 0.8f, 0 };
+        s.cfg = U4{ 64 * 20, 16 * 40, 8 * 40, 0 };
+        s.counters = U4{ 0, 0, 0, 0 };
+        in[k] = s;
+        const uint32_t mw = refTrimeshOut(s, mats, ref[k]);
+        PXG_CHECK_MSG(mw == 0xFFFFFFFFu && ref[k].outputs.y == 0u && ref[k].patches[1].w == dc[k].w7 &&
+                      ref[k].patches[2].x == dc[k].w8 && ref[k].patches[2].y == dc[k].w9 && ref[k].patches[2].z == dc[k].w10,
+                      "trimeshOut directed %u: oracle rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                      k, ref[k].patches[1].w, ref[k].patches[2].x, ref[k].patches[2].y, ref[k].patches[2].z,
+                      dc[k].w7, dc[k].w8, dc[k].w9, dc[k].w10);
+        for (int v = 1; v <= 2; ++v)
+        {
+            TmoOut tw;
+            gCombineVariant = v;
+            refTrimeshOut(s, mats, tw);
+            gCombineVariant = 0;
+            const bool differs = std::memcmp(tw.patches, ref[k].patches, sizeof tw.patches) != 0;
+            PXG_CHECK_MSG(differs == (dc[k].killsVariant == v), "trimeshOut directed %u: twin %d %s the image",
+                          k, v, differs ? "changes" : "does not change");
+            if (differs) ++(v == 1 ? cMinTie : cMaxTie);
+        }
+    }
+    PXG_CHECK_MSG(cMinTie == 2 && cMaxTie == 3, "trimeshOut: signed-zero combine coverage thin (minTie %zu maxTie %zu)",
+                  cMinTie, cMaxTie);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<TmoOut> outInit(NDIR);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    struct TmoParams { uint32_t numTests; } prm = { NDIR };
+    Kernel kr("npCvxTrimeshOut.spv", "cvxTrimeshOut",
+              { (uint32_t)sizeof(TmoIn), (uint32_t)sizeof(TmoOut), (uint32_t)sizeof(MaterialData) }, sizeof(TmoParams));
+    kr.dispatch(1, { bIn, bOut, bMat }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<TmoOut>(dev, bOut, NDIR);
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        // Words 7..10 bitwise, and the whole patch image apart from the rotated normal (words 4..6, eqF).
+        const U4* rp = ref[k].patches; const U4* gp = g[k].patches;
+        bool ok = true;
+        for (int p = 0; p < 16 && ok; ++p)
+        {
+            if ((p & 3) == 1)
+                ok = eqF(u2f(rp[p].x), u2f(gp[p].x)) && eqF(u2f(rp[p].y), u2f(gp[p].y)) &&
+                     eqF(u2f(rp[p].z), u2f(gp[p].z)) && rp[p].w == gp[p].w;
+            else
+                ok = rp[p].x == gp[p].x && rp[p].y == gp[p].y && rp[p].z == gp[p].z && rp[p].w == gp[p].w;
+        }
+        PXG_CHECK_MSG(ok, "trimeshOut directed %u: GPU rest/dynF/staF/damp %08x %08x %08x %08x, oracle %08x %08x %08x %08x",
+                      k, gp[1].w, gp[2].x, gp[2].y, gp[2].z, rp[1].w, rp[2].x, rp[2].y, rp[2].z);
+    }
+
+    for (PxgBufferHandle h : { bIn, bOut, bMat }) dev->destroyBuffer(h);
+}
+
 // ---------------------------------------------------------------------------
 // cvxTriFinishBda -- the SAME kernel on the engine BDA ABI, with real atomics on
 // a real PxgPatchAndContactCounters and real writes into the three streams.

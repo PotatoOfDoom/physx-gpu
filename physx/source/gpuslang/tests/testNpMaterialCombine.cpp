@@ -33,7 +33,9 @@
 #include "pxgTestFramework.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -47,14 +49,25 @@ struct F4 { float x, y, z, w; };
 const uint32_t MODE_MIN = 1, MODE_MULTIPLY = 2, MODE_MAX = 3;
 const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2, FLAG_COMPLIANT_ACC_SPRING = 16;
 
+static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+// P9.86e: eMIN/eMAX are PxMin/PxMax<float> = intrinsics::selectMin/selectMax (PxsMaterialCombiner.h:43/47/60/64
+// -> PxMath.h:81-101 -> PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand survives.  std::min /
+// std::max keep the FIRST operand on a tie, so they are not PxMin/PxMax; the oracle spells the selects.
+// gCombineVariant is a mutant twin replaying a reverted port: 1 = eMIN as GLSL FMin, 2 = eMAX as FMax, with
+// llvmpipe's zero order under the SZINP stamp (FMin(+-0,-+0) = -0, FMax = +0, either operand order).
+static int gCombineVariant = 0;
+static float fminLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fmaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
 float combineScalars(float a, float b, uint32_t mode)
 {
     switch (mode)
     {
     case 0: return 0.5f * (a + b);
-    case 1: return std::min(a, b);
+    case 1: return (gCombineVariant == 1) ? fminLp(a, b) : ((a < b) ? a : b);   // PxMin = selectMin
     case 2: return a * b;
-    case 3: return std::max(a, b);
+    case 3: return (gCombineVariant == 2) ? fmaxLp(a, b) : ((a > b) ? a : b);   // PxMax = selectMax
     }
     return 0.f;
 }
@@ -98,7 +111,7 @@ void refCombine(const MaterialData& m0, const MaterialData& m1, F4& outFric, uin
             const uint32_t fm = std::max(m0.fricCombineMode, m1.fricCombineMode);
             const float dyn = combineScalars(m0.dynamicFriction, m1.dynamicFriction, fm);
             const float sta = combineScalars(m0.staticFriction, m1.staticFriction, fm);
-            const float fDyn = std::max(dyn, 0.f);
+            const float fDyn = (dyn > 0.f) ? dyn : 0.f;   // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161)
             const float fSta = (sta - fDyn) >= 0.f ? sta : fDyn;
             cDyn = fDyn; cSta = fSta; cFlags = combineFlags;
         }
@@ -178,18 +191,104 @@ PXG_TEST(npMaterialCombine_combine)
 
     const auto gFric = downloadBuffer<F4>(dev, bFric, N);
     const auto gFlags = downloadBuffer<uint32_t>(dev, bFlags, N);
+    // P9.86e: every output is a pure combine result (no rounding the GPU may do differently), so the
+    // four floats compare bitwise, sign of zero included.
     size_t mm = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
         const F4& a = gFric[i]; const F4& r = refFric[i];
-        if (!almostEqual(a.x, r.x, 1e-5f, 1e-6f) || !almostEqual(a.y, r.y, 1e-5f, 1e-6f) ||
-            !almostEqual(a.z, r.z, 1e-5f, 1e-6f) || !almostEqual(a.w, r.w, 1e-5f, 1e-6f) ||
+        if (f2u(a.x) != f2u(r.x) || f2u(a.y) != f2u(r.y) || f2u(a.z) != f2u(r.z) || f2u(a.w) != f2u(r.w) ||
             gFlags[i] != refFlags[i])
             ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "combineMaterials: %zu mismatches", mm);
     PXG_CHECK_MSG(hiBit > N / 4, "combineMaterials: only %zu pairs with bit 16 set", hiBit);
     PXG_CHECK_MSG(nCompliant > N / 50 && nDisable > N / 50, "material combine: branches under-exercised (compliant=%zu disable=%zu)", nCompliant, nDisable);
+
+    for (PxgBufferHandle h : { bMat, bPairs, bFric, bFlags }) dev->destroyBuffer(h);
+}
+
+// P9.86e DIRECTED SIGNED-ZERO MATERIALS.  eMIN/eMAX are PxMin/PxMax<float> selects: a +-0 tie returns the
+// SECOND operand, so PxMin(-0,+0) = +0 and PxMax(+0,-0) = -0, where GLSL FMin/FMax on llvmpipe give -0 / +0
+// in either order.  -0 is a valid material value (NpMaterial checks finite and >= 0.f), and a restitution
+// of -0 is rigid (-0 < 0 is false).  The random bank never produces -0.
+PXG_TEST(npMaterialCombine_materialZeroSign)
+{
+    const float PZ = 0.f, NZ = u2f(0x80000000u);
+    // {dyn, sta, rest, damp, flags, fricMode, restMode, dampMode}; modes 1 = eMIN, 3 = eMAX.
+    const std::vector<MaterialData> mats = {
+        { PZ, NZ, NZ, NZ, 0, 1, 1, 1 },          // D0  -0 under eMIN
+        { PZ, PZ, PZ, PZ, 0, 1, 1, 1 },          // D1  +0 under eMIN
+        { PZ, PZ, PZ, PZ, 0, 3, 3, 3 },          // D2  +0 under eMAX
+        { PZ, NZ, NZ, NZ, 0, 3, 3, 3 },          // D3  -0 under eMAX
+        { PZ, PZ, -0.5f, PZ, 0, 0, 0, 0 },       // D4  compliant (rest < 0), damping +0
+        { PZ, PZ, NZ, NZ, 0, 0, 0, 0 },          // D5  rigid (rest -0), damping -0
+        { NZ, PZ, PZ, PZ, 0, 0, 0, 0 },          // D6  dynamic friction -0 under eAVERAGE
+    };
+    // (ma, mb) and (mb, ma) are the two shape orders.  rest/dynF/staF/damp are the CUDA's bits computed by hand
+    // from PxsCombineMaterials; killsVariant names the host twin whose output must differ.
+    struct DirCase { uint32_t ma, mb, rest, dyn, sta, damp; int killsVariant; };
+    const uint32_t NDIR = 6;
+    const DirCase dc[NDIR] = {
+        { 0, 1, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K0 eMIN(-0,+0): PxMin +0, FMin -0
+        { 2, 3, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K1 eMAX(+0,-0): PxMax -0, FMax +0
+        { 4, 5, 0xBF000000u, 0u, 0x00000000u, 0x80000000u, 2 },   // K2 one compliant: damping forced to eMAX(+0,-0)
+        { 1, 0, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 0 },   // K3 control: eMIN(+0,-0) = -0 in both
+        { 3, 2, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K4 control: eMAX(-0,+0) = +0 in both
+        { 6, 6, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K5 d = 0.5*(-0 + -0) = -0: PxMax(d, 0) keeps dynF +0
+    };
+    PXG_CHECK_MSG(std::signbit(0.5f * (mats[6].dynamicFriction + mats[6].dynamicFriction)),
+                  "combineMaterials directed: K5 must reach the dynF clamp with -0");
+
+    std::vector<uint32_t> pairsFlat(2 * NDIR);
+    std::vector<F4> refFric(NDIR);
+    std::vector<uint32_t> refFlags(NDIR);
+    size_t cMinTie = 0, cMaxTie = 0;
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        pairsFlat[2 * k] = dc[k].ma; pairsFlat[2 * k + 1] = dc[k].mb;
+        refCombine(mats[dc[k].ma], mats[dc[k].mb], refFric[k], refFlags[k]);
+        const F4& r = refFric[k];
+        PXG_CHECK_MSG(f2u(r.z) == dc[k].rest && f2u(r.y) == dc[k].dyn && f2u(r.x) == dc[k].sta && f2u(r.w) == dc[k].damp,
+                      "combineMaterials directed %u: oracle rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                      k, f2u(r.z), f2u(r.y), f2u(r.x), f2u(r.w), dc[k].rest, dc[k].dyn, dc[k].sta, dc[k].damp);
+        for (int v = 1; v <= 2; ++v)
+        {
+            F4 tw; uint32_t twFlags;
+            gCombineVariant = v;
+            refCombine(mats[dc[k].ma], mats[dc[k].mb], tw, twFlags);
+            gCombineVariant = 0;
+            const bool differs = f2u(tw.x) != f2u(r.x) || f2u(tw.y) != f2u(r.y) || f2u(tw.z) != f2u(r.z) ||
+                                 f2u(tw.w) != f2u(r.w) || twFlags != refFlags[k];
+            PXG_CHECK_MSG(differs == (dc[k].killsVariant == v), "combineMaterials directed %u: twin %d %s the output",
+                          k, v, differs ? "changes" : "does not change");
+            if (differs) ++(v == 1 ? cMinTie : cMaxTie);
+        }
+    }
+    PXG_CHECK_MSG(cMinTie == 1 && cMaxTie == 2, "combineMaterials: signed-zero combine coverage thin (minTie %zu maxTie %zu)",
+                  cMinTie, cMaxTie);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> outFric(NDIR, F4{ 9, 9, 9, 9 });
+    std::vector<uint32_t> outFlags(NDIR, 0xdeadu);
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairsFlat);
+    PxgBufferHandle bFric = createBufferFrom(dev, outFric);
+    PxgBufferHandle bFlags = createBufferFrom(dev, outFlags);
+    struct MatParams { uint32_t numPairs; } p = { NDIR };
+    Kernel kr("npMaterialCombine.spv", "combineMaterials", { 32, 8, 16, 4 }, sizeof(MatParams));
+    kr.dispatch(1, { bMat, bPairs, bFric, bFlags }, p);
+    dev->flush();
+    const auto gFric = downloadBuffer<F4>(dev, bFric, NDIR);
+    const auto gFlags = downloadBuffer<uint32_t>(dev, bFlags, NDIR);
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        const F4& a = gFric[k]; const F4& r = refFric[k];
+        PXG_CHECK_MSG(f2u(a.x) == f2u(r.x) && f2u(a.y) == f2u(r.y) && f2u(a.z) == f2u(r.z) && f2u(a.w) == f2u(r.w) &&
+                      gFlags[k] == refFlags[k],
+                      "combineMaterials directed %u: GPU rest/dynF/staF/damp %08x %08x %08x %08x, oracle %08x %08x %08x %08x",
+                      k, f2u(a.z), f2u(a.y), f2u(a.x), f2u(a.w), f2u(r.z), f2u(r.y), f2u(r.x), f2u(r.w));
+    }
 
     for (PxgBufferHandle h : { bMat, bPairs, bFric, bFlags }) dev->destroyBuffer(h);
 }

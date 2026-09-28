@@ -80,12 +80,22 @@ const uint32_t FLAG_DISABLE_FRICTION = 1, FLAG_DISABLE_STRONG_FRICTION = 2, FLAG
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
+static float u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+// P9.86e: eMIN/eMAX are PxMin/PxMax<float> = intrinsics::selectMin/selectMax (PxsMaterialCombiner.h:43/47/60/64
+// -> PxMath.h:81-101 -> PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand survives.  The oracle
+// spells the selects (std::fmin/std::fmax are not PxMin/PxMax: their zero-tie sign is libm dependent).
+// gCombineVariant is a mutant twin replaying a reverted port: 1 = eMIN as GLSL FMin, 2 = eMAX as FMax, with
+// llvmpipe's zero order under the SZINP stamp (FMin(+-0,-+0) = -0, FMax = +0, either operand order).
+static int gCombineVariant = 0;
+static float fminLp(float a, float b) { return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fmaxLp(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
 static float combineScalars(float a, float b, uint32_t mode)
 {
     if (mode == 0) return 0.5f * (a + b);
-    if (mode == MODE_MIN) return std::fmin(a, b);
+    if (mode == MODE_MIN) return (gCombineVariant == 1) ? fminLp(a, b) : ((a < b) ? a : b);   // PxMin = selectMin
     if (mode == MODE_MULTIPLY) return a * b;
-    if (mode == MODE_MAX) return std::fmax(a, b);
+    if (mode == MODE_MAX) return (gCombineVariant == 2) ? fmaxLp(a, b) : ((a > b) ? a : b);   // PxMax = selectMax
     return 0.0f;
 }
 static void combineMats(const CoreOutIn& s, float& sta, float& dyn, float& rest, float& damp, uint32_t& flags)
@@ -115,7 +125,7 @@ static void combineMats(const CoreOutIn& s, float& sta, float& dyn, float& rest,
             const uint32_t mode = std::max(s.mat0U.y, s.mat1U.y);
             const float d = combineScalars(s.mat0F.x, s.mat1F.x, mode);
             const float st = combineScalars(s.mat0F.y, s.mat1F.y, mode);
-            const float fd = std::fmax(d, 0.f);
+            const float fd = (d > 0.f) ? d : 0.f;   // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161)
             dyn = fd;
             sta = (st - fd) >= 0.f ? st : fd;
             flags = cf;
@@ -430,6 +440,92 @@ PXG_TEST(npCvxCoreOut_writeContact)
                   cHigh > N / 16 && cHighF > N / 16 && cHighP > N / 16 && cSplit > N / 16,
                   "ccoWriteContact: coverage thin (zero %zu many %zu ovfC %zu ovfF %zu ovfP %zu high %zu/%zu/%zu split %zu)",
                   cZero, cMany, cOvfC, cOvfF, cOvfP, cHigh, cHighF, cHighP, cSplit);
+
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.86e DIRECTED SIGNED-ZERO MATERIALS through ccoWriteContact's patch image.  eMIN/eMAX are PxMin/PxMax<float>
+// selects: a +-0 tie returns the SECOND operand, so PxMin(-0,+0) = +0 and PxMax(+0,-0) = -0, where GLSL
+// FMin/FMax on llvmpipe give -0 / +0 in either order.  -0 is a valid material value (NpMaterial checks finite
+// and >= 0.f), and a restitution of -0 is rigid (-0 < 0 is false).  fillCommon never produces -0.
+PXG_TEST(npCvxCoreOut_materialZeroSign)
+{
+    const float PZ = 0.f, NZ = u2f(0x80000000u);
+    // {dyn, sta, rest, damp} + {flags, fricMode, restMode, dampMode}; modes 1 = eMIN, 3 = eMAX.
+    struct DirMat { F4 f; U4 u; };
+    const DirMat dm[7] = {
+        { { PZ, NZ, NZ, NZ }, { 0, 1, 1, 1 } },      // D0  -0 under eMIN
+        { { PZ, PZ, PZ, PZ }, { 0, 1, 1, 1 } },      // D1  +0 under eMIN
+        { { PZ, PZ, PZ, PZ }, { 0, 3, 3, 3 } },      // D2  +0 under eMAX
+        { { PZ, NZ, NZ, NZ }, { 0, 3, 3, 3 } },      // D3  -0 under eMAX
+        { { PZ, PZ, -0.5f, PZ }, { 0, 0, 0, 0 } },   // D4  compliant (rest < 0), damping +0
+        { { PZ, PZ, NZ, NZ }, { 0, 0, 0, 0 } },      // D5  rigid (rest -0), damping -0
+        { { NZ, PZ, PZ, PZ }, { 0, 0, 0, 0 } },      // D6  dynamic friction -0 under eAVERAGE
+    };
+    // w7..w10 = restitution / dynF / staF / damping, the CUDA's bits computed by hand from PxsCombineMaterials;
+    // (ma, mb) and (mb, ma) are the two shape orders.  killsVariant names the host twin whose image must differ.
+    struct DirCase { uint32_t ma, mb, w7, w8, w9, w10; int killsVariant; };
+    const uint32_t NDIR = 6;
+    const DirCase dc[NDIR] = {
+        { 0, 1, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 1 },   // K0 eMIN(-0,+0): PxMin +0, FMin -0
+        { 2, 3, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 2 },   // K1 eMAX(+0,-0): PxMax -0, FMax +0
+        { 4, 5, 0xBF000000u, 0u, 0x00000000u, 0x80000000u, 2 },   // K2 one compliant: damping forced to eMAX(+0,-0)
+        { 1, 0, 0x80000000u, 0u, 0x80000000u, 0x80000000u, 0 },   // K3 control: eMIN(+0,-0) = -0 in both
+        { 3, 2, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K4 control: eMAX(-0,+0) = +0 in both
+        { 6, 6, 0x00000000u, 0u, 0x00000000u, 0x00000000u, 0 },   // K5 d = 0.5*(-0 + -0) = -0: PxMax(d, 0) keeps dynF +0
+    };
+    PXG_CHECK_MSG(std::signbit(0.5f * (dm[6].f.x + dm[6].f.x)), "ccoWriteContact directed: K5 must reach the dynF clamp with -0");
+
+    std::vector<CoreOutIn> in(NDIR);
+    std::vector<CoreOutOut> ref(NDIR);
+    size_t cMinTie = 0, cMaxTie = 0;
+    for (uint32_t k = 0; k < NDIR; ++k)
+    {
+        CoreOutIn s{};
+        s.misc = U4{ 0, 0, 1, 1 };                         // one patch with one point, allflags 0
+        s.patchCounts[0] = U4{ 1, 0, 0, 0 };
+        s.patchN[0] = F4{ 0, 1, 0, 0 };
+        s.points[0] = F4{ 0.25f, -0.5f, 1, -0.125f };
+        s.counters = U4{ 0, 0, 0, 0 };
+        s.cfg = U4{ 1u << 20, 1u << 18, 1u << 18, 0 };
+        s.mat = U4{ 7 + k, 11 + k, 0, 0 };
+        s.mat0F = dm[dc[k].ma].f; s.mat0U = dm[dc[k].ma].u;
+        s.mat1F = dm[dc[k].mb].f; s.mat1U = dm[dc[k].mb].u;
+        in[k] = s;
+        refWriteContact(s, ref[k]);
+        const U4 w1 = ref[k].patchImg[1], w2 = ref[k].patchImg[2];
+        PXG_CHECK_MSG(ref[k].flags.w == 0u && w1.w == dc[k].w7 && w2.x == dc[k].w8 && w2.y == dc[k].w9 && w2.z == dc[k].w10,
+                      "ccoWriteContact directed %u: oracle rest/dynF/staF/damp %08x %08x %08x %08x, CUDA %08x %08x %08x %08x",
+                      k, w1.w, w2.x, w2.y, w2.z, dc[k].w7, dc[k].w8, dc[k].w9, dc[k].w10);
+        for (int v = 1; v <= 2; ++v)
+        {
+            CoreOutOut tw;
+            gCombineVariant = v;
+            refWriteContact(s, tw);
+            gCombineVariant = 0;
+            const bool differs = !eqOut(tw, ref[k]);
+            PXG_CHECK_MSG(differs == (dc[k].killsVariant == v), "ccoWriteContact directed %u: twin %d %s the image",
+                          k, v, differs ? "changes" : "does not change");
+            if (differs) ++(v == 1 ? cMinTie : cMaxTie);
+        }
+    }
+    PXG_CHECK_MSG(cMinTie == 1 && cMaxTie == 2, "ccoWriteContact: signed-zero combine coverage thin (minTie %zu maxTie %zu)",
+                  cMinTie, cMaxTie);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<CoreOutOut> outInit(NDIR);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct P { uint32_t numTests; } prm = { NDIR };
+    Kernel kr("npCvxCoreOut.spv", "ccoWriteContact",
+              { (uint32_t)sizeof(CoreOutIn), (uint32_t)sizeof(CoreOutOut) }, sizeof(P));
+    kr.dispatch(1, { bIn, bOut }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<CoreOutOut>(dev, bOut, NDIR);
+    for (uint32_t k = 0; k < NDIR; ++k)
+        PXG_CHECK_MSG(eqOut(ref[k], g[k]), "ccoWriteContact directed %u: GPU rest/dynF/staF/damp %08x %08x %08x %08x, oracle %08x %08x %08x %08x",
+                      k, g[k].patchImg[1].w, g[k].patchImg[2].x, g[k].patchImg[2].y, g[k].patchImg[2].z,
+                      ref[k].patchImg[1].w, ref[k].patchImg[2].x, ref[k].patchImg[2].y, ref[k].patchImg[2].z);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

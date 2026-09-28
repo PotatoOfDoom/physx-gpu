@@ -111,9 +111,12 @@ ConstantBuffer<FinishParams> gFin;
 float combineScalars(float a, float b, uint mode)
 {
     if (mode == MODE_AVERAGE) return 0.5f * (a + b);
-    if (mode == MODE_MIN) return min(a, b);
+    // P9.86e: PxMin/PxMax<float> (PxsMaterialCombiner.h:43/47, :60/:64) are selectMin/selectMax
+    // (PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125): on a +-0 tie the SECOND operand wins.  GLSL
+    // FMin/FMax give min(+0,-0) = -0 / max(+0,-0) = +0 on llvmpipe in either order, so spell the selects.
+    if (mode == MODE_MIN) return (a < b) ? a : b;
     if (mode == MODE_MULTIPLY) return a * b;
-    if (mode == MODE_MAX) return max(a, b);
+    if (mode == MODE_MAX) return (a > b) ? a : b;
     return 0.0f;
 }
 
@@ -174,7 +177,8 @@ void combineMaterials(PxsMaterialDataGpu m0, PxsMaterialDataGpu m1,
             const uint frictionCombineMode = max(fricMode0, fricMode1);
             const float dynF = combineScalars(m0.dynamicFriction, m1.dynamicFriction, frictionCombineMode);
             const float staF = combineScalars(m0.staticFriction, m1.staticFriction, frictionCombineMode);
-            const float fDynFriction = max(dynF, 0.0f);
+            // PxMax(dynFriction, 0.0f) = selectMax (PxsMaterialCombiner.h:161): +0 for a +-0 dynF.
+            const float fDynFriction = (dynF > 0.0f) ? dynF : 0.0f;
             const float fStaFriction = (staF - fDynFriction) >= 0.0f ? staF : fDynFriction;
             dynFriction = fDynFriction;
             staFriction = fStaFriction;
