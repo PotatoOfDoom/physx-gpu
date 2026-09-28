@@ -9632,6 +9632,210 @@ PXG_TEST(softBodySimClothContactGen)
 }
 
 // ===========================================================================
+// P9.86c (softBodyClothContactGenBda-r1) -- the -0 lane of the tet barycentric.
+// computeTetBarycentric (deformableCollision.cuh:96-138) clamps every lane with
+// PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146) = selectMin(1, selectMax(0, t))
+// (PxUnixMathIntrinsics.h:116-125).  For t = -0 the selects keep -0 (0 > -0 is false); a
+// GLSL FClamp returns +0 on llvmpipe (F4).  The step-2 tet above gives x = +0, and its
+// tolerance checks are sign-blind, so that revert survived.
+// Here the step-2 tet is mirrored in x and z so its bottom face is the y = 0 plane:
+// a = (0,0,0), b = (0,0,-1), c = (-1,0,0), d = (0,1,0), detBcd = 1.  The tet witness is a
+// convex combination of bottom corners (pxgSlangGjk.slang:532), so cpA.y = +0 exactly and
+// pa = (px, +0, pz) with px, pz < 0.  Then ca x pa = (-0, pz, +0) and
+// x = ba . (ca x pa) = (+0)(-0) + (+0)pz + (-1)(+0) = -0, with or without FMA.  The CUDA
+// stores barycentric1.w = 0x80000000; the reverted FClamp stores +0.
+// The stored point is closestPointB = cpA + upperBound * o.closestPointDir
+// (pxgSlangGjk.slang:548).  o.closestPointDir = -normalize(cp) is not the stored normal
+// (-o.direction): here the final simplex is a face of the Minkowski difference whose
+// support points all have y = 0 - (-GAP) exactly, so closestPointTriW's face normal has
+// x = z = +-0 and cp.x, cp.z are +-0 exactly -- gPt.x/z are cpA.x/z bit for bit.  The
+// vertical-normal CHECK is a proxy for that; if it were ever wrong, the lane 0-2 compares
+// fail at HEAD, never under a mutant only.
+// ===========================================================================
+namespace p86cgz
+{
+struct V3z { float x, y, z; };
+static V3z zSub(V3z a, V3z b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static float zDot(V3z a, V3z b) { return a.x * b.x + a.y * b.y + a.z * b.z; }   // PxVec3::dot
+static V3z zCross(V3z a, V3z b)                                                    // PxVec3::cross
+{ return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+// false = the CUDA: PxClamp = selectMin(1, selectMax(0, t)).
+// true  = the reverted port's GLSL FClamp on llvmpipe (fmax(+-0, 0) = +0, F4).
+static bool gTetBaryFClampTwin = false;
+static float zClamp01(float t)
+{
+    if (gTetBaryFClampTwin) { const float m = (t > 0.0f) ? t : 0.0f; return (m < 1.0f) ? m : 1.0f; }
+    const float m = (0.0f > t) ? 0.0f : t;
+    return (1.0f < m) ? 1.0f : m;
+}
+// computeTetBarycentric, deformableCollision.cuh:96-138.
+static bool zTetBary(V3z a, V3z b, V3z c, V3z d, V3z p, F4& bary)
+{
+    const float minEps = -1e-5f, maxEps = 1.0f + 1e-5f;
+    const V3z ba = zSub(b, a), ca = zSub(c, a), da = zSub(d, a), pa = zSub(p, a);
+    const float detBcd = zDot(ba, zCross(ca, da));
+    const float v = zDot(pa, zCross(ca, da)) / detBcd;
+    const float w = zDot(ba, zCross(pa, da)) / detBcd;
+    const float x = zDot(ba, zCross(ca, pa)) / detBcd;
+    const float u = 1.0f - v - w - x;
+    bary = F4{ zClamp01(u), zClamp01(v), zClamp01(w), zClamp01(x) };
+    return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
+           (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
+}
+} // namespace p86cgz
+
+PXG_TEST(softBodySimClothContactGenBaryNegZero)
+{
+    using namespace p80refit;
+    using namespace p88cg;
+    using namespace p86cgz;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- one cloth triangle 0.2 below the tet, strictly inside the tet's bottom face ------
+    const float GAP = 0.20f;
+    std::vector<F4> triVerts = { F4{ -0.25f, -GAP, -0.25f, 0.0f }, F4{ -0.25f, -GAP, -0.5f, 0.0f },
+                                 F4{ -0.5f, -GAP, -0.25f, 0.0f } };
+    std::vector<TetIdx4> triIdxArr = { { 0u, 1u, 2u, 0u } };
+    DevBuf bTriVerts = makeDev(dev, triVerts), bTriIdx = makeDev(dev, triIdxArr);
+    if (!bTriVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTriVerts.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTriIdx.addr));
+    cloth.mNbVerts = 3u;
+    cloth.mNbTriangles = 1u;
+    std::vector<PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    // ---- one resting, axis-aligned tet; corner 0 at the origin, bottom face in y = 0 -------
+    const V3z A[4] = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -1.0f }, { -1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f } };
+    std::vector<F4> tetVerts;
+    for (int i = 0; i < 4; ++i) tetVerts.push_back(F4{ A[i].x, A[i].y, A[i].z, 1.0f });
+    std::vector<TetIdx4> tets = { { 0u, 1u, 2u, 3u } };
+    std::vector<uint32_t> hintWords = { 0x1u };   // face T0 (corners 0,1,2) is a surface face
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets), bHints = makeDev(dev, hintWords);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mNumTets = 1u;
+    sb.mNumVerts = 4u;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = 0u; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*cloth cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f; xf[8 + 3] = 1.0f;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { 0.16f, 0.14f, 0.0f, 0.0f };   // 0.30 > GAP
+    DevBuf bCd = makeDev(dev, cd);
+
+    std::vector<uint32_t> stack = { 0u, 0u, 0u, 0u };   // (cm 0, tet 0, tri 0)
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 1u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 4u;
+    std::vector<F4> outPoint(MAXC, F4{ -9, -9, -9, -9 }), outNp(MAXC, F4{ -9, -9, -9, -9 });
+    std::vector<F4> outB0(MAXC, F4{ -9, -9, -9, -9 }), outB1(MAXC, F4{ -9, -9, -9, -9 });
+    std::vector<FemFemInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(FemFemInfoHost));
+    std::vector<uint32_t> total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNp);
+    DevBuf bB0 = makeDev(dev, outB0), bB1 = makeDev(dev, outB1);
+    DevBuf bInfo = makeDev(dev, outInfo), bTotal = makeDev(dev, total);
+
+    SbClothCgPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.clothes = bCloth.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 16u;
+    push.filterPairs = 0u;         // no filter pairs: findFilter searches nothing
+    push.nbFilterPairs = 0u;
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.outPoint = bPt.addr; push.outNormalPen = bNp.addr;
+    push.outBarycentric0 = bB0.addr; push.outBarycentric1 = bB1.addr;
+    push.outContactInfo = bInfo.addr; push.totalContactCount = bTotal.addr;
+    push.maxContacts = MAXC;
+
+    Kernel k("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gB1 = downloadBuffer<F4>(dev, bB1.h, MAXC);
+
+    PXG_CHECK_MSG(n == 1u, "the resting tet 0.2 above a triangle inside its bottom face must "
+                           "produce its one contact, got %u", n);
+    if (n == 1u)
+    {
+        std::printf("  point=(%a %a %a) normal=(%a %a %a) bary1=(0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                    gPt[0].x, gPt[0].y, gPt[0].z, gNp[0].x, gNp[0].y, gNp[0].z,
+                    f2u(gB1[0].x), f2u(gB1[0].y), f2u(gB1[0].z), f2u(gB1[0].w));
+        PXG_CHECK_MSG(gNp[0].x == 0.0f && gNp[0].z == 0.0f && gNp[0].y == 1.0f,
+                      "the contact must be exactly vertical (proxy for cp.x = cp.z = +-0, so the "
+                      "stored cloth witness carries the tet witness x/z exactly); got (%a %a %a)",
+                      gNp[0].x, gNp[0].y, gNp[0].z);
+        PXG_CHECK_MSG(gPt[0].x <= -0.25f && gPt[0].z <= -0.25f && gPt[0].x + gPt[0].z >= -0.75f,
+                      "the witness must lie over the triangle, strictly inside the tet face "
+                      "(px < 0, pz < 0); got x=%a z=%a", gPt[0].x, gPt[0].z);
+
+        // cpA.y = u*(+0) + v*(+0) + w*(+0) = +0 (pxgSlangGjk.slang:532).
+        const V3z wit = { gPt[0].x, 0.0f, gPt[0].z };
+        F4 want, twin;
+        gTetBaryFClampTwin = false;
+        const bool inWin = zTetBary(A[0], A[1], A[2], A[3], wit, want);
+        gTetBaryFClampTwin = true;
+        zTetBary(A[0], A[1], A[2], A[3], wit, twin);
+        gTetBaryFClampTwin = false;
+        const float wl[4] = { want.x, want.y, want.z, want.w };
+        const float tl[4] = { twin.x, twin.y, twin.z, twin.w };
+        const float gl[4] = { gB1[0].x, gB1[0].y, gB1[0].z, gB1[0].w };
+        uint32_t negZeroLanes = 0u, twinDiffers = 0u;
+        for (int q = 0; q < 4; ++q)
+        {
+            if (f2u(wl[q]) == 0x80000000u) ++negZeroLanes;
+            if (f2u(wl[q]) != f2u(tl[q])) ++twinDiffers;
+        }
+        PXG_CHECK_MSG(inWin, "the mirror witness must pass the eps window");
+        PXG_CHECK_MSG(negZeroLanes == 1u && twinDiffers == 1u,
+                      "coverage: the directed tet must give the CUDA a -0 barycentric lane "
+                      "(x = ba.(ca x pa) = -0) that the FClamp twin turns into +0; got %u / %u",
+                      negZeroLanes, twinDiffers);
+        for (int q = 0; q < 4; ++q)
+            PXG_CHECK_MSG(f2u(gl[q]) == f2u(wl[q]), "barycentric1[%d] = 0x%08x, CUDA mirror 0x%08x",
+                          q, f2u(gl[q]), f2u(wl[q]));
+        PXG_CHECK_MSG(f2u(gB1[0].w) == 0x80000000u,
+                      "PxClamp(-0, 0, 1) keeps -0 (selects); GLSL FClamp gives +0; got 0x%08x",
+                      f2u(gB1[0].w));
+    }
+
+    for (PxgBufferHandle h : { bTriVerts.h, bTriIdx.h, bCloth.h, bTetVerts.h, bTets.h, bHints.h,
+                               bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h,
+                               bPairNum.h, bNeeded.h, bPt.h, bNp.h, bB0.h, bB1.h, bInfo.h, bTotal.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
 // P8.8 step 3 — sb_clothVertMidphaseGeneratePairsLaunch, the vertex-side midphase.
 //
 // The opposite direction from step 1: a cloth VERTEX queries the SOFTBODY's tetrahedron tree,
