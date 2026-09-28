@@ -244,6 +244,9 @@ struct SceneRun
     // P9.86c coverage: points on which the generic-max twin changes the clamp,
     // the pass-3 dir, or the pass-4 vertex dir.
     size_t tieClamp = 0, tieDir = 0, tieDirV = 0;
+    // Fall-back plus taps 0/2/4 whose IEEE add (sdfCollision.cuh:190-195)
+    // differs bitwise from the llvmpipe-folded form that keeps p's zero lanes.
+    size_t foldTap[3] = { 0, 0, 0 };
 };
 
 static bool bitEqV(const PxVec3& a, const PxVec3& b)
@@ -475,6 +478,13 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
             want[3] = p - PxVec3(0.f, box.dx, 0.f);
             want[4] = p + PxVec3(0.f, 0.f, box.dx);
             want[5] = p - PxVec3(0.f, 0.f, box.dx);
+            // P9.86c coverage: the F3-folded plus taps leave the literal-zero
+            // lanes as p's own (-0 stays -0).
+            const PxVec3 folded[3] = { PxVec3(p.x + box.dx, p.y, p.z),
+                                       PxVec3(p.x, p.y + box.dx, p.z),
+                                       PxVec3(p.x, p.y, p.z + box.dx) };
+            for (int k = 0; k < 3; ++k)
+                if (!bitEqV(folded[k], want[2 * k])) ++r.foldTap[k];
         }
         for (int k = 0; k < 6; ++k)
             if (!bitEq3(o + 7 + k * 3, want[k]))
@@ -977,6 +987,11 @@ PXG_TEST(sdfCollision)
     PXG_CHECK_MSG(rz.tieDirV >= 1,
                   "dense-zero-lower: no doVertexSDFCollision dir depends on the tie's sign (%zu)",
                   rz.tieDirV);
+    for (int k = 0; k < 3; ++k)
+        PXG_CHECK_MSG(rz.foldTap[k] >= 1,
+                      "dense-zero-lower: no fall-back tap %d has a -0 zero lane that its IEEE "
+                      "add turns to +0 (%zu) -- the folded-lane revert would survive",
+                      2 * k, rz.foldTap[k]);
     PXG_CHECK_MSG(rs.tieClamp == 0 && rd.tieClamp == 0,
                   "the sparse / dense-aligned scenes have no zero bound, so no tie (%zu, %zu)",
                   rs.tieClamp, rd.tieClamp);
