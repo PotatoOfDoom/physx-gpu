@@ -320,19 +320,22 @@ void cccClip(uint3 dtid : SV_DispatchThreadID)
                 normalizeDiv(Y);
             }
 
+            // P9.86f (as pxgSlangCvxCoreCvx faceClipQ): GuConvexSupport.h:810-811/:818-819 are PxMin/PxMax -- the selects
+            // a < b ? a : b / a > b ? a : b, which keep the NEW point's pX/pY on a +0/-0 tie
+            // (and a NaN); GLSL min/max (FMin/FMax) give -0/+0 in either order.
             float minX = 3.402823466e+38f, maxX = -3.402823466e+38f;
             float minY = 3.402823466e+38f, maxY = -3.402823466e+38f;
             for (uint i = 0u; i < numPoints0; ++i)
             {
                 const float pX = dot3Q(face0[i], X), pY = dot3Q(face0[i], Y);
-                minX = min(minX, pX); maxX = max(maxX, pX);
-                minY = min(minY, pY); maxY = max(maxY, pY);
+                minX = (minX < pX) ? minX : pX; maxX = (maxX > pX) ? maxX : pX;
+                minY = (minY < pY) ? minY : pY; maxY = (maxY > pY) ? maxY : pY;
             }
             for (uint i = 0u; i < numPoints1; ++i)
             {
                 const float pX = dot3Q(face1[i], X), pY = dot3Q(face1[i], Y);
-                minX = min(minX, pX); maxX = max(maxX, pX);
-                minY = min(minY, pY); maxY = max(maxY, pY);
+                minX = (minX < pX) ? minX : pX; maxX = (maxX > pX) ? maxX : pX;
+                minY = (minY < pY) ? minY : pY; maxY = (maxY > pY) ? maxY : pY;
             }
 
             const float3 refm = (point0 + point1) * 0.5f;

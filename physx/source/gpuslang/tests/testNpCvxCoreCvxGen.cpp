@@ -1277,14 +1277,14 @@ static void refClip(const ClipIn& s, ClipOut& o)
             for (uint32_t i = 0; i < n0; ++i)
             {
                 const float pX = dot3(face0[i], X), pY = dot3(face0[i], Y);
-                minX = std::fmin(minX, pX); maxX = std::fmax(maxX, pX);
-                minY = std::fmin(minY, pY); maxY = std::fmax(maxY, pY);
+                minX = (minX < pX) ? minX : pX; maxX = (maxX > pX) ? maxX : pX;   // P9.86f: PxMin/PxMax selects
+                minY = (minY < pY) ? minY : pY; maxY = (maxY > pY) ? maxY : pY;
             }
             for (uint32_t i = 0; i < n1; ++i)
             {
                 const float pX = dot3(face1[i], X), pY = dot3(face1[i], Y);
-                minX = std::fmin(minX, pX); maxX = std::fmax(maxX, pX);
-                minY = std::fmin(minY, pY); maxY = std::fmax(maxY, pY);
+                minX = (minX < pX) ? minX : pX; maxX = (maxX > pX) ? maxX : pX;   // P9.86f: PxMin/PxMax selects
+                minY = (minY < pY) ? minY : pY; maxY = (maxY > pY) ? maxY : pY;
             }
             const V3 ref = mul(add(point0, point1), 0.5f);
             const float refX = dot3(ref, X), refY = dot3(ref, Y);

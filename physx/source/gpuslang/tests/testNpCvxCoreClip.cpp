@@ -147,6 +147,16 @@ static void makePlanesRef(const V3 face[4], uint32_t numPoints, V3 axis, F4 plan
     }
 }
 
+// P9.86f: makePolygon's extents are PxMin/PxMax (GuConvexSupport.h:810-811/:818-819) -- the selects
+// a < b ? a : b / a > b ? a : b, which keep the SECOND operand (the new point's pX/pY) on a +0/-0 tie
+// or a NaN.  gFcVariant replays one reverted port line as llvmpipe's FMin/FMax (-0/+0 on a zero tie in
+// either order, NaN dropped): site 1..4 = face0's minX/maxX/minY/maxY, 5..8 = face1's.
+int gFcVariant = 0;
+static float fcFMinLp(float a, float b) { if (std::isnan(a)) return b; if (std::isnan(b)) return a; return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b); }
+static float fcFMaxLp(float a, float b) { if (std::isnan(a)) return b; if (std::isnan(b)) return a; return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
+static float fcMin(int site, float a, float b) { return (gFcVariant == site) ? fcFMinLp(a, b) : ((a < b) ? a : b); }
+static float fcMax(int site, float a, float b) { return (gFcVariant == site) ? fcFMaxLp(a, b) : ((a > b) ? a : b); }
+
 static void refClip(const ClipIn& s, ClipOut& o)
 {
     std::memset(&o, 0, sizeof(o));
@@ -244,14 +254,14 @@ static void refClip(const ClipIn& s, ClipOut& o)
             for (uint32_t i = 0; i < n0; ++i)
             {
                 const float pX = dot3(face0[i], X), pY = dot3(face0[i], Y);
-                minX = std::fmin(minX, pX); maxX = std::fmax(maxX, pX);
-                minY = std::fmin(minY, pY); maxY = std::fmax(maxY, pY);
+                minX = fcMin(1, minX, pX); maxX = fcMax(2, maxX, pX);
+                minY = fcMin(3, minY, pY); maxY = fcMax(4, maxY, pY);
             }
             for (uint32_t i = 0; i < n1; ++i)
             {
                 const float pX = dot3(face1[i], X), pY = dot3(face1[i], Y);
-                minX = std::fmin(minX, pX); maxX = std::fmax(maxX, pX);
-                minY = std::fmin(minY, pY); maxY = std::fmax(maxY, pY);
+                minX = fcMin(5, minX, pX); maxX = fcMax(6, maxX, pX);
+                minY = fcMin(7, minY, pY); maxY = fcMax(8, maxY, pY);
             }
             const V3 ref = mul(add(point0, point1), 0.5f);
             const float refX = dot3(ref, X), refY = dot3(ref, Y);
@@ -452,6 +462,99 @@ PXG_TEST(npCvxCoreClip_clip)
                   "cccClip: coverage thin (none %zu 22 %zu NN %zu 2N %zu par %zu)", cNone, c22, cNN, c2N, cPar);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.86f: the ENGINE's faceClipQ (pxgSlangCvxCoreCvx, included by cvxCoreCvxNpBda/cvxCoreTriNpBda/
+// cvxCoreTetNpBda/cvxCoreClothNpBda) on makePolygon +0/-0 extent ties, through p86SignedZeroSz.spv's
+// fcProbe entry (SZINP-stamped and NoContraction like those consumers).  Directed inputs (a host search
+// over refClip): axis-aligned axis/normals and face points with +-0 coordinates, so a projected pX/pY
+// ties +0/-0 at an extent and the zero's sign reaches an output point lane.  Case s differs from the
+// CUDA when site s's select is reverted to FMin/FMax (the mutant twin, checked on the mirror); the GPU
+// must match the CUDA mirror bitwise -- and so must this file's own transcription (cccClip).
+PXG_TEST(npCvxCoreClip_faceClipZeroTie)
+{
+    const ClipIn cases[] = {
+        /* site 1 */ { { -0x0p+0, 0x1p+0, -0x0p+0, 0 }, { -0x0p+0, 0x0p+0, 0x1p+0, 0 }, { -0x0p+0, -0x1p+0, 0x0p+0, 0 }, { -0x0p+0, -0x1p+0, 0x0p+0, 0 }, { 0x0p+0, 0x1p+0, -0x0p+0, 0 }, { 3u, 3u, 0, 0 },
+                          { { -0x0p+0, -0x0p+0, -0x0p+0, 0 }, { 0x1p+1, 0x1p-1, -0x0p+0, 0 }, { -0x0p+0, 0x1p+1, -0x1p-1, 0 }, { 0x1p+1, -0x1p-1, -0x0p+0, 0 } },
+                          { { 0x1p+0, -0x0p+0, 0x1p-1, 0 }, { 0x1p-1, 0x1p+1, 0x0p+0, 0 }, { 0x1p-1, -0x0p+0, -0x0p+0, 0 }, { 0x1p+1, -0x1p+0, 0x1p-1, 0 } } },
+        /* site 2 */ { { -0x0p+0, -0x0p+0, 0x1p+0, 0 }, { -0x0p+0, 0x0p+0, -0x0p+0, 0 }, { -0x0p+0, -0x0p+0, -0x1p+0, 0 }, { -0x0p+0, -0x0p+0, -0x1p+0, 0 }, { 0x0p+0, 0x0p+0, 0x1p+0, 0 }, { 4u, 3u, 0, 0 },
+                          { { 0x0p+0, 0x1p+0, -0x1p+0, 0 }, { 0x1p-1, -0x0p+0, 0x1p+1, 0 }, { 0x1p+1, -0x0p+0, -0x1p-1, 0 }, { 0x0p+0, -0x1p-1, -0x1p+0, 0 } },
+                          { { 0x1p+0, 0x1p-1, -0x1p-1, 0 }, { 0x1p+1, -0x1p+0, -0x0p+0, 0 }, { 0x1p+1, -0x1p+0, 0x1p+0, 0 }, { -0x0p+0, 0x1p-1, 0x1p-1, 0 } } },
+        /* site 3 */ { { -0x1p+0, -0x0p+0, 0x1p-1, 0 }, { -0x0p+0, -0x0p+0, -0x1p-1, 0 }, { -0x1p+0, 0x0p+0, -0x0p+0, 0 }, { -0x1p+0, 0x0p+0, -0x0p+0, 0 }, { 0x1p+0, -0x0p+0, 0x0p+0, 0 }, { 3u, 4u, 0, 0 },
+                          { { -0x0p+0, -0x0p+0, -0x1p+0, 0 }, { 0x1p+1, 0x0p+0, 0x0p+0, 0 }, { -0x0p+0, 0x1p+1, 0x1p+0, 0 }, { -0x1p+0, -0x1p+0, 0x1p+0, 0 } },
+                          { { 0x1p-1, 0x1p+0, 0x1p-1, 0 }, { -0x1p-1, 0x1p-1, -0x0p+0, 0 }, { -0x1p+0, 0x1p-1, -0x1p-1, 0 }, { -0x1p+0, 0x1p-1, -0x1p+0, 0 } } },
+        /* site 4 */ { { -0x1p+0, -0x1p-1, -0x0p+0, 0 }, { 0x1p+1, 0x0p+0, -0x0p+0, 0 }, { 0x0p+0, -0x1p+0, 0x0p+0, 0 }, { 0x0p+0, -0x1p+0, 0x0p+0, 0 }, { -0x0p+0, 0x1p+0, -0x0p+0, 0 }, { 3u, 3u, 0, 0 },
+                          { { 0x1p+1, 0x0p+0, -0x1p-1, 0 }, { 0x1p+1, -0x1p+0, 0x0p+0, 0 }, { -0x0p+0, -0x1p+0, -0x0p+0, 0 }, { -0x1p-1, -0x1p+0, 0x1p+0, 0 } },
+                          { { 0x1p-1, 0x1p+0, -0x1p-1, 0 }, { 0x1p-1, 0x0p+0, -0x1p-1, 0 }, { 0x1p+1, 0x1p+1, -0x1p-1, 0 }, { 0x0p+0, 0x1p-1, 0x1p+0, 0 } } },
+        /* site 5 */ { { -0x0p+0, 0x1p+1, -0x1p-1, 0 }, { -0x0p+0, 0x1p+0, -0x1p+0, 0 }, { -0x0p+0, 0x0p+0, 0x1p+0, 0 }, { -0x0p+0, 0x0p+0, 0x1p+0, 0 }, { 0x0p+0, -0x0p+0, -0x1p+0, 0 }, { 4u, 4u, 0, 0 },
+                          { { 0x1p+1, -0x0p+0, 0x1p+0, 0 }, { 0x0p+0, -0x1p+0, 0x1p+0, 0 }, { 0x1p-1, -0x1p+0, 0x1p+1, 0 }, { 0x1p+0, -0x0p+0, -0x1p-1, 0 } },
+                          { { -0x0p+0, -0x0p+0, -0x0p+0, 0 }, { -0x0p+0, 0x1p+0, -0x1p+0, 0 }, { 0x0p+0, -0x1p+0, 0x1p+1, 0 }, { 0x1p+0, -0x0p+0, 0x1p-1, 0 } } },
+        /* site 6 */ { { -0x0p+0, 0x0p+0, -0x0p+0, 0 }, { -0x0p+0, -0x1p+0, 0x1p+0, 0 }, { 0x0p+0, 0x0p+0, -0x1p+0, 0 }, { 0x0p+0, 0x0p+0, -0x1p+0, 0 }, { -0x0p+0, -0x0p+0, 0x1p+0, 0 }, { 3u, 3u, 0, 0 },
+                          { { -0x0p+0, -0x1p+0, 0x1p+1, 0 }, { -0x0p+0, 0x0p+0, 0x1p+0, 0 }, { 0x1p+1, -0x1p-1, 0x1p-1, 0 }, { 0x0p+0, 0x1p-1, -0x0p+0, 0 } },
+                          { { 0x0p+0, -0x1p+0, 0x1p+0, 0 }, { 0x1p+1, 0x0p+0, -0x1p-1, 0 }, { 0x0p+0, -0x0p+0, 0x1p+0, 0 }, { -0x0p+0, -0x1p-1, -0x0p+0, 0 } } },
+        /* site 7 */ { { 0x1p+1, -0x0p+0, -0x0p+0, 0 }, { 0x0p+0, -0x0p+0, -0x1p-1, 0 }, { 0x0p+0, -0x0p+0, 0x1p+0, 0 }, { 0x0p+0, -0x0p+0, 0x1p+0, 0 }, { -0x0p+0, 0x0p+0, -0x1p+0, 0 }, { 3u, 3u, 0, 0 },
+                          { { 0x1p+0, 0x1p+0, 0x1p+0, 0 }, { 0x0p+0, 0x1p-1, -0x0p+0, 0 }, { -0x1p+0, -0x0p+0, -0x0p+0, 0 }, { -0x0p+0, -0x0p+0, -0x1p-1, 0 } },
+                          { { -0x0p+0, 0x1p-1, 0x1p+0, 0 }, { -0x1p+0, -0x0p+0, 0x1p+0, 0 }, { 0x1p+1, 0x1p-1, -0x1p-1, 0 }, { 0x1p+0, 0x0p+0, -0x1p-1, 0 } } },
+        /* site 8 */ { { -0x1p+0, -0x0p+0, 0x1p+1, 0 }, { -0x1p-1, -0x0p+0, 0x1p+0, 0 }, { -0x0p+0, -0x0p+0, -0x1p+0, 0 }, { -0x0p+0, -0x0p+0, -0x1p+0, 0 }, { 0x0p+0, 0x0p+0, 0x1p+0, 0 }, { 3u, 3u, 0, 0 },
+                          { { 0x1p-1, -0x1p+0, -0x0p+0, 0 }, { 0x1p-1, -0x1p+0, -0x1p+0, 0 }, { -0x0p+0, -0x1p-1, -0x0p+0, 0 }, { -0x1p+0, -0x1p+0, -0x0p+0, 0 } },
+                          { { 0x1p+1, -0x1p-1, 0x1p+0, 0 }, { 0x0p+0, 0x0p+0, 0x1p+1, 0 }, { 0x1p+1, -0x0p+0, 0x0p+0, 0 }, { 0x1p-1, 0x1p+0, 0x1p+0, 0 } } },
+    };
+    const uint32_t N = uint32_t(sizeof(cases) / sizeof(cases[0]));
+    std::vector<ClipIn> in(cases, cases + N);
+    std::vector<ClipOut> ref(N);
+    uint32_t twinKills[9] = {};
+    for (uint32_t k = 0; k < N; ++k)
+    {
+        gFcVariant = 0;
+        refClip(in[k], ref[k]);
+        PXG_CHECK_MSG(ref[k].counts.x > 0, "faceClip case %u: no contact points", k);
+        for (int v = 1; v <= 8; ++v)
+        {
+            ClipOut t;
+            gFcVariant = v;
+            refClip(in[k], t);
+            gFcVariant = 0;
+            if (std::memcmp(&t, &ref[k], sizeof(t)) != 0) ++twinKills[v];
+        }
+        // case k is the witness for site k+1
+        ClipOut t;
+        gFcVariant = int(k + 1);
+        refClip(in[k], t);
+        gFcVariant = 0;
+        PXG_CHECK_MSG(std::memcmp(&t, &ref[k], sizeof(t)) != 0, "faceClip case %u: FMin/FMax twin of site %u is not observable", k, k + 1);
+    }
+    for (int v = 1; v <= 8; ++v)
+        PXG_CHECK_MSG(twinKills[v] > 0, "faceClip: twin %d changes no directed case", v);
+
+    struct SzPushH { uint64_t inp, outp; };
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<ClipOut> outInit(N);
+    std::memset(outInit.data(), 0xEE, N * sizeof(ClipOut));
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    SzPushH push{ dev->getBufferDeviceAddress(bIn), dev->getBufferDeviceAddress(bOut) };
+    Kernel k("p86SignedZeroSz.spv", "fcProbe", {}, sizeof(SzPushH));
+    k.dispatch(N, {}, push, 1u, 1u);
+    dev->flush();
+    const std::vector<ClipOut> g = downloadBuffer<ClipOut>(dev, bOut, N);
+    // the same cases through this file's own transcription (npCvxCoreClip.spv cccClip)
+    PxgBufferHandle bOut2 = createBufferFrom(dev, outInit);
+    struct P { uint32_t numTests; } prm = { N };
+    Kernel kc("npCvxCoreClip.spv", "cccClip", { (uint32_t)sizeof(ClipIn), (uint32_t)sizeof(ClipOut) }, sizeof(P));
+    kc.dispatch((N + 63) / 64, { bIn, bOut2 }, prm);
+    dev->flush();
+    const std::vector<ClipOut> g2 = downloadBuffer<ClipOut>(dev, bOut2, N);
+    dev->destroyBuffer(bIn); dev->destroyBuffer(bOut); dev->destroyBuffer(bOut2);
+    for (uint32_t i = 0; i < 2 * N; ++i)
+    {
+        const ClipOut& r = ref[i % N]; const ClipOut& q = (i < N) ? g[i] : g2[i - N];
+        bool ok = r.counts.x == q.counts.x && eqF4(r.normal, q.normal);
+        for (int j = 0; j < 4 && ok; ++j) ok = eqF4(r.pts[j], q.pts[j]);
+        PXG_CHECK_MSG(ok, "%s case %u: GPU differs from the CUDA mirror (count %u/%u, pt0 %08x %08x %08x %08x vs %08x %08x %08x %08x)",
+                      (i < N) ? "faceClipQ" : "cccClip", i % N,
+                      q.counts.x, r.counts.x, f2u(q.pts[0].x), f2u(q.pts[0].y), f2u(q.pts[0].z), f2u(q.pts[0].w),
+                      f2u(r.pts[0].x), f2u(r.pts[0].y), f2u(r.pts[0].z), f2u(r.pts[0].w));
+    }
 }
 
 } // namespace

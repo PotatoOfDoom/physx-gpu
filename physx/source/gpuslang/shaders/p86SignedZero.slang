@@ -38,6 +38,8 @@
 // OpFMul with a constant operand; any folding is the driver's.
 
 import pxgSlangTriBox;
+import pxgSlangCvxCoreShape;          // faceClipQ's shape-layer helpers (as npCvxCoreCvxGen)
+#include "pxgSlangCvxCoreCvx.slang"   // faceClipQ (fcProbe)
 
 struct SzPush { uint64_t inp; uint64_t outp; }
 [[vk::push_constant]] ConstantBuffer<SzPush> gSz;
@@ -111,4 +113,29 @@ void tbProbe(uint3 dtid : SV_DispatchThreadID)
     Ptr<uint> o = Ptr<uint>(gSz.outp);
     const uint b = dtid.x * 5u;
     o[dtid.x] = tbIntersectTriangleBox(i[b].xyz, i[b + 1u].xyz, i[b + 2u].xyz, i[b + 3u].xyz, i[b + 4u].xyz) ? 1u : 0u;
+}
+
+// P9.86f: pxgSlangCvxCoreCvx faceClipQ's makePolygon extents (GuConvexSupport.h:810-819 PxMin/PxMax
+// selects) on +0/-0 ties.  One thread per case; in: 14 float4 per case in testNpCvxCoreClip's ClipIn
+// layout (p0, p1, axis, n0, n1, counts as uint bits, fp0[4], fp1[4]); out: 6 uint4 per case in its
+// ClipOut layout (counts, normal, pts[4]).  Run from p86SignedZeroSz.spv (SZINP-stamped, NoContraction
+// like the engine consumers cvxCoreCvxNpBda/cvxCoreTriNpBda/cvxCoreTetNpBda/cvxCoreClothNpBda).
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void fcProbe(uint3 dtid : SV_DispatchThreadID)
+{
+    Ptr<float4> i = Ptr<float4>(gSz.inp);
+    Ptr<uint4> o = Ptr<uint4>(gSz.outp);
+    const uint b = dtid.x * 14u;
+    const uint4 counts = asuint(i[b + 5u]);
+    float3 fp0[4], fp1[4];
+    for (uint k = 0u; k < 4u; ++k) { fp0[k] = i[b + 6u + k].xyz; fp1[k] = i[b + 10u + k].xyz; }
+    float3 normal;
+    float4 pts[4];
+    const uint n = faceClipQ(fp0, counts.x, i[b + 3u].xyz, fp1, counts.y, i[b + 4u].xyz,
+                             i[b].xyz, i[b + 1u].xyz, i[b + 2u].xyz, normal, pts);
+    const uint ob = dtid.x * 6u;
+    o[ob] = uint4(n, 0u, 0u, 0u);
+    o[ob + 1u] = asuint(float4(normal, 0.0f));
+    for (uint k = 0u; k < 4u; ++k) o[ob + 2u + k] = asuint(pts[k]);
 }
