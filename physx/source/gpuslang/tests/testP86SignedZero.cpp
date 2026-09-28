@@ -41,14 +41,15 @@ using namespace pxgtest;
 struct SzPushH { uint64_t inp, outp; };
 
 const uint32_t P0 = 0x00000000u, N0 = 0x80000000u;
-const uint32_t NOUT = 23;
+const uint32_t NOUT = 26;
 // IEEE-754 results, which is what the CUDA computes.
-const uint32_t kIeee[NOUT] = { P0, P0, P0, N0, P0, N0,  P0, P0, P0, N0, N0,  0, 0, N0, N0,  P0, P0, N0, P0,  P0, P0, P0, P0 };
+const uint32_t kIeee[NOUT] = { P0, P0, P0, N0, P0, N0,  P0, P0, P0, N0, N0,  0, 0, N0, N0,  P0, P0, N0, P0,  P0, P0, P0, P0,  P0, P0, P0 };
 const char* const kName[NOUT] = { "0 - (+0)", "(-0) + 0", "0 + (-0)", "0 * (-0)", "(0,0,0) - v", "(-0) - 0",
                                   "rz - (+0)", "(-0) + rz", "rz + (-0)", "rz * (-0)", "-1 * (+0)",
                                   "min(+0,-0)", "max(-0,+0)", "PxMin(+0,-0)", "PxMax(+0,-0)",
                                   "(-0) + pz", "pz - (+0)", "(0,0,0) * -1", "e=0; e -= +0",
-                                  "(a,0,0)+(0,-0,..)", "unrolled 0 seed", "-0 + 0*pz", "select +0" };
+                                  "(a,0,0)+(0,-0,..)", "unrolled 0 seed", "-0 + 0*pz", "select +0",
+                                  "-0 + (c?x:0)", "(c?x:0) + -0", "v3 -0 + (c?x:0)" };
 
 // in[0] = pz, in[1] = nz: the probe's +0 / -0.  `swapZeros` loads them the other way
 // round (pz = -0, nz = +0), which turns row 11 into min(-0,+0) and row 12 into
@@ -92,6 +93,14 @@ PXG_TEST(p86SignedZero)
     // The select spelling the port uses for the folds the mode does not stop (rows 0, 4,
     // 18, 19, 20): IEEE in both builds, whatever the driver does.
     PXG_CHECK_MSG(plain[22] == kIeee[22] && sz[22] == kIeee[22], "select spelling lost the sign of zero");
+    // P9.86f (8): a literal +0 that reaches the add only as the arm of a select on a RUNTIME
+    // condition is not folded (measured: IEEE +0 in both builds, scalar either order and vector).
+    // constraintPrepPGS:329, npArtiConstraintPrep:1377, npArtiExtBody:587 (`cTargetVel + (c ? b :
+    // 0.0f)`), softBodySimBda (`oldPos + delta`, delta = isTGS ? 0 : ...) and psContactSolveTgsBda
+    // (`delta + dlta`, dlta = isFirstIteration ? 0 : ...) rely on this; were the driver to start
+    // folding it, those sites would need the plusZero spelling.
+    for (uint32_t k = 23; k < 26; ++k)
+        PXG_CHECK_MSG(plain[k] == kIeee[k] && sz[k] == kIeee[k], "%s: select-arm zero folded (%08x / %08x)", kName[k], plain[k], sz[k]);
 
     // P9.86c F4: in a stamped shader llvmpipe orders the zeros of FMin/FMax -0 < +0 in
     // EITHER operand order -- NIR's fmin/fmax are commutative with fmin(+-0,-+0) = -0,

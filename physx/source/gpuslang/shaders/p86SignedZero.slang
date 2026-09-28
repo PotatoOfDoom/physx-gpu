@@ -89,6 +89,13 @@ void szProbe(uint3 dtid : SV_DispatchThreadID)
     o[20] = asuint(acc);                                                   // +0
     o[21] = asuint(nz + 0.0f * pz);                                        // +0
     o[22] = asuint((nz == 0.0f) ? 0.0f : nz);                              // +0
+    // P9.86f (8): a literal zero reaching the add only through a SELECT ARM on a runtime
+    // condition (constraintPrepPGS `cTargetVel + (isGreater2 ? b : 0.0f)`, softBodySimBda
+    // `oldPos + (isTGS ? 0 : d)`, psContactSolveTgsBda `delta + (first ? 0 : dP)`); m1 = -1,
+    // so the zero arm is taken, and IEEE (-0) + (+0) = +0.
+    o[23] = asuint(nz + ((m1 > 0.0f) ? m1 : 0.0f));                        // +0
+    o[24] = asuint(((m1 > 0.0f) ? m1 : 0.0f) + nz);                        // +0
+    o[25] = asuint((float3(nz, nz, nz) + ((m1 > 0.0f) ? float3(m1, m1, m1) : float3(0.0f, 0.0f, 0.0f))).y);   // +0
 }
 
 // P9.86f: pxgSlangTriBox's AXISTEST/FINDMINMAX selects on NaN.  One thread per case, five float4
