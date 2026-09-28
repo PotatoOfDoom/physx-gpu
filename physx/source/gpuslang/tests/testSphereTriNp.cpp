@@ -56,6 +56,12 @@
 // The shape of the test is the whole point: ONE mesh, TWO primitives, the SAME
 // field, TWO different expected values.  A port that reuses one arm's index
 // expression for both fails on exactly one of the two rows.
+//
+// P9.86c: a THIRD pair (the capsule, rotated 180 deg about y, lying IN the plane
+// of a second triangle) pins the capsule arm's `separation = PxMin(separation,
+// pen)` (convexMesh.cu:575) on a signed-zero tie.  Its endpoint separations are
+// -0 then +0; PxMin is selectMin (a < b ? a : b) and keeps the SECOND, so the
+// stored maxDepth (:603) is +0.  GLSL FMin on llvmpipe gives -0 there.
 
 #include "pxgTestFramework.h"
 
@@ -177,17 +183,20 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
 {
     PxgSlangComputeDevice* dev = testDevice();
 
-    // ---- one mesh, one triangle, a remap that shares no value with an index --
+    // ---- one mesh, two triangles, a remap that shares no value with an index --
     // The triangle is wound so its normal is +y: cross(v1-v0, v2-v0) =
     // cross((0,0,4),(4,0,0)) = (0,16,0).  Both primitives sit above it, which is
     // the side the one-sided gate (`dist0 >= 0`) admits.
     Mesh mesh;
-    mesh.verts = { { 0, 0, 0, 0 }, { 0, 0, 4, 0 }, { 4, 0, 0, 0 } };
-    mesh.idx = { 0, 1, 2, 0 };
+    // Triangle 1 (P9.86c): (0,0,0), (4,0,-4), (-4,0,0).  cross((4,+0,-4),
+    // (-4,+0,+0)) = (+0,16,+0), so its normal is exactly (+0,1,+0) and its region
+    // reaches x < 0, where the in-plane capsule of pair 2 lies.
+    mesh.verts = { { 0, 0, 0, 0 }, { 0, 0, 4, 0 }, { 4, 0, 0, 0 }, { 4, 0, -4, 0 }, { -4, 0, 0, 0 } };
+    mesh.idx = { 0, 1, 2, 0, 0, 3, 4, 0 };
     // BOUNDARY on every edge: `isEdgeNonconvex` is false for the sentinel, so the
     // primitive's convexity verdict is true and a face contact is generated.
-    mesh.adj = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0 };
-    mesh.remap = { 700 };
+    mesh.adj = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0 };
+    mesh.remap = { 700, 701 };
     buildMesh(mesh, 2);
 
     PxgBufferHandle bMesh = createBufferFrom(dev, mesh.blob);
@@ -209,33 +218,40 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
     shapes[2].rw = 1.0f; shapes[2].type = GEOM_CAPSULE;
 
     // ---- transforms: identity rotations, the primitives 0.4 above the face ---
-    std::vector<CachedXf> xf(3);
+    std::vector<CachedXf> xf(4);
     std::memset(xf.data(), 0, xf.size() * sizeof(CachedXf));
     xf[0].qw = 1.0f; xf[0].px = 1.0f; xf[0].py = 0.4f; xf[0].pz = 1.0f;   // sphere
     xf[1].qw = 1.0f;                                                        // mesh at origin
     xf[2].qw = 1.0f; xf[2].px = 1.0f; xf[2].py = 0.4f; xf[2].pz = 1.0f;   // capsule
-    std::vector<float> contactDist(3, 0.0f);
+    // P9.86c: capsule at q = (0,1,0,0) (180 deg about y), p = (-0.5,0,0).
+    // getBasisVector0 = (-1,+0,+0), so p0 = (-1,+0,+0) and p1 = (+0,+0,+0) = v0:
+    // both endpoints lie in triangle 1's plane.  capGenerateContacts:
+    // inomp = (+0*1)+(1*-0)+(+0*-0) = +0 -> sep0 = -0;  inomq = -0 -> sep1 = +0.
+    xf[3].qy = 1.0f; xf[3].px = -0.5f;
+    std::vector<float> contactDist(4, 0.0f);
 
     // ---- two contact managers: (sphere, mesh) and (capsule, mesh) -----------
     // Slot 0 is the primitive in both, so the kernel's mesh-in-slot-0 swap does
     // NOT fire here; the swap has its own coverage in the scenes.
-    std::vector<CmInput> cms(2);
+    std::vector<CmInput> cms(3);
     cms[0] = { 0u, 1u, 0u, 1u };
     cms[1] = { 2u, 1u, 2u, 1u };
+    cms[2] = { 2u, 1u, 3u, 1u };   // P9.86c: in-plane capsule x mesh
 
     // ---- ConvexMeshPair, 56 B: startIndex @28, roundedStartIndex @40 --------
     // DIFFERENT permutations for the two fields, so a port reading the wrong one
     // lands somewhere visible rather than on the same number.
-    std::vector<uint8_t> pairRecs(2 * 56, 0);
+    std::vector<uint8_t> pairRecs(3 * 56, 0);
     auto setPair = [&](uint32_t cm, uint32_t startIndex, uint32_t rounded) {
         std::memcpy(&pairRecs[cm * 56 + 28], &startIndex, 4);
         std::memcpy(&pairRecs[cm * 56 + 40], &rounded, 4);
     };
     setPair(0, 0u, 0u);
     setPair(1, 1u, 3u);
+    setPair(2, 2u, 5u);
 
     // ---- the midphase stack -------------------------------------------------
-    const uint32_t nbPairs = 2, nbPaddedPairs = 8;
+    const uint32_t nbPairs = 3, nbPaddedPairs = 8;
     const StackOffsets so = stackLayout(nbPairs, nbPaddedPairs);
     std::vector<uint8_t> stack(size_t(so.total) + 256, 0);
     // the pair records the kernel reads: (cmIdx, triangleIdx, testOffset, 0)
@@ -245,6 +261,11 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
     };
     setStackPair(0, 0u, 0u, 0u);   // sphere  x triangle 0
     setStackPair(1, 1u, 0u, 0u);   // capsule x triangle 0
+    setStackPair(2, 2u, 1u, 0u);   // in-plane capsule x triangle 1 (P9.86c)
+    // maxDepth of pair 2 is expected to be +0: a zero-filled stack would pass
+    // vacuously, so the slot carries a sentinel the kernel must overwrite.
+    const uint32_t kDepthSentinel = 0x7fbadbadu;
+    std::memcpy(&stack[size_t(so.maxDepth) + 2 * 4], &kDepthSentinel, 4);
 
     PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
     PxgBufferHandle bXf = createBufferFrom(dev, xf);
@@ -261,7 +282,7 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
     PxgBufferHandle bScratch = createBufferFrom(dev, scratch);
     std::vector<uint64_t> outPtrs(8, 0);
     PxgBufferHandle bOutPtrs = createBufferFrom(dev, outPtrs);
-    std::vector<float> tempContacts(64, 0.0f);
+    std::vector<float> tempContacts(64, -99.0f);
     PxgBufferHandle bTemp = createBufferFrom(dev, tempContacts);
 
     const uint64_t aNbPairs = dev->getBufferDeviceAddress(bNbPairs);
@@ -289,9 +310,9 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
     p.pTempContactIndex = aScratch + 4;
     p.maxTempMemRequirement = aScratch + 8;
     p.midphasePairsNeeded = aScratch + 12;
-    p.nbContactManagers = 2u;
+    p.nbContactManagers = 3u;
 
-    // ONE workgroup of one warp: the shader is [numthreads(32,1,1)] and two pairs
+    // ONE workgroup of one warp: the shader is [numthreads(32,1,1)] and three pairs
     // fit in a single pass, so the grid-stride loop runs exactly once.
     Kernel k("sphereTriNpBda.spv", "sphereTrimeshNarrowphase", {}, sizeof(StnPush));
     k.dispatch(1u, {}, p, 1u, 1u);
@@ -325,6 +346,43 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
                   "CAPSULE arm must pack the RAW gpu triangle index "
                   "(convexMesh.cu:613): expected 0, got %u (niIndex=0x%08x)",
                   triangleIndexOf(capsuleIdx), capsuleIdx);
+
+    // ---- P9.86c: the PxMin signed-zero tie (convexMesh.cu:575, :603) --------
+    const uint32_t tieIdx = niIndexAt(2);
+    PXG_CHECK_MSG(nbContactsOf(tieIdx) == 2u && triangleIndexOf(tieIdx) == 1u,
+                  "in-plane capsule must give 2 contacts on raw triangle 1 "
+                  "(niIndex=0x%08x)", tieIdx);
+    uint32_t cs = 0xffffffffu;
+    std::memcpy(&cs, &got[size_t(so.contacts) + 2 * 4], 4);
+    PXG_CHECK_MSG(cs == 3u, "in-plane capsule contactStart: expected 3 (sphere 1 + "
+                  "capsule 2), got %u", cs);
+    if (cs + 1u < 16u)
+    {
+        const std::vector<float> tc = downloadBuffer<float>(dev, bTemp, tempContacts.size());
+        uint32_t b0, b1;
+        std::memcpy(&b0, &tc[4 * cs + 3], 4);
+        std::memcpy(&b1, &tc[4 * (cs + 1) + 3], 4);
+        int zeroTieSeen = 0;
+        if (b0 == 0x80000000u && b1 == 0x00000000u) ++zeroTieSeen;
+        PXG_CHECK_MSG(zeroTieSeen == 1,
+                      "in-plane capsule must give sep0=-0 (p0=(-1,+0,+0): inomp=+0) and "
+                      "sep1=+0 (p1=v0: inomq=-0); got 0x%08x 0x%08x -- the PxMin zero "
+                      "tie is not exercised", b0, b1);
+        float s0, s1;
+        std::memcpy(&s0, &b0, 4);
+        std::memcpy(&s1, &b1, 4);
+        // PxMin<float> = intrinsics::selectMin (PxMath.h:97-101,
+        // PxUnixMathIntrinsics.h:116-119): a < b ? a : b, a tie keeps b.  NOT
+        // std::min (keeps a) and NOT std::fmin.
+        auto pxSelectMin = [](float a, float b) { return a < b ? a : b; };
+        const float expectDepth = pxSelectMin(pxSelectMin(3.4028234663852886e+38f, s0), s1);
+        uint32_t gBits, eBits;
+        std::memcpy(&gBits, &got[size_t(so.maxDepth) + 2 * 4], 4);
+        std::memcpy(&eBits, &expectDepth, 4);
+        PXG_CHECK_MSG(gBits == eBits && eBits == 0x00000000u,
+                      "capsule maxDepth (convexMesh.cu:575 PxMin, :603 store): expected "
+                      "0x%08x, got 0x%08x", eBits, gBits);
+    }
 
     for (PxgBufferHandle h : { bMesh, bShapes, bXf, bCd, bCms, bPairRecs, bStack,
                                bNbPairs, bScratch, bOutPtrs, bTemp })
