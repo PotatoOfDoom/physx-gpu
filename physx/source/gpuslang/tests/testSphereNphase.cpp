@@ -43,6 +43,7 @@
 #include "pxgRefMath.h"
 #include "PxgCudaShim.h"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -410,8 +411,10 @@ static HShape makeShape(const Vec3& scale, uint32_t mat, uint32_t type)
 static std::vector<uint8_t> sphereShimLoader(const char* file) { return loadShaderBlob(file); }
 
 // P9.86c signed-zero material bank at ZS_BANK + k (below 0x10000, clear of bank 1 at 0..7 and
-// bank 2 at 0x10000..7).  Every value is one PxMaterial accepts: NpMaterial.cpp:110/:125 check only
-// PxIsFinite (friction), :140-141 finite and <= 1 (restitution; -0 < 0 is false, so -0 is a
+// bank 2 at 0x10000..7).  Every value is accepted by the PxMaterial setters: NpMaterial.cpp:110/:125
+// check only PxIsFinite (friction; k6's negative frictions pass that check but lie outside the
+// documented range [0, PX_MAX_F32) of include/PxMaterial.h:152/:174, and feed only the r2
+// coverage, never a kill), :140-141 finite and <= 1 (restitution; -0 < 0 is false, so -0 is a
 // rigid, non-compliant material), :161 finite and >= 0 (damping; -0 >= 0 holds).  Combine modes:
 // packedFlags bits 16-23 friction, 24-31 restitution, packedDamp bits 0-7 damping
 // (eAVERAGE 0, eMIN 1, eMULTIPLY 2, eMAX 3).
@@ -438,8 +441,12 @@ static HMaterial zeroSignMaterial(uint32_t k)
 // whose CUDA-mirror value is +-0 (the sign of zero is an output bit).  Opt-in: only the directed
 // configurations are derived to be exact on their zero lanes (every product reaching them is exact,
 // so fma contraction cannot change them); the other configurations keep the tolerance compare.
+// comparedWords (optional, P9.86c): per pair, whether patch words 7-10 were bitwise compared
+// (nb > 0 and the output pointers in range) and the GPU's words 7-10, so a caller can tie its
+// coverage to the GPU output rather than to the host mirror alone.
+struct ComparedPatch { bool compared; uint32_t w[4]; };
 static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label,
-                        bool strictZero = false)
+                        bool strictZero = false, std::vector<ComparedPatch>* comparedWords = nullptr)
 {
     using namespace physx::gpuslang;
     const uint32_t n = uint32_t(cfgs.size());
@@ -567,6 +574,7 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     const uint32_t oldPrevPatches = (priorAllflags >> 8) & 0xffu;
     const bool prevHadTouch = (oldStatus & 2u) != 0u;
     const bool prevKnown = (oldStatus & 3u) != 0u;
+    if (comparedWords) comparedWords->assign(n, ComparedPatch{ false, { 0u, 0u, 0u, 0u } });
 
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -649,6 +657,11 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         // staticFriction, damping) are compared BITWISE, the sign of zero included.
         {
             const float want[4] = { rest, dyn, sta, damping };
+            if (comparedWords)
+            {
+                (*comparedWords)[i].compared = true;
+                for (uint32_t w = 0; w < 4u; ++w) (*comparedWords)[i].w[w] = pu[7 + w];
+            }
             for (uint32_t w = 0; w < 4u; ++w)
                 if (pu[7 + w] != fbits(want[w]))
                 { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=%08x\n", label, i, 7 + w, pu[7 + w], fbits(want[w])); }
@@ -806,6 +819,8 @@ PXG_TEST(sphereNphase_materialZeroSign)
     // reach the clamp, including the eMULTIPLY pairs where staticFriction falls back to fDyn.
     uint32_t imageBad = 0, twinWord[3][4] = {}, twinPairs[3] = {}, flipTwin[3] = {};
     uint32_t forcedMaxTie = 0, dynNegZero = 0, staFromClamp = 0;
+    std::vector<std::array<uint32_t, 4>> twinBits[3];   // [variant][pair] expected words 7-10 of each twin
+    for (int v = 1; v <= 2; ++v) twinBits[v].resize(np);
     for (uint32_t p = 0; p < np; ++p)
     {
         const HMaterial m0 = zeroSignMaterial(mp[p].a), m1 = zeroSignMaterial(mp[p].b);
@@ -829,6 +844,7 @@ PXG_TEST(sphereNphase_materialZeroSign)
             gMatVariant = v;
             combineMaterials(m0, m1, wv[2], wv[1], wv[0], wv[3], fl);
             gMatVariant = 0;
+            for (uint32_t w = 0; w < 4u; ++w) twinBits[v][p][w] = fbits(wv[w]);
             bool changed = false;
             for (uint32_t w = 0; w < 4u; ++w)
                 if (fbits(wv[w]) != fbits(w0[w])) { ++twinWord[v][w]; changed = true; }
@@ -856,7 +872,32 @@ PXG_TEST(sphereNphase_materialZeroSign)
                   "dynFriction -0 reached the :161 clamp on %u pairs (expected 5), sta = fDyn on %u (expected 2)",
                   dynNegZero, staFromClamp);
 
-    checkSphere(cfgs, 0x00000000u, false, "materialZeroSign");
+    // GPU-side coverage: every directed pair must have its patch words 7-10 bitwise compared, and a
+    // twin counts as observed on a pair only where the GPU words equal the CUDA image AND differ from
+    // that twin's words -- so a pair that stopped touching, or a loosened compare, fails here.
+    std::vector<ComparedPatch> gw;
+    checkSphere(cfgs, 0x00000000u, false, "materialZeroSign", false, &gw);
+    uint32_t comparedPairs = 0, gpuObserved[3] = { 0, 0, 0 };
+    for (uint32_t p = 0; p < np && p < gw.size(); ++p)
+    {
+        if (!gw[p].compared) continue;
+        ++comparedPairs;
+        bool matchesImage = true;
+        for (uint32_t w = 0; w < 4u; ++w) if (gw[p].w[w] != mp[p].img[w]) matchesImage = false;
+        if (!matchesImage) continue;
+        for (int v = 1; v <= 2; ++v)
+        {
+            bool differs = false;
+            for (uint32_t w = 0; w < 4u; ++w) if (gw[p].w[w] != twinBits[v][p][w]) differs = true;
+            if (differs) ++gpuObserved[v];
+        }
+    }
+    std::printf("  [materialZeroSign] GPU: compared pairs=%u/%u, FMin twin observed on %u, FMax twin on %u\n",
+                comparedPairs, np, gpuObserved[1], gpuObserved[2]);
+    PXG_CHECK_MSG(comparedPairs == np, "materialZeroSign: patch words 7-10 compared for only %u of %u pairs",
+                  comparedPairs, np);
+    PXG_CHECK_MSG(gpuObserved[1] >= 2u, "GPU output observes the FMin twin (r0) on %u pairs, need 2", gpuObserved[1]);
+    PXG_CHECK_MSG(gpuObserved[2] >= 3u, "GPU output observes the FMax twin (r1) on %u pairs, need 3", gpuObserved[2]);
 }
 
 // P9.86c engine route of npCapsuleCollision_capsuleCapsuleZeroSign: capsule-capsule pairs whose
