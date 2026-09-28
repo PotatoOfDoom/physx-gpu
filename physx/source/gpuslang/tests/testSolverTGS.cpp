@@ -55,6 +55,39 @@ const uint32_t DY_SC_FLAG_INEQUALITY = 1u << 6;
 const uint32_t COMPLIANT_ACCEL_SPRING = 1u << 3;
 const float PX_MAX_F32V = 3.4028234663852885981170418348452e+38f;
 
+// ---- P9.86c: CUDA min/max semantics for the mirrors ----
+inline uint32_t tgsBits(float f)
+{
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+// PxMin<float>/PxMax<float> = intrinsics::selectMin/selectMax (PxUnixMathIntrinsics.h): a<b?a:b /
+// a>b?a:b -- on a +-0 tie (or NaN) the SECOND operand survives.
+inline float pxSelectMin(float a, float b) { return a < b ? a : b; }
+inline float pxSelectMax(float a, float b) { return a > b ? a : b; }
+// CUDA fminf/fmaxf: IEEE minNum/maxNum with NVIDIA's ordered zeros (fminf(+-0) = -0 unless both
+// +0, fmaxf(+-0) = +0 unless both -0).  glibc's fminf/fmaxf keep an operand on a zero tie instead.
+inline float tgsCudaFminf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? a : b;
+    return a < b ? a : b;
+}
+inline float tgsCudaFmaxf(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == b) return std::signbit(a) ? b : a;
+    return a > b ? a : b;
+}
+// The reverted port's clamp(v, lo, hi) = GLSL FClamp -> fmin(fmax(v, lo), hi) with ordered zeros
+// under the SignedZeroInfNanPreserve stamp (P9.86 F4) -- used only to count directed inputs on
+// which the CUDA PxClamp and the old port spelling store different bits.
+inline float tgsRevertFClamp(float v, float lo, float hi) { return tgsCudaFminf(tgsCudaFmaxf(v, lo), hi); }
+uint32_t gTorsClampRevertDiffers = 0; // torsional rows where PxClamp != FClamp bitwise (clamp taken)
+
 // ---- TGS block mirrors ----
 
 struct BatchTGS
@@ -432,8 +465,13 @@ void refSolveContactTGS(const BatchTGS& b, BodyStateTGS& s, uint32_t lane,
             const float total = (af0 - (-tv0) * vm0) - nv0 * vm0;
 
             const bool clampI = std::fabs(total) > maxFrictionImpulse * fscale;
-            const float clamped = std::fmin(maxDynFrictionImpulse * fscale,
-                                            std::fmax(-maxDynFrictionImpulse * fscale, total));
+            // PxClamp(v, lo, hi) = PxMin(hi, PxMax(lo, v)) = selectMin(hi, selectMax(lo, v))
+            // (solverBlockTGS.cuh:473): with (lo, hi) = (+0, -0) and v < 0 this stores +0.
+            const float lo = -maxDynFrictionImpulse * fscale;
+            const float hi = maxDynFrictionImpulse * fscale;
+            const float clamped = pxSelectMin(hi, pxSelectMax(lo, total));
+            if (clampI && tgsBits(tgsRevertFClamp(total, lo, hi)) != tgsBits(clamped))
+                ++gTorsClampRevertDiffers;
             const float na = clampI ? clamped : total;
             const float d = na - af0;
 
@@ -548,7 +586,9 @@ void refSolve1DTGS(const BatchTGS& b, BodyStateTGS& s, uint32_t lane,
         const float normalVel = v0 - v1;
 
         const float unclampedForce = appliedForce + (vMul * normalVel + constant);
-        const float clampedForce = std::fmin(c.maxImpulse[lane], std::fmax(c.minImpulse[lane], unclampedForce));
+        // CUDA fminf(maxImpulse, fmaxf(minImpulse, u)) (solverBlockTGS.cuh:907)
+        const float clampedForce =
+            tgsCudaFminf(c.maxImpulse[lane], tgsCudaFmaxf(c.minImpulse[lane], unclampedForce));
         const float deltaF = clampedForce - appliedForce;
 
         c.appliedForce[lane] = clampedForce;
@@ -578,6 +618,55 @@ QuatV randomQuatTGS(std::mt19937& rng)
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
     QuatV q(dist(rng) * 0.1f, dist(rng) * 0.1f, dist(rng) * 0.1f, 1.f);
     return q.getNormalized();
+}
+
+// P9.86c directed contact lane: a torsional anchor with torsionalFrictionScale = -0.  The CUDA prep
+// writes exactly that for maxPenetration == +0 with minTorsionalPatchRadius = 0
+// (contactConstraintBlockPrep.cuh:1128: selectMax(0, -0) = -0, sqrtf(-0) = -0).  Axis-aligned frame
+// (contact normal +y), one normal row on the line of centres, a y-free friction pair, torsional
+// raXn = rbXn = (0, 0.5, 0), body A spinning about the normal (angVel0.y = 1), body B not.  Then
+// acc >= +0, (lo, hi) = (-maxDyn * -0, maxDyn * -0) = (+0, -0), |total| > maxFric * -0 and
+// total = +0 - 0.5 * vm < 0: CUDA PxClamp stores +0, the old FClamp spelling -0.
+// Returns the index of the torsional friction row.
+uint32_t injectTorsNegZeroScaleLane(BatchTGS& b, uint32_t lane, std::vector<TGSContactHeader>& chs,
+                                    std::vector<TGSFrictionHeader>& fhs, std::vector<TGSContactPoint>& cps,
+                                    std::vector<TGSFriction>& frs, std::vector<Float4>& velPool, uint32_t k)
+{
+    const uint32_t bi = b.scalars[1];
+    TGSContactHeader& h = chs[bi];
+    h.normal_staticFriction[lane] = Float4{ 0.f, 1.f, 0.f, 0.6f };
+    h.numNormalConstr[lane] = 1;
+
+    TGSContactPoint& c = cps[b.scalars[2]];
+    c.raXn_extraCoeff[lane].x = c.raXn_extraCoeff[lane].y = c.raXn_extraCoeff[lane].z = 0.f;
+    c.rbXn_targetVelW[lane].x = c.rbXn_targetVelW[lane].y = c.rbXn_targetVelW[lane].z = 0.f;
+    c.appliedForce[lane] = 1.0f;
+    c.separation[lane] = 0.f;
+
+    TGSFrictionHeader& fh = fhs[bi];
+    fh.numFrictionConstr[lane] = 3;
+    fh.dynamicFriction[lane] = 0.5f;
+    fh.torsionalFrictionScale[lane] = -0.0f;
+    fh.frictionNormals0[lane] = Float4{ 1.f, 0.f, 0.f, 0.f };
+    fh.frictionNormals1[lane] = Float4{ 0.f, 0.f, 1.f, 0.f };
+
+    const uint32_t sf = b.scalars[3];
+    const float pr[2][6] = { { 0.f, 0.f, 0.3f, 0.f, 0.f, -0.3f }, { -0.3f, 0.f, 0.f, 0.3f, 0.f, 0.f } };
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        Float4& ra = frs[sf + i].raXn_error[lane];
+        Float4& rb = frs[sf + i].rbXn_targetVelW[lane];
+        ra.x = pr[i][0], ra.y = pr[i][1], ra.z = pr[i][2];
+        rb.x = pr[i][3], rb.y = pr[i][4], rb.z = pr[i][5];
+    }
+    TGSFriction& t = frs[sf + 2];
+    t.raXn_error[lane] = Float4{ 0.f, 0.5f, 0.f, 0.f };
+    t.rbXn_targetVelW[lane] = Float4{ 0.f, 0.5f, 0.f, 0.f };
+    t.appliedForce[lane] = 0.f;
+
+    velPool[k * 192 + lane + 32].x = 1.0f;  // angVel0.y
+    velPool[k * 192 + lane + 128].x = 0.0f; // angVel1.y
+    return sf + 2;
 }
 
 PXG_TEST(solverTGS_contactAndJointBatches)
@@ -744,6 +833,9 @@ PXG_TEST(solverTGS_contactAndJointBatches)
         }
     }
 
+    // P9.86c directed lane (batch 0 = eCONTACT, lane 0 < descStride): torsional scale -0.
+    const uint32_t torsRow = injectTorsNegZeroScaleLane(batches[0], 0, chs, fhs, cps, frs, velPool, 0);
+
     // ---- GPU ----
     PxgSlangComputeDevice* dev = testDevice();
 
@@ -774,6 +866,7 @@ PXG_TEST(solverTGS_contactAndJointBatches)
     std::vector<Float4> refVel = velPool;
     auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
 
+    gTorsClampRevertDiffers = 0;
     for (uint32_t k = 0; k < numBatches; ++k)
     {
         const BatchTGS& b = batches[k];
@@ -858,6 +951,15 @@ PXG_TEST(solverTGS_contactAndJointBatches)
             if (gpuFhs[i].broken[l] != fhs[i].broken[l])
                 ++mismatches;
     PXG_CHECK_MSG(mismatches == 0, "%zu applied-force/residual/broken mismatches", mismatches);
+
+    // P9.86c: the directed torsional lane, compared BITWISE (almostEqual accepts -0 == +0).
+    PXG_CHECK_MSG(gTorsClampRevertDiffers > 0,
+                  "directed torsional lane: (lo,hi)=(+0,-0), v<0 not reached (PxClamp vs FClamp untested)");
+    PXG_CHECK_MSG(tgsBits(frs[torsRow].appliedForce[0]) == 0u, "CUDA PxClamp stores +0 (ref %08x)",
+                  tgsBits(frs[torsRow].appliedForce[0]));
+    PXG_CHECK_MSG(tgsBits(gpuFrs[torsRow].appliedForce[0]) == tgsBits(frs[torsRow].appliedForce[0]),
+                  "torsional scale -0: gpu %08x ref %08x", tgsBits(gpuFrs[torsRow].appliedForce[0]),
+                  tgsBits(frs[torsRow].appliedForce[0]));
 
     for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, txBuf, velBuf, encBuf })
         dev->destroyBuffer(h);
@@ -1030,6 +1132,28 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
         }
     }
 
+    // P9.86c directed pair: a contact report threshold of -0.0f is legal data
+    // (NpRigidDynamic::setContactReportThreshold keeps -0; copied bit for bit into
+    // PxgSolverBodyData.reportThreshold).  Body A = -0, body B = +0: the CUDA PxMin<float>
+    // (selectMin, solverBlockTGS.cuh:722) stores +0, GLSL FMin would store -0.
+    {
+        bodyData[0].reportThreshold = -0.0f;
+        bodyData[0].islandNodeIndex = makeNodeIndex(1001);
+        bodyData[1].reportThreshold = 0.0f;
+        bodyData[1].islandNodeIndex = makeNodeIndex(1002);
+        BatchTGS& tb = batches[0]; // eCONTACT, lane 0 < descStride
+        tb.bodyAIndex[0] = 0;
+        tb.bodyBIndex[0] = 1;
+        chs[0].flags[0] = 1u; // eHAS_FORCE_THRESHOLDS
+        chs[0].numNormalConstr[0] = 1;
+        if (chs[0].forceWritebackOffset[0] == 0xFFFFFFFFu)
+        {
+            chs[0].forceWritebackOffset[0] = forceBufCursor;
+            forceBufCursor += rowsPerBatch;
+        }
+        cps[tb.scalars[2]].appliedForce[0] = 1.5f;
+    }
+
     PxgSlangComputeDevice* dev = testDevice();
 
     std::vector<ConstraintWriteback> wbInit(std::max(writebackCursor, 1u));
@@ -1141,6 +1265,7 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
     std::vector<ThresholdElement> refStream;
     size_t refMutations = 0;    // guard against an all-no-op fixture
     size_t refBrokenJoints = 0; // guard against a fixture that never breaks a joint
+    size_t thrNegPosZero = 0;   // P9.86c: threshold elements with (rtA, rtB) = (-0, +0)
 
     for (uint32_t k = 0; k < numBatches; ++k)
     {
@@ -1199,7 +1324,10 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
                 {
                     ThresholdElement e = {};
                     e.normalForce = normalForce;
-                    e.threshold = std::fmin(rt0, rt1);
+                    // PxMin<float> = selectMin (solverBlockTGS.cuh:722): (-0, +0) -> +0
+                    e.threshold = pxSelectMin(rt0, rt1);
+                    if (tgsBits(rt0) == 0x80000000u && tgsBits(rt1) == 0u)
+                        ++thrNegPosZero;
                     e.nodeIndexA = bodyData[b.bodyAIndex[lane]].islandNodeIndex;
                     e.nodeIndexB = bodyData[b.bodyBIndex[lane]].islandNodeIndex;
                     if (e.nodeIndexB < e.nodeIndexA)
@@ -1253,6 +1381,8 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
     // reports a broken joint, so the memcmp below can only see it if the fixture
     // actually breaks one.
     PXG_CHECK_MSG(refBrokenJoints > 0, "writeback fixture breaks no joint (the sign-bit path is untested)");
+    PXG_CHECK_MSG(thrNegPosZero > 0,
+                  "threshold fixture has no (bodyA -0, bodyB +0) element: selectMin vs FMin untested");
 
     // ---- download + compare ----
     std::vector<TGSJointRowCon> gpuRows(jrows.size());
@@ -2557,6 +2687,9 @@ PXG_TEST(solverTGS_solveBlockUnified)
         }
     }
 
+    // P9.86c directed lane (batch 1 = eCONTACT, stride 32, lane 0): torsional scale -0.
+    const uint32_t torsRow = injectTorsNegZeroScaleLane(batches[1], 0, chs, fhs, cps, frs, velPool, 1);
+
     // ---- GPU (engine ABI through the shim) ----
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
@@ -2667,6 +2800,7 @@ PXG_TEST(solverTGS_solveBlockUnified)
 
     const uint32_t startIndex = batchStartIndex;
     const uint32_t endIndex = cpp[1];
+    gTorsClampRevertDiffers = 0;
     for (uint32_t k = startIndex; k < endIndex; ++k)
     {
         const uint32_t warp = (k - startIndex) % numWarpsInGrid;
@@ -2795,6 +2929,15 @@ PXG_TEST(solverTGS_solveBlockUnified)
                 ++mismatches;
     PXG_CHECK_MSG(mismatches == 0, "solveBlockUnified: %zu applied-force/residual/broken mismatches",
                   mismatches);
+
+    // P9.86c: the directed torsional lane, compared BITWISE (almostEqual accepts -0 == +0).
+    PXG_CHECK_MSG(gTorsClampRevertDiffers > 0,
+                  "solveBlockUnified: directed torsional lane (lo,hi)=(+0,-0), v<0 not reached");
+    PXG_CHECK_MSG(tgsBits(frs[torsRow].appliedForce[0]) == 0u, "solveBlockUnified: CUDA PxClamp stores +0 (ref %08x)",
+                  tgsBits(frs[torsRow].appliedForce[0]));
+    PXG_CHECK_MSG(tgsBits(gpuFrs[torsRow].appliedForce[0]) == tgsBits(frs[torsRow].appliedForce[0]),
+                  "solveBlockUnified torsional scale -0: gpu %08x ref %08x",
+                  tgsBits(gpuFrs[torsRow].appliedForce[0]), tgsBits(frs[torsRow].appliedForce[0]));
 
     physx::PxgSolverCoreDesc gpuDesc;
     shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
