@@ -145,6 +145,9 @@ static const float3 SDFC_DISCONTINUITY_DIR = float3(0.5448762f, 0.672269f, 0.398
 // C2: PxMin / PxMax as PxMath.h spells them.
 float sdfcMin(float a, float b) { return a < b ? a : b; }
 float sdfcMax(float a, float b) { return a > b ? a : b; }   // P9.86: PxMax<float> is intrinsics::selectMax (PxUnixMathIntrinsics.h:122) -- b wins ties (either zero sign) and any NaN compare
+// P9.86c: IEEE x + (+0) (-0 becomes +0).  llvmpipe folds the literal-zero lanes
+// of a vector add `v + float3(d, 0, 0)` to v (F3); spelled as a select it is not.
+float sdfcPlusZero(float x) { return (x == 0.0f) ? 0.0f : x; }
 
 // PxVec3::magnitudeSquared / magnitude (PxVec3.h:171 / :179), spelled out so the
 // summation order is the engine's and NoContraction can forbid the fma.
@@ -282,11 +285,14 @@ float3 sdfVolumeGradEx(SparseSdfTexture t, float3 localPos, out SdfGradTrace tr)
     }
 
     tr.interior = 0u;
-    tr.coord[0] = localPos + float3(t.sdfDx, 0.0f, 0.0f);
+    // sdfCollision.cuh:190-195: localPos + PxVec3(sdfDx, 0.f, 0.f) etc. are IEEE
+    // adds, so a -0 lane comes out +0.  P9.86c: the zero lanes of the PLUS taps are
+    // spelled with sdfcPlusZero (F3); the MINUS taps (x - 0) are exact as written.
+    tr.coord[0] = float3(localPos.x + t.sdfDx, sdfcPlusZero(localPos.y), sdfcPlusZero(localPos.z));
     tr.coord[1] = localPos - float3(t.sdfDx, 0.0f, 0.0f);
-    tr.coord[2] = localPos + float3(0.0f, t.sdfDx, 0.0f);
+    tr.coord[2] = float3(sdfcPlusZero(localPos.x), localPos.y + t.sdfDx, sdfcPlusZero(localPos.z));
     tr.coord[3] = localPos - float3(0.0f, t.sdfDx, 0.0f);
-    tr.coord[4] = localPos + float3(0.0f, 0.0f, t.sdfDx);
+    tr.coord[4] = float3(sdfcPlusZero(localPos.x), sdfcPlusZero(localPos.y), localPos.z + t.sdfDx);
     tr.coord[5] = localPos - float3(0.0f, 0.0f, t.sdfDx);
     [ForceUnroll]
     for (uint i = 0; i < 6; ++i)

@@ -189,6 +189,18 @@ static PxVec3 hClampToBox(const HostSdfBox& t, const PxVec3& p)
     return p.maximum(t.lower).minimum(t.higher);      // C1 + C2, ENGINE
 }
 
+// P9.86c: the pre-P9.86 port spelling of PxMax, `a < b ? b : a` -- PxMath.h:75's
+// GENERIC template, which float does NOT use (PxMath.h:82 specialises it to
+// intrinsics::selectMax, `a > b ? a : b`, PxUnixMathIntrinsics.h:122).  The two
+// differ on a signed-zero tie: selectMax keeps the SECOND operand (the box
+// bound).  A coverage twin only -- never an expectation.
+static float hMaxGenericTwin(float a, float b) { return a < b ? b : a; }
+static PxVec3 hClampToBoxGenericMax(const HostSdfBox& t, const PxVec3& p)
+{
+    return PxVec3(hMaxGenericTwin(p.x, t.lower.x), hMaxGenericTwin(p.y, t.lower.y),
+                  hMaxGenericTwin(p.z, t.lower.z)).minimum(t.higher);
+}
+
 static PxVec3 hTexCoord(const HostSdfBox& t, const PxVec3& clamped)
 {
     return (clamped - t.lower) * t.invDx;             // C4, ENGINE
@@ -229,7 +241,13 @@ struct SceneRun
     uint64_t blobAddr;
     bool expectDiscontinuity;      // exactly one point must produce a zero gradient
     std::vector<Pt> pts;
+    // P9.86c coverage: points on which the generic-max twin changes the clamp,
+    // the pass-3 dir, or the pass-4 vertex dir.
+    size_t tieClamp = 0, tieDir = 0, tieDirV = 0;
 };
+
+static bool bitEqV(const PxVec3& a, const PxVec3& b)
+{ return bitEq(a.x, b.x) && bitEq(a.y, b.y) && bitEq(a.z, b.z); }
 
 static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
                        std::vector<PxgBufferHandle>& owned)
@@ -251,6 +269,7 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
         wantDiffMag[i] = wantDiff[i].magnitude();                 // ENGINE
         wantF[i] = hTexCoord(box, wantClamped[i]);
         wantInterior[i] = hInterior(box, wantF[i]) ? 1 : 0;
+        if (!bitEqV(hClampToBoxGenericMax(box, r.pts[i].p), wantClamped[i])) ++r.tieClamp;
     }
 
     // =====================================================================
@@ -620,6 +639,10 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
             // engine's own getNormalized.
             const PxVec3 dir = (gin.getNormalized() * PxAbs(o[0]) + wantDiff[i]).getNormalized();
             const float ret = o[0] + dir.dot(wantDiff[i]);
+            {
+                const PxVec3 dT = r.pts[i].p - hClampToBoxGenericMax(box, r.pts[i].p);
+                if (!bitEqV((gin.getNormalized() * PxAbs(o[0]) + dT).getNormalized(), dir)) ++r.tieDir;
+            }
             if (!bitEq3(o + 1, dir))
             {
                 if (badDir < 4)
@@ -726,6 +749,10 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
         {
             const PxVec3 dir = (v3(o + 4).getNormalized() * PxAbs(o[7]) + wantDiff[i]).getNormalized();
             const float ret = o[7] + dir.dot(wantDiff[i]);
+            {
+                const PxVec3 dT = r.pts[i].p - hClampToBoxGenericMax(box, r.pts[i].p);
+                if (!bitEqV((v3(o + 4).getNormalized() * PxAbs(o[7]) + dT).getNormalized(), dir)) ++r.tieDirV;
+            }
             if (!bitEq3(o + 8, dir))
             {
                 if (badDirV < 4)
@@ -775,6 +802,33 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
         PXG_CHECK_MSG(nSubstituted == 0,
                       "%s: no point here should produce an exactly zero gradient (%zu did)",
                       r.label, nSubstituted);
+}
+
+// The grid-aligned dense scene's point list, relative to the run's own box.
+static void addDenseAlignedPoints(SceneRun& r)
+{
+    const HostSdfBox& b = r.box;
+    // dims 9 x 6 x 13 -> the guard is f in [1,7] x [1,4] x [1,11], and the
+    // box spans f in [0,8] x [0,5] x [0,12].
+    r.pts.push_back({ posOfF(b, float(FLAT_X), float(FLAT_Y), float(FLAT_Z)),
+                       int(FLAT_X), int(FLAT_Y), int(FLAT_Z), "discontinuity" });
+    r.pts.push_back({ posOfF(b, 1, 1, 1),    1, 1, 1,    "guard-lo-exact" });
+    r.pts.push_back({ posOfF(b, 7, 4, 11),   7, 4, 11,   "guard-hi-exact" });
+    r.pts.push_back({ posOfF(b, 0.5f, 2, 4), -1, -1, -1, "below-guard-x" });
+    r.pts.push_back({ posOfF(b, 8, 2, 4),    8, 2, 4,    "face-x-hi" });
+    r.pts.push_back({ posOfF(b, 4, 2, 6),    4, 2, 6,    "interior" });
+    r.pts.push_back({ posOfF(b, 2, 1, 1),    2, 1, 1,    "interior-2" });
+    r.pts.push_back({ posOfF(b, 6, 4, 11),   6, 4, 11,   "interior-3" });
+    r.pts.push_back({ posOfF(b, 9, 2, 4),    -1, -1, -1, "out-x" });
+    r.pts.push_back({ posOfF(b, -2, 3, 14),  -1, -1, -1, "out-x-lo-z-hi" });
+    r.pts.push_back({ posOfF(b, -1.5f, 7.25f, -3), -1, -1, -1, "out-xyz" });
+    r.pts.push_back({ posOfF(b, 7.5f, 3.5f, 11.5f), -1, -1, -1, "half-texel-above-guard" });
+    // C7's guard ANDs three axes.  These three fail on EXACTLY ONE of them
+    // while passing the other two, which is what makes a mutant that drops
+    // one conjunct -- or tests only x -- die rather than merely be lucky.
+    r.pts.push_back({ posOfF(b, 4, 0, 6),  4, 0, 6,  "guard-fails-y-lo-only" });
+    r.pts.push_back({ posOfF(b, 4, 5, 6),  4, 5, 6,  "guard-fails-y-hi-only" });
+    r.pts.push_back({ posOfF(b, 4, 2, 0),  4, 2, 0,  "guard-fails-z-lo-only" });
 }
 
 PXG_TEST(sdfCollision)
@@ -864,31 +918,68 @@ PXG_TEST(sdfCollision)
     rd.box = hostSdfBox(dn);
     rd.blobAddr = dev->getBufferDeviceAddress(mkBuf(blobDn.bytes));
     rd.expectDiscontinuity = true;
-    {
-        const HostSdfBox& b = rd.box;
-        // dims 9 x 6 x 13 -> the guard is f in [1,7] x [1,4] x [1,11], and the
-        // box spans f in [0,8] x [0,5] x [0,12].
-        rd.pts.push_back({ posOfF(b, float(FLAT_X), float(FLAT_Y), float(FLAT_Z)),
-                           int(FLAT_X), int(FLAT_Y), int(FLAT_Z), "discontinuity" });
-        rd.pts.push_back({ posOfF(b, 1, 1, 1),    1, 1, 1,    "guard-lo-exact" });
-        rd.pts.push_back({ posOfF(b, 7, 4, 11),   7, 4, 11,   "guard-hi-exact" });
-        rd.pts.push_back({ posOfF(b, 0.5f, 2, 4), -1, -1, -1, "below-guard-x" });
-        rd.pts.push_back({ posOfF(b, 8, 2, 4),    8, 2, 4,    "face-x-hi" });
-        rd.pts.push_back({ posOfF(b, 4, 2, 6),    4, 2, 6,    "interior" });
-        rd.pts.push_back({ posOfF(b, 2, 1, 1),    2, 1, 1,    "interior-2" });
-        rd.pts.push_back({ posOfF(b, 6, 4, 11),   6, 4, 11,   "interior-3" });
-        rd.pts.push_back({ posOfF(b, 9, 2, 4),    -1, -1, -1, "out-x" });
-        rd.pts.push_back({ posOfF(b, -2, 3, 14),  -1, -1, -1, "out-x-lo-z-hi" });
-        rd.pts.push_back({ posOfF(b, -1.5f, 7.25f, -3), -1, -1, -1, "out-xyz" });
-        rd.pts.push_back({ posOfF(b, 7.5f, 3.5f, 11.5f), -1, -1, -1, "half-texel-above-guard" });
-        // C7's guard ANDs three axes.  These three fail on EXACTLY ONE of them
-        // while passing the other two, which is what makes a mutant that drops
-        // one conjunct -- or tests only x -- die rather than merely be lucky.
-        rd.pts.push_back({ posOfF(b, 4, 0, 6),  4, 0, 6,  "guard-fails-y-lo-only" });
-        rd.pts.push_back({ posOfF(b, 4, 5, 6),  4, 5, 6,  "guard-fails-y-hi-only" });
-        rd.pts.push_back({ posOfF(b, 4, 2, 0),  4, 2, 0,  "guard-fails-z-lo-only" });
-    }
+    addDenseAlignedPoints(rd);
     checkScene(dev, rd, owned);
+
+    // =====================================================================
+    // P9.86c: the dense scene shifted so that sdfBoxLower.x is EXACTLY +0
+    // (meshLower.x + 0.5*spacing = -0.125 + 0.125, a computed sum, so never -0;
+    // sdfCollision.cuh:71).  A localPos.x of -0 -- valid data: a coordinate
+    // negated from zero, or rotated by a conjugated identity quaternion --
+    // then TIES the lower face, and PxVec3::maximum's PxMax<float> is
+    // selectMax (PxMath.h:82, PxUnixMathIntrinsics.h:122): the bound, +0,
+    // survives.  clamped.x = +0, f.x = +0, diff.x = -0 in the CUDA; the generic
+    // `a < b ? b : a` keeps -0 and flips f.x and diff.x.  At texel (0,5,4) = 0
+    // the sample is +0, so with gradient case 4 (-2.5,0,0) the term
+    // G.x*|dist| is -0 and dir.x = -0 + diff.x carries diff.x's sign into the
+    // engine's contact normal (sdfCollision.cuh:215).
+    // =====================================================================
+    SdfScene dz;
+    buildDenseAligned(dz);
+    dz.meshLower.x = -0.125f;
+    dz.coarse[denseIdx(dz, 0, 5, 4)] = 0.0f;       // dist == +0 at the dir point
+    dz.coarse[denseIdx(dz, 1, 5, 4)] = -0.5f;      // its fall-back grad.x < 0
+    BlobLayout blobDz = layOutBlob(dz, 5u, 9u, 1u, 0u, 0x0BADF00Du);
+    const uint64_t hDz = sdfUploadTex(CU_AD_FORMAT_FLOAT, dz.dx, dz.dy, dz.dz,
+                                      dz.coarse.data(), sizeof(float));
+    PXG_CHECK_MSG(hDz != 0, "the zero-lower dense texture upload failed");
+    if (hDz == 0) return;
+    std::memcpy(&blobDz.bytes[blobDz.texObjOffset], &hDz, 8);
+
+    SceneRun rz;
+    rz.label = "dense-zero-lower";
+    rz.s = &dz;
+    rz.box = hostSdfBox(dz);
+    rz.blobAddr = dev->getBufferDeviceAddress(mkBuf(blobDz.bytes));
+    rz.expectDiscontinuity = true;
+    PXG_CHECK_MSG(f2u(rz.box.lower.x) == 0u,
+                  "dense-zero-lower: sdfBoxLower.x must be +0 (0x%08x)", f2u(rz.box.lower.x));
+    addDenseAlignedPoints(rz);
+    {
+        const HostSdfBox& b = rz.box;
+        auto nx = [](PxVec3 p) { p.x = -0.0f; return p; };
+        // Indices 15..19: i % 5 picks gradient cases 0, 1, 2, 3, 4.
+        rz.pts.push_back({ nx(posOfF(b, 0, 2, 4)),  0, 2, 4,  "neg0-x-tie" });
+        // Not a tie: its -0 y and z lanes pin the fall-back tap
+        // localPos + (dx,0,0) (sdfCollision.cuh:190), whose IEEE add makes them +0.
+        rz.pts.push_back({ PxVec3(b.higher.x + 0.375f, -0.0f, -0.0f), 8, 0, 0, "neg0-yz-out" });
+        rz.pts.push_back({ nx(posOfF(b, 0, 3, 7)),  0, 3, 7,  "neg0-x-tie-2" });
+        rz.pts.push_back({ nx(posOfF(b, 0, 2, 13)), 0, 2, 12, "neg0-x-tie-out-z" });
+        rz.pts.push_back({ nx(posOfF(b, 0, 6, 4)),  0, 5, 4,  "neg0-x-tie-zero-dist" });
+    }
+    checkScene(dev, rz, owned);
+    PXG_CHECK_MSG(rz.tieClamp == 4,
+                  "dense-zero-lower: %zu points tie -0 against the +0 lower face (want 4) -- "
+                  "selectMax is indistinguishable from a<b?b:a otherwise", rz.tieClamp);
+    PXG_CHECK_MSG(rz.tieDir >= 1,
+                  "dense-zero-lower: no PxSdfSampleWithGrad dir depends on the tie's sign (%zu)",
+                  rz.tieDir);
+    PXG_CHECK_MSG(rz.tieDirV >= 1,
+                  "dense-zero-lower: no doVertexSDFCollision dir depends on the tie's sign (%zu)",
+                  rz.tieDirV);
+    PXG_CHECK_MSG(rs.tieClamp == 0 && rd.tieClamp == 0,
+                  "the sparse / dense-aligned scenes have no zero bound, so no tie (%zu, %zu)",
+                  rs.tieClamp, rd.tieClamp);
 
     for (PxgBufferHandle h : owned)
         dev->destroyBuffer(h);
