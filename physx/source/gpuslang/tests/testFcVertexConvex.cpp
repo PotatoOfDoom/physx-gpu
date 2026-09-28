@@ -96,6 +96,29 @@ static V3 v3f(F4 f) { return { f.x, f.y, f.z }; }
 
 static const float MAXF = 3.4028235e38f;
 
+// P9.86c: signed-zero helpers for fcVertexConvex_zeroSign.
+static uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+// NVIDIA fmaxf on non-NaN operands: the total-order max with -0 < +0.
+static float fmaxNv(float a, float b) { return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b); }
+// GLSL FMax / FMin as llvmpipe evaluates them (F4): a +-0 tie gives +0 / -0.
+static float fmaxLp(float a, float b) { return a != a ? b : b != b ? a : fmaxNv(a, b); }
+static float fminLp(float a, float b)
+{
+    return a != a ? b : b != b ? a : (a == b ? (std::signbit(a) ? a : b) : (a < b ? a : b));
+}
+// Mutant twins inside the host mirror (0 = the CUDA semantics).
+//  gClampVariant 1: the pre-P9.86 port, clamp() = FMin(FMax(v, 0), 1)  (revert r0).
+//  gMaxVariant   1: maxps(best, v) = (best > v) ? best : v -- the SECOND operand wins a tie;
+//                2: (v > best) ? v : best -- the FIRST operand wins a tie (std::max).
+static int gClampVariant = 0;
+static int gMaxVariant = 0;
+static float redMax(float best, float v)
+{
+    if (gMaxVariant == 1) return (best > v) ? best : v;
+    if (gMaxVariant == 2) return (v > best) ? v : best;
+    return fmaxNv(best, v);   // warpReduction<MaxOpFloat> (reduction.cuh:72/83)
+}
+
 struct Slack
 {
     bool near = false;
@@ -225,12 +248,19 @@ static Hull makePrism(uint32_t n, const float* radii, float hh)
 }
 
 // ---- reference --------------------------------------------------------------
-static V3 distancePointSegment(V3 a, V3 b, V3 p)
+// femClothPrimitives.cu:1963.  PxClamp(q, 0, 1) = selectMin(1, selectMax(0, q))
+// (PxMath.h:142-146, PxUnixMathIntrinsics.h:116-125): q = -0 stays -0.
+static V3 distancePointSegment(V3 a, V3 b, V3 p, float* qOut = nullptr, float* denomOut = nullptr)
 {
     const V3 ap = sub(p, a), ab = sub(b, a);
     const float nom = dot3(ap, ab), denom = dot3(ab, ab);
-    const float tValue = std::min(std::max(nom / denom, 0.0f), 1.0f);
+    const float q = nom / denom;
+    const float lo = (0.0f > q) ? 0.0f : q;
+    float tValue = (1.0f < lo) ? 1.0f : lo;
+    if (gClampVariant == 1) tValue = fminLp(fmaxLp(q, 0.0f), 1.0f);
     const float t = denom > 0.0f ? tValue : 0.0f;
+    if (qOut) *qOut = q;
+    if (denomOut) *denomOut = denom;
     return add(a, mul(ab, t));
 }
 
@@ -472,7 +502,7 @@ PXG_TEST(fcVertexConvex_closest)
             ro.inside = true;
             ++insideN;
             float best = -MAXF;
-            for (int l = 0; l < 32; ++l) best = std::max(best, laneMax[l]);
+            for (int l = 0; l < 32; ++l) best = redMax(best, laneMax[l]);   // NVIDIA fmaxf, not std::max
             uint32_t winner = 0;
             for (int l = 0; l < 32; ++l)
                 if (laneMax[l] == best) { winner = (uint32_t)l; break; }
@@ -607,6 +637,375 @@ PXG_TEST(fcVertexConvex_closest)
     PXG_CHECK_MSG(filteredN > 100 && insideN > 80 && outsideEdgeN > 200 && gateRejN > 150 && wroteN > 300,
                   "fcVertexConvex: coverage thin (f=%zu i=%zu e=%zu r=%zu w=%zu)",
                   filteredN, insideN, outsideEdgeN, gateRejN, wroteN);
+
+    for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.86c -- fcVertexConvex_zeroSign: the sign of zero through the core, BITWISE.
+//
+// refExact is a bit-faithful mirror of fcClothVertexConvexContactGen
+// (pxgSlangVertexConvexCloth.slang; CUDA femClothPrimitives.cu:1963-2236), with
+// no Slack bookkeeping and starting from clothP - rigidP like the kernel does.
+// Every zero component it produces is compared bit for bit with the GPU; the
+// non-zero components (rsqrt vs 1/sqrt) keep the battery's tolerance.
+//
+//  ZA / ZB  (P9.86 fix at distancePointSegment, PxClamp as selects): a hull
+//     vertex with x = -0.0f and a cloth vertex beyond the (-z,-y) edge on the
+//     vertex-region boundary give nom = dot(ap, ab) = -0, so the CUDA's
+//     selectMax(0, -0) keeps t = -0 where FClamp gives +0.  a.x + ab.x * t is
+//     -0 + (-2)(-0) = +0 against -0.  ZA carries it into normalPen.x (rotations
+//     about x that keep a zero's sign), ZB into point.x (rigidP.x = -0).
+//  ZC1 / ZC2  (P9.86 fix at the all-inside warp max): a face through the
+//     vertex-space origin with d = -0 (cooking's -n.dot(v0)) gives signDist -0,
+//     an adjacent face gives +0; NVIDIA fmaxf yields pen = +0 in both lane
+//     orders.  llvmpipe's FMax under the SignedZeroInfNanPreserve stamp is the
+//     same total-order max (the revert of that fix is EQUIVALENT), so these two
+//     cases GUARD the platform fact bitwise rather than kill a mutant.
+// ===========================================================================
+struct ExactOut
+{
+    bool inside = false, wrote = false, tNegZeroWin = false, zeroTie = false;
+    float pen = 0.0f;
+    V3 p{}, n{}, pV{};
+};
+
+static V3 pVertexSpaceOf(const FvcCase& cs)
+{
+    const V3 ssp = quatRotateInv(cs.rigidQ, sub(v3f(cs.clothP), v3f(cs.rigidP)));
+    return shape2Vertex(ssp, v3f(cs.convexScale), cs.convexScaleRot);
+}
+
+static ExactOut refExact(const Hull& H, const FvcCase& cs)
+{
+    ExactOut o;
+    const V3 scale = v3f(cs.convexScale);
+    const F4 srot = cs.convexScaleRot;
+    const V3 pV = pVertexSpaceOf(cs);
+    o.pV = pV;
+    const uint32_t nbP = (uint32_t)H.faces.size();
+
+    float laneMax[32];
+    uint32_t laneIdx[32];
+    bool outside = false;
+    for (int l = 0; l < 32; ++l) { laneMax[l] = -MAXF; laneIdx[l] = 0; }
+    for (uint32_t p = 0; p < nbP; ++p)
+    {
+        const uint32_t lane = p % 32;
+        const F4& pl = H.planes[p];
+        const float sdv = dot3({ pl.x, pl.y, pl.z }, pV) + pl.w;
+        const V3 sn = mulv(quatRotate(srot, { pl.x, pl.y, pl.z }), scale);
+        const float signDist = sdv * std::sqrt(dot3(sn, sn));
+        outside = outside || signDist > 0.0f;
+        if (signDist > laneMax[lane]) { laneMax[lane] = signDist; laneIdx[lane] = p; }
+    }
+
+    V3 closestP{}, normal{};
+    float maxVal;
+    if (outside)
+    {
+        float minDist = MAXF;
+        for (uint32_t idx = 0; idx < nbP; ++idx)
+        {
+            const F4& pl = H.planes[idx];
+            const float sd = dot3({ pl.x, pl.y, pl.z }, pV) + pl.w;
+            if (!(sd > 0.0f)) continue;
+            const auto& face = H.faces[idx];
+            const uint32_t nbVerts = (uint32_t)face.size();
+            float laneSign[32];
+            bool anyOutside = false;
+            for (uint32_t l = 0; l < 32; ++l)
+            {
+                laneSign[l] = -MAXF;
+                if (l < nbVerts)
+                {
+                    const V3 rpA = H.verts[face[l]];
+                    const V3 rpB = H.verts[face[l + 1 == nbVerts ? 0 : l + 1]];
+                    const V3 epn = getNorm0(crossp({ pl.x, pl.y, pl.z }, sub(rpA, rpB)));
+                    laneSign[l] = dot3(sub(pV, rpA), epn);
+                    anyOutside = anyOutside || laneSign[l] > 0.0f;
+                }
+            }
+            V3 polyClosestP{};
+            float polyDist;
+            bool polyNegZeroT = false;
+            if (anyOutside)
+            {
+                float best = MAXF;
+                float dists[32], qs[32], dens[32];
+                V3 cps[32];
+                for (uint32_t l = 0; l < 32; ++l)
+                {
+                    dists[l] = MAXF; cps[l] = {}; qs[l] = 1.0f; dens[l] = 0.0f;
+                    if (l < nbVerts && laneSign[l] > 0.0f)
+                    {
+                        const V3 rpA = H.verts[face[l]];
+                        const V3 rpB = H.verts[face[l + 1 == nbVerts ? 0 : l + 1]];
+                        cps[l] = distancePointSegment(rpA, rpB, pV, &qs[l], &dens[l]);
+                        const V3 d = sub(cps[l], pV);
+                        dists[l] = dot3(d, d);
+                    }
+                    if (dists[l] < best) best = dists[l];
+                }
+                uint32_t winner = 0;
+                for (uint32_t l = 0; l < 32; ++l)
+                    if (dists[l] == best) { winner = l; break; }
+                polyClosestP = cps[winner];
+                polyDist = std::sqrt(best);
+                polyNegZeroT = fbits(qs[winner]) == 0x80000000u && dens[winner] > 0.0f;
+            }
+            else
+            {
+                polyDist = sd;
+                polyClosestP = sub(pV, mul({ pl.x, pl.y, pl.z }, sd));
+            }
+            if (polyDist < minDist)
+            {
+                minDist = polyDist;
+                closestP = polyClosestP;
+                o.tNegZeroWin = polyNegZeroT;
+            }
+        }
+        normal = sub(pV, closestP);
+        const V3 sn = mulv(quatRotate(srot, normal), scale);
+        maxVal = std::sqrt(dot3(sn, sn));
+    }
+    else
+    {
+        o.inside = true;
+        float best = -MAXF;
+        for (int l = 0; l < 32; ++l) best = redMax(best, laneMax[l]);
+        bool hasPos = false, hasNeg = false;
+        for (int l = 0; l < 32; ++l)
+            if (laneMax[l] == 0.0f && best == 0.0f)
+                (std::signbit(laneMax[l]) ? hasNeg : hasPos) = true;
+        o.zeroTie = hasPos && hasNeg;
+        uint32_t winner = 0;
+        for (int l = 0; l < 32; ++l)
+            if (laneMax[l] == best) { winner = (uint32_t)l; break; }
+        const F4& pl = H.planes[laneIdx[winner]];
+        const float sd = dot3({ pl.x, pl.y, pl.z }, pV) + pl.w;
+        closestP = sub(pV, mul({ pl.x, pl.y, pl.z }, sd));
+        normal = { pl.x, pl.y, pl.z };
+        maxVal = best;
+    }
+
+    const V3 outContact = vertex2Shape(closestP, scale, srot);
+    V3 outNormal = shape2Vertex(normal, scale, srot);
+    const float mag = std::sqrt(dot3(outNormal, outNormal));
+    if (!(mag < 1e-20f)) outNormal = mul(outNormal, 1.0f / mag);
+    o.pen = maxVal;
+    o.p = add(quatRotate(cs.rigidQ, outContact), v3f(cs.rigidP));
+    o.n = getNorm0(quatRotate(cs.rigidQ, outNormal));
+    o.wrote = o.pen < cs.clothP.w;
+    return o;
+}
+
+// A box x in [-2, -0.0f], y in [y0, y0+2], z in [z0, z0+2]; faces -z, -y, +x,
+// -x, +y, +z.  The -z face starts at v1 = (-0, y0, z0), so its lane-0 edge is
+// v1 -> v0 with ab = (-2, +0, +0), and it precedes the -y face that ties it.
+static Hull makeZeroCornerBox(float y0, float z0)
+{
+    Hull h;
+    const float x0 = -2.0f, x1 = -0.0f, y1 = y0 + 2.0f, z1 = z0 + 2.0f;
+    for (int i = 0; i < 8; ++i)
+        h.verts.push_back({ (i & 1) ? x1 : x0, (i & 2) ? y1 : y0, (i & 4) ? z1 : z0 });
+    h.faces = { { 1, 0, 2, 3 }, { 0, 1, 5, 4 }, { 1, 3, 7, 5 },
+                { 0, 4, 6, 2 }, { 2, 6, 7, 3 }, { 4, 5, 7, 6 } };
+    const V3 ns[6] = { { 0, 0, -1 }, { 0, -1, 0 }, { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    for (int f = 0; f < 6; ++f)
+        h.planes.push_back({ ns[f].x, ns[f].y, ns[f].z, -dot3(ns[f], h.verts[h.faces[f][0]]) });
+    h.edgeFaces = { { 0, 1 }, { 0, 2 }, { 0, 3 }, { 0, 4 }, { 5, 1 }, { 5, 2 },
+                    { 5, 3 }, { 5, 4 }, { 1, 2 }, { 1, 3 }, { 4, 2 }, { 4, 3 } };
+    return h;
+}
+
+// A box x in [-1, 0], y in [0, 1], z in [-1, 0] with its corner at the origin.
+// The -y face is listed from v5 = (0, 0, 0), so its plane stores d = -(+0) = -0.
+// swapFirst puts -x before -y.
+static Hull makeOriginCornerBox(bool swapFirst)
+{
+    Hull h;
+    for (int i = 0; i < 8; ++i)
+        h.verts.push_back({ (i & 1) ? 0.0f : -1.0f, (i & 2) ? 1.0f : 0.0f, (i & 4) ? 0.0f : -1.0f });
+    std::vector<std::vector<uint32_t>> f = { { 5, 4, 0, 1 }, { 0, 4, 6, 2 }, { 1, 3, 7, 5 },
+                                             { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    std::vector<V3> ns = { { 0, -1, 0 }, { -1, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, -1 }, { 0, 0, 1 } };
+    if (swapFirst) { std::swap(f[0], f[1]); std::swap(ns[0], ns[1]); }
+    h.faces = f;
+    for (int k = 0; k < 6; ++k)
+        h.planes.push_back({ ns[k].x, ns[k].y, ns[k].z, -dot3(ns[k], h.verts[f[k][0]]) });
+    h.edgeFaces = { { 0, 1 }, { 0, 2 }, { 0, 3 }, { 0, 4 }, { 5, 1 }, { 5, 2 },
+                    { 5, 3 }, { 5, 4 }, { 1, 2 }, { 1, 3 }, { 4, 2 }, { 4, 3 } };
+    return h;
+}
+
+PXG_TEST(fcVertexConvex_zeroSign)
+{
+    const uint32_t CLOTH = 21, CAP = 16;
+    std::vector<FvcCase> cases;
+    std::vector<Hull> hulls;
+    auto mkCase = [&](F4 clothP, F4 rigidP, F4 rigidQ, F4 srot) {
+        FvcCase cs{};
+        cs.clothP = clothP; cs.rigidP = rigidP; cs.rigidQ = rigidQ;
+        cs.convexScale = { 1.0f, 1.0f, 1.0f, 0.0f };
+        cs.convexScaleRot = srot;
+        cs.ids = { 0xA0u, 3u, CLOTH, (uint32_t)cases.size() };
+        cs.ids2 = { 0x80000005u, 0u, 0u, 0u };
+        return cs;
+    };
+    // rotations about x of the form (s < 0, +0, -0, c > 0), which keep a zero x's sign
+    const F4 qA = { -0.25881904f, 0.0f, -0.0f, 0.96592583f };   // -30 deg
+    // ZA: normal channel
+    {
+        FvcCase cs = mkCase({ 0.0f, -0.15f, 0.15f, 1.0f }, { 0.0f, 0.25f, -0.75f, 0.03f }, qA,
+                            { -0.96592583f, 0.0f, -0.0f, 0.25881904f });  // -150 deg
+        const V3 pV = pVertexSpaceOf(cs);
+        hulls.push_back(makeZeroCornerBox(pV.y + 0.5f, pV.z + 0.5f));
+        cases.push_back(cs);
+    }
+    // ZB: point channel
+    {
+        FvcCase cs = mkCase({ 0.0f, -1.8f, -1.3f, 1.0f }, { -0.0f, 0.25f, -0.75f, 0.05f }, qA,
+                            { -0.5f, 0.0f, -0.0f, 0.8660254f });          // -60 deg
+        const V3 pV = pVertexSpaceOf(cs);
+        hulls.push_back(makeZeroCornerBox(pV.y + 0.5f, pV.z + 0.5f));
+        cases.push_back(cs);
+    }
+    // ZC1 / ZC2: the all-inside +-0 tie, both lane orders
+    for (int sw = 0; sw < 2; ++sw)
+    {
+        cases.push_back(mkCase({ -1.0f, 0.0f, -0.5f, 0.1f }, { 0.0f, 0.0f, 0.0f, 0.02f },
+                               { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 1.0f }));
+        hulls.push_back(makeOriginCornerBox(sw == 1));
+    }
+    const uint32_t NC = (uint32_t)cases.size();
+    std::vector<uint32_t> blob;
+    for (uint32_t i = 0; i < NC; ++i) hulls[i].serialize(blob, cases[i].ids2.y);
+
+    std::vector<ExactOut> ref(NC);
+    for (uint32_t i = 0; i < NC; ++i) ref[i] = refExact(hulls[i], cases[i]);
+
+    // ---- coverage: the inputs must exercise both fixes, and each twin must bite ----
+    PXG_CHECK_MSG(fbits(ref[0].pV.x) == 0x80000000u && fbits(ref[1].pV.x) == 0u,
+                  "zeroSign: pV.x must be -0 (ZA) and +0 (ZB), got %08x / %08x",
+                  fbits(ref[0].pV.x), fbits(ref[1].pV.x));
+    const uint32_t tNegZeroWinN = (ref[0].tNegZeroWin ? 1u : 0u) + (ref[1].tNegZeroWin ? 1u : 0u);
+    PXG_CHECK_MSG(tNegZeroWinN == 2u && !ref[0].inside && !ref[1].inside && ref[0].wrote && ref[1].wrote,
+                  "zeroSign: ZA/ZB must win on an edge with t = -0 and write (tNegZeroWin %u)", tNegZeroWinN);
+    PXG_CHECK_MSG(fbits(ref[0].n.x) == 0x80000000u && fbits(ref[1].p.x) == 0u,
+                  "zeroSign: CUDA ZA normal.x %08x (want 80000000), ZB point.x %08x (want 0)",
+                  fbits(ref[0].n.x), fbits(ref[1].p.x));
+    {
+        gClampVariant = 1;
+        const ExactOut tA = refExact(hulls[0], cases[0]);
+        const ExactOut tB = refExact(hulls[1], cases[1]);
+        gClampVariant = 0;
+        const bool zaBites = fbits(tA.n.x) == 0u && fbits(tA.p.x) == fbits(ref[0].p.x);
+        const bool zbBites = fbits(tB.p.x) == 0x80000000u && fbits(tB.n.x) == fbits(ref[1].n.x);
+        PXG_CHECK_MSG(zaBites && zbBites,
+                      "zeroSign: the FClamp twin must flip ZA normal.x (%08x) and ZB point.x (%08x) only",
+                      fbits(tA.n.x), fbits(tB.p.x));
+    }
+    const uint32_t insideZeroTieN = (ref[2].zeroTie ? 1u : 0u) + (ref[3].zeroTie ? 1u : 0u);
+    PXG_CHECK_MSG(insideZeroTieN == 2u && ref[2].inside && ref[3].inside && ref[2].wrote && ref[3].wrote &&
+                  fbits(ref[2].pen) == 0u && fbits(ref[3].pen) == 0u,
+                  "zeroSign: ZC1/ZC2 must reach the inside branch with a +-0 lane tie and pen = +0 "
+                  "(tie %u, pen %08x / %08x)", insideZeroTieN, fbits(ref[2].pen), fbits(ref[3].pen));
+    {
+        uint32_t pen[3][2];
+        for (int v = 1; v <= 2; ++v)
+        {
+            gMaxVariant = v;
+            pen[v][0] = fbits(refExact(hulls[2], cases[2]).pen);
+            pen[v][1] = fbits(refExact(hulls[3], cases[3]).pen);
+        }
+        gMaxVariant = 0;
+        PXG_CHECK_MSG(pen[1][0] == 0u && pen[1][1] == 0x80000000u && pen[2][0] == 0x80000000u && pen[2][1] == 0u,
+                      "zeroSign: the max twins must each flip exactly one lane order "
+                      "(second-wins %08x/%08x, first-wins %08x/%08x)",
+                      pen[1][0], pen[1][1], pen[2][0], pen[2][1]);
+    }
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> femF4Init(CAP, { -9, -9, -9, -9 });
+    std::vector<U4> infoInit(CAP, { 0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu });
+    std::vector<uint32_t> u1Init(CAP, 0xeeeeeeeeu), u2Init(CAP * 2, 0xeeeeeeeeu), wc0(1, 0);
+    std::vector<F4> dbgInit(NC, { -7, -7, -7, -7 });
+    PxgBufferHandle bC = createBufferFrom(dev, cases);
+    PxgBufferHandle bH = createBufferFrom(dev, blob);
+    PxgBufferHandle bF = createBufferFrom(dev, std::vector<uint32_t>(8, 0u));
+    PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
+    PxgBufferHandle bWc = createBufferFrom(dev, wc0);
+    PxgBufferHandle bBy = createBufferFrom(dev, u2Init);
+    PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
+    PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
+    PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
+    FvcParams prm = {};
+    prm.numCases = NC; prm.maxContacts = CAP; prm.nbFilterPairs = 0u;
+    prm.hullAddr = dev->getBufferDeviceAddress(bH);
+    prm.wPoint = dev->getBufferDeviceAddress(bPt);
+    prm.wNormalPen = dev->getBufferDeviceAddress(bNp);
+    prm.wBary = dev->getBufferDeviceAddress(bBc);
+    prm.wInfo = dev->getBufferDeviceAddress(bIn);
+    prm.wCount = dev->getBufferDeviceAddress(bWc);
+    prm.wByX = dev->getBufferDeviceAddress(bBy);
+    prm.wTempByX = dev->getBufferDeviceAddress(bTb);
+    prm.wIdxByX = dev->getBufferDeviceAddress(bIx);
+    Kernel k("fcVertexConvex.spv", "ctFcVertexConvex",
+             { (uint32_t)sizeof(FvcCase), (uint32_t)sizeof(FilterPair), 16 }, sizeof(FvcParams));
+    k.dispatch(1, { bC, bF, bDb }, prm);
+    dev->flush();
+    const auto gDbg = downloadBuffer<F4>(dev, bDb, NC);
+    const auto gPt = downloadBuffer<F4>(dev, bPt, CAP);
+    const auto gNp = downloadBuffer<F4>(dev, bNp, CAP);
+    const auto gIn = downloadBuffer<U4>(dev, bIn, CAP);
+    const uint32_t gWc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+
+    PXG_CHECK_MSG(gWc == NC, "zeroSign: %u contacts written, expected %u", gWc, NC);
+    std::vector<int> slotOf(NC, -1);
+    for (uint32_t s = 0; s < std::min(gWc, CAP); ++s)
+    {
+        const uint32_t ci = gIn[s].z & 0xFFFFFu;
+        if ((gIn[s].z >> 20) == CLOTH && ci < NC) slotOf[ci] = (int)s;
+    }
+    // zero reference components bitwise, the rest by tolerance
+    auto same = [](float g, float r, float tol) {
+        return r == 0.0f ? fbits(g) == fbits(r) : almostEqual(g, r, tol, tol);
+    };
+    static const char* kName[4] = { "ZA", "ZB", "ZC1", "ZC2" };
+    size_t mm = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const ExactOut& ro = ref[i];
+        bool ok = slotOf[i] >= 0 && (gDbg[i].w != 0.0f) == ro.inside && gDbg[i].z != 0.0f &&
+                  same(gDbg[i].y, ro.pen, 2e-4f);
+        if (ok)
+        {
+            const uint32_t s = (uint32_t)slotOf[i];
+            ok = same(gPt[s].x, ro.p.x, 2e-3f) && same(gPt[s].y, ro.p.y, 2e-3f) &&
+                 same(gPt[s].z, ro.p.z, 2e-3f) && fbits(gPt[s].w) == fbits(cases[i].rigidP.w) &&
+                 same(gNp[s].x, ro.n.x, 2e-3f) && same(gNp[s].y, ro.n.y, 2e-3f) &&
+                 same(gNp[s].z, ro.n.z, 2e-3f) && same(gNp[s].w, ro.pen, 2e-4f);
+            if (!ok)
+                std::printf("  %s: gpu p(%08x %08x %08x) n(%08x %08x %08x %08x) vs ref p(%08x %08x %08x) "
+                            "n(%08x %08x %08x %08x)\n", kName[i],
+                            fbits(gPt[s].x), fbits(gPt[s].y), fbits(gPt[s].z),
+                            fbits(gNp[s].x), fbits(gNp[s].y), fbits(gNp[s].z), fbits(gNp[s].w),
+                            fbits(ro.p.x), fbits(ro.p.y), fbits(ro.p.z),
+                            fbits(ro.n.x), fbits(ro.n.y), fbits(ro.n.z), fbits(ro.pen));
+        }
+        else
+            std::printf("  %s: slot %d dbg (%g, %08x, %g, %g) vs ref inside %d pen %08x\n", kName[i], slotOf[i],
+                        gDbg[i].x, fbits(gDbg[i].y), gDbg[i].z, gDbg[i].w, ro.inside ? 1 : 0, fbits(ro.pen));
+        if (!ok) ++mm;
+    }
+    PXG_CHECK_MSG(mm == 0, "fcVertexConvex_zeroSign: %zu of %u cases differ from the CUDA mirror", mm, NC);
 
     for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
         dev->destroyBuffer(h);
