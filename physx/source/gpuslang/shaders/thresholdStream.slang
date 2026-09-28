@@ -241,7 +241,9 @@ void scanWarpTotals(uint tid)
     }
     GroupMemoryBarrierWithGroupSync();
     if (active) { gsWarpForce[tid] = fInc - f0; gsWarpPairs[tid] = pInc - p0; }
-    if (tid == WARPS_PER_BLOCK - 1) { gsBlockForce += fInc; gsBlockPairs += pInc; }
+    // P9.86f: accumulateThresholdStream.cu:256-258 adds (accumulatedForce + forceVal), i.e.
+    // ((inclusive - f) + f), which need not round back to the inclusive sum.
+    if (tid == WARPS_PER_BLOCK - 1) { gsBlockForce += ((fInc - f0) + f0); gsBlockPairs += pInc; }
 }
 
 // pairs-only variant (exceeded-force detection); folds into gsBlockPairs
@@ -370,15 +372,24 @@ void outputAccumulateThresholdStream(uint3 gtid : SV_GroupThreadID, uint3 gid : 
     GroupMemoryBarrierWithGroupSync();
     if (tid == 0)
     {
-        float fAcc = 0.0f;
+        // P9.86f: the force prefix is accumulateThresholdStream.cu:317's
+        // warpScan<AddOpPxReal>(val) - val -- a 32-lane Hillis-Steele tree (lane i adds lane i - r
+        // at radius r = 1, 2, 4, 8, 16; reduction.cuh:261-275) and then minus its own value --
+        // not a running sum: the two associate differently and round differently.  Replayed
+        // here lane by lane (descending i, so each radius reads the previous radius' values).
+        // The pair counts are integers, exact in either order.
+        float inc[NUM_BLOCKS];
+        for (uint i = 0; i < NUM_BLOCKS; ++i)
+            inc[i] = gsBlockForceAccum[i];
+        for (uint r = 1u; r < NUM_BLOCKS; r <<= 1)
+            for (int i = int(NUM_BLOCKS) - 1; i >= int(r); --i)
+                inc[i] = inc[i] + inc[i - int(r)];
         uint pAcc = 0u;
         for (uint i = 0; i < NUM_BLOCKS; ++i)
         {
-            const float f = gsBlockForceAccum[i];
             const uint p = gsBlockWriteAccum[i];
-            gsBlockForceAccum[i] = fAcc;
+            gsBlockForceAccum[i] = inc[i] - gsBlockForceAccum[i];
             gsBlockWriteAccum[i] = pAcc;
-            fAcc += f;
             pAcc += p;
         }
     }

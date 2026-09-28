@@ -32,6 +32,7 @@
 #include "pxgGpuStructs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -62,6 +63,7 @@ struct ThresholdParams
 };
 
 uint32_t idxOf(uint64_t node) { return uint32_t(node & 0xffffffffu); }
+uint32_t f2uTs(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 // P9.63 -- THE FIXTURE MUST DISPATCH THE ENGINE'S GRID, AND THE ENGINE USES TWO.
 // PxgSolverKernelIndices.h (PxgKernelGridDim) gives 32 groups to the four
@@ -366,6 +368,172 @@ PXG_TEST(thresholdStream_accumulateAndExceeded)
                                    objPairsBuf, exceededBuf, nbExcBuf, dummyBuf })
             dev->destroyBuffer(h);
     }
+}
+
+// ---------------------------------------------------------------------------
+// P9.86f: the accumulated force BITWISE, against the CUDA's association
+// ---------------------------------------------------------------------------
+// computeAccumulateThresholdStream folds each iteration's block total into sBlockAccumulator as
+// (accumulatedForce + forceVal) = ((incl - f7) + f7) (accumulateThresholdStream.cu:256-258), and
+// outputAccumulateThresholdStream takes the between-block prefix as warpScan(val) - val, a 32-lane
+// Hillis-Steele tree (:317, reduction.cuh:261-275).  The test above compares to tolerance against a
+// running sum; this one mirrors the CUDA's order exactly and compares every word.  Twin 1 is the
+// port's former `gsBlockForce += fInc`, twin 2 its former sequential between-block prefix; both
+// must change at least one output of the directed stream (forces with arbitrary mantissas over 26
+// blocks, three iterations each).
+namespace
+{
+void tsCudaAccumulate(const std::vector<ThresholdStreamElement>& s, std::vector<float>& acc, std::vector<float>& bb, int twin)
+{
+    const uint32_t N = uint32_t(s.size());
+    const uint32_t tbr = (N + THRESH_BLOCK - 1) / THRESH_BLOCK;
+    const uint32_t nipb = (tbr + THRESH_GRID - 1) / THRESH_GRID;
+    acc.assign(N, 0.f);
+    bb.assign(THRESH_GRID, 0.f);
+    for (uint32_t b = 0; b < THRESH_GRID; ++b)
+    {
+        float sBlock = 0.f;
+        for (uint32_t it = 0; it < nipb; ++it)
+        {
+            float val[256], incl[256], accumVal[256], warpF[8], acc8[8];
+            for (uint32_t t = 0; t < 256; ++t)
+            {
+                const uint32_t wi = t + it * 256 + 256 * b * nipb;
+                val[t] = (wi < N) ? s[wi].normalForce : 0.f;
+            }
+            for (uint32_t w = 0; w < 8; ++w)
+            {
+                float x[32];
+                for (uint32_t l = 0; l < 32; ++l) x[l] = val[w * 32 + l];
+                for (uint32_t r = 1; r < 32; r <<= 1)
+                {
+                    float y[32];
+                    for (uint32_t l = 0; l < 32; ++l) y[l] = (l >= r) ? x[l] + x[l - r] : x[l];
+                    std::memcpy(x, y, sizeof(x));
+                }
+                for (uint32_t l = 0; l < 32; ++l) { incl[w * 32 + l] = x[l]; accumVal[w * 32 + l] = x[l] - val[w * 32 + l]; }
+                warpF[w] = accumVal[w * 32 + 31] + val[w * 32 + 31];
+            }
+            const float prev = sBlock;
+            float x8[8];
+            std::memcpy(x8, warpF, sizeof(x8));
+            for (uint32_t r = 1; r < 8; r <<= 1)
+            {
+                float y[8];
+                for (uint32_t l = 0; l < 8; ++l) y[l] = (l >= r) ? x8[l] + x8[l - r] : x8[l];
+                std::memcpy(x8, y, sizeof(x8));
+            }
+            for (uint32_t w = 0; w < 8; ++w) acc8[w] = x8[w] - warpF[w];
+            sBlock += (twin == 1) ? x8[7] : (acc8[7] + warpF[7]);
+            for (uint32_t t = 0; t < 256; ++t)
+            {
+                const uint32_t wi = t + it * 256 + 256 * b * nipb;
+                if (wi < N) acc[wi] = val[t] + accumVal[t] + prev + acc8[t / 32];
+            }
+            (void)incl;
+        }
+        bb[b] = sBlock;
+    }
+    float res[32];
+    if (twin == 2)
+    {
+        float run = 0.f;
+        for (uint32_t i = 0; i < 32; ++i) { res[i] = run; run += bb[i]; }
+    }
+    else
+    {
+        float x[32];
+        std::memcpy(x, bb.data(), sizeof(x));
+        for (uint32_t r = 1; r < 32; r <<= 1)
+        {
+            float y[32];
+            for (uint32_t l = 0; l < 32; ++l) y[l] = (l >= r) ? x[l] + x[l - r] : x[l];
+            std::memcpy(x, y, sizeof(x));
+        }
+        for (uint32_t i = 0; i < 32; ++i) res[i] = x[i] - bb[i];
+    }
+    for (uint32_t b = 0; b < THRESH_GRID; ++b)
+        for (uint32_t it = 0; it < nipb; ++it)
+            for (uint32_t t = 0; t < 256; ++t)
+            {
+                const uint32_t wi = it * 256 + t + nipb * b * 256;
+                if (wi < N) acc[wi] = acc[wi] + res[b];
+            }
+}
+} // namespace
+
+PXG_TEST(thresholdStream_accumulateBitExact)
+{
+    const uint32_t N = 20000; // 79 blocks of 256 -> 3 iterations per group, 27 groups non-empty
+    std::mt19937 rng(8601);
+    std::uniform_real_distribution<float> uf(0.1f, 100.f);
+    std::vector<ThresholdStreamElement> stream(N);
+    std::memset(stream.data(), 0, stream.size() * sizeof(ThresholdStreamElement));
+    uint32_t a = 0, b = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (i == 0 || rng() % 4 == 0) { b += 1 + rng() % 3; if (b > 100) { a += 1; b = rng() % 5; } }
+        stream[i].nodeIndexA = a;
+        stream[i].nodeIndexB = b;
+        stream[i].shapeInteraction = i;
+        stream[i].normalForce = uf(rng);
+        stream[i].threshold = 1.0e6f;
+    }
+
+    std::vector<float> refAcc, refBB, t1Acc, t1BB, t2Acc, t2BB;
+    tsCudaAccumulate(stream, refAcc, refBB, 0);
+    tsCudaAccumulate(stream, t1Acc, t1BB, 1);
+    tsCudaAccumulate(stream, t2Acc, t2BB, 2);
+    size_t k1 = 0, k2 = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (f2uTs(t1Acc[i]) != f2uTs(refAcc[i])) ++k1;
+        if (f2uTs(t2Acc[i]) != f2uTs(refAcc[i])) ++k2;
+    }
+    std::printf("[ info ] thresholdStream bit-exact: twin1 (block total = incl) changes %zu, twin2 (sequential prefix) %zu of %u\n", k1, k2, N);
+    PXG_CHECK_MSG(k1 > 0, "twin 1 (gsBlockForce += fInc) is not observable on this stream");
+    PXG_CHECK_MSG(k2 > 0, "twin 2 (sequential between-block prefix) is not observable on this stream");
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<float> accForce(N, 0.f), accForceBB(32, 0.f);
+    std::vector<uint32_t> writeIdx(N, 0), writeIdxBB(32, 0), writeable(N, 0), dummy(16, 0);
+    PxgBufferHandle streamBuf = createBufferFrom(dev, stream);
+    PxgBufferHandle accForceBuf = createBufferFrom(dev, accForce);
+    PxgBufferHandle accForceBBBuf = createBufferFrom(dev, accForceBB);
+    PxgBufferHandle writeIdxBuf = createBufferFrom(dev, writeIdx);
+    PxgBufferHandle writeIdxBBBuf = createBufferFrom(dev, writeIdxBB);
+    PxgBufferHandle writeableBuf = createBufferFrom(dev, writeable);
+    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    ThresholdParams p = {};
+    p.nbThresholdElements = N;
+    p.dt = 1.f;
+    Kernel kAcc("thresholdStream.spv", "computeAccumulateThresholdStream",
+                { 40, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
+    kAcc.dispatch(THRESH_GRID, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
+                                 writeIdxBuf, writeIdxBBBuf, writeableBuf }, p);
+    dev->barrier();
+    const std::vector<float> gBB = downloadBuffer<float>(dev, accForceBBBuf, 32);
+    Kernel kOut("thresholdStream.spv", "outputAccumulateThresholdStream",
+                { 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
+    kOut.dispatch(THRESH_GRID, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
+                                 writeIdxBuf, writeIdxBBBuf }, p);
+    dev->flush();
+    const std::vector<float> gAcc = downloadBuffer<float>(dev, accForceBuf, N);
+
+    size_t bbBad = 0, accBad = 0;
+    for (uint32_t i = 0; i < 32; ++i)
+        if (f2uTs(gBB[i]) != f2uTs(refBB[i])) ++bbBad;
+    for (uint32_t i = 0; i < N; ++i)
+        if (f2uTs(gAcc[i]) != f2uTs(refAcc[i]))
+        {
+            if (accBad < 4) std::printf("  MM acc[%u] gpu %08x cuda %08x\n", i, f2uTs(gAcc[i]), f2uTs(refAcc[i]));
+            ++accBad;
+        }
+    PXG_CHECK_MSG(bbBad == 0, "between-block force totals: %zu of 32 differ from the CUDA bitwise", bbBad);
+    PXG_CHECK_MSG(accBad == 0, "accumulated force: %zu of %u differ from the CUDA bitwise", accBad, N);
+
+    for (PxgBufferHandle h : { streamBuf, accForceBuf, accForceBBBuf, writeIdxBuf, writeIdxBBBuf, writeableBuf, dummyBuf })
+        dev->destroyBuffer(h);
 }
 
 // ---------------------------------------------------------------------------
