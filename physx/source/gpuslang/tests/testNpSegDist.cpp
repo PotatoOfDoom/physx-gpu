@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -56,13 +57,21 @@ struct SdParams { uint32_t numTests, pad0, pad1, pad2; };
 static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static V3 sub3(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+// P9.86f: clampf(v, 0, 1) is exactly PxClamp(v, 0, 1) = PxMin(1, PxMax(0, v)) with the float selects of
+// PxUnixMathIntrinsics.h:116-125 (-0 and NaN pass through).  gSdVariant replays one pre-P9.86f port clamp
+// as GLSL FClamp on llvmpipe (FMin(FMax(v, +0), 1): +-0 -> +0, NaN -> 0): 1 = the point-segment tValue
+// (sphereCollision.cuh:98), 2 = s0, 3 = t2, 4 = s2 (distanceSegmentSegment.cuh:62/:76/:81).
+static int gSdVariant = 0;
+static float fclampLp01(float v) { const float m = (v > 0.f) ? v : 0.f; return (m < 1.f) ? m : 1.f; }
+static float clamp01(float v, int site) { return (gSdVariant == site) ? fclampLp01(v) : clampf(v, 0.0f, 1.0f); }
+static uint32_t f2uSd(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static F4 f4(V3 v) { return { v.x, v.y, v.z, 0.0f }; }
 
 static float refPointSeg(V3 a, V3 b, V3 p, float& param)
 {
     const V3 ap = sub3(p, a), ab = sub3(b, a);
     const float nom = dot3(ap, ab), denom = dot3(ab, ab);
-    const float tValue = clampf(nom / denom, 0.0f, 1.0f);
+    const float tValue = clamp01(nom / denom, 1);
     const float t = denom > 0.0f ? tValue : 0.0f;
     const V3 v = { ap.x - ab.x * t, ap.y - ab.y * t, ap.z - ab.z * t };
     param = t;
@@ -79,12 +88,12 @@ static void refSegSeg(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
     const float f = dot3(d2, r);
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
-    const float s0 = clampf(temp / denom, 0.0f, 1.0f);
+    const float s0 = clamp01(temp / denom, 2);
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = clampf(tTmp, 0.0f, 1.0f);
+    const float t2 = clamp01(tTmp, 3);
     const float comp = (b * t2 - c) * aRecip;
-    const float s2 = clampf(comp, 0.0f, 1.0f);
+    const float s2 = clamp01(comp, 4);
     s = s2; t = t2;
 }
 
@@ -218,6 +227,82 @@ PXG_TEST(npSegDist_segmentSegment)
     PXG_CHECK_MSG(parallelC > N / 8 && generalC > N / 4,
                   "sdSegmentSegment: coverage thin (parallel=%zu general=%zu skip=%zu)", parallelC, generalC, skipped);
 
+    dev->destroyBuffer(bPs); dev->destroyBuffer(bPsOut); dev->destroyBuffer(bSs); dev->destroyBuffer(bSsOut);
+}
+
+// P9.86f DIRECTED SIGNED ZERO / NaN through the four PxClamp selects, compared bitwise.  Every value is
+// exact binary (no rounding, so contraction cannot move a bit):
+//   P0: a = 0, b = (1,0,0), p = (-0,-1,-1): ap.ab = (-0) + (-0) + (-0) = -0 -> param -0 (FClamp +0)
+//   P1: p = (inf,-inf,0), b = (1,1,0): ap.ab = inf - inf = NaN -> param NaN (FClamp 0)
+//   S0: d1 = (1,0,0), d2 = (-0,1,0), r = p1 - p2 = (+0,-0,-1): b = +0, c = +0, f = -0 -> temp = -0,
+//       s0 = -0, tTmp = +0*-0 + -0 = -0, comp = +0*-0 - +0 = -0: (s,t) = (-0,-0); the s0 twin gives +0,+0
+//   S1: d2 = (2^-13,0,0) (eRecip = 0, parallel): tTmp = (2^-14 - 2^-13) * 0 = -0 -> t = -0, s = 1
+//   S2: d1 = (2^-13,0,0) (aRecip = 0, parallel), r.x = 2: t = 1, comp = (2^-13 - 2^-12) * 0 = -0 -> s = -0
+PXG_TEST(npSegDist_zeroSign)
+{
+    const float NZ = -0.0f, H = 1.220703125e-4f;   // 2^-13
+    const V3 pa[2] = { { 0, 0, 0 }, { 0, 0, 0 } }, pb[2] = { { 1, 0, 0 }, { 1, 1, 0 } };
+    const V3 pp[2] = { { NZ, -1, -1 }, { INFINITY, -INFINITY, 0 } };
+    const V3 s1[3] = { { 0, NZ, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }, sd1[3] = { { 1, 0, 0 }, { 1, 0, 0 }, { H, 0, 0 } };
+    const V3 s2[3] = { { 0, 0, 1 }, { 1, 0, 0 }, { -2, 0, 0 } }, sd2[3] = { { NZ, 1, 0 }, { H, 0, 0 }, { 1, 0, 0 } };
+    // expected CUDA bits: point-segment param; segment-segment (s, t)
+    const uint32_t wantP[2] = { 0x80000000u, 0x7FC00000u };
+    const uint32_t wantS[3] = { 0x80000000u, 0x3F800000u, 0x80000000u }, wantT[3] = { 0x80000000u, 0x80000000u, 0x3F800000u };
+    // which twin flips which case: tValue -> P0,P1; s0 -> S0; t2 -> S0,S1; s2 -> S0,S2
+    size_t twinHits[5] = {};
+    std::vector<PsIn> pin(2); std::vector<float> refP(2), refD(2);
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        pin[i] = { f4(pa[i]), f4(pb[i]), f4(pp[i]) };
+        refD[i] = refPointSeg(pa[i], pb[i], pp[i], refP[i]);
+        PXG_CHECK_MSG(std::isnan(refP[i]) ? (wantP[i] == 0x7FC00000u) : (f2uSd(refP[i]) == wantP[i]),
+                      "pointSeg directed %u: CUDA mirror param %08x, want %08x", i, f2uSd(refP[i]), wantP[i]);
+        for (int v = 1; v <= 4; ++v)
+        {
+            gSdVariant = v; float tw; refPointSeg(pa[i], pb[i], pp[i], tw); gSdVariant = 0;
+            if (f2uSd(tw) != f2uSd(refP[i])) ++twinHits[v];
+        }
+    }
+    std::vector<SsIn> sin(3); std::vector<float> refS(3), refT(3);
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        sin[i] = { f4(s1[i]), f4(sd1[i]), f4(s2[i]), f4(sd2[i]) };
+        refSegSeg(s1[i], sd1[i], s2[i], sd2[i], refS[i], refT[i]);
+        PXG_CHECK_MSG(f2uSd(refS[i]) == wantS[i] && f2uSd(refT[i]) == wantT[i],
+                      "segSeg directed %u: CUDA mirror (s,t) %08x %08x, want %08x %08x", i, f2uSd(refS[i]), f2uSd(refT[i]), wantS[i], wantT[i]);
+        for (int v = 1; v <= 4; ++v)
+        {
+            gSdVariant = v; float ts, tt; refSegSeg(s1[i], sd1[i], s2[i], sd2[i], ts, tt); gSdVariant = 0;
+            if (f2uSd(ts) != f2uSd(refS[i]) || f2uSd(tt) != f2uSd(refT[i])) ++twinHits[v];
+        }
+    }
+    PXG_CHECK_MSG(twinHits[1] == 2 && twinHits[2] == 1 && twinHits[3] == 2 && twinHits[4] == 2,
+                  "npSegDist directed: twin coverage tValue %zu s0 %zu t2 %zu s2 %zu (want 2 1 2 2)",
+                  twinHits[1], twinHits[2], twinHits[3], twinHits[4]);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<PsOut> poInit(2);
+    std::vector<SsOut> soInit(3);
+    PxgBufferHandle bPs = createBufferFrom(dev, pin), bPsOut = createBufferFrom(dev, poInit);
+    PxgBufferHandle bSs = createBufferFrom(dev, sin), bSsOut = createBufferFrom(dev, soInit);
+    const std::vector<uint32_t> strides = { (uint32_t)sizeof(PsIn), (uint32_t)sizeof(PsOut), (uint32_t)sizeof(SsIn), (uint32_t)sizeof(SsOut) };
+    SdParams prmP = { 2, 0, 0, 0 }, prmS = { 3, 0, 0, 0 };
+    Kernel kp("npSegDist.spv", "sdPointSegment", strides, sizeof(SdParams));
+    kp.dispatch(1, { bPs, bPsOut, bSs, bSsOut }, prmP);
+    Kernel ks("npSegDist.spv", "sdSegmentSegment", strides, sizeof(SdParams));
+    ks.dispatch(1, { bPs, bPsOut, bSs, bSsOut }, prmS);
+    dev->flush();
+    const auto gp = downloadBuffer<PsOut>(dev, bPsOut, 2);
+    const auto gs = downloadBuffer<SsOut>(dev, bSsOut, 3);
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        const bool ok = std::isnan(refP[i]) ? std::isnan(gp[i].r.y) : (f2uSd(gp[i].r.y) == f2uSd(refP[i]));
+        PXG_CHECK_MSG(ok, "sdPointSegment directed %u: GPU param %08x, CUDA %08x", i, f2uSd(gp[i].r.y), f2uSd(refP[i]));
+    }
+    for (uint32_t i = 0; i < 3; ++i)
+        PXG_CHECK_MSG(f2uSd(gs[i].r.x) == f2uSd(refS[i]) && f2uSd(gs[i].r.y) == f2uSd(refT[i]),
+                      "sdSegmentSegment directed %u: GPU (s,t) %08x %08x, CUDA %08x %08x",
+                      i, f2uSd(gs[i].r.x), f2uSd(gs[i].r.y), f2uSd(refS[i]), f2uSd(refT[i]));
     dev->destroyBuffer(bPs); dev->destroyBuffer(bPsOut); dev->destroyBuffer(bSs); dev->destroyBuffer(bSsOut);
 }
 

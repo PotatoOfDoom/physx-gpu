@@ -78,7 +78,14 @@ float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
     const float3 ab = b - a;
     const float nom = dot(ap, ab);
     const float denom = dot(ab, ab);
-    const float tValue = clamp(nom / denom, 0.0f, 1.0f);
+    // P9.86f: sphereCollision.cuh:98 PxClamp(nom / denom, 0, 1) = PxMin(1, PxMax(0, .)) with the float
+    // selects of PxUnixMathIntrinsics.h:116-125: nom = -0 keeps the param -0 (and NaN stays NaN), where
+    // GLSL FClamp gives +0 on llvmpipe.  (sphereCapsuleContact, the only caller, cannot show the sign:
+    // a -0 quotient needs every lane product of ap.ab to be -0, and then p = segS + ab*t changes sign
+    // only in a lane with segS = -0 and ab = +0 -- whose ap lane is +0 or nonzero, so dir keeps its bits.)
+    const float tQ = nom / denom;
+    const float tLo = (0.0f > tQ) ? 0.0f : tQ;
+    const float tValue = (1.0f < tLo) ? 1.0f : tLo;
     const float t = denom > 0.0f ? tValue : 0.0f;
     const float3 v = ap - (ab * t);
     param = t;
@@ -100,7 +107,14 @@ void distanceSegmentSegmentSquared(float3 p1, float3 d1, float3 p2, float3 d2, o
 
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
-    const float s0 = clamp(temp / denom, 0.0f, 1.0f);
+    // P9.86f: distanceSegmentSegment.cuh:62 PxClamp(temp / denom, 0, 1) = PxMin(1, PxMax(0, .)) with the
+    // float selects: temp = -0 (b >= +0, f = -0, c = +0) keeps s0 = -0, where FClamp gives +0.
+    // (capsuleCapsuleContact cannot show it: c = +0 and f = -0 put r = s0 - s1 orthogonal to both axes, and a
+    // zero lane of vv that could carry the flipped s/t forces r = 0 -- the eps branch, whose point adds the
+    // +0 posOff lane and whose normal ignores s/t.)
+    const float sQ = temp / denom;
+    const float s0Lo = (0.0f > sQ) ? 0.0f : sQ;
+    const float s0 = (1.0f < s0Lo) ? 1.0f : s0Lo;
     const float sTmp = eps > denom ? 0.5f : s0;
     const float tTmp = (b * sTmp + f) * eRecip;
     // P9.86: distanceSegmentSegment.cuh:76 PxClamp(tTmp, 0, 1) = PxMin(1, PxMax(0, tTmp)) with the

@@ -56,7 +56,12 @@ float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
     const float3 ab = b - a;
     const float nom = dot(ap, ab);
     const float denom = dot(ab, ab);
-    const float tValue = clamp(nom / denom, 0.0f, 1.0f);
+    // P9.86f: sphereCollision.cuh:98 PxClamp(nom / denom, 0, 1) = PxMin(1, PxMax(0, .)) with the float
+    // selects of PxUnixMathIntrinsics.h:116-125 (a > b ? a : b, a < b ? a : b): nom = -0 keeps param -0,
+    // and a NaN quotient stays NaN, where GLSL FClamp (FMin(FMax(v, 0), 1) on llvmpipe) gives +0 / 0.
+    const float tQ = nom / denom;
+    const float tLo = (0.0f > tQ) ? 0.0f : tQ;
+    const float tValue = (1.0f < tLo) ? 1.0f : tLo;
     const float t = denom > 0.0f ? tValue : 0.0f;
     const float3 v = ap - ab * t;
     param = t;
@@ -79,15 +84,22 @@ void distanceSegmentSegmentSquared(float3 p1, float3 d1, float3 p2, float3 d2, o
 
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
-    const float s0 = clamp(temp / denom, 0.0f, 1.0f);
+    // P9.86f: the three PxClamp(., 0.f, 1.f) of distanceSegmentSegment.cuh:62/:76/:81 are
+    // PxMin(1, PxMax(0, v)) with the float selects (PxUnixMathIntrinsics.h:116-125): a -0 or NaN
+    // argument passes through, where GLSL FClamp gives +0 / 0 on llvmpipe.
+    const float sQ = temp / denom;
+    const float s0Lo = (0.0f > sQ) ? 0.0f : sQ;
+    const float s0 = (1.0f < s0Lo) ? 1.0f : s0Lo;
 
     const float sTmp = eps > denom ? 0.5f : s0;
 
     const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = clamp(tTmp, 0.0f, 1.0f);
+    const float t2Lo = (0.0f > tTmp) ? 0.0f : tTmp;
+    const float t2 = (1.0f < t2Lo) ? 1.0f : t2Lo;
 
     const float comp = (b * t2 - c) * aRecip;
-    const float s2 = clamp(comp, 0.0f, 1.0f);
+    const float s2Lo = (0.0f > comp) ? 0.0f : comp;
+    const float s2 = (1.0f < s2Lo) ? 1.0f : s2Lo;
 
     s = s2;
     t = t2;
