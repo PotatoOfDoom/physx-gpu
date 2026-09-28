@@ -75,7 +75,11 @@ using npref::MAX_F32;
 // `parallelArm` and the two reciprocal guards are reported so the fixture can
 // require them.
 struct SegSegTrace { bool parallelArm; bool aDegenerate; bool eDegenerate;
-                     bool sClampedLo, sClampedHi, tClampedLo, tClampedHi; };
+                     bool sClampedLo, sClampedHi, tClampedLo, tClampedHi;
+                     // P9.86: the s0 clamp kept a -0 (selectMax, not the generic
+                     // a < b ? b : a) AND that sign reaches t: recomputing tTmp with
+                     // the flattened +0 changes tTmp's zero sign.
+                     bool s0SignReachesT; };
 
 inline void segSegSquared(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t, SegSegTrace& tr)
 {
@@ -108,6 +112,8 @@ inline void segSegSquared(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t, SegSeg
     tr.tClampedHi = tTmp > 1.0f;
     tr.sClampedLo = comp < 0.0f;
     tr.sClampedHi = comp > 1.0f;
+    tr.s0SignReachesT = !(eps > denom) && s0 == 0.0f && std::signbit(s0)
+                        && std::signbit(tTmp) != std::signbit((b * 0.0f + f) * eRecip);
 
     s = s2;
     t = t2;

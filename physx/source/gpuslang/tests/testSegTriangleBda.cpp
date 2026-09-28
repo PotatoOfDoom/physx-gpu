@@ -113,11 +113,22 @@ PXG_TEST(segTriangleBda)
         { {0.3f,0.2f,0.1f}, {0.0005f,0,0}, {0,1,0}, {0.3f,0,1}, "a below eps but NOT zero" },
         { {0.3f,0.2f,0.1f}, {1,0,0.3f}, {0,1,0}, {0.0005f,0,0}, "e below eps but NOT zero" },
         // ... and with the numerator POSITIVE.  The case above still could not tell
-        // `aRecip = 0` from `aRecip = 1`, because `b * t2 - c` came out negative and
-        // the clamp flattened both answers to zero.  Here c is negative, so the
+        // `aRecip = 0` from `aRecip = 1` by value, because `b * t2 - c` came out
+        // negative and the clamp took both answers to zero (-0 for aRecip = 0 under
+        // PxClamp<float> = selectMin(1, selectMax(0, v)), +0 for aRecip = 1).  Here c is negative, so the
         // mutant's product is positive and lands strictly inside [0, 1].
         { {0.0f,0.2f,0.1f}, {0.0005f,0,0}, {1.0f,1.0f,0.0f}, {0.3f,0,1.0f},
           "a below eps with a POSITIVE numerator" },
+        // --- P9.86: PxClamp<float> is selectMin(1, selectMax(0, v)) (PxMath.h:82-85,
+        //     PxUnixMathIntrinsics.h:122): selectMax(+0, -0) = -0, so a -0 clamp input
+        //     is KEPT.  The generic template a < b ? b : a would flatten it to +0.
+        //     r = (+0,-1,-1), b = 1, c = -0 + -1 + 1 = +0, f = -0, denom = 2,
+        //     temp = -0 -> s0 = -0 -> tTmp = -0 -> comp = -0: (s,t) = (-0,-0).
+        { {5,2,3}, {-1,1,-1}, {5,3,4}, {-1,0,0},
+          "P9.86 s0 = -0/2 kept by PxClamp through tTmp and comp -> (s,t) = (-0,-0)" },
+        //     e = 1e-8 < eps -> eRecip = 0; denom = +0 -> sTmp = 0.5;
+        //     tTmp = (5e-5 - 1e-4) * 0 = -0 -> t = -0, s = 1.
+        { {0,0,0}, {1,0,0}, {1,0,0}, {1e-4f,0,0}, "P9.86 e below eps: tTmp = -0 -> t = -0" },
     };
 
     // ---- distanceSegmentTriangleSquared -----------------------------------
@@ -216,12 +227,18 @@ PXG_TEST(segTriangleBda)
           "w just above 1 but inside the tolerance" },
         { {0.5f, 1.0f, 1.000001f - 0.5f}, {0.5f, 2.0f, 1.000001f - 0.5f}, A, B, C,
           "v + w EXACTLY at 1 + eps: the non-strict sum bound" },
+        // --- P9.86: a TINY segment (|pq|^2 = 2.5e-7 < eps, so aRecip = 0 in every
+        //     edge call) with both projections outside, beside edge AB:
+        //     comp = (-0.3|pq|) * 0 = -0, which PxClamp<float> keeps -> t = -0.
+        { {0.5f, 0.3f, -1.0f}, {0.5f, 0.3005f, -1.0f}, A, B, C,
+          "P9.86 TINY segment beside edge AB: comp = -0 -> t = -0" },
     };
 
     // ---- run the segment-segment probe ------------------------------------
     size_t bad = 0;
     size_t ssParallel = 0, ssADegen = 0, ssEDegen = 0;
     size_t ssSLo = 0, ssSHi = 0, ssTLo = 0, ssTHi = 0;
+    size_t ssSNegZero = 0, ssTNegZero = 0, ssS0SignReachesT = 0;
     {
         std::vector<SegSegCaseH> cs(ss.size());
         for (size_t i = 0; i < ss.size(); ++i)
@@ -263,6 +280,9 @@ PXG_TEST(segTriangleBda)
             if (tr.sClampedHi) ++ssSHi;
             if (tr.tClampedLo) ++ssTLo;
             if (tr.tClampedHi) ++ssTHi;
+            if (sameBits(s, -0.0f)) ++ssSNegZero;
+            if (sameBits(t, -0.0f)) ++ssTNegZero;
+            if (tr.s0SignReachesT) ++ssS0SignReachesT;
         }
         dev->destroyBuffer(bCases); dev->destroyBuffer(bOut);
     }
@@ -271,6 +291,7 @@ PXG_TEST(segTriangleBda)
     size_t wayCount[5] = { 0, 0, 0, 0, 0 };
     size_t edgeCount[4] = { 0, 0, 0, 0 };
     size_t stEndpointWon = 0, stEdgeWon = 0, stTookQ = 0, stDegenerate = 0, stDMulZero = 0;
+    size_t stEdgeTNegZero = 0;
     {
         std::vector<SegTriCaseH> cs(st.size());
         for (size_t i = 0; i < st.size(); ++i)
@@ -316,6 +337,7 @@ PXG_TEST(segTriangleBda)
             if (tr.tookQ) ++stTookQ;
             if (tr.degenerateTri) ++stDegenerate;
             if (tr.dMulZero) ++stDMulZero;
+            if (tr.way == WAY_EDGE_ONLY && sameBits(t, -0.0f)) ++stEdgeTNegZero;
         }
         dev->destroyBuffer(bCases); dev->destroyBuffer(bOut);
     }
@@ -327,6 +349,14 @@ PXG_TEST(segTriangleBda)
     PXG_CHECK_MSG(ssEDegen > 0, "no case has a degenerate SECOND direction (eRecip = 0)");
     PXG_CHECK_MSG(ssSLo > 0 && ssSHi > 0, "the s clamp is not driven at both ends");
     PXG_CHECK_MSG(ssTLo > 0 && ssTHi > 0, "the t clamp is not driven at both ends");
+    // P9.86: under the generic a < b ? b : a spelling of PxMax the clamp can never
+    // return -0, so each of these cases is a certain bitwise mismatch for it.
+    PXG_CHECK_MSG(ssSNegZero > 0, "no segment-segment case expects s = -0: PxClamp<float> = "
+                                  "selectMin(1, selectMax(0, v)) keeps -0 (P9.86)");
+    PXG_CHECK_MSG(ssTNegZero > 0, "no segment-segment case expects t = -0 (the t2 clamp's "
+                                  "zero sign is unpinned)");
+    PXG_CHECK_MSG(ssS0SignReachesT > 0, "no case carries the s0 clamp's -0 through sTmp into t "
+                                        "(selectMax keeps -0 at distanceSegmentSegment.cuh:63)");
 
     PXG_CHECK_MSG(wayCount[WAY_PLANE] > 0, "no case crosses the plane inside the triangle");
     PXG_CHECK_MSG(wayCount[WAY_BOTH_INSIDE] > 0, "no case has BOTH projections inside");
@@ -345,6 +375,8 @@ PXG_TEST(segTriangleBda)
     PXG_CHECK_MSG(stDegenerate > 0, "no case has a DEGENERATE triangle (the PX_MAX_F32 fallback)");
     PXG_CHECK_MSG(stDMulZero > 0, "no case puts an endpoint EXACTLY on the plane -- the "
                                   "non-strict `dMul <= 0` gate is then untested");
+    PXG_CHECK_MSG(stEdgeTNegZero > 0, "no edge-only segment-triangle case expects t = -0 "
+                                      "(tSeg is an edge's s2 clamp output, P9.86)");
 }
 
 } // namespace
