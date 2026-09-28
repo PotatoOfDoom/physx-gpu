@@ -1257,6 +1257,56 @@ PXG_TEST(constraintPrepTGS_joint)
     std::mt19937 rng(4400);
     JointSetup js = buildJointSetup(rng, true);
 
+    // ---- P9.86c directed class: a dynamic body jointed to a kinematic body AT REST ----
+    // Bodies 46/47 become kinematic with zero velocity, zero inverse mass and zero
+    // sqrtInvInertia (a resting kinematic's solver data).  On every 4th lane (l % 4 == 1)
+    // body B is one of them and body A a dynamic body; each row gets an all-negative
+    // body-1 Jacobian, so vel1 = sum of (+0)*(-c) = -0, and velocityTarget = -0.
+    // CUDA computeJointSpeedTGS (DyCpuGpu1dConstraint.h:391-395) gives 0 + (-0) = +0;
+    // a folded seed would give -0, which targetVel = -0 - vm*initJointSpeed exposes.
+    // Preprocessing is disabled on those lanes so orthogonalisation keeps the signs.
+    // No rng draws are added (post-edits only), so the random stream is unchanged.
+    std::vector<bool> restKinLane(js.numBatches * 32, false);
+    {
+        const uint32_t restKin[2] = { js.numBodies - 2, js.numBodies - 1 };
+        for (uint32_t rk : restKin)
+        {
+            SolverBodyData& bd = js.bodyData[rk];
+            bd.flags = RB_KINEMATIC;
+            bd.initialLinVelXYZ_invMassW = Float4{ 0.f, 0.f, 0.f, 0.f };
+            bd.initialAngVelXYZ_penBiasClamp.x = bd.initialAngVelXYZ_penBiasClamp.y =
+                bd.initialAngVelXYZ_penBiasClamp.z = 0.f;
+            const Mat33 zero(Vec3(0.f, 0.f, 0.f), Vec3(0.f, 0.f, 0.f), Vec3(0.f, 0.f, 0.f));
+            js.si[rk] = zero;
+            zero.store(js.txi[rk].sqrtInvInertia);
+        }
+        std::vector<uint32_t> dyn;
+        for (uint32_t bIdx = 0; bIdx < js.numBodies - 2; ++bIdx)
+            if ((js.bodyData[bIdx].flags & RB_KINEMATIC) == 0)
+                dyn.push_back(bIdx);
+        for (uint32_t k = 0; k < js.numBatches; ++k)
+        {
+            Batch& b = js.batches[k];
+            for (uint32_t lane = 1; lane < b.descStride; lane += 4)
+            {
+                restKinLane[k * 32 + lane] = true;
+                b.bodyAIndex[lane] = dyn[(k * 32 + lane) % dyn.size()];
+                b.bodyBIndex[lane] = restKin[(k + lane / 4) % 2];
+                js.jdata[k].mFlags[lane] |= CFLAG_DISABLE_PREPROCESSING;
+                for (uint32_t r = 0; r < js.jdata[k].mNumRows[lane]; ++r)
+                {
+                    const uint32_t rowIdx = k * MAX_CONSTRAINT_ROWS + r;
+                    Float4& l1 = js.jvel[rowIdx].linear1XYZ_minImpulseW[lane];
+                    Float4& a1 = js.jvel[rowIdx].angular1XYZ_maxImpulseW[lane];
+                    l1.x = -std::fabs(l1.x); l1.y = -std::fabs(l1.y); l1.z = -std::fabs(l1.z);
+                    a1.x = -std::fabs(a1.x); a1.y = -std::fabs(a1.y); a1.z = -std::fabs(a1.z);
+                    js.jvel[rowIdx].angular0XYZ_velocityTargetW[lane].w = -0.0f;
+                }
+            }
+        }
+    }
+    gTgsJsKin1NegZero = gTgsJsKin1TwinDiff = 0;
+
     const float stepDt = 1.f / 240.f, recipStepDt = 240.f, simDt = 1.f / 60.f, recipSimDt = 60.f;
     const float lengthScale = 1.f, biasCoefficient = 2.f;
     PxgSlangComputeDevice* dev = testDevice();
@@ -1417,6 +1467,40 @@ PXG_TEST(constraintPrepTGS_joint)
             }
         }
     PXG_CHECK_MSG(mism == 0, "%zu TGS joint row mismatches", mism);
+
+    // ---- P9.86c: BITWISE targetVel on the resting-kinematic lanes' zero results ----
+    {
+        auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        size_t zeroRows = 0, badBits = 0;
+        for (uint32_t k = 0; k < js.numBatches; ++k)
+            for (uint32_t l = 0; l < js.batches[k].descStride; ++l)
+            {
+                if (!restKinLane[k * 32 + l])
+                    continue;
+                for (uint32_t r = 0; r < js.jdata[k].mNumRows[l]; ++r)
+                {
+                    const uint32_t o = js.batches[k].startConstraintIndex + r;
+                    const float want = refCon[o].ang1XYZ_velTargetOrCoeff3[l].w;
+                    if (want != 0.0f)
+                        continue;
+                    ++zeroRows;
+                    if (bitsOf(gCon[o].ang1XYZ_velTargetOrCoeff3[l].w) != bitsOf(want))
+                    {
+                        if (badBits < 8)
+                            std::printf("MM tgs joint targetVel b%u l%u r%u ref %08x gpu %08x\n", k, l, r,
+                                        bitsOf(want), bitsOf(gCon[o].ang1XYZ_velTargetOrCoeff3[l].w));
+                        ++badBits;
+                    }
+                }
+            }
+        std::printf("[ info ] tgs joint at rest: kin1-only 0+(-0) rows %u, fold-twin differs %u, zero targetVel %zu\n",
+                    gTgsJsKin1NegZero, gTgsJsKin1TwinDiff, zeroRows);
+        PXG_CHECK_MSG(gTgsJsKin1NegZero >= 40, "resting kinematic body 1 must reach 0 + (-0) (%u rows)",
+                      gTgsJsKin1NegZero);
+        PXG_CHECK_MSG(gTgsJsKin1TwinDiff >= 30, "the folded-seed twin must change targetVel (%u rows)",
+                      gTgsJsKin1TwinDiff);
+        PXG_CHECK_MSG(badBits == 0, "%zu TGS joint targetVel sign-of-zero mismatches", badBits);
+    }
 
     mism = 0;
     for (uint32_t k = 0; k < js.numBatches; ++k)

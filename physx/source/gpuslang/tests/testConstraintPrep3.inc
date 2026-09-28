@@ -219,6 +219,11 @@ void refJointPGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
     }
 }
 
+// P9.86c coverage (constraintPrepTGS_joint): live rows with a kinematic body 1 only and
+// vel1 = -0 (CUDA computeJointSpeedTGS, DyCpuGpu1dConstraint.h:391-395: 0 + (-0) = +0),
+// and those on which the folded-seed twin (initJointSpeed = vel1) changes targetVel
+uint32_t gTgsJsKin1NegZero = 0, gTgsJsKin1TwinDiff = 0;
+
 // setupSolverConstraintBlockGPUTGS for one lane
 void refJointTGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
                  std::vector<BlockConstraint1DVelocities>& rvs, std::vector<BlockConstraint1DParameters>& rps,
@@ -309,6 +314,19 @@ void refJointTGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
         compute1dConstraintSolverConstantsTGS(flags, stiffness, damping, restitution, bounceVelocityThreshold,
                                               geometricError, velocityTarget, jointSpeed, initJointSpeed, unitResponse,
                                               recipUnitResponse, erp, stepDt, recipStepDt, biasScale, error, velMultiplier, targetVel);
+        {
+            auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+            if (!isKin0 && isKin1 && bitsOf(vel1) == 0x80000000u)
+            {
+                ++gTgsJsKin1NegZero;
+                float tb, te, tvm, ttv;   // twin: the +0 seed folded, 0 + v1 -> v1
+                compute1dConstraintSolverConstantsTGS(flags, stiffness, damping, restitution, bounceVelocityThreshold,
+                                                      geometricError, velocityTarget, jointSpeed, vel1, unitResponse,
+                                                      recipUnitResponse, erp, stepDt, recipStepDt, tb, te, tvm, ttv);
+                if (bitsOf(ttv) != bitsOf(targetVel))
+                    ++gTgsJsKin1TwinDiff;
+            }
+        }
 
         Float4 lin1XYZ_biasScale = cl1; lin1XYZ_biasScale.w = biasScale;
         Float4 lin0XYZ_initBiasW = cl0; lin0XYZ_initBiasW.w = error;

@@ -202,6 +202,14 @@ PXG_TEST(artiJointPrepWrap)
             sbd[i].invMass = 0.5f + std::fabs(av(i, 87));
             sbd[i].offsetSlop = 0.02f * std::fabs(av(i, 88));
         }
+        // P9.86c: the kinematic bodies 7 and 15 are AT REST (zero velocity, zero inverse
+        // mass); 3 and 11 keep moving.  See the directed kin1-only class below.
+        if (kind == 3u && (i % 8u) == 7u)
+        {
+            sbd[i].initialAngVel = PxVec3(0.0f);
+            sbd[i].initialLinVel = PxVec3(0.0f);
+            sbd[i].invMass = 0.0f;
+        }
         if (kind == 0u || kind == 1u)
         {
             txi[i].sqrtInvInertia = PxMat33(PxVec3(av(i, 90), av(i, 91), av(i, 92)),
@@ -231,6 +239,10 @@ PXG_TEST(artiJointPrepWrap)
             uint32_t aKind = (w == 2u) ? 0u : (w + l) % 4u;
             uint32_t bKind = (w == 2u) ? 0u : (w / 2u + l * 3u + 1u) % 4u;
             if (w == 1u) bKind = 3u;
+            // P9.86c: a kinematic B that is AT REST (sbd 7/15, bit 2 of the index set)
+            // gets an articulation-link A instead of a static one (the kin1-only class)
+            if (bKind == 2u && aKind == 3u && (((w * 7u + l * 3u + 1u) % AJP_NB_RIGID) & 4u) != 0u)
+                aKind = 0u;
 
             auto fill = [&](uint32_t kind, uint32_t s, PxNodeIndex* nodeArr, PxU32* idxArr,
                             PxU32* remapArr) {
@@ -290,6 +302,30 @@ PXG_TEST(artiJointPrepWrap)
     }
     PXG_CHECK_MSG(negCfmLinks == 4u, "-0 cfm links (%u)", negCfmLinks);
 
+    // ---- P9.86c directed class: a live body A jointed to a kinematic body B AT REST ----
+    // CUDA computeJointSpeedTGS (DyCpuGpu1dConstraint.h:391-395) seeds initJointSpeed
+    // with +0, so a kinematic-body-1-only lane gives 0 + vel1, never -0.  On the lanes
+    // below every body-1 Jacobian component is made negative, so vel1 = sum of
+    // (+0)*(-c) = -0 and a folded seed (0 + v1 -> v1) would store coeff0 = -0 where the
+    // CUDA stores +0.  Body A is an articulation link or a dynamic rigid body.
+    auto restKin1Lane = [&](uint32_t w, uint32_t l) -> bool {
+        const PxgBlockConstraintBatch& b = batches[AJP_BATCH_IDX[w] + AJP_RIGID_OFFSET];
+        if (l >= b.mDescStride)
+            return false;
+        const PxNodeIndex nA = b.bodyANodeIndex[l];
+        const PxNodeIndex nB = b.bodyBNodeIndex[l];
+        if (nB.isArticulation() || nB.isStaticBody())
+            return false;
+        const PxgSolverBodyData& sB = sbd[b.bodyBIndex[l]];
+        if ((sB.flags & PxRigidBodyFlag::eKINEMATIC) == 0 || !(sB.initialLinVel.isZero())
+            || !(sB.initialAngVel.isZero()))
+            return false;
+        if (nA.isArticulation())
+            return true;
+        return !nA.isStaticBody() && (sbd[b.bodyAIndex[l]].flags & PxRigidBodyFlag::eKINEMATIC) == 0;
+    };
+    uint32_t restKin1Lanes = 0;
+
     // ---- the joint prep pools ----
     std::vector<PxgBlockConstraint1DData> cdata(AJP_NB_PREP);
     std::vector<PxgBlockConstraint1DVelocities> rvel(AJP_NB_PREP * AJP_MAX_ROWS);
@@ -304,7 +340,8 @@ PXG_TEST(artiJointPrepWrap)
         PxgBlockConstraint1DData& cd = cdata[d];
         for (uint32_t l = 0; l < 32; ++l)
         {
-            cd.mNumRows[l] = ajpNumRows(w, l);
+            // P9.86c: the resting-kinematic lanes carry the full six rows
+            cd.mNumRows[l] = restKin1Lane(w, l) ? 6u : ajpNumRows(w, l);
             cd.mFlags[l] = (l % 3u == 1u) ? PxU32(PxConstraintFlag::eDRIVE_LIMITS_ARE_FORCES) : 0u;
             cd.mInvMassScale[l].linear0 = 1.0f + 0.1f * av(l, 400 + d);
             cd.mInvMassScale[l].angular0 = 1.0f + 0.1f * av(l, 401 + d);
@@ -348,7 +385,16 @@ PXG_TEST(artiJointPrepWrap)
                 rp.flags[l] = fl;
                 rp.mods.spring.stiffness[l] = 4.0f + std::fabs(av(l, 440 + r));
                 rp.mods.spring.damping[l] = 0.6f + 0.3f * std::fabs(av(l, 441 + r));
+                if (restKin1Lane(w, l))
+                {
+                    float4& l1 = rv.linear1XYZ_minImpulseW[l];
+                    float4& a1 = rv.angular1XYZ_maxImpulseW[l];
+                    l1.x = -std::fabs(l1.x); l1.y = -std::fabs(l1.y); l1.z = -std::fabs(l1.z);
+                    a1.x = -std::fabs(a1.x); a1.y = -std::fabs(a1.y); a1.z = -std::fabs(a1.z);
+                }
             }
+            if (restKin1Lane(w, l))
+                restKin1Lanes++;
         }
     }
 
@@ -469,7 +515,7 @@ PXG_TEST(artiJointPrepWrap)
     std::memset(wantR.data(), 0xAB, wantR.size() * sizeof(wantR[0]));
 
     uint32_t skippedRows = 0, tieLanes = 0, kinLanes = 0, zeroRowLanes = 0;
-    uint32_t cfmNeg0Lanes = 0, cfmTwinDiffLanes = 0;
+    uint32_t cfmNeg0Lanes = 0, cfmTwinDiffLanes = 0, jsKin1NegZeroRows = 0;
     auto fbits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
     for (uint32_t w = 0; w < AJP_LIVE_WARPS; ++w)
     {
@@ -601,6 +647,9 @@ PXG_TEST(artiJointPrepWrap)
                     Dy::computeJointSpeedTGS(vel0, b0.isKinematic != 0, vel1,
                                              b1.isKinematic != 0,
                                              jointSpeedForRestitutionBounce, initJointSpeed);
+                    // P9.86c: live rows reaching CUDA's 0 + (-0) = +0 (coeff0 = initJointSpeed)
+                    if (!b0.isKinematic && b1.isKinematic && fbits(vel1) == 0x80000000u)
+                        jsKin1NegZeroRows++;
                 }
 
                 const float geometricError = l0.w;
@@ -662,6 +711,10 @@ PXG_TEST(artiJointPrepWrap)
                 cfmTwinDiffLanes);
     PXG_CHECK_MSG(cfmNeg0Lanes == 7u, "cfm PxMax(+0,-0) = -0 coverage (%u lanes)", cfmNeg0Lanes);
     PXG_CHECK_MSG(cfmTwinDiffLanes == 7u, "cfm FMax-twin coverage (%u lanes)", cfmTwinDiffLanes);
+    std::printf("  ajp jointSpeed at rest: kin1-only lanes %u, 0+(-0) live rows %u\n", restKin1Lanes,
+                jsKin1NegZeroRows);
+    PXG_CHECK_MSG(jsKin1NegZeroRows >= 12u, "resting kinematic body 1 must reach 0 + (-0) (%u rows)",
+                  jsKin1NegZeroRows);
 
     // ---- launch: 3 blocks x 64 = 6 warps, 4 live ----
     struct Params { uint64_t prepDesc, sharedDesc; } prm = { uint64_t(dPrep), uint64_t(dShared) };
