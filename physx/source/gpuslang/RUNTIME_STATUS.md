@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.86f: a scanner over the compiled -O0 -g2 SPIR-V of all 186 engine shaders (literal-zero
+dataflow through stores, lanes, call-site arguments; FSub(0,x), FAdd(x,0), float FMin/FMax/FClamp)
+re-finds all six bugs the source audit had missed; its 893 sites were classified against the CUDA.
+Eight more divergences fixed with fixtures that failed before (TriBox selects, solverTGS lanes,
+particle capsule clamp NaN, cloth friction clamps, convex-core clip extents, cloth attach w lane,
+articulation compound inertia seed, and a thresholdStream summation-ORDER bug).  Scenes 56/56.
 P9.86c/d: every one of the 99 P9.86 audit fixes was reverted and swept; almost all survived
 (no fixture made the +-0 inputs).  Directed cases with mirror twins and coverage checks now
 kill 109 reverts; 20 are proven equivalent; none survive.  The new fixtures found six real
@@ -2051,6 +2057,76 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.86f — Scan des kompilierten SPIR-V: sechs weitere Divergenzen, eine Rundungsreihenfolge
+
+**Warum.** P9.86c hat sechs engine-erreichte Fehler gefunden, die das Quelltext-Audit von P9.86
+übersehen hatte. Sie haben eines gemeinsam: Die Literal-Null steht nicht sichtbar im
+Quelltext. Sie entsteht erst durch
+
+- Inlining eines konstanten Arguments (`hasJf = false`),
+- eine const-Lokale (`absFrom`),
+- eine Vektor-Lane (`localPos + float3(dx, 0, 0)`),
+
+oder es ist schlicht ein float-`min`/`max`, das die Finder nicht erfasst hatten.
+
+**Der Scanner** (`scratchpad/p86f/foldscan.py`, ein SPIR-V-Parser mit Datenfluss).
+
+- **Eingabe:** alle 186 engine-erreichten Shader (Manifest), mit `-O0 -g2` kompiliert. Die
+  Zeilenzuordnung kommt aus NonSemantic `DebugLine`.
+- **Gemeldet** wird, in den von den Manifest-Einstiegen erreichbaren Funktionen:
+  - **F2:** `OpFSub`, deren erster Operand eine Literal-+0 sein kann;
+  - **F3:** `OpFAdd`, deren Operand eine Literal-+0 sein kann;
+  - **F4:** GLSL `FMin`/`FMax`/`FClamp` auf floats.
+- **„Kann Literal-+0 sein“** ist eine konservative, flussinsensitive Analyse über:
+  Konstanten, Composite-Lanes, Stores in dieselbe Variable, Funktionsparameter über alle
+  Aufrufstellen und Rückgabewerte.
+- **Filter:** Treffer, deren Null nur aus der Select-Abhilfe des Projekts stammt, werden über
+  die Herkunftszeile ausgefiltert.
+- **Validierung:** Gegen den Stand vor P9.86c (43cadd4) meldet er alle sechs übersehenen Fehler,
+  im aktuellen Stand keinen davon.
+
+**Ergebnis.** 893 Kandidaten in 134 Dateien wurden gegen die CUDA klassifiziert, Batch 0 zusätzlich
+adversarial gegengeprüft. Fast alles ist CUDA-SAME, BENIGN oder NOT-A-FOLD:
+
+- **CUDA-SAME:** `fminf`/`fmaxf`-Zwillinge. Gestempeltes llvmpipe-FMin liefert bei ±0-Gleichstand
+  in beiden Reihenfolgen −0, FMax +0, NaN wird ignoriert (Mesa `lower_fminmax_signed_zero`).
+- **NOT-A-FOLD:** Schleifen mit Laufzeit-Tripzahl, Laufzeit-Selects.
+
+**Behoben, jeweils mit gezielter Fixture, die vorher fehlschlug:**
+
+| Shader | Divergenz | CUDA | Reverts |
+|---|---|---|---|
+| pxgSlangTriBox (AXISTEST/FINDMINMAX) | FMin/FMax statt selectMin/selectMax (NaN-Operand) | GuIntersectionTriangleBoxRef.h:108-233 | 18 getötet, 6 äquivalent |
+| solverTGS:1375 | z/w-Lanes ohne `(+0) + v` | solverMultiBlockTGS.cu:348/410 | 3/3 |
+| psContactGenBda:371 | Kapsel-`clamp` statt PxClamp (NaN) | sphereCollision.cuh:98 | 3/3 |
+| femClothClothContactBda:460/461 | Reibungs-PxMax/PxMin als FMax/FMin | FEMCloth-Kontakt | 3/3 |
+| pxgSlangCvxCoreCvx `faceClipQ` | Polygon-Extents FMin/FMax statt PxMin/PxMax | GuConvexSupport.h:810-819 | 8/8 |
+| femClothRigidAttachBda:614/615 | w-Lane ohne `w + 0` (−0-Inversmasse) | FEMClothExternalSolve.cu:1101-1102 | 2/2 |
+| npArtiLinkAccel compoundInertia | Literal-Null-Saat nach Inlining gefaltet | forwardDynamic2.cu:1946/2111 | 1/1 |
+| **thresholdStream** | **Summationsreihenfolge** (kein Vorzeichenfall): Blocksumme und Präfix zwischen Blöcken | accumulateThresholdStream.cu:256-258, :317 | 3/3 |
+
+Die Rundungsabweichung in thresholdStream ist die bemerkenswerteste. Die alten Schreibweisen
+ändern in einem Strom von 20000 Elementen 2258 bzw. 15653 Ausgaben
+(`thresholdStream_accumulateBitExact`).
+
+**Äquivalent oder abgelehnt, jeweils mit Begründung im Code:**
+
+- **npSpherePrimitives:81/103:** jetzt Selects. Der −0-Pfad erreicht an den einzigen Aufrufern
+  keine Ausgabe. Die Fixture-Kopie npSegDist gibt s/t aus, dort 4/4 getötet.
+- **Select-Arm-Nullen** `x + (c ? y : 0)` mit Laufzeitbedingung: Neue Probe-Zeilen 23–25 zeigen,
+  dass llvmpipe sie nicht faltet. Damit sind constraintPrepPGS:329, npArtiConstraintPrep:1377,
+  npArtiExtBody:587, softBodySimBda:226 (TGS) und psContactSolveTgsBda:254 äquivalent und nur
+  kommentiert.
+- **GuConvexSupport `addPatch` (:981/1006/1010):** in der CUDA toter Code (`#if 1`-Warp-Pfad).
+- **pxgSlangCvxCoreBvh:129:** BENIGN.
+- **Fixture-Kopien psPrimCollide/psDiffuseCollide/psPrimContact:** nicht im Manifest; sie weichen
+  nur bei nicht-endlichen Positionen ab.
+
+**Korrigierte Kommentare.** npCvxCollide, npArtiSolveExtTGS und pxgSlangEpa behaupteten, llvmpipe
+behalte bei einem Nullgleichstand den zweiten Operanden. Das gilt nur ungestempelt.
+
+**Suite:** 880/880 in beiden Speichermodi. **Szenen:** **56/56** ok.
 
 ## P9.86e — combineScalars in finishContacts: FMin/FMax statt der PxMin/PxMax-Selects
 
