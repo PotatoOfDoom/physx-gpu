@@ -111,8 +111,19 @@ Vec3 cross3(Vec3 a, Vec3 b)
 // PxQuat::rotate (PxQuat.h:286-294), verbatim -- manifold.cuh:72 is aToB.transform,
 // i.e. q.rotate(v) + p.  P9.86: this mirror used the algebraically equal
 // v + 2w(q x v) + 2(q x (q x v)) form, as the port did; it rounds differently.
+// P9.86c coverage twin: 1 = the reverted v + w*t + q x t (t = 2 q x v) spelling,
+// evaluated as the old port did.  Only pcmManifoldRefreshMulti sets it.
+static int gQuatRotateVariant = 0;
+
 Vec3 quatRotate(const float q[4], Vec3 v)
 {
+    if (gQuatRotateVariant == 1)
+    {
+        const Vec3 qv = { q[0], q[1], q[2] };
+        Vec3 t = cross3(qv, v); t = { 2.0f * t.x, 2.0f * t.y, 2.0f * t.z };
+        const Vec3 c = cross3(qv, t);
+        return { v.x + q[3] * t.x + c.x, v.y + q[3] * t.y + c.y, v.z + q[3] * t.z + c.z };
+    }
     const float x = q[0], y = q[1], z = q[2], w = q[3];
     const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
     const float w2 = w * w - 0.5f;
@@ -376,7 +387,8 @@ PXG_TEST(pcmManifoldRefreshFrame)
         {
             const float g = gotRecs[i].contacts[s].penetration;
             const float e = expect[i].contacts[s].penetration;
-            if (g != e)
+            uint32_t gb, eb; std::memcpy(&gb, &g, 4); std::memcpy(&eb, &e, 4);
+            if (gb != eb)
             { ++mm; std::printf("  refresh MM rec %u slot %u: pen got=%.9g exp=%.9g\n", i, s, g, e); }
         }
     }
@@ -442,7 +454,8 @@ PXG_TEST(pcmManifoldRefreshFrame)
             {
                 const float g = gotRecs2[i].contacts[sl].penetration;
                 const float e = expect2[i].contacts[sl].penetration;
-                if (g != e)
+                uint32_t gb, eb; std::memcpy(&gb, &g, 4); std::memcpy(&eb, &e, 4);
+                if (gb != eb)
                 { ++mm2; std::printf("  refresh(normal) MM rec %u slot %u: pen got=%.9g exp=%.9g\n",
                                      i, sl, g, e); }
             }
@@ -492,6 +505,7 @@ PXG_TEST(pcmManifoldRefreshMulti)
     Kernel k("pcmManifoldBda.spv", "pcmRefreshLaunch", {}, sizeof(RefreshPush));
 
     size_t mm = 0;
+    size_t rotSpellingSeen = 0;
     const int FRAMES = 6;
     for (int f = 0; f < FRAMES; ++f)
     {
@@ -520,7 +534,22 @@ PXG_TEST(pcmManifoldRefreshMulti)
         dev->flush();
 
         std::vector<uint32_t> expLost(N);
-        for (uint32_t i = 0; i < N; ++i) expLost[i] = cpuRefresh(model[i], q, p, threshold) ? 1u : 0u;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            // Twin: the same refresh with the reverted rotation spelling.  Every
+            // stored penetration it changes is one the bitwise compare below
+            // would catch if the shader used that spelling.
+            PcmRecord twin = model[i];
+            gQuatRotateVariant = 1; cpuRefresh(twin, q, p, threshold); gQuatRotateVariant = 0;
+            expLost[i] = cpuRefresh(model[i], q, p, threshold) ? 1u : 0u;
+            for (uint32_t s = 0; s < MAX_SLOTS; ++s)
+            {
+                uint32_t a, b;
+                std::memcpy(&a, &model[i].contacts[s].penetration, 4);
+                std::memcpy(&b, &twin.contacts[s].penetration, 4);
+                if (a != b) ++rotSpellingSeen;
+            }
+        }
 
         const auto gotLost = downloadBuffer<uint32_t>(dev, bOut.h, N);
         const auto gotBytes = downloadBuffer<uint8_t>(dev, bRec.h, uint32_t(bytes.size()));
@@ -541,13 +570,17 @@ PXG_TEST(pcmManifoldRefreshMulti)
             {
                 const float g = gotRecs[i].contacts[s].penetration;
                 const float e = model[i].contacts[s].penetration;
-                if (g != e)
+                uint32_t gb, eb; std::memcpy(&gb, &g, 4); std::memcpy(&eb, &e, 4);
+                if (gb != eb)
                 { ++mm; std::printf("  multi MM f%d rec %u slot %u: pen got=%.9g exp=%.9g\n", f, i, s, g, e); }
             }
         }
         if (mm) break;   // one bad frame is enough; later frames would just echo it
     }
     PXG_CHECK_MSG(mm == 0, "refreshManifolds bit-exact across %d dispatches (%zu mismatches)", FRAMES, mm);
+    PXG_CHECK_MSG(rotSpellingSeen > 0,
+                  "PxQuat::rotate spelling exercised: %zu stored penetrations differ from the v + w*t + q x t twin",
+                  rotSpellingSeen);
 
     dev->destroyBuffer(bRec.h); dev->destroyBuffer(bOut.h);
 }
