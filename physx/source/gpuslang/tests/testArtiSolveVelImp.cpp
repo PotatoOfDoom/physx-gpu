@@ -63,6 +63,11 @@
 // impulse at the common link onto a -0 mRootDeferredZ: npArtiSolveTendons-r1).
 // Host twins of both reverts (gPropAccelVariant = 2, gJiCommonVariant = 1) must
 // change the compared image, so the inputs cannot drift off the fold sites.
+// P9.86d: a third applyImpulses dispatch over the same rest lanes WITHOUT joint
+// impulses (SV_IMP_REST_NULLJF_CASES): the common hop is the NULL-jointForce
+// propagateImpulseW at a +0 dual product, where the CUDA's `0.0f - dot` (+0) and
+// the port's former `-dot` (-0) split on the -0 mRootDeferredZ.  Its host twin
+// (gPropImpNullJfNegDot) must change the compared image.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -321,12 +326,28 @@ static const uint32_t SV_IMP_REST_CASES[][2] = {
 };
 const uint32_t SV_NUM_IMP_REST_CASES = 1;
 
+// P9.86d (pxgSlangArticulationDynamic p86d-nulljf-negdot): the same rest lanes with
+// NO joint impulse -- both ends at the common link 1, zero spatial impulses -- so
+// ZCommon = (-lin0 - lin1 | ...) is six -0 words and the common walk's only hop
+// (link 1 -> root) is propagateImpulseW with jointForce == NULL.  Every dof axis of
+// svRestOverrides has a negative entry, so the dual product s.Z is +0 and the CUDA's
+// `0.0f - dot` is +0 where the port's pre-P9.86d `-dot` gave -0; each temp lane
+// -0 + isInvD * stZ then takes the sign of isInvD * stZ, the translate hands the top
+// half through unchanged and the root's -0 mRootDeferredZ keeps it.  Again ONE case
+// per dispatch (the first one overwrites the -0 root seed).
+static const uint32_t SV_IMP_REST_NULLJF_CASES[][2] = {
+    { 1u, 1u },
+};
+const uint32_t SV_NUM_IMP_REST_NULLJF_CASES = 1;
+
 // P9.86c coverage, filled by the host passes (before any device work)
 static uint32_t gSvGetVelFoldHits = 0;     // hops: folded J lane -0 on a -0 pDeltaV lane
 static size_t gSvGetVelFoldWords = 0;      // getVelocity words the r0 twin changes
 static size_t gSvGetVelFoldSlotsMissed = 0; // directed slots the r0 twin leaves alone
 static uint32_t gSvJiCommonNegZero = 0;    // folded jiCommon entries that are -0
 static size_t gSvJiCommonFoldBytes = 0;    // arena bytes the r1 twin changes
+static uint32_t gSvNullJfPosZeroDot = 0;   // NULL-jointForce hops with a +0 dual product
+static size_t gSvNullJfNegDotBytes = 0;    // arena bytes the p86d `-dot` twin changes
 
 struct SvParamsHost
 {
@@ -516,9 +537,19 @@ static size_t svRunApplyImp(PxgCudaShim& shim, const uint32_t (*cases)[2], uint3
     SvArena W = A;
     gJiCommonVariant = 0;
     gJiCommonFoldNegZero = 0;
+    gPropImpNullJfPosZeroDot = 0;
     mirror(W);
     if (rest)
     {
+        gSvNullJfPosZeroDot += gPropImpNullJfPosZeroDot;
+        // host twin of the p86d revert: the NULL-jointForce hop computes `-dot`
+        SvArena N = A;
+        gPropImpNullJfNegDot = true;
+        mirror(N);
+        gPropImpNullJfNegDot = false;
+        gSvNullJfNegDotBytes += svBytesDiffer(W.ab, N.ab) + svBytesDiffer(W.lk, N.lk)
+                              + svBytesDiffer(W.df, N.df);
+
         gSvJiCommonNegZero += gJiCommonFoldNegZero;
         // host twin of the r1 revert: the common hop is handed the SEEDLESS sum
         SvArena V = A;
@@ -594,6 +625,8 @@ PXG_TEST(artiSolveVelImp)
     size_t bad = 0;
     gSvJiCommonNegZero = 0;
     gSvJiCommonFoldBytes = 0;
+    gSvNullJfPosZeroDot = 0;
+    gSvNullJfNegDotBytes = 0;
     bad += svRunGetVel(shim);
     {
         // the per-case impulse table (also the shader's input)
@@ -609,6 +642,12 @@ PXG_TEST(artiSolveVelImp)
         restImp[6] = -0.0f;
         bad += svRunApplyImp(shim, SV_IMP_REST_CASES, SV_NUM_IMP_REST_CASES, restImp, true);
     }
+    {
+        // P9.86d: the rest dispatch without joint impulses -- all-zero impulse table
+        std::vector<float> restImp(size_t(SV_NUM_IMP_REST_NULLJF_CASES) * 18, 0.0f);
+        bad += svRunApplyImp(shim, SV_IMP_REST_NULLJF_CASES, SV_NUM_IMP_REST_NULLJF_CASES,
+                             restImp, true);
+    }
 
     // P9.86c coverage: each directed input must keep reaching its fold site
     std::printf("[ info ] getVelocity: %u hops with a folded -0 J lane on a -0 pDeltaV lane;"
@@ -622,5 +661,11 @@ PXG_TEST(artiSolveVelImp)
     PXG_CHECK_MSG(gSvJiCommonNegZero > 0 && gSvJiCommonFoldBytes > 0,
                   "the rest dispatch must carry a folded -0 joint impulse at the common link onto"
                   " a -0 mRootDeferredZ (npArtiSolveTendons-r1)");
+    std::printf("[ info ] applyImpulses: %u NULL-jointForce hops with a +0 dual product; %zu arena"
+                " bytes the p86d `-dot` twin changes\n", gSvNullJfPosZeroDot, gSvNullJfNegDotBytes);
+    PXG_CHECK_MSG(gSvNullJfPosZeroDot > 0 && gSvNullJfNegDotBytes > 0,
+                  "the no-joint-impulse rest dispatch must reach a NULL-jointForce hop with a +0"
+                  " dual product and carry `0 - dot` vs `-dot` onto the -0 mRootDeferredZ"
+                  " (pxgSlangArticulationDynamic p86d-nulljf-negdot)");
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

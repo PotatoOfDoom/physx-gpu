@@ -516,7 +516,16 @@ inline Cm::UnAlignedSpatialVector refPropImpulseNoWrite(
             const PxgArticulationBlockDofData& dd = df[dofBase + ind];
             const Cm::UnAlignedSpatialVector sas = loadSpatialVector(dd.mWorldMotionMatrix, lane);
             const Cm::UnAlignedSpatialVector isInvD = loadSpatialVector(dd.mIsInvDW, lane);
-            const PxReal stZ = 0.0f - sas.innerProduct(Z);
+            const PxReal dot = sas.innerProduct(Z);
+            PxReal stZ = 0.0f - dot;
+            {   // P9.86d twin + counter (pxgArtiSolveRef.h)
+                PxU32 b;
+                std::memcpy(&b, &dot, 4);
+                if (b == 0u)
+                    ++gPropImpNullJfPosZeroDot;
+                if (gPropImpNullJfNegDot)
+                    stZ = -dot;
+            }
             temp += isInvD * stZ;
         }
     }

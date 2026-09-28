@@ -146,9 +146,14 @@ public AbSpatialVector adPropagateImpulseWJf(AbSpatialVector isInvD[3], float3 c
     {
         if (ind < dofCount)
         {
-            const float jfv = hasJf ? jf[ind] * jfMult : 0.0f;
             // against Z, NOT against temp
-            const float stZ = jfv - asmInnerProduct(motionMatrix[ind], Z);
+            const float sZ = asmInnerProduct(motionMatrix[ind], Z);
+            // P9.86d: with jointForce == NULL the CUDA's stZ is `0.0f - s.Z`
+            // (articulationDynamic.cuh:141-142): +0 at a +0 dot.  Written as
+            // `jfv - sZ` with jfv the literal 0 of an inlined hasJf = false, it
+            // becomes OpFSub(0, x), which llvmpipe rewrites to -x (-0 at a +0 dot)
+            // even under SignedZeroInfNanPreserve -- so that case is the select.
+            const float stZ = hasJf ? (jf[ind] * jfMult - sZ) : ((sZ == 0.0f) ? 0.0f : -sZ);
             qstZ[ind] = qstZ[ind] + stZ;
             temp = asmSVecAdd(temp, asmSVecScale(isInvD[ind], stZ));
         }

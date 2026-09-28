@@ -59,6 +59,17 @@
 namespace pxgtest
 {
 
+// P9.86d: with jointForce == NULL the template's stZ is `0.0f - dot`
+// (articulationDynamic.cuh:141-142): +0 at a +0 dual product.
+// gPropImpNullJfNegDot is the mutant twin -- `-dot`, what the port's
+// adPropagateImpulseWJf(hasJf = false) computed before P9.86d (the inlined
+// literal-zero OpFSub that llvmpipe rewrites to a negate) -- which is -0 there.
+// gPropImpNullJfPosZeroDot counts the NULL-jointForce hops whose dual product is
+// exactly +0, the only input on which the two spellings differ.  Defaults keep
+// every user of this hop bit-identical.
+inline bool gPropImpNullJfNegDot = false;
+inline physx::PxU32 gPropImpNullJfPosZeroDot = 0;
+
 // propagateImpulseW<WriteToDeferredQstZ> (articulationDynamic.cuh:129)
 inline physx::Cm::UnAlignedSpatialVector refPropImpulseDeferred(
     physx::PxgArticulationBlockDofData* dofs, physx::PxU32 jointOffset,
@@ -76,7 +87,17 @@ inline physx::Cm::UnAlignedSpatialVector refPropImpulseDeferred(
             const Cm::UnAlignedSpatialVector sas = loadSpatialVector(dd.mWorldMotionMatrix, lane);
             const Cm::UnAlignedSpatialVector isInvD = loadSpatialVector(dd.mIsInvDW, lane);
             const PxReal jfv = jf ? jf[ind] * jfMult : 0.0f;
-            const PxReal stZ = jfv - sas.innerProduct(Z);
+            const PxReal dot = sas.innerProduct(Z);
+            PxReal stZ = jfv - dot;
+            if (!jf)
+            {
+                PxU32 b;
+                std::memcpy(&b, &dot, 4);
+                if (b == 0u)
+                    ++gPropImpNullJfPosZeroDot;
+                if (gPropImpNullJfNegDot)
+                    stZ = -dot;
+            }
             dd.mDeferredQstZ[lane] += stZ;
             temp += isInvD * stZ;
         }

@@ -130,6 +130,23 @@ const float IL_DT = 0.01f, IL_SCENE_DT = 0.033f, IL_INV_DT = 100.0f, IL_ELAPSED 
 // is +0 -- so its old-model friction (a % 3 == 0) sees jointV = +0 and the CUDA's
 // `-jointV * recipResponse + 0` stores +0 where a folded add would store -0.
 const uint32_t IL_REST_ART = 6;
+
+// P9.86d (pxgSlangArticulationDynamic p86d-nulljf-negdot) EQUIVALENCE witness.  The
+// port's DFS calls adPropagateImpulseWJf with a LITERAL hasJf = false at the backprop
+// hop (WriteToDeferredQstZ, internalConstraints2.cu:1720) and the AFTER-vel-limit hop
+// (WriteToProvidedQstZ with NULL, :1927); only there does the revert fold to `-dot`.
+// `0.0f - dot` and `-dot` differ only at dot == +0, as stZ = +0 vs -0, and that sign
+// can reach an output only through (a) qstZ = seed + stZ with a -0 seed, or (b) a
+// temp lane Z_c + isInvD_c * stZ with Z_c = -0.  Neither is reachable: mDeferredQstZ
+// is only ever zeroed (forwardDynamic2.cu:97/4056, internalConstraints2.cu:493/610) or
+// grown by adds, and the :1927 sum is discarded; Z is parentImp / childImpulseFromStatic,
+// both +0-seeded and built only by `+=`, `-=` and `impulse - before` of such sums, and
+// in round-to-nearest x + y is -0 only for -0 + -0 and x - y only for -0 - (+0).  So
+// Z_c is +0 or nonzero, temp_c comes out identical, and so does everything after it.
+// The host twin (gPropImpNullJfNegDot) must change 0 words while the rest articulation
+// feeds the hop +0 dual products (counted).
+static uint32_t gIlNullJfPosZeroDot = 0;
+static size_t gIlNullJfNegDotWords = 0;
 static float fv(uint32_t a, uint32_t l, uint32_t d, uint32_t salt)
 {
     if (a == IL_REST_ART && l < 1000u) return 0.0f;
@@ -741,8 +758,44 @@ static size_t ilRun(PxgCudaShim& shim, bool velIter, bool residual, bool extEver
 
     IlArena W = A;
     uint32_t hasImpulses = 0, fixSkips = 0, rootStatics = 0, rootJointsLive = 0;
+    gPropImpNullJfPosZeroDot = 0;
     ilMirror(W, velIter, residual, extEvery, doFDPL, doVelLimit, doStatic, biasCoefficient,
              hasImpulses, fixSkips, rootStatics, rootJointsLive);
+    gIlNullJfPosZeroDot += gPropImpNullJfPosZeroDot;
+    {
+        // P9.86d: the `-dot` twin over the same inputs (see gIlNullJfPosZeroDot)
+        IlArena T = A;
+        uint32_t h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+        gPropImpNullJfNegDot = true;
+        ilMirror(T, velIter, residual, extEvery, doFDPL, doVelLimit, doStatic, biasCoefficient,
+                 h0, h1, h2, h3);
+        gPropImpNullJfNegDot = false;
+        auto words = [](const void* x, const void* y, size_t bytes) {
+            size_t n = 0;
+            const uint32_t* p = reinterpret_cast<const uint32_t*>(x);
+            const uint32_t* q = reinterpret_cast<const uint32_t*>(y);
+            for (size_t k = 0; k < bytes / 4; ++k) n += (p[k] != q[k]) ? 1u : 0u;
+            return n;
+        };
+        gIlNullJfNegDotWords += words(W.rec.data(), T.rec.data(), W.rec.size())
+            + words(W.ab.data(), T.ab.data(), W.ab.size() * sizeof(W.ab[0]))
+            + words(W.lk.data(), T.lk.data(), W.lk.size() * sizeof(W.lk[0]))
+            + words(W.df.data(), T.df.data(), W.df.size() * sizeof(W.df[0]))
+            + words(W.stack.data(), T.stack.data(), W.stack.size() * sizeof(W.stack[0]))
+            + words(W.imp.data(), T.imp.data(), W.imp.size() * 4)
+            + words(W.slab.data(), T.slab.data(), W.slab.size() * 4)
+            + words(W.fp.data(), T.fp.data(), W.fp.size() * sizeof(W.fp[0]))
+            + words(W.cp.data(), T.cp.data(), W.cp.size() * sizeof(W.cp[0]))
+            + words(W.jr.data(), T.jr.data(), W.jr.size() * sizeof(W.jr[0]))
+            + words(W.bodySims.data(), T.bodySims.data(), W.bodySims.size())
+            + words(W.nodes.data(), T.nodes.data(), W.nodes.size() * sizeof(W.nodes[0]))
+            + words(W.jf.data(), T.jf.data(), W.jf.size() * 4)
+            + words(W.bt.data(), T.bt.data(), W.bt.size() * sizeof(W.bt[0]))
+            + words(W.ch.data(), T.ch.data(), W.ch.size() * sizeof(W.ch[0]))
+            + words(W.fh.data(), T.fh.data(), W.fh.size() * sizeof(W.fh[0]))
+            + words(W.jh.data(), T.jh.data(), W.jh.size() * sizeof(W.jh[0]))
+            + words(W.rs.data(), T.rs.data(), W.rs.size() * sizeof(W.rs[0]));
+    }
 
     std::printf("[ info ] launch(vel=%d res=%d ext=%d fdpl=%d vlim=%u stat=%d): "
                 "hasImpulses %u, fixSkips %u, rootStatics %u (joints live %u)\n",
@@ -866,6 +919,8 @@ PXG_TEST(artiSolveInternalLaunch)
 
     size_t bad = 0;
     gTgsOldFrictionNegZero = 0;
+    gIlNullJfPosZeroDot = 0;
+    gIlNullJfNegDotWords = 0;
     // posIter, residuals on, BEFORE vel-limit, static on, bias 0.9 (erp clamps to 0.7).
     // doFriction deliberately != residualReporting in A and B so a crossed byte
     // read of the flags word cannot pass as a coincidence.
@@ -878,5 +933,13 @@ PXG_TEST(artiSolveInternalLaunch)
                 unsigned(gTgsOldFrictionNegZero));
     PXG_CHECK_MSG(gTgsOldFrictionNegZero > 0,
                   "the rest articulation must reach the `+ appliedFriction` zero rule");
+    std::printf("[ info ] NULL-jointForce impulse hops with a +0 dual product: %u; words the"
+                " p86d `-dot` twin changes: %zu\n", unsigned(gIlNullJfPosZeroDot),
+                gIlNullJfNegDotWords);
+    PXG_CHECK_MSG(gIlNullJfPosZeroDot > 0,
+                  "the rest articulation must feed the NULL-jointForce hop a +0 dual product");
+    PXG_CHECK_MSG(gIlNullJfNegDotWords == 0,
+                  "the `-dot` twin changes %zu words: the p86d equivalence no longer holds",
+                  gIlNullJfNegDotWords);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }
