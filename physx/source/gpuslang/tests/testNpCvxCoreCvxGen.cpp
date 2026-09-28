@@ -289,6 +289,12 @@ static uint32_t supportIndex(ConvexC& c, V3 dir, RefStats& st)
 
 struct Vert { V3 p; float s; uint32_t aI, bI; };
 
+// P9.86c: mutant twin of the pre-fix port as llvmpipe compiles it.  0 = the CUDA
+// (GuRefGjkEpa.h:353-360 computePoints, an IEEE chain seeded with +0); 1 = the first
+// unrolled `0 + t` of computePoints dropped (the F3 unrolled-seed fold), so a lane
+// whose terms are all -0 ends at -0 instead of +0.
+static int gSeedFoldVariant = 0;
+
 // GjkDistance state + computeClosest + addPoint + driver (L129-419)
 static void refGjk(const GjkIn& in, GjkOut& o, RefStats& st)
 {
@@ -520,8 +526,10 @@ static void refGjk(const GjkIn& in, GjkOut& o, RefStats& st)
             V3 pA{ 0, 0, 0 }, pB{ 0, 0, 0 };
             for (uint32_t i = 0; i < numVerts; ++i)
             {
-                pA = vadd(pA, vscl(cA.verts[verts[i].aI], verts[i].s));
-                pB = vadd(pB, vscl(cB.verts[verts[i].bI], verts[i].s));
+                const V3 ta = vscl(cA.verts[verts[i].aI], verts[i].s);
+                const V3 tb = vscl(cB.verts[verts[i].bI], verts[i].s);
+                if (gSeedFoldVariant == 1 && i == 0) { pA = ta; pB = tb; }
+                else { pA = vadd(pA, ta); pB = vadd(pB, tb); }
             }
             o.result = F4{ closestDist, u2f(1), 0, 0 };
             o.pointA = F4{ pA.x, pA.y, pA.z, 0 };
@@ -2247,6 +2255,120 @@ PXG_TEST(npCvxCoreCvxGen_contacts)
                   cNone, cOne, cMulti, cTrig);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.86c -- pxgSlangCvxCoreCvx gjkDistanceQ computePoints: the zero-seeded pA/pB.
+//
+// The CUDA (GuRefGjkEpa.h:353-360) seeds pA/pB with +0 and only adds, so they never
+// hold -0.  llvmpipe partially unrolls the port's loop (NIR guesses 4 trips from
+// GVert verts[4]) and drops the first `0 + t`; the port therefore canonicalises pA/pB
+// with a select.  A point core's world vertex with a -0 lane makes the dropped seed
+// visible: sphere at poseP = (-0, -e, -e) rotated by q = (-.5,-.5,.5,.5) gives
+// vA = (-0, -e, -e); a zero-radius segment of half-length len/2 along x at the origin
+// gives the 45-degree axis (+0, -r, -r), GJK ends on the 2-vertex simplex, and with
+// fl(r*m0) == e exactly (m0 found by search) point0 = (pA.x, +0, +0), point1 = 0.
+// clipNone's separation w = dot(axis, point0 - point1) is +0 under the CUDA and -0
+// when pA.x = -0 (every product -0).  Everything else in the record is bit-identical.
+// ===========================================================================
+PXG_TEST(npCvxCoreCvxGen_seedFoldZeroSign)
+{
+    struct Fam { float e, len; };
+    const Fam fams[] = { { 0.25f, 2.0f }, { 0.125f, 1.0f }, { 0.5f, 4.0f } };
+    std::vector<CvxIn> in;
+    std::vector<CvxOut> ref;
+    std::vector<uint32_t> mBits;
+    size_t cSeedFoldSeen = 0, cOnlyW = 0;
+    for (const Fam& f : fams)
+    {
+        CvxIn s{};
+        s.metaA = U4{ 0, 0, 0, 0 };                       // CORE_POINT (sphere core)
+        s.poseAq = F4{ -0.5f, -0.5f, 0.5f, 0.5f };
+        s.metaB = U4{ 1, 0, 0, 0 };                       // CORE_SEGMENT, zero margin
+        s.coreB[0].x = f2u(f.len);
+        s.poseBq = F4{ 0, 0, 0, 1 };
+        s.poseBp = F4{ 0, 0, 0, 0 };
+        s.cfg = F4{ 0.1f, 0, 0, 0 };
+        const float seed = std::sqrt(2.0f) * f.e;
+        bool found = false;
+        for (int k = 0; k <= 128 && !found; ++k)
+        {
+            float m = seed;
+            const int steps = (k + 1) / 2;
+            for (int j = 0; j < steps; ++j) m = std::nextafter(m, (k & 1) ? 1e30f : -1e30f);
+            s.poseAp = F4{ -0.0f, -f.e, -f.e, m };
+            CvxOut a, t;
+            refCvxGen(s, a);
+            gjkref::gSeedFoldVariant = 1;
+            refCvxGen(s, t);
+            gjkref::gSeedFoldVariant = 0;
+            if (a.counts.x == 1 && a.counts.y == 0 && f2u(a.points[0].w) == 0u &&
+                f2u(t.points[0].w) == 0x80000000u)
+            {
+                found = true;
+                ++cSeedFoldSeen;
+                // the twin must change ONLY the separation word
+                bool same = std::memcmp(&a.counts, &t.counts, sizeof(a.counts)) == 0 &&
+                            std::memcmp(&a.normal, &t.normal, sizeof(a.normal)) == 0 &&
+                            f2u(a.points[0].x) == f2u(t.points[0].x) &&
+                            f2u(a.points[0].y) == f2u(t.points[0].y) &&
+                            f2u(a.points[0].z) == f2u(t.points[0].z) &&
+                            std::memcmp(&a.points[1], &t.points[1], sizeof(F4) * 3) == 0;
+                if (same) ++cOnlyW;
+                in.push_back(s);
+                ref.push_back(a);
+                mBits.push_back(f2u(m));
+            }
+        }
+    }
+    PXG_CHECK_MSG(cSeedFoldSeen == 3, "cvg seed-fold: only %zu of 3 directed cases change under the twin",
+                  cSeedFoldSeen);
+    PXG_CHECK_MSG(cOnlyW == cSeedFoldSeen, "cvg seed-fold: twin changed more than points[0].w (%zu of %zu)",
+                  cOnlyW, cSeedFoldSeen);
+    for (size_t i = 0; i < mBits.size(); ++i)
+        std::printf("[ info ] cvg seed-fold case %zu: m0 0x%08X\n", i, mBits[i]);
+    if (in.empty()) return;
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = uint32_t(in.size());
+    std::vector<F4> ptsHost(size_t(N) * 24, F4{ 0, 0, 0, 0 });
+    PxgBufferHandle bPts = createBufferFrom(dev, ptsHost);
+    const uint64_t ptsBase = dev->getBufferDeviceAddress(bPts);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint64_t a = ptsBase + uint64_t(i) * 24ull * sizeof(F4);
+        const uint64_t b = a + 12ull * sizeof(F4);
+        in[i].ptsAddrA = U4{ uint32_t(a & 0xffffffffu), uint32_t(a >> 32), 0, 0 };
+        in[i].ptsAddrB = U4{ uint32_t(b & 0xffffffffu), uint32_t(b >> 32), 0, 0 };
+    }
+    std::vector<CvxOut> outInit(N);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct P { uint32_t numTests; } prm = { N };
+    Kernel k("npCvxCoreCvxGen.spv", "cvgContacts",
+             { (uint32_t)sizeof(CvxIn), (uint32_t)sizeof(CvxOut) }, sizeof(P));
+    k.dispatch((N + 31) / 32, { bIn, bOut }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<CvxOut>(dev, bOut, N);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const CvxOut& r = ref[i]; const CvxOut& q = g[i];
+        bool ok = r.counts.x == q.counts.x && r.counts.y == q.counts.y && r.counts.z == q.counts.z &&
+                  eqFZ(r.normal.x, q.normal.x) && eqFZ(r.normal.y, q.normal.y) && eqFZ(r.normal.z, q.normal.z);
+        for (uint32_t j = 0; j < 4; ++j)
+            ok = ok && eqFZ(r.points[j].x, q.points[j].x) && eqFZ(r.points[j].y, q.points[j].y) &&
+                 eqFZ(r.points[j].z, q.points[j].z) && eqFZ(r.points[j].w, q.points[j].w);
+        if (!ok)
+        {
+            ++mm;
+            std::printf("MM seed-fold %u n %u/%u w 0x%08X/0x%08X p0 (%g %g %g)/(%g %g %g)\n", i,
+                        r.counts.x, q.counts.x, f2u(r.points[0].w), f2u(q.points[0].w),
+                        r.points[0].x, r.points[0].y, r.points[0].z, q.points[0].x, q.points[0].y, q.points[0].z);
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "cvg seed-fold: %zu mismatches", mm);
+    for (PxgBufferHandle h : { bIn, bOut, bPts }) dev->destroyBuffer(h);
 }
 
 // ===========================================================================
