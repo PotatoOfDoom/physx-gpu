@@ -67,6 +67,11 @@
 // G6  THE COUNTER OVERSHOOTS.  maxNumContacts is smaller than the number of contacts
 //     the scene generates, so the dropped writes and the still-incrementing counter
 //     are both measured.
+//
+// G7  THE BARYCENTRIC CLAMP KEEPS -0 (P9.86).  Tet 7 is INVERTED and particle 14 sits
+//     in its vertex-a region, so closestP == a exactly and v = w = x = +0 / -1 = -0.
+//     PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) on float selects keeps -0; a GLSL
+//     FClamp spelling (llvmpipe maxps) would store +0.  Compared bitwise in cm0.
 
 #include "pxgTestFramework.h"
 #include "PxgSoftBody.h"
@@ -294,7 +299,9 @@ static void computeTetBarycentric(V3 a, V3 b, V3 c, V3 d, V3 point, F4& bary)
     const float w = vdot(ba, vcross(pa, da)) / detBcd;
     const float x = vdot(ba, vcross(ca, pa)) / detBcd;
     const float u = 1.0f - v - w - x;
-    auto cl = [](float t) { return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t); };
+    // PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146) with the float
+    // selects of PxUnixMathIntrinsics.h:116-125: -0 stays -0 (G7).  Never std::max/fmax.
+    auto cl = [](float t) { const float lo = (0.0f > t) ? 0.0f : t; return (1.0f < lo) ? 1.0f : lo; };
     bary = F4{ cl(u), cl(v), cl(w), cl(x) };
 }
 
@@ -363,11 +370,16 @@ PXG_TEST(softBodyPsContactGen)
     verts.push_back(F4{ 34.0f, 0.0f, 0.0f, 1.0f });
     verts.push_back(F4{ 30.0f, 4.0f, 0.0f, 1.0f });
     verts.push_back(F4{ 30.0f, 0.0f, 4.0f, 1.0f });
-    const uint32_t NB_TETS = 7u;
+    // 7 is INVERTED (b and c swapped below): a=(40,0,0) b=(40,1,0) c=(41,0,0) d=(40,0,1),
+    // detBcd = -1.  Cooking keeps inverted tets (GuCookingTetrahedronMesh.cpp:383-386)
+    // and deformation produces them.  See G7.
+    pushTet(40.0f, 0.0f, 0.0f);   // 7: verts 28..31
+    const uint32_t NB_TETS = 8u;
 
     std::vector<U4> tets;
     for (uint32_t t = 0; t < NB_TETS; ++t)
         tets.push_back(U4{ 4u * t + 0u, 4u * t + 1u, 4u * t + 2u, 4u * t + 3u });
+    tets[7] = U4{ 28u, 30u, 29u, 31u };   // G7: b <-> c, so the tet is inverted
 
     DevB bVerts = mk(dev, verts);
     if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
@@ -376,7 +388,7 @@ PXG_TEST(softBodyPsContactGen)
     // ---- surface hints, one byte per tet.  Tet 3 is 0 (G5); the rest name different
     // face subsets so closestPtTetrahedron's four branches are all entered and the
     // running minimum has to choose between faces.
-    std::vector<uint8_t> hints = { 0xFu, 0xFu, 0x9u, 0x0u, 0xFu, 0x6u, 0xFu };
+    std::vector<uint8_t> hints = { 0xFu, 0xFu, 0x9u, 0x0u, 0xFu, 0x6u, 0xFu, 0xFu };
     hints.resize(((hints.size() + 3u) / 4u) * 4u, 0u);
     std::vector<uint32_t> hintWords(hints.size() / 4u, 0u);
     std::memcpy(hintWords.data(), hints.data(), hints.size());
@@ -419,6 +431,11 @@ PXG_TEST(softBodyPsContactGen)
         // 13: a second contact against the big tet, from outside, so tet 6 is not only
         //     ever reached by the inside branch.
         { 30.0f, -0.125f,   1.0f,    1.0f },  // 13
+        // 14 (G7, P9.86): a + (-1/8,-1/8,-1/8) against the INVERTED tet 7.  Faces abc,
+        //     abd, acd all return vertex a exactly, so pa = (+0,+0,+0), every cross
+        //     product in computeTetBarycentric is +0, and v = w = x = +0 / -1 = -0.
+        //     PxClamp(-0, 0, 1) keeps -0 (float selects); FClamp gives +0.
+        { 39.875f, -0.125f, -0.125f, 1.0f },  // 14
     };
     const uint32_t NB_PARTICLES = uint32_t(parts.size());
     DevB bParts = mk(dev, parts);
@@ -427,7 +444,7 @@ PXG_TEST(softBodyPsContactGen)
     // where the engine uses the unsorted one (or the reverse) changes every filter
     // query.  With the identity here the whole S3 trap would be untestable.
     const std::vector<uint32_t> sortedToUnsorted =
-        { 3u, 5u, 6u, 0u, 2u, 4u, 1u, 9u, 7u, 8u, 13u, 12u, 11u, 10u };
+        { 3u, 5u, 6u, 0u, 2u, 4u, 1u, 9u, 7u, 8u, 13u, 12u, 11u, 14u, 10u };
     for (uint32_t i = 0; i < NB_PARTICLES; ++i)
         PXG_CHECK_MSG(sortedToUnsorted[i] != i,
                       "sortedToUnsorted[%u] == %u is a FIXED POINT; the mapping must be a "
@@ -772,6 +789,30 @@ PXG_TEST(softBodyPsContactGen)
     PXG_CHECK_MSG(rest[0] != rest[1],
                   "the two managers must carry DIFFERENT rest distances or reading the "
                   "wrong one is invisible");
+
+    // G7 (P9.86): an inverted tet with a vertex-region particle gives -0 barycentric
+    // lanes, which PxClamp keeps and GLSL FClamp would flush to +0.
+    uint32_t baryNegZeroLanes = 0u;
+    const Expect* g7 = nullptr;
+    for (const Expect& e : expA)
+    {
+        const float lanes[3] = { e.bary.y, e.bary.z, e.bary.w };
+        for (float t : lanes) if (t == 0.0f && std::signbit(t)) ++baryNegZeroLanes;
+        if (e.pair0lo == 14u && e.pair1 == encSb(7u)) g7 = &e;
+    }
+    PXG_CHECK_MSG(baryNegZeroLanes > 0u,
+                  "no cm0 contact carries a -0 barycentric lane: PxClamp(-0,0,1) = -0 "
+                  "(float selects, deformableCollision.cuh:133-136) vs FClamp's +0 is "
+                  "unexercised (G7, P9.86)");
+    uint32_t g7b[4] = { 0u, 0u, 0u, 0u };
+    if (g7) std::memcpy(g7b, &g7->bary, sizeof(g7b));
+    PXG_CHECK_MSG(g7 && g7b[0] == 0x3f800000u && g7b[1] == 0x80000000u &&
+                  g7b[2] == 0x80000000u && g7b[3] == 0x80000000u,
+                  "particle 14 x inverted tet 7 must be a cm0 contact with mirror barycentric "
+                  "(1,-0,-0,-0); %s %08x %08x %08x %08x", g7 ? "got" : "ABSENT",
+                  g7b[0], g7b[1], g7b[2], g7b[3]);
+    PXG_CHECK_MSG(mirrorFor(1u, NB_STACK).size() > expB.size(),
+                  "the clamped stack tail must contain a contact");
 
     // A: everything fits, so every contact is checked bit for bit.
     const uint32_t wroteA = runOne(0u, 64u, NB_STACK, expA, "cm0/all-fit");
