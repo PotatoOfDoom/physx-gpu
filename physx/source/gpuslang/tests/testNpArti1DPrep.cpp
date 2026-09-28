@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -200,6 +201,10 @@ static void rQueryReducedPGS(uint32_t flags, float stiffness, float damping, flo
 struct RefStats
 {
     bool anySkip, trailingSkip, anyBounce, anyDrive;
+    // P9.86c (TGS only): live rows on which the pre-fix port spelling of
+    // computeJointSpeedTGS (llvmpipe: 0 - v0 -> -v0) differs from CUDA's IEEE result,
+    // and live rows reaching the kinematic-body-1-only 0 + (-0)
+    uint32_t jsTwinK0, jsKin1NegZero;
 };
 
 // exact transcription of preprocessRowsBlock + setUpArti1DConstraintBlock PGS
@@ -694,6 +699,18 @@ static void refA1dTGS(const T1In& s, T1Out& o, RefStats& st)
             if (b1.isKin)
                 initJointSpeed += vel1;
             jointSpeed = vel0 - vel1;
+
+            // P9.86c: host twin of the pre-fix port (F1/F2: the +0 seed forwarded into
+            // OpFSub(0, v0), which llvmpipe emits as -v0); coverage for the r12 kill
+            float jsTwin = 0.f;
+            if (b0.isKin)
+                jsTwin = -vel0;
+            if (b1.isKin)
+                jsTwin += vel1;
+            if (b0.isKin && !b1.isKin && f2u(jsTwin) != f2u(initJointSpeed))
+                ++st.jsTwinK0;
+            if (!b0.isKin && b1.isKin && f2u(vel1) == 0x80000000u)
+                ++st.jsKin1NegZero;
         }
 
         const float geometricError = lin0.w;
@@ -757,6 +774,7 @@ PXG_TEST(npArti1DPrep_tgs)
     std::vector<T1Out> ref(N);
     size_t cRows0 = 0, cSkipSome = 0, cTrailSkip = 0, cSpring = 0, cAccel = 0, cBounce = 0,
            cKeep = 0, cDrive = 0, cIneq = 0, cAngular = 0, cSortDup = 0, cKin = 0;
+    size_t cJsK0 = 0, cJsK1Nz = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -777,6 +795,25 @@ PXG_TEST(npArti1DPrep_tgs)
         };
         fillBody(s.b0resp, s.b0velTop, s.b0velBot, s.b0q, s.b0p);
         fillBody(s.b1resp, s.b1velTop, s.b1velBot, s.b1q, s.b1p);
+
+        // P9.86c directed class: a kinematic rigid body AT REST jointed to an articulation
+        // link (CUDA createPxgSolverExtBody: kinematic -> mSpatialResponse memset to 0).
+        //   restCase 1: body 0 kinematic, v0 = +0  -> CUDA 0 - (+0) = +0 (pre-fix port: -0)
+        //   restCase 2: body 1 kinematic, v1 = -0  -> CUDA 0 + (-0) = +0 (zero-seed fold probe)
+        // No rng draws are added, so the random stream of the other tests is unchanged.
+        const uint32_t restCase = (i % 17u == 9u) ? 1u + (i / 17u) % 2u : 0u;
+        if (restCase != 0u)
+        {
+            const bool kin0 = restCase == 1u;
+            s.bMeta = kin0 ? U4{ 0u, 1u, 1u, 0u } : U4{ 1u, 0u, 0u, 1u };
+            F4* kr = kin0 ? s.b0resp : s.b1resp;
+            F4& kt = kin0 ? s.b0velTop : s.b1velTop;
+            F4& kb = kin0 ? s.b0velBot : s.b1velBot;
+            for (int f = 0; f < 9; ++f)
+                kr[f] = F4{ 0.f, 0.f, 0.f, 0.f };
+            kt = F4{ 0.f, 0.f, 0.f, kt.w };
+            kb = F4{ 0.f, 0.f, 0.f, kb.w };
+        }
 
         const uint32_t numRows = (i % 11 == 4) ? 0u : (1u + rng() % 20u);
         if (numRows == 0)
@@ -828,6 +865,18 @@ PXG_TEST(npArti1DPrep_tgs)
             s.rvel[r * 4 + 1] = F4{ jac(), jac(), jac(), rf(-1e4f, 0.f) };
             s.rvel[r * 4 + 2] = F4{ jac(), jac(), jac(), rf(-3.f, 3.f) };
             s.rvel[r * 4 + 3] = F4{ jac(), jac(), jac(), rf(0.f, 1e4f) };
+            if (restCase == 1u)
+            {
+                F4& l0 = s.rvel[r * 4 + 0];
+                l0.x = std::fabs(l0.x);   // (+0)*(+c) = +0 makes v0 = +0 deterministically
+            }
+            else if (restCase == 2u)
+            {
+                F4& l1 = s.rvel[r * 4 + 1];
+                F4& a1 = s.rvel[r * 4 + 3];   // every (+0)*(-c) = -0 makes v1 = -0
+                l1.x = -std::fabs(l1.x); l1.y = -std::fabs(l1.y); l1.z = -std::fabs(l1.z);
+                a1.x = -std::fabs(a1.x); a1.y = -std::fabs(a1.y); a1.z = -std::fabs(a1.z);
+            }
         }
         if (dupHint)
             ++cSortDup;
@@ -835,6 +884,8 @@ PXG_TEST(npArti1DPrep_tgs)
         in[i] = s;
         RefStats st;
         refA1dTGS(s, ref[i], st);
+        cJsK0 += st.jsTwinK0;
+        cJsK1Nz += st.jsKin1NegZero;
         if (st.anySkip) ++cSkipSome;
         if (st.trailingSkip) ++cTrailSkip;
         if (st.anyBounce) ++cBounce;
@@ -856,6 +907,11 @@ PXG_TEST(npArti1DPrep_tgs)
     PXG_CHECK(cIneq > 2000);
     PXG_CHECK(cAngular > 3000);
     PXG_CHECK(cKin > 900);
+    std::printf("[ info ] t1 jointSpeed at rest: kin0 0-(+0) twin-differs %zu, kin1-only 0+(-0) %zu\n",
+                cJsK0, cJsK1Nz);
+    PXG_CHECK_MSG(cJsK0 >= 100, "resting kinematic body 0 must make the pre-fix twin differ (%zu)",
+                  cJsK0);
+    PXG_CHECK_MSG(cJsK1Nz >= 100, "resting kinematic body 1 must reach 0 + (-0) (%zu)", cJsK1Nz);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
