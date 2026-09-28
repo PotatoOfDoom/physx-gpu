@@ -678,7 +678,7 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     // ENGINE's writer re-storing what they returned
     PxgSpatialMatrixBlock wantSmOut = smOutPoison;
     PxgSpatialMatrix6x6Block wantM6Out = m6OutPoison, wantM6Zero = m6ZeroPoison;
-    size_t bad = 0, foldZeros = 0;
+    size_t bad = 0, foldZeros = 0, foldHazard = 0;
     for (uint32_t lane = 0; lane < LANES; ++lane)
     {
         SpatialMatrix mat;
@@ -717,6 +717,25 @@ PXG_TEST(artiSpatialMatrixBlockIo)
             want[75] = mv.bottom.x;
             want[76] = mv.bottom.y;
             want[77] = mv.bottom.z;
+
+            // P9.86c coverage: twin of the pre-P9.86 port spelling as llvmpipe ran
+            // it (the literal +0 seed of the unrolled constant-trip loop folded
+            // away, F3).  On the fold lane every component must make that twin
+            // give -0 where the engine gives +0, or the lane no longer guards
+            // the seed select in asmM6MulVec.
+            if (lane == FOLD_LANE)
+            {
+                const float st[6] = { sv.top.x, sv.top.y, sv.top.z,
+                                      sv.bottom.x, sv.bottom.y, sv.bottom.z };
+                for (uint32_t i = 0; i < 6; ++i)
+                {
+                    float folded = m6.column[0][i] * st[0];
+                    for (uint32_t j = 1; j < 6; ++j)
+                        folded = folded + m6.column[j][i] * st[j];
+                    if (f2u(folded) == 0x80000000u && f2u(want[72 + i]) == 0x00000000u)
+                        ++foldHazard;
+                }
+            }
         }
 
         for (uint32_t k = 0; k < FLOATS_PER_LANE; ++k)
@@ -739,6 +758,10 @@ PXG_TEST(artiSpatialMatrixBlockIo)
 
     std::printf("[ info ] fold-lane product mismatches: %zu (P9.86: must be 0)\n", foldZeros);
     PXG_CHECK_MSG(foldZeros == 0, "the fold lane's +0 seed must survive: %zu", foldZeros);
+    std::printf("[ info ] fold-lane seed-fold hazard components: %zu (must be 6)\n", foldHazard);
+    PXG_CHECK_MSG(foldHazard == 6,
+                  "the fold lane must make the seed-dropping spelling differ from the engine in all six components: %zu",
+                  foldHazard);
     PXG_CHECK_MSG(bad == 0, "block loads identical to loadSpatialMatrix / loadPxMat33");
 
     // asmStoreSpatialMatrix forwards three separate blocks to abStoreSpatialMatrix,
