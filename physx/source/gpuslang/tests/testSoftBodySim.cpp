@@ -4128,8 +4128,11 @@ static SolveRef refSolvePGS(const SbRigidConstraintHost& c, int slot, float appl
 
     const float unitResponse = rigidRefCount * raXn_resp.w + massSplit;
     const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-    float dLN = -CN * invDenom;
-    if (dLN < -appliedForceRef) dLN = -appliedForceRef;
+    // P9.86c: PxMax(float) = intrinsics::selectMax `a > b ? a : b` (deformableUtils.cuh:374,
+    // PxUnixMathIntrinsics.h:122): the SECOND operand survives a (+0,-0) tie.  The old
+    // `dLN = a; if (dLN < b) dLN = b;` kept a there, i.e. the pre-fix FMax behaviour.
+    const float dLNa = -CN * invDenom, dLNb = -appliedForceRef;
+    const float dLN = (dLNa > dLNb) ? dLNa : dLNb;
     r.deltaLambdaN = dLN;
     // deltaLambdaT collapses to 0 on the null-material path (combinedFriction == 0).
     r.deltaPos = V3{ -(dLN * normal.x) * dt, -(dLN * normal.y) * dt, -(dLN * normal.z) * dt };
@@ -4216,8 +4219,9 @@ static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool 
 
     const float unitResponse = rigidRefCount * raXn_resp.w + massSplit;
     const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-    float dLN = -CN * invDenom;
-    if (dLN < -r.accum) dLN = -r.accum;
+    // P9.86c: selectMax, second operand on a tie (deformableUtils.cuh:374).
+    const float dLNa = -CN * invDenom, dLNb = -r.accum;
+    const float dLN = (dLNa > dLNb) ? dLNa : dLNb;
     r.deltaLambdaN = dLN;
     r.accum += dLN;
 
@@ -4247,7 +4251,8 @@ static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool 
         const float dLT0 = CT0 * invT0;
         const float dLT1 = CT1 * invT1;
         const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
-        const float lim = combinedFriction * ((dLN < 0.f) ? -dLN : dLN);
+        // PxAbs = fabsf (PxMath.h:112, PxUnixMathIntrinsics.h:57): +0 for -0.
+        const float lim = combinedFriction * std::fabs(dLN);
         r.frictionBound = (lim < dLT);
         r.dLTraw = dLT; r.dLTlimit = lim;
         r.deltaLambdaT = -((dLT < lim) ? dLT : lim);
