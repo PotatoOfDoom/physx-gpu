@@ -32,10 +32,18 @@
 // against a C++ reference replicating applyAcceleration, including the
 // PxMat33::getInverse() angular transform.  Remap targets are spaced so slots
 // never alias; skipped bodies must leave their slots untouched.
+// PXG_TEST solverApplyGravityTGS_applySingularInertiaZeroSign (P9.86c) adds a directed
+// bitwise case: singular sqrt-inverse-inertia (zero inverse-inertia axis, axis-aligned
+// orientation) takes getInverse()'s PxMat33(PxIdentity) path, whose product keeps its
+// computed-zero terms and turns a -0 acceleration lane into +0.
 
 #include "pxgTestFramework.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -54,6 +62,13 @@ struct Mat33 { F4 col0, col1, col2; };
 
 const uint32_t INVALID = 0xffffffffu;
 const uint32_t LOCK_LIN_X = 1, LOCK_LIN_Y = 2, LOCK_LIN_Z = 4, LOCK_ANG_X = 8, LOCK_ANG_Y = 16, LOCK_ANG_Z = 32;
+
+uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// Mutant twin of the singular branch: 1 = the old port shortcut "return v" (drops the
+// computed-zero terms of PxMat33(PxIdentity) * v).  0 = the CUDA semantics.
+int gIdentityMulVariant = 0;
+uint32_t gSingularCalls = 0; // coverage: singular (identity) branch taken
 
 uint32_t nextPow2(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
 
@@ -76,7 +91,19 @@ void invInertiaMul(const Mat33& m, float vx, float vy, float vz, float& ox, floa
         oy = i0y * vx + i1y * vy + i2y * vz;
         oz = i0z * vx + i1z * vy + i2z * vz;
     }
-    else { ox = vx; oy = vy; oz = vz; }
+    else
+    {
+        ++gSingularCalls;
+        if (gIdentityMulVariant == 1) { ox = vx; oy = vy; oz = vz; }
+        else
+        {
+            // PxMat33(PxIdentity) (PxMat33.h:240) * v = col0*v.x + col1*v.y + col2*v.z (transform,
+            // PxMat33.h:346): the zero terms are kept, so (-0) + 0*(+x) = +0.
+            ox = (1.f * vx + 0.f * vy) + 0.f * vz;
+            oy = (0.f * vx + 1.f * vy) + 0.f * vz;
+            oz = (0.f * vx + 0.f * vy) + 1.f * vz;
+        }
+    }
 }
 
 void applyAccelRef(std::vector<F4>& buf, uint32_t bodyIndex, float gx, float gy, float gz, float stepDt,
@@ -207,6 +234,127 @@ PXG_TEST(solverApplyGravityTGS_apply)
             ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "applyTGSSubstepGravity: %zu mismatches", mm);
+
+    for (PxgBufferHandle h : { bRefs, bBody, bNode, bSim, bInertia }) dev->destroyBuffer(h);
+}
+
+// P9.86c: singular sqrt-inverse-inertia -> getInverse() returns PxMat33(PxIdentity)
+// (solverMultiBlockTGS.cu:1592, PxMat33.h:240/:346).  Lane i of the identity product is
+// (1*v_i + 0*v_j) + 0*v_k, so a -0 lane next to a +0/positive lane becomes +0.  Three bodies
+// with one zero inverse-inertia axis at a 180-degree orientation and a direct-GPU-API torque
+// (setRigidDynamicTorque, updateBodiesAndShapes.cu:1269-1276) carry a -0 angular-acceleration
+// lane; their momocity lane is -0 (sqrtInertia * angVel of the same body).  The CUDA stores
+// -0 + (+0*dt) = +0; the old port shortcut stores -0.  Compared BITWISE.
+PXG_TEST(solverApplyGravityTGS_applySingularInertiaZeroSign)
+{
+    const uint32_t numSlabs = 2, allBodiesCount = 4, bodyOffset = 1, outputOffset = 64;
+    const uint32_t numThreadsPerBody = std::min(nextPow2(numSlabs), 32u); // 2
+    const uint32_t bodyVelElems = 80;
+    const float gx = 0.f, gy = -9.81f, gz = 0.3f, stepDt = 0.016f;
+    const float s5 = std::sqrt(5.f);
+
+    const std::vector<uint32_t> nodeIndex = { 3, 2, 1, 0 };
+    std::vector<BodySimInput> sim(allBodiesCount);
+    std::vector<Mat33> inertia(allBodiesCount);
+    // body 0: below bodyOffset, skipped
+    inertia[0] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+    sim[nodeIndex[0]] = BodySimInput{ 0u, 0u, 1.f, 0u, { 1, 1, 1, 0 }, { 1, 1, 1, 0 } };
+    const uint32_t lockLin = LOCK_LIN_X | LOCK_LIN_Y | LOCK_LIN_Z; // no angular lock
+    // A: invInertia (0,0,5), q = (0,0,-1,0), torque (-1,0,-1), angVel (-1,0,-1)
+    inertia[1] = { { 0.f, -0.f, 0.f, 0 }, { -0.f, 0.f, -0.f, 0 }, { 0.f, -0.f, s5, 0 } };
+    sim[nodeIndex[1]] = BodySimInput{ 1u, lockLin, 1.f, 0u, { 0, 0, 0, 0 }, { -0.f, 0.f, -5.f, 0 } };
+    // B: invInertia (5,0,0), q = (-1,0,0,0), torque (-1,-1,+0), angVel (-1,-1,0)
+    inertia[2] = { { s5, 0.f, -0.f, 0 }, { 0.f, 0.f, -0.f, 0 }, { -0.f, -0.f, 0.f, 0 } };
+    sim[nodeIndex[2]] = BodySimInput{ 1u, lockLin, 1.f, 0u, { 0, 0, 0, 0 }, { -5.f, -0.f, 0.f, 0 } };
+    // C: invInertia (0,5,0), q = (0,-1,0,0), torque (1,-1,-1), angVel (1,-1,-1)
+    inertia[3] = { { 0.f, -0.f, -0.f, 0 }, { -0.f, s5, 0.f, 0 }, { -0.f, 0.f, 0.f, 0 } };
+    sim[nodeIndex[3]] = BodySimInput{ 1u, lockLin, 1.f, 0u, { 0, 0, 0, 0 }, { 0.f, -5.f, -0.f, 0 } };
+
+    const std::vector<uint32_t> refs = { 0, 4, 8, 12, 16, 20 };
+    std::vector<F4> init(bodyVelElems);
+    for (uint32_t e = 0; e < bodyVelElems; ++e) init[e] = { 100.f + e, 200.f + e, 300.f + e, 400.f + e };
+    // body 1 (A): linear 0,4,65 (w = -0); angular 32,36,69
+    for (uint32_t e : { 0u, 4u, 65u }) init[e] = { 0.f, 0.f, 0.f, -0.f };
+    for (uint32_t e : { 32u, 36u, 69u }) init[e] = { 0.f, 0.f, 0.25f, -0.5f };
+    // body 2 (B): linear 8,12,66; angular 40,44,70 (x = -0)
+    for (uint32_t e : { 8u, 12u, 66u }) init[e] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint32_t e : { 40u, 44u, 70u }) init[e] = { -0.f, 0.f, 0.25f, -0.5f };
+    // body 3 (C): linear 16,20,67; angular 48,52,71 (y = -0)
+    for (uint32_t e : { 16u, 20u, 67u }) init[e] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint32_t e : { 48u, 52u, 71u }) init[e] = { 0.f, -0.f, 0.25f, -0.5f };
+
+    auto runRef = [&](int variant) {
+        std::vector<F4> buf = init;
+        gIdentityMulVariant = variant;
+        gSingularCalls = 0;
+        for (uint32_t bodyId = bodyOffset; bodyId < allBodiesCount; ++bodyId)
+        {
+            const BodySimInput& s = sim[nodeIndex[bodyId]];
+            const bool hasLin = s.linAccel.x != 0.f || s.linAccel.y != 0.f || s.linAccel.z != 0.f;
+            const bool hasAng = s.angAccel.x != 0.f || s.angAccel.y != 0.f || s.angAccel.z != 0.f;
+            if (s.disableGravity == 0u || hasLin || hasAng)
+            {
+                const float agx = stepDt * gx, agy = stepDt * gy, agz = stepDt * gz;
+                for (uint32_t b = 0; b < numSlabs; ++b)
+                {
+                    const uint32_t r = refs[numSlabs * (bodyId - bodyOffset) + b];
+                    if (r != INVALID)
+                        applyAccelRef(buf, r, agx, agy, agz, stepDt, s.linAccel, s.angAccel, hasAng,
+                                      s.accelScale, s.lockFlags, inertia[bodyId], 32);
+                }
+                applyAccelRef(buf, outputOffset + bodyId, agx, agy, agz, stepDt, s.linAccel, s.angAccel, hasAng,
+                              s.accelScale, s.lockFlags, inertia[bodyId], allBodiesCount);
+            }
+        }
+        gIdentityMulVariant = 0;
+        return buf;
+    };
+    const std::vector<F4> want = runRef(0);
+    const uint32_t singular = gSingularCalls;
+    const std::vector<F4> twin = runRef(1);
+    gSingularCalls = 0;
+
+    PXG_CHECK_MSG(singular == 9, "singular identity branch taken %u times, expected 9", singular);
+    uint32_t zsA = 0, zsB = 0, zsC = 0, diffLanes = 0;
+    for (uint32_t e : { 0u, 4u, 65u }) zsA += (f2u(want[e].w) == 0u && f2u(twin[e].w) == 0x80000000u);
+    for (uint32_t e : { 40u, 44u, 70u }) zsB += (f2u(want[e].x) == 0u && f2u(twin[e].x) == 0x80000000u);
+    for (uint32_t e : { 48u, 52u, 71u }) zsC += (f2u(want[e].y) == 0u && f2u(twin[e].y) == 0x80000000u);
+    for (uint32_t e = 0; e < bodyVelElems; ++e)
+    {
+        const float* a = &want[e].x; const float* b = &twin[e].x;
+        for (int l = 0; l < 4; ++l) diffLanes += f2u(a[l]) != f2u(b[l]);
+    }
+    PXG_CHECK_MSG(zsA == 3 && zsB == 3 && zsC == 3,
+                  "mutant twin (identity shortcut) no longer changes lanes A.w/B.x/C.y (%u/%u/%u of 3) -- the case does not observe it",
+                  zsA, zsB, zsC);
+    PXG_CHECK_MSG(diffLanes == 9, "mutant twin differs in %u lanes, expected 9", diffLanes);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bRefs = createBufferFrom(dev, refs);
+    PxgBufferHandle bBody = createBufferFrom(dev, init);
+    PxgBufferHandle bNode = createBufferFrom(dev, nodeIndex);
+    PxgBufferHandle bSim = createBufferFrom(dev, sim);
+    PxgBufferHandle bInertia = createBufferFrom(dev, inertia);
+
+    Kernel k("solverApplyGravityTGS.spv", "applyTGSSubstepGravity", { 4, 16, 4, 48, 48 }, sizeof(GravityParams));
+    GravityParams p = { numSlabs, allBodiesCount, bodyOffset, outputOffset, numThreadsPerBody, gx, gy, gz, stepDt };
+    k.dispatch(1, { bRefs, bBody, bNode, bSim, bInertia }, p);
+    dev->flush();
+
+    const auto got = downloadBuffer<F4>(dev, bBody, bodyVelElems);
+    uint32_t mm = 0;
+    for (uint32_t e = 0; e < bodyVelElems; ++e)
+    {
+        const float* a = &got[e].x; const float* r = &want[e].x;
+        for (int l = 0; l < 4; ++l)
+            if (f2u(a[l]) != f2u(r[l]))
+            {
+                if (mm == 0)
+                    std::printf("  first mismatch: elem %u lane %d got 0x%08x want 0x%08x\n", e, l, f2u(a[l]), f2u(r[l]));
+                ++mm;
+            }
+    }
+    PXG_CHECK_MSG(mm == 0, "applyTGSSubstepGravity singular zero-sign: %u bitwise lane mismatches", mm);
 
     for (PxgBufferHandle h : { bRefs, bBody, bNode, bSim, bInertia }) dev->destroyBuffer(h);
 }
