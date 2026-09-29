@@ -140,7 +140,19 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     npTriTriTail
     # P9.83b-8: the mesh-mesh kernel itself, stamped like every fixture that
     # certifies one of its modules (the promise npTriTriGeom's entry made above).
-    triTriCollisionBda)
+    triTriCollisionBda
+    # P9.89: the particle contact generators.  llvmpipe (Mesa lower_fdot) evaluates an
+    # UNDECORATED OpDot as x + (y + z) and a decorated one as (x + y) + z -- measured,
+    # 0/65536 misses each way.  Every float dot in this .spv transcribes a PxVec3
+    # dot/magnitudeSquared, `x*v.x + y*v.y + z*v.z` = (x + y) + z (PxVec3.h:173/:274),
+    # or the three-lane shuffle sum shfl0 + shfl1 + shfl2 of cudaParticleSystem.cu:964
+    # and :1117.  Unstamped, the plane/box/sphere/capsule distances, getSpecVolume's
+    # magnitude and both convex penetrations came out re-associated.  The importers of
+    # the same pxgSlangGjk/Epa/TetCollide modules on the softbody path were already
+    # stamped.  testPsContactGen / testPsDiffuseContactGen / testPsConvexContactGen
+    # (the p89 cases) compare against -ffp-contract=off mirrors in the CUDA order and
+    # fail without this entry.
+    psContactGenBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

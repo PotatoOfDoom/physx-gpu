@@ -964,6 +964,736 @@ static void runCapsuleNaNContact(bool isTGS)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P9.89 -- THE ORDER OF EVERY THREE-TERM SUM IN THE PRIMITIVE CONTACT CORE.
+//
+// PxVec3::dot and ::magnitudeSquared are `x*v.x + y*v.y + z*v.z` (PxVec3.h:173,
+// :274).  C++ evaluates that as (x + y) + z, and each product is rounded on its
+// own (the P9.54 reading of the CUDA as IEEE C++; this file builds with
+// -ffp-contract=off).  The port spells every one of them `dot(a, b)`, and SPIR-V
+// leaves OpDot's summation order to the driver.  llvmpipe (Mesa's lower_fdot)
+// evaluates an UNDECORATED OpDot as x + (y + z) and a NoContraction-decorated one
+// as (x + y) + z.  Both were measured on 65536 random cases with 0 misses.
+// psContactGenBda was unstamped until P9.89, so every plane, sphere, capsule
+// and box distance, and the speculative contact-volume radius, came out
+// re-associated.  None of the batteries above could see it.  Their plane normal
+// is (-2^-24, ~1, 0) and their particles sit at x = z = 0, so at most one
+// product is ever non-zero.
+//
+// This battery is built so that each of the ten dot() sites of the primitive
+// core, taken ALONE in the old order, changes at least one compared bit.  The
+// twin is run to show it:
+//   * rotated planes, spheres, capsules and boxes with non-round transforms, and
+//     particles whose offsets to them have three non-zero components;
+//   * a CCD-off system, where the plane distance at cVolumePos IS the stored
+//     value, and a CCD-on system, where the stored value comes from particlePos
+//     and getSpecVolume's radius only gates;
+//   * two PLANTED knife edges for the two sites that only gate.  The first is a
+//     CCD particle whose plane distance sits between the two possible
+//     contact-volume radii (gridCal.cuh:139).  The second is a box whose contact
+//     distance makes maxDist^2 sit between the two possible squared corner
+//     distances (particleCollision.cuh:56);
+//   * one plane offset and one capsule axis whose own dot differs between the two
+//     orders, because those two sites are one number per shape, not per particle.
+// The DIFFUSE twin (ps_primitivesDiffuseCollisionLaunch) runs the same
+// particlePrimitiveCollision on the same rig, with isDiffuse = true, and is
+// compared per particle as well.
+// ===========================================================================
+namespace p89
+{
+static const float PX_MAX = 3.4028235e38f;
+static const float EPS_REAL = 1.192092896e-07f;
+
+// One bit per dot() site of psContactGenBda.slang's primitive core.  A set bit
+// evaluates that site in the pre-P9.89 port's order, x + (y + z).
+enum : uint32_t
+{
+    S_SPEC = 1u << 0,      // :314 sqrt(dot(off, off))  gridCal.cuh:139 cVolumeOffset.magnitude()
+    S_CAP_NOM = 1u << 1,   // :369 dot(ap, ab)          sphereCollision.cuh:97 ap.dot(ab)
+    S_CAP_DEN = 1u << 2,   // :370 dot(ab, ab)          sphereCollision.cuh:98 ab.dot(ab)
+    S_CAP_VV = 1u << 3,    // :383 dot(v, v)            sphereCollision.cuh:103 v.dot(v)
+    S_BOX_GATE = 1u << 4,  // :395 dot(dv, dv)          particleCollision.cuh:56 magnitudeSquared()
+    S_BOX_MAG = 1u << 5,   // :421 dot(n, n)            particleCollision.cuh:92 normalizeFast()
+    S_SPH = 1u << 6,       // :433 dot(rel, rel)        particleCollision.cuh:107 magnitudeSquared()
+    S_PL_P = 1u << 7,      // :484 dot(pn, shapeP)      PxPlane.h:137 `d - p.dot(n)` (cudaParticleSystem.cu:285)
+    S_PL_CV = 1u << 8,     // :486 dot(pn, cVolumePos)  cudaParticleSystem.cu:286 plane.distance()
+    S_PL_PP = 1u << 9,     // :490 dot(pn, particlePos) cudaParticleSystem.cu:294 plane.distance()
+    NB_SITES = 10u,
+    S_ALL = (1u << NB_SITES) - 1u
+};
+static const char* const SITE_NAME[NB_SITES] = {
+    "getSpecVolume :314", "capsule nom :369", "capsule denom :370", "capsule v.v :383",
+    "box gate :395", "box magnitude :421", "sphere :433", "plane offset :484",
+    "plane dist(cVolumePos) :486", "plane dist(particlePos) :490" };
+
+struct V { float x, y, z; };
+static V vsub(V a, V b) { return V{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V vadd(V a, V b) { return V{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V vmul(V a, float s) { return V{ a.x * s, a.y * s, a.z * s }; }
+
+// THE site under test.  CUDA: PxVec3::dot, (x + y) + z.  Old port: x + (y + z).
+static float dotO(uint32_t oldMask, uint32_t site, V a, V b)
+{
+    const float x = a.x * b.x, y = a.y * b.y, z = a.z * b.z;
+    return (oldMask & site) ? (x + (y + z)) : ((x + y) + z);
+}
+
+static V qRot(const float q[4], V v)
+{
+    const float in[3] = { v.x, v.y, v.z };
+    float o[3];
+    cpuQuatRotate(q, in, o);
+    return V{ o[0], o[1], o[2] };
+}
+// PxQuat::rotateInv (PxQuat.h:324) == psContactGenBda's quatRotateInv.
+static V qRotInv(const float q[4], V v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    return V{ (vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2),
+              (vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2),
+              (vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2) };
+}
+// PxQuat::getBasisVector0 (PxQuat.h:260).
+static V basis0(const float q[4])
+{
+    const float x2 = q[0] * 2.0f, w2 = q[3] * 2.0f;
+    return V{ (q[3] * w2) - 1.0f + q[0] * x2, (q[2] * w2) + q[1] * x2, (-q[1] * w2) + q[2] * x2 };
+}
+
+// gridCal.cuh:122-140 with isDiffuse selecting the scale first.
+static float specVolume(uint32_t om, V& cvp, V cur, V pred, float contactDist, bool isDiffuse, bool isTGS)
+{
+    const float scaleInv = isDiffuse ? (1.0f / 1.0f) : (isTGS ? (1.0f / 0.5f) : (1.0f / 1.0f));
+    const V off = V{ (pred.x - cur.x) * scaleInv * 0.5f, (pred.y - cur.y) * scaleInv * 0.5f,
+                     (pred.z - cur.z) * scaleInv * 0.5f };
+    cvp = vadd(cur, off);
+    return std::sqrt(dotO(om, S_SPEC, off, off)) + contactDist;
+}
+
+// particleCollision.cuh:101-121.
+static bool sphereC(uint32_t om, V point, V c, float radius, float maxDist, V& n, float& d)
+{
+    const V rel = vsub(point, c);
+    const float dsq = dotO(om, S_SPH, rel, rel);
+    if (maxDist < PX_MAX)
+    {
+        const float m = maxDist + radius;
+        if (dsq > m * m) return false;
+    }
+    const float dc = std::sqrt(dsq);
+    n = (dc > EPS_REAL) ? vmul(rel, 1.0f / dc) : V{ 1.0f, 0.0f, 0.0f };
+    d = dc - radius;
+    return true;
+}
+
+// sphereCollision.cuh:91-104 + particleCollision.cuh:128-150.
+static bool capsuleC(uint32_t om, V point, V c, V dir, float radius, float hh, float maxDist, V& n, float& d)
+{
+    const V axis = vmul(dir, hh);
+    const V rel = vsub(point, c);
+    const V a = V{ -axis.x, -axis.y, -axis.z };
+    const V ap = vsub(rel, a), ab = vsub(axis, a);
+    const float nom = dotO(om, S_CAP_NOM, ap, ab);
+    const float den = dotO(om, S_CAP_DEN, ab, ab);
+    const float q = nom / den;
+    const float lo = (0.0f > q) ? 0.0f : q;          // PxClamp = PxMin(1, PxMax(0, .)), float selects
+    const float tv = (1.0f < lo) ? 1.0f : lo;
+    const float t = den > 0.0f ? tv : 0.0f;
+    const V v = vsub(ap, vmul(ab, t));
+    const float dsq = dotO(om, S_CAP_VV, v, v);
+    if (maxDist < PX_MAX)
+    {
+        const float m = maxDist + radius;
+        if (dsq > m * m) return false;
+    }
+    const V dsv = vsub(rel, vmul(axis, 2.0f * t - 1.0f));
+    const float ds = std::sqrt(dsq);
+    n = (ds > EPS_REAL) ? vmul(dsv, 1.0f / ds) : V{ 1.0f, 0.0f, 0.0f };
+    d = ds - radius;
+    return true;
+}
+
+static float clampF(float x, float lo, float hi) { return std::min(std::max(x, lo), hi); }
+
+// particleCollision.cuh:42-95.
+static bool boxC(uint32_t om, V point, V bp, const float q[4], V h, float maxDist, V& n, float& d)
+{
+    const V rel = qRotInv(q, vsub(point, bp));
+    const V cl = V{ clampF(rel.x, -h.x, h.x), clampF(rel.y, -h.y, h.y), clampF(rel.z, -h.z, h.z) };
+    if (maxDist < PX_MAX)
+    {
+        const float m = maxDist * maxDist;
+        const V dv = vsub(rel, cl);
+        if (dotO(om, S_BOX_GATE, dv, dv) > m) return false;
+    }
+    const bool inside = h.x >= std::fabs(rel.x) && h.y >= std::fabs(rel.y) && h.z >= std::fabs(rel.z);
+    V nn;
+    float dd;
+    if (inside)
+    {
+        const V ds = V{ h.x - std::fabs(cl.x), h.y - std::fabs(cl.y), h.z - std::fabs(cl.z) };
+        nn = cl.z >= 0.0f ? V{ 0, 0, 1 } : V{ 0, 0, -1 };
+        dd = -ds.z;
+        if (ds.x <= ds.y && ds.x <= ds.z) { nn = cl.x >= 0.0f ? V{ 1, 0, 0 } : V{ -1, 0, 0 }; dd = -ds.x; }
+        else if (ds.y <= ds.z) { nn = cl.y >= 0.0f ? V{ 0, 1, 0 } : V{ 0, -1, 0 }; dd = -ds.y; }
+    }
+    else
+    {
+        nn = vsub(rel, cl);
+        const float mag = std::sqrt(dotO(om, S_BOX_MAG, nn, nn));
+        nn = vmul(nn, 1.0f / mag);
+        dd = mag;
+    }
+    n = qRot(q, nn);
+    d = dd;
+    return true;
+}
+
+// PxGeometryType: eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3.
+struct Shape { uint32_t type; float q[4]; V p; V scale; float cd; };
+
+// particlePrimitiveCollision (cudaParticleSystem.cu:268-376).
+static bool collide(uint32_t om, V pp, V cvp, float r, const Shape& s, bool ccd, V& n, float& d)
+{
+    switch (s.type)
+    {
+    case 1u:
+    {
+        const V pn = qRot(s.q, V{ 1.0f, 0.0f, 0.0f });
+        const float pdd = 0.0f - dotO(om, S_PL_P, pn, s.p);       // PxPlane::transform, d = 0
+        float dist = dotO(om, S_PL_CV, pn, cvp) + pdd;
+        if (!(dist <= r)) return false;
+        if (ccd) dist = dotO(om, S_PL_PP, pn, pp) + pdd;
+        n = pn;
+        d = dist;
+        return true;
+    }
+    case 0u:
+    {
+        if (!sphereC(om, cvp, s.p, s.scale.x, r, n, d)) return false;
+        if (ccd) sphereC(om, pp, s.p, s.scale.x, PX_MAX, n, d);
+        return true;
+    }
+    case 2u:
+    {
+        const V dir = basis0(s.q);
+        if (!capsuleC(om, cvp, s.p, dir, s.scale.y, s.scale.x, r, n, d)) return false;
+        if (ccd) capsuleC(om, pp, s.p, dir, s.scale.y, s.scale.x, PX_MAX, n, d);
+        return true;
+    }
+    case 3u:
+    {
+        if (!boxC(om, cvp, s.p, s.q, s.scale, r, n, d)) return false;
+        if (ccd) boxC(om, pp, s.p, s.q, s.scale, PX_MAX, n, d);
+        return true;
+    }
+    default: return false;
+    }
+}
+
+struct Rng
+{
+    uint64_t s;
+    float u() { s = s * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(s >> 40)) / 16777216.0f; }
+    float r(float a, float b) { return a + (b - a) * u(); }
+    // a unit direction whose three components are all at least 0.2 in magnitude
+    V dir()
+    {
+        for (;;)
+        {
+            const V v = V{ r(-1.0f, 1.0f), r(-1.0f, 1.0f), r(-1.0f, 1.0f) };
+            const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+            if (m < 0.3f) continue;
+            const V n = vmul(v, 1.0f / m);
+            if (std::fabs(n.x) > 0.2f && std::fabs(n.y) > 0.2f && std::fabs(n.z) > 0.2f) return n;
+        }
+    }
+    void quat(float q[4])
+    {
+        const V a = dir();
+        const float ang = r(0.4f, 2.6f);
+        const float s = std::sin(0.5f * ang), c = std::cos(0.5f * ang);
+        const float m = std::sqrt(a.x * a.x * s * s + a.y * a.y * s * s + a.z * a.z * s * s + c * c);
+        q[0] = a.x * s / m; q[1] = a.y * s / m; q[2] = a.z * s / m; q[3] = c / m;
+    }
+};
+
+static const uint32_t NB_SYS = 2u;          // system 0: CCD off; system 1: CCD on
+static const uint32_t NB_RIGID = 8u;
+static const uint32_t NB_PART = 160u;
+static const uint32_t NODE_BASE = 300u;
+static const float SYS_CD[NB_SYS] = { 0.2113f, 0.1837f };
+static const uint32_t K_SPEC_PARTICLE = 0u;   // system 1, planted against rigid 0
+static const uint32_t K_BOX_PARTICLE = 6u;    // system 0, planted against rigid 6
+
+struct Rig
+{
+    Shape shape[NB_RIGID];
+    V cur[NB_SYS][NB_PART], pred[NB_SYS][NB_PART];
+    float rest[NB_SYS * NB_RIGID];
+};
+
+static void placeNear(Rng& g, const Shape& s, V& p)
+{
+    switch (s.type)
+    {
+    case 1u:
+    {
+        const V pn = qRot(s.q, V{ 1.0f, 0.0f, 0.0f });
+        // two tangents: pn x e_z and pn x (pn x e_z), unnormalised is fine for placement
+        const V t1 = V{ pn.y, -pn.x, 0.0f };
+        const V t2 = V{ pn.x * pn.z, pn.y * pn.z, -(pn.x * pn.x + pn.y * pn.y) };
+        p = vadd(vadd(s.p, vadd(vmul(t1, g.r(-1.2f, 1.2f)), vmul(t2, g.r(-1.2f, 1.2f)))),
+                 vmul(pn, g.r(-0.2f, 0.33f)));
+        return;
+    }
+    case 0u:
+        p = vadd(s.p, vmul(g.dir(), s.scale.x + g.r(-0.15f, 0.3f)));
+        return;
+    case 2u:
+    {
+        const V ax = basis0(s.q);
+        const V rd = g.dir();
+        V perp = V{ ax.y * rd.z - ax.z * rd.y, ax.z * rd.x - ax.x * rd.z, ax.x * rd.y - ax.y * rd.x };
+        const float m = std::sqrt(perp.x * perp.x + perp.y * perp.y + perp.z * perp.z);
+        perp = vmul(perp, 1.0f / m);
+        p = vadd(vadd(s.p, vmul(ax, s.scale.x * g.r(-1.3f, 1.3f))), vmul(perp, s.scale.y + g.r(-0.12f, 0.3f)));
+        return;
+    }
+    default:
+    {
+        const V l = V{ (g.u() < 0.5f ? -1.0f : 1.0f) * (s.scale.x + g.r(-0.15f, 0.2f)),
+                       (g.u() < 0.5f ? -1.0f : 1.0f) * (s.scale.y + g.r(-0.15f, 0.2f)),
+                       (g.u() < 0.5f ? -1.0f : 1.0f) * (s.scale.z + g.r(-0.15f, 0.2f)) };
+        p = vadd(s.p, qRot(s.q, l));
+        return;
+    }
+    }
+}
+
+static float nextUp(float x, int k)
+{
+    float y = x;
+    for (int i = 0; i < k; ++i) y = std::nextafter(y, PX_MAX);
+    for (int i = 0; i > k; --i) y = std::nextafter(y, -PX_MAX);
+    return y;
+}
+
+// Builds the rig for one isTGS mode.  Returns false (and says why) if a planted
+// knife edge could not be found -- the fixture then fails rather than silently
+// testing less.
+static bool buildRig(Rig& R, bool isTGS)
+{
+    Rng g{ 0x5eed89u };
+    // ---- rigid 0: plane through the origin, normal ~+y tilted off every axis ----
+    for (;;)
+    {
+        g.quat(R.shape[0].q);
+        const V pn = qRot(R.shape[0].q, V{ 1, 0, 0 });
+        if (pn.y > 0.75f && std::fabs(pn.x) > 0.2f && std::fabs(pn.z) > 0.2f) break;
+    }
+    R.shape[0].type = 1u; R.shape[0].p = V{ 0.0f, 0.0f, 0.0f }; R.shape[0].scale = V{ 1, 1, 1 };
+    // ---- rigid 1: plane with normal ~+x through an off-axis point whose p.dot(n)
+    //      differs between the two orders (S_PL_P is ONE number per plane) ----
+    for (;;)
+    {
+        g.quat(R.shape[1].q);
+        const V pn = qRot(R.shape[1].q, V{ 1, 0, 0 });
+        if (!(pn.x > 0.75f && std::fabs(pn.y) > 0.2f && std::fabs(pn.z) > 0.2f)) continue;
+        R.shape[1].p = V{ g.r(-3.3f, -2.9f), g.r(0.2f, 0.6f), g.r(0.3f, 0.7f) };
+        if (dotO(0u, S_PL_P, pn, R.shape[1].p) != dotO(S_PL_P, S_PL_P, pn, R.shape[1].p)) break;
+    }
+    R.shape[1].type = 1u; R.shape[1].scale = V{ 1, 1, 1 };
+    // ---- spheres ----
+    R.shape[2] = Shape{ 0u, { 0, 0, 0, 1 }, V{ -1.31f, 1.62f, 0.43f }, V{ 0.4137f, 0.0f, 0.0f }, 0.0f };
+    R.shape[3] = Shape{ 0u, { 0, 0, 0, 1 }, V{ 0.93f, 1.91f, -0.71f }, V{ 0.2671f, 0.0f, 0.0f }, 0.0f };
+    // ---- capsules (scale.x = half height, scale.y = radius); capsule 4's |ab|^2
+    //      differs between the orders (S_CAP_DEN is ONE number per capsule) ----
+    R.shape[4] = Shape{ 2u, { 0, 0, 0, 1 }, V{ 2.13f, 1.73f, 0.31f }, V{ 0.5311f, 0.2219f, 0.0f }, 0.0f };
+    for (;;)
+    {
+        g.quat(R.shape[4].q);
+        const V ax = vmul(basis0(R.shape[4].q), R.shape[4].scale.x);
+        const V ab = vsub(ax, V{ -ax.x, -ax.y, -ax.z });
+        if (dotO(0u, S_CAP_DEN, ab, ab) != dotO(S_CAP_DEN, S_CAP_DEN, ab, ab)) break;
+    }
+    R.shape[5] = Shape{ 2u, { 0, 0, 0, 1 }, V{ -0.42f, 2.31f, -1.23f }, V{ 0.7723f, 0.1543f, 0.0f }, 0.0f };
+    g.quat(R.shape[5].q);
+    // ---- boxes (scale = half extents) ----
+    R.shape[6] = Shape{ 3u, { 0, 0, 0, 1 }, V{ 1.21f, 1.43f, 1.52f }, V{ 0.4317f, 0.2861f, 0.3593f }, 0.0f };
+    g.quat(R.shape[6].q);
+    R.shape[7] = Shape{ 3u, { 0, 0, 0, 1 }, V{ -2.23f, 1.52f, -0.91f }, V{ 0.6121f, 0.3347f, 0.2518f }, 0.0f };
+    g.quat(R.shape[7].q);
+    for (uint32_t j = 0; j < NB_RIGID; ++j) R.shape[j].cd = 0.0071f + 0.0123f * float(j);
+    for (uint32_t k = 0; k < NB_SYS * NB_RIGID; ++k) R.rest[k] = 0.0013f + 0.0021f * float(k);
+
+    // ---- particles: particle i of either system sits near rigid i % NB_RIGID ----
+    for (uint32_t s = 0; s < NB_SYS; ++s)
+        for (uint32_t i = 0; i < NB_PART; ++i)
+        {
+            placeNear(g, R.shape[i % NB_RIGID], R.cur[s][i]);
+            R.pred[s][i] = (s == 1u) ? vadd(R.cur[s][i], vmul(g.dir(), g.r(0.04f, 0.3f))) : R.cur[s][i];
+        }
+
+    // ---- K_BOX: a system-0 particle in a corner region of box 6 whose |dv|^2
+    //      differs between the orders, and box 6's contact distance chosen so
+    //      maxDist^2 = (SYS_CD[0] + cd)^2 falls between the two values ----
+    {
+        const Shape& b = R.shape[6];
+        bool found = false;
+        for (int trial = 0; trial < 20000 && !found; ++trial)
+        {
+            const V l = V{ (g.u() < 0.5f ? -1.0f : 1.0f) * (b.scale.x + g.r(0.13f, 0.2f)),
+                           (g.u() < 0.5f ? -1.0f : 1.0f) * (b.scale.y + g.r(0.13f, 0.2f)),
+                           (g.u() < 0.5f ? -1.0f : 1.0f) * (b.scale.z + g.r(0.13f, 0.2f)) };
+            const V p = vadd(b.p, qRot(b.q, l));
+            const V rel = qRotInv(b.q, vsub(p, b.p));
+            const V cl = V{ clampF(rel.x, -b.scale.x, b.scale.x), clampF(rel.y, -b.scale.y, b.scale.y),
+                            clampF(rel.z, -b.scale.z, b.scale.z) };
+            const V dv = vsub(rel, cl);
+            if (dv.x == 0.0f || dv.y == 0.0f || dv.z == 0.0f) continue;
+            const float dF = dotO(0u, S_BOX_GATE, dv, dv), dR = dotO(S_BOX_GATE, S_BOX_GATE, dv, dv);
+            if (dF == dR) continue;
+            const float lo = std::min(dF, dR), hi = std::max(dF, dR);
+            const float base = float(std::sqrt(double(lo)) - double(SYS_CD[0]));
+            for (int k = -64; k <= 64 && !found; ++k)
+            {
+                const float c = nextUp(base, k);
+                if (!(c > 0.0f)) continue;
+                const float md = SYS_CD[0] + c;
+                const float m2 = md * md;
+                if (m2 >= lo && m2 < hi)
+                {
+                    R.shape[6].cd = c;
+                    R.cur[0][K_BOX_PARTICLE] = p;
+                    R.pred[0][K_BOX_PARTICLE] = p;
+                    found = true;
+                }
+            }
+        }
+        if (!found) { std::printf("    p89: no K_BOX knife edge found\n"); return false; }
+    }
+
+    // ---- K_SPEC: a system-1 (CCD) particle whose plane-0 distance at cVolumePos
+    //      sits between the two possible contact-volume radii ----
+    {
+        const V pn = qRot(R.shape[0].q, V{ 1, 0, 0 });
+        const float cd = SYS_CD[1] + R.shape[0].cd;
+        bool found = false;
+        for (int trial = 0; trial < 20000 && !found; ++trial)
+        {
+            const V D = vmul(g.dir(), g.r(0.08f, 0.25f));
+            V c = V{ g.r(-0.5f, 0.5f), g.r(-0.5f, 0.5f), g.r(-0.5f, 0.5f) };
+            V cvp;
+            float rF = specVolume(0u, cvp, c, vadd(c, D), cd, false, isTGS);
+            // move c along the normal so the distance lands near the radius
+            const float dist0 = dotO(0u, S_PL_CV, pn, cvp);
+            c = vadd(c, vmul(pn, rF - dist0));
+            for (int k = -400; k <= 400 && !found; ++k)
+            {
+                V ck = c;
+                ck.y = nextUp(c.y, k);
+                const V pk = vadd(ck, D);
+                V cv;
+                rF = specVolume(0u, cv, ck, pk, cd, false, isTGS);
+                const float rR = specVolume(S_SPEC, cv, ck, pk, cd, false, isTGS);
+                const float dist = dotO(0u, S_PL_CV, pn, cv) + (0.0f - dotO(0u, S_PL_P, pn, R.shape[0].p));
+                if ((dist <= rF) != (dist <= rR))
+                {
+                    R.cur[1][K_SPEC_PARTICLE] = ck;
+                    R.pred[1][K_SPEC_PARTICLE] = pk;
+                    found = true;
+                }
+            }
+        }
+        if (!found) { std::printf("    p89: no K_SPEC knife edge found\n"); return false; }
+    }
+    return true;
+}
+
+struct Hit { uint32_t sys, particle, rigid; F4 np; };
+
+// The contact stream of the fluid kernel, under a site mask.
+static std::vector<Hit> predict(const Rig& R, uint32_t om, bool isDiffuse, bool isTGS)
+{
+    std::vector<Hit> out;
+    for (uint32_t s = 0; s < NB_SYS; ++s)
+        for (uint32_t j = 0; j < NB_RIGID; ++j)
+        {
+            const float cd = SYS_CD[s] + R.shape[j].cd;
+            const float rest = R.rest[s * NB_RIGID + j];
+            for (uint32_t i = 0; i < NB_PART; ++i)
+            {
+                V cvp = R.cur[s][i];
+                float r = cd;
+                const bool ccd = (s == 1u);
+                if (ccd) r = specVolume(om, cvp, R.cur[s][i], R.pred[s][i], cd, isDiffuse, isTGS);
+                V n{ 0, 0, 0 };
+                float d = 0.0f;
+                if (!collide(om, R.cur[s][i], cvp, r, R.shape[j], ccd, n, d)) continue;
+                out.push_back(Hit{ s, i, j, F4{ n.x, n.y, n.z, d - rest } });
+            }
+        }
+    return out;
+}
+
+static bool sameHit(const Hit& a, const Hit& b)
+{
+    return a.sys == b.sys && a.particle == b.particle && a.rigid == b.rigid &&
+           fbits(a.np.x) == fbits(b.np.x) && fbits(a.np.y) == fbits(b.np.y) &&
+           fbits(a.np.z) == fbits(b.np.z) && fbits(a.np.w) == fbits(b.np.w);
+}
+
+// How many hits of `a` have no bit-identical hit in `b`.
+static size_t unmatched(const std::vector<Hit>& a, const std::vector<Hit>& b)
+{
+    size_t diff = 0;
+    for (const Hit& h : a)
+    {
+        bool found = false;
+        for (const Hit& k : b)
+            if (sameHit(h, k)) { found = true; break; }
+        if (!found) ++diff;
+    }
+    return diff;
+}
+// Both directions, so a duplicated hit cannot stand in for a missing one.
+static size_t streamDiff(const std::vector<Hit>& a, const std::vector<Hit>& b)
+{
+    return unmatched(a, b) + unmatched(b, a);
+}
+} // namespace p89
+
+static void runP89DotOrder(bool isTGS)
+{
+    using namespace p89;
+    const char* lbl = isTGS ? "TGS" : "PGS";
+    PxgSlangComputeDevice* dev = testDevice();
+
+    Rig R;
+    const bool rigOk = buildRig(R, isTGS);
+    PXG_CHECK_MSG(rigOk, "%s: the P9.89 rig could not plant its knife edges", lbl);
+    if (!rigOk) return;
+
+    // ---- the fixture's own strength: every site ALONE in the old order must
+    //      change the compared stream, for BOTH kernels ----
+    const std::vector<Hit> want = predict(R, 0u, false, isTGS);
+    const std::vector<Hit> wantD = predict(R, 0u, true, isTGS);
+    for (uint32_t b = 0; b < NB_SITES; ++b)
+    {
+        const size_t d = streamDiff(predict(R, 1u << b, false, isTGS), want);
+        PXG_CHECK_MSG(d > 0u, "%s: site %s alone in the old order changes NOTHING in the fluid stream -- "
+                      "that site is not under test", lbl, SITE_NAME[b]);
+        std::printf("    [p89 %s] %-28s old order alone changes %zu of %zu fluid contacts\n",
+                    lbl, SITE_NAME[b], d, want.size());
+    }
+    const size_t allD = streamDiff(predict(R, S_ALL, true, isTGS), wantD);
+    PXG_CHECK_MSG(allD > 0u, "%s: the old port's order changes nothing in the diffuse stream", lbl);
+    const size_t allF = streamDiff(predict(R, S_ALL, false, isTGS), want);
+    std::printf("    [p89 %s] the whole pre-P9.89 order changes %zu of %zu fluid and %zu of %zu diffuse contacts\n",
+                lbl, allF, want.size(), allD, wantD.size());
+
+    // ---- device data ----
+    std::vector<PxgBufferHandle> owned;
+    auto mk = [&](auto vec) { DevBuf b = makeDev(dev, vec); owned.push_back(b.h); return b; };
+
+    DevBuf bCur[NB_SYS], bPred[NB_SYS], bInfos[NB_SYS], bForces[NB_SYS], bNodes[NB_SYS], bCounts[NB_SYS],
+        bNum[NB_SYS];
+    const uint32_t MAXC = 12u;   // PxgParticleContactInfo::MaxStaticContactsPerParticle
+    for (uint32_t s = 0; s < NB_SYS; ++s)
+    {
+        std::vector<F4> c(NB_PART), p(NB_PART);
+        for (uint32_t i = 0; i < NB_PART; ++i)
+        {
+            c[i] = F4{ R.cur[s][i].x, R.cur[s][i].y, R.cur[s][i].z, 1.0f };
+            p[i] = F4{ R.pred[s][i].x, R.pred[s][i].y, R.pred[s][i].z, 1.0f };
+        }
+        bCur[s] = mk(c);
+        bPred[s] = mk(p);
+        bInfos[s] = mk(std::vector<F4>(size_t(NB_PART) * MAXC, F4{ -8.25e3f, -8.25e3f, -8.25e3f, -8.25e3f }));
+        bForces[s] = mk(std::vector<float>(size_t(NB_PART) * MAXC, -8.25e3f));
+        bNodes[s] = mk(std::vector<uint64_t>(size_t(NB_PART) * MAXC, ~0ull));
+        bCounts[s] = mk(std::vector<uint32_t>(NB_PART, 0u));
+        bNum[s] = mk(std::vector<int32_t>{ int32_t(NB_PART), 0 });
+    }
+    DevBuf bCellStart = mk(std::vector<uint32_t>{ 0u });
+    DevBuf bCellEnd = mk(std::vector<uint32_t>{ NB_PART });
+    std::vector<uint32_t> s2u(NB_PART);
+    for (uint32_t i = 0; i < NB_PART; ++i) s2u[i] = 1000u + i;
+    DevBuf bS2U = mk(s2u);
+    DevBuf bRunsum = mk(std::vector<uint32_t>{ 0u });
+    std::vector<PxgParticleSimBuffer> simBuffers(1);
+    std::memset(simBuffers.data(), 0, sizeof(PxgParticleSimBuffer));
+    DevBuf bSimBuf = mk(simBuffers);
+
+    std::vector<PxgParticleSystem> descs(NB_SYS);
+    for (uint32_t s = 0; s < NB_SYS; ++s)
+    {
+        PxgParticleSystem ps = makeZeroPs();
+        ps.mCommonData.mGridCellWidth = 1.0f;
+        ps.mCommonData.mGridSizeX = 1u;   // 1x1x1: every work item reads cell 0
+        ps.mCommonData.mGridSizeY = 1u;
+        ps.mCommonData.mGridSizeZ = 1u;
+        ps.mCommonData.mNumParticles = NB_PART;
+        ps.mCommonData.mMaxDiffuseParticles = NB_PART;
+        ps.mCommonData.mNumParticleBuffers = 1u;
+        ps.mData.mFlags = (s == 1u) ? 8u : 0u;          // eENABLE_SPECULATIVE_CCD on system 1
+        ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bCur[s].addr));
+        ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPred[s].addr));
+        ps.mCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+        ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+        ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bS2U.addr));
+        ps.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+        ps.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(bSimBuf.addr));
+        // the diffuse side reads the SAME particles
+        ps.mDiffuseCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+        ps.mDiffuseCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+        ps.mDiffuseSortedOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bCur[s].addr));
+        ps.mDiffuseSortedPos_LifeTime = reinterpret_cast<float4*>(size_t(bPred[s].addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bNum[s].addr));
+        ps.mDiffuseOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(bInfos[s].addr));
+        ps.mDiffuseOneWayForces = reinterpret_cast<float*>(size_t(bForces[s].addr));
+        ps.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(bNodes[s].addr));
+        ps.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(bCounts[s].addr));
+        descs[s] = ps;
+    }
+    DevBuf bDesc = mk(descs);
+
+    // shapes / caches: 0..1 = the particle systems, 2.. = the rigids.  Pair k =
+    // (system k / NB_RIGID, rigid k % NB_RIGID), one work item each.
+    const uint32_t NB_SHAPES = NB_SYS + NB_RIGID, NB_PAIRS = NB_SYS * NB_RIGID;
+    std::vector<PxgShape> shapes(NB_SHAPES);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    std::vector<PxsCachedTransform> tcache(NB_SHAPES);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    std::vector<float> cdist(NB_SHAPES, 0.0f);
+    std::vector<uint64_t> remap(NB_SHAPES, 0ull);
+    for (uint32_t s = 0; s < NB_SYS; ++s)
+    {
+        shapes[s].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+        shapes[s].particleOrSoftbodyId = s;
+        cdist[s] = SYS_CD[s];
+    }
+    for (uint32_t j = 0; j < NB_RIGID; ++j)
+    {
+        const Shape& sh = R.shape[j];
+        shapes[NB_SYS + j].type = sh.type;
+        shapes[NB_SYS + j].scale.scale = PxVec3(sh.scale.x, sh.scale.y, sh.scale.z);
+        tcache[NB_SYS + j].transform = PxTransform(PxVec3(sh.p.x, sh.p.y, sh.p.z),
+                                                   PxQuat(sh.q[0], sh.q[1], sh.q[2], sh.q[3]));
+        cdist[NB_SYS + j] = sh.cd;
+        remap[NB_SYS + j] = uint64_t(NODE_BASE + j);
+    }
+    std::vector<PxgContactManagerInput> cin(NB_PAIRS);
+    std::vector<uint32_t> startIdx(NB_PAIRS);
+    for (uint32_t k = 0; k < NB_PAIRS; ++k)
+    {
+        const uint32_t s = k / NB_RIGID, j = k % NB_RIGID;
+        // odd pairs put the rigid in slot 0, so LoadShapePair's swap runs too
+        const bool swap = (k & 1u) != 0u;
+        cin[k].shapeRef0 = swap ? NB_SYS + j : s;
+        cin[k].transformCacheRef0 = swap ? NB_SYS + j : s;
+        cin[k].shapeRef1 = swap ? s : NB_SYS + j;
+        cin[k].transformCacheRef1 = swap ? s : NB_SYS + j;
+        startIdx[k] = k;
+    }
+    DevBuf bShapes = mk(shapes), bTc = mk(tcache), bCd = mk(cdist), bRemap = mk(remap), bCin = mk(cin);
+    DevBuf bStart = mk(startIdx);
+    DevBuf bTotal = mk(std::vector<uint32_t>{ NB_PAIRS });
+    DevBuf bRd = mk(std::vector<float>(R.rest, R.rest + NB_PAIRS));
+    DevBuf bMat = mk(std::vector<uint32_t>(4u, 0u));
+    std::vector<float> boundsF(size_t(NB_SHAPES) * 6u);
+    for (uint32_t sh = 0; sh < NB_SHAPES; ++sh)
+        for (int k = 0; k < 3; ++k) { boundsF[sh * 6u + k] = -20.0f; boundsF[sh * 6u + 3 + k] = 20.0f; }
+    DevBuf bBounds = mk(boundsF);
+
+    const uint32_t MAX_CONTACTS = 4096u;
+    DevBuf bContacts = mk(std::vector<HostContact>(MAX_CONTACTS));
+    DevBuf bCount = mk(std::vector<uint32_t>{ 0u });
+    DevBuf bSbP = mk(std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
+    DevBuf bTbP = mk(std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bIbP = mk(std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bBr = mk(std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
+    DevBuf bTbr = mk(std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bIbr = mk(std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+
+    PsCollideBlob blob;
+    std::memset(&blob, 0, sizeof(blob));
+    blob.isTGSWord = isTGS ? 1u : 0u;
+    blob.numTests = NB_PAIRS;
+    blob.toleranceLength = 1.0f;
+    blob.cmInputs = bCin.addr;             blob.shapes = bShapes.addr;
+    blob.transformCache = bTc.addr;        blob.bounds = bBounds.addr;
+    blob.contactDistance = bCd.addr;       blob.restDistances = bRd.addr;
+    blob.materials = bMat.addr;            blob.startIndices = bStart.addr;
+    blob.totalNumPairs = bTotal.addr;      blob.particleSystems = bDesc.addr;
+    blob.shapeToRigidRemap = bRemap.addr;
+    blob.w_particleContacts = bContacts.addr;
+    blob.w_numTotalContacts = bCount.addr;
+    blob.w_contactSortedByParticle = bSbP.addr;
+    blob.w_tempContactByParticle = bTbP.addr;
+    blob.w_contactIndexSortedByParticle = bIbP.addr;
+    blob.w_contactByRigid = bBr.addr;
+    blob.w_tempContactByRigid = bTbr.addr;
+    blob.w_contactIndexSortedByRigid = bIbr.addr;
+    blob.w_maxContacts = MAX_CONTACTS;
+
+    // ---- the fluid kernel: one global stream, compared as a multiset ----
+    {
+        Kernel k("psContactGenBda.spv", "ps_primitivesCollisionLaunch", {}, sizeof(PsCollideBlob));
+        k.dispatch(1024u, {}, blob, 1u, 1u);
+        dev->flush();
+        const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        PXG_CHECK_MSG(gCount == uint32_t(want.size()), "%s: fluid kernel emitted %u contacts, the CUDA-order "
+                      "mirror predicts %zu", lbl, gCount, want.size());
+        const uint32_t n = std::min(gCount, MAX_CONTACTS);
+        const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, n);
+        std::vector<Hit> got;
+        for (uint32_t a = 0; a < n; ++a)
+        {
+            const uint32_t sys = uint32_t(gC[a].particleId >> 32), part = uint32_t(gC[a].particleId & 0xffffffffu);
+            const uint32_t rig = uint32_t(gC[a].rigidId - NODE_BASE);
+            got.push_back(Hit{ sys, part, rig, gC[a].normal_pen });
+        }
+        const size_t mm = streamDiff(got, want);
+        const size_t asOld = (allF > 0u) ? streamDiff(got, predict(R, S_ALL, false, isTGS)) : 1u;
+        PXG_CHECK_MSG(mm == 0u, "%s: %zu fluid contacts differ bitwise from the CUDA-order mirror "
+                      "(%zu from the pre-P9.89 order twin)", lbl, mm, asOld);
+    }
+
+    // ---- the diffuse kernel: per-particle slots, compared per particle ----
+    {
+        Kernel k("psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", {}, sizeof(PsCollideBlob));
+        k.dispatch(1024u, {}, blob, 1u, 1u);
+        dev->flush();
+        size_t mm = 0, badCount = 0;
+        for (uint32_t s = 0; s < NB_SYS; ++s)
+        {
+            const auto counts = downloadBuffer<uint32_t>(dev, bCounts[s].h, NB_PART);
+            const auto infos = downloadBuffer<F4>(dev, bInfos[s].h, size_t(NB_PART) * MAXC);
+            const auto nodes = downloadBuffer<uint64_t>(dev, bNodes[s].h, size_t(NB_PART) * MAXC);
+            for (uint32_t i = 0; i < NB_PART; ++i)
+            {
+                std::vector<Hit> exp, got;
+                for (const Hit& h : wantD) if (h.sys == s && h.particle == i) exp.push_back(h);
+                if (counts[i] != uint32_t(exp.size())) { ++badCount; continue; }
+                for (uint32_t slot = 0; slot < std::min(counts[i], MAXC); ++slot)
+                {
+                    const size_t at = size_t(i) + size_t(slot) * NB_PART;
+                    got.push_back(Hit{ s, i, uint32_t(nodes[at] - NODE_BASE), infos[at] });
+                }
+                if (exp.size() <= MAXC) mm += streamDiff(got, exp);
+            }
+        }
+        PXG_CHECK_MSG(badCount == 0u, "%s: %zu diffuse per-particle counts differ from the mirror", lbl, badCount);
+        PXG_CHECK_MSG(mm == 0u, "%s: %zu diffuse contacts differ bitwise from the CUDA-order mirror", lbl, mm);
+    }
+
+    for (PxgBufferHandle h : owned) dev->destroyBuffer(h);
+}
+
 static void runPlaneContactCases(bool isTGS)
 {
     uint32_t signCases = 0;
@@ -991,5 +1721,7 @@ PXG_TEST(psContactGen_gridHashPGS) { runGridContact(false); }
 PXG_TEST(psContactGen_gridHashTGS) { runGridContact(true); }
 PXG_TEST(psContactGen_capsuleNaNPGS) { runCapsuleNaNContact(false); }
 PXG_TEST(psContactGen_capsuleNaNTGS) { runCapsuleNaNContact(true); }
+PXG_TEST(psContactGen_p89DotOrderPGS) { runP89DotOrder(false); }
+PXG_TEST(psContactGen_p89DotOrderTGS) { runP89DotOrder(true); }
 
 } // namespace

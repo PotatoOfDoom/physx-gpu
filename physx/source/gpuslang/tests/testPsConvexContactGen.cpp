@@ -1607,7 +1607,663 @@ static void runAll(PxgSlangComputeDevice* dev)
 
 } // namespace diffuse
 
+// ===========================================================================
+// P9.89 -- THE PENETRATION'S THREE-LANE SUM, BIT FOR BIT.
+//
+// cudaParticleSystem.cu:963-964 (psConvexCollision) and :1116-1117
+// (psConvexDiffuseCollision) assemble the penetration across lanes.  Lane k < 3
+// holds (witnessB[k] - witnessA[k]) * normal[k], rounded as it enters the
+// shuffle, and every lane computes
+//     pen = shfl(pen, 0) + shfl(pen, 1) + shfl(pen, 2) - restDistance
+// which C++ evaluates as ((p0 + p1) + p2) - restDistance.  The port spells it
+// `dot(closestPointB - closestPointA, direction) - restDistance`.  In an
+// UNDECORATED .spv llvmpipe evaluates that OpDot as p0 + (p1 + p2).  That is
+// NOT a contraction into fmas; it is a different association.  Measured on
+// 65536 random cases: the model misses 0 of them, and the port's value differs
+// from the CUDA's on 19346.  psContactGenBda was unstamped until P9.89.
+//
+// The two batteries above could not see this.  Their box is axis-aligned and
+// their particles sit nearest a FACE, so at most one lane product is ever
+// non-negligible.  They also compare the penetration against a closed form to
+// 2e-4, not bit for bit.
+//
+// This battery is exact instead.  The hull is a ROTATED, non-uniformly scaled
+// cloud of twelve non-round vertices.  The particles are separated from it in
+// every direction, so the closest feature is a vertex, an edge or a face at an
+// off-axis angle.  The oracle is a host transcription of pxgSlangGjk's gjkRun,
+// the same cold-start driver testNpGjk's gjkRef mirrors, run on the hull staged
+// exactly as psStageHull stages it.  Only particles that end CLOSE with no
+// anomaly (tetPrimitivesCollide2's EPA gate) are admitted, together with some
+// that are DISTANT.  So what the kernel stores is the GJK witness pair and
+// direction, and the penetration is assembled in the CUDA's lane order.  The
+// twin assembles it as p0 + (p1 + p2) and must differ on some particles.
+// ===========================================================================
+namespace p89cvx
+{
+struct V3 { float x, y, z; };
+static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 sub3(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static uint32_t bitsOf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static float floatOf(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+
+// ---- pxgSlangGjk.slang, transcribed (cold start, per-thread 32-lane arrays) ----
+static const uint32_t DEGENERATE = 0xffffu;
+static const float MAXF = 3.4028234663852886e38f;
+static const uint32_t G_DISTANT = 0u, G_CLOSE = 1u, G_OVERLAP = 2u;
+static uint32_t next3(uint32_t x) { return x == 2u ? 0u : x + 1u; }
+static uint32_t prev3(uint32_t x) { return x == 0u ? 2u : x - 1u; }
+static uint32_t ffs(uint32_t m) { if (!m) return 0; uint32_t i = 0; while (!((m >> i) & 1u)) ++i; return i + 1; }
+static void dotW(const float a[32], const float b[32], float o[32])
+{
+    float x[32]; for (uint32_t L = 0; L < 32; ++L) x[L] = a[L] * b[L];
+    for (uint32_t L = 0; L < 32; ++L)
+    {
+        const float s1 = (L + 1 < 32) ? x[L + 1] : x[L];
+        const float s2 = (L + 2 < 32) ? x[L + 2] : x[L];
+        o[L] = x[L] + s1 + s2;
+    }
+}
+static void crossW(const float a[32], const float b[32], const uint32_t c0[32], const uint32_t c1[32], float o[32])
+{
+    for (uint32_t L = 0; L < 32; ++L) o[L] = a[c0[L]] * b[c1[L]] - a[c1[L]] * b[c0[L]];
+}
+static void splatXW(const float a[32], float o[32]) { for (uint32_t L = 0; L < 32; ++L) o[L] = a[L & 28u]; }
+static void splatVW(uint32_t index, const float a[32], float o[32])
+{
+    for (uint32_t L = 0; L < 32; ++L) o[L] = a[((index << 2) | (L & 3u)) & 31u];
+}
+static void magW(const float v[32], float cm[32])
+{
+    float dv[32]; dotW(v, v, dv);
+    for (uint32_t L = 0; L < 32; ++L) cm[L] = std::sqrt(dv[L & 28u]);
+}
+static uint32_t encodeIndices(uint32_t a, uint32_t b) { return 0x3f800000u | ((b & 0xffu) << 8) | (a & 0xffu); }
+static V3 crossX(V3 a, V3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 absX(V3 a) { return { std::fabs(a.x), std::fabs(a.y), std::fabs(a.z) }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 getNormalized(V3 v)
+{
+    const float m = dot3(v, v);
+    if (m > 0.0f) { const float r = 1.0f / std::sqrt(m); return { v.x * r, v.y * r, v.z * r }; }
+    return { 0, 0, 0 };
+}
+
+static uint32_t closestPointTriW(float zV[32], const float cV[32], float closestPoint[32])
+{
+    uint32_t cp0I[32], cp1I[32];
+    for (uint32_t L = 0; L < 32; ++L) { cp0I[L] = ((L & 28u) | next3(L & 3u)) & 31u; cp1I[L] = ((L & 28u) | prev3(L & 3u)) & 31u; }
+    for (uint32_t L = 0; L < 32; ++L) closestPoint[L] = 0.0f;
+    float eV[32]; for (uint32_t L = 0; L < 32; ++L) eV[L] = cV[L] - zV[L];
+    float dee[32]; dotW(eV, eV, dee);
+    float lD[32]; splatXW(dee, lD);
+    if ((lD[0] == 0.0f) || (lD[4] == 0.0f)) return DEGENERATE;
+    float shortEdgeV[32]; for (uint32_t L = 0; L < 32; ++L) shortEdgeV[L] = (lD[L ^ 4u] < lD[L]) ? eV[L ^ 4u] : eV[L];
+    float d1[32]; for (uint32_t L = 0; L < 32; ++L) d1[L] = zV[L ^ 4u] - zV[L];
+    float mV[32]; crossW(d1, shortEdgeV, cp0I, cp1I, mV);
+    float pS[32]; dotW(eV, cV, pS);
+    float cme[32]; crossW(mV, eV, cp0I, cp1I, cme);
+    float dcme[32]; dotW(cme, cV, dcme);
+    bool uS[32]; for (uint32_t L = 0; L < 32; ++L) uS[L] = dcme[L] <= 0.0f;
+    if (!(uS[0] || uS[4]))
+    {
+        float dmc[32]; dotW(mV, cV, dmc);
+        const float projD = dmc[0];
+        float dmm[32]; dotW(mV, mV, dmm);
+        float sxdmm[32]; splatXW(dmm, sxdmm);
+        float tmp[32]; for (uint32_t L = 0; L < 32; ++L) tmp[L] = mV[L] * projD / sxdmm[L];
+        splatVW(0u, tmp, closestPoint);
+        const bool flip = projD < 0.0f;
+        for (uint32_t L = 0; L < 32; ++L) if ((L & 3u) == 3u) mV[L] = projD;
+        const uint32_t index = flip ? 1u : 0u;
+        for (uint32_t L = 0; L < 32; ++L) { const uint32_t src = ((index << 2) | (L & 3u)) & 31u; zV[L] = (L < 16u || L > 19u) ? zV[L] : mV[src]; }
+        return flip ? 0x0123u : 0x1023u;
+    }
+    uint32_t emask = 0u;
+    if (uS[0] && (pS[0] > 0.0f)) emask |= 1u;
+    if (uS[4] && (pS[4] > 0.0f)) emask |= 2u;
+    uint32_t eid = ffs(emask);
+    if (eid != 0u)
+    {
+        eid = eid - 1u;
+        float sxpS[32]; splatXW(pS, sxpS);
+        float tmp[32]; for (uint32_t L = 0; L < 32; ++L) tmp[L] = cV[L] - eV[L] * sxpS[L] / lD[L];
+        splatVW(eid, tmp, closestPoint);
+        return (eid << 8) | 0x22u;
+    }
+    for (uint32_t L = 0; L < 32; ++L) closestPoint[L] = cV[L];
+    return 0x0021u;
+}
+
+static uint32_t closestPointTetW(float zV[32], const float dV[32], float closestPoint[32])
+{
+    for (uint32_t L = 0; L < 32; ++L) closestPoint[L] = 0.0f;
+    float n0V[32]; splatVW(4u, zV, n0V);
+    float dn0d[32]; dotW(n0V, dV, dn0d);
+    float dn0z[32]; dotW(n0V, zV, dn0z);
+    if (dn0d[0] > dn0z[0]) return DEGENERATE;
+    uint32_t cp0I[32], cp1I[32], vNextI[32], vPrevI[32];
+    for (uint32_t L = 0; L < 32; ++L)
+    {
+        cp0I[L] = ((L & 28u) | next3(L & 3u)) & 31u; cp1I[L] = ((L & 28u) | prev3(L & 3u)) & 31u;
+        vNextI[L] = (L > 7u) ? (L - 8u) : (L + 4u); vPrevI[L] = (L < 4u) ? (L + 8u) : (L - 4u);
+    }
+    float eV[32]; for (uint32_t L = 0; L < 32; ++L) eV[L] = dV[L] - zV[L];
+    float dee[32]; dotW(eV, eV, dee);
+    float lD[32]; splatXW(dee, lD);
+    if ((lD[0] == 0.0f) || (lD[4] == 0.0f) || (lD[8] == 0.0f)) return DEGENERATE;
+    float shortEdgeV[32]; for (uint32_t L = 0; L < 32; ++L) shortEdgeV[L] = (lD[vNextI[L]] < lD[L]) ? eV[vNextI[L]] : eV[L];
+    float d2[32]; for (uint32_t L = 0; L < 32; ++L) d2[L] = zV[vNextI[L]] - zV[L];
+    float nV[32]; crossW(shortEdgeV, d2, cp0I, cp1I, nV);
+    float aS[32]; dotW(nV, dV, aS);
+    float zvp[32]; for (uint32_t L = 0; L < 32; ++L) zvp[L] = zV[vPrevI[L]];
+    float gS[32]; dotW(zvp, nV, gS);
+    if ((aS[0] <= gS[0]) || (aS[4] <= gS[4]) || (aS[8] <= gS[8])) return DEGENERATE;
+    for (uint32_t L = 0; L < 32; ++L) if ((L & 3u) == 3u) nV[L] = aS[L - 3u];
+    if ((aS[0] > 0.0f) && (aS[4] > 0.0f) && (aS[8] > 0.0f))
+    {
+        for (uint32_t L = 0; L < 32; ++L) if (L >= 20u) zV[L] = nV[L - 20u];
+        return 0x2104u;
+    }
+    float pS[32]; dotW(eV, dV, pS);
+    if ((pS[0] <= 0.0f) && (pS[4] <= 0.0f) && (pS[8] <= 0.0f))
+    {
+        for (uint32_t L = 0; L < 32; ++L) closestPoint[L] = dV[L];
+        return 0x2131u;
+    }
+    float cen[32]; crossW(eV, nV, cp0I, cp1I, cen);
+    float dcen[32]; dotW(cen, dV, dcen);
+    bool uiS[32]; for (uint32_t L = 0; L < 32; ++L) uiS[L] = dcen[L] <= 0.0f;
+    float evn[32]; for (uint32_t L = 0; L < 32; ++L) evn[L] = eV[vNextI[L]];
+    float cevn[32]; crossW(evn, nV, cp0I, cp1I, cevn);
+    float dcevn[32]; dotW(cevn, dV, dcevn);
+    bool ujS[32]; for (uint32_t L = 0; L < 32; ++L) ujS[L] = dcevn[L] > 0.0f;
+    uint32_t emask = 0u;
+    if (uiS[0] && ujS[vPrevI[0]] && (pS[0] >= 0.0f)) emask |= 1u;
+    if (uiS[4] && ujS[vPrevI[4]] && (pS[4] >= 0.0f)) emask |= 2u;
+    if (uiS[8] && ujS[vPrevI[8]] && (pS[8] >= 0.0f)) emask |= 4u;
+    uint32_t eid = ffs(emask);
+    if (eid != 0u)
+    {
+        eid = eid - 1u;
+        float pl[32]; for (uint32_t L = 0; L < 32; ++L) pl[L] = pS[L] / lD[L];
+        float spl[32]; splatXW(pl, spl);
+        float tmp[32]; for (uint32_t L = 0; L < 32; ++L) tmp[L] = dV[L] - eV[L] * spl[L];
+        splatVW(eid, tmp, closestPoint);
+        return (eid << 8) | 0x32u;
+    }
+    uint32_t fmask = 0u;
+    if (!uiS[0] && !ujS[0] && (aS[0] <= 0.0f)) fmask |= 1u;
+    if (!uiS[4] && !ujS[4] && (aS[4] <= 0.0f)) fmask |= 2u;
+    if (!uiS[8] && !ujS[8] && (aS[8] <= 0.0f)) fmask |= 4u;
+    uint32_t fid = ffs(fmask);
+    if (fid != 0u)
+    {
+        fid = fid - 1u;
+        float dnn[32]; dotW(nV, nV, dnn);
+        float ad[32]; for (uint32_t L = 0; L < 32; ++L) ad[L] = aS[L] / dnn[L];
+        float sad[32]; splatXW(ad, sad);
+        float tmp[32]; for (uint32_t L = 0; L < 32; ++L) tmp[L] = nV[L] * sad[L];
+        splatVW(fid, tmp, closestPoint);
+        for (uint32_t L = 0; L < 32; ++L) { const uint32_t src = ((fid << 2) | (L & 3u)) & 31u; zV[L] = (L < 16u || L > 19u) ? zV[L] : -nV[src]; }
+        return (next3(fid) << 12) | (fid << 8) | 0x33u;
+    }
+    return DEGENERATE;
+}
+
+static uint32_t supportIdx(V3 dir, const std::vector<V3>& V)
+{
+    const uint32_t nb = uint32_t(V.size());
+    uint32_t bestN = 0xFFFFFFFFu; float bestDist = -MAXF;
+    for (uint32_t i = 0; i < nb; i += 32)
+    {
+        float d[32];
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            const uint32_t n = i + lane;
+            d[lane] = (n < nb) ? dot3(dir, V[n]) : -MAXF;
+        }
+        float chunkMax = -MAXF; for (uint32_t lane = 0; lane < 32; ++lane) chunkMax = std::fmax(chunkMax, d[lane]);
+        if (chunkMax > bestDist) { uint32_t ll = 0; for (uint32_t lane = 0; lane < 32; ++lane) if (d[lane] == chunkMax) { ll = lane; break; } bestDist = chunkMax; bestN = i + ll; }
+    }
+    return bestN;
+}
+
+struct GjkRes { uint32_t ret; V3 direction, cpA, cpB, cpDir; };
+
+static GjkRes gjkRun(const std::vector<V3>& A, const std::vector<V3>& B, V3 initialUnitDir, float minSep,
+                     float convergenceRatio)
+{
+    float simplexV[32]; for (uint32_t L = 0; L < 32; ++L) simplexV[L] = 0.0f;
+    float closestPointV[32];
+    for (uint32_t L = 0; L < 32; ++L)
+    {
+        const uint32_t c = L & 3u;
+        closestPointV[L] = (c == 0) ? initialUnitDir.x : (c == 1) ? initialUnitDir.y : (c == 2) ? initialUnitDir.z : MAXF;
+    }
+    float upperBound = MAXF, lowerBound = -MAXF;
+    float cmA[32]; magW(closestPointV, cmA);
+    bool degenerate = false;
+    int size = 0, backupSize = 0;
+    float backupSimplexV[32]; for (uint32_t L = 0; L < 32; ++L) backupSimplexV[L] = 0.0f;
+    float backupClosestV[32]; for (uint32_t L = 0; L < 32; ++L) backupClosestV[L] = 0.0f;
+    V3 directionOut = { 0, 0, 0 };
+    bool run = true;
+    while (run)
+    {
+        float dV[32]; for (uint32_t L = 0; L < 32; ++L) dV[L] = closestPointV[L] / cmA[L];
+        const V3 dvVec = { dV[0], dV[1], dV[2] };
+        const uint32_t indexA = supportIdx({ -dvVec.x, -dvVec.y, -dvVec.z }, A);
+        const uint32_t indexB = supportIdx(dvVec, B);
+        const V3 sv = sub3(A[indexA], B[indexB]);
+        float supportVertexV[32];
+        for (uint32_t L = 0; L < 32; ++L) { const uint32_t c = L & 3u; supportVertexV[L] = (c == 0) ? sv.x : (c == 1) ? sv.y : (c == 2) ? sv.z : 0.0f; }
+        const float encoded = floatOf(encodeIndices(indexA, indexB));
+        for (uint32_t L = 0; L < 32; ++L) if ((L >> 2) == (uint32_t)size) simplexV[L] = ((L & 3u) < 3u) ? supportVertexV[L] : encoded;
+        float dds[32]; dotW(dV, supportVertexV, dds);
+        const float lb = dds[0];
+        if (lb > lowerBound)
+        {
+            directionOut = { -dV[0], -dV[1], -dV[2] };
+            lowerBound = lb;
+            if (lowerBound > minSep || lowerBound >= upperBound * convergenceRatio) { run = false; break; }
+        }
+        uint32_t f = 0u;
+        float pointV[32];
+        if (size == 0) { f = 0x2101u; for (uint32_t L = 0; L < 32; ++L) pointV[L] = supportVertexV[L]; }
+        else if (size == 1)
+        {
+            float aV[32]; splatVW(0u, simplexV, aV);
+            float lV[32]; for (uint32_t L = 0; L < 32; ++L) lV[L] = supportVertexV[L] - aV[L];
+            float dll[32]; dotW(lV, lV, dll);
+            float mm[32]; splatXW(dll, mm);
+            float dal[32]; dotW(aV, lV, dal);
+            float xx[32]; splatXW(dal, xx); for (uint32_t L = 0; L < 32; ++L) xx[L] = -xx[L];
+            if (mm[0] == 0.0f) { f = DEGENERATE; for (uint32_t L = 0; L < 32; ++L) pointV[L] = 0.0f; }
+            else if (xx[0] < mm[0]) { f = 0x2102u; for (uint32_t L = 0; L < 32; ++L) pointV[L] = aV[L] + lV[L] * xx[L] / mm[L]; }
+            else { f = 0x2111u; for (uint32_t L = 0; L < 32; ++L) pointV[L] = supportVertexV[L]; }
+        }
+        else if (size == 2) { f = closestPointTriW(simplexV, supportVertexV, pointV); }
+        else { f = closestPointTetW(simplexV, supportVertexV, pointV); }
+        magW(pointV, cmA);
+        const int newSize = (int)(f & 0xfu);
+        degenerate = (f == DEGENERATE) || (cmA[0] >= upperBound && newSize <= size);
+        if (degenerate) { run = false; break; }
+        backupSize = (cmA[0] >= upperBound) ? size : 0;
+        if (backupSize != 0) { for (uint32_t L = 0; L < 32; ++L) { backupSimplexV[L] = simplexV[L]; backupClosestV[L] = closestPointV[L]; } }
+        else upperBound = cmA[0];
+        for (uint32_t L = 0; L < 32; ++L) closestPointV[L] = pointV[L];
+        size = newSize;
+        float tmpP[32];
+        for (uint32_t L = 0; L < 32; ++L) { const uint32_t sourceIndex = (f >> ((L & 28u) + 4u)) & 0xfu; tmpP[L] = simplexV[((sourceIndex << 2) | (L & 3u)) & 31u]; }
+        for (uint32_t L = 0; L < 32; ++L) if (L < 12u) simplexV[L] = tmpP[L];
+        if (!(upperBound > 0.0f && lowerBound < upperBound * convergenceRatio)) run = false;
+    }
+    if (backupSize > 0) { for (uint32_t L = 0; L < 32; ++L) { simplexV[L] = backupSimplexV[L]; closestPointV[L] = backupClosestV[L]; } size = backupSize; }
+
+    GjkRes o;
+    std::memset(&o, 0, sizeof(o));
+    o.direction = directionOut;
+    if (upperBound == 0.0f) { o.ret = G_OVERLAP; return o; }
+    if (lowerBound > minSep) { o.ret = G_DISTANT; return o; }
+    const V3 cp = { closestPointV[0], closestPointV[1], closestPointV[2] };
+    const V3 gn = getNormalized(cp);
+    const V3 dir = { -gn.x, -gn.y, -gn.z };
+    o.cpDir = dir;
+    const uint32_t a0 = bitsOf(simplexV[3]) & 0xffu, a1 = bitsOf(simplexV[7]) & 0xffu, a2 = bitsOf(simplexV[11]) & 0xffu;
+    V3 cpA;
+    if (size == 3)
+    {
+        const V3 Av = { simplexV[0], simplexV[1], simplexV[2] }, Bv = { simplexV[4], simplexV[5], simplexV[6] }, Cv = { simplexV[8], simplexV[9], simplexV[10] };
+        const V3 m = crossX(sub3(Bv, Av), sub3(Cv, Av));
+        const V3 ma = absX(m);
+        const V3 s1 = crossX(sub3(Bv, cp), sub3(Cv, cp));
+        const V3 s2 = crossX(sub3(Cv, cp), sub3(Av, cp));
+        float d, u, v;
+        if (ma.x >= ma.y && ma.x >= ma.z) { d = 1.0f / m.x; u = s1.x * d; v = s2.x * d; }
+        else if (ma.y >= ma.z)            { d = 1.0f / m.y; u = s1.y * d; v = s2.y * d; }
+        else                              { d = 1.0f / m.z; u = s1.z * d; v = s2.z * d; }
+        const float w = 1.0f - u - v;
+        const V3 p0 = A[a0], p1 = A[a1], p2 = A[a2];
+        cpA = { u * p0.x + v * p1.x + w * p2.x, u * p0.y + v * p1.y + w * p2.y, u * p0.z + v * p1.z + w * p2.z };
+    }
+    else if (size == 2)
+    {
+        const V3 V0 = { simplexV[0], simplexV[1], simplexV[2] }, V1 = { simplexV[4], simplexV[5], simplexV[6] };
+        const V3 dv = sub3(V1, V0);
+        const float q = -dot3(V0, dv) / dot3(dv, dv);
+        const V3 p0 = A[a0], p1 = A[a1];
+        cpA = { (1.0f - q) * p0.x + q * p1.x, (1.0f - q) * p0.y + q * p1.y, (1.0f - q) * p0.z + q * p1.z };
+    }
+    else cpA = A[a0];
+    o.cpA = cpA;
+    o.cpB = { cpA.x + upperBound * dir.x, cpA.y + upperBound * dir.y, cpA.z + upperBound * dir.z };
+    o.ret = G_CLOSE;
+    return o;
+}
+
+// psContactGenBda's quatRotate / quatRotateInv (== PxQuat::rotate / rotateInv).
+static V3 qRot(const float q[4], V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    return V3{ (vx * w2 + (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2),
+               (vy * w2 + (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2),
+               (vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2) };
+}
+static V3 qRotInv(const float q[4], V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    return V3{ (vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2),
+               (vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2),
+               (vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2) };
+}
+
+// The rig: one hull, one particle system (fluid AND diffuse arrays over the same
+// particles), one pair, one work item, one grid cell.
+static const uint32_t NB_VERTS = 12u;
+static const uint32_t NB_PART = 96u;
+static const float PART_CD = 0.2371f, HULL_CD = 0.0173f, REST = 0.0137f;
+static const uint32_t NODE = 411u;
+static const float RIGID_Q[4] = { 0.2311f, -0.3877f, 0.1523f, 0.8795f };   // normalised below
+static const V3 RIGID_P = { 0.3713f, -0.2129f, 0.5237f };
+static const V3 SCALE = { 1.13f, 0.87f, 1.21f };
+static const float SCALE_Q[4] = { -0.1417f, 0.2963f, 0.3319f, 0.8839f };    // normalised below
+
+static void normQ(const float in[4], float q[4])
+{
+    const float m = std::sqrt(in[0] * in[0] + in[1] * in[1] + in[2] * in[2] + in[3] * in[3]);
+    for (int k = 0; k < 4; ++k) q[k] = in[k] / m;
+}
+
+struct Case { V3 p; bool contact; F4 np; float penOld; };
+
+struct Rig
+{
+    float rq[4], sq[4];
+    std::vector<V3> vertsLocal, hullWorld;
+    std::vector<Case> cases;
+    uint32_t nbDistant = 0, nbSize[4] = { 0, 0, 0, 0 };
+};
+
+static bool buildRig(Rig& R)
+{
+    normQ(RIGID_Q, R.rq);
+    normQ(SCALE_Q, R.sq);
+    uint64_t s = 0x89c0ffeeull;
+    auto u = [&]() { s = s * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(s >> 40)) / 16777216.0f; };
+    // twelve vertices on a lumpy ellipsoid, every coordinate non-round
+    for (uint32_t v = 0; v < NB_VERTS; ++v)
+    {
+        V3 d{ u() * 2.0f - 1.0f, u() * 2.0f - 1.0f, u() * 2.0f - 1.0f };
+        const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        const float r = 0.55f + 0.25f * u();
+        R.vertsLocal.push_back(V3{ d.x / m * r * 1.3f, d.y / m * r * 0.9f, d.z / m * r });
+    }
+    // psStageHull: vertex -> psVertex2Shape -> quatRotate(rigidQ) + rigidP
+    for (const V3& v : R.vertsLocal)
+    {
+        V3 t = qRot(R.sq, v);
+        t.x *= SCALE.x; t.y *= SCALE.y; t.z *= SCALE.z;
+        R.hullWorld.push_back(add3(qRot(R.rq, qRotInv(R.sq, t)), RIGID_P));
+    }
+    V3 c{ 0, 0, 0 };
+    for (const V3& w : R.hullWorld) c = add3(c, w);
+    c = V3{ c.x / float(NB_VERTS), c.y / float(NB_VERTS), c.z / float(NB_VERTS) };
+
+    const float cd = PART_CD + HULL_CD;
+    const float ratio = 1.0f - 0.000225f;
+    for (int trial = 0; trial < 100000 && R.cases.size() < NB_PART; ++trial)
+    {
+        V3 d{ u() * 2.0f - 1.0f, u() * 2.0f - 1.0f, u() * 2.0f - 1.0f };
+        const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (m < 0.2f) continue;
+        const float r = 0.4f + 1.6f * u();
+        const V3 p = V3{ c.x + d.x / m * r, c.y + d.y / m * r, c.z + d.z / m * r };
+        // particleConvexCollision, CCD off: initial direction p - rigidP
+        const V3 aToB = sub3(p, RIGID_P);
+        V3 dir0{ 1.0f, 0.0f, 0.0f };
+        if (dot3(aToB, aToB) > 0.0f) dir0 = aToB;
+        const GjkRes o = gjkRun(std::vector<V3>{ p }, R.hullWorld, dir0, cd, ratio);
+        Case k{};
+        k.p = p;
+        if (o.ret == G_DISTANT)
+        {
+            if (R.nbDistant >= NB_PART / 8u) continue;   // a few, not most
+            ++R.nbDistant;
+            k.contact = false;
+            R.cases.push_back(k);
+            continue;
+        }
+        if (o.ret != G_CLOSE) continue;                  // OVERLAP would run EPA
+        // tetPrimitivesCollide2's anomaly gate (pxgSlangTetCollide.slang:93,
+        // cudaParticleSystem.cu:751): keep well clear of 0.999 in BOTH orders
+        const float ax = o.cpDir.x * o.direction.x, ay = o.cpDir.y * o.direction.y, az = o.cpDir.z * o.direction.z;
+        if (!((ax + ay) + az > 0.9995f) || !(ax + (ay + az) > 0.9995f)) continue;
+        // cu:959-964: lane k holds (witnessB - witnessA) * normal, rounded; lanes
+        // 0 + 1 + 2 left to right, then - restDistance
+        const float p0 = (o.cpB.x - o.cpA.x) * o.direction.x;
+        const float p1 = (o.cpB.y - o.cpA.y) * o.direction.y;
+        const float p2 = (o.cpB.z - o.cpA.z) * o.direction.z;
+        k.contact = true;
+        k.np = F4{ -o.direction.x, -o.direction.y, -o.direction.z, ((p0 + p1) + p2) - REST };
+        k.penOld = (p0 + (p1 + p2)) - REST;                  // the pre-P9.89 port on llvmpipe
+        R.cases.push_back(k);
+    }
+    return R.cases.size() == NB_PART;
+}
+
+// The hull blob at pxgSlangConvexHull's offsets; the kernel reads only the
+// header, the extents and the vertex run.
+static std::vector<F4> makeBlob(const Rig& R)
+{
+    std::vector<F4> blob;
+    blob.push_back(F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    F4 desc{};
+    const uint32_t packed = (0u << 16) | (NB_VERTS << 8) | 0u;
+    std::memcpy(&desc.x, &packed, 4);
+    blob.push_back(desc);
+    blob.push_back(F4{ 1.0f, 1.0f, 1.0f, 0.4f });   // .w: inner-sphere radius (EPA only)
+    for (const V3& v : R.vertsLocal) blob.push_back(F4{ v.x, v.y, v.z, 0.0f });
+    for (int i = 0; i < 8; ++i) blob.push_back(F4{ POISON_F, POISON_F, POISON_F, POISON_F });
+    return blob;
+}
+
+static void run(bool diffuse)
+{
+    const char* lbl = diffuse ? "diffuse" : "fluid";
+    PxgSlangComputeDevice* dev = testDevice();
+    Rig R;
+    const bool ok = buildRig(R);
+    PXG_CHECK_MSG(ok, "p89 %s: only %zu admissible particles around the hull", lbl, R.cases.size());
+    if (!ok) return;
+
+    uint32_t nContact = 0, nOrder = 0;
+    for (const Case& k : R.cases)
+        if (k.contact) { ++nContact; if (bitsOf(k.penOld) != bitsOf(k.np.w)) ++nOrder; }
+    PXG_CHECK_MSG(nContact >= NB_PART / 2u, "p89 %s: only %u of %u particles are in contact", lbl, nContact, NB_PART);
+    PXG_CHECK_MSG(nOrder > 0u, "p89 %s: the pre-P9.89 lane order p0 + (p1 + p2) gives the same bits as the CUDA's "
+                  "(p0 + p1) + p2 on every contact -- the penetration's association is not under test", lbl);
+    std::printf("    [p89 %s] %u contacts, %u DISTANT; the old lane order changes %u penetrations\n",
+                lbl, nContact, R.nbDistant, nOrder);
+
+    std::vector<PxgBufferHandle> owned;
+    auto mk = [&](auto vec) { DevBuf b; b.h = createBufferFrom(dev, vec); b.addr = dev->getBufferDeviceAddress(b.h); owned.push_back(b.h); return b; };
+
+    std::vector<F4> pos(NB_PART);
+    for (uint32_t i = 0; i < NB_PART; ++i) pos[i] = F4{ R.cases[i].p.x, R.cases[i].p.y, R.cases[i].p.z, 1.0f };
+    const DevBuf bPos = mk(pos);
+    const DevBuf bHull = mk(makeBlob(R));
+    const DevBuf bCellStart = mk(std::vector<uint32_t>{ 0u });
+    const DevBuf bCellEnd = mk(std::vector<uint32_t>{ NB_PART });
+    std::vector<uint32_t> s2u(NB_PART);
+    for (uint32_t i = 0; i < NB_PART; ++i) s2u[i] = 7000u + i;
+    const DevBuf bS2U = mk(s2u);
+    const DevBuf bRunsum = mk(std::vector<uint32_t>{ 0u });
+    std::vector<PxgParticleSimBuffer> simBufs(1);
+    std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
+    const DevBuf bSimBuf = mk(simBufs);
+    const uint32_t MAXC = 12u;
+    const DevBuf bInfos = mk(std::vector<F4>(size_t(NB_PART) * MAXC, F4{ POISON_F, POISON_F, POISON_F, POISON_F }));
+    const DevBuf bForces = mk(std::vector<float>(size_t(NB_PART) * MAXC, POISON_F));
+    const DevBuf bNodes = mk(std::vector<uint64_t>(size_t(NB_PART) * MAXC, POISON_U64));
+    const DevBuf bCounts = mk(std::vector<uint32_t>(NB_PART, 0u));
+    const DevBuf bNum = mk(std::vector<int32_t>{ int32_t(NB_PART), 0 });
+
+    std::vector<PxgParticleSystem> descs(1);
+    std::memset(descs.data(), 0, sizeof(PxgParticleSystem));
+    PxgParticleSystem& m = descs[0];
+    m.mCommonData.mGridCellWidth = 1.0f;
+    m.mCommonData.mGridSizeX = 1u; m.mCommonData.mGridSizeY = 1u; m.mCommonData.mGridSizeZ = 1u;
+    m.mCommonData.mNumParticles = NB_PART;
+    m.mCommonData.mMaxDiffuseParticles = NB_PART;
+    m.mCommonData.mNumParticleBuffers = 1u;
+    m.mData.mFlags = 0u;                                   // CCD off
+    m.mCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+    m.mCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+    m.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    m.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    m.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bS2U.addr));
+    m.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+    m.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(bSimBuf.addr));
+    m.mDiffuseCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+    m.mDiffuseCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+    m.mDiffuseSortedOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bPos.addr));
+    m.mDiffuseSortedPos_LifeTime = reinterpret_cast<float4*>(size_t(bPos.addr));
+    m.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bNum.addr));
+    m.mDiffuseOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(bInfos.addr));
+    m.mDiffuseOneWayForces = reinterpret_cast<float*>(size_t(bForces.addr));
+    m.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(bNodes.addr));
+    m.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(bCounts.addr));
+    const DevBuf bDesc = mk(descs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::eCONVEXMESH);
+    shapes[1].scale = PxMeshScale(PxVec3(SCALE.x, SCALE.y, SCALE.z), PxQuat(R.sq[0], R.sq[1], R.sq[2], R.sq[3]));
+    shapes[1].hullOrMeshPtr = size_t(bHull.addr);
+    const DevBuf bShapes = mk(shapes);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(RIGID_P.x, RIGID_P.y, RIGID_P.z), PxQuat(R.rq[0], R.rq[1], R.rq[2], R.rq[3]));
+    const DevBuf bTc = mk(tcache);
+    std::vector<PxgContactManagerInput> cin(1);
+    std::memset(cin.data(), 0, sizeof(PxgContactManagerInput));
+    cin[0].shapeRef0 = 1u; cin[0].transformCacheRef0 = 1u;   // the hull in slot 0: LoadShapePair swaps
+    cin[0].shapeRef1 = 0u; cin[0].transformCacheRef1 = 0u;
+    const DevBuf bCin = mk(cin);
+    const DevBuf bBounds = mk(std::vector<float>{ -9, -9, -9, 9, 9, 9, -9, -9, -9, 9, 9, 9 });
+    const DevBuf bCd = mk(std::vector<float>{ PART_CD, HULL_CD });
+    const DevBuf bRd = mk(std::vector<float>{ REST });
+    const DevBuf bMat = mk(std::vector<uint32_t>(4u, POISON_U32));
+    const DevBuf bStart = mk(std::vector<uint32_t>{ 0u });
+    const DevBuf bTotal = mk(std::vector<uint32_t>{ 1u });
+    const DevBuf bRemap = mk(std::vector<uint64_t>{ 0ull, uint64_t(NODE) });
+    const uint32_t MAX_CONTACTS = 256u;
+    std::vector<HostContact> contacts(MAX_CONTACTS);
+    for (auto& ct : contacts) { ct.normal_pen = F4{ POISON_F, POISON_F, POISON_F, POISON_F }; ct.rigidId = POISON_U64; ct.particleId = POISON_U64; }
+    const DevBuf bContacts = mk(contacts);
+    const DevBuf bCount = mk(std::vector<uint32_t>{ 0u });
+    const DevBuf bSbP = mk(std::vector<uint64_t>(MAX_CONTACTS, POISON_U64));
+    const DevBuf bTbP = mk(std::vector<uint32_t>(MAX_CONTACTS, POISON_U32));
+    const DevBuf bIbP = mk(std::vector<uint32_t>(MAX_CONTACTS, POISON_U32));
+    const DevBuf bBr = mk(std::vector<uint64_t>(MAX_CONTACTS, POISON_U64));
+    const DevBuf bTbr = mk(std::vector<uint32_t>(MAX_CONTACTS, POISON_U32));
+    const DevBuf bIbr = mk(std::vector<uint32_t>(MAX_CONTACTS, POISON_U32));
+
+    PsCollideBlob blob;
+    std::memset(&blob, 0, sizeof(blob));
+    blob.numTests = 1u;
+    blob.toleranceLength = 1.0f;
+    blob.cmInputs = bCin.addr; blob.shapes = bShapes.addr; blob.transformCache = bTc.addr;
+    blob.bounds = bBounds.addr; blob.contactDistance = bCd.addr; blob.restDistances = bRd.addr;
+    blob.materials = bMat.addr; blob.startIndices = bStart.addr; blob.totalNumPairs = bTotal.addr;
+    blob.particleSystems = bDesc.addr; blob.shapeToRigidRemap = bRemap.addr;
+    blob.w_particleContacts = bContacts.addr; blob.w_numTotalContacts = bCount.addr;
+    blob.w_contactSortedByParticle = bSbP.addr; blob.w_tempContactByParticle = bTbP.addr;
+    blob.w_contactIndexSortedByParticle = bIbP.addr; blob.w_contactByRigid = bBr.addr;
+    blob.w_tempContactByRigid = bTbr.addr; blob.w_contactIndexSortedByRigid = bIbr.addr;
+    blob.w_maxContacts = MAX_CONTACTS;
+
+    Kernel k("psContactGenBda.spv", diffuse ? "ps_convexDiffuseCollisionLaunch" : "ps_convexCollisionLaunch", {},
+             sizeof(PsCollideBlob));
+    // The convex kernels are one warp (32 x 8 threads per block) per work item.
+    k.dispatch(1024u, {}, blob, 1u, 1u);
+    dev->flush();
+
+    // Per particle: the stored normal/penetration, or none.
+    std::vector<int> gotAt(NB_PART, -1);
+    std::vector<F4> gotNp(NB_PART);
+    size_t bad = 0, asOld = 0, extra = 0;
+    if (!diffuse)
+    {
+        const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        PXG_CHECK_MSG(gCount == nContact, "p89 %s: %u contacts, the mirror predicts %u", lbl, gCount, nContact);
+        const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, std::min(gCount, MAX_CONTACTS));
+        for (size_t a = 0; a < gC.size(); ++a)
+        {
+            const uint64_t pid = gC[a].particleId;
+            if ((pid >> 32) != 0ull || uint32_t(pid) >= NB_PART || gotAt[uint32_t(pid)] >= 0 || gC[a].rigidId != uint64_t(NODE))
+            { ++extra; continue; }
+            gotAt[uint32_t(pid)] = int(a);
+            gotNp[uint32_t(pid)] = gC[a].normal_pen;
+        }
+    }
+    else
+    {
+        const auto counts = downloadBuffer<uint32_t>(dev, bCounts.h, NB_PART);
+        const auto infos = downloadBuffer<F4>(dev, bInfos.h, NB_PART);
+        const auto nodes = downloadBuffer<uint64_t>(dev, bNodes.h, NB_PART);
+        const auto forces = downloadBuffer<float>(dev, bForces.h, NB_PART);
+        for (uint32_t i = 0; i < NB_PART; ++i)
+        {
+            if (counts[i] == 0u) continue;
+            if (counts[i] != 1u || nodes[i] != uint64_t(NODE) || forces[i] != 0.0f) { ++extra; continue; }
+            gotAt[i] = int(i);
+            gotNp[i] = infos[i];
+        }
+    }
+    for (uint32_t i = 0; i < NB_PART; ++i)
+    {
+        const Case& c = R.cases[i];
+        if ((gotAt[i] >= 0) != c.contact) { ++bad; continue; }
+        if (!c.contact) continue;
+        const F4& g = gotNp[i];
+        const bool same = bitsOf(g.x) == bitsOf(c.np.x) && bitsOf(g.y) == bitsOf(c.np.y) &&
+                          bitsOf(g.z) == bitsOf(c.np.z) && bitsOf(g.w) == bitsOf(c.np.w);
+        if (!same)
+        {
+            if (bad < 4)
+                std::printf("    p89 %s particle %u: gpu (%08x %08x %08x | %08x) mirror (%08x %08x %08x | %08x) old-order pen %08x\n",
+                            lbl, i, bitsOf(g.x), bitsOf(g.y), bitsOf(g.z), bitsOf(g.w), bitsOf(c.np.x), bitsOf(c.np.y),
+                            bitsOf(c.np.z), bitsOf(c.np.w), bitsOf(c.penOld));
+            ++bad;
+            if (bitsOf(g.w) == bitsOf(c.penOld)) ++asOld;
+        }
+    }
+    PXG_CHECK_MSG(extra == 0u, "p89 %s: %zu malformed or duplicated outputs", lbl, extra);
+    PXG_CHECK_MSG(bad == 0u, "p89 %s: %zu particles differ from the CUDA lane-order mirror (%zu of them carry the "
+                  "pre-P9.89 p0 + (p1 + p2) penetration)", lbl, bad, asOld);
+
+    for (PxgBufferHandle h : owned) dev->destroyBuffer(h);
+}
+} // namespace p89cvx
+
 } // namespace
+
+PXG_TEST(psConvexContactGen_p89PenLaneOrder)
+{
+    p89cvx::run(false);
+}
+
+PXG_TEST(psConvexDiffuseContactGen_p89PenLaneOrder)
+{
+    p89cvx::run(true);
+}
 
 PXG_TEST(psConvexContactGen)
 {

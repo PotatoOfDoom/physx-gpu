@@ -106,6 +106,25 @@ import pxgSlangConvexHull;
 import pxgSlangGjk;
 import pxgSlangTetCollide;
 
+// P9.89: EVERY dot() IN THIS FILE IS ORDERED BY THE NoContraction STAMP.
+// Each float dot here transcribes one of two CUDA shapes:
+//   * a PxVec3 dot or magnitudeSquared, `x*v.x + y*v.y + z*v.z`
+//     (PxVec3.h:173/:274), i.e. (x + y) + z with every product rounded; or
+//   * the convex kernels' three-lane penetration, shfl0 + shfl1 + shfl2
+//     (cudaParticleSystem.cu:964/:1117), i.e. the same (p0 + p1) + p2.
+// SPIR-V does not fix OpDot's summation order.  llvmpipe (Mesa lower_fdot)
+// evaluates an UNDECORATED OpDot as x + (y + z) and a NoContraction-decorated
+// one as (x + y) + z.  Both were measured on 65536 random cases with 0 misses.
+// This .spv was unstamped until P9.89, so every site below came out
+// re-associated.  The fix is psContactGenBda's entry in PXG_NOCONTRACT_SHADERS
+// (tests/CMakeLists.txt).  It stamps the importers of pxgSlangGjk / Epa /
+// TetCollide here the way the softbody path already stamped them, and that
+// includes the anomaly dot at pxgSlangTetCollide.slang:93.  Taking this shader
+// off that list re-associates every site marked "P9.89" below.
+// testPsContactGen (p89DotOrder), testPsConvexContactGen (p89PenLaneOrder) and
+// its diffuse twin compare against -ffp-contract=off mirrors in the CUDA order
+// and fail without the stamp.
+
 // PxgParticleSystemKernelBlockDim::PS_COLLISION (256) /
 // PxgParticleSystemKernelGridDim::PS_COLLISION (1024) — the fixed CUDA launch
 // geometry (PxgParticleSystemCoreKernelIndices.h:42/:59).  The Vulkan dispatch
@@ -311,6 +330,10 @@ float getSpecVolume(out float3 cVolumePos, float3 currentPos, float3 predictedPo
     // P9.47: gridCal.cuh:139 is `cVolumeOffset.magnitude() + contactDist`, and
     // PxVec3::magnitude() is PxSqrt(magnitudeSquared()) -- not GLSL Length, which
     // the Vulkan environment spec leaves several ULP of room.
+    // P9.89: magnitudeSquared is (x*x + y*y) + z*z (gridCal.cuh:139, PxVec3.h:173).
+    // That holds only because this .spv is stamped (see the P9.89 note at the
+    // imports).  The radius only GATES, so testPsContactGen plants a CCD particle
+    // whose plane distance falls between the two possible radii.
     return sqrt(dot(cVolumeOffset, cVolumeOffset)) + contactDist;
 }
 
@@ -366,6 +389,8 @@ float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
 {
     const float3 ap = p - a;
     const float3 ab = b - a;
+    // P9.89: sphereCollision.cuh:97-98 ap.dot(ab) / ab.dot(ab), and :103 v.dot(v)
+    // below, are all (x + y) + z.  The stamp keeps OpDot in that order.
     const float nom = dot(ap, ab);
     const float denom = dot(ab, ab);
     // P9.86f: sphereCollision.cuh:98 PxClamp(nom / denom, 0, 1) = PxMin(1, PxMax(0, .)) with the float
@@ -392,6 +417,9 @@ bool contactPointBox(inout float3 normal, inout float dist,
     {
         const float maxDistSq = maxDist * maxDist;
         const float3 dv = relPointPos - closestPos;
+        // P9.89: particleCollision.cuh:56 magnitudeSquared(), (x + y) + z by the stamp.
+        // A gate only: testPsContactGen plants a box whose maxDist^2 falls between the
+        // two possible corner values.
         if (dot(dv, dv) > maxDistSq)
             return false;
     }
@@ -418,6 +446,7 @@ bool contactPointBox(inout float3 normal, inout float dist,
     else
     {
         normal = relPointPos - closestPos;
+        // P9.89: normalizeFast's magnitude (particleCollision.cuh:92), (x + y) + z by the stamp.
         const float mag = sqrt(dot(normal, normal));
         normal = normal * (1.0f / mag);
         dist = mag;
@@ -430,6 +459,7 @@ bool contactPointSphere(inout float3 normal, inout float dist,
                         float3 pointPos, float3 spherePos, float sphereRadius, float maxDist)
 {
     const float3 relPointPos = pointPos - spherePos;
+    // P9.89: particleCollision.cuh:107 magnitudeSquared(), (x + y) + z by the stamp.
     const float distCenterSq = dot(relPointPos, relPointPos);
     if (maxDist < PX_MAX_F32)
     {
@@ -481,6 +511,8 @@ bool particlePrimitiveCollision(float3 particlePos, float3 cVolumePos, float cVo
         // minus turns the +0 dot of a plane through the origin into -0, and dist = dot + pdd
         // then keeps a -0 dot (particle exactly on the plane) that the CUDA's +0 pdd turns
         // into +0 -- stored as normal_pen.w when restDistance == +0.
+        // P9.89: p.dot(n) here and both plane.distance() dots below (PxPlane.h,
+        // cudaParticleSystem.cu:285-294) are (x + y) + z by the stamp.
         const float pdot = dot(pn, shapeP);
         const float pdd = (pdot == 0.0f) ? 0.0f : -pdot;
         dist = dot(pn, cVolumePos) + pdd;
@@ -1035,8 +1067,16 @@ void ps_primitivesDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 //     `pen = (witnessB - witnessA) * normal` per component, then the three
 //     components are shuffled together and restDistance subtracted ONCE.  That
 //     is `dot(closestPointB - closestPointA, direction) - restDistance`, and
-//     the summation order is lane 0 + lane 1 + lane 2, i.e. x + y + z left to
-//     right -- which is what `dot` lowers to, so the spelling is kept.
+//     the summation order is lane 0 + lane 1 + lane 2, i.e. (x + y) + z, with
+//     each lane product rounded before it crosses lanes.
+//     P9.89 corrected this note.  It used to say "which is what `dot` lowers
+//     to".  That holds only for a NoContraction-DECORATED OpDot.  On an
+//     undecorated one llvmpipe evaluates x + (y + z).  That is a different
+//     association, not a contraction into fmas: the association model missed 0
+//     of 65536 random cases, and the port differed from the CUDA on 19346 of
+//     them.  The old measurement of (x + y) + z came from a stamped fixture.
+//     This .spv was unstamped until P9.89.  Now it is stamped, and the stamp is
+//     what keeps `dot` in the lane order (see the P9.89 note at the imports).
 //
 // X9 -- the filter IS applied here, unlike the diffuse twin, and its particle
 //     key is the UNSORTED index (mSortedToUnsortedMapping), not the sorted one
@@ -1111,6 +1151,9 @@ bool particleConvexCollision(float3 particlePos, float3 cVolumePos, float cVolum
 
     float3 dir0 = float3(1.0f, 0.0f, 0.0f);
     const float3 aToB0 = cVolumePos - hullOrigin;
+    // P9.89: cu:698 magnitudeSquared() > 0.  A sum of three squares is positive
+    // exactly when one square is (NaN and inf behave the same either way), so this
+    // test and its second-pass twin (cu:733) do not depend on the order.
     if (dot(aToB0, aToB0) > 0.0f) dir0 = aToB0;
 
     if (!enableCCD)
@@ -1265,7 +1308,9 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
                                          cDistance, rigidP, hull, inSphereRadius1, o))
                 continue;
 
-            // X8 / X7.
+            // X8 / X7.  P9.89: cudaParticleSystem.cu:963-964, shfl0 + shfl1 + shfl2
+            // - restDistance = ((p0 + p1) + p2) - restDistance.  The stamp keeps
+            // OpDot in that order (testPsConvexContactGen p89PenLaneOrder).
             const float pen = dot(o.closestPointB.xyz - o.closestPointA.xyz,
                                   o.direction.xyz) - restDistance;
 
@@ -1501,7 +1546,9 @@ void ps_convexDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
                                          cDistance, rigidP, hull, inSphereRadius1, o))
                 continue;
 
-            // X8 / X7: the dot product, and the NEGATED normal.
+            // X8 / X7: the dot product, and the NEGATED normal.  P9.89:
+            // cudaParticleSystem.cu:1116-1117, ((p0 + p1) + p2) - restDistance.  The
+            // stamp keeps OpDot in that order (psConvexDiffuseContactGen_p89PenLaneOrder).
             const float pen = dot(o.closestPointB.xyz - o.closestPointA.xyz,
                                   o.direction.xyz) - restDistance;
 
