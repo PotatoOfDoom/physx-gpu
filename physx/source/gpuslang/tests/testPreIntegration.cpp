@@ -41,6 +41,20 @@ namespace
 
 using namespace pxgtest;
 
+// P9.90: every dot product of the reference goes through preDot.  The CUDA's
+// PxVec3::magnitudeSquared / magnitude (PxVec3.h:173/:274, preIntegration.cuh
+// :117/:123/:315-316) is x*x + y*y + z*z = (x + y) + z.  gPreDotOrder = 1 re-runs
+// the reference in the order llvmpipe gives an UNDECORATED OpDot, x + (y + z):
+// the twin the p90 fixture must differ from, so it can see a missing
+// NoContraction stamp on preIntegration.spv.
+int gPreDotOrder = 0;
+
+float preDot(const Vec3& a, const Vec3& b)
+{
+    const float x = a.x * b.x, y = a.y * b.y, z = a.z * b.z;
+    return gPreDotOrder == 0 ? (x + y) + z : x + (y + z);
+}
+
 // ---------------------------------------------------------------------------
 // CPU reference: direct transcription of preIntegration.cuh
 // ---------------------------------------------------------------------------
@@ -101,11 +115,11 @@ void bodyCoreComputeUnconstrainedVelocity(const Float4& maxVelSq_damping, Float4
     linearVelocity *= linVelMultiplier;
     angularVelocity *= angVelMultiplier;
 
-    const float angVelSq = angularVelocity.magnitudeSquared();
+    const float angVelSq = preDot(angularVelocity, angularVelocity);
     if (angVelSq > temp.y)
         angularVelocity *= std::sqrt(temp.y / angVelSq);
 
-    const float linVelSq = linearVelocity.magnitudeSquared();
+    const float linVelSq = preDot(linearVelocity, linearVelocity);
     if (linVelSq > temp.x)
         linearVelocity *= std::sqrt(temp.x / linVelSq);
 
@@ -192,8 +206,8 @@ void referencePreIntegration(uint32_t nbSolverBodies, float dt, const Vec3& grav
             const Vec3 origMom = localInertia.multiply(localAngVel);
             const Vec3 torque = -localAngVel.cross(origMom);
             Vec3 newMom = origMom + torque * dt;
-            const float denom = newMom.magnitude();
-            const float ratio = denom > 0.f ? origMom.magnitude() / denom : 0.f;
+            const float denom = std::sqrt(preDot(newMom, newMom));
+            const float ratio = denom > 0.f ? std::sqrt(preDot(origMom, origMom)) / denom : 0.f;
             newMom *= ratio;
             const Vec3 newDeltaAngVel = q.rotate(inverseInertia.multiply(newMom) - localAngVel);
 
@@ -734,6 +748,176 @@ void checkPreIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool skipGravity, 
 
     for (PxgDevicePtr p : { dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices })
         shim.memFree(p);
+}
+
+// P9.90: the dot order.  preIntegration's float OpDots are the velocity-clamp
+// magnitudes angVelSq / linVelSq (preIntegration.cuh:117/:123) and the gyroscopic
+// momentum magnitudes newMom.magnitude() / origMom.magnitude() (:315-316), all
+// PxVec3 dots, (x + y) + z.  They reach the outputs through the clamp scale
+// sqrt(maxVelSq / velSq) and the momentum ratio, so every body here is clamped on
+// both velocities, half of them run the gyroscopic model, and all values are
+// general (random orientation, non-round velocities, inertias, limits, gravity).
+// Every word the kernel writes for a body (both velocity-pool slots, the pose,
+// the whole PxgSolverBodyData and PxgSolverTxIData, the solver-body index) is
+// compared BITWISE against the -ffp-contract=off mirror; the gPreDotOrder = 1
+// twin must differ on enough words that a build summing x + (y + z) -- the
+// .spv without its NoContraction stamp -- cannot pass.
+void checkPreIntegrationP90(bool tgs, uint32_t nbBodies, uint32_t seed)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-7.3f, 7.3f);
+
+    const uint32_t maxNodes = nbBodies + 17;
+    std::vector<uint32_t> nodePool(maxNodes);
+    std::iota(nodePool.begin(), nodePool.end(), 0u);
+    std::shuffle(nodePool.begin(), nodePool.end(), rng);
+    std::vector<uint64_t> islandNodeIndices(nbBodies);
+    for (uint32_t i = 0; i < nbBodies; ++i)
+        islandNodeIndices[i] = makeNodeIndex(nodePool[i]);
+
+    std::vector<BodySim> bodySims(maxNodes);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    for (BodySim& b : bodySims)
+    {
+        b.linearVelocityXYZ_inverseMassW = Float4{ sym(rng), sym(rng), sym(rng), 0.1f + unit(rng) };
+        b.angularVelocityXYZ_maxPenBiasW = Float4{ sym(rng), sym(rng), sym(rng), -unit(rng) };
+        // limits well below |v|^2 (>= ~1 per axis on average): the clamp fires
+        b.maxLinearVelocitySqX_maxAngularVelocitySqY_linearDampingZ_angularDampingW =
+            Float4{ 0.173f + unit(rng) * 2.9f, 0.211f + unit(rng) * 2.7f, unit(rng) * 0.37f, unit(rng) * 0.41f };
+        b.inverseInertiaXYZ_contactReportThresholdW =
+            Float4{ 0.13f + unit(rng) * 3.7f, 0.17f + unit(rng) * 3.3f, 0.11f + unit(rng) * 3.9f, unit(rng) };
+        b.sleepAngVelAccXYZ_accelScaleW = Float4{ 0, 0, 0, 0.3f + unit(rng) };
+        b.body2World.q = randomQuat(rng).toFloat4();
+        b.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        b.body2Actor_maxImpulseW.q = Float4{ 0, 0, 0, 1 };
+        b.body2Actor_maxImpulseW.p = Float4{ 0, 0, 0, unit(rng) * 100.f };
+        b.internalFlags = unit(rng) < 0.5f ? eENABLE_GYROSCOPIC : 0u;
+        b.lockFlags = 0;
+        b.disableGravity = 0;
+        b.offsetSlop = unit(rng) * 0.01f;
+        b.externalLinearAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+        b.externalAngularAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+    }
+
+    const float dt = 1.f / 57.f;
+    const Vec3 gravity(0.37f, -9.81f, 1.23f);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { tgs ? PxgKernelDef{ "preIntegration.spv", "preIntegrationLaunchTGS", 96u, 0 }
+                                          : PxgKernelDef{ "preIntegration.spv", "preIntegrationLaunch", 88u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &preIntShimLoader);
+
+    PxgDevicePtr dData = 0, dSleep = 0, dTxi = 0, dBody = 0, dNodes = 0, dXform = 0, dVel = 0, dIndices = 0;
+    shim.memAlloc(&dData, nbBodies * sizeof(SolverBodyData));
+    shim.memAlloc(&dSleep, nbBodies * 32);
+    shim.memAlloc(&dTxi, nbBodies * sizeof(SolverTxIData));
+    shim.memAlloc(&dBody, bodySims.size() * sizeof(BodySim));
+    shim.memAlloc(&dNodes, islandNodeIndices.size() * 8);
+    shim.memAlloc(&dXform, nbBodies * sizeof(AlignedTransform));
+    shim.memAlloc(&dVel, 2 * nbBodies * sizeof(Float4));
+    shim.memAlloc(&dIndices, maxNodes * 4);
+    if (!dData || !dTxi || !dBody || !dNodes || !dXform || !dVel || !dIndices)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    std::vector<uint8_t> junk(nbBodies * sizeof(SolverBodyData), 0x3A);
+    shim.memcpyHtoD(dData, junk.data(), nbBodies * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dTxi, junk.data(), nbBodies * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dXform, junk.data(), nbBodies * sizeof(AlignedTransform));
+    shim.memcpyHtoD(dVel, junk.data(), 2 * nbBodies * sizeof(Float4));
+    const std::vector<uint32_t> bodyIndicesInit(maxNodes, 0xFFFFFFFFu);
+    shim.memcpyHtoD(dIndices, bodyIndicesInit.data(), maxNodes * 4);
+    shim.memcpyHtoD(dBody, bodySims.data(), bodySims.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dNodes, islandNodeIndices.data(), islandNodeIndices.size() * 8);
+
+    struct
+    {
+        uint32_t offset;
+        uint32_t nbSolverBodies;
+        float dt;
+        float gx, gy, gz;
+        uint64_t solverBodyDataPool, solverBodySleepDataPool, solverTxIDataPool, bodySimPool;
+        uint64_t islandNodeIndices, transforms, outVelocityPool, solverBodyIndices;
+        uint32_t skipGravityApplication;
+    } prm = { 0, nbBodies, dt, gravity.x, gravity.y, gravity.z,
+              dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices, 0u };
+    static_assert(sizeof(prm) == 96, "preIntegrationLaunchTGS blob is 96 bytes (PGS uses the first 88)");
+
+    const uint32_t nbBlocks = (nbBodies + 127) / 128;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, tgs ? 96u : 88u) == PxgResult::Success,
+                  "launch preIntegration p90");
+    shim.streamSynchronize();
+
+    auto words = [&](const std::vector<SolverBodyData>& d, const std::vector<SolverTxIData>& t,
+                     const std::vector<AlignedTransform>& x, const std::vector<Float4>& v,
+                     const std::vector<uint32_t>& idx) {
+        std::vector<uint32_t> w;
+        auto put = [&](const void* p, size_t bytes) {
+            const uint32_t* u = static_cast<const uint32_t*>(p);
+            w.insert(w.end(), u, u + bytes / 4);
+        };
+        put(d.data(), nbBodies * sizeof(SolverBodyData));
+        put(t.data(), nbBodies * sizeof(SolverTxIData));
+        put(x.data(), nbBodies * sizeof(AlignedTransform));
+        put(v.data(), 2 * nbBodies * sizeof(Float4));
+        put(idx.data(), maxNodes * 4);
+        return w;
+    };
+
+    RefOutputs ref, twin;
+    referencePreIntegration(nbBodies, dt, gravity, false, bodySims, islandNodeIndices, maxNodes, ref);
+    gPreDotOrder = 1;
+    referencePreIntegration(nbBodies, dt, gravity, false, bodySims, islandNodeIndices, maxNodes, twin);
+    gPreDotOrder = 0;
+
+    const std::vector<uint32_t> g = words(downloadShim<SolverBodyData>(shim, dData, nbBodies),
+                                          downloadShim<SolverTxIData>(shim, dTxi, nbBodies),
+                                          downloadShim<AlignedTransform>(shim, dXform, nbBodies),
+                                          downloadShim<Float4>(shim, dVel, 2 * nbBodies),
+                                          downloadShim<uint32_t>(shim, dIndices, maxNodes));
+    const std::vector<uint32_t> r = words(ref.solverBodyData, ref.txIData, ref.transforms, ref.velocityPool,
+                                          ref.solverBodyIndices);
+    const std::vector<uint32_t> t = words(twin.solverBodyData, twin.txIData, twin.transforms, twin.velocityPool,
+                                          twin.solverBodyIndices);
+
+    uint32_t miss = 0, missEqTwin = 0, twinDiff = 0, firstMiss = ~0u;
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        if (t[i] != r[i])
+            ++twinDiff;
+        if (g[i] != r[i])
+        {
+            if (firstMiss == ~0u)
+                firstMiss = uint32_t(i);
+            ++miss;
+            if (g[i] == t[i])
+                ++missEqTwin;
+        }
+    }
+    const char* tag = tgs ? "TGS" : "PGS";
+    std::printf("  p90 %s: %zu words, twin differs on %u, gpu differs on %u (%u of them equal the twin)\n", tag,
+                r.size(), twinDiff, miss, missEqTwin);
+    PXG_CHECK_MSG(twinDiff >= 64u, "p90 %s: the x + (y + z) twin differs on only %u words -- the fixture "
+                  "no longer observes the dot order", tag, twinDiff);
+    PXG_CHECK_MSG(miss == 0u, "p90 %s: %u/%zu words differ from the CUDA-order reference (%u equal the "
+                  "x + (y + z) twin; first word %u) -- preIntegration.spv lost its NoContraction stamp?",
+                  tag, miss, r.size(), missEqTwin, firstMiss);
+
+    for (PxgDevicePtr p : { dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices })
+        shim.memFree(p);
+}
+
+PXG_TEST(preIntegration_p90DotOrder)
+{
+    checkPreIntegrationP90(false, 384, 9001);
+    checkPreIntegrationP90(true, 384, 9002);
 }
 
 PXG_TEST(preIntegration_launchTGS)

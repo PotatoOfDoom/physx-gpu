@@ -258,7 +258,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # (utility.cu:77/:82/:87) are PxVec3 dots, (x + y) + z (PxVec3.h:173/:274);
     # unstamped, llvmpipe summed them x + (y + z).  skinning.slang imports no module.
     # testUtilities skinning_p90DotOrder compares the normals and skinned vertices bitwise.
-    skinning)
+    skinning
+    # P9.90: the rigid pre-integration (PGS and TGS entries).  The velocity-clamp
+    # magnitudes angVelSq / linVelSq (preIntegration.cuh:117/:123) and the gyroscopic
+    # newMom/origMom magnitudes (:315-316) are PxVec3 dots, (x + y) + z (PxVec3.h:173/:274);
+    # unstamped, llvmpipe summed them x + (y + z).  Its only import, pxgSlangCommon,
+    # contributes explicit mul+add chains (quatRotate, mat33FromQuat,
+    # transformInertiaTensor), and no other kernel is compared against this one.
+    # testPreIntegration preIntegration_p90DotOrder compares every output word bitwise
+    # and fails without this entry.
+    preIntegration)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
