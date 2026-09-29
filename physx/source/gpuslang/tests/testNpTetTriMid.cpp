@@ -1565,6 +1565,184 @@ PXG_TEST(npTetTriMid_p89SatProbe)
 }
 
 // ===========================================================================
+// P9.89 -- tetBoundingBox (deformableCollision.cuh:64-94), called by computeTetBoundWithTetrahedron
+// (softbodySoftbodyMidPhase.cu:655-670): per axis PxMin(PxMin(v0, v1), PxMin(v2, v3)) and the PxMax
+// twin, the pairwise tree of selects.  Both ports spelled it min()/max() (FMin/FMax).  It is
+// output-equivalent in both kernels -- a NaN corner fails isValidTet before the bound is taken,
+// and the box test reads the bound through `>`/`<` and through mn - tMax / mx - tMin taken only
+// when that difference is non-zero, none of which sees a zero's sign -- so it is read out through
+// a probe: ctTetTriBoundProbe here (npTetTriMid_p89BoundProbe), sb_clothMidphaseSatProbe for the
+// engine port (softBodySimClothMidphase_p89SatProbe).  The records are +-0 / non-finite
+// coordinate patterns and dyadic values, so every word is exact.
+// ===========================================================================
+namespace p89tt
+{
+struct TbRec { F4 t[4]; };
+static_assert(sizeof(TbRec) == 4 * 16, "bound record must be TB_REC_FLOAT4S = 4 float4s");
+enum TbFam { TBPAT = 0, TBRANDOM, TBFAM_COUNT };
+
+static void tbRef(const TbRec& r, uint32_t rv, float o[6])
+{
+    const V3 t[4] = { v3(r.t[0]), v3(r.t[1]), v3(r.t[2]), v3(r.t[3]) };
+    V3 mn, mx;
+    tetBound(t, mn, mx, rv);
+    o[0] = mn.x; o[1] = mn.y; o[2] = mn.z;
+    o[3] = mx.x; o[4] = mx.y; o[5] = mx.z;
+}
+static uint32_t tbDiffWords(const TbRec& r, uint32_t rv)
+{
+    float c[6], m[6];
+    tbRef(r, 0u, c);
+    tbRef(r, rv, m);
+    uint32_t n = 0;
+    for (int w = 0; w < 6; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
+    return n;
+}
+// tetBoundingBox corners: for each of the six selects, each operand order and each class
+// (signed-zero ties / non-finite), four records whose single-site twin changes a word; then
+// fillers up to `fillTo`.  Every coordinate is a planted pattern or a dyadic value.
+static void genTbRecords(uint64_t seed, size_t fillTo, std::vector<TbRec>& recs, std::vector<int>& fam,
+                         uint32_t& missing)
+{
+    uint64_t rs = seed;
+    auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
+    auto pick = [&](int n) { return int(u() * float(n)) % n; };
+    auto dy = [&](int lo, int hi, int den) { return float(pick(hi - lo + 1) + lo) / float(den); };
+    const float PAT[10] = { -0.0f, 0.0f, -1.25f, -0.75f, 0.5f, 1.5f, 0.25f, QNAN, INF, -INF };
+    auto patFinite = [&](bool zeroOnly) { return zeroOnly ? PAT[pick(2)] : PAT[pick(7)]; };
+    auto patAny = [&]() { return PAT[pick(10)]; };
+
+    for (uint32_t s = 0; s < TB_COUNT; ++s)
+        for (int sw = 0; sw < 2; ++sw)
+        {
+            const uint32_t site = sw ? ((1u << (TB_SHIFT + s)) << SWAP_SHIFT) : (1u << (TB_SHIFT + s));
+            for (int nonfin = 0; nonfin < 2; ++nonfin)
+            {
+                int found = 0;
+                for (int tries = 0; tries < 400000 && found < 4; ++tries)
+                {
+                    TbRec r;
+                    bool anyNonfin = false;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        float* c = &r.t[k].x;
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            c[i] = nonfin ? patAny() : patFinite(u() < 0.6f);
+                            anyNonfin = anyNonfin || !std::isfinite(c[i]);
+                        }
+                        r.t[k].w = 0.0f;
+                    }
+                    if (bool(nonfin) != anyNonfin) continue;
+                    if (tbDiffWords(r, site) == 0u) continue;
+                    recs.push_back(r); fam.push_back(TBPAT); ++found;
+                }
+                if (found < 4) ++missing;
+            }
+        }
+    while (recs.size() < fillTo)
+    {
+        TbRec r;
+        for (int k = 0; k < 4; ++k)
+        {
+            float* c = &r.t[k].x;
+            for (int i = 0; i < 3; ++i) c[i] = (u() < 0.3f) ? patAny() : dy(-48, 48, 32);
+            r.t[k].w = 0.0f;
+        }
+        recs.push_back(r); fam.push_back(TBRANDOM);
+    }
+}
+} // namespace p89tt
+
+PXG_TEST(npTetTriMid_p89BoundProbe)
+{
+    using namespace p89tt;
+    const char* tag = "p89 tetBound probe";
+    std::vector<TbRec> recs;
+    std::vector<int> fam;
+    uint32_t missing = 0;
+    genTbRecords(0x7b0d89a1ull, 192u, recs, fam, missing);
+    PXG_CHECK_MSG(missing == 0u, "%s: %u planted (site, zero/non-finite) classes found fewer than four records", tag,
+                  missing);
+    const uint32_t N = uint32_t(recs.size());
+
+    // ---- the battery has to SEE every select and every operand order --------------------------
+    uint32_t blind = 0, twinWords = 0;
+    std::printf("    [%s] %u records; words each single-site twin changes:\n", tag, N);
+    for (uint32_t s = 0; s < TB_COUNT; ++s)
+    {
+        const uint32_t site = 1u << (TB_SHIFT + s);
+        uint32_t rvW = 0, swW = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            rvW += tbDiffWords(recs[i], site);
+            swW += tbDiffWords(recs[i], site << SWAP_SHIFT);
+        }
+        std::printf("      %-20s revert %3u  swap %3u\n", kTbSiteName[s], rvW, swW);
+        if (rvW < 4u || swW < 4u) ++blind;
+    }
+    for (uint32_t i = 0; i < N; ++i) twinWords += tbDiffWords(recs[i], TB_ALL);
+    std::printf("      old FMin/FMax twin: %u words\n", twinWords);
+    PXG_CHECK_MSG(blind == 0u, "%s: %u selects are changed on fewer than four words by their revert or swap", tag, blind);
+
+    // ---- run the probe on ctTetTriMid's bindings ------------------------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> in(size_t(N) * 4);
+    std::memcpy(in.data(), recs.data(), sizeof(TbRec) * N);
+    std::vector<U4> outInit(size_t(N) * 2, { 0x7f800001u, 1u, 2u, 3u });
+    std::vector<Bv32Node> dNodes(1);
+    std::memset(dNodes.data(), 0, sizeof(Bv32Node));
+    std::vector<U4> dTris(1, { 0, 0, 0, 0 });
+    std::vector<TtWork> dWork(1);
+    std::memset(dWork.data(), 0, sizeof(TtWork));
+    std::vector<uint32_t> dCnt(1, 0);
+    PxgBufferHandle bN = createBufferFrom(dev, dNodes);
+    PxgBufferHandle bT = createBufferFrom(dev, dTris);
+    PxgBufferHandle bV = createBufferFrom(dev, in);
+    PxgBufferHandle bW = createBufferFrom(dev, dWork);
+    PxgBufferHandle bP = createBufferFrom(dev, outInit);
+    PxgBufferHandle bC = createBufferFrom(dev, dCnt);
+    TtParams prm = { N, 0, 0, 0 };
+    Kernel k("npTetTriMid.spv", "ctTetTriBoundProbe",
+             { (uint32_t)sizeof(Bv32Node), 16, 16, (uint32_t)sizeof(TtWork), 16, 4 }, sizeof(TtParams));
+    k.dispatch((N + 31u) / 32u, { bN, bT, bV, bW, bP, bC }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<U4>(dev, bP, size_t(N) * 2);
+    dev->destroyBuffer(bN); dev->destroyBuffer(bT); dev->destroyBuffer(bV);
+    dev->destroyBuffer(bW); dev->destroyBuffer(bP); dev->destroyBuffer(bC);
+
+    uint32_t bad[TBFAM_COUNT] = {}, badWords = 0, asOld = 0, badPad = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        float c[6], t[6];
+        tbRef(recs[i], 0u, c);
+        tbRef(recs[i], TB_ALL, t);
+        const uint32_t gw[8] = { g[2 * i].x, g[2 * i].y, g[2 * i].z, g[2 * i].w,
+                                 g[2 * i + 1].x, g[2 * i + 1].y, g[2 * i + 1].z, g[2 * i + 1].w };
+        badPad += (gw[6] != 0u || gw[7] != 0u) ? 1u : 0u;
+        bool recBad = false;
+        for (int w = 0; w < 6; ++w)
+        {
+            float gv;
+            std::memcpy(&gv, &gw[w], 4);
+            if (sameWord(gv, c[w])) continue;
+            recBad = true;
+            ++badWords;
+            if (sameWord(gv, t[w])) ++asOld;
+            if (badWords <= 6)
+                std::printf("    %s rec %u word %d: gpu %08x (%g) cuda %08x (%g) old twin %08x (%g)\n", tag, i, w, gw[w],
+                            gv, f2u(c[w]), c[w], f2u(t[w]), t[w]);
+        }
+        if (recBad) ++bad[fam[i]];
+    }
+    PXG_CHECK_MSG(badPad == 0u, "%s: %u records with a non-zero pad word", tag, badPad);
+    PXG_CHECK_MSG(badWords == 0u,
+                  "%s: %u words differ from the CUDA's select tree (%u of them equal the old FMin/FMax twin) -- "
+                  "records by family: planted %u, random %u",
+                  tag, badWords, asOld, bad[TBPAT], bad[TBRANDOM]);
+}
+
+// ===========================================================================
 // P9.89 -- the same folds in the ENGINE kernel: sb_clothMidphaseGeneratePairsLaunch
 // (softBodyClothMidphaseBda.slang, SB_CLOTH_MIDPHASE; softbodySoftbodyMidPhase.cu:1299-1444).
 //
@@ -1646,29 +1824,10 @@ static V3 quatRotateInv(const float q[4], V3 v)
              vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2 };
 }
 
-// ---- the probe: SAT record + tetBoundingBox corners ----------------------------------------
-struct TbRec { F4 t[4]; };
+// ---- the probe: SAT record + tetBoundingBox corners (p89tt::TbRec) ------------------------
 struct SbcRec { TpRec sat; TbRec tb; };
 static_assert(sizeof(SbcRec) == 13 * 16, "probe record must be SBC_PROBE_IN_FLOAT4S = 13 float4s");
-enum TbFam { TBPAT = 0, TBRANDOM, TBFAM_COUNT };
 
-static void tbRef(const TbRec& r, uint32_t rv, float o[6])
-{
-    const V3 t[4] = { v3(r.t[0]), v3(r.t[1]), v3(r.t[2]), v3(r.t[3]) };
-    V3 mn, mx;
-    tetBound(t, mn, mx, rv);
-    o[0] = mn.x; o[1] = mn.y; o[2] = mn.z;
-    o[3] = mx.x; o[4] = mx.y; o[5] = mx.z;
-}
-static uint32_t tbDiffWords(const TbRec& r, uint32_t rv)
-{
-    float c[6], m[6];
-    tbRef(r, 0u, c);
-    tbRef(r, rv, m);
-    uint32_t n = 0;
-    for (int w = 0; w < 6; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
-    return n;
-}
 // words 0..3 = the SAT (satIntersect<false>), 4..9 = tMin.xyz, tMax.xyz
 static void sbcProbeRef(const SbcRec& r, uint32_t rv, float o[10])
 {
@@ -1683,61 +1842,6 @@ static uint32_t sbcDiffWords(const SbcRec& r, uint32_t rv)
     uint32_t n = 0;
     for (int w = 0; w < 10; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
     return n;
-}
-
-// tetBoundingBox corners: for each of the six selects, each operand order and each class
-// (signed-zero ties / non-finite), four records whose single-site twin changes a word; then
-// fillers up to `fillTo`.  Every coordinate is a planted pattern or a dyadic value.
-static void genTbRecords(uint64_t seed, size_t fillTo, std::vector<TbRec>& recs, std::vector<int>& fam,
-                         uint32_t& missing)
-{
-    uint64_t rs = seed;
-    auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
-    auto pick = [&](int n) { return int(u() * float(n)) % n; };
-    auto dy = [&](int lo, int hi, int den) { return float(pick(hi - lo + 1) + lo) / float(den); };
-    const float PAT[10] = { -0.0f, 0.0f, -1.25f, -0.75f, 0.5f, 1.5f, 0.25f, QNAN, INF, -INF };
-    auto patFinite = [&](bool zeroOnly) { return zeroOnly ? PAT[pick(2)] : PAT[pick(7)]; };
-    auto patAny = [&]() { return PAT[pick(10)]; };
-
-    for (uint32_t s = 0; s < TB_COUNT; ++s)
-        for (int sw = 0; sw < 2; ++sw)
-        {
-            const uint32_t site = sw ? ((1u << (TB_SHIFT + s)) << SWAP_SHIFT) : (1u << (TB_SHIFT + s));
-            for (int nonfin = 0; nonfin < 2; ++nonfin)
-            {
-                int found = 0;
-                for (int tries = 0; tries < 400000 && found < 4; ++tries)
-                {
-                    TbRec r;
-                    bool anyNonfin = false;
-                    for (int k = 0; k < 4; ++k)
-                    {
-                        float* c = &r.t[k].x;
-                        for (int i = 0; i < 3; ++i)
-                        {
-                            c[i] = nonfin ? patAny() : patFinite(u() < 0.6f);
-                            anyNonfin = anyNonfin || !std::isfinite(c[i]);
-                        }
-                        r.t[k].w = 0.0f;
-                    }
-                    if (bool(nonfin) != anyNonfin) continue;
-                    if (tbDiffWords(r, site) == 0u) continue;
-                    recs.push_back(r); fam.push_back(TBPAT); ++found;
-                }
-                if (found < 4) ++missing;
-            }
-        }
-    while (recs.size() < fillTo)
-    {
-        TbRec r;
-        for (int k = 0; k < 4; ++k)
-        {
-            float* c = &r.t[k].x;
-            for (int i = 0; i < 3; ++i) c[i] = (u() < 0.3f) ? patAny() : dy(-48, 48, 32);
-            r.t[k].w = 0.0f;
-        }
-        recs.push_back(r); fam.push_back(TBRANDOM);
-    }
 }
 } // namespace p89sbc
 

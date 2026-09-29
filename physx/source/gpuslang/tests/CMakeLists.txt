@@ -1374,8 +1374,9 @@ pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)
 pxg_compile_shader(npSbSb ctSbSbQuery)
 # P9.89: ctTetTriSatProbe, a test-only entry that reads the tet-vs-triangle SAT's
-# selectMin/selectMax folds out bit for bit (npTetTriMid_p89SatProbe).
-pxg_compile_shader(npTetTriMid ctTetTriMid ctTetTriSatProbe)
+# selectMin/selectMax folds out bit for bit (npTetTriMid_p89SatProbe), and ctTetTriBoundProbe,
+# the same for tetBoundingBox (npTetTriMid_p89BoundProbe).
+pxg_compile_shader(npTetTriMid ctTetTriMid ctTetTriSatProbe ctTetTriBoundProbe)
 pxg_compile_shader(psPrimContact ctPsPrimContact)
 pxg_compile_shader(psBounds ctPsBoundFirstPass ctPsBoundSecondPass ctPsReorderContacts ctPsGridHash)
 # P6.4a-1: PBD particle bound / cell-range bookkeeping on the engine ABI (BDA).

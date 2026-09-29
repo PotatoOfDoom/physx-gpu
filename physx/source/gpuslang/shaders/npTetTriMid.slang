@@ -200,6 +200,24 @@ float satIntersectTetTri(float3 pn[4], float pd[4], float3 centroid,
     return sep;
 }
 
+// tetBoundingBox (deformableCollision.cuh:64-94), called by computeTetBoundWithTetrahedron
+// (softbodySoftbodyMidPhase.cu:655-670).  P9.89: per axis tX0 = PxMin(v0, v1), tX1 = PxMin(v2, v3),
+// minimum = PxMin(tX0, tX1) (:70-80), and the PxMax twin for the maximum (:83-93) -- the pairwise
+// tree, as selects (see ttSelMin above).  It was left FMin/FMax at first because it is
+// output-equivalent here: a NaN corner already failed isValidTet (every NaN reaches the
+// determinant), and the box test reads tMin/tMax through `>`/`<` and through `mn - tMax` /
+// `mx - tMin` evaluated only when that difference is non-zero -- none of which sees a zero's sign.
+// As a function it was not the CUDA's: a +-0 tie or a NaN corner changed its words.
+// npTetTriMid_p89BoundProbe reads it out bit for bit through ctTetTriBoundProbe.
+float3 ttSelMin3(float3 a, float3 b) { return float3(ttSelMin(a.x, b.x), ttSelMin(a.y, b.y), ttSelMin(a.z, b.z)); }
+float3 ttSelMax3(float3 a, float3 b) { return float3(ttSelMax(a.x, b.x), ttSelMax(a.y, b.y), ttSelMax(a.z, b.z)); }
+
+void tetBoundingBox(float3 t0, float3 t1, float3 t2, float3 t3, out float3 tMin, out float3 tMax)
+{
+    tMin = ttSelMin3(ttSelMin3(t0, t1), ttSelMin3(t2, t3));
+    tMax = ttSelMax3(ttSelMax3(t0, t1), ttSelMax3(t2, t3));
+}
+
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -215,13 +233,8 @@ void ctTetTriMid(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     // computeTetBoundWithTetrahedron
     if (!isValidTet(t0, t1, t2, t3)) return; // group-uniform
 
-    // tetBoundingBox (deformableCollision.cuh:64-94) folds with PxMin/PxMax<float> selects too;
-    // P9.89 keeps FMin/FMax here because it is output-equivalent: a NaN vertex already failed
-    // isValidTet above (every NaN reaches the determinant), so only a +-0 tie can differ, and
-    // the box test reads tMin/tMax through `>`/`<` and through `mn - tMax` / `mx - tMin`
-    // evaluated only when that difference is non-zero -- none of which sees a zero's sign.
-    const float3 tMin = min(min(t0, t1), min(t2, t3));
-    const float3 tMax = max(max(t0, t1), max(t2, t3));
+    float3 tMin, tMax;
+    tetBoundingBox(t0, t1, t2, t3, tMin, tMax);
 
     // constructTetrahedron: planes + centroid ((a+b+c)/3 — as the CUDA does)
     float3 pn[4];
@@ -432,4 +445,34 @@ void ctTetTriSatProbe(uint3 dtid : SV_DispatchThreadID)
                       asuint(satIntersectTetTri(pn, pd, ct.xyz, v0, v1, v2, ct.w)),
                       asuint(satIntersectTetTri(pn, pd, ct.xyz, v0, v1, v2, PX_MAX_F32)),
                       asuint(minProject3(tn, td, v0, v1, v2)));
+}
+
+// ===========================================================================
+// ctTetTriBoundProbe -- P9.89: tetBoundingBox read out bit for bit.  Test-only entry (never in
+// the manifest), on ctTetTriMid's own bindings.
+//
+// WHY A PROBE.  In ctTetTriMid the bound is output-equivalent: a NaN corner fails isValidTet
+// before the bound is taken, and the box test reads tMin/tMax through `>`/`<` and through
+// mn - tMax / mx - tMin taken only when that difference is non-zero, none of which sees a zero's
+// sign.  The function is still a transcription of the CUDA's selects and has to be bit-exact.
+//
+// Record r = gTriVerts[r * TB_REC_FLOAT4S + 0 .. 3]: the tet corners t0..t3 (xyz).
+// Output gPairs[2r] = asuint(tMin.xyz, tMax.x), gPairs[2r + 1] = asuint(tMax.yz, 0, 0).
+// gParams.numWorkItems is the record count.
+// ===========================================================================
+static const uint TB_REC_FLOAT4S = 4;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void ctTetTriBoundProbe(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint r = dtid.x;
+    if (r >= gParams.numWorkItems)
+        return;
+    const uint b = r * TB_REC_FLOAT4S;
+    float3 tMin, tMax;
+    tetBoundingBox(gTriVerts[b + 0].xyz, gTriVerts[b + 1].xyz, gTriVerts[b + 2].xyz, gTriVerts[b + 3].xyz,
+                   tMin, tMax);
+    gPairs[2u * r] = uint4(asuint(tMin.x), asuint(tMin.y), asuint(tMin.z), asuint(tMax.x));
+    gPairs[2u * r + 1u] = uint4(asuint(tMax.y), asuint(tMax.z), 0u, 0u);
 }
