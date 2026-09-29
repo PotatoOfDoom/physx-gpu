@@ -152,7 +152,13 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # stamped.  testPsContactGen / testPsDiffuseContactGen / testPsConvexContactGen
     # (the p89 cases) compare against -ffp-contract=off mirrors in the CUDA order and
     # fail without this entry.
-    psContactGenBda)
+    psContactGenBda
+    # P9.89: the same getSpecVolume in ps_updateBoundFirstPassLaunch
+    # (particlesystem.cu:485/:505 -> gridCal.cuh:139) is psBoundsBda's only float OpDot.
+    # It sized the CCD particle AABBs as sqrt(x^2 + (y^2 + z^2)).  testPsBounds
+    # psBounds_p89SpecVolumeOrder plants order-sensitive block extremes and fails
+    # without this entry.
+    psBoundsBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

@@ -172,6 +172,13 @@ float getSpecVolume(out float3 cVolumePos, float3 currentPos, float3 predictedPo
     // P9.47: gridCal.cuh:139 is `cVolumeOffset.magnitude() + contactDist`, and
     // PxVec3::magnitude() is PxSqrt(magnitudeSquared()) -- not GLSL Length, which
     // the Vulkan environment spec leaves several ULP of room.
+    // P9.89: magnitudeSquared is (x*x + y*y) + z*z (PxVec3.h:173).  SPIR-V does not
+    // fix OpDot's summation order.  llvmpipe (Mesa lower_fdot) evaluates an
+    // undecorated OpDot as x + (y + z) and a NoContraction-decorated one as
+    // (x + y) + z, measured with 0/65536 misses each way.  So this dot is in the
+    // CUDA order only because psBoundsBda is in PXG_NOCONTRACT_SHADERS
+    // (tests/CMakeLists.txt).  testPsBounds psBounds_p89SpecVolumeOrder fails
+    // without that entry.
     return sqrt(dot(cVolumeOffset, cVolumeOffset)) + contactDist;
 }
 

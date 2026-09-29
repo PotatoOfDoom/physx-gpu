@@ -528,6 +528,10 @@ static int gAccVariant = 0;     // second pass, per-iteration accumulator
 
 struct Ties { uint32_t minTie = 0, maxTie = 0; };
 
+// P9.89 twin: 0 = the CUDA's PxVec3::magnitudeSquared, (x*x + y*y) + z*z; 1 = the
+// pre-P9.89 port, an undecorated OpDot that llvmpipe sums as x*x + (y*y + z*z).
+static int gSpecOrderVariant = 0;
+
 // getParticleSpeculativeContactVolume (gridCal.cuh:122-140) with contactDist 0;
 // scaleInv = 1 (diffuse, PGS) or 2 (TGS), PxVec3::magnitude = sqrt(x*x+y*y+z*z).
 static float specVolume(float c[3], const F4& cur, const F4& pred, bool isDiffuse, bool isTGS)
@@ -541,7 +545,8 @@ static float specVolume(float c[3], const F4& cur, const F4& pred, bool isDiffus
         o[k] = (pp[k] - pc[k]) * scaleInv * 0.5f;
         c[k] = pc[k] + o[k];
     }
-    return std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]) + 0.0f;
+    const float xx = o[0] * o[0], yy = o[1] * o[1], zz = o[2] * o[2];
+    return std::sqrt(gSpecOrderVariant ? (xx + (yy + zz)) : ((xx + yy) + zz)) + 0.0f;
 }
 
 // ps_updateBoundFirstPassLaunch: one PxBounds3 per 1024-thread block.  Ties
@@ -984,6 +989,130 @@ PXG_TEST(psBounds_updateBoundSecondPassEmptyLanes)
 
     dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bBoundArr.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCd.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.89: the speculative contact-volume radius in ps_updateBoundFirstPassLaunch
+// (particlesystem.cu:485/:505 -> gridCal.cuh:139) is cVolumeOffset.magnitude(),
+// PxSqrt((x*x + y*y) + z*z) (PxVec3.h:173).  psBoundsBda spells it
+// sqrt(dot(off, off)).  llvmpipe evaluates an UNDECORATED OpDot as x + (y + z)
+// and a NoContraction-decorated one as (x + y) + z, and psBoundsBda was
+// unstamped until P9.89.  The batteries above could not see this.  Their CCD
+// particles either rest (offset 0) or sit at +-50, where a one-ulp change of the
+// radius vanishes when it is added to the centre.
+//
+// Here every block's min and max in every axis is a PLANTED particle.  It sits
+// just outside a cloud of +-0.4, its offset has three non-zero components, and
+// the offset is searched until c -+ r differs between the two orders.  Regular
+// particles hold the minima and diffuse particles the maxima, so both
+// isDiffuse selectors are exercised.  The first-pass PxBounds3 image is
+// compared bit for bit.  The twin (gSpecOrderVariant = 1) must change every
+// planted value, and PGS and TGS both run.
+// ---------------------------------------------------------------------------
+PXG_TEST(psBounds_p89SpecVolumeOrder)
+{
+    using namespace psbz;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t NREG = 1500u, NDIFF = 1300u, MAXDIFF = 1500u;
+    const uint32_t nBlk = (std::max(NREG, MAXDIFF) + 1023u) / 1024u;   // 2
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        const bool isTGS = mode == 1;
+        std::mt19937 rng(8989u + uint32_t(mode));
+        std::uniform_real_distribution<float> upos(-0.4f, 0.4f), uoff(-0.05f, 0.05f), ubig(0.08f, 0.3f);
+        std::vector<F4> rCur(NREG), rPred(NREG), dCur(NDIFF), dPred(NDIFF);
+        for (uint32_t i = 0; i < NREG; ++i)
+        {
+            rCur[i] = F4{ upos(rng), upos(rng), upos(rng), 1.0f };
+            rPred[i] = F4{ rCur[i].x + uoff(rng), rCur[i].y + uoff(rng), rCur[i].z + uoff(rng), 1.0f };
+        }
+        for (uint32_t i = 0; i < NDIFF; ++i)
+        {
+            dCur[i] = F4{ upos(rng), upos(rng), upos(rng), 2.0f };
+            dPred[i] = F4{ dCur[i].x + uoff(rng), dCur[i].y + uoff(rng), dCur[i].z + uoff(rng), 2.0f };
+        }
+        // Plant, per block b and axis k: regular particle (b*1024 + 2k) is the block's
+        // MIN in axis k, diffuse particle (b*1024 + 2k + 1) its MAX.  Each is placed at
+        // -0.62 / +0.62 in that axis (outside the cloud and the cloud's own radii),
+        // and its offset is redrawn until the planted value differs between orders.
+        uint32_t planted = 0;
+        for (uint32_t b = 0; b < nBlk; ++b)
+            for (int k = 0; k < 3; ++k)
+                for (int side = 0; side < 2; ++side)
+                {
+                    const uint32_t i = b * 1024u + 2u * uint32_t(k) + uint32_t(side);
+                    const bool diffuse = side == 1;
+                    if (diffuse ? (i >= NDIFF) : (i >= NREG)) continue;
+                    std::vector<F4>& cur = diffuse ? dCur : rCur;
+                    std::vector<F4>& pred = diffuse ? dPred : rPred;
+                    for (int trial = 0; trial < 10000; ++trial)
+                    {
+                        F4 c{ upos(rng), upos(rng), upos(rng), cur[i].w };
+                        (&c.x)[k] = diffuse ? 0.62f : -0.62f;
+                        const float sg[3] = { rng() & 1u ? 1.0f : -1.0f, rng() & 1u ? 1.0f : -1.0f, rng() & 1u ? 1.0f : -1.0f };
+                        const F4 p{ c.x + sg[0] * ubig(rng) * 0.3f, c.y + sg[1] * ubig(rng) * 0.3f,
+                                    c.z + sg[2] * ubig(rng) * 0.3f, c.w };
+                        float cF[3], cR[3];
+                        gSpecOrderVariant = 0;
+                        const float rF = specVolume(cF, c, p, diffuse, isTGS);
+                        gSpecOrderVariant = 1;
+                        const float rR = specVolume(cR, c, p, diffuse, isTGS);
+                        gSpecOrderVariant = 0;
+                        const float vF = diffuse ? cF[k] + rF : cF[k] - rF;
+                        const float vR = diffuse ? cR[k] + rR : cR[k] - rR;
+                        if (fbits(vF) != fbits(vR)) { cur[i] = c; pred[i] = p; ++planted; break; }
+                    }
+                }
+        PXG_CHECK_MSG(planted == nBlk * 6u, "psBounds p89 %s: planted %u of %u order-sensitive extremes",
+                      isTGS ? "TGS" : "PGS", planted, nBlk * 6u);
+
+        Ties t0, t1;
+        gSpecOrderVariant = 0;
+        const std::vector<float> want = firstPassRef(rCur, rPred, dCur, dPred, NREG, NDIFF, nBlk, true, isTGS, t0);
+        gSpecOrderVariant = 1;
+        const std::vector<float> twin = firstPassRef(rCur, rPred, dCur, dPred, NREG, NDIFF, nBlk, true, isTGS, t1);
+        gSpecOrderVariant = 0;
+        uint32_t twinDiff = 0;
+        for (uint32_t j = 0; j < nBlk * 6u; ++j) if (fbits(want[j]) != fbits(twin[j])) ++twinDiff;
+        PXG_CHECK_MSG(twinDiff == nBlk * 6u, "psBounds p89 %s: the pre-P9.89 order x + (y + z) changes only %u of %u "
+                      "first-pass values", isTGS ? "TGS" : "PGS", twinDiff, nBlk * 6u);
+
+        DevBuf bRC = makeDev(dev, rCur), bRP = makeDev(dev, rPred);
+        DevBuf bDC = makeDev(dev, dCur), bDP = makeDev(dev, dPred);
+        DevBuf bCnt = makeDev(dev, std::vector<int32_t>{ int32_t(NDIFF), 0 });
+        PxgParticleSystem ps = makeZeroPs();
+        ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bRC.addr));
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bRP.addr));
+        ps.mDiffuseOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bDC.addr));
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bDP.addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bCnt.addr));
+        ps.mCommonData.mNumParticles = NREG;
+        ps.mCommonData.mMaxDiffuseParticles = MAXDIFF;
+        ps.mData.mFlags = 8u;   // eENABLE_SPECULATIVE_CCD
+        DevBuf bDesc = makeDev(dev, std::vector<PxgParticleSystem>{ ps });
+        DevBuf bTemp = makeDev(dev, std::vector<float>(nBlk * 6u, 123.f));
+
+        Push1 p1 = { bDesc.addr, 0u, isTGS ? 1u : 0u, bTemp.addr };
+        Kernel k1("psBoundsBda.spv", "ps_updateBoundFirstPassLaunch", {}, sizeof(Push1));
+        k1.dispatch(nBlk, {}, p1, 1u, 1u);
+        dev->flush();
+        const auto gTemp = downloadBuffer<float>(dev, bTemp.h, nBlk * 6u);
+        size_t mm = 0, asTwin = 0;
+        for (uint32_t j = 0; j < nBlk * 6u; ++j)
+            if (fbits(gTemp[j]) != fbits(want[j]))
+            {
+                ++mm;
+                if (fbits(gTemp[j]) == fbits(twin[j])) ++asTwin;
+                std::printf("  p89 %s tempBounds[%u] gpu=%08x ref=%08x twin=%08x\n", isTGS ? "TGS" : "PGS", j,
+                            fbits(gTemp[j]), fbits(want[j]), fbits(twin[j]));
+            }
+        PXG_CHECK_MSG(mm == 0, "psBounds p89 %s: %zu first-pass values differ from the CUDA-order mirror "
+                      "(%zu equal the pre-P9.89 twin)", isTGS ? "TGS" : "PGS", mm, asTwin);
+        std::printf("    [p89 %s] %u planted extremes; the old order changes %u of %u first-pass values\n",
+                    isTGS ? "TGS" : "PGS", planted, twinDiff, nBlk * 6u);
+        for (PxgBufferHandle h : { bRC.h, bRP.h, bDC.h, bDP.h, bCnt.h, bDesc.h, bTemp.h }) dev->destroyBuffer(h);
+    }
 }
 
 // ---------------------------------------------------------------------------
