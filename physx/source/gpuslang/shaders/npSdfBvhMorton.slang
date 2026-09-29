@@ -46,7 +46,8 @@
 // The gather indirections (vertices/triangleIndices, itemLowers[index])
 // collapse to direct inputs.  Test inputs keep coord*Dim within int32 range
 // (float->int overflow saturation differs across backends and is out of the
-// exercised domain).  Float ops NoContraction-stamped; +-0 eqFZ; keys exact.
+// exercised domain).  Float ops NoContraction-stamped; bounds compared bit for
+// bit (+-0 and NaN included); keys exact.
 
 uint part1by2(uint n)
 {
@@ -56,6 +57,18 @@ uint part1by2(uint n)
     n = (n ^ (n << 2)) & 0x09249249u;
     return n;
 }
+
+// P9.89: PxBounds3::include (PxBounds3.h L333-338, called at SDFConstruction.cu
+// L162-163) is PxVec3::minimum/maximum = componentwise PxMin/PxMax(float) =
+// intrinsics::selectMin/selectMax (PxMath.h L82-101, PxUnixMathIntrinsics.h
+// L116-125): acc < v ? acc : v / acc > v ? acc : v.  On a +-0 tie the NEW vertex
+// survives; a NaN vertex replaces the accumulator and the next vertex replaces
+// that NaN.  Slang min()/max() are GLSL.std.450 FMin/FMax, which the stamped
+// llvmpipe build runs zero-ordered (-0 / +0 in either order) and NaN-ignoring
+// (P9.86 F4), so they are not the CUDA fold.  Transcribed as ternaries, operand
+// order (accumulator, vertex) as in the CUDA.
+float pmin(float a, float b) { return (a < b) ? a : b; }   // PxMin = selectMin
+float pmax(float a, float b) { return (a > b) ? a : b; }   // PxMax = selectMax
 
 int iselMin(int a, int b) { return a < b ? a : b; }
 int iselMax(int a, int b) { return a < b ? b : a; }
@@ -114,12 +127,13 @@ void sdfBvhMorton(uint3 dtid : SV_DispatchThreadID)
         const float3 a = s.va.xyz, b = s.vb.xyz, c = s.vc.xyz;
         const float margin = s.misc.x;
 
-        // PxBounds3(a, a); include(b); include(c): per-component min/max folds
+        // PxBounds3(a, a); include(b); include(c) (SDFConstruction.cu L161-163):
+        // per-component selectMin/selectMax folds (P9.89: pmin/pmax, not min()/max())
         float3 lo = a, hi = a;
-        lo = float3(min(lo.x, b.x), min(lo.y, b.y), min(lo.z, b.z));
-        hi = float3(max(hi.x, b.x), max(hi.y, b.y), max(hi.z, b.z));
-        lo = float3(min(lo.x, c.x), min(lo.y, c.y), min(lo.z, c.z));
-        hi = float3(max(hi.x, c.x), max(hi.y, c.y), max(hi.z, c.z));
+        lo = float3(pmin(lo.x, b.x), pmin(lo.y, b.y), pmin(lo.z, b.z));
+        hi = float3(pmax(hi.x, b.x), pmax(hi.y, b.y), pmax(hi.z, b.z));
+        lo = float3(pmin(lo.x, c.x), pmin(lo.y, c.y), pmin(lo.z, c.z));
+        hi = float3(pmax(hi.x, c.x), pmax(hi.y, c.y), pmax(hi.z, c.z));
 
         // fattenFast
         lo = float3(lo.x - margin, lo.y - margin, lo.z - margin);
