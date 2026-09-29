@@ -114,22 +114,44 @@ Vec3 basisExtent(const Mat33& basis, const Vec3& extent)
                 std::fabs(c0.z) + std::fabs(c1.z) + std::fabs(c2.z));
 }
 
-void transformFastBounds(const TransformV& pose, const Vec3& localMin, const Vec3& localMax, Bounds3& out)
+// P9.89: PxBounds3::transformFast(PxTransform) (PxBounds3.h:472-476, reached from
+// updateCacheAndBound.cuh:148 and :156) = basisExtent(transform.transform(getCenter()),
+// PxMat33(q), getExtents()).  The CENTER goes through PxTransform::transform = q.rotate(c) + p
+// (PxTransform.h:128-132, PxQuat.h:286-295: vx*w2 + (y*vz - z*vy)*w + x*dot2); only the extents
+// use the PxMat33(q) basis.  p89OldOrder = the pre-P9.89 port's twin, which centered with the
+// PxMat33(q) product col0*c.x + col1*c.y + col2*c.z: mathematically equal, a different
+// operation tree, different bits whenever the local center is non-zero.
+void transformFastBounds(const TransformV& pose, const Vec3& localMin, const Vec3& localMax, Bounds3& out,
+                         bool p89OldOrder = false)
 {
     const Mat33 rot(pose.q);
     const Vec3 center = (localMax + localMin) * 0.5f;
     const Vec3 extents = (localMax - localMin) * 0.5f;
-    const Vec3 newCenter = rot.transform(center) + pose.p;
+    const Vec3 newCenter = (p89OldOrder ? rot.transform(center) : pose.q.rotate(center)) + pose.p;
     const Vec3 newExtents = basisExtent(rot, extents);
     out.minimum = (newCenter - newExtents).toFloat3();
     out.maximum = (newCenter + newExtents).toFloat3();
 }
 
-Mat33 meshScaleToMat33(const Vec3& scale, const QuatV& rotation)
+// P9.89: PxMeshScale::toMat33 (PxMeshScale.h:120-128, reached from updateCacheAndBound.cuh:113-114):
+// trans = rot.getTranspose(); trans.column_k *= scale[k]; return trans * rot.  Element (i,j) is
+// ((R.col_i[0]*s0)*R.col_j[0] + (R.col_i[1]*s1)*R.col_j[1]) + (R.col_i[2]*s2)*R.col_j[2].
+// p89OldOrder = the pre-P9.89 port's twin: rot^T * (diag(s) * rot), which scales R's ROWS and
+// gives R.col_i[k]*(R.col_j[k]*s_k) -- the same sum order over k, a different product grouping
+// (the diagonal is the same product; every off-diagonal element can differ).
+Mat33 meshScaleToMat33(const Vec3& scale, const QuatV& rotation, bool p89OldOrder = false)
 {
     const Mat33 rot(rotation);
-    Mat33 diagTimesRot(rot.col0.multiply(scale), rot.col1.multiply(scale), rot.col2.multiply(scale));
-    return rot.getTranspose() * diagTimesRot;
+    if (p89OldOrder)
+    {
+        Mat33 diagTimesRot(rot.col0.multiply(scale), rot.col1.multiply(scale), rot.col2.multiply(scale));
+        return rot.getTranspose() * diagTimesRot;
+    }
+    Mat33 trans = rot.getTranspose();
+    trans.col0 = trans.col0 * scale.x;
+    trans.col1 = trans.col1 * scale.y;
+    trans.col2 = trans.col2 * scale.z;
+    return trans * rot;
 }
 
 // P9.86c: mutant twin of the convex-hull min/max loop.  The CUDA
@@ -165,9 +187,11 @@ struct UbFMinMaxTwin
 // PxgShape::hullOrMeshPtr); the reference rebases it onto the host copy of
 // the blob.  The bound-buffer setRigidDynamicGlobalPose path keeps it as a
 // plain byte offset (blobDeviceBase = 0).
+// p89OldOrder: evaluate the mesh-scale matrix and the transformFast center with the
+// pre-P9.89 port's operation trees (meshScaleToMat33 / transformFastBounds above).
 void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
                      const std::vector<uint32_t>& geometryBlob, const TransformV& pose, Bounds3& out,
-                     uint64_t blobDeviceBase = 0, UbFMinMaxTwin* twin = nullptr)
+                     uint64_t blobDeviceBase = 0, UbFMinMaxTwin* twin = nullptr, bool p89OldOrder = false)
 {
     const Vec3 localMin(shapeSim.localBoundsMin);
     const Vec3 localMax(shapeSim.localBoundsMax);
@@ -213,7 +237,7 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
             const bool identity = scale.x == 1.f && scale.y == 1.f && scale.z == 1.f && scaleRot.x == 0.f &&
                                   scaleRot.y == 0.f && scaleRot.z == 0.f;
             if (!identity)
-                rot = rot * meshScaleToMat33(scale, scaleRot);
+                rot = rot * meshScaleToMat33(scale, scaleRot, p89OldOrder);
 
             const uint32_t blobBase = uint32_t((shape.hullOrMeshOffset - blobDeviceBase) / 4);
             const uint32_t tmpX = geometryBlob[blobBase + 4];
@@ -247,12 +271,12 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
         }
         else
         {
-            transformFastBounds(pose, localMin, localMax, out);
+            transformFastBounds(pose, localMin, localMax, out, p89OldOrder);
         }
         break;
     }
     default:
-        transformFastBounds(pose, localMin, localMax, out);
+        transformFastBounds(pose, localMin, localMax, out, p89OldOrder);
         break;
     }
 }
@@ -275,7 +299,7 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
                      const std::vector<SolverBodySleepData>& artiSleepData,
                      const std::vector<TransformV>& artLinkB2W, const std::vector<TransformV>& artLinkB2A,
                      uint32_t maxLinks, uint32_t maxNodes, uint64_t blobDeviceBase, RefOutputs& out,
-                     std::vector<UbFMinMaxTwin>* twins = nullptr)
+                     std::vector<UbFMinMaxTwin>* twins = nullptr, bool p89OldOrder = false)
 {
     if (twins)
         twins->assign(numShapes, UbFMinMaxTwin{});
@@ -335,7 +359,7 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
                 out.transformCache[i].flags = 0;
                 if (isBPOrSq)
                     refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase,
-                                    twins ? &(*twins)[i] : nullptr);
+                                    twins ? &(*twins)[i] : nullptr, p89OldOrder);
             }
 
             if (internalFlags & eACTIVATE_THIS_FRAME)
@@ -364,13 +388,42 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
             out.transformCache[i].flags = 0;
             if (isBPOrSq)
                 refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase,
-                                twins ? &(*twins)[i] : nullptr);
+                                twins ? &(*twins)[i] : nullptr, p89OldOrder);
 
             if (internalFlags & eACTIVATE_THIS_FRAME)
                 out.active[bodySimIndex] = 1;
             else if (internalFlags & eDEACTIVATE_THIS_FRAME)
                 out.deactivate[bodySimIndex] = 1;
         }
+    }
+}
+
+// P9.89: which updateBounds() branch a shape takes (the paths the operation-order
+// coverage below is counted over).
+enum UbP89Path
+{
+    eUB_SPHERE, eUB_CAPSULE, eUB_BOX, eUB_HULL_IDENTITY, eUB_HULL_SCALED, eUB_FAST_CONVEX, eUB_FAST_OTHER,
+    eUB_NB_PATHS
+};
+static const char* const kUbP89PathNames[eUB_NB_PATHS] = { "sphere", "capsule", "box", "hull(identity)",
+                                                          "hull(scaled)", "fast(convex)", "fast(other)" };
+static uint32_t ubP89Path(const ShapeSim& s, const std::vector<Shape>& shapes)
+{
+    switch (s.shapeType)
+    {
+    case eSPHERE: return eUB_SPHERE;
+    case eCAPSULE: return eUB_CAPSULE;
+    case eBOX: return eUB_BOX;
+    case eCONVEXMESH:
+    {
+        if (s.hullDataIndex == 0xFFFFFFFFu)
+            return eUB_FAST_CONVEX;
+        const Shape& h = shapes[s.hullDataIndex];
+        const bool identity = h.scale.x == 1.f && h.scale.y == 1.f && h.scale.z == 1.f &&
+                              h.scaleRotation.x == 0.f && h.scaleRotation.y == 0.f && h.scaleRotation.z == 0.f;
+        return identity ? eUB_HULL_IDENTITY : eUB_HULL_SCALED;
+    }
+    default: return eUB_FAST_OTHER;
     }
 }
 
@@ -401,14 +454,22 @@ PXG_TEST(updateBounds_engineAbi)
     // P9.86c: two directed convex shapes appended after the random fleet
     // (600 = the hull whose x minimum is a +-0 tie, 601 = the x maximum tie)
     const uint32_t numDirShapes = 2;
-    const uint32_t numShapes = numRandomShapes + numDirShapes;
+    // P9.89: an order-sensitive fleet appended after the directed shapes (602.. =
+    // scaled hull / fast-path convex / fast-path types 6..8, round-robin), drawn from
+    // its own rng so the random fleet and the P9.86c shapes are unchanged
+    const uint32_t numP89Shapes = 192;
+    const uint32_t numP89Hulls = 2;
+    const uint32_t numShapes = numRandomShapes + numDirShapes + numP89Shapes;
     const uint32_t maxNodes = 256;    // nodes [firstArtNode, firstArtNode+12) are articulation links
     const uint32_t numHulls = 8;      // random hulls (rollGeometry draws from these)
-    const uint32_t numAllHulls = numHulls + numDirShapes;
+    const uint32_t numAllHulls = numHulls + numDirShapes + numP89Hulls;
+    const uint32_t firstP89Hull = numHulls + numDirShapes;
     const uint32_t nbArts = 3;
     const uint32_t maxLinks = 4;
     const uint32_t firstArtNode = 240;
     const uint32_t dirNode = 252;     // unused by the fleet (rigid [0,240), links [240,252))
+    const uint32_t p89Node = 253;     // P9.89 fleet body (also unused by the random fleet)
+    std::mt19937 rng89(0x589u);
 
     // ---- convex geometry blob: numHulls hulls, header (48 bytes) + up to 64
     // float4 vertices; every hull base is 16-byte aligned (multiple-of-4 uints)
@@ -459,6 +520,25 @@ PXG_TEST(updateBounds_engineAbi)
             std::memcpy(&geometryBlob[base + 12 + v * 4], dirHullVerts[k][v], 12);
     }
 
+    // ---- P9.89 hulls: 64 distinct non-round vertices each (rng89), in +-10
+    std::uniform_real_distribution<float> unit89(0.f, 1.f);
+    std::uniform_real_distribution<float> sym89(-10.f, 10.f);
+    for (uint32_t k = 0; k < numP89Hulls; ++k)
+    {
+        const uint32_t base = uint32_t(geometryBlob.size());
+        hullByteOffsets[firstP89Hull + k] = uint64_t(base) * 4;
+        const uint32_t nbVerts = 64;
+        geometryBlob.resize(base + 12 + nbVerts * 4, 0u);
+        geometryBlob[base + 4] = (nbVerts & 0xFFu) << 8;
+        for (uint32_t v = 0; v < nbVerts; ++v)
+        {
+            const float vx = sym89(rng89), vy = sym89(rng89), vz = sym89(rng89);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 0], &vx, 4);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 1], &vy, 4);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 2], &vz, 4);
+        }
+    }
+
     // ---- shapes (PxgShape pool: convex hull entries; hullOrMeshOffset is
     // patched to a live device address once the blob is uploaded)
     std::vector<Shape> shapes(numAllHulls);
@@ -479,10 +559,18 @@ PXG_TEST(updateBounds_engineAbi)
         }
         s.type = eCONVEXMESH;
     }
-    for (uint32_t h = numHulls; h < numAllHulls; ++h)
+    for (uint32_t h = numHulls; h < firstP89Hull; ++h)
     {
         shapes[h].scale = Float3{ 1.f, 1.f, 1.f }; // identity mesh scale: no scale multiply
         shapes[h].scaleRotation = Quat{ 0, 0, 0, 1 };
+        shapes[h].type = eCONVEXMESH;
+    }
+    // P9.89 hulls: strongly non-uniform, non-round mesh scales under random scale
+    // rotations -- every off-diagonal element of PxMeshScale::toMat33 is live
+    for (uint32_t h = firstP89Hull; h < numAllHulls; ++h)
+    {
+        shapes[h].scale = Float3{ 0.3f + 2.6f * unit89(rng89), 0.3f + 2.6f * unit89(rng89), 0.3f + 2.6f * unit89(rng89) };
+        shapes[h].scaleRotation = randomQuat(rng89).toQuat();
         shapes[h].type = eCONVEXMESH;
     }
 
@@ -542,6 +630,16 @@ PXG_TEST(updateBounds_engineAbi)
     bodySims[dirNode].body2Actor_maxImpulseW.p = Float4{ 0.f, 0.f, 0.f, 0.f };
     bodyDataIndices[dirNode] = dirNode;
     sleepData[dirNode].internalFlags = 0;
+    // P9.89 body: random rotations, small translations (so |pose.p| stays well below
+    // the far-off local-bounds centers of the fast-path shapes and the center's
+    // rotation bits survive the + p and +- extents roundings); active, not frozen.
+    bodySims[p89Node].body2World.q = randomQuat(rng89).toFloat4();
+    bodySims[p89Node].body2World.p = Float4{ 0.03f * sym89(rng89), 0.03f * sym89(rng89), 0.03f * sym89(rng89), 0.f };
+    bodySims[p89Node].body2Actor_maxImpulseW.q = randomQuat(rng89).toFloat4();
+    bodySims[p89Node].body2Actor_maxImpulseW.p =
+        Float4{ 0.01f * sym89(rng89), 0.01f * sym89(rng89), 0.01f * sym89(rng89), 0.f };
+    bodyDataIndices[p89Node] = p89Node;
+    sleepData[p89Node].internalFlags = 0;
 
     std::vector<TransformV> artLinkB2W(nbArts * maxLinks);
     std::vector<TransformV> artLinkB2A(nbArts * maxLinks);
@@ -630,6 +728,44 @@ PXG_TEST(updateBounds_engineAbi)
         s.hullDataIndex = numHulls + k;
         s.shapeFlags = uint16_t(eSIMULATION_SHAPE);
         s.shapeType = eCONVEXMESH;
+    }
+    // P9.89 shapes on p89Node, round-robin over the three order-sensitive paths:
+    //  k%3 == 0: a P9.89 scaled hull (PxMeshScale::toMat33 feeds every vertex);
+    //  k%3 == 1: a GPU-incompatible convex (hullIndex invalid -> transformFast);
+    //  k%3 == 2: a mesh/heightfield-type shape (6..8 -> transformFast).
+    // The fast-path local bounds sit far from the shape origin (center components
+    // in +-(4..20)) with small extents, so q.rotate(center) and the PxMat33(q)
+    // product round apart in most components and the difference survives + p.
+    for (uint32_t k = 0; k < numP89Shapes; ++k)
+    {
+        ShapeSim& s = shapeSims[numRandomShapes + numDirShapes + k];
+        s.transform.q = randomQuat(rng89).toQuat();
+        s.transform.p = Float3{ 0.02f * sym89(rng89), 0.02f * sym89(rng89), 0.02f * sym89(rng89) };
+        auto farCoord = [&]() {
+            const float m = 4.f + 16.f * unit89(rng89);
+            return unit89(rng89) < 0.5f ? -m : m;
+        };
+        const Float3 c{ farCoord(), farCoord(), farCoord() };
+        const Float3 e{ 0.05f + 0.45f * unit89(rng89), 0.05f + 0.45f * unit89(rng89), 0.05f + 0.45f * unit89(rng89) };
+        s.localBoundsMin = Float3{ c.x - e.x, c.y - e.y, c.z - e.z };
+        s.localBoundsMax = Float3{ c.x + e.x, c.y + e.y, c.z + e.z };
+        s.bodySimIndex = makeNodeIndex(p89Node);
+        s.shapeFlags = uint16_t(eSIMULATION_SHAPE);
+        switch (k % 3)
+        {
+        case 0:
+            s.shapeType = eCONVEXMESH;
+            s.hullDataIndex = firstP89Hull + (k / 3) % numP89Hulls;
+            break;
+        case 1:
+            s.shapeType = eCONVEXMESH;
+            s.hullDataIndex = 0xFFFFFFFFu;
+            break;
+        default:
+            s.shapeType = uint16_t(6 + (k / 3) % 3);
+            s.hullDataIndex = 0xFFFFFFFFu;
+            break;
+        }
     }
 
     // ---- GPU (ENGINE launch ABI through PxgCudaShim) ----
@@ -780,9 +916,54 @@ PXG_TEST(updateBounds_engineAbi)
                       bits(twins[i0].minimum.x), bits(twins[i1].maximum.x));
     }
 
-    // engine grid (256 x 256 = one pass over 602 shapes) and a 2-block grid
+    // ---- P9.89 coverage: the same fleet through the pre-P9.89 port's operation
+    // trees (rot^T * (diag(s) * rot) for PxMeshScale::toMat33, the PxMat33(q) product
+    // for the transformFast center) must store different bits than the CUDA's
+    // ((rot^T column-scaled) * rot, q.rotate(center) + p) on the scaled-hull and on
+    // both transformFast paths, and nowhere else.  The random fleet carries the data
+    // that makes the association visible: 0.5 + unit(rng) mesh scales under random
+    // scale rotations, and local bounds whose centers are non-zero (convex fast path:
+    // all three axes; types 6..8: x).  The GPU is compared bitwise below, so a port
+    // that evaluates either site in the old tree fails there.
+    RefOutputs refOld;
+    referenceUpdate(numShapes, shapeSims, shapes, geometryBlob, bodySims, bodyDataIndices, sleepData,
+                    artiSleepData, artLinkB2W, artLinkB2A, maxLinks, maxNodes, dBlob, refOld, nullptr, true);
+    {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        uint32_t pathShapes[eUB_NB_PATHS] = {}, pathDiff[eUB_NB_PATHS] = {};
+        uint32_t cacheDiff = 0;
+        for (uint32_t i = 0; i < numShapes; ++i)
+        {
+            const uint32_t path = ubP89Path(shapeSims[i], shapes);
+            const float rw[6] = { ref.bounds[i].minimum.x, ref.bounds[i].minimum.y, ref.bounds[i].minimum.z,
+                                  ref.bounds[i].maximum.x, ref.bounds[i].maximum.y, ref.bounds[i].maximum.z };
+            const float ow[6] = { refOld.bounds[i].minimum.x, refOld.bounds[i].minimum.y, refOld.bounds[i].minimum.z,
+                                  refOld.bounds[i].maximum.x, refOld.bounds[i].maximum.y, refOld.bounds[i].maximum.z };
+            ++pathShapes[path];
+            for (int c = 0; c < 6; ++c)
+                pathDiff[path] += bits(rw[c]) != bits(ow[c]) ? 1u : 0u;
+            cacheDiff += std::memcmp(&ref.transformCache[i], &refOld.transformCache[i], sizeof(CachedTransform)) != 0;
+        }
+        for (uint32_t p = 0; p < eUB_NB_PATHS; ++p)
+            std::printf("[ info ] P9.89 %-14s %3u shapes, %3u bound words differ CUDA vs old port order\n",
+                        kUbP89PathNames[p], pathShapes[p], pathDiff[p]);
+        // measured: 143 / 360 / 373 (66 / 8 / 15 of them from the random fleet alone)
+        PXG_CHECK_MSG(pathDiff[eUB_HULL_SCALED] >= 100 && pathDiff[eUB_FAST_CONVEX] >= 200 &&
+                          pathDiff[eUB_FAST_OTHER] >= 200,
+                      "P9.89 coverage: the old port order must change many bound words on every affected path "
+                      "(scaled hull %u want >= 100, fast convex %u want >= 200, fast other %u want >= 200)",
+                      pathDiff[eUB_HULL_SCALED], pathDiff[eUB_FAST_CONVEX], pathDiff[eUB_FAST_OTHER]);
+        PXG_CHECK_MSG(pathDiff[eUB_SPHERE] == 0 && pathDiff[eUB_CAPSULE] == 0 && pathDiff[eUB_BOX] == 0 &&
+                          pathDiff[eUB_HULL_IDENTITY] == 0 && cacheDiff == 0,
+                      "P9.89 twin: only the scaled-hull and transformFast bounds may differ (sphere %u capsule %u "
+                      "box %u identity hull %u cache %u)",
+                      pathDiff[eUB_SPHERE], pathDiff[eUB_CAPSULE], pathDiff[eUB_BOX], pathDiff[eUB_HULL_IDENTITY],
+                      cacheDiff);
+    }
+
+    // engine grid (256 x 256 = one pass over 794 shapes) and a 2-block grid
     // (512 threads -> the CUDA grid-stride wrap executes; threads 88/89 pick
-    // up the directed shapes 600/601)
+    // up the directed shapes 600/601, threads 90.. the P9.89 fleet)
     const std::vector<CachedTransform> cacheInit(numShapes, CachedTransform{});
     const std::vector<float> boundsInit(numShapes * 6, 0.f);
     const std::vector<uint32_t> zerosShapes(numShapes, 0), zerosNodes(maxNodes, 0);
@@ -804,6 +985,7 @@ PXG_TEST(updateBounds_engineAbi)
 
         // ---- compare ----
         uint32_t dirChecked = 0;
+        uint32_t cacheBad = 0, boundsBad[eUB_NB_PATHS] = {};
         std::vector<CachedTransform> gpuCache(numShapes);
         std::vector<float> gpuBounds(numShapes * 6);
         std::vector<uint32_t> gpuFrozen(numShapes), gpuUnfrozen(numShapes), gpuUpdated(numShapes);
@@ -826,27 +1008,40 @@ PXG_TEST(updateBounds_engineAbi)
                           "grid %u cache.flags[%u]: gpu=%u ref=%u", gridDim, i, gpuCache[i].flags,
                           ref.transformCache[i].flags);
 
+            // P9.89: the whole fleet is compared BITWISE (it was almostEqual 1e-4, which
+            // could not see an operation-order divergence): the transform cache and all six
+            // bound words of every shape.  Mismatches are counted per updateBounds() path.
             const Transform28& gt = gpuCache[i].transform;
             const Transform28& rt = ref.transformCache[i].transform;
-            PXG_CHECK_MSG(almostEqual(gt.q.x, rt.q.x, 1e-4f, 1e-5f) && almostEqual(gt.q.y, rt.q.y, 1e-4f, 1e-5f) &&
-                              almostEqual(gt.q.z, rt.q.z, 1e-4f, 1e-5f) && almostEqual(gt.q.w, rt.q.w, 1e-4f, 1e-5f),
-                          "grid %u cache.q[%u]: gpu=(%g,%g,%g,%g) ref=(%g,%g,%g,%g)", gridDim, i, gt.q.x,
-                          gt.q.y, gt.q.z, gt.q.w, rt.q.x, rt.q.y, rt.q.z, rt.q.w);
-            PXG_CHECK_MSG(almostEqual(gt.p.x, rt.p.x, 1e-4f, 1e-4f) && almostEqual(gt.p.y, rt.p.y, 1e-4f, 1e-4f) &&
-                              almostEqual(gt.p.z, rt.p.z, 1e-4f, 1e-4f),
-                          "grid %u cache.p[%u]: gpu=(%g,%g,%g) ref=(%g,%g,%g)", gridDim, i, gt.p.x, gt.p.y,
-                          gt.p.z, rt.p.x, rt.p.y, rt.p.z);
+            if (std::memcmp(&gt, &rt, sizeof(Transform28)) != 0)
+            {
+                if (cacheBad < 8)
+                    std::printf("MM grid %u cache[%u]: gpu=(%a,%a,%a,%a | %a,%a,%a) ref=(%a,%a,%a,%a | %a,%a,%a)\n",
+                                gridDim, i, gt.q.x, gt.q.y, gt.q.z, gt.q.w, gt.p.x, gt.p.y, gt.p.z, rt.q.x, rt.q.y,
+                                rt.q.z, rt.q.w, rt.p.x, rt.p.y, rt.p.z);
+                ++cacheBad;
+            }
 
             const float* gb = &gpuBounds[i * 6];
             const float rb[6] = { ref.bounds[i].minimum.x, ref.bounds[i].minimum.y, ref.bounds[i].minimum.z,
                                   ref.bounds[i].maximum.x, ref.bounds[i].maximum.y, ref.bounds[i].maximum.z };
+            const uint32_t path = ubP89Path(shapeSims[i], shapes);
             for (int c = 0; c < 6; ++c)
-                PXG_CHECK_MSG(almostEqual(gb[c], rb[c], 1e-4f, 1e-3f), "grid %u bounds[%u][%d]: gpu=%g ref=%g",
-                              gridDim, i, c, gb[c], rb[c]);
+            {
+                uint32_t g, r;
+                std::memcpy(&g, &gb[c], 4);
+                std::memcpy(&r, &rb[c], 4);
+                if (g == r)
+                    continue;
+                if (boundsBad[path] < 4)
+                    std::printf("MM grid %u bounds[%u][%d] (%s): gpu=%08x (%a) ref=%08x (%a)\n", gridDim, i, c,
+                                kUbP89PathNames[path], g, gb[c], r, rb[c]);
+                ++boundsBad[path];
+            }
 
             // P9.86c: the directed shapes are compared BITWISE (almostEqual
             // treats +0 and -0 as equal): all six bound words and the cache.
-            if (i >= numRandomShapes)
+            if (i >= numRandomShapes && i < numRandomShapes + numDirShapes)
             {
                 uint32_t gw[6], rw[6];
                 std::memcpy(gw, gb, sizeof(gw));
@@ -861,6 +1056,10 @@ PXG_TEST(updateBounds_engineAbi)
         }
         PXG_CHECK_MSG(dirChecked == numDirShapes, "P9.86c coverage: grid %u compared %u directed shapes bitwise",
                       gridDim, dirChecked);
+        PXG_CHECK_MSG(cacheBad == 0, "grid %u: %u transform cache entries differ bitwise", gridDim, cacheBad);
+        for (uint32_t p = 0; p < eUB_NB_PATHS; ++p)
+            PXG_CHECK_MSG(boundsBad[p] == 0, "grid %u: %u %s bound words differ bitwise from the CUDA order",
+                          gridDim, boundsBad[p], kUbP89PathNames[p]);
 
         for (uint32_t n = 0; n < maxNodes; ++n)
         {
@@ -1295,6 +1494,242 @@ PXG_TEST(setRigidDynamicGlobalPose_convexZeroTie)
             PXG_CHECK_MSG(bits(gpuBounds[s * 6 + c]) == bits(rb[c]), "convexZeroTie bounds[%u][%d]: gpu=%08x ref=%08x",
                           s, c, bits(gpuBounds[s * 6 + c]), bits(rb[c]));
     }
+
+    for (PxgBufferHandle h : { shapeSimBuf, shapesBuf, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf,
+                               dummyFrozen, dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, blobBuf,
+                               nodeIdxBuf, shapeIdxBuf, poseBuf, gpuIdxBuf })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.89: setRigidDynamicGlobalPose (RIGID_DYNAMIC_SET_GLOBAL_POSE) through the two
+// order-sensitive updateBounds() branches it reaches in updateBounds.slang:177
+// (PxMeshScale::toMat33, PxMeshScale.h:120-128: (rot^T column-scaled) * rot) and
+// :214/:220 (PxBounds3::transformFast, PxBounds3.h:472-476: center = q.rotate(c) + p).
+// The fleet: 8 bodies, 24 shapes each, round-robin scaled hull / GPU-incompatible
+// convex / mesh-type shape; two 64-vertex hulls under non-uniform, non-round mesh
+// scales and random scale rotations; fast-path local bounds far off the shape
+// origin with small extents.  The CUDA-order mirror and the pre-P9.89 twin
+// (rot^T * (diag(s) * rot), PxMat33(q) center product) must store different bits
+// on every path, and the GPU is compared with the mirror BITWISE (cache, bounds,
+// body2World, updated flags).
+// ---------------------------------------------------------------------------
+PXG_TEST(setRigidDynamicGlobalPose_p89MeshScaleCenterOrder)
+{
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    std::mt19937 rng(0x5896u);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-10.f, 10.f);
+
+    const uint32_t numBodies = 8;
+    const uint32_t shapesPerBody = 24;
+    const uint32_t numShapes = numBodies * shapesPerBody;
+    const uint32_t numHulls = 2;
+    const uint32_t nbVerts = 64;
+
+    // ---- bodies: random COM frames with small offsets
+    std::vector<BodySim> bodySims(numBodies);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    for (BodySim& b : bodySims)
+    {
+        b.body2World.q = randomQuat(rng).toFloat4();
+        b.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+        b.body2Actor_maxImpulseW.q = randomQuat(rng).toFloat4();
+        b.body2Actor_maxImpulseW.p = Float4{ 0.01f * sym(rng), 0.01f * sym(rng), 0.01f * sym(rng), 0 };
+    }
+
+    // ---- hulls (bound-buffer path: hullOrMeshOffset is a byte offset into the blob)
+    std::vector<uint32_t> geometryBlob;
+    std::vector<Shape> shapes(numHulls);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(Shape));
+    for (uint32_t h = 0; h < numHulls; ++h)
+    {
+        const uint32_t base = uint32_t(geometryBlob.size());
+        geometryBlob.resize(base + 12 + nbVerts * 4, 0u);
+        geometryBlob[base + 4] = (nbVerts & 0xFFu) << 8;
+        for (uint32_t v = 0; v < nbVerts; ++v)
+        {
+            const float vx = sym(rng), vy = sym(rng), vz = sym(rng);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 0], &vx, 4);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 1], &vy, 4);
+            std::memcpy(&geometryBlob[base + 12 + v * 4 + 2], &vz, 4);
+        }
+        shapes[h].scale = Float3{ 0.3f + 2.6f * unit(rng), 0.3f + 2.6f * unit(rng), 0.3f + 2.6f * unit(rng) };
+        shapes[h].scaleRotation = randomQuat(rng).toQuat();
+        shapes[h].type = eCONVEXMESH;
+        shapes[h].hullOrMeshOffset = uint64_t(base) * 4;
+    }
+
+    // ---- shapes, sorted by body (the per-shape node index array is ascending)
+    std::vector<ShapeSim> shapeSims(numShapes);
+    std::vector<uint64_t> nodeIndices(numShapes);
+    std::vector<uint32_t> shapeIndices(numShapes);
+    for (uint32_t i = 0; i < numShapes; ++i)
+    {
+        const uint32_t body = i / shapesPerBody, k = i % shapesPerBody;
+        ShapeSim s = {};
+        s.transform.q = randomQuat(rng).toQuat();
+        s.transform.p = Float3{ 0.02f * sym(rng), 0.02f * sym(rng), 0.02f * sym(rng) };
+        auto farCoord = [&]() {
+            const float m = 4.f + 16.f * unit(rng);
+            return unit(rng) < 0.5f ? -m : m;
+        };
+        const Float3 c{ farCoord(), farCoord(), farCoord() };
+        const Float3 e{ 0.05f + 0.45f * unit(rng), 0.05f + 0.45f * unit(rng), 0.05f + 0.45f * unit(rng) };
+        s.localBoundsMin = Float3{ c.x - e.x, c.y - e.y, c.z - e.z };
+        s.localBoundsMax = Float3{ c.x + e.x, c.y + e.y, c.z + e.z };
+        s.bodySimIndex = makeNodeIndex(body);
+        s.shapeFlags = eSIMULATION_SHAPE;
+        switch (k % 3)
+        {
+        case 0: s.shapeType = eCONVEXMESH; s.hullDataIndex = (k / 3) % numHulls; break;
+        case 1: s.shapeType = eCONVEXMESH; s.hullDataIndex = 0xFFFFFFFFu; break;
+        default: s.shapeType = uint16_t(6 + (k / 3) % 3); s.hullDataIndex = 0xFFFFFFFFu; break;
+        }
+        shapeSims[i] = s;
+        nodeIndices[i] = makeNodeIndex(body);
+        shapeIndices[i] = i;
+    }
+
+    // ---- one pose update per body (small translations: the far local centers
+    // dominate |newCenter|, so the rotation's rounding survives + p)
+    const uint32_t nbUpdates = numBodies;
+    std::vector<uint32_t> updateIndices(nbUpdates);
+    std::iota(updateIndices.begin(), updateIndices.end(), 0u);
+    std::shuffle(updateIndices.begin(), updateIndices.end(), rng);
+    std::vector<float> poseData(nbUpdates * 7);
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const QuatV q = randomQuat(rng);
+        poseData[i * 7 + 0] = q.x;
+        poseData[i * 7 + 1] = q.y;
+        poseData[i * 7 + 2] = q.z;
+        poseData[i * 7 + 3] = q.w;
+        poseData[i * 7 + 4] = 0.03f * sym(rng);
+        poseData[i * 7 + 5] = 0.03f * sym(rng);
+        poseData[i * 7 + 6] = 0.03f * sym(rng);
+    }
+
+    // ---- reference (CUDA order) + the pre-P9.89 twin
+    std::vector<BodySim> refBodySims = bodySims;
+    std::vector<Transform28> refCache(numShapes);
+    std::vector<Bounds3> refB(numShapes, Bounds3{}), oldB(numShapes, Bounds3{});
+    std::vector<uint32_t> refUpdated(numShapes, 0);
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const uint32_t index = updateIndices[i];
+        BodySim& bodySim = refBodySims[index];
+        const QuatV inQ(poseData[i * 7 + 0], poseData[i * 7 + 1], poseData[i * 7 + 2], poseData[i * 7 + 3]);
+        const Vec3 inP(poseData[i * 7 + 4], poseData[i * 7 + 5], poseData[i * 7 + 6]);
+        const QuatV b2aQ(bodySim.body2Actor_maxImpulseW.q);
+        const Vec3 b2aP(bodySim.body2Actor_maxImpulseW.p.x, bodySim.body2Actor_maxImpulseW.p.y,
+                        bodySim.body2Actor_maxImpulseW.p.z);
+        const TransformV body2World(inQ * b2aQ, inQ.rotate(b2aP) + inP);
+        bodySim.body2World.q = body2World.q.toFloat4();
+        bodySim.body2World.p = Float4{ body2World.p.x, body2World.p.y, body2World.p.z, 0.f };
+        const TransformV body2Actor(b2aQ, b2aP);
+        for (uint32_t s = index * shapesPerBody; s < (index + 1) * shapesPerBody; ++s)
+        {
+            const TransformV absPos = getAbsPose(body2World, TransformV(shapeSims[s].transform), body2Actor);
+            refCache[s] = absPos.toTransform28();
+            refUpdateBounds(shapeSims[s], shapes, geometryBlob, absPos, refB[s]);
+            refUpdateBounds(shapeSims[s], shapes, geometryBlob, absPos, oldB[s], 0, nullptr, true);
+            refUpdated[s] = 1;
+        }
+    }
+
+    // ---- P9.89 coverage: the old port order must change the bits on every path
+    {
+        uint32_t pathDiff[eUB_NB_PATHS] = {};
+        for (uint32_t s = 0; s < numShapes; ++s)
+        {
+            const float rw[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                                  refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+            const float ow[6] = { oldB[s].minimum.x, oldB[s].minimum.y, oldB[s].minimum.z,
+                                  oldB[s].maximum.x, oldB[s].maximum.y, oldB[s].maximum.z };
+            for (int c = 0; c < 6; ++c)
+                pathDiff[ubP89Path(shapeSims[s], shapes)] += bits(rw[c]) != bits(ow[c]) ? 1u : 0u;
+        }
+        std::printf("[ info ] P9.89 setGlobalPose: %u / %u / %u of %u bound words each differ CUDA vs old port "
+                    "order (scaled hull / fast convex / fast other)\n",
+                    pathDiff[eUB_HULL_SCALED], pathDiff[eUB_FAST_CONVEX], pathDiff[eUB_FAST_OTHER],
+                    numShapes / 3 * 6);
+        // measured: 62 / 374 / 365 of 384
+        PXG_CHECK_MSG(pathDiff[eUB_HULL_SCALED] >= 40 && pathDiff[eUB_FAST_CONVEX] >= 300 &&
+                          pathDiff[eUB_FAST_OTHER] >= 300,
+                      "P9.89 coverage: scaled hull %u (want >= 40), fast convex %u (>= 300), fast other %u (>= 300)",
+                      pathDiff[eUB_HULL_SCALED], pathDiff[eUB_FAST_CONVEX], pathDiff[eUB_FAST_OTHER]);
+    }
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+    Kernel kernel("updateBounds.spv", "setRigidDynamicGlobalPose",
+                  { sizeof(ShapeSim), sizeof(Shape), sizeof(BodySim), 4, sizeof(SolverBodySleepData),
+                    sizeof(CachedTransform), 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 4 },
+                  sizeof(UpdateBoundsParams));
+
+    PxgBufferHandle shapeSimBuf = createBufferFrom(dev, shapeSims);
+    PxgBufferHandle shapesBuf = createBufferFrom(dev, shapes);
+    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
+    PxgBufferHandle dummy4a = dev->createBuffer(16);
+    PxgBufferHandle dummySleep = dev->createBuffer(16);
+    std::vector<CachedTransform> cacheInit(numShapes);
+    std::memset(cacheInit.data(), 0, cacheInit.size() * sizeof(CachedTransform));
+    PxgBufferHandle cacheBuf = createBufferFrom(dev, cacheInit);
+    std::vector<float> boundsInit(numShapes * 6, 0.f);
+    PxgBufferHandle boundsBuf = createBufferFrom(dev, boundsInit);
+    std::vector<uint32_t> zerosShapes(numShapes, 0);
+    PxgBufferHandle dummyFrozen = dev->createBuffer(16);
+    PxgBufferHandle dummyUnfrozen = dev->createBuffer(16);
+    PxgBufferHandle updatedBuf = createBufferFrom(dev, zerosShapes);
+    PxgBufferHandle dummyActive = dev->createBuffer(16);
+    PxgBufferHandle dummyDeactivate = dev->createBuffer(16);
+    PxgBufferHandle blobBuf = createBufferFrom(dev, geometryBlob);
+    PxgBufferHandle nodeIdxBuf = createBufferFrom(dev, nodeIndices);
+    PxgBufferHandle shapeIdxBuf = createBufferFrom(dev, shapeIndices);
+    PxgBufferHandle poseBuf = createBufferFrom(dev, poseData);
+    PxgBufferHandle gpuIdxBuf = createBufferFrom(dev, updateIndices);
+
+    const UpdateBoundsParams params = { 0, nbUpdates, numShapes };
+    kernel.dispatch(1,
+                    { shapeSimBuf, shapesBuf, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf, dummyFrozen,
+                      dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, blobBuf, nodeIdxBuf, shapeIdxBuf,
+                      poseBuf, gpuIdxBuf },
+                    params);
+    dev->flush();
+
+    // ---- compare (bitwise) ----
+    const std::vector<BodySim> gpuBodySims = downloadBuffer<BodySim>(dev, bodySimBuf, numBodies);
+    const std::vector<CachedTransform> gpuCache = downloadBuffer<CachedTransform>(dev, cacheBuf, numShapes);
+    const std::vector<float> gpuBounds = downloadBuffer<float>(dev, boundsBuf, numShapes * 6);
+    const std::vector<uint32_t> gpuUpdated = downloadBuffer<uint32_t>(dev, updatedBuf, numShapes);
+    for (uint32_t n = 0; n < numBodies; ++n)
+        PXG_CHECK_MSG(std::memcmp(&gpuBodySims[n].body2World, &refBodySims[n].body2World,
+                                  sizeof(refBodySims[n].body2World)) == 0,
+                      "p89 setGlobalPose body2World[%u] differs bitwise", n);
+    uint32_t cacheBad = 0, boundsBad[eUB_NB_PATHS] = {};
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        PXG_CHECK_MSG(gpuUpdated[s] == refUpdated[s], "p89 setGlobalPose updated[%u]: gpu=%u ref=%u", s,
+                      gpuUpdated[s], refUpdated[s]);
+        cacheBad += std::memcmp(&gpuCache[s].transform, &refCache[s], sizeof(Transform28)) != 0 ? 1u : 0u;
+        const float rb[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                              refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+        const uint32_t path = ubP89Path(shapeSims[s], shapes);
+        for (int c = 0; c < 6; ++c)
+        {
+            if (bits(gpuBounds[s * 6 + c]) == bits(rb[c]))
+                continue;
+            if (boundsBad[path] < 4)
+                std::printf("MM p89 setGlobalPose bounds[%u][%d] (%s): gpu=%08x ref=%08x\n", s, c,
+                            kUbP89PathNames[path], bits(gpuBounds[s * 6 + c]), bits(rb[c]));
+            ++boundsBad[path];
+        }
+    }
+    PXG_CHECK_MSG(cacheBad == 0, "p89 setGlobalPose: %u transform cache entries differ bitwise", cacheBad);
+    for (uint32_t p = 0; p < eUB_NB_PATHS; ++p)
+        PXG_CHECK_MSG(boundsBad[p] == 0, "p89 setGlobalPose: %u %s bound words differ bitwise from the CUDA order",
+                      boundsBad[p], kUbP89PathNames[p]);
 
     for (PxgBufferHandle h : { shapeSimBuf, shapesBuf, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf,
                                dummyFrozen, dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, blobBuf,

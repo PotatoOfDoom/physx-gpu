@@ -41,7 +41,11 @@
 // phase-B chain, the zeroSimOutput velocity update + sim-output zeroing,
 // and the phase-D transform-cache/bounds refresh across all five geometry
 // paths of the lifted pxgSlangCacheBound module (sphere / capsule / box /
-// real convex hull incl. a non-identity mesh scale / fast path).
+// real convex hull incl. a non-identity mesh scale / fast path).  P9.89: the
+// mirror's scaled-hull matrix is the real PxMeshScale::toMat33 and its fast
+// path the real PxBounds3::transformFast (it transcribed the port's operation
+// trees before), and shapes 18..23 put both on trig-free records, where the
+// compare is bitwise; a twin of the pre-P9.89 trees must differ there.
 //
 // TRANSCENDENTALS: revolute/spherical joint rotations go through sin/cos,
 // which are ULP-close but not bit-equal between llvmpipe and host libm
@@ -61,6 +65,7 @@
 #include "foundation/PxTransform.h"
 #include "foundation/PxMat33.h"
 #include "foundation/PxBounds3.h"
+#include "geometry/PxMeshScale.h"
 #include "PxgShapeSim.h"
 #include "PxNodeIndex.h"
 #include "DyFeatherstoneArticulation.h"
@@ -104,7 +109,7 @@ const uint32_t UK_MAX_LINKS = 6;
 const uint32_t UK_MAX_DOFS = 12;
 const uint32_t UK_RECORD_SIZE = 544;
 const uint32_t UK_JC_SIZE = 544;
-const uint32_t UK_NB_SHAPES = 18;   // sorted node/shape table entries
+const uint32_t UK_NB_SHAPES = 24;   // sorted node/shape table entries
 const uint32_t UK_GRID = 4;         // 8 warps: ceil(12/8)=2 iters, slots 12..15 DEAD
 
 // joint classes per record: 0 all-fix, 1 all-prismatic, 2 revolute mix,
@@ -193,6 +198,13 @@ static UkShapeDef ukShape(uint32_t s)
         { 1u, 1u, 3u },                    // velocities-only record: untouched in !zeroSim
         { 3u, 1u, 0u },                    // no-eNEEDS record: never touched
         { 9u, 2u, 2u },
+        // P9.89: scaled hulls (PxgShape 2, a non-round mesh scale) and fast-path
+        // convexes on the TRIG-FREE records 0 / 5 / 8, compared bit for bit: the
+        // PxMeshScale::toMat33 grouping and the transformFast q.rotate(center) are
+        // observable here, not only on the tolerance-compared records 2 / 6 / 10
+        { 8u, 3u, 6u },  { 0u, 0u, 5u },
+        { 5u, 0u, 6u },  { 8u, 2u, 5u },
+        { 0u, 1u, 6u },  { 5u, 0u, 5u },
     };
     return defs[s];
 }
@@ -217,6 +229,7 @@ struct UkArena
     std::vector<uint32_t> convexBlob;
     std::vector<float> cache;                // PxsCachedTransform, 8 floats
     std::vector<float> bounds;               // PxBounds3, 6 floats
+    std::vector<float> boundsP89Old;         // P9.89 twin: the pre-P9.89 port's operation trees
     std::vector<uint8_t> scDesc;
 };
 
@@ -317,7 +330,7 @@ static void ukSeed(UkArena& A, uint32_t salt)
     // ---- the shape tables ----
     A.shapeSims.resize(UK_NB_SHAPES);
     std::memset(A.shapeSims.data(), 0xAB, A.shapeSims.size() * sizeof(physx::PxgShapeSim));
-    A.convexShapes.assign(2 * 48, 0);
+    A.convexShapes.assign(3 * 48, 0);
     // convex blob: 12 header words + 5 float4 vertices; count in bits [8,16) of word 4
     A.convexBlob.assign(12 + 5 * 4, 0);
     A.convexBlob[4] = (5u << 8);
@@ -335,6 +348,14 @@ static void ukSeed(UkArena& A, uint32_t salt)
         const PxQuat sr = ukQuat(3u, 9u);
         float scaled[7] = { 1.25f, 0.75f, 1.5f, sr.x, sr.y, sr.z, sr.w };
         std::memcpy(A.convexShapes.data() + 48, scaled, 28);
+        // P9.89: PxgShape 2 (the exact-record hulls 19/21/23): a non-round, strongly
+        // non-uniform scale under a rotation for which all six off-diagonal elements of
+        // PxMeshScale::toMat33 round differently in the two product groupings (measured
+        // on the host; PxgShape 1's (1.25, 0.75, 1.5) / ukQuat(3, 9) happens to round
+        // the same both ways, as does ukQuat(5, 13))
+        const PxQuat sr2 = ukQuat(6u, 13u);
+        float scaled2[7] = { 0.6180339f, 1.7320508f, 1.4142135f, sr2.x, sr2.y, sr2.z, sr2.w };
+        std::memcpy(A.convexShapes.data() + 96, scaled2, 28);
     }
 
     for (uint32_t s = 0; s < UK_NB_SHAPES; ++s)
@@ -346,8 +367,17 @@ static void ukSeed(UkArena& A, uint32_t salt)
         ss.mLocalBounds = physx::PxBounds3(
             PxVec3(-0.5f - 0.03125f * float(s), -0.75f, -0.25f - 0.0625f * float(s % 3u)),
             PxVec3(1.0f + 0.03125f * float(s), 0.4f + 0.0625f * float(s % 4u), 0.6f));
+        if (s >= 18u)
+        {
+            // P9.89 shapes: local bounds far off the shape origin (|center| up to ~13)
+            // with small extents, so q.rotate(center) and the PxMat33(q) product
+            // round apart and the difference survives + p and +- extents
+            const PxVec3 c(3.f * ukf(s, 510u), 3.f * ukf(s, 511u), 3.f * ukf(s, 512u));
+            const PxVec3 e(0.125f + 0.0625f * float(s % 5u), 0.3125f, 0.1875f);
+            ss.mLocalBounds = physx::PxBounds3(c - e, c + e);
+        }
         ss.mBodySimIndex = ukNode(d);
-        ss.mHullDataIndex = (d.geom == 5u) ? (s & 1u) : 0xFFFFFFFFu;
+        ss.mHullDataIndex = (d.geom == 5u) ? (s >= 18u ? 2u : (s & 1u)) : 0xFFFFFFFFu;
         ss.mShapeFlags = 0;
         ss.mShapeType = uint16_t(d.geom == 6u ? 5u : (d.geom == 9u ? 0u : d.geom));
     }
@@ -370,6 +400,7 @@ static void ukSeed(UkArena& A, uint32_t salt)
     A.bounds.assign(size_t(UK_NB_SHAPES) * 6, 0.f);
     std::memset(A.cache.data(), 0xAB, A.cache.size() * 4);
     std::memset(A.bounds.data(), 0xAB, A.bounds.size() * 4);
+    A.boundsP89Old = A.bounds;
 
     A.scDesc.assign(96, 0xAB);
     const uint32_t nb = UK_NB_LIVE;
@@ -550,12 +581,15 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
             std::memcpy(&ce[7], &zero, 4);
 
             PxVec3 outMin, outMax;
+            PxVec3 outMinOld, outMaxOld;   // P9.89 twin (differs on the convex branches only)
             const PxVec3 lmin = ss.mLocalBounds.minimum, lmax = ss.mLocalBounds.maximum;
             const uint32_t shapeType = ss.mShapeType;
             if (shapeType == 0u)          // sphere
             {
                 outMin = absPos.p + lmin;
                 outMax = absPos.p + lmax;
+                outMinOld = outMin;
+                outMaxOld = outMax;
             }
             else if (shapeType == 2u)     // capsule
             {
@@ -565,12 +599,16 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
                 const PxVec3 extents = dv.abs() * halfHeight + PxVec3(radius);
                 outMin = absPos.p - extents;
                 outMax = absPos.p + extents;
+                outMinOld = outMin;
+                outMaxOld = outMax;
             }
             else if (shapeType == 3u)     // box
             {
                 const PxVec3 extents = ukBasisExtent(PxMat33(absPos.q), lmax);
                 outMin = absPos.p - extents;
                 outMax = absPos.p + extents;
+                outMinOld = outMin;
+                outMaxOld = outMax;
             }
             else                          // convexmesh
             {
@@ -580,18 +618,25 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
                     float sc[7];
                     std::memcpy(sc, sh, 28);
                     PxMat33 rot(absPos.q);
+                    PxMat33 rotOld(absPos.q);
                     const bool ident = sc[0] == 1.f && sc[1] == 1.f && sc[2] == 1.f &&
                                        sc[3] == 0.f && sc[4] == 0.f && sc[5] == 0.f;
                     if (!ident)
                     {
-                        const PxMat33 sr(PxQuat(sc[3], sc[4], sc[5], sc[6]));
-                        const PxMat33 srT = sr.getTranspose();
-                        PxMat33 diagTimesRot(sr.column0.multiply(PxVec3(sc[0], sc[1], sc[2])),
-                                             sr.column1.multiply(PxVec3(sc[0], sc[1], sc[2])),
-                                             sr.column2.multiply(PxVec3(sc[0], sc[1], sc[2])));
-                        rot = rot * (srT * diagTimesRot);
+                        // P9.89: updateCacheAndBound.cuh:113-114 is rot * shape.scale.toMat33(),
+                        // the REAL PxMeshScale::toMat33 (PxMeshScale.h:120-128): (rot^T with
+                        // column k scaled by s_k) * rot.
+                        const PxVec3 msS(sc[0], sc[1], sc[2]);
+                        const PxQuat msQ(sc[3], sc[4], sc[5], sc[6]);
+                        rot = rot * physx::PxMeshScale(msS, msQ).toMat33();
+                        // the pre-P9.89 port's twin: rot^T * (diag(s) * rot)
+                        const PxMat33 sr(msQ);
+                        const PxMat33 diagTimesRot(sr.column0.multiply(msS), sr.column1.multiply(msS),
+                                                   sr.column2.multiply(msS));
+                        rotOld = rotOld * (sr.getTranspose() * diagTimesRot);
                     }
                     PxVec3 minV(PX_MAX_F32), maxV(-PX_MAX_F32);
+                    PxVec3 minO(PX_MAX_F32), maxO(-PX_MAX_F32);
                     for (uint32_t v = 0; v < 5; ++v)
                     {
                         float vf[3];
@@ -599,24 +644,38 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
                         const PxVec3 tv = rot.transform(PxVec3(vf[0], vf[1], vf[2]));
                         minV = minV.minimum(tv);
                         maxV = maxV.maximum(tv);
+                        const PxVec3 to = rotOld.transform(PxVec3(vf[0], vf[1], vf[2]));
+                        minO = minO.minimum(to);
+                        maxO = maxO.maximum(to);
                     }
                     outMin = minV + absPos.p;
                     outMax = maxV + absPos.p;
+                    outMinOld = minO + absPos.p;
+                    outMaxOld = maxO + absPos.p;
                 }
                 else                       // the fast path
                 {
+                    // P9.89: updateCacheAndBound.cuh:148 is the REAL PxBounds3::transformFast
+                    // (PxBounds3.h:472-476): center = absPos.transform(c) = q.rotate(c) + p.
+                    const physx::PxBounds3 fb = physx::PxBounds3::transformFast(absPos, ss.mLocalBounds);
+                    outMin = fb.minimum;
+                    outMax = fb.maximum;
+                    // the pre-P9.89 port's twin: the PxMat33(q) product for the center
                     const PxMat33 rot(absPos.q);
                     const PxVec3 center = (lmax + lmin) * 0.5f;
                     const PxVec3 extents = (lmax - lmin) * 0.5f;
                     const PxVec3 nc = rot.transform(center) + absPos.p;
                     const PxVec3 ne = ukBasisExtent(rot, extents);
-                    outMin = nc - ne;
-                    outMax = nc + ne;
+                    outMinOld = nc - ne;
+                    outMaxOld = nc + ne;
                 }
             }
             float* be = &W.bounds[size_t(s) * 6];
             be[0] = outMin.x; be[1] = outMin.y; be[2] = outMin.z;
             be[3] = outMax.x; be[4] = outMax.y; be[5] = outMax.z;
+            float* bo = &W.boundsP89Old[size_t(s) * 6];
+            bo[0] = outMinOld.x; bo[1] = outMinOld.y; bo[2] = outMinOld.z;
+            bo[3] = outMaxOld.x; bo[4] = outMaxOld.y; bo[5] = outMaxOld.z;
         }
     }
 }
@@ -635,7 +694,13 @@ static uint32_t ukUlp(float a, float b)
     return m > 0xFFFFFFFFll ? 0xFFFFFFFFu : uint32_t(m);
 }
 
-struct UkStats { size_t bad = 0, loud = 0, tolerated = 0; uint32_t maxUlp = 0; float maxAbs = 0; };
+struct UkStats
+{
+    size_t bad = 0, loud = 0, tolerated = 0; uint32_t maxUlp = 0; float maxAbs = 0;
+    // exact-record bound words the pre-P9.89 twin stores differently: real (scaled) hull
+    // shapes / fast-path convexes
+    size_t p89TwinDiffHull = 0, p89TwinDiffFast = 0;
+};
 
 // tolFor(k): whether word k belongs to a transcendental-tainted region
 template <typename F>
@@ -745,11 +810,12 @@ static UkStats ukRun(PxgCudaShim& shim, bool zeroSim, bool haveIndices, uint32_t
     PxgDevicePtr dSidx = up(A.shapeIndices.data(), A.shapeIndices.size() * 4);
     PxgDevicePtr dSims = up(A.shapeSims.data(), A.shapeSims.size() * sizeof(physx::PxgShapeSim));
     PxgDevicePtr dBlob = up(A.convexBlob.data(), A.convexBlob.size() * 4);
-    // patch hullOrMeshPtr of both PxgShape images to the blob's device address
+    // patch hullOrMeshPtr of all three PxgShape images to the blob's device address
     {
         const uint64_t bp = uint64_t(dBlob);
         std::memcpy(A.convexShapes.data() + 32, &bp, 8);
         std::memcpy(A.convexShapes.data() + 48 + 32, &bp, 8);
+        std::memcpy(A.convexShapes.data() + 96 + 32, &bp, 8);
     }
     PxgDevicePtr dShapes = up(A.convexShapes.data(), A.convexShapes.size());
     PxgDevicePtr dCache = up(A.cache.data(), A.cache.size() * 4);
@@ -842,6 +908,19 @@ static UkStats ukRun(PxgCudaShim& shim, bool zeroSim, bool haveIndices, uint32_t
         shim.memcpyDtoH(gotB.data(), dBounds, gotB.size() * 4);
         ukCmp(st, "bounds", W.bounds.data(), gotB.data(), gotB.size() * 4,
               [&](size_t k) { return shapeTol[uint32_t(k / 6)]; });
+        // P9.89 coverage: bound words of the bit-exact records where the CUDA order
+        // (PxMeshScale::toMat33, PxBounds3::transformFast) and the pre-P9.89 port's
+        // twin disagree -- the words the exact compare above would flag on the old port
+        for (size_t k = 0; k < W.bounds.size(); ++k)
+        {
+            if (shapeTol[uint32_t(k / 6)])
+                continue;
+            uint32_t a, b;
+            std::memcpy(&a, &W.bounds[k], 4);
+            std::memcpy(&b, &W.boundsP89Old[k], 4);
+            if (a != b)
+                ++(ukShape(uint32_t(k / 6)).geom == 5u ? st.p89TwinDiffHull : st.p89TwinDiffFast);
+        }
     }
 
     for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
@@ -882,7 +961,18 @@ PXG_TEST(artiUpdateKinematic)
                     double(st.maxAbs), st.loud, st.bad);
         total.bad += st.bad;
         total.loud += st.loud;
+        total.p89TwinDiffHull += st.p89TwinDiffHull;
+        total.p89TwinDiffFast += st.p89TwinDiffFast;
     }
+    // P9.89: the exact records carry scaled hulls (shapes 19/21/23) and fast-path
+    // convexes (18/20/22); the pre-P9.89 port's operation trees must change bits there.
+    std::printf("[ info ] uk P9.89: %zu scaled-hull / %zu fast-path exact-record bound words differ "
+                "CUDA vs old port order\n", total.p89TwinDiffHull, total.p89TwinDiffFast);
+    // measured: 18 / 42 of 54 each (3 shapes x 6 words x 3 rounds)
+    PXG_CHECK_MSG(total.p89TwinDiffHull >= 12 && total.p89TwinDiffFast >= 30,
+                  "P9.89 coverage: exact-record bound words separating the CUDA order from the pre-P9.89 twin: "
+                  "scaled hull %zu (want >= 12), fast path %zu (want >= 30)",
+                  total.p89TwinDiffHull, total.p89TwinDiffFast);
     PXG_CHECK_MSG(total.bad == 0, "%zu words outside the trig scope differ", total.bad);
     PXG_CHECK_MSG(total.loud == 0, "%zu tolerated words outside both bounds", total.loud);
 }

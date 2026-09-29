@@ -38,7 +38,7 @@
 //   getAbsPose()             -- body2World * body2Actor^-1 * shape2Actor
 //   basisExtent()            -- rotated-extent AABB half-widths
 //   transformFastBounds()    -- PxBounds3::transformFast()
-//   meshScaleToMat33()       -- PxMeshScale::toMat33(): rot^-1 * diag(s) * rot
+//   meshScaleToMat33()       -- PxMeshScale::toMat33(): (rot^T column-scaled) * rot
 //   updateBoundsBda()        -- the geometry switch (sphere / capsule / box /
 //                               convex hull walk / local-bounds fast path)
 //   updateCacheAndBoundBda() -- setTransformCache() + optional bounds refresh
@@ -70,14 +70,19 @@ public float3 basisExtent(PxgMat33 basis, float3 extent)
         abs(c0.z) + abs(c1.z) + abs(c2.z));
 }
 
-// mirrors PxBounds3::transformFast()
+// mirrors PxBounds3::transformFast(const PxTransform&, const PxBounds3&)
 public void transformFastBounds(PxgTransform28 pose, float3 localMin, float3 localMax,
                                 out float3 outMin, out float3 outMax)
 {
     const PxgMat33 rot = mat33FromQuat(pose.q());
     const float3 center = (localMax + localMin) * 0.5f;
     const float3 extents = (localMax - localMin) * 0.5f;
-    const float3 newCenter = mat33Transform(rot, center) + pose.p();
+    // P9.89: updateCacheAndBound.cuh:148/:156 -> PxBounds3.h:472-476 centers with
+    // transform.transform(getCenter()) = q.rotate(c) + p (PxTransform.h:128-132,
+    // PxQuat.h:286-295), NOT the PxMat33(q) product col0*c.x + col1*c.y + col2*c.z:
+    // equal in exact arithmetic, a different operation tree in float.  PxMat33(q) is
+    // only the basisExtent basis.
+    const float3 newCenter = quatRotate(pose.q(), center) + pose.p();
     const float3 newExtents = basisExtent(rot, extents);
     outMin = newCenter - newExtents;
     outMax = newCenter + newExtents;
@@ -87,17 +92,16 @@ public void transformFastBounds(PxgTransform28 pose, float3 localMin, float3 loc
 public PxgMat33 meshScaleToMat33(float3 scale, float4 rotation)
 {
     const PxgMat33 rot = mat33FromQuat(rotation);
-    PxgMat33 trans; // transpose(rot)
-    trans.col0 = float3(rot.col0.x, rot.col1.x, rot.col2.x);
-    trans.col1 = float3(rot.col0.y, rot.col1.y, rot.col2.y);
-    trans.col2 = float3(rot.col0.z, rot.col1.z, rot.col2.z);
-
-    PxgMat33 diagTimesRot;
-    diagTimesRot.col0 = rot.col0 * scale;
-    diagTimesRot.col1 = rot.col1 * scale;
-    diagTimesRot.col2 = rot.col2 * scale;
-    // transpose(rot) * (diag(scale) * rot):
-    return mat33MulMat33(trans, diagTimesRot);
+    // P9.89: updateCacheAndBound.cuh:113-114 -> PxMeshScale.h:122-127: trans =
+    // rot.getTranspose(); trans.column_k *= scale[k]; return trans * rot.  Element
+    // (i,j) = sum_k (rot.col_i[k] * s_k) * rot.col_j[k].  Scaling rot's ROWS instead
+    // (rot^T * (diag(s) * rot)) groups the same product as rot.col_i[k] * (rot.col_j[k]
+    // * s_k) and rounds the off-diagonal elements differently.
+    PxgMat33 trans; // transpose(rot), column k scaled by scale[k]
+    trans.col0 = float3(rot.col0.x, rot.col1.x, rot.col2.x) * scale.x;
+    trans.col1 = float3(rot.col0.y, rot.col1.y, rot.col2.y) * scale.y;
+    trans.col2 = float3(rot.col0.z, rot.col1.z, rot.col2.z) * scale.z;
+    return mat33MulMat33(trans, rot);
 }
 
 // BDA variant of updateBounds() in updateCacheAndBound.cuh: identical branch
