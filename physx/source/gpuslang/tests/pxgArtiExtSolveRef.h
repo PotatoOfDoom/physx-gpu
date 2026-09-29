@@ -132,6 +132,11 @@ inline int gExtTorsClampVariant = 0;
 // std::fmin/std::fmax (the FIRST operand; this oracle's spelling before P9.86c).  Neither is the
 // reverted FMin/FMax: under the stamp that one orders the zeros exactly like the CUDA.
 inline int gExt1DClampVariant = 0;
+// P9.89 twin of the svxAccumulateError fix (npArtiSolveExtTGS): gExtErrMaxVariant 1 = the port's
+// old GLSL max(), llvmpipe's stamped FMax (NaN-ignoring, zero-ordered: refCudaFmaxf).  The CUDA's
+// PxMax (solverResidual.cuh:57) is selectMax(a, b) = a > b ? a : b: a NaN residual REPLACES the
+// running maximum and the next row's |e| replaces the NaN; FMax keeps the old maximum instead.
+inline int gExtErrMaxVariant = 0;
 
 struct RefError
 {
@@ -143,7 +148,8 @@ struct RefError
         const float r = velMul == 0.f ? 0.f : deltaF / velMul;
         sumOfSquares += r * r;
         ++counter;
-        maxError = PxMax(maxError, PxAbs(r));
+        maxError = (gExtErrMaxVariant == 1) ? refCudaFmaxf(maxError, PxAbs(r))
+                                            : PxMax(maxError, PxAbs(r));
     }
 };
 

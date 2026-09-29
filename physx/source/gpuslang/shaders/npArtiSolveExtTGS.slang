@@ -71,7 +71,8 @@
 //     seven sites each; the self-constraint caller passes 1.
 // 10. The residual (error accumulator) divides deltaF by velMultiplier
 //     exactly (the CUDA's __fdividef is fast-math; exact division here, the
-//     established solverTGS spelling).
+//     established solverTGS spelling).  Its maxError is the CUDA's selectMax chain,
+//     not max() (P9.89: a NaN residual resets it; artiSolveExtTGSMaxErrorNaN).
 
 import pxgSlangCommon;
 import pxgSlangSpatialMatrix;
@@ -97,7 +98,13 @@ public void svxAccumulateError(inout SvxError e, float deltaF, float velocityMul
     const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
     e.sumOfSquares += r * r;
     ++e.counter;
-    e.maxError = max(e.maxError, abs(r));
+    // P9.89: maxError = PxMax(maxError, PxAbs(e)) (solverResidual.cuh:57) is selectMax(a, b) =
+    // a > b ? a : b (PxUnixMathIntrinsics.h:122), a serial select chain over the rows: a NaN
+    // residual replaces the running maximum and the next row's |e| replaces the NaN.  GLSL max()
+    // (FMax, NaN-ignoring on stamped llvmpipe) kept the old maximum across the NaN row.  Also
+    // the internal joint rows' accumulator (internalConstraints2.cu:1879, :1959 via npArtiSolveInternal).
+    const float ar = abs(r);
+    e.maxError = (e.maxError > ar) ? e.maxError : ar;
 }
 
 // computeCompliantContactCoefficientsTGS (constraintPrepShared.cuh, the
