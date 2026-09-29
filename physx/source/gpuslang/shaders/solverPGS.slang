@@ -386,7 +386,15 @@ void pxgAccumulateErrorLocal(inout PxgErrorAccumulatorSlang e, float deltaF, flo
     const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
     e.sumOfSquares += r * r;
     ++e.counter;
-    e.maxError = max(e.maxError, abs(r));
+    // P9.89: maxError = PxMax(maxError, PxAbs(e)) (gpucommon/src/CUDA/solverResidual.cuh:57) is
+    // selectMax(a, b) = a > b ? a : b (PxMath.h:82, PxUnixMathIntrinsics.h:122), a serial select chain
+    // over the lane's rows (solverBlock.cuh:482 normal, :554 friction): a NaN residual REPLACES the
+    // running maximum and the next row's |e| replaces the NaN (a trailing NaN leaves the lane NaN,
+    // which the warp fmaxf tree then drops).  GLSL max() (FMax = maxNum on llvmpipe) kept the old
+    // maximum across the NaN row.  The warp butterflies (MaxOpFloat = fmaxf, solverResidual.cuh:87)
+    // and the AtomicMax CAS stay max().  solverPGS_residualMaxErrorNaN.
+    const float ar = abs(r);
+    e.maxError = (e.maxError > ar) ? e.maxError : ar;
 }
 
 // ---------------------------------------------------------------------------
