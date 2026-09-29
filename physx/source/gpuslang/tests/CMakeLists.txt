@@ -342,7 +342,15 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # softBodySimParticleAttachmentSolve_p90BaryOrder compares both delta buffers bitwise
     # (its reassociated twin must differ); it passes unstamped too, so the entry is
     # unobserved.
-    softBodyParticleAttachBda)
+    softBodyParticleAttachBda
+    # P9.90: the force-threshold accumulation (accumulateThresholdStream.cu), stamped for
+    # consistency.  Its float math is additions only (the scanned force prefixes, spelled
+    # in the CUDA's order since P9.86f) and one product, threshold * dt (:440), which feeds
+    # only the `accumulatedForce >` compare and never an add.  There is no OpDot and no
+    # mul feeding an add, so neither llvmpipe's OpDot association nor contraction can
+    # reach an output: the stamped and unstamped .spv give the same testThresholdStream
+    # results, and no fixture can observe the entry.  No other shader compiles this module.
+    thresholdStream)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
