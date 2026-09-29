@@ -165,7 +165,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # distances are PxVec3 dots, (x + y) + z (softbodyPrimitives.cu:131-154); unstamped
     # they came out x + (y + z).  testNpGjk npTetCollide_p89InnerSphereSelect compares
     # them bit for bit and fails without this entry.
-    npTetCollide)
+    npTetCollide
+    # P9.90: the PGS contact/joint prep.  Every row it writes is PxVec3 dots,
+    # (x + y) + z (PxVec3.h:173/:274): cTargetVel, norVel, angNorVel, resp0/1 =
+    # angDom * |I^-1/2 (r x n)|^2 + invMass * |n|^2, the friction targetVel and
+    # bias (contactConstraintBlockPrep.cuh:414-470/:545-600).  Unstamped, llvmpipe
+    # summed them x + (y + z).  The other engine importers of pxgSlangPrepCommon
+    # (npArtiConstraintPrep and the npArti* leaves) were already stamped.
+    # testConstraintPrep constraintPrepPGS_p90DotOrder compares the rows bitwise
+    # and fails without this entry.
+    constraintPrepPGS)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
