@@ -1737,6 +1737,297 @@ PXG_TEST(setRigidDynamicGlobalPose_p89MeshScaleCenterOrder)
         dev->destroyBuffer(h);
 }
 
+// ---------------------------------------------------------------------------
+// P9.90: setRigidDynamicGlobalPose's pose chain in the CUDA operation order.
+// body2World = inQ * b2aQ, inQ.rotate(b2aP) + inP (updateBodiesAndShapes.cu), then
+// getAbsPose = body2World.transform(body2Actor.transformInv(shape2Actor))
+// (updateCacheAndBound.cuh) -- PxQuat::rotate/rotateInv (PxQuat.h:286-310) whose
+// dot2 = (x*vx + y*vy) + z*vz is the forward PxVec3 dot order, and the Hamilton
+// product.  updateBounds is NoContraction-stamped; the chains are scalar mul+add
+// with no OpDot.  1024 general orientations, non-round offsets, 4 shapes each
+// (sphere / capsule / box / transformFast), everything compared BITWISE.  The
+// twin evaluates every rotate/rotateInv with the re-associated dot2 x*vx + (y*vy +
+// z*vz) (what llvmpipe does to an unstamped OpDot) and must change a large part of
+// the cache and bounds.
+// ---------------------------------------------------------------------------
+namespace p90ub
+{
+static Vec3 rotate(const QuatV& q, const Vec3& v, bool oldOrder)
+{
+    if (!oldOrder)
+        return q.rotate(v);
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = q.x * vx + (q.y * vy + q.z * vz);
+    return Vec3((vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                (vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
+}
+static Vec3 rotateInv(const QuatV& q, const Vec3& v, bool oldOrder)
+{
+    if (!oldOrder)
+        return q.rotateInv(v);
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = q.x * vx + (q.y * vy + q.z * vz);
+    return Vec3((vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                (vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                (vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2));
+}
+static TransformV absPose(const TransformV& b2w, const TransformV& s2a, const TransformV& b2a, bool oldOrder)
+{
+    const TransformV t0(b2a.q.getConjugate() * s2a.q, rotateInv(b2a.q, s2a.p - b2a.p, oldOrder));
+    return TransformV(b2w.q * t0.q, rotate(b2w.q, t0.p, oldOrder) + b2w.p);
+}
+} // namespace p90ub
+
+PXG_TEST(setRigidDynamicGlobalPose_p90PoseOrder)
+{
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    std::mt19937 rng(0x90u);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-1.f, 1.f);
+
+    const uint32_t numBodies = 1024, shapesPerBody = 4, numShapes = numBodies * shapesPerBody;
+
+    std::vector<BodySim> bodySims(numBodies);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    for (BodySim& b : bodySims)
+    {
+        b.body2World.q = randomQuat(rng).toFloat4();
+        b.body2World.p = Float4{ 3.7f * sym(rng), 3.7f * sym(rng), 3.7f * sym(rng), 0 };
+        b.body2Actor_maxImpulseW.q = randomQuat(rng).toFloat4();
+        b.body2Actor_maxImpulseW.p = Float4{ 0.73f * sym(rng), 0.73f * sym(rng), 0.73f * sym(rng), 0 };
+    }
+
+    std::vector<ShapeSim> shapeSims(numShapes);
+    std::vector<uint64_t> nodeIndices(numShapes);
+    std::vector<uint32_t> shapeIndices(numShapes);
+    for (uint32_t i = 0; i < numShapes; ++i)
+    {
+        const uint32_t body = i / shapesPerBody, k = i % shapesPerBody;
+        ShapeSim s = {};
+        s.transform.q = randomQuat(rng).toQuat();
+        s.transform.p = Float3{ 0.91f * sym(rng), 0.91f * sym(rng), 0.91f * sym(rng) };
+        s.bodySimIndex = makeNodeIndex(body);
+        s.shapeFlags = eSIMULATION_SHAPE;
+        s.hullDataIndex = 0xFFFFFFFFu;
+        switch (k)
+        {
+        case 0:
+        {
+            s.shapeType = eSPHERE;
+            const float r = 0.13f + unit(rng);
+            s.localBoundsMin = Float3{ -r, -r, -r };
+            s.localBoundsMax = Float3{ r, r, r };
+            break;
+        }
+        case 1:
+        {
+            s.shapeType = eCAPSULE;
+            const float r = 0.11f + unit(rng), hh = 0.17f + unit(rng);
+            s.localBoundsMin = Float3{ -(hh + r), -r, -r };
+            s.localBoundsMax = Float3{ hh + r, r, r };
+            break;
+        }
+        case 2:
+        {
+            s.shapeType = eBOX;
+            const Float3 he{ 0.07f + unit(rng), 0.07f + unit(rng), 0.07f + unit(rng) };
+            s.localBoundsMin = Float3{ -he.x, -he.y, -he.z };
+            s.localBoundsMax = he;
+            break;
+        }
+        default:
+        {
+            s.shapeType = uint16_t(6); // triangle mesh: transformFast
+            const Float3 c{ 1.3f * sym(rng), 1.3f * sym(rng), 1.3f * sym(rng) };
+            const Float3 e{ 0.05f + 0.4f * unit(rng), 0.05f + 0.4f * unit(rng), 0.05f + 0.4f * unit(rng) };
+            s.localBoundsMin = Float3{ c.x - e.x, c.y - e.y, c.z - e.z };
+            s.localBoundsMax = Float3{ c.x + e.x, c.y + e.y, c.z + e.z };
+            break;
+        }
+        }
+        shapeSims[i] = s;
+        nodeIndices[i] = makeNodeIndex(body);
+        shapeIndices[i] = i;
+    }
+
+    const uint32_t nbUpdates = numBodies;
+    std::vector<uint32_t> updateIndices(nbUpdates);
+    std::iota(updateIndices.begin(), updateIndices.end(), 0u);
+    std::shuffle(updateIndices.begin(), updateIndices.end(), rng);
+    std::vector<float> poseData(nbUpdates * 7);
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const QuatV q = randomQuat(rng);
+        poseData[i * 7 + 0] = q.x;
+        poseData[i * 7 + 1] = q.y;
+        poseData[i * 7 + 2] = q.z;
+        poseData[i * 7 + 3] = q.w;
+        poseData[i * 7 + 4] = 2.3f * sym(rng);
+        poseData[i * 7 + 5] = 2.3f * sym(rng);
+        poseData[i * 7 + 6] = 2.3f * sym(rng);
+    }
+
+    // ---- reference (CUDA order) and the re-associated dot2 twin
+    std::vector<BodySim> refBodySims = bodySims, oldBodySims = bodySims;
+    std::vector<Transform28> refCache(numShapes), oldCache(numShapes);
+    std::vector<Bounds3> refB(numShapes, Bounds3{}), oldB(numShapes, Bounds3{});
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        const bool oldOrder = variant == 1;
+        std::vector<BodySim>& bs = oldOrder ? oldBodySims : refBodySims;
+        std::vector<Transform28>& cache = oldOrder ? oldCache : refCache;
+        std::vector<Bounds3>& bounds = oldOrder ? oldB : refB;
+        for (uint32_t i = 0; i < nbUpdates; ++i)
+        {
+            const uint32_t index = updateIndices[i];
+            BodySim& bodySim = bs[index];
+            const QuatV inQ(poseData[i * 7 + 0], poseData[i * 7 + 1], poseData[i * 7 + 2], poseData[i * 7 + 3]);
+            const Vec3 inP(poseData[i * 7 + 4], poseData[i * 7 + 5], poseData[i * 7 + 6]);
+            const QuatV b2aQ(bodySim.body2Actor_maxImpulseW.q);
+            const Vec3 b2aP(bodySim.body2Actor_maxImpulseW.p.x, bodySim.body2Actor_maxImpulseW.p.y,
+                            bodySim.body2Actor_maxImpulseW.p.z);
+            const TransformV body2World(inQ * b2aQ, p90ub::rotate(inQ, b2aP, oldOrder) + inP);
+            bodySim.body2World.q = body2World.q.toFloat4();
+            bodySim.body2World.p = Float4{ body2World.p.x, body2World.p.y, body2World.p.z, 0.f };
+            const TransformV body2Actor(b2aQ, b2aP);
+            for (uint32_t s = index * shapesPerBody; s < (index + 1) * shapesPerBody; ++s)
+            {
+                const TransformV absPos =
+                    p90ub::absPose(body2World, TransformV(shapeSims[s].transform), body2Actor, oldOrder);
+                cache[s] = absPos.toTransform28();
+                refUpdateBounds(shapeSims[s], {}, {}, absPos, bounds[s]);
+            }
+        }
+    }
+    // the CUDA-order reference must be the file's own getAbsPose (sanity of the twin helper)
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const uint32_t index = updateIndices[i];
+        const BodySim& b = refBodySims[index];
+        const TransformV b2w(QuatV(b.body2World.q), Vec3(b.body2World.p.x, b.body2World.p.y, b.body2World.p.z));
+        const TransformV b2a(QuatV(b.body2Actor_maxImpulseW.q),
+                             Vec3(b.body2Actor_maxImpulseW.p.x, b.body2Actor_maxImpulseW.p.y,
+                                  b.body2Actor_maxImpulseW.p.z));
+        const Transform28 t = getAbsPose(b2w, TransformV(shapeSims[index * shapesPerBody].transform), b2a)
+                                  .toTransform28();
+        PXG_CHECK_MSG(std::memcmp(&t, &refCache[index * shapesPerBody], sizeof(Transform28)) == 0,
+                      "p90 setGlobalPose: twin helper (CUDA order) disagrees with getAbsPose on body %u", index);
+    }
+
+    // ---- coverage guard: the re-associated dot2 must change the bits
+    uint32_t twinB2W = 0, twinCache = 0, twinBounds[4] = {};
+    for (uint32_t n = 0; n < numBodies; ++n)
+        twinB2W += std::memcmp(&refBodySims[n].body2World, &oldBodySims[n].body2World,
+                               sizeof(refBodySims[n].body2World)) != 0 ? 1u : 0u;
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        twinCache += std::memcmp(&refCache[s], &oldCache[s], sizeof(Transform28)) != 0 ? 1u : 0u;
+        const float rw[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                              refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+        const float ow[6] = { oldB[s].minimum.x, oldB[s].minimum.y, oldB[s].minimum.z,
+                              oldB[s].maximum.x, oldB[s].maximum.y, oldB[s].maximum.z };
+        for (int c = 0; c < 6; ++c)
+            twinBounds[s % shapesPerBody] += bits(rw[c]) != bits(ow[c]) ? 1u : 0u;
+    }
+    std::printf("[ info ] P9.90 setGlobalPose: old dot2 order changes %u/%u body2World, %u/%u cache entries, "
+                "bound words %u/%u/%u/%u of %u (sphere/capsule/box/fast)\n",
+                twinB2W, numBodies, twinCache, numShapes, twinBounds[0], twinBounds[1], twinBounds[2],
+                twinBounds[3], numBodies * 6);
+    // measured: 182/1024 body2World, 1719/4096 cache, 1089/1015/1111/997 of 6144 bound words
+    PXG_CHECK_MSG(twinB2W > numBodies / 8 && twinCache > numShapes / 3,
+                  "P9.90 coverage: the x*vx + (y*vy + z*vz) twin changes only %u body2World / %u cache entries",
+                  twinB2W, twinCache);
+    for (int p = 0; p < 4; ++p)
+        PXG_CHECK_MSG(twinBounds[p] > numBodies / 2, "P9.90 coverage: the twin changes only %u bound words of path %d",
+                      twinBounds[p], p);
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+    Kernel kernel("updateBounds.spv", "setRigidDynamicGlobalPose",
+                  { sizeof(ShapeSim), sizeof(Shape), sizeof(BodySim), 4, sizeof(SolverBodySleepData),
+                    sizeof(CachedTransform), 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 4 },
+                  sizeof(UpdateBoundsParams));
+
+    PxgBufferHandle shapeSimBuf = createBufferFrom(dev, shapeSims);
+    PxgBufferHandle dummyShapes = dev->createBuffer(sizeof(Shape));
+    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
+    PxgBufferHandle dummy4a = dev->createBuffer(16);
+    PxgBufferHandle dummySleep = dev->createBuffer(16);
+    std::vector<CachedTransform> cacheInit(numShapes);
+    std::memset(cacheInit.data(), 0, cacheInit.size() * sizeof(CachedTransform));
+    PxgBufferHandle cacheBuf = createBufferFrom(dev, cacheInit);
+    std::vector<float> boundsInit(numShapes * 6, 0.f);
+    PxgBufferHandle boundsBuf = createBufferFrom(dev, boundsInit);
+    std::vector<uint32_t> zerosShapes(numShapes, 0);
+    PxgBufferHandle dummyFrozen = dev->createBuffer(16);
+    PxgBufferHandle dummyUnfrozen = dev->createBuffer(16);
+    PxgBufferHandle updatedBuf = createBufferFrom(dev, zerosShapes);
+    PxgBufferHandle dummyActive = dev->createBuffer(16);
+    PxgBufferHandle dummyDeactivate = dev->createBuffer(16);
+    PxgBufferHandle dummyBlob = dev->createBuffer(16);
+    PxgBufferHandle nodeIdxBuf = createBufferFrom(dev, nodeIndices);
+    PxgBufferHandle shapeIdxBuf = createBufferFrom(dev, shapeIndices);
+    PxgBufferHandle poseBuf = createBufferFrom(dev, poseData);
+    PxgBufferHandle gpuIdxBuf = createBufferFrom(dev, updateIndices);
+
+    const UpdateBoundsParams params = { 0, nbUpdates, numShapes };
+    kernel.dispatch((nbUpdates + 255) / 256,
+                    { shapeSimBuf, dummyShapes, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf, dummyFrozen,
+                      dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, dummyBlob, nodeIdxBuf, shapeIdxBuf,
+                      poseBuf, gpuIdxBuf },
+                    params);
+    dev->flush();
+
+    const std::vector<BodySim> gpuBodySims = downloadBuffer<BodySim>(dev, bodySimBuf, numBodies);
+    const std::vector<CachedTransform> gpuCache = downloadBuffer<CachedTransform>(dev, cacheBuf, numShapes);
+    const std::vector<float> gpuBounds = downloadBuffer<float>(dev, boundsBuf, numShapes * 6);
+    const std::vector<uint32_t> gpuUpdated = downloadBuffer<uint32_t>(dev, updatedBuf, numShapes);
+    uint32_t b2wBad = 0, b2wAsTwin = 0, cacheBad = 0, cacheAsTwin = 0, boundsBad = 0, updBad = 0;
+    for (uint32_t n = 0; n < numBodies; ++n)
+    {
+        if (std::memcmp(&gpuBodySims[n].body2World, &refBodySims[n].body2World,
+                        sizeof(refBodySims[n].body2World)) == 0)
+            continue;
+        ++b2wBad;
+        b2wAsTwin += std::memcmp(&gpuBodySims[n].body2World, &oldBodySims[n].body2World,
+                                 sizeof(oldBodySims[n].body2World)) == 0 ? 1u : 0u;
+    }
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        updBad += gpuUpdated[s] != 1u ? 1u : 0u;
+        if (std::memcmp(&gpuCache[s].transform, &refCache[s], sizeof(Transform28)) != 0)
+        {
+            ++cacheBad;
+            cacheAsTwin += std::memcmp(&gpuCache[s].transform, &oldCache[s], sizeof(Transform28)) == 0 ? 1u : 0u;
+        }
+        const float rb[6] = { refB[s].minimum.x, refB[s].minimum.y, refB[s].minimum.z,
+                              refB[s].maximum.x, refB[s].maximum.y, refB[s].maximum.z };
+        for (int c = 0; c < 6; ++c)
+        {
+            if (bits(gpuBounds[s * 6 + c]) == bits(rb[c]))
+                continue;
+            if (boundsBad < 4)
+                std::printf("MM p90 setGlobalPose bounds[%u][%d]: gpu=%08x ref=%08x\n", s, c,
+                            bits(gpuBounds[s * 6 + c]), bits(rb[c]));
+            ++boundsBad;
+        }
+    }
+    PXG_CHECK_MSG(updBad == 0, "p90 setGlobalPose: %u updated flags not set", updBad);
+    PXG_CHECK_MSG(b2wBad == 0, "p90 setGlobalPose: %u body2World differ bitwise (%u equal the old-order twin)",
+                  b2wBad, b2wAsTwin);
+    PXG_CHECK_MSG(cacheBad == 0, "p90 setGlobalPose: %u transform cache entries differ bitwise (%u equal the twin)",
+                  cacheBad, cacheAsTwin);
+    PXG_CHECK_MSG(boundsBad == 0, "p90 setGlobalPose: %u bound words differ bitwise from the CUDA order", boundsBad);
+
+    for (PxgBufferHandle h : { shapeSimBuf, dummyShapes, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf,
+                               dummyFrozen, dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, dummyBlob,
+                               nodeIdxBuf, shapeIdxBuf, poseBuf, gpuIdxBuf })
+        dev->destroyBuffer(h);
+}
+
 // updateChangedAABBMgrHandlesLaunch on the ENGINE ABI (P5 Step 4 root-cause
 // fix): pack the per-shape "updated" flags into the AABB-manager changed-handle
 // bitmap (bit j of word w = updated[w*32+j] != 0).  Without this the broadphase

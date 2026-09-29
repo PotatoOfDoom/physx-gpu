@@ -316,7 +316,19 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # The stamp pins that order against a driver that would fuse.  testBodyUpdate
     # directApi_p90PoseTorqueOrder compares pose and angular acceleration bitwise (its
     # old-order twins must differ); it passes unstamped too, so the entry is unobserved.
-    directApi)
+    directApi
+    # P9.90: the transform-cache/bounds kernels, stamped for consistency.  The float
+    # math is getAbsPose (PxTransform::transformInv/transform, PxQuat rotate/rotateInv
+    # and the Hamilton product), PxMat33(q), basisExtent, PxMeshScale::toMat33, the
+    # capsule extents and transformFast (updateCacheAndBound.cuh), all scalar/vector
+    # mul+add chains spelled left to right with no OpDot, so llvmpipe's OpDot
+    # association never applies and it did not contract the chains: the unstamped .spv
+    # already matched the -ffp-contract=off mirror bitwise.  The only other importer of
+    # pxgSlangCacheBound, npArtiUpdateKin, was already stamped.  testUpdateBounds
+    # setRigidDynamicGlobalPose_p90PoseOrder compares cache, bounds and body2World
+    # bitwise (its old-order twin must differ); it passes unstamped too, so the entry is
+    # unobserved.
+    updateBounds)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
