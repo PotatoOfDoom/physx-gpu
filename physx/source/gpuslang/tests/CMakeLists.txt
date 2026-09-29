@@ -241,7 +241,18 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # that consumes this prep (psContactSolveTgsBda) is already stamped.
     # testPsContactSolve psContactSolve_p90DotOrder compares the constraint block,
     # deltaPos, appliedForces and mAccumDeltaP bitwise and fails without this entry.
-    psContactSolveBda)
+    psContactSolveBda
+    # P9.90: the engine convex/box-vs-plane narrow phase.  Its float OpDots transcribe
+    # PxVec3 dots, (x + y) + z (PxVec3.h:173/:274): the working normal
+    # bToA.rotateInv(localNormal).getNormalized() (cudaGJKEPA.cu:2863), the refresh
+    # distance v.dot(n) and projectedDifference.magnitudeSquared() (:2905-2909), the
+    # face/edge selection and the reduction dots.  Unstamped, llvmpipe summed them
+    # x + (y + z).  Its other import, pxgSlangNpPatchTail, carries no dot and its
+    # engine importer triPlaneNpBda is already stamped; the npCvxPlane{Refresh,Gen,Out}
+    # harness ports are compared against their own references, never this kernel.
+    # testConvexPlaneNphase convexPlaneNphase_p90DotOrder compares the manifold normals
+    # and the reloaded separations bitwise and fails without this entry.
+    npCvxPlaneNphase)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

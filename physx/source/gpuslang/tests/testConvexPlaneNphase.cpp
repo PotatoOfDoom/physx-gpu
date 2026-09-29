@@ -652,4 +652,219 @@ PXG_TEST(convexPlaneNphase_refreshReload)
     d.free();
 }
 
+// ---------------------------------------------------------------------------
+// 3. P9.90: DOT ORDER, BITWISE.  The kernel's float OpDots transcribe PxVec3
+//    dots, x*v.x + y*v.y + z*v.z = (x + y) + z (PxVec3.h:173/:274).  Two of
+//    them reach an output directly:
+//      - the working normal n = bToA.rotateInv(localNormal).getNormalized()
+//        (cudaGJKEPA.cu:2863): magnitudeSquared feeds 1/sqrt, and n is stored
+//        in every manifold localNormalPen.xyz on a regen;
+//      - the refresh distance dist = v.dot(n) (:2905), emitted as the contact
+//        separation on the reload path.
+//    llvmpipe evaluates an UNDECORATED OpDot as x + (y + z) (Mesa lower_fdot);
+//    the NoContraction stamp (PXG_NOCONTRACT_SHADERS) gives (x + y) + z.  The
+//    existing cases above are axis-aligned and tolerance-compared, so they
+//    cannot see the difference.  Here every pose is general (random plane
+//    rotation, tilted box, non-round extents and offsets), and the manifold
+//    and contact stream are compared word for word against a
+//    -ffp-contract=off mirror of the kernel in the CUDA order.  A twin in the
+//    old order must differ on both sites (coverage guard).
+// ---------------------------------------------------------------------------
+static Q4 qMulH(Q4 a, Q4 b)   // PxQuat operator* == npAbiQuatMul
+{
+    return Q4{ a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
+               a.w * b.y + b.w * a.y + a.z * b.x - a.x * b.z,
+               a.w * b.z + b.w * a.z + a.x * b.y - a.y * b.x,
+               a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+static V3 qRotInvH(Q4 q, V3 v) // npAbiQuatRotateInv
+{
+    const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z, w2 = q.w * q.w - 0.5f, d2 = q.x * vx + q.y * vy + q.z * vz;
+    return V3{ vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * d2,
+               vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * d2,
+               vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d2 };
+}
+// cudaOrder: (x + y) + z, the CUDA's PxVec3::dot.  !cudaOrder: x + (y + z), the
+// unstamped llvmpipe OpDot.
+static float dotO(V3 a, V3 b, bool cudaOrder)
+{
+    const float x = a.x * b.x, y = a.y * b.y, z = a.z * b.z;
+    return cudaOrder ? (x + y) + z : x + (y + z);
+}
+static V3 normO(V3 v, bool cudaOrder)   // getNormalized (npCvxPlaneNphase.slang:139)
+{
+    const float m = dotO(v, v, cudaOrder);
+    if (!(m > 0.0f)) return V3{ 0, 0, 0 };
+    const float r = 1.0f / std::sqrt(m);
+    return V3{ v.x * r, v.y * r, v.z * r };
+}
+static uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+PXG_TEST(convexPlaneNphase_p90DotOrder)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgCudaShim shim = makeShim(dev);
+
+    uint32_t rng = 0x9E3779B9u;
+    auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return float(rng >> 8) * (1.0f / 16777216.0f); }; // [0,1)
+    auto rs = [&](float lo, float hi) { return lo + (hi - lo) * rnd(); };
+
+    const int kScenes = 16;
+    int badRegen = 0, badReload = 0, twinN = 0, twinDist = 0, ran = 0;
+    for (int sc = 0; sc < kScenes; ++sc)
+    {
+        // ---- a general pose ----
+        Q4 pq = { rs(-1, 1), rs(-1, 1), rs(-1, 1), rs(-1, 1) };
+        {
+            const float l = std::sqrt(pq.x * pq.x + pq.y * pq.y + pq.z * pq.z + pq.w * pq.w);
+            pq = Q4{ pq.x / l, pq.y / l, pq.z / l, pq.w / l };
+        }
+        V3 axis = { rs(-1, 1), rs(-1, 1), rs(-1, 1) };
+        {
+            const float l = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+            axis = V3{ axis.x / l, axis.y / l, axis.z / l };
+        }
+        const float ang = rs(0.013f, 0.057f), sh = std::sin(0.5f * ang);
+        const Q4 tilt = { axis.x * sh, axis.y * sh, axis.z * sh, std::cos(0.5f * ang) };
+        const V3 h = { rs(0.31f, 0.77f), rs(0.31f, 0.77f), rs(0.31f, 0.77f) };
+        // plane-space placement: the tilted box's lowest corner 1.3 cm below the plane
+        float minX = 1e30f;
+        for (int i = 0; i < 8; ++i) minX = std::fmin(minX, qRot(tilt, boxCorner(i, h)).x);
+        const V3 pDesign = { -minX - rs(0.011f, 0.017f), rs(-0.9f, 0.9f), rs(-0.9f, 0.9f) };
+        PlaneScene s;
+        s.halfExt = h;
+        s.planeQ = pq;
+        s.planeP = V3{ rs(-2, 2), rs(-2, 2), rs(-2, 2) };
+        s.convexQ = qMulH(pq, tilt);
+        s.convexP = add(s.planeP, qRot(pq, pDesign));
+        s.contactDist = 0.2f;
+        s.matPlane = 2; s.matConvex = 5;
+
+        HManifold mf; std::memset(&mf, 0, sizeof(mf));
+        DeviceScene d;
+        buildDevice(shim, s, mf, 0u, d);
+        if (!d.dBlob || !d.dMf) { std::printf("  NOTE: no BDA -> skip\n"); d.free(); return; }
+        ++ran;
+
+        // ---- mirror: refresh inputs (cudaGJKEPA.cu:2859-2863) ----
+        const Q4 bToAq = qMulH(Q4{ -pq.x, -pq.y, -pq.z, pq.w }, s.convexQ);
+        const V3 bToAp = qRotInvH(pq, sub(s.convexP, s.planeP));
+        const V3 nRaw = qRotInvH(bToAq, V3{ 1, 0, 0 });
+        const V3 n = normO(nRaw, true), nOld = normO(nRaw, false);
+        const float contactDist = 0.5f * s.contactDist + 0.5f * s.contactDist;
+
+        // ---- invocation 1: regen.  Face 1 (-x) is the support face; its four
+        //      corners in vertexData8 order (kBoxFaceVtx[1]) are the four lanes. ----
+        EngineBlob blob = makeBlob(d, false);
+        PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &blob, sizeof(blob)) == PxgResult::Success, "p90 launch 1 (scene %d)", sc);
+        shim.streamSynchronize();
+        HOutput gOut1; shim.memcpyDtoH(&gOut1, d.dOut, sizeof(HOutput));
+        HManifold gMf; shim.memcpyDtoH(&gMf, d.dMf, sizeof(HManifold));
+
+        HManifold ref; std::memcpy(&ref, &mf, sizeof(mf));
+        V3 worldRef[4]; float sepRef[4];
+        uint32_t nbRef = 0;
+        for (int L = 0; L < 4; ++L)
+        {
+            const V3 vtx = boxCorner(kBoxFaceVtx[1][L], h);
+            const Q4 id = { 0, 0, 0, 1 };
+            const V3 r = qRot(id, vtx);
+            const V3 pS = qRotInvH(id, V3{ r.x * 1.0f, r.y * 1.0f, r.z * 1.0f });   // vertex2Shape, identity scale
+            const V3 p = add(qRot(bToAq, pS), bToAp);
+            if (!(p.x < contactDist)) continue;
+            const V3 pInB = qRotInvH(bToAq, sub(p, bToAp));
+            ref.lB[nbRef][0] = pInB.x; ref.lB[nbRef][1] = pInB.y; ref.lB[nbRef][2] = pInB.z; ref.lB[nbRef][3] = 0.0f;
+            ref.lA[nbRef][0] = p.x - p.x; ref.lA[nbRef][1] = p.y; ref.lA[nbRef][2] = p.z; ref.lA[nbRef][3] = 0.0f;
+            ref.lNp[nbRef][0] = n.x; ref.lNp[nbRef][1] = n.y; ref.lNp[nbRef][2] = n.z; ref.lNp[nbRef][3] = p.x;
+            worldRef[nbRef] = add(qRot(pq, p), s.planeP); sepRef[nbRef] = p.x;
+            ++nbRef;
+        }
+        PXG_CHECK_MSG(nbRef == 4u, "p90 scene %d: the mirror expects 4 face contacts (got %u)", sc, nbRef);
+        ref.relPos[0] = -bToAp.x; ref.relPos[1] = -bToAp.y; ref.relPos[2] = -bToAp.z; ref.relPos[3] = 0.0f;
+        std::memcpy(ref.quatA, &pq, 16); std::memcpy(ref.quatB, &s.convexQ, 16);
+        ref.nbContacts = nbRef;
+
+        if (n.x != nOld.x || n.y != nOld.y || n.z != nOld.z) ++twinN;
+
+        PXG_CHECK_MSG((gOut1.nbContacts_flags & 0xffffu) == nbRef, "p90 scene %d: regen nb gpu=%u ref=%u",
+                      sc, gOut1.nbContacts_flags & 0xffffu, nbRef);
+        {
+            const uint32_t* gw = reinterpret_cast<const uint32_t*>(&gMf);
+            const uint32_t* rw = reinterpret_cast<const uint32_t*>(&ref);
+            int bad = 0;
+            for (int w = 0; w < 61; ++w)   // through nbContacts; the warm-start words are untouched zeros
+                if (gw[w] != rw[w])
+                {
+                    if (bad < 4) std::printf("  [p90 %d] manifold word %d gpu=%08x ref=%08x\n", sc, w, gw[w], rw[w]);
+                    ++bad;
+                }
+            std::vector<float> cs(4u * nbRef);
+            shim.memcpyDtoH(cs.data(), d.dCStream + (gOut1.contactPoints - d.dCStream), cs.size() * 4);
+            for (uint32_t k = 0; k < nbRef; ++k)
+            {
+                const float e[4] = { worldRef[k].x, worldRef[k].y, worldRef[k].z, sepRef[k] };
+                for (int c = 0; c < 4; ++c)
+                    if (fbits(cs[4 * k + c]) != fbits(e[c]))
+                    {
+                        if (bad < 4) std::printf("  [p90 %d] regen contact %u.%d gpu=%08x ref=%08x\n", sc, k, c, fbits(cs[4 * k + c]), fbits(e[c]));
+                        ++bad;
+                    }
+            }
+            if (bad) ++badRegen;
+        }
+
+        // ---- invocation 2: same poses, stored mB perturbed off the corners so v is
+        //      a general vector -> refresh keeps all four, no rerun, reload path. ----
+        const float kP[4][3] = { { 0.0031f, -0.0027f, 0.0019f }, { -0.0023f, 0.0037f, -0.0011f },
+                                 { 0.0013f, 0.0029f, -0.0033f }, { -0.0041f, -0.0017f, 0.0026f } };
+        for (int j = 0; j < 4; ++j)
+            for (int c = 0; c < 3; ++c) gMf.lB[j][c] += kP[j][c];
+        shim.memcpyHtoD(d.dMf, &gMf, sizeof(HManifold));
+        HOutput out; std::memset(&out, 0, sizeof(out)); out.nbContacts_flags = 0xAAAA0000u;
+        HCounters counters = { 0, 0, 0, 0 };
+        shim.memcpyHtoD(d.dOut, &out, sizeof(HOutput));
+        shim.memcpyHtoD(d.dCounters, &counters, sizeof(HCounters));
+        shim.memsetD32(d.dCStream, 0, d.contactLimit / 4);
+        PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &blob, sizeof(blob)) == PxgResult::Success, "p90 launch 2 (scene %d)", sc);
+        shim.streamSynchronize();
+        HOutput gOut2; shim.memcpyDtoH(&gOut2, d.dOut, sizeof(HOutput));
+        PXG_CHECK_MSG((gOut2.nbContacts_flags & 0xffffu) == 4u, "p90 scene %d: reload nb gpu=%u, expected 4",
+                      sc, gOut2.nbContacts_flags & 0xffffu);
+        {
+            std::vector<float> cs(16);
+            shim.memcpyDtoH(cs.data(), d.dCStream + (gOut2.contactPoints - d.dCStream), 64);
+            int bad = 0;
+            bool twinDiff = false;
+            for (int j = 0; j < 4; ++j)
+            {
+                const V3 pA = { gMf.lA[j][0], gMf.lA[j][1], gMf.lA[j][2] };
+                const V3 pB = { gMf.lB[j][0], gMf.lB[j][1], gMf.lB[j][2] };
+                const V3 v = sub(pB, qRotInvH(bToAq, sub(pA, bToAp)));   // :2902-2904
+                const float dist = dotO(v, n, true);                      // :2905
+                const float distOld = dotO(v, nOld, false);
+                if (fbits(dist) != fbits(distOld)) twinDiff = true;
+                const V3 w = add(qRot(pq, add(qRot(bToAq, pB), bToAp)), s.planeP);
+                const float e[4] = { w.x, w.y, w.z, dist };
+                for (int c = 0; c < 4; ++c)
+                    if (fbits(cs[4 * j + c]) != fbits(e[c]))
+                    {
+                        if (bad < 4) std::printf("  [p90 %d] reload contact %d.%d gpu=%08x (%.9g) ref=%08x (%.9g) old-order=%08x\n",
+                                                 sc, j, c, fbits(cs[4 * j + c]), cs[4 * j + c], fbits(e[c]), e[c], c == 3 ? fbits(distOld) : 0u);
+                        ++bad;
+                    }
+            }
+            if (twinDiff) ++twinDist;
+            if (bad) ++badReload;
+        }
+        d.free();
+    }
+    if (ran == 0) return;
+    std::printf("  [p90] %d scenes: regen mismatches in %d, reload mismatches in %d; old-order twin moves n in %d, dist in %d\n",
+                ran, badRegen, badReload, twinN, twinDist);
+    PXG_CHECK_MSG(badRegen == 0, "p90: %d of %d regen manifolds/streams differ from the CUDA-order mirror", badRegen, ran);
+    PXG_CHECK_MSG(badReload == 0, "p90: %d of %d reload streams differ from the CUDA-order mirror", badReload, ran);
+    PXG_CHECK_MSG(twinN > 0, "p90: the x+(y+z) twin must change the working normal n in some scene (coverage)");
+    PXG_CHECK_MSG(twinDist > 0, "p90: the x+(y+z) twin must change a reloaded separation in some scene (coverage)");
+}
+
 } // namespace
