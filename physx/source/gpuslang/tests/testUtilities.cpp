@@ -615,4 +615,241 @@ PXG_TEST(skinning_softBodyAndInterleave)
     dev->destroyBuffer(outBuf);
 }
 
+// ---------------------------------------------------------------------------
+// P9.90: skinning's dots in the CUDA order, bit for bit
+// ---------------------------------------------------------------------------
+//
+// Every dot skinning.slang evaluates is a PxVec3 dot, (x*x' + y*y') + z*z'
+// (PxVec3.h:173/:274): normalizeSafe's magnitude (utility.cu:159/:191/:97) and the
+// three Phong projection scales (utility.cu:77/:82/:87).  llvmpipe (Mesa lower_fdot)
+// sums an UNDECORATED OpDot as x + (y + z); only the NoContraction stamp gives the
+// forward order.  skinning_clothPipeline could not see that: its normals come out of
+// an atomicAdd accumulation whose order is nondeterministic, so it compares with a
+// 2e-3 tolerance.  This case skips the accumulation -- the guide normals are written
+// directly (general orientation, non-round, NOT unit length) -- and compares
+// normalizeNormals and interpolateSkinnedClothVertices bitwise against a
+// -ffp-contract=off mirror parameterised by the dot order.  The old-order twin must
+// differ from it (coverage guard), and an unstamped skinning.spv fails this case.
+
+enum class P90DotOrder { Cuda, Old };
+
+float p90Dot(const Vec3& a, const Vec3& b, P90DotOrder o)
+{
+    return o == P90DotOrder::Cuda ? (a.x * b.x + a.y * b.y) + a.z * b.z
+                                  : a.x * b.x + (a.y * b.y + a.z * b.z);
+}
+
+float p90NormalizeSafe(Vec3& v, P90DotOrder o)
+{
+    const float mag = std::sqrt(p90Dot(v, v, o));
+    if (mag < 1e-20f)
+        return 0.0f;
+    v *= 1.0f / mag;
+    return mag;
+}
+
+// utility.cu evaluatePointPhongInterpolation<true>; also returns the tanh argument
+// so the caller can keep only the saturated (tanh == 1.0f exactly) vertices.
+Vec3 p90Phong(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& uvw, const Vec3& nA, const Vec3& nB,
+              const Vec3& nC, float h, P90DotOrder o, float& ratioOut)
+{
+    const float alpha = 0.625f;
+    const Vec3 q = a * uvw.x + b * uvw.y + c * uvw.z;
+    const Vec3 projA = q - nA * p90Dot(q - a, nA, o);
+    const Vec3 projB = q - nB * p90Dot(q - b, nB, o);
+    const Vec3 projC = q - nC * p90Dot(q - c, nC, o);
+    const Vec3 qStar = projA * uvw.x + projB * uvw.y + projC * uvw.z;
+    Vec3 dir = qStar - q;
+    float offset = p90NormalizeSafe(dir, o) * alpha;
+    float ratio = 0.0f;
+    ratioOut = 0.0f;
+    if (h > 0.0f)
+    {
+        ratio = offset / h;
+        ratioOut = ratio;
+        ratio = std::tanh(ratio);
+    }
+    offset = ratio * h;
+    return q + dir * offset;
+}
+
+PXG_TEST(skinning_p90DotOrder)
+{
+    std::mt19937 rng(9090);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-1.7f, 1.9f);
+
+    // Two descs: desc 0 has halfSurfaceThickness 0 (the output sees the normal's
+    // normalizeSafe dot through offsetAlongInterpolatedNormal), desc 1 has a tiny
+    // thickness so that the Phong offset saturates tanh to exactly 1.0f and the
+    // output sees q + h * normalize(qStar - q), i.e. the three projection dots.
+    const uint32_t numDescs = 2, nbVerts = 97, nbTris = 83, nbSkinned = 1201;
+    const float thickness[numDescs] = { 0.0f, 0.0117f };
+
+    std::vector<uint32_t> data;
+    std::vector<TrimeshDesc> descs(numDescs);
+    auto pushWord = [&](uint32_t w) { data.push_back(w); };
+    auto pushFloat = [&](float f) { uint32_t w; std::memcpy(&w, &f, 4); data.push_back(w); };
+
+    struct Mesh
+    {
+        std::vector<Vec3> verts, normals;
+        std::vector<uint32_t> tris, triId;
+        std::vector<float> uv, offsets;
+    };
+    std::vector<Mesh> meshes(numDescs);
+
+    for (uint32_t m = 0; m < numDescs; ++m)
+    {
+        Mesh& mesh = meshes[m];
+        TrimeshDesc& d = descs[m];
+        d.guideVertices = { uint32_t(data.size() * 4), 16, nbVerts, 0 };
+        for (uint32_t v = 0; v < nbVerts; ++v)
+        {
+            const Vec3 p(sym(rng), sym(rng), sym(rng));
+            mesh.verts.push_back(p);
+            pushFloat(p.x); pushFloat(p.y); pushFloat(p.z); pushFloat(0.f);
+        }
+        d.guideNormals = { uint32_t(data.size() * 4), 16, nbVerts, 0 };
+        for (uint32_t v = 0; v < nbVerts; ++v)
+        {
+            // general orientation, magnitude ~0.3..3.3, never unit
+            const Vec3 n(sym(rng), sym(rng), sym(rng));
+            mesh.normals.push_back(n);
+            pushFloat(n.x); pushFloat(n.y); pushFloat(n.z); pushFloat(0.f);
+        }
+        d.guideTrianglesOffset = uint32_t(data.size() * 4);
+        d.nbGuideTriangles = nbTris;
+        for (uint32_t t = 0; t < nbTris; ++t)
+        {
+            const uint32_t i0 = rng() % nbVerts, i1 = (i0 + 1 + rng() % (nbVerts - 2)) % nbVerts;
+            uint32_t i2 = rng() % nbVerts;
+            while (i2 == i0 || i2 == i1)
+                i2 = rng() % nbVerts;
+            mesh.tris.insert(mesh.tris.end(), { i0, i1, i2 });
+            pushWord(i0); pushWord(i1); pushWord(i2);
+        }
+        d.skinningInfoOffset = uint32_t(data.size() * 4);
+        for (uint32_t s = 0; s < nbSkinned; ++s)
+        {
+            const float u = unit(rng) * 1.2f - 0.1f, v = unit(rng) * 1.2f - 0.1f;
+            // desc 0: a large offset along the interpolated normal, so its normalizeSafe
+            // rounding reaches the output bits; desc 1: none, so what the output sees
+            // beyond q is the Phong projection dots alone.
+            const float off = m == 0 ? (unit(rng) * 2.f - 1.f) * 2.71f : 0.0f;
+            const uint32_t tri = rng() % nbTris;
+            mesh.uv.insert(mesh.uv.end(), { u, v });
+            mesh.offsets.push_back(off);
+            mesh.triId.push_back(tri);
+            pushFloat(u); pushFloat(v); pushFloat(off); pushWord(tri);
+        }
+        d.skinnedVertices = { uint32_t(data.size() * 4), 12, nbSkinned, 0 };
+        for (uint32_t s = 0; s < nbSkinned * 3; ++s)
+            pushFloat(0.f);
+        d.halfSurfaceThickness = thickness[m];
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const std::vector<uint32_t> strides = { 4, 4, 16, 16, 4 };
+    Kernel normalizeK("skinning.spv", "normalizeNormals", strides, sizeof(SkinningParams));
+    Kernel interpolate("skinning.spv", "interpolateSkinnedClothVertices", strides, sizeof(SkinningParams));
+    PxgBufferHandle descBuf = createBufferFrom(dev, descs);
+    PxgBufferHandle dataBuf = createBufferFrom(dev, data);
+    PxgBufferHandle dummyF4a = dev->createBuffer(16);
+    PxgBufferHandle dummyF4b = dev->createBuffer(16);
+    PxgBufferHandle dummyOut = dev->createBuffer(16);
+    const std::vector<PxgBufferHandle> bufs = { descBuf, dataBuf, dummyF4a, dummyF4b, dummyOut };
+    const SkinningParams params = { 0 };
+    normalizeK.dispatch((nbVerts + 1023) / 1024, bufs, params, numDescs); // the engine's divisor (P9.61)
+    dev->barrier();
+    interpolate.dispatch((nbSkinned + 255) / 256, bufs, params, numDescs);
+    dev->flush();
+    const std::vector<uint32_t> gpu = downloadBuffer<uint32_t>(dev, dataBuf, data.size());
+
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    uint32_t normalMiss = 0, normalTwinDiff = 0, skinMiss = 0, skinTwinDiff[numDescs] = { 0, 0 };
+    uint32_t saturated = 0;
+    for (uint32_t m = 0; m < numDescs; ++m)
+    {
+        const Mesh& mesh = meshes[m];
+        const TrimeshDesc& d = descs[m];
+        std::vector<Vec3> nrm[2];
+        for (int o = 0; o < 2; ++o)
+        {
+            nrm[o] = mesh.normals;
+            for (Vec3& n : nrm[o])
+                p90NormalizeSafe(n, o == 0 ? P90DotOrder::Cuda : P90DotOrder::Old);
+        }
+        for (uint32_t v = 0; v < nbVerts; ++v)
+        {
+            const uint32_t w = (d.guideNormals.offset + v * d.guideNormals.stride) / 4;
+            const Vec3& e = nrm[0][v];
+            const Vec3& t = nrm[1][v];
+            const bool ok = gpu[w] == bits(e.x) && gpu[w + 1] == bits(e.y) && gpu[w + 2] == bits(e.z);
+            normalMiss += ok ? 0 : 1;
+            PXG_CHECK_MSG(ok, "p90 mesh %u normal[%u]: gpu=(%08x,%08x,%08x) cuda-order=(%08x,%08x,%08x)", m, v,
+                          gpu[w], gpu[w + 1], gpu[w + 2], bits(e.x), bits(e.y), bits(e.z));
+            normalTwinDiff += (bits(e.x) != bits(t.x) || bits(e.y) != bits(t.y) || bits(e.z) != bits(t.z)) ? 1 : 0;
+        }
+        for (uint32_t s = 0; s < nbSkinned; ++s)
+        {
+            Vec3 out[2];
+            float ratio[2] = { 0.f, 0.f };
+            for (int oi = 0; oi < 2; ++oi)
+            {
+                const P90DotOrder o = oi == 0 ? P90DotOrder::Cuda : P90DotOrder::Old;
+                const uint32_t* tri = &mesh.tris[3 * mesh.triId[s]];
+                const float u = mesh.uv[2 * s], v = mesh.uv[2 * s + 1];
+                const Vec3 uvw(u, v, 1.0f - u - v);
+                Vec3 uvwProj = uvw.maximum(Vec3(0.f));
+                const float sumProj = uvwProj.x + uvwProj.y + uvwProj.z;
+                if (sumProj > 0.0f)
+                    uvwProj *= 1.0f / sumProj;
+                const Vec3 nA = nrm[oi][tri[0]], nB = nrm[oi][tri[1]], nC = nrm[oi][tri[2]];
+                Vec3 normal = nA * uvwProj.x + nB * uvwProj.y + nC * uvwProj.z;
+                p90NormalizeSafe(normal, o);
+                const Vec3 a = mesh.verts[tri[0]], b = mesh.verts[tri[1]], c = mesh.verts[tri[2]];
+                const Vec3 phong = p90Phong(a, b, c, uvwProj, nA, nB, nC, d.halfSurfaceThickness, o, ratio[oi]);
+                const Vec3 pUVW = a * uvw.x + b * uvw.y + c * uvw.z;
+                const Vec3 pUVWProj = a * uvwProj.x + b * uvwProj.y + c * uvwProj.z;
+                out[oi] = phong + normal * mesh.offsets[s] + pUVW - pUVWProj;
+            }
+            // desc 1: only vertices whose tanh argument is safely saturated (tanh ==
+            // 1.0f in float, far from exp overflow) are compared -- the case observes
+            // dot order, not the device's tanh.
+            if (d.halfSurfaceThickness > 0.0f)
+            {
+                if (!(ratio[0] > 12.0f && ratio[0] < 40.0f && ratio[1] > 12.0f && ratio[1] < 40.0f))
+                    continue;
+                ++saturated;
+            }
+            const Vec3& e = out[0];
+            const Vec3& t = out[1];
+            const uint32_t w = (d.skinnedVertices.offset + s * d.skinnedVertices.stride) / 4;
+            const bool ok = gpu[w] == bits(e.x) && gpu[w + 1] == bits(e.y) && gpu[w + 2] == bits(e.z);
+            skinMiss += ok ? 0 : 1;
+            PXG_CHECK_MSG(ok, "p90 mesh %u skinned[%u]: gpu=(%08x,%08x,%08x) cuda-order=(%08x,%08x,%08x)", m, s,
+                          gpu[w], gpu[w + 1], gpu[w + 2], bits(e.x), bits(e.y), bits(e.z));
+            skinTwinDiff[m] += (bits(e.x) != bits(t.x) || bits(e.y) != bits(t.y) || bits(e.z) != bits(t.z)) ? 1 : 0;
+        }
+    }
+    std::printf("  p90 skinning: normal misses %u (twin differs on %u/%u), skinned misses %u "
+                "(twin differs on %u/%u and %u/%u saturated)\n",
+                normalMiss, normalTwinDiff, numDescs * nbVerts, skinMiss, skinTwinDiff[0], nbSkinned,
+                skinTwinDiff[1], saturated);
+    // coverage guard: the old x + (y + z) order must be distinguishable on every path
+    PXG_CHECK_MSG(normalTwinDiff >= 10, "p90: old-order twin differs on only %u normals", normalTwinDiff);
+    PXG_CHECK_MSG(skinTwinDiff[0] >= 20, "p90: old-order twin differs on only %u h=0 skinned vertices",
+                  skinTwinDiff[0]);
+    PXG_CHECK_MSG(saturated >= 300, "p90: only %u saturated Phong vertices", saturated);
+    PXG_CHECK_MSG(skinTwinDiff[1] >= 10, "p90: old-order twin differs on only %u saturated Phong vertices",
+                  skinTwinDiff[1]);
+
+    dev->destroyBuffer(descBuf);
+    dev->destroyBuffer(dataBuf);
+    dev->destroyBuffer(dummyF4a);
+    dev->destroyBuffer(dummyF4b);
+    dev->destroyBuffer(dummyOut);
+}
+
 } // namespace

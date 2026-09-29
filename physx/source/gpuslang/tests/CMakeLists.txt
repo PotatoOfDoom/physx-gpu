@@ -252,7 +252,13 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # harness ports are compared against their own references, never this kernel.
     # testConvexPlaneNphase convexPlaneNphase_p90DotOrder compares the manifold normals
     # and the reloaded separations bitwise and fails without this entry.
-    npCvxPlaneNphase)
+    npCvxPlaneNphase
+    # P9.90: the deformable skinning kernels.  normalizeSafe's magnitude
+    # (utility.cu:159/:191/:97) and the Phong projection scales (q - a).dot(nA)
+    # (utility.cu:77/:82/:87) are PxVec3 dots, (x + y) + z (PxVec3.h:173/:274);
+    # unstamped, llvmpipe summed them x + (y + z).  skinning.slang imports no module.
+    # testUtilities skinning_p90DotOrder compares the normals and skinned vertices bitwise.
+    skinning)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
