@@ -276,7 +276,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # quatMul) and no other kernel is compared against this one.
     # testNpCvxStage1Refresh npCvxStage1Refresh_p90DotOrder compares the refreshed
     # manifold bitwise and fails without this entry.
-    npCvxStage1Refresh)
+    npCvxStage1Refresh
+    # P9.90: the convex-convex finishContactsKernel.  The group-average normal's
+    # magnitudeSquared (cudaGJKEPA.cu writeContactsToStream4threads, PxVec3.h:173) is a
+    # PxVec3 dot, (x + y) + z; unstamped, llvmpipe summed it x + (y + z) and the patch
+    # normal (PxContactPatch words 4..6) came out re-associated.  Its only import,
+    # pxgSlangNpAbi, contributes explicit mul+add chains (quatRotate), and no other
+    # kernel is compared against this one.  testNpCvxFinishContacts
+    # npCvxFinishContacts_p90DotOrder compares the patch normals bitwise and fails
+    # without this entry.
+    npCvxFinishContacts)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

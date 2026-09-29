@@ -325,6 +325,9 @@ void finishContactsKernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThread
         {
             const float3 sum = (normPenL[4u * g].xyz + normPenL[4u * g + 2u].xyz)
                              + (normPenL[4u * g + 1u].xyz + normPenL[4u * g + 3u].xyz);
+            // P9.90: PxVec3::magnitudeSquared (PxVec3.h:173) = (x*x + y*y) + z*z.  llvmpipe sums an
+            // undecorated OpDot x + (y + z); the NoContraction stamp (PXG_NOCONTRACT_SHADERS) keeps
+            // it in the CUDA order (testNpCvxFinishContacts npCvxFinishContacts_p90DotOrder).
             const float magSq = dot(sum, sum);
             float3 avgNorm;
             if (magSq >= 1e-5f)

@@ -134,6 +134,9 @@ static void combineMaterials(const MatRef& m0, const MatRef& m1,
     else { matFlags = cf | 2u; dynF = 0.f; staF = 0.f; }
 }
 
+// P9.90: 1 = the group-average normal's magnitudeSquared in the unstamped-OpDot order x + (y + z).
+static int gDotVariant = 0;
+
 // per-pair raw semantic fixture (pre-flip)
 struct Pair
 {
@@ -242,7 +245,10 @@ static void refFinish(const std::vector<Pair>& pr, uint32_t numTests, bool inser
             V3 sum{ (normPenL[4 * g].x + normPenL[4 * g + 2].x) + (normPenL[4 * g + 1].x + normPenL[4 * g + 3].x),
                     (normPenL[4 * g].y + normPenL[4 * g + 2].y) + (normPenL[4 * g + 1].y + normPenL[4 * g + 3].y),
                     (normPenL[4 * g].z + normPenL[4 * g + 2].z) + (normPenL[4 * g + 1].z + normPenL[4 * g + 3].z) };
-            const float magSq = sum.x * sum.x + sum.y * sum.y + sum.z * sum.z;
+            // P9.90: PxVec3::magnitudeSquared (PxVec3.h:173) is (x*x + y*y) + z*z.  gDotVariant = 1
+            // is the twin of the unstamped .spv, whose OpDot llvmpipe sums x + (y + z).
+            const float magSq = (gDotVariant == 1) ? sum.x * sum.x + (sum.y * sum.y + sum.z * sum.z)
+                                                   : sum.x * sum.x + sum.y * sum.y + sum.z * sum.z;
             // PxVec3::operator/= is reciprocal-multiply (matches the shader / .cu)
             const float invMag = 1.f / std::sqrt(magSq);
             V3 avg = (magSq >= 1e-5f) ? V3{ sum.x * invMag, sum.y * invMag, sum.z * invMag }
@@ -785,6 +791,228 @@ PXG_TEST(npCvxFinishContacts_engineAbi)
     PXG_CHECK_MSG(cOvf > 0 && cPatchOvf > 0 && cInval > NLAUNCH && cAvg > NLAUNCH / 3 && cInvalid > 0 && cEmpty > 0,
                   "finishContacts: coverage thin (cOvf %zu patchOvf %zu inval %zu avg %zu invalid %zu empty %zu)",
                   cOvf, cPatchOvf, cInval, cAvg, cInvalid, cEmpty);
+
+    for (PxgDevicePtr pfree : { dCmIn, dShapes, dCache, dCd, dMf, dMat, dPoints, dPatch, dForce,
+                                dCounters, dTouch, dPatchCh, dCmOut })
+        shim.memFree(pfree);
+}
+
+// ===========================================================================
+// P9.90 -- THE ORDER OF THE GROUP-AVERAGE NORMAL'S magnitudeSquared.
+//
+// writeContactsToStream4threads normalizes the butterfly sum of the four lane
+// normals with PxVec3::magnitudeSquared, `x*x + y*y + z*z` (PxVec3.h:173), i.e.
+// (x*x + y*y) + z*z with every product rounded (this file builds with
+// -ffp-contract=off).  The port spells it dot(sum, sum), and SPIR-V leaves
+// OpDot's summation order to the driver: llvmpipe evaluates an UNDECORATED
+// OpDot as x + (y + z) and a NoContraction-decorated one as (x + y) + z.  The
+// normal lands in PxContactPatch words 4..6, which the battery above compares
+// only to tolerance.  This case compares every word of every patch, and the
+// whole contact stream, BITWISE: 32 pairs with four kept, non-unit, generally
+// oriented lane normals each, rotated by non-round quaternions.  The mirror
+// twin with the old order must change at least one patch normal (checked), and
+// the GPU must equal the CUDA-order mirror -- which it does only because
+// npCvxFinishContacts is in PXG_NOCONTRACT_SHADERS.
+// ===========================================================================
+PXG_TEST(npCvxFinishContacts_p90DotOrder)
+{
+    using namespace physx;
+
+    std::mt19937 rng(90001);
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() { V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) }); const float a = rf(-3.1f, 3.1f); return F4{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) }; };
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npCvxFinishContacts.spv", "finishContactsKernel", 152u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &finLoader);
+
+    const uint32_t NMAT = 8;
+    std::vector<MatRef> mats(NMAT);
+    std::vector<PxsMaterialData> matData(NMAT);
+    for (uint32_t i = 0; i < NMAT; ++i)
+    {
+        MatRef& m = mats[i];
+        m.dyn = rf(0, 1.5f); m.sta = rf(0, 2.f); m.rest = rf(0.f, 1.f); m.damp = rf(0, 2.f);
+        m.flags = 0; m.fricMode = i % 4; m.restMode = (i + 1) % 4; m.dampMode = (i + 2) % 4;
+        matData[i].dynamicFriction = m.dyn; matData[i].staticFriction = m.sta;
+        matData[i].restitution = m.rest; matData[i].damping = m.damp;
+        matData[i].flags = PxMaterialFlags(PxU16(0));
+        matData[i].fricCombineMode = PxU8(m.fricMode);
+        matData[i].restCombineMode = PxU8(m.restMode);
+        matData[i].dampingCombineMode = PxU8(m.dampMode);
+    }
+
+    // 32 valid pairs, four kept contacts each (pen <= 0 < cd), convex-convex (no radius),
+    // average point inserted.  The lane normals are NOT unit and not axis aligned, so the
+    // three squares of their sum are all non-zero and of comparable size.
+    const uint32_t numTests = 32;
+    const bool insertAvg = true;
+    std::vector<Pair> pr(32);
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        Pair& p = pr[i];
+        p.type0 = 5u; p.type1 = (i % 3 == 0) ? 3u : 5u;   // some flipped pairs (type1 < type0)
+        p.mat0 = i % NMAT; p.mat1 = (i * 3 + 1) % NMAT;
+        p.scale0 = V3{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2) };
+        p.scale1 = V3{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2) };
+        p.t0q = randQuat(); p.t1q = randQuat();
+        p.t0p = V3{ rf(-2, 2), rf(-2, 2), rf(-2, 2) };
+        p.t1p = V3{ rf(-2, 2), rf(-2, 2), rf(-2, 2) };
+        p.cd0 = rf(0.05f, 0.3f); p.cd1 = rf(0.05f, 0.3f);
+        const V3 base = unit(V3{ rf(0.3f, 1), rf(0.3f, 1), rf(0.3f, 1) });
+        for (int j = 0; j < 4; ++j)
+        {
+            const float s = rf(0.37f, 1.73f);
+            const V3 n{ s * (base.x + rf(-0.3f, 0.3f)), s * (base.y + rf(-0.3f, 0.3f)), s * (base.z + rf(-0.3f, 0.3f)) };
+            p.normPen[j] = F4{ n.x, n.y, n.z, rf(-0.6f, -0.01f) };
+            p.pointB[j] = F4{ rf(-1.5f, 1.5f), rf(-1.5f, 1.5f), rf(-1.5f, 1.5f), 0 };
+        }
+        p.rawNb = 4;
+        p.allflags = rng();
+        p.nbContactsFlags = rng();
+    }
+
+    const size_t BUF = 8192;
+    const uint32_t initC = 0, initF = 0, initP = 0;
+    const uint32_t cLimit = 16 * 400, fLimit = 4 * 400, pLimit = 64 * 64;
+    FinishRef ref, twin;
+    refFinish(pr, numTests, insertAvg, initC, initF, initP, cLimit, fLimit, pLimit, mats, BUF, ref);
+    gDotVariant = 1;
+    refFinish(pr, numTests, insertAvg, initC, initF, initP, cLimit, fLimit, pLimit, mats, BUF, twin);
+    gDotVariant = 0;
+
+    // Coverage guard: the old order must move patch normals.  A one-ulp magnitudeSquared change
+    // survives 1/sqrt and the quaternion rotation on pairs 13 and 14 of this seed (2 of 32).
+    size_t twinNormDiff = 0;
+    for (uint32_t i = 0; i < numTests; ++i)
+    {
+        PXG_CHECK_MSG(ref.pairs[i].patchWritten, "finishContacts p90: pair %u wrote no patch", i);
+        if (!ref.pairs[i].patchWritten) continue;
+        if (std::memcmp(&ref.patch[ref.pairs[i].contactPatchesOff + 16], &twin.patch[ref.pairs[i].contactPatchesOff + 16], 12) != 0)
+            ++twinNormDiff;
+    }
+    PXG_CHECK_MSG(twinNormDiff >= 2, "finishContacts p90: the x + (y + z) twin changes only %zu patch normals", twinNormDiff);
+
+    PxgDevicePtr dCmIn = 0, dShapes = 0, dCache = 0, dCd = 0, dMf = 0, dMat = 0;
+    PxgDevicePtr dPoints = 0, dPatch = 0, dForce = 0, dCounters = 0, dTouch = 0, dPatchCh = 0, dCmOut = 0;
+    if (shim.memAlloc(&dCmIn, 32 * sizeof(PxgContactManagerInput)) != PxgResult::Success || !dCmIn)
+    { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memAlloc(&dShapes, 64 * sizeof(PxgShape));
+    shim.memAlloc(&dCache, 64 * sizeof(PxsCachedTransform));
+    shim.memAlloc(&dCd, 64 * 4);
+    shim.memAlloc(&dMf, 32 * sizeof(PxgPersistentContactManifold));
+    shim.memAlloc(&dMat, matData.size() * sizeof(PxsMaterialData));
+    shim.memAlloc(&dPoints, BUF);
+    shim.memAlloc(&dPatch, BUF);
+    shim.memAlloc(&dForce, BUF);
+    shim.memAlloc(&dCounters, sizeof(PxgPatchAndContactCounters));
+    shim.memAlloc(&dTouch, 32 * 4);
+    shim.memAlloc(&dPatchCh, 32 * 4);
+    shim.memAlloc(&dCmOut, 32 * sizeof(PxsContactManagerOutput));
+    shim.memcpyHtoD(dMat, matData.data(), matData.size() * sizeof(PxsMaterialData));
+
+    std::vector<PxgContactManagerInput> cmIn(32);
+    std::vector<PxgShape> shapes(64);
+    std::vector<PxsCachedTransform> cache(64);
+    std::vector<float> cd(64);
+    std::vector<PxgPersistentContactManifold> mf(32);
+    std::vector<PxsContactManagerOutput> cmOut(32);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    std::memset(cache.data(), 0, cache.size() * sizeof(PxsCachedTransform));
+    std::memset(mf.data(), 0, mf.size() * sizeof(PxgPersistentContactManifold));
+    std::memset(cmOut.data(), 0, cmOut.size() * sizeof(PxsContactManagerOutput));
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        const Pair& p = pr[i];
+        cmIn[i].shapeRef0 = 2 * i; cmIn[i].shapeRef1 = 2 * i + 1;
+        cmIn[i].transformCacheRef0 = 2 * i; cmIn[i].transformCacheRef1 = 2 * i + 1;
+        shapes[2 * i].type = p.type0; shapes[2 * i].materialIndex = p.mat0;
+        shapes[2 * i].scale.scale = PxVec3(p.scale0.x, p.scale0.y, p.scale0.z);
+        shapes[2 * i].scale.rotation = PxQuat(PxIdentity);
+        shapes[2 * i + 1].type = p.type1; shapes[2 * i + 1].materialIndex = p.mat1;
+        shapes[2 * i + 1].scale.scale = PxVec3(p.scale1.x, p.scale1.y, p.scale1.z);
+        shapes[2 * i + 1].scale.rotation = PxQuat(PxIdentity);
+        cache[2 * i].transform.q = PxQuat(p.t0q.x, p.t0q.y, p.t0q.z, p.t0q.w);
+        cache[2 * i].transform.p = PxVec3(p.t0p.x, p.t0p.y, p.t0p.z);
+        cache[2 * i + 1].transform.q = PxQuat(p.t1q.x, p.t1q.y, p.t1q.z, p.t1q.w);
+        cache[2 * i + 1].transform.p = PxVec3(p.t1p.x, p.t1p.y, p.t1p.z);
+        cd[2 * i] = p.cd0; cd[2 * i + 1] = p.cd1;
+        for (int j = 0; j < 4; ++j)
+        {
+            mf[i].mLocalNormal_PenW[j] = make_float4(p.normPen[j].x, p.normPen[j].y, p.normPen[j].z, p.normPen[j].w);
+            mf[i].mLocalContactB[j] = make_float4(p.pointB[j].x, p.pointB[j].y, p.pointB[j].z, 0);
+        }
+        mf[i].mNbContacts = p.rawNb;
+        std::memcpy(&cmOut[i].allflagsStart, &p.allflags, 4);
+        std::memcpy(&cmOut[i].nbContacts, &p.nbContactsFlags, 4);
+    }
+    std::vector<uint8_t> poisonImg;
+    fillPoison(poisonImg, BUF);
+    PxgPatchAndContactCounters ctr{};
+    ctr.patchesBytes = initP; ctr.contactsBytes = initC; ctr.forceAndIndiceBytes = initF; ctr.overflowError = 0;
+
+    shim.memcpyHtoD(dCmIn, cmIn.data(), 32 * sizeof(PxgContactManagerInput));
+    shim.memcpyHtoD(dShapes, shapes.data(), 64 * sizeof(PxgShape));
+    shim.memcpyHtoD(dCache, cache.data(), 64 * sizeof(PxsCachedTransform));
+    shim.memcpyHtoD(dCd, cd.data(), 64 * 4);
+    shim.memcpyHtoD(dMf, mf.data(), 32 * sizeof(PxgPersistentContactManifold));
+    shim.memcpyHtoD(dCmOut, cmOut.data(), 32 * sizeof(PxsContactManagerOutput));
+    shim.memcpyHtoD(dCounters, &ctr, sizeof(ctr));
+    shim.memcpyHtoD(dPoints, poisonImg.data(), BUF);
+    shim.memcpyHtoD(dPatch, poisonImg.data(), BUF);
+    shim.memsetD32(dTouch, 0xEEEEEEEE, 32);
+    shim.memsetD32(dPatchCh, 0xEEEEEEEE, 32);
+
+    struct FinBlob
+    {
+        uint32_t numTests;
+        uint64_t cmInputs, cmOutputs, cmManifolds, shapes, transformCache, contactDistance, materials,
+                 contactStream, patchStream;
+        uint32_t insertAveragePointWord;
+        uint64_t patchAndContactCounters, touchChangeFlags, patchChangeFlags,
+                 startContactPatches, startContactPoints, startContactForces;
+        uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit;
+    } blob = { numTests, dCmIn, dCmOut, dMf, dShapes, dCache, dCd, dMat, dPoints, dPatch,
+               insertAvg ? 1u : 0u, dCounters, dTouch, dPatchCh, dPatch, dPoints, dForce,
+               pLimit, cLimit, fLimit };
+    static_assert(sizeof(FinBlob) == 152, "finishContacts engine blob is 152 bytes");
+
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                  "launch finishContacts p90 (engine ABI)");
+    shim.streamSynchronize();
+
+    std::vector<uint8_t> gPoints(BUF), gPatch(BUF);
+    shim.memcpyDtoH(gPoints.data(), dPoints, BUF);
+    shim.memcpyDtoH(gPatch.data(), dPatch, BUF);
+
+    // Every patch word bitwise (normal words 4..6 included), and the whole contact stream.
+    size_t mmNorm = 0, mmTwin = 0, mmOther = 0;
+    for (uint32_t i = 0; i < numTests; ++i)
+    {
+        if (!ref.pairs[i].patchWritten) continue;
+        const size_t off = ref.pairs[i].contactPatchesOff;
+        uint32_t rw[16], gw[16], tw[16];
+        std::memcpy(rw, &ref.patch[off], 64);
+        std::memcpy(gw, &gPatch[off], 64);
+        std::memcpy(tw, &twin.patch[off], 64);
+        const bool normOk = std::memcmp(&rw[4], &gw[4], 12) == 0;
+        if (!normOk)
+        {
+            ++mmNorm;
+            if (std::memcmp(&tw[4], &gw[4], 12) == 0) ++mmTwin;
+            if (mmNorm <= 4)
+                std::printf("  p90 pair %u normal GPU %08x %08x %08x, CUDA order %08x %08x %08x, x+(y+z) twin %08x %08x %08x\n",
+                            i, gw[4], gw[5], gw[6], rw[4], rw[5], rw[6], tw[4], tw[5], tw[6]);
+        }
+        for (int k = 0; k < 16; ++k)
+            if ((k < 4 || k > 6) && rw[k] != gw[k]) { ++mmOther; break; }
+    }
+    PXG_CHECK_MSG(mmNorm == 0, "finishContacts p90: %zu patch normals differ bitwise from the CUDA order (%zu equal the x + (y + z) twin)",
+                  mmNorm, mmTwin);
+    PXG_CHECK_MSG(mmOther == 0, "finishContacts p90: %zu patches differ outside the normal", mmOther);
+    PXG_CHECK_MSG(std::memcmp(gPoints.data(), ref.points.data(), BUF) == 0, "finishContacts p90: contact stream differs");
 
     for (PxgDevicePtr pfree : { dCmIn, dShapes, dCache, dCd, dMf, dMat, dPoints, dPatch, dForce,
                                 dCounters, dTouch, dPatchCh, dCmOut })
