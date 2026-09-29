@@ -822,4 +822,173 @@ PXG_TEST(directApi_gettersAndSetters)
     dev->destroyBuffer(poseBuf);
 }
 
+// ---------------------------------------------------------------------------
+// P9.90: directApi's float chains, BITWISE
+// ---------------------------------------------------------------------------
+// directApi_gettersAndSetters above compares the pose and torque with a
+// tolerance.  Here the two entries that carry mul+add chains are compared bit
+// for bit against a -ffp-contract=off transcription in the CUDA order
+// (updateBodiesAndShapes.cu):
+//   getRigidDynamicGlobalPose:  body2World * body2Actor.getInverse()
+//     -- PxAlignedQuat rotateInv/rotate and the Hamilton product
+//        (AlignedQuat.h:257-366, AlignedTransform.h:124-186);
+//   setRigidDynamicTorque:  Cm::transformInertiaTensor(invI, PxMat33(q))
+//     (CmUtils.h:57-70, PxMat33.h:136-162) then PxMat33::transform
+//     column0*t.x + column1*t.y + column2*t.z (PxMat33.h:344-347).
+// Every chain is (a + b) + c, left to right.  directApi is stamped NoContraction
+// (tests/CMakeLists.txt, P9.90) so the Vulkan side keeps that order.  The shader
+// has no OpDot, so an unstamped build passes too on llvmpipe (measured): the
+// stamp is unobservable there.  The old-order twin (every three-term chain
+// summed a + (b + c)) must differ, so the case does pin the association: a
+// shader mutant with dot2 = x*vx + (y*vy + z*vz) in quatRotate/quatRotateInv and
+// c0*x + (c1*y + c2*z) in mat33Transform fails it (1691/4096 poses, 2509/4096
+// torques).
+namespace
+{
+inline float p90Sum3(float a, float b, float c, bool oldOrder) { return oldOrder ? a + (b + c) : a + b + c; }
+
+void p90DirectPose(const BodySim& b, bool oldOrder, float out[7])
+{
+    const QuatV qW(b.body2World.q), qA(b.body2Actor_maxImpulseW.q);
+    const Float4& pA = b.body2Actor_maxImpulseW.p;
+    // getInverse(): q.rotateInv(-p), q.getConjugate()
+    const Vec3 pInv = p90Rotate(qA, Vec3(-pA.x, -pA.y, -pA.z), true, oldOrder);
+    const QuatV qInv = qA.getConjugate();
+    // transform(src): q.rotate(src.p) + p, q * src.q
+    const QuatV q = qW * qInv;
+    const Vec3 r = p90Rotate(qW, pInv, false, oldOrder);
+    out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
+    out[4] = r.x + b.body2World.p.x;
+    out[5] = r.y + b.body2World.p.y;
+    out[6] = r.z + b.body2World.p.z;
+}
+
+Vec3 p90DirectTorque(const BodySim& b, const Vec3& t, bool oldOrder)
+{
+    const Float4& invD = b.inverseInertiaXYZ_contactReportThresholdW;
+    const Mat33 M(QuatV(b.body2World.q)); // PxMat33(PxQuat)
+    // M(r, c): column c, row r
+    auto at = [&](int r, int c) {
+        const Vec3& col = c == 0 ? M.col0 : (c == 1 ? M.col1 : M.col2);
+        return r == 0 ? col.x : (r == 1 ? col.y : col.z);
+    };
+    const float axx = invD.x * at(0, 0), axy = invD.x * at(1, 0), axz = invD.x * at(2, 0);
+    const float byx = invD.y * at(0, 1), byy = invD.y * at(1, 1), byz = invD.y * at(2, 1);
+    const float czx = invD.z * at(0, 2), czy = invD.z * at(1, 2), czz = invD.z * at(2, 2);
+    const float m00 = p90Sum3(axx * at(0, 0), byx * at(0, 1), czx * at(0, 2), oldOrder);
+    const float m11 = p90Sum3(axy * at(1, 0), byy * at(1, 1), czy * at(1, 2), oldOrder);
+    const float m22 = p90Sum3(axz * at(2, 0), byz * at(2, 1), czz * at(2, 2), oldOrder);
+    const float m01 = p90Sum3(axx * at(1, 0), byx * at(1, 1), czx * at(1, 2), oldOrder);
+    const float m02 = p90Sum3(axx * at(2, 0), byx * at(2, 1), czx * at(2, 2), oldOrder);
+    const float m12 = p90Sum3(axy * at(2, 0), byy * at(2, 1), czy * at(2, 2), oldOrder);
+    // columns (m00 m01 m02), (m01 m11 m12), (m02 m12 m22); transform = c0*t.x + c1*t.y + c2*t.z
+    return Vec3(p90Sum3(m00 * t.x, m01 * t.y, m02 * t.z, oldOrder),
+                p90Sum3(m01 * t.x, m11 * t.y, m12 * t.z, oldOrder),
+                p90Sum3(m02 * t.x, m12 * t.y, m22 * t.z, oldOrder));
+}
+} // namespace
+
+PXG_TEST(directApi_p90PoseTorqueOrder)
+{
+    const uint32_t N = 4096;
+    std::mt19937 rng(9091);
+    std::uniform_real_distribution<float> sym(-7.3f, 7.3f);
+    std::uniform_real_distribution<float> inertia(0.013f, 3.7f);
+
+    std::vector<BodySim> pool(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        pool[i] = randomBodySim(rng, i);
+        pool[i].body2Actor_maxImpulseW.p = Float4{ sym(rng), sym(rng), sym(rng), 1.3f };
+        pool[i].inverseInertiaXYZ_contactReportThresholdW = Float4{ inertia(rng), inertia(rng), inertia(rng), 0.5f };
+    }
+    std::vector<uint32_t> indices(N);
+    std::iota(indices.begin(), indices.end(), 0u);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    std::vector<float> torque(N * 3);
+    for (float& f : torque)
+        f = sym(rng);
+    std::vector<Float4> prevVel(N * 2, Float4{ 0.f, 0.f, 0.f, 0.f });
+
+    // CPU references and the old-order twins
+    std::vector<float> refPose(N * 7), twinPose(N * 7);
+    std::vector<Vec3> refAng(N), twinAng(N);
+    uint32_t poseTwinDiffers = 0, torqueTwinDiffers = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const BodySim& b = pool[indices[i]];
+        p90DirectPose(b, false, &refPose[i * 7]);
+        p90DirectPose(b, true, &twinPose[i * 7]);
+        if (std::memcmp(&refPose[i * 7], &twinPose[i * 7], 7 * sizeof(float)) != 0)
+            ++poseTwinDiffers;
+        const Vec3 t(torque[i * 3], torque[i * 3 + 1], torque[i * 3 + 2]);
+        refAng[i] = p90DirectTorque(b, t, false);
+        twinAng[i] = p90DirectTorque(b, t, true);
+        if (std::memcmp(&refAng[i], &twinAng[i], sizeof(Vec3)) != 0)
+            ++torqueTwinDiffers;
+    }
+    // coverage guards: the data must separate the CUDA order from a + (b + c)
+    PXG_CHECK_MSG(poseTwinDiffers > N / 4, "p90 pose twin: old order changes only %u of %u poses", poseTwinDiffers, N);
+    PXG_CHECK_MSG(torqueTwinDiffers > N / 4, "p90 torque twin: old order changes only %u of %u rows",
+                  torqueTwinDiffers, N);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const std::vector<uint32_t> strides = { 4, 4, 4, 16 };
+    PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
+    PxgBufferHandle idxBuf = createBufferFrom(dev, indices);
+    PxgBufferHandle prevBuf = createBufferFrom(dev, prevVel);
+    PxgBufferHandle poseBuf = dev->createBuffer(N * 7 * sizeof(float));
+    PxgBufferHandle vecBuf = createBufferFrom(dev, torque);
+    const DirectApiParams params = { N, 60.f, 0u };
+    const uint32_t grid = (N + 255) / 256;
+
+    Kernel getPose("directApi.spv", "getRigidDynamicGlobalPose", strides, sizeof(DirectApiParams));
+    getPose.dispatch(grid, { poseBuf, idxBuf, poolBuf, prevBuf }, params);
+    dev->barrier();
+    Kernel setTorque("directApi.spv", "setRigidDynamicTorque", strides, sizeof(DirectApiParams));
+    setTorque.dispatch(grid, { vecBuf, idxBuf, poolBuf, prevBuf }, params);
+    dev->flush();
+    const std::vector<float> gpuPose = downloadBuffer<float>(dev, poseBuf, N * 7);
+    const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, N);
+
+    uint32_t poseMismatches = 0, poseEqualsTwin = 0;
+    uint32_t torqueMismatches = 0, torqueEqualsTwin = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float* g = &gpuPose[i * 7];
+        if (std::memcmp(g, &refPose[i * 7], 7 * sizeof(float)) != 0)
+        {
+            if (std::memcmp(g, &twinPose[i * 7], 7 * sizeof(float)) == 0)
+                ++poseEqualsTwin;
+            if (poseMismatches < 5)
+                PXG_CHECK_MSG(false, "p90 pose[%u]: gpu q=(%a %a %a %a) p=(%a %a %a) ref q=(%a %a %a %a) p=(%a %a %a)", i,
+                              g[0], g[1], g[2], g[3], g[4], g[5], g[6], refPose[i * 7], refPose[i * 7 + 1],
+                              refPose[i * 7 + 2], refPose[i * 7 + 3], refPose[i * 7 + 4], refPose[i * 7 + 5],
+                              refPose[i * 7 + 6]);
+            ++poseMismatches;
+        }
+        const Float4& a = gpuPool[indices[i]].externalAngularAcceleration;
+        const Vec3 ga(a.x, a.y, a.z);
+        if (std::memcmp(&ga, &refAng[i], sizeof(Vec3)) != 0 || a.w != 0.0f)
+        {
+            if (std::memcmp(&ga, &twinAng[i], sizeof(Vec3)) == 0)
+                ++torqueEqualsTwin;
+            if (torqueMismatches < 5)
+                PXG_CHECK_MSG(false, "p90 torque[%u]: gpu=(%a %a %a %a) ref=(%a %a %a)", i, a.x, a.y, a.z, a.w,
+                              refAng[i].x, refAng[i].y, refAng[i].z);
+            ++torqueMismatches;
+        }
+    }
+    PXG_CHECK_MSG(poseMismatches == 0, "p90 pose: %u of %u differ bitwise (%u equal the old-order twin)",
+                  poseMismatches, N, poseEqualsTwin);
+    PXG_CHECK_MSG(torqueMismatches == 0, "p90 torque: %u of %u differ bitwise (%u equal the old-order twin)",
+                  torqueMismatches, N, torqueEqualsTwin);
+
+    dev->destroyBuffer(poolBuf);
+    dev->destroyBuffer(idxBuf);
+    dev->destroyBuffer(prevBuf);
+    dev->destroyBuffer(poseBuf);
+    dev->destroyBuffer(vecBuf);
+}
+
 } // namespace

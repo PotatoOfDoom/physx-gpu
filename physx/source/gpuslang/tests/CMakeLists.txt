@@ -304,7 +304,19 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # other kernel is compared against it.  testBodyUpdate
     # bodyUpdate_p90PoseRecomputeOrder compares the recomputed body2World bitwise (its
     # old-order twin must differ); it passes unstamped too, so the entry is unobserved.
-    bodyUpdate)
+    bodyUpdate
+    # P9.90: the Phase-1 Direct-GPU-API getters/setters, stamped for consistency with
+    # their engine twin directApiBda (stamped above; the two are never compared against
+    # each other).  The float math is getRigidDynamicGlobalPose's rotateInv/rotate and
+    # Hamilton product (AlignedQuat.h:257-366) and setRigidDynamicTorque's
+    # transformInertiaTensor + PxMat33::transform (CmUtils.h:57-70, PxMat33.h:344),
+    # scalar/vector mul+add chains spelled left to right with no OpDot, so llvmpipe's
+    # OpDot association never applies and it did not contract the chains: the
+    # unstamped .spv already matched the -ffp-contract=off mirror on all 4096 rows.
+    # The stamp pins that order against a driver that would fuse.  testBodyUpdate
+    # directApi_p90PoseTorqueOrder compares pose and angular acceleration bitwise (its
+    # old-order twins must differ); it passes unstamped too, so the entry is unobserved.
+    directApi)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
