@@ -293,7 +293,18 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # module and no other kernel is compared against it.  testSolverApplyGravityTGS
     # solverApplyGravityTGS_p90DotOrder compares the velocity buffer bitwise and fails
     # without this entry.
-    solverApplyGravityTGS)
+    solverApplyGravityTGS
+    # P9.90: the CPU->GPU body mirror, stamped for consistency.  Its only float math is
+    # updateBodiesLaunchDirectAPI's body2World recompute (PxAlignedQuat rotate/rotateInv
+    # and the Hamilton product, AlignedQuat.h:257-366), scalar mul+add chains spelled
+    # left to right with no OpDot, so llvmpipe's OpDot association never applies and it
+    # did not contract the chains either: the unstamped .spv already matched the
+    # -ffp-contract=off mirror on all 4096 poses.  The stamp pins that order against a
+    # driver that would fuse.  It imports only pxgSlangCommon/pxgSlangSimCoreDesc and no
+    # other kernel is compared against it.  testBodyUpdate
+    # bodyUpdate_p90PoseRecomputeOrder compares the recomputed body2World bitwise (its
+    # old-order twin must differ); it passes unstamped too, so the entry is unobserved.
+    bodyUpdate)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

@@ -561,6 +561,125 @@ PXG_TEST(bodyUpdate_directAPI)
 }
 
 // ---------------------------------------------------------------------------
+// P9.90: updateBodiesLaunchDirectAPI's body2World recompute, BITWISE
+// ---------------------------------------------------------------------------
+// The CUDA re-derives body2World when the CPU changed body2Actor
+// (updateBodiesAndShapes.cu, updateBodiesLaunchDirectAPI):
+//   actor2World = body2WorldOld * oldBody2Actor.getInverse();
+//   body2World  = actor2World * newBody2Actor;
+// i.e. PxAlignedQuat::rotateInv / rotate (AlignedQuat.h) and the Hamilton
+// product -- mul+add chains the CUDA evaluates left to right, and the mirror
+// here (built with -ffp-contract=off) does too.  bodyUpdate is stamped
+// NoContraction (tests/CMakeLists.txt, P9.90) so the Vulkan side keeps that
+// order; bodyUpdate_directAPI above only compares with a tolerance.  Every
+// record here takes the recompute path (no first transfer, body2Actor
+// changed), with general orientations and non-round positions, and the
+// resulting body2World (q and p.xyzw) is compared bit for bit.
+// The shader has no OpDot and llvmpipe does not contract its scalar chains, so
+// an unstamped build passes too (measured): the stamp is unobservable on
+// llvmpipe.  The case still pins the order -- a shader mutant with
+// dot2 = x*vx + (y*vy + z*vz) in quatRotate fails it (1555/4096 poses).
+namespace
+{
+// PxAlignedQuat::rotate / rotateInv in the CUDA order.  oldDot selects the
+// re-associated dot2 = x*vx + (y*vy + z*vz) -- the twin that must differ.
+Vec3 p90Rotate(const QuatV& q, const Vec3& v, bool inv, bool oldDot)
+{
+    const float vx = 2.0f * v.x;
+    const float vy = 2.0f * v.y;
+    const float vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = oldDot ? (q.x * vx + (q.y * vy + q.z * vz)) : (q.x * vx + q.y * vy + q.z * vz);
+    const float s = inv ? -1.0f : 1.0f;
+    // s * t is exact (sign flip), so vx*w2 + s*t == vx*w2 -/+ t bitwise
+    return Vec3((vx * w2 + s * ((q.y * vz - q.z * vy) * q.w) + q.x * dot2),
+                (vy * w2 + s * ((q.z * vx - q.x * vz) * q.w) + q.y * dot2),
+                (vz * w2 + s * ((q.x * vy - q.y * vx) * q.w) + q.z * dot2));
+}
+
+AlignedTransform p90Recompute(const AlignedTransform& b2wOld, const AlignedTransform& oldB2A,
+                              const AlignedTransform& newB2A, bool oldDot)
+{
+    const QuatV qW(b2wOld.q), qA(oldB2A.q), qN(newB2A.q);
+    // getInverse(): q.rotateInv(make_float4(-p)) (w lane 0), q.getConjugate()
+    const Vec3 pInv = p90Rotate(qA, Vec3(-oldB2A.p.x, -oldB2A.p.y, -oldB2A.p.z), true, oldDot);
+    const QuatV qInv = qA.getConjugate();
+    // transform(src): q.rotate(src.p) + p (float4 add: w = 0 + p.w), q * src.q
+    const QuatV qA2W = qW * qInv;
+    const Vec3 rA = p90Rotate(qW, pInv, false, oldDot);
+    const Float4 pA2W{ rA.x + b2wOld.p.x, rA.y + b2wOld.p.y, rA.z + b2wOld.p.z, 0.0f + b2wOld.p.w };
+    const QuatV qNew = qA2W * qN;
+    const Vec3 rN = p90Rotate(qA2W, Vec3(newB2A.p.x, newB2A.p.y, newB2A.p.z), false, oldDot);
+    AlignedTransform r;
+    r.q = qNew.toFloat4();
+    r.p = Float4{ rN.x + pA2W.x, rN.y + pA2W.y, rN.z + pA2W.z, 0.0f + pA2W.w };
+    return r;
+}
+} // namespace
+
+PXG_TEST(bodyUpdate_p90PoseRecomputeOrder)
+{
+    const uint32_t N = 4096;
+    std::mt19937 rng(9090);
+    std::uniform_real_distribution<float> sym(-7.3f, 7.3f);
+
+    std::vector<BodySim> pool(N), staged(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        pool[i] = randomBodySim(rng, i);
+        pool[i].body2World.p.w = 0.37f + 0.001f * float(i); // non-zero w lane rides through 0 + w
+        pool[i].body2Actor_maxImpulseW.p = Float4{ sym(rng), sym(rng), sym(rng), 1.3f };
+        staged[i] = randomBodySim(rng, i);
+        staged[i].internalFlags = (i & 1) ? eVELOCITY_COPY_GPU : 0u; // never eFIRST_BODY_COPY_GPU
+        staged[i].body2Actor_maxImpulseW.p = Float4{ sym(rng), sym(rng), sym(rng), 2.9f };
+    }
+
+    std::vector<AlignedTransform> ref(N), twin(N);
+    uint32_t twinDiffers = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        ref[i] = p90Recompute(pool[i].body2World, pool[i].body2Actor_maxImpulseW, staged[i].body2Actor_maxImpulseW, false);
+        twin[i] = p90Recompute(pool[i].body2World, pool[i].body2Actor_maxImpulseW, staged[i].body2Actor_maxImpulseW, true);
+        if (std::memcmp(&ref[i], &twin[i], sizeof(AlignedTransform)) != 0)
+            ++twinDiffers;
+    }
+    // coverage guard: the data must separate the CUDA dot order from x+(y+z)
+    PXG_CHECK_MSG(twinDiffers > N / 4, "p90 twin: old-order dot2 changes only %u of %u poses", twinDiffers, N);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    Kernel kernel("bodyUpdate.spv", "updateBodiesLaunchDirectAPI", { 4, 4, 4 }, sizeof(BodyUpdateParams));
+    PxgBufferHandle stagedBuf = createBufferFrom(dev, staged);
+    PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
+    PxgBufferHandle dummyShapes = dev->createBuffer(16);
+    kernel.dispatch(BODY_UPDATE_GRID, { stagedBuf, poolBuf, dummyShapes }, BodyUpdateParams{ N });
+    dev->flush();
+    const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, N);
+
+    uint32_t mismatches = 0, equalsTwin = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const AlignedTransform& g = gpuPool[i].body2World;
+        if (std::memcmp(&g, &ref[i], sizeof(AlignedTransform)) != 0)
+        {
+            if (std::memcmp(&g, &twin[i], sizeof(AlignedTransform)) == 0)
+                ++equalsTwin;
+            if (mismatches < 5)
+                PXG_CHECK_MSG(false, "p90 body2World[%u]: gpu q=(%a %a %a %a) p=(%a %a %a %a) ref q=(%a %a %a %a) p=(%a %a %a %a)",
+                              i, g.q.x, g.q.y, g.q.z, g.q.w, g.p.x, g.p.y, g.p.z, g.p.w,
+                              ref[i].q.x, ref[i].q.y, ref[i].q.z, ref[i].q.w,
+                              ref[i].p.x, ref[i].p.y, ref[i].p.z, ref[i].p.w);
+            ++mismatches;
+        }
+    }
+    PXG_CHECK_MSG(mismatches == 0, "p90 body2World: %u of %u poses differ bitwise (%u equal the old-order twin)",
+                  mismatches, N, equalsTwin);
+
+    dev->destroyBuffer(stagedBuf);
+    dev->destroyBuffer(poolBuf);
+    dev->destroyBuffer(dummyShapes);
+}
+
+// ---------------------------------------------------------------------------
 // direct API getters / setters
 // ---------------------------------------------------------------------------
 
