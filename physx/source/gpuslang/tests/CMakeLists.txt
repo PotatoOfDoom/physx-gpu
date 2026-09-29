@@ -158,7 +158,14 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # It sized the CCD particle AABBs as sqrt(x^2 + (y^2 + z^2)).  testPsBounds
     # psBounds_p89SpecVolumeOrder plants order-sensitive block extremes and fails
     # without this entry.
-    psBoundsBda)
+    psBoundsBda
+    # P9.89: the leaf of pxgSlangTetCollide, stamped like every engine importer of that
+    # module (softBody{,Cloth,Mesh,Hf}ContactGenBda, psContactGenBda), so the leaf
+    # certifies the module as the engine compiles it.  computeInnerSphere's face
+    # distances are PxVec3 dots, (x + y) + z (softbodyPrimitives.cu:131-154); unstamped
+    # they came out x + (y + z).  testNpGjk npTetCollide_p89InnerSphereSelect compares
+    # them bit for bit and fails without this entry.
+    npTetCollide)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -299,7 +306,8 @@ pxg_compile_shader(npEpa ctEpa)
 # computeInnerSphere.  Its leaf test pins the driver's POLICY -- which result
 # short-circuits, when EPA is entered, and the degenerate re-run -- while ctGjk and ctEpa
 # pin the arithmetic underneath it.
-pxg_compile_shader(npTetCollide ctTetCollide)
+# P9.89: ctInnerSphere, computeInnerSphere alone (npTetCollide_p89InnerSphereSelect).
+pxg_compile_shader(npTetCollide ctTetCollide ctInnerSphere)
 pxg_compile_shader(npGjkWarm ctGjkWarm)
 pxg_compile_shader(npCvxCvxEE cvxCvxGenEE)
 pxg_compile_shader(npCvxRayPoly cvxRayPoly)

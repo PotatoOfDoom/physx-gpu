@@ -1972,13 +1972,48 @@ static const V3 RIGID_P = { 0.3713f, -0.2129f, 0.5237f };
 static const V3 SCALE = { 1.13f, 0.87f, 1.21f };
 static const float SCALE_Q[4] = { -0.1417f, 0.2963f, 0.3319f, 0.8839f };    // normalised below
 
+// ---------------------------------------------------------------------------
+// P9.89, the second battery: tetPrimitivesCollide2's ANOMALY GATE
+// (pxgSlangTetCollide.slang, `dot(closestPointDir, direction) < 0.999f`;
+// cudaParticleSystem.cu:754, convexNpCommon.h:247).  The CUDA sums that dot as
+// PxVec3::dot, (x + y) + z.  An undecorated OpDot on llvmpipe sums it as
+// x + (y + z), and psContactGenBda was undecorated until P9.89.  The gate decides
+// whether EPA runs, so one ulp at 0.999 swaps GJK's answer for EPA's: the
+// direction, the witness pair and the penetration all change.
+//
+// A cleanly converged GJK cannot land there.  Its final direction is within
+// acos(convergenceRatio) ~ 1.2 degrees of the closest-point direction, so the
+// dot is >= 0.99977.  The gate only fires on a GJK that stops early on a
+// degenerate simplex.  With a hull a few ULP across, a point query does that
+// about once in a hundred.  So this battery shrinks the same twelve-vertex hull
+// by K_KNIFE (~1.3e-6; the hull spans ~25 ULP of its position), and plants two
+// particles that a host search over this exact hull found:
+//   KNIFE_A: the CUDA's (x + y) + z is exactly 0.999f (no EPA), and the old
+//            x + (y + z) is one ULP below it (EPA).  The oracle is the host
+//            GJK, so the check is bit for bit.
+//   KNIFE_B: the other way round.  The CUDA's sum is one ULP below 0.999f, so
+//            the CUDA runs EPA; the old order returns 0.999f and keeps GJK's
+//            answer.  There is no host EPA here, so the check is that the
+//            stored contact is NOT GJK's answer bit for bit (that answer is
+//            the old port's).
+// Both knife dots are re-derived from the host GJK at run time and must
+// straddle 0.999f in opposite orders (the twin check).  The other particles
+// are clean CLOSE queries on the same tiny hull and DISTANT ones, compared bit
+// for bit.  A strict `<` also matters: KNIFE_A's dot IS 0.999f, so `<=` would
+// run EPA on it.
+static const float K_KNIFE = 0x1.533374p-20f;
+static const V3 KNIFE_A = { 0x1.7c35bep-2f, -0x1.b403fep-3f, 0x1.0c2234p-1f };
+static const V3 KNIFE_B = { 0x1.7c367p-2f, -0x1.b404dcp-3f, 0x1.0c2224p-1f };
+
 static void normQ(const float in[4], float q[4])
 {
     const float m = std::sqrt(in[0] * in[0] + in[1] * in[1] + in[2] * in[2] + in[3] * in[3]);
     for (int k = 0; k < 4; ++k) q[k] = in[k] / m;
 }
 
-struct Case { V3 p; bool contact; F4 np; float penOld; };
+// knife: 0 = ordinary, 1 = KNIFE_A (the CUDA keeps GJK's answer), 2 = KNIFE_B (the
+// CUDA runs EPA, and np holds GJK's answer, i.e. the old port's).
+struct Case { V3 p; bool contact; F4 np; float penOld; int knife; };
 
 struct Rig
 {
@@ -1986,10 +2021,12 @@ struct Rig
     std::vector<V3> vertsLocal, hullWorld;
     std::vector<Case> cases;
     uint32_t nbDistant = 0, nbSize[4] = { 0, 0, 0, 0 };
+    float knifeDot[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };   // [A/B][CUDA order / old order]
 };
 
-static bool buildRig(Rig& R)
+static bool buildRig(Rig& R, bool knife = false)
 {
+    const float kScale = knife ? K_KNIFE : 1.0f;
     normQ(RIGID_Q, R.rq);
     normQ(SCALE_Q, R.sq);
     uint64_t s = 0x89c0ffeeull;
@@ -1999,7 +2036,7 @@ static bool buildRig(Rig& R)
     {
         V3 d{ u() * 2.0f - 1.0f, u() * 2.0f - 1.0f, u() * 2.0f - 1.0f };
         const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-        const float r = 0.55f + 0.25f * u();
+        const float r = (0.55f + 0.25f * u()) * kScale;
         R.vertsLocal.push_back(V3{ d.x / m * r * 1.3f, d.y / m * r * 0.9f, d.z / m * r });
     }
     // psStageHull: vertex -> psVertex2Shape -> quatRotate(rigidQ) + rigidP
@@ -2015,12 +2052,39 @@ static bool buildRig(Rig& R)
 
     const float cd = PART_CD + HULL_CD;
     const float ratio = 1.0f - 0.000225f;
+    if (knife)
+    {
+        for (int w = 0; w < 2; ++w)
+        {
+            const V3 p = (w == 0) ? KNIFE_A : KNIFE_B;
+            const V3 aToB = sub3(p, RIGID_P);
+            V3 dir0{ 1.0f, 0.0f, 0.0f };
+            if (dot3(aToB, aToB) > 0.0f) dir0 = aToB;
+            const GjkRes o = gjkRun(std::vector<V3>{ p }, R.hullWorld, dir0, cd, ratio);
+            if (o.ret != G_CLOSE) return false;
+            const float ax = o.cpDir.x * o.direction.x, ay = o.cpDir.y * o.direction.y, az = o.cpDir.z * o.direction.z;
+            R.knifeDot[w][0] = (ax + ay) + az;   // PxVec3::dot, the CUDA
+            R.knifeDot[w][1] = ax + (ay + az);   // undecorated OpDot on llvmpipe, the old port
+            const float p0 = (o.cpB.x - o.cpA.x) * o.direction.x;
+            const float p1 = (o.cpB.y - o.cpA.y) * o.direction.y;
+            const float p2 = (o.cpB.z - o.cpA.z) * o.direction.z;
+            Case kc{};
+            kc.p = p;
+            kc.contact = true;
+            kc.knife = w + 1;
+            kc.np = F4{ -o.direction.x, -o.direction.y, -o.direction.z, ((p0 + p1) + p2) - REST };
+            kc.penOld = kc.np.w;
+            R.cases.push_back(kc);
+        }
+    }
     for (int trial = 0; trial < 100000 && R.cases.size() < NB_PART; ++trial)
     {
         V3 d{ u() * 2.0f - 1.0f, u() * 2.0f - 1.0f, u() * 2.0f - 1.0f };
         const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
         if (m < 0.2f) continue;
-        const float r = 0.4f + 1.6f * u();
+        // the knife rig: seven in eight within a few hull sizes, the rest far off
+        const float r = !knife ? 0.4f + 1.6f * u()
+                               : (trial % 8 == 7) ? 0.4f + 1.6f * u() : kScale * (0.3f + 2.0f * u());
         const V3 p = V3{ c.x + d.x / m * r, c.y + d.y / m * r, c.z + d.z / m * r };
         // particleConvexCollision, CCD off: initial direction p - rigidP
         const V3 aToB = sub3(p, RIGID_P);
@@ -2071,21 +2135,37 @@ static std::vector<F4> makeBlob(const Rig& R)
     return blob;
 }
 
-static void run(bool diffuse)
+static void run(bool diffuse, bool knife = false)
 {
-    const char* lbl = diffuse ? "diffuse" : "fluid";
+    const char* lbl = knife ? (diffuse ? "diffuse anomaly" : "fluid anomaly") : (diffuse ? "diffuse" : "fluid");
     PxgSlangComputeDevice* dev = testDevice();
     Rig R;
-    const bool ok = buildRig(R);
-    PXG_CHECK_MSG(ok, "p89 %s: only %zu admissible particles around the hull", lbl, R.cases.size());
+    const bool ok = buildRig(R, knife);
+    PXG_CHECK_MSG(ok, "p89 %s: only %zu admissible particles around the hull (or a knife particle is not CLOSE)",
+                  lbl, R.cases.size());
     if (!ok) return;
 
     uint32_t nContact = 0, nOrder = 0;
     for (const Case& k : R.cases)
         if (k.contact) { ++nContact; if (bitsOf(k.penOld) != bitsOf(k.np.w)) ++nOrder; }
     PXG_CHECK_MSG(nContact >= NB_PART / 2u, "p89 %s: only %u of %u particles are in contact", lbl, nContact, NB_PART);
-    PXG_CHECK_MSG(nOrder > 0u, "p89 %s: the pre-P9.89 lane order p0 + (p1 + p2) gives the same bits as the CUDA's "
-                  "(p0 + p1) + p2 on every contact -- the penetration's association is not under test", lbl);
+    if (!knife)
+        PXG_CHECK_MSG(nOrder > 0u, "p89 %s: the pre-P9.89 lane order p0 + (p1 + p2) gives the same bits as the CUDA's "
+                      "(p0 + p1) + p2 on every contact -- the penetration's association is not under test", lbl);
+    else
+    {
+        // The twin: each knife dot straddles 0.999f, in opposite directions for A and B.
+        PXG_CHECK_MSG(R.knifeDot[0][0] >= 0.999f && R.knifeDot[0][1] < 0.999f,
+                      "p89 %s: KNIFE_A must be a knife edge -- the CUDA's (x + y) + z = %a must reach 0.999f "
+                      "(no EPA) and the old x + (y + z) = %a must not (EPA)", lbl,
+                      R.knifeDot[0][0], R.knifeDot[0][1]);
+        PXG_CHECK_MSG(R.knifeDot[1][0] < 0.999f && R.knifeDot[1][1] >= 0.999f,
+                      "p89 %s: KNIFE_B must be a knife edge -- the CUDA's (x + y) + z = %a must fall below 0.999f "
+                      "(EPA) and the old x + (y + z) = %a must not (no EPA)", lbl,
+                      R.knifeDot[1][0], R.knifeDot[1][1]);
+        std::printf("    [p89 %s] knife A dot %a (old order %a), knife B dot %a (old order %a)\n", lbl,
+                    R.knifeDot[0][0], R.knifeDot[0][1], R.knifeDot[1][0], R.knifeDot[1][1]);
+    }
     std::printf("    [p89 %s] %u contacts, %u DISTANT; the old lane order changes %u penetrations\n",
                 lbl, nContact, R.nbDistant, nOrder);
 
@@ -2227,14 +2307,35 @@ static void run(bool diffuse)
             gotNp[i] = infos[i];
         }
     }
+    size_t knifeBad = 0;
     for (uint32_t i = 0; i < NB_PART; ++i)
     {
         const Case& c = R.cases[i];
-        if ((gotAt[i] >= 0) != c.contact) { ++bad; continue; }
+        if ((gotAt[i] >= 0) != c.contact) { ++bad; if (c.knife) ++knifeBad; continue; }
         if (!c.contact) continue;
         const F4& g = gotNp[i];
         const bool same = bitsOf(g.x) == bitsOf(c.np.x) && bitsOf(g.y) == bitsOf(c.np.y) &&
                           bitsOf(g.z) == bitsOf(c.np.z) && bitsOf(g.w) == bitsOf(c.np.w);
+        if (c.knife == 2)
+        {
+            // The CUDA runs EPA on KNIFE_B.  GJK's answer, bit for bit, is what the old
+            // order (no EPA) stores.
+            if (same)
+            {
+                std::printf("    p89 %s KNIFE_B (particle %u) kept GJK's answer (%08x %08x %08x | %08x): the "
+                            "anomaly gate did not fire, as with x + (y + z)\n", lbl, i, bitsOf(g.x), bitsOf(g.y),
+                            bitsOf(g.z), bitsOf(g.w));
+                ++bad; ++knifeBad;
+            }
+            continue;
+        }
+        if (!same && c.knife == 1)
+        {
+            std::printf("    p89 %s KNIFE_A (particle %u): gpu (%08x %08x %08x | %08x), GJK's answer (%08x %08x %08x | "
+                        "%08x): the anomaly gate fired, as with x + (y + z)\n", lbl, i, bitsOf(g.x), bitsOf(g.y),
+                        bitsOf(g.z), bitsOf(g.w), bitsOf(c.np.x), bitsOf(c.np.y), bitsOf(c.np.z), bitsOf(c.np.w));
+            ++knifeBad;
+        }
         if (!same)
         {
             if (bad < 4)
@@ -2246,6 +2347,9 @@ static void run(bool diffuse)
         }
     }
     PXG_CHECK_MSG(extra == 0u, "p89 %s: %zu malformed or duplicated outputs", lbl, extra);
+    if (knife)
+        PXG_CHECK_MSG(knifeBad == 0u, "p89 %s: %zu of the 2 knife-edge particles went the wrong way through the "
+                      "anomaly gate -- its dot is not (x + y) + z", lbl, knifeBad);
     PXG_CHECK_MSG(bad == 0u, "p89 %s: %zu particles differ from the CUDA lane-order mirror (%zu of them carry the "
                   "pre-P9.89 p0 + (p1 + p2) penetration)", lbl, bad, asOld);
 
@@ -2263,6 +2367,16 @@ PXG_TEST(psConvexContactGen_p89PenLaneOrder)
 PXG_TEST(psConvexDiffuseContactGen_p89PenLaneOrder)
 {
     p89cvx::run(true);
+}
+
+PXG_TEST(psConvexContactGen_p89AnomalyOrder)
+{
+    p89cvx::run(false, true);
+}
+
+PXG_TEST(psConvexDiffuseContactGen_p89AnomalyOrder)
+{
+    p89cvx::run(true, true);
 }
 
 PXG_TEST(psConvexContactGen)

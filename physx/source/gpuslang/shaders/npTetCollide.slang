@@ -97,3 +97,30 @@ void ctTetCollide(uint3 dtid : SV_DispatchThreadID)
     out0.tetCenter = float4(center, 0.0f);
     gOut[t] = out0;
 }
+
+// P9.89: computeInnerSphere alone, one tetrahedron per thread, its four vertices at
+// gVB[4t .. 4t+3].  testNpGjk's npTetCollide_p89InnerSphereSelect compares the result
+// bit for bit with the CUDA's selectMin chain (softbodyPrimitives.cu:140/:147/:154),
+// including the NaN the CUDA keeps once the first face's distance is NaN.  Nothing else
+// is written, so the GJK fields of TcOut are zero.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void ctInnerSphere(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint t = dtid.x;
+    if (t >= gParams.numTests) return;
+
+    float3 center;
+    const float inner = computeInnerSphere(gVB[t * 4u + 0u].xyz, gVB[t * 4u + 1u].xyz,
+                                           gVB[t * 4u + 2u].xyz, gVB[t * 4u + 3u].xyz, center);
+
+    TcOut out0;
+    out0.result = 0u; out0.degenerate = 0u; out0.size = 0u; out0.pad = 0u;
+    out0.lowerBound = 0.0f; out0.upperBound = 0.0f; out0.pad2 = 0.0f;
+    out0.innerSphere = inner;
+    out0.direction = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    out0.closestPointA = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    out0.closestPointB = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    out0.tetCenter = float4(center, 0.0f);
+    gOut[t] = out0;
+}

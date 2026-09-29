@@ -91,6 +91,15 @@ public uint tetPrimitivesCollide2(GjkCloud a, GjkCloud b, float3 searchDir, floa
 
     const bool separated = (gjkResult == GJK_CLOSE);
     const bool anomaly = separated && dot(o.closestPointDir.xyz, o.direction.xyz) < 0.999f;
+    // P9.89: the anomaly dot above is PxVec3::dot, (x + y) + z (convexNpCommon.h:247,
+    // cudaParticleSystem.cu:754).  SPIR-V does not fix OpDot's order: llvmpipe sums an
+    // undecorated OpDot as x + (y + z) and a NoContraction-stamped one as (x + y) + z.
+    // Every importer of this module is stamped (softBody{,Cloth,Mesh,Hf}ContactGenBda,
+    // psContactGenBda since P9.89, and the npTetCollide leaf).  The gate decides whether
+    // EPA runs, so one ULP at 0.999 swaps GJK's answer for EPA's.
+    // testPsConvexContactGen psConvex{,Diffuse}ContactGen_p89AnomalyOrder plants a
+    // particle on each side of that knife edge; the one whose dot IS 0.999f also pins the
+    // strict `<`.
 
     uint result = GJK_CLOSE;
 
@@ -136,6 +145,19 @@ float3 tcNormalized(float3 v)
     return float3(0.0f, 0.0f, 0.0f);
 }
 
+// P9.89: THE RUNNING MINIMUM IS A SELECT CHAIN, NOT min().  softbodyPrimitives.cu:140/:147/
+// :154 fold with `innerSphere = PxMin(PxAbs(d), innerSphere)`, and PxMin(float, float) is
+// selectMin(a, b) = a < b ? a : b (PxMath.h:98, PxUnixMathIntrinsics.h:116): new distance
+// as a, running value as b.  A NaN running value fails the compare, is kept, and the chain
+// stays NaN to the end.  The port spelled it min(), i.e. GLSL.std.450 FMin, which llvmpipe
+// evaluates as "the non-NaN operand", so the chain recovered at the first finite face.
+// The running value is NaN when the FIRST face's normal overflows in one component
+// (|edge| ~ 2e19: m = inf, 1/sqrt(inf) = 0, inf * 0 = NaN).  The CUDA then carries NaN
+// into relEpsBase/releps; the old port carried a finite radius.  Ties cannot differ (abs()
+// never yields -0, and equal values have equal bits), and a NaN NEW distance is ignored by
+// both spellings.  testNpGjk npTetCollide_p89InnerSphereSelect plants first-face overflows
+// and compares bit for bit.  The face dots are PxVec3 dots, (x + y) + z, which every
+// importer of this module gets from the NoContraction stamp.
 public float computeInnerSphere(float3 v0, float3 v1, float3 v2, float3 v3, out float3 tetCenter)
 {
     const float3 center = (v0 + v1 + v2 + v3) * 0.25f;
@@ -145,17 +167,26 @@ public float computeInnerSphere(float3 v0, float3 v1, float3 v2, float3 v3, out 
     float3 n = tcNormalized(cross(v2 - v0, v1 - v0));
     float innerSphere = abs(dot(center - v0, n));
 
-    // 1 2 3
+    // 1 2 3  (P9.89: softbodyPrimitives.cu:140, selectMin(|d|, innerSphere))
     n = tcNormalized(cross(v2 - v1, v3 - v1));
-    innerSphere = min(abs(dot(center - v1, n)), innerSphere);
+    {
+        const float d123 = abs(dot(center - v1, n));
+        innerSphere = (d123 < innerSphere) ? d123 : innerSphere;
+    }
 
-    // 0 1 3
+    // 0 1 3  (P9.89: softbodyPrimitives.cu:147, selectMin(|d|, innerSphere))
     n = tcNormalized(cross(v1 - v0, v3 - v0));
-    innerSphere = min(abs(dot(center - v0, n)), innerSphere);
+    {
+        const float d013 = abs(dot(center - v0, n));
+        innerSphere = (d013 < innerSphere) ? d013 : innerSphere;
+    }
 
-    // 0 3 2
+    // 0 3 2  (P9.89: softbodyPrimitives.cu:154, selectMin(|d|, innerSphere))
     n = tcNormalized(cross(v3 - v0, v2 - v0));
-    innerSphere = min(abs(dot(center - v0, n)), innerSphere);
+    {
+        const float d032 = abs(dot(center - v0, n));
+        innerSphere = (d032 < innerSphere) ? d032 : innerSphere;
+    }
 
     return innerSphere;
 }

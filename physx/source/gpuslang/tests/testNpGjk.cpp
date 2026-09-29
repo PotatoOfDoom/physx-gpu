@@ -34,6 +34,7 @@
 
 #include "pxgTestFramework.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -594,6 +595,236 @@ PXG_TEST(npTetCollide_driver)
         PXG_CHECK_MSG(std::fabs(g[2].upperBound - 0.05f) < 1e-4f,
                       "and the separation is the 0.05 gap to the x face (got %.6f)", g[2].upperBound);
     }
+
+    for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.89 -- computeInnerSphere's running minimum is the CUDA's SELECT chain.
+//
+// softbodyPrimitives.cu:140/:147/:154 fold the four face distances with
+// `innerSphere = PxMin(PxAbs(d), innerSphere)`, and PxMin(float, float) is
+// selectMin(a, b) = a < b ? a : b (PxMath.h:98, PxUnixMathIntrinsics.h:116).
+// That is not fmin: a NaN running value b FAILS the compare, so it is kept, and
+// the chain stays NaN.  The port used to spell it `min(...)`, i.e. GLSL.std.450
+// FMin, and llvmpipe's FMin returns the non-NaN operand, so the chain recovered
+// at the first finite face.  Ties and signed zeros cannot tell the two apart
+// (abs() never yields -0, and equal values have equal bits); only a NaN can.
+//
+// The running value is NaN exactly when the FIRST face's |dot| is.  With finite
+// vertices that needs the face normal's cross product to OVERFLOW in one
+// component only: getNormalized then sees m = inf, scales by 1/sqrt(inf) = 0,
+// and inf * 0 = NaN.  The "first-face overflow" family below builds exactly
+// that: the edges v2 - v0 and v1 - v0 are axis-aligned and ~2e19 long, so
+// their cross product's x overflows, while v3 stays close to v0, so the faces
+// (0,1,3) and (0,3,2) keep finite normals.  The CUDA returns NaN there; the
+// old port returned the smaller of those two finite distances.  Face (1,2,3)
+// is NaN in that family as well, so a "far apex" family (v0 ~2e38 out, the
+// other three near the origin) overflows the first face alone and leaves face
+// (1,2,3) finite: each of the three fold sites is then observable on its own.
+//
+// Two control families pin everything else bit for bit: ordinary tetrahedra
+// with non-round coordinates (the PxVec3 dots are (x + y) + z, which the leaf
+// now gets from the NoContraction stamp exactly like every engine importer),
+// and a "later-face overflow" family whose NaN appears on face (1,2,3), where
+// both spellings ignore it.
+//
+// The kernel is ctInnerSphere (npTetCollide.slang), computeInnerSphere alone.
+// The mirror is the CUDA transcribed; the twin is the old FMin chain and must
+// differ on every first-face-overflow tetrahedron.
+namespace p89inner
+{
+static V3 addV(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 mulV(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+// PxMin(float, float) = selectMin (PxUnixMathIntrinsics.h:116).
+static float selectMin(float a, float b) { return a < b ? a : b; }
+// llvmpipe's GLSL.std.450 FMin: the non-NaN operand wins.
+static float fminOld(float a, float b) { return std::isnan(a) ? b : std::isnan(b) ? a : (a < b ? a : b); }
+
+// softbodyPrimitives.cu:123-160, with the fold as a parameter.
+template <typename Fold>
+static float innerSphere(V3 v0, V3 v1, V3 v2, V3 v3, V3& center, Fold fold)
+{
+    center = mulV(addV(addV(addV(v0, v1), v2), v3), 0.25f);
+    V3 n = getNormalized(crossX(sub3(v2, v0), sub3(v1, v0)));          // 0 2 1
+    float inner = std::fabs(dot3(sub3(center, v0), n));
+    n = getNormalized(crossX(sub3(v2, v1), sub3(v3, v1)));               // 1 2 3
+    inner = fold(std::fabs(dot3(sub3(center, v1), n)), inner);
+    n = getNormalized(crossX(sub3(v1, v0), sub3(v3, v0)));               // 0 1 3
+    inner = fold(std::fabs(dot3(sub3(center, v0), n)), inner);
+    n = getNormalized(crossX(sub3(v3, v0), sub3(v2, v0)));               // 0 3 2
+    inner = fold(std::fabs(dot3(sub3(center, v0), n)), inner);
+    return inner;
+}
+} // namespace p89inner
+
+PXG_TEST(npTetCollide_p89InnerSphereSelect)
+{
+    using namespace p89inner;
+    uint64_t s = 0x7e7ac011ull;
+    auto u = [&]() { s = s * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(s >> 40)) / 16777216.0f; };
+    auto sym = [&](float r) { return (u() * 2.0f - 1.0f) * r; };
+
+    enum { ORDINARY = 0, FIRST_FACE = 1, FAR_APEX = 2, LATER_FACE = 3 };
+    std::vector<float> VB;
+    std::vector<int> kind;
+    auto push = [&](const V3 (&v)[4], int k)
+    {
+        for (int i = 0; i < 4; ++i) { VB.push_back(v[i].x); VB.push_back(v[i].y); VB.push_back(v[i].z); VB.push_back(0.0f); }
+        kind.push_back(k);
+    };
+
+    // Ordinary tetrahedra: non-round, of every aspect from regular to sliver.
+    for (int t = 0; t < 448; ++t)
+    {
+        const float sc = 0.05f + 3.0f * u();
+        const V3 o = { sym(4.0f), sym(4.0f), sym(4.0f) };
+        V3 v[4];
+        for (int i = 0; i < 4; ++i) v[i] = { o.x + sym(sc), o.y + sym(sc), o.z + sym(sc) };
+        if (t % 7 == 3) v[3] = { (v[0].x + v[1].x + v[2].x) * 0.3333f + sym(0.01f * sc),
+                                 (v[0].y + v[1].y + v[2].y) * 0.3333f + sym(0.01f * sc),
+                                 (v[0].z + v[1].z + v[2].z) * 0.3333f + sym(0.01f * sc) };   // sliver
+        push(v, ORDINARY);
+    }
+    // First-face overflow: (v2 - v0) x (v1 - v0) overflows in x ONLY.
+    for (int t = 0; t < 96; ++t)
+    {
+        const V3 v0 = { sym(3.0f), sym(3.0f), sym(3.0f) };
+        const float L1 = 1.9e19f + 1.0e19f * u(), L2 = 1.9e19f + 1.0e19f * u();
+        const float sgn1 = (t & 1) ? -1.0f : 1.0f, sgn2 = (t & 2) ? -1.0f : 1.0f;
+        V3 v[4];
+        v[0] = v0;
+        v[1] = { v0.x + sym(2.0f), v0.y + sym(2.0f), v0.z + sgn1 * L1 };
+        v[2] = { v0.x + sym(2.0f), v0.y + sgn2 * L2, v0.z + sym(2.0f) };
+        v[3] = { v0.x + sym(0.4f), v0.y + sym(0.4f), v0.z + sym(0.4f) };
+        push(v, FIRST_FACE);
+    }
+    // Far apex: v0 sits ~2e38 out along -x and v1, v2, v3 near the origin, so the first
+    // face overflows in y alone (|v2.z - v0.z| >= 1.75) while face (1,2,3) is small and
+    // FINITE.  The first family's face (1,2,3) is NaN too, so without this one a revert
+    // of that site alone would still keep the NaN.
+    for (int t = 0; t < 48; ++t)
+    {
+        const float X = -(2.0e38f + 0.4e38f * u());
+        const float y0 = sym(0.3f), z0 = sym(0.3f);
+        V3 v[4];
+        v[0] = { X, y0, z0 };
+        v[1] = { sym(1.0f), y0 + sym(1.2f), z0 + sym(1.2f) };
+        v[2] = { sym(1.0f), y0 + sym(1.2f), z0 + ((t & 1) ? -1.0f : 1.0f) * (1.75f + 0.75f * u()) };
+        v[3] = { sym(1.0f), sym(1.2f), sym(1.2f) };
+        push(v, FAR_APEX);
+    }
+    // Later-face overflow: the first face stays finite and a LATER face's distance is
+    // NaN, which both folds must ignore.  Even t: faces (1,2,3) and (0,1,3) overflow;
+    // odd t: faces (1,2,3) and (0,3,2).  Together they put a NaN new distance against
+    // a finite running value at each of the three fold sites.
+    for (int t = 0; t < 48; ++t)
+    {
+        const V3 v0 = { sym(3.0f), sym(3.0f), sym(3.0f) };
+        const float L1 = 1.9e19f + 1.0e19f * u(), L2 = 1.9e19f + 1.0e19f * u();
+        V3 v[4];
+        v[0] = v0;
+        if ((t & 1) == 0)
+        {
+            v[1] = { v0.x + sym(2.0f), v0.y + sym(2.0f), v0.z + L1 };
+            v[2] = { v0.x + sym(0.4f), v0.y + sym(0.4f), v0.z + sym(0.4f) };
+            v[3] = { v0.x + sym(2.0f), v0.y + L2, v0.z + sym(2.0f) };
+        }
+        else
+        {
+            v[1] = { v0.x + sym(0.3f), v0.y + sym(0.3f), v0.z + sym(0.3f) };
+            v[2] = { v0.x + sym(2.0f), v0.y + L2, v0.z + sym(2.0f) };
+            v[3] = { v0.x + sym(2.0f), v0.y + sym(2.0f), v0.z + L1 };
+        }
+        push(v, LATER_FACE);
+    }
+
+    const uint32_t N = uint32_t(kind.size());
+    const uint32_t laterStart = uint32_t(std::find(kind.begin(), kind.end(), int(LATER_FACE)) - kind.begin());
+    std::vector<float> ref(N), twin(N);
+    std::vector<V3> refC(N);
+    uint32_t nNaN = 0, nTwinDiff = 0, nFirstNaN = 0, nApexNaN = 0, nLaterNaNFace = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const V3 v0 = { VB[t * 16 + 0], VB[t * 16 + 1], VB[t * 16 + 2] };
+        const V3 v1 = { VB[t * 16 + 4], VB[t * 16 + 5], VB[t * 16 + 6] };
+        const V3 v2 = { VB[t * 16 + 8], VB[t * 16 + 9], VB[t * 16 + 10] };
+        const V3 v3 = { VB[t * 16 + 12], VB[t * 16 + 13], VB[t * 16 + 14] };
+        V3 c2;
+        ref[t] = innerSphere(v0, v1, v2, v3, refC[t], selectMin);
+        twin[t] = innerSphere(v0, v1, v2, v3, c2, fminOld);
+        if (std::isnan(ref[t])) ++nNaN;
+        if (asU32(ref[t]) != asU32(twin[t])) ++nTwinDiff;
+        if (kind[t] == FIRST_FACE && std::isnan(ref[t]) && std::isfinite(twin[t])) ++nFirstNaN;
+        if (kind[t] == FAR_APEX && std::isnan(ref[t]) && std::isfinite(twin[t]))
+        {
+            // ... and face (1,2,3) really is finite there
+            const V3 n = getNormalized(crossX(sub3(v2, v1), sub3(v3, v1)));
+            if (std::isfinite(dot3(sub3(refC[t], v1), n))) ++nApexNaN;
+        }
+        if (kind[t] == LATER_FACE)
+        {
+            // the NaNs really are on the planned later faces, and both folds ignore them
+            const bool nan123 = std::isnan(dot3(sub3(refC[t], v1), getNormalized(crossX(sub3(v2, v1), sub3(v3, v1)))));
+            const bool nan013 = std::isnan(dot3(sub3(refC[t], v0), getNormalized(crossX(sub3(v1, v0), sub3(v3, v0)))));
+            const bool nan032 = std::isnan(dot3(sub3(refC[t], v0), getNormalized(crossX(sub3(v3, v0), sub3(v2, v0)))));
+            const bool planned = ((t - laterStart) & 1u) == 0u ? (nan123 && nan013 && !nan032) : (nan123 && !nan013 && nan032);
+            if (planned && std::isfinite(ref[t]) && asU32(ref[t]) == asU32(twin[t]))
+                ++nLaterNaNFace;
+        }
+    }
+    const uint32_t nFirst = 96u, nApex = 48u, nLater = 48u;
+    PXG_CHECK_MSG(nFirstNaN == nFirst,
+                  "p89 innerSphere: only %u of %u first-face-overflow tetrahedra give the CUDA NaN "
+                  "against a finite FMin chain -- the family does not plant the case", nFirstNaN, nFirst);
+    PXG_CHECK_MSG(nApexNaN == nApex,
+                  "p89 innerSphere: only %u of %u far-apex tetrahedra give the CUDA NaN against a finite "
+                  "FMin chain with a finite face (1,2,3)", nApexNaN, nApex);
+    PXG_CHECK_MSG(nTwinDiff == nFirst + nApex && nNaN == nFirst + nApex,
+                  "p89 innerSphere: the old FMin chain differs from the CUDA select chain on %u tetrahedra "
+                  "and the CUDA gives NaN on %u; both should be exactly the %u first-face-NaN ones",
+                  nTwinDiff, nNaN, nFirst + nApex);
+    PXG_CHECK_MSG(nLaterNaNFace == nLater,
+                  "p89 innerSphere: %u of %u later-face tetrahedra carry a NaN face that both folds ignore",
+                  nLaterNaNFace, nLater);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bVA = createBufferFrom(dev, std::vector<float>(16, 0.0f));
+    PxgBufferHandle bVB = createBufferFrom(dev, VB);
+    PxgBufferHandle bIn = createBufferFrom(dev, std::vector<TcIn>(1));
+    std::vector<TcOut> outInit(N);
+    std::memset(outInit.data(), 0xEE, outInit.size() * sizeof(TcOut));
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct TcParams { uint32_t numTests, p0, p1, p2; } prm = { N, 0, 0, 0 };
+    Kernel k("npTetCollide.spv", "ctInnerSphere",
+             { 16, 16, (uint32_t)sizeof(TcIn), (uint32_t)sizeof(TcOut) }, sizeof(TcParams));
+    k.dispatch((N + 63u) / 64u, { bVA, bVB, bIn, bOut }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<TcOut>(dev, bOut, N);
+
+    uint32_t bad[4] = { 0, 0, 0, 0 }, asTwin = 0, badC = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const bool cOk = asU32(g[t].tetCenter[0]) == asU32(refC[t].x) && asU32(g[t].tetCenter[1]) == asU32(refC[t].y) &&
+                         asU32(g[t].tetCenter[2]) == asU32(refC[t].z);
+        if (!cOk) ++badC;
+        if (asU32(g[t].innerSphere) != asU32(ref[t]))
+        {
+            if (bad[0] + bad[1] + bad[2] + bad[3] < 4)
+                std::printf("    p89 innerSphere tet %u (kind %d): gpu %08x (%g) cuda %08x (%g) old-FMin twin %08x (%g)\n",
+                            t, kind[t], asU32(g[t].innerSphere), g[t].innerSphere, asU32(ref[t]), ref[t],
+                            asU32(twin[t]), twin[t]);
+            ++bad[kind[t]];
+            if (asU32(g[t].innerSphere) == asU32(twin[t])) ++asTwin;
+        }
+    }
+    std::printf("    [p89 innerSphere] %u tetrahedra, %u CUDA NaN (first face overflows), twin differs on %u\n",
+                N, nNaN, nTwinDiff);
+    PXG_CHECK_MSG(badC == 0u, "p89 innerSphere: %u tetCenters differ from ((v0 + v1) + v2 + v3) * 0.25", badC);
+    PXG_CHECK_MSG(bad[0] + bad[1] + bad[2] + bad[3] == 0u,
+                  "p89 innerSphere: %u ordinary, %u first-face-overflow, %u far-apex and %u later-face-overflow "
+                  "tetrahedra differ from the CUDA selectMin chain (%u of them equal the old FMin chain)",
+                  bad[0], bad[1], bad[2], bad[3], asTwin);
 
     for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
 }
