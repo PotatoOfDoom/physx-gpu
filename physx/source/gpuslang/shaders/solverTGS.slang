@@ -2493,6 +2493,15 @@ void solveWholeIslandTGS(uint3 groupThreadId : SV_GroupThreadID)
 // then lane 0 of each warp accumulates into solverDesc->contactErrorAccumulator.
 // The reduction runs unconditionally (uniform control flow around the
 // barriers); a disabled launch skips only the atomics.
+// P9.89: the sum is warpReduction<AddOpPxReal> (gpucommon/src/CUDA/
+// solverResidual.cuh:85, reduction.cuh:188-199), radius 16..1, op(own,
+// partner) -- the loop below, in that order.  On the articulation branch the
+// CUDA's lanes >= mDescStride `return`ed before the FULL_MASK shuffle
+// (solverMultiBlockTGS.cu:806-807; their registers are PTX-undefined), and
+// npArtiSolvePartition feeds them as +0, the identity: lane 0 only reads an
+// exited lane whose whole xor-subtree has exited, so with +0 there the CUDA's
+// lane 0 holds this tree bit for bit.  Pinned by testArtiSolvePartitionWrap
+// (seven residual rounds; the radius-1..16 and linear-sum twins must differ).
 void solveUnifiedErrorTail(uint localIdx, uint threadIndexInWarp, float errSumSq, float errMax,
                            uint errCount, bool residualAccumulationEnabled,
                            Ptr<PxgSolverCoreDescGpu> descPtr)
