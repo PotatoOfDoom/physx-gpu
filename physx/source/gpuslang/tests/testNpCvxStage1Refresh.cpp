@@ -37,6 +37,8 @@
 // numTests: their manifolds and keep slots must keep their sentinels.
 // P9.86c: three directed fresh-manifold pairs (kDirZ) pin the SIGN of the
 // zero mRelativePos word that aToB = t1.transformInv(t0) stores, bitwise.
+// P9.90: the shader is NoContraction-stamped; npCvxStage1Refresh_p90DotOrder compares a
+// general-pose refresh bitwise, stored separations v.dot(n) included, in the CUDA dot order.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -93,6 +95,16 @@ static const float qthC[5] = { 0.9998f, 0.9999f, 0.9999f, 0.9999f, 0.9999f };
 static const float thS[3] = { 0.5f, 0.1f, 0.75f };
 static const float qthS[3] = { 0.9995f, 0.9999f, 0.9997f };
 
+// P9.90: the two PxVec3 dots the refresh stores or tests -- dist = v.dot(localNormal) and
+// projectedDifference.magnitudeSquared() (cudaGJKEPA.cu:2278/:2286) -- are (x + y) + z in the CUDA
+// (PxVec3.h:173/:274).  gS1DotOrder = 1 re-runs the mirror in the old llvmpipe order x + (y + z),
+// which an UNSTAMPED OpDot evaluates; used only to prove the p90 fixture separates the two.
+static int gS1DotOrder = 0;
+static inline float s1Dot(const V3& a, const V3& b)
+{
+    return gS1DotOrder ? a.x * b.x + (a.y * b.y + a.z * b.z) : (a.x * b.x + a.y * b.y) + a.z * b.z;
+}
+
 static float pcmMargin(const V3& e, float tol) { return std::fmin(std::fmin(std::fmin(e.x, e.y), e.z) * 0.25f, tol * 0.05f); }
 
 // P9.86c mutant twin: true selects the port's PRE-FIX aToB.p spelling q.rotateInv(v) instead
@@ -142,11 +154,11 @@ static void refStage1(const S1In& s, float tol, S1Out& o, bool& marg)
         const V3 lA = add(qRot(aToBq, v3(pA)), aToBp);
         const V3 v = sub(lA, v3(pB));
         const V3 n = v3(np);
-        const float dist = dot3(v, n);
+        const float dist = s1Dot(v, n);
         np.w = dist;
         const V3 proj = sub(lA, mul(n, dist));
         const V3 pd = sub(v3(pB), proj);
-        const float d2 = dot3(pd, pd);
+        const float d2 = s1Dot(pd, pd);
         const float th = minMargin * 0.8f;
         const float sqTh = th * th;
         if (std::fabs(d2 - sqTh) < TIE * (1.f + sqTh)) marg = true;
@@ -204,7 +216,7 @@ static uint32_t u4w(const U4& u, int k) { return k == 0 ? u.x : k == 1 ? u.y : k
 //   D1 (i=17): t1 = PxQuat(-PxHalfPi, z) = (-0,-0,-s,s), same positions: CUDA z = +0, rotateInv -0.
 //   D2 (i=27): D0 through the flip path (meta {5,3}; the kernel swaps the cache refs).
 // Every term of the diverging component is an exact zero product and w*w-0.5 < 0 fused or not,
-// so the sign is contraction-invariant on both sides (the shader is not NoContraction-stamped).
+// so the sign is contraction-invariant on both sides (stamped NoContraction since P9.90 or not).
 struct DirZ { uint32_t idx; int word; uint32_t cudaBits; };
 static const DirZ kDirZ[3] = { { 7u, 0, 0x80000000u }, { 17u, 2, 0x00000000u }, { 27u, 0, 0x80000000u } };
 static int dirZIndex(uint32_t i) { for (int k = 0; k < 3; ++k) if (i == kDirZ[k].idx) return k; return -1; }
@@ -468,7 +480,7 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
 
             // P9.86c: the directed pairs' stored zero word of mRelativePos, BITWISE (sign included),
             // against both the corrected mirror and the hard-coded CUDA bits.  The rest of md0 stays
-            // tolerant: the shader is not NoContraction-stamped, so nonzero words may drift an ulp.
+            // tolerant here; the P9.90 case below compares a whole refresh bitwise.
             const int dz = dirZIndex(i);
             if (dz >= 0)
             {
@@ -512,6 +524,201 @@ PXG_TEST(npCvxStage1Refresh_engineAbi)
     PXG_CHECK_MSG(cRun > total / 10 && cNoRun > total / 10 && cInvalPath > total / 20 && cSphere > total / 8,
                   "stage1: coverage thin (run %zu noRun %zu inval %zu sphere %zu)", cRun, cNoRun, cInvalPath, cSphere);
     PXG_CHECK_MSG(cZeroSignAToB == 9, "stage1: aToB zero-sign directed pairs lost (%zu/9)", cZeroSignAToB);
+}
+
+// P9.90: the NoContraction stamp, observed.  64 convex-convex pairs (16 through the flip
+// path) in general orientation with non-round extents, scales and poses; each manifold holds
+// four contacts whose A point maps to pB + n * pen + (a ~1e-3 tangential offset), so every
+// contact is kept far from the (0.8 * minMargin)^2 edge and the refreshed separation
+// dist = v.dot(n) is stored in mLocalNormal_PenW[j].w.  mRelativePos = PX_MAX_REAL forces
+// bRunNarrowphase, so aToB.p and both quats are stored too.  The whole refreshed manifold
+// and the keep flags are compared BITWISE against refStage1 (-ffp-contract=off, CUDA order
+// (x + y) + z); the old-order twin (gS1DotOrder = 1) must move >= 16 stored separations.
+// Unstamped, llvmpipe's OpDot sums x + (y + z) and the stored separations are the twin's.
+PXG_TEST(npCvxStage1Refresh_p90DotOrder)
+{
+    using namespace physx;
+
+    std::mt19937 rng(990153);
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000003) / 1000003.f); };
+    auto randQuat = [&]() { V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) }); const float a = rf(-3.1f, 3.1f); return F4{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) }; };
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &s1Loader);
+
+    const float tol = 1.6f;
+    const uint32_t N = 64;
+    std::vector<S1In> in(N);
+    std::vector<S1Out> ref(N), twin(N);
+    size_t nMarg = 0, nTwinW = 0, nTwinOther = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        S1In s{};
+        const bool flipped = (i % 4 == 1);
+        s.meta = flipped ? U4{ 4u, 3u, 0, 0 } : U4{ 3u, 4u, 0, 0 };
+        s.scale0 = F4{ rf(0.6f, 1.9f), rf(0.6f, 1.9f), rf(0.6f, 1.9f), 0 };
+        s.scale1 = F4{ rf(0.6f, 1.9f), rf(0.6f, 1.9f), rf(0.6f, 1.9f), 0 };
+        s.extents0 = F4{ rf(0.4f, 1.7f), rf(0.4f, 1.7f), rf(0.4f, 1.7f), 0 };
+        s.extents1 = F4{ rf(0.4f, 1.7f), rf(0.4f, 1.7f), rf(0.4f, 1.7f), 0 };
+        s.t0q = randQuat(); s.t1q = randQuat();
+        s.t0p = F4{ rf(-2.3f, 2.3f), rf(-2.3f, 2.3f), rf(-2.3f, 2.3f), 0 };
+        s.t1p = F4{ rf(-2.3f, 2.3f), rf(-2.3f, 2.3f), rf(-2.3f, 2.3f), 0 };
+
+        F4 ft0q = s.t0q, ft1q = s.t1q; V3 ft0p = v3(s.t0p), ft1p = v3(s.t1p);
+        if (flipped) { std::swap(ft0q, ft1q); std::swap(ft0p, ft1p); }
+        const F4 fc{ -ft1q.x, -ft1q.y, -ft1q.z, ft1q.w };
+        const F4 aq = qMul(fc, ft0q);
+        const V3 ap = qRot(fc, sub(ft0p, ft1p));
+        const F4 aqc{ -aq.x, -aq.y, -aq.z, aq.w };
+        for (int j = 0; j < 4; ++j)
+        {
+            const V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+            s.mNp[j] = F4{ n.x, n.y, n.z, rf(-0.4f, 0.1f) };
+            const V3 b{ rf(-1.3f, 1.3f), rf(-1.3f, 1.3f), rf(-1.3f, 1.3f) };
+            s.mB[j] = F4{ b.x, b.y, b.z, 0 };
+            const V3 tgt = add(add(b, mul(n, rf(-0.35f, 0.15f))), V3{ rf(-1e-3f, 1e-3f), rf(-1e-3f, 1e-3f), rf(-1e-3f, 1e-3f) });
+            const V3 pa = qRot(aqc, sub(tgt, ap));
+            s.mA[j] = F4{ pa.x, pa.y, pa.z, 0 };
+        }
+        // stale moreData: PX_MAX_REAL relative position forces bRunNarrowphase (deltaP > thresholdP)
+        s.md0 = U4{ 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0u };
+        const F4 qa = randQuat(), qb = randQuat();
+        s.md1 = U4{ f2u(qa.x), f2u(qa.y), f2u(qa.z), f2u(qa.w) };
+        s.md2 = U4{ f2u(qb.x), f2u(qb.y), f2u(qb.z), f2u(qb.w) };
+        s.md3 = U4{ 4u, rng() % 5, rng(), rng() };
+        in[i] = s;
+
+        bool marg = false, m2 = false;
+        refStage1(s, tol, ref[i], marg);
+        gS1DotOrder = 1; refStage1(s, tol, twin[i], m2); gS1DotOrder = 0;
+        if (marg || m2) ++nMarg;
+        for (int j = 0; j < 4; ++j)
+        {
+            if (f2u(ref[i].mNp[j].w) != f2u(twin[i].mNp[j].w)) ++nTwinW;
+            if (std::memcmp(&ref[i].mNp[j], &twin[i].mNp[j], 12) || std::memcmp(&ref[i].mA[j], &twin[i].mA[j], 16) ||
+                std::memcmp(&ref[i].mB[j], &twin[i].mB[j], 16)) ++nTwinOther;
+        }
+        if (std::memcmp(&ref[i].md0, &twin[i].md0, 64) || std::memcmp(&ref[i].result, &twin[i].result, 16)) ++nTwinOther;
+    }
+    std::printf("  p90: the old-order twin moves %zu/256 stored separations\n", nTwinW);
+    PXG_CHECK_MSG(nMarg == 0, "p90: %zu pairs sit on a keep/invalidate edge", nMarg);
+    PXG_CHECK_MSG(nTwinOther == 0, "p90: the old-order twin changed %zu words other than the stored separations", nTwinOther);
+    PXG_CHECK_MSG(nTwinW >= 16, "p90: the old-order twin x + (y + z) moves only %zu/256 stored separations", nTwinW);
+    for (uint32_t i = 0; i < N; ++i)
+        PXG_CHECK_MSG(ref[i].result.x == 1u && ref[i].result.y == 4u, "p90: pair %u not kept/rerun as planted", i);
+
+    // ---- marshal into engine arrays ----
+    std::vector<PxgContactManagerInput> cmIn(N);
+    std::vector<PxgShape> shapes(2 * N);
+    std::vector<PxsCachedTransform> cache(2 * N);
+    std::vector<PxgPersistentContactManifold> mfs(N);
+    std::vector<uint8_t> blobs(size_t(2) * N * 64, 0);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    std::memset(cache.data(), 0, cache.size() * sizeof(PxsCachedTransform));
+    std::memset(mfs.data(), 0xCD, mfs.size() * sizeof(PxgPersistentContactManifold));
+
+    PxgDevicePtr dBlobs = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dBlobs, blobs.size()) == PxgResult::Success, "memAlloc blobs");
+    if (!dBlobs) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const S1In& s = in[i];
+        cmIn[i].shapeRef0 = 2 * i; cmIn[i].shapeRef1 = 2 * i + 1;
+        cmIn[i].transformCacheRef0 = 2 * i; cmIn[i].transformCacheRef1 = 2 * i + 1;
+        PxgShape& sh0 = shapes[2 * i];
+        PxgShape& sh1 = shapes[2 * i + 1];
+        sh0.type = s.meta.x; sh1.type = s.meta.y;
+        sh0.scale.scale = PxVec3(s.scale0.x, s.scale0.y, s.scale0.z);
+        sh1.scale.scale = PxVec3(s.scale1.x, s.scale1.y, s.scale1.z);
+        sh0.scale.rotation = PxQuat(PxIdentity); sh1.scale.rotation = PxQuat(PxIdentity);
+        sh0.hullOrMeshPtr = size_t(dBlobs + uint64_t(2 * i) * 64u);
+        sh1.hullOrMeshPtr = size_t(dBlobs + uint64_t(2 * i + 1) * 64u);
+        const F4 e0{ s.extents0.x, s.extents0.y, s.extents0.z, 0 };
+        const F4 e1{ s.extents1.x, s.extents1.y, s.extents1.z, 0 };
+        std::memcpy(&blobs[size_t(2 * i) * 64 + 32], &e0, 16);
+        std::memcpy(&blobs[size_t(2 * i + 1) * 64 + 32], &e1, 16);
+        cache[2 * i].transform.q = PxQuat(s.t0q.x, s.t0q.y, s.t0q.z, s.t0q.w);
+        cache[2 * i].transform.p = PxVec3(s.t0p.x, s.t0p.y, s.t0p.z);
+        cache[2 * i + 1].transform.q = PxQuat(s.t1q.x, s.t1q.y, s.t1q.z, s.t1q.w);
+        cache[2 * i + 1].transform.p = PxVec3(s.t1p.x, s.t1p.y, s.t1p.z);
+        PxgPersistentContactManifold& m = mfs[i];
+        for (int j = 0; j < 4; ++j)
+        {
+            m.mLocalNormal_PenW[j] = make_float4(s.mNp[j].x, s.mNp[j].y, s.mNp[j].z, s.mNp[j].w);
+            m.mLocalContactA[j] = make_float4(s.mA[j].x, s.mA[j].y, s.mA[j].z, s.mA[j].w);
+            m.mLocalContactB[j] = make_float4(s.mB[j].x, s.mB[j].y, s.mB[j].z, s.mB[j].w);
+        }
+        m.mRelativePos = make_float4(u2f(s.md0.x), u2f(s.md0.y), u2f(s.md0.z), u2f(s.md0.w));
+        m.mQuatA = PxAlignedQuat(u2f(s.md1.x), u2f(s.md1.y), u2f(s.md1.z), u2f(s.md1.w));
+        m.mQuatB = PxAlignedQuat(u2f(s.md2.x), u2f(s.md2.y), u2f(s.md2.z), u2f(s.md2.w));
+        m.mNbContacts = s.md3.x; m.mNbWarmStartPoints = s.md3.y;
+        m.mWarmStartA = s.md3.z; m.mWarmStartB = s.md3.w;
+    }
+
+    PxgDevicePtr dCmIn = 0, dShapes = 0, dCache = 0, dMf = 0, dKeep = 0;
+    shim.memAlloc(&dCmIn, cmIn.size() * sizeof(PxgContactManagerInput));
+    shim.memAlloc(&dShapes, shapes.size() * sizeof(PxgShape));
+    shim.memAlloc(&dCache, cache.size() * sizeof(PxsCachedTransform));
+    shim.memAlloc(&dMf, mfs.size() * sizeof(PxgPersistentContactManifold));
+    shim.memAlloc(&dKeep, N * 4);
+    shim.memcpyHtoD(dBlobs, blobs.data(), blobs.size());
+    shim.memcpyHtoD(dCmIn, cmIn.data(), cmIn.size() * sizeof(PxgContactManagerInput));
+    shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(PxgShape));
+    shim.memcpyHtoD(dCache, cache.data(), cache.size() * sizeof(PxsCachedTransform));
+    shim.memcpyHtoD(dMf, mfs.data(), mfs.size() * sizeof(PxgPersistentContactManifold));
+    shim.memsetD32(dKeep, 0xCCCCCCCC, N);
+
+    struct Stage1Blob
+    {
+        uint32_t numTests;
+        float toleranceLength;
+        uint64_t cmInputs, transformCache, shapes, cmManifolds, tempKeepPairArray;
+    } blob = { N, tol, dCmIn, dCache, dShapes, dMf, dKeep };
+    static_assert(sizeof(Stage1Blob) == 48, "stage1 engine blob is 48 bytes");
+    PXG_CHECK_MSG(shim.launchKernel(0, (N * 4 + 127) / 128, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                  "launch stage1 (p90)");
+    shim.streamSynchronize();
+
+    std::vector<PxgPersistentContactManifold> gMf(N);
+    std::vector<uint32_t> gKeep(N);
+    shim.memcpyDtoH(gMf.data(), dMf, gMf.size() * sizeof(PxgPersistentContactManifold));
+    shim.memcpyDtoH(gKeep.data(), dKeep, N * 4);
+
+    size_t mmW = 0, mmWTwin = 0, mmOther = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const PxgPersistentContactManifold& g = gMf[i];
+        S1Out got;
+        for (int j = 0; j < 4; ++j)
+        {
+            std::memcpy(&got.mNp[j], &g.mLocalNormal_PenW[j], 16);
+            std::memcpy(&got.mA[j], &g.mLocalContactA[j], 16);
+            std::memcpy(&got.mB[j], &g.mLocalContactB[j], 16);
+            if (f2u(got.mNp[j].w) != f2u(ref[i].mNp[j].w))
+            {
+                ++mmW;
+                if (f2u(got.mNp[j].w) == f2u(twin[i].mNp[j].w)) ++mmWTwin;
+            }
+            if (std::memcmp(&got.mNp[j], &ref[i].mNp[j], 12) || std::memcmp(&got.mA[j], &ref[i].mA[j], 16) ||
+                std::memcmp(&got.mB[j], &ref[i].mB[j], 16)) ++mmOther;
+        }
+        std::memcpy(&got.md0, &g.mRelativePos, 16);
+        std::memcpy(&got.md1, &g.mQuatA, 16);
+        std::memcpy(&got.md2, &g.mQuatB, 16);
+        got.md3 = U4{ g.mNbContacts, g.mNbWarmStartPoints, g.mWarmStartA, g.mWarmStartB };
+        if (std::memcmp(&got.md0, &ref[i].md0, 64) || gKeep[i] != ref[i].result.x) ++mmOther;
+    }
+    PXG_CHECK_MSG(mmW == 0, "p90: %zu/256 stored separations v.dot(n) differ bitwise from the CUDA order (x + y) + z "
+                            "(%zu equal the old-order twin x + (y + z): is npCvxStage1Refresh NoContraction-stamped?)", mmW, mmWTwin);
+    PXG_CHECK_MSG(mmOther == 0, "p90: %zu contact/moreData/keep words differ bitwise", mmOther);
+
+    for (PxgDevicePtr pfree : { dBlobs, dCmIn, dShapes, dCache, dMf, dKeep })
+        shim.memFree(pfree);
 }
 
 } // namespace

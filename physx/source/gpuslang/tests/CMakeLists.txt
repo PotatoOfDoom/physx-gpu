@@ -267,7 +267,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # transformInertiaTensor), and no other kernel is compared against this one.
     # testPreIntegration preIntegration_p90DotOrder compares every output word bitwise
     # and fails without this entry.
-    preIntegration)
+    preIntegration
+    # P9.90: the convex-convex stage-1 manifold refresh.  The refreshed separation
+    # dist = v.dot(localNormal), stored as mLocalNormal_PenW[j].w, and the keep test's
+    # projectedDifference.magnitudeSquared() (cudaGJKEPA.cu:2278/:2286) are PxVec3 dots,
+    # (x + y) + z (PxVec3.h:173/:274); unstamped, llvmpipe summed them x + (y + z).
+    # Its only import, pxgSlangNpAbi, contributes explicit mul+add chains (quatRotate,
+    # quatMul) and no other kernel is compared against this one.
+    # testNpCvxStage1Refresh npCvxStage1Refresh_p90DotOrder compares the refreshed
+    # manifold bitwise and fails without this entry.
+    npCvxStage1Refresh)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
