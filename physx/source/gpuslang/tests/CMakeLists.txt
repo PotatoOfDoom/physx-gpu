@@ -174,7 +174,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # (npArtiConstraintPrep and the npArti* leaves) were already stamped.
     # testConstraintPrep constraintPrepPGS_p90DotOrder compares the rows bitwise
     # and fails without this entry.
-    constraintPrepPGS)
+    constraintPrepPGS
+    # P9.90: the TGS contact/joint prep, the same PxVec3 dots in
+    # setupFinalizeSolverConstraintsBlockTGS (contactConstraintBlockPrep.cuh
+    # :859-969 normal rows, :1004-1150 friction rows): normalLenSq, norVel0/1,
+    # cTargetVel, angNorVel0/1, resp0/1, the kinematic targetVel terms and the friction
+    # error/targetVel.  Unstamped, llvmpipe summed them x + (y + z).  It imports
+    # pxgSlangPrepCommon like constraintPrepPGS (stamped above), so both now compile
+    # the shared module the same way.  testConstraintPrep constraintPrepTGS_p90DotOrder
+    # compares the rows bitwise and fails without this entry.
+    constraintPrepTGS)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

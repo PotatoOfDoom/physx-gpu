@@ -2174,4 +2174,364 @@ PXG_TEST(constraintPrepPGS_p90DotOrder)
         shim.memFree(pfree);
 }
 
+// ---------------------------------------------------------------------------
+// P9.90: dot association order of the TGS contact prep.
+//
+// setupFinalizeSolverConstraintsBlockTGS (contactConstraintBlockPrep.cuh:859-969
+// normal rows, :1004-1150 friction rows) is built from the same PxVec3 dots as the
+// PGS prep above: normalLenSq, norVel0/1, cTargetVel, angNorVel0/1 (twice: the slop
+// ratio and vrel), |I^-1/2 (r x n)|^2 in resp0/1, the kinematic targetVel terms, and
+// the friction t0 projection / error / targetVel.  The existing TGS driver compares
+// these with a 2e-4 tolerance.  Here every row word is compared BITWISE against the
+// -ffp-contract=off mirror refSetupTGS (CUDA order).  p90TgsNormalRow re-derives the
+// normal rows with the dot order as a parameter: in the CUDA order it must equal the
+// mirror word for word, in the old order (llvmpipe's undecorated OpDot, x + (y + z))
+// it must differ on at least a quarter of the rows -- the stamp's coverage guard.
+// ---------------------------------------------------------------------------
+struct P90TgsRow
+{
+    Float4 raXn_extraCoeff, rbXn_targetVelW;
+    float separation, biasCoefficient, resp0, resp1;
+};
+
+P90TgsRow p90TgsNormalRow(bool oldOrder, const BlockContactData& cd, const BlockContactPoint& cp, uint32_t lane,
+                          const AFrame& bf0, const AFrame& bf1, const SolverBodyData& d0, const SolverBodyData& d1,
+                          const Mat33& si0, const Mat33& si1, float invStepDt, float stepDt, float totalDt,
+                          float invTotalDt, float bounceThreshold, float biasCoefficient, float restDistance,
+                          uint32_t flags, float solverOffsetSlop)
+{
+    const Float4 initLin0 = d0.initialLinVelXYZ_invMassW, initAng0 = d0.initialAngVelXYZ_penBiasClamp;
+    const Float4 initLin1 = d1.initialLinVelXYZ_invMassW, initAng1 = d1.initialAngVelXYZ_penBiasClamp;
+    const Vec3 linVel0(initLin0.x, initLin0.y, initLin0.z), linVel1(initLin1.x, initLin1.y, initLin1.z);
+    const Vec3 angVel0(initAng0.x, initAng0.y, initAng0.z), angVel1(initAng1.x, initAng1.y, initAng1.z);
+    const float invDtp8 = invStepDt * cpSelMin(0.8f, biasCoefficient);
+    const Float4 ims = cd.mInvMassScale[lane];
+    const float invMass0D0 = initLin0.w * ims.x, invMass1D1 = initLin1.w * ims.z;
+    const bool isKin0 = (d0.flags & RB_KINEMATIC) != 0, isKin1 = (d1.flags & RB_KINEMATIC) != 0;
+
+    const Float4 n4 = cd.normal_restitutionW[lane];
+    const Vec3 normal(n4.x, n4.y, n4.z);
+    const float restitution = n4.w;
+    const float normalLenSq = p90Dot(normal, normal, oldOrder);
+    const float norVel0 = p90Dot(normal, linVel0, oldOrder), norVel1 = p90Dot(normal, linVel1, oldOrder);
+    const float linNorVel = norVel0 - norVel1;
+    const float invMassNorLenSq0 = invMass0D0 * normalLenSq, invMassNorLenSq1 = invMass1D1 * normalLenSq;
+
+    const Float4 ps = cp.point_separationW[lane];
+    const Vec3 point(ps.x, ps.y, ps.z);
+    const Float4 tv4 = cp.targetVel_maxImpulseW[lane];
+    const float cTargetVel = p90Dot(normal, Vec3(tv4.x, tv4.y, tv4.z), oldOrder);
+    Vec3 raXn = (point - bf0.p).cross(normal), rbXn = (point - bf1.p).cross(normal);
+    const float angNorVel = p90Dot(raXn, angVel0, oldOrder) - p90Dot(rbXn, angVel1, oldOrder);
+    const float slop = solverOffsetSlop * cpSelMax(linNorVel == 0.f ? 1.f : angNorVel / linNorVel, 1.f);
+    raXn.x = std::fabs(raXn.x) < slop ? 0.f : raXn.x;
+    raXn.y = std::fabs(raXn.y) < slop ? 0.f : raXn.y;
+    raXn.z = std::fabs(raXn.z) < slop ? 0.f : raXn.z;
+    rbXn.x = std::fabs(rbXn.x) < slop ? 0.f : rbXn.x;
+    rbXn.y = std::fabs(rbXn.y) < slop ? 0.f : rbXn.y;
+    rbXn.z = std::fabs(rbXn.z) < slop ? 0.f : rbXn.z;
+    const Vec3 raI = si0.transform(raXn), rbI = si1.transform(rbXn);
+    P90TgsRow row;
+    row.resp0 = p90Dot(raI, raI, oldOrder) * ims.y + invMassNorLenSq0;
+    row.resp1 = p90Dot(rbI, rbI, oldOrder) * ims.w + invMassNorLenSq1;
+    const float unitResponse = row.resp0 + row.resp1;
+    const float angNorVel0 = p90Dot(raXn, angVel0, oldOrder), angNorVel1 = p90Dot(rbXn, angVel1, oldOrder);
+    const float vrel = linNorVel + (angNorVel0 - angNorVel1);
+
+    float scaledBias = 0.f, velMultiplier = 0.f;
+    float penetration = ps.w - restDistance;
+    const bool isSeparated = (penetration > 0.0f);
+    const float penetrationInvDt = penetration * invTotalDt;
+    const float recipResponse = (unitResponse > 0.f) ? (1.f / unitResponse) : 0.f;
+    float contactCoeff = 0.f;
+    if (restitution < 0.f)
+    {
+        const bool collidingWithVrel = ((-vrel * totalDt) > penetration);
+        contactCoeff = computeCompliantContactCoefficientsTGS(stepDt, flags, restitution, cd.damping[lane], unitResponse,
+                                                              recipResponse, isSeparated, collidingWithVrel,
+                                                              velMultiplier, scaledBias);
+    }
+    else
+        scaledBias = isSeparated ? -invStepDt : -invDtp8;
+    const bool isGreater2 = ((restitution > 0.f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
+    float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
+    if (isKin0)
+        targetVelocity -= (norVel0 + angNorVel0);
+    if (isKin1)
+        targetVelocity += (norVel1 + angNorVel1);
+    if (isGreater2)
+        penetration += targetVelocity * (totalDt + penetration / vrel);
+    row.raXn_extraCoeff = Float4{ raI.x, raI.y, raI.z, contactCoeff };
+    row.rbXn_targetVelW = Float4{ rbI.x, rbI.y, rbI.z, targetVelocity };
+    row.separation = penetration;
+    row.biasCoefficient = scaledBias;
+    return row;
+}
+
+PXG_TEST(constraintPrepTGS_p90DotOrder)
+{
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(4290);
+    ContactSetup cs = buildContactSetup(rng); // random rotations, normals, inertia; non-round data
+
+    const float stepDt = 1.f / 240.f, invStepDt = 240.f, totalDt = 1.f / 60.f, invTotalDt = 60.f;
+    const float bounceThreshold = -2.f, frictionOffsetThreshold = 0.04f, correlationDistance = 0.025f;
+    const float ccdMaxSeparation = 0.1f, biasCoefficient = 2.f;
+
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<BlockFrictionPatch> currPatches(cs.numBatches);
+    std::vector<BlockFrictionAnchorPatch> currAnchors(cs.numBatches);
+    std::memset(currPatches.data(), 0, currPatches.size() * sizeof(BlockFrictionPatch));
+    std::memset(currAnchors.data(), 0, currAnchors.size() * sizeof(BlockFrictionAnchorPatch));
+    std::vector<TGSContactHeader> chs(cs.numBatches);
+    std::vector<TGSFrictionHeader> fhs(cs.numBatches);
+    std::vector<TGSContactPoint> outCP(cs.numBatches * cs.rowsPerBatch);
+    std::vector<TGSFriction> outFR(cs.numBatches * (cs.rowsPerBatch * 2 + 1));
+    std::memset(chs.data(), 0, chs.size() * sizeof(TGSContactHeader));
+    std::memset(fhs.data(), 0, fhs.size() * sizeof(TGSFrictionHeader));
+    std::memset(outCP.data(), 0, outCP.size() * sizeof(TGSContactPoint));
+    std::memset(outFR.data(), 0, outFR.size() * sizeof(TGSFriction));
+    std::vector<uint64_t> currFricIdx(cs.numBatches * 32 + 1, 0);
+
+    static std::vector<uint8_t> (*p90Loader)(const char*) = [](const char* f) { return loadShaderBlob(f); };
+    const PxgKernelDef manifest[] = {
+        { "constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS", 16u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, p90Loader);
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, bytes);
+        if (dp && data)
+            shim.memcpyHtoD(dp, data, bytes);
+        return dp;
+    };
+
+    const PxgDevicePtr dBatches = alloc(cs.batches.data(), cs.batches.size() * sizeof(Batch));
+    const PxgDevicePtr dBi = alloc(cs.batchIndices.data(), cs.batchIndices.size() * 4);
+    const PxgDevicePtr dBd = alloc(cs.bodyData.data(), cs.bodyData.size() * sizeof(SolverBodyData));
+    const PxgDevicePtr dTx = alloc(cs.txi.data(), cs.txi.size() * sizeof(SolverTxIData));
+    const PxgDevicePtr dBf = alloc(cs.bodyFrames.data(), cs.bodyFrames.size() * sizeof(AlignedTransform));
+    const PxgDevicePtr dWu = alloc(cs.workUnits.data(), cs.workUnits.size() * sizeof(BlockWorkUnit));
+    const PxgDevicePtr dCd = alloc(cs.cdata.data(), cs.cdata.size() * sizeof(BlockContactData));
+    const PxgDevicePtr dCp = alloc(cs.cpoints.data(), cs.cpoints.size() * sizeof(BlockContactPoint));
+    const PxgDevicePtr dPatch = alloc(currPatches.data(), currPatches.size() * sizeof(BlockFrictionPatch));
+    const PxgDevicePtr dAnch = alloc(currAnchors.data(), currAnchors.size() * sizeof(BlockFrictionAnchorPatch));
+    const PxgDevicePtr dCfi = alloc(currFricIdx.data(), currFricIdx.size() * 8);
+    const PxgDevicePtr dCh = alloc(chs.data(), chs.size() * sizeof(TGSContactHeader));
+    const PxgDevicePtr dFh = alloc(fhs.data(), fhs.size() * sizeof(TGSFrictionHeader));
+    const PxgDevicePtr dOutCP = alloc(outCP.data(), outCP.size() * sizeof(TGSContactPoint));
+    const PxgDevicePtr dOutFR = alloc(outFR.data(), outFR.size() * sizeof(TGSFriction));
+    if (!dBatches) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgConstraintPrepareDesc prepDesc;
+    std::memset(&prepDesc, 0xCD, sizeof(prepDesc));
+    prepDesc.contactConstraintBatchIndices = reinterpret_cast<PxU32*>(dBi);
+    prepDesc.solverBodyDataPool = reinterpret_cast<PxgSolverBodyData*>(dBd);
+    prepDesc.solverBodyTxIDataPool = reinterpret_cast<PxgSolverTxIData*>(dTx);
+    prepDesc.blockWorkUnit = reinterpret_cast<PxgBlockWorkUnit*>(dWu);
+    prepDesc.blockCurrentFrictionIndices = reinterpret_cast<PxgBlockFrictionIndex*>(dCfi);
+    prepDesc.blockPreviousFrictionIndices = NULL;
+    prepDesc.blockContactCurrentPrepPool = reinterpret_cast<physx::PxgBlockContactData*>(dCd);
+    prepDesc.blockContactPoints = reinterpret_cast<physx::PxgBlockContactPoint*>(dCp);
+    prepDesc.blockCurrentAnchorPatches = reinterpret_cast<physx::PxgBlockFrictionAnchorPatch*>(dAnch);
+    prepDesc.blockPreviousAnchorPatches = NULL;
+    prepDesc.body2WorldPool = reinterpret_cast<PxAlignedTransform*>(dBf);
+    prepDesc.numContactBatches = cs.numBatches;
+    prepDesc.numStaticContactBatches = 0;
+    prepDesc.bounceThresholdF32 = bounceThreshold;
+    prepDesc.frictionOffsetThreshold = frictionOffsetThreshold;
+    prepDesc.correlationDistance = correlationDistance;
+    prepDesc.ccdMaxSeparation = ccdMaxSeparation;
+    prepDesc.totalPreviousEdges = 0;
+    prepDesc.totalCurrentEdges = cs.numBatches * 32;
+    prepDesc.biasCoefficient = biasCoefficient;
+
+    PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
+    std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
+    sharedDesc.blockCurrentFrictionPatches = reinterpret_cast<physx::PxgBlockFrictionPatch*>(dPatch);
+    sharedDesc.blockPreviousFrictionPatches = NULL;
+    sharedDesc.dt = totalDt;
+    sharedDesc.stepDt = stepDt;
+    sharedDesc.invDtF32 = invTotalDt;
+    sharedDesc.stepInvDtF32 = invStepDt;
+    sharedDesc.iterativeData.blockConstraintBatch = reinterpret_cast<PxgBlockConstraintBatch*>(dBatches);
+    sharedDesc.iterativeData.blockContactHeaders = reinterpret_cast<PxgTGSBlockSolverContactHeader*>(dCh);
+    sharedDesc.iterativeData.blockFrictionHeaders = reinterpret_cast<PxgTGSBlockSolverFrictionHeader*>(dFh);
+    sharedDesc.iterativeData.blockContactPoints = reinterpret_cast<PxgTGSBlockSolverContactPoint*>(dOutCP);
+    sharedDesc.iterativeData.blockFrictions = reinterpret_cast<PxgTGSBlockSolverContactFriction*>(dOutFR);
+
+    const PxgDevicePtr dPrepDesc = alloc(&prepDesc, sizeof(prepDesc));
+    const PxgDevicePtr dSharedDesc = alloc(&sharedDesc, sizeof(sharedDesc));
+    struct { uint64_t prepDesc, sharedDesc; } prm = { dPrepDesc, dSharedDesc };
+    PXG_CHECK_MSG(shim.launchKernel(0, (cs.numBatches + 1) / 2, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch contactConstraintBlockPrepareParallelLaunchTGS (p90)");
+    shim.streamSynchronize();
+
+    // ---- reference (the -ffp-contract=off mirror, CUDA dot order) ----
+    std::vector<BlockFrictionPatch> refPatches = currPatches;
+    std::vector<BlockFrictionAnchorPatch> refAnchors = currAnchors;
+    std::vector<TGSContactHeader> refCH = chs;
+    std::vector<TGSFrictionHeader> refFH = fhs;
+    std::vector<TGSContactPoint> refCP = outCP;
+    std::vector<TGSFriction> refFR = outFR;
+    std::vector<BlockFrictionPatch> prevPatchesDummy;
+    std::vector<BlockFrictionAnchorPatch> prevAnchorsDummy;
+    std::vector<uint64_t> prevIdxDummy;
+    for (uint32_t k = 0; k < cs.numBatches; ++k)
+    {
+        const Batch& b = cs.batches[k];
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            const uint32_t bA = b.bodyAIndex[lane], bB = b.bodyBIndex[lane];
+            const AFrame& bf0 = cs.frames[bA];
+            const AFrame& bf1 = cs.frames[bB];
+            const Float4 data_ = cs.cdata[k].contactData[lane];
+            uint32_t materialWord;
+            std::memcpy(&materialWord, &data_.w, 4);
+            const uint32_t nbContacts = materialWord & 0xFF;
+            const uint32_t flags = (materialWord >> 8) & 0xFF;
+            const float restDistance = data_.x, staticF = data_.y, dynamicF = data_.z;
+            const Float4 n4 = cs.cdata[k].normal_restitutionW[lane];
+            const Vec3 normal(n4.x, n4.y, n4.z);
+            const uint32_t contactBase = b.blockContactIndex;
+            refCorrelatePatches(refPatches[k], lane, nbContacts, normal, bf0, bf1);
+            const bool perPointFriction = (flags & SC_PER_POINT_FRICTION) != 0;
+            const bool disableFriction = (flags & SC_DISABLE_FRICTION) != 0;
+            refPatches[k].broken[lane] = 0;
+            float patchExtents = 0.f;
+            if (!(perPointFriction || disableFriction))
+                refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
+                                      prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance, 0u,
+                                      patchExtents, nbContacts);
+            if (!disableFriction)
+                refGrowPatches(refPatches[k], refAnchors[k], lane, cs.cpoints, contactBase, nbContacts, bf0, bf1,
+                               frictionOffsetThreshold + restDistance, patchExtents);
+            refSetupTGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
+                        cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invStepDt, stepDt, totalDt, invTotalDt,
+                        bounceThreshold, biasCoefficient, lane, cs.workUnits[k].mWriteback[lane], perPointFriction,
+                        refCH[k], refFH[k], refCP, contactBase, refFR, b.startFrictionIndex, restDistance, staticF,
+                        dynamicF, flags, std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop),
+                        cs.workUnits[k].mTorsionalFrictionData[lane]);
+        }
+    }
+
+    std::vector<TGSContactHeader> gCH(chs.size());
+    std::vector<TGSFrictionHeader> gFH(fhs.size());
+    std::vector<TGSContactPoint> gCP(outCP.size());
+    std::vector<TGSFriction> gFR(outFR.size());
+    shim.memcpyDtoH(gCH.data(), dCh, gCH.size() * sizeof(TGSContactHeader));
+    shim.memcpyDtoH(gFH.data(), dFh, gFH.size() * sizeof(TGSFrictionHeader));
+    shim.memcpyDtoH(gCP.data(), dOutCP, gCP.size() * sizeof(TGSContactPoint));
+    shim.memcpyDtoH(gFR.data(), dOutFR, gFR.size() * sizeof(TGSFriction));
+
+    auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    auto same4 = [&](const Float4& a, const Float4& b) {
+        return bitsOf(a.x) == bitsOf(b.x) && bitsOf(a.y) == bitsOf(b.y) && bitsOf(a.z) == bitsOf(b.z) &&
+               bitsOf(a.w) == bitsOf(b.w);
+    };
+    auto sameRow = [&](const P90TgsRow& t, const TGSContactPoint& p, uint32_t l) {
+        return same4(t.raXn_extraCoeff, p.raXn_extraCoeff[l]) && same4(t.rbXn_targetVelW, p.rbXn_targetVelW[l]) &&
+               bitsOf(t.separation) == bitsOf(p.separation[l]) &&
+               bitsOf(t.biasCoefficient) == bitsOf(p.biasCoefficient[l]) && bitsOf(t.resp0) == bitsOf(p.resp0[l]) &&
+               bitsOf(t.resp1) == bitsOf(p.resp1[l]);
+    };
+
+    size_t rows = 0, rowBits = 0, twinCopyBits = 0, oldTwinDiffers = 0, gpuIsOldTwin = 0;
+    size_t fRows = 0, fRowBits = 0, fHdrBits = 0, kinRows = 0, compliantRows = 0;
+    for (uint32_t k = 0; k < cs.numBatches; ++k)
+    {
+        const Batch& b = cs.batches[k];
+        for (uint32_t l = 0; l < b.descStride; ++l)
+        {
+            PXG_CHECK_MSG(gCH[k].numNormalConstr[l] == refCH[k].numNormalConstr[l] &&
+                              gFH[k].numFrictionConstr[l] == refFH[k].numFrictionConstr[l],
+                          "b%u l%u row counts differ", k, l);
+            const Float4 data_ = cs.cdata[k].contactData[l];
+            uint32_t materialWord;
+            std::memcpy(&materialWord, &data_.w, 4);
+            const uint32_t flags = (materialWord >> 8) & 0xFF;
+            const uint32_t bA = b.bodyAIndex[l], bB = b.bodyBIndex[l];
+            const float slop = std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop);
+            const bool kin = ((cs.bodyData[bA].flags | cs.bodyData[bB].flags) & RB_KINEMATIC) != 0;
+            const bool compliant = cs.cdata[k].normal_restitutionW[l].w < 0.f;
+            for (uint32_t i = 0; i < refCH[k].numNormalConstr[l]; ++i)
+            {
+                const uint32_t r = b.startConstraintIndex + i;
+                const BlockContactPoint& cp = cs.cpoints[b.blockContactIndex + i];
+                ++rows;
+                kinRows += kin ? 1u : 0u;
+                compliantRows += compliant ? 1u : 0u;
+                const P90TgsRow cur = p90TgsNormalRow(false, cs.cdata[k], cp, l, cs.frames[bA], cs.frames[bB],
+                                                      cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invStepDt,
+                                                      stepDt, totalDt, invTotalDt, bounceThreshold, biasCoefficient,
+                                                      data_.x, flags, slop);
+                const P90TgsRow old = p90TgsNormalRow(true, cs.cdata[k], cp, l, cs.frames[bA], cs.frames[bB],
+                                                      cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invStepDt,
+                                                      stepDt, totalDt, invTotalDt, bounceThreshold, biasCoefficient,
+                                                      data_.x, flags, slop);
+                if (!sameRow(cur, refCP[r], l)) ++twinCopyBits;
+                if (!sameRow(old, refCP[r], l)) ++oldTwinDiffers;
+                const bool gpuExact = same4(gCP[r].raXn_extraCoeff[l], refCP[r].raXn_extraCoeff[l]) &&
+                                      same4(gCP[r].rbXn_targetVelW[l], refCP[r].rbXn_targetVelW[l]) &&
+                                      bitsOf(gCP[r].separation[l]) == bitsOf(refCP[r].separation[l]) &&
+                                      bitsOf(gCP[r].biasCoefficient[l]) == bitsOf(refCP[r].biasCoefficient[l]) &&
+                                      bitsOf(gCP[r].resp0[l]) == bitsOf(refCP[r].resp0[l]) &&
+                                      bitsOf(gCP[r].resp1[l]) == bitsOf(refCP[r].resp1[l]) &&
+                                      bitsOf(gCP[r].maxImpulse[l]) == bitsOf(refCP[r].maxImpulse[l]);
+                if (!gpuExact)
+                {
+                    if (rowBits < 4)
+                        std::printf("  b%u l%u c%u: tv g%08x r%08x  resp0 g%08x r%08x  sep g%08x r%08x\n", k, l, i,
+                                    bitsOf(gCP[r].rbXn_targetVelW[l].w), bitsOf(refCP[r].rbXn_targetVelW[l].w),
+                                    bitsOf(gCP[r].resp0[l]), bitsOf(refCP[r].resp0[l]), bitsOf(gCP[r].separation[l]),
+                                    bitsOf(refCP[r].separation[l]));
+                    ++rowBits;
+                    if (sameRow(old, gCP[r], l)) ++gpuIsOldTwin;
+                }
+            }
+            const uint32_t nf = refFH[k].numFrictionConstr[l];
+            if (nf != 0 && (!same4(gFH[k].frictionNormals0[l], refFH[k].frictionNormals0[l]) ||
+                            !same4(gFH[k].frictionNormals1[l], refFH[k].frictionNormals1[l]) ||
+                            ((nf & 1u) && bitsOf(gFH[k].torsionalFrictionScale[l]) !=
+                                              bitsOf(refFH[k].torsionalFrictionScale[l]))))
+                ++fHdrBits;
+            for (uint32_t i = 0; i < nf; ++i)
+            {
+                const uint32_t r = b.startFrictionIndex + i;
+                ++fRows;
+                if (!same4(gFR[r].raXn_error[l], refFR[r].raXn_error[l]) ||
+                    !same4(gFR[r].rbXn_targetVelW[l], refFR[r].rbXn_targetVelW[l]) ||
+                    bitsOf(gFR[r].resp0[l]) != bitsOf(refFR[r].resp0[l]) ||
+                    bitsOf(gFR[r].resp1[l]) != bitsOf(refFR[r].resp1[l]))
+                    ++fRowBits;
+            }
+        }
+    }
+    std::printf("[ info ] P9.90 TGS dot order: %zu normal rows (%zu kinematic, %zu compliant; %zu differ bitwise, "
+                "%zu of them = old-order twin), old-order twin differs on %zu; %zu friction rows (%zu differ), "
+                "friction headers differing %zu\n",
+                rows, kinRows, compliantRows, rowBits, gpuIsOldTwin, oldTwinDiffers, fRows, fRowBits, fHdrBits);
+    PXG_CHECK_MSG(twinCopyBits == 0, "p90TgsNormalRow in the CUDA order must copy refSetupTGS (%zu rows differ)",
+                  twinCopyBits);
+    PXG_CHECK_MSG(oldTwinDiffers * 4 >= rows,
+                  "coverage guard: the x + (y + z) twin must change at least a quarter of the %zu rows (%zu do)", rows,
+                  oldTwinDiffers);
+    PXG_CHECK_MSG(kinRows > 0 && compliantRows > 0, "the fixture must reach kinematic and compliant rows (%zu, %zu)",
+                  kinRows, compliantRows);
+    PXG_CHECK_MSG(fRows > 0, "the fixture must reach friction rows");
+    PXG_CHECK_MSG(rowBits == 0, "%zu TGS normal rows differ bitwise from the CUDA-order mirror", rowBits);
+    PXG_CHECK_MSG(fRowBits == 0, "%zu TGS friction rows differ bitwise from the CUDA-order mirror", fRowBits);
+    PXG_CHECK_MSG(fHdrBits == 0, "%zu TGS friction headers differ bitwise", fHdrBits);
+
+    for (PxgDevicePtr pfree : { dBatches, dBi, dBd, dTx, dBf, dWu, dCd, dCp, dPatch, dAnch, dCfi, dCh,
+                                dFh, dOutCP, dOutFR, dPrepDesc, dSharedDesc })
+        shim.memFree(pfree);
+}
+
 } // namespace
