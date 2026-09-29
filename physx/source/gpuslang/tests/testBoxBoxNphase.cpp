@@ -86,6 +86,16 @@ struct RefPair
     float pen[6] = {};
 };
 
+// P9.90: every dot of the reference goes through rdot.  0 = the CUDA's PxVec3::dot,
+// (x*x' + y*y') + z*z' (PxVec3.h:173); 1 = the old-order twin x*x' + (y*y' + z*z'), which is
+// what llvmpipe computed for an UNDECORATED OpDot before boxBoxNphase was stamped NoContraction.
+static int gDotOld = 0;
+static float rdot(const Vec3& a, const Vec3& b)
+{
+    const float px = a.x * b.x, py = a.y * b.y, pz = a.z * b.z;
+    return gDotOld ? px + (py + pz) : (px + py) + pz;
+}
+
 static float comp3(const Vec3& v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
 static Vec3 vmul(const Vec3& a, const Vec3& b) { return Vec3(a.x * b.x, a.y * b.y, a.z * b.z); }
 
@@ -156,10 +166,10 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
 
     // ---- Stage 1 : SAT ----
     const Vec3 dP = tp1 - tp0;
-    const Vec3 r0(c00.dot(c10), c01.dot(c10), c02.dot(c10));
-    const Vec3 r1(c00.dot(c11), c01.dot(c11), c02.dot(c11));
-    const Vec3 r2(c00.dot(c12), c01.dot(c12), c02.dot(c12));
-    const Vec3 tp(c00.dot(dP), c01.dot(dP), c02.dot(dP));
+    const Vec3 r0(rdot(c00, c10), rdot(c01, c10), rdot(c02, c10));
+    const Vec3 r1(rdot(c00, c11), rdot(c01, c11), rdot(c02, c11));
+    const Vec3 r2(rdot(c00, c12), rdot(c01, c12), rdot(c02, c12));
+    const Vec3 tp(rdot(c00, dP), rdot(c01, dP), rdot(c02, dP));
     const Vec3 ab0(std::fabs(r0.x) + eps, std::fabs(r1.x) + eps, std::fabs(r2.x) + eps);
     const Vec3 ab1(std::fabs(r0.y) + eps, std::fabs(r1.y) + eps, std::fabs(r2.y) + eps);
     const Vec3 ab2(std::fabs(r0.z) + eps, std::fabs(r1.z) + eps, std::fabs(r2.z) + eps);
@@ -171,9 +181,9 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
         const Vec3 abCol(std::fabs(col.x) + eps, std::fabs(col.y) + eps, std::fabs(col.z) + eps);
         const Vec3 abT = (tid == 0) ? ab0 : (tid == 1 ? ab1 : ab2);
         const float tpc = comp3(tp, tid), ea = comp3(box0e, tid), eb = comp3(box1e, tid);
-        const float rbA = abT.dot(box1e);
+        const float rbA = rdot(abT, box1e);
         const float oA = (ea + rbA) - std::fabs(tpc) + cDist, sA = tpc;
-        const float sB = tp.dot(col), raB = abCol.dot(box0e);
+        const float sB = rdot(tp, col), raB = rdot(abCol, box0e);
         const float oB = (raB + eb) - std::fabs(sB) + cDist;
         float minO = oA; uint32_t feat = uint32_t(tid); float sgn = sA;
         if (minO > oB) { minO = oB; sgn = sB; feat = uint32_t(tid) + 3; }
@@ -213,7 +223,7 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
 
     const bool useT1 = feature < 3;
     const Vec3 oc0 = useT1 ? c10 : c00, oc1 = useT1 ? c11 : c01, oc2 = useT1 ? c12 : c02, oP = useT1 ? tp1 : tp0;
-    auto matTT = [](Vec3 a, Vec3 b, Vec3 c, Vec3 v) { return Vec3(a.dot(v), b.dot(v), c.dot(v)); };
+    auto matTT = [](Vec3 a, Vec3 b, Vec3 c, Vec3 v) { return Vec3(rdot(a, v), rdot(b, v), rdot(c, v)); };
     const Vec3 t1n0 = matTT(nc0, nc1, nc2, oc0), t1n1 = matTT(nc0, nc1, nc2, oc1), t1n2 = matTT(nc0, nc1, nc2, oc2);
     const Vec3 t1nP = matTT(nc0, nc1, nc2, oP - np);
     const Vec3 localNormal = matTT(nc0, nc1, nc2, mtd);
@@ -226,7 +236,7 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
     for (int l = 0; l < 3; ++l)
     {
         const Vec3 col = (l == 0) ? t1n0 : (l == 1 ? t1n1 : t1n2);
-        dv[l] = col.dot(axis); absd[l] = std::fabs(dv[l]);
+        dv[l] = rdot(col, axis); absd[l] = std::fabs(dv[l]);
     }
     Vec3 faceNormal;
     { // group-uniform incident face normal
@@ -278,7 +288,7 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
             if (contains4(pts[0], pts[1], pts[2], pts[3], qx, qy, bmin, bmax))
             {
                 const Vec3 diff(pts[0].x - qx, pts[0].y - qy, pts[0].z);
-                const float tval = faceNormal.dot(diff) / denom;
+                const float tval = rdot(faceNormal, diff) / denom;
                 if (cDist > (-tval)) { pArea2[l] = true; localC[l][cnt[l]] = { qx, qy, tval, -tval }; cnt[l]++; }
             }
         }
@@ -331,9 +341,9 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
         const Vec4 deepest = localC[wD][dIv[wD]];
         const Vec3 deepestPt(deepest.x, deepest.y, deepest.z);
         // furthest
-        const Vec3 dpp = deepestPt - faceNormal * faceNormal.dot(deepestPt);
+        const Vec3 dpp = deepestPt - faceNormal * rdot(faceNormal, deepestPt);
         float fWv[4]; int fIv[4];
-        for (int l = 0; l < 4; ++l) { float fW = -FMAX; int fI = 0; for (int i = 0; i < cnt[l]; ++i) { const Vec3 d = dpp - Vec3(localC[l][i].x, localC[l][i].y, localC[l][i].z); const float ds = d.dot(d); if (ds > fW) { fW = ds; fI = i; } } fWv[l] = -fW; fIv[l] = fI; }
+        for (int l = 0; l < 4; ++l) { float fW = -FMAX; int fI = 0; for (int i = 0; i < cnt[l]; ++i) { const Vec3 d = dpp - Vec3(localC[l][i].x, localC[l][i].y, localC[l][i].z); const float ds = rdot(d, d); if (ds > fW) { fW = ds; fI = i; } } fWv[l] = -fW; fIv[l] = fI; }
         int wF = argmin4(fWv);
         const Vec4 furthest = localC[wF][fIv[wF]];
         const Vec3 furthestPt(furthest.x, furthest.y, furthest.z);
@@ -343,7 +353,7 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
         for (int l = 0; l < 4; ++l)
         {
             float mxV = -FMAX, mnV = FMAX; int mxI = 0, mnI = 0;
-            for (int i = 0; i < cnt[l]; ++i) { const float dp = dir.dot(Vec3(localC[l][i].x, localC[l][i].y, localC[l][i].z) - deepestPt); if (dp > mxV) { mxV = dp; mxI = i; } if (dp < mnV) { mnV = dp; mnI = i; } }
+            for (int i = 0; i < cnt[l]; ++i) { const float dp = rdot(dir, Vec3(localC[l][i].x, localC[l][i].y, localC[l][i].z) - deepestPt); if (dp > mxV) { mxV = dp; mxI = i; } if (dp < mnV) { mnV = dp; mnI = i; } }
             mnVv[l] = mnV; mxVv[l] = -mxV; mnIv[l] = mnI; mxIv[l] = mxI;
         }
         int wA = argmin4(mnVv), wB = argmin4(mxVv);
@@ -451,6 +461,10 @@ static HMaterial zeroSignMaterial(uint32_t k)
     default: return { pz, 0.3f, 0.5f, nz, modes(2, 2), 2u };     // eMULTIPLY, zero dynamic friction
     }
 }
+
+// P9.90: when set, checkBoxBox compares the contact points, penetrations and patch normal
+// BITWISE against the -ffp-contract=off mirror instead of with a tolerance.
+static bool gBitwise = false;
 
 static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label)
 {
@@ -590,10 +604,12 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     const bool prevHadTouch = (oldStatus & 2u) != 0u;
     const bool prevKnown = (oldStatus & 3u) != 0u;
 
-    uint32_t caseBPairs = 0;
+    uint32_t caseBPairs = 0, bitLanes = 0, pairsDiff = 0, pairsOld = 0, normalsDiff = 0;
     for (uint32_t i = 0; i < n; ++i)
     {
         const RefPair R = refBoxBox(cfgs[i].box0e, cfgs[i].box1e, cfgs[i].xf0, cfgs[i].xf1, cfgs[i].cDist);
+        RefPair Rold;
+        if (gBitwise) { gDotOld = 1; Rold = refBoxBox(cfgs[i].box0e, cfgs[i].box1e, cfgs[i].xf0, cfgs[i].xf1, cfgs[i].cDist); gDotOld = 0; }
         const uint32_t nb = uint32_t(R.nbContacts);
         if (R.total > 6) caseBPairs++;
         expTotalContacts += nb; if (nb) expTotalPatches++;
@@ -639,10 +655,32 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         const uint64_t pOff = patchAddr - dPStream;
 
         // compare contacts
+        bool pairDiff = false, pairOld = true;
         for (uint32_t k = 0; k < nb; ++k)
         {
             float f4[4];
             std::memcpy(f4, &gCStream[cOff + k * 16], 16);
+            if (gBitwise)
+            {
+                // P9.90: exact bits against the CUDA-order mirror; also note whether the pair
+                // carries the old-order twin's values (the unstamped build's signature).
+                const float want[4] = { R.pts[k].x, R.pts[k].y, R.pts[k].z, R.pen[k] };
+                const float old[4] = { Rold.pts[k].x, Rold.pts[k].y, Rold.pts[k].z, Rold.pen[k] };
+                bool kDiff = false;
+                for (int c = 0; c < 4; ++c)
+                {
+                    if (fbits(f4[c]) != fbits(want[c])) { ++bitLanes; kDiff = true; }
+                    if (Rold.nbContacts != R.nbContacts || fbits(f4[c]) != fbits(old[c])) pairOld = false;
+                }
+                if (kDiff)
+                {
+                    ++bad; pairDiff = true;
+                    if (bad < 12)
+                        std::printf("  [%s] pair %u contact %u gpu=(%a,%a,%a,%a) ref=(%a,%a,%a,%a)\n", label, i, k,
+                                    f4[0], f4[1], f4[2], f4[3], want[0], want[1], want[2], want[3]);
+                }
+                continue;
+            }
             if (!(almostEqual(f4[0], R.pts[k].x, 2e-4f, 2e-5f) && almostEqual(f4[1], R.pts[k].y, 2e-4f, 2e-5f) &&
                   almostEqual(f4[2], R.pts[k].z, 2e-4f, 2e-5f) && almostEqual(f4[3], R.pen[k], 2e-4f, 2e-5f)))
             {
@@ -660,7 +698,13 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         std::memcpy(init, &patchStream[pOff], 64);   // the header's bytes as uploaded
         for (uint32_t w = 0; w < 4u; ++w)             // mMassModification = 1.0f x4 (contactPatchUtils.cuh:175-178)
             if (pu[w] != 0x3f800000u) { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch word %u gpu=%08x ref=3f800000\n", label, i, w, pu[w]); }
-        if (!(almostEqual(pf[4], R.normal.x, 2e-4f, 2e-5f) && almostEqual(pf[5], R.normal.y, 2e-4f, 2e-5f) &&
+        if (gBitwise)
+        {
+            if (pairDiff) { ++pairsDiff; if (pairOld) ++pairsOld; }
+            if (fbits(pf[4]) != fbits(R.normal.x) || fbits(pf[5]) != fbits(R.normal.y) || fbits(pf[6]) != fbits(R.normal.z))
+            { ++bad; ++normalsDiff; if (bad < 12) std::printf("  [%s] pair %u patch normal bits differ\n", label, i); }
+        }
+        else if (!(almostEqual(pf[4], R.normal.x, 2e-4f, 2e-5f) && almostEqual(pf[5], R.normal.y, 2e-4f, 2e-5f) &&
               almostEqual(pf[6], R.normal.z, 2e-4f, 2e-5f)))
         { ++bad; if (bad < 12) std::printf("  [%s] pair %u patch normal gpu=(%g,%g,%g) ref=(%g,%g,%g)\n", label, i, pf[4], pf[5], pf[6], R.normal.x, R.normal.y, R.normal.z); }
 
@@ -699,6 +743,10 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
 
     std::printf("  [%s] pairs=%u contacts=%u patches=%u caseB(>6->4)=%u\n",
                 label, n, expTotalContacts, expTotalPatches, caseBPairs);
+
+    if (gBitwise)
+        std::printf("  [%s] bitwise: %u contact lanes differ in %u pairs (%u equal the old-order twin), %u normals differ\n",
+                    label, bitLanes, pairsDiff, pairsOld, normalsDiff);
 
     if (mutate)
         PXG_CHECK_MSG(bad != 0, "[%s] mutation must FAIL (swapped startPoint/startForce)", label);
@@ -846,6 +894,92 @@ PXG_TEST(boxBoxNphase_materialZeroSign)
     PXG_CHECK_MSG(dynNegZero >= 4u, "dynFriction -0 reached the clamp on %u pairs (expected 4)", dynNegZero);
 
     checkBoxBox(cfgs, 0x00000000u, false, "materialZeroSign");
+}
+
+// P9.90: the dot order.  boxBoxNphase_Kernel's contacts are built from PxVec3 column dots,
+// (x + y) + z (PxVec3.h:173): transform0.transformTranspose(transform1) (cudaBox.cu:444), the
+// SAT radii/signs (:486/:507/:509), newTransformV.transformTranspose (:793-794), the incident
+// axis dots (:77), the corner nom (:351) and the reduction dots (:872-905).  llvmpipe sums an
+// UNDECORATED OpDot x + (y + z), so the shader is stamped NoContraction (PXG_NOCONTRACT_SHADERS).
+// The other fixtures pass either way: axis-aligned data make the dots exact, and they compare
+// with a tolerance.  Here both boxes are in general orientation with non-round extents and
+// offsets, every pair is drawn until the old-order mirror twin (gDotOld) changes its contact
+// points or penetrations, and checkBoxBox compares points, penetrations and normals bitwise.
+PXG_TEST(boxBoxNphase_p90DotOrder)
+{
+    std::mt19937 rng(9090);
+    std::uniform_real_distribution<float> u(-1.f, 1.f), ext(0.37f, 1.43f), ang(-3.1f, 3.1f);
+    auto randQ = [&]() {
+        Vec3 ax(u(rng), u(rng), u(rng));
+        while (ax.magnitudeSquared() < 0.05f) ax = Vec3(u(rng), u(rng), u(rng));
+        ax = ax.getNormalized();
+        const float a = ang(rng), s = std::sin(0.5f * a), c = std::cos(0.5f * a);
+        return QuatV(ax.x * s, ax.y * s, ax.z * s, c);
+    };
+    const uint32_t WANT_GEN = 28, WANT_B = 12, WANT = WANT_GEN + WANT_B;
+    std::vector<PairCfg> cfgs;
+    uint32_t tries = 0, caseB = 0;
+    // Keep c if its reference has contacts that the old-order twin changes (and, for the
+    // face-face draws, if it takes the > 6 -> 4 reduction path).
+    auto accept = [&](const PairCfg& c, bool needCaseB) {
+        const RefPair R = refBoxBox(c.box0e, c.box1e, c.xf0, c.xf1, c.cDist);
+        if (R.nbContacts <= 0 || (needCaseB && R.total <= 6)) return false;
+        gDotOld = 1;
+        const RefPair Ro = refBoxBox(c.box0e, c.box1e, c.xf0, c.xf1, c.cDist);
+        gDotOld = 0;
+        bool differs = Ro.nbContacts != R.nbContacts;
+        for (int k = 0; k < R.nbContacts && !differs; ++k)
+            differs = fbits(R.pts[k].x) != fbits(Ro.pts[k].x) || fbits(R.pts[k].y) != fbits(Ro.pts[k].y) ||
+                      fbits(R.pts[k].z) != fbits(Ro.pts[k].z) || fbits(R.pen[k]) != fbits(Ro.pen[k]);
+        if (!differs) return false;
+        if (R.total > 6) ++caseB;
+        return true;
+    };
+    // (a) general draws: both boxes arbitrarily oriented, centres between the inner and outer
+    //     bounding radii so most pairs touch (edge/vertex-face, 1-6 contacts).
+    while (cfgs.size() < WANT_GEN && tries < 200000u)
+    {
+        ++tries;
+        const Vec3 b0(ext(rng), ext(rng), ext(rng)), b1(ext(rng), ext(rng), ext(rng));
+        const Vec3 p0(u(rng) * 3.7f, u(rng) * 3.7f, u(rng) * 3.7f);
+        Vec3 dir(u(rng), u(rng), u(rng));
+        if (dir.magnitudeSquared() < 0.05f) continue;
+        dir = dir.getNormalized();
+        const float rIn = std::fmin(b0.x, std::fmin(b0.y, b0.z)) + std::fmin(b1.x, std::fmin(b1.y, b1.z));
+        const float rOut = b0.magnitude() + b1.magnitude();
+        const float d = rIn + (0.5f + 0.5f * u(rng)) * 0.6f * (rOut - rIn);
+        const PairCfg c = { b0, b1, xfQ(randQ(), p0), xfQ(randQ(), p0 + dir * d), 0.0137f + 0.02f * (0.5f + 0.5f * u(rng)),
+                            uint32_t(cfgs.size() % 7), uint32_t((cfgs.size() + 2) % 7) };
+        if (accept(c, false)) cfgs.push_back(c);
+    }
+    // (b) face-face draws for the 4-point reduction: B resting on A's local +z face, twisted
+    //     about that normal by 0.5-1.1 rad and tilted slightly, the whole pair in a general
+    //     orientation, so the incident square crosses the reference square in 8 points.
+    while (cfgs.size() < WANT && tries < 400000u)
+    {
+        ++tries;
+        const float ea = 0.61f + 0.4f * (0.5f + 0.5f * u(rng)), eb = ea * (0.93f + 0.1f * u(rng));
+        const Vec3 b0(ea, ea * (0.97f + 0.03f * u(rng)), ext(rng)), b1(eb, eb * (0.97f + 0.03f * u(rng)), ext(rng));
+        const QuatV qA = randQ().getNormalized();
+        const float tw = 0.8f + 0.3f * u(rng), tl = 0.013f * u(rng);
+        const QuatV qTw(0.f, 0.f, std::sin(0.5f * tw), std::cos(0.5f * tw));
+        const QuatV qTl(std::sin(0.5f * tl), 0.f, 0.f, std::cos(0.5f * tl));
+        const QuatV qB = qA * (qTw * qTl);
+        const Vec3 p0(u(rng) * 3.7f, u(rng) * 3.7f, u(rng) * 3.7f);
+        const float pen = 0.004f + 0.011f * (0.5f + 0.5f * u(rng));
+        const Vec3 rel(0.07f * u(rng), 0.07f * u(rng), b0.z + b1.z - pen);
+        const PairCfg c = { b0, b1, xfQ(qA, p0), xfQ(qB, p0 + qA.rotate(rel)), 0.0137f + 0.02f * (0.5f + 0.5f * u(rng)),
+                            uint32_t(cfgs.size() % 7), uint32_t((cfgs.size() + 2) % 7) };
+        if (accept(c, true)) cfgs.push_back(c);
+    }
+    std::printf("  [p90DotOrder] %zu pairs whose contacts change under the old-order twin (%u draws, %u caseB)\n",
+                cfgs.size(), tries, caseB);
+    PXG_CHECK_MSG(cfgs.size() == WANT, "only %zu of %u pairs observe the dot order", cfgs.size(), WANT);
+    PXG_CHECK_MSG(caseB >= WANT_B, "only %u caseB (4-point reduction) pairs -- the reduction dots are unobserved", caseB);
+
+    gBitwise = true;
+    checkBoxBox(cfgs, 0x00000000u, false, "p90DotOrder");
+    gBitwise = false;
 }
 
 PXG_TEST(boxBoxNphase_mutation)

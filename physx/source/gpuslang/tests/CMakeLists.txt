@@ -193,7 +193,17 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # tolerance against their own references, never against this kernel.
     # testSphereNphase sphereNphase_p90DotOrder compares the contact penetrations
     # bitwise and fails without this entry.
-    npSphereNphase)
+    npSphereNphase
+    # P9.90: the engine box-box narrow phase.  transform0.transformTranspose(transform1)
+    # and newTransformV.transformTranspose(...) are PxVec3 column dots, (x + y) + z
+    # (PxVec3.h:173, cudaBox.cu:444/:793-794), and so are the SAT radii and signs
+    # (:486/:507/:509), the incident-axis dots (:77), the corner-in-polygon nom (:351)
+    # and the reduction's plane/distance/perpendicular dots (:872-905).  Unstamped,
+    # llvmpipe summed them x + (y + z).  It imports only pxgSlangCommon; the npBox*
+    # primitive shaders transcribe the stages separately and are never compared against
+    # this kernel.  testBoxBoxNphase boxBoxNphase_p90DotOrder compares the contact points
+    # and penetrations bitwise and fails without this entry.
+    boxBoxNphase)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
