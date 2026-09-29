@@ -285,7 +285,15 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # kernel is compared against this one.  testNpCvxFinishContacts
     # npCvxFinishContacts_p90DotOrder compares the patch normals bitwise and fails
     # without this entry.
-    npCvxFinishContacts)
+    npCvxFinishContacts
+    # P9.90: the TGS substep gravity kernel.  applyAcceleration's sqrtInvInertia.getInverse()
+    # (solverMultiBlockTGS.cu:1592) takes the determinant column0.dot(column1.cross(column2))
+    # (PxMat33.h:247), a PxVec3 dot (x + y) + z; unstamped, llvmpipe summed the port's OpDot
+    # x + (y + z) and 1/det shifted every angular-acceleration lane.  The shader imports no
+    # module and no other kernel is compared against it.  testSolverApplyGravityTGS
+    # solverApplyGravityTGS_p90DotOrder compares the velocity buffer bitwise and fails
+    # without this entry.
+    solverApplyGravityTGS)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

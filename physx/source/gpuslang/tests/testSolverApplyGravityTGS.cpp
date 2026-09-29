@@ -36,6 +36,10 @@
 // bitwise case: singular sqrt-inverse-inertia (zero inverse-inertia axis, axis-aligned
 // orientation) takes getInverse()'s PxMat33(PxIdentity) path, whose product keeps its
 // computed-zero terms and turns a -0 acceleration lane into +0.
+// PXG_TEST solverApplyGravityTGS_p90DotOrder (P9.90) observes the NoContraction stamp:
+// generally oriented sqrt-inverse-inertia matrices, non-round accelerations, every lane
+// compared bitwise.  getDeterminant() is column0.dot(column1.cross(column2)), a PxVec3 dot
+// (x + y) + z; an undecorated OpDot on llvmpipe sums x + (y + z).
 
 #include "pxgTestFramework.h"
 
@@ -69,6 +73,9 @@ uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 // computed-zero terms of PxMat33(PxIdentity) * v).  0 = the CUDA semantics.
 int gIdentityMulVariant = 0;
 uint32_t gSingularCalls = 0; // coverage: singular (identity) branch taken
+// P9.90 twin of the determinant dot: 1 = x + (y + z) (what llvmpipe does with an undecorated
+// OpDot).  0 = the CUDA PxVec3::dot order (x + y) + z.
+int gDetDotVariant = 0;
 
 uint32_t nextPow2(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
 
@@ -80,7 +87,8 @@ void invInertiaMul(const Mat33& m, float vx, float vy, float vz, float& ox, floa
     const float c2x = m.col2.x, c2y = m.col2.y, c2z = m.col2.z;
     // det = c0 . (c1 x c2)
     const float crx = c1y * c2z - c1z * c2y, cry = c1z * c2x - c1x * c2z, crz = c1x * c2y - c1y * c2x;
-    const float det = c0x * crx + c0y * cry + c0z * crz;
+    const float det = gDetDotVariant == 1 ? c0x * crx + (c0y * cry + c0z * crz)
+                                          : (c0x * crx + c0y * cry) + c0z * crz;
     if (det != 0.f)
     {
         const float invDet = 1.f / det;
@@ -360,3 +368,123 @@ PXG_TEST(solverApplyGravityTGS_applySingularInertiaZeroSign)
 }
 
 } // namespace
+
+// P9.90: NoContraction stamp.  getInverse()'s determinant is column0.dot(column1.cross(column2))
+// (PxMat33.h:247), a PxVec3 dot (x*x' + y*y') + z*z'; unstamped, llvmpipe evaluates the port's
+// OpDot as x + (y + z) and the reciprocal feeds every angular-acceleration lane.  256 bodies with
+// generally oriented, non-diagonal sqrt-inverse-inertia matrices and non-round accelerations; the
+// whole velocity buffer is compared BITWISE against the -ffp-contract=off mirror.  A mirror twin
+// with the determinant summed x + (y + z) must change angular lanes, so the case observes the order.
+PXG_TEST(solverApplyGravityTGS_p90DotOrder)
+{
+    std::mt19937 rng(9090);
+    const uint32_t numSlabs = 2, allBodiesCount = 256, bodyOffset = 0;
+    const uint32_t numThreadsPerBody = std::min(nextPow2(numSlabs), 32u); // 2
+    const uint32_t numBodiesPerWarp = 32u / numThreadsPerBody;            // 16
+    const float gx = 0.137f, gy = -9.8127f, gz = 0.2913f, stepDt = 1.f / 240.f;
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * std::uniform_real_distribution<float>(0.f, 1.f)(rng); };
+
+    std::vector<uint32_t> nodeIndex(allBodiesCount);
+    for (uint32_t i = 0; i < allBodiesCount; ++i) nodeIndex[i] = (i * 37u + 11u) % allBodiesCount;
+    std::vector<BodySimInput> sim(allBodiesCount);
+    std::vector<Mat33> inertia(allBodiesCount);
+    for (uint32_t i = 0; i < allBodiesCount; ++i)
+    {
+        BodySimInput s{};
+        s.disableGravity = i % 5 == 0 ? 1u : 0u;
+        s.lockFlags = 0u;
+        s.accelScale = rf(0.7f, 1.3f);
+        s.linAccel = { rf(-3, 3), rf(-3, 3), rf(-3, 3), 0 };
+        s.angAccel = { rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+        sim[nodeIndex[i]] = s;
+        // R * diag(d) * R^T with R from a random unit quaternion (double, then rounded)
+        double q[4]; double n = 0;
+        for (double& c : q) { c = rf(-1, 1); n += c * c; }
+        n = std::sqrt(n); for (double& c : q) c /= n;
+        const double x = q[0], y = q[1], z = q[2], w = q[3];
+        const double R[3][3] = { { 1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w) },
+                                 { 2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w) },
+                                 { 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y) } };
+        const double d[3] = { rf(0.3f, 3.f), rf(0.3f, 3.f), rf(0.3f, 3.f) };
+        float M[3][3];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                M[r][c] = float(R[r][0] * d[0] * R[c][0] + R[r][1] * d[1] * R[c][1] + R[r][2] * d[2] * R[c][2]);
+        inertia[i] = { { M[0][0], M[1][0], M[2][0], 0 }, { M[0][1], M[1][1], M[2][1], 0 }, { M[0][2], M[1][2], M[2][2], 0 } };
+    }
+    // slab slot of (body, slab) pair i: (i/16)*64 + i%16, its angular copy +32 -- never aliased;
+    // every 7th pair is unreferenced.  The accumulation copy follows at outOff (+allBodiesCount).
+    std::vector<uint32_t> refs(numSlabs * allBodiesCount);
+    for (uint32_t i = 0; i < refs.size(); ++i) refs[i] = (i % 7 == 3) ? INVALID : (i / 16u) * 64u + (i % 16u);
+    const uint32_t outOff = (uint32_t(refs.size()) / 16u) * 64u; // 2048
+    const uint32_t totalElems = outOff + 2 * allBodiesCount;
+    std::vector<F4> init(totalElems);
+    // small initial velocities so the 1-ulp determinant difference survives the += into them
+    for (auto& e : init) e = { rf(-0.01f, 0.01f), rf(-0.01f, 0.01f), rf(-0.01f, 0.01f), rf(-0.01f, 0.01f) };
+
+    auto runRef = [&](int variant) {
+        std::vector<F4> buf = init;
+        gDetDotVariant = variant;
+        for (uint32_t bodyId = bodyOffset; bodyId < allBodiesCount; ++bodyId)
+        {
+            const BodySimInput& s = sim[nodeIndex[bodyId]];
+            const bool hasLin = s.linAccel.x != 0.f || s.linAccel.y != 0.f || s.linAccel.z != 0.f;
+            const bool hasAng = s.angAccel.x != 0.f || s.angAccel.y != 0.f || s.angAccel.z != 0.f;
+            if (s.disableGravity == 0u || hasLin || hasAng)
+            {
+                const float agx = stepDt * gx, agy = stepDt * gy, agz = stepDt * gz;
+                for (uint32_t b = 0; b < numSlabs; ++b)
+                {
+                    const uint32_t r = refs[numSlabs * (bodyId - bodyOffset) + b];
+                    if (r != INVALID)
+                        applyAccelRef(buf, r, agx, agy, agz, stepDt, s.linAccel, s.angAccel, hasAng,
+                                      s.accelScale, s.lockFlags, inertia[bodyId], 32);
+                }
+                applyAccelRef(buf, outOff + bodyId, agx, agy, agz, stepDt, s.linAccel, s.angAccel, hasAng,
+                              s.accelScale, s.lockFlags, inertia[bodyId], allBodiesCount);
+            }
+        }
+        gDetDotVariant = 0;
+        return buf;
+    };
+    const std::vector<F4> want = runRef(0);
+    const std::vector<F4> twin = runRef(1);
+    uint32_t twinLanes = 0;
+    for (uint32_t e = 0; e < totalElems; ++e)
+    {
+        const float* a = &want[e].x; const float* b = &twin[e].x;
+        for (int l = 0; l < 4; ++l) twinLanes += f2u(a[l]) != f2u(b[l]);
+    }
+    PXG_CHECK_MSG(twinLanes >= 64, "determinant-dot twin x+(y+z) changes only %u lanes -- the case does not observe the order", twinLanes);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bRefs = createBufferFrom(dev, refs);
+    PxgBufferHandle bBody = createBufferFrom(dev, init);
+    PxgBufferHandle bNode = createBufferFrom(dev, nodeIndex);
+    PxgBufferHandle bSim = createBufferFrom(dev, sim);
+    PxgBufferHandle bInertia = createBufferFrom(dev, inertia);
+
+    Kernel k("solverApplyGravityTGS.spv", "applyTGSSubstepGravity", { 4, 16, 4, 48, 48 }, sizeof(GravityParams));
+    GravityParams p = { numSlabs, allBodiesCount, bodyOffset, outOff, numThreadsPerBody, gx, gy, gz, stepDt };
+    k.dispatch((allBodiesCount + numBodiesPerWarp - 1) / numBodiesPerWarp, { bRefs, bBody, bNode, bSim, bInertia }, p);
+    dev->flush();
+
+    const auto got = downloadBuffer<F4>(dev, bBody, totalElems);
+    uint32_t mm = 0, eqTwin = 0;
+    for (uint32_t e = 0; e < totalElems; ++e)
+    {
+        const float* a = &got[e].x; const float* r = &want[e].x; const float* t = &twin[e].x;
+        for (int l = 0; l < 4; ++l)
+            if (f2u(a[l]) != f2u(r[l]))
+            {
+                if (mm == 0)
+                    std::printf("  first mismatch: elem %u lane %d got 0x%08x want 0x%08x\n", e, l, f2u(a[l]), f2u(r[l]));
+                ++mm;
+                eqTwin += f2u(a[l]) == f2u(t[l]);
+            }
+    }
+    PXG_CHECK_MSG(mm == 0, "applyTGSSubstepGravity p90 dot order: %u bitwise lane mismatches (%u equal the x+(y+z) twin; twin changes %u)",
+                  mm, eqTwin, twinLanes);
+
+    for (PxgBufferHandle h : { bRefs, bBody, bNode, bSim, bInertia }) dev->destroyBuffer(h);
+}
