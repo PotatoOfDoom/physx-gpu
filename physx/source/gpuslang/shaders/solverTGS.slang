@@ -1605,7 +1605,15 @@ void pxgAccumulateErrorLocal(inout PxgErrorAccumulatorSlang e, float deltaF, flo
     const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
     e.sumOfSquares += r * r;
     ++e.counter;
-    e.maxError = max(e.maxError, abs(r));
+    // P9.89: maxError = PxMax(maxError, PxAbs(e)) (gpucommon/src/CUDA/solverResidual.cuh:57) is
+    // selectMax(a, b) = a > b ? a : b (PxUnixMathIntrinsics.h:122), a serial select chain over the
+    // lane's rows: a NaN residual REPLACES the running maximum and the next row's |e| replaces the
+    // NaN (a trailing NaN leaves the lane NaN, which the warp fmaxf tree then drops).  GLSL max()
+    // (FMax = maxNum on llvmpipe) kept the old maximum across the NaN row.  The warp butterflies
+    // (MaxOpFloat = fmaxf, solverResidual.cuh:87) and the AtomicMax CAS stay max().
+    // solverTGS_residualMaxErrorNaN.
+    const float ar = abs(r);
+    e.maxError = (e.maxError > ar) ? e.maxError : ar;
 }
 
 // mirrors checkActiveContactBlockTGS() in solverBlockTGS.cuh — the read-only
@@ -2577,6 +2585,13 @@ void solveBlockUnified(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
     // npArtiSolvePartition.slang; the shared error tail keeps every barrier in
     // uniform control flow (the CUDA's per-lane early returns become guards
     // inside the module function, contributing zeros to the reduction).
+    // P9.89 (CUDA-UB deviation, not a proven SAME): the CUDA returns the lanes
+    // threadIndexInWarp >= batch.mDescStride (solverMultiBlockTGS.cu:806-807) BEFORE
+    // accumulateErrorGlobalFullWarp's FULL_MASK __shfl_xor_sync butterflies (:994-995,
+    // solverResidual.cuh:85-87), and a shuffle that reads an exited lane returns an
+    // undefined value, so the CUDA's warp sum/max for an arti batch with mDescStride < 32
+    // is undefined.  The port feeds the zero identity for those lanes (the only defined
+    // choice); tree order, radii, operand order and the lane-0 read otherwise match.
     if (groupId.y != 0)
     {
         float aErrSumSq;

@@ -40,6 +40,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -272,8 +273,15 @@ void refCompliantTGS(uint32_t flags, float nrdt, float unitResponse, float recip
     scaledBias = nrdt * x * oneIfAccelElseR;
 }
 
+// P9.89 twin of the pxgAccumulateErrorLocal fix: gTgsErrMaxVariant 1 = the port's old GLSL max()
+// (llvmpipe FMax = maxNum, NaN-ignoring), which keeps the running maximum across a NaN residual.
+int gTgsErrMaxVariant = 0;
+
 // PxgErrorAccumulator reference (solverResidual.cuh): per-thread contact
-// residual statistics, accumulated by solveWholeIslandTGS only.
+// residual statistics (solveWholeIslandTGS, solveBlockUnified, solveStaticBlockTGS).
+// maxError = PxMax(maxError, PxAbs(e)) (solverResidual.cuh:57) is selectMax(a, b) = a > b ? a : b
+// (PxUnixMathIntrinsics.h:122): a NaN residual replaces the running maximum and the next row's |e|
+// replaces the NaN.  (P9.89: this oracle was std::fmax, i.e. it mirrored the port, not the CUDA.)
 struct RefErrAcc
 {
     float sumSq = 0.f;
@@ -285,7 +293,8 @@ struct RefErrAcc
         const float r = velMultiplier == 0.f ? 0.f : deltaF / velMultiplier;
         sumSq += r * r;
         ++counter;
-        maxErr = std::fmax(maxErr, std::fabs(r));
+        const float a = std::fabs(r);
+        maxErr = (gTgsErrMaxVariant == 1) ? tgsCudaFmaxf(maxErr, a) : pxSelectMax(maxErr, a);
     }
 };
 
@@ -3455,6 +3464,754 @@ PXG_TEST(solverTGS_staticContactSolve)
     for (PxgDevicePtr pfree : { dVel, dBodyOut, dTx, dIsl, dCC, dJC, dCS, dJS, dBatch, dCh, dFh, dCp, dFr,
                                 dJh, dJr, dDesc, dShared })
         shim.memFree(pfree);
+}
+
+// ---------------------------------------------------------------------------
+// P9.89: the contact error accumulator's maxError chain on NaN residuals
+// ---------------------------------------------------------------------------
+// PxgErrorAccumulator::accumulateErrorLocal (solverResidual.cuh:57) does maxError =
+// PxMax(maxError, PxAbs(e)), and PxMax(float) is selectMax(a, b) = a > b ? a : b: over a lane's
+// serial row chain a NaN residual REPLACES the running maximum and the next row's |e| replaces the
+// NaN; a trailing NaN leaves the lane NaN, and accumulateErrorGlobalFullWarp's fmaxf butterfly
+// (solverResidual.cuh:87) drops that lane.  pxgAccumulateErrorLocal spelled it GLSL max() (FMax =
+// maxNum on llvmpipe), which kept the old maximum across the NaN row.  The three fixtures above
+// compare mMaxError within a tolerance, never with a NaN residual.
+//
+// Every directed row is built so its residual is EXACT on the GPU and in the mirror: targetVel =
+// -1e6 drives tempDeltaF far below -appliedForce, so deltaF = +0 - af = -af and e = -af / vm is one
+// division of bit-identical operands (reference counts 1 or 2 keep ref * resp exact).  A NaN
+// compliant coefficient (raXn_extraCoeff.w on a lane with restitutionXdt < 0) makes velMultiplier
+// NaN while fmaxf(NaN, -af) keeps deltaF = -af finite, so only that row's e is NaN.  Background
+// lanes (af in [1, 20)) mix empty, plain, compliant, NaN-first (select and FMax agree), NaN-mid and
+// NaN-last chains; one DOMINANT row (af in [5000, 6000)) per round decides the engine-visible
+// contactErrorAccumulator.mMaxError:
+//   round 0 (restart):  the dominant chain is [small, BIG, NaN, small] -> the CUDA lane restarts;
+//   round 1 (trailing): the dominant chain is [small, BIG, NaN]        -> the CUDA lane is NaN and
+//                       the warp's fmaxf drops it;
+//   round 2 (NaN warp): every chain of one warp ends on a NaN row, BIG inside -> the CUDA warp's
+//                       fmaxf is NaN and `maxErr > mMaxError` never fires.
+// mMaxError, mCounter and every appliedForce are compared BITWISE against the CUDA transcription
+// (select chain, fmaxf xor butterfly 16..1, AtomicMax); the FMax twin (gTgsErrMaxVariant = 1, the
+// old port) must give different mMaxError bits in every round.  Drivers: solveBlockUnified
+// (4 blocks x 2 warps), solveWholeIslandTGS (1 block x 8 warps), solveStaticBlockTGS (2 warps; a
+// body's chain runs through two static contact batches, so the restart crosses a batch boundary).
+
+enum MeKind : uint32_t
+{
+    kMeEmpty,     // numNormalConstr = 0: the lane keeps the zero accumulator
+    kMePlain,     // non-compliant rows
+    kMeCompliant, // compliant rows, all finite
+    kMeNanFirst,  // compliant, NaN on row 0 (select and FMax agree: a control)
+    kMeNanMid,    // compliant, NaN on a middle row (the select restarts after it)
+    kMeNanLast,   // compliant, NaN on the last row (the select leaves the lane NaN)
+};
+
+struct MeLaneSpec
+{
+    MeKind kind;
+    uint32_t nc; // numNormalConstr
+    int nanRow;  // row carrying the NaN compliant coefficient, -1 = none
+    int bigRow;  // row carrying the dominant appliedForce, -1 = none
+};
+
+const uint32_t ME_ROWS = 4; // contact rows per batch
+const float ME_ELAPSED = 0.005f;
+const float ME_MINPEN = -0.02f;
+const float ME_SUM0 = 0.5f;     // contactErrorAccumulator seed
+const float ME_MAX0 = 0.0625f;
+
+MeLaneSpec meBackground(std::mt19937& rng)
+{
+    MeLaneSpec s{ kMePlain, 1u + uint32_t(rng() % ME_ROWS), -1, -1 };
+    switch (rng() % 9u)
+    {
+    case 0: s.kind = kMeEmpty; s.nc = 0u; break;
+    case 1: case 2: break;
+    case 3: s.kind = kMeCompliant; break;
+    case 4: s.kind = kMeNanFirst; s.nc = 2u + uint32_t(rng() % 3u); s.nanRow = 0; break;
+    case 5: case 6:
+        s.kind = kMeNanMid;
+        s.nc = 3u + uint32_t(rng() % 2u);
+        s.nanRow = 1 + int(rng() % (s.nc - 2u));
+        break;
+    default: s.kind = kMeNanLast; s.nanRow = int(s.nc) - 1; break;
+    }
+    return s;
+}
+
+// 1 or 2 distinct bits: countActiveSlabs gives a reference count of 1 or 2, so ref * resp is exact.
+uint32_t meRefBits(std::mt19937& rng)
+{
+    const uint32_t a = uint32_t(rng() % 32u);
+    uint32_t e = 1u << a;
+    if (rng() & 1u)
+        e |= 1u << ((a + 1u + uint32_t(rng() % 31u)) % 32u);
+    return e;
+}
+
+struct MeData
+{
+    std::vector<BatchTGS> batches; // [0] = decoy, 1..n = contact batches (header k-1, rows (k-1)*4)
+    std::vector<TGSContactHeader> chs;
+    std::vector<TGSFrictionHeader> fhs; // all zero: no friction rows
+    std::vector<TGSContactPoint> cps;
+    std::vector<TGSFriction> frs;       // never indexed (no friction rows)
+
+    explicit MeData(uint32_t n) : batches(n + 1), chs(n), fhs(n), cps(n * ME_ROWS), frs(1)
+    {
+        std::memset(batches.data(), 0, batches.size() * sizeof(BatchTGS));
+        std::memset(chs.data(), 0, chs.size() * sizeof(TGSContactHeader));
+        std::memset(fhs.data(), 0, fhs.size() * sizeof(TGSFrictionHeader));
+        std::memset(cps.data(), 0, cps.size() * sizeof(TGSContactPoint));
+        std::memset(frs.data(), 0, frs.size() * sizeof(TGSFriction));
+        for (uint32_t k = 1; k <= n; ++k)
+        {
+            BatchTGS& b = batches[k];
+            b.descStride = 32;
+            b.constraintType = 1;              // eCONTACT
+            b.scalars[1] = k - 1;              // mConstraintBatchIndex
+            b.scalars[2] = (k - 1) * ME_ROWS;  // startConstraintIndex
+            b.scalars[3] = 0;                  // startFrictionIndex (no friction rows)
+            b.scalars[6] = 0xFFFFFFFFu;        // mask (static solve: idx = lane)
+        }
+    }
+};
+
+void meFillLane(MeData& d, uint32_t k, uint32_t lane, const MeLaneSpec& s, std::mt19937& rng)
+{
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+    TGSContactHeader& h = d.chs[k - 1];
+    h.invMass0_1_angDom0_1[lane] =
+        Float4{ 0.5f * unit(rng), 0.5f * unit(rng), 0.5f * unit(rng), 0.5f * unit(rng) };
+    const Vec3 n = randUnitV(rng);
+    h.normal_staticFriction[lane] = Float4{ n.x, n.y, n.z, unit(rng) };
+    h.maxPenBias[lane] = -0.5f;
+    h.flags[lane] = unit(rng) < 0.5f ? COMPLIANT_ACCEL_SPRING : 0u;
+    h.numNormalConstr[lane] = s.nc;
+    h.restitutionXdt[lane] = (s.kind >= kMeCompliant) ? -(0.1f + unit(rng)) : 0.f;
+    h.p8[lane] = 0.8f;
+
+    const uint32_t rs = (k - 1) * ME_ROWS;
+    for (uint32_t i = 0; i < ME_ROWS; ++i)
+    {
+        TGSContactPoint& c = d.cps[rs + i];
+        const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+        const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+        c.raXn_extraCoeff[lane] = Float4{ ra.x, ra.y, ra.z, 0.5f + 1.5f * unit(rng) }; // compliant a
+        c.rbXn_targetVelW[lane] = Float4{ rb.x, rb.y, rb.z, -1.0e6f };
+        c.separation[lane] = sym(rng) * 0.05f;
+        c.maxImpulse[lane] = 10.f + unit(rng) * 100.f;
+        c.appliedForce[lane] = 1.f + 19.f * unit(rng);
+        c.biasCoefficient[lane] = unit(rng) * 20.f;
+        c.resp0[lane] = 0.1f + unit(rng);
+        c.resp1[lane] = 0.1f + unit(rng);
+    }
+    if (s.nanRow >= 0)
+        d.cps[rs + uint32_t(s.nanRow)].raXn_extraCoeff[lane].w = std::numeric_limits<float>::quiet_NaN();
+    if (s.bigRow >= 0)
+        d.cps[rs + uint32_t(s.bigRow)].appliedForce[lane] = 5000.f + 1000.f * unit(rng);
+}
+
+// The per-lane specs of one round for nWarps full warps (thread = warp * 32 + lane).
+std::vector<MeLaneSpec> meRoundSpecs(uint32_t round, uint32_t nWarps, std::mt19937& rng, uint32_t& domThread)
+{
+    std::vector<MeLaneSpec> spec(nWarps * 32u);
+    for (MeLaneSpec& s : spec)
+        s = meBackground(rng);
+    domThread = uint32_t(rng() % (nWarps * 32u));
+    if (round == 0)
+        spec[domThread] = MeLaneSpec{ kMeNanMid, 4u, 2, 1 };  // [small, BIG, NaN, small]
+    else if (round == 1)
+        spec[domThread] = MeLaneSpec{ kMeNanLast, 3u, 2, 1 }; // [small, BIG, NaN]
+    else
+    {
+        const uint32_t w = domThread / 32u;
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            const uint32_t nc = 1u + uint32_t(rng() % ME_ROWS);
+            spec[w * 32u + l] = MeLaneSpec{ kMeNanLast, nc, int(nc) - 1, -1 };
+        }
+        spec[domThread] = MeLaneSpec{ kMeNanLast, 2u, 1, 0 }; // [BIG, NaN]
+    }
+    return spec;
+}
+
+// refSolveContactTGS on one lane of batch k (any body state: the directed rows do not depend on
+// it).  Returns the processed rows whose store is not +0, i.e. that missed the -af clamp.
+uint32_t meMirrorLane(MeData& d, uint32_t k, uint32_t lane, float ref0, float ref1, RefErrAcc& acc)
+{
+    BodyStateTGS s;
+    refSolveContactTGS(d.batches[k], s, lane, d.chs, d.fhs, d.cps, d.frs, ME_ELAPSED, ME_MINPEN, ref0, ref1,
+                       &acc);
+    uint32_t unclamped = 0;
+    const uint32_t rs = (k - 1) * ME_ROWS;
+    for (uint32_t i = 0; i < d.chs[k - 1].numNormalConstr[lane]; ++i)
+        if (tgsBits(d.cps[rs + i].appliedForce[lane]) != 0u)
+            ++unclamped;
+    return unclamped;
+}
+
+struct MeTail
+{
+    float sum;
+    uint32_t count;
+    float maxErr;
+    uint32_t nanWarps;
+};
+
+// accumulateErrorGlobalFullWarp (solverResidual.cuh:83-95) per warp: the warpReduction xor
+// butterfly, radius 16..1, input = op(input, shfl_xor(input)) with AddOpPxReal / AddOpPxU32 /
+// MaxOpFloat (fmaxf); lane 0 then atomicAdds and, if maxErr > mMaxError, AtomicMax (a CAS loop
+// while val > old: the result is the max over the warps, independent of their order).
+MeTail meCudaTail(const std::vector<RefErrAcc>& acc, uint32_t nWarps)
+{
+    MeTail t{ ME_SUM0, 0u, ME_MAX0, 0u };
+    for (uint32_t w = 0; w < nWarps; ++w)
+    {
+        float s[32], m[32];
+        uint32_t c[32];
+        for (uint32_t l = 0; l < 32; ++l)
+        {
+            s[l] = acc[w * 32 + l].sumSq;
+            m[l] = acc[w * 32 + l].maxErr;
+            c[l] = acc[w * 32 + l].counter;
+        }
+        for (uint32_t radius = 16; radius > 0; radius >>= 1)
+        {
+            float ns[32], nm[32];
+            uint32_t nc[32];
+            for (uint32_t l = 0; l < 32; ++l)
+            {
+                ns[l] = s[l] + s[l ^ radius];
+                nm[l] = tgsCudaFmaxf(m[l], m[l ^ radius]);
+                nc[l] = c[l] + c[l ^ radius];
+            }
+            std::memcpy(s, ns, sizeof(ns));
+            std::memcpy(m, nm, sizeof(nm));
+            std::memcpy(c, nc, sizeof(nc));
+        }
+        t.sum += s[0]; // atomicAdd: warp order nondeterministic (compared for NaN-ness only)
+        t.count += c[0];
+        if (std::isnan(m[0]))
+            ++t.nanWarps;
+        if (m[0] > t.maxErr)
+            t.maxErr = m[0];
+    }
+    return t;
+}
+
+size_t meCheckRound(const char* kernel, uint32_t round, const MeData& want, const std::vector<RefErrAcc>& cudaAcc,
+                    const std::vector<RefErrAcc>& twinAcc, uint32_t nWarps, uint32_t domThread, uint32_t unclamped,
+                    const physx::PxgSolverCoreDesc& gpuDesc, const std::vector<TGSContactPoint>& gpuCps)
+{
+    const MeTail cuda = meCudaTail(cudaAcc, nWarps);
+    const MeTail twin = meCudaTail(twinAcc, nWarps);
+
+    uint32_t restarted = 0, trailing = 0, other = 0, nanRows = 0;
+    for (size_t t = 0; t < cudaAcc.size(); ++t)
+    {
+        const float c = cudaAcc[t].maxErr, w = twinAcc[t].maxErr;
+        if (std::isnan(cudaAcc[t].sumSq))
+            ++nanRows;
+        if (tgsBits(c) == tgsBits(w))
+            continue;
+        if (std::isnan(c) && !std::isnan(w))
+            ++trailing;
+        else if (!std::isnan(c) && !std::isnan(w) && c < w)
+            ++restarted;
+        else
+            ++other;
+    }
+
+    size_t bad = 0;
+    for (size_t i = 0; i < want.cps.size(); ++i)
+        for (uint32_t l = 0; l < 32; ++l)
+            if (tgsBits(gpuCps[i].appliedForce[l]) != tgsBits(want.cps[i].appliedForce[l]))
+                ++bad;
+
+    const float dc = cudaAcc[domThread].maxErr, dt = twinAcc[domThread].maxErr;
+    bool domOk = false;
+    if (round == 0)
+        domOk = !std::isnan(dc) && dc < dt;
+    else if (round == 1)
+        domOk = std::isnan(dc) && !std::isnan(dt);
+    else
+        domOk = std::isnan(dc) && cuda.nanWarps >= 1u && twin.nanWarps == 0u;
+
+    const float gMax = gpuDesc.contactErrorAccumulator.mMaxError;
+    const float gSum = gpuDesc.contactErrorAccumulator.mErrorSumOfSquares;
+    std::printf("[ info ] %s round %u: %u threads with a NaN sum, twin lanes: %u trailing NaN, %u restarted,"
+                " %u other; mMaxError cuda %08x twin %08x gpu %08x; %u NaN warps\n",
+                kernel, round, nanRows, trailing, restarted, other, tgsBits(cuda.maxErr), tgsBits(twin.maxErr),
+                tgsBits(gMax), cuda.nanWarps);
+
+    PXG_CHECK_MSG(unclamped == 0u, "%s round %u: %u directed rows missed the -appliedForce clamp", kernel, round,
+                  unclamped);
+    PXG_CHECK_MSG(other == 0u && trailing >= 2u && restarted >= 2u && domOk,
+                  "%s round %u: the NaN-residual lanes lost their selectMax coverage (%u trailing, %u restarted,"
+                  " %u other, dominant %s)", kernel, round, trailing, restarted, other, domOk ? "ok" : "MISSED");
+    PXG_CHECK_MSG(tgsBits(twin.maxErr) != tgsBits(cuda.maxErr),
+                  "%s round %u: the FMax twin gives the CUDA's mMaxError %08x (round not observable)", kernel,
+                  round, tgsBits(cuda.maxErr));
+    PXG_CHECK_MSG(bad == 0u, "%s round %u: %zu appliedForce words differ", kernel, round, bad);
+    if (tgsBits(gMax) != tgsBits(cuda.maxErr))
+    {
+        ++bad;
+        PXG_CHECK_MSG(false, "%s round %u: mMaxError gpu %08x (%g) cuda %08x (%g)", kernel, round, tgsBits(gMax),
+                      double(gMax), tgsBits(cuda.maxErr), double(cuda.maxErr));
+    }
+    if (tgsBits(gMax) == tgsBits(twin.maxErr))
+        std::printf("MM %s round %u: the device reproduces the FMax twin (GLSL max() chain)\n", kernel, round);
+    if (gpuDesc.contactErrorAccumulator.mCounter != int32_t(cuda.count))
+    {
+        ++bad;
+        PXG_CHECK_MSG(false, "%s round %u: mCounter gpu %d cuda %u", kernel, round,
+                      gpuDesc.contactErrorAccumulator.mCounter, cuda.count);
+    }
+    if (std::isnan(gSum) != std::isnan(cuda.sum) ||
+        (!std::isnan(cuda.sum) && !almostEqual(gSum, cuda.sum, 2e-4f, 2e-4f)))
+    {
+        ++bad;
+        PXG_CHECK_MSG(false, "%s round %u: mErrorSumOfSquares gpu %g cuda %g", kernel, round, double(gSum),
+                      double(cuda.sum));
+    }
+    return bad;
+}
+
+struct MeDeviceBuffers
+{
+    physx::gpuslang::PxgCudaShim& shim;
+    std::vector<physx::gpuslang::PxgDevicePtr> bufs;
+    bool ok = true;
+
+    explicit MeDeviceBuffers(physx::gpuslang::PxgCudaShim& s) : shim(s) {}
+    ~MeDeviceBuffers()
+    {
+        for (physx::gpuslang::PxgDevicePtr p : bufs)
+            if (p)
+                shim.memFree(p);
+    }
+    physx::gpuslang::PxgDevicePtr up(const void* p, size_t n)
+    {
+        physx::gpuslang::PxgDevicePtr d = 0;
+        shim.memAlloc(&d, n);
+        if (!d)
+            ok = false;
+        else
+            shim.memcpyHtoD(d, p, n);
+        bufs.push_back(d);
+        return d;
+    }
+    template <typename T>
+    physx::gpuslang::PxgDevicePtr up(const std::vector<T>& v)
+    {
+        return up(v.data(), v.size() * sizeof(T));
+    }
+};
+
+// Uploads the batch / contact / (unused) joint buffers into the shared desc; returns the device
+// address of the contact points (read back for the appliedForce comparison).
+physx::gpuslang::PxgDevicePtr meSetShared(physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS>& shared,
+                                          MeDeviceBuffers& db, const MeData& d)
+{
+    std::vector<TGSJointHeader> jhs(1);
+    std::vector<TGSJointRowCon> jrows(1);
+    std::memset(jhs.data(), 0, sizeof(TGSJointHeader));
+    std::memset(jrows.data(), 0, sizeof(TGSJointRowCon));
+    const physx::gpuslang::PxgDevicePtr dCp = db.up(d.cps);
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(db.up(d.batches));
+    shared.iterativeData.blockContactHeaders = reinterpret_cast<physx::PxgTGSBlockSolverContactHeader*>(db.up(d.chs));
+    shared.iterativeData.blockFrictionHeaders = reinterpret_cast<physx::PxgTGSBlockSolverFrictionHeader*>(db.up(d.fhs));
+    shared.iterativeData.blockContactPoints = reinterpret_cast<physx::PxgTGSBlockSolverContactPoint*>(dCp);
+    shared.iterativeData.blockFrictions = reinterpret_cast<physx::PxgTGSBlockSolverContactFriction*>(db.up(d.frs));
+    shared.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DHeader*>(db.up(jhs));
+    shared.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DCon*>(db.up(jrows));
+    return dCp;
+}
+
+void meSeedAccumulator(physx::PxgSolverCoreDesc& desc)
+{
+    desc.contactErrorAccumulator.mErrorSumOfSquares = ME_SUM0;
+    desc.contactErrorAccumulator.mCounter = 0; // >= 0: residual accumulation ON
+    desc.contactErrorAccumulator.mMaxError = ME_MAX0;
+}
+
+// The CUDA mirror (and its FMax twin) for the drivers with one full contact batch per warp
+// (batch k = 1 + warp), whose reference counts come from countActiveSlabs over `encoded`.
+size_t meCheckWarpBatches(const char* kernel, uint32_t round, const MeData& d, uint32_t nWarps, uint32_t domThread,
+                          const std::vector<uint32_t>& encoded, uint32_t bodyOffset,
+                          const physx::PxgSolverCoreDesc& gpuDesc, const std::vector<TGSContactPoint>& gpuCps)
+{
+    auto refOf = [&](uint32_t body) {
+        return body >= bodyOffset ? float(std::max(1, __builtin_popcount(encoded[body]))) : 1.f;
+    };
+    uint32_t unclamped = 0;
+    auto mirror = [&](int variant, MeData& img, std::vector<RefErrAcc>& acc) {
+        gTgsErrMaxVariant = variant;
+        acc.assign(nWarps * 32u, RefErrAcc());
+        for (uint32_t k = 1; k <= nWarps; ++k)
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                const uint32_t u = meMirrorLane(img, k, lane, refOf(img.batches[k].bodyAIndex[lane]),
+                                                refOf(img.batches[k].bodyBIndex[lane]), acc[(k - 1) * 32 + lane]);
+                if (variant == 0)
+                    unclamped += u;
+            }
+        gTgsErrMaxVariant = 0;
+    };
+    MeData want = d, twinImg = d;
+    std::vector<RefErrAcc> cudaAcc, twinAcc;
+    mirror(0, want, cudaAcc);
+    mirror(1, twinImg, twinAcc);
+    return meCheckRound(kernel, round, want, cudaAcc, twinAcc, nWarps, domThread, unclamped, gpuDesc, gpuCps);
+}
+
+// solveBlockUnified: grid 4 x (32, 2) = 8 warps, one contact batch per warp (k = 1 + globalWarpIndex).
+size_t meRunUnified(uint32_t round, std::mt19937& rng)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgResult;
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t nBlocks = 4, nWarps = nBlocks * 2u, nBatches = nWarps;
+    const uint32_t bodyOffset = 8, numDynamicBodies = 200, numTotalBodies = bodyOffset + numDynamicBodies;
+
+    MeData d(nBatches);
+    uint32_t domThread = 0;
+    const std::vector<MeLaneSpec> spec = meRoundSpecs(round, nWarps, rng, domThread);
+    for (uint32_t k = 1; k <= nBatches; ++k)
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            BatchTGS& b = d.batches[k];
+            b.bodyAIndex[lane] = uint32_t(rng() % numTotalBodies);
+            b.bodyBIndex[lane] = uint32_t(rng() % numTotalBodies);
+            b.remappedBodyAIndex[lane] = k * 192 + lane;
+            b.remappedBodyBIndex[lane] = k * 192 + lane + 96;
+            meFillLane(d, k, lane, spec[(k - 1) * 32 + lane], rng);
+        }
+    std::vector<Float4> velPool((nBatches + 1) * 192);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+    std::vector<uint32_t> encoded(numTotalBodies);
+    for (uint32_t& e : encoded)
+        e = meRefBits(rng);
+    std::vector<SolverTxIData> txi(numTotalBodies);
+    std::memset(txi.data(), 0, txi.size() * sizeof(SolverTxIData));
+    std::vector<uint32_t> cpp = { 999u, 1u + nBatches };
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "solverTGS.spv", "solveBlockUnified", 48u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
+    MeDeviceBuffers db(shim);
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyStartIndex = 55u; // decoy
+    islands[0].mBodyCount = 7u;
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = numDynamicBodies;
+    islands[1].mStartPartitionIndex = 1;
+    islands[1].mNumPartitions = 1;
+    islands[1].mBatchStartIndex = 1;
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(db.up(islands, sizeof(islands)));
+    desc.constraintsPerPartition = reinterpret_cast<physx::PxU32*>(db.up(cpp));
+    desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(db.up(txi));
+    desc.numSlabs = 12;
+    meSeedAccumulator(desc);
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    const physx::gpuslang::PxgDevicePtr dVel = db.up(velPool);
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVel);
+    shared.iterativeData.solverEncodedReferenceCount = reinterpret_cast<physx::PxU32*>(db.up(encoded));
+    const physx::gpuslang::PxgDevicePtr dCp = meSetShared(shared, db, d);
+    const physx::gpuslang::PxgDevicePtr dDesc = db.up(&desc, sizeof(desc));
+    const physx::gpuslang::PxgDevicePtr dShared = db.up(&shared, sizeof(shared));
+    if (!db.ok)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return 0;
+    }
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint64_t>(dShared);
+    blob.add<uint32_t>(1u); // islandIndex
+    blob.add<uint32_t>(0u); // partitionIndex
+    blob.add<uint8_t>(1u);  // doFriction
+    blob.add<float>(ME_ELAPSED);
+    blob.add<float>(ME_MINPEN);
+    blob.add<uint64_t>(0u); // artiDesc
+    blob.finish();
+    PXG_CHECK_MSG(shim.launchKernel(0, nBlocks, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch solveBlockUnified");
+    shim.streamSynchronize();
+
+    physx::PxgSolverCoreDesc gpuDesc;
+    shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
+    std::vector<TGSContactPoint> gpuCps(d.cps.size());
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(TGSContactPoint));
+
+    return meCheckWarpBatches("solveBlockUnified", round, d, nWarps, domThread, encoded, bodyOffset, gpuDesc,
+                              gpuCps);
+}
+
+// solveWholeIslandTGS: one block of 8 warps, one partition of 8 contact batches (k = 1 + warpIndex);
+// every (body, slab) pair is unique inside the partition (pairId -> slab pairId % 4, bodies
+// 2 * (pairId / 4), +1), exactly like solverTGS_wholeIslandSolve.
+size_t meRunWholeIsland(uint32_t round, std::mt19937& rng)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgResult;
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t nWarps = 8, nBatches = 8, numSlabs = 4;
+    const uint32_t bodyOffset = 4, numDynamicBodies = 124, T = bodyOffset + numDynamicBodies; // 128 x 4 = 512 staged
+    const uint32_t deltaVOffset = 64;
+
+    MeData d(nBatches);
+    uint32_t domThread = 0;
+    const std::vector<MeLaneSpec> spec = meRoundSpecs(round, nWarps, rng, domThread);
+    for (uint32_t k = 1; k <= nBatches; ++k)
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            BatchTGS& b = d.batches[k];
+            const uint32_t pairId = (k - 1) * 32 + lane;
+            b.slabId[lane] = pairId % numSlabs;
+            b.bodyAIndex[lane] = 2 * (pairId / numSlabs);
+            b.bodyBIndex[lane] = 2 * (pairId / numSlabs) + 1;
+            meFillLane(d, k, lane, spec[(k - 1) * 32 + lane], rng);
+        }
+    std::vector<Float4> velPool(deltaVOffset + 3 * T);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+    std::vector<uint32_t> encoded(T);
+    for (uint32_t& e : encoded)
+        e = meRefBits(rng);
+    std::vector<uint32_t> references(numDynamicBodies * numSlabs, 0xFFFFFFFFu); // no averaged outputs
+    std::vector<SolverTxIData> txi(T);
+    std::memset(txi.data(), 0, txi.size() * sizeof(SolverTxIData));
+    std::vector<uint32_t> cpp = { 123u, 1u + nBatches };
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "solverTGS.spv", "solveWholeIslandTGS", 32u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
+    MeDeviceBuffers db(shim);
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyStartIndex = 88u; // decoy
+    islands[0].mBodyCount = 9u;
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = numDynamicBodies;
+    islands[1].mStartPartitionIndex = 1;
+    islands[1].mNumPartitions = 1;
+    islands[1].mBatchStartIndex = 1;
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(db.up(islands, sizeof(islands)));
+    desc.constraintsPerPartition = reinterpret_cast<physx::PxU32*>(db.up(cpp));
+    desc.solverBodyReferences = reinterpret_cast<physx::PxgSolverReferences*>(db.up(references));
+    desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(db.up(txi));
+    desc.numSlabs = numSlabs;
+    desc.numBatches = nBatches + 1;
+    desc.numArticBatches = 0;
+    desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+    meSeedAccumulator(desc);
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(db.up(velPool));
+    shared.iterativeData.solverEncodedReferenceCount = reinterpret_cast<physx::PxU32*>(db.up(encoded));
+    const physx::gpuslang::PxgDevicePtr dCp = meSetShared(shared, db, d);
+    const physx::gpuslang::PxgDevicePtr dDesc = db.up(&desc, sizeof(desc));
+    const physx::gpuslang::PxgDevicePtr dShared = db.up(&shared, sizeof(shared));
+    if (!db.ok)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return 0;
+    }
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint64_t>(dShared);
+    blob.add<uint32_t>(1u); // islandIndex
+    blob.add<uint8_t>(0u);  // doFriction
+    blob.add<float>(ME_ELAPSED);
+    blob.add<float>(ME_MINPEN);
+    blob.finish();
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch solveWholeIslandTGS");
+    shim.streamSynchronize();
+
+    physx::PxgSolverCoreDesc gpuDesc;
+    shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
+    std::vector<TGSContactPoint> gpuCps(d.cps.size());
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(TGSContactPoint));
+
+    return meCheckWarpBatches("solveWholeIslandTGS", round, d, nWarps, domThread, encoded, bodyOffset, gpuDesc,
+                              gpuCps);
+}
+
+// solveStaticBlockTGS: 64 dynamic bodies = one block of 2 warps, one static slab.  Body b (warp
+// b / 32, lane b % 32) solves static contact batch A = 1 + 2 * (b / 32) and, when its count is 2,
+// batch B = A + 1 (full masks: idx = lane), so its accumulator chain runs A's rows then B's.
+size_t meRunStatic(uint32_t round, std::mt19937& rng)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgResult;
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t numDynamicBodies = 64, bodyOffset = 2, T = numDynamicBodies + bodyOffset;
+    const uint32_t nWarps = 2, nBatches = 4, nbStaticSlabs = 1, maxStaticPartitions = 2, deltaVOffset = 16;
+
+    MeData d(nBatches);
+    std::vector<uint32_t> contactCounts(numDynamicBodies), jointCounts(numDynamicBodies, 0u);
+    std::vector<uint32_t> contactStarts(numDynamicBodies), jointStarts(numDynamicBodies, 0u);
+    std::vector<MeLaneSpec> specA(numDynamicBodies), specB(numDynamicBodies);
+    for (uint32_t b = 0; b < numDynamicBodies; ++b)
+    {
+        contactCounts[b] = 1u + uint32_t(rng() % 2u);
+        contactStarts[b] = 1u + 2u * (b / 32u);
+        specA[b] = meBackground(rng);
+        specB[b] = meBackground(rng);
+    }
+    const uint32_t dom = uint32_t(rng() % numDynamicBodies);
+    contactCounts[dom] = 2u;
+    if (round == 0) // [BIG, NaN | small...]: the restart crosses the batch boundary
+    {
+        specA[dom] = MeLaneSpec{ kMeNanLast, 2u, 1, 0 };
+        specB[dom] = MeLaneSpec{ kMePlain, 1u + uint32_t(rng() % ME_ROWS), -1, -1 };
+    }
+    else if (round == 1) // [small... | BIG, NaN]
+    {
+        specA[dom] = MeLaneSpec{ kMePlain, 1u + uint32_t(rng() % ME_ROWS), -1, -1 };
+        specB[dom] = MeLaneSpec{ kMeNanLast, 2u, 1, 0 };
+    }
+    else // every chain of the dominant warp ends on B's NaN row; [small, BIG | ..., NaN]
+    {
+        const uint32_t w = dom / 32u;
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            const uint32_t nc = 1u + uint32_t(rng() % ME_ROWS);
+            contactCounts[w * 32u + l] = 2u;
+            specB[w * 32u + l] = MeLaneSpec{ kMeNanLast, nc, int(nc) - 1, -1 };
+        }
+        specA[dom] = MeLaneSpec{ kMePlain, 2u, -1, 1 };
+    }
+    for (uint32_t b = 0; b < numDynamicBodies; ++b)
+    {
+        meFillLane(d, contactStarts[b], b % 32u, specA[b], rng);
+        meFillLane(d, contactStarts[b] + 1u, b % 32u, specB[b], rng);
+    }
+    std::vector<Float4> velPool(deltaVOffset + 3 * T);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+    std::vector<Float4> bodyOut(nbStaticSlabs * T * 2 + T, Float4{ 9.f, 9.f, 9.f, 9.f });
+    std::vector<SolverTxIData> txi(T);
+    std::memset(txi.data(), 0, txi.size() * sizeof(SolverTxIData));
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "solverTGS.spv", "solveStaticBlockTGS", 40u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
+    MeDeviceBuffers db(shim);
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyStartIndex = 77u; // decoy
+    islands[0].mBodyCount = 5u;
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = numDynamicBodies;
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(db.up(islands, sizeof(islands)));
+    desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(db.up(txi));
+    desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+    desc.mRigidStaticContactCounts = reinterpret_cast<physx::PxU32*>(db.up(contactCounts));
+    desc.mRigidStaticJointCounts = reinterpret_cast<physx::PxU32*>(db.up(jointCounts));
+    desc.mRigidStaticContactStartIndices = reinterpret_cast<physx::PxU32*>(db.up(contactStarts));
+    desc.mRigidStaticJointStartIndices = reinterpret_cast<physx::PxU32*>(db.up(jointStarts));
+    meSeedAccumulator(desc);
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(db.up(velPool));
+    shared.iterativeData.tempStaticBodyOutputs = reinterpret_cast<float4*>(db.up(bodyOut));
+    const physx::gpuslang::PxgDevicePtr dCp = meSetShared(shared, db, d);
+    const physx::gpuslang::PxgDevicePtr dDesc = db.up(&desc, sizeof(desc));
+    const physx::gpuslang::PxgDevicePtr dShared = db.up(&shared, sizeof(shared));
+    if (!db.ok)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return 0;
+    }
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint64_t>(dShared);
+    blob.add<uint32_t>(1u); // islandIndex
+    blob.add<uint32_t>(nbStaticSlabs);
+    blob.add<uint32_t>(maxStaticPartitions);
+    blob.add<float>(ME_ELAPSED);
+    blob.add<float>(ME_MINPEN);
+    blob.finish();
+    const uint32_t nbBlocks = ((numDynamicBodies + 63) / 64) * nbStaticSlabs;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch solveStaticBlockTGS");
+    shim.streamSynchronize();
+
+    physx::PxgSolverCoreDesc gpuDesc;
+    shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
+    std::vector<TGSContactPoint> gpuCps(d.cps.size());
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(TGSContactPoint));
+
+    uint32_t unclamped = 0;
+    auto mirror = [&](int variant, MeData& img, std::vector<RefErrAcc>& acc) {
+        gTgsErrMaxVariant = variant;
+        acc.assign(nWarps * 32u, RefErrAcc());
+        for (uint32_t b = 0; b < numDynamicBodies; ++b)
+            for (uint32_t i = 0; i < std::min(maxStaticPartitions, contactCounts[b]); ++i)
+            {
+                // static interactions solve with reference counts 1 (solverMultiBlockTGS.cu)
+                const uint32_t u = meMirrorLane(img, contactStarts[b] + i, b % 32u, 1.f, 1.f, acc[b]);
+                if (variant == 0)
+                    unclamped += u;
+            }
+        gTgsErrMaxVariant = 0;
+    };
+    MeData want = d, twinImg = d;
+    std::vector<RefErrAcc> cudaAcc, twinAcc;
+    mirror(0, want, cudaAcc);
+    mirror(1, twinImg, twinAcc);
+    return meCheckRound("solveStaticBlockTGS", round, want, cudaAcc, twinAcc, nWarps, dom, unclamped, gpuDesc,
+                        gpuCps);
+}
+
+PXG_TEST(solverTGS_residualMaxErrorNaN)
+{
+    std::mt19937 rng(8989);
+    size_t bad = 0;
+    for (uint32_t round = 0; round < 3; ++round)
+    {
+        bad += meRunUnified(round, rng);
+        bad += meRunWholeIsland(round, rng);
+        bad += meRunStatic(round, rng);
+    }
+    PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }
 
 // ---------------------------------------------------------------------------
