@@ -46,6 +46,36 @@ namespace
 
 using namespace pxgtest;
 
+// P9.90: every dot product of the reference goes through these.  The CUDA's
+// PxVec3::dot / magnitudeSquared (PxVec3.h:173/:274) is x*x' + y*y' + z*z' =
+// (x + y) + z, and PxQuat::magnitudeSquared / the float4 ::dot behind
+// PxAlignedQuat::getNormalized (PxQuat.h:200, AlignedQuat.h:163) is
+// ((x + y) + z) + w.  gIntDotOrder = 1 re-runs the reference in the order
+// llvmpipe gives an UNDECORATED OpDot, x + (y + z) and x + (y + (z + w)): the
+// twin the p90 fixture must differ from, so it can see a missing NoContraction
+// stamp on integration.spv.
+int gIntDotOrder = 0;
+
+float intDot(const Vec3& a, const Vec3& b)
+{
+    const float x = a.x * b.x, y = a.y * b.y, z = a.z * b.z;
+    return gIntDotOrder == 0 ? (x + y) + z : x + (y + z);
+}
+
+QuatV intQuatNormalized(const QuatV& q)
+{
+    const float x = q.x * q.x, y = q.y * q.y, z = q.z * q.z, w = q.w * q.w;
+    const float m = gIntDotOrder == 0 ? ((x + y) + z) + w : x + (y + (z + w));
+    const float s = 1.0f / std::sqrt(m);
+    return QuatV(q.x * s, q.y * s, q.z * s, q.w * s);
+}
+
+Vec3 intVecNormalized(const Vec3& v)
+{
+    const float m = intDot(v, v);
+    return m > 0.0f ? v * (1.0f / std::sqrt(m)) : Vec3(0.0f);
+}
+
 // ---------------------------------------------------------------------------
 // CPU reference: direct transcription of integration.cuh (PGS variant)
 // ---------------------------------------------------------------------------
@@ -89,8 +119,8 @@ void refUpdateWakeCounter(bool& freeze, Float4& solverBodyLinVel, Float4& solver
         if (invMass == 0.f)
             invMass = 1.f;
 
-        const float angular = sleepAngVelAcc.multiply(sleepAngVelAcc).dot(inertia) * invMass;
-        const float linear = sleepLinVelAcc.magnitudeSquared();
+        const float angular = intDot(sleepAngVelAcc.multiply(sleepAngVelAcc), inertia) * invMass;
+        const float linear = intDot(sleepLinVelAcc, sleepLinVelAcc);
         const float frameNormalizedEnergy = 0.5f * (angular + linear);
 
         const float cf = hasStaticTouch ? float(clusterFactor) : 0.f;
@@ -158,8 +188,8 @@ void refUpdateWakeCounter(bool& freeze, Float4& solverBodyLinVel, Float4& solver
 
             if (frameNormalizedEnergy >= sleepThreshold)
             {
-                const float sleepAngular = sleepAngVelAcc.multiply(sleepAngVelAcc).dot(inertia) * invMass;
-                const float sleepLinear = sleepLinVelAcc.magnitudeSquared();
+                const float sleepAngular = intDot(sleepAngVelAcc.multiply(sleepAngVelAcc), inertia) * invMass;
+                const float sleepLinear = intDot(sleepLinVelAcc, sleepLinVelAcc);
 
                 const float normalizedEnergy = 0.5f * (sleepAngular + sleepLinear);
                 const float sleepClusterFactor = clusterFactor + 1.f;
@@ -207,8 +237,8 @@ void refUpdateWakeCounter(bool& freeze, Float4& solverBodyLinVel, Float4& solver
             if (invMass == 0.f)
                 invMass = 1.f;
 
-            const float angular = sleepAngVelAcc.multiply(sleepAngVelAcc).dot(inertia) * invMass;
-            const float linear = sleepLinVelAcc.magnitudeSquared();
+            const float angular = intDot(sleepAngVelAcc.multiply(sleepAngVelAcc), inertia) * invMass;
+            const float linear = intDot(sleepLinVelAcc, sleepLinVelAcc);
             const float normalizedEnergy = 0.5f * (angular + linear);
 
             const float clusterFactor = float(1 + numCountedInteractions);
@@ -296,12 +326,12 @@ void refIntegrateCore(const Float4& motionLinVelXYZW, const Float4& motionAngVel
     const Vec3 linearMotionVel = initialLinVel + motionLinVel;
     Vec3 angularMotionVel = initialAngVel + sqrtInvInertia.transform(motionAngVel);
 
-    float w = angularMotionVel.magnitudeSquared();
+    float w = intDot(angularMotionVel, angularMotionVel);
     w = std::sqrt(w);
     const float maxW = 1e+7f;
     if (w > maxW)
     {
-        angularMotionVel = angularMotionVel.getNormalized() * maxW;
+        angularMotionVel = intVecNormalized(angularMotionVel) * maxW;
         w = maxW;
     }
 
@@ -330,7 +360,7 @@ void refIntegrateCore(const Float4& motionLinVelXYZW, const Float4& motionAngVel
 
             result = result + QuatV(body2World.q) * q;
 
-            body2World.q = result.getNormalized().toFloat4();
+            body2World.q = intQuatNormalized(result).toFloat4();
         }
     }
 }
@@ -367,12 +397,12 @@ void refIntegrateCoreTGS(const Float4& motionLinVelXYZW, const Float4& motionAng
     const Vec3 linearMotionVel = motionLinVel;
     Vec3 angularMotionVel = sqrtInvInertia.transform(motionAngVel);
 
-    float w = angularMotionVel.magnitudeSquared();
+    float w = intDot(angularMotionVel, angularMotionVel);
     w = std::sqrt(w);
     const float maxW = 1e+7f;
     if (w > maxW)
     {
-        angularMotionVel = angularMotionVel.getNormalized() * maxW;
+        angularMotionVel = intVecNormalized(angularMotionVel) * maxW;
         w = maxW;
     }
 
@@ -386,7 +416,7 @@ void refIntegrateCoreTGS(const Float4& motionLinVelXYZW, const Float4& motionAng
         body2World.p.x += deltaBody2World.p.x;
         body2World.p.y += deltaBody2World.p.y;
         body2World.p.z += deltaBody2World.p.z;
-        const QuatV q = (QuatV(deltaBody2World.q) * QuatV(body2World.q)).getNormalized();
+        const QuatV q = intQuatNormalized(QuatV(deltaBody2World.q) * QuatV(body2World.q));
         body2World.q = q.toFloat4();
     }
 }
@@ -395,6 +425,77 @@ void refIntegrateCoreTGS(const Float4& motionLinVelXYZW, const Float4& motionAng
 // test
 // ---------------------------------------------------------------------------
 
+// P9.90: the kernel's outputs, flattened to 32-bit words for a bitwise compare.
+struct IntOut
+{
+    std::vector<BodySim> bodySims;
+    std::vector<SolverBodySleepData> sleep;
+    std::vector<Float4> outVel;
+    std::vector<AlignedTransform> outPose;
+};
+
+// Every word the kernel writes for the processed bodies: the sleep data, both
+// output velocities, the output pose and the whole written-back PxgBodySim.
+// skipQ drops the PGS quaternion (outPose.q and bodySim.body2World.q): it goes
+// through __sincosf (integration.cuh:365), which no host libm reproduces bit for
+// bit, and is compared with the tolerance below instead.
+std::vector<uint32_t> intWords(const IntOut& o, const std::vector<SolverBodyData>& sd, uint32_t n, bool skipQ)
+{
+    std::vector<uint32_t> w;
+    auto put = [&](const void* p, size_t bytes) {
+        const uint32_t* u = static_cast<const uint32_t*>(p);
+        w.insert(w.end(), u, u + bytes / 4);
+    };
+    for (uint32_t a = 0; a < n; ++a)
+    {
+        put(&o.sleep[a], sizeof(SolverBodySleepData));
+        put(&o.outVel[a], sizeof(Float4));
+        put(&o.outVel[a + n], sizeof(Float4));
+        if (!skipQ)
+            put(&o.outPose[a].q, sizeof(Float4));
+        put(&o.outPose[a].p, sizeof(Float4));
+        const BodySim& b = o.bodySims[uint32_t(sd[a].islandNodeIndex & 0xFFFFFFFFu)];
+        const size_t qOff = offsetof(BodySim, body2World) + offsetof(AlignedTransform, q);
+        put(&b, qOff);
+        if (!skipQ)
+            put(&b.body2World.q, sizeof(Float4));
+        put(reinterpret_cast<const char*>(&b) + qOff + sizeof(Float4), sizeof(BodySim) - qOff - sizeof(Float4));
+    }
+    return w;
+}
+
+// Bitwise gpu == ref (the CUDA dot order, (x + y) + z), and the old-order twin
+// must differ from ref on enough words that a GPU build summing x + (y + z) --
+// integration.spv without its NoContraction stamp -- cannot pass.
+void intStrictCompare(const char* tag, const IntOut& gpu, const IntOut& ref, const IntOut& twin,
+                      const std::vector<SolverBodyData>& sd, uint32_t n, bool skipQ)
+{
+    const std::vector<uint32_t> g = intWords(gpu, sd, n, skipQ);
+    const std::vector<uint32_t> r = intWords(ref, sd, n, skipQ);
+    const std::vector<uint32_t> t = intWords(twin, sd, n, skipQ);
+    uint32_t miss = 0, missEqTwin = 0, twinDiff = 0, firstMiss = ~0u;
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        if (t[i] != r[i])
+            ++twinDiff;
+        if (g[i] != r[i])
+        {
+            if (firstMiss == ~0u)
+                firstMiss = uint32_t(i);
+            ++miss;
+            if (g[i] == t[i])
+                ++missEqTwin;
+        }
+    }
+    std::printf("  p90 %s: %zu words, twin differs on %u, gpu differs on %u (%u of them equal the twin)\n", tag,
+                r.size(), twinDiff, miss, missEqTwin);
+    PXG_CHECK_MSG(twinDiff >= 16u, "p90 %s: the x + (y + z) twin differs on only %u words -- the fixture "
+                  "no longer observes the dot order", tag, twinDiff);
+    PXG_CHECK_MSG(miss == 0u, "p90 %s: %u/%zu words differ from the CUDA-order reference (%u equal the "
+                  "x + (y + z) twin; first word %u) -- integration.spv lost its NoContraction stamp?",
+                  tag, miss, r.size(), missEqTwin, firstMiss);
+}
+
 QuatV randomQuat(std::mt19937& rng)
 {
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
@@ -402,7 +503,7 @@ QuatV randomQuat(std::mt19937& rng)
     return q.getNormalized();
 }
 
-void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization, bool sleepy)
+void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization, bool sleepy, bool strict = false)
 {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
@@ -416,7 +517,10 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
 
     // velocity scale: "sleepy" populations have tiny velocities so the
     // sleep/freeze branches fire; active populations integrate normally.
-    const float velScale = sleepy ? 0.001f : 1.f;
+    // P9.90 (strict): 0.05 puts the sleep energy near clusterFactor * sleepThreshold,
+    // so the wake counter is rewritten with factor = energy / threshold < 2 -- the
+    // path through which the dot order of the energy reaches an output.
+    const float velScale = sleepy ? (strict ? 0.05f : 0.001f) : 1.f;
 
     std::vector<uint32_t> nodePool(maxNodes);
     std::iota(nodePool.begin(), nodePool.end(), 0u);
@@ -601,10 +705,18 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
     shim.streamSynchronize();
 
     // ---- reference ----
-    std::vector<BodySim> refBodySims = bodySims;
-    std::vector<SolverBodySleepData> refSleep(nbBodies);
-    std::vector<Float4> refOutVel(2 * nbBodies);
-    std::vector<AlignedTransform> refOutPose(nbBodies);
+    // P9.90: runRef(1) is the old-dot-order twin (see gIntDotOrder)
+    auto runRef = [&](int dotOrder) {
+    gIntDotOrder = dotOrder;
+    IntOut out;
+    std::vector<BodySim>& refBodySims = out.bodySims;
+    std::vector<SolverBodySleepData>& refSleep = out.sleep;
+    std::vector<Float4>& refOutVel = out.outVel;
+    std::vector<AlignedTransform>& refOutPose = out.outPose;
+    refBodySims = bodySims;
+    refSleep.resize(nbBodies);
+    refOutVel.resize(2 * nbBodies);
+    refOutPose.resize(nbBodies);
     std::vector<Float4> refPrevVel(maxNodes * 2);
 
     for (uint32_t a = 0; a < nbBodies; ++a)
@@ -643,16 +755,32 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
         bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
         bodySim.body2World = body2World;
     }
+    gIntDotOrder = 0;
+    return out;
+    };
+    const IntOut ref = runRef(0);
+    const std::vector<BodySim>& refBodySims = ref.bodySims;
+    const std::vector<SolverBodySleepData>& refSleep = ref.sleep;
+    const std::vector<Float4>& refOutVel = ref.outVel;
+    const std::vector<AlignedTransform>& refOutPose = ref.outPose;
 
     // ---- compare ----
-    std::vector<SolverBodySleepData> gpuSleep(nbBodies);
-    std::vector<Float4> gpuOutVel(2 * nbBodies);
-    std::vector<AlignedTransform> gpuOutPose(nbBodies);
-    std::vector<BodySim> gpuBodySims(maxNodes);
+    IntOut gpu;
+    gpu.sleep.resize(nbBodies);
+    gpu.outVel.resize(2 * nbBodies);
+    gpu.outPose.resize(nbBodies);
+    gpu.bodySims.resize(maxNodes);
+    std::vector<SolverBodySleepData>& gpuSleep = gpu.sleep;
+    std::vector<Float4>& gpuOutVel = gpu.outVel;
+    std::vector<AlignedTransform>& gpuOutPose = gpu.outPose;
+    std::vector<BodySim>& gpuBodySims = gpu.bodySims;
     shim.memcpyDtoH(gpuSleep.data(), dSleep, nbBodies * sizeof(SolverBodySleepData));
     shim.memcpyDtoH(gpuOutVel.data(), dOutVel, 2 * nbBodies * sizeof(Float4));
     shim.memcpyDtoH(gpuOutPose.data(), dOutPose, nbBodies * sizeof(AlignedTransform));
     shim.memcpyDtoH(gpuBodySims.data(), dBodySim, maxNodes * sizeof(BodySim));
+
+    if (strict)
+        intStrictCompare("pgs", gpu, ref, runRef(1), solverData, nbBodies, true);
 
     // prev-velocity snapshot: bit-exact copy of the PRE-writeback body sim
     // velocities for every processed body's node (the CUDA null-pointer
@@ -731,7 +859,7 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
 // outBody2World pool, velocities are absolute in the (lin.xyz|ang.x),
 // (ang.yz|..) layout and the pose advances by the solver-accumulated delta
 // transform.
-void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilization, bool sleepy)
+void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilization, bool sleepy, bool strict = false)
 {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
@@ -742,7 +870,10 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
     const uint32_t maxNodes = nbBodies + 16;
     const uint32_t numIslands = 8;
     const uint32_t deltaVOffset = 32;
-    const float velScale = sleepy ? 0.001f : 1.f;
+    // P9.90 (strict): 0.05 puts the sleep energy near clusterFactor * sleepThreshold,
+    // so the wake counter is rewritten with factor = energy / threshold < 2 -- the
+    // path through which the dot order of the energy reaches an output.
+    const float velScale = sleepy ? (strict ? 0.05f : 0.001f) : 1.f;
 
     std::vector<uint32_t> nodePool(maxNodes);
     std::iota(nodePool.begin(), nodePool.end(), 0u);
@@ -937,10 +1068,18 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
     shim.streamSynchronize();
 
     // ---- reference ----
-    std::vector<BodySim> refBodySims = bodySims;
-    std::vector<SolverBodySleepData> refSleep(nbBodies);
-    std::vector<Float4> refOutVel(2 * nbBodies);
-    std::vector<AlignedTransform> refOutPose(nbBodies);
+    // P9.90: runRef(1) is the old-dot-order twin (see gIntDotOrder)
+    auto runRef = [&](int dotOrder) {
+    gIntDotOrder = dotOrder;
+    IntOut out;
+    std::vector<BodySim>& refBodySims = out.bodySims;
+    std::vector<SolverBodySleepData>& refSleep = out.sleep;
+    std::vector<Float4>& refOutVel = out.outVel;
+    std::vector<AlignedTransform>& refOutPose = out.outPose;
+    refBodySims = bodySims;
+    refSleep.resize(nbBodies);
+    refOutVel.resize(2 * nbBodies);
+    refOutPose.resize(nbBodies);
 
     for (uint32_t a = 0; a < nbBodies; ++a)
     {
@@ -978,16 +1117,32 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
         bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
         bodySim.body2World = body2World;
     }
+    gIntDotOrder = 0;
+    return out;
+    };
+    const IntOut ref = runRef(0);
+    const std::vector<BodySim>& refBodySims = ref.bodySims;
+    const std::vector<SolverBodySleepData>& refSleep = ref.sleep;
+    const std::vector<Float4>& refOutVel = ref.outVel;
+    const std::vector<AlignedTransform>& refOutPose = ref.outPose;
 
     // ---- compare ----
-    std::vector<SolverBodySleepData> gpuSleep(nbBodies);
-    std::vector<Float4> gpuOutVel(2 * nbBodies);
-    std::vector<AlignedTransform> gpuOutPose(nbBodies);
-    std::vector<BodySim> gpuBodySims(maxNodes);
+    IntOut gpu;
+    gpu.sleep.resize(nbBodies);
+    gpu.outVel.resize(2 * nbBodies);
+    gpu.outPose.resize(nbBodies);
+    gpu.bodySims.resize(maxNodes);
+    std::vector<SolverBodySleepData>& gpuSleep = gpu.sleep;
+    std::vector<Float4>& gpuOutVel = gpu.outVel;
+    std::vector<AlignedTransform>& gpuOutPose = gpu.outPose;
+    std::vector<BodySim>& gpuBodySims = gpu.bodySims;
     shim.memcpyDtoH(gpuSleep.data(), dSleep, nbBodies * sizeof(SolverBodySleepData));
     shim.memcpyDtoH(gpuOutVel.data(), dOutVel, 2 * nbBodies * sizeof(Float4));
     shim.memcpyDtoH(gpuOutPose.data(), dOutPose, nbBodies * sizeof(AlignedTransform));
     shim.memcpyDtoH(gpuBodySims.data(), dBodySim, maxNodes * sizeof(BodySim));
+
+    if (strict)
+        intStrictCompare("tgs", gpu, ref, runRef(1), solverData, nbBodies, false);
 
     // prev-velocity snapshot: bit-exact copy of the PRE-writeback body sim
     // velocities for every processed body's node (the CUDA null-pointer
@@ -1081,6 +1236,22 @@ PXG_TEST(integrationTGS_sleepyBodies)
 {
     checkIntegrationTGS(1000, 602, false, true);
     checkIntegrationTGS(1000, 603, true, true);
+}
+
+// P9.90: integration.spv carries the NoContraction stamp, so every OpDot sums in
+// the CUDA order: the sleep energies sleepAngVelAcc.multiply(..).dot(inertia) and
+// sleepLinVelAcc.magnitudeSquared() (integration.cuh:81-82/:164-165/:222-223),
+// which reach the wake counter through min(normalizedEnergy / threshold, 2), and
+// the 4-lane PxQuat/PxAlignedQuat magnitude of getNormalized (:375/:431), which is
+// the TGS output quaternion.  Sleepy populations (general orientations, non-round
+// values) keep factor below 2; the outputs are compared WORD FOR WORD.
+PXG_TEST(integration_p90DotOrder)
+{
+    checkIntegration(1000, 9001, false, true, true);
+    checkIntegration(1000, 9002, true, true, true);
+    checkIntegrationTGS(1000, 9003, false, true, true);
+    checkIntegrationTGS(1000, 9004, true, true, true);
+    checkIntegrationTGS(1000, 9005, false, false, true);
 }
 
 PXG_TEST(integrationTGS_partialBlock)

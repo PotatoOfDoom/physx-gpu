@@ -211,7 +211,18 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # solve math and no other kernel is compared against it; solverTGS was already
     # stamped.  testSolver solverPGS_p90DotOrder compares the solved velocities, applied
     # forces and residuals bitwise and fails without this entry.
-    solverPGS)
+    solverPGS
+    # P9.90: the rigid PGS/TGS integration.  The sleep energies
+    # sleepAngVelAcc.multiply(..).dot(inertia) + sleepLinVelAcc.magnitudeSquared()
+    # are PxVec3 dots, (x + y) + z (integration.cuh:81-82/:164-165/:222-223), and they
+    # reach the wake counter through min(energy / threshold, 2); getNormalized of the
+    # output quaternion is the 4-lane ((x + y) + z) + w (PxQuat.h:200,
+    # AlignedQuat.h:163; integration.cuh:375/:431).  Unstamped, llvmpipe summed them
+    # x + (y + z) and x + (y + (z + w)).  Its imports (pxgSlangCommon,
+    # pxgSlangSolverDesc) carry no math another kernel is compared against it with.
+    # testIntegration integration_p90DotOrder compares the outputs bitwise and fails
+    # without this entry.
+    integration)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
