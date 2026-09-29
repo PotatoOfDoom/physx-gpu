@@ -83,6 +83,16 @@ static_assert(sizeof(HMaterial) == 24, "HMaterial");
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// P9.90: every PxVec3 dot of the reference below goes through rdot.  gDotOld = false is the
+// CUDA's PxVec3::dot, x*x' + y*y' + z*z' = (x + y) + z (PxVec3.h:173); true is the old-order
+// twin x + (y + z), how llvmpipe (Mesa lower_fdot) sums an UNDECORATED OpDot.
+// sphereNphase_p90DotOrder requires the twin to change every observed word.
+static bool gDotOld = false;
+static float rdot(const Vec3& a, const Vec3& b)
+{
+    return gDotOld ? a.x * b.x + (a.y * b.y + a.z * b.z) : a.dot(b);
+}
+
 // ---------------------------------------------------------------------------
 // CPU reference : direct transcription of sphereCollision.cuh + the kernel
 // dispatch/flip in cudaSphere.cu.
@@ -98,12 +108,12 @@ struct RC
 static float distancePointSegmentSquared(Vec3 a, Vec3 b, Vec3 p, float& param)
 {
     const Vec3 ap = p - a, ab = b - a;
-    const float nom = ap.dot(ab), denom = ab.dot(ab);
+    const float nom = rdot(ap, ab), denom = rdot(ab, ab);
     const float tValue = clampf(nom / denom, 0.f, 1.f);
     const float t = denom > 0.f ? tValue : 0.f;
     const Vec3 v = ap - ab * t;
     param = t;
-    return v.dot(v);
+    return rdot(v, v);
 }
 
 // P9.86c coverage for sphereNphase_capsuleCapsuleZeroSign: how often a -0 reaches the two PxClamp
@@ -115,10 +125,10 @@ static void distanceSegmentSegmentSquared(Vec3 p1, Vec3 d1, Vec3 p2, Vec3 d2, fl
 {
     const float eps = 1e-6f;
     const Vec3 r = p1 - p2;
-    const float a = d1.dot(d1), e = d2.dot(d2), b = d1.dot(d2), c = d1.dot(r);
+    const float a = rdot(d1, d1), e = rdot(d2, d2), b = rdot(d1, d2), c = rdot(d1, r);
     const float aRecip = a > eps ? (1.f / a) : 0.f;
     const float eRecip = e > eps ? (1.f / e) : 0.f;
-    const float f = d2.dot(r);
+    const float f = rdot(d2, r);
     const float denom = a * e - b * b;
     const float temp = b * f - c * e;
     const float s0 = clampf(temp / denom, 0.f, 1.f);
@@ -137,9 +147,9 @@ static void pcmDistancePointSegmentTValue22(Vec3 a0, Vec3 b0, Vec3 a1, Vec3 b1,
                                             float& t0, float& t1, float& t2, float& t3)
 {
     const Vec3 ab0 = b0 - a0, ab1 = b1 - a1;
-    const float nom00 = (p0 - a0).dot(ab0), nom10 = (p1 - a0).dot(ab0);
-    const float nom01 = (p2 - a1).dot(ab1), nom11 = (p3 - a1).dot(ab1);
-    const float denom0 = ab0.dot(ab0), denom1 = ab1.dot(ab1);
+    const float nom00 = rdot((p0 - a0), ab0), nom10 = rdot((p1 - a0), ab0);
+    const float nom01 = rdot((p2 - a1), ab1), nom11 = rdot((p3 - a1), ab1);
+    const float denom0 = rdot(ab0, ab0), denom1 = rdot(ab1, ab1);
     const float eps = 1e-6f;
     t0 = (std::fabs(denom0) < eps) ? 0.f : (nom00 / denom0);
     t1 = (std::fabs(denom0) < eps) ? 0.f : (nom10 / denom0);
@@ -151,7 +161,7 @@ static RC refSphereSphere(TransformV t0, TransformV t1, float r0, float r1, floa
 {
     RC R;
     const Vec3 delta = t0.p - t1.p;
-    const float distanceSq = delta.dot(delta);
+    const float distanceSq = rdot(delta, delta);
     const float radiusSum = r0 + r1, inflatedSum = radiusSum + cd;
     if ((inflatedSum * inflatedSum) > distanceSq)
     {
@@ -187,7 +197,7 @@ static RC refSphereCapsule(TransformV t0, TransformV t1, float sphereR, float ca
     {
         const Vec3 p = s + (e - s) * t;
         const Vec3 dir = sphereCenter - p;
-        const float length = std::sqrt(dir.dot(dir));
+        const float length = std::sqrt(rdot(dir, dir));
         const Vec3 normal = length > PX_EPS_REAL ? dir * (1.f / length) : Vec3(1, 0, 0);
         R.pt[0] = sphereCenter - normal * sphereR;
         R.pen[0] = std::sqrt(squareDist) - radiusSum; R.normal = normal; R.nb = 1;
@@ -206,7 +216,7 @@ static RC refSphereBox(TransformV t0, TransformV t1, float sphereR, Vec3 boxExte
                 clampf(sphereCenter.y, nBox.y, boxExtents.y),
                 clampf(sphereCenter.z, nBox.z, boxExtents.z));
     const Vec3 v = sphereCenter - p;
-    const float lengthSq = v.dot(v);
+    const float lengthSq = rdot(v, v);
     if (sqInflatedSum > lengthSq)
     {
         const bool bInside = boxExtents.x >= std::fabs(sphereCenter.x) &&
@@ -269,11 +279,11 @@ static RC refCapsuleCapsule(TransformV t0, TransformV t1, float r0, float hh0, f
     const Vec3 s1 = p1 + tmp1, e1 = p1 - tmp1, d1 = e1 - s1;
     const float sumRadius = r0 + r1, inflatedSum = sumRadius + cd;
     const float inflatedSumSquared = inflatedSum * inflatedSum;
-    const float a = d0.dot(d0), e = d1.dot(d1), eps = 1e-6f;
+    const float a = rdot(d0, d0), e = rdot(d1, d1), eps = 1e-6f;
     float t0v, t1v; distanceSegmentSegmentSquared(s0, d0, s1, d1, t0v, t1v);
     const Vec3 closestA = s0 + d0 * t0v, closestB = s1 + d1 * t1v;
     const Vec3 vv = closestA - closestB;
-    const float sqDist0 = vv.dot(vv);
+    const float sqDist0 = rdot(vv, vv);
     int nb = 0; Vec3 outN;
     if (eps > sqDist0)
     {
@@ -285,15 +295,15 @@ static RC refCapsuleCapsule(TransformV t0, TransformV t1, float r0, float hh0, f
         const float parallelTolerance = 0.9998f;
         const Vec3 dir0 = (eps > a) ? Vec3(0) : d0 * (1.f / std::sqrt(a));
         const Vec3 dir1 = (eps > e) ? Vec3(0) : d1 * (1.f / std::sqrt(e));
-        const float cosv = std::fabs(dir0.dot(dir1));
+        const float cosv = std::fabs(rdot(dir0, dir1));
         if (cosv > parallelTolerance)
         {
             float tV0, tV1, tV2, tV3;
             pcmDistancePointSegmentTValue22(s0, e0, s1, e1, s1, e1, s0, e0, tV0, tV1, tV2, tV3);
-            if (tV0 >= 0.f && tV0 <= 1.f) { const Vec3 pr = s0 + d0 * tV0; const Vec3 v = pr - s1; const float d = std::sqrt(v.dot(v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (pr - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
-            if (tV1 >= 0.f && tV1 <= 1.f) { const Vec3 pr = s0 + d0 * tV1; const Vec3 v = pr - e1; const float d = std::sqrt(v.dot(v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (pr - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
-            if (nb < 2 && tV2 >= 0.f && tV2 <= 1.f) { const Vec3 pr = s1 + d1 * tV2; const Vec3 v = s0 - pr; const float d = std::sqrt(v.dot(v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (s0 - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
-            if (nb < 2 && tV3 >= 0.f && tV3 <= 1.f) { const Vec3 pr = s1 + d1 * tV3; const Vec3 v = e0 - pr; const float d = std::sqrt(v.dot(v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (e0 - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
+            if (tV0 >= 0.f && tV0 <= 1.f) { const Vec3 pr = s0 + d0 * tV0; const Vec3 v = pr - s1; const float d = std::sqrt(rdot(v, v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (pr - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
+            if (tV1 >= 0.f && tV1 <= 1.f) { const Vec3 pr = s0 + d0 * tV1; const Vec3 v = pr - e1; const float d = std::sqrt(rdot(v, v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (pr - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
+            if (nb < 2 && tV2 >= 0.f && tV2 <= 1.f) { const Vec3 pr = s1 + d1 * tV2; const Vec3 v = s0 - pr; const float d = std::sqrt(rdot(v, v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (s0 - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
+            if (nb < 2 && tV3 >= 0.f && tV3 <= 1.f) { const Vec3 pr = s1 + d1 * tV3; const Vec3 v = e0 - pr; const float d = std::sqrt(rdot(v, v)); const Vec3 n = v * (1.f / d); R.pt[nb] = (e0 - n * r0) + positionOffset; R.pen[nb] = d - sumRadius; outN = n; nb++; }
         }
         if (nb == 0)
         {
@@ -445,8 +455,12 @@ static HMaterial zeroSignMaterial(uint32_t k)
 // (nb > 0 and the output pointers in range) and the GPU's words 7-10, so a caller can tie its
 // coverage to the GPU output rather than to the host mirror alone.
 struct ComparedPatch { bool compared; uint32_t w[4]; };
+// gpuWords (optional, P9.90): per pair, the GPU's contact count, contact words (point, pen) and
+// patch normal words 4-6, for a caller that compares them bitwise.
+struct GpuContactWords { uint32_t nb; uint32_t c[2][4]; uint32_t n[3]; };
 static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label,
-                        bool strictZero = false, std::vector<ComparedPatch>* comparedWords = nullptr)
+                        bool strictZero = false, std::vector<ComparedPatch>* comparedWords = nullptr,
+                        std::vector<GpuContactWords>* gpuWords = nullptr)
 {
     using namespace physx::gpuslang;
     const uint32_t n = uint32_t(cfgs.size());
@@ -575,6 +589,7 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     const bool prevHadTouch = (oldStatus & 2u) != 0u;
     const bool prevKnown = (oldStatus & 3u) != 0u;
     if (comparedWords) comparedWords->assign(n, ComparedPatch{ false, { 0u, 0u, 0u, 0u } });
+    if (gpuWords) gpuWords->assign(n, GpuContactWords{});
 
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -615,6 +630,13 @@ static void checkSphere(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
         }
         const uint64_t cOff = cpAddr - dCStream;
         const uint64_t pOff = patchAddr - dPStream;
+        if (gpuWords)
+        {
+            GpuContactWords& g = (*gpuWords)[i];
+            g.nb = nb;
+            std::memcpy(g.c, &gCStream[cOff], nb * 16u);
+            std::memcpy(g.n, &gPStream[pOff + 16u], 12u);
+        }
 
         for (uint32_t k = 0; k < nb; ++k)
         {
@@ -936,6 +958,119 @@ PXG_TEST(sphereNphase_capsuleCapsuleZeroSign)
                       i, fbits(R.normal.z), cudaW6[i]);
     }
     checkSphere(cfgs, 0x00000000u, false, "capsZeroSign", true);
+}
+
+// P9.90: the dot order of the primitive routines, observed bitwise.  npSpherePrimitives spells
+// every PxVec3 dot of sphereCollision.cuh as a Slang dot(), and llvmpipe sums an undecorated
+// OpDot as x + (y + z) where the CUDA's PxVec3::dot is (x + y) + z; the NoContraction stamp on
+// npSphereNphase.spv (tests/CMakeLists.txt, PXG_NOCONTRACT_SHADERS) makes it forward.  The
+// fixtures above use axis-aligned or 45-degree configurations and a tolerance on the points, so
+// they pass either way.  Here: general orientations and non-round positions, each pair drawn
+// until the old-order twin changes its first penetration.  Sub-cases: sphere-sphere (distanceSq,
+// sphereCollision.cuh:45), sphere-capsule (distancePointSegmentSquared nom/denom/v.v, :96-102),
+// and capsule-capsule in the general single-contact branch (distanceSegmentSegmentSquared's five
+// dots and sqDist0, :668-686, distanceSegmentSegment.cuh), both shape orders.  Every penetration
+// is sqrt(dot) - radiusSum, correctly rounded IEEE on both sides, so it is compared BITWISE, and
+// so are the contact points and normals.  Built unstamped, all 36 penetrations differ and each
+// equals the old-order twin (measured, both device modes).
+static uint32_t gP90Rng = 0x9e3779b9u;
+static float p90Rand(float lo, float hi)
+{
+    gP90Rng = gP90Rng * 1664525u + 1013904223u;
+    return lo + (hi - lo) * float(gP90Rng >> 8) * (1.0f / 16777216.0f);
+}
+static QuatV p90Quat()
+{
+    return QuatV(p90Rand(-1, 1), p90Rand(-1, 1), p90Rand(-1, 1), p90Rand(0.2f, 1)).getNormalized();
+}
+static Vec3 p90Vec(float h) { return Vec3(p90Rand(-h, h), p90Rand(-h, h), p90Rand(-h, h)); }
+
+PXG_TEST(sphereNphase_p90DotOrder)
+{
+    std::vector<PairCfg> cfgs;
+    uint32_t kinds[3] = { 0, 0, 0 };
+    const uint32_t PER_KIND = 12u;
+    for (uint32_t attempt = 0; attempt < 20000u && (kinds[0] < PER_KIND || kinds[1] < PER_KIND || kinds[2] < PER_KIND); ++attempt)
+    {
+        const uint32_t kind = attempt % 3u;
+        if (kinds[kind] >= PER_KIND) continue;
+        PairCfg c;
+        const Vec3 base = p90Vec(3.0f);
+        const float cd = p90Rand(0.01f, 0.07f);
+        const uint32_t m0 = attempt & 7u, m1 = (attempt >> 3) & 7u;
+        if (kind == 0u)
+        {
+            const float r0 = p90Rand(0.3f, 0.9f), r1 = p90Rand(0.3f, 0.9f);
+            const Vec3 d = p90Vec(1.0f).getNormalized() * ((r0 + r1) * p90Rand(0.6f, 0.99f));
+            c = { GT_SPHERE, Vec3(r0, r0, r0), TransformV(p90Quat(), base + d),
+                  GT_SPHERE, Vec3(r1, r1, r1), TransformV(p90Quat(), base), cd, m0, m1 };
+        }
+        else if (kind == 1u)
+        {
+            const float r = p90Rand(0.3f, 0.8f), hh = p90Rand(0.4f, 1.3f), cr = p90Rand(0.2f, 0.5f);
+            const QuatV q = p90Quat();
+            const Vec3 axis = q.getBasisVector0();
+            const Vec3 off = p90Vec(1.0f);
+            const Vec3 perp = (off - axis * off.dot(axis)).getNormalized();
+            const Vec3 sc = base + axis * (hh * p90Rand(-0.8f, 0.8f)) + perp * ((r + cr) * p90Rand(0.6f, 0.99f));
+            const bool flipped = (attempt / 3u) & 1u;
+            const PairCfg sph = { GT_SPHERE, Vec3(r, r, r), TransformV(p90Quat(), sc),
+                                  GT_CAPSULE, Vec3(hh, cr, 0), TransformV(q, base), cd, m0, m1 };
+            c = flipped ? PairCfg{ sph.type1, sph.scale1, sph.xf1, sph.type0, sph.scale0, sph.xf0, cd, m0, m1 } : sph;
+        }
+        else
+        {
+            const float r0 = p90Rand(0.2f, 0.5f), r1 = p90Rand(0.2f, 0.5f);
+            const float h0 = p90Rand(0.4f, 1.2f), h1 = p90Rand(0.4f, 1.2f);
+            const QuatV q0 = p90Quat(), q1 = p90Quat();
+            const Vec3 n = q0.getBasisVector0().cross(q1.getBasisVector0());
+            if (n.magnitude() < 0.3f) continue;   // stay clear of the parallel branch
+            const Vec3 p1 = base + q1.getBasisVector0() * (h1 * p90Rand(-0.7f, 0.7f));
+            const Vec3 p0 = p1 - q0.getBasisVector0() * (h0 * p90Rand(-0.7f, 0.7f)) +
+                            n.getNormalized() * ((r0 + r1) * p90Rand(0.6f, 0.99f));
+            c = { GT_CAPSULE, Vec3(h0, r0, 0), TransformV(q0, p0), GT_CAPSULE, Vec3(h1, r1, 0), TransformV(q1, p1), cd, m0, m1 };
+        }
+        gDotOld = false; const RC R = refDispatch(c);
+        gDotOld = true;  const RC T = refDispatch(c);
+        gDotOld = false;
+        if (R.nb != 1 || T.nb != 1 || fbits(R.pen[0]) == fbits(T.pen[0])) continue;
+        cfgs.push_back(c);
+        ++kinds[kind];
+    }
+    PXG_CHECK_MSG(kinds[0] == PER_KIND && kinds[1] == PER_KIND && kinds[2] == PER_KIND,
+                  "p90DotOrder: drew %u/%u/%u order-sensitive pairs, need %u each", kinds[0], kinds[1], kinds[2], PER_KIND);
+
+    std::vector<GpuContactWords> gw;
+    checkSphere(cfgs, 0x00000000u, false, "p90DotOrder", false, nullptr, &gw);
+    if (gw.size() != cfgs.size()) return;   // no BDA
+
+    uint32_t penBad = 0, penOld = 0, laneBad = 0, twinSame = 0;
+    for (uint32_t i = 0; i < uint32_t(cfgs.size()); ++i)
+    {
+        gDotOld = false; const RC R = refDispatch(cfgs[i]);
+        gDotOld = true;  const RC T = refDispatch(cfgs[i]);
+        gDotOld = false;
+        if (fbits(T.pen[0]) == fbits(R.pen[0])) ++twinSame;
+        const GpuContactWords& g = gw[i];
+        if (g.nb != 1u) { ++penBad; continue; }
+        if (g.c[0][3] != fbits(R.pen[0]))
+        {
+            ++penBad;
+            if (g.c[0][3] == fbits(T.pen[0])) ++penOld;
+            if (penBad < 12) std::printf("  [p90DotOrder] pair %u pen gpu=%08x cuda=%08x oldOrder=%08x\n",
+                                         i, g.c[0][3], fbits(R.pen[0]), fbits(T.pen[0]));
+        }
+        const float rv[6] = { R.pt[0].x, R.pt[0].y, R.pt[0].z, R.normal.x, R.normal.y, R.normal.z };
+        const uint32_t gv[6] = { g.c[0][0], g.c[0][1], g.c[0][2], g.n[0], g.n[1], g.n[2] };
+        for (uint32_t l = 0; l < 6u; ++l) if (gv[l] != fbits(rv[l])) ++laneBad;
+    }
+    std::printf("  [p90DotOrder] %zu pairs: pen mismatches %u (%u carry the old-order value), point/normal lanes off %u\n",
+                cfgs.size(), penBad, penOld, laneBad);
+    PXG_CHECK_MSG(twinSame == 0u, "the old-order twin must change every penetration (%u unchanged)", twinSame);
+    PXG_CHECK_MSG(penBad == 0u, "p90DotOrder: %u penetrations differ bitwise from the CUDA order", penBad);
+    // The points and normals inherit the same dots (normal = delta / dist, v / |v|, the segment
+    // parameters); they are bitwise equal to the mirror too, so they are held to it.
+    PXG_CHECK_MSG(laneBad == 0u, "p90DotOrder: %u point/normal lanes differ bitwise from the CUDA order", laneBad);
 }
 
 PXG_TEST(sphereNphase_mutation)

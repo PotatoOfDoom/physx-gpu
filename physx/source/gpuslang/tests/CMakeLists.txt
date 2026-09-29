@@ -183,7 +183,17 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # pxgSlangPrepCommon like constraintPrepPGS (stamped above), so both now compile
     # the shared module the same way.  testConstraintPrep constraintPrepTGS_p90DotOrder
     # compares the rows bitwise and fails without this entry.
-    constraintPrepTGS)
+    constraintPrepTGS
+    # P9.90: the engine sphere/capsule/plane/box narrow phase.  Every distance it
+    # emits is a PxVec3 dot, (x + y) + z (PxVec3.h:173/:274): spheresphere's
+    # distanceSq, distancePointSegmentSquared's nom/denom/v.v, the capsule-capsule
+    # segment dots and sqDist (sphereCollision.cuh:45/:96-102/:668-686).  Unstamped,
+    # llvmpipe summed them x + (y + z).  The harness entries npSphereCollision /
+    # npCapsuleCollision compile the same npSpherePrimitives but are compared with a
+    # tolerance against their own references, never against this kernel.
+    # testSphereNphase sphereNphase_p90DotOrder compares the contact penetrations
+    # bitwise and fails without this entry.
+    npSphereNphase)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
