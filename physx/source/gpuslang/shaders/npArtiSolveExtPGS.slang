@@ -1069,6 +1069,17 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
     // PxgErrorAccumulator::accumulateErrorGlobalFullWarp: per-warp butterfly,
     // then lane 0 of each warp accumulates atomically (the solverPGS
     // solveBlockPartition arrangement; uniform control flow around barriers)
+    // P9.89: the sum is warpReduction<AddOpPxReal> (gpucommon/src/CUDA/
+    // solverResidual.cuh:85, reduction.cuh:188-199): __shfl_xor_sync at radius
+    // 16, 8, 4, 2, 1, op(own, partner) -- this loop, in that order.  The CUDA's
+    // lanes >= mDescStride `return`ed before it (solver.cu:100-101), so its
+    // FULL_MASK shuffle reads their registers, which PTX leaves undefined.  Here
+    // they carry error = {0, 0, 0}: +0 is the AddOpPxReal identity, and lane 0
+    // only ever reads an exited lane whose whole xor-subtree has exited (the
+    // exited lanes are the suffix descStride..31), so if the hardware hands back
+    // +0 the CUDA's lane 0 holds this tree bit for bit.  Pinned by
+    // testArtiSolvePartitionPgs (seven residual rounds; the radius-1..16 and
+    // linear-sum twins must differ).
     GroupMemoryBarrierWithGroupSync();
     shSvpErrSum[threadInBlock] = error.sumOfSquares;
     shSvpErrMax[threadInBlock] = error.maxError;
