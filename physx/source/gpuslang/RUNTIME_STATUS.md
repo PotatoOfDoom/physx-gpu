@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.90: all 19 unstamped float-computing engine shaders are NoContraction-stamped, 14 of them
+behind a directed bitwise fixture that fails on llvmpipe's undecorated OpDot order x+(y+z),
+5 for consistency only; llvmpipe does not contract written-out mul+add chains even unstamped.
+solverTGS `sep` is PxMax (selectMax, NaN kept).  run_scenes.sh --resume.  Scenes 56/56.
 P9.89: every CUDA float reduction/scan/fold (40 CUDA files, 35 port files) audited for association
 and select order: 49 divergences fixed and killed (solver residual maxError selectMax chains, SAT
 and bounds select folds, heightfield/cache bound operation order, PxQuat::rotate, penOffset leaf).
@@ -2062,6 +2066,59 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.90 — NoContraction-Stempel für jeden engine-Shader mit float-Arithmetik
+
+**Befund aus P9.89.** Ein undekoriertes `OpDot` summiert llvmpipe als `x + (y + z)`, ein
+NoContraction-gestempeltes als `(x + y) + z`. Die CUDA rechnet `PxVec3::dot` in dieser
+Vorwärtsreihenfolge, und auch der `-ffp-contract=off`-Host-Spiegel tut das. Er ist laut
+Projektregel die Referenz (siehe oben: das `-fmad=true`-Binär ist hier nicht reproduzierbar).
+
+Von 186 engine-erreichten `.spv` waren 72 ungestempelt, 19 davon rechnen mit floats. Die
+bestehenden Fixtures dieser Shader waren mit dem ungestempelten Stand grün geblieben:
+Toleranzvergleiche (1e-4, 2e-4), achsparallele Normalen oder ruhende Körper.
+
+**Alle 19 sind jetzt gestempelt.** Jeder Shader bekam eine gerichtete Fixture in allgemeiner
+Orientierung mit bitweisem Vergleich gegen den Spiegel, dazu einen Zwilling in der alten
+Reihenfolge als Abdeckungswächter.
+
+| Shader | beobachtet (ungestempelt, jede Abweichung = alte Reihenfolge) |
+|---|---|
+| constraintPrepPGS | 78/132 Normal-, 120/164 Reibungszeilen |
+| constraintPrepTGS | 84/147 Normal-, 147 Reibungszeilen |
+| npSphereNphase | alle 36 Penetrationen, 103 Punkt-/Normalenkomponenten |
+| boxBoxNphase | 258 Kontaktkomponenten in allen 40 Paaren |
+| solverPGS | 939 von 5264 Wörtern (Geschwindigkeiten, appliedForce, Residuen) |
+| integration | Schlaf-Energien (bis 1078 Wörter), Quaternionen-Norm `((x+y)+z)+w` |
+| npCvxStage2Setup (+ Dbg) | Ray-Polyeder, Witness-Wahl: 7 Wörter je Szene |
+| psContactSolveBda | 63 von 64 Kontakten |
+| npCvxPlaneNphase, skinning, preIntegration, npCvxStage1Refresh, npCvxFinishContacts, solverApplyGravityTGS | je eigene `_p90`-Fixture, ungestempelt rot |
+
+**Fünf nur der Einheitlichkeit halber gestempelt:** bodyUpdate, directApi, updateBounds,
+softBodyParticleAttachBda und thresholdStream.
+
+- Sie enthalten kein `OpDot`, nur links-nach-rechts ausgeschriebene Mul+Add-Ketten.
+- **Neue Messung:** llvmpipe kontrahiert solche Ketten auch ungestempelt nicht. Der Stempel
+  ändert dort nichts, und die neuen Fixtures laufen gestempelt wie ungestempelt grün.
+- Ein Shader-Mutant in alter Reihenfolge fällt dagegen durch. Die Fixtures sichern also die
+  Operationsreihenfolge, nicht den Stempel.
+
+**solverTGS `sep = max(minPen, …)`** (:309/:1693/:1800): jetzt `PxMax` = selectMax
+(solverBlockTGS.cuh:299/:605). Ein NaN in `separation` bleibt erhalten wie in der CUDA. FMax
+(maxNum) hatte es durch `minPen` ersetzt. Die Spiegel (bisher `std::fmax`) sind korrigiert,
+drei gerichtete NaN-Lanes schlugen auf dem alten Port fehl, 6/6 Reverts sind getötet.
+
+**Werkzeug.** `run_scenes.sh --resume <log>` übernimmt Szenen, die ein früheres Log als `ok`
+führt, und führt nur den Rest aus. Container-Neustarts hatten zwei volle Läufe von über einer
+Stunde abgebrochen.
+
+`tools/foldscan_reviewed.json` hat neun Verdikte dazubekommen: die drei thresholdStream-Stellen
+aus den P9.86f/P9.89-Spellings und sechs, die der Scanner erst seit den Änderungen von P9.89/P9.90
+meldet (die Zeilen selbst sind unverändert, seine flussinsensitive Null-Herkunft hat sich verschoben). Alle sind NOT-A-FOLD (Loads und berechnete Werte statt einer Literal-Null) oder schon
+durch einen Select abgesichert. `foldscan_all.py` meldet wieder 0 ungeprüfte Stellen und 0 offene
+MATTERS-FIX.
+
+**Suite:** 880/880 in beiden Speichermodi. **Szenen:** 56/56 (39 aus dem abgebrochenen Lauf per `--resume` übernommen, 17 neu gelaufen).
 
 ## P9.89 — Reihenfolge von float-Reduktionen, Faltungen und Punktprodukten gegen die CUDA
 

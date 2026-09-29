@@ -108,8 +108,23 @@ pass=0; fail=0; missing=0
 # which "ok" is an ok about the physics and which is an ok about the checks.
 if [ "${1:-}" = "--strict" ]; then export PXG_REQUIRE_MAPPED=1; shift; fi
 
+# P9.90: --resume <log> re-scores every scene that <log> (the output of an earlier
+# run) already lists as "ok" without running it again, and runs only the rest.  The
+# container this runs in restarts now and then, and a full run is over an hour, so a
+# run that dies at scene 40 must not cost the first 39 again.  A FAIL or MISSING in
+# <log> is re-run, never carried over, and the summary counts carried-over scenes as
+# ok the same way a fresh run would.  Only use a log produced from the same shaders.
+RESUME_LOG=""
+if [ "${1:-}" = "--resume" ]; then RESUME_LOG="${2:?--resume needs a log file}"; shift 2; fi
+carried=0
+
 run_one() {
     label="$1"; shift
+    if [ -n "$RESUME_LOG" ] && grep -qxF "ok       $label" "$RESUME_LOG"; then
+        echo "ok       $label   (carried over from $RESUME_LOG)"
+        pass=$((pass+1)); carried=$((carried+1))
+        return
+    fi
     out=$(env "$@" PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1)
     verdict=$(printf '%s\n' "$out" | grep -E '^\[ *(OK|FAIL) *\] gpu-sdk-step' | tail -1)
     unmapped=$(printf '%s\n' "$out" | grep -oE '\[pxg-unmapped\] [A-Za-z0-9_]+ was launched [0-9]+' \
@@ -154,6 +169,7 @@ run_one "softbody (convexcore floor)"  PXG_SCENE=softbody PXG_SB_FLOOR=convexcor
 run_one "softbody (heightfield floor)" PXG_SCENE=softbody PXG_SB_FLOOR=heightfield
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
+[ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
 
 if [ "${1:-}" = "--diagnostics" ]; then
     echo

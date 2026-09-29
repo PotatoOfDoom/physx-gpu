@@ -7889,5 +7889,87 @@
 ],
 "verdict": "MATTERS-FIX",
 "why": "Same as line 177."
+},
+{
+"file": "thresholdStream.slang",
+"code": "if (tid == WARPS_PER_BLOCK - 1) { gsBlockForce += ((fInc - f0) + f0); gsBlockPairs += pInc; }",
+"kinds": [
+"F2-zero-minus",
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "P9.86f spelling of accumulateThresholdStream.cu:258 sBlockAccumulator += (accumulatedForce + forceVal). Only lane 7 (active) executes it, where f0 and fInc are the loaded warp totals, not the 0.0f select arm of line 227. gsBlockForce is groupshared: its 0.0f seed (284, CUDA :191 sBlockAccumulator = 0) is re-read after a barrier, so neither slangc nor llvmpipe can forward the literal; the IEEE add of the shared seed is the CUDA's own add."
+},
+{
+"file": "thresholdStream.slang",
+"code": "inc[i] = inc[i] + inc[i - int(r)];",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "P9.86f replay of the warpScan<AddOpPxReal> Hillis-Steele tree (accumulateThresholdStream.cu:315, reduction.cuh:261-275). inc[] is loaded from gsBlockForceAccum (gAccumulatedForceBetweenBlocks), never a literal; the flow-insensitive scanner links it to the unrelated gsBlockForce = 0.0f store at 284. Same adds in the same association as the CUDA."
+},
+{
+"file": "thresholdStream.slang",
+"code": "gsBlockForceAccum[i] = inc[i] - gsBlockForceAccum[i];",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "The CUDA's warpScan(val) - val (accumulateThresholdStream.cu:315). The minuend inc[i] is a loaded/computed scan value, not a literal +0 (scanner origin 284 is the unrelated groupshared gsBlockForce seed)."
+},
+{
+"file": "npArtiSolveExtPGS.slang",
+"code": "const float tmp1 = appliedForce - (bias - targetVel) * velMultiplier;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "Both fsubs start from memory loads: appliedForce = frictionPoints[f].appliedForce, bias = raXn_bias.w (:458-483), never a literal +0. The scanner's var origin (:358) is the loop header's zero store, unrelated. Same op as solverBlock.cuh:541."
+},
+{
+"file": "solverPGS.slang",
+"code": "const float tmp1 = appliedForce - (bias - targetVel) * velMultiplier;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "appliedForce and bias are loads of the friction row (solverBlock.cuh:541 does the same IEEE ops); the var origin (:450) is the loop header's zero store, unrelated."
+},
+{
+"file": "solverPGS.slang",
+"code": "const float deltaF = newAppliedForce - appliedForce;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "newAppliedForce is a select of computed values (clamped or unclamped totalImpulse), never a literal; the CUDA op is solverBlock.cuh:551."
+},
+{
+"file": "solverTGS.slang",
+"code": "const float normalVel = relVel1 + (v0 - v1);",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "relVel1 is a computed dot seeded before the loop and updated by `relVel1 += sumInvMass * deltaF` in a loop with runtime trip count; v0 - v1 is computed. The origins (:1781 loop header, :1889 the velMultiplier1 select arm) are unrelated. Same op as solverBlockTGS.cuh:297/:603."
+},
+{
+"file": "solverTGS.slang",
+"code": "relVel1 += sumInvMass * deltaF;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "relVel1 is a computed dot and a loop phi (runtime numNormalConstr), not a literal; the product is computed. solverBlockTGS.cuh:315 does the same add."
+},
+{
+"file": "softBodyMeshContactGenBda.slang",
+"code": "const float penSum = dot(wB - wA, nrm);",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "ALREADY-FIXED",
+"why": "The only consumer of penSum is the P9.89 select on the next line, pen = (penSum == 0) ? 0 : penSum, which gives the CUDA's `+ penOffset` (literal 0, softbodyPrimitives.cu:339/:888) zero-sign result for any penSum; wB/wA come from the GJK/EPA output, not a literal. Pinned by softBodySimMeshContactGen_p89PenOffset."
 }
 ]
