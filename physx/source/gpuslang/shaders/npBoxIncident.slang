@@ -38,7 +38,8 @@
 //     face-corner vertices transformed into box A's local space, plus the
 //     (group-uniform) incident-face normal.
 //   - calculateBounds4: a width-4 __shfl_xor_sync butterfly reduction computing
-//     the AABB of the 4 per-lane points; every lane ends holding the group AABB.
+//     the AABB of the 4 per-lane points; every lane ends holding the group AABB
+//     (bit for bit only up to the selectMin/selectMax tie and NaN rule, P9.89).
 //
 // These feed the box-box clipping core (calculateContacts / doBoxBoxGenerate-
 // Contacts), a later tranche.
@@ -64,8 +65,8 @@ RWStructuredBuffer<IncidentIn> gIncIn;      // binding 0  one per group of 4
 RWStructuredBuffer<float4>     gIncVerts;    // binding 1  one per lane (4 per group)
 RWStructuredBuffer<float4>     gIncNormal;   // binding 2  one per group
 RWStructuredBuffer<float4>     gPts;         // binding 3  bounds input (one per lane)
-RWStructuredBuffer<float4>     gBoundsMin;   // binding 4  one per lane (== group min)
-RWStructuredBuffer<float4>     gBoundsMax;   // binding 5  one per lane (== group max)
+RWStructuredBuffer<float4>     gBoundsMin;   // binding 4  one per lane (group min, per-lane +-0/NaN winner)
+RWStructuredBuffer<float4>     gBoundsMax;   // binding 5  one per lane (group max, per-lane +-0/NaN winner)
 
 groupshared float gsD[256];
 groupshared float gsAbsD[256];
@@ -152,7 +153,22 @@ void boxIncidentPolygon4(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
 // ---------------------------------------------------------------------------
 // calculateBounds4: mirrors cudaBox.cu calculateBounds4()
 // width-4 __shfl_xor_sync butterfly:  xor 1 (include), then xor 2 (min / max).
+//
+// P9.89: every combine of the butterfly (cudaBox.cu L199-220: bounds.include(val)
+// at L208, bounds.minimum.minimum(...) at L210, bounds.maximum.maximum(...) at
+// L214) is PxVec3::minimum/maximum (PxBounds3.h L333-338, PxVec3.h L339/L355) =
+// componentwise PxMin/PxMax(float) = intrinsics::selectMin/selectMax (PxMath.h
+// L82-101, PxUnixMathIntrinsics.h L116-125): own < partner ? own : partner /
+// own > partner ? own : partner, the lane's OWN value first.  On a +-0 tie the
+// PARTNER survives, so the lanes of one group need not end with the same zero
+// sign; a NaN partner propagates and a NaN own value is replaced.  Slang
+// min()/max() (GLSL.std.450 FMin/FMax) run zero-ordered (-0 / +0 in either
+// order) and NaN-ignoring on the SZINP-stamped llvmpipe build (P9.86 F4), which
+// is not the CUDA's combine.  Transcribed per component as ternaries.
 // ---------------------------------------------------------------------------
+float bxSelMin(float own, float partner) { return (own < partner) ? own : partner; }  // selectMin
+float bxSelMax(float own, float partner) { return (own > partner) ? own : partner; }  // selectMax
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void boxCalculateBounds4(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
@@ -170,22 +186,25 @@ void boxCalculateBounds4(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
     GroupMemoryBarrierWithGroupSync();
     const float3 val = gsExch[lt ^ 1u];
     GroupMemoryBarrierWithGroupSync();
-    bmin = min(bmin, val);
-    bmax = max(bmax, val);
+    // P9.89: bounds.include(val) (cudaBox.cu L208) = selectMin/selectMax(own, partner)
+    bmin = float3(bxSelMin(bmin.x, val.x), bxSelMin(bmin.y, val.y), bxSelMin(bmin.z, val.z));
+    bmax = float3(bxSelMax(bmax.x, val.x), bxSelMax(bmax.y, val.y), bxSelMax(bmax.z, val.z));
 
     // __shfl_xor_sync(..., 2, 4) on the running minimum.
     gsExch[lt] = bmin;
     GroupMemoryBarrierWithGroupSync();
     const float3 omin = gsExch[lt ^ 2u];
     GroupMemoryBarrierWithGroupSync();
-    bmin = min(bmin, omin);
+    // P9.89: bounds.minimum.minimum(partner) (cudaBox.cu L210-212) = selectMin(own, partner)
+    bmin = float3(bxSelMin(bmin.x, omin.x), bxSelMin(bmin.y, omin.y), bxSelMin(bmin.z, omin.z));
 
     // __shfl_xor_sync(..., 2, 4) on the running maximum.
     gsExch[lt] = bmax;
     GroupMemoryBarrierWithGroupSync();
     const float3 omax = gsExch[lt ^ 2u];
     GroupMemoryBarrierWithGroupSync();
-    bmax = max(bmax, omax);
+    // P9.89: bounds.maximum.maximum(partner) (cudaBox.cu L214-216) = selectMax(own, partner)
+    bmax = float3(bxSelMax(bmax.x, omax.x), bxSelMax(bmax.y, omax.y), bxSelMax(bmax.z, omax.z));
 
     if (t < numLanes)
     {
