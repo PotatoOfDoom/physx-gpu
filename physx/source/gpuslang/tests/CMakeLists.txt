@@ -1190,7 +1190,10 @@ pxg_compile_shader(femClothDifferentClothBda cloth_differentClothCollisionVTLaun
 # the blob and the PxgFEMCloth descriptor through Ptr<> and lowers the warp ballot / minIndex to
 # groupshared collectives, so it is deliberately absent from PXG_HLSL_ENTRIES.  IS in
 # PXG_NOCONTRACT_SHADERS: every plane product and SAT projection is a mul-feeding-add chain.
-pxg_compile_shader(femClothMeshMidphaseBda cloth_meshMidphaseGeneratePairsLaunch)
+# P9.89: cloth_meshMidphaseSatProbe, a test-only entry that reads the triangle-triangle SAT's
+# selectMin/selectMax folds out bit for bit (femClothSimMeshMidphase_p89SatProbe).
+pxg_compile_shader(femClothMeshMidphaseBda cloth_meshMidphaseGeneratePairsLaunch
+                   cloth_meshMidphaseSatProbe)
 # P8.17 step 2: the cloth-vs-COOKED-TRIANGLE-MESH contact generation, the consumer step 1's
 # midphase had none.  The clipping core is a LIFT of fcStaticTriCloth.slang's mode 0 — already
 # fixture-verified against a CPU transcription for the descriptor-set engine — with new BDA

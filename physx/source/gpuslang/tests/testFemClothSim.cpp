@@ -68,6 +68,8 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -8912,32 +8914,81 @@ static void makePlane(V3 p0, V3 p1, V3 p2, V3& n, float& d)
     n = (m > 0.0f) ? scl(c, 1.0f / std::sqrt(m)) : V3{ 0, 0, 0 };
     d = -dot(p0, n);
 }
-// minProject (triangletriangle.cuh:43): the `+ d` lands ONCE, after the min.
-static float minProjectTri(V3 n, float d, V3 v0, V3 v1, V3 v2)
+// P9.89: every fold in triangletriangle.cuh is PxMin/PxMax<float>, i.e. selectMin(a, b) =
+// a < b ? a : b and selectMax(a, b) = a > b ? a : b (PxMath.h:82-100,
+// PxUnixMathIntrinsics.h:116-125).  An equal compare returns b, so a +-0 tie keeps b's zero, and
+// a NaN in either operand fails the compare, so b is returned: a NaN b sticks, a NaN a is
+// dropped.  This mirror used std::fmin/std::fmax before, which is the OLD port's spelling
+// (GLSL.std.450 FMin/FMax: the non-NaN operand, -0/+0 on a zero tie), so it could not see the
+// difference.  `revert` replays the old spelling one site at a time (P89SatSite); 0 is the CUDA.
+static float selMin(float a, float b) { return a < b ? a : b; }
+static float selMax(float a, float b) { return a > b ? a : b; }
+static float oldFMin(float a, float b)
 {
-    return std::fmin(dot(n, v0), std::fmin(dot(n, v1), dot(n, v2))) + d;
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == 0.0f && b == 0.0f) return (std::signbit(a) || std::signbit(b)) ? -0.0f : 0.0f;
+    return a < b ? a : b;
 }
-static float testSeparatingAxis(V3 ax, V3 a0, V3 a1, V3 a2, V3 b0, V3 b1, V3 b2)
+static float oldFMax(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    if (a == 0.0f && b == 0.0f) return (std::signbit(a) && std::signbit(b)) ? -0.0f : 0.0f;
+    return a > b ? a : b;
+}
+enum P89SatSite : uint32_t
+{
+    SITE_MP_INNER = 1u << 0,    // minProject  PxMin(n.v1, n.v2)                 (:48-49)
+    SITE_MP_OUTER = 1u << 1,    // minProject  PxMin(n.v0, inner)                (:47)
+    SITE_MIN0_1 = 1u << 2,      // testSeparatingAxis i = 1: min0 = PxMin(proj0, min0)  (:64)
+    SITE_MAX0_1 = 1u << 3,      //                           max0 = PxMax(proj0, max0)  (:65)
+    SITE_MIN1_1 = 1u << 4,      //                           min1 = PxMin(proj1, min1)  (:66)
+    SITE_MAX1_1 = 1u << 5,      //                           max1 = PxMax(proj1, max1)  (:67)
+    SITE_MIN0_2 = 1u << 6,      // the same four at i = 2
+    SITE_MAX0_2 = 1u << 7,
+    SITE_MIN1_2 = 1u << 8,
+    SITE_MAX1_2 = 1u << 9,
+    SITE_TSA_RET = 1u << 10,    // PxMax(min1 - max0, min0 - max1)               (:70)
+    SITE_SAT_PLANE = 1u << 11,  // satIntersect sep = PxMax(sep, minProject(triangle1.triPlane, triangle0)) (:80)
+    SITE_SAT_CROSS = 1u << 12,  // satIntersect sep = PxMax(sep, tSep)           (:109)
+    SITE_COUNT = 13,
+    SITE_ALL = (1u << 13) - 1u
+};
+static float foldMin(uint32_t revert, uint32_t site, float a, float b) { return (revert & site) ? oldFMin(a, b) : selMin(a, b); }
+static float foldMax(uint32_t revert, uint32_t site, float a, float b) { return (revert & site) ? oldFMax(a, b) : selMax(a, b); }
+
+// minProject (triangletriangle.cuh:43): the `+ d` lands ONCE, after the min.
+static float minProjectTri(V3 n, float d, V3 v0, V3 v1, V3 v2, uint32_t revert = 0u)
+{
+    return foldMin(revert, SITE_MP_OUTER, dot(n, v0),
+                   foldMin(revert, SITE_MP_INNER, dot(n, v1), dot(n, v2))) + d;
+}
+// testSeparatingAxis (triangletriangle.cuh:56): the loop's i = 1, 2 unrolled, projection as a,
+// running value as b.
+static float testSeparatingAxis(V3 ax, V3 a0, V3 a1, V3 a2, V3 b0, V3 b1, V3 b2, uint32_t revert = 0u)
 {
     float min0, max0, min1, max1;
     min0 = max0 = dot(a0, ax);
     min1 = max1 = dot(b0, ax);
     const float pa1 = dot(a1, ax), pb1 = dot(b1, ax);
-    min0 = std::fmin(pa1, min0); max0 = std::fmax(pa1, max0);
-    min1 = std::fmin(pb1, min1); max1 = std::fmax(pb1, max1);
+    min0 = foldMin(revert, SITE_MIN0_1, pa1, min0); max0 = foldMax(revert, SITE_MAX0_1, pa1, max0);
+    min1 = foldMin(revert, SITE_MIN1_1, pb1, min1); max1 = foldMax(revert, SITE_MAX1_1, pb1, max1);
     const float pa2 = dot(a2, ax), pb2 = dot(b2, ax);
-    min0 = std::fmin(pa2, min0); max0 = std::fmax(pa2, max0);
-    min1 = std::fmin(pb2, min1); max1 = std::fmax(pb2, max1);
-    return std::fmax(min1 - max0, min0 - max1);
+    min0 = foldMin(revert, SITE_MIN0_2, pa2, min0); max0 = foldMax(revert, SITE_MAX0_2, pa2, max0);
+    min1 = foldMin(revert, SITE_MIN1_2, pb2, min1); max1 = foldMax(revert, SITE_MAX1_2, pb2, max1);
+    return foldMax(revert, SITE_TSA_RET, min1 - max0, min0 - max1);
 }
 // Gu::satIntersect<true>, early-outs included.  `crossRaised` reports whether the cross block
 // pushed sep above what the two plane terms alone gave — the fixture asserts it fires.
+// `nanCross` counts the cross axes whose testSeparatingAxis came out NaN.
 static float satIntersect(V3 a0, V3 a1, V3 a2, V3 nA, float dA,
-                          V3 b0, V3 b1, V3 b2, V3 nB, float dB, float tol, bool* crossRaised)
+                          V3 b0, V3 b1, V3 b2, V3 nB, float dB, float tol, bool* crossRaised,
+                          uint32_t revert = 0u, int* nanCross = nullptr)
 {
-    float sep = minProjectTri(nA, dA, b0, b1, b2);
+    float sep = minProjectTri(nA, dA, b0, b1, b2, revert);
     if (sep > tol) return sep;
-    sep = std::fmax(sep, minProjectTri(nB, dB, a0, a1, a2));
+    sep = foldMax(revert, SITE_SAT_PLANE, sep, minProjectTri(nB, dB, a0, a1, a2, revert));
     if (sep > tol) return sep;
     const float planeSep = sep;
     const V3 ax0[3] = { sub(a1, a0), sub(a2, a0), sub(a2, a1) };
@@ -8950,7 +9001,9 @@ static float satIntersect(V3 a0, V3 a1, V3 a2, V3 nA, float dA,
             if (m > 1e-5f)
             {
                 sa = scl(sa, 1.0f / std::sqrt(m));
-                sep = std::fmax(sep, testSeparatingAxis(sa, a0, a1, a2, b0, b1, b2));
+                const float tSep = testSeparatingAxis(sa, a0, a1, a2, b0, b1, b2, revert);
+                if (nanCross && std::isnan(tSep)) ++*nanCross;
+                sep = foldMax(revert, SITE_SAT_CROSS, sep, tSep);
                 if (sep > tol) { if (crossRaised && sep > planeSep) *crossRaised = true; return sep; }
             }
         }
@@ -9231,8 +9284,9 @@ PXG_TEST(femClothSimMeshMidphase)
                 V3 nB; float dB; p817mesh::makePlane(b0, b1, b2, nB, dB);
                 if (!(p817mesh::dot(nB, cen) + dB >= 0.0f)) continue;   // the front-face gate
                 bool raised = false;
+                // PxMin(mBestDistance, mContactDistance) (femClothClothMidPhase.cu:140): a select.
                 const float sep = p817mesh::satIntersect(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB,
-                                                         std::fmin(best[lane], contactDist), &raised);
+                                                         p817mesh::selMin(best[lane], contactDist), &raised);
                 if (raised && sep >= contactDist) crossFired = true;
                 if (sep < best[lane]) { best[lane] = sep; bestPrim[lane] = p; }
             }
@@ -9318,6 +9372,740 @@ PXG_TEST(femClothSimMeshMidphase)
     for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bStack.h, bPairNum.h })
         dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.89 -- femClothMeshMidphaseBda's triangle-triangle SAT folds are the CUDA's SELECTS.
+//
+// Every fold in triangletriangle.cuh is PxMin/PxMax<float>: minProject's
+// PxMin(n.v0, PxMin(n.v1, n.v2)) (:48), testSeparatingAxis's running
+// min0/max0/min1/max1 = PxMin/PxMax(proj, running) (:64-67) and its
+// PxMax(min1 - max0, min0 - max1) (:70), and satIntersect's
+// sep = PxMax(sep, minProject(...)) (:80) and sep = PxMax(sep, tSep) (:109).  PxMin/PxMax<float>
+// are selectMin/selectMax, a < b ? a : b and a > b ? a : b (PxMath.h:82-100,
+// PxUnixMathIntrinsics.h:116-125).  The port spelled all of them min()/max(), i.e.
+// GLSL.std.450 FMin/FMax, which llvmpipe evaluates as "the non-NaN operand" with -0/+0 on a
+// zero tie.
+//
+// Where the engine sees it: a NaN cross axis.  satIntersect normalizes each edge cross by
+// 1/sqrt(magSq); when one component of the cross OVERFLOWS (edge lengths whose product passes
+// FLT_MAX, ~2e19 each), magSq = inf, the scale is 0, inf * 0 = NaN, and every projection on
+// that axis is NaN.  selectMax(sep, NaN) = NaN WIPES the running separation, and
+// selectMax(NaN, t) = t lets the next finite axis reset it; FMax just skips the NaN.  So:
+//   * DROP  -- the last evaluated axis is NaN.  The CUDA returns NaN, `separation < bestDist`
+//              fails and the pair is never recorded; the old port kept the plane gap and
+//              emitted it;
+//   * RESET -- NaN axes in the middle, then one finite axis.  The CUDA forgets the plane gap
+//              and returns that last axis's (negative) separation, so the pair jumps to the
+//              FRONT of the warp's top-4; the old port kept the gap and ranked it fifth, i.e.
+//              dropped it;
+//   * CTRL  -- the same NaN axes in the middle, but the cloth is level, so the last finite
+//              axis is vertical and recomputes the plane gap: the reset changes nothing, and
+//              both spellings emit the same ordered list.
+// femClothSimMeshMidphase_p89NaNAxis drives those through the engine kernel.  The other fold
+// sites cannot change a pair set at all (a NaN projection needs a NaN axis, and then all six
+// projections are NaN on both spellings; the sign of a zero never reaches a comparison), so
+// femClothSimMeshMidphase_p89SatProbe reads every fold out bit for bit through the test-only
+// cloth_meshMidphaseSatProbe entry.
+// ===========================================================================
+namespace p89cmm
+{
+using p817mesh::V3;
+
+// PxQuat::rotate / rotateInv (PxQuat.h:310, :324) and shape2Vertex (cudaNpCommon.h:285), the
+// formulas the shader carries, so the vertex-space query triangle is the kernel's bit for bit.
+static V3 quatRotate(const float q[4], V3 v, bool inv)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    if (!inv)
+        return V3{ vx * w2 + (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2,
+                   vy * w2 + (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2,
+                   vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2 };
+    return V3{ vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2,
+               vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2,
+               vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2 };
+}
+
+struct Leaf { uint32_t start, count; };
+
+// One query warp of cloth_meshMidphaseGeneratePairsLaunch: the per-lane leaf walk and the
+// top-4 extraction.  Returns the emitted prims IN EMISSION ORDER (ascending bestDist, lowest
+// lane first on a tie).  Leaves are visited highest child first, as the LIFO stack pops them.
+static std::vector<uint32_t> queryPairs(V3 a0, V3 a1, V3 a2, const std::vector<Leaf>& leaves,
+                                        const std::vector<std::array<float, 3>>& leafMin,
+                                        const std::vector<std::array<float, 3>>& leafMax,
+                                        const std::vector<F4>& mv, const std::vector<TriIdx4>& mi,
+                                        float contactDist, uint32_t revert,
+                                        std::vector<float>* bestOut = nullptr)
+{
+    using namespace p817mesh;
+    // triBoundingBox (deformableCollision.cuh:40) + fattenFast(contactDist)
+    const float tMin[3] = { selMin(selMin(a0.x, a1.x), a2.x) - contactDist,
+                            selMin(selMin(a0.y, a1.y), a2.y) - contactDist,
+                            selMin(selMin(a0.z, a1.z), a2.z) - contactDist };
+    const float tMax[3] = { selMax(selMax(a0.x, a1.x), a2.x) + contactDist,
+                            selMax(selMax(a0.y, a1.y), a2.y) + contactDist,
+                            selMax(selMax(a0.z, a1.z), a2.z) + contactDist };
+    V3 nA; float dA; makePlane(a0, a1, a2, nA, dA);
+    const float third = 1.0f / 3.0f;
+    const V3 cen{ (a0.x + a1.x + a2.x) * third, (a0.y + a1.y + a2.y) * third, (a0.z + a1.z + a2.z) * third };
+
+    std::vector<float> best(32, 3.4028235e38f);
+    std::vector<uint32_t> bestPrim(32, 0xFFFFFFFFu);
+    for (size_t c = leaves.size(); c-- > 0;)
+    {
+        bool overlap = true;
+        for (int k = 0; k < 3; ++k)
+            if (leafMin[c][k] > tMax[k] || tMin[k] > leafMax[c][k]) overlap = false;
+        if (!overlap) continue;
+        for (uint32_t lane = 0; lane < leaves[c].count && lane < 32u; ++lane)
+        {
+            const uint32_t p = leaves[c].start + lane;
+            const V3 b0{ mv[mi[p].x].x, mv[mi[p].x].y, mv[mi[p].x].z };
+            const V3 b1{ mv[mi[p].y].x, mv[mi[p].y].y, mv[mi[p].y].z };
+            const V3 b2{ mv[mi[p].z].x, mv[mi[p].z].y, mv[mi[p].z].z };
+            V3 nB; float dB; makePlane(b0, b1, b2, nB, dB);
+            if (!(dot(nB, cen) + dB >= 0.0f)) continue;   // the front-face gate (:138)
+            const float sep = satIntersect(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB,
+                                           selMin(best[lane], contactDist), nullptr, revert);
+            if (sep < best[lane]) { best[lane] = sep; bestPrim[lane] = p; }
+        }
+    }
+    if (bestOut) *bestOut = best;
+    uint32_t count = 0;
+    for (uint32_t l = 0; l < 32u; ++l) if (best[l] < contactDist) ++count;
+    if (count > 4u) count = 4u;
+    std::vector<uint32_t> out;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint32_t w = 0; float b = 3.4028235e38f;
+        for (uint32_t l = 0; l < 32u; ++l) if (best[l] < b) { b = best[l]; w = l; }
+        if (best[w] < contactDist) out.push_back(bestPrim[w]);
+        best[w] = 3.4028235e38f;
+    }
+    return out;
+}
+} // namespace p89cmm
+
+PXG_TEST(femClothSimMeshMidphase_p89NaNAxis)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p89cmm;
+    using p817mesh::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    uint64_t rs = 0x9a5c0de5ull;
+    auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
+
+    // The trimesh sits at the identity with unit scale, so vertex space is world space (the
+    // transform is still run, in the kernel's own formulas, by the reference).  Cases are
+    // stacked in y, 4 apart; every leaf box is tight in y, so each query overlaps only its own
+    // leaf.  A 90-degree turn about y, (x, z) -> (z, -x), is exact and keeps every winding, so
+    // each case comes in four orientations.
+    enum Kind { DROP = 0, RESET = 1, CTRL = 2 };
+    const int NDROP = 8, NRESET = 8, NCTRL = 4, NC = NDROP + NRESET + NCTRL;
+    const float CD_CLOTH = 0.05f, CD_MESH = 0.15f;
+    const float contactDist = CD_CLOTH + CD_MESH;
+
+    std::vector<F4> mv;
+    std::vector<TriIdx4> mi;
+    std::vector<Leaf> leaves;
+    std::vector<int> kind;
+    std::vector<std::array<V3, 3>> query;
+    auto turn = [](V3 v, int r) {
+        for (int i = 0; i < r; ++i) v = V3{ v.z, v.y, -v.x };
+        return v;
+    };
+    auto pushTri = [&](V3 p0, V3 p1, V3 p2) {
+        const uint32_t b = uint32_t(mv.size());
+        mv.push_back(F4{ p0.x, p0.y, p0.z, 0 }); mv.push_back(F4{ p1.x, p1.y, p1.z, 0 });
+        mv.push_back(F4{ p2.x, p2.y, p2.z, 0 });
+        mi.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    };
+    // prim 0: a dummy in no leaf, so no primStartIndex is zero.
+    pushTri(V3{ 1000.0f, -500.0f, 0 }, V3{ 1000.0f, -500.0f, 1.0f }, V3{ 1001.0f, -500.0f, 0 });
+
+    for (int c = 0; c < NC; ++c)
+    {
+        const int k = c < NDROP ? DROP : c < NDROP + NRESET ? RESET : CTRL;
+        const int r = c & 3;
+        const float Y = 4.0f * float(c);
+        // X * L > FLT_MAX, so a cloth edge along X crossed with a mesh edge along L overflows.
+        // s * X and m * L stay below 1.8e19, so both triangles' own plane normals are finite.
+        const float X = 1.9e19f + 1.0e19f * u(), L = 1.9e19f + 1.0e19f * u();
+        const float s = 0.25f + 0.25f * u(), m = 0.25f + 0.35f * u();
+        const float xb = 0.02f + 0.28f * u(), zb = 0.02f + 0.28f * u();
+        Leaf lf{ uint32_t(mi.size()), 0u };
+        std::array<V3, 3> q;
+        if (k == DROP)
+        {
+            // Horizontal pair, gap g.  Cloth edge a2 - a1 = (X, 0, -s) x mesh edge
+            // b2 - b1 = (m, 0, -L) is the LAST axis, (2, 2), and it overflows.  (0, 1), (0, 2)
+            // and (2, 1) are finite and vertical and give the gap.
+            const float g = 0.04f + 0.13f * u();
+            q = { turn(V3{ 0, Y + g, 0 }, r), turn(V3{ 0, Y + g, s }, r), turn(V3{ X, Y + g, 0 }, r) };
+            pushTri(turn(V3{ xb, Y, zb }, r), turn(V3{ xb, Y, zb + L }, r), turn(V3{ xb + m, Y, zb }, r));
+            lf.count = 1u;
+        }
+        else
+        {
+            // The cloth's long edge a1 - a0 = (X, 0, 0) runs along x; the mesh P is long in z.
+            // Axes (0, 0), (0, 1), (2, 0), (2, 1) overflow, (0, 2) is parallel and skipped,
+            // and the LAST axis, (2, 2) = (a2 - a1) x (m, 0, 0), is finite: the cloth normal.
+            //   RESET: the cloth is tilted by h, and P runs off in -z, under the far side of
+            //          the cloth's plane, so along the cloth normal it is NEGATIVELY separated.
+            //          The CUDA's sep ends there; the old port kept the plane gap g;
+            //   CTRL:  the cloth is level (h = 0) and P runs off in +z, so the last axis is
+            //          vertical and recomputes the gap: both spellings agree.
+            // P shares its leaf with small level slabs under the cloth's low edge, gaps
+            // 0.02 .. 0.13, all closer than g: four for RESET (so the top-4 cap binds), two
+            // for CTRL.
+            const float g = 0.15f + 0.03f * u();
+            const float h = (k == RESET) ? 0.04f + 0.26f * u() : 0.0f;
+            q = { turn(V3{ 0, Y + g, 0 }, r), turn(V3{ X, Y + g, 0 }, r), turn(V3{ 0, Y + g + h, s }, r) };
+            const uint32_t nSlab = (k == RESET) ? 4u : 2u;
+            const uint32_t pLane = uint32_t(c) % 5u % (nSlab + 1u);
+            uint32_t slab = 0;
+            for (uint32_t lane = 0; lane < nSlab + 1u; ++lane)
+            {
+                if (lane == pLane)
+                {
+                    if (k == RESET)
+                        pushTri(turn(V3{ xb, Y, zb }, r), turn(V3{ xb + m, Y, zb - L }, r), turn(V3{ xb, Y, zb - L }, r));
+                    else
+                        pushTri(turn(V3{ xb, Y, zb }, r), turn(V3{ xb, Y, zb + L }, r), turn(V3{ xb + m, Y, zb + L }, r));
+                }
+                else
+                {
+                    const float qd = 0.02f + 0.028f * float(slab++) + 0.01f * u();
+                    const float yq = Y + g - qd;
+                    pushTri(turn(V3{ 0.1f, yq, 0.05f }, r), turn(V3{ 0.1f, yq, 0.35f }, r), turn(V3{ 0.4f, yq, 0.05f }, r));
+                }
+            }
+            lf.count = nSlab + 1u;
+        }
+        leaves.push_back(lf);
+        kind.push_back(k);
+        query.push_back(q);
+    }
+    const uint32_t NPRIM = uint32_t(mi.size()), NVERT = uint32_t(mv.size());
+
+    // Leaf boxes: exactly the bounds of their primitives.
+    std::vector<std::array<float, 3>> lmin(NC), lmax(NC);
+    for (int c = 0; c < NC; ++c)
+    {
+        lmin[c] = { 3.4e38f, 3.4e38f, 3.4e38f };
+        lmax[c] = { -3.4e38f, -3.4e38f, -3.4e38f };
+        for (uint32_t p = leaves[c].start; p < leaves[c].start + leaves[c].count; ++p)
+            for (uint32_t v : { mi[p].x, mi[p].y, mi[p].z })
+            {
+                const float cc[3] = { mv[v].x, mv[v].y, mv[v].z };
+                for (int a = 0; a < 3; ++a)
+                {
+                    lmin[c][a] = std::min(lmin[c][a], cc[a]);
+                    lmax[c][a] = std::max(lmax[c][a], cc[a]);
+                }
+            }
+    }
+
+    // ---- reference: CUDA selects, and the old FMin/FMax twin ------------------------------
+    const float triQ[4] = { 0, 0, 0, 1 }, scaleRot[4] = { 0, 0, 0, 1 };
+    auto toVertex = [&](V3 w) {
+        V3 t = quatRotate(triQ, w, true);                         // world -> mesh local (triP = 0)
+        t = quatRotate(scaleRot, t, false);                       // shape2Vertex, scale (1,1,1)
+        t = V3{ t.x / 1.0f, t.y / 1.0f, t.z / 1.0f };
+        return quatRotate(scaleRot, t, true);
+    };
+    std::vector<std::vector<uint32_t>> ref(NC), twin(NC), twinCross(NC);
+    uint32_t nDropNaN = 0, nResetFront = 0, nCtrlSame = 0, nTwinDiff = 0, nCrossDiff = 0;
+    for (int c = 0; c < NC; ++c)
+    {
+        const V3 a0 = toVertex(query[c][0]), a1 = toVertex(query[c][1]), a2 = toVertex(query[c][2]);
+        std::vector<float> best;
+        ref[c] = queryPairs(a0, a1, a2, leaves, lmin, lmax, mv, mi, contactDist, 0u, &best);
+        twin[c] = queryPairs(a0, a1, a2, leaves, lmin, lmax, mv, mi, contactDist, p817mesh::SITE_ALL);
+        twinCross[c] = queryPairs(a0, a1, a2, leaves, lmin, lmax, mv, mi, contactDist, p817mesh::SITE_SAT_CROSS);
+        if (ref[c] != twin[c]) ++nTwinDiff;
+        if (ref[c] != twinCross[c]) ++nCrossDiff;
+        const uint32_t P = (kind[c] == DROP) ? leaves[c].start
+                                            : leaves[c].start + uint32_t(c) % 5u % leaves[c].count;
+        if (kind[c] == DROP && ref[c].empty() && twin[c] == std::vector<uint32_t>{ P })
+            ++nDropNaN;
+        if (kind[c] == RESET && ref[c].size() == 4u && ref[c][0] == P && best[P - leaves[c].start] < 0.0f &&
+            twin[c].size() == 4u && std::find(twin[c].begin(), twin[c].end(), P) == twin[c].end())
+            ++nResetFront;
+        if (kind[c] == CTRL && ref[c] == twin[c] && ref[c].size() == 3u && ref[c][2] == P)
+            ++nCtrlSame;
+    }
+    PXG_CHECK_MSG(nDropNaN == uint32_t(NDROP),
+                  "p89 NaN axis: only %u of %d DROP cases have the CUDA rejecting the pair (NaN last "
+                  "axis) while the old FMax twin emits it", nDropNaN, NDROP);
+    PXG_CHECK_MSG(nResetFront == uint32_t(NRESET),
+                  "p89 NaN axis: only %u of %d RESET cases put the NaN-reset pair FIRST in the CUDA "
+                  "list and leave it out of the old twin's", nResetFront, NRESET);
+    PXG_CHECK_MSG(nCtrlSame == uint32_t(NCTRL),
+                  "p89 NaN axis: only %u of %d CTRL cases emit the same three pairs, the NaN-axis "
+                  "pair last, on both spellings", nCtrlSame, NCTRL);
+    PXG_CHECK_MSG(nTwinDiff == uint32_t(NDROP + NRESET) && nCrossDiff == uint32_t(NDROP + NRESET),
+                  "p89 NaN axis: the old twin differs on %u cases and the sep = PxMax(sep, tSep) "
+                  "revert alone on %u; both should be the %d DROP + RESET cases",
+                  nTwinDiff, nCrossDiff, NDROP + NRESET);
+
+    // ---- the cooked blob: header + ONE BV32 node with NC leaf children --------------------
+    std::vector<uint32_t> blob(4u + 292u, 0u);
+    {
+        const uint32_t n = 4u;
+        for (int c = 0; c < NC; ++c)
+        {
+            for (int a = 0; a < 3; ++a)
+            {
+                blob[n + c * 4u + a] = f2u(lmin[c][a]);
+                blob[n + 128u + c * 4u + a] = f2u(lmax[c][a]);
+            }
+            blob[n + 256u + c] = 1u | (leaves[c].count << 1) | (leaves[c].start << 7);
+        }
+        blob[n + 288] = uint32_t(NC);   // mNbNodes
+        blob[n + 289] = 1u;             // mDepth
+    }
+    const size_t vBase = blob.size();
+    blob.resize(vBase + NVERT * 4u, 0u);
+    std::memcpy(blob.data() + vBase, mv.data(), NVERT * sizeof(F4));
+    const size_t iBase = blob.size();
+    blob.resize(iBase + NPRIM * 4u, 0u);
+    std::memcpy(blob.data() + iBase, mi.data(), NPRIM * sizeof(TriIdx4));
+    blob[0] = NVERT; blob[1] = NPRIM; blob[2] = 1u; blob[3] = 1u;
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<F4> cv;
+    std::vector<TriIdx4> ci;
+    for (int c = 0; c < NC; ++c)
+    {
+        const uint32_t b = uint32_t(cv.size());
+        for (int i = 0; i < 3; ++i) cv.push_back(F4{ query[c][i].x, query[c][i].y, query[c][i].z, 1.0f });
+        ci.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    }
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+    PxgFEMCloth cl = makeZeroDesc();
+    cl.mPosition_InvMass = reinterpret_cast<decltype(cl.mPosition_InvMass)>(size_t(bCv.addr));
+    cl.mTriangleVertexIndices = reinterpret_cast<decltype(cl.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cl.mNbTriangles = uint32_t(NC);
+    cl.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr = { cl };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H; shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = 1.0f; shapes[0].sy = 1.0f; shapes[0].sz = 1.0f; shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = 0u;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, 1u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f; xf[8 + 3] = 1.0f;   // both identity
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { CD_CLOTH, CD_MESH };
+    DevBuf bCd = makeDev(dev, cd);
+    const uint32_t CAP = 256u;
+    DevBuf bStack = makeDev(dev, std::vector<uint32_t>(CAP * 4u, 0xFFFFFFFFu));
+    DevBuf bPairNum = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+    p817mesh::ClothMeshMidPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    Kernel k("femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch",
+             {}, sizeof(p817mesh::ClothMeshMidPush));
+    k.dispatch(1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // Each query's pairs occupy one contiguous block (one atomicAdd), written in emission
+    // order, so the per-query sequence in stack order IS the kernel's ranking.
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+    std::vector<std::vector<uint32_t>> got(NC);
+    uint32_t badCm = 0, badTri = 0;
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        if (gStack[i * 4u + 0u] != 0u) ++badCm;
+        const uint32_t t = gStack[i * 4u + 1u];
+        if (t >= uint32_t(NC)) { ++badTri; continue; }
+        got[t].push_back(gStack[i * 4u + 2u]);
+    }
+    size_t refTotal = 0;
+    for (auto& r : ref) refTotal += r.size();
+    PXG_CHECK_MSG(badCm == 0u && badTri == 0u, "p89 NaN axis: %u pairs with a bad cmIdx, %u with a bad cloth triangle",
+                  badCm, badTri);
+    PXG_CHECK_MSG(gNum == uint32_t(refTotal), "p89 NaN axis: emitted %u pairs, the CUDA reference %zu", gNum, refTotal);
+    uint32_t bad[3] = { 0, 0, 0 }, asTwin = 0;
+    for (int c = 0; c < NC; ++c)
+    {
+        if (got[c] == ref[c]) continue;
+        ++bad[kind[c]];
+        if (got[c] == twin[c]) ++asTwin;
+        if (bad[0] + bad[1] + bad[2] <= 4)
+        {
+            std::printf("    p89 NaN axis case %d (kind %d): gpu [", c, kind[c]);
+            for (uint32_t p : got[c]) std::printf(" %u", p);
+            std::printf(" ] cuda [");
+            for (uint32_t p : ref[c]) std::printf(" %u", p);
+            std::printf(" ] old twin [");
+            for (uint32_t p : twin[c]) std::printf(" %u", p);
+            std::printf(" ]\n");
+        }
+    }
+    std::printf("    [p89 NaN axis] %d queries (%d drop, %d reset, %d ctrl), %zu CUDA pairs\n",
+                NC, NDROP, NRESET, NCTRL, refTotal);
+    PXG_CHECK_MSG(bad[0] + bad[1] + bad[2] == 0u,
+                  "p89 NaN axis: %u DROP, %u RESET and %u CTRL queries emit a different ordered pair "
+                  "list than the CUDA's selectMax folds (%u of them the old FMax twin's)",
+                  bad[0], bad[1], bad[2], asTwin);
+
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.89 -- every fold of the SAT, bit for bit, through cloth_meshMidphaseSatProbe.
+//
+// Each record carries two triangles, two explicit planes and an explicit axis (with the SAT
+// tolerance in axis.w); the probe returns
+//   x = minProjectTri(planeA, b0, b1, b2)
+//   y = testSeparatingAxis(axis, a0, a1, a2, b0, b1, b2)
+//   z = satIntersectTriTri(explicit planes)
+//   w = satIntersectTriTri(makePlane(a), makePlane(b)), the engine kernel's composition.
+// The battery:
+//   * PATTERN records, for the eleven minProject / testSeparatingAxis folds.  On an
+//     axis-aligned axis sgn * e_k a vertex's projection is ((x*ax + y*ay) + z*az), so each
+//     projection can be planted exactly: -0 (all three products -0), +0, a non-round value,
+//     +-inf, or NaN (an inf in a zeroed component: inf * 0).  For every fold a sampler draws
+//     projection patterns until it has four whose single-site revert (that ONE fold spelled
+//     FMin/FMax) changes the output -- four with signed-zero ties only, four with a
+//     non-finite operand;
+//   * PLANE records for satIntersect's sep = PxMax(sep, minProject(B, a)): TINY triangles
+//     (edges <= 4e-3, so every edge cross has magSq < 1e-5 and the nine cross axes are all
+//     skipped) with axis-aligned explicit planes, so the plane fold decides the result
+//     alone -- a -0 / +0 tie, or planeB NaN (the (0, NaN, 0) makePlane gives on overflow);
+//   * CROSS records for sep = PxMax(sep, tSep): the engine's own NaN-axis geometry, two
+//     triangles whose long edges (~2e19) overflow in the cross product, with makePlane planes;
+//   * ORDINARY records (non-round, overlapping or near) and NON-FINITE records (random inf,
+//     +-0 and ~2e19 / ~2e38 components), compared bit for bit like the rest.
+// The reference is the CUDA transcribed (p817mesh, revert = 0).  NaN outputs are compared as
+// NaN: which NaN a select hands on depends on operand order inside llvmpipe's arithmetic, and
+// the CUDA's own NaN is canonical anyway.  Everything else is compared by bits.
+// ---------------------------------------------------------------------------
+namespace p89cmm
+{
+struct SpRec { F4 a0, a1, a2, b0, b1, b2, pA, pB, ax; };
+static_assert(sizeof(SpRec) == 144, "probe record must be SP_IN_STRIDE = 144 bytes");
+struct SpPush { uint64_t input, output; uint32_t numRecords, pad0, pad1, pad2; };
+static_assert(sizeof(SpPush) == 32, "probe push block must be 32 bytes");
+
+static F4 f4(V3 v, float w = 0.0f) { return F4{ v.x, v.y, v.z, w }; }
+static V3 v3(F4 f) { return V3{ f.x, f.y, f.z }; }
+static bool sameWord(float a, float b)
+{
+    return (std::isnan(a) && std::isnan(b)) || (!std::isnan(a) && !std::isnan(b) && f2u(a) == f2u(b));
+}
+static F4 probeRef(const SpRec& r, uint32_t revert)
+{
+    using namespace p817mesh;
+    const V3 a0 = v3(r.a0), a1 = v3(r.a1), a2 = v3(r.a2), b0 = v3(r.b0), b1 = v3(r.b1), b2 = v3(r.b2);
+    F4 o;
+    o.x = minProjectTri(v3(r.pA), r.pA.w, b0, b1, b2, revert);
+    o.y = testSeparatingAxis(v3(r.ax), a0, a1, a2, b0, b1, b2, revert);
+    o.z = satIntersect(a0, a1, a2, v3(r.pA), r.pA.w, b0, b1, b2, v3(r.pB), r.pB.w, r.ax.w, nullptr, revert);
+    V3 nA, nB; float dA, dB;
+    makePlane(a0, a1, a2, nA, dA);
+    makePlane(b0, b1, b2, nB, dB);
+    o.w = satIntersect(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB, r.ax.w, nullptr, revert);
+    return o;
+}
+static uint32_t probeDiffWords(const SpRec& r, uint32_t revert)
+{
+    const F4 c = probeRef(r, 0u), m = probeRef(r, revert);
+    return uint32_t(!sameWord(c.x, m.x)) + uint32_t(!sameWord(c.y, m.y)) + uint32_t(!sameWord(c.z, m.z)) +
+           uint32_t(!sameWord(c.w, m.w));
+}
+} // namespace p89cmm
+
+PXG_TEST(femClothSimMeshMidphase_p89SatProbe)
+{
+    using namespace p89cmm;
+    using p817mesh::V3;
+    namespace pm = p817mesh;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    uint64_t rs = 0xc0ffee89ull;
+    auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
+    auto pick = [&](int n) { return int(u() * float(n)) % n; };
+    auto sym = [&](float r) { return (u() * 2.0f - 1.0f) * r; };
+    const float INF = std::numeric_limits<float>::infinity();
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    const float MAXF = 3.4028235e38f;
+
+    // A vertex whose projection on sgn * e_k is exactly p.
+    auto realize = [&](float p, int k, float sgn) {
+        float c[3];
+        const bool zero = (p == 0.0f), neg = std::signbit(p);
+        for (int i = 0; i < 3; ++i)
+            c[i] = zero ? (neg ? -(0.3f + u()) : (0.3f + u())) : sym(1.5f);
+        if (std::isnan(p)) { c[(k + 1) % 3] = (u() < 0.5f) ? INF : -INF; }
+        else if (zero) c[k] = (neg ? -0.0f : 0.0f) * sgn;
+        else c[k] = p * sgn;
+        return V3{ c[0], c[1], c[2] };
+    };
+    auto axisOf = [](int k, float sgn) { V3 a{ 0.0f, 0.0f, 0.0f }; (&a.x)[k] = sgn; return a; };
+
+    enum Fam { PATTERN = 0, PLANE = 1, CROSS = 2, ORDINARY = 3, NONFINITE = 4 };
+    std::vector<SpRec> recs;
+    std::vector<int> fam;
+    std::vector<uint32_t> famSite;   // the site a planted record was drawn for (0 = none)
+
+    // ---- PATTERN records ------------------------------------------------------------------
+    const float ZP[6] = { -0.0f, 0.0f, -1.25f, -0.75f, 0.5f, 1.5f };
+    const float FP[9] = { -0.0f, 0.0f, -1.25f, -0.75f, 0.5f, 1.5f, NaN, INF, -INF };
+    const uint32_t tsaSites[9] = { pm::SITE_MIN0_1, pm::SITE_MAX0_1, pm::SITE_MIN1_1, pm::SITE_MAX1_1,
+                                   pm::SITE_MIN0_2, pm::SITE_MAX0_2, pm::SITE_MIN1_2, pm::SITE_MAX1_2,
+                                   pm::SITE_TSA_RET };
+    const uint32_t mpSites[2] = { pm::SITE_MP_INNER, pm::SITE_MP_OUTER };
+    uint32_t missing = 0;
+    for (int si = 0; si < 11; ++si)
+    {
+        const bool isMp = si >= 9;
+        const uint32_t site = isMp ? mpSites[si - 9] : tsaSites[si];
+        for (int nonfin = 0; nonfin < 2; ++nonfin)
+        {
+            int found = 0;
+            for (int tries = 0; tries < 400000 && found < 4; ++tries)
+            {
+                const int k = pick(3);
+                const float sgn = (u() < 0.5f) ? 1.0f : -1.0f;
+                const V3 ax = axisOf(k, sgn);
+                float p[6];
+                bool anyNonfin = false;
+                for (int i = 0; i < 6; ++i)
+                {
+                    p[i] = nonfin ? FP[pick(9)] : ZP[pick(6)];
+                    if (!std::isfinite(p[i])) anyNonfin = true;
+                }
+                if (bool(nonfin) != anyNonfin) continue;
+                SpRec r;
+                const float DP[4] = { 0.0f, -0.0f, 0.25f, -0.5f };
+                if (isMp)
+                {
+                    r.a0 = f4(V3{ sym(1.0f), sym(1.0f), sym(1.0f) });
+                    r.a1 = f4(V3{ sym(1.0f), sym(1.0f), sym(1.0f) });
+                    r.a2 = f4(V3{ sym(1.0f), sym(1.0f), sym(1.0f) });
+                    r.b0 = f4(realize(p[0], k, sgn)); r.b1 = f4(realize(p[1], k, sgn)); r.b2 = f4(realize(p[2], k, sgn));
+                    r.pA = f4(ax, DP[pick(4)]);
+                }
+                else
+                {
+                    r.a0 = f4(realize(p[0], k, sgn)); r.a1 = f4(realize(p[1], k, sgn)); r.a2 = f4(realize(p[2], k, sgn));
+                    r.b0 = f4(realize(p[3], k, sgn)); r.b1 = f4(realize(p[4], k, sgn)); r.b2 = f4(realize(p[5], k, sgn));
+                    r.pA = f4(ax, DP[pick(2)]);
+                }
+                r.pB = f4(axisOf(pick(3), (u() < 0.5f) ? 1.0f : -1.0f), DP[pick(2)]);
+                r.ax = f4(ax, (u() < 0.5f) ? 0.2f : MAXF);
+                const F4 c = probeRef(r, 0u), m = probeRef(r, site);
+                if (sameWord(isMp ? c.x : c.y, isMp ? m.x : m.y)) continue;
+                recs.push_back(r); fam.push_back(PATTERN); famSite.push_back(site);
+                ++found;
+            }
+            if (found < 4) ++missing;
+        }
+    }
+    PXG_CHECK_MSG(missing == 0u, "p89 SAT probe: %u (site, zero/non-finite) pattern classes found fewer than four "
+                  "distinguishing records", missing);
+
+    // ---- PLANE records: tiny triangles, the plane fold alone ----------------------------------
+    {
+        auto tiny = [&]() {
+            const int t = pick(4);
+            return t == 0 ? 0.0f : t == 1 ? -0.0f : (u() < 0.5f ? -1.0f : 1.0f) * (0.5e-3f + 1.5e-3f * u());
+        };
+        for (int nonfin = 0; nonfin < 2; ++nonfin)
+        {
+            int found = 0;
+            for (int tries = 0; tries < 400000 && found < 4; ++tries)
+            {
+                SpRec r;
+                r.a0 = f4(V3{ tiny(), tiny(), tiny() }); r.a1 = f4(V3{ tiny(), tiny(), tiny() }); r.a2 = f4(V3{ tiny(), tiny(), tiny() });
+                r.b0 = f4(V3{ tiny(), tiny(), tiny() }); r.b1 = f4(V3{ tiny(), tiny(), tiny() }); r.b2 = f4(V3{ tiny(), tiny(), tiny() });
+                r.pA = f4(axisOf(pick(3), (u() < 0.5f) ? 1.0f : -1.0f), (u() < 0.5f) ? 0.0f : -0.0f);
+                if (nonfin)
+                {
+                    V3 n{ 0.0f, 0.0f, 0.0f }; (&n.x)[pick(3)] = NaN;   // makePlane's overflow normal
+                    r.pB = f4(n, NaN);
+                }
+                else
+                    r.pB = f4(axisOf(pick(3), (u() < 0.5f) ? 1.0f : -1.0f), (u() < 0.5f) ? 0.0f : -0.0f);
+                r.ax = f4(axisOf(pick(3), 1.0f), (u() < 0.5f) ? 0.2f : MAXF);
+                const F4 c = probeRef(r, 0u), m = probeRef(r, pm::SITE_SAT_PLANE);
+                if (sameWord(c.z, m.z)) continue;
+                recs.push_back(r); fam.push_back(PLANE); famSite.push_back(pm::SITE_SAT_PLANE);
+                ++found;
+            }
+            if (found < 4) ++missing;
+        }
+    }
+
+    // ---- CROSS records: the engine's NaN-axis geometry -----------------------------------------
+    {
+        auto turn = [](V3 v, int r) { for (int i = 0; i < r; ++i) v = V3{ v.z, v.y, -v.x }; return v; };
+        int found = 0;
+        for (int tries = 0; tries < 4000 && found < 16; ++tries)
+        {
+            const int r = pick(4), shape = pick(3);
+            const float X = 1.9e19f + 1.0e19f * u(), L = 1.9e19f + 1.0e19f * u();
+            const float s = 0.3f + 0.5f * u(), m = 0.3f + 0.5f * u(), g = sym(0.3f), h = 0.04f + 0.4f * u();
+            const float xb = sym(0.3f), zb = sym(0.3f);
+            V3 a[3], b[3];
+            if (shape == 0)
+            {
+                a[0] = { 0, g, 0 }; a[1] = { 0, g, s }; a[2] = { X, g, 0 };
+                b[0] = { xb, 0, zb }; b[1] = { xb, 0, zb + L }; b[2] = { xb + m, 0, zb };
+            }
+            else
+            {
+                a[0] = { 0, g, 0 }; a[1] = { X, g, 0 }; a[2] = { 0, g + h, s };
+                b[0] = { xb, 0, zb };
+                if (shape == 1) { b[1] = { xb + m, 0, zb - L }; b[2] = { xb, 0, zb - L }; }
+                else { b[1] = { xb, 0, zb + L }; b[2] = { xb + m, 0, zb + L }; }
+            }
+            SpRec rec;
+            rec.a0 = f4(turn(a[0], r)); rec.a1 = f4(turn(a[1], r)); rec.a2 = f4(turn(a[2], r));
+            rec.b0 = f4(turn(b[0], r)); rec.b1 = f4(turn(b[1], r)); rec.b2 = f4(turn(b[2], r));
+            V3 nA, nB; float dA, dB;
+            pm::makePlane(v3(rec.a0), v3(rec.a1), v3(rec.a2), nA, dA);
+            pm::makePlane(v3(rec.b0), v3(rec.b1), v3(rec.b2), nB, dB);
+            rec.pA = f4(nA, dA); rec.pB = f4(nB, dB);
+            V3 ax{ sym(1.0f), sym(1.0f), sym(1.0f) };
+            ax = pm::scl(ax, 1.0f / std::sqrt(pm::dot(ax, ax)));
+            rec.ax = f4(ax, (u() < 0.5f) ? 0.2f : MAXF);
+            if (probeDiffWords(rec, pm::SITE_SAT_CROSS) == 0u) continue;
+            recs.push_back(rec); fam.push_back(CROSS); famSite.push_back(pm::SITE_SAT_CROSS);
+            ++found;
+        }
+        if (found < 16) ++missing;
+    }
+
+    // ---- ORDINARY and NON-FINITE records ------------------------------------------------------
+    for (int t = 0; t < 96; ++t)
+    {
+        SpRec r;
+        const V3 o{ sym(2.0f), sym(2.0f), sym(2.0f) };
+        const float sc = 0.2f + 2.0f * u();
+        V3 a[3], b[3];
+        for (int i = 0; i < 3; ++i) a[i] = { o.x + sym(sc), o.y + sym(sc), o.z + sym(sc) };
+        const V3 o2{ o.x + sym(0.6f * sc), o.y + sym(0.6f * sc), o.z + sym(0.6f * sc) };
+        for (int i = 0; i < 3; ++i) b[i] = { o2.x + sym(sc), o2.y + sym(sc), o2.z + sym(sc) };
+        r.a0 = f4(a[0]); r.a1 = f4(a[1]); r.a2 = f4(a[2]); r.b0 = f4(b[0]); r.b1 = f4(b[1]); r.b2 = f4(b[2]);
+        V3 nA, nB; float dA, dB;
+        pm::makePlane(a[0], a[1], a[2], nA, dA);
+        pm::makePlane(b[0], b[1], b[2], nB, dB);
+        r.pA = f4(nA, dA); r.pB = f4(nB, dB);
+        V3 ax{ sym(1.0f), sym(1.0f), sym(1.0f) };
+        r.ax = f4(pm::scl(ax, 1.0f / std::sqrt(pm::dot(ax, ax))), (t & 1) ? 0.2f : MAXF);
+        recs.push_back(r); fam.push_back(ORDINARY); famSite.push_back(0u);
+    }
+    for (int t = 0; t < 96; ++t)
+    {
+        auto comp = [&]() {
+            const float c = u();
+            if (c < 0.12f) return INF;
+            if (c < 0.24f) return -INF;
+            if (c < 0.36f) return ((u() < 0.5f) ? 1.0f : -1.0f) * (1.2e19f + 1.0e19f * u());
+            if (c < 0.42f) return ((u() < 0.5f) ? 1.0f : -1.0f) * (2.0e38f + 1.0e38f * u());
+            if (c < 0.50f) return (u() < 0.5f) ? 0.0f : -0.0f;
+            return sym(2.0f);
+        };
+        SpRec r;
+        V3 a[3], b[3];
+        for (int i = 0; i < 3; ++i) { a[i] = { comp(), comp(), comp() }; b[i] = { comp(), comp(), comp() }; }
+        r.a0 = f4(a[0]); r.a1 = f4(a[1]); r.a2 = f4(a[2]); r.b0 = f4(b[0]); r.b1 = f4(b[1]); r.b2 = f4(b[2]);
+        V3 nA, nB; float dA, dB;
+        pm::makePlane(a[0], a[1], a[2], nA, dA);
+        pm::makePlane(b[0], b[1], b[2], nB, dB);
+        r.pA = f4(nA, dA); r.pB = f4(nB, dB);
+        V3 ax{ sym(1.0f), sym(1.0f), sym(1.0f) };
+        ax = pm::scl(ax, 1.0f / std::sqrt(pm::dot(ax, ax)));
+        if (u() < 0.4f) ax = axisOf(pick(3), (u() < 0.5f) ? 1.0f : -1.0f);
+        r.ax = f4(ax, (u() < 0.5f) ? 0.2f : MAXF);
+        recs.push_back(r); fam.push_back(NONFINITE); famSite.push_back(0u);
+    }
+    PXG_CHECK_MSG(missing == 0u, "p89 SAT probe: %u planted classes came up short", missing);
+    const uint32_t N = uint32_t(recs.size());
+
+    // ---- the battery has to SEE every fold: each single-site revert changes some word -------
+    const char* siteName[pm::SITE_COUNT] = { "minProject inner", "minProject outer", "min0 i=1", "max0 i=1",
+                                             "min1 i=1", "max1 i=1", "min0 i=2", "max0 i=2", "min1 i=2",
+                                             "max1 i=2", "tsa return", "sat plane", "sat cross" };
+    uint32_t siteWords[pm::SITE_COUNT] = {}, twinWords = 0, blindSites = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        for (int si = 0; si < int(pm::SITE_COUNT); ++si) siteWords[si] += probeDiffWords(recs[i], 1u << si);
+        twinWords += probeDiffWords(recs[i], pm::SITE_ALL);
+    }
+    std::printf("    [p89 SAT probe] %u records; words the single-site revert changes:", N);
+    for (int si = 0; si < int(pm::SITE_COUNT); ++si)
+    {
+        std::printf(" %s %u%s", siteName[si], siteWords[si], si + 1 < int(pm::SITE_COUNT) ? "," : "");
+        if (siteWords[si] < 4u) ++blindSites;
+    }
+    std::printf("; old twin %u\n", twinWords);
+    PXG_CHECK_MSG(blindSites == 0u, "p89 SAT probe: %u fold sites are changed on fewer than four words by their "
+                  "own revert -- the battery cannot see them", blindSites);
+
+    // ---- run the probe -----------------------------------------------------------------------
+    DevBuf bIn = makeDev(dev, recs);
+    if (!bIn.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    std::vector<F4> outInit(N, F4{ 1.0f, 2.0f, 3.0f, 4.0f });
+    DevBuf bOut = makeDev(dev, outInit);
+    SpPush push = { bIn.addr, bOut.addr, N, 0u, 0u, 0u };
+    Kernel k("femClothMeshMidphaseBda.spv", "cloth_meshMidphaseSatProbe", {}, sizeof(SpPush));
+    k.dispatch((N + 31u) / 32u, {}, push);
+    dev->flush();
+    const auto g = downloadBuffer<F4>(dev, bOut.h, N);
+
+    uint32_t bad[5] = { 0, 0, 0, 0, 0 }, badWords = 0, asTwin = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 c = probeRef(recs[i], 0u), t = probeRef(recs[i], pm::SITE_ALL);
+        const float gv[4] = { g[i].x, g[i].y, g[i].z, g[i].w }, cv[4] = { c.x, c.y, c.z, c.w }, tv[4] = { t.x, t.y, t.z, t.w };
+        bool recBad = false;
+        for (int w = 0; w < 4; ++w)
+        {
+            if (sameWord(gv[w], cv[w])) continue;
+            recBad = true;
+            ++badWords;
+            if (sameWord(gv[w], tv[w])) ++asTwin;
+            if (badWords <= 6)
+                std::printf("    p89 SAT probe rec %u (fam %d, site 0x%x) word %c: gpu %08x (%g) cuda %08x (%g) old twin %08x (%g)\n",
+                            i, fam[i], famSite[i], "xyzw"[w], f2u(gv[w]), gv[w], f2u(cv[w]), cv[w], f2u(tv[w]), tv[w]);
+        }
+        if (recBad) ++bad[fam[i]];
+    }
+    PXG_CHECK_MSG(badWords == 0u,
+                  "p89 SAT probe: %u words differ from the CUDA's select folds (%u of them equal the old "
+                  "FMin/FMax twin) -- by family: pattern %u, plane %u, cross %u, ordinary %u, non-finite %u records",
+                  badWords, asTwin, bad[PATTERN], bad[PLANE], bad[CROSS], bad[ORDINARY], bad[NONFINITE]);
+
+    for (PxgBufferHandle h : { bIn.h, bOut.h }) dev->destroyBuffer(h);
 }
 
 // ===========================================================================

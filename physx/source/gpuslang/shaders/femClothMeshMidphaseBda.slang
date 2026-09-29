@@ -181,14 +181,35 @@ void makePlane(float3 p0, float3 p1, float3 p2, out float3 n, out float d)
     d = -dot(p0, n);
 }
 
+// P9.89: EVERY FOLD OF THIS SAT IS A SELECT, NOT min()/max().  triangletriangle.cuh folds with
+// PxMin/PxMax<float>, which are selectMin(a, b) = a < b ? a : b and selectMax(a, b) =
+// a > b ? a : b (PxMath.h:82-100, PxUnixMathIntrinsics.h:116-125).  An equal compare returns b,
+// so a +-0 tie keeps b's zero; a NaN in either operand fails the compare, so b is returned -- a
+// NaN b sticks and a NaN a is dropped.  The port spelled them min()/max(), i.e. GLSL.std.450
+// FMin/FMax, which llvmpipe evaluates as "the non-NaN operand" with -0/+0 on a zero tie.
+// Engine-visible through a NaN cross axis: an edge cross whose component overflows (edges
+// ~2e19) normalizes to inf * 0 = NaN, every projection on it is NaN, and satIntersect's
+// sep = PxMax(sep, tSep) then WIPES the running separation (a NaN last axis rejects the pair;
+// a later finite axis resets sep to its own value).  FMax skipped the NaN axis instead.
+// Operand order below is the CUDA's, argument for argument.
+// testFemClothSim femClothSimMeshMidphase_p89NaNAxis drives that through the kernel, and
+// femClothSimMeshMidphase_p89SatProbe reads every fold out bit for bit.
+float cmSelMin(float a, float b) { return (a < b) ? a : b; }
+float cmSelMax(float a, float b) { return (a > b) ? a : b; }
+
 // minProject(plane, triangle) (triangletriangle.cuh:43): the `+ plane.d` lands ONCE, AFTER the
 // min over the three dots — transcribed in that order rather than folded into each term.
+// P9.89: PxMin(n.v0, PxMin(n.v1, n.v2)) (:48-49), both selects.
 float minProjectTri(float3 n, float d, float3 v0, float3 v1, float3 v2)
 {
-    return min(dot(n, v0), min(dot(n, v1), dot(n, v2))) + d;
+    return cmSelMin(dot(n, v0), cmSelMin(dot(n, v1), dot(n, v2))) + d;
 }
 
-// testSeparatingAxis (triangletriangle.cuh:56): the max gap of the two projection intervals.
+// testSeparatingAxis (triangletriangle.cuh:53): the max gap of the two projection intervals.
+// P9.89: the loop's i = 1, 2 unrolled; each step is min0 = PxMin(proj0, min0),
+// max0 = PxMax(proj0, max0), min1 = PxMin(proj1, min1), max1 = PxMax(proj1, max1) (:64-67),
+// projection first, running value second, and the result is PxMax(min1 - max0, min0 - max1)
+// (:70).  All selects.
 float testSeparatingAxis(float3 axis, float3 a0, float3 a1, float3 a2,
                          float3 b0, float3 b1, float3 b2)
 {
@@ -196,12 +217,12 @@ float testSeparatingAxis(float3 axis, float3 a0, float3 a1, float3 a2,
     min0 = max0 = dot(a0, axis);
     min1 = max1 = dot(b0, axis);
     const float pa1 = dot(a1, axis), pb1 = dot(b1, axis);
-    min0 = min(pa1, min0); max0 = max(pa1, max0);
-    min1 = min(pb1, min1); max1 = max(pb1, max1);
+    min0 = cmSelMin(pa1, min0); max0 = cmSelMax(pa1, max0);
+    min1 = cmSelMin(pb1, min1); max1 = cmSelMax(pb1, max1);
     const float pa2 = dot(a2, axis), pb2 = dot(b2, axis);
-    min0 = min(pa2, min0); max0 = max(pa2, max0);
-    min1 = min(pb2, min1); max1 = max(pb2, max1);
-    return max(min1 - max0, min0 - max1);
+    min0 = cmSelMin(pa2, min0); max0 = cmSelMax(pa2, max0);
+    min1 = cmSelMin(pb2, min1); max1 = cmSelMax(pb2, max1);
+    return cmSelMax(min1 - max0, min0 - max1);
 }
 
 // Gu::satIntersect<true>(triangle0, triangle1, tolerance) (triangletriangle.cuh:74).  triangle0
@@ -215,7 +236,8 @@ float satIntersectTriTri(float3 a0, float3 a1, float3 a2, float3 nA, float dA,
     float sep = minProjectTri(nA, dA, b0, b1, b2);
     if (sep > tolerance) return sep;
 
-    sep = max(sep, minProjectTri(nB, dB, a0, a1, a2));
+    // P9.89: sep = PxMax(sep, minProject(triangle1.triPlane, triangle0)) (:80), a select.
+    sep = cmSelMax(sep, minProjectTri(nB, dB, a0, a1, a2));
     if (sep > tolerance) return sep;
 
     const float3 axes0[3] = { a1 - a0, a2 - a0, a2 - a1 };
@@ -231,7 +253,9 @@ float satIntersectTriTri(float3 a0, float3 a1, float3 a2, float3 nA, float dA,
             if (magSq > 1e-5f)
             {
                 sepAxis = sepAxis * (1.0f / sqrt(magSq));
-                sep = max(sep, testSeparatingAxis(sepAxis, a0, a1, a2, b0, b1, b2));
+                // P9.89: sep = PxMax(sep, tSep) (:108-109), a select: a NaN tSep wipes sep,
+                // and the next finite axis resets it.
+                sep = cmSelMax(sep, testSeparatingAxis(sepAxis, a0, a1, a2, b0, b1, b2));
                 if (sep > tolerance) return sep;
             }
         }
@@ -437,9 +461,11 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
                     // against the QUERY's centroid.
                     if (dot(nB, centroid) + dB >= 0.0f)
                     {
+                        // P9.89: PxMin(mBestDistance, mContactDistance)
+                        // (femClothClothMidPhase.cu:140), a select.
                         const float separation =
                             satIntersectTriTri(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB,
-                                               min(bestDist, contactDist));
+                                               cmSelMin(bestDist, contactDist));
                         if (separation < bestDist)
                         {
                             bestDist = separation;
@@ -536,4 +562,65 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
         }
     }
     }
+}
+
+// ===========================================================================
+// cloth_meshMidphaseSatProbe -- P9.89: the triangle-triangle SAT's folds read out bit for bit.
+// Test-only entry (never in the manifest); the engine kernel above is the only consumer of
+// these functions in the engine.
+//
+// WHY A PROBE.  The kernel's only outputs are the emitted (cmIdx, clothTri, meshPrim) triples,
+// so the separation reaches them only through `sep > tolerance`, `separation < bestDist`,
+// `bestDist < contactDist` and the lane argmin -- none of which sees the sign of a zero.  A NaN
+// cross axis does reach them (testFemClothSim femClothSimMeshMidphase_p89NaNAxis), but most
+// fold sites below cannot be told apart by any pair set: a NaN projection needs a NaN axis,
+// and then all six projections are NaN on both spellings.  Every fold is a transcription of
+// a CUDA selectMin/selectMax and has to be bit-exact as a function, so this entry evaluates
+// them on caller-supplied operands, one record per thread.
+//
+// Record, SP_IN_STRIDE bytes: float4 a0, a1, a2, b0, b1, b2 (xyz used), float4 planeA
+// (n.xyz, d), float4 planeB, float4 axis (xyz) with the SAT tolerance in .w.
+// Output, one float4 per record:
+//   x = minProjectTri(planeA, b0, b1, b2)
+//   y = testSeparatingAxis(axis, a0, a1, a2, b0, b1, b2)
+//   z = satIntersectTriTri with the EXPLICIT planes A and B
+//   w = satIntersectTriTri with makePlane(a0, a1, a2) and makePlane(b0, b1, b2), the planes
+//       the engine kernel builds
+// ===========================================================================
+struct ClothMeshSatProbeParams
+{
+    uint64_t input;       // @0
+    uint64_t output;      // @8
+    uint numRecords;      // @16
+    uint _pad20, _pad24, _pad28;
+}
+
+[[vk::push_constant]] ConstantBuffer<ClothMeshSatProbeParams> gCmSatProbe;
+
+static const uint SP_IN_STRIDE = 144u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void cloth_meshMidphaseSatProbe(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint r = dtid.x;
+    if (r >= gCmSatProbe.numRecords)
+        return;
+
+    Ptr<float4> rec = Ptr<float4>(gCmSatProbe.input + uint64_t(r) * uint64_t(SP_IN_STRIDE));
+    const float3 a0 = rec[0].xyz, a1 = rec[1].xyz, a2 = rec[2].xyz;
+    const float3 b0 = rec[3].xyz, b1 = rec[4].xyz, b2 = rec[5].xyz;
+    const float4 pA = rec[6], pB = rec[7], axT = rec[8];
+
+    float4 o;
+    o.x = minProjectTri(pA.xyz, pA.w, b0, b1, b2);
+    o.y = testSeparatingAxis(axT.xyz, a0, a1, a2, b0, b1, b2);
+    o.z = satIntersectTriTri(a0, a1, a2, pA.xyz, pA.w, b0, b1, b2, pB.xyz, pB.w, axT.w);
+
+    float3 nA, nB; float dA, dB;
+    makePlane(a0, a1, a2, nA, dA);
+    makePlane(b0, b1, b2, nB, dB);
+    o.w = satIntersectTriTri(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB, axT.w);
+
+    Ptr<float4>(gCmSatProbe.output)[r] = o;
 }

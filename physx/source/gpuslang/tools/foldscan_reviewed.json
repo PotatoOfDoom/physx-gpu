@@ -1277,82 +1277,6 @@
 },
 {
 "file": "femClothMeshMidphaseBda.slang",
-"code": "return min(dot(n, v0), min(dot(n, v1), dot(n, v2))) + d;",
-"kinds": [
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "Divergent operator on a +-0 tie. The only consumers of these values are comparisons: sep > tolerance, separation < bestDist, bestDist < contactDist, and the argmin over sCmBest using <. The midphase output is indices only (cmIdx, triangleIdx, bestPrimIndex). A zero-sign difference cannot change any "
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "min0 = min(pa1, min0); max0 = max(pa1, max0);",
-"kinds": [
-"F4-FMax",
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "Divergent on a +-0 tie between projections. The only consumers of these values are comparisons: sep > tolerance, separation < bestDist, bestDist < contactDist, and the argmin over sCmBest using <. The midphase output is indices only (cmIdx, triangleIdx, bestPrimIndex). A zero-sign difference cannot "
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "min1 = min(pb1, min1); max1 = max(pb1, max1);",
-"kinds": [
-"F4-FMax",
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "min0 = min(pa2, min0); max0 = max(pa2, max0);",
-"kinds": [
-"F4-FMax",
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "min1 = min(pb2, min1); max1 = max(pb2, max1);",
-"kinds": [
-"F4-FMax",
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "return max(min1 - max0, min0 - max1);",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "sep = max(sep, minProjectTri(nB, dB, a0, a1, a2));",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "sep = max(sep, testSeparatingAxis(sepAxis, a0, a1, a2, b0, b1, b2));",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "As 199."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
 "code": "const float3 tMin = min(min(a0, a1), a2) - contactDist;",
 "kinds": [
 "F4-FMin"
@@ -1368,15 +1292,6 @@
 ],
 "verdict": "BENIGN",
 "why": "As 383."
-},
-{
-"file": "femClothMeshMidphaseBda.slang",
-"code": "const float separation =",
-"kinds": [
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "tolerance is only compared (sep > tolerance). bestDist starts at PX_MAX and contactDist is finite, so no NaN."
 },
 {
 "file": "npArtiSolveExtPGS.slang",
