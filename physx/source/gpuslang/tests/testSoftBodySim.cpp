@@ -15851,4 +15851,225 @@ PXG_TEST(softBodySimParticleAttachmentSolve)
     dev->destroyBuffer(bSbDesc.h); dev->destroyBuffer(bPsDesc.h); dev->destroyBuffer(bCon.h);
 }
 
+// ---------------------------------------------------------------------------
+// P9.90: the association of the barycentric chains, bit for bit.  The fixture above
+// uses axis-aligned tets and a single weight vector, so the order of
+// pos1 = sp0*b.x + sp1*b.y + sp2*b.z + sp3*b.w and wTot1 = sum b1w_i*b_i
+// (softBodyGM.cu:2580/:2591, float4 operator+ left to right) was never pinned.
+// Here every tet is a general-orientation tet with non-round coordinates, masses and
+// barycentrics; each lane's particle is distinct, so both delta buffers are pure
+// per-lane functions of the chains.  The mirror is -ffp-contract=off in the CUDA
+// order ((a + b) + c) + d.  Two twins must change the stream: the reassociated
+// a + (b + (c + d)) (what an undecorated OpDot-style lowering would produce) and the
+// fma-contracted chain (what a fusing driver would produce), so the compare can see
+// either divergence.  The kernel has no OpDot; the unstamped .spv matches too.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimParticleAttachmentSolve_p90BaryOrder)
+{
+    using namespace p819att;
+    using namespace p948att;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t SB_ID = 1u, PS_ID = 2u;
+    const uint32_t NB_ATT = 512u;
+
+    uint32_t seed = 0x9E3779B9u;
+    auto rnd = [&]() {   // [0,1), 24 random bits
+        seed = seed * 1664525u + 1013904223u;
+        return float(seed >> 8) * (1.0f / 16777216.0f);
+    };
+
+    std::vector<F4> sbVerts;
+    std::vector<TetIdx4> tets;
+    std::vector<F4> bary(NB_ATT);
+    std::vector<F4> partPos(NB_ATT);
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        for (uint32_t k = 0; k < 4u; ++k)
+            sbVerts.push_back(F4{ -3.1f + 6.3f * rnd(), 0.7f + 4.9f * rnd(), -2.3f + 5.1f * rnd(),
+                                  0.13f + 1.7f * rnd() });
+        const uint32_t b = a * 4u;
+        tets.push_back(TetIdx4{ b, b + 1u, b + 2u, b + 3u });
+        // Non-negative barycentrics that sum to ~1 (the engine clamps them non-negative).
+        float w0 = 0.05f + rnd(), w1 = 0.05f + rnd(), w2 = 0.05f + rnd(), w3 = 0.05f + rnd();
+        const float s = 1.0f / (w0 + w1 + w2 + w3);
+        bary[a] = F4{ w0 * s, w1 * s, w2 * s, w3 * s };
+        partPos[a] = F4{ -2.9f + 5.7f * rnd(), 1.1f + 3.7f * rnd(), -1.9f + 4.3f * rnd(),
+                         0.07f + 1.3f * rnd() };
+    }
+
+    // One buffer, unique id 0, runsum 0 and an identity unsorted->sorted mapping: lane a
+    // reaches particle a.  The indirections are the P9.48b fixture's business.
+    const std::vector<uint32_t> uids = { 0u }, uidsOrig = { 0u }, runsum = { 0u };
+    std::vector<uint32_t> u2s(NB_ATT);
+    for (uint32_t i = 0; i < NB_ATT; ++i) u2s[i] = i;
+
+    DevBuf bSbV = makeDev(dev, sbVerts);
+    if (!bSbV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bSbV.h); return; }
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bPartPos = makeDev(dev, partPos);
+    DevBuf bU2S = makeDev(dev, u2s);
+    DevBuf bRunsum = makeDev(dev, runsum);
+    DevBuf bUids = makeDev(dev, uids);
+    DevBuf bUidsOrig = makeDev(dev, uidsOrig);
+    std::vector<F4> sbDelta(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> partDelta(NB_ATT, F4{ 0, 0, 0, 0 });
+    DevBuf bSbD = makeDev(dev, sbDelta), bPartD = makeDev(dev, partDelta);
+
+    std::vector<PxgSoftBody> sbArr(SB_ID + 1u, makeZeroDesc());
+    sbArr[SB_ID].mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSbV.addr));
+    sbArr[SB_ID].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sbArr[SB_ID].mSimDelta = reinterpret_cast<float4*>(size_t(bSbD.addr));
+    DevBuf bSbDesc = makeDev(dev, sbArr);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPartPos.addr));
+    psArr[PS_ID].mUnsortedToSortedMapping = reinterpret_cast<PxU32*>(size_t(bU2S.addr));
+    psArr[PS_ID].mDelta = reinterpret_cast<float4*>(size_t(bPartD.addr));
+    psArr[PS_ID].mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+    psArr[PS_ID].mParticleBufferSortedUniqueIds = reinterpret_cast<PxU32*>(size_t(bUids.addr));
+    psArr[PS_ID].mParticleBufferSortedUniqueIdsOriginalIndex =
+        reinterpret_cast<PxU32*>(size_t(bUidsOrig.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_ATT;
+    psArr[PS_ID].mCommonData.mNumParticleBuffers = 1u;
+    DevBuf bPsDesc = makeDev(dev, psArr);
+
+    std::vector<uint32_t> con(((NB_ATT + 31u) / 32u) * FAC_STRIDE / 4, 0u);
+    auto putF4 = [&](size_t byteOff, F4 v) {
+        const size_t w = byteOff / 4;
+        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
+    };
+    // facSlot: blocks of 32 constraints, FAC_STRIDE bytes each (pxgSlangFemFemAttach).
+    auto slot = [](size_t field, uint32_t a, size_t sz) {
+        return size_t(a / 32u) * FAC_STRIDE + field + size_t(a & 31u) * sz;
+    };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const size_t w0 = slot(FAC_ELEMID0, a, 8) / 4;
+        con[w0] = a;
+        con[w0 + 1] = PS_ID;
+        con[slot(FAC_ELEMID1, a, 8) / 4] = encodeSb(SB_ID, a);
+        putF4(slot(FAC_BARYCENTRIC0, a, 16), F4{ 0.5f, 0.0f, 0.0f, 0.0f });   // buffer id 0
+        putF4(slot(FAC_BARYCENTRIC1, a, 16), bary[a]);
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ParticleSbAttachSolvePush push = {};
+    push.softbodies = bSbDesc.addr;
+    push.particleSystems = bPsDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("softBodyParticleAttachBda.spv", "sb_solveOutputParticleAttachmentDeltaVLaunch",
+             {}, sizeof(ParticleSbAttachSolvePush));
+    PXG_CHECK_MSG(k.isValid(), "the softbody-particle attachment pipeline must build");
+    if (!k.isValid()) return;
+    k.dispatch(1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // mode 0: the CUDA order ((a + b) + c) + d, mode 1: a + (b + (c + d)), mode 2: fma chain.
+    auto sum4 = [](int mode, float p0, float q0, float p1, float q1, float p2, float q2,
+                   float p3, float q3) -> float {
+        if (mode == 1) return p0 * q0 + (p1 * q1 + (p2 * q2 + p3 * q3));
+        if (mode == 2) return std::fmaf(p3, q3, std::fmaf(p2, q2, std::fmaf(p1, q1, p0 * q0)));
+        const float t0 = p0 * q0, t1 = p1 * q1, t2 = p2 * q2, t3 = p3 * q3;
+        return ((t0 + t1) + t2) + t3;
+    };
+    auto mirror = [&](int mode, std::vector<F4>& refSb, std::vector<F4>& refPart) {
+        refSb.assign(sbVerts.size(), F4{ 0, 0, 0, 0 });
+        refPart.assign(NB_ATT, F4{ 0, 0, 0, 0 });
+        for (uint32_t a = 0; a < NB_ATT; ++a)
+        {
+            const uint32_t b = a * 4u;
+            const F4 s0 = sbVerts[b], s1 = sbVerts[b + 1], s2 = sbVerts[b + 2], s3 = sbVerts[b + 3];
+            const F4 w = bary[a];
+            const F4 pos1 = { sum4(mode, s0.x, w.x, s1.x, w.y, s2.x, w.z, s3.x, w.w),
+                              sum4(mode, s0.y, w.x, s1.y, w.y, s2.y, w.z, s3.y, w.w),
+                              sum4(mode, s0.z, w.x, s1.z, w.y, s2.z, w.z, s3.z, w.w),
+                              sum4(mode, s0.w, w.x, s1.w, w.y, s2.w, w.z, s3.w, w.w) };
+            const F4 pos0 = partPos[a];
+            if (pos1.w == 0.0f && pos0.w == 0.0f) continue;
+            const float ex = pos1.x - pos0.x, ey = pos1.y - pos0.y, ez = pos1.z - pos0.z;
+            const F4 b1w = { w.x * s0.w, w.y * s1.w, w.z * s2.w, w.w * s3.w };
+            const float wTot1 = sum4(mode, b1w.x, w.x, b1w.y, w.y, b1w.z, w.z, b1w.w, w.w);
+            const float wTot = pos0.w + wTot1;
+            if (!(wTot > 0.0f)) continue;
+            const float r = 1.0f / wTot;
+            const float dx = ex * r, dy = ey * r, dz = ez * r;
+            const float bw[4] = { b1w.x, b1w.y, b1w.z, b1w.w };
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (bw[c] > 0.0f)
+                {
+                    refSb[b + c].x += -dx * bw[c];
+                    refSb[b + c].y += -dy * bw[c];
+                    refSb[b + c].z += -dz * bw[c];
+                    refSb[b + c].w += 1.0f;
+                }
+            if (pos0.w > 0.0f)
+            {
+                refPart[a].x += dx * pos0.w;
+                refPart[a].y += dy * pos0.w;
+                refPart[a].z += dz * pos0.w;
+            }
+        }
+    };
+    std::vector<F4> refSb, refPart, twSb, twPart, fmSb, fmPart;
+    mirror(0, refSb, refPart);
+    mirror(1, twSb, twPart);
+    mirror(2, fmSb, fmPart);
+
+    const auto gSb = downloadBuffer<F4>(dev, bSbD.h, uint32_t(sbVerts.size()));
+    const auto gPart = downloadBuffer<F4>(dev, bPartD.h, NB_ATT);
+    auto same = [](const F4& r, const F4& g) {
+        return f2u(r.x) == f2u(g.x) && f2u(r.y) == f2u(g.y) && f2u(r.z) == f2u(g.z) &&
+               f2u(r.w) == f2u(g.w);
+    };
+    size_t mm = 0, twDiff = 0, fmDiff = 0, gotTw = 0, gotFm = 0;
+    for (uint32_t i = 0; i < sbVerts.size(); ++i)
+    {
+        if (!same(refSb[i], gSb[i]))
+        {
+            if (mm++ < 8)
+                std::printf("  sbDelta[%u] MM: ref(%a,%a,%a) got(%a,%a,%a)\n", i, refSb[i].x,
+                            refSb[i].y, refSb[i].z, gSb[i].x, gSb[i].y, gSb[i].z);
+            if (same(twSb[i], gSb[i])) ++gotTw;
+            if (same(fmSb[i], gSb[i])) ++gotFm;
+        }
+        if (!same(refSb[i], twSb[i])) ++twDiff;
+        if (!same(refSb[i], fmSb[i])) ++fmDiff;
+    }
+    for (uint32_t i = 0; i < NB_ATT; ++i)
+    {
+        if (!same(refPart[i], gPart[i]))
+        {
+            if (mm++ < 8)
+                std::printf("  partDelta[%u] MM: ref(%a,%a,%a) got(%a,%a,%a)\n", i, refPart[i].x,
+                            refPart[i].y, refPart[i].z, gPart[i].x, gPart[i].y, gPart[i].z);
+            if (same(twPart[i], gPart[i])) ++gotTw;
+            if (same(fmPart[i], gPart[i])) ++gotFm;
+        }
+        if (!same(refPart[i], twPart[i])) ++twDiff;
+        if (!same(refPart[i], fmPart[i])) ++fmDiff;
+    }
+    std::printf("  %u lanes: %zu mismatches (%zu = reassociated twin, %zu = fma twin); "
+                "twins differ from the CUDA order on %zu / %zu of %zu slots\n",
+                NB_ATT, mm, gotTw, gotFm, twDiff, fmDiff, sbVerts.size() + size_t(NB_ATT));
+    PXG_CHECK_MSG(mm == 0,
+                  "barycentric chains must sum ((a + b) + c) + d, unfused, as the CUDA's "
+                  "float4 operator+ does (%zu mismatches)", mm);
+    // Coverage guards: the fixture only observes the order if the order matters here.
+    PXG_CHECK_MSG(twDiff >= 200u,
+                  "the reassociated a + (b + (c + d)) twin must change at least 200 delta "
+                  "slots (got %zu) -- otherwise the data cannot see the association", twDiff);
+    PXG_CHECK_MSG(fmDiff >= 200u,
+                  "the fma-contracted twin must change at least 200 delta slots (got %zu) -- "
+                  "otherwise the data cannot see a fusing driver", fmDiff);
+
+    dev->destroyBuffer(bSbV.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bPartPos.h);
+    dev->destroyBuffer(bU2S.h); dev->destroyBuffer(bRunsum.h); dev->destroyBuffer(bUids.h);
+    dev->destroyBuffer(bUidsOrig.h); dev->destroyBuffer(bSbD.h); dev->destroyBuffer(bPartD.h);
+    dev->destroyBuffer(bSbDesc.h); dev->destroyBuffer(bPsDesc.h); dev->destroyBuffer(bCon.h);
+}
+
 } // namespace

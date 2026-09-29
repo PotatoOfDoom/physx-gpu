@@ -328,7 +328,21 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # setRigidDynamicGlobalPose_p90PoseOrder compares cache, bounds and body2World
     # bitwise (its old-order twin must differ); it passes unstamped too, so the entry is
     # unobserved.
-    updateBounds)
+    updateBounds
+    # P9.90: the softbody-particle attachment solve, stamped for consistency.  Its float
+    # math (softBodyGM.cu:2580-2604) is the barycentric interpolation pos1 = sum sp_i*b_i,
+    # wTot1 = sum b1w_i*b_i, error*(1/wTot) and the scatters' delta*weight products, all
+    # scalar/vector mul+add chains spelled left to right with no OpDot (the cone-limit
+    # dots of pxgSlangFemFemAttach are never called: E1), so llvmpipe's OpDot association
+    # never applies and it did not contract the chains: the unstamped .spv already matched
+    # the -ffp-contract=off mirror bitwise.  The stamp pins that order against a driver
+    # that would fuse.  The other engine importers of pxgSlangFemFemAttach
+    # (softBodyFemAttachBda, softBodyClothAttachBda, femClothAttachBda) were already
+    # stamped, and no kernel is compared against this one.  testSoftBodySim
+    # softBodySimParticleAttachmentSolve_p90BaryOrder compares both delta buffers bitwise
+    # (its reassociated twin must differ); it passes unstamped too, so the entry is
+    # unobserved.
+    softBodyParticleAttachBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
