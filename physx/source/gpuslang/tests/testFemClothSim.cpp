@@ -59,6 +59,7 @@
 #include "geometry/PxConvexCoreGeometry.h"  // PxConvexCore::Type (P9.75: eBOX read from the enum,
                                             // never a remembered 2 -- the P9.57 rule)
 #include "foundation/PxBounds3.h"            // PxBounds3 (P7.1 tranche 4a midphase AABB)
+#include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
 
 #include <cstdint>
 #include <cstddef>
@@ -11724,6 +11725,209 @@ PXG_TEST(femClothSimHeightfieldMidphase)
                 "contact managers\n",
                 NB_ROWS, NB_COLS, NB_VERTS, NB_TRIS, nTri, nVert, countFor(gotVert, 3u),
                 nDup, nTri, cm0, cm1);
+
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.89 -- the cloth-vs-heightfield midphase under a GENERIC rotation, pair set against
+// the foundation's own PxBounds3::transformFast(hfTransform.getInverse(), bound).
+//
+// femClothSimHeightfieldMidphase above turns the field by 180 degrees about y, where
+// every rotation entry is 0 or +-1 and all spellings of the inverse transform agree bit
+// for bit -- so it could not see that the port rotated (centre - p) ONCE where the CUDA
+// rotates centre and -p separately and adds (femClothHFMidPhase.cu:107 via
+// PxTransform::getInverse), nor that it took the basis from rotateInv(q, e_i) where the
+// CUDA builds PxMat33(conj q).  Both put the local bound an ULP or two off, and an ULP is
+// a floor()/ceil()/truncation on the other side of an integer: a different pair SET.
+//
+// THE ORACLE IS NOT A TRANSCRIPTION.  pxgHfLocalBoundRef.h calls the foundation's
+// transformFast and getInverse directly, in this -ffp-contract=off binary.  The TWINS --
+// the old port whole, the old centre alone, the old basis whole and each old column
+// alone -- are composed by hand, and the fixture proves the composition honest by
+// requiring that with nothing substituted it reproduces transformFast bit for bit.
+//
+// THE POINTS ARE SEARCHED, NOT SAMPLED.  A random point separates the two orders about
+// once in a million; `rotatedPoints` places a point's bound on a row, column or height
+// integer and walks it ULP by ULP until a twin emits a different set.  The fixture then
+// REQUIRES, per twin, that some point separates it and that its whole expected pair list
+// differs from the CUDA's -- so this fixture cannot silently lose its teeth.
+//
+// Both entry points run over the same cloth: a vertex bound is (p - r, p + r)
+// (femClothHFMidPhase.cu:379), and a triangle whose three indices name one vertex has
+// triBoundingBox(p, p, p).fattenFast(r) -- the same bits -- so element i emits the same
+// pairs through either kernel.  2300 elements: past 2048, so the `j` loop runs twice.
+// ===========================================================================
+PXG_TEST(femClothSimHeightfieldMidphaseRotated)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p927hf;        // ClothHfMidPush
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const hflb::Placement hf = hflb::rotatedPlacement();
+    const std::vector<uint32_t> blob = hflb::rotatedBlob();
+    const hflb::Field field{ blob.data() };
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ASYMMETRIC and non-round; the kernel adds the two exactly as the host does.
+    const float CD_CLOTH = 0.07f, CD_HF = 0.045f;
+    const float radius = CD_CLOTH + CD_HF;
+
+    const uint32_t NB = 2300u;
+    std::vector<physx::PxVec3> pts;
+    std::vector<uint8_t> isKnife;
+    hflb::rotatedPoints(hf, field, radius, NB, pts, isKnife);
+    uint32_t nbKnives = 0u;
+    for (uint8_t k : isKnife) nbKnives += k;
+
+    // ---- the oracle, its composition check and the twins ----------------------------
+    std::vector<std::pair<uint32_t, uint32_t>> ref;           // (element, triangleIdx)
+    std::vector<std::vector<uint32_t>> refPer(NB);
+    uint32_t composedMismatch = 0u;
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        const physx::PxBounds3 b = hflb::sphereBound(pts[i], radius);
+        physx::PxVec3 mn, mx, cmn, cmx;
+        hflb::localBound(hf, b, hflb::CUDA, mn, mx);
+        hflb::localBound(hf, b, hflb::COMPOSED, cmn, cmx);
+        for (uint32_t a = 0; a < 3u; ++a)
+            if (f2u(mn[a]) != f2u(cmn[a]) || f2u(mx[a]) != f2u(cmx[a])) ++composedMismatch;
+        hflb::pairs(field, mn, mx, refPer[i]);
+        for (uint32_t t : refPer[i]) ref.push_back({ i, t });
+    }
+    std::sort(ref.begin(), ref.end());
+    PXG_CHECK_MSG(composedMismatch == 0u,
+                  "the hand-composed chain with nothing substituted differs from the "
+                  "foundation's transformFast in %u bound components; the twins below would "
+                  "then not be 'the CUDA with one piece changed'", composedMismatch);
+
+    uint32_t sepCount[6] = {}, sepKnife[6] = {};
+    for (uint32_t t = 0; t < 6u; ++t)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> twin;
+        for (uint32_t i = 0; i < NB; ++i)
+        {
+            std::vector<uint32_t> got;
+            hflb::pairsOfPoint(hf, field, pts[i], radius, hflb::ROT_TWINS[t], got);
+            if (got != refPer[i]) { ++sepCount[t]; sepKnife[t] += isKnife[i]; }
+            for (uint32_t g : got) twin.push_back({ i, g });
+        }
+        std::sort(twin.begin(), twin.end());
+        PXG_CHECK_MSG(twin != ref && sepCount[t] >= 3u,
+                      "twin '%s': only %u of %u elements emit a different pair set than the "
+                      "CUDA (need >= 3).  The fixture can no longer tell that spelling from "
+                      "transformFast(getInverse()) and would pass on the pre-P9.89 port",
+                      hflb::ROT_TWIN_NAMES[t], sepCount[t], NB);
+    }
+
+    // ---- the cloth: one vertex per point, triangle i = (i, i, i) --------------------
+    std::vector<F4> cv(NB);
+    for (uint32_t i = 0; i < NB; ++i) cv[i] = F4{ pts[i].x, pts[i].y, pts[i].z, 1.0f };
+    std::vector<TriIdx4> ci(NB);
+    for (uint32_t i = 0; i < NB; ++i) ci[i] = TriIdx4{ i, i, i, 0u };
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+
+    const uint32_t CLOTH_ID = 1u;
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbVerts = NB;
+    c.mNbTriangles = NB;
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = c;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_HEIGHTFIELD_H;  shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = hf.scale.x; shapes[0].sy = hf.scale.y; shapes[0].sz = hf.scale.z;
+    shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = CLOTH_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*hf cache*/ 1u, /*cloth cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;                                             // slot 0 (cloth) identity
+    xf[8 + 0] = hf.q.x; xf[8 + 1] = hf.q.y; xf[8 + 2] = hf.q.z; xf[8 + 3] = hf.q.w;
+    xf[8 + 4] = hf.p.x; xf[8 + 5] = hf.p.y; xf[8 + 6] = hf.p.z;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { CD_CLOTH, CD_HF };
+    DevBuf bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = 16384u;
+    PXG_CHECK_MSG(ref.size() < CAP, "the reference has %zu pairs; raise CAP", ref.size());
+    auto runOne = [&](const char* entry, std::vector<std::pair<uint32_t, uint32_t>>& emitted) {
+        std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+        DevBuf bStack = makeDev(dev, stack);
+        std::vector<uint32_t> pairNum = { 0u };
+        DevBuf bPairNum = makeDev(dev, pairNum);
+        ClothHfMidPush p = {};
+        p.numNPWorkItems = 1u;
+        p.toleranceLength = 1.0f;
+        p.cmInputs = bCms.addr;
+        p.transformCache = bXf.addr;
+        p.contactDistance = bCd.addr;
+        p.gpuShapes = bShapes.addr;
+        p.femClothes = bDesc.addr;
+        p.stackPtr = bStack.addr;
+        p.midphasePairsNum = bPairNum.addr;
+        p.stackSizeBytes = CAP * 16u;
+        Kernel k("femClothHfMidphaseBda.spv", entry, {}, sizeof(ClothHfMidPush));
+        k.dispatch(/*gridX*/ 1024u, {}, p, 1u, 1u);       // PxgNarrowphaseCore.cpp:6927
+        dev->flush();
+        const uint32_t n = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+        const auto s = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+        emitted.clear();
+        for (uint32_t i = 0; i < n && i < CAP; ++i)
+            emitted.push_back({ s[i * 4u + 1u], s[i * 4u + 2u] });
+        std::sort(emitted.begin(), emitted.end());
+        dev->destroyBuffer(bStack.h); dev->destroyBuffer(bPairNum.h);
+        return n;
+    };
+
+    const char* entries[2] = { "cloth_heightfieldMidphaseGeneratePairsLaunch",
+                               "cloth_midphaseVertexHeightfieldLaunch" };
+    for (const char* entry : entries)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> got;
+        const uint32_t n = runOne(entry, got);
+        uint32_t badElems = 0u, badKnives = 0u, firstBad = 0xFFFFFFFFu;
+        {
+            std::vector<std::vector<uint32_t>> gotPer(NB);
+            for (auto& e : got) if (e.first < NB) gotPer[e.first].push_back(e.second);
+            for (uint32_t i = 0; i < NB; ++i)
+            {
+                std::sort(gotPer[i].begin(), gotPer[i].end());
+                std::vector<uint32_t> want = refPer[i];
+                std::sort(want.begin(), want.end());
+                if (gotPer[i] != want)
+                {
+                    ++badElems; badKnives += isKnife[i];
+                    if (firstBad == 0xFFFFFFFFu) firstBad = i;
+                }
+            }
+        }
+        PXG_CHECK_MSG(n == uint32_t(ref.size()) && got == ref && badElems == 0u,
+                      "%s: %u pairs against the foundation oracle's %zu; %u elements (%u of "
+                      "them knife-edge points) emit a different set, first element %u.  A "
+                      "knife-edge mismatch is the association order of transformFast(getInverse()) "
+                      "-- femClothHFMidPhase.cu:107", entry, n, ref.size(), badElems, badKnives,
+                      firstBad);
+    }
+
+    std::printf("    [ note ] %u elements (%u knife-edge), %zu pairs; elements separating each "
+                "twin from the CUDA (knife-edge): all %u (%u), centre %u (%u), basis %u (%u), "
+                "col0 %u (%u), col1 %u (%u), col2 %u (%u)\n",
+                NB, nbKnives, ref.size(), sepCount[0], sepKnife[0], sepCount[1], sepKnife[1],
+                sepCount[2], sepKnife[2], sepCount[3], sepKnife[3], sepCount[4], sepKnife[4],
+                sepCount[5], sepKnife[5]);
 
     for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h })
         dev->destroyBuffer(h);

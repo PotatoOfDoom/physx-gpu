@@ -62,6 +62,7 @@
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData (P8.2 tranche d)
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
+#include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
 
 #include <cstdint>
 #include <cstddef>
@@ -13618,6 +13619,194 @@ PXG_TEST(softBodySimHeightfieldMidphase)
                   "%u.  0 usually means the blob walk or the inverse transform is wrong; a "
                   "large number means the row/column rectangle is not being clamped and the "
                   "whole field is being scanned", gNum);
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bTetMesh.h, bDesc.h,
+                               bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.89 -- sb_heightfieldMidphaseGeneratePairsLaunch under a GENERIC rotation, pair set
+// against the foundation's own PxBounds3::transformFast(hfTransform.getInverse(), bound)
+// (softbodyHFMidPhase.cu:205).
+//
+// The fixture above turns the field by 180 degrees about y, which is exact, so every
+// spelling of the inverse transform agrees there -- including the port's pre-P9.89
+// rotateInv(q, centre - p) and rotateInv(q, e_i) basis, which differ from the CUDA's
+// conj(q).rotate(centre) + rotateInv(q, -p) and PxMat33(conj q) by an ULP or two for any
+// rotation with inexact entries.  An ULP of the local bound is a floor/ceil/truncation on
+// the other side of an integer, i.e. a different pair SET.
+//
+// Same oracle, twins and knife-edge search as femClothSimHeightfieldMidphaseRotated
+// (pxgHfLocalBoundRef.h), driven through the SOFTBODY kernel: each tetrahedron names one
+// vertex four times, so tetBoundingBox + fattenFast(r) (softbodyHFMidPhase.cu:394-396) is
+// (p - r, p + r), the sphere bound the search places.  2300 surface tetrahedra: past
+// 2048, so the element loop runs twice.  Per twin, the fixture REQUIRES points that
+// separate it from the CUDA, so it cannot pass on the pre-P9.89 port.
+// ===========================================================================
+PXG_TEST(softBodySimHeightfieldMidphaseRotated)
+{
+    using namespace p80refit;
+    using namespace p811hf;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const hflb::Placement hf = hflb::rotatedPlacement();
+    const std::vector<uint32_t> blob = hflb::rotatedBlob();
+    const hflb::Field field{ blob.data() };
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float CD_SB = 0.07f, CD_HF = 0.045f;
+    const float radius = CD_SB + CD_HF;
+
+    const uint32_t NB = 2300u;
+    std::vector<physx::PxVec3> pts;
+    std::vector<uint8_t> isKnife;
+    hflb::rotatedPoints(hf, field, radius, NB, pts, isKnife);
+    uint32_t nbKnives = 0u;
+    for (uint8_t k : isKnife) nbKnives += k;
+
+    // ---- the oracle, its composition check and the twins ----------------------------
+    std::vector<std::pair<uint32_t, uint32_t>> ref;           // (tet, triangleIdx)
+    std::vector<std::vector<uint32_t>> refPer(NB);
+    uint32_t composedMismatch = 0u;
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        const physx::PxBounds3 b = hflb::sphereBound(pts[i], radius);
+        physx::PxVec3 mn, mx, cmn, cmx;
+        hflb::localBound(hf, b, hflb::CUDA, mn, mx);
+        hflb::localBound(hf, b, hflb::COMPOSED, cmn, cmx);
+        for (uint32_t a = 0; a < 3u; ++a)
+            if (f2u(mn[a]) != f2u(cmn[a]) || f2u(mx[a]) != f2u(cmx[a])) ++composedMismatch;
+        hflb::pairs(field, mn, mx, refPer[i]);
+        for (uint32_t t : refPer[i]) ref.push_back({ i, t });
+    }
+    std::sort(ref.begin(), ref.end());
+    PXG_CHECK_MSG(composedMismatch == 0u,
+                  "the hand-composed chain with nothing substituted differs from the "
+                  "foundation's transformFast in %u bound components", composedMismatch);
+
+    uint32_t sepCount[6] = {}, sepKnife[6] = {};
+    for (uint32_t t = 0; t < 6u; ++t)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> twin;
+        for (uint32_t i = 0; i < NB; ++i)
+        {
+            std::vector<uint32_t> got;
+            hflb::pairsOfPoint(hf, field, pts[i], radius, hflb::ROT_TWINS[t], got);
+            if (got != refPer[i]) { ++sepCount[t]; sepKnife[t] += isKnife[i]; }
+            for (uint32_t g : got) twin.push_back({ i, g });
+        }
+        std::sort(twin.begin(), twin.end());
+        PXG_CHECK_MSG(twin != ref && sepCount[t] >= 3u,
+                      "twin '%s': only %u of %u tetrahedra emit a different pair set than the "
+                      "CUDA (need >= 3) -- the fixture would pass on the pre-P9.89 port",
+                      hflb::ROT_TWIN_NAMES[t], sepCount[t], NB);
+    }
+
+    // ---- the softbody: vertex i, tetrahedron i = (i, i, i, i), every hint set ----------
+    std::vector<F4> tetVerts(NB);
+    for (uint32_t i = 0; i < NB; ++i) tetVerts[i] = F4{ pts[i].x, pts[i].y, pts[i].z, 1.0f };
+    std::vector<TetIdx4> tets(NB);
+    for (uint32_t i = 0; i < NB; ++i) tets[i] = TetIdx4{ i, i, i, i };
+    std::vector<uint32_t> hintWords((NB + 3u) / 4u + 1u, 0x01010101u);
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets),
+           bHints = makeDev(dev, hintWords);
+    std::vector<uint32_t> tetMeshHeader = { 999u, NB, 1u, 1u };     // numTets from .y
+    DevBuf bTetMesh = makeDev(dev, tetMeshHeader);
+
+    const uint32_t SB_ID = 2u;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTetMesh.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mNumTets = NB;
+    sb.mNumVerts = NB;
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_HEIGHTFIELD_H;     shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = hf.scale.x; shapes[0].sy = hf.scale.y; shapes[0].sz = hf.scale.z;
+    shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*hf cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;
+    xf[8 + 0] = hf.q.x; xf[8 + 1] = hf.q.y; xf[8 + 2] = hf.q.z; xf[8 + 3] = hf.q.w;
+    xf[8 + 4] = hf.p.x; xf[8 + 5] = hf.p.y; xf[8 + 6] = hf.p.z;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { CD_SB, CD_HF, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = 16384u;
+    PXG_CHECK_MSG(ref.size() < CAP, "the reference has %zu pairs; raise CAP", ref.size());
+    std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    SbHfMidPush push = {};
+    push.numNPWorkItems = 1u;
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbHfMidPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);          // PxgNarrowphaseCore.cpp:5360
+    dev->flush();
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+    std::vector<std::pair<uint32_t, uint32_t>> got;
+    std::vector<std::vector<uint32_t>> gotPer(NB);
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        got.push_back({ gStack[i * 4u + 1u], gStack[i * 4u + 2u] });
+        if (gStack[i * 4u + 1u] < NB) gotPer[gStack[i * 4u + 1u]].push_back(gStack[i * 4u + 2u]);
+    }
+    std::sort(got.begin(), got.end());
+    uint32_t badElems = 0u, badKnives = 0u, firstBad = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        std::sort(gotPer[i].begin(), gotPer[i].end());
+        std::vector<uint32_t> want = refPer[i];
+        std::sort(want.begin(), want.end());
+        if (gotPer[i] != want)
+        {
+            ++badElems; badKnives += isKnife[i];
+            if (firstBad == 0xFFFFFFFFu) firstBad = i;
+        }
+    }
+    PXG_CHECK_MSG(gNum == uint32_t(ref.size()) && got == ref && badElems == 0u,
+                  "%u pairs against the foundation oracle's %zu; %u tetrahedra (%u of them "
+                  "knife-edge points) emit a different set, first tet %u.  A knife-edge "
+                  "mismatch is the association order of transformFast(getInverse()) -- "
+                  "softbodyHFMidPhase.cu:205", gNum, ref.size(), badElems, badKnives, firstBad);
+
+    std::printf("  %u tets (%u knife-edge), %zu pairs; tets separating each twin from the "
+                "CUDA (knife-edge): all %u (%u), centre %u (%u), basis %u (%u), col0 %u (%u), "
+                "col1 %u (%u), col2 %u (%u)\n",
+                NB, nbKnives, ref.size(), sepCount[0], sepKnife[0], sepCount[1], sepKnife[1],
+                sepCount[2], sepKnife[2], sepCount[3], sepKnife[3], sepCount[4], sepKnife[4],
+                sepCount[5], sepKnife[5]);
 
     for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bTetMesh.h, bDesc.h,
                                bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })

@@ -331,9 +331,11 @@ public HfTriangle hfGetTriangleAdj(uint64_t samples, uint triangleIndex, float3 
 //
 // Upstream is `PxBounds3::transformFast(hfTransform.getInverse(), bound)` followed
 // by a per-axis division.  transformFast is basisExtent(inv.transform(centre),
-// PxMat33(inv.q), extents), and with inv.q = conj(hfQ) that is
-// hfQ.rotateInv(centre - hfP) for the centre and hfQ.rotateInv(e_i) for the basis
-// columns -- so the extent is the ABS-SUM of the three scaled columns.
+// PxMat33(inv.q), extents) with inv = (hfQ.rotateInv(-hfP), conj hfQ), so the centre
+// is conj(hfQ).rotate(centre) + hfQ.rotateInv(-hfP) -- two rotations, then an add --
+// and the basis is the PxMat33(conj hfQ) matrix, and the extent is the ABS-SUM of the
+// three scaled columns.  It is NOT hfQ.rotateInv(centre - hfP) and hfQ.rotateInv(e_i):
+// those are the same in exact arithmetic and differ in the last bits (P9.89).
 //
 // The height axis divides by the SIGNED scale and the row/column axes by |scale|,
 // which is upstream's asymmetry, not a transcription slip (femClothHFMidPhase.cu:200
@@ -356,10 +358,25 @@ public void hfLocalBound(float4 hfQ, float3 hfP, float3 hfScale,
 
     const float3 centre = (worldMin + worldMax) * 0.5f;
     const float3 extents = (worldMax - worldMin) * 0.5f;
-    const float3 lc = quatRotateInv(hfQ, centre - hfP);
-    const float3 c0 = quatRotateInv(hfQ, float3(1, 0, 0)) * extents.x;
-    const float3 c1 = quatRotateInv(hfQ, float3(0, 1, 0)) * extents.y;
-    const float3 c2 = quatRotateInv(hfQ, float3(0, 0, 1)) * extents.z;
+    // P9.89: femClothHFMidPhase.cu:107 / softbodyHFMidPhase.cu:205, transcribed as the
+    // foundation spells it.  getInverse() = (q.rotateInv(-p), conj q) (PxTransform.h:117)
+    // and transformFast = basisExtent(inv.q.rotate(c) + inv.p, PxMat33(inv.q), extents)
+    // (PxBounds3.h:472-476, PxTransform.h:131): the centre and -p are rotated SEPARATELY
+    // and the two rounded vectors added, and the basis is PxMat33(PxQuat)
+    // (PxMat33.h:136-163) with its `(1 - yy) - zz` diagonal.  Until P9.89 this was
+    // quatRotateInv(hfQ, centre - hfP) and quatRotateInv(hfQ, e_i) -- a different rounding
+    // tree for the centre and the `2(w^2 - 0.5) + 2x^2` diagonal, bitwise the CUDA only
+    // for the identity and the 180-degree axis turns.  quatRotate(conj q, v) is bitwise
+    // quatRotateInv(q, v) (every negation is exact); the conjugate is spelled out because
+    // that is what getInverse() hands transformFast.  Pinned by
+    // {femClothSim,softBodySim}HeightfieldMidphaseRotated.
+    const float4 qInv = quatConjugate(hfQ);
+    const float3 invP = quatRotateInv(hfQ, -hfP);
+    const float3 lc = quatRotate(qInv, centre) + invP;
+    const PxgMat33 basis = mat33FromQuat(qInv);
+    const float3 c0 = basis.col0 * extents.x;
+    const float3 c1 = basis.col1 * extents.y;
+    const float3 c2 = basis.col2 * extents.z;
     const float3 w = abs(c0) + abs(c1) + abs(c2);
     lMin = lc - w;
     lMax = lc + w;
