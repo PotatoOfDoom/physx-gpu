@@ -203,7 +203,15 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # primitive shaders transcribe the stages separately and are never compared against
     # this kernel.  testBoxBoxNphase boxBoxNphase_p90DotOrder compares the contact points
     # and penetrations bitwise and fails without this entry.
-    boxBoxNphase)
+    boxBoxNphase
+    # P9.90: the rigid PGS solve.  Every row projects the body velocities with PxVec3
+    # dots, v = lin.dot(n) + ang.dot(raXn), (x + y) + z (PxVec3.h:173,
+    # solverBlock.cuh:178/:291/:465/:537/:659); unstamped, llvmpipe summed them
+    # x + (y + z).  Its imports (pxgSlangCommon, pxgSlangSolverDesc) carry no shared
+    # solve math and no other kernel is compared against it; solverTGS was already
+    # stamped.  testSolver solverPGS_p90DotOrder compares the solved velocities, applied
+    # forces and residuals bitwise and fails without this entry.
+    solverPGS)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)

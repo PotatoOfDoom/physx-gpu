@@ -245,6 +245,19 @@ inline float pgsCudaFmaxf(float a, float b)
 // (llvmpipe FMax = maxNum, NaN-ignoring), which keeps the running maximum across a NaN residual.
 int gPgsErrMaxVariant = 0;
 
+// P9.90: PxVec3::dot is (x*x' + y*y') + z*z' (PxVec3.h:173), the order the solve's velocity
+// projections use (solverBlock.cuh:178/:465/:537: v = lin.dot(n) + ang.dot(raXn)).  On llvmpipe an
+// UNDECORATED OpDot sums x*x' + (y*y' + z*z') (Mesa lower_fdot); solverPGS is stamped NoContraction
+// (PXG_NOCONTRACT_SHADERS) so its dots run forward.  gPgsDotOrder 1 is the old-order twin the
+// solverPGS_p90DotOrder fixture uses to prove it observes the stamp.
+int gPgsDotOrder = 0;
+inline float pgsDot(const Vec3& a, const Vec3& b)
+{
+    if (gPgsDotOrder == 1)
+        return a.x * b.x + (a.y * b.y + a.z * b.z);
+    return (a.x * b.x + a.y * b.y) + a.z * b.z;
+}
+
 // PxgErrorAccumulator reference (solverResidual.cuh): per-thread contact
 // residual statistics, accumulated by the contact solve (solveBlockPartition,
 // solveStaticBlock).  maxError = PxMax(maxError, PxAbs(e)) (solverResidual.cuh:57)
@@ -335,8 +348,8 @@ void refSolveContact(const BlockConstraintBatch& batch, Vec3& lv0, Vec3& av0, Ve
         refContactCoefficients(flags, restitution, unitResponse, recipResponse, ra.w, c.coeff0[lane],
                                c.coeff1[lane], velMultiplier, impulseMul, biasedErr);
 
-        const float v0 = lv0.dot(normal) + av0.dot(raXn);
-        const float v1 = lv1.dot(normal) + av1.dot(rbXn);
+        const float v0 = pgsDot(lv0, normal) + pgsDot(av0, raXn);
+        const float v1 = pgsDot(lv1, normal) + pgsDot(av1, rbXn);
         const float normalVel = v0 - v1;
 
         const float tempDeltaF = biasedErr - normalVel * velMultiplier;
@@ -379,8 +392,8 @@ void refSolveContact(const BlockConstraintBatch& batch, Vec3& lv0, Vec3& av0, Ve
 
             const Vec3 fdel0 = fnormal * invMassA, fdel1 = fnormal * invMassB;
 
-            const float v0 = av0.dot(raXn) + lv0.dot(fnormal);
-            const float v1 = av1.dot(rbXn) + lv1.dot(fnormal);
+            const float v0 = pgsDot(av0, raXn) + pgsDot(lv0, fnormal);
+            const float v1 = pgsDot(av1, rbXn) + pgsDot(lv1, fnormal);
             const float normalVel = v0 - v1;
 
             const float tmp1 = appliedForce - (ra.w - rb.w) * velMultiplier;
@@ -470,8 +483,8 @@ void refSolve1D(const BlockConstraintBatch& batch, Vec3& lv0, Vec3& av0, Vec3& l
         unbiasedConstant += velBias;
 
         const float appliedForce = mod.appliedForce[lane];
-        const float v0 = lv0.dot(clin0) + av0.dot(cang0);
-        const float v1 = lv1.dot(clin1) + av1.dot(cang1);
+        const float v0 = pgsDot(lv0, clin0) + pgsDot(av0, cang0);
+        const float v1 = pgsDot(lv1, clin1) + pgsDot(av1, cang1);
         const float normalVel = v0 - v1;
 
         const float unclampedForce = iMul * appliedForce + (vMul * normalVel + constant);
@@ -555,14 +568,16 @@ struct EngineBlob
 // from islandContextPool[0]) but DECOY partition/batch fields, while element
 // [1] carries the real partition/batch fields but decoy body counts.
 // ---------------------------------------------------------------------------
-PXG_TEST(solverPGS_contactAndJointBatches)
+// P9.90: p90 = false is the original tolerance fixture; p90 = true compares every solve output
+// bit for bit and proves the old-order twin would differ (solverPGS_p90DotOrder).
+static void pgsPartitionFixture(uint32_t seed, bool p90)
 {
     using physx::gpuslang::PxgCudaShim;
     using physx::gpuslang::PxgKernelDef;
     using physx::gpuslang::PxgDevicePtr;
     using physx::gpuslang::PxgResult;
 
-    std::mt19937 rng(3000);
+    std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-3.f, 3.f);
 
@@ -817,43 +832,55 @@ PXG_TEST(solverPGS_contactAndJointBatches)
     // per-launch, per-warp, per-lane contact accumulators
     std::vector<RefErrAcc> errAcc(2 * numWarpsInGrid * 32);
 
-    for (uint32_t partition = 0; partition < 2; ++partition)
+    // P9.90: the reference runs as a lambda over its own mutable copies so the p90 variant can
+    // re-run it from the same inputs with the old dot order (gPgsDotOrder = 1).
+    const std::vector<BlockFrictionHeader> fhsIn = frictionHeaders;
+    const std::vector<BlockContactPoint> cpsIn = contactPoints;
+    const std::vector<BlockContactFriction> frsIn = frictions;
+    const std::vector<BlockJointRowMod> jmsIn = jointRowsMod;
+    auto runReference = [&](std::vector<Float4>& rv, std::vector<BlockFrictionHeader>& fhs,
+                            std::vector<BlockContactPoint>& cps, std::vector<BlockContactFriction>& frs,
+                            std::vector<BlockJointRowMod>& jms, std::vector<RefErrAcc>& acc)
     {
-        const uint32_t startIndex = partition == 0 ? batchStartIndex : cpp[1];
-        const uint32_t endIndex = cpp[1 + partition];
-        for (uint32_t k = startIndex; k < endIndex; ++k)
+        for (uint32_t partition = 0; partition < 2; ++partition)
         {
-            const uint32_t warp = (k - startIndex) % numWarpsInGrid;
-            const BlockConstraintBatch& b = batches[k];
-            for (uint32_t lane = 0; lane < b.descStride; ++lane)
+            const uint32_t startIndex = partition == 0 ? batchStartIndex : cpp[1];
+            const uint32_t endIndex = cpp[1 + partition];
+            for (uint32_t k = startIndex; k < endIndex; ++k)
             {
-                const uint32_t readIndex = k * 128 + lane;
-                Vec3 lv0(refVel[readIndex].x, refVel[readIndex].y, refVel[readIndex].z);
-                Vec3 av0(refVel[readIndex + 32].x, refVel[readIndex + 32].y, refVel[readIndex + 32].z);
-                Vec3 lv1(refVel[readIndex + 64].x, refVel[readIndex + 64].y, refVel[readIndex + 64].z);
-                Vec3 av1(refVel[readIndex + 96].x, refVel[readIndex + 96].y, refVel[readIndex + 96].z);
+                const uint32_t warp = (k - startIndex) % numWarpsInGrid;
+                const BlockConstraintBatch& b = batches[k];
+                for (uint32_t lane = 0; lane < b.descStride; ++lane)
+                {
+                    const uint32_t readIndex = k * 128 + lane;
+                    Vec3 lv0(rv[readIndex].x, rv[readIndex].y, rv[readIndex].z);
+                    Vec3 av0(rv[readIndex + 32].x, rv[readIndex + 32].y, rv[readIndex + 32].z);
+                    Vec3 lv1(rv[readIndex + 64].x, rv[readIndex + 64].y, rv[readIndex + 64].z);
+                    Vec3 av1(rv[readIndex + 96].x, rv[readIndex + 96].y, rv[readIndex + 96].z);
 
-                float ref0 = 1.f, ref1 = 1.f;
-                if (b.bodyAIndex[lane] >= bodyOffset)
-                    ref0 = float(refCountActiveSlabs(b.bodyAIndex[lane], numSlabs, numTotalBodies, encoded));
-                if (b.bodyBIndex[lane] >= bodyOffset)
-                    ref1 = float(refCountActiveSlabs(b.bodyBIndex[lane], numSlabs, numTotalBodies, encoded));
+                    float ref0 = 1.f, ref1 = 1.f;
+                    if (b.bodyAIndex[lane] >= bodyOffset)
+                        ref0 = float(refCountActiveSlabs(b.bodyAIndex[lane], numSlabs, numTotalBodies, encoded));
+                    if (b.bodyBIndex[lane] >= bodyOffset)
+                        ref1 = float(refCountActiveSlabs(b.bodyBIndex[lane], numSlabs, numTotalBodies, encoded));
 
-                if (b.constraintType == 1) // engine encoding: eCONTACT = 1
-                    refSolveContact(b, lv0, av0, lv1, av1, true, lane, contactHeaders, frictionHeaders,
-                                    contactPoints, frictions, ref0, ref1,
-                                    &errAcc[(partition * numWarpsInGrid + warp) * 32 + lane]);
-                else
-                    refSolve1D(b, lv0, av0, lv1, av1, lane, true, jointHeaders, jointRowsCon, jointRowsMod,
-                               ref0, ref1);
+                    if (b.constraintType == 1) // engine encoding: eCONTACT = 1
+                        refSolveContact(b, lv0, av0, lv1, av1, true, lane, contactHeaders, fhs,
+                                        cps, frs, ref0, ref1,
+                                        &acc[(partition * numWarpsInGrid + warp) * 32 + lane]);
+                    else
+                        refSolve1D(b, lv0, av0, lv1, av1, lane, true, jointHeaders, jointRowsCon, jms,
+                                   ref0, ref1);
 
-                refVel[b.remappedBodyAIndex[lane]] = Float4{ lv0.x, lv0.y, lv0.z, 0.f };
-                refVel[b.remappedBodyAIndex[lane] + 32] = Float4{ av0.x, av0.y, av0.z, 0.f };
-                refVel[b.remappedBodyBIndex[lane]] = Float4{ lv1.x, lv1.y, lv1.z, 0.f };
-                refVel[b.remappedBodyBIndex[lane] + 32] = Float4{ av1.x, av1.y, av1.z, 0.f };
+                    rv[b.remappedBodyAIndex[lane]] = Float4{ lv0.x, lv0.y, lv0.z, 0.f };
+                    rv[b.remappedBodyAIndex[lane] + 32] = Float4{ av0.x, av0.y, av0.z, 0.f };
+                    rv[b.remappedBodyBIndex[lane]] = Float4{ lv1.x, lv1.y, lv1.z, 0.f };
+                    rv[b.remappedBodyBIndex[lane] + 32] = Float4{ av1.x, av1.y, av1.z, 0.f };
+                }
             }
         }
-    }
+    };
+    runReference(refVel, frictionHeaders, contactPoints, frictions, jointRowsMod, errAcc);
 
     // accumulateErrorGlobalFullWarp reference: __shfl_xor butterfly (radius
     // 16..1) per warp, then per-warp partials into the accumulator (order-
@@ -954,9 +981,86 @@ PXG_TEST(solverPGS_contactAndJointBatches)
     PXG_CHECK_MSG(almostEqual(gpuDesc.contactErrorAccumulator.mMaxError, expectMax, 2e-4f, 2e-4f),
                   "residual max: gpu=%g ref=%g", gpuDesc.contactErrorAccumulator.mMaxError, expectMax);
 
+    if (p90)
+    {
+        // P9.90: every solve output bit for bit against the -ffp-contract=off mirror in the CUDA dot
+        // order, and against the old-order twin (x*x' + (y*y' + z*z'), the unstamped llvmpipe OpDot).
+        std::vector<Float4> twinVel = velPool;
+        std::vector<BlockFrictionHeader> twinFhs = fhsIn;
+        std::vector<BlockContactPoint> twinCps = cpsIn;
+        std::vector<BlockContactFriction> twinFrs = frsIn;
+        std::vector<BlockJointRowMod> twinJms = jmsIn;
+        std::vector<RefErrAcc> twinAcc(errAcc.size());
+        gPgsDotOrder = 1;
+        runReference(twinVel, twinFhs, twinCps, twinFrs, twinJms, twinAcc);
+        gPgsDotOrder = 0;
+
+        // One word per compared output: gpu, CUDA-order mirror, old-order twin.
+        // live = words the solve actually rewrote (mirror != input); the guard is measured against those.
+        size_t words = 0, live = 0, gpuDiff = 0, twinDiff = 0, gpuDiffIsTwin = 0;
+        auto cmp = [&](float g, float r, float t, float in) {
+            ++words;
+            if (pgsBits(r) != pgsBits(in))
+                ++live;
+            const bool twinDiffers = pgsBits(t) != pgsBits(r);
+            if (twinDiffers)
+                ++twinDiff;
+            if (pgsBits(g) != pgsBits(r))
+            {
+                ++gpuDiff;
+                if (pgsBits(g) == pgsBits(t))
+                    ++gpuDiffIsTwin;
+            }
+        };
+        for (size_t i = 0; i < refVel.size(); ++i)
+        {
+            cmp(gpuVel[i].x, refVel[i].x, twinVel[i].x, velPool[i].x);
+            cmp(gpuVel[i].y, refVel[i].y, twinVel[i].y, velPool[i].y);
+            cmp(gpuVel[i].z, refVel[i].z, twinVel[i].z, velPool[i].z);
+        }
+        for (size_t c = 0; c < contactPoints.size(); ++c)
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                cmp(gpuContacts[c].appliedForce[lane], contactPoints[c].appliedForce[lane],
+                    twinCps[c].appliedForce[lane], cpsIn[c].appliedForce[lane]);
+        for (size_t f = 0; f < frictions.size(); ++f)
+            for (uint32_t lane = 0; lane < 32; ++lane)
+                cmp(gpuFrictions[f].appliedForce[lane], frictions[f].appliedForce[lane],
+                    twinFrs[f].appliedForce[lane], frsIn[f].appliedForce[lane]);
+        for (size_t j = 0; j < jointRowsMod.size(); ++j)
+            for (uint32_t lane = 0; lane < 32; ++lane)
+            {
+                cmp(gpuJointMods[j].appliedForce[lane], jointRowsMod[j].appliedForce[lane],
+                    twinJms[j].appliedForce[lane], jmsIn[j].appliedForce[lane]);
+                cmp(gpuJointMods[j].residual[lane], jointRowsMod[j].residual[lane], twinJms[j].residual[lane],
+                    jmsIn[j].residual[lane]);
+            }
+        std::printf("    p90: %zu words (%zu rewritten by the solve), gpu != mirror: %zu (of which == old-order "
+                    "twin: %zu), twin != mirror: %zu\n", words, live, gpuDiff, gpuDiffIsTwin, twinDiff);
+        PXG_CHECK_MSG(gpuDiff == 0, "%zu of %zu solve outputs differ bitwise from the CUDA-order mirror "
+                      "(%zu equal the old-order twin: solverPGS unstamped?)", gpuDiff, words, gpuDiffIsTwin);
+        PXG_CHECK_MSG(live > 0 && twinDiff * 8 >= live,
+                      "coverage guard: the old-order dot twin must differ from the mirror on >= 1/8 of the "
+                      "rewritten outputs (got %zu of %zu)", twinDiff, live);
+    }
+
     for (PxgDevicePtr pfree : { dVel, dEnc, dCpp, dIsl, dBatch, dCh, dFh, dCp, dFr, dJh, dJc, dJm,
                                 dDesc, dShared })
         shim.memFree(pfree);
+}
+
+PXG_TEST(solverPGS_contactAndJointBatches)
+{
+    pgsPartitionFixture(3000u, false);
+}
+
+// P9.90: solverPGS is stamped NoContraction (PXG_NOCONTRACT_SHADERS), so its OpDots sum
+// (x*x' + y*y') + z*z' like PxVec3::dot.  Same two-partition contact/1D-joint solve as above, with
+// random unit normals and non-round velocities/arms, compared WORD FOR WORD: the solved velocities,
+// every normal/friction/joint appliedForce and the joint residuals.  Unstamped, llvmpipe sums
+// x*x' + (y*y' + z*z') and the outputs match the old-order twin instead.
+PXG_TEST(solverPGS_p90DotOrder)
+{
+    pgsPartitionFixture(4290u, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,8 +1874,8 @@ bool refCheckActiveContact(const BlockConstraintBatch& b, const Vec3& lv0, const
 
         const Vec3 raXn(ra.x, ra.y, ra.z), rbXn(rb.x, rb.y, rb.z);
 
-        const float v0 = lv0.dot(normal) + av0.dot(raXn);
-        const float v1 = lv1.dot(normal) + av1.dot(rbXn);
+        const float v0 = pgsDot(lv0, normal) + pgsDot(av0, raXn);
+        const float v1 = pgsDot(lv1, normal) + pgsDot(av1, rbXn);
         const float normalVel = v0 - v1;
 
         const float tempDeltaF = biasedErr - normalVel * velMultiplier;
