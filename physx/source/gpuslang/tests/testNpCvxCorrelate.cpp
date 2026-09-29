@@ -46,6 +46,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -101,6 +102,38 @@ static V3 qRot(const F4& q, const V3& v)
                vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
                vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 };
 }
+
+// P9.89 twin: the rotate cvxTriCorrelateBda carried before P9.89,
+// v*(w*w - u.u) + u*(2 u.v) + (u x v)*(2w), in the order its SPIR-V evaluated it
+// (NoContraction-stamped, OpDot as (x + y) + z).  Algebraically qRot for a unit q,
+// bitwise something else.  Used only to prove the fixture's inputs tell them apart.
+static V3 qRotOldPort(const F4& q, const V3& v)
+{
+    const V3 u{ q.x, q.y, q.z };
+    const float s = q.w * q.w - dot3(u, u);
+    const float d2 = dot3(u, v) * 2.0f;
+    const float w2 = q.w * 2.0f;
+    return add(add(mul(v, s), mul(u, d2)), mul(crossp(u, v), w2));
+}
+
+// P9.89: what the deepest-triangle pick reads when NO lane has a winner.  The CUDA
+// identity is bestIndex = 0 (convexMeshCorrelate.cu:170), an ABSOLUTE index into
+// nicBuffer (:182 stores start + i, :194 reads nicBuffer[bestIndex]).  It is only
+// reached when every surviving triangle has a +inf or NaN depth: purge (:72) drops
+// d == FLT_MAX alone, and neither passes `d < bestDepth`.
+struct RefOpts
+{
+    // The normal at GLOBAL nicBuffer slot 0.  nullptr: this record's own slot 0 --
+    // right for the scalar shader, whose record IS its buffer.  The engine layout
+    // rebases record i to slot i*64, so there global slot 0 is another pair's.
+    const V3* globalSlot0 = nullptr;
+    // Twin of the pre-P9.89 port: bestIndex run-relative, identity read as
+    // nicBuffer[start] (this pair's own first survivor).
+    bool oldRunSlot0 = false;
+    // Twin of the pre-P9.89 port's algebraic rotate.
+    bool oldRotate = false;
+    uint32_t noWinner = 0;   // out: patches whose pick fell back to the identity
+};
 
 static uint32_t getNb(uint32_t index) { return (index & 0x7FFFFFFFu) >> 27; }
 static uint32_t getTri(uint32_t index) { return index & ((1u << 27) - 1); }
@@ -192,7 +225,8 @@ static uint32_t binarySearch32(const uint32_t data[32], uint32_t value)
     return left != 0 ? left - 1 : 0;
 }
 
-static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg, bool& reduceRan)
+static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg, bool& reduceRan,
+                         RefOpts* opt = nullptr)
 {
     for (int j = 0; j < 72; ++j) o.contacts[j] = F4{ 0, 0, 0, 0 };
     o.nbC = U4{ UNTOUCHED, UNTOUCHED, UNTOUCHED, UNTOUCHED }; // stale-buffer sentinel: the per-patch write must show
@@ -270,7 +304,15 @@ static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg, bool& reduceRa
                 for (int L = 0; L < 32; ++L)
                 { const float dd = std::fabs(laneBest[L] - minD); if (laneBest[L] != FLTMAX && dd != 0.f && dd < TIE) marg = true; }
                 const uint32_t bestIndex = laneIdx[i0];
-                const V3 bestNormal = v3(s.nrm[nicSlot[bestIndex]]);
+                V3 bestNormal = v3(s.nrm[nicSlot[bestIndex]]);
+                // Every lane still holds the identity (FLT_MAX, 0): minIndex took
+                // lane 0 and the broadcast index is the init value 0.
+                if (minD == FLTMAX && opt)
+                {
+                    ++opt->noWinner;
+                    if (opt->oldRunSlot0) bestNormal = v3(s.nrm[nicSlot[start]]);
+                    else if (opt->globalSlot0) bestNormal = *opt->globalSlot0;
+                }
 
                 uint32_t curMask = 0;
                 V3 pA[32]; float sepL[32]; uint32_t triL[32]; bool hasC[32];
@@ -350,8 +392,10 @@ static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg, bool& reduceRa
                     if (curMask & (1u << L))
                     {
                         const uint32_t slot = popc(curMask & ((1u << L) - 1));
-                        const V3 nor = qRot(s.aToBq, bestNormal);
-                        const V3 pointB = add(add(qRot(s.aToBq, pA[L]), v3(s.aToBp)), mul(nor, sepL[L]));
+                        const bool oldRot = opt && opt->oldRotate;
+                        const V3 nor = oldRot ? qRotOldPort(s.aToBq, bestNormal) : qRot(s.aToBq, bestNormal);
+                        const V3 rA = oldRot ? qRotOldPort(s.aToBq, pA[L]) : qRot(s.aToBq, pA[L]);
+                        const V3 pointB = add(add(rA, v3(s.aToBp)), mul(nor, sepL[L]));
                         const uint32_t base = (nbPatches * 6 + slot) * 3;
                         o.contacts[base + 0] = F4{ pA[L].x, pA[L].y, pA[L].z, sepL[L] };
                         float triF; std::memcpy(&triF, &triL[L], 4);
@@ -649,6 +693,18 @@ PXG_TEST(cvxTriCorrelate)
     size_t nSkip = 0, cCached = 0, cZeroTri = 0, cCm1 = 0, cReduce = 0, cMultiPatch = 0,
            cQuirk8 = 0, cTwoBlocks = 0, cTie = 0;
 
+    // P9.89: the engine's GLOBAL nicBuffer slot 0 is case 0's record slot 0 (the
+    // layout below puts pair i at i*64).  Case 0 is cached (0 % 29), so the kernel
+    // never touches that record and the slot is stable for the whole dispatch --
+    // on the CUDA the no-winner read races whichever pair owns slot 0.
+    V3 g0{ 0, 0, 0 };
+    auto runRef = [&](uint32_t i, bool& marg, bool& rr) {
+        RefOpts o; o.globalSlot0 = &g0;
+        refCorrelate(in[i], ref[i], marg, rr, &o);
+    };
+    const float PINF = std::numeric_limits<float>::infinity();
+    const float QNAN = std::numeric_limits<float>::quiet_NaN();
+
     for (uint32_t i = 0; i < N; ++i)
     {
         CorrIn s{};
@@ -737,10 +793,39 @@ PXG_TEST(cvxTriCorrelate)
             s.nrm[5] = F4{ EPS_ACC, 0.08715574f, 0.f, 0 };
             s.depth[1].y = -1.0f;
         }
+        else if (i % 7 == 3 && !cached)
+        {
+            // P9.89: the NO-WINNER pick (convexMeshCorrelate.cu:170-194).  Survivors
+            // carry +inf or NaN depths, which purge keeps (it drops only
+            // d == FLT_MAX) and which never pass `d < bestDepth`, so every lane keeps
+            // the identity (FLT_MAX, 0) and the pick reads GLOBAL nicBuffer slot 0.
+            // A third of them carry that slot's normal bitwise, so the CUDA accepts
+            // exactly those; the rest keep this case's clusters, which the port's old
+            // run-relative identity (nicBuffer[start], its own first survivor) would
+            // have accepted instead.  i % 14 == 10 is the MIXED variant: cn[0]/cn[1]
+            // triangles keep finite depths and make ordinary patches first, and the
+            // no-winner pick only comes for the non-finite leftovers.
+            const bool mixed = (i % 14) == 10;
+            for (uint32_t jj = 0; jj < 64; ++jj)
+            {
+                float& d = (&s.depth[jj / 4].x)[jj & 3];
+                if (d == FLTMAX) continue;                         // purged either way
+                const uint32_t pick = rng() % 3;
+                if (mixed && pick < 2)
+                {
+                    s.nrm[jj] = F4{ cn[pick].x, cn[pick].y, cn[pick].z, 0 };
+                    continue;                                      // finite rf(-1,1) depth
+                }
+                d = (rng() % 2) ? PINF : QNAN;
+                const V3 n = (rng() % 3 == 0) ? g0 : (mixed ? cn[2] : cn[rng() % 3]);
+                s.nrm[jj] = F4{ n.x, n.y, n.z, 0 };
+            }
+        }
 
         in[i] = s;
+        if (i == 0) g0 = v3(in[0].nrm[0]);
         bool marg = false, reduceRan = false;
-        refCorrelate(s, ref[i], marg, reduceRan);
+        runRef(i, marg, reduceRan);
         skip[i] = marg ? 1 : 0;
         if (marg) { ++nSkip; continue; }
         if (cached) ++cCached;
@@ -840,7 +925,7 @@ PXG_TEST(cvxTriCorrelate)
         {
             in[i] = s;
             bool marg = false, rr = false;
-            refCorrelate(s, ref[i], marg, rr);
+            runRef(i, marg, rr);
             skip[i] = marg ? 1 : 0;
         }
         std::memcpy(&pairBuf[i * 14 + 4], &s.aToBp, 12);
@@ -849,6 +934,40 @@ PXG_TEST(cvxTriCorrelate)
     dev->destroyBuffer(bPairs);
     bPairs = createBufferFrom(dev, pairBuf);
     push.pairs = dev->getBufferDeviceAddress(bPairs);
+
+    // P9.89: the two pre-P9.89 port behaviours as TWINS of the oracle.  A fixture
+    // is only one if its inputs make the old and the new port disagree; these
+    // count the checked cases where they do, bit for bit.
+    auto outDiffers = [&](const CorrOut& a, const CorrOut& b) {
+        return std::memcmp(&a, &b, sizeof(CorrOut)) != 0;
+    };
+    size_t cNoWin = 0, cIdxTwin = 0, cRotTwin = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (skip[i]) continue;
+        bool m1 = false, r1 = false;
+        RefOpts cur; cur.globalSlot0 = &g0;
+        CorrOut chk;
+        refCorrelate(in[i], chk, m1, r1, &cur);
+        if (cur.noWinner) ++cNoWin;
+
+        bool m2 = false, r2 = false;
+        RefOpts oldIdx; oldIdx.globalSlot0 = &g0; oldIdx.oldRunSlot0 = true;
+        CorrOut twinIdx;
+        refCorrelate(in[i], twinIdx, m2, r2, &oldIdx);
+        if (outDiffers(twinIdx, ref[i])) ++cIdxTwin;
+
+        bool m3 = false, r3 = false;
+        RefOpts oldRot; oldRot.globalSlot0 = &g0; oldRot.oldRotate = true;
+        CorrOut twinRot;
+        refCorrelate(in[i], twinRot, m3, r3, &oldRot);
+        if (outDiffers(twinRot, ref[i])) ++cRotTwin;
+    }
+    PXG_CHECK_MSG(cNoWin >= 12, "cvxTriCorrelate: no-winner pick driven in only %zu cases", cNoWin);
+    PXG_CHECK_MSG(cIdxTwin >= 8,
+                  "cvxTriCorrelate: the run-relative identity twin differs in only %zu cases", cIdxTwin);
+    PXG_CHECK_MSG(cRotTwin > N / 3,
+                  "cvxTriCorrelate: the algebraic-rotate twin differs in only %zu cases", cRotTwin);
 
     {
         Kernel k("cvxTriCorrelateBda.spv", "convexTrimeshCorrelate", {}, sizeof(CcPush));
@@ -901,10 +1020,12 @@ PXG_TEST(cvxTriCorrelate)
                     const F4& e2 = r.contacts[base + 2];   // normal
                     uint32_t gotTri; std::memcpy(&gotTri, &man[(p * 6 + c) * 12 + 10], 4);
                     uint32_t expTri; std::memcpy(&expTri, &e1.w, 4);
-                    if (!eqF(cp[0], e0.x) || !eqF(cp[1], e0.y) || !eqF(cp[2], e0.z) ||
-                        !eqF(cp[3], e1.x) || !eqF(cp[4], e1.y) || !eqF(cp[5], e1.z) ||
-                        !eqF(cp[6], e2.x) || !eqF(cp[7], e2.y) || !eqF(cp[8], e2.z) ||
-                        !eqF(cp[9], e0.w) || gotTri != expTri)
+                    // P9.89: BITWISE.  This was eqF (rel 2e-4), which is how the
+                    // algebraic rotate's last-ulp normals and pointBs went unseen.
+                    if (!bitEq(cp[0], e0.x) || !bitEq(cp[1], e0.y) || !bitEq(cp[2], e0.z) ||
+                        !bitEq(cp[3], e1.x) || !bitEq(cp[4], e1.y) || !bitEq(cp[5], e1.z) ||
+                        !bitEq(cp[6], e2.x) || !bitEq(cp[7], e2.y) || !bitEq(cp[8], e2.z) ||
+                        !bitEq(cp[9], e0.w) || gotTri != expTri)
                     { ++mmC; break; }
                 }
         }

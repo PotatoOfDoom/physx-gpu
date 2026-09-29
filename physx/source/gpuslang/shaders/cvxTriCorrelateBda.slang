@@ -206,11 +206,22 @@ uint ccBinarySearch32(uint value)
 uint ccGetNbContacts(uint index) { return (index & 0x7FFFFFFFu) >> 27u; }
 uint ccGetTriangleIndex(uint index) { return index & ((1u << 27) - 1u); }
 
+// P9.89: PxQuat::rotate LITERALLY (PxQuat.h:286-295, reached through
+// PxTransform::rotate/transform at convexMeshCorrelate.cu:304 and :313).  This
+// used to be v*(w*w - |u|^2) + u*(2 u.v) + (u x v)*(2w), which equals the PhysX
+// form only algebraically and only for an exactly unit q: 2v(w^2 - 1/2) is not
+// v(w^2 - |u|^2) once q is a rounded float quaternion, and the two sum their
+// products in different orders.  Every written normal and pointB came out a few
+// ulps off.  Same class as the rotate P9.37 removed from softBodyContactGenBda;
+// npCvxCorrelate.slang's quatRotate is this same literal body.
 float3 ccQuatRotate(float4 q, float3 v)
 {
-    const float w = q.w;
-    const float3 u = q.xyz;
-    return v * (w * w - dot(u, u)) + u * (dot(u, v) * 2.0f) + cross(u, v) * (w * 2.0f);
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = q.x * vx + q.y * vy + q.z * vz;
+    return float3(vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+                  vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+                  vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2);
 }
 
 // --------------------------------------------------------------------------
@@ -325,6 +336,20 @@ void convexTrimeshCorrelate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
             // Per-lane strided scan with a STRICT `<`, so within a lane the first
             // strided index wins a tie; then an exact min across lanes, lowest
             // lane wins.  Both tie-breaks are load-bearing.
+            //
+            // P9.89: bestIndex is an ABSOLUTE index into nicBuffer, `start + i`,
+            // exactly as convexMeshCorrelate.cu:182 stores it and :194 reads it --
+            // not run-relative.  The two agree whenever some lane has a winner.
+            // They part when NO lane has one: purge (cu:72) only drops d == FLT_MAX,
+            // so a surviving triangle with a +inf or NaN depth never passes
+            // `d < bestDepth`, every lane keeps the identity (FLT_MAX, 0), minIndex
+            // picks lane 0, and the CUDA reads bestNormal from GLOBAL slot 0 --
+            // another pair's record.  Run-relative, the port read nicBuffer[start],
+            // this pair's own first survivor, which accepts itself and builds one
+            // patch where the CUDA accepts by a foreign normal (often: none, four
+            // empty patches).  Slot 0 is written by whichever pair owns it, so on
+            // the CUDA the read races that pair's purge; the port reproduces the
+            // read, and the fixture keeps the slot-0 owner cached so it is stable.
             float bestDepth = CC_MAX_F32;
             uint bestIndex = 0u;
             for (uint i = lane; i < nbTriangles; i += CC_WARP)
@@ -335,7 +360,7 @@ void convexTrimeshCorrelate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
                     if (d < bestDepth)
                     {
                         bestDepth = d;
-                        bestIndex = i;
+                        bestIndex = start + i;
                     }
                 }
             }
@@ -344,7 +369,7 @@ void convexTrimeshCorrelate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
             const uint i0 = ccMinIndex(lane, bestDepth, 0xFFFFFFFFu, minD);
             bestIndex = ccExchange(lane, bestIndex, i0);
 
-            const float3 bestNormal = Ptr<float4>(nicRun + uint64_t(bestIndex) * 16UL)[0].xyz;
+            const float3 bestNormal = Ptr<float4>(nicBuffer + uint64_t(bestIndex) * 16UL)[0].xyz;
 
             uint currentContactMask = 0u;
             float3 pA = float3(0.0f, 0.0f, 0.0f);
