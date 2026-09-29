@@ -1507,7 +1507,8 @@ pxg_compile_shader(npWarpLib wlShuffle wlBallot)
 pxg_compile_shader(npWarpNative warpNativeProbe)
 # RUNTIME_PLAN.md P6: indirect dispatch plumbing.
 pxg_compile_shader(npIndirect writeArgs fillGrid)
-pxg_compile_shader(npAtomicLib alAtomics)
+# P9.89: alAtomicSelect drives atomic.cuh's select rule (resident +-0, NaN cells).
+pxg_compile_shader(npAtomicLib alAtomics alAtomicSelect)
 # P9.33a: a PLATFORM measurement rather than a kernel port.  About forty shaders here spell
 # PxVec3::getNormalized as `v * rsqrt(m)`, but the engine computes PxRecipSqrt = 1.0f/sqrtf
 # -- an exactly-specified pair of IEEE operations -- while SPIR-V's InverseSqrt is allowed

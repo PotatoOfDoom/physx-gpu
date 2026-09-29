@@ -75,3 +75,27 @@ void alAtomics(uint3 dtid : SV_DispatchThreadID)
     const uint hi = gIn[t ^ 1u];
     gOut[t] = pxgPopcll(lo, hi) | (pxgFfsll(lo, hi) << 8) | (pxgClzll(lo, hi) << 16);
 }
+
+// P9.89 battery for the SELECT rule of atomic.cuh:104-132 AtomicMin/AtomicMax
+// on exactly the inputs where it differs from an fminf/fmaxf combine: a
+// resident +0 fed -0 (Min) / a resident -0 fed +0 (Max), NaN-seeded cells fed
+// finite values or other NaN payloads, and NaN contributions to finite cells.
+// Every scripted cell's CUDA outcome is order-independent, so it is compared
+// bitwise.  Same three bindings as alAtomics; binding 2 is READ here as the
+// per-thread selector: bit 31 = AtomicMax (else AtomicMin), bits 0..30 = cell.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void alAtomicSelect(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint t = dtid.x;
+    if (t >= gParams.numThreads)
+        return;
+
+    const uint sel = gOut[t];
+    const uint cell = sel & 0x7fffffffu;
+    const float v = asfloat(gIn[t]);
+    if ((sel >> 31) != 0u)
+        pxgAtomicMaxF(gCells, cell, v);
+    else
+        pxgAtomicMinF(gCells, cell, v);
+}

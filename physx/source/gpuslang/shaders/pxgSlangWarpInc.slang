@@ -53,11 +53,14 @@
 //     the mask-participation contract holds).  Pending hardware validation
 //     (P5): CI cannot execute this path at 32 (llvmpipe window is [8,8]).
 //
-// CUDA semantics implemented (width = power of two <= 32, segments aligned):
+// CUDA semantics implemented (width = power of two <= 32, segments aligned;
+// delta and xorMask are taken mod 32 like PTX shfl.sync's bval = b[4:0]):
 //   pxgShflSync(mask,v,srcLane,width)   : src wraps modulo width in-segment
 //   pxgShflUpSync(mask,v,delta,width)   : own value when lane-in-seg < delta
 //   pxgShflDownSync(mask,v,delta,width) : own value when lane-in-seg+delta >= width
-//   pxgShflXorSync(mask,v,xorMask,width): own value when XOR leaves the segment
+//   pxgShflXorSync(mask,v,xorMask,width): own value when the XOR partner lies
+//                                         past the END of the own segment (an
+//                                         EARLIER segment's lane IS read)
 //   pxgBallotSync(mask,pred)            : bit i iff (mask has i) && pred(lane i)
 //   pxgAnySync/pxgAllSync(mask,pred)    : over mask lanes
 //   pxgWarpRankInMask(mask,lane)        : popc(mask & ((1<<lane)-1))
@@ -153,49 +156,64 @@ uint pxgShflSyncU(uint mask, uint tid, uint value, int srcLane, uint width)
 #endif
 }
 
+// P9.89: the up/down/xor addressing is PTX shfl.sync's (sm_30_intrinsics.hpp
+// builds c = ((32-width)<<8)|0x1f for down/bfly and (32-width)<<8 for up):
+//   bval = b[4:0]                          -- delta / xorMask truncated to 5 bits
+//   minLane = segment start, maxLane = segment END (down/bfly; up clamps to 0)
+//   up:   j = lane - bval, valid iff j >= minLane
+//   down: j = lane + bval, valid iff j <= maxLane
+//   bfly: j = lane ^ bval, valid iff j <= maxLane
+//   invalid -> own value.
+// So a bfly partner in an EARLIER segment is read, not clamped (Programming
+// Guide: "able to access elements from earlier groups ... later groups ...
+// their own value"), and delta/xorMask 33 act as 1.  Before P9.89 the port
+// clamped a partner in ANY other segment and used the untruncated
+// delta/xorMask.  Latent: every engine caller passes delta < 32 and an xor
+// radius < width, where both rules agree.  The addressing is computed ONCE,
+// outside the path switch, so the native branch differs only in transport and
+// the emulated battery (npWarpLib) pins its addressing too.
 uint pxgShflUpSyncU(uint mask, uint tid, uint value, uint delta, uint width)
 {
     const uint lane = pxgLaneIdx(tid);
+    const uint bval = delta & (PXG_WARP_SIZE - 1u);   // P9.89: PTX bval = b[4:0]
     const uint laneInSeg = lane & (width - 1u);
-    const bool clamped = laneInSeg < delta;
-    const uint src = clamped ? lane : lane - delta;
+    const bool clamped = laneInSeg < bval;            // j = lane - bval < minLane
+    const uint src = clamped ? lane : lane - bval;
 #if PXG_WARP_NATIVE
     const uint r = WaveShuffle(value, int(src));
-    return clamped ? value : r;
 #else
     const uint r = pxgWarpScratchExchange(tid, value, (tid & ~(PXG_WARP_SIZE - 1u)) + src);
-    return clamped ? value : r;
 #endif
+    return clamped ? value : r;
 }
 
 uint pxgShflDownSyncU(uint mask, uint tid, uint value, uint delta, uint width)
 {
     const uint lane = pxgLaneIdx(tid);
+    const uint bval = delta & (PXG_WARP_SIZE - 1u);   // P9.89: PTX bval = b[4:0]
     const uint laneInSeg = lane & (width - 1u);
-    const bool clamped = laneInSeg + delta >= width;
-    const uint src = clamped ? lane : lane + delta;
+    const bool clamped = laneInSeg + bval >= width;   // j = lane + bval > maxLane
+    const uint src = clamped ? lane : lane + bval;
 #if PXG_WARP_NATIVE
     const uint r = WaveShuffle(value, int(src));
-    return clamped ? value : r;
 #else
     const uint r = pxgWarpScratchExchange(tid, value, (tid & ~(PXG_WARP_SIZE - 1u)) + src);
-    return clamped ? value : r;
 #endif
+    return clamped ? value : r;
 }
 
 uint pxgShflXorSyncU(uint mask, uint tid, uint value, uint xorMask, uint width)
 {
     const uint lane = pxgLaneIdx(tid);
-    const uint src = lane ^ xorMask;
-    const bool clamped = (src & ~(width - 1u)) != (lane & ~(width - 1u));
+    const uint src = lane ^ (xorMask & (PXG_WARP_SIZE - 1u));   // P9.89: j = lane ^ b[4:0]
+    const uint maxLane = (lane & ~(width - 1u)) | (width - 1u); // own segment's END
+    const bool clamped = src > maxLane;                         // later segment only
 #if PXG_WARP_NATIVE
-    const uint r = WaveShuffle(value, int(src & (PXG_WARP_SIZE - 1u)));
-    return clamped ? value : r;
+    const uint r = WaveShuffle(value, int(src));
 #else
-    const uint r = pxgWarpScratchExchange(tid, value,
-                                          (tid & ~(PXG_WARP_SIZE - 1u)) + (src & (PXG_WARP_SIZE - 1u)));
-    return clamped ? value : r;
+    const uint r = pxgWarpScratchExchange(tid, value, (tid & ~(PXG_WARP_SIZE - 1u)) + src);
 #endif
+    return clamped ? value : r;
 }
 
 float pxgShflSyncF(uint mask, uint tid, float value, int srcLane, uint width)
@@ -366,37 +384,40 @@ uint pxgClzll(uint lo, uint hi)
 
 // ---- atomics (atomic.cuh parity) ----
 // AtomicMin/AtomicMax on float are CAS loops in CUDA itself (no native
-// float min/max atomic exists there either); this is a direct transcription
-// including the fminf/fmaxf combine.  Buffers carry float BITS as uint so
-// one buffer type serves compare-exchange.  AtomicAdd uses the same CAS
-// shape: each contribution is applied exactly once; ordering across lanes
-// is unspecified exactly as with CUDA's native float atomicAdd.
+// float min/max atomic exists there either).  Buffers carry float BITS as
+// uint so one buffer type serves compare-exchange.  AtomicAdd uses the same
+// CAS shape: each contribution is applied exactly once; ordering across
+// lanes is unspecified exactly as with CUDA's native float atomicAdd.
+//
+// P9.89: atomic.cuh:104-132 is a SELECT rule, not an fminf/fmaxf combine:
+//   int old = *address_as_int, assumed;
+//   while (val < __int_as_float(old))          // AtomicMax: val > old
+//   { assumed = old; old = atomicCAS(address_as_int, assumed, __float_as_int(val)); }
+// The cell is written only on a STRICT improvement, so a NaN already in the
+// cell is never replaced, a NaN val is never written, and on a +-0 tie the
+// RESIDENT zero stays.  Before P9.89 the port CASed FMin/FMax(value, old):
+// on llvmpipe (lower_fminmax_signed_zero, gallivm fmin_nsz) that overwrote a
+// NaN cell with the first finite value and turned a resident +0 into -0
+// (Min) / a resident -0 into +0 (Max).  Latent: only npAtomicLib calls these;
+// the CUDA's return value has no caller here either.
 
 void pxgAtomicMinF(RWStructuredBuffer<uint> buf, uint index, float value)
 {
-    uint assumed = buf[index];
-    for (;;)
+    uint old = buf[index];
+    while (value < asfloat(old))
     {
-        const uint newBits = asuint(min(value, asfloat(assumed)));
-        uint old;
-        InterlockedCompareExchange(buf[index], assumed, newBits, old);
-        if (old == assumed)
-            return;
-        assumed = old;
+        const uint assumed = old;
+        InterlockedCompareExchange(buf[index], assumed, asuint(value), old);
     }
 }
 
 void pxgAtomicMaxF(RWStructuredBuffer<uint> buf, uint index, float value)
 {
-    uint assumed = buf[index];
-    for (;;)
+    uint old = buf[index];
+    while (value > asfloat(old))
     {
-        const uint newBits = asuint(max(value, asfloat(assumed)));
-        uint old;
-        InterlockedCompareExchange(buf[index], assumed, newBits, old);
-        if (old == assumed)
-            return;
-        assumed = old;
+        const uint assumed = old;
+        InterlockedCompareExchange(buf[index], assumed, asuint(value), old);
     }
 }
 

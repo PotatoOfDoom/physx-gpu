@@ -52,20 +52,64 @@ static const uint32_t T = 256;   // tests (one 64-thread workgroup each)
 
 // ---- CPU model of the library, per 32-lane tile (lockstep) ----
 
+// P9.89: the shuffle model is the PTX ISA shfl.sync pseudo-code, fed the c
+// operand the CUDA headers build (sm_30_intrinsics.hpp: __shfl_up_sync
+// c = (32-width)<<8; __shfl_sync / __shfl_down_sync / __shfl_xor_sync
+// c = ((32-width)<<8)|0x1f):
+//   bval = b[4:0]; cval = c[4:0]; segmask = c[12:8];
+//   maxLane = (lane & segmask) | (cval & ~segmask); minLane = lane & segmask;
+//   up: j = lane - bval, pval = j >= minLane    down: j = lane + bval, pval = j <= maxLane
+//   bfly: j = lane ^ bval, pval = j <= maxLane  idx: j = minLane | (bval & ~segmask), pval = j <= maxLane
+//   if (!pval) j = lane;
+// Before P9.89 this model copied the PORT's rule (clamp on ANY other segment,
+// untruncated delta/xorMask), so npWarpLib passed on non-CUDA semantics.
+enum ShflMode { kIdx, kUp, kDown, kBfly };
+static float ptxShfl(const float* t, uint32_t lane, ShflMode mode, uint32_t b, uint32_t width)
+{
+    const uint32_t c = ((32u - width) << 8) | (mode == kUp ? 0u : 0x1fu);
+    const uint32_t bval = b & 31u, cval = c & 31u, segmask = (c >> 8) & 31u;
+    const int maxLane = int((lane & segmask) | (cval & ~segmask & 31u));
+    const int minLane = int(lane & segmask);
+    int j;
+    bool pval;
+    switch (mode)
+    {
+    case kUp:   j = int(lane) - int(bval); pval = j >= minLane; break;
+    case kDown: j = int(lane) + int(bval); pval = j <= maxLane; break;
+    case kBfly: j = int(lane ^ bval);      pval = j <= maxLane; break;
+    default:    j = minLane | int(bval & ~segmask & 31u); pval = j <= maxLane; break;
+    }
+    if (!pval)
+        j = int(lane);
+    return t[j];
+}
 static float mShfl(const float* t, uint32_t lane, int srcLane, uint32_t width)
 {
-    const uint32_t seg = lane & ~(width - 1);
-    return t[seg + (uint32_t(srcLane) & (width - 1))];
+    return ptxShfl(t, lane, kIdx, uint32_t(srcLane), width);
 }
 static float mUp(const float* t, uint32_t lane, uint32_t delta, uint32_t width)
 {
-    return (lane & (width - 1)) < delta ? t[lane] : t[lane - delta];
+    return ptxShfl(t, lane, kUp, delta, width);
 }
 static float mDown(const float* t, uint32_t lane, uint32_t delta, uint32_t width)
 {
-    return (lane & (width - 1)) + delta >= width ? t[lane] : t[lane + delta];
+    return ptxShfl(t, lane, kDown, delta, width);
 }
 static float mXor(const float* t, uint32_t lane, uint32_t xm, uint32_t width)
+{
+    return ptxShfl(t, lane, kBfly, xm, width);
+}
+
+// Twins of the pre-P9.89 port rule; the script must make them differ.
+static float oldUp(const float* t, uint32_t lane, uint32_t delta, uint32_t width)
+{
+    return (lane & (width - 1)) < delta ? t[lane] : t[lane - delta];
+}
+static float oldDown(const float* t, uint32_t lane, uint32_t delta, uint32_t width)
+{
+    return (lane & (width - 1)) + delta >= width ? t[lane] : t[lane + delta];
+}
+static float oldXor(const float* t, uint32_t lane, uint32_t xm, uint32_t width)
 {
     const uint32_t src = lane ^ xm;
     return (src & ~(width - 1)) != (lane & ~(width - 1)) ? t[lane] : t[src & 31];
@@ -117,7 +161,10 @@ PXG_TEST(npWarpLib)
         }
         const uint32_t log2width = t % 6;                     // widths 1..32
         const int srcLane = int(rng() % 121) - 40;            // wraps + negatives
-        const uint32_t delta = rng() % 11;
+        // P9.89: delta up to 63 (was < 11) so the PTX 5-bit truncation of
+        // up/down deltas >= 32 is exercised; xorMask reaches both earlier
+        // segments (bits in [width, 32)) and >= 32 (truncated) partners.
+        const uint32_t delta = rng() % 64;
         const uint32_t xorMask = rng() % 64;                  // includes out-of-warp XOR
         script[4 * t + 0] = mask;
         script[4 * t + 1] = log2width;
@@ -155,6 +202,8 @@ PXG_TEST(npWarpLib)
         const auto g = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
 
         size_t mm = 0;
+        // Lanes where the pre-P9.89 twin gives other BITS, per class.
+        size_t oldUpDiff = 0, oldDownDiff = 0, oldXorEarlier = 0, oldXorTrunc = 0;
         for (uint32_t t = 0; t < T; ++t)
         {
             const uint32_t width = 1u << script[4 * t + 1];
@@ -172,6 +221,10 @@ PXG_TEST(npWarpLib)
                                             f2u(mUp(tv, lane, delta, width)),
                                             f2u(mDown(tv, lane, delta, width)),
                                             f2u(mXor(tv, lane, xm, width)) };
+                    oldUpDiff += f2u(oldUp(tv, lane, delta, width)) != e[1] ? 1 : 0;
+                    oldDownDiff += f2u(oldDown(tv, lane, delta, width)) != e[2] ? 1 : 0;
+                    if (f2u(oldXor(tv, lane, xm, width)) != e[3])
+                        ++(xm >= 32u ? oldXorTrunc : oldXorEarlier);
                     for (int c = 0; c < 4; ++c)
                         if (o[c] != e[c])
                         {
@@ -182,6 +235,10 @@ PXG_TEST(npWarpLib)
                 }
             }
         }
+        std::printf("  pre-P9.89 twin differs on %zu up, %zu down, %zu xor-earlier-segment, %zu xor-mask>=32 lanes\n",
+                    oldUpDiff, oldDownDiff, oldXorEarlier, oldXorTrunc);
+        PXG_CHECK_MSG(oldUpDiff > 0 && oldDownDiff > 0 && oldXorEarlier > 0 && oldXorTrunc > 0,
+                      "the script separates the PTX shfl.sync rule from the pre-P9.89 clamp in all four classes");
         PXG_CHECK_MSG(mm == 0, "all shuffle outputs bitwise-match the CUDA model (%zu bad)", mm);
         dev->destroyBuffer(bOut);
     }
