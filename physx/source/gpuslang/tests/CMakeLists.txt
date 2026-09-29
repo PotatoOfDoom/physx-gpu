@@ -559,8 +559,9 @@ pxg_compile_shader(polyClipBda polyClipLaunch)
 pxg_compile_shader(convexHullProbeBda convexHullProbeLaunch)
 # P8.40: the first two convex-vs-triangle SAT stages.  Test scaffolding, absent
 # from the manifest.  Absent from PXG_HLSL_ENTRIES.  IS in PXG_NOCONTRACT_SHADERS:
-# every SAT decision is the sign of a projection difference.
-pxg_compile_shader(convexSatBda convexSatLaunch convexSelectLaunch)
+# every SAT decision is the sign of a projection difference.  P9.89 adds
+# convexSupportLaunch, the stage-3 support folds read out per lane.
+pxg_compile_shader(convexSatBda convexSatLaunch convexSelectLaunch convexSupportLaunch)
 # P8.44: contactReduceShared (contactReduction.cuh:55-165) as a 32-lane virtual
 # warp, at the <false,true,5,true> instantiation the convex-vs-triangle emit tail
 # reaches.  Test scaffolding, absent from the manifest.  Absent from

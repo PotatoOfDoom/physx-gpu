@@ -315,22 +315,52 @@ uint csUshortAt(uint64_t base, uint shortIndex)
     return (word >> (8u * uint(addr - aligned))) & 0xffffu;
 }
 
-void csSupportTriangle(float3 t0, float3 t1, float3 t2, float3 dir, out float minVal, out float maxVal)
+// P9.89: supportTriangle (convexTriangle.cuh:507-518) and supportConvex (:494-505)
+// are SERIAL SELECT FOLDS: seeded minVal = PX_MAX_F32 / maxVal = -PX_MAX_F32, then
+// `minVal = PxMin(d, minVal); maxVal = PxMax(d, maxVal);` for i = 0, 1, ... in
+// order, and PxMin/PxMax<float> are intrinsics::selectMin/selectMax, `a < b ? a : b`
+// and `a > b ? a : b` (PxMath.h:82-100, PxUnixMathIntrinsics.h:116-125).  An equal
+// compare keeps the RUNNING value, so a +-0 tie keeps the FIRST-encountered zero,
+// and a NaN projection leaves the running value -- ultimately the seed -- alone.
+// This was GLSL min/max, i.e. FMin/FMax, which in this stamped build give -0 (min)
+// / +0 (max) on a zero tie in either order, and csSupportTriangle was the unseeded
+// min(d0, min(d1, d2)), which returns NaN where the CUDA returns +-PX_MAX_F32: on an
+// axis whose getNormalized() overflowed to NaN the CUDA REJECTS the pair (PX_MAX_F32
+// > -PX_MAX_F32 + contactDist) and the old port did not.  The zero sign reaches
+// `separation` and the seed reaches the stage-3 verdict (convexSatStages cases
+// 19-21); convexSatSupportFold reads all four folds out per lane.  In the engine
+// cores both are latent -- `separation` is not stored after the SAT and a NaN axis
+// needs edge lengths near 1e19 -- but the transcription is now the CUDA's.  (The
+// d0 step alone could be either spelling: against the +-PX_MAX_F32 seed,
+// FMin(d0, PX_MAX_F32) == selectMin(d0, PX_MAX_F32) for all 2^32 d0; the d1 and d2
+// steps are where the two part.)
+public void csSupportTriangle(float3 t0, float3 t1, float3 t2, float3 dir, out float minVal, out float maxVal)
 {
-    const float d0 = dot(t0, dir), d1 = dot(t1, dir), d2 = dot(t2, dir);
-    minVal = min(d0, min(d1, d2));
-    maxVal = max(d0, max(d1, d2));
+    minVal = CS_MAX_F32;
+    maxVal = -CS_MAX_F32;
+
+    const float d0 = dot(t0, dir);
+    minVal = (d0 < minVal) ? d0 : minVal;
+    maxVal = (d0 > maxVal) ? d0 : maxVal;
+
+    const float d1 = dot(t1, dir);
+    minVal = (d1 < minVal) ? d1 : minVal;
+    maxVal = (d1 > maxVal) ? d1 : maxVal;
+
+    const float d2 = dot(t2, dir);
+    minVal = (d2 < minVal) ? d2 : minVal;
+    maxVal = (d2 > maxVal) ? d2 : maxVal;
 }
 
-void csSupportConvex(uint nbVerts, float3 dir, out float minVal, out float maxVal)
+public void csSupportConvex(uint nbVerts, float3 dir, out float minVal, out float maxVal)
 {
     minVal = CS_MAX_F32;
     maxVal = -CS_MAX_F32;
     for (uint i = 0u; i < nbVerts; ++i)
     {
         const float d = dot(csScaledVert(i), dir);
-        minVal = min(d, minVal);
-        maxVal = max(d, maxVal);
+        minVal = (d < minVal) ? d : minVal;   // PxMin(d, minVal) = selectMin
+        maxVal = (d > maxVal) ? d : maxVal;   // PxMax(d, maxVal) = selectMax
     }
 }
 

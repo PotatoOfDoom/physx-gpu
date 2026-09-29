@@ -2401,42 +2401,6 @@
 "why": "CUDA spells this with fmaxf/fminf, which equal GLSL FMax/FMin on llvmpipe (-0 for min / +0 for max on a +-0 tie in either order, NaN ignored). Same nesting order."
 },
 {
-"file": "pxgSlangConvexSat.slang",
-"code": "minVal = min(d0, min(d1, d2));",
-"kinds": [
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "Twin IS a select: on a +-0 tie the running value (second operand) survives, i.e. the FIRST-encountered zero, whereas FMin/FMax yield -0/+0. The value is a +-0-only difference; minTri/maxTri/minConv/maxConv feed only (a) comparisons (sign-blind) and (b) tempOverlap0/1 = minTri - maxConv / minConv - m"
-},
-{
-"file": "pxgSlangConvexSat.slang",
-"code": "maxVal = max(d0, max(d1, d2));",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "Twin IS a select: on a +-0 tie the running value (second operand) survives, i.e. the FIRST-encountered zero, whereas FMin/FMax yield -0/+0. The value is a +-0-only difference; minTri/maxTri/minConv/maxConv feed only (a) comparisons (sign-blind) and (b) tempOverlap0/1 = minTri - maxConv / minConv - m"
-},
-{
-"file": "pxgSlangConvexSat.slang",
-"code": "minVal = min(d, minVal);",
-"kinds": [
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "Twin IS a select: on a +-0 tie the running value (second operand) survives, i.e. the FIRST-encountered zero, whereas FMin/FMax yield -0/+0. The value is a +-0-only difference; minTri/maxTri/minConv/maxConv feed only (a) comparisons (sign-blind) and (b) tempOverlap0/1 = minTri - maxConv / minConv - m"
-},
-{
-"file": "pxgSlangConvexSat.slang",
-"code": "maxVal = max(d, maxVal);",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "Twin IS a select: on a +-0 tie the running value (second operand) survives, i.e. the FIRST-encountered zero, whereas FMin/FMax yield -0/+0. The value is a +-0-only difference; minTri/maxTri/minConv/maxConv feed only (a) comparisons (sign-blind) and (b) tempOverlap0/1 = minTri - maxConv / minConv - m"
-},
-{
 "file": "convexHfMidphaseBda.slang",
 "code": "const float mn = min(min(extents.x, extents.y), extents.z);",
 "kinds": [

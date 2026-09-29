@@ -33,6 +33,7 @@
 // Suite (ctest filter "convexSat"):
 //   convexSatStages — separated and overlapping boxes, a scaled hull, the tie-break
 //                     between two equally-separating faces, and a degenerate plane.
+//   convexSatSupportFold — P9.89: the stage-3 support folds read out per lane.
 
 #include "pxgTestFramework.h"
 
@@ -41,6 +42,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <utility>
 #include <vector>
 
 namespace
@@ -98,6 +101,68 @@ float normalizeInPlace(V3& v)
     const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (m > 0.0f) { const float r = 1.0f / m; v.x *= r; v.y *= r; v.z *= r; }
     return m;
+}
+
+// ---- P9.89: the stage-3 support folds -------------------------------------
+// PxMin/PxMax<float> are intrinsics::selectMin/selectMax (PxMath.h:82-100,
+// PxUnixMathIntrinsics.h:116-125): `a < b ? a : b` and `a > b ? a : b`.  On an
+// equal compare they return the SECOND operand, which in supportTriangle and
+// supportConvex (`PxMin(d, minVal)`) is the running value: a +-0 tie keeps the
+// FIRST-encountered zero, and a NaN projection leaves the running value alone.
+float selMin(float a, float b) { return a < b ? a : b; }
+float selMax(float a, float b) { return a > b ? a : b; }
+
+// llvmpipe's GLSL FMin/FMax in a SignedZeroInfNanPreserve-stamped shader (P9.86c,
+// pinned by p86SignedZero): a NaN operand is dropped, and a +-0 tie gives -0 for
+// min and +0 for max in EITHER operand order.  That zero rule is also NVIDIA's
+// fminf/fmaxf, i.e. warpReduction<MaxOpFloat>'s combine, so the warp arg-max below
+// uses lpFMax rather than std::fmax, which leaves a zero tie to the C library.
+float lpFMin(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    return (a == b) ? (std::signbit(a) ? a : b) : (a < b ? a : b);
+}
+float lpFMax(float a, float b)
+{
+    if (std::isnan(a)) return b;
+    if (std::isnan(b)) return a;
+    return (a == b) ? (std::signbit(a) ? b : a) : (a > b ? a : b);
+}
+
+// gSupVariant replays lines of the PRE-P9.89 port, which the fixtures below must
+// tell apart from the CUDA.  A bit mask: 1 = csSupportTriangle's min as the
+// unseeded min(d0, min(d1, d2)), 2 = its max likewise, 4 = csSupportConvex's min
+// as min(d, minVal), 8 = its max as max(d, maxVal).  0 = the CUDA.
+int gSupVariant = 0;
+
+// supportTriangle, convexTriangle.cuh:507-518: seeded +-PX_MAX_F32, i = 0, 1, 2.
+void refSupportTriangle(const V3 t[3], V3 dir, float& minVal, float& maxVal)
+{
+    minVal = MAXF;
+    maxVal = -MAXF;
+    float d[3];
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        d[i] = dot3(t[i], dir);
+        minVal = selMin(d[i], minVal);
+        maxVal = selMax(d[i], maxVal);
+    }
+    if (gSupVariant & 1) minVal = lpFMin(d[0], lpFMin(d[1], d[2]));
+    if (gSupVariant & 2) maxVal = lpFMax(d[0], lpFMax(d[1], d[2]));
+}
+
+// supportConvex, convexTriangle.cuh:494-505: seeded +-PX_MAX_F32, i = 0..n-1.
+void refSupportConvex(const std::vector<V3>& verts, uint32_t n, V3 dir, float& minVal, float& maxVal)
+{
+    minVal = MAXF;
+    maxVal = -MAXF;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const float d = dot3(verts[i], dir);
+        minVal = (gSupVariant & 4) ? lpFMin(d, minVal) : selMin(d, minVal);
+        maxVal = (gSupVariant & 8) ? lpFMax(d, maxVal) : selMax(d, maxVal);
+    }
 }
 
 struct SatCase
@@ -210,7 +275,7 @@ SatResult refSat(const SatCase& c)
     r.p1 = true;
 
     float best = -MAXF;
-    for (uint32_t l = 0; l < LANES; ++l) best = std::fmax(best, lSep[l]);
+    for (uint32_t l = 0; l < LANES; ++l) best = lpFMax(best, lSep[l]);
     uint32_t winner = 0;                       // lowest lane holding the max
     for (uint32_t l = 0; l < LANES; ++l) if (lSep[l] == best) { winner = l; break; }
 
@@ -269,11 +334,11 @@ SatResult refSat(const SatCase& c)
                 const float m = std::sqrt(dot3(v, v));
                 const float rm = 1.0f / m;
                 const V3 sv3 = mk(v.x * rm, v.y * rm, v.z * rm);
-                float minTri = MAXF, maxTri = -MAXF, minConv = MAXF, maxConv = -MAXF;
-                for (uint32_t k = 0; k < 3; ++k)
-                { const float d = dot3(c.t[k], sv3); minTri = std::fmin(d, minTri); maxTri = std::fmax(d, maxTri); }
-                for (uint32_t k = 0; k < c.nbVerts; ++k)
-                { const float d = dot3(sv[k], sv3); minConv = std::fmin(d, minConv); maxConv = std::fmax(d, maxConv); }
+                // P9.89: the CUDA's select folds, not std::fmin/std::fmax -- the old
+                // oracle mirrored the port's FMin/FMax and so could not see them.
+                float minTri, maxTri, minConv, maxConv;
+                refSupportTriangle(c.t, sv3, minTri, maxTri);
+                refSupportConvex(sv, c.nbVerts, sv3, minConv, maxConv);
                 const float o0 = minTri - maxConv, o1 = minConv - maxTri;
                 if (minConv > (maxTri + c.contactDist) || minTri > (maxConv + c.contactDist))
                     lPassed[l] = false;
@@ -290,7 +355,7 @@ SatResult refSat(const SatCase& c)
         r.p3 = true;
 
         float best3 = -MAXF;
-        for (uint32_t l = 0; l < LANES; ++l) best3 = std::fmax(best3, lSep3[l]);
+        for (uint32_t l = 0; l < LANES; ++l) best3 = lpFMax(best3, lSep3[l]);
         uint32_t w3 = 0;
         for (uint32_t l = 0; l < LANES; ++l) if (lSep3[l] == best3) { w3 = l; break; }
         if (r.separation < best3)
@@ -334,6 +399,43 @@ void makeBox(SatCase& c, float hx, float hy, float hz)
     }
 }
 
+
+// P9.89: an axis-aligned box between two arbitrary corners, with makeBox's vertex,
+// face and edge numbering.  The cases that pin the support folds need a box whose
+// vertical corner edge lies ON the z axis, which a centred box cannot provide.
+void makeBoxAt(SatCase& c, V3 lo, V3 hi)
+{
+    c.nbVerts = 8; c.nbPolygons = 6; c.nbEdges = 12;
+    c.verts = { mk(lo.x, lo.y, lo.z), mk(hi.x, lo.y, lo.z), mk(hi.x, hi.y, lo.z), mk(lo.x, hi.y, lo.z),
+                mk(lo.x, lo.y, hi.z), mk(hi.x, lo.y, hi.z), mk(hi.x, hi.y, hi.z), mk(lo.x, hi.y, hi.z) };
+    const float n[6][4] = {
+        { 1, 0, 0, -hi.x }, { -1, 0, 0, lo.x },
+        { 0, 1, 0, -hi.y }, { 0, -1, 0, lo.y },
+        { 0, 0, 1, -hi.z }, { 0, 0, -1, lo.z } };
+    const uint32_t minIdx[6] = { 0, 1, 0, 2, 0, 4 };
+    const uint32_t E[12][4] = {
+        {0,1,3,5},{1,2,0,5},{2,3,2,5},{3,0,1,5},
+        {4,5,3,4},{5,6,0,4},{6,7,2,4},{7,4,1,4},
+        {0,4,1,3},{1,5,0,3},{2,6,0,2},{3,7,1,2} };
+    c.vbe.clear(); c.fbe.clear();
+    for (uint32_t e = 0; e < 12; ++e)
+    { c.vbe.push_back(E[e][0]); c.vbe.push_back(E[e][1]); c.fbe.push_back(E[e][2]); c.fbe.push_back(E[e][3]); }
+    c.planes.clear(); c.polyDescs.clear();
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        for (uint32_t k = 0; k < 4; ++k) c.planes.push_back(n[i][k]);
+        c.polyDescs.push_back(packPolyDesc(4u * i, 4u, minIdx[i]));
+    }
+}
+
+// A triangle normal from the winding, as the other cases compute it.
+V3 windingNormal(const V3 t[3])
+{
+    const V3 e1 = sub(t[1], t[0]), e2 = sub(t[2], t[0]);
+    const V3 nn = cross3(e1, e2);
+    const float m = std::sqrt(dot3(nn, nn));
+    return mk(nn.x / m, nn.y / m, nn.z / m);
+}
 
 // A drum with `sides` side faces plus two caps: nbPolygons > 32, so a lane owns
 // SEVERAL polygons and the strided loop actually iterates.  Without that, lane ==
@@ -673,6 +775,80 @@ void buildCases(std::vector<SatCase>& cases)
         cases.push_back(c);
     }
 
+    // Cases 19-21 (P9.89) pin the stage-3 support folds.  supportTriangle and
+    // supportConvex are serial PxMin/PxMax SELECT folds seeded with +-PX_MAX_F32;
+    // the port had them as GLSL FMin/FMax (and supportTriangle unseeded).  The two
+    // spellings agree on every finite projection except a +-0 TIE, where the select
+    // keeps the first-encountered zero and FMin/FMax give -0/+0, and they disagree
+    // when the projections are NaN, where the CUDA keeps the seed.
+    //
+    // A zero's sign reaches an output only when BOTH operands of tempOverlap0/1
+    // (minTri - maxConv, minConv - maxTri) are zeros, the edge axis is the stage's
+    // best, and every lane that reports a zero agrees -- fmaxf gives +0 as soon as
+    // one lane has +0.  Exact signed-zero projections need a vertex whose nonzero
+    // coordinates meet zero components of the axis.  Both cases therefore put the
+    // box's vertical corner edge ON the z axis, box vertices 2 and 6 at (0,0,zlo)
+    // and (0,0,zhi), and use an axis in the plane x + y = 0.
+    {   // 19: THE CONVEX MIN FOLD, at a genuine edge-edge contact.  Box
+        //     [-2,0]^2 x [-1,1]; the triangle edge t0->t1, direction (1,-1,-0.5),
+        //     lies in the plane x + y = 0 and crosses the box's corner edge at
+        //     (0,0,0.05).  Its cross with the box edge (0,0,-2) is (-2,-2,-0), so the
+        //     axis is (-a,-a,-0) and the box's zero projections are vertex 2 ->
+        //     -0 + -0 + (-1)(-0) = +0 and vertex 6 -> -0 + -0 + (1)(-0) = -0.  The
+        //     CUDA's select keeps vertex 2's +0; FMin gives -0.  Both triangle zeros
+        //     are +0 (0.375a - 0.375a), so minConv - maxTri is +0 in the CUDA and -0
+        //     in the old port -- and it is the stage's maximum, because every face
+        //     and the triangle normal overlap.
+        SatCase c; makeBoxAt(c, mk(-2.0f, -2.0f, -1.0f), mk(0.0f, 0.0f, 1.0f));
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(-0.375f, 0.375f, 0.3f); c.t[1] = mk(0.625f, -0.625f, -0.2f); c.t[2] = mk(0.8f, 0.6f, 0.3f);
+        c.triN = windingNormal(c.t);
+        c.probeIndex = 2; c.name = "P9.89 convex fold keeps the first zero";
+        cases.push_back(c);
+    }
+    {   // 20: THE TRIANGLE MIN FOLD.  Box [-2,0]^2 x [0.1875,1.625]; the triangle
+        //     edge t0->t1, direction (-0.625,0.625,-2), lies in the plane x + y = 0
+        //     and meets the box edge's LINE at t1 = (-0,-0,-0.75), below the box.
+        //     The axis is (a,a,+0): t0 projects to 0.625a - 0.625a = +0, t1 to
+        //     -0 + -0 + (-0.75)(+0) = -0, and every box zero is +0.  The CUDA fold
+        //     meets t0 first and keeps +0; min(d0, min(d1, d2)) gives -0, so
+        //     minTri - maxConv is +0 against -0.  (The pair is not touching -- the
+        //     gate on dot(triN, planeN) < 0 prunes the axes that would see the gap
+        //     -- which is exactly what the CUDA reports, and what the port must.)
+        SatCase c; makeBoxAt(c, mk(-2.0f, -2.0f, 0.1875f), mk(0.0f, 0.0f, 1.625f));
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(0.625f, -0.625f, 1.25f); c.t[1] = mk(-0.0f, -0.0f, -0.75f); c.t[2] = mk(-0.4375f, 0.5f, 0.3125f);
+        c.triN = windingNormal(c.t);
+        c.probeIndex = 3; c.name = "P9.89 triangle fold keeps the first zero";
+        cases.push_back(c);
+    }
+    {   // 21: THE TRIANGLE FOLD'S SEED.  A box of half-extent 1e19 and a triangle
+        //     that cuts through it.  Box edges (2e19) crossed with triangle edges
+        //     (~2.3e19) overflow a component of v to inf; |v|^2 > 1e-10 holds,
+        //     1/sqrt(inf) = 0 and getNormalized() gives inf * 0 = NaN in that
+        //     component, so every projection on that axis is NaN.  The CUDA's
+        //     supportTriangle keeps its seeds (+PX_MAX_F32 / -PX_MAX_F32), so
+        //     `minConv > maxTri + contactDist` is PX_MAX_F32 > -PX_MAX_F32 and the
+        //     pair is REJECTED by stage 3.  The unseeded min(d0, min(d1, d2)) returns
+        //     NaN, both rejection tests are false, and the old port passed it.
+        //     (supportConvex is seeded in both spellings and keeps +-PX_MAX_F32.)
+        //     The normal is computed in double: the float cross product overflows.
+        const float B = 1e19f;
+        SatCase c; makeBox(c, B, B, B);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(-0.9f * B, -1.1f * B, 0.15f * B);
+        c.t[1] = mk(1.3f * B, -0.7f * B, 0.3f * B);
+        c.t[2] = mk(-0.2f * B, 1.2f * B, 0.1f * B);
+        {
+            const double ax = double(c.t[1].x) - c.t[0].x, ay = double(c.t[1].y) - c.t[0].y, az = double(c.t[1].z) - c.t[0].z;
+            const double bx = double(c.t[2].x) - c.t[0].x, by = double(c.t[2].y) - c.t[0].y, bz = double(c.t[2].z) - c.t[0].z;
+            const double nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+            const double m = std::sqrt(nx * nx + ny * ny + nz * nz);
+            c.triN = mk(float(nx / m), float(ny / m), float(nz / m));
+        }
+        c.probeIndex = 2; c.name = "P9.89 overflowed axis hits the seed";
+        cases.push_back(c);
+    }
 }
 
 PXG_TEST(convexSatStages)
@@ -736,6 +912,7 @@ PXG_TEST(convexSatStages)
 
     bool sawStage1Reject = false, sawStage2Reject = false, sawBothPass = false, sawTriFeature = false;
     bool sawManyPolys = false, sawEdgeFeature = false, sawStage3 = false, sawStage3Reject = false;
+    uint32_t gpuIsTwin = 0;
     for (uint32_t i = 0; i < n; ++i)
     {
         const SatResult e = refSat(cases[i]);
@@ -774,6 +951,20 @@ PXG_TEST(convexSatStages)
         }
         chkF("scaledVert.x", r[12], e.scaledVert.x);
         chkF("scaledVert.y", r[13], e.scaledVert.y);
+
+        // P9.89 diagnostic: does the GPU reproduce the pre-P9.89 folds' answer?
+        // (Printed, not checked: it is how the twin was validated against the old
+        // shader, and after the fix it reads 18 of 21.)
+        {
+            gSupVariant = 15;
+            const SatResult tw = refSat(cases[i]);
+            gSupVariant = 0;
+            bool eq = p1 == (tw.p1 ? 1u : 0u) && p2 == (tw.p2 ? 1u : 0u) && p3 == (tw.p3 ? 1u : 0u);
+            if (tw.p1)
+                eq = eq && feat == tw.feature && same(r[4], tw.faceNormal.x) && same(r[5], tw.faceNormal.y) &&
+                     same(r[6], tw.faceNormal.z) && same(r[7], tw.separation);
+            if (eq) ++gpuIsTwin;
+        }
     }
 
     for (PxgBufferHandle h : hullBufs) dev->destroyBuffer(h);
@@ -789,6 +980,53 @@ PXG_TEST(convexSatStages)
     PXG_CHECK_MSG(sawEdgeFeature, "some case commits an edge-cross axis");
     PXG_CHECK_MSG(sawStage3Reject, "some case is rejected by the edge-cross stage alone");
     PXG_CHECK_MSG(sawStage2Reject, "some case is rejected by the triangle-normal stage");
+
+    // P9.89: the pre-P9.89 support folds, one line at a time, against the CUDA
+    // oracle over the same cases.  Each must lose somewhere, or the fixture above
+    // could not have told the fix from the bug.  Only the two MIN folds can reach
+    // these outputs (see cases 19-20); the two MAX folds are pinned by
+    // convexSatSupportFold.
+    {
+        auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        auto differs = [&](const SatResult& a, const SatResult& b) {
+            return a.p1 != b.p1 || a.p2 != b.p2 || a.p3 != b.p3 || a.feature != b.feature ||
+                   bitsOf(a.separation) != bitsOf(b.separation) ||
+                   bitsOf(a.faceNormal.x) != bitsOf(b.faceNormal.x) ||
+                   bitsOf(a.faceNormal.y) != bitsOf(b.faceNormal.y) ||
+                   bitsOf(a.faceNormal.z) != bitsOf(b.faceNormal.z);
+        };
+        // 3 = the whole old csSupportTriangle: the seed only shows when BOTH its
+        // folds are unseeded, since either seed alone still trips a rejection test
+        const int variants[6] = { 1, 2, 3, 4, 8, 15 };
+        uint32_t lost[6] = {};
+        bool seedFlip = false, zeroTri = false, zeroConv = false;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            gSupVariant = 0;
+            const SatResult cuda = refSat(cases[i]);
+            for (uint32_t v = 0; v < 6; ++v)
+            {
+                gSupVariant = variants[v];
+                const SatResult twin = refSat(cases[i]);
+                if (!differs(cuda, twin)) continue;
+                ++lost[v];
+                if (variants[v] == 3 && cuda.p2 && !cuda.p3 && twin.p3) seedFlip = true;
+                if (variants[v] == 1 && cuda.p3 && twin.p3 && cuda.separation == 0.0f &&
+                    bitsOf(cuda.separation) != bitsOf(twin.separation)) zeroTri = true;
+                if (variants[v] == 4 && cuda.p3 && twin.p3 && cuda.separation == 0.0f &&
+                    bitsOf(cuda.separation) != bitsOf(twin.separation)) zeroConv = true;
+            }
+        }
+        gSupVariant = 0;
+        std::printf("  P9.89 old-fold twins that disagree with the CUDA oracle, cases of %u: "
+                    "triMin %u, triMax %u, triangle %u, convMin %u, convMax %u, all four %u; "
+                    "the GPU reproduces the all-four twin in %u\n",
+                    n, lost[0], lost[1], lost[2], lost[3], lost[4], lost[5], gpuIsTwin);
+        PXG_CHECK_MSG(zeroConv, "the old csSupportConvex min fold commits -0 where the CUDA commits +0");
+        PXG_CHECK_MSG(zeroTri, "the old csSupportTriangle min fold commits -0 where the CUDA commits +0");
+        PXG_CHECK_MSG(seedFlip, "the unseeded old csSupportTriangle passes a pair the CUDA rejects on a NaN axis");
+        PXG_CHECK_MSG(lost[5] >= 3u, "the whole old port loses on the three P9.89 cases (%u)", lost[5]);
+    }
 }
 
 // ===========================================================================
@@ -1017,6 +1255,269 @@ PXG_TEST(convexSelectFace)
     PXG_CHECK_MSG(sawNoDelay, "some case does not delay its contacts");
     PXG_CHECK_MSG(sawEdgePick, "some case picks both faces of an edge that beats every face");
     PXG_CHECK_MSG(sawNeighbourPick, "some case picks the best neighbour of the winning face");
+}
+
+// ===========================================================================
+// P9.89: convexSatSupportFold -- csSupportTriangle and csSupportConvex, per lane
+// ===========================================================================
+//
+// supportTriangle (convexTriangle.cuh:507-518) and supportConvex (:494-505) are
+// serial PxMin/PxMax select folds, seeded +-PX_MAX_F32, in index order.  The port
+// had FMin/FMax (and no seed in the triangle fold).  The two agree on distinct
+// finite projections, so the lanes below are built to make them disagree, and
+// every word is compared bit for bit against the CUDA transcription:
+//
+//   lanes  0-7   the axis is one of the eight signed-zero vectors: every
+//                projection is a signed zero, so every fold is one long zero tie
+//                and the answer is the FIRST vertex's zero (the select) against
+//                -0 / +0 (FMin / FMax);
+//   lanes  8-13  one non-round axis component and two signed zeros: ties only
+//                among the vertices with a zero coordinate on that axis;
+//   lanes 14-21  a generic non-round axis -- the folds agree, and this checks the
+//                ordinary path;
+//   lanes 22-25  a NaN axis component: every projection is NaN, the CUDA keeps
+//                both seeds, FMin(NaN, FMin(NaN, NaN)) is NaN;
+//   lanes 26-27  (+inf, +-0, +-0) with the triangle at x > 0: every triangle
+//                projection is +inf, and selectMin(+inf, PX_MAX_F32) keeps the seed;
+//   lanes 28-29  a huge axis that overflows every triangle projection to -inf,
+//                the mirror for the max fold;
+//   lanes 30-31  the FIRST triangle projection alone is NaN (t0 carries an inf
+//                that meets a zero axis component): the seeded fold skips it,
+//                an unseeded select would keep it.
+//
+// Eight hulls: a 27-point grid with zero coordinates, 64 pseudo-random points on a
+// zero-rich pool, 48 non-round points, the second pool again through a non-unit
+// scale and a rotation (so shape space is not the vertex space), and those four
+// with their vertex order reversed.
+namespace
+{
+struct Lcg
+{
+    uint32_t s;
+    uint32_t next() { s = s * 1664525u + 1013904223u; return s; }
+    float uni(float lo, float hi) { return lo + (hi - lo) * float(next() >> 8) * (1.0f / 16777216.0f); }
+    float sgn() { return (next() >> 31) ? -1.0f : 1.0f; }
+    float zero() { return (next() >> 31) ? -0.0f : 0.0f; }
+};
+} // namespace
+
+PXG_TEST(convexSatSupportFold)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t GROUPS = 8u;
+    const size_t IN_FLOATS = (64u + 32u * 64u) / 4u;
+    const size_t OUT_FLOATS = 32u * 4u;
+    const float QNAN = std::numeric_limits<float>::quiet_NaN();
+    const float INF = std::numeric_limits<float>::infinity();
+
+    Lcg rng{ 0x9e3779b9u };
+
+    // ---- the four hulls (vertices only: csScaleVerts reads nothing else) -----
+    std::vector<SatCase> hulls(GROUPS);
+    {
+        SatCase& h = hulls[0];
+        const float g[3] = { 0.6875f, 0.0f, -1.375f };
+        for (uint32_t a = 0; a < 3; ++a)
+            for (uint32_t b = 0; b < 3; ++b)
+                for (uint32_t k = 0; k < 3; ++k)
+                    h.verts.push_back(mk(g[(a + k) % 3], g[b], g[(k + 2u * a) % 3]));
+    }
+    {
+        const float pool[8] = { 0.0f, 0.0f, 0.4375f, -0.8173541f, 1.3125f, -2.71875f, 0.1234567f, -0.0f };
+        for (uint32_t i = 0; i < 64u; ++i)
+            hulls[1].verts.push_back(mk(pool[rng.next() % 8u], pool[rng.next() % 8u], pool[rng.next() % 8u]));
+        hulls[3].verts = hulls[1].verts;
+    }
+    for (uint32_t i = 0; i < 48u; ++i)
+        hulls[2].verts.push_back(mk(rng.uni(-1.9f, 1.9f), rng.uni(-1.9f, 1.9f), rng.uni(-1.9f, 1.9f)));
+    for (uint32_t gi = 0; gi < GROUPS; ++gi)
+    {
+        SatCase& h = hulls[gi];
+        h.scale = mk(1, 1, 1); h.rot[0] = h.rot[1] = h.rot[2] = 0.0f; h.rot[3] = 1.0f;
+    }
+    {
+        SatCase& h = hulls[3];
+        h.scale = mk(1.3f, 0.7f, 2.1f);
+        const float qa = 0.37f, qb = -0.22f, qc = 0.61f, qd = 0.66f;
+        const float qm = std::sqrt(qa * qa + qb * qb + qc * qc + qd * qd);
+        h.rot[0] = qa / qm; h.rot[1] = qb / qm; h.rot[2] = qc / qm; h.rot[3] = qd / qm;
+    }
+    // Hulls 4-7 are 0-3 with the vertex order REVERSED.  Which zero wins a tie is
+    // the first one met, and the first vertex fixes it for a whole group, so the
+    // reversed copies both double the tie coverage and pin the fold's direction.
+    for (uint32_t gi = 4; gi < GROUPS; ++gi)
+    {
+        hulls[gi] = hulls[gi - 4u];
+        std::vector<V3>& v = hulls[gi].verts;
+        for (size_t a = 0, b = v.size() - 1u; a < b; ++a, --b) std::swap(v[a], v[b]);
+    }
+    for (uint32_t gi = 0; gi < GROUPS; ++gi)
+    { hulls[gi].nbVerts = uint32_t(hulls[gi].verts.size()); hulls[gi].nbPolygons = 0; hulls[gi].nbEdges = 0; }
+
+    // ---- the lanes -------------------------------------------------------------
+    struct Lane { V3 t[3]; V3 dir; };
+    std::vector<Lane> lanes(size_t(GROUPS) * 32u);
+    for (uint32_t gi = 0; gi < GROUPS; ++gi)
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            Lane& L = lanes[size_t(gi) * 32u + l];
+            auto rv = [&]() { return mk(rng.sgn() * rng.uni(0.05f, 2.3f), rng.sgn() * rng.uni(0.05f, 2.3f),
+                                        rng.sgn() * rng.uni(0.05f, 2.3f)); };
+            for (uint32_t k = 0; k < 3; ++k) L.t[k] = rv();
+            if (l < 8u)
+            {
+                const bool neg[3] = { (l & 1u) != 0u, (l & 2u) != 0u, (l & 4u) != 0u };
+                L.dir = mk(neg[0] ? -0.0f : 0.0f, neg[1] ? -0.0f : 0.0f, neg[2] ? -0.0f : 0.0f);
+                // Plant the triangle's zero signs.  A projection is -0 only when all
+                // three products are -0, i.e. every coordinate's sign is opposite to
+                // its axis zero's; one coordinate of the same sign makes it +0.
+                // Every pattern mixes both zeros, so either the min or the max fold
+                // disagrees with FMin/FMax on it.
+                static const char* pat[6] = { "+-+", "-+-", "++-", "--+", "+--", "-++" };
+                const char* P = pat[(l + gi) % 6u];
+                for (uint32_t k = 0; k < 3; ++k)
+                {
+                    float* c[3] = { &L.t[k].x, &L.t[k].y, &L.t[k].z };
+                    for (uint32_t a = 0; a < 3; ++a)
+                    {
+                        const float m = std::fabs(*c[a]);
+                        const bool wantNeg = (P[k] == '-') ? !neg[a] : (a == 0u ? neg[a] : (*c[a] < 0.0f));
+                        *c[a] = wantNeg ? -m : m;
+                    }
+                }
+            }
+            else if (l < 14u)
+            {
+                const uint32_t axis = l % 3u;
+                float d[3] = { rng.zero(), rng.zero(), rng.zero() };
+                d[axis] = rng.sgn() * rng.uni(0.2f, 1.6f);
+                L.dir = mk(d[0], d[1], d[2]);
+                // two of the three triangle vertices get a zero on that axis
+                float* c0 = (axis == 0) ? &L.t[0].x : (axis == 1) ? &L.t[0].y : &L.t[0].z;
+                float* c2 = (axis == 0) ? &L.t[2].x : (axis == 1) ? &L.t[2].y : &L.t[2].z;
+                *c0 = rng.zero(); *c2 = rng.zero();
+            }
+            else if (l < 22u)
+                L.dir = mk(rng.uni(-1.7f, 1.7f), rng.uni(-1.7f, 1.7f), rng.uni(-1.7f, 1.7f));
+            else if (l < 26u)
+            {
+                L.dir = mk(rng.uni(-1.7f, 1.7f), rng.uni(-1.7f, 1.7f), rng.uni(-1.7f, 1.7f));
+                if (l == 22u) L.dir.x = QNAN; else if (l == 23u) L.dir.y = QNAN; else if (l == 24u) L.dir.z = QNAN;
+                else L.dir = mk(QNAN, QNAN, QNAN);
+            }
+            else if (l < 28u)
+            {
+                L.dir = mk(INF, rng.zero(), rng.zero());
+                for (uint32_t k = 0; k < 3; ++k) L.t[k].x = std::fabs(L.t[k].x);
+            }
+            else if (l < 30u)
+            {
+                L.dir = mk(3.0e38f, 3.0e38f, rng.uni(-1.0f, 1.0f));
+                for (uint32_t k = 0; k < 3; ++k)
+                { L.t[k].x = -1.0f - std::fabs(L.t[k].x); L.t[k].y = -1.0f - std::fabs(L.t[k].y); }
+            }
+            else
+            {
+                L.dir = mk(rng.uni(0.2f, 1.7f), rng.zero(), -rng.uni(0.2f, 1.7f));
+                L.t[0].y = (l & 1u) ? -INF : INF;
+            }
+        }
+
+    // ---- upload and dispatch ---------------------------------------------------
+    std::vector<PxgBufferHandle> hullBufs;
+    std::vector<float> input(size_t(GROUPS) * IN_FLOATS, 0.0f);
+    for (uint32_t gi = 0; gi < GROUPS; ++gi)
+    {
+        SatCase& h = hulls[gi];
+        buildBlob(h);
+        PxgBufferHandle hb = createBufferFrom(dev, h.hull);
+        hullBufs.push_back(hb);
+        const uint64_t addr = dev->getBufferDeviceAddress(hb);
+        float* p = input.data() + size_t(gi) * IN_FLOATS;
+        std::memcpy(p, &addr, 8);
+        p[4] = h.scale.x; p[5] = h.scale.y; p[6] = h.scale.z;
+        p[8] = h.rot[0]; p[9] = h.rot[1]; p[10] = h.rot[2]; p[11] = h.rot[3];
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            const Lane& L = lanes[size_t(gi) * 32u + l];
+            float* q = p + 16 + 16 * l;
+            for (uint32_t k = 0; k < 3; ++k) { q[4 * k] = L.t[k].x; q[4 * k + 1] = L.t[k].y; q[4 * k + 2] = L.t[k].z; }
+            q[12] = L.dir.x; q[13] = L.dir.y; q[14] = L.dir.z;
+        }
+    }
+    PxgBufferHandle bIn = createBufferFrom(dev, input);
+    std::vector<float> outInit(size_t(GROUPS) * OUT_FLOATS, -12345.0f);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    SatPush push{};
+    push.input = dev->getBufferDeviceAddress(bIn);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numCases = GROUPS;
+    {
+        Kernel k("convexSatBda.spv", "convexSupportLaunch", {}, sizeof(SatPush));
+        k.dispatch(GROUPS, {}, push, 1u, 1u);
+        dev->flush();
+    }
+    const auto got = downloadBuffer<float>(dev, bOut, outInit.size());
+    for (PxgBufferHandle h : hullBufs) dev->destroyBuffer(h);
+    dev->destroyBuffer(bIn);
+    dev->destroyBuffer(bOut);
+
+    // ---- compare against the CUDA transcription, and the old fold against it ----
+    auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const char* word[4] = { "minTri", "maxTri", "minConv", "maxConv" };
+    size_t bad = 0;
+    uint32_t twinLost[4] = {}, twinZero[4] = {}, twinSeed[4] = {}, gpuIsTwin = 0, nanOut = 0;
+    for (uint32_t gi = 0; gi < GROUPS; ++gi)
+    {
+        const SatCase& h = hulls[gi];
+        std::vector<V3> sv(h.nbVerts);
+        for (uint32_t i = 0; i < h.nbVerts; ++i) sv[i] = vertex2Shape(h.verts[i], h.scale, h.rot);
+        for (uint32_t l = 0; l < 32u; ++l)
+        {
+            const Lane& L = lanes[size_t(gi) * 32u + l];
+            float cuda[4], twin[4];
+            gSupVariant = 0;
+            refSupportTriangle(L.t, L.dir, cuda[0], cuda[1]);
+            refSupportConvex(sv, h.nbVerts, L.dir, cuda[2], cuda[3]);
+            gSupVariant = 15;
+            refSupportTriangle(L.t, L.dir, twin[0], twin[1]);
+            refSupportConvex(sv, h.nbVerts, L.dir, twin[2], twin[3]);
+            gSupVariant = 0;
+            const float* r = got.data() + size_t(gi) * OUT_FLOATS + 4u * l;
+            for (uint32_t w = 0; w < 4; ++w)
+            {
+                if (std::isnan(cuda[w])) ++nanOut;
+                if (bitsOf(r[w]) != bitsOf(cuda[w]))
+                {
+                    ++bad;
+                    if (bad <= 12)
+                        std::printf("  [hull %u lane %2u] %s: got=%08x (%.9g) exp=%08x (%.9g)\n", gi, l, word[w],
+                                    bitsOf(r[w]), r[w], bitsOf(cuda[w]), cuda[w]);
+                }
+                const bool sameTwin = bitsOf(twin[w]) == bitsOf(cuda[w]);
+                if (bitsOf(r[w]) == bitsOf(twin[w]) || (std::isnan(r[w]) && std::isnan(twin[w]))) ++gpuIsTwin;
+                if (sameTwin) continue;
+                ++twinLost[w];
+                if (cuda[w] == 0.0f && twin[w] == 0.0f) ++twinZero[w];
+                else ++twinSeed[w];
+            }
+        }
+    }
+    std::printf("  old-fold twin loses: minTri %u (zero %u, seed %u), maxTri %u (zero %u, seed %u), "
+                "minConv %u (zero %u), maxConv %u (zero %u); GPU equals the twin in %u of %u words\n",
+                twinLost[0], twinZero[0], twinSeed[0], twinLost[1], twinZero[1], twinSeed[1],
+                twinLost[2], twinZero[2], twinLost[3], twinZero[3], gpuIsTwin, GROUPS * 32u * 4u);
+
+    PXG_CHECK_MSG(bad == 0, "the support folds match the CUDA's select folds bit for bit (%zu mismatches)", bad);
+    PXG_CHECK_MSG(nanOut == 0, "the CUDA's seeded select folds never return NaN (%u)", nanOut);
+    for (uint32_t w = 0; w < 4; ++w)
+        PXG_CHECK_MSG(twinZero[w] >= 8u, "the FMin/FMax twin loses %s on a +-0 tie in at least 8 lanes (%u)",
+                      word[w], twinZero[w]);
+    PXG_CHECK_MSG(twinSeed[0] >= 4u && twinSeed[1] >= 4u,
+                  "the unseeded triangle twin loses both seeds on NaN/inf projections (%u / %u)",
+                  twinSeed[0], twinSeed[1]);
 }
 
 } // namespace

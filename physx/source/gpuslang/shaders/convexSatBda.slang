@@ -217,3 +217,63 @@ void convexSelectLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// convexSupportLaunch -- P9.89: the two stage-3 support folds, csSupportTriangle
+// (supportTriangle, convexTriangle.cuh:507-518) and csSupportConvex
+// (supportConvex, :494-505), driven directly, one (triangle, direction) pair per
+// lane against the group's hull.
+//
+// Why a probe of its own: in satEdgeCrossDirection2 the four results only reach
+// an output through `minConv > maxTri + contactDist` style comparisons, which
+// cannot see the sign of a zero, and through tempOverlap0/1 -> `separation`,
+// which only shows the sign when BOTH operands are zeros.  Two of the four lines
+// (the two MIN folds) can be pinned that way and are, in convexSatStages; the
+// two MAX folds, the fold order and the +-PX_MAX_F32 seeds against a +inf
+// projection cannot, so they are read out here, per lane and bit for bit.
+//
+// Input record, CSB_SUP_IN_STRIDE bytes per group:
+//   @0   uint64 hullAddr | uint _pad[2]
+//   @16  float4 scale.xyz, _pad
+//   @32  float4 scaleRot (quat)
+//   @48  _pad[16]
+//   @64  32 x { float4 t0, float4 t1, float4 t2, float4 dir }
+// Output: 32 x float4 (minTri, maxTri, minConv, maxConv) per group.
+// ---------------------------------------------------------------------------
+static const uint CSB_SUP_IN_STRIDE = 64u + 32u * 64u;
+static const uint CSB_SUP_OUT_STRIDE = 32u * 16u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void convexSupportLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint lane = gtid.x;
+
+    // One group per hull and no grid-stride loop, for the reason convexSatLaunch
+    // gives: `hull` is a chained BDA load.
+    const uint g = gid.x;
+    if (g < gCs.numCases)
+    {
+        const uint64_t inBase = gCs.input + uint64_t(g) * uint64_t(CSB_SUP_IN_STRIDE);
+        const uint64_t hull = Ptr<uint64_t>(inBase)[0];
+        const float4 scale = Ptr<float4>(inBase + 16UL)[0];
+        const float4 scaleRot = Ptr<float4>(inBase + 32UL)[0];
+        const uint desc = chHullDesc(hull);
+
+        // fills convexScaledVerts and ends with the group barrier
+        csScaleVerts(lane, hull, desc, scale.xyz, scaleRot);
+
+        const uint64_t laneIn = inBase + 64UL + uint64_t(lane) * 64UL;
+        const float3 t0 = Ptr<float4>(laneIn)[0].xyz;
+        const float3 t1 = Ptr<float4>(laneIn + 16UL)[0].xyz;
+        const float3 t2 = Ptr<float4>(laneIn + 32UL)[0].xyz;
+        const float3 dir = Ptr<float4>(laneIn + 48UL)[0].xyz;
+
+        float minTri, maxTri, minConv, maxConv;
+        csSupportTriangle(t0, t1, t2, dir, minTri, maxTri);
+        csSupportConvex(chNbVerts(desc), dir, minConv, maxConv);
+
+        const uint64_t outBase = gCs.output + uint64_t(g) * uint64_t(CSB_SUP_OUT_STRIDE);
+        Ptr<float4>(outBase + uint64_t(lane) * 16UL)[0] = float4(minTri, maxTri, minConv, maxConv);
+    }
+}
