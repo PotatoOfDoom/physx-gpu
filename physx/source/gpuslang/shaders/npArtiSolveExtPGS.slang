@@ -209,7 +209,13 @@ public void svpAccumulateError(inout SvpError e, float deltaF, float velocityMul
     const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
     e.sumOfSquares += r * r;
     ++e.counter;
-    e.maxError = max(e.maxError, abs(r));
+    // P9.89: maxError = PxMax(maxError, PxAbs(e)) (solverResidual.cuh:57) is selectMax(a, b) =
+    // a > b ? a : b (PxUnixMathIntrinsics.h:122), a serial select chain over the rows: a NaN
+    // residual replaces the running maximum and the next row's |e| replaces the NaN.  GLSL max()
+    // (FMax, NaN-ignoring on stamped llvmpipe) kept the old maximum across the NaN row.  Feeds
+    // artiSolveBlockPartition and the PGS static contacts (npArtiSolveInternal, npArtiSolveSelf).
+    const float ar = abs(r);
+    e.maxError = (e.maxError > ar) ? e.maxError : ar;
 }
 
 // PxgErrorAccumulator::calculateResidual

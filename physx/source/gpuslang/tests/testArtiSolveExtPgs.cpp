@@ -52,6 +52,10 @@
 //    pool and broken flags POISONED;
 //  * three 1D rounds: residual reporting on/(refs)/off — the off round must
 //    leave mod.residual poisoned;
+//  * P9.89 (artiSolveExtPgsMaxErrorNaN): contact rows with a NaN residual (a NaN compliant
+//    coefficient), on a lane's last residual row or mid-chain, so the error accumulator's
+//    maxError must follow the CUDA's selectMax chain (solverResidual.cuh:57); an FMax twin
+//    must differ;
 //  * every block byte compared bit-exactly; untouched fields at the seed.
 
 #include "pxgTestFramework.h"
@@ -72,6 +76,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace
@@ -191,7 +196,8 @@ struct SvpParamsHost
 };
 static_assert(sizeof(SvpParamsHost) == 72, "params blob");
 
-static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, float ref1)
+static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, float ref1,
+                            bool nanResiduals = false)
 {
     PxgBlockConstraintBatch batch;
     svpSeedBatch(batch);
@@ -280,31 +286,114 @@ static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, floa
     PXG_CHECK_MSG(nCompliant > 5 && nZeroContacts > 0 && nFloor > 4 && nWithFriction > 10,
                   "contact coverage hole");
 
+    // P9.89 (npArtiSolveExtPGS svpAccumulateError): a NaN residual inside a lane's row chain.
+    // The CUDA's maxError = PxMax(maxError, PxAbs(e)) (solverResidual.cuh:57) is selectMax, so a
+    // NaN row REPLACES the running maximum and the next row's |e| replaces the NaN: the lane ends
+    // with the maximum over the rows AFTER the NaN, or with NaN when the NaN row is the last one.
+    // The port's old GLSL max() (llvmpipe's stamped FMax ignores a NaN) kept the maximum over all
+    // finite rows.  The NaN comes from a NaN compliant coefficient a = coeff0 on a compliant lane:
+    // velMultiplier = x * a * m and impulseMul = 1 - x are NaN, the CUDA's fminf(NaN, maxImpulse)
+    // makes the row's newForce exactly maxImpulse -- a finite deltaF, so the velocities, impulses
+    // and later rows stay finite and only e = deltaF / NaN is NaN.  Even lanes take the NaN on the
+    // LAST contact row, odd lanes on a middle row; every lane with contacts becomes compliant (with
+    // the compliant lanes' a > 0 on its other rows).
+    uint32_t nNanRows = 0;
+    if (nanResiduals)
+    {
+        for (uint32_t l = 0; l < SVP_LANES; ++l)
+        {
+            const uint32_t nc = svpNumContacts(l);
+            if (nc == 0u)
+                continue;
+            const uint32_t k = (l & 1u) ? (nc - 1u) / 2u : nc - 1u;
+            ch[0].restitution[l] = -600.0f - 10.0f * float(l);
+            for (uint32_t i = 0; i < SVP_MAX_CONTACTS; ++i)
+                cp[SVP_START_CONSTRAINT + i].coeff0[l] = 0.5f + 0.4f * std::fabs(fv(l, 30 + i, 0, 78));
+            cp[SVP_START_CONSTRAINT + k].coeff0[l] = std::numeric_limits<float>::quiet_NaN();
+            ++nNanRows;
+        }
+    }
+
     SvpIoBuf io;
     io.init(90);
 
-    // mirror
-    std::vector<PxgBlockSolverContactHeader> wCh = ch;
-    std::vector<PxgBlockSolverFrictionHeader> wFh = fh;
-    std::vector<PxgBlockSolverContactPoint> wCp = cp;
-    std::vector<PxgBlockSolverContactFriction> wFp = fp;
-    std::vector<float> wantIo = io.data;
-    for (uint32_t l = 0; l < SVP_LANES; ++l)
+    // mirror; errVariant selects gExtErrMaxVariant (0 = the CUDA)
+    struct ContactImage
     {
-        LaneIo lio = svpLaneIo(l, 90);
-        UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
-        RefError err;
-        refSolveExtContactPGS(batch, lio.vel0, lio.vel1, doFriction, l, wCh.data(),
-                              wFh.data(), wCp.data(), wFp.data(), rsp.data(), imp0, imp1,
-                              &err, ref0, ref1);
-        float* o = &wantIo[32 * 32 + l * 32];
-        const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
-        for (int v = 0; v < 4; ++v)
+        std::vector<PxgBlockSolverContactHeader> ch;
+        std::vector<PxgBlockSolverFrictionHeader> fh;
+        std::vector<PxgBlockSolverContactPoint> cp;
+        std::vector<PxgBlockSolverContactFriction> fp;
+        std::vector<float> io;
+    };
+    auto mirror = [&](int errVariant) {
+        ContactImage w{ ch, fh, cp, fp, io.data };
+        gExtErrMaxVariant = errVariant;
+        for (uint32_t l = 0; l < SVP_LANES; ++l)
         {
-            o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
-            o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            LaneIo lio = svpLaneIo(l, 90);
+            UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+            RefError err;
+            refSolveExtContactPGS(batch, lio.vel0, lio.vel1, doFriction, l, w.ch.data(),
+                                  w.fh.data(), w.cp.data(), w.fp.data(), rsp.data(), imp0, imp1,
+                                  &err, ref0, ref1);
+            float* o = &w.io[32 * 32 + l * 32];
+            const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
+            for (int v = 0; v < 4; ++v)
+            {
+                o[v * 6 + 0] = vs[v]->top.x; o[v * 6 + 1] = vs[v]->top.y; o[v * 6 + 2] = vs[v]->top.z;
+                o[v * 6 + 3] = vs[v]->bottom.x; o[v * 6 + 4] = vs[v]->bottom.y; o[v * 6 + 5] = vs[v]->bottom.z;
+            }
+            o[24] = err.sumOfSquares; o[25] = float(err.counter); o[26] = err.maxError;
         }
-        o[24] = err.sumOfSquares; o[25] = float(err.counter); o[26] = err.maxError;
+        gExtErrMaxVariant = 0;
+        return w;
+    };
+    const ContactImage want = mirror(0);
+    const std::vector<PxgBlockSolverContactHeader>& wCh = want.ch;
+    const std::vector<PxgBlockSolverFrictionHeader>& wFh = want.fh;
+    const std::vector<PxgBlockSolverContactPoint>& wCp = want.cp;
+    const std::vector<PxgBlockSolverContactFriction>& wFp = want.fp;
+    const std::vector<float>& wantIo = want.io;
+
+    // P9.89 twin: the old FMax chain may change ONLY maxError words (io out slot 26), and on the
+    // NaN rounds it must change some: lanes whose CUDA maxError is the trailing NaN, and lanes
+    // whose CUDA maxError restarted after the NaN below an earlier row's |e|.
+    std::vector<float> errTwinIo;
+    if (nanResiduals)
+    {
+        const ContactImage twin = mirror(1);
+        errTwinIo = twin.io;
+        uint32_t nanSumLanes = 0, cudaNanMax = 0, restartedMax = 0, otherIoWords = 0;
+        for (uint32_t l = 0; l < SVP_LANES; ++l)
+        {
+            const float* o = &wantIo[32 * 32 + l * 32];
+            const float* t = &twin.io[32 * 32 + l * 32];
+            if (std::isnan(o[24])) ++nanSumLanes;
+            for (uint32_t k = 0; k < 32; ++k)
+                if (k != 26u && std::memcmp(&o[k], &t[k], 4u) != 0) ++otherIoWords;
+            if (std::memcmp(&o[26], &t[26], 4u) == 0)
+                continue;
+            if (std::isnan(o[26]) && !std::isnan(t[26])) ++cudaNanMax;
+            else if (!std::isnan(o[26]) && !std::isnan(t[26]) && o[26] < t[26]) ++restartedMax;
+            else ++otherIoWords;
+        }
+        for (uint32_t k = 0; k < 32 * 32; ++k)
+            if (std::memcmp(&wantIo[k], &twin.io[k], 4u) != 0) ++otherIoWords;
+        const bool blocksSame = std::memcmp(twin.ch.data(), wCh.data(), sizeof(wCh[0])) == 0 &&
+                                std::memcmp(twin.fh.data(), wFh.data(), sizeof(wFh[0])) == 0 &&
+                                std::memcmp(twin.cp.data(), wCp.data(), wCp.size() * sizeof(wCp[0])) == 0 &&
+                                std::memcmp(twin.fp.data(), wFp.data(), wFp.size() * sizeof(wFp[0])) == 0;
+        std::printf("[ info ] svp contact(doF %d, ref %g/%g): %u NaN-residual rows, %u lanes with a"
+                    " NaN sumOfSquares; FMax twin: %u maxError trailing NaN -> finite, %u restarted"
+                    " maxError raised, %u other words, blocks %s\n",
+                    int(doFriction), double(ref0), double(ref1), nNanRows, nanSumLanes, cudaNanMax,
+                    restartedMax, otherIoWords, blocksSame ? "same" : "DIFFER");
+        PXG_CHECK_MSG(nNanRows == 27u && nanSumLanes == nNanRows && cudaNanMax >= 3u &&
+                          restartedMax >= 3u && otherIoWords == 0u && blocksSame,
+                      "P9.89: the NaN-residual lanes lost their selectMax coverage (%u rows, %u NaN"
+                      " sums, %u trailing NaN, %u restarted, %u other words)", nNanRows, nanSumLanes,
+                      cudaNanMax, restartedMax, otherIoWords);
     }
 
     std::vector<PxgDevicePtr> bufs;
@@ -357,6 +446,13 @@ static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, floa
     cmp(dCp, wCp.data(), wCp.size() * sizeof(wCp[0]), "contactPoints");
     cmp(dFp, wFp.data(), wFp.size() * sizeof(wFp[0]), "frictionPoints");
     cmp(dIo, wantIo.data(), wantIo.size() * 4, "io");
+    if (!errTwinIo.empty())
+    {
+        std::vector<float> g(errTwinIo.size());
+        shim.memcpyDtoH(g.data(), dIo, g.size() * 4);
+        if (std::memcmp(g.data(), errTwinIo.data(), g.size() * 4) == 0)
+            std::printf("MM contact/io: the device reproduces the FMax twin (GLSL max() chain)\n");
+    }
 
     for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
     return bad;
@@ -521,5 +617,23 @@ PXG_TEST(artiSolveExtPgs)
     bad += svpRun1D(shim, true, 1.0f, 1.0f);
     bad += svpRun1D(shim, true, 0.75f, 1.25f);
     bad += svpRun1D(shim, false, 1.0f, 1.0f);
+    PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
+}
+
+// P9.89: the contact rounds again with NaN residual rows (svpRunContact nanResiduals): the
+// maxError chain must be the CUDA's selectMax (solverResidual.cuh:57), not GLSL max().
+PXG_TEST(artiSolveExtPgsMaxErrorNaN)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npArtiSolveExtPGS.spv", "svpContactTest", 72u, 0 },
+        { "npArtiSolveExtPGS.spv", "svp1DTest", 72u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &svpLoader);
+
+    size_t bad = 0;
+    bad += svpRunContact(shim, true, 1.0f, 1.0f, true);
+    bad += svpRunContact(shim, true, 0.75f, 1.25f, true);
+    bad += svpRunContact(shim, false, 1.0f, 1.0f, true);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }
