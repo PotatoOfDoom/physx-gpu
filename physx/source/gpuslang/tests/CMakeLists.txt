@@ -231,7 +231,17 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # SAME npCvxStage2Core/npCvxCollide modules, so it joins too.  testCvxCollide
     # cvxCollide_p90RayDotOrder compares the face-ray tEnter and contact points bitwise
     # and fails without this entry.
-    npCvxStage2Setup npCvxStage2SetupDbg)
+    npCvxStage2Setup npCvxStage2SetupDbg
+    # P9.90: the PGS particle/rigid contact prep + solve.  The prep's response
+    # terms raXnSqrtInertia.dot(raXnSqrtInertia) (particlesystem.cu:1386/:1391-1392)
+    # and the solve's normal/tangent velocities linVel0.dot(n) + angVel0.dot(raXn)
+    # (:1654-1656) and separation/biasedF dots (:1438/:1453-1454) are float OpDots,
+    # (x + y) + z in the CUDA; unstamped, llvmpipe summed them x + (y + z).  Its
+    # imports are descriptor layouts only (no shared float code), and the TGS solve
+    # that consumes this prep (psContactSolveTgsBda) is already stamped.
+    # testPsContactSolve psContactSolve_p90DotOrder compares the constraint block,
+    # deltaPos, appliedForces and mAccumDeltaP bitwise and fails without this entry.
+    psContactSolveBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
