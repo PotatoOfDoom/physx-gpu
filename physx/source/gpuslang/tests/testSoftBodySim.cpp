@@ -9724,6 +9724,11 @@ PXG_TEST(softBodySimPrimitiveContactGenHull)
 //   * `nbPrimitives = (data >> 1) & 63` cannot be told from `& 31` by EITHER fixture: the two
 //     differ only for a leaf holding 32 or more primitives, and a leaf is walked by one warp,
 //     so neither test harness builds one.
+//
+// P9.89: the SAT's and tetBoundingBox's PxMin/PxMax selects are fixtured in testNpTetTriMid.cpp
+// (softBodySimClothMidphase_p89NaNSelect through this kernel, softBodySimClothMidphase_p89SatProbe
+// through the test-only sb_clothMidphaseSatProbe), next to the p89tt model they share with
+// npTetTriMid.
 // ===========================================================================
 namespace p88cloth
 {

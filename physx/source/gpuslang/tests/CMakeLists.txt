@@ -1329,7 +1329,11 @@ pxg_compile_shader(softBodyFemAttachBda femAttachmentPrepareLaunch
 # traverser npTetTriMid ports for the descriptor set.  IS in PXG_NOCONTRACT_SHADERS: satIntersect
 # is dot-of-cross throughout and the plane distances are mul-feeding-add chains.  Pure BDA, so
 # deliberately absent from PXG_HLSL_ENTRIES.
-pxg_compile_shader(softBodyClothMidphaseBda sb_clothMidphaseGeneratePairsLaunch)
+# P9.89: sb_clothMidphaseSatProbe, a test-only entry that reads the tet-vs-triangle SAT's
+# selectMin/selectMax folds and tetBoundingBox out bit for bit
+# (softBodySimClothMidphase_p89SatProbe).
+pxg_compile_shader(softBodyClothMidphaseBda sb_clothMidphaseGeneratePairsLaunch
+                   sb_clothMidphaseSatProbe)
 
 # softBodyClothContactGenBda — sb_clothContactGenLaunch (P8.8 step 2).  Tet-vs-triangle GJK/EPA
 # through the shared driver, both barycentrics, the surface-face rejection and the two-level

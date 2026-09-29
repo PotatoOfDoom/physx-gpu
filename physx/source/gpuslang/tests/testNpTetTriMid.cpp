@@ -51,6 +51,16 @@
 
 #include "pxgTestFramework.h"
 
+// P9.89: softBodySimClothMidphase_p89NaNSelect drives the ENGINE kernel
+// sb_clothMidphaseGeneratePairsLaunch, which reads the real engine descriptors.  It lives in
+// this file because its reference is the p89tt model below -- the kernel's traverser is the
+// same TriangleLeafBoundMinMaxTraverser<false> ctTetTriMid ports.
+#include "geometry/PxGeometry.h"
+// no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers; must precede PxgSoftBody.h.
+#include "host_defines.h"
+#include "PxgSoftBody.h"
+#include "PxgFEMCloth.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -664,6 +674,24 @@ enum Site : uint32_t
 static const char* const kSiteName[SITE_COUNT] = { "minProject inner", "minProject outer", "sep planes[0]",
                                                    "sep planes[1]", "sep planes[2]", "sep planes[3]",
                                                    "tolerance" };
+// tetBoundingBox (deformableCollision.cuh:64-94), per axis
+//   minimum = PxMin(PxMin(v0, v1), PxMin(v2, v3)), maximum = PxMax(PxMax(v0, v1), PxMax(v2, v3)).
+// Its own mask space (bits 16..21, swaps at 24..29), so SITE_ALL and twinMasks() above keep
+// meaning the SAT alone.
+enum TbSite : uint32_t
+{
+    TB_MIN01 = 1u << 16,  // tX0 = PxMin(worldV0.x, worldV1.x)   (:70-72)
+    TB_MIN23 = 1u << 17,  // tX1 = PxMin(worldV2.x, worldV3.x)   (:74-76)
+    TB_MINOUT = 1u << 18, // minimum.x = PxMin(tX0, tX1)         (:78-80)
+    TB_MAX01 = 1u << 19,  // tX0 = PxMax(worldV0.x, worldV1.x)   (:83-85)
+    TB_MAX23 = 1u << 20,  // tX1 = PxMax(worldV2.x, worldV3.x)   (:87-89)
+    TB_MAXOUT = 1u << 21, // maximum.x = PxMax(tX0, tX1)         (:91-93)
+    TB_COUNT = 6,
+    TB_SHIFT = 16,
+    TB_ALL = 0x3Fu << 16
+};
+static const char* const kTbSiteName[TB_COUNT] = { "tetBound min(v0,v1)", "tetBound min(v2,v3)", "tetBound min outer",
+                                                   "tetBound max(v0,v1)", "tetBound max(v2,v3)", "tetBound max outer" };
 static float foldMin(uint32_t rv, uint32_t site, float a, float b)
 {
     if (rv & site) return oldFMin(a, b);
@@ -724,14 +752,16 @@ static float minProject(V3 n, float d, V3 v0, V3 v1, V3 v2, uint32_t rv)
     return foldMin(rv, MP_OUTER, dot3(n, v0) + d, foldMin(rv, MP_INNER, dot3(n, v1) + d, dot3(n, v2) + d));
 }
 
-// satIntersect<BackFaceCull> (:78-106)
+// satIntersect<BackFaceCull> (:78-106).  `cull` = BackFaceCull: ctTetTriMid keeps the internal
+// cull (it stands in for both instantiations), softBodyClothMidphaseBda is the <false>
+// instantiation the engine calls.  Behind the caller's front-face gate the two agree.
 static float satIntersect(const V3 pn[4], const float pd[4], V3 centroid, V3 v0, V3 v1, V3 v2,
-                          float tolerance, uint32_t rv, Frag* fr)
+                          float tolerance, uint32_t rv, Frag* fr, bool cull = true)
 {
     V3 n;
     float d;
     plane3(v0, v1, v2, n, d);
-    if (dot3(n, centroid) + d < 0.0f)
+    if (cull && dot3(n, centroid) + d < 0.0f)
         return MAXF;
     float sep = minProject(n, d, v0, v1, v2, rv);
     if (fr) fr->note(sep, tolerance);
@@ -744,6 +774,18 @@ static float satIntersect(const V3 pn[4], const float pd[4], V3 centroid, V3 v0,
         if (sep > tolerance) return sep;
     }
     return sep;
+}
+
+// tetBoundingBox (deformableCollision.cuh:64-94): the pairwise tree, per axis, as selects
+static void tetBound(const V3 t[4], V3& tMin, V3& tMax, uint32_t rv)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        setComp(tMin, i, foldMin(rv, TB_MINOUT, foldMin(rv, TB_MIN01, comp(t[0], i), comp(t[1], i)),
+                                 foldMin(rv, TB_MIN23, comp(t[2], i), comp(t[3], i))));
+        setComp(tMax, i, foldMax(rv, TB_MAXOUT, foldMax(rv, TB_MAX01, comp(t[0], i), comp(t[1], i)),
+                                 foldMax(rv, TB_MAX23, comp(t[2], i), comp(t[3], i))));
+    }
 }
 
 struct Scene
@@ -764,13 +806,8 @@ static std::vector<uint32_t> runQuery(const Scene& sc, const TtWork& w, uint32_t
     fr.note(det, 1e-9f);
     if (!(det > 1e-9f)) return out;
 
-    // tetBoundingBox (deformableCollision.cuh:64-94), selects
     V3 tMin, tMax;
-    for (int i = 0; i < 3; ++i)
-    {
-        setComp(tMin, i, selMin(selMin(comp(t[0], i), comp(t[1], i)), selMin(comp(t[2], i), comp(t[3], i))));
-        setComp(tMax, i, selMax(selMax(comp(t[0], i), comp(t[1], i)), selMax(comp(t[2], i), comp(t[3], i))));
-    }
+    tetBound(t, tMin, tMax, rv);
     V3 pn[4];
     float pd[4], dist[4];
     tetPlanes(t, pn, pd, dist);
@@ -916,18 +953,31 @@ static std::string twinName(uint32_t m)
     }
     return "?";
 }
-} // namespace p89tt
+// ---- npTetTriMid_p89NaNSelect and softBodySimClothMidphase_p89NaNSelect share the generator,
+// the host evaluation and the GPU comparison below; only the kernel launch differs. ------------
+enum NsFam { INF3 = 0, INF2, INF1, NANV, OVF, INF0, ORD, FAM_COUNT };
+static const char* const famName[FAM_COUNT] = { "INF3", "INF2", "INF1", "NANV", "OVF", "INF0", "ORD" };
 
-PXG_TEST(npTetTriMid_p89NaNSelect)
+struct NsSet
 {
-    using namespace p89tt;
-    std::mt19937 rng(89089u);
+    std::vector<Region> regions;
+    std::vector<TtWork> work;
+    std::vector<int> fam;
+    int famHave[FAM_COUNT] = {};
+    uint32_t drawn = 0, fragile = 0, unplanted = 0;
+    bool famShort = false;
+};
+
+// Draws the families (see the header) one query at a time, each evaluated in a scene of its own:
+// a margin-fragile candidate, or one whose planted twin does not differ, is redrawn.
+static NsSet genNaNSelect(uint32_t seed)
+{
+    NsSet gs;
+    std::mt19937 rng(seed);
     auto D = [&](int lo, int hi, int den) { return float(int(rng() % uint32_t(hi - lo + 1)) + lo) / float(den); };
     auto u01 = [&]() { return float(rng() % 1000001u) / 1000000.0f; };
     auto axisVec = [](int a, float s) { V3 v = { 0.0f, 0.0f, 0.0f }; setComp(v, a, s); return v; };
 
-    enum Fam { INF3 = 0, INF2, INF1, NANV, OVF, INF0, ORD, FAM_COUNT };
-    const char* famName[FAM_COUNT] = { "INF3", "INF2", "INF1", "NANV", "OVF", "INF0", "ORD" };
     const int famWant[FAM_COUNT] = { 8, 8, 8, 6, 6, 4, 6 };
     const std::vector<uint32_t> twins = twinMasks();
 
@@ -1001,11 +1051,13 @@ PXG_TEST(npTetTriMid_p89NaNSelect)
         return true;
     };
 
-    std::vector<Region> regions;
-    std::vector<TtWork> work;
-    std::vector<int> fam;
-    int famHave[FAM_COUNT] = {};
-    uint32_t drawn = 0, fragile = 0, unplanted = 0;
+    std::vector<Region>& regions = gs.regions;
+    std::vector<TtWork>& work = gs.work;
+    std::vector<int>& fam = gs.fam;
+    int* famHave = gs.famHave;
+    uint32_t& drawn = gs.drawn;
+    uint32_t& fragile = gs.fragile;
+    uint32_t& unplanted = gs.unplanted;
     uint32_t grid = 0, ovfLevel = 0;
 
     for (int f = 0; f < FAM_COUNT; ++f)
@@ -1091,30 +1143,52 @@ PXG_TEST(npTetTriMid_p89NaNSelect)
             if (f == OVF) ++ovfLevel; else ++grid;
         }
     }
-    bool famShort = false;
-    for (int f = 0; f < FAM_COUNT; ++f) famShort = famShort || famHave[f] < famWant[f];
-    PXG_CHECK_MSG(!famShort, "p89 NaN select: a family came up short (INF3 %d INF2 %d INF1 %d NANV %d OVF %d INF0 %d ORD %d)",
-                  famHave[INF3], famHave[INF2], famHave[INF1], famHave[NANV], famHave[OVF], famHave[INF0], famHave[ORD]);
-    if (famShort) return;
+    for (int f = 0; f < FAM_COUNT; ++f) gs.famShort = gs.famShort || gs.famHave[f] < famWant[f];
+    return gs;
+}
 
-    // ---- the full scene: the reference and every twin, re-evaluated in place ----------------
-    const Scene sc = buildScene(regions);
+static bool famOk(const char* tag, const NsSet& g)
+{
+    PXG_CHECK_MSG(!g.famShort, "%s: a family came up short (INF3 %d INF2 %d INF1 %d NANV %d OVF %d INF0 %d ORD %d)", tag,
+                  g.famHave[INF3], g.famHave[INF2], g.famHave[INF1], g.famHave[NANV], g.famHave[OVF], g.famHave[INF0],
+                  g.famHave[ORD]);
+    return !g.famShort;
+}
+
+struct NsEval
+{
+    std::vector<uint32_t> twins;
+    std::vector<std::vector<uint32_t>> ref;
+    std::vector<std::vector<std::vector<uint32_t>>> tw;
+    size_t refPairs = 0;
+};
+
+// The full scene: the reference and every twin, re-evaluated in place, and the host-side proof
+// that the battery sees each site it claims to see.
+static NsEval evalNaNSelect(const char* tag, const Scene& sc, const std::vector<TtWork>& work,
+                            const std::vector<int>& fam, const NsSet& g)
+{
+    NsEval ev;
+    ev.twins = twinMasks();
+    const std::vector<uint32_t>& twins = ev.twins;
     const uint32_t NQ = uint32_t(work.size());
-    std::vector<std::vector<uint32_t>> ref(NQ);
-    std::vector<std::vector<std::vector<uint32_t>>> tw(NQ, std::vector<std::vector<uint32_t>>(twins.size()));
-    size_t refPairs = 0, frag = 0;
+    std::vector<std::vector<uint32_t>>& ref = ev.ref;
+    std::vector<std::vector<std::vector<uint32_t>>>& tw = ev.tw;
+    ref.assign(NQ, {});
+    tw.assign(NQ, std::vector<std::vector<uint32_t>>(twins.size()));
+    size_t frag = 0;
     for (uint32_t q = 0; q < NQ; ++q)
     {
         Frag fr;
         ref[q] = runQuery(sc, work[q], 0u, fr);
         for (size_t i = 0; i < twins.size(); ++i) tw[q][i] = runQuery(sc, work[q], twins[i], fr);
         frag += fr.hit ? 1u : 0u;
-        refPairs += ref[q].size();
+        ev.refPairs += ref[q].size();
     }
-    PXG_CHECK_MSG(frag == 0, "p89 NaN select: %zu queries became margin-fragile in the assembled scene", frag);
+    PXG_CHECK_MSG(frag == 0, "%s: %zu queries became margin-fragile in the assembled scene", tag, frag);
 
-    std::printf("    [p89 NaN select] %u queries (%u drawn, %u margin-fragile, %u unplanted redrawn), %zu CUDA pairs\n",
-                NQ, drawn, fragile, unplanted, refPairs);
+    std::printf("    [%s] %u queries (%u drawn, %u margin-fragile, %u unplanted redrawn), %zu CUDA pairs\n",
+                tag, NQ, g.drawn, g.fragile, g.unplanted, ev.refPairs);
     std::vector<uint32_t> twinDiff(twins.size(), 0);
     for (size_t i = 0; i < twins.size(); ++i)
     {
@@ -1131,17 +1205,64 @@ PXG_TEST(npTetTriMid_p89NaNSelect)
     for (uint32_t m : mustSee)
         for (size_t i = 0; i < twins.size(); ++i)
             if (twins[i] == m)
-                PXG_CHECK_MSG(twinDiff[i] >= 4u, "p89 NaN select: the %s twin differs on only %u queries",
+                PXG_CHECK_MSG(twinDiff[i] >= 4u, "%s: the %s twin differs on only %u queries", tag,
                               twinName(m).c_str(), twinDiff[i]);
     uint32_t oldSame = 0;
     for (uint32_t q = 0; q < NQ; ++q)
         if (fam[q] <= OVF && tw[q][SITE_COUNT] == ref[q]) ++oldSame;
-    PXG_CHECK_MSG(oldSame == 0u, "p89 NaN select: the old twin matches the CUDA on %u planted queries", oldSame);
+    PXG_CHECK_MSG(oldSame == 0u, "%s: the old twin matches the CUDA on %u planted queries", tag, oldSame);
     uint32_t ordDiff = 0;
     for (uint32_t q = 0; q < NQ; ++q)
         if (fam[q] == ORD)
             for (size_t i = 0; i < twins.size(); ++i) ordDiff += (tw[q][i] != ref[q]) ? 1u : 0u;
-    PXG_CHECK_MSG(ordDiff == 0u, "p89 NaN select: %u (ORD query, twin) pairs differ -- the control is not one", ordDiff);
+    PXG_CHECK_MSG(ordDiff == 0u, "%s: %u (ORD query, twin) pairs differ -- the control is not one", tag, ordDiff);
+    return ev;
+}
+
+// `gpu[q]` is query q's primitive list in EMISSION order (slot index + i).
+static void checkNaNSelectGpu(const char* tag, const NsEval& ev, const std::vector<int>& fam,
+                              const std::vector<std::vector<uint32_t>>& gpu, uint32_t gCount, size_t bogus)
+{
+    const std::vector<std::vector<uint32_t>>& ref = ev.ref;
+    const std::vector<std::vector<std::vector<uint32_t>>>& tw = ev.tw;
+    const uint32_t NQ = uint32_t(ref.size());
+    uint32_t bad[FAM_COUNT] = {}, badTotal = 0, asOld = 0, shown = 0;
+    for (uint32_t q = 0; q < NQ; ++q)
+    {
+        if (gpu[q] == ref[q]) continue;
+        ++badTotal;
+        ++bad[fam[q]];
+        if (gpu[q] == tw[q][SITE_COUNT]) ++asOld;
+        if (shown++ < 6)
+        {
+            auto str = [](const std::vector<uint32_t>& v) {
+                std::string s = "[";
+                for (size_t i = 0; i < v.size(); ++i) s += (i ? " " : "") + std::to_string(v[i]);
+                return s + "]";
+            };
+            std::printf("    %s q%u (%s): gpu %s cuda %s old twin %s\n", tag, q, famName[fam[q]],
+                        str(gpu[q]).c_str(), str(ref[q]).c_str(), str(tw[q][SITE_COUNT]).c_str());
+        }
+    }
+    PXG_CHECK_MSG(bogus == 0, "%s: %zu pairs with an out-of-range workId", tag, bogus);
+    PXG_CHECK_MSG(gCount == ev.refPairs, "%s: counter %u, the CUDA emits %zu", tag, gCount, ev.refPairs);
+    PXG_CHECK_MSG(badTotal == 0u,
+                  "%s: %u queries emit a different list than the CUDA's selects (%u of them the old "
+                  "FMin/FMax twin's) -- INF3 %u INF2 %u INF1 %u NANV %u OVF %u INF0 %u ORD %u", tag,
+                  badTotal, asOld, bad[INF3], bad[INF2], bad[INF1], bad[NANV], bad[OVF], bad[INF0], bad[ORD]);
+}
+} // namespace p89tt
+
+PXG_TEST(npTetTriMid_p89NaNSelect)
+{
+    using namespace p89tt;
+    const char* tag = "p89 NaN select";
+    const NsSet gen = genNaNSelect(89089u);
+    if (!famOk(tag, gen)) return;
+    const std::vector<TtWork>& work = gen.work;
+    const Scene sc = buildScene(gen.regions);
+    const NsEval ev = evalNaNSelect(tag, sc, work, gen.fam, gen);
+    const uint32_t NQ = uint32_t(work.size());
 
     // ---- GPU ----------------------------------------------------------------------------------
     PxgSlangComputeDevice* dev = testDevice();
@@ -1171,30 +1292,7 @@ PXG_TEST(npTetTriMid_p89NaNSelect)
         if (gP[i].x < NQ) gpu[gP[i].x].push_back(gP[i].y);
         else ++bogus;
     }
-    uint32_t bad[FAM_COUNT] = {}, badTotal = 0, asOld = 0, shown = 0;
-    for (uint32_t q = 0; q < NQ; ++q)
-    {
-        if (gpu[q] == ref[q]) continue;
-        ++badTotal;
-        ++bad[fam[q]];
-        if (gpu[q] == tw[q][SITE_COUNT]) ++asOld;
-        if (shown++ < 6)
-        {
-            auto str = [](const std::vector<uint32_t>& v) {
-                std::string s = "[";
-                for (size_t i = 0; i < v.size(); ++i) s += (i ? " " : "") + std::to_string(v[i]);
-                return s + "]";
-            };
-            std::printf("    p89 NaN select q%u (%s): gpu %s cuda %s old twin %s\n", q, famName[fam[q]],
-                        str(gpu[q]).c_str(), str(ref[q]).c_str(), str(tw[q][SITE_COUNT]).c_str());
-        }
-    }
-    PXG_CHECK_MSG(bogus == 0, "p89 NaN select: %zu pairs with an out-of-range workId", bogus);
-    PXG_CHECK_MSG(gCount == refPairs, "p89 NaN select: counter %u, the CUDA emits %zu", gCount, refPairs);
-    PXG_CHECK_MSG(badTotal == 0u,
-                  "p89 NaN select: %u queries emit a different list than the CUDA's selects (%u of them the old "
-                  "FMin/FMax twin's) -- INF3 %u INF2 %u INF1 %u NANV %u OVF %u INF0 %u ORD %u",
-                  badTotal, asOld, bad[INF3], bad[INF2], bad[INF1], bad[NANV], bad[OVF], bad[INF0], bad[ORD]);
+    checkNaNSelectGpu(tag, ev, gen.fam, gpu, gCount, bogus);
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,15 +1305,17 @@ namespace p89tt
 struct TpRec { F4 v0, v1, v2, pl[4], ct, lone; };
 static_assert(sizeof(TpRec) == 9 * 16, "probe record must be TP_REC_FLOAT4S = 9 float4s");
 
-static void probeRef(const TpRec& r, uint32_t rv, float o[4])
+// `cull`: see satIntersect -- ctTetTriSatProbe runs the culling copy, sb_clothMidphaseSatProbe
+// the engine's <false> instantiation.
+static void probeRef(const TpRec& r, uint32_t rv, float o[4], bool cull = true)
 {
     const V3 v0 = v3(r.v0), v1 = v3(r.v1), v2 = v3(r.v2);
     V3 pn[4];
     float pd[4];
     for (int k = 0; k < 4; ++k) { pn[k] = v3(r.pl[k]); pd[k] = r.pl[k].w; }
     o[0] = minProject(v3(r.lone), r.lone.w, v0, v1, v2, rv);
-    o[1] = satIntersect(pn, pd, v3(r.ct), v0, v1, v2, r.ct.w, rv, nullptr);
-    o[2] = satIntersect(pn, pd, v3(r.ct), v0, v1, v2, MAXF, rv, nullptr);
+    o[1] = satIntersect(pn, pd, v3(r.ct), v0, v1, v2, r.ct.w, rv, nullptr, cull);
+    o[2] = satIntersect(pn, pd, v3(r.ct), v0, v1, v2, MAXF, rv, nullptr, cull);
     V3 tn;
     float td;
     plane3(v0, v1, v2, tn, td);
@@ -1225,21 +1325,24 @@ static bool sameWord(float a, float b)
 {
     return (std::isnan(a) && std::isnan(b)) || (!std::isnan(a) && !std::isnan(b) && f2u(a) == f2u(b));
 }
-static uint32_t probeDiffWords(const TpRec& r, uint32_t rv)
+static uint32_t probeDiffWords(const TpRec& r, uint32_t rv, bool cull = true)
 {
     float c[4], m[4];
-    probeRef(r, 0u, c);
-    probeRef(r, rv, m);
+    probeRef(r, 0u, c, cull);
+    probeRef(r, rv, m, cull);
     uint32_t n = 0;
     for (int w = 0; w < 4; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
     return n;
 }
-} // namespace p89tt
+enum PFam { MPPAT = 0, SEPPAT, AXTRI, RANDOM, PFAM_COUNT };
 
-PXG_TEST(npTetTriMid_p89SatProbe)
+// The SAT probe battery (see npTetTriMid_p89SatProbe): exact-arithmetic records, planted per
+// fold, per operand order and per class (signed zero / non-finite), then ordinary fillers.
+// `cull` picks the satIntersect the planted records are checked against.
+static void genSatProbeRecords(uint64_t seed, bool cull, std::vector<TpRec>& recs, std::vector<int>& fam,
+                               uint32_t& missing)
 {
-    using namespace p89tt;
-    uint64_t rs = 0x89e7a7e1ull;
+    uint64_t rs = seed;
     auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
     auto pick = [&](int n) { return int(u() * float(n)) % n; };
     auto dy = [&](int lo, int hi, int den) { return float(pick(hi - lo + 1) + lo) / float(den); };
@@ -1270,10 +1373,6 @@ PXG_TEST(npTetTriMid_p89SatProbe)
         r.v0 = f4(vv[0]); r.v1 = f4(vv[1]); r.v2 = f4(vv[2]);
     };
 
-    enum Fam { MPPAT = 0, SEPPAT, AXTRI, RANDOM, PFAM_COUNT };
-    std::vector<TpRec> recs;
-    std::vector<int> fam;
-    uint32_t missing = 0;
 
     // ---- MPPAT: minProject's two folds, x word (and w) ----------------------------------------
     {
@@ -1301,8 +1400,8 @@ PXG_TEST(npTetTriMid_p89SatProbe)
                     for (int j = 0; j < 4; ++j) r.pl[j] = menuPlane(pick(3));
                     r.ct = { dy(-32, 32, 16), dy(-32, 32, 16), dy(-32, 32, 16), TOLS[pick(6)] };
                     float cw[4], mw[4];
-                    probeRef(r, 0u, cw);
-                    probeRef(r, site, mw);
+                    probeRef(r, 0u, cw, cull);
+                    probeRef(r, site, mw, cull);
                     if (sameWord(cw[0], mw[0])) continue;
                     recs.push_back(r); fam.push_back(MPPAT); ++found;
                 }
@@ -1337,8 +1436,8 @@ PXG_TEST(npTetTriMid_p89SatProbe)
                     r.lone = menuPlane(0);
                     r.ct = { dy(-32, 32, 16), dy(-32, 32, 16), dy(-32, 32, 16), TOLS[pick(6)] };
                     float cw[4], mw[4];
-                    probeRef(r, 0u, cw);
-                    probeRef(r, site, mw);
+                    probeRef(r, 0u, cw, cull);
+                    probeRef(r, site, mw, cull);
                     if (sameWord(cw[1], mw[1]) && sameWord(cw[2], mw[2])) continue;
                     recs.push_back(r); fam.push_back(SEPPAT); ++found;
                 }
@@ -1378,6 +1477,16 @@ PXG_TEST(npTetTriMid_p89SatProbe)
         r.ct = { dy(-32, 32, 16), dy(-32, 32, 16), dy(-32, 32, 16), TOLS[pick(6)] };
         recs.push_back(r); fam.push_back(RANDOM);
     }
+}
+} // namespace p89tt
+
+PXG_TEST(npTetTriMid_p89SatProbe)
+{
+    using namespace p89tt;
+    std::vector<TpRec> recs;
+    std::vector<int> fam;
+    uint32_t missing = 0;
+    genSatProbeRecords(0x89e7a7e1ull, /*cull*/ true, recs, fam, missing);
     PXG_CHECK_MSG(missing == 0u, "p89 SAT probe: %u planted (site, zero/non-finite) classes found fewer than four records",
                   missing);
     const uint32_t N = uint32_t(recs.size());
@@ -1453,6 +1562,449 @@ PXG_TEST(npTetTriMid_p89SatProbe)
                   "p89 SAT probe: %u words differ from the CUDA's select folds (%u of them equal the old FMin/FMax "
                   "twin) -- records by family: minProject %u, sep %u, axis-tri %u, random %u",
                   badWords, asOld, bad[MPPAT], bad[SEPPAT], bad[AXTRI], bad[RANDOM]);
+}
+
+// ===========================================================================
+// P9.89 -- the same folds in the ENGINE kernel: sb_clothMidphaseGeneratePairsLaunch
+// (softBodyClothMidphaseBda.slang, SB_CLOTH_MIDPHASE; softbodySoftbodyMidPhase.cu:1299-1444).
+//
+// Its traverser is TriangleLeafBoundMinMaxTraverser<false> -- the one ctTetTriMid ports -- so the
+// p89tt model above IS its reference: minProject (:72-76), satIntersect's four
+// sep = PxMax(sep, minProject(tet0.planes[k], ...)) (:93, :96, :99, :102), the caller's
+// PxMin(mBestDistance, mContactDistance) (:153) and tetBoundingBox (deformableCollision.cuh:64-94),
+// all PxMin/PxMax<float> selects.  The port spelled every one of them min()/max() (GLSL.std.450
+// FMin/FMax).  The tests live in this file for that reason; they carry the softBodySim suite name
+// because the kernel is that suite's.
+//
+// softBodySimClothMidphase_p89NaNSelect -- the NaN-select battery of npTetTriMid_p89NaNSelect
+// (drawn with its own seed), through the engine kernel and its driver:
+//   * one contact manager per query (grid y = cmIdx), each pairing its OWN one-tet softbody with
+//     the ONE cloth whose BV32 tree holds every region; odd managers list the cloth first, so
+//     LoadShapePairWarp finds the tet mesh by type;
+//   * the query's contact distance is contactDistance[sb] + contactDistance[cloth] = cd_q + 0;
+//   * the tets are handed over in WORLD space (cloth-local + T, identity rotation) and the
+//     reference evaluates what PxTransform::transformInv (PxTransform.h:134-138,
+//     PxQuat::rotateInv PxQuat.h:324-333) hands the traverser;
+//   * the engine grid, 1024 x numTests, and every surface hint set.
+// Each query's pairs are compared IN EMISSION ORDER (one atomicAdd of the count, then slot
+// index + i).  The kernel is in PXG_NOCONTRACT_SHADERS; the Frag margins are kept anyway.
+//
+// softBodySimClothMidphase_p89SatProbe -- sb_clothMidphaseSatProbe (test-only, not in the
+// manifest) returns minProject3, satIntersectTetTri (the <false> instantiation: no internal cull)
+// and tetBoundingBox on caller operands, bit for bit.  It is the only way to see the planes[0]
+// fold (kernel-blind, see the p89tt header) and tetBoundingBox: in the kernel a NaN corner fails
+// isValidTet before the bound is taken, and the box test reads the bound through `>`/`<` and
+// through mn - tMax / mx - tMin taken only when that difference is non-zero, none of which sees a
+// zero's sign.  The tetBoundingBox records are +-0 / non-finite coordinate patterns, so every
+// value is exact.
+//
+// The tolerance fold stays output-equivalent here too (see the p89tt header): bestDist is never
+// NaN, and a NaN contactDist fails `|d|^2 < contactDist^2` for every child of the root.
+// ===========================================================================
+namespace p89sbc
+{
+using namespace p89tt;
+
+// { PxReal toleranceLength, cmInputs*, transformCache*, bounds*, contactDistance*, gpuShapes*,
+//   softbodies*, clothes*, PxU32 stackSizeBytes, stackPtr*, midphasePairsNum* }
+struct SbClothMidPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, softbodies, clothes;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbClothMidPush) == 88, "sb_clothMidphase push blob must be 88 bytes");
+static_assert(sizeof(Bv32Node) == 1168, "Gu::BV32DataPacked is 1168 bytes");
+
+struct CmIn { uint32_t shapeRef0, shapeRef1, cacheRef0, cacheRef1; };
+struct ShapeH
+{
+    float sx, sy, sz, srx, sry, srz, srw;
+    uint32_t materialIndex, hullLo, hullHi, type, particleOrSoftbodyId;
+};
+static_assert(sizeof(ShapeH) == 48, "PxgShape mirror must be 48 bytes");
+
+struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
+template <typename T>
+static DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
+{
+    DevBuf b;
+    b.h = createBufferFrom(dev, data);
+    b.addr = dev->getBufferDeviceAddress(b.h);
+    return b;
+}
+
+// PxQuat::rotateInv (PxQuat.h:324-333), expression for expression
+static V3 quatRotateInv(const float q[4], V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    return { vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2,
+             vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2,
+             vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2 };
+}
+
+// ---- the probe: SAT record + tetBoundingBox corners ----------------------------------------
+struct TbRec { F4 t[4]; };
+struct SbcRec { TpRec sat; TbRec tb; };
+static_assert(sizeof(SbcRec) == 13 * 16, "probe record must be SBC_PROBE_IN_FLOAT4S = 13 float4s");
+enum TbFam { TBPAT = 0, TBRANDOM, TBFAM_COUNT };
+
+static void tbRef(const TbRec& r, uint32_t rv, float o[6])
+{
+    const V3 t[4] = { v3(r.t[0]), v3(r.t[1]), v3(r.t[2]), v3(r.t[3]) };
+    V3 mn, mx;
+    tetBound(t, mn, mx, rv);
+    o[0] = mn.x; o[1] = mn.y; o[2] = mn.z;
+    o[3] = mx.x; o[4] = mx.y; o[5] = mx.z;
+}
+static uint32_t tbDiffWords(const TbRec& r, uint32_t rv)
+{
+    float c[6], m[6];
+    tbRef(r, 0u, c);
+    tbRef(r, rv, m);
+    uint32_t n = 0;
+    for (int w = 0; w < 6; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
+    return n;
+}
+// words 0..3 = the SAT (satIntersect<false>), 4..9 = tMin.xyz, tMax.xyz
+static void sbcProbeRef(const SbcRec& r, uint32_t rv, float o[10])
+{
+    probeRef(r.sat, rv, o, /*cull*/ false);
+    tbRef(r.tb, rv, o + 4);
+}
+static uint32_t sbcDiffWords(const SbcRec& r, uint32_t rv)
+{
+    float c[10], m[10];
+    sbcProbeRef(r, 0u, c);
+    sbcProbeRef(r, rv, m);
+    uint32_t n = 0;
+    for (int w = 0; w < 10; ++w) n += sameWord(c[w], m[w]) ? 0u : 1u;
+    return n;
+}
+
+// tetBoundingBox corners: for each of the six selects, each operand order and each class
+// (signed-zero ties / non-finite), four records whose single-site twin changes a word; then
+// fillers up to `fillTo`.  Every coordinate is a planted pattern or a dyadic value.
+static void genTbRecords(uint64_t seed, size_t fillTo, std::vector<TbRec>& recs, std::vector<int>& fam,
+                         uint32_t& missing)
+{
+    uint64_t rs = seed;
+    auto u = [&]() { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return float(uint32_t(rs >> 40)) / 16777216.0f; };
+    auto pick = [&](int n) { return int(u() * float(n)) % n; };
+    auto dy = [&](int lo, int hi, int den) { return float(pick(hi - lo + 1) + lo) / float(den); };
+    const float PAT[10] = { -0.0f, 0.0f, -1.25f, -0.75f, 0.5f, 1.5f, 0.25f, QNAN, INF, -INF };
+    auto patFinite = [&](bool zeroOnly) { return zeroOnly ? PAT[pick(2)] : PAT[pick(7)]; };
+    auto patAny = [&]() { return PAT[pick(10)]; };
+
+    for (uint32_t s = 0; s < TB_COUNT; ++s)
+        for (int sw = 0; sw < 2; ++sw)
+        {
+            const uint32_t site = sw ? ((1u << (TB_SHIFT + s)) << SWAP_SHIFT) : (1u << (TB_SHIFT + s));
+            for (int nonfin = 0; nonfin < 2; ++nonfin)
+            {
+                int found = 0;
+                for (int tries = 0; tries < 400000 && found < 4; ++tries)
+                {
+                    TbRec r;
+                    bool anyNonfin = false;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        float* c = &r.t[k].x;
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            c[i] = nonfin ? patAny() : patFinite(u() < 0.6f);
+                            anyNonfin = anyNonfin || !std::isfinite(c[i]);
+                        }
+                        r.t[k].w = 0.0f;
+                    }
+                    if (bool(nonfin) != anyNonfin) continue;
+                    if (tbDiffWords(r, site) == 0u) continue;
+                    recs.push_back(r); fam.push_back(TBPAT); ++found;
+                }
+                if (found < 4) ++missing;
+            }
+        }
+    while (recs.size() < fillTo)
+    {
+        TbRec r;
+        for (int k = 0; k < 4; ++k)
+        {
+            float* c = &r.t[k].x;
+            for (int i = 0; i < 3; ++i) c[i] = (u() < 0.3f) ? patAny() : dy(-48, 48, 32);
+            r.t[k].w = 0.0f;
+        }
+        recs.push_back(r); fam.push_back(TBRANDOM);
+    }
+}
+} // namespace p89sbc
+
+PXG_TEST(softBodySimClothMidphase_p89NaNSelect)
+{
+    using namespace p89tt;
+    using namespace p89sbc;
+    const char* tag = "p89 sbCloth NaN select";
+    const NsSet gen = genNaNSelect(89188u);
+    if (!famOk(tag, gen)) return;
+    const uint32_t NQ = uint32_t(gen.work.size());
+
+    // ---- the cloth frame and the tets the kernel's traverser sees ----------------------------
+    const float Q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const V3 T = { 8.0f, -16.0f, 4.0f };
+    std::vector<F4> tetWorld;
+    std::vector<U4> tetIdx;
+    std::vector<TtWork> seen(NQ);
+    uint32_t moved = 0;
+    for (uint32_t q = 0; q < NQ; ++q)
+    {
+        const F4* lv[4] = { &gen.work[q].v0, &gen.work[q].v1, &gen.work[q].v2, &gen.work[q].v3 };
+        F4* sv[4] = { &seen[q].v0, &seen[q].v1, &seen[q].v2, &seen[q].v3 };
+        for (int k = 0; k < 4; ++k)
+        {
+            const V3 w = add(v3(*lv[k]), T);
+            tetWorld.push_back({ w.x, w.y, w.z, 1.0f });
+            const V3 c = quatRotateInv(Q, sub(w, T));   // clothToWorld.transformInv(worldV)
+            *sv[k] = f4(c);
+            if (f2u(c.x) != f2u(lv[k]->x) || f2u(c.y) != f2u(lv[k]->y) || f2u(c.z) != f2u(lv[k]->z)) ++moved;
+        }
+        seen[q].params = gen.work[q].params;
+        tetIdx.push_back({ 4u * q, 4u * q + 1u, 4u * q + 2u, 4u * q + 3u });
+    }
+    std::printf("    [%s] %u of %u tet corners change bits through transformInv (signs of zero only)\n", tag, moved, 4u * NQ);
+
+    const Scene sc = buildScene(gen.regions);
+    const NsEval ev = evalNaNSelect(tag, sc, seen, gen.fam, gen);
+    // tetBoundingBox is kernel-blind (see the header), and this battery agrees: its whole old
+    // spelling, and each of its single-site twins, changes no query
+    uint32_t tbSeen = 0;
+    for (uint32_t q = 0; q < NQ; ++q)
+    {
+        Frag fr;
+        tbSeen += (runQuery(sc, seen[q], TB_ALL, fr) != ev.ref[q]) ? 1u : 0u;
+        for (uint32_t s = 0; s < TB_COUNT; ++s)
+        {
+            const uint32_t site = 1u << (TB_SHIFT + s);
+            tbSeen += (runQuery(sc, seen[q], site, fr) != ev.ref[q]) ? 1u : 0u;
+            tbSeen += (runQuery(sc, seen[q], site << SWAP_SHIFT, fr) != ev.ref[q]) ? 1u : 0u;
+        }
+    }
+    PXG_CHECK_MSG(tbSeen == 0u, "%s: %u (query, tetBound twin) pairs differ -- the bound is not kernel-blind", tag, tbSeen);
+
+    // ---- GPU: the engine kernel on the engine descriptors -----------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> treeBlob(4 + sc.nodes.size() * (sizeof(Bv32Node) / 4), 0u);
+    treeBlob[0] = uint32_t(sc.verts.size());
+    treeBlob[1] = uint32_t(sc.tris.size());
+    treeBlob[2] = 2u;
+    treeBlob[3] = uint32_t(sc.nodes.size());
+    std::memcpy(treeBlob.data() + 4, sc.nodes.data(), sc.nodes.size() * sizeof(Bv32Node));
+    DevBuf bTree = makeDev(dev, treeBlob), bTriV = makeDev(dev, sc.verts), bTriI = makeDev(dev, sc.tris);
+    if (!bTree.addr)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        for (PxgBufferHandle h : { bTree.h, bTriV.h, bTriI.h }) dev->destroyBuffer(h);
+        return;
+    }
+    physx::PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bTriV.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bTriI.addr));
+    cloth.mNbVerts = uint32_t(sc.verts.size());
+    cloth.mNbTriangles = uint32_t(sc.tris.size());
+    const std::vector<physx::PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    DevBuf bTetV = makeDev(dev, tetWorld), bTetI = makeDev(dev, tetIdx);
+    const std::vector<uint32_t> hintWords((NQ + 3u) / 4u + 1u, 0x01010101u);
+    DevBuf bHint = makeDev(dev, hintWords);
+    std::vector<physx::PxgSoftBody> sbs(NQ);
+    for (uint32_t q = 0; q < NQ; ++q)
+    {
+        physx::PxgSoftBody& sb = sbs[q];
+        std::memset(&sb, 0, sizeof(sb));
+        sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTetI.addr + 16ull * q));
+        sb.mPosition_InvMass = reinterpret_cast<decltype(sb.mPosition_InvMass)>(size_t(bTetV.addr));
+        sb.mTetMeshSurfaceHint = reinterpret_cast<decltype(sb.mTetMeshSurfaceHint)>(size_t(bHint.addr + q));
+        sb.mNumTets = 1u;
+        sb.mNumVerts = 4u * NQ;
+    }
+    DevBuf bSb = makeDev(dev, sbs);
+
+    // shape 0 = the cloth, shape 1 + q = softbody q; transform/contact-distance slot q = softbody
+    // q, slot NQ = the cloth
+    std::vector<ShapeH> shapes(NQ + 1);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(ShapeH));
+    shapes[0].type = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+    shapes[0].srw = 1.0f;
+    for (uint32_t q = 0; q < NQ; ++q)
+    {
+        shapes[1 + q].type = uint32_t(physx::PxGeometryType::eTETRAHEDRONMESH);
+        shapes[1 + q].particleOrSoftbodyId = q;
+        shapes[1 + q].srw = 1.0f;
+    }
+    std::vector<CmIn> cms(NQ);
+    for (uint32_t q = 0; q < NQ; ++q)
+        cms[q] = (q & 1u) ? CmIn{ 0u, 1u + q, NQ, q } : CmIn{ 1u + q, 0u, q, NQ };
+    std::vector<float> xf(size_t(NQ + 1) * 8u, 0.0f);   // PxsCachedTransform: q @0, p @16, flags @28
+    for (uint32_t i = 0; i <= NQ; ++i) xf[8u * i + 3u] = 1.0f;
+    for (int k = 0; k < 4; ++k) xf[8u * NQ + k] = Q[k];
+    xf[8u * NQ + 4u] = T.x; xf[8u * NQ + 5u] = T.y; xf[8u * NQ + 6u] = T.z;
+    std::vector<float> cd(NQ + 1, 0.0f);
+    for (uint32_t q = 0; q < NQ; ++q) cd[q] = gen.work[q].params.x;
+    DevBuf bShapes = makeDev(dev, shapes), bCms = makeDev(dev, cms), bXf = makeDev(dev, xf), bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = NQ * 4 + 16;
+    const std::vector<U4> stackInit(CAP, { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu });
+    const std::vector<uint32_t> cnt(1, 0u);
+    DevBuf bStack = makeDev(dev, stackInit), bCnt = makeDev(dev, cnt);
+
+    SbClothMidPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.bounds = 0ull;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bSb.addr;
+    push.clothes = bCloth.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bCnt.addr;
+    {
+        Kernel k("softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch", {}, sizeof(SbClothMidPush));
+        // the engine grid (PxgNarrowphaseCore.cpp:4617): x = SB_SBMIDPHASE = 1024, y = numTests
+        k.dispatch(1024u, {}, push, NQ, 1u);
+        dev->flush();
+    }
+    const auto gS = downloadBuffer<U4>(dev, bStack.h, CAP);
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+    for (PxgBufferHandle h : { bTree.h, bTriV.h, bTriI.h, bCloth.h, bTetV.h, bTetI.h, bHint.h, bSb.h, bShapes.h,
+                               bCms.h, bXf.h, bCd.h, bStack.h, bCnt.h })
+        dev->destroyBuffer(h);
+
+    // the stack in slot order: each query's reservation is contiguous, so this is emission order
+    std::vector<std::vector<uint32_t>> gpu(NQ);
+    size_t bogus = 0;
+    for (uint32_t i = 0; i < gCount && i < CAP; ++i)
+    {
+        if (gS[i].x < NQ && gS[i].y == 0u && gS[i].w == 0u) gpu[gS[i].x].push_back(gS[i].z);
+        else ++bogus;
+    }
+    checkNaNSelectGpu(tag, ev, gen.fam, gpu, gCount, bogus);
+}
+
+PXG_TEST(softBodySimClothMidphase_p89SatProbe)
+{
+    using namespace p89tt;
+    using namespace p89sbc;
+    const char* tag = "p89 sbCloth SAT probe";
+    std::vector<TpRec> sat;
+    std::vector<int> satFam;
+    uint32_t satMissing = 0;
+    genSatProbeRecords(0x5bc1a7e1ull, /*cull*/ false, sat, satFam, satMissing);
+    std::vector<TbRec> tb;
+    std::vector<int> tbFam;
+    uint32_t tbMissing = 0;
+    genTbRecords(0x7e7b0dd1ull, sat.size(), tb, tbFam, tbMissing);
+    PXG_CHECK_MSG(satMissing == 0u && tbMissing == 0u,
+                  "%s: planted (site, zero/non-finite) classes with fewer than four records -- SAT %u, tetBound %u", tag,
+                  satMissing, tbMissing);
+    PXG_CHECK_MSG(tb.size() == sat.size(), "%s: %zu tetBound records against %zu SAT records", tag, tb.size(), sat.size());
+    if (tb.size() != sat.size()) return;
+    const uint32_t N = uint32_t(sat.size());
+    std::vector<SbcRec> recs(N);
+    for (uint32_t i = 0; i < N; ++i) { recs[i].sat = sat[i]; recs[i].tb = tb[i]; }
+
+    // ---- the battery has to SEE every fold and every operand order ----------------------------
+    uint32_t blind = 0, twinWords = 0;
+    std::printf("    [%s] %u records; words each single-site twin changes:\n", tag, N);
+    for (uint32_t s = 0; s < 6; ++s)
+    {
+        uint32_t rvW = 0, swW = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            rvW += sbcDiffWords(recs[i], 1u << s);
+            swW += sbcDiffWords(recs[i], (1u << s) << SWAP_SHIFT);
+        }
+        std::printf("      %-20s revert %3u  swap %3u\n", kSiteName[s], rvW, swW);
+        if (rvW < 4u || swW < 4u) ++blind;
+    }
+    for (uint32_t s = 0; s < TB_COUNT; ++s)
+    {
+        const uint32_t site = 1u << (TB_SHIFT + s);
+        uint32_t rvW = 0, swW = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            rvW += sbcDiffWords(recs[i], site);
+            swW += sbcDiffWords(recs[i], site << SWAP_SHIFT);
+        }
+        std::printf("      %-20s revert %3u  swap %3u\n", kTbSiteName[s], rvW, swW);
+        if (rvW < 4u || swW < 4u) ++blind;
+    }
+    const uint32_t OLD = SITE_ALL | TB_ALL;
+    for (uint32_t i = 0; i < N; ++i) twinWords += sbcDiffWords(recs[i], OLD);
+    std::printf("      old FMin/FMax twin: %u words\n", twinWords);
+    PXG_CHECK_MSG(blind == 0u, "%s: %u fold sites are changed on fewer than four words by their revert or swap", tag,
+                  blind);
+
+    // ---- run the probe ---------------------------------------------------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> in(size_t(N) * 13u);
+    std::memcpy(in.data(), recs.data(), sizeof(SbcRec) * N);
+    const std::vector<U4> outInit(size_t(N) * 3u, { 0x7f800001u, 1u, 2u, 3u });
+    DevBuf bIn = makeDev(dev, in), bOut = makeDev(dev, outInit);
+    if (!bIn.addr)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        dev->destroyBuffer(bIn.h); dev->destroyBuffer(bOut.h);
+        return;
+    }
+    struct ProbePush { uint64_t input, output; uint32_t numRecords, pad20, pad24, pad28; };
+    static_assert(sizeof(ProbePush) == 32, "SbClothSatProbeParams is 32 bytes");
+    const ProbePush pp = { bIn.addr, bOut.addr, N, 0u, 0u, 0u };
+    {
+        Kernel k("softBodyClothMidphaseBda.spv", "sb_clothMidphaseSatProbe", {}, sizeof(ProbePush));
+        k.dispatch((N + 31u) / 32u, {}, pp);
+        dev->flush();
+    }
+    const auto g = downloadBuffer<U4>(dev, bOut.h, size_t(N) * 3u);
+    dev->destroyBuffer(bIn.h); dev->destroyBuffer(bOut.h);
+
+    uint32_t badSat[PFAM_COUNT] = {}, badTb[TBFAM_COUNT] = {}, badWords = 0, asOld = 0, badPad = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        float c[10], t[10];
+        sbcProbeRef(recs[i], 0u, c);
+        sbcProbeRef(recs[i], OLD, t);
+        const uint32_t gw[12] = { g[3 * i].x, g[3 * i].y, g[3 * i].z, g[3 * i].w,
+                                  g[3 * i + 1].x, g[3 * i + 1].y, g[3 * i + 1].z, g[3 * i + 1].w,
+                                  g[3 * i + 2].x, g[3 * i + 2].y, g[3 * i + 2].z, g[3 * i + 2].w };
+        badPad += (gw[10] != 0u || gw[11] != 0u) ? 1u : 0u;
+        bool satBad = false, tbBad = false;
+        for (int w = 0; w < 10; ++w)
+        {
+            float gv;
+            std::memcpy(&gv, &gw[w], 4);
+            if (sameWord(gv, c[w])) continue;
+            (w < 4 ? satBad : tbBad) = true;
+            ++badWords;
+            if (sameWord(gv, t[w])) ++asOld;
+            if (badWords <= 6)
+                std::printf("    %s rec %u word %d: gpu %08x (%g) cuda %08x (%g) old twin %08x (%g)\n", tag, i, w, gw[w],
+                            gv, f2u(c[w]), c[w], f2u(t[w]), t[w]);
+        }
+        if (satBad) ++badSat[satFam[i]];
+        if (tbBad) ++badTb[tbFam[i]];
+    }
+    PXG_CHECK_MSG(badPad == 0u, "%s: %u records with a non-zero pad word", tag, badPad);
+    PXG_CHECK_MSG(badWords == 0u,
+                  "%s: %u words differ from the CUDA's select folds (%u of them equal the old FMin/FMax twin) -- "
+                  "records by family: minProject %u, sep %u, axis-tri %u, random %u; tetBound planted %u, random %u",
+                  tag, badWords, asOld, badSat[MPPAT], badSat[SEPPAT], badSat[AXTRI], badSat[RANDOM], badTb[TBPAT],
+                  badTb[TBRANDOM]);
 }
 
 } // namespace

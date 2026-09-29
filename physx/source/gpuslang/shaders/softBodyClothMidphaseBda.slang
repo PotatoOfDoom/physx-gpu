@@ -159,9 +159,37 @@ void createPlane(float3 pa, float3 pb, float3 pc, float3 pd, out float3 n, out f
     if (dot(n, pd) + d > 0.0f) { n = -n; d = -d; }
 }
 
+// P9.89: EVERY FOLD OF THE SAT AND OF THE TET BOUND IS A SELECT, NOT min()/max().
+// softbodySoftbodyMidPhase.cu folds with PxMin/PxMax<float>, and so does tetBoundingBox
+// (deformableCollision.cuh:64-94); both are selectMin(a, b) = a < b ? a : b and
+// selectMax(a, b) = a > b ? a : b (PxMath.h:82-100, PxUnixMathIntrinsics.h:116-125).  An equal
+// compare returns b, so a +-0 tie keeps b's zero; a NaN in either operand fails the compare, so b
+// is returned -- a NaN b sticks and a NaN a is dropped.  The port spelled them min()/max(), i.e.
+// GLSL.std.450 FMin/FMax, which llvmpipe evaluates as "the non-NaN operand" with -0/+0 on a zero
+// tie.  Nesting and operand order were already the CUDA's; only the operator differed.
+// Kernel-visible through a NaN projection: a triangle whose THIRD vertex has an infinite
+// coordinate (and whose first edge has a zero component off that axis) passes the front-face
+// gate -- its edge cross holds 0 * inf = NaN, getNormalized's `m > 0` fails, the normal is the
+// zero vector and the gate reads +-0 >= 0 -- and every tet plane whose normal has an exact zero
+// in that coordinate projects the vertex as 0 * inf = NaN.  minProject then returns NaN (the
+// CUDA's PxMin(d1, NaN) = NaN sticks), satIntersect's sep = PxMax(sep, NaN) WIPES the running
+// separation, and the next plane RESETS it -- a NaN last plane drops the triangle.  All-finite
+// input gets there too: a tet with two ~2e19 edges overflows the cross products of faces 0 and 3
+// and their normals come out (0, 0, NaN).  FMin/FMax skipped every NaN instead.
+// testNpTetTriMid softBodySimClothMidphase_p89NaNSelect drives that through this kernel, and
+// softBodySimClothMidphase_p89SatProbe reads every fold, tetBoundingBox included, out bit for bit
+// through sb_clothMidphaseSatProbe.
+float sbcSelMin(float a, float b) { return (a < b) ? a : b; }
+float sbcSelMax(float a, float b) { return (a > b) ? a : b; }
+float3 sbcSelMin3(float3 a, float3 b) { return float3(sbcSelMin(a.x, b.x), sbcSelMin(a.y, b.y), sbcSelMin(a.z, b.z)); }
+float3 sbcSelMax3(float3 a, float3 b) { return float3(sbcSelMax(a.x, b.x), sbcSelMax(a.y, b.y), sbcSelMax(a.z, b.z)); }
+
+// minProject(plane, v0, v1, v2) (softbodySoftbodyMidPhase.cu:72-76).
+// P9.89: PxMin(plane.distance(v0), PxMin(plane.distance(v1), plane.distance(v2))), both selects;
+// the `+ d` is inside each distance.
 float minProject3(float3 n, float d, float3 v0, float3 v1, float3 v2)
 {
-    return min(dot(n, v0) + d, min(dot(n, v1) + d, dot(n, v2) + d));
+    return sbcSelMin(dot(n, v0) + d, sbcSelMin(dot(n, v1) + d, dot(n, v2) + d));
 }
 
 // satIntersect<false>: the triangle plane term, then the four tet planes, with an early-out
@@ -173,6 +201,9 @@ float minProject3(float3 n, float d, float3 v0, float3 v1, float3 v2)
 // because it stands in for both instantiations; carrying it here too made the outer gate
 // provably redundant, and a mutant that deleted the gate survived because the duplicate still
 // culled.  One gate, in the place the .cu puts it.
+// P9.89: each sep = PxMax(sep, minProject(tet0.planes[k], v0, v1, v2))
+// (softbodySoftbodyMidPhase.cu:93, :96, :99, :102) is a select, running value first: a NaN
+// projection wipes sep, and the next plane's value replaces it.
 float satIntersectTetTri(float3 pn[4], float pd[4], float3 centroid,
                          float3 v0, float3 v1, float3 v2, float tolerance)
 {
@@ -180,14 +211,25 @@ float satIntersectTetTri(float3 pn[4], float pd[4], float3 centroid,
     makePlane(v0, v1, v2, n, d);
     float sep = minProject3(n, d, v0, v1, v2);
     if (sep > tolerance) return sep;
-    sep = max(sep, minProject3(pn[0], pd[0], v0, v1, v2));
+    sep = sbcSelMax(sep, minProject3(pn[0], pd[0], v0, v1, v2));
     if (sep > tolerance) return sep;
-    sep = max(sep, minProject3(pn[1], pd[1], v0, v1, v2));
+    sep = sbcSelMax(sep, minProject3(pn[1], pd[1], v0, v1, v2));
     if (sep > tolerance) return sep;
-    sep = max(sep, minProject3(pn[2], pd[2], v0, v1, v2));
+    sep = sbcSelMax(sep, minProject3(pn[2], pd[2], v0, v1, v2));
     if (sep > tolerance) return sep;
-    sep = max(sep, minProject3(pn[3], pd[3], v0, v1, v2));
+    sep = sbcSelMax(sep, minProject3(pn[3], pd[3], v0, v1, v2));
     return sep;
+}
+
+// tetBoundingBox (deformableCollision.cuh:64-94), called by computeTetBoundWithTetrahedron
+// (softbodySoftbodyMidPhase.cu:655-670).  P9.89: per axis tX0 = PxMin(v0, v1), tX1 = PxMin(v2, v3),
+// minimum = PxMin(tX0, tX1) (:70-80), and the PxMax twin for the maximum (:83-93) -- the pairwise
+// tree, as selects.  Output-equivalent in the kernel (a NaN corner already failed isValidTet, and
+// intersectBoxFullWarp cannot see a zero's sign), bit-exact as a function: the probe reads it.
+void tetBoundingBox(float3 t0, float3 t1, float3 t2, float3 t3, out float3 tMin, out float3 tMax)
+{
+    tMin = sbcSelMin3(sbcSelMin3(t0, t1), sbcSelMin3(t2, t3));
+    tMax = sbcSelMax3(sbcSelMax3(t0, t1), sbcSelMax3(t2, t3));
 }
 
 // PxTransform::transformInv(p) = q.rotateInv(p - t).  PxQuat::rotateInv (PxQuat.h:324).
@@ -310,8 +352,8 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         if (!isValidTet(t0, t1, t2, t3))
             continue;
 
-        const float3 tMin = min(min(t0, t1), min(t2, t3));
-        const float3 tMax = max(max(t0, t1), max(t2, t3));
+        float3 tMin, tMax;
+        tetBoundingBox(t0, t1, t2, t3, tMin, tMax);
 
         float3 pn[4]; float pd[4];
         createPlane(t0, t1, t2, t3, pn[0], pd[0]);
@@ -366,9 +408,13 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
                     // which is what makes satIntersect's own BackFaceCull dead code.
                     if (dot(tn, centroid) + td >= 0.0f)
                     {
+                        // P9.89: PxMin(mBestDistance, mContactDistance)
+                        // (softbodySoftbodyMidPhase.cu:153), a select.  Output-equivalent:
+                        // bestDist is never NaN, a NaN contactDist visits no leaf, and
+                        // `sep > tolerance` cannot see a +-0 tie.
                         const float separation =
                             satIntersectTetTri(pn, pd, centroid, v0, v1, v2,
-                                               min(bestDist, contactDist));
+                                               sbcSelMin(bestDist, contactDist));
                         if (separation < bestDist)
                         {
                             bestDist = separation;
@@ -468,4 +514,83 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         }
     }
     }
+}
+
+// ===========================================================================
+// sb_clothMidphaseSatProbe -- P9.89: the SAT folds and tetBoundingBox read out bit for bit.
+// Test-only entry (never in the manifest); the engine kernel above is the only engine consumer
+// of these functions.
+//
+// WHY A PROBE.  The kernel's only outputs are the (cmIdx, tetIdx, primIndex) triples, so a
+// separation reaches them only through `sep > tolerance`, `separation < bestDist`,
+// `bestDist < contactDist` and the lane argmin, and the tet bound only through the box test's
+// `>`/`<` and a difference taken when it is non-zero -- none of which sees the sign of a zero.
+// A NaN projection does reach the pairs (softBodySimClothMidphase_p89NaNSelect), but not at
+// every fold: the kernel's route to a NaN projection is an infinite triangle vertex, which also
+// makes the tri-plane term NaN, so the planes[0] fold never sees a finite running value there;
+// and a NaN tet corner never reaches the bound, because isValidTet rejects it first.  Every
+// fold is a transcription of a CUDA select and has to be bit-exact as a function, so this entry
+// evaluates them on caller-supplied operands, one record per thread.
+//
+// Record, SBC_PROBE_IN_FLOAT4S float4s:
+//   [0..2]  triangle v0, v1, v2 (xyz)
+//   [3..6]  tet planes 0..3 (n.xyz, d)
+//   [7]     centroid (xyz, unused by satIntersect<false>), satIntersect tolerance in .w
+//   [8]     a lone plane (n.xyz, d)
+//   [9..12] tet corners t0..t3 (xyz) for tetBoundingBox
+// Output, SBC_PROBE_OUT_FLOAT4S float4s per record:
+//   [0] = (minProject3(lone plane, v0, v1, v2),
+//          satIntersectTetTri(planes, v0, v1, v2, tolerance),
+//          satIntersectTetTri(planes, v0, v1, v2, PX_MAX_F32)   -- the whole chain,
+//          minProject3(makePlane(v0, v1, v2), v0, v1, v2))      -- the tri-plane term
+//   [1] = (tMin.xyz, tMax.x), [2] = (tMax.yz, 0, 0)
+// ===========================================================================
+struct SbClothSatProbeParams
+{
+    uint64_t input;       // @0
+    uint64_t output;      // @8
+    uint numRecords;      // @16
+    uint _pad20, _pad24, _pad28;
+}
+
+[[vk::push_constant]] ConstantBuffer<SbClothSatProbeParams> gSbcSatProbe;
+
+static const uint SBC_PROBE_IN_FLOAT4S = 13u;
+static const uint SBC_PROBE_OUT_FLOAT4S = 3u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void sb_clothMidphaseSatProbe(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint r = dtid.x;
+    if (r >= gSbcSatProbe.numRecords)
+        return;
+
+    Ptr<float4> rec = Ptr<float4>(gSbcSatProbe.input + uint64_t(r) * uint64_t(SBC_PROBE_IN_FLOAT4S * 16u));
+    const float3 v0 = rec[0].xyz, v1 = rec[1].xyz, v2 = rec[2].xyz;
+    float3 pn[4];
+    float pd[4];
+    for (uint k = 0u; k < 4u; ++k)
+    {
+        const float4 p = rec[3u + k];
+        pn[k] = p.xyz;
+        pd[k] = p.w;
+    }
+    const float4 ct = rec[7];
+    const float4 lp = rec[8];
+
+    float3 tn;
+    float td;
+    makePlane(v0, v1, v2, tn, td);
+
+    float3 tMin, tMax;
+    tetBoundingBox(rec[9].xyz, rec[10].xyz, rec[11].xyz, rec[12].xyz, tMin, tMax);
+
+    Ptr<float4> o = Ptr<float4>(gSbcSatProbe.output + uint64_t(r) * uint64_t(SBC_PROBE_OUT_FLOAT4S * 16u));
+    o[0] = float4(minProject3(lp.xyz, lp.w, v0, v1, v2),
+                  satIntersectTetTri(pn, pd, ct.xyz, v0, v1, v2, ct.w),
+                  satIntersectTetTri(pn, pd, ct.xyz, v0, v1, v2, PX_MAX_F32),
+                  minProject3(tn, td, v0, v1, v2));
+    o[1] = float4(tMin, tMax.x);
+    o[2] = float4(tMax.y, tMax.z, 0.0f, 0.0f);
 }
