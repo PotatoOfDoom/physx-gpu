@@ -408,7 +408,18 @@ void sb_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
         const float3 wA = o.closestPointA.xyz;
         const float3 wB = o.closestPointB.xyz;
         const float3 nrm = mcGetNormalized(o.direction.xyz);
-        const float pen = dot(wB - wA, nrm);
+        // P9.89: the CUDA sums the three lanes' products and then adds penOffset,
+        // pen = ((p0 + p1) + p2) + penOffset (softbodyPrimitives.cu:339), and this call site
+        // passes a literal 0 (:888-889).  The association is OpDot's under the NoContraction
+        // stamp; the `+ 0` leaf is not a no-op: it turns a -0 sum into +0.  A tet that
+        // touches the mesh exactly goes to EPA with lowerBound = +-0, so wB == wA, every
+        // lane is +0 * nrm_i, and a normal of (-0, -1, -0) makes the bare dot -0.  Spelled as
+        // a select, like the HF sibling's P9.86 fix (softBodyHfContactGenBda.slang:398-402),
+        // because a literal `penSum + 0.0f` is folded away (measured: that spelling stores -0
+        // again).  testSoftBodySim softBodySimMeshContactGen_p89PenOffset: 24 exact touches,
+        // 72 separated contacts against a bitwise mirror of :339.
+        const float penSum = dot(wB - wA, nrm);
+        const float pen = (penSum == 0.0f) ? 0.0f : penSum;
 
         uint index;
         InterlockedAdd(Ptr<uint>(gMc.w_totalContactCount)[0], 1u, index);

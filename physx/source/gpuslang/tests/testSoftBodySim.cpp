@@ -12941,6 +12941,383 @@ PXG_TEST(softBodySimMeshContactGen)
 }
 
 // ===========================================================================
+// P9.89 -- sb_meshContactGenLaunch's PENETRATION, bit for bit.
+//
+// writeContactNoBarycentricFullWarp (softbodyPrimitives.cu:297) spreads the projection over
+// the warp: lane i < 3 forms p_i = (witnessB_i - witnessA_i) * normal_i, lanes >= 3 form
+// (0 - 0) * 0, and then EVERY lane evaluates (:339)
+//
+//     pen = ((shfl(pen, 0) + shfl(pen, 1)) + shfl(pen, 2)) + penOffset
+//
+// The mesh call site passes penOffset = a literal 0 and normal = the normalised GJK/EPA
+// direction (:888-889).  Two things about that expression are pinned here:
+//
+//   * THE `+ penOffset` LEAF.  x + 0.0f is x for every x except -0, which it turns into +0.
+//     The port spelled the sum as `dot(wB - wA, nrm)` and dropped the leaf, so a -0 sum
+//     stayed -0.  The HF sibling (same helper, penOffset 0 at :1135-1136) got the P9.86
+//     select at softBodyHfContactGenBda.slang:398-402; the mesh path never did.  A -0 sum
+//     is reachable: a tetrahedron that TOUCHES the triangle exactly is not separated for
+//     GJK, so EPA runs and ends with lowerBound = +-0; closestPoint = bestDir * (+-0) has +-0
+//     components and closestPointB = closestPointA - closestPoint (epa.cuh:508, :521) IS
+//     closestPointA.  Every lane's witnessB - witnessA is then +0, and when the normalised
+//     direction has a set sign bit in all three components -- (-0, -1, -0) off a horizontal
+//     mesh -- every product is +0 * (<= -0) = -0 and so is the sum.  The CUDA stores +0,
+//     the old port -0.  LEVEL below is 24 such touches; the signs of the two zero components
+//     come out of EPA's face cross products, and measured, 11 of the 24 hit (-0, -1, -0)
+//     (the old port stored -0 on exactly those 11) while the other 13 carry a +0 component,
+//     where both spellings agree.
+//
+//   * THE ASSOCIATION.  ((p0 + p1) + p2), not p0 + (p1 + p2): the shader is
+//     NoContraction-stamped, which is what makes llvmpipe evaluate OpDot left to right.
+//     SEPARATED below is 72 vertex-vertex contacts with non-round offsets, each converging
+//     on GJK's size-1 simplex {apex - triangle vertex}, so closestPointA IS the apex
+//     (gjk.cuh:412, closestPointA = vA[a0]) and the host knows every operand: the stored
+//     point is witnessB (:414) and the stored normal is -normal, an exact negation.
+//     Measured: the same shader built WITHOUT the stamp fails 16 of the 72, each with the
+//     p0 + (p1 + p2) value.  The fma twin guards against a driver that fuses; llvmpipe
+//     evaluates even an explicit GLSL Fma unfused, so an fma spelling is equivalent here.
+//
+// The host mirror below transcribes :339 literally; the twins are the old port's spelling
+// (no penOffset), the right-to-left sum and the fma chain, and each must differ from the
+// mirror on several contacts or this fixture no longer tells them apart.
+// ===========================================================================
+PXG_TEST(softBodySimMeshContactGen_p89PenOffset)
+{
+    using namespace p80refit;
+    using namespace p88cloth;      // Bv32NodeHost
+    using namespace p810cg;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The mesh's placement, softBodySimMeshContactGen's: world = R * (vertex * scale) + T,
+    // R(x, y, z) = (-x, y, -z).  Exact for these inputs, so the host knows the world
+    // triangle bit for bit and the mesh plane is exactly y = TY.
+    const float SX = 2.0f, SY = 1.0f, SZ = 0.5f;
+    const float TX = 10.0f, TY = 20.0f, TZ = 30.0f;
+    auto toWorld = [&](float vx, float vy, float vz) {
+        return F4{ -(vx * SX) + TX, (vy * SY) + TY, -(vz * SZ) + TZ, 1.0f };
+    };
+
+    // Two triangles in the vertex-space plane y = 0, both wound so the kernel's reversed
+    // cross product points DOWN and the front-face gate admits a tet from above: the
+    // right-angled one of the base fixture and a scalene one.
+    std::vector<F4> triVerts;
+    std::vector<TetIdx4> triIdx;
+    auto addTri = [&](F4 a, F4 b, F4 c) {
+        const uint32_t base = uint32_t(triVerts.size());
+        triVerts.push_back(a); triVerts.push_back(b); triVerts.push_back(c);
+        triIdx.push_back({ base, base + 1u, base + 2u, 0u });
+        return uint32_t(triIdx.size() - 1u);
+    };
+    addTri(F4{ 1.0f, 0.0f, 0.0f, 0.0f }, F4{ 1.0f, 0.0f, 0.4f, 0.0f }, F4{ 1.4f, 0.0f, 0.0f, 0.0f });
+    addTri(F4{ 2.1f, 0.0f, 0.1f, 0.0f }, F4{ 2.4f, 0.0f, 0.7f, 0.0f }, F4{ 2.9f, 0.0f, 0.2f, 0.0f });
+    const uint32_t NPRIM = uint32_t(triIdx.size());
+    const uint32_t NVERT = uint32_t(triVerts.size());
+    std::vector<F4> W(NVERT);
+    for (uint32_t i = 0; i < NVERT; ++i) W[i] = toWorld(triVerts[i].x, triVerts[i].y, triVerts[i].z);
+    PXG_CHECK_MSG(W[0].y == TY && W[4].y == TY, "the mesh plane must be exactly y = TY");
+
+    std::vector<uint32_t> blob;
+    {
+        Bv32NodeHost node;
+        std::memset(&node, 0, sizeof(node));
+        node.mNbNodes = 1u;
+        node.mData[0] = 1u | (NPRIM << 1);
+        blob.resize(4u, 0u);
+        blob[0] = NVERT; blob[1] = NPRIM; blob[2] = 0u; blob[3] = 1u;
+        const size_t nodeWords = sizeof(Bv32NodeHost) / 4u;
+        blob.resize(4u + nodeWords, 0u);
+        std::memcpy(blob.data() + 4, &node, sizeof(node));
+        const size_t vBase = blob.size();
+        blob.resize(vBase + NVERT * 4u, 0u);
+        std::memcpy(blob.data() + vBase, triVerts.data(), NVERT * sizeof(F4));
+        const size_t iBase = blob.size();
+        blob.resize(iBase + NPRIM * 4u, 0u);
+        std::memcpy(blob.data() + iBase, triIdx.data(), NPRIM * sizeof(TetIdx4));
+    }
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the tetrahedra; vertex 0 of each is the one nearest the mesh -------------------
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    std::vector<uint32_t> tetTri;
+    auto addTet = [&](uint32_t tri, F4 p0, F4 p1, F4 p2, F4 p3) {
+        const uint32_t b = uint32_t(tetVerts.size());
+        tetVerts.push_back(p0); tetVerts.push_back(p1); tetVerts.push_back(p2); tetVerts.push_back(p3);
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        tetTri.push_back(tri);
+        return uint32_t(tets.size() - 1u);
+    };
+    auto P = [](float x, float y, float z) { return F4{ x, y, z, 1.0f }; };
+
+    // LEVEL: apex-down tets whose apex lies EXACTLY on the plane y = TY, strictly inside a
+    // triangle, base 0.2-0.4 above.  Deterministic pseudo-random placement.
+    const uint32_t NB_LEVEL = 24u;
+    {
+        uint32_t lcg = 12345u;
+        auto rnd = [&]() { lcg = lcg * 1664525u + 1013904223u; return float(lcg >> 8) / 16777216.0f; };
+        for (uint32_t tri = 0; tri < 2u; ++tri)
+            for (uint32_t k = 0; k < NB_LEVEL / 2u; ++k)
+            {
+                const F4 a = W[tri * 3u], b = W[tri * 3u + 1u], c = W[tri * 3u + 2u];
+                float u = 0.1f + 0.6f * rnd(), v = 0.1f + 0.6f * rnd();
+                if (u + v > 0.85f) { u *= 0.5f; v *= 0.5f; }
+                const float x = a.x + u * (b.x - a.x) + v * (c.x - a.x);
+                const float z = a.z + u * (b.z - a.z) + v * (c.z - a.z);
+                const float h = 0.2f + 0.2f * rnd();
+                const float r = 0.03f + 0.03f * rnd();
+                const float ph = 6.2831853f * rnd();
+                F4 q[3];
+                for (int j = 0; j < 3; ++j)
+                {
+                    const float ang = ph + 2.0943951f * float(j);
+                    q[j] = P(x + r * std::cos(ang), TY + h + 0.02f * rnd(), z + r * std::sin(ang));
+                }
+                addTet(tri, P(x, TY, z), q[0], q[1], q[2]);
+            }
+    }
+
+    // SEPARATED: for every triangle vertex Wv, twelve apexes in Wv's Voronoi region -- off the
+    // triangle along the outward bisector (turned by up to +-0.3 rad) and 0.012-0.036
+    // above it, at most 0.046 from Wv, inside the 0.05 contact distance.  Every edge from
+    // the apex runs AWAY from Wv (base = apex + L*u + r*(perpendicular), u = the unit
+    // Wv -> apex), so (apex, Wv) is the unique closest pair and GJK ends on the size-1
+    // simplex: witnessA IS the apex.
+    const uint32_t NB_SEP_PER_VERT = 12u;
+    {
+        double offs[NB_SEP_PER_VERT][3];            // { lateral, height, turn }
+        uint32_t lcg = 777u;
+        auto rnd = [&]() { lcg = lcg * 1664525u + 1013904223u; return double(lcg >> 8) / 16777216.0; };
+        for (uint32_t k = 0; k < NB_SEP_PER_VERT; ++k)
+        {
+            offs[k][0] = 0.004 + 0.024 * rnd();
+            offs[k][1] = 0.012 + 0.024 * rnd();
+            offs[k][2] = -0.29 + 0.58 * rnd();
+        }
+        for (uint32_t v = 0; v < NVERT; ++v)
+        {
+            const uint32_t tri = v / 3u, i0 = tri * 3u;
+            const F4 w = W[v], n1 = W[i0 + (v - i0 + 1u) % 3u], n2 = W[i0 + (v - i0 + 2u) % 3u];
+            double e1x = n1.x - w.x, e1z = n1.z - w.z, e2x = n2.x - w.x, e2z = n2.z - w.z;
+            const double l1 = std::sqrt(e1x * e1x + e1z * e1z), l2 = std::sqrt(e2x * e2x + e2z * e2z);
+            double ox = -(e1x / l1 + e2x / l2), oz = -(e1z / l1 + e2z / l2);
+            const double lo = std::sqrt(ox * ox + oz * oz);
+            ox /= lo; oz /= lo;
+            for (uint32_t k = 0; k < NB_SEP_PER_VERT; ++k)
+            {
+                const double cs = std::cos(offs[k][2]), sn = std::sin(offs[k][2]);
+                const double dx = (ox * cs - oz * sn) * offs[k][0], dz = (ox * sn + oz * cs) * offs[k][0];
+                const double dy = offs[k][1];
+                const F4 apex = P(float(w.x + dx), float(w.y + dy), float(w.z + dz));
+                const double ln = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const double ux = dx / ln, uy = dy / ln, uz = dz / ln;
+                // p1 = normalize(cross(u, +y)) = normalize((-uz, 0, ux)), p2 = cross(u, p1)
+                const double lp = std::sqrt(ux * ux + uz * uz);
+                const double p1x = -uz / lp, p1z = ux / lp;
+                const double p2x = uy * p1z, p2y = uz * p1x - ux * p1z, p2z = -uy * p1x;
+                F4 q[3];
+                for (int j = 0; j < 3; ++j)
+                {
+                    const double L = 0.25 + 0.037 * double(j + int(k)), rr = 0.09 + 0.011 * double(j);
+                    const double ang = 0.37 * double(k) + 2.0943951 * double(j);
+                    const double c = std::cos(ang) * rr, s = std::sin(ang) * rr;
+                    q[j] = P(float(apex.x + ux * L + p1x * c + p2x * s),
+                             float(apex.y + uy * L + p2y * s),
+                             float(apex.z + uz * L + p1z * c + p2z * s));
+                }
+                addTet(tri, apex, q[0], q[1], q[2]);
+            }
+        }
+    }
+    const uint32_t NB = uint32_t(tets.size());
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets);
+
+    const uint32_t SB_ID = 1u;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mNumTets = NB;
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = SX; shapes[0].sy = SY; shapes[0].sz = SZ; shapes[0].srw = 1.0f;
+    shapes[0].materialIndex = 5u;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*trimesh cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;
+    xf[8 + 1] = 1.0f;                                          // 180 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { 0.02f, 0.03f, 0.0f, 0.0f };      // contact distance 0.05
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> rd = { 0.125f, 0.0f };
+    DevBuf bRd = makeDev(dev, rd);
+    std::vector<uint64_t> remap = { 0ull, 0x0000000900000004ull };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // One stack entry per tet, so the pairs land on NB different (block, warp) slots.
+    std::vector<uint32_t> stack;
+    for (uint32_t t = 0; t < NB; ++t)
+    {
+        stack.push_back(0u); stack.push_back(t); stack.push_back(tetTri[t]); stack.push_back(0u);
+    }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { NB };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 128u;
+    PXG_CHECK_MSG(NB <= MAXC, "fixture: %u pairs exceed the %u-contact buffer", NB, MAXC);
+    std::vector<F4> zeroF4(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<uint32_t> zeroU(MAXC * 4u, 0u);
+    DevBuf bPoint = makeDev(dev, zeroF4), bNormalPen = makeDev(dev, zeroF4),
+           bBary = makeDev(dev, zeroF4), bInfo = makeDev(dev, zeroU),
+           bByX = makeDev(dev, zeroU), bTempByX = makeDev(dev, zeroU),
+           bIdxSorted = makeDev(dev, zeroU), bSorted = makeDev(dev, zeroU);
+    std::vector<uint32_t> zeroCount = { 0u };
+    DevBuf bCount = makeDev(dev, zeroCount);
+
+    SbMeshCgPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = NB * 16u;
+    push.filterPairs = 0u;
+    push.nbFilterPairs = 0u;
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.wPoint = bPoint.addr;
+    push.wNormalPen = bNormalPen.addr;
+    push.wBarycentric = bBary.addr;
+    push.wContactInfo = bInfo.addr;
+    push.wTotalCount = bCount.addr;
+    push.wContactByX = bByX.addr;
+    push.wTempContactByX = bTempByX.addr;
+    push.wContactIndexSortedByX = bIdxSorted.addr;
+    push.wContactSortedByX = bSorted.addr;
+    push.wMaxContacts = MAXC;
+
+    Kernel k("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, bNormalPen.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
+
+    PXG_CHECK_MSG(gCount == NB, "every one of the %u pairs is a contact (%u LEVEL touches, %u "
+                  "separated within the contact distance); got %u", NB, NB_LEVEL,
+                  NB - NB_LEVEL, gCount);
+
+    // The contact order is the atomics'; map back by the encoded tet.
+    std::vector<int> slotOf(NB, -1);
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+    {
+        const uint32_t t = gInfo[i * 4u + 2u] & 0xfffffu;
+        PXG_CHECK_MSG((gInfo[i * 4u + 2u] >> 20) == SB_ID && t < NB && slotOf[t] < 0,
+                      "contact %u: pairInd1 0x%08x is not a fresh tet of softbody %u", i,
+                      gInfo[i * 4u + 2u], SB_ID);
+        if (t < NB && slotOf[t] < 0) slotOf[t] = int(i);
+    }
+
+    uint32_t levelNegTwin = 0u, levelPosTwin = 0u, sepAssocDiffer = 0u, sepFmaDiffer = 0u;
+    for (uint32_t t = 0; t < NB; ++t)
+    {
+        const int i = slotOf[t];
+        PXG_CHECK_MSG(i >= 0, "tet %u produced no contact", t);
+        if (i < 0) continue;
+        const F4 apex = tetVerts[tets[t].x];
+        const F4 wB = gPoint[i];
+        // the stored xyz is -normal (flipOutputNormal = true); negation is exact
+        const float nx = -gNormalPen[i].x, ny = -gNormalPen[i].y, nz = -gNormalPen[i].z;
+        const float pen = gNormalPen[i].w;
+
+        if (t < NB_LEVEL)
+        {
+            // A touch: the witness is the apex, on the plane, and the normal is straight down
+            // with two zero components whose signs EPA's cross products decide.
+            PXG_CHECK_MSG(f2u(wB.y) == f2u(TY) && std::fabs(wB.x - apex.x) <= 1e-5f &&
+                          std::fabs(wB.z - apex.z) <= 1e-5f,
+                          "level tet %u: the witness is the touching apex (%a %a %a); got "
+                          "(%a %a %a)", t, apex.x, apex.y, apex.z, wB.x, wB.y, wB.z);
+            PXG_CHECK_MSG(nx == 0.0f && nz == 0.0f && f2u(ny) == 0xbf800000u,
+                          "level tet %u: the normal of a touch on a horizontal mesh is "
+                          "(+-0, -1, +-0); got (0x%08x 0x%08x 0x%08x)", t, f2u(nx), f2u(ny),
+                          f2u(nz));
+            // witnessB - witnessA is +0 in every lane (see the header), so lane i holds
+            // +0 * normal_i.  CUDA :339, transcribed: ((p0 + p1) + p2) + penOffset(0).
+            const float d = 0.0f;
+            const float p0 = d * nx, p1 = d * ny, p2 = d * nz;
+            const float twin = (p0 + p1) + p2;            // the old port: OpDot, no penOffset
+            const float cudaPen = twin + 0.0f;             // softbodyPrimitives.cu:339, :888
+            if (f2u(twin) == 0x80000000u) ++levelNegTwin; else ++levelPosTwin;
+            PXG_CHECK_MSG(f2u(cudaPen) == 0u && f2u(pen) == f2u(cudaPen),
+                          "level tet %u: a touching contact's pen is the CUDA's sum + penOffset "
+                          "0 = +0 (0x00000000); got 0x%08x -- 0x80000000 is the bare dot "
+                          "without the `+ penOffset` leaf (normal 0x%08x 0x%08x 0x%08x)",
+                          t, f2u(pen), f2u(nx), f2u(ny), f2u(nz));
+        }
+        else
+        {
+            // Vertex-vertex: witnessA is the apex exactly (GJK size-1 simplex).
+            const float d0 = wB.x - apex.x, d1 = wB.y - apex.y, d2 = wB.z - apex.z;
+            const float p0 = d0 * nx, p1 = d1 * ny, p2 = d2 * nz;
+            const float cudaPen = ((p0 + p1) + p2) + 0.0f; // softbodyPrimitives.cu:339
+            const float twinRL = p0 + (p1 + p2);           // undecorated OpDot on llvmpipe
+            const float twinFma = std::fmaf(d2, nz, std::fmaf(d1, ny, p0));
+            if (f2u(twinRL) != f2u(cudaPen)) ++sepAssocDiffer;
+            if (f2u(twinFma) != f2u(cudaPen)) ++sepFmaDiffer;
+            PXG_CHECK_MSG(pen > 0.0f && ny < 0.0f,
+                          "separated tet %u: the apex is above its triangle vertex, so pen > 0 "
+                          "and the normal points down; got pen %a, n.y %a", t, pen, ny);
+            PXG_CHECK_MSG(f2u(pen) == f2u(cudaPen),
+                          "separated tet %u: pen must be ((p0 + p1) + p2) + 0 of the CUDA "
+                          "(softbodyPrimitives.cu:339) = 0x%08x; got 0x%08x (p0 + (p1 + p2) "
+                          "= 0x%08x, fma chain = 0x%08x)", t, f2u(cudaPen), f2u(pen),
+                          f2u(twinRL), f2u(twinFma));
+        }
+    }
+    std::printf("  level: %u touches with a -0 bare dot, %u with +0; separated: %u of %u "
+                "re-associate, %u of %u fuse differently\n", levelNegTwin, levelPosTwin,
+                sepAssocDiffer, NB - NB_LEVEL, sepFmaDiffer, NB - NB_LEVEL);
+    PXG_CHECK_MSG(levelNegTwin >= 6u && levelPosTwin >= 6u,
+                  "coverage: the LEVEL touches must include both zero-sign patterns -- normal "
+                  "(-0, -1, -0), where the bare dot is -0 and only `+ penOffset` makes it +0, "
+                  "and a +0 component, where both spellings agree; got %u and %u",
+                  levelNegTwin, levelPosTwin);
+    PXG_CHECK_MSG(sepAssocDiffer >= 8u && sepFmaDiffer >= 4u,
+                  "coverage: the separated contacts must tell ((p0 + p1) + p2) from p0 + (p1 + "
+                  "p2) and from the fma chain; they differ on %u and %u contacts",
+                  sepAssocDiffer, sepFmaDiffer);
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h,
+                               bCd.h, bRd.h, bRemap.h, bStack.h, bPairNum.h, bNeeded.h,
+                               bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h, bTempByX.h,
+                               bIdxSorted.h, bSorted.h, bCount.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
 // P8.11 step 1 -- sb_heightfieldMidphaseGeneratePairsLaunch, the softbody-vs-HEIGHTFIELD
 // midphase.  There is no BVH on this path: the tetrahedron's world AABB is pushed into the
 // heightfield's unscaled row/column space and the integer rectangle it lands on names the
