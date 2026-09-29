@@ -231,6 +231,8 @@ struct Scene
     float q0x = 0, q0y = 0, q0z = 0, q0w = 1; // shape0 world orientation
     uint32_t preloadCount = 0;               // manifold slots preloaded before launch
     ExpContact pre[4] = {};                  // (countsWord low byte must match)
+    // P9.90: shape1 blob override (a generally rotated box hull); boxHalf unused then
+    const std::vector<uint8_t>* hull1 = nullptr;
 };
 
 struct RunResult
@@ -249,7 +251,7 @@ static bool runScene(const Scene& sc, RunResult& out)
     };
     PxgCudaShim shim(dev, manifest, 1, &ccLoader);
 
-    std::vector<uint8_t> blob = buildBoxHull(sc.boxHalf);
+    std::vector<uint8_t> blob = sc.hull1 ? *sc.hull1 : buildBoxHull(sc.boxHalf);
     if (sc.flipTopPlane)
     {
         // negate the +y plane (polygon 2): n = (0,-1,0), d = -d
@@ -756,6 +758,225 @@ PXG_TEST(cvxCollide_hullMutation)
     const size_t bad = checkScene(mut, 4u, cvxCornerContacts(0.05f), true, "hullMutation");
     PXG_CHECK_MSG(bad != 0, "hull mutation must FAIL the near expectations");
     std::printf("  [hullMutation] flipped A top plane breaks the expectations (%zu mismatches) ok\n", bad);
+}
+
+
+// ---------------------------------------------------------------------------
+// 14. P9.90: the capsule face-ray dot order.  intersectRayPolyhedron's
+// denominator = n.dot(dir) and distToPlane = n.dot(a) + d (cudaGJKEPA.cu
+// :1051-1052) are PxVec3 dots, (x + y) + z (PxVec3.h:173); the port spells
+// them dot(), an OpDot, which llvmpipe sums x + (y + z) unless the .spv is
+// stamped NoContraction.  The scene makes every term non-zero: hull B is a
+// box whose vertices AND plane normals are rotated by a general quaternion
+// R, and a capsule lies over its +y face (rotated by R, then yawed), so the
+// GJK direction, the ray origins and the plane normals all have three
+// non-zero, non-round components.  The GJK/EPA path has no OpDot, so the
+// test takes the GJK direction from the kernel's own output (np.xyz = -dir)
+// and transcribes everything downstream of it in the CUDA order:
+// prepareVertices (cu L2465-2476 + cudaNpCommon.h:315-343), the vertex-space
+// ray (cu L1103-1107), intersectRayPolyhedron and the slot store
+// (cu L1112-1136).  np.w = tEnter and localContactB = vA - dir * tEnter are
+// compared BITWISE; a twin with the old x + (y + z) dot must disagree (the
+// coverage guard: the scene is order-sensitive).
+// ---------------------------------------------------------------------------
+static V3 p90QRot(const float q[4], V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float d2 = q[0] * vx + q[1] * vy + q[2] * vz;
+    return V3{ vx * w2 + (q[1] * vz - q[2] * vy) * q[3] + q[0] * d2,
+               vy * w2 + (q[2] * vx - q[0] * vz) * q[3] + q[1] * d2,
+               vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * d2 };
+}
+static V3 p90QRotInv(const float q[4], V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float d2 = q[0] * vx + q[1] * vy + q[2] * vz;
+    return V3{ vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * d2,
+               vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * d2,
+               vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * d2 };
+}
+static void p90QMul(const float a[4], const float b[4], float o[4])
+{
+    o[0] = a[3] * b[0] + b[3] * a[0] + a[1] * b[2] - a[2] * b[1];
+    o[1] = a[3] * b[1] + b[3] * a[1] + a[2] * b[0] - a[0] * b[2];
+    o[2] = a[3] * b[2] + b[3] * a[2] + a[0] * b[1] - a[1] * b[0];
+    o[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+static V3 p90Sub(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 p90Add(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 p90MulV(V3 a, V3 b) { return V3{ a.x * b.x, a.y * b.y, a.z * b.z }; }
+static V3 p90DivV(V3 a, V3 b) { return V3{ a.x / b.x, a.y / b.y, a.z / b.z }; }
+static float p90DotCuda(V3 a, V3 b) { return (a.x * b.x + a.y * b.y) + a.z * b.z; } // PxVec3::dot
+static float p90DotOld(V3 a, V3 b) { return a.x * b.x + (a.y * b.y + a.z * b.z); } // unstamped OpDot
+static uint32_t p90Bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// the box hull of buildBoxHull with every vertex and plane normal rotated by R;
+// d = -n.dot(first face vertex) (the winding stays outward under a rotation)
+static std::vector<uint8_t> buildRotBoxHull(V3 h, const float R[4])
+{
+    std::vector<uint8_t> blob = buildBoxHull(h);
+    const size_t vertsBase = 16 + 32, planesBase = vertsBase + 16 * 8;
+    V3 rv[8];
+    for (int i = 0; i < 8; ++i)
+    {
+        rv[i] = p90QRot(R, boxCorner(i, h));
+        std::memcpy(&blob[vertsBase + 16 * i], &rv[i], 12);
+    }
+    for (int f = 0; f < 6; ++f)
+    {
+        const V3 n = p90QRot(R, V3{ kBoxFaceN[f][0], kBoxFaceN[f][1], kBoxFaceN[f][2] });
+        const float d = -p90DotCuda(n, rv[kBoxFaceVtx[f][0]]);
+        const float pl[4] = { n.x, n.y, n.z, d };
+        std::memcpy(&blob[planesBase + 16 * f], pl, 16);
+    }
+    return blob;
+}
+
+// intersectRayPolyhedron (cu L1025-1097; one warp block: nbPolygons = 6 < 32)
+static bool p90Ray(const std::vector<uint8_t>& blob, V3 a, V3 dir, float (*dotFn)(V3, V3), float& tEnter)
+{
+    const size_t planesBase = 16 + 32 + 16 * 8;
+    const float eps = 1e-7f;
+    float tFirst = 0.0f, tLast = 3.4028234663852886e38f;
+    tEnter = 0.0f;
+    bool blockSep = false;
+    float newFirst = tFirst, newLast = tLast;
+    for (int k = 0; k < 6; ++k)
+    {
+        float pl[4];
+        std::memcpy(pl, &blob[planesBase + 16 * k], 16);
+        const V3 n{ pl[0], pl[1], pl[2] };
+        const float denominator = dotFn(n, dir);
+        const float distToPlane = dotFn(n, a) + pl[3];
+        if (std::fabs(denominator) < eps)
+        {
+            if (distToPlane > 0.0f) blockSep = true;
+        }
+        else
+        {
+            const float tTemp = -distToPlane / denominator;
+            const bool con = 0.0f > denominator;
+            if (con && tTemp > tFirst) newFirst = std::fmax(newFirst, tTemp);
+            if (tLast > tTemp && !con) newLast = std::fmin(newLast, tTemp);
+        }
+    }
+    if (blockSep) return false;
+    tFirst = newFirst; tLast = newLast;
+    if (tFirst > tLast) return false;
+    tEnter = tFirst;
+    return true;
+}
+
+struct P90Case { float R[4]; float yaw; V3 off; float gap; };
+
+// Runs one case; returns the bitwise mirror mismatches, reports the old-order
+// twin's differing words and whether the scene produced two face contacts.
+static size_t p90RunCase(const P90Case& pc, size_t& twinDiff, bool& twoFace, bool quiet)
+{
+    twinDiff = 0; twoFace = false;
+    float R[4];
+    {
+        const float m = std::sqrt(((pc.R[0] * pc.R[0] + pc.R[1] * pc.R[1]) + pc.R[2] * pc.R[2]) + pc.R[3] * pc.R[3]);
+        for (int i = 0; i < 4; ++i) R[i] = pc.R[i] / m;
+    }
+    const V3 h{ 1.7f, 0.43f, 1.3f };
+    const std::vector<uint8_t> hull = buildRotBoxHull(h, R);
+    const float yawQ[4] = { 0.0f, std::sin(0.5f * pc.yaw), 0.0f, std::cos(0.5f * pc.yaw) };
+    float q0[4];
+    p90QMul(R, yawQ, q0);
+    const float hh = 0.37f, rad = 0.29f, cdPer = 0.061f;
+    const V3 pos0 = p90QRot(R, V3{ pc.off.x, h.y + rad + pc.gap, pc.off.z });
+
+    Scene sc = { 2u, V3{ hh, rad, rad }, pos0, h, cdPer, 0u, false };
+    sc.q0x = q0[0]; sc.q0y = q0[1]; sc.q0z = q0[2]; sc.q0w = q0[3];
+    sc.hull1 = &hull;
+    RunResult r;
+    if (!runScene(sc, r)) return 0; // no BDA -> skip
+    size_t bad = r.tailBad;
+    if (r.mf.nbContacts != 2u)
+    {
+        if (!quiet) std::printf("  [p90] word12 gpu=%08x, want 2 face contacts\n", r.mf.nbContacts);
+        return bad + 1;
+    }
+
+    // prepareVertices: aToB = transf1.transformInv(transf0), transf1 = identity
+    const float t1q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float c1[4] = { -t1q[0], -t1q[1], -t1q[2], t1q[3] };
+    float aq[4];
+    p90QMul(c1, q0, aq);
+    const V3 ap = p90QRotInv(t1q, p90Sub(pos0, V3{ 0.0f, 0.0f, 0.0f }));
+    const float idq[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const V3 sc0{ hh, rad, rad }, one{ 1.0f, 1.0f, 1.0f };
+    auto vertex2Shape = [&](V3 v, V3 s) { return p90QRotInv(idq, p90MulV(p90QRot(idq, v), s)); };
+    auto shape2Vertex = [&](V3 v, V3 s) { return p90QRotInv(idq, p90DivV(p90QRot(idq, v), s)); };
+    const V3 vA[2] = { p90Add(p90QRot(aq, vertex2Shape(V3{ 1.0f, 0.0f, 0.0f }, sc0)), ap),
+                       p90Add(p90QRot(aq, vertex2Shape(V3{ -1.0f, 0.0f, 0.0f }, sc0)), ap) };
+    const float inflatedRadius = (cdPer + cdPer) + rad;
+
+    const V3 dir{ r.mf.lNp[0][0], r.mf.lNp[0][1], r.mf.lNp[0][2] }; // = -gjkOutput.direction
+    const V3 vsd = shape2Vertex(V3{ -dir.x, -dir.y, -dir.z }, one);
+    twoFace = true;
+    for (int k = 0; k < 2; ++k)
+    {
+        const V3 p = shape2Vertex(vA[k], one);
+        float tNew = 0.0f, tOld = 0.0f;
+        const bool hitNew = p90Ray(hull, p, vsd, &p90DotCuda, tNew) && inflatedRadius >= tNew;
+        const bool hitOld = p90Ray(hull, p, vsd, &p90DotOld, tOld) && inflatedRadius >= tOld;
+        if (!hitNew) { twoFace = false; ++bad; continue; }
+        const V3 bNew = p90Sub(vA[k], V3{ dir.x * tNew, dir.y * tNew, dir.z * tNew });
+        const V3 bOld = p90Sub(vA[k], V3{ dir.x * tOld, dir.y * tOld, dir.z * tOld });
+        const V3 aExp = p90QRotInv(aq, p90Sub(vA[k], ap));
+        const float expNp[4] = { dir.x, dir.y, dir.z, tNew };
+        const float expA[4] = { aExp.x, aExp.y, aExp.z, 0.0f };
+        const float expB[4] = { bNew.x, bNew.y, bNew.z, 0.0f };
+        const float oldW[4] = { tOld, bOld.x, bOld.y, bOld.z };
+        const float newW[4] = { tNew, bNew.x, bNew.y, bNew.z };
+        size_t slotBad = 0;
+        for (int c = 0; c < 4; ++c)
+        {
+            if (p90Bits(r.mf.lNp[k][c]) != p90Bits(expNp[c])) ++slotBad;
+            if (p90Bits(r.mf.lA[k][c]) != p90Bits(expA[c])) ++slotBad;
+            if (p90Bits(r.mf.lB[k][c]) != p90Bits(expB[c])) ++slotBad;
+            if (!hitOld || p90Bits(oldW[c]) != p90Bits(newW[c])) ++twinDiff;
+        }
+        if (slotBad && !quiet)
+            std::printf("  [p90] slot %d: gpu np.w=%08x B=(%08x %08x %08x) | CUDA-order %08x (%08x %08x %08x) | old-order %08x (%08x %08x %08x)\n",
+                        k, p90Bits(r.mf.lNp[k][3]), p90Bits(r.mf.lB[k][0]), p90Bits(r.mf.lB[k][1]), p90Bits(r.mf.lB[k][2]),
+                        p90Bits(tNew), p90Bits(bNew.x), p90Bits(bNew.y), p90Bits(bNew.z),
+                        p90Bits(tOld), p90Bits(bOld.x), p90Bits(bOld.y), p90Bits(bOld.z));
+        bad += slotBad;
+    }
+    // slots 2/3 untouched
+    for (uint32_t j = 2; j < 4; ++j)
+        if (!slotUntouched(r.mf, j)) ++bad;
+    return bad;
+}
+
+PXG_TEST(cvxCollide_p90RayDotOrder)
+{
+    // three drawn scenes (R unnormalized, normalized in p90RunCase; yaw about
+    // the face normal; offset along the face; capsule-surface gap), each one
+    // chosen so the old-order twin changes 7 of its 8 compared words
+    static const P90Case kCases[3] = {
+        { { -0.843457997f, -0.200796008f, -0.844009995f, 0.976701915f }, -0.59839797f,
+          V3{ 0.483326435f, 0.0f, 0.358987182f }, 0.0648716539f },
+        { { 0.60563004f, -0.535809994f, 0.018075943f, 0.951876402f }, -0.119771957f,
+          V3{ -0.0635100007f, 0.0f, 0.0359064043f }, 0.0551702827f },
+        { { 0.343778014f, -0.484485984f, -0.0675820112f, 0.450248003f }, 1.49427295f,
+          V3{ -0.0520223975f, 0.0f, -0.108169585f }, 0.0664741024f },
+    };
+    for (int c = 0; c < 3; ++c)
+    {
+        size_t twin = 0;
+        bool two = false;
+        const size_t bad = p90RunCase(kCases[c], twin, two, false);
+        PXG_CHECK_MSG(bad == 0, "p90 case %d: %zu words differ from the CUDA-order (x + y) + z transcription", c, bad);
+        PXG_CHECK_MSG(two, "p90 case %d: the scene no longer yields two face-ray contacts", c);
+        PXG_CHECK_MSG(twin != 0, "p90 case %d: the old-order x + (y + z) twin equals the CUDA order -- scene not order-sensitive", c);
+        std::printf("  [p90] case %d: 2 face contacts bitwise in the CUDA dot order; old-order twin differs in %zu/8 words\n", c, twin);
+    }
 }
 
 } // namespace

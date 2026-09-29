@@ -222,7 +222,16 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # pxgSlangSolverDesc) carry no math another kernel is compared against it with.
     # testIntegration integration_p90DotOrder compares the outputs bitwise and fails
     # without this entry.
-    integration)
+    integration
+    # P9.90: the convex-convex stage-2 kernel.  collide()'s float OpDots transcribe
+    # PxVec3 dots, (x + y) + z (PxVec3.h:173): the capsule face-ray
+    # intersectRayPolyhedron denominator/distToPlane (cudaGJKEPA.cu:1051-1052), the
+    # witness-polygon selection (:647/:682) and the EE fallback (:1150-1185).
+    # Unstamped, llvmpipe summed them x + (y + z).  npCvxStage2SetupDbg compiles the
+    # SAME npCvxStage2Core/npCvxCollide modules, so it joins too.  testCvxCollide
+    # cvxCollide_p90RayDotOrder compares the face-ray tEnter and contact points bitwise
+    # and fails without this entry.
+    npCvxStage2Setup npCvxStage2SetupDbg)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
