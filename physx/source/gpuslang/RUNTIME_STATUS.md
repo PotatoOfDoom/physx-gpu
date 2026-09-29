@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.89: every CUDA float reduction/scan/fold (40 CUDA files, 35 port files) audited for association
+and select order: 49 divergences fixed and killed (solver residual maxError selectMax chains, SAT
+and bounds select folds, heightfield/cache bound operation order, PxQuat::rotate, penOffset leaf).
+New fact: on llvmpipe an undecorated OpDot sums x+(y+z), a NoContraction one (x+y)+z like the
+CUDA; 14 unstamped engine shaders with OpDot remain (P9.90).  Scenes 56/56.
 P9.86f: a scanner over the compiled -O0 -g2 SPIR-V of all 186 engine shaders (literal-zero
 dataflow through stores, lanes, call-site arguments; FSub(0,x), FAdd(x,0), float FMin/FMax/FClamp)
 re-finds all six bugs the source audit had missed; its 893 sites were classified against the CUDA.
@@ -2057,6 +2062,59 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.89 — Reihenfolge von float-Reduktionen, Faltungen und Punktprodukten gegen die CUDA
+
+**Auslöser.** P9.86f fand in thresholdStream eine laufende Summe, wo die CUDA einen
+32-Lane-Baum-Scan und `(incl − f) + f` rechnet. Die Fixture hatte das nie bemerkt. Deshalb wurde
+jede Stelle geprüft, an der die CUDA floats über Lanes, Warps, Blöcke oder Schleifen kombiniert:
+
+- 40 CUDA-Dateien mit warpScan/warpReduction/blockReduction/`__shfl_*_sync`/AddOp/Min-MaxOp;
+- zusätzlich 35 Port-Dateien mit groupshared-float-Reduktionen;
+- je Gruppe ein Audit gegen den Kombinationsbaum der CUDA (Lane-Abstände, inklusiv/exklusiv,
+  Rück-Subtraktion, Padding, zweite Ebene) und eine adversariale Gegenprüfung;
+- dann serielle Umsetzung mit einer Fixture, die auf dem alten Port nachweislich fehlschlägt.
+
+Integer-Scans und `fminf`/`fmaxf`-Reduktionen sind reihenfolgefrei. Kritisch sind
+float-Additionen und Select-Faltungen (PxMin/PxMax), bei denen die Reihenfolge über
+±0-Gleichstände und NaN entscheidet.
+
+**Ergebnis: 49 Divergenzen behoben und getötet, 3 äquivalent, 6 als identisch abgelehnt,
+3 Fixtures verstärkt, 21 Commits.**
+
+| Bereich | Divergenz | CUDA |
+|---|---|---|
+| Solver-Residuen: solverPGS, solverTGS, npArtiSolveExtPGS/TGS | `maxError = max(maxError, abs(r))` ist FMax (verwirft NaN); CUDA hat eine selectMax-Kette (NaN ersetzt das Maximum, die nächste Zeile ersetzt das NaN) | solverResidual.cuh:57 |
+| pxgSlangConvexSat (Stufe 3) | supportTriangle/supportConvex als FMin/FMax, Dreieck ohne ±MAX-Saat und rechtsassoziiert | convexTriangle.cuh:494-518 |
+| Deformable-Midphases: femClothMesh, npTetTriMid, softBodyClothMidphase | SAT-Faltungen (minProject, testSeparatingAxis, sep) und tetBoundingBox als FMin/FMax | triangletriangle.cuh, softbodySoftbodyMidPhase.cu, deformableCollision.cuh |
+| npBoxIncident, npSdfBvhMorton | Bounds-Butterfly bzw. Bounds-Faltung mit Selects in der Operandenreihenfolge der CUDA | cudaBox.cu:199-219, SDFConstruction.cu:161-164 |
+| pxgSlangTetCollide | innerSphere als selectMin-Kette | softbodyPrimitives.cu:140-154 |
+| pxgSlangCacheBound | PxMeshScale::toMat33 und transformFast-Zentrum in CUDA-Operationsreihenfolge | updateCacheAndBound.cuh:113-156 |
+| pxgSlangHeightfield | hfLocalBound als `transformFast(getInverse())`: geteilte Zentrumsrotation, PxMat33(conj q)-Basis | softbodyHFMidPhase.cu:205, femClothHFMidPhase.cu:107 |
+| cvxTriCorrelateBda | wörtliches `PxQuat::rotate`; absolute bestIndex-Identität | convexMeshCorrelate.cu:170-313 |
+| softBodyMeshContactGenBda | `pen` bekommt das `+ penOffset`-Blatt der CUDA | softbodyPrimitives.cu:339 |
+| psContactGenBda, psBoundsBda | NoContraction-Stempel, damit jedes `OpDot` wie die CUDA `(x+y)+z` summiert | cudaParticleSystem.cu:963/1116, Bounds-Radius |
+| pxgSlangWarpInc (Testcode) | float-AtomicMin/Max nach der Select-Regel von atomic.cuh; PTX-`shfl.sync`-Adressierung | atomic.cuh:104-132 |
+
+**Neue Plattform-Tatsache.** Auf llvmpipe wird ein *undekoriertes* `OpDot` als `x + (y + z)`
+ausgewertet, ein NoContraction-gestempeltes als `(x + y) + z`. Die CUDA rechnet `PxVec3::dot`
+vorwärts. Auch GLSL `Fma` wird ungefused ausgewertet. Die bestehenden Partikel-Fixtures liefen
+auf dem ungestempelten Port grün: achsparallele oder ruhende Daten, 2e-4 Toleranz.
+
+**Offen, als P9.90 geplant.**
+
+- 14 engine-erreichte .spv enthalten undekorierte `OpDot` ohne Stempel: boxBoxNphase,
+  constraintPrepPGS/TGS, integration, npCvxFinishContacts, npCvxPlaneNphase,
+  npCvxStage1Refresh, npCvxStage2Setup, npSphereNphase, preIntegration, psContactSolveBda,
+  skinning, solverApplyGravityTGS und solverPGS.
+- solverTGS `sep = max(minPen, …)` (:309/:1693/:1800): PxMax, unterscheidet sich nur bei NaN.
+
+**Dokumentiert als CUDA-UB.** Der Arti-Zweig von solveBlockUnified: Die CUDA verlässt Lanes
+≥ mDescStride vor FULL_MASK-Shuffles, deren Ergebnis dann undefiniert ist. Der Port speist dort
+Nullen ein.
+
+**Suite:** 880/880 in beiden Speichermodi; die neuen Fälle sind PXG_TESTs in bestehenden
+ctest-Suiten. **Szenen:** **56/56** ok.
 
 ## P9.86f — Scan des kompilierten SPIR-V: sechs weitere Divergenzen, eine Rundungsreihenfolge
 
