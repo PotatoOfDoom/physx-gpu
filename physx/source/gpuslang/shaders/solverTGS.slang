@@ -306,7 +306,13 @@ void solveContactBlockTGS(uint batchIndex, inout float3 linVel0, inout float3 an
             const float v1 = dot(angVel1, rbXn);
             const float normalVel = relVel1 + (v0 - v1);
 
-            const float sep = max(minPen, separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn));
+            // P9.90 (solveContactBlockTGS): sep = PxMax(minPen, ...) (solverBlockTGS.cuh:299) is
+            // selectMax = a > b ? a : b:
+            // a NaN argument survives (fminf(-maxPenBias, NaN) then drops it) and a +-0 tie keeps the
+            // second operand.  GLSL max() (FMax = maxNum on llvmpipe) replaced the NaN with minPen.
+            // solverTGS_contactAndJointBatches / _solveBlockUnified / _markActiveSlab (NaN separation).
+            const float sepArg = separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn);
+            const float sep = (minPen > sepArg) ? minPen : sepArg;
 
             // How much the target vel should have changed the position of this constraint...
             const float tVelErr = targetVel * elapsedTime;
@@ -1690,7 +1696,13 @@ bool checkActiveContactBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint ba
         const float v1 = dot(angVel1, rbXn);
         const float normalVel = relVel1 + (v0 - v1);
 
-        const float sep = max(minPen, separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn));
+        // P9.90 (checkActiveContactBlockTGS): sep = PxMax(minPen, ...) (solverBlockTGS.cuh:605) is
+        // selectMax = a > b ? a : b:
+        // a NaN argument survives (fminf(-maxPenBias, NaN) then drops it) and a +-0 tie keeps the
+        // second operand.  GLSL max() (FMax = maxNum on llvmpipe) replaced the NaN with minPen.
+        // solverTGS_contactAndJointBatches / _solveBlockUnified / _markActiveSlab (NaN separation).
+        const float sepArg = separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn);
+        const float sep = (minPen > sepArg) ? minPen : sepArg;
 
         const float tVelErr = targetVel * elapsedTime;
         const float biasedErr = recipResponse * min(-maxPenBias, biasCoefficient * (sep - tVelErr));
@@ -1797,7 +1809,13 @@ void solveContactBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchInd
             const float v1 = dot(angVel1, rbXn);
             const float normalVel = relVel1 + (v0 - v1);
 
-            const float sep = max(minPen, separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn));
+            // P9.90 (the BDA solve): sep = PxMax(minPen, ...) (solverBlockTGS.cuh:299) is
+            // selectMax = a > b ? a : b:
+            // a NaN argument survives (fminf(-maxPenBias, NaN) then drops it) and a +-0 tie keeps the
+            // second operand.  GLSL max() (FMax = maxNum on llvmpipe) replaced the NaN with minPen.
+            // solverTGS_contactAndJointBatches / _solveBlockUnified / _markActiveSlab (NaN separation).
+            const float sepArg = separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn);
+            const float sep = (minPen > sepArg) ? minPen : sepArg;
 
             // How much the target vel should have changed the position of this constraint...
             const float tVelErr = targetVel * elapsedTime;

@@ -89,6 +89,10 @@ inline float tgsCudaFmaxf(float a, float b)
 // which the CUDA PxClamp and the old port spelling store different bits.
 inline float tgsRevertFClamp(float v, float lo, float hi) { return tgsCudaFminf(tgsCudaFmaxf(v, lo), hi); }
 uint32_t gTorsClampRevertDiffers = 0; // torsional rows where PxClamp != FClamp bitwise (clamp taken)
+// P9.90: contact rows where the old port's sep = max(minPen, ...) (GLSL FMax = maxNum) would store
+// different appliedForce bits than the CUDA's PxMax = selectMax (a NaN argument survives the select).
+uint32_t gSepMaxRevertDiffers = 0;
+int gTgsSepMaxVariant = 0; // refCheckActiveContactTGS: 1 = the old port's maxNum spelling
 
 // ---- TGS block mirrors ----
 
@@ -366,7 +370,11 @@ void refSolveContactTGS(const BatchTGS& b, BodyStateTGS& s, uint32_t lane,
         const float v0 = s.av0.dot(raXn), v1 = s.av1.dot(rbXn);
         const float normalVel = relVel1 + (v0 - v1);
 
-        const float sep = std::fmax(minPen, separation + deltaV + s.ad0.dot(raXn) - s.ad1.dot(rbXn));
+        // P9.90: PxMax(minPen, ...) (solverBlockTGS.cuh:299/:605) is selectMax = a > b ? a : b, so a
+        // NaN argument SURVIVES (then fminf(-maxPenBias, NaN) drops it).  The old port's GLSL max()
+        // (FMax = maxNum on llvmpipe, std::fmax here) replaced the NaN with minPen.
+        const float sepArg = separation + deltaV + s.ad0.dot(raXn) - s.ad1.dot(rbXn);
+        const float sep = pxSelectMax(minPen, sepArg);
         const float tVelErr = targetVel * elapsedTime;
         const float biasedErr = recipResponse * std::fmin(-maxPenBias, biasCoefficient * (sep - tVelErr));
 
@@ -374,6 +382,14 @@ void refSolveContactTGS(const BatchTGS& b, BodyStateTGS& s, uint32_t lane,
         const float _deltaF = std::fmax(tempDeltaF, -appliedForce);
         const float newForce = std::fmin(appliedForce + _deltaF, maxImpulse);
         const float deltaF = newForce - appliedForce;
+        {
+            const float sepOld = std::fmax(minPen, sepArg);
+            const float beOld = recipResponse * std::fmin(-maxPenBias, biasCoefficient * (sepOld - tVelErr));
+            const float nfOld = std::fmin(
+                appliedForce + std::fmax(beOld - (normalVel - targetVel) * velMultiplier, -appliedForce), maxImpulse);
+            if (tgsBits(nfOld) != tgsBits(newForce))
+                ++gSepMaxRevertDiffers;
+        }
 
         accumDeltaF += deltaF;
         relVel1 += sumInvMass * deltaF;
@@ -679,6 +695,37 @@ uint32_t injectTorsNegZeroScaleLane(BatchTGS& b, uint32_t lane, std::vector<TGSC
     return sf + 2;
 }
 
+// P9.90 directed contact lane: row 0 carries separation = NaN, so the CUDA's
+// sep = PxMax(minPen, NaN + ...) = selectMax keeps the NaN and biasedErr = recip * fminf(-maxPenBias,
+// NaN) = recip * -maxPenBias, while the old port's GLSL max() (maxNum) gave sep = minPen and
+// biasedErr = recip * fminf(-maxPenBias, bc * minPen) < 0.  The row keeps a general (non-axis)
+// normal and lever arm; body B's slots copy body A's and rbXn = raXn, so normalVel is exactly 0 and
+// the two spellings store different appliedForce bits whatever the reference counts are.
+// Returns the index of the directed contact row.
+uint32_t injectSepNanLane(BatchTGS& b, uint32_t lane, std::vector<TGSContactHeader>& chs,
+                          std::vector<TGSContactPoint>& cps, std::vector<Float4>& velPool, uint32_t k)
+{
+    TGSContactHeader& h = chs[b.scalars[1]];
+    h.normal_staticFriction[lane] = Float4{ 0.3713907f, -0.557086f, 0.7427814f, 0.45f };
+    h.numNormalConstr[lane] = 2;
+    h.restitutionXdt[lane] = 0.f;
+    h.maxPenBias[lane] = -0.8125f;
+
+    TGSContactPoint& c = cps[b.scalars[2]];
+    const Float4 ra = Float4{ 0.1371f, -0.2463f, 0.0917f, 0.f };
+    c.raXn_extraCoeff[lane] = ra;
+    c.rbXn_targetVelW[lane] = Float4{ ra.x, ra.y, ra.z, 0.f };
+    c.separation[lane] = std::numeric_limits<float>::quiet_NaN();
+    c.appliedForce[lane] = 0.3671875f;
+    c.biasCoefficient[lane] = 7.3125f;
+    c.maxImpulse[lane] = 50.f;
+
+    const uint32_t ri = k * 192 + lane;
+    for (uint32_t j = 0; j < 3; ++j)
+        velPool[ri + 96 + 32 * j] = velPool[ri + 32 * j];
+    return b.scalars[2];
+}
+
 PXG_TEST(solverTGS_contactAndJointBatches)
 {
     std::mt19937 rng(3300);
@@ -845,6 +892,9 @@ PXG_TEST(solverTGS_contactAndJointBatches)
 
     // P9.86c directed lane (batch 0 = eCONTACT, lane 0 < descStride): torsional scale -0.
     const uint32_t torsRow = injectTorsNegZeroScaleLane(batches[0], 0, chs, fhs, cps, frs, velPool, 0);
+    // P9.90 directed lane (batch 2 = eCONTACT, lane 1): separation NaN through PxMax(minPen, ...).
+    batches[2].descStride = std::max<uint16_t>(batches[2].descStride, 2);
+    const uint32_t sepRow = injectSepNanLane(batches[2], 1, chs, cps, velPool, 2);
 
     // ---- GPU ----
     PxgSlangComputeDevice* dev = testDevice();
@@ -877,6 +927,7 @@ PXG_TEST(solverTGS_contactAndJointBatches)
     auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
 
     gTorsClampRevertDiffers = 0;
+    gSepMaxRevertDiffers = 0;
     for (uint32_t k = 0; k < numBatches; ++k)
     {
         const BatchTGS& b = batches[k];
@@ -970,6 +1021,13 @@ PXG_TEST(solverTGS_contactAndJointBatches)
     PXG_CHECK_MSG(tgsBits(gpuFrs[torsRow].appliedForce[0]) == tgsBits(frs[torsRow].appliedForce[0]),
                   "torsional scale -0: gpu %08x ref %08x", tgsBits(gpuFrs[torsRow].appliedForce[0]),
                   tgsBits(frs[torsRow].appliedForce[0]));
+
+    // P9.90: the directed NaN-separation row, compared BITWISE; the old maxNum spelling must differ.
+    PXG_CHECK_MSG(gSepMaxRevertDiffers > 0,
+                  "directed NaN-separation row: PxMax select and the old GLSL max() store the same force");
+    PXG_CHECK_MSG(tgsBits(gpuCps[sepRow].appliedForce[1]) == tgsBits(cps[sepRow].appliedForce[1]),
+                  "NaN separation (PxMax select): gpu %08x ref %08x", tgsBits(gpuCps[sepRow].appliedForce[1]),
+                  tgsBits(cps[sepRow].appliedForce[1]));
 
     for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, txBuf, velBuf, encBuf })
         dev->destroyBuffer(h);
@@ -2743,6 +2801,8 @@ PXG_TEST(solverTGS_solveBlockUnified)
 
     // P9.86c directed lane (batch 1 = eCONTACT, stride 32, lane 0): torsional scale -0.
     const uint32_t torsRow = injectTorsNegZeroScaleLane(batches[1], 0, chs, fhs, cps, frs, velPool, 1);
+    // P9.90 directed lane (batch 1, lane 3): separation NaN through PxMax(minPen, ...) (BDA solve).
+    const uint32_t sepRow = injectSepNanLane(batches[1], 3, chs, cps, velPool, 1);
 
     // ---- GPU (engine ABI through the shim) ----
     PxgSlangComputeDevice* dev = testDevice();
@@ -2855,6 +2915,7 @@ PXG_TEST(solverTGS_solveBlockUnified)
     const uint32_t startIndex = batchStartIndex;
     const uint32_t endIndex = cpp[1];
     gTorsClampRevertDiffers = 0;
+    gSepMaxRevertDiffers = 0;
     for (uint32_t k = startIndex; k < endIndex; ++k)
     {
         const uint32_t warp = (k - startIndex) % numWarpsInGrid;
@@ -2992,6 +3053,13 @@ PXG_TEST(solverTGS_solveBlockUnified)
     PXG_CHECK_MSG(tgsBits(gpuFrs[torsRow].appliedForce[0]) == tgsBits(frs[torsRow].appliedForce[0]),
                   "solveBlockUnified torsional scale -0: gpu %08x ref %08x",
                   tgsBits(gpuFrs[torsRow].appliedForce[0]), tgsBits(frs[torsRow].appliedForce[0]));
+
+    // P9.90: the directed NaN-separation row, compared BITWISE; the old maxNum spelling must differ.
+    PXG_CHECK_MSG(gSepMaxRevertDiffers > 0,
+                  "solveBlockUnified: directed NaN-separation row does not separate select from maxNum");
+    PXG_CHECK_MSG(tgsBits(gpuCps[sepRow].appliedForce[3]) == tgsBits(cps[sepRow].appliedForce[3]),
+                  "solveBlockUnified NaN separation (PxMax select): gpu %08x ref %08x",
+                  tgsBits(gpuCps[sepRow].appliedForce[3]), tgsBits(cps[sepRow].appliedForce[3]));
 
     physx::PxgSolverCoreDesc gpuDesc;
     shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
@@ -4454,7 +4522,9 @@ bool refCheckActiveContactTGS(const BatchTGS& b, const BodyStateTGS& s, uint32_t
         const float v0 = s.av0.dot(raXn), v1 = s.av1.dot(rbXn);
         const float normalVel = relVel1 + (v0 - v1);
 
-        const float sep = std::fmax(minPen, separation + deltaV + s.ad0.dot(raXn) - s.ad1.dot(rbXn));
+        // P9.90: selectMax like the CUDA; gTgsSepMaxVariant 1 = the old port's GLSL max() (maxNum).
+        const float sepArg = separation + deltaV + s.ad0.dot(raXn) - s.ad1.dot(rbXn);
+        const float sep = gTgsSepMaxVariant == 1 ? std::fmax(minPen, sepArg) : pxSelectMax(minPen, sepArg);
         const float tVelErr = targetVel * elapsedTime;
         const float biasedErr = recipResponse * std::fmin(-maxPenBias, biasCoefficient * (sep - tVelErr));
 
@@ -4579,6 +4649,28 @@ PXG_TEST(solverTGS_markActiveSlab)
         }
     }
 
+    // P9.90 directed lane (batch 1, lane 7): one row, separation NaN, appliedForce 0, bodyA == bodyB
+    // (a dynamic body, so both read the same velocities and rbXn = raXn gives normalVel = 0 exactly).
+    // The CUDA's PxMax select keeps the NaN -> biasedErr = recip * -maxPenBias > 0 -> ACTIVE; the old
+    // port's maxNum gave sep = minPen -> biasedErr < 0 -> deltaF = 0 -> inactive.
+    {
+        BatchTGS& b = batches[1];
+        const uint32_t lane = 7;
+        b.bodyAIndex[lane] = b.bodyBIndex[lane] = bodyOffset + 37u;
+        TGSContactHeader& h = chs[b.scalars[1]];
+        h.normal_staticFriction[lane] = Float4{ 0.3713907f, -0.557086f, 0.7427814f, 0.45f };
+        h.numNormalConstr[lane] = 1;
+        h.restitutionXdt[lane] = 0.f;
+        h.maxPenBias[lane] = -0.8125f;
+        TGSContactPoint& c = cps[b.scalars[2]];
+        c.raXn_extraCoeff[lane] = Float4{ 0.1371f, -0.2463f, 0.0917f, 0.f };
+        c.rbXn_targetVelW[lane] = Float4{ 0.1371f, -0.2463f, 0.0917f, 0.f };
+        c.separation[lane] = std::numeric_limits<float>::quiet_NaN();
+        c.appliedForce[lane] = 0.f;
+        c.biasCoefficient[lane] = 7.3125f;
+        c.maxImpulse[lane] = 50.f;
+    }
+
     // ---- reference: OR from a zero-initialised encoded buffer ----
     auto unpackBody = [&](uint32_t bodyId, Vec3& lv, Vec3& av, Vec3& ld, Vec3& ad) {
         const uint32_t fi = outputOffset + bodyId;
@@ -4593,6 +4685,7 @@ PXG_TEST(solverTGS_markActiveSlab)
 
     const uint32_t encSize = num32Slabs * numTotalBodies;
     std::vector<uint32_t> refEnc(encSize, 0);
+    std::vector<uint32_t> refEncOld(encSize, 0); // P9.90 twin: the old port's maxNum sep spelling
     uint32_t contactActive = 0, contactInactive = 0, jointMarks = 0;
     for (uint32_t k = batchStartIndex; k < cpp[1]; ++k)
     {
@@ -4605,10 +4698,10 @@ PXG_TEST(solverTGS_markActiveSlab)
             const uint32_t slabIndexOffset = (slabId / 32u) * numTotalBodies;
             const uint32_t encodedSlabIndex = (1u << (slabId % 32u));
 
-            bool active;
+            bool active, activeOld;
             if (b.constraintType != 1) // joint (eCONSTRAINT_1D) -> always active
             {
-                active = true;
+                active = activeOld = true;
                 ++jointMarks;
             }
             else
@@ -4617,6 +4710,9 @@ PXG_TEST(solverTGS_markActiveSlab)
                 unpackBody(bodyIdA, s.lv0, s.av0, s.ld0, s.ad0);
                 unpackBody(bodyIdB, s.lv1, s.av1, s.ld1, s.ad1);
                 active = refCheckActiveContactTGS(b, s, lane, chs, cps, elapsedTime, minPen);
+                gTgsSepMaxVariant = 1;
+                activeOld = refCheckActiveContactTGS(b, s, lane, chs, cps, elapsedTime, minPen);
+                gTgsSepMaxVariant = 0;
                 if (active)
                     ++contactActive;
                 else
@@ -4627,6 +4723,10 @@ PXG_TEST(solverTGS_markActiveSlab)
                 refEnc[slabIndexOffset + bodyIdA] |= encodedSlabIndex;
             if (active && bodyIdB >= bodyOffset)
                 refEnc[slabIndexOffset + bodyIdB] |= encodedSlabIndex;
+            if (activeOld && bodyIdA >= bodyOffset)
+                refEncOld[slabIndexOffset + bodyIdA] |= encodedSlabIndex;
+            if (activeOld && bodyIdB >= bodyOffset)
+                refEncOld[slabIndexOffset + bodyIdB] |= encodedSlabIndex;
         }
     }
 
@@ -4634,6 +4734,8 @@ PXG_TEST(solverTGS_markActiveSlab)
     PXG_CHECK_MSG(contactActive > 0, "fixture: at least one contact marks its slab active");
     PXG_CHECK_MSG(contactInactive > 0, "fixture: at least one contact leaves its slab inactive");
     PXG_CHECK_MSG(jointMarks > 0, "fixture: at least one joint batch (unconditionally active)");
+    PXG_CHECK_MSG(refEncOld != refEnc,
+                  "fixture: the NaN-separation lane marks the same words under the old maxNum spelling");
     uint32_t markedWords = 0;
     for (uint32_t e : refEnc)
         if (e)
