@@ -203,6 +203,14 @@ static const uint8_t kArtiSolveBlockPartitionPGS[] = { 8, 8, 4, 4, 1, 8 };
 //   (desc, sharedDesc, PxU32 islandIndex) -> 24-byte blob
 static const uint8_t kDescsIslandPGS[] = { 8, 8, 4 };
 
+// P9.91: accumulateThresholdStream.cu's body-index radix sort (thresholdStreamBda.slang),
+//   bodyInputAndRanksSingleBlockLaunch / bodyInputAndRanksBlocksLaunch
+//   (const PxgSolverCoreDesc*, PxgRadixSortDesc*, const PxU32 gStartBit) -> 24-byte blob.
+//   Launched from PxgCudaSolverCore::radixSort (:1688/:1692) and its TGS twin (:1794).
+//   The rest of the file's kernels take (desc) -> kOnePtr, (desc, rsDesc) or
+//   (desc, sharedDesc) -> kTwoPtr.
+static const uint8_t kThresholdRadix[] = { 8, 8, 4 };
+
 // computeAverageSolverBodyVelocity / propagateSolverBodyVelocity
 //   (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*)
 //   -> kTwoPtr (16 bytes)
@@ -1723,6 +1731,23 @@ static const PxgKernelAbiRow kRows[] = {
     { "propagateStaticSolverBodyVelocities", kPropagateStaticPGS, uint32_t(sizeof(kPropagateStaticPGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
     { "integrateCoreParallelLaunch", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
+    // accumulateThresholdStream.cu, the force-threshold reporting pipeline (P9.91,
+    // thresholdStreamBda.spv); launched by PxgCudaSolverCore.cpp:1666-1845 and
+    // PxgTGSCudaSolverCore.cpp:1790-1969 when mHasForceThresholds
+    { "bodyInputAndRanksSingleBlockLaunch", kThresholdRadix, uint32_t(sizeof(kThresholdRadix)) },
+    { "bodyInputAndRanksBlocksLaunch", kThresholdRadix, uint32_t(sizeof(kThresholdRadix)) },
+    { "initialRanksAndBodyIndexB", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "initialRanksAndBodyIndexA", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "reorganizeThresholdElements", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "computeAccumulateThresholdStream", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "outputAccumulateThresholdStream", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "writeoutAccumulatedForcePerObject", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "computeExceededForceThresholdElementIndice", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "outputExceededForceThresholdElementIndice", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "setThresholdElementsMask", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "computeThresholdElementMaskIndices", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "outputThresholdPairsMaskIndices", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "createForceChangeThresholdElements", kOnePtr, uint32_t(sizeof(kOnePtr)) },
     // solverMultiBlock.cu DMA-back glue (P5 Step 5 BDA)
     { "dmaBackChangedElems", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "dmaConstraintResidual", kTwoPtrU32, uint32_t(sizeof(kTwoPtrU32)) },

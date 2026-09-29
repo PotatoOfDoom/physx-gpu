@@ -350,7 +350,10 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # mul feeding an add, so neither llvmpipe's OpDot association nor contraction can
     # reach an output: the stamped and unstamped .spv give the same testThresholdStream
     # results, and no fixture can observe the entry.  No other shader compiles this module.
-    thresholdStream)
+    thresholdStream
+    # P9.91: its engine-ABI twin, the file the manifest maps -- the same bodies and the same
+    # argument: additions in the CUDA's order and one threshold * dt that feeds a compare.
+    thresholdStreamBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -435,6 +438,16 @@ pxg_compile_shader(thresholdStream initialRanksAndBodyIndexB initialRanksAndBody
                    outputAccumulateThresholdStream writeoutAccumulatedForcePerObject
                    computeExceededForceThresholdElementIndice outputExceededForceThresholdElementIndice)
 pxg_compile_shader(thresholdForceChange setThresholdElementsMask setPersistentForceElementMask
+                   computeThresholdElementMaskIndices outputThresholdPairsMaskIndices
+                   createForceChangeThresholdElements)
+# P9.91: the engine-ABI port of the whole force-threshold pipeline (all fourteen kernels of
+# accumulateThresholdStream.cu, BDA through the PxgSolverCoreDesc); the two files above stay
+# as the binding-level proofs their fixtures drive.
+pxg_compile_shader(thresholdStreamBda bodyInputAndRanksSingleBlockLaunch bodyInputAndRanksBlocksLaunch
+                   initialRanksAndBodyIndexB initialRanksAndBodyIndexA reorganizeThresholdElements
+                   computeAccumulateThresholdStream outputAccumulateThresholdStream
+                   writeoutAccumulatedForcePerObject computeExceededForceThresholdElementIndice
+                   outputExceededForceThresholdElementIndice setThresholdElementsMask
                    computeThresholdElementMaskIndices outputThresholdPairsMaskIndices
                    createForceChangeThresholdElements)
 pxg_compile_shader(solverZeroBodies ZeroBodies ZeroBodiesTGS)
@@ -1819,6 +1832,7 @@ add_executable(gpuslang-tests
     testSolverTGS.cpp
     testConstraintPrep.cpp
     testThresholdStream.cpp
+    testThresholdStreamBda.cpp
     testThresholdForceChange.cpp
     testSolverZeroBodies.cpp
     testSolverInitVelocitiesTGS.cpp

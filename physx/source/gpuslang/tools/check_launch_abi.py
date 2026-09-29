@@ -75,14 +75,8 @@ KNOWN_UNWIRED = {
     "getRigidDynamicAngularAcceleration", "setRigidDynamicGlobalPose",
     "setRigidDynamicLinearVelocity", "setRigidDynamicAngularVelocity",
     "setRigidDynamicForce", "setRigidDynamicTorque",
-    # threshold / force-change stream
-    "initialRanksAndBodyIndexB", "initialRanksAndBodyIndexA",
-    "reorganizeThresholdElements", "computeAccumulateThresholdStream",
-    "outputAccumulateThresholdStream", "writeoutAccumulatedForcePerObject",
-    "computeExceededForceThresholdElementIndice",
-    "outputExceededForceThresholdElementIndice", "setThresholdElementsMask",
-    "computeThresholdElementMaskIndices", "outputThresholdPairsMaskIndices",
-    "createForceChangeThresholdElements",
+    # (P9.91 wired the threshold / force-change stream -- all twelve, plus the two
+    # radix kernels that were not mapped at all -- behind PXG_SCENE=forcethreshold.)
     # solver / sort odds and ends.  P9.79 wired radixSortCopyBits2 and
     # radixSortCopy2: PxgGpuNarrowphaseCore::computeRigidsToShapes() is their only
     # caller and it runs only under the direct-GPU API, so PXG_SCENE=directapi is

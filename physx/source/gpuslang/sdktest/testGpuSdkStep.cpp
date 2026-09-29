@@ -36,6 +36,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <string>
 #include <utility>
 
 using namespace physx;
@@ -114,10 +115,18 @@ public:
     PxU32 getWorkerCount() const override { return 1; }
 };
 
+// P9.91 -- raised (before createScene; the filter shader is fixed there) only for
+// PXG_SCENE=forcethreshold.  Every other scene keeps eCONTACT_DEFAULT and nothing else,
+// so none of them reaches PxgGpuContext's mHasForceThresholds branch.
+static bool gForceThresholdPairs = false;
+
 PxFilterFlags stepFilterShader(PxFilterObjectAttributes, PxFilterData, PxFilterObjectAttributes, PxFilterData,
                                PxPairFlags& pairFlags, const void*, PxU32)
 {
     pairFlags = PxPairFlag::eCONTACT_DEFAULT;
+    if (gForceThresholdPairs)
+        pairFlags |= PxPairFlag::eNOTIFY_THRESHOLD_FORCE_FOUND | PxPairFlag::eNOTIFY_THRESHOLD_FORCE_PERSISTS |
+                     PxPairFlag::eNOTIFY_THRESHOLD_FORCE_LOST;
     return PxFilterFlag::eDEFAULT;
 }
 
@@ -1559,6 +1568,152 @@ DirectApiScene buildDirectApiScene(PxPhysics* physics, PxScene* scene, PxMateria
     s.joint->setMotion(PxD6Axis::eSWING1, PxD6Motion::eLOCKED);
     s.joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
     return s;
+}
+
+// PXG_SCENE=forcethreshold (P9.91): the FORCE-THRESHOLD REPORTING pipeline.
+//
+// PxgGpuContext::doConstraintSolveGPU runs accumulatedForceThresholdStream() -- the
+// fourteen kernels of accumulateThresholdStream.cu, from the body-index radix sort to
+// createForceChangeThresholdElements -- only `if (mHasForceThresholds)`, and that is
+// raised only by a pair whose filter flags ask for eNOTIFY_THRESHOLD_FORCE_* and one of
+// whose bodies has a contact report threshold below PX_MAX_F32.  No scene before this
+// one did either, so the whole group had never been launched by the engine: two of its
+// kernels were unmapped and the other twelve had no launch-ABI row.
+//
+// The observable is the event stream the host builds from the GPU's force-change
+// elements, counted per actor pair and per step.  Every body is a 1000 kg box
+// (weight m g = 9810 N) spawned AT REST, so there is no impact spike to straddle a
+// threshold, and none of them may sleep (a sleeping pair is not solved and reports
+// nothing):
+//
+//   over    alone on the ground, threshold 5000 N: FOUND on its first contact step,
+//           PERSISTS on every step after, until step kRaiseStep raises its threshold
+//           to 1e7 N -- then exactly one LOST, while the box is still resting there.
+//           LOST is the cross-frame diff (setThresholdElementsMask against the
+//           previous frame's exceeded set), so it cannot come from one frame's data.
+//   under   alone on the ground, threshold 20000 N: never exceeded, NO event at all.
+//   lower   on the ground, default threshold: its ground pair has no threshold below
+//           PX_MAX_F32 and must report nothing ...
+//   upper   ... while the box stacked on it (threshold 5000 N) makes the (lower,
+//           upper) pair a DYNAMIC-dynamic threshold pair: FOUND, then PERSISTS to the
+//           end.  Two exceeded pairs per step with distinct node indices are what the
+//           radix sort and the segmented accumulation have to keep apart.
+//
+// THE REFERENCE IS THE CPU PGS SOLVER.  PXG_CPU_CONTROL=1 PXG_SOLVER=pgs produces
+// exactly the timeline asserted here (measured: FOUND @0, PERSISTS @1..119, LOST @120 for
+// ground|over; FOUND @0, PERSISTS @1..239 for lower|upper; nothing else).  The CPU TGS
+// control reports NO force-threshold event at all, and that is upstream, not this scene:
+// DyTGSDynamics.cpp never builds the force-change stream (it has no
+// createForceChangeThresholdStream step; DyDynamics.cpp:522 is PGS-only), while the GPU
+// TGS core runs the same fourteen kernels as the GPU PGS core.  The scene is scored
+// under both GPU solvers.
+static const int kForceThresholdSteps = 240;
+static const int kForceThresholdRaiseStep = 120;
+
+struct ForceThresholdEvents : public PxSimulationEventCallback
+{
+    struct PairLog
+    {
+        std::vector<unsigned char> perStep;   // bit 0 FOUND, bit 1 PERSISTS, bit 2 LOST
+        PairLog() : perStep(kForceThresholdSteps, 0) {}
+    };
+    std::map<std::string, PairLog> pairs;     // "nameA|nameB", names sorted
+    int step = 0;
+
+    static const char* nameOf(const PxActor* a)
+    {
+        const char* n = a ? a->getName() : nullptr;
+        return n ? n : "?";
+    }
+    void onContact(const PxContactPairHeader& h, const PxContactPair* p, PxU32 n) override
+    {
+        std::string a = nameOf(h.actors[0]), b = nameOf(h.actors[1]);
+        if (b < a) std::swap(a, b);
+        PairLog& log = pairs[a + "|" + b];
+        for (PxU32 i = 0; i < n; ++i)
+        {
+            const PxPairFlags ev = p[i].events;
+            unsigned char bits = 0;
+            if (ev & PxPairFlag::eNOTIFY_THRESHOLD_FORCE_FOUND)    bits |= 1;
+            if (ev & PxPairFlag::eNOTIFY_THRESHOLD_FORCE_PERSISTS) bits |= 2;
+            if (ev & PxPairFlag::eNOTIFY_THRESHOLD_FORCE_LOST)     bits |= 4;
+            if (step >= 0 && step < kForceThresholdSteps)
+                log.perStep[step] |= bits;
+        }
+    }
+    void onConstraintBreak(PxConstraintInfo*, PxU32) override {}
+    void onWake(PxActor**, PxU32) override {}
+    void onSleep(PxActor**, PxU32) override {}
+    void onTrigger(PxTriggerPair*, PxU32) override {}
+    void onAdvance(const PxRigidBody* const*, const PxTransform*, const PxU32) override {}
+};
+
+struct ForceThresholdScene
+{
+    PxRigidDynamic* over;
+    PxRigidDynamic* under;
+    PxRigidDynamic* lower;
+    PxRigidDynamic* upper;
+};
+
+ForceThresholdScene buildForceThresholdScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    ForceThresholdScene s = {};
+    PxRigidStatic* ground = addGroundBox(physics, scene, material);
+    ground->setName("ground");
+    auto box = [&](float x, float y, const char* name, float threshold) {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), y, x);
+        b->setName(name);
+        b->setSleepThreshold(0.0f);
+        if (threshold < PX_MAX_F32)
+            b->setContactReportThreshold(threshold);
+        return b;
+    };
+    s.over  = box(-3.0f, 0.5f, "over", 5000.0f);
+    s.under = box(0.0f, 0.5f, "under", 20000.0f);
+    s.lower = box(3.0f, 0.5f, "lower", PX_MAX_F32);
+    s.upper = box(3.0f, 1.5f, "upper", 5000.0f);
+    return s;
+}
+
+// Checks one pair's per-step event bits against "FOUND once at step f <= 2, PERSISTS on
+// every step strictly between, LOST once at step l" (l = -1: no LOST, PERSISTS runs to
+// the last step).  Prints the timeline either way and returns the number of failures.
+int checkThresholdTimeline(const ForceThresholdEvents& ev, const char* key, int lostLo, int lostHi)
+{
+    auto it = ev.pairs.find(key);
+    if (it == ev.pairs.end())
+    {
+        std::printf("FAIL: [%s] no force-threshold event at all\n", key);
+        return 1;
+    }
+    const std::vector<unsigned char>& s = it->second.perStep;
+    int found = 0, persists = 0, lost = 0, f = -1, l = -1, firstP = -1, lastP = -1;
+    for (int i = 0; i < kForceThresholdSteps; ++i)
+    {
+        if (s[i] & 1) { ++found; if (f < 0) f = i; }
+        if (s[i] & 2) { ++persists; if (firstP < 0) firstP = i; lastP = i; }
+        if (s[i] & 4) { ++lost; if (l < 0) l = i; }
+    }
+    std::printf("  [%s] FOUND x%d (first @%d)  PERSISTS x%d (@%d..%d)  LOST x%d (first @%d)\n",
+                key, found, f, persists, firstP, lastP, lost, l);
+    int failures = 0;
+    if (found != 1 || f > 2) { std::printf("FAIL: [%s] expected one FOUND at step <= 2\n", key); ++failures; }
+    const bool wantLost = lostLo >= 0;
+    if (wantLost && (lost != 1 || l < lostLo || l > lostHi))
+    {
+        std::printf("FAIL: [%s] expected one LOST in steps %d..%d\n", key, lostLo, lostHi);
+        ++failures;
+    }
+    if (!wantLost && lost != 0) { std::printf("FAIL: [%s] expected no LOST\n", key); ++failures; }
+    const int end = wantLost ? l : kForceThresholdSteps;   // PERSISTS on every step in (f, end)
+    if (f >= 0 && end > f + 1 && (persists != end - f - 1 || firstP != f + 1 || lastP != end - 1))
+    {
+        std::printf("FAIL: [%s] expected PERSISTS on every step %d..%d\n", key, f + 1, end - 1);
+        ++failures;
+    }
+    return failures;
 }
 
 // PXG_SCENE=articulation (P8.55): the first ARTICULATION scene, and the first
@@ -6096,6 +6251,8 @@ int main()
             std::printf("  [ P9.79 ] eENABLE_DIRECT_GPU_API raised: host writeback is OFF, the "
                         "direct-API getters are the only way to see the simulation\n");
         }
+        if (sn && !std::strcmp(sn, "forcethreshold"))
+            gForceThresholdPairs = true;
     }
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
@@ -9023,6 +9180,84 @@ int main()
     // P9.79 -- PXG_SCENE=directapi.  Its own arm rather than a RestTarget, because
     // with eENABLE_DIRECT_GPU_API raised the host actor poses are no longer updated
     // by the simulation and the generic rest check would be reading a spawn pose.
+    if (!std::strcmp(sceneName, "forcethreshold"))
+    {
+        ForceThresholdEvents events;
+        scene->setSimulationEventCallback(&events);
+        ForceThresholdScene fs = buildForceThresholdScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'forcethreshold' built: four 1000 kg boxes at rest, thresholds "
+                    "over=5000 N under=20000 N upper=5000 N (weight 9810 N)\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: forcethreshold pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        std::printf("  stepping forcethreshold (%d x %.4fs); 'over' threshold -> 1e7 N before step %d\n",
+                    kForceThresholdSteps, dt, kForceThresholdRaiseStep);
+        for (int i = 0; i < kForceThresholdSteps; ++i)
+        {
+            if (i == kForceThresholdRaiseStep)
+            {
+                fs.over->setContactReportThreshold(1.0e7f);
+                // UPSTREAM (documented, not reported): Sc::BodyCore::setContactReportThreshold
+                // (ScBodyCore.h:144) only stores the value -- unlike the other BodyCore setters
+                // it never calls updateBodySim(), so with GPU dynamics the new threshold never
+                // reaches PxgBodySim::inverseInertiaXYZ_contactReportThresholdW
+                // (PxgSimulationController.cpp:2411) and the pair keeps PERSISTING.  The CPU
+                // solver reads the core every step and does see it.  Measured: without the
+                // line below, GPU TGS and GPU PGS both report PERSISTS on all 239 steps and no
+                // LOST.  Re-setting the linear damping to its own value is a no-op for the
+                // physics and does call updateBodySim(), so the GPU body sim is re-uploaded.
+                fs.over->setLinearDamping(fs.over->getLinearDamping());
+            }
+            events.step = i;
+            scene->simulate(dt);
+            scene->fetchResults(true);
+        }
+        int failures = 0;
+        // LOST lands on the raise step itself: the refreshed body sim is uploaded before that
+        // step's solve (measured on GPU TGS, GPU PGS and the CPU PGS reference alike).
+        failures += checkThresholdTimeline(events, "ground|over", kForceThresholdRaiseStep,
+                                           kForceThresholdRaiseStep);
+        failures += checkThresholdTimeline(events, "lower|upper", -1, -1);
+        for (const auto& kv : events.pairs)
+        {
+            if (kv.first == "ground|over" || kv.first == "lower|upper") continue;
+            int any = 0;
+            for (unsigned char b : kv.second.perStep) any += b != 0;
+            std::printf("  [%s] %d step(s) with a force-threshold event\n", kv.first.c_str(), any);
+            if (any) { std::printf("FAIL: [%s] must report nothing\n", kv.first.c_str()); ++failures; }
+        }
+        const struct { PxRigidDynamic* b; float restY; const char* label; } rest[] = {
+            { fs.over, 0.5f, "over" }, { fs.under, 0.5f, "under" },
+            { fs.lower, 0.5f, "lower" }, { fs.upper, 1.5f, "upper" } };
+        for (const auto& r : rest)
+        {
+            const float y = r.b->getGlobalPose().p.y;
+            std::printf("  [%s] final y=%.4f (rest %.3f)\n", r.label, y, r.restY);
+            if (!(std::fabs(y - r.restY) < 0.1f)) { std::printf("FAIL: [%s] left its rest height\n", r.label); ++failures; }
+        }
+        scene->setSimulationEventCallback(nullptr);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (cpuControl)
+        {
+            std::printf("[ control ] gpu-sdk-step: forcethreshold CPU control run (%d check(s) failed), "
+                        "not scored\n", failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'forcethreshold' stepped: FOUND/PERSISTS/LOST "
+                        "per pair as asserted\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'forcethreshold': %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "directapi"))
     {
         DirectApiScene ds = buildDirectApiScene(physics, scene, material);
@@ -9330,6 +9565,7 @@ int main()
                        "          particleattach                          (P9.76: the particle ATTACHMENT chain)\n"
                        "          particlerigid                           (P9.80: PBD shape matching + volume bounds)\n"
                        "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
+                       "          forcethreshold                          (P9.91: FOUND/PERSISTS/LOST force-threshold events)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

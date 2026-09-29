@@ -98,7 +98,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh"
+        sdfmesh forcethreshold"
 
 pass=0; fail=0; missing=0
 
@@ -167,6 +167,13 @@ run_one "particle (settling bag, STARTY=4.0)" PXG_SCENE=particle PXG_PARTICLE_ST
 run_one "softbody (mesh floor)"        PXG_SCENE=softbody PXG_SB_FLOOR=mesh
 run_one "softbody (convexcore floor)"  PXG_SCENE=softbody PXG_SB_FLOOR=convexcore
 run_one "softbody (heightfield floor)" PXG_SCENE=softbody PXG_SB_FLOOR=heightfield
+
+# P9.91: the force-threshold pipeline (accumulateThresholdStream.cu) is launched by BOTH
+# GPU solver cores -- PxgCudaSolverCore and PxgTGSCudaSolverCore each carry their own
+# copy of accumulatedForceThresholdStream() -- so the scene is scored under both.  Its
+# reference is the CPU PGS solver (PXG_CPU_CONTROL=1 PXG_SOLVER=pgs); the CPU TGS solver
+# builds no force-change stream at all (see the scene's header in testGpuSdkStep.cpp).
+run_one "forcethreshold (PGS)" PXG_SCENE=forcethreshold PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"

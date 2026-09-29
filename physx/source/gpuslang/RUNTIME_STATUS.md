@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.91: GPU force-threshold reporting: all 14 kernels of accumulateThresholdStream.cu on the
+engine ABI (thresholdStreamBda.spv; 2 were unmapped, 12 had no launch-ABI row), observed by
+PXG_SCENE=forcethreshold under GPU TGS and PGS: FOUND/PERSISTS/LOST step for step as the CPU
+PGS reference.  Manifest 421 -> 423, KNOWN_UNWIRED 48 -> 36, engine-reachable unmapped 11 -> 9.
+57 mutants: 56 killed, 1 equivalent.  Upstream candidates: setContactReportThreshold never
+reaches the GPU body sim; a cross-block race in computeThresholdElementMaskIndices.  Scenes 58/58.
 P9.90: all 19 unstamped float-computing engine shaders are NoContraction-stamped, 14 of them
 behind a directed bitwise fixture that fails on llvmpipe's undecorated OpDot order x+(y+z),
 5 for consistency only; llvmpipe does not contract written-out mul+add chains even unstamped.
@@ -2066,6 +2072,146 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.91 — Force-Threshold-Meldungen: die ganze Pipeline aus accumulateThresholdStream.cu auf dem Engine-ABI
+
+**Ausgangslage.** `PxgGpuContext::doConstraintSolveGPU` ruft `accumulatedForceThresholdStream()`
+nur `if (mHasForceThresholds)` auf (PxgContext.cpp:593). Das setzt ein Paar voraus, dessen
+Filter-Flags `eNOTIFY_THRESHOLD_FORCE_*` verlangen und von dessen Körpern einer eine endliche
+Contact-Report-Schwelle hat. Das hatte keine der 56 Szenen. Die Gruppe hat 14 Kernel. Zwei davon
+(`bodyInputAndRanksSingleBlockLaunch` und `bodyInputAndRanksBlocksLaunch`, die Radix-Sortierung
+nach Körperindex) waren gar nicht gemappt. Die übrigen zwölf zeigten auf die Binding-Ports
+`thresholdStream.spv` und `thresholdForceChange.spv` und hatten keine Launch-ABI-Zeile, standen
+also in `KNOWN_UNWIRED`.
+
+**Erst der Beobachter: `PXG_SCENE=forcethreshold`.** Vier Boxen von je 1000 kg (Gewicht 9810 N)
+starten ruhend und dürfen nicht einschlafen:
+
+- `over` allein am Boden, Schwelle 5000 N;
+- `under` allein, Schwelle 20000 N;
+- `lower` am Boden mit Standard-Schwelle, darauf `upper` mit 5000 N, also ein dynamisch-dynamisches
+  Schwellen-Paar.
+
+Vor Schritt 120 steigt die Schwelle von `over` auf 1e7 N. Gezählt werden die Events pro Paar und
+Schritt.
+
+**Referenz ist der CPU-PGS-Solver** (`PXG_CPU_CONTROL=1 PXG_SOLVER=pgs`), gemessen:
+
+- `ground|over`: FOUND @0, PERSISTS @1..119, LOST @120;
+- `lower|upper`: FOUND @0, PERSISTS @1..239;
+- alle anderen Paare: nichts.
+
+**Der CPU-TGS-Solver meldet gar nichts. Das liegt upstream, nicht an der Szene.**
+`DyTGSDynamics.cpp` baut den Force-Change-Stream nie (es fehlt ein Schritt wie
+`createForceChangeThresholdStream`, DyDynamics.cpp:522 gibt es nur für PGS). Der GPU-TGS-Kern
+startet dagegen dieselben 14 Kernel wie der GPU-PGS-Kern.
+
+**Rot gemessen, vor dem Port:**
+
+- GPU-TGS und GPU-PGS: kein einziges Event.
+- `PXG_LAUNCH_TRACE`: elf Kernel je 240× abgewiesen, die zwei Radix-Kernel je 960× übersprungen.
+- `setThresholdElementsMask` wurde nie gestartet, weil ohne Exceeded-Menge nie ein Vorgänger-Set
+  entsteht.
+
+**Der Port: `thresholdStreamBda.slang`.** Er enthält alle 14 Kernel in der Launch-Reihenfolge der
+beiden Solver-Kerne und liest den echten `PxgSolverCoreDesc` (sowie `dt` aus dem
+`PxgSolverSharedDesc`) per BDA. Die Rümpfe sind die von testThresholdStream und
+testThresholdForceChange bewiesenen, inklusive der P9.86f/P9.89-Assoziationen. Neu gegenüber den
+Binding-Ports:
+
+- **`bool* thresholdStreamWriteable`** ist auf dem Engine-ABI ein Byte-Array. Jeder Store ist das
+  InterlockedAnd/Or-Paar (check_subword_store), jeder Load maskiert sein Byte.
+- **Die Radix-Kernel** sind die Rümpfe aus radixSortDesc, aber mit der Solver-Blockgröße 256
+  statt 1024; die Blockaufteilung hängt an `blockDim.x`. Der Schlüsselzähler kommt aus
+  `solverDesc->sharedThresholdStreamIndex`. Das Histogramm zählt die Padding-Lanes, die
+  `sanitizeKeys()` zu 0xffffffff macht, also Ziffer 0xF. Damit enthält `radixBlockCounts` die
+  Zahlen der CUDA. Der Rang-Pass schreibt Padding nie, genau wie `keysToProcess` in der CUDA.
+- **Die Element-Kopien** (exceeded und force-change) schreiben die sechs benannten Felder und
+  lassen `pad` unberührt. Die CUDA kopiert ein lokales `tempElement` mit unbelegtem `pad`, der
+  Inhalt ist dort also unbestimmt. Die Binding-Ports schrieben 0.
+- **`setPersistentForceElementMask`** läuft wie in der CUDA am Kopf von
+  `computeThresholdElementMaskIndices`. Die Binding-Portierung hatte dafür einen eigenen Launch,
+  den die Engine nicht kennt.
+
+Manifest **421 → 423**, `KNOWN_UNWIRED` **48 → 36**, engine-erreichbar ungemappt **11 → 9**.
+
+**Die Fixture: `testThresholdStreamBda.cpp`** mit drei Tests. Sie fährt die Launch-Sequenz der
+Engine:
+
+- die Kopie `thresholdStream` → `tmpThresholdStream`;
+- die zwei Ping-Pong-Radix-Deskriptoren aus `constructRadixSortDesc`;
+- nbPasses nach :1705-1710;
+- das memset der Masken auf 1;
+- `setThresholdElementsMask` nur bei nbPrev > 0.
+
+Das Orakel ist eine wörtliche C++-Abschrift jedes Kernels. Verglichen wird **jeder berührte Puffer
+bitweise**, auch Bytes, die die CUDA liegen lässt (vorher auf beiden Seiten vergiftet): Keys/Ranks
+beider Ping-Pong-Puffer, `radixBlockCounts`, der sortierte Stream samt `accumulatedForce` und `pad`,
+die akkumulierten Kräfte und Blocksummen, der wiederverwendete Write-Index/Masken-Puffer, die
+Bool-Bytes, die Paarkräfte, exceeded- und force-change-Elemente und die zwei Zähler, die die Kernel
+in den Deskriptor schreiben.
+
+- **`thresholdStreamBda_keyStages`:** Schlüsselextraktion, B-Sortierung und A-Extraktion, jeweils
+  direkt nach der Stufe verglichen.
+- **`thresholdStreamBda_frameLarge`:** 40001 Elemente mit drei Padding-Lanes, in Knoten-Paaren mit
+  1..4 Shape-Paaren, dazu statische und Artikulations-Knoten. Jede blockgeteilte Schleife iteriert
+  mehrfach, jede Grid-Stride-Schleife läuft um. 24101 Elemente sind exceeded (der Maskenscan
+  überspannt alle 32 Blöcke). 121 Gleichstands-Elemente mit Kraft == Schwelle·dt pinnen das `>`
+  von :440.
+- **`thresholdStreamBda_twoFrames`:** Frame 2 wird gegen die Exceeded-Menge von Frame 1 abgeglichen
+  (nbPrev 13, nbExceeded 16). Abgedeckt sind persistente Paare (8), ein ersetztes Shape-Paar, ein
+  Shape-Zeiger, der sich nur im oberen Wort unterscheidet, sechs Rückwärtsschritte der binären
+  Suche über gleiche Knoten, ungefundene Elemente (8) und der Fall der CUDA, in dem `pos > 1` einen
+  Schritt vor Slot 0 anhält (1). Jeder Fall hat einen Abdeckungszähler. Die drei Maskenbereiche
+  bleiben in Block 0 (Summe 42 ≤ 256), siehe Upstream-Kandidat 2.
+
+**Mutations-Sweep** (`thresholdStreamBda.spv`, frisch gebaut): 55 Mutanten, 53 getötet (8 davon durch einen
+Fault). Abgedeckt sind:
+
+- Radix-Histogramm und -Ränge samt Padding-Zählung, Blockaufteilung und Iterationsfortschritt;
+- Schlüsselextraktion und Reorganize;
+- die Akkumulation und ihre Assoziation, die Blocksummen;
+- die Bool-Byte-Stores;
+- `>` gegen `>=`, der `dt`-Offset;
+- die Element-Felder und `pad`;
+- der Maskendiff mit `pos > 1`, dem Hochwort des Shape-Zeigers und der Persistent-Maske;
+- die Kompaktierung und beide Zähler im Deskriptor.
+
+Zwei überlebten:
+
+- **`initB-pad-key`:** Die Padding-Schlüssel von `initialRanksAndBodyIndexB` liest wegen
+  `sanitizeKeys` niemand, und `initialRanksAndBodyIndexA` überschreibt dieselben Slots. Die CUDA
+  schreibt sie aber. `thresholdStreamBda_keyStages` vergleicht deshalb nach jeder Stufe und tötet
+  den Mutanten.
+- **`outacc-force`:** Äquivalent, denn Addition ist kommutativ und `·1.0` exakt. Ersetzt durch das
+  Weglassen des Blockpräfixes, der Ersatz ist getötet.
+
+**Gesamt 57 Mutanten: 56 getötet, 1 äquivalent.**
+
+**Szene grün:** GPU-TGS und GPU-PGS liefern exakt die CPU-PGS-Zeitlinie. `run_scenes.sh` führt
+`forcethreshold` unter TGS und zusätzlich `forcethreshold (PGS)` aus. Szenen **56 → 58**.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+
+1. **`setContactReportThreshold` erreicht die GPU nie.** `Sc::BodyCore::setContactReportThreshold`
+   (ScBodyCore.h:144) speichert nur den Wert. Anders als die übrigen BodyCore-Setter ruft er kein
+   `updateBodySim()` auf, also kommt die neue Schwelle nie in
+   `PxgBodySim::inverseInertiaXYZ_contactReportThresholdW` an (PxgSimulationController.cpp:2411).
+   Gemessen: Ohne Gegenmaßnahme melden GPU-TGS und GPU-PGS 239× PERSISTS und kein LOST. Die CPU
+   liest den Core jeden Schritt und sieht die Änderung. Die Szene setzt deshalb danach die lineare
+   Dämpfung auf ihren eigenen Wert. Das ist physikalisch wirkungslos, ruft aber `updateBodySim()`.
+2. **Wettlauf zwischen Blöcken in `computeThresholdElementMaskIndices`** (:633/:612). Die
+   Persistent-Maske von Vorgänger-Element k schreibt der globale Thread k. Gelesen wird sie von dem
+   Block, dessen Abschnitt diesen Slot enthält, während derselbe Scan die Vorgänger-Masken in place
+   überschreibt. Sobald die drei Bereiche mehr als einen Block überspannen, hängt das Ergebnis der
+   CUDA von der Block-Reihenfolge ab. Der Port übernimmt das unverändert, statt eine Antwort zu
+   erfinden, die die CUDA nicht gibt. Die Fixture bleibt im geordneten Bereich (ein Block).
+3. **`else if (pos > 1)`** in `setThresholdElementsMask` (:600) prüft Slot 0 nie. Steht der
+   passende Vorgänger in Slot 0 und ein anderes Shape-Paar desselben Körperpaars in Slot 1, wird
+   ein persistentes Paar als LOST + FOUND gemeldet. Der Port übernimmt das; die Fixture erzwingt den
+   Fall.
+
+**Suite:** 880/880 in beiden Speichermodi. **Szenen:** 58/58 (neu: `forcethreshold` unter TGS und `forcethreshold (PGS)`).
 
 ## P9.90 — NoContraction-Stempel für jeden engine-Shader mit float-Arithmetik
 

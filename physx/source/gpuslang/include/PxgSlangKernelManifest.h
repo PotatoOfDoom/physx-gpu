@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 421;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 423;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -114,20 +114,20 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "writeBackBodies", "solverPGS.spv", "writeBackBodies" },  // WRITE_BACK_BODIES
     { "computeAverageSolverBodyVelocity", "solverPGS.spv", "computeAverageSolverBodyVelocity" },  // COMPUTE_AVERAGE_VELOCITY
     { "propagateSolverBodyVelocity", "solverPGS.spv", "propagateSolverBodyVelocity" },  // PROPAGATE_BODY_VELOCITY
-    { "initialRanksAndBodyIndexB", "thresholdStream.spv", "initialRanksAndBodyIndexB" },  // INITIALIZE_INPUT_AND_RANKS_B
-    { "initialRanksAndBodyIndexA", "thresholdStream.spv", "initialRanksAndBodyIndexA" },  // INITIALIZE_INPUT_AND_RANKS_A
-    { "bodyInputAndRanksSingleBlockLaunch", nullptr, nullptr },  // RADIXSORT_SINGLEBLOCK (unmapped)
-    { "bodyInputAndRanksBlocksLaunch", nullptr, nullptr },  // RADIXSORT_CALCULATERANKS (unmapped)
-    { "reorganizeThresholdElements", "thresholdStream.spv", "reorganizeThresholdElements" },  // REORGANIZE_THRESHOLDSTREAM
-    { "computeAccumulateThresholdStream", "thresholdStream.spv", "computeAccumulateThresholdStream" },  // COMPUTE_ACCUMULATED_THRESHOLDSTREAM
-    { "outputAccumulateThresholdStream", "thresholdStream.spv", "outputAccumulateThresholdStream" },  // OUTPUT_ACCUMULATED_THRESHOLDSTREAM
-    { "writeoutAccumulatedForcePerObject", "thresholdStream.spv", "writeoutAccumulatedForcePerObject" },  // WRITEOUT_ACCUMULATEDFORCEPEROBJECT
-    { "computeExceededForceThresholdElementIndice", "thresholdStream.spv", "computeExceededForceThresholdElementIndice" },  // COMPUTE_EXCEEDEDFORCE_THRESHOLDELEMENT_INDICE
-    { "outputExceededForceThresholdElementIndice", "thresholdStream.spv", "outputExceededForceThresholdElementIndice" },  // OUTPUT_EXCEEDEDFORCE_THRESHOLDELEMENT_INDICE
-    { "setThresholdElementsMask", "thresholdForceChange.spv", "setThresholdElementsMask" },  // SET_THRESHOLDELEMENT_MASK
-    { "computeThresholdElementMaskIndices", "thresholdForceChange.spv", "computeThresholdElementMaskIndices" },  // COMPUTE_THRESHOLDELEMENT_MASK_INDICES
-    { "outputThresholdPairsMaskIndices", "thresholdForceChange.spv", "outputThresholdPairsMaskIndices" },  // OUTPUT_THRESHOLDELEMENT_MASK_INDICES
-    { "createForceChangeThresholdElements", "thresholdForceChange.spv", "createForceChangeThresholdElements" },  // CREATE_FORCECHANGE_THRESHOLDELEMENTS
+    { "initialRanksAndBodyIndexB", "thresholdStreamBda.spv", "initialRanksAndBodyIndexB" },  // INITIALIZE_INPUT_AND_RANKS_B
+    { "initialRanksAndBodyIndexA", "thresholdStreamBda.spv", "initialRanksAndBodyIndexA" },  // INITIALIZE_INPUT_AND_RANKS_A
+    { "bodyInputAndRanksSingleBlockLaunch", "thresholdStreamBda.spv", "bodyInputAndRanksSingleBlockLaunch" },  // RADIXSORT_SINGLEBLOCK (P9.91)
+    { "bodyInputAndRanksBlocksLaunch", "thresholdStreamBda.spv", "bodyInputAndRanksBlocksLaunch" },  // RADIXSORT_CALCULATERANKS (P9.91)
+    { "reorganizeThresholdElements", "thresholdStreamBda.spv", "reorganizeThresholdElements" },  // REORGANIZE_THRESHOLDSTREAM
+    { "computeAccumulateThresholdStream", "thresholdStreamBda.spv", "computeAccumulateThresholdStream" },  // COMPUTE_ACCUMULATED_THRESHOLDSTREAM
+    { "outputAccumulateThresholdStream", "thresholdStreamBda.spv", "outputAccumulateThresholdStream" },  // OUTPUT_ACCUMULATED_THRESHOLDSTREAM
+    { "writeoutAccumulatedForcePerObject", "thresholdStreamBda.spv", "writeoutAccumulatedForcePerObject" },  // WRITEOUT_ACCUMULATEDFORCEPEROBJECT
+    { "computeExceededForceThresholdElementIndice", "thresholdStreamBda.spv", "computeExceededForceThresholdElementIndice" },  // COMPUTE_EXCEEDEDFORCE_THRESHOLDELEMENT_INDICE
+    { "outputExceededForceThresholdElementIndice", "thresholdStreamBda.spv", "outputExceededForceThresholdElementIndice" },  // OUTPUT_EXCEEDEDFORCE_THRESHOLDELEMENT_INDICE
+    { "setThresholdElementsMask", "thresholdStreamBda.spv", "setThresholdElementsMask" },  // SET_THRESHOLDELEMENT_MASK
+    { "computeThresholdElementMaskIndices", "thresholdStreamBda.spv", "computeThresholdElementMaskIndices" },  // COMPUTE_THRESHOLDELEMENT_MASK_INDICES
+    { "outputThresholdPairsMaskIndices", "thresholdStreamBda.spv", "outputThresholdPairsMaskIndices" },  // OUTPUT_THRESHOLDELEMENT_MASK_INDICES
+    { "createForceChangeThresholdElements", "thresholdStreamBda.spv", "createForceChangeThresholdElements" },  // CREATE_FORCECHANGE_THRESHOLDELEMENTS
     { "solveBlockUnified", "solverTGS.spv", "solveBlockUnified" },  // SOLVE_UNIFIED (P5 Step 5 tranche A BDA)
     { "propagateStaticSolverBodyVelocities", "solverPGS.spv", "propagateStaticSolverBodyVelocities" },  // PROPAGATE_STATIC_SOLVER_VELOCITIES (P5 Step 5 BDA port)
     { "integrateCoreParallelLaunch", "integration.spv", "integrateCoreParallelLaunch" },  // INTEGRATE_CORE_PARALLEL

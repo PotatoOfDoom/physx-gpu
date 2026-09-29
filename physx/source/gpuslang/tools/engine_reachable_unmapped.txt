@@ -153,9 +153,13 @@ applyParticleBufferDataDEPRECATED
 
 # PxgParticleSystemCore.cpp (3)
 
-# PxgCudaSolverCore.cpp + PxgTGSCudaSolverCore.cpp (2)
-bodyInputAndRanksBlocksLaunch
-bodyInputAndRanksSingleBlockLaunch
+# PxgCudaSolverCore.cpp + PxgTGSCudaSolverCore.cpp (2, both mapped in P9.91)
+# bodyInputAndRanksSingleBlockLaunch / bodyInputAndRanksBlocksLaunch -- MAPPED in
+# P9.91 (thresholdStreamBda.spv), together with the twelve force-threshold kernels
+# around them that were mapped to binding-only ports and had no launch-ABI row.  The
+# whole group runs only `if (mHasForceThresholds)` (PxgContext.cpp:593), which no
+# scene raised until PXG_SCENE=forcethreshold: a pair asking for
+# eNOTIFY_THRESHOLD_FORCE_* on a body whose contact report threshold is finite.
 
 # PxgSimulationController.cpp (1)
 mergeTransformCacheAndBoundArrayChanges
