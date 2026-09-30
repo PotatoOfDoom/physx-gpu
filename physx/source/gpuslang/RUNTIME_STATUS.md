@@ -7,7 +7,14 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **881/881** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.93: the write half of the direct-GPU API (five setters), both acceleration getters and
+updateBodyExternalVelocitiesLaunch on the engine ABI, observed by PXG_SCENE=directapiwrite and
+PXG_SCENE=extforce under GPU TGS and PGS (plus a directapi PGS row).  Two spellings fixed in the
+shared pxgSlangCacheBound module (conjugate-rotate transformInv, sign of zero; scale-only
+PxMeshScale::isIdentity).  check_launch_abi_pack now sees 269 kernels (was 216).  KNOWN_UNWIRED
+22 -> 14.  51 mutants, all killed.  A 178-site inverse-rotation audit confirmed 35 more divergences
+(P9.94).  Scenes 64/64.
 P9.92: the GPU broadphase's aggregate path: all 14 kernels of aggregate.cu on the engine ABI
 (aggregateBda.spv; none had a launch-ABI row), observed by PXG_SCENE=aggregate (self-collision on and
 off, aggregate-aggregate, aggregate-actor): all nine bodies at the CPU rest heights under GPU TGS and
@@ -2078,6 +2085,245 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.93 — Die Schreibseite der Direct-GPU-API, die zwei Beschleunigungs-Getter und `updateBodyExternalVelocitiesLaunch` auf dem Engine-ABI; zwei Spellings im gemeinsamen Cache/Bound-Modul
+
+**Ausgangslage.** Acht der 22 Namen in `KNOWN_UNWIRED` gehören zusammen:
+
+- die fünf Setter von `PxDirectGPUAPI::setRigidDynamicData` (`eGLOBAL_POSE`, `eLINEAR_VELOCITY`,
+  `eANGULAR_VELOCITY`, `eFORCE`, `eTORQUE`);
+- die zwei Beschleunigungs-Getter (`eLINEAR_/eANGULAR_ACCELERATION`), die zusätzlich zur
+  Direct-API `PxSceneFlag::eENABLE_BODY_ACCELERATIONS` brauchen;
+- `updateBodyExternalVelocitiesLaunch`. `PxgSimulationCore::updateBodies` startet ihn nur, wenn
+  `nbUpdatedBodies > 0` ist und die Direct-API aus ist (PxgSimulationCore.cpp:2313).
+  `nbUpdatedBodies` füllt allein `BodySim::updateForces`, also `PxRigidDynamic::addForce` /
+  `addTorque` / `setForceAndTorque` / `clearForce` / `clearTorque`. `setLinearVelocity` nimmt
+  dagegen den Weg über `updateBodySim`.
+
+Keine Szene rief eines davon auf. Die sieben Direct-API-Kernel zeigten auf die Binding-Ports in
+`directApi.slang` und `updateBounds.slang`, der achte auf einen Binding-Eintrag in
+`bodyUpdate.slang`. Keiner hatte eine Launch-ABI-Zeile.
+
+**Erst die Beobachter.**
+
+**`PXG_SCENE=directapiwrite`.** Das sind sieben Boxen von je 1000 kg (inverse Trägheit 0.006)
+im freien Fall ab y = 20. Die Szene hat Direct-API und `eENABLE_BODY_ACCELERATIONS`, ein
+Aufwärm-Schritt geht voraus (vorher weist die API jeden Aufruf ab). Dann folgt EIN
+Schreibfenster, danach sechzig Schritte:
+
+- **T** wird per `eGLOBAL_POSE` nach (−10, 0.5, 3) teleportiert, 45° gegiert. **T2** kommt im
+  selben Aufruf (zwei Elemente, umgekehrte Indexreihenfolge) nach (−6, 30, −4), 90° gerollt.
+  Beide Posen werden sofort zurückgelesen und müssen exakt stimmen.
+- **V** bekommt `eLINEAR_VELOCITY` (4, 0, −2), **W** bekommt `eANGULAR_VELOCITY` (0, 3, 0).
+  Beide Aufrufe sind gebündelt mit R, dem die eigene Geschwindigkeit zurückgeschrieben wird;
+  das prüft die 12-Byte-Schrittweite. Direkt danach muss die Beschleunigung exakt 0 sein, weil
+  der Setter auch die Vorgeschwindigkeit schreibt.
+- **F** bekommt `eFORCE` zweimal, erst 10000 N, dann 5000 N entlang z. Der Kernel ZUWEIST, also
+  zählen nur 5000 N.
+- **Q** bekommt `eTORQUE` 30000 N m um z.
+- **R** ist die Referenz.
+
+Gemessen werden:
+
+- R: (0, −9.81, 0) aus der genullten Vorgeschwindigkeit;
+- F: (0, −9.81, 5) im Schritt nach dem Schreiben und wieder 0 im Schritt danach (die Kraft wirkt
+  EINEN Schritt);
+- Q: ω = 3 und α = 180 rad/s², ebenfalls nur EINEN Schritt;
+- nach sechzig Schritten die Endposen: T liegt am Boden, T2 bei y = 24.84975, V bei
+  (2, 15.010525, −2), W und Q bei 3 rad.
+
+Jeder Lesepuffer ist vergiftet und hat einen vergifteten Slot hinter dem Ende.
+
+**`PXG_SCENE=extforce`.** Vier Boxen fallen ab y = 100 frei und berühren nichts.
+
+- K bekommt vor Schritt 30 `addForce((3,0,0), eVELOCITY_CHANGE)`.
+- F bekommt vor jedem Schritt 30..59 `addForce((0,0,2000), eFORCE)`.
+- S bekommt vor Schritt 30 `addTorque((0,500,0), eIMPULSE)`.
+- C bleibt unberührt.
+
+Erwartet: K.x = 1.5, F.z = 0.258333 und v_z = 1, S dreht sich mit ω_y = 3 bis 1.5 rad.
+
+Jeder Aufruf hat **`autowake = false`**, und das ist kein Detail. Mit dem Default wird ein wacher
+Körper mit Wake-Counter unter 0.4 zusätzlich durch `setWakeCounter → updateBodySim →
+updateBodiesLaunch` geschoben. Das betrifft jeden fallenden Körper auf der GPU, sein Counter liegt
+zwischen 0.2 und 0.4. `updateBodiesLaunch` schreibt dieselbe Geschwindigkeit nach dem Kick neu und
+würde einen abgewiesenen Kernel vollständig verdecken.
+
+**Rot gemessen, vor dem Port.** Dafür wurden ABI-Zeilen und Manifest aus HEAD gebaut:
+
+- `directapiwrite`: Alle sieben Kernel werden abgewiesen. Die Getter werden je Aufruf
+  abgewiesen: linear 5×, angular 4×; `setRigidDynamicForce` 2×, die übrigen Setter je 1×. Jede
+  Beschleunigung liest Gift, jede Rücklesung zeigt den freien Fall. Alle sieben Körper enden bei
+  y = 14.847028 mit Einheitsquaternion.
+- `extforce`: `updateBodyExternalVelocitiesLaunch` wird 30× abgewiesen. Der Kick bleibt im
+  CPU-Core liegen und wird vom nächsten GPU-Writeback überschrieben: K.x = 0, F.z = 0,
+  S.ω = 0.
+
+**Der Port.**
+
+- **`directApiBda.slang`** bekommt die sieben Einträge, jeder mit dem bloßen
+  `if (i < nbElements)` der CUDA und dem Host-Grid (n + 255) / 256. Der Body-Sim-Pool ist
+  wortadressiert. Jeder Setter ist ein Read-Modify-Write einzelner float4 in einem
+  224-Byte-Record, und nur ein uint-Move ist für jede Eingabe bitgenau, NaN-Payloads und −0
+  eingeschlossen.
+- **Der Pose-Setter** schreibt `body2World = pose.transform(body2Actor)` mit p.w = 0, und zwar VOR
+  dem Return bei `totalNumShapes == 0`, wie die CUDA. Danach läuft der Shape-Walk in der
+  geklemmten P9.28-Form (npArtiUpdateKin). `pos` ist 0xFFFFFFFF, wenn der Walk über Index 0
+  hinausläuft, und `&&` in der Schleifenbedingung ist hier eine Maske, kein Kurzschluss. Also
+  wird die Adresse geklemmt, während der Sentinel den Wert entscheidet. `isBP` ist ein wörtliches
+  `true`, kein Shape-Flag schaltet die Bound ab.
+- **`updateBodyExternalVelocitiesLaunch`** wird in `bodyUpdate.slang` auf das Engine-ABI
+  umgestellt, wie zuvor `updateBodiesLaunch`. Er liest den echten `PxgUpdatedBodiesDesc`, neu
+  gespiegelt in `pxgSlangSimCoreDesc.slang`. Dessen Pool-Zeiger steht ZUERST, umgekehrt zu
+  `PxgNewBodiesDesc`. Bewegt werden uint4: linVel.w des Records ist der Körperindex als rohe
+  Bits (PX_FR), nie ein float.
+
+Das Manifest bleibt bei **423**, die acht Zeilen zeigen jetzt auf die Engine-Einträge;
+`setRigidDynamicGlobalPose` ist von Hand gesetzt, der Generator würde `updateBounds.spv` nehmen.
+`KNOWN_UNWIRED` **22 → 14**.
+
+**Zwei Spellings im gemeinsamen Modul `pxgSlangCacheBound.slang`.** Der Pose-Setter importiert das
+Modul. Es liefert auch `updateTransformCacheAndBoundArrayLaunch` und `artiUpdateKinematic` aus,
+die schon angebunden waren. Der Kritiker des Spezifikations-Workflows fand dort zwei latente
+bitweise Abweichungen:
+
+1. **`getAbsPose` / `PxTransform::transformInv(PxTransform)`.** Die CUDA rechnet
+   `qinv = q.getConjugate(); qinv.rotate(src.p − p)` (PxTransform.h:162-169), der Port
+   rechnete `quatRotateInv(q, src.p − p)`. Das stimmt in jedem Bit überein, AUSSER im Vorzeichen
+   einer exakten Null: Der Kreuzterm der Konjugierten (−y)·vz − (−z)·vy ergibt +0, wo rotateInvs
+   −(y·vz − z·vy) −0 ergibt. Ob das am Ausgang ankommt, wurde nicht angenommen, sondern
+   gezählt. Mit echten PhysX-Typen, IEEE ohne Kontraktion, über alle Einheitsquaternionen aus
+   {±0, ±½, ±√½, ±1} und Vektoren aus {±0, 0.25, −0.5, 1} liefern **207 487 500 von
+   2 116 000 000** Kombinationen eine andere `absPos.p`. Beispiel: body2Actor.q = (0, 0, −√½, √½),
+   p = 0, Pose q = (0, 0, −1, −0), p = (0, 0, −0).
+2. **`PxMeshScale::isIdentity()`** prüft NUR die Skalierung (PxMeshScale.h:104-107). Der Port
+   verlangte zusätzlich Rotation xyz = 0. Eine Einheitsskalierung mit gedrehter Skalierungsachse
+   ist ein gültiges PxMeshScale und wird unverändert in die GPU-Shape kopiert. Die CUDA
+   überspringt dafür die Multiplikation, der Port multiplizierte mit Rᵀ·R ≠ I in float.
+
+Beide sind korrigiert, ebenso der Binding-Zwilling in `updateBounds.slang` und die Orakel in
+`testUpdateBounds.cpp` (dessen `getAbsPose` jetzt wörtlich; `pxgRefMath.h` bleibt für P9.94) und
+`testArtiUpdateKinematic.cpp`. Die Fixture beweist, dass sie beide unterscheidet (siehe unten).
+
+**Der Pack-Checker sah einen Teil der Engine nicht.** `check_launch_abi_pack.py` meldete die fünf
+Setter als UNDECIDED. Ursache war `const void* PX_RESTRICT data`: Der Qualifier zwischen Typ und
+Name versteckte die Deklaration. Er wird jetzt entfernt, die Ratchet wächst dafür nicht. Dabei
+fiel eine ältere Blindstelle auf. Der Checker suchte den `PxCudaKernelParam`-Block nur NACH dem
+`getCuFunction`-Handle. Deshalb waren alle Kernel unsichtbar, deren Block davor steht, etwa die
+drei angebundenen Getter und die Beschleunigungs-Getter. Sie galten als „keine Startstelle
+gefunden“. Die Suche beginnt jetzt am Funktionskopf, auf Text mit ausgeblendeten Kommentaren und
+`#if 0`-Blöcken:
+
+- Ohne Maskierung las sie einen auskommentierten `ps_averageVertsLaunch`-Aufruf
+  (PxgParticleSystemCore.cpp:1470-1500) als zweite, abweichende Startstelle.
+- Ohne `#if 0` las sie ein totes `ps_applyDeltaLaunch`-Paket mit falscher Signatur
+  (PxgPBDParticleSystemCore.cpp:757-777) als zweite Startstelle.
+
+Geprüft werden jetzt **269 Kernel statt 216**, und alle stimmen. Drei Kernel sind neu sichtbar und
+fallen in dokumentierte Klassen: `writer` als Wert und `mGravity` als Klassen-Member. Sie wurden von
+Hand gegen ihre Zeilen geprüft und mit Begründung in `KNOWN_UNDECIDED` eingetragen (**37 → 40**).
+Das ist keine Regression, sie waren vorher gar nicht sichtbar.
+
+**Die Fixtures.**
+
+`testDirectApiBdaWrite.cpp` enthält vier Tests über `PxgCudaShim`. Jede Push-Struktur und jedes
+Layout ist gegen die echten Header gepinnt, alle elf Felder von `PxgUpdateActorDataDesc`
+eingeschlossen. Der Kommentar, `testSimCoreDescLayout` pinne sie, war falsch und ist korrigiert.
+Das Orakel ist eine wörtliche Abschrift aus echten PhysX-Typen. **Jede Region** wird nach jedem
+Launch bitweise verglichen, auch Eingaben, Deskriptoren und Köder.
+
+- **`directApiRigidAccelGet`:** Vorgeschwindigkeiten nach Körper indiziert, Query-Liste mit
+  Duplikaten, 1/dt = 59.7, vel = prev (+0), −0 − +0 (−0), Grid-Schwanz mit Fallen-Indizes dahinter.
+- **`directApiRigidSetVel`:** Vier Launches mit und ohne Vorgeschwindigkeits-Puffer. Die Daten
+  enthalten −0, eine NaN mit Payload und ±inf. Geprüft wird das .w des Pools und von prev.
+- **`directApiRigidSetForceTorque`:**
+  - Kraft: inverse Masse 0 gegen eine negative Kraft (−0);
+  - Drehmoment: anisotrope inverse Trägheit mit Null-Komponente unter Nicht-Achsen-Rotationen;
+  - eine lebende Vorbeschleunigung mit .w ≠ 0, die überschrieben werden muss.
+- **`directApiRigidSetPose`:** 627 Shapes, jeder Geometrietyp 0-10, jede Hull-Variante, Fast Path.
+  Außerdem:
+  - der Walk von Position 0 mit Wrap;
+  - 0xFFFFFFFF-Slots am Anfang, in der Mitte und am Ende eines Laufs;
+  - Statics und Artikulations-Links, deren mID einem abgefragten Körper gleicht;
+  - Körper ohne Shapes, darunter einer über allen starren Einträgen;
+  - ein lebender, passender Fallen-Eintrag bei `[totalNumShapes]`;
+  - `totalNumShapes == 0`: Pose geschrieben, keine Shape berührt;
+  - Shape-Element-IDs, die gegen die Tabellenreihenfolge permutiert sind;
+  - ein vierter Launch über die Tabelle ohne Statics.
+
+  Vor dem ersten Launch wird er auf dem Host zweimal wiederholt, je mit EINEM alten Spelling.
+  Jedes muss ein Wort dieses Launches ändern: transformInv als rotateInv 1 Wort, isIdentity mit
+  Rotation 56 Wörter. Der Nullvorzeichen-Fall wird dafür per Suche über dieselben exakten Werte
+  gefunden.
+
+`bodyUpdate_externalVelocities` läuft jetzt über das Engine-ABI, mit dem festen 64er-Grid bei
+zwei Größen. Die kleinen (denormalen) Körperindizes liegen in den ersten Records, Körper 0 ist
+nie Ziel. Alle vier .w sind ≠ 0, Records und Deskriptor müssen unverändert bleiben.
+
+**Mutations-Sweep** (frisch gebaut): **51 Mutanten, alle getötet (2 durch einen Fault), keiner
+äquivalent.**
+
+- 39 auf `directApiBda.spv`: jede Indexquelle (Körper gegen Thread), jede Lane und jedes .w, jeder
+  Guard, die Klemmung, die Suchlänge, das `true` für isBP, der Dekrement-Schritt, das
+  Early-Return VOR dem Pose-Schreiben, Zuweisen gegen Akkumulieren.
+- 8 auf `bodyUpdate.spv`: .w jeder der vier Kopien, Grid-Stride, der Index als float, die
+  Zeigerreihenfolge im Deskriptor.
+- 3 im Modul `pxgSlangCacheBound` (über `directApiBda.spv`): die Rück-Mutanten BEIDER
+  Spelling-Korrekturen und ein Low-Word-Vergleich in der Binärsuche.
+- 1 im Binding-Zwilling `updateBounds.slang`.
+
+Drei überlebten den ersten Lauf, alle drei waren Fixture-Lücken:
+
+- **`ps-sim-by-pos`** (Shape-Sim über die Tabellenposition statt über den Shape-Index): Die
+  Fixture vergab die Element-IDs in Tabellenreihenfolge. Jetzt sind sie permutiert, wie in der
+  Engine.
+- **`cb-search-lowword`**: Zwischen starren Einträgen und Artikulations-Links lagen immer
+  Statics, deren Low-Word 0xFFFFFFFF die Suche nie an den Links vorbeiließ. Ein vierter Launch
+  mit einer Tabelle ohne Statics tötet ihn.
+- **`c2-ident-revert-binding`**: Die Binding-Fixtures hatten keine Hull mit Einheitsskalierung
+  und gedrehter Achse. `setRigidDynamicGlobalPose_p89MeshScaleCenterOrder` hat jetzt eine (Hull
+  2), die P9.89-Abdeckung der skalierten Hull bleibt bei 46 ≥ 40 Wörtern.
+
+**Szenen grün.** `directapiwrite` und `extforce` bestehen unter TGS und PGS, kein Launch wird
+abgewiesen. Die GPU stimmt mit den CPU-Kontrollen überein
+(`PXG_DIRECTAPI_CONTROL=1 PXG_CPU_CONTROL=1` bzw. `PXG_CPU_CONTROL=1`). W und Q treffen den
+analytischen Wert 0.0707372 (GPU 0.070737, CPU 0.070718). `run_scenes.sh` bekommt
+`directapiwrite` und `extforce` samt PGS-Zeilen, dazu die fehlende Zeile `directapi (PGS)`.
+Szenen **59 → 64**.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+
+1. **Die Beschleunigungs-Getter dereferenzieren null**, wenn `eENABLE_BODY_ACCELERATIONS` aus ist.
+   `NpDirectGPUAPI` prüft das Flag nicht, `PxgSimulationCore` nur per `PX_ASSERT` (:2804, :2825).
+   Der Puffer ist dann nie alloziert (`getDevicePtr()` = 0). Der Port übernimmt das wörtlich,
+   die Szene setzt das Flag.
+2. **Der Rückgabewert von `set/getRigidDynamicData` sieht keinen gescheiterten Launch.** Ohne
+   Finish-Event wird `result` durch das Ergebnis von `streamSynchronize` ersetzt (:2851-2858,
+   :3059-3064). Hier gemessen: Jeder abgewiesene Setter meldete `true`. Deshalb urteilt die Szene
+   nur über Wirkung und Gift.
+3. **Die Setter starten mit der Blockgröße von `RIGID_DYNAMIC_GET_GLOBAL_POSE`**, berechnen das
+   Grid aber aus ihrer eigenen. Das ist ein Copy-Paste-Fehler (:2972 ff.), harmlos, weil alle 256
+   sind.
+4. **Der Kommentar „first pos“** am `binarySearch` in `setRigidDynamicGlobalPose`
+   (updateBodiesAndShapes.cu:1154) ist falsch: `binarySearch` liefert die LETZTE Position ≤ dem
+   Wert, und der Walk läuft deshalb rückwärts.
+
+**Nebenbefund für P9.94.** Parallel lief ein Audit-Workflow über alle 178 inversen Rotationen des
+Ports (`quatRotateInv`, `transformInvTransform`, Konjugierte-Rotation) gegen ihre
+CUDA-Schreibweise:
+
+- 136 sind treu, 41 wurden als abweichend gemeldet.
+- **35 davon haben adversariale Prüfer bestätigt.** Die sechs widerlegten sind genau die hier
+  schon korrigierten `getAbsPose`-Stellen.
+- Darunter ist der gemeinsame `transformInvTransform` (pxgSlangCommon.slang:274, fünf Aufrufer)
+  und `pxgSlangPrepCommon.slang:190`.
+- Außerdem zwei allgemeine Rundungsabweichungen, bei denen die CUDA eine Matrix bildet und der
+  Port Quaternionen verkettet: die Query-Box in `convexTrimeshMidphaseBda.slang:354-361` und die
+  lokale Bound in `psHfMidphaseBda.slang:576-579`.
+
+Das ist P9.94.
+
+**Suite:** 883/883 in beiden Speichermodi. **Szenen:** 64/64.
 
 ## P9.92 — Aggregat-Broadphase: alle 14 Kernel aus aggregate.cu auf dem Engine-ABI
 

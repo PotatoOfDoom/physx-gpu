@@ -81,6 +81,7 @@
 
 import pxgSlangCommon;
 import pxgSlangSimCoreDesc;
+import pxgSlangCacheBound;   // P9.93: setRigidDynamicGlobalPose's per-shape cache + bound update
 
 static const uint BLOCK_SIZE = 256;   // every launch in this file: block 256
 
@@ -363,6 +364,342 @@ void getRigidDynamicAngularVelocity(uint3 dispatchThreadId : SV_DispatchThreadID
     data[i * 3 + 0] = v.x;
     data[i * 3 + 1] = v.y;
     data[i * 3 + 2] = v.z;
+}
+
+// ===========================================================================
+// P9.93 -- the rest of the rigid direct-GPU API: the two ACCELERATION getters
+// (PxSceneFlag::eENABLE_BODY_ACCELERATIONS) and the five SETTERS
+// (PxDirectGPUAPI::setRigidDynamicData).  PXG_SCENE=directapi never drove them,
+// so until PXG_SCENE=directapiwrite they had no launch-ABI row and pointed at the
+// Phase-1 bound-buffer ports in directApi.slang / updateBounds.slang.
+//
+// Every entry is the CUDA's bare `if (globalThreadIndex < nbElements)` with the
+// host's (nbElements + 255) / 256 grid, so none needs a grid-stride loop.
+//
+// The body-sim pool is WORD-addressed here, as in updateBodiesLaunchDirectAPI:
+// every setter is a read-modify-write of single float4s inside a 224-byte
+// record, and a uint move is the only spelling that is bit-exact for every
+// input, NaN payloads and -0 included.
+// ===========================================================================
+static const uint W_LINVEL = 0;            // linearVelocityXYZ_inverseMassW
+static const uint W_ANGVEL = 4;            // angularVelocityXYZ_maxPenBiasW
+static const uint W_INV_INERTIA = 12;      // inverseInertiaXYZ_contactReportThresholdW
+static const uint W_EXT_LIN_ACCEL = 48;    // externalLinearAcceleration
+static const uint W_EXT_ANG_ACCEL = 52;    // externalAngularAcceleration
+static const uint PREV_VEL_WORDS = 8;      // PxgBodySimVelocities { float4 lin; float4 ang; } = 32 bytes
+
+// ---------------------------------------------------------------------------
+// The acceleration getters (updateBodiesAndShapes.cu:1063 / :1086).
+//
+// ENGINE launch pack, identical for both
+// (PxgSimulationCore::getRigidDynamicData, PxgSimulationCore.cpp:2806 / :2827):
+//   (PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//    const PxgBodySim* bodySimBufferDeviceData,
+//    const PxgBodySimVelocities* prevVelocities, PxU32 nbElements, float oneOverDt)
+// -> argSizes {8,8,8,8,4,4} = a 40-byte blob with no padding.
+//
+// prevVelocities is dereferenced UNCONDITIONALLY, exactly as in the CUDA: the
+// host only PX_ASSERTs it (PxgSimulationCore.cpp:2804 / :2825) and it is null
+// whenever eENABLE_BODY_ACCELERATIONS is off (see RUNTIME_STATUS P9.93).
+// ---------------------------------------------------------------------------
+struct RigidGetAccelParams
+{
+    uint64_t data;           // @0  PxVec3*  (user device memory)
+    uint64_t gpuIndices;     // @8  const PxRigidDynamicGPUIndex*
+    uint64_t bodySims;       // @16 const PxgBodySim*
+    uint64_t prevVelocities; // @24 const PxgBodySimVelocities*
+    uint nbElements;         // @32
+    float oneOverDt;         // @36 -> 40
+};
+
+[[vk::push_constant]]
+ConstantBuffer<RigidGetAccelParams> gRigidGetAccel;
+
+// (vel - prevVelocities[index].vel) * oneOverDt, all four lanes in the CUDA, of
+// which PxLoad3 keeps x, y, z.  `word` selects linear (0) or angular (4) in both
+// the body sim and the PxgBodySimVelocities record -- the two structs put the
+// two velocities at the same word offsets.
+void rigidGetAcceleration(uint i, uint word)
+{
+    const uint index = (Ptr<uint>(gRigidGetAccel.gpuIndices))[i];
+    Ptr<uint> pool = Ptr<uint>(gRigidGetAccel.bodySims);
+    Ptr<uint> prev = Ptr<uint>(gRigidGetAccel.prevVelocities);
+
+    const float4 vel = loadF4Ptr(pool, index * BODYSIM_WORDS + word);
+    const float4 prevVel = loadF4Ptr(prev, index * PREV_VEL_WORDS + word);
+    const float4 delta = vel - prevVel;
+    const float4 accel = delta * gRigidGetAccel.oneOverDt;
+
+    Ptr<float> data = Ptr<float>(gRigidGetAccel.data);
+    data[i * 3 + 0] = accel.x;
+    data[i * 3 + 1] = accel.y;
+    data[i * 3 + 2] = accel.z;
+}
+
+// mirrors getRigidDynamicLinearAcceleration()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void getRigidDynamicLinearAcceleration(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidGetAccel.nbElements)
+        return;
+    rigidGetAcceleration(i, W_LINVEL);
+}
+
+// mirrors getRigidDynamicAngularAcceleration()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void getRigidDynamicAngularAcceleration(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidGetAccel.nbElements)
+        return;
+    rigidGetAcceleration(i, W_ANGVEL);
+}
+
+// ---------------------------------------------------------------------------
+// setRigidDynamicGlobalPose (updateBodiesAndShapes.cu:1108).
+//
+// ENGINE launch pack (PxgSimulationCore::setRigidDynamicData, :2968):
+//   (const PxTransform* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//    const PxgUpdateActorDataDesc* updateActorDataDesc, PxU32 nbElements,
+//    PxU32 totalNumShapes)
+// -> argSizes {8,8,8,4,4} = a 32-byte blob.
+//
+// The pose is the actor pose: body2World = pose.transform(body2Actor), written
+// with p.w = 0 BEFORE the `totalNumShapes == 0` early return, exactly as the
+// CUDA orders it.  Then every shape of the body gets its transform cache entry,
+// its broadphase bound (isBP is a literal `true` here -- unlike the array kernel,
+// no shape flag gates it) and its `updated` word.
+//
+// The shape walk is P9.28's clamped form (npArtiUpdateKin.slang), not the
+// bound-buffer spelling of updateBounds.slang: `pos` is 0xFFFFFFFF when the walk
+// runs off index 0, and this platform evaluates BOTH sides of the `&&` in the
+// loop condition for every lane still in the loop, so the node read is clamped
+// at the ADDRESS while the sentinel still decides the VALUE.  The shape-sim
+// read is clamped the same way under the `shapeIndex != 0xFFFFFFFF` guard.
+// ---------------------------------------------------------------------------
+struct RigidSetPoseParams
+{
+    uint64_t data;                // @0  const PxTransform*  (user device memory)
+    uint64_t gpuIndices;          // @8  const PxRigidDynamicGPUIndex*
+    uint64_t updateActorDataDesc; // @16 const PxgUpdateActorDataDesc*
+    uint nbElements;              // @24
+    uint totalNumShapes;          // @28 -> 32
+};
+
+[[vk::push_constant]]
+ConstantBuffer<RigidSetPoseParams> gRigidSetPose;
+
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicGlobalPose(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidSetPose.nbElements)
+        return;
+
+    const PxgUpdateActorDataDescGpu desc = (Ptr<PxgUpdateActorDataDescGpu>(gRigidSetPose.updateActorDataDesc))[0];
+    Ptr<uint> pool = Ptr<uint>(desc.mBodySimBufferDeviceData);
+
+    const uint index = (Ptr<uint>(gRigidSetPose.gpuIndices))[i];
+    Ptr<float> data = Ptr<float>(gRigidSetPose.data);
+    const float4 inQ = float4(data[i * 7 + 0], data[i * 7 + 1], data[i * 7 + 2], data[i * 7 + 3]);
+    const float3 inP = float3(data[i * 7 + 4], data[i * 7 + 5], data[i * 7 + 6]);
+
+    // PxAlignedTransform trans(inputTransform);
+    // body2World = trans.transform(bodySim.body2Actor_maxImpulseW).getTransform()
+    //            = (trans.q.rotate(b2a.p) + trans.p, trans.q * b2a.q)
+    // (PxAlignedQuat::rotate(float4) drops b2a.p.w = maxImpulse; getTransform drops w)
+    const uint base = index * BODYSIM_WORDS;
+    const float4 b2aQ = loadF4Ptr(pool, base + W_BODY2ACTOR);
+    const float3 b2aP = loadF4Ptr(pool, base + W_BODY2ACTOR + 4).xyz;
+    const float3 b2wP = quatRotate(inQ, b2aP) + inP;
+    const float4 b2wQ = quatMul(inQ, b2aQ);
+
+    storeF4Ptr(pool, base + W_BODY2WORLD + 4, float4(b2wP, 0.0f));
+    storeF4Ptr(pool, base + W_BODY2WORLD, b2wQ);
+
+    const uint totalNumShapes = gRigidSetPose.totalNumShapes;
+    if (totalNumShapes == 0u)
+        return;   // after the pose write, as in the CUDA
+
+    Ptr<uint2> nodeIndices = Ptr<uint2>(desc.mRigidNodeIndices);
+    Ptr<uint> shapeIndices = Ptr<uint>(desc.mShapeIndices);
+    Ptr<PxgShapeSim> shapeSimPool = Ptr<PxgShapeSim>(desc.mShapeSimsBufferDeviceData);
+    Ptr<PxsCachedTransform> cacheArray = Ptr<PxsCachedTransform>(desc.mTransformCache);
+    Ptr<PxBounds3Gpu> boundsArray = Ptr<PxBounds3Gpu>(desc.mBounds);
+    Ptr<PxgShapeGpu> convexShapes = Ptr<PxgShapeGpu>(desc.mShapes);
+    Ptr<uint> updated = Ptr<uint>(desc.mUpdated);
+
+    const PxgTransform28 body2World = makeTransform28(b2wQ, b2wP);
+    const PxgTransform28 body2Actor = makeTransform28(b2aQ, b2aP);
+
+    // PxNodeIndex(index): mID = index, mLinkID = 0
+    const uint2 nodeIndex = uint2(index, 0u);
+    const uint lastShape = totalNumShapes - 1u;   // totalNumShapes != 0 here
+    uint pos = binarySearchNodeIndexBda(nodeIndices, totalNumShapes, nodeIndex);
+
+    while (pos != 0xFFFFFFFFu && all(nodeIndices[min(pos, lastShape)] == nodeIndex))
+    {
+        const uint shapeIndex = shapeIndices[min(pos, lastShape)];
+        if (shapeIndex != 0xFFFFFFFFu)
+        {
+            const PxgShapeSim shapeSim = shapeSimPool[shapeIndex != 0xFFFFFFFFu ? shapeIndex : 0u];
+            const PxgTransform28 absPos = getAbsPose(body2World, shapeSim.mTransform, body2Actor);
+            updateCacheAndBoundBda(absPos, shapeSim, shapeIndex, cacheArray, boundsArray, convexShapes, true);
+            updated[shapeIndex] = 1u;
+        }
+        pos--;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The velocity setters (updateBodiesAndShapes.cu:1179 / :1204).
+//
+// ENGINE launch pack, identical for both (:2986 / :3008):
+//   (const PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//    const PxgUpdateActorDataDesc* updateActorDataDesc,
+//    PxgBodySimVelocities* prevVelocities, PxU32 nbElements)
+// -> argSizes {8,8,8,8,4} = 36, rounded to a 40-byte blob.
+//
+// v = (data.xyz, pool.w): the inverse mass / max penetration bias survives.  The
+// SAME float4, w included, goes to prevVelocities[index] when that pointer is not
+// null -- it is null whenever eENABLE_BODY_ACCELERATIONS is off, and the CUDA's
+// `if (prevVelocities)` is the test below.
+// ---------------------------------------------------------------------------
+struct RigidSetVelParams
+{
+    uint64_t data;                // @0  const PxVec3*  (user device memory)
+    uint64_t gpuIndices;          // @8  const PxRigidDynamicGPUIndex*
+    uint64_t updateActorDataDesc; // @16 const PxgUpdateActorDataDesc*
+    uint64_t prevVelocities;      // @24 PxgBodySimVelocities* (may be 0)
+    uint nbElements;              // @32 (+4 pad -> 40)
+};
+
+[[vk::push_constant]]
+ConstantBuffer<RigidSetVelParams> gRigidSetVel;
+
+void rigidSetVelocity(uint i, uint word)
+{
+    const PxgUpdateActorDataDescGpu desc = (Ptr<PxgUpdateActorDataDescGpu>(gRigidSetVel.updateActorDataDesc))[0];
+    Ptr<uint> pool = Ptr<uint>(desc.mBodySimBufferDeviceData);
+    const uint index = (Ptr<uint>(gRigidSetVel.gpuIndices))[i];
+    const uint base = index * BODYSIM_WORDS + word;
+
+    Ptr<uint> data = Ptr<uint>(gRigidSetVel.data);
+    const uint x = data[i * 3 + 0];
+    const uint y = data[i * 3 + 1];
+    const uint z = data[i * 3 + 2];
+    const uint w = pool[base + 3];
+
+    pool[base + 0] = x;
+    pool[base + 1] = y;
+    pool[base + 2] = z;
+    pool[base + 3] = w;
+
+    if (gRigidSetVel.prevVelocities != 0)
+    {
+        Ptr<uint> prev = Ptr<uint>(gRigidSetVel.prevVelocities);
+        const uint prevBase = index * PREV_VEL_WORDS + word;
+        prev[prevBase + 0] = x;
+        prev[prevBase + 1] = y;
+        prev[prevBase + 2] = z;
+        prev[prevBase + 3] = w;
+    }
+}
+
+// mirrors setRigidDynamicLinearVelocity()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicLinearVelocity(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidSetVel.nbElements)
+        return;
+    rigidSetVelocity(i, W_LINVEL);
+}
+
+// mirrors setRigidDynamicAngularVelocity()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicAngularVelocity(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidSetVel.nbElements)
+        return;
+    rigidSetVelocity(i, W_ANGVEL);
+}
+
+// ---------------------------------------------------------------------------
+// The force and torque setters (updateBodiesAndShapes.cu:1229 / :1253).
+//
+// ENGINE launch pack, identical for both (:3027 / :3042):
+//   (const PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//    const PxgUpdateActorDataDesc* updateActorDataDesc, PxU32 nbElements)
+// -> argSizes {8,8,8,4} = 28, rounded to a 32-byte blob.  The same SHAPE as
+// RigidGetParams, but slot 2 is the update-actor desc, not the pool.
+//
+// Both ASSIGN an acceleration (w = 0.f); neither accumulates.  The force becomes
+// force * invMass; the torque becomes (R diag(invI) R^T) * torque with R the
+// body's world rotation (Cm::transformInertiaTensor(invI, PxMat33(body2World.q))).
+// ---------------------------------------------------------------------------
+struct RigidSetForceParams
+{
+    uint64_t data;                // @0  const PxVec3*  (user device memory)
+    uint64_t gpuIndices;          // @8  const PxRigidDynamicGPUIndex*
+    uint64_t updateActorDataDesc; // @16 const PxgUpdateActorDataDesc*
+    uint nbElements;              // @24 (+4 pad -> 32)
+};
+
+[[vk::push_constant]]
+ConstantBuffer<RigidSetForceParams> gRigidSetForce;
+
+// mirrors setRigidDynamicForce()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicForce(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidSetForce.nbElements)
+        return;
+
+    const PxgUpdateActorDataDescGpu desc = (Ptr<PxgUpdateActorDataDescGpu>(gRigidSetForce.updateActorDataDesc))[0];
+    Ptr<uint> pool = Ptr<uint>(desc.mBodySimBufferDeviceData);
+    const uint index = (Ptr<uint>(gRigidSetForce.gpuIndices))[i];
+    const uint base = index * BODYSIM_WORDS;
+
+    Ptr<float> data = Ptr<float>(gRigidSetForce.data);
+    const float3 force = float3(data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]);
+    const float invMass = asfloat(pool[base + W_LINVEL + 3]);
+
+    const float3 deltaLin = force * invMass;
+    storeF4Ptr(pool, base + W_EXT_LIN_ACCEL, float4(deltaLin, 0.0f));
+}
+
+// mirrors setRigidDynamicTorque()
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicTorque(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidSetForce.nbElements)
+        return;
+
+    const PxgUpdateActorDataDescGpu desc = (Ptr<PxgUpdateActorDataDescGpu>(gRigidSetForce.updateActorDataDesc))[0];
+    Ptr<uint> pool = Ptr<uint>(desc.mBodySimBufferDeviceData);
+    const uint index = (Ptr<uint>(gRigidSetForce.gpuIndices))[i];
+    const uint base = index * BODYSIM_WORDS;
+
+    Ptr<float> data = Ptr<float>(gRigidSetForce.data);
+    const float3 torque = float3(data[i * 3 + 0], data[i * 3 + 1], data[i * 3 + 2]);
+    const float3 invInertia = loadF4Ptr(pool, base + W_INV_INERTIA).xyz;
+    const float4 q = loadF4Ptr(pool, base + W_BODY2WORLD);
+
+    const PxgMat33 inverseInertiaWorldSpace = transformInertiaTensor(invInertia, mat33FromQuat(q));
+    const float3 deltaAng = mat33Transform(inverseInertiaWorldSpace, torque);
+    storeF4Ptr(pool, base + W_EXT_ANG_ACCEL, float4(deltaAng, 0.0f));
 }
 
 // ---------------------------------------------------------------------------

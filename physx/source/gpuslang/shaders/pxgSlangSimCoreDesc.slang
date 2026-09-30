@@ -82,6 +82,17 @@ public struct PxgSimulationCoreDescGpu
     public uint mTotalUnfrozenShapes;           // @148
 }                                               // = 152
 
+// mirrors PxgUpdatedBodiesDesc (PxgSimulationCoreDesc.h:316, 24 bytes incl. 4
+// tail-padding bytes; P9.93, for updateBodyExternalVelocitiesLaunch).  NOTE the
+// pointer order is the REVERSE of PxgNewBodiesDesc: the pool comes FIRST here.
+// Pinned by static_asserts in tests/testBodyUpdate.cpp.
+public struct PxgUpdatedBodiesDescGpu
+{
+    public uint64_t mBodySimBufferDeviceData; // @0  PxgBodySim*
+    public uint64_t mUpdatedBodySim;          // @8  const PxgBodySimVelocityUpdate*
+    public uint mNbUpdatedBodies;             // @16 (+4 bytes pad -> 24)
+}
+
 // mirrors PxgNewBodiesDesc (24 bytes incl. 4 tail-padding bytes; only ever
 // dereferenced as desc[0])
 public struct PxgNewBodiesDescGpu
@@ -98,7 +109,9 @@ public struct PxgNewBodiesDescGpu
 //
 // P9.79 added it for mergeChangedAABBMgrHandlesLaunch, which is launched from
 // ScPipeline.cpp:355 under `if (isDirectGPUAPIInitialized())` and nowhere else.
-// Its offsets are pinned by testSimCoreDescLayout, like every other mirror here.
+// Its offsets are pinned against the real struct by static_asserts in
+// tests/testDirectApiBdaWrite.cpp (every field and the size, P9.93) -- NOT by
+// testSimCoreDescLayout, as this comment said until P9.93.
 public struct PxgUpdateActorDataDescGpu
 {
     public uint64_t mBodySimBufferDeviceData;   // @0  PxgBodySim*

@@ -63,18 +63,11 @@ ABI = os.path.join(ROOT, "physx", "source", "gpuslang", "bridge",
 # name here is a kernel that WOULD be refused if the engine launched it.  The
 # list may shrink; a name that is not on it and has no ABI row fails the check.
 KNOWN_UNWIRED = {
-    # simulation core / direct API
-    "updateBodyExternalVelocitiesLaunch",
-    # P9.79 wired the three direct-API GETTERS the first direct-GPU-API scene
-    # actually launches (getRigidDynamicGlobalPose / LinearVelocity /
-    # AngularVelocity) and updateBodiesLaunchDirectAPI, and re-pointed them at
-    # directApiBda.spv.  What is left here is what PXG_SCENE=directapi does not
-    # yet drive: the SETTERS, and the two acceleration getters, which need
-    # PxSceneFlag::eENABLE_BODY_ACCELERATIONS on top of the direct-API flag.
-    "getRigidDynamicLinearAcceleration",
-    "getRigidDynamicAngularAcceleration", "setRigidDynamicGlobalPose",
-    "setRigidDynamicLinearVelocity", "setRigidDynamicAngularVelocity",
-    "setRigidDynamicForce", "setRigidDynamicTorque",
+    # (P9.79 wired the three direct-API getters PXG_SCENE=directapi launches and
+    # updateBodiesLaunchDirectAPI; P9.93 wired the rest of the rigid direct API --
+    # the five setters and the two acceleration getters -- behind
+    # PXG_SCENE=directapiwrite, and updateBodyExternalVelocitiesLaunch, reached only
+    # by PxRigidDynamic::addForce / addTorque & co., behind PXG_SCENE=extforce.)
     # (P9.91 wired the threshold / force-change stream -- all twelve, plus the two
     # radix kernels that were not mapped at all -- behind PXG_SCENE=forcethreshold.)
     # solver / sort odds and ends.  P9.79 wired radixSortCopyBits2 and

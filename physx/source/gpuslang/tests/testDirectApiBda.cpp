@@ -601,8 +601,9 @@ PXG_TEST(directApiMergeAabb)
     auto mk = [&](auto const& vec) { PxgBufferHandle h = createBufferFrom(dev, vec); all.push_back(h); return h; };
 
     // PxgUpdateActorDataDesc byte layout (PxgSimulationCoreDesc.h:375, 80 B).
-    // These offsets are the ones pxgSlangSimCoreDesc.slang mirrors; the
-    // simCoreDescLayout suite pins them against the real struct.
+    // These offsets are the ones pxgSlangSimCoreDesc.slang mirrors; the four
+    // this test uses are pinned below, every field in testDirectApiBdaWrite.cpp
+    // (P9.93; the simCoreDescLayout suite never pinned this struct).
     const uint32_t SZ_UPDATE_ACTOR_DESC = 80u;
     const uint32_t UAD_UPDATED = 48u, UAD_CHANGED = 56u, UAD_WORDCOUNTS = 64u;
     static_assert(sizeof(physx::PxgUpdateActorDataDesc) == 80u, "PxgUpdateActorDataDesc size");

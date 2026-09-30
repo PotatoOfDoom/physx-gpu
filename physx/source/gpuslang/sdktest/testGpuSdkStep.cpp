@@ -1545,11 +1545,13 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
 // evaluatePointDistancesSDFBatch.  Not "rarely reached" -- UNREACHABLE, in every
 // one of the forty-nine scenes this harness had before today.
 //
-// And the twelve direct-API rigid getters and setters that ARE ported
+// And the twelve direct-API rigid getters and setters that WERE ported
 // (shaders/directApi.slang, plus setRigidDynamicGlobalPose in updateBounds.slang)
-// sit in check_launch_abi.py's KNOWN_UNWIRED list for the same reason: they have no
-// row in bridge/PxgVulkanKernelAbi.cpp, so pushConstantSizeFor() returns 0 and the
-// shim refuses every launch.  Nobody noticed, because nothing launched them.
+// sat in check_launch_abi.py's KNOWN_UNWIRED list for the same reason: they had no
+// row in bridge/PxgVulkanKernelAbi.cpp, so pushConstantSizeFor() returned 0 and the
+// shim refused every launch.  Nobody noticed, because nothing launched them.  This
+// scene wired the three getters it reads (P9.79); PXG_SCENE=directapiwrite wired
+// the five setters and the two acceleration getters (P9.93).
 //
 // *** WHAT MAKES A REFUSAL VISIBLE HERE. ***
 //
@@ -1636,6 +1638,130 @@ DirectApiScene buildDirectApiScene(PxPhysics* physics, PxScene* scene, PxMateria
     s.joint->setMotion(PxD6Axis::eTWIST, PxD6Motion::eLOCKED);
     s.joint->setMotion(PxD6Axis::eSWING1, PxD6Motion::eLOCKED);
     s.joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
+    return s;
+}
+
+// PXG_SCENE=directapiwrite (P9.93): the WRITE half of the direct-GPU API, and the
+// two ACCELERATION getters.
+//
+// PXG_SCENE=directapi only reads.  PxDirectGPUAPI::setRigidDynamicData (five
+// kernels: eGLOBAL_POSE, eLINEAR_VELOCITY, eANGULAR_VELOCITY, eFORCE, eTORQUE) and
+// the eLINEAR_/eANGULAR_ACCELERATION reads -- live only under
+// PxSceneFlag::eENABLE_BODY_ACCELERATIONS on top of the direct-API flag -- were
+// never launched by anything, so none of the seven had a launch-ABI row.
+//
+// *** WHAT MAKES A REFUSED SETTER VISIBLE. ***  A setter returns a bool the
+// launch result cannot reach: without a finish event PxgSimulationCore replaces it
+// with the streamSynchronize result.  So every setter is judged by what it DID --
+// through the already-wired getters immediately, and through the physics after
+// sixty more steps -- and every read goes through poisoned device memory.
+//
+// Seven 1000 kg boxes (inverse inertia 0.006 about every axis) free-fall from y=20
+// at x = -10, -6, -2, 2, 6, 10, 14, far from each other and from the ground.  One
+// warm-up step (the direct API refuses every call before the first simulate
+// completes), then ONE write window, then sixty steps:
+//
+//   T  (x=-10) teleported by eGLOBAL_POSE to (-10, 0.5, 3), yawed 45 degrees: it
+//              must END on the ground there, yawed.
+//   T2 (x=-6)  teleported in the SAME call (two elements, reversed index order) to
+//              (-6, 30, -4), rolled 90 degrees: the teleport keeps its velocity, so it
+//              ends at y = 30 - 0.1635 - 4.98675 = 24.84975, still rolled.
+//   V  (x=-2)  eLINEAR_VELOCITY (4, 0, -2), batched with R's own velocity written
+//              back to it (the 12-byte stride): ends at (2, 15.010525, -2).
+//   W  (x=2)   eANGULAR_VELOCITY (0, 3, 0), batched with R's: 3 rad about y.
+//   F  (x=6)   eFORCE twice, 10000 N then 5000 N along z.  The kernel ASSIGNS, so only
+//              5000 N counts: a = 5 m/s^2 for one step, v_z = 0.0833333, z = 0.0833333.
+//   Q  (x=10)  eTORQUE 30000 N m about z: alpha = 180 rad/s^2 for one step,
+//              omega_z = 3, 3 rad after sixty steps.
+//   R  (x=14)  the reference: nothing written; it drops 5.152975 in 61 steps.
+//
+// The acceleration getters are read after the warm-up (R: (0, -9.81, 0) from a
+// zeroed previous-velocity buffer), right after the velocity writes (exactly 0: the
+// setters also write the previous velocity), and after the next two steps (F's
+// force for one step only, Q's torque likewise).
+//
+// Every body keeps linear damping 0; W, Q and R also get angular damping 0 (the
+// default 0.05 would bleed the spin), and all seven a sleep threshold of 0, so no
+// body the setters touch can be asleep: a setter does not wake anything.
+struct DirectApiWriteScene
+{
+    PxRigidDynamic* T;
+    PxRigidDynamic* T2;
+    PxRigidDynamic* V;
+    PxRigidDynamic* W;
+    PxRigidDynamic* F;
+    PxRigidDynamic* Q;
+    PxRigidDynamic* R;
+};
+
+DirectApiWriteScene buildDirectApiWriteScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    DirectApiWriteScene s = {};
+    addGroundBox(physics, scene, material);
+    auto body = [&](float x) {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), 20.0f, x);
+        b->setSleepThreshold(0.0f);
+        b->setAngularDamping(0.0f);
+        return b;
+    };
+    s.T = body(-10.0f);
+    s.T2 = body(-6.0f);
+    s.V = body(-2.0f);
+    s.W = body(2.0f);
+    s.F = body(6.0f);
+    s.Q = body(10.0f);
+    s.R = body(14.0f);
+    return s;
+}
+
+// PXG_SCENE=extforce (P9.93): updateBodyExternalVelocitiesLaunch.
+//
+// PxgSimulationCore::updateBodies launches it only when nbUpdatedBodies > 0 and the
+// direct-GPU API is OFF (PxgSimulationCore.cpp:2313), and nbUpdatedBodies counts the
+// bodies Sc::Scene::beforeSolver collected from BodySim::updateForces -- which only
+// PxRigidDynamic::addForce / addTorque / setForceAndTorque / clearForce /
+// clearTorque feed (setLinearVelocity takes the updateBodySim path instead).  No
+// scene called any of them, so the kernel never launched.
+//
+// autowake = FALSE on every call, and that is not a detail: with the default `true`
+// an awake body whose wake counter sits below 0.4 -- every falling body on the GPU,
+// whose counter lives between 0.2 and 0.4 -- is ALSO pushed through setWakeCounter
+// -> updateBodySim -> updateBodiesLaunch, which rewrites the same post-kick velocity
+// and would hide a refused kernel completely.
+//
+// Four 1000 kg boxes (inverse inertia 0.006) free-fall from y=100 and never touch
+// anything in sixty steps (they drop 4.98675):
+//   K (x=0)   before step 30: addForce((3,0,0), eVELOCITY_CHANGE): x = 1.5.
+//   F (x=5)   before each of steps 30..59: addForce((0,0,2000), eFORCE) = 2 m/s^2:
+//             v_z = 1.0, z = 2 dt^2 (30*31/2) = 0.258333.
+//   S (x=10)  before step 30: addTorque((0,500,0), eIMPULSE): omega_y = 0.006*500 = 3,
+//             1.5 rad about y after thirty steps.  Angular damping 0.
+//   C (x=-5)  untouched: x = z = 0.
+// If the kernel is refused, the kick sits in the CPU core only and the next GPU
+// writeback overwrites it: K.x = 0, F.z = 0, S.omega = 0.
+struct ExtForceScene
+{
+    PxRigidDynamic* K;
+    PxRigidDynamic* F;
+    PxRigidDynamic* S;
+    PxRigidDynamic* C;
+};
+
+ExtForceScene buildExtForceScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    ExtForceScene s = {};
+    addGroundBox(physics, scene, material);
+    auto body = [&](float x) {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), 100.0f, x);
+        b->setAngularDamping(0.0f);
+        return b;
+    };
+    s.K = body(0.0f);
+    s.F = body(5.0f);
+    s.S = body(10.0f);
+    s.C = body(-5.0f);
     return s;
 }
 
@@ -6320,6 +6446,27 @@ int main()
             std::printf("  [ P9.79 ] eENABLE_DIRECT_GPU_API raised: host writeback is OFF, the "
                         "direct-API getters are the only way to see the simulation\n");
         }
+        // P9.93 -- PXG_SCENE=directapiwrite needs eENABLE_BODY_ACCELERATIONS as well:
+        // without it the previous-velocity buffer is never allocated and the
+        // acceleration getters dereference a null pointer (the host only asserts).
+        // Its control (PXG_DIRECTAPI_CONTROL=1) keeps the accelerations and drops the
+        // direct API, and drives the same writes through the ordinary CPU setters.
+        if (sn && !std::strcmp(sn, "directapiwrite"))
+        {
+            sceneDesc.flags |= PxSceneFlag::eENABLE_BODY_ACCELERATIONS;
+            if (!std::getenv("PXG_DIRECTAPI_CONTROL"))
+            {
+                if (cpuControl)
+                {
+                    std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=directapiwrite requires the GPU pipeline; "
+                                "PXG_CPU_CONTROL=1 needs PXG_DIRECTAPI_CONTROL=1 as well\n");
+                    physics->release(); cudaCtx->release(); foundation->release();
+                    return 1;
+                }
+                sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+                std::printf("  [ P9.93 ] eENABLE_DIRECT_GPU_API | eENABLE_BODY_ACCELERATIONS raised\n");
+            }
+        }
         if (sn && !std::strcmp(sn, "forcethreshold"))
             gForceThresholdPairs = true;
     }
@@ -9327,6 +9474,279 @@ int main()
         return 2;
     }
 
+    if (!std::strcmp(sceneName, "extforce"))
+    {
+        ExtForceScene es = buildExtForceScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'extforce' built: four free-falling 1000 kg boxes, three of them "
+                    "kicked through addForce / addTorque (autowake=false)\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: extforce pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        for (int i = 0; i < 60; ++i)
+        {
+            if (i == 30)
+            {
+                es.K->addForce(PxVec3(3.0f, 0.0f, 0.0f), PxForceMode::eVELOCITY_CHANGE, false);
+                es.S->addTorque(PxVec3(0.0f, 500.0f, 0.0f), PxForceMode::eIMPULSE, false);
+            }
+            if (i >= 30)
+                es.F->addForce(PxVec3(0.0f, 0.0f, 2000.0f), PxForceMode::eFORCE, false);
+            scene->simulate(dt);
+            scene->fetchResults(true);
+        }
+        const PxVec3 kP = es.K->getGlobalPose().p, kV = es.K->getLinearVelocity();
+        const PxVec3 fP = es.F->getGlobalPose().p, fV = es.F->getLinearVelocity();
+        const PxQuat sQ = es.S->getGlobalPose().q;
+        const PxVec3 sW = es.S->getAngularVelocity();
+        const PxVec3 cP = es.C->getGlobalPose().p;
+        std::printf("  K p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", kP.x, kP.y, kP.z, kV.x, kV.y, kV.z);
+        std::printf("  F p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", fP.x, fP.y, fP.z, fV.x, fV.y, fV.z);
+        std::printf("  S q=(%.6f, %.6f, %.6f, %.6f) w=(%.6f, %.6f, %.6f)\n", sQ.x, sQ.y, sQ.z, sQ.w, sW.x, sW.y, sW.z);
+        std::printf("  C p=(%.6f, %.6f, %.6f)\n", cP.x, cP.y, cP.z);
+
+        int failures = 0;
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        const float yEnd = 100.0f - 4.98675f;   // g dt^2 * 60*61/2
+        near("K.x", kP.x, 1.5f, 1e-3f);         near("K.v.x", kV.x, 3.0f, 1e-4f);
+        near("K.y", kP.y, yEnd, 2e-3f);         near("K.z", kP.z, 0.0f, 1e-5f);
+        near("F.z", fP.z, 0.258333f, 1e-4f);    near("F.v.z", fV.z, 1.0f, 1e-4f);
+        near("F.x", fP.x, 5.0f, 1e-5f);         near("F.y", fP.y, yEnd, 2e-3f);
+        near("S.w.y", sW.y, 3.0f, 1e-4f);       near("S.w.x", sW.x, 0.0f, 1e-5f);
+        near("S.w.z", sW.z, 0.0f, 1e-5f);
+        near("S.q.y", std::fabs(sQ.y), 0.6816388f, 1e-3f);
+        near("S.q.w", std::fabs(sQ.w), 0.7316889f, 1e-3f);
+        near("C.x", cP.x, -5.0f, 1e-5f);        near("C.z", cP.z, 0.0f, 1e-5f);
+        near("C.y", cP.y, yEnd, 2e-3f);
+        failures += unmappedPenalty();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: addForce / addTorque reached the GPU bodies: K moved %.4f, F "
+                        "drifted %.4f along z, S spins at %.4f rad/s\n", kP.x, fP.z, sW.y);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'extforce': %d check(s) failed\n", failures);
+        return 2;
+    }
+
+    if (!std::strcmp(sceneName, "directapiwrite"))
+    {
+        DirectApiWriteScene ws = buildDirectApiWriteScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'directapiwrite' built: seven free-falling 1000 kg boxes, one write "
+                    "window through PxDirectGPUAPI::setRigidDynamicData\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: directapiwrite pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const PxQuat qT(0.0f, 0.38268343f, 0.0f, 0.92387953f);   // 45 degrees about y
+        const PxQuat qT2(0.70710677f, 0.0f, 0.0f, 0.70710677f);  // 90 degrees about x
+        const PxVec3 pT(-10.0f, 0.5f, 3.0f), pT2(-6.0f, 30.0f, -4.0f);
+
+        // PXG_DIRECTAPI_CONTROL=1: the same writes through the ORDINARY CPU setters,
+        // with the direct API off.  Reported, never scored (addForce accumulates on
+        // the CPU, so the double eFORCE write has no twin there).
+        if (std::getenv("PXG_DIRECTAPI_CONTROL"))
+        {
+            scene->simulate(dt); scene->fetchResults(true);
+            ws.T2->setGlobalPose(PxTransform(pT2, qT2));
+            ws.T->setGlobalPose(PxTransform(pT, qT));
+            ws.V->setLinearVelocity(PxVec3(4.0f, 0.0f, -2.0f));
+            ws.W->setAngularVelocity(PxVec3(0.0f, 3.0f, 0.0f));
+            ws.F->addForce(PxVec3(0.0f, 0.0f, 5000.0f));
+            ws.Q->addTorque(PxVec3(0.0f, 0.0f, 30000.0f));
+            scene->simulate(dt); scene->fetchResults(true);
+            const PxVec3 fa = ws.F->getLinearAcceleration(), qa = ws.Q->getAngularAcceleration();
+            std::printf("  [ control ] after the write step: F accel=(%.5f, %.5f, %.5f)  Q ang accel=(%.4f, %.4f, %.4f)\n",
+                        fa.x, fa.y, fa.z, qa.x, qa.y, qa.z);
+            for (int i = 2; i < 61; ++i) { scene->simulate(dt); scene->fetchResults(true); }
+            const PxRigidDynamic* bodies[7] = { ws.T, ws.T2, ws.V, ws.W, ws.F, ws.Q, ws.R };
+            const char* names[7] = { "T", "T2", "V", "W", "F", "Q", "R" };
+            for (int b = 0; b < 7; ++b)
+            {
+                const PxTransform t = bodies[b]->getGlobalPose();
+                std::printf("  [ control ] %-2s p=(%.6f, %.6f, %.6f) q=(%.6f, %.6f, %.6f, %.6f)\n", names[b],
+                            t.p.x, t.p.y, t.p.z, t.q.x, t.q.y, t.q.z, t.q.w);
+            }
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            std::printf("[ control ] gpu-sdk-step: directapiwrite control run, not scored\n");
+            return 0;
+        }
+
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        PxDirectGPUAPI& api = scene->getDirectGPUAPI();
+        static const float POISON = -999.0f;
+        const size_t MAX_FLOATS = 64;
+        CUdeviceptr devIdx = 0, devData = 0;
+        if (ctx->memAlloc(&devIdx, 8 * sizeof(PxU32)) != 0 || !devIdx ||
+            ctx->memAlloc(&devData, MAX_FLOATS * sizeof(float)) != 0 || !devData)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: directapiwrite memAlloc failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        int failures = 0;
+        // A read of `per` floats for each index, into poisoned memory with ONE extra
+        // poisoned slot past the end: a refused kernel leaves the poison, a kernel with
+        // the wrong element stride writes past the end.
+        auto rd = [&](PxRigidDynamicGPUAPIReadType::Enum type, std::vector<PxU32> idx, size_t per,
+                      const char* what) -> std::vector<float>
+        {
+            const size_t n = idx.size() * per;
+            std::vector<float> host(n + 1, POISON);
+            ctx->memcpyHtoD(devData, host.data(), (n + 1) * sizeof(float));
+            ctx->memcpyHtoD(devIdx, idx.data(), idx.size() * sizeof(PxU32));
+            const bool ok = api.getRigidDynamicData(reinterpret_cast<void*>(devData),
+                                                    reinterpret_cast<const PxRigidDynamicGPUIndex*>(devIdx),
+                                                    type, PxU32(idx.size()));
+            ctx->memcpyDtoH(host.data(), devData, (n + 1) * sizeof(float));
+            if (!ok) { std::printf("FAIL: %s: getRigidDynamicData returned false\n", what); ++failures; }
+            for (size_t i = 0; i < n; ++i)
+                if (host[i] == POISON)
+                { std::printf("FAIL: %s: element float %zu still holds the poison\n", what, i); ++failures; break; }
+            if (host[n] != POISON)
+            { std::printf("FAIL: %s: the slot past the end was written\n", what); ++failures; }
+            host.resize(n);
+            return host;
+        };
+        auto wr = [&](PxRigidDynamicGPUAPIWriteType::Enum type, std::vector<PxU32> idx,
+                      std::vector<float> data, const char* what)
+        {
+            ctx->memcpyHtoD(devData, data.data(), data.size() * sizeof(float));
+            ctx->memcpyHtoD(devIdx, idx.data(), idx.size() * sizeof(PxU32));
+            if (!api.setRigidDynamicData(reinterpret_cast<const void*>(devData),
+                                         reinterpret_cast<const PxRigidDynamicGPUIndex*>(devIdx),
+                                         type, PxU32(idx.size())))
+            { std::printf("FAIL: %s: setRigidDynamicData returned false\n", what); ++failures; }
+        };
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        auto same = [&](const char* what, const std::vector<float>& got, const std::vector<float>& want) {
+            for (size_t i = 0; i < want.size(); ++i)
+                if (!(got[i] == want[i]))
+                { std::printf("FAIL: %s[%zu] = %.8g, expected exactly %.8g\n", what, i, got[i], want[i]);
+                  ++failures; return; }
+        };
+        using RT = PxRigidDynamicGPUAPIReadType;
+        using WT = PxRigidDynamicGPUAPIWriteType;
+        const PxU32 iT = ws.T->getGPUIndex(), iT2 = ws.T2->getGPUIndex(), iV = ws.V->getGPUIndex(),
+                    iW = ws.W->getGPUIndex(), iF = ws.F->getGPUIndex(), iQ = ws.Q->getGPUIndex(),
+                    iR = ws.R->getGPUIndex();
+        std::printf("  gpuIndex T=%u T2=%u V=%u W=%u F=%u Q=%u R=%u\n", iT, iT2, iV, iW, iF, iQ, iR);
+
+        // ---- step 1: the warm-up (every direct call is refused before it) ----
+        scene->simulate(dt); scene->fetchResults(true);
+        const std::vector<float> aR1 = rd(RT::eLINEAR_ACCELERATION, { iR }, 3, "R lin accel after warm-up");
+        std::printf("  after warm-up: R lin accel=(%.5f, %.5f, %.5f)\n", aR1[0], aR1[1], aR1[2]);
+        near("R lin accel.y after warm-up", aR1[1], -9.81f, 1e-3f);
+        near("R lin accel.x after warm-up", aR1[0], 0.0f, 1e-5f);
+        const std::vector<float> vR = rd(RT::eLINEAR_VELOCITY, { iR }, 3, "R lin vel");
+        const std::vector<float> wR = rd(RT::eANGULAR_VELOCITY, { iR }, 3, "R ang vel");
+
+        // ---- the write window ----
+        const std::vector<float> poses = { qT2.x, qT2.y, qT2.z, qT2.w, pT2.x, pT2.y, pT2.z,
+                                           qT.x, qT.y, qT.z, qT.w, pT.x, pT.y, pT.z };
+        wr(WT::eGLOBAL_POSE, { iT2, iT }, poses, "pose T2,T");
+        same("pose read-back T2,T", rd(RT::eGLOBAL_POSE, { iT2, iT }, 7, "pose read-back"), poses);
+
+        const std::vector<float> vel = { 4.0f, 0.0f, -2.0f, vR[0], vR[1], vR[2] };
+        wr(WT::eLINEAR_VELOCITY, { iV, iR }, vel, "lin vel V,R");
+        same("lin vel read-back V,R", rd(RT::eLINEAR_VELOCITY, { iV, iR }, 3, "lin vel read-back"), vel);
+        same("lin accel right after the write V,R",
+             rd(RT::eLINEAR_ACCELERATION, { iV, iR }, 3, "lin accel after write"), { 0, 0, 0, 0, 0, 0 });
+
+        const std::vector<float> ang = { 0.0f, 3.0f, 0.0f, wR[0], wR[1], wR[2] };
+        wr(WT::eANGULAR_VELOCITY, { iW, iR }, ang, "ang vel W,R");
+        same("ang vel read-back W,R", rd(RT::eANGULAR_VELOCITY, { iW, iR }, 3, "ang vel read-back"), ang);
+        same("ang accel right after the write W,R",
+             rd(RT::eANGULAR_ACCELERATION, { iW, iR }, 3, "ang accel after write"), { 0, 0, 0, 0, 0, 0 });
+
+        wr(WT::eFORCE, { iF }, { 0.0f, 0.0f, 10000.0f }, "force F (first)");
+        wr(WT::eFORCE, { iF }, { 0.0f, 0.0f, 5000.0f }, "force F (second, the one that counts)");
+        wr(WT::eTORQUE, { iQ }, { 0.0f, 0.0f, 30000.0f }, "torque Q");
+
+        // ---- step 2: force and torque act for this one step ----
+        scene->simulate(dt); scene->fetchResults(true);
+        const std::vector<float> aF2 = rd(RT::eLINEAR_ACCELERATION, { iF }, 3, "F lin accel step 2");
+        const std::vector<float> wQ2 = rd(RT::eANGULAR_VELOCITY, { iQ }, 3, "Q ang vel step 2");
+        const std::vector<float> aQ2 = rd(RT::eANGULAR_ACCELERATION, { iQ }, 3, "Q ang accel step 2");
+        const std::vector<float> vV2 = rd(RT::eLINEAR_VELOCITY, { iV }, 3, "V lin vel step 2");
+        const std::vector<float> aV2 = rd(RT::eLINEAR_ACCELERATION, { iV }, 3, "V lin accel step 2");
+        const std::vector<float> wW2 = rd(RT::eANGULAR_VELOCITY, { iW }, 3, "W ang vel step 2");
+        const std::vector<float> aW2 = rd(RT::eANGULAR_ACCELERATION, { iW }, 3, "W ang accel step 2");
+        std::printf("  step 2: F accel=(%.5f, %.5f, %.5f)  Q w=(%.5f, %.5f, %.5f) alpha=(%.3f, %.3f, %.3f)\n",
+                    aF2[0], aF2[1], aF2[2], wQ2[0], wQ2[1], wQ2[2], aQ2[0], aQ2[1], aQ2[2]);
+        near("F lin accel.z step 2 (5000 N / 1000 kg; 15 would mean it accumulated)", aF2[2], 5.0f, 1e-3f);
+        near("F lin accel.y step 2", aF2[1], -9.81f, 1e-3f);
+        near("Q ang vel.z step 2", wQ2[2], 3.0f, 1e-4f);
+        near("Q ang accel.z step 2", aQ2[2], 180.0f, 1e-2f);
+        near("V lin vel.x step 2", vV2[0], 4.0f, 1e-5f);
+        near("V lin vel.y step 2", vV2[1], -0.1635f, 1e-4f);
+        near("V lin vel.z step 2", vV2[2], -2.0f, 1e-5f);
+        near("V lin accel.y step 2", aV2[1], -9.81f, 1e-3f);
+        near("V lin accel.x step 2", aV2[0], 0.0f, 1e-3f);
+        near("W ang vel.y step 2", wW2[1], 3.0f, 1e-4f);
+        near("W ang accel.y step 2", aW2[1], 0.0f, 1e-3f);
+
+        // ---- step 3: both were one-step accelerations ----
+        scene->simulate(dt); scene->fetchResults(true);
+        const std::vector<float> aF3 = rd(RT::eLINEAR_ACCELERATION, { iF }, 3, "F lin accel step 3");
+        const std::vector<float> vF3 = rd(RT::eLINEAR_VELOCITY, { iF }, 3, "F lin vel step 3");
+        const std::vector<float> aQ3 = rd(RT::eANGULAR_ACCELERATION, { iQ }, 3, "Q ang accel step 3");
+        near("F lin accel.z step 3 (the force lasts one step)", aF3[2], 0.0f, 1e-3f);
+        near("F lin vel.z step 3", vF3[2], 5.0f / 60.0f, 1e-5f);
+        near("Q ang accel.z step 3 (the torque lasts one step)", aQ3[2], 0.0f, 1e-2f);
+
+        // ---- 58 more steps: sixty after the write window ----
+        for (int i = 3; i < 61; ++i) { scene->simulate(dt); scene->fetchResults(true); }
+        const std::vector<float> fin = rd(RT::eGLOBAL_POSE, { iT, iT2, iV, iW, iF, iQ, iR }, 7, "final poses");
+        ctx->memFree(devIdx);
+        ctx->memFree(devData);
+        const char* names[7] = { "T", "T2", "V", "W", "F", "Q", "R" };
+        for (int b = 0; b < 7; ++b)
+            std::printf("  %-2s p=(%.6f, %.6f, %.6f) q=(%.6f, %.6f, %.6f, %.6f)\n", names[b],
+                        fin[b * 7 + 4], fin[b * 7 + 5], fin[b * 7 + 6],
+                        fin[b * 7 + 0], fin[b * 7 + 1], fin[b * 7 + 2], fin[b * 7 + 3]);
+        auto P = [&](int b, int c) { return fin[b * 7 + 4 + c]; };
+        auto Qc = [&](int b, int c) { return fin[b * 7 + c]; };
+        const float yFree61 = 20.0f - 5.152975f;       // g dt^2 * 61*62/2
+        near("T.x", P(0, 0), -10.0f, 0.05f);  near("T.y (rests on the ground)", P(0, 1), 0.5f, 0.05f);
+        near("T.z", P(0, 2), 3.0f, 0.05f);
+        near("T.q.y", std::fabs(Qc(0, 1)), 0.38268343f, 1e-2f); near("T.q.w", std::fabs(Qc(0, 3)), 0.92387953f, 1e-2f);
+        near("T2.x", P(1, 0), -6.0f, 1e-4f);  near("T2.y", P(1, 1), 24.84975f, 2e-3f);
+        near("T2.z", P(1, 2), -4.0f, 1e-4f);
+        near("T2.q.x", std::fabs(Qc(1, 0)), 0.70710677f, 1e-4f); near("T2.q.w", std::fabs(Qc(1, 3)), 0.70710677f, 1e-4f);
+        near("V.x", P(2, 0), 2.0f, 1e-3f);    near("V.y", P(2, 1), 15.010525f, 2e-3f);
+        near("V.z", P(2, 2), -2.0f, 1e-3f);
+        near("W.q.y", std::fabs(Qc(3, 1)), 0.9974950f, 2e-3f); near("W.q.w", std::fabs(Qc(3, 3)), 0.0707372f, 2e-3f);
+        near("W.y", P(3, 1), yFree61, 2e-3f);
+        near("F.z", P(4, 2), 5.0f / 60.0f, 1e-4f); near("F.y", P(4, 1), yFree61, 2e-3f);
+        near("Q.q.z", std::fabs(Qc(5, 2)), 0.9974950f, 2e-3f); near("Q.q.w", std::fabs(Qc(5, 3)), 0.0707372f, 2e-3f);
+        near("R.y", P(6, 1), yFree61, 2e-3f); near("R.x", P(6, 0), 14.0f, 1e-5f);
+        failures += unmappedPenalty();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: all five direct-API setters and both acceleration getters "
+                        "answer on Vulkan -- teleports, velocities, a one-step force and torque, read back "
+                        "and integrated\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'directapiwrite': %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "directapi"))
     {
         DirectApiScene ds = buildDirectApiScene(physics, scene, material);
@@ -9637,6 +10057,8 @@ int main()
                        "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
                        "          forcethreshold                          (P9.91: FOUND/PERSISTS/LOST force-threshold events)\n"
                        "          aggregate                               (P9.92: PxAggregate self / actor / aggregate pairs)\n"
+                       "          directapiwrite                          (P9.93: direct-API setters + acceleration getters)\n"
+                       "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

@@ -170,9 +170,10 @@ void updateBounds(PxgShapeSim shapeSim, PxgTransform28 pose, uint index)
         {
             const PxgShape shape = gShapes[hullIndex];
             PxgMat33 rot = mat33FromQuat(pose.q());
+            // P9.93: PxMeshScale::isIdentity() tests the scale only (see
+            // pxgSlangCacheBound.slang's updateBoundsBda, the engine twin).
             const bool scaleIsIdentity =
-                shape.scaleX == 1.0f && shape.scaleY == 1.0f && shape.scaleZ == 1.0f &&
-                shape.scaleRotX == 0.0f && shape.scaleRotY == 0.0f && shape.scaleRotZ == 0.0f;
+                shape.scaleX == 1.0f && shape.scaleY == 1.0f && shape.scaleZ == 1.0f;
             if (!scaleIsIdentity)
                 rot = mat33MulMat33(rot, meshScaleToMat33(shape.scale(), shape.scaleRotation()));
 

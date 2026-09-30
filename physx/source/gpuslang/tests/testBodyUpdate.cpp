@@ -43,6 +43,10 @@
 
 #include "PxNodeIndex.h" // completes PxNodeIndex for the engine desc header
 #include "PxgSimulationCoreDesc.h"
+#include "PxgBodySim.h"          // P9.93: PxgBodySimVelocityUpdate / external-acceleration offsets
+
+#include <algorithm>
+#include <cstddef>
 
 #include <numeric>
 #include <random>
@@ -357,12 +361,51 @@ struct SizePair { uint32_t poolSize; uint32_t count; };
 static const SizePair SIZE_CASES[2] = { { 150u, 60u },
                                         { BODY_UPDATE_PASS + 3616u, BODY_UPDATE_PASS + 1393u } };
 
+// P9.93 -- updateBodyExternalVelocitiesLaunch on the ENGINE launch ABI ({8}: one
+// PxgUpdatedBodiesDesc pointer), launched through PxgCudaShim with the engine's
+// fixed 64-group grid, at the two SIZE_CASES (the second past one grid pass).
+//
+// What the records carry, and why:
+//   * linVel.w is the TARGET BODY INDEX as raw bits (PX_FR in PxgBodySimManager).
+//     Targets are 1..poolSize-1 shuffled, so small indices are DENORMAL floats: a
+//     port that ever moved the word through a float with flush-to-zero, or through
+//     a float-to-int conversion, would scatter them onto body 0 -- which is never a
+//     target and must stay untouched.
+//   * angVel.w and BOTH external accelerations' .w are non-zero: the kernel copies
+//     all four lanes of each (updateBodiesAndShapes.cu:923-926), and the engine's
+//     own producer writing w = 0 there must not let a three-lane copy pass.
+//   * linVel.w of the POOL survives (the inverse mass).
+// The whole pool, the records and the descriptor are compared bit for bit.
+static_assert(sizeof(physx::PxgUpdatedBodiesDesc) == 24, "PxgUpdatedBodiesDesc size");
+static_assert(offsetof(physx::PxgUpdatedBodiesDesc, mBodySimBufferDeviceData) == 0, "desc @0");
+static_assert(offsetof(physx::PxgUpdatedBodiesDesc, mUpdatedBodySim) == 8, "desc @8");
+static_assert(offsetof(physx::PxgUpdatedBodiesDesc, mNbUpdatedBodies) == 16, "desc @16");
+static_assert(sizeof(physx::PxgBodySimVelocityUpdate) == 64, "PxgBodySimVelocityUpdate size");
+static_assert(offsetof(physx::PxgBodySimVelocityUpdate, linearVelocityXYZ_bodySimIndexW) == 0, "upd @0");
+static_assert(offsetof(physx::PxgBodySimVelocityUpdate, angularVelocityXYZ_maxPenBiasW) == 16, "upd @16");
+static_assert(offsetof(physx::PxgBodySimVelocityUpdate, externalLinearAccelerationXYZ) == 32, "upd @32");
+static_assert(offsetof(physx::PxgBodySimVelocityUpdate, externalAngularAccelerationXYZ) == 48, "upd @48");
+static_assert(offsetof(physx::PxgBodySim, externalLinearAcceleration) == 192, "PxgBodySim @192");
+static_assert(offsetof(physx::PxgBodySim, externalAngularAcceleration) == 208, "PxgBodySim @208");
+
 PXG_TEST(bodyUpdate_externalVelocities)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch", 8u, 0 }, // { u64 }
+    };
+    PxgCudaShim shim(dev, manifest, 1, &bodyUpdateAbiLoader);
+
     for (const SizePair sizes : SIZE_CASES)
     {
         std::mt19937 rng(2001);
         std::uniform_real_distribution<float> sym(-5.f, 5.f);
+        auto nonZero = [&]() { float v = sym(rng); return v == 0.f ? 1.5f : v; };
 
         const uint32_t poolSize = sizes.poolSize;
         const uint32_t nbUpdates = sizes.count;
@@ -371,9 +414,13 @@ PXG_TEST(bodyUpdate_externalVelocities)
         for (uint32_t i = 0; i < poolSize; ++i)
             pool[i] = randomBodySim(rng, i);
 
-        std::vector<uint32_t> targets(poolSize);
-        std::iota(targets.begin(), targets.end(), 0u);
+        // body 0 is never a target (see the header)
+        std::vector<uint32_t> targets(poolSize - 1);
+        std::iota(targets.begin(), targets.end(), 1u);
         std::shuffle(targets.begin(), targets.end(), rng);
+        // ...but the first records DO carry the smallest (denormal) indices
+        for (uint32_t k = 0; k < 4; ++k)
+            std::swap(targets[k], *std::find(targets.begin(), targets.end(), k + 1u));
 
         // PxgBodySimVelocityUpdate: 4 float4
         std::vector<Float4> updates(nbUpdates * 4);
@@ -382,24 +429,48 @@ PXG_TEST(bodyUpdate_externalVelocities)
             Float4 lin = { sym(rng), sym(rng), sym(rng), 0.f };
             std::memcpy(&lin.w, &targets[i], 4);
             updates[i * 4 + 0] = lin;
-            updates[i * 4 + 1] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
-            updates[i * 4 + 2] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
-            updates[i * 4 + 3] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+            updates[i * 4 + 1] = Float4{ sym(rng), sym(rng), sym(rng), nonZero() };
+            updates[i * 4 + 2] = Float4{ sym(rng), sym(rng), sym(rng), nonZero() };
+            updates[i * 4 + 3] = Float4{ sym(rng), sym(rng), sym(rng), nonZero() };
         }
 
-        PxgSlangComputeDevice* dev = testDevice();
-        Kernel kernel("bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch", { 4, 4, 4 },
-                      sizeof(BodyUpdateParams));
+        PxgDevicePtr dUpdates = 0, dPool = 0, dDesc = 0;
+        shim.memAlloc(&dUpdates, updates.size() * sizeof(Float4));
+        shim.memAlloc(&dPool, pool.size() * sizeof(BodySim));
+        shim.memAlloc(&dDesc, sizeof(physx::PxgUpdatedBodiesDesc));
+        if (!dUpdates || !dPool || !dDesc)
+        {
+            std::printf("  NOTE: no BDA -> skip\n");
+            return;
+        }
+        shim.memcpyHtoD(dUpdates, updates.data(), updates.size() * sizeof(Float4));
+        shim.memcpyHtoD(dPool, pool.data(), pool.size() * sizeof(BodySim));
 
-        PxgBufferHandle updatesBuf = createBufferFrom(dev, updates);
-        PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
-        PxgBufferHandle dummyShapes = dev->createBuffer(16);
+        // the REAL engine desc -- pool FIRST, the reverse of PxgNewBodiesDesc
+        physx::PxgUpdatedBodiesDesc desc;
+        std::memset(&desc, 0xEE, sizeof(desc));   // the 4 pad bytes must survive
+        desc.mBodySimBufferDeviceData = reinterpret_cast<physx::PxgBodySim*>(dPool);
+        desc.mUpdatedBodySim = reinterpret_cast<physx::PxgBodySimVelocityUpdate*>(dUpdates);
+        desc.mNbUpdatedBodies = nbUpdates;
+        shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
-        kernel.dispatch(BODY_UPDATE_GRID, { updatesBuf, poolBuf, dummyShapes },
-                        BodyUpdateParams{ nbUpdates });
-        dev->flush();
+        EngineBlob blob;
+        blob.add<uint64_t>(dDesc);
+        blob.finish();
+        PXG_CHECK_MSG(blob.bytes.size() == 8, "engine blob is 8 bytes (got %zu)", blob.bytes.size());
 
-        const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
+        // engine grid: UPDATE_BODY_EXTERNAL_VELOCITIES = 64 blocks x 256 threads
+        PXG_CHECK_MSG(shim.launchKernel(0, BODY_UPDATE_GRID, 1, 1, blob.bytes.data(),
+                                        uint32_t(blob.bytes.size())) == PxgResult::Success,
+                      "launch updateBodyExternalVelocitiesLaunch through the engine-ABI blob");
+        shim.streamSynchronize();
+
+        std::vector<BodySim> gpuPool(poolSize);
+        shim.memcpyDtoH(gpuPool.data(), dPool, poolSize * sizeof(BodySim));
+        std::vector<Float4> gpuUpdates(updates.size());
+        shim.memcpyDtoH(gpuUpdates.data(), dUpdates, updates.size() * sizeof(Float4));
+        physx::PxgUpdatedBodiesDesc gpuDesc;
+        shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
 
         std::vector<BodySim> refPool = pool;
         for (uint32_t i = 0; i < nbUpdates; ++i)
@@ -414,11 +485,16 @@ PXG_TEST(bodyUpdate_externalVelocities)
         }
 
         PXG_CHECK_MSG(std::memcmp(gpuPool.data(), refPool.data(), poolSize * sizeof(BodySim)) == 0,
-                      "external velocity update mismatch");
+                      "external velocity update mismatch (count %u)", nbUpdates);
+        PXG_CHECK_MSG(std::memcmp(&gpuPool[0], &pool[0], sizeof(BodySim)) == 0,
+                      "body 0 is never a target and must be untouched");
+        PXG_CHECK_MSG(std::memcmp(gpuUpdates.data(), updates.data(), updates.size() * sizeof(Float4)) == 0,
+                      "the update records are read-only");
+        PXG_CHECK_MSG(std::memcmp(&gpuDesc, &desc, sizeof(desc)) == 0, "the descriptor is read-only");
 
-        dev->destroyBuffer(updatesBuf);
-        dev->destroyBuffer(poolBuf);
-        dev->destroyBuffer(dummyShapes);
+        shim.memFree(dUpdates);
+        shim.memFree(dPool);
+        shim.memFree(dDesc);
     }
 }
 

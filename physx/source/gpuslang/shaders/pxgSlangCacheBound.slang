@@ -49,11 +49,22 @@
 import pxgSlangCommon;
 import pxgSlangSimCoreDesc;
 
-// mirrors getAbsPose() in updateCacheAndBound.cuh
+// mirrors getAbsPose() in updateCacheAndBound.cuh:
+//     t0 = body2Actor.transformInv(shape2Actor); return body2World.transform(t0);
+//
+// P9.93: PxTransform::transformInv(PxTransform) is spelled
+//     qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q)
+// (PxTransform.h:162-169), and that is what is written here -- NOT
+// quatRotateInv(q, src.p - p).  The two agree in every bit EXCEPT the sign of an
+// exact zero: the conjugate's cross term (-y)*vz - (-z)*vy is +0 where
+// rotateInv's -(y*vz - z*vy) is -0.  E.g. body2Actor.q = (-0.5, 0.5, 0.5, 0.5)
+// and shape2Actor.p == body2Actor.p gave t0.p.x = -0 here and +0 in the CUDA.
 public PxgTransform28 getAbsPose(PxgTransform28 body2World, PxgTransform28 shape2Actor,
                                  PxgTransform28 body2Actor)
 {
-    const PxgTransform28 t0 = transformInvTransform(body2Actor, shape2Actor);
+    const float4 qinv = quatConjugate(body2Actor.q());
+    const PxgTransform28 t0 = makeTransform28(quatMul(qinv, shape2Actor.q()),
+                                              quatRotate(qinv, shape2Actor.p() - body2Actor.p()));
     return transformTransform(body2World, t0);
 }
 
@@ -147,9 +158,13 @@ public void updateBoundsBda(PxgShapeSim shapeSim, Ptr<PxgShapeGpu> convexShapes,
         {
             const PxgShapeGpu shape = convexShapes[hullIndex];
             PxgMat33 rot = mat33FromQuat(pose.q());
+            // P9.93: PxMeshScale::isIdentity() tests the SCALE only
+            // (PxMeshScale.h:104-107); the rotation is not part of it.  The port
+            // also required rotation xyz == 0, so a unit scale with a non-identity
+            // scale rotation -- a valid PxMeshScale, copied verbatim into the GPU
+            // shape -- was multiplied by R^T R here and skipped in the CUDA.
             const bool scaleIsIdentity =
-                shape.scaleX == 1.0f && shape.scaleY == 1.0f && shape.scaleZ == 1.0f &&
-                shape.scaleRotX == 0.0f && shape.scaleRotY == 0.0f && shape.scaleRotZ == 0.0f;
+                shape.scaleX == 1.0f && shape.scaleY == 1.0f && shape.scaleZ == 1.0f;
             if (!scaleIsIdentity)
                 rot = mat33MulMat33(rot, meshScaleToMat33(
                     float3(shape.scaleX, shape.scaleY, shape.scaleZ),

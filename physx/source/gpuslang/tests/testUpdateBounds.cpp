@@ -99,7 +99,11 @@ static std::vector<uint8_t> updateBoundsAbiLoader(const char* file) { return loa
 
 TransformV getAbsPose(const TransformV& body2World, const TransformV& shape2Actor, const TransformV& body2Actor)
 {
-    const TransformV t0 = body2Actor.transformInv(shape2Actor);
+    // P9.93: PxTransform::transformInv(PxTransform) LITERALLY (PxTransform.h:162-169):
+    // the conjugate's rotate, not rotateInv -- they differ in the sign of exact zeros.
+    // (TransformV::transformInv in pxgRefMath.h spells rotateInv.)
+    const QuatV qinv = body2Actor.q.getConjugate();
+    const TransformV t0(qinv * shape2Actor.q, qinv.rotate(shape2Actor.p - body2Actor.p));
     return body2World.transform(t0);
 }
 
@@ -234,8 +238,8 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
             Mat33 rot(pose.q);
             const Vec3 scale(shape.scale);
             const QuatV scaleRot(shape.scaleRotation);
-            const bool identity = scale.x == 1.f && scale.y == 1.f && scale.z == 1.f && scaleRot.x == 0.f &&
-                                  scaleRot.y == 0.f && scaleRot.z == 0.f;
+            // P9.93: PxMeshScale::isIdentity() -- the scale only (PxMeshScale.h:104-107)
+            const bool identity = scale.x == 1.f && scale.y == 1.f && scale.z == 1.f;
             if (!identity)
                 rot = rot * meshScaleToMat33(scale, scaleRot, p89OldOrder);
 
@@ -419,8 +423,7 @@ static uint32_t ubP89Path(const ShapeSim& s, const std::vector<Shape>& shapes)
         if (s.hullDataIndex == 0xFFFFFFFFu)
             return eUB_FAST_CONVEX;
         const Shape& h = shapes[s.hullDataIndex];
-        const bool identity = h.scale.x == 1.f && h.scale.y == 1.f && h.scale.z == 1.f &&
-                              h.scaleRotation.x == 0.f && h.scaleRotation.y == 0.f && h.scaleRotation.z == 0.f;
+        const bool identity = h.scale.x == 1.f && h.scale.y == 1.f && h.scale.z == 1.f;   // P9.93: scale only
         return identity ? eUB_HULL_IDENTITY : eUB_HULL_SCALED;
     }
     default: return eUB_FAST_OTHER;
@@ -1524,7 +1527,7 @@ PXG_TEST(setRigidDynamicGlobalPose_p89MeshScaleCenterOrder)
     const uint32_t numBodies = 8;
     const uint32_t shapesPerBody = 24;
     const uint32_t numShapes = numBodies * shapesPerBody;
-    const uint32_t numHulls = 2;
+    const uint32_t numHulls = 3;   // P9.93: hull 2 is a UNIT scale with a rotated scale axis
     const uint32_t nbVerts = 64;
 
     // ---- bodies: random COM frames with small offsets
@@ -1559,6 +1562,10 @@ PXG_TEST(setRigidDynamicGlobalPose_p89MeshScaleCenterOrder)
         shapes[h].type = eCONVEXMESH;
         shapes[h].hullOrMeshOffset = uint64_t(base) * 4;
     }
+    // P9.93: PxMeshScale::isIdentity() tests the scale only, so hull 2 -- scale
+    // (1, 1, 1) under a rotated scale axis, a valid PxMeshScale -- takes the
+    // IDENTITY path in the CUDA; the pre-P9.93 port multiplied by R^T R there
+    shapes[2].scale = Float3{ 1.f, 1.f, 1.f };
 
     // ---- shapes, sorted by body (the per-shape node index array is ascending)
     std::vector<ShapeSim> shapeSims(numShapes);
@@ -1582,7 +1589,7 @@ PXG_TEST(setRigidDynamicGlobalPose_p89MeshScaleCenterOrder)
         s.shapeFlags = eSIMULATION_SHAPE;
         switch (k % 3)
         {
-        case 0: s.shapeType = eCONVEXMESH; s.hullDataIndex = (k / 3) % numHulls; break;
+        case 0: s.shapeType = eCONVEXMESH; s.hullDataIndex = (k == 21u) ? 2u : (k / 3) % 2u; break;
         case 1: s.shapeType = eCONVEXMESH; s.hullDataIndex = 0xFFFFFFFFu; break;
         default: s.shapeType = uint16_t(6 + (k / 3) % 3); s.hullDataIndex = 0xFFFFFFFFu; break;
         }

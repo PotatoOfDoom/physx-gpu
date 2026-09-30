@@ -20,7 +20,7 @@ static const unsigned PXG_SLANG_KERNEL_MAPPED = 423;
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "mergeChangedAABBMgrHandlesLaunch", "updateBounds.spv", "mergeChangedAABBMgrHandlesLaunch" },  // MERGE_AABBMGR_HANDLES (P9.79)
-    { "updateBodyExternalVelocitiesLaunch", "bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch" },  // UPDATE_BODY_EXTERNAL_VELOCITIES
+    { "updateBodyExternalVelocitiesLaunch", "bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch" },  // UPDATE_BODY_EXTERNAL_VELOCITIES (P9.93 engine ABI in place)
     { "updateShapesLaunch", "bodyUpdate.spv", "updateShapesLaunch" },  // UPDATE_SHAPES
     { "updateBodiesLaunch", "bodyUpdate.spv", "updateBodiesLaunch" },  // UPDATE_BODIES
     { "updateBodiesLaunchDirectAPI", "directApiBda.spv", "updateBodiesLaunchDirectAPI" },  // UPDATE_BODIES_DIRECT_API (P9.79 BDA re-point)
@@ -349,13 +349,13 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "getRigidDynamicGlobalPose", "directApiBda.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE (P9.79 BDA re-point)
     { "getRigidDynamicLinearVelocity", "directApiBda.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL (P9.79 BDA re-point)
     { "getRigidDynamicAngularVelocity", "directApiBda.spv", "getRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_GET_ANGVEL (P9.79 BDA re-point)
-    { "getRigidDynamicLinearAcceleration", "directApi.spv", "getRigidDynamicLinearAcceleration" },  // RIGID_DYNAMIC_GET_LINACCEL
-    { "getRigidDynamicAngularAcceleration", "directApi.spv", "getRigidDynamicAngularAcceleration" },  // RIGID_DYNAMIC_GET_ANGACCEL
-    { "setRigidDynamicGlobalPose", "updateBounds.spv", "setRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_SET_GLOBAL_POSE
-    { "setRigidDynamicLinearVelocity", "directApi.spv", "setRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_SET_LINVEL
-    { "setRigidDynamicAngularVelocity", "directApi.spv", "setRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_SET_ANGVEL
-    { "setRigidDynamicForce", "directApi.spv", "setRigidDynamicForce" },  // RIGID_DYNAMIC_SET_FORCE
-    { "setRigidDynamicTorque", "directApi.spv", "setRigidDynamicTorque" },  // RIGID_DYNAMIC_SET_TORQUE
+    { "getRigidDynamicLinearAcceleration", "directApiBda.spv", "getRigidDynamicLinearAcceleration" },  // RIGID_DYNAMIC_GET_LINACCEL (P9.93 BDA re-point)
+    { "getRigidDynamicAngularAcceleration", "directApiBda.spv", "getRigidDynamicAngularAcceleration" },  // RIGID_DYNAMIC_GET_ANGACCEL (P9.93 BDA re-point)
+    { "setRigidDynamicGlobalPose", "directApiBda.spv", "setRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_SET_GLOBAL_POSE (P9.93 BDA re-point; hand-edited: the generator would pick updateBounds.spv)
+    { "setRigidDynamicLinearVelocity", "directApiBda.spv", "setRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_SET_LINVEL (P9.93 BDA re-point)
+    { "setRigidDynamicAngularVelocity", "directApiBda.spv", "setRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_SET_ANGVEL (P9.93 BDA re-point)
+    { "setRigidDynamicForce", "directApiBda.spv", "setRigidDynamicForce" },  // RIGID_DYNAMIC_SET_FORCE (P9.93 BDA re-point)
+    { "setRigidDynamicTorque", "directApiBda.spv", "setRigidDynamicTorque" },  // RIGID_DYNAMIC_SET_TORQUE (P9.93 BDA re-point)
     { "getArtiDofStates", "npArtiGetSet.spv", "getArtiDofStates" },  // ARTI_GET_DOF_STATES (unmapped)
     { "getArtiTransformStates", "npArtiGetSet.spv", "getArtiTransformStates" },  // ARTI_GET_TRANSFORM_STATES (unmapped)
     { "getArtiVelocityStates", "npArtiGetSet.spv", "getArtiVelocityStates" },  // ARTI_GET_VELOCITY_STATES (unmapped)

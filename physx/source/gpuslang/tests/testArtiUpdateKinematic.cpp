@@ -619,8 +619,8 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
                     std::memcpy(sc, sh, 28);
                     PxMat33 rot(absPos.q);
                     PxMat33 rotOld(absPos.q);
-                    const bool ident = sc[0] == 1.f && sc[1] == 1.f && sc[2] == 1.f &&
-                                       sc[3] == 0.f && sc[4] == 0.f && sc[5] == 0.f;
+                    // P9.93: PxMeshScale::isIdentity() -- the scale only (PxMeshScale.h:104-107)
+                    const bool ident = sc[0] == 1.f && sc[1] == 1.f && sc[2] == 1.f;
                     if (!ident)
                     {
                         // P9.89: updateCacheAndBound.cuh:113-114 is rot * shape.scale.toMat33(),

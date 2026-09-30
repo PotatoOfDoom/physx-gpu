@@ -98,7 +98,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate"
+        sdfmesh forcethreshold aggregate directapiwrite extforce"
 
 pass=0; fail=0; missing=0
 
@@ -174,6 +174,16 @@ run_one "softbody (heightfield floor)" PXG_SCENE=softbody PXG_SB_FLOOR=heightfie
 # reference is the CPU PGS solver (PXG_CPU_CONTROL=1 PXG_SOLVER=pgs); the CPU TGS solver
 # builds no force-change stream at all (see the scene's header in testGpuSdkStep.cpp).
 run_one "forcethreshold (PGS)" PXG_SCENE=forcethreshold PXG_SOLVER=pgs
+
+# P9.93: the rest of the rigid direct-GPU API (directapiwrite: the five setters and the
+# two acceleration getters) and updateBodyExternalVelocitiesLaunch (extforce: addForce /
+# addTorque) are the SAME kernels under both solvers, but what they feed -- the TGS or
+# PGS integration, which also writes the previous-velocity buffer the acceleration
+# getters read -- is not, so each is scored under both; and so, now, is directapi,
+# whose PGS result was measured by hand in P9.79 but never had a row.
+run_one "directapi (PGS)" PXG_SCENE=directapi PXG_SOLVER=pgs
+run_one "directapiwrite (PGS)" PXG_SCENE=directapiwrite PXG_SOLVER=pgs
+run_one "extforce (PGS)" PXG_SCENE=extforce PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"

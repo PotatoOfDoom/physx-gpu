@@ -1504,6 +1504,34 @@ static const uint8_t kRadixCopyBits2[] = { 8, 8, 8, 4, 1 };
 // -> 0, 8, 16, 24 = 28, rounded to a 32-byte blob.
 static const uint8_t kRigidGet[] = { 8, 8, 8, 4 };
 
+// P9.93 -- the rest of the rigid direct-GPU API (updateBodiesAndShapes.cu).
+// Named per family, NOT aliased to same-shaped packs of unrelated kernels.
+//   getRigidDynamicLinearAcceleration / getRigidDynamicAngularAcceleration(
+//     PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//     const PxgBodySim* bodySimBufferDeviceData,
+//     const PxgBodySimVelocities* prevVelocities, const PxU32 nbElements,
+//     const float oneOverDt)
+// -> 0, 8, 16, 24, 32, 36 = a 40-byte blob, no padding.
+static const uint8_t kRigidGetAccel[] = { 8, 8, 8, 8, 4, 4 };
+//   setRigidDynamicGlobalPose(const PxTransform* data,
+//     const PxRigidDynamicGPUIndex* gpuIndices,
+//     const PxgUpdateActorDataDesc* updateActorDataDesc, const PxU32 nbElements,
+//     const PxU32 totalNumShapes)
+// -> 0, 8, 16, 24, 28 = a 32-byte blob.
+static const uint8_t kRigidSetPose[] = { 8, 8, 8, 4, 4 };
+//   setRigidDynamicLinearVelocity / setRigidDynamicAngularVelocity(
+//     const PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
+//     const PxgUpdateActorDataDesc* updateActorDataDesc,
+//     PxgBodySimVelocities* prevVelocities, const PxU32 nbElements)
+// -> 0, 8, 16, 24, 32 = 36, rounded to a 40-byte blob.
+static const uint8_t kRigidSetVel[] = { 8, 8, 8, 8, 4 };
+//   setRigidDynamicForce / setRigidDynamicTorque(const PxVec3* data,
+//     const PxRigidDynamicGPUIndex* gpuIndices,
+//     const PxgUpdateActorDataDesc* updateActorDataDesc, const PxU32 nbElements)
+// -> 0, 8, 16, 24 = 28, rounded to a 32-byte blob.  kRigidGet's shape, but slot
+// 2 is the update-actor desc, not the body-sim pool.
+static const uint8_t kRigidSetForce[] = { 8, 8, 8, 4 };
+
 //   getD6JointForces / getD6JointTorques(PxVec3* data,
 //     const PxD6JointGPUIndex* gpuIndices, PxU32 nbElements,
 //     const PxgConstraintWriteback* constraintWriteBackBuffer, PxF32 oneOverDt,
@@ -1786,6 +1814,9 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
+    // updateBodiesAndShapes.cu:909 -- updateBodyExternalVelocitiesLaunch(
+    //   const PxgUpdatedBodiesDesc*) (P9.93; PxgSimulationCore.cpp:2313)
+    { "updateBodyExternalVelocitiesLaunch", kOnePtr, 1u },
     { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
     // P9.79 -- the DIRECT-GPU API family.  Every row below was missing, and every
     // one of these kernels was refused on every launch, because until
@@ -2359,6 +2390,18 @@ static const PxgKernelAbiRow kRows[] = {
     { "getRigidDynamicGlobalPose", kRigidGet, uint32_t(sizeof(kRigidGet)) },
     { "getRigidDynamicLinearVelocity", kRigidGet, uint32_t(sizeof(kRigidGet)) },
     { "getRigidDynamicAngularVelocity", kRigidGet, uint32_t(sizeof(kRigidGet)) },
+    // updateBodiesAndShapes.cu:1063 / :1086 -- the acceleration getters (P9.93),
+    // live only under eENABLE_BODY_ACCELERATIONS
+    // (PxgSimulationCore::getRigidDynamicData, PxgSimulationCore.cpp:2806 / :2827).
+    { "getRigidDynamicLinearAcceleration", kRigidGetAccel, uint32_t(sizeof(kRigidGetAccel)) },
+    { "getRigidDynamicAngularAcceleration", kRigidGetAccel, uint32_t(sizeof(kRigidGetAccel)) },
+    // updateBodiesAndShapes.cu:1108 / :1179 / :1204 / :1229 / :1253 -- the five
+    // setters (P9.93; PxgSimulationCore::setRigidDynamicData, :2968-3043).
+    { "setRigidDynamicGlobalPose", kRigidSetPose, uint32_t(sizeof(kRigidSetPose)) },
+    { "setRigidDynamicLinearVelocity", kRigidSetVel, uint32_t(sizeof(kRigidSetVel)) },
+    { "setRigidDynamicAngularVelocity", kRigidSetVel, uint32_t(sizeof(kRigidSetVel)) },
+    { "setRigidDynamicForce", kRigidSetForce, uint32_t(sizeof(kRigidSetForce)) },
+    { "setRigidDynamicTorque", kRigidSetForce, uint32_t(sizeof(kRigidSetForce)) },
     // updateBodiesAndShapes.cu:1344 / :1367 -- the D6 joint force/torque getters
     // (P9.79), two instantiations of one template, so one pack
     // (PxgSimulationCore::getD6JointData, PxgSimulationCore.cpp:3098).  Note the

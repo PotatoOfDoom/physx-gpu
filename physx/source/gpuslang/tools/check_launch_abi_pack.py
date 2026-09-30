@@ -145,8 +145,9 @@ ENGINE_DIRS = [
 
 # Kernels whose pack this checker cannot yet decide.  RATCHET: may shrink, never
 # grow.  Being on this list is NOT a clean bill -- it is a recorded blind spot,
-# and the honest state of the tree is that 37 of the kernels with an ABI row have
-# one (101 before P9.83a-6 taught the resolver function scope).
+# and the honest state of the tree is that 40 of the kernels with an ABI row have
+# one (101 before P9.83a-6 taught the resolver function scope; 37 before P9.93
+# made three more kernels VISIBLE -- see the note at the end of the set).
 #
 # THE REASONS, in the order they will be worth attacking:
 #   * a struct passed BY VALUE whose size this table does not know (the
@@ -213,6 +214,22 @@ KNOWN_UNDECIDED = {
     "sb_sbMidphaseGeneratePairsLaunch",
     "sb_sdfMeshMidphaseGeneratePairsLaunch",
     "sb_selfCollisionMidphaseGeneratePairsLaunch",
+    # P9.93 -- NOT a regression: these three were INVISIBLE before, skipped as "no
+    # launch site found" because their PxCudaKernelParam block precedes the
+    # getCuFunction handle.  P9.93 searches from the function head (and blanks
+    # comments and `#if 0`), which made them visible; each falls into a category
+    # above, and each pack was checked BY HAND against its row:
+    #   convexCoreTetmeshNphase_Kernel32   PxgNarrowphaseCore.cpp:1050 -- `writer`,
+    #     the PxgFEMContactWriter by value (9 pointers + PxU32 = 80); pack
+    #     {4,8,8,8,8,8,8,8,80} == kCvxCoreTet.
+    #   convexCoreClothmeshNphase_Kernel32 PxgNarrowphaseCore.cpp:1189 -- the same
+    #     writer; pack {8 x10,4,4,8,80} == kCvxCoreCloth.
+    #   ps_stepParticlesLaunch             PxgParticleSystemCore.cpp:2460 --
+    #     `mGravity`, a PxVec3 CLASS MEMBER (PxgParticleSystemCore.h:292) passed by
+    #     value; pack {8,8,4,4,1,1,1,12} == kPsStepParticles.
+    "convexCoreTetmeshNphase_Kernel32",
+    "convexCoreClothmeshNphase_Kernel32",
+    "ps_stepParticlesLaunch",
 }
 
 
@@ -325,6 +342,40 @@ def engine_sources():
 
 DECL_CACHE = {}
 SPAN_CACHE = {}
+
+
+def _mask_if0(text):
+    """`text` with every `#if 0` ... `#endif` region (up to a same-depth `#else` /
+    `#elif`, which is live again) blanked to spaces, newlines kept, so offsets and
+    line numbers still index the original.  P9.93: PxgPBDParticleSystemCore.cpp:
+    757-777 keeps a dead ps_applyDeltaLaunch site under `#if 0` whose pack --
+    (particleSystemsd, id, mRelaxationFactor, dt) -- is not the kernel's signature
+    at all; once launch sites were searched from the function head it was read as a
+    second, live site of the kernel."""
+    out = list(text)
+    lines = text.split("\n")
+    pos, dead, depth = 0, False, 0
+    for ln in lines:
+        m = re.match(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)", ln)
+        kind = m.group(1) if m else None
+        if not dead:
+            if kind == "if" and re.match(r"\s*0\s*(?://.*|/\*.*)?$", m.group(2)):
+                dead, depth = True, 0
+        else:
+            if kind in ("if", "ifdef", "ifndef"):
+                depth += 1
+            elif kind == "endif":
+                if depth == 0:
+                    dead = False
+                else:
+                    depth -= 1
+            elif kind in ("else", "elif") and depth == 0:
+                dead = False
+        if dead:
+            for k in range(pos, pos + len(ln)):
+                out[k] = " "
+        pos += len(ln) + 1
+    return "".join(out)
 
 
 def _masked(src):
@@ -502,6 +553,12 @@ def declared_size(src, var, cache_key=None, pos=None):
 
     def scan(text):
         """(sizes seen, whether any declaration had an unresolvable type)"""
+        # P9.93: a qualifier between the type and the name -- `const void*
+        # PX_RESTRICT data` (PxgSimulationCore::setRigidDynamicData) -- hid the
+        # declaration, the flat-file fallback then met two unrelated `data`s of
+        # unresolvable type, and all five direct-API setters came out UNDECIDED.
+        # Dropping the macro changes no size and can only resolve more.
+        text = re.sub(r"\bPX_RESTRICT\b", " ", text)
         sizes, unresolved = set(), False
         for m in re.finditer(r"(?:^|[;{}\(,])\s*((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*[*&]?)\s+"
                              + re.escape(var) + r"\s*(?:=|;|\)|,|\[)", text, re.M):
@@ -589,14 +646,21 @@ def launch_packs(ids):
             continue
         if "PxgKernelIds::" not in src:
             continue
+        # P9.93: the chain is followed over the MASKED text (comments and literals
+        # blanked, offsets preserved).  Commented-out launch code is common in these
+        # files -- PxgParticleSystemCore.cpp:1470-1500 keeps a whole old
+        # ps_averageVertsLaunch site under `//` -- and once the block search below
+        # started at the function head it began reading those dead sites as live
+        # ones.  Only real code launches anything.
+        code = _mask_if0(_masked(src))
         # every handle assignment, including the ternary two-id form
-        for hm in re.finditer(r"(\w+)\s*=\s*([^;]*?getCuFunction\s*\([^;]*?)\s*;", src, re.S):
+        for hm in re.finditer(r"(\w+)\s*=\s*([^;]*?getCuFunction\s*\([^;]*?)\s*;", code, re.S):
             handle, rhs = hm.group(1), hm.group(2)
             kids = re.findall(r"PxgKernelIds::(\w+)", rhs)
             if not kids:
                 continue
             # the launchKernel that uses this handle, before the handle is reassigned
-            tail = src[hm.end():]
+            tail = code[hm.end():]
             nxt = re.search(r"\b" + re.escape(handle) + r"\s*=\s*[^;]*getCuFunction", tail, re.S)
             region = tail[:nxt.start()] if nxt else tail
             lm = re.search(r"launchKernel\s*\(\s*" + re.escape(handle) + r"\s*,(.*?)\)\s*;",
@@ -612,9 +676,21 @@ def launch_packs(ids):
             # (PxgParticleSystemCore.cpp:856-880 launches the first and second
             # update-bound passes that way), and taking the first match handed the
             # second kernel the first one's arguments.
+            #
+            # P9.93: and the search starts at the ENCLOSING FUNCTION, not at the
+            # handle.  PxgSimulationCore::getRigidDynamicData declares every case's
+            # block BEFORE its `CUfunction kernelFunction = ...getCuFunction(...)`,
+            # and so do updateBodies and others; searching only after the handle
+            # found no block there, and those kernels were silently skipped as "no
+            # launch site found" -- five wired getters and updateBodiesLaunch among
+            # them.  C++ scoping makes the last block of that name before the launch
+            # inside the function the one the launch uses.
+            launchAbs = hm.end() + lm.start()
+            span = function_span(src, hm.start(), path)
+            searchFrom = span[0] if span else 0
             blocks = list(re.finditer(r"PxCudaKernelParam\s+" + re.escape(pname) +
                                       r"\s*\[\]\s*=\s*\{(.*?)\}\s*;",
-                                      region[:lm.start()], re.S))
+                                      code[searchFrom:launchAbs], re.S))
             if not blocks:
                 continue
             bm = blocks[-1]

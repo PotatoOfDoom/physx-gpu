@@ -100,6 +100,16 @@ struct UpdateShapesAbiParams
 [[vk::push_constant]]
 ConstantBuffer<UpdateShapesAbiParams> gUpdateShapesAbi;
 
+// ENGINE launch ABI of updateBodyExternalVelocitiesLaunch (P9.93): exactly the
+// CUDA parameter list -- one device pointer to PxgUpdatedBodiesDesc ({8} blob).
+struct UpdatedBodiesAbiParams
+{
+    uint64_t scDesc; // const PxgUpdatedBodiesDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<UpdatedBodiesAbiParams> gUpdatedBodiesAbi;
+
 RWStructuredBuffer<uint> gNewData;      // binding 0: staged source (bodies / shapes / velocity updates)
 RWStructuredBuffer<uint> gBodySimPool;  // binding 1: persistent PxgBodySim pool (word-addressed)
 RWStructuredBuffer<uint> gShapeSimPool; // binding 2: persistent PxgShapeSim pool (word-addressed)
@@ -324,27 +334,44 @@ void updateShapesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 // the port applied the update to the first 16384 records and DROPPED the rest, so
 // past that count a setLinearVelocity / addForce from the user simply did not
 // arrive -- the body kept its previous velocity with no error anywhere.
+//
+// P9.93 -- ENGINE launch ABI.  This entry was a bound-buffer port ({count} push,
+// gNewData / gBodySimPool bindings, like the Phase-1 updateBodiesLaunchDirectAPI
+// twin above, whose engine entry lives in directApiBda.slang) and could never satisfy
+// the engine's one-pointer pack; no scene had ever called PxRigidDynamic::addForce
+// / addTorque / setForceAndTorque / clearForce / clearTorque, the only APIs that
+// reach it (PxgSimulationCore::updateBodies launches it only when
+// nbUpdatedBodies > 0 and the direct-GPU API is off), so the refusal never showed.
+// It now reads the REAL PxgUpdatedBodiesDesc -- whose pool pointer comes FIRST,
+// the reverse of PxgNewBodiesDesc -- and moves uint4s: the record's linVel.w is
+// the body index as raw bits (PX_FR in PxgBodySimManager::updateBodies), never a
+// float.  PXG_SCENE=extforce is the observer.
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateBodyExternalVelocitiesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    const uint UPDATE_WORDS = 16; // sizeof(PxgBodySimVelocityUpdate) = 64
+    const uint UPDATE_UINT4 = 4; // sizeof(PxgBodySimVelocityUpdate) = 64
 
-    for (uint i = dispatchThreadId.x; i < gParams.count; i += BLOCK_SIZE * WorkgroupCount().x)
+    const PxgUpdatedBodiesDescGpu scDesc = (Ptr<PxgUpdatedBodiesDescGpu>(gUpdatedBodiesAbi.scDesc))[0];
+    Ptr<uint4> gBodySim = Ptr<uint4>(scDesc.mBodySimBufferDeviceData);
+    Ptr<uint4> gUpdatedBodies = Ptr<uint4>(scDesc.mUpdatedBodySim);
+    const uint gNbBodies = scDesc.mNbUpdatedBodies;
+
+    for (uint i = dispatchThreadId.x; i < gNbBodies; i += BLOCK_SIZE * WorkgroupCount().x)
     {
-        const uint srcBase = i * UPDATE_WORDS;
+        const uint srcBase = i * UPDATE_UINT4;
 
-        float4 linearVel = loadFloat4(gNewData, srcBase + 0);
-        const uint bodyIndex = asuint(linearVel.w);
-        const uint dstBase = bodyIndex * BODYSIM_WORDS;
+        uint4 linearVel = gUpdatedBodies[srcBase + 0];
+        const uint bodyIndex = linearVel.w;
+        const uint dstBase = bodyIndex * PXG_BODY_SIM_UINT4_SIZE;
 
-        const float originalInvMass = asfloat(gBodySimPool[dstBase + W_LINVEL + 3]);
-        linearVel.w = originalInvMass;
+        // linearVel.w = originalLinearV.w  (the pool's inverse mass survives)
+        linearVel.w = gBodySim[dstBase + W_LINVEL / 4].w;
 
-        storeFloat4(gBodySimPool, dstBase + W_LINVEL, linearVel);
-        storeFloat4(gBodySimPool, dstBase + W_ANGVEL, loadFloat4(gNewData, srcBase + 4));
-        storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL, loadFloat4(gNewData, srcBase + 8));
-        storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL + 4, loadFloat4(gNewData, srcBase + 12));
+        gBodySim[dstBase + W_LINVEL / 4] = linearVel;
+        gBodySim[dstBase + W_ANGVEL / 4] = gUpdatedBodies[srcBase + 1];
+        gBodySim[dstBase + W_EXTERNAL_ACCEL / 4] = gUpdatedBodies[srcBase + 2];
+        gBodySim[dstBase + W_EXTERNAL_ACCEL / 4 + 1] = gUpdatedBodies[srcBase + 3];
     }
 }
 
