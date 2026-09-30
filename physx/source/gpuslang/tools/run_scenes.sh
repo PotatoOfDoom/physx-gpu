@@ -98,7 +98,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold"
+        sdfmesh forcethreshold aggregate"
 
 pass=0; fail=0; missing=0
 

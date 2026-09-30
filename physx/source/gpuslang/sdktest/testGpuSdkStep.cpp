@@ -190,6 +190,75 @@ void buildBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     targets.push_back({ b, 5.0f, 0.5f, "box" });
 }
 
+// PXG_SCENE=aggregate (P9.92): the GPU broadphase's AGGREGATE path.
+//
+// With an eGPU broadphase every PxAggregate is processed by PxgAABBManager
+// (aggregate.cu, fourteen kernels): the aggregate's merged bound goes into the
+// broadphase proper, and the pairs INSIDE an aggregate (self-collision) and between an
+// aggregate and anything else are found by the aggregate kernels, not by the SAP.  No
+// scene before this one created an aggregate, so none of those kernels had ever run.
+// Four groups, each at its own x, each deciding one rest height that only a working
+// aggregate path produces:
+//
+//   selfstack  x=-6  one aggregate WITH self-collision, three boxes dropped with gaps:
+//                    they stack at 0.5 / 1.5 / 2.5.  The stack needs the self pairs; the
+//                    bottom box needs the aggregate-vs-actor pair with the ground.
+//   noself     x=-2  one aggregate WITHOUT self-collision, two boxes one above the other:
+//                    the upper one must fall THROUGH the lower one, so both end at 0.5.
+//                    A self pair that is created anyway stacks them at 0.5 / 1.5.
+//   aggagg     x=+2  a box in one aggregate resting on the ground and a box in a SECOND
+//                    aggregate dropped on it: 0.5 / 1.5 through an aggregate-vs-aggregate
+//                    pair.
+//   actoragg   x=+6  an ordinary (non-aggregated) box dropped on a box in an aggregate:
+//                    0.5 / 1.5 through an aggregate-vs-actor pair between two DYNAMICS.
+void buildAggregateScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                         std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+    auto box = [&](float x, float y) {
+        PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(x, y, 0.0f)));
+        PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *material);
+        b->attachShape(*s);
+        b->setMass(1000.0f);
+        b->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+        return b;
+    };
+    auto aggregate = [&](bool selfCollision, std::initializer_list<PxRigidDynamic*> bodies) {
+        PxAggregate* agg = physics->createAggregate(PxU32(bodies.size()), PxU32(bodies.size()),
+                                                    PxGetAggregateFilterHint(PxAggregateType::eGENERIC, selfCollision));
+        for (PxRigidDynamic* b : bodies) agg->addActor(*b);
+        scene->addAggregate(*agg);
+    };
+
+    PxRigidDynamic* s0 = box(-6.0f, 2.0f);
+    PxRigidDynamic* s1 = box(-6.0f, 3.4f);
+    PxRigidDynamic* s2 = box(-6.0f, 4.8f);
+    aggregate(true, { s0, s1, s2 });
+    targets.push_back({ s0, 2.0f, 0.5f, "selfstack0" });
+    targets.push_back({ s1, 3.4f, 1.5f, "selfstack1" });
+    targets.push_back({ s2, 4.8f, 2.5f, "selfstack2" });
+
+    PxRigidDynamic* n0 = box(-2.0f, 1.0f);
+    PxRigidDynamic* n1 = box(-2.0f, 2.4f);
+    aggregate(false, { n0, n1 });
+    targets.push_back({ n0, 1.0f, 0.5f, "noself0" });
+    targets.push_back({ n1, 2.4f, 0.5f, "noself1" });
+
+    PxRigidDynamic* a0 = box(2.0f, 1.0f);
+    PxRigidDynamic* a1 = box(2.0f, 2.4f);
+    aggregate(false, { a0 });
+    aggregate(false, { a1 });
+    targets.push_back({ a0, 1.0f, 0.5f, "aggagg0" });
+    targets.push_back({ a1, 2.4f, 1.5f, "aggagg1" });
+
+    PxRigidDynamic* c0 = box(6.0f, 1.0f);
+    PxRigidDynamic* c1 = box(6.0f, 2.4f);
+    aggregate(true, { c0 });
+    scene->addActor(*c1);
+    targets.push_back({ c0, 1.0f, 0.5f, "actoragg0" });
+    targets.push_back({ c1, 2.4f, 1.5f, "actoragg1" });
+}
+
 // PXG_SCENE=stack: a static ground box + three dynamic boxes spawned with gaps so
 // they settle into a stack.  Exercises dynamic-vs-dynamic box-box contacts and the
 // TGS partition solve path (solveBlockUnified) — the multi-body island case.
@@ -9529,6 +9598,7 @@ int main()
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "aggregate")) buildAggregateScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "plane"))     buildPlaneScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "sphere"))    buildSphereScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsule"))   buildCapsuleScene(physics, scene, material, targets);
@@ -9566,6 +9636,7 @@ int main()
                        "          particlerigid                           (P9.80: PBD shape matching + volume bounds)\n"
                        "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
                        "          forcethreshold                          (P9.91: FOUND/PERSISTS/LOST force-threshold events)\n"
+                       "          aggregate                               (P9.92: PxAggregate self / actor / aggregate pairs)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

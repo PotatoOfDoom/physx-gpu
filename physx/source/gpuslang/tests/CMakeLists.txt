@@ -353,7 +353,11 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     thresholdStream
     # P9.91: its engine-ABI twin, the file the manifest maps -- the same bodies and the same
     # argument: additions in the CUDA's order and one threshold * dt that feeds a compare.
-    thresholdStreamBda)
+    thresholdStreamBda
+    # P9.92: the aggregate broadphase.  Its only float arithmetic is updateAggregateBounds'
+    # `bound -+ contactDistance` feeding PxMin/PxMax selects -- no OpDot, no mul, so nothing
+    # a stamp could change; stamped for consistency with every other float-computing shader.
+    aggregateBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -450,6 +454,13 @@ pxg_compile_shader(thresholdStreamBda bodyInputAndRanksSingleBlockLaunch bodyInp
                    outputExceededForceThresholdElementIndice setThresholdElementsMask
                    computeThresholdElementMaskIndices outputThresholdPairsMaskIndices
                    createForceChangeThresholdElements)
+# P9.92: the engine-ABI port of the aggregate broadphase (all fourteen kernels of
+# gpubroadphase/src/CUDA/aggregate.cu, BDA through PxgAggregateDesc / PxgBroadPhaseDesc);
+# the broadphaseAgg*.slang / broadphaseAggregate*.slang files stay as the Phase-1 proofs.
+pxg_compile_shader(aggregateBda updateDirtyAggregate clearDirtyAggregates markAggregateBoundsUpdatedBitmap
+                   updateAggregateBounds markAddedAndDeletedAggregatedBounds sortAndUpdateAggregateProjections
+                   doSelfCollision doAggPairCollisions aggCopyReports addAggPairsStage1 addAggPairsStage2
+                   removeAggPairsStage1 removeAggPairsStage2 removeAggPairsStage3)
 pxg_compile_shader(solverZeroBodies ZeroBodies ZeroBodiesTGS)
 pxg_compile_shader(solverInitVelocitiesTGS initializeSolverVelocitiesTGS)
 pxg_compile_shader(solverApplyGravityTGS applyTGSSubstepGravity)
@@ -1833,6 +1844,7 @@ add_executable(gpuslang-tests
     testConstraintPrep.cpp
     testThresholdStream.cpp
     testThresholdStreamBda.cpp
+    testAggregateBda.cpp
     testThresholdForceChange.cpp
     testSolverZeroBodies.cpp
     testSolverInitVelocitiesTGS.cpp
@@ -2414,7 +2426,7 @@ endif()
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
-foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integration updateBounds frozenHistogram memCopy clamp skinning
+foreach(suite scan radixSort radixSortDesc aggregateBda radixSortGather preIntegration integration updateBounds frozenHistogram memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS npCrsWrapper2 npTriTriReduce npTriTriWrite npTriTriBlock npTriTriGeom npTriTriBody npTriTriFind npTriTriTail npTriTriKernel
         constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npConvexEdgeSat npConvexFeature npConvexTriOut npConvexPolyClip npCvxTriEmit npCvxTriFind npCvxTriPurge npCvxTriWorldNormal npGjkSupport npGjkNewPoint npGjkBarycentric npHfTriFlags npWarpVec npGjkSimplex npGjkClosestTri npGjkClosestTet npGjkClosestSeg npGjkOutput npGjkPermute npGjkSupportStep npGjkWarmStart npGjk npEpaStart4 npEpaStart123 npEpa npGjkWarm npCvxCvxEE npCvxRayPoly npCvxFaceContacts npCvxReduceManifold npCvxWitnessPoly npCvxLocalNormal npCvxAddManifold npCvxBlob npCvxBlobRead npCvxEEDriver npCvxRefFrame npCvxPolyClip npCvxClipEmit npCvxContactDecide npCvxCollidePrep npCvxCollideDecide npCvxLostFound npCvxWriteStream npCvxFinishContacts npCvxStage1Refresh npCvxStage2Setup cvxCollide npCvxPlanePolyIndex npCvxPlaneRefresh npCvxPlaneGen npCvxPlaneOut npCvxCorrelate npCvxPostProcess npCvxTrimeshOut npTriTriOverlap npCvxTriNpSetup npCvxHfNpSetup npCvxCoreOut npCvxCoreSetup npCvxCoreSupport npCvxCoreFace npCvxCorePtsFace npCvxCoreClip npCvxCoreContact npCvxCoreGjk npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npCvxBvhGlue npCvxCoreWarpAcc cvxCoreTailBda p86SignedZero npD6JointPrep npRemapIndex npContactPrePrep npRigidSumBatches npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npSlabRefCount npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiBitfield npArtiSpatialMatMat npArtiConstructSM npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npGridIndex npJacobiRotate npClothAtan npAnisoHelpers npSparseGridHash npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridLookup npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npDefFilterBda softBodyPsContactGen softBodyPsPrepare npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal particleSim femClothSim cvxCoreClothNp softBodySim particleContactSort femContactSort pcmManifold convexTrimeshMidphase convexHfMidphase midphaseAlloc triFeature deferContact initManifolds pairMgmt polyClip convexHull convexSat convexSelect particleGrid contactReduce cvxTriEmit cvxTriSetup sphereTriNp cvxHfSetup cvxHfPostProcess sphereHfCore hfTriFlagsBda segTriangleBda capTriangleBda capsuleHfCore radixWarp sortTriIndices cvxTriPostProcess cvxTriCorrelate cvxTriFinish npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psContactGen psContactSort psContactSolve psContactSolveTgs psContactSolveRigid psRigidAttachPrepare psRigidAttachSolve directApiRigidGet directApiD6JointGet directApiRadixCopy2 directApiMergeAabb directApiUpdateBodies psVolumeBound psShapeMatch rigidDeltaAccum psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide fcPrim2 npPolyClip4 fcConvexTri fcVertexConvex fcStaticTriCloth fcMidphase npSbPrim npSbRemap npCvxHfMid npTriPlaneNp npTriHfNp npCvxMeshNp npCvxHfNp npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce boxBoxNphase sphereNphase convexPlaneNphase broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap

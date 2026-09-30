@@ -373,21 +373,21 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "getArtiFixedTendonJointState", "npArtiGetSet.spv", "getArtiFixedTendonJointState" },  // ARTI_GET_FIXED_TENDON_JOINT_STATE (unmapped)
     { "getD6JointForces", "directApiBda.spv", "getD6JointForces" },  // D6_JOINT_GET_FORCE (P9.79)
     { "getD6JointTorques", "directApiBda.spv", "getD6JointTorques" },  // D6_JOINT_GET_TORQUE (P9.79)
-    { "updateDirtyAggregate", "broadphaseAggregateDirty.spv", "updateDirtyAggregate" },  // UPDATE_DIRTY_AGGREGATE
-    { "updateAggregateBounds", "broadphaseAggregateBounds.spv", "updateAggregateBounds" },  // UPDATE_AGGREGATE_BOUND
-    { "markAggregateBoundsUpdatedBitmap", "broadphaseAggregateBounds.spv", "markAggregateBoundsUpdatedBitmap" },  // MARK_AGGREGATE_BOUND_BITMAP
-    { "sortAndUpdateAggregateProjections", "broadphaseAggSortProjections.spv", "sortAndUpdateAggregateProjections" },  // AGG_SORT_UPDATE_PROJECTIONS
-    { "doSelfCollision", "broadphaseAggSelfCollision.spv", "doSelfCollision" },  // AGG_SELF_COLLISION
-    { "addAggPairsStage1", "broadphaseAggregatePairsAdd.spv", "addAggPairsStage1" },  // AGG_ADD_AGGPAIRS_STAGE_1
-    { "addAggPairsStage2", "broadphaseAggregatePairsAdd.spv", "addAggPairsStage2" },  // AGG_ADD_AGGPAIRS_STAGE_2
-    { "doAggPairCollisions", "broadphaseAggPairCollision.spv", "doAggPairCollisions" },  // AGG_PAIR_COLLISION
-    { "removeAggPairsStage1", "broadphaseAggregatePairsRemove.spv", "removeAggPairsStage1" },  // AGG_REMOVE_AGGPAIRS_STAGE_1
-    { "removeAggPairsStage2", "broadphaseAggregatePairsRemove.spv", "removeAggPairsStage2" },  // AGG_REMOVE_AGGPAIRS_STAGE_2
-    { "removeAggPairsStage3", "broadphaseAggregateFinalize.spv", "removeAggPairsStage3" },  // AGG_REMOVE_AGGPAIRS_STAGE_3
-    { "aggCopyReports", "broadphaseAggregateFinalize.spv", "aggCopyReports" },  // AGG_COPY_REPORTS
-    { "clearDirtyAggregates", "broadphaseAggregateDirty.spv", "clearDirtyAggregates" },  // CLEAR_DIRTY_AGGS
+    { "updateDirtyAggregate", "aggregateBda.spv", "updateDirtyAggregate" },  // UPDATE_DIRTY_AGGREGATE
+    { "updateAggregateBounds", "aggregateBda.spv", "updateAggregateBounds" },  // UPDATE_AGGREGATE_BOUND
+    { "markAggregateBoundsUpdatedBitmap", "aggregateBda.spv", "markAggregateBoundsUpdatedBitmap" },  // MARK_AGGREGATE_BOUND_BITMAP
+    { "sortAndUpdateAggregateProjections", "aggregateBda.spv", "sortAndUpdateAggregateProjections" },  // AGG_SORT_UPDATE_PROJECTIONS
+    { "doSelfCollision", "aggregateBda.spv", "doSelfCollision" },  // AGG_SELF_COLLISION
+    { "addAggPairsStage1", "aggregateBda.spv", "addAggPairsStage1" },  // AGG_ADD_AGGPAIRS_STAGE_1
+    { "addAggPairsStage2", "aggregateBda.spv", "addAggPairsStage2" },  // AGG_ADD_AGGPAIRS_STAGE_2
+    { "doAggPairCollisions", "aggregateBda.spv", "doAggPairCollisions" },  // AGG_PAIR_COLLISION
+    { "removeAggPairsStage1", "aggregateBda.spv", "removeAggPairsStage1" },  // AGG_REMOVE_AGGPAIRS_STAGE_1
+    { "removeAggPairsStage2", "aggregateBda.spv", "removeAggPairsStage2" },  // AGG_REMOVE_AGGPAIRS_STAGE_2
+    { "removeAggPairsStage3", "aggregateBda.spv", "removeAggPairsStage3" },  // AGG_REMOVE_AGGPAIRS_STAGE_3
+    { "aggCopyReports", "aggregateBda.spv", "aggCopyReports" },  // AGG_COPY_REPORTS
+    { "clearDirtyAggregates", "aggregateBda.spv", "clearDirtyAggregates" },  // CLEAR_DIRTY_AGGS
     { "copyUserData", nullptr, nullptr },  // COPY_USER_DATA (unmapped)
-    { "markAddedAndDeletedAggregatedBounds", "broadphaseAggregateFinalize.spv", "markAddedAndDeletedAggregatedBounds" },  // AGG_MARK_ADDED_DELETED_AGGREGATED_BOUNDS
+    { "markAddedAndDeletedAggregatedBounds", "aggregateBda.spv", "markAddedAndDeletedAggregatedBounds" },  // AGG_MARK_ADDED_DELETED_AGGREGATED_BOUNDS
     { "cloth_preIntegrateLaunch", "femClothSimBda.spv", "cloth_preIntegrateLaunch" },  // CLOTH_SIM_PREINTEGRATION (P7.0 BDA port: FEMCloth free-fall predict + integrate)
     { "cloth_refitBoundLaunch", "femClothRefitBda.spv", "cloth_refitBoundLaunch" },  // CLOTH_REFIT_BOUND (P7.2 tranche 3a BDA port)
     { "cloth_midphaseGeneratePairsLaunch", "femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch" },  // CLOTH_MIDPHASE_PRIMITIVES (P9.15b: cloth BV32 tree vs one rigid AABB)

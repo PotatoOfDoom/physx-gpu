@@ -44,6 +44,12 @@
 # DIFFERENT argument unread is a regression the bare name would hide.  The list
 # may SHRINK, never grow.
 #
+# Wiring a kernel for the first time is the one way in, and only with the
+# same one-by-one reading: P9.92's aggregate kernels add three lines because
+# their CUDA ignores the argument too -- `numAggregates` of updateDirtyAggregate
+# and clearDirtyAggregates (aggregate.cu:56, :119) and `aggDesc` of
+# markAddedAndDeletedAggregatedBounds (:1429).
+#
 # Reading PAST the row, and a row argument no declared field covers at all, are
 # separate outcomes and neither is ratchetable.
 #
@@ -55,6 +61,7 @@ artiSolveInternalConstraints1T                         6@32+8:staticContactUniqu
 artiSolveInternalConstraintsTGS1T                      6@32+8:staticContactUniqueIds;7@40+8:staticJointUniqueIds      # dead-upstream
 boxBoxNphase_Kernel                                    18@132+4:toleranceLength                                       # dead-upstream
 clearDeltaVRigidSecondLaunchMulti                      3@24+8:solverCoreDesc                                          # dead-upstream
+clearDirtyAggregates                                   1@8+4:numAggregates                                            # dead-upstream
 cloth_SphereContactGenLaunch                           0@0+4:toleranceLength                                          # dead-upstream
 cloth_boxTriangleContactGenLaunch                      0@0+4:toleranceLength                                          # dead-upstream
 cloth_clothContactPrepareLaunch                        4@32+8:clothMaterials                                          # dead-upstream
@@ -98,6 +105,7 @@ convexTrimeshCorrelate                                 5@40+8:cmOutputs;10@72+8:
 convexTrimeshPostProcess                               2@16+8:cvxTriIntermPtr                                         # dead-upstream
 markActiveSlabPGS                                      4@24+8:artiDesc                                                # deferred
 markActiveSlabTGS                                      6@32+8:artiDesc                                                # deferred
+markAddedAndDeletedAggregatedBounds                    1@8+8:aggDesc                                                  # dead-upstream
 midphaseGeneratePairs                                  9@64+8:cmOutputs                                               # dead-upstream
 preIntegrationLaunch                                   5@32+8:solverBodySleepDataPool                                 # dead-upstream
 preIntegrationLaunchTGS                                5@32+8:solverBodySleepDataPool                                 # dead-upstream
@@ -174,3 +182,4 @@ sphereNphase_Kernel                                    1@4+4:toleranceLength    
 sphereTrimeshNarrowphase                               15@120+4:stackSizeBytes                                        # dead-upstream
 triangleTriangleOverlaps                               5@40+8:cmOutputs                                               # dead-upstream
 updateBodiesLaunch_Part3                               1@8+4:dt;2@12+1:integrateWord                                  # dead-upstream
+updateDirtyAggregate                                   1@8+4:numAggregates                                            # dead-upstream

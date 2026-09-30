@@ -211,6 +211,20 @@ static const uint8_t kDescsIslandPGS[] = { 8, 8, 4 };
 //   (desc, sharedDesc) -> kTwoPtr.
 static const uint8_t kThresholdRadix[] = { 8, 8, 4 };
 
+// P9.92: gpubroadphase/src/CUDA/aggregate.cu (aggregateBda.slang), launched through the
+// void** form by PxgAABBManager:
+//   updateDirtyAggregate(PxgAggregate*, PxU32, PxU32*, PxgAggregate*, PxU32, const PxU32*,
+//     const PxU32*) -> 56-byte blob
+//   clearDirtyAggregates(PxgAggregate*, PxU32, PxU32*, PxU32) -> 32-byte blob
+//   markAddedAndDeletedAggregatedBounds(PxgBroadPhaseDesc*, PxgAggregateDesc*, PxU32*, PxU32,
+//     PxU32*, PxU32) -> 48-byte blob
+//   updateAggregateBounds(PxgAggregateDesc*, PxBounds3*, PxReal*) -> kAggThreePtr
+//   the rest take (desc) -> kOnePtr or two descs / a desc and a bitmap -> kTwoPtr
+static const uint8_t kAggUpdateDirty[] = { 8, 4, 8, 8, 4, 8, 8 };
+static const uint8_t kAggClearDirty[] = { 8, 4, 8, 4 };
+static const uint8_t kAggMarkAddedDeleted[] = { 8, 8, 8, 4, 8, 4 };
+static const uint8_t kAggThreePtr[] = { 8, 8, 8 };
+
 // computeAverageSolverBodyVelocity / propagateSolverBodyVelocity
 //   (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*)
 //   -> kTwoPtr (16 bytes)
@@ -1731,6 +1745,22 @@ static const PxgKernelAbiRow kRows[] = {
     { "propagateStaticSolverBodyVelocities", kPropagateStaticPGS, uint32_t(sizeof(kPropagateStaticPGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
     { "integrateCoreParallelLaunch", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
+    // aggregate.cu, the GPU broadphase's aggregate path (P9.92, aggregateBda.spv);
+    // launched by PxgAABBManager.cpp:679-764 and :1223-1363 when an aggregate exists
+    { "updateDirtyAggregate", kAggUpdateDirty, uint32_t(sizeof(kAggUpdateDirty)) },
+    { "clearDirtyAggregates", kAggClearDirty, uint32_t(sizeof(kAggClearDirty)) },
+    { "markAggregateBoundsUpdatedBitmap", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "updateAggregateBounds", kAggThreePtr, uint32_t(sizeof(kAggThreePtr)) },
+    { "markAddedAndDeletedAggregatedBounds", kAggMarkAddedDeleted, uint32_t(sizeof(kAggMarkAddedDeleted)) },
+    { "sortAndUpdateAggregateProjections", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "doSelfCollision", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "doAggPairCollisions", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "aggCopyReports", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "addAggPairsStage1", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "addAggPairsStage2", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "removeAggPairsStage1", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "removeAggPairsStage2", kOnePtr, uint32_t(sizeof(kOnePtr)) },
+    { "removeAggPairsStage3", kOnePtr, uint32_t(sizeof(kOnePtr)) },
     // accumulateThresholdStream.cu, the force-threshold reporting pipeline (P9.91,
     // thresholdStreamBda.spv); launched by PxgCudaSolverCore.cpp:1666-1845 and
     // PxgTGSCudaSolverCore.cpp:1790-1969 when mHasForceThresholds

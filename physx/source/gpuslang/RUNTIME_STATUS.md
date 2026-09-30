@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **880/880** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **881/881** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.92: the GPU broadphase's aggregate path: all 14 kernels of aggregate.cu on the engine ABI
+(aggregateBda.spv; none had a launch-ABI row), observed by PXG_SCENE=aggregate (self-collision on and
+off, aggregate-aggregate, aggregate-actor): all nine bodies at the CPU rest heights under GPU TGS and
+PGS, where before every one fell through the ground.  KNOWN_UNWIRED 36 -> 22.  85 mutants: 80 killed,
+5 equivalent.  Upstream candidates: countComparisons counts a start-mask word past the projections;
+a grid-size precedence slip; shWarpSum reused across waves without a barrier.  Scenes 59/59.
 P9.91: GPU force-threshold reporting: all 14 kernels of accumulateThresholdStream.cu on the
 engine ABI (thresholdStreamBda.spv; 2 were unmapped, 12 had no launch-ABI row), observed by
 PXG_SCENE=forcethreshold under GPU TGS and PGS: FOUND/PERSISTS/LOST step for step as the CPU
@@ -2072,6 +2078,177 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.92 — Aggregat-Broadphase: alle 14 Kernel aus aggregate.cu auf dem Engine-ABI
+
+**Ausgangslage.** Mit der eGPU-Broadphase bearbeitet `PxgAABBManager` jedes `PxAggregate` selbst
+(aggregate.cu, 14 Kernel). Die zusammengeführte Bound eines Aggregats geht in die eigentliche
+Broadphase. Die Paare **innerhalb** eines Aggregats (Self-Collision) und die zwischen einem Aggregat
+und allem anderen finden die Aggregat-Kernel, nicht der SAP. Keine der 58 Szenen legte ein Aggregat
+an. Alle 14 Kernel waren gemappt, aber auf die Phase-1-Binding-Ports (`broadphaseAggregate*.spv`,
+`broadphaseAgg*.spv`). Keiner hatte eine Launch-ABI-Zeile, alle standen in `KNOWN_UNWIRED`.
+
+**Erst der Beobachter: `PXG_SCENE=aggregate`.** Boxen von je 1000 kg in vier Gruppen, jede an
+ihrem eigenen x. Jede Gruppe entscheidet eine Ruhehöhe, die nur ein funktionierender Aggregat-Pfad
+liefert:
+
+- `selfstack` (x = −6): ein Aggregat **mit** Self-Collision, drei Boxen mit Lücken fallen gelassen.
+  Sie stapeln sich auf 0.5 / 1.5 / 2.5. Der Stapel braucht die Self-Paare, die unterste Box das
+  Aggregat-Akteur-Paar mit dem Boden.
+- `noself` (x = −2): ein Aggregat **ohne** Self-Collision, zwei Boxen übereinander. Die obere muss
+  durch die untere **hindurch**fallen, beide enden auf 0.5. Ein fälschlich erzeugtes Self-Paar
+  stapelt sie auf 0.5 / 1.5.
+- `aggagg` (x = +2): eine Box in einem Aggregat liegt am Boden, eine Box in einem **zweiten**
+  Aggregat fällt darauf: 0.5 / 1.5 über ein Aggregat-Aggregat-Paar.
+- `actoragg` (x = +6): eine gewöhnliche, nicht aggregierte Box fällt auf eine Box in einem
+  Aggregat: 0.5 / 1.5 über ein Aggregat-Akteur-Paar zwischen zwei **dynamischen** Körpern.
+
+Die CPU-Kontrolle (`PXG_CPU_CONTROL=1`) legt alle neun Körper auf genau diese Höhen.
+
+**Rot gemessen, vor dem Port (GPU-TGS):**
+
+- Alle neun Körper fallen durch den Boden, auch die nicht aggregierte Box von `actoragg`: End-y
+  −74.0 … −77.8, |v| = 39.24.
+- `PXG_LAUNCH_TRACE`:
+  - je 240× abgewiesen: `updateAggregateBounds`, `sortAndUpdateAggregateProjections`,
+    `doSelfCollision`, `doAggPairCollisions`, `aggCopyReports`, die zwei `addAggPairsStage*` und
+    die drei `removeAggPairsStage*`;
+  - 239× `markAggregateBoundsUpdatedBitmap`;
+  - je 1× `updateDirtyAggregate`, `clearDirtyAggregates` und `markAddedAndDeletedAggregatedBounds`,
+    weil nur der erste Frame neue Aggregate hat.
+
+**Der Port: `aggregateBda.slang`.** Er enthält alle 14 Kernel so, wie `PxgAABBManager` sie startet
+(void**-Form, `KERNEL_PARAM_TYPE`-Pakete). Jeder Puffer wird per BDA über den echten
+`PxgAggregateDesc` / `PxgBroadPhaseDesc` und die `PxgAggregate`-Records (136 Bytes) erreicht. Die
+Einzelheiten:
+
+- **Eine virtuelle Warp nach der anderen.** Die CUDA arbeitet warp-pro-Element mit `blockDim.y`
+  Warps pro Block und synchronisiert nur auf Warp-Ebene. Hier ist eine Workgroup **eine** Warp aus
+  32 Lanes, die die Warps ihres Blocks nacheinander abläuft. Die Warps eines Blocks reden in diesen
+  Kerneln nie miteinander, also ändert das nur die Reihenfolge der globalen Atomics, die
+  Report-Slots vergeben. Die ist in der CUDA ebenfalls ungeordnet. Jede Schleife mit einem
+  Warp-Primitiv hat eine warp-uniforme Trip-Anzahl, wie die CUDA es für ihre FULL_MASK-Primitive
+  verlangt. Die 1024-Thread-Kernel (`addAggPairsStage1`, `removeAggPairsStage1/2`) nutzen den
+  Tile-Ballot/-Shuffle.
+- **Sub-Word-Stores** (`PxgAggregate::isNew`, `PxgAggregatePair::isNew/isDead` und die drei
+  Überlauf-Bools des Deskriptors) sind das InterlockedAnd/Or-Paar (check_subword_store).
+- **`updateAggregateBounds`** faltet die Member mit `PxVec3::minimum/maximum`, also mit
+  PxMin/PxMax-Selects, der laufende Wert zuerst. Danach kommt der XOR-Butterfly (Radius 1, 2, 4, 8,
+  16) mit `PxMin(partner, own)`. Der Wert des Partners ist der **erste** Operand, also behält die
+  Lane bei einem ±0-Gleichstand oder einem NaN ihren eigenen Wert. Das leere Aggregat ist
+  `setEmpty` mit 0x7e7fffff.
+- **`sortAndUpdateAggregateProjections`** sortiert mit `radixSortSingleWarp` (RadixSort.cuh:702).
+  Das ist neu in `pxgSlangRadixWarp.slang` als `rsSortSingleWarp` und `rsPassKR`: acht
+  Vier-Bit-Pässe über Keys **und** Ranks, deren Temp-Hälfte die zweite Hälfte derselben Arrays
+  ist. So landen beide Hälften genau so im Speicher wie bei der CUDA. `sanitizeKeys` fasst nur die
+  Keys an, also tragen Padding-Lanes ihren Rang roh mit.
+- **`doAggPairCollisions`** baut für ein einzelnes Akteur-Gegenüber die Ein-Box-Struktur der CUDA
+  (aggregate.cu:992-1005) im Groupshared-Speicher. Höchstens **eine** Seite eines Paars ist ein
+  einzelner Akteur, denn Akteur-Akteur-Paare erreichen die Aggregat-Paarliste nie. Deshalb reicht
+  ein Satz Groupshared-Worte.
+- **`removeAggPairsStage1/2`** setzen zwischen zwei Wellen eine Barriere, die der CUDA fehlt (siehe
+  Upstream-Kandidat 3).
+
+Manifest bleibt bei **423**, die 14 Zeilen zeigen jetzt auf `aggregateBda.spv`. `KNOWN_UNWIRED`
+**36 → 22**, engine-erreichbar ungemappt bleibt bei **9**. `push_block_known.txt` bekommt drei
+Zeilen, jede gegen die CUDA gelesen und upstream tot: `numAggregates` von `updateDirtyAggregate`
+und `clearDirtyAggregates` (aggregate.cu:56, :119) und `aggDesc` von
+`markAddedAndDeletedAggregatedBounds` (:1429). `barrier_uniformity_waivers.txt` bekommt einen
+Waiver mit Beweis. Die Paarschleife von `boxPruningProjection` läuft bis `totalCount`, und das ist
+`warpShfl(lane, inclusiveSum, 31u)`: Jede Lane liest `gsLane[31]` nach der Barriere, und die
+Workgroup ist die eine 32-Lane-Warp. Die CUDA-Schranke ist derselbe `__shfl_sync`-Broadcast. Der
+Checker taintet flussinsensitiv über das `lane`-Argument.
+
+**Die Fixture: `testAggregateBda.cpp`** mit drei Tests. Jeder Kernel bekommt den Push-Blob, den
+`PxgAABBManager` baut, und das Grid der Engine, über Speicher im Layout der echten Records:
+`PxgAggregate` 136, `PxgAggregateDesc` 136, `PxgAggregatePair` 12, `Bp::VolumeData` 16, dazu der
+Broadphase-Deskriptor. Das Orakel ist eine wörtliche C++-Abschrift jedes Kernels auf denselben
+Puffern. Danach wird **jeder Puffer bitweise** verglichen, auch Bytes, die die CUDA liegen lässt
+(vorher auf beiden Seiten vergiftet).
+
+Nur die Found/Lost-Reports werden als **Multimengen** verglichen. Ihre Slots vergibt ein globales
+`atomicAdd` pro Warp, die Reihenfolge ist also auch in der CUDA ungeordnet. Ihre **Anzahlen** sind
+exakt. Die Überlauf-Fälle laufen mit einem einzigen Aggregat, dort ist die Reihenfolge fest, und
+werden Wort für Wort verglichen.
+
+- **`aggregateBda_dirtyBounds`:**
+  - `updateDirtyAggregate` für neue und bestehende Records, darunter ein veraltetes `prevSize`
+    und Records, die schrumpfen und ihren `mIndex` verschieben; der Vergleich läuft direkt nach
+    der Stufe;
+  - `clearDirtyAggregates`, `markAggregateBoundsUpdatedBitmap`,
+    `markAddedAndDeletedAggregatedBounds`;
+  - `updateAggregateBounds` mit zwei gerichteten Aggregaten: eines mit Kontaktabstand −0.0f,
+    Membern mit max ±0 / −1 und einem NaN, eines, dessen Member alle leer sind (min +inf,
+    max −inf).
+- **`aggregateBda_sortSelf`:** zwei Frames Sortierung und `doSelfCollision` über 34 Aggregate mit
+  1..70 Membern (Frame 1: 1293 gefunden; Frame 2: 865 gefunden, 1003 verloren). Zwischen den
+  Frames ändert sich die Mitgliedschaft: ein Aggregat verliert 9 Member, eines gewinnt 6 bei
+  Kapazität Größe+8. Dazu kommt ein Report-Überlauf mit einem Aggregat.
+- **`aggregateBda_pairs`:** der Aggregat-Paar-Pool:
+  - `addAggPairsStage1/2` in freie und neue Slots, dabei 100 neue Paare bei 150 freien;
+  - `doAggPairCollisions` über Aggregat-Aggregat- und Aggregat-Akteur-Paare (21791 gefunden,
+    8328 verloren), mit gleichen Gruppen-IDs, einem entfernten Handle und einem toten Paar;
+    ein Aggregat schrumpft zwischen den zwei Sortierungen um 3 Member, verglichen nach der
+    ersten;
+  - `removeAggPairsStage1/2/3` über zwei Wellen (40000 Paare, 6698 entfernt), `aggCopyReports`;
+  - eine eigene Überlauf-Welt mit einem Aggregat: zu viele neue Aggregat-Paare, der Pool über
+    seinem Maximum und die Reports über ihrem.
+
+**Mutations-Sweep** (`aggregateBda.spv`, frisch gebaut): 79 Mutanten über die 14 Kernel, dazu 6 über
+den neuen Keys+Ranks-Radix-Pass. Der erste Lauf ließ 17 überleben. Zwölf davon waren
+Fixture-Lücken, geschlossen in zwei Runden und danach getötet:
+
+- `prevSize = size` in `updateDirtyAggregate` und in `clearDirtyAggregates`;
+- die `mIndex`-Kopie;
+- der ±0-Gleichstand im Butterfly (FMax statt Select) und das Empty-Extent 0x7e7fffff statt
+  FLT_MAX;
+- die Lost-Paare über die Größe des Vorframes, in `doSelfCollision` wie auf der Paar-Seite;
+- die Gruppen-Gleichheit;
+- das Low-Bit von `isAggregate`;
+- das Oder im Found-Überlauf-Flag;
+- die Zahl der neuen freien Slots;
+- die Addition auf die Freiliste in Stufe 3.
+
+Die übrigen fünf sind äquivalent:
+
+- **`so-bi-odd`** (`boundIndices` aus der ungeraden statt der geraden Projektion): beide
+  Projektionen eines Members schreiben denselben Wert `updateBoundIndices[id]`.
+- **`se-end-mask`** (`(1<<k)−1` statt `(2<<k)−1` am Ende der Zählung in `doSelfCollision`): Bit
+  `endIdx` ist die eigene End-Projektion des Members, also nie ein Start-Bit.
+- **`ith-upper`** (`getIthBit` sucht ab 0 statt ab i): das i-te gesetzte Bit kann nicht unter
+  Position i liegen, die Untergrenze verkürzt nur die Suche.
+- **`pc-last`** (`<` statt `<=` in der Suche nach der letzten Projektion): die Suche geht auf ein
+  max-Encoding (ungerade), also kann Gleichheit nur End-Projektionen treffen, deren Start-Bit 0
+  ist. Die Zählung bleibt gleich.
+- **`sd-shared-handle`** (Handle-Index 1 statt 0 für die Ein-Box-Seite): beide
+  `gsSideBi`-Slots halten denselben Akteur.
+
+**Gesamt 85 Mutanten: 80 getötet (16 davon durch einen Fault), 5 äquivalent.**
+
+**Szene grün:** Unter GPU-TGS und GPU-PGS liegen alle neun Körper auf den Ruhehöhen der
+CPU-Kontrolle, kein Launch wird abgewiesen. `run_scenes.sh` führt `aggregate` aus, Szenen
+**58 → 59**.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+
+1. **`countComparisons` (aggregate.cu:737) zählt ein Maskenwort hinter den Projektionen.**
+   Voraussetzungen: ein Objekt liegt rechts von allen Projektionen der Gegenseite, und
+   `nbProjections` ist ein Vielfaches von 32. Dann ist `startIdx = nb` und `endIdx = nb − 1`, die
+   Schleife läuft nicht, und beide Masken (`~((1<<0)−1)` und `(2<<31)−1`) sind voll. Gezählt wird
+   also das ganze Wort `startMasks[nb/32]`. Es stammt aus einem früheren Frame. Ist das Aggregat
+   bis zu seiner Kapazität gefüllt, liegt es hinter der Allokation von `(maxNumShapes·2+31)/32`
+   Worten (PxgAABBManager.cpp:275). Die gezählten Scheinvergleiche löst die Paarsuche über Slots
+   hinter `nb` auf. Port und Orakel übernehmen das wörtlich.
+2. **Präzedenzfehler im Grid von `markAddedAndDeletedAggregatedBounds`** (PxgAABBManager.cpp:677):
+   `(PxMax(a, b) + (128 − 1) / 128)` ergibt `max(a, b)` Blöcke statt ⌈max/128⌉. Das sind 128× zu
+   viele Blöcke, harmlos wegen des Guards. Die überzähligen Workgroups kehren sofort zurück.
+3. **`removeAggPairsStage1/2`** (aggregate.cu:1277/:1335) benutzen `shWarpSum` in der nächsten
+   Welle ohne `__syncthreads` nach dem Lesen. Warp y ≠ 0 kann sein Wort für Welle i+1 schreiben,
+   bevor Warp 0 es für Welle i gelesen hat. Das passiert erst ab mehr als 32768 Paar-Masken, also
+   ab zwei Wellen. Der Port setzt dort eine Barriere und liefert damit die geordnete Antwort. Die
+   Fixture fährt zwei Wellen.
+
+**Suite:** 881/881 in beiden Speichermodi. **Szenen:** 59/59.
 
 ## P9.91 — Force-Threshold-Meldungen: die ganze Pipeline aus accumulateThresholdStream.cu auf dem Engine-ABI
 

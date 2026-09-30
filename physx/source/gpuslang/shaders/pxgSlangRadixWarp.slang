@@ -284,3 +284,145 @@ public void rsSortSingleWarpKeysOnly(uint lane, uint64_t gInputKeys, uint gNumOf
         const uint64_t t = k0; k0 = k1; k1 = t;
     }
 }
+
+// --------------------------------------------------------------------------
+// P9.92: the KEYS+RANKS pass, radixSortPassSingleWarp (RadixSort.cuh:450-577), for
+// `radixSortSingleWarp` (:702-721), which sortAndUpdateAggregateProjections
+// (aggregate.cu:325) drives.  Identical to rsPass above except that each uint4 row
+// of RANKS is read beside its keys -- raw: sanitizeKeys touches the keys only, so a
+// padding lane carries whatever its rank slot holds -- and written beside each key.
+// --------------------------------------------------------------------------
+void rsPassKR(uint lane, uint64_t gInputKeys, uint64_t gInputRanks, uint gNumOfKeys, uint numUint4,
+              uint64_t gOutputKeys, uint64_t gOutputRanks, uint startBit)
+{
+    uint radixAccum[8];
+    for (uint i = 0u; i < 8u; ++i)
+        radixAccum[i] = 0u;
+
+    for (uint i = lane; i < numUint4; i += RS_WARP)
+    {
+        uint4 keyValue = Ptr<uint4>(gInputKeys)[i];
+        rsSanitizeKeys(keyValue, i * 4u, gNumOfKeys);
+        const uint4 radix = rsGetRadix(keyValue, startBit);
+
+        for (uint bit = 0u; bit < 16u; bit += 2u)
+        {
+            uint accum = rsShl(1u, (radix.x - bit) << 4u);
+            accum += rsShl(1u, (radix.y - bit) << 4u);
+            accum += rsShl(1u, (radix.z - bit) << 4u);
+            accum += rsShl(1u, (radix.w - bit) << 4u);
+            radixAccum[bit / 2u] += accum;
+        }
+    }
+
+    uint accumValue = 0u;
+    for (uint i = 0u; i < RS_RADIX_SIZE; i += 2u)
+    {
+        const uint val = rsReduceAdd(lane, radixAccum[i / 2u]);
+        const uint v0 = val & 0xffffu;
+        const uint v1 = val >> 16;
+
+        if (lane == 0u)
+        {
+            gsRsRunsum[i] = accumValue;
+            gsRsRunsum[i + 1u] = accumValue + v0;
+        }
+        accumValue += v0 + v1;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint i = 0u; i < numUint4; i += RS_WARP)
+    {
+        const uint inputKeyIndex = i + lane;
+
+        uint4 keyValue = uint4(0u, 0u, 0u, 0u);
+        uint4 keyIndex = uint4(0u, 0u, 0u, 0u);
+        uint4 radix = uint4(0xffu, 0xffu, 0xffu, 0xffu);
+
+        if (inputKeyIndex < numUint4)
+        {
+            keyIndex = Ptr<uint4>(gInputRanks)[inputKeyIndex];
+            keyValue = Ptr<uint4>(gInputKeys)[inputKeyIndex];
+            rsSanitizeKeys(keyValue, inputKeyIndex * 4u, gNumOfKeys);
+            radix = rsGetRadix(keyValue, startBit);
+        }
+
+        for (uint r = 0u; r < RS_RADIX_SIZE; r += 4u)
+        {
+            const uint rankX = radix.x - r;
+            const uint rankY = radix.y - r;
+            const uint rankZ = radix.z - r;
+            const uint rankW = radix.w - r;
+
+            const uint accum = rsShl(1u, rankX << 3u) + rsShl(1u, rankY << 3u)
+                             + rsShl(1u, rankZ << 3u) + rsShl(1u, rankW << 3u);
+
+            uint val = rsScanAddInclusive(lane, accum);
+            const uint val2 = rsExchange(lane, val, RS_WARP - 1u);
+
+            val -= accum;
+
+            if (accum != 0u)
+            {
+                if (rankX < 4u)
+                {
+                    const uint outputIndex = gsRsRunsum[radix.x] + ((val >> (rankX << 3u)) & 0xffu);
+                    val += 1u << (rankX << 3u);
+                    Ptr<uint>(gOutputKeys)[outputIndex] = keyValue.x;
+                    Ptr<uint>(gOutputRanks)[outputIndex] = keyIndex.x;
+                }
+                if (rankY < 4u)
+                {
+                    const uint outputIndex = gsRsRunsum[radix.y] + ((val >> (rankY << 3u)) & 0xffu);
+                    val += 1u << (rankY << 3u);
+                    Ptr<uint>(gOutputKeys)[outputIndex] = keyValue.y;
+                    Ptr<uint>(gOutputRanks)[outputIndex] = keyIndex.y;
+                }
+                if (rankZ < 4u)
+                {
+                    const uint outputIndex = gsRsRunsum[radix.z] + ((val >> (rankZ << 3u)) & 0xffu);
+                    val += 1u << (rankZ << 3u);
+                    Ptr<uint>(gOutputKeys)[outputIndex] = keyValue.z;
+                    Ptr<uint>(gOutputRanks)[outputIndex] = keyIndex.z;
+                }
+                if (rankW < 4u)
+                {
+                    const uint outputIndex = gsRsRunsum[radix.w] + ((val >> (rankW << 3u)) & 0xffu);
+                    val += 1u << (rankW << 3u);
+                    Ptr<uint>(gOutputKeys)[outputIndex] = keyValue.w;
+                    Ptr<uint>(gOutputRanks)[outputIndex] = keyIndex.w;
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            if (lane == 0u)
+            {
+                gsRsRunsum[r] += val2 & 0xffu;
+                gsRsRunsum[r + 1u] += (val2 >> 8) & 0xffu;
+                gsRsRunsum[r + 2u] += (val2 >> 16) & 0xffu;
+                gsRsRunsum[r + 3u] += (val2 >> 24) & 0xffu;
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+}
+
+// radixSortSingleWarp (RadixSort.cuh:702): `nbPasses` four-bit passes ping-ponging keys
+// and ranks between the input and temp regions.
+public void rsSortSingleWarp(uint lane, uint64_t gInputKeys, uint64_t gInputRanks, uint gNumOfKeys,
+                             uint numUint4, uint64_t gTempKeys, uint64_t gTempRanks, uint nbPasses)
+{
+    uint64_t k0 = gInputKeys;
+    uint64_t k1 = gTempKeys;
+    uint64_t r0 = gInputRanks;
+    uint64_t r1 = gTempRanks;
+
+    for (uint i = 0u; i < nbPasses; ++i)
+    {
+        rsPassKR(lane, k0, r0, gNumOfKeys, numUint4, k1, r1, i * 4u);
+        uint64_t t = k0; k0 = k1; k1 = t;
+        t = r0; r0 = r1; r1 = t;
+    }
+}

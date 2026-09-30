@@ -52,3 +52,12 @@ npTriTriFind.slang | call | while ((startIndex < nbTriangles || numTrianglesToSu
 # WARP because they come out of collectives that take tid.
 triTriCollisionBda.slang | scope | while (i < nbTriangles || numTrianglesToSubdividePerThread > 0u) | numTrianglesToSubdividePerThread is every thread's read of gTtfNumSubdivide after the :1204 barrier that follows thread 0's publish; i is every thread's read of gSdfOffset after the gather's final barrier -- the cu:1064 argument of the P9.83b-8 refine map, as for npTriTriFind
 triTriCollisionBda.slang | call | while (i < nbTriangles || numTrianglesToSubdividePerThread > 0u) | same loop, same two block-uniform reads: every thread calls the gather, addToRefinementBuffer, the count and the assignment the same number of times
+
+# --- aggregateBda.slang (P9.92) ----------------------------------------------
+# boxPruningProjection (aggregate.cu:767): the pair loop runs to totalCount, which is
+# `warpShfl(lane, inclusiveSum, 31u)` -- every lane writes gsLane[lane], the barrier
+# follows, and every lane reads gsLane[31].  The workgroup is ONE warp of 32 lanes
+# (numthreads(32,1,1), the virtual-warp scheme in the file header), so that read is the
+# same value in every thread of the group.  The checker taints the call's result by its
+# `lane` argument; the CUDA's own loop bound is the same __shfl_sync broadcast.
+aggregateBda.slang | call | for (uint b = 0u; b < totalCount; b += WARP) | totalCount is warpShfl(lane, inclusiveSum, 31u): every lane reads gsLane[31] after the barrier that follows every lane's write, and the workgroup is the one 32-lane warp, so warpBallot and warpShfl are reached the same number of times in every thread

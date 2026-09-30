@@ -82,13 +82,8 @@ KNOWN_UNWIRED = {
     # caller and it runs only under the direct-GPU API, so PXG_SCENE=directapi is
     # what finally launched them (and found them refused).
     "applyTGSSubstepGravity",
-    # the aggregate broadphase
-    "updateDirtyAggregate", "updateAggregateBounds",
-    "markAggregateBoundsUpdatedBitmap", "sortAndUpdateAggregateProjections",
-    "doSelfCollision", "addAggPairsStage1", "addAggPairsStage2",
-    "doAggPairCollisions", "removeAggPairsStage1", "removeAggPairsStage2",
-    "removeAggPairsStage3", "aggCopyReports", "clearDirtyAggregates",
-    "markAddedAndDeletedAggregatedBounds",
+    # (P9.92 wired the aggregate broadphase -- all fourteen kernels of aggregate.cu --
+    # behind PXG_SCENE=aggregate.)
     # generic scan / radix utilities the engine drives through its own launchers
     "scanPerBlockKernel", "scanPerBlockKernel4x4", "addBlockSumsKernel",
     "addBlockSumsKernel4x4", "radixFourBitCountPerBlockKernel",
