@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.94a: transformInvTransform (pxgSlangCommon, five callers incl. the two engine cloth contact
+kernels) and the shared oracle TransformV::transformInv now spell PxTransform::transformInv literally
+(conjugate rotate; differs from rotateInv in the sign of exact zeros).  Five directed zero-sign
+fixtures with twin checks; 10/10 revert mutants killed.  Scenes 64/64.
 P9.93: the write half of the direct-GPU API (five setters), both acceleration getters and
 updateBodyExternalVelocitiesLaunch on the engine ABI, observed by PXG_SCENE=directapiwrite and
 PXG_SCENE=extforce under GPU TGS and PGS (plus a directapi PGS row).  Two spellings fixed in the
@@ -2085,6 +2089,68 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.94a — `transformInvTransform`: der gemeinsame Helfer rechnet `PxTransform::transformInv` jetzt wörtlich
+
+**Ausgangslage.** Der Audit aus P9.93 hat 178 inverse Rotationen gegen ihre CUDA-Schreibweise
+geprüft und 35 Abweichungen bestätigt. Die erste Einheit ist der gemeinsame Helfer
+`transformInvTransform` (pxgSlangCommon.slang). Er spiegelt `PxTransform::transformInv(PxTransform)`,
+also `qinv = q.getConjugate(); (qinv.rotate(src.p − p), qinv * src.q)` (PxTransform.h:162-169),
+rechnete p aber mit `quatRotateInv(q, src.p − p)`. Das ergibt dieselben Bits bis auf das Vorzeichen
+exakter Nullen. Alle fünf Aufrufer spiegeln genau diesen CUDA-Aufruf:
+
+- `femClothMeshContactGenBda` (engine, `cloth_meshContactGenLaunch`);
+- `femClothHfContactGenBda` (engine, `cloth_heightfieldContactGenLaunch`);
+- `npTriPlaneNp`, `npTriHfNp` und `fcStaticTriCloth` (Fixture-Ports).
+
+**Die Korrektur** ist eine Zeile im Helfer: `quatRotate(qinv, b.p − a.p)`. Das gemeinsame Orakel
+`TransformV::transformInv` in `pxgRefMath.h` rechnet jetzt ebenfalls wörtlich. Damit wurde die
+Prüfung in `testUpdateBounds.cpp`, die „rotateInv und conj().rotate stimmen hier überein“
+behauptete, zur Tautologie. Sie vergleicht jetzt rotateInv gegen die Konjugierte. Ein neuer Pin
+(identity.transformInv((−0,−0,1)) ergibt p.x = −0) tötet einen Revert des Orakels.
+
+**Keine vorhandene Fixture sah den Unterschied.** Ihre Eingaben erzeugen nie die nötigen exakten
+Nullen, und ihre Vergleiche sind toleranzbasiert oder vorzeichenblind. Deshalb gibt es fünf neue
+gerichtete Tests: `npTriPlaneNp_p94ZeroSign`, `npTriHfNp_p94ZeroSign`, `fcStaticTriCloth_p94ZeroSign`,
+`femClothSimMeshContactGenP94ZeroSign` und `femClothSimHeightfieldContactGenP94ZeroSign`. Jeder
+arbeitet so:
+
+- er rechnet das gespeicherte Ausgabewort mit dem wörtlichen Orakel;
+- er rechnet es ein zweites Mal mit einem Zwillings-Flag, das das alte Spelling einschaltet;
+- er prüft, dass beide Ergebnisse sich unterscheiden;
+- er verlangt, dass die GPU bitweise dem wörtlichen Ergebnis entspricht.
+
+Die Fälle sind so gebaut, dass beide Richtungen vorkommen (CUDA −0 gegen alt +0 und umgekehrt):
+
+| Test | gespeichertes Wort | Beispiel CUDA / alt |
+|---|---|---|
+| npTriPlaneNp | `gManRel[1].xyz` | (−16, +0, +0) / (−16, −0, −0) |
+| npTriHfNp | Separation im Kontaktstrom | −0 / +0 |
+| fcStaticTriCloth | `np.w`, `gDebug.z` | +0 / −0 |
+| Cloth-Mesh | `normalPen.w` | 0x00000000 bzw. 0x80000000 |
+| Cloth-Heightfield | `normalPen.w` | 0x00000000 bzw. 0x80000000 |
+
+Die Oracles von `testNpTriPlaneNp`, `testNpTriHfNp`, `testFcStaticTriCloth` und `testFemClothSim`
+rechnen jetzt wörtlich. Der Vergleich der Relativtransformation in `npTriPlaneNp` ist bitweise.
+Die Tests entstanden in einem sequenziellen Workflow, pro Datei ein Agent, geplant und
+gegengeprüft von einem vorgeschalteten Planungs-Workflow.
+
+**Mutations-Sweep** (frisch gebaut, Modul `pxgSlangCommon` über jeden der fünf Importeure): Der
+Revert auf `quatRotateInv` und die Variante `−quatRotate(qinv, a.p − b.p)` werden in allen fünf
+getötet, 10 von 10.
+
+**Weitergegeben an P9.94b ff.** Der Gegenleser fand dasselbe Spelling unter anderen Helfernamen,
+die der erste Audit nicht erfasste:
+
+- `triPlaneNpBda.slang:231` (engine, `npAbiQuatRotateInv`; braucht eine eigene Engine-ABI-Fixture);
+- `pxgSlangCapsuleHfCore.slang:255` (sein Kommentar behauptet fälschlich Bitgleichheit);
+- `npCvxPlaneNphase.slang:275`, `npCvxStage2Core.slang:102`, `cvxCoreClothNpBda.slang:440`,
+  `cvxCoreTetNpBda.slang:342`, `pxgSlangTriTriOverlap.slang:174`.
+
+Dazu kommen die übrigen 29 bestätigten Stellen aus P9.93. Die Suche braucht einen zweiten Audit
+über alle Helfernamen für inverse Rotation.
+
+**Suite:** 883/883 in beiden Speichermodi. **Szenen:** 64/64.
 
 ## P9.93 — Die Schreibseite der Direct-GPU-API, die zwei Beschleunigungs-Getter und `updateBodyExternalVelocitiesLaunch` auf dem Engine-ABI; zwei Spellings im gemeinsamen Cache/Bound-Modul
 

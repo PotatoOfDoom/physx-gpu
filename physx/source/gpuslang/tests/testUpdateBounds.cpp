@@ -101,7 +101,7 @@ TransformV getAbsPose(const TransformV& body2World, const TransformV& shape2Acto
 {
     // P9.93: PxTransform::transformInv(PxTransform) LITERALLY (PxTransform.h:162-169):
     // the conjugate's rotate, not rotateInv -- they differ in the sign of exact zeros.
-    // (TransformV::transformInv in pxgRefMath.h spells rotateInv.)
+    // (TransformV::transformInv in pxgRefMath.h spells it the same way since P9.94a.)
     const QuatV qinv = body2Actor.q.getConjugate();
     const TransformV t0(qinv * shape2Actor.q, qinv.rotate(shape2Actor.p - body2Actor.p));
     return body2World.transform(t0);
@@ -1342,6 +1342,17 @@ PXG_TEST(setRigidDynamicGlobalPose_convexZeroTie)
 {
     auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
 
+    // P9.94a pin: pxgRefMath's TransformV::transformInv must be the CUDA's
+    // getConjugate().rotate, not rotateInv.  identity.transformInv((-0,-0,1)):
+    // the conjugate's x lane is -0, rotateInv's is +0.
+    {
+        const TransformV pin = TransformV(QuatV(0.f, 0.f, 0.f, 1.f), Vec3(0.f, 0.f, 0.f))
+                                   .transformInv(TransformV(QuatV(0.f, 0.f, 0.f, 1.f), Vec3(-0.f, -0.f, 1.f)));
+        PXG_CHECK_MSG(bits(pin.p.x) == 0x80000000u && bits(pin.p.y) == 0u && bits(pin.p.z) == 0x3f800000u,
+                      "P9.94a: TransformV::transformInv must be conj().rotate (got %08x %08x %08x)",
+                      bits(pin.p.x), bits(pin.p.y), bits(pin.p.z));
+    }
+
     std::vector<BodySim> bodySims(1);
     std::memset(bodySims.data(), 0, sizeof(BodySim));
     bodySims[0].body2World.q = Float4{ 0.f, 0.f, 0.f, 1.f };
@@ -1444,12 +1455,13 @@ PXG_TEST(setRigidDynamicGlobalPose_convexZeroTie)
     for (uint32_t s = 0; s < numShapes; ++s)
     {
         const TransformV shape2Actor(shapeSims[s].transform);
-        // the mirror's transformInv uses rotateInv; the CUDA's PxTransform::
-        // transformInv is getConjugate().rotate -- pin that both agree on this input
-        const TransformV t0a = body2Actor.transformInv(shape2Actor);
+        // rotateInv and the CUDA's getConjugate().rotate agree on THIS input (they
+        // differ only in the sign of exact zeros, which these shapes never produce);
+        // the pin below (P9.94a) is the input where they do not
+        const Vec3 t0aP = b2aQ.rotateInv(shape2Actor.p - b2aP);
         const Vec3 t0bP = b2aQ.getConjugate().rotate(shape2Actor.p - b2aP);
-        PXG_CHECK_MSG(bits(t0a.p.x) == bits(t0bP.x) && bits(t0a.p.y) == bits(t0bP.y) &&
-                          bits(t0a.p.z) == bits(t0bP.z),
+        PXG_CHECK_MSG(bits(t0aP.x) == bits(t0bP.x) && bits(t0aP.y) == bits(t0bP.y) &&
+                          bits(t0aP.z) == bits(t0bP.z),
                       "convexZeroTie: rotateInv and conj().rotate must agree on t0.p (shape %u)", s);
 
         const TransformV absPos = getAbsPose(body2World, shape2Actor, body2Actor);

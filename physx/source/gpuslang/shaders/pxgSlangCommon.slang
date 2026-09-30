@@ -266,12 +266,17 @@ public PxgTransform28 transformTransform(PxgTransform28 a, PxgTransform28 b)
     return makeTransform28(q, p);
 }
 
-// mirrors PxTransform::transformInv(PxTransform)
+// mirrors PxTransform::transformInv(PxTransform) (PxTransform.h:162-169) LITERALLY:
+//     qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q)
+// P9.94a: NOT q.rotateInv(src.p - p), which this helper spelled until P9.94a.  The two
+// give the same bits for every non-zero component, but an exact-zero component can
+// take the other sign (the conjugate's cross term (-y)*vz - (-z)*vy is +0 where
+// rotateInv's -(y*vz - z*vy) is -0).  All five callers mirror this very CUDA call.
 public PxgTransform28 transformInvTransform(PxgTransform28 a, PxgTransform28 b)
 {
     const float4 qinv = quatConjugate(a.q());
     const float4 q = quatMul(qinv, b.q());
-    const float3 p = quatRotateInv(a.q(), b.p() - a.p());
+    const float3 p = quatRotate(qinv, b.p() - a.p());
     return makeTransform28(q, p);
 }
 

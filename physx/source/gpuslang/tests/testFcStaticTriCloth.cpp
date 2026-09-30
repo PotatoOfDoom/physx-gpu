@@ -293,6 +293,36 @@ struct RefOut
     F4 bary = {};
 };
 
+// P9.94a mutant twin: true selects the port's PRE-FIX trimeshToClothTransform.p spelling
+// clothQ.rotateInv(v) instead of the CUDA's transformInv(PxTransform) = q.getConjugate().rotate(v).
+// Used only to prove that fcStaticTriCloth_p94ZeroSign separates the two forms.
+static bool gP94TinvRotInv = false;
+
+// P9.94a: mode-0 static-triangle chain (femClothPrimitives.cu:3876 transform, then
+// staticTriangleVsClothCollision up to the sep gate), shared by the random fixture and the
+// directed zero-sign test.  poly is in/out (cloth triangle in, clipped loop out).
+struct Mode0Chain { V3 fixNormal; F4 triPlane; int corners; V3 dp; float sep; };
+static Mode0Chain refMode0Chain(const FstCase& cs, V3* poly, Slack& sl)
+{
+    // trimeshToClothTransform = clothT.transformInv(meshT) (PxTransform.h:162-169 LITERALLY:
+    // qinv = q.getConjugate(); qinv.rotate(src.p - p), not q.rotateInv(src.p - p))
+    const F4 clothQInv = quatConj(cs.clothQ);
+    const F4 mtcQ = quatMul(clothQInv, cs.meshQ);
+    const V3 mtcV = sub(v3f(cs.meshP), v3f(cs.clothP));
+    const V3 mtcP = gP94TinvRotInv ? quatRotateInv(cs.clothQ, mtcV) : quatRotate(clothQInv, mtcV);
+    const V3 lA = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triA), v3f(cs.scale), cs.scaleRot)), mtcP);
+    const V3 lB = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triB), v3f(cs.scale), cs.scaleRot)), mtcP);
+    const V3 lC = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triC), v3f(cs.scale), cs.scaleRot)), mtcP);
+    const float cd = cs.clothP.w;
+
+    Mode0Chain m;
+    m.fixNormal = getNorm0(crossp(sub(lB, lA), sub(lC, lA)));
+    m.triPlane = makePlane(lA, m.fixNormal);
+    m.corners = trimTriangleByTriangleRef(poly, 3, lA, lB, lC, cd, cd, sl);
+    m.dp = deepestRef(poly, m.corners, m.triPlane, 0.01f * cd, m.sep, sl);
+    return m;
+}
+
 static const uint32_t POISON = 0xCDCDCDCDu;
 static const uint32_t INFOPOISON = 0xDEADBEEFu;
 static const uint32_t CLOTH0 = 3, CLOTH1 = 5;
@@ -454,25 +484,20 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
                       findRef(filters, r64, (CLOTH0 << 20) | cs.ids2.w);
         if (ro.filtered) { ++skipN; continue; }
 
-        // trimeshToClothTransform = clothT.transformInv(meshT)
-        const F4 mtcQ = quatMul(quatConj(cs.clothQ), cs.meshQ);
-        const V3 mtcP = quatRotateInv(cs.clothQ, sub(v3f(cs.meshP), v3f(cs.clothP)));
-        const V3 lA = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triA), v3f(cs.scale), cs.scaleRot)), mtcP);
-        const V3 lB = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triB), v3f(cs.scale), cs.scaleRot)), mtcP);
-        const V3 lC = add(quatRotate(mtcQ, vertex2Shape(v3f(cs.triC), v3f(cs.scale), cs.scaleRot)), mtcP);
-
         const V3 a1 = v3f(clothPos[cs.ids2.y]);
         const V3 b1 = v3f(clothPos[cs.ids2.z]);
         const V3 c1 = v3f(clothPos[cs.ids2.w]);
         const float cd = cs.clothP.w;
 
+        // P9.94a: transform + trim + deepest point via the shared literal chain
         V3 poly[8] = { a1, b1, c1, {}, {}, {}, {}, {} };
-        const V3 fixNormal = getNorm0(crossp(sub(lB, lA), sub(lC, lA)));
-        const F4 triPlane = makePlane(lA, fixNormal);
-        const int corners = trimTriangleByTriangleRef(poly, 3, lA, lB, lC, cd, cd, sl);
-        float sep;
+        const Mode0Chain m0 = refMode0Chain(cs, poly, sl);
+        const V3 fixNormal = m0.fixNormal;
+        const F4 triPlane = m0.triPlane;
+        const int corners = m0.corners;
+        const float sep = m0.sep;
+        const V3 dp = m0.dp;
         int cnt = 0;
-        const V3 dp = deepestRef(poly, corners, triPlane, 0.01f * cd, sep, sl);
         for (int k = 0; k < corners; ++k) // count the averaging band population for coverage
             if (planeDist(triPlane, poly[k]) < sep + 0.011f * cd) ++cnt;
         sl.note(sep - cd, BAND_EPS); // strict gate
@@ -778,6 +803,102 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
                   skipN, contactN, emptyN, avgN, deepN, degenN);
     PXG_CHECK_MSG(bSkipN > 40 && bInsideN > 120 && bOutsideN > 100 && bRejN > 60,
                   "fcStaticTriCloth m1 coverage thin (s=%zu i=%zu o=%zu r=%zu)", bSkipN, bInsideN, bOutsideN, bRejN);
+}
+
+// P9.94a: directed zero-sign cases for trimeshToClothTransform = clothT.transformInv(meshT).
+// Cloth identity, meshQ = (0,0,1,0), static triangle on the cloth-space x = 0 plane: the
+// normal is (1,+0,+0) and every planeDist term is a signed zero, so sep (a strictly-inside,
+// unclipped cloth vertex) is exactly the sign of mtcP.x.  The CUDA conj().rotate and the old
+// rotateInv spelling give opposite zero signs in that lane; A and B cover both directions.
+static uint32_t p94Bits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+PXG_TEST(fcStaticTriCloth_p94ZeroSign)
+{
+    struct Variant { const char* name; F4 meshP; V3 cloth[3]; uint32_t cudaSep; };
+    const Variant variants[2] = {
+        { "A", { -0.0f, -0.0f, 0.5f, 0.05f },
+          { { -0.0f, -1.25f, -0.75f }, { -0.0f, -1.5f, -0.75f }, { -0.0f, -1.25f, -1.0f } }, 0x00000000u },
+        { "B", { -0.0f, -0.0f, -0.0f, 0.05f },
+          { { -0.0f, -1.25f, -1.25f }, { -0.0f, -1.5f, -1.25f }, { -0.0f, -1.25f, -1.5f } }, 0x80000000u },
+    };
+
+    PxgSlangComputeDevice* dev = testDevice();
+    Kernel k("fcStaticTriCloth.spv", "fcStaticTriClothKernel",
+             { (uint32_t)sizeof(FstCase), 16, (uint32_t)sizeof(FilterPair),
+               16, 16, 16, 16, 4, 8, 4, 4, 4, 16 }, sizeof(FstParams));
+    const uint32_t CAPD = 4;
+
+    for (const Variant& v : variants)
+    {
+        FstCase cs;
+        std::memset(&cs, 0, sizeof(cs));
+        cs.triA = { 0.0f, 1.0f, -1.0f, 0 };
+        cs.triB = { 0.0f, 2.0f, -1.0f, 0 };
+        cs.triC = { 0.0f, 1.0f, -2.0f, 0 };
+        cs.clothQ = { 0, 0, 0, 1 };
+        cs.clothP = { 0, 0, 0, 0.1f }; // w = cDistance
+        cs.meshQ = { 0, 0, 1, 0 };
+        cs.meshP = v.meshP;
+        cs.scale = { 1, 1, 1, 0 };
+        cs.scaleRot = { 0, 0, 0, 1 };
+        cs.ids = { 0x40u, 2u, CLOTH0, 0u };
+        cs.ids2 = { 0x90u, 0u, 1u, 2u };
+        const std::vector<FstCase> cc(1, cs);
+        std::vector<F4> cp(3);
+        for (int j = 0; j < 3; ++j)
+            cp[j] = { v.cloth[j].x, v.cloth[j].y, v.cloth[j].z, 1.0f };
+
+        // literal CUDA oracle, then the rotateInv twin
+        Slack sl;
+        V3 poly[8] = { v.cloth[0], v.cloth[1], v.cloth[2], {}, {}, {}, {}, {} };
+        const Mode0Chain lit = refMode0Chain(cs, poly, sl);
+        gP94TinvRotInv = true;
+        Slack slT;
+        V3 polyT[8] = { v.cloth[0], v.cloth[1], v.cloth[2], {}, {}, {}, {}, {} };
+        const Mode0Chain twin = refMode0Chain(cs, polyT, slT);
+        gP94TinvRotInv = false;
+        const uint32_t litBits = p94Bits(lit.sep), twinBits = p94Bits(twin.sep);
+        PXG_CHECK_MSG(lit.corners == 3 && lit.sep < cs.clothP.w && litBits == v.cudaSep,
+                      "fcStaticTriCloth p94 %s: oracle corners %d sep 0x%08x (want 3, 0x%08x)",
+                      v.name, lit.corners, litBits, v.cudaSep);
+        PXG_CHECK_MSG(twinBits != litBits,
+                      "fcStaticTriCloth p94 %s: twin sep 0x%08x == literal 0x%08x (case does not discriminate)",
+                      v.name, twinBits, litBits);
+
+        // GPU: one case, empty filter table (one dummy entry, nbFilterPairs = 0)
+        const std::vector<FilterPair> dummyFilter(1, FilterPair{ 0, 0, 0, 0, 0, 0 });
+        std::vector<F4> femF4Init(CAPD, { -9, -9, -9, -9 });
+        std::vector<U4> infoInit(CAPD, { INFOPOISON, INFOPOISON, INFOPOISON, INFOPOISON });
+        std::vector<uint32_t> u1Init(CAPD, POISON), u2Init(CAPD * 2, POISON), wc0(1, 0);
+        std::vector<F4> dbgInit(1, { -7, -7, -7, -7 });
+        PxgBufferHandle bC = createBufferFrom(dev, cc);
+        PxgBufferHandle bP = createBufferFrom(dev, cp);
+        PxgBufferHandle bF = createBufferFrom(dev, dummyFilter);
+        PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
+        PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
+        PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
+        PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
+        PxgBufferHandle bWc = createBufferFrom(dev, wc0);
+        PxgBufferHandle bBy = createBufferFrom(dev, u2Init);
+        PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
+        PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
+        PxgBufferHandle bS3 = createBufferFrom(dev, u1Init);
+        PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
+        FstParams prm = { 1, CAPD, 0, 0 };
+        k.dispatch(1, { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb }, prm);
+        dev->flush();
+        const std::vector<F4> np = downloadBuffer<F4>(dev, bNp, CAPD);
+        const std::vector<F4> dbg = downloadBuffer<F4>(dev, bDb, 1);
+        const uint32_t wc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+        for (PxgBufferHandle h : { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb })
+            dev->destroyBuffer(h);
+
+        PXG_CHECK_MSG(wc == 1 && dbg[0].y == 1.0f && dbg[0].w == 3.0f,
+                      "fcStaticTriCloth p94 %s: wc %u hasContact %g corners %g", v.name, wc, dbg[0].y, dbg[0].w);
+        PXG_CHECK_MSG(p94Bits(np[0].w) == litBits && p94Bits(dbg[0].z) == litBits,
+                      "fcStaticTriCloth p94 %s: gpu sep np.w 0x%08x dbg.z 0x%08x != literal 0x%08x (twin 0x%08x)",
+                      v.name, p94Bits(np[0].w), p94Bits(dbg[0].z), litBits, twinBits);
+    }
 }
 
 } // namespace

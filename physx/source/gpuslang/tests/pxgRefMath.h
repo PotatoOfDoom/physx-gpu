@@ -219,10 +219,13 @@ struct TransformV
         return TransformV(q * x.q, q.rotate(x.p) + p);
     }
 
-    // mirrors PxTransform::transformInv(PxTransform)
+    // mirrors PxTransform::transformInv(PxTransform) LITERALLY (PxTransform.h:162-169):
+    // the conjugate's rotate, not rotateInv -- the two differ in the sign of exact
+    // zeros (P9.94a; pinned in testUpdateBounds' convexZeroTie test)
     TransformV transformInv(const TransformV& x) const
     {
-        return TransformV(q.getConjugate() * x.q, q.rotateInv(x.p - p));
+        const QuatV qinv = q.getConjugate();
+        return TransformV(qinv * x.q, qinv.rotate(x.p - p));
     }
 
     Transform28 toTransform28() const

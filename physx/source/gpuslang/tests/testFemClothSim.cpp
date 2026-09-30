@@ -10265,7 +10265,8 @@ PXG_TEST(femClothSimMeshContactGen)
     float clothQConj[4] = { -clothQ[0], -clothQ[1], -clothQ[2], clothQ[3] };
     float m2cQ[4];
     qMul(clothQConj, meshQ, m2cQ);
-    const V3 m2cP = qRotInv(clothQ, sub(meshP, clothP));
+    // P9.94a: the conjugate's rotate, as written in PxTransform.h:166 -- not clothQ.rotateInv.
+    const V3 m2cP = qRot(clothQConj, sub(meshP, clothP));
     auto toClothLocal = [&](F4 v) {
         return add(qRot(m2cQ, vertex2Shape(V3{ v.x, v.y, v.z }, meshScale, meshScaleRot)), m2cP);
     };
@@ -12807,7 +12808,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     using namespace p816dc;
     using namespace p927cg;
     using p817cg::V3;
-    using p817cg::qRot; using p817cg::qRotInv; using p817cg::qMul;
+    using p817cg::qRot; using p817cg::qMul;
     using p817cg::norm; using p817cg::crs; using p817cg::sub; using p817cg::add;
     using p817cg::scl; using p817cg::dot;
     PxgSlangComputeDevice* dev = testDevice();
@@ -12895,7 +12896,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     // The static triangle in CLOTH-local space, for placing the cloth on top of it.
     float clothQConj[4] = { -clothQ[0], -clothQ[1], -clothQ[2], clothQ[3] };
     float r2cQ[4]; qMul(clothQConj, rigidQ, r2cQ);
-    const V3 r2cP = qRotInv(clothQ, sub(rigidP, clothP));
+    const V3 r2cP = qRot(clothQConj, sub(rigidP, clothP));   // P9.94a: literal transformInv
     auto toClothLocal = [&](V3 v) { return add(qRot(r2cQ, v), r2cP); };
     const V3 A0 = toClothLocal(hfA), B0 = toClothLocal(hfB), C0 = toClothLocal(hfC);
     const V3 fixNormal = norm(crs(sub(B0, A0), sub(C0, A0)));
@@ -13249,6 +13250,266 @@ PXG_TEST(femClothSimHeightfieldContactGen)
                                bRemap.h, bHfStack.h, bMeshStack.h, bHfNum.h, bMeshNum.h,
                                bHfNeeded.h, bMeshNeeded.h })
         dev->destroyBuffer(h);
+}
+
+
+// ===========================================================================
+// P9.94a -- the SIGN OF ZERO through transformInvTransform, on both engine cloth
+// kernels.
+//
+// femClothPrimitives.cu:3716 / :3876 build the static triangle's cloth-space
+// transform as clothTransform.transformInv(rigidTransform), and PxTransform.h:
+// 162-169 spells that `qinv = q.getConjugate(); qinv.rotate(src.p - p)`.  The
+// port used to write q.rotateInv(src.p - p): identical bits for every nonzero
+// component, but a component that is a sum of exact zeros can take the other
+// sign.  The two fixtures above cannot see that -- femClothSimMeshContactGen
+// compares at 2e-4, and femClothSimHeightfieldContactGen is a differential
+// between two kernels that share the helper, so a revert moves both sides.
+//
+// So each test here is ABSOLUTE: one pair, geometry built so that every term of
+// the separation is an exact zero (an axis-aligned triangle whose cloth-space
+// normal has two zero lanes, a cloth triangle lying IN its plane and strictly
+// inside all five trim planes), and the stored normalPen.w is compared BIT-EXACTLY
+// against a short literal host chain.  The chain is valid because nothing is
+// clipped and the three corners tie, so sep = planeDistance(plane, a1).  The twin
+// flag switches only the chain's transformInv p to the old spelling, and each case
+// asserts that the twin gives the other zero -- the proof that the case separates.
+// ===========================================================================
+namespace p994a
+{
+using p817cg::V3;
+using p817cg::qRot; using p817cg::qRotInv; using p817cg::qMul;
+using p817cg::norm; using p817cg::crs; using p817cg::sub; using p817cg::add; using p817cg::dot;
+
+// Mutant twin: true selects the PRE-FIX spelling clothQ.rotateInv(rigidP - clothP).
+static bool gP94TinvRotInv = false;
+
+// The literal chain: hfToCloth / trimeshToClothTransform, the static triangle in cloth
+// space (vertex2Shape first for the cooked mesh, not for the heightfield: C2), then
+// staticTriangleVsClothCollision's plane and planeDistance(plane, a1).
+static float sepRef(const float clothQ[4], V3 clothP, const float rigidQ[4], V3 rigidP,
+                    const V3 tri[3], bool meshVertex2Shape, V3 a1)
+{
+    const float qinv[4] = { -clothQ[0], -clothQ[1], -clothQ[2], clothQ[3] };
+    float relQ[4];
+    qMul(qinv, rigidQ, relQ);
+    const V3 relP = gP94TinvRotInv ? qRotInv(clothQ, sub(rigidP, clothP))
+                                   : qRot(qinv, sub(rigidP, clothP));
+    const float idRot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    V3 l[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        const V3 v = meshVertex2Shape ? p817cg::vertex2Shape(tri[k], V3{ 1.0f, 1.0f, 1.0f }, idRot) : tri[k];
+        l[k] = add(qRot(relQ, v), relP);
+    }
+    const V3 n = norm(crs(sub(l[1], l[0]), sub(l[2], l[0])));
+    const float d = -dot(l[0], n);               // makePlane(localA0, fixNormal)
+    return dot(n, a1) + d;                       // planeDistance(plane, a1)
+}
+
+struct Case
+{
+    const char* name;
+    float rigidQ[4]; V3 rigidP;
+    V3 cloth[3];
+    uint32_t cudaBits;                           // hand-derived, re-checked against sepRef
+};
+
+// One pair through the MESH (hf == false) or HEIGHTFIELD kernel.  Cloth identity at
+// cache ref 0 / shapeRef0, the rigid at 1 -- positional for the heightfield kernel (C1),
+// and the mesh kernel finds the cloth by its body id either way.  Returns the contact
+// count and the stored normalPen.w word of slot 0.
+static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t& count, uint32_t& sepBits)
+{
+    using namespace p816dc;
+    count = 0xFFFFFFFFu; sepBits = 0xFFFFFFFFu;
+
+    // The rigid geometry.  Mesh: triangle (0,1,-1), (0,2,-1), (0,1,-2), cooked as one
+    // triangle behind one (unused) BV32 node.  Heightfield: 3x3 samples at height 0, no
+    // tessellation bit; triangle 8 = cell 4's first = (1,0,1), (1,0,2), (2,0,1).
+    std::vector<uint32_t> blob;
+    uint32_t rigidTri = 0u;
+    if (hf)
+    {
+        blob.assign(2u + 9u, 0u);
+        blob[0] = 3u; blob[1] = 3u;
+        for (uint32_t s = 0; s < 9u; ++s) blob[2u + s] = p927cg::hfSample(0, 3u, 3u);
+        rigidTri = 8u;
+    }
+    else
+    {
+        const std::vector<F4> mv = { { 0.0f, 1.0f, -1.0f, 0 }, { 0.0f, 2.0f, -1.0f, 0 }, { 0.0f, 1.0f, -2.0f, 0 } };
+        const std::vector<TriIdx4> mi = { { 0u, 1u, 2u, 0u } };
+        blob.assign(4u + 292u, 0u);
+        const size_t vBase = blob.size();
+        blob.resize(vBase + mv.size() * 4u, 0u);
+        std::memcpy(blob.data() + vBase, mv.data(), mv.size() * sizeof(F4));
+        const size_t iBase = blob.size();
+        blob.resize(iBase + mi.size() * 4u, 0u);
+        std::memcpy(blob.data() + iBase, mi.data(), mi.size() * sizeof(TriIdx4));
+        blob[0] = uint32_t(mv.size()); blob[1] = uint32_t(mi.size()); blob[2] = 1u; blob[3] = 1u;
+    }
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<F4> cv = { { cs.cloth[0].x, cs.cloth[0].y, cs.cloth[0].z, 1.0f },
+                           { cs.cloth[1].x, cs.cloth[1].y, cs.cloth[1].z, 1.0f },
+                           { cs.cloth[2].x, cs.cloth[2].y, cs.cloth[2].z, 1.0f } };
+    std::vector<TriIdx4> ci = { { 0u, 1u, 2u, 0u } };
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbTriangles = 1u; c.mNbVerts = 3u;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0] = makeClothShape(0u);
+    shapes[1].type = hf ? uint32_t(physx::PxGeometryType::eHEIGHTFIELD) : GEOM_TRIANGLEMESH_H;
+    shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[1].sx = shapes[1].sy = shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    shapes[1].materialIndex = 0x2Au;
+    shapes[1].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[1].hullHi = uint32_t(bBlob.addr >> 32);
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform: slot 0 the cloth (identity), slot 1 the rigid.  The -0 lanes are
+    // the point, so they are stored as written.
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;
+    for (int k = 0; k < 4; ++k) xf[8 + k] = cs.rigidQ[k];
+    xf[8 + 4] = cs.rigidP.x; xf[8 + 5] = cs.rigidP.y; xf[8 + 6] = cs.rigidP.z;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { 0.05f, 0.05f };
+    std::vector<float> rd = { 0.125f };
+    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+    std::vector<uint64_t> remap = { 0ull, 0x00000007ull };
+    DevBuf bRemap = makeDev(dev, remap);
+    std::vector<uint32_t> stack = { 0u, 0u, rigidTri, 0u };
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> one = { 1u }, zero = { 0u };
+    DevBuf bNum = makeDev(dev, one), bNeeded = makeDev(dev, zero);
+    WriterBufs w = makeWriter(dev, 4u);
+
+    if (hf)
+    {
+        p927cg::ClothHfCgPush p = {};
+        p.toleranceLength = 1.0f;
+        p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
+        p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+        p.gpuShapes = bShapes.addr; p.femClothes = bDesc.addr;
+        p.shapeToRigidRemapTable = bRemap.addr;
+        p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+        p.stackSizeBytes = 16u; p.stackSizeNeededOnDevice = bNeeded.addr;
+        p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
+        p.wInfo = w.info.addr; p.wCount = w.count.addr;
+        p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
+        p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+        p.wMaxContacts = w.maxContacts;
+        Kernel k("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch", {},
+                 sizeof(p927cg::ClothHfCgPush));
+        k.dispatch(2048u, {}, p, 1u, 1u);
+    }
+    else
+    {
+        p817cg::ClothMeshCgPush p = {};
+        p.toleranceLength = 1.0f;
+        p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
+        p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+        p.gpuShapes = bShapes.addr; p.femClothes = bDesc.addr;
+        p.shapeToRigidRemapTable = bRemap.addr;
+        p.stackSizeBytes = 16u; p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+        p.filterPairs = 0ull; p.nbFilterPairs = 0u;
+        p.stackSizeNeededOnDevice = bNeeded.addr;
+        p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
+        p.wInfo = w.info.addr; p.wCount = w.count.addr;
+        p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
+        p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+        p.wMaxContacts = w.maxContacts;
+        Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {},
+                 sizeof(p817cg::ClothMeshCgPush));
+        k.dispatch(2048u, {}, p, 1u, 1u);
+    }
+    dev->flush();
+
+    count = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    sepBits = f2u(downloadBuffer<F4>(dev, w.normalPen.h, 1)[0].w);
+
+    destroyWriter(dev, w);
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bRd.h, bRemap.h, bStack.h, bNum.h, bNeeded.h })
+        dev->destroyBuffer(h);
+}
+
+static void runCases(bool hf, const Case* cases, size_t nbCases)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const V3 meshTri[3] = { { 0.0f, 1.0f, -1.0f }, { 0.0f, 2.0f, -1.0f }, { 0.0f, 1.0f, -2.0f } };
+    const V3 hfTri[3] = { { 1.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 2.0f }, { 2.0f, 0.0f, 1.0f } };
+    const float clothQ[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const V3 clothP{ 0.0f, 0.0f, 0.0f };
+    for (size_t i = 0; i < nbCases; ++i)
+    {
+        const Case& cs = cases[i];
+        const V3* tri = hf ? hfTri : meshTri;
+        const uint32_t lit = f2u(sepRef(clothQ, clothP, cs.rigidQ, cs.rigidP, tri, !hf, cs.cloth[0]));
+        gP94TinvRotInv = true;
+        const uint32_t twin = f2u(sepRef(clothQ, clothP, cs.rigidQ, cs.rigidP, tri, !hf, cs.cloth[0]));
+        gP94TinvRotInv = false;
+        PXG_CHECK_MSG(lit == cs.cudaBits,
+                      "%s: the literal chain gives sep 0x%08X, the hand derivation 0x%08X",
+                      cs.name, lit, cs.cudaBits);
+        PXG_CHECK_MSG(twin == (lit ^ 0x80000000u),
+                      "%s: the rotateInv twin gives sep 0x%08X against the literal 0x%08X -- "
+                      "the case does not separate the two transformInv spellings", cs.name, twin, lit);
+
+        uint32_t count = 0u, gSep = 0u;
+        runOne(dev, hf, cs, count, gSep);
+        if (count == 0xFFFFFFFFu) return;        // no BDA
+        PXG_CHECK_MSG(count == 1u, "%s: %u contacts, expected exactly 1 (nothing clipped, sep 0 < "
+                      "cDistance 0.1)", cs.name, count);
+        PXG_CHECK_MSG(gSep == lit,
+                      "%s: normalPen.w is 0x%08X, CUDA 0x%08X (the old rotateInv spelling gives "
+                      "0x%08X).  transformInvTransform must be quatRotate(quatConjugate(a.q), "
+                      "b.p - a.p)", cs.name, gSep, lit, twin);
+        std::printf("    [ note ] %s: sep 0x%08X (twin 0x%08X), %u contact\n", cs.name, gSep, twin, count);
+    }
+}
+} // namespace p994a
+
+// Mesh: meshQ = 180 degrees about z; the cloth-space normal is (1,+0,+0) and every sep
+// term is a zero.  A and B put the zero on opposite sides, so a fix that canonicalizes
+// zeros to +0 dies on B.
+PXG_TEST(femClothSimMeshContactGenP94ZeroSign)
+{
+    using p994a::Case;
+    const float mz = -0.0f;
+    const Case cases[] = {
+        { "mesh A", { 0.0f, 0.0f, 1.0f, 0.0f }, { mz, mz, 0.5f },
+          { { mz, -1.25f, -0.75f }, { mz, -1.5f, -0.75f }, { mz, -1.25f, -1.0f } }, 0x00000000u },
+        { "mesh B", { 0.0f, 0.0f, 1.0f, 0.0f }, { mz, mz, mz },
+          { { mz, -1.25f, -1.25f }, { mz, -1.5f, -1.25f }, { mz, -1.25f, -1.5f } }, 0x80000000u },
+    };
+    p994a::runCases(/*hf*/ false, cases, sizeof(cases) / sizeof(cases[0]));
+}
+
+// Heightfield: hfQ = 180 degrees about x with signed-zero lanes; the rotated y of every
+// vertex is -0, the normal is (+0,-1,+0), and the literal chain gives +0 where the old one
+// gives -0.
+PXG_TEST(femClothSimHeightfieldContactGenP94ZeroSign)
+{
+    using p994a::Case;
+    const float mz = -0.0f;
+    const Case cases[] = {
+        { "hf A", { 1.0f, mz, mz, 0.0f }, { -4.0f, mz, mz },
+          { { -2.75f, 0.0f, -1.25f }, { -2.75f, 0.0f, -1.5f }, { -2.5f, 0.0f, -1.25f } }, 0x00000000u },
+    };
+    p994a::runCases(/*hf*/ true, cases, sizeof(cases) / sizeof(cases[0]));
 }
 
 

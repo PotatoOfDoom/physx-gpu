@@ -274,12 +274,27 @@ struct ThRef
     bool reduced = false, dupeCulled = false, bigPack = false;
 };
 
+// P9.94a mutant twin: true selects the port's PRE-FIX trimeshToHf.p spelling q.rotateInv(v)
+// instead of the CUDA's heightfieldTransform.transformInv(trimeshTransform) (trimeshCollision.cu
+// :502) = q.getConjugate().rotate(v).  Used only to prove that npTriHfNp_p94ZeroSign separates
+// the two forms.
+static bool gP94TinvRotInv = false;
+
+// P9.94a: PxTransform::transformInv(PxTransform).p (PxTransform.h:162-169) LITERALLY:
+// qinv = q.getConjugate(); qinv.rotate(src.p - p).  NOT q.rotateInv(src.p - p): same bits for
+// every nonzero component, but an exact-zero component can take the other sign.
+static V3 ttpPRef(const ThCase& cs)
+{
+    const V3 v = sub(v3(cs.meshP), v3(cs.hfP));
+    return gP94TinvRotInv ? quatRotateInv(cs.hfQ, v) : quatRotate(quatConj(cs.hfQ), v);
+}
+
 static ThRef refTh(const ThCase& cs, const std::vector<F4>& verts)
 {
     ThRef ro;
     const float cd = cs.hfP.w, clusterBias = cs.scale.w;
     const F4 ttpQ = quatMul(quatConj(cs.hfQ), cs.meshQ);
-    const V3 ttpP = quatRotateInv(cs.hfQ, sub(v3(cs.meshP), v3(cs.hfP)));
+    const V3 ttpP = ttpPRef(cs); // P9.94a: literal conj().rotate
     ro.worldNormal = basis0(cs.hfQ);
 
     V3 contacts[198];
@@ -503,7 +518,7 @@ static ThFixture buildFixture(uint32_t NC, uint32_t seed)
         {
             // cd = the exact max heightfield-space x over the verts
             const F4 ttpQ = quatMul(quatConj(cs.hfQ), cs.meshQ);
-            const V3 ttpP = quatRotateInv(cs.hfQ, sub(v3(cs.meshP), v3(cs.hfP)));
+            const V3 ttpP = ttpPRef(cs); // P9.94a: literal conj().rotate
             float mxX = -FLT_BIG;
             for (uint32_t k = 0; k < numVerts; ++k)
             {
@@ -763,6 +778,59 @@ PXG_TEST(npTriHfNp_overflow)
                 if (r.stream[k].x != -777.0f) ++bad;
             PXG_CHECK_MSG(bad == 0, "overflow D (else-if skip): %zu bad", bad);
         }
+    }
+}
+
+// P9.94a: directed zero-sign cases for trimeshToHf = hfT.transformInv(meshT).  One vertex
+// (0, 1, -1), meshQ = 180 deg about z, identity hf: the composed rotation gives x = -0 for the
+// vertex, so sep = -0 + ttpP.x keeps ttpP.x's sign.  ttpP.x = conj(hfQ).rotate(meshP - hfP).x
+// is -0 (A) / +0 (B) under CUDA and +0 (A) / -0 (B) under the old rotateInv spelling.  No RNG.
+PXG_TEST(npTriHfNp_p94ZeroSign)
+{
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const float nz = -0.0f;
+    std::vector<F4> verts = { { 0.0f, 1.0f, -1.0f, 0.0f } };
+    std::vector<ThCase> cases(2);
+    for (ThCase& cs : cases)
+    {
+        std::memset(&cs, 0, sizeof(cs));
+        cs.meshQ = { 0, 0, 1, 0 };
+        cs.hfQ = { 0, 0, 0, 1 };
+        cs.hfP = { 0, 0, 0, 0.25f };
+        cs.scale = { 1, 1, 1, 0.0625f };
+        cs.scaleRot = { 0, 0, 0, 1 };
+        cs.verts = { 0, 1, 0, 0 };
+    }
+    cases[0].meshP = { nz, nz, 0.5f, 0 }; // A: CUDA sep -0
+    cases[1].meshP = { nz, nz, nz, 0 };   // B: CUDA sep +0
+    const uint32_t wantSep[2] = { 0x80000000u, 0x00000000u };
+
+    ThRef lit[2];
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        lit[i] = refTh(cases[i], verts);
+        gP94TinvRotInv = true;
+        const ThRef twin = refTh(cases[i], verts);
+        gP94TinvRotInv = false;
+        PXG_CHECK_MSG(lit[i].retained == 1 && twin.retained == 1,
+                      "p94 case %u: retained %u/%u != 1", i, lit[i].retained, twin.retained);
+        PXG_CHECK_MSG(u32(lit[i].seps[0]) == wantSep[i],
+                      "p94 case %u: literal sep 0x%08x != 0x%08x", i, u32(lit[i].seps[0]), wantSep[i]);
+        PXG_CHECK_MSG(u32(twin.seps[0]) != u32(lit[i].seps[0]),
+                      "p94 case %u: twin sep 0x%08x does not discriminate", i, u32(twin.seps[0]));
+    }
+
+    const ThRun r = runTh(cases, verts, 2 + 4, 0x10000000u, 0x10000000u);
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        const U4 rec = r.rec[i];
+        PXG_CHECK_MSG(rec.z == 1 && rec.x != 0xFFFFFFFFu && rec.x % 16 == 0 && rec.x / 16 < 2,
+                      "p94 case %u: record %u/%u", i, rec.x, rec.z);
+        if (rec.z != 1 || rec.x == 0xFFFFFFFFu || rec.x / 16 >= 2) continue;
+        const F4 got = r.stream[rec.x / 16];
+        PXG_CHECK_MSG(u32(got.w) == u32(lit[i].seps[0]) && u32(got.x) == u32(lit[i].pts[0].x) &&
+                      u32(got.y) == u32(lit[i].pts[0].y) && u32(got.z) == u32(lit[i].pts[0].z),
+                      "p94 case %u: GPU sep 0x%08x != literal 0x%08x", i, u32(got.w), u32(lit[i].seps[0]));
     }
 }
 

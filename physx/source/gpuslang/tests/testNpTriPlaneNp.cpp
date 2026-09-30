@@ -120,6 +120,17 @@ static F4 quatMul(F4 a, F4 b)
              a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
 }
 static F4 quatConj(F4 q) { return { -q.x, -q.y, -q.z, q.w }; }
+
+// P9.94a mutant twin: true selects the port's PRE-FIX trimeshToPlane.p spelling
+// q.rotateInv(v) instead of the CUDA's planeTransform.transformInv(trimeshTransform)
+// = q.getConjugate().rotate(v) (PxTransform.h:162-169).  Same bits for every
+// nonzero component; an exact-zero component can take the other sign.  Used
+// only to prove that the directed zero-sign cases below separate the two forms.
+static bool gP94TinvRotInv = false;
+static V3 transformInvP(F4 q, V3 v)
+{
+    return gP94TinvRotInv ? quatRotateInv(q, v) : quatRotate(quatConj(q), v);
+}
 static V3 basis0(F4 q)
 {
     const float x2 = q.x * 2.0f, w2 = q.w * 2.0f;
@@ -273,7 +284,8 @@ static TpRef refTp(const TpCase& cs, const std::vector<F4>& verts, const std::ve
     const float minMargin = std::min(mnE * 0.25f, tol * 0.05f) * 0.5f;
 
     ro.ttpQ = quatMul(quatConj(cs.planeQ), cs.meshQ);
-    ro.ttpP = quatRotateInv(cs.planeQ, sub(v3(cs.meshP), v3(cs.planeP)));
+    // trimeshCollision.cu:147 planeTransform.transformInv(trimeshTransform) (P9.94a: literal conj().rotate)
+    ro.ttpP = transformInvP(cs.planeQ, sub(v3(cs.meshP), v3(cs.planeP)));
     ro.thresholdP = minMargin * 0.1f;
     const V3 dP = sub(ro.ttpP, prevP);
     const float deltaP = std::max(std::fabs(dP.x), std::max(std::fabs(dP.y), std::fabs(dP.z)));
@@ -569,7 +581,7 @@ static TpFixture buildFixture(uint32_t NC, uint32_t seed)
 
         // trimeshToPlane (exact) for seeds and probes
         const F4 ttpQ = quatMul(quatConj(cs.planeQ), cs.meshQ);
-        const V3 ttpP = quatRotateInv(cs.planeQ, sub(v3(cs.meshP), v3(cs.planeP)));
+        const V3 ttpP = transformInvP(cs.planeQ, sub(v3(cs.meshP), v3(cs.planeP))); // P9.94a
 
         if (fam == 4)
         {
@@ -766,11 +778,14 @@ PXG_TEST(npTriPlaneNp_narrowphase)
             }
         }
         // relative transform: written only on full gen with retained contacts
+        // (P9.94a: BITWISE, so a zero-sign slip in trimeshToPlane is visible)
         const F4 rq = r.rel[i * 2 + 0], rp = r.rel[i * 2 + 1];
         if (ro.fullGen && ro.retained > 0)
         {
-            if (rq.x != ro.ttpQ.x || rq.y != ro.ttpQ.y || rq.z != ro.ttpQ.z || rq.w != ro.ttpQ.w ||
-                rp.x != ro.ttpP.x || rp.y != ro.ttpP.y || rp.z != ro.ttpP.z || rp.w != 0.0f) ++mm;
+            if (asU32(rq.x) != asU32(ro.ttpQ.x) || asU32(rq.y) != asU32(ro.ttpQ.y) ||
+                asU32(rq.z) != asU32(ro.ttpQ.z) || asU32(rq.w) != asU32(ro.ttpQ.w) ||
+                asU32(rp.x) != asU32(ro.ttpP.x) || asU32(rp.y) != asU32(ro.ttpP.y) ||
+                asU32(rp.z) != asU32(ro.ttpP.z) || rp.w != 0.0f) ++mm;
         }
         else if (std::memcmp(&rq, &fx.rel[i * 2 + 0], 16) != 0 ||
                  std::memcmp(&rp, &fx.rel[i * 2 + 1], 16) != 0) ++mm;
@@ -930,6 +945,94 @@ PXG_TEST(npTriPlaneNp_overflow)
             PXG_CHECK_MSG(bad == 0, "overflow D (both overflow): %zu bad", bad);
         }
     }
+}
+
+// P9.94a: directed zero-sign cases for trimeshToPlane = planeTransform.transformInv(
+// trimeshTransform) (trimeshCollision.cu:147).  Identity rotations and -0 position
+// components make p a sum of exact zeros in the y/z (case A) or x (case B) lane, where
+// the CUDA's conj().rotate and the pre-fix rotateInv give opposite signs.  Both cases
+// force a full gen with 3 retained contacts, so gManRel[1].xyz is written.
+//   A: meshP (-0,-0,-0), planeP (16,0,0): CUDA (-16,+0,+0), rotateInv (-16,-0,-0)
+//   B: meshP (-0,-0,1),  planeP (0,0,0):  CUDA (-0,+0,1),   rotateInv (+0,+0,1)
+PXG_TEST(npTriPlaneNp_p94ZeroSign)
+{
+    const uint32_t NC = 2;
+    TpFixture fx;
+    fx.cases.resize(NC);
+    fx.manA.assign(NC * 24, F4{ 0, 0, 0, 0 });
+    fx.manB.assign(NC * 24, F4{ 0, 0, 0, 0 });
+    fx.manN.assign(NC * 24, F4{ 1, 0, 0, 0.25f });
+    fx.meta.assign(NC, U4{ 0, 0, 0, 0 });
+    fx.rel.resize(NC * 2);
+    fx.ref.resize(NC);
+    fx.verts = { { -0.5f, 0.25f, 0.75f, 0 }, { -0.25f, 0.5f, 0.25f, 0 }, { 0.25f, -0.75f, 0.5f, 0 } };
+    fx.root = { { -1, -1, -1, 0 }, { 1, 1, 1, 0 } };
+    const F4 meshPs[NC] = { { -0.0f, -0.0f, -0.0f, 0.5f }, { -0.0f, -0.0f, 1.0f, 0.5f } };
+    const F4 planePs[NC] = { { 16.0f, 0.0f, 0.0f, 0.25f }, { 0.0f, 0.0f, 0.0f, 0.25f } };
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        TpCase& cs = fx.cases[i];
+        std::memset(&cs, 0, sizeof(cs));
+        cs.meshQ = { 0, 0, 0, 1 };
+        cs.meshP = meshPs[i];
+        cs.planeQ = { 0, 0, 0, 1 };
+        cs.planeP = planePs[i];
+        cs.scale = { 1, 1, 1, 0.0625f };
+        cs.scaleRot = { 0, 0, 0, 1 };
+        cs.verts = { 0, 3, 0, 0 };
+        cs.rootMeta = { 1, 0, 0, 0 };
+        // far previous transform -> invalidate -> full gen
+        fx.rel[i * 2 + 0] = { 0, 0, 0, 1 };
+        fx.rel[i * 2 + 1] = { 1000.0f, 0, 0, 5.0f };
+    }
+
+    std::vector<TpRef> twin(NC);
+    size_t nTwinDiff = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        fx.ref[i] = refTp(fx.cases[i], fx.verts, fx.root, &fx.manA[i * 24], &fx.manB[i * 24],
+                          &fx.manN[i * 24], fx.meta[i], fx.rel[i * 2], v3(fx.rel[i * 2 + 1]));
+        gP94TinvRotInv = true;
+        twin[i] = refTp(fx.cases[i], fx.verts, fx.root, &fx.manA[i * 24], &fx.manB[i * 24],
+                        &fx.manN[i * 24], fx.meta[i], fx.rel[i * 2], v3(fx.rel[i * 2 + 1]));
+        gP94TinvRotInv = false;
+        const TpRef& ro = fx.ref[i];
+        PXG_CHECK_MSG(ro.fullGen && ro.retained == 3, "p94 case %u: want full gen with 3 contacts (%d %u)",
+                      i, int(ro.fullGen), ro.retained);
+        std::printf("  p94 case %c: CUDA ttpP %08x %08x %08x, rotateInv twin %08x %08x %08x\n", 'A' + i,
+                    asU32(ro.ttpP.x), asU32(ro.ttpP.y), asU32(ro.ttpP.z),
+                    asU32(twin[i].ttpP.x), asU32(twin[i].ttpP.y), asU32(twin[i].ttpP.z));
+        if (std::memcmp(&ro.ttpP, &twin[i].ttpP, sizeof(V3)) != 0) ++nTwinDiff;
+    }
+    // the cases must discriminate: A in the y/z lanes, B in the x lane
+    PXG_CHECK_MSG(asU32(fx.ref[0].ttpP.y) != asU32(twin[0].ttpP.y) &&
+                  asU32(fx.ref[0].ttpP.z) != asU32(twin[0].ttpP.z) &&
+                  asU32(fx.ref[1].ttpP.x) != asU32(twin[1].ttpP.x) && nTwinDiff == NC,
+                  "p94: directed cases do not separate conj().rotate from rotateInv");
+    // hard-coded CUDA bits
+    PXG_CHECK_MSG(asU32(fx.ref[0].ttpP.x) == 0xC1800000u && asU32(fx.ref[0].ttpP.y) == 0u &&
+                  asU32(fx.ref[0].ttpP.z) == 0u && asU32(fx.ref[1].ttpP.x) == 0x80000000u &&
+                  asU32(fx.ref[1].ttpP.y) == 0u && asU32(fx.ref[1].ttpP.z) == 0x3F800000u,
+                  "p94: literal oracle bits differ from the hand-derived CUDA bits");
+
+    const TpRun r = runTp(fx.cases, fx.verts, fx.root, fx.manA, fx.manB, fx.manN, fx.meta, fx.rel,
+                          6 + 32, 0x10000000u, 0x10000000u);
+    size_t mm = 0, mmTwin = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const TpRef& ro = fx.ref[i];
+        const F4 rq = r.rel[i * 2 + 0], rp = r.rel[i * 2 + 1];
+        if (r.rec[i].z != ro.retained) ++mm;
+        if (asU32(rq.x) != asU32(ro.ttpQ.x) || asU32(rq.y) != asU32(ro.ttpQ.y) ||
+            asU32(rq.z) != asU32(ro.ttpQ.z) || asU32(rq.w) != asU32(ro.ttpQ.w) ||
+            asU32(rp.x) != asU32(ro.ttpP.x) || asU32(rp.y) != asU32(ro.ttpP.y) ||
+            asU32(rp.z) != asU32(ro.ttpP.z) || rp.w != 0.0f) ++mm;
+        if (asU32(rp.x) == asU32(twin[i].ttpP.x) && asU32(rp.y) == asU32(twin[i].ttpP.y) &&
+            asU32(rp.z) == asU32(twin[i].ttpP.z)) ++mmTwin;
+        std::printf("  p94 case %c: GPU gManRel[1] %08x %08x %08x\n", 'A' + i, asU32(rp.x), asU32(rp.y), asU32(rp.z));
+    }
+    PXG_CHECK_MSG(mm == 0, "p94: %zu cases differ bitwise from the literal CUDA oracle "
+                  "(%zu equal the rotateInv twin: transformInvTransform reverted?)", mm, mmTwin);
 }
 
 } // namespace
