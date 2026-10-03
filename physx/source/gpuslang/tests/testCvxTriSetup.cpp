@@ -37,6 +37,7 @@
 #include "pxgTestFramework.h"
 
 #include "geometry/PxGeometry.h"
+#include "foundation/PxQuat.h"
 
 // The BV32 node stride is taken from the ENGINE HEADER, never typed by hand.  It
 // was typed by hand once (160) and the shader carried the same wrong number, so
@@ -64,7 +65,11 @@ static V3 cross3(V3 a, V3 b)
 static V3 mul(V3 a, V3 b) { return { a.x * b.x, a.y * b.y, a.z * b.z }; }
 static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 
-static V3 quatRotate(V4 q, V3 v)
+// P9.94d: the RODRIGUES spelling the shader's ctQuatRotate/ctQuatRotateInv carried
+// before P9.94d (and this mirror with them): `v*(w*w - u.u) + u*(2 v.u) +- (u x v)*2w`.
+// Not PxQuat's formula -- the same rotation in exact arithmetic, a different float
+// expression.  Kept ONLY as the vacuity twin selected by gP94dRodrigues.
+static V3 quatRotateRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -74,7 +79,7 @@ static V3 quatRotate(V4 q, V3 v)
              v.y * (w * w - uu) + u.y * (vu * 2.0f) + c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) + c.z * (w * 2.0f) };
 }
-static V3 quatRotateInv(V4 q, V3 v)
+static V3 quatRotateInvRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -83,6 +88,27 @@ static V3 quatRotateInv(V4 q, V3 v)
     return { v.x * (w * w - uu) + u.x * (vu * 2.0f) - c.x * (w * 2.0f),
              v.y * (w * w - uu) + u.y * (vu * 2.0f) - c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) - c.z * (w * 2.0f) };
+}
+// P9.94d mutant twins, false except inside a vacuity probe:
+//   gP94dRodrigues    -- both rotations take the old Rodrigues spelling above;
+//   gP94dToCvxPRotInv -- toCvxP takes the old q0.rotateInv(p1 - p0) spelling instead
+//                        of the CUDA's q0.getConjugate().rotate(p1 - p0).
+static bool gP94dRodrigues = false;
+static bool gP94dToCvxPRotInv = false;
+
+// PxQuat::rotate / rotateInv (PxQuat.h:286-295 / :324-333), the engine header's own
+// code called rather than retyped (this TU is -ffp-contract=off).  P9.94d.
+static V3 quatRotate(V4 q, V3 v)
+{
+    if (gP94dRodrigues) return quatRotateRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotate(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
+}
+static V3 quatRotateInv(V4 q, V3 v)
+{
+    if (gP94dRodrigues) return quatRotateInvRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotateInv(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
 }
 static V4 quatMul(V4 a, V4 b)
 {
@@ -170,6 +196,95 @@ static void buildMesh(Mesh& m, uint32_t nbNodes)
     for (int i = 0; i < 64; ++i) u32(0);   // trailing sections this stage never reads
 }
 
+struct Pair { uint32_t cm, tri, off, pad; };
+
+// convexTransform.transformInv(trimeshTransform).p (convexMesh.cu:139) =
+// PxTransform::transformInv(PxTransform) (PxTransform.h:162-169) LITERALLY:
+// qinv = q0.getConjugate(); qinv.rotate(p1 - p0).  P9.94d.
+static V3 toCvxPRef(V4 q0, V3 p0, V3 p1)
+{
+    const V3 d = sub(p1, p0);
+    return gP94dToCvxPRotInv ? quatRotateInv(q0, d) : quatRotate(quatConj(q0), d);
+}
+
+// The three triangle vertices in convex space and the normal, as the stage stores
+// them (convexMesh.cu:139, :176-196 and the normal of :204-206).
+struct TriRef { V3 e0, e1, e2, en; bool flip; };
+static TriRef refTri(const Mesh& mesh, uint32_t tri, V3 triScale, V4 triRot,
+                     V4 q0, V3 p0, V4 q1, V3 p1)
+{
+    const V4 toCvxQ = quatMul(quatConj(q0), q1);
+    const V3 toCvxP = toCvxPRef(q0, p0, p1);
+    TriRef r;
+    r.flip = (triScale.x * triScale.y * triScale.z) < 0.0f;
+    V3 loc[3];
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t vi = mesh.idx[4 * tri + k];
+        const V4 v4 = mesh.verts[vi];
+        const V3 v = { v4.x, v4.y, v4.z };
+        loc[k] = add(quatRotate(toCvxQ, vertex2Shape(v, triScale, triRot)), toCvxP);
+    }
+    r.e0 = loc[0];
+    r.e1 = r.flip ? loc[2] : loc[1];
+    r.e2 = r.flip ? loc[1] : loc[2];
+    r.en = normalized(cross3(sub(r.e1, r.e0), sub(r.e2, r.e0)));
+    return r;
+}
+
+// The twelve stored float words a TriRef predicts, and where they sit in the
+// 128-byte output record (in floats).
+static const uint32_t kRefWordAt[12] = { 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26 };
+static void refWords(const TriRef& r, uint32_t w[12])
+{
+    const float f[12] = { r.e0.x, r.e0.y, r.e0.z, r.e1.x, r.e1.y, r.e1.z,
+                          r.e2.x, r.e2.y, r.e2.z, r.en.x, r.en.y, r.en.z };
+    std::memcpy(w, f, sizeof(f));
+}
+
+// Uploads one fixture, runs cvxTriSetupLaunch over `pairs` and returns the
+// 128-byte-per-pair output.  The shapes already carry the device addresses.
+static std::vector<float> runSetupKernel(PxgSlangComputeDevice* dev,
+                                         const std::vector<GpuShape>& shapes,
+                                         const std::vector<float>& xf,
+                                         const std::vector<float>& cdist,
+                                         const std::vector<CmInput>& cms,
+                                         const std::vector<uint8_t>& pairBlob,
+                                         const std::vector<Pair>& pairs)
+{
+    const uint32_t n = uint32_t(pairs.size());
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCm = createBufferFrom(dev, cms);
+    PxgBufferHandle bPairBlob = createBufferFrom(dev, pairBlob);
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairs);
+    std::vector<float> outInit(size_t(n) * (128 / 4), -12345.0f);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    SetupPush push{};
+    push.cmInputs = dev->getBufferDeviceAddress(bCm);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.gpuShapes = dev->getBufferDeviceAddress(bShapes);
+    push.cvxTrimeshPair = dev->getBufferDeviceAddress(bPairBlob);
+    push.pairs = dev->getBufferDeviceAddress(bPairs);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numPairs = n;
+
+    {
+        Kernel k("cvxTriSetupBda.spv", "cvxTriSetupLaunch", {}, sizeof(SetupPush));
+        k.dispatch(n, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    std::vector<float> got = downloadBuffer<float>(dev, bOut, outInit.size());
+    dev->destroyBuffer(bShapes); dev->destroyBuffer(bXf); dev->destroyBuffer(bCd);
+    dev->destroyBuffer(bCm); dev->destroyBuffer(bPairBlob); dev->destroyBuffer(bPairs);
+    dev->destroyBuffer(bOut);
+    return got;
+}
+
 PXG_TEST(cvxTriSetupPrologue)
 {
     PxgSlangComputeDevice* dev = testDevice();
@@ -247,7 +362,7 @@ PXG_TEST(cvxTriSetupPrologue)
         r[4] = p.x; r[5] = p.y; r[6] = p.z;
     };
     // THE CONVEX BODY MUST ROTATE.  The composition is conj(q0)*q1 with
-    // rotInv(q0, p1 - p0); with q0 the identity the conjugate is a no-op and the
+    // conj(q0).rotate(p1 - p0); with q0 the identity the conjugate is a no-op and the
     // translation needs no rotating, so three separate mistakes become invisible.
     {
         const float a = 0.55f;
@@ -303,7 +418,6 @@ PXG_TEST(cvxTriSetupPrologue)
     setPair(4, 1100, 6, 99, 1200);
 
     // ---- the pairs to run --------------------------------------------------
-    struct Pair { uint32_t cm, tri, off, pad; };
     std::vector<Pair> pairs = {
         { 0, 0, 0, 0 },
         { 0, 2, 3, 0 },     // a different triangle of the same mesh
@@ -315,37 +429,11 @@ PXG_TEST(cvxTriSetupPrologue)
     };
 
     const uint32_t n = uint32_t(pairs.size());
-
-    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
-    PxgBufferHandle bXf = createBufferFrom(dev, xf);
-    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
-    PxgBufferHandle bCm = createBufferFrom(dev, cms);
-    PxgBufferHandle bPairBlob = createBufferFrom(dev, pairBlob);
-    PxgBufferHandle bPairs = createBufferFrom(dev, pairs);
-    std::vector<float> outInit(size_t(n) * (128 / 4), -12345.0f);
-    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
-
-    SetupPush push{};
-    push.cmInputs = dev->getBufferDeviceAddress(bCm);
-    push.transformCache = dev->getBufferDeviceAddress(bXf);
-    push.contactDistance = dev->getBufferDeviceAddress(bCd);
-    push.gpuShapes = dev->getBufferDeviceAddress(bShapes);
-    push.cvxTrimeshPair = dev->getBufferDeviceAddress(bPairBlob);
-    push.pairs = dev->getBufferDeviceAddress(bPairs);
-    push.output = dev->getBufferDeviceAddress(bOut);
-    push.numPairs = n;
-
-    {
-        Kernel k("cvxTriSetupBda.spv", "cvxTriSetupLaunch", {}, sizeof(SetupPush));
-        k.dispatch(n, {}, push, 1u, 1u);
-        dev->flush();
-    }
-
-    const auto got = downloadBuffer<float>(dev, bOut, outInit.size());
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
 
     size_t bad = 0;
     size_t sawSwap = 0, sawFlip = 0, sawBoundaryAdj = 0, sawRotatedScale = 0;
-    size_t sawDegenerate = 0, sawNegativePairNoFlip = 0;
+    size_t sawDegenerate = 0, sawNegativePairNoFlip = 0, sawRodriguesDiffers = 0;
     auto sameF = [](float a, float b)
     { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
@@ -367,9 +455,6 @@ PXG_TEST(cvxTriSetupPrologue)
         const V3 p0 = { xf[tc0 * 8 + 4], xf[tc0 * 8 + 5], xf[tc0 * 8 + 6] };
         const V4 q1 = { xf[tc1 * 8 + 0], xf[tc1 * 8 + 1], xf[tc1 * 8 + 2], xf[tc1 * 8 + 3] };
         const V3 p1 = { xf[tc1 * 8 + 4], xf[tc1 * 8 + 5], xf[tc1 * 8 + 6] };
-        const V4 toCvxQ = quatMul(quatConj(q0), q1);
-        const V3 toCvxP = quatRotateInv(q0, sub(p1, p0));
-
         const V3 triScale = { tri.sx, tri.sy, tri.sz };
         const V4 triRot = { tri.rx, tri.ry, tri.rz, tri.rw };
         const bool flip = (triScale.x * triScale.y * triScale.z) < 0.0f;
@@ -378,18 +463,19 @@ PXG_TEST(cvxTriSetupPrologue)
             ++sawNegativePairNoFlip;
         if ((cvx.rx != 0.0f) || (cvx.ry != 0.0f) || (cvx.rz != 0.0f)) ++sawRotatedScale;
 
-        V3 loc[3];
-        for (uint32_t k = 0; k < 3; ++k)
+        const TriRef ref = refTri(mesh, pr.tri, triScale, triRot, q0, p0, q1, p1);
+        const V3 e0 = ref.e0, e1 = ref.e1, e2 = ref.e2, en = ref.en;
+        // P9.94d vacuity: the same pair under the OLD Rodrigues rotations.  At least
+        // one pair must store a different word, or this fixture never saw the
+        // shader's switch to the literal PxQuat formula.
         {
-            const uint32_t vi = mesh.idx[4 * pr.tri + k];
-            const V4 v4 = mesh.verts[vi];
-            const V3 v = { v4.x, v4.y, v4.z };
-            loc[k] = add(quatRotate(toCvxQ, vertex2Shape(v, triScale, triRot)), toCvxP);
+            gP94dRodrigues = true;
+            const TriRef twin = refTri(mesh, pr.tri, triScale, triRot, q0, p0, q1, p1);
+            gP94dRodrigues = false;
+            uint32_t a[12], b[12];
+            refWords(ref, a); refWords(twin, b);
+            for (uint32_t k = 0; k < 12; ++k) if (a[k] != b[k]) { ++sawRodriguesDiffers; break; }
         }
-        const V3 e0 = loc[0];
-        const V3 e1 = flip ? loc[2] : loc[1];
-        const V3 e2 = flip ? loc[1] : loc[2];
-        const V3 en = normalized(cross3(sub(e1, e0), sub(e2, e0)));
 
         if (dot3(cross3(sub(e1, e0), sub(e2, e0)), cross3(sub(e1, e0), sub(e2, e0))) == 0.0f)
             ++sawDegenerate;
@@ -435,9 +521,6 @@ PXG_TEST(cvxTriSetupPrologue)
     }
 
     dev->destroyBuffer(bMeshA); dev->destroyBuffer(bMeshB); dev->destroyBuffer(bHull);
-    dev->destroyBuffer(bShapes); dev->destroyBuffer(bXf); dev->destroyBuffer(bCd);
-    dev->destroyBuffer(bCm); dev->destroyBuffer(bPairBlob); dev->destroyBuffer(bPairs);
-    dev->destroyBuffer(bOut);
 
     PXG_CHECK_MSG(bad == 0, "cvxTriSetup: %zu mismatches", bad);
     PXG_CHECK_MSG(sawSwap > 0, "no case has the mesh in slot 0 (the swap is untested)");
@@ -447,6 +530,256 @@ PXG_TEST(cvxTriSetupPrologue)
     PXG_CHECK_MSG(sawDegenerate > 0, "no case has a degenerate triangle (the zero-normal branch)");
     PXG_CHECK_MSG(sawNegativePairNoFlip > 0,
                   "no case has negative scale components WITHOUT a negative determinant");
+    PXG_CHECK_MSG(sawRodriguesDiffers > 0,
+                  "no case stores a different word under the old Rodrigues rotation "
+                  "(the P9.94d literal PxQuat formula is unobserved)");
+}
+
+// P9.94d: toCvxP = convexTransform.transformInv(trimeshTransform).p (convexMesh.cu:139)
+// is q0.getConjugate().rotate(p1 - p0) (PxTransform.h:162-169), NOT q0.rotateInv(p1 - p0).
+// The two agree on every nonzero component; this case makes them disagree on a zero.
+//
+// q0 = identity, p0 = +0, p1 = (-0,-0,-0): d = p1 - p0 = (-0,-0,-0).  conj(q0) is
+// (-0,-0,-0,1), and its rotate gives, per axis, vx*w2 + (y*vz - z*vy)*w + x*dot2 =
+// (-0) + (+0 - +0 = +0) + (-0 * +0 = -0) = +0; q0.rotateInv gives
+// vx*w2 - (y*vz - z*vy)*w + x*dot2 = (-0) - (-0 - -0 = +0) + (+0 * -0 = -0) = -0.  So
+// toCvxP is (+0,+0,+0) under the CUDA and (-0,-0,-0) under the old spelling.  q1 = (1,0,0,0) (180 deg about x) turns a vertex with y = +0 into a
+// rotated y of -0, and -0 + toCvxP.y keeps toCvxP.y's sign: the stored vertex y is +0
+// (CUDA) against -0 (old).  The mesh scale is the identity, so vertex2Shape leaves the
+// coordinates' magnitudes alone.  No RNG.
+PXG_TEST(cvxTriSetup_p94dToCvxPZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const float nz = -0.0f;
+
+    Mesh mesh;
+    mesh.verts = { { -1, 0, 1, 0 }, { 2, 0, 1, 0 }, { 0, 0, -3, 0 } };
+    mesh.idx = { 0, 1, 2, 0 };
+    mesh.adj = { 5, 6, 7, 0 };
+    mesh.remap = { 400 };
+    buildMesh(mesh, 1);
+    std::vector<uint32_t> hullBlob(64, 0x1234u);
+    PxgBufferHandle bMesh = createBufferFrom(dev, mesh.blob);
+    PxgBufferHandle bHull = createBufferFrom(dev, hullBlob);
+    const uint64_t addrMesh = dev->getBufferDeviceAddress(bMesh);
+    const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
+
+    std::vector<GpuShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0].sx = 1.0f; shapes[0].sy = 1.0f; shapes[0].sz = 1.0f; shapes[0].rw = 1.0f;
+    shapes[0].hullLo = uint32_t(addrHull & 0xffffffffu); shapes[0].hullHi = uint32_t(addrHull >> 32);
+    shapes[0].type = GEOM_CONVEXMESH;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].rw = 1.0f;
+    shapes[1].hullLo = uint32_t(addrMesh & 0xffffffffu); shapes[1].hullHi = uint32_t(addrMesh >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH;
+
+    const V4 q0 = { 0, 0, 0, 1 }, q1 = { 1, 0, 0, 0 };
+    const V3 p0 = { 0, 0, 0 }, p1 = { nz, nz, nz };
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[0] = q0.x; xf[1] = q0.y; xf[2] = q0.z; xf[3] = q0.w; xf[4] = p0.x; xf[5] = p0.y; xf[6] = p0.z;
+    xf[8] = q1.x; xf[9] = q1.y; xf[10] = q1.z; xf[11] = q1.w; xf[12] = p1.x; xf[13] = p1.y; xf[14] = p1.z;
+    std::vector<float> cdist = { 0.01f, 0.02f };
+    std::vector<CmInput> cms = { { 0, 1, 0, 1 } };
+    std::vector<uint8_t> pairBlob(56, 0);
+    std::vector<Pair> pairs = { { 0, 0, 0, 0 } };
+
+    const V3 one = { 1, 1, 1 };
+    const V4 idq = { 0, 0, 0, 1 };
+    const TriRef lit = refTri(mesh, 0, one, idq, q0, p0, q1, p1);
+    gP94dToCvxPRotInv = true;
+    const TriRef twin = refTri(mesh, 0, one, idq, q0, p0, q1, p1);
+    gP94dToCvxPRotInv = false;
+    uint32_t a[12], b[12];
+    refWords(lit, a); refWords(twin, b);
+    PXG_CHECK_MSG(u32(lit.e0.y) == 0x00000000u && u32(twin.e0.y) == 0x80000000u,
+                  "p94d: literal v0.y 0x%08x (want +0), twin 0x%08x (want -0)",
+                  u32(lit.e0.y), u32(twin.e0.y));
+    uint32_t differ = 0;
+    for (uint32_t k = 0; k < 12; ++k) if (a[k] != b[k]) ++differ;
+    PXG_CHECK_MSG(differ > 0, "p94d: the rotateInv twin stores the same words -- not discriminating");
+
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
+    for (uint32_t k = 0; k < 12; ++k)
+    {
+        const uint32_t g = u32(got[kRefWordAt[k]]);
+        PXG_CHECK_MSG(g == a[k], "p94d: stored word %u (float %u) GPU 0x%08x != literal 0x%08x (twin 0x%08x)",
+                      k, kRefWordAt[k], g, a[k], b[k]);
+    }
+    dev->destroyBuffer(bMesh); dev->destroyBuffer(bHull);
+}
+
+// P9.94d: ctQuatRotateInv must keep PxQuat::rotateInv's OPERAND ORDER
+// (PxQuat.h:324-333), not merely its value.  Its z lane is
+// `vz*w2 - (x*vy - y*vx)*w + z*dot2`; the respelling `vz*w2 + (y*vx - x*vy)*w + z*dot2`
+// is the same number whenever the cross term is nonzero, but when x*vy == y*vx the
+// bracket is +0 in BOTH spellings, and `a - (+0*w)` against `a + (+0*w)` differs on
+// a = -0.  The P9.94d sweep left that respelling (R12) alive: no fixture reached the
+// zero.  A host search over 180-degree quaternions, signed-zero vertices and +-1 scales
+// found this witness, which reaches it through vertex2Shape's rotateInv (convexMesh.cu
+// :176-196, cudaNpCommon.h:265-276):
+//   mesh scale (1,-1,1), scale rotation (1,0,0,0), vertex (-1,-0,-0),
+//   q0 = (1,0,0,0), q1 = (-1,0,-0,0), p0 = 0, p1 = (-0,0,0)
+// stores v0 = (-1,+0,-0) under the literal formula and (-1,+0,+0) under R12.  No RNG.
+PXG_TEST(cvxTriSetup_p94dRotateInvZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const float nz = -0.0f;
+
+    Mesh mesh;
+    mesh.verts = { { -1, nz, nz, 0 }, { 2, 1, 0.5f, 0 }, { 0.5f, 3, -1, 0 } };
+    mesh.idx = { 0, 1, 2, 0 };
+    mesh.adj = { 5, 6, 7, 0 };
+    mesh.remap = { 400 };
+    buildMesh(mesh, 1);
+    std::vector<uint32_t> hullBlob(64, 0x1234u);
+    PxgBufferHandle bMesh = createBufferFrom(dev, mesh.blob);
+    PxgBufferHandle bHull = createBufferFrom(dev, hullBlob);
+    const uint64_t addrMesh = dev->getBufferDeviceAddress(bMesh);
+    const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
+
+    const V3 sc = { 1.0f, -1.0f, 1.0f };
+    const V4 rq = { 1, 0, 0, 0 };
+    std::vector<GpuShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0].sx = 1.0f; shapes[0].sy = 1.0f; shapes[0].sz = 1.0f; shapes[0].rw = 1.0f;
+    shapes[0].hullLo = uint32_t(addrHull & 0xffffffffu); shapes[0].hullHi = uint32_t(addrHull >> 32);
+    shapes[0].type = GEOM_CONVEXMESH;
+    shapes[1].sx = sc.x; shapes[1].sy = sc.y; shapes[1].sz = sc.z;
+    shapes[1].rx = rq.x; shapes[1].ry = rq.y; shapes[1].rz = rq.z; shapes[1].rw = rq.w;
+    shapes[1].hullLo = uint32_t(addrMesh & 0xffffffffu); shapes[1].hullHi = uint32_t(addrMesh >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH;
+
+    const V4 q0 = { 1, 0, 0, 0 }, q1 = { -1, 0, nz, 0 };
+    const V3 p0 = { 0, 0, 0 }, p1 = { nz, 0, 0 };
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[0] = q0.x; xf[1] = q0.y; xf[2] = q0.z; xf[3] = q0.w; xf[4] = p0.x; xf[5] = p0.y; xf[6] = p0.z;
+    xf[8] = q1.x; xf[9] = q1.y; xf[10] = q1.z; xf[11] = q1.w; xf[12] = p1.x; xf[13] = p1.y; xf[14] = p1.z;
+    std::vector<float> cdist = { 0.01f, 0.02f };
+    std::vector<CmInput> cms = { { 0, 1, 0, 1 } };
+    std::vector<uint8_t> pairBlob(56, 0);
+    std::vector<Pair> pairs = { { 0, 0, 0, 0 } };
+
+    const TriRef lit = refTri(mesh, 0, sc, rq, q0, p0, q1, p1);
+    PXG_CHECK_MSG(u32(lit.e0.x) == u32(-1.0f) && u32(lit.e0.y) == 0x00000000u &&
+                  u32(lit.e0.z) == 0x80000000u,
+                  "p94d: literal v0 (0x%08x 0x%08x 0x%08x), want (-1, +0, -0)",
+                  u32(lit.e0.x), u32(lit.e0.y), u32(lit.e0.z));
+    uint32_t a[12];
+    refWords(lit, a);
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
+    for (uint32_t k = 0; k < 12; ++k)
+    {
+        const uint32_t g = u32(got[kRefWordAt[k]]);
+        PXG_CHECK_MSG(g == a[k], "p94d: stored word %u (float %u) GPU 0x%08x != literal 0x%08x",
+                      k, kRefWordAt[k], g, a[k]);
+    }
+    dev->destroyBuffer(bMesh); dev->destroyBuffer(bHull);
+}
+
+// P9.94d: ctQuatRotate/ctQuatRotateInv are PxQuat::rotate/rotateInv LITERALLY.  Random
+// poses, random mesh scales and scale rotations, both slot orders: every stored vertex
+// and normal word must equal the literal oracle BITWISE, and the old Rodrigues spelling
+// must store a different word on some of them -- otherwise this test cannot tell the
+// two formulas apart and proves nothing about the switch.
+PXG_TEST(cvxTriSetup_p94dLiteralRotate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+
+    uint32_t seed = 0x94d0001u;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return float(seed >> 8) * (1.0f / 16777216.0f); };
+    auto sym = [&](float m) { return (rnd() * 2.0f - 1.0f) * m; };
+    auto unitQ = [&]() {
+        V4 q = { sym(1), sym(1), sym(1), sym(1) };
+        const float r = 1.0f / std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        return V4{ q.x * r, q.y * r, q.z * r, q.w * r };
+    };
+
+    Mesh mesh;
+    for (uint32_t i = 0; i < 9; ++i) mesh.verts.push_back({ sym(3), sym(3), sym(3), 0 });
+    mesh.idx = { 0, 1, 2, 0,   3, 4, 5, 0,   6, 7, 8, 0,   0, 4, 8, 0 };
+    mesh.adj = { 1, 2, 3, 0,   0, 2, 3, 0,   0, 1, 3, 0,   0, 1, 2, 0 };
+    mesh.remap = { 10, 11, 12, 13 };
+    buildMesh(mesh, 2);
+    std::vector<uint32_t> hullBlob(64, 0x1234u);
+    PxgBufferHandle bMesh = createBufferFrom(dev, mesh.blob);
+    PxgBufferHandle bHull = createBufferFrom(dev, hullBlob);
+    const uint64_t addrMesh = dev->getBufferDeviceAddress(bMesh);
+    const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
+
+    const uint32_t N = 128;
+    std::vector<GpuShape> shapes(1 + N);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0].sx = 1.2f; shapes[0].sy = 0.9f; shapes[0].sz = 1.1f; shapes[0].rw = 1.0f;
+    shapes[0].hullLo = uint32_t(addrHull & 0xffffffffu); shapes[0].hullHi = uint32_t(addrHull >> 32);
+    shapes[0].type = GEOM_CONVEXMESH;
+    std::vector<float> xf(size_t(2 * N) * 8, 0.0f);
+    std::vector<float> cdist(2 * N, 0.01f);
+    std::vector<CmInput> cms(N);
+    std::vector<uint8_t> pairBlob(size_t(N) * 56, 0);
+    std::vector<Pair> pairs(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        GpuShape& m = shapes[1 + i];
+        auto mag = [&]() { const float s = 0.5f + rnd() * 1.5f; return rnd() < 0.2f ? -s : s; };
+        m.sx = mag(); m.sy = mag(); m.sz = mag();
+        const V4 r = unitQ();
+        m.rx = r.x; m.ry = r.y; m.rz = r.z; m.rw = r.w;
+        m.hullLo = uint32_t(addrMesh & 0xffffffffu); m.hullHi = uint32_t(addrMesh >> 32);
+        m.type = GEOM_TRIANGLEMESH;
+        for (uint32_t t = 0; t < 2; ++t)
+        {
+            const V4 q = unitQ();
+            float* x = xf.data() + size_t(2 * i + t) * 8;
+            x[0] = q.x; x[1] = q.y; x[2] = q.z; x[3] = q.w;
+            x[4] = sym(4); x[5] = sym(4); x[6] = sym(4);
+        }
+        // odd pairs put the mesh in slot 0, so the swap path runs the same helpers
+        cms[i] = (i & 1u) ? CmInput{ 1 + i, 0, 2 * i + 1, 2 * i } : CmInput{ 0, 1 + i, 2 * i, 2 * i + 1 };
+        pairs[i] = { i, i % 4u, 0, 0 };
+    }
+
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
+
+    size_t bad = 0, rodriguesDiffers = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const GpuShape& m = shapes[1 + i];
+        const float* x0 = xf.data() + size_t(2 * i) * 8;   // the convex's transform
+        const float* x1 = x0 + 8;                          // the mesh's
+        const V4 q0 = { x0[0], x0[1], x0[2], x0[3] }, q1 = { x1[0], x1[1], x1[2], x1[3] };
+        const V3 p0 = { x0[4], x0[5], x0[6] }, p1 = { x1[4], x1[5], x1[6] };
+        const V3 sc = { m.sx, m.sy, m.sz };
+        const V4 rq = { m.rx, m.ry, m.rz, m.rw };
+        const TriRef lit = refTri(mesh, pairs[i].tri, sc, rq, q0, p0, q1, p1);
+        gP94dRodrigues = true;
+        const TriRef twin = refTri(mesh, pairs[i].tri, sc, rq, q0, p0, q1, p1);
+        gP94dRodrigues = false;
+        uint32_t a[12], b[12];
+        refWords(lit, a); refWords(twin, b);
+        bool differs = false;
+        for (uint32_t k = 0; k < 12; ++k)
+        {
+            if (a[k] != b[k]) differs = true;
+            const uint32_t g = u32(got[size_t(i) * 32 + kRefWordAt[k]]);
+            if (g != a[k])
+            {
+                if (++bad <= 12)
+                    std::printf("  [pair %u] word %u: GPU 0x%08x literal 0x%08x twin 0x%08x\n",
+                                i, k, g, a[k], b[k]);
+            }
+        }
+        if (differs) ++rodriguesDiffers;
+    }
+    std::printf("  cvxTriSetup_p94dLiteralRotate: %zu/%u pairs store a different word under the "
+                "Rodrigues twin\n", rodriguesDiffers, N);
+    PXG_CHECK_MSG(bad == 0, "p94d: %zu stored words differ from the literal PxQuat oracle", bad);
+    PXG_CHECK_MSG(rodriguesDiffers > 0,
+                  "p94d: the Rodrigues twin stores the same words on every pair -- the literal "
+                  "formula is unobserved");
+    dev->destroyBuffer(bMesh); dev->destroyBuffer(bHull);
 }
 
 } // namespace

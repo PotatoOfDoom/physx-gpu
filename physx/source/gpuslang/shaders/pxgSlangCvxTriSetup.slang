@@ -120,18 +120,35 @@ public struct CtContactManagerInput
 // ---------------------------------------------------------------------------
 // quaternion / scale helpers (PxQuat, PxMeshScale)
 // ---------------------------------------------------------------------------
+// P9.94d: PxQuat::rotate / rotateInv (PxQuat.h:286-295 / :324-333) LITERALLY --
+// the header's own temporaries and its own operand order, with no dot()/cross()
+// builtins.  The earlier Rodrigues spelling `v*(w*w - u.u) + u*(2 v.u) +- (u x v)*2w`
+// is the same rotation in exact arithmetic and a different float expression: it
+// rounds differently in the last bit and can take the other sign on an exact
+// zero, and every convex/sphere/capsule contact against a mesh or heightfield
+// runs through these two functions.
 public float3 ctQuatRotate(float4 q, float3 v)
 {
-    const float3 u = float3(q.x, q.y, q.z);
-    const float w = q.w;
-    return v * (w * w - dot(u, u)) + u * (dot(v, u) * 2.0f) + cross(u, v) * (w * 2.0f);
+    const float vx = 2.0f * v.x;
+    const float vy = 2.0f * v.y;
+    const float vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3((vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                  (vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                  (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
 }
 
 public float3 ctQuatRotateInv(float4 q, float3 v)
 {
-    const float3 u = float3(q.x, q.y, q.z);
-    const float w = q.w;
-    return v * (w * w - dot(u, u)) + u * (dot(v, u) * 2.0f) - cross(u, v) * (w * 2.0f);
+    const float vx = 2.0f * v.x;
+    const float vy = 2.0f * v.y;
+    const float vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3((vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                  (vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                  (vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2));
 }
 
 public float4 ctQuatMul(float4 a, float4 b)
@@ -286,12 +303,17 @@ public CtCommon ctCommon(uint64_t cmInputs, uint64_t transformCache, uint64_t co
     const float4 q1 = Ptr<float4>(xf1)[0];
     const float3 p1 = float3(Ptr<float>(xf1 + 16UL)[0], Ptr<float>(xf1 + 20UL)[0], Ptr<float>(xf1 + 24UL)[0]);
 
-    // convexTransform.transformInv(trimeshTransform): q = conj(q0)*q1,
-    // p = rotInv(q0, p1 - p0).  NOTE THE DIRECTION -- the midphase composes the
-    // OTHER way round (mesh-relative), this one is convex-relative
-    // (convexMesh.cu:141).
-    const float4 toCvxQ = ctQuatMul(ctQuatConjugate(q0), q1);
-    const float3 toCvxP = ctQuatRotateInv(q0, p1 - p0);
+    // convexTransform.transformInv(trimeshTransform) (convexMesh.cu:139,
+    // convexHeightfield.cu:208), which is PxTransform::transformInv(PxTransform)
+    // (PxTransform.h:162-169) LITERALLY: qinv = q0.getConjugate();
+    // q = qinv*q1, p = qinv.rotate(p1 - p0).  P9.94d: NOT q0.rotateInv(p1 - p0) --
+    // equal for every nonzero component, but an exact-zero component can take the
+    // other sign (cvxTriSetup_p94dToCvxPZeroSign / cvxHfSetup_p94dToCvxPZeroSign).
+    // NOTE THE DIRECTION -- the midphase composes the OTHER way round
+    // (mesh-relative), this one is convex-relative.
+    const float4 q0inv = ctQuatConjugate(q0);
+    const float4 toCvxQ = ctQuatMul(q0inv, q1);
+    const float3 toCvxP = ctQuatRotate(q0inv, p1 - p0);
 
     s.toCvxQ = toCvxQ;
     s.toCvxP = toCvxP;

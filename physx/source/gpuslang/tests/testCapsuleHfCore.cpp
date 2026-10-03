@@ -140,6 +140,10 @@ struct GpuShape
 static_assert(sizeof(GpuShape) == 48, "PxgShape mirror");
 struct CmInput { uint32_t shapeRef0, shapeRef1, tcRef0, tcRef1; };
 
+// P9.94d twin switch: the pre-P9.94d `rotateInv(capQ, meshP - capP)` spelling of
+// toCapP.  False except inside the zero-sign probe, which resets it.
+static bool& p94dToCapPTwin() { static bool b = false; return b; }
+
 static CoreOut capsuleCore(const Hf& hf, const GpuShape& capsuleShape,
                            const GpuShape& hfShape, V4 capQ, V3 capP, V4 meshQ, V3 meshP,
                            float contactDist, uint32_t triangleIdx,
@@ -156,8 +160,14 @@ static CoreOut capsuleCore(const Hf& hf, const GpuShape& capsuleShape,
     const float capsuleRadius = capsuleShape.sy;
     const float capsuleHalfHeight = capsuleShape.sx;
 
-    const V4 toCapQ = quatMul(quatConj(capQ), meshQ);
-    const V3 toCapP = quatRotateInv(capQ, sub(meshP, capP));
+    // PxTransform::transformInv(PxTransform) (PxTransform.h:162-169), as the CUDA
+    // calls it (convexHeightfield.cu:676): rotate by the CONJUGATE.  P9.94d: the old
+    // spelling, rotateInv(capQ, .), differs only in the sign of an exact zero and is
+    // kept as the twin capsuleHfCore_p94dToCapPZeroSign must tell apart.
+    const V4 capQinv = quatConj(capQ);
+    const V4 toCapQ = quatMul(capQinv, meshQ);
+    const V3 toCapP = p94dToCapPTwin() ? quatRotateInv(capQ, sub(meshP, capP))
+                                       : quatRotate(capQinv, sub(meshP, capP));
 
     const V3 tmp = mul(basisVector0(capQ), capsuleHalfHeight);
     const V3 capsuleCenterInMesh = quatRotateInv(meshQ, sub(capP, meshP));
@@ -424,7 +434,7 @@ PXG_TEST(capsuleHfCore)
         // bu = bv = h = 0 puts the segment midpoint on vertex a itself, so
         // `capsuleCenterInMesh - t.v0` is the exact zero vector and its dot product
         // with any normal is exactly 0.0f -- but only through the IDENTITY mesh
-        // transform, where ctQuatRotate's `v*(w*w - dot(u,u))` degenerates to `v*1`
+        // transform, where ctQuatRotate's `vx*w2` (PxQuat::rotate, 2v * 0.5) is `v` exactly
         // and the world round trip is bit-exact.  `dist-from-v1` then measures from
         // v1 instead, whose offset from the plane is the rounding residue of
         // `dot(ab, N)`; on a SLOPED triangle that residue is not zero, and the guard
@@ -647,6 +657,33 @@ PXG_TEST(capsuleHfCore)
                              specs[i].tri, startIdx[i], roundedIdx[i], specs[i].testOffset);
     }
 
+    // P9.94d vacuity: the same cases under the OLD Rodrigues rotations (the spelling
+    // ctQuatRotate/ctQuatRotateInv carried before P9.94d).  Some case must store a
+    // different word, or this fixture never saw the switch to PxQuat's formula.
+    size_t sawRodriguesDiffers = 0;
+    {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        auto words = [&](const CoreOut& o, std::vector<uint32_t>& w) {
+            w = { o.nb, o.ordered, o.niIndex, bits(o.maxDepth),
+                  bits(o.niNormal.x), bits(o.niNormal.y), bits(o.niNormal.z) };
+            for (uint32_t k = 0; k < 2; ++k)
+            {
+                const bool live = k < o.nb;
+                w.push_back(live ? bits(o.pt[k].x) : 0u); w.push_back(live ? bits(o.pt[k].y) : 0u);
+                w.push_back(live ? bits(o.pt[k].z) : 0u); w.push_back(live ? bits(o.sep[k]) : 0u);
+            }
+        };
+        p94dRodriguesTwin() = true;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            std::vector<uint32_t> a, b;
+            words(exp[i], a);
+            words(runMirror(i), b);
+            if (a != b) ++sawRodriguesDiffers;
+        }
+        p94dRodriguesTwin() = false;
+    }
+
     uint32_t maxOff = 0, maxPad = 0;
     for (uint32_t i = 0; i < n; ++i)
     { maxOff = std::max(maxOff, exp[i].pairOffset); maxPad = std::max(maxPad, exp[i].pairOffsetPadded); }
@@ -809,6 +846,9 @@ PXG_TEST(capsuleHfCore)
                 nbCount[0], nbCount[1], nbCount[2]);
 
     PXG_CHECK_MSG(bad == 0, "capsuleHfCore: %zu mismatches", bad);
+    PXG_CHECK_MSG(sawRodriguesDiffers > 0,
+                  "no case stores a different word under the old Rodrigues rotation "
+                  "(the P9.94d literal PxQuat formula is unobserved)");
     PXG_CHECK_MSG(sawRotatedHf > 0,
                   "no case has a ROTATED heightfield actor -- upstream candidate 50, the "
                   "capsule axis left in world space, is then invisible");
@@ -913,6 +953,221 @@ PXG_TEST(capsuleHfCore)
                       "no case enters the body from the last-but-one cell row -- `rows` "
                       "reaches the output only through `cell / c != r - 2`");
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// P9.94d: toCapP is `conj(capQ).rotate(meshP - capP)` (convexHeightfield.cu:676 ->
+// PxTransform::transformInv(PxTransform), PxTransform.h:162-169), not
+// `capQ.rotateInv(meshP - capP)`.  The two differ ONLY in the sign of an exact-zero
+// component -- the cross term `(y*vz - z*vy)*w` cancels to +-0 and is added in one,
+// subtracted in the other -- so no generic input can tell them apart.  This probe
+// SEARCHES for an input that does: every pairing of the 56 quaternions with
+// exactly-representable rotations and signed-zero imaginary/real parts (the 8
+// signed-zero identities (+-0,+-0,+-0,1) and the 48 signed-zero 180-degree axis
+// turns), both signs of a zero z offset in each frame, and both triangles of the
+// first cell of a flat heightfield.  The capsule lies along x (every one of these
+// rotations keeps getBasisVector0 on the x axis), 0.125 above the face at mesh-local
+// z = 0, so its contacts are its endpoints, whose z is a signed zero, and the stored
+// contact z is `rotate(toCapQ, pt).z + toCapP.z` -- a sum of two zeros, whose sign
+// shows toCapP.z's whenever the rotated point's z is -0.
+//
+// The oracle runs every candidate under both spellings; the candidates where a
+// STORED contact word differs are the witnesses.  The GPU then runs the witnesses
+// (and a handful of non-witnesses as controls) and must match the literal oracle
+// bitwise on every stored word -- and, on a witness, therefore differ from the twin.
+PXG_TEST(capsuleHfCore_p94dToCapPZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+
+    // a flat 4x4 heightfield, height 0 everywhere
+    Hf hf;
+    hf.rows = 4; hf.cols = 4;
+    for (uint32_t i = 0; i < 16; ++i)
+        hf.samples.push_back(sampleWord(0, uint8_t(1 + (i % 5)), (i % 4u) == 1u, uint8_t(2 + (i % 7))));
+    buildHf(hf);
+    PxgBufferHandle bHf = createBufferFrom(dev, hf.blob);
+    const uint64_t addrHf = dev->getBufferDeviceAddress(bHf);
+
+    std::vector<GpuShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0] = { 0.25f, 0.25f, 0.25f, 0, 0, 0, 1, 0, 0, 0, 2u, 0 };                       // capsule
+    shapes[1] = { 1.0f, 0.0625f, 1.0f, 0, 0, 0, 1, 0,
+                  uint32_t(addrHf & 0xffffffffu), uint32_t(addrHf >> 32), 9u, 0 };   // heightfield
+
+    // the 56 quaternions
+    std::vector<V4> qs;
+    for (uint32_t sgn = 0; sgn < 8; ++sgn)
+        qs.push_back(V4{ (sgn & 1) ? -0.0f : 0.0f, (sgn & 2) ? -0.0f : 0.0f, (sgn & 4) ? -0.0f : 0.0f, 1.0f });
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        for (uint32_t sgn = 0; sgn < 16; ++sgn)
+        {
+            float c[4];
+            uint32_t z = 0;
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                if (k == axis) c[k] = (sgn & 1) ? -1.0f : 1.0f;
+                else { c[k] = (sgn & (2u << z)) ? -0.0f : 0.0f; ++z; }
+            }
+            qs.push_back(V4{ c[0], c[1], c[2], c[3] });
+        }
+
+    struct Cand { V4 capQ, meshQ; V3 capP, meshP; uint32_t tri; };
+    auto wordsOf = [&](const CoreOut& o, std::vector<uint32_t>& w) {
+        w = { o.nb, o.ordered, o.niIndex, bits(o.maxDepth),
+              bits(o.niNormal.x), bits(o.niNormal.y), bits(o.niNormal.z) };
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            const bool live = k < o.nb;
+            w.push_back(live ? bits(o.pt[k].x) : 0u); w.push_back(live ? bits(o.pt[k].y) : 0u);
+            w.push_back(live ? bits(o.pt[k].z) : 0u); w.push_back(live ? bits(o.sep[k]) : 0u);
+        }
+    };
+    auto runCand = [&](const Cand& c, uint32_t startIndex, uint32_t rounded) {
+        return capsuleCore(hf, shapes[0], shapes[1], c.capQ, c.capP, c.meshQ, c.meshP, 0.0f,
+                           c.tri, startIndex, rounded, 0u);
+    };
+
+    std::vector<Cand> witnesses, controls;
+    size_t searched = 0, entered = 0;
+    for (const V4& capQ : qs)
+        for (const V4& meshQ : qs)
+            for (uint32_t zs = 0; zs < 4; ++zs)
+                for (uint32_t tri = 0; tri < 2; ++tri)
+                {
+                    Cand c;
+                    c.capQ = capQ; c.meshQ = meshQ; c.tri = tri;
+                    c.meshP = V3{ 1.0f, 2.0f, (zs & 1) ? -0.0f : 0.0f };
+                    // mesh-local centre (0.5, 0.125, 0) pushed out through the mesh pose;
+                    // every rotation here is exact, so the centre comes back exactly.
+                    const V3 off = quatRotate(meshQ, V3{ 0.5f, 0.125f, 0.0f });
+                    c.capP = V3{ c.meshP.x + off.x, c.meshP.y + off.y, (zs & 2) ? -0.0f : 0.0f };
+                    ++searched;
+                    const CoreOut lit = runCand(c, 0u, 0u);
+                    if (lit.nb == 0) continue;
+                    ++entered;
+                    p94dToCapPTwin() = true;
+                    const CoreOut twin = runCand(c, 0u, 0u);
+                    p94dToCapPTwin() = false;
+                    std::vector<uint32_t> a, b;
+                    wordsOf(lit, a); wordsOf(twin, b);
+                    if (a != b) { if (witnesses.size() < 24) witnesses.push_back(c); }
+                    else if (controls.size() < 8) controls.push_back(c);
+                }
+    std::printf("  capsuleHfCore_p94dToCapPZeroSign: %zu candidates, %zu with contacts, "
+                "%zu+ witnesses\n", searched, entered, witnesses.size());
+    PXG_CHECK_MSG(entered > 0, "p94d: no candidate reaches the contact loop -- the search is vacuous");
+    PXG_CHECK_MSG(!witnesses.empty(),
+                  "p94d: no candidate stores a different word under rotateInv(capQ) -- the "
+                  "conjugate spelling of toCapP is unobserved");
+
+    std::vector<Cand> cases = witnesses;
+    cases.insert(cases.end(), controls.begin(), controls.end());
+    const uint32_t n = uint32_t(cases.size());
+
+    std::vector<float> xf(size_t(n) * 2 * 8, 0.0f);
+    std::vector<CmInput> cms(n);
+    std::vector<uint8_t> pairBlob(size_t(n) * 56, 0);
+    struct Pair { uint32_t cm, tri, off, pad; };
+    std::vector<Pair> pairs(n);
+    std::vector<CoreOut> exp(n), twinExp(n);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const Cand& c = cases[i];
+        float* r0 = xf.data() + size_t(2 * i) * 8;
+        float* r1 = r0 + 8;
+        r0[0] = c.capQ.x; r0[1] = c.capQ.y; r0[2] = c.capQ.z; r0[3] = c.capQ.w;
+        r0[4] = c.capP.x; r0[5] = c.capP.y; r0[6] = c.capP.z;
+        r1[0] = c.meshQ.x; r1[1] = c.meshQ.y; r1[2] = c.meshQ.z; r1[3] = c.meshQ.w;
+        r1[4] = c.meshP.x; r1[5] = c.meshP.y; r1[6] = c.meshP.z;
+        cms[i] = { 0u, 1u, 2 * i, 2 * i + 1 };
+        const uint32_t start = i, rounded = n + i;
+        std::memcpy(&pairBlob[size_t(i) * 56 + 28], &start, 4);
+        std::memcpy(&pairBlob[size_t(i) * 56 + 40], &rounded, 4);
+        pairs[i] = { i, c.tri, 0u, 0u };
+        exp[i] = runCand(c, start, rounded);
+        p94dToCapPTwin() = true;
+        twinExp[i] = runCand(c, start, rounded);
+        p94dToCapPTwin() = false;
+    }
+    std::vector<float> cdist(size_t(n) * 2, 0.0f);
+
+    const uint32_t slots = 2 * n;
+    const uint32_t U_SENT = 0xdeadbeefu;
+    std::vector<uint32_t> niInit(size_t(slots) * 4, U_SENT), mdInit(slots, U_SENT);
+    std::vector<uint32_t> imInit(slots, U_SENT), ordInit(slots, U_SENT);
+    std::vector<uint32_t> outInit(size_t(n) * 12, U_SENT);
+
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCm = createBufferFrom(dev, cms);
+    PxgBufferHandle bPairBlob = createBufferFrom(dev, pairBlob);
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairs);
+    PxgBufferHandle bNi = createBufferFrom(dev, niInit);
+    PxgBufferHandle bMd = createBufferFrom(dev, mdInit);
+    PxgBufferHandle bIm = createBufferFrom(dev, imInit);
+    PxgBufferHandle bOrd = createBufferFrom(dev, ordInit);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    Push push{};
+    push.cmInputs = dev->getBufferDeviceAddress(bCm);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.gpuShapes = dev->getBufferDeviceAddress(bShapes);
+    push.sphereTrimeshPair = dev->getBufferDeviceAddress(bPairBlob);
+    push.ni = dev->getBufferDeviceAddress(bNi);
+    push.maxDepth = dev->getBufferDeviceAddress(bMd);
+    push.interm = dev->getBufferDeviceAddress(bIm);
+    push.ordered = dev->getBufferDeviceAddress(bOrd);
+    push.pairs = dev->getBufferDeviceAddress(bPairs);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numPairs = n;
+    {
+        Kernel k("capsuleHfCoreBda.spv", "capsuleHfCoreLaunch", {}, sizeof(Push));
+        k.dispatch((n + 63u) / 64u, {}, push, 1u, 1u);
+        dev->flush();
+    }
+    const auto gotOut = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+    const auto gotNi = downloadBuffer<uint32_t>(dev, bNi, niInit.size());
+    const auto gotMd = downloadBuffer<uint32_t>(dev, bMd, slots);
+
+    size_t bad = 0, gpuDiffersFromTwin = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const CoreOut& e = exp[i];
+        const CoreOut& t = twinExp[i];
+        const uint32_t* r = gotOut.data() + size_t(i) * 12;
+        auto chk = [&](const char* w, uint32_t g, uint32_t x) {
+            if (g != x && ++bad <= 16)
+                std::printf("  [case %u] %s: GPU 0x%08x literal 0x%08x\n", i, w, g, x);
+        };
+        chk("nb", r[0], e.nb);
+        for (uint32_t k = 0; k < e.nb && k < 2; ++k)
+        {
+            const uint32_t* f = r + 4 + k * 4;
+            chk("pt.x", f[0], bits(e.pt[k].x)); chk("pt.y", f[1], bits(e.pt[k].y));
+            chk("pt.z", f[2], bits(e.pt[k].z)); chk("sep", f[3], bits(e.sep[k]));
+            if (k < t.nb && (f[0] != bits(t.pt[k].x) || f[1] != bits(t.pt[k].y)
+                             || f[2] != bits(t.pt[k].z)))
+                ++gpuDiffersFromTwin;
+        }
+        chk("maxDepth", gotMd[e.pairOffset], bits(e.maxDepth));
+        chk("ni.x", gotNi[4 * e.pairOffset + 0], bits(e.niNormal.x));
+        chk("ni.y", gotNi[4 * e.pairOffset + 1], bits(e.niNormal.y));
+        chk("ni.z", gotNi[4 * e.pairOffset + 2], bits(e.niNormal.z));
+        chk("ni.index", gotNi[4 * e.pairOffset + 3], e.niIndex);
+    }
+    std::printf("  %u cases on the GPU (%zu witnesses), %zu stored contacts differ from the twin\n",
+                n, witnesses.size(), gpuDiffersFromTwin);
+    PXG_CHECK_MSG(bad == 0, "p94d: %zu stored words differ from the literal oracle", bad);
+    PXG_CHECK_MSG(gpuDiffersFromTwin > 0,
+                  "p94d: no GPU contact differs from the rotateInv twin on a witness");
+
+    for (PxgBufferHandle h : { bHf, bShapes, bXf, bCd, bCm, bPairBlob, bPairs, bNi, bMd, bIm,
+                               bOrd, bOut })
+        dev->destroyBuffer(h);
 }
 
 } // namespace

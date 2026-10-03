@@ -366,9 +366,13 @@ public void hfLocalBound(float4 hfQ, float3 hfP, float3 hfScale,
     // (PxMat33.h:136-163) with its `(1 - yy) - zz` diagonal.  Until P9.89 this was
     // quatRotateInv(hfQ, centre - hfP) and quatRotateInv(hfQ, e_i) -- a different rounding
     // tree for the centre and the `2(w^2 - 0.5) + 2x^2` diagonal, bitwise the CUDA only
-    // for the identity and the 180-degree axis turns.  quatRotate(conj q, v) is bitwise
-    // quatRotateInv(q, v) (every negation is exact); the conjugate is spelled out because
-    // that is what getInverse() hands transformFast.  Pinned by
+    // for the identity and the 180-degree axis turns.  The conjugate is spelled out
+    // because that is what getInverse() hands transformFast, and it is NOT
+    // interchangeable with quatRotateInv(q, v) (P9.94d): the two agree in every nonzero
+    // bit but can differ in the SIGN OF AN EXACT ZERO (the cross term cancels to +0 and
+    // is added in one, subtracted in the other).  Here that is unobservable -- lMin/lMax
+    // reach nothing but comparisons, floor/ceil -> int and hfF2uSat, all of which treat
+    // -0 as +0 -- but the spelling stays the foundation's.  Pinned by
     // {femClothSim,softBodySim}HeightfieldMidphaseRotated.
     const float4 qInv = quatConjugate(hfQ);
     const float3 invP = quatRotateInv(hfQ, -hfP);

@@ -244,20 +244,41 @@ StMesh stReadMesh(uint64_t meshPtr)
     return m;
 }
 
-// getShapeSpaceVerts (convexMesh.cu:55-72): vertex2Shape per vertex, then the
-// winding flip when the scale determinant is negative.  The CUDA writes lanes 1
-// and 2 to swapped slots; lane 0 never moves.
+// getShapeSpaceVerts (convexMesh.cu:55-72) -> MeshScaling::getShapeSpaceVert
+// (cudaNpCommon.h:241-259).  P9.94d: the IDENTITY-SCALE BYPASS is part of it.
+// `idtMeshScale` is `scale == (1,1,1)` exactly (cudaNpCommon.h:197) and looks at
+// the SCALE ONLY -- a non-identity scale rotation with a unit scale still takes
+// the bypass, and the raw vertices go through untouched.  vertex2Shape there
+// would be the identity in exact arithmetic, but `rotateInv(rot, rotate(rot, v))`
+// rounds, so skipping it is observable (sphereTriNp_p94dIdtScaleRot).  No flip in
+// that branch: a unit scale's determinant is +1.  Otherwise vertex2Shape per
+// vertex, then the winding flip when the scale determinant is negative: lanes 1
+// and 2 go to swapped slots; lane 0 never moves.  Same shape as the Phase-1 twin
+// (npCvxMeshNp.slang getShapeSpaceVerts).
 void stShapeSpaceVerts(StMesh m, uint triangleIdx, float3 scale, float4 scaleRot,
                        out float3 v0, out float3 v1, out float3 v2)
 {
     const uint4 vi = Ptr<uint4>(m.indices)[triangleIdx];
-    const float3 a = ctVertex2Shape(Ptr<float4>(m.verts)[vi.x].xyz, scale, scaleRot);
-    const float3 b = ctVertex2Shape(Ptr<float4>(m.verts)[vi.y].xyz, scale, scaleRot);
-    const float3 c = ctVertex2Shape(Ptr<float4>(m.verts)[vi.z].xyz, scale, scaleRot);
-    const bool flipNormal = (scale.x * scale.y * scale.z) < 0.0f;
-    v0 = a;
-    v1 = flipNormal ? c : b;
-    v2 = flipNormal ? b : c;
+    const float3 a = Ptr<float4>(m.verts)[vi.x].xyz;
+    const float3 b = Ptr<float4>(m.verts)[vi.y].xyz;
+    const float3 c = Ptr<float4>(m.verts)[vi.z].xyz;
+    const bool idtMeshScale = (scale.x == 1.0f && scale.y == 1.0f && scale.z == 1.0f);
+    if (idtMeshScale)
+    {
+        v0 = a;
+        v1 = b;
+        v2 = c;
+    }
+    else
+    {
+        const float3 sa = ctVertex2Shape(a, scale, scaleRot);
+        const float3 sb = ctVertex2Shape(b, scale, scaleRot);
+        const float3 sc = ctVertex2Shape(c, scale, scaleRot);
+        const bool flipNormal = (scale.x * scale.y * scale.z) < 0.0f;
+        v0 = sa;
+        v1 = flipNormal ? sc : sb;
+        v2 = flipNormal ? sb : sc;
+    }
 }
 
 // getTriangleActiveMaskFromNormal (convexTriangle.cuh).  Only the CAPSULE arm
@@ -505,9 +526,15 @@ StArmOut stCapsuleArm(uint globalThreadIndex,
     const float4 trimeshScaleRot = float4(trimeshShape.scaleRotX, trimeshShape.scaleRotY,
                                           trimeshShape.scaleRotZ, trimeshShape.scaleRotW);
 
-    // meshToCapsule = capsuleTransform.transformInv(trimeshTransform) (:442).
-    const float4 meshToCapQ = ctQuatMul(ctQuatConjugate(capQ), meshQ);
-    const float3 meshToCapP = ctQuatRotateInv(capQ, meshP - capP);
+    // meshToCapsule = capsuleTransform.transformInv(trimeshTransform) (:443),
+    // PxTransform.h:162-169: `qinv = q.getConjugate(); (qinv.rotate(src.p - p),
+    // qinv * src.q)`.  P9.94d: rotate by the CONJUGATE, literally -- rotateInv(q)
+    // matches it in every nonzero bit but can flip the sign of an exact-zero
+    // component (the zero cross term is added in one, subtracted in the other),
+    // and that sign reaches the stored contact (sphereTriNp_p94dCapsuleMtcZeroSign).
+    const float4 capQinv = ctQuatConjugate(capQ);
+    const float4 meshToCapQ = ctQuatMul(capQinv, meshQ);
+    const float3 meshToCapP = ctQuatRotate(capQinv, meshP - capP);
 
     // getBasisVector0 is its OWN formula, not rotate(q,(1,0,0)) -- see
     // pxgSlangCapsuleHfCore's header.  Unlike the heightfield twin (upstream

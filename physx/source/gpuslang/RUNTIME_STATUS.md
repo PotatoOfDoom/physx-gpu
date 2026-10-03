@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.94d (A+B): the ct quaternion helpers in pxgSlangCvxTriSetup now spell PxQuat::rotate/rotateInv
+literally (they used the Rodrigues vector form: general rounding on every convex/sphere/capsule vs
+mesh/heightfield contact); toCvxP / toCapP / meshToCapsule via the conjugate (transformInv(PxTransform));
+sphereTriNpBda gains the idtMeshScale bypass of getShapeSpaceVert.  Oracles call physx::PxQuat with a
+Rodrigues twin.  Directed fixtures in cvxTriSetup, cvxHfSetup, sphereTriNp, capsuleHfCore.  Scenes 64/64.
 P9.94c: convexTrimeshMidphaseBda aToB (conjugate, stored zero signs) and the vertex-space query box
 (literal getInverse().toMat33() * PxMat33(conj q) + transformFast; general rounding moved the box
 faces and so the visited BV32 children), plus the particle-heightfield local bound in
@@ -2100,6 +2105,62 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.94d (Teil 1) — Die `ct`-Quaternion-Helfer rechnen `PxQuat::rotate` wörtlich; Konjugierte und Identitäts-Skalierung im Kapsel-/Kugel-Pfad
+
+**Ausgangslage.** Der zweite Audit über alle Helfernamen für inverse Rotation fand 44 Stellen. Der
+gewichtigste Fund: `ctQuatRotate`/`ctQuatRotateInv` in `pxgSlangCvxTriSetup.slang` rechneten die
+Vektorform `v·(w² − u·u) + u·(2 v·u) ± (u×v)·2w`. PxQuat.h:286-295 / :324-333 rechnet aber
+`vx = 2v.x …; w2 = w·w − 0.5; dot2 = x·vx + y·vy + z·vz` und komponentenweise
+`vx·w2 ± (y·vz − z·vy)·w + x·dot2`. Das ist in exakter Arithmetik gleich, rundet in float32 aber anders.
+Betroffen sind alle Engine-Pfade Konvex/Kugel/Kapsel gegen Mesh und Heightfield: cvxTriSetup,
+cvxHfSetup, sphereHfCore, capsuleHfCore und sphereTriNp sowie die Engine-Kernel convexTrimeshCoreBda,
+convexHfCoreBda und sphereHfNpBda.
+
+**Einheit A.**
+- Beide Helfer sind jetzt wörtliche Transkriptionen, ohne `dot()`/`cross()`.
+- `toCvxP` spiegelt `transformInv(PxTransform)` (convexMesh.cu:139, convexHeightfield.cu:208) und
+  rechnet jetzt über die Konjugierte.
+- Das gemeinsame Orakel `pxgNpRefMath.h` ruft `physx::PxQuat` direkt auf. Die alte Rodrigues-Form
+  bleibt als Zwilling erhalten. `testCvxTriSetup` und `testCvxHfSetup` sind entsprechend
+  umgebaut, ebenfalls mit Zwillingen.
+- Neue Tests: `cvxTriSetup_p94dToCvxPZeroSign`, `cvxTriSetup_p94dRotateInvZeroSign`,
+  `cvxTriSetup_p94dLiteralRotate` (128 Posen; der Zwilling weicht in 128/128 ab),
+  `cvxHfSetup_p94dToCvxPZeroSign`, `cvxHfSetup_p94dLiteralRotate` (128/128),
+  `sphereTriNp_p94dLiteralRotate` (31/32). sphereHfCore und capsuleHfCore haben zusätzliche
+  Vakuitäts-Prüfungen.
+- **Sweep:** 17 Mutanten über 5 Shader. Jeder wird in mindestens einem Shader getötet, bis auf R11
+  (`dot()`-Builtin statt `dot2`). R11 ist auf diesem Build äquivalent: Alle Importeure sind
+  NoContraction-gestempelt, und llvmpipe wertet ein so gestempeltes OpDot als (x+y)+z aus
+  (Messung aus P9.89). Das ist treiberabhängig, deshalb bleibt die ausgeschriebene Form.
+
+**Einheit B.**
+- `pxgSlangCapsuleHfCore` (convexHeightfield.cu:676) und die Kapselseite von `sphereTriNpBda`
+  (convexMesh.cu:443) bilden die Kapsel-Relativtransformation jetzt über die Konjugierte. Der
+  falsche Kommentar „bit-identical“ ist ersetzt.
+- `sphereTriNpBda` hatte die Abkürzung `idtMeshScale` von `MeshScaling::getShapeSpaceVert` nicht
+  (cudaNpCommon.h:197/:241-259). Bei Skalierung (1,1,1) mit nicht-trivialer `scaleRot` lief der Port
+  eine Rotations-Rundreise, die CUDA nimmt die rohen Vertices.
+- Der falsche Kommentar in `pxgSlangHeightfield.slang` (rotate(conj q) sei bitgleich mit rotateInv q)
+  ist korrigiert. Dort ist der Unterschied unbeobachtbar.
+- Neue Tests:
+  - `capsuleHfCore_p94dToCapPZeroSign` und `sphereTriNp_p94dCapsuleMtcZeroSign`: Wirtsuche über
+    vorzeichenbehaftete Identitäten und 180°-Drehungen, je 24 Zeugen.
+  - `sphereTriNp_p94dIdtScaleRot`: Einheits-Skalierung mit gedrehter `scaleRot`, dazu vier
+    Nicht-Einheits-Skalierungen gegen `||`- und Weglass-Mutanten.
+- **Sweeps:** capsuleHfCore 5/5 getötet; sphereTriNp 12/13 getötet. Der Überlebende I9 (Flip im
+  Bypass) ist äquivalent, denn der Bypass läuft nur bei Determinante 1.
+
+**Foldscan:** 843 Stellen, UNREVIEWED 0. **Suite:** 883/883 in beiden Speichermodi.
+**Szenen:** 64/64.
+
+**Offen für P9.94d Teil 2:**
+- Einheit C, npAbi-Familie: `triPlaneNpBda:231` mit neuer Engine-ABI-Fixture, `npCvxPlaneNphase`,
+  `npCvxStage2Core`, `pxgSlangTriTriOverlap`, `cvxCoreCloth`/`cvxCoreTet`.
+- Einheit D: die Baryzentrik in `cvxCoreClothNpBda:508`, `softBodySdfMidphaseBda` (dort umgekehrt
+  falsch) und die Fixture-Zwillinge `npCvxTriNpSetup` / `npCvxHfNpSetup`.
+- Außerhalb dieses Audits: `pxgSlangCvxHfSetup:130` und die Normale in `pxgSlangCvxTriSetup` nutzen
+  noch die Builtins `cross()`/`dot()`.
 
 ## P9.94c — Query-Boxen in Matrixform: convexTrimeshMidphase und die Heightfield-Grenze der Partikel
 

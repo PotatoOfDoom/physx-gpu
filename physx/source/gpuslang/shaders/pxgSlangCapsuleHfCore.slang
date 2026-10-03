@@ -249,10 +249,16 @@ public CapHfOut chCapsuleCore(uint64_t cmInputs, uint64_t transformCache,
 
     // PxTransform::transformInv(PxTransform) (PxTransform.h:162-169):
     // `qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q)`.
-    // `rotate(conj(q), v)` and `rotateInv(q, v)` are bit-identical -- each
-    // negation cancels exactly in IEEE -- so the shared helper is used.
-    const float4 toCapQ = ctQuatMul(ctQuatConjugate(capQ), meshQ);
-    const float3 toCapP = ctQuatRotateInv(capQ, meshP - capP);
+    // P9.94d: spelled exactly that way -- rotate by the CONJUGATE, not rotateInv
+    // by q.  The two agree in every nonzero bit (each negation is exact) but NOT
+    // in the sign of an exact zero: the cross term `(y*vz - z*vy)` cancels to +0
+    // in both, and is then ADDED in one and SUBTRACTED in the other, so a
+    // component of `meshP - capP` that is +-0 can come out with the opposite sign.
+    // It reaches the stored contact through `rotate(toCapQ, pt) + toCapP` whenever
+    // the rotated point is -0 there (capsuleHfCore_p94dToCapPZeroSign).
+    const float4 capQinv = ctQuatConjugate(capQ);
+    const float4 toCapQ = ctQuatMul(capQinv, meshQ);
+    const float3 toCapP = ctQuatRotate(capQinv, meshP - capP);
 
     // WORLD space.  See upstream candidate 50 in the header.
     const float3 tmp = chBasisVector0(capQ) * capsuleHalfHeight;

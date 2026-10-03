@@ -240,8 +240,8 @@ static float distancePointTriangleSquared(V3 p, V3 a, V3 b, V3 c, const uint32_t
 // R_AT_V0 puts the centre EXACTLY on vertex 0, which is the only way to reach
 // `dist == 0` bit-exactly and therefore the only input that tells `dist >= 0`
 // (:453) apart from `dist > 0`.  It needs an IDENTITY mesh transform: with
-// q = (0,0,0,1) and p = 0 both quatRotate and quatRotateInv reduce to
-// `v * (1 - 0) + u * 0 +- 0`, so the world round trip is exact and the shader's
+// q = (0,0,0,1) and p = 0 both quatRotate and quatRotateInv (PxQuat.h) reduce to
+// `vx*w2 = (2v)*0.5 = v` plus zero terms, so the world round trip is exact and the shader's
 // `centre - v0` is the true zero vector rather than a few ulp of one.
 // (`a + n * 0` is also exact: hf2shapep can produce +0 but never -0, and
 // x + (-0) == x for every such x.)
@@ -526,8 +526,7 @@ PXG_TEST(sphereHfCore)
         pairs[i] = { i, specs[i].tri, testOff[i], specs[i].gti };
 
     // ---- the mirror --------------------------------------------------------
-    std::vector<Expected> exp(n);
-    for (uint32_t i = 0; i < n; ++i)
+    auto mirror = [&](uint32_t i) -> Expected
     {
         const Spec& s = specs[i];
         const CmInput& cm = cms[i];
@@ -604,7 +603,7 @@ PXG_TEST(sphereHfCore)
             }
         }
 
-        Expected& e = exp[i];
+        Expected e{};
         e.nb = nb;
         e.outMask = outMask;
         e.pairOffset = pairOffset;
@@ -632,6 +631,29 @@ PXG_TEST(sphereHfCore)
         e.sqDist = sqDist;
         e.sqInflated = sqInflated;
         e.contactDist = contactDist;
+        return e;
+    };
+    std::vector<Expected> exp(n);
+    for (uint32_t i = 0; i < n; ++i) exp[i] = mirror(i);
+
+    // P9.94d vacuity: the same cases under the OLD Rodrigues rotations (the spelling
+    // ctQuatRotate/ctQuatRotateInv carried before P9.94d).  Some case must store a
+    // different word, or this fixture never saw the switch to PxQuat's formula.
+    size_t sawRodriguesDiffers = 0;
+    {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        p94dRodriguesTwin() = true;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const Expected t = mirror(i);
+            const Expected& e = exp[i];
+            if (t.nb != e.nb || t.outMask != e.outMask || t.ordered != e.ordered ||
+                t.niIndex != e.niIndex || bits(t.sep) != bits(e.sep) ||
+                bits(t.maxDepth) != bits(e.maxDepth) || bits(t.niNormal.x) != bits(e.niNormal.x) ||
+                bits(t.niNormal.y) != bits(e.niNormal.y) || bits(t.niNormal.z) != bits(e.niNormal.z))
+                ++sawRodriguesDiffers;
+        }
+        p94dRodriguesTwin() = false;
     }
 
     // ---- record arrays, seeded with sentinels ------------------------------
@@ -824,6 +846,9 @@ PXG_TEST(sphereHfCore)
     dev->destroyBuffer(bOrd); dev->destroyBuffer(bOut);
 
     PXG_CHECK_MSG(bad == 0, "sphereHfCore: %zu mismatches", bad);
+    PXG_CHECK_MSG(sawRodriguesDiffers > 0,
+                  "no case stores a different word under the old Rodrigues rotation "
+                  "(the P9.94d literal PxQuat formula is unobserved)");
 
     // Each of these guards a branch the mirror distinguishes.  Without them an
     // edit to the case table could quietly stop reaching a branch and the fixture

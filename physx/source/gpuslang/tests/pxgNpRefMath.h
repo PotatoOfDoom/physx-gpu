@@ -51,6 +51,8 @@
 #ifndef PXG_NP_REF_MATH_H
 #define PXG_NP_REF_MATH_H
 
+#include "foundation/PxQuat.h"
+
 #include <cmath>
 #include <cstdint>
 
@@ -70,7 +72,12 @@ inline float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline V3 cross3(V3 a, V3 b)
 { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
 
-inline V3 quatRotate(V4 q, V3 v)
+// P9.94d: the RODRIGUES spelling these two used to carry, `v*(w*w - u.u) + u*(2 v.u)
+// +- (u x v)*2w`.  It is not PxQuat's formula: the same rotation in exact arithmetic,
+// a different float expression (last bits, and the sign of an exact zero).  Kept ONLY
+// as the vacuity twin -- a fixture that flips p94dRodriguesTwin() and still matches
+// its stored words has not observed the shader's switch to the literal formula.
+inline V3 quatRotateRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -80,7 +87,7 @@ inline V3 quatRotate(V4 q, V3 v)
              v.y * (w * w - uu) + u.y * (vu * 2.0f) + c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) + c.z * (w * 2.0f) };
 }
-inline V3 quatRotateInv(V4 q, V3 v)
+inline V3 quatRotateInvRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -89,6 +96,25 @@ inline V3 quatRotateInv(V4 q, V3 v)
     return { v.x * (w * w - uu) + u.x * (vu * 2.0f) - c.x * (w * 2.0f),
              v.y * (w * w - uu) + u.y * (vu * 2.0f) - c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) - c.z * (w * 2.0f) };
+}
+// The twin switch.  False everywhere except inside a vacuity probe, which must set it
+// back before returning.
+inline bool& p94dRodriguesTwin() { static bool b = false; return b; }
+
+// PxQuat::rotate / rotateInv (PxQuat.h:286-295 / :324-333) -- the engine header's
+// own code, called rather than retyped; this TU is -ffp-contract=off, so the host
+// evaluates it in exactly the order written.  P9.94d.
+inline V3 quatRotate(V4 q, V3 v)
+{
+    if (p94dRodriguesTwin()) return quatRotateRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotate(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
+}
+inline V3 quatRotateInv(V4 q, V3 v)
+{
+    if (p94dRodriguesTwin()) return quatRotateInvRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotateInv(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
 }
 inline V4 quatMul(V4 a, V4 b)
 {

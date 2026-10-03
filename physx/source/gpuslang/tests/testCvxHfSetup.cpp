@@ -59,6 +59,7 @@
 #include "pxgTestFramework.h"
 
 #include "geometry/PxGeometry.h"
+#include "foundation/PxQuat.h"
 
 #include <cmath>
 #include <cstdint>
@@ -78,7 +79,11 @@ static V3 cross3(V3 a, V3 b)
 { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
 static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 
-static V3 quatRotate(V4 q, V3 v)
+// P9.94d: the RODRIGUES spelling the shader's ctQuatRotate/ctQuatRotateInv carried
+// before P9.94d (and this mirror with them): `v*(w*w - u.u) + u*(2 v.u) +- (u x v)*2w`.
+// Not PxQuat's formula -- the same rotation in exact arithmetic, a different float
+// expression.  Kept ONLY as the vacuity twin selected by gP94dRodrigues.
+static V3 quatRotateRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -88,7 +93,7 @@ static V3 quatRotate(V4 q, V3 v)
              v.y * (w * w - uu) + u.y * (vu * 2.0f) + c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) + c.z * (w * 2.0f) };
 }
-static V3 quatRotateInv(V4 q, V3 v)
+static V3 quatRotateInvRodrigues(V4 q, V3 v)
 {
     const V3 u = { q.x, q.y, q.z };
     const float w = q.w;
@@ -97,6 +102,27 @@ static V3 quatRotateInv(V4 q, V3 v)
     return { v.x * (w * w - uu) + u.x * (vu * 2.0f) - c.x * (w * 2.0f),
              v.y * (w * w - uu) + u.y * (vu * 2.0f) - c.y * (w * 2.0f),
              v.z * (w * w - uu) + u.z * (vu * 2.0f) - c.z * (w * 2.0f) };
+}
+// P9.94d mutant twins, false except inside a vacuity probe:
+//   gP94dRodrigues    -- both rotations take the old Rodrigues spelling above;
+//   gP94dToCvxPRotInv -- toCvxP takes the old q0.rotateInv(p1 - p0) spelling instead
+//                        of the CUDA's q0.getConjugate().rotate(p1 - p0).
+static bool gP94dRodrigues = false;
+static bool gP94dToCvxPRotInv = false;
+
+// PxQuat::rotate / rotateInv (PxQuat.h:286-295 / :324-333), the engine header's own
+// code called rather than retyped (this TU is -ffp-contract=off).  P9.94d.
+static V3 quatRotate(V4 q, V3 v)
+{
+    if (gP94dRodrigues) return quatRotateRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotate(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
+}
+static V3 quatRotateInv(V4 q, V3 v)
+{
+    if (gP94dRodrigues) return quatRotateInvRodrigues(q, v);
+    const physx::PxVec3 r = physx::PxQuat(q.x, q.y, q.z, q.w).rotateInv(physx::PxVec3(v.x, v.y, v.z));
+    return { r.x, r.y, r.z };
 }
 static V4 quatMul(V4 a, V4 b)
 {
@@ -272,6 +298,89 @@ static void getTriangle(const Hf& h, uint32_t t, V3 scale,
     }
 }
 
+struct Pair { uint32_t cm, tri, off, pad; };
+
+// convexTransform.transformInv(heightfieldTransform).p (convexHeightfield.cu:208) =
+// PxTransform::transformInv(PxTransform) (PxTransform.h:162-169) LITERALLY:
+// qinv = q0.getConjugate(); qinv.rotate(p1 - p0).  P9.94d.
+static V3 toCvxPRef(V4 q0, V3 p0, V3 p1)
+{
+    const V3 d = sub(p1, p0);
+    return gP94dToCvxPRotInv ? quatRotateInv(q0, d) : quatRotate(quatConj(q0), d);
+}
+
+// buildTriangleInformations (convexHeightfield.cu:120-157) over one triangle: the
+// three vertices in convex space and the normal, as the stage stores them.
+struct HfRef { V3 e0, e1, e2, en; uint32_t adj[3]; bool wrongHanded; };
+static HfRef refHfTri(const Hf& hf, uint32_t tri, V3 hfScale, V4 q0, V3 p0, V4 q1, V3 p1)
+{
+    const V4 toCvxQ = quatMul(quatConj(q0), q1);
+    const V3 toCvxP = toCvxPRef(q0, p0, p1);
+    HfRef r;
+    V3 w0, w1, w2;
+    getTriangle(hf, tri, hfScale, w0, w1, w2, r.adj, r.wrongHanded);
+    // The normal is the DENORMALIZED cross, rotated, THEN normalized (:136-137);
+    // `rotate` carries no translation, the vertices get the full transform.
+    r.en = normalized(quatRotate(toCvxQ, cross3(sub(w1, w0), sub(w2, w0))));
+    r.e0 = add(quatRotate(toCvxQ, w0), toCvxP);
+    r.e1 = add(quatRotate(toCvxQ, w1), toCvxP);
+    r.e2 = add(quatRotate(toCvxQ, w2), toCvxP);
+    return r;
+}
+
+// The twelve stored float words an HfRef predicts, and where they sit in the
+// 128-byte output record (in floats).
+static const uint32_t kRefWordAt[12] = { 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26 };
+static void refWords(const HfRef& r, uint32_t w[12])
+{
+    const float f[12] = { r.e0.x, r.e0.y, r.e0.z, r.e1.x, r.e1.y, r.e1.z,
+                          r.e2.x, r.e2.y, r.e2.z, r.en.x, r.en.y, r.en.z };
+    std::memcpy(w, f, sizeof(f));
+}
+
+// Uploads one fixture, runs cvxHfSetupLaunch over `pairs` and returns the
+// 128-byte-per-pair output.  The shapes already carry the device addresses.
+static std::vector<float> runSetupKernel(PxgSlangComputeDevice* dev,
+                                         const std::vector<GpuShape>& shapes,
+                                         const std::vector<float>& xf,
+                                         const std::vector<float>& cdist,
+                                         const std::vector<CmInput>& cms,
+                                         const std::vector<uint8_t>& pairBlob,
+                                         const std::vector<Pair>& pairs)
+{
+    const uint32_t n = uint32_t(pairs.size());
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCm = createBufferFrom(dev, cms);
+    PxgBufferHandle bPairBlob = createBufferFrom(dev, pairBlob);
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairs);
+    std::vector<float> outInit(size_t(n) * (128 / 4), -12345.0f);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    SetupPush push{};
+    push.cmInputs = dev->getBufferDeviceAddress(bCm);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.gpuShapes = dev->getBufferDeviceAddress(bShapes);
+    push.cvxTrimeshPair = dev->getBufferDeviceAddress(bPairBlob);
+    push.pairs = dev->getBufferDeviceAddress(bPairs);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numPairs = n;
+
+    {
+        Kernel k("cvxHfSetupBda.spv", "cvxHfSetupLaunch", {}, sizeof(SetupPush));
+        k.dispatch(n, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    std::vector<float> got = downloadBuffer<float>(dev, bOut, outInit.size());
+    dev->destroyBuffer(bShapes); dev->destroyBuffer(bXf); dev->destroyBuffer(bCd);
+    dev->destroyBuffer(bCm); dev->destroyBuffer(bPairBlob); dev->destroyBuffer(bPairs);
+    dev->destroyBuffer(bOut);
+    return got;
+}
+
 PXG_TEST(cvxHfSetupPrologue)
 {
     PxgSlangComputeDevice* dev = testDevice();
@@ -390,7 +499,7 @@ PXG_TEST(cvxHfSetupPrologue)
         r[4] = p.x; r[5] = p.y; r[6] = p.z;
     };
     // THE CONVEX BODY MUST ROTATE: the composition is conj(q0)*q1 with
-    // rotInv(q0, p1 - p0), and with q0 the identity the conjugate is a no-op and
+    // conj(q0).rotate(p1 - p0), and with q0 the identity the conjugate is a no-op and
     // the translation needs no rotating -- three separate mistakes become invisible.
     { const float a = 0.55f;
       setXf(0, { 0.0f, 0.0f, std::sin(a * 0.5f), std::cos(a * 0.5f) }, { 0.5f, -0.25f, 1.0f }); }
@@ -444,7 +553,6 @@ PXG_TEST(cvxHfSetupPrologue)
     //   cell 12 (r3,c0)  r == rows-2, so `cell / cols != rows-2` fails
     // and both triangles of a cell are driven, because the two arms of each
     // adjacency branch differ in WHICH guards they apply.
-    struct Pair { uint32_t cm, tri, off, pad; };
     std::vector<Pair> pairs = {
         { 0, 0, 0, 0 },     // cell 0, first triangle
         { 0, 1, 3, 0 },     // cell 0, second triangle
@@ -472,40 +580,14 @@ PXG_TEST(cvxHfSetupPrologue)
     };
 
     const uint32_t n = uint32_t(pairs.size());
-
-    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
-    PxgBufferHandle bXf = createBufferFrom(dev, xf);
-    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
-    PxgBufferHandle bCm = createBufferFrom(dev, cms);
-    PxgBufferHandle bPairBlob = createBufferFrom(dev, pairBlob);
-    PxgBufferHandle bPairs = createBufferFrom(dev, pairs);
-    std::vector<float> outInit(size_t(n) * (128 / 4), -12345.0f);
-    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
-
-    SetupPush push{};
-    push.cmInputs = dev->getBufferDeviceAddress(bCm);
-    push.transformCache = dev->getBufferDeviceAddress(bXf);
-    push.contactDistance = dev->getBufferDeviceAddress(bCd);
-    push.gpuShapes = dev->getBufferDeviceAddress(bShapes);
-    push.cvxTrimeshPair = dev->getBufferDeviceAddress(bPairBlob);
-    push.pairs = dev->getBufferDeviceAddress(bPairs);
-    push.output = dev->getBufferDeviceAddress(bOut);
-    push.numPairs = n;
-
-    {
-        Kernel k("cvxHfSetupBda.spv", "cvxHfSetupLaunch", {}, sizeof(SetupPush));
-        k.dispatch(n, {}, push, 1u, 1u);
-        dev->flush();
-    }
-
-    const auto got = downloadBuffer<float>(dev, bOut, outInit.size());
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
 
     size_t bad = 0;
     size_t sawWrongHanded = 0, sawSharedDiagonal = 0, sawUnsharedDiagonal = 0;
     size_t sawBoundaryAdj = 0, sawAllRealAdj = 0, sawSecondTri = 0;
     size_t sawNegativeHeight = 0, sawTrimeshTypedSlot0 = 0, sawIgnoredHfScaleRot = 0;
     size_t sawTwoNegativeNoFlip = 0;
-    size_t sawSharedOnColumnGuard = 0, sawSharedOnRowGuard = 0;
+    size_t sawSharedOnColumnGuard = 0, sawSharedOnRowGuard = 0, sawRodriguesDiffers = 0;
     auto sameF = [](float a, float b)
     { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
@@ -530,13 +612,20 @@ PXG_TEST(cvxHfSetupPrologue)
         const V3 p0 = { xf[tc0 * 8 + 4], xf[tc0 * 8 + 5], xf[tc0 * 8 + 6] };
         const V4 q1 = { xf[tc1 * 8 + 0], xf[tc1 * 8 + 1], xf[tc1 * 8 + 2], xf[tc1 * 8 + 3] };
         const V3 p1 = { xf[tc1 * 8 + 4], xf[tc1 * 8 + 5], xf[tc1 * 8 + 6] };
-        const V4 toCvxQ = quatMul(quatConj(q0), q1);
-        const V3 toCvxP = quatRotateInv(q0, sub(p1, p0));
-
-        V3 w0, w1, w2;
-        uint32_t adj[3] = { 0, 0, 0 };
-        bool wrongHanded = false;
-        getTriangle(hf, pr.tri, V3{ hfs.sx, hfs.sy, hfs.sz }, w0, w1, w2, adj, wrongHanded);
+        const HfRef ref = refHfTri(hf, pr.tri, V3{ hfs.sx, hfs.sy, hfs.sz }, q0, p0, q1, p1);
+        const uint32_t* adj = ref.adj;
+        const bool wrongHanded = ref.wrongHanded;
+        // P9.94d vacuity: the same pair under the OLD Rodrigues rotations.  At least
+        // one pair must store a different word, or this fixture never saw the
+        // shader's switch to the literal PxQuat formula.
+        {
+            gP94dRodrigues = true;
+            const HfRef twin = refHfTri(hf, pr.tri, V3{ hfs.sx, hfs.sy, hfs.sz }, q0, p0, q1, p1);
+            gP94dRodrigues = false;
+            uint32_t a[12], b[12];
+            refWords(ref, a); refWords(twin, b);
+            for (uint32_t k = 0; k < 12; ++k) if (a[k] != b[k]) { ++sawRodriguesDiffers; break; }
+        }
 
         if (wrongHanded) ++sawWrongHanded;
         if (!wrongHanded && (hfs.sx < 0.0f || hfs.sz < 0.0f)) ++sawTwoNegativeNoFlip;
@@ -558,12 +647,7 @@ PXG_TEST(cvxHfSetupPrologue)
                 ++sawNegativeHeight;
         }
 
-        // The normal is the DENORMALIZED cross, rotated, THEN normalized (:136-137);
-        // `rotate` carries no translation, the vertices get the full transform.
-        const V3 en = normalized(quatRotate(toCvxQ, cross3(sub(w1, w0), sub(w2, w0))));
-        const V3 e0 = add(quatRotate(toCvxQ, w0), toCvxP);
-        const V3 e1 = add(quatRotate(toCvxQ, w1), toCvxP);
-        const V3 e2 = add(quatRotate(toCvxQ, w2), toCvxP);
+        const V3 en = ref.en, e0 = ref.e0, e1 = ref.e1, e2 = ref.e2;
 
         const float* r = got.data() + size_t(i) * (128 / 4);
         uint32_t u[4];
@@ -607,9 +691,6 @@ PXG_TEST(cvxHfSetupPrologue)
     }
 
     dev->destroyBuffer(bHfA); dev->destroyBuffer(bHfB); dev->destroyBuffer(bHull);
-    dev->destroyBuffer(bShapes); dev->destroyBuffer(bXf); dev->destroyBuffer(bCd);
-    dev->destroyBuffer(bCm); dev->destroyBuffer(bPairBlob); dev->destroyBuffer(bPairs);
-    dev->destroyBuffer(bOut);
 
     PXG_CHECK_MSG(bad == 0, "cvxHfSetup: %zu mismatches", bad);
     // Every one of these guards a branch the mirror above distinguishes.  Without
@@ -638,6 +719,185 @@ PXG_TEST(cvxHfSetupPrologue)
                   "no pair reads a NEGATIVE height (the 16-bit sign extension is untested)");
     PXG_CHECK_MSG(sawIgnoredHfScaleRot > 0,
                   "no heightfield carries a scale rotation the path must ignore");
+    PXG_CHECK_MSG(sawRodriguesDiffers > 0,
+                  "no pair stores a different word under the old Rodrigues rotation "
+                  "(the P9.94d literal PxQuat formula is unobserved)");
+}
+
+// P9.94d: toCvxP = convexTransform.transformInv(heightfieldTransform).p
+// (convexHeightfield.cu:208) is q0.getConjugate().rotate(p1 - p0) (PxTransform.h:162-169),
+// NOT q0.rotateInv(p1 - p0).  The two agree on every nonzero component; this case makes
+// them disagree on a zero.
+//
+// q0 = identity, p0 = +0, p1 = (-0,-0,-0): toCvxP is (+0,+0,+0) under the CUDA and
+// (-0,-0,-0) under the old spelling (the arithmetic is spelled out at
+// cvxTriSetup_p94dToCvxPZeroSign).  q1 = (0,1,0,0), 180 deg about y; toCvxQ =
+// conj(q0)*q1 = (+0,1,+0,+0).  A heightfield vertex in COLUMN 0 has z = 0*colScale = +0,
+// and with row > 0 (vx > 0) and a NEGATIVE height (dot2 = 2*h*heightScale < 0) its
+// rotated z is vz*w2 + (x*vy - y*vx)*w + z*dot2 = (-0) + (-0) + (+0 * neg = -0) = -0, so
+// the stored z is -0 + toCvxP.z: +0 (CUDA) against -0 (old).  2x2 heightfield, every
+// height -5, no tessellation flag: triangle 0 is (r0,c0), (r0,c1), (r1,c0), and its third
+// vertex is the (row 1, column 0) one.  No RNG.
+PXG_TEST(cvxHfSetup_p94dToCvxPZeroSign)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const float nz = -0.0f;
+
+    Hf hf;
+    hf.rows = 2; hf.cols = 2;
+    for (uint32_t i = 0; i < 4; ++i) hf.samples.push_back(sampleWord(-5, 1, false, 2));
+    buildHf(hf);
+    std::vector<uint32_t> hullBlob(64, 0x1234u);
+    PxgBufferHandle bHf = createBufferFrom(dev, hf.blob);
+    PxgBufferHandle bHull = createBufferFrom(dev, hullBlob);
+    const uint64_t addrHf = dev->getBufferDeviceAddress(bHf);
+    const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
+
+    std::vector<GpuShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0].sx = 1.0f; shapes[0].sy = 1.0f; shapes[0].sz = 1.0f; shapes[0].rw = 1.0f;
+    shapes[0].hullLo = uint32_t(addrHull & 0xffffffffu); shapes[0].hullHi = uint32_t(addrHull >> 32);
+    shapes[0].type = GEOM_CONVEXMESH;
+    shapes[1].sx = 1.0f; shapes[1].sy = 0.5f; shapes[1].sz = 1.0f; shapes[1].rw = 1.0f;
+    shapes[1].hullLo = uint32_t(addrHf & 0xffffffffu); shapes[1].hullHi = uint32_t(addrHf >> 32);
+    shapes[1].type = GEOM_HEIGHTFIELD;
+
+    const V4 q0 = { 0, 0, 0, 1 }, q1 = { 0, 1, 0, 0 };
+    const V3 p0 = { 0, 0, 0 }, p1 = { nz, nz, nz };
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[0] = q0.x; xf[1] = q0.y; xf[2] = q0.z; xf[3] = q0.w; xf[4] = p0.x; xf[5] = p0.y; xf[6] = p0.z;
+    xf[8] = q1.x; xf[9] = q1.y; xf[10] = q1.z; xf[11] = q1.w; xf[12] = p1.x; xf[13] = p1.y; xf[14] = p1.z;
+    std::vector<float> cdist = { 0.01f, 0.02f };
+    std::vector<CmInput> cms = { { 0, 1, 0, 1 } };
+    std::vector<uint8_t> pairBlob(56, 0);
+    std::vector<Pair> pairs = { { 0, 0, 0, 0 } };
+
+    const V3 hfScale = { shapes[1].sx, shapes[1].sy, shapes[1].sz };
+    const HfRef lit = refHfTri(hf, 0, hfScale, q0, p0, q1, p1);
+    gP94dToCvxPRotInv = true;
+    const HfRef twin = refHfTri(hf, 0, hfScale, q0, p0, q1, p1);
+    gP94dToCvxPRotInv = false;
+    uint32_t a[12], b[12];
+    refWords(lit, a); refWords(twin, b);
+    PXG_CHECK_MSG(u32(lit.e2.z) == 0x00000000u && u32(twin.e2.z) == 0x80000000u,
+                  "p94d: literal v2.z 0x%08x (want +0), twin 0x%08x (want -0)",
+                  u32(lit.e2.z), u32(twin.e2.z));
+    uint32_t differ = 0;
+    for (uint32_t k = 0; k < 12; ++k) if (a[k] != b[k]) ++differ;
+    PXG_CHECK_MSG(differ > 0, "p94d: the rotateInv twin stores the same words -- not discriminating");
+
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
+    for (uint32_t k = 0; k < 12; ++k)
+    {
+        const uint32_t g = u32(got[kRefWordAt[k]]);
+        PXG_CHECK_MSG(g == a[k], "p94d: stored word %u (float %u) GPU 0x%08x != literal 0x%08x (twin 0x%08x)",
+                      k, kRefWordAt[k], g, a[k], b[k]);
+    }
+    dev->destroyBuffer(bHf); dev->destroyBuffer(bHull);
+}
+
+// P9.94d: ctQuatRotate is PxQuat::rotate LITERALLY.  Random poses and heightfield
+// scales over every triangle of a 4x4 heightfield: every stored vertex and normal
+// word must equal the literal oracle BITWISE, and the old Rodrigues spelling must
+// store a different word on some of them -- otherwise this test cannot tell the two
+// formulas apart.
+PXG_TEST(cvxHfSetup_p94dLiteralRotate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    auto u32 = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+
+    uint32_t seed = 0x94d0002u;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return float(seed >> 8) * (1.0f / 16777216.0f); };
+    auto sym = [&](float m) { return (rnd() * 2.0f - 1.0f) * m; };
+    auto unitQ = [&]() {
+        V4 q = { sym(1), sym(1), sym(1), sym(1) };
+        const float r = 1.0f / std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        return V4{ q.x * r, q.y * r, q.z * r, q.w * r };
+    };
+
+    Hf hf;
+    hf.rows = 4; hf.cols = 4;
+    for (uint32_t i = 0; i < 16; ++i)
+        hf.samples.push_back(sampleWord(int16_t(int32_t(rnd() * 2000.0f) - 1000), 1, (i % 3u) == 0u, 2));
+    buildHf(hf);
+    std::vector<uint32_t> hullBlob(64, 0x1234u);
+    PxgBufferHandle bHf = createBufferFrom(dev, hf.blob);
+    PxgBufferHandle bHull = createBufferFrom(dev, hullBlob);
+    const uint64_t addrHf = dev->getBufferDeviceAddress(bHf);
+    const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
+
+    const uint32_t N = 128;
+    std::vector<GpuShape> shapes(1 + N);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    shapes[0].sx = 1.2f; shapes[0].sy = 0.9f; shapes[0].sz = 1.1f; shapes[0].rw = 1.0f;
+    shapes[0].hullLo = uint32_t(addrHull & 0xffffffffu); shapes[0].hullHi = uint32_t(addrHull >> 32);
+    shapes[0].type = GEOM_CONVEXMESH;
+    std::vector<float> xf(size_t(2 * N) * 8, 0.0f);
+    std::vector<float> cdist(2 * N, 0.01f);
+    std::vector<CmInput> cms(N);
+    std::vector<uint8_t> pairBlob(size_t(N) * 56, 0);
+    std::vector<Pair> pairs(N);
+    std::vector<uint32_t> tris(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        GpuShape& h = shapes[1 + i];
+        h.sx = 0.25f + rnd() * 2.0f; h.sy = 0.001f + rnd() * 0.01f; h.sz = 0.25f + rnd() * 2.0f;
+        h.rw = 1.0f;
+        h.hullLo = uint32_t(addrHf & 0xffffffffu); h.hullHi = uint32_t(addrHf >> 32);
+        h.type = GEOM_HEIGHTFIELD;
+        for (uint32_t t = 0; t < 2; ++t)
+        {
+            const V4 q = unitQ();
+            float* x = xf.data() + size_t(2 * i + t) * 8;
+            x[0] = q.x; x[1] = q.y; x[2] = q.z; x[3] = q.w;
+            x[4] = sym(4); x[5] = sym(4); x[6] = sym(4);
+        }
+        cms[i] = { 0, 1 + i, 2 * i, 2 * i + 1 };
+        // a cell in the first rows-1 rows and first cols-1 columns
+        const uint32_t cell = (i % (hf.rows - 1)) * hf.cols + ((i / 3u) % (hf.cols - 1));
+        tris[i] = cell * 2u + ((i / 9u) & 1u);
+        pairs[i] = { i, tris[i], 0, 0 };
+    }
+
+    const auto got = runSetupKernel(dev, shapes, xf, cdist, cms, pairBlob, pairs);
+
+    size_t bad = 0, rodriguesDiffers = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const GpuShape& h = shapes[1 + i];
+        const float* x0 = xf.data() + size_t(2 * i) * 8;
+        const float* x1 = x0 + 8;
+        const V4 q0 = { x0[0], x0[1], x0[2], x0[3] }, q1 = { x1[0], x1[1], x1[2], x1[3] };
+        const V3 p0 = { x0[4], x0[5], x0[6] }, p1 = { x1[4], x1[5], x1[6] };
+        const V3 sc = { h.sx, h.sy, h.sz };
+        const HfRef lit = refHfTri(hf, tris[i], sc, q0, p0, q1, p1);
+        gP94dRodrigues = true;
+        const HfRef twin = refHfTri(hf, tris[i], sc, q0, p0, q1, p1);
+        gP94dRodrigues = false;
+        uint32_t a[12], b[12];
+        refWords(lit, a); refWords(twin, b);
+        bool differs = false;
+        for (uint32_t k = 0; k < 12; ++k)
+        {
+            if (a[k] != b[k]) differs = true;
+            const uint32_t g = u32(got[size_t(i) * 32 + kRefWordAt[k]]);
+            if (g != a[k])
+            {
+                if (++bad <= 12)
+                    std::printf("  [pair %u] word %u: GPU 0x%08x literal 0x%08x twin 0x%08x\n",
+                                i, k, g, a[k], b[k]);
+            }
+        }
+        if (differs) ++rodriguesDiffers;
+    }
+    std::printf("  cvxHfSetup_p94dLiteralRotate: %zu/%u pairs store a different word under the "
+                "Rodrigues twin\n", rodriguesDiffers, N);
+    PXG_CHECK_MSG(bad == 0, "p94d: %zu stored words differ from the literal PxQuat oracle", bad);
+    PXG_CHECK_MSG(rodriguesDiffers > 0,
+                  "p94d: the Rodrigues twin stores the same words on every pair -- the literal "
+                  "formula is unobserved");
+    dev->destroyBuffer(bHf); dev->destroyBuffer(bHull);
 }
 
 } // namespace
