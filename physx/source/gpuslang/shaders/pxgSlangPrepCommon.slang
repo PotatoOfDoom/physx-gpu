@@ -180,14 +180,22 @@ public float4 alignedTransformPoint(PxgAlignedTransform t, float4 input)
     return alignedRotate(t.q, input) + t.p;
 }
 
-// PxAlignedTransform::transformInv(PxAlignedTransform):
-// src = [srct, srcr] -> [r^-1*(srct-t), r^-1*srcr]
+// PxAlignedTransform::transformInv(PxAlignedTransform) (AlignedTransform.h:213-220):
+//   qinv = q.getConjugate(); return (qinv.rotate(src.p - p), qinv * src.q)
+// P9.94b: spelled with the conjugate's float4 rotate (AlignedQuat.h:272-286, w = 0),
+// NOT quatRotateInv(q, .): the two differ only in the sign of an exact zero (or a NaN
+// sign) -- q = (-0.5,0.5,0.5,0.5), src.p == p: here p = (+0,-0,+0), via rotateInv
+// (-0,+0,+0).  EQUIVALENT at every kernel output: the only consumer of r.p,
+// pointsAreClose(), reduces it through + - * abs < to a bool (abs erases the zero sign,
+// no division on the path), and every stored output of getFrictionPatches* is that bool
+// or a copy.  The revert mutant is KILLED at helper level by acpTransformInvProbe
+// (npArtiConstraintPrep.slang, testArtiConstraintPrepBody.cpp).
 public PxgAlignedTransform alignedTransformInvTransform(PxgAlignedTransform a, PxgAlignedTransform b)
 {
     const float4 qinv = quatConjugate(a.q);
     PxgAlignedTransform r;
     r.q = quatMul(qinv, b.q);
-    r.p = float4(quatRotateInv(a.q, (b.p - a.p).xyz), 0.0f);
+    r.p = alignedRotate(qinv, b.p - a.p);
     return r;
 }
 

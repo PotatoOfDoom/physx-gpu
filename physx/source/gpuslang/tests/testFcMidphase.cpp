@@ -512,7 +512,18 @@ struct HfRangeRef
     uint32_t minRow = 0, maxRow = 0, minColumn = 0, maxColumn = 0;
     float minyF = 0, maxyF = 0;
     uint32_t nbPairs = 0;
+    float lmnY = 0, lmxY = 0;   // P9.94b: the scaled localBound y, as stored in gDebug.y/.z
 };
+
+// P9.94b TWINS (file-local).  The CUDA's centre is PxBounds3::transformFast(
+// hfT.getInverse(), b): inv.q.rotate(c) + inv.p with inv.q = q.getConjugate() and
+// inv.p = q.rotateInv(-p) (PxTransform.h:117/131).  sFcTwinCenterRotInv restores
+// the pre-P9.94b port spelling q.rotateInv(c); sFcTwinInvPConj spells inv.p as
+// conj(q).rotate(-p).  Each differs from the literal form only in exact-zero
+// signs, which the port exposes through gDebug.y (lmn.y).
+static bool sFcTwinCenterRotInv = false;
+static bool sFcTwinInvPConj = false;
+static uint32_t fbitsFc(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 static HfRangeRef refHfRange(const FmCase& cs, const std::vector<uint32_t>& smp, std::vector<U4>* pairs)
 {
@@ -541,8 +552,10 @@ static HfRangeRef refHfRange(const FmCase& cs, const std::vector<uint32_t>& smp,
     const V3 extentW = mul(sub(bmx, bmn), 0.5f);
     // getInverse() materialized first, then inv.transform(c): two rotations
     // plus a vector add (matches CUDA op order; NOT rotateInv(c - p))
-    const V3 invP = quatRotateInv(q, { -cs.e.x, -cs.e.y, -cs.e.z });
-    const V3 center = add(quatRotateInv(q, centerW), invP);
+    const V3 negE = { -cs.e.x, -cs.e.y, -cs.e.z };
+    const V3 invP = sFcTwinInvPConj ? quatRotate(qinv, negE) : quatRotateInv(q, negE);
+    const V3 center = add(sFcTwinCenterRotInv ? quatRotateInv(q, centerW)
+                                              : quatRotate(qinv, centerW), invP);   // P9.94b
     // PxMat33(qinv) columns
     const float x = qinv.x, y = qinv.y, z = qinv.z, w = qinv.w;
     const float x2 = x + x, y2 = y + y, z2 = z + z;
@@ -558,8 +571,13 @@ static HfRangeRef refHfRange(const FmCase& cs, const std::vector<uint32_t>& smp,
                       std::fabs(e0.z) + std::fabs(e1.z) + std::fabs(e2.z) };
     V3 lmn = sub(center, wext);
     V3 lmx = add(center, wext);
-    lmn = { lmn.x / std::fabs(cs.f.x), lmn.y / cs.f.y, lmn.z / std::fabs(cs.f.z) };
-    lmx = { lmx.x / std::fabs(cs.f.x), lmx.y / cs.f.y, lmx.z / std::fabs(cs.f.z) };
+    // P9.94b: the CUDA's `*= oneOver*Scale` (a reciprocal multiply, not a divide)
+    const float oneOverH = 1.0f / cs.f.y, oneOverR = 1.0f / std::fabs(cs.f.x),
+                oneOverC = 1.0f / std::fabs(cs.f.z);
+    lmn = { lmn.x * oneOverR, lmn.y * oneOverH, lmn.z * oneOverC };
+    lmx = { lmx.x * oneOverR, lmx.y * oneOverH, lmx.z * oneOverC };
+    r.lmnY = lmn.y;
+    r.lmxY = lmx.y;
 
     // FAITHFUL: ! binds only to the first comparison
     if (!(lmn.x > float(HF_ROWS - 1)) || (lmn.z > float(HF_COLS - 1)) || (lmx.x < 0.0f) || (lmx.z < 0.0f))
@@ -600,6 +618,70 @@ static HfRangeRef refHfRange(const FmCase& cs, const std::vector<uint32_t>& smp,
         }
     }
     return r;
+}
+
+
+// P9.94b -- directed zero-sign cases for the transformFast(getInverse(), b)
+// centre.  Indices 1 and 17 are vertex/default-family, not gated, hint 1, so no
+// coverage counter moves.  The element sits at +0 with a zero contact distance
+// (wext = 0, so lmn.y = centre.y exactly).
+//   i=1   q = ( 1/2,-1/2,1/2,1/2), hfP = (-0,-0,+0): literal lmn.y +0, the old
+//         q.rotateInv(c) centre gives -0.
+//   i=17  q = (-1/2, 1/2,1/2,1/2), hfP = (-0,-0,-0): literal lmn.y +0, an inv.p
+//         spelled conj(q).rotate(-p) gives -0.
+static const uint32_t kFcDirIdx[2] = { 1u, 17u };
+static void setFcDirected(FmCase& cs, uint32_t i, uint32_t NC, bool sb)
+{
+    std::memset(&cs, 0, sizeof(cs));
+    cs.d = (i == 1u) ? F4{ 0.5f, -0.5f, 0.5f, 0.5f } : F4{ -0.5f, 0.5f, 0.5f, 0.5f };
+    cs.e = (i == 1u) ? F4{ -0.0f, -0.0f, 0.0f, 0.0f } : F4{ -0.0f, -0.0f, -0.0f, 0.0f };
+    cs.f = { 1.0f, 1.0f, 1.0f, 0.0f };
+    cs.a = { 0.0f, 0.0f, 0.0f, 0.0f };   // cd = 0
+    cs.b = cs.c = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (sb) { cs.g = { 0.0f, 0.0f, 0.0f, 1.0f }; cs.ids = { i, i, 0u, NC + 100u }; }
+    else    { cs.ids = { i, i, 1u, NC + 100u }; }
+}
+
+// Bitwise gDebug.y/.z against the oracle on every non-gated case, then the
+// directed cases' twin guards: the literal oracle stores +0 in lmn.y and the
+// twin spelling -0, and the GPU must store the literal word.
+template <typename RefFn, typename GatedFn>
+static void checkFcLmnBits(const char* name, const std::vector<FmCase>& cases,
+                           const std::vector<uint32_t>& samples, const std::vector<HfRangeRef>& refR,
+                           const std::vector<F4>& gDbg, RefFn ref, GatedFn gated)
+{
+    size_t bad = 0;
+    for (uint32_t i = 0; i < uint32_t(cases.size()); ++i)
+    {
+        if (gated(cases[i])) continue;
+        if (fbitsFc(gDbg[i].y) != fbitsFc(refR[i].lmnY) || fbitsFc(gDbg[i].z) != fbitsFc(refR[i].lmxY))
+        {
+            if (bad < 4)
+                std::printf("    [ fail ] %s case %u: gDebug.y/.z 0x%08x/0x%08x, oracle 0x%08x/0x%08x\n",
+                            name, i, fbitsFc(gDbg[i].y), fbitsFc(gDbg[i].z),
+                            fbitsFc(refR[i].lmnY), fbitsFc(refR[i].lmxY));
+            ++bad;
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "%s: %zu cases store a localBound y that differs bitwise from the oracle",
+                  name, bad);
+
+    for (int k = 0; k < 2; ++k)
+    {
+        const uint32_t i = kFcDirIdx[k];
+        const HfRangeRef lit = ref(cases[i], samples);
+        bool& twin = (k == 0) ? sFcTwinCenterRotInv : sFcTwinInvPConj;
+        twin = true;
+        const HfRangeRef old = ref(cases[i], samples);
+        twin = false;
+        PXG_CHECK_MSG(fbitsFc(lit.lmnY) == 0x00000000u && fbitsFc(old.lmnY) == 0x80000000u,
+                      "%s case %u: oracle lmn.y literal 0x%08x / twin 0x%08x -- the input no longer "
+                      "separates the two spellings", name, i, fbitsFc(lit.lmnY), fbitsFc(old.lmnY));
+        PXG_CHECK_MSG(fbitsFc(gDbg[i].y) == fbitsFc(lit.lmnY),
+                      "%s case %u: gDebug.y 0x%08x, the literal transformFast(getInverse()) gives "
+                      "0x%08x (twin 0x%08x)", name, i, fbitsFc(gDbg[i].y), fbitsFc(lit.lmnY),
+                      fbitsFc(old.lmnY));
+    }
 }
 
 PXG_TEST(fcMidphase_hfBound)
@@ -665,6 +747,7 @@ PXG_TEST(fcMidphase_hfBound)
         else
             cs.a = { world.x, world.y, world.z, cd };
     }
+    for (uint32_t i : kFcDirIdx) setFcDirected(cases[i], i, NC, /*sb*/ false);   // P9.94b
 
     std::vector<U4> expect;
     std::vector<HfRangeRef> refR(NC);
@@ -677,6 +760,7 @@ PXG_TEST(fcMidphase_hfBound)
     }
     const uint32_t total = (uint32_t)expect.size();
     PXG_CHECK_MSG(total > 800, "hfBound: scene too sparse (%u)", total);
+    std::printf("    [ note ] hfBound: %u pairs with the P9.94b directed cases 1/17 at area 0\n", total);
     size_t offZPairs = 0;
     for (uint32_t i = 0; i < NC; ++i)
         if (i % 8 == 5 || i % 8 == 6) offZPairs += refR[i].nbPairs;
@@ -760,6 +844,9 @@ PXG_TEST(fcMidphase_hfBound)
     for (uint32_t s = gWc; s < CAP; ++s) if (gOut[s].x != PAIRPOISON) ++dirty;
     PXG_CHECK_MSG(mm == 0 && mmB == 0 && dirty == 0,
                   "hfBound: %zu mismatches, %zu contiguity breaks, %zu dirty", mm, mmB, dirty);
+    checkFcLmnBits("hfBound", cases, samples, refR, gDbg,                         // P9.94b
+                   [](const FmCase& c, const std::vector<uint32_t>& sm) { return refHfRange(c, sm, nullptr); },
+                   [](const FmCase& c) { return c.ids.y >= c.ids.w; });
 
     // capacity run: counter unchanged, stores capped at TINY
     const uint32_t TINY = total / 4;
@@ -805,8 +892,10 @@ static HfRangeRef refSbHfRange(const FmCase& cs, const std::vector<uint32_t>& sm
     const F4 qinv = { -q.x, -q.y, -q.z, q.w };
     const V3 centerW = mul(add(bmn, bmx), 0.5f);
     const V3 extentW = mul(sub(bmx, bmn), 0.5f);
-    const V3 invP = quatRotateInv(q, { -cs.e.x, -cs.e.y, -cs.e.z });
-    const V3 center = add(quatRotateInv(q, centerW), invP);
+    const V3 negE = { -cs.e.x, -cs.e.y, -cs.e.z };
+    const V3 invP = sFcTwinInvPConj ? quatRotate(qinv, negE) : quatRotateInv(q, negE);
+    const V3 center = add(sFcTwinCenterRotInv ? quatRotateInv(q, centerW)
+                                              : quatRotate(qinv, centerW), invP);   // P9.94b
     const float x = qinv.x, y = qinv.y, z = qinv.z, w = qinv.w;
     const float x2 = x + x, y2 = y + y, z2 = z + z;
     const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
@@ -821,8 +910,13 @@ static HfRangeRef refSbHfRange(const FmCase& cs, const std::vector<uint32_t>& sm
                       std::fabs(e0.z) + std::fabs(e1.z) + std::fabs(e2.z) };
     V3 lmn = sub(center, wext);
     V3 lmx = add(center, wext);
-    lmn = { lmn.x / std::fabs(cs.f.x), lmn.y / cs.f.y, lmn.z / std::fabs(cs.f.z) };
-    lmx = { lmx.x / std::fabs(cs.f.x), lmx.y / cs.f.y, lmx.z / std::fabs(cs.f.z) };
+    // P9.94b: the CUDA's `*= oneOver*Scale` (a reciprocal multiply, not a divide)
+    const float oneOverH = 1.0f / cs.f.y, oneOverR = 1.0f / std::fabs(cs.f.x),
+                oneOverC = 1.0f / std::fabs(cs.f.z);
+    lmn = { lmn.x * oneOverR, lmn.y * oneOverH, lmn.z * oneOverC };
+    lmx = { lmx.x * oneOverR, lmx.y * oneOverH, lmx.z * oneOverC };
+    r.lmnY = lmn.y;
+    r.lmxY = lmx.y;
 
     if (!(lmn.x > float(HF_ROWS - 1)) || (lmn.z > float(HF_COLS - 1)) || (lmx.x < 0.0f) || (lmx.z < 0.0f))
     {
@@ -931,6 +1025,7 @@ PXG_TEST(fcMidphase_sbHfBound)
         cs.c = { c.x, c.y, c.z, 0 };
         cs.g = { dl.x, dl.y, dl.z, hint };
     }
+    for (uint32_t i : kFcDirIdx) setFcDirected(cases[i], i, NC, /*sb*/ true);   // P9.94b
 
     std::vector<U4> expect;
     std::vector<HfRangeRef> refR(NC);
@@ -943,6 +1038,7 @@ PXG_TEST(fcMidphase_sbHfBound)
     }
     const uint32_t total = (uint32_t)expect.size();
     PXG_CHECK_MSG(total > 800, "sbHfBound: scene too sparse (%u)", total);
+    std::printf("    [ note ] sbHfBound: %u pairs with the P9.94b directed cases 1/17 at area 0\n", total);
     size_t hint255Pairs = 0, offZPairs = 0, offXZPairs = 0;
     for (uint32_t i = 0; i < NC; ++i)
     {
@@ -1028,6 +1124,9 @@ PXG_TEST(fcMidphase_sbHfBound)
     for (uint32_t s = gWc; s < CAP; ++s) if (gOut[s].x != PAIRPOISON) ++dirty;
     PXG_CHECK_MSG(mm == 0 && mmB == 0 && dirty == 0,
                   "sbHfBound: %zu mismatches, %zu contiguity breaks, %zu dirty", mm, mmB, dirty);
+    checkFcLmnBits("sbHfBound", cases, samples, refR, gDbg,                       // P9.94b
+                   [](const FmCase& c, const std::vector<uint32_t>& sm) { return refSbHfRange(c, sm, nullptr); },
+                   [](const FmCase& c) { return !(c.g.w != 0.0f) || c.ids.y >= c.ids.w; });
 
     const uint32_t TINY = total / 4;
     const auto capped = run(TINY, CAP);

@@ -1525,9 +1525,29 @@ PXG_TEST(constraintPrepTGS_joint)
 // which the other contact tests skip (hasPrevFrictionIndices = 0).  Uses
 // identity body frames so the normal/anchor correlation succeeds
 // deterministically, and previous patches carrying 1 or 2 anchors.
-PXG_TEST(constraintPrepPGS_frictionCarryover)
+//
+// P9.94b: framed = true is constraintPrepPGS_frictionCarryoverFrames -- the same
+// batches over GENERAL body frames, so body1ToBody0 = bf0.transformInv(bf1) is a
+// real transform and the pointsAreClose / normal gates see it:
+//   * the previous patch is built consistently from the frames on the host
+//     (body0/1Normal = bf0/1.rotateInv(n), body1Anchors = bf1.transformInv(
+//     bf0.transform(body0Anchors)), literal AFrame math), so carry-over succeeds;
+//   * lane % 8 == 5 pushes body1Anchors0 0.5 along body1Normal -> pointsAreClose
+//     REJECTS and growPatches rebuilds the patch;
+//   * lane % 8 == 0 pairs body 0 (q = (-0.5,0.5,0.5,0.5)) with body 1 (identity)
+//     at the same p -- the zero-sign member of transformInv, where the literal
+//     p = (+0,-0,+0) and the old q.rotateInv spelling gives (-0,+0,+0);
+//   * EQUIVALENCE WITNESS: the reference is run with the file's TWIN flag
+//     (sTinvTwinRotateInv, the old spelling) and without; every reference image
+//     must be bitwise identical while sTinvSpellingsDiffer > 0 proves the
+//     intermediate really differed on a reached lane.
+// The revert itself is killed at helper level (artiConstraintPrepBody_transformInvProbe);
+// this variant kills the neighbour mutants of alignedTransformInvTransform in
+// constraintPrepPGS.spv, which the identity frames cannot see.
+static void frictionCarryoverPGS(bool framed)
 {
     std::mt19937 rng(4500);
+    std::mt19937 frameRng(9940); // P9.94b: frames drawn apart so the batches match the identity run
     std::uniform_real_distribution<float> u(0.f, 1.f), s(-1.f, 1.f);
 
     const uint32_t numBatches = 3, rowsPerBatch = 4, numBodies = 32;
@@ -1556,6 +1576,16 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
         AlignedTransform f;
         f.q = Float4{ 0, 0, 0, 1 }; // identity
         f.p = Float4{ 0, 0, 0, 0 };
+        if (framed)
+        {
+            // P9.94b: bodies 0/1 = the transformInv zero-sign member, the rest general
+            if (b == 0)
+                f.q = Float4{ -0.5f, 0.5f, 0.5f, 0.5f };
+            if (b <= 1)
+                f.p = Float4{ 0.25f, -0.5f, 1.0f, 0.f };
+            else
+                f = makeFrame(frameRng);
+        }
         cs.bodyFrames[b] = f;
         cs.frames[b] = toAFrame(f);
         const Mat33 m = randSymInvInertia(rng);
@@ -1595,6 +1625,11 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
         {
             b.bodyAIndex[lane] = rng() % numBodies;
             b.bodyBIndex[lane] = rng() % numBodies;
+            if (framed && (lane & 7u) == 0u) // P9.94b: the zero-sign member
+            {
+                b.bodyAIndex[lane] = 0;
+                b.bodyBIndex[lane] = 1;
+            }
 
             const uint32_t nc = 2 + rng() % (rowsPerBatch - 1); // 2..4 contacts
             const uint32_t prevAnchorCnt = 1 + (rng() & 1);      // carry 1 or 2 anchors
@@ -1634,6 +1669,21 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
             prevAnchors[k].body1Anchors0[lane] = Float4{ a0.x, a0.y, a0.z, 0.f }; // == body0 so pointsAreClose holds (identity frames)
             prevAnchors[k].body0Anchors1[lane] = Float4{ a1.x, a1.y, a1.z, 0.f };
             prevAnchors[k].body1Anchors1[lane] = Float4{ a1.x, a1.y, a1.z, 0.f };
+            if (framed)
+            {
+                // P9.94b: the previous patch as the frames would have built it
+                const AFrame& f0 = cs.frames[b.bodyAIndex[lane]];
+                const AFrame& f1 = cs.frames[b.bodyBIndex[lane]];
+                const Vec3 n0 = aRotateInv(f0.q, n), n1 = aRotateInv(f1.q, n);
+                prevPatches[k].body0Normal[lane] = Float4{ n0.x, n0.y, n0.z, 0.f };
+                prevPatches[k].body1Normal[lane] = Float4{ n1.x, n1.y, n1.z, 0.f };
+                Vec3 l10 = aTransformInv(f1, aTransform(f0, a0));
+                const Vec3 l11 = aTransformInv(f1, aTransform(f0, a1));
+                if ((lane & 7u) == 5u) // the reject lane
+                    l10 = l10 + n1 * 0.5f;
+                prevAnchors[k].body1Anchors0[lane] = Float4{ l10.x, l10.y, l10.z, 0.f };
+                prevAnchors[k].body1Anchors1[lane] = Float4{ l11.x, l11.y, l11.z, 0.f };
+            }
             // prev friction index: patchIndex = k, oldThreadId = lane
             prevFricIdx[edgeIndex] = (uint64_t(k) << 5) | lane;
         }
@@ -1742,14 +1792,24 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
     shim.streamSynchronize();
 
     // ---- reference ----
-    std::vector<BlockFrictionPatch> refPatches = currPatches;
-    std::vector<BlockFrictionAnchorPatch> refAnchors = currAnchors;
-    std::vector<BlockSolverContactHeader> refCH = chs;
-    std::vector<BlockSolverFrictionHeader> refFH = fhs;
-    std::vector<BlockSolverContactPoint> refCP = outCP;
-    std::vector<BlockSolverContactFriction> refFR = outFR;
+    std::vector<BlockFrictionPatch> refPatches;
+    std::vector<BlockFrictionAnchorPatch> refAnchors;
+    std::vector<BlockSolverContactHeader> refCH;
+    std::vector<BlockSolverFrictionHeader> refFH;
+    std::vector<BlockSolverContactPoint> refCP;
+    std::vector<BlockSolverContactFriction> refFR;
 
-    uint32_t carriedOver = 0;
+    uint32_t carriedOver = 0, rejected = 0;
+    // P9.94b: one reference pass (run twice by the framed variant, TWIN off/on)
+    auto refPass = [&]() {
+    refPatches = currPatches;
+    refAnchors = currAnchors;
+    refCH = chs;
+    refFH = fhs;
+    refCP = outCP;
+    refFR = outFR;
+    carriedOver = 0;
+    rejected = 0;
     for (uint32_t k = 0; k < numBatches; ++k)
     {
         const Batch& b = cs.batches[k];
@@ -1777,6 +1837,8 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
                                   patchExtents, nbContacts);
             if (refPatches[k].anchorCount[lane] > 0)
                 ++carriedOver;
+            else if (framed && (lane & 7u) == 5u)
+                ++rejected; // P9.94b: the reject lane really was rejected
             refGrowPatches(refPatches[k], refAnchors[k], lane, cs.cpoints, contactBase, nbContacts, bf0, bf1,
                            frictionOffsetThreshold + restDistance, patchExtents);
             refSetupPGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
@@ -1785,6 +1847,36 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
                         b.startFrictionIndex, restDistance, staticF, dynamicF, 0, ccdMaxSeparation, 0.f);
         }
     }
+    };
+
+    if (framed)
+    {
+        // P9.94b equivalence witness: the old spelling (TWIN) first, snapshotted ...
+        sTinvTwinRotateInv = true;
+        refPass();
+        sTinvTwinRotateInv = false;
+        const std::vector<BlockFrictionPatch> twPatches = refPatches;
+        const std::vector<BlockFrictionAnchorPatch> twAnchors = refAnchors;
+        const std::vector<BlockSolverContactHeader> twCH = refCH;
+        const std::vector<BlockSolverFrictionHeader> twFH = refFH;
+        const std::vector<BlockSolverContactPoint> twCP = refCP;
+        const std::vector<BlockSolverContactFriction> twFR = refFR;
+        const uint32_t twCarried = carriedOver;
+        // ... then the literal oracle, counting reached lanes where p differs
+        sTinvSpellingsDiffer = 0;
+        refPass();
+        auto same = [](const auto& x, const auto& y) {
+            return x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0;
+        };
+        std::printf("  P9.94b carry-over witness: transformInv p differs on %u reached lanes, carried %u\n",
+                    sTinvSpellingsDiffer, carriedOver);
+        PXG_CHECK_MSG(sTinvSpellingsDiffer > 0, "the zero-sign member never reached transformInv (witness vacuous)");
+        PXG_CHECK_MSG(twCarried == carriedOver && same(twPatches, refPatches) && same(twAnchors, refAnchors) &&
+                          same(twCH, refCH) && same(twFH, refFH) && same(twCP, refCP) && same(twFR, refFR),
+                      "the old transformInv spelling changed a stored reference word");
+    }
+    else
+        refPass();
 
     std::vector<BlockSolverContactFriction> gFR(outFR.size());
     std::vector<BlockSolverFrictionHeader> gFH(fhs.size());
@@ -1796,12 +1888,31 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
     shim.memcpyDtoH(gPatch.data(), dPatch, gPatch.size() * sizeof(BlockFrictionPatch));
 
     PXG_CHECK_MSG(carriedOver > 0, "no previous friction patches were carried over (test is vacuous)");
+    if (framed)
+    {
+        std::printf("  P9.94b framed carry-over: carried %u, rejected %u\n", carriedOver, rejected);
+        PXG_CHECK_MSG(rejected > 0, "no reject lane was rejected (framed variant vacuous)");
+    }
 
-    size_t mism = 0;
+    auto bits4 = [](const Float4& x, const Float4& y) { return std::memcmp(&x, &y, sizeof(Float4)) == 0; };
+    size_t mism = 0, mismBits = 0;
     for (uint32_t k = 0; k < numBatches; ++k)
         for (uint32_t l = 0; l < cs.batches[k].descStride; ++l)
         {
             if (gPatch[k].anchorCount[l] != refPatches[k].anchorCount[l]) { PXG_CHECK_MSG(false, "b%u l%u anchors g%u r%u", k, l, gPatch[k].anchorCount[l], refPatches[k].anchorCount[l]); ++mism; }
+            if (framed)
+            {
+                // P9.94b: the patch words the carry-over writes, BITWISE
+                if (!bits4(gPatch[k].body0Normal[l], refPatches[k].body0Normal[l])) ++mismBits;
+                if (!bits4(gPatch[k].body1Normal[l], refPatches[k].body1Normal[l])) ++mismBits;
+                for (uint32_t a = 0; a < refPatches[k].anchorCount[l] && a < 2; ++a)
+                {
+                    if (!bits4(a == 0 ? gAnch[k].body0Anchors0[l] : gAnch[k].body0Anchors1[l],
+                               a == 0 ? refAnchors[k].body0Anchors0[l] : refAnchors[k].body0Anchors1[l])) ++mismBits;
+                    if (!bits4(a == 0 ? gAnch[k].body1Anchors0[l] : gAnch[k].body1Anchors1[l],
+                               a == 0 ? refAnchors[k].body1Anchors0[l] : refAnchors[k].body1Anchors1[l])) ++mismBits;
+                }
+            }
             if (gFH[k].numFrictionConstr[l] != refFH[k].numFrictionConstr[l]) ++mism;
             const uint32_t nf = refFH[k].numFrictionConstr[l];
             for (uint32_t i = 0; i < nf; ++i)
@@ -1820,10 +1931,22 @@ PXG_TEST(constraintPrepPGS_frictionCarryover)
             }
         }
     PXG_CHECK_MSG(mism == 0, "%zu carry-over mismatches", mism);
+    PXG_CHECK_MSG(mismBits == 0, "%zu bitwise patch/anchor mismatches (framed)", mismBits);
 
     for (PxgDevicePtr pfree : { dBatches, dBi, dBd, dTx, dBf, dWu, dCd, dCp, dPatch, dPPatch, dAnch,
                                 dPAnch, dCfi, dPfi, dCh, dFh, dOutCP, dOutFR, dPrepDesc, dSharedDesc })
         shim.memFree(pfree);
+}
+
+PXG_TEST(constraintPrepPGS_frictionCarryover)
+{
+    frictionCarryoverPGS(false);
+}
+
+// P9.94b: the carry-over over general frames (see frictionCarryoverPGS)
+PXG_TEST(constraintPrepPGS_frictionCarryoverFrames)
+{
+    frictionCarryoverPGS(true);
 }
 
 // ---------------------------------------------------------------------------

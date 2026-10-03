@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.94b: alignedTransformInvTransform (prep common, equivalent at kernel outputs, killed at helper
+level by the new acpTransformInvProbe entry), convexHfMidphase aToB (engine-observable) plus the
+equivalent midphase centres, fcMidphase centres, and four single inverse-rotation sites
+(npSpherePrimitives, npCvxPlaneRefresh, npCvxMeshNp, femClothContactGenBda) now spell the CUDA
+conjugate-rotate literally; directed zero-sign fixtures with twins.  foldscan baseline covers the
+thresholdStreamBda lines (UNREVIEWED 0).  Scenes 64/64.
 P9.94a: transformInvTransform (pxgSlangCommon, five callers incl. the two engine cloth contact
 kernels) and the shared oracle TransformV::transformInv now spell PxTransform::transformInv literally
 (conjugate rotate; differs from rotateInv in the sign of exact zeros).  Five directed zero-sign
@@ -2089,6 +2095,59 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.94b — Konjugiertes Rotieren statt `rotateInv`: Prep-Common, Midphase-Zentren und vier Einzelstellen
+
+**Ausgangslage.** Nach P9.94a blieben aus dem P9.93-Audit Stellen, an denen der Port
+`quatRotateInv(q, x)` rechnet, die CUDA aber `q.getConjugate().rotate(x)`. Beide Schreibweisen
+liefern dieselben Bits bis auf das Vorzeichen exakter Nullen. P9.94b schließt drei Einheiten.
+
+**1. Prep-Common (`alignedTransformInvTransform`).** Der Helfer spiegelt
+`PxAlignedTransform::transformInv` (AlignedTransform.h:213-220) und rechnet jetzt
+`alignedRotate(qinv, b.p − a.p)`. Die Änderung ist an jedem Kernel-Ausgang äquivalent: `p` erreicht
+nur `pointsAreClose` (rotate + p, Differenz, dot, abs, `<`), das das Nullvorzeichen nicht sieht. Der
+Beweis steht im Shader-Kommentar. Damit ein Revert trotzdem auffällt, gibt es den Test-Einstieg
+`acpTransformInvProbe` in `npArtiConstraintPrep.slang`. `artiConstraintPrepBody_transformInvProbe`
+prüft 22881 Lanes bitweise gegen das Engine-Orakel; in 4161 davon weicht der alte Zwilling ab.
+Zusätzlich gibt es einen Host-Zeugen, `constraintPrepPGS_frictionCarryoverFrames`, und das Orakel
+`aTransformInvFrame` rechnet wörtlich. Sweep: 7/7 getötet.
+
+**2. Midphase-Zentren.**
+- `convexHfMidphaseBda`: aToB wird jetzt über `q1inv` gebildet. Das ist engine-sichtbar: Der
+  gespeicherte Record und die relative Transformation im Manifold ändern ihre Nullvorzeichen. Neuer
+  Test `convexHfMidphaseAToB` plus Prüfung aller 7 Record-Wörter.
+- Das Zentrum in `convexHfMidphaseBda` und in `npCvxHfMid` ist äquivalent: Es speist nur
+  vorzeichenblinde Operationen (Vergleiche, `floor`/`ceil` → int, Höhen aus int16), und nichts
+  daraus wird gespeichert.
+- `fcMidphase`: die fm- und sb-Zentren, mit gerichteten Fällen i=1 und i=17.
+
+Sweeps: hf 5 getötet und 3 äquivalente Überlebende (davon ist F1 der bekannte Last-Bit-Tripwire);
+chmid 1 äquivalent; fc 4/4.
+
+**3. Vier Einzelstellen**, jede mit einem gerichteten Nullvorzeichen-Test samt Zwilling:
+
+| Shader | Stelle | Test |
+|---|---|---|
+| `npSpherePrimitives` | `bToAp = quatRotate(qinv, p1 − p0)` | `npCapsuleCollision_planeCapsuleZeroSign`, `sphereNphase_planeCapsuleZeroSign` (+ `planeCapsuleOrder`) |
+| `npCvxPlaneRefresh` | bToA.p über `planeQinv` | `npCvxPlaneRefresh_bToApZeroSign` |
+| `npCvxMeshNp` | Kapsel-p über `aQinv` | `npCvxMeshNp_capsuleMtcPZeroSign` |
+| `femClothContactGenBda` | `toConvP = ctQuatRotate(rigidQinv, clothP − rigidP)` | `femClothSimConvexTriangleZeroSign` |
+
+Die Orakel in den zugehörigen Testdateien rechnen jetzt wörtlich. Alle Mutanten wurden getötet,
+jeder Revert schon vom gerichteten Test allein.
+
+**Foldscan.** Der BDA-Port aus P9.91 hatte sieben Zeilen von `thresholdStream.slang` nach
+`thresholdStreamBda.slang` gehoben, ohne Basiseinträge. Die Urteile des Zwillings (BENIGN bzw.
+NOT-A-FOLD) wurden übernommen. `foldscan_all.py` meldet jetzt UNREVIEWED 0.
+
+**Weitergegeben an P9.94c/d.** Der zweite Audit (über alle Helfernamen für inverse Rotation)
+bestätigte 44 Stellen. Der wichtigste neue Fund ist, dass `ctQuatRotate`/`ctQuatRotateInv` in
+`pxgSlangCvxTriSetup.slang` nicht wörtlich `PxQuat::rotate`/`rotateInv` sind. Sie runden allgemein
+anders und werden von sphereTri, sphereHf, capsuleHf und cvxTri in der Engine erreicht. Dazu kommen
+die bekannten Nullvorzeichen-Stellen (u. a. `triPlaneNpBda:231`) und der falsche Kommentar in
+`pxgSlangHeightfield.slang:370-371`.
+
+**Suite:** 883/883 in beiden Speichermodi. **Szenen:** 64/64.
 
 ## P9.94a — `transformInvTransform`: der gemeinsame Helfer rechnet `PxTransform::transformInv` jetzt wörtlich
 

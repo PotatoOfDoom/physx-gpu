@@ -76,6 +76,11 @@ static uint32_t popc(uint32_t m) { uint32_t c = 0; while (m) { c += m & 1u; m >>
 static const float thC[5] = { 0.5f, 0.125f, 0.25f, 0.375f, 0.375f };
 static const float qthCP[5] = { 0.99996f, 0.99996f, 0.99996f, 0.99996f, 0.99996f };
 
+// P9.94b twin of the shader's bToAp (cudaGJKEPA.cu:2860 planeTransform.transformInv(convexTransform)):
+// false = the CUDA's PxTransform::transformInv, conj(planeTq).rotate(convexTp - planeTp)
+// (PxTransform.h:162-168); true = the pre-P9.94b spelling planeTq.rotateInv(convexTp - planeTp).
+static bool gPlaneRefreshRotInvTwin = false;
+
 static void refPlaneRefresh(const PrIn& s, PrOut& o, bool& marg)
 {
     const F4 planeTq = s.planeTq; const V3 planeTp = v3(s.planeTp);
@@ -84,7 +89,7 @@ static void refPlaneRefresh(const PrIn& s, PrOut& o, bool& marg)
 
     const F4 c{ -planeTq.x, -planeTq.y, -planeTq.z, planeTq.w };
     const F4 bToAq = qMul(c, convexTq);
-    const V3 bToAp = qRotInv(planeTq, sub(convexTp, planeTp));
+    const V3 bToAp = gPlaneRefreshRotInvTwin ? qRotInv(planeTq, sub(convexTp, planeTp)) : qRot(c, sub(convexTp, planeTp));
 
     const V3 n = getNormalized(qRotInv(bToAq, V3{ 1, 0, 0 }));
 
@@ -185,7 +190,7 @@ PXG_TEST(npCvxPlaneRefresh_refresh)
         // get a large in-plane offset so the refresh drops them
         const F4 c{ -s.planeTq.x, -s.planeTq.y, -s.planeTq.z, s.planeTq.w };
         const F4 bToAq = qMul(c, s.convexTq);
-        const V3 bToAp = qRotInv(s.planeTq, sub(v3(s.convexTp), v3(s.planeTp)));
+        const V3 bToAp = qRot(c, sub(v3(s.convexTp), v3(s.planeTp)));   // P9.94b: transformInv, literal
         const V3 n = getNormalized(qRotInv(bToAq, V3{ 1, 0, 0 }));
         V3 u = unit(V3{ n.y, -n.x + 0.3f, n.z + 0.1f });
         u = unit(sub(u, mul(n, dot3(u, n)))); // in-plane direction
@@ -269,6 +274,76 @@ PXG_TEST(npCvxPlaneRefresh_refresh)
     PXG_CHECK_MSG(cRun > N / 10 && cNoRun > N / 20 && cInval > N / 20 && cDrop > N / 10,
                   "planeRefresh: coverage thin (run %zu noRun %zu inval %zu drop %zu)", cRun, cNoRun, cInval, cDrop);
 
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.94b: bToA = planeTransform.transformInv(convexTransform) (cudaGJKEPA.cu:2860) spells
+// conj(planeTq).rotate(convexTp - planeTp) (PxTransform.h:162-168), not planeTq.rotateInv(...); the
+// stored bToAp shows the difference directly.  Identity plane and convex at the origin, V = 2v:
+// with V.y = -0 and V.z < 0 the y lane's cross term is (-0*Vx) - (-0*Vz) under the conjugate but
+// (0*Vx) - (0*Vz), negated, under rotateInv, and the q.y*dot2 term is -0 vs +0, so
+//   A: convexTp = (1,-0,-1):  CUDA bToAp.y = -0, old +0
+//   B: convexTp = (-1,-0,-1): CUDA bToAp.y = +0, old -0.
+// misc.x = 0 and zero md* give bRun = 1 (deltaP = 1 > thP).  Every word is exact IEEE arithmetic
+// (products of 0, +-1, 1/2, 2), so every PrOut word is compared bitwise.
+PXG_TEST(npCvxPlaneRefresh_bToApZeroSign)
+{
+    const uint32_t N = 2;
+    std::vector<PrIn> in(N);
+    const float cx[N] = { 1.0f, -1.0f };
+    const uint32_t cudaY[N] = { 0x80000000u, 0x00000000u }, twinY[N] = { 0x00000000u, 0x80000000u };
+    std::vector<PrOut> ref(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        PrIn s{};
+        s.planeTq = F4{ 0, 0, 0, 1 };
+        s.convexTq = F4{ 0, 0, 0, 1 };
+        s.planeTp = F4{ 0, 0, 0, 0 };
+        s.convexTp = F4{ cx[i], -0.0f, -1.0f, 0 };
+        s.extents = F4{ 1, 1, 1, 0 };
+        s.scale = F4{ 1, 1, 1, 1 };
+        s.misc = U4{ 0, 0, 0, 0 };
+        in[i] = s;
+        bool marg = false;
+        refPlaneRefresh(s, ref[i], marg);
+        PrOut twin{};
+        bool margT = false;
+        gPlaneRefreshRotInvTwin = true;
+        refPlaneRefresh(s, twin, margT);
+        gPlaneRefreshRotInvTwin = false;
+        std::printf("  [bToApZeroSign] case %u: bRun %u, bToAp.y cuda=%08x twin=%08x\n",
+                    i, ref[i].result.x, f2u(ref[i].bToAp.y), f2u(twin.bToAp.y));
+        PXG_CHECK_MSG(!marg && ref[i].result.x == 1u, "case %u: no longer a non-marginal bRun case", i);
+        PXG_CHECK_MSG(f2u(ref[i].bToAp.y) == cudaY[i] && f2u(twin.bToAp.y) == twinY[i],
+                      "case %u: the rotateInv twin no longer flips bToAp.y (cuda %08x, twin %08x)",
+                      i, f2u(ref[i].bToAp.y), f2u(twin.bToAp.y));
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<PrOut> outInit(N);
+    std::memset(outInit.data(), 0xA5, sizeof(PrOut) * N);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct PrParams { uint32_t numTests; } prm = { N };
+    Kernel k("npCvxPlaneRefresh.spv", "cvxPlaneRefresh",
+             { (uint32_t)sizeof(PrIn), (uint32_t)sizeof(PrOut) }, sizeof(PrParams));
+    k.dispatch(1, { bIn, bOut }, prm);
+    dev->flush();
+    const auto g = downloadBuffer<PrOut>(dev, bOut, N);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        uint32_t gw[sizeof(PrOut) / 4], rw[sizeof(PrOut) / 4];
+        std::memcpy(gw, &g[i], sizeof(PrOut));
+        std::memcpy(rw, &ref[i], sizeof(PrOut));
+        for (uint32_t w = 0; w < sizeof(PrOut) / 4; ++w)
+            if (gw[w] != rw[w])
+            {
+                ++mm;
+                if (mm < 12) std::printf("  case %u word %u gpu=%08x ref=%08x\n", i, w, gw[w], rw[w]);
+            }
+    }
+    PXG_CHECK_MSG(mm == 0, "bToApZeroSign: %zu word mismatches", mm);
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 

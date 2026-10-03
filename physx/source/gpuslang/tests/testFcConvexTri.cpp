@@ -808,7 +808,8 @@ PXG_TEST(femClothSimBoxTriangleContactGen)
         if (triangleIdx == TRI_PARTIAL) ++partialKept;
 
         const Q toConvQ = qmul(qconj(boxQ), clothQ);                                   // B5
-        const V3c toConvP = qrotInv(boxQ, V3c{ clothP.x - boxP.x, clothP.y - boxP.y, clothP.z - boxP.z });
+        // P9.94b: PxTransform::transformInv (PxTransform.h:162-168) -- conj(q).rotate, literally.
+        const V3c toConvP = qrot(qconj(boxQ), V3c{ clothP.x - boxP.x, clothP.y - boxP.y, clothP.z - boxP.z });
         auto toConv = [&](const F4& v) {
             const V3c r = qrot(toConvQ, V3c{ v.x, v.y, v.z });
             return V3c{ r.x + toConvP.x, r.y + toConvP.y, r.z + toConvP.z };
@@ -1895,6 +1896,320 @@ PXG_TEST(fcConvexTri_contactGenRotLaneZeroSign)
                   signLanes, NC);
 
     for (PxgBufferHandle h : { bC, bH, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.94b -- B5's toConvP, the sign of a zero, observed end to end.
+//
+// clothConvexTriCgBody's trimeshToConvexTransform is rigidTransform.transformInv(clothTransform)
+// (femClothPrimitives.cu:1826 / :3272), whose position PxTransform.h:162-168 spells
+// conj(rigidQ).rotate(clothP - rigidP).  The port spelled rigidQ.rotateInv(clothP - rigidP),
+// which differs only in the sign of a zero lane -- and only a zero lane that reaches a stored
+// word through a chain of zero products.  The chain below was derived by hand (P9.94 review):
+//
+//   rigid: eCONVEXMESH, hull makeRotLaneHull(-0, 0.25, -0, 0.25, 0.5, (0,0,-1), 0.25) -- vertex 0
+//          is (-0,-0,0.25), bottom face 5 at z = 0.25 -- scale 1 with rotation (-0,-0,-0,1),
+//          q = (-0,+0,-0,1), p = +0, contactDistance 0.25
+//   cloth: q = (+0,+0,+0,-1), p = (2,-0.5,-0), contactDistance 0.25, one triangle
+//          v0 = (-3,0.5,-0), v1 = (-1,-0.5,-0), v2 = (-1,1.5,-0)
+//
+//   d = (2,-0.5,-0): toConvP.z is +0 (CUDA) / -0 (old); t1.z follows it (rotate(toConvQ, v1).z
+//   = -0), so the convex-space triangle (-1,+0,+0), (1,-1,+-0), (1,1,+0) gets triN.xy =
+//   (-0,+0) / (+0,-0).  The SAT keeps face 5 (separation 0.25 either way), all four bottom
+//   vertices clip inside the triangle, and vertex 0 -- (-0,+0,0.25) in shape space -- projects
+//   to tProj.x = -0 - n.x*s: +0 / -0.  Its contact normal x is -0 / +0 and the rigid's rotation
+//   carries it to the stored normalPen.x: 0x00000000 (CUDA) / 0x80000000 (old).
+//
+// The host mirrors both glue spellings (gToConvPRotInvTwin), the core entry ctFcConvexTri runs
+// both FctCases and must agree bitwise with the reference face block, the two streams must
+// differ in exactly that word, and the ENGINE kernel cloth_convexContactGenLaunch must
+// reproduce the CUDA-spelled stream bitwise.  Every product is exact.
+// ---------------------------------------------------------------------------
+static bool gToConvPRotInvTwin = false;   // P9.94b: true = the pre-P9.94b rotateInv glue
+
+PXG_TEST(femClothSimConvexTriangleZeroSign)
+{
+    using namespace btri;
+    using btri::f2u;
+    const uint32_t CAP = 64, RIGID_FACE = 5;
+    const Hull H = makeRotLaneHull(-0.0f, 0.25f, -0.0f, 0.25f, 0.5f, { 0, 0, -1 }, 0.25f);
+    const Q rigidQ = { -0.0f, 0.0f, -0.0f, 1.0f };
+    const V3c rigidP = { 0.0f, 0.0f, 0.0f };
+    const Q clothQ = { 0.0f, 0.0f, 0.0f, -1.0f };
+    const V3c clothP = { 2.0f, -0.5f, -0.0f };
+    const F4 scaleRot = { -0.0f, -0.0f, -0.0f, 1.0f };
+    const float cdCloth = 0.25f, cdRigid = 0.25f, rest = 0.0625f;
+    const uint32_t materialIndex = 9u, CLOTH_ID = 1u;
+    const uint64_t rigidNodeInd = 0x0000000500000023ull;
+    const std::vector<F4> cverts = { { -3.0f, 0.5f, -0.0f, 1.0f }, { -1.0f, -0.5f, -0.0f, 1.0f },
+                                     { -1.0f, 1.5f, -0.0f, 1.0f } };
+
+    // ---- the host mirror of the glue (clothConvexTriCgBody), both spellings ----
+    auto glue = [&](bool oldSpelling) {
+        const Q toConvQ = qmul(qconj(rigidQ), clothQ);
+        const V3c d = { clothP.x - rigidP.x, clothP.y - rigidP.y, clothP.z - rigidP.z };
+        const V3c toConvP = oldSpelling ? qrotInv(rigidQ, d) : qrot(qconj(rigidQ), d);
+        V3c t[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            const V3c r = qrot(toConvQ, V3c{ cverts[k].x, cverts[k].y, cverts[k].z });
+            t[k] = V3c{ r.x + toConvP.x, r.y + toConvP.y, r.z + toConvP.z };
+        }
+        const V3c e0 = { t[1].x - t[0].x, t[1].y - t[0].y, t[1].z - t[0].z };
+        const V3c e1 = { t[2].x - t[0].x, t[2].y - t[0].y, t[2].z - t[0].z };
+        V3c n = { e0.y * e1.z - e0.z * e1.y, e0.z * e1.x - e0.x * e1.z, e0.x * e1.y - e0.y * e1.x };
+        const float nm = n.x * n.x + n.y * n.y + n.z * n.z;   // PxVec3::getNormalized (P9.47)
+        if (nm > 0.0f) { const float r = 1.0f / std::sqrt(nm); n = V3c{ n.x * r, n.y * r, n.z * r }; }
+        else n = V3c{ 0.0f, 0.0f, 0.0f };
+        FctCase cs{};
+        cs.convexScale = F4{ 1, 1, 1, cdCloth + cdRigid };
+        cs.convexScaleRot = scaleRot;
+        cs.t0 = F4{ t[0].x, t[0].y, t[0].z, rest };
+        cs.t1 = F4{ t[1].x, t[1].y, t[1].z, 0.0f };
+        cs.t2 = F4{ t[2].x, t[2].y, t[2].z, 0.0f };
+        cs.triNormal = F4{ n.x, n.y, n.z, 0.0f };
+        cs.convexP = F4{ rigidP.x, rigidP.y, rigidP.z, 0.0f };
+        cs.convexQ = F4{ rigidQ.x, rigidQ.y, rigidQ.z, rigidQ.w };
+        cs.ids = U4{ uint32_t(rigidNodeInd & 0xffffffffu), uint32_t(rigidNodeInd >> 32), CLOTH_ID, 0u };
+        cs.ids2 = U4{ materialIndex, 0u, 0u, 0u };
+        return cs;
+    };
+    const FctCase csCuda = glue(gToConvPRotInvTwin);
+    gToConvPRotInvTwin = true;
+    const FctCase csOld = glue(gToConvPRotInvTwin);
+    gToConvPRotInvTwin = false;
+    std::printf("  [convexTriZeroSign] t1.z cuda=%08x old=%08x, triN.xy cuda=(%08x,%08x) old=(%08x,%08x)\n",
+                f2u(csCuda.t1.z), f2u(csOld.t1.z), f2u(csCuda.triNormal.x), f2u(csCuda.triNormal.y),
+                f2u(csOld.triNormal.x), f2u(csOld.triNormal.y));
+    PXG_CHECK_MSG(f2u(csCuda.t1.z) == 0x00000000u && f2u(csOld.t1.z) == 0x80000000u,
+                  "the glue twin no longer flips t1.z (cuda %08x, old %08x)", f2u(csCuda.t1.z), f2u(csOld.t1.z));
+    PXG_CHECK_MSG(f2u(csCuda.triNormal.x) == 0x80000000u && f2u(csCuda.triNormal.y) == 0x00000000u &&
+                  f2u(csOld.triNormal.x) == 0x00000000u && f2u(csOld.triNormal.y) == 0x80000000u,
+                  "the glue twin no longer flips triNormal.xy");
+
+    // ---- reference face block (feature 5), both spellings ----
+    std::vector<RefContact> refCuda, refOld;
+    PXG_CHECK_MSG(rotLaneFaceContacts(H, csCuda, rotLaneMinNormal(H, csCuda, RIGID_FACE), RIGID_FACE, refCuda) &&
+                  rotLaneFaceContacts(H, csOld, rotLaneMinNormal(H, csOld, RIGID_FACE), RIGID_FACE, refOld),
+                  "the face emits more than 5 contacts");
+    auto words = [&](const RefContact& rc, const FctCase& cs, float* w) {
+        const float v[12] = { rc.p.x, rc.p.y, rc.p.z, cs.t0.w, rc.n.x, rc.n.y, rc.n.z, rc.sep,
+                              rc.bary.x, rc.bary.y, rc.bary.z, rc.bary.w };
+        std::memcpy(w, v, sizeof(v));
+    };
+    uint32_t refDiff = 0, refFlipSlot = 0xffffffffu;
+    if (refCuda.size() == refOld.size())
+        for (size_t c = 0; c < refCuda.size(); ++c)
+        {
+            float a[12], b[12];
+            words(refCuda[c], csCuda, a);
+            words(refOld[c], csOld, b);
+            for (int j = 0; j < 12; ++j)
+                if (f2u(a[j]) != f2u(b[j]))
+                {
+                    ++refDiff;
+                    if (j == 4 && f2u(a[j]) == 0x00000000u && f2u(b[j]) == 0x80000000u) refFlipSlot = uint32_t(c);
+                }
+        }
+    std::printf("  [convexTriZeroSign] reference: %zu/%zu contacts, %u words differ, normalPen.x flip in slot %d\n",
+                refCuda.size(), refOld.size(), refDiff, int(refFlipSlot));
+    PXG_CHECK_MSG(refCuda.size() == 4u && refOld.size() == 4u && refDiff == 1u && refFlipSlot != 0xffffffffu,
+                  "the reference must emit 4 contacts per spelling differing ONLY in one normalPen.x "
+                  "(+0 CUDA / -0 old): %zu/%zu contacts, %u words differ", refCuda.size(), refOld.size(), refDiff);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<uint32_t> blob;
+    uint32_t hullOffset = 0;
+    H.serialize(blob, hullOffset);
+    PXG_CHECK_MSG(hullOffset == 0u, "the hull must start at offset 0 for this rig");
+    DevBuf bHull = mkBuf(dev, blob);
+
+    // ---- the core over each glue spelling: one dispatch per writer ----
+    struct Stream { uint32_t count = 0; std::vector<F4> pt, np, by; std::vector<FemInfoHost> info; U4 dbg{}; };
+    auto runCore = [&](const FctCase& cs) {
+        Stream st;
+        std::vector<FctCase> cases = { cs };
+        DevBuf bCases = mkBuf(dev, cases);
+        DevBuf bDbg = mkBuf(dev, std::vector<U4>(1, U4{ 7, 7, 7, 7 }));
+        WBufs w = mkWriter(dev, CAP);
+        FctParams fp = {};
+        fp.numCases = 1u; fp.maxContacts = CAP; fp.hullAddr = bHull.addr;
+        fp.wPoint = w.point.addr; fp.wNormalPen = w.normalPen.addr; fp.wBary = w.bary.addr;
+        fp.wInfo = w.info.addr; fp.wCount = w.count.addr; fp.wByX = w.byX.addr;
+        fp.wTempByX = w.tempByX.addr; fp.wIdxByX = w.idxByX.addr;
+        Kernel kb("fcConvexTri.spv", "ctFcConvexTri", { (uint32_t)sizeof(FctCase), 16 }, sizeof(FctParams));
+        if (kb.isValid())
+        {
+            kb.dispatch(1u, { bCases.h, bDbg.h }, fp);
+            dev->flush();
+            st.count = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+            const uint32_t n = std::min(st.count, CAP);
+            st.pt = downloadBuffer<F4>(dev, w.point.h, n);
+            st.np = downloadBuffer<F4>(dev, w.normalPen.h, n);
+            st.by = downloadBuffer<F4>(dev, w.bary.h, n);
+            st.info = downloadBuffer<FemInfoHost>(dev, w.info.h, n);
+            st.dbg = downloadBuffer<U4>(dev, bDbg.h, 1)[0];
+        }
+        killWriter(dev, w);
+        dev->destroyBuffer(bCases.h); dev->destroyBuffer(bDbg.h);
+        return st;
+    };
+    const Stream sCuda = runCore(csCuda), sOld = runCore(csOld);
+    for (const Stream* s : { &sCuda, &sOld })
+        PXG_CHECK_MSG(s->dbg.x == 1u && s->dbg.y == RIGID_FACE && s->dbg.z == RIGID_FACE && s->dbg.w == 0xFFFFFFFFu &&
+                      s->count == 4u,
+                      "%s core: verdict (%u, %u, %u, %08x) with %u contacts, expected (1, 5, 5, ffffffff) and 4",
+                      s == &sCuda ? "CUDA-glue" : "old-glue", s->dbg.x, s->dbg.y, s->dbg.z, s->dbg.w, s->count);
+
+    // one thread, one face: the core's slots follow the reference order
+    size_t mmRef = 0;
+    if (sCuda.count == refCuda.size())
+        for (uint32_t c = 0; c < sCuda.count; ++c)
+        {
+            float want[12];
+            words(refCuda[c], csCuda, want);
+            const float got[12] = { sCuda.pt[c].x, sCuda.pt[c].y, sCuda.pt[c].z, sCuda.pt[c].w,
+                                    sCuda.np[c].x, sCuda.np[c].y, sCuda.np[c].z, sCuda.np[c].w,
+                                    sCuda.by[c].x, sCuda.by[c].y, sCuda.by[c].z, sCuda.by[c].w };
+            for (int j = 0; j < 12; ++j)
+                if (f2u(got[j]) != f2u(want[j]))
+                {
+                    if (mmRef < 8) std::printf("  core contact %u word %d: GPU %08x, reference %08x\n", c, j,
+                                               f2u(got[j]), f2u(want[j]));
+                    ++mmRef;
+                }
+        }
+    else
+        ++mmRef;
+    PXG_CHECK_MSG(mmRef == 0, "the core over the CUDA glue differs from the reference in %zu words", mmRef);
+
+    uint32_t coreDiff = 0, coreFlip = 0;
+    if (sCuda.count == sOld.count)
+        for (uint32_t c = 0; c < std::min(sCuda.count, CAP); ++c)
+        {
+            const uint32_t a[12] = { f2u(sCuda.pt[c].x), f2u(sCuda.pt[c].y), f2u(sCuda.pt[c].z), f2u(sCuda.pt[c].w),
+                                     f2u(sCuda.np[c].x), f2u(sCuda.np[c].y), f2u(sCuda.np[c].z), f2u(sCuda.np[c].w),
+                                     f2u(sCuda.by[c].x), f2u(sCuda.by[c].y), f2u(sCuda.by[c].z), f2u(sCuda.by[c].w) };
+            const uint32_t b[12] = { f2u(sOld.pt[c].x), f2u(sOld.pt[c].y), f2u(sOld.pt[c].z), f2u(sOld.pt[c].w),
+                                     f2u(sOld.np[c].x), f2u(sOld.np[c].y), f2u(sOld.np[c].z), f2u(sOld.np[c].w),
+                                     f2u(sOld.by[c].x), f2u(sOld.by[c].y), f2u(sOld.by[c].z), f2u(sOld.by[c].w) };
+            for (int j = 0; j < 12; ++j)
+                if (a[j] != b[j])
+                {
+                    ++coreDiff;
+                    if (j == 4 && a[j] == 0x00000000u && b[j] == 0x80000000u) ++coreFlip;
+                }
+        }
+    std::printf("  [convexTriZeroSign] core: %u words differ between the two glue spellings (%u normalPen.x flips)\n",
+                coreDiff, coreFlip);
+    PXG_CHECK_MSG(coreDiff == 1u && coreFlip == 1u,
+                  "the core must carry the glue flip into exactly one normalPen.x (+0 CUDA / -0 old): "
+                  "%u words differ, %u flips", coreDiff, coreFlip);
+
+    // ---- the engine kernel over the same arena ----
+    std::vector<Tri4> ctris = { Tri4{ 0u, 1u, 2u, 0u } };
+    DevBuf bCVerts = mkBuf(dev, cverts);
+    DevBuf bCTris = mkBuf(dev, ctris);
+    PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
+    fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCVerts.addr));
+    fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bCTris.addr));
+    fc.mNbVerts = uint32_t(cverts.size());
+    fc.mNbTriangles = 1u;
+    PxgFEMCloth decoy; std::memset(&decoy, 0, sizeof(decoy));
+    DevBuf bDesc = mkBuf(dev, std::vector<PxgFEMCloth>{ decoy, fc });
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = mkBuf(dev, cmInputs);
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = CLOTH_ID;
+    shapes[1].type = PxU32(PxGeometryType::eCONVEXMESH);
+    shapes[1].materialIndex = materialIndex;
+    shapes[1].scale = PxMeshScale(PxVec3(1.0f, 1.0f, 1.0f), PxQuat(scaleRot.x, scaleRot.y, scaleRot.z, scaleRot.w));
+    shapes[1].hullOrMeshPtr = size_t(bHull.addr);
+    DevBuf bShapes = mkBuf(dev, shapes);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[0].transform = PxTransform(PxVec3(clothP.x, clothP.y, clothP.z), PxQuat(clothQ.x, clothQ.y, clothQ.z, clothQ.w));
+    tcache[1].transform = PxTransform(PxVec3(rigidP.x, rigidP.y, rigidP.z), PxQuat(rigidQ.x, rigidQ.y, rigidQ.z, rigidQ.w));
+    DevBuf bTc = mkBuf(dev, tcache);
+    DevBuf bCd = mkBuf(dev, std::vector<float>{ cdCloth, cdRigid });
+    DevBuf bRd = mkBuf(dev, std::vector<float>{ rest });
+    DevBuf bRemap = mkBuf(dev, std::vector<uint64_t>{ 0ull, rigidNodeInd });
+    PxgRigidFilterPair noPair; std::memset(&noPair, 0, sizeof(noPair));   // nbFilterPairs = 0
+    DevBuf bFilters = mkBuf(dev, std::vector<PxgRigidFilterPair>{ noPair });
+    DevBuf bStack = mkBuf(dev, std::vector<U4>{ U4{ 0u, 0u, 0u, 0u } });
+    DevBuf bPairsNum = mkBuf(dev, std::vector<uint32_t>{ 1u });
+    DevBuf bNeeded = mkBuf(dev, std::vector<uint32_t>{ 0u });
+    WBufs wa = mkWriter(dev, CAP);
+    BTriPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr;
+    push.contactDistance = bCd.addr; push.restDistance = bRd.addr;
+    push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairsNum.addr; push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = 0u;
+    push.stackSizeBytes = 16u;
+    push.stackSizeNeeded = bNeeded.addr;
+    push.bPoint = wa.point.addr; push.bNormalPen = wa.normalPen.addr;
+    push.bBary = wa.bary.addr; push.bInfo = wa.info.addr;
+    push.bCount = wa.count.addr; push.bByX = wa.byX.addr;
+    push.bTempByX = wa.tempByX.addr; push.bIdxByX = wa.idxByX.addr;
+    push.bSortedByX = wa.sortedByX.addr; push.bMaxNumContacts = CAP;
+    Kernel ka("femClothContactGenBda.spv", "cloth_convexContactGenLaunch", {}, sizeof(BTriPush));
+    PXG_CHECK_MSG(ka.isValid(), "the cloth convex-triangle pipeline must build");
+    if (ka.isValid())
+    {
+        ka.dispatch(/*gridX*/ 4096u, {}, push, 1u, 1u);
+        dev->flush();
+        const uint32_t cntA = downloadBuffer<uint32_t>(dev, wa.count.h, 1)[0];
+        PXG_CHECK_MSG(cntA == sCuda.count, "the engine kernel emitted %u contacts, the core over the CUDA glue %u",
+                      cntA, sCuda.count);
+        if (cntA == sCuda.count && cntA > 0u)
+        {
+            const uint32_t n = std::min(cntA, CAP);
+            const auto pA = downloadBuffer<F4>(dev, wa.point.h, n);
+            const auto nA = downloadBuffer<F4>(dev, wa.normalPen.h, n);
+            const auto yA = downloadBuffer<F4>(dev, wa.bary.h, n);
+            const auto iA = downloadBuffer<FemInfoHost>(dev, wa.info.h, n);
+            auto eq4 = [&](const F4& a, const F4& b, bool w) {
+                return f2u(a.x) == f2u(b.x) && f2u(a.y) == f2u(b.y) && f2u(a.z) == f2u(b.z) && (!w || f2u(a.w) == f2u(b.w));
+            };
+            std::vector<bool> used(n, false);
+            size_t mm = 0;
+            for (uint32_t a = 0; a < n; ++a)
+            {
+                bool found = false;
+                for (uint32_t b = 0; b < n && !found; ++b)
+                {
+                    if (used[b] || !eq4(pA[a], sCuda.pt[b], true) || !eq4(nA[a], sCuda.np[b], true) ||
+                        !eq4(yA[a], sCuda.by[b], false))
+                        continue;
+                    if (iA[a].pairInd0 != sCuda.info[b].pairInd0 || iA[a].pairInd1 != sCuda.info[b].pairInd1 ||
+                        iA[a].rigidMatInd != sCuda.info[b].rigidMatInd)
+                        continue;
+                    used[b] = true; found = true;
+                }
+                if (!found)
+                {
+                    if (mm < 4) std::printf("  engine contact %u (np %08x,%08x,%08x,%08x) has no match in the CUDA-glue "
+                                            "core stream\n", a, f2u(nA[a].x), f2u(nA[a].y), f2u(nA[a].z), f2u(nA[a].w));
+                    ++mm;
+                }
+            }
+            PXG_CHECK_MSG(mm == 0, "cloth_convexContactGenLaunch differs bitwise from the core over the CUDA glue "
+                          "in %zu contacts", mm);
+        }
+    }
+
+    killWriter(dev, wa);
+    for (PxgBufferHandle h : { bHull.h, bCVerts.h, bCTris.h, bDesc.h, bCin.h, bShapes.h, bTc.h, bCd.h, bRd.h,
+                               bRemap.h, bFilters.h, bStack.h, bPairsNum.h, bNeeded.h })
         dev->destroyBuffer(h);
 }
 

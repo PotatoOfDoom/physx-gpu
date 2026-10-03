@@ -59,6 +59,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <array>
 
 namespace
 {
@@ -195,17 +196,55 @@ static uint32_t hfMat1At(const std::vector<uint32_t>& blob, uint32_t vertexIndex
 // ---------------------------------------------------------------------------
 struct HfXform { float qx, qy, qz, qw, px, py, pz; };
 
-static V3 quatRotateInvH(const HfXform& t, V3 v)
+// P9.94b: literal PxQuat transcriptions.  The former quatRotateInvH spelled
+// v*(2w^2-1) - cross*2w + a*d*2, which is neither PxQuat::rotateInv nor the
+// conjugate rotate; these follow the header token for token.
+static V3 pxQuatRotate(float qx, float qy, float qz, float qw, V3 v)   // PxQuat.h:286-295
 {
-    // PxQuat::rotateInv: v*(2w^2 - 1) - cross(axis,v)*2w + axis*(dot(axis,v)*2)
-    const float w = t.qw;
-    const V3 a{ t.qx, t.qy, t.qz };
-    const float d = a.x * v.x + a.y * v.y + a.z * v.z;
-    const V3 cr{ a.y * v.z - a.z * v.y, a.z * v.x - a.x * v.z, a.x * v.y - a.y * v.x };
-    const float k = 2.0f * w * w - 1.0f;
-    return V3{ v.x * k - cr.x * 2.0f * w + a.x * d * 2.0f,
-               v.y * k - cr.y * 2.0f * w + a.y * d * 2.0f,
-               v.z * k - cr.z * 2.0f * w + a.z * d * 2.0f };
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = qw * qw - 0.5f;
+    const float dot2 = (qx * vx + qy * vy + qz * vz);
+    return V3{ (vx * w2 + (qy * vz - qz * vy) * qw + qx * dot2),
+               (vy * w2 + (qz * vx - qx * vz) * qw + qy * dot2),
+               (vz * w2 + (qx * vy - qy * vx) * qw + qz * dot2) };
+}
+static V3 pxQuatRotateInv(float qx, float qy, float qz, float qw, V3 v)   // PxQuat.h:324-333
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = qw * qw - 0.5f;
+    const float dot2 = (qx * vx + qy * vy + qz * vz);
+    return V3{ (vx * w2 - (qy * vz - qz * vy) * qw + qx * dot2),
+               (vy * w2 - (qz * vx - qx * vz) * qw + qy * dot2),
+               (vz * w2 - (qx * vy - qy * vx) * qw + qz * dot2) };
+}
+// PxQuat::operator* (PxQuat.h:388-392), this = a; {x,y,z,w}.
+static void pxQuatMul(const float a[4], const float b[4], float o[4])
+{
+    o[0] = a[3] * b[0] + b[3] * a[0] + a[1] * b[2] - b[1] * a[2];
+    o[1] = a[3] * b[1] + b[3] * a[1] + a[2] * b[0] - b[2] * a[0];
+    o[2] = a[3] * b[2] + b[3] * a[2] + a[0] * b[1] - b[0] * a[1];
+    o[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+static uint32_t fbitsH(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// P9.94b TWIN: true restores the pre-P9.94b port spelling of aToB.p,
+// quatRotateInv(q1, p0 - p1), so a directed test can prove its input separates
+// that spelling from the literal PxTransform::transformInv one.
+static bool sAToBTwinRotInv = false;
+
+// The ConvexMeshPair record's aToB (bytes 0..27): heightfieldTransform.
+// transformInv(shapeTransform) (convexHFMidphase.cu:109) as PxTransform.h:167-168
+// spells it: qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).
+static std::array<uint32_t, 7> expectedAToB(const float q1[4], V3 p1, const float q0[4], V3 p0)
+{
+    const float qinv[4] = { -q1[0], -q1[1], -q1[2], q1[3] };
+    float q[4];
+    pxQuatMul(qinv, q0, q);
+    const V3 d{ p0.x - p1.x, p0.y - p1.y, p0.z - p1.z };
+    const V3 p = sAToBTwinRotInv ? pxQuatRotateInv(q1[0], q1[1], q1[2], q1[3], d)
+                                 : pxQuatRotate(qinv[0], qinv[1], qinv[2], qinv[3], d);
+    return { fbitsH(q[0]), fbitsH(q[1]), fbitsH(q[2]), fbitsH(q[3]),
+             fbitsH(p.x), fbitsH(p.y), fbitsH(p.z) };
 }
 
 // PxMat33(PxQuat) columns -- what PxBounds3::transformFast takes the absolute
@@ -244,14 +283,14 @@ static std::vector<uint32_t> expectedTriangles(const std::vector<uint32_t>& hf,
     const float oneOverColScale = 1.0f / std::fabs(hfScale.z);
 
     // PxBounds3::transformFast(getInverse(), worldBound) -- the inverse is
-    // materialised FIRST (:191), so the centre is rotInv(q,c) + rotInv(q,-p).
+    // materialised FIRST (:192), so the centre is conj(q).rotate(c) + q.rotateInv(-p).
     const V3 centerW{ (worldMin.x + worldMax.x) * 0.5f, (worldMin.y + worldMax.y) * 0.5f,
                       (worldMin.z + worldMax.z) * 0.5f };
     const V3 extentW{ (worldMax.x - worldMin.x) * 0.5f, (worldMax.y - worldMin.y) * 0.5f,
                       (worldMax.z - worldMin.z) * 0.5f };
     const V3 negP{ -hfT.px, -hfT.py, -hfT.pz };
-    const V3 invP = quatRotateInvH(hfT, negP);
-    const V3 rc = quatRotateInvH(hfT, centerW);
+    const V3 invP = pxQuatRotateInv(hfT.qx, hfT.qy, hfT.qz, hfT.qw, negP);
+    const V3 rc = pxQuatRotate(-hfT.qx, -hfT.qy, -hfT.qz, hfT.qw, centerW);
     const V3 center{ rc.x + invP.x, rc.y + invP.y, rc.z + invP.z };
 
     V3 c0, c1, c2;
@@ -329,6 +368,7 @@ struct Built
     DevBuf hf, hull, cmIn, xf, bnd, cdist, shapes, pair, manifold, stack,
            stackOff, pairsNum, pairsNumPadded;
     std::vector<uint32_t> hfBlob;
+    std::vector<float> xfHost;   // P9.94b: the uploaded transform cache, for the aToB oracle
 };
 
 static const float HF_SCALE_Y = 0.1f;    // int16 heights -> world units
@@ -356,6 +396,7 @@ static Built build(PxgSlangComputeDevice* dev, bool cached)
                               0,0,0,1,  2.0f, 0.3f, 11.0f, 0,     // the off-grid box
                               0,0,0,1,  0,0,0,0 };                // the heightfield
     b.xf = makeDev(dev, xf);
+    b.xfHost = xf;
 
     // PxBounds3, 24 B each, in the same order.
     //
@@ -489,6 +530,28 @@ static void dispatchMidphase(PxgSlangComputeDevice* dev, Built& b)
     dev->flush();
 }
 
+// P9.94b: every record's aToB (words 0..6) bitwise against the literal oracle.
+// Transform-cache slot cm is manager cm's convex, slot 3 the heightfield.
+static void checkRecordsAToB(const std::vector<float>& xf, const std::vector<uint8_t>& pair,
+                             const char* where)
+{
+    const float* q1 = &xf[3 * 8];
+    const V3 p1{ xf[3 * 8 + 4], xf[3 * 8 + 5], xf[3 * 8 + 6] };
+    for (uint32_t cm = 0; cm < 3u; ++cm)
+    {
+        const float* q0 = &xf[cm * 8];
+        const V3 p0{ xf[cm * 8 + 4], xf[cm * 8 + 5], xf[cm * 8 + 6] };
+        const std::array<uint32_t, 7> e = expectedAToB(q1, p1, q0, p0);
+        for (uint32_t w = 0; w < 7u; ++w)
+        {
+            uint32_t got;
+            std::memcpy(&got, pair.data() + cm * 56 + w * 4, 4);
+            PXG_CHECK_MSG(got == e[w], "%s: record %u aToB word %u is 0x%08x, the literal "
+                          "PxTransform::transformInv gives 0x%08x", where, cm, w, got, e[w]);
+        }
+    }
+}
+
 // The two managers' expected sets, from the CPU model.
 static const V3 WMIN[3] = { { -0.5f, -0.4f, -0.5f }, { 2.01f, -0.4f, 2.01f },
                             { 1.00f, -0.4f, 10.0f } };
@@ -596,6 +659,7 @@ PXG_TEST(convexHfMidphasePairs)
     PXG_CHECK_MSG(readU(1, 48) == 9u && readU(1, 52) == 11u,
                   "record 1 materials (%u,%u), expected the SPHERE's 9 then 11",
                   readU(1, 48), readU(1, 52));
+    checkRecordsAToB(b.xfHost, pair, "Pairs");   // P9.94b
 
     std::printf("    [ note ] %zu + %zu pairs over a %ux%u heightfield; manager 1's "
                 "rectangle is decided by the fatten, manager 2 is rejected by the gate\n",
@@ -631,6 +695,7 @@ PXG_TEST(convexHfMidphaseCached)
                       "record %u startIndex is %d, expected the no-pairs sentinel",
                       cm, readI(cm, 28));
     }
+    checkRecordsAToB(b.xfHost, pair, "Cached");   // P9.94b
     std::printf("    [ note ] both managers cached: no walk, no pairs, count == -1\n");
     destroy(dev, b);
 }
@@ -643,7 +708,7 @@ PXG_TEST(convexHfMidphaseRotated)
 
     // Turn the heightfield 90 degrees about y and re-upload the transform cache.
     // WITH AN IDENTITY HEIGHTFIELD every spelling of the bound conversion agrees,
-    // so `Pairs` cannot see it: rotInv(q, c - p) and rotInv(q,c) + rotInv(q,-p)
+    // so `Pairs` cannot see it: rotInv(q, c - p) and conj(q).rotate(c) + q.rotateInv(-p)
     // are the same when q is identity, and quatRotate(q, e_i) equals the PxMat33
     // columns exactly.  This fixture is the one that separates them.
     // A 90-degree turn about y maps local (x,y,z) to world (z,y,-x), so the grid's
@@ -657,6 +722,7 @@ PXG_TEST(convexHfMidphaseRotated)
                               0,0,0,1,  11.0f, 0.3f, -2.0f, 0,
                               0,s,0,s,  1.5f, 0.25f, -0.75f, 0 };
     dev->upload(b.xf.h, xf.data(), xf.size() * sizeof(float));
+    b.xfHost = xf;
 
     const V3 boxMin{ 1.5f, -0.4f, -7.75f }, boxMax{ 5.5f, 1.0f, 0.25f };
     const V3 sphMin{ 1.51f, -0.4f, -3.74f }, sphMax{ 3.48f, 1.0f, -1.77f };
@@ -698,10 +764,93 @@ PXG_TEST(convexHfMidphaseRotated)
                   got0.size(), w0.size());
     PXG_CHECK_MSG(got1 == w1, "rotated manager 1 emitted %zu triangles, expected %zu",
                   got1.size(), w1.size());
+    checkRecordsAToB(b.xfHost, downloadBuffer<uint8_t>(dev, b.pair.h, 3 * 56),
+                     "Rotated");   // P9.94b
 
     std::printf("    [ note ] heightfield turned 90 degrees about y: %zu + %zu pairs, "
                 "bit-exact against the CUDA op order\n", w0.size(), w1.size());
     destroy(dev, b);
+}
+
+// ---------------------------------------------------------------------------
+// P9.94b -- the record's aToB is heightfieldTransform.transformInv(shapeTransform)
+// spelled qinv.rotate(src.p - p) with qinv = q.getConjugate() (PxTransform.h:
+// 167-168), NOT q.rotateInv(src.p - p).  The two agree on every value except the
+// sign of an exact zero, so the inputs below put the convex EXACTLY on the
+// heightfield origin (or at -0 against a +0 origin) and the twin flag proves the
+// old spelling would have stored different bits.
+//
+//   A  identity heightfield at +0, manager 2 at (-0,-0,-0): p0 - p1 = -0 per axis,
+//      and the identity conjugate rotate gives +0 where rotateInv gives -0.
+//      Record 2 aToB.p: {+0,+0,+0} vs the old {-0,-0,-0}.
+//   B  heightfield q1 = (-1/2,1/2,1/2,1/2) at (3.5,0.3,2), manager 0 at the same
+//      point: d = +0.  Record 0 aToB.p {+0,-0,+0} vs the old {-0,+0,+0}; aToB.q
+//      {1/2,-1/2,1/2,1/2}, which also separates the Hamilton operand order.
+// The walk is not asserted (B rotates the grid); the manifolds are far, so the
+// gate invalidates and nothing else is refreshed.
+// ---------------------------------------------------------------------------
+PXG_TEST(convexHfMidphaseAToB)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    struct Sub { const char* name; std::vector<float> xf; uint32_t cm;
+                 uint32_t want[3]; uint32_t old[3]; };
+    const float m0 = -0.0f;
+    const Sub subs[2] = {
+        { "A", { 0,0,0,1, 3.5f,0.3f,2.0f,0,   0,0,0,1, 2.0f,0.3f,2.0f,0,
+                 0,0,0,1, m0,m0,m0,0,         0,0,0,1, 0,0,0,0 },
+          2u, { 0x00000000u, 0x00000000u, 0x00000000u },
+              { 0x80000000u, 0x80000000u, 0x80000000u } },
+        { "B", { 0.5f,0.5f,0.5f,0.5f, 3.5f,0.3f,2.0f,0,   0,0,0,1, 2.0f,0.3f,2.0f,0,
+                 0,0,0,1, 2.0f,0.3f,11.0f,0,  -0.5f,0.5f,0.5f,0.5f, 3.5f,0.3f,2.0f,0 },
+          0u, { 0x00000000u, 0x80000000u, 0x00000000u },
+              { 0x80000000u, 0x00000000u, 0x00000000u } },
+    };
+    for (const Sub& sc : subs)
+    {
+        Built b = build(dev, /*cached*/ false);
+        dev->upload(b.xf.h, sc.xf.data(), sc.xf.size() * sizeof(float));
+        b.xfHost = sc.xf;
+        dispatchMidphase(dev, b);
+        const auto pair = downloadBuffer<uint8_t>(dev, b.pair.h, 3 * 56);
+
+        // The oracle, literal and twin, on the directed record.
+        const float* q1 = &sc.xf[3 * 8];
+        const V3 p1{ sc.xf[28], sc.xf[29], sc.xf[30] };
+        const float* q0 = &sc.xf[sc.cm * 8];
+        const V3 p0{ sc.xf[sc.cm * 8 + 4], sc.xf[sc.cm * 8 + 5], sc.xf[sc.cm * 8 + 6] };
+        const std::array<uint32_t, 7> lit = expectedAToB(q1, p1, q0, p0);
+        sAToBTwinRotInv = true;
+        const std::array<uint32_t, 7> twin = expectedAToB(q1, p1, q0, p0);
+        sAToBTwinRotInv = false;
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            PXG_CHECK_MSG(lit[4 + k] == sc.want[k] && twin[4 + k] == sc.old[k],
+                          "%s: oracle aToB.p[%u] literal 0x%08x / twin 0x%08x, derived "
+                          "0x%08x / 0x%08x", sc.name, k, lit[4 + k], twin[4 + k],
+                          sc.want[k], sc.old[k]);
+        }
+        PXG_CHECK_MSG(lit != twin, "%s: the input no longer separates the literal "
+                      "transformInv from quatRotateInv(q1, p0 - p1)", sc.name);
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            uint32_t got;
+            std::memcpy(&got, pair.data() + sc.cm * 56 + (4 + k) * 4, 4);
+            PXG_CHECK_MSG(got == lit[4 + k], "%s: record %u aToB.p[%u] is 0x%08x, the "
+                          "literal transformInv gives 0x%08x (old spelling 0x%08x)",
+                          sc.name, sc.cm, k, got, lit[4 + k], twin[4 + k]);
+        }
+        if (sc.name[0] == 'B')
+        {
+            const uint32_t wq[4] = { 0x3f000000u, 0xbf000000u, 0x3f000000u, 0x3f000000u };
+            for (uint32_t k = 0; k < 4u; ++k)
+                PXG_CHECK_MSG(lit[k] == wq[k], "B: oracle aToB.q[%u] 0x%08x, derived 0x%08x",
+                              k, lit[k], wq[k]);
+        }
+        checkRecordsAToB(b.xfHost, pair, sc.name);
+        destroy(dev, b);
+    }
+    std::printf("    [ note ] aToB zero signs: A record 2 {+0,+0,+0}, B record 0 "
+                "{+0,-0,+0}; the rotateInv spelling stores the opposite signs\n");
 }
 
 }  // namespace

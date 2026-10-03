@@ -176,7 +176,7 @@ static ChRef refCh(const ChCase& cs, const std::vector<ChContact>& manifold, uin
     const V3 centerW = mul(add(v3(cs.boundMin), v3(cs.boundMax)), 0.5f);
     const V3 extentW = mul(sub(v3(cs.boundMax), v3(cs.boundMin)), 0.5f);
     const V3 invP = quatRotateInv(q, { -cs.hfP.x, -cs.hfP.y, -cs.hfP.z });
-    const V3 center = add(quatRotateInv(q, centerW), invP);
+    const V3 center = add(quatRotate(qinv, centerW), invP);   // P9.94b: inv.q.rotate(c) + inv.p
     const float x = qinv.x, y = qinv.y, z = qinv.z, w = qinv.w;
     const float x2 = x + x, y2 = y + y, z2 = z + z;
     const float xx = x2 * x, yy = y2 * y, zz = z2 * z;

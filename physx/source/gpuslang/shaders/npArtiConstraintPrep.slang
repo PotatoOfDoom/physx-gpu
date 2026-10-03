@@ -881,6 +881,39 @@ void acpSetupTest(uint3 dispatchThreadId : SV_DispatchThreadID)
     pio[lane] = uint4(io.x, io.y, io.z, written);
 }
 
+// ---------------------------------------------------------------------------
+// P9.94b: helper-level probe of alignedTransformInvTransform (pxgSlangPrepCommon)
+// -- PxAlignedTransform::transformInv(PxAlignedTransform), the body1ToBody0 of
+// getFrictionPatches.  Its p differs from the old quatRotateInv spelling only in
+// the sign of an exact zero, which no kernel output can see (pointsAreClose
+// erases it), so the revert mutant is killed here, one 32-byte transform per lane.
+// Test-only entry: no manifest row.
+// ---------------------------------------------------------------------------
+
+struct AtiParams
+{
+    uint64_t a;    // @0  PxAlignedTransform per lane (this)
+    uint64_t b;    // @8  PxAlignedTransform per lane (src)
+    uint64_t out;  // @16 PxAlignedTransform per lane
+    uint n;        // @24
+    uint pad;      // @28 -> 32
+}
+
+[[vk::push_constant]]
+ConstantBuffer<AtiParams> gAti;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void acpTransformInvProbe(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint lane = dispatchThreadId.x;
+    if (lane >= gAti.n)
+        return;
+    (Ptr<PxgAlignedTransform>(gAti.out))[lane] =
+        alignedTransformInvTransform((Ptr<PxgAlignedTransform>(gAti.a))[lane],
+                                     (Ptr<PxgAlignedTransform>(gAti.b))[lane]);
+}
+
 // ===========================================================================
 // P8.102c: the ENGINE entry -- artiTGSContactConstraintBlockPrepareLaunch
 // (artiConstraintPrep2.cu:1388 -> artiContactConstraintBlockPrepare :1201

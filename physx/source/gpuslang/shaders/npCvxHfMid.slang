@@ -271,7 +271,11 @@ void chMidphase(uint3 dtid : SV_DispatchThreadID)
         const float3 centerW = (cs.boundMin.xyz + cs.boundMax.xyz) * 0.5f;
         const float3 extentW = (cs.boundMax.xyz - cs.boundMin.xyz) * 0.5f;
         const float3 invP = quatRotateInv(cs.hfQ, -cs.hfP.xyz);
-        const float3 center = quatRotateInv(cs.hfQ, centerW) + invP;
+        // P9.94b: inv.transform(c) = conj(q).rotate(c) + inv.p (PxTransform.h:131);
+        // equivalent to quatRotateInv(q, c) at every stored output (centre only
+        // feeds compares/floor/ceil, nothing derived from it is stored) -- the
+        // sweep mutant p994-chmid-center-rotinv survives for exactly that reason.
+        const float3 center = quatRotate(qinv, centerW) + invP;
         float3 c0, c1, c2;
         quatBasis(qinv, c0, c1, c2);
         const float3 e0 = c0 * extentW.x;

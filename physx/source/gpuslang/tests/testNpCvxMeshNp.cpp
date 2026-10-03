@@ -574,6 +574,9 @@ static CmRef refSphere(const CmCase& cs, const CmMesh& mesh, const std::vector<U
     return ro;
 }
 
+// P9.94b twin of cmCapsuleTri's mtcP: false = the CUDA (conj(aQ).rotate), true = aQ.rotateInv.
+static bool gMtcPRotInvTwin = false;
+
 static CmRef refCapsule(const CmCase& cs, const CmMesh& mesh, const std::vector<U4>& pairRec)
 {
     CmRef ro;
@@ -584,8 +587,13 @@ static CmRef refCapsule(const CmCase& cs, const CmMesh& mesh, const std::vector<
     const float contactDist = cs.aP.w;
     const float radius = cs.scale.w;
     const float halfHeight = cs.mP.w;
-    const F4 mtcQ = quatMul(quatConj(cs.aQ), cs.mQ);
-    const V3 mtcP = quatRotateInv(cs.aQ, sub(v3(cs.mP), v3(cs.aP)));
+    // P9.94b: meshToCapsule = capsuleT.transformInv(meshT) (convexMesh.cu:443) is, per
+    // PxTransform.h:162-168, (conj(aQ) * mQ, conj(aQ).rotate(mP - aP)); gMtcPRotInvTwin restores
+    // the pre-P9.94b spelling aQ.rotateInv(mP - aP).
+    const F4 aQinv = quatConj(cs.aQ);
+    const F4 mtcQ = quatMul(aQinv, cs.mQ);
+    const V3 mtcP = gMtcPRotInvTwin ? quatRotateInv(cs.aQ, sub(v3(cs.mP), v3(cs.aP)))
+                                    : quatRotate(aQinv, sub(v3(cs.mP), v3(cs.aP)));
     const V3 tmp = mul(basis0(cs.aQ), halfHeight);
     const V3 center = quatRotateInv(cs.mQ, sub(v3(cs.aP), v3(cs.mP)));
     const V3 dir = quatRotateInv(cs.mQ, tmp);
@@ -1106,6 +1114,80 @@ PXG_TEST(npCvxMeshNp_sphere)
 PXG_TEST(npCvxMeshNp_capsule)
 {
     checkKind("cmCapsuleTri", true, 1060702);
+}
+
+// P9.94b: meshToCapsule = capsuleT.transformInv(meshT) (convexMesh.cu:443, consumed by
+// meshToCapsule.transform(contacts[i]) at :573) spells conj(aQ).rotate(mP - aP)
+// (PxTransform.h:162-168), not aQ.rotateInv(mP - aP).  aQ = (1,-0,0,0) at aP = (0,0,1),
+// mQ = (-1,-0,0,0) at mP = 0, so d = (+0,+0,-1): CUDA mtcP = (+0,+0,1), old (+0,-0,1);
+// mtcQ = (+0,+0,+0,-1).  The capsule (radius 0.5, halfHeight 0.5, cd 0.25) lies in mesh space on
+// center (+0,-0,-1), dir (0.5,+0,-0), above the one boundary triangle at z = -1.5: sqDist = 0.25,
+// patchNormal = triNormal (not deferred), contacts p0 and p1 with separation 0.5 each.
+// quatRotate(mtcQ, p1 = (-0.5,-0,-1)).y = -0 (all three terms -0), so temp contact [1].y is
+// mtcP.y + (-0): CUDA 0x00000000, old 0x80000000.  Every product is exact; every output word of
+// the case is compared bitwise (kept separate from checkKind, whose float == is sign-blind).
+PXG_TEST(npCvxMeshNp_capsuleMtcPZeroSign)
+{
+    CmMesh mesh;
+    mesh.verts = { { -2, -2, -1.5f, 0 }, { 2, -2, -1.5f, 0 }, { 0, 2, -1.5f, 0 } };
+    mesh.tris = { { 0, 1, 2, 0 } };
+    mesh.adj = { { BOUNDARY, BOUNDARY, BOUNDARY, 0 } };
+    mesh.remap = { 0x301u };
+    const std::vector<U4> pairRec = { { 0, 0, 0, 0 } };
+    CmCase cs{};
+    cs.aQ = { 1, -0.0f, 0, 0 };
+    cs.aP = { 0, 0, 1, 0.25f };
+    cs.mQ = { -1, -0.0f, 0, 0 };
+    cs.mP = { 0, 0, 0, 0.5f };
+    cs.scale = { 1, 1, 1, 0.5f };
+    cs.scaleRot = { 0, 0, 0, 1 };
+    cs.pair = { 0, 0, 0, (1u << 28) | 1u };
+    cs.mesh = { 0, 0, 0, 0 };
+    const std::vector<CmCase> cases = { cs };
+
+    const CmRef ro = refCapsule(cs, mesh, pairRec);
+    gMtcPRotInvTwin = true;
+    const CmRef tw = refCapsule(cs, mesh, pairRec);
+    gMtcPRotInvTwin = false;
+    std::printf("  [capsuleMtcPZeroSign] nb cuda=%u twin=%u delay=%d, cts[1].y cuda=%08x twin=%08x, cts[0].y %08x/%08x\n",
+                ro.nb, tw.nb, int(ro.delay), asU32(ro.cts[1].y), asU32(tw.cts[1].y), asU32(ro.cts[0].y), asU32(tw.cts[0].y));
+    PXG_CHECK_MSG(ro.nb == 2 && tw.nb == 2 && !ro.delay && asU32(ro.cts[1].y) == 0x00000000u &&
+                  asU32(tw.cts[1].y) == 0x80000000u,
+                  "capsuleMtcPZeroSign: the rotateInv twin no longer flips temp contact [1].y (cuda %08x, twin %08x, nb %u)",
+                  asU32(ro.cts[1].y), asU32(tw.cts[1].y), ro.nb);
+
+    const uint32_t poolN = 4, spCap = 4, tcCap = 4;
+    const CmRun r = runCm("cmCapsuleTri", cases, mesh, pairRec, poolN, spCap, tcCap);
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t g, uint32_t w) {
+        if (g != w) { ++mm; std::printf("  %s gpu=%08x ref=%08x\n", what, g, w); }
+    };
+    cmp("counters[0]", r.counters[0], 0u);
+    cmp("counters[1]", r.counters[1], ro.nb);
+    const F4 ni = r.ni[ro.pairOffset];
+    cmp("ni.x", asU32(ni.x), asU32(ro.niNormal.x));
+    cmp("ni.y", asU32(ni.y), asU32(ro.niNormal.y));
+    cmp("ni.z", asU32(ni.z), asU32(ro.niNormal.z));
+    cmp("ni.w", asU32(ni.w), ro.niIndex);
+    cmp("depth", asU32(r.depth[ro.pairOffset]), asU32(ro.maxDepth));
+    cmp("interm", r.interm[ro.pairOffset], cs.pair.y);
+    cmp("ordered", r.ordered[ro.padOffset], ro.ordered);
+    cmp("dbg.x", asU32(r.dbg[0].x), asU32(float(ro.nb)));
+    cmp("dbg.y", asU32(r.dbg[0].y), asU32(ro.maxDepth));
+    cmp("dbg.z", asU32(r.dbg[0].z), asU32(ro.delay ? 1.0f : 0.0f));
+    cmp("dbg.w", asU32(r.dbg[0].w), asU32(ro.edge ? 1.0f : 0.0f));
+    const uint32_t idx = r.ctsIdx[ro.pairOffset];
+    cmp("ctsIdx", idx, 0u);
+    if (idx == 0u)
+        for (uint32_t k = 0; k < ro.nb; ++k)
+        {
+            const F4 got = r.temp[idx + k];
+            cmp("temp.x", asU32(got.x), asU32(ro.cts[k].x));
+            cmp("temp.y", asU32(got.y), asU32(ro.cts[k].y));
+            cmp("temp.z", asU32(got.z), asU32(ro.cts[k].z));
+            cmp("temp.w", asU32(got.w), asU32(ro.seps[k]));
+        }
+    PXG_CHECK_MSG(mm == 0, "capsuleMtcPZeroSign: %zu word mismatches", mm);
 }
 
 } // namespace

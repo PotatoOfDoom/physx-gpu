@@ -666,9 +666,13 @@ void cmCapsuleTri(uint3 dtid : SV_DispatchThreadID)
         const float capsuleRadius = cs.scale.w;
         const float capsuleHalfHeight = cs.mP.w;
 
-        // meshToCapsule = capsuleT.transformInv(meshT)
-        const float4 mtcQ = quatMul(quatConjugate(cs.aQ), cs.mQ);
-        const float3 mtcP = quatRotateInv(cs.aQ, cs.mP.xyz - cs.aP.xyz);
+        // meshToCapsule = capsuleT.transformInv(meshT)  (convexMesh.cu:443).
+        // P9.94b: PxTransform::transformInv (PxTransform.h:162-168) rotates by
+        // the conjugate FORWARD (`qinv.rotate(src.p - p)`), not by q.rotateInv;
+        // the two differ in the sign of a zero lane.
+        const float4 aQinv = quatConjugate(cs.aQ);
+        const float4 mtcQ = quatMul(aQinv, cs.mQ);
+        const float3 mtcP = quatRotate(aQinv, cs.mP.xyz - cs.aP.xyz);
 
         // capsule segment in mesh space
         const float3 tmp = quatBasisVector0(cs.aQ) * capsuleHalfHeight;

@@ -315,10 +315,14 @@ public PrimContact planeCapsuleContact(float4 q0, float3 p0, float4 q1, float3 p
 {
     PrimContact c = emptyContact();
 
-    // bToA = transform0.transformInv(transform1)
+    // bToA = transform0.transformInv(transform1)  (sphereCollision.cuh:527).
+    // P9.94b: PxTransform::transformInv (PxTransform.h:162-168) is
+    // `qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q)` -- the
+    // conjugate's FORWARD rotate, not q.rotateInv: the two differ in the sign
+    // of a zero lane (the cross term enters negated vs. with negated factors).
     const float4 qinv = quatConjugate(q0);
     const float4 bToAq = quatMul(qinv, q1);
-    const float3 bToAp = quatRotateInv(q0, p1 - p0);
+    const float3 bToAp = quatRotate(qinv, p1 - p0);
 
     const float3 planeNormal = normalize3(quatBasisVector0(q0));
     const float3 outN = -planeNormal;

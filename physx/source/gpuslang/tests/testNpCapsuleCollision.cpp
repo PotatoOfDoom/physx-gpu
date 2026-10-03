@@ -137,12 +137,20 @@ void pcm22(V3 a0, V3 b0, V3 a1, V3 b1, V3 p0, V3 p1, V3 p2, V3 p3,
 
 struct Result { uint32_t nb; V3 pt[2]; float pen[2]; V3 normal; };
 
+// P9.94b twin of planeCapsuleContact's bToAp: false = the CUDA (conj(q0).rotate), true = the old
+// q0.rotateInv spelling.  File-local.
+static bool gPlaneCapsuleRotInvTwin = false;
+
 Result refPlaneCapsule(const XformC& t0, const XformC& t1, const CapsuleTest& c)
 {
     Result r{}; r.nb = 0;
     Quat q0 = qof(t0);
-    Quat bToAq = qmul(conj(q0), qof(t1));
-    V3 bToAp = qrotInv(q0, sub(pof(t1), pof(t0)));
+    // P9.94b: bToA = transform0.transformInv(transform1) (sphereCollision.cuh:527) is, per
+    // PxTransform.h:162-168, qinv = q0.getConjugate(); (qinv.rotate(p1 - p0), qinv * q1).
+    // gPlaneCapsuleRotInvTwin restores the pre-P9.94b spelling q0.rotateInv(p1 - p0).
+    const Quat q0inv = conj(q0);
+    Quat bToAq = qmul(q0inv, qof(t1));
+    V3 bToAp = gPlaneCapsuleRotInvTwin ? qrotInv(q0, sub(pof(t1), pof(t0))) : qrot(q0inv, sub(pof(t1), pof(t0)));
     V3 planeNormal = normalize(basis0(q0));
     r.normal = mul(planeNormal, -1.f);
     V3 bv = basis0(bToAq);
@@ -422,6 +430,56 @@ PXG_TEST(npCapsuleCollision_capsuleCapsuleZeroSign)
     }
     PXG_CHECK_MSG(mm == 0, "capsuleCapsuleZeroSign: %zu mismatches", mm);
     PXG_CHECK_MSG(zeroLanes >= 3 * N, "capsuleCapsuleZeroSign: only %zu +-0 reference lanes compared bitwise", zeroLanes);
+    for (PxgBufferHandle h : { b0, b1, bt, bpp, bn, bnb }) dev->destroyBuffer(h);
+}
+
+// P9.94b: planeCapsuleContact's bToA = transform0.transformInv(transform1) (sphereCollision.cuh:527)
+// spells conj(q0).rotate(p1 - p0) (PxTransform.h:162-168), which is not bitwise q0.rotateInv(p1 - p0).
+// The plane is turned 180 deg about x (q0 = (1,0,0,0); its normal stays +x) and sits at p0 = (0,-0,0);
+// the capsule (q1 = q0, halfHeight 1, radius 0.5, contactDist 0.125) is at p1 = (0,0,-1).
+// v = p1 - p0 = (+0,+0,-1): CUDA bToAp = (+0,-0,1), old (+0,+0,1).  segE = bToAp - (1,+0,+0) carries
+// the y sign, q0.rotate(segE).y flips it (its other two terms are -0), + p0.y (-0) - n.y*r (+0) keep
+// it: the stored contact point y is CUDA 0x00000000, old 0x80000000.  Every product is exact.
+PXG_TEST(npCapsuleCollision_planeCapsuleZeroSign)
+{
+    const uint32_t N = 1;
+    std::vector<XformC> x0 = { { 0.0f, -0.0f, 0.0f, 0, 1, 0, 0, 0 } };
+    std::vector<XformC> x1 = { { 0.0f, 0.0f, -1.0f, 0, 1, 0, 0, 0 } };
+    CapsuleTest c{}; c.radius0 = 0.5f; c.halfHeight0 = 1.0f; c.contactDist = 0.125f;
+    std::vector<CapsuleTest> tests = { c };
+    const Result ref = refPlaneCapsule(x0[0], x1[0], tests[0]);
+    gPlaneCapsuleRotInvTwin = true;
+    const Result twin = refPlaneCapsule(x0[0], x1[0], tests[0]);
+    gPlaneCapsuleRotInvTwin = false;
+    std::printf("  [planeCapsuleZeroSign] nb cuda=%u twin=%u, pt[0].y cuda=%08x twin=%08x\n",
+                ref.nb, twin.nb, f2u(ref.pt[0].y), f2u(twin.pt[0].y));
+    PXG_CHECK_MSG(ref.nb == 1 && twin.nb == 1 && f2u(ref.pt[0].y) == 0x00000000u && f2u(twin.pt[0].y) == 0x80000000u,
+                  "planeCapsuleZeroSign: the rotateInv twin no longer flips pt[0].y (cuda %08x, twin %08x)",
+                  f2u(ref.pt[0].y), f2u(twin.pt[0].y));
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<F4> outPP(2 * N, F4{ 9, 9, 9, 9 }), outN(N, F4{ 9, 9, 9, 9 });
+    std::vector<uint32_t> outNb(N, 7);
+    PxgBufferHandle b0 = createBufferFrom(dev, x0), b1 = createBufferFrom(dev, x1), bt = createBufferFrom(dev, tests);
+    PxgBufferHandle bpp = createBufferFrom(dev, outPP), bn = createBufferFrom(dev, outN), bnb = createBufferFrom(dev, outNb);
+    struct CapsuleParams { uint32_t numTests; } p = { N };
+    Kernel k("npCapsuleCollision.spv", "planeCapsule", { 32, 32, 32, 16, 16, 4 }, sizeof(CapsuleParams));
+    k.dispatch(1, { b0, b1, bt, bpp, bn, bnb }, p); dev->flush();
+    const auto gPP = downloadBuffer<F4>(dev, bpp, 2 * N);
+    const auto gN = downloadBuffer<F4>(dev, bn, N);
+    const auto gNb = downloadBuffer<uint32_t>(dev, bnb, N);
+    // Every lane is exact IEEE arithmetic (products of 0, +-1, 1/2, 2): compare all 7 bitwise.
+    size_t mm = 0;
+    if (gNb[0] != ref.nb) { ++mm; std::printf("  nb gpu=%u ref=%u\n", gNb[0], ref.nb); }
+    const float gv[7] = { gN[0].x, gN[0].y, gN[0].z, gPP[0].x, gPP[0].y, gPP[0].z, gPP[0].w };
+    const float rv[7] = { ref.normal.x, ref.normal.y, ref.normal.z, ref.pt[0].x, ref.pt[0].y, ref.pt[0].z, ref.pen[0] };
+    for (uint32_t l = 0; l < 7; ++l)
+        if (f2u(gv[l]) != f2u(rv[l]))
+        {
+            ++mm;
+            std::printf("  lane %u gpu=%08x (%g) ref=%08x (%g)\n", l, f2u(gv[l]), gv[l], f2u(rv[l]), rv[l]);
+        }
+    PXG_CHECK_MSG(mm == 0, "planeCapsuleZeroSign: %zu mismatches", mm);
     for (PxgBufferHandle h : { b0, b1, bt, bpp, bn, bnb }) dev->destroyBuffer(h);
 }
 

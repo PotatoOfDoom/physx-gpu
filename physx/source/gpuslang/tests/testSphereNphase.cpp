@@ -247,10 +247,16 @@ static RC refSphereBox(TransformV t0, TransformV t1, float sphereR, Vec3 boxExte
     return R;
 }
 
+// P9.94b twin of planeCapsuleContact's bToA.p (sphereCollision.cuh:527): false = the CUDA's
+// PxTransform::transformInv (conj(q).rotate(p1 - p0), pxgRefMath.h TransformV::transformInv),
+// true = the pre-P9.94b npSpherePrimitives spelling q.rotateInv(p1 - p0).
+static bool gPlaneCapsuleRotInvTwin = false;
+
 static RC refPlaneCapsule(TransformV t0, TransformV t1, float radius, float hh, float cd)
 {
     RC R;
-    const TransformV bToA = t0.transformInv(t1);
+    TransformV bToA = t0.transformInv(t1);
+    if (gPlaneCapsuleRotInvTwin) bToA.p = t0.q.rotateInv(t1.p - t0.p);
     const Vec3 planeNormal = t0.q.getBasisVector0().getNormalized();
     const Vec3 outN = -planeNormal;
     const Vec3 basis = bToA.q.getBasisVector0();
@@ -958,6 +964,44 @@ PXG_TEST(sphereNphase_capsuleCapsuleZeroSign)
                       i, fbits(R.normal.z), cudaW6[i]);
     }
     checkSphere(cfgs, 0x00000000u, false, "capsZeroSign", true);
+}
+
+// P9.94b engine route of npCapsuleCollision_planeCapsuleZeroSign: plane-capsule's bToA =
+// transform0.transformInv(transform1) (sphereCollision.cuh:527) is conj(q0).rotate(p1 - p0)
+// (PxTransform.h:162-168), not q0.rotateInv(p1 - p0).  Plane q0 = (1,0,0,0) (180 deg about x, the
+// normal stays +x) at p0 = (0,-0,0); capsule q1 = q0 at p1 = (0,0,-1), halfHeight 1, radius 0.5,
+// cDist 0.0625 + 0.0625.  CUDA bToAp = (+0,-0,1), old (+0,+0,1); the y sign survives segE and
+// q0.rotate into the stored contact point y: CUDA 0x00000000, old 0x80000000 (one contact; the
+// patch normal is (-1,-0,-0)).  strictZero compares that lane and normal words 5-6 bitwise.
+PXG_TEST(sphereNphase_planeCapsuleZeroSign)
+{
+    std::vector<PairCfg> cfgs;
+    cfgs.push_back({ GT_PLANE, Vec3(1, 1, 1), TransformV(QuatV(1, 0, 0, 0), Vec3(0, -0.0f, 0)),
+                     GT_CAPSULE, Vec3(1.0f /*hh*/, 0.5f /*r*/, 0), TransformV(QuatV(1, 0, 0, 0), Vec3(0, 0, -1)),
+                     0.125f, 1, 2 });
+    const RC R = refDispatch(cfgs[0]);
+    gPlaneCapsuleRotInvTwin = true;
+    const RC T = refDispatch(cfgs[0]);
+    gPlaneCapsuleRotInvTwin = false;
+    std::printf("  [planeCapsuleZeroSign] nb cuda=%d twin=%d, pt[0].y cuda=%08x twin=%08x, normal=(%08x,%08x,%08x)\n",
+                R.nb, T.nb, fbits(R.pt[0].y), fbits(T.pt[0].y), fbits(R.normal.x), fbits(R.normal.y), fbits(R.normal.z));
+    PXG_CHECK_MSG(R.nb == 1 && T.nb == 1 && fbits(R.pt[0].y) == 0x00000000u && fbits(T.pt[0].y) == 0x80000000u,
+                  "planeCapsuleZeroSign: the rotateInv twin no longer flips pt[0].y (cuda %08x, twin %08x)",
+                  fbits(R.pt[0].y), fbits(T.pt[0].y));
+    checkSphere(cfgs, 0x00000000u, false, "planeCapsuleZeroSign", true);
+
+    // The composition order of bToA.q = conj(q0) * q1 as well: allSubCases' only plane-capsule
+    // pair has an identity plane, under which the product commutes.  Plane turned 90 deg about z
+    // (normal +y), capsule turned 90 deg about x at p1 = (0, 0.5, 0): conj(q0) * q1 lays the
+    // segment along the plane's -y, q1 * conj(q0) along its -z -- two contacts either way, at
+    // different points (tolerance compare).
+    const float h = 0.70710678f;
+    std::vector<PairCfg> order;
+    order.push_back({ GT_PLANE, Vec3(1, 1, 1), TransformV(QuatV(0, 0, h, h), Vec3(0, 0, 0)),
+                      GT_CAPSULE, Vec3(1.0f /*hh*/, 0.5f /*r*/, 0), TransformV(QuatV(h, 0, 0, h), Vec3(0, 0.5f, 0)),
+                      0.1f, 1, 2 });
+    PXG_CHECK_MSG(refDispatch(order[0]).nb == 2, "planeCapsuleOrder: the pair no longer makes two contacts");
+    checkSphere(order, 0x00000000u, false, "planeCapsuleOrder");
 }
 
 // P9.90: the dot order of the primitive routines, observed bitwise.  npSpherePrimitives spells

@@ -135,9 +135,13 @@ void cvxPlaneRefresh(uint3 dtid : SV_DispatchThreadID)
     const float3 convexTp = s.convexTp.xyz;
     const float toleranceLength = s.scale.w;
 
-    // bToA = planeTransform.transformInv(convexTransform)
-    const float4 bToAq = quatMul(float4(-planeTq.x, -planeTq.y, -planeTq.z, planeTq.w), convexTq);
-    const float3 bToAp = quatRotateInv(planeTq, convexTp - planeTp);
+    // bToA = planeTransform.transformInv(convexTransform)  (cudaGJKEPA.cu:2860).
+    // P9.94b: PxTransform::transformInv (PxTransform.h:162-168) rotates by the
+    // conjugate FORWARD (`qinv.rotate(src.p - p)`), not by q.rotateInv -- the
+    // two differ in the sign of a zero lane of the stored bToAp.
+    const float4 planeQinv = float4(-planeTq.x, -planeTq.y, -planeTq.z, planeTq.w); // PxQuat::getConjugate
+    const float4 bToAq = quatMul(planeQinv, convexTq);
+    const float3 bToAp = quatRotate(planeQinv, convexTp - planeTp);
 
     // n = bToA.rotateInv(localNormal=(1,0,0)).getNormalized()
     const float3 n = getNormalized(quatRotateInv(bToAq, float3(1, 0, 0)));

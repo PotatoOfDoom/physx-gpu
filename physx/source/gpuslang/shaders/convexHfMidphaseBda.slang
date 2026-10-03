@@ -114,7 +114,7 @@
 //       not define.
 //
 //   F1  "don't materialise the inverse" -- rotInv(q, c - p) instead of
-//       rotInv(q, c) + rotInv(q, -p).
+//       conj(q).rotate(c) + q.rotateInv(-p).
 //   F2  "build the basis with quatRotate(q, e_i)" instead of the PxMat33 columns.
 //
 // F1 and F2 are the P9.37 class: the same value in exact arithmetic, at most a
@@ -123,6 +123,16 @@
 // fixture cannot place on purpose and should not pretend to.  They are kept in
 // the sweep as a tripwire for a future change that makes them observable, and the
 // reason the port spells them the CUDA's way is the transcription, not a mutant.
+//
+// P9.94b adds two zero-sign-equivalent survivors of the same kind as H1:
+//   p994-hf-center-rotinv  quatRotateInv(q1, centerW) for quatRotate(qinv, centerW)
+//   p994-hf-invp-conj      quatRotate(qinv, -p1) for quatRotateInv(q1, -p1)
+// Both spellings agree bit for bit except the sign of an exact zero.  The centre
+// only reaches +-extent, the per-axis scale multiply, the negative-scale swap,
+// '<'/'>' against 0 and nbRows-1/nbCols-1, floor()/ceil() to int (+-0 -> 0) and
+// min/max-height comparisons against int16-derived heights (never -0); no float
+// derived from it is stored, by this port or by the CUDA.  No input can change a
+// stored bit.  (aToB, by contrast, IS stored, and its spelling is fixture-killed.)
 
 module convexHfMidphaseBda;
 
@@ -312,10 +322,14 @@ void convexHeightFieldMidphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gro
         const float3 p1 = float3(Ptr<float>(xf1 + 16UL)[0], Ptr<float>(xf1 + 20UL)[0],
                                  Ptr<float>(xf1 + 24UL)[0]);
 
-        // heightfieldTransform.transformInv(shapeTransform): q = conj(q1)*q0,
-        // p = rotInv(q1, p0 - p1)   (convexHFMidphase.cu:109)
-        const float4 aToBq = quatMul(quatConjugate(q1), q0);
-        const float3 aToBp = quatRotateInv(q1, p0 - p1);
+        // heightfieldTransform.transformInv(shapeTransform) (convexHFMidphase.cu:109), as
+        // PxTransform.h:167-168 spells it: qinv = q.getConjugate(); (qinv.rotate(src.p - p),
+        // qinv * src.q).  P9.94b: NOT quatRotateInv(q1, p0 - p1) -- equal except the sign of
+        // exact zeros (q1 = (-1/2,1/2,1/2,1/2), p0 == p1: (+0,-0,+0) here, (-0,+0,+0) via
+        // rotateInv), and aToB is a stored record output (convexHFMidphase.cu:337).
+        const float4 q1inv = quatConjugate(q1);
+        const float4 aToBq = quatMul(q1inv, q0);
+        const float3 aToBp = quatRotate(q1inv, p0 - p1);
 
         const float3 shapeScale = float3(shape.scaleX, shape.scaleY, shape.scaleZ);
         const uint64_t hullPtr = uint64_t(shape.hullOrMeshOffset.x) |
@@ -387,7 +401,7 @@ void convexHeightFieldMidphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gro
             // The convex's WORLD bound, taken to heightfield space by
             // PxBounds3::transformFast(getInverse(), worldBound) -- and in the
             // CUDA's op order: the inverse is materialised FIRST, so the centre
-            // is rotInv(q, c) + rotInv(q, -p) rather than rotInv(q, c - p).
+            // is conj(q).rotate(c) + q.rotateInv(-p) rather than rotInv(q, c - p).
             // Those differ in the last bits, and P9.37 is the tranche that
             // learned to care.
             float3 worldMin, worldMax;
@@ -397,7 +411,7 @@ void convexHeightFieldMidphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gro
             const float3 centerW = (worldMin + worldMax) * 0.5f;
             const float3 extentW = (worldMax - worldMin) * 0.5f;
             const float3 invP = quatRotateInv(q1, -p1);
-            const float3 center = quatRotateInv(q1, centerW) + invP;
+            const float3 center = quatRotate(qinv, centerW) + invP; // P9.94b: inv.q.rotate(c)
             float3 c0, c1, c2;
             chQuatBasis(qinv, c0, c1, c2);
             const float3 e0 = c0 * extentW.x;

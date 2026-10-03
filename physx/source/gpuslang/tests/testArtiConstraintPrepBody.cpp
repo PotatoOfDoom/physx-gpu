@@ -334,3 +334,210 @@ PXG_TEST(artiConstraintPrepBody)
 
     for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
 }
+
+// ---------------------------------------------------------------------------
+// P9.94b: helper-level probe of pxgSlangPrepCommon::alignedTransformInvTransform
+// (= PxAlignedTransform::transformInv(PxAlignedTransform), AlignedTransform.h:213-220,
+// the body1ToBody0 of getFrictionPatches): qinv = q.getConjugate();
+// (qinv.rotate(src.p - p), qinv * src.q).  The pre-P9.94b port spelled p as
+// q.rotateInv(src.p - p), which differs only in the sign of an exact zero -- and
+// pointsAreClose() erases that before any kernel output, so the revert is
+// killed HERE, on all 8 words of every lane, against the engine's own
+// transformInv.  sAtiTwinRotateInv restores the old spelling in the host
+// mirror; the fixture requires that the twin differs on at least one
+// dispatched-and-compared lane (and on the known member, lane 0).
+//
+// Inputs: this.q over every unit quaternion with components in
+// {+-0, +-1/2, +-sqrt(1/2), +-1} (zero signs enumerated: 64 + 96 + 16 = 176),
+// times 65 position cases (case 0: this.p == src.p == (1,2,3,0), delta +0;
+// cases 1..64: this.p = +0, src.p = delta in {+0,-0,+1,-1}^3), times two src.q
+// (identity, and a member of the same set).
+// ---------------------------------------------------------------------------
+
+namespace
+{
+// P9.94b TWIN flag: true restores the pre-P9.94b spelling q.rotateInv(src.p - p).
+static bool sAtiTwinRotateInv = false;
+
+static PxAlignedTransform atiTransformInv(const PxAlignedTransform& a, const PxAlignedTransform& b)
+{
+    if (!sAtiTwinRotateInv)
+        return a.transformInv(b);   // the engine's own AlignedTransform.h:213-220
+    return PxAlignedTransform(a.q.rotateInv(b.p - a.p), a.q.getConjugate() * b.q);
+}
+
+static float atiSigned(float mag, bool neg) { return neg ? -mag : mag; }
+
+static void atiQuats(std::vector<PxAlignedQuat>& out)
+{
+    const float s = 0.70710678118654752f;   // sqrt(1/2), float-rounded
+    float c[4];
+    // one +-1, three +-0
+    for (uint32_t k = 0; k < 4; ++k)
+        for (uint32_t m = 0; m < 16; ++m)
+        {
+            uint32_t zi = 0;
+            for (uint32_t i = 0; i < 4; ++i)
+                c[i] = (i == k) ? atiSigned(1.0f, (m & 8u) != 0) : atiSigned(0.0f, ((m >> zi++) & 1u) != 0);
+            out.push_back(PxAlignedQuat(c[0], c[1], c[2], c[3]));
+        }
+    // two +-sqrt(1/2), two +-0
+    for (uint32_t i0 = 0; i0 < 4; ++i0)
+        for (uint32_t i1 = i0 + 1; i1 < 4; ++i1)
+            for (uint32_t m = 0; m < 16; ++m)
+            {
+                uint32_t zi = 0;
+                for (uint32_t i = 0; i < 4; ++i)
+                {
+                    if (i == i0)
+                        c[i] = atiSigned(s, (m & 4u) != 0);
+                    else if (i == i1)
+                        c[i] = atiSigned(s, (m & 8u) != 0);
+                    else
+                        c[i] = atiSigned(0.0f, ((m >> zi++) & 1u) != 0);
+                }
+                out.push_back(PxAlignedQuat(c[0], c[1], c[2], c[3]));
+            }
+    // four +-1/2
+    for (uint32_t m = 0; m < 16; ++m)
+        out.push_back(PxAlignedQuat(atiSigned(0.5f, (m & 1u) != 0), atiSigned(0.5f, (m & 2u) != 0),
+                                    atiSigned(0.5f, (m & 4u) != 0), atiSigned(0.5f, (m & 8u) != 0)));
+}
+
+static bool atiSameBits(const PxAlignedTransform& x, const PxAlignedTransform& y)
+{
+    return std::memcmp(&x, &y, sizeof(PxAlignedTransform)) == 0;
+}
+
+static_assert(sizeof(PxAlignedTransform) == 32, "PxAlignedTransform stride");
+static_assert(offsetof(PxAlignedTransform, q) == 0 && offsetof(PxAlignedTransform, p) == 16,
+              "PxAlignedTransform layout (q, p) == PxgAlignedTransform");
+} // namespace
+
+PXG_TEST(artiConstraintPrepBody_transformInvProbe)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npArtiConstraintPrep.spv", "acpTransformInvProbe", 32u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &acpLoader);
+
+    std::vector<PxAlignedQuat> quats;
+    atiQuats(quats);
+    const uint32_t nq = uint32_t(quats.size());
+    PXG_CHECK_MSG(nq == 176u, "quaternion set size %u", nq);
+
+    std::vector<PxAlignedTransform> ina, inb;
+    auto addLane = [&](const PxAlignedQuat& qa, const float4& pa, const PxAlignedQuat& qb, const float4& pb) {
+        ina.push_back(PxAlignedTransform(pa, qa));
+        inb.push_back(PxAlignedTransform(pb, qb));
+    };
+    const PxAlignedQuat qId(0.0f, 0.0f, 0.0f, 1.0f);
+    const float4 p123 = make_float4(1.0f, 2.0f, 3.0f, 0.0f);
+    const float4 pz = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // lane 0: the known member -- q = (-0.5,0.5,0.5,0.5), src.p == p
+    addLane(PxAlignedQuat(-0.5f, 0.5f, 0.5f, 0.5f), p123, qId, p123);
+
+    const float dv[4] = { 0.0f, -0.0f, 1.0f, -1.0f };
+    for (uint32_t qi = 0; qi < nq; ++qi)
+        for (uint32_t c = 0; c < 65; ++c)
+            for (uint32_t bq = 0; bq < 2; ++bq)
+            {
+                const PxAlignedQuat qb = bq == 0 ? qId : quats[(qi * 37u + c * 11u + 5u) % nq];
+                if (c == 0)
+                    addLane(quats[qi], p123, qb, p123);
+                else
+                {
+                    const uint32_t d = c - 1u;
+                    addLane(quats[qi], pz, qb,
+                            make_float4(dv[d & 3u], dv[(d >> 2) & 3u], dv[(d >> 4) & 3u], 0.0f));
+                }
+            }
+    const uint32_t n = uint32_t(ina.size());
+
+    std::vector<PxAlignedTransform> want(n), twin(n);
+    sAtiTwinRotateInv = false;
+    for (uint32_t i = 0; i < n; ++i) want[i] = atiTransformInv(ina[i], inb[i]);
+    sAtiTwinRotateInv = true;
+    for (uint32_t i = 0; i < n; ++i) twin[i] = atiTransformInv(ina[i], inb[i]);
+    sAtiTwinRotateInv = false;
+
+    // the known member, by hand: literal p = (+0,-0,+0,+0), old spelling p = (-0,+0,+0,+0)
+    {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        PXG_CHECK_MSG(bits(want[0].p.x) == 0x00000000u && bits(want[0].p.y) == 0x80000000u &&
+                      bits(want[0].p.z) == 0x00000000u && bits(want[0].p.w) == 0x00000000u,
+                      "known member literal p %08x %08x %08x %08x", bits(want[0].p.x),
+                      bits(want[0].p.y), bits(want[0].p.z), bits(want[0].p.w));
+        PXG_CHECK_MSG(bits(twin[0].p.x) == 0x80000000u && bits(twin[0].p.y) == 0x00000000u &&
+                      bits(twin[0].p.z) == 0x00000000u && bits(twin[0].p.w) == 0x00000000u,
+                      "known member twin p %08x %08x %08x %08x", bits(twin[0].p.x),
+                      bits(twin[0].p.y), bits(twin[0].p.z), bits(twin[0].p.w));
+    }
+
+    // ---- device ----
+    std::vector<PxgDevicePtr> bufs;
+    auto up = [&](const void* p, size_t sz) {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, sz);
+        if (dp && p) shim.memcpyHtoD(dp, p, sz);
+        bufs.push_back(dp);
+        return dp;
+    };
+    PxgDevicePtr dA = up(ina.data(), size_t(n) * 32u);
+    PxgDevicePtr dB = up(inb.data(), size_t(n) * 32u);
+    std::vector<uint8_t> poison(size_t(n) * 32u, 0xAB);
+    PxgDevicePtr dOut = up(poison.data(), poison.size());
+
+    bool ok = true;
+    for (PxgDevicePtr p : bufs) ok = ok && (p != 0);
+    if (!ok)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
+        return;
+    }
+
+    struct Params
+    {
+        uint64_t a, b, out;
+        uint32_t n, pad;
+    } prm = { uint64_t(dA), uint64_t(dB), uint64_t(dOut), n, 0u };
+    static_assert(sizeof(Params) == 32, "params blob");
+    PXG_CHECK_MSG(shim.launchKernel(0, (n + 31u) / 32u, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch acpTransformInvProbe");
+    shim.streamSynchronize();
+
+    std::vector<PxAlignedTransform> got(n);
+    shim.memcpyDtoH(got.data(), dOut, size_t(n) * 32u);
+
+    size_t bad = 0, twinDiffers = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const bool same = atiSameBits(got[i], want[i]);
+        if (!same)
+        {
+            if (bad < 12)
+            {
+                const uint32_t* w = reinterpret_cast<const uint32_t*>(&want[i]);
+                const uint32_t* g = reinterpret_cast<const uint32_t*>(&got[i]);
+                for (uint32_t k = 0; k < 8; ++k)
+                    if (w[k] != g[k])
+                        std::printf("MM ati lane %u word %u  ref %08x  gpu %08x\n", i, k, w[k], g[k]);
+            }
+            ++bad;
+        }
+        // dispatched and compared: every lane < n is both
+        if (!atiSameBits(twin[i], want[i]))
+            ++twinDiffers;
+    }
+    std::printf("  P9.94b transformInv probe: %u lanes, twin(rotateInv) differs on %zu, gpu mismatches %zu\n",
+                n, twinDiffers, bad);
+    PXG_CHECK_MSG(!atiSameBits(twin[0], want[0]), "known member: twin does not discriminate");
+    PXG_CHECK_MSG(atiSameBits(got[0], want[0]), "known member: gpu != literal oracle");
+    PXG_CHECK_MSG(twinDiffers > 0, "the old spelling does not discriminate on any compared lane");
+    PXG_CHECK_MSG(bad == 0, "%zu mismatching lanes", bad);
+
+    for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
+}

@@ -413,12 +413,30 @@ Vec3 aRotateInv(const QuatV& q, const Vec3& v) { return q.rotateInv(v); }
 Vec3 aTransform(const AFrame& t, const Vec3& v) { return t.q.rotate(v) + t.p; }
 Vec3 aTransformInv(const AFrame& t, const Vec3& v) { return t.q.rotateInv(v - t.p); }
 
-// body1ToBody0 = bodyFrame0.transformInv(bodyFrame1)
+// P9.94b TWIN flag: true restores the pre-P9.94b spelling a.q.rotateInv(b.p - a.p) of
+// body1ToBody0.p below.  sTinvSpellingsDiffer counts the calls (i.e. lanes that REACHED
+// the transformInv in refGetFrictionPatches) on which the two spellings' p differ in at
+// least one word -- the equivalence witness of constraintPrepPGS_frictionCarryoverFrames.
+static bool sTinvTwinRotateInv = false;
+static uint32_t sTinvSpellingsDiffer = 0;
+
+// body1ToBody0 = bodyFrame0.transformInv(bodyFrame1): AlignedTransform.h:213-220
+//   qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q)
+// P9.94b: literal -- the conjugate's forward rotate, not q.rotateInv (zero-sign twin).
 AFrame aTransformInvFrame(const AFrame& a, const AFrame& b)
 {
+    const QuatV qinv = a.q.getConjugate();
     AFrame r;
-    r.q = a.q.getConjugate() * b.q;
-    r.p = a.q.rotateInv(b.p - a.p);
+    r.q = qinv * b.q;
+    r.p = qinv.rotate(b.p - a.p);
+    const Vec3 old = a.q.rotateInv(b.p - a.p);
+    uint32_t wl[3], wo[3];
+    std::memcpy(&wl[0], &r.p.x, 4); std::memcpy(&wl[1], &r.p.y, 4); std::memcpy(&wl[2], &r.p.z, 4);
+    std::memcpy(&wo[0], &old.x, 4); std::memcpy(&wo[1], &old.y, 4); std::memcpy(&wo[2], &old.z, 4);
+    if (wl[0] != wo[0] || wl[1] != wo[1] || wl[2] != wo[2])
+        ++sTinvSpellingsDiffer;
+    if (sTinvTwinRotateInv)
+        r.p = old;
     return r;
 }
 

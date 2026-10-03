@@ -1171,7 +1171,9 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 //     stack never grow.
 //
 // B5 -- trimeshToConvexTransform is `rigidTransform.transformInv(clothTransform)`:
-//         q = conj(rigidQ) * clothQ,   p = quatRotateInv(rigidQ, clothP - rigidP)
+//         q = conj(rigidQ) * clothQ,   p = conj(rigidQ).rotate(clothP - rigidP)
+//     (PxTransform.h:162-168; P9.94b: the conjugate's FORWARD rotate, which is
+//     not bitwise rigidQ.rotateInv -- they differ in the sign of a zero lane)
 //     and the triangle is then moved by THAT, while `convexTransform` -- the one
 //     the module uses to put the contact back into world space -- is the RIGID's
 //     own transform.  Two transforms, one of them a composition; swapping them
@@ -1282,8 +1284,10 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
 
         // B5: PxTransform::transformInv -- q = conj(rigidQ) * clothQ,
         //     p = conj(rigidQ).rotate(clothP - rigidP).
-        const float4 toConvQ = ctQuatMul(ctQuatConj(rigidQ), clothQ);
-        const float3 toConvP = quatRotateInv(rigidQ, clothP - rigidP);
+        // P9.94b: spelled literally (was quatRotateInv(rigidQ, ...)).
+        const float4 rigidQinv = ctQuatConj(rigidQ);
+        const float4 toConvQ = ctQuatMul(rigidQinv, clothQ);
+        const float3 toConvP = ctQuatRotate(rigidQinv, clothP - rigidP);
 
         Ptr<float4> verts = Ptr<float4>(femClothes[clothId].mPosition_InvMass);
         // B2: the cloth is NOT scaled -- the raw world vertices go straight in.

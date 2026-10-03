@@ -7971,5 +7971,69 @@
 ],
 "verdict": "ALREADY-FIXED",
 "why": "The only consumer of penSum is the P9.89 select on the next line, pen = (penSum == 0) ? 0 : penSum, which gives the CUDA's `+ penOffset` (literal 0, softbodyPrimitives.cu:339/:888) zero-sign result for any penSum; wB/wA come from the GJK/EPA output, not a literal. Pinned by softBodySimMeshContactGen_p89PenOffset."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "gsForce[tid] += add;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: Slang adds a runtime-selected 0.0f in lanes < off; the add is a runtime select, not a literal, so there is no llvmpipe fold. In IEEE it can turn an intermediate -0 into +0 where CUDA skips the add. The only consumer is accumVal = inclusive - val, and that is identical either way. A zero inclusive wi"
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "fInc += fa;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: fa is a runtime select (take ? load : 0), not a literal. As at 203, the exclusive value fInc - f0 is insensitive to the zero sign of the inclusive sum."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "if (active) { gsWarpForce[tid] = fInc - f0; gsWarpPairs[tid] = pInc - p0; }",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: fInc/f0 are runtime selects. The literal 0.0f arms only occur for inactive lanes, which do not store. Same zero-sign argument as 203."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "if (tid == WARPS_PER_BLOCK - 1) { gsBlockForce += ((fInc - f0) + f0); gsBlockPairs += pInc; }",
+"kinds": [
+"F2-zero-minus",
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: P9.86f spelling of accumulateThresholdStream.cu:258 sBlockAccumulator += (accumulatedForce + forceVal). Only lane 7 (active) executes it, where f0 and fInc are the loaded warp totals, not the 0.0f select arm of line 227. gsBlockForce is groupshared: its 0.0f seed (284, CUDA :191 sBlockAccumulator = 0) is re-read after a barrier, so neither slangc nor llvmpipe can forward the literal; the IEEE add of the shared seed is the CUDA's own add."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "const float accumVal = gsForce[tid] - val;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: gsForce[tid] is the scanned value, not the literal store at 312 forwarded (the scan barriers and stores intervene). The result is identical to CUDA (see 203)."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "gsWarpForce[warpIndex] = accumVal + val;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: Same expression and operand order as CUDA. No literal operand: val is a runtime select of a load."
+},
+{
+"file": "thresholdStreamBda.slang",
+"code": "accumulatedForce[workIndex] = val + accumVal + prevBlockForce + gsWarpForce[warpIndex];",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: prevBlockForce may be the +0 seed on the first iteration. But val + accumVal is never -0 (accumVal zero is always +0), so x + (+0) == x whether folded or not. The associativity order matches CUDA."
 }
 ]

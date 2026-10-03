@@ -540,13 +540,15 @@ void fmHfBound(uint3 dtid : SV_DispatchThreadID)
             // then inv.transform(c) = conj(q).rotate(c) + inv.p — TWO rotations
             // and a vector add, NOT one rotation of the difference (the forms
             // differ in ULPs and the center feeds floor/ceil grid clamps).
-            // conj(q).rotate(x) is bit-identical to q.rotateInv(x) under the
-            // PxQuat formula, so quatRotateInv stands in for the conjugate.
+            // P9.94b: conj(q).rotate(x) and q.rotateInv(x) differ in the sign
+            // of exact zeros ((-y)*vz - (-z)*vy is +0 where -(y*vz - z*vy) is
+            // -0), so the conjugate is spelled out.  The CUDA absorbs the sign
+            // (miny/maxy are PxU32), but the port stores lmn.y/lmx.y in gDebug.
             const float4 qinv = float4(-cs.d.x, -cs.d.y, -cs.d.z, cs.d.w);
             const float3 centerW = (bmn + bmx) * 0.5f;
             const float3 extentW = (bmx - bmn) * 0.5f;
-            const float3 invP = quatRotateInv(cs.d, -cs.e.xyz);
-            const float3 center = quatRotateInv(cs.d, centerW) + invP;
+            const float3 invP = quatRotateInv(cs.d, -cs.e.xyz); // fm: getInverse().p = q.rotateInv(-p)
+            const float3 center = quatRotate(qinv, centerW) + invP; // fm: inv.q.rotate(c) + inv.p (P9.94b)
             float3 c0, c1, c2;
             quatBasis(qinv, c0, c1, c2);
             const float3 e0 = c0 * extentW.x;
@@ -654,8 +656,8 @@ void sbHfBound(uint3 dtid : SV_DispatchThreadID)
             const float4 qinv = float4(-cs.d.x, -cs.d.y, -cs.d.z, cs.d.w);
             const float3 centerW = (bmn + bmx) * 0.5f;
             const float3 extentW = (bmx - bmn) * 0.5f;
-            const float3 invP = quatRotateInv(cs.d, -cs.e.xyz);
-            const float3 center = quatRotateInv(cs.d, centerW) + invP;
+            const float3 invP = quatRotateInv(cs.d, -cs.e.xyz); // sb: getInverse().p = q.rotateInv(-p)
+            const float3 center = quatRotate(qinv, centerW) + invP; // sb: inv.q.rotate(c) + inv.p (P9.94b)
             float3 c0, c1, c2;
             quatBasis(qinv, c0, c1, c2);
             const float3 e0 = c0 * extentW.x;
