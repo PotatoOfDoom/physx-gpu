@@ -425,12 +425,20 @@ static V3 v2s(V3 v, V3 sc, const F4& rot) // vertex2Shape, multiply transform
     return qRotInv(rot, V3{ r.x * sc.x, r.y * sc.y, r.z * sc.z });
 }
 
+// P9.94d: aToB = transform1.transformInv(transform0) (cu L1447) is spelled as
+// PxTransform::transformInv(PxTransform) (PxTransform.h:162-169): qinv =
+// q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).  The twin flag selects
+// the pre-P9.94d qRotInv(q1, .) -- the same value, but an exact-zero component can
+// take the other sign.  Used only by the vacuity probe in npTriTriOverlap_p94dZeroSign.
+static bool gP94dRotInvTwin = false;
+
 // prep transcription (cu L1447-1514): fills VA/VB (8 verts each) and GjkIn
 static void refPrep(const TtoIn& s, float* VA, float* VB, GjkIn& gin)
 {
     const F4 conj1{ -s.t1q.x, -s.t1q.y, -s.t1q.z, s.t1q.w };
     const F4 aToBq = qMul(conj1, s.t0q);
-    const V3 aToBp = qRotInv(s.t1q, V3{ s.t0p.x - s.t1p.x, s.t0p.y - s.t1p.y, s.t0p.z - s.t1p.z });
+    const V3 dP{ s.t0p.x - s.t1p.x, s.t0p.y - s.t1p.y, s.t0p.z - s.t1p.z };
+    const V3 aToBp = gP94dRotInvTwin ? qRotInv(s.t1q, dP) : qRot(conj1, dP);
 
     V3 mn0{ s.nMin0[0].x, s.nMin0[0].y, s.nMin0[0].z }, mx0{ s.nMax0[0].x, s.nMax0[0].y, s.nMax0[0].z };
     for (uint32_t L = 1; L < s.counts[0]; ++L)
@@ -570,6 +578,81 @@ PXG_TEST(npTriTriOverlap_overlaps)
                   "triTriOverlap: coverage thin (ovl %zu dist %zu close %zu ident %zu multi %zu)",
                   cOverlap, cDistant, cClose, cIdent, cMulti);
 
+    for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.94d: the aToB.p zero sign through the prep clouds, BITWISE.  q0 = (1,0,0,0)
+// (180 deg about x), q1 = identity, p1 = 0, mesh 0's box min.y = +0, so its corners
+// with y = +0 rotate to y = -0 and keep that sign only when aToB.p.y is -0 too.
+//   case 0: p0 = (0,-0,-0): v = (+0,-0,-0); conj(q1).rotate(v) = (+0,-0,+0) where the
+//           old q1.rotateInv(v) gave (+0,+0,+0) -> cloudA[3].y is -0 in the CUDA, +0
+//           in the old port (the rotateInv twin must differ here);
+//   case 1: p0 = (0,0,0): the spellings agree, but a "-rotate(qinv, p1 - p0)"
+//           rewrite does not (rotate of (+0,+0,+0) is not the negation of rotate of
+//           (+0,-0,-0)), so the sign-swapped forms are pinned too.
+// Every VA/VB word is compared bitwise against the literal oracle.
+PXG_TEST(npTriTriOverlap_p94dZeroSign)
+{
+    const uint32_t N = 2, MAXV = 8;
+    std::vector<TtoIn> in(N);
+    for (uint32_t c = 0; c < N; ++c)
+    {
+        TtoIn& s = in[c];
+        s = TtoIn{};
+        s.t0q = F4{ 1.0f, 0.0f, 0.0f, 0.0f };
+        s.t0p = c == 0 ? F4{ 0.0f, -0.0f, -0.0f, 0 } : F4{ 0.0f, 0.0f, 0.0f, 0 };
+        s.t1q = F4{ 0.0f, 0.0f, 0.0f, 1.0f }; s.t1p = F4{ 0.0f, 0.0f, 0.0f, 0 };
+        s.scaleS0 = F4{ 1, 1, 1, 0 }; s.scaleR0 = F4{ 0, 0, 0, 1 };
+        s.scaleS1 = F4{ 1, 1, 1, 0 }; s.scaleR1 = F4{ 0, 0, 0, 1 };
+        s.counts[0] = 1; s.counts[1] = 1;
+        s.misc = F4{ 0.1f, 0, 0, 0 };
+        s.nMin0[0] = F4{ -1.0f, 0.0f, -1.0f, 0 }; s.nMax0[0] = F4{ 1.0f, 1.0f, 1.0f, 0 };
+        s.nMin1[0] = F4{ -0.5f, -0.5f, -0.5f, 0 }; s.nMax1[0] = F4{ 0.5f, 0.5f, 0.5f, 0 };
+    }
+
+    std::vector<float> refVA(N * MAXV * 4, 0.f), refVB(N * MAXV * 4, 0.f);
+    std::vector<float> twVA(N * MAXV * 4, 0.f), twVB(N * MAXV * 4, 0.f);
+    for (uint32_t c = 0; c < N; ++c)
+    {
+        GjkIn gin{}, gtw{};
+        refPrep(in[c], &refVA[c * MAXV * 4], &refVB[c * MAXV * 4], gin);
+        gP94dRotInvTwin = true;
+        refPrep(in[c], &twVA[c * MAXV * 4], &twVB[c * MAXV * 4], gtw);
+        gP94dRotInvTwin = false;
+    }
+    size_t twinWords = 0;
+    for (uint32_t j = 0; j < MAXV * 4; ++j)
+        if ((j & 3) != 3 && asU32(refVA[j]) != asU32(twVA[j])) ++twinWords;
+    std::printf("  [p94d] CUDA cloudA[3] %08x %08x %08x | rotateInv twin %08x %08x %08x (twin differs in %zu words)\n",
+                asU32(refVA[12]), asU32(refVA[13]), asU32(refVA[14]), asU32(twVA[12]), asU32(twVA[13]), asU32(twVA[14]), twinWords);
+    PXG_CHECK_MSG(asU32(refVA[13]) == 0x80000000u && asU32(twVA[13]) == 0u,
+                  "p94d: hand-derived cloudA[3].y bits (CUDA -0, rotateInv +0) not reproduced");
+    PXG_CHECK_MSG(twinWords > 0, "p94d: the rotateInv twin equals the literal oracle -- case not zero-sign sensitive");
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<float> vaInit(N * MAXV * 4, 7.f), vbInit(N * MAXV * 4, 7.f);
+    std::vector<GjkOut> outInit(N);
+    PxgBufferHandle bVA = createBufferFrom(dev, vaInit);
+    PxgBufferHandle bVB = createBufferFrom(dev, vbInit);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    GjkParams prm = { N, MAXV, 0, 0 };
+    Kernel k("npTriTriOverlap.spv", "triTriOverlap",
+             { 16u, 16u, (uint32_t)sizeof(TtoIn), (uint32_t)sizeof(GjkOut) }, sizeof(GjkParams));
+    k.dispatch(1, { bVA, bVB, bIn, bOut }, prm);
+    dev->flush();
+    const auto gva = downloadBuffer<float>(dev, bVA, N * MAXV * 4);
+    const auto gvb = downloadBuffer<float>(dev, bVB, N * MAXV * 4);
+    size_t mm = 0, eqTwin = 0;
+    for (uint32_t j = 0; j < N * MAXV * 4; ++j)
+    {
+        if ((j & 3) == 3) continue;
+        if (asU32(refVA[j]) != asU32(gva[j]) || asU32(refVB[j]) != asU32(gvb[j])) ++mm;
+        if (asU32(twVA[j]) != asU32(refVA[j]) && asU32(twVA[j]) == asU32(gva[j])) ++eqTwin;
+    }
+    std::printf("  [p94d] GPU cloudA[3] %08x %08x %08x\n", asU32(gva[12]), asU32(gva[13]), asU32(gva[14]));
+    PXG_CHECK_MSG(mm == 0, "p94d: %zu cloud words differ bitwise from the literal oracle (%zu take the rotateInv twin's bits)",
+                  mm, eqTwin);
     for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
 }
 

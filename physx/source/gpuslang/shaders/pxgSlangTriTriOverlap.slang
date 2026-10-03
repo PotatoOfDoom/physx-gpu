@@ -167,11 +167,15 @@ public uint ttoOverlap(TtoBox b0, TtoBox b1,
                        float contactDistance,
                        out GjkOut o, out float3 cloudA[8], out float3 cloudB[8])
 {
-    // aToB = transform1.transformInv(transform0): q = conj(q1)*q0,
-    // p = rotInv(q1, p0 - p1).  Mesh 0 is the A side and moves into mesh 1's
-    // space -- the OPPOSITE direction from ctCommon's convex-relative compose.
-    const float4 aToBq = npAbiQuatMul(float4(-q1.x, -q1.y, -q1.z, q1.w), q0);
-    const float3 aToBp = npAbiQuatRotateInv(q1, p0 - p1);
+    // aToB = transform1.transformInv(transform0) (cu:1447), spelled as
+    // PxTransform::transformInv(PxTransform) is (PxTransform.h:162-169): qinv =
+    // conj(q1); q = qinv*q0, p = qinv.rotate(p0 - p1).  P9.94d: NOT rotInv(q1, .)
+    // -- same value, but an exact-zero component can take the other sign.  Mesh 0
+    // is the A side and moves into mesh 1's space -- the OPPOSITE direction from
+    // ctCommon's convex-relative compose.
+    const float4 q1Inv = float4(-q1.x, -q1.y, -q1.z, q1.w);
+    const float4 aToBq = npAbiQuatMul(q1Inv, q0);
+    const float3 aToBp = npAbiQuatRotate(q1Inv, p0 - p1);
 
     ttoCorners(b0, scale0, scaleRot0, true, aToBq, aToBp, cloudA);
     ttoCorners(b1, scale1, scaleRot1, false, aToBq, aToBp, cloudB);

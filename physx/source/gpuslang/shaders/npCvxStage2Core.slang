@@ -97,9 +97,13 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
     const float4 t1q = float4(tc1.qx, tc1.qy, tc1.qz, tc1.qw);
     const float3 t1p = float3(tc1.px, tc1.py, tc1.pz);
 
-    // aToB = transf1.transformInv(transf0)
-    const float4 aToBq = npAbiQuatMul(float4(-t1q.x, -t1q.y, -t1q.z, t1q.w), t0q);
-    const float3 aToBp = npAbiQuatRotateInv(t1q, t0p - t1p);
+    // aToB = transf1.transformInv(transf0) (cudaGJKEPA.cu:2454), spelled as
+    // PxTransform::transformInv(PxTransform) is (PxTransform.h:162-169): qinv =
+    // q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).  P9.94d: NOT
+    // q.rotateInv(v) -- same value, but an exact-zero component can take the other sign.
+    const float4 t1qInv = float4(-t1q.x, -t1q.y, -t1q.z, t1q.w);
+    const float4 aToBq = npAbiQuatMul(t1qInv, t0q);
+    const float3 aToBp = npAbiQuatRotate(t1qInv, t0p - t1p);
 
     Ptr<PxgPersistentContactManifoldGpu> manifold =
         Ptr<PxgPersistentContactManifoldGpu>(cmManifoldsPtr + uint64_t(globalWarpIndex) * 256u);

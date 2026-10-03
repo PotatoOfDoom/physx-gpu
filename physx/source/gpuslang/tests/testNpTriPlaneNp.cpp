@@ -60,9 +60,11 @@
 // kernel itself only ever writes manifold 0).
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
 
 #include <algorithm>
 #include <bitset>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1033,6 +1035,240 @@ PXG_TEST(npTriPlaneNp_p94ZeroSign)
     }
     PXG_CHECK_MSG(mm == 0, "p94: %zu cases differ bitwise from the literal CUDA oracle "
                   "(%zu equal the rotateInv twin: transformInvTransform reverted?)", mm, mmTwin);
+}
+
+// ===========================================================================
+// P9.94d: triPlaneNpBda (trimeshPlaneNarrowphase on the ENGINE launch ABI) -- the
+// first fixture that loads triPlaneNpBda.spv at all.  Until now only the Phase-1
+// twin npTriPlaneNp above was driven; the engine kernel composes the same modules
+// but owns its own trimeshToPlane line (triPlaneNpBda.slang, trimeshCollision.cu
+// :147), and that line is what P9.94d changed: planeTransform.transformInv(
+// trimeshTransform).p = planeQ.getConjugate().rotate(meshP - planeP)
+// (PxTransform.h:162-169), not planeQ.rotateInv(.), which differs only in the sign
+// of an exact zero -- and the result is STORED at PCM_RELTRANSFORM_P.
+//
+// MINIMAL BY DESIGN.  It reuses npTriPlaneNp_p94ZeroSign's two directed cases (A:
+// meshP (-0,-0,-0), planeP (16,0,0); B: meshP (-0,-0,1), planeP 0; identity
+// rotations; a far previous relative transform, so the manifold is invalidated and
+// a full contact gen runs) and the Phase-1 CPU reference refTp as the oracle.  The
+// engine side is built byte for byte: the 144-byte push blob (ABI row
+// { 4,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,4,4,4,4 }), PxgContactManagerInput / PxgShape /
+// PxsCachedTransform / PxsContactManagerOutput / PxgPatchAndContactCounters /
+// PxsMaterialData records, the cooked-mesh blob (header uint4 | one BV32 node |
+// float4 verts), and the 1216-byte multi-manifold record.  Both cases ride in ONE
+// launch (two blocks, numBlocks = numTests as PxgNarrowphaseCore.cpp:1261 sizes
+// it), so the workIndex addressing of every per-pair array is exercised too.
+//
+// Checked BITWISE against refTp: the stored relative transform (Q and P, P.w = 0),
+// mNbManifolds = 1, mNbContacts[0] = the retained count, the cmOutput contact count
+// and the emitted contact stream (world point, separation).  The rotateInv twin
+// (gP94TinvRotInv) must differ from the literal oracle in each case.
+// ===========================================================================
+namespace p94dtp
+{
+#pragma pack(push, 1)
+struct HInput { uint32_t shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1; };  // 16
+struct HCachedTransform { float qx, qy, qz, qw, px, py, pz; uint32_t flags; };              // 32
+struct HShape { float sx, sy, sz, srx, sry, srz, srw; uint32_t materialIndex;
+                uint64_t hullPtr; uint32_t type, particleId; };                             // 48
+struct HOutput { uint64_t contactPatches, contactPoints, contactForces, frictionPatches;
+                 uint32_t allflagsWord, nbContacts_flags; uint32_t pad0, pad1; };           // 48
+struct HCounters { uint32_t patchesBytes, contactsBytes, forceAndIndiceBytes, overflowError; }; // 16
+struct HMaterial { float dyn, sta, rest, damp; uint32_t packedFlags, packedDamp; };         // 24
+// TriPlaneParams (triPlaneNpBda.slang), the CUDA parameter list of
+// PxgNarrowphaseCore.cpp:1236-1256 at natural alignment.
+struct Push
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, cmOutputs, shapes, transformCache, contactDistance, materials, multiManifold,
+             contactStream, patchStream, patchAndContactCounters, touchChangeFlags, patchChangeFlags,
+             startContactPatches, startContactPoints, startContactForces;
+    uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit; float clusterTolerance;
+};
+#pragma pack(pop)
+static_assert(sizeof(HInput) == 16 && sizeof(HCachedTransform) == 32 && sizeof(HShape) == 48 &&
+              sizeof(HOutput) == 48 && sizeof(HCounters) == 16 && sizeof(HMaterial) == 24, "engine mirrors");
+static_assert(sizeof(Push) == 144, "trimeshPlaneNarrowphase push blob is 144 bytes");
+static_assert(offsetof(Push, patchBytesLimit) == 128 && offsetof(Push, clusterTolerance) == 140, "push tail");
+
+static const uint64_t BV32_STRIDE = 1168, BV32_MMAX = 512, BV32_MNBNODES = 1152;
+static const uint64_t PCM_STRIDE = 1216, PCM_NBCONTACTS = 1152, PCM_RELQ = 1168, PCM_RELP = 1184, PCM_NBMAN = 1200;
+static const uint32_t GEOM_PLANE = 1u, GEOM_TRIANGLEMESH = 8u;   // PxGeometryType
+
+static std::vector<uint8_t> shaderLoader(const char* file) { return loadShaderBlob(file); }
+}
+
+PXG_TEST(npTriPlaneNp_engineAbiP94dZeroSign)
+{
+    using namespace p94dtp;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    // A, B: the zero-sign cases.  C: a general signed-permutation pose (both rotations
+    // non-identity), so a conjugate dropped or doubled -- a wrong ROTATION, not just a
+    // wrong zero sign -- is visible too.
+    const uint32_t NC = 3;
+    const float TOL = 0.5f, CD_HALF = 0.125f, CLUSTER = 0.0625f;   // refTp: meshP.w, planeP.w, scale.w
+    const std::vector<F4> verts = { { -0.5f, 0.25f, 0.75f, 0 }, { -0.25f, 0.5f, 0.25f, 0 }, { 0.25f, -0.75f, 0.5f, 0 } };
+    const std::vector<F4> root = { { -1, -1, -1, 0 }, { 1, 1, 1, 0 } };
+    const F4 meshPs[NC] = { { -0.0f, -0.0f, -0.0f, TOL }, { -0.0f, -0.0f, 1.0f, TOL }, { 0.25f, 1.5f, -0.75f, TOL } };
+    const F4 planePs[NC] = { { 16.0f, 0.0f, 0.0f, 2 * CD_HALF }, { 0.0f, 0.0f, 0.0f, 2 * CD_HALF },
+                             { 0.5f, 0.75f, -0.25f, 2 * CD_HALF } };
+    const F4 meshQs[NC] = { { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { -0.5f, 0.5f, 0.5f, 0.5f } };
+    const F4 planeQs[NC] = { { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0.5f, -0.5f, 0.5f, 0.5f } };
+    const F4 prevQ = { 0, 0, 0, 1 };
+    const V3 prevP = { 1000.0f, 0, 0 };
+
+    // ---- the oracle: refTp (literal conj().rotate) and its rotateInv twin ----
+    std::vector<TpCase> cases(NC);
+    std::vector<TpRef> ref(NC), twin(NC);
+    const std::vector<F4> mZero(24, F4{ 0, 0, 0, 0 });
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        TpCase& cs = cases[i];
+        std::memset(&cs, 0, sizeof(cs));
+        cs.meshQ = meshQs[i]; cs.meshP = meshPs[i];
+        cs.planeQ = planeQs[i]; cs.planeP = planePs[i];
+        cs.scale = { 1, 1, 1, CLUSTER }; cs.scaleRot = { 0, 0, 0, 1 };
+        cs.verts = { 0, 3, 0, 0 }; cs.rootMeta = { 1, 0, 0, 0 };
+        ref[i] = refTp(cs, verts, root, mZero.data(), mZero.data(), mZero.data(), U4{ 0, 0, 0, 0 }, prevQ, prevP);
+        gP94TinvRotInv = true;
+        twin[i] = refTp(cs, verts, root, mZero.data(), mZero.data(), mZero.data(), U4{ 0, 0, 0, 0 }, prevQ, prevP);
+        gP94TinvRotInv = false;
+        PXG_CHECK_MSG(ref[i].fullGen && ref[i].retained > 0 && (i == 2 || ref[i].retained == 3),
+                      "p94d engine case %c: want a full gen with contacts (%d %u)", 'A' + i, int(ref[i].fullGen), ref[i].retained);
+        if (i < 2)
+            PXG_CHECK_MSG(std::memcmp(&ref[i].ttpP, &twin[i].ttpP, sizeof(V3)) != 0,
+                          "p94d engine case %c: the rotateInv twin equals the literal oracle", 'A' + i);
+    }
+    PXG_CHECK_MSG(asU32(ref[0].ttpP.x) == 0xC1800000u && asU32(ref[0].ttpP.y) == 0u && asU32(ref[0].ttpP.z) == 0u &&
+                  asU32(ref[1].ttpP.x) == 0x80000000u && asU32(ref[1].ttpP.y) == 0u && asU32(ref[1].ttpP.z) == 0x3F800000u,
+                  "p94d engine: literal oracle bits differ from the hand-derived CUDA bits");
+
+    // ---- engine arrays: shapes/caches [2i] = plane, [2i+1] = mesh (the kernel routes by type) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    static const PxgKernelDef manifest[] = { { "triPlaneNpBda.spv", "trimeshPlaneNarrowphase", 144u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &shaderLoader);
+
+    std::vector<uint8_t> blob(16 + BV32_STRIDE + 16 * verts.size(), 0);
+    {
+        const uint32_t hdr[4] = { uint32_t(verts.size()), 0u, 0u, 1u };   // .x numVerts, .w nbPackedNodes
+        std::memcpy(&blob[0], hdr, 16);
+        std::memcpy(&blob[16 + 0], &root[0], 16);                          // mMin[0]
+        std::memcpy(&blob[16 + BV32_MMAX], &root[1], 16);                  // mMax[0]
+        const uint32_t nbNodes = 1u;
+        std::memcpy(&blob[16 + BV32_MNBNODES], &nbNodes, 4);
+        std::memcpy(&blob[16 + BV32_STRIDE], verts.data(), 16 * verts.size());
+    }
+    PxgDevicePtr dBlob = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dBlob, blob.size()) == PxgResult::Success, "memAlloc mesh blob");
+    if (!dBlob) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<HInput> in(NC);
+    std::vector<HShape> shapes(2 * NC);
+    std::vector<HCachedTransform> xf(2 * NC);
+    std::vector<float> cd(2 * NC, CD_HALF);
+    std::vector<uint8_t> mf(NC * PCM_STRIDE, 0);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        in[i] = { 2 * i, 2 * i + 1, 2 * i, 2 * i + 1 };
+        shapes[2 * i] = { 1, 1, 1, 0, 0, 0, 1, 0u, 0u, GEOM_PLANE, 0u };
+        shapes[2 * i + 1] = { 1, 1, 1, 0, 0, 0, 1, 1u, uint64_t(dBlob), GEOM_TRIANGLEMESH, 0u };
+        const TpCase& cs = cases[i];
+        xf[2 * i] = { cs.planeQ.x, cs.planeQ.y, cs.planeQ.z, cs.planeQ.w, cs.planeP.x, cs.planeP.y, cs.planeP.z, 0u };
+        xf[2 * i + 1] = { cs.meshQ.x, cs.meshQ.y, cs.meshQ.z, cs.meshQ.w, cs.meshP.x, cs.meshP.y, cs.meshP.z, 0u };
+        const float relQ[4] = { prevQ.x, prevQ.y, prevQ.z, prevQ.w }, relP[4] = { prevP.x, prevP.y, prevP.z, 5.0f };
+        std::memcpy(&mf[i * PCM_STRIDE + PCM_RELQ], relQ, 16);
+        std::memcpy(&mf[i * PCM_STRIDE + PCM_RELP], relP, 16);
+    }
+    std::vector<HMaterial> mats(2);
+    mats[0] = { 0.5f, 0.6f, 0.1f, 0.0f, 0u, 0u };
+    mats[1] = { 0.3f, 0.4f, 0.2f, 0.0f, 0u, 0u };
+    std::vector<HOutput> outs(NC);
+    std::memset(outs.data(), 0, outs.size() * sizeof(HOutput));
+    const HCounters counters = { 0, 0, 0, 0 };
+    const uint32_t streamBytes = 4096;
+
+    PxgDevicePtr dIn = 0, dOut = 0, dShapes = 0, dXf = 0, dCd = 0, dMat = 0, dMf = 0, dCS = 0, dPS = 0, dCnt = 0,
+                 dTouch = 0, dPatch = 0, dForce = 0;
+    shim.memAlloc(&dIn, in.size() * sizeof(HInput));
+    shim.memAlloc(&dOut, outs.size() * sizeof(HOutput));
+    shim.memAlloc(&dShapes, shapes.size() * sizeof(HShape));
+    shim.memAlloc(&dXf, xf.size() * sizeof(HCachedTransform));
+    shim.memAlloc(&dCd, cd.size() * 4);
+    shim.memAlloc(&dMat, mats.size() * sizeof(HMaterial));
+    shim.memAlloc(&dMf, mf.size());
+    shim.memAlloc(&dCS, streamBytes);
+    shim.memAlloc(&dPS, streamBytes);
+    shim.memAlloc(&dCnt, sizeof(HCounters));
+    shim.memAlloc(&dTouch, NC * 4);
+    shim.memAlloc(&dPatch, NC * 4);
+    shim.memAlloc(&dForce, streamBytes);
+    shim.memcpyHtoD(dBlob, blob.data(), blob.size());
+    shim.memcpyHtoD(dIn, in.data(), in.size() * sizeof(HInput));
+    shim.memcpyHtoD(dOut, outs.data(), outs.size() * sizeof(HOutput));
+    shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(HShape));
+    shim.memcpyHtoD(dXf, xf.data(), xf.size() * sizeof(HCachedTransform));
+    shim.memcpyHtoD(dCd, cd.data(), cd.size() * 4);
+    shim.memcpyHtoD(dMat, mats.data(), mats.size() * sizeof(HMaterial));
+    shim.memcpyHtoD(dMf, mf.data(), mf.size());
+    shim.memsetD32(dCS, 0xCDCDCDCDu, streamBytes / 4);
+    shim.memsetD32(dPS, 0, streamBytes / 4);
+    shim.memcpyHtoD(dCnt, &counters, sizeof(HCounters));
+    shim.memsetD32(dTouch, 0, NC);
+    shim.memsetD32(dPatch, 0, NC);
+    shim.memsetD32(dForce, 0, streamBytes / 4);
+
+    Push push = { TOL, 0u, dIn, dOut, dShapes, dXf, dCd, dMat, dMf, dCS, dPS, dCnt, dTouch, dPatch,
+                  dPS, dCS, dForce, streamBytes, streamBytes, streamBytes, CLUSTER };
+    PXG_CHECK_MSG(shim.launchKernel(0, NC, 1, 1, &push, sizeof(push)) == PxgResult::Success, "launch trimeshPlaneNarrowphase");
+    shim.streamSynchronize();
+
+    std::vector<uint8_t> gMf(mf.size());
+    shim.memcpyDtoH(gMf.data(), dMf, gMf.size());
+    std::vector<HOutput> gOut(NC);
+    shim.memcpyDtoH(gOut.data(), dOut, gOut.size() * sizeof(HOutput));
+
+    size_t mm = 0, mmTwin = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const TpRef& ro = ref[i];
+        const uint8_t* m = &gMf[i * PCM_STRIDE];
+        F4 rq, rp; uint32_t nbMan, nbC0;
+        std::memcpy(&rq, m + PCM_RELQ, 16); std::memcpy(&rp, m + PCM_RELP, 16);
+        std::memcpy(&nbMan, m + PCM_NBMAN, 4); std::memcpy(&nbC0, m + PCM_NBCONTACTS, 4);
+        size_t bad = 0;
+        if (asU32(rq.x) != asU32(ro.ttpQ.x) || asU32(rq.y) != asU32(ro.ttpQ.y) ||
+            asU32(rq.z) != asU32(ro.ttpQ.z) || asU32(rq.w) != asU32(ro.ttpQ.w)) ++bad;
+        if (asU32(rp.x) != asU32(ro.ttpP.x) || asU32(rp.y) != asU32(ro.ttpP.y) ||
+            asU32(rp.z) != asU32(ro.ttpP.z) || asU32(rp.w) != 0u) ++bad;
+        if (i < 2 && asU32(rp.x) == asU32(twin[i].ttpP.x) && asU32(rp.y) == asU32(twin[i].ttpP.y) &&
+            asU32(rp.z) == asU32(twin[i].ttpP.z)) ++mmTwin;
+        if (nbMan != 1u || nbC0 != ro.retained) ++bad;
+        const uint32_t gNb = gOut[i].nbContacts_flags & 0xffffu;
+        if (gNb != ro.retained) ++bad;
+        else if (gOut[i].contactPoints < dCS || gOut[i].contactPoints + 16u * gNb > dCS + streamBytes) ++bad;
+        else
+        {
+            std::vector<F4> cs(gNb);
+            shim.memcpyDtoH(cs.data(), gOut[i].contactPoints, 16u * gNb);
+            for (uint32_t k = 0; k < gNb; ++k)
+                if (asU32(cs[k].x) != asU32(ro.pts[k].x) || asU32(cs[k].y) != asU32(ro.pts[k].y) ||
+                    asU32(cs[k].z) != asU32(ro.pts[k].z) || asU32(cs[k].w) != asU32(ro.seps[k])) ++bad;
+        }
+        std::printf("  p94d engine case %c: GPU relP %08x %08x %08x (CUDA %08x %08x %08x, rotateInv twin %08x %08x %08x)"
+                    " nbMan %u nb %u/%u -> %zu bad\n", 'A' + i,
+                    asU32(rp.x), asU32(rp.y), asU32(rp.z), asU32(ro.ttpP.x), asU32(ro.ttpP.y), asU32(ro.ttpP.z),
+                    asU32(twin[i].ttpP.x), asU32(twin[i].ttpP.y), asU32(twin[i].ttpP.z), nbMan, nbC0, gNb, bad);
+        mm += bad;
+    }
+    PXG_CHECK_MSG(mm == 0, "p94d engine: %zu mismatches against the literal CUDA oracle "
+                  "(%zu cases store the rotateInv twin's relP: transformInv reverted?)", mm, mmTwin);
+
+    for (PxgDevicePtr p : { dBlob, dIn, dOut, dShapes, dXf, dCd, dMat, dMf, dCS, dPS, dCnt, dTouch, dPatch, dForce })
+        shim.memFree(p);
 }
 
 } // namespace

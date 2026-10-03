@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.94d (C+D): the remaining inverse-rotation sites spell the CUDA (triPlaneNpBda with its first
+engine-ABI fixture, npCvxPlaneNphase, npCvxStage2Core, pxgSlangTriTriOverlap, cvxCoreCloth/Tet,
+npCvxTriNpSetup, npCvxHfNpSetup, softBodySdfMidphaseBda getInverse); the cloth convex-core barycentric
+goes through the mesh-scale matrix (getTriBarycentric).  All 44 audit-2 findings closed.  Scenes 64/64.
 P9.94d (A+B): the ct quaternion helpers in pxgSlangCvxTriSetup now spell PxQuat::rotate/rotateInv
 literally (they used the Rodrigues vector form: general rounding on every convex/sphere/capsule vs
 mesh/heightfield contact); toCvxP / toCapP / meshToCapsule via the conjugate (transformInv(PxTransform));
@@ -2105,6 +2109,55 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.94d (Teil 2) — Die restlichen Stellen der npAbi-Familie, die Cloth-Baryzentrik und die Fixture-Zwillinge; Audit 2 abgeschlossen
+
+**Einheit C (npAbi-Familie).** Sechs Stellen rechneten `rotateInv(q, x)`, wo die CUDA
+`transformInv(PxTransform)` aufruft, also `q.getConjugate().rotate(x)`. Sie verwenden jetzt die
+Konjugierte:
+
+| Stelle | CUDA | Beobachtet durch |
+|---|---|---|
+| `triPlaneNpBda` (engine) | trimeshCollision.cu:147 | neuer Test `npTriPlaneNp_engineAbiP94dZeroSign`, der erste, der `triPlaneNpBda.spv` lädt (144-B-Push-Block, Mesh-Blob mit BV32-Knoten, PCM-Record; drei Contact-Manager). relP für Fall A: (−16, +0, +0) |
+| `npCvxPlaneNphase` (engine) | cudaGJKEPA.cu:2860 | `convexPlaneNphase_p94dZeroSign`: `mRelativePos.x` = 0x80000000, ganzer Manifold bitweise |
+| `npCvxStage2Core` | cudaGJKEPA.cu:2454 | `npCvxStage2Setup_p94dZeroSign` (Dbg-SPIR-V); der Engine-ABI-Test vergleicht aToB jetzt bitweise; Orakel in `testCvxCollide` korrigiert |
+| `pxgSlangTriTriOverlap` | convexMeshMidphase.cu:1447 | `npTriTriOverlap_p94dZeroSign` (zwei Fälle); Kommentar korrigiert |
+| `cvxCoreClothNpBda:440`, `cvxCoreTetNpBda:342` | convexCoreCollision.cu:1241/:1147 | nicht beobachtet (siehe unten) |
+
+Sweeps: triPlane 5/5, convexPlane 5/5, stage2 5/5, npTriTriOverlap 5/5, triTriOverlapBda 2/5 (die
+übrigen drei werden über die Fixture desselben Moduls getötet; die Engine-Glue liest aToBp nicht).
+
+Bei cvxCoreCloth überlebt der Revert (0/5). Die Cloth-Transformation ist dort die Identität, und aToBp
+wird nur zu `poseP`, das ausschließlich addiert oder subtrahiert wird. Eine gezielte Probe mit einem
+Punkt-Core zeigte bitgleiche Ausgaben. Das ist unbeobachtet, aber nicht bewiesen. Für cvxCoreTet
+gibt es keine Fixture.
+
+**Einheit D.**
+- **Cloth-Baryzentrik.** `cvxCoreClothNpBda` rechnete die Baryzentrik auf den rohen Vertices. Die
+  CUDA (`TrimeshBvh::getTriBarycentric`, convexCoreCollision.cu:672-680) schickt sie zuerst durch die
+  Mesh-Scale-Matrix. Auch die Identitätsmatrix macht dabei aus −0 ein +0. Neu ist
+  `cvxBvhTriBarycentric` in `pxgSlangCvxCoreBvh`, die Glue-Fixture `npCvxBvhGlue` treibt sie an:
+  - `npCvxBvhGlue_p94dTriBaryZeroSign` mit zwei Zeugen aus einer erschöpfenden Wirtsuche; der Zeuge
+    des Planers war falsch;
+  - die 8000 Zufallsfälle prüfen `bary` jetzt bitweise;
+  - der falsche Header-Kommentar ist korrigiert.
+
+  Der Revert an der Aufrufstelle im Kernel überlebt in `cvxCoreClothNp`, weil dessen Dreiecke
+  horizontal liegen und keine −0-Koordinaten haben. Die gemeinsame Funktion ist über die Glue-Fixture
+  bitweise festgenagelt.
+- **`softBodySdfMidphaseBda`.** Hier war der Fehler umgekehrt: Der Port rotierte mit der Konjugierten,
+  die CUDA `getInverse()` rechnet aber `q.rotateInv(−p)`. Jetzt wörtlich. Die Reverts überleben; das
+  Argument steht im Shader und betrifft nur das Nullvorzeichen eines Summanden.
+- **`npCvxTriNpSetup` / `npCvxHfNpSetup`** (Fixture-Zwillinge, convexMesh.cu:139 /
+  convexHeightfield.cu:208): `t2cp` über die Konjugierte. Neue Tests `npCvxTriNpSetup_p94dZeroSign`
+  und `npCvxHfNpSetup_p94dZeroSign` (`t2cp.y` = 0x80000000). Sweeps je 4/4.
+
+**Audit 2 ist damit vollständig abgearbeitet: alle 44 bestätigten Funde sind in P9.94a–d behoben.**
+Außerhalb des Audits offen: `pxgSlangCvxHfSetup:130` und die Normale in `pxgSlangCvxTriSetup` nutzen
+noch die Builtins `cross()`/`dot()`.
+
+**Foldscan:** 843 Stellen, UNREVIEWED 0. **Suite:** 883/883 in beiden Speichermodi.
+**Szenen:** 64/64.
 
 ## P9.94d (Teil 1) — Die `ct`-Quaternion-Helfer rechnen `PxQuat::rotate` wörtlich; Konjugierte und Identitäts-Skalierung im Kapsel-/Kugel-Pfad
 

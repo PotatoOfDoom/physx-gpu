@@ -111,11 +111,18 @@ static V3 nrmz(V3 v)
     return V3{ 0, 0, 0 };
 }
 
+// P9.94d twin: the OLD spelling of the translation, q.rotateInv(src.p - p).  The CUDA
+// (convexMesh.cu:139) is PxTransform::transformInv(PxTransform): qinv = q.getConjugate();
+// qinv.rotate(src.p - p) (PxTransform.h:162-169).  The two differ only in the sign of an
+// exact zero, which npCvxTriNpSetup_p94dZeroSign must show.
+static bool& p94dRotInvTwin() { static bool b = false; return b; }
+
 static void refSetup(const SetIn& s, SetOut& o)
 {
     const F4 conjC{ -s.cq.x, -s.cq.y, -s.cq.z, s.cq.w };
     const F4 t2cq = qMul(conjC, s.tq);
-    const V3 t2cp = qRotInv(s.cq, V3{ s.tp.x - s.cp.x, s.tp.y - s.cp.y, s.tp.z - s.cp.z });
+    const V3 rel{ s.tp.x - s.cp.x, s.tp.y - s.cp.y, s.tp.z - s.cp.z };
+    const V3 t2cp = p94dRotInvTwin() ? qRotInv(s.cq, rel) : qRot(conjC, rel);
     const float contactDist = s.dists.x + s.dists.y;
     o.t2cq = t2cq;
     o.t2cp = F4{ t2cp.x, t2cp.y, t2cp.z, contactDist };
@@ -260,6 +267,72 @@ PXG_TEST(npCvxTriNpSetup_setup)
                   "cvxTriNpSetup: coverage thin (flip %zu bv32 %zu deep %zu bigV %zu bigT %zu)",
                   cFlip, cBv32, cBv32Deep, cBigV, cBigT);
 
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.94d: t2cp = convexT.transformInv(trimeshT).p (convexMesh.cu:139) is
+// conj(cq).rotate(tp - cp), not cq.rotateInv(tp - cp).  cq = tq = identity,
+// cp = (1,0,0), tp = (1,-0,-0): tp - cp = (+0,-0,-0), and
+//   rotate((-0,-0,-0,1), .).y = vy*w2 + (qz*vx - qx*vz)*w + qy*d2 = -0 + -0 + -0 = -0
+//   rotateInv((0,0,0,1), .).y = vy*w2 - (qz*vx - qx*vz)*w + qy*d2 = -0 - +0 + +0 = +0
+// so the stored t2cp.y is 0x80000000 under the CUDA and 0 under the old spelling.
+// A 3-vertex / 1-triangle mesh, no BV32, identity scales; every output word compares.
+PXG_TEST(npCvxTriNpSetup_p94dZeroSign)
+{
+    const float nz = -0.0f;
+    SetIn s{};
+    s.cq = F4{ 0, 0, 0, 1 }; s.cp = F4{ 1, 0, 0, 0 };
+    s.tq = F4{ 0, 0, 0, 1 }; s.tp = F4{ 1, nz, nz, 0 };
+    s.cScaleS = F4{ 1, 1, 1, 0 }; s.cScaleR = F4{ 0, 0, 0, 1 };
+    s.tScaleS = F4{ 1, 1, 1, 0 }; s.tScaleR = F4{ 0, 0, 0, 1 };
+    s.dists = F4{ 0.125f, 0.25f, 0, 0 };
+    s.cvxBlob[0] = F4{ 0.25f, 0.5f, 0.75f, 0 };
+    s.cvxBlob[1] = F4{ u2f(0x00030004u), 0, 0, 0 };
+    word(s.blob, 0) = 3u; word(s.blob, 1) = 1u; word(s.blob, 2) = 0u; word(s.blob, 3) = 0u;
+    const float verts[3][3] = { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 0, 1 } };
+    const uint32_t vertsOff = 16u, triOff = vertsOff + 16u * 3u, adjOff = triOff + 16u, remapOff = adjOff + 16u;
+    for (uint32_t v = 0; v < 3; ++v)
+        for (uint32_t c = 0; c < 3; ++c)
+            word(s.blob, (vertsOff + 16u * v + 4u * c) / 4u) = f2u(verts[v][c]);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        word(s.blob, (triOff + 4u * c) / 4u) = c;
+        word(s.blob, (adjOff + 4u * c) / 4u) = 0xA0u + c;
+    }
+    word(s.blob, remapOff / 4u) = 0x77u;
+    s.pairInfo = U4{ 0u, 5u, 8u, 1u };
+
+    SetOut lit{}, twin{};
+    refSetup(s, lit);
+    p94dRotInvTwin() = true;
+    refSetup(s, twin);
+    p94dRotInvTwin() = false;
+    std::printf("  [p94d] t2cp literal %08x %08x %08x | rotateInv twin %08x %08x %08x\n",
+                f2u(lit.t2cp.x), f2u(lit.t2cp.y), f2u(lit.t2cp.z),
+                f2u(twin.t2cp.x), f2u(twin.t2cp.y), f2u(twin.t2cp.z));
+    PXG_CHECK_MSG(f2u(lit.t2cp.y) == 0x80000000u && f2u(twin.t2cp.y) == 0x00000000u,
+                  "p94d: literal t2cp.y 0x%08x (want -0), rotateInv twin 0x%08x (want +0)",
+                  f2u(lit.t2cp.y), f2u(twin.t2cp.y));
+    PXG_CHECK_MSG(std::memcmp(&lit, &twin, sizeof(SetOut)) != 0,
+                  "p94d: the rotateInv twin stores the same words -- not discriminating");
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<SetIn> in(1, s);
+    std::vector<SetOut> outInit(1);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct Prm { uint32_t numTests; } prm = { 1u };
+    Kernel k("npCvxTriNpSetup.spv", "cvxTriNpSetup",
+             { (uint32_t)sizeof(SetIn), (uint32_t)sizeof(SetOut) }, sizeof(Prm));
+    k.dispatch(1u, { bIn, bOut }, prm);
+    dev->flush();
+    const SetOut g = downloadBuffer<SetOut>(dev, bOut, 1)[0];
+    const uint32_t* gw = reinterpret_cast<const uint32_t*>(&g);
+    const uint32_t* lw = reinterpret_cast<const uint32_t*>(&lit);
+    const uint32_t* tw = reinterpret_cast<const uint32_t*>(&twin);
+    for (uint32_t w = 0; w < sizeof(SetOut) / 4u; ++w)
+        PXG_CHECK_MSG(gw[w] == lw[w], "p94d: output word %u GPU 0x%08x != literal 0x%08x (twin 0x%08x)",
+                      w, gw[w], lw[w], tw[w]);
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 

@@ -59,6 +59,7 @@
 #include "geometry/PxConvexCoreGeometry.h"  // PxConvexCore::Type (P9.75: eBOX read from the enum,
                                             // never a remembered 2 -- the P9.57 rule)
 #include "foundation/PxBounds3.h"            // PxBounds3 (P7.1 tranche 4a midphase AABB)
+#include "geometry/PxMeshScale.h"           // P9.94d: getTriBarycentric's scale.toMat33()
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
 
 #include <cstdint>
@@ -16728,7 +16729,23 @@ static_assert(offsetof(CvxCoreClothPush, w_maxNumContacts) == 168, "maxNumContac
 // [-1e-4, 1+1e-4] acceptance window whose bool gates a contact.  The kernel under
 // test has no such gate, and transcribing the windowed one would import a decision
 // that does not belong on this path.
+//
+// P9.94d: it is TrimeshBvh::getTriBarycentric (convexCoreCollision.cu:672-680) that the
+// kernel mirrors, and that transforms the three vertices by the cloth's
+// `scale.toMat33()` FIRST.  The cloth's PxMeshScale is default-constructed, i.e.
+// identity, and an identity PxMat33 transform is exact on nonzero coordinates but
+// maps -0 to +0 -- so the oracle goes through the real PxMeshScale().toMat33() too.
+static F4 cpuTriBarycentricRaw(V3c a, V3c b, V3c c, V3c p);
 static F4 cpuTriBarycentric(V3c a, V3c b, V3c c, V3c p)
+{
+    const physx::PxMat33 xform = physx::PxMeshScale().toMat33();
+    auto xf = [&](const V3c& v) {
+        const physx::PxVec3 r = xform.transform(physx::PxVec3(v.x, v.y, v.z));
+        return V3c{ r.x, r.y, r.z };
+    };
+    return cpuTriBarycentricRaw(xf(a), xf(b), xf(c), p);
+}
+static F4 cpuTriBarycentricRaw(V3c a, V3c b, V3c c, V3c p)
 {
     const V3c v0{ b.x - a.x, b.y - a.y, b.z - a.z };
     const V3c v1{ c.x - a.x, c.y - a.y, c.z - a.z };

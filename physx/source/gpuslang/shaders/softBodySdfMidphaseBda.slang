@@ -249,12 +249,35 @@ void sb_sdfMeshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID,
     const uint64_t tetIndices = bodies[sbId].mTetIndices;
     const uint64_t tetVerts = bodies[sbId].mPosition_InvMass;
 
-    // T3: the BARE inverse of the mesh pose.  PxTransform::getInverse() is
-    // (q.getConjugate(), q.rotateInv(-p)), and rotateInv by q is rotate by the
-    // conjugate, so this is the conjugate applied to the negated translation.
+    // T3: the BARE inverse of the mesh pose (softbodySoftbodyMidPhase.cu:1189,
+    // trimeshToWorld.getInverse()).  PxTransform::getInverse() is
+    // PxTransform(q.rotateInv(-p), q.getConjugate()) (PxTransform.h:114-118), and the
+    // translation is spelled that way here: rotateInv BY meshQ, not rotate by the
+    // conjugate.  P9.94d: the two are NOT bit-interchangeable -- they agree on every
+    // nonzero word and can differ in the sign of an exact zero (meshQ = identity,
+    // meshP = (1,0,0): rotateInv gives (-1,-0,-0), rotate(conj) (-1,+0,+0)).
+    //
+    // Why no fixture can see the difference (the revert mutant is expected to
+    // survive): aToBp is consumed ONLY as the addend of sdfTransformPoint,
+    // quatRotate(aToBq, v) + aToBp, so its zero sign survives only where the rotated
+    // vertex component is itself -0, and it then has to survive shape2Vertex, the SDF
+    // closest-point search and the exit transform trimeshToWorld.transform(.) (or
+    // .rotate for the normal) before it is stored.  On an identity mesh pose one of
+    // the two rotations erases it: if meshQ's imaginary parts are -0, aToBq =
+    // conj(meshQ) has +0 imaginary parts and the ENTRY rotate never outputs -0 (an
+    // identity quaternion with +0 imaginary parts cannot: its cross and dot terms
+    // cannot all be -0 at once), so `+0 + (+-0)` is +0 and the transformed tet is
+    // bit-identical either way; if they are +0, the EXIT rotate by meshQ never outputs
+    // -0, so the stored point and normal cannot carry it -- only the separation
+    // could, and only were it an exact-zero SDF distance whose sign followed a
+    // vertex coordinate's (not shown impossible, not reachable by any fixture).  On a
+    // general pose an exact-zero aToBp component needs an exact cancellation of
+    // -meshP under the rotation, plus an exact-zero rotated vertex on the same axis,
+    // plus exact zeros along every later sum.  The literal spelling is kept because it
+    // is what the CUDA computes; testSoftBodySdfMid's oracle is already getInverse().
     const float4 invQ = float4(-meshQ.x, -meshQ.y, -meshQ.z, meshQ.w);
     const float4 aToBq = invQ;
-    const float3 aToBp = quatRotate(invQ, -meshP);
+    const float3 aToBp = quatRotateInv(meshQ, -meshP);
 
     uint startIndex = 0u;
     while (startIndex < nbTets)

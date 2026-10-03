@@ -94,10 +94,14 @@
 // The value is IDENTITY, deterministically, and the CUDA is well-defined.  This is
 // therefore NOT an upstream bug candidate.
 //
-// The consequence for the port is that both call sites reduce to the raw vertices,
-// and this file spells that out (identity scale, identity rotation passed to
-// cvxBvhCreateConvex) rather than skipping the transform, so the day a cloth does
-// carry a scale the two stay in step.
+// The consequence for the port is that both call sites transform the vertices
+// through the IDENTITY matrix `scale.toMat33()`, and this file passes identity scale
+// and identity rotation to cvxBvhCreateConvex and cvxBvhTriBarycentric rather than
+// skipping the transform.  That is NOT the same as using the raw vertices: the
+// transform is `column0*v.x + column1*v.y + column2*v.z` with +0 off-diagonals, which
+// is exact on every nonzero component but turns a -0 into +0 wherever a +0 product
+// joins the sum -- and the barycentric of a triangle with signed-zero coordinates can
+// change its own zero sign with it (P9.94d; npCvxBvhGlue_p94dTriBaryZeroSign).
 //
 // ===========================================================================
 // WHAT IS REUSED
@@ -212,39 +216,9 @@ void cvxCoreClothComputeBounds(ShapeRef s, PtsRef pts, float margin, out float3 
                 cvxCoreClothSupport(s, pts, margin, Z).z);
 }
 
-// PxComputeBarycentric, the TRIANGLE overload (PxMathUtils.h:390-409).
-//
-// TRANSCRIBED FROM PxMathUtils.h, NOT from the corpus's `computeBarycentric`
-// (fcPrim2.slang:309, fcStaticTriCloth.slang:215).  Those are femClothPrimitives.cu's
-// function: the same Cramer arithmetic plus a [-1e-4, 1+1e-4] acceptance window whose
-// bool result gates a contact.  This call site has no gate and wants the raw
-// coordinates, so lifting one of those and ignoring its return would have imported a
-// window that does not belong here.
-//
-// `denom` is NOT guarded upstream -- a degenerate triangle divides by zero and
-// produces inf/NaN.  Transcribed as written; the engine relies on the midphase not
-// emitting degenerate triangles.
-float4 cvxCoreTriBarycentric(float3 a, float3 b, float3 c, float3 p)
-{
-    const float3 v0 = b - a;
-    const float3 v1 = c - a;
-    const float3 v2 = p - a;
-
-    const float d00 = dot3Q(v0, v0);
-    const float d01 = dot3Q(v0, v1);
-    const float d11 = dot3Q(v1, v1);
-    const float d20 = dot3Q(v2, v0);
-    const float d21 = dot3Q(v2, v1);
-
-    const float denom = d00 * d11 - d01 * d01;
-    const float v = (d11 * d20 - d01 * d21) / denom;
-    const float w = (d00 * d21 - d01 * d20) / denom;
-    const float u = 1.0f - v - w;
-
-    // bary.w = 0 upstream -- the fourth slot exists for the TETRAHEDRON overload
-    // (:358-377) and is deliberately zeroed on the triangle path.
-    return float4(u, v, w, 0.0f);
-}
+// PxComputeBarycentric and TrimeshBvh::getTriBarycentric live in pxgSlangCvxCoreBvh
+// (cvxBvhComputeBarycentric / cvxBvhTriBarycentric) since P9.94d, so that npCvxBvhGlue
+// drives the same text bitwise.
 
 // ===========================================================================
 // Gu::generateContacts, the SIX-argument overload (GuConvexSupport.h:1203-1207),
@@ -395,8 +369,9 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
         const PxgFEMClothGpu cloth = Ptr<PxgFEMClothGpu>(gCloth.femClothes)[clothId];
         Ptr<float4> clothVerts = Ptr<float4>(cloth.mPosition_InvMass);
         Ptr<uint4> clothTriInds = Ptr<uint4>(cloth.mTriangleVertexIndices);
-        // The scale left IDENTITY by that constructor -- see the header.  Spelled out
-        // so the two call sites below stay in step if a cloth ever carries one.
+        // The scale left IDENTITY by that constructor -- see the header.  Spelled out,
+        // and pushed through the identity matrix at BOTH call sites below exactly as the
+        // CUDA does (the transform is not a no-op on signed zeros).
         const float3 clothScale = float3(1, 1, 1);
         const float4 clothScaleRot = float4(0, 0, 0, 1);
 
@@ -437,7 +412,23 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
         // transform0in1 = transform1.transformInv(transform0) (:1241).
         const float4 conjQ1 = float4(-q1.x, -q1.y, -q1.z, q1.w);
         const float4 aToBq = npAbiQuatMul(conjQ1, q0);
-        const float3 aToBp = npAbiQuatRotateInv(q1, p0 - p1);
+        // P9.94d: qinv.rotate(src.p - p) with qinv = q.getConjugate(), as
+        // PxTransform::transformInv(PxTransform) spells it (PxTransform.h:162-169) --
+        // not q1.rotateInv(.), which differs only in the sign of an exact zero.
+        // NO FIXTURE PINS THIS LINE, AND THAT IS MEASURED, NOT ASSUMED.  aToBp only
+        // becomes ShapeRef.poseP, which every consumer uses as an ADDEND (poseTransform
+        // `quatRotQ(q, v) + poseP`, the face points `(quatRotQ(q, fpl) + poseP) + wn *
+        // margin`, the support `... + dir * margin`) or a subtrahend (`point - poseP`).
+        // A zero's sign survives a sum only when the other addend is -0 as well, so it
+        // reaches an output only along an all-zero chain.  cvxCoreClothNp's box at the
+        // origin gives the same bits on both spellings; a probe (P9.94d, not committed)
+        // with a POINT core (margin 0.2) at (-0, 1.05, -0) over the same cloth -- where
+        // the old spelling gives aToBp.z = +0 and this one -0 -- emitted bit-identical
+        // points, normals and barycentrics both ways.  Revert mutants survive
+        // cvxCoreClothNp for that reason (and because the cloth's own transform is
+        // identity, so a dropped/doubled conjugate is a zero-sign change too); the
+        // literal spelling is kept because it is what the CUDA computes.
+        const float3 aToBp = npAbiQuatRotate(conjQ1, p0 - p1);
 
         ShapeRef convex;
         float convexMargin;
@@ -505,7 +496,17 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
                 const float4 normDist = float4(-normal.x, -normal.y, -normal.z, patch[i].w);
                 // The barycentric is of the MIDPOINT `point`, not of patch[i].xyz
                 // (:1270) -- it is computed after the half-penetration shift.
-                const float4 bary = cvxCoreTriBarycentric(tv0, tv1, tv2, point);
+                // bvh.getTriBarycentric (:672-680) transforms the three vertices by
+                // scale.toMat33() FIRST, like createConvex; P9.94d made the port do the
+                // same instead of handing it the raw vertices (they differ on -0
+                // coordinates -- see the header).  The function is pinned bitwise by
+                // npCvxBvhGlue (incl. the zero-sign witnesses); reverting THIS call to
+                // raw vertices survives cvxCoreClothNp, whose cloth triangles are
+                // horizontal with no -0 coordinate -- an exhaustive host search over
+                // that family (x,z in {+-0.5,+-0}, contact point at a vertex or grid
+                // point) found no barycentric word that the identity transform changes.
+                const float4 bary = cvxBvhTriBarycentric(clothScale, clothScaleRot,
+                                                         tv0, tv1, tv2, point);
                 clothWriteRigidVsDeformable(index + i, posRest, normDist, bary,
                                             rigidId, pairInd1, rigidId, shape0.materialIndex);
             }

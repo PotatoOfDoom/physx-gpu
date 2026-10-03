@@ -30,9 +30,9 @@
 // same text rather than two copies of it.
 //
 // npCvxBvhGlue was written first, as a Phase-1 fixture, and it stays the arbiter:
-// `gpuslang.npCvxBvhGlue` drives scaleBounds, the callback margin, intersectBox and
-// createConvex against a CPU mirror and compares every output word.  After the lift
-// it drives THESE functions, which is the whole point of lifting this way round
+// `gpuslang.npCvxBvhGlue` drives scaleBounds, the callback margin, intersectBox,
+// createConvex and (since P9.94d) getTriBarycentric against a CPU mirror and
+// compares every output word.  After the lift it drives THESE functions, which is the whole point of lifting this way round
 // (the same move P9.67b made for the shape layer and P9.69a for GJK/EPA).
 //
 // An #include and not a module, for the reason MEASURED in pxgSlangCvxCoreCvx's
@@ -213,4 +213,58 @@ float3 cvxBvhTriNormal(float3 scale, float4 scaleRot, float3 v0, float3 v1, floa
     const float3 tv1 = cvxBvhMat33Transform(m0, m1, m2, v1);
     const float3 tv2 = cvxBvhMat33Transform(m0, m1, m2, v2);
     return getNormalizedQ(crossQ(tv1 - tv0, tv2 - tv0));
+}
+
+// PxComputeBarycentric, the TRIANGLE overload (PxMathUtils.h:390-409).  Moved here
+// from cvxCoreClothNpBda by P9.94d so the fixture drives it.
+//
+// TRANSCRIBED FROM PxMathUtils.h, NOT from the corpus's `computeBarycentric`
+// (fcPrim2.slang:309, fcStaticTriCloth.slang:215).  Those are femClothPrimitives.cu's
+// function: the same Cramer arithmetic plus a [-1e-4, 1+1e-4] acceptance window whose
+// bool result gates a contact.  This call site has no gate and wants the raw
+// coordinates, so lifting one of those and ignoring its return would have imported a
+// window that does not belong here.
+//
+// `denom` is NOT guarded upstream -- a degenerate triangle divides by zero and
+// produces inf/NaN.  Transcribed as written; the engine relies on the midphase not
+// emitting degenerate triangles.
+float4 cvxBvhComputeBarycentric(float3 a, float3 b, float3 c, float3 p)
+{
+    const float3 v0 = b - a;
+    const float3 v1 = c - a;
+    const float3 v2 = p - a;
+
+    const float d00 = dot3Q(v0, v0);
+    const float d01 = dot3Q(v0, v1);
+    const float d11 = dot3Q(v1, v1);
+    const float d20 = dot3Q(v2, v0);
+    const float d21 = dot3Q(v2, v1);
+
+    const float denom = d00 * d11 - d01 * d01;
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    const float u = 1.0f - v - w;
+
+    // bary.w = 0 upstream -- the fourth slot exists for the TETRAHEDRON overload
+    // (:358-377) and is deliberately zeroed on the triangle path.
+    return float4(u, v, w, 0.0f);
+}
+
+// TrimeshBvh::getTriBarycentric (convexCoreCollision.cu:672-680): the SAME forward
+// scale transform as createConvex and getTriNormal, THEN PxComputeBarycentric of the
+// query point against the transformed triangle.  P9.94d: the cloth kernel used to
+// pass the raw vertices on the grounds that the cloth's scale is identity -- but an
+// identity PxMat33 transform is not a bit-level no-op: `column0*x + column1*y +
+// column2*z` with +0 off-diagonals turns a -0 coordinate into +0 wherever a +0
+// product joins the sum, and that changes the zero sign of v or w on triangles with
+// signed-zero coordinates (npCvxBvhGlue_p94dTriBaryZeroSign).
+float4 cvxBvhTriBarycentric(float3 scale, float4 scaleRot, float3 v0, float3 v1, float3 v2,
+                            float3 p)
+{
+    float3 m0, m1, m2;
+    cvxBvhMeshScaleMat(scale, scaleRot, m0, m1, m2);
+    const float3 tv0 = cvxBvhMat33Transform(m0, m1, m2, v0);
+    const float3 tv1 = cvxBvhMat33Transform(m0, m1, m2, v1);
+    const float3 tv2 = cvxBvhMat33Transform(m0, m1, m2, v2);
+    return cvxBvhComputeBarycentric(tv0, tv1, tv2, p);
 }

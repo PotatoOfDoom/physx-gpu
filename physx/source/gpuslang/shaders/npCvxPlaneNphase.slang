@@ -270,9 +270,14 @@ void convexPlaneNphase_Kernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupTh
     // ======================================================================
     // REFRESH (npCvxPlaneRefresh.slang) — bToA, working normal, margin, keep.
     // ======================================================================
-    // bToA = planeTransform.transformInv(convexTransform)
-    const float4 bToAq = npAbiQuatMul(float4(-planeTq.x, -planeTq.y, -planeTq.z, planeTq.w), convexTq);
-    const float3 bToAp = npAbiQuatRotateInv(planeTq, convexTp - planeTp);
+    // bToA = planeTransform.transformInv(convexTransform) (cudaGJKEPA.cu:2860), spelled
+    // as PxTransform::transformInv(PxTransform) is (PxTransform.h:162-169): qinv =
+    // q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).  P9.94d: NOT
+    // q.rotateInv(v) -- same value, but an exact-zero component can take the other
+    // sign, and -bToAp is STORED as mRelativePos.
+    const float4 planeTqInv = float4(-planeTq.x, -planeTq.y, -planeTq.z, planeTq.w);
+    const float4 bToAq = npAbiQuatMul(planeTqInv, convexTq);
+    const float3 bToAp = npAbiQuatRotate(planeTqInv, convexTp - planeTp);
     // n = bToA.rotateInv(localNormal=(1,0,0)).getNormalized()
     const float3 n = getNormalized(npAbiQuatRotateInv(bToAq, float3(1, 0, 0)));
 

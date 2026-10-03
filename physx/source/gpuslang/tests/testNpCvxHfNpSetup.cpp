@@ -180,11 +180,18 @@ static void hfTriAdjacencyIndices(const HfsIn& s, uint32_t triangleIndex, uint32
     }
 }
 
+// P9.94d twin: the OLD spelling of the translation, q.rotateInv(src.p - p).  The CUDA
+// (convexHeightfield.cu:208) is PxTransform::transformInv(PxTransform): qinv = q.getConjugate();
+// qinv.rotate(src.p - p) (PxTransform.h:162-169).  The two differ only in the sign of an
+// exact zero, which npCvxHfNpSetup_p94dZeroSign must show.
+static bool& p94dRotInvTwin() { static bool b = false; return b; }
+
 static void refSetup(const HfsIn& s, HfsOut& o)
 {
     const F4 conjC{ -s.cq.x, -s.cq.y, -s.cq.z, s.cq.w };
     const F4 t2cq = qMul(conjC, s.tq);
-    const V3 t2cp = qRotInv(s.cq, V3{ s.tp.x - s.cp.x, s.tp.y - s.cp.y, s.tp.z - s.cp.z });
+    const V3 rel{ s.tp.x - s.cp.x, s.tp.y - s.cp.y, s.tp.z - s.cp.z };
+    const V3 t2cp = p94dRotInvTwin() ? qRotInv(s.cq, rel) : qRot(conjC, rel);
     const float contactDist = s.dists.x + s.dists.y;
     o.t2cq = t2cq;
     o.t2cp = F4{ t2cp.x, t2cp.y, t2cp.z, contactDist };
@@ -309,6 +316,60 @@ PXG_TEST(npCvxHfNpSetup_setup)
     PXG_CHECK_MSG(cWrong > N / 3 && cTess > N / 3 && cBoundary > N / 8 && cInterior > N / 8,
                   "cvxHfNpSetup: coverage thin (wrong %zu tess %zu bnd %zu int %zu)", cWrong, cTess, cBoundary, cInterior);
 
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// P9.94d: t2cp = convexT.transformInv(heightfieldT).p (convexHeightfield.cu:208) is
+// conj(cq).rotate(tp - cp), not cq.rotateInv(tp - cp) -- the same witness as
+// npCvxTriNpSetup_p94dZeroSign: cq = tq = identity, cp = (1,0,0), tp = (1,-0,-0) gives
+// t2cp.y = -0 (CUDA) against +0 (old spelling).  A 3x3 heightfield, positive heights,
+// no tessellation bits, unit scales; every output word compares.
+PXG_TEST(npCvxHfNpSetup_p94dZeroSign)
+{
+    const float nz = -0.0f;
+    HfsIn s{};
+    s.cq = F4{ 0, 0, 0, 1 }; s.cp = F4{ 1, 0, 0, 0 };
+    s.tq = F4{ 0, 0, 0, 1 }; s.tp = F4{ 1, nz, nz, 0 };
+    s.cScaleS = F4{ 1, 1, 1, 0 }; s.cScaleR = F4{ 0, 0, 0, 1 };
+    s.hfScale = F4{ 1, 1, 1, 0 };
+    s.dists = F4{ 0.125f, 0.25f, 0, 0 };
+    s.cvxBlob[0] = F4{ 0.25f, 0.5f, 0.75f, 0 };
+    s.cvxBlob[1] = F4{ u2f(0x00030004u), 0, 0, 0 };
+    word(s.hf, 0) = 3u; word(s.hf, 1) = 3u;
+    for (uint32_t v = 0; v < 9u; ++v) word(s.hf, 2 + v) = 2u + v;   // heights 2..10, no tess bit
+    s.pairInfo = U4{ 0u, 5u, 8u, 1u };
+
+    HfsOut lit{}, twin{};
+    refSetup(s, lit);
+    p94dRotInvTwin() = true;
+    refSetup(s, twin);
+    p94dRotInvTwin() = false;
+    std::printf("  [p94d] t2cp literal %08x %08x %08x | rotateInv twin %08x %08x %08x\n",
+                f2u(lit.t2cp.x), f2u(lit.t2cp.y), f2u(lit.t2cp.z),
+                f2u(twin.t2cp.x), f2u(twin.t2cp.y), f2u(twin.t2cp.z));
+    PXG_CHECK_MSG(f2u(lit.t2cp.y) == 0x80000000u && f2u(twin.t2cp.y) == 0x00000000u,
+                  "p94d: literal t2cp.y 0x%08x (want -0), rotateInv twin 0x%08x (want +0)",
+                  f2u(lit.t2cp.y), f2u(twin.t2cp.y));
+    PXG_CHECK_MSG(std::memcmp(&lit, &twin, sizeof(HfsOut)) != 0,
+                  "p94d: the rotateInv twin stores the same words -- not discriminating");
+
+    PxgSlangComputeDevice* dev = testDevice();
+    std::vector<HfsIn> in(1, s);
+    std::vector<HfsOut> outInit(1);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    struct Prm { uint32_t numTests; } prm = { 1u };
+    Kernel k("npCvxHfNpSetup.spv", "cvxHfNpSetup",
+             { (uint32_t)sizeof(HfsIn), (uint32_t)sizeof(HfsOut) }, sizeof(Prm));
+    k.dispatch(1u, { bIn, bOut }, prm);
+    dev->flush();
+    const HfsOut g = downloadBuffer<HfsOut>(dev, bOut, 1)[0];
+    const uint32_t* gw = reinterpret_cast<const uint32_t*>(&g);
+    const uint32_t* lw = reinterpret_cast<const uint32_t*>(&lit);
+    const uint32_t* tw = reinterpret_cast<const uint32_t*>(&twin);
+    for (uint32_t w = 0; w < sizeof(HfsOut) / 4u; ++w)
+        PXG_CHECK_MSG(gw[w] == lw[w], "p94d: output word %u GPU 0x%08x != literal 0x%08x (twin 0x%08x)",
+                      w, gw[w], lw[w], tw[w]);
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 

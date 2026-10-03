@@ -226,9 +226,14 @@ void trimeshPlaneNarrowphase(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThread
     const float ratio = 0.1f;
     const float breakingThresholdRatio = 0.5f;
 
-    // trimeshToPlane = planeTransform.transformInv(trimeshTransform)
-    const float4 relQ = npAbiQuatMul(float4(-planeQ.x, -planeQ.y, -planeQ.z, planeQ.w), meshQ);
-    const float3 relP = npAbiQuatRotateInv(planeQ, meshP - planeP);
+    // trimeshToPlane = planeTransform.transformInv(trimeshTransform) (trimeshCollision.cu:147),
+    // spelled as PxTransform::transformInv(PxTransform) is (PxTransform.h:162-169):
+    // qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).  P9.94d: NOT
+    // q.rotateInv(v) -- same value, but an exact-zero component can take the other
+    // sign, and relP is STORED (PCM_RELTRANSFORM_P below).
+    const float4 planeQinv = float4(-planeQ.x, -planeQ.y, -planeQ.z, planeQ.w);
+    const float4 relQ = npAbiQuatMul(planeQinv, meshQ);
+    const float3 relP = npAbiQuatRotate(planeQinv, meshP - planeP);
 
     const uint64_t manifold = gTP.multiManifold + uint64_t(workIndex) * PCM_STRIDE;
 

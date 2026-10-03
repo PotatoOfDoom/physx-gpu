@@ -136,9 +136,15 @@ void cvxTriNpSetup(uint3 dtid : SV_DispatchThreadID)
 
     SetOut r;
 
-    // trimeshToConvexTransform = convexT.transformInv(trimeshT)
+    // trimeshToConvexTransform = convexT.transformInv(trimeshT) (convexMesh.cu:139).
+    // PxTransform::transformInv(PxTransform) is qinv = q.getConjugate();
+    // (qinv.rotate(src.p - p), qinv * src.q) (PxTransform.h:162-169).  P9.94d: the
+    // translation is the CONJUGATE ROTATED, not quatRotInvQ(s.cq, .) -- the two agree on
+    // every nonzero word and differ in the sign of an exact zero (cq = identity,
+    // tp - cp = (0,-0,-0): t2cp.y is -0 here, +0 under rotateInv).
+    // npCvxTriNpSetup_p94dZeroSign pins it.
     const float4 t2cq = quatMulQ(quatConjQ(s.cq), s.tq);
-    const float3 t2cp = quatRotInvQ(s.cq, s.tp.xyz - s.cp.xyz);
+    const float3 t2cp = quatRotQ(quatConjQ(s.cq), s.tp.xyz - s.cp.xyz);
     const float contactDist = s.dists.x + s.dists.y;
     r.t2cq = t2cq;
     r.t2cp = float4(t2cp, contactDist);

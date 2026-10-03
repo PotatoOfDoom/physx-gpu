@@ -339,7 +339,14 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
         // transform0in1 = transform1.transformInv(transform0) (:1147).
         const float4 conjQ1 = float4(-q1.x, -q1.y, -q1.z, q1.w);
         const float4 aToBq = npAbiQuatMul(conjQ1, q0);
-        const float3 aToBp = npAbiQuatRotateInv(q1, p0 - p1);
+        // P9.94d: qinv.rotate(src.p - p) with qinv = q.getConjugate(), as
+        // PxTransform::transformInv(PxTransform) spells it (PxTransform.h:162-169) --
+        // not q1.rotateInv(.), which differs only in the sign of an exact zero.
+        // UNPINNED: no fixture loads cvxCoreTetNpBda.spv (scenes only).  aToBp only
+        // becomes ShapeRef.poseP, used as an addend/subtrahend throughout (see the same
+        // line in cvxCoreClothNpBda, whose fixture probe saw no output difference); the
+        // literal spelling is kept because it is what the CUDA computes.
+        const float3 aToBp = npAbiQuatRotate(conjQ1, p0 - p1);
 
         ShapeRef convex;
         float convexMargin;

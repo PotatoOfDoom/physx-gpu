@@ -199,8 +199,13 @@ void cvxHfNpSetup(uint3 dtid : SV_DispatchThreadID)
 
     HfsOut r;
 
+    // trimeshToConvexTransform = convexT.transformInv(heightfieldT)
+    // (convexHeightfield.cu:208): qinv = q.getConjugate(); (qinv.rotate(src.p - p),
+    // qinv * src.q) (PxTransform.h:162-169).  P9.94d: the CONJUGATE ROTATED, not
+    // quatRotInvQ(s.cq, .), which differs only in the sign of an exact zero;
+    // npCvxHfNpSetup_p94dZeroSign pins it.
     const float4 t2cq = quatMulQ(quatConjQ(s.cq), s.tq);
-    const float3 t2cp = quatRotInvQ(s.cq, s.tp.xyz - s.cp.xyz);
+    const float3 t2cp = quatRotQ(quatConjQ(s.cq), s.tp.xyz - s.cp.xyz);
     const float contactDist = s.dists.x + s.dists.y;
     r.t2cq = t2cq;
     r.t2cp = float4(t2cp, contactDist);

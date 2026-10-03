@@ -83,6 +83,17 @@ static inline V3 mul(const V3& a, float s) { return V3{ a.x * s, a.y * s, a.z * 
 static inline float dot3(const V3& a, const V3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static inline V3 unit(const V3& a) { float l = std::sqrt(dot3(a, a)); return l > 0 ? mul(a, 1.f / l) : a; }
 static V3 qRotInv(const F4& q, const V3& v) { const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z, w2 = q.w * q.w - 0.5f, d2 = q.x * vx + q.y * vy + q.z * vz; return V3{ vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * d2, vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * d2, vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d2 }; }
+static V3 qRot(const F4& q, const V3& v) { const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z, w2 = q.w * q.w - 0.5f, d2 = q.x * vx + q.y * vy + q.z * vz; return V3{ vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2, vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2, vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 }; }
+// P9.94d: aToB.p = transf1.transformInv(transf0).p (cudaGJKEPA.cu:2454), spelled as
+// PxTransform::transformInv(PxTransform) is (PxTransform.h:162-169): qinv =
+// q.getConjugate(); qinv.rotate(src.p - p).  The twin flag selects the pre-P9.94d
+// spelling q.rotateInv(src.p - p) -- the same value, but an exact-zero component
+// can take the other sign.  Used only by the vacuity probe in npCvxStage2Setup_p94dZeroSign.
+static bool gP94dRotInvTwin = false;
+static V3 tinvP(const F4& q, const V3& v)
+{
+    return gP94dRotInvTwin ? qRotInv(q, v) : qRot(F4{ -q.x, -q.y, -q.z, q.w }, v);
+}
 static F4 qMul(const F4& a, const F4& b)
 {
     return F4{ a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
@@ -119,7 +130,7 @@ static void refSetup(const S2In& s, float tol, S2Dbg& o)
 
     const F4 c{ -t1q.x, -t1q.y, -t1q.z, t1q.w };
     const F4 aq = qMul(c, t0q);
-    const V3 ap = qRotInv(t1q, sub(t0p, t1p));
+    const V3 ap = tinvP(t1q, sub(t0p, t1p));
 
     o.verts0[0] = F4{ 0, 0, 0, 0 }; o.verts0[1] = F4{ 0, 0, 0, 0 };
     float em, cm0, is0;
@@ -384,7 +395,8 @@ PXG_TEST(npCvxStage2Setup_engineAbi)
             if (!eqF4(r.rotOut0, g.rotOut0) || !eqF4(r.rotOut1, g.rotOut1) ||
                 !eqF4(r.tBq, g.tBq) || !eqF4(r.tBp, g.tBp) ||
                 !eqU4(r.materials, g.materials) ||
-                !eqF4(r.aToBq, g.aToBq) || !eqF4(r.aToBp, g.aToBp) ||
+                // P9.94d: aToB BITWISE (the TU is -ffp-contract=off, the .spv stamped)
+                std::memcmp(&r.aToBq, &g.aToBq, sizeof(F4)) != 0 || std::memcmp(&r.aToBp, &g.aToBp, sizeof(F4)) != 0 ||
                 !eqF4(r.verts0[0], g.verts0[0]) || !eqF4(r.verts0[1], g.verts0[1]) ||
                 !eqU4(r.counts0, g.counts0) || !eqU4(r.counts1, g.counts1) ||
                 !eqF4(r.params, g.params) || !eqU4(r.result, g.result)) ++mmD;
@@ -413,6 +425,120 @@ PXG_TEST(npCvxStage2Setup_engineAbi)
                   cSkipPair > total / 20 && cBadQuat > total / 40,
                   "stage2: coverage thin (sph %zu cap %zu box1 %zu flip %zu skip %zu badQuat %zu)",
                   cSphere, cCapsule, cBox1, cFlip, cSkipPair, cBadQuat);
+}
+
+// ---------------------------------------------------------------------------
+// P9.94d: the aToB.p zero sign, BITWISE, through the Debug entry (dbg.aToBp).
+// t1q = (-1,0,0,0) (180 deg about x) and t0p == t1p make v = (+0,+0,+0); the
+// CUDA's conj(t1q).rotate(v) is (+0,-0,+0), the old t1q.rotateInv(v) (-0,+0,+0).
+// One pair, the same marshalling as above (t0q non-unit: collide() stays gated).
+// ---------------------------------------------------------------------------
+PXG_TEST(npCvxStage2Setup_p94dZeroSign)
+{
+    using namespace physx;
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel", 56u, 0 },
+        { "npCvxStage2SetupDbg.spv", "convexConvexNphase_stage2KernelDebug", 64u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &s2Loader);
+    const float tol = 1.1f;
+
+    S2In s{};
+    s.meta0 = U4{ 3u, 7u, (12u << 16) | (8u << 8) | 6u, 0 };   // box
+    s.meta1 = U4{ 5u, 9u, (12u << 16) | (8u << 8) | 6u, 0 };   // convex mesh: no flip
+    s.scale0 = F4{ 1, 1, 1, 0 }; s.scale1 = F4{ 1, 1, 1, 0 };
+    s.rot0 = F4{ 0, 0, 0, 1 }; s.rot1 = F4{ 0, 0, 0, 1 };
+    s.extents0 = F4{ 0.5f, 0.5f, 0.5f, 0.25f }; s.extents1 = F4{ 0.5f, 0.5f, 0.5f, 0.25f };
+    s.t0q = F4{ 0.0f, 0.0f, 0.0f, 1.2f };                       // non-unit: collide() gated off
+    s.t1q = F4{ -1.0f, 0.0f, 0.0f, 0.0f };
+    s.t0p = F4{ 0.5f, 0.25f, -1.0f, 0.0625f };
+    s.t1p = F4{ 0.5f, 0.25f, -1.0f, 0.125f };
+    s.misc = U4{ 0u, 0, 0, 0 };
+
+    S2Dbg ref{}, twin{};
+    refSetup(s, tol, ref);
+    gP94dRotInvTwin = true;
+    refSetup(s, tol, twin);
+    gP94dRotInvTwin = false;
+    auto b = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    std::printf("  [p94d] CUDA aToB.p %08x %08x %08x | rotateInv twin %08x %08x %08x\n",
+                b(ref.aToBp.x), b(ref.aToBp.y), b(ref.aToBp.z), b(twin.aToBp.x), b(twin.aToBp.y), b(twin.aToBp.z));
+    PXG_CHECK_MSG(b(ref.aToBp.x) == 0u && b(ref.aToBp.y) == 0x80000000u && b(ref.aToBp.z) == 0u,
+                  "p94d: literal oracle bits differ from the hand-derived CUDA bits (+0,-0,+0)");
+    PXG_CHECK_MSG(std::memcmp(&ref.aToBp, &twin.aToBp, sizeof(F4)) != 0,
+                  "p94d: the rotateInv twin equals the literal oracle -- case not zero-sign sensitive");
+
+    PxgContactManagerInput cmIn; std::memset(&cmIn, 0, sizeof(cmIn));
+    cmIn.shapeRef0 = 0; cmIn.shapeRef1 = 1; cmIn.transformCacheRef0 = 0; cmIn.transformCacheRef1 = 1;
+    PxgShape shapes[2]; std::memset(shapes, 0, sizeof(shapes));
+    PxsCachedTransform cache[2]; std::memset(cache, 0, sizeof(cache));
+    PxgPersistentContactManifold mf; std::memset(&mf, 0xCD, sizeof(mf));
+    mf.mNbContacts = s.misc.x;
+    std::vector<uint8_t> blobs(128, 0);
+    PxgDevicePtr dBlobs = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dBlobs, blobs.size()) == PxgResult::Success, "memAlloc blobs");
+    if (!dBlobs) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    for (int k = 0; k < 2; ++k)
+    {
+        const U4& meta = k == 0 ? s.meta0 : s.meta1;
+        const F4& sc = k == 0 ? s.scale0 : s.scale1;
+        const F4& ro = k == 0 ? s.rot0 : s.rot1;
+        const F4& ex = k == 0 ? s.extents0 : s.extents1;
+        shapes[k].type = meta.x;
+        shapes[k].materialIndex = meta.y;
+        shapes[k].scale.scale = PxVec3(sc.x, sc.y, sc.z);
+        shapes[k].scale.rotation = PxQuat(ro.x, ro.y, ro.z, ro.w);
+        shapes[k].hullOrMeshPtr = size_t(dBlobs + uint64_t(k) * 64u);
+        U4 hdr{ meta.z, 0, 0, 0 };
+        std::memcpy(&blobs[size_t(k) * 64 + 16], &hdr, 16);
+        std::memcpy(&blobs[size_t(k) * 64 + 32], &ex, 16);
+    }
+    cache[0].transform.q = PxQuat(s.t0q.x, s.t0q.y, s.t0q.z, s.t0q.w);
+    cache[0].transform.p = PxVec3(s.t0p.x, s.t0p.y, s.t0p.z);
+    cache[1].transform.q = PxQuat(s.t1q.x, s.t1q.y, s.t1q.z, s.t1q.w);
+    cache[1].transform.p = PxVec3(s.t1p.x, s.t1p.y, s.t1p.z);
+    const float cdArr[2] = { s.t0p.w, s.t1p.w };
+    const uint32_t keep = 1u;
+
+    PxgDevicePtr dCmIn = 0, dShapes = 0, dCache = 0, dCd = 0, dMf = 0, dKeep = 0, dDbg = 0;
+    shim.memAlloc(&dCmIn, sizeof(cmIn));
+    shim.memAlloc(&dShapes, sizeof(shapes));
+    shim.memAlloc(&dCache, sizeof(cache));
+    shim.memAlloc(&dCd, sizeof(cdArr));
+    shim.memAlloc(&dMf, sizeof(mf));
+    shim.memAlloc(&dKeep, 4);
+    shim.memAlloc(&dDbg, sizeof(S2Dbg));
+    shim.memcpyHtoD(dBlobs, blobs.data(), blobs.size());
+    shim.memcpyHtoD(dCmIn, &cmIn, sizeof(cmIn));
+    shim.memcpyHtoD(dShapes, shapes, sizeof(shapes));
+    shim.memcpyHtoD(dCache, cache, sizeof(cache));
+    shim.memcpyHtoD(dCd, cdArr, sizeof(cdArr));
+    shim.memcpyHtoD(dMf, &mf, sizeof(mf));
+    shim.memcpyHtoD(dKeep, &keep, 4);
+    shim.memsetD32(dDbg, 0xCCCCCCCC, sizeof(S2Dbg) / 4);
+
+    struct Stage2DebugBlob
+    {
+        uint32_t numTests;
+        float toleranceLength;
+        uint64_t tempKeepPairsArray, cmInputs, cmManifolds, shapes, transformCache, contactDistance;
+        uint64_t debugOut;
+    } dblob = { 1u, tol, dKeep, dCmIn, dMf, dShapes, dCache, dCd, dDbg };
+    static_assert(sizeof(Stage2DebugBlob) == 64, "stage2 debug blob is 64 bytes");
+    PXG_CHECK_MSG(shim.launchKernel(1, 1, 1, 1, &dblob, sizeof(dblob)) == PxgResult::Success, "p94d launch (debug entry)");
+    shim.streamSynchronize();
+    S2Dbg g; shim.memcpyDtoH(&g, dDbg, sizeof(S2Dbg));
+    std::printf("  [p94d] GPU dbg.aToBp %08x %08x %08x %08x\n", b(g.aToBp.x), b(g.aToBp.y), b(g.aToBp.z), b(g.aToBp.w));
+    PXG_CHECK_MSG(std::memcmp(&g.aToBp, &ref.aToBp, sizeof(F4)) == 0 && std::memcmp(&g.aToBq, &ref.aToBq, sizeof(F4)) == 0,
+                  "p94d: dbg.aToB differs bitwise from the literal transformInv oracle%s",
+                  std::memcmp(&g.aToBp, &twin.aToBp, sizeof(F4)) == 0 ? " (it equals the rotateInv twin)" : "");
+    PXG_CHECK_MSG(eqF4(ref.rotOut0, g.rotOut0) && eqF4(ref.tBq, g.tBq) && eqF4(ref.tBp, g.tBp) &&
+                  eqU4(ref.counts0, g.counts0) && eqU4(ref.counts1, g.counts1) && eqF4(ref.params, g.params) &&
+                  eqU4(ref.result, g.result) && eqU4(ref.materials, g.materials),
+                  "p94d: the rest of the debug record differs from refSetup");
+    for (PxgDevicePtr pfree : { dBlobs, dCmIn, dShapes, dCache, dCd, dMf, dKeep, dDbg })
+        shim.memFree(pfree);
 }
 
 } // namespace

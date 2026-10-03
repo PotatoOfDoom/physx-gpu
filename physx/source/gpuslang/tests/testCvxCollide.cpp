@@ -906,7 +906,9 @@ static size_t p90RunCase(const P90Case& pc, size_t& twinDiff, bool& twoFace, boo
     const float c1[4] = { -t1q[0], -t1q[1], -t1q[2], t1q[3] };
     float aq[4];
     p90QMul(c1, q0, aq);
-    const V3 ap = p90QRotInv(t1q, p90Sub(pos0, V3{ 0.0f, 0.0f, 0.0f }));
+    // P9.94d: transformInv(PxTransform).p = q.getConjugate().rotate(src.p - p)
+    // (PxTransform.h:162-169), not q.rotateInv -- they differ in the sign of an exact zero.
+    const V3 ap = p90QRot(c1, p90Sub(pos0, V3{ 0.0f, 0.0f, 0.0f }));
     const float idq[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     const V3 sc0{ hh, rad, rad }, one{ 1.0f, 1.0f, 1.0f };
     auto vertex2Shape = [&](V3 v, V3 s) { return p90QRotInv(idq, p90MulV(p90QRot(idq, v), s)); };

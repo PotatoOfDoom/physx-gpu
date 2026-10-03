@@ -51,7 +51,8 @@
 //     sizeof(float4), S = 1, R = identity, identity pose, the callback
 //     margin) -- emitted here as the tranche-163 coreData image.
 // getTriNormal / getTriBarycentric were ported in npTriMesh.slang
-// (tranche 71); bv32TreeTraversal in npBv32.slang (tranche 76); the
+// (tranche 71); the convex-core getTriBarycentric (cvxBvhTriBarycentric, the
+// cloth kernel's) is driven here too since P9.94d; bv32TreeTraversal in npBv32.slang (tranche 76); the
 // Contact32 warp accumulator is tranche 173.  ALL outputs verify bitwise.
 
 struct BvhIn
@@ -63,6 +64,7 @@ struct BvhIn
     float4 v0, v1, v2;   // unscaled triangle verts
     float4 v3;           // the FOURTH vertex, for the tetrahedron arm (P9.73)
     float4 dir;          // support direction for the tet support query (P9.73)
+    float4 p;            // query point for getTriBarycentric (P9.94d)
 }
 
 struct BvhOut
@@ -76,6 +78,8 @@ struct BvhOut
     float4 tetVerts[4];  // read back THROUGH ptsAt, so the storage itself is checked
     uint4 tetCore[3];    // the tet PointsCore image (numPoints = 4)
     float4 tetSup;       // supportLocalQ over the 4-point inline pool.  THE decisive one.
+    // ---- getTriBarycentric (P9.94d) ----
+    float4 bary;         // cvxBvhTriBarycentric(scale, scaleRot, v0, v1, v2, p)
 }
 
 import pxgSlangCvxCoreShape;             // ShapeRef / PtsRef / ptsFromTri / CORE_POINTS
@@ -160,5 +164,12 @@ void cbgGlue(uint3 dtid : SV_DispatchThreadID)
     r.tetCore[1] = tetSh.core[1];
     r.tetCore[2] = tetSh.core[2];
     r.tetSup = float4(supportLocalQ(tetSh, tetPts, s.dir.xyz), 0.0f);
+
+    // ---- TrimeshBvh::getTriBarycentric (P9.94d) ----------------------------
+    // The cloth kernel's barycentric (convexCoreCollision.cu:1270 -> :672-680): the
+    // vertices go through the SAME forward mesh-scale matrix as createConvex before
+    // PxComputeBarycentric.  Driven here so the engine text is checked bitwise,
+    // including the signed-zero case the identity matrix changes.
+    r.bary = cvxBvhTriBarycentric(scale, s.scaleRot, s.v0.xyz, s.v1.xyz, s.v2.xyz, s.p.xyz);
     gOut[t] = r;
 }
