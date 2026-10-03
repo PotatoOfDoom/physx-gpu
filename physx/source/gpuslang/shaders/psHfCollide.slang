@@ -337,19 +337,26 @@ void ctPsHfCollide(uint3 tid : SV_DispatchThreadID)
         cVolumeRadius = contactDist;
     }
 
-    // world bound -> heightfield local bound (transformFast of the inverse:
-    // rotate the 8 corners == rotateInv of the axis extents)
+    // PxBounds3::transformFast(heightfieldTransform.getInverse(), worldBound)
+    // (particleSystemHFMidPhaseCG.cu:109-122) as the foundation spells it: getInverse() =
+    // (q.rotateInv(-p), q.getConjugate()) (PxTransform.h:114-118); centre =
+    // inv.q.rotate(c) + inv.p (PxBounds3.h:472-476, PxTransform.h:128-132); basis =
+    // PxMat33(inv.q) (PxMat33.h:136-163); extent = abs-sum of the scaled columns
+    // (PxBounds3.h:301-314).  NOT hfQ.rotateInv(c - p) / hfQ.rotateInv(e_i): for
+    // axis-aligned poses that moves the cell rectangle and the contact COUNT.
+    // Pinned by psHfCollide_boundLiteral.
     const float3 wmin = cVolumePos - float3(cVolumeRadius, cVolumeRadius, cVolumeRadius);
     const float3 wmax = cVolumePos + float3(cVolumeRadius, cVolumeRadius, cVolumeRadius);
-    // PxBounds3::transformFast(inverse(pose), bounds): center/extent form
     const float3 wc = (wmin + wmax) * 0.5f;
     const float3 we = (wmax - wmin) * 0.5f;
-    const float3 lc = quatRotateInv(mesh.hfQ, wc - mesh.hfP.xyz);
-    // |R^T| * extents via the rotation matrix rows of the inverse quat
-    const float3 col0 = quatRotateInv(mesh.hfQ, float3(1, 0, 0));
-    const float3 col1 = quatRotateInv(mesh.hfQ, float3(0, 1, 0));
-    const float3 col2 = quatRotateInv(mesh.hfQ, float3(0, 0, 1));
-    const float3 le = abs(col0) * we.x + abs(col1) * we.y + abs(col2) * we.z;
+    const float4 invQ = quatConjugate(mesh.hfQ);
+    const float3 invP = quatRotateInv(mesh.hfQ, -mesh.hfP.xyz);
+    const float3 lc = quatRotate(invQ, wc) + invP;
+    const PxgMat33 basis = mat33FromQuat(invQ);
+    const float3 c0 = basis.col0 * we.x;
+    const float3 c1 = basis.col1 * we.y;
+    const float3 c2 = basis.col2 * we.z;
+    const float3 le = abs(c0) + abs(c1) + abs(c2);
     float3 lmin = lc - le;
     float3 lmax = lc + le;
 

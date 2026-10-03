@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.94c: convexTrimeshMidphaseBda aToB (conjugate, stored zero signs) and the vertex-space query box
+(literal getInverse().toMat33() * PxMat33(conj q) + transformFast; general rounding moved the box
+faces and so the visited BV32 children), plus the particle-heightfield local bound in
+psHfMidphaseBda / psHfCollide (literal getInverse + transformFast).  Directed fixtures
+convexTrimeshMidphaseQueryBox, psHfCollide_boundLiteral, psHfMidphaseBoundLiteral.  Scenes 64/64.
 P9.94b: alignedTransformInvTransform (prep common, equivalent at kernel outputs, killed at helper
 level by the new acpTransformInvProbe entry), convexHfMidphase aToB (engine-observable) plus the
 equivalent midphase centres, fcMidphase centres, and four single inverse-rotation sites
@@ -2095,6 +2100,55 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.94c — Query-Boxen in Matrixform: convexTrimeshMidphase und die Heightfield-Grenze der Partikel
+
+**Ausgangslage.** Zwei Stellen bildeten eine CUDA-Matrixrechnung über Quaternionen nach. In exakter
+Arithmetik ist das gleich, in float32 rundet es anders. Diese Einheiten sind nicht nur
+Nullvorzeichen-Fälle: Die Rundung verschiebt Boxflächen um ULPs und damit, welche Knoten besucht
+werden.
+
+**1. `convexTrimeshMidphaseBda` (engine, `midphaseGeneratePairs`).**
+- **aToB** (convexMeshMidphase.cu:224, `transformInv(PxTransform)`) wird jetzt als
+  `quatRotate(q1inv, p0 − p1)` gerechnet. Der Unterschied betrifft nur das Nullvorzeichen, aber aToB
+  wird im ConvexMeshPair-Record gespeichert.
+- **Query-Box im Vertex-Raum** (cu:321-327): `trimeshScale.getInverse().toMat33() *
+  PxMat33(q.getConjugate())` und danach `PxBounds3::transformFast`, wörtlich über
+  `meshScaleToMat33`/`basisExtent` aus `pxgSlangCacheBound`, das der Shader jetzt importiert. Die
+  alte Form (rotateInv + shape2Vertex pro Achse) rundete anders.
+- **Tests.** `convexTrimeshMidphasePairs` setzt die Box auf (−0, boxY, −0) und prüft beide Records
+  bitweise, mit einem Vakuitäts-Wächter. Der neue Test `convexTrimeshMidphaseQueryBox` hat zwei
+  Fälle (gedrehte Box, gedrehtes, nicht-uniform skaliertes Mesh) und 12 Blatt-Kinder: pro Fläche
+  eines, das die erwartete Box berührt, und eines, das genau ein `nextafterf` außerhalb liegt.
+  Erwartet wird die Menge {0,1,2,6,7,8}. Das alte Spelling ergibt eine andere Menge, was der Test
+  als Wächter selbst nachrechnet.
+- **Sweep:** 12/12 getötet, alle Reverts eingeschlossen.
+
+**2. Heightfield-Grenze der Partikel (`psHfMidphaseBda` engine, `psHfCollide` Fixture-Zwilling).**
+- particleSystemHFMidPhaseCG.cu:122 rechnet
+  `PxBounds3::transformFast(heightfieldTransform.getInverse(), worldBound)`. Die Ports rechnen das
+  jetzt wörtlich:
+  - `invQ = conj(q)`, `invP = rotateInv(q, −p)`;
+  - Zentrum `rotate(invQ, wc) + invP`;
+  - Basis `mat33FromQuat(invQ)`;
+  - Extent `|c0| + |c1| + |c2|`.
+- **Tests.** Der neue Header `tests/pxgPsHfBoundCases.h` enthält drei Posen (X90, DIAG, DIAG035) mit
+  den erwarteten Kontaktzahlen für fünf Spellings. `psHfCollide_boundLiteral` prüft, dass das Orakel
+  jede Tabellenzahl reproduziert, und vergleicht die GPU-Zahl mit dem wörtlichen Spelling.
+  `psHfMidphaseBoundLiteral` prüft die BDA-Engine-Version, statisch und dynamisch.
+- **Sweeps:** je Shader 5 von 8 getötet. Die drei Überlebenden:
+  - `invp-conj` ist äquivalent: Nur das Nullvorzeichen ändert sich, und alle Verbraucher sind
+    vorzeichenblind (Vergleiche, `floor`/`ceil` → int, Höhen aus int16).
+  - `extent-absprod` ist äquivalent: `|m·we| = |m|·we` gilt exakt für `we ≥ +0`.
+  - `extent-reassoc` ist auf den Fixtures nicht beobachtbar, aber nicht als äquivalent bewiesen:
+    Float-Addition ist nicht assoziativ. Es ist ein Nachbarmutant, kein Revert.
+  - Der Host-Orakel-Sweep tötet 4 von 4.
+
+**Engine-Szenen.** Alle Heightfields der Engine-Szenen haben Identitätsrotation, die Meshböden
+ebenso. Dort sind altes und neues Spelling bis auf Nullvorzeichen gleich.
+
+**Foldscan:** UNREVIEWED 0, keine Basisänderung. **Suite:** 883/883 in beiden Speichermodi.
+**Szenen:** 64/64.
 
 ## P9.94b — Konjugiertes Rotieren statt `rotateInv`: Prep-Common, Midphase-Zentren und vier Einzelstellen
 

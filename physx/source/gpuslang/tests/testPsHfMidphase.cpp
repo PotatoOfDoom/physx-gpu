@@ -69,8 +69,13 @@
 //                           one-way counter PRE-SEEDED so the atomicAdd's returned
 //                           base is not zero.  One pair, so unlike the clobber test
 //                           there is no race and the outcome is exact.
+//   psHfMidphaseBoundLiteral -- P9.94c: the directed axis-aligned poses of
+//                           pxgPsHfBoundCases.h, where the local bound's spelling
+//                           decides the contact COUNT; the differential plus the
+//                           literal reference's counts.
 
 #include "pxgTestFramework.h"
+#include "pxgPsHfBoundCases.h"
 
 #include "host_defines.h"
 #include "PxgParticleSystem.h"     // PxgParticleSystem, PxgParticleContactWriter
@@ -287,6 +292,36 @@ static void buildScene(Scene& S)
         S.predPos[p] = { wp.x + 0.15f * uv(rng), wp.y + 0.15f * uv(rng),
                          wp.z + 0.15f * uv(rng), 1 };
     }
+}
+
+// The P9.94c directed scene: one pose of pxgPsHfBoundCases.h, its two particles
+// alternating over all NP slots (so every grid-stride lane sees both), predicted ==
+// current.  The heightfield is the header's ramp: rows 0-2 at 30/20/10, the rest 0,
+// materials 0 and no tessellation flag.
+static void buildBoundScene(Scene& S, const pxgpshfbound::Pose& pose)
+{
+    using namespace pxgpshfbound;
+    static_assert(kRows == Scene::ROWS && kCols == Scene::COLS, "the bound cases use the Scene grid");
+    auto fb = [](uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; };
+    S.samples.assign(Scene::ROWS * Scene::COLS, 0u);
+    for (uint32_t r = 0; r < 3u; ++r)
+        for (uint32_t c = 0; c < Scene::COLS; ++c)
+            S.samples[r * Scene::COLS + c] = uint32_t(uint16_t(kRowHeight[r]));
+    S.mesh.hfP = { fb(pose.p[0]), fb(pose.p[1]), fb(pose.p[2]), 0 };
+    S.mesh.hfQ = { fb(pose.q[0]), fb(pose.q[1]), fb(pose.q[2]), fb(pose.q[3]) };
+    S.cdPs = fb(pose.cdPs);
+    S.cdHf = fb(pose.cdHf);
+    S.mesh.scale = { 1.0f, 1.0f, 1.0f, S.cdPs + S.cdHf };
+    S.mesh.misc = { kRestDist, 0, 0, 0 };
+    S.mesh.dims = { Scene::ROWS, Scene::COLS, 0, 0 };
+    S.mesh.rigid = { 0x99u, 4u, 0, 0 };
+    S.curPos.resize(Scene::NP);
+    for (uint32_t i = 0; i < Scene::NP; ++i)
+    {
+        const Part& part = pose.part[i % 2u];
+        S.curPos[i] = { fb(part.cur[0]), fb(part.cur[1]), fb(part.cur[2]), 1.0f };
+    }
+    S.predPos = S.curPos;
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,4 +1562,92 @@ PXG_TEST(psHfMidphaseAccum)
 
     A.destroy(dev);
     B.destroy(dev);
+}
+
+// ===========================================================================
+// P9.94c: the local bound, on inputs where its spelling decides the contact COUNT.
+// The random scene's general rotation hides the difference between the CUDA's
+// transformFast(pose.getInverse(), bound) and a rotateInv spelling (no contact
+// moves), so a shader pair that both drifted would still pass psHfMidphase.  Here
+// each pose of pxgPsHfBoundCases.h fixes the count to the literal reference's,
+// which psHfCollide_boundLiteral derives and pins on the host.
+// ===========================================================================
+PXG_TEST(psHfMidphaseBoundLiteral)
+{
+    using namespace pxgpshfbound;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t refGroups = (Scene::NP + 255u) / 256u;
+
+    for (const Pose& pose : kPoses)
+    {
+        Scene S;
+        buildBoundScene(S, pose);
+        const uint32_t nLit[2] = { pose.part[0].nLit, pose.part[1].nLit };
+        const uint32_t sumLit = (Scene::NP / 2u) * (nLit[0] + nLit[1]);
+
+        for (const bool staticRigid : { true, false })
+        {
+            BdaOptions opt;
+            opt.enableCcd = false;
+            opt.staticRigid = staticRigid;
+            const char* mode = staticRigid ? "static" : "dynamic";
+
+            BdaRig A;
+            RefRig B;
+            buildBda(dev, S, opt, A);
+            buildRef(dev, S, opt, B);
+            {
+                Kernel k("psHfMidphaseBda.spv", "ps_heightfieldCollisonLaunch", {}, sizeof(PsHfMidBlob));
+                k.dispatch(64u, {}, A.blob, 1u, 1u);
+            }
+            {
+                Kernel k("psHfCollide.spv", "ctPsHfCollide", refStrides(), sizeof(PhParams));
+                k.dispatch(refGroups, B.bindings(), B.prm);
+            }
+            dev->flush();
+
+            const auto aI = downloadBuffer<F4>(dev, A.bInfos.h, size_t(Scene::NP) * MAXPART);
+            const auto bI = downloadBuffer<F4>(dev, B.bI, size_t(Scene::NP) * MAXPART);
+            const auto aC = downloadBuffer<uint32_t>(dev, A.bCounts.h, Scene::NP);
+            const auto bC = downloadBuffer<uint32_t>(dev, B.bC, Scene::NP);
+            const auto aN = downloadBuffer<uint32_t>(dev, A.bNodeIdx.h, size_t(Scene::NP) * MAXPART * 2u);
+            const auto bN = downloadBuffer<uint32_t>(dev, B.bNi, size_t(Scene::NP) * MAXPART * 2u);
+            PXG_CHECK_MSG(std::memcmp(aC.data(), bC.data(), aC.size() * 4) == 0,
+                          "%s %s: the one-way COUNTS differ", pose.name, mode);
+            PXG_CHECK_MSG(std::memcmp(aI.data(), bI.data(), aI.size() * sizeof(F4)) == 0,
+                          "%s %s: the one-way CONTACT INFOS differ", pose.name, mode);
+            PXG_CHECK_MSG(std::memcmp(aN.data(), bN.data(), aN.size() * 4) == 0,
+                          "%s %s: the one-way NODE INDICES differ", pose.name, mode);
+
+            const uint32_t aW = downloadBuffer<uint32_t>(dev, A.bCount.h, 1)[0];
+            const uint32_t bW = downloadBuffer<uint32_t>(dev, B.bWc, 1)[0];
+            PXG_CHECK_MSG(aW == bW, "%s %s: writer counters differ (%u vs %u)", pose.name, mode, aW, bW);
+            {
+                const auto aCt = downloadBuffer<PsC>(dev, A.bContacts.h, Scene::CAP);
+                const auto bCt = downloadBuffer<PsC>(dev, B.bW, Scene::CAP);
+                const auto ga = groupByParticle(aCt, std::min(aW, Scene::CAP));
+                const auto gb = groupByParticle(bCt, std::min(bW, Scene::CAP));
+                size_t mism = 0;
+                for (uint32_t p = 0; p <= Scene::NP; ++p)
+                {
+                    if (ga[p].size() != gb[p].size()) { ++mism; continue; }
+                    for (size_t i = 0; i < ga[p].size(); ++i)
+                        if (!sameContact(ga[p][i], gb[p][i])) { ++mism; break; }
+                }
+                PXG_CHECK_MSG(mism == 0, "%s %s: %zu particles' writer contacts differ", pose.name, mode, mism);
+            }
+
+            // The literal reference's count, not merely agreement between the twins.
+            size_t wrong = 0;
+            for (uint32_t i = 0; i < Scene::NP; ++i)
+                if (aC[i] != (staticRigid ? nLit[i % 2u] : 0u)) ++wrong;
+            PXG_CHECK_MSG(wrong == 0, "%s %s: %zu one-way counts differ from the literal reference (%u, %u)",
+                          pose.name, mode, wrong, nLit[0], nLit[1]);
+            const uint32_t wantW = staticRigid ? 0u : sumLit;
+            PXG_CHECK_MSG(aW == wantW, "%s %s: writer counter %u, literal total %u", pose.name, mode, aW, wantW);
+
+            A.destroy(dev);
+            B.destroy(dev);
+        }
+    }
 }

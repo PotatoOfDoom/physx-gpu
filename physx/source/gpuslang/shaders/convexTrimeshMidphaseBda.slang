@@ -78,6 +78,7 @@ import pxgSlangCommon;
 import pxgSlangBv32;
 import pxgSlangTriBox;
 import pxgSlangPcmManifold;
+import pxgSlangCacheBound;
 
 static const uint WARP = 32u;
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
@@ -255,9 +256,13 @@ void midphaseGeneratePairs(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         const float4 q1 = Ptr<float4>(xf1)[0];
         const float3 p1 = float3(Ptr<float>(xf1 + 16UL)[0], Ptr<float>(xf1 + 20UL)[0], Ptr<float>(xf1 + 24UL)[0]);
 
-        // trimeshTransform.transformInv(shapeTransform): q = conj(q1)*q0, p = rotInv(q1, p0 - p1)
-        const float4 aToBq = quatMul(quatConjugate(q1), q0);
-        const float3 aToBp = quatRotateInv(q1, p0 - p1);
+        // convexMeshMidphase.cu:224 shapeToMeshNoScale = trimeshTransform.transformInv(shapeTransform)
+        // -> PxTransform.h:162-169: qinv = q.getConjugate(); (qinv.rotate(src.p - p), qinv * src.q).
+        // P9.94: NOT quatRotateInv(q1, p0 - p1) -- same bits except the sign of an exact zero,
+        // and aToB.p is stored in the ConvexMeshPair record (and feeds the manifold refresh).
+        const float4 q1inv = quatConjugate(q1);
+        const float4 aToBq = quatMul(q1inv, q0);
+        const float3 aToBp = quatRotate(q1inv, p0 - p1);
 
         const float3 shapeScale = float3(shape.scaleX, shape.scaleY, shape.scaleZ);
         const float4 shapeScaleRot = float4(shape.scaleRotX, shape.scaleRotY, shape.scaleRotZ, shape.scaleRotW);
@@ -341,25 +346,23 @@ void midphaseGeneratePairs(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
             const float3 center = (aabbMin + aabbMax) * 0.5f;
             const float3 inflatedExtents = (aabbMax - aabbMin) * 0.5f + float3(contactDist, contactDist, contactDist);
 
-            // The VERTEX-space box the tree walk uses: translate by -meshPos, fatten,
-            // then transform by inverse(meshScale) * conj(meshRot).  PxBounds3::transformFast
-            // over a rotation is the centre/extent form below.
+            // The VERTEX-space box the tree walk uses (convexMeshMidphase.cu:321-327):
+            //   aabb.min/max -= trimeshTransf.p; fattenFast(contactDist);
+            //   worldToTrimeshVertex = trimeshScale.getInverse().toMat33() * PxMat33(q.getConjugate());
+            //   PxBounds3::transformFast(M, b) = basisExtent(M * getCenter(), M, getExtents())
+            //   (PxBounds3.h:460-464, :301-314).  P9.94: the matrix is built and applied literally;
+            //   the pre-fix quatRotateInv + shape2Vertex per axis is equal in exact arithmetic but a
+            //   different float tree -- it moved these faces by ULPs, i.e. which BV32 children are visited.
             float3 vMin = aabbMin - p1 - float3(contactDist, contactDist, contactDist);
             float3 vMax = aabbMax - p1 + float3(contactDist, contactDist, contactDist);
             {
-                const float3 c = (vMin + vMax) * 0.5f;
-                const float3 e = (vMax - vMin) * 0.5f;
-                // worldToTrimeshVertex = meshScale.getInverse().toMat33() * Mat33(conj(q1)).
-                // Applied to the centre directly and to the extents through |M|.
-                const float3 cRot = quatRotateInv(q1, c);
-                const float3 cV = mpShape2Vertex(cRot, triScale, triScaleRot);
-                // Extent transform: the row-absolute sum of the same linear map.  Built by
-                // mapping the three axis extents and taking |.| componentwise, which is the
-                // same bound PxBounds3::transformFast computes.
-                const float3 ex = abs(mpShape2Vertex(quatRotateInv(q1, float3(e.x, 0, 0)), triScale, triScaleRot));
-                const float3 ey = abs(mpShape2Vertex(quatRotateInv(q1, float3(0, e.y, 0)), triScale, triScaleRot));
-                const float3 ez = abs(mpShape2Vertex(quatRotateInv(q1, float3(0, 0, e.z)), triScale, triScaleRot));
-                const float3 eV = ex + ey + ez;
+                // PxMeshScale::getInverse() (PxMeshScale.h:112-115): reciprocal scale, same rotation.
+                const float3 invTriScale = float3(1.0f / triScale.x, 1.0f / triScale.y, 1.0f / triScale.z);
+                const PxgMat33 worldToTrimeshVertex = mat33MulMat33(meshScaleToMat33(invTriScale, triScaleRot), mat33FromQuat(q1inv));
+                const float3 c = (vMin + vMax) * 0.5f;   // getCenter()  PxBounds3.h:392-396
+                const float3 e = (vMax - vMin) * 0.5f;   // getExtents() PxBounds3.h:410-420
+                const float3 cV = mat33Transform(worldToTrimeshVertex, c);
+                const float3 eV = basisExtent(worldToTrimeshVertex, e);
                 vMin = cV - eV;
                 vMax = cV + eV;
             }

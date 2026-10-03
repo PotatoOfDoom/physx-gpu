@@ -567,17 +567,26 @@ void ps_heightfieldCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
             cVolumeRadius = contactDist;
         }
 
-        // PxBounds3::transformFast(inverse(pose), worldBound), in centre/extent
-        // form: the rotated extent is |R^T| applied to the axis extents.
+        // PxBounds3::transformFast(heightfieldTransform.getInverse(), worldBound)
+        // (particleSystemHFMidPhaseCG.cu:109-122) as the foundation spells it: getInverse() =
+        // (q.rotateInv(-p), q.getConjugate()) (PxTransform.h:114-118); centre =
+        // inv.q.rotate(c) + inv.p (PxBounds3.h:472-476, PxTransform.h:128-132); basis =
+        // PxMat33(inv.q) (PxMat33.h:136-163); extent = abs-sum of the scaled columns
+        // (PxBounds3.h:301-314).  NOT hfQ.rotateInv(c - p) / hfQ.rotateInv(e_i): for
+        // axis-aligned poses that moves the cell rectangle and the contact COUNT.
+        // Pinned by psHfMidphaseBoundLiteral.
         const float3 wmin = cVolumePos - float3(cVolumeRadius, cVolumeRadius, cVolumeRadius);
         const float3 wmax = cVolumePos + float3(cVolumeRadius, cVolumeRadius, cVolumeRadius);
         const float3 wc = (wmin + wmax) * 0.5f;
         const float3 we = (wmax - wmin) * 0.5f;
-        const float3 lc = quatRotateInv(hfQ, wc - hfP);
-        const float3 col0 = quatRotateInv(hfQ, float3(1, 0, 0));
-        const float3 col1 = quatRotateInv(hfQ, float3(0, 1, 0));
-        const float3 col2 = quatRotateInv(hfQ, float3(0, 0, 1));
-        const float3 le = abs(col0) * we.x + abs(col1) * we.y + abs(col2) * we.z;
+        const float4 invQ = quatConjugate(hfQ);
+        const float3 invP = quatRotateInv(hfQ, -hfP);
+        const float3 lc = quatRotate(invQ, wc) + invP;
+        const PxgMat33 basis = mat33FromQuat(invQ);
+        const float3 c0 = basis.col0 * we.x;
+        const float3 c1 = basis.col1 * we.y;
+        const float3 c2 = basis.col2 * we.z;
+        const float3 le = abs(c0) + abs(c1) + abs(c2);
         float3 lmin = lc - le;
         float3 lmax = lc + le;
 

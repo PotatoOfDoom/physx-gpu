@@ -54,10 +54,12 @@
 // PxBitAndByte 7-bit mask).
 
 #include "pxgTestFramework.h"
+#include "pxgPsHfBoundCases.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -102,6 +104,73 @@ static V3 quatRotateInv(F4 q, V3 v)
     return { vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * d,
              vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * d,
              vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d };
+}
+
+// mirrors PxMat33(const PxQuat&) (PxMat33.h:136-163)
+static void refMat33FromQuat(F4 q, V3& col0, V3& col1, V3& col2)
+{
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    col0 = { 1.0f - yy - zz, xy + zw, xz - yw };
+    col1 = { xy - zw, 1.0f - xx - zz, yz + xw };
+    col2 = { xz + yw, yz - xw, 1.0f - xx - yy };
+}
+
+// Which spelling of PxBounds3::transformFast(pose.getInverse(), worldBound)
+// (particleSystemHFMidPhaseCG.cu:122) the reference uses.  Literal is the CUDA and
+// the only one the GPU is compared against; the others are the pre-P9.94c port's
+// pieces and the dropped-conjugate slip, kept ONLY so psHfCollide_boundLiteral can
+// assert that its directed inputs tell each of them apart from the literal one.
+enum class HfBoundSpelling
+{
+    Literal,          // (inv.q.rotate(c) + inv.p, PxMat33(inv.q)), inv = (q.rotateInv(-p), conj q)
+    CentreRotateInv,  // centre q.rotateInv(c - p), basis literal
+    BasisRotateInv,   // centre literal, basis columns q.rotateInv(e_i)
+    OldPort,          // both of the above (the port before P9.94c)
+    BasisNoConj       // literal, but PxMat33(q) instead of PxMat33(conj q)
+};
+
+static void refLocalBound(const PhMesh& mesh, V3 wmin, V3 wmax, HfBoundSpelling s, V3& lmin, V3& lmax)
+{
+    const F4 q = mesh.hfQ;
+    const V3 wc = muls(add(wmin, wmax), 0.5f), we = muls(sub(wmax, wmin), 0.5f);
+    const bool oldCentre = s == HfBoundSpelling::CentreRotateInv || s == HfBoundSpelling::OldPort;
+    const bool oldBasis = s == HfBoundSpelling::BasisRotateInv || s == HfBoundSpelling::OldPort;
+    V3 lc, le;
+    if (oldCentre)
+        lc = quatRotateInv(q, sub(wc, v3(mesh.hfP)));
+    else
+    {
+        // PxTransform::getInverse() (PxTransform.h:114-118), then inv.transform(c)
+        // (PxTransform.h:128-132)
+        const F4 invQ = { -q.x, -q.y, -q.z, q.w };
+        lc = add(quatRotate(invQ, wc), quatRotateInv(q, V3{ -mesh.hfP.x, -mesh.hfP.y, -mesh.hfP.z }));
+    }
+    if (oldBasis)
+    {
+        const V3 c0 = quatRotateInv(q, V3{ 1, 0, 0 });
+        const V3 c1 = quatRotateInv(q, V3{ 0, 1, 0 });
+        const V3 c2 = quatRotateInv(q, V3{ 0, 0, 1 });
+        le = { std::fabs(c0.x) * we.x + std::fabs(c1.x) * we.y + std::fabs(c2.x) * we.z,
+               std::fabs(c0.y) * we.x + std::fabs(c1.y) * we.y + std::fabs(c2.y) * we.z,
+               std::fabs(c0.z) * we.x + std::fabs(c1.z) * we.y + std::fabs(c2.z) * we.z };
+    }
+    else
+    {
+        // PxBounds3::basisExtent(center, PxMat33(inv.q), extent) (PxBounds3.h:301-314)
+        const F4 invQ = { -q.x, -q.y, -q.z, q.w };
+        V3 b0, b1, b2;
+        refMat33FromQuat(s == HfBoundSpelling::BasisNoConj ? q : invQ, b0, b1, b2);
+        const V3 c0 = muls(b0, we.x), c1 = muls(b1, we.y), c2 = muls(b2, we.z);
+        le = { std::fabs(c0.x) + std::fabs(c1.x) + std::fabs(c2.x),
+               std::fabs(c0.y) + std::fabs(c1.y) + std::fabs(c2.y),
+               std::fabs(c0.z) + std::fabs(c1.z) + std::fabs(c2.z) };
+    }
+    lmin = sub(lc, le);
+    lmax = add(lc, le);
 }
 
 static V3 refTriClosest(V3 p, V3 a, V3 b, V3 c)
@@ -208,7 +277,8 @@ static uint32_t clampI(int v, int lo, int hi) { return (uint32_t)std::min(std::m
 // full reference for one particle against one heightfield mesh; returns the
 // deterministic temp list
 static uint32_t refParticle(const Hf& hf, const PhMesh& mesh, V3 cur, V3 pred,
-                            bool ccd, bool tgs, bool diffuse, F4* temp, Slack& sl)
+                            bool ccd, bool tgs, bool diffuse, F4* temp, Slack& sl,
+                            HfBoundSpelling spelling = HfBoundSpelling::Literal)
 {
     const float contactDist = mesh.scale.w, restDist = mesh.misc.x;
     V3 cvp = cur;
@@ -221,15 +291,8 @@ static uint32_t refParticle(const Hf& hf, const PhMesh& mesh, V3 cur, V3 pred,
         cvr = std::sqrt(dot3(off, off)) + contactDist;
     }
     const V3 wmin = sub(cvp, V3{ cvr, cvr, cvr }), wmax = add(cvp, V3{ cvr, cvr, cvr });
-    const V3 wc = muls(add(wmin, wmax), 0.5f), we = muls(sub(wmax, wmin), 0.5f);
-    const V3 lc = quatRotateInv(mesh.hfQ, sub(wc, v3(mesh.hfP)));
-    const V3 c0 = quatRotateInv(mesh.hfQ, V3{ 1, 0, 0 });
-    const V3 c1 = quatRotateInv(mesh.hfQ, V3{ 0, 1, 0 });
-    const V3 c2 = quatRotateInv(mesh.hfQ, V3{ 0, 0, 1 });
-    const V3 le = { std::fabs(c0.x) * we.x + std::fabs(c1.x) * we.y + std::fabs(c2.x) * we.z,
-                    std::fabs(c0.y) * we.x + std::fabs(c1.y) * we.y + std::fabs(c2.y) * we.z,
-                    std::fabs(c0.z) * we.x + std::fabs(c1.z) * we.y + std::fabs(c2.z) * we.z };
-    V3 lmin = sub(lc, le), lmax = add(lc, le);
+    V3 lmin, lmax;
+    refLocalBound(mesh, wmin, wmax, spelling, lmin, lmax);
     const float oh = 1.0f / mesh.scale.y, orow = 1.0f / std::fabs(mesh.scale.x), ocol = 1.0f / std::fabs(mesh.scale.z);
     lmin = { lmin.x * orow, lmin.y * oh, lmin.z * ocol };
     lmax = { lmax.x * orow, lmax.y * oh, lmax.z * ocol };
@@ -672,6 +735,173 @@ PXG_TEST(psHfCollide_core)
         PXG_CHECK_MSG(mmH == 0, "psHfCollide: %zu capacity-guard violations", mmH);
         PXG_CHECK_MSG(H.wc == B.wc && H.wc > TINY,
                       "psHfCollide: overflow counter %u (expected %u > %u)", H.wc, B.wc, TINY);
+    }
+}
+
+// P9.94c: the local bound must be the CUDA's literal
+// PxBounds3::transformFast(pose.getInverse(), worldBound).  Under psHfCollide_core's
+// general rotation the old rotateInv spelling moves bounds by an ULP but never a
+// contact, so this test uses the directed axis-aligned poses of pxgPsHfBoundCases.h,
+// where the one-way contact COUNT itself depends on the spelling.  No Slack taint:
+// these particles sit on an integer row boundary by construction, and that is the
+// point.  Counts, node indices and sentinels compare exactly; contact values with
+// almostEqual only (every non-count decision has margin, see the header).
+PXG_TEST(psHfCollide_boundLiteral)
+{
+    using namespace pxgpshfbound;
+    auto fb = [](uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; };
+    auto bitsOf = [](float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; };
+    const uint32_t NP = 2, SYS = 6, CAP = 64;
+
+    Hf hf;
+    hf.rows = kRows;
+    hf.cols = kCols;
+    hf.samples.resize(kRows * kCols);
+    for (uint32_t r = 0; r < kRows; ++r)
+        for (uint32_t c = 0; c < kCols; ++c)
+        {
+            const int16_t h = r < 3 ? kRowHeight[r] : int16_t(0);
+            hf.samples[r * kCols + c] = uint32_t(uint16_t(h));   // materials 0, tess flag 0
+        }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const std::vector<uint32_t> strides = { (uint32_t)sizeof(PhMesh), 4, 16, 16, 16, 8, 4,
+                                            (uint32_t)sizeof(PsC), 8, 4, 4, 8, 4, 4, 4 };
+    const HfBoundSpelling spellings[5] = { HfBoundSpelling::Literal, HfBoundSpelling::CentreRotateInv,
+                                           HfBoundSpelling::BasisRotateInv, HfBoundSpelling::OldPort,
+                                           HfBoundSpelling::BasisNoConj };
+    const char* spellingName[5] = { "literal", "centre-rotateInv", "basis-rotateInv", "old-port",
+                                    "basis-noconj" };
+
+    for (const Pose& pose : kPoses)
+    {
+        PhMesh mesh;
+        mesh.hfP = { fb(pose.p[0]), fb(pose.p[1]), fb(pose.p[2]), 0 };
+        mesh.hfQ = { fb(pose.q[0]), fb(pose.q[1]), fb(pose.q[2]), fb(pose.q[3]) };
+        const float cd = fb(pose.cdPs) + fb(pose.cdHf);
+        mesh.scale = { 1.0f, 1.0f, 1.0f, cd };
+        mesh.misc = { kRestDist, 0, 0, 0 };
+        mesh.dims = { kRows, kCols, 0, 0 };
+        mesh.rigid = { 0x99u, 4u, 0, 0 };
+        if (std::strcmp(pose.name, "DIAG035") == 0)
+            PXG_CHECK_MSG(bitsOf(cd) == 0x3eb33333u, "%s: contactDist bits 0x%08x", pose.name, bitsOf(cd));
+
+        std::vector<F4> pos(NP);
+        std::vector<F4> ref[2];
+        uint32_t nLit[2], sumLit = 0;
+        for (uint32_t i = 0; i < NP; ++i)
+        {
+            const Part& part = pose.part[i];
+            pos[i] = { fb(part.cur[0]), fb(part.cur[1]), fb(part.cur[2]), 1.0f };
+            const uint32_t expect[5] = { part.nLit, part.nCentre, part.nBasis, part.nOld, part.nNoConj };
+            for (uint32_t k = 0; k < 5; ++k)
+            {
+                F4 tmp[MAXMESH];
+                Slack sl;   // deliberately unused: these inputs are knife-edged by design
+                const uint32_t n = refParticle(hf, mesh, v3(pos[i]), v3(pos[i]), false, false, false,
+                                               tmp, sl, spellings[k]);
+                // the DESIGN check: each spelling yields the tabulated count, so the
+                // inputs really separate the literal spelling from every other one
+                PXG_CHECK_MSG(n == expect[k], "%s part %u: %s reference count %u, table %u",
+                              pose.name, i, spellingName[k], n, expect[k]);
+                if (k == 0) ref[i].assign(tmp, tmp + n);
+            }
+            nLit[i] = (uint32_t)ref[i].size();
+            sumLit += nLit[i];
+        }
+
+        std::vector<PhMesh> meshV(1, mesh);
+        std::vector<F4> infoInit(NP * MAXPART, { -9, -9, -9, -9 });
+        std::vector<uint32_t> nodeInit(NP * MAXPART * 2, 0xcccccccc), cnt0(NP, 0), wc0(1, 0);
+        std::vector<PsC> ctInit(CAP);
+        std::memset(ctInit.data(), 0xAB, ctInit.size() * sizeof(PsC));
+        std::vector<uint32_t> z2(CAP * 2, 0), z1(CAP, 0);
+        for (uint32_t flags : { 8u, 0u })   // static rigid, then dynamic rigid (non-CCD, PGS)
+        {
+            PxgBufferHandle bM = createBufferFrom(dev, meshV);
+            PxgBufferHandle bS = createBufferFrom(dev, hf.samples);
+            PxgBufferHandle bCur = createBufferFrom(dev, pos);
+            PxgBufferHandle bPred = createBufferFrom(dev, pos);
+            PxgBufferHandle bI = createBufferFrom(dev, infoInit);
+            PxgBufferHandle bNi = createBufferFrom(dev, nodeInit);
+            PxgBufferHandle bC = createBufferFrom(dev, cnt0);
+            PxgBufferHandle bW = createBufferFrom(dev, ctInit);
+            PxgBufferHandle bBR = createBufferFrom(dev, z2);
+            PxgBufferHandle bTBR = createBufferFrom(dev, z1);
+            PxgBufferHandle bIBR = createBufferFrom(dev, z1);
+            PxgBufferHandle bSP = createBufferFrom(dev, z2);
+            PxgBufferHandle bTBP = createBufferFrom(dev, z1);
+            PxgBufferHandle bIBP = createBufferFrom(dev, z1);
+            PxgBufferHandle bWc = createBufferFrom(dev, wc0);
+            PhParams prm = { NP, CAP, flags, SYS };
+            {
+                Kernel k("psHfCollide.spv", "ctPsHfCollide", strides, sizeof(PhParams));
+                k.dispatch(1, { bM, bS, bCur, bPred, bI, bNi, bC, bW, bBR, bTBR, bIBR, bSP, bTBP, bIBP, bWc }, prm);
+            }
+            dev->flush();
+            const auto info = downloadBuffer<F4>(dev, bI, NP * MAXPART);
+            const auto cnt = downloadBuffer<uint32_t>(dev, bC, NP);
+            const auto node = downloadBuffer<uint32_t>(dev, bNi, NP * MAXPART * 2);
+            const auto ct = downloadBuffer<PsC>(dev, bW, CAP);
+            const uint32_t wc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+            for (PxgBufferHandle h : { bM, bS, bCur, bPred, bI, bNi, bC, bW, bBR, bTBR, bIBR, bSP, bTBP, bIBP, bWc })
+                dev->destroyBuffer(h);
+
+            const bool isStatic = (flags & 8u) != 0;
+            size_t bad = 0;
+            for (uint32_t i = 0; i < NP; ++i)
+            {
+                const uint32_t nOneWay = isStatic ? nLit[i] : 0u;
+                PXG_CHECK_MSG(cnt[i] == nOneWay, "%s part %u flags %u: one-way count %u, literal %u",
+                              pose.name, i, flags, cnt[i], nOneWay);
+                for (uint32_t s = 0; s < MAXPART; ++s)
+                {
+                    const uint32_t oi = i + s * NP;
+                    if (s < nOneWay && cnt[i] == nOneWay)
+                    {
+                        const F4& r = ref[i][s];
+                        if (!almostEqual(info[oi].x, r.x, 1e-4f, 1e-4f) || !almostEqual(info[oi].y, r.y, 1e-4f, 1e-4f) ||
+                            !almostEqual(info[oi].z, r.z, 1e-4f, 1e-4f) || !almostEqual(info[oi].w, r.w, 1e-4f, 1e-4f) ||
+                            node[oi * 2] != 0x99u || node[oi * 2 + 1] != 4u)
+                            ++bad;
+                    }
+                    else if (s >= nOneWay)
+                    {
+                        if (info[oi].x != -9.0f || info[oi].y != -9.0f || info[oi].z != -9.0f ||
+                            info[oi].w != -9.0f || node[oi * 2] != 0xccccccccu || node[oi * 2 + 1] != 0xccccccccu)
+                            ++bad;
+                    }
+                }
+            }
+            if (isStatic)
+                PXG_CHECK_MSG(wc == 0, "%s: static writer used (%u)", pose.name, wc);
+            else
+            {
+                PXG_CHECK_MSG(wc == sumLit, "%s: writer counter %u, literal total %u", pose.name, wc, sumLit);
+                std::vector<uint32_t> slots[2];
+                for (uint32_t j = 0; j < std::min(wc, CAP); ++j)
+                {
+                    if (ct[j].pLo < NP && ct[j].pHi == SYS && ct[j].rLo == 0x99u && ct[j].rHi == 4u)
+                        slots[ct[j].pLo].push_back(j);
+                    else
+                        ++bad;
+                }
+                for (uint32_t i = 0; i < NP; ++i)
+                {
+                    if (slots[i].size() != nLit[i]) { ++bad; continue; }
+                    std::sort(slots[i].begin(), slots[i].end());
+                    for (uint32_t s = 0; s < nLit[i]; ++s)
+                    {
+                        const F4& g = ct[slots[i][s]].normal_pen;
+                        const F4& r = ref[i][s];
+                        if (!almostEqual(g.x, r.x, 1e-4f, 1e-4f) || !almostEqual(g.y, r.y, 1e-4f, 1e-4f) ||
+                            !almostEqual(g.z, r.z, 1e-4f, 1e-4f) || !almostEqual(g.w, r.w, 1e-4f, 1e-4f))
+                            ++bad;
+                    }
+                }
+            }
+            PXG_CHECK_MSG(bad == 0, "%s flags %u: %zu slot/value/sentinel mismatches", pose.name, flags, bad);
+        }
     }
 }
 

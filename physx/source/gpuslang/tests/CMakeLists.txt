@@ -323,8 +323,9 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # capsule extents and transformFast (updateCacheAndBound.cuh), all scalar/vector
     # mul+add chains spelled left to right with no OpDot, so llvmpipe's OpDot
     # association never applies and it did not contract the chains: the unstamped .spv
-    # already matched the -ffp-contract=off mirror bitwise.  The only other importer of
-    # pxgSlangCacheBound, npArtiUpdateKin, was already stamped.  testUpdateBounds
+    # already matched the -ffp-contract=off mirror bitwise.  The other importers of
+    # pxgSlangCacheBound -- directApiBda, npArtiUpdateKin and (P9.94c)
+    # convexTrimeshMidphaseBda -- are stamped too.  testUpdateBounds
     # setRigidDynamicGlobalPose_p90PoseOrder compares cache, bounds and body2World
     # bitwise (its old-order twin must differ); it passes unstamped too, so the entry is
     # unobserved.
