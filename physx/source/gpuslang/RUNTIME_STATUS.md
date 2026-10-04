@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95d: mergeTransformCacheAndBoundArrayChanges (updateTransformAndBoundArray.cu:52-73) on the
+engine ABI (48-byte blob; manifest 425 -> 426, engine-reachable unmapped 7 -> 6): under the
+direct-GPU API it merges CPU-side shape additions / resetFiltering into the device transform cache
+and bounds.  Bitwise fixtures incl. a row-sized pinned launch; PXG_SCENE=directapimerge (TGS + PGS):
+a skipped kernel drops a new slab and a re-inserted slab (boxes fall to -73.8).  Scenes 71/71.
 P9.95c: sb_copyOrApplySoftBodyDataDEPRECATED (softBodyGM.cu:3094-3134, PxScene::copy/
 applySoftBodyData) on the engine ABI: 80-byte by-object blob, manifest 424 -> 425, engine-reachable
 unmapped 8 -> 7.  Seven bitwise fixtures through the real context and registry; pack checker
@@ -2125,6 +2130,65 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95d — `mergeTransformCacheAndBoundArrayChanges`: Formänderungen während der Direct-GPU-API
+
+**Erreichbarkeit.** Mit `PxSceneFlag::eENABLE_DIRECT_GPU_API` gehören Transform-Cache und Bounds
+nach dem ersten Schritt der GPU. Ändert die Anwendung danach Formen auf der CPU-Seite (neue Form,
+`resetFiltering`, das eine Form neu einfügt), zeichnet der Controller die geänderten Indizes auf.
+Dieser Kernel überträgt sie in die Gerätepuffer (PxgSimulationController.cpp:694-800, nur wenn
+`hasShapeInstanceChanged`). Bisher war er nicht gemappt; die Änderungen gingen verloren.
+
+**Port** (updateTransformAndBoundArray.cu:52-73), neuer Einstieg in `updateBounds.slang`:
+- vorzeichenloser Guard, MSB-Regel (`isNew`) und Maske wie in der CUDA; erst die Bounds, dann die
+  Transformation;
+- ganze Wörter werden kopiert, die Flags @28 eingeschlossen; Adressierung mit 64-Bit-Offsets wie in
+  der CUDA; keine Float-Operation, keine Grid-Stride-Schleife, numthreads 256;
+- der Record-Index ist auf den letzten echten Record geklemmt. Das ist der Speculation-Schutz; er
+  ist nur durch Review gesichert, nicht durch ein Gate.
+- ABI-Zeile `kMergeTcBound {8,8,8,8,8,4}` = 48 B, Manifest 425 → 426,
+  `engine_reachable_unmapped.txt` 7 → 6. Die Zeile für updateTransformAndBoundArray.cu in
+  MIGRATION_STATUS steht jetzt auf ✅, denn alle 7 Kernel der Datei sind gemappt.
+
+**Fixtures:** `updateBounds_mergeTcBound` und `updateBounds_mergeTcBound_pinned` vergleichen jedes
+Wort bitweise gegen eine wörtliche Übertragung der CUDA. Abgedeckt sind Indexmengen, eine
+Tail-Falle, vergiftete Enden sowie NaN, −0, Denormale und Unendlichkeiten. Fünf falsche
+Host-Schreibweisen müssen das Erwartete jeweils ändern. Der gepinnte Test nimmt seine Push-Größe aus
+der ABI-Zeile.
+
+**Sweeps.**
+- Fixture: 28 Mutanten, 24 getötet, 2 durch Absturz getötet, 2 überlebt. Die beiden Überlebenden
+  sind `+ 0.0f`-Kopien, die slangc wegfaltet. Die Varianten mit einer nicht faltbaren Null werden
+  getötet.
+- Die als äquivalent erklärte Menge (5) überlebt wie begründet.
+- Szene: 6/6 getötet.
+
+**Szene `PXG_SCENE=directapimerge`** (TGS und PGS, plus Kontrolle ohne Direct-GPU-API): drei
+statische Platten, Boxen darüber. Nach Schritt 2 kommt eine neue Platte G2 dazu, und
+`resetFiltering(G1)` fügt eine Platte neu ein. Nach Schritt 61 folgt `resetFiltering(C)` auf eine
+Box.
+
+| Lauf | B.y (neue Platte) | A.y (neu eingefügte Platte) | C v_y nach dem Reset |
+|---|---|---|---|
+| Kernel übersprungen | −73.8070 | −76.8070 | −0.1644 |
+| Port, TGS / PGS | 0.5000 | 0.5000 | −0.0009 / −0.0001 |
+| Kontrolle ohne Direct-GPU-API | 0.5000 | 0.5000 | −0.0009 / −0.0001 |
+
+Der Port stimmt mit der Kontrolle bis auf die letzte gedruckte Stelle überein, auch unter
+`PXG_DEVICE_V2=1`.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+- Zwei Records können in einem Start denselben Slot treffen (zweimal `resetFiltering` in einem
+  Fenster). Das Ergebnis hängt dann vom Scheduling ab.
+- `isNew` kopiert den CPU-Slot. Für einen dynamischen Körper im Direct-Modus ist das die veraltete
+  Host-Pose.
+- `PxRigidStatic::setGlobalPose` wirkt nach der Initialisierung nur halb: Der Broadphase-Puffer wird
+  aktualisiert, der Narrowphase-Transform-Cache nicht.
+- Eine Änderung ohne `hasShapeInstanceChanged` wird verworfen.
+- Ungeprüft: Eine allein hinzugefügte `PxAggregate` könnte über `mUsedSize` hinaus kopieren.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 883/883 in beiden Speichermodi.
+**Szenen:** 71/71.
 
 ## P9.95c — `sb_copyOrApplySoftBodyDataDEPRECATED`: `PxScene::copySoftBodyData` / `applySoftBodyData` auf dem Engine-ABI
 

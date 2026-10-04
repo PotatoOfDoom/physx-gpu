@@ -38,6 +38,12 @@
 // geometry (GridDim/BlockDim::UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY =
 // 256 x 256), plus a 2-block variant that executes the grid-stride wrap.
 // setRigidDynamicGlobalPose stays on the bound-buffer harness.
+//
+// mergeTransformCacheAndBoundArrayChanges (P9.95, the direct-GPU API's
+// between-steps merge) is verified bitwise against a literal transcription of
+// updateTransformAndBoundArray.cu:52-73 in the real PhysX types, through the
+// framework (updateBounds_mergeTcBound) and through PxgCudaShim with pinned
+// host arrays (updateBounds_mergeTcBound_pinned).
 
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
@@ -47,9 +53,16 @@
 #include "PxNodeIndex.h" // completes PxNodeIndex for the engine desc header
 #include "PxgSimulationCoreDesc.h"
 #include "PxgArticulation.h"
+#include "PxgAABBManager.h"     // P9.95: PxBoundTransformUpdate (the merge kernel's record)
+#include "PxsTransformCache.h"  // P9.95: PxsCachedTransform
+#include "PxgVulkanKernelAbi.h" // P9.95: the merge kernel's launch-ABI row
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <numeric>
 #include <random>
+#include <utility>
 
 namespace
 {
@@ -2117,6 +2130,436 @@ PXG_TEST(updateBounds_changedAABBMgrHandles)
     shim.memFree(dUpdated);
     shim.memFree(dChanged);
     shim.memFree(dDesc);
+}
+
+// ---------------------------------------------------------------------------
+// mergeTransformCacheAndBoundArrayChanges (P9.95): the direct-GPU API's
+// between-steps merge of new / re-inserted shapes, on the ENGINE launch ABI.
+// ---------------------------------------------------------------------------
+
+static_assert(sizeof(physx::PxBounds3) == 24u, "PxBounds3 stride");
+static_assert(sizeof(physx::PxsCachedTransform) == 32u, "PxsCachedTransform stride");
+static_assert(offsetof(physx::PxsCachedTransform, flags) == 28u, "PxsCachedTransform::flags @28");
+static_assert(sizeof(physx::PxBoundTransformUpdate) == 8u, "PxBoundTransformUpdate stride");
+static_assert(offsetof(physx::PxBoundTransformUpdate, indexFrom) == 4u, "PxBoundTransformUpdate::indexFrom @4");
+
+// The push block = the host pack of PxgSimulationController.cpp:752-754.
+struct MergeTcBoundPush
+{
+    uint64_t deviceBounds, deviceTransforms, boundsArray, transformsArray, changes;
+    uint32_t numChanges, pad;
+};
+static_assert(sizeof(MergeTcBoundPush) == 48u, "blob = pxgKernelAbiPushSize({8,8,8,8,8,4})");
+
+static const char* const MTC_SPV = "updateBounds.spv";
+static const char* const MTC_KERNEL = "mergeTransformCacheAndBoundArrayChanges";
+static const uint32_t MTC_BLOCK = 256u;   // PxgSimulationCoreKernelIndices.h:44
+static const uint32_t MTC_SLOTS = 1024u;  // live slots per array
+// A poisoned tail of as many slots again, inside the compared images: a mutant with a
+// wrong stride then writes into a COMPARED region instead of faulting or corrupting
+// the harness.
+static const uint32_t MTC_ALL = 2u * MTC_SLOTS;
+static const uint32_t MTC_NEW = 0x80000000u;   // indexFrom's MSB: copy from the CPU arrays
+// The tail trap: record [numChanges], one past the last real record.  Slot 1000 is
+// never an indexTo and never a source, so a lane that reads the trap shows up there.
+static const uint32_t MTC_TRAP_TO = 1000u;
+static const uint32_t MTC_TRAP_FROM = 600u;
+
+// The engine grid (PxgSimulationController.cpp:756-757): ceil(numChanges / 256).
+static uint32_t mtcGrid(uint32_t n) { return (n + MTC_BLOCK - 1u) / MTC_BLOCK; }
+
+// updateTransformAndBoundArray.cu:52-73, LITERALLY, in the real PhysX types, run
+// over gridDim x 256 threads.  Sequential execution equals every parallel order here
+// because no record set below has a write conflict: every indexTo is unique and no
+// indexTo is a device-to-device source (see mtcRecords).
+static void refMergeTcBound(physx::PxBounds3* PX_RESTRICT deviceBounds,
+                            physx::PxsCachedTransform* PX_RESTRICT deviceTransforms,
+                            const physx::PxBounds3* PX_RESTRICT boundsArray,
+                            const physx::PxsCachedTransform* PX_RESTRICT transformsArray,
+                            const physx::PxBoundTransformUpdate* PX_RESTRICT changes,
+                            const physx::PxU32 numChanges, uint32_t gridDim)
+{
+    for (uint32_t blockIdx = 0; blockIdx < gridDim; ++blockIdx)
+        for (uint32_t threadIdx = 0; threadIdx < MTC_BLOCK; ++threadIdx)
+        {
+            int idx = int(blockIdx * MTC_BLOCK + threadIdx);
+            if (idx < numChanges) {
+                physx::PxU32 indexTo = changes[idx].indexTo;
+                physx::PxU32 indexFrom = changes[idx].indexFrom & 0x7FFFFFFF;
+                bool isNew = (changes[idx].indexFrom & (1U << 31)) != 0;
+                if (isNew) {
+                    deviceBounds[indexTo] = boundsArray[indexFrom];
+                    deviceTransforms[indexTo] = transformsArray[indexFrom];
+                } else {
+                    deviceBounds[indexTo] = deviceBounds[indexFrom];
+                    deviceTransforms[indexTo] = deviceTransforms[indexFrom];
+                }
+            }
+        }
+}
+
+// The wrong spellings the discrimination twins run (host only, never the oracle).
+enum class MtcTwin { AlwaysCpu, AlwaysDevice, SwapToFrom, NoFlags, LeNoClamp };
+
+static void twinMergeTcBound(MtcTwin t, physx::PxBounds3* deviceBounds, physx::PxsCachedTransform* deviceTransforms,
+                             const physx::PxBounds3* boundsArray, const physx::PxsCachedTransform* transformsArray,
+                             const physx::PxBoundTransformUpdate* changes, physx::PxU32 numChanges, uint32_t gridDim)
+{
+    for (uint32_t i = 0; i < gridDim * MTC_BLOCK; ++i)
+    {
+        // LeNoClamp: a `<=` guard with no clamp reads the record one past the end.
+        if (!(t == MtcTwin::LeNoClamp ? i <= numChanges : i < numChanges))
+            continue;
+        physx::PxU32 indexTo = changes[i].indexTo;
+        physx::PxU32 indexFrom = changes[i].indexFrom & 0x7FFFFFFFu;
+        bool isNew = (changes[i].indexFrom & MTC_NEW) != 0u;
+        if (t == MtcTwin::SwapToFrom) std::swap(indexTo, indexFrom);
+        if (t == MtcTwin::AlwaysCpu) isNew = true;
+        if (t == MtcTwin::AlwaysDevice) isNew = false;
+        const physx::PxU32 oldFlags = deviceTransforms[indexTo].flags;
+        deviceBounds[indexTo] = isNew ? boundsArray[indexFrom] : deviceBounds[indexFrom];
+        deviceTransforms[indexTo] = isNew ? transformsArray[indexFrom] : deviceTransforms[indexFrom];
+        if (t == MtcTwin::NoFlags) deviceTransforms[indexTo].flags = oldFlags;
+    }
+}
+
+// Source payloads, placed in EVERY word position across the population: a qNaN with a
+// payload, a SIGNALLING NaN (a float move may quiet it), -0 (a float add of +0 turns it
+// into +0), the smallest denormal (a flushing float path zeroes it), and both
+// infinities.  The flags word @28 gets eFROZEN, all-ones and a pattern instead.
+static const uint32_t MTC_PAYLOAD[6] = { 0x7FC12345u, 0x7F800001u, 0x80000000u, 0x00000001u, 0x7F800000u, 0xFF800000u };
+static const uint32_t MTC_FLAGS[3] = { 1u, 0xFFFFFFFFu, 0xA5A5A5A5u };
+
+// Every other word is a unique poison, tag 0xC (CPU) / 0xD (device), so an untouched
+// or misplaced write is recognisable: bounds words carry w = 0..5, transform words
+// w = 8..15.
+static uint32_t mtcWord(uint32_t tag, uint32_t slot, uint32_t w, bool transform)
+{
+    if ((slot + w) % 3u == 0u)
+        return (transform && w == 7u) ? MTC_FLAGS[(slot / 3u) % 3u] : MTC_PAYLOAD[(slot / 3u + w) % 6u];
+    return (tag << 28) | (slot << 4) | (transform ? 8u + w : w);
+}
+
+struct MtcWorld
+{
+    std::vector<physx::PxBounds3> devBounds, cpuBounds;
+    std::vector<physx::PxsCachedTransform> devXf, cpuXf;
+    std::vector<physx::PxBoundTransformUpdate> changes;   // numChanges real records + the tail trap
+    uint32_t numChanges = 0;
+};
+
+static void mtcFill(MtcWorld& w)
+{
+    w.devBounds.resize(MTC_ALL); w.cpuBounds.resize(MTC_ALL);
+    w.devXf.resize(MTC_ALL); w.cpuXf.resize(MTC_ALL);
+    for (uint32_t slot = 0; slot < MTC_ALL; ++slot)
+    {
+        uint32_t b[6], x[8];
+        for (uint32_t k = 0; k < 6u; ++k) b[k] = mtcWord(0xDu, slot, k, false);
+        for (uint32_t k = 0; k < 8u; ++k) x[k] = mtcWord(0xDu, slot, k, true);
+        std::memcpy(&w.devBounds[slot], b, 24); std::memcpy(&w.devXf[slot], x, 32);
+        for (uint32_t k = 0; k < 6u; ++k) b[k] = mtcWord(0xCu, slot, k, false);
+        for (uint32_t k = 0; k < 8u; ++k) x[k] = mtcWord(0xCu, slot, k, true);
+        std::memcpy(&w.cpuBounds[slot], b, 24); std::memcpy(&w.cpuXf[slot], x, 32);
+    }
+}
+
+// nSame isNew records with from == to (PxgBoundsArray::updateBounds / setBounds for a
+// new shape), nDiff isNew with from != to (legal for the kernel; it separates the two
+// source arrays), nDev device-to-device (reinsertBroadPhase's {new id, old id}).
+//   indexTo: unique, from [0,512) U {1023}; 1000 never.
+//   device-to-device indexFrom: [512,1023) \ {1000} -- disjoint from every indexTo.
+//   isNew indexFrom: anything in [0,1024) (a CPU slot is never written).
+// Required, when the class exists: an isNew record to 0 / from 0 (raw word 0x80000000,
+// the one a mask that reads it as "from 0, not new" gets wrong), and an isNew record
+// to 1023 whose from is 0 as well.
+static std::vector<physx::PxBoundTransformUpdate> mtcRecords(std::mt19937& rng, uint32_t nSame, uint32_t nDiff,
+                                                             uint32_t nDev)
+{
+    const uint32_t n = nSame + nDiff + nDev;
+    std::vector<uint32_t> pool;
+    for (uint32_t t = 1; t < 512u; ++t) pool.push_back(t);
+    std::shuffle(pool.begin(), pool.end(), rng);
+    size_t next = 0;
+    auto takeTo = [&]() { return pool[next++]; };
+    std::uniform_int_distribution<uint32_t> anySlot(0u, MTC_SLOTS - 1u), devFrom(512u, 1022u);
+
+    std::vector<physx::PxBoundTransformUpdate> r;
+    for (uint32_t i = 0; i < nSame; ++i)
+    {
+        const uint32_t to = (i == 0u) ? 0u : takeTo();
+        r.push_back({ to, to | MTC_NEW });
+    }
+    for (uint32_t i = 0; i < nDiff; ++i)
+    {
+        const uint32_t to = (i == 0u) ? 1023u : takeTo();
+        uint32_t from = (i == 0u) ? 0u : anySlot(rng);
+        while (from == to) from = anySlot(rng);
+        r.push_back({ to, from | MTC_NEW });
+    }
+    for (uint32_t i = 0; i < nDev; ++i)
+    {
+        uint32_t from = devFrom(rng);
+        while (from == MTC_TRAP_TO) from = devFrom(rng);
+        r.push_back({ takeTo(), from });
+    }
+    std::shuffle(r.begin(), r.end(), rng);
+    PXG_CHECK_MSG(r.size() == n, "record count");
+    r.push_back({ MTC_TRAP_TO, MTC_TRAP_FROM | MTC_NEW });   // the tail trap, at [numChanges]
+    return r;
+}
+
+template <typename T>
+static std::vector<uint32_t> mtcWords(const std::vector<T>& v)
+{
+    std::vector<uint32_t> w(v.size() * sizeof(T) / 4u);
+    std::memcpy(w.data(), v.data(), w.size() * 4u);
+    return w;
+}
+
+// Bitwise compare of two word images; prints the first 8 mismatches.
+static uint32_t mtcCompare(const char* what, const char* array, const std::vector<uint32_t>& got,
+                           const std::vector<uint32_t>& want, uint32_t wordsPerSlot)
+{
+    uint32_t bad = 0;
+    for (size_t i = 0; i < want.size(); ++i)
+        if (got[i] != want[i] && bad++ < 8u)
+            std::printf("    %s %s: slot %zu word %zu: got 0x%08x, expected 0x%08x\n", what, array,
+                        i / wordsPerSlot, i % wordsPerSlot, got[i], want[i]);
+    return bad;
+}
+
+// Runs the oracle over a copy of `w` and returns the expected images.
+static MtcWorld mtcExpected(const MtcWorld& w)
+{
+    MtcWorld e = w;
+    refMergeTcBound(e.devBounds.data(), e.devXf.data(), e.cpuBounds.data(), e.cpuXf.data(), e.changes.data(),
+                    w.numChanges, mtcGrid(w.numChanges));
+    return e;
+}
+
+// The oracle must itself be a bit-exact move: every record's destination equals its
+// source word for word (this is what proves the host copy keeps the sNaN payload,
+// -0 and the denormal), and the copied words include each payload at least once.
+static void mtcCheckOracle(const char* what, const MtcWorld& w, const MtcWorld& e)
+{
+    uint32_t moved[6] = { 0, 0, 0, 0, 0, 0 }, bad = 0;
+    for (uint32_t i = 0; i < w.numChanges; ++i)
+    {
+        const uint32_t to = w.changes[i].indexTo, from = w.changes[i].indexFrom & 0x7FFFFFFFu;
+        const bool isNew = (w.changes[i].indexFrom & MTC_NEW) != 0u;
+        uint32_t src[14], dst[14];
+        std::memcpy(src, isNew ? &w.cpuBounds[from] : &w.devBounds[from], 24);
+        std::memcpy(src + 6, isNew ? &w.cpuXf[from] : &w.devXf[from], 32);
+        std::memcpy(dst, &e.devBounds[to], 24);
+        std::memcpy(dst + 6, &e.devXf[to], 32);
+        for (uint32_t k = 0; k < 14u; ++k)
+        {
+            if (src[k] != dst[k]) ++bad;
+            for (uint32_t p = 0; p < 6u; ++p)
+                if (k != 13u && src[k] == MTC_PAYLOAD[p]) ++moved[p];
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "%s: the host oracle changed %u copied words (it must be a bit-exact move)", what, bad);
+    if (w.numChanges >= 100u)
+        for (uint32_t p = 0; p < 6u; ++p)
+            PXG_CHECK_MSG(moved[p] > 0u, "%s: payload 0x%08x is never copied", what, MTC_PAYLOAD[p]);
+}
+
+static uint32_t mtcCompareWorld(const char* what, const MtcWorld& got, const MtcWorld& want)
+{
+    uint32_t bad = 0;
+    bad += mtcCompare(what, "device bounds", mtcWords(got.devBounds), mtcWords(want.devBounds), 6u);
+    bad += mtcCompare(what, "device transforms", mtcWords(got.devXf), mtcWords(want.devXf), 8u);
+    bad += mtcCompare(what, "CPU bounds", mtcWords(got.cpuBounds), mtcWords(want.cpuBounds), 6u);
+    bad += mtcCompare(what, "CPU transforms", mtcWords(got.cpuXf), mtcWords(want.cpuXf), 8u);
+    bad += mtcCompare(what, "changes", mtcWords(got.changes), mtcWords(want.changes), 2u);
+    return bad;
+}
+
+// mergeTransformCacheAndBoundArrayChanges through the framework: one 48-byte push
+// block packed in the order of PxgSimulationController.cpp:752-754, every array a
+// device buffer.  Three launches at the engine's grid ceil(n / 256):
+//   L1  n = 300  grid 2, the second workgroup partly filled (lanes 300..511 idle);
+//   L2  n = 256  grid 1, exactly full;
+//   L3  n = 1    grid 1, the scene's lane-D shape (one device-to-device record).
+// Each compares every word of all five arrays (device arrays INCLUDING their poisoned
+// tails, the CPU arrays and the records, which must be unchanged) against the literal
+// oracle above.  Before the GPU runs, five wrong spellings are run on the host over
+// L1's data and each must change at least one word: proof that the data can see them.
+PXG_TEST(updateBounds_mergeTcBound)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    std::mt19937 rng(9501u);
+
+    struct Launch { const char* name; uint32_t nSame, nDiff, nDev; };
+    const Launch launches[3] = { { "L1 n=300", 100u, 60u, 140u },
+                                 { "L2 n=256", 80u, 50u, 126u },
+                                 { "L3 n=1", 0u, 0u, 1u } };
+
+    Kernel k(MTC_SPV, MTC_KERNEL, {}, uint32_t(sizeof(MergeTcBoundPush)));
+    for (const Launch& L : launches)
+    {
+        MtcWorld w;
+        mtcFill(w);
+        w.changes = mtcRecords(rng, L.nSame, L.nDiff, L.nDev);
+        w.numChanges = L.nSame + L.nDiff + L.nDev;
+        const MtcWorld e = mtcExpected(w);
+        mtcCheckOracle(L.name, w, e);
+
+        if (&L == &launches[0])
+        {
+            const MtcTwin twins[5] = { MtcTwin::AlwaysCpu, MtcTwin::AlwaysDevice, MtcTwin::SwapToFrom,
+                                       MtcTwin::NoFlags, MtcTwin::LeNoClamp };
+            const char* twinNames[5] = { "always-CPU", "always-device", "swapped to/from", "flags not copied",
+                                         "<= without clamp (reads the tail trap)" };
+            for (uint32_t t = 0; t < 5u; ++t)
+            {
+                MtcWorld m = w;
+                twinMergeTcBound(twins[t], m.devBounds.data(), m.devXf.data(), m.cpuBounds.data(), m.cpuXf.data(),
+                                 m.changes.data(), w.numChanges, mtcGrid(w.numChanges));
+                const bool differs = mtcWords(m.devBounds) != mtcWords(e.devBounds) ||
+                                     mtcWords(m.devXf) != mtcWords(e.devXf);
+                PXG_CHECK_MSG(differs, "discrimination twin '%s' leaves L1's image unchanged", twinNames[t]);
+            }
+        }
+
+        std::vector<PxgBufferHandle> all;
+        auto mk = [&](auto const& v) { PxgBufferHandle h = createBufferFrom(dev, v); all.push_back(h); return h; };
+        const PxgBufferHandle bDevB = mk(w.devBounds), bDevX = mk(w.devXf), bCpuB = mk(w.cpuBounds),
+                              bCpuX = mk(w.cpuXf), bChg = mk(w.changes);
+        if (!dev->getBufferDeviceAddress(bDevB))
+        {
+            std::printf("  NOTE: no BDA -> skip\n");
+            for (PxgBufferHandle h : all) dev->destroyBuffer(h);
+            return;
+        }
+        MergeTcBoundPush p = {};
+        p.deviceBounds = dev->getBufferDeviceAddress(bDevB);
+        p.deviceTransforms = dev->getBufferDeviceAddress(bDevX);
+        p.boundsArray = dev->getBufferDeviceAddress(bCpuB);
+        p.transformsArray = dev->getBufferDeviceAddress(bCpuX);
+        p.changes = dev->getBufferDeviceAddress(bChg);
+        p.numChanges = w.numChanges;
+        k.dispatch(mtcGrid(w.numChanges), {}, p);
+        dev->flush();
+
+        MtcWorld g;
+        g.devBounds = downloadBuffer<physx::PxBounds3>(dev, bDevB, MTC_ALL);
+        g.devXf = downloadBuffer<physx::PxsCachedTransform>(dev, bDevX, MTC_ALL);
+        g.cpuBounds = downloadBuffer<physx::PxBounds3>(dev, bCpuB, MTC_ALL);
+        g.cpuXf = downloadBuffer<physx::PxsCachedTransform>(dev, bCpuX, MTC_ALL);
+        g.changes = downloadBuffer<physx::PxBoundTransformUpdate>(dev, bChg, w.changes.size());
+        for (PxgBufferHandle h : all) dev->destroyBuffer(h);
+
+        const uint32_t bad = mtcCompareWorld(L.name, g, e);
+        PXG_CHECK_MSG(bad == 0, "%s (grid %u): %u words differ bitwise from updateTransformAndBoundArray.cu:52-73",
+                      L.name, mtcGrid(w.numChanges), bad);
+    }
+}
+
+// The engine path with PINNED host arrays: exactly what mergeBoundsAndTransformsChanges
+// hands the kernel.  The CPU bounds, CPU transforms and the records come from
+// memHostAlloc, are filled through their CPU pointers and are passed as
+// hostGetDevicePointer(...) -- what getMappedDevicePtr does (PxgCudaUtils.h ->
+// memHostGetDevicePointer).  The device arrays come from memAlloc.  The launch goes
+// through PxgCudaShim with the push size taken from the bridge's launch-ABI row, so
+// a row of the wrong size refuses the launch here.
+//
+// What this proves: the kernel reads pinned memory through the translated address and
+// never writes it.  What it cannot prove: anything about the row's hostPtrMask.  The
+// harness bypasses the bridge's translateHostPtrs, and on llvmpipe a pinned
+// allocation's device address equals its CPU address, so a mask would be inert anyway.
+PXG_TEST(updateBounds_mergeTcBound_pinned)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    const physx::gpuslang::PxgKernelAbiRow* row = physx::gpuslang::pxgFindKernelAbi(MTC_KERNEL);
+    const uint32_t rowPush = row ? physx::gpuslang::pxgKernelAbiPushSize(*row) : 0u;
+    PXG_CHECK_MSG(row != nullptr && row->argCount == 6u && rowPush == 48u,
+                  "launch-ABI row {8,8,8,8,8,4} -> 48-byte blob (got %u args, %u bytes)",
+                  row ? row->argCount : 0u, rowPush);
+    PXG_CHECK_MSG(row == nullptr || row->hostPtrMask == 0u,
+                  "hostPtrMask must be 0: the host arrays arrive already translated by getMappedDevicePtr");
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { MTC_SPV, MTC_KERNEL, rowPush, 0u, MTC_KERNEL } };
+    PxgCudaShim shim(dev, manifest, 1, &updateBoundsAbiLoader);
+    std::mt19937 rng(9502u);
+
+    struct Launch { const char* name; uint32_t nSame, nDiff, nDev; };
+    const Launch launches[2] = { { "pinned n=5", 2u, 1u, 2u }, { "pinned n=257", 90u, 50u, 117u } };
+    for (const Launch& L : launches)
+    {
+        MtcWorld w;
+        mtcFill(w);
+        w.changes = mtcRecords(rng, L.nSame, L.nDiff, L.nDev);
+        w.numChanges = L.nSame + L.nDiff + L.nDev;
+        const MtcWorld e = mtcExpected(w);
+        mtcCheckOracle(L.name, w, e);
+
+        const size_t bBytes = w.cpuBounds.size() * 24u, xBytes = w.cpuXf.size() * 32u, cBytes = w.changes.size() * 8u;
+        PxgDevicePtr dDevB = 0, dDevX = 0;
+        void* hCpuB = nullptr;
+        void* hCpuX = nullptr;
+        void* hChg = nullptr;
+        shim.memAlloc(&dDevB, bBytes);
+        shim.memAlloc(&dDevX, xBytes);
+        shim.memHostAlloc(&hCpuB, bBytes);
+        shim.memHostAlloc(&hCpuX, xBytes);
+        shim.memHostAlloc(&hChg, cBytes);
+        const PxgDevicePtr dCpuB = hCpuB ? shim.hostGetDevicePointer(hCpuB) : 0;
+        const PxgDevicePtr dCpuX = hCpuX ? shim.hostGetDevicePointer(hCpuX) : 0;
+        const PxgDevicePtr dChg = hChg ? shim.hostGetDevicePointer(hChg) : 0;
+        if (!dDevB || !dDevX || !dCpuB || !dCpuX || !dChg)
+        {
+            std::printf("  NOTE: no BDA / pinned memory -> skip\n");
+            if (dDevB) shim.memFree(dDevB);
+            if (dDevX) shim.memFree(dDevX);
+            if (hCpuB) shim.memFreeHost(hCpuB);
+            if (hCpuX) shim.memFreeHost(hCpuX);
+            if (hChg) shim.memFreeHost(hChg);
+            return;
+        }
+        std::memcpy(hCpuB, w.cpuBounds.data(), bBytes);
+        std::memcpy(hCpuX, w.cpuXf.data(), xBytes);
+        std::memcpy(hChg, w.changes.data(), cBytes);
+        shim.memcpyHtoD(dDevB, w.devBounds.data(), bBytes);
+        shim.memcpyHtoD(dDevX, w.devXf.data(), xBytes);
+
+        EngineBlob blob;   // PX_CUDA_KERNEL_PARAM order of :752-754
+        blob.add<uint64_t>(dDevB);
+        blob.add<uint64_t>(dDevX);
+        blob.add<uint64_t>(dCpuB);
+        blob.add<uint64_t>(dCpuX);
+        blob.add<uint64_t>(dChg);
+        blob.add<uint32_t>(w.numChanges);
+        blob.finish();
+        PXG_CHECK_MSG(blob.bytes.size() == 48u, "engine blob is 48 bytes (got %zu)", blob.bytes.size());
+        PXG_CHECK_MSG(shim.launchKernel(0, mtcGrid(w.numChanges), 1, 1, blob.bytes.data(),
+                                        uint32_t(blob.bytes.size())) == PxgResult::Success,
+                      "%s: launch %s", L.name, MTC_KERNEL);
+        shim.streamSynchronize();
+
+        MtcWorld g = w;
+        shim.memcpyDtoH(g.devBounds.data(), dDevB, bBytes);
+        shim.memcpyDtoH(g.devXf.data(), dDevX, xBytes);
+        std::memcpy(g.cpuBounds.data(), hCpuB, bBytes);   // re-read through the CPU pointers
+        std::memcpy(g.cpuXf.data(), hCpuX, xBytes);
+        std::memcpy(g.changes.data(), hChg, cBytes);
+        shim.memFree(dDevB);
+        shim.memFree(dDevX);
+        shim.memFreeHost(hCpuB);
+        shim.memFreeHost(hCpuX);
+        shim.memFreeHost(hChg);
+
+        const uint32_t bad = mtcCompareWorld(L.name, g, e);
+        PXG_CHECK_MSG(bad == 0, "%s (grid %u): %u words differ bitwise from updateTransformAndBoundArray.cu:52-73",
+                      L.name, mtcGrid(w.numChanges), bad);
+    }
 }
 
 } // namespace

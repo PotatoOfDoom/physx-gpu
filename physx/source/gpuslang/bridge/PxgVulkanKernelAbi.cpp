@@ -279,6 +279,22 @@ static const uint8_t kPropagateStaticPGS[] = { 8, 8, 4, 4, 4 };
 static const uint8_t kTwoPtrU32[] = { 8, 8, 4 };
 static const uint8_t kFourPtrU32[] = { 8, 8, 8, 8, 4 };
 
+// updateTransformAndBoundArray.cu:52 mergeTransformCacheAndBoundArrayChanges(
+//   PxBounds3* deviceBounds, PxsCachedTransform* deviceTransforms,
+//   const PxBounds3* boundsArray, const PxsCachedTransform* transformsArray,
+//   const PxBoundTransformUpdate* changes, const PxU32 numChanges)
+// packed by PxgSimulationController.cpp:752-754 -> pointers @0/@8/@16/@24/@32,
+// the PxU32 @40 = 44, rounded to the 8-alignment = a 48-byte blob (P9.95).
+// A dedicated array, not a shared one: no other kernel has this list.
+// hostPtrMask 0, for CUDA parity: the three host arrays are pinned and arrive
+// ALREADY translated by getMappedDevicePtr (:730-737 -> memHostGetDevicePointer
+// -> PxgCudaShim::hostGetDevicePointer).  A mask bit would translate the device
+// address a second time; where that address is not a host pointer the lookup
+// yields 0 and translateHostPtrs refuses the launch.  (On llvmpipe a pinned
+// allocation's device address equals its CPU address, so a mask would be inert
+// there -- no test in this tree can observe it either way.)
+static const uint8_t kMergeTcBound[] = { 8, 8, 8, 8, 8, 4 };
+
 // gpusimulationcontroller updateBodiesAndShapes.cu:
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
@@ -1863,6 +1879,10 @@ static const PxgKernelAbiRow kRows[] = {
     // descriptor, PxgUpdateActorDataDesc (ScPipeline.cpp:355).
     { "updateBodiesLaunchDirectAPI", kOnePtr, 1u },
     { "mergeChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
+    // P9.95 -- the direct-GPU API's between-steps merge of new / re-inserted shapes
+    // (PxgSimulationController::mergeBoundsAndTransformsChanges, :725-764); first
+    // launched by PXG_SCENE=directapimerge.  hostPtrMask 0 (see kMergeTcBound).
+    { "mergeTransformCacheAndBoundArrayChanges", kMergeTcBound, uint32_t(sizeof(kMergeTcBound)) },
     // P9.42: the frozen/unfrozen compaction trio, same one-pointer list
     // (PxgSimulationCore.cpp:2656-2660, :2695-2706)
     { "computeFrozenAndUnfrozenHistogramLaunch", kOnePtr, 1u },

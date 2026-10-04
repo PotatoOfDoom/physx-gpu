@@ -405,8 +405,12 @@ pxg_compile_shader(radixSortDesc radixSortMultiBlockLaunchWithCount radixSortMul
 pxg_compile_shader(radixSortGather radixSortCopy radixSortCopy2 radixSortCopyBits2 radixSortDoubleCopy radixSortDoubleCopyHigh32Bits)
 pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics preIntegrationLaunchTGS)
 pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
+# P9.95: mergeTransformCacheAndBoundArrayChanges joins updateBounds as a BDA entry on
+# the engine ABI.  It moves words and does no float arithmetic, so updateBounds' place in
+# PXG_NOCONTRACT_SHADERS changes nothing for it; like mergeChangedAABBMgrHandlesLaunch it
+# has no HLSL twin (BDA entry), so PXG_HLSL_ENTRIES is unchanged.
 pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch setRigidDynamicGlobalPose updateChangedAABBMgrHandlesLaunch
-                   mergeChangedAABBMgrHandlesLaunch)
+                   mergeChangedAABBMgrHandlesLaunch mergeTransformCacheAndBoundArrayChanges)
 # P9.79: the DIRECT-GPU API on the engine launch ABI.  directApi.slang keeps the
 # Phase-1 bound-buffer ports and testDirectApi; these are what the engine gets.
 # P9.80: the PBD particle-VOLUME bounds -- the other half of the PxParticleRigidBuffer

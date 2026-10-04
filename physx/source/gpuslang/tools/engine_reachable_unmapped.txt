@@ -166,8 +166,12 @@ sb_plasticDeformLaunch2
 # scene raised until PXG_SCENE=forcethreshold: a pair asking for
 # eNOTIFY_THRESHOLD_FORCE_* on a body whose contact report threshold is finite.
 
-# PxgSimulationController.cpp (1)
-mergeTransformCacheAndBoundArrayChanges
+# PxgSimulationController.cpp (0)
+# mergeTransformCacheAndBoundArrayChanges -- MAPPED in P9.95 (updateBounds.spv); driven
+# by PXG_SCENE=directapimerge, the first scene to add or re-insert a shape BETWEEN two
+# steps under eENABLE_DIRECT_GPU_API (PxScene::addActor, PxScene::resetFiltering).
+# Every other scene changes its shapes only before the first step, when the whole
+# arrays are copied instead, so the merge had never run.
 
 # PxgMemCopyDispatcher.cpp (1)
 # copyUserData -- a FIFTH kind of unreachability, found by P9.79 and named here

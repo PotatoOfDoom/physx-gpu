@@ -30,6 +30,8 @@
 // (gpusimulationcontroller/src/CUDA/updateTransformAndBoundArray.cu +
 //  gpucommon/src/CUDA/updateCacheAndBound.cuh):
 //   - updateTransformCacheAndBoundArrayLaunch (rigid + articulation paths)
+//   - mergeTransformCacheAndBoundArrayChanges (P9.95, at the end of the file:
+//     the direct-GPU API's between-steps merge of new / re-inserted shapes)
 //
 // Per simulation shape this kernel composes the world pose
 // (body2World * body2Actor^-1 * shape2Actor), refreshes the transform cache
@@ -564,5 +566,166 @@ void mergeChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (lane == 0)
             changed[w] = changed[w] | gAabbMgrMergeWord;   // CUDA: |=, not =
         GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ENGINE launch ABI of mergeTransformCacheAndBoundArrayChanges (P9.95):
+// exactly the CUDA parameter list (updateTransformAndBoundArray.cu:52-59),
+// packed by PxgSimulationController.cpp:752-754 -> {8,8,8,8,8,4} = 44 -> 48 B.
+// The three "CPU" arrays are pinned host allocations (the scene's host
+// allocator is PxgVulkanMemoryManager's memHostAlloc callback) that reach the
+// blob ALREADY translated to device addresses by getMappedDevicePtr
+// (:730-737); the ABI row's hostPtrMask is therefore 0, as for every other
+// argument here.
+struct MergeTcBoundParams
+{
+    uint64_t deviceBounds;     // @0  PxBounds3*                     (GPU-BP mBoxFpBoundsBuf)
+    uint64_t deviceTransforms; // @8  PxsCachedTransform*            (NP transform cache)
+    uint64_t boundsArray;      // @16 const PxBounds3*               (mapped PxgBoundsArray::mBounds)
+    uint64_t transformsArray;  // @24 const PxsCachedTransform*      (mapped PxsTransformCache)
+    uint64_t changes;          // @32 const PxBoundTransformUpdate*  (mapped staging, 8 B per record)
+    uint numChanges;           // @40 (+4 pad -> 48)
+};
+
+[[vk::push_constant]]
+ConstantBuffer<MergeTcBoundParams> gMergeTcBound;
+
+// The CUDA indexes with 64-bit pointer arithmetic (ptr[PxU32] = base + u64(i) *
+// sizeof), and so does this port.  A 32-bit WORD index (slot * 6u, slot * 8u)
+// would wrap mod 2^32 and hide a missing 0x7FFFFFFF mask: (2^31 + f) * 6 ==
+// 6f (mod 2^32), so the masked and the unmasked index would address the same
+// word.  The byte strides are kept apart from the word counts so a mutant of
+// one cannot silently be a mutant of the other.
+static const uint64_t MERGE_BOUNDS_BYTES = 24ull;    // sizeof(PxBounds3)
+static const uint64_t MERGE_TRANSFORM_BYTES = 32ull; // sizeof(PxsCachedTransform), flags @28
+static const uint MERGE_BOUNDS_WORDS = 6u;
+static const uint MERGE_TRANSFORM_WORDS = 8u;
+
+// dstBase[dstSlot] = srcBase[srcSlot] -- the PxBounds3 struct assignment, 24 B.
+// Moved as uint words, not floats (the P9.93 convention for pure moves): a
+// float load/store pair need not preserve sNaN payloads or denormals, a CUDA
+// struct copy does.  All words are loaded before any is stored, as a struct
+// assignment reads its source before it writes (only observable for
+// dst == src, which no producer emits).
+void mergeCopyBounds(uint64_t dstBase, uint dstSlot, uint64_t srcBase, uint srcSlot)
+{
+    Ptr<uint> dst = Ptr<uint>(dstBase + uint64_t(dstSlot) * MERGE_BOUNDS_BYTES);
+    Ptr<uint> src = Ptr<uint>(srcBase + uint64_t(srcSlot) * MERGE_BOUNDS_BYTES);
+    uint w[MERGE_BOUNDS_WORDS];
+    for (uint k = 0u; k < MERGE_BOUNDS_WORDS; ++k)
+        w[k] = src[k];
+    // load mergeCopyBounds
+    for (uint k = 0u; k < MERGE_BOUNDS_WORDS; ++k)
+        dst[k] = w[k];
+    // end mergeCopyBounds
+}
+
+// dstBase[dstSlot] = srcBase[srcSlot] -- the PxsCachedTransform struct
+// assignment, 32 B including the flags word @28 (eFROZEN), which the CUDA
+// struct copy moves as well.
+void mergeCopyTransform(uint64_t dstBase, uint dstSlot, uint64_t srcBase, uint srcSlot)
+{
+    Ptr<uint> dst = Ptr<uint>(dstBase + uint64_t(dstSlot) * MERGE_TRANSFORM_BYTES);
+    Ptr<uint> src = Ptr<uint>(srcBase + uint64_t(srcSlot) * MERGE_TRANSFORM_BYTES);
+    uint w[MERGE_TRANSFORM_WORDS];
+    for (uint k = 0u; k < MERGE_TRANSFORM_WORDS; ++k)
+        w[k] = src[k];
+    // load mergeCopyTransform
+    for (uint k = 0u; k < MERGE_TRANSFORM_WORDS; ++k)
+        dst[k] = w[k];
+    // end mergeCopyTransform
+}
+
+// mirrors mergeTransformCacheAndBoundArrayChanges() in updateTransformAndBoundArray.cu:52
+// -- the DIRECT-GPU API's between-steps merge.  With eENABLE_DIRECT_GPU_API the
+// bounds and the transform cache are uploaded whole only on the first step
+// (PxgSimulationController.cpp:707-710); every shape added or re-inserted
+// after that is recorded by PxgBoundsArray::updateChanges
+// (PxgAABBManager.h:308-321) and merged here, one thread per record:
+//   indexFrom's MSB set   (isNew: a new shape, or setBounds) -> copy the slot
+//                         from the CPU arrays;
+//   indexFrom's MSB clear (a re-insertion under a new element id,
+//                         ScShapeSimBase.cpp:106-157) -> move the slot within
+//                         the DEVICE arrays, whose contents are the live GPU
+//                         state the CPU arrays do not have.
+//
+// One thread per change and NO grid-stride loop: the host sizes the grid to
+// ceil(numChanges / 256) (PxgSimulationController.cpp:756-760) and never
+// launches with numChanges == 0 (:712).  numthreads == the CUDA block (256,
+// PxgSimulationCoreKernelIndices.h:44) because the bridge forwards only the grid.
+//
+// Speculation (P9.22/P9.23): on llvmpipe the per-lane guard becomes a mask and
+// the loads under it are still issued for the excluded lanes, so the record
+// index is clamped to the last real record.  With that, every lane holds a
+// real record, and the copy addresses stay in range for both branches.  The
+// device BOUNDS are grown to the CPU bounds array's size before the launch
+// (:741-747); the device TRANSFORM CACHE is grown only to mUsedSize
+// (PxsTransformCache::getTotalSize, PxsTransformCache.h:109-111), which is
+// <= the CPU array's power-of-two capacity.  Every recorded index went through
+// PxsTransformCache::initEntry (mUsedSize > index), so it is in range for both.
+// Unverified upstream candidate (read, not run; documented, not reported):
+// PxgAABBManager::createAggregate (PxgAABBManager.cpp:292) records a new
+// bounds entry via setBounds, but ScScene.cpp:2855-2859 runs no transform-cache
+// initEntry for the aggregate, so a PxAggregate added alone between steps could
+// make the merge copy transformsArray[aggIdx] past mUsedSize -- the CUDA and
+// this port behave the same.
+// check_speculated_loads.py sees the clamp through `rec` (measured: the same
+// entry spelled `changes[idx * 2u + ...]` without the clamp adds two LOW-launch
+// findings), but it does NOT analyse the memory-sourced copy indices, and
+// removing the clamp is invisible to it and to every fixture (the guard masks
+// all stores).  The clamp is protected by review, not by a gate.
+//
+// Not reproduced, because it cannot be observed: the CUDA reads
+// changes[idx].indexFrom twice; the array is const and restrict and nothing
+// writes it during the launch, so one read is the same value.
+//
+// Upstream candidates, NOT verified at runtime and NOT changed here (the port
+// reproduces the CUDA):
+//   - Two records can target one slot in one launch, and then the result
+//     depends on scheduling: resetFiltering twice on one shape in one window
+//     records {j, i} and then {j, j|new} (the second call finds the shape
+//     pending insert and keeps the id, ScShapeSimBase.cpp:108-147).  The isNew
+//     writer would also copy a stale host pose for a dynamic in direct mode.
+//   - isNew copies the CPU slot, which for a DYNAMIC body in direct mode holds
+//     the pose the host last knew (writeback is off): attachShape on a moved
+//     dynamic after init merges its new shape at the spawn pose for one step
+//     (ScShapeSimBase.cpp:184-191).
+//   - The merge runs only when a shape instance changed
+//     (PxgSimulationController.cpp:799); a change recorded without one would be
+//     dropped at resetChanges (PxgSimulationCore.cpp:2256-2261).  No public
+//     trigger is known.
+//   - Port-only: dispatches are deferred to the next flush, so a host write to
+//     the mapped CPU arrays between this launch and the flush would be seen by
+//     the kernel.  Every window in PXG_SCENE=directapimerge opens after
+//     fetchResults(true); re-examine if a scene ever edits between simulate and
+//     fetchResults.
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void mergeTransformCacheAndBoundArrayChanges(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    // CUDA: int idx = blockIdx.x * blockDim.x + threadIdx.x, compared against the
+    // PxU32 numChanges -- an UNSIGNED compare under the usual conversions; the grid
+    // is far below 2^31 threads, so a uint is exact.  Spelled as a plain uint so the
+    // speculated-load checker can see the guard.
+    const uint idx = dispatchThreadId.x;
+    const uint numChanges = gMergeTcBound.numChanges;
+    if (idx < numChanges)
+    {
+        const uint rec = min(idx, numChanges - 1u);   // speculation clamp (P9.22); the guard decides
+        Ptr<uint> changes = Ptr<uint>(gMergeTcBound.changes);
+        const uint indexTo = changes[rec * 2u + 0u];
+        const uint rawFrom = changes[rec * 2u + 1u];
+        const uint indexFrom = rawFrom & 0x7FFFFFFFu;
+        const bool isNew = (rawFrom & (1u << 31u)) != 0u;
+        if (isNew)
+        {
+            mergeCopyBounds(gMergeTcBound.deviceBounds, indexTo, gMergeTcBound.boundsArray, indexFrom);
+            mergeCopyTransform(gMergeTcBound.deviceTransforms, indexTo, gMergeTcBound.transformsArray, indexFrom);
+        }
+        else
+        {
+            mergeCopyBounds(gMergeTcBound.deviceBounds, indexTo, gMergeTcBound.deviceBounds, indexFrom);
+            mergeCopyTransform(gMergeTcBound.deviceTransforms, indexTo, gMergeTcBound.deviceTransforms, indexFrom);
+        }
     }
 }

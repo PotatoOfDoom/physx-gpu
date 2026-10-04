@@ -93,15 +93,16 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.95, softbodydata added): 59 named scenes below, plus ten explicit rows
-# after the loop (the settling bag, three softbody floors, six PGS rows) = 69.
+# Today (P9.95, directapimerge added): 60 named scenes below, plus eleven explicit
+# rows after the loop (the settling bag, three softbody floors, seven PGS rows) = 71.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata"
+        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata
+        directapimerge"
 
 pass=0; fail=0; missing=0
 
@@ -200,6 +201,11 @@ run_one "particleapply (PGS)" PXG_SCENE=particleapply PXG_SOLVER=pgs
 # position (and the skinning that moves the collision mesh after them) run through the TGS
 # or the PGS softbody path, so it is scored under both.
 run_one "softbodydata (PGS)" PXG_SCENE=softbodydata PXG_SOLVER=pgs
+# P9.95: directapimerge (mergeTransformCacheAndBoundArrayChanges: shapes added and
+# re-inserted between steps under the direct-GPU API) is one kernel under both solvers,
+# but lane D's observable -- the re-inserted body's velocity right after the reset step --
+# is the solver's, so it is scored under both, as directapi and directapiwrite are.
+run_one "directapimerge (PGS)" PXG_SCENE=directapimerge PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
@@ -238,6 +244,17 @@ if [ "${1:-}" = "--diagnostics" ]; then
         for ctl in "" PXG_SBDATA_CONTROL=1; do
             env $ctl PXG_SCENE=softbodydata PXG_SOLVER=$solver PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
                 | grep -E 'final sim-position hash' | sed 's/^/    /'
+        done
+    done
+
+    # P9.95: directapimerge's control builds the same lanes without the direct-GPU API (the
+    # merge kernel never runs there) and reads the ordinary API; its lane line is the
+    # reference for the live run's (measured equal under TGS and PGS).
+    for solver in tgs pgs; do
+        echo "--- directapimerge ($solver) live vs PXG_DIRECTAPI_CONTROL=1: lane values"
+        for ctl in "" PXG_DIRECTAPI_CONTROL=1; do
+            env $ctl PXG_SCENE=directapimerge PXG_SOLVER=$solver PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+                | grep -E '^  (\[ control \] )?lane N:' | sed 's/^/    /'
         done
     done
 

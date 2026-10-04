@@ -1543,7 +1543,10 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
 // (isDirectGPUAPIInitialized())`), mergeTransformCacheAndBoundArrayChanges
 // (PxgSimulationController.cpp:703, `if (getEnableDirectGPUAPI())`) and
 // evaluatePointDistancesSDFBatch.  Not "rarely reached" -- UNREACHABLE, in every
-// one of the forty-nine scenes this harness had before today.
+// one of the forty-nine scenes this harness had before today.  (The flag is
+// necessary, not sufficient, for mergeTransformCacheAndBoundArrayChanges: it also
+// needs a shape added or re-inserted between two steps, which this scene never
+// does.  PXG_SCENE=directapimerge does, and reaches it -- P9.95.)
 //
 // And the twelve direct-API rigid getters and setters that WERE ported
 // (shaders/directApi.slang, plus setRigidDynamicGlobalPose in updateBounds.slang)
@@ -1712,6 +1715,118 @@ DirectApiWriteScene buildDirectApiWriteScene(PxPhysics* physics, PxScene* scene,
     s.F = body(6.0f);
     s.Q = body(10.0f);
     s.R = body(14.0f);
+    return s;
+}
+
+// PXG_SCENE=directapimerge (P9.95): mergeTransformCacheAndBoundArrayChanges.
+//
+// With the direct-GPU API on, the bounds array and the transform cache are uploaded
+// whole ONCE, on the first step (PxgSimulationController.cpp:707-710).  After that,
+// every shape added or re-inserted between two steps is recorded by PxgBoundsArray
+// (PxgAABBManager.h:262-321) as {indexTo, indexFrom | isNew<<31} and merged into the
+// device arrays by this one kernel (:712-714, launch :725-764) -- the host never
+// re-uploads them.  It runs only behind four guards: the direct-API flag, a first
+// step already done, a shape instance registered or unregistered since the last step
+// (:799), and a change recorded BETWEEN steps (changes recorded during a step are
+// dropped at its DMA-back, PxgSimulationCore.cpp:2256-2261).  No scene before this
+// one changed a shape after step 0, so the kernel had never been launched.
+//
+// Three lanes, each on its own small static slab (half (2, 0.5, 2), top at y = 0;
+// NOT a ground box, which would catch every lane at once and hide which slot is
+// wrong), each exercising one branch of the kernel:
+//
+//   N  (x=-30)  B falls from y=5 with NOTHING under it.  After the second step the
+//               slab G2 is added under it: an isNew record (from == to), copied from
+//               the CPU arrays.  Two far decoy slabs are added in the same window.
+//   S  (x=-10)  A falls from y=2 onto G1, which exists from step 0.  In the same
+//               window resetFiltering(G1) re-inserts G1 under a NEW element id: a
+//               device-to-device record (ScShapeSimBase.cpp:106-157).
+//   D  (x=+10)  C falls from y=3 onto G3 and rests.  After step 60 resetFiltering(C)
+//               re-inserts C: a device-to-device record for a DYNAMIC body, whose
+//               device slot (the GPU pose) and CPU slot (the stale spawn pose, y=3:
+//               host writeback is off) differ.  resetFiltering on a dynamic always
+//               calls wakeUpInternal() too (NpScene.cpp:2597-2599).
+//
+// Every body is read back through PxDirectGPUAPI::getRigidDynamicData into poisoned
+// memory.  The checks: B and A rest at 0.5 (lanes N and S), C's vertical velocity
+// right after the reset step is ~0 and its height 0.5 (lane D: a slot taken from
+// the CPU arrays would put C at y=3 for one step, with no broadphase pair, and C
+// would free-fall for that step), and C still rests at the end.
+//
+// PXG_DIRECTAPI_CONTROL=1 builds the same scene without the flag and reads the
+// ordinary API; the merge kernel never runs there (copyBoundsAndTransforms instead).
+// It is the reference for C's velocity at the reset step.  Reported, never scored.
+//
+// *** MEASURED, RED BEFORE THE PORT (kernel unmapped, launches skipped). ***
+//
+//   [pxg-unmapped] mergeTransformCacheAndBoundArrayChanges was launched 2 time(s)
+//   B.y = -73.8070  A.y = -76.8070  (both free-fall through: 240 steps from y=5 / y=2)
+//   C.v_y after the reset step = -0.1644 (TGS) / -0.1637 (PGS): one step of free fall
+//   C.y after the reset step = 0.4973, C.y at the end = 0.5000 (it recovers)
+//
+// The control (no direct API) gives C.v_y = -0.0009 (TGS) / -0.0001 (PGS) after the
+// reset step: the pair the re-insertion destroys is found again and gets contacts in
+// the SAME step, so v_y right after it separates a correct merge from a wrong one.
+// After the port the live run equals the control to the printed digit under both
+// solvers (B.y = A.y = C.y = 0.5000), and the dumped records (PXG_DUMP_ARGS) are
+// launch 1 = {5, 5|new} {6, 6|new} {7, 7|new} {8, 0} (G2, the decoys, G1 0 -> 8) and
+// launch 2 = {0, 3} (C 3 -> 0, G1's released id).  The wake resetFiltering(C) adds
+// does NOT push C's stale host pose: C.y after the reset step is 0.5000, not 3.
+//
+// What each wrong merge does to the lanes (scene mutation sweep, TGS):
+//   kernel skipped           N -73.81, S -76.81, D -0.1644
+//   MSB ignored, always CPU  D only (-0.1644; -0.1637 under PGS).  S passes: G1 is a
+//                            static, so its CPU slot 0 is as current as its device slot.
+//   MSB ignored, always dev  N only (-73.81)
+//   indexTo / indexFrom swapped  S and D.  N passes: its record has from == to.
+//   isNew copies bounds only N only: G2's transform-cache slot is never written.
+//   re-insert copies the transform only  S and D.
+//
+// The slabs are added and re-inserted, never MOVED.  PxRigidStatic::setGlobalPose
+// after init takes another road (upstream candidate, unverified): updateDirtyShapes
+// writes the CPU arrays and flags the bounds array changed (ScPipeline.cpp:244), so
+// preBpUpdate_GPU re-uploads the WHOLE CPU bounds array into the broadphase buffer
+// (PxgCudaBroadPhaseSap.cpp:1242-1246) while the NP transform cache keeps the old
+// pose -- and that re-upload would also mask lanes N and S here.
+struct DirectApiMergeScene
+{
+    PxRigidStatic*  G1;   // lane S slab, re-inserted in window W1
+    PxRigidStatic*  G3;   // lane D slab
+    PxRigidDynamic* A;    // lane S faller
+    PxRigidDynamic* B;    // lane N faller (its slab G2 arrives in W1)
+    PxRigidDynamic* C;    // lane D faller, re-inserted in window W2
+};
+
+// A static slab with ONE exclusive box shape, half (2, 0.5, 2), centred at
+// (x, -0.5, 0) so its top face is y = 0.  Created, NOT added: the caller adds it,
+// before the first step or between two steps.
+PxRigidStatic* makeMergeSlab(PxPhysics* physics, PxMaterial* material, float x)
+{
+    PxRigidStatic* slab = physics->createRigidStatic(PxTransform(PxVec3(x, -0.5f, 0.0f)));
+    PxShape* shape = physics->createShape(PxBoxGeometry(2.0f, 0.5f, 2.0f), *material, true);
+    slab->attachShape(*shape);
+    shape->release();
+    return slab;
+}
+
+DirectApiMergeScene buildDirectApiMergeScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    DirectApiMergeScene s = {};
+    auto body = [&](float x, float y) {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), y, x);
+        b->setSleepThreshold(0.0f);
+        b->setAngularDamping(0.0f);
+        return b;
+    };
+    // Creation order fixes the element ids: G1 0, A 1, G3 2, C 3, B 4.
+    s.G1 = makeMergeSlab(physics, material, -10.0f);
+    scene->addActor(*s.G1);
+    s.A = body(-10.0f, 2.0f);
+    s.G3 = makeMergeSlab(physics, material, 10.0f);
+    scene->addActor(*s.G3);
+    s.C = body(10.0f, 3.0f);
+    s.B = body(-30.0f, 5.0f);
     return s;
 }
 
@@ -6808,6 +6923,22 @@ int main()
                 std::printf("  [ P9.93 ] eENABLE_DIRECT_GPU_API | eENABLE_BODY_ACCELERATIONS raised\n");
             }
         }
+        // P9.95 -- PXG_SCENE=directapimerge: mergeTransformCacheAndBoundArrayChanges runs
+        // only in direct-GPU-API mode (PxgSimulationController.cpp:702), only after the
+        // first copy (:707-710), and only for shapes added or re-inserted BETWEEN steps
+        // (:712, :799).  Its control (PXG_DIRECTAPI_CONTROL=1) drops the flag.
+        if (sn && !std::strcmp(sn, "directapimerge") && !std::getenv("PXG_DIRECTAPI_CONTROL"))
+        {
+            if (cpuControl)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=directapimerge requires the GPU pipeline; "
+                            "PXG_CPU_CONTROL=1 is incompatible with eENABLE_DIRECT_GPU_API\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+            std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (directapimerge)\n");
+        }
         if (sn && !std::strcmp(sn, "forcethreshold"))
             gForceThresholdPairs = true;
         // P9.95 -- PXG_SCENE=substepgravity: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is
@@ -10456,6 +10587,134 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=directapimerge (P9.95): mergeTransformCacheAndBoundArrayChanges, the
+    // direct-GPU API's between-steps merge of new and re-inserted shapes.  The three
+    // lanes are described at buildDirectApiMergeScene.
+    if (!std::strcmp(sceneName, "directapimerge"))
+    {
+        DirectApiMergeScene ms = buildDirectApiMergeScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'directapimerge' built: lanes N (x=-30, slab added later), S (x=-10, slab "
+                    "re-inserted), D (x=+10, body re-inserted)\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: directapimerge pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const bool control = std::getenv("PXG_DIRECTAPI_CONTROL") != nullptr;
+        const float dt = 1.0f / 60.0f;
+        const int steps = 240;
+        const int W1_AFTER = 1;    // window W1 opens after the 2nd step's fetchResults
+        const int W2_AFTER = 60;   // window W2 opens after the 61st step's fetchResults
+
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        static const float POISON = -999.0f;
+        const size_t OUT_FLOATS = 8;   // a PxTransform is 7; round up
+        CUdeviceptr devIdx = 0, devOut = 0;
+        if (!control && (ctx->memAlloc(&devIdx, sizeof(PxU32)) != 0 || !devIdx ||
+                         ctx->memAlloc(&devOut, OUT_FLOATS * sizeof(float)) != 0 || !devOut))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: directapimerge memAlloc failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        int failures = 0;
+        // One body's pose (7 floats) or linear velocity (3 floats) through the direct
+        // API, into memory poisoned before every read: a refused getter reads -999.
+        // (A copy of directapi's readPoisoned, deliberately not shared.)
+        auto readBody = [&](PxRigidDynamic* b, PxRigidDynamicGPUAPIReadType::Enum type, size_t count,
+                            float* host) -> bool
+        {
+            float poison[OUT_FLOATS];
+            for (size_t i = 0; i < OUT_FLOATS; ++i) poison[i] = POISON;
+            ctx->memcpyHtoD(devOut, poison, OUT_FLOATS * sizeof(float));
+            const PxU32 gpuIndex = b->getGPUIndex();
+            ctx->memcpyHtoD(devIdx, &gpuIndex, sizeof(PxU32));
+            const bool ok = scene->getDirectGPUAPI().getRigidDynamicData(
+                reinterpret_cast<void*>(devOut), reinterpret_cast<const PxRigidDynamicGPUIndex*>(devIdx), type, 1);
+            ctx->memcpyDtoH(host, devOut, count * sizeof(float));
+            return ok;
+        };
+        // PxTransform is (q.xyzw, p.xyz): the centre height is element 5.
+        auto bodyY = [&](PxRigidDynamic* b) -> float {
+            if (control) return b->getGlobalPose().p.y;
+            float h[OUT_FLOATS];
+            if (!readBody(b, PxRigidDynamicGPUAPIReadType::eGLOBAL_POSE, 7, h))
+            { std::printf("FAIL: getRigidDynamicData(eGLOBAL_POSE) returned false\n"); ++failures; }
+            return h[5];
+        };
+        auto bodyVy = [&](PxRigidDynamic* b) -> float {
+            if (control) return b->getLinearVelocity().y;
+            float h[OUT_FLOATS];
+            if (!readBody(b, PxRigidDynamicGPUAPIReadType::eLINEAR_VELOCITY, 3, h))
+            { std::printf("FAIL: getRigidDynamicData(eLINEAR_VELOCITY) returned false\n"); ++failures; }
+            return h[1];
+        };
+
+        std::printf("  stepping directapimerge (%d x %.4fs)%s: W1 after step %d, W2 after step %d\n", steps, dt,
+                    control ? " -- CONTROL, no direct-GPU API" : "", W1_AFTER, W2_AFTER);
+        float cVy60 = POISON, cVy61 = POISON, cY61 = POISON;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i == W1_AFTER)
+            {
+                // W1: G2 under B and two far decoys (isNew records, from == to), and G1
+                // re-inserted under a new element id (a device-to-device record).
+                scene->addActor(*makeMergeSlab(physics, material, -30.0f));
+                scene->addActor(*makeMergeSlab(physics, material, 60.0f));
+                scene->addActor(*makeMergeSlab(physics, material, 90.0f));
+                if (!scene->resetFiltering(*ms.G1))
+                { std::printf("FAIL: resetFiltering(G1) returned false\n"); ++failures; }
+            }
+            if (i == W2_AFTER)
+            {
+                cVy60 = bodyVy(ms.C);
+                // W2: C re-inserted (a device-to-device record for a dynamic body).
+                if (!scene->resetFiltering(*ms.C))
+                { std::printf("FAIL: resetFiltering(C) returned false\n"); ++failures; }
+            }
+            if (i == W2_AFTER + 1)
+            {
+                cVy61 = bodyVy(ms.C);
+                cY61 = bodyY(ms.C);
+            }
+        }
+        const float aY = bodyY(ms.A), bY = bodyY(ms.B), cY = bodyY(ms.C);
+        if (!control) { ctx->memFree(devIdx); ctx->memFree(devOut); }
+        std::printf("  %slane N: B.y=%.4f   lane S: A.y=%.4f   lane D: C.v_y(step %d)=%.4f C.v_y(step %d)=%.4f "
+                    "C.y(step %d)=%.4f C.y=%.4f\n", control ? "[ control ] " : "", bY, aY, W2_AFTER, cVy60,
+                    W2_AFTER + 1, cVy61, W2_AFTER + 1, cY61, cY);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (control)
+        {
+            std::printf("[ control ] gpu-sdk-step: directapimerge control run, not scored\n");
+            return 0;
+        }
+
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.4f, expected %.4f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        near("B.y (lane N: G2 is an isNew record, copied from the CPU arrays)", bY, 0.5f, 0.02f);
+        near("A.y (lane S: G1's new slot is copied from its old DEVICE slot)", aY, 0.5f, 0.02f);
+        near("C.v_y before the reset (lane D baseline)", cVy60, 0.0f, 0.02f);
+        near("C.v_y after the reset step (lane D: no one-step free fall)", cVy61, 0.0f, 0.02f);
+        near("C.y after the reset step (lane D: the GPU pose, not the stale host pose y=3)", cY61, 0.5f, 0.02f);
+        near("C.y at the end (lane D)", cY, 0.5f, 0.02f);
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: directapimerge: an added slab (isNew), a re-inserted slab and a "
+                        "re-inserted body (device to device) all hold their bodies -- "
+                        "mergeTransformCacheAndBoundArrayChanges runs on Vulkan\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'directapimerge': %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "directapiwrite"))
     {
         DirectApiWriteScene ws = buildDirectApiWriteScene(physics, scene, material);
@@ -10982,6 +11241,7 @@ int main()
                        "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
                        "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
                        "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
+                       "          directapimerge                          (P9.95: shapes added / re-inserted between steps -> mergeTransformCacheAndBoundArrayChanges)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

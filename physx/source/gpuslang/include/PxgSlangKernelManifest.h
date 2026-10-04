@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 425;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 426;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -28,7 +28,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateArticulationsLaunch", "updateArticulationsBda.spv", "updateArticulationsLaunch" },  // UPDATE_ARTICULATIONS (P8.124 BDA)
     { "updateJointsLaunch", "bodyUpdate.spv", "updateJointsLaunch" },  // UPDATE_JOINTS (P5 Step 5 BDA port)
     { "updateTransformCacheAndBoundArrayLaunch", "updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch" },  // UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY
-    { "mergeTransformCacheAndBoundArrayChanges", nullptr, nullptr },  // MERGE_TRANSFORMCACHE_AND_BOUNDARRAY_CHANGES (unmapped)
+    { "mergeTransformCacheAndBoundArrayChanges", "updateBounds.spv", "mergeTransformCacheAndBoundArrayChanges" },  // MERGE_TRANSFORMCACHE_AND_BOUNDARRAY_CHANGES (P9.95 engine ABI: the direct-GPU API's between-steps merge)
     { "updateChangedAABBMgrHandlesLaunch", "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch" },  // UPDATE_AABBMGR_HANDLES (P5 Step 4 BDA)
     { "computeFrozenAndUnfrozenHistogramLaunch", "frozenHistogram.spv", "computeFrozenAndUnfrozenHistogramLaunch" },  // COMPUTE_FROZEN_UNFROZEN_HISTOGRAM (P9.42)
     { "outputFrozenAndUnfrozenHistogram", "frozenHistogram.spv", "outputFrozenAndUnfrozenHistogram" },  // OUTPUT_FROZEN_UNFROZEN_HISTOGRAM (P9.42)
