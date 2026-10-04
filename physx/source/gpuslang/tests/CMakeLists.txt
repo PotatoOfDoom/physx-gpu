@@ -710,7 +710,7 @@ pxg_compile_shader(gridCal ctGridCal)
 # kernels on the engine ABI (BDA).  Vulkan-only (BDA reads the PxgParticleSystem
 # descriptor array through Ptr<>, which does not lower to HLSL cs_6_0), so
 # deliberately absent from PXG_HLSL_ENTRIES (same precedent as solveBlockUnified).
-pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch ps_preDiffuseIntegrateLaunch)
+pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch ps_preDiffuseIntegrateLaunch applyParticleBufferDataDEPRECATED)
 # P6.1: particle contact-sort bring-up — the three contact-sort orchestration
 # kernels on the engine ABI (BDA), re-pointed off the Phase-1 harness
 # (radixSortGather / clampValues).  The radix double-copies grid-stride via

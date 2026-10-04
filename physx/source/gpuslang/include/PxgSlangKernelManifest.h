@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 423;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 424;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -345,7 +345,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeArtiCentrifugalForces", "npArtiInverseDyn.spv", "computeArtiCentrifugalForces" },  // COMPUTE_ARTI_CENTRIFUGAL_FORCES (unmapped)
     { "computeArtiCOM", "npArtiInverseDyn.spv", "computeArtiCOM" },  // COMPUTE_ARTI_COM (unmapped)
     { "computeArtiCentroidalMomentumMatrices", "npArtiInverseDyn.spv", "computeArtiCentroidalMomentumMatrices" },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
-    { "applyParticleBufferDataDEPRECATED", nullptr, nullptr },  // APPLY_PARTICLE_BUFFER_DATA_DEPRECATED (unmapped)
+    { "applyParticleBufferDataDEPRECATED", "particleSim.spv", "applyParticleBufferDataDEPRECATED" },  // APPLY_PARTICLE_BUFFER_DATA_DEPRECATED (P9.95: direct-GPU-API ingest by unique id)
     { "getRigidDynamicGlobalPose", "directApiBda.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE (P9.79 BDA re-point)
     { "getRigidDynamicLinearVelocity", "directApiBda.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL (P9.79 BDA re-point)
     { "getRigidDynamicAngularVelocity", "directApiBda.spv", "getRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_GET_ANGVEL (P9.79 BDA re-point)

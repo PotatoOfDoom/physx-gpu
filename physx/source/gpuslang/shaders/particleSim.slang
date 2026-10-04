@@ -489,3 +489,70 @@ void ps_updateUnsortedArrayLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// applyParticleBufferDataDEPRECATED -- direct-GPU-API ingest by UNIQUE ID
+// (particlesystem.cu:5831-5866; host PxgPBDParticleSystemCore.cpp:2267-2309, launch
+// :2287).  P9.95.  The sibling of ps_updateUnsortedArrayLaunch above, with three
+// differences that are the whole kernel:
+//   * the workgroup's y names a SLOT of the user arrays through indices[] (:5836), and
+//     the slot's PxGpuParticleBufferIndexPair names the SYSTEM and a buffer UNIQUE ID
+//     (:5837-5838) -- not an active-system list and not a buffer index;
+//   * the unique id is resolved by psFindBufferIndexFromUniqueId (:5844);
+//   * the flags come from the user's array at the SLOT, read through `const PxU32*`
+//     (:5854-5855) although the parameter is declared `const PxParticleBufferFlag*`
+//     (1 byte): the stride is 4, which matches PxParticleBufferFlags.
+// Only POSITION and VELOCITY are honoured (:5860-5864); PHASE and RESTPOSITION are
+// dropped upstream and are deliberately NOT completed from the sibling.
+//
+// Differences from CUDA (all value-neutral):
+//   - the copies move uint4, not float4, so every bit of the source survives (-0, NaN
+//     payloads, signalling patterns, denormals);
+//   - the pair is read as two uint at 2*index rather than through a mirror struct;
+//   - P9.22 rule: the SOURCE index is clamped so a masked-out lane cannot speculate a
+//     load past a short user buffer.  The grid is sized by the LARGEST buffer
+//     (mMaxParticlesPerBuffer, :2277) while the guard uses THIS buffer's count, so the
+//     overshoot can be far more than one workgroup.  Only in-guard lanes store, so the
+//     clamp changes an address and never a value.
+// Host pack (:2279-2285) == kernel args: four 8-byte device pointers, 32 bytes.
+// ---------------------------------------------------------------------------
+struct PsApplyBufferDataParams
+{
+    uint64_t particleSystems; // @0  CUdeviceptr particleSystemd
+    uint64_t indices;         // @8  const PxU32*
+    uint64_t indexPairs;      // @16 PxGpuParticleBufferIndexPair {systemIndex@0, bufferIndex@4}, stride 8
+    uint64_t dirtyFlags;      // @24 declared PxParticleBufferFlag* but read as PxU32* (:5854) -> stride 4
+}
+[[vk::push_constant]] ConstantBuffer<PsApplyBufferDataParams> gApply;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]   // == host block (:2276); the bridge discards blockDim
+void applyParticleBufferDataDEPRECATED(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint index = Ptr<uint>(gApply.indices)[groupId.y];                       // AP:index :5836
+    const uint systemIndex = Ptr<uint>(gApply.indexPairs)[2u * index + 0u];        // AP:pairSys :5837
+    const uint uniqueId    = Ptr<uint>(gApply.indexPairs)[2u * index + 1u];        // AP:pairUid :5837
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gApply.particleSystems); // :5838
+    Ptr<uint4> unsortedPositions = Ptr<uint4>(systems[systemIndex].mUnsortedPositions_InvMass); // AP:sysPos :5840
+    Ptr<uint4> unsortedVels      = Ptr<uint4>(systems[systemIndex].mUnsortedVelocities);        // AP:sysVel :5841
+    const uint bufferId = psFindBufferIndexFromUniqueId(systems, systemIndex, uniqueId);       // AP:lookup :5844
+    Ptr<PxgParticleSimBufferGpu> simBuffers = Ptr<PxgParticleSimBufferGpu>(systems[systemIndex].mParticleSimBuffers); // AP:sysSim :5846
+    const uint offset = Ptr<uint>(systems[systemIndex].mParticleBufferRunsum)[bufferId];      // AP:offset :5847
+    const uint64_t particlesAddr  = simBuffers[bufferId].mPositionInvMasses;                  // :5849
+    const uint64_t velocitiesAddr = simBuffers[bufferId].mVelocities;                         // :5850
+    const uint numActive = simBuffers[bufferId].mNumActiveParticles;                          // :5857 operand
+    const uint globalThreadIndex = groupThreadId.x + PS_BLOCK_DIM * groupId.x;                // AP:gtid :5852
+    const uint flags = Ptr<uint>(gApply.dirtyFlags)[index];                                   // AP:flags :5854-5855
+    // P9.22 rule: the source address is clamped so masked-out lanes cannot speculate past a
+    // short user buffer (grid sized by the LARGEST buffer).  Value-neutral: only in-guard
+    // lanes store.
+    const uint srcIdx = (globalThreadIndex < numActive) ? globalThreadIndex : 0u;           // AP:clamp
+    if (globalThreadIndex < numActive)                                                        // AP:guard :5857
+    {
+        const uint ind = offset + globalThreadIndex;                                          // AP:ind :5859
+        if ((flags & PS_BUFFER_FLAG_UPDATE_POSITION) != 0u)                                   // AP:posGuard :5860
+            unsortedPositions[ind] = Ptr<uint4>(particlesAddr)[srcIdx];                       // AP:posCopy :5861
+        if ((flags & PS_BUFFER_FLAG_UPDATE_VELOCITY) != 0u)                                   // AP:velGuard :5863
+            unsortedVels[ind] = Ptr<uint4>(velocitiesAddr)[srcIdx];                           // AP:velCopy :5864
+    }
+}

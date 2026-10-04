@@ -336,3 +336,35 @@ public float pxgLoadParticleMaterialFloat(uint64_t materialsBase, uint mi, uint 
     let elem = materialsBase + uint64_t(mi) * uint64_t(stride);
     return (Ptr<float>(elem))[floatIndex];
 }
+
+// ---------------------------------------------------------------------------
+// P9.95: findBufferIndexFromUniqueId (particleSystem.cuh:99-117), lifted here from
+// softBodyParticleAttachBda (its E4) when applyParticleBufferDataDEPRECATED became the
+// second user, by the same rule P9.13d applied to psGetFluid: one transcription, not two.
+//
+// It is NOT dfFindRange.  It is an UPPER-BOUND binary search over
+// mParticleBufferSortedUniqueIds (`values[m] > id` moves r down, everything else moves
+// l up), then a lookup of r - 1 in the ORIGINAL-INDEX table.  The length-0 early return
+// is what keeps r - 1 from wrapping.  There is NO validation, upstream and kept: an id
+// below every registered id leaves r == 0 and reads OriginalIndex[0xFFFFFFFF], and an
+// unregistered larger id resolves to its predecessor's buffer.
+// ---------------------------------------------------------------------------
+public uint psFindBufferIndexFromUniqueId(Ptr<PxgParticleSystemGpu> systems, uint systemId, uint uniqueBufferId)
+{
+    const uint length = systems[systemId].mCommonData_NumParticleBuffers;
+    if (length == 0u)                                                    // FB:len0
+        return 0u;
+
+    Ptr<uint> values = Ptr<uint>(systems[systemId].mParticleBufferSortedUniqueIds);
+
+    uint l = 0u, r = length;
+    while (l < r)
+    {
+        const uint m = (l + r) / 2u;                                     // FB:mid
+        if (values[m] > uniqueBufferId)                                  // FB:cmp
+            r = m;
+        else
+            l = m + 1u;
+    }
+    return Ptr<uint>(systems[systemId].mParticleBufferSortedUniqueIdsOriginalIndex)[r - 1u];   // FB:ret
+}

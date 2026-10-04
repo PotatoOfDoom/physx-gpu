@@ -139,7 +139,7 @@ sb_plasticDeformLaunch2
 # updateChangedAABBMgrHandlesLaunch writes `=`.  Launched from ScPipeline.cpp:355
 # under `if (isDirectGPUAPIInitialized())`, 239 times in a 240-step directapi run.
 
-# PxgPBDParticleSystemCore.cpp (1)
+# PxgPBDParticleSystemCore.cpp (0)
 # P9.80 removed ps_solveShapes and ps_update_volume_bound: both are mapped and
 # both are now DRIVEN, by PXG_SCENE=particlerigid -- the first scene in this
 # harness to create a PxParticleRigidBuffer (a shape-matched cluster) and the
@@ -149,7 +149,9 @@ sb_plasticDeformLaunch2
 # not asserted: with ps_solveShapes skipped the cluster's y-extent collapses from
 # 1.4999 to 0.0000, and with ps_update_volume_bound skipped the volume bound still
 # holds the -999 the scene poisoned it with.
-applyParticleBufferDataDEPRECATED
+# applyParticleBufferDataDEPRECATED -- MAPPED in P9.95 (particleSim.spv); driven by
+# PXG_SCENE=particleapply through PxScene::applyParticleBufferData, the first scene
+# to combine eENABLE_DIRECT_GPU_API with a PBD particle system.
 
 # PxgParticleSystemCore.cpp (3)
 

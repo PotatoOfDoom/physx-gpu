@@ -92,13 +92,16 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # P9.51 was unmapped end to end and therefore a silent no-op -- the box fell
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
+#
+# Today (P9.95, particleapply added): 58 named scenes below, plus nine explicit rows
+# after the loop (the settling bag, three softbody floors, five PGS rows) = 67.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity"
+        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply"
 
 pass=0; fail=0; missing=0
 
@@ -188,6 +191,10 @@ run_one "extforce (PGS)" PXG_SCENE=extforce PXG_SOLVER=pgs
 # kernel is launched only by PxgTGSCudaSolverCore, and its scene flag
 # eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is rejected with PGS by
 # PxSceneDesc::isValid (PxSceneDesc.h:1129), so the scene refuses PXG_SOLVER=pgs.
+# P9.95: particleapply (applyParticleBufferDataDEPRECATED, the direct-API particle
+# ingest) is the same kernel under both solvers, but the first step that integrates what
+# it ingested runs through the TGS or the PGS particle path, so it is scored under both.
+run_one "particleapply (PGS)" PXG_SCENE=particleapply PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
@@ -207,6 +214,16 @@ if [ "${1:-}" = "--diagnostics" ]; then
         env PXG_SCENE=$sc $var=1 PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
             | grep -E '^  particle |^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
     done
+
+    # P9.95: particleapply's control ingests the same edits through raiseFlags (the mapped
+    # ps_updateUnsortedArrayLaunch) instead of applyParticleBufferData.  The live run dumps
+    # its final user arrays and the control counts the words that differ (measured 0).
+    pa_dump=$(mktemp)
+    echo "--- particleapply + PXG_PARTICLE_APPLY_CONTROL=1"
+    env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 ./gpu-sdk-step >/dev/null 2>&1
+    env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_CONTROL=1 PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 \
+        ./gpu-sdk-step 2>&1 | grep -E '^  \[ control \]|^FAIL:|^\[ *(OK|FAIL|control) *\] gpu-sdk-step' | sed 's/^/    /'
+    rm -f "$pa_dump"
 
     # A SECOND diagnostic list, and a different kind.  The controls above are
     # references that exist to fail; these are scenes that exist to NAME KERNELS

@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95b: applyParticleBufferDataDEPRECATED (particlesystem.cu:5831-5866) ported and mapped
+(manifest 423 -> 424, engine-reachable unmapped 9 -> 8); the upper-bound id search is shared with
+the softbody attach port.  Bitwise fixture, 27+ mutants (1 equivalent), PXG_SCENE=particleapply
+(TGS + PGS; skipped kernel leaves the clouds unmoved).  Scenes 67/67.
 P9.95a: liveness audit of the 23 remaining kernels -- 6 reachable, 17 not (13 mapped-unwired scan/
 radix/skinning kernels exist only behind the PhysicsGpu factory this build does not compile;
 reorderKernel has no caller even upstream; the 4 documented dead ones re-verified).
@@ -2116,6 +2120,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95b — `applyParticleBufferDataDEPRECATED`: Partikelpuffer-Daten über `PxParticleSystem::applyParticleBufferData`
+
+**Erreichbarkeit.** Der Kernel (particlesystem.cu:5831-5866) läuft, wenn eine Anwendung
+`applyParticleBufferData` mit Indizes, Paaren (System, Puffer-ID) und Flags aufruft. Er kopiert
+Positionen und Geschwindigkeiten aus den Nutzerpuffern in die Simulationspuffer. Bisher war er nicht
+gemappt, der Aufruf lief also ins Leere.
+
+**Port.**
+- Neuer Einstieg `applyParticleBufferDataDEPRECATED` in `particleSim.slang`, Push-Block 32 B,
+  ABI-Zeile `kPsApplyBufferData {8,8,8,8}`.
+- Kopiert wird über uint4-Moves, damit jedes Bitmuster erhalten bleibt. Nur POS (1) und VEL (2)
+  werden beachtet, wie in der CUDA.
+- Der Quellindex ist geklemmt, damit Lanes hinter einem kurzen Puffer nicht außerhalb lesen.
+  Gespeichert wird nur innerhalb des Guards; das ändert keinen Wert.
+- Die Upper-Bound-Suche `findBufferIndexFromUniqueId` (particleSystem.cuh:99-117) ist jetzt als
+  `psFindBufferIndexFromUniqueId` in `pxgSlangParticleDesc` gemeinsam. Die lokale Kopie in
+  `softBodyParticleAttachBda` ist entfernt.
+- Manifest 423 → 424, `engine_reachable_unmapped.txt` 9 → 8.
+
+**Fixture** `particleSimApplyBufferData` (testParticleSim.cpp): zwei Partikelsysteme, drei Starts,
+bitweise gegen ein wörtliches CUDA-Orakel. Fünf absichtlich falsche Orakel-Schreibweisen müssen
+das Ergebnis jeweils ändern.
+
+**Sweeps.**
+- Fixture: 27 Mutanten, 26 getötet. `ap-float-move` (`x + 0.0f`) ist äquivalent, weil slangc ihn
+  selbst bei -O0 wegfaltet. Zwei Varianten mit einer Laufzeit-Null werden getötet.
+- Helfer: getötet über die Partikel- und die Softbody-Fixture. `fb-len0` hatte zuerst überlebt, weil
+  der Out-of-Bounds-Lesezugriff zufällig 0 lieferte. Start 3 der Fixture ist verschärft, jetzt
+  stirbt er.
+- Szene: 5/5 getötet.
+
+**Szene `PXG_SCENE=particleapply`** (TGS und PGS, plus Kontrollmodus):
+
+| Messgröße | Kernel übersprungen | grün |
+|---|---|---|
+| B.z − C.z | 0 | 7.0000 |
+| B.x-Verschiebung | 0 | 1.5000 |
+| A.y − C.y | 0 | 3.0000 |
+
+Die Kontrolle (gewöhnliche Puffer-Flags statt des Apply-Aufrufs) weicht in 0 von 1536 Endwörtern ab.
+`mergeTransformCacheAndBoundArrayChanges` feuert dabei nicht.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):** sechs, darunter eine Null-Dereferenz, bevor
+das erste PBD-System existiert, und dass `indexPairs` nie auf null geprüft wird.
+`ps_updateUnsortedArrayLaunch` hat dieselbe latente Out-of-Bounds-Lesestelle; sie ist als
+Folgepunkt notiert.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün (Pack-Checker 282 geprüft).
+**Suite:** 883/883 in beiden Speichermodi. **Szenen:** 67/67.
 
 ## P9.95a — Lebendigkeits-Audit der letzten 23 Kernel; `applyTGSSubstepGravity` auf dem Engine-ABI
 

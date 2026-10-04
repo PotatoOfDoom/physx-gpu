@@ -2942,6 +2942,134 @@ float diffuseMinY(const ParticleScene& psc)
 }
 
 // ---------------------------------------------------------------------------
+// P9.95 -- PXG_SCENE=particleapply: the direct-GPU-API particle ingest,
+// PxScene::applyParticleBufferData -> PxgPBDParticleSystemCore::
+// applyParticleBufferDataDEPRECATED (:2267-2309) -> applyParticleBufferDataDEPRECATED
+// (particlesystem.cu:5831-5866).  The only application entry point into that kernel,
+// and the first scene in this tree that combines eENABLE_DIRECT_GPU_API with a PBD
+// particle system.
+//
+// THREE CLOUDS IN ONE SYSTEM, NAMED BY UNIQUE ID.  The kernel resolves each slot's
+// PxGpuParticleBufferIndexPair through two indirections: indices[blockIdx.y] picks the
+// SLOT, and the slot's unique id goes through findBufferIndexFromUniqueId (an
+// upper-bound search over the sorted ids, then the ORIGINAL-INDEX table) to the buffer.
+// The buffers are created C, B, A and added A, B, C, so the unique ids run backwards
+// against the buffer order and the original-index table is a real permutation.
+//
+// The write window edits all three clouds' user arrays and raises NO flags, then
+// applies two of three slots:
+//     pairs   = { {sys, uid(A)}, {sys, uid(C)}, {sys, uid(B)} }
+//     flags   = {  VEL,           POS|VEL,       POS|VEL      }
+//     indices = { 2, 0 }                      -> slots 2 (B, POS|VEL) and 0 (A, VEL)
+// Slot 1 (C) is a decoy that is never named.  The per-step egress
+// (ps_updateUserBufferLaunch) overwrites every user array after each step, so an edit
+// the kernel did not apply is simply lost -- which is what makes the clouds the
+// observable.  Every particle is free (empty phase flags, damping 0), so a cloud keeps
+// its shape and its mean moves only by what was applied.
+static const float PAPPLY_DZ_B = 7.0f, PAPPLY_VX_B = 3.0f;
+static const float PAPPLY_DZ_A = -9.0f, PAPPLY_DVY_A = 6.0f;
+static const float PAPPLY_DZ_C = 11.0f, PAPPLY_VZ_C = 4.0f;
+static const int PAPPLY_STEPS = 30;
+
+struct ParticleApplyScene
+{
+    PxPBDParticleSystem* system = nullptr;
+    PxParticleBuffer* a = nullptr;
+    PxParticleBuffer* b = nullptr;
+    PxParticleBuffer* c = nullptr;
+    PxU32 n = 0;   // particles per cloud
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+ParticleApplyScene buildParticleApplyScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                           PxCudaContextManager* cudaCtx)
+{
+    ParticleApplyScene out;
+    out.cudaCtx = cudaCtx;
+    // The ground plus ONE live dynamic rigid far below the clouds (the particle island
+    // needs it, see buildParticleScene).  Both are added before the first step and no
+    // host pose is touched afterwards.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 40.0f);
+
+    PxPBDMaterial* pbdMat = physics->createPBDMaterial(/*friction*/ 0.05f, /*damping*/ 0.0f,
+        /*adhesion*/ 0.0f, /*viscosity*/ 0.0f, /*vorticityConfinement*/ 0.0f, /*surfaceTension*/ 0.0f,
+        /*cohesion*/ 0.0f, /*lift*/ 0.0f, /*drag*/ 0.0f);
+    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
+    const float spacing = 0.5f;
+    const float restOffset = 0.5f * spacing;
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.05f);
+    ps->setParticleContactOffset(restOffset + 0.05f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setMaxVelocity(1e6f);
+    // Empty phase flags: no self-collision, so every particle integrates on its own.
+    const PxU32 phase = ps->createPhase(pbdMat, PxParticlePhaseFlags());
+
+    const int G = 4;
+    const PxU32 N = PxU32(G * G * G);
+    out.n = N;
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    auto makeCloud = [&](float centreX) -> PxParticleBuffer*
+    {
+        PxParticleBuffer* buf = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+        if (!buf) return nullptr;
+        std::vector<PxVec4> pos(N), vel(N, PxVec4(0.0f));
+        std::vector<PxU32> ph(N, phase);
+        const float c = 0.5f * float(G - 1) * spacing;
+        PxU32 i = 0;
+        for (int x = 0; x < G; ++x)
+            for (int y = 0; y < G; ++y)
+                for (int z = 0; z < G; ++z)
+                    pos[i++] = PxVec4(centreX + float(x) * spacing - c, 100.0f + float(y) * spacing - c,
+                                      float(z) * spacing - c, 1.0f);
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf->getPositionInvMasses()), pos.data(), N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf->getVelocities()), vel.data(), N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf->getPhases()), ph.data(), N * sizeof(PxU32));
+        buf->setNbActiveParticles(N);
+        buf->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+        buf->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+        buf->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+        return buf;
+    };
+    // Created C, B, A (unique ids ascend in creation order) ...
+    out.c = makeCloud(20.0f);
+    out.b = makeCloud(0.0f);
+    out.a = makeCloud(-20.0f);
+    if (!out.a || !out.b || !out.c)
+    {
+        std::printf("FAIL: createParticleBuffer returned null\n");
+        return out;
+    }
+    // ... and added A, B, C.
+    ps->addParticleBuffer(out.a);
+    ps->addParticleBuffer(out.b);
+    ps->addParticleBuffer(out.c);
+    scene->addActor(*ps);
+    out.system = ps;
+    return out;
+}
+
+// DtoH one cloud's user positions and velocities.
+static void particleApplyRead(const ParticleApplyScene& s, PxParticleBuffer* buf,
+                              std::vector<PxVec4>& pos, std::vector<PxVec4>& vel)
+{
+    PxCudaContext* ctx = s.cudaCtx->getCudaContext();
+    pos.resize(s.n); vel.resize(s.n);
+    ctx->memcpyDtoH(pos.data(), reinterpret_cast<CUdeviceptr>(buf->getPositionInvMasses()), s.n * sizeof(PxVec4));
+    ctx->memcpyDtoH(vel.data(), reinterpret_cast<CUdeviceptr>(buf->getVelocities()), s.n * sizeof(PxVec4));
+}
+
+static PxVec3 particleApplyMean(const std::vector<PxVec4>& v)
+{
+    double x = 0.0, y = 0.0, z = 0.0;
+    for (const PxVec4& p : v) { x += double(p.x); y += double(p.y); z += double(p.z); }
+    const double n = double(v.size());
+    return PxVec3(float(x / n), float(y / n), float(z / n));
+}
+
+// ---------------------------------------------------------------------------
 // P9.4 -- PXG_SCENE=particlecloth: the PBD CLOTH sheet.
 //
 // This is the scene that makes the spring chain observable.  Four kernels were
@@ -6595,6 +6723,22 @@ int main()
             sceneDesc.flags |= PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS;
             std::printf("  [ P9.95 ] eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS raised\n");
         }
+        // P9.95 -- PXG_SCENE=particleapply: applyParticleBufferData is legal only once the
+        // direct-GPU API is initialized (NpScene.cpp:3735), so the flag is raised here.  It
+        // is raised for the control (PXG_PARTICLE_APPLY_CONTROL=1) as well: the control
+        // differs from the live run only in how the edits are ingested, not in the pipeline.
+        if (sn && !std::strcmp(sn, "particleapply"))
+        {
+            if (cpuControl)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=particleapply requires the GPU pipeline; "
+                            "PXG_CPU_CONTROL=1 is incompatible with eENABLE_DIRECT_GPU_API\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+            std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (particle direct-API ingest)\n");
+        }
     }
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
@@ -9662,6 +9806,189 @@ int main()
         return 2;
     }
 
+    if (!std::strcmp(sceneName, "particleapply"))
+    {
+        const bool control = std::getenv("PXG_PARTICLE_APPLY_CONTROL") != nullptr;
+        ParticleApplyScene pa = buildParticleApplyScene(physics, scene, material, cudaCtx);
+        if (!pa.system)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particleapply scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particleapply' built: three %u-particle clouds A B C in one PBD system, "
+                    "unique ids C < B < A, buffers added A B C\n", pa.n);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particleapply pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        int failures = 0;
+        PxParticleBuffer* clouds[3] = { pa.a, pa.b, pa.c };
+        const char* names[3] = { "A", "B", "C" };
+        std::vector<PxVec4> pos[3], vel[3], spawn[3];
+        for (int k = 0; k < 3; ++k) particleApplyRead(pa, clouds[k], spawn[k], vel[k]);
+
+        // 1. Warm-up step: it initializes the direct-GPU API (ScPipeline.cpp:2813-2815).
+        scene->simulate(dt);
+        scene->fetchResults(true);
+        // The egress must have refreshed the user arrays, or every observable below is void.
+        particleApplyRead(pa, pa.b, pos[1], vel[1]);
+        const float warmDy = particleApplyMean(pos[1]).y - particleApplyMean(spawn[1]).y;
+        std::printf("  warm-up: B mean dy = %.6f (expected about -g dt^2 = -0.002725)\n", warmDy);
+        if (!(warmDy < -1e-3f && warmDy > -5e-3f))
+        { std::printf("FAIL: the per-step egress did not refresh B's user array (dy = %.6f)\n", warmDy); ++failures; }
+
+        // 2. The write window: every cloud is edited, NO flag is raised.
+        for (int k = 0; k < 3; ++k) particleApplyRead(pa, clouds[k], pos[k], vel[k]);
+        for (PxU32 i = 0; i < pa.n; ++i)
+        {
+            pos[0][i].z += PAPPLY_DZ_A; vel[0][i].y += PAPPLY_DVY_A;
+            pos[1][i].z += PAPPLY_DZ_B; vel[1][i].x = PAPPLY_VX_B;
+            pos[2][i].z += PAPPLY_DZ_C; vel[2][i].z = PAPPLY_VZ_C;
+        }
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        for (int k = 0; k < 3; ++k)
+        {
+            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(clouds[k]->getPositionInvMasses()), pos[k].data(),
+                            pa.n * sizeof(PxVec4));
+            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(clouds[k]->getVelocities()), vel[k].data(),
+                            pa.n * sizeof(PxVec4));
+        }
+
+        // 3. The ingest: applyParticleBufferData, or (control) the ordinary flags.
+        CUdeviceptr devIdx = 0, devPairs = 0, devFlags = 0;
+        if (control)
+        {
+            pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+            pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+            pa.a->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+            std::printf("  [ control ] PXG_PARTICLE_APPLY_CONTROL=1: B POS|VEL and A VEL raised as buffer flags\n");
+        }
+        else
+        {
+            const PxU32 sys = pa.system->getGpuParticleSystemIndex();
+            const PxGpuParticleBufferIndexPair pairs[3] = {
+                { sys, pa.a->getUniqueId() }, { sys, pa.c->getUniqueId() }, { sys, pa.b->getUniqueId() } };
+            const PxParticleBufferFlags flags[3] = {
+                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_VELOCITY),
+                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY,
+                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY };
+            const PxU32 indices[2] = { 2u, 0u };
+            std::printf("  apply: system %u, unique ids A=%u B=%u C=%u, indices {2, 0}\n", sys,
+                        pa.a->getUniqueId(), pa.b->getUniqueId(), pa.c->getUniqueId());
+            if (ctx->memAlloc(&devIdx, sizeof(indices)) != 0 || !devIdx ||
+                ctx->memAlloc(&devPairs, sizeof(pairs)) != 0 || !devPairs ||
+                ctx->memAlloc(&devFlags, sizeof(flags)) != 0 || !devFlags)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: particleapply memAlloc failed\n");
+                scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+            }
+            ctx->memcpyHtoD(devIdx, indices, sizeof(indices));
+            ctx->memcpyHtoD(devPairs, pairs, sizeof(pairs));
+            ctx->memcpyHtoD(devFlags, flags, sizeof(flags));
+            scene->applyParticleBufferData(reinterpret_cast<const PxU32*>(devIdx),
+                                           reinterpret_cast<const PxGpuParticleBufferIndexPair*>(devPairs),
+                                           reinterpret_cast<const PxParticleBufferFlags*>(devFlags), 2u);
+        }
+
+        // 4. Thirty steps, then read every cloud back.
+        for (int i = 0; i < PAPPLY_STEPS; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+        }
+        PxVec3 mp[3], mv[3];
+        float shapeDev[3] = { 0.0f, 0.0f, 0.0f };
+        bool finite = true;
+        for (int k = 0; k < 3; ++k)
+        {
+            particleApplyRead(pa, clouds[k], pos[k], vel[k]);
+            mp[k] = particleApplyMean(pos[k]);
+            mv[k] = particleApplyMean(vel[k]);
+            const PxVec3 m0 = particleApplyMean(spawn[k]);
+            for (PxU32 i = 0; i < pa.n; ++i)
+            {
+                const PxVec3 d = (pos[k][i].getXYZ() - mp[k]) - (spawn[k][i].getXYZ() - m0);
+                shapeDev[k] = PxMax(shapeDev[k], PxMax(PxAbs(d.x), PxMax(PxAbs(d.y), PxAbs(d.z))));
+                finite = finite && pos[k][i].getXYZ().isFinite() && vel[k][i].getXYZ().isFinite();
+            }
+            std::printf("  %s  mean p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f) shape dev %.6f\n", names[k],
+                        mp[k].x, mp[k].y, mp[k].z, mv[k].x, mv[k].y, mv[k].z, shapeDev[k]);
+        }
+
+        // PXG_PARTICLE_APPLY_DUMP=<file>: the live run writes its final user arrays there,
+        // and the control compares against them word by word.  Reported, never scored.
+        if (const char* dumpPath = std::getenv("PXG_PARTICLE_APPLY_DUMP"))
+        {
+            std::vector<PxU32> words;
+            for (int k = 0; k < 3; ++k)
+                for (const std::vector<PxVec4>* v : { &pos[k], &vel[k] })
+                {
+                    const size_t base = words.size();
+                    words.resize(base + v->size() * 4);
+                    std::memcpy(words.data() + base, v->data(), v->size() * sizeof(PxVec4));
+                }
+            if (!control)
+            {
+                if (FILE* f = std::fopen(dumpPath, "wb"))
+                { std::fwrite(words.data(), sizeof(PxU32), words.size(), f); std::fclose(f); }
+            }
+            else if (FILE* f = std::fopen(dumpPath, "rb"))
+            {
+                std::vector<PxU32> ref(words.size(), 0u);
+                const size_t got = std::fread(ref.data(), sizeof(PxU32), ref.size(), f);
+                std::fclose(f);
+                size_t mism = 0;
+                for (size_t i = 0; i < words.size(); ++i) mism += (i >= got || ref[i] != words[i]) ? 1u : 0u;
+                std::printf("  [ control ] %zu of %zu final user-array words differ from the apply run\n",
+                            mism, words.size());
+            }
+        }
+
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        const float t = float(PAPPLY_STEPS) * dt;
+        if (!finite) { std::printf("FAIL: a cloud is not finite\n"); ++failures; }
+        near("B.z - C.z (B's POS applied)", mp[1].z - mp[2].z, PAPPLY_DZ_B, 1e-3f);
+        near("B.x - (C.x - 20) (B's VEL applied)", mp[1].x - (mp[2].x - 20.0f), PAPPLY_VX_B * t, 1e-3f);
+        near("B.v.x", mv[1].x, PAPPLY_VX_B, 1e-3f);
+        near("A.y - C.y (A's VEL applied)", mp[0].y - mp[2].y, PAPPLY_DVY_A * t, 1e-3f);
+        near("A.v.y - C.v.y", mv[0].y - mv[2].y, PAPPLY_DVY_A, 2e-3f);
+        near("A.z - C.z (A's POS NOT applied: flags are per slot)", mp[0].z - mp[2].z, 0.0f, 1e-3f);
+        near("A.x - (C.x - 40)", mp[0].x - (mp[2].x - 40.0f), 0.0f, 1e-3f);
+        near("B.y - C.y", mp[1].y - mp[2].y, 0.0f, 1e-3f);
+        near("C.x (decoy slot never read)", mp[2].x, 20.0f, 1e-3f);
+        near("C.z (decoy slot never read)", mp[2].z, 0.0f, 1e-3f);
+        near("C.v.z", mv[2].z, 0.0f, 1e-3f);
+        for (int k = 0; k < 3; ++k)
+            if (!(shapeDev[k] <= 1e-3f))
+            { std::printf("FAIL: cloud %s lost its shape (max offset change %.6f)\n", names[k], shapeDev[k]); ++failures; }
+
+        if (devIdx) ctx->memFree(devIdx);
+        if (devPairs) ctx->memFree(devPairs);
+        if (devFlags) ctx->memFree(devFlags);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (control)
+        {
+            std::printf("[ control ] gpu-sdk-step: particleapply control run (%d check(s) failed), not scored\n",
+                        failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particleapply: B.z-C.z = %.4f, B moved %.4f along x, A rose %.4f "
+                        "against C, A.z-C.z = %.4f, C untouched\n", mp[1].z - mp[2].z,
+                        mp[1].x - (mp[2].x - 20.0f), mp[0].y - mp[2].y, mp[0].z - mp[2].z);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particleapply: %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "substepgravity"))
     {
         SubstepGravityScene gs = buildSubstepGravityScene(physics, scene, material);
@@ -10300,6 +10627,7 @@ int main()
                        "          directapiwrite                          (P9.93: direct-API setters + acceleration getters)\n"
                        "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
                        "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
+                       "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

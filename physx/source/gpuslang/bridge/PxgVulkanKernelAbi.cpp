@@ -390,6 +390,16 @@ static const uint8_t kPsSolveSprings[] = { 8, 8, 4, 4, 1 };
 //     const PxU32* activeParticleSystems) — user-buffer -> unsorted ingest.
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
 static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
+// P9.95: applyParticleBufferDataDEPRECATED(const PxgParticleSystem*, const PxU32* indices,
+//   const PxGpuParticleBufferIndexPair* indexPairs, const PxParticleBufferFlag* dirtyFlags)
+//   (particlesystem.cu:5831; pack PxgPBDParticleSystemCore.cpp:2279-2285) -> four device
+//   pointers = 32 bytes.  hostPtrMask 0: the user arrays must be DEVICE memory.  A pinned-host
+//   pointer (legal under CUDA UVA) is NOT translated -- translateHostPtrs returns early for
+//   mask 0 (PxgVulkanCudaContext.cpp:397) -- so it reaches the shader as a raw host address:
+//   unsupported, a documented port limitation.  A mask cannot fix it: a masked argument that
+//   is not a pinned allocation refuses the launch (:410), which would refuse the normal
+//   device-pointer case.  Not aliased to kRadixCopy: same shape, different family.
+static const uint8_t kPsApplyBufferData[] = { 8, 8, 8, 8 };
 
 // gpusimulationcontroller FEMCloth.cu (P7.0 FEMCloth free-fall BDA):
 //   cloth_preIntegrateLaunch(PxgFEMCloth* femCloths, const PxU32* activeIds,
@@ -2058,6 +2068,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_preDiffuseIntegrateLaunch", kPsPreDiffuseIntegrate, uint32_t(sizeof(kPsPreDiffuseIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    { "applyParticleBufferDataDEPRECATED", kPsApplyBufferData, uint32_t(sizeof(kPsApplyBufferData)) },
     { "ps_updateMaterials", kPsUpdateMaterials, uint32_t(sizeof(kPsUpdateMaterials)) },
     // P9.1b: ps_calculateDensityAndPotentialLaunch(particleSystems*,
     //   activeParticleSystems*, bool shouldComputePotentials) -> {8,8,1}, the

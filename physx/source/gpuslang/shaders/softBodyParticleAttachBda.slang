@@ -70,6 +70,8 @@
 //     mParticleBufferSortedUniqueIdsOriginalIndex[r - 1], with an early 0 for an empty
 //     table (particleSystem.cuh:99-117).  `r - 1` on r == 0 would wrap; the length-0 guard
 //     is what makes that unreachable.
+//     The search lives in pxgSlangParticleDesc as psFindBufferIndexFromUniqueId (P9.95:
+//     lifted there when applyParticleBufferDataDEPRECATED became its second user).
 //
 // E5  wTot0 IS ASYMMETRIC.  Side 1 keeps the four-term barycentric sum, but side 0 is
 //     simply `pos0.w` — the particle's inverse mass, raw (:2592).  Every sibling computes
@@ -124,33 +126,10 @@ static const uint SBPA_BLOCK = 256u;
 static const uint PXG_BITSHIFT_TET_ID = 20u;
 static const uint PXG_VOLUME_TET_MASK = 0x000fffffu;
 
-// findBufferIndexFromUniqueId (particleSystem.cuh:99).  E4: an UPPER-BOUND binary search
-// (`values[m] > id` moves r down, everything else moves l up), then a lookup of r - 1 in
-// the ORIGINAL-INDEX table.  The length-0 early return is what keeps r - 1 from wrapping.
-uint findBufferIndexFromUniqueId(Ptr<PxgParticleSystemGpu> systems, uint systemId, uint uniqueBufferId)
-{
-    const uint length = systems[systemId].mCommonData_NumParticleBuffers;
-    if (length == 0u)
-        return 0u;
-
-    Ptr<uint> values = Ptr<uint>(systems[systemId].mParticleBufferSortedUniqueIds);
-
-    uint l = 0u, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2u;
-        if (values[m] > uniqueBufferId)
-            r = m;
-        else
-            l = m + 1u;
-    }
-    return Ptr<uint>(systems[systemId].mParticleBufferSortedUniqueIdsOriginalIndex)[r - 1u];
-}
-
 // findBufferOffset (softBodyGM.cu:2515).
 uint findBufferOffset(Ptr<PxgParticleSystemGpu> systems, uint systemId, uint uniqueBufferId)
 {
-    const uint bufferIndex = findBufferIndexFromUniqueId(systems, systemId, uniqueBufferId);
+    const uint bufferIndex = psFindBufferIndexFromUniqueId(systems, systemId, uniqueBufferId);
     return Ptr<uint>(systems[systemId].mParticleBufferRunsum)[bufferIndex];
 }
 
