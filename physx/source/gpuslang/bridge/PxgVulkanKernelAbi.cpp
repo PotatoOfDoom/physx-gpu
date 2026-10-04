@@ -667,6 +667,22 @@ static const uint8_t kSbFinalizeVelocities[] = { 8, 8, 4, 4, 4, 1 };
 //   the next pointer to @16) + device pointer + two PxReal (@24/@28) + two device
 //   pointers (@32/@40) -> 48-byte blob.  Same shape as the cloth kClothSleeping row.
 static const uint8_t kSbSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
+// gpusimulationcontroller softBodyGM.cu:3094 (P9.95):
+//   sb_copyOrApplySoftBodyDataDEPRECATED(PxgSoftBody* softbodies, const PxU32 dataIndex,
+//     const PxU32* softBodyIndices, const PxU32 softBodyIndicesSize, PxU32** data,
+//     const PxU32* dataSizes, const PxU32 threadsPerSoftBody, const PxU32 applyDataToSoftBodies)
+//   -- launch site PxgSoftBodyCore.cpp:3144.  THE ROW FOLLOWS THE HOST PACK, NOT THE SIGNATURE:
+//   argument 0 is PX_CUDA_KERNEL_PARAM(core->getSoftBodyBuffer()) (:3134), i.e. the 32-byte
+//   host PxgTypedCudaBuffer<PxgSoftBody> object (mPtr@0, allocator*@8, mSize@16, statGroup@24,
+//   pad@28; PxgCudaBuffer.h:103-107).  paramAlign(32) == 16 puts it at @0..@31; PxU32 @32,
+//   ptr @40, PxU32 @48, ptrs @56/@64, PxU32 @72/@76 -> 80-byte blob.  A row taken from the
+//   signature would give 56 bytes, and the shim's blobSize == pushConstantSize gate would
+//   refuse every launch in silence -- P9.76b's class, where the host pack and the signature
+//   also disagreed.  CUDA survives only because launchKernel drops sizes and mPtr is the
+//   object's first member.  hostPtrMask 0: @0 is a device address and bytes 8..31 are host
+//   data the shader never reads; bit 0 would also demand argSizes[0] == 8 and refuse the
+//   launch (PxgVulkanCudaContext.cpp translateHostPtrs).
+static const uint8_t kSbCopyOrApplyData[] = { 32, 4, 8, 4, 8, 8, 4, 4 };
 
 // gpusimulationcontroller softBodyGM.cu (P8.0 tranche 4 — the softbody FEM-volume solve
 // bracket):
@@ -2203,6 +2219,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_gm_stepSoftbodyLaunch", kSbStepSoftbody, uint32_t(sizeof(kSbStepSoftbody)) },
     { "sb_gm_finalizeVelocitiesLaunch", kSbFinalizeVelocities, uint32_t(sizeof(kSbFinalizeVelocities)) },
     { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)) },
+    // gpusimulationcontroller softbody deprecated direct API: PxScene::copy/applySoftBodyData (P9.95)
+    { "sb_copyOrApplySoftBodyDataDEPRECATED", kSbCopyOrApplyData, uint32_t(sizeof(kSbCopyOrApplyData)) },
     // gpusimulationcontroller softbody FEM-volume solve bracket (P8.0 tranche 4)
     { "sb_gm_zeroTetMultipliers", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     { "sb_gm_applyExternalDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },

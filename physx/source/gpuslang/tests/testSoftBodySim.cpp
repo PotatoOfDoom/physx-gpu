@@ -38,6 +38,8 @@
 //   softBodySimDescLayout        — byte-offset proof of the descriptor mirror
 //   softBodySimPreIntegratePGS   — sb_gm_preIntegrateLaunch PGS predict+integrate
 //   softBodySimPreIntegrateTGS   — sb_gm_preIntegrateLaunch TGS branch (vel + zero posDelta)
+//   softBodySimCopy*             — P9.95: sb_copyOrApplySoftBodyDataDEPRECATED through the
+//                                  ENGINE launch path (section at the end of the file)
 
 #include "pxgTestFramework.h"
 // P9.81: the heightfield decoders (Hf / buildHf / getTriangleNoAdj), so the step-2
@@ -63,6 +65,22 @@
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
+
+// P9.95: sb_copyOrApplySoftBodyDataDEPRECATED runs through the ENGINE launch path (the
+// real context, the ABI row, the shim gate and a real heap buffer object) -- see the
+// section at the end of this file.
+#include "foundation/PxFoundation.h"
+#include "foundation/PxAllocatorCallback.h"
+#include "foundation/PxErrorCallback.h"
+#include "foundation/PxPhysicsVersion.h"
+#include "PxgCudaShim.h"
+#include "PxgVulkanCudaContext.h"
+#include "PxgVulkanMemoryManager.h"
+#include "PxgVulkanKernelAbi.h"
+#include "PxgHeapMemAllocator.h"
+#include "PxgSlangKernelManifest.h"
+#include "cudamanager/PxCudaContext.h"
+#include "cudamanager/PxCudaContextManager.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -16070,6 +16088,734 @@ PXG_TEST(softBodySimParticleAttachmentSolve_p90BaryOrder)
     dev->destroyBuffer(bU2S.h); dev->destroyBuffer(bRunsum.h); dev->destroyBuffer(bUids.h);
     dev->destroyBuffer(bUidsOrig.h); dev->destroyBuffer(bSbD.h); dev->destroyBuffer(bPartD.h);
     dev->destroyBuffer(bSbDesc.h); dev->destroyBuffer(bPsDesc.h); dev->destroyBuffer(bCon.h);
+}
+
+// ===========================================================================
+// P9.95 -- sb_copyOrApplySoftBodyDataDEPRECATED (softBodyGM.cu:3094) through the ENGINE
+// launch path, not through a hand-built blob.
+//
+// WHY THE REAL CONTEXT AND NOT Kernel::dispatch.  Argument 0 of this kernel's host pack
+// (PxgSoftBodyCore.cpp:3134) is PX_CUDA_KERNEL_PARAM(core->getSoftBodyBuffer()): the
+// 32-byte HOST object PxgTypedCudaBuffer<PxgSoftBody>, not a device pointer.  CUDA drops
+// the sizes (CudaContextManager.cpp:1165-1169) and reads the object's first 8 bytes -- the
+// RAW mPtr, not getDevicePtr() -- as `PxgSoftBody*`.  The Vulkan bridge keeps the sizes and
+// builds an 80-byte blob, which the shim refuses unless the ABI row also says 80.  A
+// fixture that builds its own blob tests none of that, so the stack here is the engine's:
+//   PxgCudaShim over a registry built the way PhysXGpuVulkan.cpp's ensureRuntime builds it
+//   (push size FROM THE ABI ROW, cudaName set -- with testP4Aabb's {..., 0u, 0u} registry
+//   the shim would refuse every launch, 80 != 0) -> PxgCreateVulkanCudaContextManager ->
+//   PxgVulkanMemoryManager -> the REAL PxgHeapMemoryAllocatorManager.  The kernel is
+//   launched with the PxCudaKernelParam block of PxgSoftBodyCore.cpp:3132-3142 copied
+//   verbatim, its argument 0 a REAL PxgTypedCudaBuffer<PxgSoftBody> carved from that heap,
+//   and with the host's own tps / grid formula (:3122-3130).
+//
+// THE WORLD.  Every 8-byte word of the descriptor allocation holds the address of its own
+// 16448-byte slot -- the 8 pointer fields the flags map AND every other word, scalars
+// included -- so a port that reads the wrong slot reads a valid, distinctly patterned
+// buffer: a wrong result, never a host fault.  Every slot, user buffer and table (and the
+// descriptor allocation itself) is compared BITWISE after every launch against a literal
+// host transcription of softBodyGM.cu:3103-3133 run over host images of the same memory.
+// The patterns carry -0, a quiet NaN with payload, a signalling NaN, a denormal and
+// +/-inf, so a move that goes through float arithmetic cannot pass.
+// ===========================================================================
+
+static const PxU32 SBC_DESC_ALLOC = 5u;                         // elements allocated: slack for the +16 base
+static const PxU32 SBC_DESC_WORDS = 432u / 8u;                  // 54 eight-byte words per descriptor
+static const PxU32 SBC_REGION_WORDS = SBC_DESC_ALLOC * SBC_DESC_WORDS;   // 270
+static const PxU32 SBC_FIELD_SLOTS = SBC_REGION_WORDS + 2u;     // + the two words before a +16 base
+static const PxU32 SBC_SLOT_BYTES = 16384u + 64u;               // largest case size + a poisoned tail
+static const PxU32 SBC_NUSER = 8u;
+// The three tables, 128 entries each: indices @0, sizes @512, data (u64) @1024.  Every
+// entry past a case's own is a VALID TRAP (descriptor 3, size 64, user buffer 7), so a port
+// that reads past n -- an unclamped overshoot lane, a table indexed by the wrong thing --
+// writes real memory the compare sees, instead of following a garbage pointer.
+static const PxU32 SBC_TAB_ENTRIES = 128u;
+static const PxU32 SBC_TAB_SIZES = SBC_TAB_ENTRIES * 4u;
+static const PxU32 SBC_TAB_DATA = SBC_TAB_ENTRIES * 8u;
+static const PxU32 SBC_TABLE_BYTES = SBC_TAB_ENTRIES * 16u;
+static const char* const SBC_KERNEL = "sb_copyOrApplySoftBodyDataDEPRECATED";
+
+// dataIndexFromFlagDEPRECATED for PxSoftBodyGpuDataFlag 0..7 (PxgSoftBody.cpp:580-608):
+// offsetof(field) / 8.  NOT sorted: eSIM_TET_ROTATIONS (5) is mSimTetraRotations @168.
+static const PxU32 SBC_DATA_INDEX[8] = { 2u, 5u, 7u, 8u, 10u, 21u, 11u, 12u };
+
+// -0, a quiet NaN with a payload, a signalling NaN, the smallest denormal, +inf, -inf.
+static const uint32_t SBC_SPECIALS[6] = { 0x80000000u, 0x7FC12345u, 0x7F800001u,
+                                          0x00000001u, 0x7F800000u, 0xFF800000u };
+
+// `phase` puts the special words of slots (0) and user buffers (3) on different columns, so
+// a copy between the two changes EVERY word it stores -- each store is observable.
+static uint32_t sbcPattern(uint32_t tag, uint32_t i, uint32_t phase)
+{
+    if (i % 5u == phase)
+        return SBC_SPECIALS[(i / 5u + tag) % 6u];
+    uint32_t h = (tag + 1u) * 0x9E3779B1u ^ (i + 0x7F4A7C15u) * 0x85EBCA77u;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
+    return h;
+}
+
+struct SbcAllocator : physx::PxAllocatorCallback
+{
+    void* allocate(size_t size, const char*, const char*, int) override
+    {
+        void* p = nullptr;
+        if (posix_memalign(&p, 16, size ? size : 1)) return nullptr;
+        return p;
+    }
+    void deallocate(void* p) override { free(p); }
+};
+struct SbcError : physx::PxErrorCallback
+{
+    void reportError(physx::PxErrorCode::Enum, const char*, const char*, int) override {}
+};
+
+static std::vector<uint8_t> sbcLoader(const char* file) { return loadShaderBlob(file); }
+
+// `Probe::ptrOff()` is the byte offset of the protected PxgCudaBuffer::mPtr, i.e. which 8
+// bytes of the 32-byte object CUDA reads as the kernel's `softbodies`.  PX_OFFSET_OF_RT is
+// not a constant expression, so it is a run-time check.
+struct SbcProbe : PxgTypedCudaBuffer<PxgSoftBody>
+{
+    static size_t ptrOff() { return PX_OFFSET_OF_RT(SbcProbe, mPtr); }
+};
+static_assert(sizeof(PxgTypedCudaBuffer<PxgSoftBody>) == 32,
+              "argument 0 is the 32-byte buffer OBJECT (mPtr, allocator*, mSize, statGroup + pad)");
+static_assert(sizeof(PxgSoftBody) == 432, "descriptor stride");
+
+// One device allocation and its host image.
+struct SbcRegion
+{
+    CUdeviceptr dev = 0;
+    std::vector<uint32_t> img;
+    const char* name = "";
+};
+
+struct SbcFixture
+{
+    SbcAllocator alloc;
+    SbcError err;
+    PxFoundation* foundation = nullptr;
+    std::vector<gpuslang::PxgKernelDef> reg;
+    gpuslang::PxgCudaShim* shim = nullptr;
+    PxCudaContextManager* ccm = nullptr;
+    PxCudaContext* ctx = nullptr;
+    gpuslang::PxgVulkanMemoryManager* memMgr = nullptr;
+    PxgHeapMemoryAllocatorManager* heapMgr = nullptr;
+    PxgTypedCudaBuffer<PxgSoftBody>* buf = nullptr;
+    CUfunction fn = nullptr;
+    bool fnMapped = false;        // moduleGetFunction succeeded (an unmapped name gets a sentinel)
+    CUdeviceptr origPtr = 0;      // the RAW mPtr allocateElements handed out
+    PxU64 origSize = 0;
+    PxU32 descOffBytes = 0;       // where descriptor 0 sits inside the allocation (0 or 16)
+    SbcRegion desc, field, user, table;
+    bool oracleFault = false;
+    size_t oracleStores = 0;      // stores the oracle executed (coverage guards)
+    uint32_t scratch = 0;
+
+    bool init()
+    {
+        foundation = PxCreateFoundation(PX_PHYSICS_VERSION, alloc, err);
+        if (!foundation)
+            return false;
+        PxgSlangComputeDevice* dev = testDevice();
+        // PhysXGpuVulkan.cpp:214-218 / pushConstantSizeFor (:178-182), not testP4Aabb's
+        // {spirv, entry, 0u, 0u}: the shim gates every launch on the ROW's size.
+        reg.resize(gpuslang::PXG_SLANG_KERNEL_COUNT);
+        for (unsigned i = 0; i < gpuslang::PXG_SLANG_KERNEL_COUNT; ++i)
+        {
+            const char* cn = gpuslang::gPxgSlangKernelManifest[i].cudaName;
+            const gpuslang::PxgKernelAbiRow* row = gpuslang::pxgFindKernelAbi(cn);
+            reg[i] = gpuslang::PxgKernelDef{ gpuslang::gPxgSlangKernelManifest[i].spirvFile,
+                                             gpuslang::gPxgSlangKernelManifest[i].entry,
+                                             row ? gpuslang::pxgKernelAbiPushSize(*row) : 0u, 0u, cn };
+        }
+        shim = new gpuslang::PxgCudaShim(dev, reg.data(), gpuslang::PXG_SLANG_KERNEL_COUNT, &sbcLoader);
+        ccm = gpuslang::PxgCreateVulkanCudaContextManager(dev, shim, reg.data(), gpuslang::PXG_SLANG_KERNEL_COUNT);
+        ctx = ccm ? ccm->getCudaContext() : nullptr;
+        if (!ctx)
+            return false;
+        memMgr = PX_NEW(gpuslang::PxgVulkanMemoryManager)(ctx);
+        heapMgr = PX_NEW(PxgHeapMemoryAllocatorManager)(2u * 1024u * 1024u, memMgr);
+        buf = new PxgTypedCudaBuffer<PxgSoftBody>(heapMgr, PxsHeapStats::eSIMULATION_SOFTBODY);
+        buf->allocateElements(SBC_DESC_ALLOC, PX_FL);
+        std::memcpy(&origPtr, buf, sizeof(origPtr));
+        origSize = buf->getSize();
+        fnMapped = PxU32(ctx->moduleGetFunction(&fn, nullptr, SBC_KERNEL)) == 0u && fn != nullptr;
+
+        desc.name = "descriptors";
+        desc.dev = origPtr;
+        desc.img.assign(SBC_REGION_WORDS * 2u, 0u);
+        field.name = "field slots";
+        field.img.assign(size_t(SBC_FIELD_SLOTS) * SBC_SLOT_BYTES / 4u, 0u);
+        user.name = "user buffers";
+        user.img.assign(size_t(SBC_NUSER) * SBC_SLOT_BYTES / 4u, 0u);
+        table.name = "tables";
+        table.img.assign(SBC_TABLE_BYTES / 4u, 0u);
+        for (SbcRegion* r : { &field, &user, &table })
+            if (ctx->memAlloc(&r->dev, r->img.size() * 4u) != 0 || r->dev == 0)
+                return false;
+        return origPtr != 0;
+    }
+
+    ~SbcFixture()
+    {
+        if (buf)
+        {
+            buf->set(origPtr, origSize);   // the misaligned case moves mPtr; free the real block
+            delete buf;
+        }
+        PX_DELETE(heapMgr);
+        PX_DELETE(memMgr);
+        if (ctx)
+            for (SbcRegion* r : { &field, &user, &table })
+                if (r->dev)
+                    ctx->memFree(r->dev);
+        if (ccm)
+            ccm->release();
+        delete shim;
+        if (foundation)
+            foundation->release();
+    }
+
+    CUdeviceptr slotAddr(PxU32 slot) const { return field.dev + CUdeviceptr(slot) * SBC_SLOT_BYTES; }
+    // Logical descriptor k, 8-byte word w -> its slot.
+    CUdeviceptr fieldAddr(PxU32 k, PxU32 w) const { return slotAddr(k * SBC_DESC_WORDS + w); }
+    CUdeviceptr userAddr(PxU32 u) const { return user.dev + CUdeviceptr(u) * SBC_SLOT_BYTES; }
+    CUdeviceptr idxDev() const { return table.dev; }
+    CUdeviceptr sizesDev() const { return table.dev + SBC_TAB_SIZES; }
+    CUdeviceptr dataDev() const { return table.dev + SBC_TAB_DATA; }
+
+    // Fresh images: every descriptor word -> its slot, every slot and user buffer patterned.
+    void resetWorld(uint32_t seed)
+    {
+        const PxU32 offWords = descOffBytes / 8u;
+        for (PxU32 j = 0; j < SBC_REGION_WORDS; ++j)
+        {
+            const PxU32 slot = (j >= offWords) ? j - offWords : SBC_REGION_WORDS + j;
+            const uint64_t a = slotAddr(slot);
+            desc.img[2u * j] = uint32_t(a);
+            desc.img[2u * j + 1u] = uint32_t(a >> 32);
+        }
+        const PxU32 sw = SBC_SLOT_BYTES / 4u;
+        for (PxU32 s = 0; s < SBC_FIELD_SLOTS; ++s)
+            for (PxU32 i = 0; i < sw; ++i)
+                field.img[size_t(s) * sw + i] = sbcPattern(seed * 7919u + 1000u + s, i, 0u);
+        for (PxU32 u = 0; u < SBC_NUSER; ++u)
+            for (PxU32 i = 0; i < sw; ++i)
+                user.img[size_t(u) * sw + i] = sbcPattern(seed * 7919u + 9000u + u, i, 3u);
+        for (PxU32 i = 0; i < SBC_TAB_ENTRIES; ++i)
+        {
+            const uint64_t trap = userAddr(SBC_NUSER - 1u);
+            table.img[i] = 3u;
+            table.img[SBC_TAB_SIZES / 4u + i] = 64u;
+            table.img[SBC_TAB_DATA / 4u + 2u * i] = uint32_t(trap);
+            table.img[SBC_TAB_DATA / 4u + 2u * i + 1u] = uint32_t(trap >> 32);
+        }
+    }
+
+    void setTable(const std::vector<PxU32>& indices, const std::vector<PxU32>& sizes,
+                  const std::vector<uint64_t>& data)
+    {
+        for (size_t i = 0; i < indices.size(); ++i) table.img[i] = indices[i];
+        for (size_t i = 0; i < sizes.size(); ++i) table.img[SBC_TAB_SIZES / 4u + i] = sizes[i];
+        for (size_t i = 0; i < data.size(); ++i)
+        {
+            table.img[SBC_TAB_DATA / 4u + 2u * i] = uint32_t(data[i]);
+            table.img[SBC_TAB_DATA / 4u + 2u * i + 1u] = uint32_t(data[i] >> 32);
+        }
+    }
+
+    void upload()
+    {
+        for (SbcRegion* r : { &desc, &field, &user, &table })
+            ctx->memcpyHtoD(r->dev, r->img.data(), r->img.size() * 4u);
+    }
+
+    uint32_t* word(uint64_t addr)
+    {
+        for (SbcRegion* r : { &desc, &field, &user, &table })
+            if (addr >= r->dev && addr + 4u <= r->dev + r->img.size() * 4u && (addr - r->dev) % 4u == 0u)
+                return &r->img[size_t((addr - r->dev) / 4u)];
+        oracleFault = true;
+        return &scratch;
+    }
+    uint64_t u64(uint64_t addr) { const uint64_t lo = *word(addr); return lo | (uint64_t(*word(addr + 4u)) << 32); }
+
+    // Downloads every region and compares it with its image; prints the first few
+    // mismatches of each region.  Returns the total.
+    size_t compare(const char* label)
+    {
+        size_t total = 0;
+        for (SbcRegion* r : { &desc, &field, &user, &table })
+        {
+            std::vector<uint32_t> got(r->img.size(), 0u);
+            ctx->memcpyDtoH(got.data(), r->dev, got.size() * 4u);
+            size_t mm = 0;
+            for (size_t i = 0; i < got.size(); ++i)
+            {
+                if (got[i] == r->img[i])
+                    continue;
+                if (mm++ < 6)
+                {
+                    if (r == &field)
+                        std::printf("  %s: %s slot %zu word %zu: expected 0x%08X got 0x%08X\n", label, r->name,
+                                    i / (SBC_SLOT_BYTES / 4u), i % (SBC_SLOT_BYTES / 4u), r->img[i], got[i]);
+                    else if (r == &user)
+                        std::printf("  %s: %s %zu word %zu: expected 0x%08X got 0x%08X\n", label, r->name,
+                                    i / (SBC_SLOT_BYTES / 4u), i % (SBC_SLOT_BYTES / 4u), r->img[i], got[i]);
+                    else
+                        std::printf("  %s: %s word %zu: expected 0x%08X got 0x%08X\n", label, r->name, i,
+                                    r->img[i], got[i]);
+                }
+            }
+            if (mm > 6)
+                std::printf("  %s: %s: %zu mismatches in all\n", label, r->name, mm);
+            total += mm;
+        }
+        return total;
+    }
+};
+
+// PxgSoftBodyCore::copyOrApplySoftBodyDataDEPRECATED (PxgSoftBodyCore.cpp:3118-3145), copied
+// literally with three substitutions: the CUfunction is a parameter, the buffer object is
+// the fixture's (core->getSoftBodyBuffer() returns the core's), and the stream is null.
+static PxCUresult sbcCopyOrApply(PxCudaContext* cudaContext, CUfunction kernelFunction,
+                                 PxgTypedCudaBuffer<PxgSoftBody>& softBodyBuffer, PxU32 dataIndex,
+                                 PxU32* softBodyIndices, PxU8** data, PxU32* dataSizes, PxU32 maxSizeInBytes,
+                                 const PxU32 nbSoftbodies, const PxU32 applyDataToSoftBodies,
+                                 PxU32& tpsOut, PxU32& numBlocksOut)
+{
+    PxU32 maxElementsToCopyPerThread = 4;
+    PxU32 maxSize = (maxSizeInBytes + 4 - 1) / 4; //We copy 4 bytes at a time
+
+    PxU32 threadsPerSoftBody = (maxSize + maxElementsToCopyPerThread - 1) / maxElementsToCopyPerThread;
+    PxU32 totalNumberOfThreads = nbSoftbodies * threadsPerSoftBody;
+    PxU32 threadsPerBlock = 128;
+    PxU32 numBlocks = (totalNumberOfThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+    PxCudaKernelParam kernelParams[] =
+    {
+        PX_CUDA_KERNEL_PARAM(softBodyBuffer),
+        PX_CUDA_KERNEL_PARAM(dataIndex),
+        PX_CUDA_KERNEL_PARAM(softBodyIndices),
+        PX_CUDA_KERNEL_PARAM(nbSoftbodies),
+        PX_CUDA_KERNEL_PARAM(data),
+        PX_CUDA_KERNEL_PARAM(dataSizes),
+        PX_CUDA_KERNEL_PARAM(threadsPerSoftBody),
+        PX_CUDA_KERNEL_PARAM(applyDataToSoftBodies)
+    };
+
+    tpsOut = threadsPerSoftBody;
+    numBlocksOut = numBlocks;
+    return cudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, threadsPerBlock, 1, 1, 0, nullptr,
+                                     kernelParams, sizeof(kernelParams), 0, PX_FL);
+}
+
+// softBodyGM.cu:3103-3133, transcribed literally over the host images.  blockDim.x is the
+// host's threadsPerBlock (128); `softbodies` is the RAW pointer the kernel receives (the
+// object's first 8 bytes), and every pointer it follows is a DEVICE address resolved
+// through the fixture's address -> image map.  Sequential lanes are exact here: no case
+// lets one lane read what another writes, and duplicate APPLY sections carry the same data.
+static void sbcOracle(SbcFixture& f, uint64_t softbodies, const PxU32 dataIndex, uint64_t softBodyIndices,
+                      const PxU32 softBodyIndicesSize, uint64_t data, uint64_t dataSizes,
+                      const PxU32 threadsPerSoftBody, const PxU32 applyDataToSoftBodies, PxU32 numBlocks)
+{
+    const PxU32 blockDimX = 128;
+    for (PxU32 blockIdx = 0; blockIdx < numBlocks; ++blockIdx)
+        for (PxU32 threadIdx = 0; threadIdx < blockDimX; ++threadIdx)
+        {
+            const PxU32 globalThreadIndex = threadIdx + blockDimX * blockIdx;
+            const PxU32 sectionIndex = globalThreadIndex / threadsPerSoftBody;
+
+            if (sectionIndex < softBodyIndicesSize)
+            {
+                const PxU32 softBodyIndex = *f.word(softBodyIndices + 4ull * sectionIndex);
+                PxgSoftBody softbody;
+                uint32_t raw[sizeof(PxgSoftBody) / 4];
+                for (PxU32 i = 0; i < sizeof(PxgSoftBody) / 4; ++i)
+                    raw[i] = *f.word(softbodies + uint64_t(sizeof(PxgSoftBody)) * softBodyIndex + 4ull * i);
+                std::memcpy(&softbody, raw, sizeof(PxgSoftBody));
+
+                uint64_t dest;
+                uint64_t source;
+                if (applyDataToSoftBodies)
+                {
+                    dest = uint64_t(uintptr_t(((void**)&softbody)[dataIndex]));
+                    source = f.u64(data + 8ull * sectionIndex);
+                }
+                else
+                {
+                    source = uint64_t(uintptr_t(((void**)&softbody)[dataIndex]));
+                    dest = f.u64(data + 8ull * sectionIndex);
+                }
+
+                PxU32 index = globalThreadIndex % threadsPerSoftBody;
+                const PxU32 end = (*f.word(dataSizes + 4ull * sectionIndex) + 4 - 1) / 4; //We copy 4 bytes at a time
+                while (index < end)
+                {
+                    *f.word(dest + 4ull * index) = *f.word(source + 4ull * index); //Write to the output buffer
+                    ++f.oracleStores;                                          // (fixture bookkeeping)
+                    index += threadsPerSoftBody;
+                }
+            }
+        }
+}
+
+struct SbcLaunch
+{
+    PxU32 dataIndex;
+    std::vector<PxU32> indices;      // table entries; may run past nb (trap entries)
+    std::vector<PxU32> sizes;
+    std::vector<uint64_t> data;
+    PxU32 maxSizeInBytes;
+    PxU32 nb;
+    PxU32 apply;
+};
+
+// One launch through the engine path, then the whole world compared bitwise with the
+// oracle.  `oracleWrites` receives how many stores the ORACLE executed (coverage guards;
+// a store may leave a word unchanged when two patterns happen to agree, so the count of
+// changed words is printed but not asserted).
+static size_t sbcRun(SbcFixture& f, const char* label, const SbcLaunch& L, uint32_t seed,
+                     size_t* oracleWrites = nullptr, PxU32* gridOut = nullptr)
+{
+    f.resetWorld(seed);
+    f.setTable(L.indices, L.sizes, L.data);
+    f.upload();
+
+    PxU32 tps = 0, numBlocks = 0;
+    const PxCUresult r = sbcCopyOrApply(f.ctx, f.fn, *f.buf, L.dataIndex,
+                                        reinterpret_cast<PxU32*>(uintptr_t(f.idxDev())),
+                                        reinterpret_cast<PxU8**>(uintptr_t(f.dataDev())),
+                                        reinterpret_cast<PxU32*>(uintptr_t(f.sizesDev())),
+                                        L.maxSizeInBytes, L.nb, L.apply, tps, numBlocks);
+    f.ctx->streamSynchronize(nullptr);
+    if (gridOut) *gridOut = numBlocks;
+    PXG_CHECK_MSG(PxU32(r) == 0u, "%s: the engine-path launch must be accepted (got CUresult %u)", label, PxU32(r));
+
+    uint64_t softbodies = 0;
+    std::memcpy(&softbodies, f.buf, sizeof(softbodies));   // exactly the 8 bytes CUDA reads
+    const std::vector<uint32_t> d0 = f.desc.img, fl0 = f.field.img, u0 = f.user.img;
+    f.oracleFault = false;
+    f.oracleStores = 0;
+    sbcOracle(f, softbodies, L.dataIndex, f.idxDev(), L.nb, f.dataDev(), f.sizesDev(), tps, L.apply, numBlocks);
+    PXG_CHECK_MSG(!f.oracleFault, "%s: the oracle followed a pointer outside the fixture's world", label);
+    size_t changed = 0;
+    for (size_t i = 0; i < d0.size(); ++i) changed += d0[i] != f.desc.img[i];
+    for (size_t i = 0; i < fl0.size(); ++i) changed += fl0[i] != f.field.img[i];
+    for (size_t i = 0; i < u0.size(); ++i) changed += u0[i] != f.user.img[i];
+    if (oracleWrites) *oracleWrites = f.oracleStores;
+    PXG_CHECK_MSG(changed == f.oracleStores, "%s: fixture self-check -- every oracle store must change its word "
+                  "(%zu stores, %zu changed)", label, f.oracleStores, changed);
+
+    const size_t mm = f.compare(label);
+    std::printf("  %s: dataIndex %u, n %u, maxSize %u -> tps %u, grid %u; oracle %zu stores (%zu words changed), "
+                "%zu mismatches\n", label, L.dataIndex, L.nb, L.maxSizeInBytes, tps, numBlocks, f.oracleStores,
+                changed, mm);
+    return mm;
+}
+
+static bool sbcSetup(SbcFixture& f)
+{
+    const bool ok = f.init();
+    PXG_CHECK_MSG(ok, "engine stack (foundation, shim, context, heap) for %s", SBC_KERNEL);
+    PXG_CHECK_MSG(ok && f.fnMapped, "moduleGetFunction(%s) must resolve to a mapped kernel", SBC_KERNEL);
+    return ok && f.fnMapped;
+}
+
+// ---------------------------------------------------------------------------
+// The pins, the Step 0 alignment probe, and THE TRAP demonstrated: the kernel's own
+// signature pack (argument 0 as the 8-byte getDevicePtr()) is a 56-byte blob and is
+// REFUSED, touching nothing; only the host pack's 80 bytes reach the shader.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyApplyLayout)
+{
+    PXG_CHECK_MSG(SbcProbe::ptrOff() == 0u, "PxgCudaBuffer::mPtr is the object's FIRST member (offset %zu) -- "
+                  "the 8 bytes CUDA reads as `softbodies`", SbcProbe::ptrOff());
+    for (PxU32 flag = 0; flag < 8u; ++flag)
+    {
+        const PxU32 idx = PxgSoftBody::dataIndexFromFlagDEPRECATED(PxSoftBodyGpuDataFlag::Enum(flag));
+        PXG_CHECK_MSG(idx == SBC_DATA_INDEX[flag], "dataIndexFromFlagDEPRECATED(%u) = %u, expected %u",
+                      flag, idx, SBC_DATA_INDEX[flag]);
+    }
+    const gpuslang::PxgKernelAbiRow* row = gpuslang::pxgFindKernelAbi(SBC_KERNEL);
+    PXG_CHECK_MSG(row != nullptr && gpuslang::pxgKernelAbiPushSize(*row) == 80u,
+                  "the ABI row follows the HOST pack: 32-byte object + 7 arguments = 80 bytes (got %u)",
+                  row ? gpuslang::pxgKernelAbiPushSize(*row) : 0u);
+    PXG_CHECK_MSG(row == nullptr || row->hostPtrMask == 0u, "hostPtrMask must stay 0 (argument 0 is 32 bytes)");
+
+    SbcFixture f;
+    const bool ok = f.init();
+    PXG_CHECK_MSG(ok, "engine stack for %s", SBC_KERNEL);
+    if (!ok)
+        return;
+
+    // Step 0 (P9.95): CUDA reads the RAW mPtr; every other softbody kernel receives
+    // getDevicePtr() = (mPtr + 127) & ~127.  The two agree only if the heap hands out
+    // 128-aligned pointers.  Probed over the buddy blocks and the exceptional (> root)
+    // path, interleaved with odd-sized allocations from the same heap.
+    {
+        PxgHeapMemoryAllocator* heap = f.heapMgr->mDeviceMemoryAllocators;
+        std::vector<void*> odd;
+        std::vector<PxgTypedCudaBuffer<PxgSoftBody>*> bufs;
+        const PxU32 ks[5] = { 1u, 3u, 7u, 64u, 5000u };
+        const size_t oddSizes[5] = { 200u, 1000u, 3333u, 77u, 129u };
+        size_t misaligned = 0;
+        for (int t = 0; t < 5; ++t)
+        {
+            odd.push_back(heap->allocate(oddSizes[t], PxsHeapStats::eSIMULATION_SOFTBODY, PX_FL));
+            PxgTypedCudaBuffer<PxgSoftBody>* b =
+                new PxgTypedCudaBuffer<PxgSoftBody>(f.heapMgr, PxsHeapStats::eSIMULATION_SOFTBODY);
+            b->allocateElements(ks[t], PX_FL);
+            bufs.push_back(b);
+            CUdeviceptr raw = 0;
+            std::memcpy(&raw, b, sizeof(raw));
+            std::printf("  step 0: allocateElements(%u): raw mPtr 0x%llx (mod 128 = %llu, mod 256 = %llu), "
+                        "getDevicePtr 0x%llx\n", ks[t], (unsigned long long)raw,
+                        (unsigned long long)(raw & 127u), (unsigned long long)(raw & 255u),
+                        (unsigned long long)b->getDevicePtr());
+            misaligned += (raw == 0u || raw != b->getDevicePtr()) ? 1u : 0u;
+        }
+        std::printf("  step 0: fixture buffer raw mPtr 0x%llx (mod 128 = %llu)\n",
+                    (unsigned long long)f.origPtr, (unsigned long long)(f.origPtr & 127u));
+        misaligned += (f.origPtr != f.buf->getDevicePtr()) ? 1u : 0u;
+        PXG_CHECK_MSG(misaligned == 0u, "raw mPtr == getDevicePtr() on every heap buffer (%zu differ)", misaligned);
+        for (PxgTypedCudaBuffer<PxgSoftBody>* b : bufs) delete b;
+        for (void* p : odd) if (p) heap->deallocate(p);
+    }
+
+    PXG_CHECK_MSG(f.fnMapped, "moduleGetFunction(%s) must resolve to a mapped kernel", SBC_KERNEL);
+    if (!f.fnMapped)
+        return;
+
+    // The trap: the SIGNATURE pack, argument 0 as the kernel's own 8-byte PxgSoftBody*.
+    f.resetWorld(1u);
+    f.setTable({ 2u, 0u, 1u }, { 16u, 6u, 4096u }, { f.userAddr(0), f.userAddr(1), f.userAddr(2) });
+    f.upload();
+    {
+        CUdeviceptr softbodies = f.buf->getDevicePtr();
+        PxU32 dataIndex = 12u;
+        PxU32* softBodyIndices = reinterpret_cast<PxU32*>(uintptr_t(f.idxDev()));
+        const PxU32 nbSoftbodies = 3u;
+        PxU8** data = reinterpret_cast<PxU8**>(uintptr_t(f.dataDev()));
+        PxU32* dataSizes = reinterpret_cast<PxU32*>(uintptr_t(f.sizesDev()));
+        PxU32 threadsPerSoftBody = 256u;
+        const PxU32 applyDataToSoftBodies = 0u;
+        PxCudaKernelParam signaturePack[] =
+        {
+            PX_CUDA_KERNEL_PARAM(softbodies),
+            PX_CUDA_KERNEL_PARAM(dataIndex),
+            PX_CUDA_KERNEL_PARAM(softBodyIndices),
+            PX_CUDA_KERNEL_PARAM(nbSoftbodies),
+            PX_CUDA_KERNEL_PARAM(data),
+            PX_CUDA_KERNEL_PARAM(dataSizes),
+            PX_CUDA_KERNEL_PARAM(threadsPerSoftBody),
+            PX_CUDA_KERNEL_PARAM(applyDataToSoftBodies)
+        };
+        const PxCUresult r = f.ctx->launchKernel(f.fn, 6, 1, 1, 128, 1, 1, 0, nullptr, signaturePack,
+                                                 sizeof(signaturePack), 0, PX_FL);
+        f.ctx->streamSynchronize(nullptr);
+        PXG_CHECK_MSG(PxU32(r) == 1u, "the 56-byte SIGNATURE pack must be refused with INVALID_VALUE (got %u)",
+                      PxU32(r));
+    }
+    PXG_CHECK_MSG(f.compare("signature pack") == 0u, "a refused launch must touch nothing");
+
+    // ... and the HOST pack of the same request is accepted and does the copy.
+    size_t writes = 0;
+    const size_t mm = sbcRun(f, "host pack", { 12u, { 2u, 0u, 1u }, { 16u, 6u, 4096u },
+                                               { f.userAddr(0), f.userAddr(1), f.userAddr(2) }, 4096u, 3u, 0u },
+                             1u, &writes);
+    PXG_CHECK_MSG(mm == 0u && writes == 4u + 2u + 1024u,
+                  "the 80-byte host pack runs the copy (%zu mismatches, %zu stores)", mm, writes);
+}
+
+// ---------------------------------------------------------------------------
+// COPY for each of the eight flags.  Indices REVERSED {2,0,1}; sizes {16, 6, 4096} with
+// maxSize 4096 -> tps 256, 768 threads, 6 blocks: sections straddle block boundaries, the
+// size-6 section copies TWO words (the CUDA rounds up -- upstream: up to 3 bytes past the
+// requested size), and the 4096-byte one runs the stride loop four times per lane.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyAllFlags)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    for (PxU32 flag = 0; flag < 8u; ++flag)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "copy flag %u", flag);
+        size_t writes = 0;
+        PxU32 grid = 0;
+        const PxU32 dataIndex = PxgSoftBody::dataIndexFromFlagDEPRECATED(PxSoftBodyGpuDataFlag::Enum(flag));
+        const size_t mm = sbcRun(f, label, { dataIndex, { 2u, 0u, 1u }, { 16u, 6u, 4096u },
+                                             { f.userAddr(0), f.userAddr(1), f.userAddr(2) }, 4096u, 3u, 0u },
+                                 10u + flag, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u, "%s bit-exact (%zu mismatches)", label, mm);
+        PXG_CHECK_MSG(grid == 6u && writes == 4u + 2u + 1024u, "%s: coverage (grid %u, %zu stores)", label, grid,
+                      writes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COPY with DUPLICATE indices {1,1,0,1} into four distinct destinations, sizes chosen so
+// every section ends on a different word and two straddle a block.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyDuplicates)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    const PxU32 flags[2] = { 7u, 3u };
+    for (PxU32 t = 0; t < 2u; ++t)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "copy duplicates flag %u", flags[t]);
+        size_t writes = 0;
+        const PxU32 dataIndex = PxgSoftBody::dataIndexFromFlagDEPRECATED(PxSoftBodyGpuDataFlag::Enum(flags[t]));
+        const size_t mm = sbcRun(f, label, { dataIndex, { 1u, 1u, 0u, 1u }, { 4096u, 2052u, 20u, 4093u },
+                                             { f.userAddr(3), f.userAddr(0), f.userAddr(6), f.userAddr(1) },
+                                             4096u, 4u, 0u },
+                                 30u + t, &writes);
+        PXG_CHECK_MSG(mm == 0u && writes == 1024u + 513u + 5u + 1024u, "%s bit-exact (%zu mismatches, %zu stores)",
+                      label, mm, writes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// APPLY for each of the eight flags with indices {1,2}: descriptors 0 and 3 keep every
+// field, and each field keeps its tail past the size except the rounded-up word.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyApplyAllFlags)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    for (PxU32 flag = 0; flag < 8u; ++flag)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "apply flag %u", flag);
+        size_t writes = 0;
+        PxU32 grid = 0;
+        const PxU32 dataIndex = PxgSoftBody::dataIndexFromFlagDEPRECATED(PxSoftBodyGpuDataFlag::Enum(flag));
+        const size_t mm = sbcRun(f, label, { dataIndex, { 1u, 2u }, { 6u, 4096u },
+                                             { f.userAddr(4), f.userAddr(5) }, 4096u, 2u, 1u },
+                                 50u + flag, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u, "%s bit-exact (%zu mismatches)", label, mm);
+        PXG_CHECK_MSG(grid == 4u && writes == 2u + 1024u, "%s: coverage (grid %u, %zu stores)", label, grid, writes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE TRAPS.  n = 2 with sizes {352, 200} and maxSize 352: tps 22, 44 threads, one block,
+// so lanes 44..127 are OVERSHOOT lanes with sections 2..5.  Table entries 2..5 are VALID
+// (descriptors 0 and 3, user buffers 2..5, nonzero sizes): a port that let an overshoot
+// lane through would read real pointers and write real memory, so every trap must stay as
+// it was, in both directions.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyApplyTraps)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    for (PxU32 apply = 0; apply < 2u; ++apply)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "traps %s", apply ? "apply" : "copy");
+        size_t writes = 0;
+        PxU32 grid = 0;
+        const size_t mm = sbcRun(f, label, { apply ? 11u : 12u, { 1u, 2u, 0u, 3u, 0u, 3u },
+                                             { 352u, 200u, 352u, 352u, 352u, 352u },
+                                             { f.userAddr(0), f.userAddr(1), f.userAddr(2), f.userAddr(3),
+                                               f.userAddr(4), f.userAddr(5) },
+                                             352u, 2u, apply },
+                                 70u + apply, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u, "%s: overshoot lanes (sections 2..5) must touch nothing (%zu mismatches)",
+                      label, mm);
+        PXG_CHECK_MSG(grid == 1u && writes == (352u + 200u) / 4u, "%s: coverage (grid %u, %zu stores)", label,
+                      grid, writes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge sizes.
+//   (a) sizes {0, 4, 6, 16384}, maxSize 16384: tps 1024, 32 blocks; section 0 copies nothing.
+//   (b) maxSize 0: tps 0 and grid 0.  CUDA returns INVALID_VALUE for a zero grid
+//       (CudaContextManager.cpp:1160-1162), the bridge records an EMPTY-GRID no-op; either
+//       way nothing may be touched (upstream: nothing guards tps == 0).
+//   (c) dataSizes = 0xFFFFFFFE: `end` wraps to 0 in PxU32 and nothing is touched.
+//   (d) APPLY with a NULL user pointer and size 0 in section 0 next to a live section 1
+//       in the SAME 8-lane bundle: the empty section's masked loads must not follow NULL.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyApplyEdgeSizes)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    size_t writes = 0;
+    PxU32 grid = 0;
+    for (PxU32 apply = 0; apply < 2u; ++apply)
+    {
+        const size_t mm = sbcRun(f, apply ? "edge (a) apply" : "edge (a) copy",
+                                 { apply ? 2u : 12u, { 3u, 0u, 2u, 1u }, { 0u, 4u, 6u, 16384u },
+                                   { f.userAddr(0), f.userAddr(1), f.userAddr(2), f.userAddr(3) }, 16384u, 4u, apply },
+                                 90u + apply, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u && grid == 32u && writes == 1u + 2u + 4096u,
+                      "edge (a): sizes {0,4,6,16384} bit-exact (%zu mismatches, grid %u, %zu stores)", mm, grid,
+                      writes);
+    }
+
+    {
+        const size_t mm = sbcRun(f, "edge (b) maxSize 0", { 12u, { 0u, 1u }, { 16u, 16u },
+                                                            { f.userAddr(0), f.userAddr(1) }, 0u, 2u, 0u },
+                                 93u, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u && grid == 0u && writes == 0u,
+                      "edge (b): maxSize 0 is an empty grid and touches nothing (%zu mismatches, grid %u)", mm, grid);
+    }
+
+    for (PxU32 apply = 0; apply < 2u; ++apply)
+    {
+        const size_t mm = sbcRun(f, apply ? "edge (c) apply" : "edge (c) copy",
+                                 { 12u, { 1u }, { 0xFFFFFFFEu }, { f.userAddr(0) }, 16u, 1u, apply },
+                                 94u + apply, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u && grid == 1u && writes == 0u,
+                      "edge (c): dataSizes 0xFFFFFFFE wraps `end` to 0 and touches nothing (%zu mismatches)", mm);
+    }
+
+    {
+        const size_t mm = sbcRun(f, "edge (d) apply NULL/0", { 11u, { 2u, 1u }, { 0u, 64u },
+                                                               { 0ull, f.userAddr(1) }, 64u, 2u, 1u },
+                                 96u, &writes, &grid);
+        PXG_CHECK_MSG(mm == 0u && grid == 1u && writes == 16u,
+                      "edge (d): a NULL, size-0 section next to a live one (%zu mismatches, %zu stores)", mm, writes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The RAW mPtr, measured.  The descriptors are written 16 bytes into the allocation and
+// the buffer object is set() there, so mPtr is NOT 128-aligned and getDevicePtr() =
+// (mPtr + 127) & ~127 points 112 bytes further on.  CUDA reads the raw mPtr, and so must
+// the port: rounding it like getDevicePtr() reads other words -- a different result.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimCopyApplyMisalignedBase)
+{
+    SbcFixture f;
+    if (!sbcSetup(f))
+        return;
+    f.descOffBytes = 16u;
+    f.buf->set(f.origPtr + 16u, f.origSize - 16u);
+    PXG_CHECK_MSG(f.buf->getDevicePtr() == f.origPtr + 128u, "setup: getDevicePtr() rounds the +16 base up to +128");
+    for (PxU32 apply = 0; apply < 2u; ++apply)
+    {
+        size_t writes = 0;
+        const size_t mm = sbcRun(f, apply ? "misaligned apply" : "misaligned copy",
+                                 { apply ? 11u : 12u, { 2u, 0u, 1u }, { 16u, 6u, 4096u },
+                                   { f.userAddr(0), f.userAddr(1), f.userAddr(2) }, 4096u, 3u, apply },
+                                 110u + apply, &writes);
+        PXG_CHECK_MSG(mm == 0u && writes == 4u + 2u + 1024u,
+                      "the kernel reads the RAW mPtr (+16), not getDevicePtr() (%zu mismatches)", mm);
+    }
+    f.buf->set(f.origPtr, f.origSize);
+    f.descOffBytes = 0u;
 }
 
 } // namespace

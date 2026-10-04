@@ -1272,10 +1272,16 @@ pxg_compile_shader(femClothRefitBda cloth_refitBoundLaunch)
 # (the speculative-CCD AtomicMax reduction) is omitted as dead on the free-fall
 # scene, so there is no groupshared / barrier and no subgroup lowering (see the
 # shader header).
+# P9.95: sb_copyOrApplySoftBodyDataDEPRECATED joins as the fifth entry -- the word copy
+# behind PxScene::copySoftBodyData / applySoftBodyData.  Its argument 0 is the 32-byte
+# PxgTypedCudaBuffer OBJECT the host pushes by value (PxgSoftBodyCore.cpp:3134), so its
+# push block is 80 bytes (ABI row kSbCopyOrApplyData).  It has no float op at all, so the
+# file's NoContraction stamp is moot for it and still covers the file.
 pxg_compile_shader(softBodySimBda sb_gm_preIntegrateLaunch
                    sb_gm_stepSoftbodyLaunch
                    sb_gm_finalizeVelocitiesLaunch
-                   sb_sleeping)
+                   sb_sleeping
+                   sb_copyOrApplySoftBodyDataDEPRECATED)
 # P8.0 tranche 2: the SOFTBODY BVH bounds refit (sb_refitBoundLaunch) — second kernel of
 # the free-fall chain.  Direct sibling of femClothRefitBda (same algorithm over
 # tetrahedra instead of triangles), same BDA Ptr<> reads and same groupshared warp
@@ -2321,7 +2327,12 @@ add_executable(gpuslang-tests
     # geometry bounds path: Gu::computeBounds + its convex-shape helpers.
     ${GPUSLANG_ROOT}/../geomutils/src/GuBounds.cpp
     ${GPUSLANG_ROOT}/../geomutils/src/convex/GuConvexUtilsInternal.cpp
-    ${GPUSLANG_ROOT}/../geomutils/src/GuConvexGeometry.cpp)
+    ${GPUSLANG_ROOT}/../geomutils/src/GuConvexGeometry.cpp
+    # P9.95: the REAL PxgSoftBody::dataIndexFromFlagDEPRECATED (PxgSoftBody.cpp:580),
+    # which softBodySimCopy* pins and drives the sb_copyOrApplySoftBodyDataDEPRECATED
+    # launches with -- a transcription of it would pin the fixture against itself.
+    # The translation unit needs only the foundation (PxGetBroadcastAllocator).
+    ${GPUSLANG_ROOT}/../gpusimulationcontroller/src/PxgSoftBody.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # PXG_NO_CUDA_TOOLKIT lets the real CudaKernelWrangler.cpp compile without <cuda.h>
 # and without the CUDART registration shims (only the ctor is needed here).

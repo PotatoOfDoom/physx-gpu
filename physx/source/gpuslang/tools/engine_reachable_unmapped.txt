@@ -114,8 +114,11 @@ trimeshHeightfieldNarrowphase
 # certified the whole algorithm bit-exactly in npTriPlaneNp.slang, so P9.82 moved
 # the shared parts into pxgSlangTriPlane / pxgSlangNpPatchTail and composed them.
 
-# PxgSoftBodyCore.cpp (4)
-sb_copyOrApplySoftBodyDataDEPRECATED
+# PxgSoftBodyCore.cpp (3)
+# sb_copyOrApplySoftBodyDataDEPRECATED -- MAPPED in P9.95 (softBodySimBda.spv); driven by
+# PXG_SCENE=softbodydata through PxScene::copySoftBodyData / applySoftBodyData, which no
+# scene had called.  Its host pack pushes the 32-byte PxgTypedCudaBuffer OBJECT as
+# argument 0, so its ABI row is the 80-byte host pack, not the 56-byte signature.
 sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch
 # sb_plasticDeformLaunch / sb_plasticDeformLaunch2 -- P9.79's liveness audit found
 # that PxgSoftBodyCore::plasticDeformation() has EXACTLY ONE call site in the tree

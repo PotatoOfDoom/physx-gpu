@@ -93,15 +93,15 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.95, particleapply added): 58 named scenes below, plus nine explicit rows
-# after the loop (the settling bag, three softbody floors, five PGS rows) = 67.
+# Today (P9.95, softbodydata added): 59 named scenes below, plus ten explicit rows
+# after the loop (the settling bag, three softbody floors, six PGS rows) = 69.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply"
+        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata"
 
 pass=0; fail=0; missing=0
 
@@ -195,6 +195,11 @@ run_one "extforce (PGS)" PXG_SCENE=extforce PXG_SOLVER=pgs
 # ingest) is the same kernel under both solvers, but the first step that integrates what
 # it ingested runs through the TGS or the PGS particle path, so it is scored under both.
 run_one "particleapply (PGS)" PXG_SCENE=particleapply PXG_SOLVER=pgs
+# P9.95: softbodydata (sb_copyOrApplySoftBodyDataDEPRECATED, PxScene::copy/applySoftBodyData)
+# is one kernel under both solvers, but the steps that carry the applied velocity and
+# position (and the skinning that moves the collision mesh after them) run through the TGS
+# or the PGS softbody path, so it is scored under both.
+run_one "softbodydata (PGS)" PXG_SCENE=softbodydata PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
@@ -224,6 +229,17 @@ if [ "${1:-}" = "--diagnostics" ]; then
     env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_CONTROL=1 PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 \
         ./gpu-sdk-step 2>&1 | grep -E '^  \[ control \]|^FAIL:|^\[ *(OK|FAIL|control) *\] gpu-sdk-step' | sed 's/^/    /'
     rm -f "$pa_dump"
+
+    # P9.95: softbodydata's control makes the same reads and writes with plain DtoH/HtoD on
+    # the aliased public buffers instead of copySoftBodyData / applySoftBodyData.  Its final
+    # sim-position hash must equal the live run's (measured equal under TGS and PGS).
+    for solver in tgs pgs; do
+        echo "--- softbodydata ($solver) live vs PXG_SBDATA_CONTROL=1: final sim-position hashes"
+        for ctl in "" PXG_SBDATA_CONTROL=1; do
+            env $ctl PXG_SCENE=softbodydata PXG_SOLVER=$solver PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+                | grep -E 'final sim-position hash' | sed 's/^/    /'
+        done
+    done
 
     # A SECOND diagnostic list, and a different kind.  The controls above are
     # references that exist to fail; these are scenes that exist to NAME KERNELS

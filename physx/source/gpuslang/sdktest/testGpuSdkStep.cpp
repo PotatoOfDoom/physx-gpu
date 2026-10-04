@@ -6577,6 +6577,110 @@ SoftBodyAttachScene buildSoftBodyHangScene(PxPhysics* physics, PxScene* scene,
     return out;
 }
 
+// ===========================================================================
+// PXG_SCENE=softbodydata (P9.95): the deprecated direct softbody-data API,
+// PxScene::copySoftBodyData / applySoftBodyData (PxScene.h:1761/:1776) ->
+// PxgSimulationController (:564-582) -> PxgSoftBodyCore::copy/applySoftBodyDataDEPRECATED
+// (:3157/:3175) -> copyOrApplySoftBodyDataDEPRECATED (:3118) ->
+// sb_copyOrApplySoftBodyDataDEPRECATED (softBodyGM.cu:3094).  The kernel never runs inside
+// simulate(); these two calls are its only way in, and no scene made them before.  No
+// scene flag is needed: NpScene.cpp:3711/:3720 have the direct-GPU-API guard commented out.
+//
+// WHY THE OBSERVABLES ARE BIT-EXACT.  Three of the eight PxSoftBodyGpuDataFlag slots alias
+// public device buffers (NpDeformableVolume.cpp:527-557; PxgSimulationCore.cpp:1313-1318):
+//   eTET_POSITION_INV_MASS -> getPositionInvMassBufferD    (dataIndex 8)
+//   eSIM_VELOCITY_INV_MASS -> getSimVelocityBufferD        (dataIndex 11)
+//   eSIM_POSITION_INV_MASS -> getSimPositionInvMassBufferD (dataIndex 12)
+// so every COPY must bit-equal a memcpyDtoH of the aliased buffer taken in the same window,
+// and every APPLY must be bit-visible in it at once.
+//
+// TWO VOLUMES, AND WHY B IS BIGGER.  A is the usual cells=2 cube at x = -3, B a cells=4 cube
+// (125 lattice vertices) at x = +3.  maxSize = nbSimB*16 makes tps = nbSimB > 64, so the
+// two-section copies straddle the 128-thread block boundary.  The indices are passed
+// REVERSED {B, A}, and A's section copies only HALF its vertices: a port that ignores the
+// index table swaps the volumes, one that ignores dataSizes overruns A's half, and every
+// destination carries one poisoned slot past its size.
+//
+// THE WINDOW.  One warm-up step is mandatory: mSoftBodyBuffer's mPtr stays 0 until the
+// first simulate DMAs the descriptors (PxgSimulationCore.cpp:1155/:1638 -- upstream does
+// not guard the call).  Every call passes NULL events, so the core synchronizes its stream
+// before returning (PxgSoftBodyCore.cpp:3166-3171, :3185-3190).  Then:
+//   COPY  x3   sim positions, sim velocities, collision positions -- bit-exact;
+//   APPLY (a)  A's sim velocities with v.x += 3 (y, z and w bitwise) -- a sideways kick;
+//   APPLY (b)  B's sim positions with z += 2 (w bitwise) -- a teleport;
+// then 60 steps.  A drifts 3 further in x than it would have; B sits 2 further in z, in
+// its SIM mesh and -- after the first step -- in its COLLISION mesh, which only the
+// skinning (sb_gm_updateTetModelVertsLaunch) can move: the apply reached solver state.
+//
+// THE CONTROL.  PXG_SBDATA_CONTROL=1 makes the same reads and writes with plain
+// memcpyDtoH / memcpyHtoD on the aliased buffers instead of the two API calls.  It is
+// reported, never scored (the PXG_DIRECTAPI_CONTROL convention); the final-position hash
+// it prints must equal the live run's.
+//
+// UPSTREAM CANDIDATES this scene steps around (documented, not reported): the controller
+// dereferences mGpuSoftBodyCore with no null check (PxgSimulationController.cpp:567-570,
+// :577-580), so either call on a GPU scene without a deformable volume crashes; and nothing
+// stops a call before the first simulate, when the kernel would read descriptors at
+// address 0 + idx*432 -- hence the mandatory warm-up above.
+// ===========================================================================
+struct SoftBodyDataScene
+{
+    PxDeformableVolume* a = nullptr;
+    PxDeformableVolume* b = nullptr;
+    PxU32 nbSimA = 0, nbSimB = 0, nbCollA = 0, nbCollB = 0;
+};
+
+SoftBodyDataScene buildSoftBodyDataScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                         PxCudaContextManager* cudaCtx)
+{
+    SoftBodyDataScene out;
+    // One live dynamic rigid, parked far away -- the requirement every FEM scene here carries
+    // (see buildSoftBodyHangScene).  No floor: both volumes fall freely the whole time.
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f, 30.0f);
+    out.a = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, /*size*/ 1.0f, /*baseY*/ 10.0f,
+                               /*offsetX*/ -3.0f);
+    out.b = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 4u, /*size*/ 1.0f, /*baseY*/ 10.0f,
+                               /*offsetX*/ 3.0f);
+    if (!out.a || !out.b)
+        return out;
+    out.nbSimA = out.a->getSimulationMesh()->getNbVertices();
+    out.nbSimB = out.b->getSimulationMesh()->getNbVertices();
+    out.nbCollA = out.a->getCollisionMesh()->getNbVertices();
+    out.nbCollB = out.b->getCollisionMesh()->getNbVertices();
+    return out;
+}
+
+static void sbDataRead(PxCudaContext* ctx, const PxVec4* dev, PxU32 n, std::vector<PxVec4>& out)
+{
+    out.assign(n, PxVec4(0.0f));
+    ctx->memcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(dev), n * sizeof(PxVec4));
+}
+
+static PxVec3 sbDataMean(const std::vector<PxVec4>& v)
+{
+    double x = 0.0, y = 0.0, z = 0.0;
+    for (const PxVec4& p : v) { x += double(p.x); y += double(p.y); z += double(p.z); }
+    const double n = v.empty() ? 1.0 : double(v.size());
+    return PxVec3(float(x / n), float(y / n), float(z / n));
+}
+
+// Words of `got[0..n)` that differ bitwise from `want[0..n)`.
+static PxU32 sbDataBitDiff(const PxVec4* got, const PxVec4* want, PxU32 n)
+{
+    PxU32 d = 0;
+    for (PxU32 i = 0; i < n; ++i)
+        d += std::memcmp(&got[i], &want[i], sizeof(PxVec4)) != 0 ? 1u : 0u;
+    return d;
+}
+
+static uint64_t sbDataFnv(uint64_t h, const std::vector<PxVec4>& v)
+{
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(PxVec4); ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 int main()
 {
     // LINE-BUFFER STDOUT.  This harness exists to drive scenes that crash, and a
@@ -9258,6 +9362,255 @@ int main()
         return 1;
     }
 
+    // PXG_SCENE=softbodydata (P9.95): PxScene::copySoftBodyData / applySoftBodyData ->
+    // sb_copyOrApplySoftBodyDataDEPRECATED.  See buildSoftBodyDataScene's header.
+    if (!std::strcmp(sceneName, "softbodydata"))
+    {
+        const bool control = std::getenv("PXG_SBDATA_CONTROL") != nullptr;
+        SoftBodyDataScene sd = buildSoftBodyDataScene(physics, scene, material, cudaCtx);
+        if (!sd.a || !sd.b || sd.nbSimA == 0 || sd.nbSimB == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodydata scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodydata' built: FEM volume A (%u sim / %u collision vertices) at "
+                    "x=-3, B (%u / %u) at x=+3, no floor\n", sd.nbSimA, sd.nbCollA, sd.nbSimB, sd.nbCollB);
+        // B's size is a constant (cells = 4), not tuned to the cooker; if the cooker ever
+        // gives fewer than 65 simulation vertices the block straddle is gone, so say so.
+        if (!(sd.nbSimB > 64u))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodydata: B has %u simulation vertices; tps = nbSimB must "
+                        "exceed 64 so the two-section copies straddle a 128-thread block\n", sd.nbSimB);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodydata pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const int steps = 60;
+        int failures = 0;
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+
+        // 1. The mandatory warm-up step (see the header).
+        scene->simulate(dt);
+        scene->fetchResults(true);
+        const PxU32 gpuA = sd.a->getGpuDeformableVolumeIndex();
+        const PxU32 gpuB = sd.b->getGpuDeformableVolumeIndex();
+        std::printf("  warm-up done: GPU indices A=%u B=%u%s\n", gpuA, gpuB,
+                    control ? "  [ control ] PXG_SBDATA_CONTROL=1: plain DtoH/HtoD instead of the API" : "");
+
+        // Device memory for the calls.  The tables are padded to 8 zeroed entries; every
+        // destination carries one poisoned slot past the largest size it is asked for.
+        const float POISON = -999.0f;
+        const PxU32 slotsB = PxMax(sd.nbSimB, sd.nbCollB) + 1u;
+        const PxU32 slotsA = PxMax(sd.nbSimA, sd.nbCollA) + 1u;
+        const PxU32 applySlots = PxMax(sd.nbSimA, sd.nbSimB);
+        CUdeviceptr dTab = 0, dSizes = 0, dIdx = 0, dDstB = 0, dDstA = 0, dApply = 0;
+        if (ctx->memAlloc(&dTab, 8 * sizeof(CUdeviceptr)) != 0 || !dTab ||
+            ctx->memAlloc(&dSizes, 8 * sizeof(PxU32)) != 0 || !dSizes ||
+            ctx->memAlloc(&dIdx, 8 * sizeof(PxU32)) != 0 || !dIdx ||
+            ctx->memAlloc(&dDstB, slotsB * sizeof(PxVec4)) != 0 || !dDstB ||
+            ctx->memAlloc(&dDstA, slotsA * sizeof(PxVec4)) != 0 || !dDstA ||
+            ctx->memAlloc(&dApply, applySlots * sizeof(PxVec4)) != 0 || !dApply)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodydata memAlloc failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        auto setTables = [&](std::vector<CUdeviceptr> tab, std::vector<PxU32> sizes, std::vector<PxU32> idx) {
+            tab.resize(8, 0); sizes.resize(8, 0u); idx.resize(8, 0u);
+            ctx->memcpyHtoD(dTab, tab.data(), 8 * sizeof(CUdeviceptr));
+            ctx->memcpyHtoD(dSizes, sizes.data(), 8 * sizeof(PxU32));
+            ctx->memcpyHtoD(dIdx, idx.data(), 8 * sizeof(PxU32));
+        };
+        auto poison = [&](CUdeviceptr d, PxU32 n) {
+            std::vector<PxVec4> p(n, PxVec4(POISON));
+            ctx->memcpyHtoD(d, p.data(), n * sizeof(PxVec4));
+        };
+
+        // 2. COPY, three flags.  Indices REVERSED {B, A}; A's section is half its vertices.
+        // dataIndex = offsetof(PxgSoftBody, field) / 8 (PxgSoftBody.cpp:580-608), for the log.
+        struct CopyCase { PxSoftBodyGpuDataFlag::Enum flag; const char* name; bool collision; PxU32 field;
+                          PxU32 dataIndex; };
+        const CopyCase copies[3] = {
+            { PxSoftBodyGpuDataFlag::eSIM_POSITION_INV_MASS, "sim positions", false, 0u, 12u },
+            { PxSoftBodyGpuDataFlag::eSIM_VELOCITY_INV_MASS, "sim velocities", false, 1u, 11u },
+            { PxSoftBodyGpuDataFlag::eTET_POSITION_INV_MASS, "collision positions", true, 2u, 8u } };
+        auto aliased = [](PxDeformableVolume* v, PxU32 field) -> PxVec4* {
+            return field == 0u ? v->getSimPositionInvMassBufferD()
+                 : field == 1u ? v->getSimVelocityBufferD() : v->getPositionInvMassBufferD(); };
+        PxU32 copyBad = 0;
+        for (const CopyCase& c : copies)
+        {
+            const PxU32 nB = c.collision ? sd.nbCollB : sd.nbSimB;
+            const PxU32 nA = c.collision ? sd.nbCollA : sd.nbSimA;
+            const PxU32 halfA = nA / 2u;
+            poison(dDstB, slotsB);
+            poison(dDstA, slotsA);
+            setTables({ dDstB, dDstA }, { nB * 16u, halfA * 16u }, { gpuB, gpuA });
+            std::vector<PxVec4> refB, refA;
+            if (control)
+            {
+                sbDataRead(ctx, aliased(sd.b, c.field), nB, refB);
+                sbDataRead(ctx, aliased(sd.a, c.field), halfA, refA);
+                ctx->memcpyHtoD(dDstB, refB.data(), nB * sizeof(PxVec4));
+                ctx->memcpyHtoD(dDstA, refA.data(), halfA * sizeof(PxVec4));
+            }
+            else
+            {
+                scene->copySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
+                                        reinterpret_cast<void*>(dIdx), c.flag, 2u, nB * 16u);
+            }
+            sbDataRead(ctx, aliased(sd.b, c.field), nB, refB);
+            sbDataRead(ctx, aliased(sd.a, c.field), nA, refA);
+            std::vector<PxVec4> gotB(slotsB), gotA(slotsA);
+            ctx->memcpyDtoH(gotB.data(), dDstB, slotsB * sizeof(PxVec4));
+            ctx->memcpyDtoH(gotA.data(), dDstA, slotsA * sizeof(PxVec4));
+            const std::vector<PxVec4> poisonV(PxMax(slotsA, slotsB), PxVec4(POISON));
+            const PxU32 badB = sbDataBitDiff(gotB.data(), refB.data(), nB);
+            const PxU32 badA = sbDataBitDiff(gotA.data(), refA.data(), halfA);
+            const PxU32 badTail = sbDataBitDiff(&gotB[nB], poisonV.data(), slotsB - nB) +
+                                  sbDataBitDiff(&gotA[halfA], poisonV.data(), slotsA - halfA);
+            std::printf("  copy %-19s (dataIndex %2u): B %u/%u vertices bit-equal, A %u/%u of its first half, "
+                        "%u poisoned slots overwritten\n", c.name,
+                        c.dataIndex, nB - badB, nB, halfA - badA, halfA, badTail);
+            if (badB || badA || badTail)
+            {
+                std::printf("FAIL: copySoftBodyData(%s) is not the aliased buffer bit for bit (B %u, A %u, "
+                            "tail %u differ)\n", c.name, badB, badA, badTail);
+                ++failures; ++copyBad;
+            }
+        }
+
+        // Pre-apply state (the reference every scored observable is measured from).
+        std::vector<PxVec4> posA0, posB0, velA0, velB0, collB0;
+        sbDataRead(ctx, sd.a->getSimPositionInvMassBufferD(), sd.nbSimA, posA0);
+        sbDataRead(ctx, sd.b->getSimPositionInvMassBufferD(), sd.nbSimB, posB0);
+        sbDataRead(ctx, sd.a->getSimVelocityBufferD(), sd.nbSimA, velA0);
+        sbDataRead(ctx, sd.b->getSimVelocityBufferD(), sd.nbSimB, velB0);
+        sbDataRead(ctx, sd.b->getPositionInvMassBufferD(), sd.nbCollB, collB0);
+        const PxVec3 mA0 = sbDataMean(posA0), mB0 = sbDataMean(posB0), mcB0 = sbDataMean(collB0);
+        const float vx0 = sbDataMean(velA0).x;
+
+        // 3. APPLY (a): A's sim velocities with v.x += 3 -- y, z and w (invMass) bitwise.
+        const float KICK = 3.0f, TELEPORT = 2.0f;
+        std::vector<PxVec4> kickA = velA0;
+        for (PxVec4& v : kickA) v.x += KICK;
+        ctx->memcpyHtoD(dApply, kickA.data(), sd.nbSimA * sizeof(PxVec4));
+        setTables({ dApply }, { sd.nbSimA * 16u }, { gpuA });
+        if (control)
+            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.a->getSimVelocityBufferD()), kickA.data(),
+                            sd.nbSimA * sizeof(PxVec4));
+        else
+            scene->applySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
+                                     reinterpret_cast<void*>(dIdx), PxSoftBodyGpuDataFlag::eSIM_VELOCITY_INV_MASS,
+                                     1u, sd.nbSimA * 16u);
+        {
+            std::vector<PxVec4> velA1, velB1;
+            sbDataRead(ctx, sd.a->getSimVelocityBufferD(), sd.nbSimA, velA1);
+            sbDataRead(ctx, sd.b->getSimVelocityBufferD(), sd.nbSimB, velB1);
+            const PxU32 badA = sbDataBitDiff(velA1.data(), kickA.data(), sd.nbSimA);
+            const PxU32 badB = sbDataBitDiff(velB1.data(), velB0.data(), sd.nbSimB);
+            std::printf("  apply (a) A sim velocities v.x += %.1f: %u/%u bit-equal at once; B untouched: %u/%u\n",
+                        KICK, sd.nbSimA - badA, sd.nbSimA, sd.nbSimB - badB, sd.nbSimB);
+            if (badA || badB)
+            { std::printf("FAIL: applySoftBodyData(velocities) did not land bitwise (A %u, B %u differ)\n", badA, badB);
+              ++failures; }
+        }
+
+        // 4. APPLY (b): B's sim positions with z += 2 -- w bitwise.
+        std::vector<PxVec4> moveB = posB0;
+        for (PxVec4& p : moveB) p.z += TELEPORT;
+        ctx->memcpyHtoD(dApply, moveB.data(), sd.nbSimB * sizeof(PxVec4));
+        setTables({ dApply }, { sd.nbSimB * 16u }, { gpuB });
+        if (control)
+            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.b->getSimPositionInvMassBufferD()), moveB.data(),
+                            sd.nbSimB * sizeof(PxVec4));
+        else
+            scene->applySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
+                                     reinterpret_cast<void*>(dIdx), PxSoftBodyGpuDataFlag::eSIM_POSITION_INV_MASS,
+                                     1u, sd.nbSimB * 16u);
+        {
+            std::vector<PxVec4> posA1, posB1;
+            sbDataRead(ctx, sd.a->getSimPositionInvMassBufferD(), sd.nbSimA, posA1);
+            sbDataRead(ctx, sd.b->getSimPositionInvMassBufferD(), sd.nbSimB, posB1);
+            const PxU32 badB = sbDataBitDiff(posB1.data(), moveB.data(), sd.nbSimB);
+            const PxU32 badA = sbDataBitDiff(posA1.data(), posA0.data(), sd.nbSimA);
+            std::printf("  apply (b) B sim positions z += %.1f: %u/%u bit-equal at once; A untouched: %u/%u\n",
+                        TELEPORT, sd.nbSimB - badB, sd.nbSimB, sd.nbSimA - badA, sd.nbSimA);
+            if (badA || badB)
+            { std::printf("FAIL: applySoftBodyData(positions) did not land bitwise (B %u, A %u differ)\n", badB, badA);
+              ++failures; }
+        }
+
+        // 5. Step.  After the FIRST step B's COLLISION mesh -- written only by the skinning
+        // from the sim mesh -- must stand 2 further in z.
+        float collDz = 0.0f;
+        bool finite = true;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i == 0)
+            {
+                std::vector<PxVec4> collB1;
+                sbDataRead(ctx, sd.b->getPositionInvMassBufferD(), sd.nbCollB, collB1);
+                collDz = sbDataMean(collB1).z - mcB0.z;
+            }
+        }
+        std::vector<PxVec4> posA2, posB2;
+        sbDataRead(ctx, sd.a->getSimPositionInvMassBufferD(), sd.nbSimA, posA2);
+        sbDataRead(ctx, sd.b->getSimPositionInvMassBufferD(), sd.nbSimB, posB2);
+        for (const PxVec4& p : posA2) finite = finite && p.getXYZ().isFinite();
+        for (const PxVec4& p : posB2) finite = finite && p.getXYZ().isFinite();
+        const PxVec3 mA2 = sbDataMean(posA2), mB2 = sbDataMean(posB2);
+        const float t = float(steps) * dt;
+        const float dxA = mA2.x - mA0.x, dxB = mB2.x - mB0.x, dzB = mB2.z - mB0.z;
+        const float dyA = mA2.y - mA0.y, dyB = mB2.y - mB0.y;
+        const uint64_t hash = sbDataFnv(sbDataFnv(1469598103934665603ull, posA2), posB2);
+        std::printf("  after %d steps: A dx = %.6f (kick %.1f * %.3f s + warm-up vx %.6f), B dx = %.6f, B dz = %.6f, "
+                    "B collision dz after step 1 = %.6f, dy A = %.6f, B = %.6f\n", steps, dxA, KICK, t, vx0, dxB, dzB,
+                    collDz, dyA, dyB);
+        std::printf("  final sim-position hash (A then B, FNV-1a): %016llx%s\n", (unsigned long long)hash,
+                    control ? "  [ control ]" : "");
+
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        if (!finite) { std::printf("FAIL: a volume is not finite\n"); ++failures; }
+        near("B collision-mesh mean dz after the first step (skinning read the applied sim mesh)", collDz,
+             TELEPORT, 1e-4f);
+        // Measured at first green: 2.999957 (TGS) and 2.999999 (PGS) against (3 + vx0) * 1 s with
+        // vx0 = 0.000000 -- the bar is the larger deviation + 1e-4, not a guess.
+        near("A sim mean dx since the apply (velocity kick)", dxA, (KICK + vx0) * t, 1.5e-4f);
+        near("B sim mean dx since the apply (no kick)", dxB, 0.0f, 1e-4f);
+        near("B sim mean dz since the apply (teleport kept)", dzB, TELEPORT, 1e-3f);
+        near("A vs B mean y drop since the apply (both keep their warm-up vy)", dyA - dyB, 0.0f, 1e-3f);
+
+        ctx->memFree(dTab); ctx->memFree(dSizes); ctx->memFree(dIdx);
+        ctx->memFree(dDstB); ctx->memFree(dDstA); ctx->memFree(dApply);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (control)
+        {
+            std::printf("[ control ] gpu-sdk-step: softbodydata control run (%d check(s) failed), not scored\n",
+                        failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodydata: 3 copies bit-exact, A kicked %.4f along x, B "
+                        "teleported %.4f in z (collision mesh %.4f after one step) -- "
+                        "sb_copyOrApplySoftBodyDataDEPRECATED runs on Vulkan\n", dxA, dzB, collDz);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodydata: %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "softbodyattach"))
     {
         SoftBodyAttachScene sa = buildSoftBodyAttachScene(physics, scene, material, cudaCtx);
@@ -10628,6 +10981,7 @@ int main()
                        "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
                        "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
                        "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
+                       "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

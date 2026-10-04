@@ -145,10 +145,10 @@ ENGINE_DIRS = [
 
 # Kernels whose pack this checker cannot yet decide.  RATCHET: may shrink, never
 # grow.  Being on this list is NOT a clean bill -- it is a recorded blind spot,
-# and the honest state of the tree is that 29 of the kernels with an ABI row have
+# and the honest state of the tree is that 28 of the kernels with an ABI row have
 # one (101 before P9.83a-6 taught the resolver function scope; 37 before P9.93
-# made three more kernels VISIBLE; 40 before P9.95 taught SIZES PxVec3 -- see the
-# notes at the end of the set).
+# made three more kernels VISIBLE; 40 before P9.95 taught SIZES PxVec3; 29 before
+# P9.95 taught the declaration regex `**` -- see the notes at the end of the set).
 #
 # THE REASONS, in the order they will be worth attacking:
 #   * a struct passed BY VALUE whose size this table does not know (the
@@ -192,7 +192,6 @@ KNOWN_UNDECIDED = {
     "cloth_planeVertContactGenLaunch",
     "cloth_psContactGenLaunch",
     "cloth_sdfMeshContactGenLaunch",
-    "prepareLostFoundPairs_Stage2",
     "ps_heightfieldCollisonLaunch",
     "ps_meshCollisonLaunch",
     "ps_primitivesCollisionLaunch",
@@ -232,6 +231,17 @@ KNOWN_UNDECIDED = {
     # ps_preIntegrateLaunch, ps_stepParticlesLaunch, sb_gm_preIntegrateLaunch and
     # sb_gm_stepSoftbodyLaunch.  Checked 269 -> 281 (those eleven + the new row),
     # KNOWN_UNDECIDED 40 -> 29.
+    #
+    # P9.95 (sb_copyOrApplySoftBodyDataDEPRECATED) taught the resolver three things:
+    # never to decide on a partial argument list, a call-expression argument sized by its
+    # declared return type (method_return_size), and a by-value PxgCudaBuffer object as
+    # 32 bytes.  It decides the new row -- {32,4,8,4,8,8,4,4} = 80 -- once it can also read
+    # `PxU8** data`, and that double-pointer declaration decided ONE more kernel that was
+    # on this list, in agreement with its row:
+    #   prepareLostFoundPairs_Stage2  PxgNarrowphaseCore.cpp:342 -- `lostFoundCms` and
+    #     `cmArray` are PxsContactManager** locals; pack {8,8,8,8,8,8,8,4,8} == kLostFound2.
+    # The full per-kernel decision table was diffed before and after: nothing else moved.
+    # Checked 282 -> 284, KNOWN_UNDECIDED 29 -> 28.
 }
 
 
@@ -271,8 +281,17 @@ def arg_size(decl_type):
         return PTR8
     if t.endswith("&"):
         return arg_size(t[:-1])
-    if t.startswith("PxgDevicePointer<") or t.startswith("PxgTypedCudaBuffer<"):
+    # PxgDevicePointer<T> is a one-pointer wrapper: 8.  A PxgCudaBuffer / PxgTypedCudaBuffer<T>
+    # is NOT -- it is the 32-byte host OBJECT (mPtr @0, mHeapMemoryAllocator* @8, mSize @16,
+    # mStatGroup @24 + pad; PxgCudaBuffer.h:103-107), and PX_CUDA_KERNEL_PARAM(buffer) pushes
+    # all 32 bytes.  P9.95: PxgSoftBodyCore.cpp:3134 does exactly that for
+    # sb_copyOrApplySoftBodyDataDEPRECATED (core->getSoftBodyBuffer(), a reference to one);
+    # this branch used to size it 8, which would have blessed a 56-byte signature row that
+    # the shim refuses on every launch.
+    if t.startswith("PxgDevicePointer<"):
         return PTR8
+    if t.startswith("PxgTypedCudaBuffer<") or t == "PxgCudaBuffer":
+        return 32
     base = t.split()[-1] if " " in t else t
     return SIZES.get(base) or SIZES.get(t)
 
@@ -565,7 +584,14 @@ def declared_size(src, var, cache_key=None, pos=None):
         # Dropping the macro changes no size and can only resolve more.
         text = re.sub(r"\bPX_RESTRICT\b", " ", text)
         sizes, unresolved = set(), False
-        for m in re.finditer(r"(?:^|[;{}\(,])\s*((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*[*&]?)\s+"
+        # P9.95: `\*{0,2}&?`, not `[*&]?` -- a double pointer (`PxU8** data`, the host
+        # parameter of copyOrApplySoftBodyDataDEPRECATED) or a reference to a pointer was
+        # not a declaration to this regex at all, so the name fell through to the flat file
+        # scan and met unrelated `data`s there.  NOT `[*&]{0,2}`: that was tried and reads
+        # `(anyArticulationConstraints && c == 0` (PxgTGSCudaSolverCore.cpp:1193) as a
+        # declaration of `c` with type `anyArticulationConstraints&&`, which made
+        # solveBlockUnified undecidable.  A logical AND is not a reference to a reference.
+        for m in re.finditer(r"(?:^|[;{}\(,])\s*((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*\*{0,2}&?)\s+"
                              + re.escape(var) + r"\s*(?:=|;|\)|,|\[)", text, re.M):
         # NOTE the leading-delimiter class: it is what keeps `foo(bar, baz)` from
         # reading `bar` as a declaration of type `foo(`.
@@ -622,6 +648,53 @@ def declared_size(src, var, cache_key=None, pos=None):
         hunresolved = hunresolved or hu
     res = hsizes.pop() if (len(hsizes) == 1 and not hunresolved) else None
     DECL_CACHE[key] = res
+    return res
+
+
+# ---------------------------------------------------------------------------
+# call-expression arguments (P9.95)
+# ---------------------------------------------------------------------------
+# PX_CUDA_KERNEL_PARAM(core->getSoftBodyBuffer()) (PxgSoftBodyCore.cpp:3134) pushes
+# sizeof(<the call's return type>).  It is the only call-expression argument in gpu*/ (a
+# grep of every PX_CUDA_KERNEL_PARAM found no other), and until P9.95 the argument regex
+# could not match it: findall DROPPED it in silence, so the pack was read as seven
+# arguments.  Now the argument regex accepts a trailing `()`, and `obj->method()` /
+# `method()` is sized by the RETURN TYPE the method is declared with in gpu*/include.  The
+# object's type is not checked: the method is looked up by NAME across those headers, so
+# two declarations of one name with different sizes leave the argument undecidable --
+# never a guess.
+HEADER_DIRS = sorted(
+    os.path.join(ROOT, "physx", "source", d, "include")
+    for d in os.listdir(os.path.join(ROOT, "physx", "source"))
+    if d.startswith("gpu") and os.path.isdir(os.path.join(ROOT, "physx", "source", d, "include")))
+METHOD_CACHE = {}
+
+
+def method_return_size(method):
+    """sizeof the value `method()` returns, from its declarations in gpu*/include, or None."""
+    if method in METHOD_CACHE:
+        return METHOD_CACHE[method]
+    sizes, unresolved = set(), False
+    for d in HEADER_DIRS:
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".h"):
+                continue
+            try:
+                text = _masked(open(os.path.join(d, fn), errors="replace").read())
+            except OSError:
+                continue
+            for m in re.finditer(r"(?:^|[;{}\s])((?:const\s+)?[\w:]+(?:\s*<[^<>;]*>)?\s*\*{0,2}&?)\s+"
+                                 + re.escape(method) + r"\s*\(\s*\)", text, re.M):
+                t = m.group(1).strip()
+                if t.split()[-1] in ("return", "else", "case", "new", "delete"):
+                    continue
+                sz = arg_size(t)
+                if sz is None:
+                    unresolved = True
+                else:
+                    sizes.add(sz)
+    res = sizes.pop() if (len(sizes) == 1 and not unresolved) else None
+    METHOD_CACHE[method] = res
     return res
 
 
@@ -713,16 +786,28 @@ def launch_packs(ids):
             # under-counts; both are the checker being wrong about the engine.
             block = re.sub(r"/\*.*?\*/", " ", bm.group(1), flags=re.S)
             block = re.sub(r"//[^\n]*", " ", block)
-            args = re.findall(r"PX_CUDA_KERNEL_PARAM2?\(\s*\(?\s*([\w\.\->\[\]]+)\s*\)?\s*\)",
+            # P9.95: an optional trailing `()` -- a call expression (see method_return_size).
+            args = re.findall(r"PX_CUDA_KERNEL_PARAM2?\(\s*\(?\s*([\w\.\->\[\]]+(?:\(\))?)\s*\)?\s*\)",
                               block)
             if not args:
                 continue
-            sizes = []
+            # P9.95: NEVER DECIDE ON A PARTIAL ARGUMENT LIST.  Every argument form the regex
+            # above does not know is dropped by findall without a word, and the pack then
+            # looks short -- that is how core->getSoftBodyBuffer() vanished.  If the block
+            # has more PX_CUDA_KERNEL_PARAM's than the regex captured, the pack is UNDECIDED.
+            if len(re.findall(r"PX_CUDA_KERNEL_PARAM2?\(", block)) != len(args):
+                sizes = None
+                args = []
+            else:
+                sizes = []
             for a in args:
-                if not re.match(r"^\w+$", a):
-                    sizes = None
-                    break
-                sz = declared_size(src, a, path, hm.start())
+                cm = re.match(r"^(?:\w+->|\w+\.)?(\w+)\(\)$", a)
+                if cm:
+                    sz = method_return_size(cm.group(1))
+                elif re.match(r"^\w+$", a):
+                    sz = declared_size(src, a, path, hm.start())
+                else:
+                    sz = None
                 if sz is None:
                     sizes = None
                     break

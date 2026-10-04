@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 424;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 425;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -334,7 +334,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_plasticDeformLaunch", nullptr, nullptr },  // SB_PLASTIC_DEFORM (DELIBERATELY unmapped: the CUDA body is gated on a hard-coded `if (false)`, softBodyGM.cu:2844 -- porting it would map an empty kernel and inflate the count)
     { "sb_initPlasticDeformLaunch", nullptr, nullptr },  // SB_INIT_PLASTIC_DEFORM (DELIBERATELY unmapped: no call site anywhere in PhysX -- the engine never launches it)
     { "sb_plasticDeformLaunch2", nullptr, nullptr },  // SB_PLASTIC_DEFORM2 (DELIBERATELY unmapped: same hard-coded `if (false)`, softBodyGM.cu:3013)
-    { "sb_copyOrApplySoftBodyDataDEPRECATED", nullptr, nullptr },  // SB_COPY_OR_APPLY_SOFTBODY_DATA_DEPRECATED (unmapped)
+    { "sb_copyOrApplySoftBodyDataDEPRECATED", "softBodySimBda.spv", "sb_copyOrApplySoftBodyDataDEPRECATED" },  // SB_COPY_OR_APPLY_SOFTBODY_DATA_DEPRECATED (P9.95 BDA port: PxScene::copy/applySoftBodyData; arg 0 is the 32-byte PxgTypedCudaBuffer object)
     { "sb_gm_finalizeVelocitiesLaunch", "softBodySimBda.spv", "sb_gm_finalizeVelocitiesLaunch" },  // SB_GM_FINALIZE_VELOCITIES (P8.0 tranche 3 BDA port)
     { "sb_sleeping", "softBodySimBda.spv", "sb_sleeping" },  // SB_SLEEPING (P8.0 tranche 3 BDA port)
     { "compressContactStage1", "npCompressContacts.spv", "compressContactStage1" },  // COMPRESS_CONTACT_STAGE_1

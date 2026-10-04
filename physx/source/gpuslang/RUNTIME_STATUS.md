@@ -8,6 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95c: sb_copyOrApplySoftBodyDataDEPRECATED (softBodyGM.cu:3094-3134, PxScene::copy/
+applySoftBodyData) on the engine ABI: 80-byte by-object blob, manifest 424 -> 425, engine-reachable
+unmapped 8 -> 7.  Seven bitwise fixtures through the real context and registry; pack checker
+learns call-expression and buffer-object arguments (284 checked, KNOWN_UNDECIDED 29 -> 28).
+PXG_SCENE=softbodydata (TGS + PGS).  Scenes 69/69.
 P9.95b: applyParticleBufferDataDEPRECATED (particlesystem.cu:5831-5866) ported and mapped
 (manifest 423 -> 424, engine-reachable unmapped 9 -> 8); the upper-bound id search is shared with
 the softbody attach port.  Bitwise fixture, 27+ mutants (1 equivalent), PXG_SCENE=particleapply
@@ -2120,6 +2125,70 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95c — `sb_copyOrApplySoftBodyDataDEPRECATED`: `PxScene::copySoftBodyData` / `applySoftBodyData` auf dem Engine-ABI
+
+**Erreichbarkeit.** Die Direct-GPU-Aufrufe `copySoftBodyData` und `applySoftBodyData` (über
+PxgSimulationController → PxgSoftBodyCore.cpp:3144) starten diesen Kernel. Er kopiert Wortblöcke
+zwischen Nutzerpuffern und Feldern der `PxgSoftBody`-Deskriptoren. Bisher war er nicht gemappt.
+
+**Ausrichtung zuerst gemessen.** Der Host übergibt als Argument 0 das ganze 32-B-Objekt
+`PxgTypedCudaBuffer` statt `getDevicePtr()`. Die CUDA liest davon nur die ersten 8 Bytes, den rohen
+`mPtr`. Gemessen wurde, dass `mPtr` hier immer gleich `getDevicePtr()` ist und mindestens 256-fach
+ausgerichtet: in der Fixture für alle Puffergrößen beider Speichermodi und in der Szene für alle
+5 Starts unter TGS, PGS und V2. Eine Shim-Korrektur war nicht nötig.
+
+**Port.**
+- Neuer Einstieg in `softBodySimBda.slang`. Er bewegt nur uint-Wörter, keine Float-Operation, in
+  der Reihenfolge der CUDA: `section = gtid/tps`, Guard `section < n`, Deskriptor bei
+  raw + idx·432, Feld `((u64*)desc)[dataIndex]`, `end = (size + 3)/4` mit PxU32-Überlauf, und die
+  Schleife mit Schritt tps.
+- ABI-Zeile `kSbCopyOrApplyData {32,4,8,4,8,8,4,4}` = 80 B, Manifest 424 → 425,
+  `engine_reachable_unmapped.txt` 8 → 7.
+- Die Tabellen-Lesezugriffe sind auf Abschnitt n−1 geklemmt, und ein leerer Abschnitt liest von
+  einer gültigen Basis. Diese Klemmen sind **defensiv, nicht gemessen**: Auf diesem llvmpipe (LLVM
+  20.1.2) blieb der Mutant ohne Klemme 3/3 grün, obwohl alle Einträge hinter n ungültige Zeiger
+  waren. Keine Fixture kann zeigen, dass sie nötig sind.
+
+**Fixture:** 7 Tests `softBodySimCopy*` laufen über den echten Kontext, mit der Registry so, wie die
+Engine sie baut. Der Argumentblock des Hosts wird wörtlich kopiert, und `PxgSoftBody.cpp` ist für
+das echte `dataIndexFromFlagDEPRECATED` mitgebaut. Verglichen wird jedes Wort bitweise gegen ein
+wörtliches Host-Orakel.
+
+**Pack-Checker:** Er entscheidet nicht mehr auf einer unvollständigen Argumentliste, bemisst
+Argumente aus Aufrufausdrücken nach ihrem Rückgabetyp und zählt ein Pufferobjekt mit 32 B. Damit
+sind 284 Kernel geprüft, KNOWN_UNDECIDED 29 → 28 (`prepareLostFoundPairs_Stage2` ist jetzt
+entschieden, 72 B, passend).
+
+**Sweeps.**
+- Shader: 25 Mutanten, 18 getötet, 6 durch Fault getötet, 1 überlebt. Die beiden Reverts sind
+  getötet. Der Überlebende m21 (`+ 0.0f`) wird vom Compiler weggefaltet; die Variante mit einer
+  Laufzeit-Null wird getötet.
+- ABI-Zeile: 4/4 getötet. Szene: 6/6 getötet.
+
+**Szene `PXG_SCENE=softbodydata`** (TGS und PGS): zwei FEM-Würfel A (27 Vertices) und B (125, damit
+ein Abschnitt den Block überspannt), dreimal COPY und zweimal APPLY, danach 60 Schritte.
+
+| Messgröße | Kernel übersprungen | grün |
+|---|---|---|
+| Kopien bitgleich zu den Simulationspuffern | 0 (Gift) | alle |
+| A: mittleres dx nach APPLY (v.x += 3) | 0 | 2.99996 (TGS) / 3.00000 (PGS) |
+| B: mittleres dz nach APPLY (z += 2) | 0 | 2.000000 |
+| B: Kollisionsnetz dz nach dem Skinning | 0 | 2.000000 |
+
+Die Kontrolle mit gewöhnlichem DtoH/HtoD liefert denselben Hash.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+- Der Host übergibt das Pufferobjekt statt des Zeigers. Das funktioniert nur, weil `mPtr` das erste
+  Element ist.
+- `mGpuSoftBodyCore` wird nicht auf null geprüft, der Guard in NpScene ist auskommentiert. Ein
+  Aufruf ohne Deformable stürzt ab.
+- Vor dem ersten `simulate` ist `mPtr` noch 0.
+- Bei maxSize 0 ist das Grid 0.
+- Weil Bytegrößen auf Wörter aufgerundet werden, landen bis zu 3 Bytes hinter `dataSizes`.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 883/883 in beiden Speichermodi.
+**Szenen:** 69/69.
 
 ## P9.95b — `applyParticleBufferDataDEPRECATED`: Partikelpuffer-Daten über `PxParticleSystem::applyParticleBufferData`
 
