@@ -1765,6 +1765,115 @@ ExtForceScene buildExtForceScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     return s;
 }
 
+// PXG_SCENE=substepgravity (P9.95): applyTGSSubstepGravity.
+//
+// PxgTGSCudaSolverCore::solveContactMultiBlockParallel launches it once per POSITION
+// iteration (PxgTGSCudaSolverCore.cpp:1354-1374) and only when the scene raised
+// PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS.  That flag is not in
+// eMUTABLE_FLAGS (PxSceneDesc.h:373), so it is raised before createScene, and it is
+// TGS-only (PxSceneDesc::isValid rejects it with PGS, PxSceneDesc.h:1129).  Under the
+// flag preIntegration skips gravity and the external accelerations
+// (skipGravityApplication, PxgTGSCudaSolverCore.cpp:826,850) and this kernel adds them
+// per substep instead; ScBodySim.cpp:681-711 turns velocity changes and impulses into
+// accelerations (v/dt).  So a REFUSED kernel leaves every body hovering at y = 100.
+//
+// The extforce bodies again (1000 kg boxes, inverse inertia 0.006, angular damping 0,
+// y = 100, sixty steps of 1/60, 4 position iterations -> n = 4 substeps).  Applied
+// per substep, an acceleration a over one frame moves a body by
+// v0*dt + a*dt^2*(n+1)/(2n), not v0*dt + a*dt^2 (factor 0.625 instead of 1):
+//   C (x=-5)  untouched: y = 100 - g dt^2 (1770 + 60*0.625) = 95.0745625, v.y = -9.81.
+//   K (x=0)   addForce((3,0,0), eVELOCITY_CHANGE) before step 30: x = 3 dt (29 + 0.625)
+//             = 1.48125 (1.5 when the flag is ignored), v.x = 3.
+//   F (x=5)   addForce((0,0,2000), eFORCE) before each of steps 30..59:
+//             z = 2 dt^2 (435 + 18.75) = 0.2520833, v.z = 1.
+//   S (x=10)  addTorque((0,500,0), eIMPULSE) before step 30: omega_y = 3, angle
+//             3 dt (29 + 0.625) = 1.48125 about y.
+//   D (x=15)  eDISABLE_GRAVITY, and F's force from step 30 on.  UPSTREAM QUIRK: the
+//             kernel's gate reads disableGravity (solverMultiBlockTGS.cu:1656) but
+//             applyAcceleration never does (:1575-1583), so once D has an
+//             acceleration it receives gravity as well: y = 100 - g dt^2 (435 +
+//             18.75) = 98.7635313, v.y = -4.905.  The CPU twin zeroes gravity under
+//             disableGravity (DyTGSDynamics.cpp:1490-1493): y = 100, v.y = 0.
+//   L (x=20)  eLOCK_LINEAR_X | eLOCK_ANGULAR_Y, pushed along x and twisted about y
+//             from step 30.  A SMOKE and CPU-parity check only: the locked
+//             components are zeroed again after this kernel, in the per-substep
+//             integration (solverMultiBlockTGS.cu:541-552) and in the final
+//             writes (integration.cuh:316-329), so L does not observe how this
+//             kernel treats lockFlags.  That is fixture-only.
+//   J1/J2     (x=25 and 26.5) one box pair joined by a fully LOCKED D6.  Every body
+//             above is constraint-free, so its solverBodyReferences entries stay
+//             INVALID (memset at PxgTGSCudaSolverCore.cpp:679; the only writer is
+//             constraint prep, constraintPrepShared.cuh:145) and only the
+//             kernel's accumulation-copy write is observed.  The joint gives the
+//             pair slab references, and computeAverageSolverBodyVelocityTGS
+//             (solverMultiBlockTGS.cu:338-415) replaces their accumulated velocity
+//             with the slab average -- so the pair falls like C only if the slab
+//             writes happen.
+//   FILLERS   640 more free-falling boxes far off (x >= 40, never touching), checked
+//             like C.  They are there for J1/J2: solveContactMultiBlockParallel solves
+//             an island whose (mBodyCount + mBodyStartIndex) * numSlabs is at most
+//             640 with solveWholeIslandTGS (PxgTGSCudaSolverCore.cpp:1123-1141, 640
+//             under PXG_NO_CUDA_TOOLKIT), and that kernel reads the ACCUMULATED copy
+//             (solverMultiBlockTGS.cu:1728-1731), never the slab copies.  Measured:
+//             with eight bodies a kernel that skipped every slab write still passed.
+//             649 > 640 forces the per-partition path, whose solve reads the slab
+//             copies and whose computeAverageSolverBodyVelocityTGS then overwrites
+//             the accumulated copy with them.
+// Every body gets setSleepThreshold(0): with the kernel refused they are all at rest
+// from step 0, and without it they would fall asleep (energy >= threshold keeps the
+// wake counter, integration.cuh:160 / DySleep.cpp:136).
+struct SubstepGravityScene
+{
+    ExtForceScene e;
+    PxRigidDynamic* D;
+    PxRigidDynamic* L;
+    PxRigidDynamic* J1;
+    PxRigidDynamic* J2;
+    std::vector<PxRigidDynamic*> fillers;
+};
+
+SubstepGravityScene buildSubstepGravityScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    SubstepGravityScene s = {};
+    s.e = buildExtForceScene(physics, scene, material);
+    auto body = [&](float x) {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), 100.0f, x);
+        b->setAngularDamping(0.0f);
+        return b;
+    };
+    s.D = body(15.0f);
+    s.D->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+    s.L = body(20.0f);
+    s.L->setRigidDynamicLockFlags(PxRigidDynamicLockFlag::eLOCK_LINEAR_X | PxRigidDynamicLockFlag::eLOCK_ANGULAR_Y);
+    s.J1 = body(25.0f);
+    s.J2 = body(26.5f);
+    PxD6Joint* joint = PxD6JointCreate(*physics, s.J1, PxTransform(PxVec3(0.75f, 0.0f, 0.0f)),
+                                       s.J2, PxTransform(PxVec3(-0.75f, 0.0f, 0.0f)));
+    joint->setMotion(PxD6Axis::eX, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eY, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eZ, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eTWIST, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eSWING1, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eLOCKED);
+    for (PxRigidDynamic* b : { s.e.K, s.e.F, s.e.S, s.e.C, s.D, s.L, s.J1, s.J2 })
+        b->setSleepThreshold(0.0f);
+    PxShape* fillerShape = physics->createShape(PxBoxGeometry(0.25f, 0.25f, 0.25f), *material);
+    for (int i = 0; i < 640; ++i)
+    {
+        PxRigidDynamic* b = physics->createRigidDynamic(
+            PxTransform(PxVec3(40.0f + 2.0f * float(i % 32), 100.0f, -20.0f + 2.0f * float(i / 32))));
+        b->attachShape(*fillerShape);
+        b->setMass(1000.0f);
+        b->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.25f), 1000.0f));
+        b->setSleepThreshold(0.0f);
+        scene->addActor(*b);
+        s.fillers.push_back(b);
+    }
+    fillerShape->release();
+    return s;
+}
+
 // PXG_SCENE=forcethreshold (P9.91): the FORCE-THRESHOLD REPORTING pipeline.
 //
 // PxgGpuContext::doConstraintSolveGPU runs accumulatedForceThresholdStream() -- the
@@ -6469,6 +6578,23 @@ int main()
         }
         if (sn && !std::strcmp(sn, "forcethreshold"))
             gForceThresholdPairs = true;
+        // P9.95 -- PXG_SCENE=substepgravity: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is
+        // not in eMUTABLE_FLAGS (PxSceneDesc.h:373), so it is raised here.  It is TGS-only:
+        // PxSceneDesc::isValid rejects it with PGS (PxSceneDesc.h:1129) and createScene
+        // would return null.  PXG_CPU_CONTROL=1 stays legal (the CPU TGS supports the flag,
+        // DyTGSDynamics.cpp:1478); it is reported and not scored.
+        if (sn && !std::strcmp(sn, "substepgravity"))
+        {
+            if (usePgs)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=substepgravity is TGS-only (PxSceneDesc::isValid "
+                            "rejects eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS with PGS, PxSceneDesc.h:1129)\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            sceneDesc.flags |= PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS;
+            std::printf("  [ P9.95 ] eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS raised\n");
+        }
     }
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
@@ -9536,6 +9662,120 @@ int main()
         return 2;
     }
 
+    if (!std::strcmp(sceneName, "substepgravity"))
+    {
+        SubstepGravityScene gs = buildSubstepGravityScene(physics, scene, material);
+        ExtForceScene& es = gs.e;
+        std::printf("  [  OK  ] scene 'substepgravity' built: eight free-falling 1000 kg boxes (K F S C D L + a "
+                    "D6-locked pair J1/J2) + 640 fillers, gravity and forces applied per TGS substep\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: substepgravity pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        for (int i = 0; i < 60; ++i)
+        {
+            if (i == 30)
+            {
+                es.K->addForce(PxVec3(3.0f, 0.0f, 0.0f), PxForceMode::eVELOCITY_CHANGE, false);
+                es.S->addTorque(PxVec3(0.0f, 500.0f, 0.0f), PxForceMode::eIMPULSE, false);
+            }
+            if (i >= 30)
+            {
+                es.F->addForce(PxVec3(0.0f, 0.0f, 2000.0f), PxForceMode::eFORCE, false);
+                gs.D->addForce(PxVec3(0.0f, 0.0f, 2000.0f), PxForceMode::eFORCE, false);
+                gs.L->addForce(PxVec3(2000.0f, 0.0f, 0.0f), PxForceMode::eFORCE, false);
+                gs.L->addTorque(PxVec3(0.0f, 500.0f, 0.0f), PxForceMode::eFORCE, false);
+            }
+            scene->simulate(dt);
+            scene->fetchResults(true);
+        }
+        const PxVec3 kP = es.K->getGlobalPose().p, kV = es.K->getLinearVelocity();
+        const PxVec3 fP = es.F->getGlobalPose().p, fV = es.F->getLinearVelocity();
+        const PxQuat sQ = es.S->getGlobalPose().q;
+        const PxVec3 sW = es.S->getAngularVelocity();
+        const PxVec3 cP = es.C->getGlobalPose().p, cV = es.C->getLinearVelocity();
+        const PxVec3 dP = gs.D->getGlobalPose().p, dV = gs.D->getLinearVelocity();
+        const PxVec3 lP = gs.L->getGlobalPose().p, lV = gs.L->getLinearVelocity(), lW = gs.L->getAngularVelocity();
+        const PxVec3 j1P = gs.J1->getGlobalPose().p, j1V = gs.J1->getLinearVelocity();
+        const PxVec3 j2P = gs.J2->getGlobalPose().p, j2V = gs.J2->getLinearVelocity();
+        std::printf("  K  p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", kP.x, kP.y, kP.z, kV.x, kV.y, kV.z);
+        std::printf("  F  p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", fP.x, fP.y, fP.z, fV.x, fV.y, fV.z);
+        std::printf("  S  q=(%.6f, %.6f, %.6f, %.6f) w=(%.6f, %.6f, %.6f)\n", sQ.x, sQ.y, sQ.z, sQ.w, sW.x, sW.y, sW.z);
+        std::printf("  C  p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", cP.x, cP.y, cP.z, cV.x, cV.y, cV.z);
+        std::printf("  D  p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", dP.x, dP.y, dP.z, dV.x, dV.y, dV.z);
+        std::printf("  L  p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f) w=(%.6f, %.6f, %.6f)\n", lP.x, lP.y, lP.z,
+                    lV.x, lV.y, lV.z, lW.x, lW.y, lW.z);
+        std::printf("  J1 p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", j1P.x, j1P.y, j1P.z, j1V.x, j1V.y, j1V.z);
+        std::printf("  J2 p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f)\n", j2P.x, j2P.y, j2P.z, j2V.x, j2V.y, j2V.z);
+
+        int failures = 0;
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
+        };
+        // Per-substep application: a frame moves v0*dt + a*dt^2*(n+1)/(2n), n = 4 -> 0.625.
+        const float yEnd = 100.0f - 0.002725f * 1807.5f;  // g dt^2 (60*59/2 + 60*0.625) = 95.0745625
+        near("C.y", cP.y, yEnd, 2e-3f);              near("C.v.y", cV.y, -9.81f, 1e-3f);
+        near("C.x", cP.x, -5.0f, 1e-5f);             near("C.z", cP.z, 0.0f, 1e-5f);
+        near("K.x", kP.x, 1.48125f, 1e-4f);          near("K.v.x", kV.x, 3.0f, 1e-4f);
+        near("K.y", kP.y, yEnd, 2e-3f);
+        near("F.z", fP.z, 0.2520833f, 5e-5f);        near("F.v.z", fV.z, 1.0f, 1e-4f);
+        near("F.y", fP.y, yEnd, 2e-3f);
+        near("S.w.y", sW.y, 3.0f, 1e-4f);            near("S.w.x", sW.x, 0.0f, 1e-5f);
+        near("S.w.z", sW.z, 0.0f, 1e-5f);
+        near("S.q.y", std::fabs(sQ.y), 0.6747493f, 1e-4f);
+        near("S.q.w", std::fabs(sQ.w), 0.7380470f, 1e-4f);
+        // D: the GPU (CUDA) semantics -- gravity once an acceleration opens the gate.
+        const float dyEnd = 100.0f - 0.002725f * 453.75f;  // g dt^2 (30*29/2 + 30*0.625) = 98.7635313
+        if (!cpuControl)
+        {
+            near("D.y", dP.y, dyEnd, 2e-3f);         near("D.v.y", dV.y, -4.905f, 1e-3f);
+        }
+        near("D.z", dP.z, 0.2520833f, 5e-5f);
+        // L: smoke + parity only (see the builder): the locks are re-applied after this kernel.
+        near("L.x", lP.x, 20.0f, 1e-6f);             near("L.v.x", lV.x, 0.0f, 1e-6f);
+        near("L.w.y", lW.y, 0.0f, 1e-6f);            near("L.y", lP.y, yEnd, 2e-3f);
+        // J1/J2: the SLAB path (the only bodies with valid solverBodyReferences).
+        near("J1.y", j1P.y, yEnd, 2e-3f);            near("J2.y", j2P.y, yEnd, 2e-3f);
+        near("J1.v.y", j1V.y, -9.81f, 2e-3f);        near("J2.v.y", j2V.y, -9.81f, 2e-3f);
+        near("|J1.y-J2.y|", std::fabs(j1P.y - j2P.y), 0.0f, 1e-4f);
+        // The fillers fall like C (and keep the island on the per-partition path).
+        float fillerDev = 0.0f;
+        for (PxRigidDynamic* b : gs.fillers)
+            fillerDev = std::max(fillerDev, std::fabs(b->getGlobalPose().p.y - cP.y));
+        std::printf("  %zu fillers: max |y - C.y| = %.6f\n", gs.fillers.size(), fillerDev);
+        near("max |filler.y - C.y|", fillerDev, 0.0f, 1e-4f);
+        int asleep = 0;
+        for (PxRigidDynamic* b : { es.K, es.F, es.S, es.C, gs.D, gs.L, gs.J1, gs.J2 })
+            asleep += b->isSleeping() ? 1 : 0;
+        for (PxRigidDynamic* b : gs.fillers)
+            asleep += b->isSleeping() ? 1 : 0;
+        std::printf("  %d of %zu bodies asleep\n", asleep, 8 + gs.fillers.size());
+        if (asleep) { std::printf("FAIL: %d bod(ies) fell asleep (sleep threshold 0 must keep them awake)\n", asleep); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (cpuControl)
+        {
+            std::printf("  [ control ] D: CPU y=%.6f v.y=%.6f vs GPU %.7f / -4.905 -- upstream applyAcceleration "
+                        "ignores disableGravity (solverMultiBlockTGS.cu:1575-1583,1656; DyTGSDynamics.cpp:1490-1493)\n",
+                        dP.y, dV.y, dyEnd);
+            std::printf("[ control ] gpu-sdk-step: substepgravity CPU control run (%d check(s) failed), not scored\n",
+                        failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: gravity and forces applied per substep: C fell to %.4f, K moved "
+                        "%.5f, D (gravity disabled) fell to %.4f, J pair at %.4f\n", cP.y, kP.x, dP.y, j1P.y);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'substepgravity': %d check(s) failed\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "directapiwrite"))
     {
         DirectApiWriteScene ws = buildDirectApiWriteScene(physics, scene, material);
@@ -10059,6 +10299,7 @@ int main()
                        "          aggregate                               (P9.92: PxAggregate self / actor / aggregate pairs)\n"
                        "          directapiwrite                          (P9.93: direct-API setters + acceleration getters)\n"
                        "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
+                       "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

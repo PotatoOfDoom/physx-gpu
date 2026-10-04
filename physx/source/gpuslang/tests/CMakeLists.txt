@@ -289,10 +289,12 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # P9.90: the TGS substep gravity kernel.  applyAcceleration's sqrtInvInertia.getInverse()
     # (solverMultiBlockTGS.cu:1592) takes the determinant column0.dot(column1.cross(column2))
     # (PxMat33.h:247), a PxVec3 dot (x + y) + z; unstamped, llvmpipe summed the port's OpDot
-    # x + (y + z) and 1/det shifted every angular-acceleration lane.  The shader imports no
-    # module and no other kernel is compared against it.  testSolverApplyGravityTGS
-    # solverApplyGravityTGS_p90DotOrder compares the velocity buffer bitwise and fails
-    # without this entry.
+    # x + (y + z) and 1/det shifted every angular-acceleration lane.  No other kernel is
+    # compared against it.  testSolverApplyGravityTGS solverApplyGravityTGS_p90DotOrder
+    # compares the velocity buffer bitwise and fails without this entry.  P9.95: rewritten
+    # on the engine ABI; the shader now imports pxgSlangCommon / pxgSlangSolverDesc (layout
+    # mirrors and an integer node-index helper, no float math), spells the determinant dot
+    # out explicitly as (x + y) + z, and every fixture in the file is bitwise.
     solverApplyGravityTGS
     # P9.90: the CPU->GPU body mirror, stamped for consistency.  Its only float math is
     # updateBodiesLaunchDirectAPI's body2World recompute (PxAlignedQuat rotate/rotateInv

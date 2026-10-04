@@ -8,6 +8,13 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95a: liveness audit of the 23 remaining kernels -- 6 reachable, 17 not (13 mapped-unwired scan/
+radix/skinning kernels exist only behind the PhysicsGpu factory this build does not compile;
+reorderKernel has no caller even upstream; the 4 documented dead ones re-verified).
+applyTGSSubstepGravity on the engine ABI (KNOWN_UNWIRED 14 -> 13), 6 bitwise engine-ABI fixtures,
+PXG_SCENE=substepgravity (>640 body-slabs to force the per-partition path).  Pack checker learns
+PxVec3: 281 checked, KNOWN_UNDECIDED 40 -> 29.  Upstream candidate: disableGravity ignored once a
+body has an external acceleration.  Scenes 65/65.
 P9.94d (C+D): the remaining inverse-rotation sites spell the CUDA (triPlaneNpBda with its first
 engine-ABI fixture, npCvxPlaneNphase, npCvxStage2Core, pxgSlangTriTriOverlap, cvxCoreCloth/Tet,
 npCvxTriNpSetup, npCvxHfNpSetup, softBodySdfMidphaseBda getInverse); the cloth convex-core barycentric
@@ -2109,6 +2116,54 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95a — Lebendigkeits-Audit der letzten 23 Kernel; `applyTGSSubstepGravity` auf dem Engine-ABI
+
+**Lebendigkeit zuerst.** Ein Workflow hat die 23 noch nicht laufenden Kernel in neun Gruppen
+erfasst. Für jeden prüfte ein zweiter Agent gezielt, ob das Urteil (erreichbar / unerreichbar) zu
+widerlegen ist. Alle Urteile hielten:
+
+| Gruppe | Kernel | Urteil |
+|---|---|---|
+| Scan/Radix | scanPerBlockKernel(4x4), addBlockSumsKernel(4x4), radixFourBitCount/Reorder, reorderKernel, interleaveBuffers | unerreichbar: Die Besitzer (`PxGpuScan`/`PxGpuRadixSort` in SDF-Builder, Isosurface, Sparse-Grid; `PxgArrayConverter`) entstehen nur über die PhysicsGpu-Factory. `PxgPhysXGpu.cpp` wird nicht kompiliert, `PxGpu.cpp` ist nicht gelinkt, die Bridge liefert NULL. `reorderKernel` ruft auch upstream niemand auf. |
+| Skinning | interpolateSkinnedCloth/SoftBodyVertices, normalVectorsAreaWeighted, normalizeNormals, zeroNormals | unerreichbar: `PxgDeformableSkinning`, ebenfalls nur über die Factory (nicht `PxgArrayConverter`, wie der Checker-Kommentar behauptete) |
+| bekannt tot | trimeshHeightfieldNarrowphase, sb_plasticDeformLaunch(2), copyUserData | erneut bestätigt |
+| erreichbar | applyTGSSubstepGravity, evaluatePointDistancesSDFBatch, sb_copyOrApplySoftBodyDataDEPRECATED, sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch, applyParticleBufferDataDEPRECATED, mergeTransformCacheAndBoundArrayChanges | je ein Plan mit Review; Tranchen P9.95a–f |
+
+Die 13 unerreichbaren Kernel zu verdrahten wäre Manifest-Theater. Die Kommentare in
+`check_launch_abi.py` sind korrigiert. Als Upstream-Kandidat notiert (nicht gemeldet):
+`PxGpuRadixSort` schreibt bei Kapazität ≤ 512 hinter seinen Temp-Puffer.
+
+**`applyTGSSubstepGravity`** (solverMultiBlockTGS.cu:1575-1683) läuft jetzt auf dem Engine-ABI:
+- Push-Block 32 B (zwei Zeiger + PxVec3) und die ABI-Zeile `{8,8,12}`.
+- Der Shader ist wörtlich übertragen: `PxMat33::getInverse`, gesperrte Achsen als Select auf +0,
+  das `TxI`-Lesen nur unter `hasAngularAcceleration`, Slab-Index und Winkelgeschwindigkeits-Offsets.
+- **Fixture:** `testSolverApplyGravityTGS.cpp` ist neu geschrieben, mit 6 bitweisen Engine-ABI-Tests
+  (`engineAbi`, `engineSlabCoverage`, `engineAccelZeroNaN`, `engineDisableGravityQuirk` sowie die
+  übernommenen `applySingularInertiaZeroSign`/`p90DotOrder`). Das Orakel ist eine wörtliche Kopie
+  der CUDA über das echte `PxMat33`. Guard-Zonen umgeben den Pool, und alle Eingaben werden auf
+  Unverändertheit geprüft. Nach der Gegenprüfung kamen Lanes mit negativer und mit NaN-Determinante
+  dazu (sie töten `det > 0`).
+- **Sweeps:** Fixture 37 Mutanten, alle getötet (2 durch Fault). Szene S1–S4 getötet.
+- **Szene `PXG_SCENE=substepgravity`:** Unter 640 Body-Slabs löst `solveWholeIslandTGS` die Insel
+  und liest nur die akkumulierte Geschwindigkeit. Dort konnte der Mutant, der die Slab-Schreibzugriffe
+  weglässt, nicht sterben. Deshalb stehen 640 Füllkörper weit abseits; damit läuft der
+  Pro-Partition-Pfad, und der Mutant ist getötet.
+- **Last tragend:** Normal sind es 240 Starts und keine Ablehnung (C.y 95.0746). Ohne ABI-Zeile gibt
+  es 240 Ablehnungen, 19 Prüfungen schlagen fehl, und alle Körper schweben bei y = 100.
+
+**Upstream-Kandidat (dokumentiert, nicht gemeldet):** Auf der GPU erhält ein Körper mit
+`disableGravity` trotzdem Schwerkraft, sobald er eine äußere Beschleunigung hat: `applyAcceleration`
+liest das Flag nie (Gate bei :1656). Die CPU nullt die Schwerkraft (DyTGSDynamics.cpp:1490-1493).
+Körper D: GPU 98.7635, CPU 100. Der Port bildet die CUDA absichtlich nach.
+
+**Checker:**
+- KNOWN_UNWIRED 14 → 13.
+- Der Pack-Checker kennt jetzt `PxVec3: 12`: 281 Kernel geprüft, KNOWN_UNDECIDED 40 → 29 (11 weitere
+  entschieden, alle passend). Er vergleicht weiterhin nur die Blob-Summe.
+- Drei Foldscan-Einträge sind neu verschlüsselt, UNREVIEWED 0.
+
+**Suite:** 883/883 in beiden Speichermodi. **Szenen:** 65/65.
 
 ## P9.94d (Teil 2) — Die restlichen Stellen der npAbi-Familie, die Cloth-Baryzentrik und die Fixture-Zwillinge; Audit 2 abgeschlossen
 

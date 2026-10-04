@@ -130,6 +130,12 @@ static const uint8_t kInitStaticKin[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
 // gpusolver TGS kernels taking (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*)
 static const uint8_t kTwoPtr[] = { 8, 8 };
 
+// solverMultiBlockTGS.cu:1608 applyTGSSubstepGravity(const PxgSolverCoreDesc*,
+//   const PxgSolverSharedDesc<IterativeSolveDataTGS>*, PxVec3 gravity) -- PxVec3 BY VALUE = 12.
+// Host pack PxgTGSCudaSolverCore.cpp:1362-1367 {mSolverCoreDescd, mSharedDescd, gravity}:
+// ptr @0, ptr @8, 12 bytes @16 -> 28, rounded to the 8-byte max alignment = 32.  (P9.95)
+static const uint8_t kTwoPtrVec3[] = { 8, 8, 12 };
+
 // gpusimulationcontroller/src/CUDA/particlesystem.cu:5121 (P9.80):
 //   ps_solveShapes(PxgParticleSystem*, const PxU32* activeParticleSystems,
 //                  const PxReal dt, const PxReal biasCoefficient)
@@ -1750,6 +1756,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ZeroBodiesTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "initializeSolverVelocitiesTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "computeAverageSolverBodyVelocityTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "applyTGSSubstepGravity", kTwoPtrVec3, uint32_t(sizeof(kTwoPtrVec3)) },
     { "propagateAverageSolverBodyVelocityTGS", kPropagateAvg, uint32_t(sizeof(kPropagateAvg)) },
     { "writeBackBodiesTGS", kWriteBackTGS, uint32_t(sizeof(kWriteBackTGS)) },
     { "solveWholeIslandTGS", kSolveWholeIslandTGS, uint32_t(sizeof(kSolveWholeIslandTGS)) },

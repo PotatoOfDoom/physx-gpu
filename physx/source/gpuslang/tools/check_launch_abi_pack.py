@@ -145,9 +145,10 @@ ENGINE_DIRS = [
 
 # Kernels whose pack this checker cannot yet decide.  RATCHET: may shrink, never
 # grow.  Being on this list is NOT a clean bill -- it is a recorded blind spot,
-# and the honest state of the tree is that 40 of the kernels with an ABI row have
+# and the honest state of the tree is that 29 of the kernels with an ABI row have
 # one (101 before P9.83a-6 taught the resolver function scope; 37 before P9.93
-# made three more kernels VISIBLE -- see the note at the end of the set).
+# made three more kernels VISIBLE; 40 before P9.95 taught SIZES PxVec3 -- see the
+# notes at the end of the set).
 #
 # THE REASONS, in the order they will be worth attacking:
 #   * a struct passed BY VALUE whose size this table does not know (the
@@ -169,8 +170,9 @@ ENGINE_DIRS = [
 #     the real step is FUNCTION scope, not a bigger type table -- and doing it
 #     without that scoping would make the checker confidently wrong, which is the
 #     one outcome worse than undecided.
-#   * PxVec3 / PxQuat / PxTransform arguments passed by reference, whose sizeof is
-#     the referent's.
+#   * PxQuat / PxTransform arguments passed by reference, whose sizeof is the
+#     referent's.  (PxVec3 is decided since P9.95: SIZES knows it is 12, by value
+#     and as the referent of a reference alike.)
 #   * the void** launch form (PX_CUDA_KERNEL_PARAM2), which carries no per-argument
 #     sizes at all -- the bridge reads them from this very table, so there is
 #     nothing independent to compare against and these can never be decided here.
@@ -188,25 +190,15 @@ KNOWN_UNDECIDED = {
     "cloth_meshContactGenLaunch",
     "cloth_meshVertexContactGenLaunch",
     "cloth_planeVertContactGenLaunch",
-    "cloth_preIntegrateLaunch",
     "cloth_psContactGenLaunch",
     "cloth_sdfMeshContactGenLaunch",
-    "cloth_stepLaunch",
-    "preIntegrationLaunch",
-    "preIntegrationLaunchTGS",
     "prepareLostFoundPairs_Stage2",
-    "ps_diffuseParticleCompact",
-    "ps_diffuseParticleUpdatePBF",
     "ps_heightfieldCollisonLaunch",
     "ps_meshCollisonLaunch",
-    "ps_preDiffuseIntegrateLaunch",
-    "ps_preIntegrateLaunch",
     "ps_primitivesCollisionLaunch",
     "ps_sdfMeshCollisonLaunch",
     "sb_clothContactGenLaunch",
     "sb_clothVertContactGenLaunch",
-    "sb_gm_preIntegrateLaunch",
-    "sb_gm_stepSoftbodyLaunch",
     "sb_heightfieldContactGenLaunch",
     "sb_meshContactGenLaunch",
     "sb_primitiveContactGenLaunch",
@@ -227,9 +219,19 @@ KNOWN_UNDECIDED = {
     #   ps_stepParticlesLaunch             PxgParticleSystemCore.cpp:2460 --
     #     `mGravity`, a PxVec3 CLASS MEMBER (PxgParticleSystemCore.h:292) passed by
     #     value; pack {8,8,4,4,1,1,1,12} == kPsStepParticles.
+    #     (P9.95: decided now -- "PxVec3": 12 in SIZES -- and off this list.)
     "convexCoreTetmeshNphase_Kernel32",
     "convexCoreClothmeshNphase_Kernel32",
-    "ps_stepParticlesLaunch",
+    # P9.95 taught SIZES "PxVec3": 12 when wiring applyTGSSubstepGravity, whose pack
+    # pushes `gravity`, the `const PxVec3&` PARAMETER of solveContactMultiBlockParallel
+    # (PxgTGSCudaSolverCore.cpp:1254, :1362-1367) -> {8,8,12} == kTwoPtrVec3.  That
+    # also decided ELEVEN kernels that were on this list, every one of them in
+    # AGREEMENT with its row: cloth_preIntegrateLaunch, cloth_stepLaunch,
+    # preIntegrationLaunch, preIntegrationLaunchTGS, ps_diffuseParticleCompact,
+    # ps_diffuseParticleUpdatePBF, ps_preDiffuseIntegrateLaunch,
+    # ps_preIntegrateLaunch, ps_stepParticlesLaunch, sb_gm_preIntegrateLaunch and
+    # sb_gm_stepSoftbodyLaunch.  Checked 269 -> 281 (those eleven + the new row),
+    # KNOWN_UNDECIDED 40 -> 29.
 }
 
 
@@ -243,6 +245,8 @@ SIZES = {
     "PxU64": 8, "PxI64": 8, "uint64_t": 8, "int64_t": 8, "size_t": 8,
     "PxU32": 4, "PxI32": 4, "uint32_t": 4, "int32_t": 4, "PxReal": 4,
     "float": 4, "int": 4, "unsigned": 4, "PxU16": 2, "PxU8": 1, "bool": 1,
+    # P9.95: three floats, align 4 -- unambiguous by value and as a referent
+    "PxVec3": 12,
 }
 
 
@@ -260,8 +264,9 @@ def arg_size(decl_type):
     # made preIntegrationLaunch look 8 bytes short -- a kernel that, were it
     # really refused, would leave every rigid body un-integrated and every one of
     # the 48 scenes failing.  That control is what exposed it.  A reference now
-    # resolves to its REFERENT, which for PxVec3 is not in this table, so the
-    # kernel becomes UNDECIDED instead of falsely accused.
+    # resolves to its REFERENT, so the kernel is sized by sizeof(PxVec3) == 12
+    # (in SIZES since P9.95; before that it was UNDECIDED instead of falsely
+    # accused) -- and preIntegrationLaunch now decides, in agreement with its row.
     if t.endswith("*"):
         return PTR8
     if t.endswith("&"):

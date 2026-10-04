@@ -74,14 +74,30 @@ KNOWN_UNWIRED = {
     # radixSortCopy2: PxgGpuNarrowphaseCore::computeRigidsToShapes() is their only
     # caller and it runs only under the direct-GPU API, so PXG_SCENE=directapi is
     # what finally launched them (and found them refused).
-    "applyTGSSubstepGravity",
+    # (P9.95 wired applyTGSSubstepGravity behind PXG_SCENE=substepgravity,
+    # eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS.)
     # (P9.92 wired the aggregate broadphase -- all fourteen kernels of aggregate.cu --
     # behind PXG_SCENE=aggregate.)
-    # generic scan / radix utilities the engine drives through its own launchers
+    #
+    # The thirteen below are UNREACHABLE in this build (P9.95 scope): every one of
+    # them is launched only by an object that the PhysicsGpu factory constructs
+    # (physxgpu/src/PxgPhysXGpu.cpp), and this build does not compile that factory --
+    # PxgPhysXGpu.cpp is not in the sdktest glob, PxGetPhysicsGpu() stays NULL without
+    # libcuda, and the bridge's PxGpuCreatePhysicsGpu() returns NULL.  They are also
+    # binding-only ports, so an ABI row alone would not make them run.
+    #
+    # Generic scan / radix utilities: PxGpuScan and PxGpuRadixSort<PxU32>
+    # (gpusimulationcontroller/src/PxgAlgorithms.cpp), owned only by the factory's
+    # SDF builder, particle neighborhood provider and isosurface extractors.
+    # reorderKernel's launcher (reorderLaunch, PxgAlgorithms.cpp:95) has no caller
+    # even upstream.  interleaveBuffers is launched only by PxgArrayConverter
+    # (PxgArrayConverter.cpp:57), factory-only (PxgPhysXGpu.cpp:458).
     "scanPerBlockKernel", "scanPerBlockKernel4x4", "addBlockSumsKernel",
     "addBlockSumsKernel4x4", "radixFourBitCountPerBlockKernel",
     "radixFourBitReorderKernel", "reorderKernel", "interleaveBuffers",
-    # deformable skinning / normal generation (the PxgArrayConverter path)
+    # Deformable skinning / normal generation: launched by PxgDeformableSkinning
+    # (PxgDeformableSkinning.cpp:59-87), not PxgArrayConverter; its only
+    # construction site is the factory (PxgPhysXGpu.cpp:472).
     "interpolateSkinnedClothVertices", "interpolateSkinnedSoftBodyVertices",
     "normalVectorsAreaWeighted", "normalizeNormals", "zeroNormals",
 }

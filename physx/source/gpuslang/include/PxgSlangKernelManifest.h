@@ -183,7 +183,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "contactConstraintBlockPrepareParallelLaunchTGS", "constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS" },  // TGS_CONTACT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "propagateAverageSolverBodyVelocityTGS", "solverTGS.spv", "propagateAverageSolverBodyVelocityTGS" },  // PROPAGATE_AVERAGE_VELOCITY_TGS
     { "propagateStaticSolverBodyVelocitiesTGS", "solverTGS.spv", "propagateStaticSolverBodyVelocitiesTGS" },  // PROPAGATE_STATIC_SOLVER_VELOCITIES_TGS
-    { "applyTGSSubstepGravity", "solverApplyGravityTGS.spv", "applyTGSSubstepGravity" },  // APPLY_TGS_SUBSTEP_GRAVITY
+    { "applyTGSSubstepGravity", "solverApplyGravityTGS.spv", "applyTGSSubstepGravity" },  // APPLY_TGS_SUBSTEP_GRAVITY (P9.95: engine ABI)
     { "markActiveSlabPGS", "solverPGS.spv", "markActiveSlabPGS" },  // MARK_ACTIVE_SLAB_PGS (P5 Step 5 BDA port)
     { "markActiveSlabTGS", "solverTGS.spv", "markActiveSlabTGS" },  // MARK_ACTIVE_SLAB_TGS (P5 Step 5 BDA port)
     { "radixSortMultiBlockLaunch", "radixSortDesc.spv", "radixSortMultiBlockLaunch" },  // RS_MULTIBLOCK (P6.4b-1 BDA port: numKeys from *desc.numKeys)

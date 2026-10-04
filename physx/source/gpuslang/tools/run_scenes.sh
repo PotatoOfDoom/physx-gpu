@@ -98,7 +98,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate directapiwrite extforce"
+        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity"
 
 pass=0; fail=0; missing=0
 
@@ -184,6 +184,10 @@ run_one "forcethreshold (PGS)" PXG_SCENE=forcethreshold PXG_SOLVER=pgs
 run_one "directapi (PGS)" PXG_SCENE=directapi PXG_SOLVER=pgs
 run_one "directapiwrite (PGS)" PXG_SCENE=directapiwrite PXG_SOLVER=pgs
 run_one "extforce (PGS)" PXG_SCENE=extforce PXG_SOLVER=pgs
+# P9.95: substepgravity (applyTGSSubstepGravity) has NO PGS row, deliberately: the
+# kernel is launched only by PxgTGSCudaSolverCore, and its scene flag
+# eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is rejected with PGS by
+# PxSceneDesc::isValid (PxSceneDesc.h:1129), so the scene refuses PXG_SOLVER=pgs.
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"

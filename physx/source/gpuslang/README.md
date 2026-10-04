@@ -32,7 +32,7 @@ gpuslang/
 │   ├── solverTGS.slang              TGS solver: iteration, conclude, writeback, averaging
 │   ├── solverZeroBodies.slang       pre-solve body-velocity reset (PGS + TGS)
 │   ├── solverInitVelocitiesTGS.slang TGS pre-solve velocity seeding (slab scatter)
-│   ├── solverApplyGravityTGS.slang   TGS substep gravity + external accel (lock flags, inertia)
+│   ├── solverApplyGravityTGS.slang   TGS substep gravity + external accel (lock flags, inertia), engine ABI (P9.95)
 │   ├── solverDmaBack.slang           force-change elem DMA-back + constraint residual gather
 │   ├── npPairManagement.slang        narrow-phase sparse-remove keep/drop core + manifold init
 │   ├── npPairRemoveSwap.slang        narrow-phase sparse-remove Stage5 data swap (+ CvxTri)

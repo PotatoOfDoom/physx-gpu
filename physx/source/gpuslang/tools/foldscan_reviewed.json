@@ -5274,30 +5274,30 @@
 },
 {
 "file": "solverApplyGravityTGS.slang",
-"code": "v.x += accelScale * gravityTimesDt.x + linAccel.x * stepDt;",
+"code": "v.x += accelScale * gravityTimesDt.x + linearAcceleration.x * stepDt;",
 "kinds": [
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "v is loaded from gBodyVelocities and the addend is computed from loaded push/body data; the zeroOrigins are the lock selects that run AFTER the add. Both call sites pass runtime values, no literal constant argument."
+"why": "P9.95a: engine-ABI rewrite of this site (was linAccel). v is loaded from the solver body-velocity pool (bodyVelocities[bodyIndex]) and the addend accelScale * gravityTimesDt.c + linearAcceleration.c * stepDt is computed from loaded PxgBodySim / shared-desc / push data; the flagged zeroOrigins (:158-160, :171-173) are the lock selects that run AFTER the add. Both applyAcceleration call sites pass runtime values, no literal constant argument. Same as the CUDA (solverMultiBlockTGS.cu:1580-1582); fixture-verified bitwise."
 },
 {
 "file": "solverApplyGravityTGS.slang",
-"code": "v.y += accelScale * gravityTimesDt.y + linAccel.y * stepDt;",
+"code": "v.y += accelScale * gravityTimesDt.y + linearAcceleration.y * stepDt;",
 "kinds": [
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "As 136."
+"why": "P9.95a: engine-ABI rewrite of this site (was linAccel). v is loaded from the solver body-velocity pool (bodyVelocities[bodyIndex]) and the addend accelScale * gravityTimesDt.c + linearAcceleration.c * stepDt is computed from loaded PxgBodySim / shared-desc / push data; the flagged zeroOrigins (:158-160, :171-173) are the lock selects that run AFTER the add. Both applyAcceleration call sites pass runtime values, no literal constant argument. Same as the CUDA (solverMultiBlockTGS.cu:1580-1582); fixture-verified bitwise."
 },
 {
 "file": "solverApplyGravityTGS.slang",
-"code": "v.z += accelScale * gravityTimesDt.z + linAccel.z * stepDt;",
+"code": "v.z += accelScale * gravityTimesDt.z + linearAcceleration.z * stepDt;",
 "kinds": [
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "As 136."
+"why": "P9.95a: engine-ABI rewrite of this site (was linAccel). v is loaded from the solver body-velocity pool (bodyVelocities[bodyIndex]) and the addend accelScale * gravityTimesDt.c + linearAcceleration.c * stepDt is computed from loaded PxgBodySim / shared-desc / push data; the flagged zeroOrigins (:158-160, :171-173) are the lock selects that run AFTER the add. Both applyAcceleration call sites pass runtime values, no literal constant argument. Same as the CUDA (solverMultiBlockTGS.cu:1580-1582); fixture-verified bitwise."
 },
 {
 "file": "solverApplyGravityTGS.slang",
@@ -5306,7 +5306,7 @@
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "v.w loaded; angAcc computed by invInertiaMul from loaded data; lock selects come after."
+"why": "P9.95a: engine-ABI rewrite (same code text). v.w / a are loaded from the pool; angAcc comes from mat33InverseTransform over the loaded sqrtInvInertia and acceleration; the flagged zeroOrigins are the lock selects that run AFTER the add. Same as the CUDA (solverMultiBlockTGS.cu:1594-1596)."
 },
 {
 "file": "solverApplyGravityTGS.slang",
@@ -5315,7 +5315,7 @@
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "As 149."
+"why": "P9.95a: engine-ABI rewrite (same code text). v.w / a are loaded from the pool; angAcc comes from mat33InverseTransform over the loaded sqrtInvInertia and acceleration; the flagged zeroOrigins are the lock selects that run AFTER the add. Same as the CUDA (solverMultiBlockTGS.cu:1594-1596)."
 },
 {
 "file": "solverApplyGravityTGS.slang",
@@ -5324,7 +5324,7 @@
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "As 149."
+"why": "P9.95a: engine-ABI rewrite (same code text). v.w / a are loaded from the pool; angAcc comes from mat33InverseTransform over the loaded sqrtInvInertia and acceleration; the flagged zeroOrigins are the lock selects that run AFTER the add. Same as the CUDA (solverMultiBlockTGS.cu:1594-1596)."
 },
 {
 "file": "npCvxStage1Refresh.slang",
