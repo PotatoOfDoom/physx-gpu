@@ -8,6 +8,14 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95f: sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch and the hexahedron (voxel) branch of
+sb_gm_cp_solveTetrahedronsPartitionLaunch -- which was a silent no-op -- on the engine ABI via the
+shared sb_gm_cp_solveHexahedronsPartition_parallelGS<bool> (manifest 427 -> 428, engine-reachable
+unmapped 5 -> 4).  12 bitwise hex fixtures, 38/38 mutants; PXG_SCENE=softbodyhex (box + Jacobi
+fork, TGS + PGS): the voxel lattice relaxes to its rest shape (351 distances, <= 3.1e-6).
+P9.95 COMPLETE: every kernel this build can launch is mapped and wired.  What remains unmapped or
+unwired is unreachable here: 4 dead (dead bucket, commented-out caller, dead owner) and 13 behind
+the PhysicsGpu factory this build does not compile.  Scenes 75/75.
 P9.95e: evaluatePointDistancesSDFBatch (convexMeshMidphase.cu:1233-1287, reached through
 PxDirectGPUAPI::evaluateSDFDistances) on the engine ABI (new sdfQueryBda.slang, 48-byte blob;
 manifest 426 -> 427, engine-reachable unmapped 6 -> 5).  New ctest suite sdfQuery (884 tests):
@@ -2136,6 +2144,99 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95f — Voxel-Softbodies: `sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch` und der Hexaeder-Zweig des GS-Kernels; P9.95 abgeschlossen
+
+**Ausgangslage.** Ein Voxel-Softbody (`PxDeformableVolume` mit Hexaeder-Simulationsnetz) wird in
+Partitionen gelöst. Die ersten acht Partitionen löst `sb_gm_cp_solveTetrahedronsPartitionLaunch`
+mit Gauss-Seidel. Die Elemente, die keiner dieser Partitionen zugeordnet werden, löst
+`sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch` nach Jacobi; ihre Deltas wendet
+`applyDeformationDeltas` an.
+- Der Jacobi-Kernel war nicht gemappt.
+- Der Hexaeder-Zweig des GS-Kernels fehlte im Port ganz, ohne Meldung. Gemessen an HEAD: Das
+  Voxelgitter blieb bitgleich bei der Startstreckung 1.60000.
+
+**Port** (softBodyGM.cu:1044-1046, 1149-1213, 1313-1507): ein gemeinsamer Helfer
+`sb_gm_cp_solveHexahedronsPartition_parallelGS<bool>` mit zwei Aufrufern.
+- Die Tabellen sind zeilenweise übernommen: 10 Zeilen tets5, 6 Zeilen tets6, mit Flip-Offset und
+  der Zeile `(4i + offset)/4`, die wie in der .cu auch auf die 6-Tet-Tabelle wirkt. Masken,
+  `nbElements` und Slot `w + nbElements·i` folgen der CUDA.
+- Der q-Startwert wird links-assoziativ getestet. Die Rotation wird vor dem frühen Return
+  gespeichert. `sum = (c0 + c1) + c2`.
+- GS-Ende: deltaPos, dann pos, dann vel, mit frischem Positions-Load. Jacobi-Ende: frischer Load und
+  vier Atomics, w += 1.
+- Ein im Plan vorgesehener Select auf `deltaPos.w` ist entfernt. Der Summand ist ein Laufzeitwert
+  (+0 oder NaN, nie ein Literal), ein −0-Ergebnis kann nicht entstehen. Das schlichte `+=` stimmt
+  deshalb bitgenau mit der CUDA überein; der Mutant „Select weglassen“ hatte das gezeigt.
+- Alle Lane-Loads laufen über einen geklemmten Index (Speculation). Das frühe Return im
+  Jacobi-Kernel ist für die ganze Workgroup gleich.
+- ABI-Zeile `{8,8,4,4,1,8}` (40 B), vom Pack-Checker aus PxgSoftBodyCore.cpp:1234 selbst abgeleitet.
+  Manifest 427 → 428, `engine_reachable_unmapped.txt` 5 → 4, Zeile in `push_block_known.txt`.
+
+**Fixtures:** 12 Tests `softBodySimHex*` bitweise gegen ein wörtliches Host-Orakel; die
+softBodySim-Suite hat jetzt 96 Tests.
+- Zwei Testentwürfe aus dem abgebrochenen ersten Lauf waren falsch angelegt:
+  - Bei 1.9 rad ist die Rotationsextraktion mit 4 Iterationen schlecht konditioniert; schon im
+    Host-Orakel verschob ein ULP Eingabe die Ausgabe um bis zu 127 %. Der Fall läuft jetzt mit
+    0.5 rad, bitgenau.
+  - Der „hat gearbeitet“-Test verglich Rotationen, die vorher wie nachher die Identität sind. Er
+    prüft jetzt die Multiplikatoren.
+- `softBodySimHexGS5TGS` ist neu, denn ohne ihn wäre ein abgeschaltetes `isTGS` unbemerkt geblieben.
+- Nach der Gegenprüfung kam eine nicht-triviale `mInitialRotation` (1,0,0,0) dazu. Sie tötet eine
+  vertauschte Komponentenreihenfolge.
+
+**Sweeps.**
+- Fixture: 38 Mutanten, 36 getötet, 2 durch Fault getötet (echte Out-of-Bounds-Lesezugriffe nur
+  der Mutanten).
+- GS-Einstieg: 4/4 getötet.
+- Szene: AB2, S1 und S4 (zwei Ecken einer Tabellenzeile vertauscht) getötet. Die beiden
+  Überlebenden sind als äquivalent begründet:
+  - S2 (Jacobi schreibt die Positionen direkt): Bei einem Jacobi-Voxel ist die Skalierung 1.0.
+    Der gleiche Fixture-Mutant m22 wird getötet.
+  - S3 (Flip-Offset 20 → 0): Jede nicht gespiegelte Untertet-Zeile ist eine eigentliche Drehung
+    ihres gespiegelten Gegenstücks (exakt nachgerechnet), und isotrope Materialien sind dagegen
+    invariant. Der gleiche Fixture-Mutant m01 wird getötet.
+
+**Szene `PXG_SCENE=softbodyhex`** (Box- und Fork-Arm mit einem Jacobi-Zwillingsvoxel; TGS und PGS):
+
+| Arm | Gitter (Start 1.60000) | Zwilling / Original |
+|---|---|---|
+| Box TGS | 1.00669 | – |
+| Box PGS | 1.00713 | – |
+| Fork TGS | 1.03469 | 0.50990 / 0.50990 |
+| Fork PGS | 1.03320 | 0.51004 / 0.51004 |
+
+- Prüfung (f): Das Gitter kehrt in seine Ruheform zurück, gemessen über alle 351 Punktabstände
+  (höchstens 3.1e-6). Die y-Ausdehnung ist nicht 1.0, weil der Körper am Ende leicht gedreht
+  liegt.
+- Ohne Manifest-Zeile (AB1) bleibt der Zwilling bitgleich auf der Startpose.
+- Prüfung (e) aus dem Plan (der Box-Arm startet weder Jacobi noch applyDeformationDeltas) ist nicht
+  in der Szene geprüft, denn die Harness zählt nur ungemappte Starts. Getraced: Fork 4800/600/600,
+  Box 4800/0/0.
+- **Drift des Schwerpunkts, Toleranz 2.5e-2:** gemessen 2.2e-3 (TGS) bzw. 6.7e-4 (PGS) mit der
+  Standard-Dämpfung. Ohne Settling sinkt PGS auf 2.9e-6, der Hex-Solve erhält also den Impuls.
+  Laut Code (nicht als Ursache gemessen) schaltet TGS `alwaysRunVelocityAveraging` ein, und
+  `sb_gm_finalizeVelocitiesLaunch` mischt die Geschwindigkeiten pro Vertex. Das ist nicht
+  impulserhaltend und passt zur reinen TGS-Drift.
+- Der Tet-Pfad ist unverändert: Der Shader von HEAD und der neue liefern auf Tet-Szenen identische
+  Ausgaben.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+- Der Jacobi-Kernel hat nach seinem `blockCopy` keine Barriere (softBodyGM.cu:1478).
+- Der Cooker übernimmt die Voxelbreite von Vertex 0, und seine Umorientierung zerstört die
+  Rekonstruktion der Hex-Ecken.
+- Ein Jacobi-Voxel, der unter großer Drehung entsteht, bekommt nur 4 Rotationsiterationen; das ist
+  der oben gemessene schlecht konditionierte Bereich.
+
+**P9.95 ist damit abgeschlossen.** Jeder Kernel, den dieser Build starten kann, ist jetzt gemappt und
+verdrahtet. Von den 23 Kerneln, die vor P9.95 offen waren, sind 6 portiert (P9.95a–f). Die übrigen 17
+sind hier nicht erreichbar:
+- 4 sind tot: `trimeshHeightfieldNarrowphase` (Bucket wird nie erzeugt), `sb_plasticDeformLaunch(2)`
+  (einziger Aufruf auskommentiert), `copyUserData` (Besitzer nie konstruiert);
+- 13 hängen an der PhysicsGpu-Factory, die dieser Build nicht kompiliert (Scan/Radix, Skinning).
+
+**Foldscan:** UNREVIEWED 0 (neue Stelle `sum` als BENIGN eingetragen). **Checker:** alle grün.
+**Suite:** 884/884 in beiden Speichermodi. **Szenen:** 75/75.
 
 ## P9.95e — `evaluatePointDistancesSDFBatch`: SDF-Abstandsabfragen über `PxDirectGPUAPI::evaluateSDFDistances`
 

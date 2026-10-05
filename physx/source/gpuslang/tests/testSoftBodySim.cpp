@@ -40,6 +40,8 @@
 //   softBodySimPreIntegrateTGS   — sb_gm_preIntegrateLaunch TGS branch (vel + zero posDelta)
 //   softBodySimCopy*             — P9.95: sb_copyOrApplySoftBodyDataDEPRECATED through the
 //                                  ENGINE launch path (section at the end of the file)
+//   softBodySimHex*              — P9.95f: the hexahedral (voxel) solve -- the Jacobi
+//                                  partition entry and the GS entry's hex branch
 
 #include "pxgTestFramework.h"
 // P9.81: the heightfield decoders (Hf / buildHf / getTriangleNoAdj), so the step-2
@@ -2530,6 +2532,1165 @@ PXG_TEST(softBodySimSolveCorotationalRestZeroSign)
     dev->destroyBuffer(bRest.h); dev->destroyBuffer(bRot.h); dev->destroyBuffer(bMult.h);
     dev->destroyBuffer(bMat.h); dev->destroyBuffer(bMatIdx.h); dev->destroyBuffer(bPart.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ===========================================================================
+// P9.95f — the HEXAHEDRAL (voxel) solve: sb_gm_cp_solveHexahedronsPartition_parallelGS
+// (softBodyGM.cu:1313-1404) through its two callers,
+//   sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch (softBodyGM.cu:1463), the 9th
+//     ("Jacobi") partition: no position/velocity writes, AtomicAdd(mSimDelta, (p-pos, 1));
+//   the hex branch of sb_gm_cp_solveTetrahedronsPartitionLaunch (softBodyGM.cu:1450-1455):
+//     in-place p/v and mSimDeltaPos += p - pos.
+//
+// The oracle (namespace p95hex) is the .cu spelled literally on the host -- F4 p[8], v[8]
+// and the two flat tables are fine here -- reusing the tranche-5/6 transcriptions
+// p80rot::extractRotation and p80solve::solveGM (tetrahedronsSolveGM), under the TU's
+// -ffp-contract=off.
+//
+// BIT-EXACT despite the sin/cos seam, by construction rather than by tolerance:
+//   - rest corners are the unit voxel (x = bit2, y = bit1, z = bit0) and current positions
+//     are diag(s)*rest + t with dyadic s, t, so every sub-tet's F = U*Qinv is EXACTLY
+//     diagonal: extractRotation sees omega == 0, sin(0) == 0, cos(0) == 1, and an identity q
+//     is a bit-exact fixed point for 4 or 100 iterations;
+//   - the sub-tets of a voxel run in sequence on the gathered copies, so a moved corner
+//     would hand the next sub-tet a non-affine F.  Non-zero inverse mass therefore goes only
+//     to corners that belong to EXACTLY ONE sub-tet: {1,7,4,2} non-flipped, {0,6,5,3}
+//     flipped (the central row owns none);
+//   - Jacobi voxels read the unwritten positions, and a vertex shared by two Jacobi voxels
+//     is single-owner in both or massless; no vertex gets more than two Jacobi
+//     contributions, so the atomic order cannot change a bit (0 + a + b == 0 + b + a), and
+//     a non-zero mSimDelta seed sits only on one-contribution vertices;
+//   - the 6-tet table has no single-owner corner (every row holds corners 1 and 6), so 6-tet
+//     voxels get a massless ROUTING tier (bit-exact) and a ULP-BUDGET tier.
+// ===========================================================================
+
+struct SolveTetraJacobiPush
+{
+    uint64_t gSoftbodies, activeSoftbodies;
+    uint32_t numActiveSoftbodies;
+    float invDt;
+    uint32_t flagsWord, pad28;
+    uint64_t materials;
+};
+static_assert(sizeof(SolveTetraJacobiPush) == 40, "solveTetraJacobi push blob must be 40 bytes");
+static_assert(offsetof(SolveTetraJacobiPush, invDt) == 20, "invDt @20");
+static_assert(offsetof(SolveTetraJacobiPush, flagsWord) == 24, "isTGS @24");
+static_assert(offsetof(SolveTetraJacobiPush, pad28) == 28, "pad @28");
+static_assert(offsetof(SolveTetraJacobiPush, materials) == 32, "materials @32");
+
+namespace p95hex
+{
+using p80rot::M3;
+using p80rot::Q4;
+using p80refit::TetIdx4;
+
+// softBodyGM.cu:1209 and :1211-1213, verbatim.
+static const uint32_t tets6PerVoxel[24] = { 0,1,6,2,  0,1,4,6,  1,4,6,5,  1,2,3,6,  1,3,7,6,  1,5,6,7 };
+static const uint32_t tets5PerVoxel[40] = {
+                     0, 6, 3, 5,   0, 1, 5, 3,   6, 7, 3, 5,   4, 5, 6, 0,   2, 3, 0, 6,
+                     1, 7, 4, 2,   1, 0, 2, 4,   7, 6, 4, 2,   5, 4, 1, 7,   3, 2, 7, 1 };
+static const uint32_t PULL_IND_MASK = 0x7fffffffu;
+static const uint32_t FLIPPED_MASK = 0x80000000u;
+// SB_PARTITION_LIMIT (8) comes from PxgSoftBody.h itself.
+static const uint32_t POISON = 0x7F7F7F7Fu;
+static const float SENTINEL = 777.0f;
+static const uint32_t PAD = 64u;
+
+// One softbody's buffers, host side.  Every array is padded, and every padding / untouched
+// slot carries poison, so a stray read or write past the live range shows.
+struct HexBody
+{
+    uint32_t tpe = 5, nbElements = 0, numPartitions = 9;
+    uint8_t bodyFlags = 0;
+    Q4 initialRotation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t nbVerts = 0;                // live vertices; [nbVerts, nbVerts+PAD) are sentinels
+    std::vector<uint32_t> acc;           // mSimAccumulatedPartitionsCP
+    std::vector<TetIdx4> pull;           // mSimPullIndices, 2*nbElements live
+    std::vector<F4> pos, vel, delta, deltaPos, cpPos, cpVel;
+    std::vector<TetIdx4> remap;          // mSimRemapOutputCP (the hex path must not touch it)
+    std::vector<uint32_t> rest;          // mSimTetraRestPoses, PxgMat33Block words
+    std::vector<F4> rot;                 // mSimTetraRotations
+    std::vector<uint32_t> mult;          // mSimTetraMultipliers, PxgSpatialVectorBlock words
+    std::vector<uint16_t> matIdx;        // mOrderedMaterialIndices, preceded by matLead halves
+    uint32_t matLead = 0;                // 1 -> the descriptor points 2 bytes into the buffer
+    uint32_t nbTets() const { return nbElements * tpe; }
+};
+
+static void initBody(HexBody& b, uint32_t tpe, uint32_t nbElements, uint32_t nbVerts)
+{
+    b.tpe = tpe; b.nbElements = nbElements; b.nbVerts = nbVerts;
+    const uint32_t nbTets = tpe * nbElements;
+    const uint32_t nbBlocks = (nbTets + 31u) / 32u + 2u;
+    b.acc.assign(16u, POISON);
+    // padding pull entries point at a sentinel vertex: a mutant that reads past the live
+    // range gathers garbage, not an address fault
+    b.pull.assign(2u * nbElements + PAD, TetIdx4{ nbVerts, nbVerts, nbVerts, nbVerts });
+    const F4 sent = { SENTINEL, SENTINEL, SENTINEL, SENTINEL };
+    b.pos.assign(nbVerts + PAD, sent);
+    b.vel.assign(nbVerts + PAD, sent);
+    b.delta.assign(nbVerts + PAD, F4{ 1234.5f, -1234.5f, 99.0f, 7.0f });
+    b.deltaPos.assign(nbVerts + PAD, F4{ 555.0f, -555.0f, 55.0f, 5.0f });
+    b.cpPos.assign(nbTets * 4u + PAD, sent);
+    b.cpVel.assign(nbTets * 4u + PAD, sent);
+    b.remap.assign(nbTets + PAD, TetIdx4{ POISON, POISON, POISON, POISON });
+    b.rest.assign(nbBlocks * MAT33_BLOCK_WORDS, POISON);
+    b.rot.assign(nbTets + PAD, F4{ u2f(POISON), u2f(POISON), u2f(POISON), u2f(POISON) });
+    b.mult.assign(nbBlocks * SPATIAL_BLOCK_WORDS, POISON);
+    b.matIdx.assign(nbElements + PAD, uint16_t(0u));
+}
+
+static void setRest(HexBody& b, uint32_t slot, const M3& m)
+{
+    const uint32_t base = (slot / 32u) * MAT33_BLOCK_WORDS, lane = slot & 31u;
+    b.rest[base + lane*4+0] = f2u(m.c0[0]); b.rest[base + lane*4+1] = f2u(m.c0[1]);
+    b.rest[base + lane*4+2] = f2u(m.c0[2]); b.rest[base + lane*4+3] = f2u(m.c1[0]);
+    b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+0] = f2u(m.c1[1]);
+    b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+1] = f2u(m.c1[2]);
+    b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+2] = f2u(m.c2[0]);
+    b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+3] = f2u(m.c2[1]);
+    b.rest[base + MAT33_BLOCK_COL2_WORD + lane] = f2u(m.c2[2]);
+}
+
+// loadPxMat33(mSimTetraRestPoses[slot/32], slot&31)
+static M3 getRest(const HexBody& b, uint32_t slot)
+{
+    const uint32_t base = (slot / 32u) * MAT33_BLOCK_WORDS, lane = slot & 31u;
+    M3 m;
+    m.c0[0] = u2f(b.rest[base + lane*4+0]); m.c0[1] = u2f(b.rest[base + lane*4+1]);
+    m.c0[2] = u2f(b.rest[base + lane*4+2]); m.c1[0] = u2f(b.rest[base + lane*4+3]);
+    m.c1[1] = u2f(b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+0]);
+    m.c1[2] = u2f(b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+1]);
+    m.c2[0] = u2f(b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+2]);
+    m.c2[1] = u2f(b.rest[base + MAT33_BLOCK_COL1_WORD + lane*4+3]);
+    m.c2[2] = u2f(b.rest[base + MAT33_BLOCK_COL2_WORD + lane]);
+    return m;
+}
+
+static uint32_t mbyzWord(uint32_t slot) { return (slot / 32u) * SPATIAL_BLOCK_WORDS + SPATIAL_BLOCK_MBYZ_WORD + (slot & 31u) * 2u; }
+
+// The rest-pose inverse of a sub-tet with corners a..d of the unit voxel (x = bit2,
+// y = bit1, z = bit0).  Exact: the entries are multiples of 1/2, +0 never -0.
+static M3 unitRestInverse(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    auto cx = [](uint32_t j) { return double((j >> 2) & 1u); };
+    auto cy = [](uint32_t j) { return double((j >> 1) & 1u); };
+    auto cz = [](uint32_t j) { return double(j & 1u); };
+    const double D[3][3] = { { cx(b)-cx(a), cx(c)-cx(a), cx(d)-cx(a) },
+                             { cy(b)-cy(a), cy(c)-cy(a), cy(d)-cy(a) },
+                             { cz(b)-cz(a), cz(c)-cz(a), cz(d)-cz(a) } };   // columns = edges
+    const double det = D[0][0]*(D[1][1]*D[2][2]-D[1][2]*D[2][1]) - D[0][1]*(D[1][0]*D[2][2]-D[1][2]*D[2][0])
+                     + D[0][2]*(D[1][0]*D[2][1]-D[1][1]*D[2][0]);
+    double inv[3][3];
+    inv[0][0] =  (D[1][1]*D[2][2]-D[1][2]*D[2][1]) / det; inv[0][1] = -(D[0][1]*D[2][2]-D[0][2]*D[2][1]) / det;
+    inv[0][2] =  (D[0][1]*D[1][2]-D[0][2]*D[1][1]) / det; inv[1][0] = -(D[1][0]*D[2][2]-D[1][2]*D[2][0]) / det;
+    inv[1][1] =  (D[0][0]*D[2][2]-D[0][2]*D[2][0]) / det; inv[1][2] = -(D[0][0]*D[1][2]-D[0][2]*D[1][0]) / det;
+    inv[2][0] =  (D[1][0]*D[2][1]-D[1][1]*D[2][0]) / det; inv[2][1] = -(D[0][0]*D[2][1]-D[0][1]*D[2][0]) / det;
+    inv[2][2] =  (D[0][0]*D[1][1]-D[0][1]*D[1][0]) / det;
+    M3 m;   // column-major: m.cK[r] = inv[r][K]
+    for (int r = 0; r < 3; ++r)
+    {
+        m.c0[r] = float(inv[r][0]) + 0.0f; m.c1[r] = float(inv[r][1]) + 0.0f; m.c2[r] = float(inv[r][2]) + 0.0f;
+    }
+    return m;
+}
+
+// The table row of sub-tet i, as the .cu addresses it: ptr[4*i + k + offset].
+static void subTetCorners(uint32_t tpe, bool flipped, uint32_t i, uint32_t c[4])
+{
+    const uint32_t offset = (tpe == 5u && flipped) ? 20u : 0u;
+    const uint32_t* ptr = tpe == 5u ? tets5PerVoxel : tets6PerVoxel;
+    for (uint32_t k = 0; k < 4; ++k) c[k] = ptr[4u * i + k + offset];
+}
+
+// One voxel at element w: pull indices (flipped bit in the MSB of pull[w].x), the rest pose of
+// each sub-tet slot w + nbElements*i from the unit voxel, identity rotations, PGS multiplier
+// seeds.  `verts[j]` is the vertex of corner j.
+static void setVoxel(HexBody& b, uint32_t w, const uint32_t verts[8], bool flipped, bool markFlippedBit,
+                     uint32_t matIndex)
+{
+    b.pull[w] = TetIdx4{ verts[0] | (markFlippedBit ? FLIPPED_MASK : 0u), verts[1], verts[2], verts[3] };
+    b.pull[w + b.nbElements] = TetIdx4{ verts[4], verts[5], verts[6], verts[7] };
+    for (uint32_t i = 0; i < b.tpe; ++i)
+    {
+        uint32_t c[4];
+        subTetCorners(b.tpe, flipped, i, c);
+        const uint32_t slot = w + b.nbElements * i;
+        setRest(b, slot, unitRestInverse(c[0], c[1], c[2], c[3]));
+        b.rot[slot] = F4{ 0.0f, 0.0f, 0.0f, 1.0f };
+        b.mult[mbyzWord(slot) + 0] = f2u(0.013f * float(slot + 1));
+        b.mult[mbyzWord(slot) + 1] = f2u(-0.007f * float(slot + 1));
+    }
+    b.matIdx[b.matLead + w] = uint16_t(matIndex);
+}
+
+static const float AFF_S[3] = { 1.5f, 0.75f, 1.25f };   // diag(s): dyadic
+static const float AFF_T[3] = { 0.25f, 3.0f, -0.5f };
+
+// Position of lattice point (i,j,k) under the affine seed.
+static F4 affinePos(uint32_t i, uint32_t j, uint32_t k, float invMass)
+{
+    return F4{ AFF_S[0] * float(i) + AFF_T[0], AFF_S[1] * float(j) + AFF_T[1], AFF_S[2] * float(k) + AFF_T[2], invMass };
+}
+
+static bool singleOwner(uint32_t corner, bool flipped)
+{
+    static const bool nf[8] = { false, true, true, false, true, false, false, true };   // {1,7,4,2}
+    static const bool f[8]  = { true, false, false, true, false, true, true, false };   // {0,6,5,3}
+    return flipped ? f[corner] : nf[corner];
+}
+
+// A voxel with 8 PRIVATE vertices [base, base+8) at lattice cell (ox,oy,oz); single-owner
+// corners get invMass from `masses` (cycled), the others 0.
+static void privateVoxel(HexBody& b, uint32_t w, uint32_t base, uint32_t ox, uint32_t oy, uint32_t oz,
+                         bool flipped, bool markFlippedBit, uint32_t matIndex, bool massless)
+{
+    static const float masses[4] = { 1.0f, 0.5f, 2.0f, 0.25f };
+    uint32_t verts[8];
+    uint32_t m = 0;
+    for (uint32_t j = 0; j < 8; ++j)
+    {
+        verts[j] = base + j;
+        const float im = (!massless && b.tpe == 5u && singleOwner(j, flipped)) ? masses[(m++) & 3u] : 0.0f;
+        b.pos[base + j] = affinePos(ox + ((j >> 2) & 1u), oy + ((j >> 1) & 1u), oz + (j & 1u), im);
+        b.vel[base + j] = F4{ 0.011f * float(base + j) - 0.05f, -0.013f * float(j) + 0.02f, 0.007f * float(j), im };
+    }
+    setVoxel(b, w, verts, flipped, markFlippedBit, matIndex);
+}
+
+// Non-affine seed for the budget tiers: every corner massive, positions rotated by `th` rad
+// and jittered, so the rotation refresh (seeded at the identity) is far from converged.
+//
+// THE ANGLE IS NOT FREE for a 4-iteration solve.  At 1.9 rad the dot sum that extractRotation
+// divides by (|sum R_i . A_i| + eps) is small for some sub-tets, the first omega is several
+// radians, and the 4-iteration result is ILL-CONDITIONED: measured on the host oracle alone, a
+// 1-ULP nudge of one input position moved Jacobi outputs by up to 127% (2.1e9 ULP), while the
+// same nudge moved the 100-iteration result by 160 ULP.  The llvmpipe sin/cos seam is such a
+// nudge, so a 4-iteration case at 1.9 rad cannot hold any budget.  The 100-iteration GS case
+// keeps 1.9 rad; the 4-iteration Jacobi case uses 0.5 rad, where the same 1-ULP nudge moves
+// at most 512 ULP / 4.6e-5 relative (inside the budget) and 4 vs 100 iterations still differ
+// by far more than 10x the budget (scanned 0.3..1.3 rad, P9.95f).
+static void nonAffineVoxel(HexBody& b, uint32_t w, uint32_t base, uint32_t ox, bool flipped, bool markFlippedBit,
+                           double th = 1.9)
+{
+    static const float masses[8] = { 1.0f, 0.5f, 2.0f, 0.25f, 0.75f, 1.5f, 1.25f, 0.625f };
+    // rotation by `th` rad about (1,2,3)/|(1,2,3)|, written out as a matrix (row-major)
+    const double ax = 1.0 / std::sqrt(14.0), ay = 2.0 / std::sqrt(14.0), az = 3.0 / std::sqrt(14.0);
+    const double cs = std::cos(th), sn = std::sin(th), oc = 1.0 - cs;
+    const double R[3][3] = { { cs + ax*ax*oc, ax*ay*oc - az*sn, ax*az*oc + ay*sn },
+                             { ay*ax*oc + az*sn, cs + ay*ay*oc, ay*az*oc - ax*sn },
+                             { az*ax*oc - ay*sn, az*ay*oc + ax*sn, cs + az*az*oc } };
+    uint32_t verts[8];
+    for (uint32_t j = 0; j < 8; ++j)
+    {
+        verts[j] = base + j;
+        const double r[3] = { double(ox + ((j >> 2) & 1u)) * 1.3, double((j >> 1) & 1u) * 0.8, double(j & 1u) * 1.1 };
+        const double jit[3] = { 0.031 * double((j * 7u) % 5u), -0.027 * double((j * 3u) % 4u), 0.019 * double((j * 5u) % 3u) };
+        float p[3];
+        for (int a = 0; a < 3; ++a)
+            p[a] = float(R[a][0] * r[0] + R[a][1] * r[1] + R[a][2] * r[2] + jit[a]);
+        b.pos[base + j] = F4{ p[0], p[1] + 2.0f, p[2], masses[j] };
+        b.vel[base + j] = F4{ 0.05f * float(j) - 0.1f, 0.03f, -0.02f * float(j), masses[j] };
+    }
+    setVoxel(b, w, verts, flipped, markFlippedBit, 0u);
+}
+
+struct Stats { uint32_t assocWitness = 0; uint32_t movedCorners = 0; };
+
+// sb_gm_cp_solveSubTetrahedron (softBodyGM.cu:1149-1205)
+static void solveSubTetrahedron(HexBody& b, uint32_t workIndex, F4& p0, F4& p1, F4& p2, F4& p3,
+                                F4& v0, F4& v1, F4& v2, F4& v3, float invDtSq, float invDt, bool isTGS,
+                                bool isFirstIteration, const p80solve::Material& material, Stats& st)
+{
+    const M3 Qinv = getRest(b, workIndex);
+    const F4 q4 = b.rot[workIndex];
+    Q4 q = { q4.x, q4.y, q4.z, q4.w };
+
+    const float u1[3] = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
+    const float u2[3] = { p2.x - p0.x, p2.y - p0.y, p2.z - p0.z };
+    const float u3[3] = { p3.x - p0.x, p3.y - p0.y, p3.z - p0.z };
+    {
+        if ((q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w) == 0.0f)
+            q = b.initialRotation;
+        M3 P; for (int i = 0; i < 3; ++i) { P.c0[i] = u1[i]; P.c1[i] = u2[i]; P.c2[i] = u3[i]; }
+        M3 F; p80solve::mat33Mul(P, Qinv, F);
+        q = p80rot::extractRotation(F, q, isFirstIteration ? 100 : 4);
+        b.rot[workIndex] = F4{ q.x, q.y, q.z, q.w };
+    }
+
+    bool zero = true;
+    for (int i = 0; i < 3; ++i)
+        zero = zero && Qinv.c0[i] == 0.0f && Qinv.c1[i] == 0.0f && Qinv.c2[i] == 0.0f;
+    if (zero)
+        return;
+
+    float mb[2] = { u2f(b.mult[mbyzWord(workIndex)]), u2f(b.mult[mbyzWord(workIndex) + 1]) };
+    M3 dl;
+    p80solve::solveGM(dl, u1, u2, u3, v0, v1, v2, v3, mb, invDtSq, invDt, Qinv, q, isTGS, material);
+    b.mult[mbyzWord(workIndex)] = f2u(mb[0]);
+    b.mult[mbyzWord(workIndex) + 1] = f2u(mb[1]);
+
+    float sum[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        sum[i] = dl.c0[i] + dl.c1[i] + dl.c2[i];   // left-associated, as PxVec3 evaluates it
+        if (p0.w != 0.0f && f2u(sum[i]) != f2u(dl.c0[i] + (dl.c1[i] + dl.c2[i]))) ++st.assocWitness;
+    }
+    float dp[3];
+    for (int i = 0; i < 3; ++i) dp[i] = -sum[i] * p0.w;
+    p0.x += dp[0]; p0.y += dp[1]; p0.z += dp[2]; p0.w += 0.0f;
+    v0.x += dp[0] * invDt; v0.y += dp[1] * invDt; v0.z += dp[2] * invDt; v0.w += 0.0f;
+    const float* cols[3] = { dl.c0, dl.c1, dl.c2 };
+    F4* ps[3] = { &p1, &p2, &p3 };
+    F4* vs[3] = { &v1, &v2, &v3 };
+    for (int k = 0; k < 3; ++k)
+    {
+        F4& p = *ps[k]; F4& v = *vs[k];
+        float d[3];
+        for (int i = 0; i < 3; ++i) d[i] = cols[k][i] * p.w;
+        p.x += d[0]; p.y += d[1]; p.z += d[2]; p.w += 0.0f;
+        v.x += d[0] * invDt; v.y += d[1] * invDt; v.z += d[2] * invDt; v.w += 0.0f;
+    }
+}
+
+// sb_gm_cp_solveHexahedronsPartition_parallelGS<updatePosVel> (softBodyGM.cu:1313-1404)
+static void solveHexahedron(HexBody& b, uint32_t workIndex, bool updatePosVel, float invDt, bool isTGS,
+                            bool isFirstIteration, const std::vector<p80solve::Material>& materials, Stats& st)
+{
+    const float invDtSq = invDt * invDt;
+    const uint32_t nbElements = b.nbTets() / b.tpe;
+    const uint16_t globalMaterialIndex = b.matIdx[b.matLead + workIndex];
+    const p80solve::Material& material = materials[globalMaterialIndex];
+
+    TetIdx4 pullInd[2] = { b.pull[workIndex], b.pull[workIndex + nbElements] };
+    const bool flipped = (pullInd[0].x & FLIPPED_MASK) != 0u;
+    pullInd[0].x &= PULL_IND_MASK;
+    const uint32_t idx[8] = { pullInd[0].x, pullInd[0].y, pullInd[0].z, pullInd[0].w,
+                              pullInd[1].x, pullInd[1].y, pullInd[1].z, pullInd[1].w };
+    F4 p[8], v[8];
+    for (uint32_t i = 0; i < 8; ++i) { p[i] = b.pos[idx[i]]; v[i] = b.vel[idx[i]]; }
+
+    uint32_t offset = 0;
+    if (b.tpe == 5u && flipped)
+        offset = 20;
+    const uint32_t* ptr = b.tpe == 5u ? tets5PerVoxel : tets6PerVoxel;
+    for (uint32_t i = 0; i < b.tpe; ++i)
+    {
+        const uint32_t a = ptr[4*i + 0 + offset], c1 = ptr[4*i + 1 + offset];
+        const uint32_t c2 = ptr[4*i + 2 + offset], d = ptr[4*i + 3 + offset];
+        solveSubTetrahedron(b, workIndex + nbElements * i, p[a], p[c1], p[c2], p[d], v[a], v[c1], v[c2], v[d],
+                            invDtSq, invDt, isTGS, isFirstIteration, material, st);
+    }
+
+    if (updatePosVel)
+    {
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            const uint32_t index = idx[i];
+            F4& dp = b.deltaPos[index];
+            const F4 old = b.pos[index];
+            dp.x += p[i].x - old.x; dp.y += p[i].y - old.y; dp.z += p[i].z - old.z; dp.w += p[i].w - old.w;
+            b.pos[index] = p[i];
+            b.vel[index] = v[i];
+        }
+    }
+    else
+    {
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            const uint32_t index = idx[i];
+            const F4 old = b.pos[index];
+            const F4 delta4 = { p[i].x - old.x, p[i].y - old.y, p[i].z - old.z, p[i].w - old.w };
+            if (f2u(delta4.x) != 0u || f2u(delta4.y) != 0u || f2u(delta4.z) != 0u) ++st.movedCorners;
+            F4& d = b.delta[index];
+            d.x += delta4.x; d.y += delta4.y; d.z += delta4.z; d.w += 1.0f;
+        }
+    }
+}
+
+// The Jacobi kernel (softBodyGM.cu:1463-1507) over one body.
+static void jacobiKernel(HexBody& b, float invDt, bool isTGS, const std::vector<p80solve::Material>& mats,
+                         Stats& st, bool isFirstIteration = false)
+{
+    if (b.numPartitions <= SB_PARTITION_LIMIT || b.tpe == 1u) return;
+    if (b.bodyFlags & PxDeformableBodyFlag::eKINEMATIC) return;
+    for (uint32_t w = b.acc[SB_PARTITION_LIMIT - 1]; w < b.acc[SB_PARTITION_LIMIT]; ++w)
+        solveHexahedron(b, w, /*updatePosVel*/ false, invDt, isTGS, isFirstIteration, mats, st);
+}
+
+// The GS kernel's hex branch (softBodyGM.cu:1416-1457) over one body and one partition.
+static void gsKernel(HexBody& b, uint32_t partitionId, float invDt, bool isTGS, bool isFirstIteration,
+                     const std::vector<p80solve::Material>& mats, Stats& st)
+{
+    if (b.bodyFlags & PxDeformableBodyFlag::eKINEMATIC) return;
+    if (!(b.nbTets() > 0u && partitionId < b.numPartitions)) return;
+    const uint32_t start = partitionId > 0u ? b.acc[partitionId - 1] : 0u, end = b.acc[partitionId];
+    for (uint32_t w = start; w < end; ++w)
+        solveHexahedron(b, w, /*updatePosVel*/ true, invDt, isTGS, isFirstIteration, mats, st);
+}
+
+// ---- device side ----------------------------------------------------------
+struct DevHex { DevBuf pos, vel, delta, deltaPos, cpPos, cpVel, remap, pull, rest, rot, mult, matIdx, acc; };
+
+static PxgSoftBody uploadBody(PxgSlangComputeDevice* dev, const HexBody& b, DevHex& d)
+{
+    d.pos = makeDev(dev, b.pos); d.vel = makeDev(dev, b.vel);
+    d.delta = makeDev(dev, b.delta); d.deltaPos = makeDev(dev, b.deltaPos);
+    d.cpPos = makeDev(dev, b.cpPos); d.cpVel = makeDev(dev, b.cpVel);
+    d.remap = makeDev(dev, b.remap); d.pull = makeDev(dev, b.pull);
+    d.rest = makeDev(dev, b.rest); d.rot = makeDev(dev, b.rot); d.mult = makeDev(dev, b.mult);
+    d.matIdx = makeDev(dev, b.matIdx); d.acc = makeDev(dev, b.acc);
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(d.pos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(d.vel.addr));
+    c.mSimDelta = reinterpret_cast<float4*>(size_t(d.delta.addr));
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(d.deltaPos.addr));
+    c.mSimPosition_InvMassCP = reinterpret_cast<float4*>(size_t(d.cpPos.addr));
+    c.mSimVelocity_invMassCP = reinterpret_cast<float4*>(size_t(d.cpVel.addr));
+    c.mSimRemapOutputCP = reinterpret_cast<decltype(c.mSimRemapOutputCP)>(size_t(d.remap.addr));
+    c.mSimPullIndices = reinterpret_cast<decltype(c.mSimPullIndices)>(size_t(d.pull.addr));
+    c.mSimTetraRestPoses = reinterpret_cast<decltype(c.mSimTetraRestPoses)>(size_t(d.rest.addr));
+    c.mSimTetraRotations = reinterpret_cast<float4*>(size_t(d.rot.addr));
+    c.mSimTetraMultipliers = reinterpret_cast<decltype(c.mSimTetraMultipliers)>(size_t(d.mult.addr));
+    c.mOrderedMaterialIndices = reinterpret_cast<PxU16*>(size_t(d.matIdx.addr + 2u * b.matLead));
+    c.mSimAccumulatedPartitionsCP = reinterpret_cast<PxU32*>(size_t(d.acc.addr));
+    c.mNumTetsGM = b.nbTets();
+    c.mNumPartitionsGM = b.numPartitions;
+    c.mNumTetsPerElement = b.tpe;
+    c.mNumVertsGM = b.nbVerts;
+    c.mBodyFlags = PxU8(b.bodyFlags);
+    c.mInitialRotation = PxQuat(b.initialRotation.x, b.initialRotation.y, b.initialRotation.z, b.initialRotation.w);
+    return c;
+}
+
+static HexBody downloadBody(PxgSlangComputeDevice* dev, const HexBody& shape, const DevHex& d)
+{
+    HexBody g = shape;
+    g.pos = downloadBuffer<F4>(dev, d.pos.h, shape.pos.size());
+    g.vel = downloadBuffer<F4>(dev, d.vel.h, shape.vel.size());
+    g.delta = downloadBuffer<F4>(dev, d.delta.h, shape.delta.size());
+    g.deltaPos = downloadBuffer<F4>(dev, d.deltaPos.h, shape.deltaPos.size());
+    g.cpPos = downloadBuffer<F4>(dev, d.cpPos.h, shape.cpPos.size());
+    g.cpVel = downloadBuffer<F4>(dev, d.cpVel.h, shape.cpVel.size());
+    g.remap = downloadBuffer<TetIdx4>(dev, d.remap.h, shape.remap.size());
+    g.pull = downloadBuffer<TetIdx4>(dev, d.pull.h, shape.pull.size());
+    g.rest = downloadBuffer<uint32_t>(dev, d.rest.h, shape.rest.size());
+    g.rot = downloadBuffer<F4>(dev, d.rot.h, shape.rot.size());
+    g.mult = downloadBuffer<uint32_t>(dev, d.mult.h, shape.mult.size());
+    g.matIdx = downloadBuffer<uint16_t>(dev, d.matIdx.h, shape.matIdx.size());
+    g.acc = downloadBuffer<uint32_t>(dev, d.acc.h, shape.acc.size());
+    return g;
+}
+
+static void destroyBody(PxgSlangComputeDevice* dev, DevHex& d)
+{
+    const DevBuf* all[] = { &d.pos, &d.vel, &d.delta, &d.deltaPos, &d.cpPos, &d.cpVel, &d.remap, &d.pull,
+                            &d.rest, &d.rot, &d.mult, &d.matIdx, &d.acc };
+    for (const DevBuf* x : all) dev->destroyBuffer(x->h);
+}
+
+// Every buffer of `got` against `want`.  budgetUlp == 0: bitwise.  Otherwise a float lane
+// mismatches only beyond BOTH budgetUlp ULP and budgetRel relative (the inherited sin/cos
+// seam), and the integer buffers stay exact.  Returns the mismatch count, records the worst.
+struct CmpResult { size_t mm = 0; uint32_t worstUlp = 0; double worstRel = 0.0; };
+static CmpResult compareBody(const char* tag, const HexBody& want, const HexBody& got,
+                             uint32_t budgetUlp = 0u, double budgetRel = 0.0, bool quiet = false)
+{
+    CmpResult r;
+    auto lane = [&](const char* what, size_t i, int e, float a, float g) {
+        if (f2u(a) == f2u(g)) return;
+        bool bad = true;
+        if (budgetUlp != 0u)
+        {
+            const uint32_t u = p80rot::ulpDist(a, g);
+            const double rel = std::fabs(double(a) - double(g)) / std::fmax(1.0e-6, std::fabs(double(a)));
+            if (std::isfinite(a) && std::isfinite(g))
+            {
+                if (u > r.worstUlp) r.worstUlp = u;
+                if (rel > r.worstRel) r.worstRel = rel;
+                bad = u > budgetUlp && rel > budgetRel;
+            }
+        }
+        if (bad)
+        {
+            ++r.mm;
+            if (r.mm <= 12 && !quiet)
+                std::printf("  [%s] %s[%zu].%d MM: want %08x (%.9g) got %08x (%.9g)\n", tag, what, i, e,
+                            f2u(a), a, f2u(g), g);
+        }
+    };
+    auto f4s = [&](const char* what, const std::vector<F4>& a, const std::vector<F4>& g) {
+        for (size_t i = 0; i < a.size(); ++i)
+        { lane(what, i, 0, a[i].x, g[i].x); lane(what, i, 1, a[i].y, g[i].y);
+          lane(what, i, 2, a[i].z, g[i].z); lane(what, i, 3, a[i].w, g[i].w); } };
+    auto words = [&](const char* what, const std::vector<uint32_t>& a, const std::vector<uint32_t>& g, bool asFloat) {
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            if (asFloat) lane(what, i, 0, u2f(a[i]), u2f(g[i]));
+            else if (a[i] != g[i]) { ++r.mm; if (r.mm <= 12) std::printf("  [%s] %s[%zu] MM: want %08x got %08x\n", tag, what, i, a[i], g[i]); }
+        } };
+    auto idx4 = [&](const char* what, const std::vector<TetIdx4>& a, const std::vector<TetIdx4>& g) {
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].x != g[i].x || a[i].y != g[i].y || a[i].z != g[i].z || a[i].w != g[i].w)
+            { ++r.mm; if (r.mm <= 12) std::printf("  [%s] %s[%zu] MM\n", tag, what, i); } };
+    f4s("pos", want.pos, got.pos);
+    f4s("vel", want.vel, got.vel);
+    f4s("delta", want.delta, got.delta);
+    f4s("deltaPos", want.deltaPos, got.deltaPos);
+    f4s("cpPos", want.cpPos, got.cpPos);
+    f4s("cpVel", want.cpVel, got.cpVel);
+    f4s("rot", want.rot, got.rot);
+    words("mult", want.mult, got.mult, /*asFloat*/ true);
+    words("rest", want.rest, got.rest, false);
+    words("acc", want.acc, got.acc, false);
+    idx4("pull", want.pull, got.pull);
+    idx4("remap", want.remap, got.remap);
+    for (size_t i = 0; i < want.matIdx.size(); ++i)
+        if (want.matIdx[i] != got.matIdx[i]) { ++r.mm; std::printf("  [%s] matIdx[%zu] MM\n", tag, i); }
+    return r;
+}
+
+// PxsDeformableVolumeMaterialData words (32-byte stride) for a list of materials.
+static std::vector<uint32_t> materialWords(const std::vector<p80solve::Material>& mats, uint16_t dampingScaleU16)
+{
+    std::vector<uint32_t> w(8u * mats.size() + 64u, 0u);
+    for (size_t m = 0; m < mats.size(); ++m)
+    {
+        w[8*m + 0] = f2u(mats[m].youngs);
+        w[8*m + 1] = f2u(mats[m].poissons);
+        w[8*m + 2] = f2u(0.0f);
+        w[8*m + 3] = f2u(mats[m].elasticityDamping);
+        w[8*m + 4] = uint32_t(dampingScaleU16) | (mats[m].model << 16);
+    }
+    return w;
+}
+
+static const uint16_t DSCALE_U16 = 32768u;
+static p80solve::Material coRot(float damping = 0.0f)
+{ return p80solve::Material{ 1.0e5f, 0.31f, damping, float(DSCALE_U16) * (1.0f / 65535.0f), 0u }; }
+static p80solve::Material neoHookean()
+{ return p80solve::Material{ 2.0e5f, 0.27f, 0.0f, float(DSCALE_U16) * (1.0f / 65535.0f), 1u }; }
+
+// Runs the Jacobi entry over `bodies` (descriptor index = position in the vector) in the
+// order `active`, with the host grid (ceil(maxJacobi/32), nbActive, 1).
+static void dispatchJacobi(PxgSlangComputeDevice* dev, std::vector<HexBody>& bodies, std::vector<DevHex>& devs,
+                           const std::vector<uint32_t>& active, uint32_t maxJacobi, bool isTGS, float invDt,
+                           const std::vector<p80solve::Material>& mats)
+{
+    std::vector<PxgSoftBody> descs;
+    devs.resize(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i) descs.push_back(uploadBody(dev, bodies[i], devs[i]));
+    DevBuf bDesc = makeDev(dev, descs);
+    DevBuf bActive = makeDev(dev, active);
+    DevBuf bMat = makeDev(dev, materialWords(mats, DSCALE_U16));
+    SolveTetraJacobiPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.numActiveSoftbodies = 0xDEAD0000u;      // never read (dead upstream too)
+    push.invDt = invDt;
+    push.flagsWord = (isTGS ? 1u : 0u) | 0xA5C3E100u;   // pad bytes 25..27 poisoned (trap H8)
+    push.pad28 = 0xDEADBEEFu;
+    push.materials = bMat.addr;
+    Kernel k("softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", {}, sizeof(SolveTetraJacobiPush));
+    k.dispatch((maxJacobi + 31u) / 32u, {}, push, uint32_t(active.size()), 1u);
+    dev->flush();
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bMat.h);
+}
+
+// Runs the GS entry for one partition, host grid (ceil(maxPerPartition/32), nbActive, 1).
+static void dispatchGS(PxgSlangComputeDevice* dev, std::vector<HexBody>& bodies, std::vector<DevHex>& devs,
+                       const std::vector<uint32_t>& active, uint32_t maxPerPartition, uint32_t partitionId,
+                       bool isTGS, bool isFirstIteration, float invDt, const std::vector<p80solve::Material>& mats,
+                       bool upload = true)
+{
+    std::vector<PxgSoftBody> descs;
+    if (upload) devs.resize(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i)
+    {
+        if (upload) descs.push_back(uploadBody(dev, bodies[i], devs[i]));
+        else
+        {
+            // re-describe the already uploaded buffers (a second dispatch over the same state)
+            DevHex tmp;
+            PxgSoftBody c = uploadBody(dev, bodies[i], tmp);
+            destroyBody(dev, tmp);
+            const DevHex& d = devs[i];
+            c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(d.pos.addr));
+            c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(d.vel.addr));
+            c.mSimDelta = reinterpret_cast<float4*>(size_t(d.delta.addr));
+            c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(d.deltaPos.addr));
+            c.mSimPosition_InvMassCP = reinterpret_cast<float4*>(size_t(d.cpPos.addr));
+            c.mSimVelocity_invMassCP = reinterpret_cast<float4*>(size_t(d.cpVel.addr));
+            c.mSimRemapOutputCP = reinterpret_cast<decltype(c.mSimRemapOutputCP)>(size_t(d.remap.addr));
+            c.mSimPullIndices = reinterpret_cast<decltype(c.mSimPullIndices)>(size_t(d.pull.addr));
+            c.mSimTetraRestPoses = reinterpret_cast<decltype(c.mSimTetraRestPoses)>(size_t(d.rest.addr));
+            c.mSimTetraRotations = reinterpret_cast<float4*>(size_t(d.rot.addr));
+            c.mSimTetraMultipliers = reinterpret_cast<decltype(c.mSimTetraMultipliers)>(size_t(d.mult.addr));
+            c.mOrderedMaterialIndices = reinterpret_cast<PxU16*>(size_t(d.matIdx.addr + 2u * bodies[i].matLead));
+            c.mSimAccumulatedPartitionsCP = reinterpret_cast<PxU32*>(size_t(d.acc.addr));
+            descs.push_back(c);
+        }
+    }
+    DevBuf bDesc = makeDev(dev, descs);
+    DevBuf bActive = makeDev(dev, active);
+    DevBuf bMat = makeDev(dev, materialWords(mats, DSCALE_U16));
+    SolveTetraPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.numActiveSoftbodies = uint32_t(active.size());
+    push.invDt = invDt;
+    push.partitionId = partitionId;
+    push.flagsWord = (isTGS ? 1u : 0u) | (isFirstIteration ? 0x100u : 0u);
+    push.materials = bMat.addr;
+    Kernel k("softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch", {}, sizeof(SolveTetraPush));
+    k.dispatch((maxPerPartition + 31u) / 32u, {}, push, uint32_t(active.size()), 1u);
+    dev->flush();
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bMat.h);
+}
+
+// A body descriptor that the Jacobi guard rejects (0 partitions): occupies descriptor slot 0
+// so the live body is never at groupId.y.
+static HexBody idleBody()
+{
+    HexBody b;
+    initBody(b, 5u, 1u, 8u);
+    b.numPartitions = 0u;
+    b.acc.assign(16u, 0u);
+    return b;
+}
+
+static bool sameBits(const std::vector<F4>& a, const std::vector<F4>& b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (f2u(a[i].x) != f2u(b[i].x) || f2u(a[i].y) != f2u(b[i].y) || f2u(a[i].z) != f2u(b[i].z) ||
+            f2u(a[i].w) != f2u(b[i].w)) return false;
+    return true;
+}
+
+static bool isIdentityBits(const F4& q)
+{ return f2u(q.x) == 0u && f2u(q.y) == 0u && f2u(q.z) == 0u && f2u(q.w) == 0x3f800000u; }
+} // namespace p95hex
+
+// ---------------------------------------------------------------------------
+// The two-voxel Jacobi body: elements 0,1 are GS elements (partitions 0 and 7), elements 2
+// (A, non-flipped) and 3 (B, flipped, FLIPPED bit in pull[3].x) are the Jacobi partition
+// [acc[7], acc[8]) = [2, 4).  B sits on A's +x face: A corner j+4 == B corner j, on a 3x2x2
+// lattice whose vertex (i,j,k) is (i*2 + j)*2 + k, so A = verts 0..7, B = verts 4..11.
+// acc = {1,1,1,1,1,1,1,2,4}: acc[6] == 1 != acc[7], so a range that starts one partition
+// early reaches element 1, whose slots are poison (review D1).
+// ---------------------------------------------------------------------------
+static p95hex::HexBody makeJacobi5Body()
+{
+    using namespace p95hex;
+    HexBody b;
+    initBody(b, 5u, 4u, 12u);
+    b.acc = { 1u, 1u, 1u, 1u, 1u, 1u, 1u, 2u, 4u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 9u;
+    // inverse masses: single-owner corners only; A4 == B0 and A7 == B3 are single-owner in both
+    const float im[12] = { 0.0f, 1.0f, 0.5f, 0.0f, 2.0f, 0.0f, 0.0f, 0.25f, 0.0f, 1.5f, 0.75f, 0.0f };
+    for (uint32_t i = 0; i < 3; ++i)
+        for (uint32_t j = 0; j < 2; ++j)
+            for (uint32_t k = 0; k < 2; ++k)
+            {
+                const uint32_t v = (i * 2u + j) * 2u + k;
+                b.pos[v] = affinePos(i, j, k, im[v]);
+                b.vel[v] = F4{ 0.021f * float(v) - 0.1f, 0.017f * float(v), -0.009f * float(v) + 0.03f, im[v] };
+            }
+    const uint32_t A[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    const uint32_t B[8] = { 4, 5, 6, 7, 8, 9, 10, 11 };
+    setVoxel(b, 2u, A, /*flipped*/ false, false, 0u);
+    setVoxel(b, 3u, B, /*flipped*/ true, /*bit*/ true, 0u);
+    // mSimDelta: 0 on the two-contribution verts (4..7); seeds on one-contribution verts:
+    // 0.25-family (store-instead-of-add) and -0 (the -0 + +0 = +0 probe).
+    for (uint32_t v = 0; v < 12; ++v) b.delta[v] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    b.delta[1] = F4{ 0.25f, -0.125f, 0.0625f, 3.0f };
+    b.delta[2] = F4{ -0.0f, -0.0f, -0.0f, -0.0f };
+    b.delta[0] = F4{ -0.0f, 0.5f, -0.0f, 1.0f };
+    b.delta[9] = F4{ 0.25f, 0.25f, 0.25f, 0.0f };
+    b.delta[11] = F4{ -0.0f, -0.0f, -0.0f, 2.0f };
+    // the GS elements 0 and 1 gather the sentinel vertex; their slots stay poison
+    return b;
+}
+
+static void runHexJacobi5(bool isTGS)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    std::vector<HexBody> bodies = { idleBody(), makeJacobi5Body() };
+    const HexBody upload = bodies[1];
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 1u }, /*maxJacobi*/ 2u, isTGS, invDt, mats);
+
+    HexBody want = upload;
+    Stats st;
+    jacobiKernel(want, invDt, isTGS, mats, st);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+
+    // Preconditions of the bitwise construction, checked on the ORACLE: it must have moved
+    // corners (a non-trivial solve), produced an identity rotation everywhere it wrote, and
+    // -- review D5 -- contain at least one mobile corner-0 lane where the association of
+    // c0 + c1 + c2 matters, or the sum-order mutant would be invisible.
+    PXG_CHECK_MSG(st.movedCorners >= 6u, "the Jacobi oracle must move the mobile corners (%u)", st.movedCorners);
+    PXG_CHECK_MSG(st.assocWitness > 0u, "no mobile corner-0 lane separates (c0+c1)+c2 from c0+(c1+c2)");
+    std::printf("  [hexJacobi5 %s] oracle: %u moved corner deltas, %u association-witness lanes\n",
+                isTGS ? "TGS" : "PGS", st.movedCorners, st.assocWitness);
+    for (uint32_t w = 2; w < 4; ++w)
+        for (uint32_t i = 0; i < 5; ++i)
+            PXG_CHECK_MSG(isIdentityBits(want.rot[w + 4u * i]), "oracle rotation slot %u not the exact identity", w + 4u * i);
+    // The w lane counts contributions: 2 on the shared face, 1 elsewhere (plus the seed).
+    PXG_CHECK_MSG(want.delta[4].w == 2.0f && want.delta[1].w == 4.0f && want.delta[11].w == 3.0f,
+                  "oracle w-counts (%g %g %g)", want.delta[4].w, want.delta[1].w, want.delta[11].w);
+
+    const CmpResult r = compareBody(isTGS ? "hexJacobi5TGS" : "hexJacobi5", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch bit-exact vs the CUDA transcription (%zu)", r.mm);
+    // Explicit teeth, in case the oracle and the shader agreed on a vacuous state:
+    PXG_CHECK_MSG(f2u(got.rot[0].x) == POISON && f2u(got.rot[1].x) == POISON,
+                  "the GS elements' rotation slots (0, 1) must keep their poison");
+    PXG_CHECK_MSG(f2u(got.rot[4u * 4u + 4u].x) == POISON, "the slot past the last element must keep its poison");
+    PXG_CHECK_MSG(f2u(got.pos[4].x) == f2u(upload.pos[4].x) && f2u(got.deltaPos[4].x) == f2u(upload.deltaPos[4].x),
+                  "the Jacobi kernel must not write positions or mSimDeltaPos");
+    if (isTGS)
+        PXG_CHECK_MSG(got.mult == upload.mult, "TGS must not store multipliers");
+    else
+        PXG_CHECK_MSG(got.mult[mbyzWord(2)] != upload.mult[mbyzWord(2)], "PGS must store the multipliers");
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// 70 Jacobi elements on one body (3 workgroups of 32): massless private voxels, so the
+// case is exact and every vertex must count exactly one contribution -- the per-group
+// stride (groupId.x * 32) is the thing under test.
+static void runHexJacobiWide()
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    const uint32_t nbE = 70u;
+    HexBody b;
+    initBody(b, 5u, nbE, nbE * 8u);
+    b.acc = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, nbE };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 9u;
+    for (uint32_t w = 0; w < nbE; ++w)
+    {
+        privateVoxel(b, w, w * 8u, (w % 7u) * 2u, (w / 7u) % 5u, w / 35u, (w & 1u) != 0u, (w & 1u) != 0u, 0u,
+                     /*massless*/ true);
+        for (uint32_t j = 0; j < 8; ++j) b.delta[w * 8u + j] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    }
+    std::vector<HexBody> bodies = { idleBody(), b };
+    const HexBody upload = b;
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 1u }, nbE, /*isTGS*/ false, invDt, mats);
+    HexBody want = upload;
+    Stats st;
+    jacobiKernel(want, invDt, false, mats, st);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    uint32_t badCount = 0;
+    for (uint32_t v = 0; v < nbE * 8u; ++v)
+        if (got.delta[v].w != 1.0f) ++badCount;
+    PXG_CHECK_MSG(badCount == 0u, "70-element Jacobi: %u vertices do not count exactly one contribution", badCount);
+    const CmpResult r = compareBody("hexJacobiWide", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "70-element Jacobi dispatch (3 groups) bit-exact (%zu)", r.mm);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+PXG_TEST(softBodySimHexJacobi5) { runHexJacobi5(/*isTGS*/ false); runHexJacobiWide(); }
+PXG_TEST(softBodySimHexJacobi5TGS) { runHexJacobi5(/*isTGS*/ true); }
+
+// ---------------------------------------------------------------------------
+// The two early-outs (softBodyGM.cu:1482, :1485) in ONE dispatch of four bodies, listed
+// through a permuted activeSoftbodies: (i) hex with 8 partitions, (ii) tet (tpe 1) with 9,
+// (iii) hex with 9 but eKINEMATIC, (iv) live.  (i)-(iii) carry valid, non-empty acc[7..8]
+// ranges and full buffers, so a dropped guard does real (and visible) work.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimHexJacobiEarlyOuts)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    std::vector<HexBody> bodies(4, makeJacobi5Body());
+    bodies[0].numPartitions = 8u;                                  // (i)
+    bodies[1].tpe = 1u; bodies[1].nbElements = 20u;                // (ii) same 20 tets, one per element
+    bodies[2].bodyFlags = uint8_t(PxDeformableBodyFlag::eKINEMATIC);   // (iii)
+    // (iv) = bodies[3], live
+    const std::vector<HexBody> upload = bodies;
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 2u, 0u, 3u, 1u }, /*maxJacobi*/ 2u, /*isTGS*/ false, invDt, mats);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        HexBody want = upload[i];
+        Stats st;
+        jacobiKernel(want, invDt, false, mats, st);
+        PXG_CHECK_MSG((i == 3u) == (st.movedCorners > 0u), "oracle: only body (iv) may do work (body %u)", i);
+        const HexBody got = downloadBody(dev, upload[i], devs[i]);
+        static const char* tags[4] = { "earlyOut(i) 8 partitions", "earlyOut(ii) tet", "earlyOut(iii) kinematic",
+                                       "earlyOut(iv) live" };
+        mm += compareBody(tags[i], want, got).mm;
+    }
+    PXG_CHECK_MSG(mm == 0, "Jacobi early-outs: (i)-(iii) untouched, (iv) solved (%zu)", mm);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// ---------------------------------------------------------------------------
+// The degenerate rest pose (Qinv == 0, softBodyGM.cu:1176-1177): the rotation is STILL
+// stored, then the sub-tet returns before p/v are touched.  Review D3: in a Jacobi tail the
+// difference between "returned" and "added a zero delta" is invisible, so the case has two
+// halves --
+//   (a) Jacobi entry, PGS, NEO-HOOKEAN: the degenerate slot's multiplier must keep its seed
+//       (the neo-Hookean multiplier moves even at Qinv == 0, the co-rotational one does not)
+//       and its rotation, seeded with the non-unit (0,0,0,2), must come back normalised to
+//       the identity (stored before the return).  A second slot starts at q == (0,0,0,0)
+//       and must be seeded from mInitialRotation, set to the non-identity (1,0,0,0) in
+//       both halves.
+//   (b) GS entry, co-rotational: the degenerate sub-tet's single-owner corner 1 carries
+//       p.w == v.w == -0; returned early it is written back verbatim (-0), while a sub-tet
+//       that ran would have turned both into +0.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimHexJacobiDegenerate)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    for (int half = 0; half < 2; ++half)
+    {
+        const bool jacobi = half == 0;
+        const std::vector<p80solve::Material> mats = { jacobi ? neoHookean() : coRot() };
+        HexBody b;
+        initBody(b, 5u, 1u, 8u);
+        b.acc = jacobi ? std::vector<uint32_t>{ 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u }
+                       : std::vector<uint32_t>{ 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u };
+        b.acc.resize(16u, POISON);
+        b.numPartitions = jacobi ? 9u : 8u;
+        privateVoxel(b, 0u, 0u, 0u, 0u, 0u, false, false, 0u, false);
+        // A NON-identity mInitialRotation: every other hex fixture uses the identity, so a
+        // component-order slip in the float4 sbHexDescOf builds from the four scalars @348..@360
+        // would otherwise go unseen (an X/Y swap survived all 12 fixtures).  (1,0,0,0), 180 deg
+        // about X, is an exact extractRotation fixed point under the affine (diagonal F) seed:
+        // omega == 0 on the first iteration, so slot 3 comes back as exactly (1,0,0,0).
+        b.initialRotation = Q4{ 1.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t j = 0; j < 8; ++j) b.delta[j] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+        setRest(b, 1u, M3{});                         // sub-tet row 1 (corners 0,1,5,3): Qinv = +0
+        b.rot[1u] = F4{ 0.0f, 0.0f, 0.0f, 2.0f };     // non-unit: the store normalises it
+        b.rot[3u] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };     // seeded from mInitialRotation
+        if (!jacobi)
+        {
+            b.pos[1].w = -0.0f; b.vel[1].w = -0.0f;   // corner 1 is in row 1 only
+            for (uint32_t j = 0; j < 8; ++j) b.deltaPos[j] = F4{ 0.125f, -0.25f, 0.5f, 0.0f };
+        }
+        const HexBody upload = b;
+        std::vector<HexBody> bodies = { idleBody(), b };
+        std::vector<DevHex> devs;
+        if (jacobi) dispatchJacobi(dev, bodies, devs, { 1u }, 1u, /*isTGS*/ false, invDt, mats);
+        else dispatchGS(dev, bodies, devs, { 1u }, 1u, /*partition*/ 0u, false, /*first*/ true, invDt, mats);
+        HexBody want = upload;
+        Stats st;
+        if (jacobi) jacobiKernel(want, invDt, false, mats, st);
+        else gsKernel(want, 0u, invDt, false, true, mats, st);
+        const HexBody got = downloadBody(dev, upload, devs[1]);
+        const CmpResult r = compareBody(jacobi ? "hexDegenerate(a) Jacobi" : "hexDegenerate(b) GS", want, got);
+        PXG_CHECK_MSG(r.mm == 0, "degenerate rest pose (%s) bit-exact (%zu)", jacobi ? "Jacobi" : "GS", r.mm);
+        PXG_CHECK_MSG(isIdentityBits(want.rot[1]) && isIdentityBits(got.rot[1]),
+                      "the degenerate slot's rotation is stored (normalised to identity) before the return");
+        PXG_CHECK_MSG(f2u(got.rot[3].x) == 0x3f800000u && f2u(got.rot[3].y) == 0u &&
+                      f2u(got.rot[3].z) == 0u && f2u(got.rot[3].w) == 0u,
+                      "q == 0 must be seeded from mInitialRotation (1,0,0,0) (got %08x %08x %08x %08x)",
+                      f2u(got.rot[3].x), f2u(got.rot[3].y), f2u(got.rot[3].z), f2u(got.rot[3].w));
+        if (jacobi)
+            PXG_CHECK_MSG(got.mult[mbyzWord(1)] == upload.mult[mbyzWord(1)] &&
+                          got.mult[mbyzWord(2)] != upload.mult[mbyzWord(2)],
+                          "the degenerate slot's multiplier keeps its seed, a live slot's moves");
+        else
+            PXG_CHECK_MSG(f2u(got.pos[1].w) == 0x80000000u && f2u(got.vel[1].w) == 0x80000000u &&
+                          f2u(got.pos[0].w) == 0u,
+                          "corner 1 (only in the degenerate sub-tet) keeps -0 in w (pos %08x vel %08x); "
+                          "corner 0 is +0", f2u(got.pos[1].w), f2u(got.vel[1].w));
+        for (auto& d : devs) destroyBody(dev, d);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mOrderedMaterialIndices[w] is a PxU16 read through its containing word, with the half
+// chosen by the ADDRESS (P9.88).  Two Jacobi voxels, material 0 (co-rotational, damped) and
+// 1 (neo-Hookean), with the array based at an address == 2 (mod 4): element 0 reads the HIGH
+// half, element 1 the LOW half of the next word; the neighbouring halves hold the OTHER
+// index, so either half rule mistaken picks the wrong material.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimHexJacobiMaterialHalf)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot(0.35f), neoHookean() };
+    HexBody b;
+    initBody(b, 5u, 2u, 16u);
+    b.acc = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 2u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 9u;
+    b.matLead = 1u;
+    privateVoxel(b, 0u, 0u, 0u, 0u, 0u, false, false, 0u, false);
+    privateVoxel(b, 1u, 8u, 3u, 0u, 0u, true, true, 1u, false);
+    b.matIdx[0] = 1u;       // the low half of element 0's word
+    b.matIdx[3] = 0u;       // the high half of element 1's word
+    for (uint32_t v = 0; v < 16; ++v) b.delta[v] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 1u }, 2u, false, invDt, mats);
+    HexBody want = upload;
+    Stats st;
+    jacobiKernel(want, invDt, false, mats, st);
+    // the two materials must give different answers, or the half rule has no teeth
+    HexBody swapped = upload;
+    swapped.matIdx[1] = 1u; swapped.matIdx[2] = 0u;
+    Stats st2;
+    jacobiKernel(swapped, invDt, false, mats, st2);
+    PXG_CHECK_MSG(!sameBits(swapped.delta, want.delta) || swapped.mult != want.mult, "swapping the materials must change the oracle");
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody("hexMaterialHalf", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "Jacobi material lookup through the PxU16 half rule bit-exact (%zu)", r.mm);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// ---------------------------------------------------------------------------
+// 6 tets per voxel, massless (the bit-exact ROUTING tier): rotations, multipliers, the +0
+// deltas and the w-counts, with nbElements = 5 so that the slot rules w + 5i, w*6 + i and
+// w + 6i are pairwise different (review D2), and the FLIPPED bit set on one voxel (it must
+// not select an offset for the 6-tet table).
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimHexJacobi6Routing)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    HexBody b;
+    initBody(b, 6u, 5u, 40u);
+    b.acc = { 1u, 1u, 1u, 1u, 1u, 1u, 1u, 2u, 5u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 9u;
+    for (uint32_t w = 0; w < 5; ++w)
+    {
+        privateVoxel(b, w, 8u * w, 2u * w, 0u, 0u, false, /*bit*/ w == 3u, 0u, /*massless*/ true);
+        for (uint32_t j = 0; j < 8; ++j) b.delta[8u * w + j] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    }
+    // elements 0 and 1 are GS elements: their slots must stay poison
+    for (uint32_t w = 0; w < 2; ++w)
+        for (uint32_t i = 0; i < 6; ++i)
+        {
+            const uint32_t s = w + 5u * i;
+            for (uint32_t e = 0; e < 4; ++e) (&b.rot[s].x)[e] = u2f(POISON);
+            b.mult[mbyzWord(s)] = POISON; b.mult[mbyzWord(s) + 1] = POISON;
+        }
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 1u }, 3u, false, invDt, mats);
+    HexBody want = upload;
+    Stats st;
+    jacobiKernel(want, invDt, false, mats, st);
+    for (uint32_t w = 2; w < 5; ++w)
+        for (uint32_t i = 0; i < 6; ++i)
+            PXG_CHECK_MSG(isIdentityBits(want.rot[w + 5u * i]), "oracle 6-tet slot %u not identity", w + 5u * i);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody("hex6Routing", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "6-tet Jacobi routing bit-exact (%zu)", r.mm);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// The ULP budget of the budget tiers: runSolveTetraPartition's (4096 ULP AND 1e-3
+// relative), the inherited sin/cos seam of extractRotation.  Each budget case also proves
+// that 100 vs 4 rotation iterations differ by >= 10x that budget from its seed, so the
+// isFirstIteration wiring is observable through the budget (review D4).
+static const uint32_t HEX_BUDGET_ULP = 4096u;
+static const double HEX_BUDGET_REL = 1.0e-3;
+
+static void checkIterationGap(const char* tag, const p95hex::HexBody& it4, const p95hex::HexBody& it100)
+{
+    const p95hex::CmpResult g = p95hex::compareBody(tag, it4, it100, HEX_BUDGET_ULP * 10u, HEX_BUDGET_REL * 10.0, /*quiet*/ true);
+    std::printf("  [%s] 4 vs 100 rotation iterations: %zu lanes beyond 10x the budget (worst %u ULP, rel %.3e)\n",
+                tag, g.mm, g.worstUlp, g.worstRel);
+    PXG_CHECK_MSG(g.mm > 0u, "%s: 4 and 100 rotation iterations must differ by >= 10x the budget", tag);
+}
+
+// 6 tets per voxel with masses on every corner and a rotated (0.5 rad, see nonAffineVoxel),
+// jittered seed: the general Jacobi path under the budget.  isFirstIteration is hard-wired
+// false (:1503), so this is a 4-iteration solve and the seed must keep it well-conditioned.
+PXG_TEST(softBodySimHexJacobi6Budget)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    HexBody b;
+    initBody(b, 6u, 5u, 16u);
+    b.acc = { 1u, 1u, 1u, 1u, 1u, 1u, 1u, 3u, 5u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 9u;
+    nonAffineVoxel(b, 3u, 0u, 0u, false, false, /*th*/ 0.5);
+    nonAffineVoxel(b, 4u, 8u, 2u, false, true, /*th*/ 0.5);
+    for (uint32_t v = 0; v < 16; ++v) b.delta[v] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchJacobi(dev, bodies, devs, { 1u }, 2u, false, invDt, mats);
+    HexBody want = upload, want100 = upload;
+    Stats st, st100;
+    jacobiKernel(want, invDt, false, mats, st, /*isFirstIteration*/ false);
+    jacobiKernel(want100, invDt, false, mats, st100, /*isFirstIteration*/ true);
+    checkIterationGap("hex6Budget", want, want100);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody("hex6Budget", want, got, HEX_BUDGET_ULP, HEX_BUDGET_REL);
+    std::printf("  [seam] hex 6-tet Jacobi: worst %u ULP, worst relative %.3e\n", r.worstUlp, r.worstRel);
+    PXG_CHECK_MSG(r.mm == 0, "6-tet Jacobi within the documented sin/cos budget (%zu)", r.mm);
+    PXG_CHECK_MSG(st.movedCorners >= 8u, "the budget tier must move corners (%u)", st.movedCorners);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// ---------------------------------------------------------------------------
+// The GS entry's hex branch (softBodyGM.cu:1450-1455): two private voxels, element 0
+// FLIPPED in partition 0 and element 1 non-flipped in partition 1, dispatched one partition
+// after the other with isFirstIteration = 1 (100 rotation iterations, still the fixed
+// point).  In-place p/v on the UNORDERED buffers, mSimDeltaPos += p - pos onto a non-zero
+// seed whose w is -0 (H2), an invMass -0 corner whose w must come back +0, velocities
+// changed on the mobile corners, and nothing in mSimDelta, the CP buffers or the remap.
+// Run under PGS and TGS: the hoisted isTGS must reach the hex branch (TGS stores no
+// multipliers, PGS does).
+// ---------------------------------------------------------------------------
+static void runHexGS5(bool isTGS)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot(0.35f) };
+    HexBody b;
+    initBody(b, 5u, 2u, 16u);
+    b.acc = { 1u, 2u, 2u, 2u, 2u, 2u, 2u, 2u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 8u;
+    privateVoxel(b, 0u, 0u, 0u, 0u, 0u, /*flipped*/ true, true, 0u, false);
+    privateVoxel(b, 1u, 8u, 3u, 0u, 0u, false, false, 0u, false);
+    for (uint32_t v = 0; v < 16; ++v)
+        b.deltaPos[v] = F4{ 0.125f + 0.0625f * float(v), -0.25f, 0.5f, -0.0f };
+    b.pos[8].w = -0.0f; b.vel[8].w = -0.0f;     // element 1 corner 0: massless, solved -> +0
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchGS(dev, bodies, devs, { 1u }, 1u, /*partition*/ 0u, isTGS, /*first*/ true, invDt, mats);
+    dispatchGS(dev, bodies, devs, { 1u }, 1u, /*partition*/ 1u, isTGS, /*first*/ true, invDt, mats, /*upload*/ false);
+    HexBody want = upload;
+    Stats st;
+    gsKernel(want, 0u, invDt, isTGS, true, mats, st);
+    gsKernel(want, 1u, invDt, isTGS, true, mats, st);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody(isTGS ? "hexGS5TGS" : "hexGS5", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "GS hex branch bit-exact vs the CUDA transcription (%zu)", r.mm);
+    uint32_t velMoved = 0;
+    for (uint32_t v = 0; v < 16; ++v)
+        if (f2u(got.vel[v].x) != f2u(upload.vel[v].x)) ++velMoved;
+    PXG_CHECK_MSG(velMoved >= 8u, "the GS tail must write the mobile corners' velocities (%u)", velMoved);
+    PXG_CHECK_MSG(f2u(got.pos[8].w) == 0u && f2u(got.vel[8].w) == 0u && f2u(got.deltaPos[3].w) == 0u,
+                  "w lanes: -0 invMass -> +0 (pos %08x vel %08x), deltaPos -0 + (+0) -> +0 (%08x)",
+                  f2u(got.pos[8].w), f2u(got.vel[8].w), f2u(got.deltaPos[3].w));
+    PXG_CHECK_MSG(sameBits(got.delta, upload.delta), "the GS tail must not write mSimDelta");
+    if (isTGS)
+        PXG_CHECK_MSG(got.mult == upload.mult, "TGS must not store multipliers");
+    else
+        PXG_CHECK_MSG(got.mult != upload.mult, "PGS must store the multipliers");
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+PXG_TEST(softBodySimHexGS5) { runHexGS5(/*isTGS*/ false); }
+PXG_TEST(softBodySimHexGS5TGS) { runHexGS5(/*isTGS*/ true); }
+
+// 6 tets per voxel through the GS entry, massless: routing, slots, in-place tail.
+PXG_TEST(softBodySimHexGS6Routing)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    HexBody b;
+    initBody(b, 6u, 5u, 40u);
+    b.acc = { 2u, 3u, 5u, 5u, 5u, 5u, 5u, 5u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 8u;
+    for (uint32_t w = 0; w < 5; ++w)
+        privateVoxel(b, w, 8u * w, 2u * w, 0u, 0u, false, /*bit*/ w == 4u, 0u, /*massless*/ true);
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchGS(dev, bodies, devs, { 1u }, 2u, /*partition*/ 2u, false, /*first*/ false, invDt, mats);
+    HexBody want = upload;
+    Stats st;
+    gsKernel(want, 2u, invDt, false, false, mats, st);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody("hexGS6Routing", want, got);
+    PXG_CHECK_MSG(r.mm == 0, "6-tet GS routing bit-exact (%zu)", r.mm);
+    // Massless and affine, so positions, velocities, mSimDeltaPos and the identity rotations
+    // all come back with their upload bits; the PGS multipliers are what moves (C != 0 for the
+    // stretched voxel, and with no mass dlambda = (-C - alpha*lambda)/alpha).
+    PXG_CHECK_MSG(want.mult != upload.mult && got.mult != upload.mult,
+                  "the GS hex branch must do work (the PGS multipliers of partition 2's voxels move)");
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// 6 tets per voxel through the GS entry with isFirstIteration = 1 from a large-rotation seed:
+// the budget tier, and the proof that the forwarded flag (100 iterations) is observable.
+PXG_TEST(softBodySimHexGS6Budget)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invDt = 60.0f;
+    const std::vector<p80solve::Material> mats = { coRot() };
+    HexBody b;
+    initBody(b, 6u, 2u, 16u);
+    b.acc = { 2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 8u;
+    nonAffineVoxel(b, 0u, 0u, 0u, false, false);
+    nonAffineVoxel(b, 1u, 8u, 2u, false, false);
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchGS(dev, bodies, devs, { 1u }, 2u, /*partition*/ 0u, false, /*first*/ true, invDt, mats);
+    HexBody want = upload, want4 = upload;
+    Stats st, st4;
+    gsKernel(want, 0u, invDt, false, /*first*/ true, mats, st);
+    gsKernel(want4, 0u, invDt, false, /*first*/ false, mats, st4);
+    checkIterationGap("hexGS6Budget", want4, want);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    const CmpResult r = compareBody("hexGS6Budget", want, got, HEX_BUDGET_ULP, HEX_BUDGET_REL);
+    std::printf("  [seam] hex 6-tet GS: worst %u ULP, worst relative %.3e\n", r.worstUlp, r.worstRel);
+    PXG_CHECK_MSG(r.mm == 0, "6-tet GS within the documented sin/cos budget (%zu)", r.mm);
+    for (auto& d : devs) destroyBody(dev, d);
+}
+
+// The GS early-out on eKINEMATIC is the existing tet-path code; this pins that the hex
+// branch sits behind it (regression only).
+PXG_TEST(softBodySimHexGSKinematic)
+{
+    using namespace p95hex;
+    PxgSlangComputeDevice* dev = testDevice();
+    const std::vector<p80solve::Material> mats = { coRot() };
+    HexBody b;
+    initBody(b, 5u, 1u, 8u);
+    b.acc = { 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u };
+    b.acc.resize(16u, POISON);
+    b.numPartitions = 8u;
+    b.bodyFlags = uint8_t(PxDeformableBodyFlag::eKINEMATIC);
+    privateVoxel(b, 0u, 0u, 0u, 0u, 0u, false, false, 0u, false);
+    const HexBody upload = b;
+    std::vector<HexBody> bodies = { idleBody(), b };
+    std::vector<DevHex> devs;
+    dispatchGS(dev, bodies, devs, { 1u }, 1u, 0u, false, true, 60.0f, mats);
+    const HexBody got = downloadBody(dev, upload, devs[1]);
+    PXG_CHECK_MSG(compareBody("hexGSKinematic", upload, got).mm == 0, "a kinematic voxel body must be untouched");
+    for (auto& d : devs) destroyBody(dev, d);
 }
 
 // MINIMAL REPRO, NOT REGISTERED.  Dispatch only — no CPU reference, no comparison, no

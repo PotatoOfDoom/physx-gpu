@@ -717,6 +717,12 @@ static const uint8_t kSbApplyExternalDeltas[] = { 8, 8, 4 };
 //   Two device pointers + three 4-byte scalars (@16/@20/@24) + two bools (@28/@29) + a
 //   device pointer realigned to @32 -> 40-byte blob (P8.0 tranche 6).
 static const uint8_t kSbSolveTetraPartition[] = { 8, 8, 4, 4, 4, 1, 1, 8 };
+//   sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch(PxgSoftBody* gSoftbodies,
+//     const PxU32* activeSoftbodies, const PxU32 numActiveSoftbodies, const PxReal invDt,
+//     bool isTGS, PxsDeformableVolumeMaterialData* materials)  -- launch site
+//   PxgSoftBodyCore.cpp:1245.  Two device pointers + two 4-byte scalars (@16/@20) + a bool
+//   (@24) + a device pointer realigned to @32 -> 40-byte blob (P9.95f).
+static const uint8_t kSbSolveTetraJacobi[] = { 8, 8, 4, 4, 1, 8 };
 //   sb_gm_updateTetrahedraRotationsLaunch / sb_updateTetrahedraRotationsLaunch(
 //     PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies)  -- launch sites
 //   PxgSoftBodyCore.cpp:747 and :790.  Same two-device-pointer pack as
@@ -2257,6 +2263,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     // gpusimulationcontroller softbody FEM-volume constraint solve (P8.0 tranche 6)
     { "sb_gm_cp_solveTetrahedronsPartitionLaunch", kSbSolveTetraPartition, uint32_t(sizeof(kSbSolveTetraPartition)) },
+    // gpusimulationcontroller softbody hex Jacobi partition (P9.95f)
+    { "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", kSbSolveTetraJacobi, uint32_t(sizeof(kSbSolveTetraJacobi)) },
     // gpusimulationcontroller softbody step closers (P8.0 tranche 7)
     { "sb_gm_cp_averageVertsLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
     { "sb_gm_applyDeformationDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 427;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 428;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -314,8 +314,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_solveOutputSCDeltaVLaunch", "softBodyClothSolveBda.spv", "sb_solveOutputSCDeltaVLaunch" },  // SB_SOLVE_SOFT_CLOTH_BOTH_DELTA (P8.8 step 6 BDA port — closes the softbody-vs-cloth chain)
     { "sb_solveOutputSPDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputSPDeltaVLaunch" },  // mapped P9.39e
     { "sb_solveOutputParticleDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputParticleDeltaVLaunch" },  // mapped P9.39e
-    { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port)
-    { "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", nullptr, nullptr },  // SB_GM_CP_SOLVE_TETRA_JACOBI_PARTITION (unmapped)
+    { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port; hex branch P9.95f)
+    { "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA_JACOBI_PARTITION (P9.95f BDA port: the 9th (Jacobi) partition of a voxel mesh with a duplicated voxel)
     { "sb_gm_updateTetModelVertsLaunch", "softBodySolveBda.spv", "sb_gm_updateTetModelVertsLaunch" },  // SB_GM_UPDATETETMODELVERTS (P8.0 tranche 7 BDA port)
     { "sb_gm_zeroTetMultipliers", "softBodySolveBda.spv", "sb_gm_zeroTetMultipliers" },  // SB_GM_ZERO_TETMULTIPLIERS (P8.0 tranche 4 BDA port)
     { "sb_gm_cp_averageVertsLaunch", "softBodySolveBda.spv", "sb_gm_cp_averageVertsLaunch" },  // SB_GM_CP_AVERAGEVERTS (P8.0 tranche 7 BDA port)

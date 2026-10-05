@@ -5791,6 +5791,286 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
 }
 
 // ===========================================================================
+// PXG_SCENE=softbodyhex (P9.95f): the first scene with a HEXAHEDRAL (voxel) simulation
+// mesh, and the observer for both callers of sb_gm_cp_solveHexahedronsPartition_parallelGS
+// (softBodyGM.cu:1313):
+//
+//   the hex branch of sb_gm_cp_solveTetrahedronsPartitionLaunch (softBodyGM.cu:1450-1455),
+//     which until P9.95f was a SILENT no-op in this port (the P8.0 tranche-6 scope ported
+//     only the one-tet-per-element path), and
+//   sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch (softBodyGM.cu:1463), the 9th
+//     ("Jacobi") partition, launched only when the cooker emits more than 8 partitions
+//     (PxgSoftBodyCore.cpp:1185) -- which it does for a hex mesh with a DUPLICATED voxel
+//     that shares a vertex with its predecessor (GuCookingTetrahedronMesh.cpp:696-768).
+//     Its deltas are folded back by sb_gm_applyDeformationDeltasLaunch, which this scene
+//     drives through the engine for the first time.
+//
+// Every voxel softbody the stock extension path makes (PxDeformableVolumeExt::
+// createDeformableVolumeMesh / createDeformableVolumeBox) has a hex simulation mesh, so
+// before P9.95f every one of them got NO elastic solve here, with no refusal and no
+// [pxg-unmapped] line.  physxextensions is not linked into this harness, so the voxel mesh
+// is hand-authored on the 27-vertex lattice of PXG_SCENE=softbody:
+//   - corner j of a cell is (x + bit2, y + bit1, z + bit0), the PhysX tetmaker convention
+//     (ExtDelaunayBoundaryInserter.cpp:1344-1346), cells looped z outer, x inner;
+//   - each cell is the 5 tets of tets5PerVoxel (softBodyGM.cu:1211-1213), the flipped half
+//     (offset 20) on odd (x+y+z), emitted WITHOUT reorientation: the cooker recovers the
+//     8 corners from that exact 20-index layout (GuCookingTetrahedronMesh.cpp:413-414,
+//     flipped test :737), and every one of the 45 tets is positively oriented already;
+//   - vertex 0 is corner 0 of the first voxel, which keeps the cooker's voxel-width seed
+//     (it seeds min/max from vertexPositions[0], :659-669 -- an upstream quirk) honest.
+// PXG_SB_HEX selects the arm:
+//   box   the 8 voxels: 27 verts / 40 tets / 8 partitions.  No Jacobi launch at all; it
+//         drives the GS hex branch only.
+//   fork  (the default) adds a TWIN of cell (0,0,0) right after it, sharing its +x face
+//         (verts 9,10,12,13) with 4 private verts 27..30 at the positions of {0,1,3,4}:
+//         31 verts / 45 tets / 9 partitions, the twin alone in partition 8.  Verts 27..30
+//         are touched by NO GS voxel, so with gravity off only the Jacobi kernel (through
+//         applyDeformationDeltas) can ever move them.
+// The collision mesh is the 40-tet alternating-split cube of PXG_SCENE=softbody; the cooker
+// computes the embedding.  Gravity is off and there is no floor, so only the constitutive
+// solve can change anything: the body is spawned stretched 1.6x along y and must relax.
+// ===========================================================================
+struct SoftBodyHexScene
+{
+    PxDeformableVolume* volume = nullptr;
+    PxCudaContextManager* cudaCtx = nullptr;
+    PxU32 nbSim = 0;
+    PxU32 nbSimTets = 0;
+    std::vector<PxVec3> simRest;   // the cooked sim mesh's REST vertices (unstretched)
+    bool fork = false;
+    float stretchY = 1.0f;
+};
+
+// The voxel simulation mesh (see the scene header).
+static void buildHexSimMesh(bool fork, std::vector<PxVec3>& verts, std::vector<PxU32>& tets)
+{
+    // tets5PerVoxel (softBodyGM.cu:1211-1213): rows 0..4 non-flipped, 5..9 flipped.
+    static const PxU32 tets5[40] = { 0, 6, 3, 5,   0, 1, 5, 3,   6, 7, 3, 5,   4, 5, 6, 0,   2, 3, 0, 6,
+                                     1, 7, 4, 2,   1, 0, 2, 4,   7, 6, 4, 2,   5, 4, 1, 7,   3, 2, 7, 1 };
+    const PxU32 cells = 2, n = cells + 1;
+    const float h = 0.5f;
+    verts.clear(); tets.clear();
+    for (PxU32 i = 0; i < n; ++i)
+        for (PxU32 j = 0; j < n; ++j)
+            for (PxU32 k = 0; k < n; ++k)
+                verts.push_back(PxVec3(float(i) * h - 0.5f, float(j) * h - 0.5f, float(k) * h - 0.5f));
+    auto vid = [n](PxU32 i, PxU32 j, PxU32 k) { return (i * n + j) * n + k; };
+    auto emit = [&](const PxU32 c[8], PxU32 flip) {
+        for (PxU32 e = 0; e < 20; ++e) tets.push_back(c[tets5[20 * flip + e]]);
+    };
+    for (PxU32 z = 0; z < cells; ++z)
+        for (PxU32 y = 0; y < cells; ++y)
+            for (PxU32 x = 0; x < cells; ++x)
+            {
+                PxU32 c[8];
+                for (PxU32 j = 0; j < 8; ++j)
+                    c[j] = vid(x + ((j >> 2) & 1u), y + ((j >> 1) & 1u), z + (j & 1u));
+                const PxU32 flip = (x + y + z) % 2u;
+                emit(c, flip);
+                if (fork && x == 0 && y == 0 && z == 0)
+                {
+                    // The twin: same cell, corners 0..3 (the -x face) replaced by private copies.
+                    PxU32 c2[8];
+                    for (PxU32 j = 0; j < 8; ++j) c2[j] = c[j];
+                    for (PxU32 j = 0; j < 4; ++j)
+                    {
+                        verts.push_back(verts[c[j]]);
+                        c2[j] = PxU32(verts.size() - 1);
+                    }
+                    emit(c2, flip);
+                }
+            }
+}
+
+// The 40-tet alternating-split cube of buildSoftBodyScene (same splits, same orientation
+// fix), used here as the COLLISION mesh only.
+static void buildAlternatingCubeTets(std::vector<PxVec3>& tverts, std::vector<PxU32>& tets)
+{
+    const PxU32 cells = 2, n = cells + 1;
+    const float size = 1.0f, h = size / float(cells);
+    tverts.clear(); tets.clear();
+    for (PxU32 i = 0; i < n; ++i)
+        for (PxU32 j = 0; j < n; ++j)
+            for (PxU32 k = 0; k < n; ++k)
+                tverts.push_back(PxVec3(float(i) * h - 0.5f * size, float(j) * h - 0.5f * size,
+                                        float(k) * h - 0.5f * size));
+    auto vid = [n](PxU32 i, PxU32 j, PxU32 k) { return (i * n + j) * n + k; };
+    static const PxU32 splitA[5][4] = { {0,1,2,4}, {1,3,2,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7} };
+    static const PxU32 splitB[5][4] = { {0,1,3,5}, {0,3,2,6}, {0,5,4,6}, {3,7,5,6}, {0,3,5,6} };
+    for (PxU32 i = 0; i < cells; ++i)
+        for (PxU32 j = 0; j < cells; ++j)
+            for (PxU32 k = 0; k < cells; ++k)
+            {
+                const PxU32 c[8] = { vid(i, j, k), vid(i + 1, j, k), vid(i, j + 1, k), vid(i + 1, j + 1, k),
+                                     vid(i, j, k + 1), vid(i + 1, j, k + 1), vid(i, j + 1, k + 1),
+                                     vid(i + 1, j + 1, k + 1) };
+                const bool even = ((i + j + k) & 1u) == 0u;
+                for (PxU32 t = 0; t < 5; ++t)
+                {
+                    PxU32 a = c[even ? splitA[t][0] : splitB[t][0]];
+                    PxU32 b = c[even ? splitA[t][1] : splitB[t][1]];
+                    PxU32 cc = c[even ? splitA[t][2] : splitB[t][2]];
+                    PxU32 d = c[even ? splitA[t][3] : splitB[t][3]];
+                    const PxVec3 e1 = tverts[b] - tverts[a];
+                    const PxVec3 e2 = tverts[cc] - tverts[a];
+                    const PxVec3 e3 = tverts[d] - tverts[a];
+                    if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
+                    tets.push_back(a); tets.push_back(b); tets.push_back(cc); tets.push_back(d);
+                }
+            }
+}
+
+SoftBodyHexScene buildSoftBodyHexScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                       PxCudaContextManager* cudaCtx, bool fork, float stretchY)
+{
+    SoftBodyHexScene out;
+    out.cudaCtx = cudaCtx;
+    out.fork = fork;
+    out.stretchY = stretchY;
+
+    // No floor: the ground box is parked far below, as PXG_SB_FLOOR=none does.  The one
+    // dynamic rigid body is the island the rigid PGS/TGS solve needs (see buildSoftBodyScene).
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
+
+    std::vector<PxVec3> simVerts3, collVerts3;
+    std::vector<PxU32> simTets, collTets;
+    buildHexSimMesh(fork, simVerts3, simTets);
+    buildAlternatingCubeTets(collVerts3, collTets);
+
+    PxTetrahedronMeshDesc simDesc;
+    simDesc.points.count = PxU32(simVerts3.size());
+    simDesc.points.stride = sizeof(PxVec3);
+    simDesc.points.data = simVerts3.data();
+    simDesc.tetrahedrons.count = PxU32(simTets.size() / 4);
+    simDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+    simDesc.tetrahedrons.data = simTets.data();
+    simDesc.tetsPerElement = 5;   // PxTetrahedronMeshDesc::eHEX_MESH, 5 tets per voxel
+
+    PxTetrahedronMeshDesc collDesc;
+    collDesc.points.count = PxU32(collVerts3.size());
+    collDesc.points.stride = sizeof(PxVec3);
+    collDesc.points.data = collVerts3.data();
+    collDesc.tetrahedrons.count = PxU32(collTets.size() / 4);
+    collDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+    collDesc.tetrahedrons.data = collTets.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshWeldTolerance = 0.001f;
+    ckParams.midphaseDesc = PxMeshMidPhase::eBVH34;
+
+    // The SIMULATION desc comes first (Cooking.cpp:135).
+    PxDeformableVolumeSimulationDataDesc simDataDesc;
+    PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
+        ckParams, simDesc, collDesc, simDataDesc, physics->getPhysicsInsertionCallback());
+    if (!volMesh) { std::printf("FAIL: createDeformableVolumeMesh (hex sim mesh) returned null\n"); return out; }
+
+    const PxU32 wantVerts = fork ? 31u : 27u, wantTets = fork ? 45u : 40u;
+    if (volMesh->getSimulationMesh()->getNbVertices() != wantVerts ||
+        volMesh->getSimulationMesh()->getNbTetrahedrons() != wantTets)
+    {
+        std::printf("FAIL: the cooked hex sim mesh has %u verts / %u tets, expected %u / %u -- the "
+                    "vertex numbering the checks rely on is gone\n",
+                    volMesh->getSimulationMesh()->getNbVertices(),
+                    volMesh->getSimulationMesh()->getNbTetrahedrons(), wantVerts, wantTets);
+        return out;
+    }
+
+    // The material of the stretched PXG_SCENE=softbody cube (damped so the relaxation settles).
+    PxDeformableVolumeMaterial* volMat =
+        physics->createDeformableVolumeMaterial(/*youngs*/ 1.e5f, /*poissons*/ 0.3f,
+                                                /*dynamicFriction*/ 0.5f, /*elasticityDamping*/ 0.05f);
+    PxDeformableVolumeMaterial* mats[1] = { volMat };
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()),
+                                          mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable volume) returned null\n"); return out; }
+    PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
+    if (!volume) { std::printf("FAIL: createDeformableVolume returned null\n"); return out; }
+    volume->attachShape(*shape);
+    shape->release();
+    volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
+    volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    volume->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+    volume->setLinearDamping(0.0f);
+    volume->setMaxLinearVelocity(1.0e6f);
+    // KEPT AWAKE: with a sleep threshold of 0 sb_sleeping's `magSq >= tolerance*tolerance`
+    // (softBodyGM.cu:3163-3178) holds for every vertex, so the solve runs on every step.  Measured before the port,
+    // with the default threshold, the motionless body fell asleep after 26 steps (130 Jacobi
+    // attempts = 26 x 5 iterations instead of 120 x 5), which would let a dead kernel pass
+    // for a converged one and make the launch counts depend on the physics.
+    volume->setSleepThreshold(0.0f);
+    const char* itersEnv = std::getenv("PXG_SB_ITERS");
+    static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(itersEnv ? PxU32(atoi(itersEnv)) : 4u, 1u);
+    scene->addActor(*volume);
+
+    // Host mirror, as in buildSoftBodyScene: spawned stretched along y at y ~ 4, at rest.
+    const float spawnY = 4.0f;
+    const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
+    const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
+    std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
+    const PxVec3* sv = volume->getSimulationMesh()->getVertices();
+    const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
+    for (PxU32 v = 0; v < nbSim; ++v)
+    {
+        const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
+        simPos[v] = PxVec4(sv[v].x, sv[v].y * stretchY + spawnY, sv[v].z, im);
+        simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
+    }
+    const PxVec3* cv = volume->getCollisionMesh()->getVertices();
+    for (PxU32 v = 0; v < nbColl; ++v)
+    {
+        collPos[v] = PxVec4(cv[v].x, cv[v].y * stretchY + spawnY, cv[v].z, 1.0f);
+        restPos[v] = collPos[v];
+    }
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
+                    simPos.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
+                    simVel.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
+                    collPos.data(), nbColl * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
+                    restPos.data(), nbColl * sizeof(PxVec4));
+    volume->markDirty(PxDeformableVolumeDataFlag::eALL);
+
+    out.volume = volume;
+    out.nbSim = nbSim;
+    out.nbSimTets = volume->getSimulationMesh()->getNbTetrahedrons();
+    out.simRest.assign(sv, sv + nbSim);
+    std::printf("  softbodyhex mesh (%s): %u sim verts / %u sim tets (tetsPerElement 5), %u collision verts\n",
+                fork ? "fork" : "box", nbSim, out.nbSimTets, nbColl);
+    return out;
+}
+
+static std::vector<PxVec4> softBodyHexReadSim(const SoftBodyHexScene& s)
+{
+    std::vector<PxVec4> host(s.nbSim);
+    s.cudaCtx->getCudaContext()->memcpyDtoH(
+        host.data(), reinterpret_cast<CUdeviceptr>(s.volume->getSimPositionInvMassBufferD()),
+        s.nbSim * sizeof(PxVec4));
+    return host;
+}
+
+// y extent (max - min) over a vertex index range [b, e) or an explicit list.
+static float softBodyHexExtY(const std::vector<PxVec4>& p, PxU32 b, PxU32 e)
+{
+    float lo = p[b].y, hi = p[b].y;
+    for (PxU32 i = b + 1; i < e; ++i) { lo = PxMin(lo, p[i].y); hi = PxMax(hi, p[i].y); }
+    return hi - lo;
+}
+static float softBodyHexExtY(const std::vector<PxVec4>& p, const PxU32* ids, PxU32 n)
+{
+    float lo = p[ids[0]].y, hi = p[ids[0]].y;
+    for (PxU32 i = 1; i < n; ++i) { lo = PxMin(lo, p[ids[i]].y); hi = PxMax(hi, p[ids[i]].y); }
+    return hi - lo;
+}
+
+// ===========================================================================
 // PXG_SCENE=softbodyselfcollide (P8.4): the FEM-VOLUME SELF-collision scene.
 //
 // The softbody analogue of PXG_SCENE=clothselfcollide, and the first scene that drives
@@ -9497,6 +9777,203 @@ int main()
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: softbody free-fall checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=softbodyhex (P9.95f): the voxel softbody.  See buildSoftBodyHexScene's header.
+    if (!std::strcmp(sceneName, "softbodyhex"))
+    {
+        const char* hexEnv = std::getenv("PXG_SB_HEX");
+        if (hexEnv && std::strcmp(hexEnv, "box") && std::strcmp(hexEnv, "fork"))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: PXG_SB_HEX=%s is not an arm (box | fork)\n", hexEnv);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        const bool fork = !hexEnv || !std::strcmp(hexEnv, "fork");
+        const char* stretchEnv = std::getenv("PXG_SB_STRETCH");
+        const float stretchY = stretchEnv ? float(atof(stretchEnv)) : 1.6f;
+        SoftBodyHexScene hs = buildSoftBodyHexScene(physics, scene, material, cudaCtx, fork, stretchY);
+        if (!hs.volume)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyhex scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyhex' built: a %u-vertex VOXEL softbody (%s arm), gravity off, "
+                    "no floor, spawn stretch %.2fx\n", hs.nbSim, fork ? "fork" : "box", stretchY);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyhex GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_SB_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        // Verts 27..30 are the twin's private -x face; {0,1,3,4} are the original cell's.
+        static const PxU32 kFace[4] = { 0u, 1u, 3u, 4u };
+        static const PxU32 kTwin[4] = { 27u, 28u, 29u, 30u };
+
+        const std::vector<PxVec4> p0 = softBodyHexReadSim(hs);
+        const float latExt0 = softBodyHexExtY(p0, 0u, 27u);
+        const float twinExt0 = fork ? softBodyHexExtY(p0, kTwin, 4u) : 0.0f;
+        // MASS-weighted centre (D7): the cooker's masses are not uniform, and the XPBD solve
+        // conserves sum(p/w), not the plain mean.
+        auto massCom = [](const std::vector<PxVec4>& p) {
+            double sx = 0.0, sy = 0.0, sz = 0.0, sm = 0.0;
+            for (const PxVec4& q : p)
+                if (q.w > 0.0f)
+                { const double m = 1.0 / double(q.w); sx += q.x * m; sy += q.y * m; sz += q.z * m; sm += m; }
+            return PxVec3(float(sx / sm), float(sy / sm), float(sz / sm));
+        };
+        const PxVec3 com0 = massCom(p0);
+        std::printf("  stepping the voxel softbody (%d x %.4fs): lattice y-extent %.5f%s, mass-weighted "
+                    "centre (%.5f, %.5f, %.5f)\n", steps, dt, latExt0,
+                    fork ? "" : " (box arm: 8 partitions, no Jacobi voxel)", com0.x, com0.y, com0.z);
+        if (fork)
+            std::printf("  twin face (verts 27..30) y-extent %.5f at spawn\n", twinExt0);
+
+        bool latUnmovedEver = true, twinUnmovedEver = true;
+        std::vector<PxVec4> p = p0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            p = softBodyHexReadSim(hs);
+            const float latExt = softBodyHexExtY(p, 0u, 27u);
+            if (latExt != latExt0) latUnmovedEver = false;
+            float twinExt = 0.0f, faceExt = 0.0f;
+            if (fork)
+            {
+                twinExt = softBodyHexExtY(p, kTwin, 4u);
+                faceExt = softBodyHexExtY(p, kFace, 4u);
+                if (twinExt != twinExt0) twinUnmovedEver = false;
+            }
+            if (i < 3 || i == steps - 1 || (i % 10 == 0))
+            {
+                if (fork)
+                    std::printf("    step %3d: lattice y-extent %.5f, twin face %.5f, original -x face %.5f\n",
+                                i, latExt, twinExt, faceExt);
+                else
+                    std::printf("    step %3d: lattice y-extent %.5f\n", i, latExt);
+            }
+        }
+
+        int failures = 0;
+        bool finite = true;
+        for (const PxVec4& q : p)
+            if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) || !std::isfinite(q.w)) finite = false;
+        if (!finite) { std::printf("FAIL: a simulation position went non-finite\n"); ++failures; }
+
+        // (a) the GS hex branch: the lattice must relax.  Before P9.95f it stayed BIT-EQUAL to
+        // the spawn extent at every step (the hex branch was a no-op, averaging is off for hex).
+        const float latExt = softBodyHexExtY(p, 0u, 27u);
+        std::printf("  lattice (verts 0..26) y-extent: %.5f -> %.5f (rest 1.00000)%s\n", latExt0, latExt,
+                    latUnmovedEver ? " -- BIT-EQUAL to the spawn extent at every step" : "");
+        if (!(latExt < latExt0 - 0.1f))
+        { std::printf("FAIL: (a) the voxel lattice did not relax (%.5f -> %.5f) -- the GS hex branch "
+                      "of sb_gm_cp_solveTetrahedronsPartitionLaunch did no work\n", latExt0, latExt); ++failures; }
+
+        // (b) the Jacobi partition: the twin's private face must relax AND track the original
+        // cell's -x face it duplicates.
+        if (fork)
+        {
+            const float twinExt = softBodyHexExtY(p, kTwin, 4u);
+            const float faceExt = softBodyHexExtY(p, kFace, 4u);
+            float maxGap = 0.0f;
+            for (PxU32 j = 0; j < 4; ++j)
+            {
+                const PxVec3 d(p[kTwin[j]].x - p[kFace[j]].x, p[kTwin[j]].y - p[kFace[j]].y,
+                               p[kTwin[j]].z - p[kFace[j]].z);
+                maxGap = PxMax(maxGap, d.magnitude());
+            }
+            // Measured at 120 steps (P9.95f): |ext diff| 1.2e-6 / max corner gap 2.7e-6 (TGS) and
+            // 2.4e-7 / 2.6e-7 (PGS) -- the twin relaxes onto its original -- so tolB is the 0.02
+            // floor, still ~15x below the 0.29 gap a skipped Jacobi kernel leaves.
+            const float tolB = 0.02f;
+            std::printf("  twin face (verts 27..30) y-extent: %.5f -> %.5f; original -x face %.5f; "
+                        "|ext diff| %.2e, max |p[27+j] - p[face j]| %.2e (tolB %.3f)%s\n",
+                        twinExt0, twinExt, faceExt, PxAbs(twinExt - faceExt), maxGap, tolB,
+                        twinUnmovedEver ? " -- BIT-EQUAL to its spawn extent at every step" : "");
+            if (!(PxAbs(twinExt - twinExt0) > 0.1f))
+            { std::printf("FAIL: (b) the twin voxel's private face did not relax (%.5f -> %.5f) -- "
+                          "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch did no work\n", twinExt0, twinExt); ++failures; }
+            else if (!(PxAbs(twinExt - faceExt) < tolB && maxGap < tolB))
+            { std::printf("FAIL: (b) the twin face does not track the original -x face (|ext diff| %.5f, "
+                          "max gap %.5f, tol %.3f)\n", PxAbs(twinExt - faceExt), maxGap, tolB); ++failures; }
+        }
+
+        // (f) the lattice relaxes to its REST SHAPE, not merely to something shorter than the
+        // spawn: the largest error of any of the 351 pairwise distances among verts 0..26 against
+        // the cooked rest mesh.  (The final y-extent is NOT 1.0 -- 1.0067 box, 1.035 fork --
+        // because the relaxed body ends slightly ROTATED; the shape itself is exact.)  Measured
+        // (P9.95f, 120 steps): <= 2.5e-6 in all four arms; a sub-tet table row with two corners
+        // swapped (an inverted rest pose) ends at 1.0 and the spawn is 0.6, so tolShape is a
+        // 1e-3 floor.  It does NOT see the flipped-table offset dropped (20 -> 0): every
+        // non-flipped row i is the image of flipped row 5+i under a PROPER cube rotation
+        // (180 deg about (1,1,0) for rows 0..2, about (1,-1,0) for rows 3..4), and an isotropic
+        // material is invariant under that rest-frame rotation, so that mutant relaxes to the
+        // same rest shape (shape error 1.4e-6) -- the fixtures' bitwise rotations kill it.
+        float shapeErr = 0.0f, shapeErr0 = 0.0f;
+        for (PxU32 i = 0; i < 27u; ++i)
+            for (PxU32 j = i + 1; j < 27u; ++j)
+            {
+                const float d0 = (hs.simRest[i] - hs.simRest[j]).magnitude();
+                const PxVec3 a(p[i].x - p[j].x, p[i].y - p[j].y, p[i].z - p[j].z);
+                const PxVec3 a0(p0[i].x - p0[j].x, p0[i].y - p0[j].y, p0[i].z - p0[j].z);
+                shapeErr = PxMax(shapeErr, PxAbs(a.magnitude() - d0));
+                shapeErr0 = PxMax(shapeErr0, PxAbs(a0.magnitude() - d0));
+            }
+        const float tolShape = 1.0e-3f;
+        std::printf("  lattice shape error (max |pairwise distance - rest|, 351 pairs): %.5f at spawn -> %.2e "
+                    "(tol %.3f)\n", shapeErr0, shapeErr, tolShape);
+        if (!(shapeErr < tolShape))
+        { std::printf("FAIL: (f) the voxel lattice did not relax to its rest shape (shape error %.5f -> %.5f, "
+                      "tol %.3f)\n", shapeErr0, shapeErr, tolShape); ++failures; }
+
+        // (c) nothing but internal forces acts, so the mass-weighted centre must stay put.
+        const PxVec3 com = massCom(p);
+        const float comDrift = (com - com0).magnitude();
+        // Not zero, and measured rather than assumed (P9.95f, 120 steps, default settling):
+        // fork TGS 2.199e-3, box TGS 1.396e-3, fork PGS 6.655e-4, box PGS 5.269e-4.  Under PGS
+        // it is the settling damping in sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3176-3180,
+        // :3195), which scales each slow vertex's velocity on its own: with the settling
+        // threshold and damping forced to 0 the PGS drift drops to 2.9e-6 (box) / 1.7e-5
+        // (fork), i.e. the hex solve conserves sum(p/w) to rounding.  Under TGS a drift remains
+        // even then (1.0e-2 box, 2.0e-2 fork).  A likely source, READ FROM THE CODE and NOT
+        // measured as the cause: TGS turns on alwaysRunVelocityAveraging
+        // (PxgSoftBodyCore.cpp:916, isTGS && !externalForcesEveryTgsIteration), and
+        // sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3136-3217, blend at :3187-3196) then
+        // blends each vertex's velocity toward deltaPos/dt on its own, and only where
+        // |deltaPos/dt| < |v|.  A per-vertex, conditional rewrite like that does not conserve
+        // momentum, which is consistent with a drift that appears only under TGS.  tolC is
+        // ~10x the default-settling worst; a stray push of the size the relaxation moves (0.3)
+        // is still >10x beyond it.
+        const float tolC = 0.025f;
+        std::printf("  mass-weighted centre drift %.3e (tol %.1e)\n", comDrift, tolC);
+        if (!(comDrift < tolC))
+        { std::printf("FAIL: (c) the mass-weighted centre moved %.3e with only internal forces acting\n",
+                      comDrift); ++failures; }
+
+        // (e) from the plan (box arm: 0 Jacobi and 0 applyDeformationDeltas launches) is NOT
+        // asserted here.  The harness has no per-kernel launch counter: the bridge exposes only
+        // pxgUnmappedLaunchCount, which counts launches of UNMAPPED kernels, and both kernels
+        // are mapped.  The counts were read from PXG_LAUNCH_TRACE=1 runs instead (P9.95f, 120
+        // steps, TGS and PGS alike): GS / Jacobi / applyDeformationDeltas = 4800 / 600 / 600
+        // in the fork arm and 4800 / 0 / 0 in the box arm.  That the fork arm really reaches
+        // the Jacobi partition is proven by the manual A/B (AB1: manifest row of
+        // sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch set to nullptr), under which (b) fails
+        // with the twin face BIT-EQUAL to its spawn extent at every step.
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the VOXEL softbody relaxed on Vulkan (lattice %.5f -> %.5f)%s\n",
+                        latExt0, latExt, fork ? ", and the Jacobi twin voxel tracked its original" : "");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyhex checks failed (%d)\n", failures);
         return 2;
     }
 

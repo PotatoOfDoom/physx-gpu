@@ -153,6 +153,7 @@ sb_clothContactGenLaunch                               0@0+4:tolerenceLength;12@
 sb_clothMidphaseGeneratePairsLaunch                    0@0+4:toleranceLength;3@24+8:bounds                            # dead-upstream
 sb_clothVertContactGenLaunch                           0@0+4:tolerenceLength;2@16+8:transformCache                    # dead-upstream
 sb_clothVertMidphaseGeneratePairsLaunch                0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
+sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch        2@16+4:numActiveSoftbodies                                     # dead-upstream
 sb_gm_cp_solveTetrahedronsPartitionLaunch              2@16+4:numActiveSoftbodies                                     # dead-upstream
 sb_gm_preIntegrateLaunch                               5@40+8:speculativeCCDContactOffset                             # deferred
 sb_heightfieldMidphaseGeneratePairsLaunch              1@4+4:toleranceLength                                          # dead-upstream

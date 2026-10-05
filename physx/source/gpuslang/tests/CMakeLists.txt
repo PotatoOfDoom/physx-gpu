@@ -1316,6 +1316,10 @@ pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
                    sb_gm_updateTetrahedraRotationsLaunch
                    sb_updateTetrahedraRotationsLaunch
                    sb_gm_cp_solveTetrahedronsPartitionLaunch
+# P9.95f: the hex (voxel) Jacobi partition -- the 9th partition of a voxel mesh, sharing
+# sb_gm_cp_solveHexahedronsPartition_parallelGS with the GS entry's hex branch.  IS in
+# PXG_NOCONTRACT_SHADERS already (`p + dp`, `v + dp*invDt`).
+                   sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch
 # P8.0 tranche 7: the three kernels that CLOSE the softbody step —
 # sb_gm_cp_averageVertsLaunch merges the per-partition vertex copies,
 # sb_gm_applyDeformationDeltasLaunch is the Jacobi twin of applyExternalDeltas, and

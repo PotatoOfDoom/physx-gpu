@@ -123,7 +123,12 @@ trimeshHeightfieldNarrowphase
 # PXG_SCENE=softbodydata through PxScene::copySoftBodyData / applySoftBodyData, which no
 # scene had called.  Its host pack pushes the 32-byte PxgTypedCudaBuffer OBJECT as
 # argument 0, so its ABI row is the 80-byte host pack, not the 56-byte signature.
-sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch
+# sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch -- MAPPED in P9.95f (softBodySolveBda.spv),
+# DRIVEN by PXG_SCENE=softbodyhex (fork arm): the 9th ("Jacobi") partition the cooker emits
+# only for a VOXEL simulation mesh with a duplicated voxel -- no scene had ever built a hex
+# sim mesh.  It shares sb_gm_cp_solveHexahedronsPartition_parallelGS with the hex branch of
+# the GS kernel, which was a silent no-op until the same tranche.  Red measured first:
+# 600 unmapped launches over 120 steps, the twin voxel's private face bit-unmoved at 0.80000.
 # sb_plasticDeformLaunch / sb_plasticDeformLaunch2 -- P9.79's liveness audit found
 # that PxgSoftBodyCore::plasticDeformation() has EXACTLY ONE call site in the tree
 # and it is COMMENTED OUT (PxgSoftBodyCore.cpp:986, `//plasticDeformation();`).

@@ -8035,5 +8035,14 @@
 ],
 "verdict": "BENIGN",
 "why": "P9.94b: the P9.91 BDA port lifted this line, with the same seeds, barriers, runtime selects and operand order, from thresholdStream.slang, where it was judged: prevBlockForce may be the +0 seed on the first iteration. But val + accumVal is never -0 (accumVal zero is always +0), so x + (+0) == x whether folded or not. The associativity order matches CUDA."
+},
+{
+"file": "softBodySolveBda.slang",
+"code": "const float3 sum = dl.c0 + dl.c1 + dl.c2;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.95f: the hex sub-tet's `sum = c0 + c1 + c2` (softBodyGM.cu:1184), same dl and same left association as the tet path's reviewed `-(dl.c0 + dl.c1 + dl.c2)`. dl is sbTetrahedronsSolveGM's return: on the youngs < threshold early return it is the literal sbMat33Zero (all three addends literal +0 -> exact constant fold, +0 = IEEE); on the co-rotational path every lane has passed sbPlusZero3 (never -0, so a folded x + (+0) == x, and a computed c0 + c1 is never -0 in round-to-nearest); the neo-Hookean return is computed (d += sv). No input separates folded from unfolded."
 }
 ]

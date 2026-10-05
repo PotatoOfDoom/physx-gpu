@@ -74,6 +74,7 @@
 // seam.
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mSimPosition_InvMass@96, ...)
+import pxgSlangAtomicFloat;    // P9.95f: pxgAtomicAddF4XYZ / pxgAtomicAddF4W (the hex Jacobi tail)
 
 // PxgSpatialVectorBlock (PxgArticulation.h:77): float4 mTopxyz_bx[32] @0, float2 mbyz[32]
 // @512 -> 768-byte stride.
@@ -476,9 +477,10 @@ void sb_updateTetrahedraRotationsLaunch(uint3 groupThreadId : SV_GroupThreadID, 
 //
 // SCOPE: the mNumTetsPerElement == 1 (pure tetrahedral mesh) path.  The hexahedral
 // sibling (sb_gm_cp_solveHexahedronsPartition_parallelGS, taken when
-// mNumTetsPerElement != 1) is a separate arg-compatible branch and is NOT ported here;
-// the kernel reproduces the .cu's dispatch and simply performs no work in that case,
-// which is faithful for every tet-mesh softbody (the only kind the harness builds).
+// mNumTetsPerElement != 1) was NOT ported by this tranche, and until P9.95f the kernel
+// performed no work at all for a voxel mesh -- a silent no-op for every softbody the
+// stock extension path builds.  P9.95f ported it: see the P9.95f block below, which
+// also carries the 9th-partition Jacobi entry that shares the same device function.
 //
 // Doctrine: descriptor through Ptr<> from the byte-exact pxgSlangSoftBodyDesc mirror.
 // Fields touched: mSimVelocity_invMassCP @176, mSimPosition_InvMassCP @184,
@@ -548,6 +550,28 @@ SbMaterial sbLoadMaterial(uint64_t materials, uint index)
     m.dampingScale = float(packed & 0xffffu) * (1.0f / 65535.0f);
     m.materialModel = (packed >> 16) & 0xffffu;
     return m;
+}
+
+// Element i of a PxU16 array at `base` (mOrderedMaterialIndices): read the containing 32-bit
+// word.  P9.95f factored this out of the GS tet body so the hex path reads the same way.
+uint sbReadU16(uint64_t base, uint i)
+{
+    const uint64_t matIdxAddr = base + uint64_t(i) * 2UL;
+    // NOTE THE `~uint64_t(3)`.  Writing the obvious `matIdxAddr & ~3UL` MISCOMPILES:
+    // Slang evaluates `~3UL` in 32 bits, and the resulting 0xFFFFFFFC is then
+    // zero-extended for the 64-bit AND — which silently clears the TOP HALF of the
+    // device address.  The read then lands at a garbage address and the driver
+    // faults.  Verified in isolation (tools/lvprepro): `& ~3UL` faults, while
+    // `& ~uint64_t(3)`, `& ~3ull`, `& 0xFFFFFFFFFFFFFFFCUL` and
+    // `- (matIdxAddr % 4UL)` all run clean on the same shader and data.  Note that
+    // `ull` DOES widen the complement correctly while `UL` does not — the sweep in
+    // tools/lvprepro/ultest.slang prints the surviving address for each spelling.
+    const uint matWord = Ptr<uint>(matIdxAddr & ~uint64_t(3))[0];
+    // Which half of the word: derive it from the ADDRESS, not from the index's
+    // parity — that only coincides when the array base is 4-aligned, and nothing
+    // in the engine promises that.
+    const uint matHalf = uint((matIdxAddr >> 1) & 1UL);
+    return (matHalf != 0u) ? (matWord >> 16) : (matWord & 0xffffu);
 }
 
 // --- PxMat33 as a struct of three columns ---------------------------------------------
@@ -900,6 +924,332 @@ void sbScatter(Ptr<float4> curPositions, Ptr<float4> velocities, uint writeIndex
     velocities[writeIndex] = float4(v.x + deltaV.x, v.y + deltaV.y, v.z + deltaV.z, v.w);
 }
 
+// ===========================================================================
+// P9.95f — the HEXAHEDRAL (voxel) solve.
+//
+//   sb_gm_cp_solveHexahedronsPartition_parallelGS<updatePosVel> (softBodyGM.cu:1313-1404)
+//     with its per-sub-tet body sb_gm_cp_solveSubTetrahedron (softBodyGM.cu:1149-1205),
+//   called from TWO kernels:
+//     <true>  the hex `else` branch of sb_gm_cp_solveTetrahedronsPartitionLaunch
+//             (softBodyGM.cu:1449-1455; launch PxgSoftBodyCore.cpp:1196-1213), and
+//     <false> sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch (softBodyGM.cu:1463-1507;
+//             LAUNCH PxgSoftBodyCore.cpp:1230-1247, guarded by hasExtraJacobi =
+//             maxPartitions > 8 at :1185; grid (ceil(maxJacobiTets/32), nbActive, 1),
+//             block SB_SOLVETETRA_LOW = 32).
+//
+// A voxel mesh (PxTetrahedronMeshDesc::tetsPerElement 5 or 6) is solved per ELEMENT: one
+// thread gathers the voxel's 8 corners through mSimPullIndices[w] and [w + nbElements]
+// (the MSB of pull[w].x is the voxel's FLIPPED bit), solves its 5 or 6 sub-tets in order
+// on the gathered copies, and writes back.  The GS form writes positions/velocities in
+// place and accumulates mSimDeltaPos; the Jacobi form (the cooker's 9th partition: voxels
+// that share a vertex with a duplicate of their own cell, GuCookingTetrahedronMesh.cpp:
+// 696-768) only atomically accumulates (p - pos, 1) into mSimDelta, which
+// sb_gm_applyDeformationDeltasLaunch folds back after the iteration.
+//
+// CUDA line map:
+//   :1044-1046  PULL_IND_MASK / FLIPPED_MASK
+//   :1149-1205  sub-tet solve -> sbSolveSubTetrahedron
+//   :1209       tets6PerVoxel -> sbTets6PerVoxel;  :1211-1213 tets5PerVoxel -> sbTets5PerVoxel
+//   :1317-1374  gather + sub-tet loop -> sbSolveHexahedronsPartition
+//   :1378-1390  GS tail -> sbHexWriteGS;  :1392-1403 Jacobi tail -> sbHexWriteJacobi
+//   :1442-1455  GS kernel dispatch;  :1463-1507 Jacobi kernel
+//
+// TRAPS:
+//   H1  early return.  On a zero rest pose (Qinv == 0) the sub-tet returns AFTER storing
+//       its rotation and BEFORE any `p += (dp, 0)` (:1176-1177): p and v stay bit-
+//       untouched.  The tet path (sbScatter) still scatters a zero delta -- not reused.
+//   H2  w lanes.  `p += make_float4(d, 0.f)` is IEEE `p.w + 0.f`, which turns -0 into +0
+//       (likewise v.w).  slangc folds a literal-zero add, so the w lane is spelled as the
+//       select `(a.w == 0.0f) ? 0.0f : a.w` (P9.86).  The GS tail's `mSimDeltaPos += p - pos`
+//       needs NO select: its w addend is the runtime difference p.w - pos.w (+0 for a finite
+//       w), not a literal, so the IEEE add itself maps a -0 deltaPos.w to +0 and is spelled
+//       as the plain add (a select there was measured redundant, P9.95f).
+//   H3  no dynamically indexed locals.  CUDA's float4 p[8], v[8] indexed through the
+//       table are 16 NAMED members (SbHexPV) with a select-chain get and an if-chain put,
+//       and the tables are switches returning uint4 literals (the llvmpipe JIT landmine
+//       documented at the tet scatter below, and the 23-argument SIGSEGV note above);
+//       every signature here stays at 12 parameters or fewer.
+//   H4  clamped index.  The element index feeds indirect loads (pull indices, then
+//       positions), so the guarded index is clamped before use (P9.22/P9.23): Jacobi
+//       min(w, end-1) (end >= 1 past the :1482 guard), GS end > 0 ? min(w, end-1) : 0.
+//       The value is unchanged for every live lane.
+//   H5  isFirstIteration.  The Jacobi kernel hard-wires false (:1503: 4 rotation
+//       iterations even on the first solver iteration); the GS hex branch forwards the
+//       push flag (100 or 4).
+//   H6  the w atomic is real.  AtomicAdd(float4&, PxVec3, 1.f) (atomic.cuh:46-52) does
+//       four atomicAdds, so mSimDelta.w counts the contributions; the "4th value is
+//       unused" comment at :1401 means unused by the consumer, not "not added".
+//   H7  blockCopy dropped, as in every softbody tranche.  This also removes the
+//       Jacobi kernel's missing __syncthreads after its blockCopy (:1478; the GS kernel
+//       has one at :1425) -- an upstream race masked by blockDim == warpSize.
+//   H8  isTGS is byte 0 of the @24 word; bytes 25..27 and the @28 word are pad (P9.87).
+//   H9  nbElements = nbTets / tpe, nbTets = mNumTetsGM (the SUB-tet count).  The sub-tet
+//       slot is w + nbElements*i -- for rest poses, rotations and multipliers alike --
+//       not w*tpe + i (PxgSoftBody.cpp:55-92 lays the rest poses out that way).
+//
+// TOLERANCE SEAM: exactly the tet path's -- only the rotation refresh (sin/cos in
+// extractRotation); the sub-tet maths is the bit-exact tetrahedronsSolveGM above.
+// ===========================================================================
+
+// Opposite of PULL_IND_MASK: the MSB of pull[w].x is the voxel's flipped bit (softBodyGM.cu:1046).
+static const uint FLIPPED_MASK = 0x80000000u;
+static const uint SB_PARTITION_LIMIT = 8u;   // PxgSoftBody.h: the 9th partition is the Jacobi one
+
+// tets5PerVoxel (softBodyGM.cu:1211-1213), addressed by ROW = (4*i + offset)/4: rows 0..4
+// are the non-flipped voxel, rows 5..9 (flat offset 20) the flipped one.
+uint4 sbTets5PerVoxel(uint row)
+{
+    switch (row)
+    {
+    case 0u: return uint4(0u, 6u, 3u, 5u);
+    case 1u: return uint4(0u, 1u, 5u, 3u);
+    case 2u: return uint4(6u, 7u, 3u, 5u);
+    case 3u: return uint4(4u, 5u, 6u, 0u);
+    case 4u: return uint4(2u, 3u, 0u, 6u);
+    case 5u: return uint4(1u, 7u, 4u, 2u);
+    case 6u: return uint4(1u, 0u, 2u, 4u);
+    case 7u: return uint4(7u, 6u, 4u, 2u);
+    case 8u: return uint4(5u, 4u, 1u, 7u);
+    default: return uint4(3u, 2u, 7u, 1u);   // row 9
+    }
+}
+
+// tets6PerVoxel (softBodyGM.cu:1209)
+uint4 sbTets6PerVoxel(uint row)
+{
+    switch (row)
+    {
+    case 0u: return uint4(0u, 1u, 6u, 2u);
+    case 1u: return uint4(0u, 1u, 4u, 6u);
+    case 2u: return uint4(1u, 4u, 6u, 5u);
+    case 3u: return uint4(1u, 2u, 3u, 6u);
+    case 4u: return uint4(1u, 3u, 7u, 6u);
+    default: return uint4(1u, 5u, 6u, 7u);   // row 5
+    }
+}
+
+// The .cu's float4 p[8], v[8] as 16 NAMED members (trap H3).
+struct SbHexPV
+{
+    float4 p0, p1, p2, p3, p4, p5, p6, p7;
+    float4 v0, v1, v2, v3, v4, v5, v6, v7;
+}
+
+float4 sbHexP(SbHexPV h, uint c)
+{
+    return c == 0u ? h.p0 : c == 1u ? h.p1 : c == 2u ? h.p2 : c == 3u ? h.p3 :
+           c == 4u ? h.p4 : c == 5u ? h.p5 : c == 6u ? h.p6 : h.p7;
+}
+
+float4 sbHexV(SbHexPV h, uint c)
+{
+    return c == 0u ? h.v0 : c == 1u ? h.v1 : c == 2u ? h.v2 : c == 3u ? h.v3 :
+           c == 4u ? h.v4 : c == 5u ? h.v5 : c == 6u ? h.v6 : h.v7;
+}
+
+void sbHexPut(inout SbHexPV h, uint c, float4 p, float4 v)
+{
+    if (c == 0u) { h.p0 = p; h.v0 = v; }
+    if (c == 1u) { h.p1 = p; h.v1 = v; }
+    if (c == 2u) { h.p2 = p; h.v2 = v; }
+    if (c == 3u) { h.p3 = p; h.v3 = v; }
+    if (c == 4u) { h.p4 = p; h.v4 = v; }
+    if (c == 5u) { h.p5 = p; h.v5 = v; }
+    if (c == 6u) { h.p6 = p; h.v6 = v; }
+    if (c == 7u) { h.p7 = p; h.v7 = v; }
+}
+
+// `a += make_float4(d.x, d.y, d.z, 0.f)` (softBodyGM.cu:1187-1204): the w lane is the IEEE
+// `a.w + 0.f`, -0 -> +0 (trap H2).
+float4 sbAddXyzW0(float4 a, float3 d)
+{
+    return float4(a.x + d.x, a.y + d.y, a.z + d.z, (a.w == 0.0f) ? 0.0f : a.w);
+}
+
+// The descriptor fields the hex solve touches, read once per thread.
+struct SbHexDesc
+{
+    uint64_t positions;      // mSimPosition_InvMass @96
+    uint64_t velocities;     // mSimVelocity_InvMass @88
+    uint64_t pullInds;       // mSimPullIndices @400
+    uint64_t restPoses;      // mSimTetraRestPoses @136 (PxgMat33Block, 1152-byte stride)
+    uint64_t rotations;      // mSimTetraRotations @168
+    uint64_t multipliers;    // mSimTetraMultipliers @264
+    uint64_t deltaPos;       // mSimDeltaPos @128
+    uint64_t delta;          // mSimDelta @272
+    uint64_t materialIdx;    // mOrderedMaterialIndices @288 (PxU16*)
+    float4 initialRotation;  // mInitialRotation @348..@360 (four scalars, not 16-aligned)
+}
+
+SbHexDesc sbHexDescOf(Ptr<PxgSoftBodyGpu> sb, uint id)
+{
+    SbHexDesc d;
+    d.positions = sb[id].mSimPosition_InvMass;
+    d.velocities = sb[id].mSimVelocity_InvMass;
+    d.pullInds = sb[id].mSimPullIndices;
+    d.restPoses = sb[id].mSimTetraRestPoses;
+    d.rotations = sb[id].mSimTetraRotations;
+    d.multipliers = sb[id].mSimTetraMultipliers;
+    d.deltaPos = sb[id].mSimDeltaPos;
+    d.delta = sb[id].mSimDelta;
+    d.materialIdx = sb[id].mOrderedMaterialIndices;
+    d.initialRotation = float4(sb[id].mInitialRotationX, sb[id].mInitialRotationY,
+                               sb[id].mInitialRotationZ, sb[id].mInitialRotationW);
+    return d;
+}
+
+// sb_gm_cp_solveSubTetrahedron (softBodyGM.cu:1149-1205).  c = the four voxel corners of
+// sub-tet i (one table row), subIdx = its slot w + nbElements*i (trap H9).
+void sbSolveSubTetrahedron(inout SbHexPV h, uint4 c, SbHexDesc d, uint subIdx, float invDtSq,
+                           float invDt, bool isTGS, bool isFirstIteration, SbMaterial material)
+{
+    float4 p0 = sbHexP(h, c.x);
+    float4 p1 = sbHexP(h, c.y);
+    float4 p2 = sbHexP(h, c.z);
+    float4 p3 = sbHexP(h, c.w);
+    float4 v0 = sbHexV(h, c.x);
+    float4 v1 = sbHexV(h, c.y);
+    float4 v2 = sbHexV(h, c.z);
+    float4 v3 = sbHexV(h, c.w);
+
+    // loadPxMat33(mSimTetraRestPoses[subIdx / 32], subIdx & 31) -- the GS tet path's load
+    const uint64_t restBase = d.restPoses + uint64_t(subIdx >> 5) * MAT33_BLOCK_STRIDE;
+    const uint lane = subIdx & 31u;
+    const float4 c0v = Ptr<float4>(restBase + uint64_t(lane) * 16UL)[0];
+    const float4 c1v = Ptr<float4>(restBase + MAT33_BLOCK_COL1_OFFSET + uint64_t(lane) * 16UL)[0];
+    const float c2v = Ptr<float>(restBase + MAT33_BLOCK_COL2_OFFSET + uint64_t(lane) * 4UL)[0];
+    const SbMat33 Qinv = sbMat33(float3(c0v.x, c0v.y, c0v.z),
+                                 float3(c0v.w, c1v.x, c1v.y),
+                                 float3(c1v.z, c1v.w, c2v));
+
+    float4 q = Ptr<float4>(d.rotations)[subIdx];
+
+    const float3 u1 = float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+    const float3 u2 = float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+    const float3 u3 = float3(p3.x - p0.x, p3.y - p0.y, p3.z - p0.z);
+
+    {
+        if ((q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) == 0.0f)
+            q = d.initialRotation;
+
+        // computeGMTetrahedronRotations: 100 iterations on the first solver iteration, 4 after.
+        const SbMat33 Fm = sbMat33MulM(sbMat33(u1, u2, u3), Qinv);
+        q = sbExtractRotation(Fm.c0, Fm.c1, Fm.c2, q, isFirstIteration ? 100 : 4);
+
+        Ptr<float4>(d.rotations)[subIdx] = q;
+    }
+
+    // softBodyGM.cu:1176 -- the EARLY RETURN: p and v untouched (trap H1)
+    if (sbMat33IsZero(Qinv))
+        return;
+
+    SbTetV tv; tv.v0 = v0; tv.v1 = v1; tv.v2 = v2; tv.v3 = v3;
+    const SbMat33 dl = sbTetrahedronsSolveGM(sbMat33(u1, u2, u3), tv, d.multipliers, invDtSq, invDt,
+                                             subIdx, Qinv, q, isTGS, material);
+
+    // c0 + c1 + c2, left-associated as the PxVec3 operators evaluate it (:1184)
+    const float3 sum = dl.c0 + dl.c1 + dl.c2;
+    const float3 deltaPos0 = -sum * p0.w;
+    p0 = sbAddXyzW0(p0, deltaPos0);
+    v0 = sbAddXyzW0(v0, deltaPos0 * invDt);
+    const float3 deltaPos1 = dl.c0 * p1.w;
+    p1 = sbAddXyzW0(p1, deltaPos1);
+    v1 = sbAddXyzW0(v1, deltaPos1 * invDt);
+    const float3 deltaPos2 = dl.c1 * p2.w;
+    p2 = sbAddXyzW0(p2, deltaPos2);
+    v2 = sbAddXyzW0(v2, deltaPos2 * invDt);
+    const float3 deltaPos3 = dl.c2 * p3.w;
+    p3 = sbAddXyzW0(p3, deltaPos3);
+    v3 = sbAddXyzW0(v3, deltaPos3 * invDt);
+
+    sbHexPut(h, c.x, p0, v0);
+    sbHexPut(h, c.y, p1, v1);
+    sbHexPut(h, c.z, p2, v2);
+    sbHexPut(h, c.w, p3, v3);
+}
+
+// One corner of the GS tail (softBodyGM.cu:1382-1388), in the .cu's order: deltaPos, then
+// position, then velocity.  `mSimDeltaPos[index] += p - pos` is the plain IEEE add (trap H2).
+void sbHexWriteGS(SbHexDesc d, uint index, float4 p, float4 v)
+{
+    const float4 pos = Ptr<float4>(d.positions)[index];
+    const float4 dp = Ptr<float4>(d.deltaPos)[index] + (p - pos);
+    Ptr<float4>(d.deltaPos)[index] = dp;
+    Ptr<float4>(d.positions)[index] = p;
+    Ptr<float4>(d.velocities)[index] = v;
+}
+
+// One corner of the Jacobi tail (softBodyGM.cu:1396-1402): a FRESH position load, then
+// AtomicAdd(mSimDelta[index], (p - pos).xyz, 1.f).
+void sbHexWriteJacobi(SbHexDesc d, uint index, float4 p)
+{
+    const float4 delta4 = p - Ptr<float4>(d.positions)[index];
+    pxgAtomicAddF4XYZ(d.delta, index, float3(delta4.x, delta4.y, delta4.z));
+    pxgAtomicAddF4W(d.delta, index, 1.0f);   // trap H6
+}
+
+// sb_gm_cp_solveHexahedronsPartition_parallelGS<updatePosVel> (softBodyGM.cu:1313-1404)
+void sbSolveHexahedronsPartition(SbHexDesc d, uint workIndex, uint nbTets, float invDt, bool isTGS,
+                                 bool isFirstIteration, uint64_t materials, uint numTetsPerElement,
+                                 bool updatePosVel)
+{
+    const float invDtSq = invDt * invDt;
+    const uint nbElements = nbTets / numTetsPerElement;
+
+    const SbMaterial material = sbLoadMaterial(materials, sbReadU16(d.materialIdx, workIndex));
+
+    uint4 pull0 = Ptr<uint4>(d.pullInds)[workIndex];
+    const uint4 pull1 = Ptr<uint4>(d.pullInds)[workIndex + nbElements];
+    const bool flipped = (pull0.x & FLIPPED_MASK) != 0u;
+    pull0.x &= PULL_IND_MASK;
+
+    // All 8 corners come from the UNORDERED buffers: the hex path has no CP copies.
+    Ptr<float4> pos = Ptr<float4>(d.positions);
+    Ptr<float4> vel = Ptr<float4>(d.velocities);
+    SbHexPV h;
+    h.p0 = pos[pull0.x]; h.p1 = pos[pull0.y]; h.p2 = pos[pull0.z]; h.p3 = pos[pull0.w];
+    h.p4 = pos[pull1.x]; h.p5 = pos[pull1.y]; h.p6 = pos[pull1.z]; h.p7 = pos[pull1.w];
+    h.v0 = vel[pull0.x]; h.v1 = vel[pull0.y]; h.v2 = vel[pull0.z]; h.v3 = vel[pull0.w];
+    h.v4 = vel[pull1.x]; h.v5 = vel[pull1.y]; h.v6 = vel[pull1.z]; h.v7 = vel[pull1.w];
+
+    uint offset = 0u;
+    if (numTetsPerElement == 5u && flipped)
+        offset = 20u;
+
+    for (uint i = 0u; i < numTetsPerElement; ++i)
+    {
+        // ptr[4*i + k + offset] of the .cu, one ROW at a time.  offset is 0 whenever the
+        // 6-tet table is selected, but it is applied to both, as in the .cu.
+        const uint4 c = (numTetsPerElement == 5u) ? sbTets5PerVoxel((4u * i + offset) / 4u)
+                                                  : sbTets6PerVoxel((4u * i + offset) / 4u);
+        sbSolveSubTetrahedron(h, c, d, workIndex + nbElements * i, invDtSq, invDt, isTGS,
+                              isFirstIteration, material);
+    }
+
+    if (updatePosVel) // GS-style update: positions and velocities in place
+    {
+        sbHexWriteGS(d, pull0.x, h.p0, h.v0);
+        sbHexWriteGS(d, pull0.y, h.p1, h.v1);
+        sbHexWriteGS(d, pull0.z, h.p2, h.v2);
+        sbHexWriteGS(d, pull0.w, h.p3, h.v3);
+        sbHexWriteGS(d, pull1.x, h.p4, h.v4);
+        sbHexWriteGS(d, pull1.y, h.p5, h.v5);
+        sbHexWriteGS(d, pull1.z, h.p6, h.v6);
+        sbHexWriteGS(d, pull1.w, h.p7, h.v7);
+    }
+    else // Jacobi-style update: only mSimDelta; applyDeformationDeltas moves the vertices
+    {
+        sbHexWriteJacobi(d, pull0.x, h.p0);
+        sbHexWriteJacobi(d, pull0.y, h.p1);
+        sbHexWriteJacobi(d, pull0.z, h.p2);
+        sbHexWriteJacobi(d, pull0.w, h.p3);
+        sbHexWriteJacobi(d, pull1.x, h.p4);
+        sbHexWriteJacobi(d, pull1.y, h.p5);
+        sbHexWriteJacobi(d, pull1.z, h.p6);
+        sbHexWriteJacobi(d, pull1.w, h.p7);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sb_gm_cp_solveTetrahedronsPartitionLaunch (softBodyGM.cu:1408)
 // CUDA arg pack (PxgSoftBodyCore.cpp:1202): { PxgSoftBody* gSoftbodies,
@@ -922,7 +1272,10 @@ struct SolveTetraParams
 ConstantBuffer<SolveTetraParams> gSolve;
 
 [shader("compute")]
-[numthreads(64, 1, 1)] // SB_SOLVETETRA; grid (nbBlocks, nbActiveSoftbodies, 1)
+// The host block is SB_SOLVETETRA_LOW = 32 (PxgSoftBodyCore.cpp:1192), not SB_SOLVETETRA:
+// 64 is guarded over-coverage (the `workIndex < endInd` test), kept so the existing grids
+// do not change.  grid (nbBlocks, nbActiveSoftbodies, 1)
+[numthreads(64, 1, 1)]
 void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gSolve.gSoftbodies);
@@ -952,120 +1305,171 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
 
         const uint workIndex = startInd + groupThreadIdx;
 
-        // Only the pure-tetrahedral path is ported (see the header); the hexahedral
-        // sibling is a separate kernel body and performs no work here.
-        if (workIndex < endInd && gSoftbodies[softbodyId].mNumTetsPerElement == 1u)
+        // The .cu's two-level dispatch (softBodyGM.cu:1442-1455): the tetrahedral body, or
+        // the hexahedral (voxel) one -- the latter a silent no-op here until P9.95f.
+        if (workIndex < endInd)
         {
             const bool isTGS = (gSolve.flagsWord & 0xffu) != 0u;
             const bool isFirstIteration = ((gSolve.flagsWord >> 8) & 0xffu) != 0u;
-            const float invDt = gSolve.invDt;
-            const float invDtSq = invDt * invDt;
-
-            Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMassCP);
-            Ptr<float4> velocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_invMassCP);
-            Ptr<uint4> writeIndices = Ptr<uint4>(gSoftbodies[softbodyId].mSimRemapOutputCP);
-            Ptr<float4> unorderedPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
-            Ptr<float4> unorderedVelocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_InvMass);
-            Ptr<uint4> pullInds = Ptr<uint4>(gSoftbodies[softbodyId].mSimPullIndices);
-
-            // mOrderedMaterialIndices is a PxU16 array — read the containing 32-bit word.
-            const uint64_t matIdxAddr = gSoftbodies[softbodyId].mOrderedMaterialIndices +
-                                        uint64_t(workIndex) * 2UL;
-            // NOTE THE `~uint64_t(3)`.  Writing the obvious `matIdxAddr & ~3UL` MISCOMPILES:
-            // Slang evaluates `~3UL` in 32 bits, and the resulting 0xFFFFFFFC is then
-            // zero-extended for the 64-bit AND — which silently clears the TOP HALF of the
-            // device address.  The read then lands at a garbage address and the driver
-            // faults.  Verified in isolation (tools/lvprepro): `& ~3UL` faults, while
-            // `& ~uint64_t(3)`, `& ~3ull`, `& 0xFFFFFFFFFFFFFFFCUL` and
-            // `- (matIdxAddr % 4UL)` all run clean on the same shader and data.  Note that
-            // `ull` DOES widen the complement correctly while `UL` does not — the sweep in
-            // tools/lvprepro/ultest.slang prints the surviving address for each spelling.
-            const uint matWord = Ptr<uint>(matIdxAddr & ~uint64_t(3))[0];
-            // Which half of the word: derive it from the ADDRESS, not from workIndex's
-            // parity — that only coincides when the array base is 4-aligned, and nothing
-            // in the engine promises that.
-            const uint matHalf = uint((matIdxAddr >> 1) & 1UL);
-            const uint globalMaterialIndex = (matHalf != 0u) ? (matWord >> 16) : (matWord & 0xffffu);
-            const SbMaterial material = sbLoadMaterial(gSolve.materials, globalMaterialIndex);
-
-            // --- gather the four vertices ------------------------------------------
-            uint4 pullInd = pullInds[workIndex];
-            pullInd.x &= PULL_IND_MASK;
-
-            // Unrolled for the same reason as the scatter: no dynamically-indexed local
-            // array survives into the SPIR-V.
-            float4 p0, p1, p2, p3, v0, v1, v2, v3;
-            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
-                     pullInd.x, workIndex + 0u * nbTets, p0, v0);
-            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
-                     pullInd.y, workIndex + 1u * nbTets, p1, v1);
-            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
-                     pullInd.z, workIndex + 2u * nbTets, p2, v2);
-            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
-                     pullInd.w, workIndex + 3u * nbTets, p3, v3);
-
-            // --- rest pose + rotation refresh ---------------------------------------
-            const uint64_t restBase = gSoftbodies[softbodyId].mSimTetraRestPoses +
-                                      uint64_t(workIndex >> 5) * MAT33_BLOCK_STRIDE;
-            const uint lane = workIndex & 31u;
-            const float4 c0v = Ptr<float4>(restBase + uint64_t(lane) * 16UL)[0];
-            const float4 c1v = Ptr<float4>(restBase + MAT33_BLOCK_COL1_OFFSET + uint64_t(lane) * 16UL)[0];
-            const float c2v = Ptr<float>(restBase + MAT33_BLOCK_COL2_OFFSET + uint64_t(lane) * 4UL)[0];
-            const SbMat33 Qinv = sbMat33(float3(c0v.x, c0v.y, c0v.z),
-                                         float3(c0v.w, c1v.x, c1v.y),
-                                         float3(c1v.z, c1v.w, c2v));
-
-            Ptr<float4> tetRotations = Ptr<float4>(gSoftbodies[softbodyId].mSimTetraRotations);
-            float4 q = tetRotations[workIndex];
-
-            const float3 u1 = float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
-            const float3 u2 = float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
-            const float3 u3 = float3(p3.x - p0.x, p3.y - p0.y, p3.z - p0.z);
-
+            if (gSoftbodies[softbodyId].mNumTetsPerElement == 1u)
             {
-                if ((q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) == 0.0f)
-                    q = float4(gSoftbodies[softbodyId].mInitialRotationX,
-                               gSoftbodies[softbodyId].mInitialRotationY,
-                               gSoftbodies[softbodyId].mInitialRotationZ,
-                               gSoftbodies[softbodyId].mInitialRotationW);
+                const float invDt = gSolve.invDt;
+                const float invDtSq = invDt * invDt;
 
-                // computeGMTetrahedronRotations (softBodyGM.cu:288): F = P*Qinv then
-                // extractRotation with 100 iterations on the first solver iteration, 4
-                // afterwards.  THIS is where the tranche-5 sin/cos seam enters the solve.
-                const SbMat33 Fm = sbMat33MulM(sbMat33(u1, u2, u3), Qinv);
-                q = sbExtractRotation(Fm.c0, Fm.c1, Fm.c2, q, isFirstIteration ? 100 : 4);
+                Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMassCP);
+                Ptr<float4> velocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_invMassCP);
+                Ptr<uint4> writeIndices = Ptr<uint4>(gSoftbodies[softbodyId].mSimRemapOutputCP);
+                Ptr<float4> unorderedPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
+                Ptr<float4> unorderedVelocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_InvMass);
+                Ptr<uint4> pullInds = Ptr<uint4>(gSoftbodies[softbodyId].mSimPullIndices);
 
-                tetRotations[workIndex] = q;
+                // mOrderedMaterialIndices is a PxU16 array (sbReadU16 reads the containing word).
+                const uint globalMaterialIndex = sbReadU16(gSoftbodies[softbodyId].mOrderedMaterialIndices, workIndex);
+                const SbMaterial material = sbLoadMaterial(gSolve.materials, globalMaterialIndex);
+
+                // --- gather the four vertices ------------------------------------------
+                uint4 pullInd = pullInds[workIndex];
+                pullInd.x &= PULL_IND_MASK;
+
+                // Unrolled for the same reason as the scatter: no dynamically-indexed local
+                // array survives into the SPIR-V.
+                float4 p0, p1, p2, p3, v0, v1, v2, v3;
+                sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                         pullInd.x, workIndex + 0u * nbTets, p0, v0);
+                sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                         pullInd.y, workIndex + 1u * nbTets, p1, v1);
+                sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                         pullInd.z, workIndex + 2u * nbTets, p2, v2);
+                sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                         pullInd.w, workIndex + 3u * nbTets, p3, v3);
+
+                // --- rest pose + rotation refresh ---------------------------------------
+                const uint64_t restBase = gSoftbodies[softbodyId].mSimTetraRestPoses +
+                                          uint64_t(workIndex >> 5) * MAT33_BLOCK_STRIDE;
+                const uint lane = workIndex & 31u;
+                const float4 c0v = Ptr<float4>(restBase + uint64_t(lane) * 16UL)[0];
+                const float4 c1v = Ptr<float4>(restBase + MAT33_BLOCK_COL1_OFFSET + uint64_t(lane) * 16UL)[0];
+                const float c2v = Ptr<float>(restBase + MAT33_BLOCK_COL2_OFFSET + uint64_t(lane) * 4UL)[0];
+                const SbMat33 Qinv = sbMat33(float3(c0v.x, c0v.y, c0v.z),
+                                             float3(c0v.w, c1v.x, c1v.y),
+                                             float3(c1v.z, c1v.w, c2v));
+
+                Ptr<float4> tetRotations = Ptr<float4>(gSoftbodies[softbodyId].mSimTetraRotations);
+                float4 q = tetRotations[workIndex];
+
+                const float3 u1 = float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+                const float3 u2 = float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+                const float3 u3 = float3(p3.x - p0.x, p3.y - p0.y, p3.z - p0.z);
+
+                {
+                    if ((q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) == 0.0f)
+                        q = float4(gSoftbodies[softbodyId].mInitialRotationX,
+                                   gSoftbodies[softbodyId].mInitialRotationY,
+                                   gSoftbodies[softbodyId].mInitialRotationZ,
+                                   gSoftbodies[softbodyId].mInitialRotationW);
+
+                    // computeGMTetrahedronRotations (softBodyGM.cu:288): F = P*Qinv then
+                    // extractRotation with 100 iterations on the first solver iteration, 4
+                    // afterwards.  THIS is where the tranche-5 sin/cos seam enters the solve.
+                    const SbMat33 Fm = sbMat33MulM(sbMat33(u1, u2, u3), Qinv);
+                    q = sbExtractRotation(Fm.c0, Fm.c1, Fm.c2, q, isFirstIteration ? 100 : 4);
+
+                    tetRotations[workIndex] = q;
+                }
+
+                // --- constitutive solve, guarded on a degenerate rest pose ---------------
+                // softBodyGM.cu:1123 — the scatter below STILL RUNS with a zero delta when
+                // the rest pose is degenerate; only the solve is skipped.
+                SbMat33 dl = sbMat33Zero();
+                if (!sbMat33IsZero(Qinv))
+                {
+                    SbTetV tv; tv.v0 = v0; tv.v1 = v1; tv.v2 = v2; tv.v3 = v3;
+                    dl = sbTetrahedronsSolveGM(sbMat33(u1, u2, u3), tv,
+                                               gSoftbodies[softbodyId].mSimTetraMultipliers, invDtSq, invDt,
+                                               workIndex, Qinv, q, isTGS, material);
+                }
+
+                // --- scatter -------------------------------------------------------------
+                // The scatter is written out per-vertex rather than as a 4-iteration loop over
+                // a local float3[3].  That indexed temporary is a llvmpipe LANDMINE: with a
+                // ZERO delta the array folds to a constant and the shader runs, but the moment
+                // its three entries differ the driver materialises a dynamically-indexed local
+                // array and SIGSEGVs in the JIT worker.  Bisected precisely — a CONSTANT
+                // non-zero delta with no matrix work at all reproduces it, which is what ruled
+                // out every arithmetic suspect.  Unrolling removes the dynamic index entirely.
+                const uint4 writeIndex4 = writeIndices[workIndex];
+
+                sbScatter(curPositions, velocities, writeIndex4.x, p0, v0,
+                          -(dl.c0 + dl.c1 + dl.c2) * p0.w, invDt);
+                sbScatter(curPositions, velocities, writeIndex4.y, p1, v1, dl.c0 * p1.w, invDt);
+                sbScatter(curPositions, velocities, writeIndex4.z, p2, v2, dl.c1 * p2.w, invDt);
+                sbScatter(curPositions, velocities, writeIndex4.w, p3, v3, dl.c2 * p3.w, invDt);
             }
-
-            // --- constitutive solve, guarded on a degenerate rest pose ---------------
-            // softBodyGM.cu:1123 — the scatter below STILL RUNS with a zero delta when
-            // the rest pose is degenerate; only the solve is skipped.
-            SbMat33 dl = sbMat33Zero();
-            if (!sbMat33IsZero(Qinv))
+            else
             {
-                SbTetV tv; tv.v0 = v0; tv.v1 = v1; tv.v2 = v2; tv.v3 = v3;
-                dl = sbTetrahedronsSolveGM(sbMat33(u1, u2, u3), tv,
-                                           gSoftbodies[softbodyId].mSimTetraMultipliers, invDtSq, invDt,
-                                           workIndex, Qinv, q, isTGS, material);
+                const uint safeW = endInd > 0u ? min(workIndex, endInd - 1u) : 0u;   // trap H4
+                sbSolveHexahedronsPartition(sbHexDescOf(gSoftbodies, softbodyId), safeW, nbTets, gSolve.invDt,
+                                            isTGS, isFirstIteration, gSolve.materials,
+                                            gSoftbodies[softbodyId].mNumTetsPerElement, true);
             }
-
-            // --- scatter -------------------------------------------------------------
-            // The scatter is written out per-vertex rather than as a 4-iteration loop over
-            // a local float3[3].  That indexed temporary is a llvmpipe LANDMINE: with a
-            // ZERO delta the array folds to a constant and the shader runs, but the moment
-            // its three entries differ the driver materialises a dynamically-indexed local
-            // array and SIGSEGVs in the JIT worker.  Bisected precisely — a CONSTANT
-            // non-zero delta with no matrix work at all reproduces it, which is what ruled
-            // out every arithmetic suspect.  Unrolling removes the dynamic index entirely.
-            const uint4 writeIndex4 = writeIndices[workIndex];
-
-            sbScatter(curPositions, velocities, writeIndex4.x, p0, v0,
-                      -(dl.c0 + dl.c1 + dl.c2) * p0.w, invDt);
-            sbScatter(curPositions, velocities, writeIndex4.y, p1, v1, dl.c0 * p1.w, invDt);
-            sbScatter(curPositions, velocities, writeIndex4.z, p2, v2, dl.c1 * p2.w, invDt);
-            sbScatter(curPositions, velocities, writeIndex4.w, p3, v3, dl.c2 * p3.w, invDt);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch (softBodyGM.cu:1463) -- P9.95f
+// CUDA arg pack (PxgSoftBodyCore.cpp:1238-1243): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxU32 numActiveSoftbodies (never read, upstream
+// too), const PxReal invDt, bool isTGS, PxsDeformableVolumeMaterialData* materials }
+// -> isTGS @24 (pad 25..27 and @28..31), the pointer realigns to @32 -> 40-byte blob.
+// (ABI row {8,8,4,4,1,8}.)
+// ---------------------------------------------------------------------------
+struct SolveTetraJacobiParams
+{
+    uint64_t gSoftbodies;          // @0
+    uint64_t activeSoftbodies;     // @8
+    uint numActiveSoftbodies;      // @16  never read (dead upstream, push_block_known.txt)
+    float invDt;                   // @20
+    uint flagsWord;                // @24  byte0 = isTGS; bytes 1..3 are pad (P9.87)
+    uint _pad28;                   // @28
+    uint64_t materials;            // @32  -> 40
+}
+[[vk::push_constant]]
+ConstantBuffer<SolveTetraJacobiParams> gJacobi;
+
+[shader("compute")]
+[numthreads(32, 1, 1)] // SB_SOLVETETRA_LOW; grid (ceil(maxJacobiTets/32), nbActiveSoftbodies, 1)
+void sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gJacobi.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gJacobi.activeSoftbodies))[groupId.y];
+
+    // softBodyGM.cu:1482 -- no extra Jacobi required (read from the GLOBAL descriptor there,
+    // which is the only copy here)
+    if (gSoftbodies[softbodyId].mNumPartitionsGM <= SB_PARTITION_LIMIT || gSoftbodies[softbodyId].mNumTetsPerElement == 1u)
+        return;
+
+    // softBodyGM.cu:1485 -- the @392 fold: byte1 = mBodyFlags
+    const uint bodyFlags = (gSoftbodies[softbodyId].mFlagsWord >> 8) & 0xffu;
+    if ((bodyFlags & PXG_SOFTBODY_BODYFLAG_KINEMATIC) != 0u)
+        return;
+
+    const uint groupThreadIdx = groupThreadId.x + groupId.x * 32u;
+    const uint nbTets = gSoftbodies[softbodyId].mNumTetsGM;
+
+    Ptr<uint> accumulatedPartitions = Ptr<uint>(gSoftbodies[softbodyId].mSimAccumulatedPartitionsCP);
+    const uint startInd = accumulatedPartitions[SB_PARTITION_LIMIT - 1u];
+    const uint endInd = accumulatedPartitions[SB_PARTITION_LIMIT];
+
+    const uint workIndex = startInd + groupThreadIdx;
+
+    if (workIndex < endInd)
+    {
+        const uint safeW = min(workIndex, endInd - 1u);   // trap H4; endInd >= 1 here
+        const bool isTGS = (gJacobi.flagsWord & 0xffu) != 0u;
+        // isFirstIteration = false: this kernel always comes after the GS steps (softBodyGM.cu:1497-1503)
+        sbSolveHexahedronsPartition(sbHexDescOf(gSoftbodies, softbodyId), safeW, nbTets, gJacobi.invDt, isTGS,
+                                    false, gJacobi.materials, gSoftbodies[softbodyId].mNumTetsPerElement, false);
     }
 }
 

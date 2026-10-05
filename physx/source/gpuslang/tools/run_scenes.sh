@@ -93,8 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.95, sdfquery added): 61 named scenes below, plus eleven explicit rows
-# after the loop (the settling bag, three softbody floors, seven PGS rows) = 72.
+# Today (P9.95f, softbodyhex added): 62 named scenes below, plus thirteen explicit rows
+# after the loop (the settling bag, three softbody floors, the softbodyhex box arm, eight
+# PGS rows) = 75.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -104,7 +105,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata
-        directapimerge sdfquery"
+        directapimerge sdfquery softbodyhex"
 
 pass=0; fail=0; missing=0
 
@@ -208,6 +209,13 @@ run_one "softbodydata (PGS)" PXG_SCENE=softbodydata PXG_SOLVER=pgs
 # but lane D's observable -- the re-inserted body's velocity right after the reset step --
 # is the solver's, so it is scored under both, as directapi and directapiwrite are.
 run_one "directapimerge (PGS)" PXG_SCENE=directapimerge PXG_SOLVER=pgs
+# P9.95f: softbodyhex is the voxel (hex) softbody.  The named row above runs its default
+# `fork` arm (a duplicated voxel -> a 9th partition -> sb_gm_cp_solveTetrahedronsJacobi-
+# PartitionLaunch + applyDeformationDeltas, plus the GS hex branch).  `box` is the plain
+# 8-voxel lattice, the GS hex branch alone (no Jacobi launch), and the fork arm is scored
+# under PGS as well, since both callers of the hex solve take isTGS from the solver.
+run_one "softbodyhex (box)" PXG_SCENE=softbodyhex PXG_SB_HEX=box
+run_one "softbodyhex (PGS)" PXG_SCENE=softbodyhex PXG_SB_HEX=fork PXG_SOLVER=pgs
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
