@@ -1588,6 +1588,14 @@ static const uint8_t kRigidSetForce[] = { 8, 8, 8, 4 };
 // sorted by size: two PxU32s sit between device pointers and each pads the
 // pointer after it up to the next multiple of 8.
 static const uint8_t kD6JointGet[] = { 8, 8, 4, 8, 4, 8, 4 };
+// gpunarrowphase convexMeshMidphase.cu:1236 (P9.95):
+//   evaluatePointDistancesSDFBatch(const PxgShape* gpuShapes, const PxU32* shapeRefsSDF,
+//     const PxVec4* localPositionsConcatenated, const PxU32* pointCountPerShape,
+//     const PxU32 maxPointCount, PxVec4* localGradientAndSDFValueConcatenated)
+// packed by PxgNarrowphaseCore.cpp:8912-8920 -> pointers @0/@8/@16/@24, the PxU32
+// @32, and the last pointer padded from 36 to 40 = a 48-byte blob.  kD6JointGet's
+// lesson again: a PxU32 BETWEEN two pointers pads the pointer after it.
+static const uint8_t kSdfPointDist[] = { 8, 8, 8, 8, 4, 8 };
 // gpucommon/src/CUDA/MemCopyBalanced.cu:95 (P8.20):
 //   clampMaxValues(PxU32* value0, PxU32* value1, PxU32* value2, const PxU32 maxValue)
 //   -> three pointers @0/@8/@16 + a PxU32 BY VALUE @24 = 28 data bytes, rounded to
@@ -2466,6 +2474,11 @@ static const PxgKernelAbiRow kRows[] = {
     // wild constraintWriteBackBuffer.
     { "getD6JointForces", kD6JointGet, uint32_t(sizeof(kD6JointGet)) },
     { "getD6JointTorques", kD6JointGet, uint32_t(sizeof(kD6JointGet)) },
+    // convexMeshMidphase.cu:1236 -- PxDirectGPUAPI::evaluateSDFDistances
+    // (PxgGpuNarrowphaseCore::evaluateSDFDistances, PxgNarrowphaseCore.cpp:8899-8942),
+    // first launched by PXG_SCENE=sdfquery (P9.95).  hostPtrMask 0: all four buffers
+    // are the caller's device allocations.
+    { "evaluatePointDistancesSDFBatch", kSdfPointDist, uint32_t(sizeof(kSdfPointDist)) },
     // MemCopyBalanced.cu:95 — clampMaxValues(three PxU32*, const PxU32) -> {8,8,8,4}
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
     // particlesystem.cu:683 -- ps_update_volume_bound(const PxgParticleSystem*,

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 426;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 427;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -99,7 +99,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "trimeshHeightfieldNarrowphase", nullptr, nullptr },  // TRIMESH_HEIGHTFIELD_CORE (unmapped)
     { "triangleTriangleCollision", "triTriCollisionBda.spv", "triangleTriangleCollision" },  // TRIMESH_TRIMESH_CORE (P9.83b-8)
     { "triangleTriangleOverlaps", "triTriOverlapBda.spv", "triangleTriangleOverlaps" },  // TRIMESH_TRIMESH_OVERLAP (P9.83)
-    { "evaluatePointDistancesSDFBatch", nullptr, nullptr },  // EVALUATE_POINT_DISTANCES_SDF (unmapped)
+    { "evaluatePointDistancesSDFBatch", "sdfQueryBda.spv", "evaluatePointDistancesSDFBatch" },  // EVALUATE_POINT_DISTANCES_SDF (P9.95 engine ABI: PxDirectGPUAPI::evaluateSDFDistances)
     { "updateFrictionPatches", "npCompressContacts.spv", "updateFrictionPatches" },  // UPDATE_FRICTION_PATCHES
     { "preIntegrationLaunch", "preIntegration.spv", "preIntegrationLaunch" },  // PRE_INTEGRATION
     { "constraintContactBlockPrePrepLaunch", "npContactPrePrep.spv", "constraintContactBlockPrePrepLaunch" },  // CONTACT_CONSTRAINT_PREPREP_BLOCK (P5 Step 4 BDA port)

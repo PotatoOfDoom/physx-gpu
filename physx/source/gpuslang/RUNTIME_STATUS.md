@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **883/883** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.95e: evaluatePointDistancesSDFBatch (convexMeshMidphase.cu:1233-1287, reached through
+PxDirectGPUAPI::evaluateSDFDistances) on the engine ABI (new sdfQueryBda.slang, 48-byte blob;
+manifest 426 -> 427, engine-reachable unmapped 6 -> 5).  New ctest suite sdfQuery (884 tests):
+bitwise against the stored texels, normalizeSafe epsilon bracketed by adjacent floats.
+PXG_SCENE=sdfquery.  OPEN: SDF samples on non-power-of-two grids differ from CUDA's unnormalised
+tex3D by about an ulp (Vulkan normalised 3D sampling).  Scenes 72/72.
 P9.95d: mergeTransformCacheAndBoundArrayChanges (updateTransformAndBoundArray.cu:52-73) on the
 engine ABI (48-byte blob; manifest 425 -> 426, engine-reachable unmapped 7 -> 6): under the
 direct-GPU API it merges CPU-side shape additions / resetFiltering into the device transform cache
@@ -2130,6 +2136,73 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.95e — `evaluatePointDistancesSDFBatch`: SDF-Abstandsabfragen über `PxDirectGPUAPI::evaluateSDFDistances`
+
+**Erreichbarkeit.** `PxScene::getDirectGPUAPI().evaluateSDFDistances(...)` führt über
+NpDirectGPUAPI.cpp:162 und PxgSimulationController.cpp:631-636 zu
+`PxgGpuNarrowphaseCore::evaluateSDFDistances` (PxgNarrowphaseCore.cpp:8899-8942). Der Kernel war
+nicht gemappt. Der Host meldete „fail to launch“, gab aber trotzdem `true` zurück, und alle
+Ausgaben blieben auf dem Giftwert.
+
+**Port** (convexMeshMidphase.cu:1233-1287), neuer Shader `sdfQueryBda.slang`:
+- `batchId` aus `gid.y`; der Slice ist das PxU32-Produkt `batchId·maxPointCount`, erst danach
+  verbreitert; Blockgröße 1024; der Guard `>=` auf die Punktzahl der Form;
+- vom Punkt wird nur `.xyz` gelesen, dann `sdfVolumeGrad`, `normalizeSafe` (`< 1e-20`, sonst
+  `· (1/mag)`, Betrag als `x·x + y·y + z·z`), `sdfDistance` und das Speichern von `(grad, d)`;
+- NoContraction-gestempelt (alle 74 Float-Operationen); der Ladeindex ist gegen spekulierte Lesezugriffe
+  geklemmt.
+- Abweichungen: Eine Form ohne SDF schreibt nichts (D1); die Daten werden pro Thread gelesen statt
+  über Shared Memory (D2).
+- ABI-Zeile `kSdfPointDist {8,8,8,8,4,8}` = 48 B, Manifest 426 → 427,
+  `engine_reachable_unmapped.txt` 6 → 5, testShimBindless 4 → 5 SDF-Kernel.
+
+**Fixture: neue Suite `sdfQuery`** (4 Tests; ctest 883 → 884). Der Abgleich ist bitweise, gegen
+`npSdfCollision.spv` plus das echte `PxVec3::normalizeSafe` und gegen gespeicherte Texel auf
+gitterausgerichteten Meshes.
+- `sdfQueryGuard` nutzt ein per Wirtsuche gefundenes Mesh, auf dem alle sechs Grenzen
+  unterscheidbar sind. Auf ausgerichteten Meshes stimmen beide Gradientenpfade exakt überein, dort
+  überlebten die Grenz-Mutanten.
+- Das Epsilon ist von **benachbarten Floats** eingeschlossen: g = 1.00000078e-20 bleibt unverändert,
+  g = 1.00000086e-20 wird normalisiert. Die Gegenprüfung hatte gezeigt, dass Epsilon-Werte von 1e-12
+  bis 1e-3 und später 2e-21 bis 4e-20 durchkamen. Jetzt sind alle vier Epsilon-Mutanten getötet.
+  Unterscheiden lässt sich nur das Intervall (9.99997303e-21, 1.00000433e-20] nicht, denn keine
+  Wurzel eines Floats liegt darin. llvmpipe erhält dabei subnormale Quadrate (gemessen mit 5e-20).
+
+**Sweeps.**
+- Einstieg: 30 Mutanten, 25 getötet (3 davon durch Absturz), 1 nicht kompilierbar (neu formuliert
+  und getötet), 4 äquivalent:
+  - `localPos + 0` ergibt identisches SPIR-V;
+  - `<` → `<=` auf dem Epsilon: kein Float hat genau 1e-20 als Wurzel;
+  - ohne Ladeklemme ändert sich für speichernde Lanes nichts;
+  - ein 64-Bit-Slice-Produkt ist unter 64 GiB gleich.
+- `rv-norm-rsqrt` überlebt ebenfalls, weil `rsqrt` und `1/sqrt` auf llvmpipe bitgleich sind
+  (P9.33a).
+- Module: `pxgSlangSdfTexture` 4/4 und `pxgSlangSdfCollision` 8/8 getötet. Szene: 7/7 getötet.
+
+**Szene `PXG_SCENE=sdfquery`:** drei statische SDF-Formen (32³ und 16³, eine mit Skalierung 2),
+1112 Abfragepunkte.
+
+| Lauf | geschrieben | Gift | Abweichungen |
+|---|---|---|---|
+| Port | 1112 | 0 | 0 |
+| Kernel übersprungen | 0 | 1112 | — |
+| Skalierung angewandt / falscher Formindex / ohne Normalisierung | — | — | 5 / 1107 / 1112 |
+
+**Offener Port-Befund (nicht behoben):** Auf SDF-Gittern, deren Größe keine Zweierpotenz ist,
+weicht jedes SDF-Sample des Ports um etwa ein ULP vom unnormalisierten `tex3D` der CUDA ab.
+`pxgTex3D` übergibt (k + 0.5)/dim an den Sampler, und der Rückweg ist ungenau; Vulkan kennt kein
+unnormalisiertes 3D-Sampling. Das betrifft alle SDF-Pfade, darunter die 20³-Szene `sdfmesh`. Fixture
+und Szene nutzen deshalb Zweierpotenz-Gitter. Das ist als eigener Punkt nach P9.95 vorgemerkt.
+
+**Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+- Ein abgelehnter Start gibt trotzdem `true` zurück (`success` wird überschrieben); das ist gemessen.
+- Es gibt keine Vorbedingungsprüfung: ungültiger Index, Nicht-Mesh oder Mesh ohne SDF.
+- Latenter PxU32-Überlauf.
+- Nach einem Cook zeigt `PxSDFDesc::sdf.data` auf freigegebenen Speicher.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 884/884 in beiden Speichermodi.
+**Szenen:** 72/72.
 
 ## P9.95d — `mergeTransformCacheAndBoundArrayChanges`: Formänderungen während der Direct-GPU-API
 

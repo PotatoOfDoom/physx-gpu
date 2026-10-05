@@ -93,8 +93,10 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.95, directapimerge added): 60 named scenes below, plus eleven explicit
-# rows after the loop (the settling bag, three softbody floors, seven PGS rows) = 71.
+# Today (P9.95, sdfquery added): 61 named scenes below, plus eleven explicit rows
+# after the loop (the settling bag, three softbody floors, seven PGS rows) = 72.
+# sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
+# NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
@@ -102,7 +104,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata
-        directapimerge"
+        directapimerge sdfquery"
 
 pass=0; fail=0; missing=0
 

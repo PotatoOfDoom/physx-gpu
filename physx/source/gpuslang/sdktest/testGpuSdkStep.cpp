@@ -81,6 +81,12 @@ public:
 // an anonymous no-op and 33 green scenes said nothing about it.
 static unsigned gUnmappedLaunchReports = 0;
 
+// P9.95 -- PXG_SCENE=sdfquery counts the host's own launch-failure report
+// (PxgNarrowphaseCore.cpp:8925-8929): evaluateSDFDistances returns true even when the
+// launch was refused, because the streamSynchronize result overwrites `success`
+// (:8936-8939), so this message is the only in-process sign of a refused launch.
+static unsigned gSdfQueryLaunchFailures = 0;
+
 class StepError : public PxErrorCallback
 {
 public:
@@ -88,6 +94,8 @@ public:
     {
         if (message && std::strncmp(message, "[pxg-unmapped]", 14) == 0)
             ++gUnmappedLaunchReports;
+        if (message && std::strstr(message, "evaluatePointDistancesSDF fail to launch"))
+            ++gSdfQueryLaunchFailures;
         std::printf("  [PhysX %d] %s (%s:%d)\n", int(code), message, file, line);
     }
 };
@@ -370,7 +378,13 @@ void buildMeshFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* materia
 //
 // *** EXPECTED TO FAIL UNTIL THE THREE KERNELS ARE MAPPED. ***  This is P9.82a; the
 // port is P9.82.  The red measurement is the point of building it first.
-PxTriangleMesh* cookSdfBox(PxPhysics* physics, float h)
+// P9.95: `spacing` became a parameter for PXG_SCENE=sdfquery, which cooks two boxes on
+// a power-of-two grid (1/16) so that its sample points land on texel centres exactly.
+// The default keeps sdfmesh's 0.05.  Every call fills its OWN PxSDFDesc: the cooker
+// points the desc's sdf.data at a temporary that is freed on return
+// (GuCookingSDF.cpp:399/:408), so a desc reused for a second cook hands it a dangling
+// field instead of an empty one.
+PxTriangleMesh* cookSdfBox(PxPhysics* physics, float h, float spacing = 0.05f)
 {
     // A CLOSED box, 8 vertices and 12 triangles wound outward.  Closed matters twice
     // over: an SDF is a signed distance, which needs an inside, and isMeshGPUCompatible
@@ -403,7 +417,7 @@ PxTriangleMesh* cookSdfBox(PxPhysics* physics, float h)
     // subgridSize 0 selects the DENSE field: the sparse form needs the subgrid block
     // dimensions and a min/max range, which are the cooker's outputs, not ours.
     PxSDFDesc sdfDesc;
-    sdfDesc.spacing = 0.05f;
+    sdfDesc.spacing = spacing;
     sdfDesc.subgridSize = 0;
     sdfDesc.numThreadsForSdfConstruction = 4;
     md.sdfDesc = &sdfDesc;
@@ -1828,6 +1842,253 @@ DirectApiMergeScene buildDirectApiMergeScene(PxPhysics* physics, PxScene* scene,
     s.C = body(10.0f, 3.0f);
     s.B = body(-30.0f, 5.0f);
     return s;
+}
+
+// PXG_SCENE=sdfquery (P9.95): evaluatePointDistancesSDFBatch, the kernel behind
+// PxDirectGPUAPI::evaluateSDFDistances -- the only caller it has
+// (NpDirectGPUAPI.cpp:151-163 -> PxgSimulationController.cpp:631-636 ->
+// PxgGpuNarrowphaseCore::evaluateSDFDistances, PxgNarrowphaseCore.cpp:8899-8942).
+// Before this scene nothing in the harness had ever asked for it: it is a pure QUERY,
+// launched only by the API call, never by a simulation step.
+//
+// THE MESHES are two closed boxes cooked on a POWER-OF-TWO grid (spacing 1/16):
+//   A  half 0.875, dims 32^3, meshLower -1.0, SDF box +-0.96875
+//   B  half 0.375, dims 16^3, meshLower -0.5, SDF box +-0.46875
+// (GuCookingSDF.cpp:316-345: dims = int(edge / (spacing*(1-1e-4))) + 4, meshLower =
+// bounds.min - 0.5*(spacing - (edge - (dims-1)*spacing)); the dense SDF box is
+// meshLower + [0.5, dims-0.5]*spacing, sdfCollision.cuh:66-72).  Every number there is
+// dyadic, so a sample point p = boxLower + k/16 has texel coordinate f = k EXACTLY.
+// The DIMENSIONS are powers of two as well, and that is not cosmetic: pxgTex3D hands
+// the sampler (k + 0.5) / dim and the sampler scales it back, a round trip that is
+// exact only for dim = 2^n (testSdfQuery.cpp, buildAligned, measured).  With it, the
+// linear filter at a texel centre returns the stored texel bit-for-bit.
+// That is what lets the host oracle below be literal and tolerance-free: every tap the
+// kernel reads is a stored texel the host can index, plus an exact clamp distance.
+//
+// THE QUERY: three static shapes, posed with a rotation and a translation the kernel
+// must ignore (the API's points are in mesh-local space):
+//   S_B  mesh B, scale 1    7 points, one of them (0.21875, 0.03125, 0.03125) -- a
+//                           texel centre of BOTH meshes (A (19,16,16), B (11,8,8)), so
+//                           a shape mixup is visible
+//   S_A  mesh A, scale 1    1100 points (interior and boundary nodes, outside points on
+//                           every face and corner), indices >= 1024 included: the grid
+//                           is (2, 3, 1) and block 1 carries 76 of them
+//   S_C  mesh A, scale 2    S_A's first 5 points.  The kernel ignores PxMeshScale
+//                           (convexMeshMidphase.cu:1282-1286 reads no scale), so S_C's
+//                           answer must equal S_A's bit-for-bit.
+// maxPointCount 1100, so S_B's slots 7..1099 and S_C's 5..1099 must stay poisoned.
+//
+// THE OBSERVABLE is the API's output buffer itself, poisoned with -999 before the call:
+// with the kernel skipped (unmapped) every live slot reads -999.
+
+// Index of a texel in a dense cooked SDF: x fastest (sdfmesh reads it the same way).
+struct SdfQueryField
+{
+    PxU32 dims;              // cubic: the box is cubic
+    float lower, higher;     // the SDF box on every axis
+    std::vector<float> sdf;  // getSDF(), copied
+};
+
+// The cooker's meshLower for a centred cube of half extent h (GuCookingSDF.cpp:316-345),
+// transcribed so the box the oracle uses is derived and asserted, not typed in.
+static float sdfQueryMeshLower(float h, float spacing, PxU32 dims)
+{
+    const float edge = 2.0f * h;
+    const float offset = 0.5f * (spacing - (edge - float(dims - 1) * spacing));
+    return -h - offset;
+}
+
+// One tap: the stored texel at an EXACT integer texel coordinate.  `ok` goes false when
+// a coordinate is not an integer in range -- an oracle precondition, never a tolerance.
+static float sdfQuerySample(const SdfQueryField& F, const PxVec3& f, bool& ok)
+{
+    const float c[3] = { f.x, f.y, f.z };
+    PxU32 k[3];
+    for (int a = 0; a < 3; ++a)
+    {
+        if (!(c[a] >= 0.0f && c[a] <= float(F.dims - 1)) || c[a] != std::floor(c[a]))
+        {
+            ok = false;
+            return 0.0f;
+        }
+        k[a] = PxU32(c[a]);
+    }
+    return F.sdf[(size_t(k[2]) * F.dims + k[1]) * F.dims + k[0]];
+}
+
+// PxSdfDistance (sdfCollision.cuh:156-166), every primitive the engine's own PxVec3.
+static float sdfQueryDistance(const SdfQueryField& F, const PxVec3& p, bool& ok)
+{
+    const PxVec3 lo(F.lower), hi(F.higher);
+    const PxVec3 clamped = p.maximum(lo).minimum(hi);
+    const PxReal diffMag = (p - clamped).magnitude();
+    const PxVec3 f = (clamped - lo) * (1.0f / 0.0625f);
+    return sdfQuerySample(F, f, ok) + diffMag;
+}
+
+// PxVolumeGrad (sdfCollision.cuh:168-198): the texel-space central difference inside
+// the inclusive guard, the clamping world-space difference outside it.
+static PxVec3 sdfQueryGrad(const SdfQueryField& F, const PxVec3& p, bool& ok)
+{
+    const float dx = 0.0625f;
+    const PxVec3 lo(F.lower), hi(F.higher);
+    const PxVec3 clamped = p.maximum(lo).minimum(hi);
+    const PxVec3 f = (clamped - lo) * (1.0f / dx);
+    const float top = float(F.dims) - 2.0f;
+    if (f.x >= 1.0f && f.x <= top && f.y >= 1.0f && f.y <= top && f.z >= 1.0f && f.z <= top)
+    {
+        return PxVec3(sdfQuerySample(F, PxVec3(f.x + 1.0f, f.y, f.z), ok) - sdfQuerySample(F, PxVec3(f.x - 1.0f, f.y, f.z), ok),
+                      sdfQuerySample(F, PxVec3(f.x, f.y + 1.0f, f.z), ok) - sdfQuerySample(F, PxVec3(f.x, f.y - 1.0f, f.z), ok),
+                      sdfQuerySample(F, PxVec3(f.x, f.y, f.z + 1.0f), ok) - sdfQuerySample(F, PxVec3(f.x, f.y, f.z - 1.0f), ok));
+    }
+    return PxVec3(sdfQueryDistance(F, p + PxVec3(dx, 0.0f, 0.0f), ok) - sdfQueryDistance(F, p - PxVec3(dx, 0.0f, 0.0f), ok),
+                  sdfQueryDistance(F, p + PxVec3(0.0f, dx, 0.0f), ok) - sdfQueryDistance(F, p - PxVec3(0.0f, dx, 0.0f), ok),
+                  sdfQueryDistance(F, p + PxVec3(0.0f, 0.0f, dx), ok) - sdfQueryDistance(F, p - PxVec3(0.0f, 0.0f, dx), ok));
+}
+
+// convexMeshMidphase.cu:1282-1286 on the host: grad, normalizeSafe (ENGINE), distance.
+static PxVec4 sdfQueryOracle(const SdfQueryField& F, const PxVec3& p, bool& ok)
+{
+    PxVec3 g = sdfQueryGrad(F, p, ok);
+    g.normalizeSafe();
+    const PxReal d = sdfQueryDistance(F, p, ok);
+    return PxVec4(g, d);
+}
+
+struct SdfQueryScene
+{
+    PxShape* SA;
+    PxShape* SB;
+    PxShape* SC;
+    SdfQueryField A, B;
+    bool ok;
+};
+
+static bool sdfQueryCook(PxPhysics* physics, float h, PxU32 wantDims, float wantMeshLower,
+                         PxTriangleMesh*& mesh, SdfQueryField& F)
+{
+    const float spacing = 0.0625f;
+    mesh = cookSdfBox(physics, h, spacing);
+    if (!mesh) return false;
+    PxU32 x = 0, y = 0, z = 0;
+    mesh->getSDFDimensions(x, y, z);
+    const float meshLower = sdfQueryMeshLower(h, spacing, x);
+    std::printf("  sdfquery: cooked half %.2f at spacing 1/16: dims %u x %u x %u, meshLower %.6f, SDF box +-%.6f\n",
+                h, x, y, z, meshLower, -(meshLower + 0.5f * spacing));
+    if (!mesh->getSDF() || x != wantDims || y != wantDims || z != wantDims || meshLower != wantMeshLower)
+    {
+        std::printf("FAIL: sdfquery: cooked SDF is not the one the oracle is written for (want dims %u, "
+                    "meshLower %.6f, an SDF present)\n", wantDims, wantMeshLower);
+        return false;
+    }
+    F.dims = x;
+    F.lower = meshLower + 0.5f * spacing;
+    F.higher = meshLower + (float(x) - 0.5f) * spacing;
+    F.sdf.assign(mesh->getSDF(), mesh->getSDF() + size_t(x) * y * z);
+    return true;
+}
+
+SdfQueryScene buildSdfQueryScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    SdfQueryScene s = {};
+    PxTriangleMesh* meshA = nullptr;
+    PxTriangleMesh* meshB = nullptr;
+    if (!sdfQueryCook(physics, 0.875f, 32u, -1.0f, meshA, s.A) ||
+        !sdfQueryCook(physics, 0.375f, 16u, -0.5f, meshB, s.B))
+        return s;
+    auto addStatic = [&](PxTriangleMesh* mesh, const PxMeshScale& scale, const PxTransform& pose) {
+        PxRigidStatic* a = physics->createRigidStatic(pose);
+        PxShape* sh = physics->createShape(PxTriangleMeshGeometry(mesh, scale), *material, true);
+        a->attachShape(*sh);
+        sh->release();
+        scene->addActor(*a);
+        return sh;
+    };
+    // Rotated and translated: the kernel works in mesh-local space and must not see them.
+    s.SA = addStatic(meshA, PxMeshScale(1.0f), PxTransform(PxVec3(-6.0f, 2.0f, 3.0f),
+                                                           PxQuat(0.6f, PxVec3(0.0f, 1.0f, 0.0f))));
+    s.SB = addStatic(meshB, PxMeshScale(1.0f), PxTransform(PxVec3(6.0f, 1.5f, -2.0f),
+                                                           PxQuat(-1.1f, PxVec3(1.0f, 0.0f, 0.0f))));
+    s.SC = addStatic(meshA, PxMeshScale(2.0f), PxTransform(PxVec3(0.0f, 4.0f, 9.0f),
+                                                           PxQuat(2.3f, PxVec3(0.0f, 0.0f, 1.0f))));
+    meshA->release();
+    meshB->release();
+    // Something to simulate, far from the meshes: a box on a plane.
+    PxRigidStatic* plane = physics->createRigidStatic(PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 10.0f)));
+    PxShape* ps = physics->createShape(PxPlaneGeometry(), *material);
+    plane->attachShape(*ps);
+    ps->release();
+    scene->addActor(*plane);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               -8.0f, 40.0f);
+    s.ok = true;
+    return s;
+}
+
+// The sample points.  `k` are texel indices: the node at k is boxLower + k/16, exact.
+static PxVec3 sdfQueryNode(const SdfQueryField& F, float kx, float ky, float kz)
+{
+    return PxVec3(F.lower + kx * 0.0625f, F.lower + ky * 0.0625f, F.lower + kz * 0.0625f);
+}
+
+static std::vector<PxVec3> sdfQueryPointsA(const SdfQueryField& A)
+{
+    std::vector<PxVec3> p;
+    // [0..4] -- also S_C's five: interior, two boundary nodes, outside +x, an outside corner.
+    p.push_back(sdfQueryNode(A, 5, 7, 11));
+    p.push_back(sdfQueryNode(A, 0, 4, 9));
+    p.push_back(sdfQueryNode(A, 31, 31, 3));
+    p.push_back(PxVec3(1.5f, sdfQueryNode(A, 0, 8, 12).y, sdfQueryNode(A, 0, 8, 12).z));
+    p.push_back(PxVec3(-1.25f, -0.90625f, 2.0f));
+    // [5] the shared node: (19, 16, 16) of A, (11, 8, 8) of B.
+    p.push_back(PxVec3(0.21875f, 0.03125f, 0.03125f));
+    // Outside every face, and the guard's own bounds (f == 1 and f == dims-2 are inside
+    // the inclusive guard; 0 and dims-1 are not).
+    const float out[2] = { -1.5f, 1.65625f };
+    for (int a = 0; a < 3; ++a)
+        for (int side = 0; side < 2; ++side)
+        {
+            PxVec3 q = sdfQueryNode(A, 6, 13, 2);
+            (&q.x)[a] = out[side];
+            p.push_back(q);
+        }
+    const float edge[4] = { 0, 1, 30, 31 };
+    for (float ex : edge) for (float ey : edge) for (float ez : edge)
+        p.push_back(sdfQueryNode(A, ex, ey, ez));
+    // The rest: nodes from a fixed LCG, 1 in 4 on a face, plus an outside point every 37th.
+    PxU32 r = 0x5DF95u;
+    auto next = [&r](PxU32 n) { r = r * 1664525u + 1013904223u; return (r >> 8) % n; };
+    while (p.size() < 1100)
+    {
+        if (p.size() % 37u == 0u)
+        {
+            // y outside by a whole number of texels, so the fall-back's +-dx taps that
+            // re-enter the box land on texel centres too.
+            p.push_back(PxVec3(sdfQueryNode(A, float(next(32)), 0, 0).x, A.higher + 0.0625f * float(1 + next(8)),
+                               sdfQueryNode(A, 0, 0, float(next(32))).z));
+            continue;
+        }
+        float k[3] = { float(1 + next(30)), float(1 + next(30)), float(1 + next(30)) };
+        if (next(4) == 0u)
+            k[next(3)] = next(2) ? 31.0f : 0.0f;
+        p.push_back(sdfQueryNode(A, k[0], k[1], k[2]));
+    }
+    // A last outside point at the very end of block 1.
+    p[1099] = PxVec3(-1.25f, 1.09375f, -1.09375f);
+    return p;
+}
+
+static std::vector<PxVec3> sdfQueryPointsB(const SdfQueryField& B)
+{
+    std::vector<PxVec3> p;
+    p.push_back(PxVec3(0.21875f, 0.03125f, 0.03125f));   // node (11, 8, 8) of B
+    p.push_back(sdfQueryNode(B, 3, 8, 5));
+    p.push_back(sdfQueryNode(B, 15, 0, 5));
+    p.push_back(sdfQueryNode(B, 1, 10, 14));
+    p.push_back(PxVec3(0.75f, sdfQueryNode(B, 0, 3, 4).y, sdfQueryNode(B, 0, 3, 4).z));
+    p.push_back(PxVec3(-0.5625f, -0.625f, 0.75f));
+    p.push_back(sdfQueryNode(B, 6, 6, 1));
+    return p;
 }
 
 // PXG_SCENE=extforce (P9.93): updateBodyExternalVelocitiesLaunch.
@@ -6939,6 +7200,21 @@ int main()
             sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
             std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (directapimerge)\n");
         }
+        // P9.95 -- PXG_SCENE=sdfquery: PxDirectGPUAPI::evaluateSDFDistances is refused
+        // unless the direct-GPU API is initialized (NpDirectGPUAPI.cpp:156), which needs
+        // this flag at createScene and one completed step.
+        if (sn && !std::strcmp(sn, "sdfquery"))
+        {
+            if (cpuControl)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=sdfquery requires the GPU pipeline; "
+                            "PXG_CPU_CONTROL=1 is incompatible with eENABLE_DIRECT_GPU_API\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+            std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (sdfquery)\n");
+        }
         if (sn && !std::strcmp(sn, "forcethreshold"))
             gForceThresholdPairs = true;
         // P9.95 -- PXG_SCENE=substepgravity: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is
@@ -10587,6 +10863,182 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=sdfquery (P9.95): evaluatePointDistancesSDFBatch through
+    // PxDirectGPUAPI::evaluateSDFDistances.  The meshes, shapes and points are described
+    // at buildSdfQueryScene.
+    if (!std::strcmp(sceneName, "sdfquery"))
+    {
+        SdfQueryScene qs = buildSdfQueryScene(physics, scene, material);
+        if (!qs.ok)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: scene 'sdfquery' could not be built\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        std::printf("  [  OK  ] scene 'sdfquery' built: S_A (mesh A), S_B (mesh B), S_C (mesh A, scale 2), "
+                    "all static\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: sdfquery pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const PxU32 NB = 3, MAXP = 1100;
+        const std::vector<PxVec3> ptsA = sdfQueryPointsA(qs.A), ptsB = sdfQueryPointsB(qs.B);
+        const PxU32 counts[NB] = { PxU32(ptsB.size()), PxU32(ptsA.size()), 5u };   // S_B, S_A, S_C
+        const SdfQueryField* fields[NB] = { &qs.B, &qs.A, &qs.A };
+        const size_t SLOTS = size_t(NB) * MAXP;
+        std::vector<PxVec4> hostPts(SLOTS);
+        // Live slots: the points, with a .w the kernel must not read (a NaN with a
+        // payload, +-inf, junk).  Dead slots: distinct finite junk.
+        for (size_t i = 0; i < SLOTS; ++i)
+            hostPts[i] = PxVec4(100.0f + float(i), -200.0f - float(i), 300.0f + float(i), 7.0f);
+        const PxU32 wBits[4] = { 0x7FC0BEEFu, 0x7F800000u, 0xFF800000u, 0x4640E6B7u };
+        for (PxU32 b = 0; b < NB; ++b)
+            for (PxU32 i = 0; i < counts[b]; ++i)
+            {
+                const PxVec3 p = (b == 0) ? ptsB[i] : ptsA[i];
+                float w;
+                std::memcpy(&w, &wBits[i % 4u], 4);
+                hostPts[size_t(b) * MAXP + i] = PxVec4(p, w);
+            }
+        static const float POISON = -999.0f;
+        const std::vector<PxVec4> poison(SLOTS, PxVec4(POISON));
+
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        CUdeviceptr dOut = 0, dIdx = 0, dPts = 0, dCnt = 0;
+        if (ctx->memAlloc(&dOut, SLOTS * sizeof(PxVec4)) != 0 || !dOut ||
+            ctx->memAlloc(&dIdx, NB * sizeof(PxShapeGPUIndex)) != 0 || !dIdx ||
+            ctx->memAlloc(&dPts, SLOTS * sizeof(PxVec4)) != 0 || !dPts ||
+            ctx->memAlloc(&dCnt, NB * sizeof(PxU32)) != 0 || !dCnt)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: sdfquery memAlloc failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        ctx->memcpyHtoD(dPts, hostPts.data(), SLOTS * sizeof(PxVec4));
+        ctx->memcpyHtoD(dCnt, counts, NB * sizeof(PxU32));
+        ctx->memcpyHtoD(dOut, poison.data(), SLOTS * sizeof(PxVec4));
+        int failures = 0;
+        auto query = [&]() {
+            return scene->getDirectGPUAPI().evaluateSDFDistances(
+                reinterpret_cast<PxVec4*>(dOut), reinterpret_cast<const PxShapeGPUIndex*>(dIdx),
+                reinterpret_cast<const PxVec4*>(dPts), reinterpret_cast<const PxU32*>(dCnt), NB, MAXP);
+        };
+        std::vector<PxVec4> out(SLOTS);
+        auto countPoison = [&]() {
+            size_t n = 0;
+            for (size_t i = 0; i < SLOTS; ++i)
+                if (std::memcmp(&out[i], &poison[i], sizeof(PxVec4)) == 0) ++n;
+            return n;
+        };
+
+        // (1) Before the first step the direct-GPU API is not initialized
+        // (NpDirectGPUAPI.cpp:156): the call is refused and the buffer is untouched.
+        {
+            PxShapeGPUIndex idx0[NB] = { 0u, 0u, 0u };
+            ctx->memcpyHtoD(dIdx, idx0, sizeof(idx0));
+            const bool early = query();
+            ctx->memcpyDtoH(out.data(), dOut, SLOTS * sizeof(PxVec4));
+            const size_t p = countPoison();
+            std::printf("  sdfquery: before the first step evaluateSDFDistances returned %s, %zu/%zu slots still poison\n",
+                        early ? "true" : "false", p, SLOTS);
+            if (early || p != SLOTS)
+            { std::printf("FAIL: the pre-step call must be refused and write nothing\n"); ++failures; }
+        }
+
+        // (2) One step: setDirectGPUAPIInitialized (ScPipeline.cpp:2814-2815).
+        scene->simulate(1.0f / 60.0f);
+        scene->fetchResults(true);
+
+        // (3) The real query.
+        const PxShapeGPUIndex idx[NB] = { qs.SB->getGPUIndex(), qs.SA->getGPUIndex(), qs.SC->getGPUIndex() };
+        std::printf("  sdfquery: shape GPU indices S_B=%u S_A=%u S_C=%u, counts {%u, %u, %u}, maxPointCount %u\n",
+                    idx[0], idx[1], idx[2], counts[0], counts[1], counts[2], MAXP);
+        for (PxU32 b = 0; b < NB; ++b)
+            if (idx[b] == 0xFFFFFFFFu) { std::printf("FAIL: shape %u has no GPU index\n", b); ++failures; }
+        ctx->memcpyHtoD(dIdx, idx, sizeof(idx));
+        ctx->memcpyHtoD(dOut, poison.data(), SLOTS * sizeof(PxVec4));
+        const unsigned launchFailsBefore = gSdfQueryLaunchFailures;
+        const bool ret = query();
+        ctx->memcpyDtoH(out.data(), dOut, SLOTS * sizeof(PxVec4));
+        std::vector<PxVec4> inBack(SLOTS);
+        ctx->memcpyDtoH(inBack.data(), dPts, SLOTS * sizeof(PxVec4));
+        ctx->memFree(dOut); ctx->memFree(dIdx); ctx->memFree(dPts); ctx->memFree(dCnt);
+        const unsigned launchFails = gSdfQueryLaunchFailures - launchFailsBefore;
+        std::printf("  sdfquery: evaluateSDFDistances returned %s (reported, not scored: the shim's "
+                    "streamSynchronize overwrites the launch result)\n", ret ? "true" : "false");
+
+        // (a) + (b): every live slot written, bit-equal to the literal host oracle.
+        size_t written = 0, livePoison = 0, mismatches = 0, oracleBad = 0;
+        for (PxU32 b = 0; b < NB; ++b)
+            for (PxU32 i = 0; i < counts[b]; ++i)
+            {
+                const size_t s = size_t(b) * MAXP + i;
+                if (std::memcmp(&out[s], &poison[s], sizeof(PxVec4)) == 0) { ++livePoison; continue; }
+                ++written;
+                bool ok = true;
+                const PxVec4 want = sdfQueryOracle(*fields[b], hostPts[s].getXYZ(), ok);
+                if (!ok)
+                {
+                    std::printf("  sdfquery: slot %u/%u p=(%.9g, %.9g, %.9g) is not on texel centres\n", b, i,
+                                hostPts[s].x, hostPts[s].y, hostPts[s].z);
+                    ++oracleBad;
+                    continue;
+                }
+                if (std::memcmp(&out[s], &want, sizeof(PxVec4)) != 0)
+                {
+                    if (mismatches < 8)
+                        std::printf("FAIL: slot %u/%u p=(%.6f, %.6f, %.6f): got (%.9g, %.9g, %.9g, %.9g), "
+                                    "want (%.9g, %.9g, %.9g, %.9g)\n", b, i, hostPts[s].x, hostPts[s].y, hostPts[s].z,
+                                    out[s].x, out[s].y, out[s].z, out[s].w, want.x, want.y, want.z, want.w);
+                    ++mismatches;
+                }
+            }
+        // (c) the slots past each count keep their poison.
+        size_t tailWritten = 0;
+        for (PxU32 b = 0; b < NB; ++b)
+            for (PxU32 i = counts[b]; i < MAXP; ++i)
+            {
+                const size_t s = size_t(b) * MAXP + i;
+                if (std::memcmp(&out[s], &poison[s], sizeof(PxVec4)) != 0) ++tailWritten;
+            }
+        // (d) S_C (scale 2) == S_A's first 5, bitwise.
+        const bool scaleInvariant = std::memcmp(&out[2 * MAXP], &out[1 * MAXP], 5 * sizeof(PxVec4)) == 0;
+        // (e) the shared node answers differently on the two meshes.
+        const bool mixupDistinct = std::memcmp(&out[0], &out[MAXP + 5], sizeof(PxVec4)) != 0;
+        // The inputs are read-only.
+        const bool inputsKept = std::memcmp(inBack.data(), hostPts.data(), SLOTS * sizeof(PxVec4)) == 0;
+        std::printf("  sdfquery: S_A[0]=(%.6f, %.6f, %.6f, %.6f)  S_B[0]=(%.6f, %.6f, %.6f, %.6f)  S_A[5]=(%.6f, %.6f, "
+                    "%.6f, %.6f)\n", out[MAXP].x, out[MAXP].y, out[MAXP].z, out[MAXP].w, out[0].x, out[0].y, out[0].z,
+                    out[0].w, out[MAXP + 5].x, out[MAXP + 5].y, out[MAXP + 5].z, out[MAXP + 5].w);
+        std::printf("  sdfquery: %zu written / %zu poison / %zu mismatches / %s / %s  (tail slots written %zu, "
+                    "oracle preconditions failed %zu, \"fail to launch\" errors %u)\n", written, livePoison, mismatches,
+                    scaleInvariant ? "scale-invariant" : "SCALE-DEPENDENT", mixupDistinct ? "mixup-distinct" : "MIXUP-EQUAL",
+                    tailWritten, oracleBad, launchFails);
+        if (livePoison) { std::printf("FAIL: %zu live slot(s) still hold the poison\n", livePoison); ++failures; }
+        if (mismatches) { std::printf("FAIL: %zu slot(s) differ bitwise from convexMeshMidphase.cu:1282-1286\n", mismatches); ++failures; }
+        if (oracleBad) { std::printf("FAIL: %zu point(s) do not sample exact texel centres\n", oracleBad); ++failures; }
+        if (tailWritten) { std::printf("FAIL: %zu slot(s) past a shape's count were written\n", tailWritten); ++failures; }
+        if (!scaleInvariant) { std::printf("FAIL: S_C (scale 2) differs from S_A: the kernel must ignore PxMeshScale\n"); ++failures; }
+        if (!mixupDistinct) { std::printf("FAIL: S_B and S_A answer the shared node identically\n"); ++failures; }
+        if (!inputsKept) { std::printf("FAIL: the sample-point buffer changed\n"); ++failures; }
+        if (launchFails) { std::printf("FAIL: %u \"evaluatePointDistancesSDF fail to launch\" error(s)\n", launchFails); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (gUnmappedLaunchReports)
+        { std::printf("FAIL: %u unmapped launch report(s)\n", gUnmappedLaunchReports); ++failures; }
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: sdfquery: %zu points on three SDF shapes bit-equal to the host "
+                        "oracle -- evaluatePointDistancesSDFBatch runs on Vulkan\n", written);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'sdfquery': %d check(s) failed\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=directapimerge (P9.95): mergeTransformCacheAndBoundArrayChanges, the
     // direct-GPU API's between-steps merge of new and re-inserted shapes.  The three
     // lanes are described at buildDirectApiMergeScene.
@@ -11242,6 +11694,7 @@ int main()
                        "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
                        "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
                        "          directapimerge                          (P9.95: shapes added / re-inserted between steps -> mergeTransformCacheAndBoundArrayChanges)\n"
+                       "          sdfquery                                (P9.95: PxDirectGPUAPI::evaluateSDFDistances -> evaluatePointDistancesSDFBatch)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

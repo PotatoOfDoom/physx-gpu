@@ -224,9 +224,11 @@ PXG_TEST(shimBindless_enginePath)
 // ---------------------------------------------------------------------------
 // shimBindless_enginePath shows the door works for a kernel that samples.  This
 // one shows the door is chosen for EXACTLY the kernels that sample: over every
-// mapped row of the engine manifest, the entries that use set 1 must be the four
+// mapped row of the engine manifest, the entries that use set 1 must be the five
 // SDF kernels and nothing else.  P9.83b-8 mapped triangleTriangleCollision (it
-// samples both meshes' SDFs) and the list grew by one, on purpose.
+// samples both meshes' SDFs) and the list grew by one, on purpose; P9.95 mapped
+// evaluatePointDistancesSDFBatch (PxDirectGPUAPI::evaluateSDFDistances samples the
+// queried mesh's SDF) and it grew by one again.
 PXG_TEST(shimBindless_classify)
 {
     using physx::gpuslang::gPxgSlangKernelManifest;
@@ -258,7 +260,8 @@ PXG_TEST(shimBindless_classify)
             sampling.insert(row.cudaName);
     }
     const std::set<std::string> expected = { "cloth_sdfMeshContactGenLaunch", "ps_sdfMeshCollisonLaunch",
-                                             "sb_sdfMeshMidphaseGeneratePairsLaunch", "triangleTriangleCollision" };
+                                             "sb_sdfMeshMidphaseGeneratePairsLaunch", "triangleTriangleCollision",
+                                             "evaluatePointDistancesSDFBatch" };
     PXG_CHECK_MSG(missing == 0, "shimBindless_classify: %zu mapped rows have no loadable .spv", missing);
     for (const std::string& n : sampling)
         if (!expected.count(n))
@@ -267,7 +270,7 @@ PXG_TEST(shimBindless_classify)
         if (!sampling.count(n))
             std::printf("  expected to sample, not classified: %s\n", n.c_str());
     PXG_CHECK_MSG(sampling == expected,
-                  "shimBindless_classify: %zu engine entries classified as using set 1, expected the 4 "
+                  "shimBindless_classify: %zu engine entries classified as using set 1, expected the 5 "
                   "SDF kernels exactly", sampling.size());
 
     // PER ENTRY, not per module: two harness modules mix sampling and
@@ -362,6 +365,6 @@ PXG_TEST(shimBindless_classify)
                   "must classify as not sampling");
 
     std::printf("  shimBindless_classify: %zu mapped engine rows over %zu modules; %zu use set 1 "
-                "(the 4 SDF kernels); %zu per-entry cases\n",
+                "(the 5 SDF kernels); %zu per-entry cases\n",
                 mapped, blobs.size(), sampling.size(), sizeof(cases) / sizeof(cases[0]));
 }

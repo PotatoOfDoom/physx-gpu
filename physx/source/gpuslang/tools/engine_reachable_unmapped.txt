@@ -54,7 +54,11 @@
 # convexCoreTrimeshNphase_Kernel32 -- MAPPED in P9.70c (cvxCoreTriNpBda.spv).  The
 # third convexCore arm, and the one the `convexcoretrimesh` scene was written
 # against BEFORE the kernel existed, so the red measurement is on record.
-evaluatePointDistancesSDFBatch
+# evaluatePointDistancesSDFBatch -- MAPPED in P9.95 (sdfQueryBda.spv), DRIVEN by
+# PXG_SCENE=sdfquery via PxDirectGPUAPI::evaluateSDFDistances, its only caller: a
+# query the API launches on demand, never a simulation step, so no scene that only
+# steps could have reached it.  Red measured first: unmapped, all 1112 live output
+# slots stayed at the -999 poison and the call still returned true.
 # sb_heightfieldContactGenLaunch -- MAPPED in P9.81 (softBodyHfContactGenBda.spv),
 # and DRIVEN, by PXG_SB_FLOOR=heightfield -- the sixth floor of the softbody scene's
 # floor matrix and the first (softbody, heightfield) pair this harness has ever built.
