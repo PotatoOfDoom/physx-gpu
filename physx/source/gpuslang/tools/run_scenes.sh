@@ -93,9 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.97a, slabgrid added): 63 named scenes below, plus sixteen explicit rows
-# after the loop (the settling bag, three softbody floors, the softbodyhex box arm, eight
-# PGS rows, three slabgrid modes) = 79.
+# Today (P9.97b, the sdfmesh softbody floor added): 63 named scenes below, plus seventeen
+# explicit rows after the loop (the settling bag, four softbody floors, the softbodyhex box
+# arm, eight PGS rows, three slabgrid modes) = 80.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -168,12 +168,21 @@ run_one "particle (settling bag, STARTY=4.0)" PXG_SCENE=particle PXG_PARTICLE_ST
 # rather than three separate scenes:
 #
 #   box (the default, above)  0.4893    mesh  0.4883    heightfield  0.4891
+#   sdfmesh  0.4895 (P9.97b)
+#
+# P9.97b added the sdfmesh floor: a static triangle mesh cooked WITH AN SDF (sdfmesh's
+# cookSdfBox), the only floor whose pair routes to eSoftbodySdfTrimesh and so to
+# sb_sdfMeshMidphaseGeneratePairsLaunch, which no scene reached before.  Its shader read
+# the by-value writer at @88 while the bridge pushes it at @96 (paramAlign(80) = 16);
+# with that shader this row SEGFAULTS (3 of 3 runs, at the first contacting step), with
+# the fixed one it settles at 0.4895 with 20 contacts.
 #
 # plane and sphere are left unscored: both route to sb_primitiveContactGenLaunch,
 # which the box arm already covers, so scoring them would buy runtime and no reach.
 run_one "softbody (mesh floor)"        PXG_SCENE=softbody PXG_SB_FLOOR=mesh
 run_one "softbody (convexcore floor)"  PXG_SCENE=softbody PXG_SB_FLOOR=convexcore
 run_one "softbody (heightfield floor)" PXG_SCENE=softbody PXG_SB_FLOOR=heightfield
+run_one "softbody (sdfmesh floor)"     PXG_SCENE=softbody PXG_SB_FLOOR=sdfmesh
 
 # P9.91: the force-threshold pipeline (accumulateThresholdStream.cu) is launched by BOTH
 # GPU solver cores -- PxgCudaSolverCore and PxgTGSCudaSolverCore each carry their own

@@ -61,11 +61,44 @@
 # The silent half of a defect pair is the half that needs a checker.
 #
 # ---------------------------------------------------------------------------
+# THE JOIN: ROW == SHADER LAYOUT (P9.97b)
+# ---------------------------------------------------------------------------
+# Coverage alone is a necessary condition, not a sufficient one: two structs can
+# agree on which bytes are read and still disagree on what lives there.  P9.97b
+# found the case that proves it.  sb_sdfMeshMidphaseGeneratePairsLaunch's shader put
+# its 80-byte by-value PxgFEMContactWriter at @88 in a 168-byte block while the row
+# and the bridge put it at @96 (paramAlign(80) = 16; push 176).  Coverage was FULL
+# and NO-MEMBER silent -- every argument was overlapped by SOME member -- while on the
+# engine path w_outPoint read bridge padding and every later writer field sat one
+# slot off.  The scene that finally reached it segfaulted.
+#
+# So every reached leaf member of the push block (nested Slang structs recursed) is
+# now laid against the row's arguments AS THE BRIDGE PLACES THEM (paramAlign), with
+# each by-value aggregate argument FLATTENED into its fields -- from the CUDA
+# signature's struct (check_launch_abi_pack.struct_fields), from the vector types, or
+# from HOST_ARG_FIELDS for a host-shaped row.  Failures, never ratcheted:
+#
+#   R0 PAD-READ    a REACHED member that overlaps no argument field: it reads bytes
+#                  the bridge filled with zero padding (the P9.97b defect).
+#   R1 STRADDLE    a member over more than one ARGUMENT, any of them >= 4 bytes.  A
+#                  word over several SUB-WORD arguments is the packed-bool idiom
+#                  (solveFlagsWord, boolsWord, extFlagsWord) and stays legal.
+#   R2 CUT         a member edge strictly inside a field or a scalar/pointer argument.
+#   R5 F-SUBWORD   a FLOAT member over an argument field narrower than 4 bytes (kills
+#                  P9.97's M2, the kSapBoxInit {8,1,4} swap, at updateBodiesLaunch*'s
+#                  `dt`, without flagging the bool-read-as-a-word idiom).
+#
+# Report-only: an UNREACHED member that is not named *pad* and lies wholly in padding
+# (R0b).  A kernel whose push block or aggregate argument cannot be laid out goes to
+# KNOWN_UNDECIDED_JOIN, a ratchet that is EMPTY.  A SELFTEST runs first (M1 -> CUT,
+# M2 -> F-SUBWORD, the P9.97b writer@88 -> PAD-READ + CUT, plus synthetic cases).
+#
+# ---------------------------------------------------------------------------
 # WHAT IT DOES *NOT* CHECK
 # ---------------------------------------------------------------------------
-# Byte LAYOUT within the pushed range.  Two structs can agree on which bytes are
-# read and still disagree on what lives there.  Coverage is a necessary
-# condition, not a sufficient one.
+# A permutation of same-sized fields INSIDE one aggregate (two pointers swapped):
+# offsets cannot see names.  The bridge-path fixtures can (testSoftBodySdfMid's
+# softBodySdfMidphaseBridgeSized launches the engine's host pack).
 #
 # Nor can it tell a DELIBERATE omission from an accidental one -- that is a
 # question about the CUDA, and the answer goes in push_block_known.txt beside
@@ -103,6 +136,7 @@
 # Usage: python3 check_push_block.py [shader-dir]
 #        (default: ../../../../build-gpuslang/shaders)
 
+import collections
 import os
 import re
 import struct
@@ -299,6 +333,44 @@ class Module(object):
             return out
         return []
 
+    def leaf_members(self, name):
+        """[(offset, end, dotted name, kind)] of every LEAF member of the entry point's
+        push block, nested structs recursed with their parent offsets added; kind is
+        'f' for a float scalar/vector/matrix/array, 'i' otherwise.  None when undecidable."""
+        for ename, _fn, iface in self.entries:
+            if ename != name:
+                continue
+            pushes = [v for v in iface if v in self.push_vars]
+            if len(pushes) != 1:
+                return None
+            out = []
+
+            def walk(sid, base, prefix):
+                t = self.types.get(sid)
+                if not t or t[0] != OP_TYPE_STRUCT:
+                    return False
+                for idx, mt in enumerate(t[1]):
+                    off = self.member_offset.get((sid, idx))
+                    if off is None:
+                        return False
+                    nm = prefix + self.member_name.get((sid, idx), "?")
+                    mtt = self.types.get(mt)
+                    if mtt and mtt[0] == OP_TYPE_STRUCT:
+                        if not walk(mt, base + off, nm + "."):
+                            return False
+                        continue
+                    sz = self.type_size(mt)
+                    if sz is None or not mtt:
+                        return False
+                    k = mtt
+                    while k and k[0] in (OP_TYPE_VECTOR, OP_TYPE_MATRIX, OP_TYPE_ARRAY):
+                        k = self.types.get(k[1][0])
+                    out.append((base + off, base + off + sz, nm, "f" if k and k[0] == OP_TYPE_FLOAT else "i"))
+                return True
+
+            return out if walk(self.push_vars[pushes[0]], 0, "") else None
+        return None
+
     def coverage_for_entry(self, name):
         """(reached byte ranges, declared block size, note).
 
@@ -347,55 +419,86 @@ class Module(object):
 # ---------------------------------------------------------------------------
 # the ABI table and the manifest
 # ---------------------------------------------------------------------------
-def _param_align(size):
-    """paramAlign (PxgVulkanCudaContext.cpp:114) / abiAlign (PxgVulkanKernelAbi.cpp
-    :2206): the largest power of two that DIVIDES the size, capped at 16.
+# P9.97b: ONE row model for both checkers.  check_launch_abi_pack.read_abi models
+# array[:argCount] -- what the bridge uses -- and reports every row it cannot read
+# (an unparsed array, a wrong count, a duplicate name) instead of skipping it.  The
+# copy that stood here read whole arrays and kept the LAST of two rows with one name,
+# where the bridge takes the FIRST.  Sibling import, the check_block_coverage.py
+# precedent.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import check_launch_abi_pack as lap   # noqa: E402
 
-    Transcribed as a modulo ladder, which it is.  P9.78b's first draft wrote it as
-    `size if size in (1,2,4,8) else 16`, which is right for every power-of-two size
-    and wrong for a 12-byte PxVec3 -- the by-value `gravity` argument.  That gave
-    16 where the bridge gives 4 and shifted every argument after it, mis-sizing 16
-    of the 358 rows and inventing two "unread arguments" that were nothing of the
-    kind.  The same wrong copy shipped in check_launch_abi_pack.py and is corrected
-    there too."""
-    if size == 0:
-        return 1
-    for a in (16, 8, 4, 2):
-        if size % a == 0:
-            return a
-    return 1
+_param_align = lap._param_align
 
 
 def _abi_arg_ranges(row):
     """[(start, end)] per CUDA argument, laid out exactly as the bridge lays the
-    blob out (PxgVulkanCudaContext.cpp:443-462)."""
-    out, off = [], 0
-    for s in row:
-        a = _param_align(s)
-        off = (off + a - 1) & ~(a - 1)
-        out.append((off, off + s))
-        off += s
-    return out
+    blob out (paramAlign, PxgVulkanCudaContext.cpp sized launchKernel)."""
+    return [(o, o + s) for (o, s) in lap.arg_layout(row)[0]]
 
 
 def abi_push_size(row):
-    """pxgKernelAbiPushSize (PxgVulkanKernelAbi.cpp:2231), transcribed."""
-    ranges = _abi_arg_ranges(row)
-    end = ranges[-1][1] if ranges else 0
-    ma = max([_param_align(s) for s in row] + [1])
-    return (end + ma - 1) & ~(ma - 1)
+    """pxgKernelAbiPushSize (PxgVulkanKernelAbi.cpp), transcribed."""
+    return lap.abi_push_size(row)
 
 
-def read_abi():
-    src = open(ABI).read()
-    arrays = {}
-    for m in re.finditer(r"static\s+const\s+uint8_t\s+(\w+)\s*\[\]\s*=\s*\{([^}]*)\}", src):
-        arrays[m.group(1)] = [int(v) for v in re.findall(r"\d+", m.group(2))]
-    rows = {}
-    for m in re.finditer(r'\{\s*"([^"]+)"\s*,\s*(\w+)\s*,', src):
-        if m.group(2) in arrays:
-            rows[m.group(1)] = arrays[m.group(2)]
-    return rows
+def read_abi(text=None):
+    """(cuda name -> argument sizes, integrity problems) from the shared row model."""
+    rows, bad = lap.read_abi(text)
+    return collections.OrderedDict((k, r.sizes) for k, r in rows.items()), bad
+
+
+# Kernels whose push block or aggregate argument this join cannot lay out.  RATCHET:
+# may shrink, never grow.  Empty.
+KNOWN_UNDECIDED_JOIN = set()
+
+
+def arg_fields(name, row, sigs=None):
+    """[(start, end, argument index)] -- the row's arguments as the bridge places them,
+    every by-value aggregate FLATTENED into its fields; None when an aggregate cannot be
+    laid out (an UNDECIDED join, never a pass)."""
+    out = []
+    shapes = lap.arg_fields(name, row, sigs)
+    for i, ((a, b), shape) in enumerate(zip(_abi_arg_ranges(row), shapes)):
+        if shape == "UNDECIDED":
+            return None
+        if shape is None:
+            out.append((a, b, i))
+        else:
+            out.extend((a + fo, a + fo + fs, i) for (fo, fs, _k) in shape)
+    return out
+
+
+def join_check(row, fields, leaves, reached):
+    """The layout join for one kernel.  Pure, so the selftest can feed it synthetic
+    blocks.  Returns ([(rule, member, detail)] failures, [report-only notes])."""
+    bad, notes = [], []
+    args = _abi_arg_ranges(row)
+    total = abi_push_size(row)
+    for (ms, me, nm, kind) in leaves:
+        if ms >= total:
+            continue   # a shared struct sized for a larger sibling; over-reads are OVER-READ's
+        hit_f = [(a, b, i) for (a, b, i) in fields if ms < b and a < me]
+        hit_a = sorted(set(i for (a, b, i) in hit_f) |
+                       set(i for i, (a, b) in enumerate(args) if ms < b and a < me))
+        is_reached = reached is None or any(rs < me and ms < re_ for (rs, re_) in reached)
+        if not hit_f:
+            if is_reached:
+                bad.append(("PAD-READ", nm, "@%d+%d is reached and overlaps no argument field -- it "
+                            "reads bytes the bridge pads with zero" % (ms, me - ms)))
+            elif "pad" not in nm.lower():
+                notes.append("%s @%d+%d lies wholly in padding (unreached)" % (nm, ms, me - ms))
+            continue
+        if len(hit_a) > 1 and any(args[i][1] - args[i][0] >= 4 for i in hit_a):
+            bad.append(("STRADDLE", nm, "@%d+%d spans arguments %s" % (ms, me - ms,
+                        ", ".join("%d@%d+%d" % (i, args[i][0], args[i][1] - args[i][0]) for i in hit_a))))
+        for (a, b, i) in hit_f:
+            if a < ms < b or a < me < b:
+                bad.append(("CUT", nm, "@%d+%d cuts argument %d's field @%d+%d" % (ms, me - ms, i, a, b - a)))
+        if kind == "f" and any(b - a < 4 for (a, b, _i) in hit_f):
+            bad.append(("F-SUBWORD", nm, "float @%d+%d over a %s-byte argument" % (
+                ms, me - ms, "/".join(str(b - a) for (a, b, _i) in hit_f if b - a < 4))))
+    return bad, notes
 
 
 def read_manifest():
@@ -422,15 +525,125 @@ def read_known():
     return known
 
 
+# ---------------------------------------------------------------------------
+# SELFTEST (P9.97b): each case is built so that a join that cannot see it fails here.
+# ---------------------------------------------------------------------------
+SELFTEST_ROWS = [
+    ("M1 vec3 split", "static const uint8_t kTwoPtrVec3[] = { 8, 8, 12 };",
+     "static const uint8_t kTwoPtrVec3[] = { 8, 8, 8, 4 };", {"applyTGSSubstepGravity": "CUT"}),
+    ("M2 sapbox swap", "static const uint8_t kSapBoxInit[] = { 8, 4, 1 };",
+     "static const uint8_t kSapBoxInit[] = { 8, 1, 4 };",
+     {"updateBodiesLaunch1T": "F-SUBWORD", "updateBodiesLaunch_Part2": "F-SUBWORD",
+      "updateBodiesLaunch_Part3": "F-SUBWORD"}),
+]
+
+
+def _sdf_block(writer_at):
+    """sb_sdfMeshMidphaseGeneratePairsLaunch's push block with the writer at `writer_at`."""
+    out = [(0, 4, "tolerenceLength", "f"), (4, 8, "_pad4", "i")]
+    out += [(8 + 8 * i, 16 + 8 * i, "ptr%d" % i, "i") for i in range(9)]
+    out += [(80, 84, "nbFilterPairs", "i"), (84, 88, "_pad84", "i")]
+    if writer_at == 96:
+        out.append((88, 96, "_pad88", "i"))
+    out += [(writer_at + 8 * i, writer_at + 8 + 8 * i, "w_ptr%d" % i, "i") for i in range(9)]
+    out += [(writer_at + 72, writer_at + 76, "w_maxNumContacts", "i"),
+            (writer_at + 76, writer_at + 80, "_pad%d" % (writer_at + 76), "i")]
+    return out
+
+
+def selftest(shader_dir):
+    fails = []
+    sigs = lap.cuda_signatures()
+    abi_text = open(ABI).read()
+    manifest = dict((c, (spv, e)) for (c, spv, e) in read_manifest())
+    mods = {}
+
+    def rules_for(rows, name):
+        spv, entry = manifest[name]
+        if spv not in mods:
+            mods[spv] = Module(os.path.join(shader_dir, spv))
+        m = mods[spv]
+        leaves, flat = m.leaf_members(entry), arg_fields(name, rows[name], sigs)
+        if leaves is None or flat is None:
+            return None
+        return set(r for (r, _m, _d) in join_check(rows[name], flat, leaves,
+                                                    m.coverage_for_entry(entry)[0])[0])
+
+    for label, old, new, expect in SELFTEST_ROWS:
+        if abi_text.count(old) != 1:
+            fails.append("SELFTEST BROKEN: %s -- anchor found %d times; re-anchor it" % (label, abi_text.count(old)))
+            continue
+        rows, _bad = read_abi(abi_text.replace(old, new))
+        for k, rule in expect.items():
+            try:
+                got = rules_for(rows, k)
+            except (OSError, ValueError, KeyError) as e:
+                got = None
+                fails.append("SELFTEST BROKEN: %s -- %s" % (label, e))
+            if got is None or rule not in got:
+                fails.append("SELFTEST: %s must give %s at %s; got %s" % (label, rule, k, got))
+    # The P9.97b defect itself, synthetic: the writer at @88 over the row's writer at @96.
+    name = "sb_sdfMeshMidphaseGeneratePairsLaunch"
+    row = [4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80]
+    flat = arg_fields(name, row, sigs)
+    if flat is None:
+        fails.append("SELFTEST: the FEM writer of %s cannot be flattened" % name)
+    else:
+        for at in (88, 96):
+            blk = _sdf_block(at)
+            reached = [(a, b) for (a, b, n, _k) in blk if "pad" not in n]
+            got = join_check(row, flat, blk, reached)[0]
+            if at == 88:
+                rules = set(r for (r, _m, _d) in got)
+                if not {"PAD-READ", "CUT"} <= rules:
+                    fails.append("SELFTEST: a writer @88 against the row's @96 must give PAD-READ and CUT; "
+                                 "got %s" % rules)
+            elif got:
+                fails.append("SELFTEST: the writer @96 must join cleanly; got %s" % got)
+    # STRADDLE over two 4-byte arguments, and the legal packed-bool word.
+    got = set(r for (r, _m, _d) in join_check([8, 4, 4], [(0, 8, 0), (8, 12, 1), (12, 16, 2)],
+                                               [(0, 8, "p", "i"), (8, 16, "two", "i")], None)[0])
+    if "STRADDLE" not in got:
+        fails.append("SELFTEST: one member over two 4-byte arguments must give STRADDLE; got %s" % got)
+    got = join_check([8, 1, 1, 1, 1], [(0, 8, 0), (8, 9, 1), (9, 10, 2), (10, 11, 3), (11, 12, 4)],
+                     [(0, 8, "p", "i"), (8, 12, "flagsWord", "i")], None)[0]
+    if got:
+        fails.append("SELFTEST: a word over four bool arguments is the packed-bool idiom; got %s" % got)
+    # Nested Slang structs are recursed (a top-level-only walk would see one 8-byte member).
+    fm = Module.__new__(Module)
+    fm.types = {1: (OP_TYPE_INT, [32, 0]), 2: (OP_TYPE_FLOAT, [32]), 3: (OP_TYPE_INT, [64, 0]),
+                10: (OP_TYPE_STRUCT, [2, 2]), 11: (OP_TYPE_STRUCT, [3, 10, 1])}
+    fm.member_offset = {(10, 0): 0, (10, 1): 4, (11, 0): 0, (11, 1): 8, (11, 2): 16}
+    fm.member_name = {(10, 0): "x", (10, 1): "y", (11, 0): "a", (11, 1): "b", (11, 2): "c"}
+    fm.push_vars, fm.entries = {99: 11}, [("e", 0, [99])]
+    fm.constants, fm.array_stride, fm.matrix_stride = {}, {}, {}
+    want = [(0, 8, "a", "i"), (8, 12, "b.x", "f"), (12, 16, "b.y", "f"), (16, 20, "c", "i")]
+    if fm.leaf_members("e") != want:
+        fails.append("SELFTEST: nested push-block structs must be recursed: %s" % fm.leaf_members("e"))
+    return fails
+
+
 def main():
     shader_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build-gpuslang", "shaders")
     if not os.path.isdir(shader_dir):
         print("no shader directory: %s" % shader_dir)
         return 2
 
-    rows = read_abi()
+    fails = selftest(shader_dir)
+    if fails:
+        print("THE PUSH-BLOCK JOIN SELFTEST FAILED -- it cannot see what it claims to see:")
+        for f in fails:
+            print("  " + f)
+        print()
+
+    rows, integrity = read_abi()
+    sigs = lap.cuda_signatures()
     known = read_known()
     modules = {}
+    joinbad = []         # (cuda, rule, member, detail)
+    joinnotes = []
+    join_undecided = set()
+    joined = 0
 
     full = 0
     no_row = 0
@@ -465,6 +678,17 @@ def main():
         if reach > want:
             over.append((cuda, entry, reach, want, declared, note))
             continue
+
+        # ---- the layout join (P9.97b) ----
+        leaves = modules[spv].leaf_members(entry)
+        flat = arg_fields(cuda, row, sigs)
+        if leaves is None or flat is None:
+            join_undecided.add(cuda)
+        else:
+            joined += 1
+            jb, jn = join_check(row, flat, leaves, ranges)
+            joinbad += [(cuda, r, m, d) for (r, m, d) in jb]
+            joinnotes += ["%s: %s" % (cuda, n) for n in jn]
 
         args = _abi_arg_ranges(row)
         fields = modules[spv].block_members(entry)
@@ -506,7 +730,44 @@ def main():
     print("  UNDECIDED  %d" % len(undecided))
     print("  unread arguments in total: %d" % sum(len(p[2]) for p in partial))
 
-    failures = 0
+    print("  JOIN       %d kernels laid against their row field by field: %d PAD-READ, %d STRADDLE, "
+          "%d CUT, %d F-SUBWORD; %d undecided (ratchet %d)"
+          % (joined, sum(1 for x in joinbad if x[1] == "PAD-READ"),
+             sum(1 for x in joinbad if x[1] == "STRADDLE"), sum(1 for x in joinbad if x[1] == "CUT"),
+             sum(1 for x in joinbad if x[1] == "F-SUBWORD"), len(join_undecided), len(KNOWN_UNDECIDED_JOIN)))
+
+    failures = len(fails)
+
+    if integrity:
+        print("\nThe ABI table has rows the shared row model cannot read as the bridge does")
+        print("(check_launch_abi_pack.py reports the same, under I1/I4):")
+        for name, cat, msg in integrity:
+            print("  %-46s %s: %s" % (name, cat, msg))
+        failures += len(integrity)
+
+    if joinbad:
+        print("\nTHE SHADER'S PUSH BLOCK AND THE ROW DISAGREE ON THE LAYOUT.  The bridge places")
+        print("each argument at paramAlign(size) (an 80-byte writer at 16, not at its natural 8);")
+        print("a member that reads padding or cuts a field reads the wrong bytes on the engine")
+        print("path, while every fixture that dispatches its own blob stays green:")
+        for cuda, rule, member, detail in sorted(joinbad):
+            print("  %-46s %-9s %s %s" % (cuda, rule, member, detail))
+        failures += len(joinbad)
+    fresh_und = sorted(join_undecided - KNOWN_UNDECIDED_JOIN)
+    if fresh_und:
+        print("\n%d kernel(s) whose layout join is UNDECIDED (not a pass; teach struct_fields" % len(fresh_und))
+        print("or HOST_ARG_FIELDS the aggregate, or add it to KNOWN_UNDECIDED_JOIN):")
+        for k in fresh_und:
+            print("  %s" % k)
+        failures += len(fresh_und)
+    stale_und = sorted(KNOWN_UNDECIDED_JOIN - join_undecided)
+    if stale_und:
+        print("\nSTALE KNOWN_UNDECIDED_JOIN entries (now decided; remove them): %s" % ", ".join(stale_und))
+        failures += len(stale_und)
+    if joinnotes:
+        print("\nReport only -- unreached members that lie wholly in padding (R0b):")
+        for n in sorted(joinnotes):
+            print("  " + n)
 
     if nomember:
         print("\nA row argument that NO declared push-block field covers means the shader")

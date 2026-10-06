@@ -31,6 +31,10 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "PxgCudaShim.h"
+#include "PxgVulkanCudaContext.h"      // P9.97b: the void** bridge path
+#include "PxgVulkanKernelAbi.h"
+#include "cudamanager/PxCudaContext.h"
+#include "PxDirectGPUAPI.h"            // PxArticulationGPUAPIReadType (the enum pin below)
 
 #include "foundation/PxBounds3.h"
 #include "PxgBroadPhaseDesc.h"
@@ -40,6 +44,13 @@
 #include <numeric>
 #include <random>
 #include <vector>
+
+// P9.97b: check_launch_abi_pack.py sizes every `X::Enum` argument as 4 bytes -- PhysX
+// enums declare no underlying type, so that is a property of the compilers this builds
+// with, pinned here rather than assumed (the articulation direct-API getters push a
+// PxArticulationGPUAPIReadType::Enum by value through the void** form).
+static_assert(sizeof(physx::PxArticulationGPUAPIReadType::Enum) == 4,
+              "check_launch_abi_pack.py's `X::Enum` = 4 rule");
 
 namespace
 {
@@ -420,6 +431,21 @@ PXG_TEST(broadphaseSetup_markCreatedPairs)
         shim.memFree(pfree);
 }
 
+// The oracle of initializeSapBox1DLaunch for one axis: projection i of handle h writes i
+// into h's min (start) or max (end) slot.  Hoisted (P9.97b) so the bridge-path test below
+// shares it.
+static void sapRefAxis(const std::vector<uint32_t>& handles, uint32_t numProjections,
+                       std::vector<SapBox1D>& sap)
+{
+    for (uint32_t i = 0; i < numProjections; ++i)
+    {
+        const uint32_t sh = handles[i];
+        const uint32_t handle = sh >> 3;
+        const bool isStart = (sh & 1) != 0;
+        sap[handle].mMinMax[isStart ? 0 : 1] = i;
+    }
+}
+
 PXG_TEST(broadphaseSetup_initializeSapBox1D)
 {
     using namespace physx;
@@ -488,19 +514,10 @@ PXG_TEST(broadphaseSetup_initializeSapBox1D)
                                         uint32_t(blob.bytes.size())) == PxgResult::Success, "launch sapbox init");
         shim.streamSynchronize();
 
-        auto refAxis = [&](const std::vector<uint32_t>& handles, std::vector<SapBox1D>& sap) {
-            for (uint32_t i = 0; i < numProjections; ++i)
-            {
-                const uint32_t sh = handles[i];
-                const uint32_t handle = sh >> 3;
-                const bool isStart = (sh & 1) != 0;
-                sap[handle].mMinMax[isStart ? 0 : 1] = i;
-            }
-        };
         std::vector<SapBox1D> rX = sapInit, rY = sapInit, rZ = sapInit;
-        refAxis(handX, rX);
-        refAxis(handY, rY);
-        refAxis(handZ, rZ);
+        sapRefAxis(handX, numProjections, rX);
+        sapRefAxis(handY, numProjections, rY);
+        sapRefAxis(handZ, numProjections, rZ);
 
         std::vector<SapBox1D> gX(numHandles), gY(numHandles), gZ(numHandles);
         shim.memcpyDtoH(gX.data(), dSX, numHandles * sizeof(SapBox1D));
@@ -519,6 +536,121 @@ PXG_TEST(broadphaseSetup_initializeSapBox1D)
         for (PxgDevicePtr pfree : { dHX, dHY, dHZ, dSX, dSY, dSZ, dDesc })
             shim.memFree(pfree);
     }
+}
+
+// ---------------------------------------------------------------------------
+// P9.97b -- initializeSapBox1DLaunch through the REAL void** bridge path.
+//
+// The void** launch form (PX_CUDA_KERNEL_PARAM2 / USE_NEW_LAUNCH_FUNCTION: broadphase,
+// AABB manager, articulation) carries no argument sizes, so the bridge copies
+// row.argSizes[i] bytes from host kernelParams[i] (PxgVulkanCudaContext.cpp, void**
+// launchKernel): the ROW is the copy length, and the shim's gate compares the row with
+// itself, so it can never fire.  No fixture executed a successful void** launch through
+// the bridge before this one -- the test above builds its own EngineBlob -- so a row
+// whose ENTRIES are wrong but whose total is right (P9.97's M2, kSapBoxInit {8,4,1} ->
+// {8,1,4}) passed the whole suite.  Here the arguments are the engine's own
+// (PxgCudaBroadPhaseSap.cpp: CUdeviceptr, PxU32 numHandles, bool isNew), the copy
+// lengths come from the row, and every SapBox1D is compared with the oracle.
+// numHandles = 300 > 255: a 1-byte copy of it (M2) truncates to 44 and leaves most
+// boxes unwritten -- observable.  (Under M2 the bridge would also read 4 bytes from the
+// 1-byte `isNew`, a 3-byte host over-read; the shader masks it `& 0xFF`.)
+// ---------------------------------------------------------------------------
+PXG_TEST(broadphaseSetup_initializeSapBox1DBridgeVoidStar)
+{
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+
+    const char* kName = "initializeSapBox1DLaunch";
+    const gpuslang::PxgKernelAbiRow* row = gpuslang::pxgFindKernelAbi(kName);
+    PXG_CHECK_MSG(row != nullptr, "the kernel has a launch-ABI row");
+    if (!row)
+        return;
+    // The literal host oracle, its own message so a runtime kill is attributed apart.
+    PXG_CHECK_MSG(row->argCount == 3 && row->argSizes[0] == 8 && row->argSizes[1] == 4 && row->argSizes[2] == 1,
+                  "the row is the host pack {CUdeviceptr, PxU32, bool} (PxgCudaBroadPhaseSap.cpp)");
+
+    std::mt19937 rng(6301);
+    const uint32_t numHandles = 300;
+    const uint32_t numProjections = numHandles * 2;
+    auto buildAxis = [&](std::vector<uint32_t>& handles) {
+        std::vector<uint32_t> order(numProjections);
+        std::iota(order.begin(), order.end(), 0u);
+        std::shuffle(order.begin(), order.end(), rng);
+        handles.resize(numProjections);
+        for (uint32_t j = 0; j < numProjections; ++j)
+            handles[j] = createHandle(order[j] >> 1, (order[j] & 1) == 0, false);
+    };
+    std::vector<uint32_t> handX, handY, handZ;
+    buildAxis(handX);
+    buildAxis(handY);
+    buildAxis(handZ);
+    std::vector<SapBox1D> sapInit(numHandles);
+    std::memset(sapInit.data(), 0xff, sapInit.size() * sizeof(SapBox1D));
+
+    PxgSlangComputeDevice* dev = testDevice();
+    // PhysXGpuVulkan.cpp's manifest rule: push size FROM THE ROW, cudaName set.
+    const PxgKernelDef manifest[] = {
+        { "broadphaseSetup.spv", kName, gpuslang::pxgKernelAbiPushSize(*row), 0u, kName } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
+    PxCudaContext* ctx = gpuslang::PxgCreateVulkanCudaContext(&shim, manifest, 1);
+    CUfunction fn = nullptr;
+    const bool mapped = ctx && ctx->moduleGetFunction(&fn, nullptr, kName) == 0 && fn != nullptr;
+    PXG_CHECK_MSG(mapped, "the bridge resolves %s", kName);
+
+    for (uint32_t variant = 0; mapped && variant < 2; ++variant)
+    {
+        BpDescRig rig(&shim);
+        const PxgDevicePtr dHX = rig.alloc(handX.data(), handX.size() * 4);
+        const PxgDevicePtr dHY = rig.alloc(handY.data(), handY.size() * 4);
+        const PxgDevicePtr dHZ = rig.alloc(handZ.data(), handZ.size() * 4);
+        const PxgDevicePtr dSX = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        const PxgDevicePtr dSY = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        const PxgDevicePtr dSZ = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        if (!dHX) { std::printf("  NOTE: no BDA -> skip\n"); break; }
+        const bool isNew = variant == 1;
+        rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dHX);
+        rig.desc.boxHandles[0][1] = reinterpret_cast<PxU32*>(dHY);
+        rig.desc.boxHandles[0][2] = reinterpret_cast<PxU32*>(dHZ);
+        PxgSapBox1D** sapArr = isNew ? rig.desc.boxNewSapBox1D : rig.desc.boxSapBox1D;
+        sapArr[0] = reinterpret_cast<PxgSapBox1D*>(dSX);
+        sapArr[1] = reinterpret_cast<PxgSapBox1D*>(dSY);
+        sapArr[2] = reinterpret_cast<PxgSapBox1D*>(dSZ);
+        const PxgDevicePtr dDesc = rig.upload();
+
+        // The engine's exact host types and argument order, in the void** form.
+        CUdeviceptr descd = CUdeviceptr(dDesc);
+        PxU32 nh = numHandles;
+        bool newFlag = isNew;
+        void* kernelParams[] = { &descd, &nh, &newFlag };
+        PXG_CHECK_MSG(ctx->launchKernel(fn, (numProjections + 255) / 256, 1, 1, 256, 1, 1, 0, nullptr,
+                                        kernelParams, nullptr, __FILE__, __LINE__) == 0,
+                      "variant %u: the void** launch is accepted", variant);
+        PXG_CHECK_MSG(ctx->streamSynchronize(nullptr) == 0, "streamSynchronize");
+
+        std::vector<SapBox1D> rX = sapInit, rY = sapInit, rZ = sapInit;
+        sapRefAxis(handX, numProjections, rX);
+        sapRefAxis(handY, numProjections, rY);
+        sapRefAxis(handZ, numProjections, rZ);
+        std::vector<SapBox1D> gX(numHandles), gY(numHandles), gZ(numHandles);
+        shim.memcpyDtoH(gX.data(), dSX, numHandles * sizeof(SapBox1D));
+        shim.memcpyDtoH(gY.data(), dSY, numHandles * sizeof(SapBox1D));
+        shim.memcpyDtoH(gZ.data(), dSZ, numHandles * sizeof(SapBox1D));
+        size_t mism = 0;
+        for (uint32_t h = 0; h < numHandles; ++h)
+        {
+            if (gX[h].mMinMax[0] != rX[h].mMinMax[0] || gX[h].mMinMax[1] != rX[h].mMinMax[1]) ++mism;
+            if (gY[h].mMinMax[0] != rY[h].mMinMax[0] || gY[h].mMinMax[1] != rY[h].mMinMax[1]) ++mism;
+            if (gZ[h].mMinMax[0] != rZ[h].mMinMax[0] || gZ[h].mMinMax[1] != rZ[h].mMinMax[1]) ++mism;
+        }
+        PXG_CHECK_MSG(mism == 0, "variant %u (isNew=%d): %zu of %u SAP boxes differ from the oracle "
+                                 "through the void** bridge path", variant, int(isNew), mism, 3u * numHandles);
+        for (PxgDevicePtr pfree : { dHX, dHY, dHZ, dSX, dSY, dSZ, dDesc })
+            shim.memFree(pfree);
+    }
+    if (ctx)
+        ctx->release();
 }
 
 PXG_TEST(broadphaseSetup_initializeRadixRanks)

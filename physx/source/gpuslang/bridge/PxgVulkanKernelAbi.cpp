@@ -26,10 +26,20 @@
 
 // See PxgVulkanKernelAbi.h.  One row per kernel brought up on the engine
 // launch path (P5 Step 4); argument sizes are transcribed from the CUDA
-// __global__ signature verbatim.  Pointer = 8, PxU32/float/enum = 4,
-// PxU16 = 2, PxU8/bool = 1; aggregates passed BY VALUE get their sizeof
-// (PhysX passes large aggregates by device pointer, so by-value structs
-// stay small).
+// __global__ signature verbatim -- EXCEPT the eight sized-only rows that
+// deliberately follow the HOST pack instead (propagateStaticSolverBodyVelocitiesTGS,
+// ps_solveRigidAttachmentsLaunch, ps_updateUserBufferLaunch,
+// removeContactManagers_Stage1..4, sb_copyOrApplySoftBodyDataDEPRECATED; each named
+// with its reason in tools/check_launch_abi_pack.py's KNOWN_ROW_FOLLOWS_HOST).
+// Pointer = 8, PxU32/float/enum = 4, PxU16 = 2, PxU8/bool = 1; aggregates passed
+// BY VALUE get their sizeof (PhysX passes large aggregates by device pointer, so
+// by-value structs stay small).
+//
+// P9.97b: check_launch_abi_pack.py holds every row PER ARGUMENT against its CUDA
+// signature and against every launch site's host pack (both launch forms), and
+// models array[:argCount] and hostPtrMask as the bridge does; check_push_block.py
+// holds every shader's push block to the row's layout AS THE BRIDGE PLACES IT
+// (paramAlign: an 80-byte writer goes to a 16-byte boundary).
 
 #include "PxgVulkanKernelAbi.h"
 
@@ -1330,6 +1340,8 @@ static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 
 //   both of them still occupy their slots.
 //   Launch site PxgNarrowphaseCore.cpp:4886: grid (numTests, 1, 1) x block
 //   (1024, 1, 1) -- one block per test, and no count argument to guard against.
+//   P9.97b: blob 176 bytes, the writer at @96 -- paramAlign(80) = 16 after
+//   nbFilterPairs ends at @84.  The shader put it at its natural @88 until P9.97b.
 static const uint8_t kSbSdfMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
 
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):

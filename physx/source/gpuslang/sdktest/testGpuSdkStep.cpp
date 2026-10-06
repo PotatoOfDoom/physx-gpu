@@ -5559,6 +5559,8 @@ struct SoftBodyScene
                                 // branch of sb_primitiveContactGenLaunch rather than GJK/EPA
     bool hasHeightfield = false;// PXG_SB_FLOOR=heightfield (P9.81a): the SIXTH floor, and the
                                 // only one whose pair routes to GPU_BUCKET_ID::eSoftbodyHeightfield
+    bool hasSdfMesh = false;    // PXG_SB_FLOOR=sdfmesh (P9.97b): the SEVENTH floor, the only one
+                                // whose pair routes to GPU_BUCKET_ID::eSoftbodySdfTrimesh
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
@@ -5569,7 +5571,8 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     out.cudaCtx = cudaCtx;
 
     // ---- the floor ------------------------------------------------------------
-    // PXG_SB_FLOOR selects it: "box" (the default), "plane", "sphere" or "none".
+    // PXG_SB_FLOOR selects it: "box" (the default), "plane", "sphere", "mesh", "convexcore",
+    // "heightfield", "sdfmesh" (P9.97b) or "none".
     //
     // THE DEFAULT CHANGED WHEN THE HULL BRANCH LANDED, AND THAT IS THE RESULT.  A ground box
     // -- half extents (50, 0.5, 50) at y = -0.5, so its top face IS the plane y = 0 -- has
@@ -5602,8 +5605,9 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     const bool floorMesh   = floorEnv && !std::strcmp(floorEnv, "mesh");
     const bool floorCore    = floorEnv && !std::strcmp(floorEnv, "convexcore");
     const bool floorHf     = floorEnv && !std::strcmp(floorEnv, "heightfield");
+    const bool floorSdf    = floorEnv && !std::strcmp(floorEnv, "sdfmesh");
     const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh
-                          && !floorCore && !floorHf;
+                          && !floorCore && !floorHf && !floorSdf;
 
     PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
     if (!floorBox)
@@ -5727,11 +5731,57 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
             return out;   // addHeightFieldFloor prints its own FAIL
     }
 
+    // PXG_SB_FLOOR=sdfmesh (P9.97b): a static triangle mesh cooked WITH AN SDF, the SEVENTH
+    // floor, and the only one whose pair routes to GPU_BUCKET_ID::eSoftbodySdfTrimesh --
+    // i.e. to sb_sdfMeshMidphaseGeneratePairsLaunch, which no scene reached before.  The
+    // routing is cndCaseTetraMesh (PxgNphaseImplementationContext.cpp:1281-1304): a RIGID
+    // triangle mesh that is GPU-compatible, carries at most one material index and has an
+    // SDF (isDynamicMesh is `getSdfDataFast().mSdf != NULL`) -> eSoftbodySdfTrimesh; the
+    // same mesh WITHOUT the SDF is PXG_SB_FLOOR=mesh's eSoftbodyTrimesh.
+    //
+    // The mesh is sdfmesh's own cooker (cookSdfBox: a closed, outward-wound 12-triangle
+    // box, dense SDF, buildGPUData), half extent 1.5 at y = -1.5, so its top face is the
+    // plane y = 0 -- the SAME floor height as every other arm of this matrix, which is
+    // what makes its settle number comparable with theirs -- and 3 x 3 wide under the
+    // 1 x 1 cube.  Spacing 0.1 is 30 cells per side, cooked on the CPU in well under a
+    // second.  Its sign is checked like sdfmesh's: the centre texel must be negative.
+    //
+    // P9.97b IS WHY IT EXISTS: the kernel's shader read its 80-byte by-value writer at @88
+    // while the bridge places it at @96 (paramAlign(80) = 16).  Latent because no scene
+    // routed here; this arm is the scene that does.
+    if (floorSdf)
+    {
+        PxTriangleMesh* sdfFloor = cookSdfBox(physics, 1.5f, 0.1f);
+        if (!sdfFloor) return out;   // cookSdfBox prints its own FAIL
+        if (!sdfFloor->getSDF())
+        {
+            std::printf("FAIL: the cooked floor carries NO SDF, so the pair would route to "
+                        "eSoftbodyTrimesh and this arm would measure PXG_SB_FLOOR=mesh again\n");
+            return out;
+        }
+        PxU32 sdx = 0, sdy = 0, sdz = 0;
+        sdfFloor->getSDFDimensions(sdx, sdy, sdz);
+        const PxReal centre = sdfFloor->getSDF()[(size_t(sdz / 2) * sdy + sdy / 2) * sdx + sdx / 2];
+        std::printf("  softbody sdfmesh floor: SDF dims %u x %u x %u, centre texel %.4f\n",
+                    sdx, sdy, sdz, centre);
+        if (!(centre < 0.0f))
+        {
+            std::printf("FAIL: the cooked floor's SDF is not negative inside -- wound inward\n");
+            return out;
+        }
+        PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -1.5f, 0.0f)));
+        PxShape* fs = physics->createShape(PxTriangleMeshGeometry(sdfFloor), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
+    }
+
     out.hasPlane = !floorNone;      // "there is a floor to settle on", whatever its shape
     out.hasSphere = floorSphere;
     out.hasBox = floorBox;
     out.hasPlaneShape = floorPlane;
     out.hasHeightfield = floorHf;
+    out.hasSdfMesh = floorSdf;
 
     // The one dynamic body the rigid PGS island needs: rigidSumInternalContactAndJointBatches2
     // null-derefs the solver descriptors with zero dynamic rigids, as in the cloth and
@@ -9747,7 +9797,8 @@ int main()
         // there and must not fail.
         const char* floorName = !sbs.hasPlane ? "none"
                               : sbs.hasPlaneShape ? "plane" : sbs.hasSphere ? "sphere"
-                              : sbs.hasBox ? "box" : sbs.hasHeightfield ? "heightfield" : "mesh";
+                              : sbs.hasBox ? "box" : sbs.hasHeightfield ? "heightfield"
+                              : sbs.hasSdfMesh ? "sdfmesh" : "mesh";
         std::printf("  contact chain: max deformable-volume contacts = %u, first at step %d "
                     "(floor: %s)\n",
                     maxSbContacts, firstContactStep, floorName);

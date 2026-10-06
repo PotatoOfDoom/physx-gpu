@@ -8,6 +8,13 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.97b: REAL DEFECT FIXED -- sb_sdfMeshMidphaseGeneratePairsLaunch's shader read its 80-byte by-value
+PxgFEMContactWriter @88 while the bridge places it @96 (paramAlign(80) = 16): a softbody on an
+SDF-cooked mesh SIGSEGVed at the first contact.  Shader padded (push 176), bridge-sized fixture,
+new floor PXG_SB_FLOOR=sdfmesh (settles 0.48950).  check_launch_abi_pack.py now compares host pack
+vs row per argument plus a CUDA-signature leg (410 rows decided, 407 = signature);
+check_push_block.py joins every row with the shader push block as the bridge lays it out
+(415 joined, 0 findings; 3 on the old shader).  Scenes 80/80.
 P9.97a: REAL DEFECT FIXED -- initializeSolverVelocitiesTGS, computeAverageSolverBodyVelocityTGS and
 propagateAverageSolverBodyVelocityTGS ran [numthreads(32,1,1)] with warp = gid.x under the engine's
 (32,8)-block grid, i.e. 1/8 of the CUDA's warps: at numSlabs >= 5 bodies were never initialised /
@@ -2158,6 +2165,64 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.97b — Echter Fehler: Push-Layout von `sb_sdfMeshMidphaseGeneratePairsLaunch`; Pack- und Push-Block-Checker pro Argument
+
+**Befund.** Die Planung zum Pack-Checker sollte nur eine Lücke schließen: Er verglich pro Kernel nur
+die Gesamtgröße des Argumentblocks. Die dabei vorgeschlagene Kopplung Host-Paket = ABI-Zeile =
+Shader-Push-Block fand aber einen echten Fehler:
+- `sb_sdfMeshMidphaseGeneratePairsLaunch` legt seinen 80-Byte-`PxgFEMContactWriter` (by value; 9
+  Zeiger + PxU32, PxgFEMCore.h:361) im Shader auf **@88** (Block 168 B).
+- Die Bridge legt ihn nach der Regel `paramAlign(80) = 16` auf **@96** (Push 176 B), wie die
+  ABI-Zeile, das Host-Paket (PxgNarrowphaseCore.cpp:4888-4903) und die CUDA-Signatur.
+- Der Shader las `w_outPoint` also aus Bridge-Padding (Null), und jedes weitere Writer-Feld lag einen
+  Slot daneben.
+- P9.84 hielt den Bucket für unerreichbar („keine Szene erreicht einen der drei“). Das stimmt nicht:
+  Ein Softbody auf einem SDF-gekochten Mesh-Boden erreicht ihn, und der alte Port stürzt dort beim
+  ersten Kontakt mit SIGSEGV ab (3/3).
+
+**Korrektur:** `uint2 _pad88` im Shader. Damit liegt der Writer bei @96, Push 176, wie bei den fünf
+anderen Kerneln mit `_pad104` (kClothBoxTriCg ×4, kSbPsContactGen). Eine Änderung der Zeile allein
+hätte den Writer nicht verschoben, sondern nur das Gate gebrochen.
+- **Fixture:** `SbSdfBlob` hat dasselbe Pad (static_asserts 176/@96, Blob-Größe gegen die ABI-Zeile).
+  Neu ist `softBodySdfMidphaseBridgeSized`: Es startet das echte 12-Argument-Host-Paket über die
+  Bridge und vergleicht bitweise. Auf dem alten Shader schlägt es mit 9 Prüfungen fehl, kein
+  Kontakt erreicht die Ausgabe.
+- **Szene:** neuer Boden `PXG_SB_FLOOR=sdfmesh` (statisch, mit dem Cooker der sdfmesh-Szene). Er setzt
+  sich bei 0.48950 mit 20 Kontakten ab; der Kernel läuft 150-mal mit einem 176-B-Blob. Die übrigen
+  Böden sind unverändert (box 0.48929, mesh 0.48830, hf 0.48918, convexcore 0.48948).
+- **Sweep:** 5/5 getötet. Zwei davon vertauschen gleich große Writer-Felder; sie sieht nur die
+  Fixture, nicht der Checker.
+
+**Checker.**
+- `check_launch_abi_pack.py` ist neu geschrieben (3.8 s statt 16.9 s):
+  - Host-Paket gegen Zeile **pro Argument**, in beiden Startformen: 410 von 415 Zeilen über 497
+    Startstellen entschieden, 0 unentschieden, 5 benannte Zeilen ohne nachverfolgbare Startstelle.
+  - Neues Bein „CUDA-Signatur“: 407 Zeilen gleich der Signatur, 8 benannte Zeilen folgen bewusst dem
+    Host-Paket.
+  - Die Host-Pointer-Maske wird nur noch nach Größe geprüft (behebt einen Fehlalarm).
+  - Alle Ratschen schlagen fehl, sobald sie veraltet sind.
+- `check_push_block.py` legt jeden Shader-Push-Block über die Zeile so, wie die Bridge die Argumente
+  platziert; By-Value-Structs werden in Felder zerlegt. Vier Regeln: Lesen aus Padding, Member über
+  zwei Argumente, Member-Kante schneidet ein Feld, Float über einem Argument unter 4 Byte. Ergebnis:
+  415 verbunden, 0 Funde; auf dem alten Shader genau die 3 erwarteten.
+- Beide Checker laufen zuerst Selbsttests auf Kopien mit absichtlich falschen Zeilen. Im Speicher
+  mutiert, fingen die Selbsttests 16/16 bzw. 7/7 Checker-Mutanten; die 9 Zeilen-Mutanten aus dem
+  Review sind getötet.
+- Neue Laufzeit-Fixture `broadphaseSetup_initializeSapBox1DBridgeVoidStar` für die zweite Startform
+  der Bridge.
+- **Bekannte Lücke (dokumentiert):** Ein Member, der ein Feld ≥ 4 Byte abdeckt und dann ins Padding
+  läuft, wird nicht gemeldet. Wert-neutral, weil die Bridge Padding mit Nullen füllt. Ebenso
+  unsichtbar bleibt das Vertauschen zweier gleich großer Argumente auf oberster Ebene.
+
+Die Bridge-Dateien haben nur Kommentar-Änderungen. Der Code ist bytegleich, und alle 415 Zeilen sind
+vor wie nach identisch (Sonde).
+
+**Upstream-Kandidat (dokumentiert, nicht gemeldet):** `propagateStaticSolverBodyVelocities` erhält ein
+Paket mit 6 Argumenten für einen Kernel mit 5.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 884/884 in beiden Speichermodi.
+**Szenen:** 80/80.
 
 ## P9.97a — Echter Fehler: drei TGS-Kernel liefen nur ein Achtel der CUDA-Warps
 

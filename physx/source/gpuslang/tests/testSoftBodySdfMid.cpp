@@ -63,6 +63,10 @@
 
 #include "PxgCudaShim.h"
 #include "PxgCudaToolkitShim.h"
+#include "PxgVulkanCudaContext.h"      // P9.97b: the engine's launch bridge
+#include "PxgVulkanKernelAbi.h"        // P9.97b: the row the bridge lays the blob out from
+#include "cudamanager/PxCudaContext.h" // PxCudaKernelParam, PX_CUDA_KERNEL_PARAM
+#include "foundation/PxBounds3.h"
 #include "pxgSdfSceneRef.h"
 
 #include <algorithm>
@@ -88,7 +92,13 @@ using namespace pxgsdfref;
 
 struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
 
-// softBodySdfMidphaseBda.slang's SbSdfMidParams, byte for byte.
+// softBodySdfMidphaseBda.slang's SbSdfMidParams, byte for byte -- and, since P9.97b,
+// byte for byte the blob the BRIDGE builds from the engine's host pack too.  The bridge
+// places each argument at paramAlign(size), and paramAlign(80) = 16, so the 80-byte
+// writer starts at @96 behind 12 bytes of padding, not at the @88 its natural alignment
+// of 8 would give.  Until P9.97b this struct said @88 / 168 bytes like the shader did,
+// and every fixture here passed while the engine path read the writer one slot off;
+// softBodySdfMidphaseBridgeSized below launches through the bridge to hold it.
 struct SbSdfBlob
 {
     float tolerenceLength;             // @0   dead
@@ -104,20 +114,22 @@ struct SbSdfBlob
     uint64_t filterPairs;              // @72
     uint32_t nbFilterPairs;            // @80
     uint32_t pad84;                    // @84
-    uint64_t w_outPoint;               // @88
-    uint64_t w_outNormalPen;           // @96
-    uint64_t w_outBarycentric;         // @104
-    uint64_t w_outContactInfo;         // @112
-    uint64_t w_totalContactCount;      // @120
-    uint64_t w_contactByX;             // @128
-    uint64_t w_tempContactByX;         // @136
-    uint64_t w_contactIndexSortedByX;  // @144
-    uint64_t w_contactSortedByX;       // @152
-    uint32_t w_maxNumContacts;         // @160
-    uint32_t pad164;                   // -> 168
+    uint64_t pad88;                    // @88  paramAlign(80) = 16
+    uint64_t w_outPoint;               // @96
+    uint64_t w_outNormalPen;           // @104
+    uint64_t w_outBarycentric;         // @112
+    uint64_t w_outContactInfo;         // @120
+    uint64_t w_totalContactCount;      // @128
+    uint64_t w_contactByX;             // @136
+    uint64_t w_tempContactByX;         // @144
+    uint64_t w_contactIndexSortedByX;  // @152
+    uint64_t w_contactSortedByX;       // @160
+    uint32_t w_maxNumContacts;         // @168
+    uint32_t pad172;                   // -> 176
 };
-static_assert(sizeof(SbSdfBlob) == 168, "engine ABI blob size");
-static_assert(offsetof(SbSdfBlob, w_outPoint) == 88, "the writer lands at 88");
+static_assert(sizeof(SbSdfBlob) == 176, "engine ABI blob size (pxgKernelAbiPushSize of the row)");
+static_assert(offsetof(SbSdfBlob, w_outPoint) == 96, "the writer lands at 96: paramAlign(80) = 16");
+static_assert(offsetof(SbSdfBlob, w_maxNumContacts) == 168, "the writer's count lands at 96 + 72");
 
 // npSdfFind.slang's SdfFindParams.
 struct P_Find
@@ -273,7 +285,43 @@ struct Options
     uint32_t seedCount = 0u;
     bool negScale = false;
     bool exactGate = false;   // the manufactured cull-gate boundary
+    // P9.97b: when set, the kernel is launched the way the ENGINE launches it -- the
+    // host pack of PxgNarrowphaseCore.cpp:4888-4903 through PxCudaContext::launchKernel,
+    // which lays the blob out from the argument sizes (paramAlign) -- instead of with
+    // this file's own SbSdfBlob.
+    physx::PxCudaContext* bridgeCtx = nullptr;
+    CUfunction bridgeFn = nullptr;
 };
+
+// P9.97b -- a HOST mirror of PxgFEMContactWriter (PxgFEMCore.h:361-375), the 80-byte
+// struct the engine passes BY VALUE as the last argument.  The engine type has no
+// constructor this TU can call (it takes a PxgFEMCore*), so the mirror stands in for it,
+// pinned to it member by member: same size, same alignment, same offsets.  What the
+// bridge sees is only (pointer, sizeof) of this object, so pinning those is pinning
+// everything the launch depends on.
+struct HostFemWriter
+{
+    float4* outPoint;
+    float4* outNormalPen;
+    float4* outBarycentric;
+    PxgFemOtherContactInfo* outContactInfo;
+    PxU32* totalContactCount;
+    PxU64* contactByX;
+    PxU32* tempContactByX;
+    PxU32* contactIndexSortedByX;
+    PxU32* contactSortedByX;
+    PxU32 maxNumContacts;
+};
+static_assert(sizeof(HostFemWriter) == sizeof(PxgFEMContactWriter) && sizeof(HostFemWriter) == 80,
+              "the by-value writer is 80 bytes (9 pointers + PxU32 + 4 tail pad)");
+static_assert(alignof(HostFemWriter) == alignof(PxgFEMContactWriter) && alignof(HostFemWriter) == 8,
+              "alignof(writer) is 8 -- the bridge nevertheless places it at paramAlign(80) = 16");
+#define PXG_SBSDF_PIN(f) static_assert(offsetof(HostFemWriter, f) == offsetof(PxgFEMContactWriter, f), #f)
+PXG_SBSDF_PIN(outPoint); PXG_SBSDF_PIN(outNormalPen); PXG_SBSDF_PIN(outBarycentric);
+PXG_SBSDF_PIN(outContactInfo); PXG_SBSDF_PIN(totalContactCount); PXG_SBSDF_PIN(contactByX);
+PXG_SBSDF_PIN(tempContactByX); PXG_SBSDF_PIN(contactIndexSortedByX);
+PXG_SBSDF_PIN(contactSortedByX); PXG_SBSDF_PIN(maxNumContacts);
+#undef PXG_SBSDF_PIN
 
 struct Rig
 {
@@ -715,6 +763,65 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     for (uint32_t p = 0; p < opt.numPairs; ++p)
         exp[p] = predictPair(S, R, rounds, tets, desc, S.restByPair[p]);
 
+    if (opt.bridgeCtx)
+    {
+        // P9.97b: THE ENGINE'S HOST PACK, PxgNarrowphaseCore.cpp:4870-4903, with the
+        // engine's own argument types and order -- not this file's SbSdfBlob.  The bridge
+        // (PxgVulkanCudaContext.cpp, sized launchKernel) places each argument at
+        // paramAlign(size), so the 80-byte writer goes to @96, not to the @88 its natural
+        // alignment of 8 would give.  A shader whose push block disagrees reads the wrong
+        // bytes here and nowhere else in this file.
+        const PxReal toleranceLength = R.blob.tolerenceLength;
+        const PxgContactManagerInput* cmInputs =
+            reinterpret_cast<const PxgContactManagerInput*>(size_t(R.bCin.addr));
+        const PxsCachedTransform* transformCached =
+            reinterpret_cast<const PxsCachedTransform*>(size_t(R.bXf.addr));
+        const PxBounds3* boundsd = reinterpret_cast<const PxBounds3*>(size_t(R.bBounds.addr));
+        const PxReal* contactDistanced = reinterpret_cast<const PxReal*>(size_t(R.bCd.addr));
+        const PxReal* restDistanced = reinterpret_cast<const PxReal*>(size_t(R.bRest.addr));
+        PxgShape* gpuShapes = reinterpret_cast<PxgShape*>(size_t(R.bShapes.addr));
+        CUdeviceptr softBodiesd = CUdeviceptr(R.bDesc.addr);
+        CUdeviceptr shapeToRigidRemapTabled = CUdeviceptr(R.bRemap.addr);
+        CUdeviceptr filterPairs = CUdeviceptr(R.bPairs.addr);
+        const PxU32 nbFilterPairs = PxU32(R.pairs.size());
+        HostFemWriter writer;
+        writer.outPoint = reinterpret_cast<float4*>(size_t(R.bPoint.addr));
+        writer.outNormalPen = reinterpret_cast<float4*>(size_t(R.bNormalPen.addr));
+        writer.outBarycentric = reinterpret_cast<float4*>(size_t(R.bBary.addr));
+        writer.outContactInfo = reinterpret_cast<PxgFemOtherContactInfo*>(size_t(R.bInfo.addr));
+        writer.totalContactCount = reinterpret_cast<PxU32*>(size_t(R.bCount.addr));
+        writer.contactByX = reinterpret_cast<PxU64*>(size_t(R.bByX.addr));
+        writer.tempContactByX = reinterpret_cast<PxU32*>(size_t(R.bTempByX.addr));
+        writer.contactIndexSortedByX = reinterpret_cast<PxU32*>(size_t(R.bIdxByX.addr));
+        writer.contactSortedByX = reinterpret_cast<PxU32*>(size_t(R.bSortedByX.addr));
+        writer.maxNumContacts = opt.capacity;
+
+        PxCudaKernelParam kernelParams[] =
+        {
+            PX_CUDA_KERNEL_PARAM(toleranceLength),
+            PX_CUDA_KERNEL_PARAM(cmInputs),
+            PX_CUDA_KERNEL_PARAM(transformCached),
+            PX_CUDA_KERNEL_PARAM(boundsd),
+            PX_CUDA_KERNEL_PARAM(contactDistanced),
+            PX_CUDA_KERNEL_PARAM(restDistanced),
+            PX_CUDA_KERNEL_PARAM(gpuShapes),
+            PX_CUDA_KERNEL_PARAM(softBodiesd),
+            PX_CUDA_KERNEL_PARAM(shapeToRigidRemapTabled),
+
+            PX_CUDA_KERNEL_PARAM(filterPairs),
+            PX_CUDA_KERNEL_PARAM(nbFilterPairs),
+
+            PX_CUDA_KERNEL_PARAM(writer)
+        };
+        const PxCUresult lr = opt.bridgeCtx->launchKernel(opt.bridgeFn, opt.numPairs, 1, 1, 1024, 1, 1,
+                                                          0, nullptr, kernelParams, sizeof(kernelParams),
+                                                          nullptr, __FILE__, __LINE__);
+        PXG_CHECK_MSG(lr == 0, "%s: the bridge must accept the engine's 12-argument host pack "
+                               "(its blob is gated against the ABI row's push size)", label);
+        if (lr != 0) { R.destroy(dev); return; }
+        PXG_CHECK_MSG(opt.bridgeCtx->streamSynchronize(nullptr) == 0, "%s: streamSynchronize", label);
+    }
+    else
     {
         Kernel k(Kernel::Bindless{}, "softBodySdfMidphaseBda.spv",
                  "sb_sdfMeshMidphaseGeneratePairsLaunch", {}, sizeof(SbSdfBlob));
@@ -911,6 +1018,16 @@ static void endShim(PxgCudaShim*& shim)
 
 PXG_TEST(softBodySdfMidphase)
 {
+    // P9.97b: the literal tie between this file's blob and the launch-ABI row.  The
+    // static_asserts above pin SbSdfBlob to the shader's layout; this pins it to what
+    // the ENGINE pushes.  One line, and it would have caught P9.35c's @88 writer.
+    {
+        const physx::gpuslang::PxgKernelAbiRow* row =
+            physx::gpuslang::pxgFindKernelAbi("sb_sdfMeshMidphaseGeneratePairsLaunch");
+        PXG_CHECK_MSG(row && sizeof(SbSdfBlob) == physx::gpuslang::pxgKernelAbiPushSize(*row),
+                      "SbSdfBlob (%zu bytes) is the blob the bridge builds from the row (%u)",
+                      sizeof(SbSdfBlob), row ? physx::gpuslang::pxgKernelAbiPushSize(*row) : 0u);
+    }
     PxgSlangComputeDevice* dev = testDevice();
     if (!dev->supportsBindlessTextures())
     {
@@ -1099,6 +1216,79 @@ PXG_TEST(softBodySdfMidphaseNegScale)
       runOne(dev, "neg-scale/mesh-first", o); }
 
     endShim(shim);
+}
+
+// ---------------------------------------------------------------------------
+// P9.97b -- THE SAME KERNEL THROUGH THE ENGINE'S LAUNCH PATH.
+//
+// Every fixture above dispatches SbSdfBlob, this file's own transcription of the
+// shader's push block -- so a block laid out differently from what the engine pushes
+// passes all of them by construction: the fixture and the shader agree with EACH OTHER.
+// That is exactly what happened in P9.35c.  The row is {4, 8 x 9, 4, 80} and the bridge
+// places each argument at paramAlign(size) (PxgVulkanCudaContext.cpp, sized
+// launchKernel), so the 80-byte writer starts at @96 and the blob is 176 bytes; the
+// shader and SbSdfBlob put the writer at its natural alignment, @88, in a 168-byte
+// block.  On the engine path the shader then read `w_outPoint` from the bridge's
+// zero padding and every later writer field one slot off -- the femClothContactGenBda
+// "segfault at 0" class (femClothContactGenBda.slang:283-289), latent only because no
+// scene reached the eSoftbodySdfTrimesh bucket.
+//
+// This test closes the gap the way the engine closes it: the manifest's push size is
+// the ROW's (PhysXGpuVulkan.cpp pushConstantSizeFor), the context is the bridge
+// (PxgCreateVulkanCudaContext), and the arguments are the engine's host pack with its
+// own types (runOneScene, opt.bridgeCtx).  The expectation is the same two-reference
+// oracle, compared bitwise.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySdfMidphaseBridgeSized)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+    const char* kName = "sb_sdfMeshMidphaseGeneratePairsLaunch";
+    const physx::gpuslang::PxgKernelAbiRow* row = physx::gpuslang::pxgFindKernelAbi(kName);
+    PXG_CHECK_MSG(row != nullptr, "the kernel has a launch-ABI row");
+    if (!row)
+        return;
+    const uint32_t push = physx::gpuslang::pxgKernelAbiPushSize(*row);
+    // The row itself, literally: the host pack PxgNarrowphaseCore.cpp:4888-4903 pushes.
+    static const uint8_t kHostPack[12] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+    bool rowIsHostPack = row->argCount == 12u;
+    for (uint32_t i = 0; rowIsHostPack && i < 12u; ++i)
+        rowIsHostPack = row->argSizes[i] == kHostPack[i];
+    PXG_CHECK_MSG(rowIsHostPack, "the row is the host pack {4, 8 x 9, 4, 80}");
+    PXG_CHECK_MSG(push == 176u, "the row's push size is %u; the writer at paramAlign(80) = 16 "
+                                "makes it 176", push);
+    // THE LITERAL TIE: this file's own blob must BE the bridge's blob, size first.
+    PXG_CHECK_MSG(sizeof(SbSdfBlob) == push,
+                  "SbSdfBlob is %zu bytes but the bridge pushes %u -- the fixture's blob is not the "
+                  "engine's", sizeof(SbSdfBlob), push);
+
+    const PxgKernelDef manifest[] = {
+        { "softBodySdfMidphaseBda.spv", kName, push, 0u, kName } };
+    static auto loader = [](const char* f) { return loadShaderBlob(f); };
+    PxgCudaShim* shim = new PxgCudaShim(dev, manifest, 1, +loader);
+    physx::gpuslang::pxgSetVulkanDriverShim(shim);
+    physx::PxCudaContext* ctx = physx::gpuslang::PxgCreateVulkanCudaContext(shim, manifest, 1);
+    CUfunction fn = nullptr;
+    const bool mapped = ctx && ctx->moduleGetFunction(&fn, nullptr, kName) == 0 && fn != nullptr;
+    PXG_CHECK_MSG(mapped, "the bridge resolves %s", kName);
+    if (mapped)
+    {
+        { Options o; o.bridgeCtx = ctx; o.bridgeFn = fn;                  runOne(dev, "bridge/sb-first", o); }
+        { Options o; o.bridgeCtx = ctx; o.bridgeFn = fn; o.sbFirst = false; runOne(dev, "bridge/mesh-first", o); }
+        { Options o; o.bridgeCtx = ctx; o.bridgeFn = fn; o.seedCount = 37u; runOne(dev, "bridge/seeded-counter", o); }
+        // capacity is the writer's LAST field (maxNumContacts): a block that misplaces it
+        // reads a pointer half as the cap, and only a capped run can tell.
+        { Options o; o.bridgeCtx = ctx; o.bridgeFn = fn; o.capacity = 24u;  runOne(dev, "bridge/capped", o); }
+        { Options o; o.bridgeCtx = ctx; o.bridgeFn = fn; o.numPairs = 2u;   runOne(dev, "bridge/two-pairs", o); }
+    }
+    if (ctx)
+        ctx->release();
+    physx::gpuslang::pxgSetVulkanDriverShim(nullptr);
+    delete shim;
 }
 
 }  // namespace

@@ -111,6 +111,20 @@ inline PxCUresult oomResult() { return PxCUresult(PxU32(PXG_CUDA_ERROR_OUT_OF_ME
 // vector types, AND tightly-packed scalar aggregates such as a 12-byte PxVec3
 // (alignment 4) passed by value (e.g. gravity in preIntegrationLaunchTGS).  The
 // matching Slang push-constant field must be authored to the same layout.
+//
+// NOT exact for a by-value struct whose size has a larger power-of-two factor than
+// its alignment: the 80-byte PxgFEMContactWriter (nine pointers + PxU32, alignof 8)
+// gets paramAlign(80) = 16, where CUDA's .param bank would place it at 8.  Where the
+// argument before it ends on an 8-but-not-16 boundary that inserts 8 pad bytes (P9.97,
+// measured over every row): kClothBoxTriCg (four cloth kernels) and kSbPsContactGen
+// put the writer at @112, not @104, and kSbSdfMidphase at @96, not @88.  The blob is
+// built from this function and the push size from abiAlign (PxgVulkanKernelAbi.cpp),
+// which agree, so the shaders must follow THIS placement -- the first five always did
+// (`_pad104`); sb_sdfMeshMidphaseGeneratePairsLaunch's did not until P9.97b, and on the
+// engine path it read its writer from the padding.  check_push_block.py's layout join
+// now holds every shader to this rule.  Changing paramAlign would re-lay-out those six
+// rows and their shaders; the divergence from CUDA is harmless as long as both ends
+// agree, because nothing else ever reads the blob.
 inline size_t paramAlign(size_t size)
 {
     if (size == 0) return 1;

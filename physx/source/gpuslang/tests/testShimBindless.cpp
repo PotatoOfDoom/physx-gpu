@@ -36,9 +36,11 @@
 // Meanwhile three MAPPED engine kernels declare set 1 in their SPIR-V --
 // cloth_sdfMeshContactGenLaunch, ps_sdfMeshCollisonLaunch and
 // sb_sdfMeshMidphaseGeneratePairsLaunch -- and the engine uploads its SDFs INTO
-// that set (bridge cuTexObjectCreate -> createTexture3DFmt, bindless).  No scene
-// reaches any of the three with a real SDF, so nothing has ever run the
-// combination: an engine-built pipeline sampling an engine-uploaded texture.
+// that set (bridge cuTexObjectCreate -> createTexture3DFmt, bindless).  Until
+// P9.97b no scene reached any of the three with a real SDF, so nothing had run
+// the combination: an engine-built pipeline sampling an engine-uploaded texture.
+// PXG_SCENE=softbody PXG_SB_FLOOR=sdfmesh now runs it through
+// sb_sdfMeshMidphaseGeneratePairsLaunch; this fixture still pins it directly.
 //
 // This is that combination, and nothing else.  The entry is npTex3dBindless's
 // own (fully BDA, handle read from memory), so the shader side is already

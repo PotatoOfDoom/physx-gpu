@@ -65,10 +65,13 @@ struct PxgKernelAbiRow
     // builder copies argument bytes verbatim, so without this mask the shader
     // would receive a CPU virtual address and dereference nonsense.
     //
-    // Zero for every row that has no such argument, which is all of them today:
-    // the four kernels that take that pointer — the convex/sphere trimesh and
-    // heightfield cores — are all still unmapped, so this is a prerequisite for
-    // bringing them up rather than a fix for a live fault.
+    // Zero for every row that has no such argument.  Five rows set it, all mapped
+    // (P9.97): the four convex/sphere trimesh and heightfield cores (bit 18,
+    // mMaxConvexMeshTempMemory) and dmaArticulationResidual (bit 1, a CUdeviceptr
+    // into pinned memory).  A set bit must name an argument that is 8 bytes in the
+    // row AND at every launch site -- translateHostPtrs refuses every launch
+    // otherwise -- which check_launch_abi_pack.py (I4) enforces by SIZE; a
+    // pointer-TYPE rule would wrongly reject the CUdeviceptr.
     uint32_t hostPtrMask;
 };
 

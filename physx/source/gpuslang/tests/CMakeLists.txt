@@ -3202,8 +3202,15 @@ add_test(NAME gpuslang.blockCoverage
 # kernel had never run on Vulkan -- with fixtures, the suite and all 48 scenes green,
 # because a fixture dispatches the shader directly and never passes the gate.
 # This one derives the blob from the PX_CUDA_KERNEL_PARAM list at the launch site and
-# compares.  141 kernels decided, 99 in a ratcheted undecided set (mostly by-value
-# structs whose size wants the struct read).
+# compares.
+# P9.97b: PER ARGUMENT, not totals (P9.97 measured that the totals-only version and
+# check_push_block together let five of nine row mutants through, two runtime-fatal).
+# All 415 rows: I1 row integrity (array[:argCount], duplicates, unparsed arrays FAIL),
+# I4 hostPtrMask by size, the host leg (410 decided per argument over 497 launch sites
+# in both launch forms, 1 by named tail waiver, 0 undecided, 5 named no-site rows), and
+# the CUDA-signature leg (407 equal, 8 host-shaped rows by name, 0 unresolved).  A
+# selftest on scratch copies of the ABI text with deliberately wrong rows, and on literal
+# resolver snippets, runs first.  About 4 s (was 17 s).
 add_test(NAME gpuslang.launchAbiPack
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_launch_abi_pack.py)
 
@@ -3213,5 +3220,10 @@ add_test(NAME gpuslang.launchAbiPack
 # silently.  This walks each entry point's call graph and compares the highest
 # push-constant byte it can reach against its row.  It needs the built .spv, so
 # it depends on the shader target like the other SPIR-V readers.
+# P9.97b: plus the LAYOUT JOIN -- every reached leaf member laid against the row's
+# arguments as the bridge places them (paramAlign), by-value aggregates flattened into
+# their fields: PAD-READ / STRADDLE / CUT / F-SUBWORD, never ratcheted.  It caught
+# sb_sdfMeshMidphaseGeneratePairsLaunch reading its 80-byte writer at @88 where the
+# bridge pushes it at @96; 415 kernels joined, 0 findings since that shader's fix.
 add_test(NAME gpuslang.pushBlock
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_push_block.py ${SHADER_OUT_DIR})

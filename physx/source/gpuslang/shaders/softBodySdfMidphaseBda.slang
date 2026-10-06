@@ -127,7 +127,21 @@ import pxgSlangDefFilter;      // P9.35c: the filter, shared rather than copied
 //   PxgContactManagerInput*, PxsCachedTransform*, PxBounds3*, PxReal* contactDistance,
 //   PxReal* restDistance, PxgShape*, PxgSoftBody*, PxNodeIndex*,
 //   PxgRigidFilterPair*, PxU32 nbFilterPairs, PxgFEMContactWriter by value)
-// -> ABI row {4,8,8,8,8,8,8,8,8,8,4,80}, 168-byte blob.
+// -> ABI row {4,8,8,8,8,8,8,8,8,8,4,80}, 176-byte blob, the writer @96.
+//
+// P9.97b: THE WRITER IS AT @96, NOT @88.  The bridge places every argument at
+// paramAlign(size) -- the largest power of two dividing the size, capped at 16
+// (PxgVulkanCudaContext.cpp paramAlign; pxgKernelAbiPushSize in PxgVulkanKernelAbi.cpp
+// does the same) -- and paramAlign(80) is 16, although alignof(PxgFEMContactWriter) is
+// only 8 (the P9.15e trap; femClothPsContactGenBda.slang says it for its own writer).
+// nbFilterPairs ends at @84, so @84..@96 is padding and the blob is 176 bytes.  Until
+// P9.97b this struct put the writer at its natural @88 in a 168-byte block, and so did
+// the fixture's SbSdfBlob, so every fixture agreed with the shader and none with the
+// engine: on the engine path w_outPoint read the bridge's zero padding and every later
+// writer field sat one slot off (w_totalContactCount was really outContactInfo,
+// w_maxNumContacts the low half of contactSortedByX).  check_push_block.py's join (R0
+// PAD-READ / R2 CUT) and testSoftBodySdfMid's softBodySdfMidphaseBridgeSized, which
+// launches through the bridge with the engine's host pack, now hold it.
 struct SbSdfMidParams
 {
     float tolerenceLength;         // @0    T1: never read
@@ -143,18 +157,19 @@ struct SbSdfMidParams
     uint64_t filterPairs;          // @72
     uint nbFilterPairs;            // @80
     uint _pad84;                   // @84
-    // ---- PxgFEMContactWriter (by value, 80B) @88 ----
-    uint64_t w_outPoint;             // @88
-    uint64_t w_outNormalPen;         // @96
-    uint64_t w_outBarycentric;       // @104
-    uint64_t w_outContactInfo;       // @112
-    uint64_t w_totalContactCount;    // @120
-    uint64_t w_contactByX;           // @128
-    uint64_t w_tempContactByX;       // @136
-    uint64_t w_contactIndexSortedByX; // @144
-    uint64_t w_contactSortedByX;     // @152
-    uint w_maxNumContacts;           // @160
-    uint _pad164;                    // @164 -> 168
+    uint2 _pad88;                  // @88   paramAlign(80) = 16: the writer starts at @96
+    // ---- PxgFEMContactWriter (by value, 80B) @96 ----
+    uint64_t w_outPoint;             // @96
+    uint64_t w_outNormalPen;         // @104
+    uint64_t w_outBarycentric;       // @112
+    uint64_t w_outContactInfo;       // @120
+    uint64_t w_totalContactCount;    // @128
+    uint64_t w_contactByX;           // @136
+    uint64_t w_tempContactByX;       // @144
+    uint64_t w_contactIndexSortedByX; // @152
+    uint64_t w_contactSortedByX;     // @160
+    uint w_maxNumContacts;           // @168
+    uint _pad172;                    // @172 -> 176
 }
 
 [[vk::push_constant]] ConstantBuffer<SbSdfMidParams> gSb;
