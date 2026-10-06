@@ -45,7 +45,7 @@
 # or missing anchor is reported as ANCHOR-FAIL and counted as untested, never as a kill.
 #
 # Reported per mutant: KILLED (test failed), KILLED-FAULT (test crashed), KILLED-HANG
-# (test exceeded MUTATION_SWEEP_TIMEOUT, default 300s) -- all three are kills, counted
+# (test exceeded the per-run bound, see below) -- all three are kills, counted
 # separately -- plus SURVIVED, NOCOMPILE (not a kill) and ANCHOR-FAIL (not a kill).
 #
 # MUTATION_SWEEP_SPV_ONLY=1 (added in P9.83b-8): rebuild ONLY <shader-stem>.spv per
@@ -61,8 +61,15 @@
 # consistent either way.  Unix Makefiles only; with another generator the full build is
 # used and a note says so.
 #
-# The BASELINE run is bounded by the same timeout: if the clean suite cannot finish
-# inside it, every mutant would be reported as a hang, so that is refused up front.
+# THE PER-RUN BOUND (P9.97; policy and reasons in sweep_timeout.sh).  Unless
+# MUTATION_SWEEP_TIMEOUT is set, the baseline is TIMED (bounded only by
+# MUTATION_SWEEP_BASELINE_TIMEOUT, default 3600 s) and every later run is bounded by
+#     max(MUTATION_SWEEP_TIMEOUT_FLOOR (300), MUTATION_SWEEP_TIMEOUT_FACTOR (3) x baseline)
+# -- 300 s, as before, for any suite up to 100 s; 1305 s for the 435 s triTriCollisionBda
+# suite that the old fixed 300 refused.  MUTATION_SWEEP_TIMEOUT=<s> still fixes the bound
+# for every run, the baseline included, and a clean suite that does not fit is refused
+# up front (every mutant would otherwise read as a hang); one that uses more than half
+# of it is warned about.  The bound in force is printed after the baseline.
 
 set -u
 
@@ -81,6 +88,8 @@ BAK="$(mktemp)"
 [ -f "$SRC" ] || { echo "no such shader: $SRC" >&2; exit 2; }
 [ -d "$BUILD" ] || { echo "no build tree: $BUILD" >&2; exit 2; }
 [ -f "$MUTANTS" ] || { echo "no mutants file: $MUTANTS" >&2; exit 2; }
+. "$ROOT/physx/source/gpuslang/tools/sweep_timeout.sh"
+sweep_init MUTATION_SWEEP 300 || { rm -f "$BAK"; exit 2; }
 
 cp "$SRC" "$BAK"
 
@@ -107,21 +116,25 @@ restore() { cp "$BAK" "$SRC"; rebuild_full; }
 # is left with the pristine source AND a .spv built from it.
 trap 'echo; echo "!! interrupted -- restoring pristine source and .spv"; restore; rm -f "$BAK"; exit 130' INT TERM
 
-# Seconds any single suite run may take.  Generous by default -- it is a backstop
-# against a mutant that never terminates, not a performance budget.
-: "${MUTATION_SWEEP_TIMEOUT:=300}"
-TIMEOUT_RC=124   # what GNU coreutils `timeout` exits with when it fires
+# Seconds any single suite run may take: SWEEP_TMO, owned by sweep_timeout.sh -- the
+# baseline bound until the baseline is green, the derived (or fixed) bound after it.
+# A backstop against a mutant that never terminates, not a performance budget.
+TIMEOUT_RC=124   # what sweep_run_bounded returns whenever the bound expired
 
 # <test-suite> may be a COMMA-SEPARATED list of bare PXG_TEST filters (P9.86c): a shader
 # driven by several fixtures is measured against all of them, and a mutant dies if any
 # one fails.  The rc is the worst of the runs (a timeout or crash wins over a failure).
+# A TIMEOUT IS STICKY (P9.97): a later filter's crash must not overwrite an earlier
+# filter's hang -- the crash rc would send the mutant round the fault retries, and every
+# retry re-runs the hang for one more whole bound, only to report KILLED-FAULT.
 run_suite() {
     worst=0
     for s in $(echo "$SUITE" | tr ',' ' '); do
-        ( cd "$BUILD" && PXG_SHADER_DIR="$BUILD/shaders" \
-            timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$s" 2>&1 )
+        ( cd "$BUILD" && export PXG_SHADER_DIR="$BUILD/shaders" \
+            && sweep_run_bounded ./gpuslang-tests "$s" 2>&1 )
         r=$?
-        if [ $r -eq $TIMEOUT_RC ] || [ $r -ge 128 ]; then worst=$r
+        if [ $r -eq $TIMEOUT_RC ]; then worst=$TIMEOUT_RC
+        elif [ $r -ge 128 ] && [ $worst -ne $TIMEOUT_RC ]; then worst=$r
         elif [ $r -ne 0 ] && [ $worst -eq 0 ]; then worst=$r; fi
     done
     return $worst
@@ -151,15 +164,20 @@ all_green() { echo "$1" | grep -q "test(s) ran" && ! echo "$1" | grep -Eq ", [1-
 # rather than silent.
 : "${MUTATION_SWEEP_FAULT_RETRIES:=3}"
 
-# Sets SUITE_OUT / SUITE_RC / SUITE_TRIES.  A timeout is NOT retried: a hang is a
-# behaviour change, and re-running it only costs another MUTATION_SWEEP_TIMEOUT.
+# Sets SUITE_OUT / SUITE_RC / SUITE_TRIES / SUITE_SECS (wall seconds of the attempt
+# that is the result -- for the baseline, the number the bound is derived from).  A
+# timeout is NOT retried: a hang is a behaviour change, and re-running it only costs
+# another bound.
+run_suite_timed() {
+    _t0=$(date +%s); SUITE_OUT=$(run_suite); SUITE_RC=$?; SUITE_SECS=$(( $(date +%s) - _t0 ))
+}
 run_suite_tolerant() {
     SUITE_TRIES=1
-    SUITE_OUT=$(run_suite); SUITE_RC=$?
+    run_suite_timed
     while [ $SUITE_RC -ge 128 ] && [ $SUITE_RC -ne $TIMEOUT_RC ] \
           && [ $SUITE_TRIES -le $MUTATION_SWEEP_FAULT_RETRIES ]; do
         SUITE_TRIES=$((SUITE_TRIES+1))
-        SUITE_OUT=$(run_suite); SUITE_RC=$?
+        run_suite_timed
     done
 }
 
@@ -180,8 +198,17 @@ baseline_ok() {
         return 1
     fi
     if [ $brc -eq $TIMEOUT_RC ]; then
-        echo "!! the CLEAN suite exceeded MUTATION_SWEEP_TIMEOUT=${MUTATION_SWEEP_TIMEOUT}s;" >&2
-        echo "   raise it or every mutant will be reported as a hang" >&2
+        echo "!! the CLEAN suite exceeded ${SWEEP_TMO_KNOB}=${SWEEP_TMO}s${SWEEP_BASE_SECS:+ (the first baseline took ${SWEEP_BASE_SECS}s)};" >&2
+        # The advice is for the FIRST baseline only: after it the bound is the derived
+        # (or fixed) one, which is no knob of its own, and the closing baseline prints
+        # its own message.
+        if [ -z "$SWEEP_BASE_SECS" ]; then
+            if [ -n "$SWEEP_FIXED" ]; then
+                echo "   raise it (or unset it to derive the bound) -- every mutant would be reported as a hang" >&2
+            else
+                echo "   raise it -- it bounds the clean run itself, not the mutants" >&2
+            fi
+        fi
         return 1
     fi
     if ran_nothing "$out"; then
@@ -194,10 +221,14 @@ baseline_ok() {
 
 restore
 if ! baseline_ok; then
-    echo "!! BASELINE IS RED before the sweep -- refusing to measure mutants against it"
-    run_suite | tail -5
+    echo "!! BASELINE IS NOT GREEN before the sweep -- refusing to measure mutants against it"
+    # The run just made, not a second one: up to P9.96 this line re-ran the suite, and
+    # after a timeout that cost one more whole bound to print a truncated tail.
+    printf '%s\n' "$SUITE_OUT" | tail -5
     rm -f "$BAK"; exit 1
 fi
+sweep_set_bound "$SUITE_SECS"
+echo "baseline green in ${SWEEP_BASE_SECS}s; every run below is bounded by ${SWEEP_TMO}s ($SWEEP_TMO_HOW)"
 echo "baseline green; sweeping $SRCSTEM (via $STEM.spv) against suite '$SUITE'"
 
 killed=0; faulted=0; hung=0; survived=0; nocompile=0; anchorfail=0; retried=0
@@ -228,7 +259,7 @@ PY
     run_suite_tolerant; out="$SUITE_OUT"; rc=$SUITE_RC
     [ "$SUITE_TRIES" -gt 1 ] && retried=$((retried+1))
     if [ $rc -eq $TIMEOUT_RC ]; then
-        echo "KILLED-HANG   $name   (exceeded ${MUTATION_SWEEP_TIMEOUT}s)"; hung=$((hung+1))
+        echo "KILLED-HANG   $name   (exceeded ${SWEEP_TMO}s; baseline ${SWEEP_BASE_SECS}s)"; hung=$((hung+1))
     elif [ $rc -ge 128 ] || ! echo "$out" | grep -q "test(s) ran"; then
         echo "KILLED-FAULT  $name   (crashed $SUITE_TRIES/$((MUTATION_SWEEP_FAULT_RETRIES+1)) times: rc=$rc)"
         faulted=$((faulted+1))
@@ -250,10 +281,15 @@ echo "=== sweep: $total mutants -- $killed killed, $faulted killed-by-fault, $hu
 [ "$retried" -gt 0 ] && echo "    ($retried mutant(s) hit a platform fault and were re-run; see the note at run_suite_tolerant)"
 
 if ! baseline_ok; then
-    echo "!! BASELINE IS RED after the restore -- the tree is NOT clean, do not trust the run"
+    if [ "$SUITE_RC" -eq $TIMEOUT_RC ]; then
+        echo "!! the RESTORED suite did not finish inside ${SWEEP_TMO}s -- slower machine or unclean tree;"
+        echo "   run the suite by hand before trusting this sweep"
+    else
+        echo "!! BASELINE IS RED after the restore -- the tree is NOT clean, do not trust the run"
+    fi
     rm -f "$BAK"; exit 1
 fi
-echo "baseline green again; source and .spv restored"
+echo "baseline green again in ${SUITE_SECS}s; source and .spv restored"
 rm -f "$BAK"
 
 # A survivor is not a result until it is diagnosed.  The caller must prove each one

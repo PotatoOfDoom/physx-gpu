@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **886/886** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.97c: hardening -- value-identical clamps in ps_updateUnsortedArrayLaunch / ps_updateUserBufferLaunch
+behind guard-page fixtures (no defect on this llvmpipe: masked gathers never read past a buffer);
+the unused bindless sampler (set 1 binding 1) removed, validation layer unchanged; mutation-sweep
+timeouts derived from the measured baseline (max(floor, 3x)), 137-at-bound = hang, baseline crash
+retried; two new tool ctests (886).  P9.97 complete.  Scenes 80/80.
 P9.97b: REAL DEFECT FIXED -- sb_sdfMeshMidphaseGeneratePairsLaunch's shader read its 80-byte by-value
 PxgFEMContactWriter @88 while the bridge places it @96 (paramAlign(80) = 16): a softbody on an
 SDF-cooked mesh SIGSEGVed at the first contact.  Shader padded (push 176), bridge-sized fixture,
@@ -2165,6 +2170,67 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.97c — Härtung: Partikel-Klemmen, Sampler-Binding entfernt, Sweep-Timeouts aus der Baseline; P9.97 abgeschlossen
+
+**1. `ps_updateUnsortedArrayLaunch` / `ps_updateUserBufferLaunch` (particleSim.slang).** Das Grid
+richtet sich nach dem größten Puffer, die Loads sind nur pro Lane bewacht (Befund D8 aus P9.95b).
+- **Kein Fehler auf dieser Plattform.** Gemessen auf Mesa 25.2.8 / LLVM 20.1.2: Jedes Array endet
+  vor einer ungemappten Guard-Page, 80 Läufe waren bitgenau und ohne Fault. Die Lane-Loads werden zu
+  maskierten Gathers, die Loads pro Workgroup liegen hinter echten Verzweigungen. Die
+  Positivkontrollen (Load vor den Guard verschoben) stürzen an der Seitengrenze ab.
+- Deshalb nur wertneutrale Klemmen (Tier 1): `srcIdx`, `srcInd` und der Rest-Zeiger. Für jede Lane,
+  die speichert, gilt Gleichheit mit der CUDA (particlesystem.cu:218-301); der `&& restPose`-Test der
+  CUDA bleibt.
+- Neue Fixtures `particleSimIngestGuard` / `particleSimUpdateBufferGuard` mit Guard-Pages, nur auf
+  llvmpipe und bei Host-Adresse = Device-Adresse; 0/80 Fehlschläge in Wiederholungen.
+- **Sweeps:**
+  - Haupt-Sweep: 35 Mutanten, 23 getötet, 9 durch Fault getötet. Die 3 Überlebenden sind die
+    vorhergesagten plattform-äquivalenten.
+  - Arena-Sweep: Die vier Hoist-Zeilen aus dem Review fügten einen unbenutzten Load ein, den der
+    Compiler entfernte. Neu gebaut, ergibt der Sweep 3 Faults, 1 getötet und 2 erwartete Überlebende.
+  - Szenen: `particleapply` 5 getötet, 3 äquivalent. Neu in `particlerigid`, wo der Pfad mit
+    Null-Rest live ist: Ohne Null-Test und ohne Select stürzt die Engine ab, mit dem Select allein
+    bleibt sie grün.
+- Die particleapply-Dumps (TGS und PGS) sind bytegleich zu vorher. 19/19 betroffene Szenen sind im
+  strikten Modus OK.
+- `check_speculated_loads.py` sieht diese beiden Kernel weiterhin nicht.
+
+**2. Bindless-Sampler entfernt.** Seit P9.96 deklariert kein Shader mehr set 1 / binding 1.
+- Layout, Binding-Flags, Pool, Writes und Destroy enthalten jetzt nur noch Binding 0
+  (SAMPLED_IMAGE, 4096).
+- Ein Modul, das einen Sampler-Typ im Bindless-Set deklariert, wird abgelehnt. Nur `npTex3d.spv`
+  (P2-Probe) deklariert noch einen Sampler, mit eigenen Set-0-Samplern.
+- 470 von 471 Modulen sind bytegleich; die Ausnahme ist `particleSim.spv` aus Punkt 1.
+- Khronos-Validierungsschicht vorher und nachher identisch, keine Deskriptor- oder Sampler-Meldung.
+  Nebenbei gesehene, davon unabhängige Meldungen (SDF-Push-Blöcke, eine Shared-Memory-Warnung, ein
+  Pipeline-Handle im Fehlerfall) sind als Folgepunkte notiert.
+- Host-Sweeps: Device 28/28 getötet, Testseite 8/8.
+
+**3. Sweep-Timeouts.**
+- Das neue `tools/sweep_timeout.sh` setzt ohne Override die Grenze
+  max(alter Standard, 3 × Baseline). 137 an der Grenze zählt als Hänger, ein früheres SIGKILL bleibt
+  ein Fault.
+- Die Baseline wird nach einem Plattformabsturz bis zu `MUTATION_SWEEP_FAULT_RETRIES`-mal wiederholt.
+  Eine Ablehnung führt die Suite nicht mehr erneut aus.
+- Die Host-Runner lehnen langsame Läufe mit fester Grenze nicht mehr fälschlich ab.
+- Zwei neue Tool-ctests: `gpuslang.sweepTimeoutPolicy` und `gpuslang.sweepRunners` (alle vier Runner
+  Ende-zu-Ende gegen einen Fake-Baum). Mit den alten Tools schlagen sie 9 bzw. 24 Prüfungen fehl.
+- Praxistest: Der Sweep über `triTriCollisionBda` lief ohne Override durch (Baseline 486 s →
+  Grenze 1458 s), 6/6 getötet.
+- Sweeps über die Tools: Helfer 18/18, die drei Shell-Runner 6/6, 3/3 und 3/3; Python-Runner 8/9.
+  Der Überlebende (`--no-tests=error` entfernt) ist äquivalent, weil die neue Prüfung „Regex trifft
+  keinen Test“ vorher greift.
+
+**Gegenprüfung:** keine Blocker. Drei kleine Punkte sind behoben: ein PID-eindeutiger Sleep im
+Selbsttest gegen parallele Läufe, ein Leck im Fehlerpfad von `GuardWorld` und die Wiederholung der
+Baseline nach einem Absturz.
+
+**P9.97 ist damit abgeschlossen** (a: TGS-Grid-Fehler, b: Push-Layout-Fehler plus Checker,
+c: Härtung).
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 886/886 in beiden Speichermodi.
+**Szenen:** 80/80.
 
 ## P9.97b — Echter Fehler: Push-Layout von `sb_sdfMeshMidphaseGeneratePairsLaunch`; Pack- und Push-Block-Checker pro Argument
 

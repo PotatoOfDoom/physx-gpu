@@ -73,6 +73,77 @@ namespace gpuslang
         }                                                                                  \
     } while (0)
 
+// P9.97 -- see the declaration in PxgSlangComputeDevice.h.  Module-wide on purpose:
+// stricter than per entry, and no module in the build declares anything it refuses
+// (P9.97 scan of all 471 .spv).  ONLY the bindless door applies it: createPipeline
+// must not, because sdfCollBaryClamp and sdfTexProbe share a module with set-1
+// entries and are built without set 1 (P9.84 classifies per entry).
+bool pxgSpirvFitsBindlessLayout(const void* code, size_t codeSize, uint32_t* badSet, uint32_t* badBinding)
+{
+    if (badSet)
+        *badSet = ~0u;
+    if (badBinding)
+        *badBinding = ~0u;
+    if (!code || codeSize < 20 || (codeSize & 3u) != 0)
+        return false;
+    const size_t n = codeSize / 4;
+    std::vector<uint32_t> w(n);
+    std::memcpy(w.data(), code, n * 4);
+    if (w[0] != 0x07230203u)
+        return false;
+    std::unordered_map<uint32_t, uint32_t> setOf, bindingOf;
+    for (size_t i = 5; i < n;)
+    {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > n)
+            return false;
+        if (op == 71u && wc >= 4u)               // OpDecorate <id> <decoration> <literal>
+        {
+            if (w[i + 2] == 34u)                 // DescriptorSet
+                setOf[w[i + 1]] = w[i + 3];
+            else if (w[i + 2] == 33u)            // Binding
+                bindingOf[w[i + 1]] = w[i + 3];
+        }
+        i += wc;
+    }
+    for (const auto& v : setOf)
+    {
+        const uint32_t set = v.second;
+        const auto b = bindingOf.find(v.first);
+        const uint32_t binding = b == bindingOf.end() ? ~0u : b->second;
+        if (set > 1u || (set == 1u && binding != 0u))
+        {
+            if (badSet)
+                *badSet = set;
+            if (badBinding)
+                *badBinding = binding;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool pxgSpirvDeclaresSampler(const void* code, size_t codeSize)
+{
+    if (!code || codeSize < 20 || (codeSize & 3u) != 0)
+        return false;
+    const size_t n = codeSize / 4;
+    std::vector<uint32_t> w(n);
+    std::memcpy(w.data(), code, n * 4);
+    if (w[0] != 0x07230203u)
+        return false;
+    for (size_t i = 5; i < n;)
+    {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > n)
+            return false;
+        if (op == 26u /* OpTypeSampler */ || op == 27u /* OpTypeSampledImage */)
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 class PxgVulkanComputeDevice : public PxgSlangComputeDevice
 {
 public:
@@ -108,8 +179,6 @@ public:
                     vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
                 }
             }
-            if (mBindlessSampler)
-                vkDestroySampler(mDevice, mBindlessSampler, nullptr);
             if (mBindlessPool)
                 vkDestroyDescriptorPool(mDevice, mBindlessPool, nullptr);
             if (mBindlessSetLayout)
@@ -856,17 +925,22 @@ public:
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         PXG_VK_CHECK(vkCreateImageView(mDevice, &viewInfo, nullptr, &tex.view));
 
-        // The CUDA SDF sampler configuration: trilinear, clamp-to-edge,
-        // element-type reads, no mips.
-        VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_LINEAR;
-        samplerInfo.minFilter = VK_FILTER_LINEAR;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        // Only the bound path samples in hardware: a createTexture3D texture (set 0,
+        // createPipelineTex/dispatchTex -- the P2 probe npTex3d, kept as the record
+        // of what the Vulkan sampler does) carries the CUDA SDF sampler
+        // configuration: trilinear, clamp-to-edge, element-type reads, no mips.
+        // A bindless texture owns NO sampler (P9.97): pxgTex3D fetches texels.
         if (!bindless)
-            PXG_VK_CHECK(vkCreateSampler(mDevice, &samplerInfo, nullptr, &tex.sampler));
+        {
+            VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+            samplerInfo.magFilter = VK_FILTER_LINEAR;
+            samplerInfo.minFilter = VK_FILTER_LINEAR;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            PXG_VK_CHECK(createSamplerCounted(samplerInfo, &tex.sampler));
+        }
 
         const PxgTextureHandle handle = mNextTextureHandle++;
         if (bindless)
@@ -893,48 +967,47 @@ public:
 
     bool initBindlessTextures()
     {
-        VkDescriptorSetLayoutBinding bindings[2] = {};
-        bindings[0].binding = 0;
-        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        bindings[0].descriptorCount = kBindlessTextureCapacity;
-        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        // P9.97: ONE binding.  Binding 1 -- a shared LINEAR/CLAMP sampler for
+        // pxgTex3D's SampleLevel since P9.12a -- lost its last reader when P9.96
+        // moved pxgTex3D to texel loads, and is gone from the layout, the pool and
+        // the device: no VkSampler is created for this set.  createPipelineBindless
+        // refuses a module that declares anything but binding 0 here.
+        const VkDescriptorSetLayoutBinding bindings[] = {
+            { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kBindlessTextureCapacity, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        };
+        const uint32_t numBindings = uint32_t(sizeof(bindings) / sizeof(bindings[0]));
 
         // PARTIALLY_BOUND: slots for textures that do not exist yet (and slot 0,
         // the reserved null handle) are never written and never read.
         // UPDATE_AFTER_BIND: createTexture3DFmt may run while a previously
-        // recorded dispatch still references the set.
-        const VkDescriptorBindingFlags flags[2] = {
-            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-            0
+        // recorded dispatch still references the set.  One flag word per binding.
+        VkDescriptorBindingFlags flags[sizeof(bindings) / sizeof(bindings[0])] = {
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
         };
         VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
         };
-        flagsInfo.bindingCount = 2;
+        flagsInfo.bindingCount = numBindings;
         flagsInfo.pBindingFlags = flags;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = numBindings;
         layoutInfo.pBindings = bindings;
         layoutInfo.pNext = &flagsInfo;
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        recordBindlessLayout(layoutInfo);
         if (vkCreateDescriptorSetLayout(mDevice, &layoutInfo, nullptr, &mBindlessSetLayout) != VK_SUCCESS)
             return false;
 
-        VkDescriptorPoolSize poolSizes[2] = {};
-        poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[0].descriptorCount = kBindlessTextureCapacity;
-        poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-        poolSizes[1].descriptorCount = 1;
+        const VkDescriptorPoolSize poolSizes[] = {
+            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kBindlessTextureCapacity },
+        };
         VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 2;
+        poolInfo.poolSizeCount = uint32_t(sizeof(poolSizes) / sizeof(poolSizes[0]));
         poolInfo.pPoolSizes = poolSizes;
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        recordBindlessPool(poolInfo);
         if (vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &mBindlessPool) != VK_SUCCESS)
             return false;
 
@@ -942,32 +1015,67 @@ public:
         allocInfo.descriptorPool = mBindlessPool;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &mBindlessSetLayout;
-        if (vkAllocateDescriptorSets(mDevice, &allocInfo, &mBindlessSet) != VK_SUCCESS)
-            return false;
-
-        // The engine's SDF sampler, verbatim: clamp on all three axes, linear
-        // filter, no mips (PxgGeometryManager.cpp:761-769).
-        VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-        samplerInfo.magFilter = VK_FILTER_LINEAR;
-        samplerInfo.minFilter = VK_FILTER_LINEAR;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (vkCreateSampler(mDevice, &samplerInfo, nullptr, &mBindlessSampler) != VK_SUCCESS)
-            return false;
-
-        VkDescriptorImageInfo smpInfo = {};
-        smpInfo.sampler = mBindlessSampler;
-        VkWriteDescriptorSet write = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        write.dstSet = mBindlessSet;
-        write.dstBinding = 1;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        write.pImageInfo = &smpInfo;
-        vkUpdateDescriptorSets(mDevice, 1, &write, 0, nullptr);
-        return true;
+        return vkAllocateDescriptorSets(mDevice, &allocInfo, &mBindlessSet) == VK_SUCCESS;
     }
+
+    // P9.97: what the driver was handed for the bindless set, for bindlessSetInfo().
+    void recordBindlessLayout(const VkDescriptorSetLayoutCreateInfo& li)
+    {
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo* fi = nullptr;
+        for (const VkBaseInStructure* p = static_cast<const VkBaseInStructure*>(li.pNext); p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO)
+                fi = reinterpret_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(p);
+        BindlessSetInfo& s = mBindlessInfo;
+        s.layoutFlags = li.flags;
+        s.bindingCount = li.bindingCount;
+        s.bindingFlagsCount = fi ? fi->bindingCount : 0u;
+        for (uint32_t i = 0; i < li.bindingCount && i < BindlessSetInfo::kMax; ++i)
+        {
+            s.binding[i] = li.pBindings[i].binding;
+            s.descriptorType[i] = uint32_t(li.pBindings[i].descriptorType);
+            s.descriptorCount[i] = li.pBindings[i].descriptorCount;
+            s.stageFlags[i] = li.pBindings[i].stageFlags;
+            s.bindingFlags[i] = (fi && i < fi->bindingCount) ? fi->pBindingFlags[i] : 0u;
+        }
+    }
+
+    void recordBindlessPool(const VkDescriptorPoolCreateInfo& pi)
+    {
+        BindlessSetInfo& s = mBindlessInfo;
+        s.poolFlags = pi.flags;
+        s.poolMaxSets = pi.maxSets;
+        s.poolSizeCount = pi.poolSizeCount;
+        for (uint32_t i = 0; i < pi.poolSizeCount && i < BindlessSetInfo::kMax; ++i)
+        {
+            s.poolType[i] = uint32_t(pi.pPoolSizes[i].type);
+            s.poolCount[i] = pi.pPoolSizes[i].descriptorCount;
+        }
+    }
+
+    BindlessSetInfo bindlessSetInfo() const override
+    {
+        return mHasBindlessTextures ? mBindlessInfo : BindlessSetInfo();
+    }
+
+    // P9.97: every VkSampler goes through these two, which is what makes
+    // liveSamplerCount() an account of the device's samplers.
+    VkResult createSamplerCounted(const VkSamplerCreateInfo& info, VkSampler* out)
+    {
+        const VkResult r = vkCreateSampler(mDevice, &info, nullptr, out);
+        if (r == VK_SUCCESS)
+            ++mLiveSamplers;
+        return r;
+    }
+
+    void destroySamplerCounted(VkSampler sampler)
+    {
+        if (sampler == VK_NULL_HANDLE)
+            return;
+        vkDestroySampler(mDevice, sampler, nullptr);
+        --mLiveSamplers;
+    }
+
+    uint32_t liveSamplerCount() const override { return mLiveSamplers; }
 
     void writeBindlessSlot(uint32_t slot, VkImageView view)
     {
@@ -1031,6 +1139,35 @@ public:
     {
         if (!mHasBindlessTextures)
             return 0;
+        // P9.97: a module the one-binding set cannot hold is refused HERE, because
+        // llvmpipe does not refuse it: measured, a SamplerState at (1, 1) builds,
+        // then samples through whichever VkSampler the process happens to own --
+        // or segfaults at dispatch when it owns none.
+        uint32_t badSet = 0, badBinding = 0;
+        if (!pxgSpirvFitsBindlessLayout(code, codeSize, &badSet, &badBinding))
+        {
+            if (badSet == ~0u)
+                std::fprintf(stderr, "[PxgVulkan] createPipelineBindless(%s): the module is not a well-formed "
+                                     "SPIR-V word stream; refused\n",
+                             entryName ? entryName : "?");
+            else if (badBinding == ~0u)
+                std::fprintf(stderr, "[PxgVulkan] createPipelineBindless(%s): the module declares a set-%u "
+                                     "variable without a Binding; refused\n",
+                             entryName ? entryName : "?", badSet);
+            else
+                std::fprintf(stderr,
+                             "[PxgVulkan] createPipelineBindless(%s): the module declares set %u binding %u, "
+                             "which the bindless layout (set 1 = binding 0 only, P9.97) does not have; refused\n",
+                             entryName ? entryName : "?", badSet, badBinding);
+            return 0;
+        }
+        if (pxgSpirvDeclaresSampler(code, codeSize))
+        {
+            std::fprintf(stderr, "[PxgVulkan] createPipelineBindless(%s): the module declares a sampler; the "
+                                 "bindless path fetches texels and never samples in hardware (P9.96); refused\n",
+                         entryName ? entryName : "?");
+            return 0;
+        }
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
                                       0, 0, true);
     }
@@ -1474,8 +1611,8 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
-        // Owned only by the bound path; the bindless path shares
-        // mBindlessSampler and leaves this null.
+        // Owned only by the bound path (createTexture3D); a bindless texture has
+        // none (P9.97 -- there is no bindless sampler any more).
         VkSampler sampler = VK_NULL_HANDLE;
         uint32_t width = 0, height = 0, depth = 0;
         bool bindless = false;
@@ -1616,8 +1753,7 @@ private:
 
     void releaseTexture(Texture& tex)
     {
-        if (tex.sampler)
-            vkDestroySampler(mDevice, tex.sampler, nullptr);
+        destroySamplerCounted(tex.sampler);
         if (tex.view)
             vkDestroyImageView(mDevice, tex.view, nullptr);
         if (tex.image)
@@ -1732,24 +1868,23 @@ private:
     bool mHasShaderBufferFloat32AtomicAdd = false;
     SubgroupCaps mSubgroupCaps;
 
-    // ---- the bindless texture set (P9.12a) ----
-    // One device-wide descriptor set at index 1: an unbounded array of sampled
-    // 3D images at binding 0 and ONE shared sampler at binding 1.  Binding 1 is
-    // RESERVED AND UNUSED since P9.96: pxgTex3D no longer samples, it fetches
-    // texels (OpImageFetch, which needs no sampler) and evaluates CUDA's
-    // clamp/linear filter itself, so the engine's one texture descriptor --
-    // clamp on all three axes, linear filter, normalized element reads,
-    // unnormalized coordinates (PxgGeometryManager.cpp:762-770) -- lives in
-    // shader code.  A layout binding
-    // no shader uses is valid Vulkan; dropping it (layout, pool sizes, sampler
-    // create/destroy) is a follow-up.  A texture that wants different addressing
-    // now means extending pxgTex3D, not this set.
+    // ---- the bindless texture set (P9.12a; one binding since P9.97) ----
+    // One device-wide descriptor set at index 1: an array of 4096 sampled 3D
+    // images at binding 0 and nothing else.  Until P9.97 binding 1 held ONE
+    // shared sampler; P9.96 made pxgTex3D fetch texels (OpImageFetch, which needs
+    // no sampler) and evaluate CUDA's clamp/linear filter itself, so the engine's
+    // one texture descriptor -- clamp on all three axes, linear filter,
+    // normalized element reads, unnormalized coordinates
+    // (PxgGeometryManager.cpp:762-770) -- lives in shader code, and P9.97 removed
+    // the binding, its pool size and the sampler.  A texture that wants different
+    // addressing means extending pxgTex3D, not this set.
     static const uint32_t kBindlessTextureCapacity = 4096;
     bool mHasBindlessTextures = false;
     VkDescriptorSetLayout mBindlessSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool mBindlessPool = VK_NULL_HANDLE;
     VkDescriptorSet mBindlessSet = VK_NULL_HANDLE;
-    VkSampler mBindlessSampler = VK_NULL_HANDLE;
+    BindlessSetInfo mBindlessInfo;   // P9.97: as created, see recordBindlessLayout/Pool
+    uint32_t mLiveSamplers = 0;      // P9.97: see createSamplerCounted
 
     std::string mDeviceName;
 };

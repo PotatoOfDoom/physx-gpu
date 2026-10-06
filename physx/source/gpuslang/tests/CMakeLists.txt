@@ -3227,3 +3227,23 @@ add_test(NAME gpuslang.launchAbiPack
 # bridge pushes it at @96; 415 kernels joined, 0 findings since that shader's fix.
 add_test(NAME gpuslang.pushBlock
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_push_block.py ${SHADER_OUT_DIR})
+
+# P9.97: the mutation-sweep runners derive their per-run bound from a timed baseline
+# (tools/sweep_timeout.sh) instead of a fixed 300 s, which refused the 435-527 s
+# triTriCollisionBda suite and, near the bound, would read a merely slower mutant as
+# KILLED-HANG.  This pins the POLICY: the derivation table as literals, the knob
+# validation (0, suffixes, leading zeros, factor < 2), the warning boundary, the
+# 137 -> hang mapping, the Python twin (derive_timeout, knob, the process-group kill of
+# run_bounded), and that no runner calls timeout(1) on its own.  No GPU, about 20 s.
+add_test(NAME gpuslang.sweepTimeoutPolicy
+    COMMAND sh ${GPUSLANG_ROOT}/tools/test_sweep_timeout.sh)
+
+# P9.97: the runners THEMSELVES, end to end, on a mirror tree with fake suite and scene
+# binaries (no GPU, no slangc, about 80 s): the refusal runs the suite once, the derived
+# bound is printed and used, a SIGTERM-ignoring hang and a hang followed by a crash are
+# hangs (one attempt), a closing-baseline timeout says so, sweep_common.sh refuses a
+# baseline that times out or reads "10 failed", and the host runner refuses an empty
+# regex before building, sizes its outer bound by the number of tests, and does not
+# re-run a red baseline.  Every row also checks that source and .spv are restored.
+add_test(NAME gpuslang.sweepRunners
+    COMMAND sh ${GPUSLANG_ROOT}/tools/test_sweep_runners.sh)

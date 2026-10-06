@@ -63,7 +63,10 @@
 //   - the PxU16 phase->material lookup and mData.mLockFlags reads fold into 32-bit
 //     loads (no 16-bit-storage capability required on llvmpipe);
 //   - the ps_integrateLaunch material fetch is dead in the CUDA original (mat is
-//     read but only data.mMaxVelocity is used), so it is dropped.
+//     read but only data.mMaxVelocity is used), so it is dropped;
+//   - P9.97: value-identical source-index clamps and a rest-pointer select in the two
+//     buffer-copy kernels (UA:/UB: tags) -- hardening for back ends that hoist a
+//     guarded load; llvmpipe issues none of the unclamped reads (measured).
 
 import pxgSlangParticleDesc;
 
@@ -387,6 +390,26 @@ void ps_integrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
 // CUDA __global__ takes 2 pointers; the launch site passes a 3rd PxU32 `count`
 // (unused by the kernel) -> the marshalled pack is { particleSystems*,
 // activeParticleSystems*, PxU32 count } -> 24-byte blob.
+//
+// P9.97 (P9.22 rule) -- HARDENING, NOT A DEFECT ON THIS PLATFORM: the per-lane SOURCE
+// index into the unsorted arrays is clamped (UB:clamp, through the CUDA's own `ind`,
+// :293).  The grid is (ceil(mMaxParticlesPerBuffer/1024), mMaxBuffersPerSystem,
+// nbActive) (PxgParticleSystemCore.cpp:2520/2532).  Both maxima are taken over every
+// buffer of every system and only grow, so a lane can sit past the end of the unsorted
+// arrays (offset + x, typically for the LAST buffer; the arrays hold at least the
+// summed capacities, grow-only and doubling, PxgCudaBuffer.cpp:47-64).  Only in-guard
+// lanes store, so the clamp moves an address on a lane that stores nothing, never a
+// value.  On llvmpipe 25.2.8 / LLVM 20.1.2 the unclamped reads are masked gathers and
+// are never issued for a masked lane -- the particleSim*Guard fixtures measure this
+// with every array ending at a PROT_NONE guard page; the clamp is for back ends that
+// hoist a guarded load.  The per-workgroup reads at y >= nb (runsum[y], the sim-buffer
+// record) are NOT clamped: they stay behind the CUDA's guard (:278), which llvmpipe
+// compiles to a real branch because the guarded body is never a single block (it holds
+// the per-lane `if`; lp_should_flatten_cf_list flattens only a single block of < 8
+// instructions -- an edit that ever made this body one small block WOULD let those
+// uniform reads be issued here).  For an empty system (nb == 0) the record and runsum
+// pointers may be null, stale or uninitialised, and no index clamp could make them
+// valid.
 struct PsUpdateUserBufferParams
 {
     uint64_t particleSystems;       // @0
@@ -401,35 +424,36 @@ ConstantBuffer<PsUpdateUserBufferParams> gUpd;
 void ps_updateUserBufferLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gUpd.particleSystems);
-    const uint particleId = (Ptr<uint>(gUpd.activeParticleSystems))[groupId.z];
+    const uint particleId = (Ptr<uint>(gUpd.activeParticleSystems))[groupId.z];             // UB:sys :272
 
-    const uint bufferIndex = groupId.y;
+    const uint bufferIndex = groupId.y;                                                       // UB:y :276
     const uint numParticleBuffers = systems[particleId].mCommonData_NumParticleBuffers;
 
-    if (bufferIndex < numParticleBuffers)
+    if (bufferIndex < numParticleBuffers)                                                     // UB:bufGuard :278
     {
         Ptr<float4> unsortedPositions = Ptr<float4>(systems[particleId].mUnsortedPositions_InvMass);
         Ptr<float4> unsortedVels = Ptr<float4>(systems[particleId].mUnsortedVelocities);
 
         Ptr<PxgParticleSimBufferGpu> simBuffers = Ptr<PxgParticleSimBufferGpu>(systems[particleId].mParticleSimBuffers);
         Ptr<uint> runsum = Ptr<uint>(systems[particleId].mParticleBufferRunsum);
-        const uint offset = runsum[bufferIndex];
+        const uint offset = runsum[bufferIndex];                                                   // UB:offset :284
 
-        Ptr<float4> particles = Ptr<float4>(simBuffers[bufferIndex].mPositionInvMasses);
-        Ptr<float4> velocities = Ptr<float4>(simBuffers[bufferIndex].mVelocities);
-        const uint numActiveParticles = simBuffers[bufferIndex].mNumActiveParticles;
+        Ptr<float4> particles = Ptr<float4>(simBuffers[bufferIndex].mPositionInvMasses);          // UB:dstPos :286
+        Ptr<float4> velocities = Ptr<float4>(simBuffers[bufferIndex].mVelocities);                // UB:dstVel :287
+        const uint numActiveParticles = simBuffers[bufferIndex].mNumActiveParticles;              // UB:count :291
 
-        const uint globalThreadIndex = groupThreadId.x + groupId.x * PS_BLOCK_DIM;
+        const uint globalThreadIndex = groupThreadId.x + groupId.x * PS_BLOCK_DIM;            // UB:gtid :289
+        const uint ind = offset + globalThreadIndex;                                           // UB:ind :293 (above the guard: integer only)
+        const uint srcInd = (globalThreadIndex < numActiveParticles) ? ind : 0u;                // UB:clamp (P9.97)
 
-        if (globalThreadIndex < numActiveParticles)
+        if (globalThreadIndex < numActiveParticles)                                            // UB:guard :291
         {
-            const uint ind = offset + globalThreadIndex;
-            particles[globalThreadIndex] = unsortedPositions[ind];
-            velocities[globalThreadIndex] = unsortedVels[ind];
+            particles[globalThreadIndex] = unsortedPositions[srcInd];                          // UB:posCopy :294
+            velocities[globalThreadIndex] = unsortedVels[srcInd];                              // UB:velCopy :295
         }
 
-        if (globalThreadIndex == 0u)
-            simBuffers[bufferIndex].mFlags = 0u;
+        if (globalThreadIndex == 0u)                                                           // UB:flagsGuard :298
+            simBuffers[bufferIndex].mFlags = 0u;                                                    // UB:flagsClear :299
     }
 }
 
@@ -437,6 +461,25 @@ void ps_updateUserBufferLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 gro
 // ps_updateUnsortedArrayLaunch — ingest user buffer -> unsorted (particlesystem.cu:218-267)
 // ---------------------------------------------------------------------------
 // argSizes: { particleSystems*, activeParticleSystems* } -> 16-byte blob.
+//
+// P9.97 (P9.22 rule) -- HARDENING, NOT A DEFECT ON THIS PLATFORM: the per-lane SOURCE
+// index is clamped (UA:clamp, as applyParticleBufferDataDEPRECATED's AP:clamp), and the
+// optionally-NULL rest pointer is selected (UA:restSel, P8.2c rule); the CUDA's own null
+// test is kept (UA:restFlag), so a null rest buffer is still never copied.  The grid is
+// (ceil(mMaxParticlesPerBuffer/1024), mMaxBuffersPerSystem, nbActive)
+// (PxgParticleSystemCore.cpp:753/764).  Both maxima are taken over every buffer of
+// every system and only grow, so a lane can sit past THIS buffer's user arrays.  Only
+// in-guard lanes store, so the clamps move an address on a lane that stores nothing,
+// never a value.  On llvmpipe 25.2.8 / LLVM 20.1.2 the unclamped reads are masked
+// gathers and are never issued for a masked lane (the null test folds into the mask);
+// the particleSim*Guard fixtures measure this with PROT_NONE guard pages.  The clamps
+// are for back ends that hoist a guarded load.  NULL rest + REST flag is LIVE in the
+// engine: initParticleSimBuffer leaves mRestPositions NULL for every non-cloth buffer
+// (PxgPBDParticleSystemCore.cpp:1411) and the rigid-buffer update raises the REST flag
+// (:1519-1521) -- PXG_SCENE=particlerigid ingests exactly that; without the null test
+// AND without the select it segfaults at its first step.  The per-workgroup reads at
+// y >= nb are NOT clamped: see ps_updateUserBufferLaunch (guard :227, a real branch on
+// llvmpipe; nb == 0 pointers may be null, stale or uninitialised).
 struct PsUpdateUnsortedParams
 {
     uint64_t particleSystems;       // @0
@@ -450,12 +493,12 @@ ConstantBuffer<PsUpdateUnsortedParams> gIngest;
 void ps_updateUnsortedArrayLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gIngest.particleSystems);
-    const uint particleId = (Ptr<uint>(gIngest.activeParticleSystems))[groupId.z];
+    const uint particleId = (Ptr<uint>(gIngest.activeParticleSystems))[groupId.z];          // UA:sys :221
 
-    const uint bufferIndex = groupId.y;
+    const uint bufferIndex = groupId.y;                                                       // UA:y :225
     const uint numParticleBuffers = systems[particleId].mCommonData_NumParticleBuffers;
 
-    if (bufferIndex < numParticleBuffers)
+    if (bufferIndex < numParticleBuffers)                                                     // UA:bufGuard :227
     {
         Ptr<float4> unsortedPositions = Ptr<float4>(systems[particleId].mUnsortedPositions_InvMass);
         Ptr<float4> unsortedVels = Ptr<float4>(systems[particleId].mUnsortedVelocities);
@@ -464,28 +507,30 @@ void ps_updateUnsortedArrayLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
 
         Ptr<PxgParticleSimBufferGpu> simBuffers = Ptr<PxgParticleSimBufferGpu>(systems[particleId].mParticleSimBuffers);
         Ptr<uint> runsum = Ptr<uint>(systems[particleId].mParticleBufferRunsum);
-        const uint offset = runsum[bufferIndex];
+        const uint offset = runsum[bufferIndex];                                                   // UA:offset :236
 
-        const uint64_t particlesAddr = simBuffers[bufferIndex].mPositionInvMasses;
-        const uint64_t velocitiesAddr = simBuffers[bufferIndex].mVelocities;
-        const uint64_t restAddr = simBuffers[bufferIndex].mRestPositions;
-        const uint64_t phasesAddr = simBuffers[bufferIndex].mPhases;
-        const uint numActiveParticles = simBuffers[bufferIndex].mNumActiveParticles;
-        const uint flags = simBuffers[bufferIndex].mFlags;
+        const uint64_t particlesAddr = simBuffers[bufferIndex].mPositionInvMasses;                // UA:srcPos :238
+        const uint64_t velocitiesAddr = simBuffers[bufferIndex].mVelocities;                      // UA:srcVel :239
+        const uint64_t restAddr = simBuffers[bufferIndex].mRestPositions;                         // UA:srcRest :240
+        const uint64_t phasesAddr = simBuffers[bufferIndex].mPhases;                              // UA:srcPhase :241
+        const uint numActiveParticles = simBuffers[bufferIndex].mNumActiveParticles;              // UA:count :248
+        const uint flags = simBuffers[bufferIndex].mFlags;                                        // UA:flags :246
 
-        const uint globalThreadIndex = groupThreadId.x + groupId.x * PS_BLOCK_DIM;
+        const uint globalThreadIndex = groupThreadId.x + groupId.x * PS_BLOCK_DIM;            // UA:gtid :244
+        const uint srcIdx = (globalThreadIndex < numActiveParticles) ? globalThreadIndex : 0u;  // UA:clamp (P9.97)
+        const uint64_t restSrc = (restAddr != 0UL) ? restAddr : particlesAddr;                // UA:restSel (P9.97)
 
-        if (globalThreadIndex < numActiveParticles)
+        if (globalThreadIndex < numActiveParticles)                                            // UA:guard :248
         {
-            const uint ind = offset + globalThreadIndex;
-            if ((flags & PS_BUFFER_FLAG_UPDATE_POSITION) != 0u)
-                unsortedPositions[ind] = Ptr<float4>(particlesAddr)[globalThreadIndex];
-            if ((flags & PS_BUFFER_FLAG_UPDATE_VELOCITY) != 0u)
-                unsortedVels[ind] = Ptr<float4>(velocitiesAddr)[globalThreadIndex];
-            if ((flags & PS_BUFFER_FLAG_UPDATE_PHASE) != 0u)
-                unsortedPhases[ind] = Ptr<uint>(phasesAddr)[globalThreadIndex];
-            if (((flags & PS_BUFFER_FLAG_UPDATE_RESTPOSITION) != 0u) && restAddr != 0u)
-                unsortedRestArray[ind] = Ptr<float4>(restAddr)[globalThreadIndex];
+            const uint ind = offset + globalThreadIndex;                                       // UA:ind :250
+            if ((flags & PS_BUFFER_FLAG_UPDATE_POSITION) != 0u)                                // UA:posFlag :251
+                unsortedPositions[ind] = Ptr<float4>(particlesAddr)[srcIdx];                   // UA:posCopy :252
+            if ((flags & PS_BUFFER_FLAG_UPDATE_VELOCITY) != 0u)                                // UA:velFlag :254
+                unsortedVels[ind] = Ptr<float4>(velocitiesAddr)[srcIdx];                       // UA:velCopy :255
+            if ((flags & PS_BUFFER_FLAG_UPDATE_PHASE) != 0u)                                   // UA:phaseFlag :257
+                unsortedPhases[ind] = Ptr<uint>(phasesAddr)[srcIdx];                           // UA:phaseCopy :258
+            if (((flags & PS_BUFFER_FLAG_UPDATE_RESTPOSITION) != 0u) && restAddr != 0UL)        // UA:restFlag :260
+                unsortedRestArray[ind] = Ptr<float4>(restSrc)[srcIdx];                         // UA:restCopy :261
         }
     }
 }

@@ -167,9 +167,9 @@
 // side by side.
 
 [[vk::binding(0, 1)]] Texture3D<float> gPxgTex3D[];
-// Binding 1 (the SamplerState) is no longer declared -- nothing samples since
-// P9.96.  The device's bindless layout still carries it, which is valid Vulkan
-// (a layout may declare a binding no shader uses); removing it is a follow-up.
+// The set has NO other binding: until P9.96 a SamplerState sat at binding 1, and
+// P9.97 removed it from the device's layout too.  Do not declare anything else in
+// set 1 -- createPipelineBindless refuses such a module (pxgSpirvFitsBindlessLayout).
 
 // 2^8: CUDA's 8 fractional weight bits.  STEP is 2^-8, exact, and a multiply --
 // never a runtime division.

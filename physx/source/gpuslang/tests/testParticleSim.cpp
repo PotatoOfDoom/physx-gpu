@@ -40,6 +40,9 @@
 //   particleSimIntegrate    — ps_integrateLaunch post-solve writeback
 //   particleSimUpdateBuffer — ps_updateUserBufferLaunch user-buffer copy
 //   particleSimApplyBufferData — applyParticleBufferDataDEPRECATED (P9.95)
+//   particleSimIngestGuard / particleSimUpdateBufferGuard — the two buffer-copy
+//                             kernels on the engine grid, every array before a
+//                             PROT_NONE guard page (P9.97)
 
 #include "pxgTestFramework.h"
 
@@ -55,7 +58,12 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -1215,6 +1223,493 @@ PXG_TEST(particleSimUpdateBuffer)
     dev->destroyBuffer(bUPos.h); dev->destroyBuffer(bUVel.h); dev->destroyBuffer(bUserPos.h);
     dev->destroyBuffer(bUserVel.h); dev->destroyBuffer(bRunsum.h); dev->destroyBuffer(bSim.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.97 -- particleSimIngestGuard / particleSimUpdateBufferGuard: the two buffer-copy
+// kernels on the ENGINE's grid, with every array ending at a PROT_NONE guard page.
+//
+// The engine launches both kernels on (ceil(mMaxParticlesPerBuffer/1024),
+// mMaxBuffersPerSystem, nbActive) (PxgParticleSystemCore.cpp:753/764, :2520/2532):
+// both maxima are over every buffer of every system and only grow, so lanes run past
+// a buffer's user arrays (ingest) and past the unsorted arrays (egress, offset + x),
+// and workgroups run past a system's buffer count.  The CUDA guards every such
+// access; the port adds value-identical clamps (UA:clamp, UA:restSel, UB:clamp) for
+// back ends that hoist a guarded load.  On llvmpipe none of the unclamped reads is
+// issued (masked gathers; the y-guarded body is a real branch), so the clamps
+// cannot be made visible here -- what this fixture pins instead:
+//   * every word of every array, decoy system, descriptors, records, runsum and active
+//     list included, against a CUDA-literal host oracle (particlesystem.cu:218-301);
+//   * with the guard arena, a load moved out of its guard FAULTS deterministically
+//     (the arrays end on the last byte before a PROT_NONE page -- no layout lottery);
+//   * the CUDA's own guards: y at nb == 0 (L2/E2: an active system with NO buffers and
+//     NULL record/runsum pointers, standing for the engine's null, stale or
+//     uninitialised nb == 0 pointers -- PxgSimulationController.cpp:1148-1150), the
+//     lane guard, the null-rest test (S0 b0 has REST set and a NULL rest pointer,
+//     as every rigid buffer has in the engine, PxgPBDParticleSystemCore.cpp:1411/1519).
+//
+// The arena hands the shader plain mmap memory by its host VA.  That is valid only
+// where a buffer device address IS the host VA -- llvmpipe (P8.46a), measured here
+// through a host-visible buffer, never assumed -- so it is used only when that
+// identity holds AND the device is llvmpipe; elsewhere every array is a host-visible
+// device buffer and the fixture is bitwise-only (a hoisted load then reads slack
+// instead of faulting).  Neither mode is asserted.
+//
+// Layout (the engine formula gives grid (3, 3, 2)):
+//   S0 active (z = 1): b0 n=3 flags 0xF rest NULL; b1 n=2100 flags 0xD (no VEL) rest valid
+//   S1 DECOY, never active: b0..b2 n = 5, 6, 7 flags 0xF -- makes mMaxBuffersPerSystem 3
+//   S2 active (z = 0): b0 n=700 flags 0x2 rest NULL; b1 n=0 (capacity 1) flags 0xF rest
+//      valid -- or, for L2/E2, NO buffers at all (null record and runsum pointers)
+// active list {2, 0}: not a permutation of all systems, so dropping the indirection shows.
+// The unsorted arrays are sized to the sum of ACTIVE counts, tighter than the engine's
+// (at least the sum of capacities, grow-only): every CUDA store index is below it.
+// ---------------------------------------------------------------------------
+struct GuardArr
+{
+    uint8_t* p = nullptr;      // host view of the first byte
+    uint64_t dev = 0;          // device address (0 for an absent array)
+    size_t bytes = 0;
+    void* map = nullptr;       // guard mode: the mmap (array + guard page)
+    size_t mapBytes = 0;
+    PxgBufferHandle h = 0;     // otherwise: the host-visible buffer
+};
+
+// Does this device address a host-visible buffer AT its host VA?
+static bool guardIdentity(PxgSlangComputeDevice* dev)
+{
+    void* m = nullptr;
+    const PxgBufferHandle h = dev->createHostVisibleBuffer(256, &m);
+    const bool id = h != 0 && m != nullptr && dev->getBufferDeviceAddress(h) == uint64_t(uintptr_t(m));
+    if (h)
+        dev->destroyBuffer(h);
+    return id;
+}
+
+static GuardArr guardAlloc(PxgSlangComputeDevice* dev, bool guard, size_t bytes)
+{
+    GuardArr a;
+    a.bytes = bytes;
+    if (bytes == 0)
+        return a;                                   // an absent (NULL) array
+#if defined(__linux__)
+    if (guard)
+    {
+        const size_t pg = size_t(sysconf(_SC_PAGESIZE));
+        const size_t np = (bytes + pg - 1) / pg;
+        void* m = mmap(nullptr, (np + 1) * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED)
+            return a;
+        uint8_t* base = static_cast<uint8_t*>(m);
+        if (mprotect(base + np * pg, pg, PROT_NONE) != 0)
+        {
+            munmap(m, (np + 1) * pg);
+            return a;
+        }
+        std::memset(base, 0xA5, np * pg);            // poison in front of the array
+        a.map = m;
+        a.mapBytes = (np + 1) * pg;
+        a.p = base + np * pg - bytes;               // the LAST byte is the last before the guard
+        a.dev = uint64_t(uintptr_t(a.p));
+        return a;
+    }
+#else
+    (void)guard;
+#endif
+    void* m = nullptr;
+    a.h = dev->createHostVisibleBuffer(bytes, &m);
+    a.p = static_cast<uint8_t*>(m);
+    a.dev = a.h ? dev->getBufferDeviceAddress(a.h) : 0;
+    return a;
+}
+
+static void guardFree(PxgSlangComputeDevice* dev, GuardArr& a)
+{
+#if defined(__linux__)
+    if (a.map)
+        munmap(a.map, a.mapBytes);
+#endif
+    if (a.h)
+        dev->destroyBuffer(a.h);
+    a = GuardArr();
+}
+
+static uint32_t guardPattern(uint32_t salt, uint32_t i)
+{
+    // every third word a P9.95b special value: -0, +0, quiet/signalling NaN payloads,
+    // +-inf, the smallest denormal, the largest negative denormal
+    static const uint32_t special[] = { 0x80000000u, 0x00000000u, 0x7fc12345u, 0x7f812345u,
+                                        0x7f800000u, 0xff800000u, 0x00000001u, 0x807fffffu };
+    const uint32_t h = (i * 2654435761u) ^ (salt * 40503u + 0x9e37u);
+    return (i % 3u == 0u) ? special[(h >> 7) % 8u] : h;
+}
+
+struct GuardBuf { uint32_t active, flags; bool rest; GuardArr pos, vel, restA, phaseA; };
+struct GuardSys { std::vector<GuardBuf> bufs; GuardArr upos, uvel, uphase, urest, simbuf, runsum; uint32_t total = 0; };
+
+// Oracle variants: the CUDA (None) and four deliberately wrong ones, each of which the
+// layout must be able to tell apart (checked on the host before the launch).
+enum class GuardVariant { None, SysDirect, FlagsBuf0, OffsetDrop, NoFlagsClear };
+
+struct GuardWorld
+{
+    PxgSlangComputeDevice* dev = nullptr;
+    bool guard = false, ok = true;
+    std::vector<GuardSys> sys;
+    std::vector<uint32_t> active;
+    GuardArr desc, act;
+    std::vector<GuardArr*> all;          // every array, in a fixed order
+    std::vector<std::string> names;
+
+    GuardArr alloc(size_t bytes)
+    {
+        GuardArr a = guardAlloc(dev, guard, bytes);
+        if (bytes && !a.p)
+            ok = false;
+        return a;
+    }
+
+    void build(bool emptyS2, bool egress)
+    {
+        sys.resize(3);
+        sys[0].bufs = { { 3u, 0xFu, false, {}, {}, {}, {} }, { 2100u, 0xDu, true, {}, {}, {}, {} } };
+        sys[1].bufs = { { 5u, 0xFu, true, {}, {}, {}, {} }, { 6u, 0xFu, true, {}, {}, {}, {} },
+                        { 7u, 0xFu, true, {}, {}, {}, {} } };
+        if (!emptyS2)
+            sys[2].bufs = { { 700u, 0x2u, false, {}, {}, {}, {} }, { 0u, 0xFu, true, {}, {}, {}, {} } };
+        active = { 2u, 0u };
+        uint32_t salt = 1;
+        for (size_t si = 0; si < sys.size(); ++si)
+        {
+            GuardSys& s = sys[si];
+            for (size_t k = 0; k < s.bufs.size(); ++k)
+            {
+                GuardBuf& b = s.bufs[k];
+                const uint32_t cap = b.active ? b.active : 1u;      // the buffer's capacity
+                b.pos = alloc(16u * cap);
+                b.vel = alloc(16u * cap);
+                b.restA = b.rest ? alloc(16u * cap) : GuardArr();
+                b.phaseA = alloc(4u * cap);
+                if (!ok)
+                    return;
+                for (uint32_t i = 0; i < 4u * cap; ++i)
+                {
+                    put32(b.pos.p, i, guardPattern(salt, i));
+                    put32(b.vel.p, i, guardPattern(salt + 100u, i));
+                    if (b.rest)
+                        put32(b.restA.p, i, guardPattern(salt + 200u, i));
+                }
+                for (uint32_t i = 0; i < cap; ++i)
+                    put32(b.phaseA.p, i, guardPattern(salt + 300u, i));
+                ++salt;
+                s.total += b.active;
+            }
+            const uint32_t tot = s.total ? s.total : 1u;
+            s.upos = alloc(16u * tot);
+            s.uvel = alloc(16u * tot);
+            s.urest = alloc(16u * tot);
+            s.uphase = alloc(4u * tot);
+            s.simbuf = alloc(sizeof(PxgParticleSimBuffer) * s.bufs.size());   // NULL when nb == 0
+            s.runsum = alloc(4u * s.bufs.size());
+            if (!ok)
+                return;
+            for (uint32_t i = 0; i < 4u * tot; ++i)
+            {
+                put32(s.upos.p, i, guardPattern(salt + 400u, i));
+                put32(s.uvel.p, i, guardPattern(salt + 500u, i));
+                put32(s.urest.p, i, guardPattern(salt + 600u, i));
+            }
+            for (uint32_t i = 0; i < tot; ++i)
+                put32(s.uphase.p, i, guardPattern(salt + 700u, i));
+            uint32_t run = 0;
+            for (size_t k = 0; k < s.bufs.size(); ++k)
+            {
+                const GuardBuf& b = s.bufs[k];
+                PxgParticleSimBuffer r;
+                std::memset(&r, 0, sizeof(r));
+                r.mPositionInvMasses = reinterpret_cast<float4*>(size_t(b.pos.dev));
+                r.mVelocities = reinterpret_cast<float4*>(size_t(b.vel.dev));
+                r.mRestPositions = reinterpret_cast<float4*>(size_t(b.restA.dev));
+                r.mPhases = reinterpret_cast<PxU32*>(size_t(b.phaseA.dev));
+                r.mNumActiveParticles = b.active;
+                // egress: a record-unique sentinel, so a clear of the wrong record shows
+                r.mFlags = egress ? (0xF00D0000u | uint32_t(si << 8) | uint32_t(k)) : b.flags;
+                r.mUniqueId = 0x5EED0000u | uint32_t(si << 8) | uint32_t(k);
+                std::memcpy(s.simbuf.p + sizeof(PxgParticleSimBuffer) * k, &r, sizeof(r));
+                put32(s.runsum.p, uint32_t(k), run);
+                run += b.active;
+            }
+        }
+        desc = alloc(sizeof(PxgParticleSystem) * sys.size());
+        act = alloc(4u * active.size());
+        if (!ok)
+            return;
+        for (size_t si = 0; si < sys.size(); ++si)
+        {
+            PxgParticleSystem ps = makeZeroDesc();
+            ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(sys[si].upos.dev));
+            ps.mUnsortedVelocities = reinterpret_cast<float4*>(size_t(sys[si].uvel.dev));
+            ps.mUnsortedPhaseArray = reinterpret_cast<PxU32*>(size_t(sys[si].uphase.dev));
+            ps.mRestArray = reinterpret_cast<float4*>(size_t(sys[si].urest.dev));
+            ps.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(sys[si].simbuf.dev));
+            ps.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(sys[si].runsum.dev));
+            ps.mCommonData.mNumParticleBuffers = PxU32(sys[si].bufs.size());
+            ps.mCommonData.mNumParticles = sys[si].total;
+            std::memcpy(desc.p + sizeof(PxgParticleSystem) * si, &ps, sizeof(ps));
+        }
+        for (size_t i = 0; i < active.size(); ++i)
+            put32(act.p, uint32_t(i), active[i]);
+
+        char nm[64];
+        for (size_t si = 0; si < sys.size(); ++si)
+        {
+            GuardSys& s = sys[si];
+            const char* sn[] = { "upos", "uvel", "uphase", "urest", "records", "runsum" };
+            GuardArr* sa[] = { &s.upos, &s.uvel, &s.uphase, &s.urest, &s.simbuf, &s.runsum };
+            for (int j = 0; j < 6; ++j)
+            {
+                std::snprintf(nm, sizeof(nm), "S%zu.%s", si, sn[j]);
+                all.push_back(sa[j]);
+                names.push_back(nm);
+            }
+            for (size_t k = 0; k < s.bufs.size(); ++k)
+            {
+                const char* bn[] = { "pos", "vel", "rest", "phase" };
+                GuardArr* ba[] = { &s.bufs[k].pos, &s.bufs[k].vel, &s.bufs[k].restA, &s.bufs[k].phaseA };
+                for (int j = 0; j < 4; ++j)
+                {
+                    std::snprintf(nm, sizeof(nm), "S%zu.b%zu.%s", si, k, bn[j]);
+                    all.push_back(ba[j]);
+                    names.push_back(nm);
+                }
+            }
+        }
+        all.push_back(&desc);
+        names.push_back("descriptors");
+        all.push_back(&act);
+        names.push_back("active");
+    }
+
+    static void put32(uint8_t* p, uint32_t word, uint32_t v) { std::memcpy(p + 4u * word, &v, 4); }
+
+    std::vector<std::vector<uint8_t>> snapshot() const
+    {
+        std::vector<std::vector<uint8_t>> r(all.size());
+        for (size_t i = 0; i < all.size(); ++i)
+            if (all[i]->bytes)
+                r[i].assign(all[i]->p, all[i]->p + all[i]->bytes);
+        return r;
+    }
+
+    // The CUDA, literally, over host SHADOWS: device pointers read from the shadow
+    // descriptors / records are resolved to the shadow of the array they point into.
+    void oracle(std::vector<std::vector<uint8_t>>& sh, bool ingest, GuardVariant v,
+                uint32_t gx, uint32_t gy, uint32_t gz) const
+    {
+        auto at = [&](uint64_t addr) -> uint8_t* {
+            for (size_t i = 0; i < all.size(); ++i)
+                if (all[i]->bytes && addr >= all[i]->dev && addr < all[i]->dev + all[i]->bytes)
+                    return sh[i].data() + (addr - all[i]->dev);
+            return nullptr;   // NULL, or past an end: the caller must not dereference it
+        };
+        auto rd32 = [](const uint8_t* p) { uint32_t x; std::memcpy(&x, p, 4); return x; };
+        auto rd64 = [](const uint8_t* p) { uint64_t x; std::memcpy(&x, p, 8); return x; };
+        const uint64_t SP = sizeof(PxgParticleSystem), SB = sizeof(PxgParticleSimBuffer);
+        for (uint32_t bz = 0; bz < gz; ++bz)
+            for (uint32_t by = 0; by < gy; ++by)
+                for (uint32_t bx = 0; bx < gx; ++bx)
+                    for (uint32_t tx = 0; tx < 1024u; ++tx)
+                    {
+                        const uint32_t particleId = v == GuardVariant::SysDirect ? bz : rd32(at(act.dev + 4u * bz));
+                        const uint8_t* ps = at(desc.dev + SP * particleId);
+                        const uint32_t bufferIndex = by;
+                        if (!(bufferIndex < rd32(ps + offsetof(PxgParticleSystem, mCommonData) +
+                                                 offsetof(PxGpuParticleData, mNumParticleBuffers))))
+                            continue;
+                        const uint64_t uPos = rd64(ps + offsetof(PxgParticleSystem, mUnsortedPositions_InvMass));
+                        const uint64_t uVel = rd64(ps + offsetof(PxgParticleSystem, mUnsortedVelocities));
+                        const uint64_t uRest = rd64(ps + offsetof(PxgParticleSystem, mRestArray));
+                        const uint64_t uPhase = rd64(ps + offsetof(PxgParticleSystem, mUnsortedPhaseArray));
+                        const uint64_t recs = rd64(ps + offsetof(PxgParticleSystem, mParticleSimBuffers));
+                        const uint64_t runs = rd64(ps + offsetof(PxgParticleSystem, mParticleBufferRunsum));
+                        uint8_t* buffer = at(recs + SB * bufferIndex);
+                        const uint32_t offset = v == GuardVariant::OffsetDrop ? 0u : rd32(at(runs + 4u * bufferIndex));
+                        const uint64_t particles = rd64(buffer + offsetof(PxgParticleSimBuffer, mPositionInvMasses));
+                        const uint64_t velocities = rd64(buffer + offsetof(PxgParticleSimBuffer, mVelocities));
+                        const uint64_t restPose = rd64(buffer + offsetof(PxgParticleSimBuffer, mRestPositions));
+                        const uint64_t phases = rd64(buffer + offsetof(PxgParticleSimBuffer, mPhases));
+                        const uint32_t n = rd32(buffer + offsetof(PxgParticleSimBuffer, mNumActiveParticles));
+                        const uint32_t globalThreadIndex = tx + 1024u * bx;
+                        const uint8_t* flagRec = v == GuardVariant::FlagsBuf0 ? at(recs) : buffer;
+                        const uint32_t flags = rd32(flagRec + offsetof(PxgParticleSimBuffer, mFlags));
+                        if (globalThreadIndex < n)
+                        {
+                            const uint32_t ind = offset + globalThreadIndex;
+                            if (ingest)
+                            {
+                                if (flags & 1u)
+                                    std::memcpy(at(uPos + 16u * ind), at(particles + 16u * globalThreadIndex), 16);
+                                if (flags & 2u)
+                                    std::memcpy(at(uVel + 16u * ind), at(velocities + 16u * globalThreadIndex), 16);
+                                if (flags & 4u)
+                                    std::memcpy(at(uPhase + 4u * ind), at(phases + 4u * globalThreadIndex), 4);
+                                if ((flags & 8u) && restPose)
+                                    std::memcpy(at(uRest + 16u * ind), at(restPose + 16u * globalThreadIndex), 16);
+                            }
+                            else
+                            {
+                                std::memcpy(at(particles + 16u * globalThreadIndex), at(uPos + 16u * ind), 16);
+                                std::memcpy(at(velocities + 16u * globalThreadIndex), at(uVel + 16u * ind), 16);
+                            }
+                        }
+                        if (!ingest && globalThreadIndex == 0u && v != GuardVariant::NoFlagsClear)
+                        {
+                            const uint32_t zero = 0u;
+                            std::memcpy(buffer + offsetof(PxgParticleSimBuffer, mFlags), &zero, 4);
+                        }
+                    }
+    }
+
+    // Words differing between two snapshots, printing up to 8 per array when `say`.
+    size_t diff(const std::vector<std::vector<uint8_t>>& want, const std::vector<std::vector<uint8_t>>& got,
+                bool say) const
+    {
+        size_t mm = 0;
+        for (size_t i = 0; i < all.size(); ++i)
+        {
+            size_t here = 0;
+            for (size_t w = 0; w + 4 <= want[i].size(); w += 4)
+                if (std::memcmp(want[i].data() + w, got[i].data() + w, 4) != 0)
+                {
+                    if (say && here < 8)
+                    {
+                        uint32_t a, b;
+                        std::memcpy(&a, got[i].data() + w, 4);
+                        std::memcpy(&b, want[i].data() + w, 4);
+                        std::printf("    %s word %zu: got 0x%08x want 0x%08x\n", names[i].c_str(), w / 4, a, b);
+                    }
+                    ++here;
+                }
+            mm += here;
+        }
+        return mm;
+    }
+
+    // Walks the members, not `all`: build() registers the arrays in `all` only after every
+    // allocation succeeded, so a failure part-way through would leak those already made.
+    void release()
+    {
+        for (GuardSys& s : sys)
+        {
+            for (GuardBuf& b : s.bufs)
+                for (GuardArr* a : { &b.pos, &b.vel, &b.restA, &b.phaseA })
+                    guardFree(dev, *a);
+            for (GuardArr* a : { &s.upos, &s.uvel, &s.uphase, &s.urest, &s.simbuf, &s.runsum })
+                guardFree(dev, *a);
+        }
+        guardFree(dev, desc);
+        guardFree(dev, act);
+        all.clear();
+        names.clear();
+    }
+};
+
+// One launch: build the world, check the oracle can see the four wrong variants (on
+// the L1/E1 layout), run the real kernel on the engine grid, compare every word.
+static void runGuardLaunch(bool ingest, bool emptyS2, const char* tag)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const bool llvmpipe = std::strstr(dev->getDeviceName(), "llvmpipe") != nullptr;
+    const bool identity = guardIdentity(dev);
+    GuardWorld wld;
+    wld.dev = dev;
+    wld.guard = identity && llvmpipe;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        if (wld.guard)
+            std::printf("  NOTE: guard pages active (llvmpipe, device address == host VA)\n");
+        else
+            std::printf("  NOTE: no guard pages (%s) -> bitwise checks only\n",
+                        !identity ? "device addresses are not host VAs here" : "not llvmpipe");
+    }
+    wld.build(emptyS2, !ingest);
+    PXG_CHECK_MSG(wld.ok, "%s: could not allocate the arena", tag);
+    if (!wld.ok)
+    {
+        wld.release();
+        return;
+    }
+    // engine grid: x = ceil(max active / 1024) over EVERY buffer of every system (the
+    // decoy's included), y = max buffer count of any system, z = active systems
+    uint32_t maxActive = 0, maxBufs = 0;
+    for (const GuardSys& s : wld.sys)
+    {
+        maxBufs = std::max<uint32_t>(maxBufs, uint32_t(s.bufs.size()));
+        for (const GuardBuf& b : s.bufs)
+            maxActive = std::max(maxActive, b.active);
+    }
+    const uint32_t gx = (maxActive + 1023u) / 1024u, gy = maxBufs, gz = uint32_t(wld.active.size());
+    PXG_CHECK_MSG(gx == 3u && gy == 3u && gz == 2u, "%s: grid (%u, %u, %u), want (3, 3, 2)", tag, gx, gy, gz);
+
+    const std::vector<std::vector<uint8_t>> before = wld.snapshot();
+    std::vector<std::vector<uint8_t>> want = before;
+    wld.oracle(want, ingest, GuardVariant::None, gx, gy, gz);
+    // The oracle must change something, and must tell every wrong variant from the CUDA.
+    PXG_CHECK_MSG(wld.diff(before, want, false) > 0, "%s: the oracle changes nothing", tag);
+    if (!emptyS2)
+    {
+        const GuardVariant vs[] = { GuardVariant::SysDirect, GuardVariant::FlagsBuf0, GuardVariant::OffsetDrop,
+                                    GuardVariant::NoFlagsClear };
+        const char* vn[] = { "particleId = blockIdx.z", "flags from record 0", "offset dropped", "no mFlags clear" };
+        for (int i = 0; i < 4; ++i)
+        {
+            if (ingest && vs[i] == GuardVariant::NoFlagsClear)
+                continue;   // the ingest has no clear
+            if (!ingest && vs[i] == GuardVariant::FlagsBuf0)
+                continue;   // the egress reads no flags
+            std::vector<std::vector<uint8_t>> alt = before;
+            wld.oracle(alt, ingest, vs[i], gx, gy, gz);
+            PXG_CHECK_MSG(wld.diff(want, alt, false) > 0, "%s: the layout cannot see the wrong variant '%s'", tag,
+                          vn[i]);
+        }
+    }
+
+    struct IngestPush { uint64_t particleSystems, activeParticleSystems; };
+    struct UpdPush { uint64_t particleSystems, activeParticleSystems; uint32_t count; };
+    if (ingest)
+    {
+        Kernel k("particleSim.spv", "ps_updateUnsortedArrayLaunch", {}, sizeof(IngestPush));
+        k.dispatch(gx, {}, IngestPush{ wld.desc.dev, wld.act.dev }, gy, gz);
+    }
+    else
+    {
+        Kernel k("particleSim.spv", "ps_updateUserBufferLaunch", {}, sizeof(UpdPush));
+        k.dispatch(gx, {}, UpdPush{ wld.desc.dev, wld.act.dev, 42u /* the dead launch argument */ }, gy, gz);
+    }
+    dev->flush();
+
+    const std::vector<std::vector<uint8_t>> got = wld.snapshot();
+    size_t words = 0;
+    for (const auto& a : got)
+        words += a.size() / 4;
+    const size_t mm = wld.diff(want, got, true);
+    PXG_CHECK_MSG(mm == 0, "%s: %zu of %zu words differ from the CUDA-literal oracle", tag, mm, words);
+    std::printf("  %s: grid (%u, %u, %u), %zu words compared, %zu differ%s\n", tag, gx, gy, gz, words, mm,
+                wld.guard ? ", 0 faults" : "");
+    wld.release();
+}
+
+PXG_TEST(particleSimIngestGuard)
+{
+    runGuardLaunch(true, false, "L1 ingest");
+    runGuardLaunch(true, true, "L2 ingest, active system with no buffers");
+}
+
+PXG_TEST(particleSimUpdateBufferGuard)
+{
+    runGuardLaunch(false, false, "E1 egress");
+    runGuardLaunch(false, true, "E2 egress, active system with no buffers");
 }
 
 }  // namespace

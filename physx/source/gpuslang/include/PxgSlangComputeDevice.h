@@ -276,12 +276,14 @@ public:
     { return 0; }
 
     // Like createPipeline, but the kernel additionally declares the bindless
-    // set at descriptor set 1 (`Texture3D<float> gPxgTex3D[]` at binding 0 --
-    // see shaders/pxgSlangTex3d.slang; binding 1, the shared sampler, is still
-    // in the layout but reserved and unused since P9.96, when pxgTex3D moved to
-    // texel loads).  Kernels that do not sample must keep
-    // using createPipeline: a pipeline layout that declares a set it never
-    // reads costs a bind per dispatch for nothing.
+    // set at descriptor set 1, which has ONE binding since P9.97:
+    // `Texture3D<float> gPxgTex3D[]` at binding 0 (shaders/pxgSlangTex3d.slang;
+    // pxgTex3D fetches texels, so there is no sampler).  A module that declares
+    // anything else in set 1, or any set above 1, or a sampler type, is REFUSED
+    // (returns 0, reason on stderr; pxgSpirvFitsBindlessLayout / pxgSpirvDeclaresSampler)
+    // -- llvmpipe would not refuse it.  Kernels
+    // that do not sample must keep using createPipeline: a pipeline layout that
+    // declares a set it never reads costs a bind per dispatch for nothing.
     virtual PxgPipelineHandle createPipelineBindless(const void* /*code*/, size_t /*codeSize*/,
                                                      const char* /*entryName*/, uint32_t /*numBuffers*/,
                                                      const uint32_t* /*bufferStrides*/,
@@ -300,7 +302,50 @@ public:
                              uint32_t /*gridZ*/, const PxgBufferHandle* /*buffers*/, uint32_t /*numBuffers*/,
                              const PxgTextureHandle* /*textures*/, uint32_t /*numTextures*/,
                              const void* /*pushConstants*/, uint32_t /*pushConstantSize*/) {}
+
+    // ---- P9.97 diagnostics -- APPENDED, so every existing vtable slot keeps its index ----
+
+    // P9.97: the bindless set AS HANDED TO THE DRIVER -- diagnostic only, for the
+    // fixture that pins it (shimBindless_setLayout).  The Vulkan device records it
+    // at its vkCreateDescriptorSetLayout / vkCreateDescriptorPool call sites from
+    // the very create-infos it passes (the binding flags from the pNext chain), so a
+    // binding added to those arrays shows up here.  Raw Vulkan enum values; all
+    // zero when the device has no bindless set.
+    struct BindlessSetInfo
+    {
+        static const uint32_t kMax = 4;
+        uint32_t layoutFlags = 0;
+        uint32_t bindingCount = 0;       // entries beyond kMax are counted, not copied
+        uint32_t bindingFlagsCount = 0;  // VkDescriptorSetLayoutBindingFlagsCreateInfo::bindingCount
+        uint32_t binding[kMax] = {}, descriptorType[kMax] = {}, descriptorCount[kMax] = {},
+                 stageFlags[kMax] = {}, bindingFlags[kMax] = {};
+        uint32_t poolFlags = 0, poolMaxSets = 0, poolSizeCount = 0;
+        uint32_t poolType[kMax] = {}, poolCount[kMax] = {};
+    };
+    virtual BindlessSetInfo bindlessSetInfo() const { return BindlessSetInfo(); }
+
+    // P9.97: VkSamplers this device owns right now (created minus destroyed through
+    // its own two helpers).  Diagnostic only.  Since P9.97 the only owner is a
+    // createTexture3D texture (set 0, the P2 probe); a bindless texture owns none.
+    virtual uint32_t liveSamplerCount() const { return 0; }
 };
+
+// P9.97: does the module's use of descriptor sets >= 1 fit the bindless set -- set 1 with
+// binding 0 only, nothing in set 2 or above?  MODULE-WIDE: every variable decorated
+// DescriptorSet counts, used by the entry or not.  NOT checked: set 0 (the caller's
+// numBuffers storage buffers) and descriptor TYPES -- pxgSpirvDeclaresSampler covers the
+// sampler case.  OpDecorate only (slangc emits no decoration groups / OpDecorateId;
+// P9.97 scan of all 471 .spv).  On false, *badSet / *badBinding (either may be null)
+// name an offending variable (binding ~0u = no Binding decoration); a blob that is not
+// a well-formed SPIR-V word stream does not fit either (both ~0u).  Defined by the
+// Vulkan backend.
+bool pxgSpirvFitsBindlessLayout(const void* code, size_t codeSize, uint32_t* badSet, uint32_t* badBinding);
+
+// P9.97: true when the module declares a sampler type (OpTypeSampler / OpTypeSampledImage),
+// i.e. could sample in hardware.  The bindless path never does since P9.96, and
+// createPipelineBindless refuses such a module.  False for a malformed blob (the layout
+// check refuses that one).
+bool pxgSpirvDeclaresSampler(const void* code, size_t codeSize);
 
 // Factory functions; each returns NULL when the backend is unavailable.
 PxgSlangComputeDevice* PxgCreateVulkanComputeDevice(const PxgSlangDeviceDesc& desc);

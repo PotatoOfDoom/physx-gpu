@@ -62,7 +62,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -288,8 +290,9 @@ PXG_TEST(shimBindless_classify)
         { "npSdfCollision.spv", "sdfCollTetClamp", 1u, false },
         { "npTriTriBlock.spv", "ttbProbe", 1u, false },         // a module with no descriptor set at all
         // The SET number is what is asked, not "any descriptor": npTex3d's
-        // createPipelineTex-style texture lives in set 0 (with a Binding 1 on its
-        // sampler, so a test that read the wrong decoration word would say yes).
+        // createPipelineTex-style texture lives in set 0, and its gOut buffer carries
+        // Binding 1 (the sampler is at binding 3), so a test that read the wrong
+        // decoration word would say yes.
         { "npTex3d.spv", "tex3dSample", 1u, false },
         { "npTex3d.spv", "tex3dSample", 0u, true },
         { "npTex3dBindless.spv", "tex3dBindlessSample", 0u, false },
@@ -369,4 +372,287 @@ PXG_TEST(shimBindless_classify)
     std::printf("  shimBindless_classify: %zu mapped engine rows over %zu modules; %zu use set 1 "
                 "(the 5 SDF kernels); %zu per-entry cases\n",
                 mapped, blobs.size(), sampling.size(), sizeof(cases) / sizeof(cases[0]));
+}
+
+// ---------------------------------------------------------------------------
+// P9.97: the bindless set has ONE binding, and no VkSampler stands behind it.
+// ---------------------------------------------------------------------------
+// P9.12a's set carried a shared LINEAR/CLAMP sampler at binding 1.  P9.96 moved
+// pxgTex3D to texel loads and no module has declared that sampler since (scan of
+// all 471 .spv); P9.97 removed it from the layout, the pool and the device.  Three
+// things are pinned here, each against LITERAL values (raw Vulkan enum numbers, so
+// an edit to a shared header cannot move both sides):
+//   1. the set as handed to the driver: ONE binding {0, SAMPLED_IMAGE, 4096,
+//      COMPUTE, PARTIALLY_BOUND|UPDATE_AFTER_BIND}, layout flag
+//      UPDATE_AFTER_BIND_POOL, ONE pool size {SAMPLED_IMAGE, 4096}, maxSets 1, pool
+//      flag UPDATE_AFTER_BIND -- and no SAMPLER anywhere;
+//   2. sampler ownership, on a PRIVATE device so the count is absolute: none after
+//      init, none for a bindless texture, exactly one for a set-0 createTexture3D
+//      texture (the P2 probe's path, which still samples in hardware), none after
+//      it is destroyed;
+//   3. the door refuses a module the layout cannot hold.  MEASURED (P9.97 scratch
+//      probe) why that is not left to the driver: llvmpipe builds a pipeline whose
+//      module declares a SamplerState at (1, 1) against the one-binding layout, then
+//      samples through whichever VkSampler the process happens to own -- or
+//      segfaults at dispatch when it owns none.  The refused modules here are
+//      npTex3dBindless.spv with its image array's Binding rewritten 0 -> 1 (the old
+//      sampler slot) or its DescriptorSet 1 -> 2.  They are never dispatched.
+
+// npTex3dBindless.spv with ONE decoration of the variable decorated DescriptorSet 1
+// rewritten: its `decoration` (33 Binding / 34 DescriptorSet) gets the literal
+// `value`, and -- when newKind != decoration -- becomes decoration `newKind` (35
+// Offset: the variable then has no Binding at all).  Empty if the blob does not
+// have exactly one such variable and one such decoration on it.
+static std::vector<uint8_t> repatchSetOneVar(std::vector<uint8_t> b, uint32_t decoration, uint32_t value,
+                                             uint32_t newKind = ~0u)
+{
+    if (b.size() < 20 || (b.size() & 3u) != 0)
+        return {};
+    std::vector<uint32_t> w(b.size() / 4);
+    std::memcpy(w.data(), b.data(), b.size());
+    uint32_t target = 0, targets = 0;
+    for (size_t i = 5; i < w.size();)
+    {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > w.size())
+            return {};
+        if (op == 71u && wc >= 4u && w[i + 2] == 34u && w[i + 3] == 1u)
+        {
+            target = w[i + 1];
+            ++targets;
+        }
+        i += wc;
+    }
+    size_t hits = 0;
+    for (size_t i = 5; i < w.size(); i += w[i] >> 16)
+        if ((w[i] & 0xFFFFu) == 71u && (w[i] >> 16) >= 4u && w[i + 1] == target && w[i + 2] == decoration)
+        {
+            w[i + 3] = value;
+            if (newKind != ~0u)
+                w[i + 2] = newKind;
+            ++hits;
+        }
+    if (targets != 1 || hits != 1)
+        return {};
+    std::memcpy(b.data(), w.data(), b.size());
+    return b;
+}
+
+PXG_TEST(shimBindless_setLayout)
+{
+    using physx::gpuslang::pxgSpirvFitsBindlessLayout;
+    using physx::gpuslang::pxgSpirvDeclaresSampler;
+    PxgSlangComputeDevice* shared = testDevice();
+    const bool llvmpipe = std::strstr(shared->getDeviceName(), "llvmpipe") != nullptr;
+    if (!shared->supportsBindlessTextures())
+    {
+        // llvmpipe has all five descriptor-indexing features (measured since P9.12a):
+        // there a missing set is a FAILURE -- e.g. a layout its pool cannot allocate
+        // -- never a skip that would silence every bindless fixture.
+        PXG_CHECK_MSG(!llvmpipe, "shimBindless_setLayout: llvmpipe has no bindless set");
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+
+    // ---- 1. the set as created ----
+    const PxgSlangComputeDevice::BindlessSetInfo s = shared->bindlessSetInfo();
+    PXG_CHECK_MSG(s.bindingCount == 1u && s.bindingFlagsCount == 1u,
+                  "shimBindless_setLayout: %u binding(s), %u flag word(s); want exactly 1 (the image array)",
+                  s.bindingCount, s.bindingFlagsCount);
+    PXG_CHECK_MSG(s.binding[0] == 0u && s.descriptorType[0] == 2u /* SAMPLED_IMAGE */ &&
+                  s.descriptorCount[0] == 4096u && s.stageFlags[0] == 0x20u /* COMPUTE */ &&
+                  s.bindingFlags[0] == 0x5u /* PARTIALLY_BOUND | UPDATE_AFTER_BIND */,
+                  "shimBindless_setLayout: binding {%u, type %u, n %u, stages 0x%x, flags 0x%x}; want "
+                  "{0, 2, 4096, 0x20, 0x5}", s.binding[0], s.descriptorType[0], s.descriptorCount[0],
+                  s.stageFlags[0], s.bindingFlags[0]);
+    PXG_CHECK_MSG(s.layoutFlags == 0x2u /* UPDATE_AFTER_BIND_POOL */,
+                  "shimBindless_setLayout: layout flags 0x%x, want 0x2", s.layoutFlags);
+    PXG_CHECK_MSG(s.poolSizeCount == 1u && s.poolType[0] == 2u && s.poolCount[0] == 4096u &&
+                  s.poolMaxSets == 1u && s.poolFlags == 0x2u /* UPDATE_AFTER_BIND */,
+                  "shimBindless_setLayout: pool {%u size(s), first {type %u, n %u}, maxSets %u, flags 0x%x}; "
+                  "want {1, {2, 4096}, 1, 0x2}", s.poolSizeCount, s.poolType[0], s.poolCount[0],
+                  s.poolMaxSets, s.poolFlags);
+    size_t samplerSlots = 0;
+    for (uint32_t i = 0; i < s.bindingCount && i < PxgSlangComputeDevice::BindlessSetInfo::kMax; ++i)
+        samplerSlots += s.descriptorType[i] == 0u /* SAMPLER */ ? 1 : 0;
+    for (uint32_t i = 0; i < s.poolSizeCount && i < PxgSlangComputeDevice::BindlessSetInfo::kMax; ++i)
+        samplerSlots += s.poolType[i] == 0u ? 1 : 0;
+    PXG_CHECK_MSG(samplerSlots == 0, "shimBindless_setLayout: %zu SAMPLER entries in the bindless layout/pool",
+                  samplerSlots);
+
+    // ---- 2. sampler ownership, on a private device ----
+    {
+        PxgSlangDeviceDesc desc;
+        const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
+        desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
+        const char* v2 = std::getenv("PXG_DEVICE_V2");
+        desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+        std::unique_ptr<PxgSlangComputeDevice> dev(physx::gpuslang::PxgCreateVulkanComputeDevice(desc));
+        PXG_CHECK_MSG(dev && dev->supportsBindlessTextures(),
+                      "shimBindless_setLayout: a second device with a bindless set could not be created");
+        if (dev && dev->supportsBindlessTextures())
+        {
+            const float texels[8] = { 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f };
+            const uint32_t c0 = dev->liveSamplerCount();
+            const PxgTextureHandle tb = dev->createTexture3DFmt(
+                2, 2, 2, PxgSlangComputeDevice::TextureFormat::R32Float, texels);
+            const uint32_t c1 = dev->liveSamplerCount();
+            const PxgTextureHandle tp = dev->createTexture3D(2, 2, 2, texels);
+            const uint32_t c2 = dev->liveSamplerCount();
+            dev->destroyTexture3D(tp);
+            const uint32_t c3 = dev->liveSamplerCount();
+            dev->destroyTexture3D(tb);
+            const uint32_t c4 = dev->liveSamplerCount();
+            PXG_CHECK_MSG(tb != 0 && tp != 0, "shimBindless_setLayout: texture creation failed (%u, %u)",
+                          unsigned(tb), unsigned(tp));
+            PXG_CHECK_MSG(c0 == 0u && c1 == 0u && c2 == 1u && c3 == 0u && c4 == 0u,
+                          "shimBindless_setLayout: live samplers init/+bindless/+bound/-bound/-bindless = "
+                          "%u/%u/%u/%u/%u; want 0/0/1/0/0", c0, c1, c2, c3, c4);
+        }
+    }
+
+    // ---- 3. the door ----
+    // Every module the build has fits the LAYOUT check: the manifest's .spv plus the
+    // fixture modules that declare set 1, and npTex3d (its sampler lives in set 0, which
+    // the layout check does not look at -- the sampler check below refuses it).
+    using physx::gpuslang::gPxgSlangKernelManifest;
+    using physx::gpuslang::PXG_SLANG_KERNEL_COUNT;
+    std::set<std::string> files = { "npTex3dBindless.spv", "npSdfTexture.spv", "npSdfCollision.spv",
+                                    "npSdfFind.spv", "npSdfParticle.spv", "npTex3d.spv" };
+    for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
+        if (gPxgSlangKernelManifest[i].spirvFile)
+            files.insert(gPxgSlangKernelManifest[i].spirvFile);
+    size_t refusedReal = 0, unloadable = 0;
+    for (const std::string& f : files)
+    {
+        const std::vector<uint8_t> b = loadShaderBlob(f.c_str());
+        if (b.empty())
+        {
+            ++unloadable;
+            continue;
+        }
+        uint32_t bs = 0, bb = 0;
+        if (!pxgSpirvFitsBindlessLayout(b.data(), b.size(), &bs, &bb))
+        {
+            std::printf("  refused a real module: %s (set %u binding %u)\n", f.c_str(), bs, bb);
+            ++refusedReal;
+        }
+    }
+    PXG_CHECK_MSG(unloadable == 0 && refusedReal == 0,
+                  "shimBindless_setLayout: %zu of %zu modules refused, %zu not loadable", refusedReal,
+                  files.size(), unloadable);
+
+    const std::vector<uint8_t> real = loadShaderBlob("npTex3dBindless.spv");
+    const std::vector<uint8_t> atB1 = repatchSetOneVar(real, 33u, 1u);   // Binding 0 -> 1
+    const std::vector<uint8_t> atS2 = repatchSetOneVar(real, 34u, 2u);   // DescriptorSet 1 -> 2
+    const std::vector<uint8_t> noBnd = repatchSetOneVar(real, 33u, 0u, 35u); // no Binding decoration
+    PXG_CHECK_MSG(!atB1.empty() && !atS2.empty() && !noBnd.empty(),
+                  "shimBindless_setLayout: could not build the patched blobs");
+    uint32_t badSetB1 = 0, badBindingB1 = 0, badSetS2 = 0, badBindingS2 = 0;
+    const bool fitsB1 = pxgSpirvFitsBindlessLayout(atB1.data(), atB1.size(), &badSetB1, &badBindingB1);
+    const bool fitsS2 = pxgSpirvFitsBindlessLayout(atS2.data(), atS2.size(), &badSetS2, &badBindingS2);
+    PXG_CHECK_MSG(!fitsB1 && badSetB1 == 1u && badBindingB1 == 1u,
+                  "shimBindless_setLayout: image array at (1, 1) -> fits %d, reported (%u, %u); want refused "
+                  "at (1, 1)", int(fitsB1), badSetB1, badBindingB1);
+    PXG_CHECK_MSG(!fitsS2 && badSetS2 == 2u && badBindingS2 == 0u,
+                  "shimBindless_setLayout: image array at (2, 0) -> fits %d, reported (%u, %u); want refused "
+                  "at (2, 0)", int(fitsS2), badSetS2, badBindingS2);
+
+    // A set-1 variable with no Binding is not "binding 0" (Vulkan requires the
+    // decoration; the guard does not guess).
+    uint32_t badSetNB = 0, badBindingNB = 0;
+    const bool fitsNB = pxgSpirvFitsBindlessLayout(noBnd.data(), noBnd.size(), &badSetNB, &badBindingNB);
+    PXG_CHECK_MSG(!fitsNB && badSetNB == 1u && badBindingNB == ~0u,
+                  "shimBindless_setLayout: set-1 variable without Binding -> fits %d, reported (%u, 0x%x)",
+                  int(fitsNB), badSetNB, badBindingNB);
+
+    // Malformed word streams do not fit: an instruction running past the end, a wrong magic.
+    const uint32_t overrun[6] = { 0x07230203u, 0x00010500u, 0u, 100u, 0u, (10u << 16) | 71u };
+    std::vector<uint8_t> badMagic = real;
+    if (!badMagic.empty())
+        badMagic[0] ^= 0xFFu;
+    PXG_CHECK_MSG(!pxgSpirvFitsBindlessLayout(overrun, sizeof(overrun), nullptr, nullptr) &&
+                  !pxgSpirvFitsBindlessLayout(badMagic.data(), badMagic.size(), nullptr, nullptr),
+                  "shimBindless_setLayout: a malformed blob must not fit");
+    // ...nor does a blob whose size is not a whole number of words (copying it word-wise
+    // would read past its end), nor one shorter than the 5-word header even with a valid
+    // magic.  Both report (~0u, ~0u): "not a word stream", not a set/binding.
+    std::vector<uint8_t> plusOne = real;
+    plusOne.push_back(0u);
+    const std::vector<uint8_t> head16(real.begin(), real.begin() + (real.size() >= 16 ? 16 : real.size()));
+    uint32_t bsP1 = 0, bbP1 = 0, bs16 = 0, bb16 = 0;
+    const bool fitsP1 = pxgSpirvFitsBindlessLayout(plusOne.data(), plusOne.size(), &bsP1, &bbP1);
+    const bool fits16 = pxgSpirvFitsBindlessLayout(head16.data(), head16.size(), &bs16, &bb16);
+    PXG_CHECK_MSG(!fitsP1 && bsP1 == ~0u && bbP1 == ~0u && !fits16 && bs16 == ~0u && bb16 == ~0u,
+                  "shimBindless_setLayout: real+1 byte -> fits %d (%u, %u); first 16 bytes -> fits %d (%u, %u); "
+                  "want both refused as (~0u, ~0u)", int(fitsP1), bsP1, bbP1, int(fits16), bs16, bb16);
+
+    // ---- 3c. no hardware sampling through this door (the P9.96 policy) ----
+    // Among every module the build has, exactly npTex3d.spv declares a sampler type --
+    // the set-0 P2 probe, which goes through createPipelineTex, never through here.
+    size_t declSampler = 0;
+    bool tex3dDeclares = false;
+    for (const std::string& f : files)
+    {
+        const std::vector<uint8_t> b = loadShaderBlob(f.c_str());
+        if (pxgSpirvDeclaresSampler(b.data(), b.size()))
+        {
+            ++declSampler;
+            if (f == "npTex3d.spv")
+                tex3dDeclares = true;
+            else
+                std::printf("  declares a sampler type: %s\n", f.c_str());
+        }
+    }
+    PXG_CHECK_MSG(declSampler == 1 && tex3dDeclares,
+                  "shimBindless_setLayout: %zu module(s) declare a sampler type (npTex3d.spv among them: %d); "
+                  "want exactly npTex3d.spv", declSampler, int(tex3dDeclares));
+    // Synthetic words after a valid 5-word header: OpTypeSampler %9 / OpTypeSampledImage
+    // %9 %8 declare one; an OpDecorate does not; an instruction overrunning the end is
+    // malformed and reads as "no".
+    auto synth = [](std::initializer_list<uint32_t> tail) {
+        std::vector<uint32_t> w = { 0x07230203u, 0x00010500u, 0u, 100u, 0u };
+        w.insert(w.end(), tail);
+        return w;
+    };
+    const std::vector<uint32_t> sy26 = synth({ (2u << 16) | 26u, 9u });
+    const std::vector<uint32_t> sy27 = synth({ (3u << 16) | 27u, 9u, 8u });
+    const std::vector<uint32_t> sy71 = synth({ (4u << 16) | 71u, 9u, 33u, 0u });
+    const std::vector<uint32_t> syOv = synth({ (10u << 16) | 26u });
+    const bool d26 = pxgSpirvDeclaresSampler(sy26.data(), sy26.size() * 4);
+    const bool d27 = pxgSpirvDeclaresSampler(sy27.data(), sy27.size() * 4);
+    const bool d71 = pxgSpirvDeclaresSampler(sy71.data(), sy71.size() * 4);
+    const bool dOv = pxgSpirvDeclaresSampler(syOv.data(), syOv.size() * 4);
+    PXG_CHECK_MSG(d26 && d27 && !d71 && !dOv,
+                  "shimBindless_setLayout: declaresSampler(OpTypeSampler, OpTypeSampledImage, OpDecorate, overrun) "
+                  "= %d %d %d %d; want 1 1 0 0", int(d26), int(d27), int(d71), int(dOv));
+    // ...and the door refuses the real sampling module (never dispatched).
+    {
+        const std::vector<uint8_t> t3 = loadShaderBlob("npTex3d.spv");
+        const uint32_t t3Strides[2] = { 16, 4 };
+        const PxgPipelineHandle pT3 = shared->createPipelineBindless(t3.data(), t3.size(), "tex3dSample", 2,
+                                                                     t3Strides, 16u);
+        PXG_CHECK_MSG(pT3 == 0, "shimBindless_setLayout: createPipelineBindless(npTex3d.spv) gave %u; want 0 "
+                      "(it declares a sampler)", unsigned(pT3));
+        if (pT3)
+            shared->destroyPipeline(pT3);
+    }
+
+    // ...and the DOOR applies it: the patched module gets no pipeline, the real one does.
+    // (Never dispatched: a pipeline built from atB1 is exactly the measured hazard.)
+    const PxgPipelineHandle pBad = shared->createPipelineBindless(atB1.data(), atB1.size(), "tex3dBindlessLoad",
+                                                                  0, nullptr, uint32_t(sizeof(ShimTxbParams)));
+    const PxgPipelineHandle pOk = shared->createPipelineBindless(real.data(), real.size(), "tex3dBindlessLoad",
+                                                                 0, nullptr, uint32_t(sizeof(ShimTxbParams)));
+    PXG_CHECK_MSG(pBad == 0 && pOk != 0,
+                  "shimBindless_setLayout: createPipelineBindless gave %u for the (1, 1) module (want 0) and "
+                  "%u for the real one (want != 0)", unsigned(pBad), unsigned(pOk));
+    if (pBad)
+        shared->destroyPipeline(pBad);
+    if (pOk)
+        shared->destroyPipeline(pOk);
+
+    std::printf("  shimBindless_setLayout: 1 binding {0, SAMPLED_IMAGE, 4096}, 0 sampler slots; samplers "
+                "0/0/1/0/0; %zu modules fit, (1,1) and (2,0) refused; only npTex3d declares a sampler\n",
+                files.size());
 }

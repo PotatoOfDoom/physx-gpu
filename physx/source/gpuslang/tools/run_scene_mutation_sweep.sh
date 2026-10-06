@@ -36,9 +36,12 @@
 # Use \n for newlines.  A non-unique or missing anchor is ANCHOR-FAIL and counts as
 # untested, never as a kill.
 #
-# Environment: SCENE_SWEEP_TIMEOUT (default 900s -- a scene is minutes, not
-# seconds, so this is far above the fixture runner's 300), plus any PXG_* the
-# scene itself takes, which are passed through.
+# Environment: plus any PXG_* the scene itself takes, which are passed through.
+# THE PER-RUN BOUND (P9.97; policy in sweep_timeout.sh): unless SCENE_SWEEP_TIMEOUT
+# is set, the clean scene is timed (bounded by SCENE_SWEEP_BASELINE_TIMEOUT, default
+# 3600 s) and every later run is bounded by max(SCENE_SWEEP_TIMEOUT_FLOOR (900),
+# SCENE_SWEEP_TIMEOUT_FACTOR (3) x baseline) -- 900 s, as before, for any scene up to
+# 300 s.  SCENE_SWEEP_TIMEOUT=<s> fixes the bound for every run, as before.
 
 set -u
 
@@ -59,6 +62,8 @@ BAK="$(mktemp)"
 [ -d "$BUILD" ] || { echo "no build tree: $BUILD" >&2; exit 2; }
 [ -x "$SDK/gpu-sdk-step" ] || { echo "no gpu-sdk-step in $SDK" >&2; exit 2; }
 [ -f "$MUTANTS" ] || { echo "no mutants file: $MUTANTS" >&2; exit 2; }
+. "$ROOT/physx/source/gpuslang/tools/sweep_timeout.sh"
+sweep_init SCENE_SWEEP 900 || { rm -f "$BAK"; exit 2; }
 
 cp "$SRC" "$BAK"
 
@@ -70,12 +75,11 @@ restore() { cp "$BAK" "$SRC"; rebuild; }
 
 trap 'echo; echo "!! interrupted -- restoring pristine source and .spv"; restore; rm -f "$BAK"; exit 130' INT TERM
 
-: "${SCENE_SWEEP_TIMEOUT:=900}"
-TIMEOUT_RC=124
+TIMEOUT_RC=124   # what sweep_run_bounded returns whenever the bound (SWEEP_TMO) expired
 
 run_scene() {
-    ( cd "$SDK" && PXG_SHADER_DIR="$BUILD/shaders" PXG_SCENE="$SCENE" PXG_GPU_STEP=1 \
-        timeout -k 10 "$SCENE_SWEEP_TIMEOUT" ./gpu-sdk-step 2>&1 )
+    ( cd "$SDK" && export PXG_SHADER_DIR="$BUILD/shaders" PXG_SCENE="$SCENE" PXG_GPU_STEP=1 \
+        && sweep_run_bounded ./gpu-sdk-step 2>&1 )
 }
 
 # The three verdict shapes, in the order they must be tested.  "no verdict" is
@@ -108,21 +112,24 @@ scene_verdict() {   # stdin: the run's output -> echoes green|red|silent
 # so a crash is retried and only an all-attempts-crash is reported as a fault.
 : "${SCENE_SWEEP_FAULT_RETRIES:=2}"
 
+run_scene_timed() {
+    _t0=$(date +%s); SCENE_OUT=$(run_scene); SCENE_RC=$?; SCENE_SECS=$(( $(date +%s) - _t0 ))
+}
 run_scene_tolerant() {
     SCENE_TRIES=1
-    SCENE_OUT=$(run_scene); SCENE_RC=$?
+    run_scene_timed
     while [ $SCENE_RC -ge 128 ] && [ $SCENE_RC -ne $TIMEOUT_RC ] \
           && [ $SCENE_TRIES -le $SCENE_SWEEP_FAULT_RETRIES ]; do
         SCENE_TRIES=$((SCENE_TRIES+1))
-        SCENE_OUT=$(run_scene); SCENE_RC=$?
+        run_scene_timed
     done
 }
 
 restore
 run_scene_tolerant
 if [ $SCENE_RC -eq $TIMEOUT_RC ]; then
-    echo "!! the CLEAN scene exceeded SCENE_SWEEP_TIMEOUT=${SCENE_SWEEP_TIMEOUT}s;" >&2
-    echo "   raise it or every mutant will be reported as a hang" >&2
+    echo "!! the CLEAN scene exceeded ${SWEEP_TMO_KNOB}=${SWEEP_TMO}s;" >&2
+    echo "   raise it${SWEEP_FIXED:+ (or unset it to derive the bound)} -- every mutant would be reported as a hang" >&2
     rm -f "$BAK"; exit 1
 fi
 if [ "$(scene_verdict "$SCENE_OUT")" != "green" ]; then
@@ -130,6 +137,8 @@ if [ "$(scene_verdict "$SCENE_OUT")" != "green" ]; then
     echo "$SCENE_OUT" | grep -viE "Could not find CUDA module" | tail -8
     rm -f "$BAK"; exit 1
 fi
+sweep_set_bound "$SCENE_SECS"
+echo "baseline green in ${SWEEP_BASE_SECS}s; every run below is bounded by ${SWEEP_TMO}s ($SWEEP_TMO_HOW)"
 echo "baseline green; sweeping $SRCSTEM (via $STEM.spv) against scene '$SCENE'"
 
 killed=0; faulted=0; hung=0; silent=0; survived=0; nocompile=0; anchorfail=0
@@ -164,7 +173,7 @@ PY
 
     run_scene_tolerant
     if [ $SCENE_RC -eq $TIMEOUT_RC ]; then
-        printf '  %-40s KILLED-HANG\n' "$name"
+        printf '  %-40s KILLED-HANG (exceeded %ss; baseline %ss)\n' "$name" "$SWEEP_TMO" "$SWEEP_BASE_SECS"
         hung=$((hung+1))
     elif [ $SCENE_RC -ge 128 ]; then
         printf '  %-40s KILLED-FAULT (%d tries)\n' "$name" "$SCENE_TRIES"
@@ -180,6 +189,11 @@ done < "$MUTANTS"
 
 restore
 run_scene_tolerant
+if [ $SCENE_RC -eq $TIMEOUT_RC ]; then
+    echo "!! the RESTORED scene did not finish inside ${SWEEP_TMO}s (first baseline ${SWEEP_BASE_SECS}s) --" >&2
+    echo "   slower machine or unclean tree; run the scene by hand before trusting this sweep" >&2
+    rm -f "$BAK"; exit 1
+fi
 if [ "$(scene_verdict "$SCENE_OUT")" != "green" ]; then
     echo "!! the RESTORED tree is not green -- the sweep left something behind" >&2
     rm -f "$BAK"; exit 1
