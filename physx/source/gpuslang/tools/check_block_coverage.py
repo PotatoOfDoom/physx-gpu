@@ -60,9 +60,10 @@
 #   4. PASS if the GRID IS NOT SIZED FROM THE BLOCK (grid_from_block below).  One
 #      block per object is the common shape and there the group width is parallelism,
 #      not coverage;
-#   5. PASS if the port carries a covering construct (check_grid_stride.slang_covers:
-#      WorkgroupCount(), a named stride in a for-increment, or a counted loop whose
-#      variable scales a named product);
+#   5. PASS if the port carries a covering construct (grid_covers below:
+#      WorkgroupCount(), a named stride in a for-increment WHOSE INIT CLAUSE IS ROOTED
+#      IN SV_GroupID / SV_DispatchThreadID / WorkgroupCount (P9.97a), or a counted
+#      loop whose variable scales a named product);
 #   6. PASS if the port PARTITIONS THE BLOCK SERIALLY (serial_factor below) by enough:
 #      slangThreads * tripCount >= cudaBlock;
 #   7. otherwise FAIL, reporting the ratio.
@@ -106,6 +107,21 @@
 #    some configuration and are read normally.
 #  * IT SAYS NOTHING ABOUT WHETHER A STRIDE IS CORRECT, only that one is present --
 #    the same honest limit check_grid_stride.py states about itself.
+#  * A NAMED INCREMENT IS NOT A STRIDE (P9.97a).  Up to P9.97 rule 5 accepted ANY
+#    `for (...; ...; x += name)`, which is check_grid_stride.slang_covers' marker.
+#    initializeSolverVelocitiesTGS, computeAverageSolverBodyVelocityTGS and
+#    propagateAverageSolverBodyVelocityTGS all carry
+#        for (uint b = threadIdInWorkUnit; b < numSlabs; b += numThreadsPerBody)
+#    -- the loop over ONE body's slabs, not a grid stride -- and passed on it while
+#    running [numthreads(32,1,1)] against the engine's (32, 8) block: one eighth of
+#    the CUDA's warps, i.e. 1/2 .. 1/8 of the bodies for numSlabs >= 5 and 1/8 of the
+#    velocity-iteration propagate at any numSlabs, measured in the engine as a
+#    frozen hub (PXG_SCENE=slabgrid).  A grid-stride loop STARTS at a global index, so
+#    grid_covers() now requires the init clause of a named-increment loop to be rooted
+#    (through at most three local assignments) in a parameter declared SV_GroupID or
+#    SV_DispatchThreadID, or in WorkgroupCount().  On the unfixed tree the tightened
+#    rule flagged exactly those three kernels and nothing else among the mapped ones.
+#    What it still cannot decide: a rooted init with a stride of the wrong size.
 #
 #  * FIXED-GRID LAUNCHES ARE A DIFFERENT CLASS AND ARE NOT CHECKED HERE.  When the
 #    host launches a constant grid, CUDA reaches grid*cudaBlock threads and the port
@@ -425,14 +441,19 @@ def slang_val(scope, expr, depth=0):
     return None
 
 
-def slang_entries():
-    """(shader stem, entry) -> (threadProduct or None, fileText, bodyOffset, constScope)."""
+def slang_entries(mutate=None):
+    """(shader stem, entry) -> (threadProduct or None, fileText, bodyOffset, constScope).
+
+    `mutate(fileName, text)`, when given, rewrites a file's text in memory first
+    (the selftest's hook)."""
     out = {}
     for fn in sorted(os.listdir(SHADERS)):
         if not fn.endswith(".slang"):
             continue
-        text = cgs.strip_comments(open(os.path.join(SHADERS, fn),
-                                       encoding="utf-8", errors="replace").read())
+        raw = open(os.path.join(SHADERS, fn), encoding="utf-8", errors="replace").read()
+        if mutate is not None:
+            raw = mutate(fn, raw)
+        text = cgs.strip_comments(raw)
         scope = {}
         for mod in SLANG_IMPORT.findall(text):          # one level of imports
             mpath = os.path.join(SHADERS, mod + ".slang")
@@ -513,6 +534,66 @@ def serial_factor(text, body, val):
     return best
 
 
+SV_GRID = re.compile(r"\b(\w+)\s*:\s*SV_(?:GroupID|DispatchThreadID)\b")
+
+
+def entry_sig(text, off):
+    """The parameter list of the entry whose `name(` ends at `off`."""
+    i = text.find("{", off)
+    return text[off:i] if i >= 0 else ""
+
+
+def sv_rooted(body, sig, expr, depth=0):
+    """True if `expr` is rooted in a grid-wide system value.
+
+    A grid-stride loop starts at the GLOBAL index -- gid.x * W + lane, or the
+    dispatch-thread id -- and steps by the grid.  An intra-item loop starts at a
+    lane-in-work-unit and steps by the work unit.  Both are `x += name`; only the
+    start tells them apart.  Local assignments are followed up to three levels
+    (`warpIndex = gid.x * 8 + gtid.y; bodyId = warpIndex * bpw + ...; i = bodyId`)."""
+    if re.search(r"WorkgroupCount\s*\(", expr):
+        return True
+    for n in SV_GRID.findall(sig):
+        if re.search(r"\b" + re.escape(n) + r"\b", expr):
+            return True
+    if depth >= 3:
+        return False
+    for ident in set(re.findall(r"\b[A-Za-z_]\w*\b", expr)):
+        for m in re.finditer(r"\b" + re.escape(ident) + r"\s*=\s*([^;=][^;]*);", body):
+            if sv_rooted(body, sig, m.group(1), depth + 1):
+                return True
+    return False
+
+
+def grid_covers(text, body, sig):
+    """Rule 5: the port carries a construct that covers the whole grid's work.
+
+    check_grid_stride.slang_covers() minus its blind spot (see the header's P9.97a
+    note): a named-increment `for` counts only when its init clause is sv_rooted.
+    The one level of same-file helpers is kept for WorkgroupCount() and counted
+    loops; a helper's named-increment loop starts at a PARAMETER, which nothing
+    here can root, so it is not accepted."""
+    if cgs.SLANG_STRIDE.search(body):
+        return True
+    for parts in cgs.for_headers(body):
+        if (cgs.NAMED_INC.search(parts[2]) or cgs.SLANG_STRIDE.search(parts[2])) \
+                and sv_rooted(body, sig, parts[0]):
+            return True
+    if cgs.counted_covers(body):
+        return True
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body):
+        name = m.group(1)
+        if name in ("if", "for", "while", "switch", "return"):
+            continue
+        fm = re.search(r"\b\w[\w<>,\s\*]*\s" + re.escape(name) + r"\s*\([^;{]*\)\s*\{", text)
+        if fm is None:
+            continue
+        hb = cgs.brace_body(text, fm.end() - 1)
+        if hb is not None and (cgs.SLANG_STRIDE.search(hb) or cgs.counted_covers(hb)):
+            return True
+    return False
+
+
 def load_manifest():
     rows = []
     with open(MANIFEST, encoding="utf-8") as f:
@@ -533,15 +614,8 @@ def load_known():
     return out
 
 
-def main():
-    global CONSTS, DEFINES
-    CONSTS = dim_constants()
-    DEFINES = int_defines()
-    names = kernel_names()
-    blocks = engine_blocks(names)
-    entries = slang_entries()
-    known = load_known()
-
+def scan(blocks, entries):
+    """(findings, unresolved, checked) over every mapped row with a launch site."""
     findings, unresolved, checked = [], [], 0
     for cuda, spv, entry, line in load_manifest():
         if cuda not in blocks:
@@ -564,13 +638,60 @@ def main():
         if not derived:
             continue          # grid is not sized from the block: see grid_from_block
         body = cgs.brace_body(text, off - 1)
-        if body is not None and cgs.slang_covers(text, body):
+        if body is not None and grid_covers(text, body, entry_sig(text, off)):
             continue
         if body is not None:
             factor = serial_factor(text, body, lambda e: slang_val(scope, e))
             if st * factor >= cb:
                 continue
         findings.append((cuda, spv, entry, cb, st, line))
+    return findings, unresolved, checked
+
+
+# The negative control (P9.97a), in the style of check_barrier_uniformity.py: put the
+# shipped P9.97 geometry back into initializeSolverVelocitiesTGS in memory -- a one-warp
+# group whose body still carries the per-body slab loop `b += numThreadsPerBody` --
+# and demand a finding.  That loop is exactly what the pre-P9.97a rule 5 took for a
+# grid stride; a green run of this file therefore also says the tightening is awake.
+SELFTEST_FILE = "solverInitVelocitiesTGS.slang"
+SELFTEST_FROM = "[numthreads(32, INITVEL_WARPS_PER_BLOCK, 1)]"
+SELFTEST_TO = "[numthreads(32, 1, 1)]"
+SELFTEST_KERNEL = "initializeSolverVelocitiesTGS"
+
+
+def selftest(blocks):
+    def mutate(fn, text):
+        if fn != SELFTEST_FILE:
+            return text
+        if text.count(SELFTEST_FROM) != 1:
+            print("SELFTEST BROKEN: the anchor %r is gone from %s." % (SELFTEST_FROM, SELFTEST_FILE))
+            print("  Re-anchor it on whatever now spells that kernel's [numthreads]; do NOT")
+            print("  delete the selftest.")
+            sys.exit(2)
+        return text.replace(SELFTEST_FROM, SELFTEST_TO)
+    findings, _, _ = scan(blocks, slang_entries(mutate))
+    if SELFTEST_KERNEL not in {f[0] for f in findings}:
+        print("SELFTEST FAILED: %s with a one-warp group was not reported short." % SELFTEST_KERNEL)
+        print("  The per-body slab loop is being accepted as a grid stride again (P9.97a).")
+        return 2
+    print("selftest: %s with [numthreads(32,1,1)] -> reported short.  The checker can "
+          "still see it." % SELFTEST_KERNEL)
+    return 0
+
+
+def main():
+    global CONSTS, DEFINES
+    CONSTS = dim_constants()
+    DEFINES = int_defines()
+    names = kernel_names()
+    blocks = engine_blocks(names)
+    rc = selftest(blocks)
+    if rc:
+        return rc
+    entries = slang_entries()
+    known = load_known()
+
+    findings, unresolved, checked = scan(blocks, entries)
 
     found = {f[0] for f in findings}
     new = sorted(found - known)

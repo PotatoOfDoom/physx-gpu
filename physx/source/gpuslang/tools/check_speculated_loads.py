@@ -51,7 +51,16 @@
 #
 #   LOW-launch  the index is assigned IN THIS FUNCTION from a thread-id system
 #               value.  The launch is sized to the data rounded up to a
-#               workgroup, so the overshoot is less than one workgroup.
+#               workgroup, so the overshoot is less than one workgroup --
+#               FOR A ONE-ITEM-PER-THREAD KERNEL ONLY.  P9.97a: a warp-packed
+#               kernel (bpw = 32/numThreadsPerBody items per warp, the TGS
+#               init/average/propagate family and applyTGSSubstepGravity) is
+#               launched with a grid sized for 32 threads PER ITEM, so its
+#               bodyId reaches 8*G*bpw, i.e. up to ~32x the item count at
+#               bpw 32 -- about 31T float4 past a 2T array in
+#               initializeSolverVelocitiesTGS.  Those three kernels therefore
+#               clamp their load indices since P9.97a (bodyIdL = min(bodyId,
+#               bound - 1u)) and are no longer reported.
 #
 #   LOW-const   the guard's bound is a compile-time constant, so the overshoot is
 #               at most that constant.

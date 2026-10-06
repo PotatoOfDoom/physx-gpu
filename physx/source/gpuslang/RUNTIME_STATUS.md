@@ -8,6 +8,12 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.97a: REAL DEFECT FIXED -- initializeSolverVelocitiesTGS, computeAverageSolverBodyVelocityTGS and
+propagateAverageSolverBodyVelocityTGS ran [numthreads(32,1,1)] with warp = gid.x under the engine's
+(32,8)-block grid, i.e. 1/8 of the CUDA's warps: at numSlabs >= 5 bodies were never initialised /
+averaged / propagated, and with >= 2 velocity iterations even at numSlabs 1.  Now (32,8) like the
+CUDA, with clamped masked-lane loads.  Engine-grid fixtures, PXG_SCENE=slabgrid (4 modes: hub frozen
+or satellites flung off -> free fall 48.73288), check_block_coverage.py stricter.  Scenes 79/79.
 P9.96: CUDA tex3D<float> is emulated from texel Loads in pxgSlangTex3d (x-0.5, floor, alpha rounded to
 the nearest 1/256 ties-up, coordinate clamp [0.5, N-0.5], the guide's eight-term sum) instead of a
 Vulkan sampler with normalised coordinates, which missed texel centres on non-power-of-two grids and
@@ -2152,6 +2158,73 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.97a — Echter Fehler: drei TGS-Kernel liefen nur ein Achtel der CUDA-Warps
+
+**Befund** (P9.97-Planung, unabhängig nachgemessen). `initializeSolverVelocitiesTGS`,
+`computeAverageSolverBodyVelocityTGS` und `propagateAverageSolverBodyVelocityTGS` waren als
+`[numthreads(32,1,1)]` mit `warpIndex = gid.x` portiert. Die Engine startet sie mit einem
+(32,8)-Block auf dem Grid `ceil(32·N/256)` (PxgTGSCudaSolverCore.cpp:1236/:1301/:1495/:1748). Die
+Bridge reicht nur das Grid weiter, also lief der Port 1/8 der CUDA-Warps. Folgen:
+- Ab **numSlabs ≥ 5** werden Körper nie initialisiert, gemittelt oder propagiert, im Fixture-Maßstab
+  100, 150 bzw. 175 von 200 bei numSlabs 5–8, 9–16 und ≥ 17. numSlabs ist
+  ceil(Partitionen / gpuMaxNumPartitions); 5 erreicht z. B. ein Körper mit ≥ 33 Gelenken zu anderen
+  dynamischen Körpern.
+- Der Propagate-Start der **Geschwindigkeitsiteration** hat dieselbe Lücke schon bei numSlabs 1.
+  Sichtbar wird sie erst ab 2 Geschwindigkeitsiterationen: In 80 bitgleichen Hantel-Kopien liefen
+  33 auseinander.
+- Keine der 75 Szenen erreichte einen dieser Fälle, deshalb blieb alles grün. Die Fixtures
+  dispatchten `nb·8` und verdeckten den Fehler. `check_block_coverage.py` las die Schleife über die
+  Slabs eines Körpers als Grid-Stride-Schleife.
+
+**Korrektur.** Die drei Kernel laufen jetzt mit dem CUDA-Block:
+- `[numthreads(32, W, 1)]` mit der benannten Konstante W = 8 pro Kernel und
+  `warpIndex = gid.x·W + gtid.y`. W → 1 ist der exakte Revert, W → 16 die Überdeckung.
+- Die Groupshared-Arrays der Mittelung haben 256 Plätze (7168 B). Der Partner im Butterfly ist
+  `flat ^ radius` innerhalb des Warps, summiert wird „eigenes + Partner“ wie im CUDA-Shuffle.
+- Ausgeschlossene Lanes laden über geklemmte Indizes; das schließt auch den Unterlauf von
+  `bodyId − bodyOffset`. Die Stores bleiben bei `bodyId`.
+- Bridge, ABI-Zeilen und Manifest sind unverändert.
+- `check_block_coverage.py` akzeptiert eine Schleife mit benanntem Inkrement nur noch dann als
+  Grid-Stride, wenn sie bei einer Gruppen- oder Dispatch-ID beginnt; vor der Korrektur scheiterte
+  er an genau diesen drei Kerneln, und er hat einen Selbsttest.
+- `check_barrier_uniformity.py` löst benannte `numthreads` auf.
+
+**Fixtures** (wörtliches CUDA-Start-Orakel, bitweise, Engine-Grid nicht ·8):
+`solverInitVelocitiesTGS_engineSlabCoverage` und `solverTGS_averagePropagateEngineGrid`. Letzterer
+nutzt das eigene Grid der Geschwindigkeitsiteration, Abdeckungszähler und Körper ohne
+Slab-Referenzen. Auf den alten Shadern schlagen beide fehl.
+
+**Szene `PXG_SCENE=slabgrid`:** eine drehende, fallende Nabe mit 40 über gesperrte D6-Gelenke
+verbundenen Satelliten.
+
+| Modus | alter Port | korrigiert |
+|---|---|---|
+| slab (Slab-Pfad, Füllkörper) | Nabe eingefroren bei y = 50.00000 | 48.73288 (freier Fall); Replika-Klassen [0..14][15][16..79] |
+| whole (ganze Insel) | Nabe 49.479, alle 40 Satelliten vom Rad | 48.73288, 0 von 40 |
+| one (2 Geschwindigkeitsiterationen) | Replika-Klassen [0..30][31][32..79] | eine Klasse |
+| slab5 | Nabe eingefroren, Füllkörper 1.267 daneben | korrekt; Klassen [0..62][63][64..79] |
+
+- Jeder der drei Kernel trägt Last: Ein Revert von init oder Mittelung färbt slab, whole und slab5
+  rot, ein Revert von propagate alle vier Modi.
+- Der Überdeckungs-Mutant (W = 16) stirbt nur an den Replika-Grenzen. Das belegt, dass der Port der
+  CUDA folgt und nicht einfach jeden Körper abdeckt.
+- Die Regressionsorakel stack, joint, box, articulation und substepgravity sind bitgleich zur alten
+  Ausgabe.
+
+**Upstream-Kandidat (dokumentiert, nicht gemeldet):** Der CUDA-Start der Propagierung in der
+Geschwindigkeitsiteration (`32·ceil(M/10)` Threads) übersieht bei numSlabs ≥ 3 und großen
+Körperzahlen selbst Körper. Der Port bildet das exakt nach; die Replika-Grenzen in `slabgrid`
+pinnen es.
+
+**Sweeps:**
+- init 11 Mutanten, 8 getötet; TGS 24 Mutanten, 19 getötet, 1 durch Fault.
+- Die 7 Überlebenden sind schriftlich als äquivalent begründet: zweimal W = 16, wo die CUDA ohnehin
+  jeden Körper erreicht, und fünf entfernte Klemmen, die nur Adressen verworfener Lanes ändern.
+- 8 Szenen-Sweeps (4 Modi × 2 Dateien) ergaben das vorhergesagte Bild.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 884/884 in beiden Speichermodi.
+**Szenen:** 79/79.
 
 ## P9.96 — `tex3D` ohne Sampler: CUDA-Linearfilterung aus Texel-Loads nachgebaut
 

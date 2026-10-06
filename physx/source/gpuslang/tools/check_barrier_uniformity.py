@@ -155,7 +155,57 @@ ASSIGN = re.compile(
 FOR_INIT = re.compile(
     r'\bfor\s*\(\s*(?:const\s+)?(?:[A-Za-z_][A-Za-z_0-9<>,\s\*]*?\s+)?'
     r'([A-Za-z_][A-Za-z_0-9]*)\s*(?<![=!<>+\-*/&|^])=(?!=)\s*([^;]*);')
-NUMTHREADS = re.compile(r'numthreads\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)')
+# P9.97a: the operands may be NAMED constants -- `[numthreads(32,
+# TGS_AVG_WARPS_PER_BLOCK, 1)]`, `[numthreads(BLOCK_SIZE, 1, 1)]`.  Up to P9.97 this
+# pattern matched literals only, so such an entry was never registered and its
+# barriers silently inherited the block of whatever literal entry preceded it in the
+# file (measured: computeAverageSolverBodyVelocityTGS read 256 from writeBackBodiesTGS
+# by accident).  Operands are now resolved through the file's and its imports'
+# `static const` integers (resolve_dim), and one that cannot be resolved FAILS the
+# check instead of being skipped.  The scan also runs on the comment-stripped text:
+# prose such as "a [numthreads(32,1,1)] group is ONE warp" used to register a
+# phantom 32-wide entry.
+NUMTHREADS = re.compile(r'numthreads\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)')
+DIMCONST = re.compile(
+    r'\b(?:public\s+)?(?:static\s+)?const\s+u?int\w*\s+([A-Za-z_][A-Za-z_0-9]*)'
+    r'\s*=\s*([^;]+);')
+IMPORT = re.compile(r'^\s*import\s+([A-Za-z_][A-Za-z_0-9]*)\s*;', re.M)
+
+
+def dim_scope(src, shaders_dir=None):
+    """name -> expression for every integer constant visible to `src` (one level
+    of `import`, the file's own declarations winning)."""
+    shaders_dir = shaders_dir or SHADERS
+    scope = {}
+    for mod in IMPORT.findall(src):
+        mpath = os.path.join(shaders_dir, mod + '.slang')
+        if os.path.exists(mpath):
+            mtext = strip_comments(open(mpath).read())
+            scope.update({m.group(1): m.group(2) for m in DIMCONST.finditer(mtext)})
+    scope.update({m.group(1): m.group(2) for m in DIMCONST.finditer(src)})
+    return scope
+
+
+def resolve_dim(expr, scope, depth=0):
+    """Integer value of a [numthreads] operand, or None."""
+    e = expr.strip()
+    while e.startswith('(') and e.endswith(')'):
+        e = e[1:-1].strip()
+    m = re.fullmatch(r'(\d+)[uU]?', e)
+    if m:
+        return int(m.group(1))
+    if depth > 5:
+        return None
+    if e in scope:
+        return resolve_dim(scope[e], scope, depth + 1)
+    for op in ('*', '/'):
+        parts = e.split(op)
+        if len(parts) == 2:
+            a = resolve_dim(parts[0], scope, depth + 1)
+            b = resolve_dim(parts[1], scope, depth + 1)
+            if a is not None and b is not None and (op == '*' or b):
+                return a * b if op == '*' else a // b
+    return None
 
 # Builtins and intrinsics: never user functions, so never call-graph nodes.
 BUILTIN = set('''
@@ -498,6 +548,8 @@ class Shader(object):
         self._sorted = None
         self._starts = None
         self.entries = []        # (line, block_size, name)
+        self.unresolved = []     # (line, numthreads text) whose operands did not resolve
+        self.shaders_dir = os.path.dirname(os.path.abspath(path))
         self._scan_functions()
         self._scan_entries(raw)
 
@@ -524,12 +576,19 @@ class Shader(object):
             i = j + 1
 
     def _scan_entries(self, raw):
-        lines = raw.split('\n')
+        lines = self.src.split('\n')     # comment-stripped, line-preserving
+        scope = None
         for i, l in enumerate(lines):
             m = NUMTHREADS.search(l)
             if not m:
                 continue
-            block = int(m.group(1)) * int(m.group(2)) * int(m.group(3))
+            if scope is None:
+                scope = dim_scope(self.src, self.shaders_dir)
+            dims = [resolve_dim(m.group(k), scope) for k in (1, 2, 3)]
+            if any(d is None for d in dims):
+                self.unresolved.append((i + 1, m.group(0)))
+                continue
+            block = dims[0] * dims[1] * dims[2]
             name = None
             for j in range(i, min(i + 5, len(lines))):
                 mm = re.search(r'\bvoid\s+([A-Za-z_][A-Za-z_0-9]*)', lines[j])
@@ -832,6 +891,38 @@ def selftest():
         return 2
     print('selftest: warp-rounded bound in a 512-thread block -> %d site(s) '
           'reported.  The checker can still see it.' % len(hits))
+    return selftest_named_block()
+
+
+# P9.97a: the shape that hid computeAverageSolverBodyVelocityTGS's block.  A
+# named-constant entry with a barrier, after a 32-wide literal entry, must be
+# attributed ITS OWN block (8 * 32 = 256), and an operand that resolves to
+# nothing must be reported rather than skipped.
+SELFTEST_NAMED = '''static const uint SELFTEST_WARPS = 8u;
+[numthreads(32, 1, 1)]
+void selftestNarrow(uint3 gtid : SV_GroupThreadID) { }
+[numthreads(32, SELFTEST_WARPS, 1)]
+void selftestNamed(uint3 gtid : SV_GroupThreadID)
+{
+    GroupMemoryBarrierWithGroupSync();
+}
+[numthreads(SELFTEST_UNDEFINED, 1, 1)]
+void selftestUnresolved(uint3 gtid : SV_GroupThreadID) { }
+'''
+
+
+def selftest_named_block():
+    sh = Shader(os.path.join(SHADERS, 'selftestNamedBlock.slang'), SELFTEST_NAMED)
+    line = SELFTEST_NAMED.split('\n').index('    GroupMemoryBarrierWithGroupSync();') + 1
+    got = sh.block_at(line)
+    if got != 256 or len(sh.unresolved) != 1:
+        print('SELFTEST FAILED: a barrier in a [numthreads(32, NAMED, 1)] entry was')
+        print('  attributed block %s (want 256), %d unresolved operand(s) (want 1).'
+              % (got, len(sh.unresolved)))
+        print('  Named numthreads are being skipped again (the P9.97a gap).')
+        return 2
+    print('selftest: named [numthreads] operand -> block %d, unresolved operand '
+          'reported.  Named entries are registered.' % got)
     return 0
 
 
@@ -893,6 +984,14 @@ def main():
     if rc:
         return rc
     shaders = load_corpus()
+    unresolved = [(sh.name, ln, txt) for sh in shaders.values() for (ln, txt) in sh.unresolved]
+    if unresolved:
+        print('%d [numthreads] whose operands do not resolve to integers:' % len(unresolved))
+        for (name, ln, txt) in unresolved:
+            print('  %s:%d  %s' % (name, ln, txt))
+        print('An unregistered entry hands its barriers the block of the entry above it')
+        print('(P9.97a).  Spell the operand as a literal or a `static const` integer.')
+        return 1
 
     findings = analyse(shaders)
     waived = load_waivers()

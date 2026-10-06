@@ -40,6 +40,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -1036,6 +1037,7 @@ PXG_TEST(solverTGS_contactAndJointBatches)
 // Shared engine-ABI test helpers (used by every PxgCudaShim-driven test below).
 static std::vector<uint8_t> solverTgsAbiLoader(const char* file) { return loadShaderBlob(file); }
 static uint32_t f2uTGS(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static uint32_t nextPow2TGS(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
 
 // Mirrors the bridge's marshalling: place each argument at the natural
 // alignment inferred from its size, then round the blob to the largest
@@ -1527,27 +1529,42 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
 // ENGINE ABI (P5 Step 4): the averaging/propagate/writeback-bodies kernels
 // take the engine's (PxgSolverCoreDesc*, PxgSolverSharedDesc*) packs; the
 // test fills the REAL engine descs (+ PxgIslandContext) with live device
-// addresses and launches through PxgCudaShim with the engine's grid
-// arithmetic (warp-structured blockDim (32,8,1) -> one-warp workgroups x8;
-// WRITE_BACK_BODIES blockDim 256).  writeBackBodiesTGS is launched with
+// addresses and launches through PxgCudaShim with the engine's grids,
+// UNSCALED: the bridge drops blockDim, so the (32, 8) workgroup of the
+// average/propagate kernels IS the CUDA block (32, COMPUTE_BODIES_AVERAGE_VELOCITY
+// / 32) and the engine's gridX is dispatched as it is (WRITE_BACK_BODIES blockDim
+// 256).  Up to P9.97a this header read "one-warp workgroups x8": the fixture
+// multiplied a grid nothing in the engine multiplies, and so passed a port that
+// ran one eighth of the CUDA's warps.  writeBackBodiesTGS is launched with
 // islandIndex = 1 against a 2-element island array whose element [0] is a
 // decoy, pinning the PxgIslandContext stride on the real ABI.
 // solverTgsAbiLoader + EngineBlob are defined above (before the first
 // engine-ABI test).
 
-PXG_TEST(solverTGS_velocityAveragingAndPropagate)
+//
+// P9.97a: the reference emulates each pass's CUDA reach literally -- a body is
+// averaged / propagated only if some (blockIdx < G, threadIdx.y < 8, threadIdx.x <
+// 32) of the engine grid maps to it, warpIndex = blockIdx*8 + threadIdx.y
+// (solverMultiBlockTGS.cu:324/452).  The velocity-iteration propagate is launched
+// with the engine's own grid 32*((mBodyCount+9)/10) (PxgTGSCudaSolverCore.cpp:1734),
+// which for numSlabs >= 3 reaches fewer bodies than exist: an upstream quirk the
+// port reproduces (the CUDA is the spec), pinned here as "unreached bodies keep
+// their priors".  The averaged lanes follow the CUDA reduction order (per-lane
+// partial sums over b = t, t+nTPB, ..., then the __shfl_xor butterfly, own +
+// partner), so the whole velocity pool is compared BITWISE.
+static void runVelocityAveragingAndPropagate(uint32_t seed, std::initializer_list<uint32_t> slabList)
 {
     using physx::gpuslang::PxgCudaShim;
     using physx::gpuslang::PxgKernelDef;
     using physx::gpuslang::PxgDevicePtr;
     using physx::gpuslang::PxgResult;
 
-    std::mt19937 rng(3500);
+    std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-3.f, 3.f);
 
     for (uint32_t isVelocityIteration : { 0u, 1u })
-    for (uint32_t numSlabs : { 4u, 12u, 40u })
+    for (uint32_t numSlabs : slabList)
     {
         const uint32_t totalBodyCount = 70; // dynamic bodies
         const uint32_t bodyOffset = 8;      // world body + kinematics
@@ -1585,6 +1602,65 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         for (uint32_t i = 0; i < references.size(); ++i)
             if ((rng() & 3) != 0) // ~75% of slab slots active
                 references[i] = propBase + 3 * (i & ~31u) + (i & 31u);
+
+        // the CUDA work geometry (solverMultiBlockTGS.cu:324-334)
+        const uint32_t pow2Slabs = (numSlabs & (numSlabs - 1)) == 0 ? numSlabs : nextPow2TGS(numSlabs);
+        const uint32_t numThreadsPerBody = std::min(pow2Slabs, 32u);
+        const uint32_t numBodiesPerWarp = 32 / numThreadsPerBody;
+
+        // P9.97a DIRECTED reference-less bodies.  With ~75% random references a body
+        // with NO valid slab reference is ~0.25^numSlabs rare, so nothing put such a
+        // body next to one with references in the same lane of another warp of the
+        // block -- the only place an averaging slip that reads warp 0's hasRef slot
+        // for every warp can show.  Per block of 8 warps: in kind 1 the body at
+        // bodyInWarp 0 of the block's LAST warp has no reference while warp 0's has
+        // one; in kind 2 warp 0's body has none while the other warps' have.  With
+        // one body per warp (bpw 1) the two kinds alternate between even and odd
+        // blocks.  Seeded after the random draws (rng untouched).
+        auto clearRefs = [&](uint32_t b) { for (uint32_t k = 0; k < numSlabs; ++k) references[b * numSlabs + k] = 0xFFFFFFFFu; };
+        auto forceRef = [&](uint32_t b) { references[b * numSlabs] = propBase + 3 * ((b * numSlabs) & ~31u) + ((b * numSlabs) & 31u); };
+        const uint32_t numWarps = (totalBodyCount + numBodiesPerWarp - 1) / numBodiesPerWarp;
+        for (uint32_t w0 = 0; w0 < numWarps; w0 += 8)
+        {
+            const uint32_t last = std::min(w0 + 7, numWarps - 1);
+            const bool odd = ((w0 / 8) & 1) != 0;
+            if (last > w0 && (numBodiesPerWarp > 1 || !odd))
+            {   // kind 1: bodyInWarp 0 of the last warp vs warp 0
+                clearRefs(last * numBodiesPerWarp);
+                forceRef(w0 * numBodiesPerWarp);
+            }
+            const uint32_t k2 = numBodiesPerWarp > 1 ? 1u : 0u;
+            if (last > w0 && (numBodiesPerWarp > 1 || odd) && w0 * numBodiesPerWarp + k2 < totalBodyCount)
+            {   // kind 2: warp 0's body vs the other warps' at the same bodyInWarp
+                clearRefs(w0 * numBodiesPerWarp + k2);
+                for (uint32_t w = w0 + 1; w <= last; ++w)
+                    if (w * numBodiesPerWarp + k2 < totalBodyCount)
+                        forceRef(w * numBodiesPerWarp + k2);
+            }
+        }
+        auto hasAnyRef = [&](uint32_t b) {
+            for (uint32_t k = 0; k < numSlabs; ++k)
+                if (references[b * numSlabs + k] != 0xFFFFFFFFu) return true;
+            return false;
+        };
+        uint32_t kind1 = 0, kind2 = 0;   // reference-less bodies opposite a referenced one
+        for (uint32_t b = 0; b < totalBodyCount; ++b)
+        {
+            const uint32_t w = b / numBodiesPerWarp, biw = b % numBodiesPerWarp, w0 = w & ~7u;
+            if (hasAnyRef(b))
+                continue;
+            if (w != w0 && hasAnyRef(w0 * numBodiesPerWarp + biw))
+                ++kind1;
+            if (w == w0)
+                for (uint32_t ww = w0 + 1; ww < std::min(w0 + 8, numWarps); ++ww)
+                    if (ww * numBodiesPerWarp + biw < totalBodyCount && hasAnyRef(ww * numBodiesPerWarp + biw))
+                    {
+                        ++kind2;
+                        break;
+                    }
+        }
+        PXG_CHECK_MSG(kind1 >= 1 && kind2 >= 1, "slabs=%u: directed reference-less bodies missing (kind1 %u, kind2 %u)",
+                      numSlabs, kind1, kind2);
 
         const uint32_t num32Slabs = (numSlabs + 31) / 32;
         std::vector<uint32_t> encoded(numTotalBodies * num32Slabs);
@@ -1704,19 +1780,19 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         shim.memAlloc(&dShared, sizeof(shared));
         shim.memcpyHtoD(dShared, &shared, sizeof(shared));
 
-        // engine grid arithmetic: COMPUTE_BODIES_AVERAGE_VELOCITY = 256,
-        // blockDim (32,8,1) -> dispatch nbBlocks*8 one-warp workgroups.
-        // average (solvePartitions): nbThreads = 32 * mBodyCount;
-        // propagate (pos-iter site): nbThreads = 32 * (mBodyCount + mBodyStartIndex).
-        // (The velocity-iteration engine site under-dispatches via
-        // 32*((mBodyCount+9)/10); the kernel is guard-correct under any grid,
-        // so the test keeps the full-coverage grid for both variants to match
-        // the all-bodies reference.)
+        // the engine's grids, dispatched UNSCALED (COMPUTE_BODIES_AVERAGE_VELOCITY = 256,
+        // blockDim (32, 8, 1) = the shader's workgroup):
+        // average (solvePartitions, PxgTGSCudaSolverCore.cpp:1232-1239): 32 * mBodyCount;
+        // propagate, position iteration (:1481-1495): 32 * (mBodyCount + mBodyStartIndex);
+        // propagate, velocity iteration (:1734-1748): 32 * ((mBodyCount + 9) / 10) -- the
+        // upstream under-dispatch for numSlabs >= 3, reproduced and pinned below.
         const uint32_t avgBlocks = (32 * totalBodyCount + 255) / 256;
-        const uint32_t propBlocks = (32 * (totalBodyCount + bodyOffset) + 255) / 256;
+        const uint32_t propBlocksPos = (32 * (totalBodyCount + bodyOffset) + 255) / 256;
+        const uint32_t propBlocksVel = (32 * ((totalBodyCount + 9) / 10) + 255) / 256;
+        const uint32_t propBlocks = isVelocityIteration ? propBlocksVel : propBlocksPos;
 
         struct { uint64_t desc, shared; } avgPrm = { dDescA, dShared };
-        PXG_CHECK_MSG(shim.launchKernel(0, avgBlocks * 8, 1, 1, &avgPrm, sizeof(avgPrm)) == PxgResult::Success,
+        PXG_CHECK_MSG(shim.launchKernel(0, avgBlocks, 1, 1, &avgPrm, sizeof(avgPrm)) == PxgResult::Success,
                       "launch computeAverageSolverBodyVelocityTGS");
 
         // (descs..., bool isVelocityIteration, bool isLastPosIteration, PxReal
@@ -1730,7 +1806,7 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         propBlob.finish();
         PXG_CHECK_MSG(propBlob.bytes.size() == 24, "propagate blob is 24 bytes (got %zu)",
                       propBlob.bytes.size());
-        PXG_CHECK_MSG(shim.launchKernel(1, propBlocks * 8, 1, 1, propBlob.bytes.data(),
+        PXG_CHECK_MSG(shim.launchKernel(1, propBlocks, 1, 1, propBlob.bytes.data(),
                                         uint32_t(propBlob.bytes.size())) == PxgResult::Success,
                       "launch propagateAverageSolverBodyVelocityTGS");
 
@@ -1754,29 +1830,72 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         std::vector<Float4> refMotion = motionVel;
         auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
 
+        // which bodies a pass reaches: the CUDA launch emulated literally
+        // (blockIdx < G, threadIdx.y < 8, lane 0 of each work unit), guard bodyId < bound
+        auto reach = [&](uint32_t G, uint32_t bound, std::vector<uint8_t>& reached) {
+            reached.assign(bound, 0);
+            uint32_t written = 0;
+            for (uint32_t blockIdx = 0; blockIdx < G; ++blockIdx)
+            for (uint32_t threadIdxY = 0; threadIdxY < 8; ++threadIdxY)
+            for (uint32_t threadIdxX = 0; threadIdxX < 32; threadIdxX += numThreadsPerBody)
+            {
+                const uint32_t warpIndex = blockIdx * 8 + threadIdxY;
+                const uint32_t bodyId = warpIndex * numBodiesPerWarp + threadIdxX / numThreadsPerBody;
+                if (bodyId < bound) { reached[bodyId] = 1; ++written; }
+            }
+            return written;
+        };
+        std::vector<uint8_t> avgReached, propReached;
+        const uint32_t avgWritten = reach(avgBlocks, totalBodyCount, avgReached);
+        const uint32_t propWritten = reach(propBlocks, T, propReached);
+        // coverage counters against the closed form min(bound, 8*G*bpw)
+        PXG_CHECK_MSG(avgWritten == std::min(totalBodyCount, 8 * avgBlocks * numBodiesPerWarp) && avgWritten == totalBodyCount,
+                      "slabs=%u: average reaches %u of %u bodies", numSlabs, avgWritten, totalBodyCount);
+        PXG_CHECK_MSG(propWritten == std::min(T, 8 * propBlocks * numBodiesPerWarp),
+                      "slabs=%u velIt=%u: propagate reaches %u, closed form %u", numSlabs, isVelocityIteration,
+                      propWritten, std::min(T, 8 * propBlocks * numBodiesPerWarp));
+        // the upstream velocity-iteration quirk must actually be exercised (bodies left unreached)
+        if (isVelocityIteration && numSlabs >= 4)
+            PXG_CHECK_MSG(propWritten < T, "slabs=%u: velocity-iteration propagate reaches all %u bodies", numSlabs, T);
+
         // average pass (dynamic bodies only)
         size_t cNegZ = 0, cNegW = 0;   // P9.86f: bodies whose -0 z / w lane the (+0)+ add turns +0
         for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
         {
+            if (!avgReached[bodyId])
+                continue;
             const Float4 vel0 = velPool[bodyOffset + deltaVOffset + bodyId];
             const Float4 vel1 = velPool[bodyOffset + deltaVOffset + bodyId + T];
-            float acc[6] = {};
+            // per-lane partial sums in the CUDA's order (.cu:353-375: curVel0 = make_float4(0.f),
+            // b = t, t+nTPB, ...; delta = pool - vel), then the __shfl_xor butterfly
+            // (.cu:380-391: own + partner, radius nTPB/2 .. 1); lane 0 holds the result
+            float lane[32][6] = {};
             bool hasRef = false;
-            for (uint32_t b = 0; b < numSlabs; ++b)
+            for (uint32_t t = 0; t < numThreadsPerBody; ++t)
+            for (uint32_t b = t; b < numSlabs; b += numThreadsPerBody)
             {
                 const uint32_t bodyIndex = bodyId * numSlabs + b;
                 if (references[bodyIndex] != 0xFFFFFFFFu)
                 {
                     const uint32_t velIndex = averageOutputOffsets + 3 * (bodyIndex & ~31u) + (bodyIndex & 31u);
-                    acc[0] += velPool[velIndex].x - vel0.x;
-                    acc[1] += velPool[velIndex].y - vel0.y;
-                    acc[2] += velPool[velIndex].z - vel0.z;
-                    acc[3] += velPool[velIndex].w - vel0.w;
-                    acc[4] += velPool[velIndex + 32].x - vel1.x;
-                    acc[5] += velPool[velIndex + 32].y - vel1.y;
+                    lane[t][0] += velPool[velIndex].x - vel0.x;
+                    lane[t][1] += velPool[velIndex].y - vel0.y;
+                    lane[t][2] += velPool[velIndex].z - vel0.z;
+                    lane[t][3] += velPool[velIndex].w - vel0.w;
+                    lane[t][4] += velPool[velIndex + 32].x - vel1.x;
+                    lane[t][5] += velPool[velIndex + 32].y - vel1.y;
                     hasRef = true;
                 }
             }
+            for (uint32_t radius = numThreadsPerBody >> 1; radius > 0; radius >>= 1)
+            {
+                float next[32][6];
+                for (uint32_t t = 0; t < numThreadsPerBody; ++t)
+                    for (int k = 0; k < 6; ++k)
+                        next[t][k] = lane[t][k] + lane[t ^ radius][k];
+                std::memcpy(lane, next, sizeof(next));
+            }
+            float* acc = lane[0];
             if (hasRef)
             {
                 uint32_t refCount = 0;
@@ -1784,8 +1903,8 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
                     refCount += popcount(encoded[bodyOffset + bodyId + i * numTotalBodies]);
                 refCount = std::max(1u, refCount);
                 const float recip = 1.f / float(refCount);
-                for (float& a : acc)
-                    a *= recip;
+                for (int k = 0; k < 6; ++k)
+                    acc[k] *= recip;
                 for (uint32_t i = 0; i < num32Slabs; ++i)
                     refEnc[bodyOffset + bodyId + i * numTotalBodies] = 0;
                 refVel[bodyOffset + deltaVOffset + bodyId] =
@@ -1804,6 +1923,8 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         // the barrier between the dispatches)
         for (uint32_t bodyId = 0; bodyId < T; ++bodyId)
         {
+            if (!propReached[bodyId])
+                continue;   // unreached: slab slots, deltas and pose keep their priors
             const Float4 curVel0 = refVel[deltaVOffset + bodyId];
             Float4 curVel1 = refVel[deltaVOffset + bodyId + T];
             Float4 curVel2 = refVel[deltaVOffset + bodyId + 2 * T];
@@ -1927,7 +2048,7 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
             const float* g = &gpuVel[i].x;
             const float* r = &refVel[i].x;
             for (int c = 0; c < 4; ++c)
-                if (!almostEqual(g[c], r[c], 1e-4f, 1e-4f))
+                if (f2uTGS(g[c]) != f2uTGS(r[c]))   // P9.97a: bitwise (CUDA reduction order)
                 {
                     if (mismatches < 3)
                         PXG_CHECK_MSG(false, "slabs=%u velIt=%u vel[%zu].%d: gpu=%g ref=%g", numSlabs,
@@ -1967,7 +2088,7 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
             const float* g = &gpuMotion[i].x;
             const float* r = &refMotion[i].x;
             for (int c = 0; c < 4; ++c)
-                if (!almostEqual(g[c], r[c], 1e-4f, 1e-4f))
+                if (f2uTGS(g[c]) != f2uTGS(r[c]))
                     ++mismatches;
         }
         PXG_CHECK_MSG(mismatches == 0, "slabs=%u velIt=%u: %zu motion-velocity mismatches", numSlabs,
@@ -1976,6 +2097,20 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         for (PxgDevicePtr pfree : { dVel, dEnc, dRef, dTx, dBd, dBs, dMv, dIslA, dIslB, dDescA, dDescB, dShared })
             shim.memFree(pfree);
     }
+}
+
+PXG_TEST(solverTGS_velocityAveragingAndPropagate)
+{
+    runVelocityAveragingAndPropagate(3500, { 4u, 12u, 40u });
+}
+
+// P9.97a: every numThreadsPerBody band at the engine grid.  The velocity-iteration
+// propagate reaches 8*bpw of the 78 bodies here (its grid is 1 block): all at
+// numSlabs 1-2, 64 / 32 / 16 / 8 at numSlabs 4 / 5 / 12 / >= 17.  A port that covers
+// more than the CUDA (a 16-warp group) or less (the shipped one-warp group) fails.
+PXG_TEST(solverTGS_averagePropagateEngineGrid)
+{
+    runVelocityAveragingAndPropagate(97200, { 1u, 2u, 4u, 5u, 12u, 32u, 33u, 40u });
 }
 
 // ---------------------------------------------------------------------------

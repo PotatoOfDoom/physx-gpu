@@ -5773,21 +5773,21 @@
 },
 {
 "file": "solverTGS.slang",
-"code": "gsVel0[groupThreadId.x] += v0Other;",
+"code": "gsVel0[flat] += v0Other;",
 "kinds": [
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "Both operands are groupshared loads separated by GroupMemoryBarrierWithGroupSync, so no store of the constant can be forwarded across the barrier. The radius loop starts at numThreadsPerBody>>1, which is a runtime value. The operand order (own + partner) matches the CUDA shuffle reduction."
+"why": "P9.97a: re-keyed (the slot index is now flat = gtid.y*32 + gtid.x of the (32, 8) block; was groupThreadId.x). Both operands are groupshared loads separated by GroupMemoryBarrierWithGroupSync, so no store of the constant can be forwarded across the barrier. The radius loop starts at numThreadsPerBody>>1, which is a runtime value. The operand order (own + partner) matches the CUDA shuffle reduction; fixture-verified bitwise (solverTGS_averagePropagateEngineGrid)."
 },
 {
 "file": "solverTGS.slang",
-"code": "gsVel1[groupThreadId.x] += v1Other;",
+"code": "gsVel1[flat] += v1Other;",
 "kinds": [
 "F3-zero-add"
 ],
 "verdict": "NOT-A-FOLD",
-"why": "Same case as line 1350: groupshared loads across barriers in a runtime-trip loop."
+"why": "P9.97a: re-keyed (flat slot index, was groupThreadId.x). Same case as the gsVel0 site: groupshared loads across barriers in a runtime-trip loop."
 },
 {
 "file": "solverTGS.slang",

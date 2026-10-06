@@ -1269,20 +1269,26 @@ uint computeAverageBodyOutputIndex(uint bodyIndex)
     return 3 * (bodyIndex & ~31u) + (bodyIndex & 31u);
 }
 
-groupshared float4 gsVel0[32];
-groupshared float2 gsVel1[32];
-groupshared uint gsHasRef[32];
+static const uint TGS_AVG_WARPS_PER_BLOCK = 8u;    // COMPUTE_BODIES_AVERAGE_VELOCITY / 32 -- PxgTGSCudaSolverCore.cpp:1238-1239
+static const uint TGS_PROP_WARPS_PER_BLOCK = 8u;   // COMPUTE_BODIES_AVERAGE_VELOCITY / 32 -- PxgTGSCudaSolverCore.cpp:1495 / :1748
+groupshared float4 gsVel0[32 * TGS_AVG_WARPS_PER_BLOCK];   // one slot per thread of the (32, 8) block
+groupshared float2 gsVel1[32 * TGS_AVG_WARPS_PER_BLOCK];
+groupshared uint gsHasRef[32 * TGS_AVG_WARPS_PER_BLOCK];
 
 // mirrors computeAverageSolverBodyVelocityTGS() in solverMultiBlockTGS.cu:
 // averages the per-slab deltas of the 6-component velocity (linVel.xyz +
 // angVel.x in vel0, angVel.yz in vel1.xy) and resets the slab reference
 // counts; the accumulated position/angle deltas in vel1.zw are untouched.
 // The CUDA sub-warp __shfl_xor reductions become groupshared reductions over
-// the same power-of-two lane groups; one workgroup covers one warp's bodies
-// (dispatch = engine block count * 8 warps/block).  Engine ABI: everything is
-// read from the two descs on-device.
+// the same power-of-two lane groups.  One workgroup is one CUDA block (32, 8):
+// eight warps, warpIndex = gid.x*8 + gtid.y; the bridge dispatches the engine
+// grid ceil(32*mBodyCount/256) unscaled (P9.97a -- up to then the group was one
+// warp and the engine ran 1/8 of the CUDA's warps).  Each warp's 32 groupshared
+// slots are contiguous (flat = gtid.y*32 + gtid.x), so the butterfly partner
+// flat ^ radius (radius < numThreadsPerBody <= 32) never leaves the warp.
+// Engine ABI: everything is read from the two descs on-device.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(32, TGS_AVG_WARPS_PER_BLOCK, 1)]   // CUDA block (32, 8) -- PxgTGSCudaSolverCore.cpp:1238
 void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gAvgAbi.solverCoreDesc))[0];
@@ -1304,10 +1310,16 @@ void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32 / numThreadsPerBody;
 
-    const uint warpBodyStartIndex = groupId.x * numBodiesPerWarp;
+    const uint warpIndex = groupId.x * TGS_AVG_WARPS_PER_BLOCK + groupThreadId.y;   // .cu:324 blockIdx.x * blockDim.y + threadIdx.y
+    const uint warpBodyStartIndex = warpIndex * numBodiesPerWarp;
     const uint threadIdInWorkUnit = groupThreadId.x & (numThreadsPerBody - 1);
     const uint bodyInWarp = groupThreadId.x / numThreadsPerBody;
     const uint bodyId = warpBodyStartIndex + bodyInWarp;
+    // MASKED-LANE LOAD CLAMP (P9.97a): the grid is sized for 32 threads per body, so the
+    // excluded lanes' bodyId reaches 8*G*bpw ~ 32*mBodyCount, and llvmpipe issues their
+    // guarded BDA loads anyway (P9.22).  Load addresses use bodyIdL; on every active lane
+    // bodyIdL == bodyId (bit-identical result), and every store keeps bodyId.
+    const uint bodyIdL = min(bodyId, totalBodyCount - 1u);
 
     float4 curVel0 = float4(0.0f);
     float2 curVel1 = float2(0.0f);
@@ -1317,12 +1329,12 @@ void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
 
     if (bodyId < totalBodyCount)
     {
-        vel0 = bodyVelocities[bodyOffset + deltaVOffset + bodyId];
-        vel1 = bodyVelocities[bodyOffset + deltaVOffset + bodyId + totalBodiesIncKinematics];
+        vel0 = bodyVelocities[bodyOffset + deltaVOffset + bodyIdL];
+        vel1 = bodyVelocities[bodyOffset + deltaVOffset + bodyIdL + totalBodiesIncKinematics];
 
         for (uint b = threadIdInWorkUnit; b < numSlabs; b += numThreadsPerBody)
         {
-            const uint bodyIndex = bodyId * numSlabs + b;
+            const uint bodyIndex = bodyIdL * numSlabs + b;   // == bodyId * numSlabs + b on every active lane
             const uint remappedBodyIndex = solverReferences[bodyIndex];
 
             if (remappedBodyIndex != 0xFFFFFFFFu)
@@ -1341,32 +1353,33 @@ void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
 
     // sub-group reduction over the numThreadsPerBody lanes of each body
     // (replaces the CUDA __shfl_xor_sync / __ballot_sync pattern)
-    gsVel0[groupThreadId.x] = curVel0;
-    gsVel1[groupThreadId.x] = curVel1;
-    gsHasRef[groupThreadId.x] = hasRef ? 1u : 0u;
+    const uint flat = groupThreadId.y * 32u + groupThreadId.x;   // this lane's slot; a warp's 32 slots are contiguous
+    gsVel0[flat] = curVel0;
+    gsVel1[flat] = curVel1;
+    gsHasRef[flat] = hasRef ? 1u : 0u;
     GroupMemoryBarrierWithGroupSync();
 
     for (uint radius = numThreadsPerBody >> 1; radius > 0; radius >>= 1)
     {
-        const uint partner = groupThreadId.x ^ radius;
+        const uint partner = flat ^ radius;   // radius < 32: stays inside the warp
         const float4 v0Other = gsVel0[partner];
         const float2 v1Other = gsVel1[partner];
         const uint rOther = gsHasRef[partner];
         GroupMemoryBarrierWithGroupSync();
-        gsVel0[groupThreadId.x] += v0Other;
-        gsVel1[groupThreadId.x] += v1Other;
-        gsHasRef[groupThreadId.x] |= rOther;
+        gsVel0[flat] += v0Other;
+        gsVel1[flat] += v1Other;
+        gsHasRef[flat] |= rOther;
         GroupMemoryBarrierWithGroupSync();
     }
 
-    if (bodyId < totalBodyCount && gsHasRef[groupThreadId.x] != 0 && threadIdInWorkUnit == 0)
+    if (bodyId < totalBodyCount && gsHasRef[flat] != 0 && threadIdInWorkUnit == 0)
     {
-        curVel0 = gsVel0[groupThreadId.x];
-        curVel1 = gsVel1[groupThreadId.x];
+        curVel0 = gsVel0[flat];
+        curVel1 = gsVel1[flat];
 
         const uint numTotalBodies = bodyOffset + totalBodyCount + island.mArticulationCount;
         const uint referenceCount =
-            countActiveSlabsBda(bodyOffset + bodyId, numSlabs, numTotalBodies, encodedReferenceCount);
+            countActiveSlabsBda(bodyOffset + bodyIdL, numSlabs, numTotalBodies, encodedReferenceCount);
         const float recipRefs = 1.0f / float(referenceCount);
 
         curVel0 *= recipRefs;
@@ -1398,8 +1411,17 @@ void computeAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
 // Engine ABI: (descs..., bool isVelocityIteration, bool isLastPosIteration,
 // PxReal biasCoefficient) — the latter two ride in the pack but are unused by
 // the kernel body (their uses are commented out in the .cu too).
+// One workgroup = one CUDA block (32, 8), warpIndex = gid.x*8 + gtid.y (P9.97a;
+// up to then one warp per group, 1/8 of the CUDA's warps).  Launched at two sites
+// with different grids: the position iteration with 32*(mBodyCount+mBodyStartIndex)
+// threads (PxgTGSCudaSolverCore.cpp:1481-1495) and the velocity iteration with
+// 32*((mBodyCount+9)/10) (:1734-1748).  The latter reaches 8*G*bpw bodies, fewer
+// than exist for numSlabs >= 3 at large body counts -- an UPSTREAM under-dispatch
+// (a ten-bodies-per-warp formula never updated for the numThreadsPerBody mapping,
+// cf. the stale comment at solverMultiBlockTGS.cu:457), reproduced here because the
+// CUDA is the spec; PXG_SCENE=slabgrid pins its replica boundary.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(32, TGS_PROP_WARPS_PER_BLOCK, 1)]   // CUDA block (32, 8) -- PxgTGSCudaSolverCore.cpp:1495 / :1748
 void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gPropagateAbi.solverCoreDesc))[0];
@@ -1423,21 +1445,28 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32 / numThreadsPerBody;
 
-    const uint warpBodyStartIndex = groupId.x * numBodiesPerWarp;
+    const uint warpIndex = groupId.x * TGS_PROP_WARPS_PER_BLOCK + groupThreadId.y;   // .cu:452 blockIdx.x * blockDim.y + threadIdx.y
+    const uint warpBodyStartIndex = warpIndex * numBodiesPerWarp;
     const uint threadIdInWorkUnit = groupThreadId.x & (numThreadsPerBody - 1);
     const uint bodyInWarp = groupThreadId.x / numThreadsPerBody;
     const uint bodyId = warpBodyStartIndex + bodyInWarp;
 
     const bool active = bodyId < totalBodiesIncKinematics;
+    // MASKED-LANE LOAD CLAMP (P9.97a), as in computeAverageSolverBodyVelocityTGS: load
+    // addresses use bodyIdL (== bodyId on every active lane), stores keep bodyId.
+    // slabBodyL is the slab loop's (bodyId - bodyOffset), which UNDERFLOWS for the
+    // excluded lanes with bodyId < bodyOffset.
+    const uint bodyIdL = min(bodyId, totalBodiesIncKinematics - 1u);
+    const uint slabBodyL = (bodyIdL >= bodyOffset) ? (bodyIdL - bodyOffset) : 0u;
 
     float4 curVel0 = float4(0.0f);
     float4 curVel1 = float4(0.0f);
     float4 curVel2 = float4(0.0f);
     if (active)
     {
-        curVel0 = bodyVelocities[deltaVOffset + bodyId];
-        curVel1 = bodyVelocities[deltaVOffset + bodyId + totalBodiesIncKinematics];
-        curVel2 = bodyVelocities[deltaVOffset + bodyId + 2 * totalBodiesIncKinematics];
+        curVel0 = bodyVelocities[deltaVOffset + bodyIdL];
+        curVel1 = bodyVelocities[deltaVOffset + bodyIdL + totalBodiesIncKinematics];
+        curVel2 = bodyVelocities[deltaVOffset + bodyIdL + 2 * totalBodiesIncKinematics];
     }
 
     // Every lane of a work unit reads its body's accumulation slots above and
@@ -1450,7 +1479,7 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
 
     if (!isVelocityIteration && bodyId > 0)
     {
-        const uint nodeIndex = nodeIndexIndex(solverBodyDataPool[bodyId].islandNodeIndex);
+        const uint nodeIndex = nodeIndexIndex(solverBodyDataPool[bodyIdL].islandNodeIndex);
         const uint lockFlags = bodySimPool[nodeIndex].lockFlags_disableGravity & 0xFFFFu;
 
         float3 linVel = curVel0.xyz;
@@ -1458,7 +1487,7 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
 
         float3 angularMotionVel = angVel;
         if (bodyId >= bodyOffset)
-            angularMotionVel = mat33Transform(mat33Load(gIData[bodyId].sqrtInvInertia), angVel);
+            angularMotionVel = mat33Transform(mat33Load(gIData[bodyIdL].sqrtInvInertia), angVel);
 
         if ((lockFlags & PXG_LOCK_ANGULAR_X) != 0)
             angularMotionVel.x = 0.0f;
@@ -1484,8 +1513,8 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
 
         if (threadIdInWorkUnit == 0)
         {
-            float4 q = gIData[bodyId].deltaBody2World.q();
-            float3 p = gIData[bodyId].deltaBody2World.p();
+            float4 q = gIData[bodyIdL].deltaBody2World.q();
+            float3 p = gIData[bodyIdL].deltaBody2World.p();
 
             const float w2 = dot(angularMotionVel, angularMotionVel);
 
@@ -1518,7 +1547,7 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
         // copy the final velocity to the corresponding body velocity slots
         for (uint b = threadIdInWorkUnit; b < numSlabs; b += numThreadsPerBody)
         {
-            const uint bodyIndex = (bodyId - bodyOffset) * numSlabs + b;
+            const uint bodyIndex = slabBodyL * numSlabs + b;   // == (bodyId - bodyOffset) * numSlabs + b on every active lane
             const uint remappedBodyIndex = solverReferences[bodyIndex];
             if (remappedBodyIndex != 0xFFFFFFFFu)
             {

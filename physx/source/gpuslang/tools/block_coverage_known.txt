@@ -22,8 +22,18 @@
 #          16 of them fell through the plane (final y = -73.807, |v| = 39.240, 32
 #          failed checks).  With the covering loop, 0.
 #
-# Both were found by hand, late, and by accident.  This file exists so the third one
-# is found by the build.
+#   P9.97a initializeSolverVelocitiesTGS / computeAverageSolverBodyVelocityTGS /
+#          propagateAverageSolverBodyVelocityTGS: [numthreads(32,1,1)], warp = gid.x,
+#          against the engine's (32, 8) block -- one eighth of the CUDA's warps.  The
+#          check SAW them and passed them: its covering-construct rule took the per-body
+#          slab loop `b += numThreadsPerBody` for a grid stride.  A named-increment loop
+#          now counts only when its init is rooted in SV_GroupID / SV_DispatchThreadID /
+#          WorkgroupCount (check_block_coverage.py, grid_covers), and the selftest puts
+#          the one-warp group back in memory on every run.
+#
+# Both of the first two were found by hand, late, and by accident; the third passed this
+# file because of a rule that was too generous.  This file exists so the next one is
+# found by the build.
 #
 # A NEW short port fails the check by name.  A name left here after its port is fixed
 # ALSO fails it -- a stale allowlist is how a ratchet quietly stops ratcheting.

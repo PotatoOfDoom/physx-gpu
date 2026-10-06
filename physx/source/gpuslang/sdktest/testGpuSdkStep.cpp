@@ -2253,6 +2253,163 @@ SubstepGravityScene buildSubstepGravityScene(PxPhysics* physics, PxScene* scene,
     return s;
 }
 
+// PXG_SCENE=slabgrid (P9.97a): the TGS averaging family -- initializeSolverVelocitiesTGS,
+// computeAverageSolverBodyVelocityTGS and propagateAverageSolverBodyVelocityTGS -- at the
+// engine's own grid.
+//
+// All three kernels map bpw = 32/numThreadsPerBody bodies to one warp, numThreadsPerBody
+// = min(pow2(numSlabs), 32), and are launched with block (32, COMPUTE_BODIES_AVERAGE_VELOCITY
+// / 32 = 8) and a grid sized for 32 threads per body (PxgTGSCudaSolverCore.cpp:1232-1239,
+// :1295-1306, :1481-1495, :1734-1748).  Up to P9.97a the port ran [numthreads(32,1,1)] with
+// warp = gid.x under that grid: one eighth of the CUDA's warps.  Two engine-visible faults
+// followed, and each mode below observes one of them:
+//   * numSlabs >= 5 (>= 33 constraint partners on one body at gpuMaxNumPartitions 8):
+//     init, average and position-iteration propagate reach ~1/2, 1/4, 1/8 of the bodies.
+//   * >= 2 velocity iterations: the velocity-iteration propagate (grid
+//     ceil(32*ceil(M/10)/256)) reached 32*G_D bodies where the CUDA reaches 8*G_D*bpw.
+//
+// THE WHEEL.  A free-falling hub (10 kg box, spinning at w = 2 about y) with K satellites
+// (1 kg spheres) at radius R, each joined to the hub by a fully LOCKED D6.  The K joints
+// share the hub, so the partitioner needs K partitions and numSlabs = ceil(K / 8)
+// (PxgContext.cpp:1632-1633).  Correct: the hub falls freely (yFree = 50 - g dt^2 n(n+1)/2
+// = 48.73288 after n = 30 steps of 1/60), turns by ~w t = 1 rad, and every satellite stays
+// on the wheel.  Measured on the shipped port: the hub frozen at y = 50 (slab path) or at
+// 49.479 with every satellite off the wheel (whole-island path).
+//
+// THE REPLICAS.  80 identical spinning dumbbells (1 kg + 5 kg spheres, locked D6),
+// inserted FIRST, so replica i is solver bodies 1+2i and 2+2i (body 0 is the static world
+// body, mBodyStartIndex = 1); centred at x = 1030 + 12i so every x stays inside one binade
+// [1024, 2048) and the solve is translation-equivariant BIT FOR BIT.  Replicas are
+// partitioned by bitwise equality of their 26-float state (pose relative to the centre,
+// both velocities, both quaternions).  The partition is PREDICTED from the CUDA's
+// velocity-iteration reach C = min(T, 8*G_D*bpw), G_D = ceil(32*ceil(M/10)/256): a
+// replica both of whose bodies are below C is "full", the one straddling C is the
+// straddler, the rest share the fate of bodies the second velocity iteration does not
+// refresh.  UPSTREAM QUIRK KEPT: for numSlabs >= 3 that launch reaches fewer bodies than
+// exist (`(mBodyCount + 9) / 10` -- ten bodies per warp, the mapping the stale comment at
+// solverMultiBlockTGS.cu:457 describes, never updated for the numThreadsPerBody mapping;
+// it also omits mBodyStartIndex).  The port reproduces the CUDA, so the expected
+// partition has three classes; a port covering MORE than the CUDA (a 16-warp group) moves
+// the boundary and fails exactly as one covering less does.
+//
+// Modes (PXG_SLABGRID):
+//   slab   (default) 80 replicas, then hub + K = 136 at R = 15: numSlabs 17, bpw 1;
+//          T*numSlabs > 640, so the per-partition path (no solveWholeIslandTGS).
+//   whole  hub + K = 40 at R = 5: numSlabs 5; 42*5 <= 640, so the position iterations
+//          run solveWholeIslandTGS -- init and average on that path.
+//   one    80 replicas only: numSlabs 1; the velocity-iteration propagate alone.
+//   slab5  80 replicas + 100 free fillers + hub + K = 40: numSlabs 5, bpw 4, slab path.
+//          The fillers have NO slab reference and sit in the same warp lanes as
+//          referenced bodies; the only mode that observes an average that reads another
+//          warp's hasRef.
+// Every body: setSolverIterationCounts(4, 2), sleep threshold 0, no damping.  Nothing
+// touches anything (satellites 0.4 m apart at R = 15, replicas 12 m apart, a joint pair
+// does not collide), so the harness filter's contacts never arise.
+struct SlabGridScene
+{
+    const char* mode;
+    int K;
+    float R;
+    PxRigidDynamic* hub;
+    std::vector<PxRigidDynamic*> sats;
+    std::vector<PxRigidDynamic*> pa;
+    std::vector<PxRigidDynamic*> pb;
+    std::vector<PxRigidDynamic*> fillers;
+};
+
+SlabGridScene buildSlabGridScene(PxPhysics* physics, PxScene* scene, PxMaterial* material, const char* mode)
+{
+    SlabGridScene s = {};
+    s.mode = mode;
+    const bool slab = !std::strcmp(mode, "slab"), whole = !std::strcmp(mode, "whole"),
+               one = !std::strcmp(mode, "one"), slab5 = !std::strcmp(mode, "slab5");
+    s.K = slab ? 136 : (whole || slab5) ? 40 : 0;
+    s.R = slab ? 15.0f : 5.0f;
+    const int pairs = (slab || one || slab5) ? 80 : 0;
+    const int fill = slab5 ? 100 : 0;
+    auto setup = [&](PxRigidDynamic* b) {
+        b->setAngularDamping(0.0f);
+        b->setLinearDamping(0.0f);
+        b->setSleepThreshold(0.0f);
+        b->setSolverIterationCounts(4, 2);
+    };
+    auto lockAll = [&](PxD6Joint* j) {
+        for (PxD6Axis::Enum ax : { PxD6Axis::eX, PxD6Axis::eY, PxD6Axis::eZ, PxD6Axis::eTWIST, PxD6Axis::eSWING1,
+                                   PxD6Axis::eSWING2 })
+            j->setMotion(ax, PxD6Motion::eLOCKED);
+    };
+    // replicas FIRST: replica i = solver bodies 1+2i, 2+2i
+    for (int i = 0; i < pairs; ++i)
+    {
+        const PxVec3 c(1030.0f + 12.0f * float(i), 48.0f, 0.0f), r(1.5f, 0.0f, 0.0f);
+        PxRigidDynamic* A = physics->createRigidDynamic(PxTransform(c - r));
+        PxRigidDynamic* B = physics->createRigidDynamic(PxTransform(c + r));
+        for (PxRigidDynamic* X : { A, B })
+        {
+            PxShape* sh = physics->createShape(PxSphereGeometry(0.25f), *material);
+            X->attachShape(*sh);
+            sh->release();
+            setup(X);
+            X->setAngularVelocity(PxVec3(0.0f, 3.0f, 0.0f));
+        }
+        A->setMass(1.0f);
+        A->setMassSpaceInertiaTensor(PxVec3(0.025f));
+        B->setMass(5.0f);
+        B->setMassSpaceInertiaTensor(PxVec3(0.125f));
+        A->setLinearVelocity(PxVec3(0.0f, 3.0f, 0.0f).cross(-r));
+        B->setLinearVelocity(PxVec3(0.0f, 3.0f, 0.0f).cross(r));
+        scene->addActor(*A);
+        scene->addActor(*B);
+        lockAll(PxD6JointCreate(*physics, A, PxTransform(r * 2.0f), B, PxTransform(PxIdentity)));
+        s.pa.push_back(A);
+        s.pb.push_back(B);
+    }
+    for (int i = 0; i < fill; ++i)
+    {
+        PxRigidDynamic* b = physics->createRigidDynamic(
+            PxTransform(PxVec3(100.0f + 2.0f * float(i % 32), 50.0f, 2.0f * float(i / 32))));
+        PxShape* sh = physics->createShape(PxBoxGeometry(0.25f, 0.25f, 0.25f), *material);
+        b->attachShape(*sh);
+        sh->release();
+        b->setMass(10.0f);
+        b->setMassSpaceInertiaTensor(PxVec3(0.4f));
+        setup(b);
+        scene->addActor(*b);
+        s.fillers.push_back(b);
+    }
+    if (s.K > 0)
+    {
+        const float w = 2.0f, y0 = 50.0f;
+        s.hub = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, y0, 0.0f)));
+        PxShape* hs = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *material);
+        s.hub->attachShape(*hs);
+        hs->release();
+        s.hub->setMass(10.0f);
+        s.hub->setMassSpaceInertiaTensor(PxVec3(10.0f / 6.0f));
+        setup(s.hub);
+        s.hub->setAngularVelocity(PxVec3(0.0f, w, 0.0f));
+        scene->addActor(*s.hub);
+        for (int i = 0; i < s.K; ++i)
+        {
+            const float a = 6.283185307f * float(i) / float(s.K);
+            const PxVec3 r(s.R * std::cos(a), 0.0f, s.R * std::sin(a));
+            PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, y0, 0.0f) + r));
+            PxShape* sh = physics->createShape(PxSphereGeometry(0.2f), *material);
+            b->attachShape(*sh);
+            sh->release();
+            b->setMass(1.0f);
+            b->setMassSpaceInertiaTensor(PxVec3(0.016f));
+            setup(b);
+            b->setLinearVelocity(PxVec3(0.0f, w, 0.0f).cross(r));
+            b->setAngularVelocity(PxVec3(0.0f, w, 0.0f));
+            scene->addActor(*b);
+            lockAll(PxD6JointCreate(*physics, s.hub, PxTransform(r), b, PxTransform(PxIdentity)));
+            s.sats.push_back(b);
+        }
+    }
+    return s;
+}
+
 // PXG_SCENE=forcethreshold (P9.91): the FORCE-THRESHOLD REPORTING pipeline.
 //
 // PxgGpuContext::doConstraintSolveGPU runs accumulatedForceThresholdStream() -- the
@@ -11343,6 +11500,195 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=slabgrid (P9.97a): the TGS averaging family at the engine grid; the modes and
+    // the predicted replica partition are described at buildSlabGridScene.
+    if (!std::strcmp(sceneName, "slabgrid"))
+    {
+        const char* modeEnv = std::getenv("PXG_SLABGRID");
+        const char* mode = modeEnv ? modeEnv : "slab";
+        if (std::strcmp(mode, "slab") && std::strcmp(mode, "whole") && std::strcmp(mode, "one") &&
+            std::strcmp(mode, "slab5"))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: PXG_SLABGRID=%s is not a mode (slab | whole | one | slab5)\n", mode);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        if (usePgs)
+        {
+            // The three kernels are launched by PxgTGSCudaSolverCore only; the PGS twins are
+            // 2-D / 256 wide already, and the replica partition below is the TGS launch's.
+            std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=slabgrid is TGS-only (it observes the TGS "
+                        "averaging launches, PxgTGSCudaSolverCore.cpp:1232-1239/1295-1306/1481-1495/1734-1748)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 1;
+        }
+        SlabGridScene sg = buildSlabGridScene(physics, scene, material, mode);
+        const int nPairs = int(sg.pa.size());
+        // solver-body counts: body 0 is the static world body (mBodyStartIndex = 1)
+        const uint32_t O = 1u;
+        const uint32_t M = uint32_t(2 * nPairs + int(sg.fillers.size()) + (sg.hub ? 1 + sg.K : 0));
+        const uint32_t T = M + O;
+        const uint32_t numSlabs = sg.K > 0 ? uint32_t((sg.K + 7) / 8) : 1u;   // gpuMaxNumPartitions 8
+        uint32_t nTPB = 1;
+        while (nTPB < numSlabs) nTPB <<= 1;
+        nTPB = std::min(nTPB, 32u);
+        const uint32_t bpw = 32u / nTPB;
+        const uint32_t GD = (32u * ((M + 9u) / 10u) + 255u) / 256u;     // PxgTGSCudaSolverCore.cpp:1734-1735
+        const uint32_t C = std::min(T, 8u * GD * bpw);                     // CUDA velocity-iteration reach
+        std::printf("  [  OK  ] scene 'slabgrid' built (mode %s): %d replicas, %zu fillers, %s K=%d R=%.0f; "
+                    "T=%u M=%u, expected numSlabs %u (bpw %u), %s path\n",
+                    mode, nPairs, sg.fillers.size(), sg.hub ? "hub +" : "no hub,", sg.K, double(sg.R), T, M,
+                    numSlabs, bpw, (T * numSlabs > 640u) ? "per-partition" : "whole-island (position iterations)");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: slabgrid pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 30;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+        }
+
+        int failures = 0;
+        const float yFree = 50.0f - 9.81f * dt * dt * 0.5f * float(steps) * float(steps + 1);   // 48.73288
+        if (sg.hub)
+        {
+            const PxTransform H = sg.hub->getGlobalPose();
+            const float hubAngle = 2.0f * std::atan2(H.q.y, H.q.w);
+            float maxRad = 0.0f, maxDy = 0.0f;
+            int off = 0, firstOff = -1;
+            for (int i = 0; i < sg.K; ++i)
+            {
+                const PxVec3 p = sg.sats[size_t(i)]->getGlobalPose().p - H.p;
+                const float er = std::fabs(std::sqrt(p.x * p.x + p.z * p.z) - sg.R), ey = std::fabs(p.y);
+                maxRad = std::max(maxRad, er);
+                maxDy = std::max(maxDy, ey);
+                if (!(er < 0.02f * sg.R) || !(ey < 1e-3f)) { ++off; if (firstOff < 0) firstOff = i; }
+            }
+            std::printf("  hub y=%.5f (free fall %.5f) angle=%.5f | satellites off the wheel %d/%d (first %d), "
+                        "max|r-R|=%.5f max|dy|=%.5f\n", H.p.y, yFree, hubAngle, off, sg.K, firstOff, maxRad, maxDy);
+            if (!(std::fabs(H.p.y - yFree) < 1e-3f))
+            { std::printf("FAIL: hub y = %.5f, free fall %.5f\n", H.p.y, yFree); ++failures; }
+            if (!(hubAngle >= 0.9f && hubAngle <= 1.1f))
+            { std::printf("FAIL: hub angle about y = %.5f, expected ~w*t = 1\n", hubAngle); ++failures; }
+            if (off)
+            { std::printf("FAIL: %d of %d satellites left the wheel (first %d)\n", off, sg.K, firstOff); ++failures; }
+        }
+        if (!sg.fillers.empty())
+        {
+            float fillDev = 0.0f;
+            for (PxRigidDynamic* f : sg.fillers)
+                fillDev = std::max(fillDev, std::fabs(f->getGlobalPose().p.y - yFree));
+            std::printf("  %zu fillers: max|y - yFree| = %.5f\n", sg.fillers.size(), fillDev);
+            if (!(fillDev < 1e-3f))
+            { std::printf("FAIL: fillers max|y - yFree| = %.5f\n", fillDev); ++failures; }
+        }
+        if (nPairs > 0)
+        {
+            auto state = [&](int i, float* o) {
+                const PxVec3 c(1030.0f + 12.0f * float(i), 0.0f, 0.0f);
+                const PxTransform a = sg.pa[size_t(i)]->getGlobalPose(), b = sg.pb[size_t(i)]->getGlobalPose();
+                const PxVec3 v[] = { a.p - c, b.p - c, sg.pa[size_t(i)]->getLinearVelocity(),
+                                     sg.pb[size_t(i)]->getLinearVelocity(), sg.pa[size_t(i)]->getAngularVelocity(),
+                                     sg.pb[size_t(i)]->getAngularVelocity() };
+                for (int k = 0; k < 6; ++k) { o[3 * k] = v[k].x; o[3 * k + 1] = v[k].y; o[3 * k + 2] = v[k].z; }
+                o[18] = a.q.x; o[19] = a.q.y; o[20] = a.q.z; o[21] = a.q.w;
+                o[22] = b.q.x; o[23] = b.q.y; o[24] = b.q.z; o[25] = b.q.w;
+            };
+            std::vector<std::vector<float>> st(size_t(nPairs), std::vector<float>(26));
+            for (int i = 0; i < nPairs; ++i) state(i, st[size_t(i)].data());
+            // measured: classes of bitwise-equal replicas, in order of first member
+            std::vector<int> cls(static_cast<size_t>(nPairs), -1);
+            int nc = 0;
+            for (int i = 0; i < nPairs; ++i)
+            {
+                if (cls[size_t(i)] >= 0) continue;
+                cls[size_t(i)] = nc;
+                for (int j = i + 1; j < nPairs; ++j)
+                    if (cls[size_t(j)] < 0 && !std::memcmp(st[size_t(i)].data(), st[size_t(j)].data(), 26 * sizeof(float)))
+                        cls[size_t(j)] = nc;
+                ++nc;
+            }
+            // predicted: full (2+2i < C), straddler (1+2i < C <= 2+2i), rest (1+2i >= C)
+            std::vector<int> pred(static_cast<size_t>(nPairs));
+            for (int i = 0; i < nPairs; ++i)
+            {
+                const uint32_t b1 = O + 2u * uint32_t(i), b2 = b1 + 1u;
+                pred[size_t(i)] = b2 < C ? 0 : (b1 < C ? 1 : 2);
+            }
+            auto describe = [&](const std::vector<int>& c) {
+                std::string out;
+                int prev = -1, start = 0;
+                for (int i = 0; i <= nPairs; ++i)
+                {
+                    const int v = i < nPairs ? c[size_t(i)] : -2;
+                    if (i > 0 && v != prev)
+                    {
+                        char buf[48];
+                        std::snprintf(buf, sizeof(buf), "[%d..%d]", start, i - 1);
+                        out += buf;
+                        start = i;
+                    }
+                    prev = v;
+                }
+                return out;
+            };
+            // canonical form of the prediction: class ids numbered by first member
+            std::vector<int> predCanon(static_cast<size_t>(nPairs));
+            {
+                int map[3] = { -1, -1, -1 }, next = 0;
+                for (int i = 0; i < nPairs; ++i)
+                {
+                    int& m = map[pred[size_t(i)]];
+                    if (m < 0) m = next++;
+                    predCanon[size_t(i)] = m;
+                }
+            }
+            int diff0 = 0, first0 = -1;
+            float maxDev = 0.0f;
+            for (int i = 1; i < nPairs; ++i)
+            {
+                if (cls[size_t(i)] != cls[0]) { ++diff0; if (first0 < 0) first0 = i; }
+                for (int k = 0; k < 26; ++k)
+                    maxDev = std::max(maxDev, std::fabs(st[size_t(i)][size_t(k)] - st[0][size_t(k)]));
+            }
+            std::printf("  replicas: G_D=%u bpw=%u C=min(T, 8*G_D*bpw)=%u | expected classes %s | measured %d "
+                        "class(es) %s | %d/%d differ from replica 0 (first %d), max|dev|=%.3g\n",
+                        GD, bpw, C, describe(pred).c_str(), nc, describe(cls).c_str(), diff0, nPairs - 1, first0,
+                        double(maxDev));
+            if (cls != predCanon)
+            {
+                std::printf("FAIL: replica partition %s, the CUDA's velocity-iteration reach predicts %s\n",
+                            describe(cls).c_str(), describe(pred).c_str());
+                ++failures;
+            }
+        }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (cpuControl)
+        {
+            std::printf("[ control ] gpu-sdk-step: slabgrid(%s) CPU control run (%d check(s) failed), not scored "
+                        "(the replica partition is the GPU launch's)\n", mode, failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            if (nPairs > 0)
+                std::printf("[  OK  ] gpu-sdk-step: slabgrid(%s): T=%u M=%u numSlabs %u -- every check holds, replica "
+                            "boundary C=%u as the CUDA's velocity-iteration launch predicts\n", mode, T, M, numSlabs, C);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: slabgrid(%s): T=%u M=%u numSlabs %u -- the hub falls freely and "
+                            "all %d satellites stay on the wheel\n", mode, T, M, numSlabs, sg.K);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: scene 'slabgrid' (%s): %d check(s) failed\n", mode, failures);
+        return 2;
+    }
+
     // PXG_SCENE=sdfquery (P9.95): evaluatePointDistancesSDFBatch through
     // PxDirectGPUAPI::evaluateSDFDistances.  The meshes, shapes and points are described
     // at buildSdfQueryScene.
@@ -12171,6 +12517,7 @@ int main()
                        "          directapiwrite                          (P9.93: direct-API setters + acceleration getters)\n"
                        "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
                        "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
+                       "          slabgrid                                (P9.97a: TGS init/average/propagate at the engine grid; PXG_SLABGRID=slab|whole|one|slab5)\n"
                        "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
                        "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
                        "          directapimerge                          (P9.95: shapes added / re-inserted between steps -> mergeTransformCacheAndBoundArrayChanges)\n"

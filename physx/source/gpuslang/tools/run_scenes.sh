@@ -93,9 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.95f, softbodyhex added): 62 named scenes below, plus thirteen explicit rows
+# Today (P9.97a, slabgrid added): 63 named scenes below, plus sixteen explicit rows
 # after the loop (the settling bag, three softbody floors, the softbodyhex box arm, eight
-# PGS rows) = 75.
+# PGS rows, three slabgrid modes) = 79.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -104,7 +104,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
-        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity particleapply softbodydata
+        sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity slabgrid particleapply softbodydata
         directapimerge sdfquery softbodyhex"
 
 pass=0; fail=0; missing=0
@@ -216,6 +216,17 @@ run_one "directapimerge (PGS)" PXG_SCENE=directapimerge PXG_SOLVER=pgs
 # under PGS as well, since both callers of the hex solve take isTGS from the solver.
 run_one "softbodyhex (box)" PXG_SCENE=softbodyhex PXG_SB_HEX=box
 run_one "softbodyhex (PGS)" PXG_SCENE=softbodyhex PXG_SB_HEX=fork PXG_SOLVER=pgs
+
+# P9.97a: slabgrid observes the TGS averaging family (initializeSolverVelocitiesTGS,
+# computeAverageSolverBodyVelocityTGS, propagateAverageSolverBodyVelocityTGS) at the
+# engine grid.  The named row above runs the default `slab` mode (numSlabs 17, per-
+# partition path, replica partition pinned to the CUDA's velocity-iteration reach); the
+# three rows below are the whole-island path at numSlabs 5, the velocity-iteration
+# propagate alone at numSlabs 1, and numSlabs 5 on the slab path with reference-less
+# fillers.  No PGS row: the kernels are TGS-only and the scene refuses PXG_SOLVER=pgs.
+run_one "slabgrid (whole)" PXG_SCENE=slabgrid PXG_SLABGRID=whole
+run_one "slabgrid (one)"   PXG_SCENE=slabgrid PXG_SLABGRID=one
+run_one "slabgrid (slab5)" PXG_SCENE=slabgrid PXG_SLABGRID=slab5
 
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"

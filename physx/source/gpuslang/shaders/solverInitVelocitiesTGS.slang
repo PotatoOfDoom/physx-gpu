@@ -40,9 +40,16 @@
 //
 // Work layout: the CUDA uses a 2D block (32 lanes x blockDim.y = 8 warps) with
 // numThreadsPerBody = min(nextPow2(numSlabs), 32) cooperating threads per body
-// and numBodiesPerWarp = 32 / numThreadsPerBody bodies per warp.  Here each warp
-// maps to one 32-thread group (group id == warpIndex == blockIdx.x*8 +
-// threadIdx.y), so the dispatch multiplies the engine's block count by 8.
+// and numBodiesPerWarp = 32 / numThreadsPerBody bodies per warp.  The engine
+// launches that (32, 8) block with grid ceil(32*(mBodyCount+mBodyStartIndex)/256)
+// (PxgTGSCudaSolverCore.cpp:1295-1306); the bridge drops blockDim and dispatches
+// that grid unscaled, so the group IS the CUDA block: [numthreads(32,
+// INITVEL_WARPS_PER_BLOCK = 8, 1)], threadIdx.x = gtid.x, threadIdx.y = gtid.y,
+// warpIndex = gid.x*8 + gtid.y (.cu:689).  Up to P9.97a the group was ONE warp
+// (warpIndex = gid.x) and the fixture dispatched grid*8, a multiplication nothing
+// in the engine performs: the engine ran 1/8 of the CUDA's warps, and every body
+// past ceil(T/8)*bpw was never seeded for numSlabs >= 5 (PXG_SCENE=slabgrid froze
+// the hub at its start height).
 //
 // P5 Step 4 BDA engine-launch ABI: the kernel takes the engine's
 // (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*) pack and
@@ -75,8 +82,11 @@ uint nextPowerOfTwo(uint x)
     return x + 1;
 }
 
+// CUDA block (32, COMPUTE_BODIES_AVERAGE_VELOCITY / 32) -- PxgTGSCudaSolverCore.cpp:1306
+static const uint INITVEL_WARPS_PER_BLOCK = 8u;   // PxgKernelBlockDim::COMPUTE_BODIES_AVERAGE_VELOCITY (256) / 32
+
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(32, INITVEL_WARPS_PER_BLOCK, 1)]
 void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gParams.solverCoreDesc))[0];
@@ -105,16 +115,28 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32u / numThreadsPerBody;
 
-    const uint warpIndex = gid.x;                       // one 32-thread group per warp
-    const uint lane = gtid.x;
+    const uint warpIndex = gid.x * INITVEL_WARPS_PER_BLOCK + gtid.y;   // .cu:689 blockIdx.x * blockDim.y + threadIdx.y
+    const uint lane = gtid.x;                     // threadIdx.x
     const uint threadIdxInWorkUnit = lane & (numThreadsPerBody - 1u);
     const uint bodyInWarp = lane / numThreadsPerBody;
     const uint bodyId = warpIndex * numBodiesPerWarp + bodyInWarp;
 
     if (bodyId < allBodiesCount)
     {
-        const float4 linVel = velocities[bodyId];
-        const float4 angVel = velocities[bodyId + allBodiesCount];
+        // MASKED-LANE LOAD CLAMP (P9.97a).  llvmpipe issues a guarded BDA load for the
+        // lanes the guard excludes and blends the value away afterwards (P9.22), so the
+        // excluded lanes' ADDRESSES must stay in the buffer.  The grid is sized for 32
+        // threads per body and a warp serves bpw = 32/numThreadsPerBody bodies, so
+        // bodyId reaches 8*G*bpw ~ 32T at numSlabs 1 -- ~31T float4 past the 2T
+        // velocity array.  Load addresses use the clamped id; every active lane has
+        // bodyIdL == bodyId, so the result is bit-identical, and every store keeps
+        // bodyId.  slabBodyL does the same for the slab loop's (bodyId - bodyOffset),
+        // which UNDERFLOWS for the masked lanes with bodyId < bodyOffset (the loop below
+        // runs only for bodyId >= bodyOffset, but the excluded lanes' loads are issued).
+        const uint bodyIdL = min(bodyId, allBodiesCount - 1u);
+        const uint slabBodyL = (bodyIdL >= bodyOffset) ? (bodyIdL - bodyOffset) : 0u;
+        const float4 linVel = velocities[bodyIdL];
+        const float4 angVel = velocities[bodyIdL + allBodiesCount];
 
         const float4 vel0 = float4(linVel.x, linVel.y, linVel.z, angVel.x);
         const float4 vel1 = float4(angVel.y, angVel.z, 0.0f, 0.0f);
@@ -124,7 +146,7 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
         {
             for (uint b = threadIdxInWorkUnit; b < numSlabs; b += numThreadsPerBody)
             {
-                const uint bodyIndex = numSlabs * (bodyId - bodyOffset) + b;
+                const uint bodyIndex = numSlabs * slabBodyL + b;   // == numSlabs * (bodyId - bodyOffset) + b on every active lane
                 const uint remappedBodyIndex = solverReferences[bodyIndex];
 
                 // THE BOUND IS A DELIBERATE DIVERGENCE FROM THE CUDA, and it is the
