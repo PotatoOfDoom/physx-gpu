@@ -61,7 +61,8 @@
 // and not noise: on the grid-aligned dense scene the reported sample at an
 // integer texel coordinate must be the stored texel BIT-EXACTLY, and on the
 // sparse scene it must agree with sparseOracle inside P9.12a's measured filter
-// bounds.
+// bounds.  Since P9.96 every reported sample is also bitwise against sdfSampleRef
+// (pxgSdfSceneRef.h) at the host's texel coordinate, on both scenes.
 //
 // ---------------------------------------------------------------------------
 // THE TWO SCENES, and why the second one exists
@@ -336,12 +337,13 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
     dev->flush();
     const auto D = downloadBuffer<float>(dev, bOutD, size_t(N) * STRIDE_GRAD);
 
-    size_t badClamp = 0, badF = 0, badMag = 0, badSum = 0, badSample = 0;
+    size_t badClamp = 0, badF = 0, badMag = 0, badSum = 0, badSample = 0, badRef = 0;
+    const SdfRefVols refVols = sdfRefVols(*r.s);
     size_t nOutside = 0, nInside = 0, nExactTexel = 0;
     double worstSample = 0.0;
-    // P9.12a's measured filter bounds, reused: a FLOAT coarse texture is good to
-    // ~3e-06 over a range of 8, an 8-bit UNORM subgrid to half a quantisation
-    // step of its own range.
+    // P9.12a's measured filter bounds, kept as the SECONDARY check against the
+    // engine's decodeSparse at the nodes (its coarse branch is PxTriLerp, not the
+    // guide's sum); the primary check is bitwise against sdfSampleRef (P9.96).
     const double sparseBound = (r.s->sg == 0u) ? 0.0
                              : 0.5 * double(r.s->smax - r.s->smin) / 255.0 + 1e-4;
     for (uint32_t i = 0; i < N; ++i)
@@ -380,6 +382,19 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
             ++badSum;
         }
         if (wantDiffMag[i] > 0.0f) ++nOutside; else ++nInside;
+
+        // P9.96: every reported sample, bit for bit, against the host transcription of
+        // Sample() at the texel coordinate the host computed (and that o[3..5] was just
+        // checked to equal) -- pxgTex3D is CUDA's filter now, not a tolerance.
+        {
+            const float ref = sdfSampleRef(*r.s, refVols, wantF[i]);
+            if (!bitEq(o[7], ref))
+            {
+                if (badRef < 4)
+                    std::printf("    %s %s: sample %.9g != sdfSampleRef %.9g\n", r.label, r.pts[i].name, o[7], ref);
+                ++badRef;
+            }
+        }
 
         // Is the reported sample really the SDF's?
         if (r.pts[i].gx >= 0)
@@ -423,6 +438,8 @@ static void checkScene(PxgSlangComputeDevice* dev, SceneRun& r,
                   r.label, badSum);
     PXG_CHECK_MSG(badSample == 0, "%s: %zu reported samples are not the SDF's own values",
                   r.label, badSample);
+    PXG_CHECK_MSG(badRef == 0, "%s: %zu of %u reported samples differ from sdfSampleRef bit for bit",
+                  r.label, badRef, N);
     PXG_CHECK_MSG(nOutside > 0 && nInside > 0,
                   "%s: the point list must contain points BOTH inside and outside the box "
                   "(%zu outside, %zu inside) -- diffMag is dead weight otherwise",

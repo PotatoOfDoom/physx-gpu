@@ -35,6 +35,10 @@
 //      filter's weight precision, so this path is a documented REPLACEMENT
 //      of CUDA tex3D, not a bit-exact port; fixed-point hardware filters
 //      get a per-device tolerance in P5 (PXG_TEX3D_TOL overrides).
+// P9.96: the ENGINE path no longer samples -- pxgSlangTex3d.slang evaluates CUDA's
+// filter from texel loads and is bitwise against tests/pxgTex3dRef.h
+// (npTex3dBindless).  This probe keeps its hardware sampler, its set-0 binding and
+// its tolerance on purpose: it is the record of what the Vulkan sampler does.
 
 #include "pxgTestFramework.h"
 

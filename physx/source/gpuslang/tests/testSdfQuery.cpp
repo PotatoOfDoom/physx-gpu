@@ -40,10 +40,15 @@
 //      sdfQueryBda.spv, so under a module mutant this cross-check stays the clean
 //      reference -- that is what lets the module sweeps below bite.
 //  (2) An INDEPENDENT ANCHOR on two grid-aligned dense meshes (power-of-two spacing,
-//      dyadic meshLower, POWER-OF-TWO DIMENSIONS -- see buildAligned), where a point on
+//      dyadic meshLower; power-of-two dimensions until P9.96 -- see buildAligned), where a point on
 //      a texel centre has an exact integer texel coordinate: the distance must BE the stored texel, the gradient the per-axis
 //      difference of the stored neighbours, normalised by the engine's PxVec3.  On the
-//      sparse mesh the distance is held to sparseOracle inside P9.12a's filter bound.
+//      sparse mesh the distance is bitwise against the host's PxSdfDistance over
+//      sdfSampleRef (P9.96; until then it was held to sparseOracle inside P9.12a's
+//      filter bound, which stays as a secondary bound at the nodes).  The node slots'
+//      output bits were recorded before P9.96 replaced the sampler and are asserted
+//      unchanged, and sdfQueryNonPow2 checks the same anchors on a 10 x 7 x 11 grid,
+//      plus every slot's distance bitwise against the host's PxSdfDistance.
 //  (3) PLUMBING facts: every slot past a shape's count keeps its poison, a trap slot past
 //      the whole output keeps its poison, the inputs are bit-unchanged, a mesh without an
 //      SDF writes nothing (D1), a scaled + rotated shape over the same mesh answers
@@ -168,18 +173,19 @@ static const float EPSHI_G = 1.00000086e-20f;   // 0x1e3ce513, |g| = 1.00000433e
 // of `lower + k*spacing` is exactly k.  No texel is -0; the only zero texels are the
 // four patched +0s below, and none is an anchor centre of the fixed points.
 //
-// AND POWER-OF-TWO DIMENSIONS, which the review's plan (dims 10 x 7 x 11) did not have
-// and which turned out to be necessary: pxgTex3D hands the sampler NORMALISED
-// coordinates, (k + 0.5) / dim (pxgSlangTex3d.slang:97 -- Vulkan allows unnormalised
-// coordinates only on 1D/2D views), and the sampler scales them back by dim.  For a
+// AND POWER-OF-TWO DIMENSIONS, which were necessary until P9.96: pxgTex3D handed a
+// Vulkan sampler NORMALISED coordinates, (k + 0.5) / dim (Vulkan allows unnormalised
+// coordinates only on 1D/2D views), and the sampler scaled them back by dim.  For a
 // dim that is not a power of two that round trip is not exact, the trilinear weights
-// come out a few ulps off 0/1, and a "texel-centre" sample mixes in ~1e-7 of the
-// neighbour.  MEASURED here with dims 10 x 7 x 11: the flat-gradient point read
+// came out a few ulps off 0/1, and a "texel-centre" sample mixed in ~1e-7 of the
+// neighbour.  MEASURED (P9.95e) with dims 10 x 7 x 11: the flat-gradient point read
 // grad.z = -1.07e-06 instead of 0, and 85 of the 1024 points of sdfQueryGrid's first
-// case missed the stored texels' gradient by an ulp or more.  With dims 2^n both divisions are exact.
-// (The same round trip makes every SDF sample of the port deviate from CUDA's
-// unnormalised tex3D by that much on non-power-of-two grids -- a P9.12a matter,
-// recorded in the P9.95 report, not changed here.)
+// case missed the stored texels' gradient by an ulp or more.
+// P9.96 removed the round trip: the filter now runs in texel space from texel loads,
+// and a texel centre is exact for EVERY extent -- sdfQueryNonPow2 pins that on a
+// 10 x 7 x 11 grid (140 of its 1024 slots differed on the old sampler, 0 now).  The
+// meshes below keep their power-of-two dims so that their recorded bits stay
+// comparable; nothing requires them any more.
 static void buildAligned(SdfScene& s, uint32_t dx, uint32_t dy, uint32_t dz, const PxVec3& meshLower,
                          uint32_t seed, bool patch)
 {
@@ -799,6 +805,33 @@ PXG_TEST(sdfQuery)
     PXG_CHECK_MSG(bad == 0, "sdfQuery: %zu slot(s) differ bitwise from convexMeshMidphase.cu:1282-1286", bad);
     PXG_CHECK_MSG(anchored >= 2 * 200 && anchoredAl2 == 3, "sdfQuery: %zu / %zu independent anchors", anchored, anchoredAl2);
 
+    // P9.96: the node slots' output BITS, recorded on the pre-P9.96 sampler and
+    // asserted unchanged after the filter was replaced.  Every node of the aligned
+    // meshes (borders included, anchorable or not) sits at an integer texel
+    // coordinate, so every tap the kernel takes there has weight 0 or 1 under both
+    // filters; this pins that the argument holds in fact, not only on paper.
+    {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a 64
+        size_t nodes = 0;
+        for (uint32_t b : { 0u, 2u })
+        {
+            const std::vector<NodePt>& lst = b == 0u ? p0 : p2;
+            for (uint32_t i = 0; i < L.counts[b]; ++i)
+            {
+                if (lst[i].gx < 0) continue;
+                ++nodes;
+                const uint8_t* q = reinterpret_cast<const uint8_t*>(&L.out[size_t(b) * M + i]);
+                for (size_t k = 0; k < sizeof(PxVec4); ++k) { h ^= q[k]; h *= 1099511628211ull; }
+            }
+        }
+        std::printf("    [ note ] node-slot bits: FNV-1a 0x%016llx over %zu slots\n", (unsigned long long)h, nodes);
+        // Recorded on the pre-P9.96 tree (the Vulkan sampler, d0b07e4) with this exact
+        // point set; the P9.96 filter must reproduce it.
+        PXG_CHECK_MSG(h == 0x73976e65db8d123bull && nodes == 570u,
+                      "sdfQuery: the node slots' bits changed (FNV-1a 0x%016llx over %zu slots, recorded "
+                      "0x73976e65db8d123b over 570)", (unsigned long long)h, nodes);
+    }
+
     // The patched points, exactly.
     {
         const float dFlat = mAl.s.coarse[dIdx(mAl.s, FLAT_X, FLAT_Y, FLAT_Z)];
@@ -830,23 +863,43 @@ PXG_TEST(sdfQuery)
         }
     }
 
-    // M_sparse at its nodes: the distance against sparseOracle inside P9.12a's bound.
+    // M_sparse, every point, BIT FOR BIT against the host's PxSdfDistance: the box clamp
+    // and the texel coordinate exactly as sdfcClampToBox / sdfcTexCoord compute them,
+    // sdfSampleRef for Sample(), plus PxVec3::magnitude of the clamp offset (C3).  The
+    // nodes keep sparseOracle (the engine's decodeSparse) as a secondary BOUND: the
+    // spacing is 0.11, so a node's texel coordinate is an integer only to within an ulp,
+    // and the coarse branch of the oracle is the engine's PxTriLerp (pxgSlangTex3d K2).
     {
+        const SdfRefVols vols = sdfRefVols(mSp.s);
+        const HostSdfBox& bx = mSp.box;
         const double bound = 0.5 * double(mSp.s.smax - mSp.s.smin) / 255.0 + 1e-4;
-        size_t n = 0, off = 0;
+        size_t n = 0, off = 0, bad = 0;
         for (uint32_t i = 0; i < 37; ++i)
         {
+            const PxVec3 p = p1[i].p;
+            const PxVec3 hi(std::max(p.x, bx.lower.x), std::max(p.y, bx.lower.y), std::max(p.z, bx.lower.z));
+            const PxVec3 cl(std::min(hi.x, bx.higher.x), std::min(hi.y, bx.higher.y), std::min(hi.z, bx.higher.z));
+            const PxVec3 f = (cl - bx.lower) * bx.invDx;
+            const float want = sdfSampleRef(mSp.s, vols, f) + (p - cl).magnitude();
+            const float got = L.out[size_t(1) * M + i].w;
+            if (f2u(got) != f2u(want))
+            {
+                if (bad < 5)
+                    std::printf("    M_sparse point %u: %.9g vs host PxSdfDistance %.9g\n", i, got, want);
+                ++bad;
+            }
             if (p1[i].gx < 0) continue;
             ++n;
-            const float want = sparseOracle(mSp.s, p1[i].gx, p1[i].gy, p1[i].gz);
-            if (std::fabs(double(L.out[size_t(1) * M + i].w) - double(want)) > bound)
+            const float o = sparseOracle(mSp.s, p1[i].gx, p1[i].gy, p1[i].gz);
+            if (std::fabs(double(got) - double(o)) > bound)
             {
                 std::printf("    M_sparse node (%d,%d,%d): %.9g vs sparseOracle %.9g\n", p1[i].gx, p1[i].gy, p1[i].gz,
-                            L.out[size_t(1) * M + i].w, want);
+                            got, o);
                 ++off;
             }
         }
-        PXG_CHECK_MSG(n == 12 && off == 0, "M_sparse: %zu of %zu node distances outside the filter bound", off, n);
+        PXG_CHECK_MSG(bad == 0, "M_sparse: %zu of 37 distances differ from the host PxSdfDistance", bad);
+        PXG_CHECK_MSG(n == 12 && off == 0, "M_sparse: %zu of %zu node distances outside the decodeSparse bound", off, n);
     }
 
     // Q8: the scaled, rotated shape over the same mesh answers identically.
@@ -989,6 +1042,17 @@ PXG_TEST(sdfQueryGrid)
 // one, chosen so that the two paths' NORMALISED gradients differ bitwise -- checked
 // here, before the kernel runs, from npSdfCollision's own distances at the six
 // fall-back taps.
+//
+// P9.96 CHANGED WHAT "A ROUNDING ERROR OFF" BUYS.  pxgTex3D now rounds each filter
+// weight to the nearest 1/256 (CUDA's 1.8 fixed point), so a tap an ulp off a texel
+// coordinate reads EXACTLY what the exact tap reads unless that ulp moves a weight
+// across a rounding boundary.  Measured: on the first 32 random base points four of the
+// six bounds no longer had a telling point, and 64 rounds of random points (114,688
+// candidates) found none either.  What still tells the paths apart is a coordinate that
+// sits EXACTLY on a weight tie, f = j + (m + 0.5)/256, where the fall-back tap's ulp of
+// error rounds the weight the other way.  So the first round keeps the pre-P9.96 random
+// points and every later round places all three coordinates on such ties; two rounds
+// suffice (printed).  The kernel check itself is unchanged.
 // ===========================================================================
 PXG_TEST(sdfQueryGuard)
 {
@@ -1003,53 +1067,74 @@ PXG_TEST(sdfQueryGuard)
     PXG_CHECK_MSG(uploadMesh(H.dev, mD, 3u, 2u, 1u), "mesh upload");
     const HostSdfBox& b = mD.box;
 
-    // Candidates: every exact guard coordinate, over 32 interior base points.
-    std::vector<PxVec3> cand;
-    std::vector<int> candBound;
+    // Candidates: every exact guard coordinate, over interior base points drawn in
+    // rounds of 32 until every bound has a point that tells the two paths apart.  (The
+    // first round is the pre-P9.96 set; see the P9.96 note above for why more rounds
+    // are needed now.)
     std::mt19937 rng(0x6A2Du);
-    for (int base = 0; base < 32; ++base)
+    std::vector<PxVec3> pts;
+    bool have[6] = { false, false, false, false, false, false };
+    int rounds = 0;
+    size_t tried = 0;
+    const float dx = b.dx;
+    for (; rounds < 64 && !(have[0] && have[1] && have[2] && have[3] && have[4] && have[5]); ++rounds)
     {
-        const PxVec3 q0 = at(b, 1.0f + float(rng() % 500u) / 100.0f, 1.0f + float(rng() % 100u) / 100.0f,
-                             1.0f + float(rng() % 1300u) / 100.0f);
-        for (int k = 0; k < 6; ++k)
+        std::vector<PxVec3> cand;
+        std::vector<int> candBound;
+        for (int base = 0; base < 32; ++base)
         {
-            const int axis = k / 2;
-            const float target = (k % 2 == 0) ? 1.0f : float(b.dims[axis]) - 2.0f;
-            for (float c : guardCoords(b, axis, target))
+            PxVec3 q0 = at(b, 1.0f + float(rng() % 500u) / 100.0f, 1.0f + float(rng() % 100u) / 100.0f,
+                           1.0f + float(rng() % 1300u) / 100.0f);
+            if (rounds > 0)
             {
-                PxVec3 q = q0;
-                (&q.x)[axis] = c;
-                cand.push_back(q);
-                candBound.push_back(k);
+                // P9.96: every coordinate on an exact weight TIE, f = j + (m + 0.5)/256,
+                // where an ulp of tap error decides which way the 1/256 weight rounds.
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    const float target = 1.0f + float(rng() % (b.dims[axis] - 3u)) + (float(rng() % 256u) + 0.5f) / 256.0f;
+                    const std::vector<float> hit = guardCoords(b, axis, target);
+                    if (!hit.empty()) (&q0.x)[axis] = hit[0];
+                }
+            }
+            for (int k = 0; k < 6; ++k)
+            {
+                const int axis = k / 2;
+                const float target = (k % 2 == 0) ? 1.0f : float(b.dims[axis]) - 2.0f;
+                for (float c : guardCoords(b, axis, target))
+                {
+                    PxVec3 q = q0;
+                    (&q.x)[axis] = c;
+                    cand.push_back(q);
+                    candBound.push_back(k);
+                }
+            }
+        }
+        std::vector<PxVec3> taps;
+        for (const PxVec3& q : cand)
+        {
+            taps.push_back(q + PxVec3(dx, 0.0f, 0.0f)); taps.push_back(q - PxVec3(dx, 0.0f, 0.0f));
+            taps.push_back(q + PxVec3(0.0f, dx, 0.0f)); taps.push_back(q - PxVec3(0.0f, dx, 0.0f));
+            taps.push_back(q + PxVec3(0.0f, 0.0f, dx)); taps.push_back(q - PxVec3(0.0f, 0.0f, dx));
+        }
+        Cross ci, ct;
+        PXG_CHECK_MSG(crossCheck(H.dev, mD.addr, cand, ci) && crossCheck(H.dev, mD.addr, taps, ct), "cross-check");
+        tried += cand.size();
+        for (size_t j = 0; j < cand.size(); ++j)
+        {
+            const int k = candBound[j];
+            if (have[k]) continue;
+            PxVec3 fb(ct.d[6 * j + 0] - ct.d[6 * j + 1], ct.d[6 * j + 2] - ct.d[6 * j + 3], ct.d[6 * j + 4] - ct.d[6 * j + 5]);
+            PxVec3 in = ci.g[j];
+            fb.normalizeSafe();
+            in.normalizeSafe();
+            if (std::memcmp(&fb, &in, sizeof(PxVec3)) != 0)
+            {
+                have[k] = true;
+                pts.push_back(cand[j]);
             }
         }
     }
-    std::vector<PxVec3> taps;
-    const float dx = b.dx;
-    for (const PxVec3& q : cand)
-    {
-        taps.push_back(q + PxVec3(dx, 0.0f, 0.0f)); taps.push_back(q - PxVec3(dx, 0.0f, 0.0f));
-        taps.push_back(q + PxVec3(0.0f, dx, 0.0f)); taps.push_back(q - PxVec3(0.0f, dx, 0.0f));
-        taps.push_back(q + PxVec3(0.0f, 0.0f, dx)); taps.push_back(q - PxVec3(0.0f, 0.0f, dx));
-    }
-    Cross ci, ct;
-    PXG_CHECK_MSG(crossCheck(H.dev, mD.addr, cand, ci) && crossCheck(H.dev, mD.addr, taps, ct), "cross-check");
-    std::vector<PxVec3> pts;
-    bool have[6] = { false, false, false, false, false, false };
-    for (size_t j = 0; j < cand.size(); ++j)
-    {
-        const int k = candBound[j];
-        if (have[k]) continue;
-        PxVec3 fb(ct.d[6 * j + 0] - ct.d[6 * j + 1], ct.d[6 * j + 2] - ct.d[6 * j + 3], ct.d[6 * j + 4] - ct.d[6 * j + 5]);
-        PxVec3 in = ci.g[j];
-        fb.normalizeSafe();
-        in.normalizeSafe();
-        if (std::memcmp(&fb, &in, sizeof(PxVec3)) != 0)
-        {
-            have[k] = true;
-            pts.push_back(cand[j]);
-        }
-    }
+    std::printf("    [ note ] sdfQueryGuard: %d round(s) of 32 base points, %zu guard candidates\n", rounds, tried);
     for (int k = 0; k < 6; ++k)
         PXG_CHECK_MSG(have[k], "bound %d (axis %d, %s): no point on it tells the two gradient paths apart", k, k / 2,
                       (k % 2 == 0) ? "f == 1" : "f == dims - 2");
@@ -1070,4 +1155,132 @@ PXG_TEST(sdfQueryGuard)
     checkUntouched("sdfQueryGuard", L);
 }
 
+// ===========================================================================
+// sdfQueryNonPow2 (P9.96): the P9.95e finding as a regression test.  buildAligned with
+// dims 10 x 7 x 11 -- none a power of two -- and 1024 points: nodes everywhere on the
+// grid (borders included), half-texel points, and free points inside and outside the
+// box.  Every slot must equal the npSdfCollision cross-check bit for bit, and every
+// interior node the independent anchor (the stored texel and its neighbour
+// differences).  Before P9.96 the sampler was handed (k + 0.5) / dim, a round trip that
+// is inexact on these extents, and the anchors missed; since P9.96 the filter runs in
+// texel space and a texel centre is exact for every extent.  The cross-check imports
+// the same pxgSlangTex3d module as the kernel, so it cannot see a filter defect that
+// keeps texel centres exact; every slot's DISTANCE is therefore also compared bit for
+// bit with the host's PxSdfDistance (as M_sparse is in sdfQuery) -- the half-texel and
+// free points included, which no anchor reaches.
+// ===========================================================================
+PXG_TEST(sdfQueryNonPow2)
+{
+    Harness H;
+    if (!H.shim) return;
+    PXG_CHECK_MSG(H.ok, "harness");
+    if (!H.ok) return;
+    Mesh& mN = *H.add("M_np2");
+    buildAligned(mN.s, 10, 7, 11, PxVec3(-1.25f, 0.75f, -0.5f), 0x96A2u, false);
+    mN.hasSdf = true;
+    PXG_CHECK_MSG(uploadMesh(H.dev, mN, 4u, 6u, 1u), "mesh upload");
+
+    const uint32_t NP = 1024u;
+    std::vector<NodePt> pts;
+    {
+        const HostSdfBox& b = mN.box;
+        auto node = [&](int x, int y, int z) { pts.push_back({ at(b, float(x), float(y), float(z)), x, y, z }); };
+        // Every interior node once (8 x 5 x 9 = 360), then the eight corners.
+        for (int z = 1; z <= 9; ++z)
+            for (int y = 1; y <= 5; ++y)
+                for (int x = 1; x <= 8; ++x)
+                    node(x, y, z);
+        for (int c = 0; c < 8; ++c) node((c & 1) ? 9 : 0, (c & 2) ? 6 : 0, (c & 4) ? 10 : 0);
+        std::mt19937 rng(0x96A3u);
+        while (pts.size() < NP)
+        {
+            const uint32_t kind = rng() % 3u;
+            if (kind == 0u)
+                node(int(rng() % 10u), int(rng() % 7u), int(rng() % 11u));
+            else if (kind == 1u)
+                pts.push_back({ at(b, 0.5f + float(rng() % 9u), 0.5f + float(rng() % 6u), 0.5f + float(rng() % 10u)),
+                                -1, -1, -1 });
+            else
+                pts.push_back({ at(b, -2.0f + float(rng() % 1400u) / 100.0f, -2.0f + float(rng() % 1100u) / 100.0f,
+                                   -2.0f + float(rng() % 1500u) / 100.0f), -1, -1, -1 });
+        }
+    }
+    Launch L;
+    L.shapes = { meshShape(mN.addr, PxMeshScale(1.0f), 0u), meshShape(mN.addr, PxMeshScale(1.0f), 1u) };
+    L.shapeRefs = { 1u };
+    L.counts = { NP };
+    L.maxPointCount = NP;
+    L.in.resize(NP);
+    for (uint32_t i = 0; i < NP; ++i) { L.in[i] = PxVec4(pts[i].p, 0.0f); setW(L.in[i], i); }
+    Cross c;
+    PXG_CHECK_MSG(crossCheck(H.dev, mN.addr, justP(pts), c), "cross-check");
+    PXG_CHECK_MSG(runKernel(H.dev, *H.shim, L), "launch");
+    size_t anchored = 0;
+    const size_t bad = checkBatch("sdfQueryNonPow2", L, 0, c, &pts, &mN.s, &anchored);
+    PXG_CHECK_MSG(anchored >= 360, "sdfQueryNonPow2: only %zu interior nodes anchored", anchored);
+    PXG_CHECK_MSG(bad == 0, "sdfQueryNonPow2: %zu of %u slot(s) differ (cross-check or texel anchor) on a "
+                  "10 x 7 x 11 grid", bad, NP);
+    // The host's PxSdfDistance for every slot: the box clamp and the texel coordinate
+    // exactly as sdfcClampToBox / sdfcTexCoord compute them, sdfSampleRef for Sample()
+    // (pxgtex::tex3D at f + 0.5 on this dense mesh), plus PxVec3::magnitude of the
+    // clamp offset (C3).
+    // Bite asserts: every non-equivalent filter variant must change at least one of
+    // these host distances, so a module defect that keeps texel centres exact -- which
+    // the cross-check (same module) and the anchors (centres only) would both miss --
+    // still fails here.  Exempt: the out-of-domain family, for testSdfTexture's
+    // reasons (the engine stays inside [0.5, N - 0.5]; no -0 texel; w > h here), and
+    // the two tie rules -- no point here puts a weight on an exact 1/512 tie (the tie
+    // passes of npTex3dBindless and sdfTexture do).
+    size_t dBad = 0;
+    {
+        const SdfRefVols vols = sdfRefVols(mN.s);
+        const HostSdfBox& bx = mN.box;
+        std::vector<PxVec3> fs(NP), offs(NP);
+        std::vector<float> wants(NP);
+        for (uint32_t i = 0; i < NP; ++i)
+        {
+            const PxVec3 p = pts[i].p;
+            const PxVec3 hi(std::max(p.x, bx.lower.x), std::max(p.y, bx.lower.y), std::max(p.z, bx.lower.z));
+            const PxVec3 cl(std::min(hi.x, bx.higher.x), std::min(hi.y, bx.higher.y), std::min(hi.z, bx.higher.z));
+            const PxVec3 f = (cl - bx.lower) * bx.invDx;
+            fs[i] = f;
+            offs[i] = p - cl;
+            const float want = sdfSampleRef(mN.s, vols, f) + (p - cl).magnitude();
+            wants[i] = want;
+            const float got = L.out[i].w;
+            if (f2u(got) != f2u(want))
+            {
+                if (dBad < 5)
+                    std::printf("    sdfQueryNonPow2 slot %u: distance %.9g (0x%08x) vs host PxSdfDistance %.9g (0x%08x)\n",
+                                i, got, f2u(got), want, f2u(want));
+                ++dBad;
+            }
+        }
+        auto outOfDomain = [](int v) {
+            return v == pxgtex::V_CC_NONE || v == pxgtex::V_CC_LO_X || v == pxgtex::V_CC_HI_X ||
+                   v == pxgtex::V_CC_HI_N_Y || v == pxgtex::V_CC_LO_0_Z || v == pxgtex::V_Y_DIMX ||
+                   v == pxgtex::V_IDX_HI_X || v == pxgtex::V_TIES_DOWN || v == pxgtex::V_RNE;
+        };
+        std::printf("    [ note ] sdfQueryNonPow2 bite asserts over %u host distances:\n     ", NP);
+        for (int var = 1; var < pxgtex::V_COUNT; ++var)
+        {
+            size_t differ = 0;
+            for (uint32_t i = 0; i < NP; ++i)
+                if (f2u(sdfSampleRef(mN.s, vols, fs[i], var) + offs[i].magnitude()) != f2u(wants[i])) ++differ;
+            std::printf(" %s %zu%s", pxgtex::variantName(var), differ, var % 6 == 0 ? "\n     " : ";");
+            if (pxgtex::variantIsEquivalent(var))
+                PXG_CHECK_MSG(differ == 0, "%s is declared equivalent but changes %zu distances",
+                              pxgtex::variantName(var), differ);
+            else if (!outOfDomain(var))
+                PXG_CHECK_MSG(differ >= 1, "%s changes no distance of sdfQueryNonPow2", pxgtex::variantName(var));
+        }
+        std::printf("\n");
+    }
+    PXG_CHECK_MSG(dBad == 0, "sdfQueryNonPow2: %zu of %u distances differ from the host PxSdfDistance", dBad, NP);
+    std::printf("    [ note ] non-power-of-two 10 x 7 x 11: %u slots, %zu anchored, %zu differ; %u distances bitwise vs "
+                "the host PxSdfDistance, %zu differ\n", NP, anchored, bad, NP, dBad);
+    checkUntouched("sdfQueryNonPow2", L);
+}
+
 } // namespace
+

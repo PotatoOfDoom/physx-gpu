@@ -43,6 +43,23 @@
 // over and the cooked-blob writer now live in pxgSdfSceneRef.h, shared with the
 // P9.12d fixture; see that header for the scene's numbers and for the offline
 // measurement against the real Gu::SDF::decodeSparse.
+//
+// P9.96: NO TOLERANCE IS LEFT.  pxgTex3D evaluates CUDA's linear filter itself, so
+// every sample here is bitwise:
+//   * RESIDENT points against sparseOracle -- the engine's decodeSample, because the
+//     driver's UNORM read is the engine's spelling (npTex3dBindlessUnormExhaustive);
+//   * every point against sdfSampleRef (pxgSdfSceneRef.h), the host transcription of
+//     Sample() over pxgtex::tex3D, which is itself anchored to sparseOracle bit for
+//     bit on the resident points and on the coarse points with zero weights;
+//   * COARSE points keep their bound against sparseOracle as a secondary check: its
+//     coarse branch is the engine's nested PxTriLerp at quarter weights, which rounds
+//     differently from the guide's eight-term sum (pxgSlangTex3d.slang K2);
+//   * a FRACTIONAL pass -- the first check of Sample() between texels -- over both
+//     meshes: random f, block borders, subgrid faces, and exact weight TIES
+//     f = k + (j + 0.5)/256 on the dense mesh, which is what lets this fixture tell
+//     round-half-up from round-to-even and ties-down.
+// Bite asserts over the whole sample set run on the host at the END, after the three
+// launches (only the sdfSampleRef anchor to decodeSparse runs before its launch).
 
 #include "pxgTestFramework.h"
 
@@ -54,6 +71,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <vector>
 
 namespace physx { namespace gpuslang {
@@ -190,70 +208,110 @@ PXG_TEST(sdfTexture)
                       "subgridsSdfValueRange must be max - min, computed the same way");
     }
 
-    // ---- the samples, against the oracle ----
-    {
-        std::vector<F4> coords;
-        std::vector<float> want;
-        std::vector<int> resident;
-        for (int32_t z = 0; z <= int32_t(sp.dz); ++z)
-            for (int32_t y = 0; y <= int32_t(sp.dy); ++y)
-                for (int32_t x = 0; x <= int32_t(sp.dx); ++x)
-                {
-                    coords.push_back(F4{ float(x), float(y), float(z), 0.f });
-                    want.push_back(sparseOracle(sp, x, y, z));
-                    const uint32_t cx = std::min(uint32_t(x) / sp.sg, sp.nbx - 1);
-                    const uint32_t cy = std::min(uint32_t(y) / sp.sg, sp.nby - 1);
-                    const uint32_t cz = std::min(uint32_t(z) / sp.sg, sp.nbz - 1);
-                    resident.push_back(sp.starts[cz * sp.nbx * sp.nby + cy * sp.nbx + cx] != 0xFFFFFFFFu);
-                }
+    const SdfRefVols spVols = sdfRefVols(sp);
+    // Everything compared bitwise against sdfSampleRef, for the bite asserts below.
+    struct RefSample { const SdfScene* s; const SdfRefVols* v; PxVec3 f; };
+    std::vector<RefSample> allRef;
+
+    auto runAt = [&](uint64_t blobAddr, const std::vector<F4>& coords, std::vector<float>& got) {
         const uint32_t N = uint32_t(coords.size());
-        std::vector<float> outInit(N, -777.f);
         const PxgBufferHandle bC = createBufferFrom(dev, coords);
-        const PxgBufferHandle bO = createBufferFrom(dev, outInit);
+        const PxgBufferHandle bO = createBufferFrom(dev, std::vector<float>(N, -777.f));
         owned.push_back(bC); owned.push_back(bO);
-        P_Sdf prm = {}; prm.meshPtr = aBlobSp; prm.coords = dev->getBufferDeviceAddress(bC);
+        P_Sdf prm = {}; prm.meshPtr = blobAddr; prm.coords = dev->getBufferDeviceAddress(bC);
         prm.outValue = dev->getBufferDeviceAddress(bO); prm.numSamples = N;
         {
             Kernel k(Kernel::Bindless{}, "npSdfTexture.spv", "sdfTexSampleAt", {}, sizeof(P_Sdf));
             PXG_CHECK_MSG(k.isValid(), "bindless sample pipeline creation succeeds");
-            if (!k.isValid()) return;
+            if (!k.isValid()) return false;
             k.dispatch((N + 63) / 64, {}, prm);
         }
         dev->flush();
-        const auto got = downloadBuffer<float>(dev, bO, N);
+        got = downloadBuffer<float>(dev, bO, N);
+        return true;
+    };
 
-        // Two different bounds, because the two paths carry different precision
-        // and lumping them together would hide a regression in the tighter one:
-        //   RESIDENT  -- an 8-bit UNORM texel read at its centre.  P9.12a measured
-        //                the conversion as faithful to the stored byte, so what
-        //                must hold is that the value round-trips to the same byte,
-        //                i.e. |diff| below half a quantisation step of the range.
-        //   COARSE    -- a FLOAT texture, interpolated.  The host reference is the
-        //                engine's own PxTriLerp, the GPU is the hardware filter;
-        //                P9.12a measured that at 3.25e-06 over a range of 8, so
-        //                1e-5 of this scene's range is the bound.
-        const double residentBound = 0.5 * double(sp.smax - sp.smin) / 255.0;
-        const double coarseBound = 1e-5 * 3.0;
-        size_t badR = 0, badC = 0, nR = 0, nC = 0;
-        double worstR = 0.0, worstC = 0.0;
+    // ---- the integer fine grid, against the engine oracle and sdfSampleRef ----
+    {
+        std::vector<F4> coords;
+        std::vector<float> want, ref;
+        std::vector<int> resident, alpha0;
+        for (int32_t z = 0; z <= int32_t(sp.dz); ++z)
+            for (int32_t y = 0; y <= int32_t(sp.dy); ++y)
+                for (int32_t x = 0; x <= int32_t(sp.dx); ++x)
+                {
+                    const PxVec3 f{ float(x), float(y), float(z) };
+                    coords.push_back(F4{ f.x, f.y, f.z, 0.f });
+                    want.push_back(sparseOracle(sp, x, y, z));
+                    ref.push_back(sdfSampleRef(sp, spVols, f));
+                    allRef.push_back({ &sp, &spVols, f });
+                    const uint32_t cx = std::min(uint32_t(x) / sp.sg, sp.nbx - 1);
+                    const uint32_t cy = std::min(uint32_t(y) / sp.sg, sp.nby - 1);
+                    const uint32_t cz = std::min(uint32_t(z) / sp.sg, sp.nbz - 1);
+                    resident.push_back(sp.starts[cz * sp.nbx * sp.nby + cy * sp.nbx + cx] != 0xFFFFFFFFu);
+                    // Zero weights in BOTH evaluations: a multiple of sg on every axis
+                    // (the guide sum's weights are 0), and NOT on a far face, where
+                    // sampleSDFDirect clamps its base to N - 2 and lerps with t = 1.0,
+                    // which PxTriLerp does not evaluate exactly (measured: 5 of the 65
+                    // multiple-of-sg coarse points sit on a far face and miss by an ulp).
+                    alpha0.push_back(x % int32_t(sp.sg) == 0 && y % int32_t(sp.sg) == 0 && z % int32_t(sp.sg) == 0 &&
+                                     x < int32_t(sp.dx) && y < int32_t(sp.dy) && z < int32_t(sp.dz));
+                }
+        const uint32_t N = uint32_t(coords.size());
+
+        // The transcription's anchor to the engine (pxgSdfSceneRef.h): bit-equal on
+        // every resident point and every zero-weight coarse point, BEFORE the launch.
+        size_t anchorN = 0, anchorBad = 0, alpha0Coarse = 0;
         for (uint32_t i = 0; i < N; ++i)
         {
-            const double d = std::fabs(double(got[i]) - double(want[i]));
+            if (!resident[i] && !alpha0[i]) continue;
+            ++anchorN;
+            if (!resident[i]) ++alpha0Coarse;
+            if (f2u(ref[i]) != f2u(want[i]))
+            {
+                if (anchorBad < 5)
+                    std::printf("    anchor (%g,%g,%g) %s: sdfSampleRef %.9g decodeSparse %.9g\n", coords[i].x,
+                                coords[i].y, coords[i].z, resident[i] ? "resident" : "coarse", ref[i], want[i]);
+                ++anchorBad;
+            }
+        }
+        PXG_CHECK_MSG(anchorBad == 0 && alpha0Coarse > 0,
+                      "sdfSampleRef differs from the engine's decodeSparse on %zu of %zu anchor points "
+                      "(%zu of them zero-weight coarse)", anchorBad, anchorN, alpha0Coarse);
+
+        std::vector<float> got;
+        if (!runAt(aBlobSp, coords, got)) return;
+
+        // COARSE keeps sparseOracle as a secondary BOUND: the engine's nested
+        // PxTriLerp at quarter weights against the guide's sum (K2 of the module).
+        const double coarseBound = 1e-5 * 3.0;
+        size_t badR = 0, badRef = 0, badC = 0, nR = 0, nC = 0, nCexact = 0;
+        double worstC = 0.0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            if (f2u(got[i]) != f2u(ref[i]))
+            {
+                if (badRef < 5)
+                    std::printf("    sparse (%g,%g,%g): got %.9g (0x%08x) want sdfSampleRef %.9g (0x%08x)\n",
+                                coords[i].x, coords[i].y, coords[i].z, got[i], f2u(got[i]), ref[i], f2u(ref[i]));
+                ++badRef;
+            }
             if (resident[i])
             {
                 ++nR;
-                if (d > worstR) worstR = d;
-                if (d > residentBound)
+                if (f2u(got[i]) != f2u(want[i]))
                 {
                     if (badR < 5)
-                        std::printf("    resident (%g,%g,%g): got %.9g want %.9g diff %.3g\n",
-                                    coords[i].x, coords[i].y, coords[i].z, got[i], want[i], d);
+                        std::printf("    resident (%g,%g,%g): got %.9g want decodeSparse %.9g\n",
+                                    coords[i].x, coords[i].y, coords[i].z, got[i], want[i]);
                     ++badR;
                 }
             }
             else
             {
                 ++nC;
+                const double d = std::fabs(double(got[i]) - double(want[i]));
+                if (d == 0.0) ++nCexact;
                 if (d > worstC) worstC = d;
                 if (d > coarseBound)
                 {
@@ -267,12 +325,77 @@ PXG_TEST(sdfTexture)
         PXG_CHECK_MSG(nR > 0 && nC > 0,
                       "both the resident and the coarse-fall-back paths must be reached "
                       "(%zu resident, %zu coarse)", nR, nC);
-        PXG_CHECK_MSG(badR == 0, "%zu of %zu RESIDENT samples disagree with the engine oracle "
-                      "(worst %.3g, bound %.3g)", badR, nR, worstR, residentBound);
-        PXG_CHECK_MSG(badC == 0, "%zu of %zu COARSE-FALL-BACK samples disagree with the engine "
-                      "oracle (worst %.3g, bound %.3g)", badC, nC, worstC, coarseBound);
-        std::printf("    [ note ] sparse: %zu resident (worst %.3g), %zu coarse (worst %.3g)\n",
-                    nR, worstR, nC, worstC);
+        PXG_CHECK_MSG(badRef == 0, "%zu of %u sparse samples differ from sdfSampleRef", badRef, N);
+        PXG_CHECK_MSG(badR == 0, "%zu of %zu RESIDENT samples are not the engine's decodeSparse bit for bit",
+                      badR, nR);
+        PXG_CHECK_MSG(badC == 0, "%zu of %zu COARSE-FALL-BACK samples exceed the PxTriLerp bound "
+                      "(worst %.3g, bound %.3g)", badC, nC, worstC, coarseBound);
+        std::printf("    [ note ] sparse grid: %u bitwise vs sdfSampleRef; %zu resident bitwise vs decodeSparse; "
+                    "%zu coarse (%zu bit-equal to PxTriLerp, worst %.3g)\n", N, nR, nC, nCexact, worstC);
+    }
+
+    // ---- the sparse mesh BETWEEN texels, against sdfSampleRef ----
+    {
+        std::mt19937 rng(0x5D96Fu);
+        auto uf = [&rng](float lo, float hi) { return lo + (hi - lo) * float(rng() % 1000000u) / 1000000.0f; };
+        const float D[3] = { float(sp.dx), float(sp.dy), float(sp.dz) };
+        std::vector<F4> coords;
+        auto put = [&](float x, float y, float z) { coords.push_back(F4{ x, y, z, 0.f }); };
+        for (int i = 0; i < 600; ++i)                               // random
+            put(uf(0.0f, D[0]), uf(0.0f, D[1]), uf(0.0f, D[2]));
+        for (int ax = 0; ax < 3; ++ax)                              // block borders
+        {
+            const uint32_t nb = ax == 0 ? sp.nbx : ax == 1 ? sp.nby : sp.nbz;
+            for (uint32_t m = 1; m < nb; ++m)
+                for (float off : { -0.3f, -1.0f / 256.0f, 0.0f, 1.0f / 256.0f, 0.3f })
+                {
+                    float p[3] = { uf(0.0f, D[0]), uf(0.0f, D[1]), uf(0.0f, D[2]) };
+                    p[ax] = float(m * sp.sg) + off;
+                    put(p[0], p[1], p[2]);
+                }
+        }
+        // Subgrid faces: f = base*sg + {0, sg, sg + 1} on one axis of every resident
+        // cell, the other axes fractional.  What Sample() makes of them (it picks the
+        // cell from f, not from `base`): +0 is local 0 of this cell; +sg and +sg+1 are
+        // local 0 and 1 of the NEXT cell (often non-resident, so the coarse path), except
+        // on the grid's far face, where the cell index is clamped and min(., D) lands
+        // both on local sg.  Local sg + 1, the bound of Sample()'s subgrid clamp, needs
+        // f >= dims + 1, which neither this fixture nor the engine's box clamp produces.
+        for (uint32_t c = 0; c < sp.starts.size(); ++c)
+        {
+            if (sp.starts[c] == 0xFFFFFFFFu) continue;
+            const uint32_t cx = c % sp.nbx, cy = (c / sp.nbx) % sp.nby, cz = c / (sp.nbx * sp.nby);
+            for (int ax = 0; ax < 3; ++ax)
+                for (uint32_t loc : { 0u, sp.sg, sp.sg + 1u })
+                {
+                    float p[3] = { float(cx * sp.sg) + uf(0.1f, float(sp.sg) - 0.1f),
+                                   float(cy * sp.sg) + uf(0.1f, float(sp.sg) - 0.1f),
+                                   float(cz * sp.sg) + uf(0.1f, float(sp.sg) - 0.1f) };
+                    const uint32_t base = ax == 0 ? cx : ax == 1 ? cy : cz;
+                    p[ax] = std::min(float(base * sp.sg + loc), D[ax]);
+                    put(p[0], p[1], p[2]);
+                }
+        }
+        std::vector<float> got;
+        if (!runAt(aBlobSp, coords, got)) return;
+        size_t bad = 0, nRes = 0;
+        for (uint32_t i = 0; i < coords.size(); ++i)
+        {
+            const PxVec3 f(coords[i].x, coords[i].y, coords[i].z);
+            allRef.push_back({ &sp, &spVols, f });
+            if (sdfRefResident(sp, f)) ++nRes;
+            const float want = sdfSampleRef(sp, spVols, f);
+            if (f2u(got[i]) != f2u(want))
+            {
+                if (bad < 5)
+                    std::printf("    sparse fractional (%.9g,%.9g,%.9g): got %.9g want %.9g\n", f.x, f.y, f.z, got[i], want);
+                ++bad;
+            }
+        }
+        PXG_CHECK_MSG(nRes > 0 && nRes < coords.size(), "the fractional pass must reach both branches (%zu of %zu resident)",
+                      nRes, coords.size());
+        PXG_CHECK_MSG(bad == 0, "%zu of %zu fractional sparse samples differ from sdfSampleRef", bad, coords.size());
+        std::printf("    [ note ] sparse fractional: %zu bitwise (%zu resident)\n", coords.size(), nRes);
     }
 
     // =====================================================================
@@ -373,6 +496,89 @@ PXG_TEST(sdfTexture)
         // A FLOAT texture at a texel centre has weights 0 and 1, so this is exact.
         PXG_CHECK_MSG(bad == 0, "%zu of %u dense texel-centre samples are not bit-exact", bad, N);
         std::printf("    [ note ] dense: %u texel centres bit-exact\n", N);
+
+        // The dense mesh between texels: random f over the engine's domain [0, N-1]
+        // (the box shrunk by the 0.5 margin) and exact weight TIES f = k + (j + 0.5)/256
+        // on each axis, j in {0, 1, 2, 3, 128, 129} -- both parities, at both ends of
+        // the weight range -- so ties-up, ties-down and ties-to-even give three answers.
+        static SdfRefVols dnVols;
+        dnVols = sdfRefVols(dn);
+        std::mt19937 rng(0xDE96Fu);
+        auto uf = [&rng](float lo, float hi) { return lo + (hi - lo) * float(rng() % 1000000u) / 1000000.0f; };
+        const float D[3] = { float(dn.dx), float(dn.dy), float(dn.dz) };
+        std::vector<F4> fc;
+        for (int i = 0; i < 600; ++i)
+            fc.push_back(F4{ uf(0.0f, D[0] - 1.0f), uf(0.0f, D[1] - 1.0f), uf(0.0f, D[2] - 1.0f), 0.f });
+        for (int ax = 0; ax < 3; ++ax)
+            for (uint32_t k = 0; k + 1 < uint32_t(D[ax]); ++k)
+                for (uint32_t j : { 0u, 1u, 2u, 3u, 128u, 129u })
+                {
+                    float p[3] = { uf(0.0f, D[0] - 1.0f), uf(0.0f, D[1] - 1.0f), uf(0.0f, D[2] - 1.0f) };
+                    p[ax] = float(k) + (float(j) + 0.5f) / 256.0f;
+                    fc.push_back(F4{ p[0], p[1], p[2], 0.f });
+                }
+        const uint32_t NF = uint32_t(fc.size());
+        const PxgBufferHandle bFC = createBufferFrom(dev, fc);
+        const PxgBufferHandle bFO = createBufferFrom(dev, std::vector<float>(NF, -777.f));
+        owned.push_back(bFC); owned.push_back(bFO);
+        P_Sdf fprm = {}; fprm.meshPtr = aBlobDn; fprm.coords = dev->getBufferDeviceAddress(bFC);
+        fprm.outValue = dev->getBufferDeviceAddress(bFO); fprm.numSamples = NF;
+        {
+            Kernel k(Kernel::Bindless{}, "npSdfTexture.spv", "sdfTexSampleAt", {}, sizeof(P_Sdf));
+            if (!k.isValid()) return;
+            k.dispatch((NF + 63) / 64, {}, fprm);
+        }
+        dev->flush();
+        const auto fgot = downloadBuffer<float>(dev, bFO, NF);
+        size_t fbad = 0;
+        for (uint32_t i = 0; i < NF; ++i)
+        {
+            const PxVec3 f(fc[i].x, fc[i].y, fc[i].z);
+            allRef.push_back({ &dn, &dnVols, f });
+            const float want = sdfSampleRef(dn, dnVols, f);
+            if (f2u(fgot[i]) != f2u(want))
+            {
+                if (fbad < 5)
+                    std::printf("    dense fractional (%.9g,%.9g,%.9g): got %.9g want %.9g\n", f.x, f.y, f.z, fgot[i], want);
+                ++fbad;
+            }
+        }
+        PXG_CHECK_MSG(fbad == 0, "%zu of %u fractional dense samples differ from sdfSampleRef", fbad, NF);
+        std::printf("    [ note ] dense fractional: %u bitwise (600 random, %u ties)\n", NF, NF - 600u);
+    }
+
+    // Bite asserts over everything compared bitwise above.  The engine never leaves
+    // the texture's [0.5, N - 0.5] coordinate range (dense: f is clamped to the box
+    // shrunk by the 0.5 margin; sparse: the coarse coordinate stays inside the
+    // (nb+1) grid and the local one inside [0, sg+1] + 0.5), so the coordinate-clamp
+    // variants have NOTHING to bite on here -- they are npTex3dBindless's (its clamp
+    // shell) -- except cc-guide, whose [0, N-1] already differs on the far face
+    // x = N - 0.5 (pxgSlangTex3d K4).  The dimx index clamp needs a volume with w < h,
+    // and every volume here has w >= h.  The missing x index clamp changes only the
+    // sign of a zero result over a -0 far-face texel, which no volume here holds
+    // (npTex3dBindless's signed-zero set has one).  The P9.96 sweep lists the matching
+    // mutants as this fixture's expected survivors; every other non-equivalent
+    // variant must change an expectation.
+    {
+        auto outOfDomain = [](int v) {
+            return v == pxgtex::V_CC_NONE || v == pxgtex::V_CC_LO_X || v == pxgtex::V_CC_HI_X ||
+                   v == pxgtex::V_CC_HI_N_Y || v == pxgtex::V_CC_LO_0_Z || v == pxgtex::V_Y_DIMX ||
+                   v == pxgtex::V_IDX_HI_X;
+        };
+        std::printf("    [ note ] bite asserts over %zu samples:\n     ", allRef.size());
+        for (int var = 1; var < pxgtex::V_COUNT; ++var)
+        {
+            size_t differ = 0;
+            for (const RefSample& r : allRef)
+                if (f2u(sdfSampleRef(*r.s, *r.v, r.f, var)) != f2u(sdfSampleRef(*r.s, *r.v, r.f))) ++differ;
+            std::printf(" %s %zu%s", pxgtex::variantName(var), differ, var % 6 == 0 ? "\n     " : ";");
+            if (pxgtex::variantIsEquivalent(var))
+                PXG_CHECK_MSG(differ == 0, "%s is declared equivalent but changes %zu expectations",
+                              pxgtex::variantName(var), differ);
+            else if (!outOfDomain(var))
+                PXG_CHECK_MSG(differ >= 1, "%s changes no expectation of sdfTexture", pxgtex::variantName(var));
+        }
+        std::printf("\n");
     }
 
     for (PxgBufferHandle h : owned)

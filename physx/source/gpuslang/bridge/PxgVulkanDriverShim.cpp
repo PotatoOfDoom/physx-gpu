@@ -165,7 +165,7 @@ extern "C" CUresult cuArrayDestroy(CUarray hArray)
 }
 
 extern "C" CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC* pResDesc,
-                                      const CUDA_TEXTURE_DESC* pTexDesc, const CUDA_RESOURCE_VIEW_DESC*)
+                                      const CUDA_TEXTURE_DESC* pTexDesc, const CUDA_RESOURCE_VIEW_DESC* pResViewDesc)
 {
     if (pTexObject) *pTexObject = 0;
     if (!pTexObject || !pResDesc || !pTexDesc)
@@ -175,25 +175,44 @@ extern "C" CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOUR
     if (pResDesc->resType != CU_RESOURCE_TYPE_ARRAY || !pResDesc->res.array.hArray)
         return CUDA_ERROR_INVALID_VALUE;
 
-    // THE SAMPLER IS SHARED, so a descriptor that asks for anything else would be
-    // silently sampled with the wrong addressing or filter.  The bindless set
-    // carries exactly one sampler -- clamp on all three axes, linear, normalized
-    // element reads -- because that is what the engine builds every SDF texture
-    // with.  Anything else is refused here rather than quietly mis-sampled, and
-    // the remedy is stated: the sampler binding becomes an array too.
+    // ONE TEXTURE DESCRIPTOR IS IMPLEMENTED, so a descriptor that asks for
+    // anything else would be silently read with the wrong addressing, filter or
+    // coordinate convention.  Since P9.96 there is no sampler at all: pxgTex3D
+    // (shaders/pxgSlangTex3d.slang) fetches texels and evaluates exactly one
+    // descriptor in shader code -- clamp on all three axes, linear, normalized
+    // element reads, UNNORMALIZED coordinates -- because that is what the engine
+    // builds every SDF texture with (PxgGeometryManager.cpp:762-770: PxMemZero'd,
+    // flags 0, no resource view).  The remedy for anything else is stated: extend
+    // pxgTex3D (and carry the mode with the handle).
+    //
+    // CHECKED, and refused unless equal to the engine's: the three address modes,
+    // the filter mode, EVERY flags bit (READ_AS_INTEGER, NORMALIZED_COORDINATES --
+    // refused since P9.96, the shader always read texel-space coordinates -- and
+    // any other, e.g. CU_TRSF_SRGB 0x10, which would change the 8-bit conversion),
+    // and the resource view (must be absent).  NOT checked: maxAnisotropy, the
+    // mipmap fields and borderColor.  The engine zeroes them, and they are not
+    // expected to change a sample of a single-level CUarray under clamp addressing
+    // (borderColor is read only in BORDER mode, which is refused), but nothing here
+    // verifies that.
     const bool clamped = pTexDesc->addressMode[0] == CU_TR_ADDRESS_MODE_CLAMP &&
                          pTexDesc->addressMode[1] == CU_TR_ADDRESS_MODE_CLAMP &&
                          pTexDesc->addressMode[2] == CU_TR_ADDRESS_MODE_CLAMP;
     const bool linear = pTexDesc->filterMode == CU_TR_FILTER_MODE_LINEAR;
     const bool elementRead = (pTexDesc->flags & CU_TRSF_READ_AS_INTEGER) == 0;
-    if (!clamped || !linear || !elementRead)
+    const bool unnormalized = (pTexDesc->flags & CU_TRSF_NORMALIZED_COORDINATES) == 0;
+    const bool noOtherFlag =
+        (pTexDesc->flags & ~unsigned(CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES)) == 0;
+    const bool noView = pResViewDesc == nullptr;
+    if (!clamped || !linear || !elementRead || !unnormalized || !noOtherFlag || !noView)
     {
         std::fprintf(stderr,
-            "[PxgVulkan] cuTexObjectCreate: this bridge binds ONE shared sampler "
-            "(clamp/clamp/clamp, linear, normalized reads); asked for %d/%d/%d, filter %d, "
-            "flags 0x%x.  Turn binding 1 of the bindless set into an array to support it.\n",
+            "[PxgVulkan] cuTexObjectCreate: this bridge implements ONE texture descriptor in "
+            "pxgTex3D (clamp/clamp/clamp, linear, normalized reads, unnormalized coordinates, "
+            "flags 0, no resource view); asked for %d/%d/%d, filter %d, flags 0x%x, %s resource "
+            "view.  Extend pxgTex3D (shaders/pxgSlangTex3d.slang) to support it.\n",
             int(pTexDesc->addressMode[0]), int(pTexDesc->addressMode[1]),
-            int(pTexDesc->addressMode[2]), int(pTexDesc->filterMode), pTexDesc->flags);
+            int(pTexDesc->addressMode[2]), int(pTexDesc->filterMode), pTexDesc->flags,
+            noView ? "no" : "a");
         return CUDA_ERROR_INVALID_VALUE;
     }
 

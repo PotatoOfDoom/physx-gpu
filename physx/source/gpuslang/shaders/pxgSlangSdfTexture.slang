@@ -36,7 +36,9 @@
 // texture and addressed through a per-coarse-cell start slot.  Sample() is the
 // lookup that decides, per point, which of the two it reads -- and essentially
 // all of this tranche's risk is in that addressing, not in the filtering
-// (P9.12a already measured the filter).
+// (since P9.96 the filter is pxgTex3D's emulation of CUDA's, bitwise against
+// tests/pxgTex3dRef.h; tests/pxgSdfSceneRef.h's sdfSampleRef transcribes this
+// file's Sample() over it).
 //
 // THE ORACLE, AND IT IS A REAL ONE.  Gu::SDF::decodeSparse (GuSDF.cpp:1340-1412,
 // exported PX_PHYSX_COMMON_API) evaluates the same sparse SDF on the HOST at an
@@ -44,8 +46,10 @@
 // the coarse cell by integer division, the far-edge fix-up, decodeTriple's
 // 10-bit unpack, the (subgridSize+1) block stride, and the coarse fall-back over
 // a (nbX+1, nbY+1, nbZ+1) grid.  At a texel CENTRE the trilinear weights are 0
-// and 1, so the GPU sample must equal it.  The fixture compares against that,
-// not against a second transcription of this file.
+// and 1, so the GPU sample must equal it on every resident point (P9.96: bit for
+// bit).  Its coarse fall-back is the engine's PxTriLerp, which rounds differently
+// from CUDA's filter between coarse texels, so there the fixture also compares
+// against sdfSampleRef, a transcription of this file over the host filter oracle.
 //
 // ---------------------------------------------------------------------------
 // THE COOKED-MESH BLOB, past where any earlier shader has read

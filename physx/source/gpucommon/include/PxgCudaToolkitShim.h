@@ -127,6 +127,7 @@ typedef enum CUmemorytype_enum {
     CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2, CU_MEMORYTYPE_ARRAY = 3, CU_MEMORYTYPE_UNIFIED = 4
 } CUmemorytype;
 #define CU_TRSF_READ_AS_INTEGER 1
+#define CU_TRSF_NORMALIZED_COORDINATES 0x02   // cuda.h value; the bridge refuses it (P9.96)
 typedef struct CUDA_ARRAY3D_DESCRIPTOR_st {
     size_t Width; size_t Height; size_t Depth;
     CUarray_format Format; unsigned int NumChannels; unsigned int Flags;

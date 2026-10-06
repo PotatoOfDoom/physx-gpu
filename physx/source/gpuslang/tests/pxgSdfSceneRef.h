@@ -55,6 +55,7 @@
 
 #include "GuSDF.h"
 #include "PxgCudaToolkitShim.h"
+#include "pxgTex3dRef.h"
 
 #include <cstdint>
 #include <cstring>
@@ -185,6 +186,99 @@ inline float sparseOracle(const SdfScene& s, int32_t xx, int32_t yy, int32_t zz)
     Gu::DenseSDF coarse(nbX + 1, nbY + 1, nbZ + 1, const_cast<float*>(s.coarse.data()));
     const float sc = 1.0f / s.sg;
     return coarse.sampleSDFDirect(PxVec3(xBase + x * sc, yBase + y * sc, zBase + z * sc));  // ENGINE
+}
+
+// ---------------------------------------------------------------------------
+// sdfSampleRef (P9.96): SparseSDFTexture::Sample (pxgSlangSdfTexture.slang
+// sdfTexSample, sdfCollision.cuh:113-151) on the host, at ANY fine coordinate f,
+// over pxgtex::tex3D -- the dense, coarse-fall-back and resident branches, statement
+// for statement and in the shader's expression order: the float-to-uint truncation
+// and unsigned clamp for the cell (T7), the rescale into coarse units only on the
+// fall-back (T8), the local clamp to [0, sg + 1] (T9), applySubgridStart's ADD
+// (T10), and `raw * range + min` with range = max - min (T4) only on the resident
+// path (T11).  The subgrid volume holds pxgtex::unorm8 of the stored bytes.
+//
+// WHAT ANCHORS IT TO THE ENGINE.  sparseOracle above is the engine's decodeSparse.
+// At an integer f the two must agree BIT FOR BIT on every RESIDENT point (the subgrid
+// coordinate is integer + 0.5, so the weights are 1 and 0, and the value is
+// unorm8(v) * range + min exactly as decodeSample spells it) and on every COARSE point
+// whose fine coordinate is a multiple of sg on all three axes AND below the far face
+// (coarse weights 0 in both: on a far face sampleSDFDirect clamps its base to N - 2
+// and lerps with t = 1.0, which PxTriLerp does not evaluate exactly -- measured, 5 of
+// the 65 multiple-of-sg coarse points of buildSparse miss there by an ulp).
+// At every OTHER integer coarse point they legitimately differ by roundings:
+// sparseOracle's coarse branch is DenseSDF::sampleSDFDirect, the engine's nested
+// PxTriLerp at quarter weights, which is not the guide's eight-term sum.  Those
+// points are held to a bound against sparseOracle and bitwise only against this.
+// Domain: f >= 0 on the sparse path (the shader's float-to-uint is undefined below
+// 0, and every caller clamps to the box first); any finite f on the dense path.
+// `variant` threads a pxgtex::Variant through for bite asserts.
+// ---------------------------------------------------------------------------
+struct SdfRefVols
+{
+    pxgtex::Vol primary;    // dense: the field; sparse: the (nbx+1)(nby+1)(nbz+1) coarse grid
+    pxgtex::Vol sub;        // sparse only: the subgrid texture, after the UNORM read
+};
+
+inline SdfRefVols sdfRefVols(const SdfScene& s)
+{
+    SdfRefVols v;
+    if (s.sg == 0u)
+    {
+        v.primary.w = s.dx; v.primary.h = s.dy; v.primary.d = s.dz;
+    }
+    else
+    {
+        v.primary.w = s.nbx + 1u; v.primary.h = s.nby + 1u; v.primary.d = s.nbz + 1u;
+        v.sub.w = s.blkx * (s.sg + 1u); v.sub.h = s.blky * (s.sg + 1u); v.sub.d = s.blkz * (s.sg + 1u);
+        v.sub.t.resize(s.sub.size());
+        for (size_t i = 0; i < s.sub.size(); ++i)
+            v.sub.t[i] = pxgtex::unorm8(s.sub[i]);
+    }
+    v.primary.t = s.coarse;
+    return v;
+}
+
+inline float sdfSampleRef(const SdfScene& s, const SdfRefVols& v, PxVec3 f, int variant = pxgtex::V_GUIDE)
+{
+    if (s.sg == 0u)
+        return pxgtex::tex3D(v.primary, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f, variant);
+
+    const float fineToCoarse = 1.0f / float(s.sg);
+    const uint32_t csx = s.dx / s.sg, csy = s.dy / s.sg, csz = s.dz / s.sg;
+    const uint32_t xBase = std::min(std::max(uint32_t(f.x * fineToCoarse), 0u), csx - 1u);
+    const uint32_t yBase = std::min(std::max(uint32_t(f.y * fineToCoarse), 0u), csy - 1u);
+    const uint32_t zBase = std::min(std::max(uint32_t(f.z * fineToCoarse), 0u), csz - 1u);
+    const uint32_t startSlot = s.starts[zBase * csx * csy + yBase * csx + xBase];
+    if (startSlot == 0xFFFFFFFFu)
+    {
+        f = PxVec3(f.x * fineToCoarse, f.y * fineToCoarse, f.z * fineToCoarse);
+        return pxgtex::tex3D(v.primary, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f, variant);
+    }
+    const float hi = float(s.sg + 1u);
+    f.x = std::min(std::max(f.x - float(xBase * s.sg), 0.0f), hi);
+    f.y = std::min(std::max(f.y - float(yBase * s.sg), 0.0f), hi);
+    f.z = std::min(std::max(f.z - float(zBase * s.sg), 0.0f), hi);
+    uint32_t triple = startSlot;
+    f.x += float((triple & 1023u) * (s.sg + 1u));
+    triple >>= 10;
+    f.y += float((triple & 1023u) * (s.sg + 1u));
+    triple >>= 10;
+    f.z += float((triple & 1023u) * (s.sg + 1u));
+    const float raw = pxgtex::tex3D(v.sub, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f, variant);
+    const float range = s.smax - s.smin;
+    return raw * range + s.smin;
+}
+
+// Which branch sdfSampleRef takes at f (sparse scenes only): true == resident.
+inline bool sdfRefResident(const SdfScene& s, const PxVec3& f)
+{
+    const float fineToCoarse = 1.0f / float(s.sg);
+    const uint32_t csx = s.dx / s.sg, csy = s.dy / s.sg, csz = s.dz / s.sg;
+    const uint32_t xBase = std::min(uint32_t(f.x * fineToCoarse), csx - 1u);
+    const uint32_t yBase = std::min(uint32_t(f.y * fineToCoarse), csy - 1u);
+    const uint32_t zBase = std::min(uint32_t(f.z * fineToCoarse), csz - 1u);
+    return s.starts[zBase * csx * csy + yBase * csx + xBase] != 0xFFFFFFFFu;
 }
 
 // ---------------------------------------------------------------------------

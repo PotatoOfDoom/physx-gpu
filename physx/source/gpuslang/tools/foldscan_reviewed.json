@@ -8044,5 +8044,44 @@
 ],
 "verdict": "BENIGN",
 "why": "P9.95f: the hex sub-tet's `sum = c0 + c1 + c2` (softBodyGM.cu:1184), same dl and same left association as the tet path's reviewed `-(dl.c0 + dl.c1 + dl.c2)`. dl is sbTetrahedronsSolveGM's return: on the youngs < threshold early return it is the literal sbMat33Zero (all three addends literal +0 -> exact constant fold, +0 = IEEE); on the co-rotational path every lane has passed sbPlusZero3 (never -0, so a folded x + (+0) == x, and a computed c0 + c1 is never -0 in round-to-nearest); the neo-Hookean return is computed (d += sv). No input separates folded from unfolded."
+},
+{
+"file": "pxgSlangTex3d.slang",
+"code": "return (q + (r >= 0.5f ? 1.0f : 0.0f)) * PXG_TEX3D_WEIGHT_STEP;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "P9.96: the zero is the false arm of the tie select, so this is q + 0.0f when r < 0.5. q = floor(a*256) with a = xB - floor(xB), and xB - floor(xB) is +0 (never -0: x - x is +0 in round-to-nearest) or positive, so q >= +0 and a fold to q is bit-identical; a NaN q stays NaN either way. No CUDA source twin exists (the weight is hardware fixed point); the fp32 spelling is checked bitwise against tests/pxgTex3dRef.h by npTex3dBindless."
+},
+{
+"file": "pxgSlangTex3d.slang",
+"code": "const float xc = min(max(xyz.x, 0.5f), float(dim.x) - 0.5f);",
+"kinds": [
+"F4-FMax",
+"F4-FMin"
+],
+"verdict": "BENIGN",
+"why": "P9.96: the coordinate clamp to [0.5, N - 0.5] (K4 of the module). Slang min/max are GLSL FMin/FMax, which differ from a select only on a +-0 tie or a NaN operand. Neither bound is ever zero (0.5, and float(n) - 0.5 = -0.5 for an empty extent), so no +-0 tie exists; a NaN coordinate is documented (K5) as giving an unspecified value at a clamped, in-range address, and the fixture checks such lanes for 'written' only. No CUDA source twin exists (hardware addressing)."
+},
+{
+"file": "pxgSlangTex3d.slang",
+"code": "const float yc = min(max(xyz.y, 0.5f), float(dim.y) - 0.5f);",
+"kinds": [
+"F4-FMax",
+"F4-FMin"
+],
+"verdict": "BENIGN",
+"why": "P9.96: the coordinate clamp to [0.5, N - 0.5] (K4 of the module). Slang min/max are GLSL FMin/FMax, which differ from a select only on a +-0 tie or a NaN operand. Neither bound is ever zero (0.5, and float(n) - 0.5 = -0.5 for an empty extent), so no +-0 tie exists; a NaN coordinate is documented (K5) as giving an unspecified value at a clamped, in-range address, and the fixture checks such lanes for 'written' only. No CUDA source twin exists (hardware addressing)."
+},
+{
+"file": "pxgSlangTex3d.slang",
+"code": "const float zc = min(max(xyz.z, 0.5f), float(dim.z) - 0.5f);",
+"kinds": [
+"F4-FMax",
+"F4-FMin"
+],
+"verdict": "BENIGN",
+"why": "P9.96: the coordinate clamp to [0.5, N - 0.5] (K4 of the module). Slang min/max are GLSL FMin/FMax, which differ from a select only on a +-0 tie or a NaN operand. Neither bound is ever zero (0.5, and float(n) - 0.5 = -0.5 for an empty extent), so no +-0 tie exists; a NaN coordinate is documented (K5) as giving an unspecified value at a clamped, in-range address, and the fixture checks such lanes for 'written' only. No CUDA source twin exists (hardware addressing)."
 }
 ]

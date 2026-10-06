@@ -38,6 +38,14 @@
 //   * every buffer travels as a DEVICE ADDRESS, so the SPIR-V has to hold
 //     PhysicalStorageBufferAddresses and RuntimeDescriptorArray at once -- the
 //     combination the SDF kernels need and the one most likely to be missing.
+//
+// P9.96 adds `tex3dBindlessLoad`: the same parameters, but each sample is ONE raw texel
+// read through pxgTex3DTexel at the integer coordinate in xyz.  It is what lets
+// npTex3dBindlessUnormExhaustive measure the driver's UNORM conversion on its own,
+// without the filter in between, and compare it with the filtered centre value.
+// pxgTex3DTexel clamps nothing (pxgSlangTex3d SAFETY), so the entry clamps each index
+// to the queried extent itself -- a no-op for the gate, whose coordinates are all in
+// range, and what keeps any other coordinate from an out-of-bounds fetch.
 
 import pxgSlangTex3d;
 
@@ -67,4 +75,22 @@ void tex3dBindlessSample(uint3 dtid : SV_DispatchThreadID)
     const uint3 dim = pxgTex3DSize(handle);
     Ptr<uint4>(gP.outSize)[i] = uint4(dim.x, dim.y, dim.z, handle);
     Ptr<float>(gP.outValue)[i] = pxgTex3D(handle, p.xyz);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void tex3dBindlessLoad(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint i = dtid.x;
+    if (i >= gP.numSamples)
+        return;
+
+    const uint handle = Ptr<uint>(gP.handles)[i];
+    const float4 p = Ptr<float4>(gP.coords)[i];
+
+    const uint3 dim = pxgTex3DSize(handle);
+    Ptr<uint4>(gP.outSize)[i] = uint4(dim.x, dim.y, dim.z, handle);
+    Ptr<float>(gP.outValue)[i] = pxgTex3DTexel(handle, pxgTex3DClampIdx(int(p.x), dim.x),
+                                               pxgTex3DClampIdx(int(p.y), dim.y),
+                                               pxgTex3DClampIdx(int(p.z), dim.z));
 }

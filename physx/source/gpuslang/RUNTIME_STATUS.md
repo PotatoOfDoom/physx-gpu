@@ -8,6 +8,14 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **884/884** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.96: CUDA tex3D<float> is emulated from texel Loads in pxgSlangTex3d (x-0.5, floor, alpha rounded to
+the nearest 1/256 ties-up, coordinate clamp [0.5, N-0.5], the guide's eight-term sum) instead of a
+Vulkan sampler with normalised coordinates, which missed texel centres on non-power-of-two grids and
+filtered at driver precision.  UNORM reads measured exhaustively: llvmpipe = v*(1/(2^b-1)), the
+engine's own decoder.  SDF fixtures bitwise (npTex3dBindless 10653 samples, sdfQueryNonPow2 140 -> 0
+misses); sdfmesh rests closer to its analytic heights.  SDF fixture suite ~2.5x slower, engine
+sdfmesh ~11%.  Bit equality with NVIDIA hardware stays unprovable (alpha rounding and blend
+arithmetic undocumented).  Scenes 75/75.
 P9.95f: sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch and the hexahedron (voxel) branch of
 sb_gm_cp_solveTetrahedronsPartitionLaunch -- which was a silent no-op -- on the engine ABI via the
 shared sb_gm_cp_solveHexahedronsPartition_parallelGS<bool> (manifest 427 -> 428, engine-reachable
@@ -2144,6 +2152,102 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.96 — `tex3D` ohne Sampler: CUDA-Linearfilterung aus Texel-Loads nachgebaut
+
+**Ausgangslage (Befund aus P9.95e).** `pxgSlangTex3d` bildete `tex3D<float>` der CUDA
+(unnormalisierte Texelkoordinaten, clamp-to-edge, trilinear) über einen Vulkan-Sampler mit
+**normalisierten** Koordinaten nach, weil Vulkan unnormalisierte Koordinaten auf 3D-Bildern verbietet.
+Das hatte zwei Folgen:
+- Auf Gittern, deren Größe keine Zweierpotenz ist, trifft der Rückweg (k + 0.5)/dim selbst die
+  Texelzentren nicht exakt. In `sdfQueryNonPow2` lagen vorher 140 Punkte daneben.
+- Zwischen den Texeln war die Filterpräzision treiberabhängig (Kopfnotiz T3).
+
+Betroffen sind alle SDF-Pfade: sdfQuery, psSdfMidphase, softBodySdfMidphase, femClothSdfMeshCg und
+triTriCollision, dazu die Fixtures npSdfTexture, npSdfCollision, npSdfFind und npSdfParticle.
+
+**Neue Umsetzung** (CUDA Programming Guide, „Linear Filtering“):
+- Koordinate auf [0.5, N − 0.5] klemmen, dann `xB = x − 0.5` und `floor`.
+- α auf das nächste Vielfache von 1/256 runden, Gleichstand nach oben. Gerechnet wird
+  `s = α·256; q = floor(s); (q + (s − q ≥ 0.5))·2⁻⁸`; das ist über alle 1.07·10⁹ Floats in [0,1)
+  gegen exaktes Runden geprüft.
+- Acht Texel-Loads mit `NonUniformResourceIndex` und geklemmtem Index (nur zur Adresssicherheit;
+  geprüft: ein geklemmter Tap trägt nie ein Gewicht ≠ 0). Die Ausdehnung wird einmal pro Sample
+  abgefragt.
+- Die Acht-Term-Summe des Guides, von links nach rechts. Die Gewichtsprodukte sind exakt.
+- Der Sampler (Binding 1) wird nicht mehr deklariert. Er bleibt reserviert im Layout, das ist
+  gültiges Vulkan.
+- `npTex3dBindless` ist jetzt NoContraction-gestempelt. Laut SPIR-V tragen alle Float-Operationen
+  NoContraction, 1/256 ist eine Konstante, und nichts ist umassoziiert.
+- Die Bridge lehnt `CU_TRSF_NORMALIZED_COORDINATES`, alle sonstigen Flag-Bits (z. B. SRGB) und nicht
+  leere Resource-Views ab. Der Deskriptor der Engine (Flags 0) ist davon nicht betroffen.
+
+**UNORM erschöpfend gemessen (Ergebnis A):** llvmpipe liefert für alle 256 8-Bit- und alle 65536
+16-Bit-Codes `v·(1/(2^b − 1))`. Das ist bitgleich mit dem CPU-Decoder der Engine (GuSDF.h) und mit
+Mesas `lp_build_unsigned_norm_to_float`, nicht mit dem korrekt gerundeten `v/255` (126 bzw. 512
+Codes Unterschied). Gepinnt durch `npTex3dBindlessUnormExhaustive`.
+
+**Bekannte Unbekannte (dokumentiert, nicht beweisbar):** Bitgleichheit mit echter NVIDIA-Hardware
+lässt sich nicht beweisen. Die Behauptung lautet nur: IEEE-Lesart des Guides.
+- K1: Die α-Rundung ist nicht dokumentiert. „Nächster Wert, Gleichstand nach oben“ stützt sich auf
+  eine einzige Fremdmessung auf sm_86.
+- K2: Die Blend-Arithmetik ist nicht dokumentiert (angeblich ganzzahlige Gewichte mit einer
+  Rundung). Der Port verwendet die fp32-Reihenfolge des Guides als Konvention.
+- K4: Die Klemmregel des Guide-Textes ([0, N−1] auf die Koordinate) weicht auf dem letzten halben
+  Texel jeder Achse ab, ab x = N − 1 + 1/512. Dieser Bereich liegt **im** Engine-Wertebereich.
+  Gewählt ist die Regel der Hardwaremessung, [0.5, N − 0.5].
+- K5: Ein +0-Texel liefert +0. Unendliche Koordinaten landen auf dem Randsample. Unspezifiziert ist
+  nur eine NaN-Koordinate.
+
+**Fixtures** (über das neue Host-Orakel `tests/pxgTex3dRef.h` mit 25 Varianten):
+- `npTex3dBindless`: 10665 Samples, davon 10653 bitweise. Darunter sind Zentren, 6912 Gleichstände,
+  α → 1, Rand-Schale, Ecken, ±inf/±1e30 und Texel mit Nullvorzeichen; nur die 12 NaN-Lanes werden
+  allein auf „geschrieben“ geprüft.
+- `testSdfTexture`: residente Punkte bitweise gegen `decodeSparse`, grobe und fraktionale Punkte
+  bitweise gegen den neuen `sdfSampleRef`.
+- `sdfQueryNonPow2` (10×7×11): alle 1024 Abstände bitweise; vorher wichen 140 ab.
+- `testSdfCollision`: die Sparse-Grenze ist bitweise.
+
+**Sweeps.**
+- Modul über npTex3dBindless (28 Mutanten): 24 getötet. Die 4 Überlebenden sind äquivalent oder
+  dienen nur der Sicherheit: `w-naive`, Gewichtsreihenfolge, `floor` → trunc und fehlende untere
+  Indexklemme.
+- `handle-uniform` (ohne `NonUniformResourceIndex`) wird getötet; llvmpipe braucht die Dekoration
+  also wirklich.
+- `idx-clamp-hi-missing` ist nach der Gegenprüfung über das Nullvorzeichen getötet.
+- Kern-Mutanten über jeden Engine-Importeur mit Fixture (npSdfCollision, sdfQueryBda, npSdfParticle,
+  psSdfMidphase, softBodySdfMidphase, femClothSdfMeshCg, triTriCollision): je 6/6 getötet.
+- Host-Orakel: 7/7 getötet.
+
+**Szenen.** `sdfquery` ist bitgleich (alle Punkte liegen auf Texelzentren). In `sdfmesh` (20³)
+ruhen die Körper näher an ihren analytischen Höhen:
+
+| Körper | vorher | nachher | Soll |
+|---|---|---|---|
+| sdfBoxOnMesh | 2.49977255 | 2.50002337 | 2.5 |
+| sdfBoxStackBottom | 0.500038326 | 0.500022531 | 0.5 |
+| sdfBoxStackTop | 1.50540733 | 1.50463605 | 1.5 |
+
+**Kosten.** Pro Sample sind es jetzt 9 Deskriptorzugriffe statt 2. Die SDF-Fixture-Suite läuft etwa
+2,5-mal so lange (220 s → 560 s); die Engine-Szene `sdfmesh` verliert 11 % (3.23 → 2.88 Schritte/s).
+Akzeptiert, weil Bitgenauigkeit das Ziel ist. Zwei Gegenmaßnahmen sind verworfen:
+- die Ausdehnung nur einmal abfragen: 4 % Gewinn;
+- ein Schnellpfad für Lanes mit gleichem Handle: kein Gewinn, und der Shader-Compile lief in einen
+  Speicherabbruch.
+
+Der Mutations-Sweep über `triTriCollisionBda` braucht jetzt `MUTATION_SWEEP_TIMEOUT=1200`, denn die
+Suite dauert unmutiert etwa 435 s.
+
+**Gegenprüfung** mit drei unabhängigen Blickwinkeln (Arithmetik, Abdeckung, Integration): 12 Funde,
+keiner an der Rechnung selbst. Sie betrafen K4/K5-Texte, nicht bitweise geprüfte ±inf-Lanes,
+fehlende Nullvorzeichen-Texel, eine ungeklemmte Test-Ladefunktion, veraltete Sampler-Kommentare und
+die Shim-Flagprüfung. Alle sind behoben.
+
+**Offen:** Binding 1 (Sampler) aus dem Layout entfernen; ein Weg ohne Deskriptoren, falls die
+Kosten stören.
+
+**Foldscan:** UNREVIEWED 0 (+39 geprüfte Stellen). **Checker:** alle grün. **Suite:** 884/884 in
+beiden Speichermodi. **Szenen:** 75/75.
 
 ## P9.95f — Voxel-Softbodies: `sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch` und der Hexaeder-Zweig des GS-Kernels; P9.95 abgeschlossen
 

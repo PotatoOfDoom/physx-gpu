@@ -30,6 +30,9 @@
 // convention (unnormalized voxel space, texel i centered at i + 0.5); the
 // kernel normalizes by the inverse extents, which is exact for
 // power-of-two dimensions.
+// P9.96: the engine path (pxgSlangTex3d.slang) no longer samples -- it fetches
+// texels and evaluates CUDA's filter itself.  This probe keeps the hardware
+// sampler as the record of what the Vulkan sampler does.
 
 struct TxParams
 {

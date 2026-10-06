@@ -286,8 +286,8 @@ PXG_TEST(p3ShimTexture3d)
                       "a format outside {FLOAT, UINT8, UINT16} must be refused");
     }
     {
-        // A real array, then descriptors that ask for something the shared
-        // sampler cannot give.
+        // A real array, then descriptors that ask for something pxgTex3D does
+        // not implement.
         CUDA_ARRAY3D_DESCRIPTOR ad;
         std::memset(&ad, 0, sizeof(ad));
         ad.Format = CU_AD_FORMAT_FLOAT;
@@ -332,15 +332,31 @@ PXG_TEST(p3ShimTexture3d)
         CUDA_TEXTURE_DESC wrapZ = td;
         wrapZ.addressMode[2] = CU_TR_ADDRESS_MODE_WRAP;
         PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &wrapZ, nullptr) != CUDA_SUCCESS,
-                      "a wrap address mode must be refused; the shared sampler clamps");
+                      "a wrap address mode must be refused; pxgTex3D clamps");
         CUDA_TEXTURE_DESC pointFilter = td;
         pointFilter.filterMode = CU_TR_FILTER_MODE_POINT;
         PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &pointFilter, nullptr) != CUDA_SUCCESS,
-                      "a point filter must be refused; the shared sampler is linear");
+                      "a point filter must be refused; pxgTex3D is linear");
         CUDA_TEXTURE_DESC asInt = td;
         asInt.flags = CU_TRSF_READ_AS_INTEGER;
         PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &asInt, nullptr) != CUDA_SUCCESS,
                       "CU_TRSF_READ_AS_INTEGER must be refused; the UNORM formats promote");
+        // P9.96: pxgTex3D reads texel-space coordinates only, so a descriptor asking
+        // for normalized ones must be refused rather than silently mis-addressed.
+        CUDA_TEXTURE_DESC normCoords = td;
+        normCoords.flags = CU_TRSF_NORMALIZED_COORDINATES;
+        PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &normCoords, nullptr) != CUDA_SUCCESS,
+                      "CU_TRSF_NORMALIZED_COORDINATES must be refused; pxgTex3D takes unnormalized coordinates");
+        // P9.96 check round: every other flag bit too (0x10 is cuda.h's CU_TRSF_SRGB,
+        // which would change the 8-bit conversion), and any resource view.
+        CUDA_TEXTURE_DESC srgb = td;
+        srgb.flags = 0x10u;
+        PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &srgb, nullptr) != CUDA_SUCCESS,
+                      "an unknown flags bit (CU_TRSF_SRGB) must be refused; the engine passes flags 0");
+        CUDA_RESOURCE_VIEW_DESC view;
+        std::memset(&view, 0, sizeof(view));
+        PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &td, &view) != CUDA_SUCCESS,
+                      "a resource view must be refused; the engine passes none");
 
         PXG_CHECK_MSG(cuTexObjectCreate(&t, &rd, &td, nullptr) == CUDA_SUCCESS,
                       "the well-formed control descriptor was refused");

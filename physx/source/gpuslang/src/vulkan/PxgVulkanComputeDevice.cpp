@@ -1734,12 +1734,16 @@ private:
 
     // ---- the bindless texture set (P9.12a) ----
     // One device-wide descriptor set at index 1: an unbounded array of sampled
-    // 3D images at binding 0 and ONE shared sampler at binding 1.  One sampler
-    // is enough because the engine builds every SDF texture with the identical
-    // descriptor -- clamp on all three axes, linear filter, unnormalized
-    // element reads (PxgGeometryManager.cpp:761-769).  A future texture that
-    // wants different addressing turns binding 1 into an array too; until then
-    // sharing it is a statement about the engine, not a shortcut.
+    // 3D images at binding 0 and ONE shared sampler at binding 1.  Binding 1 is
+    // RESERVED AND UNUSED since P9.96: pxgTex3D no longer samples, it fetches
+    // texels (OpImageFetch, which needs no sampler) and evaluates CUDA's
+    // clamp/linear filter itself, so the engine's one texture descriptor --
+    // clamp on all three axes, linear filter, normalized element reads,
+    // unnormalized coordinates (PxgGeometryManager.cpp:762-770) -- lives in
+    // shader code.  A layout binding
+    // no shader uses is valid Vulkan; dropping it (layout, pool sizes, sampler
+    // create/destroy) is a follow-up.  A texture that wants different addressing
+    // now means extending pxgTex3D, not this set.
     static const uint32_t kBindlessTextureCapacity = 4096;
     bool mHasBindlessTextures = false;
     VkDescriptorSetLayout mBindlessSetLayout = VK_NULL_HANDLE;

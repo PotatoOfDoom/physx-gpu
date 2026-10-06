@@ -43,7 +43,9 @@
 //
 // and the driver (P9.83b-8, 15) composes them.  The fixture can then mirror every
 // operation on the host from the engine's own PxVec3/PxQuat/PxTransform/PxMath
-// without a sampler mirror, which llvmpipe's filtering would make a guess.
+// without mirroring the SDF sample.  (Until P9.96 such a mirror would have been a
+// guess at llvmpipe's filtering; pxgTex3D now evaluates the filter itself, and
+// pxgSdfSceneRef.h's sdfSampleRef mirrors it exactly.)
 //
 // The contact is passed as its four fields rather than as TtbContact: that struct
 // lives in pxgSlangTriTriBlock, which is #included (it declares Workgroup storage)

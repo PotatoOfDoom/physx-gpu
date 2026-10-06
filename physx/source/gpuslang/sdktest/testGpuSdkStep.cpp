@@ -38,6 +38,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <chrono>
 
 using namespace physx;
 
@@ -456,7 +457,7 @@ void buildSdfMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     // separation +0.025 however deep the box sank, and the boxes sank through.
     {
         const PxReal centre = sdfBox->getSDF()[(size_t(sdz / 2) * sdy + sdy / 2) * sdx + sdx / 2];
-        std::printf("  sdfmesh: SDF at the centre texel %.4f (must be negative)\n", centre);
+        std::printf("  sdfmesh: SDF at the centre texel %.4f (must be negative; %.9g)\n", centre, centre);
         if (!(centre < 0.0f))
         {
             std::printf("FAIL: the cooked SDF is not negative inside the box -- the mesh is wound inward\n");
@@ -1858,10 +1859,12 @@ DirectApiMergeScene buildDirectApiMergeScene(PxPhysics* physics, PxScene* scene,
 // bounds.min - 0.5*(spacing - (edge - (dims-1)*spacing)); the dense SDF box is
 // meshLower + [0.5, dims-0.5]*spacing, sdfCollision.cuh:66-72).  Every number there is
 // dyadic, so a sample point p = boxLower + k/16 has texel coordinate f = k EXACTLY.
-// The DIMENSIONS are powers of two as well, and that is not cosmetic: pxgTex3D hands
-// the sampler (k + 0.5) / dim and the sampler scales it back, a round trip that is
-// exact only for dim = 2^n (testSdfQuery.cpp, buildAligned, measured).  With it, the
-// linear filter at a texel centre returns the stored texel bit-for-bit.
+// The DIMENSIONS are powers of two as well.  Until P9.96 that was not cosmetic: pxgTex3D
+// handed a sampler (k + 0.5) / dim and the sampler scaled it back, a round trip exact
+// only for dim = 2^n (testSdfQuery.cpp, buildAligned, measured).  Since P9.96 pxgTex3D
+// filters in texel space from texel loads and a texel centre returns the stored texel
+// bit-for-bit for ANY extent (testSdfQuery's sdfQueryNonPow2); the dims are kept so
+// the scene's recorded numbers stay comparable.
 // That is what lets the host oracle below be literal and tolerance-free: every tap the
 // kernel reads is a stored texel the host can index, plus an exact clamp distance.
 //
@@ -12218,6 +12221,10 @@ int main()
     // the shelf does (P9.83b-8 T7, PXG_SCENE=sdfmesh).
     const char* restTraceEnv = std::getenv("PXG_REST_TRACE");
     const int restTraceEvery = restTraceEnv ? std::atoi(restTraceEnv) : 0;
+    // P9.96: the stepping loop is timed, so a change to a hot kernel has a steps-per-
+    // second figure to compare (the whole-process wall time is dominated by pipeline
+    // creation and cooking, which the step rate leaves out).
+    const auto stepT0 = std::chrono::steady_clock::now();
     for (int i = 0; i < steps; ++i)
     {
         scene->simulate(dt);
@@ -12235,6 +12242,11 @@ int main()
         }
     }
 
+    {
+        const double stepSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - stepT0).count();
+        std::printf("  stepping took %.3f s (%.2f steps/s)\n", stepSec, stepSec > 0.0 ? double(steps) / stepSec : 0.0);
+    }
+
     // Per-body rest checks: began falling, reached its resting band (restY within a
     // generous tolerance — stacks settle with some jitter), did not sink through, at rest.
     int failures = 0;
@@ -12245,6 +12257,10 @@ int main()
         const float speed = tg.body->getLinearVelocity().magnitude();
         std::printf("  [%s] start y=%.3f, y after 1 step=%.4f, final y=%.4f (rest %.3f), |v|=%.4f\n",
                     tg.label, tg.startY, yAfterOne[t], finalY, tg.restY, speed);
+        // P9.96: the same numbers at full precision, so a change below the 4-digit print
+        // (a filter, a rounding) is visible as a before/after rather than hidden by it.
+        std::printf("  [%s] full: y after 1 step=%.9g, final y=%.9g, |v|=%.9g\n", tg.label, yAfterOne[t],
+                    finalY, speed);
         if (!(yAfterOne[t] < tg.startY)) { std::printf("FAIL: [%s] did not begin falling\n", tg.label); ++failures; }
         if (!(finalY < tg.restY + 0.75f)) { std::printf("FAIL: [%s] above rest band (finalY=%.3f)\n", tg.label, finalY); ++failures; }
         if (!(finalY > tg.restY - 0.75f)) { std::printf("FAIL: [%s] below rest band / sank (finalY=%.3f)\n", tg.label, finalY); ++failures; }

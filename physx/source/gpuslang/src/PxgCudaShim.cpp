@@ -221,8 +221,8 @@ PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWor
 // PxgKernelDef has no field saying a kernel samples the bindless set, and the
 // manifest is generated from kernel NAMES, so a hand-maintained flag would be one
 // more thing that can drift from the shader it describes.  The SPIR-V already
-// says it: a kernel that samples declares its image array and sampler with
-// `DescriptorSet 1` (pxgSlangTex3d.slang).  So pipelineFor reads that off the blob
+// says it: a kernel that samples declares its image array with
+// `DescriptorSet 1` (pxgSlangTex3d.slang; P9.96 dropped the sampler).  So pipelineFor reads that off the blob
 // it is about to compile, and nothing has to be remembered.
 //
 // PER ENTRY POINT, not per module.  From SPIR-V 1.4 on, an OpEntryPoint's

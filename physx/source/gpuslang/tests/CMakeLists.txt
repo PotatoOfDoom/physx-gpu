@@ -138,6 +138,14 @@ set(PXG_NOCONTRACT_SHADERS softBodySdfMidphaseBda femClothSdfMeshCgBda npCvxCore
     # P9.83b-8 T2: the block-tail fixture -- the header normal and the points are
     # quatRotate chains compared bit for bit.
     npTriTriTail
+    # P9.96: the pxgSlangTex3d fixture joins.  pxgTex3D is now an explicit linear
+    # filter -- eight texel products and seven adds, r = r + w*t -- compared BIT FOR
+    # BIT against tests/pxgTex3dRef.h (built -ffp-contract=off), and every ENGINE
+    # importer of the module (sdfQueryBda, psSdfMidphaseBda, softBodySdfMidphaseBda,
+    # femClothSdfMeshCgBda, triTriCollisionBda, and the npSdf* fixtures) is already
+    # stamped above.  Unstamped, llvmpipe may fuse the chain into fmas, and the
+    # fixture would certify a build no engine kernel runs.
+    npTex3dBindless
     # P9.83b-8: the mesh-mesh kernel itself, stamped like every fixture that
     # certifies one of its modules (the promise npTriTriGeom's entry made above).
     triTriCollisionBda
@@ -1769,7 +1777,7 @@ pxg_compile_shader(npAtomicLib alAtomics alAtomicSelect)
 pxg_compile_shader(npFloatIntrin floatIntrinRecipSqrtLaunch)
 # RUNTIME_PLAN.md P2: tex3D replacement (Vulkan-only sampled-image path).
 pxg_compile_shader(npTex3d tex3dSample)
-pxg_compile_shader(npTex3dBindless tex3dBindlessSample)
+pxg_compile_shader(npTex3dBindless tex3dBindlessSample tex3dBindlessLoad)
 pxg_compile_shader(npSdfTexture sdfTexProbe sdfTexSampleAt)
 # P9.34a adds the two entries the cloth-vs-SDF contact gen needs: the barycentric clamp
 # (Gu::closestPtPointBaryTriangle, the one function on this page with a real host oracle)

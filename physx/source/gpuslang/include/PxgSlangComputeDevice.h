@@ -276,9 +276,10 @@ public:
     { return 0; }
 
     // Like createPipeline, but the kernel additionally declares the bindless
-    // set at descriptor set 1 (`Texture3D<float> gPxgTex3D[]` at binding 0 and
-    // `SamplerState gPxgTex3DSampler` at binding 1 -- see
-    // shaders/pxgSlangTex3d.slang).  Kernels that do not sample must keep
+    // set at descriptor set 1 (`Texture3D<float> gPxgTex3D[]` at binding 0 --
+    // see shaders/pxgSlangTex3d.slang; binding 1, the shared sampler, is still
+    // in the layout but reserved and unused since P9.96, when pxgTex3D moved to
+    // texel loads).  Kernels that do not sample must keep
     // using createPipeline: a pipeline layout that declares a set it never
     // reads costs a bind per dispatch for nothing.
     virtual PxgPipelineHandle createPipelineBindless(const void* /*code*/, size_t /*codeSize*/,
