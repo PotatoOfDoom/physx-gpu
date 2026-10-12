@@ -174,6 +174,48 @@ cmake --build build-gpuslang -j
 ctest --test-dir build-gpuslang --output-on-failure
 ```
 
+Validation-layer run (P9.98): `sh physx/source/gpuslang/tools/run_validation.sh
+suite` runs the whole suite (both memory modes) under `VK_LAYER_KHRONOS_validation`
+with `tools/validation/vk_layer_settings.txt`, and `... subset` /
+`'scene:box|PXG_SCENE=box'` run a fast subset or gpu-sdk-step rows. It fails on any
+message `tools/validation_waivers.txt` does not cover (filtering is per module, via
+the entry-point names the device attaches under `PXG_VK_DEBUG_NAMES=1`). Point
+`PXG_VVL_DIR` at an extracted `vulkan-validationlayers` package if no system layer
+is installed; ctest's `gpuslang.validationSubset` runs the subset and is skipped
+when no layer is found. Memory mode 0 runs with `PXG_DEVICE_V2` unset (the engine
+bridge takes any value, `0` included, as mode 1), and `--best-practices` uses the
+Best Practices configuration instead. The runner removes any inherited `VK_LAYER_*` /
+`VK_KHRONOS_VALIDATION_*` setting (they override the config file, e.g. a message-ID
+filter), and the triage also fails on the port's own signals: a device or shim refusal
+outside the fixtures that provoke them (`pipelineRefusal`, `shimBindless`), a push range
+the device widened for an entry the waivers do not list (since P9.98 the layout covers
+the shader's whole push block and the surplus is zero-filled, so VUID-07987 can no longer
+fire), and an allocation peak (`PXG_VK_ALLOC_STATS=1`, set by the runner) above the
+device's `maxMemoryAllocationCount` or above the F5 waivers' bound. `sh
+tools/test_vvl_triage.sh` (ctest `gpuslang.vvlTriage`) pins those rules.
+
+Since P9.98 the Vulkan device checks every entry point against the device's limits
+before it builds the pipeline (push block, Workgroup memory per entry point,
+workgroup size and invocations, read from the SPIR-V) and refuses an over-limit or
+failed build with a reason on stderr (handle 0, which the shim reports as a refused
+launch) instead of crashing at dispatch. To see what a smaller device would refuse,
+lower a limit for a whole process with `PXG_VK_LIMIT_PUSH_CONSTANTS`,
+`PXG_VK_LIMIT_SHARED_MEMORY`, `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS`,
+`PXG_VK_LIMIT_WORKGROUP_SIZE` or `PXG_VK_LIMIT_WORKGROUP_COUNT` (a value can only lower
+the device's limit). Sizes past 4 GiB are refused, never wrapped. A dispatch whose grid
+exceeds `maxComputeWorkGroupCount` (65535 per dimension on llvmpipe and the Vulkan
+minimum; CUDA allows a `gridDim.x` up to 2^31-1) is refused; `dispatchIndirect`'s counts
+live on the device and are not checked. `run_scenes.sh` ends with a scored refusal
+control: box under `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128` must fail cleanly (rc 2), not
+crash.
+A buffer or texture whose allocation fails is likewise handle 0 (the shim reports
+`OutOfMemory`), and a dispatch whose buffers, textures or indirect-argument buffer
+do not match the pipeline or are not live is refused without recording anything, and
+a transfer (`upload`, `download`, `copyBuffer`, `fillBuffer`; the shim's `cuMemcpy*` /
+`cuMemsetD32`, which return `InvalidValue`) that runs past its buffer is refused;
+the Vulkan calls the device cannot recover from (submission, waits, the staging
+ring) abort with the failing call named.
+
 On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).

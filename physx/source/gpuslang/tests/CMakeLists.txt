@@ -1798,6 +1798,10 @@ pxg_compile_shader(npSdfFind sdfFindRounds sdfFindTriangleRounds sdfFindTetRound
 pxg_compile_shader(npSdfParticle sdfParticleContactAt)
 # RUNTIME_PLAN.md P3 shim proof kernel (nested BDA params).
 pxg_compile_shader(npShimAxpy shimAxpy)
+# P9.98 (gpuslang.pipelineRefusal): a push block wider than its caller that READS the
+# tail, so the device's zero fill of the surplus (VUID-07987 fix) is observable; and two
+# (1,2,1) / (1,1,2) workgroups for the per-dimension workgroup-size limit.
+pxg_compile_shader(p98PushPad pushPadEcho pushPadDimY pushPadDimZ)
 # P5 Step 4: PxgBroadPhaseDesc mirror layout proof (BDA).
 pxg_compile_shader(npBpDescProbe bpDescProbe)
 # P5 Step 4: narrowphase element-struct mirror layout proof (BDA).
@@ -1866,6 +1870,7 @@ endif()
 # ---- test executable ----
 add_executable(gpuslang-tests
     main.cpp
+    testPipelineRefusal.cpp
     testScan.cpp
     testRadixSort.cpp
     testRadixSortGather.cpp
@@ -2480,7 +2485,8 @@ foreach(suite scan radixSort radixSortDesc aggregateBda radixSortGather preInteg
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda robustProbe p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psSprings psSolveSprings psAverageVerts psAerodynamics psInflatable psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide)
+        p0Subgroup p0Bda robustProbe p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psSprings psSolveSprings psAverageVerts psAerodynamics psInflatable psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide
+        pipelineRefusal)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -3247,3 +3253,24 @@ add_test(NAME gpuslang.sweepTimeoutPolicy
 # re-run a red baseline.  Every row also checks that source and .spv are restored.
 add_test(NAME gpuslang.sweepRunners
     COMMAND sh ${GPUSLANG_ROOT}/tools/test_sweep_runners.sh)
+
+# P9.98 check round 1: tools/vvl_triage.py against the checked-in waivers, on tiny
+# inline logs: a device / shim / bridge refusal fails outside the fixtures that provoke it
+# (it used to pass), a widened push range fails unless its entry is listed, the F5 waivers
+# hold only under their allocation bound.  No GPU, no layer, about 2 s.
+add_test(NAME gpuslang.vvlTriage
+    COMMAND sh ${GPUSLANG_ROOT}/tools/test_vvl_triage.sh)
+
+# P9.98: a small validation-layer run -- tools/run_validation.sh subset: the
+# pipelineRefusal fixtures plus the suites whose modules the layer flagged in the P9.98
+# scope (sdfFind, sdfParticle, psSdfMidphase, psDiffuseContactGen, solverTGS) and the
+# sync-control suites (scan, p6Indirect), in both memory modes, failing on any message
+# tools/validation_waivers.txt does not cover.  SKIPPED (77) when no
+# VK_LAYER_KHRONOS_validation is found -- set PXG_VVL_DIR to an extracted
+# vulkan-validationlayers package to arm it.  The full run is
+# `sh tools/run_validation.sh suite` (about 9 min per memory mode).
+add_test(NAME gpuslang.validationSubset
+    COMMAND sh ${GPUSLANG_ROOT}/tools/run_validation.sh subset)
+set_tests_properties(gpuslang.validationSubset PROPERTIES
+    ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR};PXG_BUILD_TESTS=${CMAKE_BINARY_DIR}"
+    SKIP_RETURN_CODE 77)

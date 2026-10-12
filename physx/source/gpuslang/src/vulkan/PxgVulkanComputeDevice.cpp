@@ -61,15 +61,24 @@ namespace physx
 namespace gpuslang
 {
 
+// A Vulkan call whose failure this device cannot recover from: recording, submission,
+// waiting, mapping for a transfer, the staging ring.  P9.98 check round 0: it ABORTS in
+// every build -- it used to assert only, and both build trees are -DNDEBUG, so a failure
+// ran on with a null or stale object and crashed later, somewhere unrelated.  Every
+// failure a caller CAN act on is checked by hand instead and refused with a reason:
+// pipelines (createPipelineInternal), buffers and textures (createBuffer /
+// createHostVisibleBuffer / createTexture3D* return 0, which the shim reports as
+// OutOfMemory), descriptor sets (the dispatch is refused) and init (no device).
 #define PXG_VK_CHECK(expr)                                                                 \
     do                                                                                     \
     {                                                                                      \
         VkResult pxgVkResult_ = (expr);                                                    \
         if (pxgVkResult_ != VK_SUCCESS)                                                    \
         {                                                                                  \
-            fprintf(stderr, "[gpuslang/vulkan] %s failed: %d (%s:%d)\n", #expr,            \
+            fprintf(stderr, "[gpuslang/vulkan] %s failed: %d (%s:%d); aborting\n", #expr,  \
                     int(pxgVkResult_), __FILE__, __LINE__);                                \
-            assert(false);                                                                 \
+            fflush(stderr);                                                                \
+            std::abort();                                                                  \
         }                                                                                  \
     } while (0)
 
@@ -144,8 +153,270 @@ bool pxgSpirvDeclaresSampler(const void* code, size_t codeSize)
     return false;
 }
 
+// P9.98 -- see the declaration in PxgSlangComputeDevice.h.  The size rules are the two
+// static checkers' (tools/check_push_block.py for the push block, rounded to 4;
+// tools/check_groupshared.py for Workgroup storage, including its struct rounding),
+// so the device refuses exactly what those tools measure; the P9.98 fixture
+// gpuslang.pipelineRefusal pins the numbers for the modules the validation layer
+// flagged.
+namespace
+{
+struct SpirvTypeTable
+{
+    struct Type
+    {
+        uint32_t op = 0;
+        std::vector<uint32_t> a;
+    };
+    std::unordered_map<uint32_t, Type> types;
+    std::unordered_map<uint32_t, uint32_t> consts, arrayStride;
+    std::unordered_map<uint64_t, uint32_t> memberOffset;   // (struct << 32 | member) -> Offset
+
+    // P9.98 check round 1: sizes are 64-bit and SATURATE at kHuge.  They were uint32 and
+    // wrapped: `groupshared float gA[0x40000000]` (4 GiB) reflected as 0 B, passed the
+    // limit check and was built -- and the device crashed at the flush (measured, rc 139),
+    // the crash class the limit check exists to turn into a refusal.  kHuge is far above
+    // any uint32, so a saturated size can never come back under a limit; the public
+    // PxgSpirvEntryInfo then reports it as UINT32_MAX (over every limit), not undecided.
+    static constexpr uint64_t kUndecided = ~0ull;
+    static constexpr uint64_t kHuge = 1ull << 40;
+    static uint64_t sat(uint64_t v) { return v > kHuge ? kHuge : v; }
+    static uint64_t mul(uint64_t a, uint64_t b) { return (b != 0 && a > kHuge / b) ? kHuge : sat(a * b); }
+
+    // Byte size of `tid`, or kUndecided.  `workgroup` selects check_groupshared's struct
+    // rounding (to the largest member alignment) over the push block's (to 4, applied by
+    // the caller).
+    uint64_t size(uint32_t tid, bool workgroup, int depth = 0) const
+    {
+        const auto it = types.find(tid);
+        if (depth > 24 || it == types.end())
+            return kUndecided;
+        const Type& t = it->second;
+        switch (t.op)
+        {
+        case 20u: return 4u;                                               // OpTypeBool
+        case 21u: case 22u: return t.a.empty() ? kUndecided : (t.a[0] / 8u ? t.a[0] / 8u : 1u); // Int/Float
+        case 23u: case 24u:                                                // Vector/Matrix
+        {
+            if (t.a.size() < 2)
+                return kUndecided;
+            const uint64_t e = size(t.a[0], workgroup, depth + 1);
+            return e == kUndecided ? kUndecided : mul(e, t.a[1]);
+        }
+        case 28u:                                                          // OpTypeArray
+        {
+            if (t.a.size() < 2)
+                return kUndecided;
+            const auto n = consts.find(t.a[1]);
+            if (n == consts.end())
+                return kUndecided;
+            const auto st = arrayStride.find(tid);
+            const uint64_t stride = st != arrayStride.end() ? st->second : size(t.a[0], workgroup, depth + 1);
+            return stride == kUndecided ? kUndecided : mul(stride, n->second);
+        }
+        case 29u: return 0u;                                               // RuntimeArray
+        case 32u: return 8u;                                               // pointer (BDA)
+        case 30u:                                                          // OpTypeStruct
+        {
+            if (t.a.empty())
+                return 0u;
+            uint64_t total = 0, align = 1;
+            bool decorated = true;
+            for (size_t m = 0; m < t.a.size(); ++m)
+                if (memberOffset.find((uint64_t(tid) << 32) | m) == memberOffset.end())
+                    decorated = false;
+            for (size_t m = 0; m < t.a.size(); ++m)
+            {
+                const uint64_t ms = size(t.a[m], workgroup, depth + 1);
+                if (ms == kUndecided)
+                    return kUndecided;
+                const uint64_t a = (ms == 1u || ms == 2u || ms == 4u || ms == 8u || ms == 16u) ? ms : 16u;
+                align = a > align ? a : align;
+                if (decorated)
+                {
+                    const uint64_t end = sat(memberOffset.at((uint64_t(tid) << 32) | m) + ms);
+                    total = end > total ? end : total;
+                }
+                else
+                    total = sat((total + a - 1u) / a * a + ms);
+            }
+            if (workgroup || !decorated)
+                total = (total + align - 1u) / align * align;
+            else
+                total = (total + 3u) & ~uint64_t(3);   // check_push_block.struct_size
+            return sat(total);
+        }
+        default: return kUndecided;
+        }
+    }
+};
+
+// A 64-bit size as PxgSpirvEntryInfo reports it: UINT32_MAX for anything that does not
+// fit (over every device limit, so it is refused -- never wrapped to a small number).
+static uint32_t reportedBytes(uint64_t v)
+{
+    return v > 0xFFFFFFFFull ? 0xFFFFFFFFu : uint32_t(v);
+}
+} // namespace
+
+// *malformed tells the two false results apart for createPipelineInternal's reason: the
+// blob is not a well-formed word stream (true), or it is and has no such entry (false).
+static bool reflectEntryImpl(const void* code, size_t codeSize, const char* entry, PxgSpirvEntryInfo* out,
+                             bool* malformed)
+{
+    *malformed = true;
+    if (!code || !entry || codeSize < 20 || (codeSize & 3u) != 0)
+        return false;
+    const size_t n = codeSize / 4;
+    std::vector<uint32_t> w(n);
+    std::memcpy(w.data(), code, n * 4);
+    if (w[0] != 0x07230203u)
+        return false;
+    const bool perEntry = w[1] >= 0x00010400u;   // interface lists every global since 1.4
+
+    SpirvTypeTable tt;
+    struct Var
+    {
+        uint32_t id, pointee, storage;
+    };
+    std::vector<Var> vars;
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> pointers;   // id -> (storage, pointee)
+    size_t epIface = 0, epEnd = 0;
+    uint32_t epFn = 0;
+    bool found = false;
+    struct ExecMode
+    {
+        uint32_t fn, mode, x, y, z;
+        bool ids;
+    };
+    std::vector<ExecMode> modes;
+    const size_t entryLen = std::strlen(entry);
+    for (size_t i = 5; i < n;)
+    {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > n)
+            return false;
+        if (op == 15u && wc >= 4u)                                  // OpEntryPoint
+        {
+            const char* name = reinterpret_cast<const char*>(&w[i + 3]);
+            const size_t maxBytes = size_t(wc - 3) * 4;
+            const size_t len = strnlen(name, maxBytes);
+            if (!found && len < maxBytes && len == entryLen && std::memcmp(name, entry, len) == 0 &&
+                w[i + 1] == 5u /* GLCompute */)
+            {
+                found = true;
+                epFn = w[i + 2];
+                epIface = i + 3 + (len + 4) / 4;
+                epEnd = i + wc;
+            }
+        }
+        else if ((op == 16u || op == 331u) && wc >= 6u &&           // OpExecutionMode(Id)
+                 (w[i + 2] == 17u || w[i + 2] == 38u))              // LocalSize / LocalSizeId
+            modes.push_back({ w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5], op == 331u || w[i + 2] == 38u });
+        else if (op == 71u && wc >= 4u && w[i + 2] == 6u)           // OpDecorate ArrayStride
+            tt.arrayStride[w[i + 1]] = w[i + 3];
+        else if (op == 72u && wc >= 5u && w[i + 3] == 35u)          // OpMemberDecorate Offset
+            tt.memberOffset[(uint64_t(w[i + 1]) << 32) | w[i + 2]] = w[i + 4];
+        else if (op == 43u && wc >= 4u)                             // OpConstant (low word)
+            tt.consts[w[i + 2]] = w[i + 3];
+        else if (op == 32u && wc >= 4u)                             // OpTypePointer
+        {
+            pointers[w[i + 1]] = { w[i + 2], w[i + 3] };
+            tt.types[w[i + 1]].op = op;
+        }
+        else if ((op >= 20u && op <= 24u) || op == 28u || op == 29u || op == 30u)
+        {
+            // Every type instruction has a result id (word 1); a word count of 1 is not
+            // a well-formed instruction, and the assign below would be a reversed range.
+            if (wc < 2u)
+                return false;
+            SpirvTypeTable::Type& t = tt.types[w[i + 1]];
+            t.op = op;
+            t.a.assign(w.begin() + i + 2, w.begin() + i + wc);
+        }
+        else if (op == 59u && wc >= 4u)                             // OpVariable
+        {
+            const auto p = pointers.find(w[i + 1]);
+            if (p != pointers.end())
+                vars.push_back({ w[i + 2], p->second.second, w[i + 3] });
+        }
+        i += wc;
+    }
+    *malformed = false;
+    if (!found)
+        return false;
+
+    PxgSpirvEntryInfo info;
+    info.perEntry = perEntry;
+    uint64_t pushBytes = 0, workgroupBytes = 0;   // 64-bit, saturating: see SpirvTypeTable
+    for (const Var& v : vars)
+    {
+        if (v.storage != 9u && v.storage != 4u)                    // PushConstant / Workgroup
+            continue;
+        if (perEntry)
+        {
+            bool listed = false;
+            for (size_t k = epIface; k < epEnd && !listed; ++k)
+                listed = w[k] == v.id;
+            if (!listed)
+                continue;
+        }
+        if (v.storage == 9u)
+        {
+            const uint64_t s = tt.size(v.pointee, false);
+            if (s == SpirvTypeTable::kUndecided)
+                info.pushDecided = false;
+            else
+            {
+                const uint64_t r = (s + 3u) & ~uint64_t(3);
+                pushBytes = r > pushBytes ? r : pushBytes;
+            }
+        }
+        else
+        {
+            const uint64_t s = tt.size(v.pointee, true);
+            if (s == SpirvTypeTable::kUndecided)
+                info.workgroupDecided = false;
+            else
+                workgroupBytes = SpirvTypeTable::sat(workgroupBytes + s);
+        }
+    }
+    info.pushBlockBytes = reportedBytes(pushBytes);
+    info.workgroupBytes = reportedBytes(workgroupBytes);
+    for (const ExecMode& m : modes)
+    {
+        if (m.fn != epFn)
+            continue;
+        const uint32_t xyz[3] = { m.x, m.y, m.z };
+        for (int d = 0; d < 3; ++d)
+        {
+            if (!m.ids)
+                info.localSize[d] = xyz[d];
+            else
+            {
+                const auto c = tt.consts.find(xyz[d]);
+                info.localSize[d] = c == tt.consts.end() ? 0u : c->second;
+            }
+        }
+    }
+    if (out)
+        *out = info;
+    return true;
+}
+
+bool pxgSpirvReflectEntry(const void* code, size_t codeSize, const char* entry, PxgSpirvEntryInfo* out)
+{
+    bool malformed = false;
+    return reflectEntryImpl(code, codeSize, entry, out, &malformed);
+}
+
 class PxgVulkanComputeDevice : public PxgSlangComputeDevice
 {
+private:
+    struct Pipeline;   // defined with the other private state below
+    struct Buffer;
+    struct Texture;
+
 public:
     PxgVulkanComputeDevice() {}
 
@@ -158,7 +429,7 @@ public:
             for (auto& kv : mBuffers)
             {
                 vkDestroyBuffer(mDevice, kv.second.buffer, nullptr);
-                vkFreeMemory(mDevice, kv.second.memory, nullptr);
+                freeMemoryCounted(kv.second.memory);
             }
             for (auto& kv : mTextures)
                 releaseTexture(kv.second);
@@ -176,7 +447,7 @@ public:
                 if (frame.staging)
                 {
                     vkDestroyBuffer(mDevice, frame.staging, nullptr);
-                    vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
+                    freeMemoryCounted(frame.stagingMemory);
                 }
             }
             if (mBindlessPool)
@@ -202,6 +473,31 @@ public:
             vkDestroyInstance(mInstance, nullptr);
     }
 
+    // P9.98 check round 0: an init step that fails makes NO device (the factory returns
+    // null, the destructor releases what exists) instead of a device with null objects.
+    // P9.98 check round 1: the Vulkan spec leaves a create call's output UNDEFINED when it
+    // fails (Fundamentals > Return Codes: only vkAllocateCommandBuffers,
+    // vkAllocateDescriptorSets and vkCreate*Pipelines promise VK_NULL_HANDLE), and every
+    // refusal path -- refuseBuffer, refuseTexture, refusePipeline, the destructor after a
+    // failed init -- destroys the non-null objects it finds.  So each such call's output is
+    // reset here before anything can read it: a driver that leaves junk behind must not
+    // have that junk handed to vkDestroy* / vkFree*.
+    template <class H>
+    static VkResult madeOrNull(VkResult r, H* out)
+    {
+        if (r != VK_SUCCESS)
+            *out = VK_NULL_HANDLE;
+        return r;
+    }
+
+    static bool initStep(VkResult r, const char* what)
+    {
+        if (r == VK_SUCCESS)
+            return true;
+        std::fprintf(stderr, "[PxgVulkan] init: %s failed with VkResult %d; no device\n", what, int(r));
+        return false;
+    }
+
     bool init(const PxgSlangDeviceDesc& desc)
     {
         // ---- instance ----
@@ -219,13 +515,39 @@ public:
         if (desc.enableValidation)
             layers.push_back("VK_LAYER_KHRONOS_validation");
 
+        // P9.98: PXG_VK_DEBUG_NAMES=1 (set by tools/run_validation.sh) or enableValidation
+        // names every shader module, pipeline layout and pipeline after its ENTRY POINT
+        // through VK_EXT_debug_utils, so each validation-layer message carries
+        // `name = <entry>` and can be attributed -- and a waiver scoped to one module --
+        // without an LD_PRELOAD probe.  Off otherwise; no effect on what runs.
+        std::vector<const char*> instExts;
+        {
+            const char* dn = std::getenv("PXG_VK_DEBUG_NAMES");
+            const bool wantNames = desc.enableValidation || (dn && std::strcmp(dn, "0") != 0);
+            mDebugNames = wantNames;
+            uint32_t extCount = 0;
+            if (wantNames && vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr) == VK_SUCCESS)
+            {
+                std::vector<VkExtensionProperties> exts(extCount);
+                vkEnumerateInstanceExtensionProperties(nullptr, &extCount, exts.data());
+                for (const VkExtensionProperties& e : exts)
+                    if (std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0)
+                        instExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            }
+        }
+
         VkInstanceCreateInfo instInfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
         instInfo.pApplicationInfo = &appInfo;
         instInfo.enabledLayerCount = uint32_t(layers.size());
         instInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+        instInfo.enabledExtensionCount = uint32_t(instExts.size());
+        instInfo.ppEnabledExtensionNames = instExts.empty() ? nullptr : instExts.data();
 
-        if (vkCreateInstance(&instInfo, nullptr, &mInstance) != VK_SUCCESS)
+        if (madeOrNull(vkCreateInstance(&instInfo, nullptr, &mInstance), &mInstance) != VK_SUCCESS)
             return false;
+        if (!instExts.empty())
+            mSetObjectName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+                vkGetInstanceProcAddr(mInstance, "vkSetDebugUtilsObjectNameEXT"));
 
         // ---- physical device ----
         uint32_t count = 0;
@@ -260,6 +582,45 @@ public:
         vkGetPhysicalDeviceProperties(mPhysicalDevice, &props);
         mDeviceName = props.deviceName;
         mTimestampPeriod = props.limits.timestampPeriod;   // ns per tick, 0 => timestamps unusable
+        allocStats().maxCount = props.limits.maxMemoryAllocationCount;
+
+        // P9.98: the limits every pipeline is checked against at creation.  Nothing
+        // compared them before, and llvmpipe's are generous (push 256, shared 32768),
+        // so a kernel over a smaller device's limit failed vkCreateComputePipelines
+        // there -- and that failure was not handled either (F4).  The test hooks may
+        // only LOWER a limit.
+        mLimits.maxPushConstantsSize = props.limits.maxPushConstantsSize;
+        mLimits.maxComputeSharedMemorySize = props.limits.maxComputeSharedMemorySize;
+        mLimits.maxComputeWorkGroupInvocations = props.limits.maxComputeWorkGroupInvocations;
+        for (int d = 0; d < 3; ++d)
+        {
+            mLimits.maxComputeWorkGroupSize[d] = props.limits.maxComputeWorkGroupSize[d];
+            mLimits.maxComputeWorkGroupCount[d] = props.limits.maxComputeWorkGroupCount[d];
+        }
+        {
+            auto lower = [](uint32_t& limit, uint32_t hook, const char* env) {
+                if (hook != 0 && hook < limit)
+                    limit = hook;
+                if (const char* e = std::getenv(env))
+                {
+                    const unsigned long v = std::strtoul(e, nullptr, 0);
+                    if (v != 0 && v < limit)
+                        limit = uint32_t(v);
+                }
+            };
+            lower(mLimits.maxPushConstantsSize, desc.limitMaxPushConstantsSize, "PXG_VK_LIMIT_PUSH_CONSTANTS");
+            lower(mLimits.maxComputeSharedMemorySize, desc.limitMaxComputeSharedMemorySize,
+                  "PXG_VK_LIMIT_SHARED_MEMORY");
+            lower(mLimits.maxComputeWorkGroupInvocations, desc.limitMaxComputeWorkGroupInvocations,
+                  "PXG_VK_LIMIT_WORKGROUP_INVOCATIONS");
+            for (int d = 0; d < 3; ++d)
+            {
+                lower(mLimits.maxComputeWorkGroupSize[d], desc.limitMaxComputeWorkGroupSize,
+                      "PXG_VK_LIMIT_WORKGROUP_SIZE");
+                lower(mLimits.maxComputeWorkGroupCount[d], desc.limitMaxComputeWorkGroupCount,
+                      "PXG_VK_LIMIT_WORKGROUP_COUNT");
+            }
+        }
 
         // ---- queue family ----
         uint32_t queueFamilyCount = 0;
@@ -411,7 +772,7 @@ public:
         deviceInfo.enabledExtensionCount = uint32_t(deviceExts.size());
         deviceInfo.ppEnabledExtensionNames = deviceExts.empty() ? nullptr : deviceExts.data();
 
-        if (vkCreateDevice(mPhysicalDevice, &deviceInfo, nullptr, &mDevice) != VK_SUCCESS)
+        if (madeOrNull(vkCreateDevice(mPhysicalDevice, &deviceInfo, nullptr, &mDevice), &mDevice) != VK_SUCCESS)
             return false;
 
         vkGetDeviceQueue(mDevice, mQueueFamily, 0, &mQueue);
@@ -431,19 +792,23 @@ public:
         VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         poolInfo.queueFamilyIndex = mQueueFamily;
-        PXG_VK_CHECK(vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mCommandPool));
+        if (!initStep(madeOrNull(vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mCommandPool), &mCommandPool),
+                      "vkCreateCommandPool"))
+            return false;
 
         VkCommandBufferAllocateInfo cmdInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
         cmdInfo.commandPool = mCommandPool;
         cmdInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cmdInfo.commandBufferCount = kFramesInFlight;
         VkCommandBuffer cmds[kFramesInFlight] = {};
-        PXG_VK_CHECK(vkAllocateCommandBuffers(mDevice, &cmdInfo, cmds));
+        if (!initStep(vkAllocateCommandBuffers(mDevice, &cmdInfo, cmds), "vkAllocateCommandBuffers"))
+            return false;
         for (uint32_t i = 0; i < kFramesInFlight; ++i)
             mFrames[i].cmd = cmds[i];
 
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        PXG_VK_CHECK(vkCreateFence(mDevice, &fenceInfo, nullptr, &mFence));
+        if (!initStep(madeOrNull(vkCreateFence(mDevice, &fenceInfo, nullptr, &mFence), &mFence), "vkCreateFence"))
+            return false;
 
         // One timeline semaphore per queue: every submit signals the next
         // monotonic value, so any past submission can be waited on or polled
@@ -455,7 +820,15 @@ public:
             typeInfo.initialValue = 0;
             VkSemaphoreCreateInfo semInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
             semInfo.pNext = &typeInfo;
-            PXG_VK_CHECK(vkCreateSemaphore(mDevice, &semInfo, nullptr, &mTimeline));
+            // A failure here is not fatal: the blocking-fence path below covers devices
+            // without timeline semaphores, so the device falls back to it -- and says so.
+            const VkResult r = vkCreateSemaphore(mDevice, &semInfo, nullptr, &mTimeline);
+            if (r != VK_SUCCESS)
+            {
+                std::fprintf(stderr, "[PxgVulkan] init: vkCreateSemaphore (timeline) failed with VkResult %d; "
+                                     "using blocking fence submission\n", int(r));
+                mTimeline = VK_NULL_HANDLE;
+            }
             mHasTimeline = mTimeline != VK_NULL_HANDLE;
         }
 
@@ -470,7 +843,7 @@ public:
             VkQueryPoolCreateInfo qpInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
             qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
             qpInfo.queryCount = kMaxTimestamps;
-            if (vkCreateQueryPool(mDevice, &qpInfo, nullptr, &mQueryPool) == VK_SUCCESS)
+            if (madeOrNull(vkCreateQueryPool(mDevice, &qpInfo, nullptr, &mQueryPool), &mQueryPool) == VK_SUCCESS)
                 mHasTimestamps = true;
         }
 
@@ -497,7 +870,18 @@ public:
         VkPipelineCacheCreateInfo cacheInfo = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
         cacheInfo.initialDataSize = cacheSeed.size();
         cacheInfo.pInitialData = cacheSeed.empty() ? nullptr : cacheSeed.data();
-        PXG_VK_CHECK(vkCreatePipelineCache(mDevice, &cacheInfo, nullptr, &mPipelineCache));
+        // P9.98 check round 1: the cache is OPTIONAL -- vkCreateComputePipelines takes
+        // VK_NULL_HANDLE, the destructor null-checks it and savePipelineCache is skipped
+        // without one -- so a failure is reported and the device carries on without it, as
+        // it does for the timeline semaphore and the query pool.  (Round 0 had made it a
+        // fatal init step; before that it was an assert-only check.)
+        {
+            const VkResult r =
+                madeOrNull(vkCreatePipelineCache(mDevice, &cacheInfo, nullptr, &mPipelineCache), &mPipelineCache);
+            if (r != VK_SUCCESS)
+                std::fprintf(stderr, "[PxgVulkan] init: vkCreatePipelineCache failed with VkResult %d; continuing "
+                                     "without a pipeline cache\n", int(r));
+        }
 
         vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProperties);
 
@@ -511,54 +895,11 @@ public:
 
     PxgBufferHandle createBuffer(size_t sizeBytes) override
     {
-        if (sizeBytes == 0)
-            sizeBytes = 4;
-
-        VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bufferInfo.size = sizeBytes;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-        if (mHasBufferDeviceAddress)
-            bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        Buffer buf = {};
-        buf.size = sizeBytes;
-        PXG_VK_CHECK(vkCreateBuffer(mDevice, &bufferInfo, nullptr, &buf.buffer));
-
-        VkMemoryRequirements memReq;
-        vkGetBufferMemoryRequirements(mDevice, buf.buffer, &memReq);
-
         // v2 memory mode: DEVICE_LOCAL storage with staged transfers.  The
         // staged path is taken even when the winning memory type happens to
         // also be host-visible (UMA/software devices) so the production
         // transfer path is exercised everywhere, CI included.
-        buf.hostVisible = !mDesc.useDeviceLocalMemory;
-        const uint32_t memoryType = buf.hostVisible
-            ? findMemoryType(memReq.memoryTypeBits,
-                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-            : findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-        VkMemoryAllocateFlagsInfo allocFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
-        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-
-        VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        allocInfo.pNext = mHasBufferDeviceAddress ? &allocFlags : nullptr;
-        allocInfo.allocationSize = memReq.size;
-        allocInfo.memoryTypeIndex = memoryType;
-        PXG_VK_CHECK(vkAllocateMemory(mDevice, &allocInfo, nullptr, &buf.memory));
-        PXG_VK_CHECK(vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0));
-
-        if (mHasBufferDeviceAddress)
-        {
-            VkBufferDeviceAddressInfo addrInfo = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
-            addrInfo.buffer = buf.buffer;
-            buf.deviceAddress = vkGetBufferDeviceAddress(mDevice, &addrInfo);
-        }
-
-        const PxgBufferHandle handle = mNextBufferHandle++;
-        mBuffers[handle] = buf;
-        return handle;
+        return createBufferInternal(sizeBytes, !mDesc.useDeviceLocalMemory, nullptr, "createBuffer");
     }
 
     // Pinned-host buffer (RUNTIME_PLAN.md P5 Step 4b): the CUDA cuMemHostAlloc
@@ -570,6 +911,26 @@ public:
     // submission are visible to the device (implicit domain acquire at submit);
     // device writes become host-visible at the flush/wait sync points.
     PxgBufferHandle createHostVisibleBuffer(size_t sizeBytes, void** mappedPtr) override
+    {
+        if (mappedPtr)
+            *mappedPtr = nullptr;
+        void* mapped = nullptr;
+        const PxgBufferHandle handle = createBufferInternal(sizeBytes, true, &mapped, "createHostVisibleBuffer");
+        if (handle && mappedPtr)
+            *mappedPtr = mapped;
+        return handle;
+    }
+
+    // P9.98 check round 0: every step is checked IN RELEASE BUILDS.  A failure releases
+    // whatever the attempt had made, says which call failed, and returns 0 -- which the
+    // shim's memAlloc / memHostAlloc report as OutOfMemory (the bridge's
+    // CUDA_ERROR_OUT_OF_MEMORY).  These were PXG_VK_CHECKs, assert-only in Release: a
+    // failed vkAllocateMemory went on to bind and address a null VkDeviceMemory and
+    // segfaulted inside createBuffer (measured, rc 139, both memory modes).
+    // `persistentMap` non-null = the pinned-host form: HOST_VISIBLE|HOST_COHERENT in both
+    // memory modes, mapped for the buffer's lifetime.
+    PxgBufferHandle createBufferInternal(size_t sizeBytes, bool hostVisible, void** persistentMap,
+                                         const char* caller)
     {
         if (sizeBytes == 0)
             sizeBytes = 4;
@@ -584,11 +945,19 @@ public:
 
         Buffer buf = {};
         buf.size = sizeBytes;
-        buf.hostVisible = true;
-        PXG_VK_CHECK(vkCreateBuffer(mDevice, &bufferInfo, nullptr, &buf.buffer));
+        buf.hostVisible = hostVisible;
+        VkResult r = madeOrNull(vkCreateBuffer(mDevice, &bufferInfo, nullptr, &buf.buffer), &buf.buffer);
+        if (r != VK_SUCCESS)
+            return refuseBuffer(buf, caller, sizeBytes, "vkCreateBuffer", r);
 
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(mDevice, buf.buffer, &memReq);
+        const uint32_t memoryType = hostVisible
+            ? findMemoryType(memReq.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            : findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryType == kNoMemoryType)
+            return refuseBuffer(buf, caller, sizeBytes, "no memory type with the required properties", VK_SUCCESS);
 
         VkMemoryAllocateFlagsInfo allocFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
         allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
@@ -596,10 +965,13 @@ public:
         VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         allocInfo.pNext = mHasBufferDeviceAddress ? &allocFlags : nullptr;
         allocInfo.allocationSize = memReq.size;
-        allocInfo.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        PXG_VK_CHECK(vkAllocateMemory(mDevice, &allocInfo, nullptr, &buf.memory));
-        PXG_VK_CHECK(vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0));
+        allocInfo.memoryTypeIndex = memoryType;
+        r = madeOrNull(allocateMemoryCounted(&allocInfo, &buf.memory), &buf.memory);
+        if (r != VK_SUCCESS)
+            return refuseBuffer(buf, caller, sizeBytes, "vkAllocateMemory", r);
+        r = vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0);
+        if (r != VK_SUCCESS)
+            return refuseBuffer(buf, caller, sizeBytes, "vkBindBufferMemory", r);
 
         if (mHasBufferDeviceAddress)
         {
@@ -608,13 +980,66 @@ public:
             buf.deviceAddress = vkGetBufferDeviceAddress(mDevice, &addrInfo);
         }
 
-        PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, 0, VK_WHOLE_SIZE, 0, &buf.mappedPtr));
-        if (mappedPtr)
-            *mappedPtr = buf.mappedPtr;
+        if (persistentMap)
+        {
+            r = vkMapMemory(mDevice, buf.memory, 0, VK_WHOLE_SIZE, 0, &buf.mappedPtr);
+            if (r != VK_SUCCESS || !buf.mappedPtr)
+            {
+                buf.mappedPtr = nullptr;   // nothing to unmap
+                return refuseBuffer(buf, caller, sizeBytes, "vkMapMemory", r == VK_SUCCESS ? VK_ERROR_MEMORY_MAP_FAILED : r);
+            }
+            *persistentMap = buf.mappedPtr;
+        }
 
         const PxgBufferHandle handle = mNextBufferHandle++;
         mBuffers[handle] = buf;
         return handle;
+    }
+
+    PxgBufferHandle refuseBuffer(Buffer& buf, const char* caller, size_t sizeBytes, const char* what, VkResult r)
+    {
+        if (r != VK_SUCCESS)
+            std::fprintf(stderr, "[PxgVulkan] %s(%zu B): %s failed with VkResult %d; returning 0\n", caller,
+                         sizeBytes, what, int(r));
+        else
+            std::fprintf(stderr, "[PxgVulkan] %s(%zu B): %s; returning 0\n", caller, sizeBytes, what);
+        if (buf.buffer)
+            vkDestroyBuffer(mDevice, buf.buffer, nullptr);
+        if (buf.memory)
+            freeMemoryCounted(buf.memory);
+        buf = Buffer{};
+        return 0;
+    }
+
+    // P9.98 check round 0: buffers are looked up with find(), never operator[], which
+    // default-inserted a Buffer of null handles for an unknown id (a 0 from a refused
+    // createBuffer, a destroyed buffer) and then recorded or mapped VK_NULL_HANDLE.  A
+    // transfer on such a handle is skipped with a message; a dispatch is refused.
+    Buffer* liveBuffer(PxgBufferHandle handle, const char* caller)
+    {
+        const auto it = handle == 0 ? mBuffers.end() : mBuffers.find(handle);
+        if (it == mBuffers.end())
+        {
+            std::fprintf(stderr, "[PxgVulkan] %s: buffer handle %u is not a live buffer; refused\n", caller,
+                         unsigned(handle));
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    // P9.98 check round 1: a transfer must lie inside its buffer.  upload / download memcpy'd
+    // through the mapping and copyBuffer / fillBuffer recorded the command with no bounds
+    // check: measured, 4096 B at offset 1020 of a 1024-byte buffer was a heap overrun of the
+    // pinned mapping or a VUID-vkCmdCopyBuffer-size-00116 / vkMapMemory-size-00681, then
+    // rc 139.  Refused like a stale handle: a message, nothing mapped or recorded.
+    // Overflow-safe: offset + bytes is never formed.
+    static bool inRange(const Buffer& buf, PxgBufferHandle handle, size_t offset, size_t bytes, const char* caller)
+    {
+        if (offset <= buf.size && bytes <= buf.size - offset)
+            return true;
+        std::fprintf(stderr, "[PxgVulkan] %s: %zu B at offset %zu runs past buffer %u's %zu bytes; refused\n", caller,
+                     bytes, offset, unsigned(handle), buf.size);
+        return false;
     }
 
     void destroyBuffer(PxgBufferHandle handle) override
@@ -637,7 +1062,10 @@ public:
     {
         if (sizeBytes == 0)
             return;
-        Buffer& buf = mBuffers[handle];
+        Buffer* live = liveBuffer(handle, "upload");
+        if (!live || !inRange(*live, handle, dstOffset, sizeBytes, "upload"))
+            return;
+        Buffer& buf = *live;
         if (buf.mappedPtr)
         {
             // Persistently mapped pinned buffer: same stream-ordering drain,
@@ -701,7 +1129,10 @@ public:
     {
         if (sizeBytes == 0)
             return;
-        Buffer& buf = mBuffers[handle];
+        Buffer* live = liveBuffer(handle, "download");
+        if (!live || !inRange(*live, handle, srcOffset, sizeBytes, "download"))
+            return;
+        Buffer& buf = *live;
         if (buf.mappedPtr)
         {
             // Persistently mapped pinned buffer: same device->host visibility
@@ -773,8 +1204,13 @@ public:
     {
         if (sizeBytes == 0)
             return;
-        const Buffer& src = mBuffers[srcHandle];
-        const Buffer& dst = mBuffers[dstHandle];
+        const Buffer* liveSrc = liveBuffer(srcHandle, "copyBuffer");
+        const Buffer* liveDst = liveBuffer(dstHandle, "copyBuffer");
+        if (!liveSrc || !liveDst || !inRange(*liveSrc, srcHandle, srcOffset, sizeBytes, "copyBuffer (source)") ||
+            !inRange(*liveDst, dstHandle, dstOffset, sizeBytes, "copyBuffer (destination)"))
+            return;
+        const Buffer& src = *liveSrc;
+        const Buffer& dst = *liveDst;
         beginRecording();
         bufferBarrier(src.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -798,7 +1234,10 @@ public:
         // vkCmdFillBuffer requires 4-byte aligned offset and size (the
         // cuMemsetD32 contract); a misaligned device pointer is caller error.
         assert((dstOffset % 4) == 0 && (sizeBytes % 4) == 0);
-        const Buffer& dst = mBuffers[dstHandle];
+        const Buffer* liveDst = liveBuffer(dstHandle, "fillBuffer");
+        if (!liveDst || !inRange(*liveDst, dstHandle, dstOffset, sizeBytes, "fillBuffer"))
+            return;
+        const Buffer& dst = *liveDst;
         beginRecording();
         bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -847,6 +1286,9 @@ public:
         }
     }
 
+    // P9.98 check round 0: like createBufferInternal, every step is checked in Release;
+    // a failure releases what the attempt made (image, memory, view, staging) and
+    // returns 0, which the shim reports as Unsupported (cuTexObjectCreate fails).
     PxgTextureHandle createTexture3DInternal(uint32_t width, uint32_t height, uint32_t depth,
                                              TextureFormat format, const void* texels, bool bindless)
     {
@@ -856,6 +1298,7 @@ public:
         tex.depth = depth;
         tex.bindless = bindless;
         const VkFormat vkFormat = vkFormatOf(format);
+        const char* caller = bindless ? "createTexture3DFmt" : "createTexture3D";
 
         VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         imageInfo.imageType = VK_IMAGE_TYPE_3D;
@@ -868,15 +1311,24 @@ public:
         imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        PXG_VK_CHECK(vkCreateImage(mDevice, &imageInfo, nullptr, &tex.image));
+        VkResult r = madeOrNull(vkCreateImage(mDevice, &imageInfo, nullptr, &tex.image), &tex.image);
+        if (r != VK_SUCCESS)
+            return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkCreateImage", r);
 
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(mDevice, tex.image, &req);
         VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         alloc.allocationSize = req.size;
         alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        PXG_VK_CHECK(vkAllocateMemory(mDevice, &alloc, nullptr, &tex.memory));
-        PXG_VK_CHECK(vkBindImageMemory(mDevice, tex.image, tex.memory, 0));
+        if (alloc.memoryTypeIndex == kNoMemoryType)
+            return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller,
+                                 "no device-local memory type for the image", VK_SUCCESS);
+        r = madeOrNull(allocateMemoryCounted(&alloc, &tex.memory), &tex.memory);
+        if (r != VK_SUCCESS)
+            return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkAllocateMemory", r);
+        r = vkBindImageMemory(mDevice, tex.image, tex.memory, 0);
+        if (r != VK_SUCCESS)
+            return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkBindImageMemory", r);
 
         // One-shot staging upload with the required layout transitions.
         const size_t bytes = size_t(width) * height * depth * texelSizeOf(format);
@@ -887,17 +1339,29 @@ public:
             bi.size = bytes;
             bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            PXG_VK_CHECK(vkCreateBuffer(mDevice, &bi, nullptr, &staging));
+            r = madeOrNull(vkCreateBuffer(mDevice, &bi, nullptr, &staging), &staging);
+            if (r != VK_SUCCESS)
+                return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkCreateBuffer (staging)", r);
             VkMemoryRequirements sreq;
             vkGetBufferMemoryRequirements(mDevice, staging, &sreq);
             VkMemoryAllocateInfo sa = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             sa.allocationSize = sreq.size;
             sa.memoryTypeIndex = findMemoryType(
                 sreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            PXG_VK_CHECK(vkAllocateMemory(mDevice, &sa, nullptr, &stagingMem));
-            PXG_VK_CHECK(vkBindBufferMemory(mDevice, staging, stagingMem, 0));
+            if (sa.memoryTypeIndex == kNoMemoryType)
+                return refuseTexture(tex, staging, VK_NULL_HANDLE, caller,
+                                     "no host-visible memory type for the staging buffer", VK_SUCCESS);
+            r = madeOrNull(allocateMemoryCounted(&sa, &stagingMem), &stagingMem);
+            if (r != VK_SUCCESS)
+                return refuseTexture(tex, staging, VK_NULL_HANDLE, caller, "vkAllocateMemory (staging)", r);
+            r = vkBindBufferMemory(mDevice, staging, stagingMem, 0);
+            if (r != VK_SUCCESS)
+                return refuseTexture(tex, staging, stagingMem, caller, "vkBindBufferMemory (staging)", r);
             void* mapped = nullptr;
-            PXG_VK_CHECK(vkMapMemory(mDevice, stagingMem, 0, VK_WHOLE_SIZE, 0, &mapped));
+            r = vkMapMemory(mDevice, stagingMem, 0, VK_WHOLE_SIZE, 0, &mapped);
+            if (r != VK_SUCCESS || !mapped)
+                return refuseTexture(tex, staging, stagingMem, caller, "vkMapMemory (staging)",
+                                     r == VK_SUCCESS ? VK_ERROR_MEMORY_MAP_FAILED : r);
             memcpy(mapped, texels, bytes);
             vkUnmapMemory(mDevice, stagingMem);
         }
@@ -916,14 +1380,16 @@ public:
         flush();
 
         vkDestroyBuffer(mDevice, staging, nullptr);
-        vkFreeMemory(mDevice, stagingMem, nullptr);
+        freeMemoryCounted(stagingMem);
 
         VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         viewInfo.image = tex.image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
         viewInfo.format = vkFormat;
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        PXG_VK_CHECK(vkCreateImageView(mDevice, &viewInfo, nullptr, &tex.view));
+        r = madeOrNull(vkCreateImageView(mDevice, &viewInfo, nullptr, &tex.view), &tex.view);
+        if (r != VK_SUCCESS)
+            return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkCreateImageView", r);
 
         // Only the bound path samples in hardware: a createTexture3D texture (set 0,
         // createPipelineTex/dispatchTex -- the P2 probe npTex3d, kept as the record
@@ -939,7 +1405,9 @@ public:
             samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
             samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
             samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            PXG_VK_CHECK(createSamplerCounted(samplerInfo, &tex.sampler));
+            r = madeOrNull(createSamplerCounted(samplerInfo, &tex.sampler), &tex.sampler);   // not counted
+            if (r != VK_SUCCESS)
+                return refuseTexture(tex, VK_NULL_HANDLE, VK_NULL_HANDLE, caller, "vkCreateSampler", r);
         }
 
         const PxgTextureHandle handle = mNextTextureHandle++;
@@ -952,15 +1420,31 @@ public:
             {
                 std::fprintf(stderr, "[PxgVulkan] bindless texture capacity (%u) exhausted\n",
                              kBindlessTextureCapacity);
-                vkDestroyImageView(mDevice, tex.view, nullptr);
-                vkDestroyImage(mDevice, tex.image, nullptr);
-                vkFreeMemory(mDevice, tex.memory, nullptr);
+                releaseTexture(tex);
                 return 0;
             }
             writeBindlessSlot(uint32_t(handle), tex.view);
         }
         mTextures[handle] = tex;
         return handle;
+    }
+
+    PxgTextureHandle refuseTexture(Texture& tex, VkBuffer staging, VkDeviceMemory stagingMem, const char* caller,
+                                   const char* what, VkResult r)
+    {
+        if (r != VK_SUCCESS)
+            std::fprintf(stderr, "[PxgVulkan] %s(%u x %u x %u): %s failed with VkResult %d; returning 0\n", caller,
+                         tex.width, tex.height, tex.depth, what, int(r));
+        else
+            std::fprintf(stderr, "[PxgVulkan] %s(%u x %u x %u): %s; returning 0\n", caller, tex.width, tex.height,
+                         tex.depth, what);
+        if (staging)
+            vkDestroyBuffer(mDevice, staging, nullptr);
+        if (stagingMem)
+            freeMemoryCounted(stagingMem);
+        releaseTexture(tex);
+        tex = Texture{};
+        return 0;
     }
 
     // ---- the bindless set ----
@@ -996,7 +1480,8 @@ public:
         layoutInfo.pNext = &flagsInfo;
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         recordBindlessLayout(layoutInfo);
-        if (vkCreateDescriptorSetLayout(mDevice, &layoutInfo, nullptr, &mBindlessSetLayout) != VK_SUCCESS)
+        if (madeOrNull(vkCreateDescriptorSetLayout(mDevice, &layoutInfo, nullptr, &mBindlessSetLayout),
+                       &mBindlessSetLayout) != VK_SUCCESS)
             return false;
 
         const VkDescriptorPoolSize poolSizes[] = {
@@ -1008,7 +1493,8 @@ public:
         poolInfo.pPoolSizes = poolSizes;
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         recordBindlessPool(poolInfo);
-        if (vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &mBindlessPool) != VK_SUCCESS)
+        if (madeOrNull(vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &mBindlessPool), &mBindlessPool) !=
+            VK_SUCCESS)
             return false;
 
         VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -1067,6 +1553,48 @@ public:
         return r;
     }
 
+    // P9.98 check round 1: every VkDeviceMemory goes through these two, so the device can
+    // say how many allocations it holds at once.  The Best Practices waiver for
+    // small-allocation (F5) rests on the engine's PEAK staying far below
+    // maxMemoryAllocationCount; with PXG_VK_ALLOC_STATS=1 (tools/run_validation.sh sets
+    // it) the process prints its peak at exit and tools/vvl_triage.py checks the bound
+    // the waiver states.  Process-wide, like SyncStatsReport: the engine's device is not
+    // necessarily destroyed before the process ends.
+    struct AllocStats
+    {
+        uint64_t live = 0, peak = 0, maxCount = 0;
+        bool report = std::getenv("PXG_VK_ALLOC_STATS") != nullptr;
+        ~AllocStats()
+        {
+            if (report)
+                std::fprintf(stderr, "[pxg-alloc] peak %llu live VkDeviceMemory allocation(s) "
+                                     "(maxMemoryAllocationCount %llu)\n",
+                             (unsigned long long)peak, (unsigned long long)maxCount);
+        }
+    };
+    static AllocStats& allocStats()
+    {
+        static AllocStats stats;   // destroyed -- and printed -- at exit
+        return stats;
+    }
+    VkResult allocateMemoryCounted(const VkMemoryAllocateInfo* info, VkDeviceMemory* out)
+    {
+        const VkResult r = vkAllocateMemory(mDevice, info, nullptr, out);
+        if (r == VK_SUCCESS)
+        {
+            AllocStats& a = allocStats();
+            a.peak = ++a.live > a.peak ? a.live : a.peak;
+        }
+        return r;
+    }
+    void freeMemoryCounted(VkDeviceMemory memory)
+    {
+        if (memory == VK_NULL_HANDLE)
+            return;
+        vkFreeMemory(mDevice, memory, nullptr);
+        --allocStats().live;
+    }
+
     void destroySamplerCounted(VkSampler sampler)
     {
         if (sampler == VK_NULL_HANDLE)
@@ -1120,7 +1648,14 @@ public:
         if (requiredSubgroupSize != 0 &&
             (!mSubgroupCaps.canRequireSize || requiredSubgroupSize < mSubgroupCaps.minSize ||
              requiredSubgroupSize > mSubgroupCaps.maxSize))
+        {
+            // P9.98 check round 0: every refusal says why (the bridge's trace points here).
+            std::fprintf(stderr, "[PxgVulkan] createPipelineEx(%s): required subgroup size %u is not available "
+                                 "(can require: %d, range %u..%u); refused\n",
+                         entryName ? entryName : "?", requiredSubgroupSize, int(mSubgroupCaps.canRequireSize),
+                         mSubgroupCaps.minSize, mSubgroupCaps.maxSize);
             return 0;
+        }
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
                                       requiredSubgroupSize, 0, false);
     }
@@ -1138,7 +1673,12 @@ public:
                                              uint32_t pushConstantSize) override
     {
         if (!mHasBindlessTextures)
+        {
+            std::fprintf(stderr, "[PxgVulkan] createPipelineBindless(%s): this device has no bindless texture set "
+                                 "(descriptor indexing); refused\n",
+                         entryName ? entryName : "?");
             return 0;
+        }
         // P9.97: a module the one-binding set cannot hold is refused HERE, because
         // llvmpipe does not refuse it: measured, a SamplerState at (1, 1) builds,
         // then samples through whichever VkSampler the process happens to own --
@@ -1174,10 +1714,56 @@ public:
 
     SubgroupCaps getSubgroupCaps() const override { return mSubgroupCaps; }
 
+    ComputeLimits computeLimits() const override { return mLimits; }
+
+    uint32_t pipelinePushRangeBytes(PxgPipelineHandle handle) const override
+    {
+        const auto it = mPipelines.find(handle);
+        return it == mPipelines.end() ? ~0u : it->second.layoutPushSize;
+    }
+
     uint64_t getBufferDeviceAddress(PxgBufferHandle handle) const override
     {
         auto it = mBuffers.find(handle);
         return it == mBuffers.end() ? 0 : it->second.deviceAddress;
+    }
+
+    // P9.98 (F4): every step's VkResult is checked IN RELEASE BUILDS -- PXG_VK_CHECK only
+    // asserts, and both build trees are -DNDEBUG -- and a failure destroys whatever was
+    // created and returns 0.  Before P9.98 a failed vkCreateComputePipelines still got a
+    // handle, the shim's `pipe == 0 -> NotFound` never fired, and the first dispatch bound
+    // VK_NULL_HANDLE and segfaulted (measured: scan with vkCreateComputePipelines forced
+    // to fail, rc 139).  The checks against the device limits run BEFORE any Vulkan
+    // object exists, so an over-limit kernel is a refusal with a reason rather than a
+    // driver error (or, on a driver that does not check, undefined behaviour).
+    void nameObject(VkObjectType type, uint64_t handle, const char* name)
+    {
+        if (!mSetObjectName || !handle || !name)
+            return;
+        VkDebugUtilsObjectNameInfoEXT info = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        info.objectType = type;
+        info.objectHandle = handle;
+        info.pObjectName = name;
+        mSetObjectName(mDevice, &info);
+    }
+
+    PxgPipelineHandle refusePipeline(Pipeline& pipe, const char* entryName, const char* what, int vkResult)
+    {
+        if (vkResult != 0)
+            std::fprintf(stderr, "[PxgVulkan] createPipeline(%s): %s failed with VkResult %d; refused\n",
+                         entryName ? entryName : "?", what, vkResult);
+        else
+            std::fprintf(stderr, "[PxgVulkan] createPipeline(%s): %s; refused\n", entryName ? entryName : "?", what);
+        if (pipe.pipeline)
+            vkDestroyPipeline(mDevice, pipe.pipeline, nullptr);
+        if (pipe.layout)
+            vkDestroyPipelineLayout(mDevice, pipe.layout, nullptr);
+        if (pipe.setLayout)
+            vkDestroyDescriptorSetLayout(mDevice, pipe.setLayout, nullptr);
+        if (pipe.module)
+            vkDestroyShaderModule(mDevice, pipe.module, nullptr);
+        pipe = Pipeline{};
+        return 0;
     }
 
     PxgPipelineHandle createPipelineInternal(const void* code, size_t codeSize, const char* entryName,
@@ -1193,10 +1779,74 @@ public:
         pipe.pushConstantSize = pushConstantSize;
         pipe.bindless = bindless;
 
+        // ---- what the entry point asks of the device, from the SPIR-V (P9.98) ----
+        PxgSpirvEntryInfo info;
+        bool malformed = false;
+        if (!reflectEntryImpl(code, codeSize, entryName, &info, &malformed))
+            return refusePipeline(pipe, entryName,
+                                  malformed ? "the module is not a well-formed SPIR-V word stream"
+                                            : "the module has no GLCompute entry point of that name",
+                                  0);
+        char why[256];
+        // F2: the layout's push range covers the entry's DECLARED block, not just the
+        // bytes the caller pushes -- VUID-VkComputePipelineCreateInfo-layout-07987 -- and
+        // dispatch zero-fills the surplus.  Shared push structs (one Slang struct sized
+        // for the largest of several entries) stay legal and the shaders stay unchanged.
+        pipe.layoutPushSize = (pushConstantSize + 3u) & ~3u;
+        if (info.pushDecided && info.pushBlockBytes > pipe.layoutPushSize)
+        {
+            pipe.layoutPushSize = info.pushBlockBytes;
+        }
+        if (pipe.layoutPushSize > mLimits.maxPushConstantsSize)
+        {
+            std::snprintf(why, sizeof(why),
+                          "push-constant range %u B%s (caller %u B, SPIR-V block %u B) exceeds the device's "
+                          "maxPushConstantsSize %u B",
+                          pipe.layoutPushSize, pipe.layoutPushSize == 0xFFFFFFFFu ? " (or more)" : "",
+                          pushConstantSize, info.pushBlockBytes, mLimits.maxPushConstantsSize);
+            return refusePipeline(pipe, entryName, why, 0);
+        }
+        // Per ENTRY POINT, not per module: Vulkan applies the limit per pipeline
+        // (tools/check_groupshared.py's header; F3 is a layer that sums the module).
+        if (info.workgroupDecided && info.workgroupBytes > mLimits.maxComputeSharedMemorySize)
+        {
+            std::snprintf(why, sizeof(why),
+                          "Workgroup (groupshared) storage %u B%s exceeds the device's "
+                          "maxComputeSharedMemorySize %u B",
+                          info.workgroupBytes, info.workgroupBytes == 0xFFFFFFFFu ? " (or more)" : "",
+                          mLimits.maxComputeSharedMemorySize);
+            return refusePipeline(pipe, entryName, why, 0);
+        }
+        if (info.localSize[0] && info.localSize[1] && info.localSize[2])
+        {
+            const uint64_t invocations = uint64_t(info.localSize[0]) * info.localSize[1] * info.localSize[2];
+            for (int d = 0; d < 3; ++d)
+                if (info.localSize[d] > mLimits.maxComputeWorkGroupSize[d])
+                {
+                    std::snprintf(why, sizeof(why),
+                                  "workgroup size (%u, %u, %u) exceeds the device's maxComputeWorkGroupSize[%d] %u",
+                                  info.localSize[0], info.localSize[1], info.localSize[2], d,
+                                  mLimits.maxComputeWorkGroupSize[d]);
+                    return refusePipeline(pipe, entryName, why, 0);
+                }
+            if (invocations > mLimits.maxComputeWorkGroupInvocations)
+            {
+                std::snprintf(why, sizeof(why),
+                              "workgroup size (%u, %u, %u) = %llu invocations exceeds the device's "
+                              "maxComputeWorkGroupInvocations %u",
+                              info.localSize[0], info.localSize[1], info.localSize[2],
+                              (unsigned long long)invocations, mLimits.maxComputeWorkGroupInvocations);
+                return refusePipeline(pipe, entryName, why, 0);
+            }
+        }
+
         VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         moduleInfo.codeSize = codeSize;
         moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code);
-        PXG_VK_CHECK(vkCreateShaderModule(mDevice, &moduleInfo, nullptr, &pipe.module));
+        VkResult r = madeOrNull(vkCreateShaderModule(mDevice, &moduleInfo, nullptr, &pipe.module), &pipe.module);
+        if (r != VK_SUCCESS)
+            return refusePipeline(pipe, entryName, "vkCreateShaderModule", int(r));
+        nameObject(VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(pipe.module), entryName);
 
         // Storage buffers at 0..numBuffers-1; each texture is a sampled
         // image + sampler pair right after (Slang emits Texture3D and
@@ -1227,12 +1877,14 @@ public:
         VkDescriptorSetLayoutCreateInfo setLayoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         setLayoutInfo.bindingCount = numBindings;
         setLayoutInfo.pBindings = bindings.empty() ? nullptr : bindings.data();
-        PXG_VK_CHECK(vkCreateDescriptorSetLayout(mDevice, &setLayoutInfo, nullptr, &pipe.setLayout));
+        r = madeOrNull(vkCreateDescriptorSetLayout(mDevice, &setLayoutInfo, nullptr, &pipe.setLayout), &pipe.setLayout);
+        if (r != VK_SUCCESS)
+            return refusePipeline(pipe, entryName, "vkCreateDescriptorSetLayout", int(r));
 
         VkPushConstantRange pushRange = {};
         pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushRange.offset = 0;
-        pushRange.size = pushConstantSize;
+        pushRange.size = pipe.layoutPushSize;
 
         // Set 0 is the pipeline's own bindings; set 1, when declared, is the
         // device-wide bindless texture set.
@@ -1240,9 +1892,12 @@ public:
         VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         layoutInfo.setLayoutCount = bindless ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts;
-        layoutInfo.pushConstantRangeCount = pushConstantSize > 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = pushConstantSize > 0 ? &pushRange : nullptr;
-        PXG_VK_CHECK(vkCreatePipelineLayout(mDevice, &layoutInfo, nullptr, &pipe.layout));
+        layoutInfo.pushConstantRangeCount = pipe.layoutPushSize > 0 ? 1 : 0;
+        layoutInfo.pPushConstantRanges = pipe.layoutPushSize > 0 ? &pushRange : nullptr;
+        r = madeOrNull(vkCreatePipelineLayout(mDevice, &layoutInfo, nullptr, &pipe.layout), &pipe.layout);
+        if (r != VK_SUCCESS)
+            return refusePipeline(pipe, entryName, "vkCreatePipelineLayout", int(r));
+        nameObject(VK_OBJECT_TYPE_PIPELINE_LAYOUT, uint64_t(pipe.layout), entryName);
 
         VkPipelineShaderStageCreateInfo stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1265,7 +1920,23 @@ public:
         VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.stage = stageInfo;
         pipelineInfo.layout = pipe.layout;
-        PXG_VK_CHECK(vkCreateComputePipelines(mDevice, mPipelineCache, 1, &pipelineInfo, nullptr, &pipe.pipeline));
+        r = vkCreateComputePipelines(mDevice, mPipelineCache, 1, &pipelineInfo, nullptr, &pipe.pipeline);
+        // A driver may return a non-success code and still write a handle (refusePipeline
+        // destroys it), or return success and none: both mean "no pipeline" here.
+        if (r != VK_SUCCESS)
+            return refusePipeline(pipe, entryName, "vkCreateComputePipelines", int(r));
+        if (pipe.pipeline == VK_NULL_HANDLE)
+            return refusePipeline(pipe, entryName, "vkCreateComputePipelines returned VK_SUCCESS but no pipeline", 0);
+        nameObject(VK_OBJECT_TYPE_PIPELINE, uint64_t(pipe.pipeline), entryName);
+
+        // Check round 1: widening the range past the caller's blob (F2, above) makes
+        // VUID-07987 unreachable, so a shader that READS past the caller's bytes now reads
+        // zeros with no layer message.  Under PXG_VK_DEBUG_NAMES (tools/run_validation.sh)
+        // a BUILT pipeline whose range was widened is reported instead, and
+        // tools/vvl_triage.py fails on the line unless validation_waivers.txt lists the entry.
+        if (mDebugNames && pipe.layoutPushSize > ((pushConstantSize + 3u) & ~3u))
+            std::fprintf(stderr, "[PxgVulkan] createPipeline(%s): push block %u B wider than caller %u B; "
+                                 "zero-filled\n", entryName ? entryName : "?", info.pushBlockBytes, pushConstantSize);
 
         const PxgPipelineHandle handle = mNextPipelineHandle++;
         mPipelines[handle] = pipe;
@@ -1289,48 +1960,166 @@ public:
 
     // ---- execution ----
 
-    void dispatch(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+    bool dispatch(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                   const PxgBufferHandle* buffers, uint32_t numBuffers,
                   const void* pushConstants, uint32_t pushConstantSize) override
     {
-        dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, nullptr, 0,
+        return dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, nullptr, 0,
                          pushConstants, pushConstantSize);
     }
 
-    void dispatchTex(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+    bool dispatchTex(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                      const PxgBufferHandle* buffers, uint32_t numBuffers,
                      const PxgTextureHandle* textures, uint32_t numTextures,
                      const void* pushConstants, uint32_t pushConstantSize) override
     {
-        dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, textures, numTextures,
+        return dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, textures, numTextures,
                          pushConstants, pushConstantSize);
     }
 
-    void dispatchInternal(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+    // P9.98 (F4): the pipeline is looked up with find(), never operator[] -- which used
+    // to default-insert a Pipeline of null handles for an unknown id and then bind
+    // VK_NULL_HANDLE.  A refusal records nothing and says why; the shim reports it as a
+    // refused launch (NotFound).
+    const Pipeline* livePipeline(PxgPipelineHandle handle, uint32_t pushConstantSize, const char* caller) const
+    {
+        const auto it = handle == 0 ? mPipelines.end() : mPipelines.find(handle);
+        if (it == mPipelines.end())
+        {
+            std::fprintf(stderr, "[PxgVulkan] %s: pipeline handle %u is not a live pipeline (refused or never "
+                                 "created); nothing recorded\n", caller, unsigned(handle));
+            return nullptr;
+        }
+        if (pushConstantSize > it->second.layoutPushSize)
+        {
+            std::fprintf(stderr, "[PxgVulkan] %s: a %u-byte push blob does not fit pipeline %u's %u-byte push "
+                                 "range; nothing recorded\n", caller, pushConstantSize, unsigned(handle),
+                         it->second.layoutPushSize);
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    // F2: push the WHOLE layout range, the caller's bytes followed by zeros, so the
+    // block the shader declares is fully defined.  When the caller fills the range
+    // exactly (every engine row but three, P9.98 scope) its own pointer is pushed.
+    void pushConstantsPadded(const Pipeline& pipe, const void* pushConstants, uint32_t pushConstantSize)
+    {
+        if (pipe.layoutPushSize == 0)
+            return;
+        const void* src = pushConstants;
+        if (pushConstantSize != pipe.layoutPushSize || !pushConstants)
+        {
+            mPushScratch.assign(pipe.layoutPushSize, 0u);
+            if (pushConstants && pushConstantSize)
+                std::memcpy(mPushScratch.data(), pushConstants, pushConstantSize);
+            src = mPushScratch.data();
+        }
+        vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pipe.layoutPushSize, src);
+    }
+
+    // P9.98 check round 0: what the dispatch BINDS is validated as strictly as the
+    // pipeline -- the counts must be the pipeline's (they were assert-only in Release)
+    // and every buffer / texture handle must be live (they were operator[] lookups,
+    // which default-inserted a null object and recorded VK_NULL_HANDLE descriptors: VVL
+    // VUID-VkDescriptorBufferInfo-buffer-02998 / vkCmdDispatch-None-08114, and a SIGSEGV
+    // for dispatchIndirect's arg buffer).  All of it is resolved before anything is
+    // recorded, so a refusal records nothing.
+    bool bindingsMatch(const Pipeline& pipe, PxgPipelineHandle handle, uint32_t numBuffers,
+                       const PxgBufferHandle* buffers, uint32_t numTextures, const PxgTextureHandle* textures,
+                       const char* caller)
+    {
+        if (numBuffers == pipe.numBuffers && numTextures == pipe.numTextures && (numBuffers == 0 || buffers) &&
+            (numTextures == 0 || textures))
+            return true;
+        std::fprintf(stderr, "[PxgVulkan] %s: pipeline %u binds %u buffer(s) and %u texture(s); the dispatch "
+                             "passed %u%s and %u%s; nothing recorded\n", caller, unsigned(handle), pipe.numBuffers,
+                     pipe.numTextures, numBuffers, numBuffers && !buffers ? " (null array)" : "", numTextures,
+                     numTextures && !textures ? " (null array)" : "");
+        return false;
+    }
+
+    bool resolveBuffers(const PxgBufferHandle* buffers, uint32_t numBuffers,
+                        std::vector<VkDescriptorBufferInfo>& infos, const char* caller)
+    {
+        infos.assign(numBuffers, VkDescriptorBufferInfo{});
+        for (uint32_t i = 0; i < numBuffers; ++i)
+        {
+            const Buffer* buf = liveBuffer(buffers[i], caller);
+            if (!buf)
+                return false;
+            infos[i].buffer = buf->buffer;
+            infos[i].offset = 0;
+            infos[i].range = VK_WHOLE_SIZE;
+        }
+        return true;
+    }
+
+    VkDescriptorSet descriptorSetOrRefuse(const Pipeline& pipe, uint32_t numBindings, const char* caller)
+    {
+        const VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBindings);
+        if (set == VK_NULL_HANDLE)
+            std::fprintf(stderr, "[PxgVulkan] %s: no descriptor set could be allocated (see the line above); "
+                                 "nothing recorded\n", caller);
+        return set;
+    }
+
+    bool dispatchInternal(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                           const PxgBufferHandle* buffers, uint32_t numBuffers,
                           const PxgTextureHandle* textures, uint32_t numTextures,
                           const void* pushConstants, uint32_t pushConstantSize)
     {
-        Pipeline& pipe = mPipelines[pipelineHandle];
-        assert(numBuffers == pipe.numBuffers);
-        assert(numTextures == pipe.numTextures);
+        const Pipeline* live = livePipeline(pipelineHandle, pushConstantSize, "dispatch");
+        if (!live)
+            return false;
+        const Pipeline& pipe = *live;
         assert(pushConstantSize == pipe.pushConstantSize);
+        if (!bindingsMatch(pipe, pipelineHandle, numBuffers, buffers, numTextures, textures, "dispatch"))
+            return false;
+        // P9.98 check round 1: the grid against maxComputeWorkGroupCount
+        // (VUID-vkCmdDispatch-groupCountX-00386 / Y-00387 / Z-00388).  CUDA accepts a
+        // gridDim.x up to 2^31-1; Vulkan's minimum -- and llvmpipe's value -- is 65535, and
+        // a larger grid was recorded as if valid.
+        const uint32_t grid[3] = { gridX, gridY, gridZ };
+        for (int d = 0; d < 3; ++d)
+            if (grid[d] > mLimits.maxComputeWorkGroupCount[d])
+            {
+                std::fprintf(stderr, "[PxgVulkan] dispatch: grid (%u, %u, %u) exceeds the device's "
+                                     "maxComputeWorkGroupCount[%d] %u (pipeline %u); nothing recorded\n",
+                             gridX, gridY, gridZ, d, mLimits.maxComputeWorkGroupCount[d], unsigned(pipelineHandle));
+                return false;
+            }
+
+        std::vector<VkDescriptorBufferInfo> bufferInfos;
+        if (!resolveBuffers(buffers, numBuffers, bufferInfos, "dispatch"))
+            return false;
+        std::vector<VkDescriptorImageInfo> imageInfos(2 * numTextures);
+        for (uint32_t t = 0; t < numTextures; ++t)
+        {
+            const auto it = textures[t] == 0 ? mTextures.end() : mTextures.find(textures[t]);
+            // A bindless texture (createTexture3DFmt) owns no sampler, so it cannot fill
+            // this path's image + sampler pair.
+            if (it == mTextures.end() || it->second.sampler == VK_NULL_HANDLE)
+            {
+                std::fprintf(stderr, "[PxgVulkan] dispatch: texture handle %u is not a live bound texture "
+                                     "(createTexture3D); nothing recorded\n", unsigned(textures[t]));
+                return false;
+            }
+            imageInfos[2 * t].imageView = it->second.view;
+            imageInfos[2 * t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos[2 * t + 1].sampler = it->second.sampler;
+        }
 
         beginRecording();
 
         const uint32_t numBindings = numBuffers + 2 * numTextures;
-        VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBindings);
+        const VkDescriptorSet set = descriptorSetOrRefuse(pipe, numBindings, "dispatch");
+        if (set == VK_NULL_HANDLE)
+            return false;
 
-        std::vector<VkDescriptorBufferInfo> bufferInfos(numBuffers);
-        std::vector<VkDescriptorImageInfo> imageInfos(2 * numTextures);
         std::vector<VkWriteDescriptorSet> writes(numBindings);
         for (uint32_t i = 0; i < numBuffers; ++i)
         {
-            const Buffer& buf = mBuffers[buffers[i]];
-            bufferInfos[i].buffer = buf.buffer;
-            bufferInfos[i].offset = 0;
-            bufferInfos[i].range = VK_WHOLE_SIZE;
-
             writes[i] = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             writes[i].dstSet = set;
             writes[i].dstBinding = i;
@@ -1340,11 +2129,6 @@ public:
         }
         for (uint32_t t = 0; t < numTextures; ++t)
         {
-            const Texture& tex = mTextures[textures[t]];
-            imageInfos[2 * t].imageView = tex.view;
-            imageInfos[2 * t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            imageInfos[2 * t + 1].sampler = tex.sampler;
-
             VkWriteDescriptorSet& wImg = writes[numBuffers + 2 * t];
             wImg = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             wImg.dstSet = set;
@@ -1370,11 +2154,11 @@ public:
         if (pipe.bindless)
             vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 1, 1,
                                     &mBindlessSet, 0, nullptr);
-        if (pushConstantSize > 0)
-            vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
+        pushConstantsPadded(pipe, pushConstants, pushConstantSize);
 
         noteDispatch();
         vkCmdDispatch(mCommandBuffer, gridX, gridY, gridZ);
+        return true;
     }
 
     bool supportsIndirectDispatch() const override { return true; }
@@ -1417,29 +2201,42 @@ public:
         return double(diff) * double(mTimestampPeriod);
     }
 
-    void dispatchIndirect(PxgPipelineHandle pipelineHandle, PxgBufferHandle argBuffer, size_t argOffset,
+    bool dispatchIndirect(PxgPipelineHandle pipelineHandle, PxgBufferHandle argBuffer, size_t argOffset,
                           const PxgBufferHandle* buffers, uint32_t numBuffers,
                           const void* pushConstants, uint32_t pushConstantSize) override
     {
-        Pipeline& pipe = mPipelines[pipelineHandle];
-        assert(numBuffers == pipe.numBuffers);
-        assert(pipe.numTextures == 0);
+        const Pipeline* live = livePipeline(pipelineHandle, pushConstantSize, "dispatchIndirect");
+        if (!live)
+            return false;
+        const Pipeline& pipe = *live;
         assert(pushConstantSize == pipe.pushConstantSize);
-        // vkCmdDispatchIndirect requires a 4-byte aligned arg offset holding
-        // a VkDispatchIndirectCommand (3 x uint32).
-        assert((argOffset % 4) == 0);
+        // The indirect path binds no textures, so a textured pipeline cannot run here.
+        if (!bindingsMatch(pipe, pipelineHandle, numBuffers, buffers, 0, nullptr, "dispatchIndirect"))
+            return false;
+        std::vector<VkDescriptorBufferInfo> bufferInfos;
+        if (!resolveBuffers(buffers, numBuffers, bufferInfos, "dispatchIndirect"))
+            return false;
+        // vkCmdDispatchIndirect reads a VkDispatchIndirectCommand (3 x uint32) at a
+        // 4-byte aligned offset that lies inside the arg buffer.
+        const Buffer* arg = liveBuffer(argBuffer, "dispatchIndirect (arg buffer)");
+        if (!arg)
+            return false;
+        if ((argOffset % 4) != 0 || argOffset > arg->size || arg->size - argOffset < 3 * sizeof(uint32_t))
+        {
+            std::fprintf(stderr, "[PxgVulkan] dispatchIndirect: arg offset %zu is not a 4-byte aligned "
+                                 "VkDispatchIndirectCommand inside the %zu-byte arg buffer %u; nothing recorded\n",
+                         argOffset, arg->size, unsigned(argBuffer));
+            return false;
+        }
 
         beginRecording();
 
-        VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBuffers);
-        std::vector<VkDescriptorBufferInfo> bufferInfos(numBuffers);
+        const VkDescriptorSet set = descriptorSetOrRefuse(pipe, numBuffers, "dispatchIndirect");
+        if (set == VK_NULL_HANDLE)
+            return false;
         std::vector<VkWriteDescriptorSet> writes(numBuffers);
         for (uint32_t i = 0; i < numBuffers; ++i)
         {
-            const Buffer& buf = mBuffers[buffers[i]];
-            bufferInfos[i].buffer = buf.buffer;
-            bufferInfos[i].offset = 0;
-            bufferInfos[i].range = VK_WHOLE_SIZE;
             writes[i] = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             writes[i].dstSet = set;
             writes[i].dstBinding = i;
@@ -1452,8 +2249,7 @@ public:
 
         // The arg buffer was produced by a prior compute dispatch; make its
         // workgroup counts visible to the indirect-command read stage.
-        const Buffer& arg = mBuffers[argBuffer];
-        bufferBarrier(arg.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        bufferBarrier(arg->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
 
         vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
@@ -1462,11 +2258,11 @@ public:
         if (pipe.bindless)
             vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 1, 1,
                                     &mBindlessSet, 0, nullptr);
-        if (pushConstantSize > 0)
-            vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
+        pushConstantsPadded(pipe, pushConstants, pushConstantSize);
 
         noteDispatch();
-        vkCmdDispatchIndirect(mCommandBuffer, arg.buffer, argOffset);
+        vkCmdDispatchIndirect(mCommandBuffer, arg->buffer, argOffset);
+        return true;
     }
 
     // P9.85 bookkeeping for unorderedDispatchCount().  With PXG_SYNC_STATS=1 the
@@ -1645,8 +2441,14 @@ private:
         uint32_t numTextures;
         uint32_t pushConstantSize;
         bool bindless = false;   // declares the device-wide texture set at index 1
+        // P9.98 F2: the layout's push range, max(pushConstantSize, the entry's SPIR-V
+        // block) rounded to 4.  dispatch pushes exactly this many bytes, zero-padded.
+        uint32_t layoutPushSize = 0;
     };
 
+    // kNoMemoryType when no type matches (P9.98 check round 0: it returned type 0 with an
+    // assert-only complaint, i.e. allocated from whatever type 0 is in Release).
+    static const uint32_t kNoMemoryType = ~0u;
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) const
     {
         for (uint32_t i = 0; i < mMemoryProperties.memoryTypeCount; ++i)
@@ -1655,8 +2457,7 @@ private:
                 (mMemoryProperties.memoryTypes[i].propertyFlags & properties) == properties)
                 return i;
         }
-        assert(false && "no suitable memory type");
-        return 0;
+        return kNoMemoryType;
     }
 
     // Acquire the next frame slot and open its command buffer.  Waiting on
@@ -1705,7 +2506,9 @@ private:
         alloc.allocationSize = req.size;
         alloc.memoryTypeIndex = findMemoryType(
             req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        PXG_VK_CHECK(vkAllocateMemory(mDevice, &alloc, nullptr, &f.stagingMemory));
+        // The staging ring carries every v2 transfer; without it the device cannot work.
+        PXG_VK_CHECK(alloc.memoryTypeIndex == kNoMemoryType ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS);
+        PXG_VK_CHECK(allocateMemoryCounted(&alloc, &f.stagingMemory));
         PXG_VK_CHECK(vkBindBufferMemory(mDevice, f.staging, f.stagingMemory, 0));
 
         void* mapped = nullptr;
@@ -1759,7 +2562,7 @@ private:
         if (tex.image)
             vkDestroyImage(mDevice, tex.image, nullptr);
         if (tex.memory)
-            vkFreeMemory(mDevice, tex.memory, nullptr);
+            freeMemoryCounted(tex.memory);
     }
 
     // Per-buffer memory dependency on the readback/upload edges
@@ -1779,11 +2582,18 @@ private:
         vkCmdPipelineBarrier(mCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 1, &b, 0, nullptr);
     }
 
+    // VK_NULL_HANDLE when no set can be had -- the pool cannot be created, a FRESH pool
+    // cannot hold the layout, or any other failure (P9.98 check round 0: `pool` was
+    // uninitialised after a failed vkCreateDescriptorPool and pushed anyway, a fresh
+    // pool that still reported OUT_OF_POOL_MEMORY looped forever creating pools, and
+    // other failures were assert-only).  The dispatch is then refused.
     VkDescriptorSet allocateDescriptorSet(VkDescriptorSetLayout layout, uint32_t numBuffers)
     {
+        (void)numBuffers;
         Frame& f = mFrames[mFrameIndex];
         for (;;)
         {
+            bool fresh = false;
             if (f.currentPool == f.pools.size())
             {
                 VkDescriptorPoolSize poolSizes[3] = {};
@@ -1799,9 +2609,15 @@ private:
                 poolInfo.poolSizeCount = 3;
                 poolInfo.pPoolSizes = poolSizes;
 
-                VkDescriptorPool pool;
-                PXG_VK_CHECK(vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &pool));
+                VkDescriptorPool pool = VK_NULL_HANDLE;
+                const VkResult pr = vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &pool);
+                if (pr != VK_SUCCESS || pool == VK_NULL_HANDLE)
+                {
+                    std::fprintf(stderr, "[PxgVulkan] vkCreateDescriptorPool failed with VkResult %d\n", int(pr));
+                    return VK_NULL_HANDLE;
+                }
                 f.pools.push_back(pool);
+                fresh = true;
             }
 
             VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -1811,14 +2627,15 @@ private:
 
             VkDescriptorSet set = VK_NULL_HANDLE;
             const VkResult res = vkAllocateDescriptorSets(mDevice, &allocInfo, &set);
-            if (res == VK_SUCCESS)
+            if (res == VK_SUCCESS && set != VK_NULL_HANDLE)
                 return set;
-            if (res == VK_ERROR_OUT_OF_POOL_MEMORY || res == VK_ERROR_FRAGMENTED_POOL)
+            if ((res == VK_ERROR_OUT_OF_POOL_MEMORY || res == VK_ERROR_FRAGMENTED_POOL) && !fresh)
             {
                 ++f.currentPool;
                 continue;
             }
-            PXG_VK_CHECK(res);
+            std::fprintf(stderr, "[PxgVulkan] vkAllocateDescriptorSets failed with VkResult %d%s\n", int(res),
+                         fresh ? " on a fresh pool" : "");
             return VK_NULL_HANDLE;
         }
     }
@@ -1835,6 +2652,10 @@ private:
 
     std::unordered_map<PxgBufferHandle, Buffer> mBuffers;
     std::unordered_map<PxgPipelineHandle, Pipeline> mPipelines;
+    ComputeLimits mLimits;                 // P9.98: checked by createPipelineInternal
+    PFN_vkSetDebugUtilsObjectNameEXT mSetObjectName = nullptr;   // P9.98: PXG_VK_DEBUG_NAMES
+    bool mDebugNames = false;              // P9.98 check round 1: also reports widened push ranges
+    std::vector<uint8_t> mPushScratch;     // P9.98 F2: the zero-padded push copy
     std::unordered_map<PxgTextureHandle, Texture> mTextures;
     PxgBufferHandle mNextBufferHandle = 1;
     PxgPipelineHandle mNextPipelineHandle = 1;

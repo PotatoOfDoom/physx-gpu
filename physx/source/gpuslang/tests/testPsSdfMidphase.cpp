@@ -135,6 +135,10 @@ static_assert(sizeof(PsSdfMidBlob) == 136, "engine ABI blob size");
 static_assert(offsetof(PsSdfMidBlob, w_particleContacts) == 64, "the writer lands at 64");
 
 // The two reference entry points' push blocks (P9.12e / P9.12f).
+// P_Find mirrors ALL of npSdfFind.slang's SdfFindParams (176 B since P9.34b/P9.35b).
+// Until P9.98 it stopped at maxRounds (128 B), which the validation layer reported as
+// VUID-07987 (declared block outside the layout's push range); sdfFindRounds never
+// reads past @112, so the zeroed tail changes nothing it computes.
 struct P_Find
 {
     uint64_t meshPtr, positions, echoOut, roundsOut, bufOut, numRoundsOut;
@@ -143,7 +147,11 @@ struct P_Find
     float aToBp[3];  float tolerance;
     float scale[3];  uint32_t numVertices;
     uint32_t maxRounds, f0, f1, f2;
+    uint64_t meshInd, touchedOut;   // 128, 136 -- the triangle / tet gathers' (0 here)
+    float scale0Rot[4];             // 144
+    float scale0[3]; uint32_t f3;   // 160 -> 176
 };
+static_assert(sizeof(P_Find) == 176, "npSdfFind push block (SdfFindParams)");
 struct P_Part
 {
     uint64_t meshPtr, positions, positionsPrev, outBuf;

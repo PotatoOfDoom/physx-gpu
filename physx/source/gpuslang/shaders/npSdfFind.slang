@@ -46,9 +46,10 @@ import pxgSlangSdfCollision;
 
 #include "pxgSlangSdfFind.slang"
 
-// 128 bytes exactly -- the size Vulkan guarantees every implementation offers.
-// (llvmpipe reports maxPushConstantsSize = 256, but the guarantee is what this
-// is sized against.)
+// 176 bytes since P9.34b/P9.35b (it was 128 -- the size Vulkan guarantees every
+// implementation offers -- until the triangle and tet gathers extended it).  The
+// device refuses the pipeline with a reason on a device whose maxPushConstantsSize
+// is smaller (P9.98); llvmpipe reports 256.
 struct SdfFindParams
 {
     uint64_t meshPtr;        //   0  the cooked-mesh blob
@@ -80,9 +81,11 @@ struct SdfFindParams
     float4 scale0Rot;        // 144
     float3 scale0;           // 160
     uint _pad172;            // 172 -> 176
-    uint pad0;               // 116
-    uint pad1;               // 120
-    uint pad2;               // 124
+    // P9.98: three stray `uint pad0/pad1/pad2; // 116/120/124` stood here.  Their
+    // comments named the slots _pad116.._pad124 above, but they sat AFTER _pad172, so
+    // the block was 188 B while every fixture pushes 176 (static_assert'ed in
+    // testSdfFind, testFemClothSdfCg and testSoftBodySdfMid) -- the validation layer's
+    // VUID-07987 on all three entries.  Nothing read them.
 }
 
 [[vk::push_constant]]

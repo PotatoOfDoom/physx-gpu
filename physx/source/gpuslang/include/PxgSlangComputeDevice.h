@@ -75,6 +75,22 @@ struct PxgSlangDeviceDesc
     // pipeline (shader) compilation is reused across runs.  NULL disables
     // the on-disk cache (an in-memory cache is still used within a run).
     const char* pipelineCachePath = nullptr;
+    // P9.98 test hooks: when nonzero, LOWER the corresponding device limit to this
+    // value (never raise it) before any pipeline is checked against it, so a fixture
+    // can show that a kernel over a smaller device's limit is REFUSED rather than
+    // built.  The environment variables PXG_VK_LIMIT_PUSH_CONSTANTS,
+    // PXG_VK_LIMIT_SHARED_MEMORY, PXG_VK_LIMIT_WORKGROUP_INVOCATIONS and
+    // PXG_VK_LIMIT_WORKGROUP_SIZE do the same for a whole process (a scene), and the
+    // smallest of the three sources (device, desc, environment) wins.
+    // limitMaxComputeWorkGroupSize lowers each of the three dimensions.
+    // P9.98 check round 1: limitMaxComputeWorkGroupCount / PXG_VK_LIMIT_WORKGROUP_COUNT
+    // lower each dimension of maxComputeWorkGroupCount, which dispatch checks the grid
+    // against.
+    uint32_t limitMaxPushConstantsSize = 0;
+    uint32_t limitMaxComputeSharedMemorySize = 0;
+    uint32_t limitMaxComputeWorkGroupInvocations = 0;
+    uint32_t limitMaxComputeWorkGroupSize = 0;
+    uint32_t limitMaxComputeWorkGroupCount = 0;
 };
 
 class PxgSlangComputeDevice
@@ -86,6 +102,9 @@ public:
     virtual const char* getBackendName() const = 0;
 
     // ---- resources ----
+    // Returns 0 when the buffer cannot be created (an out-of-memory allocation on the
+    // Vulkan backend since P9.98: the attempt is released and the failing call named on
+    // stderr; the shim reports OutOfMemory).
     virtual PxgBufferHandle createBuffer(size_t sizeBytes) = 0;
     virtual void destroyBuffer(PxgBufferHandle buffer) = 0;
 
@@ -93,7 +112,8 @@ public:
     // 4b): host-visible memory persistently mapped for the buffer's lifetime —
     // the CPU reads/writes it through `*mappedPtr` while shaders access it by
     // buffer device address.  Freed with destroyBuffer.  Returns 0 (and leaves
-    // *mappedPtr untouched) on backends without pinned-mapped support.
+    // *mappedPtr untouched) on backends without pinned-mapped support; the Vulkan
+    // backend returns 0 with *mappedPtr = NULL when the allocation fails.
     virtual PxgBufferHandle createHostVisibleBuffer(size_t /*sizeBytes*/, void** /*mappedPtr*/) { return 0; }
 
     virtual void upload(PxgBufferHandle buffer, const void* data, size_t sizeBytes, size_t dstOffset = 0) = 0;
@@ -132,7 +152,19 @@ public:
     // ---- execution ----
     // Records a dispatch of gridX x gridY x gridZ workgroups.  `buffers`
     // bind to the shader's storage buffers in declaration order.
-    virtual void dispatch(PxgPipelineHandle pipeline, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+    // P9.98: returns false -- and records NOTHING -- when the pipeline handle is 0
+    // or unknown (e.g. a createPipeline* that was refused) or the push blob is
+    // larger than the pipeline's push range; since P9.98 check round 0 also when
+    // numBuffers / numTextures differ from the pipeline's, a buffer or texture handle
+    // is 0 or unknown (dispatchIndirect: the arg buffer too, and an arg offset that is
+    // not a 4-byte aligned command inside it), or no descriptor set can be allocated;
+    // since check round 1 also when gridX / gridY / gridZ exceeds the device's
+    // maxComputeWorkGroupCount (65535 on llvmpipe and the Vulkan minimum -- CUDA allows a
+    // gridDim.x up to 2^31-1, Vulkan does not; dispatchIndirect's counts live on the device
+    // and cannot be checked here).
+    // The device prints why; the shim turns it into a refused launch (NotFound),
+    // exactly like a pipeline it could not build.
+    virtual bool dispatch(PxgPipelineHandle pipeline, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                           const PxgBufferHandle* buffers, uint32_t numBuffers,
                           const void* pushConstants, uint32_t pushConstantSize) = 0;
 
@@ -142,10 +174,10 @@ public:
     // D3D12 dispatch-args layout.  Lets a kernel compute the next grid on
     // device without a count readback (RUNTIME_PLAN.md P6).  Base default
     // is unsupported (returns without recording); backends override.
-    virtual void dispatchIndirect(PxgPipelineHandle /*pipeline*/, PxgBufferHandle /*argBuffer*/,
+    virtual bool dispatchIndirect(PxgPipelineHandle /*pipeline*/, PxgBufferHandle /*argBuffer*/,
                                   size_t /*argOffset*/, const PxgBufferHandle* /*buffers*/,
                                   uint32_t /*numBuffers*/, const void* /*pushConstants*/,
-                                  uint32_t /*pushConstantSize*/) {}
+                                  uint32_t /*pushConstantSize*/) { return false; }
     virtual bool supportsIndirectDispatch() const { return false; }
 
     // ---- GPU timestamps (per-stage timing, RUNTIME_PLAN.md P1.6) ----
@@ -298,10 +330,10 @@ public:
                                                 const uint32_t* /*bufferStrides*/,
                                                 uint32_t /*pushConstantSize*/, uint32_t /*numTextures*/)
     { return 0; }
-    virtual void dispatchTex(PxgPipelineHandle /*pipeline*/, uint32_t /*gridX*/, uint32_t /*gridY*/,
+    virtual bool dispatchTex(PxgPipelineHandle /*pipeline*/, uint32_t /*gridX*/, uint32_t /*gridY*/,
                              uint32_t /*gridZ*/, const PxgBufferHandle* /*buffers*/, uint32_t /*numBuffers*/,
                              const PxgTextureHandle* /*textures*/, uint32_t /*numTextures*/,
-                             const void* /*pushConstants*/, uint32_t /*pushConstantSize*/) {}
+                             const void* /*pushConstants*/, uint32_t /*pushConstantSize*/) { return false; }
 
     // ---- P9.97 diagnostics -- APPENDED, so every existing vtable slot keeps its index ----
 
@@ -328,6 +360,29 @@ public:
     // its own two helpers).  Diagnostic only.  Since P9.97 the only owner is a
     // createTexture3D texture (set 0, the P2 probe); a bindless texture owns none.
     virtual uint32_t liveSamplerCount() const { return 0; }
+
+    // ---- P9.98 diagnostics -- APPENDED like the P9.97 ones ----
+
+    // The limits createPipeline* checks every entry point against: the device's
+    // VkPhysicalDeviceLimits, lowered by the PxgSlangDeviceDesc / environment test
+    // hooks.  All zero on a backend that does not check.  maxComputeWorkGroupCount
+    // (check round 1) is the one dispatch checks the grid against.
+    struct ComputeLimits
+    {
+        uint32_t maxPushConstantsSize = 0;
+        uint32_t maxComputeSharedMemorySize = 0;
+        uint32_t maxComputeWorkGroupInvocations = 0;
+        uint32_t maxComputeWorkGroupSize[3] = { 0, 0, 0 };
+        uint32_t maxComputeWorkGroupCount[3] = { 0, 0, 0 };
+    };
+    virtual ComputeLimits computeLimits() const { return ComputeLimits(); }
+
+    // The size of the push-constant range the pipeline's LAYOUT declares:
+    // max(the caller's pushConstantSize, the entry point's SPIR-V push block), so the
+    // declared block always lies inside the layout (VUID-07987, P9.98 F2).  ~0u for a
+    // handle the device does not hold (0 is a held pipeline with no push range), and
+    // on a backend that does not report it.
+    virtual uint32_t pipelinePushRangeBytes(PxgPipelineHandle /*pipeline*/) const { return ~0u; }
 };
 
 // P9.97: does the module's use of descriptor sets >= 1 fit the bindless set -- set 1 with
@@ -346,6 +401,33 @@ bool pxgSpirvFitsBindlessLayout(const void* code, size_t codeSize, uint32_t* bad
 // createPipelineBindless refuses such a module.  False for a malformed blob (the layout
 // check refuses that one).
 bool pxgSpirvDeclaresSampler(const void* code, size_t codeSize);
+
+// P9.98: what one entry point of a SPIR-V module asks of the device, read from the
+// binary.  PER ENTRY POINT when the module is SPIR-V 1.4+ (OpEntryPoint's interface
+// list then names every global the entry statically uses -- Slang emits 1.5), else
+// module-wide (perEntry = false), which can only over-count.
+//   pushBlockBytes  the entry's PushConstant block: max(member Offset + size), rounded
+//                   up to 4 (0 = none).  The size VUID-07987 compares the layout with.
+//   workgroupBytes  the summed size of its Workgroup variables (the same rules as
+//                   tools/check_groupshared.py) -- what maxComputeSharedMemorySize caps.
+//   localSize       OpExecutionMode LocalSize (or LocalSizeId of constants); 0 = unknown.
+// A size the walker cannot decide clears *Decided (the caller then skips that check).
+// Check round 1: sizes are computed in 64 bits and a size that does not fit 32 bits is
+// reported as UINT32_MAX (decided, so over every limit) -- they used to wrap, and a 4 GiB
+// groupshared array reflected as 0 B and was built.
+struct PxgSpirvEntryInfo
+{
+    uint32_t pushBlockBytes = 0;
+    uint32_t workgroupBytes = 0;
+    uint32_t localSize[3] = { 0, 0, 0 };
+    bool pushDecided = true;
+    bool workgroupDecided = true;
+    bool perEntry = true;
+};
+
+// False when the blob is not a well-formed SPIR-V word stream or declares no entry
+// point named `entry`; *out is then left default.  Defined by the Vulkan backend.
+bool pxgSpirvReflectEntry(const void* code, size_t codeSize, const char* entry, PxgSpirvEntryInfo* out);
 
 // Factory functions; each returns NULL when the backend is unavailable.
 PxgSlangComputeDevice* PxgCreateVulkanComputeDevice(const PxgSlangDeviceDesc& desc);

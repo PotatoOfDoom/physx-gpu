@@ -104,7 +104,8 @@ using physx::gpuslang::PxgKernelDef;
 using namespace physx;
 using namespace pxgsdfref;
 
-// npSdfFind.slang's push-constant block -- 128 bytes, laid out to match.
+// npSdfFind.slang's push-constant block -- 176 bytes (128 until P9.34b/P9.35b), laid
+// out to match.  P9.98 removed three stray shader members that had made it 188.
 struct P_Find
 {
     uint64_t meshPtr, positions, echoOut, roundsOut, bufOut, numRoundsOut;   //  0.. 47

@@ -1,0 +1,9 @@
+# P9.98 -- Best Practices variant (tools/run_validation.sh --best-practices).  Its two
+# findings on this port are waived in tools/validation_waivers.txt (F5 one
+# VkDeviceMemory per buffer, F6 RESET_COMMAND_BUFFER_BIT), and so is the one warning the
+# runner itself causes (VK_EXT_debug_utils, enabled by its PXG_VK_DEBUG_NAMES=1); anything
+# else it reports fails.
+khronos_validation.report_flags = error,warn,perf
+khronos_validation.enable_message_limit = false
+khronos_validation.validate_best_practices = true
+khronos_validation.enables = VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT

@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <iterator>
 
 namespace physx
 {
@@ -159,11 +160,29 @@ bool PxgCudaShim::resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* off
     return true;
 }
 
+// P9.98 check round 1: a transfer whose range runs past its allocation is InvalidValue
+// (CUDA's answer for an out-of-range cuMemcpy / cuMemset), not a heap overrun of the
+// pinned mapping or an out-of-range vkCmdCopyBuffer: resolve() checked only the START
+// pointer (measured, 4096 B at offset 1020 of a 1024-byte allocation: rc 139).  The
+// device refuses such a range too; checking here keeps the CUDA error code.
+bool PxgCudaShim::resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* buffer, size_t* offset,
+                               const char* caller) const
+{
+    if (!resolve(ptr, buffer, offset))
+        return false;
+    const Alloc& a = std::prev(mAllocs.upper_bound(ptr))->second;
+    if (bytes <= a.size - *offset)
+        return true;
+    std::fprintf(stderr, "[PxgShim] %s: %zu B at offset %zu runs past the %zu-byte allocation; InvalidValue\n",
+                 caller, bytes, *offset, a.size);
+    return false;
+}
+
 PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t bytes)
 {
     PxgBufferHandle buf;
     size_t off;
-    if (!resolve(dst, &buf, &off))
+    if (!resolveRange(dst, bytes, &buf, &off, "memcpyHtoD"))
         return PxgResult::InvalidValue;
     mDevice->upload(buf, src, bytes, off);
     return PxgResult::Success;
@@ -173,7 +192,7 @@ PxgResult PxgCudaShim::memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes)
 {
     PxgBufferHandle buf;
     size_t off;
-    if (!resolve(src, &buf, &off))
+    if (!resolveRange(src, bytes, &buf, &off, "memcpyDtoH"))
         return PxgResult::InvalidValue;
     mDevice->download(buf, dst, bytes, off);
     return PxgResult::Success;
@@ -183,7 +202,8 @@ PxgResult PxgCudaShim::memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t byt
 {
     PxgBufferHandle sBuf, dBuf;
     size_t sOff, dOff;
-    if (!resolve(src, &sBuf, &sOff) || !resolve(dst, &dBuf, &dOff))
+    if (!resolveRange(src, bytes, &sBuf, &sOff, "memcpyDtoD (source)") ||
+        !resolveRange(dst, bytes, &dBuf, &dOff, "memcpyDtoD (destination)"))
         return PxgResult::InvalidValue;
     // Device-side copy (vkCmdCopyBuffer), stream-ordered; the base class
     // stages through host on backends without a device path.
@@ -195,10 +215,13 @@ PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWor
 {
     PxgBufferHandle buf;
     size_t off;
-    if (!resolve(dst, &buf, &off))
+    // numWords * 4 is not formed before the range check: a count above SIZE_MAX / 4 is
+    // out of range of any allocation.
+    const size_t bytes = numWords > (~size_t(0)) / sizeof(uint32_t) ? ~size_t(0) : numWords * sizeof(uint32_t);
+    if (!resolveRange(dst, bytes, &buf, &off, "memsetD32"))
         return PxgResult::InvalidValue;
     // Device-side fill (vkCmdFillBuffer), stream-ordered.
-    mDevice->fillBuffer(buf, off, value, numWords * sizeof(uint32_t));
+    mDevice->fillBuffer(buf, off, value, bytes);
     return PxgResult::Success;
 }
 
@@ -341,11 +364,16 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
         std::fflush(stderr);
     }
 
-    if (numTextures > 0)
-        mDevice->dispatchTex(pipe, gridX, gridY, gridZ, nullptr, 0, textures, numTextures,
-                             paramBlob, paramBlobSize);
-    else
-        mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
+    // P9.98: the device refuses -- records nothing and says why on stderr -- a handle
+    // it does not hold or a blob larger than the pipeline's push range.  That is a
+    // refused launch, reported exactly like a pipeline that could not be built.
+    const bool recorded =
+        numTextures > 0
+            ? mDevice->dispatchTex(pipe, gridX, gridY, gridZ, nullptr, 0, textures, numTextures, paramBlob,
+                                   paramBlobSize)
+            : mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
+    if (!recorded)
+        return PxgResult::NotFound;
 
     // P9.85: CUDA runs the kernels of one stream in order, and the device
     // interface's equivalent is barrier() -- "orders successive dispatches"

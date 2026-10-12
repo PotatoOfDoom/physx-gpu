@@ -1,0 +1,15 @@
+# P9.98 -- the Khronos validation layer configuration tools/run_validation.sh uses
+# (VK_LAYER_SETTINGS_PATH points here).  Core, synchronization, thread-safety and
+# stateless checks; every message reported (no per-ID cap, which under-counts).
+#
+# Nothing is filtered HERE.  khronos_validation.message_id_filter can only drop an ID
+# for every module, and the one waiver this port needs (VUID-RuntimeSpirv-Workgroup-06530
+# on solverTGS.spv, a layer false positive -- see tools/validation_waivers.txt) must not
+# hide the same ID on any other module.  tools/vvl_triage.py applies the waivers per
+# module, from the `name = <entry>` the device attaches under PXG_VK_DEBUG_NAMES=1.
+khronos_validation.report_flags = error,warn,perf
+khronos_validation.enable_message_limit = false
+khronos_validation.validate_sync = true
+khronos_validation.thread_safety = true
+khronos_validation.disables =
+khronos_validation.enables = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT

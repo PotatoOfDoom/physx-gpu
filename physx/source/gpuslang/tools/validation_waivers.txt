@@ -1,0 +1,89 @@
+# P9.98 -- validation-layer messages this port accepts, and why.  Read by
+# tools/vvl_triage.py; any message NOT matched here fails tools/run_validation.sh.
+#
+# Format (whitespace-separated):   <message ID>   <scope>   <condition>
+#   message ID a layer VUID / UNASSIGNED id, or one of the port's own lines (check round 1,
+#              see tools/vvl_triage.py): PXG-refusal, PXG-push-zero-filled,
+#              PXG-alloc-over-limit (never waivable: no scope matches it).
+#   scope      `module:<file>.spv`  -- the message's shader-module name (the entry point,
+#              attached by the device under PXG_VK_DEBUG_NAMES=1) must be an entry point
+#              of that module in $PXG_SHADER_DIR;  `any` -- every object;
+#              `suite:<name>` -- the line comes from that gpuslang suite's output (a
+#              subset_v<m>_<name>.log, or its lines in a ctest -V log; never a scene);
+#              `entry:<name>` -- the line names that entry point.
+#   condition  `module-sum`  -- 06530 only: the bytes the layer reports must EQUAL the
+#              module-wide Workgroup total (tools/check_groupshared.py) while the named
+#              entry point's own total is within the limit the message names.  I.e. the
+#              layer summed the module; any other 06530 on the module still fails.
+#              `always`.
+#              `text:<substring>` -- the message line must contain <substring> (no spaces).
+#              `alloc-peak:<N>` -- the log's largest `[pxg-alloc] peak` (PXG_VK_ALLOC_STATS,
+#              set by run_validation.sh) is at most N; a log that reports none fails.
+# A line with another scope or condition is an input error (vvl_triage.py exits 2).
+# The list may shrink; it may not grow without a reason written beside the line.
+
+# F3 -- VVL 1.3.275 sums EVERY Workgroup OpVariable in the module, not the entry point's
+# interface (Vulkan applies maxComputeSharedMemorySize per pipeline).  solverTGS.spv
+# carries 11 entries whose Workgroup sets total 40448 B (31744 + 7168 + 768 + 768); the
+# largest single entry, solveWholeIslandTGS, is 31744 B and entries with 0 B are flagged
+# with the same 40448.  Proven in P9.98 by compiling one-entry modules (no message) and a
+# two-entry module whose entries each fit (message with their sum).  The REAL limit is
+# checked per entry by the device at pipeline creation since P9.98 (a refusal, not this
+# message), so nothing is lost by the waiver.
+VUID-RuntimeSpirv-Workgroup-06530    module:solverTGS.spv    module-sum
+
+# F5 -- Best Practices only.  createBuffer/createPinned/textures allocate one
+# VkDeviceMemory each.  Fixtures make thousands of tiny buffers; the engine sub-allocates
+# through PhysX's own heap and peaks at 25-53 live allocations (P9.98 scope, measured in
+# both memory modes), far below the common maxMemoryAllocationCount of 4096.  A block
+# sub-allocator is not justified by that.  Check round 1: that reason is now CHECKED --
+# the device counts its live VkDeviceMemory and prints the peak at exit
+# (PXG_VK_ALLOC_STATS), and the waiver holds only while every process in the log stayed
+# at or below the bound -- so drift toward the limit fails
+# the run instead of being absorbed.  The bound is 2048, half of 4096: measured in check
+# round 1, the fixtures peak at up to ~1.6k live allocations (aggregateBda, the
+# articulation update suites) and the engine scenes far lower (see the P9.98 report).
+UNASSIGNED-BestPractices-vkAllocateMemory-small-allocation          any    alloc-peak:2048
+UNASSIGNED-BestPractices-vkBindMemory-small-dedicated-allocation    any    alloc-peak:2048
+
+# F6 -- Best Practices only, and a false positive for this design: the device keeps
+# kFramesInFlight command buffers in ONE pool and resets each through
+# vkBeginCommandBuffer, which REQUIRES the flag (VUID-vkBeginCommandBuffer-commandBuffer-00050).
+UNASSIGNED-BestPractices-vkCreateCommandPool-command-buffer-reset   any    always
+
+# Best Practices only, and caused by the RUNNER, not the port: run_validation.sh sets
+# PXG_VK_DEBUG_NAMES=1 so every message names its entry point (the F3 waiver depends on
+# it), which makes the device enable VK_EXT_debug_utils -- a "special use" debugging
+# extension Best Practices warns about once per instance.  Without PXG_VK_DEBUG_NAMES (or
+# enableValidation) the device never enables it.  Scoped to that extension's name, so
+# another special-use extension still fails.  (Check round 0: without this line
+# `run_validation.sh --best-practices` could never pass.)
+UNASSIGNED-BestPractices-vkCreateInstance-specialuse-extension-debugging   any   text:VK_EXT_debug_utils
+
+# ---- check round 1: the port's own lines (tools/vvl_triage.py) ----
+
+# A refusal is a kernel that never ran (or a transfer / allocation that never happened),
+# which the layer cannot see.  Only the fixtures that provoke refusals ON PURPOSE are
+# waived: gpuslang.pipelineRefusal forces every refusal path (bad modules, lowered limits,
+# forced Vulkan failures, stale handles, out-of-range transfers), and gpuslang.shimBindless
+# checks the P9.97 bindless-layout refusals.  A refusal anywhere else -- any other suite,
+# any scene -- fails the run.
+PXG-refusal    suite:pipelineRefusal    always
+PXG-refusal    suite:shimBindless       always
+# gpuslang.p0Subgroup checks that createPipelineEx REFUSES a required subgroup size the
+# device cannot provide (256 on llvmpipe, whose range is 8..8) -- one refusal, on purpose.
+PXG-refusal    suite:p0Subgroup         always
+# gpuslang.vvlTriage is the triage's own self-test: its row descriptions and the
+# inputs it echoes on a failure NAME these lines; nothing in it is a device.
+PXG-refusal    suite:vvlTriage          always
+
+# The entries whose push-constant range the device widens past the caller's blob (F2,
+# zero-filled).  The three engine rows the P9.98 scope measured -- the diffuse
+# collision launches push 104 B of a 176-B block, ps_updateUnsortedDiffuseArrayLaunch
+# 16 B of 24 -- whose shaders do not read the surplus (tools/check_push_block.py), and
+# p98PushPad's echo, which reads it to prove the zero fill.  A new entry here needs the
+# same argument written beside it.
+PXG-push-zero-filled    entry:ps_primitivesDiffuseCollisionLaunch    always
+PXG-push-zero-filled    entry:ps_convexDiffuseCollisionLaunch        always
+PXG-push-zero-filled    entry:ps_updateUnsortedDiffuseArrayLaunch    always
+PXG-push-zero-filled    entry:pushPadEcho                            always

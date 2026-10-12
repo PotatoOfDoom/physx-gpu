@@ -240,6 +240,33 @@ run_one "slabgrid (slab5)" PXG_SCENE=slabgrid PXG_SLABGRID=slab5
 echo "=== scenes: $pass ok, $fail fail, $missing missing (of $((pass+fail+missing))) ==="
 [ "$carried" -gt 0 ] && echo "    ($carried ok carried over from $RESUME_LOG, $((pass+fail+missing-carried)) run now)"
 
+# P9.98 check round 1: the REFUSAL CONTROL -- scored, but not a scene, so the count above
+# stays the scene inventory.  A pipeline the device cannot build must be a clean refusal
+# that the scene reports as a failed check, never a crash: before P9.98 a failed
+# vkCreateComputePipelines left a VK_NULL_HANDLE pipeline that the first dispatch bound
+# (rc 139).  The device's own hook makes the failure real in under a second, with no
+# probe library: box under PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128 refuses every
+# 256-thread kernel (39 refusal lines measured) and must end with the harness's own
+# failure exit (rc 2, "[ PARTIAL ]") -- not a signal, and not a pass, which would mean
+# the refusals stopped happening or stopped mattering.  Always run, also under --resume.
+ctl_ok=0; ctl_fail=0
+refusal_control() {
+    label="$1"; shift
+    out=$(env "$@" PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1)
+    rc=$?
+    nref=$(printf '%s\n' "$out" | grep -cE '^\[PxgVulkan\] createPipeline\(.*; refused$')
+    if [ "$rc" -eq 2 ] && [ "$nref" -ge 1 ]; then
+        echo "ok       $label   (rc 2, $nref pipeline refusal(s), no crash)"; ctl_ok=$((ctl_ok+1))
+    else
+        echo "FAIL     $label   (rc $rc, $nref pipeline refusal(s); want rc 2 and at least one)"
+        printf '%s\n' "$out" | tail -3 | sed 's/^/           /'
+        ctl_fail=$((ctl_fail+1))
+    fi
+}
+refusal_control "refusal control (box, PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128)" \
+    PXG_SCENE=box PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128
+echo "=== controls: $ctl_ok ok, $ctl_fail fail ==="
+
 if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== diagnostics (NOT scored: these controls exist to fail the checks they"
@@ -377,4 +404,4 @@ if [ "${1:-}" = "--diagnostics" ]; then
     # waiting on this port.
 fi
 
-[ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]
+[ "$fail" -eq 0 ] && [ "$missing" -eq 0 ] && [ "$ctl_fail" -eq 0 ]

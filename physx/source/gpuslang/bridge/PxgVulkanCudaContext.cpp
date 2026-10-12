@@ -333,7 +333,7 @@ public:
     // never runs.  That is indistinguishable, in a trace, from a kernel that ran
     // and found nothing.  The blob size the bridge actually built goes in the
     // line so the next reader can compare it against the shader's blob at once.
-    void traceRefusal(const char* form, PxgKernelId id, uint32_t blobBytes)
+    void traceRefusal(const char* form, PxgKernelId id, uint32_t blobBytes, PxgResult res)
     {
         static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
         if (!on)
@@ -341,8 +341,20 @@ public:
         const char* name = id < mManifestCount && mManifest[id].cudaName
             ? mManifest[id].cudaName
             : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
-        std::fprintf(stderr, "[pxg-refused] %s %s built a %u-byte push blob -- the shim "
-                             "requires an EXACT match with the shader's\n", form, name, blobBytes);
+        if (res == PxgResult::NotFound)
+        {
+            // P9.98: the device refused the pipeline (or the dispatch) and said why on
+            // stderr -- a VkResult, or a device limit the entry point exceeds.  The shim
+            // caches a refused build, so the device's line is printed ONCE, at the first
+            // launch: it can be far above this one, hence "the first ... naming <entry>".
+            const char* entry = id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?";
+            std::fprintf(stderr, "[pxg-refused] %s %s: no pipeline could be built or bound for it -- the device "
+                                 "refused the build (the first [PxgVulkan] line naming %s says why) or this "
+                                 "dispatch (the [PxgVulkan] dispatch line just above)\n", form, name, entry);
+        }
+        else
+            std::fprintf(stderr, "[pxg-refused] %s %s built a %u-byte push blob -- the shim "
+                                 "requires an EXACT match with the shader's\n", form, name, blobBytes);
     }
 
     void traceLaunch(const char* form, PxgKernelId id, bool ok,
@@ -485,7 +497,7 @@ public:
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
         if (res != PxgResult::Success)
-            traceRefusal("sized", id, uint32_t(blob.size()));
+            traceRefusal("sized", id, uint32_t(blob.size()), res);
         traceLaunch("sized", id, res == PxgResult::Success, gridDimX, gridDimY, gridDimZ);
         if (res == PxgResult::Success)
             dumpArgs(id, blob);
@@ -600,6 +612,8 @@ public:
         traceDispatch("void**", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
+        if (res != PxgResult::Success)
+            traceRefusal("void**", id, uint32_t(blob.size()), res);
         traceLaunch("void**", id, res == PxgResult::Success);
         return record(res);
     }

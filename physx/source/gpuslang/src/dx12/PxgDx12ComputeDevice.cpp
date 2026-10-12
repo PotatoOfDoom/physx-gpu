@@ -108,6 +108,10 @@ private:
 
 class PxgDx12ComputeDevice : public PxgSlangComputeDevice
 {
+private:
+    struct Pipeline;   // defined with the other private state below (refusePipeline takes one)
+    struct Buffer;     // likewise (liveBuffer returns one)
+
 public:
     PxgDx12ComputeDevice() {}
 
@@ -118,8 +122,10 @@ public:
             kv.second.resource->Release();
         for (auto& kv : mPipelines)
         {
-            kv.second.pso->Release();
-            kv.second.rootSignature->Release();
+            if (kv.second.pso)
+                kv.second.pso->Release();
+            if (kv.second.rootSignature)
+                kv.second.rootSignature->Release();
         }
         if (mEvent)
             CloseHandle(mEvent);
@@ -233,9 +239,21 @@ public:
 
         Buffer buf = {};
         buf.size = sizeBytes;
-        PXG_DX_CHECK(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
-                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                      IID_PPV_ARGS(&buf.resource)));
+        // P9.98 check round 1: checked IN RELEASE BUILDS (PXG_DX_CHECK only asserts), as the
+        // Vulkan backend's createBufferInternal is: a failure returns 0 -- the shim's
+        // OutOfMemory -- instead of registering a handle with a null resource that
+        // upload / download / dispatch then dereference.
+        const HRESULT hr = mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
+                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                           IID_PPV_ARGS(&buf.resource));
+        if (FAILED(hr) || !buf.resource)
+        {
+            std::fprintf(stderr, "[PxgDx12] createBuffer(%zu B): CreateCommittedResource failed with HRESULT "
+                                 "0x%08lx; returning 0\n", sizeBytes, static_cast<unsigned long>(hr));
+            if (buf.resource)
+                buf.resource->Release();
+            return 0;
+        }
 
         const PxgBufferHandle handle = mNextBufferHandle++;
         mBuffers[handle] = buf;
@@ -252,25 +270,67 @@ public:
         mBuffers.erase(it);
     }
 
+    // P9.98 check round 1: the Vulkan backend's transfer contract -- an unknown handle is
+    // skipped with a message (operator[] default-inserted a Buffer with a null resource and
+    // then called Map on it), a range past the buffer is refused, and a failed Map is
+    // checked in Release instead of memcpy'ing through a null pointer.
+    Buffer* liveBuffer(PxgBufferHandle handle, size_t offset, size_t bytes, const char* caller)
+    {
+        const auto it = handle == 0 ? mBuffers.end() : mBuffers.find(handle);
+        if (it == mBuffers.end())
+        {
+            std::fprintf(stderr, "[PxgDx12] %s: buffer handle %u is not a live buffer; refused\n", caller,
+                         unsigned(handle));
+            return nullptr;
+        }
+        if (offset > it->second.size || bytes > it->second.size - offset)
+        {
+            std::fprintf(stderr, "[PxgDx12] %s: %zu B at offset %zu runs past buffer %u's %zu bytes; refused\n",
+                         caller, bytes, offset, unsigned(handle), it->second.size);
+            return nullptr;
+        }
+        return &it->second;
+    }
+
     void upload(PxgBufferHandle handle, const void* data, size_t sizeBytes, size_t dstOffset) override
     {
-        Buffer& buf = mBuffers[handle];
+        if (sizeBytes == 0)
+            return;
+        Buffer* buf = liveBuffer(handle, dstOffset, sizeBytes, "upload");
+        if (!buf)
+            return;
         void* mapped = nullptr;
         const D3D12_RANGE readRange = { 0, 0 };
-        PXG_DX_CHECK(buf.resource->Map(0, &readRange, &mapped));
+        const HRESULT hr = buf->resource->Map(0, &readRange, &mapped);
+        if (FAILED(hr) || !mapped)
+        {
+            std::fprintf(stderr, "[PxgDx12] upload: Map failed with HRESULT 0x%08lx; refused\n",
+                         static_cast<unsigned long>(hr));
+            return;
+        }
         memcpy(static_cast<uint8_t*>(mapped) + dstOffset, data, sizeBytes);
-        buf.resource->Unmap(0, nullptr);
+        buf->resource->Unmap(0, nullptr);
     }
 
     void download(PxgBufferHandle handle, void* data, size_t sizeBytes, size_t srcOffset) override
     {
-        Buffer& buf = mBuffers[handle];
+        if (sizeBytes == 0)
+            return;
+        Buffer* buf = liveBuffer(handle, srcOffset, sizeBytes, "download");
+        if (!buf)
+            return;
         void* mapped = nullptr;
         const D3D12_RANGE readRange = { srcOffset, srcOffset + sizeBytes };
-        PXG_DX_CHECK(buf.resource->Map(0, &readRange, &mapped));
+        const HRESULT hr = buf->resource->Map(0, &readRange, &mapped);
+        if (FAILED(hr) || !mapped)
+        {
+            std::fprintf(stderr, "[PxgDx12] download: Map failed with HRESULT 0x%08lx; refused\n",
+                         static_cast<unsigned long>(hr));
+            return;
+        }
         memcpy(data, static_cast<uint8_t*>(mapped) + srcOffset, sizeBytes);
         const D3D12_RANGE writtenRange = { 0, 0 };
-        buf.resource->Unmap(0, &writtenRange);
+        buf->resource->Unmap(0, &writtenRange);
     }
 
     // ---- pipelines ----
@@ -327,23 +387,45 @@ public:
         rootDesc.NumParameters = numParams;
         rootDesc.pParameters = params;
 
+        // P9.98 check round 0: each HRESULT is checked IN RELEASE BUILDS (PXG_DX_CHECK only
+        // asserts) and a failure releases what was made and returns 0, as the Vulkan
+        // backend's createPipelineInternal does -- a handle with a null root signature or
+        // PSO used to be registered, and dispatch / destroyPipeline then used it.
         ComPtrLite<ID3DBlob> serialized;
         ComPtrLite<ID3DBlob> errors;
-        PXG_DX_CHECK(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                                 serialized.put(), errors.put()));
-        PXG_DX_CHECK(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(),
-                                                  serialized->GetBufferSize(),
-                                                  IID_PPV_ARGS(&pipe.rootSignature)));
+        HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, serialized.put(),
+                                                 errors.put());
+        if (FAILED(hr) || !serialized)
+            return refusePipeline(pipe, "D3D12SerializeRootSignature", hr);
+        hr = mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                          IID_PPV_ARGS(&pipe.rootSignature));
+        if (FAILED(hr) || !pipe.rootSignature)
+            return refusePipeline(pipe, "CreateRootSignature", hr);
 
         D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
         psoDesc.pRootSignature = pipe.rootSignature;
         psoDesc.CS.pShaderBytecode = code;
         psoDesc.CS.BytecodeLength = codeSize;
-        PXG_DX_CHECK(mDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pipe.pso)));
+        hr = mDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pipe.pso));
+        if (FAILED(hr) || !pipe.pso)
+            return refusePipeline(pipe, "CreateComputePipelineState", hr);
 
         const PxgPipelineHandle handle = mNextPipelineHandle++;
         mPipelines[handle] = pipe;
         return handle;
+    }
+
+    PxgPipelineHandle refusePipeline(Pipeline& pipe, const char* what, HRESULT hr)
+    {
+        std::fprintf(stderr, "[PxgDx12] createPipeline: %s failed with HRESULT 0x%08lx; refused\n", what,
+                     static_cast<unsigned long>(hr));
+        if (pipe.pso)
+            pipe.pso->Release();
+        if (pipe.rootSignature)
+            pipe.rootSignature->Release();
+        pipe.pso = nullptr;
+        pipe.rootSignature = nullptr;
+        return 0;
     }
 
     void destroyPipeline(PxgPipelineHandle handle) override
@@ -352,20 +434,62 @@ public:
         if (it == mPipelines.end())
             return;
         waitForGpu();
-        it->second.pso->Release();
-        it->second.rootSignature->Release();
+        if (it->second.pso)
+            it->second.pso->Release();
+        if (it->second.rootSignature)
+            it->second.rootSignature->Release();
         mPipelines.erase(it);
     }
 
     // ---- execution ----
 
-    void dispatch(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+    bool dispatch(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                   const PxgBufferHandle* buffers, uint32_t numBuffers,
                   const void* pushConstants, uint32_t pushConstantSize) override
     {
-        Pipeline& pipe = mPipelines[pipelineHandle];
-        assert(numBuffers == pipe.numBuffers);
+        // P9.98: an unknown handle is refused, never default-inserted (see the Vulkan
+        // backend's dispatchInternal).
+        auto found = mPipelines.find(pipelineHandle);
+        if (pipelineHandle == 0 || found == mPipelines.end())
+        {
+            std::fprintf(stderr, "[PxgDx12] dispatch: pipeline handle %u is not a live pipeline; "
+                                 "nothing recorded\n", unsigned(pipelineHandle));
+            return false;
+        }
+        Pipeline& pipe = found->second;
         assert(pushConstantSize == pipe.pushConstantSize);
+        // P9.98 check round 0: the header's dispatch contract -- a blob larger than the
+        // root constants (Num32BitValues = ceil(pipe.pushConstantSize / 4)), a buffer
+        // count that is not the pipeline's, or a buffer handle that is 0 / unknown is
+        // refused before anything is recorded (they were assert-only, and the buffers
+        // operator[] lookups default-inserted a null resource).
+        const uint32_t rootConstantBytes =
+            pipe.rootConstantParamIndex != UINT(-1) ? (pipe.pushConstantSize + 3u) / 4u * 4u : 0u;
+        if (pushConstantSize > rootConstantBytes)
+        {
+            std::fprintf(stderr, "[PxgDx12] dispatch: a %u-byte push blob does not fit pipeline %u's %u bytes of "
+                                 "root constants; nothing recorded\n", pushConstantSize, unsigned(pipelineHandle),
+                         rootConstantBytes);
+            return false;
+        }
+        if (numBuffers != pipe.numBuffers || (numBuffers > 0 && !buffers))
+        {
+            std::fprintf(stderr, "[PxgDx12] dispatch: pipeline %u binds %u buffer(s), the dispatch passed %u; "
+                                 "nothing recorded\n", unsigned(pipelineHandle), pipe.numBuffers, numBuffers);
+            return false;
+        }
+        std::vector<const Buffer*> bound(numBuffers, nullptr);
+        for (uint32_t i = 0; i < numBuffers; ++i)
+        {
+            const auto b = buffers[i] == 0 ? mBuffers.end() : mBuffers.find(buffers[i]);
+            if (b == mBuffers.end())
+            {
+                std::fprintf(stderr, "[PxgDx12] dispatch: buffer handle %u is not a live buffer; nothing recorded\n",
+                             unsigned(buffers[i]));
+                return false;
+            }
+            bound[i] = &b->second;
+        }
         assert(mDescriptorCursor + numBuffers <= kDescriptorHeapSize && "descriptor heap exhausted; flush() more often");
 
         beginRecording();
@@ -374,8 +498,23 @@ public:
         mCommandList->SetComputeRootSignature(pipe.rootSignature);
 
         if (pipe.rootConstantParamIndex != UINT(-1) && pushConstantSize > 0)
-            mCommandList->SetComputeRoot32BitConstants(pipe.rootConstantParamIndex,
-                                                       (pushConstantSize + 3) / 4, pushConstants, 0);
+        {
+            // P9.98 check round 1: SetComputeRoot32BitConstants reads whole 32-bit values,
+            // so a blob whose size is not a multiple of 4 is copied into zeroed scratch of
+            // the rounded size first -- reading ceil(size / 4) words straight from the
+            // caller's blob read up to 3 bytes past it (the Vulkan backend's
+            // pushConstantsPadded copies the same way).
+            const void* src = pushConstants;
+            const uint32_t words = (pushConstantSize + 3) / 4;
+            if ((pushConstantSize & 3u) != 0)
+            {
+                mPushScratch.assign(size_t(words) * 4u, 0u);
+                if (pushConstants)
+                    memcpy(mPushScratch.data(), pushConstants, pushConstantSize);
+                src = mPushScratch.data();
+            }
+            mCommandList->SetComputeRoot32BitConstants(pipe.rootConstantParamIndex, words, src, 0);
+        }
 
         if (numBuffers > 0)
         {
@@ -386,7 +525,7 @@ public:
 
             for (uint32_t i = 0; i < numBuffers; ++i)
             {
-                const Buffer& buf = mBuffers[buffers[i]];
+                const Buffer& buf = *bound[i];
                 const uint32_t stride = pipe.bufferStrides[i];
 
                 // Structured UAV matching the shader's RWStructuredBuffer stride.
@@ -406,6 +545,7 @@ public:
         }
 
         mCommandList->Dispatch(gridX, gridY, gridZ);
+        return true;
     }
 
     void barrier() override
@@ -489,6 +629,7 @@ private:
     bool mRecording = false;
 
     std::unordered_map<PxgBufferHandle, Buffer> mBuffers;
+    std::vector<uint8_t> mPushScratch;   // P9.98 check round 1: rounded root-constant copy
     std::unordered_map<PxgPipelineHandle, Pipeline> mPipelines;
     PxgBufferHandle mNextBufferHandle = 1;
     PxgPipelineHandle mNextPipelineHandle = 1;

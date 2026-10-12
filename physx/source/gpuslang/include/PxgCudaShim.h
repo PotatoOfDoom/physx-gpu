@@ -182,6 +182,10 @@ public:
 
 private:
     PxgPipelineHandle pipelineFor(PxgKernelId id);
+    // P9.98 check round 1: resolve() plus "the `bytes` from ptr on lie inside the
+    // allocation" -- the transfer entry points' check (InvalidValue otherwise).
+    bool resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* buffer, size_t* offset,
+                      const char* caller) const;
 
     struct Alloc
     {

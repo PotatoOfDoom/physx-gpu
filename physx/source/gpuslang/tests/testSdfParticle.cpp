@@ -97,11 +97,15 @@ static const uint32_t NUM_PAIRS = 512u;
 // npSdfCollision.slang's push-constant block and the stride of its sdfCollVertex
 // entry (P9.12d).  Used to re-evaluate doVertexSDFCollision INDEPENDENTLY at the
 // points this shader says it sampled -- see the note above runAndCheck.
+// P9.98: the whole SdfCollParams, 64 B since P9.34a appended triVerts/triOut (it was
+// 48, the VUID-07987 the validation layer reported); sdfCollVertex reads neither.
 struct P_Coll
 {
     uint64_t meshPtr, points, gradIn, dirSeed, outBuf;
     uint32_t numPoints, pad;
+    uint64_t triVerts, triOut;   // 48, 56 -- the triangle descent's (0 here)
 };
+static_assert(sizeof(P_Coll) == 64, "npSdfCollision push block (SdfCollParams)");
 static const uint32_t STRIDE_VTX = 16u;
 
 static bool bitEq(float a, float b) { return f2u(a) == f2u(b); }

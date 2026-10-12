@@ -7,7 +7,15 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **886/886** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **889/889** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.98: Khronos validation layer over the whole suite (both modes) and all scenes: 6 findings.  F4 REAL
+LATENT DEFECT FIXED -- a failed pipeline creation returned a live handle (release builds only
+asserted) and the next dispatch crashed; now every Vulkan result is checked, partial objects are
+destroyed, unknown handles are refused and the bridge reports a refused launch.  Per-entry device
+limits (push block, groupshared, workgroup size/count) checked at pipeline creation from SPIR-V
+(64-bit, saturating), push ranges = max(caller, SPIR-V block) zero-padded (VUID-07987 91 -> 0),
+solverTGS shared-memory message proven a whole-module layer false positive and waived exactly.
+tools/run_validation.sh + gpuslang.validationSubset / vvlTriage ctests (889).  Scenes 80/80.
 P9.97c: hardening -- value-identical clamps in ps_updateUnsortedArrayLaunch / ps_updateUserBufferLaunch
 behind guard-page fixtures (no defect on this llvmpipe: masked gathers never read past a buffer);
 the unused bindless sampler (set 1 binding 1) removed, validation layer unchanged; mutation-sweep
@@ -2170,6 +2178,76 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.98 — Khronos-Validierung über Suite und Szenen; echter latenter Fehler bei fehlgeschlagener Pipeline-Erstellung
+
+**Lauf.** Die Validierungsschicht (1.3.275: Core, Synchronisation, Thread-Safety) lief über alle 886
+Tests in beiden Speichermodi und über alle 80 Szenen (22 davon auch mit `PXG_DEVICE_V2=1`).
+- Eine Preload-Sonde ordnete jede Meldung ihrem `.spv`, Einstiegspunkt und Test zu.
+- Alle 11 951 Pipeline-Erstellungen gelangen.
+- Zur Dispatch-, Barrier-, Deskriptor- und Submit-Zeit gab es keine Meldung. Eine Gegenprobe zeigte,
+  dass der Synchronisations-Checker greift: Ohne Barrieren meldet er 69 Gefahren in `scan`.
+- Grenze der Aussage: Engine-Kernel greifen über Buffer-Device-Adressen zu, die der
+  Synchronisations-Checker nicht verfolgen kann. Die Reihenfolge zwischen Engine-Kerneln ist damit
+  nicht geprüft. Die Out-of-Bounds-Instrumentierung lief nicht, weil sie auf llvmpipe für 857
+  Einstiegspunkte unpraktikabel ist.
+
+**Befunde:**
+
+| # | Meldung | Einordnung | Erledigung |
+|---|---|---|---|
+| F4 | Pipeline-Handle nach fehlgeschlagener Erstellung → Absturz beim Dispatch | **echter latenter Fehler**: `createPipelineInternal` prüfte VkResults nur per assert (im Release aus), Dispatch nutzte `operator[]` | jedes Ergebnis geprüft, Teilobjekte zerstört, Rückgabe 0; unbekannte Handles abgelehnt; die Bridge meldet einen abgelehnten Start. Kontrolle: erzwungener Fehler bei `integrateCoreParallelLaunchTGS` → sauberes FAIL statt SIGSEGV |
+| F2 | VUID-07987: Push-Block größer als das Layout (Partikel-diffuse-Kernel, Engine) | Spezifikationsverstoß ohne Wirkung | Push-Bereich = max(Aufrufer, SPIR-V-Block), mit Nullen aufgefüllt; 91 → 0 Meldungen pro Modus |
+| F1 | dasselbe in SDF-Fixtures | Testseite | drei verirrte Pads in `npSdfFind.slang` entfernt, Fixture-Structs angepasst |
+| F3 | Shared Memory über dem Limit in `solverTGS` | **Fehlalarm** der Layer-Version: Sie summiert das ganze Modul (40448 B), der größte einzelne Einstiegspunkt braucht 31744 B | genau diese Meldung für genau dieses Modul freigestellt; jede andere Summe schlägt fehl |
+| F5 / F6 | Best Practices: kleine Allokationen, Command-Pool-Flag | Hinweise | begründet freigestellt; F5 nur bis zu einem Allokations-Höchststand von 2048 |
+
+**Gerätelimits zur Laufzeit.** Auf llvmpipe wird keines verletzt, auf anderen Treibern schon:
+- Größter Push-Block: 192 B. llvmpipe erlaubt 256, manche Treiber nur 128.
+- Größter Shared-Memory-Bedarf: 31744 B. Die Spezifikation garantiert nur 16384.
+
+Deshalb prüft das Device jetzt beim Pipeline-Bau pro Einstiegspunkt aus dem SPIR-V: Push-Block,
+Groupshared-Größe, Workgroup-Größe und -Aufrufe; beim Dispatch zusätzlich die Workgroup-Anzahl.
+- Ein Verstoß lehnt sauber über den F4-Pfad ab, mit präziser Meldung.
+- Die Größenrechnung ist 64-bittig und sättigend. Eine 4-GiB-Groupshared-Variable lief vorher auf 0
+  über und wurde gebaut (Fund der Gegenprüfung).
+- Mit `PXG_VK_LIMIT_*` lassen sich kleinere Limits simulieren. Mit Shared Memory auf 16384 gedeckelt
+  schlägt die box-Szene sauber fehl, statt abzustürzen.
+- Der C++-SPIR-V-Leser stimmt auf allen 911 Einstiegspunkten mit `check_push_block.py` und
+  `check_groupshared.py` überein.
+
+**Weitere Härtung aus der Gegenprüfung:**
+- Nach jedem fehlgeschlagenen Create wird das laut Spezifikation undefinierte Ausgabe-Handle auf null
+  gesetzt.
+- Upload, Download, Copy und Fill sowie die Shim-memcpy lehnen Bereiche hinter dem Puffer ab.
+- Ein fehlgeschlagener Pipeline-Cache ist nicht mehr fatal.
+- Das DX12-Backend erhielt die entsprechenden Prüfungen. Es wird unter Linux nicht gebaut und ist nur
+  auf Syntax geprüft.
+
+**Werkzeuge:**
+- `tools/run_validation.sh` mit `validation_waivers.txt` und `vvl_triage.py`. Es schlägt bei jeder
+  nicht freigestellten Meldung fehl, ebenso bei Device-Ablehnungen außerhalb der absichtlich
+  provozierenden Suites und bei Allokations-Höchstständen über dem Limit.
+- ctests: `gpuslang.validationSubset` (wird ohne Layer übersprungen) und `gpuslang.vvlTriage`.
+
+**Tests:** `testPipelineRefusal`. Ein Vulkan-Interposer lässt jedes Create der Reihe nach scheitern
+(schreibt Datenmüll ins Ausgabe-Handle und zählt jedes Zerstören davon). Abgedeckt sind kaputte
+Module und Einstiegspunkte, jedes Limit samt Hook, die Grid-Ablehnung, Bereichsprüfungen und die
+aufgefüllten Push-Daten.
+
+**Sweeps:** Device-Host-Mutanten in Modus 0: 98 von 103 getötet, 3 Testlücken danach geschlossen;
+Modus 1: 44 von 46 getötet. Die 2 Überlebenden sind äquivalent (der Texture-Ablehnungspfad liest den
+Staging-Ausgang nie). Shim: 7/7 getötet. Bei den Shadern ist gegenüber HEAD nur `npSdfFind.spv`
+geändert (die Pads); `p98PushPad.spv` ist neu und nur für Tests.
+
+**Ergebnis unter der Schicht:** Suite 889/889 in beiden Modi, 0 nicht freigestellte Meldungen, die
+F3-Zahl unverändert. 21 repräsentative Szenen sind bitgleich zu HEAD.
+
+**Offen:** `createPipelineEx` lehnt eine nicht unterstützte Subgroup-Größe weiterhin stillschweigend ab
+(schon vor P9.98 so).
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle grün. **Suite:** 889/889 in beiden Speichermodi.
+**Szenen:** 80/80.
 
 ## P9.97c — Härtung: Partikel-Klemmen, Sampler-Binding entfernt, Sweep-Timeouts aus der Baseline; P9.97 abgeschlossen
 
