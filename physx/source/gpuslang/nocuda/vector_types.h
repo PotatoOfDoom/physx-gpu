@@ -43,7 +43,10 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define PXG_VT_ALIGN(n) __attribute__((aligned(n)))
 #elif defined(_MSC_VER)
-#define PXG_VT_ALIGN(n) __declspec(align(n))
+// alignas, not __declspec(align(n)): MSVC's align() takes integer literals only,
+// and long2/ulong2 below spell their alignment as 2 * sizeof(long int) -- 8 on
+// Windows (LLP64), as in the toolkit, and 16 on LP64 Linux.
+#define PXG_VT_ALIGN(n) alignas(n)
 #else
 #define PXG_VT_ALIGN(n)
 #endif

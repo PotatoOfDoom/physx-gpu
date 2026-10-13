@@ -62,6 +62,7 @@
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
 #include "PxgSlangEnv.h"              // gpuslang/include: pxgDeviceV2FromEnv (shared with gpuslang-tests)
 #include "PxgSlangKernelManifest.h"   // gpuslang/include: generated enum-indexed registry manifest
+#include "PxgModulePath.h"            // bridge: module directory + UTF-8 file/env helpers
 #include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
 #include "PxgKernelWrangler.h"        // gpucommon: the REAL PxgCudaKernelWranglerManager (reused)
 
@@ -82,7 +83,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -94,26 +94,31 @@ namespace gpuslang
 namespace
 {
 
-// SPIR-V blob loader: resolves a manifest spirvFile name against $PXG_SHADER_DIR
-// (the same convention the harness uses), falling back to the bare name.  Used
-// lazily by the shim when a pipeline is first launched.
-// Warn (loudly, once) when a MAPPED kernel's SPIR-V blob cannot be loaded.  An
-// empty blob silently produces an empty VkShaderModule, whose vkCreateComputePipelines
-// fails VK_ERROR_UNKNOWN; because PXG_VK_CHECK's assert compiles out under NDEBUG the
-// shim then binds a NULL VkPipeline, which crashes the driver at submit time
-// (lavapipe: null deref in handle_pipeline) — a failure mode that reads like an
-// environment/driver fault but is really just a missing $PXG_SHADER_DIR.  This diagnostic
-// makes the real cause unmissable.  (See RUNTIME_STATUS.md P7.0 environment note.)
-inline void warnMissingSpirv(const std::string& path)
+// SPIR-V blob loader, used lazily by the shim when a pipeline is first launched.
+// A manifest spirvFile name is resolved against, in order:
+//   1. $PXG_SHADER_DIR/<file>                 -- when set and non-empty, ONLY there (development
+//                                                and test builds point it at their
+//                                                own shader directory);
+//   2. <dir of this module>/PhysXGpuShaders/<file> -- the layout the SDK build
+//                                                produces and installs;
+//   3. <file> relative to the working directory (legacy).
+// Warn (loudly, once per blob) when a MAPPED kernel's SPIR-V blob cannot be loaded.
+// An empty blob silently produces an empty VkShaderModule, whose
+// vkCreateComputePipelines fails, and a launch on that kernel then has no pipeline
+// -- a failure mode that reads like an environment/driver fault but is really just
+// a missing shader directory.  This diagnostic makes the real cause unmissable.
+// (See RUNTIME_STATUS.md P7.0 environment note.)
+void warnMissingSpirv(const char* file, const std::vector<std::string>& tried)
 {
-    const char* dir = std::getenv("PXG_SHADER_DIR");
-    fprintf(stderr,
-            "[gpuslang/bridge] FATAL-ish: SPIR-V blob '%s' is missing or empty. "
-            "The engine will bind a NULL compute pipeline and the GPU driver will crash. "
-            "Set PXG_SHADER_DIR to the compiled-shader directory "
-            "(e.g. <build-gpuslang>/shaders). PXG_SHADER_DIR is currently %s%s%s.\n",
-            path.c_str(),
-            dir ? "'" : "UNSET", dir ? dir : "", dir ? "'" : "");
+    std::string list;
+    for (const std::string& p : tried)
+        list += "\n    " + p;
+    std::fprintf(stderr,
+                 "[gpuslang/bridge] FATAL-ish: SPIR-V blob '%s' is missing or empty. "
+                 "The kernels in it cannot run. Looked in:%s\n"
+                 "  Ship PhysXGpuShaders/ next to the PhysXGpu library, or set PXG_SHADER_DIR to the "
+                 "compiled-shader directory (e.g. <build-gpuslang>/shaders).\n",
+                 file, list.c_str());
 }
 
 std::vector<uint8_t> envSpirvLoader(const char* file)
@@ -121,28 +126,23 @@ std::vector<uint8_t> envSpirvLoader(const char* file)
     std::vector<uint8_t> blob;
     if (!file)
         return blob;
-    const char* dir = std::getenv("PXG_SHADER_DIR");
-    const std::string path = dir ? (std::string(dir) + "/" + file) : std::string(file);
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f)
+    std::vector<std::string> candidates;
+    std::string dir;
+    if (pxgGetEnv("PXG_SHADER_DIR", dir) && !dir.empty()) // set-but-empty counts as unset
+        candidates.push_back(dir + "/" + file);
+    else
     {
-        warnMissingSpirv(path);
-        return blob;
+        const std::string moduleDir = pxgModuleDirectory();
+        if (!moduleDir.empty())
+            candidates.push_back(moduleDir + "PhysXGpuShaders/" + file);
+        candidates.push_back(file);
     }
-    const std::streamsize n = f.tellg();
-    if (n <= 0)
+    for (const std::string& path : candidates)
     {
-        warnMissingSpirv(path);
-        return blob;
+        if (pxgReadFile(path, blob))
+            return blob;
     }
-    f.seekg(0);
-    blob.resize(size_t(n));
-    f.read(reinterpret_cast<char*>(blob.data()), n);
-    if (!f)
-    {
-        blob.clear();
-        warnMissingSpirv(path);
-    }
+    warnMissingSpirv(file, candidates);
     return blob;
 }
 
@@ -428,15 +428,22 @@ physx::PxPhysXGpu* PxCreatePhysXGpu()
     return &physx::gpuslang::PhysXGpuVulkan::getInstance();
 }
 
-physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& /*foundation*/,
+physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& foundation,
                                                         const physx::PxCudaContextManagerDesc& /*desc*/,
-                                                        physx::PxProfilerCallback* /*profilerCallback*/,
+                                                        physx::PxProfilerCallback* profilerCallback,
                                                         bool /*launchSynchronous*/)
 {
-    // The bridge manager reports errors through its own result codes, so the
-    // foundation/profiler globals the CUDA lib sets for its static-lib config
-    // are not needed here; desc.deviceOrdinal maps onto the (single) Vulkan
-    // device selected at runtime creation.
+    // As the CUDA module does (physxgpu/src/PxgPhysXGpu.cpp): a PhysXGpu built as
+    // its own shared library carries its OWN foundation globals, which stay null
+    // until the application's foundation is handed over -- and the first PX_NEW /
+    // PxGetFoundation() inside the module (the memory managers, the subsystem
+    // factories) would then dereference null.  With a static SDK on Linux and on
+    // every Windows build there is no symbol interposition to paper over that.
+    PxSetFoundationInstance(foundation);
+    PxSetProfilerCallback(profilerCallback);
+
+    // desc.deviceOrdinal maps onto the (single) Vulkan device selected at runtime
+    // creation.
     physx::gpuslang::VulkanGpuRuntime* r = physx::gpuslang::ensureRuntime();
     if (!r)
         return NULL;
@@ -444,12 +451,14 @@ physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& /*f
                                                               uint32_t(r->manifest.size()));
 }
 
-void PxSetPhysXGpuProfilerCallback(physx::PxProfilerCallback* /*profilerCallback*/)
+void PxSetPhysXGpuProfilerCallback(physx::PxProfilerCallback* profilerCallback)
 {
+    PxSetProfilerCallback(profilerCallback);
 }
 
-void PxSetPhysXGpuFoundationInstance(physx::PxFoundation& /*foundation*/)
+void PxSetPhysXGpuFoundationInstance(physx::PxFoundation& foundation)
 {
+    PxSetFoundationInstance(foundation);
 }
 
 int PxGetSuggestedCudaDeviceOrdinal(physx::PxErrorCallback& /*errc*/)

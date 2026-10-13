@@ -31,7 +31,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
@@ -52,6 +54,40 @@ void pxgSetVulkanDriverShim(PxgCudaShim* shim);
 
 namespace
 {
+// The live PxgVulkanCudaContexts.  pxgUnmappedLaunchCount takes any PxCudaContext
+// and must tell ours apart without RTTI: PhysX builds with -fno-rtti / /GR-, so a
+// dynamic_cast does not compile there.
+// Both are leaked on purpose (like the bridge runtime): a context released from an
+// application's static destructor must not find them already destroyed.
+std::mutex& liveContextMutex()
+{
+    static std::mutex* m = new std::mutex;
+    return *m;
+}
+
+std::vector<const physx::PxCudaContext*>& liveContexts()
+{
+    static std::vector<const physx::PxCudaContext*>* v = new std::vector<const physx::PxCudaContext*>;
+    return *v;
+}
+
+void registerLiveContext(const physx::PxCudaContext* ctx, bool live)
+{
+    std::lock_guard<std::mutex> lock(liveContextMutex());
+    std::vector<const physx::PxCudaContext*>& v = liveContexts();
+    if (live)
+        v.push_back(ctx);
+    else
+        v.erase(std::remove(v.begin(), v.end(), ctx), v.end());
+}
+
+bool isLiveContext(const physx::PxCudaContext* ctx)
+{
+    std::lock_guard<std::mutex> lock(liveContextMutex());
+    const std::vector<const physx::PxCudaContext*>& v = liveContexts();
+    return std::find(v.begin(), v.end(), ctx) != v.end();
+}
+
 // ---- handle <-> shim id encodings (see header) ----
 inline CUstream toStream(PxgStreamId id) { return reinterpret_cast<CUstream>(uintptr_t(id)); }
 inline PxgStreamId fromStream(CUstream s) { return PxgStreamId(reinterpret_cast<uintptr_t>(s)); }
@@ -147,11 +183,13 @@ public:
         // entry points (bridge/PxgVulkanDriverShim.cpp) route memcpys through us.
         pxgSetVulkanDriverContext(this);
         pxgSetVulkanDriverShim(shim);
+        registerLiveContext(this, true);
     }
 
     void release() override
     {
         reportUnmappedLaunches();
+        registerLiveContext(this, false);
         pxgSetVulkanDriverContext(nullptr); pxgSetVulkanDriverShim(nullptr); delete this;
     }
 
@@ -928,8 +966,9 @@ physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDe
 // P9.40 -- see the header.
 uint32_t pxgUnmappedLaunchCount(const physx::PxCudaContext* ctx, uint32_t kernelId)
 {
-    const PxgVulkanCudaContext* c = dynamic_cast<const PxgVulkanCudaContext*>(ctx);
-    return c ? c->unmappedLaunchCount(kernelId) : 0u;
+    if (!ctx || !isLiveContext(ctx))
+        return 0u;
+    return static_cast<const PxgVulkanCudaContext*>(ctx)->unmappedLaunchCount(kernelId);
 }
 
 CUfunction PxgVulkanKernelWrangler::getFunction(uint32_t kernelId) const

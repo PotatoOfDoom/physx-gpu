@@ -33,13 +33,24 @@
 // (on the include path only for the no-toolkit targets) expands them to nothing —
 // exactly what the toolkit's own host_defines.h does when __CUDACC__ is undefined.
 // Only the qualifiers that are NOT native compiler keywords are defined here; the
-// gcc/clang keywords __inline__ / __restrict__ are deliberately left untouched.
+// gcc/clang keywords __inline__ / __restrict__ are deliberately left untouched --
+// except under MSVC, which has neither (cutil_math.h uses `static __inline__`),
+// where they map to its own spellings exactly as the toolkit's header does.
 
 #ifndef PXG_NOCUDA_HOST_DEFINES_H
 #define PXG_NOCUDA_HOST_DEFINES_H
 
 #ifndef __location__
 #define __location__(...)
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#ifndef __inline__
+#define __inline__ __inline
+#endif
+#ifndef __restrict__
+#define __restrict__ __restrict
+#endif
 #endif
 
 #ifndef __device__
@@ -73,7 +84,7 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define __align__(n) __attribute__((aligned(n)))
 #elif defined(_MSC_VER)
-#define __align__(n) __declspec(align(n))
+#define __align__(n) alignas(n) // not __declspec(align(n)): that takes integer literals only
 #else
 #define __align__(n)
 #endif

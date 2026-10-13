@@ -154,6 +154,9 @@ class CMakePreset:
             self.cmakeParams.append(cmParam)
     pass
 
+    def isVulkanGpuBackend(self):
+        return '-DPX_GPU_BACKEND=VULKAN' in self.cmakeSwitches
+
     def isMultiConfigPlatform(self):
         if self.targetPlatform == 'linux':
             return False
@@ -196,16 +199,26 @@ class CMakePreset:
             
         # Determine if we need to add CUDA paths
         gpuEnabled = gpuProjectsEnabled or gpuProjectsOnlyEnabled
+        # PX_GPU_BACKEND=VULKAN builds PhysXGpu from the Slang/SPIR-V port: no CUDA toolkit
+        vulkanBackend = self.isVulkanGpuBackend()
         
         # Log GPU status
         print(f"GPU projects enabled: {gpuEnabled} ({GPU_PROJECTS_SWITCH}={gpuProjectsEnabled}, {GPU_PROJECTS_ONLY_SWITCH}={gpuProjectsOnlyEnabled})")
+        if gpuEnabled:
+            print('GPU backend: ' + ('VULKAN' if vulkanBackend else 'CUDA'))
                 
         # Second pass: Add all switches to output
         for cmakeSwitch in self.cmakeSwitches:
             outString = outString + ' ' + cmakeSwitch
+
+        # The Vulkan build post-processes its SPIR-V with Python scripts: use the
+        # interpreter packman provides (generate_projects.bat runs it) when there is one.
+        if gpuEnabled and vulkanBackend and os.environ.get('PM_PYTHON') is not None:
+            outString = outString + ' -DPython3_EXECUTABLE=\"' + \
+                os.environ['PM_PYTHON'].replace('\\', '/') + '\"'
             
         # Only add CUDA paths if GPU is enabled
-        if gpuEnabled:
+        if gpuEnabled and not vulkanBackend:
             if os.environ.get('PM_CUDA_PATH') is not None:
                 if os.environ.get('PM_CUDA_PATH') is not None:
                     outString = outString + ' -DCUDAToolkit_ROOT_DIR=' + \
@@ -388,6 +401,7 @@ def presetProvided(pName, physx_root_dir):
         cmakeMasterDir = 'internal'
     else:
         cmakeMasterDir = 'public'
+    failedConfigs = []
     if parsedPreset.isMultiConfigPlatform():
         # cleanup and create output directory
         outputDir = os.path.join(physx_root_dir, 'compiler', parsedPreset.presetName)
@@ -396,8 +410,9 @@ def presetProvided(pName, physx_root_dir):
         # run the cmake script
         #print('Cmake params:' + cmakeParams)
         os.chdir(outputDir)
-        os.system(cmakeExec + ' \"' +
-                  physx_root_dir + '/compiler/' + cmakeMasterDir + '\"' + cmakeParams)
+        if os.system(cmakeExec + ' \"' +
+                     physx_root_dir + '/compiler/' + cmakeMasterDir + '\"' + cmakeParams) != 0:
+            failedConfigs.append(parsedPreset.presetName)
         os.chdir(physx_root_dir)
     else:
         configs = ['debug', 'checked', 'profile', 'release']
@@ -410,9 +425,13 @@ def presetProvided(pName, physx_root_dir):
             #print('Cmake params:' + cmakeParams)
             os.chdir(outputDir)
             # print(cmakeExec + ' \"' + physx_root_dir + '/compiler/' + cmakeMasterDir + '\"' + cmakeParams + ' -DCMAKE_BUILD_TYPE=' + config)
-            os.system(cmakeExec + ' \"' + physx_root_dir + '/compiler/' +
-                      cmakeMasterDir + '\"' + cmakeParams + ' -DCMAKE_BUILD_TYPE=' + config)
+            if os.system(cmakeExec + ' \"' + physx_root_dir + '/compiler/' +
+                         cmakeMasterDir + '\"' + cmakeParams + ' -DCMAKE_BUILD_TYPE=' + config) != 0:
+                failedConfigs.append(parsedPreset.presetName + '-' + config)
             os.chdir(physx_root_dir)
+    if failedConfigs:
+        print('CMake failed for: ' + ', '.join(failedConfigs))
+        exit(1)
     pass
 
 

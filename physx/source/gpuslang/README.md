@@ -15,8 +15,10 @@ wired** (P9.95 complete). The full GPU pipeline steps real scenes over Vulkan,
 and the suite and scene harness are green. Development and verification have
 happened **only on Linux with Mesa llvmpipe** (software Vulkan). The port has
 never run on real GPU hardware. The D3D12 backend has never been built or
-executed. Applications cannot use the port yet, because no standalone PhysXGpu
-library is packaged (see [Known limitations](#known-limitations)).
+executed. The SDK's own build scripts produce the port as a standalone
+`PhysXGpu` module with no CUDA toolkit (`PX_GPU_BACKEND=VULKAN` presets, see
+[The SDK build](#the-sdk-build-px_gpu_backendvulkan)); its Windows build has
+never been compiled with MSVC.
 
 Status documents:
 
@@ -46,6 +48,9 @@ gpuslang/
 ├── bridge/                         the engine hook: PxPhysXGpu C-ABI factory (PhysXGpuVulkan.cpp),
 │                                   PxCudaContext/Manager over the shim, kernel table + launch ABI rows
 │                                   (PxgVulkanKernelAbi.cpp), driver/kernel-init shims, memory manager
+├── cmake/                          shared by the SDK build (source/compiler/cmakegpuvulkan), tests and sdktest:
+│                                   PxgShaders (slangc + post-processing), PxgShaderList (every shader),
+│                                   PxgEngineShaders (the manifest's subset), PxgVulkanGpuSources (module sources)
 ├── nocuda/                         CUDA header stand-ins so the gpu* host code compiles without a toolkit
 ├── shaders/                        555 .slang files: pxgSlang* shared modules (79), the *Bda.slang engine
 │                                   kernels (buffer-device-address ABI), Phase-1 cores and fixture shaders
@@ -322,6 +327,66 @@ Notes:
 - `tools/lvprepro/` is a standalone Vulkan harness for deciding whether a fault
   is in a shader or in llvmpipe.
 
+### The SDK build (`PX_GPU_BACKEND=VULKAN`)
+
+The official scripts build the port as the SDK's GPU module, with no CUDA
+toolkit, through four presets: `linux-gcc-vulkan`, `linux-clang-vulkan`,
+`vc17win64-vulkan` and `vc18win64-vulkan`.
+
+```bash
+cd physx
+./generate_projects.sh linux-gcc-vulkan          # Windows: generate_projects.bat vc18win64-vulkan
+cmake --build compiler/linux-gcc-vulkan-release -j
+# -> bin/linux.x86_64/release/libPhysXGpu_64.so + bin/linux.x86_64/release/PhysXGpuShaders/*.spv
+```
+
+- `compiler/public/CMakeLists.txt` takes the switch `PX_GPU_BACKEND`
+  (`CUDA` by default, or `VULKAN`). With `VULKAN` and the GPU projects on, it
+  neither enables the CUDA language nor looks for the toolkit. It adds
+  `source/compiler/cmakegpuvulkan` instead of `source/compiler/cmakegpu`, which
+  stays untouched. The snippet render library then skips its CUDA–GL interop.
+- `cmakegpuvulkan` builds **one** shared `PhysXGpu` with the name, output
+  directory, flags and CRT of the CUDA module. It compiles:
+  - the gpu* host modules;
+  - the bridge and the Vulkan device (`cmake/PxgVulkanGpuSources.cmake`, which
+    `sdktest` uses as well);
+  - the PhysX dependency sources the CUDA module also compiles into itself (read
+    from `cmakegpu/PhysXGpuDependencies.cmake`).
+- On Linux the module links with `-Wl,--no-undefined`, so a missing symbol fails
+  at link time as it would under MSVC.
+- It compiles the 178 shader files the kernel manifest maps
+  (`cmake/PxgEngineShaders.cmake`) into `PhysXGpuShaders/` next to the library.
+  It uses the same `pxg_compile_shader` calls as the suite: `cmake/PxgShaderList.cmake`
+  is the one list, and the configure step fails if the manifest names a file or
+  entry the list does not export.
+- The bridge looks for each `.spv` in this order:
+  1. `$PXG_SHADER_DIR` when it is set;
+  2. `PhysXGpuShaders/` next to the module;
+  3. the working directory.
+- `PxCreateCudaContextManager` and `PxSetPhysXGpuFoundationInstance` hand the
+  application's foundation to the module, as the CUDA module does. Without that, a
+  separately loaded module dereferences a null foundation: on Windows always, and
+  on Linux with the static SDK libraries.
+- The Linux loader (`PxPhysXGpuModuleLoader.cpp`) still loads `libcuda.so.1` first
+  when it exists, but no longer refuses to load the GPU module without it.
+- `PxGetPhysicsGpu()` is NULL (see below), so the skinning and isosurface snippets
+  are not generated with this backend.
+- `PX_GENERATE_GPU_STATIC_LIBRARIES` and `PX_USE_NVTX` stop the configure step
+  with a message.
+- slangc is searched for on `PATH`, in `$SLANG_DIR(/bin)` and in
+  `$VULKAN_SDK/Bin|bin`, or given with `-DPXG_SLANGC`. A version other than
+  2026.14.1 configures with a warning.
+- Windows: MSVC has never compiled this. `tools/check_msvc_portability.py` (ctest
+  `gpuslang.msvcPortability`) scans the module's sources for the failure classes
+  gcc and clang let through:
+  - RTTI under `/GR-`;
+  - GNU attributes, builtins and keywords;
+  - unguarded POSIX code;
+  - a raw `<windows.h>`;
+  - a non-literal `__declspec(align())`.
+
+  It is a guard, not a compiler; a real Visual Studio build is still owed.
+
 ## Known limitations
 
 - **Linux + llvmpipe only.** Everything above was developed and measured on Mesa
@@ -345,10 +410,11 @@ Notes:
     unmeasured.
   - Atomic accumulation order: a few cloth/softbody scenes vary in the 5th
     decimal from run to run on llvmpipe, within scene tolerances.
-- **No application-facing drop-in yet.** The engine is hooked in by the
-  `sdktest` build: the bridge's `PxPhysXGpu` factory is linked statically and
-  replaces the CUDA `PhysXGpu` module. A packaged PhysXGpu shared library that
-  an unmodified application can load is not built yet. The PhysicsGpu factory
+- **The Windows module has never been built.** The `vc17win64-vulkan` /
+  `vc18win64-vulkan` presets exist and the MSVC-specific failure classes are
+  checked from Linux, but no Visual Studio build has run. The scene harness and
+  the suite exercise the bridge linked statically (`sdktest`); the shared module
+  the SDK build produces is what an unmodified application loads. The PhysicsGpu factory
   (SDF builder, isosurface, sparse grid, array converter, skinning;
   `PxGetPhysicsGpu()`) is not compiled, so those app-facing utilities are
   unavailable (see Coverage).

@@ -38,6 +38,7 @@
 #include "windows/CmWindowsModuleUpdateLoader.h"
 #elif PX_LINUX
 #include <dlfcn.h>
+#include "foundation/PxString.h"
 #endif // ~PX_LINUX
 
 #include "stdio.h"
@@ -189,21 +190,22 @@ namespace physx
 	{
 		static void* s_library = NULL;
 
+		// The libcuda.so.1 load error, kept for the report below (dlerror() is overwritten by the next dl call).
+		char libCudaError[512] = { 0 };
+
 		if (s_library == NULL)
 		{
 			// load libcuda.so.1 here since gcc configured with --as-needed won't link to it
 			// if there is no call from the binary to it.
+			// A PhysXGpu built without CUDA (PX_GPU_BACKEND=VULKAN) does not need it, so a
+			// missing libcuda is only reported when the GPU module itself then fails to load.
 			void* hLibCuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-			if (hLibCuda)
+			if (!hLibCuda)
 			{
-				s_library = dlopen(gPhysXGpuLibraryName, RTLD_NOW);
+				const char* error = dlerror();
+				Pxsnprintf(libCudaError, sizeof(libCudaError), "%s", error ? error : "unknown error");
 			}
-			else
-			{
-				char* error = dlerror();
-				reportError(PX_FL, "Could not load libcuda.so.1: %s\n", error);
-				return;
-			}	
+			s_library = dlopen(gPhysXGpuLibraryName, RTLD_NOW);
 		}
 
 		// no UpdateLoader
@@ -227,7 +229,10 @@ namespace physx
 		if (s_library == NULL)
 		{
 			char* error = dlerror();
-			reportError(PX_FL, "Failed to load %s!: %s\n", gPhysXGpuLibraryName, error);
+			if (libCudaError[0])
+				reportError(PX_FL, "Failed to load %s!: %s (and could not load libcuda.so.1: %s)\n", gPhysXGpuLibraryName, error, libCudaError);
+			else
+				reportError(PX_FL, "Failed to load %s!: %s\n", gPhysXGpuLibraryName, error);
 			return;
 		}
 		if (g_PxCreatePhysXGpu_Func == NULL || g_PxCreateCudaContextManager_Func == NULL || g_PxGetSuggestedCudaDeviceOrdinal_Func == NULL)

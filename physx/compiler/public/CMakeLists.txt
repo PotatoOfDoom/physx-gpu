@@ -47,7 +47,29 @@ IF(NOT CMAKE_CROSSCOMPILING AND (TARGET_BUILD_PLATFORM STREQUAL "windows" OR TAR
 	OPTION(PX_GENERATE_GPU_PROJECTS "Generate the GPU projects, if possible." OFF)
 	OPTION(PX_GENERATE_GPU_PROJECTS_ONLY "Generate ONLY the GPU projects, if possible." OFF)
 
-	IF(PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY)
+	# How PhysXGpu is built when the GPU projects are on:
+	#   CUDA   - the CUDA kernels, with nvcc (needs the CUDA toolkit)
+	#   VULKAN - the Slang/SPIR-V port of the kernels over Vulkan compute
+	#            (source/gpuslang; needs the Vulkan SDK and slangc, no CUDA)
+	SET(PX_GPU_BACKEND "CUDA" CACHE STRING "GPU backend for PhysXGpu: CUDA or VULKAN")
+	SET_PROPERTY(CACHE PX_GPU_BACKEND PROPERTY STRINGS CUDA VULKAN)
+	STRING(TOUPPER "${PX_GPU_BACKEND}" PX_GPU_BACKEND)
+	IF(NOT PX_GPU_BACKEND STREQUAL "CUDA" AND NOT PX_GPU_BACKEND STREQUAL "VULKAN")
+		MESSAGE(FATAL_ERROR "PX_GPU_BACKEND must be CUDA or VULKAN, not '${PX_GPU_BACKEND}'.")
+	ENDIF()
+
+	IF((PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY) AND PX_GPU_BACKEND STREQUAL "VULKAN")
+		# The Vulkan PhysXGpu is one shared module that compiles its own copy of the
+		# foundation; a static PhysXGpu would collide with the core's PxGpu.cpp.
+		IF(PX_GENERATE_GPU_STATIC_LIBRARIES)
+			MESSAGE(FATAL_ERROR "PX_GPU_BACKEND=VULKAN builds PhysXGpu as a shared library only; set PX_GENERATE_GPU_STATIC_LIBRARIES=OFF.")
+		ENDIF()
+		# NVTX comes from the CUDA toolkit.
+		IF(PX_USE_NVTX)
+			MESSAGE(FATAL_ERROR "PX_USE_NVTX needs the CUDA toolkit and is not available with PX_GPU_BACKEND=VULKAN.")
+		ENDIF()
+		MESSAGE(STATUS "PhysXGpu backend: VULKAN (Slang/SPIR-V, no CUDA toolkit)")
+	ELSEIF(PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY)
 		# Will enable building CUDA files ( .cu )
 		ENABLE_LANGUAGE(CUDA)
 		# The FIND_PACKAGE(CUDAToolkit) makes it easier if you have CUDA language enabled to link to
@@ -87,7 +109,11 @@ MESSAGE("Added PhysX")
 
 IF(PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY)
 	# Add PhysX SDK Gpu Source code to solution
-	ADD_SUBDIRECTORY(${PHYSX_ROOT_DIR}/source/compiler/cmakegpu ${CMAKE_CURRENT_BINARY_DIR}/sdk_gpu_source_bin)
+	IF(PX_GPU_BACKEND STREQUAL "VULKAN")
+		ADD_SUBDIRECTORY(${PHYSX_ROOT_DIR}/source/compiler/cmakegpuvulkan ${CMAKE_CURRENT_BINARY_DIR}/sdk_gpu_source_bin)
+	ELSE()
+		ADD_SUBDIRECTORY(${PHYSX_ROOT_DIR}/source/compiler/cmakegpu ${CMAKE_CURRENT_BINARY_DIR}/sdk_gpu_source_bin)
+	ENDIF()
 	MESSAGE("Added PhysX GPU")
 ENDIF()
 

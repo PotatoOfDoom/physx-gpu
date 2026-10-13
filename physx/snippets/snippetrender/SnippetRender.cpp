@@ -28,7 +28,11 @@
 
 #include "foundation/PxPreprocessor.h"
 
+// The build defines USE_CUDA_INTEROP=0 for a GPU backend without a CUDA driver
+// (PX_GPU_BACKEND=VULKAN); the buffers are then copied through PxCudaContext.
+#ifndef USE_CUDA_INTEROP
 #define USE_CUDA_INTEROP (PX_SUPPORT_GPU_PHYSX)
+#endif
 
 #if (PX_SUPPORT_GPU_PHYSX && USE_CUDA_INTEROP)
 #if PX_LINUX && PX_CLANG

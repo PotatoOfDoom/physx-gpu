@@ -83,6 +83,11 @@ SET(GPU_SNIPPET_LIST
 #TODO, create a propper define for whether GPU features are enabled or not!
 IF (PX_GENERATE_GPU_PROJECTS AND 
     (NOT (CMAKE_CROSSCOMPILING OR CMAKE_GENERATOR_PLATFORM STREQUAL "NX64")))
+    IF(PX_GPU_BACKEND STREQUAL "VULKAN")
+	# The Slang/Vulkan PhysXGpu has no PxPhysicsGpu (PxGetPhysicsGpu() returns NULL),
+	# which the skinning and isosurface snippets need.
+	LIST(REMOVE_ITEM GPU_SNIPPET_LIST DeformableSurfaceSkinning DeformableVolumeSkinning Isosurface)
+    ENDIF()
     LIST(APPEND SNIPPETS_LIST ${GPU_SNIPPET_LIST})
 ENDIF()
 	
