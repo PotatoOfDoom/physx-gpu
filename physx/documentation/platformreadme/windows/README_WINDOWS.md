@@ -13,7 +13,9 @@
 * NVIDIA CUDA Toolkit 12.8 (Not required for CPU only builds)
 
 Compilers and C++ Standard:
-  * Microsoft Visual Studio 2017, 2019, 2022 (64 bit)
+  * Microsoft Visual Studio 2017, 2019, 2022, 2026 (64 bit)
+  * Visual Studio 2026 uses the `vc18win64` / `vc18win64-cpu-only` presets and needs CMake 4.2 or newer
+    (the "Visual Studio 18 2026" generator); the generation script stops with a message on an older CMake.
   * Tested with C++14 standard
 
 ## PhysX GPU Acceleration:

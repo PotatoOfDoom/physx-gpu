@@ -210,7 +210,7 @@ class CMakePreset:
                 if os.environ.get('PM_CUDA_PATH') is not None:
                     outString = outString + ' -DCUDAToolkit_ROOT_DIR=' + \
                             os.environ['PM_CUDA_PATH']
-                    if self.compiler in ['vc15', 'vc16', 'vc17'] and self.generator != 'ninja':
+                    if self.compiler in ['vc15', 'vc16', 'vc17', 'vc18'] and self.generator != 'ninja':
                         outString = outString + ' -T cuda=' + os.environ['PM_CUDA_PATH']
                     # TODO: Need to do the same for gcc (aarch64) when we package it with Packman
                     elif self.compiler == 'clang':
@@ -233,7 +233,8 @@ class CMakePreset:
         vs_versions = {
             'vc15': '\"Visual Studio 15 2017\"',
             'vc16': '\"Visual Studio 16 2019\"',
-            'vc17': '\"Visual Studio 17 2022\"'
+            'vc17': '\"Visual Studio 17 2022\"',
+            'vc18': '\"Visual Studio 18 2026\"'
         }
 
         # Visual studio
@@ -338,6 +339,32 @@ def cleanupCompilerDir(compilerDirName):
     if os.path.exists(compilerDirName) == False:
         os.makedirs(compilerDirName)
 
+# Minimum CMake version per Visual Studio generator; the "Visual Studio 18 2026"
+# generator was added in CMake 4.2.
+VS_GENERATOR_MIN_CMAKE = {
+    'vc18': (4, 2),
+}
+
+def checkCMakeSupportsPreset(cmakeExec, parsedPreset):
+    required = VS_GENERATOR_MIN_CMAKE.get(parsedPreset.compiler)
+    if required is None or parsedPreset.generator == 'ninja':
+        return
+    try:
+        out = subprocess.check_output([cmakeExec.strip('"'), '--version'], universal_newlines=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print('Could not run ' + cmakeExec + ' --version: ' + str(e))
+        exit(1)
+    first = out.splitlines()[0] if out else ''
+    try:
+        version = tuple(int(x) for x in first.split()[-1].split('-')[0].split('.')[:2])
+    except ValueError:
+        print('Could not parse the CMake version from: ' + first)
+        exit(1)
+    if version < required:
+        print('Preset ' + parsedPreset.presetName + ' needs CMake ' + '.'.join(str(x) for x in required) +
+              ' or newer for its Visual Studio generator; found ' + first + '.')
+        exit(1)
+
 def presetProvided(pName, physx_root_dir):
     parsedPreset = CMakePreset(pName, physx_root_dir)
 
@@ -348,6 +375,7 @@ def presetProvided(pName, physx_root_dir):
     else:
         cmakeExec = 'cmake' + cmakeExt()
     print('Cmake: ' + cmakeExec)
+    checkCMakeSupportsPreset(cmakeExec, parsedPreset)
 
     # gather cmake parameters
     cmakeParams = parsedPreset.getPlatformCMakeParams()
