@@ -785,7 +785,7 @@ static void buildMeshBlob(MeshBlob& m, uint32_t nbNodes, V3 lo, V3 hi)
 }
 } // namespace p983tto
 
-PXG_TEST(triTriOverlapEngineAbi)
+PXG_TEST(npTriTriOverlap_engineAbi)
 {
     using namespace p983tto;
     PxgSlangComputeDevice* dev = testDevice();
@@ -1010,17 +1010,17 @@ PXG_TEST(triTriOverlapEngineAbi)
     // the mirror's own verdict is checked against the intent first.
     for (uint32_t i = 0; i < N; ++i)
         PXG_CHECK_MSG(bool(want[i]) == pdef[i].wantOverlap,
-                      "triTriOverlapEngineAbi: pair %u was meant to be %s and the CPU mirror says %s -- "
+                      "npTriTriOverlap_engineAbi: pair %u was meant to be %s and the CPU mirror says %s -- "
                       "the separation no longer produces the designed byte pattern",
                       i, pdef[i].wantOverlap ? "overlapping" : "distant", want[i] ? "overlapping" : "distant");
     for (uint32_t i = 0; i < N; ++i)
         PXG_CHECK_MSG(!pdef[i].wantClose || gotRet[i] == GJK_CLOSE,
-                      "triTriOverlapEngineAbi: pair %u is the CLOSE-band observable and the CPU mirror "
+                      "npTriTriOverlap_engineAbi: pair %u is the CLOSE-band observable and the CPU mirror "
                       "returned %u (0 distant, 1 close, 2 overlap) with lowerBound %.6f against minSep "
                       "%.6f -- without a CLOSE pair the != eDISTANT test is indistinguishable from "
                       "== eOVERLAP",
                       i, gotRet[i], double(gotLower[i]), double(gotMinSep[i]));
-    PXG_CHECK_MSG(nClose >= 1, "triTriOverlapEngineAbi: no pair reaches GJK_CLOSE");
+    PXG_CHECK_MSG(nClose >= 1, "npTriTriOverlap_engineAbi: no pair reaches GJK_CLOSE");
     // The cd-asymmetry pairs only measure anything while the gap sits STRICTLY
     // between the doubled small half and the true sum.  Outside that window both
     // spellings agree and the pair silently stops testing the sum.
@@ -1031,14 +1031,14 @@ PXG_TEST(triTriOverlapEngineAbi)
         const float sum = pdef[i].cd0 + pdef[i].cd1;
         if (!(small * 2.0f < sum * 0.5f)) continue;   // pair 5 is the CLOSE pair, not an asymmetry one
         PXG_CHECK_MSG(gotLower[i] > small * 2.0f && gotLower[i] < sum,
-                      "triTriOverlapEngineAbi: pair %u is a contact-distance asymmetry pair and its gap "
+                      "npTriTriOverlap_engineAbi: pair %u is a contact-distance asymmetry pair and its gap "
                       "%.6f is outside (%.6f, %.6f) -- a kernel reading only one half of the sum would "
                       "still get the same flag",
                       i, double(gotLower[i]), double(small * 2.0f), double(sum));
     }
-    PXG_CHECK_MSG(nMarginal == 0, "triTriOverlapEngineAbi: %zu pair(s) sit on the DISTANT boundary", nMarginal);
+    PXG_CHECK_MSG(nMarginal == 0, "npTriTriOverlap_engineAbi: %zu pair(s) sit on the DISTANT boundary", nMarginal);
     PXG_CHECK_MSG(nTrue >= 4 && nFalse >= 4,
-                  "triTriOverlapEngineAbi: coverage thin (%zu overlapping, %zu distant)", nTrue, nFalse);
+                  "npTriTriOverlap_engineAbi: coverage thin (%zu overlapping, %zu distant)", nTrue, nFalse);
 
     // ---- run ---------------------------------------------------------------
     // Sixteen bytes for eleven pairs: bytes 11..15 are the tail trap.  0xFF is
@@ -1095,13 +1095,13 @@ PXG_TEST(triTriOverlapEngineAbi)
                         got[i] == POISON_SLOT_LO ? "   (still the uploaded poison -- nothing was stored)" : "");
         }
     }
-    PXG_CHECK_MSG(mm == 0, "triTriOverlapEngineAbi: %zu overlap byte(s) wrong", mm);
+    PXG_CHECK_MSG(mm == 0, "npTriTriOverlap_engineAbi: %zu overlap byte(s) wrong", mm);
 
     size_t tail = 0;
     for (uint32_t b = N; b < 24; ++b)
         if (got[b] != POISON_SLOT_LO) { ++tail; std::printf("  tail byte %u: 0x%02x\n", b, got[b]); }
     PXG_CHECK_MSG(tail == 0,
-                  "triTriOverlapEngineAbi: %zu byte(s) past numWorkItems were overwritten -- "
+                  "npTriTriOverlap_engineAbi: %zu byte(s) past numWorkItems were overwritten -- "
                   "the store is not byte-scoped or the work guard is wrong", tail);
 
     for (PxgBufferHandle h : { bShapes, bXf, bCd, bCm, bOv, bCmOut }) dev->destroyBuffer(h);
