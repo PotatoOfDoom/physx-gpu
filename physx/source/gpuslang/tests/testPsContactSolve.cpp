@@ -343,6 +343,279 @@ PXG_TEST(psContactSolve_penetratingParticle)
 }
 
 // ===========================================================================
+// P9.99b -- TWO SYSTEMS in one contact list: prepare -> PGS solve -> accumulate.
+//
+// Every fixture above holds ONE contact of system 0, so `contact id >> 32` (prepare),
+// the constraint block's system id (solve) and the run head's system id (accumulate)
+// were only ever 0, and the P9.99b force-system-0 mutants of all three survived.
+// Here the sorted list interleaves systems 0 and 2 -- 8 contacts in 6 particle runs:
+//     #  sys pid  contact (normal (0,1,0), pen)
+//     0   0   0   -0.10   penetrating
+//     1   0   1   +0.05   separated, inside the adhesion radius
+//     2   0   3   -0.08   \ one run of two
+//     3   0   3   +0.03   /
+//     4   2   3   -0.12   \ system 2's first particle == system 0's last one, so a
+//     5   2   3   +0.04   / low-32-bit-only id would merge the runs
+//     6   2   4   +0.05
+//     7   2   6   -0.06
+// and the two systems differ in everything the three kernels read per system: the
+// inverse mass (1 / 0.5, read by prepare from the sorted positions and by the solve
+// from the sorted deltaP), the running delta (tangential, so friction is live), the
+// material through each system's own phase->material map (friction 0.05 / 0.3,
+// adhesion 0.3 / 0.5, radius scale 1.5 / 2.0) and mData.mRestOffset (0.25 / 0.15),
+// which the adhesion branch reads for the two separated contacts of each system.
+// Slot 1 of the pool is a decoy no contact names; its arrays must survive.
+// The static rigid keeps the prepare at velMultiplier = 1/invMass; every dot product
+// the oracle takes is exact (the delta is orthogonal to the normal), so the CPU
+// transcription is bit-exact.
+// ===========================================================================
+// The PGS core, solvePCOutputDeltaV (particlesystem.cu:1421; psContactSolveBda.slang),
+// transcribed in full -- friction, adhesion and the rest offset included -- for the
+// two-system twin below.  pmin/pmax are the PxMin/PxMax ternaries.
+struct P99V3 { float x, y, z; };
+static float p99Dot(P99V3 a, P99V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static P99V3 p99Cross(P99V3 a, P99V3 b) { return P99V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static float p99Min(float a, float b) { return (a < b) ? a : b; }
+static float p99Max(float a, float b) { return (a > b) ? a : b; }
+struct P99PgsOut { float deltaF, deltaFr0, deltaFr1; F2 appliedForce; };
+static P99PgsOut p99SolvePCOutputDeltaV(P99V3 normal, float error, P99V3 delta, P99V3 fric0, P99V3 fric1,
+                                        float tanVel0, float tanVel1, float normalVel, float velMultiplier,
+                                        float vmF0, float vmF1, float frictionCoefficient, float restOffset,
+                                        float adhesion, float adhesionRadiusScale, float dt, F2 appliedForce)
+{
+    const float separation = (error - p99Dot(normal, delta));
+    float clamp = -appliedForce.x;
+    if (adhesionRadiusScale > 0.0f && adhesion > 0.0f)
+    {
+        const float adhesionRadius = restOffset * adhesionRadiusScale - restOffset;
+        if (separation < adhesionRadiusScale)
+        {
+            const float q = 1.0f - separation / adhesionRadius;
+            clamp = p99Min(clamp, -p99Max(0.0f, adhesion * (q * q * q * q) * p99Max(0.0f, separation) * velMultiplier));
+        }
+    }
+    P99PgsOut r;
+    r.deltaF = p99Max(clamp, (-separation - normalVel * dt) * velMultiplier);
+    appliedForce.x = p99Max(0.0f, r.deltaF + appliedForce.x);
+    const float friction = appliedForce.x * frictionCoefficient;
+    const float biasedF0 = -(p99Dot(fric0, delta));
+    const float biasedF1 = -(p99Dot(fric1, delta));
+    const float requiredF0Force = (biasedF0 + tanVel0 * dt) * vmF0;
+    const float requiredF1Force = (biasedF1 + tanVel1 * dt) * vmF1;
+    const float requiredForce = std::sqrt(requiredF0Force * requiredF0Force + requiredF1Force * requiredF1Force);
+    const float recip = (requiredForce >= 1e-16f) ? (1.0f / requiredForce) : 0.0f;
+    const float ratio0 = requiredF0Force * recip;
+    const float ratio1 = requiredF1Force * recip;
+    const float deltaFr = p99Min(requiredForce + appliedForce.y, friction) - appliedForce.y;
+    appliedForce.y = appliedForce.y + deltaFr;
+    r.deltaFr0 = deltaFr * ratio0;
+    r.deltaFr1 = deltaFr * ratio1;
+    r.appliedForce = appliedForce;
+    return r;
+}
+
+struct P99Sys
+{
+    uint32_t n = 0;
+    float invMass = 0.f, restOffset = 0.f;
+    uint16_t mat = 0;
+    std::vector<F4> pos, deltaP, accum;
+    std::vector<uint32_t> phases, p2m;
+    PxgBufferHandle bPos = 0, bDeltaP = 0, bAccum = 0, bPhases = 0, bP2M = 0;
+};
+
+PXG_TEST(psContactSolve_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f, relax = 0.8f;
+    // materials: friction, damping, adhesion, gravityScale, adhesionRadiusScale (stride 20)
+    const std::vector<float> materials = {
+        0.05f, 0.0f, 0.3f, 1.0f, 1.5f,     // material 0: system 0
+        0.3f,  0.0f, 0.5f, 1.0f, 2.0f,     // material 1: system 2
+        0.9f,  0.0f, 0.7f, 1.0f, 3.0f };   // material 2: the decoy
+    P99Sys s[3];
+    const uint32_t NP[3] = { 8u, 9u, 7u };
+    const float IM[3] = { 1.0f, 2.0f, 0.5f }, REST[3] = { 0.25f, 0.4f, 0.15f };
+    const uint16_t MAT[3] = { 0u, 2u, 1u };
+    PxgBufferHandle bMaterials = createBufferFrom(dev, materials);
+    if (!addrOf(dev, bMaterials)) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bMaterials); return; }
+    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        P99Sys& c = s[k];
+        c.n = NP[k]; c.invMass = IM[k]; c.restOffset = REST[k]; c.mat = MAT[k];
+        const float fk = float(k);
+        for (uint32_t i = 0; i < c.n; ++i)
+        {
+            const float fi = float(i);
+            c.pos.push_back({ 0.1f * fi, 0.5f + fk, -0.2f * fi, c.invMass });
+            // tangential only: delta.y = 0, so normal.dot(delta) is an exact zero
+            c.deltaP.push_back({ (k == 2u ? -0.015f : 0.01f) + 0.001f * fi, 0.0f, (k == 2u ? 0.005f : 0.02f) - 0.002f * fi, c.invMass });
+            c.accum.push_back({ 0.5f * fi - fk, -0.25f + 0.125f * fk, 0.75f, 1.0f + fi });
+        }
+        c.phases.assign(c.n, 0u);
+        c.p2m = { uint32_t(c.mat) };
+        c.bPos = createBufferFrom(dev, c.pos); c.bDeltaP = createBufferFrom(dev, c.deltaP);
+        c.bAccum = createBufferFrom(dev, c.accum); c.bPhases = createBufferFrom(dev, c.phases);
+        c.bP2M = createBufferFrom(dev, c.p2m);
+        std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
+        putU64(psys, 24, addrOf(dev, c.bPos));        // mSortedPositions_InvMass
+        putU64(psys, 40, addrOf(dev, c.bPhases));     // mSortedPhaseArray
+        putU64(psys, 80, addrOf(dev, bMaterials));    // mParticleMaterials (one shared table)
+        putU32(psys, 116, c.n);                       // mCommonData_NumParticles
+        putU64(psys, 152, addrOf(dev, c.bAccum));     // mAccumDeltaP
+        putU64(psys, 160, addrOf(dev, c.bDeltaP));    // mSortedDeltaP
+        putF32(psys, 268, c.restOffset);              // mData_RestOffset
+        putU32(psys, 632, 20u);                       // mParticleMaterialStride (bytes)
+        putU64(psys, 640, addrOf(dev, c.bP2M));       // mPhaseGroupToMaterialHandle
+        std::memcpy(pool.data() + k * SZ_PARTICLE_SYS, psys.data(), SZ_PARTICLE_SYS);
+    }
+    PxgBufferHandle bPsys = createBufferFrom(dev, pool);
+
+    struct C { uint32_t sys, pid; float pen; };
+    const C cl[8] = { { 0, 0, -0.10f }, { 0, 1, 0.05f }, { 0, 3, -0.08f }, { 0, 3, 0.03f },
+                      { 2, 3, -0.12f }, { 2, 3, 0.04f }, { 2, 4, 0.05f }, { 2, 6, -0.06f } };
+    const uint32_t NC = 8u;
+    const uint32_t runStart[6] = { 0u, 1u, 2u, 4u, 6u, 7u }, runEnd[6] = { 1u, 2u, 4u, 6u, 7u, 8u };
+    std::vector<PsContact> contacts(NC);
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        contacts[c].normal_pen = { 0.0f, 1.0f, 0.0f, cl[c].pen };
+        contacts[c].rigidLo = 0xffffffffu; contacts[c].rigidHi = 0u;   // static body, not articulation
+        contacts[c].particleLo = cl[c].pid; contacts[c].particleHi = cl[c].sys;
+    }
+    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
+    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, NC));
+    PxgBufferHandle bConstraints = createBufferFrom(dev, std::vector<uint8_t>(CB_STRIDE, 0));
+    PxgBufferHandle bApplied = createBufferFrom(dev, std::vector<F2>(32, { 9.0f, 9.0f }));
+    PxgBufferHandle bDeltaPos = createBufferFrom(dev, std::vector<F4>(32, { 0.0f, 0.0f, 0.0f, 0.0f }));
+    std::vector<uint8_t> solverBody(SZ_SOLVER_BODY, 0), txi(SZ_TXI, 0), bodyFrame(SZ_ALIGNED_XF, 0);
+    PxgBufferHandle bSolverBody = createBufferFrom(dev, solverBody);
+    PxgBufferHandle bTxi = createBufferFrom(dev, txi);
+    PxgBufferHandle bBodyFrame = createBufferFrom(dev, bodyFrame);
+    std::vector<uint8_t> prepDesc(SZ_PREP_DESC, 0);
+    putU64(prepDesc, 64, addrOf(dev, bSolverBody));
+    putU64(prepDesc, 72, addrOf(dev, bTxi));
+    putU64(prepDesc, 168, addrOf(dev, bBodyFrame));
+    PxgBufferHandle bPrepDesc = createBufferFrom(dev, prepDesc);
+    PxgBufferHandle bPrePrepDesc = createBufferFrom(dev, std::vector<uint8_t>(SZ_PREPREP_DESC, 0));
+    PxgBufferHandle bVelPool = createBufferFrom(dev, std::vector<F4>(2, { 0.0f, 0.0f, 0.0f, 0.0f }));
+    PxgBufferHandle bOutVel = createBufferFrom(dev, std::vector<F4>(2, { 0.0f, 0.0f, 0.0f, 0.0f }));
+    std::vector<uint8_t> coreDesc(SZ_CORE_DESC, 0);
+    putU64(coreDesc, 0, addrOf(dev, bOutVel)); // outSolverVelocity
+    putU32(coreDesc, 268, 1u);                 // numSolverBodies
+    putU32(coreDesc, 276, 0u);                 // accumulatedBodyDeltaVOffset
+    PxgBufferHandle bCoreDesc = createBufferFrom(dev, coreDesc);
+    std::vector<uint8_t> sharedPgs(SZ_SHARED_PGS, 0);
+    putU64(sharedPgs, 160, addrOf(dev, bVelPool));
+    PxgBufferHandle bSharedPgs = createBufferFrom(dev, sharedPgs);
+    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, 6u));
+    PxgBufferHandle bStart = createBufferFrom(dev, std::vector<uint32_t>(runStart, runStart + 6));
+    PxgBufferHandle bEnd = createBufferFrom(dev, std::vector<uint32_t>(runEnd, runEnd + 6));
+
+    {
+        PrepPush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.numContacts = addrOf(dev, bNum); p.primitiveConstraints = addrOf(dev, bConstraints);
+        p.preDesc = addrOf(dev, bPrePrepDesc); p.prepareDesc = addrOf(dev, bPrepDesc);
+        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.isTGSWord = 0u;
+        p.deltaVel = 0ull; p.sharedDesc = 0ull;
+        Kernel k("psContactSolveBda.spv", "ps_contactPrepareLaunch", {}, sizeof(PrepPush));
+        k.dispatch(1024u, {}, p);
+    }
+    {
+        SolvePush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.primitiveConstraints = addrOf(dev, bConstraints); p.numContacts = addrOf(dev, bNum);
+        p.prePrepDesc = addrOf(dev, bPrePrepDesc); p.solverCoreDesc = addrOf(dev, bCoreDesc);
+        p.sharedDesc = addrOf(dev, bSharedPgs); p.deltaPos = addrOf(dev, bDeltaPos);
+        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.relaxationCoefficient = relax;
+        p.isVelIterWord = 0u; p.artiCoreDesc = 0ull;
+        Kernel k("psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch", {}, sizeof(SolvePush));
+        k.dispatch(1024u, {}, p);
+    }
+    {
+        AccumPush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.totalNumPairs = addrOf(dev, bPairs); p.rangeStart = addrOf(dev, bStart);
+        p.rangeEnd = addrOf(dev, bEnd); p.deltaPos = addrOf(dev, bDeltaPos);
+        Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
+        k.dispatch(32u, {}, p);
+    }
+    dev->flush();
+
+    // CPU oracle: prepare (static rigid) -> p99SolvePCOutputDeltaV -> accumulate.
+    const P99V3 normal = { -0.0f, -1.0f, -0.0f };    // prepare flips the contact normal (0,1,0)
+    const P99V3 fric0 = { 1.0f, 0.0f, 0.0f };        // computeBasisVectors: |dir.y| > 0.9999
+    const P99V3 fric1 = p99Cross(normal, fric0);
+    std::vector<F4> refDeltaPos(NC);
+    std::vector<F2> refApplied(NC);
+    std::vector<F4> refAccum[3] = { s[0].accum, s[1].accum, s[2].accum };
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        const P99Sys& sy = s[cl[c].sys];
+        const float invMass1 = sy.pos[cl[c].pid].w;
+        const float vm = (invMass1 > 0.0f) ? (1.0f / (0.0f + invMass1)) : 0.0f;
+        const F4 d4 = sy.deltaP[cl[c].pid];
+        const P99V3 delta = { d4.x, d4.y, d4.z };
+        const float* m = &materials[sy.mat * 5u];
+        // static rigid: zero body velocity -> tanVel0 = tanVel1 = normalVel = 0
+        const P99PgsOut r = p99SolvePCOutputDeltaV(normal, cl[c].pen, delta, fric0, fric1, 0.0f, 0.0f, 0.0f, vm, vm, vm,
+                                                   m[0], sy.restOffset, m[2], m[4], dt, F2{ 0.0f, 0.0f });
+        const float im = d4.w;
+        refDeltaPos[c] = { ((-(normal.x * r.deltaF) + fric0.x * r.deltaFr0) + fric1.x * r.deltaFr1) * im * relax,
+                           ((-(normal.y * r.deltaF) + fric0.y * r.deltaFr0) + fric1.y * r.deltaFr1) * im * relax,
+                           ((-(normal.z * r.deltaF) + fric0.z * r.deltaFr0) + fric1.z * r.deltaFr1) * im * relax,
+                           (r.deltaF != 0.0f) ? 1.0f : 0.0f };
+        refApplied[c] = r.appliedForce;
+    }
+    for (uint32_t run = 0; run < 6; ++run)
+    {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, fc = 0.0f;
+        for (uint32_t j = runStart[run]; j < runEnd[run]; ++j)
+        { ax += refDeltaPos[j].x; ay += refDeltaPos[j].y; az += refDeltaPos[j].z; fc += refDeltaPos[j].w; }
+        const float recip = 1.0f / p99Max(1.0f, fc);
+        ax *= recip; ay *= recip; az *= recip;
+        F4& a = refAccum[cl[runStart[run]].sys][cl[runStart[run]].pid];
+        a = { a.x + ax, a.y + ay, a.z + az, a.w + 0.0f };
+    }
+
+    size_t mm = 0;
+    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos, NC);
+    const auto gApplied = downloadBuffer<F2>(dev, bApplied, NC);
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        if (std::memcmp(&gDeltaPos[c], &refDeltaPos[c], sizeof(F4)) != 0)
+        { if (mm < 8) std::printf("  contact %u deltaPos gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", c, gDeltaPos[c].x, gDeltaPos[c].y,
+                                  gDeltaPos[c].z, gDeltaPos[c].w, refDeltaPos[c].x, refDeltaPos[c].y, refDeltaPos[c].z, refDeltaPos[c].w); ++mm; }
+        if (std::memcmp(&gApplied[c], &refApplied[c], sizeof(F2)) != 0)
+        { if (mm < 8) std::printf("  contact %u appliedForce gpu(%g,%g) cpu(%g,%g)\n", c, gApplied[c].x, gApplied[c].y,
+                                  refApplied[c].x, refApplied[c].y); ++mm; }
+    }
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const auto gAcc = downloadBuffer<F4>(dev, s[k].bAccum, s[k].n);
+        for (uint32_t i = 0; i < s[k].n; ++i)
+            if (std::memcmp(&gAcc[i], &refAccum[k][i], sizeof(F4)) != 0)
+            { if (mm < 12) std::printf("  slot %u accumDeltaP[%u] gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", k, i, gAcc[i].x, gAcc[i].y,
+                                       gAcc[i].z, gAcc[i].w, refAccum[k][i].x, refAccum[k][i].y, refAccum[k][i].z, refAccum[k][i].w); ++mm; }
+    }
+    // the separated contacts really took the adhesion branch (else mRestOffset is not read)
+    PXG_CHECK_MSG(refDeltaPos[5].y < 0.0f && refDeltaPos[6].y < 0.0f && refDeltaPos[1].y < 0.0f,
+                  "the separated contacts must be pulled in by adhesion (dy %g %g %g)", refDeltaPos[1].y,
+                  refDeltaPos[5].y, refDeltaPos[6].y);
+    PXG_CHECK_MSG(mm == 0, "PGS pipeline over systems 0 and 2 (interleaved runs, decoy at slot 1): bit-exact vs CPU "
+                  "(%zu mismatches)", mm);
+
+    PxgBufferHandle all[] = { bMaterials, bPsys, bContacts, bNum, bConstraints, bApplied, bDeltaPos, bSolverBody, bTxi,
+        bBodyFrame, bPrepDesc, bPrePrepDesc, bVelPool, bOutVel, bCoreDesc, bSharedPgs, bPairs, bStart, bEnd };
+    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
+    for (uint32_t k = 0; k < 3; ++k)
+        for (PxgBufferHandle h : { s[k].bPos, s[k].bDeltaP, s[k].bAccum, s[k].bPhases, s[k].bP2M })
+            dev->destroyBuffer(h);
+}
+
+// ===========================================================================
 // Under-relaxed correction (relax = 0.5) — still upward, still bit-exact, and
 // exercises a non-trivial relaxation multiply.
 // ===========================================================================

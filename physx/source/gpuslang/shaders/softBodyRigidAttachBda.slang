@@ -133,7 +133,7 @@ struct SbPrepAttachParams
     uint _pad36;                     // @36
     uint64_t constraints;            // @40  output
     uint64_t prePrepDesc;            // @48
-    uint64_t prepDesc;               // @56
+    uint64_t prepareDesc;            // @56
     uint64_t sharedDesc;             // @64  (DEFERRED: articulation-only)
     uint64_t rigidDeltaVel;          // @72  output, OPTIONAL -> 80
 }
@@ -236,7 +236,7 @@ void sb_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
     Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSbPrepAtt.softbodies);
     Ptr<uint> activeRigidAttachments = Ptr<uint>(gSbPrepAtt.activeRigidAttachments);
     Ptr<uint64_t> rigidAttachmentIds = Ptr<uint64_t>(gSbPrepAtt.rigidAttachmentIds);
-    Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(gSbPrepAtt.prepDesc);
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(gSbPrepAtt.prepareDesc);
 
     const uint64_t bodyFramesBase = prepDesc[0].body2WorldPool;
     const uint64_t solverBodyDataBase = prepDesc[0].solverBodyDataPool;

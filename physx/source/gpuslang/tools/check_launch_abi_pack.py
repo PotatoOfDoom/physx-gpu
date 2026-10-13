@@ -33,6 +33,13 @@
 # So the invariant chain is  CUDA signature == row == host pack  (this file)  and
 # row == shader push block (check_push_block.py's join).
 #
+# P9.99: the signature parser also keeps the CUDA NAMES (param_name, signature_names,
+# struct_field_names, HOST_ARG_FIELD_NAMES) for check_push_block.py's name leg; its entry
+# point is arg_field_names.  They are side tables only: every decision of this file is
+# unchanged (PXG_ABI_PACK_DUMP byte-identical before and after).  Names that cannot be
+# decided are never guessed: arg_field_names returns None when two declarations with the
+# same sizes disagree on the names, and '?' for a parameter or struct field it cannot name.
+#
 # ---------------------------------------------------------------------------
 # WHAT IT CHECKS (P9.97b; before it, TOTALS ONLY)
 # ---------------------------------------------------------------------------
@@ -214,6 +221,13 @@ KNOWN_SIG_UNDECIDED = set()
 # testSoftBodySim.cpp).
 HOST_ARG_FIELDS = {
     ("sb_copyOrApplySoftBodyDataDEPRECATED", 0): [(0, 8, "i"), (8, 8, "i"), (16, 8, "i"), (24, 4, "i")],
+}
+# P9.99: the same fields' NAMES (and types) for check_push_block.py's name leg, parallel to
+# HOST_ARG_FIELDS entry by entry (PxgCudaBuffer.h:104-107).
+HOST_ARG_FIELD_NAMES = {
+    ("sb_copyOrApplySoftBodyDataDEPRECATED", 0): [("mPtr", "CUdeviceptr"),
+                                                  ("mHeapMemoryAllocator", "PxgHeapMemoryAllocator*"),
+                                                  ("mSize", "PxU64"), ("mStatGroup", "PxsHeapStats::Enum")],
 }
 
 # ---------------------------------------------------------------------------
@@ -557,7 +571,29 @@ def _header_texts():
 
 
 _STRUCT_CACHE = {}
+_STRUCT_NAMES = {}      # P9.99: name -> [(dotted field name, type)] parallel to struct_fields' fields
 _ALIGN_OVERRIDE = {"CUdeviceptr": 8, "size_t": 8}
+
+
+def _member_names(t, nsub):
+    """[(suffix, type)] for the `nsub` leaf fields _member_shape gives a member of type `t`:
+    '' for a scalar or pointer, '.x'.. for a vector, '.<field>' for a nested struct."""
+    t = _norm_type(t or "")
+    if (t.split() or [""])[-1] in VECTORS:
+        return [("." + "xyzw"[i], t) for i in range(nsub)]
+    if t.endswith("*") or nsub == 1:
+        return [("", t)]
+    sub = struct_field_names(t.split()[-1])
+    if sub and len(sub) == nsub:
+        return [("." + n, ty) for (n, ty) in sub]
+    return [(".?", None)] * nsub
+
+
+def struct_field_names(name):
+    """[(dotted field name, type)] parallel to struct_fields(name)[2], or None (P9.99)."""
+    if struct_fields(name) is None:
+        return None
+    return _STRUCT_NAMES.get(name)
 
 
 def _member_shape(t):
@@ -589,6 +625,7 @@ def struct_fields(name):
         return _STRUCT_CACHE[name]
     _STRUCT_CACHE[name] = None              # recursion guard
     found = set()
+    names_of = {}                           # P9.99: layout -> {field-name tuples}
     for text in _header_texts():
         for m in re.finditer(r"\bstruct\s+(PX_ALIGN_PREFIX\s*\(\s*\d+\s*\)\s*)?" + re.escape(name) +
                              r"\s*(:[^{;]*)?\{", text):
@@ -621,7 +658,7 @@ def struct_fields(name):
                     continue
                 if d == 0:
                     flat.append(ch)
-            off, ma, fields, ok = 0, 1, [], True
+            off, ma, fields, fnames, ok = 0, 1, [], [], True
             for decl in "".join(flat).split(";"):
                 decl = re.sub(r"^\s*(public|private|protected)\s*:", "", decl.strip()).strip()
                 if not decl or "(" in decl or re.match(
@@ -641,24 +678,32 @@ def struct_fields(name):
                     ok = False
                     break
                 sz, al, sub = shape
+                subn = _member_names(mm.group(1), len(sub))
                 n = 1
                 if mm.group(3):
                     if not mm.group(4).isdigit():
                         ok = False
                         break
                     n = int(mm.group(4))
-                for _ in mm.group(2).split(","):
+                for vn in mm.group(2).split(","):
+                    vn = vn.strip().lstrip("*").strip()
                     off = (off + al - 1) & ~(al - 1)
                     for e in range(n):
                         fields.extend((off + e * sz + so, ss, sk) for (so, ss, sk) in sub)
+                        fnames.extend((vn + ("[%d]" % e if n > 1 else "") + sn, ty) for (sn, ty) in subn)
                     off += sz * n
                     ma = max(ma, al)
             if not ok:
                 found.add(None)
                 continue
             found.add(((off + ma - 1) & ~(ma - 1), ma, tuple(fields)))
+            names_of.setdefault(((off + ma - 1) & ~(ma - 1), ma, tuple(fields)), set()).add(tuple(fnames))
     res = found.pop() if len(found) == 1 and None not in found else None
     if res is not None:
+        nm = names_of.get(res, set())
+        # two definitions with one layout but different names: the layout stands (as before
+        # P9.99), the NAMES are undecided -- never a guess
+        _STRUCT_NAMES[name] = list(next(iter(nm))) if len(nm) == 1 else None
         res = (res[0], res[1], list(res[2]))
     _STRUCT_CACHE[name] = res
     return res
@@ -854,7 +899,21 @@ def param_shape(p):
     return None, t, None
 
 
+def param_name(p):
+    """The declared NAME of one CUDA parameter, or None (P9.99) -- param_shape's own regex,
+    so the two can never disagree on where the name is."""
+    p = re.sub(r"=.*$", "", p).strip()
+    p = _norm_type(p)
+    if p in ("void", ""):
+        return None
+    m = re.match(r"^(.*?)(\w+)\s*(\[\s*\w*\s*\])?$", p)
+    if not m or not m.group(1).strip():
+        return None
+    return m.group(2)
+
+
 _SIGS = None
+_SIG_NAMES = {}         # P9.99: (relpath, line) -> [parameter names], filled by signatures_in
 
 
 def cuda_signatures():
@@ -895,8 +954,28 @@ def signatures_in(src, rel, cgs=None):
                     break
             k -= 1
         plist = t[k + 1:j]
-        out[name].append((rel, t.count("\n", 0, off) + 1, [param_shape(p) for p in _split_params(plist)]))
+        line = t.count("\n", 0, off) + 1
+        out[name].append((rel, line, [param_shape(p) for p in _split_params(plist)]))
+        _SIG_NAMES[(rel, line)] = [param_name(p) for p in _split_params(plist)]
     return out
+
+
+def signature_names(name, sigs=None):
+    """The parameter names of the declaration signature_of decided on, or None.  Every
+    declaration with the same sizes must carry the same names (a forward declaration that
+    renames a parameter is an UNDECIDED name join, never a pick) -- P9.99."""
+    sigs = cuda_signatures() if sigs is None else sigs
+    st, sizes, info = signature_of(name, sigs)
+    if st != "OK":
+        return None
+    seen = set()
+    for rel, line, params in sigs.get(name, ()):
+        if [s for s, _t, _f in params] == sizes:
+            nm = _SIG_NAMES.get((rel, line))
+            if nm is None:
+                return None
+            seen.add(tuple(nm))
+    return list(seen.pop()) if len(seen) == 1 else None
 
 
 def signature_of(name, sigs=None):
@@ -937,6 +1016,36 @@ def arg_fields(name, row_sizes, sigs=None):
             out.append(None)
             continue
         out.append(None if s in (1, 2, 4, 8) else "UNDECIDED")
+    return out
+
+
+def arg_field_names(name, row_sizes, sigs=None):
+    """P9.99, for check_push_block.py's NAME leg: per row argument, [(dotted CUDA name, CUDA
+    type)] -- one entry for a scalar/pointer, one per field (the order of arg_fields) for a
+    by-value aggregate; (None, None) where the row does not follow the signature.
+
+    None -- the whole kernel's name join UNDECIDED, never a pass -- when the signature is
+    decided but its NAMES are not (two declarations with the same sizes and different
+    parameter names).  A parameter the row follows whose name cannot be read is named '?',
+    as is every field of a by-value struct whose names are undecided (`writer.?`); the
+    name leg treats a reached member over a '?' as UNDECIDED too."""
+    st, _sizes, info = signature_of(name, sigs)
+    params = info[2] if st == "OK" else None
+    pnames = signature_names(name, sigs) if params is not None else None
+    if params is not None and pnames is None:
+        return None
+    out = []
+    for i, (s, shape) in enumerate(zip(row_sizes, arg_fields(name, row_sizes, sigs))):
+        if (name, i) in HOST_ARG_FIELD_NAMES:
+            out.append(list(HOST_ARG_FIELD_NAMES[(name, i)]))
+            continue
+        follows = pnames is not None and i < len(params) and params[i][0] == s
+        pn, pt = (pnames[i] or "?", params[i][1]) if follows else (None, None)
+        if shape is None or shape == "UNDECIDED":
+            out.append([(pn, pt)])
+            continue
+        sub = _member_names(pt, len(shape)) if pn else [("", None)] * len(shape)
+        out.append([((pn + sn) if pn else None, ty) for (sn, ty) in sub])
     return out
 
 

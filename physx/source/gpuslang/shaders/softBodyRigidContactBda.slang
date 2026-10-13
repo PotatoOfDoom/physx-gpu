@@ -155,7 +155,7 @@ struct SbPrepContactParams
     uint64_t numContacts;         // @40
     uint64_t constraints;         // @48  output
     uint64_t prePrepDesc;         // @56
-    uint64_t prepDesc;            // @64
+    uint64_t prepareDesc;         // @64
     uint64_t rigidAppliedForces;  // @72  output (zeroed here)
     float invDt;                  // @80  (DEFERRED: unread, as in CUDA)
     uint _pad84;                  // @84
@@ -234,7 +234,7 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
         const uint64_t cBase = gSbPrep.constraints + uint64_t(index) * FRC_STRIDE;
 
         prepareFEMContacts(cBase, offset, normal, p, pen, delta, rigidId, barycentric,
-                           gSbPrep.prepDesc, gSbPrep.prePrepDesc,
+                           gSbPrep.prepareDesc, gSbPrep.prePrepDesc,
                            softbodies[softBodyId].mPenBiasClamp);
     }
 }

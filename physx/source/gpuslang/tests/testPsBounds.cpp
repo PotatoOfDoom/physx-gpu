@@ -479,6 +479,129 @@ PXG_TEST(psBounds_updateBoundReduce)
 }
 
 // ---------------------------------------------------------------------------
+// P9.99b -- psBounds_updateBoundReduce with push id 2 in BOTH passes and broadphase
+// element 3.  The host launches the two passes once per active system with `id` =
+// its remap index and `elemIndex` = its broadphase element (PxgParticleSystemCore.cpp:
+// 851-913); the single-system fixture only ever passed id 0.  Pool of three: slots 0
+// and 1 are decoys with MORE particles (3000 / 2800, wider spreads, a distinct
+// sentinel mBoundCenter), slot 2 the real system (2100 particles).
+//
+// The second pass uses `id` for ONE thing: the mData.mBoundCenter writeback, which no
+// kernel or host code reads (the only writer is particlesystem.cu:672) -- so a wrong
+// id in pass 2 is engine-equivalent, and this fixture is the only place it can die:
+// it checks slot 2's centre AND that both decoy descriptors are bit-identical.
+// ---------------------------------------------------------------------------
+PXG_TEST(psBounds_updateBoundReduce_p99Id2)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 3000u, 2800u, 2100u };
+    const float SPREAD[3] = { 80.f, 65.f, 50.f };
+    const uint32_t id = 2u;
+    const uint32_t elemIndex = 3u;
+    const float cd = 0.375f;
+    const uint32_t numBlocks = (NS[id] + 1024u - 1u) / 1024u;   // 3 pass-1 blocks, partial last one
+
+    std::vector<F4> predicted[3];
+    DevBuf bPred[3];
+    std::vector<int32_t> dummyDiffuseCount = { 0 };
+    DevBuf bDiffCount = makeDev(dev, dummyDiffuseCount);
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        std::mt19937 rng(64041u + 17u * k);
+        std::uniform_real_distribution<float> uv(-SPREAD[k], SPREAD[k]);
+        predicted[k].resize(NS[k]);
+        for (uint32_t i = 0; i < NS[k]; ++i)
+            predicted[k][i] = { uv(rng), uv(rng), uv(rng), 1.0f };
+        bPred[k] = makeDev(dev, predicted[k]);
+        PxgParticleSystem ps = makeZeroPs();
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPred[k].addr));
+        ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bPred[k].addr));       // unused (no CCD)
+        ps.mDiffuseOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bPred[k].addr));
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bPred[k].addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bDiffCount.addr));   // unused (maxDiffuse 0)
+        ps.mCommonData.mNumParticles = NS[k];
+        ps.mCommonData.mMaxDiffuseParticles = 0;
+        ps.mData.mFlags = 0;  // no eENABLE_SPECULATIVE_CCD
+        ps.mData.mBoundCenter = PxVec3(-7.0f - float(k), 11.0f + float(k), 0.5f * float(k) - 3.0f);   // sentinel
+        descArr[k] = ps;
+    }
+
+    // CPU reference for slot 2: global min/max over xyz, fattened by cd, then centred.
+    float gmin[3] = { 3.4028235e38f, 3.4028235e38f, 3.4028235e38f };
+    float gmax[3] = { -3.4028235e38f, -3.4028235e38f, -3.4028235e38f };
+    for (uint32_t i = 0; i < NS[id]; ++i)
+    {
+        const float* p = &predicted[id][i].x;
+        for (int k = 0; k < 3; ++k) { gmin[k] = std::min(gmin[k], p[k]); gmax[k] = std::max(gmax[k], p[k]); }
+    }
+    float refMin[3], refMax[3], refCenter[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        refMin[k] = gmin[k] - cd;
+        refMax[k] = gmax[k] + cd;
+        refCenter[k] = (refMax[k] + refMin[k]) * 0.5f;
+    }
+
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<float> tempBounds(numBlocks * 6u, 0.f);
+    DevBuf bTemp = makeDev(dev, tempBounds);
+    std::vector<float> boundArray((elemIndex + 1u) * 6u, -123.f);
+    DevBuf bBoundArr = makeDev(dev, boundArray);
+    std::vector<float> contactDists(elemIndex + 1u, 0.f);
+    contactDists[elemIndex] = cd;
+    DevBuf bCd = makeDev(dev, contactDists);
+
+    struct Push1 { uint64_t particleSystems; uint32_t id; uint32_t isTGS; uint64_t bounds; };
+    Push1 p1 = { bDesc.addr, id, 0u, bTemp.addr };
+    {
+        Kernel k1("psBoundsBda.spv", "ps_updateBoundFirstPassLaunch", {}, sizeof(Push1));
+        k1.dispatch(numBlocks, {}, p1, 1u, 1u);
+    }
+    dev->flush();
+    struct Push2
+    {
+        uint64_t particleSystems; uint32_t id; uint32_t pad12; uint64_t bounds;
+        uint32_t numBounds; uint32_t pad28; uint64_t boundArray; uint64_t contactDists;
+        uint32_t elemIndex; uint32_t pad52;
+    };
+    Push2 p2 = { bDesc.addr, id, 0u, bTemp.addr, numBlocks, 0u, bBoundArr.addr, bCd.addr, elemIndex, 0u };
+    {
+        Kernel k2("psBoundsBda.spv", "ps_updateBoundSecondPassLaunch", {}, sizeof(Push2));
+        k2.dispatch(1u, {}, p2, 1u, 1u);
+    }
+    dev->flush();
+
+    const auto gBound = downloadBuffer<float>(dev, bBoundArr.h, (elemIndex + 1u) * 6u);
+    const auto gDesc = downloadBuffer<PxgParticleSystem>(dev, bDesc.h, 3);
+
+    size_t mm = 0;
+    for (uint32_t e = 0; e <= elemIndex; ++e)
+        for (int k = 0; k < 6; ++k)
+        {
+            const float want = (e == elemIndex) ? (k < 3 ? refMin[k] : refMax[k - 3]) : -123.f;
+            if (fbits(gBound[e * 6u + k]) != fbits(want))
+            { ++mm; std::printf("  bound[%u][%d] gpu=%g ref=%g\n", e, k, gBound[e * 6u + k], want); }
+        }
+    const float gc[3] = { gDesc[id].mData.mBoundCenter.x, gDesc[id].mData.mBoundCenter.y, gDesc[id].mData.mBoundCenter.z };
+    for (int k = 0; k < 3; ++k)
+        if (fbits(gc[k]) != fbits(refCenter[k])) { ++mm;
+            std::printf("  slot 2 boundCenter[%d] gpu=%g ref=%g\n", k, gc[k], refCenter[k]); }
+    // the decoys' descriptors -- sentinel centre included -- are untouched, byte for byte
+    for (uint32_t k = 0; k < 2; ++k)
+        if (std::memcmp(&gDesc[k], &descArr[k], sizeof(PxgParticleSystem)) != 0)
+        { ++mm; std::printf("  decoy descriptor %u was written (boundCenter now %g %g %g)\n", k,
+                            gDesc[k].mData.mBoundCenter.x, gDesc[k].mData.mBoundCenter.y, gDesc[k].mData.mBoundCenter.z); }
+
+    PXG_CHECK_MSG(mm == 0, "ps_updateBound, id 2 in both passes, element 3, decoys at slots 0/1 untouched: "
+                  "bit-exact AABB reduce vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k) dev->destroyBuffer(bPred[k].h);
+    dev->destroyBuffer(bDiffCount.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bTemp.h); dev->destroyBuffer(bBoundArr.h); dev->destroyBuffer(bCd.h);
+}
+
+// ---------------------------------------------------------------------------
 // P9.86c: signed-zero ties in ps_updateBound{First,Second}PassLaunch.
 //
 // (1) First pass, per-thread regular/diffuse combine (particlesystem.cu:506-507

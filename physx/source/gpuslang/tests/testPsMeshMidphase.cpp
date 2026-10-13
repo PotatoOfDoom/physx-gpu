@@ -653,6 +653,27 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
         ps.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(R.bDiffNodeIdx.addr));
         ps.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(R.bDiffCounts.addr));
     }
+    // P9.99b: slot 0 is a VALID decoy -- the same inputs, its OWN poisoned outputs.  A
+    // kernel that resolved the system to index 0 instead of the shape's
+    // particleOrSoftbodyId (the p2-meshmid-sys0 mutant) used to dereference the 0xEE
+    // poison and fault; now it writes the decoy's outputs and leaves slot SYS's poisoned,
+    // so it dies by value.  The other neighbours keep the 0xEE poison.
+    {
+        PxgParticleSystem decoy = ps;
+        std::vector<F4> dInfos(size_t(S.nppad) * MAXPART, { -5, -5, -5, -5 });
+        std::vector<uint32_t> dNodeIdx(size_t(S.nppad) * MAXPART * 2u, 0xDDDDDDDDu);
+        std::vector<uint32_t> dCounts(S.nppad, 0u);
+        decoy.mOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(R.mk(dev, dInfos).addr));
+        decoy.mOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(R.mk(dev, dNodeIdx).addr));
+        decoy.mOneWayContactCount = reinterpret_cast<PxU32*>(size_t(R.mk(dev, dCounts).addr));
+        if (opt.maxDiffuse != 0u)
+        {
+            decoy.mDiffuseOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(R.mk(dev, dInfos).addr));
+            decoy.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(R.mk(dev, dNodeIdx).addr));
+            decoy.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(R.mk(dev, dCounts).addr));
+        }
+        descArr[0] = decoy;
+    }
     descArr[Scene::SYS] = ps;
     R.bDesc = R.mk(dev, descArr);
 

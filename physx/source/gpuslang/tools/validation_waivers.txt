@@ -40,9 +40,11 @@ VUID-RuntimeSpirv-Workgroup-06530    module:solverTGS.spv    module-sum
 # the device counts its live VkDeviceMemory and prints the peak at exit
 # (PXG_VK_ALLOC_STATS), and the waiver holds only while every process in the log stayed
 # at or below the bound -- so drift toward the limit fails
-# the run instead of being absorbed.  The bound is 2048, half of 4096: measured in check
-# round 1, the fixtures peak at up to ~1.6k live allocations (aggregateBda, the
-# articulation update suites) and the engine scenes far lower (see the P9.98 report).
+# the run instead of being absorbed.  The bound is 2048, half of 4096.  Measured at the
+# P9.99 check round, after destroyBuffer was routed through the counted free (until then
+# no buffer free was counted and every peak was a running total): the fixtures peak at
+# 569 live allocations (aggregateBda; 480 artiUpdateBodies2, 397 artiUpdateBodies1T),
+# the particle2 scene rows at 39-46.
 UNASSIGNED-BestPractices-vkAllocateMemory-small-allocation          any    alloc-peak:2048
 UNASSIGNED-BestPractices-vkBindMemory-small-dedicated-allocation    any    alloc-peak:2048
 
@@ -71,7 +73,10 @@ UNASSIGNED-BestPractices-vkCreateInstance-specialuse-extension-debugging   any  
 PXG-refusal    suite:pipelineRefusal    always
 PXG-refusal    suite:shimBindless       always
 # gpuslang.p0Subgroup checks that createPipelineEx REFUSES a required subgroup size the
-# device cannot provide (256 on llvmpipe, whose range is 8..8) -- one refusal, on purpose.
+# device cannot provide (256 on llvmpipe, whose window is [8, 8]: since P9.99 the line reads
+# "createPipeline(spikeSubgroup): ... above the device's window [8, 8] (VUID-02762);
+# refused") -- one refusal, on purpose.  P9.99's shape refusals (VUID-02756 /
+# 02757) are provoked in gpuslang.pipelineRefusal, which the line above already waives.
 PXG-refusal    suite:p0Subgroup         always
 # gpuslang.vvlTriage is the triage's own self-test: its row descriptions and the
 # inputs it echoes on a failure NAME these lines; nothing in it is a device.

@@ -93,9 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.97b, the sdfmesh softbody floor added): 63 named scenes below, plus seventeen
-# explicit rows after the loop (the settling bag, four softbody floors, the softbodyhex box
-# arm, eight PGS rows, three slabgrid modes) = 80.
+# Today (P9.99b, particle2 added): 64 named scenes below, plus twenty-one explicit rows
+# after the loop (the settling bag, four softbody floors, the softbodyhex box arm, nine PGS
+# rows, three slabgrid modes, three particle2 arms) = 85.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -105,7 +105,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity slabgrid particleapply softbodydata
-        directapimerge sdfquery softbodyhex"
+        directapimerge sdfquery softbodyhex particle2"
 
 pass=0; fail=0; missing=0
 
@@ -226,6 +226,25 @@ run_one "directapimerge (PGS)" PXG_SCENE=directapimerge PXG_SOLVER=pgs
 run_one "softbodyhex (box)" PXG_SCENE=softbodyhex PXG_SB_HEX=box
 run_one "softbodyhex (PGS)" PXG_SCENE=softbodyhex PXG_SB_HEX=fork PXG_SOLVER=pgs
 
+# P9.99b: particle2 is the first scene with TWO PBD particle systems.  Every per-system
+# path of the particle pipeline (act[blockIdx.y], the host-loop id, contact id >> 32, the
+# user's buffer pairs) has only one possible answer when there is one system, so 33
+# "force system index 0" mutants were value-identical in every other scene.  Each row runs
+# several sub-scenes in one process -- both systems, the swapped pool order, each system
+# alone -- and compares the final user arrays BITWISE (C1: a system does not depend on the
+# other's existence, C2: nor on its pool index), plus absolute physics (C3).  The named row
+# above is the default `split` arm under TGS (B on a cooked mesh patch with lock Z,
+# adhesion live in both); below: split under PGS, `fluid` (B a SnippetPBF fluid with 2048
+# diffuse particles; diffuse arrays compared as multisets, their slot order is not
+# deterministic), `apply` (applyParticleBufferData naming only system 1's slot) and `push`
+# (each system pushes its own 10 kg box; scored physically -- the box's contact order
+# depends on the composition, so it is not bitwise).  Measured: every bitwise comparison 0
+# of 512 / 1000 words.  About 5 minutes per row.
+run_one "particle2 (PGS)"   PXG_SCENE=particle2 PXG_SOLVER=pgs
+run_one "particle2 (fluid)" PXG_SCENE=particle2 PXG_P2_ARM=fluid
+run_one "particle2 (apply)" PXG_SCENE=particle2 PXG_P2_ARM=apply
+run_one "particle2 (push)"  PXG_SCENE=particle2 PXG_P2_ARM=push
+
 # P9.97a: slabgrid observes the TGS averaging family (initializeSolverVelocitiesTGS,
 # computeAverageSolverBodyVelocityTGS, propagateAverageSolverBodyVelocityTGS) at the
 # engine grid.  The named row above runs the default `slab` mode (numSlabs 17, per-
@@ -292,6 +311,17 @@ if [ "${1:-}" = "--diagnostics" ]; then
     env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_CONTROL=1 PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 \
         ./gpu-sdk-step 2>&1 | grep -E '^  \[ control \]|^FAIL:|^\[ *(OK|FAIL|control) *\] gpu-sdk-step' | sed 's/^/    /'
     rm -f "$pa_dump"
+
+    # P9.99b: upstream note U1 -- ps_stepParticlesLaunch steps pool slot blockIdx.y, not
+    # act[blockIdx.y] (particlesystem.cu:130).  With system A (slot 0) removed before step
+    # 60, the TGS predictor advances A's still-allocated arrays and never steps B (slot 1):
+    # B's final arrays differ from the no-removal run (measured 500 of 1000 words).  PGS
+    # does not launch the kernel (0 words).  The port keeps the CUDA's indexing.
+    for solver in tgs pgs; do
+        echo "--- particle2 (remove, $solver): A removed before step 60"
+        env PXG_SCENE=particle2 PXG_P2_ARM=remove PXG_SOLVER=$solver PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+            | grep -E '^  B remove/both|^\[ *(OK|FAIL|diagnostic) *\] gpu-sdk-step' | sed 's/^/    /'
+    done
 
     # P9.95: softbodydata's control makes the same reads and writes with plain DtoH/HtoD on
     # the aliased public buffers instead of copySoftBodyData / applySoftBodyData.  Its final

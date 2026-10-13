@@ -144,7 +144,7 @@ struct PxgShape                 // PxgConvexConvexShape.h, 48 B
 // ---------------------------------------------------------------------------
 struct SbMidphaseParams
 {
-    uint numTests;              // @0
+    uint numWorkItems;          // @0  (CUDA softbodyMidPhase.cu:200 `numWorkItems`)
     float toleranceLength;      // @4   (ABI parity only — never read)
     uint64_t cmInputs;          // @8
     uint64_t transformCache;    // @16  (ABI parity only — never read)
@@ -251,7 +251,7 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
     {
     GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
     const uint cmIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
-    if (cmIdx >= gMid.numTests)
+    if (cmIdx >= gMid.numWorkItems)
         break;
 
     PxgShape sbShape, rigidShape;

@@ -153,7 +153,7 @@ struct PrepAttachParams
     uint _pad36;                      // @36
     uint64_t constraints;             // @40
     uint64_t prePrepDesc;             // @48
-    uint64_t prepDesc;                // @56
+    uint64_t prepareDesc;             // @56
     uint64_t sharedDesc;              // @64
     uint64_t rigidDeltaVel;           // @72  -> 80
 }
@@ -211,7 +211,7 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gPrep.clothes);
     Ptr<uint> activeRigidAttachments = Ptr<uint>(gPrep.activeRigidAttachments);
     Ptr<uint64_t> rigidAttachmentIds = Ptr<uint64_t>(gPrep.rigidAttachmentIds);
-    Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(gPrep.prepDesc);
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(gPrep.prepareDesc);
 
     // body2WorldPool / solverBodyDataPool / solverBodyTxIDataPool bases.
     const uint64_t bodyFramesBase = prepDesc[0].body2WorldPool;

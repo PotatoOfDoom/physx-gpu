@@ -95,7 +95,9 @@ PXG_TEST(p0Subgroup)
     }
 
     // --- required-size pipeline: prove the createPipelineEx mechanism ---
-    if (caps.canRequireSize)
+    // createPipelineEx promises FULL subgroups, so it refuses (VUID-02785) without
+    // computeFullSubgroups even when the size itself is in range.
+    if (caps.canRequireSize && caps.fullSubgroups)
     {
         // Prefer 32 (the warp-32 profile); otherwise exercise the mechanism at
         // the device's minimum size (e.g. llvmpipe is fixed at 8).

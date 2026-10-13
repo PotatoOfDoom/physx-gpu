@@ -7,7 +7,15 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **889/889** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **890/890** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.99: (A) a required subgroup size is checked against the device AND the entry's workgroup shape
+(VUID 02755/02785/02760/02761/02762/02757/02756) and refused loudly instead of silently;
+check_subgroup_ops.py pins that no engine kernel depends on a subgroup width.  (C) check_push_block.py
+gains a run-on-into-padding rule and a name leg against the CUDA parameter names (CUDA-side swaps
+simulated too; 8 shader members renamed to the CUDA names, layout unchanged; 17 name-blind kernels
+ratcheted).  (B) PXG_SCENE=particle2: two PBD systems bit-identical to each system alone and to the
+swapped pool order (TGS/PGS, fluid+diffuse, apply, push); 32/32 scene mutants killed, 13 fixture
+twins.  Allocation counter fixed (frees were never counted since P9.98).  Scenes 85/85.
 P9.98: Khronos validation layer over the whole suite (both modes) and all scenes: 6 findings.  F4 REAL
 LATENT DEFECT FIXED -- a failed pipeline creation returned a live handle (release builds only
 asserted) and the next dispatch crashed; now every Vulkan result is checked, partial objects are
@@ -2178,6 +2186,74 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.99 — Subgroup-Größe laut abgelehnt, Namensabgleich im Push-Block-Checker, Szene mit zwei Partikelsystemen
+
+**A — Subgroup-Größe.** Konnte `createPipelineEx` eine angeforderte Subgroup-Größe nicht erfüllen,
+lehnte es still ab. Die P9.98-Notiz „offen“ war schon beim Commit überholt: Der stille Zweig lag im
+Basis-Default (D3D12), nicht im Vulkan-Pfad.
+- Jetzt prüft `pxgRequiredSubgroupSizeFits` in der Reihenfolge der Spezifikation (VUIDs 02755,
+  02785, 02760, 02761/02762, 02757, 02756) gegen das Gerät **und** gegen die Workgroup-Form des
+  Einstiegspunkts. Abgelehnt wird über den P9.98-Pfad, bevor ein Vulkan-Objekt existiert, mit einer
+  Meldung, die die verletzte Seite nennt.
+- `REQUIRE_FULL_SUBGROUPS` wird mit jeder Größe gesetzt.
+- Vorher wurden fünf Formen gebaut, die hätten abgelehnt werden müssen, mit 5 Layer-Fehlern pro
+  Modus. Jetzt ist es 0. Engine-Pipelines fordern keine Größe an; das ändert sich also auf keinem
+  Treiber.
+- `check_subgroup_ops.py` hält statisch fest, dass kein Engine-Modul Subgroup-Operationen benutzt,
+  Quad-Control (5087/5110/5111) eingeschlossen; nur drei Proben stehen auf der Allowlist.
+- Neuer ctest `gpuslang.subgroupOps`.
+- Sweeps: Device 38/39 (der Überlebende ist plattform-äquivalent), Checker 14/14.
+
+**C — Push-Block-Checker.**
+- Neue Regel RUN-ON: Ein gelesener Member, der ein Host-Feld ≥ 4 Byte abdeckt und dann ins Padding
+  läuft, wird gemeldet. Auf dem Baum gibt es 0 Funde; die 86 Member, die ins Padding laufen, liegen
+  alle über 1-Byte-Bools.
+- **Namensabgleich:** Die Namen der Push-Member werden gegen die CUDA-Parameter und die Felder von
+  By-Value-Structs verglichen (normalisiert). Eine Vertauschung wird simuliert, auf Shader- wie auf
+  CUDA-Seite.
+  - Von 8520 möglichen Vertauschungen gleich großer gelesener Member sieht die Größenprüfung 96, der
+    Namensabgleich 8407.
+  - Die Gegenprüfung fand, dass CUDA-seitige Vertauschungen zwischen einem gelesenen und einem
+    ungelesenen Parameter unsichtbar waren (17 Paare in 12 Kerneln). 8 davon sind durch Umbenennen
+    der Shader-Member auf die CUDA-Namen geschlossen; das SPIR-V ist bis auf die Namen wortgleich:
+    - `numTests` → `numWorkItems` (3 Midphase-Blöcke),
+    - `prepDesc` → `prepareDesc` (4 Shader),
+    - `clothAppliedForces` → `softBodyAppliedForces`.
+  - 17 namenblinde Kernel stehen mit Begründung in `push_name_known.txt`.
+- Der Checker-Mutations-Sweep tötet alle sechs Mutanten der Gegenprüfung. Ein Mutant, der `main`
+  umgeht, wird nur im End-to-End-Rotlauf sichtbar.
+- Kein echter Tausch auf dem Baum.
+
+**B — Zwei Partikelsysteme.** Neue Szene `PXG_SCENE=particle2` mit 5 Zeilen (split TGS/PGS, fluid,
+apply, push) und einer Diagnose `remove`.
+- Jedes System ist bitgleich zu sich allein und zur vertauschten Pool-Reihenfolge: 0/512 bzw. 0/1000
+  Wörter, die Diffuse-Mengen identisch. Die push-Zeile ist physikalisch geprüft, weil die
+  Kontaktreihenfolge von der Szene abhängt.
+- Der Launch-Trace zeigt beide Systeme in jedem Kernel mit Pfad pro System.
+- 32/32 Szenen-Mutanten getötet, jeder lässt einen Kernel System 0 benutzen. Der äquivalente
+  `p2-bound2-id0` schreibt nur das nie gelesene `mBoundCenter`.
+- 13 Fixture-Zwillinge mit drei Systemen im Pool und einer Köder-Prüfung. Vorher überlebten 22
+  Mutanten, jetzt sind 34/34 nach Wert getötet.
+- **Kein Port-Fehler** für mehrere PBD-Systeme.
+- **Upstream-Kandidaten (dokumentiert, nicht gemeldet):**
+  - U1: `ps_stepParticlesLaunch` indiziert `particleSystems[blockIdx.y]`. Nach dem Entfernen eines
+    Systems wird das entfernte System weiter geschrittet und das überlebende im höchsten Slot nie
+    (particlesystem.cu:130, `replaceWithLast`).
+  - U3: Die Adhäsionsprüfung vergleicht gegen den Skalenwert statt gegen den Radius (:1443/:1499).
+  - U2/U4: Die Reihenfolge der Starrkörper-Kontakte und der Spray-Partikel ist nicht stabil.
+
+**Zählfehler aus P9.98 behoben.** `destroyBuffer` gab Speicher ohne `freeMemoryCounted` frei. Der
+gemeldete Allokations-„Höchststand“ war deshalb eine laufende Summe; der Verdacht auf ein Leck beim
+Freigeben einer Szene war falsch, unter gdb gemessen ist der Live-Stand danach jeweils 0. Neu
+gemessen: particle2 39–46 statt 154–204, größter Suite-Wert 569. Die F5-Schwelle 2048 bleibt.
+
+**Beobachtung:** clothcloth, clothselfcollide, softbodystack und der Softbody-Heightfield-Boden
+schwanken auf llvmpipe von Lauf zu Lauf in der 5. Nachkommastelle, mit alten wie neuen Shadern
+(Atomics-Reihenfolge). Sie liegen innerhalb der Szenentoleranzen.
+
+**Foldscan:** UNREVIEWED 0. **Checker:** alle 19 grün. **Validierung:** 0 nicht freigestellte
+Meldungen. **Suite:** 890/890 in beiden Speichermodi. **Szenen:** 85/85.
 
 ## P9.98 — Khronos-Validierung über Suite und Szenen; echter latenter Fehler bei fehlgeschlagener Pipeline-Erstellung
 

@@ -73,6 +73,18 @@
 // over maxComputeWorkGroupCount is a refused dispatch; every PXG_VK_LIMIT_* name is pinned;
 // device and shim transfers past their buffer are refused; and the widened push range is
 // reported under PXG_VK_DEBUG_NAMES.
+//
+// P9.99 (pipelineRefusal_subgroupSize*).  createPipelineEx asks for an EXACT subgroup size
+// with FULL subgroups.  Until P9.99 it checked only the device's window: an in-window size
+// on an entry whose workgroup x is not a multiple of it (VUID-02757) or whose x*y*z exceeds
+// size x maxComputeWorkgroupSubgroups (VUID-02756) was BUILT -- measured on HEAD 2a97aa5
+// with p99SubgroupShape.spv: 5 rows, 5 layer errors, both memory modes -- and llvmpipe,
+// which refuses no size itself (4, 6, 12, 16, 256: VkResult 0), ran x = 4 as 8-lane
+// subgroups with 4 active lanes.  The rule (pxgRequiredSubgroupSizeFits) is pinned by a
+// literal host oracle; the device rows by what the driver was asked for (the interposer
+// records every vkCreateComputePipelines stage) and by what the subgroups did; the
+// desc hooks take a capability away so each refusal shows on llvmpipe.  No engine path
+// calls createPipelineEx (the shim builds through createPipeline / -Tex / -Bindless).
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -158,6 +170,19 @@ void p98Gone(uint64_t h)
     if (gP98Track)
         gP98Live.erase(h);
 }
+
+// P9.99: what the LAST vkCreateComputePipelines call asked the driver for, recorded armed or
+// not.  llvmpipe runs full 8-lane subgroups at x = 64 with or without the request, so only
+// this record shows a dropped VkPipelineShaderStageRequiredSubgroupSizeCreateInfo, a wrong
+// size in it, or a missing REQUIRE_FULL_SUBGROUPS flag.
+struct P99Stage
+{
+    uint32_t calls = 0;
+    VkPipelineShaderStageCreateFlags flags = 0;
+    bool chained = false;   // a required-subgroup-size struct on the stage's pNext chain
+    uint32_t size = 0;      // its requiredSubgroupSize
+};
+P99Stage gP99Stage;
 } // namespace
 
 // One create / destroy pair: a failure writes junk and returns `err`; a success is
@@ -210,6 +235,18 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice d, VkPipelineCa
                                                         const VkAllocationCallbacks* a, VkPipeline* out)
 {
     static const auto real = p98Next<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+    ++gP99Stage.calls;
+    gP99Stage.flags = n > 0 ? ci[0].stage.flags : 0;
+    gP99Stage.chained = false;
+    gP99Stage.size = 0;
+    for (const VkBaseInStructure* s = n > 0 ? static_cast<const VkBaseInStructure*>(ci[0].stage.pNext) : nullptr; s;
+         s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO)
+        {
+            gP99Stage.chained = true;
+            gP99Stage.size =
+                reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*>(s)->requiredSubgroupSize;
+        }
     if (p98Armed("vkCreateComputePipelines") || p98Armed("vkCreateComputePipelines+null"))
     {
         for (uint32_t i = 0; i < n; ++i)
@@ -353,6 +390,7 @@ using physx::gpuslang::PxgKernelDef;
 using physx::gpuslang::PxgResult;
 using physx::gpuslang::PxgSpirvEntryInfo;
 using physx::gpuslang::pxgSpirvReflectEntry;
+using physx::gpuslang::pxgRequiredSubgroupSizeFits;
 
 std::vector<uint8_t> refusalLoader(const char* f)
 {
@@ -420,6 +458,86 @@ bool physicalLimits(const char* name, VkPhysicalDeviceLimits* out)
     return found;
 }
 
+// P9.99: a device whose SubgroupCaps the desc hooks have lowered, in the suite's memory mode
+// (the hooks only take a capability away; the features stay enabled).
+PxgSlangComputeDevice* subgroupDevice(bool noSizeControl, bool noFullSubgroups, uint32_t maxWorkgroupSubgroups)
+{
+    PxgSlangDeviceDesc desc;
+    const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
+    desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
+    const char* v2 = std::getenv("PXG_DEVICE_V2");
+    desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+    desc.noSubgroupSizeControl = noSizeControl;
+    desc.noFullSubgroups = noFullSubgroups;
+    desc.limitMaxComputeWorkgroupSubgroups = maxWorkgroupSubgroups;
+    return physx::gpuslang::PxgCreateVulkanComputeDevice(desc);
+}
+
+// P9.99: the physical device's own subgroup properties and subgroup-size-control
+// properties / features, read through a separate Vulkan 1.3 instance (as physicalLimits),
+// for the device named `name`; false if not found.
+struct PhysicalSubgroup
+{
+    uint32_t subgroupSize = 0;
+    VkPhysicalDeviceSubgroupSizeControlProperties props = {};
+    VkPhysicalDeviceSubgroupSizeControlFeatures feats = {};
+    // What SubgroupCaps must say (the device's init reads exactly these).
+    bool canRequire() const
+    {
+        return feats.subgroupSizeControl == VK_TRUE && (props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+    bool full() const { return feats.computeFullSubgroups == VK_TRUE; }
+    // The numbers the device rows below are written for (llvmpipe, 256-bit).
+    bool isLlvmpipeShape() const
+    {
+        return props.minSubgroupSize == 8 && props.maxSubgroupSize == 8 && canRequire() && full() &&
+               props.maxComputeWorkgroupSubgroups == 32;
+    }
+};
+bool physicalSubgroupControl(const char* name, PhysicalSubgroup* out)
+{
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ci.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS)
+        return false;
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    std::vector<VkPhysicalDevice> pds(n);
+    if (n)
+        vkEnumeratePhysicalDevices(inst, &n, pds.data());
+    bool found = false;
+    for (VkPhysicalDevice pd : pds)
+    {
+        VkPhysicalDeviceSubgroupSizeControlProperties sizeProps = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES
+        };
+        VkPhysicalDeviceSubgroupProperties sgProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+        sgProps.pNext = &sizeProps;
+        VkPhysicalDeviceProperties2 props2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        props2.pNext = &sgProps;
+        vkGetPhysicalDeviceProperties2(pd, &props2);
+        if (found || std::strcmp(props2.properties.deviceName, name) != 0)
+            continue;
+        VkPhysicalDeviceSubgroupSizeControlFeatures sizeFeats = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES
+        };
+        VkPhysicalDeviceFeatures2 feats2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        feats2.pNext = &sizeFeats;
+        vkGetPhysicalDeviceFeatures2(pd, &feats2);
+        out->subgroupSize = sgProps.subgroupSize;
+        out->props = sizeProps;
+        out->props.pNext = nullptr;
+        out->feats = sizeFeats;
+        out->feats.pNext = nullptr;
+        found = true;
+    }
+    vkDestroyInstance(inst, nullptr);
+    return found;
+}
+
 // Check round 1: sets an environment variable for its lifetime and then RESTORES what the
 // caller had (unsetenv only when it was unset), so a fixture never clobbers a user's hook.
 struct ScopedEnv
@@ -470,6 +588,51 @@ std::string captureStderr(F fn)
     std::fclose(tmp);
     std::fputs(out.c_str(), stderr);   // still in the test log
     return out;
+}
+
+// P9.99: createPipelineEx on p99SubgroupShape.spv (one 16-byte storage buffer, a 4-byte push
+// block), with the stderr it wrote.
+PxgPipelineHandle p99BuildEx(PxgSlangComputeDevice* dev, const std::vector<uint8_t>& blob, const char* entry,
+                             uint32_t size, std::string* message)
+{
+    const uint32_t stride = 16;
+    PxgPipelineHandle h = 0;
+    const std::string m =
+        captureStderr([&] { h = dev->createPipelineEx(blob.data(), blob.size(), entry, 1, &stride, 4, size); });
+    if (message)
+        *message = m;
+    return h;
+}
+
+// P9.99: runs `pipe` (`invocations` per workgroup) over 3 workgroups and counts the threads
+// NOT in a full 8-lane subgroup: lane count != 8, WavePrefixSum(1) != lane index, or
+// ballot / WaveActiveSum(1) != the lane count -- or not written at all.  `ballot` (if
+// non-null) gets the first thread's ballot count.
+uint32_t p99NotFullThreads(PxgSlangComputeDevice* dev, PxgPipelineHandle pipe, uint32_t invocations,
+                           uint32_t* ballot = nullptr)
+{
+    struct SgOut
+    {
+        uint32_t x, y, z, w;
+    };
+    const uint32_t groups = 3, n = groups * invocations;
+    const std::vector<SgOut> init(n, SgOut{ 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu });
+    PxgBufferHandle b = createBufferFrom(dev, init);
+    const uint32_t numThreads = n;
+    dev->dispatch(pipe, groups, 1, 1, &b, 1, &numThreads, sizeof(numThreads));
+    dev->flush();
+    const std::vector<SgOut> g = downloadBuffer<SgOut>(dev, b, n);
+    dev->destroyBuffer(b);
+    uint32_t notFull = 0;
+    for (const SgOut& o : g)
+    {
+        const uint32_t lane = o.x & 0xffffu, count = o.x >> 16;
+        if (o.x == 0xffffffffu || count != 8u || o.y != lane || o.z != count || o.w != count)
+            ++notFull;
+    }
+    if (ballot)
+        *ballot = g.empty() ? 0u : g[0].z;
+    return notFull;
 }
 
 // Check round 1: a hand-assembled SPIR-V 1.5 module whose one GLCompute entry "main"
@@ -1639,4 +1802,330 @@ PXG_TEST(pipelineRefusal_outOfMemory)
         delete noCache;
     }
     PXG_CHECK_MSG(gP98JunkDestroyed == 0, "the failed cache's undefined output was destroyed");
+}
+
+// ---- P9.99: createPipelineEx's required subgroup size ----
+
+namespace
+{
+// Reaches the BASE default createPipelineEx -- the one the D3D12 backend inherits -- with
+// the eleven pure virtuals stubbed; createPipeline answers 77.
+struct P99BaseDevice : PxgSlangComputeDevice
+{
+    const char* getDeviceName() const override { return "p99-base"; }
+    const char* getBackendName() const override { return "P99Base"; }
+    PxgBufferHandle createBuffer(size_t) override { return 0; }
+    void destroyBuffer(PxgBufferHandle) override {}
+    void upload(PxgBufferHandle, const void*, size_t, size_t) override {}
+    void download(PxgBufferHandle, void*, size_t, size_t) override {}
+    PxgPipelineHandle createPipeline(const void*, size_t, const char*, uint32_t, const uint32_t*, uint32_t) override
+    {
+        return PxgPipelineHandle(77);
+    }
+    void destroyPipeline(PxgPipelineHandle) override {}
+    bool dispatch(PxgPipelineHandle, uint32_t, uint32_t, uint32_t, const PxgBufferHandle*, uint32_t, const void*,
+                  uint32_t) override
+    {
+        return true;
+    }
+    void barrier() override {}
+    void flush() override {}
+};
+} // namespace
+
+// The rule as a LITERAL host oracle, no device.  L is llvmpipe (measured: window [8, 8],
+// maxComputeWorkgroupSubgroups 32); W a wide window [8, 64] with 16 subgroups and default 32,
+// so a rule written against minSize or defaultSize instead of the requested size is caught
+// (a 32-wide x is a multiple of 8 but not of 64); `big` puts the limit product past 32 bits,
+// and a (2^31, 2, 2) workgroup the invocation product.  A refusing row must name its rule,
+// an accepting row must leave `why` empty, and a null or zero-length `why` is never written.
+PXG_TEST(pipelineRefusal_subgroupSizeRule)
+{
+    typedef PxgSlangComputeDevice::SubgroupCaps Caps;
+    Caps L;
+    L.defaultSize = 8;
+    L.minSize = 8;
+    L.maxSize = 8;
+    L.canRequireSize = true;
+    L.fullSubgroups = true;
+    L.maxComputeWorkgroupSubgroups = 32;
+    Caps W;
+    W.defaultSize = 32;
+    W.minSize = 8;
+    W.maxSize = 64;
+    W.canRequireSize = true;
+    W.fullSubgroups = true;
+    W.maxComputeWorkgroupSubgroups = 16;
+    Caps noCtl = L;
+    noCtl.canRequireSize = false;
+    Caps noFull = L;
+    noFull.fullSubgroups = false;
+    Caps noMws = L;
+    noMws.maxComputeWorkgroupSubgroups = 0;
+    Caps big;
+    big.defaultSize = 2;
+    big.minSize = 2;
+    big.maxSize = 2;
+    big.canRequireSize = true;
+    big.fullSubgroups = true;
+    big.maxComputeWorkgroupSubgroups = 0x80000000u;
+    struct Row
+    {
+        const char* name;
+        const Caps* caps;
+        uint32_t size;
+        uint32_t localSize[3];
+        bool fits;
+        const char* says;   // what a refusal must name
+    };
+    const Row rows[] = {
+        { "no request, any shape", &L, 0, { 1, 1, 1 }, true, "" },
+        { "no request, no size control", &noCtl, 0, { 4, 1, 1 }, true, "" },
+        { "64 at 8", &L, 8, { 64, 1, 1 }, true, "" },
+        { "(8, 32, 1) = 8 x 32, the boundary", &L, 8, { 8, 32, 1 }, true, "" },
+        { "(8, 33, 1) > 256", &L, 8, { 8, 33, 1 }, false, "VUID-02756" },
+        { "(8, 1, 33) > 256 through z", &L, 8, { 8, 1, 33 }, false, "VUID-02756" },
+        { "512 > 256", &L, 8, { 512, 1, 1 }, false, "VUID-02756" },
+        { "x 4 not a multiple", &L, 8, { 4, 1, 1 }, false, "VUID-02757" },
+        { "x 12 >= 8, not a multiple", &L, 8, { 12, 1, 1 }, false, "VUID-02757" },
+        { "16 above the window", &L, 16, { 64, 1, 1 }, false, "VUID-02762" },
+        { "4 below the window", &L, 4, { 64, 1, 1 }, false, "VUID-02761" },
+        { "256 above the window", &L, 256, { 256, 1, 1 }, false, "VUID-02762" },
+        { "12 not a power of two (narrow)", &L, 12, { 48, 1, 1 }, false, "VUID-02760" },
+        { "24 inside a wide window, not a power of two", &W, 24, { 48, 1, 1 }, false, "VUID-02760" },
+        { "wide: 8, the min boundary", &W, 8, { 64, 1, 1 }, true, "" },
+        { "wide: 32", &W, 32, { 64, 1, 1 }, true, "" },
+        { "wide: 64, the max boundary", &W, 64, { 64, 1, 1 }, true, "" },
+        { "wide: 64 x 16 = 1024, the boundary", &W, 64, { 64, 16, 1 }, true, "" },
+        { "wide: 64 x 17 > 1024", &W, 64, { 64, 17, 1 }, false, "VUID-02756" },
+        { "no size control", &noCtl, 8, { 64, 1, 1 }, false, "VUID-02755" },
+        { "no full subgroups", &noFull, 8, { 64, 1, 1 }, false, "VUID-02785" },
+        { "unknown x", &L, 8, { 0, 1, 1 }, false, "not readable" },
+        { "unknown y", &L, 8, { 8, 0, 1 }, false, "not readable" },
+        { "unknown z", &L, 8, { 8, 1, 0 }, false, "not readable" },
+        { "maxComputeWorkgroupSubgroups unknown refuses", &noMws, 8, { 8, 1, 1 }, false, "VUID-02756" },
+        { "64-bit limit product", &big, 2, { 2, 1, 1 }, true, "" },
+        { "64-bit invocation product", &L, 8, { 0x80000000u, 2, 2 }, false, "VUID-02756" },
+        { "wide: 64 on x 32 (min and default divide x)", &W, 64, { 32, 1, 1 }, false, "VUID-02757" },
+        { "wide: 16 on (8, 2, 1)", &W, 16, { 8, 2, 1 }, false, "VUID-02757" },
+        { "wide: 8 on x 8 (default 32)", &W, 8, { 8, 1, 1 }, true, "" },
+    };
+    for (const Row& r : rows)
+    {
+        char why[320];
+        std::memset(why, 'J', sizeof(why));
+        why[sizeof(why) - 1] = '\0';
+        const bool got = pxgRequiredSubgroupSizeFits(*r.caps, r.size, r.localSize, why, sizeof(why));
+        const bool ok = got == r.fits && (r.fits ? why[0] == '\0' : std::strstr(why, r.says) != nullptr);
+        PXG_CHECK_MSG(ok, "%s: size %u on (%u, %u, %u) got %d (expected %d, naming '%s'), why '%s'", r.name, r.size,
+                      r.localSize[0], r.localSize[1], r.localSize[2], int(got), int(r.fits), r.says, why);
+    }
+    const uint32_t x4[3] = { 4, 1, 1 };
+    PXG_CHECK_MSG(!pxgRequiredSubgroupSizeFits(L, 8, x4, nullptr, 0), "a null why still refuses");
+    char one[1] = { 'J' };
+    const bool zeroLen = pxgRequiredSubgroupSizeFits(L, 8, x4, one, 0);
+    PXG_CHECK_MSG(!zeroLen && one[0] == 'J', "a zero-length why refuses and is not written (got %d, '%c')",
+                  int(zeroLen), one[0]);
+    std::printf("  %zu oracle rows + 2 why rows\n", sizeof(rows) / sizeof(rows[0]));
+}
+
+// createPipelineEx on the real device.  Its SubgroupCaps must be the physical device's own
+// (read through a separate instance).  On llvmpipe's numbers -- gated on the PHYSICAL values,
+// so a device that never reads them cannot skip the rows -- every row of
+// p99SubgroupShape.spv is either BUILT (exactly one pipeline create, asking the driver for
+// the size WITH full subgroups, and every thread then in a full 8-lane subgroup) or
+// REFUSED with its VUID before any Vulkan object exists.  sgShape4 without a request is
+// the detector's positive control: a 4-thread workgroup cannot fill an 8-lane subgroup, so
+// llvmpipe runs it with 4 active lanes and the counter must see all 12 threads.
+PXG_TEST(pipelineRefusal_subgroupSizeDevice)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgSlangComputeDevice::SubgroupCaps caps = dev->getSubgroupCaps();
+    std::printf("  subgroup caps: default %u, window [%u, %u], can require %d, full %d, "
+                "maxComputeWorkgroupSubgroups %u\n",
+                caps.defaultSize, caps.minSize, caps.maxSize, int(caps.canRequireSize), int(caps.fullSubgroups),
+                caps.maxComputeWorkgroupSubgroups);
+    PhysicalSubgroup ps;
+    const bool havePs = physicalSubgroupControl(dev->getDeviceName(), &ps);
+    PXG_CHECK_MSG(havePs, "the physical device %s must be found again", dev->getDeviceName());
+    if (!havePs)
+        return;
+    std::printf("  physical: subgroupSize %u, window [%u, %u], requiredSubgroupSizeStages 0x%x, subgroupSizeControl "
+                "%u, computeFullSubgroups %u, maxComputeWorkgroupSubgroups %u\n",
+                ps.subgroupSize, ps.props.minSubgroupSize, ps.props.maxSubgroupSize,
+                unsigned(ps.props.requiredSubgroupSizeStages), unsigned(ps.feats.subgroupSizeControl),
+                unsigned(ps.feats.computeFullSubgroups), ps.props.maxComputeWorkgroupSubgroups);
+    PXG_CHECK_MSG(caps.defaultSize == ps.subgroupSize && caps.minSize == ps.props.minSubgroupSize &&
+                      caps.maxSize == ps.props.maxSubgroupSize,
+                  "the window must be the physical device's");
+    PXG_CHECK_MSG(caps.maxComputeWorkgroupSubgroups == ps.props.maxComputeWorkgroupSubgroups,
+                  "maxComputeWorkgroupSubgroups must be the physical device's (%u vs %u)",
+                  caps.maxComputeWorkgroupSubgroups, ps.props.maxComputeWorkgroupSubgroups);
+    PXG_CHECK_MSG(caps.canRequireSize == ps.canRequire() && caps.fullSubgroups == ps.full(),
+                  "canRequireSize / fullSubgroups must be the physical device's (%d %d vs %d %d)",
+                  int(caps.canRequireSize), int(caps.fullSubgroups), int(ps.canRequire()), int(ps.full()));
+    if (!ps.isLlvmpipeShape())
+    {
+        std::printf("  NOTE: not llvmpipe's subgroup numbers -> skip the device rows\n");
+        return;
+    }
+
+    const std::vector<uint8_t> blob = loadShaderBlob("p99SubgroupShape.spv");
+    struct Case
+    {
+        const char* entry;
+        uint32_t invocations;
+        uint32_t size;
+        const char* says;    // nullptr: must build
+        uint32_t notFull;    // built: threads (of 3 workgroups) not in a full 8-lane subgroup
+        uint32_t ballot;     // built: the first thread's ballot count
+    };
+    const Case cases[] = {
+        { "sgShape64", 64, 8, nullptr, 0, 8 },
+        { "sgShape8x32", 256, 8, nullptr, 0, 8 },
+        { "sgShape4", 4, 0, nullptr, 12, 4 },   // the detector's positive control
+        { "sgShape8x33", 264, 8, "VUID-02756", 0, 0 },
+        { "sgShape8x1x33", 264, 8, "VUID-02756", 0, 0 },
+        { "sgShape512", 512, 8, "VUID-02756", 0, 0 },
+        { "sgShape4", 4, 8, "VUID-02757", 0, 0 },
+        { "sgShape12", 12, 8, "VUID-02757", 0, 0 },
+        { "sgShape64", 64, 16, "VUID-02762", 0, 0 },
+        { "sgShape64", 64, 4, "VUID-02761", 0, 0 },
+        { "sgShape64", 64, 12, "VUID-02760", 0, 0 },
+        { "sgShape64", 64, 256, "VUID-02762", 0, 0 },
+    };
+    std::fprintf(stderr, "[pipelineRefusal] the [PxgVulkan] subgroup-size refusals below are EXPECTED\n");
+    for (const Case& c : cases)
+    {
+        const uint32_t callsBefore = gP99Stage.calls;
+        gP98Live.clear();
+        gP98Created = 0;
+        gP98Track = true;
+        std::string m;
+        const PxgPipelineHandle h = p99BuildEx(dev, blob, c.entry, c.size, &m);
+        gP98Track = false;
+        const bool full = (gP99Stage.flags & VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) != 0;
+        std::printf("  %-14s @%-3u -> %s\n", c.entry, c.size, h ? "built" : "refused");
+        if (c.says)
+        {
+            PXG_CHECK_MSG(h == 0, "%s @%u must be refused (%s)", c.entry, c.size, c.says);
+            PXG_CHECK_MSG(gP98Created == 0, "%s @%u: refused before ANY Vulkan object, but %u were made", c.entry,
+                          c.size, gP98Created);
+            PXG_CHECK_MSG(gP99Stage.calls == callsBefore, "%s @%u: no vkCreateComputePipelines call (%u)", c.entry,
+                          c.size, gP99Stage.calls - callsBefore);
+            PXG_CHECK_MSG(m.find(c.entry) != std::string::npos && m.find(c.says) != std::string::npos &&
+                              m.find("; refused") != std::string::npos,
+                          "%s @%u: the line must name the entry, %s and '; refused': '%s'", c.entry, c.size, c.says,
+                          m.c_str());
+            if (h)
+            {
+                // Only on a device that wrongly built it: what the subgroups then did.
+                const uint32_t nf = p99NotFullThreads(dev, h, c.invocations);
+                std::printf("    built anyway: threads in a non-full subgroup %u of %u\n", nf, 3 * c.invocations);
+            }
+        }
+        else
+        {
+            PXG_CHECK_MSG(h != 0 && m.empty(), "%s @%u must build without a line: '%s'", c.entry, c.size, m.c_str());
+            PXG_CHECK_MSG(gP99Stage.calls == callsBefore + 1, "%s @%u: exactly one vkCreateComputePipelines call (%u)",
+                          c.entry, c.size, gP99Stage.calls - callsBefore);
+            if (c.size)
+                PXG_CHECK_MSG(gP99Stage.chained && gP99Stage.size == c.size && full,
+                              "%s @%u: the driver must be asked for size %u with full subgroups (struct %d, size %u, "
+                              "full %d)",
+                              c.entry, c.size, c.size, int(gP99Stage.chained), gP99Stage.size, int(full));
+            else
+                PXG_CHECK_MSG(!gP99Stage.chained && !full,
+                              "%s @0: no size struct and no full-subgroups flag (struct %d, full %d)", c.entry,
+                              int(gP99Stage.chained), int(full));
+            if (h)
+            {
+                uint32_t ballot = 0;
+                const uint32_t nf = p99NotFullThreads(dev, h, c.invocations, &ballot);
+                std::printf("    threads in a non-full subgroup %u of %u, first ballot %u\n", nf, 3 * c.invocations,
+                            ballot);
+                PXG_CHECK_MSG(nf == c.notFull && ballot == c.ballot,
+                              "%s @%u: %u threads not in a full subgroup (expected %u), ballot %u (expected %u)",
+                              c.entry, c.size, nf, c.notFull, ballot, c.ballot);
+            }
+        }
+        if (h)
+            dev->destroyPipeline(h);
+    }
+}
+
+// The desc hooks take one capability away each -- so each capability refusal shows on
+// llvmpipe -- and never raise one.  And the base default (D3D12's) refuses WITH a line.
+PXG_TEST(pipelineRefusal_subgroupSizeHooks)
+{
+    {
+        P99BaseDevice base;
+        const uint32_t stride = 16;
+        PxgPipelineHandle h = 1;
+        const std::string m =
+            captureStderr([&] { h = base.createPipelineEx(nullptr, 0, "p99probe", 1, &stride, 4, 32); });
+        PXG_CHECK_MSG(h == 0 && m.find("p99probe") != std::string::npos && m.find("size 32") != std::string::npos &&
+                          m.find("; refused") != std::string::npos,
+                      "the base default refuses a size with a line: handle %u, '%s'", h, m.c_str());
+        PXG_CHECK_MSG(base.createPipelineEx(nullptr, 0, "p99probe", 1, &stride, 4, 0) == PxgPipelineHandle(77),
+                      "the base default forwards size 0 to createPipeline");
+    }
+
+    PxgSlangComputeDevice* real = testDevice();
+    PhysicalSubgroup ps;
+    const bool havePs = physicalSubgroupControl(real->getDeviceName(), &ps);
+    PXG_CHECK_MSG(havePs, "the physical device %s must be found again", real->getDeviceName());
+    if (!havePs)
+        return;
+    if (!ps.isLlvmpipeShape())
+    {
+        std::printf("  NOTE: not llvmpipe's subgroup numbers -> skip the hook rows\n");
+        return;
+    }
+    const std::vector<uint8_t> blob = loadShaderBlob("p99SubgroupShape.spv");
+    const uint32_t mws = ps.props.maxComputeWorkgroupSubgroups;
+    std::fprintf(stderr, "[pipelineRefusal] the [PxgVulkan] subgroup-size refusals below are EXPECTED (hooks)\n");
+    struct Hook
+    {
+        const char* what;
+        bool noCtl, noFull;
+        uint32_t limit;
+        bool canRequire, fullSubgroups;
+        uint32_t mws;           // what the caps must say
+        const char* says;       // sgShape64 @8: nullptr = builds, else the refusal's rule
+    };
+    const Hook hooks[] = {
+        { "noSubgroupSizeControl", true, false, 0, false, true, mws, "VUID-02755" },
+        { "noFullSubgroups", false, true, 0, true, false, mws, "VUID-02785" },
+        { "limitMaxComputeWorkgroupSubgroups 4", false, false, 4, true, true, 4, "VUID-02756" },
+        { "limitMaxComputeWorkgroupSubgroups 1000 (above: no effect)", false, false, 1000, true, true, mws, nullptr },
+    };
+    for (const Hook& k : hooks)
+    {
+        PxgSlangComputeDevice* d = subgroupDevice(k.noCtl, k.noFull, k.limit);
+        PXG_CHECK_MSG(d != nullptr, "%s: the device must be created", k.what);
+        if (!d)
+            continue;
+        const PxgSlangComputeDevice::SubgroupCaps c = d->getSubgroupCaps();
+        PXG_CHECK_MSG(c.canRequireSize == k.canRequire && c.fullSubgroups == k.fullSubgroups &&
+                          c.maxComputeWorkgroupSubgroups == k.mws && c.minSize == ps.props.minSubgroupSize &&
+                          c.maxSize == ps.props.maxSubgroupSize,
+                      "%s: caps can require %d, full %d, maxComputeWorkgroupSubgroups %u (expected %d %d %u)", k.what,
+                      int(c.canRequireSize), int(c.fullSubgroups), c.maxComputeWorkgroupSubgroups, int(k.canRequire),
+                      int(k.fullSubgroups), k.mws);
+        std::string m;
+        PxgPipelineHandle h = p99BuildEx(d, blob, "sgShape64", 8, &m);
+        if (k.says)
+            PXG_CHECK_MSG(h == 0 && m.find(k.says) != std::string::npos && m.find("; refused") != std::string::npos,
+                          "%s: sgShape64 @8 must be refused naming %s: '%s'", k.what, k.says, m.c_str());
+        else
+            PXG_CHECK_MSG(h != 0 && m.empty(), "%s: sgShape64 @8 must build: '%s'", k.what, m.c_str());
+        if (h)
+            d->destroyPipeline(h);
+        h = p99BuildEx(d, blob, "sgShape64", 0, &m);
+        PXG_CHECK_MSG(h != 0 && m.empty(), "%s: without a request sgShape64 still builds: '%s'", k.what, m.c_str());
+        if (h)
+            d->destroyPipeline(h);
+        delete d;
+    }
 }

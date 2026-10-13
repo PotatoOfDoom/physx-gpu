@@ -1802,6 +1802,12 @@ pxg_compile_shader(npShimAxpy shimAxpy)
 # tail, so the device's zero fill of the surplus (VUID-07987 fix) is observable; and two
 # (1,2,1) / (1,1,2) workgroups for the per-dimension workgroup-size limit.
 pxg_compile_shader(p98PushPad pushPadEcho pushPadDimY pushPadDimZ)
+# P9.99 (gpuslang.pipelineRefusal): one wave-op body at seven workgroup shapes, for
+# createPipelineEx's required-subgroup-size rules (VUID-02756 / 02757).  Vulkan-only like
+# npSpikeSubgroup: absent from PXG_HLSL_ENTRIES and PXG_NOCONTRACT_SHADERS, never in the
+# engine manifest.
+pxg_compile_shader(p99SubgroupShape sgShape64 sgShape8x32 sgShape8x33 sgShape8x1x33 sgShape512 sgShape4
+                   sgShape12)
 # P5 Step 4: PxgBroadPhaseDesc mirror layout proof (BDA).
 pxg_compile_shader(npBpDescProbe bpDescProbe)
 # P5 Step 4: narrowphase element-struct mirror layout proof (BDA).
@@ -3231,8 +3237,26 @@ add_test(NAME gpuslang.launchAbiPack
 # their fields: PAD-READ / STRADDLE / CUT / F-SUBWORD, never ratcheted.  It caught
 # sb_sdfMeshMidphaseGeneratePairsLaunch reading its 80-byte writer at @88 where the
 # bridge pushes it at @96; 415 kernels joined, 0 findings since that shader's fix.
+# P9.99: + R3 RUN-ON (a member over a field of >= 4 bytes running on into padding) and the
+# NAME leg -- every reached member against the CUDA names of the fields it covers, so a
+# swap of equal-size members (two pointers, or a word over a bool and a PxU32) that no
+# offset can see is NAME-SWAP; 0 findings.  Swaps neither the join nor the names can see
+# are simulated, in the shader and (check round) in the CUDA declaration: 324 of 337
+# kernels with an equal-size reached pair decidable, 9 of 9728 CUDA-side pairs blind;
+# 17 kernels on tools/push_name_known.txt.  Selftest plus an end-to-end red run of the
+# whole checker on a scratch dir with two member names swapped; about 12 s.
 add_test(NAME gpuslang.pushBlock
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_push_block.py ${SHADER_OUT_DIR})
+
+# P9.99: the premise behind createPipelineEx's refusals (no fallback): no engine host path
+# calls createPipelineEx (src/, bridge/, include/: declarations only, comments and strings
+# stripped), and no engine module carries an explicit subgroup dependency -- capability,
+# Subgroup* built-in, OpGroupNonUniform* / OpSubgroup*KHR, or a barrier / atomic with
+# Scope Subgroup.  The allowlist of probe modules that use subgroups is exact over the
+# whole shader directory.  A selftest injects each kind into an engine module first.  No
+# GPU, under a second.
+add_test(NAME gpuslang.subgroupOps
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_subgroup_ops.py ${SHADER_OUT_DIR})
 
 # P9.97: the mutation-sweep runners derive their per-run bound from a timed baseline
 # (tools/sweep_timeout.sh) instead of a fixed 300 s, which refused the 435-527 s

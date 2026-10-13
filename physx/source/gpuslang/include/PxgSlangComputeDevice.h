@@ -47,6 +47,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 namespace physx
@@ -91,6 +92,15 @@ struct PxgSlangDeviceDesc
     uint32_t limitMaxComputeWorkGroupInvocations = 0;
     uint32_t limitMaxComputeWorkGroupSize = 0;
     uint32_t limitMaxComputeWorkGroupCount = 0;
+    // P9.99 test hooks for createPipelineEx.  Like the limits above they only take a
+    // capability AWAY, so a fixture can show each refusal on llvmpipe; the device keeps
+    // the features enabled, only what createPipelineEx checks against changes.
+    // limitMaxComputeWorkgroupSubgroups lowers SubgroupCaps::maxComputeWorkgroupSubgroups
+    // (never raises it); noSubgroupSizeControl / noFullSubgroups clear canRequireSize /
+    // fullSubgroups.  No environment variables: nothing outside the fixtures needs them.
+    uint32_t limitMaxComputeWorkgroupSubgroups = 0;
+    bool noSubgroupSizeControl = false;
+    bool noFullSubgroups = false;
 };
 
 class PxgSlangComputeDevice
@@ -237,19 +247,29 @@ public:
         uint32_t maxSize = 0;
         bool canRequireSize = false; // subgroupSizeControl usable on compute
         bool fullSubgroups = false;  // computeFullSubgroups
+        // P9.99: VkPhysicalDeviceSubgroupSizeControlProperties::maxComputeWorkgroupSubgroups.
+        // A required size S admits at most S x this many invocations (VUID-02756); 0 = unknown.
+        uint32_t maxComputeWorkgroupSubgroups = 0;
     };
     virtual SubgroupCaps getSubgroupCaps() const { return SubgroupCaps(); }
 
-    // Like createPipeline, but requests an exact subgroup size (with full
-    // subgroups) for the entry point.  requiredSubgroupSize == 0 behaves
-    // exactly like createPipeline.  Returns 0 when the size cannot be
-    // honored on this device.
+    // Like createPipeline, but requests an exact subgroup size WITH full subgroups
+    // (REQUIRE_FULL_SUBGROUPS) for the entry point.  requiredSubgroupSize == 0 behaves
+    // exactly like createPipeline.  Returns 0, with a "; refused" line naming the rule,
+    // when the size cannot be honoured for THIS entry (P9.99: the device's window AND the
+    // entry's workgroup shape, pxgRequiredSubgroupSizeFits).  This default -- the D3D12
+    // backend's -- cannot require a size at all.
     virtual PxgPipelineHandle createPipelineEx(const void* code, size_t codeSize, const char* entryName,
                                                uint32_t numBuffers, const uint32_t* bufferStrides,
                                                uint32_t pushConstantSize, uint32_t requiredSubgroupSize)
     {
         if (requiredSubgroupSize != 0)
+        {
+            std::fprintf(stderr, "[PxgSlangComputeDevice] createPipelineEx(%s): required subgroup size %u: the %s "
+                                 "backend cannot require a subgroup size; refused\n",
+                         entryName ? entryName : "?", requiredSubgroupSize, getBackendName());
             return 0;
+        }
         return createPipeline(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize);
     }
 
@@ -428,6 +448,17 @@ struct PxgSpirvEntryInfo
 // False when the blob is not a well-formed SPIR-V word stream or declares no entry
 // point named `entry`; *out is then left default.  Defined by the Vulkan backend.
 bool pxgSpirvReflectEntry(const void* code, size_t codeSize, const char* entry, PxgSpirvEntryInfo* out);
+
+// P9.99: can an entry of workgroup size `localSize` (pxgSpirvReflectEntry's; 0 = unknown) be
+// built with `requiredSubgroupSize` and full subgroups -- createPipelineEx's contract -- on a
+// device with `caps`?  0 = no request (true).  The rules, in order: the device can require a
+// size in compute (VUID-02755) and has computeFullSubgroups (VUID-02785); the size is a power
+// of two (VUID-02760) inside [minSize, maxSize] (VUID-02761/02762); the shape is known; x is a
+// multiple of the size (VUID-02757); x*y*z <= size * maxComputeWorkgroupSubgroups
+// (VUID-02756).  On false, `why` (if non-null and whyLen > 0) names the rule.  Pure host
+// function, defined by the Vulkan backend.
+bool pxgRequiredSubgroupSizeFits(const PxgSlangComputeDevice::SubgroupCaps& caps, uint32_t requiredSubgroupSize,
+                                 const uint32_t localSize[3], char* why, size_t whyLen);
 
 // Factory functions; each returns NULL when the backend is unavailable.
 PxgSlangComputeDevice* PxgCreateVulkanComputeDevice(const PxgSlangDeviceDesc& desc);

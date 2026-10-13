@@ -48,6 +48,10 @@
 //   * psContactSolveTgs_finalize: ps_finalizeParticlesLaunch in isolation — the
 //     velocity blend newVel = vel*scale + deltaVel*(1-scale) when |vel| > |deltaVel|
 //     (and the no-write case when it is not), bit-exact.
+//   * P9.99b two-system twins: psContactSolveTgs_p99TwoSystems (systems 0 and 2 in one
+//     contact list through prepare -> TGS solve -> accumulate), psContactSolveTgs_step_p99Direct
+//     (pins the CUDA's pool[blockIdx.y] indexing, upstream note U1) and
+//     psContactSolveTgs_finalize_p99Id2 (push id 2).
 
 #include "pxgTestFramework.h"
 
@@ -398,6 +402,232 @@ PXG_TEST(psContactSolveTgs_penetratingParticle)
 }
 
 // ===========================================================================
+// P9.99b -- TWO SYSTEMS in one contact list: prepare -> TGS solve -> accumulate.
+//
+// Every fixture above holds ONE contact of system 0, so `contact id >> 32` (prepare),
+// the constraint block's system id (solve) and the run head's system id (accumulate)
+// were only ever 0, and the P9.99b force-system-0 mutants of all three survived.
+// Here the sorted list interleaves systems 0 and 2 -- 8 contacts in 6 particle runs:
+//     #  sys pid  contact (normal (0,1,0), pen)
+//     0   0   0   -0.10   penetrating
+//     1   0   1   +0.05   separated, inside the adhesion radius
+//     2   0   3   -0.08   \ one run of two
+//     3   0   3   +0.03   /
+//     4   2   3   -0.12   \ system 2's first particle == system 0's last one, so a
+//     5   2   3   +0.04   / low-32-bit-only id would merge the runs
+//     6   2   4   +0.05
+//     7   2   6   -0.06
+// and the two systems differ in everything the three kernels read per system: the
+// inverse mass (1 / 0.5, read by prepare from the sorted positions and by the solve
+// from the sorted deltaP), the running delta (tangential, so friction is live), the
+// material through each system's own phase->material map (friction 0.05 / 0.3,
+// adhesion 0.3 / 0.5, radius scale 1.5 / 2.0) and mData.mRestOffset (0.25 / 0.15),
+// which the adhesion branch reads for the two separated contacts of each system.
+// Slot 1 of the pool is a decoy no contact names; its arrays must survive.
+// The static rigid keeps the prepare at velMultiplier = 1/invMass; every dot product
+// the oracle takes is exact (the delta is orthogonal to the normal), so the CPU
+// transcription is bit-exact.
+// ===========================================================================
+struct P99Sys
+{
+    uint32_t n = 0;
+    float invMass = 0.f, restOffset = 0.f;
+    uint16_t mat = 0;
+    std::vector<F4> pos, deltaP, accum;
+    std::vector<uint32_t> phases, p2m;
+    PxgBufferHandle bPos = 0, bDeltaP = 0, bAccum = 0, bPhases = 0, bP2M = 0;
+};
+
+PXG_TEST(psContactSolveTgs_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f, relax = 0.8f;
+    // materials: friction, damping, adhesion, gravityScale, adhesionRadiusScale (stride 20)
+    const std::vector<float> materials = {
+        0.05f, 0.0f, 0.3f, 1.0f, 1.5f,     // material 0: system 0
+        0.3f,  0.0f, 0.5f, 1.0f, 2.0f,     // material 1: system 2
+        0.9f,  0.0f, 0.7f, 1.0f, 3.0f };   // material 2: the decoy
+    P99Sys s[3];
+    const uint32_t NP[3] = { 8u, 9u, 7u };
+    const float IM[3] = { 1.0f, 2.0f, 0.5f }, REST[3] = { 0.25f, 0.4f, 0.15f };
+    const uint16_t MAT[3] = { 0u, 2u, 1u };
+    PxgBufferHandle bMaterials = createBufferFrom(dev, materials);
+    if (!addrOf(dev, bMaterials)) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bMaterials); return; }
+    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        P99Sys& c = s[k];
+        c.n = NP[k]; c.invMass = IM[k]; c.restOffset = REST[k]; c.mat = MAT[k];
+        const float fk = float(k);
+        for (uint32_t i = 0; i < c.n; ++i)
+        {
+            const float fi = float(i);
+            c.pos.push_back({ 0.1f * fi, 0.5f + fk, -0.2f * fi, c.invMass });
+            // tangential only: delta.y = 0, so normal.dot(delta) is an exact zero
+            c.deltaP.push_back({ (k == 2u ? -0.015f : 0.01f) + 0.001f * fi, 0.0f, (k == 2u ? 0.005f : 0.02f) - 0.002f * fi, c.invMass });
+            c.accum.push_back({ 0.5f * fi - fk, -0.25f + 0.125f * fk, 0.75f, 1.0f + fi });
+        }
+        c.phases.assign(c.n, 0u);
+        c.p2m = { uint32_t(c.mat) };
+        c.bPos = createBufferFrom(dev, c.pos); c.bDeltaP = createBufferFrom(dev, c.deltaP);
+        c.bAccum = createBufferFrom(dev, c.accum); c.bPhases = createBufferFrom(dev, c.phases);
+        c.bP2M = createBufferFrom(dev, c.p2m);
+        std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
+        putU64(psys, 24, addrOf(dev, c.bPos));        // mSortedPositions_InvMass
+        putU64(psys, 40, addrOf(dev, c.bPhases));     // mSortedPhaseArray
+        putU64(psys, 80, addrOf(dev, bMaterials));    // mParticleMaterials (one shared table)
+        putU32(psys, 116, c.n);                       // mCommonData_NumParticles
+        putU64(psys, 152, addrOf(dev, c.bAccum));     // mAccumDeltaP
+        putU64(psys, 160, addrOf(dev, c.bDeltaP));    // mSortedDeltaP
+        putF32(psys, 268, c.restOffset);              // mData_RestOffset
+        putU32(psys, 632, 20u);                       // mParticleMaterialStride (bytes)
+        putU64(psys, 640, addrOf(dev, c.bP2M));       // mPhaseGroupToMaterialHandle
+        std::memcpy(pool.data() + k * SZ_PARTICLE_SYS, psys.data(), SZ_PARTICLE_SYS);
+    }
+    PxgBufferHandle bPsys = createBufferFrom(dev, pool);
+
+    struct C { uint32_t sys, pid; float pen; };
+    const C cl[8] = { { 0, 0, -0.10f }, { 0, 1, 0.05f }, { 0, 3, -0.08f }, { 0, 3, 0.03f },
+                      { 2, 3, -0.12f }, { 2, 3, 0.04f }, { 2, 4, 0.05f }, { 2, 6, -0.06f } };
+    const uint32_t NC = 8u;
+    const uint32_t runStart[6] = { 0u, 1u, 2u, 4u, 6u, 7u }, runEnd[6] = { 1u, 2u, 4u, 6u, 7u, 8u };
+    std::vector<PsContact> contacts(NC);
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        contacts[c].normal_pen = { 0.0f, 1.0f, 0.0f, cl[c].pen };
+        contacts[c].rigidLo = 0xffffffffu; contacts[c].rigidHi = 0u;   // static body, not articulation
+        contacts[c].particleLo = cl[c].pid; contacts[c].particleHi = cl[c].sys;
+    }
+    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
+    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, NC));
+    PxgBufferHandle bConstraints = createBufferFrom(dev, std::vector<uint8_t>(CB_STRIDE, 0));
+    PxgBufferHandle bApplied = createBufferFrom(dev, std::vector<F2>(32, { 9.0f, 9.0f }));
+    PxgBufferHandle bDeltaPos = createBufferFrom(dev, std::vector<F4>(32, { 0.0f, 0.0f, 0.0f, 0.0f }));
+    std::vector<uint8_t> solverBody(SZ_SOLVER_BODY, 0), txi(SZ_TXI, 0), bodyFrame(SZ_ALIGNED_XF, 0);
+    PxgBufferHandle bSolverBody = createBufferFrom(dev, solverBody);
+    PxgBufferHandle bTxi = createBufferFrom(dev, txi);
+    PxgBufferHandle bBodyFrame = createBufferFrom(dev, bodyFrame);
+    std::vector<uint8_t> prepDesc(SZ_PREP_DESC, 0);
+    putU64(prepDesc, 64, addrOf(dev, bSolverBody));
+    putU64(prepDesc, 72, addrOf(dev, bTxi));
+    putU64(prepDesc, 168, addrOf(dev, bBodyFrame));
+    PxgBufferHandle bPrepDesc = createBufferFrom(dev, prepDesc);
+    PxgBufferHandle bPrePrepDesc = createBufferFrom(dev, std::vector<uint8_t>(SZ_PREPREP_DESC, 0));
+    PxgBufferHandle bVelPool = createBufferFrom(dev, std::vector<F4>(3, { 0.0f, 0.0f, 0.0f, 0.0f }));
+    std::vector<uint8_t> coreDesc(SZ_CORE_DESC, 0);
+    putU32(coreDesc, 268, 1u);                 // numSolverBodies
+    putU32(coreDesc, 276, 0u);                 // accumulatedBodyDeltaVOffset
+    PxgBufferHandle bCoreDesc = createBufferFrom(dev, coreDesc);
+    std::vector<uint8_t> sharedPgs(SZ_SHARED_PGS, 0);
+    putU64(sharedPgs, 160, addrOf(dev, bVelPool));
+    PxgBufferHandle bSharedPgs = createBufferFrom(dev, sharedPgs);
+    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, 6u));
+    PxgBufferHandle bStart = createBufferFrom(dev, std::vector<uint32_t>(runStart, runStart + 6));
+    PxgBufferHandle bEnd = createBufferFrom(dev, std::vector<uint32_t>(runEnd, runEnd + 6));
+
+    {
+        PrepPush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.numContacts = addrOf(dev, bNum); p.primitiveConstraints = addrOf(dev, bConstraints);
+        p.preDesc = addrOf(dev, bPrePrepDesc); p.prepareDesc = addrOf(dev, bPrepDesc);
+        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.isTGSWord = 1u;
+        p.deltaVel = 0ull; p.sharedDesc = 0ull;
+        Kernel k("psContactSolveBda.spv", "ps_contactPrepareLaunch", {}, sizeof(PrepPush));
+        k.dispatch(1024u, {}, p);
+    }
+    {
+        SolvePush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.primitiveConstraints = addrOf(dev, bConstraints); p.numContacts = addrOf(dev, bNum);
+        p.prePrepDesc = addrOf(dev, bPrePrepDesc); p.solverCoreDesc = addrOf(dev, bCoreDesc);
+        p.sharedDesc = addrOf(dev, bSharedPgs); p.deltaPos = addrOf(dev, bDeltaPos);
+        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.relaxationCoefficient = relax;
+        p.isVelIterWord = 0u; p.artiCoreDesc = 0ull;
+        Kernel k("psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch", {}, sizeof(SolvePush));
+        k.dispatch(1024u, {}, p);
+    }
+    {
+        AccumPush p{};
+        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
+        p.totalNumPairs = addrOf(dev, bPairs); p.rangeStart = addrOf(dev, bStart);
+        p.rangeEnd = addrOf(dev, bEnd); p.deltaPos = addrOf(dev, bDeltaPos);
+        Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
+        k.dispatch(32u, {}, p);
+    }
+    dev->flush();
+
+    // CPU oracle: prepare (static rigid) -> cpuSolvePCOutputDeltaVTGS -> accumulate.
+    const V3 normal = { -0.0f, -1.0f, -0.0f };       // prepare flips the contact normal (0,1,0)
+    const V3 fric0 = { 1.0f, 0.0f, 0.0f };           // computeBasisVectors: |dir.y| > 0.9999
+    const V3 fric1 = cross3(normal, fric0);
+    std::vector<F4> refDeltaPos(NC);
+    std::vector<F2> refApplied(NC);
+    std::vector<F4> refAccum[3] = { s[0].accum, s[1].accum, s[2].accum };
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        const P99Sys& sy = s[cl[c].sys];
+        const float invMass1 = sy.pos[cl[c].pid].w;
+        const float vm = (invMass1 > 0.0f) ? (1.0f / (0.0f + invMass1)) : 0.0f;
+        const F4 d4 = sy.deltaP[cl[c].pid];
+        const V3 delta = { d4.x, d4.y, d4.z };
+        const float* m = &materials[sy.mat * 5u];
+        const TgsSolveOut r = cpuSolvePCOutputDeltaVTGS(normal, cl[c].pen, delta, fric0, fric1, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                        0.0f, 0.0f, vm, vm, vm, m[0], sy.restOffset, m[2], m[4],
+                                                        false, dt, F2{ 0.0f, 0.0f });
+        const float im = d4.w;
+        refDeltaPos[c] = { ((-(normal.x * r.deltaF) + fric0.x * r.deltaFr0) + fric1.x * r.deltaFr1) * im * relax,
+                           ((-(normal.y * r.deltaF) + fric0.y * r.deltaFr0) + fric1.y * r.deltaFr1) * im * relax,
+                           ((-(normal.z * r.deltaF) + fric0.z * r.deltaFr0) + fric1.z * r.deltaFr1) * im * relax,
+                           (r.deltaF != 0.0f) ? 1.0f : 0.0f };
+        refApplied[c] = r.appliedForce;
+    }
+    for (uint32_t run = 0; run < 6; ++run)
+    {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, fc = 0.0f;
+        for (uint32_t j = runStart[run]; j < runEnd[run]; ++j)
+        { ax += refDeltaPos[j].x; ay += refDeltaPos[j].y; az += refDeltaPos[j].z; fc += refDeltaPos[j].w; }
+        const float recip = 1.0f / pmax(1.0f, fc);
+        ax *= recip; ay *= recip; az *= recip;
+        F4& a = refAccum[cl[runStart[run]].sys][cl[runStart[run]].pid];
+        a = { a.x + ax, a.y + ay, a.z + az, a.w + 0.0f };
+    }
+
+    size_t mm = 0;
+    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos, NC);
+    const auto gApplied = downloadBuffer<F2>(dev, bApplied, NC);
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        if (std::memcmp(&gDeltaPos[c], &refDeltaPos[c], sizeof(F4)) != 0)
+        { if (mm < 8) std::printf("  contact %u deltaPos gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", c, gDeltaPos[c].x, gDeltaPos[c].y,
+                                  gDeltaPos[c].z, gDeltaPos[c].w, refDeltaPos[c].x, refDeltaPos[c].y, refDeltaPos[c].z, refDeltaPos[c].w); ++mm; }
+        if (std::memcmp(&gApplied[c], &refApplied[c], sizeof(F2)) != 0)
+        { if (mm < 8) std::printf("  contact %u appliedForce gpu(%g,%g) cpu(%g,%g)\n", c, gApplied[c].x, gApplied[c].y,
+                                  refApplied[c].x, refApplied[c].y); ++mm; }
+    }
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const auto gAcc = downloadBuffer<F4>(dev, s[k].bAccum, s[k].n);
+        for (uint32_t i = 0; i < s[k].n; ++i)
+            if (std::memcmp(&gAcc[i], &refAccum[k][i], sizeof(F4)) != 0)
+            { if (mm < 12) std::printf("  slot %u accumDeltaP[%u] gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", k, i, gAcc[i].x, gAcc[i].y,
+                                       gAcc[i].z, gAcc[i].w, refAccum[k][i].x, refAccum[k][i].y, refAccum[k][i].z, refAccum[k][i].w); ++mm; }
+    }
+    // the separated contacts really took the adhesion branch (else mRestOffset is not read)
+    PXG_CHECK_MSG(refDeltaPos[5].y < 0.0f && refDeltaPos[6].y < 0.0f && refDeltaPos[1].y < 0.0f,
+                  "the separated contacts must be pulled in by adhesion (dy %g %g %g)", refDeltaPos[1].y,
+                  refDeltaPos[5].y, refDeltaPos[6].y);
+    PXG_CHECK_MSG(mm == 0, "TGS pipeline over systems 0 and 2 (interleaved runs, decoy at slot 1): bit-exact vs CPU "
+                  "(%zu mismatches)", mm);
+
+    PxgBufferHandle all[] = { bMaterials, bPsys, bContacts, bNum, bConstraints, bApplied, bDeltaPos, bSolverBody, bTxi,
+        bBodyFrame, bPrepDesc, bPrePrepDesc, bVelPool, bCoreDesc, bSharedPgs, bPairs, bStart, bEnd };
+    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
+    for (uint32_t k = 0; k < 3; ++k)
+        for (PxgBufferHandle h : { s[k].bPos, s[k].bDeltaP, s[k].bAccum, s[k].bPhases, s[k].bP2M })
+            dev->destroyBuffer(h);
+}
+
+// ===========================================================================
 // TGS-specific: a moving NON-static rigid body — exercises readVelocitiesTGS
 // unpacking and the normalDelta + normalVel*projectionDt folding (dead for the
 // static floor).  The constraint block is poked DIRECTLY (bypassing prepare) so
@@ -604,12 +834,17 @@ PXG_TEST(psContactSolveTgs_step)
     putU64(psys, 392, addrOf(dev, bOrigin));     // mSortedOriginPos_InvMass
     putU64(psys, 640, addrOf(dev, bPhaseToMat)); // mPhaseGroupToMaterialHandle
     PxgBufferHandle bPsys = createBufferFrom(dev, psys);
+    // P9.99b: a REAL active list {0}, as the engine passes one.  The CUDA never reads it
+    // (pool[blockIdx.y], U1), so the value is the same either way -- but with a null
+    // pointer here an act-indexed spelling of the kernel FAULTED the whole psContactSolveTgs
+    // process (SIGSEGV), which hid whether psContactSolveTgs_step_p99Direct catches it.
+    PxgBufferHandle bAct = createBufferFrom(dev, std::vector<uint32_t>(1, 0u));
 
     auto runStep = [&](bool isFirstIteration)
     {
         StepPush p{};
         p.particleSystems = addrOf(dev, bPsys);
-        p.activeParticleSystems = 0ull;           // ABI parity; unused
+        p.activeParticleSystems = addrOf(dev, bAct);   // {0}; ABI parity -- the CUDA never reads it
         p.dt = dt;
         p.invTotalDt = 1.0f / dt;
         p.flagsWord = isFirstIteration ? 1u : 0u; // byte0=isFirstIteration, byte2=extForces(0)
@@ -654,8 +889,155 @@ PXG_TEST(psContactSolveTgs_step)
                   "step[next] deltaP gpu(%g,%g,%g,%g) != cpu(%g,%g,%g,%g)",
                   dp2.x, dp2.y, dp2.z, dp2.w, refDp2.x, refDp2.y, refDp2.z, refDp2.w);
 
-    for (PxgBufferHandle h : { bOrigin, bPos, bVels, bDeltaP, bPhases, bPhaseToMat, bMaterials, bPsys })
+    for (PxgBufferHandle h : { bOrigin, bPos, bVels, bDeltaP, bPhases, bPhaseToMat, bMaterials, bPsys, bAct })
         dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.99b -- ps_stepParticlesLaunch indexes the POOL by blockIdx.y, literally
+// (particlesystem.cu:130 `particleSystems[blockIdx.y]`; activeParticleSystems is never
+// read).  That is upstream behaviour the port keeps (RUNTIME_STATUS P9.99b, U1: after a
+// system that is not the last is removed, the TGS predictor steps the removed slot and
+// never the survivor in the highest slot) -- and this fixture pins it, so neither a
+// "fix" toward act[blockIdx.y] nor a lost system index can slip in unnoticed.
+//
+// Three REAL, distinct systems sit in slots 0, 1 and 2, the active list is {2, 0} and the
+// grid is (1, 2): the CUDA steps slots 0 and 1 and leaves slot 2 bit-unchanged.  An
+// act-indexed kernel would step 2 and 0 and leave 1 alone; `sysIndex = 0` would step
+// slot 0 twice and slot 1 never.  The slots differ in N (3 / 5 / 4), data and the CFL
+// cap: slot 1's cap is 2 and its particle 0 moves at 4 (clamped, along -y, so every
+// value of the clamp is exact), slot 0's cap is 1e18 -- a cap read from the wrong slot
+// changes slot 1.  Both the first iteration (from the sorted origin, dlta = 0) and a
+// subsequent one (from the sorted position, dlta = the running deltaP) are checked;
+// the oracle is psContactSolveTgs_step's transcription plus the clamp.
+// ===========================================================================
+PXG_TEST(psContactSolveTgs_step_p99Direct)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const uint32_t NS[3] = { 3u, 5u, 4u };
+    const float CAP[3] = { 1.0e18f, 2.0f, 3.0f };
+    struct Sys
+    {
+        std::vector<F4> origin, pos, vel, deltaP;
+        std::vector<uint32_t> phases, p2m;
+        PxgBufferHandle bOrigin = 0, bPos = 0, bVel = 0, bDeltaP = 0, bPhases = 0, bP2M = 0;
+    };
+    Sys s[3];
+    PxgBufferHandle bMaterials = createBufferFrom(dev, std::vector<float>(8, 0.0f));
+    if (!addrOf(dev, bMaterials)) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bMaterials); return; }
+    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        Sys& c = s[k];
+        const float fk = float(k);
+        for (uint32_t i = 0; i < NS[k]; ++i)
+        {
+            const float fi = float(i);
+            const float w = (i == 2u) ? 0.0f : 1.0f;      // particle 2: infinite mass, never moves
+            c.origin.push_back({ 1.0f + fi + 10.0f * fk, 3.0f - fk, -2.0f + 0.5f * fi, w });
+            c.pos.push_back({ 0.0f, 0.0f, 0.0f, w });
+            if (k == 1u && i == 0u) c.vel.push_back({ 0.0f, -4.0f, 0.0f, w });   // |v| 4 > cap 2: clamped to (0,-2,0)
+            else c.vel.push_back({ 0.5f - 0.25f * fi + 0.1f * fk, -1.0f + 0.125f * fi, 0.25f * fk, w });
+            c.deltaP.push_back({ 0.0f, 0.0f, 0.0f, 0.0f });
+        }
+        c.phases.assign(NS[k], 0u);
+        c.p2m = { 0u };
+        c.bOrigin = createBufferFrom(dev, c.origin); c.bPos = createBufferFrom(dev, c.pos);
+        c.bVel = createBufferFrom(dev, c.vel); c.bDeltaP = createBufferFrom(dev, c.deltaP);
+        c.bPhases = createBufferFrom(dev, c.phases); c.bP2M = createBufferFrom(dev, c.p2m);
+        std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
+        putU32(psys, 116, NS[k]);                       // mCommonData_NumParticles
+        putU64(psys, 24, addrOf(dev, c.bPos));          // mSortedPositions_InvMass
+        putU64(psys, 32, addrOf(dev, c.bVel));          // mSortedVelocities
+        putU64(psys, 40, addrOf(dev, c.bPhases));       // mSortedPhaseArray
+        putU64(psys, 80, addrOf(dev, bMaterials));      // mParticleMaterials
+        putU64(psys, 160, addrOf(dev, c.bDeltaP));      // mSortedDeltaP
+        putF32(psys, 316, CAP[k]);                      // mData_MaxVelocity (the CFL cap)
+        putU32(psys, 632, 20u);                         // mParticleMaterialStride
+        putU64(psys, 392, addrOf(dev, c.bOrigin));      // mSortedOriginPos_InvMass
+        putU64(psys, 640, addrOf(dev, c.bP2M));         // mPhaseGroupToMaterialHandle
+        std::memcpy(pool.data() + k * SZ_PARTICLE_SYS, psys.data(), SZ_PARTICLE_SYS);
+    }
+    PxgBufferHandle bPsys = createBufferFrom(dev, pool);
+    PxgBufferHandle bAct = createBufferFrom(dev, std::vector<uint32_t>{ 2u, 0u });
+
+    auto runStep = [&](bool isFirstIteration)
+    {
+        StepPush p{};
+        p.particleSystems = addrOf(dev, bPsys);
+        p.activeParticleSystems = addrOf(dev, bAct);   // {2, 0}: the CUDA never reads it
+        p.dt = dt;
+        p.invTotalDt = 1.0f / dt;
+        p.flagsWord = isFirstIteration ? 1u : 0u;
+        p.gravityX = 0.0f; p.gravityY = -9.81f; p.gravityZ = 0.0f;   // unused (extForces off)
+        Kernel k("psContactSolveTgsBda.spv", "ps_stepParticlesLaunch", {}, sizeof(StepPush));
+        k.dispatch(1u, {}, p, /*gridY = nbActive*/ 2u, 1u);
+        dev->flush();
+    };
+
+    // CPU model of one step over slots 0 and 1 (pool[blockIdx.y], blockIdx.y < 2).
+    std::vector<F4> rPos[3], rVel[3], rDeltaP[3];
+    for (uint32_t k = 0; k < 3; ++k) { rPos[k] = s[k].pos; rVel[k] = s[k].vel; rDeltaP[k] = s[k].deltaP; }
+    auto cpuStep = [&](bool isFirstIteration)
+    {
+        for (uint32_t k = 0; k < 2; ++k)
+            for (uint32_t i = 0; i < NS[k]; ++i)
+            {
+                const F4 tPos = isFirstIteration ? s[k].origin[i] : rPos[k][i];
+                if (tPos.w == 0.0f) continue;
+                float vx = rVel[k][i].x, vy = rVel[k][i].y, vz = rVel[k][i].z;
+                bool velChanged = false;
+                const float lim = CAP[k];
+                if (vx * vx + vy * vy + vz * vz > lim * lim)
+                {
+                    const float m = std::sqrt(vx * vx + vy * vy + vz * vz);
+                    const float invM = 1.0f / m;
+                    vx = (vx * invM) * lim; vy = (vy * invM) * lim; vz = (vz * invM) * lim;
+                    velChanged = true;
+                }
+                const float dlx = isFirstIteration ? 0.0f : rDeltaP[k][i].x;
+                const float dly = isFirstIteration ? 0.0f : rDeltaP[k][i].y;
+                const float dlz = isFirstIteration ? 0.0f : rDeltaP[k][i].z;
+                const float ddx = vx * dt, ddy = vy * dt, ddz = vz * dt;
+                if (velChanged) rVel[k][i] = { vx, vy, vz, tPos.w };
+                rPos[k][i] = { tPos.x + ddx, tPos.y + ddy, tPos.z + ddz, tPos.w };
+                rDeltaP[k][i] = { ddx + dlx, ddy + dly, ddz + dlz, tPos.w };
+            }
+    };
+
+    size_t mm = 0;
+    auto compareAll = [&](const char* phase) {
+        for (uint32_t k = 0; k < 3; ++k)
+        {
+            const auto gPos = downloadBuffer<F4>(dev, s[k].bPos, NS[k]);
+            const auto gVel = downloadBuffer<F4>(dev, s[k].bVel, NS[k]);
+            const auto gDp = downloadBuffer<F4>(dev, s[k].bDeltaP, NS[k]);
+            for (uint32_t i = 0; i < NS[k]; ++i)
+            {
+                if (std::memcmp(&gPos[i], &rPos[k][i], sizeof(F4)) != 0 || std::memcmp(&gVel[i], &rVel[k][i], sizeof(F4)) != 0 ||
+                    std::memcmp(&gDp[i], &rDeltaP[k][i], sizeof(F4)) != 0)
+                {
+                    if (mm < 8)
+                        std::printf("  %s slot %u particle %u: pos gpu(%g,%g,%g) cpu(%g,%g,%g) vel gpu(%g,%g,%g) cpu(%g,%g,%g)\n",
+                                    phase, k, i, gPos[i].x, gPos[i].y, gPos[i].z, rPos[k][i].x, rPos[k][i].y, rPos[k][i].z,
+                                    gVel[i].x, gVel[i].y, gVel[i].z, rVel[k][i].x, rVel[k][i].y, rVel[k][i].z);
+                    ++mm;
+                }
+            }
+        }
+    };
+    runStep(true);  cpuStep(true);  compareAll("first");
+    runStep(false); cpuStep(false); compareAll("next");
+
+    PXG_CHECK_MSG(rVel[1][0].y == -2.0f, "slot 1's fast particle must be clamped to its own cap (v.y %g)", rVel[1][0].y);
+    PXG_CHECK_MSG(mm == 0, "ps_stepParticlesLaunch steps pool slots 0 and 1 (blockIdx.y), not act {2,0}; slot 2 "
+                  "untouched; both iterations bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+        for (PxgBufferHandle h : { s[k].bOrigin, s[k].bPos, s[k].bVel, s[k].bDeltaP, s[k].bPhases, s[k].bP2M })
+            dev->destroyBuffer(h);
+    dev->destroyBuffer(bMaterials); dev->destroyBuffer(bPsys); dev->destroyBuffer(bAct);
 }
 
 // ===========================================================================
@@ -742,6 +1124,88 @@ PXG_TEST(psContactSolveTgs_finalize)
                       "finalize[w==0] velocity wrongly changed: (%g,%g,%g,%g)",
                       gpu.x, gpu.y, gpu.z, gpu.w);
     }
+}
+
+// ===========================================================================
+// P9.99b -- ps_finalizeParticlesLaunch with push id 2.  The host launches it once per
+// active system with `index` = its remap index (PxgPBDParticleSystemCore.cpp:480-505);
+// psContactSolveTgs_finalize only ever passed 0.  Pool of three: slots 0 and 1 are
+// decoys with MORE particles whose velocities WOULD be blended (so a wrong id changes
+// them), slot 2 holds psContactSolveTgs_finalize's three cases (blend, no blend,
+// infinite mass) plus a fourth blended particle.
+// ===========================================================================
+PXG_TEST(psContactSolveTgs_finalize_p99Id2)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float invTotalDt = 60.0f, velocityScale = 0.7f;
+    const uint32_t NS[3] = { 6u, 5u, 4u };
+    std::vector<F4> vel[3], dlta[3];
+    PxgBufferHandle bVel[3], bDlta[3];
+    // slot 2: the fixture's three cases + one more blend
+    vel[2] = { { 1.0f, -2.0f, 0.5f, 1.0f }, { 0.0f, 0.01f, 0.0f, 1.0f }, { 1.0f, -2.0f, 0.5f, 0.0f }, { -3.0f, 0.25f, 1.5f, 0.5f } };
+    dlta[2] = { { 0.001f, 0.002f, 0.0f, 1.0f }, { 0.0f, 0.5f, 0.0f, 1.0f }, { 0.001f, 0.002f, 0.0f, 0.0f }, { -0.004f, 0.0f, 0.003f, 0.5f } };
+    for (uint32_t k = 0; k < 2; ++k)
+        for (uint32_t i = 0; i < NS[k]; ++i)
+        {
+            vel[k].push_back({ 2.0f + float(i) + float(k), -1.5f, 0.75f * float(i), 1.0f });   // |vel| >> |deltaVel|: would blend
+            dlta[k].push_back({ 0.002f * float(i), -0.001f, 0.0005f, 1.0f });
+        }
+    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        bVel[k] = createBufferFrom(dev, vel[k]);
+        bDlta[k] = createBufferFrom(dev, dlta[k]);
+        if (!addrOf(dev, bVel[k])) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+        std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
+        putU32(psys, 116, NS[k]);                    // mCommonData_NumParticles
+        putU64(psys, 32, addrOf(dev, bVel[k]));      // mSortedVelocities
+        putU64(psys, 160, addrOf(dev, bDlta[k]));    // mSortedDeltaP
+        std::memcpy(pool.data() + k * SZ_PARTICLE_SYS, psys.data(), SZ_PARTICLE_SYS);
+    }
+    PxgBufferHandle bPsys = createBufferFrom(dev, pool);
+    {
+        FinalizePush p{};
+        p.particleSystems = addrOf(dev, bPsys);
+        p.id = 2u;
+        p.invTotalDt = invTotalDt;
+        p.velocityScale = velocityScale;
+        Kernel k("psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch", {}, sizeof(FinalizePush));
+        k.dispatch(1u, {}, p, 1u, 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const auto g = downloadBuffer<F4>(dev, bVel[k], NS[k]);
+        for (uint32_t i = 0; i < NS[k]; ++i)
+        {
+            F4 want = vel[k][i];
+            const F4 tv = vel[k][i], d = dlta[k][i];
+            if (k == 2u && tv.w != 0.0f)
+            {
+                const V3 v = { tv.x, tv.y, tv.z };
+                const V3 dv = { d.x * invTotalDt, d.y * invTotalDt, d.z * invTotalDt };
+                if (dot3(v, v) > dot3(dv, dv))
+                {
+                    const float s = velocityScale;
+                    want = { v.x * s + dv.x * (1.0f - s), v.y * s + dv.y * (1.0f - s), v.z * s + dv.z * (1.0f - s), tv.w };
+                }
+            }
+            if (std::memcmp(&g[i], &want, sizeof(F4)) != 0)
+            {
+                if (mm < 8)
+                    std::printf("  slot %u particle %u: gpu(%g,%g,%g,%g) want(%g,%g,%g,%g)\n", k, i, g[i].x, g[i].y, g[i].z, g[i].w,
+                                want.x, want.y, want.z, want.w);
+                ++mm;
+            }
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_finalizeParticlesLaunch, id 2, decoys at slots 0/1 untouched: bit-exact vs CPU "
+                  "(%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k) { dev->destroyBuffer(bVel[k]); dev->destroyBuffer(bDlta[k]); }
+    dev->destroyBuffer(bPsys);
 }
 
 } // namespace

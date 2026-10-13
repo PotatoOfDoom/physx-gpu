@@ -43,6 +43,9 @@
 //   particleSimIngestGuard / particleSimUpdateBufferGuard — the two buffer-copy
 //                             kernels on the engine grid, every array before a
 //                             PROT_NONE guard page (P9.97)
+//   particleSimPreIntegrate_p99TwoSystems / particleSimIntegrate_p99TwoSystems —
+//                             P9.99b: the same kernels over a pool of three with
+//                             act = {2, 0} (per-system material map, cap, lock)
 
 #include "pxgTestFramework.h"
 
@@ -286,6 +289,178 @@ PXG_TEST(particleSimPreIntegrate)
     dev->destroyBuffer(bOri.h); dev->destroyBuffer(bAccum.h); dev->destroyBuffer(bCounts.h);
     dev->destroyBuffer(bForces.h); dev->destroyBuffer(bMat.h); dev->destroyBuffer(bP2M.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.99b -- the TWO-SYSTEM twin of particleSimPreIntegrate.
+//
+// particleSimPreIntegrate drives one system at act = {0}, so a kernel that took the
+// system from anywhere but act[blockIdx.y], or read a per-system parameter out of
+// the wrong descriptor, was invisible there: the P9.99b force-system-0 mutants of
+// this kernel (`particleId = act[0]`, `systems[0].mPhaseGroupToMaterialHandle`)
+// survived every fixture.  The frame every p99 twin shares:
+//   * a pool of THREE descriptors, act = {2, 0}, gridY = 2 -- not a permutation, so
+//     a kernel that indexes the pool by blockIdx.y hits the DECOY at slot 1 instead
+//     of permuting the work;
+//   * systems 2 and 0 differ in everything the kernel reads: N, the data, and the
+//     material, which each system reaches through its OWN phase->material map into
+//     ONE shared material table (as in the engine);
+//   * the decoy has a LARGER count and sentinel data in every array, and all of it
+//     must survive bit for bit.
+// The oracle is particleSimPreIntegrate's CPU transcription, per system.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSimPreIntegrate_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 8u, 21u, 13u };   // slot 1 is the decoy, with the largest count
+    // material: friction, damping, adhesion, gravityScale, adhesionRadiusScale (stride 20)
+    const std::vector<float> material = {
+        0.5f, 0.25f, 0.0f, 2.0f, 0.0f,    // material 0: system 0
+        0.1f, 0.6f,  0.0f, 0.5f, 0.0f,    // material 1: system 2
+        0.0f, 0.9f,  0.0f, 3.0f, 0.0f };  // material 2: the decoy
+    const uint32_t materialStride = 20u;
+    const uint16_t matOf[3] = { 0u, 2u, 1u };
+    DevBuf bMat = makeDev(dev, material);
+
+    struct Sys
+    {
+        std::vector<F4> pos, vel, ori, accum;
+        std::vector<uint32_t> phase, counts;
+        std::vector<float> forces;
+        std::vector<uint16_t> p2m;
+        DevBuf bPos, bVel, bPhase, bOri, bAccum, bCounts, bForces, bP2M;
+    };
+    Sys s[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const float fk = float(k);
+        s[k].pos.resize(N); s[k].vel.resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float w = (i == 3) ? 0.0f : (k == 2 ? 0.5f : 1.0f);   // particle 3: infinite mass
+            s[k].pos[i] = { float(i) * 1.0f + 10.0f * fk, float(i) * 2.0f + 0.5f - fk, -float(i) * 0.5f + 0.25f * fk, w };
+            s[k].vel[i] = { 0.1f * float(i) - 0.3f * fk, -0.2f * float(i) + 0.7f * fk, 0.05f * float(i), 0.0f };
+        }
+        s[k].phase.assign(N, 0u);
+        s[k].ori.assign(N, { -1.f, -1.f, -1.f, -1.f });
+        s[k].accum.assign(N, { 9.f, 9.f, 9.f, 9.f });
+        s[k].counts.assign(N, 7u);
+        s[k].forces.assign(2 * 12 * N, 5.0f);
+        s[k].p2m = { matOf[k], matOf[k] };
+        s[k].bPos = makeDev(dev, s[k].pos);
+        s[k].bVel = makeDev(dev, s[k].vel);
+        s[k].bPhase = makeDev(dev, s[k].phase);
+        s[k].bOri = makeDev(dev, s[k].ori);
+        s[k].bAccum = makeDev(dev, s[k].accum);
+        s[k].bCounts = makeDev(dev, s[k].counts);
+        s[k].bForces = makeDev(dev, s[k].forces);
+        s[k].bP2M = makeDev(dev, s[k].p2m);
+
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(s[k].bPos.addr));
+        ps.mUnsortedVelocities = reinterpret_cast<float4*>(size_t(s[k].bVel.addr));
+        ps.mUnsortedPhaseArray = reinterpret_cast<PxU32*>(size_t(s[k].bPhase.addr));
+        ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(s[k].bOri.addr));
+        ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(s[k].bAccum.addr));
+        ps.mOneWayContactCount = reinterpret_cast<PxU32*>(size_t(s[k].bCounts.addr));
+        ps.mOneWayForces = reinterpret_cast<float2*>(size_t(s[k].bForces.addr));
+        ps.mParticleMaterials = reinterpret_cast<PxsParticleMaterialData*>(size_t(bMat.addr));
+        ps.mPhaseGroupToMaterialHandle = reinterpret_cast<PxU16*>(size_t(s[k].bP2M.addr));
+        ps.mParticleMaterialStride = materialStride;
+        ps.mCommonData.mNumParticles = N;
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct PrePush
+    {
+        uint64_t particleSystems, activeParticleSystems;
+        float gx, gy, gz, dt;
+        uint32_t flagsWord, pad;
+    };
+    const float dt = 1.0f / 60.0f;
+    const bool isTGS = true, extForces = false;
+    PrePush push = { bDesc.addr, bActive.addr, 0.0f, -9.81f, 0.0f, dt,
+                     (isTGS ? 1u : 0u) | (extForces ? 0x100u : 0u), 0u };
+    {
+        Kernel k("particleSim.spv", "ps_preIntegrateLaunch", {}, sizeof(PrePush));
+        k.dispatch(1u, {}, push, /*gridY = nbActive*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    auto cmp4 = [&](const F4& a, const F4& b, const char* what, uint32_t k, uint32_t i) {
+        if (f2u(a.x) != f2u(b.x) || f2u(a.y) != f2u(b.y) || f2u(a.z) != f2u(b.z) || f2u(a.w) != f2u(b.w))
+        {
+            if (mm < 8)
+                std::printf("  sys%u %s MM %u: ref(%g %g %g %g) got(%g %g %g %g)\n", k, what, i,
+                            a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+            ++mm;
+        }
+    };
+    const float3 g = { 0.0f, -9.81f, 0.0f };
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const bool live = k != 1u;   // the decoy is never named by act
+        const float matDamping = material[matOf[k] * 5u + 1u], matGravityScale = material[matOf[k] * 5u + 3u];
+        std::vector<F4> refPos = s[k].pos, refVel = s[k].vel, refOri = s[k].ori, refAccum = s[k].accum;
+        std::vector<uint32_t> refCounts = s[k].counts;
+        std::vector<float> refForces = s[k].forces;
+        if (live)
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                const F4 tPos = s[k].pos[i];
+                refOri[i] = tPos;
+                const float damping = 1.0f - std::fmin(1.0f, matDamping * dt);
+                const float tgx = g.x * matGravityScale, tgy = g.y * matGravityScale, tgz = g.z * matGravityScale;
+                float vx = 0.f, vy = 0.f, vz = 0.f;
+                if (tPos.w != 0.0f)
+                {
+                    const F4 tv = s[k].vel[i];
+                    vx = (tv.x + tgx * dt) * damping;
+                    vy = (tv.y + tgy * dt) * damping;
+                    vz = (tv.z + tgz * dt) * damping;
+                    const float fwd = isTGS ? FWD_TGS : FWD_PGS;
+                    refPos[i] = { tPos.x + vx * dt * fwd, tPos.y + vy * dt * fwd, tPos.z + vz * dt * fwd, tPos.w };
+                }
+                if (!extForces)
+                    refVel[i] = { vx, vy, vz, tPos.w };
+                refAccum[i] = { 0.f, 0.f, 0.f, 0.f };
+                refCounts[i] = 0u;
+                for (uint32_t j = i; j < 12 * N; j += N) { refForces[2 * j] = 0.f; refForces[2 * j + 1] = 0.f; }
+            }
+        const auto gPos = downloadBuffer<F4>(dev, s[k].bPos.h, N);
+        const auto gVel = downloadBuffer<F4>(dev, s[k].bVel.h, N);
+        const auto gOri = downloadBuffer<F4>(dev, s[k].bOri.h, N);
+        const auto gAccum = downloadBuffer<F4>(dev, s[k].bAccum.h, N);
+        const auto gCounts = downloadBuffer<uint32_t>(dev, s[k].bCounts.h, N);
+        const auto gForces = downloadBuffer<float>(dev, s[k].bForces.h, 2 * 12 * N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            cmp4(refPos[i], gPos[i], "pos", k, i);
+            cmp4(refVel[i], gVel[i], "vel", k, i);
+            cmp4(refOri[i], gOri[i], "ori", k, i);
+            cmp4(refAccum[i], gAccum[i], "accum", k, i);
+            if (gCounts[i] != refCounts[i]) { ++mm; std::printf("  sys%u count MM %u\n", k, i); }
+        }
+        for (uint32_t j = 0; j < 2 * 12 * N; ++j)
+            if (f2u(refForces[j]) != f2u(gForces[j])) { if (mm < 12) std::printf("  sys%u force MM %u\n", k, j); ++mm; }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_preIntegrateLaunch, systems 2 and 0 via act {2,0}, decoy untouched: bit-exact "
+                  "vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        dev->destroyBuffer(s[k].bPos.h); dev->destroyBuffer(s[k].bVel.h); dev->destroyBuffer(s[k].bPhase.h);
+        dev->destroyBuffer(s[k].bOri.h); dev->destroyBuffer(s[k].bAccum.h); dev->destroyBuffer(s[k].bCounts.h);
+        dev->destroyBuffer(s[k].bForces.h); dev->destroyBuffer(s[k].bP2M.h);
+    }
+    dev->destroyBuffer(bMat.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +779,173 @@ PXG_TEST(particleSimIntegrate)
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bNewPos.h); dev->destroyBuffer(bOrig.h);
     dev->destroyBuffer(bDeltaP.h); dev->destroyBuffer(bOrigVel.h); dev->destroyBuffer(bNewVel.h);
     dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bMap.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.99b -- the TWO-SYSTEM twin of particleSimIntegrate (frame: see
+// particleSimPreIntegrate_p99TwoSystems).  What differs per system is what the
+// kernel reads per system:
+//   * mData.mMaxVelocity: 3 for system 0, 5 for system 2.  System 2's unlocked
+//     particles move at 3.2-4.4, under ITS cap and over system 0's, so reading system
+//     0's cap clamps them (and only then is rsqrt reached for a live particle -- the
+//     oracle never needs it);
+//   * mData.mLockFlags: none for system 0, eLOCK_Z for system 2 (z reset to the
+//     origin, v.z = 0);
+//   * N, the permutation and every array.
+// The oracle is particleSimIntegrate's CPU transcription plus the lock branch.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSimIntegrate_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 8u, 20u, 11u };          // slot 1 is the decoy, with the largest count
+    const float MAXV[3] = { 3.0f, 2.0f, 5.0f };
+    const uint32_t LOCK[3] = { 0u, 0u, 4u };          // PxParticleLockFlag::eLOCK_Z = 4
+    const float eps = 1e-6f;
+    const float dt = 1.0f / 60.0f;
+
+    struct Sys
+    {
+        std::vector<uint32_t> mapping;
+        std::vector<F4> sortedDeltaP, sortedOrigin, sortedPos, sortedVel, delta, position, originalVels;
+        DevBuf bPos, bNewPos, bOrig, bDeltaP, bOrigVel, bNewVel, bDelta, bMap;
+    };
+    Sys s[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const float fk = float(k);
+        s[k].mapping.resize(N);
+        for (uint32_t i = 0; i < N; ++i) s[k].mapping[i] = (i * 3u + k) % N;   // a permutation (gcd(3, N) = 1)
+        s[k].sortedDeltaP.resize(N); s[k].sortedOrigin.resize(N); s[k].sortedPos.resize(N);
+        s[k].sortedVel.resize(N); s[k].delta.resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float fi = float(i);
+            // particle 0: zero delta -> locked; particle 5: newPos.w == 0 -> skipped.
+            s[k].sortedDeltaP[i] = (i == 0) ? F4{ 0, 0, 0, 0 } : F4{ 0.1f, 0.2f + 0.1f * fk, 0.3f, 0.f };
+            s[k].sortedOrigin[i] = { fi + fk, fi + 1.f, fi + 2.f - fk, 1.f };
+            const float w = (i == 5) ? 0.0f : (k == 2 ? 0.5f : 1.0f);
+            s[k].sortedPos[i] = { 10.f + fi, 20.f + fi - fk, 30.f + fi + 0.5f * fk, w };
+            if (k == 2)
+                s[k].sortedVel[i] = { 3.0f + 0.1f * fi, -1.0f - 0.05f * fi, 0.2f, 0.f };   // |v| in (3.2, 4.4)
+            else
+                s[k].sortedVel[i] = { 0.3f * fi, -0.2f * fi, 0.2f + 0.1f * fk, 0.f };    // |v| < 2.6
+            s[k].delta[i] = { 0.01f * fi, 0.02f * fi, 0.03f * fi, fi + 1.f };
+        }
+        s[k].position.assign(N, { -100.f, -100.f, -100.f, -100.f });
+        s[k].originalVels.assign(N, { -50.f, -50.f, -50.f, -50.f });
+        s[k].bPos = makeDev(dev, s[k].position);
+        s[k].bNewPos = makeDev(dev, s[k].sortedPos);
+        s[k].bOrig = makeDev(dev, s[k].sortedOrigin);
+        s[k].bDeltaP = makeDev(dev, s[k].sortedDeltaP);
+        s[k].bOrigVel = makeDev(dev, s[k].originalVels);
+        s[k].bNewVel = makeDev(dev, s[k].sortedVel);
+        s[k].bDelta = makeDev(dev, s[k].delta);
+        s[k].bMap = makeDev(dev, s[k].mapping);
+
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(s[k].bPos.addr));
+        ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(s[k].bNewPos.addr));
+        ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(s[k].bOrig.addr));
+        ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(s[k].bDeltaP.addr));
+        ps.mUnsortedVelocities = reinterpret_cast<float4*>(size_t(s[k].bOrigVel.addr));
+        ps.mSortedVelocities = reinterpret_cast<float4*>(size_t(s[k].bNewVel.addr));
+        ps.mDelta = reinterpret_cast<float4*>(size_t(s[k].bDelta.addr));
+        ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(s[k].bMap.addr));
+        ps.mData.mMaxVelocity = MAXV[k];
+        ps.mData.mLockFlags = PxU16(LOCK[k]);
+        ps.mCommonData.mNumParticles = N;
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct IntPush { uint64_t particleSystems, activeParticleSystems; float dt, eps; };
+    IntPush push = { bDesc.addr, bActive.addr, dt, eps };
+    {
+        Kernel k("particleSim.spv", "ps_integrateLaunch", {}, sizeof(IntPush));
+        k.dispatch(1u, {}, push, /*gridY = nbActive*/ 2u, 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    auto cmp4 = [&](const F4& a, const F4& b, const char* what, uint32_t k, uint32_t i) {
+        if (f2u(a.x) != f2u(b.x) || f2u(a.y) != f2u(b.y) || f2u(a.z) != f2u(b.z) || f2u(a.w) != f2u(b.w))
+        {
+            if (mm < 8)
+                std::printf("  sys%u %s MM %u: ref(%g %g %g %g) got(%g %g %g %g)\n", k, what, i,
+                            a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+            ++mm;
+        }
+    };
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const Sys& c = s[k];
+        std::vector<F4> refPos = c.position, refVel = c.originalVels, refDelta = c.delta;
+        if (k != 1u)   // the decoy is never named by act
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                const uint32_t sortedIndex = c.mapping[i];
+                const float dsq = c.sortedDeltaP[i].x * c.sortedDeltaP[i].x + c.sortedDeltaP[i].y * c.sortedDeltaP[i].y +
+                                  c.sortedDeltaP[i].z * c.sortedDeltaP[i].z;
+                const bool locked = dsq <= eps;
+                const F4 origPos4 = c.sortedOrigin[i];
+                F4 pos4 = locked ? origPos4 : c.sortedPos[i];
+                if (pos4.w > 0.0f)
+                {
+                    const float mv = locked ? 0.0f : MAXV[k];
+                    const F4 nv = c.sortedVel[i];
+                    const F4 j = c.delta[i];
+                    const float scale = 1.0f / std::fmax(j.w, 1.0f);
+                    float vx = nv.x + j.x * scale, vy = nv.y + j.y * scale, vz = nv.z + j.z * scale;
+                    const float magSq = vx * vx + vy * vy + vz * vz;
+                    if (magSq > mv * mv)
+                    {
+                        // Only the locked (mv == 0) particle -> ratio 0 -> zero (rsqrt-independent).
+                        const float ratio = mv * (1.0f / std::sqrt(magSq));
+                        vx *= ratio; vy *= ratio; vz *= ratio;
+                    }
+                    if (LOCK[k] & 4u) { pos4.z = origPos4.z; vz = 0.0f; }
+                    refPos[sortedIndex] = pos4;
+                    refVel[sortedIndex] = { vx, vy, vz, 0.0f };
+                    refDelta[i] = { 0.f, 0.f, 0.f, 0.f };
+                }
+            }
+        const auto gPos = downloadBuffer<F4>(dev, c.bPos.h, N);
+        const auto gVel = downloadBuffer<F4>(dev, c.bOrigVel.h, N);
+        const auto gDelta = downloadBuffer<F4>(dev, c.bDelta.h, N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            cmp4(refPos[i], gPos[i], "pos", k, i);
+            cmp4(refVel[i], gVel[i], "vel", k, i);
+            cmp4(refDelta[i], gDelta[i], "delta", k, i);
+        }
+    }
+    // System 2's live particles really sit between the two caps (else the max-velocity
+    // read is not discriminated).
+    uint32_t between = 0;
+    for (uint32_t i = 1; i < NS[2]; ++i)
+    {
+        const F4 nv = s[2].sortedVel[i], j = s[2].delta[i];
+        const float sc = 1.0f / std::fmax(j.w, 1.0f);
+        const float vx = nv.x + j.x * sc, vy = nv.y + j.y * sc, vz = nv.z + j.z * sc;
+        const float m2 = vx * vx + vy * vy + vz * vz;
+        if (s[2].sortedPos[i].w > 0.0f && m2 > MAXV[0] * MAXV[0] && m2 < MAXV[2] * MAXV[2]) ++between;
+    }
+    PXG_CHECK_MSG(between == NS[2] - 2u, "system 2: %u of %u live particles between the two caps", between, NS[2] - 2u);
+    PXG_CHECK_MSG(mm == 0, "ps_integrateLaunch, systems 2 and 0 via act {2,0} (caps 5/3, lock Z/none), decoy "
+                  "untouched: bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        dev->destroyBuffer(s[k].bPos.h); dev->destroyBuffer(s[k].bNewPos.h); dev->destroyBuffer(s[k].bOrig.h);
+        dev->destroyBuffer(s[k].bDeltaP.h); dev->destroyBuffer(s[k].bOrigVel.h); dev->destroyBuffer(s[k].bNewVel.h);
+        dev->destroyBuffer(s[k].bDelta.h); dev->destroyBuffer(s[k].bMap.h);
+    }
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 

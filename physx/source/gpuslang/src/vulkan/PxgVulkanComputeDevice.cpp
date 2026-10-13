@@ -410,6 +410,73 @@ bool pxgSpirvReflectEntry(const void* code, size_t codeSize, const char* entry, 
     return reflectEntryImpl(code, codeSize, entry, out, &malformed);
 }
 
+// P9.99: createPipelineEx's contract -- an EXACT subgroup size with FULL subgroups -- checked
+// against the device and the entry's workgroup shape, in the order a reader would ask.
+// Before P9.99 only the window was checked: llvmpipe builds every request it is handed
+// (measured: 4, 6, 12, 16 and 256 at a window of [8, 8], VkResult 0), and an in-window
+// size on an X-not-a-multiple entry ran PARTIAL subgroups under REQUIRE_FULL_SUBGROUPS.
+bool pxgRequiredSubgroupSizeFits(const PxgSlangComputeDevice::SubgroupCaps& caps, uint32_t size,
+                                 const uint32_t localSize[3], char* why, size_t whyLen)
+{
+    char scratch[4];
+    if (!why || whyLen == 0)
+    {
+        why = scratch;
+        whyLen = sizeof(scratch);
+    }
+    why[0] = '\0';
+    if (size == 0)
+        return true;
+    if (!caps.canRequireSize)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u: the device cannot require a subgroup size in compute "
+                                   "(subgroupSizeControl, requiredSubgroupSizeStages; VUID-02755)", size);
+        return false;
+    }
+    if (!caps.fullSubgroups)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u: the device has no computeFullSubgroups, and "
+                                   "createPipelineEx promises full subgroups (VUID-02785; PXG_WARP_NATIVE)", size);
+        return false;
+    }
+    if ((size & (size - 1u)) != 0u)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u is not a power of two (VUID-02760)", size);
+        return false;
+    }
+    if (size < caps.minSize || size > caps.maxSize)
+    {
+        // Name the bound actually crossed: 02761 is the minimum, 02762 the maximum.
+        std::snprintf(why, whyLen, "required subgroup size %u is %s the device's window [%u, %u] (%s)", size,
+                      size < caps.minSize ? "below" : "above", caps.minSize, caps.maxSize,
+                      size < caps.minSize ? "VUID-02761" : "VUID-02762");
+        return false;
+    }
+    if (localSize[0] == 0u || localSize[1] == 0u || localSize[2] == 0u)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u: the entry's workgroup size is not readable from "
+                                   "the SPIR-V, so full subgroups cannot be shown", size);
+        return false;
+    }
+    if (localSize[0] % size != 0u)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u: workgroup size x %u is not a multiple of it, so "
+                                   "not every subgroup can be full (VUID-02757)", size, localSize[0]);
+        return false;
+    }
+    const uint64_t invocations = uint64_t(localSize[0]) * localSize[1] * localSize[2];
+    const uint64_t most = uint64_t(size) * caps.maxComputeWorkgroupSubgroups;
+    if (invocations > most)
+    {
+        std::snprintf(why, whyLen, "required subgroup size %u: workgroup (%u, %u, %u) = %llu invocations exceeds "
+                                   "%u x maxComputeWorkgroupSubgroups %u = %llu (VUID-02756)", size, localSize[0],
+                      localSize[1], localSize[2], (unsigned long long)invocations, size,
+                      caps.maxComputeWorkgroupSubgroups, (unsigned long long)most);
+        return false;
+    }
+    return true;
+}
+
 class PxgVulkanComputeDevice : public PxgSlangComputeDevice
 {
 private:
@@ -760,6 +827,16 @@ public:
         mSubgroupCaps.canRequireSize = enabledSgSize.subgroupSizeControl == VK_TRUE &&
                                        (sgSizeProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
         mSubgroupCaps.fullSubgroups = enabledSgSize.computeFullSubgroups == VK_TRUE;
+        mSubgroupCaps.maxComputeWorkgroupSubgroups = sgSizeProps.maxComputeWorkgroupSubgroups;
+        // P9.99 test hooks (PxgSlangDeviceDesc): they only take a capability away, so a
+        // fixture can show createPipelineEx's refusals on llvmpipe; the features stay enabled.
+        if (desc.noSubgroupSizeControl)
+            mSubgroupCaps.canRequireSize = false;
+        if (desc.noFullSubgroups)
+            mSubgroupCaps.fullSubgroups = false;
+        if (desc.limitMaxComputeWorkgroupSubgroups != 0 &&
+            desc.limitMaxComputeWorkgroupSubgroups < mSubgroupCaps.maxComputeWorkgroupSubgroups)
+            mSubgroupCaps.maxComputeWorkgroupSubgroups = desc.limitMaxComputeWorkgroupSubgroups;
 
         std::vector<const char*> deviceExts;
         if (mHasShaderBufferFloat32AtomicAdd)
@@ -1054,7 +1131,7 @@ public:
         if (it->second.mappedPtr)
             vkUnmapMemory(mDevice, it->second.memory);
         vkDestroyBuffer(mDevice, it->second.buffer, nullptr);
-        vkFreeMemory(mDevice, it->second.memory, nullptr);
+        freeMemoryCounted(it->second.memory);
         mBuffers.erase(it);
     }
 
@@ -1645,17 +1722,9 @@ public:
                                        uint32_t numBuffers, const uint32_t* bufferStrides,
                                        uint32_t pushConstantSize, uint32_t requiredSubgroupSize) override
     {
-        if (requiredSubgroupSize != 0 &&
-            (!mSubgroupCaps.canRequireSize || requiredSubgroupSize < mSubgroupCaps.minSize ||
-             requiredSubgroupSize > mSubgroupCaps.maxSize))
-        {
-            // P9.98 check round 0: every refusal says why (the bridge's trace points here).
-            std::fprintf(stderr, "[PxgVulkan] createPipelineEx(%s): required subgroup size %u is not available "
-                                 "(can require: %d, range %u..%u); refused\n",
-                         entryName ? entryName : "?", requiredSubgroupSize, int(mSubgroupCaps.canRequireSize),
-                         mSubgroupCaps.minSize, mSubgroupCaps.maxSize);
-            return 0;
-        }
+        // P9.99: the request is checked in createPipelineInternal, once the entry's workgroup
+        // shape is read (VUID-02756 / 02757 need it), and refused through refusePipeline like
+        // every P9.98 refusal.  Before P9.99 only the window was checked here.
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
                                       requiredSubgroupSize, 0, false);
     }
@@ -1787,7 +1856,7 @@ public:
                                   malformed ? "the module is not a well-formed SPIR-V word stream"
                                             : "the module has no GLCompute entry point of that name",
                                   0);
-        char why[256];
+        char why[320];
         // F2: the layout's push range covers the entry's DECLARED block, not just the
         // bytes the caller pushes -- VUID-VkComputePipelineCreateInfo-layout-07987 -- and
         // dispatch zero-fills the surplus.  Shared push structs (one Slang struct sized
@@ -1839,6 +1908,13 @@ public:
                 return refusePipeline(pipe, entryName, why, 0);
             }
         }
+        // P9.99: an exact subgroup size (createPipelineEx) only when the device can require it
+        // AND this entry's shape lets every subgroup be full.  Measured on HEAD 2a97aa5: an
+        // in-window 8 on x = 4 / 12 (VUID-02757) or on 264 / 512 invocations (VUID-02756) was
+        // BUILT, and llvmpipe ran x = 4 as 8-lane subgroups with 4 active lanes.
+        if (requiredSubgroupSize != 0 &&
+            !pxgRequiredSubgroupSizeFits(mSubgroupCaps, requiredSubgroupSize, info.localSize, why, sizeof(why)))
+            return refusePipeline(pipe, entryName, why, 0);
 
         VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         moduleInfo.codeSize = codeSize;
@@ -1905,7 +1981,8 @@ public:
         stageInfo.pName = entryName;
 
         // Exact-subgroup-size request (warp-32 primitive library on hardware
-        // targets; validated against SubgroupCaps by createPipelineEx).
+        // targets).  Checked above (pxgRequiredSubgroupSizeFits), which also guarantees
+        // computeFullSubgroups, so full subgroups are always requested with it (P9.99).
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sgSizeInfo = {
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
         };
@@ -1913,8 +1990,7 @@ public:
         {
             sgSizeInfo.requiredSubgroupSize = requiredSubgroupSize;
             stageInfo.pNext = &sgSizeInfo;
-            if (mSubgroupCaps.fullSubgroups)
-                stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+            stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         }
 
         VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };

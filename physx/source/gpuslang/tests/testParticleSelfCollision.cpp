@@ -303,6 +303,121 @@ PXG_TEST(particleSelfCollisionNeighborSearch)
 }
 
 // ---------------------------------------------------------------------------
+// (2') P9.99b -- particleSelfCollisionNeighborSearch with push id 2.  The host runs
+// ps_selfCollisionLaunch once per active system with `id` = its remap index
+// (PxgParticleSystemCore.cpp:1041ff); the single-system fixture only ever passed 0.
+// Pool of three: slots 0 and 1 are decoys (6 particles on a 4^3 grid, maxNeighborhood
+// 8, a valid cell structure, sentinel outputs), slot 2 is the real system -- the
+// fixture's two overlapping pairs on an 8^3 grid with maxNeighborhood 6.
+// ---------------------------------------------------------------------------
+struct SelfSys
+{
+    uint32_t N = 0, gs = 0, maxNbr = 0;
+    std::vector<F4> sortedPos;
+    std::vector<uint32_t> sortedPhase, mapping, cellStart, cellEnd, selfCount, collisionIndex;
+    std::vector<F2> collisionForces;
+    DevBuf bPos, bPhase, bMap, bStart, bEnd, bCount, bColIdx, bColForce;
+};
+
+PXG_TEST(particleSelfCollisionNeighborSearch_p99Id2)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float cellWidth = 0.3f;
+    const uint32_t EMPTY = 0xffffffffu;
+    SelfSys s[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        SelfSys& c = s[k];
+        const bool real = k == 2u;
+        c.N = real ? 4u : 6u;
+        c.gs = real ? 8u : 4u;
+        c.maxNbr = real ? 6u : 8u;
+        const uint32_t numCells = c.gs * c.gs * c.gs;
+        // sorted 0,1 in cell (0,0,0); 2,3 in cell (2,0,0); decoys add 4,5 in cell (3,0,0).
+        c.sortedPos = { { 0.00f, 0.05f, 0.05f, 1.0f }, { 0.15f, 0.05f, 0.05f, 1.0f },
+                        { 0.65f, 0.05f, 0.05f, 1.0f }, { 0.70f, 0.05f, 0.05f, 1.0f } };
+        if (!real) { c.sortedPos.push_back({ 0.95f, 0.05f, 0.05f, 1.0f }); c.sortedPos.push_back({ 1.00f, 0.05f, 0.05f, 1.0f }); }
+        c.sortedPhase.assign(c.N, PHASE_SELF_COLLIDE);
+        c.mapping.resize(c.N);
+        for (uint32_t i = 0; i < c.N; ++i) c.mapping[i] = i;
+        c.cellStart.assign(numCells, EMPTY);
+        c.cellEnd.assign(numCells, 0u);
+        c.cellStart[0] = 0u; c.cellEnd[0] = 2u;
+        c.cellStart[2] = 2u; c.cellEnd[2] = 4u;
+        if (!real) { c.cellStart[3] = 4u; c.cellEnd[3] = 6u; }
+        c.selfCount.assign(c.N, 0xdeadbeefu);
+        c.collisionIndex.assign(c.N * c.maxNbr, 0xccccccccu);
+        c.collisionForces.assign(c.N * c.maxNbr, { 7.0f, 7.0f });
+        c.bPos = makeDev(dev, c.sortedPos); c.bPhase = makeDev(dev, c.sortedPhase); c.bMap = makeDev(dev, c.mapping);
+        c.bStart = makeDev(dev, c.cellStart); c.bEnd = makeDev(dev, c.cellEnd); c.bCount = makeDev(dev, c.selfCount);
+        c.bColIdx = makeDev(dev, c.collisionIndex); c.bColForce = makeDev(dev, c.collisionForces);
+
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(c.bPos.addr));
+        ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(c.bPhase.addr));
+        ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(c.bMap.addr));
+        ps.mCellStart = reinterpret_cast<PxU32*>(size_t(c.bStart.addr));
+        ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(c.bEnd.addr));
+        ps.mParticleSelfCollisionCount = reinterpret_cast<PxU32*>(size_t(c.bCount.addr));
+        ps.mCollisionIndex = reinterpret_cast<PxU32*>(size_t(c.bColIdx.addr));
+        ps.mDensityCollisionImpulses = reinterpret_cast<float2*>(size_t(c.bColForce.addr));
+        ps.mCommonData.mNumParticles = c.N;
+        ps.mCommonData.mGridCellWidth = cellWidth;
+        ps.mCommonData.mGridSizeX = c.gs;
+        ps.mCommonData.mGridSizeY = c.gs;
+        ps.mCommonData.mGridSizeZ = c.gs;
+        ps.mCommonData.mMaxNeighborhood = c.maxNbr;
+        ps.mData.mSolidRestOffset = real ? 0.15f : 0.1f; // only used under the (disabled) filter branch
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    struct SelfPush { uint64_t particleSystems; uint32_t id; };
+    SelfPush push = { bDesc.addr, 2u };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_selfCollisionLaunch", {}, sizeof(SelfPush));
+        k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const SelfSys& c = s[k];
+        std::vector<uint32_t> refCount = c.selfCount, refIdx = c.collisionIndex;
+        std::vector<F2> refForce = c.collisionForces;
+        if (k == 2u)
+        {
+            // one neighbour per particle (its overlapping pair), output slot 0 = index gtid
+            const uint32_t nb[4] = { 1u, 0u, 3u, 2u };
+            for (uint32_t i = 0; i < c.N; ++i) { refCount[i] = 1u; refIdx[i] = nb[i]; refForce[i] = { 0.0f, 0.0f }; }
+        }
+        const auto gCount = downloadBuffer<uint32_t>(dev, c.bCount.h, c.N);
+        const auto gIdx = downloadBuffer<uint32_t>(dev, c.bColIdx.h, c.N * c.maxNbr);
+        const auto gForce = downloadBuffer<F2>(dev, c.bColForce.h, c.N * c.maxNbr);
+        for (uint32_t i = 0; i < c.N; ++i)
+            if (gCount[i] != refCount[i]) { if (mm < 8) std::printf("  slot%u count MM %u: ref %u got %u\n", k, i, refCount[i], gCount[i]); ++mm; }
+        for (uint32_t i = 0; i < c.N * c.maxNbr; ++i)
+        {
+            if (gIdx[i] != refIdx[i]) { if (mm < 8) std::printf("  slot%u collisionIndex MM %u: ref %u got %u\n", k, i, refIdx[i], gIdx[i]); ++mm; }
+            if (f2u(gForce[i].x) != f2u(refForce[i].x) || f2u(gForce[i].y) != f2u(refForce[i].y))
+            { if (mm < 8) std::printf("  slot%u force MM %u: got(%g %g)\n", k, i, gForce[i].x, gForce[i].y); ++mm; }
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_selfCollisionLaunch, push id 2, decoys at slots 0/1 untouched: neighbour search "
+                  "matches CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const SelfSys& c = s[k];
+        for (const DevBuf* b : { &c.bPos, &c.bPhase, &c.bMap, &c.bStart, &c.bEnd, &c.bCount, &c.bColIdx, &c.bColForce })
+            dev->destroyBuffer(b->h);
+    }
+    dev->destroyBuffer(bDesc.h);
+}
+
+// ---------------------------------------------------------------------------
 // DIVERGENT neighbour counts inside one subgroup.
 //
 // particleSelfCollisionNeighborSearch above gives every particle exactly ONE neighbour, so
@@ -516,6 +631,118 @@ PXG_TEST(particleSelfCollisionSolveOneWay)
 }
 
 // ---------------------------------------------------------------------------
+// (3') P9.99b -- the TWO-SYSTEM twin of particleSelfCollisionSolveOneWay: a pool of
+// three descriptors, act = {2, 0}, gridY = 2.  Systems 2 and 0 differ in N, contacts,
+// penetrations, inverse masses and rest offset; the decoy at slot 1 has the largest
+// count, a contact on every particle and sentinel accumulators that must survive.
+// Oracle: cpuSolveOneWay (one contact per particle, friction/adhesion zero).
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSelfCollisionSolveOneWay_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float bias = 0.75f;
+    const uint32_t NS[3] = { 2u, 6u, 3u };
+    const uint32_t MAXC = PxgParticleContactInfo::MaxStaticContactsPerParticle;
+
+    struct Sys
+    {
+        std::vector<F4> contacts, sortedDeltaP, accumDeltaP;
+        std::vector<uint32_t> count, phase;
+        std::vector<F2> forces;
+        DevBuf bContacts, bCount, bForces, bDeltaP, bAccum, bPhase;
+    };
+    Sys s[3];
+    std::vector<DevBuf> keep;
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        Sys& c = s[k];
+        const uint32_t N = NS[k];
+        c.contacts.assign(MAXC * N, { 0.0f, 0.0f, 0.0f, 0.0f });
+        c.count.assign(N, 1u);
+        c.forces.assign(MAXC * N, { 0.0f, 0.0f });
+        c.sortedDeltaP.resize(N);
+        c.accumDeltaP.resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float fi = float(i), fk = float(k);
+            // per system a different normal and depth: +y floors for 0, a tilted wall for 2
+            const F4 n = (k == 2u) ? F4{ 0.6f, 0.8f, 0.0f, -0.2f + 0.05f * fi } : F4{ 0.0f, 1.0f, 0.0f, -0.1f - 0.03f * fi };
+            c.contacts[i] = n;
+            // dp lies along z, orthogonal to both normals, so normal.dot(dp) is an exact 0 in any
+            // association; .w = inverse mass
+            c.sortedDeltaP[i] = { 0.0f, 0.0f, 0.005f * fi + 0.01f * fk, (k == 2u) ? 0.5f : 1.0f };
+            c.accumDeltaP[i] = { 0.1f * fi + fk, -0.25f, 0.5f * fk, 0.0f };
+        }
+        if (k == 2u) c.count[1] = 0u;   // a particle without contact keeps its accumulator
+        c.phase.assign(N, PHASE_SELF_COLLIDE);
+        c.bContacts = makeDev(dev, c.contacts); c.bCount = makeDev(dev, c.count); c.bForces = makeDev(dev, c.forces);
+        c.bDeltaP = makeDev(dev, c.sortedDeltaP); c.bAccum = makeDev(dev, c.accumDeltaP); c.bPhase = makeDev(dev, c.phase);
+
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(c.bContacts.addr));
+        ps.mOneWayContactCount = reinterpret_cast<PxU32*>(size_t(c.bCount.addr));
+        ps.mOneWayForces = reinterpret_cast<float2*>(size_t(c.bForces.addr));
+        ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(c.bDeltaP.addr));
+        ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(c.bAccum.addr));
+        ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(c.bPhase.addr));
+        ps.mCommonData.mNumParticles = N;
+        ps.mData.mRestOffset = (k == 2u) ? 0.15f : 0.05f;
+        makeMaterialBufs(dev, ps, keep);
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct SolvePush { uint64_t systems, active; float invDt, dt, bias; uint32_t velIter; };
+    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, bias, 0u };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch", {}, sizeof(SolvePush));
+        k.dispatch(1u, {}, push, /*gridY (nbActive)*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const Sys& c = s[k];
+        const uint32_t N = NS[k];
+        std::vector<F4> ref = c.accumDeltaP;
+        if (k != 1u)
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                if (c.count[i] == 0u) continue;
+                float d[3];
+                cpuSolveOneWay(&c.contacts[i].x, &c.sortedDeltaP[i].x, bias, dt, false, d);
+                ref[i].x += d[0]; ref[i].y += d[1]; ref[i].z += d[2];
+            }
+        const auto g = downloadBuffer<F4>(dev, c.bAccum.h, N);
+        for (uint32_t i = 0; i < N; ++i)
+            if (f2u(g[i].x) != f2u(ref[i].x) || f2u(g[i].y) != f2u(ref[i].y) || f2u(g[i].z) != f2u(ref[i].z) ||
+                f2u(g[i].w) != f2u(ref[i].w))
+            {
+                if (mm < 8)
+                    std::printf("  sys%u accumDeltaP MM %u: ref(%g %g %g %g) got(%g %g %g %g)\n", k, i, ref[i].x, ref[i].y,
+                                ref[i].z, ref[i].w, g[i].x, g[i].y, g[i].z, g[i].w);
+                ++mm;
+            }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_solveOneWayContactDeltaVLaunch, systems 2 and 0 via act {2,0}, decoy untouched: "
+                  "bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const Sys& c = s[k];
+        for (const DevBuf* b : { &c.bContacts, &c.bCount, &c.bForces, &c.bDeltaP, &c.bAccum, &c.bPhase })
+            dev->destroyBuffer(b->h);
+    }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+    for (auto& b : keep) dev->destroyBuffer(b.h);
+}
+
+// ---------------------------------------------------------------------------
 // (4) ps_applyDeltaLaunch — SOR-average mDelta into mAccumDeltaP.
 // ---------------------------------------------------------------------------
 PXG_TEST(particleSelfCollisionApplyDelta)
@@ -572,6 +799,82 @@ PXG_TEST(particleSelfCollisionApplyDelta)
     PXG_CHECK_MSG(mm == 0, "ps_applyDeltaLaunch bit-exact vs CPU (%zu mismatches)", mm);
 
     dev->destroyBuffer(bDeltas.h); dev->destroyBuffer(bAccum.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// (4') P9.99b -- the TWO-SYSTEM twin of particleSelfCollisionApplyDelta: act = {2, 0},
+// gridY = 2; systems 2 and 0 differ in N (5 / 3), data and relaxation factor
+// (0.8 / 1.5); the decoy at slot 1 (N 7, relaxation 2.5) must survive bit for bit.
+// Oracle: particleSelfCollisionApplyDelta's, per system.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSelfCollisionApplyDelta_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 3u, 7u, 5u };
+    const float RELAX[3] = { 1.5f, 2.5f, 0.8f };
+    std::vector<F4> deltas[3], accum[3];
+    DevBuf bDeltas[3], bAccum[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const float fk = float(k);
+        deltas[k].resize(N); accum[k].resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            deltas[k][i] = { 0.1f * float(i + 1) + fk, -0.2f * float(i + 1), 0.05f - 0.01f * fk, 2.0f + float(i) - 0.5f * fk }; // .w = weight
+            accum[k][i] = { float(i) + 0.5f * fk, -float(i), 0.5f * float(i), 3.0f + fk };
+        }
+        bDeltas[k] = makeDev(dev, deltas[k]);
+        bAccum[k] = makeDev(dev, accum[k]);
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mDelta = reinterpret_cast<float4*>(size_t(bDeltas[k].addr));
+        ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(bAccum[k].addr));
+        ps.mCommonData.mNumParticles = N;
+        ps.mData.mRelaxationFactor = RELAX[k];
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct ApplyPush { uint64_t systems, active; float dt; };
+    ApplyPush push = { bDesc.addr, bActive.addr, 1.0f / 60.0f };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_applyDeltaLaunch", {}, sizeof(ApplyPush));
+        k.dispatch(1u, {}, push, /*gridY*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const auto gAccum = downloadBuffer<F4>(dev, bAccum[k].h, NS[k]);
+        const auto gDeltas = downloadBuffer<F4>(dev, bDeltas[k].h, NS[k]);
+        for (uint32_t i = 0; i < NS[k]; ++i)
+        {
+            F4 wantA = accum[k][i], wantD = deltas[k][i];
+            if (k != 1u)
+            {
+                const F4 j = deltas[k][i];
+                const F4 a = accum[k][i];
+                const float scale = 1.0f / std::fmax(j.w * RELAX[k], 1.0f);
+                wantA = { a.x + j.x * scale, a.y + j.y * scale, a.z + j.z * scale, 0.0f };
+                wantD = { 0.0f, 0.0f, 0.0f, 0.0f };
+            }
+            if (f2u(gAccum[i].x) != f2u(wantA.x) || f2u(gAccum[i].y) != f2u(wantA.y) ||
+                f2u(gAccum[i].z) != f2u(wantA.z) || f2u(gAccum[i].w) != f2u(wantA.w))
+            { if (mm < 8) std::printf("  sys%u accum MM %u\n", k, i); ++mm; }
+            if (f2u(gDeltas[i].x) != f2u(wantD.x) || f2u(gDeltas[i].y) != f2u(wantD.y) ||
+                f2u(gDeltas[i].z) != f2u(wantD.z) || f2u(gDeltas[i].w) != f2u(wantD.w))
+            { if (mm < 8) std::printf("  sys%u delta MM %u\n", k, i); ++mm; }
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_applyDeltaLaunch, systems 2 and 0 via act {2,0} (relaxation 0.8/1.5), decoy "
+                  "untouched: bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k) { dev->destroyBuffer(bDeltas[k].h); dev->destroyBuffer(bAccum[k].h); }
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
@@ -647,6 +950,91 @@ PXG_TEST(particleSelfCollisionUpdateParticle)
 
     dev->destroyBuffer(bAccum.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDeltaP.h);
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// (5') P9.99b -- the TWO-SYSTEM twin of particleSelfCollisionUpdateParticle: act =
+// {2, 0}, gridY = 2; systems 2 and 0 differ in N (4 / 3) and every array; the decoy
+// at slot 1 (N 6) must survive bit for bit.  Oracle: particleSelfCollisionUpdateParticle's.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSelfCollisionUpdateParticle_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 3u, 6u, 4u };
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+    std::vector<F4> accum[3], vel[3], deltaP[3], pos[3];
+    DevBuf bAccum[3], bVel[3], bDeltaP[3], bPos[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        const float fk = float(k);
+        accum[k].resize(N); vel[k].resize(N); deltaP[k].resize(N); pos[k].resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float fi = float(i);
+            accum[k][i] = { 0.01f * float(i + 1) + 0.002f * fk, 0.02f - 0.004f * fk, -0.03f * fi, 0.0f };
+            vel[k][i] = { fi - fk, -0.5f * fi, 0.25f + fk, 0.0f };
+            deltaP[k][i] = { 0.001f, 0.002f * (fk + 1.0f), 0.003f, 1.0f + fi };
+            pos[k][i] = { 5.0f + fi + 10.0f * fk, 2.0f - fk, -1.0f * fi, 1.0f + 0.1f * fi };
+        }
+        bAccum[k] = makeDev(dev, accum[k]); bVel[k] = makeDev(dev, vel[k]);
+        bDeltaP[k] = makeDev(dev, deltaP[k]); bPos[k] = makeDev(dev, pos[k]);
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(bAccum[k].addr));
+        ps.mSortedVelocities = reinterpret_cast<float4*>(size_t(bVel[k].addr));
+        ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP[k].addr));
+        ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos[k].addr));
+        ps.mCommonData.mNumParticles = N;
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t skip; };
+    UpdatePush push = { bDesc.addr, bActive.addr, invDt, 0u };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_updateParticleLaunch", {}, sizeof(UpdatePush));
+        k.dispatch(1u, {}, push, /*gridY*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    auto cmp4 = [&](const F4& a, const F4& b, const char* what, uint32_t k, uint32_t i) {
+        if (f2u(a.x) != f2u(b.x) || f2u(a.y) != f2u(b.y) || f2u(a.z) != f2u(b.z) || f2u(a.w) != f2u(b.w))
+        { if (mm < 8) std::printf("  sys%u %s MM %u\n", k, what, i); ++mm; }
+    };
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const auto gVel = downloadBuffer<F4>(dev, bVel[k].h, NS[k]);
+        const auto gPos = downloadBuffer<F4>(dev, bPos[k].h, NS[k]);
+        const auto gAccum = downloadBuffer<F4>(dev, bAccum[k].h, NS[k]);
+        const auto gDeltaP = downloadBuffer<F4>(dev, bDeltaP[k].h, NS[k]);
+        for (uint32_t i = 0; i < NS[k]; ++i)
+        {
+            const F4 a = accum[k][i], v = vel[k][i], dp = deltaP[k][i], p = pos[k][i];
+            F4 nv = v, np = p, ndp = dp, na = a;
+            if (k != 1u)
+            {
+                nv = { v.x + a.x * invDt, v.y + a.y * invDt, v.z + a.z * invDt, v.w + a.w * invDt };
+                np = { p.x + a.x, p.y + a.y, p.z + a.z, p.w };   // w passes through sortedPos.w
+                ndp = { dp.x + a.x, dp.y + a.y, dp.z + a.z, dp.w + a.w };
+                na = { 0.0f, 0.0f, 0.0f, 0.0f };
+            }
+            cmp4(nv, gVel[i], "vel", k, i);
+            cmp4(np, gPos[i], "pos", k, i);
+            cmp4(ndp, gDeltaP[i], "sortedDeltaP", k, i);
+            cmp4(na, gAccum[i], "accum", k, i);
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_updateParticleLaunch, systems 2 and 0 via act {2,0}, decoy untouched: bit-exact "
+                  "vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    { dev->destroyBuffer(bAccum[k].h); dev->destroyBuffer(bVel[k].h); dev->destroyBuffer(bDeltaP[k].h); dev->destroyBuffer(bPos[k].h); }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
 // ---------------------------------------------------------------------------

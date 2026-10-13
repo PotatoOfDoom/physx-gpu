@@ -338,6 +338,101 @@ PXG_TEST(particleGridCalculateHash)
 }
 
 // ---------------------------------------------------------------------------
+// (3') P9.99b -- the TWO-SYSTEM twin of particleGridCalculateHash.  The single-system
+// fixture runs act = {0}, where `act[blockIdx.y]` and `act[0]` are the same read.
+// Here: a pool of three descriptors, act = {2, 0}, gridY = 2; systems 2 and 0 differ
+// in N, positions, cell width (0.5 / 0.3) and grid size (32^3 / 16x64x8); the decoy
+// at slot 1 has the largest count and sentinel outputs that must survive.  Oracle:
+// particleGridCalculateHash's cpuGridPos/cpuGridHash, per system.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleGridCalculateHash_p99TwoSystems)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t NS[3] = { 8u, 19u, 11u };
+    const float CW[3] = { 0.5f, 0.7f, 0.3f };
+    const uint32_t GX[3] = { 32u, 8u, 16u }, GY[3] = { 32u, 8u, 64u }, GZ[3] = { 32u, 8u, 8u };
+
+    std::vector<F4> positions[3];
+    std::vector<uint32_t> hashArray[3], mapping[3];
+    DevBuf bPos[3], bHash[3], bMap[3];
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        positions[k].resize(N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            // Spread over negative and positive coordinates; every coordinate is kept
+            // > 1e-3 cells off a cell boundary so floor() is unambiguous.
+            const float fi = float(i);
+            positions[k][i] = { -2.13f + 0.731f * fi + 0.37f * float(k), 0.11f + 0.913f * fi - 1.7f * float(k),
+                                -0.27f * fi + 0.07f, (i % 3u == 2u) ? 0.0f : 1.0f };
+        }
+        hashArray[k].assign(N, 0xdeadbeefu);
+        mapping[k].assign(N, 0xffffffffu);
+        bPos[k] = makeDev(dev, positions[k]);
+        bHash[k] = makeDev(dev, hashArray[k]);
+        bMap[k] = makeDev(dev, mapping[k]);
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos[k].addr));
+        ps.mGridParticleHash = reinterpret_cast<PxU32*>(size_t(bHash[k].addr));
+        ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bMap[k].addr));
+        ps.mCommonData.mNumParticles = N;
+        ps.mCommonData.mGridCellWidth = CW[k];
+        ps.mCommonData.mGridSizeX = GX[k];
+        ps.mCommonData.mGridSizeY = GY[k];
+        ps.mCommonData.mGridSizeZ = GZ[k];
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct HashPush { uint64_t particleSystems, activeParticleSystems; };
+    HashPush push = { bDesc.addr, bActive.addr };
+    {
+        Kernel k("particleGridBda.spv", "ps_calculateHashLaunch", {}, sizeof(HashPush));
+        k.dispatch(1u, {}, push, /*gridY = nbActive*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0, unsafe = 0;
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const uint32_t N = NS[k];
+        std::vector<uint32_t> refHash = hashArray[k], refMap = mapping[k];
+        if (k != 1u)
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                const float* p = &positions[k][i].x;
+                for (int a = 0; a < 3; ++a)
+                {
+                    const float q = p[a] / CW[k];
+                    if (std::fabs(q - std::round(q)) <= 1e-3f) ++unsafe;
+                }
+                int32_t gx, gy, gz;
+                cpuGridPos(positions[k][i], CW[k], gx, gy, gz);
+                refHash[i] = cpuGridHash(gx, gy, gz, GX[k], GY[k], GZ[k]);
+                refMap[i] = i;
+            }
+        const auto gHash = downloadBuffer<uint32_t>(dev, bHash[k].h, N);
+        const auto gMap = downloadBuffer<uint32_t>(dev, bMap[k].h, N);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            if (gHash[i] != refHash[i]) { if (mm < 8) std::printf("  sys%u hash MM %u: ref %u got %u\n", k, i, refHash[i], gHash[i]); ++mm; }
+            if (gMap[i] != refMap[i]) { if (mm < 8) std::printf("  sys%u map MM %u: ref %u got %u\n", k, i, refMap[i], gMap[i]); ++mm; }
+        }
+    }
+    PXG_CHECK_MSG(unsafe == 0, "%zu coordinates sit within 1e-3 cells of a cell boundary", unsafe);
+    PXG_CHECK_MSG(mm == 0, "ps_calculateHashLaunch, systems 2 and 0 via act {2,0} (cell 0.3/0.5, grid 16x64x8/32^3), "
+                  "decoy untouched: bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    { dev->destroyBuffer(bPos[k].h); dev->destroyBuffer(bHash[k].h); dev->destroyBuffer(bMap[k].h); }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
 // (3b) ps_calculateHashForDiffuseParticlesLaunch — the DIFFUSE grid build (P9.13b)
 // ---------------------------------------------------------------------------
 // The one thing this must separate from its solid twin: the kernel is bounded by
@@ -685,6 +780,177 @@ PXG_TEST(particleGridReorder)
     dev->destroyBuffer(bSPos.h); dev->destroyBuffer(bSVel.h); dev->destroyBuffer(bSOrigin.h);
     dev->destroyBuffer(bSDeltaP.h); dev->destroyBuffer(bSPhases.h); dev->destroyBuffer(bReverse.h);
     dev->destroyBuffer(bCellStart.h); dev->destroyBuffer(bCellEnd.h); dev->destroyBuffer(bDesc.h);
+}
+
+// ---------------------------------------------------------------------------
+// (4') P9.99b -- particleGridReorder with push id 2.  The host launches this kernel
+// once per ACTIVE system with `id` = its remap index (PxgParticleSystemCore.cpp:679ff);
+// particleGridReorder only ever passed id 0, where `systems[id]` and `systems[0]` are
+// the same read.  Here the pool holds three descriptors: slots 0 and 1 are decoys
+// (larger N, a valid sorted-hash/permutation structure, sentinel outputs that must
+// survive bit for bit) and slot 2 is the real system.  Oracle: particleGridReorder's
+// CPU transcription.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleGridReorder_p99Id2)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t EMPTY = 0xffffffffu;
+    struct Sys
+    {
+        uint32_t N = 0, numCells = 0;
+        std::vector<uint32_t> sortedHash, mapping, phases, sortedPhases, reverseLookup, cellStart, cellEnd;
+        std::vector<F4> unsortedPos, unsortedVel, originPos, sortedPos, sortedVel, sortedOrigin, sortedDeltaP;
+        DevBuf bHash, bMap, bUPos, bUVel, bOrigin, bPhases, bSPos, bSVel, bSOrigin, bSDeltaP, bSPhases, bReverse,
+            bCellStart, bCellEnd;
+    };
+    Sys s[3];
+    // slots 0/1: decoys, 12 particles over 16 cells; slot 2: the real system, 10 over 12.
+    const std::vector<uint32_t> hashes[3] = {
+        { 0u, 2u, 2u, 3u, 5u, 5u, 5u, 8u, 9u, 12u, 15u, 15u },
+        { 1u, 1u, 4u, 4u, 4u, 4u, 7u, 10u, 10u, 13u, 14u, 15u },
+        { 1u, 1u, 1u, 4u, 4u, 6u, 9u, 9u, 11u, 11u } };
+    const uint32_t numCellsOf[3] = { 16u, 16u, 12u };
+    std::vector<PxgParticleSystem> descArr(3);
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        Sys& c = s[k];
+        c.sortedHash = hashes[k];
+        c.N = uint32_t(c.sortedHash.size());
+        c.numCells = numCellsOf[k];
+        const uint32_t N = c.N;
+        c.mapping.resize(N);
+        for (uint32_t i = 0; i < N; ++i) c.mapping[i] = (i * 7u + 3u * k + 1u) % N;   // gcd(7, N) = 1
+        c.unsortedPos.resize(N); c.unsortedVel.resize(N); c.originPos.resize(N); c.phases.resize(N);
+        const float fk = float(k);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float fi = float(i);
+            c.unsortedPos[i] = { fi + 0.25f + 100.f * fk, 10.f + fi - fk, -fi * 2.f + 0.5f * fk, 1.0f + 0.1f * fi + fk };
+            c.unsortedVel[i] = { 0.5f * fi - fk, -0.3f * fi, 0.2f + fk, 0.0f };
+            c.originPos[i] = { fi * 0.5f + fk, fi + 1.f, 2.f - fi - 3.f * fk, 1.0f };
+            c.phases[i] = 0x40000000u | (i * 7u + k);
+        }
+        c.sortedPos.assign(N, { -1.f, -1.f, -1.f, -1.f });
+        c.sortedVel.assign(N, { -2.f, -2.f, -2.f, -2.f });
+        c.sortedOrigin.assign(N, { -3.f, -3.f, -3.f, -3.f });
+        c.sortedDeltaP.assign(N, { -4.f, -4.f, -4.f, -4.f });
+        c.sortedPhases.assign(N, 0xa5a5a5a5u);
+        c.reverseLookup.assign(N, 0xbbbbbbbbu);
+        c.cellStart.assign(c.numCells, EMPTY);
+        c.cellEnd.assign(c.numCells, 0xccccccccu);
+        c.bHash = makeDev(dev, c.sortedHash); c.bMap = makeDev(dev, c.mapping);
+        c.bUPos = makeDev(dev, c.unsortedPos); c.bUVel = makeDev(dev, c.unsortedVel);
+        c.bOrigin = makeDev(dev, c.originPos); c.bPhases = makeDev(dev, c.phases);
+        c.bSPos = makeDev(dev, c.sortedPos); c.bSVel = makeDev(dev, c.sortedVel);
+        c.bSOrigin = makeDev(dev, c.sortedOrigin); c.bSDeltaP = makeDev(dev, c.sortedDeltaP);
+        c.bSPhases = makeDev(dev, c.sortedPhases); c.bReverse = makeDev(dev, c.reverseLookup);
+        c.bCellStart = makeDev(dev, c.cellStart); c.bCellEnd = makeDev(dev, c.cellEnd);
+
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mGridParticleHash = reinterpret_cast<PxU32*>(size_t(c.bHash.addr));
+        ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(c.bMap.addr));
+        ps.mUnsortedToSortedMapping = reinterpret_cast<PxU32*>(size_t(c.bReverse.addr));
+        ps.mCellStart = reinterpret_cast<PxU32*>(size_t(c.bCellStart.addr));
+        ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(c.bCellEnd.addr));
+        ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(c.bUPos.addr));
+        ps.mUnsortedVelocities = reinterpret_cast<float4*>(size_t(c.bUVel.addr));
+        ps.mUnsortedPhaseArray = reinterpret_cast<PxU32*>(size_t(c.bPhases.addr));
+        ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(c.bSPos.addr));
+        ps.mSortedVelocities = reinterpret_cast<float4*>(size_t(c.bSVel.addr));
+        ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(c.bSPhases.addr));
+        ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(c.bSDeltaP.addr));
+        ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(c.bOrigin.addr));
+        ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(c.bSOrigin.addr));
+        ps.mCommonData.mNumParticles = N;
+        ps.mCommonData.mMaxDiffuseParticles = 0; // the diffuse slab (blockIdx.z == 1) returns early
+        descArr[k] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    struct ReorderPush { uint64_t particleSystems; uint32_t id; };
+    ReorderPush push = { bDesc.addr, 2u };
+    {
+        Kernel k("particleGridBda.spv", "ps_reorderDataAndFindCellStartLaunch", {}, sizeof(ReorderPush));
+        k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 2u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    auto cmp4 = [&](const F4& a, const F4& b, const char* what, uint32_t k, uint32_t i) {
+        if (f2u(a.x) != f2u(b.x) || f2u(a.y) != f2u(b.y) || f2u(a.z) != f2u(b.z) || f2u(a.w) != f2u(b.w))
+        {
+            if (mm < 8)
+                std::printf("  slot%u %s MM %u: ref(%g %g %g %g) got(%g %g %g %g)\n", k, what, i,
+                            a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+            ++mm;
+        }
+    };
+    auto cmpU = [&](uint32_t a, uint32_t b, const char* what, uint32_t k, uint32_t i) {
+        if (a != b) { if (mm < 8) std::printf("  slot%u %s MM %u: ref %u got %u\n", k, what, i, a, b); ++mm; }
+    };
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const Sys& c = s[k];
+        const uint32_t N = c.N;
+        std::vector<F4> refSPos = c.sortedPos, refSVel = c.sortedVel, refSOrigin = c.sortedOrigin, refSDeltaP = c.sortedDeltaP;
+        std::vector<uint32_t> refSPhases = c.sortedPhases, refReverse = c.reverseLookup;
+        std::vector<uint32_t> refCellStart = c.cellStart, refCellEnd = c.cellEnd;
+        if (k == 2u)
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                const uint32_t si = c.mapping[i];
+                const F4 p = c.unsortedPos[si];
+                const F4 v = c.unsortedVel[si];
+                const uint32_t hash = c.sortedHash[i];
+                const uint32_t otherHash = (i > 0) ? c.sortedHash[i - 1] : 0u;
+                if (i == 0 || hash != otherHash)
+                {
+                    refCellStart[hash] = i;
+                    if (i > 0) refCellEnd[otherHash] = i;
+                }
+                if (i == N - 1) refCellEnd[hash] = i + 1;
+                refSPos[i] = p;
+                refSVel[i] = v;
+                refReverse[si] = i;
+                const F4 orig = c.originPos[si];
+                refSOrigin[i] = orig;
+                refSDeltaP[i] = { p.x - orig.x, p.y - orig.y, p.z - orig.z, p.w };
+                refSPhases[i] = c.phases[si];
+            }
+        const auto gSPos = downloadBuffer<F4>(dev, c.bSPos.h, N);
+        const auto gSVel = downloadBuffer<F4>(dev, c.bSVel.h, N);
+        const auto gSOrigin = downloadBuffer<F4>(dev, c.bSOrigin.h, N);
+        const auto gSDeltaP = downloadBuffer<F4>(dev, c.bSDeltaP.h, N);
+        const auto gSPhases = downloadBuffer<uint32_t>(dev, c.bSPhases.h, N);
+        const auto gReverse = downloadBuffer<uint32_t>(dev, c.bReverse.h, N);
+        const auto gCellStart = downloadBuffer<uint32_t>(dev, c.bCellStart.h, c.numCells);
+        const auto gCellEnd = downloadBuffer<uint32_t>(dev, c.bCellEnd.h, c.numCells);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            cmp4(refSPos[i], gSPos[i], "sortedPos", k, i);
+            cmp4(refSVel[i], gSVel[i], "sortedVel", k, i);
+            cmp4(refSOrigin[i], gSOrigin[i], "sortedOrigin", k, i);
+            cmp4(refSDeltaP[i], gSDeltaP[i], "sortedDeltaP", k, i);
+            cmpU(refSPhases[i], gSPhases[i], "phase", k, i);
+            cmpU(refReverse[i], gReverse[i], "reverse", k, i);
+        }
+        for (uint32_t q = 0; q < c.numCells; ++q)
+        {
+            cmpU(refCellStart[q], gCellStart[q], "cellStart", k, q);
+            cmpU(refCellEnd[q], gCellEnd[q], "cellEnd", k, q);
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "ps_reorderDataAndFindCellStartLaunch, push id 2, decoys at slots 0/1 untouched: "
+                  "bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        const Sys& c = s[k];
+        for (const DevBuf* b : { &c.bHash, &c.bMap, &c.bUPos, &c.bUVel, &c.bOrigin, &c.bPhases, &c.bSPos, &c.bSVel,
+                                 &c.bSOrigin, &c.bSDeltaP, &c.bSPhases, &c.bReverse, &c.bCellStart, &c.bCellEnd })
+            dev->destroyBuffer(b->h);
+    }
+    dev->destroyBuffer(bDesc.h);
 }
 
 }  // namespace

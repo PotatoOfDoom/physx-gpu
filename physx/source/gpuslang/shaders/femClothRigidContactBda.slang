@@ -159,7 +159,7 @@ struct PrepContactParams
     uint64_t numContacts;    // @40
     uint64_t constraints;    // @48
     uint64_t prePrepDesc;    // @56
-    uint64_t prepDesc;       // @64
+    uint64_t prepareDesc;    // @64
     uint64_t rigidLambdaNs;  // @72
     float invDt;             // @80
     uint _pad84;             // @84
@@ -301,7 +301,7 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
         const uint64_t cBase = gPrep.constraints + uint64_t(index) * FRC_STRIDE;
 
         prepareFEMContacts(cBase, offset, normal, p, pen, delta, rigidId, barycentric,
-                           gPrep.prepDesc, gPrep.prePrepDesc, femClothes[clothId].mPenBiasClamp);
+                           gPrep.prepareDesc, gPrep.prePrepDesc, femClothes[clothId].mPenBiasClamp);
     }
 }
 

@@ -124,7 +124,7 @@ struct ClothPsPrepareParams
     uint64_t contactInfos;             // @40  PxgFemOtherContactInfo* (16 B stride)
     uint64_t numContacts;              // @48
     uint64_t constraints;              // @56  PxgFEMParticleConstraintBlock*
-    uint64_t clothAppliedForces;       // @64  float2*
+    uint64_t softBodyAppliedForces;    // @64  float2* -- the CUDA's name (FEMClothConstraintPrep.cu:291): the cloth's own forces
     uint64_t particleAppliedForces;    // @72  float2* -> 80
 }
 
@@ -165,7 +165,7 @@ void cloth_particleContactPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
             return;                                          // P7
 
         // P8: float2, and zeroed before anything else happens.
-        Ptr<float2>(gPp.clothAppliedForces)[workIndex] = float2(0.0f, 0.0f);
+        Ptr<float2>(gPp.softBodyAppliedForces)[workIndex] = float2(0.0f, 0.0f);
         Ptr<float2>(gPp.particleAppliedForces)[workIndex] = float2(0.0f, 0.0f);
 
         // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8.

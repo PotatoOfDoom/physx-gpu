@@ -3606,6 +3606,493 @@ static PxVec3 particleApplyMean(const std::vector<PxVec4>& v)
 }
 
 // ---------------------------------------------------------------------------
+// P9.99b -- PXG_SCENE=particle2: TWO PBD particle systems in one scene.
+//
+// Until P9.99b no scene built more than one PxPBDParticleSystem, so in every scene the
+// particle pipeline ran with ONE system, at pool index 0, act = {0}.  Every per-system
+// choice the pipeline makes therefore had a single possible answer there:
+//   * system = act[blockIdx.y|z] -- preIntegrate, integrate, calculateHash, the one-way
+//     contact solve, applyDelta, updateParticle, the fluid density/vorticity/velocity
+//     kernels, updateMaterials, the user-buffer ingest/egress (particleSim,
+//     particleGridBda, particleSelfCollisionBda, npPsFluid*, npPsMaterials);
+//   * system = a host-loop `id` (mRemapIndex) -- the two bound passes, reorderData,
+//     selfCollision, finalizeParticles (PxgParticleSystemCore.cpp:851-913, 679ff,
+//     1041ff; PxgPBDParticleSystemCore.cpp:480-505);
+//   * system = contact id >> 32 -- primitive contact generation (particleOrSoftbodyId),
+//     the mesh midphase, contactPrepare, the PGS/TGS particle and rigid delta-V solves,
+//     accumulateDeltaV (one contact list for ALL systems, sorted by (system, particle));
+//   * system = blockIdx.y DIRECTLY -- ps_stepParticlesLaunch (particlesystem.cu:130), the
+//     TGS predictor; it indexes the POOL, not act[] (upstream note U1 below);
+//   * system = the user's PxGpuParticleBufferIndexPair -- applyParticleBufferData.
+// 33 "force system index 0" mutants of those reads are value-identical in every
+// single-system scene by construction.  This scene is where they are not.
+//
+// TWO SYSTEMS THAT DIFFER IN EVERY PER-SYSTEM PARAMETER A KERNEL READS.  A is created and
+// added first (pool/remap index 0), B second (index 1):
+//                  A                                B (split / apply)
+//   cloud          4^3, spacing 0.5, x -10.75       5^3, spacing 0.3, x 9.4, inv mass 0.5
+//   rest/contact   0.25 / 0.30, particle 0.30       0.15 / 0.17, particle 0.18
+//   neighbourhood  96                               64
+//   max velocity   3                                5     (B must be FASTER than A)
+//   material       friction 0.05, gravity scale 1   friction 0.3, damping 0.1, gs 1.5
+//   adhesion       0.3, radius scale 1.5            0.5, radius scale 2.0
+//   lock           none (drifts in z at v.z = 1)    eLOCK_Z (v.z = 1 at spawn, z stays 0)
+//   floor          the ground box (primitive        a cooked 2-triangle patch at (10, 1, 0),
+//                  contacts)                        half 3 (ONE-WAY contacts, mesh midphase)
+// The adhesion is what makes mData.mRestOffset live in the primitive contact solve: its
+// only consumer there is the adhesion branch, dead at the default radius scale 0
+// (NpFactory.cpp:763).
+//
+// SUB-SCENES IN ONE PROCESS.  Each row builds, steps (120 x 1/60 s) and releases several
+// sub-scenes from main's sceneDesc, with the SAME rigid set in every one, in this order:
+//   both  -- A then B (the scored configuration);
+//   soloA, soloB -- the system alone;
+//   swap  -- B then A (B at pool index 0, A at index 1); split and fluid only, and only
+//            once every check on the first three held (see the dispatch block).
+//   C1 (bitwise)  A(both) == A(soloA), B(both) == B(soloB): a system's trajectory may not
+//                 depend on whether another system exists;
+//   C2 (bitwise)  A(both) == A(swap),  B(both) == B(swap): nor on which pool index it got.
+//                 In `split` B has no primitive contacts, so a force-index-0 mutant on the
+//                 primitive path is invisible in `both` -- and wrong in `swap`, where A is
+//                 index 1.  C2 is what kills gen / prep / accum / the PGS and TGS solves;
+//   C3 (absolute) rest heights, the velocity caps, the lock, per-row physics -- so a
+//                 mutant that breaks every sub-scene the same way still dies.
+// Rows (tools/run_scenes.sh): split TGS, split PGS, fluid (B = SnippetPBF fluid with 2048
+// diffuse particles on the ground box: the fluid/vorticity/material kernels at index 1;
+// its diffuse arrays compare as MULTISETS, U4), apply (eENABLE_DIRECT_GPU_API,
+// applyParticleBufferData naming ONLY B's slot with pairs from getGpuParticleSystemIndex,
+// A's edit must be lost), push (each system pushes its own 10 kg box: the rigid delta-V
+// decode; scored physically, U2).  `PXG_P2_ARM=remove` is a diagnostic, never scored.
+//
+// MEASURED (P9.99b): every C1/C2 comparison 0 of 512 (A) and 0 of 1000 (B) words, TGS and
+// PGS, in split, fluid and apply.
+//   split TGS  A y_min 0.249792, z 0.534571; B y_min 1.147884, z 0; at steps 20 / 30
+//              B v.y -4.999955 / -4.999985, A |v| 2.999979 / 2.999988 (both clouds still
+//              more than 0.5 m above contact onset at step 30)
+//   split PGS  A 0.248886, z 0.718450; B 1.138487, z 0; B v.y -5.000000, A |v| 3.000000
+//   fluid      B one layer at y 0.166666; diffuse peak 2048 (the cap), 1814 at the end, the
+//              diffuse multisets of both / soloB / swap equal (1814 of 1814)
+//   apply      gpu indices A 0, B 1; B z 5.000000 and v.x 1.996657 after the apply step, B
+//              ends off the patch on the ground box at y_min 0.148359; A == soloA
+//   push       box A moved 3.4980, box B 3.0656; 0.0268 / 0.0101 from the system alone
+//              (C1 not bitwise: 333 / 500 words, U2)
+//   remove     TGS: B differs from the no-removal run in 500 of 1000 words; PGS: 0
+//
+// UPSTREAM NOTES (documented, not reported; the port stays literal):
+//   U1  ps_stepParticlesLaunch steps pool slot blockIdx.y, not act[blockIdx.y].  After a
+//       system that is not the last is removed, the TGS predictor advances the REMOVED
+//       system's still-allocated arrays (freed only at core teardown) and never steps the
+//       survivor in the highest slot.  `PXG_P2_ARM=remove` shows it (B differs by 500 of
+//       1000 words under TGS, 0 under PGS); psContactSolveTgs_step_p99Direct pins it.
+//   U2  the order of contacts inside one body's run is the generation order, which
+//       depends on which OTHER pairs share the warps -- so two systems pushing boxes
+//       associate the box's delta-V sum differently than one.  Legit on CUDA too; the
+//       push row is scored physically, never bitwise.
+//   U3  the adhesion branch tests `separation < adhesionRadiusScale` (a scale, not the
+//       radius).  This scene stays below the adhesion radius, so it never enters it.
+//   U4  the diffuse slot order is run-to-run nondeterministic (atomic slot allocation);
+//       the multiset is deterministic.
+struct P2SysCfg
+{
+    int   g;                       // g x g x g cloud
+    float spacing;
+    float cx, off, shiftX;         // x = cx + i*spacing - off + shiftX, z = k*spacing - off
+    float bottomY;
+    float invMass;
+    float rest, contactOff, particleContactOff, fluidRest;
+    float maxV;
+    PxU32 maxNbr;
+    float friction, damping, viscosity, vorticity, surfaceTension, cohesion, gravityScale;
+    float adhesion, adhesionRadiusScale;   // adhesion 0: the setters are not called
+    bool  lockZ, fluid, diffuse;
+    float v0x, v0z;
+};
+
+static P2SysCfg particle2CfgA(bool push)
+{
+    P2SysCfg c = {};
+    c.g = 4; c.spacing = 0.5f; c.cx = -10.0f; c.off = 0.75f; c.shiftX = push ? 0.5f : 0.0f;
+    c.bottomY = push ? 0.25f : 2.0f; c.invMass = 1.0f;
+    c.rest = 0.25f; c.contactOff = 0.25f + 0.05f; c.particleContactOff = 0.25f + 0.05f; c.fluidRest = 0.0f;
+    c.maxV = push ? 1e6f : 3.0f; c.maxNbr = 96;
+    c.friction = 0.05f; c.gravityScale = 1.0f;
+    c.adhesion = push ? 0.0f : 0.3f; c.adhesionRadiusScale = push ? 0.0f : 1.5f;
+    c.v0x = push ? 4.0f : 0.0f; c.v0z = 1.0f;
+    return c;
+}
+
+static P2SysCfg particle2CfgB(bool push, bool fluid)
+{
+    P2SysCfg c = {};
+    c.g = 5; c.cx = 10.0f; c.off = 0.6f; c.shiftX = push ? 0.5f : 0.0f; c.invMass = 0.5f;
+    c.maxNbr = 64; c.friction = 0.3f; c.damping = 0.1f;
+    if (fluid)
+    {
+        // SnippetPBF's fluid offsets: r = 0.5 spacing / 0.6, fluid rest 0.6 r.
+        c.spacing = 0.2f; c.bottomY = 3.0f;
+        const float r = 0.5f * c.spacing / 0.6f;
+        c.rest = r; c.contactOff = r + 0.02f; c.particleContactOff = r; c.fluidRest = r * 0.6f;
+        c.maxV = 4.0f;
+        c.viscosity = 0.001f; c.vorticity = 0.5f; c.surfaceTension = 0.005f; c.cohesion = 0.01f;
+        c.gravityScale = 0.6f;
+        c.fluid = true; c.diffuse = true;
+        return c;
+    }
+    c.spacing = 0.3f; c.bottomY = push ? 0.15f : 4.0f;
+    c.rest = 0.15f; c.contactOff = 0.15f + 0.02f; c.particleContactOff = 0.15f + 0.03f;
+    c.maxV = push ? 4.0f : 5.0f;
+    c.gravityScale = push ? 0.6f : 1.5f;
+    c.adhesion = push ? 0.0f : 0.5f; c.adhesionRadiusScale = push ? 0.0f : 2.0f;
+    c.lockZ = true;
+    c.v0x = push ? 4.0f : 0.0f; c.v0z = 1.0f;
+    return c;
+}
+
+static const int P2_STEPS = 120;
+static const int P2_REMOVE_STEP = 60;
+static const PxU32 P2_MAX_DIFFUSE = 2048;
+
+enum P2Who { P2_BOTH, P2_SWAP, P2_SOLO_A, P2_SOLO_B, P2_REMOVE_A };
+static const char* const P2_WHO_NAME[] = { "both", "swap", "soloA", "soloB", "remove" };
+
+struct P2Run
+{
+    bool ok = false;
+    bool present[2] = { false, false };
+    PxU32 n[2] = { 0, 0 }, nActive[2] = { 0, 0 };
+    PxU32 gpuIdx[2] = { 0xffffffffu, 0xffffffffu };      // read at the apply call
+    std::vector<PxVec4> pos[2], vel[2];                   // final user arrays
+    PxVec3 vProbe[2][2];                                  // mean velocity after steps 20 / 30
+    PxVec3 pAfterApply[2], vAfterApply[2];                // mean p / v after step 1 (apply arm)
+    PxVec3 meanP[2];
+    float yMin[2] = { 0.0f, 0.0f }, yMax[2] = { 0.0f, 0.0f };
+    bool finite[2] = { true, true };
+    PxU32 diffusePeak[2] = { 0, 0 }, diffuseEnd[2] = { 0, 0 };
+    std::vector<PxVec4> diffPos[2], diffVel[2];           // final active diffuse particles
+    PxVec3 box[2];                                        // push arm: final box positions
+};
+
+static PxVec3 particle2MeanXYZ(const std::vector<PxVec4>& v)
+{
+    double x = 0.0, y = 0.0, z = 0.0;
+    for (const PxVec4& p : v) { x += double(p.x); y += double(p.y); z += double(p.z); }
+    const double n = double(v.size() ? v.size() : 1);
+    return PxVec3(float(x / n), float(y / n), float(z / n));
+}
+
+// One sub-scene: build, step, read back, release everything it created.  Every rigid
+// actor is created in every mode, in the same order, so node indices and the rigid pair
+// order never depend on `who`.
+static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMaterial* material,
+                          PxCudaContextManager* cudaCtx, const char* arm, P2Who who, int steps)
+{
+    P2Run r;
+    const bool armSplit = !std::strcmp(arm, "split") || !std::strcmp(arm, "remove");
+    const bool armApply = !std::strcmp(arm, "apply");
+    const bool armFluid = !std::strcmp(arm, "fluid");
+    const bool armPush = !std::strcmp(arm, "push");
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+
+    PxScene* scene = physics->createScene(desc);
+    if (!scene) { std::printf("FAIL: particle2 [%s]: createScene returned null\n", P2_WHO_NAME[who]); return r; }
+    std::vector<PxRigidActor*> rigids;
+    rigids.push_back(addGroundBox(physics, scene, material));
+    // the live dynamic rigid the particle island needs, far aside
+    rigids.push_back(addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 40.0f));
+    PxTriangleMesh* patch = nullptr;
+    if (armSplit || armApply)
+    {
+        // B's floor: a cooked 2-triangle patch, half 3, top at y = 1 under B only.
+        const float E = 3.0f;
+        const PxVec3 mverts[4] = { PxVec3(-E, 0.0f, -E), PxVec3(-E, 0.0f, E), PxVec3(E, 0.0f, -E), PxVec3(E, 0.0f, E) };
+        const PxU32 mtris[6] = { 0u, 1u, 2u, 2u, 1u, 3u };
+        PxTriangleMeshDesc md;
+        md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mverts;
+        md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mtris;
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.buildGPUData = true;
+        patch = immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+        if (!patch) { std::printf("FAIL: particle2: createTriangleMesh returned null\n"); scene->release(); return r; }
+        PxRigidStatic* fl = physics->createRigidStatic(PxTransform(PxVec3(10.0f, 1.0f, 0.0f)));
+        PxShape* fs = physics->createShape(PxTriangleMeshGeometry(patch), *material);
+        fl->attachShape(*fs); scene->addActor(*fl); fs->release();
+        rigids.push_back(fl);
+    }
+    PxRigidDynamic* boxes[2] = { nullptr, nullptr };
+    if (armPush)
+    {
+        // one 10 kg push target per system, present in EVERY sub-scene
+        for (int k = 0; k < 2; ++k)
+        {
+            const PxVec3 half(0.5f, 1.0f, 0.5f);
+            PxRigidDynamic* t = physics->createRigidDynamic(PxTransform(PxVec3(k ? 12.5f : -7.5f, half.y, 0.0f)));
+            PxShape* s = physics->createShape(PxBoxGeometry(half), *material);
+            t->attachShape(*s); s->release();
+            t->setMass(10.0f); t->setMassSpaceInertiaTensor(boxInertia(half, 10.0f));
+            scene->addActor(*t);
+            boxes[k] = t; rigids.push_back(t);
+        }
+    }
+
+    const P2SysCfg cfg[2] = { particle2CfgA(armPush), particle2CfgB(armPush, armFluid) };
+    const bool want[2] = { who != P2_SOLO_B, who != P2_SOLO_A };
+    PxPBDParticleSystem* ps[2] = { nullptr, nullptr };
+    PxParticleBuffer* buf[2] = { nullptr, nullptr };
+    PxParticleAndDiffuseBuffer* dbuf[2] = { nullptr, nullptr };
+    PxPBDMaterial* pmat[2] = { nullptr, nullptr };
+    bool built = true;
+    for (int k = 0; k < 2 && built; ++k)
+    {
+        if (!want[k]) continue;
+        const P2SysCfg& c = cfg[k];
+        pmat[k] = physics->createPBDMaterial(c.friction, c.damping, 0.0f, c.viscosity, c.vorticity, c.surfaceTension,
+                                             c.cohesion, 0.0f, 0.0f, 1.0f, c.gravityScale);
+        ps[k] = pmat[k] ? physics->createPBDParticleSystem(*cudaCtx, c.maxNbr) : nullptr;
+        if (!ps[k]) { built = false; break; }
+        if (c.adhesion > 0.0f) { pmat[k]->setAdhesion(c.adhesion); pmat[k]->setAdhesionRadiusScale(c.adhesionRadiusScale); }
+        ps[k]->setRestOffset(c.rest);
+        ps[k]->setContactOffset(c.contactOff);
+        ps[k]->setParticleContactOffset(c.particleContactOff);
+        if (c.fluid) ps[k]->setFluidRestOffset(c.fluidRest);
+        ps[k]->setSolidRestOffset(c.rest);
+        ps[k]->setMaxVelocity(c.maxV);
+        ps[k]->setSolverIterationCounts(8, 1);
+        if (c.lockZ) ps[k]->setParticleLockFlag(PxParticleLockFlag::eLOCK_Z, true);
+        const PxU32 phase = ps[k]->createPhase(pmat[k], PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide |
+                                               (c.fluid ? PxParticlePhaseFlag::eParticlePhaseFluid : PxParticlePhaseFlag::Enum(0))));
+        const PxU32 N = PxU32(c.g * c.g * c.g);
+        std::vector<PxVec4> pos(N), vel(N, PxVec4(c.v0x, 0.0f, c.v0z, 0.0f));
+        std::vector<PxU32> ph(N, phase);
+        PxU32 i = 0;
+        for (int x = 0; x < c.g; ++x)
+            for (int y = 0; y < c.g; ++y)
+                for (int z = 0; z < c.g; ++z)
+                    pos[i++] = PxVec4(c.cx + x * c.spacing - c.off + c.shiftX, c.bottomY + y * c.spacing,
+                                      z * c.spacing - c.off, c.invMass);
+        if (c.diffuse)
+        {
+            dbuf[k] = physics->createParticleAndDiffuseBuffer(N, 0, P2_MAX_DIFFUSE, cudaCtx);
+            if (dbuf[k])
+            {
+                PxDiffuseParticleParams dp; dp.threshold = 1.0f; dp.lifetime = 2.0f;
+                dbuf[k]->setDiffuseParticleParams(dp);
+                dbuf[k]->setMaxActiveDiffuseParticles(P2_MAX_DIFFUSE);
+            }
+            buf[k] = dbuf[k];
+        }
+        else
+            buf[k] = physics->createParticleBuffer(N, 0, cudaCtx);
+        if (!buf[k]) { built = false; break; }
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getPositionInvMasses()), pos.data(), N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getVelocities()), vel.data(), N * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getPhases()), ph.data(), N * sizeof(PxU32));
+        buf[k]->setNbActiveParticles(N);
+        buf[k]->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+        buf[k]->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+        buf[k]->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+        ps[k]->addParticleBuffer(buf[k]);
+        r.present[k] = true;
+        r.n[k] = N;
+    }
+
+    auto readSys = [&](int k, std::vector<PxVec4>& p, std::vector<PxVec4>& v) {
+        p.resize(r.n[k]); v.resize(r.n[k]);
+        ctx->memcpyDtoH(p.data(), reinterpret_cast<CUdeviceptr>(buf[k]->getPositionInvMasses()), r.n[k] * sizeof(PxVec4));
+        ctx->memcpyDtoH(v.data(), reinterpret_cast<CUdeviceptr>(buf[k]->getVelocities()), r.n[k] * sizeof(PxVec4));
+    };
+    CUdeviceptr devIdx = 0, devPairs = 0, devFlags = 0;
+    if (built)
+    {
+        const int order[2] = { who == P2_SWAP ? 1 : 0, who == P2_SWAP ? 0 : 1 };
+        for (int k : order) if (ps[k]) scene->addActor(*ps[k]);
+        bool aLive = ps[0] != nullptr;
+        for (int i = 0; i < steps && built; ++i)
+        {
+            if (armApply && i == 1)
+            {
+                // The write window after the warm-up step: both user arrays are edited and NO
+                // flag is raised.  Only B's slot is applied (indices = {1}); A's edit must be
+                // lost to the next egress.
+                for (int k = 0; k < 2; ++k)
+                {
+                    if (!ps[k]) continue;
+                    r.gpuIdx[k] = ps[k]->getGpuParticleSystemIndex();
+                    std::vector<PxVec4> p, v; readSys(k, p, v);
+                    for (PxU32 q = 0; q < r.n[k]; ++q)
+                    {
+                        if (k == 1) { p[q].z += 5.0f; v[q].x = 2.0f; }
+                        else        { v[q].y = 3.0f; }
+                    }
+                    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getPositionInvMasses()), p.data(), r.n[k] * sizeof(PxVec4));
+                    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getVelocities()), v.data(), r.n[k] * sizeof(PxVec4));
+                }
+                std::printf("  [%s] apply: gpu index A %u B %u\n", P2_WHO_NAME[who], r.gpuIdx[0], r.gpuIdx[1]);
+                if (ps[1])
+                {
+                    const PxGpuParticleBufferIndexPair pairs[2] = {
+                        { r.gpuIdx[0], ps[0] ? buf[0]->getUniqueId() : 0u }, { r.gpuIdx[1], buf[1]->getUniqueId() } };
+                    const PxParticleBufferFlags flags[2] = {
+                        PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_VELOCITY),
+                        PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY };
+                    const PxU32 indices[1] = { 1u };
+                    if (ctx->memAlloc(&devIdx, sizeof(indices)) != 0 || !devIdx ||
+                        ctx->memAlloc(&devPairs, sizeof(pairs)) != 0 || !devPairs ||
+                        ctx->memAlloc(&devFlags, sizeof(flags)) != 0 || !devFlags)
+                    {
+                        std::printf("FAIL: particle2 apply: memAlloc failed\n");
+                        built = false; break;
+                    }
+                    ctx->memcpyHtoD(devIdx, indices, sizeof(indices));
+                    ctx->memcpyHtoD(devPairs, pairs, sizeof(pairs));
+                    ctx->memcpyHtoD(devFlags, flags, sizeof(flags));
+                    scene->applyParticleBufferData(reinterpret_cast<const PxU32*>(devIdx),
+                                                   reinterpret_cast<const PxGpuParticleBufferIndexPair*>(devPairs),
+                                                   reinterpret_cast<const PxParticleBufferFlags*>(devFlags), 1u);
+                }
+            }
+            if (who == P2_REMOVE_A && i == P2_REMOVE_STEP && aLive)
+            {
+                scene->removeActor(*ps[0]);
+                aLive = false;
+                std::printf("  [remove] A removed before step %d\n", i);
+            }
+            scene->simulate(1.0f / 60.0f);
+            scene->fetchResults(true);
+            for (int k = 0; k < 2; ++k)
+                if (dbuf[k]) r.diffusePeak[k] = PxMax(r.diffusePeak[k], dbuf[k]->getNbActiveDiffuseParticles());
+            if (i == 1 || i == 20 || i == 30)
+                for (int k = 0; k < 2; ++k)
+                {
+                    if (!ps[k] || (k == 0 && !aLive)) continue;
+                    std::vector<PxVec4> p, v; readSys(k, p, v);
+                    const PxVec3 mp = particle2MeanXYZ(p), mv = particle2MeanXYZ(v);
+                    if (i == 1) { r.pAfterApply[k] = mp; r.vAfterApply[k] = mv; }
+                    else r.vProbe[k][i == 30] = mv;
+                    std::printf("  [%s] step %3d %s: mean p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f) |v| %.6f\n",
+                                P2_WHO_NAME[who], i, k ? "B" : "A", mp.x, mp.y, mp.z, mv.x, mv.y, mv.z, mv.magnitude());
+                }
+        }
+        // Read back.  A removed system (diagnostic arm) is not read.
+        for (int k = 0; k < 2 && built; ++k)
+        {
+            if (!ps[k] || (k == 0 && !aLive)) { r.present[k] = r.present[k] && aLive; continue; }
+            readSys(k, r.pos[k], r.vel[k]);
+            r.nActive[k] = buf[k]->getNbActiveParticles();
+            r.meanP[k] = particle2MeanXYZ(r.pos[k]);
+            r.yMin[k] = FLT_MAX; r.yMax[k] = -FLT_MAX;
+            for (PxU32 q = 0; q < r.n[k]; ++q)
+            {
+                r.yMin[k] = PxMin(r.yMin[k], r.pos[k][q].y);
+                r.yMax[k] = PxMax(r.yMax[k], r.pos[k][q].y);
+                r.finite[k] = r.finite[k] && r.pos[k][q].isFinite() && r.vel[k][q].isFinite();
+            }
+            if (dbuf[k])
+            {
+                const PxU32 nd = PxMin(dbuf[k]->getNbActiveDiffuseParticles(), P2_MAX_DIFFUSE);
+                r.diffuseEnd[k] = nd;
+                r.diffPos[k].resize(nd); r.diffVel[k].resize(nd);
+                if (nd)
+                {
+                    ctx->memcpyDtoH(r.diffPos[k].data(), reinterpret_cast<CUdeviceptr>(dbuf[k]->getDiffusePositionLifeTime()), nd * sizeof(PxVec4));
+                    ctx->memcpyDtoH(r.diffVel[k].data(), reinterpret_cast<CUdeviceptr>(dbuf[k]->getDiffuseVelocities()), nd * sizeof(PxVec4));
+                }
+            }
+            const PxVec3 mv = particle2MeanXYZ(r.vel[k]);
+            std::printf("  [%s] %s: N %u (active %u) mean p=(%.6f, %.6f, %.6f) v=(%.6f, %.6f, %.6f) y[min %.6f max %.6f] "
+                        "finite %d%s", P2_WHO_NAME[who], k ? "B" : "A", r.n[k], r.nActive[k], r.meanP[k].x, r.meanP[k].y,
+                        r.meanP[k].z, mv.x, mv.y, mv.z, r.yMin[k], r.yMax[k], int(r.finite[k]), dbuf[k] ? "" : "\n");
+            if (dbuf[k]) std::printf(" diffuse peak %u end %u\n", r.diffusePeak[k], r.diffuseEnd[k]);
+        }
+        for (int k = 0; k < 2; ++k)
+            if (boxes[k])
+            {
+                r.box[k] = boxes[k]->getGlobalPose().p;
+                std::printf("  [%s] box %s: (%.6f, %.6f, %.6f)\n", P2_WHO_NAME[who], k ? "B" : "A", r.box[k].x, r.box[k].y, r.box[k].z);
+            }
+        r.ok = built;
+    }
+    if (!built) std::printf("FAIL: particle2 [%s]: a particle system could not be built\n", P2_WHO_NAME[who]);
+
+    scene->release();
+    for (int k = 0; k < 2; ++k)
+    {
+        if (ps[k]) ps[k]->release();
+        if (buf[k]) buf[k]->release();
+        if (pmat[k]) pmat[k]->release();
+    }
+    for (PxRigidActor* a : rigids) a->release();
+    if (patch) patch->release();
+    if (devIdx) ctx->memFree(devIdx);
+    if (devPairs) ctx->memFree(devPairs);
+    if (devFlags) ctx->memFree(devFlags);
+    return r;
+}
+
+// C1/C2: the differing 32-bit words of system k's final user arrays (pos + vel).  On a
+// difference the first differing particle is printed in %a.
+static size_t particle2CompareWords(const char* what, const P2Run& x, const P2Run& y, int k)
+{
+    const PxU32 n = x.n[k];
+    if (!x.present[k] || !y.present[k] || y.n[k] != n)
+    {
+        std::printf("FAIL: %s: system %s missing from a sub-scene\n", what, k ? "B" : "A");
+        return size_t(-1);
+    }
+    size_t mism = 0, first = size_t(-1);
+    for (int a = 0; a < 2; ++a)
+    {
+        const std::vector<PxVec4>& vx = a ? x.vel[k] : x.pos[k];
+        const std::vector<PxVec4>& vy = a ? y.vel[k] : y.pos[k];
+        for (PxU32 q = 0; q < n; ++q)
+        {
+            PxU32 wx[4], wy[4];
+            std::memcpy(wx, &vx[q], sizeof(wx)); std::memcpy(wy, &vy[q], sizeof(wy));
+            for (int c = 0; c < 4; ++c)
+                if (wx[c] != wy[c]) { ++mism; if (first == size_t(-1)) first = q; }
+        }
+    }
+    std::printf("  %s: %zu of %u words differ\n", what, mism, n * 8u);
+    if (mism)
+    {
+        const PxU32 q = PxU32(first);
+        std::printf("    first differing particle %u: p (%a, %a, %a) vs (%a, %a, %a), v (%a, %a, %a) vs (%a, %a, %a)\n", q,
+                    double(x.pos[k][q].x), double(x.pos[k][q].y), double(x.pos[k][q].z),
+                    double(y.pos[k][q].x), double(y.pos[k][q].y), double(y.pos[k][q].z),
+                    double(x.vel[k][q].x), double(x.vel[k][q].y), double(x.vel[k][q].z),
+                    double(y.vel[k][q].x), double(y.vel[k][q].y), double(y.vel[k][q].z));
+        std::printf("    diagnosis (U2): PXG_DUMP_ARGS=ps_reorderPrimitiveContactsLaunch:32:4096:40:4096:8:4 on both runs; an equal "
+                    "contact multiset in a different order is composition-dependent association, a different multiset is a defect\n");
+    }
+    return mism;
+}
+
+// The diffuse arrays as MULTISETS of (position+lifetime, velocity) records: the slot
+// order is not deterministic (U4), the set is.
+static bool particle2CompareDiffuse(const char* what, const P2Run& x, const P2Run& y, int k)
+{
+    struct Rec { PxU32 w[8]; bool operator<(const Rec& o) const { return std::lexicographical_compare(w, w + 8, o.w, o.w + 8); } };
+    auto recs = [&](const P2Run& r) {
+        std::vector<Rec> v(r.diffPos[k].size());
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            std::memcpy(v[i].w, &r.diffPos[k][i], 16);
+            std::memcpy(v[i].w + 4, &r.diffVel[k][i], 16);
+        }
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    const std::vector<Rec> rx = recs(x), ry = recs(y);
+    size_t same = 0;
+    if (rx.size() == ry.size())
+        for (size_t i = 0; i < rx.size(); ++i) same += std::memcmp(rx[i].w, ry[i].w, sizeof(rx[i].w)) == 0 ? 1u : 0u;
+    const bool ok = rx.size() == ry.size() && same == rx.size();
+    std::printf("  %s: diffuse multiset %zu vs %zu records, %zu equal after sorting%s\n", what, rx.size(), ry.size(), same,
+                ok ? "" : "  <-- differs");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // P9.4 -- PXG_SCENE=particlecloth: the PBD CLOTH sheet.
 //
 // This is the scene that makes the spring chain observable.  Four kernels were
@@ -7740,6 +8227,26 @@ int main()
             sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
             std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (particle direct-API ingest)\n");
         }
+        // P9.99b -- PXG_SCENE=particle2: PBD particle systems exist only on the GPU pipeline,
+        // so PXG_CPU_CONTROL=1 is refused for every arm.  The `apply` arm calls
+        // applyParticleBufferData, legal only under the direct-GPU API (NpScene.cpp:3735);
+        // the flag is immutable after createScene, so it is raised here, for every sub-scene.
+        if (sn && !std::strcmp(sn, "particle2"))
+        {
+            if (cpuControl)
+            {
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=particle2 requires the GPU pipeline (PBD particle "
+                            "systems); PXG_CPU_CONTROL=1 is refused\n");
+                physics->release(); cudaCtx->release(); foundation->release();
+                return 1;
+            }
+            const char* p2arm = std::getenv("PXG_P2_ARM");
+            if (p2arm && !std::strcmp(p2arm, "apply"))
+            {
+                sceneDesc.flags |= PxSceneFlag::eENABLE_DIRECT_GPU_API;
+                std::printf("  [ P9.99b ] eENABLE_DIRECT_GPU_API raised (particle2 apply arm)\n");
+            }
+        }
     }
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
@@ -11437,6 +11944,201 @@ int main()
         return 2;
     }
 
+    // P9.99b -- PXG_SCENE=particle2: two PBD particle systems in one scene (see the block
+    // above runParticle2 for the inventory, the arms and the oracles).  The sub-scenes
+    // make their own scenes from sceneDesc; main's scene is released first.
+    if (!std::strcmp(sceneName, "particle2"))
+    {
+        const char* armEnv = std::getenv("PXG_P2_ARM");
+        const char* arm = armEnv ? armEnv : "split";
+        const bool armSplit = !std::strcmp(arm, "split"), armFluid = !std::strcmp(arm, "fluid");
+        const bool armApply = !std::strcmp(arm, "apply"), armPush = !std::strcmp(arm, "push");
+        const bool armRemove = !std::strcmp(arm, "remove");
+        const char* solverName = usePgs ? "PGS" : "TGS";
+        scene->release(); scene = nullptr;
+        if (!(armSplit || armFluid || armApply || armPush || armRemove))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particle2: unknown PXG_P2_ARM=%s (split, fluid, apply, push, remove)\n", arm);
+            physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            const P2Run c = runParticle2(physics, sceneDesc, material, cudaCtx, arm, P2_BOTH, 0);
+            physics->release(); cudaCtx->release(); foundation->release();
+            if (!c.ok) { std::printf("[ FAIL ] gpu-sdk-step: particle2 (%s) scene build failed\n", arm); return 1; }
+            std::printf("[  OK  ] gpu-sdk-step: particle2 (%s) pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n", arm);
+            return 0;
+        }
+        std::printf("  particle2 (%s, %s): two PBD systems, A (4^3, index 0) and B (5^3, index 1), %d steps per sub-scene\n",
+                    arm, solverName, P2_STEPS);
+
+        // Sub-scene order: both, each system alone, and the swapped pool order LAST (split and
+        // fluid only), after every other check has held.  The order does not change any
+        // sub-scene's result (each is a fresh scene; measured bit-identical in either order),
+        // but it decides how a broken kernel dies: a scene that reads arrays a wrong-index
+        // kernel never wrote may fault in a LATER sub-scene of the same process, where the
+        // allocator hands back memory an earlier sub-scene left behind (measured: the
+        // self-collision `id = 0` mutant collapses B in `both` and then segfaults in `swap`).
+        // Running `swap` only when C1/C3 already held turns such a mutant into a value kill.
+        P2Run runs[5];
+        std::vector<P2Who> whos;   // the sub-scenes that ran, in order
+        auto runSub = [&](P2Who w) {
+            const auto t0 = std::chrono::steady_clock::now();
+            runs[w] = runParticle2(physics, sceneDesc, material, cudaCtx, arm, w, P2_STEPS);
+            whos.push_back(w);
+            std::printf("  [%s] sub-scene done in %.1f s\n", P2_WHO_NAME[w],
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        };
+        runSub(P2_BOTH);
+        if (armRemove) runSub(P2_REMOVE_A);
+        else { runSub(P2_SOLO_A); runSub(P2_SOLO_B); }
+        const P2Run& both = runs[P2_BOTH];
+        bool ran = true;
+        for (P2Who w : whos) ran = ran && runs[w].ok;
+
+        int failures = 0;
+        auto inRange = [&](const char* what, float got, float lo, float hi) {
+            if (!(got >= lo && got <= hi))
+            { std::printf("FAIL: %s = %.6f, expected in [%g, %g]\n", what, got, lo, hi); ++failures; }
+        };
+        auto near = [&](const char* what, float got, float want, float tol) {
+            if (!(std::fabs(got - want) <= tol))
+            { std::printf("FAIL: %s = %.6f, expected %g +- %g\n", what, got, want, tol); ++failures; }
+        };
+
+        if (armRemove)
+        {
+            // U1, diagnostic: B's final arrays with A removed before step 60 vs the no-removal run.
+            physics->release(); cudaCtx->release(); foundation->release();
+            const P2Run& rm = runs[P2_REMOVE_A];
+            if (!both.ok || !rm.ok) { std::printf("[ diagnostic ] gpu-sdk-step: particle2 (remove, %s): a sub-scene failed\n", solverName); return 0; }
+            const size_t d = particle2CompareWords("B remove/both", rm, both, 1);
+            std::printf("[ diagnostic ] gpu-sdk-step: particle2 (remove, %s): %zu of %u B words differ from the no-removal run "
+                        "(U1: the TGS predictor steps pool slot blockIdx.y; measured 500 TGS, 0 PGS), not scored\n",
+                        solverName, d, both.n[1] * 8u);
+            return 0;
+        }
+
+        // Every sub-scene: built, both systems' N, finite, nothing fell through the world.
+        auto subSceneChecks = [&](P2Who w) {
+            const P2Run& r = runs[w];
+            if (!r.ok) { std::printf("FAIL: sub-scene [%s] did not run\n", P2_WHO_NAME[w]); ++failures; return; }
+            for (int k = 0; k < 2; ++k)
+            {
+                if (!r.present[k]) continue;
+                if (r.nActive[k] != r.n[k])
+                { std::printf("FAIL: [%s] %s has %u active particles, expected %u\n", P2_WHO_NAME[w], k ? "B" : "A", r.nActive[k], r.n[k]); ++failures; }
+                if (!r.finite[k]) { std::printf("FAIL: [%s] %s is not finite\n", P2_WHO_NAME[w], k ? "B" : "A"); ++failures; }
+                if (!(r.yMin[k] > -1.0f)) { std::printf("FAIL: [%s] %s fell through (y_min %.6f)\n", P2_WHO_NAME[w], k ? "B" : "A", r.yMin[k]); ++failures; }
+            }
+        };
+        for (P2Who w : whos) subSceneChecks(w);
+
+        size_t c1[2] = { 0, 0 }, c2[2] = { 0, 0 };
+        if (ran)
+        {
+            // C1: a system's trajectory does not depend on whether the other one exists.
+            c1[0] = particle2CompareWords("C1 A both/soloA", both, runs[P2_SOLO_A], 0);
+            c1[1] = particle2CompareWords("C1 B both/soloB", both, runs[P2_SOLO_B], 1);
+            if (armPush)
+                std::printf("  (push: C1 is NOT scored -- the box's contact order inside its rigid run depends on the "
+                            "composition, U2; the push row is scored physically)\n");
+            else
+                for (int k = 0; k < 2; ++k)
+                    if (c1[k]) { std::printf("FAIL: C1 %s: %zu words differ from the system alone\n", k ? "B" : "A", c1[k]); ++failures; }
+            if (armFluid && !particle2CompareDiffuse("C1 B diffuse both/soloB", both, runs[P2_SOLO_B], 1)) ++failures;
+        }
+
+        // C3: absolute physics of the scored `both` sub-scene.
+        if (ran && (armSplit || armFluid))
+        {
+            // A: the granular cloud on the ground box (identical in both rows).
+            inRange("A y_min (rest 0.25 on the ground box)", both.yMin[0], 0.24f, 0.26f);
+            inRange("A mean z (drifts at v.z = 1, no lock)", both.meanP[0].z, 0.3f, 1e30f);
+            for (int s = 0; s < 2; ++s)
+                near(s ? "A |mean v| at step 30 (cap 3)" : "A |mean v| at step 20 (cap 3)", both.vProbe[0][s].magnitude(), 3.0f, 2e-3f);
+        }
+        if (ran && armSplit)
+        {
+            inRange("B y_min (rest 0.15 on the mesh patch at y = 1)", both.yMin[1], 1.13f, 1.16f);
+            near("B mean z (eLOCK_Z)", both.meanP[1].z, 0.0f, 1e-4f);
+            for (int s = 0; s < 2; ++s)
+                near(s ? "B mean v.y at step 30 (cap 5)" : "B mean v.y at step 20 (cap 5)", both.vProbe[1][s].y, -5.0f, 2e-3f);
+        }
+        if (ran && armFluid)
+        {
+            inRange("B y_min (one fluid layer)", both.yMin[1], 0.1666f, 0.1667f);
+            inRange("B y_max (one fluid layer)", both.yMax[1], 0.1666f, 0.1667f);
+            if (both.diffusePeak[1] != P2_MAX_DIFFUSE)
+            { std::printf("FAIL: B diffuse peak %u, expected the cap %u\n", both.diffusePeak[1], P2_MAX_DIFFUSE); ++failures; }
+            if (both.diffuseEnd[1] == 0) { std::printf("FAIL: B has no diffuse particles at the end\n"); ++failures; }
+        }
+        if (ran && armApply)
+        {
+            if (both.gpuIdx[0] != 0u || both.gpuIdx[1] != 1u)
+            { std::printf("FAIL: gpu indices A %u B %u, expected 0 and 1 (indices = {1} names B's slot)\n", both.gpuIdx[0], both.gpuIdx[1]); ++failures; }
+            near("B mean z after the apply step (z += 5 applied)", both.pAfterApply[1].z, 5.0f, 1e-4f);
+            inRange("B mean v.x after the apply step (v.x = 2 applied)", both.vAfterApply[1].x, 1.99f, 2.0f);
+            near("B mean z at the end (eLOCK_Z keeps the applied z)", both.meanP[1].z, 5.0f, 1e-4f);
+            inRange("B y_min at the end (off the patch, on the ground box)", both.yMin[1], 0.14f, 0.16f);
+        }
+        if (ran && armPush)
+        {
+            const float x0[2] = { -7.5f, 12.5f };
+            const P2Run* solo[2] = { &runs[P2_SOLO_A], &runs[P2_SOLO_B] };
+            for (int k = 0; k < 2; ++k)
+            {
+                char what[96];
+                std::snprintf(what, sizeof(what), "box %s pushed forward by system %s", k ? "B" : "A", k ? "B" : "A");
+                inRange(what, both.box[k].x - x0[k], 2.0f, 4.5f);
+                std::snprintf(what, sizeof(what), "|box %s (both) - box %s (system %s alone)|", k ? "B" : "A", k ? "B" : "A", k ? "B" : "A");
+                inRange(what, (both.box[k] - solo[k]->box[k]).magnitude(), 0.0f, 0.25f);
+            }
+        }
+
+        // C2 last: the swapped pool order (A at index 1), run only when everything above held.
+        if (armSplit || armFluid)
+        {
+            if (failures == 0)
+            {
+                runSub(P2_SWAP);
+                subSceneChecks(P2_SWAP);
+                if (runs[P2_SWAP].ok)
+                {
+                    c2[0] = particle2CompareWords("C2 A both/swap", both, runs[P2_SWAP], 0);
+                    c2[1] = particle2CompareWords("C2 B both/swap", both, runs[P2_SWAP], 1);
+                    for (int k = 0; k < 2; ++k)
+                        if (c2[k]) { std::printf("FAIL: C2 %s: %zu words differ from the swapped pool order\n", k ? "B" : "A", c2[k]); ++failures; }
+                    if (armFluid && !particle2CompareDiffuse("C2 B diffuse both/swap", both, runs[P2_SWAP], 1)) ++failures;
+                }
+            }
+            else
+                std::printf("  [swap] not run: %d check(s) already failed\n", failures);
+        }
+
+        physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particle2 (%s, %s): %d check(s) failed\n", arm, solverName, failures);
+            return 2;
+        }
+        if (armPush)
+            std::printf("[  OK  ] gpu-sdk-step: particle2 (push, %s): box A moved %.4f, box B %.4f; vs alone %.4f / %.4f\n",
+                        solverName, both.box[0].x + 7.5f, both.box[1].x - 12.5f,
+                        (both.box[0] - runs[P2_SOLO_A].box[0]).magnitude(), (both.box[1] - runs[P2_SOLO_B].box[1]).magnitude());
+        else if (armApply)
+            std::printf("[  OK  ] gpu-sdk-step: particle2 (apply, %s): C1 %zu/%u %zu/%u; B z %.6f, v.x %.6f after the apply, "
+                        "rests %.6f off the patch; A's edit lost\n", solverName, c1[0], both.n[0] * 8u, c1[1], both.n[1] * 8u,
+                        both.pAfterApply[1].z, both.vAfterApply[1].x, both.yMin[1]);
+        else
+            std::printf("[  OK  ] gpu-sdk-step: particle2 (%s, %s): C1 %zu/%u %zu/%u, C2 %zu/%u %zu/%u; A rests %.6f z %.6f, "
+                        "B y[%.6f %.6f] z %.6f%s\n", arm, solverName, c1[0], both.n[0] * 8u, c1[1], both.n[1] * 8u,
+                        c2[0], both.n[0] * 8u, c2[1], both.n[1] * 8u, both.yMin[0], both.meanP[0].z, both.yMin[1], both.yMax[1],
+                        both.meanP[1].z, armFluid ? ", diffuse multisets equal" : "");
+        return 0;
+    }
+
     if (!std::strcmp(sceneName, "substepgravity"))
     {
         SubstepGravityScene gs = buildSubstepGravityScene(physics, scene, material);
@@ -12573,6 +13275,7 @@ int main()
                        "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
                        "          directapimerge                          (P9.95: shapes added / re-inserted between steps -> mergeTransformCacheAndBoundArrayChanges)\n"
                        "          sdfquery                                (P9.95: PxDirectGPUAPI::evaluateSDFDistances -> evaluatePointDistancesSDFBatch)\n"
+                       "          particle2                               (P9.99b: TWO PBD particle systems; PXG_P2_ARM=split|fluid|apply|push|remove)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"

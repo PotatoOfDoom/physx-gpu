@@ -181,7 +181,7 @@ struct PxsCachedTransform
 // (ABI row {4,4,8,8,8,8,8,8,8,8}.)
 struct MidphaseParams
 {
-    uint numTests;              // @0
+    uint numWorkItems;          // @0  (CUDA femClothMidPhase.cu:229 `numWorkItems`)
     float toleranceLength;      // @4  (unused; ABI parity)
     uint64_t cmInputs;          // @8
     uint64_t transformCache;    // @16 (unused; ABI parity — the vertex midphase
@@ -241,7 +241,7 @@ struct ContactGenParams
 // wrong offset.
 struct ClothTriMidphaseParams
 {
-    uint numTests;              // @0
+    uint numWorkItems;          // @0  (CUDA femClothMidPhase.cu:192 `numWorkItems`)
     float toleranceLength;      // @4  (unused; ABI parity)
     uint64_t cmInputs;          // @8
     uint64_t transformCache;    // @16 (unused; the AABB comes from bounds)
@@ -399,7 +399,7 @@ void cloth_midphaseGenerateVertexPairsLaunch(uint3 gtid : SV_GroupThreadID, uint
     const uint lane = tid & (WARP - 1u); // threadIdx.x
     const uint cmIdx = gid.y;           // blockIdx.y
 
-    if (cmIdx >= gMid.numTests)
+    if (cmIdx >= gMid.numWorkItems)
         return;
 
     PxgShape clothShape, rigidShape;
@@ -998,7 +998,7 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     {
     GroupMemoryBarrierWithGroupSync();   // the groupshared scratch is reused per sub-warp
     const uint cmIdx = gid.x * TMID_WARPS_PER_BLOCK + sub;
-    if (cmIdx >= gTMid.numTests)
+    if (cmIdx >= gTMid.numWorkItems)
         break;
 
     PxgShape clothShape, rigidShape;
