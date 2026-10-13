@@ -485,8 +485,7 @@ PXG_TEST(shimBindless_setLayout)
         PxgSlangDeviceDesc desc;
         const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
         desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
-        const char* v2 = std::getenv("PXG_DEVICE_V2");
-        desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+        desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
         std::unique_ptr<PxgSlangComputeDevice> dev(physx::gpuslang::PxgCreateVulkanComputeDevice(desc));
         PXG_CHECK_MSG(dev && dev->supportsBindlessTextures(),
                       "shimBindless_setLayout: a second device with a bindless set could not be created");

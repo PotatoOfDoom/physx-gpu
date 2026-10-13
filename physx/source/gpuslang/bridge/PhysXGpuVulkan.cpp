@@ -60,6 +60,7 @@
 #include "PxgCudaShim.h"              // gpuslang/include: PxgCudaShim, PxgKernelDef, PxgSpirvLoader
 #include "PxgVulkanKernelAbi.h"       // bridge: per-kernel launch-ABI table (P5 Step 4)
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
+#include "PxgSlangEnv.h"              // gpuslang/include: pxgDeviceV2FromEnv (shared with gpuslang-tests)
 #include "PxgSlangKernelManifest.h"   // gpuslang/include: generated enum-indexed registry manifest
 #include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
 #include "PxgKernelWrangler.h"        // gpucommon: the REAL PxgCudaKernelWranglerManager (reused)
@@ -197,10 +198,15 @@ VulkanGpuRuntime* ensureRuntime()
     // when no discrete GPU is present, so a software-only CI box still comes up.
     const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
     desc.preferSoftwareDevice = (preferSw != nullptr) && (std::strcmp(preferSw, "0") != 0);
-    desc.useDeviceLocalMemory = std::getenv("PXG_DEVICE_V2") != nullptr;
+    // PXG_DEVICE_V2: unset/""/"0" -> host-visible (default), "1" -> device-local + staged;
+    // anything else warns and stays default.  Same parser as gpuslang-tests.
+    desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
     r.device = PxgCreateVulkanComputeDevice(desc);
     if (!r.device)
         return nullptr;
+    std::fprintf(stderr, "[PhysXGpuVulkan] device: %s, memory mode: %s\n", r.device->getDeviceName(),
+                 desc.useDeviceLocalMemory ? "device-local + staged (PXG_DEVICE_V2=1)"
+                                           : "host-visible (default)");
 
     // Build the enum-indexed kernel manifest from the generated registry.  The
     // spirvFile/entry pointers reference static string data in the generated

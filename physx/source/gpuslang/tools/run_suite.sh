@@ -62,8 +62,9 @@ run_mode() {
 
     local out
     out="$(mktemp)"
-    # The env assignment is per-invocation, so the default mode really does run
-    # with PXG_DEVICE_V2 unset rather than merely set to 0.
+    # The env arguments are per-invocation.  The default mode REMOVES an inherited
+    # PXG_DEVICE_V2 (env -u), so a caller that exported =1 still gets a real default
+    # run.  Unset, "" and "0" all mean the default mode (include/PxgSlangEnv.h).
     ( cd "$BUILD_DIR" && env "$@" ctest -j4 ) > "$out" 2>&1
     local rc=$?
 
@@ -95,7 +96,7 @@ run_mode() {
     rm -f "$out"
 }
 
-run_mode default
+run_mode default -u PXG_DEVICE_V2
 run_mode v2 PXG_DEVICE_V2=1
 
 if [ $FAILURES -ne 0 ]; then

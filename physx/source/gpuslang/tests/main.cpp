@@ -52,9 +52,9 @@ PxgSlangComputeDevice* testDevice()
         desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
         // v2 device mode (RUNTIME_PLAN.md P1): device-local buffers + staged
         // transfers; lets the whole bit-exact suite re-run through the
-        // production memory path.
-        const char* v2 = std::getenv("PXG_DEVICE_V2");
-        desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+        // production memory path.  PXG_DEVICE_V2 is parsed by the helper the
+        // engine bridge shares (include/PxgSlangEnv.h): unset/""/"0" off, "1" on.
+        desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
 #if defined(_WIN32)
         const char* backend = std::getenv("PXG_TEST_BACKEND");
         if (backend && std::strcmp(backend, "dx12") == 0)

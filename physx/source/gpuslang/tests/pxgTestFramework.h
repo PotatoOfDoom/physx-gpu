@@ -32,6 +32,7 @@
 // builds anywhere the Vulkan SDK headers are available.
 
 #include "PxgSlangComputeDevice.h"
+#include "PxgSlangEnv.h"
 
 #include <cmath>
 #include <cstdio>

@@ -417,8 +417,7 @@ PxgSlangComputeDevice* limitedDevice(uint32_t push, uint32_t shared, uint32_t in
     PxgSlangDeviceDesc desc;
     const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
     desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
-    const char* v2 = std::getenv("PXG_DEVICE_V2");
-    desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+    desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
     desc.limitMaxPushConstantsSize = push;
     desc.limitMaxComputeSharedMemorySize = shared;
     desc.limitMaxComputeWorkGroupInvocations = invocations;
@@ -465,8 +464,7 @@ PxgSlangComputeDevice* subgroupDevice(bool noSizeControl, bool noFullSubgroups, 
     PxgSlangDeviceDesc desc;
     const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
     desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
-    const char* v2 = std::getenv("PXG_DEVICE_V2");
-    desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
+    desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
     desc.noSubgroupSizeControl = noSizeControl;
     desc.noFullSubgroups = noFullSubgroups;
     desc.limitMaxComputeWorkgroupSubgroups = maxWorkgroupSubgroups;

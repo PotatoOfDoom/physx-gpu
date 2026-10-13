@@ -34,11 +34,14 @@
 
 #include "pxgTestFramework.h"
 
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace
@@ -250,6 +253,128 @@ PXG_TEST(p1DeviceV2)
         dev->destroyBuffer(bB);
         dev->destroyBuffer(bD);
         dev->destroyBuffer(bE);
+    }
+}
+
+// PXG_DEVICE_V2 parsing (include/PxgSlangEnv.h), the one parser the engine bridge and this
+// suite share: unset/""/"0" -> off, "1" -> on, anything else -> off plus ONE stderr warning
+// per process.  (Before it the bridge took any set value, "0" included, as on.)
+namespace envparse
+{
+struct ScopedEnv
+{
+    std::string name, old;
+    bool had;
+    ScopedEnv(const char* n, const char* v) : name(n)
+    {
+        const char* o = std::getenv(n);
+        had = o != nullptr;
+        if (had)
+            old = o;
+        if (v)
+            setenv(n, v, 1);
+        else
+            unsetenv(n);
+    }
+    ~ScopedEnv()
+    {
+        if (had)
+            setenv(name.c_str(), old.c_str(), 1);
+        else
+            unsetenv(name.c_str());
+    }
+};
+
+template <class F>
+std::string captureStderr(F fn)
+{
+    std::fflush(stderr);
+    FILE* tmp = std::tmpfile();
+    if (!tmp)
+    {
+        fn();
+        return "<no tmpfile>";
+    }
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+    fn();
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+    std::string out;
+    std::rewind(tmp);
+    char buf[512];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0)
+        out.append(buf, n);
+    std::fclose(tmp);
+    std::fputs(out.c_str(), stderr);
+    return out;
+}
+
+size_t countOf(const std::string& hay, const char* needle)
+{
+    size_t c = 0;
+    for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+        ++c;
+    return c;
+}
+} // namespace envparse
+
+PXG_TEST(p1DeviceV2EnvParse)
+{
+    using physx::gpuslang::PxgDeviceV2Value;
+    using physx::gpuslang::pxgParseDeviceV2;
+    using physx::gpuslang::pxgDeviceV2FromEnv;
+
+    // The pure table.
+    PXG_CHECK_MSG(pxgParseDeviceV2(nullptr) == PxgDeviceV2Value::eOFF, "unset -> off");
+    PXG_CHECK_MSG(pxgParseDeviceV2("") == PxgDeviceV2Value::eOFF, "\"\" -> off");
+    PXG_CHECK_MSG(pxgParseDeviceV2("0") == PxgDeviceV2Value::eOFF, "\"0\" -> off");
+    PXG_CHECK_MSG(pxgParseDeviceV2("1") == PxgDeviceV2Value::eON, "\"1\" -> on");
+    const char* const invalid[] = { "2", "true", "yes", "on", "00", "01", " 1", "1 ", "-1", "v2" };
+    for (const char* v : invalid)
+        PXG_CHECK_MSG(pxgParseDeviceV2(v) == PxgDeviceV2Value::eINVALID, "\"%s\" -> invalid", v);
+
+    // Was the process already started with an unrecognised value (then the one-time
+    // warning has been spent by the suite device and cannot be observed here)?
+    const bool warnedAlready = pxgParseDeviceV2(std::getenv("PXG_DEVICE_V2")) == PxgDeviceV2Value::eINVALID;
+
+    // Through the environment.
+    {
+        envparse::ScopedEnv e("PXG_DEVICE_V2", nullptr);
+        PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env unset -> host-visible");
+    }
+    {
+        envparse::ScopedEnv e("PXG_DEVICE_V2", "");
+        PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"\" -> host-visible");
+    }
+    {
+        envparse::ScopedEnv e("PXG_DEVICE_V2", "0");
+        const std::string err = envparse::captureStderr([] { PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"0\" -> host-visible"); });
+        PXG_CHECK_MSG(err.find("PXG_DEVICE_V2") == std::string::npos, "\"0\" is silent (got '%s')", err.c_str());
+    }
+    {
+        envparse::ScopedEnv e("PXG_DEVICE_V2", "1");
+        PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"1\" -> device-local");
+    }
+    {
+        // Unrecognised: off, and warned at most once per process however often it is read.
+        std::string err;
+        {
+            envparse::ScopedEnv e("PXG_DEVICE_V2", "true");
+            err += envparse::captureStderr([] { PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"true\" -> host-visible"); });
+        }
+        {
+            envparse::ScopedEnv e("PXG_DEVICE_V2", "2");
+            err += envparse::captureStderr([] { PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"2\" -> host-visible"); });
+        }
+        const size_t warnings = envparse::countOf(err, "is not recognised");
+        if (warnedAlready)
+            PXG_CHECK_MSG(warnings == 0, "warning is once per process (%zu more seen)", warnings);
+        else
+            PXG_CHECK_MSG(warnings == 1 && err.find("PXG_DEVICE_V2='true'") != std::string::npos,
+                          "exactly one warning naming the first bad value (%zu seen: '%s')", warnings, err.c_str());
     }
 }
 

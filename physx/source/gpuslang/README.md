@@ -25,8 +25,10 @@ Status documents:
   with the current test and scene counts. The detailed entries since about P9.4x
   are in German.
 - [MIGRATION_STATUS.md](MIGRATION_STATUS.md) is the Phase 1 per-file record of the
-  CUDA math-core port. Phase 1 is closed. Some of its 🟡/⬜ table rows predate
-  Phase 2, so for coverage, trust the manifest and the checkers below.
+  CUDA math-core port. Phase 1 is closed. Its Status column now reflects the
+  current per-file state, which matches the manifest and the checkers below.
+  Unreachable kernels are marked ⛔, with the reason. The long notes in its rows
+  are the Phase 1 log.
 - [RUNTIME_PLAN.md](RUNTIME_PLAN.md) is the original Phase 2 plan.
 
 ```
@@ -35,6 +37,7 @@ gpuslang/
 │   ├── PxgSlangComputeDevice.h     device abstraction (buffers, textures, pipelines, dispatch, sync)
 │   ├── PxgCudaShim.h               CUDA driver-API surface over the device (flat address map, launches)
 │   ├── PxgSlangHeapAllocator.h     sub-allocator
+│   ├── PxgSlangEnv.h               environment switches shared by bridge and tests (PXG_DEVICE_V2)
 │   └── PxgSlangKernelManifest.h    GENERATED: CUDA kernel id -> SPIR-V module + entry (tools/gen_kernel_manifest.py)
 ├── src/
 │   ├── vulkan/PxgVulkanComputeDevice.cpp   Vulkan backend (SPIR-V, Vulkan >= 1.2)
@@ -107,8 +110,18 @@ The device has two memory modes, and the suite runs in both:
 - **`PXG_DEVICE_V2=1`:** device-local buffers with staged transfers and
   timeline-semaphore synchronisation.
 
-In `gpuslang-tests`, `PXG_DEVICE_V2=0` means off. The engine bridge treats any
-value, `0` included, as on.
+The engine bridge and `gpuslang-tests` parse `PXG_DEVICE_V2` with the same
+helper (`include/PxgSlangEnv.h`):
+
+- unset, empty or `0`: default mode;
+- `1`: device-local mode;
+- any other value: default mode, with a one-time warning on stderr that names
+  the value.
+
+The bridge prints the chosen mode once at startup, for example
+`[PhysXGpuVulkan] device: llvmpipe (...), memory mode: host-visible (default)`.
+`gpuslang-tests` appends `[v2: device-local + staged]` to its backend line.
+Earlier versions of the bridge treated any set value, `0` included, as on.
 
 ### Warp-level code
 

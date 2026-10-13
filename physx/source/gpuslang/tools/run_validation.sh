@@ -25,8 +25,9 @@
 # baseline was measured with VVL 1.3.275.
 #
 # Memory modes: mode 0 runs with PXG_DEVICE_V2 UNSET (an inherited value is removed), mode
-# 1 with PXG_DEVICE_V2=1.  "Set to 0" is not mode 0: the engine bridge
-# (bridge/PhysXGpuVulkan.cpp) takes ANY value as v2, as tools/run_suite.sh notes.
+# 1 with PXG_DEVICE_V2=1.  The bridge and the suite share one parser (include/PxgSlangEnv.h:
+# unset/""/"0" off, "1" on, anything else warns and is off), so "set to 0" is mode 0 too;
+# unsetting is kept so an inherited odd value cannot leak in.
 #
 # What it sets: VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation, VK_LAYER_SETTINGS_PATH to
 # the project config (core + sync + thread safety, no message cap), PXG_VK_DEBUG_NAMES=1 so
