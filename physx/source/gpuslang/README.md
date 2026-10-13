@@ -1,365 +1,352 @@
-# PhysX GPU — Slang Migration (gpuslang)
+# PhysX GPU — Slang/Vulkan port (gpuslang)
 
-This directory contains the CUDA→Slang migration of the PhysX GPU pipeline:
-compute kernels rewritten in [Slang](https://shader-slang.org/), executed
-through explicit **Vulkan** and **Direct3D 12** compute backends instead of the
-CUDA driver API. The goal is byte-identical data structures and semantics with
-the original CUDA kernels, verified by a self-contained test suite that runs
-the Slang kernels on a real (or software) Vulkan device against CPU reference
-implementations transcribed from the CUDA sources.
+This directory contains the port of the PhysX 5.6.1 GPU pipeline from CUDA to
+[Slang](https://shader-slang.org/). The kernels run on an explicit **Vulkan**
+compute backend, with a **Direct3D 12** backend alongside it, instead of the
+CUDA driver API. The unmodified engine host code (the `gpu*` modules:
+broadphase, narrowphase, solver, articulations, simulation controller,
+softbody, cloth, particles) drives the Slang kernels through a CUDA-driver
+shim. The goal is bit-identical results with the CUDA kernels under an IEEE
+reading of the CUDA source. It is checked bitwise against host oracles
+transcribed from the CUDA, and end to end by stepping real `PxScene`s.
+
+Status in one paragraph: **every kernel this build can launch is mapped and
+wired** (P9.95 complete). The full GPU pipeline steps real scenes over Vulkan,
+and the suite and scene harness are green. Development and verification have
+happened **only on Linux with Mesa llvmpipe** (software Vulkan). The port has
+never run on real GPU hardware. The D3D12 backend has never been built or
+executed. Applications cannot use the port yet, because no standalone PhysXGpu
+library is packaged (see [Known limitations](#known-limitations)).
+
+Status documents:
+
+- [RUNTIME_STATUS.md](RUNTIME_STATUS.md) is the authoritative tranche log
+  (Phase 2, P0–P9.x). Its header block summarises every tranche, newest first,
+  with the current test and scene counts. The detailed entries since about P9.4x
+  are in German.
+- [MIGRATION_STATUS.md](MIGRATION_STATUS.md) is the Phase 1 per-file record of the
+  CUDA math-core port. Phase 1 is closed. Some of its 🟡/⬜ table rows predate
+  Phase 2, so for coverage, trust the manifest and the checkers below.
+- [RUNTIME_PLAN.md](RUNTIME_PLAN.md) is the original Phase 2 plan.
 
 ```
 gpuslang/
 ├── include/
-│   └── PxgSlangComputeDevice.h      device abstraction (buffers, pipelines, dispatch)
+│   ├── PxgSlangComputeDevice.h     device abstraction (buffers, textures, pipelines, dispatch, sync)
+│   ├── PxgCudaShim.h               CUDA driver-API surface over the device (flat address map, launches)
+│   ├── PxgSlangHeapAllocator.h     sub-allocator
+│   └── PxgSlangKernelManifest.h    GENERATED: CUDA kernel id -> SPIR-V module + entry (tools/gen_kernel_manifest.py)
 ├── src/
-│   ├── vulkan/PxgVulkanComputeDevice.cpp   Vulkan backend (SPIR-V, any 1.2+ device)
-│   └── dx12/PxgDx12ComputeDevice.cpp       D3D12 backend (DXIL, Windows)
-├── shaders/
-│   ├── pxgSlangCommon.slang         math + GPU struct layouts (mirrors CUDA headers)
-│   ├── pxgSlangScan.slang           portable workgroup scan primitives
-│   ├── radixSort.slang              gpucommon radix sort (histogram + stable reorder)
-│   ├── radixSort64.slang            64-bit key support (copyHigh32Bits chaining)
-│   ├── radixSortGather.slang        rank-indexed 64-bit gather/copy family
-│   ├── scan.slang                   device-wide prefix sums (algorithms.cu)
-│   ├── scan4x4.slang                int4x4 16-counter scans (PxGpuRadixSort)
-│   ├── radixFourBit.slang           PxGpuRadixSort count/reorder passes
-│   ├── reorderData.slang            float4 payload gather (reorderKernel)
-│   ├── preIntegration.slang         solver pre-integration (PGS + TGS)
-│   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
-│   ├── updateBounds.slang           transform cache + world AABB update
-│   ├── solverPGS.slang              PGS solver: iteration, conclude, writeback, averaging
-│   ├── solverTGS.slang              TGS solver: iteration, conclude, writeback, averaging
-│   ├── solverZeroBodies.slang       pre-solve body-velocity reset (PGS + TGS)
-│   ├── solverInitVelocitiesTGS.slang TGS pre-solve velocity seeding (slab scatter)
-│   ├── solverApplyGravityTGS.slang   TGS substep gravity + external accel (lock flags, inertia), engine ABI (P9.95)
-│   ├── solverDmaBack.slang           force-change elem DMA-back + constraint residual gather
-│   ├── npPairManagement.slang        narrow-phase sparse-remove keep/drop core + manifold init
-│   ├── npPairRemoveSwap.slang        narrow-phase sparse-remove Stage5 data swap (+ CvxTri)
-│   ├── npSphereCollision.slang       sphere primitive contacts (sphere/plane/capsule/box)
-│   ├── npCapsuleCollision.slang      capsule two-contact routines (plane/capsule, seg-seg)
-│   ├── npMaterialCombine.slang       contact-patch material combine (friction/restitution/damping)
-│   ├── npContactPatch.slang          contact-stream alloc + status-flag packing (atomic)
-│   ├── npInsertPatch.slang           PxContactPatch header write (material combine + pack)
-│   ├── npCompressContacts.slang      contact-count histogram + friction-patch offset rescale
-│   ├── npCompressContacts2.slang     cross-block PxGpuContactPair compaction (Stage2)
-│   ├── npTriangle.slang              triangle closest-point (Voronoi) + line-triangle test
-│   ├── npSegTriangle.slang           segment-vs-triangle squared distance (capsule/mesh)
-│   ├── npCapTriangle.slang           capsule-triangle contacts (endpoint + edge-edge)
-│   ├── npTriTri.slang                triangle-triangle SAT separation test
-│   ├── npHeightfield.slang           heightfield triangle extraction (vertex indices + verts) + adjacency + scaled getTriangle
-│   ├── npHfMidphase.slang            heightfield midphase pair generation (compute/output pairs)
-│   ├── npHfPointQuery.slang          heightfield grid-range helpers + testLocalPoint (bilinear height)
-│   ├── npConvexTri.slang             convex-triangle edge-edge SAT (Minkowski-face + edge-pair test)
-│   ├── npConvexSat.slang             convex support functions + triangle-normal SAT axis
-│   ├── npConvexFaceSat.slang         convex-face-normal SAT (per-polygon plane axes vs triangle)
-│   ├── npManifold.slang              persistent-manifold refresh + invalidate (contact drift / pose staleness)
-│   ├── npSegDist.slang               point-segment + segment-segment closest-point distances
-│   ├── npTriMask.slang               triangle barycentric coords + active-edge/vertex feature masks
-│   ├── npNpUtils.slang               narrowphase predicates: next3/prev3, edge flags, delayGenerateContact
-│   ├── npConvexReduce.slang          convex-core 4-point manifold reduction (reducePoints)
-│   ├── npTriMesh.slang               scaled-triangle normal + Cramer's-rule barycentric (mesh scale)
-│   ├── npClosest.slang               deformable closest-point: point-triangle (Ericson 7-region) + point-edge
-│   ├── npTetra.slang                 deformable tetra: tri/tet bounding box + Cramer's-rule tet barycentric
-│   ├── npEdgeEdge.slang              segment-segment closest point: infinite-line + finite-edge (fallback)
-│   ├── npDefFilter.slang             deformable element-filter binary searches + edge-authorship predicates
-│   ├── npBv32.slang                  BV32 midphase tree traversal (warp-cooperative walk + output push)
-│   ├── npMidphaseCvx.slang           convex-vs-trimesh midphase traverser (cull + tri-box SAT + pair emit)
-│   ├── npMidphaseDeform.slang        cloth/softbody midphase traversers (tri/tet bounds vs query box)
-│   ├── npMidphaseAlloc.slang         midphase collision-stack allocator + ConvexTriNormalAndIndex accessors
-│   ├── npClothCloth.slang            cloth-vs-mesh/cloth midphase traverser (per-lane SAT argmin + filters)
-│   ├── npSbTet.slang                 softbody tet primitives (constructTetrahedron, tet-tet SAT, closestPtTet)
-│   ├── npBoxClip.slang               box-box clipping primitives (point-in-poly, segment-AABB)
-│   ├── npBoxIncident.slang           box-box width-4 incident-face select + bounds4 reduction
-│   ├── npBoxContacts.slang           box-box clipping core (calculateContacts: area/corner/edge)
-│   ├── npBoxSat.slang                box-box 15-axis SAT + feature/sign selection
-│   ├── npBoxFeature.slang            box-box feature->newTransform reference-frame setup
-│   ├── npBoxReduce.slang             box-box Stage-2 contact compaction + 4-point reduction
-│   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
-│   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
-│   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
-│   ├── thresholdStream.slang        force-threshold reporting accumulation
-│   ├── thresholdForceChange.slang   cross-frame found/lost/persistent force-change diff
-│   ├── broadphaseSetup.slang        broad-phase integer-AABB + SAP-box setup
-│   ├── broadphaseReports.slang      broad-phase found/lost pair report accumulation
-│   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
-│   ├── broadphaseEndPtHistogram.slang        start/end-point projection histograms + ordered handles
-│   ├── broadphaseIncrementalSap.slang        incremental sweep-and-prune found/lost pair generation
-│   ├── broadphaseRegionHistogram.slang       region accumulator prefix-sum scan pair
-│   ├── broadphaseCreateRegions.slang         region-span + overlap-check-count producer
-│   ├── broadphaseActiveRegionHistogram.slang per-region handle compaction (flags/scan/scatter)
-│   ├── broadphaseOverlapCheckHistogram.slang overlap-check counts + 64-bit region scan
-│   ├── broadphaseNewBoundsPairs.slang        new-bounds region found-pair generation
-│   ├── broadphaseMarkPairs.slang             incremental delete/update projection marking
-│   ├── broadphaseClearNewFlag.slang          clear new-box flag + completion signal
-│   ├── broadphaseAggregateBounds.slang       aggregate bounds union + changed-bitmap refresh
-│   ├── broadphaseAggregateDirty.slang        dirty-aggregate double-buffer merge + bound scatter
-│   ├── broadphaseAggregatePairsAdd.slang     agg-pair free-list slot alloc + overflow finalize
-│   ├── broadphaseAggregateFinalize.slang     agg report copy + free-count + added/deleted setEmpty
-│   ├── broadphaseAggregatePairsRemove.slang  agg-pair remove compaction (2-pass, into free list)
-│   ├── broadphaseAggregateBoxPruning.slang   bipartite SAP box-pruning sweep (agg collision core)
-│   ├── broadphaseAggPairCollision.slang      aggregate-pair collision dispatch (found/lost)
-│   ├── broadphaseAggSelfCollision.slang      aggregate self-collision (found/lost within one agg)
-│   ├── broadphaseAggSortProjections.slang    build sorted aggregate projection SAP structure
-│   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
-│   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
-│   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
-│   ├── clampValues.slang            counter clamp utilities
-│   ├── gridCal.slang                particle hash-grid helpers (cell coords, wrap/periodic hash, ranges)
-│   ├── contactReduce.slang          warp contact-manifold reduction (dupe cull, anchors, clustering)
-│   └── skinning.slang               deformable skinning (cloth Phong / softbody barycentric)
-└── tests/                           verification suite (CMake + ctest)
+│   ├── vulkan/PxgVulkanComputeDevice.cpp   Vulkan backend (SPIR-V, Vulkan >= 1.2)
+│   ├── dx12/PxgDx12ComputeDevice.cpp       D3D12 backend (DXIL, Windows only; never built, see below)
+│   └── PxgCudaShim.cpp
+├── bridge/                         the engine hook: PxPhysXGpu C-ABI factory (PhysXGpuVulkan.cpp),
+│                                   PxCudaContext/Manager over the shim, kernel table + launch ABI rows
+│                                   (PxgVulkanKernelAbi.cpp), driver/kernel-init shims, memory manager
+├── nocuda/                         CUDA header stand-ins so the gpu* host code compiles without a toolkit
+├── shaders/                        555 .slang files: pxgSlang* shared modules (79), the *Bda.slang engine
+│                                   kernels (buffer-device-address ABI), Phase-1 cores and fixture shaders
+├── tests/                          standalone verification suite (CMake + ctest) and the host oracles (*Ref.h)
+├── sdktest/                        full-SDK builds: sdk-step (CPU) and gpu-sdk-step (GPU scene harness)
+└── tools/                          scene/suite/validation runners, mutation sweeps, static checkers, foldscan
 ```
 
-See [MIGRATION_STATUS.md](MIGRATION_STATUS.md) for the per-kernel migration
-coverage — this directory is the migration *architecture* plus a verified
-vertical slice through it, not yet a complete port of all 61 `.cu` files.
+## Coverage
+
+The kernel registry (`PxgKernelNames.h`) has **501** kernels.
+`include/PxgSlangKernelManifest.h` maps **428** of them to an entry point in 178
+SPIR-V modules. Of those, **415** have a launch-ABI row in
+`bridge/PxgVulkanKernelAbi.cpp`, which makes them launchable by the engine
+(`tools/check_launch_abi.py`). Everything that is not both mapped and wired is
+unreachable in this build. `tools/check_unmapped_reachability.py` and the
+ratchet files classify these kernels:
+
+| Kernels | State | Why it is unreachable |
+|---|---|---|
+| 13 | mapped, no ABI row (`KNOWN_UNWIRED`) | Owned only by objects the PhysicsGpu factory (`physxgpu/src/PxgPhysXGpu.cpp`) constructs. That factory is not compiled here, and `PxGpuCreatePhysicsGpu()` returns NULL. These are the generic scan/radix utilities (incl. `reorderKernel`, which has no caller even upstream), `interleaveBuffers`, and the five skinning kernels. |
+| 58 | unmapped, STANDALONE | App-facing features behind the same factory: isosurface extraction, SDF builder, sparse-grid provider, anisotropy, smoothed positions. |
+| 11 | unmapped, ORPHAN | Nothing launches them, even upstream. |
+| 4 | unmapped, ENGINE-named but dead (`tools/engine_reachable_unmapped.txt`) | `trimeshHeightfieldNarrowphase` sits in a dispatch bucket that no classifier produces. `sb_plasticDeformLaunch`/`sb_plasticDeformLaunch2` have a single caller, and it is commented out upstream. `copyUserData` belongs to an owner class that is never constructed. |
+
+Both lists are ratchets: a new unwired or reachable-unmapped kernel fails the
+build, and so does a stale entry. The articulation branch of
+`updateTransformCacheAndBoundArrayLaunch` is ported (it reads the link poses out
+of the articulation pool).
 
 ## Design
 
-### Device abstraction
+### Device abstraction and the CUDA shim
 
-`PxgSlangComputeDevice` replaces the CUDA driver layer
-(`PxCudaContextManager` / `PxgKernelWrangler`):
+`PxgSlangComputeDevice` replaces the CUDA driver layer. `PxgCudaShim` and the
+bridge implement the `PxCudaContext` / `PxCudaContextManager` surface the engine
+calls on top of it:
 
 | CUDA concept | gpuslang equivalent |
 |---|---|
-| `CUdeviceptr` + kernel pointer args | storage buffers bound by declaration order |
-| kernel scalar arguments | push constants (Vulkan) / root constants (D3D12) |
-| `cuLaunchKernel(grid, block)` | `dispatch(pipeline, gridX, gridY, gridZ, …)` |
-| single CUDA stream ordering | `barrier()` between recorded dispatches |
-| `cuStreamSynchronize` | `flush()` |
-| CUBIN / fatbin modules | SPIR-V (Vulkan) / DXIL (D3D12), compiled offline by `slangc` |
+| `CUdeviceptr` (flat address) | Vulkan buffer device address; the shim keeps an interval map address → (buffer, offset) |
+| `cuLaunchKernel` parameter pack | passed through **unchanged** as the push-constant block. Engine kernels (`*Bda.slang`) dereference the embedded addresses as BDA pointers, so the CUDA pointer-passing model is kept 1:1 |
+| `cuLaunchKernel(grid, block)` | `dispatch` / `dispatchIndirect` with the CUDA block shape as `numthreads` |
+| stream ordering / `cuStreamSynchronize` | recorded dispatches with barriers; `flush()`; timeline semaphores in device-local mode |
+| `cuTexObject` / `tex3D<float>` | bindless sampled images (set 1, binding 0), with filtering emulated in the shader (below) |
+| CUBIN / fatbin | SPIR-V (Vulkan) / DXIL (D3D12), compiled offline by `slangc` |
 
-Descriptor-based APIs cannot chase raw device pointers, which the CUDA code
-embeds in descriptor structs (`PxgRadixSortDesc`, `PxgSolverCoreDesc`,
-`PxgShape::hullOrMeshPtr`). The port therefore:
+The launch-ABI row for each kernel fixes the size of its argument pack. The
+shim's size check is exact. A mismatched pack is refused and never runs
+silently.
 
-- binds each buffer member of a descriptor struct explicitly, and passes the
-  scalar members as push constants;
-- turns embedded data pointers (e.g. the cooked convex hull pointer) into
-  **byte offsets into a bound geometry blob buffer** — the blob layout itself
-  (convexFormat.h) is unchanged.
+The early Phase-1 fixture kernels (radix sort, scans, the first solver and
+broadphase ports) still use the older model: each buffer member of a
+descriptor struct is bound explicitly, and embedded pointers become byte offsets
+into a bound blob.
 
-### Portability of warp-level code
+### Memory modes
 
-The CUDA kernels lean heavily on `__shfl_sync` with a hard-wired 32-thread
-warp. Vulkan/D3D12 subgroups vary in width (8–64) and the software devices
-used for CI (llvmpipe, WARP) differ again, so the port replaces warp shuffles
-with **groupshared-memory scans over 32-lane "virtual warps"**
-(`pxgSlangScan.slang`), preserving the packed 8-bit/16-bit counter ranking
-schemes of the originals. This is correctness-first; a wave-intrinsic
-specialization (via `WaveActiveSum`/`WavePrefixSum` guarded by subgroup-size
-queries) can be layered on later without touching call sites.
+The device has two memory modes, and the suite runs in both:
+
+- **Default:** host-visible buffers.
+- **`PXG_DEVICE_V2=1`:** device-local buffers with staged transfers and
+  timeline-semaphore synchronisation.
+
+In `gpuslang-tests`, `PXG_DEVICE_V2=0` means off. The engine bridge treats any
+value, `0` included, as on.
+
+### Warp-level code
+
+The CUDA kernels assume a 32-lane warp (`__shfl_sync`, ballots, warp scans).
+The port emulates these with **groupshared memory over 32-lane virtual warps**
+(`pxgSlangScan` and the warp/atomic libraries), so no engine kernel depends on
+the subgroup width. `tools/check_subgroup_ops.py` pins this; only three probes
+use subgroup operations. Workgroup barriers need block-uniform control flow,
+whereas CUDA only needs warp-uniform flow. `check_barrier_uniformity.py` and
+`check_helper_uniformity.py` check this statically.
 
 ### Struct layout fidelity
 
-`pxgSlangCommon.slang` re-declares the GPU data structures (`PxgBodySim`,
-`PxgSolverBodyData`, `PxgShapeSim`, …) with the exact byte layout of the C++
-headers, using only scalar/`float4`/`uint2` members so std430 rules cannot
-introduce padding (a bare `float3` would be 16-byte aligned). The test suite
-pins every layout with `static_assert`s against hand-mirrored C++ structs.
+The GPU structs are re-declared with the exact byte layout of the C++ headers,
+using scalar, `float4` and `uint2` members so that std430 cannot insert padding.
+Layouts are pinned by `static_assert`s and the `*DescLayout` / `npAbiLayout`
+suites. `check_push_block.py` overlays every shader push block on its ABI row,
+placing the arguments the way the bridge does, and compares member names
+against the CUDA parameter names.
 
-## Building and running the verification suite
+### `tex3D` (SDF) emulation
 
-Requirements: C++17 compiler, CMake ≥ 3.16, Vulkan SDK (headers + loader),
-any conformant Vulkan ≥ 1.2 ICD (GPU driver **or** CPU implementations such as
-Mesa llvmpipe — the suite runs entirely on llvmpipe in GPU-less containers),
-and `slangc` (github.com/shader-slang/slang releases, or the copy inside the
-`slangtorch` Python wheel).
+Since P9.96, CUDA's `tex3D<float>` (unnormalised coordinates, clamp-to-edge,
+trilinear) is emulated in `pxgSlangTex3d` from eight texel loads, with **no
+sampler**. The emulation follows the CUDA Programming Guide's linear-filtering
+formula: clamp the coordinate to [0.5, N−0.5], compute `x−0.5` and `floor`,
+round α to the nearest 1/256 with ties going up, and form the eight-term sum.
+On llvmpipe, UNORM decoding was measured exhaustively and matches the engine's
+own decoder. The emulation costs speed: the SDF fixture suite is about 2.5×
+slower, and the `sdfmesh` scene about 11% slower.
+
+## Verification
+
+The standard is **bitwise** comparison, for floats as well as integers. Since
+P9.86, the float-equality helper `eqFZ` is bitwise, including the sign of zero.
+Some older Phase-1 fixtures still carry relative tolerances. Those cover
+order-nondeterministic float sums such as parallel scans and atomic
+accumulation.
+
+- **Literal host oracles.** The reference for each kernel is a C++ transcription
+  of the CUDA, often written over the engine's own `PxVec3`/`PxQuat`/
+  `PxTransform`. The test binary is compiled with `-ffp-contract=off`.
+- **Bitwise IEEE reading of the CUDA.** slangc emits no `NoContraction`, and
+  Vulkan drivers may contract. Every float-computing engine shader therefore has
+  its SPIR-V stamped with `NoContraction` (`tools/spv_nocontract.py`) and
+  `SignedZeroInfNanPreserve`. Spelling is kept literal: `PxMin`/`PxMax` are
+  selects, `transformInv` is a conjugate rotate, and the association order of
+  sums matches the CUDA. The sign of zero is treated as observable. This rests on
+  measured llvmpipe facts recorded in RUNTIME_STATUS:
+  - llvmpipe folds `0 - x` and `x + 0` even under `SignedZeroInfNanPreserve`;
+  - an undecorated `OpDot` sums `x+(y+z)`, while a stamped one sums `(x+y)+z`
+    like the CUDA.
+
+  P9.86–P9.94 audited every engine-reached file for these hazards. Directed
+  fixtures, each with a mirror twin, kill the reverts.
+- **Mutation sweeps.** No change ships without a sweep showing that the fixtures
+  discriminate. Each runner restores the source and the SPIR-V after every
+  mutant. Per-run timeouts are derived from the measured baseline
+  (max(floor, 3× baseline)), and exit code 137 at the bound counts as a hang.
+  - `tools/run_mutation_sweep.sh <shader-stem> <suite> <mutants-file>` sweeps
+    shaders (`MUTATION_SWEEP_SPV_ONLY=1` for one `.spv` per mutant).
+  - `tools/run_scene_mutation_sweep.sh <shader-stem> <scene> <mutants-file>`
+    sweeps engine wiring whose only observer is a scene.
+  - `tools/run_host_mutation_sweep.py <source> <ctest-regex> <mutants-file>`
+    sweeps host C++.
+- **Static checkers.** There are 19 `tools/check_*.py` checkers, all run as
+  ctests. Most of them run a self-test or negative control first, so a green
+  result means the checker is working, not just quiet. They cover:
+  - launch-ABI rows and host packs vs. rows vs. CUDA signatures (`check_launch_abi*.py`);
+  - push-block overlay and names (`check_push_block.py`);
+  - unmapped-kernel reachability and disabled/twin kernels;
+  - barrier and helper uniformity, block/grid-stride coverage and fixture grids;
+  - groupshared limits, subgroup ops, speculated loads and sub-word stores;
+  - vector/component divide and `length` spellings, and geometry-type constants.
+- **Foldscan.** `tools/foldscan_all.py <build-gpuslang> <out> [-j N]` scans the
+  compiled `-O0 -g2` SPIR-V of every engine-reached shader for literal-zero fold
+  hazards: `FSub(0,x)`, `FAdd(x,0)`, and float `FMin`/`FMax`/`FClamp`. Results
+  are compared against the reviewed baseline `foldscan_reviewed.json`. The
+  expected state is `UNREVIEWED 0`.
+- **Khronos validation (P9.98).** `tools/run_validation.sh` runs the suite (both
+  memory modes) and scene rows under `VK_LAYER_KHRONOS_validation` (baseline
+  VVL 1.3.275), with `tools/validation/vk_layer_settings.txt` (core +
+  synchronisation + thread safety). It fails on any message not covered by
+  `tools/validation_waivers.txt`. It also fails on the port's own signals:
+  - a refusal outside the fixtures that provoke it;
+  - a push range widened for an entry the waivers do not list;
+  - an allocation peak above the device limit.
+
+  The synchronisation checker cannot follow buffer-device-address accesses, so
+  ordering between engine kernels is not validated by the layer.
+- **Runtime limit refusals (P9.98/P9.99).** Before building a pipeline, the
+  Vulkan device reads each entry point's SPIR-V and checks it against the device
+  limits: push block, groupshared size, workgroup size and invocations, and a
+  required subgroup size against both the device and the workgroup shape.
+  Dispatch grids are also checked against `maxComputeWorkGroupCount`. A
+  violation is refused with a reason on stderr (handle 0; the shim reports a
+  refused launch). It does not crash. Failed allocations and out-of-range
+  transfers are refused in the same way. Smaller devices can be simulated with
+  `PXG_VK_LIMIT_PUSH_CONSTANTS`, `PXG_VK_LIMIT_SHARED_MEMORY`,
+  `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS`, `PXG_VK_LIMIT_WORKGROUP_SIZE` and
+  `PXG_VK_LIMIT_WORKGROUP_COUNT` (these can only lower a limit). The port's
+  largest push block is 192 B (some drivers allow only 128). Its largest
+  groupshared footprint is 31744 B (the Vulkan minimum is 16384).
+
+### The test suite (`ctest`): 890 tests
+
+| Group | Count | What it is |
+|---|---|---|
+| `gpuslang.<suite>` | 511 | GPU fixture suites in `gpuslang-tests`, each with many cases: Phase-1 cores; engine-ABI kernel fixtures for broadphase, narrowphase (convex/mesh/heightfield/SDF/tri-tri), solver PGS/TGS, articulations, softbody, FEM cloth and particles (PBD, diffuse); the runtime and shim (`p0`–`p6`, `p3CudaContext`, `p4Loader`, `pipelineRefusal`, …) |
+| `gpuslang.hlsl.<entry>` | 356 | D3D12 path: `slangc -target hlsl -profile cs_6_0` cross-compile of each listed entry (HLSL only, no DXIL, no execution) |
+| tool tests | 23 | the 19 checkers, `sweepTimeoutPolicy`, `sweepRunners`, `vvlTriage`, and `validationSubset` (skipped, exit 77, when no validation layer is found) |
+
+### The scene harness (`gpu-sdk-step`, `tools/run_scenes.sh`): 85 rows
+
+`gpu-sdk-step` builds a real `PxScene` from the CPU SDK with
+`eENABLE_GPU_DYNAMICS` and the GPU broadphase. The engine's GPU module pointer
+is aimed at the bridge's statically linked `PxPhysXGpu` factory, in place of
+the CUDA `libPhysXGpu_64.so`. Every `Pxg*` subsystem is then constructed over
+Vulkan and stepped. Each scene checks physical outcomes: rest heights, contact
+and event sequences, and bit-identity invariants. The reference is either
+analytic or the CPU solver.
+
+- Scenes are selected with `PXG_SCENE=<name>` and stepped with `PXG_GPU_STEP=1`.
+  The solver is TGS by default and PGS with `PXG_SOLVER=pgs`.
+- `tools/run_scenes.sh` scores **85 rows**: 64 named scenes plus 21 explicit
+  variants. The variants are:
+  - the settling bag;
+  - softbody on mesh / convex-core / heightfield / SDF-mesh floors;
+  - `softbodyhex` box;
+  - 9 PGS rows;
+  - 3 `slabgrid` modes;
+  - 3 `particle2` arms.
+- Every run ends with a scored refusal control: `box` under
+  `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128` must fail cleanly with rc 2 and must
+  not crash.
+- A missing verdict line is scored as its own outcome and never counted as a
+  pass.
+- Runner options:
+  - `--strict` sets `PXG_REQUIRE_MAPPED=1`, so any launch of an unmapped kernel
+    fails the scene;
+  - `--resume <log>` re-scores the rows that log already lists as ok;
+  - `--diagnostics` adds the unscored control modes.
+
+A full run takes over an hour on llvmpipe.
+
+## Building and running
+
+Requirements:
+
+- C++17 compiler and CMake ≥ 3.16;
+- Vulkan SDK headers and loader;
+- a Vulkan ≥ 1.2 ICD (Mesa llvmpipe is what everything has been run on). The
+  engine path needs `bufferDeviceAddress` and `shaderInt64`, and SDF textures
+  need descriptor indexing;
+- `slangc` (github.com/shader-slang/slang releases; developed with 2026.14.1);
+- Python 3 for the tools.
 
 ```bash
+# 1. Kernels + verification suite (also builds the shaders into build-gpuslang/shaders)
 cmake -S physx/source/gpuslang/tests -B build-gpuslang -DCMAKE_BUILD_TYPE=Release
 cmake --build build-gpuslang -j
-ctest --test-dir build-gpuslang --output-on-failure
+ctest --test-dir build-gpuslang -j4 --output-on-failure      # sets PXG_SHADER_DIR itself
+sh physx/source/gpuslang/tools/run_suite.sh build-gpuslang   # both memory modes, archives failures
+
+# 2. Full SDK + GPU scene harness (CPU SDK and the unmodified gpu* host modules, no CUDA toolkit)
+cmake -S physx/source/gpuslang/sdktest -B build-sdk -DCMAKE_BUILD_TYPE=Release
+cmake --build build-sdk -j --target gpu-sdk-step
+cd build-sdk
+PXG_SHADER_DIR=../build-gpuslang/shaders PXG_SCENE=box PXG_GPU_STEP=1 ./gpu-sdk-step
+sh ../physx/source/gpuslang/tools/run_scenes.sh              # all 85 rows + refusal control
+cd ..
+
+# 3. Validation-layer run (needs VK_LAYER_KHRONOS_validation; PXG_VVL_DIR = extracted
+#    vulkan-validationlayers package if none is installed)
+sh physx/source/gpuslang/tools/run_validation.sh subset            # fast, both modes
+sh physx/source/gpuslang/tools/run_validation.sh suite             # whole suite, both modes
+sh physx/source/gpuslang/tools/run_validation.sh 'scene:box|PXG_SCENE=box'
 ```
 
-Validation-layer run (P9.98): `sh physx/source/gpuslang/tools/run_validation.sh
-suite` runs the whole suite (both memory modes) under `VK_LAYER_KHRONOS_validation`
-with `tools/validation/vk_layer_settings.txt`, and `... subset` /
-`'scene:box|PXG_SCENE=box'` run a fast subset or gpu-sdk-step rows. It fails on any
-message `tools/validation_waivers.txt` does not cover (filtering is per module, via
-the entry-point names the device attaches under `PXG_VK_DEBUG_NAMES=1`). Point
-`PXG_VVL_DIR` at an extracted `vulkan-validationlayers` package if no system layer
-is installed; ctest's `gpuslang.validationSubset` runs the subset and is skipped
-when no layer is found. Memory mode 0 runs with `PXG_DEVICE_V2` unset (the engine
-bridge takes any value, `0` included, as mode 1), and `--best-practices` uses the
-Best Practices configuration instead. The runner removes any inherited `VK_LAYER_*` /
-`VK_KHRONOS_VALIDATION_*` setting (they override the config file, e.g. a message-ID
-filter), and the triage also fails on the port's own signals: a device or shim refusal
-outside the fixtures that provoke them (`pipelineRefusal`, `shimBindless`), a push range
-the device widened for an entry the waivers do not list (since P9.98 the layout covers
-the shader's whole push block and the surplus is zero-filled, so VUID-07987 can no longer
-fire), and an allocation peak (`PXG_VK_ALLOC_STATS=1`, set by the runner) above the
-device's `maxMemoryAllocationCount` or above the F5 waivers' bound. `sh
-tools/test_vvl_triage.sh` (ctest `gpuslang.vvlTriage`) pins those rules.
+Notes:
 
-Since P9.98 the Vulkan device checks every entry point against the device's limits
-before it builds the pipeline (push block, Workgroup memory per entry point,
-workgroup size and invocations, read from the SPIR-V) and refuses an over-limit or
-failed build with a reason on stderr (handle 0, which the shim reports as a refused
-launch) instead of crashing at dispatch. To see what a smaller device would refuse,
-lower a limit for a whole process with `PXG_VK_LIMIT_PUSH_CONSTANTS`,
-`PXG_VK_LIMIT_SHARED_MEMORY`, `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS`,
-`PXG_VK_LIMIT_WORKGROUP_SIZE` or `PXG_VK_LIMIT_WORKGROUP_COUNT` (a value can only lower
-the device's limit). Sizes past 4 GiB are refused, never wrapped. A dispatch whose grid
-exceeds `maxComputeWorkGroupCount` (65535 per dimension on llvmpipe and the Vulkan
-minimum; CUDA allows a `gridDim.x` up to 2^31-1) is refused; `dispatchIndirect`'s counts
-live on the device and are not checked. `run_scenes.sh` ends with a scored refusal
-control: box under `PXG_VK_LIMIT_WORKGROUP_INVOCATIONS=128` must fail cleanly (rc 2), not
-crash.
-A buffer or texture whose allocation fails is likewise handle 0 (the shim reports
-`OutOfMemory`), and a dispatch whose buffers, textures or indirect-argument buffer
-do not match the pipeline or are not live is refused without recording anything, and
-a transfer (`upload`, `download`, `copyBuffer`, `fillBuffer`; the shim's `cuMemcpy*` /
-`cuMemsetD32`, which return `InvalidValue`) that runs past its buffer is refused;
-the Vulkan calls the device cannot recover from (submission, waits, the staging
-ring) abort with the failing call named.
-
-On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
-the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
-D3D12 backend (kernels compiled with `slangc -target dxil`).
-
-The suite (227 GPU test cases + 255 DX12 cross-compile checks) verifies:
-
-- **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
-  including block-boundary sizes and multi-hundred-thousand element inputs;
-- **radixSort** — full 8-pass key+rank sorts vs `std::stable_sort`, including
-  stability under heavy duplicates, non-multiple-of-4 sizes and 1M elements;
-- **preIntegration** — unconstrained velocity update, damping, velocity
-  clamping, lock flags, gyroscopic forces and world-space √(I⁻¹) tensors vs a
-  C++ transcription of the CUDA kernel, over randomized rigid-body populations;
-- **integration** — post-solver velocity finalization, the complete
-  sleep/freeze/wake-counter state machine (flag outputs compared exactly) and
-  closed-form quaternion pose integration vs a C++ transcription;
-- **updateBounds** — world pose composition and AABBs for sphere / capsule /
-  box / convex-hull / fallback geometry, plus frozen/unfrozen/updated/
-  activate/deactivate bookkeeping, compared field-by-field;
-- **integration (TGS)** — the TGS velocity-pool layout and delta-transform
-  pose accumulation, sharing the verified sleep state machine;
-- **radix sort (64-bit)** — two chained 8-pass sorts through the
-  copyHigh32Bits gather, checked against `std::stable_sort` of PxU64;
-- **MemCopyBalanced / clamp utilities** — the PxgCopyManager balanced copy
-  dispatcher over random descriptor batches;
-- **skinning** — area-weighted normal accumulation (portable CAS float
-  atomics), Phong cloth interpolation and barycentric softbody interpolation
-  over strided vertex views;
-- **PxGpuRadixSort** — the second, general-purpose radix sort
-  (algorithms.cu): int4x4 histogram scans, the count → computeBlockSum →
-  reorder pass composition with reorder-tracking, partial bit widths and the
-  float4 payload gather kernel;
-- **PGS solver iteration** — solveBlockPartition over mixed contact/joint
-  batches: normal impulses with rigid and compliant (acceleration-spring)
-  restitution, static/dynamic friction clamping with broken flags, 1D joint
-  rows with spring modes and residual writeback, and the mass-splitting
-  slab reference counts;
-- **TGS solver iteration** — the sub-timestep solver: accumulated-delta
-  contact separations, paired anisotropic friction with torsional anchors,
-  and 1D joints re-anchored through per-body delta transforms with
-  ortho-axis projection;
-- **TGS conclude / writeback / velocity averaging** — joint bias removal,
-  contact force and joint impulse/breakage writeback with friction patch
-  export and the threshold stream, the 6-component mass-splitting velocity
-  averaging with slab-count reset, the per-substep delta-pose quaternion
-  integration (including body lock flags and kinematics) and the
-  accumulated-delta motion-velocity writeback;
-- **constraint prep (PGS + TGS)** — the contact and 1D-joint block
-  preparation that turns cooked contact/joint data into the solver's block
-  SoA constraints: friction-patch correlation (including previous-frame
-  anchor carry-over), contact/friction Jacobians and response terms,
-  compliant and TGS coefficient derivations with torsional friction, and the
-  1D-joint row orthogonalization plus PGS/TGS solver-constant computation;
-- **threshold stream** — the force-threshold reporting pipeline: two-pass
-  (nodeIndexA, nodeIndexB) sort-key extraction and stream reorganize, the
-  device-wide segmented scan that accumulates each body pair's normal force,
-  and the exceeded-force detection and compaction, verified across the
-  32-block boundary;
-- **threshold force-change diff** — the cross-frame event pipeline: binary
-  searching the sorted previous-exceeded set (with the ThresholdStreamElement /
-  PxNodeIndex 64-bit comparators and the backward run-walk that matches
-  shapeInteraction), the persistent-mask complement, the two-pass device-wide
-  exclusive prefix over the previous|current|persistent mask, and the
-  compaction of the found / lost / persistent force-change events;
-- **broad-phase setup** — the incremental-SAP foundation: quantizing float
-  AABBs into the sortable integer projection layout (contact-distance
-  inflation, monotonic float encoding, axis bit-shifts and environment-ID
-  packing), appending newly created bounds' projections and sort handles, and
-  building the 1D SAP boxes from the sorted handles;
-- **broad-phase reports** — the found/lost pair report accumulation: classifying
-  each pair as aggregate vs actor (VolumeData::isSingleActor), the two-stage
-  between-block prefix that stably compacts the four found/lost × agg/actor
-  categories, and the actor-report copy-out with overflow flagging;
-- **broad-phase incremental histograms** — the incremental-SAP comparison-count
-  stage: per-projection overlap-comparison counts derived as differences of two
-  prefix-sum histogram entries (selected from the 2×2×3 start/end ×
-  this/last-frame × axis table by each projection's start/end kind and down/up
-  pass, with the down-pass rank clamp and deleted-projection exclusion), and the
-  device-wide two-pass exclusive prefix (per-projection running total, per-block
-  totals and per-axis grand total) verified across the 32-block boundary;
-- **broad-phase endpoint histograms** — the upstream producer of those
-  histograms: per-projection start / end / all-end classification with a
-  packed three-counter block scan (10-bit fields), promoted to the device-wide
-  start/end/total-end point histograms and their per-block totals, and the
-  compacting scatter of non-deleted handles into the ordered start/end point
-  handle arrays, over incremental (with and without the removed-handle rescan)
-  and full-rebuild modes;
-- **broad-phase incremental SAP** — the sweep-and-prune core
-  (performIncrementalSAP) that consumes the two histogram stages: binary-search
-  work distribution over the per-projection comparison prefix (grid-stride loop),
-  up/down-sweep swap-partner resolution through the ordered start/end handles,
-  integer-AABB overlap-change detection (new/old bounds inverted by sweep
-  direction, with first-axis-of-separation dedup and group/environment-ID
-  filtering) and the atomic-compacted found/lost pair emission, verified by
-  comparing the produced pair sets and counts against a transcription of the
-  kernel logic;
-- **broad-phase region histogram** — the region-accumulator prefix-sum scan pair
-  (the shared computeHistogram/outputHistogram helpers behind the four
-  start-region/region wrappers): a plain device-wide two-pass exclusive prefix
-  sum plus grand total over a flat integer array, verified against
-  `std::exclusive_scan` across warp/block/grid-stride boundary sizes and a
-  wide-value case;
-- **broad-phase create regions** — the region producer (createRegionsKernel)
-  that maps each box's per-axis endpoint positions through the total-end-point
-  histogram into a coarse min/max region-index span, writing regionRange, the
-  collision-free start-region scatter and the per-projection region
-  overlap-check counts that the region prefix-sum scan then accumulates;
-- **broad-phase active-region histogram** — the per-region handle-compaction
-  pipeline: stamping start/new flags into each region slice a box touches
-  (binary-search work distribution + region-cell decode), the in-place
-  per-region exclusive prefix of the packed 16/16 start+active flags (a
-  512-thread block scan with block-accumulator carry), and the scatter of each
-  box's handle into the compacted ordered start/active handle arrays, verified
-  end-to-end against a transcription over a synthetic region layout;
-- **broad-phase overlap-check histogram** — the overlap-check counting +
-  scan trio: the per-comparison overlap-candidate count from the ordered-handle
-  offset tables (with the handle/region record), and the device-wide **64-bit**
-  (`PxU64` → `uint64_t`) two-pass exclusive prefix sum + grand total, verified
-  against a `uint64` exclusive scan whose total exceeds 2³² to exercise the
-  64-bit path (the Vulkan device enables `shaderInt64` when available);
-- **broad-phase new-bounds pairs** — the final region kernel
-  (generateFoundPairsForNewBoundsRegion) that consumes the whole region
-  pipeline: a 64-bit grid-stride binary-search over the overlap-check total,
-  region-slice candidate resolution from the compacted ordered handle lists, the
-  max-of-min-corners dedup, group/environment filtering, integer-AABB
-  intersection and atomic-compacted found-pair output — verified end-to-end by
-  rebuilding the entire region pipeline on the CPU to feed consistent inputs and
-  comparing the produced pair set against a transcription.
+- If `slangc` is not on `PATH`, pass `-DPXG_SLANGC=/path/to/slangc`.
+- Running `build-gpuslang/gpuslang-tests <suite>` directly needs
+  `PXG_SHADER_DIR=<build-gpuslang>/shaders`. `run_scenes.sh` and
+  `run_validation.sh` find `../build-gpuslang/shaders` themselves.
+- `gpuslang-tests` prefers a software device unless
+  `PXG_PREFER_SOFTWARE_DEVICE=0`. The engine bridge prefers hardware unless
+  `PXG_PREFER_SOFTWARE_DEVICE=1`.
+- On Windows, `PXG_TEST_BACKEND=dx12` would select the D3D12 backend. This has
+  never been tried.
+- Shaders are built with `-O0 -fvk-use-entrypoint-name` (`PXG_SLANG_FLAGS`).
+  `-O0` keeps slangc from invoking spirv-opt, which needs the optional
+  `slang-glslang` library. Drivers still optimise.
+- `build-gpuslang` also produces:
+  - `pxg-caps`, a device-profile probe;
+  - `libPhysXGpuVulkan_64.so`, a C-ABI export library used by the loader test.
+    It contains only the broadphase/AABB subsystem seams, not the full pipeline.
+- `tools/lvprepro/` is a standalone Vulkan harness for deciding whether a fault
+  is in a shader or in llvmpipe.
 
 ## Known limitations
 
-- Kernel coverage is the vertical slice listed in MIGRATION_STATUS.md; the
-  remaining CUDA modules (narrowphase, broadphase, articulations, softbody,
-  particles, …) still require porting on this foundation.
-- The D3D12 backend compiles only on Windows and has not been executed in this
-  (Linux) development environment; the per-kernel HLSL cross-compilation is
-  enforced by ctest on all platforms.
-- The articulation branch of `updateTransformCacheAndBoundArrayLaunch` is not
-  ported yet (it walks per-articulation link arrays through embedded device
-  pointers, which needs the articulation data redesign first).
-- Buffers use host-visible memory for simplicity (ideal for the verification
-  suite and software devices); a production integration wants device-local
-  heaps with staging rings.
-- Shaders are built with `-O0` because the trimmed `slangc` used in CI lacks
-  the optional `slang-glslang` library that backs slangc's spirv-opt pass;
-  drivers still run their own optimizers. Use a full slang release for
-  optimized offline builds.
+- **Linux + llvmpipe only.** Everything above was developed and measured on Mesa
+  llvmpipe (Mesa 25.2.8 / LLVM 20.1.2 at the last measurement). No run on real
+  GPU hardware or on any other Vulkan driver has happened. The device-limit and
+  subgroup checks exist so that a smaller device refuses instead of crashing,
+  but no real device has exercised them.
+- **D3D12 has never been built or executed.** The backend compiles only on
+  Windows. Its edits since P9.98 (the limit and range checks) are
+  syntax-checked only. The HLSL ctests cover the cross-compile of a subset of
+  entries, not DXIL or execution. Several kernels have no `cs_6_0` lowering
+  (`WorkgroupCount()`).
+- **Bit equality with NVIDIA hardware is not provable for every path.** The
+  claim is equality with an IEEE reading of the CUDA source, measured on
+  llvmpipe. Known unknowns:
+  - `tex3D` filtering: the α rounding and the blend arithmetic are undocumented
+    by NVIDIA (P9.96 K1/K2). The [0.5, N−0.5] clamp follows a hardware
+    measurement, not the guide text (K4).
+  - `OpDot` and other driver-lowered operations: their association order is
+    driver-defined. llvmpipe matches the CUDA when stamped; other drivers are
+    unmeasured.
+  - Atomic accumulation order: a few cloth/softbody scenes vary in the 5th
+    decimal from run to run on llvmpipe, within scene tolerances.
+- **No application-facing drop-in yet.** The engine is hooked in by the
+  `sdktest` build: the bridge's `PxPhysXGpu` factory is linked statically and
+  replaces the CUDA `PhysXGpu` module. A packaged PhysXGpu shared library that
+  an unmodified application can load is not built yet. The PhysicsGpu factory
+  (SDF builder, isosurface, sparse grid, array converter, skinning;
+  `PxGetPhysicsGpu()`) is not compiled, so those app-facing utilities are
+  unavailable (see Coverage).
+- **Performance has not been a goal.** The design is correctness-first:
+  - groupshared warp emulation instead of subgroup intrinsics;
+  - `-O0` SPIR-V;
+  - `tex3D` emulation that costs 9 descriptor accesses per sample.
+- **Upstream bug candidates.** Porting turned up a number of suspected defects in
+  the CUDA/host code. Examples: a permuted launch pack for
+  `trimeshHeightfieldNarrowphase`, `ps_stepParticlesLaunch` stepping a removed
+  particle system, and a race in `computeThresholdElementMaskIndices`. They are
+  documented in RUNTIME_STATUS.md (numbered up to 60 by P9.83b, with more noted
+  per tranche since). The port reproduces the upstream behaviour. **None has
+  been reported upstream.**
