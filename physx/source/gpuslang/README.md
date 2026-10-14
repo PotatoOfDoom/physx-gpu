@@ -359,10 +359,9 @@ cmake --build compiler/linux-gcc-vulkan-release -j
   It uses the same `pxg_compile_shader` calls as the suite: `cmake/PxgShaderList.cmake`
   is the one list, and the configure step fails if the manifest names a file or
   entry the list does not export.
-- The bridge looks for each `.spv` in this order:
-  1. `$PXG_SHADER_DIR` when it is set;
-  2. `PhysXGpuShaders/` next to the module;
-  3. the working directory.
+- The bridge loads each `.spv` from `$PXG_SHADER_DIR` only, when that is set and
+  not empty (no fallback). Otherwise it tries `PhysXGpuShaders/` next to the
+  module, then the working directory.
 - `PxCreateCudaContextManager` and `PxSetPhysXGpuFoundationInstance` hand the
   application's foundation to the module, as the CUDA module does. Without that, a
   separately loaded module dereferences a null foundation: on Windows always, and
@@ -373,8 +372,8 @@ cmake --build compiler/linux-gcc-vulkan-release -j
   are not generated with this backend.
 - `PX_GENERATE_GPU_STATIC_LIBRARIES` and `PX_USE_NVTX` stop the configure step
   with a message.
-- slangc is searched for on `PATH`, in `$SLANG_DIR(/bin)` and in
-  `$VULKAN_SDK/Bin|bin`, or given with `-DPXG_SLANGC`. A version other than
+- slangc comes from `-DPXG_SLANGC`, else `$SLANG_DIR/bin` and `$SLANG_DIR`, then
+  `PATH`, then `$VULKAN_SDK/Bin|bin`. A version other than
   2026.14.1 configures with a warning.
 - Windows: MSVC has never compiled this. `tools/check_msvc_portability.py` (ctest
   `gpuslang.msvcPortability`) scans the module's sources for the failure classes
@@ -383,7 +382,12 @@ cmake --build compiler/linux-gcc-vulkan-release -j
   - GNU attributes, builtins and keywords;
   - unguarded POSIX code;
   - a raw `<windows.h>`;
-  - a non-literal `__declspec(align())`.
+  - a non-literal `__declspec(align())`;
+  - Win32 APIs hidden by `PxWindowsInclude.h`'s `NO*` macros (`NONLS`,
+    `NOUSER`/`NOMB`, `NOGDI`).
+
+  The UTF-8/UTF-16 path conversion the Windows module uses is platform-neutral
+  and tested on Linux (ctest `gpuslang.p4ModulePath`).
 
   It is a guard, not a compiler; a real Visual Studio build is still owed.
 

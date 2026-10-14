@@ -71,8 +71,8 @@ std::string toUtf8(const wchar_t* w, size_t len)
 
 // UTF-8 <-> UTF-16 by hand: PxWindowsInclude.h defines NONLS, which hides
 // MultiByteToWideChar / WideCharToMultiByte, and a raw <windows.h> is not allowed.
-// Malformed or truncated UTF-8 sequences become U+FFFD; an unpaired surrogate is
-// encoded as its own code point.
+// Malformed, overlong or truncated UTF-8 sequences become U+FFFD (one per lead
+// byte); an unpaired surrogate is encoded as its own code point, both ways.
 std::u16string pxgUtf8ToUtf16(const std::string& s)
 {
     std::u16string w;
@@ -97,7 +97,11 @@ std::u16string pxgUtf8ToUtf16(const std::string& s)
             else
                 cp = (cp << 6) | (cc & 0x3Fu);
         }
-        if (!ok || cp > 0x10FFFF)
+        // Reject overlong forms (C0 80 for NUL, E0 80 AF for '/') -- they would smuggle
+        // characters past a path check.  Encoded surrogates (ED A0..BF xx) are kept, so
+        // an unpaired surrogate from pxgUtf16ToUtf8 round-trips.
+        static const uint32_t minForLength[4] = { 0x0u, 0x80u, 0x800u, 0x10000u };
+        if (!ok || cp > 0x10FFFF || cp < minForLength[extra])
         {
             w.push_back(char16_t(0xFFFD));
             ++i;

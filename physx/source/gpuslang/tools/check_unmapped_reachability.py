@@ -17,9 +17,11 @@
 #     generators and the particle neighbourhood provider are application-facing
 #     features.  They are created only through `PxGetPhysicsGpu()`, whose factory
 #     lives in physxgpu/src/PxgPhysXGpu.cpp.
-#   * That file is NOT COMPILED into the gpuslang build -- the sdktest recipe globs
-#     gpucommon/gpubroadphase/gpunarrowphase/gpusimulationcontroller/gpusolver/
-#     gpuarticulation but never physxgpu -- and the Vulkan bridge's replacement
+#   * That file is NOT COMPILED into the gpuslang build -- the shared source list
+#     (cmake/PxgVulkanGpuSources.cmake, used by sdktest and by the official
+#     source/compiler/cmakegpuvulkan PhysXGpu) globs gpucommon/gpubroadphase/
+#     gpunarrowphase/gpusimulationcontroller/gpusolver/gpuarticulation but never
+#     physxgpu -- and the Vulkan bridge's replacement
 #     `PxGpuCreatePhysicsGpu()` returns NULL.
 #   * So no application, and no scene, can construct any of those owners here.
 #
@@ -57,7 +59,8 @@
 #      factory physxgpu/src/PxgPhysXGpu.cpp;
 #   2. that factory's entry point is stubbed out in the bridge -- gpuslang's
 #      `PxGpuCreatePhysicsGpu()` returns NULL;
-#   3. physxgpu/src is not in the sdktest source glob.
+#   3. physxgpu/src is not in the shared source list, both builds take their
+#      sources from it, and neither adds physxgpu/src on its own.
 #
 # If any leg breaks, the bucket is no longer sound and the check fails loudly rather
 # than continuing to report a comfortable number.
@@ -97,6 +100,8 @@ STANDALONE_OWNERS = {
 FACTORY = os.path.join(SRC, "physxgpu/src/PxgPhysXGpu.cpp")
 BRIDGE = os.path.join(GS, "bridge/PhysXGpuVulkan.cpp")
 SDKTEST_CMAKE = os.path.join(GS, "sdktest/CMakeLists.txt")
+SOURCES_CMAKE = os.path.join(GS, "cmake/PxgVulkanGpuSources.cmake")
+OFFICIAL_CMAKE = os.path.join(SRC, "compiler/cmakegpuvulkan/CMakeLists.txt")
 
 
 def kernel_enums():
@@ -182,18 +187,38 @@ def verify_standalone_basis(texts):
             errs.append("bridge: PxGpuCreatePhysicsGpu() no longer returns NULL -- the "
                         "app-facing GPU feature factory may now be live")
 
-    # leg 3 -- physxgpu/src is not compiled into the sdk test binary
-    if not os.path.exists(SDKTEST_CMAKE):
-        errs.append("sdktest/CMakeLists.txt not found")
+    # leg 3 -- physxgpu/src is compiled into neither the sdk test binary nor the
+    # official Vulkan PhysXGpu: both take their sources from the shared list.
+    if not os.path.exists(SOURCES_CMAKE):
+        errs.append("cmake/PxgVulkanGpuSources.cmake not found")
     else:
-        c = open(SDKTEST_CMAKE, encoding="utf-8", errors="replace").read()
-        m = re.search(r"file\(GLOB_RECURSE\s+GPUHOST_SRC(.*?)\)", c, re.S)
+        c = strip_cmake_comments(open(SOURCES_CMAKE, encoding="utf-8", errors="replace").read())
+        m = re.search(r"file\(GLOB_RECURSE\s+host(.*?)\)", c, re.S)
         if m is None:
-            errs.append("sdktest: GPUHOST_SRC glob not found")
-        elif "physxgpu/src" in m.group(1):
-            errs.append("sdktest: physxgpu/src is now in the GPUHOST_SRC glob -- the app "
-                        "factory is compiled and STANDALONE no longer holds")
+            errs.append("PxgVulkanGpuSources.cmake: the host-source glob was not found")
+        elif PHYSXGPU_SRC_COMPILED.search(c):
+            errs.append("PxgVulkanGpuSources.cmake: physxgpu/src is now in the shared source list -- "
+                        "the app factory is compiled and STANDALONE no longer holds")
+    for path, name in ((SDKTEST_CMAKE, "sdktest/CMakeLists.txt"),
+                       (OFFICIAL_CMAKE, "source/compiler/cmakegpuvulkan/CMakeLists.txt")):
+        if not os.path.exists(path):
+            errs.append(name + " not found")
+            continue
+        c = strip_cmake_comments(open(path, encoding="utf-8", errors="replace").read())
+        if "pxg_vulkan_gpu_sources(" not in c:
+            errs.append(name + ": no longer takes its sources from pxg_vulkan_gpu_sources()")
+        if PHYSXGPU_SRC_COMPILED.search(c):
+            errs.append(name + ": compiles physxgpu/src -- the app factory is live and "
+                        "STANDALONE no longer holds")
     return errs
+
+
+# A source file or a glob under physxgpu/src -- an include directory of that name is fine.
+PHYSXGPU_SRC_COMPILED = re.compile(r"physxgpu/src/[^\s)\"]*(\.cpp|\.cu|\*)")
+
+
+def strip_cmake_comments(text):
+    return "\n".join(line.split("#", 1)[0] for line in text.split("\n"))
 
 
 def load_ratchet():

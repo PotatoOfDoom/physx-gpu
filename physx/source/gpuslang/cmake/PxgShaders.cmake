@@ -43,11 +43,19 @@
 cmake_policy(SET CMP0057 NEW) # IN_LIST
 
 # ---- Tools ----
-# slangc: -DPXG_SLANGC=<path> wins; otherwise PATH, then the Vulkan SDK (which
-# bundles slangc in its Bin dir), then $SLANG_DIR/bin.
+# slangc: -DPXG_SLANGC=<path> wins; otherwise $SLANG_DIR/bin and $SLANG_DIR (a Slang
+# release), then PATH, then the Vulkan SDK (which bundles slangc in its Bin dir).
+set(_pxgSlangHints "")
+if(DEFINED ENV{SLANG_DIR} AND NOT "$ENV{SLANG_DIR}" STREQUAL "")
+    set(_pxgSlangHints "$ENV{SLANG_DIR}/bin" "$ENV{SLANG_DIR}")
+endif()
+set(_pxgSlangPaths "")
+if(DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+    set(_pxgSlangPaths "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+endif()
 find_program(PXG_SLANGC slangc
-    HINTS ENV SLANG_DIR
-    PATHS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" "$ENV{SLANG_DIR}/bin"
+    HINTS ${_pxgSlangHints}
+    PATHS ${_pxgSlangPaths}
     DOC "Path to the slangc compiler")
 # A cached path is not searched again, so check it exists -- a stale or mistyped
 # -DPXG_SLANGC would otherwise configure fine and fail on the first shader.

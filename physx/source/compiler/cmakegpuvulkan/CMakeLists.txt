@@ -275,10 +275,15 @@ ENDIF()
 
 # The library's own output directory (NvidiaBuildOptions: <lib dir>/<config>),
 # spelled without $<TARGET_FILE_DIR:PhysXGpu> so PhysXGpu can depend on this target.
-IF(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
-	MESSAGE(FATAL_ERROR "PhysXGpu (Vulkan): set CMAKE_BUILD_TYPE (debug, checked, profile or release); generate_projects does.")
+IF(NOT CMAKE_CONFIGURATION_TYPES)
+	STRING(TOLOWER "${CMAKE_BUILD_TYPE}" _pxgBuildType)
+	IF(NOT _pxgBuildType MATCHES "^(debug|checked|profile|release)$")
+		MESSAGE(FATAL_ERROR "PhysXGpu (Vulkan): CMAKE_BUILD_TYPE must be debug, checked, profile or release (got '${CMAKE_BUILD_TYPE}'); generate_projects sets it.")
+	ENDIF()
 ENDIF()
-SET(PXG_SHADER_BIN_DIR "${PX_OUTPUT_LIB_DIR}/${PX_ROOT_LIB_DIR}/$<CONFIG>/PhysXGpuShaders")
+# Lower-cased like the output directories (CMAKE_LIBRARY_OUTPUT_DIRECTORY_<CFG> are
+# lower-case paths), so -DCMAKE_BUILD_TYPE=Release still puts the shaders next to the library.
+SET(PXG_SHADER_BIN_DIR "${PX_OUTPUT_LIB_DIR}/${PX_ROOT_LIB_DIR}/$<LOWER_CASE:$<CONFIG>>/PhysXGpuShaders")
 # copy_directory, not one copy_if_different with every file: 178 paths overflow
 # cmd.exe's 8191-character command line on Windows.  The directory holds exactly the
 # engine shaders (PXG_SHADER_ONLY).
