@@ -12,13 +12,16 @@ transcribed from the CUDA, and end to end by stepping real `PxScene`s.
 
 Status in one paragraph: **every kernel this build can launch is mapped and
 wired** (P9.95 complete). The full GPU pipeline steps real scenes over Vulkan,
-and the suite and scene harness are green. Development and verification have
-happened **only on Linux with Mesa llvmpipe** (software Vulkan). The port has
-never run on real GPU hardware. The D3D12 backend has never been built or
-executed. The SDK's own build scripts produce the port as a standalone
-`PhysXGpu` module with no CUDA toolkit (`PX_GPU_BACKEND=VULKAN` presets, see
-[The SDK build](#the-sdk-build-px_gpu_backendvulkan)); its Windows build has
-never been compiled with MSVC.
+and the suite and scene harness are green. Development and verification
+(suite, scenes, bitwise comparisons) have happened **on Linux with Mesa
+llvmpipe** (software Vulkan). The SDK's own build scripts produce the port as a
+standalone `PhysXGpu` module with no CUDA toolkit (`PX_GPU_BACKEND=VULKAN`
+presets, see [The SDK build](#the-sdk-build-px_gpu_backendvulkan)). The first run
+on real hardware was a user's build with Visual Studio 2026 on Windows on an AMD
+Radeon RX 9070 XT: the GPU snippets run there (after the fixes for an old slangc
+and for concurrent GPU calls). That is a "runs" result; the suite and the bitwise
+comparisons have not been run on that hardware. The D3D12 backend has never been
+built or executed.
 
 Status documents:
 
@@ -316,6 +319,15 @@ Notes:
 - `gpuslang-tests` prefers a software device unless
   `PXG_PREFER_SOFTWARE_DEVICE=0`. The engine bridge prefers hardware unless
   `PXG_PREFER_SOFTWARE_DEVICE=1`.
+- Diagnostics of the engine bridge (all off by default):
+  - `PXG_LAUNCH_TRACE=1` names every kernel launch on stderr;
+  - `PXG_SYNC_EACH=1` waits for the GPU after every dispatch, so with the trace the
+    last launch line before a device error is the kernel that caused it;
+  - `PXG_VERBOSE=1` reports how many registry kernels have no SPIR-V port.
+- The bridge serializes all GPU calls with one process-wide lock: PhysX launches
+  from several worker threads at once, which the CUDA driver allows and a Vulkan
+  command buffer does not (found on an AMD RX 9070 XT, the first real GPU the port
+  ran on).
 - On Windows, `PXG_TEST_BACKEND=dx12` would select the D3D12 backend. This has
   never been tried.
 - Shaders are built with `-O0 -fvk-use-entrypoint-name` (`PXG_SLANG_FLAGS`).
@@ -381,7 +393,8 @@ cmake --build compiler/linux-gcc-vulkan-release -j
   against its SHA-256 (Windows x64, Linux x86_64; `PXG_SLANG_DOWNLOAD=OFF`
   makes it an error, `PXG_SLANGC_ALLOW_UNTESTED=ON` keeps the old one). A newer
   version configures with a warning.
-- Windows: MSVC has never compiled this. `tools/check_msvc_portability.py` (ctest
+- Windows: built with Visual Studio 2026 (`vc18win64-vulkan`) by a user; the
+  snippets run on an AMD RX 9070 XT. `tools/check_msvc_portability.py` (ctest
   `gpuslang.msvcPortability`) scans the module's sources for the failure classes
   gcc and clang let through:
   - RTTI under `/GR-`;
@@ -399,11 +412,13 @@ cmake --build compiler/linux-gcc-vulkan-release -j
 
 ## Known limitations
 
-- **Linux + llvmpipe only.** Everything above was developed and measured on Mesa
-  llvmpipe (Mesa 25.2.8 / LLVM 20.1.2 at the last measurement). No run on real
-  GPU hardware or on any other Vulkan driver has happened. The device-limit and
-  subgroup checks exist so that a smaller device refuses instead of crashing,
-  but no real device has exercised them.
+- **Measured on llvmpipe only.** Everything above was developed and measured on
+  Mesa llvmpipe (Mesa 25.2.8 / LLVM 20.1.2 at the last measurement). The only
+  real hardware so far is one AMD Radeon RX 9070 XT on Windows, where the GPU
+  snippets run; the suite, the scene harness and the bitwise comparisons have
+  not been run there, and no other driver has been tried. llvmpipe tolerated
+  concurrent GPU calls from several threads that the AMD driver did not (fixed
+  with a lock), so more such differences may surface on other hardware.
 - **D3D12 has never been built or executed.** The backend compiles only on
   Windows. Its edits since P9.98 (the limit and range checks) are
   syntax-checked only. The HLSL ctests cover the cross-compile of a subset of
@@ -420,9 +435,9 @@ cmake --build compiler/linux-gcc-vulkan-release -j
     unmeasured.
   - Atomic accumulation order: a few cloth/softbody scenes vary in the 5th
     decimal from run to run on llvmpipe, within scene tolerances.
-- **The Windows module has never been built.** The `vc17win64-vulkan` /
-  `vc18win64-vulkan` presets exist and the MSVC-specific failure classes are
-  checked from Linux, but no Visual Studio build has run. The scene harness and
+- **The Windows module is barely exercised.** One Visual Studio 2026 build
+  (`vc18win64-vulkan`) by a user runs the GPU snippets; VS 2022
+  (`vc17win64-vulkan`) has not been tried. The scene harness and
   the suite exercise the bridge linked statically (`sdktest`); the shared module
   the SDK build produces is what an unmodified application loads. The PhysicsGpu factory
   (SDF builder, isosurface, sparse grid, array converter, skinning;

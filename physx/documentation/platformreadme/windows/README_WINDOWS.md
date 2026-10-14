@@ -33,7 +33,7 @@ Compilers and C++ Standard:
 
 The `vc17win64-vulkan` and `vc18win64-vulkan` presets build `PhysXGpu_64.dll` from the Slang/SPIR-V port of the GPU kernels (source/gpuslang) over Vulkan compute, instead of from the CUDA kernels. No CUDA toolkit or NVIDIA driver is needed. Building needs the Vulkan 1.3 headers; at run time a device with a Vulkan 1.2 or newer driver is accepted. So far only Mesa llvmpipe (on Linux) has run it; a device whose subgroup-size or compute limits a kernel cannot meet refuses that kernel. The presets set the CMake switch `PX_GPU_BACKEND=VULKAN` (default: `CUDA`).
 
-Status: the Windows build of this backend is implemented but **has not been compiled with MSVC yet**. It is built and run on Linux only; `gpuslang/tools/check_msvc_portability.py` (a ctest of the gpuslang suite) guards the MSVC-specific failure classes from there. Please report what a real Visual Studio build shows.
+Status: built with Visual Studio 2026 (`vc18win64-vulkan`); the GPU snippets run on an AMD Radeon RX 9070 XT. That is the only Windows and the only real-GPU run so far: VS 2022 and other GPUs are untried, and the port's bitwise verification runs on Linux (Mesa llvmpipe). `gpuslang/tools/check_msvc_portability.py` (a ctest of the gpuslang suite) guards the MSVC-specific failure classes from Linux. Please report problems with the output of a run with `PXG_LAUNCH_TRACE=1` and `PXG_SYNC_EACH=1` set.
 
 Required in addition to the packages above:
   * The LunarG Vulkan SDK 1.3 or newer (https://vulkan.lunarg.com), for the Vulkan headers and `vulkan-1.lib`. It sets `VULKAN_SDK`.

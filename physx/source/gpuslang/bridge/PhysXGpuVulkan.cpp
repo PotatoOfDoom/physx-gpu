@@ -398,7 +398,9 @@ public:
         static UnmappedKernelNoticeFilter* filter = new UnmappedKernelNoticeFilter(PxGetFoundation().getErrorCallback());
         static PxsKernelWranglerManager* s = [&]() {
             PxsKernelWranglerManager* m = PX_NEW(PxgCudaKernelWranglerManager)(*cudaContextManager, *filter);
-            if (filter->suppressed())
+            // Informational only, so off unless asked for: PXG_VERBOSE=1.
+            const char* verbose = std::getenv("PXG_VERBOSE");
+            if (filter->suppressed() && verbose && std::strcmp(verbose, "0") != 0)
                 std::fprintf(stderr, "[PhysXGpuVulkan] %u registry kernels have no SPIR-V port (the PxGetPhysicsGpu() "
                                      "utilities and kernels nothing launches); a launch of one is refused and reported.\n",
                              filter->suppressed());
