@@ -1009,12 +1009,20 @@ namespace physx
 
 		if (numBlocks)
 		{
-			mArticulationOutputDesc->linkAndJointAndRootStateData = linkAndJointAndRootStateData.begin();
-			mArticulationOutputDesc->sleepData = sleepPool.begin();
+			// These are pinned host arrays the kernel writes through.  Store their mapped
+			// device pointers, as PxgSimulationCore does for its descriptors: identical
+			// under CUDA's unified addressing, required where host and device addresses
+			// differ (the Vulkan backend).
+			struct MapPinned
+			{
+				static void* run(PxCudaContext* ctx, void* p) { return p ? getMappedDevicePtr(ctx, p) : NULL; }
+			};
+			mArticulationOutputDesc->linkAndJointAndRootStateData = reinterpret_cast<PxU8*>(MapPinned::run(mCudaContext, linkAndJointAndRootStateData.begin()));
+			mArticulationOutputDesc->sleepData = reinterpret_cast<PxgSolverBodySleepData*>(MapPinned::run(mCudaContext, sleepPool.begin()));
 			if (contactResidual.size())
 			{
-				mArticulationOutputDesc->errorAccumulator = internalResidualPerArticulation.begin();
-				mArticulationOutputDesc->contactResidualAccumulator = contactResidual.begin();
+				mArticulationOutputDesc->errorAccumulator = reinterpret_cast<Dy::ErrorAccumulator*>(MapPinned::run(mCudaContext, internalResidualPerArticulation.begin()));
+				mArticulationOutputDesc->contactResidualAccumulator = reinterpret_cast<Dy::ErrorAccumulator*>(MapPinned::run(mCudaContext, contactResidual.begin()));
 			}
 			else
 			{
