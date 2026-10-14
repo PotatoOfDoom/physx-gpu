@@ -473,34 +473,81 @@ public:
     // Under CUDA's unified addressing a cuMemHostAlloc pointer IS a device
     // pointer, so PhysX passes such pointers to kernels unchanged.  Here pinned
     // memory is a host-visible Vulkan buffer whose CPU mapping and device address
-    // are unrelated numbers, and the blob builders copy argument bytes verbatim —
-    // so any argument the ABI row marks must be translated on the way in.
+    // are unrelated numbers, and the blob builders copy argument bytes verbatim --
+    // so such arguments must be translated on the way in.
     //
-    // A null pointer stays null (CUDA parity: kernels null-check these).  A
-    // non-null pointer that does not resolve is a REFUSED LAUNCH rather than a
-    // silent zero, because the alternative is a shader writing to address 0.
+    // Which arguments: EVERY 8-byte argument, not only the ones the ABI row marks.
+    // The marks were found by hand, and llvmpipe cannot reveal a missing one -- there
+    // a pinned allocation's device address equals its CPU address, so an untranslated
+    // pointer works by accident.  On real hardware it is a write to a CPU address: an
+    // AMD RX 9070 XT page-faulted in sb_sleeping, whose stateChangedMask is a
+    // PxBitMapPinned's words (PxgSoftBodyCore.cpp:950) and whose row had no mark.
+    // A value that lies inside a live device allocation is a device address and is
+    // left alone (that also covers llvmpipe, and pointers the engine already ran
+    // through getMappedDevicePtr); a value inside a pinned allocation's CPU range is
+    // translated; anything else is a plain 8-byte value.
+    //
+    // A marked argument keeps its stricter contract: null stays null (CUDA parity:
+    // kernels null-check these), and a non-null value that resolves to nothing is a
+    // REFUSED LAUNCH rather than a shader writing to a CPU address.
     bool translateHostPtrs(const PxgKernelAbiRow* abi, std::vector<uint8_t>& blob,
-                           const std::vector<size_t>& offsets) const
+                           const std::vector<size_t>& offsets, PxgKernelId id) const
     {
-        if (!abi || abi->hostPtrMask == 0)
+        if (!abi)
             return true;
         for (uint32_t i = 0; i < abi->argCount && i < offsets.size(); ++i)
         {
-            if (((abi->hostPtrMask >> i) & 1u) == 0u)
-                continue;
+            const bool marked = ((abi->hostPtrMask >> i) & 1u) != 0u;
             if (abi->argSizes[i] != 8 || offsets[i] + 8 > blob.size())
-                return false;
-            uint64_t hostAddr = 0;
-            std::memcpy(&hostAddr, blob.data() + offsets[i], 8);
-            if (hostAddr == 0)
+            {
+                if (marked)
+                    return false;
                 continue;
-            const PxgDevicePtr dev = mShim->hostGetDevicePointer(reinterpret_cast<const void*>(uintptr_t(hostAddr)));
+            }
+            uint64_t value = 0;
+            std::memcpy(&value, blob.data() + offsets[i], 8);
+            if (value == 0)
+                continue;
+            if (!marked)
+            {
+                PxgBufferHandle buf;
+                size_t off;
+                if (mShim->resolve(PxgDevicePtr(value), &buf, &off))
+                    continue;   // already a device address
+            }
+            const PxgDevicePtr dev = mShim->hostGetDevicePointer(reinterpret_cast<const void*>(uintptr_t(value)));
             if (dev == 0)
-                return false;
+            {
+                if (marked)
+                    return false;
+                continue;   // a plain 8-byte value
+            }
+            if (!marked)
+                noteUnmarkedHostPtr(id, i);
             const uint64_t devAddr = uint64_t(dev);
             std::memcpy(blob.data() + offsets[i], &devAddr, 8);
         }
         return true;
+    }
+
+    // PXG_VERBOSE=1: name each (kernel, argument) that carried a pinned host pointer
+    // without a hostPtrMask bit, once -- the list of rows whose mark is missing.
+    void noteUnmarkedHostPtr(PxgKernelId id, uint32_t arg) const
+    {
+        static const bool verbose = [] {
+            const char* v = std::getenv("PXG_VERBOSE");
+            return v && std::strcmp(v, "0") != 0;
+        }();
+        if (!verbose)
+            return;
+        static std::vector<uint64_t> seen;
+        const uint64_t key = (uint64_t(id) << 8) | arg;
+        if (std::find(seen.begin(), seen.end(), key) != seen.end())
+            return;
+        seen.push_back(key);
+        const char* name = id < mManifestCount && mManifest[id].cudaName ? mManifest[id].cudaName : "?";
+        std::fprintf(stderr, "[pxg-hostptr] %s argument %u: pinned host pointer translated (no hostPtrMask bit)\n",
+                     name, arg);
     }
 
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -550,7 +597,7 @@ public:
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
         {
             const PxgKernelAbiRow* abi = id < mManifestCount ? pxgFindKernelAbi(mManifest[id].cudaName) : nullptr;
-            if (!translateHostPtrs(abi, blob, offsets))
+            if (!translateHostPtrs(abi, blob, offsets, id))
             {
                 traceLaunch("sized", id, false);
                 return record(PxgResult::InvalidValue);
@@ -668,7 +715,7 @@ public:
             blob.insert(blob.end(), d, d + abi->argSizes[i]);
         }
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
-        if (!translateHostPtrs(abi, blob, offsets))
+        if (!translateHostPtrs(abi, blob, offsets, id))
         {
             traceLaunch("void**", id, false);
             return record(PxgResult::InvalidValue);
