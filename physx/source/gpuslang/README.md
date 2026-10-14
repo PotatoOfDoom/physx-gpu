@@ -374,8 +374,13 @@ cmake --build compiler/linux-gcc-vulkan-release -j
 - `PX_GENERATE_GPU_STATIC_LIBRARIES` and `PX_USE_NVTX` stop the configure step
   with a message.
 - slangc comes from `-DPXG_SLANGC`, else `$SLANG_DIR/bin` and `$SLANG_DIR`, then
-  `PATH`, then `$VULKAN_SDK/Bin|bin`. A version other than
-  2026.14.1 configures with a warning.
+  `PATH`, then `$VULKAN_SDK/Bin|bin`. It must be 2026.14.1 or newer: older
+  releases (the one some Vulkan SDKs ship among them) lack `WorkgroupCount()`.
+  A missing, older or unreadable slangc is replaced by the pinned 2026.14.1
+  release, downloaded once from GitHub into `compiler/_slang/` and checked
+  against its SHA-256 (Windows x64, Linux x86_64; `PXG_SLANG_DOWNLOAD=OFF`
+  makes it an error, `PXG_SLANGC_ALLOW_UNTESTED=ON` keeps the old one). A newer
+  version configures with a warning.
 - Windows: MSVC has never compiled this. `tools/check_msvc_portability.py` (ctest
   `gpuslang.msvcPortability`) scans the module's sources for the failure classes
   gcc and clang let through:

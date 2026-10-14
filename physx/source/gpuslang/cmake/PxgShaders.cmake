@@ -43,8 +43,95 @@
 cmake_policy(SET CMP0057 NEW) # IN_LIST
 
 # ---- Tools ----
-# slangc: -DPXG_SLANGC=<path> wins; otherwise $SLANG_DIR/bin and $SLANG_DIR (a Slang
-# release), then PATH, then the Vulkan SDK (which bundles slangc in its Bin dir).
+# slangc.  The port is developed and validated with ONE Slang release; the shaders
+# use intrinsics older releases lack (WorkgroupCount() among them -- the slangc in
+# older Vulkan SDKs fails with "undefined identifier 'WorkgroupCount'"), and another
+# compiler may emit different SPIR-V than the suite validated.
+#
+# Search: -DPXG_SLANGC=<path>; else $SLANG_DIR/bin and $SLANG_DIR (a Slang release),
+# then PATH, then the Vulkan SDK's Bin dir.  A slangc that is missing, older than
+# PXG_SLANGC_MIN_VERSION, or whose version cannot be read is replaced by the pinned
+# release, downloaded once and checked against its SHA-256
+# (PXG_SLANG_DOWNLOAD=OFF turns that into an error;
+#  PXG_SLANGC_ALLOW_UNTESTED=ON keeps an older slangc anyway).
+set(PXG_SLANG_PINNED_VERSION "2026.14.1")
+set(PXG_SLANGC_MIN_VERSION "2026.14.1")
+option(PXG_SLANG_DOWNLOAD "Download the pinned Slang release when no suitable slangc is found" ON)
+option(PXG_SLANGC_ALLOW_UNTESTED "Use a slangc older than ${PXG_SLANGC_MIN_VERSION} anyway" OFF)
+if(NOT DEFINED PXG_SLANG_DOWNLOAD_DIR)
+    if(DEFINED PHYSX_ROOT_DIR)
+        # Shared by the four single-config build dirs generate_projects creates.
+        set(_pxgSlangDlDefault "${PHYSX_ROOT_DIR}/compiler/_slang")
+    else()
+        set(_pxgSlangDlDefault "${CMAKE_BINARY_DIR}/_slang")
+    endif()
+    set(PXG_SLANG_DOWNLOAD_DIR "${_pxgSlangDlDefault}" CACHE PATH "Where the pinned Slang release is downloaded to")
+endif()
+
+# pxg_slangc_version(<exe> <out>): the version slangc -v prints ("2026.14.1",
+# also "v2026.14.1"), or "" when it cannot be run or read.
+function(pxg_slangc_version exe out)
+    execute_process(COMMAND "${exe}" -v
+        RESULT_VARIABLE res OUTPUT_VARIABLE o ERROR_VARIABLE e
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+    set(v "")
+    if(res EQUAL 0)
+        string(REGEX MATCH "[0-9]+\\.[0-9]+(\\.[0-9]+)?" v "${o} ${e}")
+    endif()
+    set(${out} "${v}" PARENT_SCOPE)
+endfunction()
+
+# pxg_slang_download(<out_exe>): the pinned release for this host, or "" when none is
+# known for it.
+function(pxg_slang_download out_exe)
+    set(${out_exe} "" PARENT_SCOPE)
+    set(base "https://github.com/shader-slang/slang/releases/download/v${PXG_SLANG_PINNED_VERSION}")
+    if(CMAKE_HOST_WIN32 AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
+        set(asset "slang-${PXG_SLANG_PINNED_VERSION}-windows-x86_64.zip")
+        set(sha "5ed0a59d650a0af0aca45d5db4e083b3d8fb5cea05748747dd95dfbe9c580658")
+        set(exe "bin/slangc.exe")
+    elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        set(asset "slang-${PXG_SLANG_PINNED_VERSION}-linux-x86_64.tar.gz")
+        set(sha "21f2d7847385a770e569fb61b1507a7794d742d97850bce0432bff0032ca005f")
+        set(exe "bin/slangc")
+    else()
+        return()
+    endif()
+    set(dir "${PXG_SLANG_DOWNLOAD_DIR}/slang-${PXG_SLANG_PINNED_VERSION}")
+    if(EXISTS "${dir}/${exe}")
+        set(${out_exe} "${dir}/${exe}" PARENT_SCOPE)
+        return()
+    endif()
+    set(archive "${PXG_SLANG_DOWNLOAD_DIR}/${asset}")
+    if(NOT EXISTS "${archive}")
+        message(STATUS "Downloading ${base}/${asset}")
+        file(DOWNLOAD "${base}/${asset}" "${archive}.part"
+            EXPECTED_HASH SHA256=${sha} TLS_VERIFY ON STATUS st)
+        list(GET st 0 code)
+        if(NOT code EQUAL 0)
+            file(REMOVE "${archive}.part")
+            list(GET st 1 msg)
+            message(FATAL_ERROR "Downloading ${base}/${asset} failed: ${msg}\n"
+                "Download it by hand and pass -DPXG_SLANGC=<extracted>/${exe}, or set SLANG_DIR.")
+        endif()
+        file(RENAME "${archive}.part" "${archive}")
+    endif()
+    file(SHA256 "${archive}" got)
+    if(NOT got STREQUAL sha)
+        file(REMOVE "${archive}")
+        message(FATAL_ERROR "${archive}: SHA-256 ${got}, expected ${sha}; removed, configure again to re-download.")
+    endif()
+    file(REMOVE_RECURSE "${dir}.part")
+    file(MAKE_DIRECTORY "${dir}.part")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E tar xf "${archive}"
+        WORKING_DIRECTORY "${dir}.part" RESULT_VARIABLE res)
+    if(NOT res EQUAL 0 OR NOT EXISTS "${dir}.part/${exe}")
+        message(FATAL_ERROR "Extracting ${archive} failed (${res}).")
+    endif()
+    file(RENAME "${dir}.part" "${dir}")
+    set(${out_exe} "${dir}/${exe}" PARENT_SCOPE)
+endfunction()
+
 set(_pxgSlangHints "")
 if(DEFINED ENV{SLANG_DIR} AND NOT "$ENV{SLANG_DIR}" STREQUAL "")
     set(_pxgSlangHints "$ENV{SLANG_DIR}/bin" "$ENV{SLANG_DIR}")
@@ -57,37 +144,51 @@ find_program(PXG_SLANGC slangc
     HINTS ${_pxgSlangHints}
     PATHS ${_pxgSlangPaths}
     DOC "Path to the slangc compiler")
-# A cached path is not searched again, so check it exists -- a stale or mistyped
-# -DPXG_SLANGC would otherwise configure fine and fail on the first shader.
-if(NOT PXG_SLANGC OR NOT EXISTS "${PXG_SLANGC}")
-    message(FATAL_ERROR
-        "slangc not found (PXG_SLANGC='${PXG_SLANGC}').\n"
-        "The Slang/Vulkan GPU build compiles its shaders with slangc. Install the LunarG\n"
-        "Vulkan SDK (it ships slangc in %VULKAN_SDK%\\Bin on Windows, $VULKAN_SDK/bin on Linux) or a Slang\n"
-        "release from https://github.com/shader-slang/slang/releases, then put slangc on\n"
-        "PATH, set SLANG_DIR to the release directory, or pass -DPXG_SLANGC=/path/to/slangc.")
-endif()
-if(NOT DEFINED PXG_SLANGC_VERSION_CHECKED OR NOT PXG_SLANGC_VERSION_CHECKED STREQUAL PXG_SLANGC)
-    execute_process(COMMAND "${PXG_SLANGC}" -v
-        RESULT_VARIABLE _pxgSlangcResult
-        OUTPUT_VARIABLE _pxgSlangcVersion ERROR_VARIABLE _pxgSlangcVersionErr
-        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
-    if(NOT _pxgSlangcResult EQUAL 0)
-        message(FATAL_ERROR "'${PXG_SLANGC} -v' failed (${_pxgSlangcResult}): ${_pxgSlangcVersionErr}")
+
+# The check is redone whenever the slangc path or the policy changes (the key also
+# invalidates entries cached by builds before the minimum version existed).
+set(_pxgSlangcCheckKey "${PXG_SLANGC}|min=${PXG_SLANGC_MIN_VERSION}|untested=${PXG_SLANGC_ALLOW_UNTESTED}")
+if(NOT DEFINED PXG_SLANGC_CHECKED_KEY OR NOT PXG_SLANGC_CHECKED_KEY STREQUAL _pxgSlangcCheckKey)
+    set(_pxgSlangcVersion "")
+    # A cached path is not searched again, so check it exists -- a stale or mistyped
+    # -DPXG_SLANGC would otherwise configure fine and fail on the first shader.
+    if(PXG_SLANGC AND EXISTS "${PXG_SLANGC}")
+        pxg_slangc_version("${PXG_SLANGC}" _pxgSlangcVersion)
     endif()
-    if(NOT _pxgSlangcVersion)
-        set(_pxgSlangcVersion "${_pxgSlangcVersionErr}")
+    set(_pxgSlangcUnsuitable "")
+    if(NOT PXG_SLANGC OR NOT EXISTS "${PXG_SLANGC}")
+        set(_pxgSlangcUnsuitable "no slangc found (PXG_SLANGC='${PXG_SLANGC}')")
+    elseif(NOT _pxgSlangcVersion)
+        set(_pxgSlangcUnsuitable "'${PXG_SLANGC} -v' did not report a version")
+    elseif(_pxgSlangcVersion VERSION_LESS PXG_SLANGC_MIN_VERSION AND NOT PXG_SLANGC_ALLOW_UNTESTED)
+        set(_pxgSlangcUnsuitable "slangc ${_pxgSlangcVersion} (${PXG_SLANGC}) is older than ${PXG_SLANGC_MIN_VERSION}")
     endif()
-    # The port is developed and validated with this slangc; another version may
-    # emit different (still valid) SPIR-V, which the suite has not checked.
-    set(PXG_SLANGC_EXPECTED_VERSION "2026.14.1")
-    if(NOT _pxgSlangcVersion STREQUAL PXG_SLANGC_EXPECTED_VERSION)
+    if(_pxgSlangcUnsuitable)
+        set(_pxgSlangcDownloaded "")
+        if(PXG_SLANG_DOWNLOAD)
+            pxg_slang_download(_pxgSlangcDownloaded)
+        endif()
+        if(NOT _pxgSlangcDownloaded)
+            message(FATAL_ERROR
+                "${_pxgSlangcUnsuitable}.\n"
+                "The Slang/Vulkan GPU build needs slangc ${PXG_SLANGC_MIN_VERSION} or newer (validated: "
+                "${PXG_SLANG_PINNED_VERSION}). Get it from https://github.com/shader-slang/slang/releases/tag/v${PXG_SLANG_PINNED_VERSION} "
+                "and pass -DPXG_SLANGC=<dir>/bin/slangc (or set SLANG_DIR to <dir>). "
+                "With PXG_SLANG_DOWNLOAD=ON (the default) on Windows x64 or Linux x86_64 this is downloaded automatically; "
+                "PXG_SLANGC_ALLOW_UNTESTED=ON keeps an older slangc anyway.")
+        endif()
+        message(WARNING "${_pxgSlangcUnsuitable}; using the pinned Slang ${PXG_SLANG_PINNED_VERSION}: ${_pxgSlangcDownloaded}")
+        set(PXG_SLANGC "${_pxgSlangcDownloaded}" CACHE FILEPATH "Path to the slangc compiler" FORCE)
+        pxg_slangc_version("${PXG_SLANGC}" _pxgSlangcVersion)
+    endif()
+    if(NOT _pxgSlangcVersion VERSION_EQUAL PXG_SLANG_PINNED_VERSION)
         message(WARNING "slangc ${_pxgSlangcVersion} (${PXG_SLANGC}); the Slang port is validated with "
-            "${PXG_SLANGC_EXPECTED_VERSION}. Other versions are expected to work but are untested.")
+            "${PXG_SLANG_PINNED_VERSION}. Other versions may emit different SPIR-V than the suite validated.")
     else()
         message(STATUS "slangc ${_pxgSlangcVersion}: ${PXG_SLANGC}")
     endif()
-    set(PXG_SLANGC_VERSION_CHECKED "${PXG_SLANGC}" CACHE INTERNAL "slangc whose version was checked")
+    set(PXG_SLANGC_CHECKED_KEY "${PXG_SLANGC}|min=${PXG_SLANGC_MIN_VERSION}|untested=${PXG_SLANGC_ALLOW_UNTESTED}"
+        CACHE INTERNAL "slangc path and policy that were checked")
 endif()
 
 # The SPIR-V post-processors (tools/spv_*.py) are stdlib-only Python 3.

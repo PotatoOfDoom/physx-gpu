@@ -36,8 +36,8 @@ The `vc17win64-vulkan` and `vc18win64-vulkan` presets build `PhysXGpu_64.dll` fr
 Status: the Windows build of this backend is implemented but **has not been compiled with MSVC yet**. It is built and run on Linux only; `gpuslang/tools/check_msvc_portability.py` (a ctest of the gpuslang suite) guards the MSVC-specific failure classes from there. Please report what a real Visual Studio build shows.
 
 Required in addition to the packages above:
-  * The LunarG Vulkan SDK 1.3 or newer (https://vulkan.lunarg.com). It sets `VULKAN_SDK` and ships `slangc.exe` in `%VULKAN_SDK%\Bin`.
-  * slangc: the port is validated with Slang 2026.14.1; another version configures with a warning. To use a specific one, take a release from https://github.com/shader-slang/slang/releases and pass `-DPXG_SLANGC=<path to slangc.exe>` or set `SLANG_DIR` to the extracted directory. Search order: `-DPXG_SLANGC`, `%SLANG_DIR%\bin` and `%SLANG_DIR%`, `PATH`, `%VULKAN_SDK%\Bin`.
+  * The LunarG Vulkan SDK 1.3 or newer (https://vulkan.lunarg.com), for the Vulkan headers and `vulkan-1.lib`. It sets `VULKAN_SDK`.
+  * slangc 2026.14.1 or newer (the port is validated with 2026.14.1). Older releases, including the `slangc.exe` some Vulkan SDKs ship, fail on the shaders ("undefined identifier 'WorkgroupCount'"). Nothing to install by hand: when the slangc found is missing or older, the configure step downloads the Slang 2026.14.1 release from GitHub once into `compiler\_slang\` (SHA-256 checked) and uses it. Search order before that: `-DPXG_SLANGC=<path to slangc.exe>`, `%SLANG_DIR%\bin` and `%SLANG_DIR%`, `PATH`, `%VULKAN_SDK%\Bin`. Without network access, download https://github.com/shader-slang/slang/releases/tag/v2026.14.1 (`slang-2026.14.1-windows-x86_64.zip`) yourself and set `SLANG_DIR` to the extracted folder. `-DPXG_SLANG_DOWNLOAD=OFF` disables the download; `-DPXG_SLANGC_ALLOW_UNTESTED=ON` keeps an older slangc (expect the error above).
   * Python 3 (the packman Python that generate_projects.bat uses is passed through) for the SPIR-V post-processing scripts.
 
 Generating and building:
