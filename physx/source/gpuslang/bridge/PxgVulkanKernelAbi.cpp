@@ -441,6 +441,13 @@ static const uint8_t kClothFinalizeVel[] = { 8, 8, 4, 4, 1 };
 //     activeId, PxReal dt, PxReal resetCounter, PxReal* wakeCounters,
 //     PxU32* stateChangedMask) -> 48-byte blob (activeId 8-aligned after the PxU32).
 static const uint8_t kClothSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
+// stateChangedMask (argument 6) of cloth_sleeping and sb_sleeping is
+// core->getActive{Cloth,SB}StateChangedMap().getWords() (PxgFEMClothCore.cpp:1216,
+// PxgSoftBodyCore.cpp:950): a PxBitMapPinned, pinned HOST memory that the kernel
+// writes through -- legal under CUDA's unified addressing, a CPU address to the GPU
+// here.  An AMD RX 9070 XT page-faulted on exactly that write (sb_sleeping); llvmpipe
+// cannot show it, its device addresses equal the CPU addresses.
+static const uint32_t kSleepingHostPtrMask = 1u << 6;
 // P9.19, the damping trio (PxgFEMClothCore::applyDamping, :2023).  Three rows and
 // NOT one: the three kernels take three different packs, and the two accumulators
 // differ only by the materials pointer -- exactly the shape that invites reusing
@@ -2183,7 +2190,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
-    { "cloth_sleeping", kClothSleeping, uint32_t(sizeof(kClothSleeping)) },
+    { "cloth_sleeping", kClothSleeping, uint32_t(sizeof(kClothSleeping)), kSleepingHostPtrMask },
     { "cloth_accumulateInPlaneDampingDeltaVelocity", kClothInPlaneDamp,
       uint32_t(sizeof(kClothInPlaneDamp)) },
     { "cloth_accumulateBendingDampingDeltaVelocity", kClothBendingDamp,
@@ -2264,7 +2271,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller softbody free-fall chain: substep integrate + finalize + sleep (P8.0 tranche 3)
     { "sb_gm_stepSoftbodyLaunch", kSbStepSoftbody, uint32_t(sizeof(kSbStepSoftbody)) },
     { "sb_gm_finalizeVelocitiesLaunch", kSbFinalizeVelocities, uint32_t(sizeof(kSbFinalizeVelocities)) },
-    { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)) },
+    { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)), kSleepingHostPtrMask },
     // gpusimulationcontroller softbody deprecated direct API: PxScene::copy/applySoftBodyData (P9.95)
     { "sb_copyOrApplySoftBodyDataDEPRECATED", kSbCopyOrApplyData, uint32_t(sizeof(kSbCopyOrApplyData)) },
     // gpusimulationcontroller softbody FEM-volume solve bracket (P8.0 tranche 4)

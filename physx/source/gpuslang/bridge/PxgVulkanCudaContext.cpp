@@ -476,28 +476,35 @@ public:
     // are unrelated numbers, and the blob builders copy argument bytes verbatim --
     // so such arguments must be translated on the way in.
     //
-    // Which arguments: EVERY 8-byte argument, not only the ones the ABI row marks.
-    // The marks were found by hand, and llvmpipe cannot reveal a missing one -- there
-    // a pinned allocation's device address equals its CPU address, so an untranslated
-    // pointer works by accident.  On real hardware it is a write to a CPU address: an
-    // AMD RX 9070 XT page-faulted in sb_sleeping, whose stateChangedMask is a
-    // PxBitMapPinned's words (PxgSoftBodyCore.cpp:950) and whose row had no mark.
-    // A value that lies inside a live device allocation is a device address and is
-    // left alone (that also covers llvmpipe, and pointers the engine already ran
-    // through getMappedDevicePtr); a value inside a pinned allocation's CPU range is
-    // translated; anything else is a plain 8-byte value.
+    // Which arguments: ONLY the ones the ABI row's hostPtrMask marks.  Translating
+    // every 8-byte argument that happens to lie in a pinned allocation (tried once)
+    // is wrong: some pinned pointers are ADDRESS TAGS that a kernel only subtracts
+    // from another pinned pointer -- the narrowphase contact-stream bases
+    // (startContactPatches/Points/Forces, cpuCompressed*Base) -- and translating one
+    // side of that subtraction yields a garbage patch index (an AMD RX 9070 XT read
+    // fault after constraintContactBlockPrePrepLaunch).  llvmpipe cannot reveal a
+    // missing mark: there a pinned allocation's device address equals its CPU
+    // address, so an untranslated pointer works by accident.  PXG_VERBOSE=1 lists
+    // unmarked arguments that carry a pinned address (see noteUnmarkedHostPtr) so a
+    // missing mark can be found on llvmpipe, too.
     //
-    // A marked argument keeps its stricter contract: null stays null (CUDA parity:
-    // kernels null-check these), and a non-null value that resolves to nothing is a
-    // REFUSED LAUNCH rather than a shader writing to a CPU address.
+    // A marked argument: null stays null (CUDA parity: kernels null-check these), and
+    // a non-null value that resolves to nothing is a REFUSED LAUNCH rather than a
+    // shader writing to a CPU address.
     bool translateHostPtrs(const PxgKernelAbiRow* abi, std::vector<uint8_t>& blob,
                            const std::vector<size_t>& offsets, PxgKernelId id) const
     {
         if (!abi)
             return true;
+        static const bool verbose = [] {
+            const char* v = std::getenv("PXG_VERBOSE");
+            return v && std::strcmp(v, "0") != 0;
+        }();
         for (uint32_t i = 0; i < abi->argCount && i < offsets.size(); ++i)
         {
             const bool marked = ((abi->hostPtrMask >> i) & 1u) != 0u;
+            if (!marked && !verbose)
+                continue;
             if (abi->argSizes[i] != 8 || offsets[i] + 8 > blob.size())
             {
                 if (marked)
@@ -508,22 +515,15 @@ public:
             std::memcpy(&value, blob.data() + offsets[i], 8);
             if (value == 0)
                 continue;
-            if (!marked)
-            {
-                PxgBufferHandle buf;
-                size_t off;
-                if (mShim->resolve(PxgDevicePtr(value), &buf, &off))
-                    continue;   // already a device address
-            }
             const PxgDevicePtr dev = mShim->hostGetDevicePointer(reinterpret_cast<const void*>(uintptr_t(value)));
-            if (dev == 0)
-            {
-                if (marked)
-                    return false;
-                continue;   // a plain 8-byte value
-            }
             if (!marked)
-                noteUnmarkedHostPtr(id, i);
+            {
+                if (dev != 0)
+                    noteUnmarkedHostPtr(id, i);
+                continue;
+            }
+            if (dev == 0)
+                return false;
             const uint64_t devAddr = uint64_t(dev);
             std::memcpy(blob.data() + offsets[i], &devAddr, 8);
         }
@@ -531,23 +531,18 @@ public:
     }
 
     // PXG_VERBOSE=1: name each (kernel, argument) that carried a pinned host pointer
-    // without a hostPtrMask bit, once -- the list of rows whose mark is missing.
+    // without a hostPtrMask bit, once.  Either an address tag (correctly left alone)
+    // or a missing mark -- the kernel source decides which.
     void noteUnmarkedHostPtr(PxgKernelId id, uint32_t arg) const
     {
-        static const bool verbose = [] {
-            const char* v = std::getenv("PXG_VERBOSE");
-            return v && std::strcmp(v, "0") != 0;
-        }();
-        if (!verbose)
-            return;
         static std::vector<uint64_t> seen;
         const uint64_t key = (uint64_t(id) << 8) | arg;
         if (std::find(seen.begin(), seen.end(), key) != seen.end())
             return;
         seen.push_back(key);
         const char* name = id < mManifestCount && mManifest[id].cudaName ? mManifest[id].cudaName : "?";
-        std::fprintf(stderr, "[pxg-hostptr] %s argument %u: pinned host pointer translated (no hostPtrMask bit)\n",
-                     name, arg);
+        std::fprintf(stderr, "[pxg-hostptr] %s argument %u: pinned host pointer NOT translated (no hostPtrMask bit; "
+                             "mark it if the kernel dereferences it)\n", name, arg);
     }
 
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
