@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -188,6 +189,7 @@ public:
 
     void release() override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         reportUnmappedLaunches();
         registerLiveContext(this, false);
         pxgSetVulkanDriverContext(nullptr); pxgSetVulkanDriverShim(nullptr); delete this;
@@ -195,7 +197,10 @@ public:
 
     // P9.40.  How often kernel `id` was launched while unmapped (0 for mapped ones).
     uint32_t unmappedLaunchCount(PxgKernelId id) const
-    { return id < mManifestCount ? mUnmappedLaunches[id] : 0u; }
+    {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+        return id < mManifestCount ? mUnmappedLaunches[id] : 0u;
+    }
 
     // The backing shim (bridge-internal): the ccm's getMappedDevicePtr resolves
     // pinned host pointers through it.
@@ -204,6 +209,7 @@ public:
     // ---- memory ----
     PxCUresult memAlloc(CUdeviceptr* dptr, size_t bytesize) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         PxgDevicePtr p = 0;
         const PxgResult r = mShim->memAlloc(&p, bytesize);
@@ -213,12 +219,14 @@ public:
     }
     PxCUresult memFree(CUdeviceptr dptr) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memFree(PxgDevicePtr(dptr)));
     }
 
     PxCUresult memHostAlloc(void** pp, size_t bytesize, unsigned int /*Flags*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         // P5 Step 4b: real pinned-mapped memory — a persistently mapped host-
         // visible buffer with a device address, so the engine's mapped-pointer
         // model (PxPinnedArray + getMappedDevicePtr, the copy-descriptor queue,
@@ -228,11 +236,13 @@ public:
     }
     PxCUresult memFreeHost(void* p) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memFreeHost(p));
     }
     PxCUresult memHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned int /*Flags*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         // Interior CPU pointers of pinned allocations resolve to their device
         // address (CUDA parity).  Unknown host memory yields the null result.
         // Does NOT touch mLastResult (an unsupported query — even mid-abort —
@@ -247,6 +257,7 @@ public:
     PxCUresult moduleLoadDataEx(CUmodule* module, const void* /*image*/, unsigned int /*numOptions*/,
                                 PxCUjit_option* /*options*/, void** /*optionValues*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         if (module)
             *module = sentinelModule();
@@ -254,6 +265,7 @@ public:
     }
     PxCUresult moduleGetFunction(CUfunction* hfunc, CUmodule /*hmod*/, const char* name) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         for (uint32_t i = 0; i < mManifestCount; ++i)
         {
@@ -286,11 +298,12 @@ public:
         }
         return record(PxgResult::NotFound);
     }
-    PxCUresult moduleUnload(CUmodule /*hmod*/) override { return record(PxgResult::Success); }
+    PxCUresult moduleUnload(CUmodule /*hmod*/) override { std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex()); return record(PxgResult::Success); }
 
     // ---- streams ----
     PxCUresult streamCreate(CUstream* phStream, unsigned int /*Flags*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         PxgStreamId id = 0;
         const PxgResult r = mShim->streamCreate(&id);
@@ -300,30 +313,36 @@ public:
     }
     PxCUresult streamCreateWithPriority(CUstream* phStream, unsigned int flags, int /*priority*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         return streamCreate(phStream, flags);
     }
     PxCUresult streamFlush(CUstream hStream) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->streamSynchronize(fromStream(hStream)));
     }
     PxCUresult streamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int /*Flags*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->streamWaitEvent(fromStream(hStream), fromEvent(hEvent)));
     }
     PxCUresult streamWaitEvent(CUstream hStream, CUevent hEvent) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->streamWaitEvent(fromStream(hStream), fromEvent(hEvent)));
     }
     PxCUresult streamDestroy(CUstream hStream) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->streamDestroy(fromStream(hStream)));
     }
     PxCUresult streamSynchronize(CUstream hStream) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->streamSynchronize(fromStream(hStream)));
     }
@@ -331,6 +350,7 @@ public:
     // ---- events ----
     PxCUresult eventCreate(CUevent* phEvent, unsigned int /*Flags*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         uint32_t id = 0;
         const PxgResult r = mShim->eventCreate(&id);
@@ -340,21 +360,25 @@ public:
     }
     PxCUresult eventRecord(CUevent hEvent, CUstream hStream) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->eventRecord(fromEvent(hEvent), fromStream(hStream)));
     }
     PxCUresult eventQuery(CUevent hEvent) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->eventQuery(fromEvent(hEvent)));
     }
     PxCUresult eventSynchronize(CUevent hEvent) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->eventSynchronize(fromEvent(hEvent)));
     }
     PxCUresult eventDestroy(CUevent hEvent) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->eventDestroy(fromEvent(hEvent)));
     }
@@ -485,6 +509,7 @@ public:
                             size_t kernelParamsSizeInBytes, void** /*extra*/, const char* /*file*/,
                             int /*line*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         PxgKernelId id = 0;
         if (!fromFunc(f, &id))
@@ -608,6 +633,7 @@ public:
                             CUstream /*hStream*/, void** kernelParams, void** /*extra*/, const char* /*file*/,
                             int /*line*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         // The void** launch form (PX_CUDA_KERNEL_PARAM2; USE_NEW_LAUNCH_FUNCTION
         // in broadphase/AABB-manager/articulation) carries no per-argument sizes
         // — CUDA reads them from the compiled kernel's parameter metadata.  The
@@ -659,36 +685,43 @@ public:
     // ---- copies (async == sync: P3 serializes on one queue) ----
     PxCUresult memcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoH(dstHost, PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream /*hStream*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoH(dstHost, PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyHtoD(PxgDevicePtr(dstDevice), srcHost, ByteCount));
     }
     PxCUresult memcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream /*hStream*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyHtoD(PxgDevicePtr(dstDevice), srcHost, ByteCount));
     }
     PxCUresult memcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream /*hStream*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoD(PxgDevicePtr(dstDevice), PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoD(PxgDevicePtr(dstDevice), PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyPeerAsync(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, size_t, CUstream) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(PxgResult::InvalidValue); // single device: no peer copies
     }
@@ -696,20 +729,24 @@ public:
     // ---- memset ----
     PxCUresult memsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream /*hStream*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memsetD32(PxgDevicePtr(dstDevice), ui, N));
     }
     PxCUresult memsetD32(CUdeviceptr dstDevice, unsigned int ui, size_t N) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         return record(mShim->memsetD32(PxgDevicePtr(dstDevice), ui, N));
     }
     PxCUresult memsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream /*hStream*/) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         return memsetD8(dstDevice, uc, N);
     }
     PxCUresult memsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         // vkCmdFillBuffer is 32-bit; a byte fill maps to it only when the run
         // is 4-byte aligned (replicate the byte across the word).  Sub-word
@@ -723,6 +760,7 @@ public:
     }
     PxCUresult memsetD16(CUdeviceptr dstDevice, unsigned short uh, size_t N) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
         if ((N % 2u) != 0u || (uint64_t(dstDevice) % 4u) != 0u)
             return record(PxgResult::InvalidValue);
@@ -734,16 +772,17 @@ public:
     // Matches CudaCtx::getLastError: in abort mode report OUT_OF_MEMORY (the
     // sticky terminal state the engine polls for) rather than the last recorded
     // op result, which a benign forwarded call could otherwise have cleared.
-    PxCUresult getLastError() override { return mAbort ? oomResult() : mLastResult; }
+    PxCUresult getLastError() override { std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex()); return mAbort ? oomResult() : mLastResult; }
     void setAbortMode(bool abort) override
     {
+        std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         mAbort = abort;
         // When abort clears, recover from the sticky OUT_OF_MEMORY so the next
         // getLastError() reads healthy again (matches CudaCtx::setAbortMode).
         if (!abort && mLastResult.value == uint32_t(PXG_CUDA_ERROR_OUT_OF_MEMORY))
             mLastResult = okResult();
     }
-    bool isInAbortMode() override { return mAbort; }
+    bool isInAbortMode() override { std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex()); return mAbort; }
 
 private:
     PxCUresult record(PxgResult r)
@@ -826,9 +865,13 @@ public:
     {
         return CUdeviceptr(mContext->shim()->hostGetDevicePointer(pinnedHostBuffer));
     }
-    void acquireContext() override { ++mAcquireCount; }
-    bool tryAcquireContext() override { ++mAcquireCount; return true; }
-    void releaseContext() override { if (mAcquireCount > 0) --mAcquireCount; }
+    void acquireContext() override { mAcquireCount.fetch_add(1u); }
+    bool tryAcquireContext() override { mAcquireCount.fetch_add(1u); return true; }
+    void releaseContext() override
+    {
+        unsigned n = mAcquireCount.load();
+        while (n > 0 && !mAcquireCount.compare_exchange_weak(n, n - 1u)) {}
+    }
     CUcontext getContext() override { return reinterpret_cast<CUcontext>(uintptr_t(1)); }
     PxCudaContext* getCudaContext() override { return mContext; }
     bool contextIsValid() const override { return mContext != nullptr; }
@@ -938,7 +981,7 @@ protected:
 private:
     PxgSlangComputeDevice* mDevice;
     PxgVulkanCudaContext* mContext;
-    unsigned mAcquireCount = 0;
+    std::atomic<unsigned> mAcquireCount{0};
     bool mConcurrentStreams = false;
 };
 

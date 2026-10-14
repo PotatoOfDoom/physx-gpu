@@ -45,7 +45,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace
@@ -135,6 +137,101 @@ PXG_TEST(p3CudaContext)
     ctx->memFree(dx);
     ctx->memFree(dy);
     ctx->memFree(dOut);
+    ctx->release();
+}
+
+// PhysX calls the CUDA layer from several worker threads at once: in one step the
+// broadphase and narrowphase tasks launch kernels concurrently (an AMD RX 9070 XT
+// trace showed convexPlaneNphase_Kernel and bpSignalComplete interleaved, then
+// vkBeginCommandBuffer failing / DEVICE_LOST).  The CUDA driver is thread-safe; the
+// Vulkan command buffer and the shim's bookkeeping are not, so every call holds
+// pxgGpuApiMutex().  Here four threads each run alloc / upload / launch / sync /
+// download / free cycles through ONE context, and every result must be bitwise
+// right.  Without the lock this crashes or corrupts on llvmpipe as well.
+PXG_TEST(p3CudaContextThreads)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    struct AxpyBuffers { uint64_t x, y, out; };
+    struct AxpyParams { AxpyBuffers bufs; float alpha; uint32_t count; };
+    const PxgKernelDef manifest[] = {
+        { "npShimAxpy.spv", "shimAxpy", uint32_t(sizeof(AxpyParams)), 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &ctxLoader);
+    PxCudaContext* ctx = physx::gpuslang::PxgCreateVulkanCudaContext(&shim, manifest, 1);
+    PXG_CHECK_MSG(ctx != nullptr, "PxCudaContext created");
+    if (!ctx)
+        return;
+    CUmodule mod = nullptr;
+    ctx->moduleLoadDataEx(&mod, nullptr, 0, nullptr, nullptr);
+    CUfunction fn = nullptr;
+    PXG_CHECK_MSG(ctx->moduleGetFunction(&fn, mod, "shimAxpy") == 0 && fn != nullptr, "kernel resolves");
+    if (!fn)
+    {
+        ctx->release();
+        return;
+    }
+
+    const uint32_t kThreads = 4, kIterations = 40, N = 2048;
+    std::atomic<uint32_t> failedCalls(0), badValues(0), cycles(0);
+    auto worker = [&](uint32_t tid) {
+        std::mt19937 rng(1000u + tid);
+        std::vector<float> x(N), y(N), out(N);
+        for (uint32_t it = 0; it < kIterations; ++it)
+        {
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                x[i] = float(int(rng() % 2001u) - 1000) * 0.01f;
+                y[i] = float(int(rng() % 2001u) - 1000) * 0.01f;
+            }
+            const float alpha = 0.5f + float(tid) + float(it) * 0.25f;
+            CUdeviceptr dx = 0, dy = 0, dOut = 0;
+            uint32_t fails = 0;
+            fails += ctx->memAlloc(&dx, N * 4) != 0;
+            fails += ctx->memAlloc(&dy, N * 4) != 0;
+            fails += ctx->memAlloc(&dOut, N * 4) != 0;
+            if (fails)
+            {
+                failedCalls += fails;
+                continue;
+            }
+            CUstream stream = nullptr;
+            fails += ctx->streamCreate(&stream, 0) != 0;
+            fails += ctx->memcpyHtoD(dx, x.data(), N * 4) != 0;
+            fails += ctx->memcpyHtoD(dy, y.data(), N * 4) != 0;
+            AxpyParams prm;
+            prm.bufs.x = uint64_t(dx);
+            prm.bufs.y = uint64_t(dy);
+            prm.bufs.out = uint64_t(dOut);
+            prm.alpha = alpha;
+            prm.count = N;
+            PxCudaKernelParam kp[1] = { { &prm, sizeof(prm) } };
+            fails += ctx->launchKernel(fn, (N + 63) / 64, 1, 1, 64, 1, 1, 0, stream,
+                                       kp, sizeof(kp), nullptr, __FILE__, __LINE__) != 0;
+            fails += ctx->streamSynchronize(stream) != 0;
+            fails += ctx->memcpyDtoH(out.data(), dOut, N * 4) != 0;
+            uint32_t bad = 0;
+            for (uint32_t i = 0; i < N; ++i)
+                if (f2u(alpha * x[i] + y[i]) != f2u(out[i]))
+                    ++bad;
+            fails += ctx->streamDestroy(stream) != 0;
+            fails += ctx->memFree(dx) != 0;
+            fails += ctx->memFree(dy) != 0;
+            fails += ctx->memFree(dOut) != 0;
+            failedCalls += fails;
+            badValues += bad;
+            ++cycles;
+        }
+    };
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < kThreads; ++t)
+        threads.emplace_back(worker, t);
+    for (std::thread& th : threads)
+        th.join();
+
+    PXG_CHECK_MSG(cycles.load() == kThreads * kIterations, "every cycle ran (%u of %u)", cycles.load(), kThreads * kIterations);
+    PXG_CHECK_MSG(failedCalls.load() == 0, "no call failed under concurrency (%u failed)", failedCalls.load());
+    PXG_CHECK_MSG(badValues.load() == 0, "every concurrent result is bitwise correct (%u bad values)", badValues.load());
     ctx->release();
 }
 

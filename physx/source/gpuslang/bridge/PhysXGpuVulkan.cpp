@@ -146,6 +146,60 @@ std::vector<uint8_t> envSpirvLoader(const char* file)
     return blob;
 }
 
+// The engine KernelWrangler (cudamanager/src/CudaKernelWrangler.cpp) resolves every
+// kernel of the registry when it is built and reports each one it cannot resolve as
+// an eINTERNAL_ERROR, "Could not find CUDA module containing function '<name>'.".
+// The kernels the manifest deliberately leaves without SPIR-V (the PxGetPhysicsGpu()
+// utilities -- SDF builder, isosurface, sparse grid, anisotropy, smoothing -- and
+// kernels nothing launches) would print 73 such errors for every application that
+// enables GPU dynamics, although nothing is wrong.  This forwards everything else
+// unchanged and drops exactly those notices: a kernel that IS mapped and fails to
+// resolve, a name missing from the function table, or any other message still
+// reaches the application.  An actual launch of an unmapped kernel is refused,
+// counted and reported when the context is released (P9.40), so nothing that
+// matters is hidden.
+class UnmappedKernelNoticeFilter : public PxErrorCallback
+{
+public:
+    explicit UnmappedKernelNoticeFilter(PxErrorCallback& next) : mNext(next) {}
+
+    void reportError(PxErrorCode::Enum code, const char* message, const char* file, int line) PX_OVERRIDE
+    {
+        if (code == PxErrorCode::eINTERNAL_ERROR && isUnmappedKernelNotice(message))
+        {
+            ++mSuppressed;
+            return;
+        }
+        mNext.reportError(code, message, file, line);
+    }
+
+    uint32_t suppressed() const { return mSuppressed; }
+
+    static bool isUnmappedKernelNotice(const char* message)
+    {
+        static const char prefix[] = "Could not find CUDA module containing function '";
+        if (!message || std::strncmp(message, prefix, sizeof(prefix) - 1) != 0)
+            return false;
+        const char* name = message + sizeof(prefix) - 1;
+        const char* end = std::strchr(name, '\'');
+        if (!end || std::strcmp(end, "'.") != 0)
+            return false;
+        const size_t len = size_t(end - name);
+        for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
+        {
+            const PxgSlangKernelRow& row = gPxgSlangKernelManifest[i];
+            if (!row.spirvFile && row.cudaName && std::strlen(row.cudaName) == len &&
+                std::strncmp(row.cudaName, name, len) == 0)
+                return true;
+        }
+        return false;
+    }
+
+private:
+    PxErrorCallback& mNext;
+    uint32_t mSuppressed = 0;
+};
+
 // The process-global Vulkan runtime.  A Vulkan device is a process singleton, so
 // PxCreateCudaContextManager hands out managers over ONE shared device/shim (one
 // scene at a time — the P3 single-queue model); the objects live until process
@@ -339,8 +393,17 @@ public:
     // same instance back and the singleton PxPhysXGpu owns it until process exit.
     PxsKernelWranglerManager* getGpuKernelWranglerManager(PxCudaContextManager* cudaContextManager) PX_OVERRIDE
     {
-        static PxsKernelWranglerManager* s =
-            PX_NEW(PxgCudaKernelWranglerManager)(*cudaContextManager, PxGetFoundation().getErrorCallback());
+        // The wrangler keeps a reference to the callback but uses it only while it is
+        // constructed; the filter is leaked with the manager it serves.
+        static UnmappedKernelNoticeFilter* filter = new UnmappedKernelNoticeFilter(PxGetFoundation().getErrorCallback());
+        static PxsKernelWranglerManager* s = [&]() {
+            PxsKernelWranglerManager* m = PX_NEW(PxgCudaKernelWranglerManager)(*cudaContextManager, *filter);
+            if (filter->suppressed())
+                std::fprintf(stderr, "[PhysXGpuVulkan] %u registry kernels have no SPIR-V port (the PxGetPhysicsGpu() "
+                                     "utilities and kernels nothing launches); a launch of one is refused and reported.\n",
+                             filter->suppressed());
+            return m;
+        }();
         return s;
     }
 

@@ -54,8 +54,17 @@ PxgCudaShim::~PxgCudaShim()
 
 // ---- memory ----
 
+
+std::recursive_mutex& pxgGpuApiMutex()
+{
+    // Leaked on purpose: a context released from a static destructor must still find it.
+    static std::recursive_mutex* m = new std::recursive_mutex;
+    return *m;
+}
+
 PxgResult PxgCudaShim::memAlloc(PxgDevicePtr* out, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!out || bytes == 0)
         return PxgResult::InvalidValue;
     const PxgBufferHandle buf = mDevice->createBuffer(bytes);
@@ -77,6 +86,7 @@ PxgResult PxgCudaShim::memAlloc(PxgDevicePtr* out, size_t bytes)
 
 PxgResult PxgCudaShim::memFree(PxgDevicePtr ptr)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mAllocs.find(ptr);
     if (it == mAllocs.end())
         return PxgResult::NotFound; // CUDA requires the base pointer, not an interior one
@@ -89,6 +99,7 @@ PxgResult PxgCudaShim::memFree(PxgDevicePtr ptr)
 
 PxgResult PxgCudaShim::memHostAlloc(void** out, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!out)
         return PxgResult::InvalidValue;
     if (bytes == 0)
@@ -111,6 +122,7 @@ PxgResult PxgCudaShim::memHostAlloc(void** out, size_t bytes)
 
 PxgResult PxgCudaShim::memFreeHost(void* p)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mHostAllocs.find(uintptr_t(p));
     if (it == mHostAllocs.end())
         return PxgResult::NotFound; // base pointer required, like memFree
@@ -127,6 +139,7 @@ PxgResult PxgCudaShim::memFreeHost(void* p)
 
 PxgDevicePtr PxgCudaShim::hostGetDevicePointer(const void* p) const
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     const uintptr_t addr = uintptr_t(p);
     if (addr == 0 || mHostAllocs.empty())
         return 0;
@@ -143,6 +156,7 @@ PxgDevicePtr PxgCudaShim::hostGetDevicePointer(const void* p) const
 
 bool PxgCudaShim::resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* offset) const
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (ptr == 0 || mAllocs.empty())
         return false;
     // First allocation whose base is > ptr; the candidate is its predecessor.
@@ -180,6 +194,7 @@ bool PxgCudaShim::resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* 
 
 PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     PxgBufferHandle buf;
     size_t off;
     if (!resolveRange(dst, bytes, &buf, &off, "memcpyHtoD"))
@@ -190,6 +205,7 @@ PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t byte
 
 PxgResult PxgCudaShim::memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     PxgBufferHandle buf;
     size_t off;
     if (!resolveRange(src, bytes, &buf, &off, "memcpyDtoH"))
@@ -200,6 +216,7 @@ PxgResult PxgCudaShim::memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes)
 
 PxgResult PxgCudaShim::memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     PxgBufferHandle sBuf, dBuf;
     size_t sOff, dOff;
     if (!resolveRange(src, bytes, &sBuf, &sOff, "memcpyDtoD (source)") ||
@@ -213,6 +230,7 @@ PxgResult PxgCudaShim::memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t byt
 
 PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWords)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     PxgBufferHandle buf;
     size_t off;
     // numWords * 4 is not formed before the range check: a count above SIZE_MAX / 4 is
@@ -340,6 +358,7 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
                                     const void* paramBlob, uint32_t paramBlobSize,
                                     const PxgTextureHandle* textures, uint32_t numTextures)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (id >= mManifestCount)
         return PxgResult::NotFound;
     if (paramBlobSize != mManifest[id].pushConstantSize || numTextures != mManifest[id].numTextures)
@@ -401,6 +420,7 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
 
 PxgResult PxgCudaShim::streamCreate(PxgStreamId* out)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!out)
         return PxgResult::InvalidValue;
     const PxgStreamId id = mNextStream++;
@@ -411,6 +431,7 @@ PxgResult PxgCudaShim::streamCreate(PxgStreamId* out)
 
 PxgResult PxgCudaShim::streamDestroy(PxgStreamId stream)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mStreams.find(stream);
     if (it == mStreams.end())
         return PxgResult::NotFound;
@@ -420,6 +441,7 @@ PxgResult PxgCudaShim::streamDestroy(PxgStreamId stream)
 
 PxgResult PxgCudaShim::streamSynchronize(PxgStreamId /*stream*/)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     // One queue: syncing any stream drains all recorded + submitted work.
     mDevice->flush();
     return PxgResult::Success;
@@ -427,6 +449,7 @@ PxgResult PxgCudaShim::streamSynchronize(PxgStreamId /*stream*/)
 
 PxgResult PxgCudaShim::eventCreate(uint32_t* out)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!out)
         return PxgResult::InvalidValue;
     const uint32_t id = mNextEvent++;
@@ -437,6 +460,7 @@ PxgResult PxgCudaShim::eventCreate(uint32_t* out)
 
 PxgResult PxgCudaShim::eventDestroy(uint32_t event)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
@@ -446,6 +470,7 @@ PxgResult PxgCudaShim::eventDestroy(uint32_t event)
 
 PxgResult PxgCudaShim::eventRecord(uint32_t event, PxgStreamId /*stream*/)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
@@ -460,6 +485,7 @@ PxgResult PxgCudaShim::eventRecord(uint32_t event, PxgStreamId /*stream*/)
 
 PxgResult PxgCudaShim::eventSynchronize(uint32_t event)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
@@ -469,6 +495,7 @@ PxgResult PxgCudaShim::eventSynchronize(uint32_t event)
 
 PxgResult PxgCudaShim::eventQuery(uint32_t event)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
@@ -477,6 +504,7 @@ PxgResult PxgCudaShim::eventQuery(uint32_t event)
 
 PxgResult PxgCudaShim::streamWaitEvent(PxgStreamId stream, uint32_t event)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (stream != 0 && mStreams.find(stream) == mStreams.end())
         return PxgResult::NotFound;
     auto it = mEvents.find(event);
@@ -501,6 +529,7 @@ PxgResult PxgCudaShim::streamWaitEvent(PxgStreamId stream, uint32_t event)
 PxgResult PxgCudaShim::arrayCreate3D(uint32_t* outArray, uint32_t width, uint32_t height,
                                      uint32_t depth, PxgSlangComputeDevice::TextureFormat format)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!outArray || width == 0 || height == 0 || depth == 0)
         return PxgResult::InvalidValue;
     if (!mDevice->supportsBindlessTextures())
@@ -531,6 +560,7 @@ PxgResult PxgCudaShim::arrayCreate3D(uint32_t* outArray, uint32_t width, uint32_
 
 PxgResult PxgCudaShim::arrayUpload(uint32_t arrayId, const void* src, size_t bytes)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mArrays.find(arrayId);
     if (it == mArrays.end())
         return PxgResult::NotFound;
@@ -548,6 +578,7 @@ PxgResult PxgCudaShim::arrayUpload(uint32_t arrayId, const void* src, size_t byt
 
 PxgResult PxgCudaShim::textureObjectCreate(PxgTextureHandle* out, uint32_t arrayId)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (!out)
         return PxgResult::InvalidValue;
     auto it = mArrays.find(arrayId);
@@ -569,6 +600,7 @@ PxgResult PxgCudaShim::textureObjectCreate(PxgTextureHandle* out, uint32_t array
 
 PxgResult PxgCudaShim::arrayDestroy(uint32_t arrayId)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     auto it = mArrays.find(arrayId);
     if (it == mArrays.end())
         return PxgResult::NotFound;
@@ -582,6 +614,7 @@ PxgResult PxgCudaShim::arrayDestroy(uint32_t arrayId)
 
 PxgResult PxgCudaShim::textureObjectDestroy(PxgTextureHandle handle)
 {
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     if (handle == 0)
         return PxgResult::Success;   // the null texture, as CUDA treats it
     mDevice->destroyTexture3D(handle);

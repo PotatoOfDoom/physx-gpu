@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <map>
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 namespace physx
@@ -98,6 +99,18 @@ enum class PxgResult
 // Loads a compiled SPIR-V blob by manifest file name.  In the engine this is
 // the module manifest lookup; in the harness it is the test's shader loader.
 typedef std::vector<uint8_t> (*PxgSpirvLoader)(const char* file);
+
+// The GPU API lock.  PhysX calls the CUDA layer from several worker threads at once
+// (the broadphase and narrowphase tasks of one step launch kernels concurrently), which
+// the CUDA driver allows: it is thread-safe.  Vulkan is not -- a command buffer, its
+// pool and the queue must be externally synchronized -- and neither is the shim's own
+// bookkeeping.  Every PxgCudaShim entry point and every PxgVulkanCudaContext call
+// holds this process-wide lock, so concurrent callers are serialized exactly where
+// the CUDA driver serializes them internally.  Recursive: the context calls into the
+// shim, and the shim into itself.  (Found on an AMD RX 9070 XT: two threads recording
+// into one command buffer -> vkBeginCommandBuffer VK_ERROR_UNKNOWN / DEVICE_LOST;
+// llvmpipe tolerated it.)
+std::recursive_mutex& pxgGpuApiMutex();
 
 class PxgCudaShim
 {
