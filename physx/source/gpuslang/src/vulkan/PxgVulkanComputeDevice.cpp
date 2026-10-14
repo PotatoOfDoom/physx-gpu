@@ -69,6 +69,11 @@ namespace gpuslang
 // pipelines (createPipelineInternal), buffers and textures (createBuffer /
 // createHostVisibleBuffer / createTexture3D* return 0, which the shim reports as
 // OutOfMemory), descriptor sets (the dispatch is refused) and init (no device).
+// On VK_ERROR_DEVICE_LOST the device's fault report (VK_EXT_device_fault, when the
+// driver offers it) is printed before aborting: the faulting GPU address and the
+// allocation it falls in or next to.  Defined after the device class.
+static void pxgVkReportFatal(VkResult result);
+
 #define PXG_VK_CHECK(expr)                                                                 \
     do                                                                                     \
     {                                                                                      \
@@ -77,6 +82,7 @@ namespace gpuslang
         {                                                                                  \
             fprintf(stderr, "[gpuslang/vulkan] %s failed: %d (%s:%d); aborting\n", #expr,  \
                     int(pxgVkResult_), __FILE__, __LINE__);                                \
+            pxgVkReportFatal(pxgVkResult_);                                                \
             fflush(stderr);                                                                \
             std::abort();                                                                  \
         }                                                                                  \
@@ -477,6 +483,10 @@ bool pxgRequiredSubgroupSizeFits(const PxgSlangComputeDevice::SubgroupCaps& caps
     return true;
 }
 
+class PxgVulkanComputeDevice;
+// The live device for pxgVkReportFatal (a process has one).
+static PxgVulkanComputeDevice* gFaultReportDevice = nullptr;
+
 class PxgVulkanComputeDevice : public PxgSlangComputeDevice
 {
 private:
@@ -489,6 +499,8 @@ public:
 
     ~PxgVulkanComputeDevice() override
     {
+        if (gFaultReportDevice == this)
+            gFaultReportDevice = nullptr;
         if (mDevice)
         {
             vkDeviceWaitIdle(mDevice);
@@ -727,6 +739,7 @@ public:
         // that emit OpAtomicFAddEXT will fail pipeline creation without it, so the
         // capability is recorded and reported rather than silently assumed.
         bool atomicFloatExtPresent = false;
+        bool deviceFaultExtPresent = false;
         {
             uint32_t extCount = 0;
             vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &extCount, nullptr);
@@ -734,9 +747,16 @@ public:
             if (extCount)
                 vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &extCount, exts.data());
             for (const VkExtensionProperties& e : exts)
+            {
                 if (std::strcmp(e.extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) == 0)
                     atomicFloatExtPresent = true;
+#ifdef VK_EXT_device_fault
+                if (std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0)
+                    deviceFaultExtPresent = true;
+#endif
+            }
         }
+        (void)deviceFaultExtPresent;
 
         VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloatSupported = {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
@@ -750,6 +770,16 @@ public:
         supported12.pNext = &sgSizeSupported;
         VkPhysicalDeviceFeatures2 supported2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         supported2.pNext = &supported12;
+#ifdef VK_EXT_device_fault
+        // VK_EXT_device_fault: diagnostics only.  After VK_ERROR_DEVICE_LOST it tells
+        // which GPU address faulted; nothing depends on it being present.
+        VkPhysicalDeviceFaultFeaturesEXT faultSupported = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+        if (deviceFaultExtPresent)
+        {
+            faultSupported.pNext = supported2.pNext;
+            supported2.pNext = &faultSupported;
+        }
+#endif
         vkGetPhysicalDeviceFeatures2(mPhysicalDevice, &supported2);
         const VkPhysicalDeviceFeatures& supported = supported2.features;
 
@@ -841,6 +871,17 @@ public:
         std::vector<const char*> deviceExts;
         if (mHasShaderBufferFloat32AtomicAdd)
             deviceExts.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+#ifdef VK_EXT_device_fault
+        VkPhysicalDeviceFaultFeaturesEXT enabledFault = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT };
+        if (deviceFaultExtPresent && faultSupported.deviceFault == VK_TRUE)
+        {
+            enabledFault.deviceFault = VK_TRUE;
+            enabledFault.pNext = enabled2.pNext;
+            enabled2.pNext = &enabledFault;
+            deviceExts.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+            mHasDeviceFault = true;
+        }
+#endif
 
         VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         deviceInfo.queueCreateInfoCount = 1;
@@ -853,6 +894,12 @@ public:
             return false;
 
         vkGetDeviceQueue(mDevice, mQueueFamily, 0, &mQueue);
+#ifdef VK_EXT_device_fault
+        if (mHasDeviceFault)
+            mGetDeviceFaultInfo = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+                vkGetDeviceProcAddr(mDevice, "vkGetDeviceFaultInfoEXT"));
+#endif
+        gFaultReportDevice = this;
 
         if (mHasBindlessTextures && !initBindlessTextures())
         {
@@ -2463,6 +2510,106 @@ public:
         wait(submit());
     }
 
+    // After VK_ERROR_DEVICE_LOST: print what the driver knows about the fault and map
+    // each faulting address onto the allocations (handle, size, and how far inside or
+    // past it the address lies).  Diagnostics only; the caller aborts afterwards.
+    void reportDeviceFault()
+    {
+#ifdef VK_EXT_device_fault
+        if (!mHasDeviceFault || !mGetDeviceFaultInfo)
+        {
+            std::fprintf(stderr, "[gpuslang/vulkan] device lost; this driver offers no VK_EXT_device_fault report. "
+                                 "Run with PXG_LAUNCH_TRACE=1 PXG_SYNC_EACH=1 to find the last kernel.\n");
+            return;
+        }
+        VkDeviceFaultCountsEXT counts = { VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT };
+        if (mGetDeviceFaultInfo(mDevice, &counts, nullptr) != VK_SUCCESS)
+        {
+            std::fprintf(stderr, "[gpuslang/vulkan] device lost; vkGetDeviceFaultInfoEXT returned no report\n");
+            return;
+        }
+        std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+        VkDeviceFaultInfoEXT info = { VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT };
+        info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+        info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+        counts.vendorBinarySize = 0;   // the binary dump is not requested
+        if (mGetDeviceFaultInfo(mDevice, &counts, &info) != VK_SUCCESS && counts.addressInfoCount == 0)
+        {
+            std::fprintf(stderr, "[gpuslang/vulkan] device lost; vkGetDeviceFaultInfoEXT failed\n");
+            return;
+        }
+        std::fprintf(stderr, "[gpuslang/vulkan] device fault: %s\n", info.description);
+        for (uint32_t i = 0; i < counts.addressInfoCount; ++i)
+        {
+            const VkDeviceFaultAddressInfoEXT& a = addresses[i];
+            const char* kind = "?";
+            switch (a.addressType)
+            {
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: kind = "none"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: kind = "invalid read"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: kind = "invalid write"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: kind = "invalid execute"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: kind = "instruction pointer (unknown)"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: kind = "instruction pointer (invalid)"; break;
+            case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: kind = "instruction pointer (fault)"; break;
+            default: break;
+            }
+            const uint64_t addr = a.reportedAddress;
+            std::fprintf(stderr, "[gpuslang/vulkan]   %s at 0x%llx (precision 0x%llx)\n", kind,
+                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(a.addressPrecision));
+            describeAddress(addr);
+        }
+        for (uint32_t i = 0; i < counts.vendorInfoCount; ++i)
+            std::fprintf(stderr, "[gpuslang/vulkan]   vendor: %s (code 0x%llx, data 0x%llx)\n", vendor[i].description,
+                         static_cast<unsigned long long>(vendor[i].vendorFaultCode),
+                         static_cast<unsigned long long>(vendor[i].vendorFaultData));
+#else
+        std::fprintf(stderr, "[gpuslang/vulkan] device lost (built without VK_EXT_device_fault headers)\n");
+#endif
+    }
+
+    // Which allocation an address belongs to, or the nearest ones around it.
+    void describeAddress(uint64_t addr) const
+    {
+        const Buffer* below = nullptr;
+        const Buffer* above = nullptr;
+        PxgBufferHandle belowHandle = 0, aboveHandle = 0;
+        for (const auto& kv : mBuffers)
+        {
+            const Buffer& b = kv.second;
+            if (!b.deviceAddress)
+                continue;
+            if (addr >= b.deviceAddress && addr < b.deviceAddress + b.size)
+            {
+                std::fprintf(stderr, "[gpuslang/vulkan]     inside buffer %u (base 0x%llx, %zu bytes) at offset %llu\n",
+                             unsigned(kv.first), static_cast<unsigned long long>(b.deviceAddress), b.size,
+                             static_cast<unsigned long long>(addr - b.deviceAddress));
+                return;
+            }
+            if (b.deviceAddress <= addr && (!below || b.deviceAddress > below->deviceAddress))
+            {
+                below = &b;
+                belowHandle = kv.first;
+            }
+            if (b.deviceAddress > addr && (!above || b.deviceAddress < above->deviceAddress))
+            {
+                above = &b;
+                aboveHandle = kv.first;
+            }
+        }
+        if (below)
+            std::fprintf(stderr, "[gpuslang/vulkan]     %llu bytes past the end of buffer %u (base 0x%llx, %zu bytes)\n",
+                         static_cast<unsigned long long>(addr - (below->deviceAddress + below->size)), unsigned(belowHandle),
+                         static_cast<unsigned long long>(below->deviceAddress), below->size);
+        if (above)
+            std::fprintf(stderr, "[gpuslang/vulkan]     %llu bytes before buffer %u (base 0x%llx, %zu bytes)\n",
+                         static_cast<unsigned long long>(above->deviceAddress - addr), unsigned(aboveHandle),
+                         static_cast<unsigned long long>(above->deviceAddress), above->size);
+        if (!below && !above)
+            std::fprintf(stderr, "[gpuslang/vulkan]     not near any live buffer\n");
+    }
+
 private:
     struct Buffer
     {
@@ -2763,6 +2910,10 @@ private:
     // VK_EXT_shader_atomic_float / shaderBufferFloat32AtomicAdd.  Kernels that
     // transcribe CUDA's atomicAdd(float*) emit OpAtomicFAddEXT and require it.
     bool mHasShaderBufferFloat32AtomicAdd = false;
+    bool mHasDeviceFault = false;
+#ifdef VK_EXT_device_fault
+    PFN_vkGetDeviceFaultInfoEXT mGetDeviceFaultInfo = nullptr;
+#endif
     SubgroupCaps mSubgroupCaps;
 
     // ---- the bindless texture set (P9.12a; one binding since P9.97) ----
@@ -2785,6 +2936,12 @@ private:
 
     std::string mDeviceName;
 };
+
+static void pxgVkReportFatal(VkResult result)
+{
+    if (result == VK_ERROR_DEVICE_LOST && gFaultReportDevice)
+        gFaultReportDevice->reportDeviceFault();
+}
 
 PxgSlangComputeDevice* PxgCreateVulkanComputeDevice(const PxgSlangDeviceDesc& desc)
 {
