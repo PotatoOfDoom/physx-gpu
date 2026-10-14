@@ -1577,11 +1577,15 @@ void PxgTGSCudaSolverCore::solveContactMultiBlockParallel(PxgIslandContext* isla
 			{
 				CUfunction function = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::DMA_CONSTRAINT_RESIDUAL);
 
+				// The residual pool is a pinned host array the kernel writes; pass its mapped
+				// device pointer (identical under CUDA's unified addressing, required where
+				// host and device addresses differ).
+				PxReal* residualsDev = reinterpret_cast<PxReal*>(getMappedDevicePtr(mCudaContext, posIterResidualSharedMem));
 				CUdeviceptr ptr = mConstraintWriteBackBuffer.getDevicePtr();
 				PxCudaKernelParam kernelParams[] =
 				{
 					PX_CUDA_KERNEL_PARAM(ptr),
-					PX_CUDA_KERNEL_PARAM(posIterResidualSharedMem),
+					PX_CUDA_KERNEL_PARAM(residualsDev),
 					PX_CUDA_KERNEL_PARAM(posIterResidualSharedMemSize)
 				};
 

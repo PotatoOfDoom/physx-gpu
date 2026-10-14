@@ -1718,7 +1718,10 @@ namespace physx
 				diffuseBuffer.mNumDiffuseParticles = srcBuffer.mNumDiffuseParticlesD;
 				diffuseBuffer.mFlags = srcBuffer.mBufferFlags;
 				diffuseBuffer.mStartIndex = 0;
-				diffuseBuffer.mNumActiveDiffuseParticles = srcBuffer.mNumActiveDiffuseParticlesH;
+				// Pinned host counter the diffuse copy kernel writes through this (device-side)
+				// descriptor: store its mapped device pointer; the CPU keeps reading the host one.
+				diffuseBuffer.mNumActiveDiffuseParticles = srcBuffer.mNumActiveDiffuseParticlesH
+					? reinterpret_cast<int*>(getMappedDevicePtr(mCudaContext, srcBuffer.mNumActiveDiffuseParticlesH)) : NULL;
 				
 				numActiveParticles += srcBuffer.mNumActiveParticles;
 				numMaxParticles += srcBuffer.mMaxNumParticles;
