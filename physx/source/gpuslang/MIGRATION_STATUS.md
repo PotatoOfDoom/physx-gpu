@@ -123,15 +123,15 @@ _Phase 1 log, kept as written (its ⬜ remarks are historical; see the rows abov
 
 ## Verification
 
-The suite has **890 ctest tests** (`ctest -N` in `build-gpuslang`):
+The suite has **892 ctest tests** (`ctest -N` in `build-gpuslang`):
 
-- 511 `gpuslang.<suite>` GPU fixture suites.  Each one selects `PXG_TEST` cases of
-  `gpuslang-tests` by name substring.  The binary has **1045** cases, and every one
+- 512 `gpuslang.<suite>` GPU fixture suites.  Each one selects `PXG_TEST` cases of
+  `gpuslang-tests` by name substring.  The binary has **1047** cases, and every one
   of them is selected by at least one suite (the last unselected case,
   `triTriOverlapEngineAbi`, was renamed `npTriTriOverlap_engineAbi` so the
   `npTriTriOverlap` suite runs it);
 - 356 `gpuslang.hlsl.<entry>` HLSL cross-compile checks;
-- 23 tool tests: the 19 `tools/check_*.py` checkers, `sweepTimeoutPolicy`,
+- 24 tool tests: the 20 `tools/check_*.py` checkers, `sweepTimeoutPolicy`,
   `sweepRunners`, `vvlTriage` and `validationSubset`.
 
 They run green on llvmpipe in both memory modes.  The scene harness

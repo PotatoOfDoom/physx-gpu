@@ -7,7 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **890/890** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+Build: the official scripts build the port as the SDK's GPU module without the CUDA toolkit
+(PX_GPU_BACKEND=VULKAN; presets linux-gcc/clang-vulkan, vc17/vc18win64-vulkan; source/compiler/cmakegpuvulkan).
+Linux verified: libPhysXGpu_64.so + PhysXGpuShaders/ (178 .spv, byte-identical to the suite's), the unmodified
+SDK loader with a static core runs a GPU scene matching the CPU; the Windows build is implemented, never compiled.
 P9.99: (A) a required subgroup size is checked against the device AND the entry's workgroup shape
 (VUID 02755/02785/02760/02761/02762/02757/02756) and refused loudly instead of silently;
 check_subgroup_ops.py pins that no engine kernel depends on a subgroup width.  (C) check_push_block.py
@@ -2186,6 +2190,64 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Build — Vulkan-PhysXGpu über die offiziellen Skripte, ohne CUDA (Linux verifiziert, Windows ungebaut)
+
+**Ausgangslage.** `generate_projects.sh/.bat` konnte keinen GPU-Build ohne CUDA-Toolkit konfigurieren:
+`compiler/public/CMakeLists.txt` aktivierte die Sprache CUDA und verlangte `CUDAToolkit`, sobald die
+GPU-Projekte an waren, und der einzige PhysXGpu-Baum war der CUDA-Baum. Ein Modul, das eine
+unveränderte Anwendung laden kann, gab es nicht; die Szenen liefen nur über `sdktest` (statisch gelinkt,
+gepatchter `g_PxCreatePhysXGpu_Func`).
+
+**Umsetzung (6306a05, 026c181).**
+- Schalter `PX_GPU_BACKEND` (`CUDA` Standard, `VULKAN`). Mit `VULKAN` weder CUDA-Sprache noch Toolkit;
+  statt `cmakegpu` (unverändert) wird `source/compiler/cmakegpuvulkan` eingebunden. Statische GPU-Libs und
+  NVTX brechen mit Meldung ab.
+- `cmakegpuvulkan`: **ein** Shared-`PhysXGpu` mit Name, Ausgabeordner, Flags und CRT des CUDA-Moduls
+  (`NvidiaBuildOptions`, `_64`, `/MT`, PDB, `.rc`, Install). Quellen: gpu*-Host-Code, Bridge, Vulkan-Gerät
+  (`cmake/PxgVulkanGpuSources.cmake`, auch von `sdktest` benutzt) und die Abhängigkeitsquellen, die das
+  CUDA-Modul ebenfalls in sich kompiliert (aus `cmakegpu/PhysXGpuDependencies.cmake` gelesen). Linux mit
+  `--no-undefined`, versteckter Sichtbarkeit.
+- Shader: die 178 Dateien, die das Manifest mappt, über **dieselben** `pxg_compile_shader`-Aufrufe wie die
+  Suite (`cmake/PxgShaderList.cmake` ist die eine Liste; `PxgShaders.cmake` Befehl und Nachbearbeitung;
+  `PxgEngineShaders.cmake` die Manifest-Teilmenge mit Gegenprüfung 428 Zeilen / 178 Dateien und Abbruch,
+  wenn ein Eintrag fehlt). Kopie nach `PhysXGpuShaders/` neben dem Modul.
+- Laufzeit: die Bridge reicht Foundation und Profiler weiter wie das CUDA-Modul; Shader-Suche
+  `$PXG_SHADER_DIR` (wenn gesetzt, nur dort) → `<Modulordner>/PhysXGpuShaders` → Arbeitsverzeichnis;
+  Windows mit Wide-APIs und eigener UTF-8/UTF-16-Umwandlung (`PxWindowsInclude.h` setzt `NONLS`).
+  Der Linux-Loader verlangt `libcuda.so.1` nicht mehr.
+- MSVC-Blocker: `dynamic_cast` unter `/GR-` durch ein Register lebender Kontexte ersetzt; `alignas` statt
+  `__declspec(align(2*sizeof(long)))`; `__inline__`/`__restrict__` gemappt.
+- Presets `linux-gcc-vulkan`, `linux-clang-vulkan`, `vc17win64-vulkan`, `vc18win64-vulkan`;
+  `cmake_generate_projects.py` lässt die CUDA-Argumente weg, reicht packmans Python durch und endet jetzt
+  mit Fehlercode, wenn CMake scheitert. Snippets: keine CUDA-GL-Interop; Skinning/Isosurface entfallen
+  (`PxGetPhysicsGpu()` ist NULL).
+
+**Verifikation (Linux, nach dem Push).**
+- `generate_projects.sh linux-gcc-vulkan` ohne `nvcc`/`libcuda`: alle vier Konfigurationen. Release:
+  `bin/linux.x86_64/release/libPhysXGpu_64.so`, 12 Loader-Symbole, kein `cu*` exportiert, kein `libcuda`,
+  `RTLD_NOW`; die 178 ausgelieferten `.spv` sind byte-identisch mit denen der Suite.
+- Echter SDK-Loader, **statischer** Kern (verhält sich wie Windows), `PXG_SHADER_DIR` ungesetzt, cwd `/tmp`:
+  Pyramide + Gelenkkette laufen auf der GPU (`gpu=1`) und stimmen mit der CPU überein. Gegenproben: ohne
+  Shader sauberer Fehlschlag; **ohne `PxSetFoundationInstance` Segfault** — die Prüfung fängt den Fehler.
+- `linux-clang-vulkan` (`-Weverything -Werror`) baut. Alle 70 Snippet-Targets kompilieren; das Linken
+  scheitert hier an fehlenden System-X-Bibliotheken der packman-`libGL` (betrifft auch CPU-Snippets),
+  `SnippetHelloGRB` linkt mit geduldeten GL-Lücken und importiert kein CUDA-Symbol.
+- Negativtests (statische GPU-Libs, `FOO`, fehlendes slangc, NVTX) brechen mit Meldung ab; der
+  CUDA-Pfad scheitert unverändert an fehlendem `nvcc`. Install-Layout geprüft.
+- Suite 892/892 in beiden Modi; Szenen über das umgebaute `sdktest`: 85/85 grün plus Kontrolle (Lauf am 2-h-Limit bei 81 abgebrochen, mit `--resume` fortgesetzt).
+
+**Reviews.** Zwei unabhängige Runden. Echte Funde, alle behoben: das Manifest wurde mit `file(STRINGS)`
+gelesen und lieferte wegen `[start,end)` in Kommentaren nur 102 von 178 Shadern; die Kopierzeile hätte
+cmd.exes 8191-Zeichen-Grenze gesprengt; `MultiByteToWideChar` ist unter `NONLS` verborgen;
+`-DCMAKE_BUILD_TYPE=Release` legte die Shader nach `Release/`; Overlong-UTF-8; `SLANG_DIR`-Reihenfolge;
+sechs Doku-Aussagen. Die Suite fand zusätzlich, dass `check_unmapped_reachability.py` die Quellliste noch
+in `sdktest` suchte; Leg 3 prüft jetzt die gemeinsame Liste und beide Builds (drei eingepflanzte
+Gegenproben schlagen an). Neue Tests: `gpuslang.msvcPortability` (Checker mit Selbsttest) und
+`gpuslang.p4ModulePath` (Umwandlung über alle Codepunkte, Overlong-Gegenprobe).
+
+**Offen.** Kein MSVC hier: der Windows-Build ist umgesetzt, aber nie kompiliert. Ein echter
+Visual-Studio-Lauf (`vc18win64-vulkan`) ist der nächste Nachweis.
 
 ## P9.99 — Subgroup-Größe laut abgelehnt, Namensabgleich im Push-Block-Checker, Szene mit zwei Partikelsystemen
 

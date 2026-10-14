@@ -192,7 +192,7 @@ accumulation.
     sweeps engine wiring whose only observer is a scene.
   - `tools/run_host_mutation_sweep.py <source> <ctest-regex> <mutants-file>`
     sweeps host C++.
-- **Static checkers.** There are 19 `tools/check_*.py` checkers, all run as
+- **Static checkers.** There are 20 `tools/check_*.py` checkers, all run as
   ctests. Most of them run a self-test or negative control first, so a green
   result means the checker is working, not just quiet. They cover:
   - launch-ABI rows and host packs vs. rows vs. CUDA signatures (`check_launch_abi*.py`);
@@ -200,7 +200,8 @@ accumulation.
   - unmapped-kernel reachability and disabled/twin kernels;
   - barrier and helper uniformity, block/grid-stride coverage and fixture grids;
   - groupshared limits, subgroup ops, speculated loads and sub-word stores;
-  - vector/component divide and `length` spellings, and geometry-type constants.
+  - vector/component divide and `length` spellings, and geometry-type constants;
+  - MSVC portability of the Vulkan PhysXGpu's sources (`check_msvc_portability.py`).
 - **Foldscan.** `tools/foldscan_all.py <build-gpuslang> <out> [-j N]` scans the
   compiled `-O0 -g2` SPIR-V of every engine-reached shader for literal-zero fold
   hazards: `FSub(0,x)`, `FAdd(x,0)`, and float `FMin`/`FMax`/`FClamp`. Results
@@ -231,13 +232,13 @@ accumulation.
   largest push block is 192 B (some drivers allow only 128). Its largest
   groupshared footprint is 31744 B (the Vulkan minimum is 16384).
 
-### The test suite (`ctest`): 890 tests
+### The test suite (`ctest`): 892 tests
 
 | Group | Count | What it is |
 |---|---|---|
-| `gpuslang.<suite>` | 511 | GPU fixture suites in `gpuslang-tests`, each with many cases: Phase-1 cores; engine-ABI kernel fixtures for broadphase, narrowphase (convex/mesh/heightfield/SDF/tri-tri), solver PGS/TGS, articulations, softbody, FEM cloth and particles (PBD, diffuse); the runtime and shim (`p0`–`p6`, `p3CudaContext`, `p4Loader`, `pipelineRefusal`, …) |
+| `gpuslang.<suite>` | 512 | GPU fixture suites in `gpuslang-tests`, each with many cases: Phase-1 cores; engine-ABI kernel fixtures for broadphase, narrowphase (convex/mesh/heightfield/SDF/tri-tri), solver PGS/TGS, articulations, softbody, FEM cloth and particles (PBD, diffuse); the runtime and shim (`p0`–`p6`, `p3CudaContext`, `p4Loader`, `pipelineRefusal`, …) |
 | `gpuslang.hlsl.<entry>` | 356 | D3D12 path: `slangc -target hlsl -profile cs_6_0` cross-compile of each listed entry (HLSL only, no DXIL, no execution) |
-| tool tests | 23 | the 19 checkers, `sweepTimeoutPolicy`, `sweepRunners`, `vvlTriage`, and `validationSubset` (skipped, exit 77, when no validation layer is found) |
+| tool tests | 24 | the 20 checkers, `sweepTimeoutPolicy`, `sweepRunners`, `vvlTriage`, and `validationSubset` (skipped, exit 77, when no validation layer is found) |
 
 ### The scene harness (`gpu-sdk-step`, `tools/run_scenes.sh`): 85 rows
 
