@@ -93,9 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (P9.99b, particle2 added): 64 named scenes below, plus twenty-one explicit rows
-# after the loop (the settling bag, four softbody floors, the softbodyhex box arm, nine PGS
-# rows, three slabgrid modes, three particle2 arms) = 85.
+# Today (articulationloop added): 65 named scenes below, plus twenty-two explicit rows
+# after the loop (the settling bag, four softbody floors, the softbodyhex box arm, ten PGS
+# rows, three slabgrid modes, three particle2 arms) = 87.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -105,7 +105,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity slabgrid particleapply softbodydata
-        directapimerge sdfquery softbodyhex particle2"
+        directapimerge sdfquery softbodyhex particle2 articulationloop"
 
 pass=0; fail=0; missing=0
 
@@ -244,6 +244,12 @@ run_one "particle2 (PGS)"   PXG_SCENE=particle2 PXG_SOLVER=pgs
 run_one "particle2 (fluid)" PXG_SCENE=particle2 PXG_P2_ARM=fluid
 run_one "particle2 (apply)" PXG_SCENE=particle2 PXG_P2_ARM=apply
 run_one "particle2 (push)"  PXG_SCENE=particle2 PXG_P2_ARM=push
+
+# articulationloop: D6 joints on articulation links (self and world), held horizontal.
+# The joint rows are built by constraint1DPrePrepLaunch, which both solvers share; the
+# self constraints are solved by artiPropagateRigidImpulsesAndSolveSelfConstraints(TGS)1T,
+# a different kernel per solver -- hence the PGS row.
+run_one "articulationloop (PGS)" PXG_SCENE=articulationloop PXG_SOLVER=pgs
 
 # P9.97a: slabgrid observes the TGS averaging family (initializeSolverVelocitiesTGS,
 # computeAverageSolverBodyVelocityTGS, propagateAverageSolverBodyVelocityTGS) at the

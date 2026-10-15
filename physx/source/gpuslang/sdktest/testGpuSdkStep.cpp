@@ -2637,6 +2637,78 @@ buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     return arti;
 }
 
+// PXG_SCENE=articulationloop: D6 joints that touch ARTICULATION LINKS.  A fixed base
+// (0, 3, 0) with two free revolute links spawned horizontal, each of which would
+// swing down to hang like `articulation`'s link -- but each is held up by a
+// PxD6Joint (every axis locked, the default) at its outer tip:
+//   linkA (+x side) to linkB, a second link of the SAME articulation fixed to the
+//         base: an articulation SELF constraint, the loop-closing joint of
+//         SnippetDirectGPUAPIArticulation's scissor lift;
+//   linkC (-x side) to a world anchor: a link-to-world (static) articulation joint.
+// Until the articulation arms of updateJointsLaunch and constraint1DPrePrepLaunch
+// were ported, every D6 joint touching a link prepared 0 rows: both links swung
+// down exactly as if the joints did not exist (the scissor lift collapsed, then
+// blew up).  linkB sits 0.2 beyond linkA's tip so the two siblings never touch --
+// a contact must not be what holds linkA up.
+struct ArticulationLoopScene
+{
+    PxArticulationReducedCoordinate* arti = nullptr;
+    PxArticulationLink* linkA = nullptr;
+    PxArticulationLink* linkC = nullptr;
+};
+
+ArticulationLoopScene buildArticulationLoopScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    const float baseY = 3.0f, baseHalf = 0.2f, linkHalf = 0.5f;
+    ArticulationLoopScene r;
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    r.arti = arti;
+
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    PxShape* bs = physics->createShape(PxBoxGeometry(baseHalf, baseHalf, baseHalf), *material);
+    base->attachShape(*bs);
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), 10.0f));
+
+    auto swingLink = [&](float side) {
+        PxArticulationLink* l = arti->createLink(base, PxTransform(PxVec3(side * (baseHalf + linkHalf), baseY, 0.0f)));
+        PxShape* ls = physics->createShape(PxBoxGeometry(linkHalf, 0.1f, 0.1f), *material);
+        l->attachShape(*ls);
+        l->setMass(10.0f);
+        l->setMassSpaceInertiaTensor(boxInertia(PxVec3(linkHalf, 0.1f, 0.1f), 10.0f));
+        PxArticulationJointReducedCoordinate* j = l->getInboundJoint();
+        j->setJointType(PxArticulationJointType::eREVOLUTE);
+        j->setParentPose(PxTransform(PxVec3(side * baseHalf, 0.0f, 0.0f)));
+        j->setChildPose(PxTransform(PxVec3(-side * linkHalf, 0.0f, 0.0f)));
+        j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
+        return l;
+    };
+    r.linkA = swingLink(1.0f);
+    r.linkC = swingLink(-1.0f);
+
+    // linkB: fixed to the base, its centre 0.3 beyond linkA's tip (x = 1.2).
+    const float tipX = baseHalf + 2.0f * linkHalf;
+    PxArticulationLink* linkB = arti->createLink(base, PxTransform(PxVec3(tipX + 0.3f, baseY, 0.0f)));
+    PxShape* bsh = physics->createShape(PxBoxGeometry(0.1f, 0.1f, 0.1f), *material);
+    linkB->attachShape(*bsh);
+    linkB->setMass(1.0f);
+    linkB->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.1f), 1.0f));
+    PxArticulationJointReducedCoordinate* jb = linkB->getInboundJoint();
+    jb->setJointType(PxArticulationJointType::eFIX);
+    jb->setParentPose(PxTransform(PxVec3(tipX + 0.3f, 0.0f, 0.0f)));
+    jb->setChildPose(PxTransform(PxIdentity));
+
+    scene->addArticulation(*arti);
+
+    // all six axes eLOCKED (the PxD6Joint default): the tips are pinned.
+    PxD6JointCreate(*physics, r.linkA, PxTransform(PxVec3(linkHalf, 0.0f, 0.0f)), linkB,
+                    PxTransform(PxVec3(-0.3f, 0.0f, 0.0f)));
+    PxD6JointCreate(*physics, NULL, PxTransform(PxVec3(-tipX, baseY, 0.0f)), r.linkC,
+                    PxTransform(PxVec3(-linkHalf, 0.0f, 0.0f)));
+    return r;
+}
+
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
 // cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
 // zero initial velocity and no ground, so it is a pure free fall with NO contacts.
@@ -11618,6 +11690,62 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=articulationloop: two links held horizontal by D6 joints at their
+    // tips (one to a sibling link of the same articulation, one to the world).  Its
+    // own arm: the generic rest band (+-0.75) cannot tell held (y 3.0) from hanging
+    // (y 2.5).
+    if (!std::strcmp(sceneName, "articulationloop"))
+    {
+        ArticulationLoopScene ls = buildArticulationLoopScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'articulationloop' built: fixed base, two revolute links, %u dof(s), "
+                    "D6 tip joints link-to-link (self) and link-to-world\n", ls.arti->getDofs());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: articulationloop pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 120;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i < 2 || i % 40 == 0 || i == steps - 1)
+                std::printf("    step %3d: linkA y=%.5f  linkC y=%.5f\n", i, ls.linkA->getGlobalPose().p.y,
+                            ls.linkC->getGlobalPose().p.y);
+        }
+        int failures = 0;
+        const struct { PxArticulationLink* l; const char* label; } held[] = {
+            { ls.linkA, "linkA (self joint)" }, { ls.linkC, "linkC (world joint)" } };
+        for (const auto& h : held)
+        {
+            const PxTransform pose = h.l->getGlobalPose();
+            const float angle = std::atan2(pose.q.getBasisVector0().y, pose.q.getBasisVector0().x);
+            const float tilt = PxMin(PxAbs(angle), PxAbs(PxAbs(angle) - PxPi));
+            std::printf("  [%s] final y=%.5f, tilt %.5f rad (hanging would be y 2.5, tilt 1.571)\n", h.label,
+                        pose.p.y, tilt);
+            if (!std::isfinite(pose.p.y) || !(PxAbs(pose.p.y - 3.0f) < 0.02f) || !(tilt < 0.02f))
+            { std::printf("FAIL: [%s] is not held horizontal by its D6 joint\n", h.label); ++failures; }
+        }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (cpuControl)
+        {
+            std::printf("[ control ] gpu-sdk-step: articulationloop CPU control run (%d check(s) failed), "
+                        "not scored\n", failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'articulationloop' stepped: D6 joints on articulation "
+                        "links hold (self and world)\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: articulationloop checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // P9.79 -- PXG_SCENE=directapi.  Its own arm rather than a RestTarget, because
     // with eENABLE_DIRECT_GPU_API raised the host actor poses are no longer updated
     // by the simulation and the generic rest check would be reading a spawn pose.
@@ -13256,7 +13384,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"

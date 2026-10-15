@@ -57,6 +57,7 @@
 // pxgSlangCommon).
 import pxgSlangPrepDesc;
 import pxgSlangCommon;
+import pxgSlangArticulationDesc; // PXG_ARTI_STRIDE, PXG_ARTI_LINK_BODY2WORLDS, artiPtrField
 
 static const float FLT_MAXQ = 3.402823466e+38f;
 static const uint MAX_ROWS = 24u;
@@ -958,8 +959,14 @@ void c1dPrePrep(uint3 dtid : SV_DispatchThreadID)
 //   solver-agnostic and constraintPrePrepParallel is shared by the PGS and TGS
 //   cores), so BOTH solver paths hit this kernel.  nbD6Joints spans rigid AND
 //   arti joints; threads with threadIndex >= nbRigidJoints take the articulation
-//   branch, which is a DEFERRED no-op here (mirrors every other arti path in the
-//   port — markActiveSlab / solveBlockUnified).
+//   arm, constraint1DPrePrep<true> (L1203-1212): the artiJointData /
+//   artiConstraintPrePrep inputs, the artiConstraintData / artiConstraintRows
+//   outputs, and a link's pose from
+//   articulations[bodySims[node].articulationRemapId].linkBody2Worlds[linkId]
+//   (L1083-1113).  It was a deferred no-op until a D6 joint touching a link was
+//   measured to have EXACTLY zero effect: every articulation D6 batch read 0 rows
+//   from the never-written arti pools (SnippetDirectGPUAPIArticulation's scissor
+//   loops; link-to-body and link-to-world joints alike).
 //
 // The rigid arm is constraint1DPrePrep<false> transcribed line-for-line:
 //   - the removed-joint gate (both node indices PX_INVALID_NODE -> NO write);
@@ -1113,6 +1120,37 @@ D6In d6InFromReal(const PxgD6JointDataGpu d, float4 pose0q, float3 pose0p, float
     return s;
 }
 
+// One side's pose for constraint1DPrePrep (constraintBlockPrePrep.cu:1083-1129).
+// The articulation arm takes a LINK's pose from
+// articulations[bodySims[node].articulationRemapId].linkBody2Worlds[linkId]
+// (PxgSolverSharedDescBase: mBodySimBufferDeviceData @32, articulations @40 --
+// the base, so the PGS and TGS template instances agree); every other side, and
+// every side of a rigid joint, reads solverBodyData[solverBodyIndices[node]]
+// (PX_INVALID_NODE -> solver body 0) and getTransform()s the aligned pose.
+void d6JointPose(uint2 igNodeIndex, bool hasArticulationLink, Ptr<uint> solverBodyIndices,
+                 Ptr<PxgSolverBodyData> solverBodyData, out float4 q, out float3 p)
+{
+    const uint nodeIndex = igNodeIndex.x;   // PxNodeIndex::index()
+    if (hasArticulationLink && nodeIndexIsArticulation(igNodeIndex))
+    {
+        Ptr<uint64_t> shared = Ptr<uint64_t>(gC1dLaunch.sharedDesc);
+        Ptr<PxgBodySim> bodySims = Ptr<PxgBodySim>(shared[4]);   // @32
+        const uint64_t articulations = shared[5];                 // @40
+        const uint articulationId = bodySims[nodeIndex].articulationRemapId;
+        const uint linkId = nodeIndexArticulationLinkId(igNodeIndex);
+        const uint64_t a = articulations + uint64_t(articulationId) * PXG_ARTI_STRIDE;
+        // linkBody2Worlds: PxTransform (28 B) -- q at 0, p at 16
+        Ptr<float> t = Ptr<float>(artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS) + uint64_t(linkId) * 28u);
+        q = float4(t[0], t[1], t[2], t[3]);
+        p = float3(t[4], t[5], t[6]);
+        return;
+    }
+    const uint sbIndex = nodeIndex == PX_INVALID_NODE_J ? 0u : solverBodyIndices[nodeIndex];
+    const PxgSolverBodyData body = solverBodyData[sbIndex];
+    q = body.body2World.q;       // PxAlignedTransform::getTransform()
+    p = body.body2World.p.xyz;
+}
+
 [shader("compute")]
 [numthreads(128, 1, 1)]
 void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
@@ -1131,15 +1169,13 @@ void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
     if (threadIndex >= nbTotalJoints)
         return;
 
-    // articulation joints (else branch of the .cu): DEFERRED no-op, exactly like
-    // every other articulation path in the port.
-    if (threadIndex >= nbRigidJoints)
-        return;
+    // threadIndex >= nbRigidJoints: the articulation arm (L1201-1213), index
+    // threadIndex - nbRigidJoints into the arti pools.
+    const bool hasArticulationLink = threadIndex >= nbRigidJoints;
+    const uint jointDataIndex = hasArticulationLink ? threadIndex - nbRigidJoints : threadIndex;
 
-    const uint jointDataIndex = threadIndex;
-
-    Ptr<PxgConstraintPrePrepGpu> prePrep =
-        Ptr<PxgConstraintPrePrepGpu>(desc[0].rigidConstraintPrePrep);
+    Ptr<PxgConstraintPrePrepGpu> prePrep = Ptr<PxgConstraintPrePrepGpu>(
+        hasArticulationLink ? desc[0].artiConstraintPrePrep : desc[0].rigidConstraintPrePrep);
     const PxgConstraintPrePrepGpu pp = prePrep[jointDataIndex];
 
     const uint nodeIndexA = pp.mNodeIndexA.x;   // PxNodeIndex::index()
@@ -1156,17 +1192,13 @@ void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
     Ptr<uint> solverBodyIndices = Ptr<uint>(desc[0].solverBodyIndices);
     Ptr<PxgSolverBodyData> solverBodyData = Ptr<PxgSolverBodyData>(desc[0].mSolverBodyData);
 
-    const uint sbIndexA = nodeIndexA == PX_INVALID_NODE_J ? 0u : solverBodyIndices[nodeIndexA];
-    const uint sbIndexB = nodeIndexB == PX_INVALID_NODE_J ? 0u : solverBodyIndices[nodeIndexB];
+    float4 pose0q, pose1q;
+    float3 pose0p, pose1p;
+    d6JointPose(pp.mNodeIndexA, hasArticulationLink, solverBodyIndices, solverBodyData, pose0q, pose0p);
+    d6JointPose(pp.mNodeIndexB, hasArticulationLink, solverBodyIndices, solverBodyData, pose1q, pose1p);
 
-    const PxgSolverBodyData bodyA = solverBodyData[sbIndexA];
-    const PxgSolverBodyData bodyB = solverBodyData[sbIndexB];
-    const float4 pose0q = bodyA.body2World.q;       // PxAlignedTransform::getTransform()
-    const float3 pose0p = bodyA.body2World.p.xyz;
-    const float4 pose1q = bodyB.body2World.q;
-    const float3 pose1p = bodyB.body2World.p.xyz;
-
-    Ptr<PxgD6JointDataGpu> jointData = Ptr<PxgD6JointDataGpu>(desc[0].rigidJointData);
+    Ptr<PxgD6JointDataGpu> jointData = Ptr<PxgD6JointDataGpu>(
+        hasArticulationLink ? desc[0].artiJointData : desc[0].rigidJointData);
     const PxgD6JointDataGpu d = jointData[jointDataIndex];
 
     uint trig = 0u;
@@ -1194,7 +1226,8 @@ void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
     const uint numRows = buf.n;
     const uint constraintsStartIndex = jointDataIndex * DY_MAX_CONSTRAINT_ROWS;
 
-    Ptr<Px1DConstraintGpu> constraintRows = Ptr<Px1DConstraintGpu>(desc[0].constraintRows);
+    Ptr<Px1DConstraintGpu> constraintRows = Ptr<Px1DConstraintGpu>(
+        hasArticulationLink ? desc[0].artiConstraintRows : desc[0].constraintRows);
     for (uint i = 0u; i < numRows; ++i)
     {
         const C1D c = buf.r[i];
@@ -1210,7 +1243,8 @@ void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
         constraintRows[constraintsStartIndex + i] = row;
     }
 
-    Ptr<PxgConstraintDataGpu> constraintData = Ptr<PxgConstraintDataGpu>(desc[0].constraintData);
+    Ptr<PxgConstraintDataGpu> constraintData = Ptr<PxgConstraintDataGpu>(
+        hasArticulationLink ? desc[0].artiConstraintData : desc[0].constraintData);
     PxgConstraintDataGpu cd;
     cd.mInvMassScale = d.invMassScale;             // passthrough from jointData
     cd.mRaWorld_linBreakForceW = float4(ra, pp.mLinBreakForce);

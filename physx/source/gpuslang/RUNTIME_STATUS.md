@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+Articulation D6 joints: updateJointsLaunch's articulation branch and constraint1DPrePrepLaunch's
+articulation arm were deferred no-ops, so every D6 joint touching a link prepared 0 rows (bit-identical
+to no joint; SnippetDirectGPUAPIArticulation's scissor lift collapsed).  Ported; PXG_SCENE=articulationloop
+(self + world joint on links, TGS and PGS rows; both partial fixes and the old state fail it).
 PBF neighbour lists: ps_selfCollisionLaunch wrote every neighbour past the 32 cached ones into particle
 0's mCollisionIndex column (the CUDA pointer is pre-offset by globalThreadIndex); dense fluid saw <= 32
 neighbours, drifted into the +x/+z corner of SnippetPBFMultiMat (>18000 particles in one grid cell, the
@@ -2200,6 +2204,41 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Artikulation — D6-Gelenke an Links hatten auf der GPU null Wirkung
+
+**Ausgangslage.** Rückmeldung vom RX-9070-XT-System: in SnippetDirectGPUAPIArticulation „explodiert
+die Hebebühne“. Nachgestellt mit einem Headless-Harness (Snippet-Szene, GPU mit Direct-GPU-API, GPU mit
+normaler API, CPU): CPU fährt die Bühne hoch (Oberkante 3,6 → 6,7), GPU sackt ab (Frame 30: 2,35 statt
+4,44), ab Frame ~40 fliegen die Boxen davon. Direct-API und normale API liefern dieselben Zahlen.
+
+**Eingrenzung.** GPU mit D6-Schleifengelenken und GPU OHNE sie: bitgleich. `PXG_LAUNCH_TRACE` zeigt
+`constraint1DPrePrepLaunch`, `artiTGSJointConstraintBlockPrepareParallelLaunch`, `updateJointsLaunch`
+als einzige Zusatz-Launches. Workflow (Host-Seite, Prep-Kernel, Solve-Kernel; adversarial gegengeprüft):
+Host-Klassifizierung, Zählung, Self-Batches und der Self-Constraint-Solve sind treu portiert; leer sind
+die Zeilen. Zwei als „DEFERRED no-op“ zurückgestellte Zweige:
+- `updateJointsLaunch` (`bodyUpdate.slang`), `blockIdx.y == 1`: die Arti-D6-Pools auf dem Gerät
+  behielten die 0xFFFFFFFF-Füllung des Hosts;
+- `constraint1DPrePrepLaunch` (`npD6JointPrep.slang`), Arti-Arm: `artiConstraintData` /
+  `artiConstraintRows` wurden nie geschrieben — jede Arti-D6-Batch hatte 0 Zeilen.
+Betroffen war JEDES D6-Gelenk mit einem Link: Link–Link derselben Artikulation (Self), Link–Starrkörper,
+Link–Welt.
+
+**Fix.** Beide Zweige portiert (updateBodiesAndShapes.cu:962-995, constraintBlockPrePrep.cu:1083-1213):
+gleiche Kopie über die mD6Arti*-Pools; der Arti-Arm nimmt die Link-Pose aus
+`articulations[bodySims[node].articulationRemapId].linkBody2Worlds[linkId]` (PxgSolverSharedDescBase
+@32/@40, in PGS- und TGS-Instanz gleich), sonst wie der Starrkörper-Arm.
+
+**Test.** Neue Szene `PXG_SCENE=articulationloop` (+ PGS-Zeile in run_scenes.sh): feste Basis, zwei
+freie Drehgelenk-Links, je an der Spitze per D6 gehalten — einer an einem zweiten Link derselben
+Artikulation, einer an der Welt; geprüft wird y = 3 ± 0,02 und Neigung < 0,02 rad nach 120 Schritten.
+Mit Fix: 3,00000 / 0,00000 (TGS und PGS, wie die CPU-Kontrolle). Alter Stand und jeder Teil-Fix allein
+(nur Prep, nur Update): beide Links hängen (2,50 / 1,50 rad), FAIL.
+
+**Offen.** Die Bühne hält jetzt und fährt bis Frame 9 deckungsgleich mit der CPU, explodiert aber beim
+Aufsetzen der Boxen. Eigener Fehler, auch ohne D6 reproduzierbar: GPU-Kontakte Starrkörper–Artikulation
+explodieren unter TGS (PGS: Boxen rutschen ab), sobald 8 gestapelte Boxen auf einem Link liegen
+(7 gestapelt, 8 nebeneinander und 8 ohne Artikulation sind stabil). In Arbeit.
 
 ## PBF — Nachbarlisten ab dem 33. Nachbarn landeten in der Spalte von Partikel 0
 

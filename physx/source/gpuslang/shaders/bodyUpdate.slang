@@ -389,9 +389,11 @@ void updateBodyExternalVelocitiesLaunch(uint3 dispatchThreadId : SV_DispatchThre
 // one joint; the copy is a pure byte scatter (no arithmetic), so the strided
 // per-lane loop below is byte-identical to the CUDA warpCopy.
 //
-// Engine launch pack: a single (const PxgUpdatedJointsDesc*) -> {8}.  The arti
-// branch (blockIdx.y == 1) is a documented DEFERRED no-op, mirroring every other
-// articulation path in the port.
+// Engine launch pack: a single (const PxgUpdatedJointsDesc*) -> {8}.  blockIdx.y
+// == 1 is the articulation branch (L962): the same copy over the mD6Arti* pools.
+// It was a deferred no-op until a D6 joint touching an articulation link was
+// measured to have EXACTLY zero effect (SnippetDirectGPUAPIArticulation's scissor
+// loops): the device arti pools kept the host's 0xFFFFFFFF fill.
 static const uint PXG_D6_JOINT_DATA_WORDS = 112u;      // sizeof(PxgD6JointData) / 4 = 448/4
 static const uint PXG_CONSTRAINT_PREPREP_WORDS = 8u;   // sizeof(PxgConstraintPrePrep) / 4 = 32/4
 
@@ -429,31 +431,34 @@ void updateJointsLaunch(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_Gro
     if (gUpdateJointsAbi.jointDesc == 0)
         return;
 
-    // articulation branch (blockIdx.y == 1): DEFERRED no-op.
-    if (groupId.y != 0u)
-        return;
-
     Ptr<PxgUpdatedJointsDescGpu> desc = Ptr<PxgUpdatedJointsDescGpu>(gUpdateJointsAbi.jointDesc);
 
-    const uint nbUpdatedJoints = desc[0].mNbUpdatedRigidJoints;
+    // blockIdx.y == 0: rigid pools; otherwise the articulation pools (L962-995).
+    const bool arti = groupId.y != 0u;
+    const uint64_t jointCpuPool = arti ? desc[0].mD6ArtiJointCPUPool : desc[0].mD6RigidJointCPUPool;
+    const uint64_t jointGpuPool = arti ? desc[0].mD6ArtiJointGPUPool : desc[0].mD6RigidJointGPUPool;
+    const uint64_t prePrepCpuPool = arti ? desc[0].mD6ArtiJointPrePrepCPUPool : desc[0].mD6RigidJointPrePrepCPUPool;
+    const uint64_t prePrepGpuPool = arti ? desc[0].mD6ArtiJointPrePrepGPUPool : desc[0].mD6RigidJointPrePrepGPUPool;
+    const uint64_t updatedIndices = arti ? desc[0].mUpdatedArtiJointIndices : desc[0].mUpdatedRigidJointIndices;
+    const uint nbUpdatedJoints = arti ? desc[0].mNbUpdatedArtiJoints : desc[0].mNbUpdatedRigidJoints;
     const uint lane = groupThreadId.x;                                  // threadIdx.x (0..31)
     const uint globalWarpIndex = groupId.x * 8u + groupThreadId.y;      // blockIdx.x*blockDim.y + threadIdx.y
 
     if (globalWarpIndex >= nbUpdatedJoints)
         return;
 
-    Ptr<uint> updateJointIndices = Ptr<uint>(desc[0].mUpdatedRigidJointIndices);
+    Ptr<uint> updateJointIndices = Ptr<uint>(updatedIndices);
     const uint jointIndex = updateJointIndices[globalWarpIndex];
 
     // PxgD6JointData scatter: 448 bytes = 112 uints, strided across the 32 lanes.
-    Ptr<uint> srcJoint = Ptr<uint>(desc[0].mD6RigidJointCPUPool + uint64_t(jointIndex) * 448);
-    Ptr<uint> dstJoint = Ptr<uint>(desc[0].mD6RigidJointGPUPool + uint64_t(jointIndex) * 448);
+    Ptr<uint> srcJoint = Ptr<uint>(jointCpuPool + uint64_t(jointIndex) * 448);
+    Ptr<uint> dstJoint = Ptr<uint>(jointGpuPool + uint64_t(jointIndex) * 448);
     for (uint u = lane; u < PXG_D6_JOINT_DATA_WORDS; u += 32u)
         dstJoint[u] = srcJoint[u];
 
     // PxgConstraintPrePrep scatter: 32 bytes = 8 uints.
-    Ptr<uint> srcPP = Ptr<uint>(desc[0].mD6RigidJointPrePrepCPUPool + uint64_t(jointIndex) * 32);
-    Ptr<uint> dstPP = Ptr<uint>(desc[0].mD6RigidJointPrePrepGPUPool + uint64_t(jointIndex) * 32);
+    Ptr<uint> srcPP = Ptr<uint>(prePrepCpuPool + uint64_t(jointIndex) * 32);
+    Ptr<uint> dstPP = Ptr<uint>(prePrepGpuPool + uint64_t(jointIndex) * 32);
     for (uint u = lane; u < PXG_CONSTRAINT_PREPREP_WORDS; u += 32u)
         dstPP[u] = srcPP[u];
 }
