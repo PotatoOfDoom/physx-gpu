@@ -66,25 +66,20 @@
 //     (same shape as psPrimCollide.slang's findPs/findRange/findRigid).
 //
 // Deviations from CUDA (recipe policy) + llvmpipe guards:
-//   - NO 32-lane-warp assumption.  The CUDA caller's grid-stride ballot/warpScan
-//     compaction of non-empty work items into shared batches is a pure SCHEDULING
-//     optimisation — the SET of emitted contacts and the running numTotalContacts
-//     total are identical whether or not work is compacted (contact-buffer
-//     indices are already atomicAdd-order-nondeterministic, and the six radix
-//     staging arrays are sorted downstream).  It is DROPPED: every work item is
-//     processed once, in place, by the thread that owns it (same as the harness
-//     core).
-//   - the per-warp `range = warpReduction<Max>` that makes the inner ballot
-//     group-uniform is lowered to a full-BLOCK groupshared max reduction
-//     (blockMaxRange).  Iterating to the block max (>= the warp max) only adds
-//     idle rounds — extra `ind` past a lane's own cell population fail the
-//     `particleIndex < endIndex` guard, intersect stays false, so the contact set
-//     is unchanged.  A block-uniform loop bound is what lets the ballot barriers
-//     below be safe without a hardware-subgroup width.
-//   - the per-warp contact aggregation (ballot + popc prefix + ONE lane-0
-//     atomicAdd) is kept but done per 32-lane LOGICAL tile through groupshared
-//     (sMask/sStart, WARPS_PER_BLOCK of them) with full-block barriers; output-
-//     equivalent to the CUDA __ballot_sync/__shfl_sync warp path.
+//   - NO 32-lane-warp assumption.  The CUDA caller's ballot/warpScan compaction is
+//     a block prefix sum through groupshared here (see the entry).
+//   - the per-warp `range = warpReduction<Max>` round loop and the per-warp contact
+//     aggregation (ballot + popc prefix + ONE lane-0 atomicAdd per round) need a
+//     32-lane group that can be synchronised, which takes subgroup operations
+//     (forbidden in engine modules, check_subgroup_ops.py).  They were first lowered
+//     to a BLOCK-max round loop with block barriers; that made every thread run the
+//     fullest cell's rounds (~50% of SnippetPBFMultiMat's GPU time on an RX 9070 XT
+//     once the fluid settled).  Now each thread walks its own cell: count, one
+//     atomicAdd per cell, write (psPrimProcessCell).  Same contact set and count;
+//     the stream order is per cell instead of per warp round -- it was atomic-order
+//     dependent anyway, and every consumer sorts.
+//   - the CUDA wrapper's compaction of non-empty work items into full blocks IS kept
+//     (the ps_primitivesCollisionLaunch entry), in the CUDA's queue order.
 //   - descriptor / cmInput / shape / transform / bound / filter reads are direct
 //     Ptr<> loads (BDA nested-pointer walk) instead of the CUDA blockCopy-to-
 //     shared + LoadShapePair warp-broadcast; semantically identical read-fanout.
@@ -578,9 +573,6 @@ void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, u
 }
 
 // ---------------------------------------------------------------------------
-groupshared uint sRange[PS_BLOCK];    // per-thread cell population (block max)
-groupshared uint sMask[WARPS_PER_BLOCK];  // per-tile intersect ballot
-groupshared uint sStart[WARPS_PER_BLOCK]; // per-tile contact start index
 
 // P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
 // It was written out by hand fifteen times across this corpus; every copy was checked
@@ -753,80 +745,82 @@ void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint l
     const uint64_t curPosAddr = c.curPosAddr;
     const uint64_t predPosAddr = c.predPosAddr;
     const uint64_t sortedToUnsortedAddr = c.sortedToUnsortedAddr;
-    // ---- block-uniform max cell population (llvmpipe guard: no warp shuffle) ----
-    sRange[tid] = range;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = PS_BLOCK / 2u; s > 0u; s >>= 1)
+    // Each thread walks ITS OWN cell's particles -- no block-max rounds, no barriers.
+    // Pass 1 counts the cell's contacts, one atomicAdd reserves them as a contiguous
+    // run, pass 2 recomputes and writes them (the test is deterministic, so the two
+    // passes agree).  The CUDA aggregates per warp instead (ballot + one atomic per
+    // warp per particle round) and loops to the WARP's largest cell; the port had
+    // lowered that to the BLOCK's largest cell with three block barriers per round,
+    // because a 32-lane tile cannot be synchronised without subgroup operations
+    // (check_subgroup_ops.py).  Once a fluid settles in a container, cell
+    // populations are uneven and every one of the 256 threads ran the fullest cell's
+    // rounds: SnippetPBFMultiMat spent ~50% of its GPU time here on an RX 9070 XT.
+    // The contact SET and count are the CUDA's; the order within the stream differs
+    // (per cell instead of per warp round), and it was atomic-order dependent before.
+    uint nbContacts = 0u;
+    if (valid && startIndex != EMPTY_CELL)
     {
-        if (tid < s)
-            sRange[tid] = max(sRange[tid], sRange[tid + s]);
-        GroupMemoryBarrierWithGroupSync();
+        for (uint particleIndex = startIndex; particleIndex < endIndex; ++particleIndex)
+        {
+            float3 normal;
+            float distance;
+            if (psPrimTestParticle(systems, psId, rigidId, particleIndex, curPosAddr, predPosAddr,
+                                   sortedToUnsortedAddr, enableCCD, isTGS, cDistance, rigidQ, rigidP,
+                                   rigidType, rigidScale, normal, distance))
+                ++nbContacts;
+        }
     }
-    const uint blockMaxRange = sRange[0];
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint ind = 0u; ind < blockMaxRange; ++ind)
+    if (nbContacts == 0u)
+        return;
+    uint contactIndex = 0u;
+    InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], nbContacts, contactIndex);
+    for (uint particleIndex = startIndex; particleIndex < endIndex; ++particleIndex)
     {
-        bool intersect = false;
-        float3 normal = float3(0, 0, 0);
-        float distance = 0.0f;
-        uint2 compressed = uint2(0, 0);
-
-        if (valid && startIndex != EMPTY_CELL)
+        float3 normal;
+        float distance;
+        if (psPrimTestParticle(systems, psId, rigidId, particleIndex, curPosAddr, predPosAddr,
+                               sortedToUnsortedAddr, enableCCD, isTGS, cDistance, rigidQ, rigidP,
+                               rigidType, rigidScale, normal, distance))
         {
-            const uint particleIndex = startIndex + ind;
-            if (particleIndex < endIndex)
-            {
-                const float3 currentPos = Ptr<float4>(curPosAddr)[particleIndex].xyz;
-
-                float3 cVolumePos;
-                float cVolumeRadius;
-                if (enableCCD)
-                {
-                    const float3 predictedPos = Ptr<float4>(predPosAddr)[particleIndex].xyz;
-                    cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, false, isTGS);
-                }
-                else
-                {
-                    cVolumeRadius = cDistance;
-                    cVolumePos = currentPos;
-                }
-
-                compressed = uint2(particleIndex, psId); // PxEncodeParticleIndex
-                const uint2 particleMask = uint2(Ptr<uint>(sortedToUnsortedAddr)[particleIndex], psId);
-
-                if (!findPs(systems, psId, rigidId, particleMask))
-                    intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
-                                                           rigidQ, rigidP, rigidType, rigidScale,
-                                                           enableCCD, normal, distance);
-            }
+            writeContact(contactIndex, float4(normal, distance - restDistance),
+                         uint2(particleIndex, psId) /* PxEncodeParticleIndex */, rigidId);
+            ++contactIndex;
         }
-
-        // ---- per-32-lane-tile contact aggregation (one atomicAdd per tile) ----
-        const uint threadMask = (1u << lane) - 1u;
-        if (lane == 0u) sMask[warpId] = 0u;
-        GroupMemoryBarrierWithGroupSync();
-        if (intersect) InterlockedOr(sMask[warpId], 1u << lane);
-        GroupMemoryBarrierWithGroupSync();
-        const uint mask = sMask[warpId];
-        const uint nbToLock = countbits(mask);
-        const uint contactIndex = countbits(mask & threadMask);
-        if (lane == 0u)
-        {
-            uint s = 0u;
-            if (nbToLock != 0u)
-                InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], nbToLock, s);
-            sStart[warpId] = s;
-        }
-        GroupMemoryBarrierWithGroupSync();
-        const uint contactStartIndex = sStart[warpId];
-
-        if (intersect)
-            writeContact(contactStartIndex + contactIndex,
-                         float4(normal, distance - restDistance), compressed, rigidId);
-        GroupMemoryBarrierWithGroupSync();
     }
 }
+
+// One particle of a cell against the rigid shape (the CUDA loop body,
+// cudaParticleSystem.cu psPrimitivesCollision): speculative volume, the
+// particle-rigid filter, then the primitive test.
+bool psPrimTestParticle(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint particleIndex,
+                        uint64_t curPosAddr, uint64_t predPosAddr, uint64_t sortedToUnsortedAddr,
+                        bool enableCCD, bool isTGS, float cDistance, float4 rigidQ, float3 rigidP,
+                        uint rigidType, float3 rigidScale, out float3 normal, out float distance)
+{
+    normal = float3(0, 0, 0);
+    distance = 0.0f;
+    const float3 currentPos = Ptr<float4>(curPosAddr)[particleIndex].xyz;
+
+    float3 cVolumePos;
+    float cVolumeRadius;
+    if (enableCCD)
+    {
+        const float3 predictedPos = Ptr<float4>(predPosAddr)[particleIndex].xyz;
+        cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, false, isTGS);
+    }
+    else
+    {
+        cVolumeRadius = cDistance;
+        cVolumePos = currentPos;
+    }
+
+    const uint2 particleMask = uint2(Ptr<uint>(sortedToUnsortedAddr)[particleIndex], psId);
+    if (findPs(systems, psId, rigidId, particleMask))
+        return false;
+    return particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius, rigidQ, rigidP, rigidType, rigidScale,
+                                      enableCCD, normal, distance);
+}
+
 
 groupshared uint sWork[PS_BLOCK];     // compacted non-empty work items (cudaParticleSystem.cu shWorkIndices)
 groupshared uint sScan[PS_BLOCK];     // block prefix sum of "this item's cell is non-empty"
