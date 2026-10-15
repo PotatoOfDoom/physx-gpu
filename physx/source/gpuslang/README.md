@@ -118,6 +118,19 @@ The device has two memory modes, and the suite runs in both:
 - **`PXG_DEVICE_V2=1`:** device-local buffers with staged transfers and
   timeline-semaphore synchronisation.
 
+In the default mode, bulk buffers are placed in VRAM when the whole of it is
+host-visible (resizable BAR / UMA: a `DEVICE_LOCAL|HOST_VISIBLE` type on a heap of
+at least 1 GiB), otherwise in host-visible system memory. Pinned
+(`cuMemHostAlloc`) memory prefers CPU-cached system memory in both modes.
+
+Transfers follow CUDA's stream model. An async copy whose host side is pinned
+(`memcpyHtoDAsync` / `memcpyDtoHAsync`) is recorded into the stream as a device
+copy that reads or writes the pinned bytes when it executes. Other uploads are
+snapshotted through the staging ring, also recorded. Only downloads into
+pageable memory, the synchronous forms, and stream/event synchronisation wait for
+the GPU. Event records do not submit; `eventQuery`/`eventSynchronize` do, and so
+does a `bpSignalComplete` launch, whose pinned flag the engine spin-waits on.
+
 The engine bridge and `gpuslang-tests` parse `PXG_DEVICE_V2` with the same
 helper (`include/PxgSlangEnv.h`):
 
@@ -323,7 +336,14 @@ Notes:
   - `PXG_LAUNCH_TRACE=1` names every kernel launch on stderr;
   - `PXG_SYNC_EACH=1` waits for the GPU after every dispatch, so with the trace the
     last launch line before a device error is the kernel that caused it;
-  - `PXG_VERBOSE=1` reports how many registry kernels have no SPIR-V port.
+  - `PXG_VERBOSE=1` reports how many registry kernels have no SPIR-V port, and
+    names each unmarked kernel argument that carries a pinned host address
+    (`[pxg-hostptr]`, once per argument). These are left untranslated: they are
+    either address tags or pointers the engine already mapped; a kernel that
+    dereferences one needs a `hostPtrMask` bit in `bridge/PxgVulkanKernelAbi.cpp`;
+  - `PXG_SYNC_STATS=1` prints, every 2000 launches and at exit, the launches,
+    host transfers (recorded, staged, drained) and synchronisations
+    (`[pxg-xfer]`), plus the dispatches recorded without a barrier (`[pxg-sync]`).
 - The bridge serializes all GPU calls with one process-wide lock: PhysX launches
   from several worker threads at once, which the CUDA driver allows and a Vulkan
   command buffer does not (found on an AMD RX 9070 XT, the first real GPU the port

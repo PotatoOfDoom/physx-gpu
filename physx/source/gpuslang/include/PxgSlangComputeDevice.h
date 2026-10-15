@@ -237,6 +237,13 @@ public:
     virtual void wait(uint64_t /*ticket*/) {}
     virtual bool poll(uint64_t /*ticket*/) { return true; }
 
+    // The ticket the work recorded so far WILL carry, without submitting it (a CUDA
+    // event record: a marker, not a flush); isSubmitted() says whether that ticket's
+    // batch has been handed to the device yet -- if not, submit() before wait()/poll().
+    // Defaults keep the submit-at-record behaviour for backends without lazy tickets.
+    virtual uint64_t pendingTicket() { return submit(); }
+    virtual bool isSubmitted(uint64_t /*ticket*/) const { return true; }
+
     // ---- Phase-2 runtime capabilities (RUNTIME_PLAN.md) ----
     // Additive with conservative defaults so backends opt in individually.
 

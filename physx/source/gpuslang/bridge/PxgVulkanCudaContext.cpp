@@ -724,7 +724,10 @@ public:
         return record(res);
     }
 
-    // ---- copies (async == sync: P3 serializes on one queue) ----
+    // ---- copies ----
+    // One queue serializes every stream.  An async copy whose host side is pinned is
+    // recorded into it (no drain); the synchronous forms, and async copies to or from
+    // pageable memory, complete before returning (PxgCudaShim::memcpy*).
     PxCUresult memcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) override
     {
         std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
@@ -735,7 +738,7 @@ public:
     {
         std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
-        return record(mShim->memcpyDtoH(dstHost, PxgDevicePtr(srcDevice), ByteCount));
+        return record(mShim->memcpyDtoHAsync(dstHost, PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) override
     {
@@ -747,7 +750,7 @@ public:
     {
         std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
         if (mAbort) return mLastResult;
-        return record(mShim->memcpyHtoD(PxgDevicePtr(dstDevice), srcHost, ByteCount));
+        return record(mShim->memcpyHtoDAsync(PxgDevicePtr(dstDevice), srcHost, ByteCount));
     }
     PxCUresult memcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream /*hStream*/) override
     {

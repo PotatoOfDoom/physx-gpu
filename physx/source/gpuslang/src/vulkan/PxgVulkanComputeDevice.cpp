@@ -1008,6 +1008,18 @@ public:
         }
 
         vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProperties);
+        // Resizable BAR / UMA: a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type on a large
+        // heap (a plain BAR window is 256 MiB).  The default memory mode then keeps its
+        // host-visible bulk buffers in VRAM.
+        for (uint32_t i = 0; i < mMemoryProperties.memoryTypeCount; ++i)
+        {
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            const VkMemoryType& t = mMemoryProperties.memoryTypes[i];
+            if ((t.propertyFlags & want) == want &&
+                mMemoryProperties.memoryHeaps[t.heapIndex].size >= VkDeviceSize(1024) * 1024 * 1024)
+                mLargeHostVisibleVram = true;
+        }
 
         return true;
     }
@@ -1076,10 +1088,40 @@ public:
 
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(mDevice, buf.buffer, &memReq);
-        const uint32_t memoryType = hostVisible
-            ? findMemoryType(memReq.memoryTypeBits,
-                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-            : findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // Memory type: the REQUIRED properties decide correctness, the preference only
+        // speed (a fallback type is tried when the preferred one cannot be allocated).
+        //   pinned (persistentMap): system memory, CPU-cached when offered -- the engine
+        //     reads results back through these mappings, and reads from write-combined
+        //     memory are an order of magnitude slower;
+        //   default-mode bulk buffers (hostVisible): VRAM when all of it is host-visible
+        //     (resizable BAR, UMA), else system memory -- kernels read and write these,
+        //     and over PCIe that bounds every kernel;
+        //   v2 bulk buffers: DEVICE_LOCAL.
+        const VkMemoryPropertyFlags hostFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t memoryType = kNoMemoryType;
+        uint32_t fallbackType = kNoMemoryType;
+        if (persistentMap)
+        {
+            memoryType = findMemoryTypePreferred(memReq.memoryTypeBits, hostFlags, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            fallbackType = findMemoryType(memReq.memoryTypeBits, hostFlags);
+        }
+        else if (hostVisible)
+        {
+            memoryType = mLargeHostVisibleVram
+                ? findMemoryType(memReq.memoryTypeBits, hostFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                : kNoMemoryType;
+            fallbackType = findMemoryType(memReq.memoryTypeBits, hostFlags);
+        }
+        else
+            memoryType = findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryType == kNoMemoryType)
+        {
+            memoryType = fallbackType;
+            fallbackType = kNoMemoryType;
+        }
+        if (memoryType == fallbackType)
+            fallbackType = kNoMemoryType;
         if (memoryType == kNoMemoryType)
             return refuseBuffer(buf, caller, sizeBytes, "no memory type with the required properties", VK_SUCCESS);
 
@@ -1091,6 +1133,12 @@ public:
         allocInfo.allocationSize = memReq.size;
         allocInfo.memoryTypeIndex = memoryType;
         r = madeOrNull(allocateMemoryCounted(&allocInfo, &buf.memory), &buf.memory);
+        if (r != VK_SUCCESS && fallbackType != kNoMemoryType)
+        {
+            // e.g. the host-visible VRAM heap is full: the slower type still works.
+            allocInfo.memoryTypeIndex = fallbackType;
+            r = madeOrNull(allocateMemoryCounted(&allocInfo, &buf.memory), &buf.memory);
+        }
         if (r != VK_SUCCESS)
             return refuseBuffer(buf, caller, sizeBytes, "vkAllocateMemory", r);
         r = vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0);
@@ -1198,24 +1246,12 @@ public:
             memcpy(static_cast<uint8_t*>(buf.mappedPtr) + dstOffset, data, sizeBytes);
             return;
         }
-        if (buf.hostVisible)
-        {
-            // cuMemcpyHtoD is stream-ordered: drain prior recorded/in-flight
-            // GPU work before the direct host write, so a fillBuffer/copyBuffer
-            // or dispatch cannot clobber this upload out of order.  Cheap when
-            // idle (submit returns the last ticket, already retired).
-            flush();
-            void* mapped = nullptr;
-            PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, dstOffset, sizeBytes, 0, &mapped));
-            memcpy(mapped, data, sizeBytes);
-            vkUnmapMemory(mDevice, buf.memory);
-            return;
-        }
-
-        // Staged path: copy through the current frame's persistently mapped
-        // staging ring, recorded into the open command buffer so the copy
-        // orders exactly like a stream-ordered H2D copy — after previously
-        // recorded dispatches, before subsequent ones.
+        // Staged path, host-visible bulk buffers included: copy through the current
+        // frame's persistently mapped staging ring, recorded into the open command
+        // buffer so the copy orders exactly like a stream-ordered H2D copy -- after
+        // previously recorded dispatches, before subsequent ones.  (Host-visible
+        // buffers used to be written through a mapping, which first had to drain the
+        // queue: a GPU round trip per upload, ~100 per particle step.)
         const uint8_t* src = static_cast<const uint8_t*>(data);
         size_t remaining = sizeBytes;
         size_t off = dstOffset;
@@ -1269,30 +1305,14 @@ public:
             memcpy(data, static_cast<const uint8_t*>(buf.mappedPtr) + srcOffset, sizeBytes);
             return;
         }
-        if (buf.hostVisible)
-        {
-            // cuMemcpyDtoH is stream-ordered: drain any recorded GPU work
-            // (dispatches, copyBuffer/fillBuffer) that may write this buffer
-            // and, with a device->host domain barrier, make those writes
-            // visible to the host read.  On same-queue submission order the
-            // barrier's first scope covers prior submitted batches, so this
-            // closes the device->host visibility edge that HOST_COHERENT alone
-            // does not guarantee.
-            beginRecording();
-            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
-            flush();
-            void* mapped = nullptr;
-            PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, srcOffset, sizeBytes, 0, &mapped));
-            memcpy(data, mapped, sizeBytes);
-            vkUnmapMemory(mDevice, buf.memory);
-            return;
-        }
-
-        // Staged path: everything recorded so far must have retired before
-        // the readback copy of a device-local buffer is recorded.
-        flush();
+        // Host-visible bulk buffers (default memory mode) take the staged path too:
+        // with resizable BAR they live in VRAM, and CPU reads through that mapping are
+        // uncached PCIe reads; the staging ring is CPU-cached system memory.
+        // Staged path: the readback copy is recorded after everything recorded so far
+        // (stream order; the barrier orders it after prior writes to the buffer) into
+        // the free tail of this frame's staging ring, then one flush retires both.
+        // (This used to flush first so the copy could start at staging offset 0 -- a
+        // second GPU round trip per download.)
         uint8_t* dst = static_cast<uint8_t*>(data);
         size_t remaining = sizeBytes;
         size_t off = srcOffset;
@@ -1301,18 +1321,30 @@ public:
             beginRecording();
             Frame& f = mFrames[mFrameIndex];
             ensureStaging(f);
-            const size_t chunk = remaining < kStagingBytes ? remaining : kStagingBytes;
+            const size_t avail = kStagingBytes - f.stagingOffset;
+            if (avail == 0)
+            {
+                flush(); // ring exhausted: retire this batch, continue on a fresh frame
+                continue;
+            }
+            const size_t chunk = remaining < avail ? remaining : avail;
+            const size_t stagingOffset = f.stagingOffset;
 
-            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            VkBufferCopy region = { off, 0, chunk };
+            VkBufferCopy region = { off, stagingOffset, chunk };
             vkCmdCopyBuffer(mCommandBuffer, buf.buffer, f.staging, 1, &region);
             bufferBarrier(f.staging, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+            f.stagingOffset += chunk;
 
+            // The frame's staging slice stays untouched until the frame slot is begun
+            // again, which first waits for -- and resets -- it; nothing is recorded in
+            // between, so the read below sees the copied bytes.
             Frame* recorded = &f;
             flush();
-            memcpy(dst, recorded->stagingMapped, chunk);
+            memcpy(dst, recorded->stagingMapped + stagingOffset, chunk);
 
             dst += chunk;
             off += chunk;
@@ -2436,6 +2468,16 @@ public:
         if (!mRecording)
             return mLastTicket;
 
+        // Make every device write of the batch available to the host domain: kernels
+        // and recorded DtoH copies write pinned memory that the CPU reads after waiting
+        // on this batch (HOST_COHERENT alone does not cover the device->host edge).
+        {
+            VkMemoryBarrier hostBarrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+            vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
+        }
         PXG_VK_CHECK(vkEndCommandBuffer(mCommandBuffer));
         Frame& f = mFrames[mFrameIndex];
 
@@ -2508,6 +2550,23 @@ public:
     void flush() override
     {
         wait(submit());
+    }
+
+    // With timeline semaphores the open recording will be submitted as ticket
+    // mTimelineValue + 1 (submit() is the only place that advances it).  Without
+    // them every submission is blocking and complete on return (ticket 0); a
+    // marker inside an open recording is then "1", pending until submitted.
+    uint64_t pendingTicket() override
+    {
+        if (mHasTimeline)
+            return mRecording ? mTimelineValue + 1 : mLastTicket;
+        return mRecording ? 1u : 0u;
+    }
+    bool isSubmitted(uint64_t ticket) const override
+    {
+        if (mHasTimeline)
+            return ticket <= mLastTicket;
+        return ticket == 0;
     }
 
     // After VK_ERROR_DEVICE_LOST: print what the driver knows about the fault and map
@@ -2672,6 +2731,24 @@ private:
     // kNoMemoryType when no type matches (P9.98 check round 0: it returned type 0 with an
     // assert-only complaint, i.e. allocated from whatever type 0 is in Release).
     static const uint32_t kNoMemoryType = ~0u;
+    // First type with the `required` and `preferred` flags and none of `avoid`; else
+    // the first with `required` and `preferred`; else findMemoryType(required).
+    uint32_t findMemoryTypePreferred(uint32_t typeBits, VkMemoryPropertyFlags required,
+                                     VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags avoid) const
+    {
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            for (uint32_t i = 0; i < mMemoryProperties.memoryTypeCount; ++i)
+            {
+                const VkMemoryPropertyFlags f = mMemoryProperties.memoryTypes[i].propertyFlags;
+                if ((typeBits & (1u << i)) && (f & (required | preferred)) == (required | preferred) &&
+                    (pass == 1 || (f & avoid) == 0))
+                    return i;
+            }
+        }
+        return findMemoryType(typeBits, required);
+    }
+
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) const
     {
         for (uint32_t i = 0; i < mMemoryProperties.memoryTypeCount; ++i)
@@ -2727,9 +2804,11 @@ private:
         vkGetBufferMemoryRequirements(mDevice, f.staging, &req);
         VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex = findMemoryType(
-            req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        // The staging ring carries every v2 transfer; without it the device cannot work.
+        // CPU-cached when offered: downloads read the ring back on the CPU.
+        alloc.memoryTypeIndex = findMemoryTypePreferred(
+            req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // The staging ring carries every staged transfer; without it the device cannot work.
         PXG_VK_CHECK(alloc.memoryTypeIndex == kNoMemoryType ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS);
         PXG_VK_CHECK(allocateMemoryCounted(&alloc, &f.stagingMemory));
         PXG_VK_CHECK(vkBindBufferMemory(mDevice, f.staging, f.stagingMemory, 0));
@@ -2872,6 +2951,7 @@ private:
     VkCommandBuffer mCommandBuffer = VK_NULL_HANDLE;
     VkFence mFence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties mMemoryProperties = {};
+    bool mLargeHostVisibleVram = false;
 
     std::unordered_map<PxgBufferHandle, Buffer> mBuffers;
     std::unordered_map<PxgPipelineHandle, Pipeline> mPipelines;

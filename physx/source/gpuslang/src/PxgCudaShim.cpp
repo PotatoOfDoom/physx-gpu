@@ -192,6 +192,60 @@ bool PxgCudaShim::resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* 
     return false;
 }
 
+// PXG_SYNC_STATS=1: count the host transfers and synchronisations the engine asks
+// for, by how they were carried out -- recorded into the stream as a device copy,
+// staged (snapshot through the staging ring, recorded), or drained (the queue is
+// flushed and waited for).  Drains and synchronisations are the GPU round trips; a
+// running total is printed every 2000 launches and at exit.
+namespace
+{
+struct TransferStats
+{
+    enum Kind { HtoDRecorded, HtoDStaged, HtoDDrained, DtoHRecorded, DtoHDrained, StreamSync, EventSync, EventRecord, Launch, KindCount };
+    uint64_t count[KindCount] = {};
+    uint64_t bytes[KindCount] = {};
+    void print() const
+    {
+        std::fprintf(stderr,
+                     "[pxg-xfer] launches %llu | HtoD recorded %llu (%llu B) staged %llu (%llu B) drained %llu (%llu B) | "
+                     "DtoH recorded %llu (%llu B) drained %llu (%llu B) | streamSync %llu eventSync %llu eventRecord %llu\n",
+                     (unsigned long long)count[Launch], (unsigned long long)count[HtoDRecorded],
+                     (unsigned long long)bytes[HtoDRecorded], (unsigned long long)count[HtoDStaged],
+                     (unsigned long long)bytes[HtoDStaged], (unsigned long long)count[HtoDDrained],
+                     (unsigned long long)bytes[HtoDDrained], (unsigned long long)count[DtoHRecorded],
+                     (unsigned long long)bytes[DtoHRecorded], (unsigned long long)count[DtoHDrained],
+                     (unsigned long long)bytes[DtoHDrained], (unsigned long long)count[StreamSync],
+                     (unsigned long long)count[EventSync], (unsigned long long)count[EventRecord]);
+    }
+    ~TransferStats() { print(); }
+};
+void noteTransfer(TransferStats::Kind kind, size_t bytes)
+{
+    static const bool enabled = std::getenv("PXG_SYNC_STATS") != nullptr;
+    if (!enabled)
+        return;
+    static TransferStats stats;   // destroyed -- and printed -- at exit
+    stats.count[kind] += 1;
+    stats.bytes[kind] += bytes;
+    if (kind == TransferStats::Launch && stats.count[kind] % 2000 == 0)
+        stats.print();
+}
+}
+
+bool PxgCudaShim::resolvePinnedRange(const void* host, size_t bytes, PxgBufferHandle* buffer, size_t* offset) const
+{
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+    const PxgDevicePtr dev = hostGetDevicePointer(host);
+    if (dev == 0 || !resolve(dev, buffer, offset))
+        return false;
+    const Alloc& a = std::prev(mAllocs.upper_bound(dev))->second;
+    return bytes <= a.size - *offset;
+}
+
+// cuMemcpyHtoD is synchronous: the source is consumed before the call returns.  It
+// is snapshotted through the device's staging path (recorded, stream-ordered).  A
+// PINNED source may still be written by recorded or in-flight GPU work -- a kernel
+// or an async DtoH into it -- so that case drains first, as the CUDA call would wait.
 PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t bytes)
 {
     std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
@@ -199,6 +253,33 @@ PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t byte
     size_t off;
     if (!resolveRange(dst, bytes, &buf, &off, "memcpyHtoD"))
         return PxgResult::InvalidValue;
+    if (hostGetDevicePointer(src))
+    {
+        noteTransfer(TransferStats::HtoDDrained, bytes);
+        mDevice->flush();
+    }
+    else
+        noteTransfer(TransferStats::HtoDStaged, bytes);
+    mDevice->upload(buf, src, bytes, off);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memcpyHtoDAsync(PxgDevicePtr dst, const void* src, size_t bytes)
+{
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+    PxgBufferHandle buf, srcBuf;
+    size_t off, srcOff;
+    if (!resolveRange(dst, bytes, &buf, &off, "memcpyHtoDAsync"))
+        return PxgResult::InvalidValue;
+    if (resolvePinnedRange(src, bytes, &srcBuf, &srcOff) && srcBuf != buf)
+    {
+        // Pinned source: a device copy that reads it when it executes (CUDA's DMA).
+        noteTransfer(TransferStats::HtoDRecorded, bytes);
+        mDevice->copyBuffer(buf, off, srcBuf, srcOff, bytes);
+        return PxgResult::Success;
+    }
+    // Pageable source: CUDA stages it before returning -- a snapshot, as here.
+    noteTransfer(TransferStats::HtoDStaged, bytes);
     mDevice->upload(buf, src, bytes, off);
     return PxgResult::Success;
 }
@@ -210,6 +291,28 @@ PxgResult PxgCudaShim::memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes)
     size_t off;
     if (!resolveRange(src, bytes, &buf, &off, "memcpyDtoH"))
         return PxgResult::InvalidValue;
+    noteTransfer(TransferStats::DtoHDrained, bytes);
+    mDevice->download(buf, dst, bytes, off);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memcpyDtoHAsync(void* dst, PxgDevicePtr src, size_t bytes)
+{
+    std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+    PxgBufferHandle buf, dstBuf;
+    size_t off, dstOff;
+    if (!resolveRange(src, bytes, &buf, &off, "memcpyDtoHAsync"))
+        return PxgResult::InvalidValue;
+    if (resolvePinnedRange(dst, bytes, &dstBuf, &dstOff) && dstBuf != buf)
+    {
+        // Pinned destination: a device copy into it, complete -- and visible to the
+        // host -- once the engine synchronises (stream/event/context), as in CUDA.
+        noteTransfer(TransferStats::DtoHRecorded, bytes);
+        mDevice->copyBuffer(dstBuf, dstOff, buf, off, bytes);
+        return PxgResult::Success;
+    }
+    // Pageable destination: CUDA completes such a copy before returning.
+    noteTransfer(TransferStats::DtoHDrained, bytes);
     mDevice->download(buf, dst, bytes, off);
     return PxgResult::Success;
 }
@@ -393,6 +496,7 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
             : mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
     if (!recorded)
         return PxgResult::NotFound;
+    noteTransfer(TransferStats::Launch, 0);
 
     // P9.85: CUDA runs the kernels of one stream in order, and the device
     // interface's equivalent is barrier() -- "orders successive dispatches"
@@ -405,6 +509,15 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
     // stream records next -- and a batch boundary is already ordered (each
     // submission waits on the one before it).
     mDevice->barrier();
+
+    // bpSignalComplete writes a pinned flag the CPU then spin-waits on (spinWait in
+    // the broadphase, solver and simulation core), giving up after 0.1 s and falling
+    // back to a stream synchronisation.  Under CUDA the kernel reaches the GPU at
+    // once; here it would sit in the open recording until the next submit, and the
+    // spin would run into its timeout.  Submit now -- non-blocking, like CUDA's own
+    // launch.
+    if (id < mManifestCount && mManifest[id].cudaName && std::strcmp(mManifest[id].cudaName, "bpSignalComplete") == 0)
+        mDevice->submit();
 
     // PXG_SYNC_EACH=1: drain the queue after every dispatch so a shader-side
     // fault (e.g. a stray BDA dereference) is attributed to the exact kernel
@@ -443,6 +556,7 @@ PxgResult PxgCudaShim::streamSynchronize(PxgStreamId /*stream*/)
 {
     std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
     // One queue: syncing any stream drains all recorded + submitted work.
+    noteTransfer(TransferStats::StreamSync, 0);
     mDevice->flush();
     return PxgResult::Success;
 }
@@ -474,11 +588,13 @@ PxgResult PxgCudaShim::eventRecord(uint32_t event, PxgStreamId /*stream*/)
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
-    // Enqueue a marker after all prior work: submit the recorded batch
-    // (non-blocking) and capture its ticket.  submit() with nothing recorded
-    // returns the most recent ticket, so back-to-back records are harmless.
-    const uint64_t ticket = mDevice->submit();
+    // A marker after all prior work: the ticket the recorded batch will carry.  It
+    // is NOT submitted here -- a CUDA event record does not flush either, and the
+    // particle solver records ~85 events per step, each a separate batch while this
+    // submitted.  eventSynchronize/eventQuery submit the batch when they need it.
+    const uint64_t ticket = mDevice->pendingTicket();
     it->second = ticket;
+    noteTransfer(TransferStats::EventRecord, 0);
     mLastLaunchTicket = ticket;
     return PxgResult::Success;
 }
@@ -489,6 +605,11 @@ PxgResult PxgCudaShim::eventSynchronize(uint32_t event)
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
+    noteTransfer(TransferStats::EventSync, 0);
+    // Submit a still-pending marker's batch first: waiting on an unsubmitted timeline
+    // value would never return.
+    if (!mDevice->isSubmitted(it->second))
+        mDevice->submit();
     mDevice->wait(it->second);
     return PxgResult::Success;
 }
@@ -499,6 +620,10 @@ PxgResult PxgCudaShim::eventQuery(uint32_t event)
     auto it = mEvents.find(event);
     if (it == mEvents.end())
         return PxgResult::NotFound;
+    // A query must make progress: a pending marker's batch is submitted first,
+    // otherwise a poll loop would spin on work that never reaches the device.
+    if (!mDevice->isSubmitted(it->second))
+        mDevice->submit();
     return mDevice->poll(it->second) ? PxgResult::Success : PxgResult::InvalidValue;
 }
 

@@ -125,6 +125,13 @@ public:
     PxgResult memcpyHtoD(PxgDevicePtr dst, const void* src, size_t bytes);
     PxgResult memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes);
     PxgResult memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t bytes);
+    // cuMemcpyHtoDAsync / cuMemcpyDtoHAsync.  When the host side lies in a pinned
+    // allocation the copy is RECORDED into the stream as a device copy -- read or
+    // written when it executes, exactly like CUDA's DMA from/to pinned memory -- and
+    // nothing is drained; the engine synchronises before it reads the destination.
+    // Pageable host memory takes the synchronous paths above (CUDA stages those too).
+    PxgResult memcpyHtoDAsync(PxgDevicePtr dst, const void* src, size_t bytes);
+    PxgResult memcpyDtoHAsync(void* dst, PxgDevicePtr src, size_t bytes);
     PxgResult memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWords);
 
     // ---- pinned host memory (cuMemHostAlloc / cuMemHostGetDevicePointer
@@ -199,6 +206,9 @@ private:
     // allocation" -- the transfer entry points' check (InvalidValue otherwise).
     bool resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* buffer, size_t* offset,
                       const char* caller) const;
+    // The pinned allocation holding [host, host + bytes): its buffer and offset.  false
+    // (silently) for pageable memory or a range that leaves the allocation.
+    bool resolvePinnedRange(const void* host, size_t bytes, PxgBufferHandle* buffer, size_t* offset) const;
 
     struct Alloc
     {

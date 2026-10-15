@@ -402,4 +402,114 @@ PXG_TEST(p3ShimPinned)
     shim.memFree(dy);
 }
 
+
+// The async transfer model (stream-ordered, no drain).  memcpyDtoHAsync into pinned
+// memory and memcpyHtoDAsync out of it are recorded as device copies that touch the
+// pinned bytes WHEN THEY EXECUTE, as CUDA's DMA does:
+//   * a DtoHAsync into pinned memory, then an HtoDAsync of the same bytes, must carry
+//     the kernel's result -- a call-time snapshot of the pinned source (the v2 staged
+//     upload before this model) reads the bytes from before the DtoH ran;
+//   * an HtoDAsync from PAGEABLE memory is a snapshot (CUDA stages it before
+//     returning): overwriting the source right after the call must not leak through;
+//   * a synchronous HtoD from pinned memory a kernel is still writing must see the
+//     write (it waits, as cuMemcpyHtoD does);
+//   * an event recorded behind pending work makes progress under eventQuery polling
+//     and eventSynchronize (event records no longer submit; the queries must).
+PXG_TEST(p3ShimAsyncPinned)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    struct AxpyBuffers { uint64_t x, y, out; };
+    struct AxpyParams { AxpyBuffers bufs; float alpha; uint32_t count; };
+    const PxgKernelDef manifest[] = {
+        { "npShimAxpy.spv", "shimAxpy", uint32_t(sizeof(AxpyParams)), 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &shimLoader);
+
+    const uint32_t N = 4096;
+    void* hp = nullptr;
+    if (shim.memHostAlloc(&hp, N * 4) != PxgResult::Success)
+    {
+        std::printf("  NOTE: no pinned-mapped support on this backend -> skip\n");
+        return;
+    }
+    void* hq = nullptr;
+    PXG_CHECK_MSG(shim.memHostAlloc(&hq, N * 4) == PxgResult::Success, "memHostAlloc q");
+    PxgDevicePtr dx = 0, dy = 0, dout = 0, dcopy = 0, dsnap = 0, dsync = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dx, N * 4) == PxgResult::Success, "memAlloc x");
+    PXG_CHECK_MSG(shim.memAlloc(&dy, N * 4) == PxgResult::Success, "memAlloc y");
+    PXG_CHECK_MSG(shim.memAlloc(&dout, N * 4) == PxgResult::Success, "memAlloc out");
+    PXG_CHECK_MSG(shim.memAlloc(&dcopy, N * 4) == PxgResult::Success, "memAlloc copy");
+    PXG_CHECK_MSG(shim.memAlloc(&dsnap, N * 4) == PxgResult::Success, "memAlloc snap");
+    PXG_CHECK_MSG(shim.memAlloc(&dsync, N * 4) == PxgResult::Success, "memAlloc sync");
+
+    std::vector<float> x(N), y(N), ref(N);
+    std::mt19937 rng(0xA5A5);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        x[i] = float(int(rng() % 4001) - 2000) * 0.25f;
+        y[i] = float(int(rng() % 4001) - 2000) * 0.5f;
+        ref[i] = 3.0f * x[i] + y[i];
+    }
+    PXG_CHECK(shim.memcpyHtoD(dx, x.data(), N * 4) == PxgResult::Success);
+    PXG_CHECK(shim.memcpyHtoD(dy, y.data(), N * 4) == PxgResult::Success);
+    shim.streamSynchronize();
+    std::memset(hp, 0xcd, N * 4);   // stale pattern the copies must not deliver
+
+    AxpyParams prm;
+    prm.bufs.x = dx;
+    prm.bufs.y = dy;
+    prm.bufs.out = dout;
+    prm.alpha = 3.0f;
+    prm.count = N;
+    PXG_CHECK(shim.launchKernel(0, (N + 63) / 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success);
+    PXG_CHECK_MSG(shim.memcpyDtoHAsync(hp, dout, N * 4) == PxgResult::Success, "DtoHAsync into pinned");
+    PXG_CHECK_MSG(shim.memcpyHtoDAsync(dcopy, hp, N * 4) == PxgResult::Success, "HtoDAsync from pinned");
+
+    // Pageable async source: a snapshot.  Overwrite it right after the call.
+    std::vector<float> pageable(x);
+    PXG_CHECK_MSG(shim.memcpyHtoDAsync(dsnap, pageable.data(), N * 4) == PxgResult::Success, "HtoDAsync pageable");
+    std::fill(pageable.begin(), pageable.end(), -1.0f);
+
+    // Event behind the pending work: polling must make progress (bounded).
+    uint32_t ev = 0;
+    PXG_CHECK(shim.eventCreate(&ev) == PxgResult::Success);
+    PXG_CHECK(shim.eventRecord(ev, 0) == PxgResult::Success);
+    bool done = false;
+    for (uint32_t i = 0; i < 2000000 && !done; ++i)
+        done = shim.eventQuery(ev) == PxgResult::Success;
+    PXG_CHECK_MSG(done, "eventQuery on a recorded event reports completion (the batch is submitted)");
+    PXG_CHECK(shim.eventSynchronize(ev) == PxgResult::Success);
+
+    const float* pinned = static_cast<const float*>(hp);
+    PXG_CHECK_MSG(std::memcmp(pinned, ref.data(), N * 4) == 0, "DtoHAsync delivered the kernel result into pinned memory");
+    std::vector<float> got(N, 0.f);
+    PXG_CHECK(shim.memcpyDtoH(got.data(), dcopy, N * 4) == PxgResult::Success);
+    PXG_CHECK_MSG(std::memcmp(got.data(), ref.data(), N * 4) == 0,
+                  "HtoDAsync from pinned read the bytes the earlier DtoHAsync wrote (execution-time read)");
+    PXG_CHECK(shim.memcpyDtoH(got.data(), dsnap, N * 4) == PxgResult::Success);
+    PXG_CHECK_MSG(std::memcmp(got.data(), x.data(), N * 4) == 0,
+                  "HtoDAsync from pageable memory is a call-time snapshot");
+
+    // Synchronous HtoD from pinned memory a recorded kernel writes.
+    std::memset(hq, 0xcd, N * 4);
+    prm.bufs.out = shim.hostGetDevicePointer(hq);
+    PXG_CHECK(shim.launchKernel(0, (N + 63) / 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success);
+    PXG_CHECK(shim.memcpyHtoD(dsync, hq, N * 4) == PxgResult::Success);
+    shim.streamSynchronize();
+    PXG_CHECK(shim.memcpyDtoH(got.data(), dsync, N * 4) == PxgResult::Success);
+    PXG_CHECK_MSG(std::memcmp(got.data(), ref.data(), N * 4) == 0,
+                  "synchronous HtoD from pinned memory waits for the kernel writing it");
+
+    shim.eventDestroy(ev);
+    shim.memFree(dx);
+    shim.memFree(dy);
+    shim.memFree(dout);
+    shim.memFree(dcopy);
+    shim.memFree(dsnap);
+    shim.memFree(dsync);
+    shim.memFreeHost(hp);
+    shim.memFreeHost(hq);
+}
+
 }  // namespace
