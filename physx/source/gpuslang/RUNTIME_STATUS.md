@@ -12,6 +12,10 @@ Articulation D6 joints: updateJointsLaunch's articulation branch and constraint1
 articulation arm were deferred no-ops, so every D6 joint touching a link prepared 0 rows (bit-identical
 to no joint; SnippetDirectGPUAPIArticulation's scissor lift collapsed).  Ported; PXG_SCENE=articulationloop
 (self + world joint on links, TGS and PGS rows; both partial fixes and the old state fail it).
+markActiveSlabTGS/PGS: the articulation half was a deferred no-op; once an island has more than
+gpuMaxNumPartitions (8) partitions a body with a link contact was under-counted for mass splitting
+(8 stacked boxes on a link: TGS exploded, PGS slid off).  Ported; PXG_SCENE=articulationstack (+ PGS).
+SnippetDirectGPUAPIArticulation now tracks the CPU for 300 frames (lift top within 5 mm).
 PBF neighbour lists: ps_selfCollisionLaunch wrote every neighbour past the 32 cached ones into particle
 0's mCollisionIndex column (the CUDA pointer is pre-offset by globalThreadIndex); dense fluid saw <= 32
 neighbours, drifted into the +x/+z corner of SnippetPBFMultiMat (>18000 particles in one grid cell, the
@@ -2235,10 +2239,34 @@ Artikulation, einer an der Welt; geprüft wird y = 3 ± 0,02 und Neigung < 0,02 
 Mit Fix: 3,00000 / 0,00000 (TGS und PGS, wie die CPU-Kontrolle). Alter Stand und jeder Teil-Fix allein
 (nur Prep, nur Update): beide Links hängen (2,50 / 1,50 rad), FAIL.
 
-**Offen.** Die Bühne hält jetzt und fährt bis Frame 9 deckungsgleich mit der CPU, explodiert aber beim
-Aufsetzen der Boxen. Eigener Fehler, auch ohne D6 reproduzierbar: GPU-Kontakte Starrkörper–Artikulation
-explodieren unter TGS (PGS: Boxen rutschen ab), sobald 8 gestapelte Boxen auf einem Link liegen
-(7 gestapelt, 8 nebeneinander und 8 ohne Artikulation sind stabil). In Arbeit.
+**Zweiter Fehler: Slab-Markierung.** Die Bühne hielt danach und fuhr bis Frame 9 deckungsgleich mit der
+CPU, explodierte aber beim Aufsetzen der Boxen — auch ohne D6 reproduzierbar: 8 gestapelte Boxen auf einem
+Link explodieren unter TGS (PGS: sie rutschen ab); 7 gestapelt, 8 nebeneinander und 8 ohne Artikulation
+sind stabil. Workflow (Experimente + drei Code-Vergleiche, gegengeprüft): 7 → 8 ist die Grenze
+`gpuMaxNumPartitions` = 8 — darüber teilt der Solver die Insel in Slabs. `markActiveSlabTGS/PGS`
+zählen für das Mass-Splitting, in wie vielen Slabs ein Körper aktiv ist; ihre ARTIKULATIONS-Hälfte
+(`blockIdx.y == 1`, solverMultiBlockTGS.cu:1233 / solverMultiBlock.cu:211) war ein „DEFERRED no-op“.
+Eine Box mit Link-Kontakt in einem Slab und Box-Kontakt in einem anderen zählte einen Slab zu wenig,
+ihre Geschwindigkeitsänderungen pro Slab wurden summiert statt gemittelt — Verstärkung ~2 pro Iteration.
+Belege: Limit 16/32 → 8 Boxen ruhen exakt; Limit 1 → schon 2 gestapelte Boxen explodieren; dieselben
+Stapel auf einer statischen Box (nur Starrkörper, mehrere Slabs) ruhen.
+
+**Fix.** Beide Hälften portiert (`markActiveSlabArticulationTGS/PGS`, dazu
+`checkExtActiveContactBlock(TGS)Bda` — die Ext-Prädikate mit `cfm` in der Einheitsantwort; Link-
+Geschwindigkeit aus dem 192-/128-float4-Staging der Batch, Starrkörper aus dem akkumulierten deltaV; das
+Artikulations-Bit an `remappedBody + numDynamicBodies + bodyOffset`). Neue Szene
+`PXG_SCENE=articulationstack` (+ PGS-Zeile): 8 Boxen in zwei 2×2-Lagen auf einem Link, jede muss auf
+± 0,02 ruhen. Mit Fix: 2,50000 / 3,00000, |v| = 0 (TGS, PGS, CPU-Kontrolle). Alter Stand: TGS y = 18594,
+PGS rutscht ab — FAIL. `push_block_known.txt`: `constraint1DPrePrepLaunch` liest jetzt jedes Argument
+(Eintrag entfernt); `markActiveSlab*` `artiDesc` ist „dead-upstream“ (auch die CUDA liest es nicht).
+
+**Ergebnis.** SnippetDirectGPUAPIArticulation (Harness, 300 Frames, llvmpipe) folgt der CPU: Oberkante
+3,610 → 6,724 gegen 3,610 → 6,709 (Frame 270: 6,7096 / 6,7090), die Boxen fahren oben mit (Drift 1–2 cm),
+normale API und Direct-GPU-API identisch.
+
+**Noch offen (eigene Aufgabe).** `push_block_known.txt` führt weitere „deferred“-Artikulationspfade:
+FEM-Cloth- und Soft-Body-Kontakte/Anhänge an Starrkörpern lesen `artiCoreDesc` nicht — ihr
+Artikulationszweig fehlt (Cloth/Soft-Body an einem Artikulations-Link).
 
 ## PBF — Nachbarlisten ab dem 33. Nachbarn landeten in der Spalte von Partikel 0
 

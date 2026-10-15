@@ -98,13 +98,12 @@ cloth_solveRigidClothAttachmentTGSLaunch               5@40+8:artiCoreDesc;8@64+
 cloth_solveRigidClothCollisionLaunch                   6@48+8:artiCoreDesc                                            # deferred
 cloth_solveRigidClothCollisionTGSLaunch                6@48+8:artiCoreDesc                                            # deferred
 cloth_updateClothContactValidityLaunch                 7@48+4:dt                                                      # dead-upstream
-constraint1DPrePrepLaunch                              1@8+8:sharedDesc                                               # deferred
 convexHeightFieldMidphase                              9@64+8:cmOutputs                                               # dead-upstream
 convexHeightfieldPostProcess                           2@16+8:cvxTriIntermPtr                                         # dead-upstream
 convexTrimeshCorrelate                                 5@40+8:cmOutputs;10@72+8:pTempContactIndex                     # dead-upstream
 convexTrimeshPostProcess                               2@16+8:cvxTriIntermPtr                                         # dead-upstream
-markActiveSlabPGS                                      4@24+8:artiDesc                                                # deferred
-markActiveSlabTGS                                      6@32+8:artiDesc                                                # deferred
+markActiveSlabPGS                                      4@24+8:artiDesc                                                # dead-upstream
+markActiveSlabTGS                                      6@32+8:artiDesc                                                # dead-upstream
 markAddedAndDeletedAggregatedBounds                    1@8+8:aggDesc                                                  # dead-upstream
 midphaseGeneratePairs                                  9@64+8:cmOutputs                                               # dead-upstream
 preIntegrationLaunch                                   5@32+8:solverBodySleepDataPool                                 # dead-upstream

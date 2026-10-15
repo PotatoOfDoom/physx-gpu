@@ -2856,10 +2856,15 @@ void solveBlockUnified(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
 // The CUDA body is a single `if (batchIndex < endIndex)` (no strided loop), so
 // the grid.x is sized to cover the whole batch range in one wave — mirrored 1:1.
 //
-// RIGID PATH ONLY (this milestone): groupId.y == 0.  The engine only launches
-// blockY == 2 when the last partition has articulation batches, which a
-// rigid-only scene never produces, so markActiveSlab_articulationTGS is a
-// DEFERRED no-op early-return.
+// groupId.y == 0: markActiveSlab_rigidBodyTGS.  groupId.y == 1 (the engine
+// launches blockY == 2 when there are articulation batches, PxgSolverCore.cpp:
+// 673-686): markActiveSlab_articulationTGS (solverMultiBlockTGS.cu:1233), below.
+// The articulation half was a deferred no-op until it was measured to matter:
+// once an island needs more partitions than gpuMaxNumPartitions (default 8) it
+// is split into slabs, and a body with a link contact in one slab and a contact
+// to another body in a second slab was counted in one slab only -- its per-slab
+// velocity changes were summed instead of averaged.  Eight stacked boxes on an
+// articulation link exploded under TGS (PGS: they slid off); seven did not.
 //
 // Body-velocity staging is the accumulated deltaV layout (3 float4 per body at
 // accumulatedBodyDeltaVOffset + bodyId + k*totalBodiesIncKinematics), identical
@@ -2873,20 +2878,220 @@ struct MarkActiveSlabTGSAbiParams
     uint lastPartition;      // @20
     float minPen;            // @24
     float elapsedTime;       // @28
-    uint64_t artiDesc;       // @32: PxgArticulationCoreDesc* (articulation path deferred; unused here)
+    uint64_t artiDesc;       // @32: PxgArticulationCoreDesc* (unused by the CUDA body too)
 }                            // = 40 (maxAlign 8; @32 already 8-aligned, no padding)
 [[vk::push_constant]]
 ConstantBuffer<MarkActiveSlabTGSAbiParams> gMarkActiveSlabAbi;
+
+// checkExtActiveContactBlockTGS (solver.cuh:738): the articulation variant of
+// checkActiveContactBlockTGSBda above -- the ext contact header adds cfm to the
+// unit response, the target-velocity term sits inside the separation clamp, and
+// the angular velocities come from spatial vectors.  The CUDA steps a response
+// pointer it never reads; nothing to port.
+bool checkExtActiveContactBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                                      float3 linVel0, float3 angVel0, float3 linVel1, float3 angVel1,
+                                      float3 linDelta0, float3 angDelta0, float3 linDelta1, float3 angDelta1,
+                                      uint threadIndex,
+                                      Ptr<PxgTGSBlockSolverContactHeader> contactHeaders,
+                                      Ptr<PxgTGSBlockSolverContactPoint> contactPoints,
+                                      float elapsedTime, float minPen)
+{
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
+
+    const uint numNormalConstr = contactHeaders[constraintBatchIndex].numNormalConstr[threadIndex];
+    const float maxPenBias = contactHeaders[constraintBatchIndex].maxPenBias[threadIndex];
+    const float4 normal_staticFriction = contactHeaders[constraintBatchIndex].normal_staticFriction[threadIndex];
+    const float restitutionXdt = contactHeaders[constraintBatchIndex].restitutionXdt[threadIndex];
+    const float cfm = contactHeaders[constraintBatchIndex].cfm[threadIndex];
+    const uint flags = contactHeaders[constraintBatchIndex].flags[threadIndex] & 0xFFu;   // (PxU8)
+    const float3 normal = normal_staticFriction.xyz;
+
+    const float3 relMotion = linDelta0 - linDelta1;
+    const float deltaV = dot(normal, relMotion);
+
+    for (uint i = 0; i < numNormalConstr; i++)
+    {
+        const uint c = startConstraintIndex + i;
+
+        const float4 raXn_extraCoeff = contactPoints[c].raXn_extraCoeff[threadIndex];
+        const float3 raXn = raXn_extraCoeff.xyz;
+        const float compliantContactCoef = raXn_extraCoeff.w;
+        const float4 rbXn_targetVelW = contactPoints[c].rbXn_targetVelW[threadIndex];
+        const float appliedForce = contactPoints[c].appliedForce[threadIndex];
+        const float separation = contactPoints[c].separation[threadIndex];
+        const float maxImpulse = contactPoints[c].maxImpulse[threadIndex];
+        const float3 rbXn = rbXn_targetVelW.xyz;
+        const float targetVel = rbXn_targetVelW.w;
+        float biasCoefficient = contactPoints[c].biasCoefficient[threadIndex];
+
+        const float resp0 = contactPoints[c].resp0[threadIndex];
+        const float resp1 = contactPoints[c].resp1[threadIndex];
+        const float unitResponse = resp0 + resp1;
+        const float recipResponse = (unitResponse > 0.0f) ? (1.0f / (unitResponse + cfm)) : 0.0f;
+
+        float velMultiplier = recipResponse;
+        if (restitutionXdt < 0.0f)
+            computeCompliantContactCoefficientsTGS(flags, restitutionXdt, unitResponse, recipResponse,
+                                                   compliantContactCoef, velMultiplier, biasCoefficient);
+
+        const float v0 = dot(angVel0, raXn) + dot(linVel0, normal);
+        const float v1 = dot(angVel1, rbXn) + dot(linVel1, normal);
+        const float normalVel = v0 - v1;
+
+        const float deltaBias = deltaV + dot(angDelta0, raXn) - dot(angDelta1, rbXn) - targetVel * elapsedTime;
+
+        // PxMax / PxMin are selectMax / selectMin (PxUnixMathIntrinsics.h:116-125).
+        const float sepArg = separation + deltaBias;
+        const float sep = (minPen > sepArg) ? minPen : sepArg;
+        const float biasArg = biasCoefficient * sep;
+        const float biased = (-maxPenBias < biasArg) ? -maxPenBias : biasArg;
+        const float tVelBias = recipResponse * biased;
+
+        const float tempDeltaF = tVelBias - (normalVel - targetVel) * velMultiplier;
+        const float _deltaF = max(tempDeltaF, -appliedForce);
+        const float _newForce = appliedForce + _deltaF;
+        const float newForce = min(_newForce, maxImpulse);
+        const float deltaF = newForce - appliedForce;
+
+        if (abs(deltaF) > 1.0e-8f)
+            return true;
+    }
+    return false;
+}
+
+// markActiveSlab_articulationTGS (solverMultiBlockTGS.cu:1233-1388): the same
+// slab marking over the island's ARTICULATION batches.  A joint lane is always
+// active; a contact lane asks checkExtActiveContactBlockTGS, reading a link's
+// velocity from the per-batch 192-float4 staging (readIndex + 0/32/64 for A,
+// +96/128/160 for B, as artiSolveBlockPartition does) and a rigid body's from
+// its accumulated deltaV.  An articulation's bit goes to
+// remappedBody + numDynamicBodies + bodyOffset ("articulation IDs are at the back
+// of rigid body IDs"), a rigid body's to its bodyId when >= bodyOffset.
+void markActiveSlabArticulationTGS(uint3 groupThreadId, uint3 groupId)
+{
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gMarkActiveSlabAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescTGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescTGSGpu>(gMarkActiveSlabAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gMarkActiveSlabAbi.islandIndex];
+    PxgIslandContextGpu island0 = (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[0];
+
+    // same uniform guard as the rigid half (a constraint-free island leaves the
+    // batch pointer null).
+    if (sharedDesc.iter_blockConstraintBatch == 0 || desc.artiConstraintsPerPartition == 0)
+        return;
+
+    const uint startPartitionIndex = island.mStartPartitionIndex;
+    const uint startIndex = island.mArtiBatchStartIndex;
+    const uint articulationBatchOffset = island0.mBatchCount;
+    const uint endIndex = (Ptr<uint>(desc.artiConstraintsPerPartition))[gMarkActiveSlabAbi.lastPartition + startPartitionIndex]
+                        + articulationBatchOffset;
+
+    const uint threadIndexInWarp = groupThreadId.x;
+    const uint globalWarpIndex = groupId.x * 2u + groupThreadId.y;
+    const uint batchIndex = startIndex + globalWarpIndex + articulationBatchOffset;
+
+    const uint numDynamicBodies = island0.mBodyCount;   // nbBodies minus offset!
+    const uint bodyOffset = island.mBodyStartIndex;
+
+    if (batchIndex >= endIndex)
+        return;
+
+    Ptr<PxgBlockConstraintBatch> batches = Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
+    const uint constraintType = batches[batchIndex].descStride_constraintType >> 16;
+    if (threadIndexInWarp >= descStride)
+        return;
+
+    const uint2 igNodeIndexA = batches[batchIndex].bodyANodeIndex[threadIndexInWarp];
+    const uint2 igNodeIndexB = batches[batchIndex].bodyBNodeIndex[threadIndexInWarp];
+    const bool isArticulationA = nodeIndexIsArticulation(igNodeIndexA);
+    const bool isArticulationB = nodeIndexIsArticulation(igNodeIndexB);
+    const uint slabId = batches[batchIndex].slabId[threadIndexInWarp];
+    const uint bodyIdA = batches[batchIndex].bodyAIndex[threadIndexInWarp];
+    const uint bodyIdB = batches[batchIndex].bodyBIndex[threadIndexInWarp];
+
+    const uint numArticulations = island0.mArticulationCount;
+    const uint numTotalBodies = bodyOffset + numDynamicBodies + numArticulations;
+    const uint slabIndexOffset = (slabId / 32u) * numTotalBodies;
+    const uint encodedSlabIndex = (1u << (slabId % 32u));
+
+    bool isActiveSlab = false;
+    if (constraintType == 2u)   // PxgSolverConstraintDesc::eARTICULATION_CONSTRAINT_1D
+    {
+        // joints: simply mark the slabs active (the CUDA's own choice)
+        isActiveSlab = true;
+    }
+    else
+    {
+        Ptr<float4> vel = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+        const uint readIndex = batchIndex * 192u + threadIndexInWarp;
+        const uint outputOffset = desc.accumulatedBodyDeltaVOffset;
+        const uint totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+
+        float4 a0, a1, a2, b0, b1, b2;
+        if (isArticulationA)
+        {
+            a0 = vel[readIndex]; a1 = vel[readIndex + 32u]; a2 = vel[readIndex + 64u];
+        }
+        else
+        {
+            const uint finalIdA = outputOffset + bodyIdA;
+            a0 = vel[finalIdA]; a1 = vel[finalIdA + totalBodiesIncKinematics];
+            a2 = vel[finalIdA + 2u * totalBodiesIncKinematics];
+        }
+        if (isArticulationB)
+        {
+            b0 = vel[readIndex + 96u]; b1 = vel[readIndex + 128u]; b2 = vel[readIndex + 160u];
+        }
+        else
+        {
+            const uint finalIdB = outputOffset + bodyIdB;
+            b0 = vel[finalIdB]; b1 = vel[finalIdB + totalBodiesIncKinematics];
+            b2 = vel[finalIdB + 2u * totalBodiesIncKinematics];
+        }
+        // UnAlignedSpatialVector(top = angular, bottom = linear) from the packed
+        // float4s: bottom = vec0.xyz, top = (vec0.w, vec1.x, vec1.y); delta bottom =
+        // (vec1.z, vec1.w, vec2.x), delta top = (vec2.y, vec2.z, vec2.w).
+        isActiveSlab = checkExtActiveContactBlockTGSBda(
+            batches, batchIndex,
+            a0.xyz, float3(a0.w, a1.x, a1.y), b0.xyz, float3(b0.w, b1.x, b1.y),
+            float3(a1.z, a1.w, a2.x), float3(a2.y, a2.z, a2.w),
+            float3(b1.z, b1.w, b2.x), float3(b2.y, b2.z, b2.w),
+            threadIndexInWarp,
+            Ptr<PxgTGSBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders),
+            Ptr<PxgTGSBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints),
+            gMarkActiveSlabAbi.elapsedTime, gMarkActiveSlabAbi.minPen);
+    }
+
+    if (!isActiveSlab)
+        return;
+
+    Ptr<uint> encodedReferenceCount = Ptr<uint>(sharedDesc.iter_solverEncodedReferenceCount);
+    uint prev;
+    if (isArticulationA)
+        InterlockedOr(encodedReferenceCount[slabIndexOffset + batches[batchIndex].remappedBodyAIndex[threadIndexInWarp]
+                                            + numDynamicBodies + bodyOffset], encodedSlabIndex, prev);
+    else if (bodyIdA >= bodyOffset)
+        InterlockedOr(encodedReferenceCount[slabIndexOffset + bodyIdA], encodedSlabIndex, prev);
+
+    if (isArticulationB)
+        InterlockedOr(encodedReferenceCount[slabIndexOffset + batches[batchIndex].remappedBodyBIndex[threadIndexInWarp]
+                                            + numDynamicBodies + bodyOffset], encodedSlabIndex, prev);
+    else if (bodyIdB >= bodyOffset)
+        InterlockedOr(encodedReferenceCount[slabIndexOffset + bodyIdB], encodedSlabIndex, prev);
+}
 
 [shader("compute")]
 [numthreads(32, 2, 1)]
 void markActiveSlabTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    // Deferred articulation path: the engine only dispatches groupId.y != 0
-    // (blockY == 2) when the last partition carries articulation batches, which
-    // a rigid-only scene never produces.
     if (groupId.y != 0)
+    {
+        markActiveSlabArticulationTGS(groupThreadId, groupId);
         return;
+    }
 
     PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gMarkActiveSlabAbi.solverCoreDesc))[0];
     PxgSolverSharedDescTGSGpu sharedDesc =

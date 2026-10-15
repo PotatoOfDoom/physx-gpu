@@ -2709,6 +2709,56 @@ ArticulationLoopScene buildArticulationLoopScene(PxPhysics* physics, PxScene* sc
     return r;
 }
 
+// PXG_SCENE=articulationstack: eight boxes (half 0.25) in two stacked 2x2 layers on
+// the root link of a fixed-base articulation (box 0.5 x 0.25 x 1.5 at y = 2).  The
+// island needs more constraint partitions than gpuMaxNumPartitions (8), so the
+// solver splits it into slabs, and each lower box has its link contact in one slab
+// and its box contacts in others.  markActiveSlabTGS/PGS count a body's active
+// slabs for mass splitting; their ARTICULATION half (the link contacts) was a
+// deferred no-op, so a lower box was counted in too few slabs and its per-slab
+// velocity changes were summed instead of averaged: TGS blew up (|v| ~ 25000 by
+// step 30), PGS let the boxes slide off.  Seven boxes need 8 partitions or fewer
+// and always rested -- which is why no earlier scene saw it.
+struct ArticulationStackScene
+{
+    std::vector<PxRigidDynamic*> boxes;
+    std::vector<float> restY;
+};
+
+ArticulationStackScene buildArticulationStackScene(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    ArticulationStackScene r;
+    const float baseY = 2.0f, baseHalfY = 0.25f, half = 0.25f;
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    arti->setSolverIterationCounts(32);
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    PxShape* bs = physics->createShape(PxBoxGeometry(0.5f, baseHalfY, 1.5f), *material);
+    base->attachShape(*bs);
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f, baseHalfY, 1.5f), 10.0f));
+    scene->addArticulation(*arti);
+
+    const float topY = baseY + baseHalfY;
+    for (int i = 0; i < 8; ++i)
+    {
+        const int layer = i / 4;
+        const PxVec3 p((i % 2) * 0.5f - 0.25f, topY + 0.5f + 0.5f * float(layer), ((i / 2) % 2) * 0.5f);
+        PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(p));
+        PxShape* sh = physics->createShape(PxBoxGeometry(half, half, half), *material);
+        sh->setContactOffset(0.2f);
+        b->attachShape(*sh);
+        // density 0.5 over a 0.5^3 cube (PxRigidBodyExt is not linked into this harness)
+        const float mass = 0.5f * 0.125f;
+        b->setMass(mass);
+        b->setMassSpaceInertiaTensor(boxInertia(PxVec3(half), mass));
+        scene->addActor(*b);
+        r.boxes.push_back(b);
+        r.restY.push_back(topY + half + 2.0f * half * float(layer));
+    }
+    return r;
+}
+
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
 // cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
 // zero initial velocity and no ground, so it is a pure free fall with NO contacts.
@@ -11690,6 +11740,57 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=articulationstack: eight stacked boxes on an articulation link, an
+    // island split into slabs.  Its own arm: every box must come to rest at its
+    // stacking height (+-0.02), which the generic +-0.75 band would not check.
+    if (!std::strcmp(sceneName, "articulationstack"))
+    {
+        ArticulationStackScene st = buildArticulationStackScene(physics, scene, material);
+        std::printf("  [  OK  ] scene 'articulationstack' built: fixed-base link, 8 boxes in two 2x2 layers\n");
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: articulationstack pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 90;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i % 15 == 0 || i == steps - 1)
+                std::printf("    step %3d: box0 y=%.5f |v|=%.5f  box4 y=%.5f |v|=%.5f\n", i,
+                            st.boxes[0]->getGlobalPose().p.y, st.boxes[0]->getLinearVelocity().magnitude(),
+                            st.boxes[4]->getGlobalPose().p.y, st.boxes[4]->getLinearVelocity().magnitude());
+        }
+        int failures = 0;
+        for (size_t k = 0; k < st.boxes.size(); ++k)
+        {
+            const PxVec3 p = st.boxes[k]->getGlobalPose().p;
+            const float v = st.boxes[k]->getLinearVelocity().magnitude();
+            std::printf("  [box%zu] final y=%.5f (rest %.3f) |v|=%.5f\n", k, p.y, st.restY[k], v);
+            if (!std::isfinite(p.y) || !(PxAbs(p.y - st.restY[k]) < 0.02f) || !(v < 0.05f))
+            { std::printf("FAIL: [box%zu] is not resting in its stack\n", k); ++failures; }
+        }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (cpuControl)
+        {
+            std::printf("[ control ] gpu-sdk-step: articulationstack CPU control run (%d check(s) failed), "
+                        "not scored\n", failures);
+            return 0;
+        }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'articulationstack' stepped: eight stacked boxes rest on "
+                        "the articulation link across slabs\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: articulationstack checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=articulationloop: two links held horizontal by D6 joints at their
     // tips (one to a sibling link of the same articulation, one to the world).  Its
     // own arm: the generic rest band (+-0.75) cannot tell held (y 3.0) from hanging
@@ -13384,7 +13485,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
