@@ -123,6 +123,27 @@ host-visible (resizable BAR / UMA: a `DEVICE_LOCAL|HOST_VISIBLE` type on a heap 
 at least 1 GiB), otherwise in host-visible system memory. Pinned
 (`cuMemHostAlloc`) memory prefers CPU-cached system memory in both modes.
 
+Kernel pipelines are built when first needed, and a build compiles the SPIR-V
+in the driver -- hundreds of milliseconds for the largest kernels on real
+hardware. Two things keep that out of the simulation:
+
+- **Pipeline cache on disk.** The engine bridge keeps the driver's
+  `VkPipelineCache` in `pipeline-cache.bin` in the per-user cache directory
+  (`%LOCALAPPDATA%\PhysXGpuVulkan\` on Windows, `$XDG_CACHE_HOME/PhysXGpuVulkan/`
+  or `~/.cache/PhysXGpuVulkan/` elsewhere). It is written when a
+  `PxCudaContextManager` is released and after a warm-up. A cache made for
+  another GPU or driver is ignored. `PXG_PIPELINE_CACHE=<file>` moves it;
+  `PXG_PIPELINE_CACHE=0` turns it off.
+- **Warm-up.** Next to the cache, `pipeline-cache.bin.kernels` lists the
+  kernels earlier runs launched, in the order they were first needed. At
+  startup, background threads build exactly those pipelines from the cache,
+  without the GPU lock. A launch whose pipeline is still being built waits for
+  that build; one not reached yet is built by the launch. The first run on a
+  machine has no list and builds every pipeline at its first launch.
+  `PXG_PIPELINE_WARMUP=0` turns the warm-up off, `=all` builds every
+  launchable kernel (the listed ones first), and `=<n>` sets the number of
+  threads (default: hardware threads - 1, at most 4).
+
 Transfers follow CUDA's stream model. An async copy whose host side is pinned
 (`memcpyHtoDAsync` / `memcpyDtoHAsync`) is recorded into the stream as a device
 copy that reads or writes the pinned bytes when it executes. Other uploads are
@@ -341,6 +362,9 @@ Notes:
     (`[pxg-hostptr]`, once per argument). These are left untranslated: they are
     either address tags or pointers the engine already mapped; a kernel that
     dereferences one needs a `hostPtrMask` bit in `bridge/PxgVulkanKernelAbi.cpp`;
+  - `PXG_PIPELINE_STATS=1` prints what building each kernel's pipeline costs
+    (SPIR-V load, pipeline creation), whether a warm-up thread or a launch built
+    it, and how long a launch waited for a build in flight (`[pxg-pipe]`);
   - `PXG_SYNC_STATS=1` prints, every 2000 launches and at exit, the launches,
     host transfers (recorded, staged, drained) and synchronisations
     (`[pxg-xfer]`), plus the dispatches recorded without a barrier (`[pxg-sync]`).

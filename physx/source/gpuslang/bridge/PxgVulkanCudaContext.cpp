@@ -897,8 +897,8 @@ class PxgVulkanCudaContextManager : public physx::PxCudaContextManager
 {
 public:
     PxgVulkanCudaContextManager(PxgSlangComputeDevice* device, PxgCudaShim* shim,
-                                const PxgKernelDef* manifest, uint32_t manifestCount)
-        : mDevice(device)
+                                const PxgKernelDef* manifest, uint32_t manifestCount, void (*onRelease)())
+        : mDevice(device), mOnRelease(onRelease)
     {
         mContext = new PxgVulkanCudaContext(shim, manifest, manifestCount);
     }
@@ -968,6 +968,8 @@ protected:
     {
         if (mContext)
             mContext->release();
+        if (mOnRelease)
+            mOnRelease();
     }
 
     // ---- deprecated Internal buffer helpers: forward onto the context ----
@@ -1025,6 +1027,7 @@ protected:
 
 private:
     PxgSlangComputeDevice* mDevice;
+    void (*mOnRelease)() = nullptr;
     PxgVulkanCudaContext* mContext;
     std::atomic<unsigned> mAcquireCount{0};
     bool mConcurrentStreams = false;
@@ -1041,9 +1044,10 @@ physx::PxCudaContext* PxgCreateVulkanCudaContext(PxgCudaShim* shim, const PxgKer
 physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDevice* device,
                                                                PxgCudaShim* shim,
                                                                const PxgKernelDef* manifest,
-                                                               uint32_t manifestCount)
+                                                               uint32_t manifestCount,
+                                                               void (*onRelease)())
 {
-    return new PxgVulkanCudaContextManager(device, shim, manifest, manifestCount);
+    return new PxgVulkanCudaContextManager(device, shim, manifest, manifestCount, onRelease);
 }
 
 // ---- PxgVulkanKernelWrangler ----

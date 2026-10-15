@@ -79,12 +79,14 @@
 #include "foundation/PxErrorCallback.h"
 #include "foundation/PxFoundation.h"  // PxGetErrorCallback
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace physx
@@ -211,6 +213,13 @@ struct VulkanGpuRuntime
     PxgCudaShim* shim = nullptr;
     std::vector<PxgKernelDef> manifest;
     bool tried = false;
+    // The on-disk VkPipelineCache (empty: disabled) and the bytes last read from or
+    // written to it, so an unchanged cache is not rewritten.
+    std::string pipelineCachePath;
+    std::vector<uint8_t> pipelineCacheBytes;
+    // The kernels earlier runs launched, in first-launch order (cudaNames), read from
+    // and written to <pipelineCachePath>.kernels: what the warm-up builds next time.
+    std::vector<std::string> warmKernelNames;
 };
 
 VulkanGpuRuntime& runtimeState()
@@ -236,6 +245,140 @@ uint32_t pushConstantSizeFor(const char* cudaName)
     return row ? pxgKernelAbiPushSize(*row) : 0u;
 }
 
+bool pxgVerbose()
+{
+    const char* v = std::getenv("PXG_VERBOSE");
+    return v && std::strcmp(v, "0") != 0;
+}
+
+// PXG_PIPELINE_CACHE: unset -> <user cache dir>/pipeline-cache.bin; "" or "0" -> no
+// on-disk cache; anything else -> that file.
+std::string pipelineCachePathFromEnv()
+{
+    std::string v;
+    if (pxgGetEnv("PXG_PIPELINE_CACHE", v))
+        return (v.empty() || v == "0") ? std::string() : v;
+    const std::string dir = pxgUserCacheDirectory();
+    return dir.empty() ? std::string() : dir + "pipeline-cache.bin";
+}
+
+std::string kernelListPath(const VulkanGpuRuntime& r)
+{
+    return r.pipelineCachePath.empty() ? std::string() : r.pipelineCachePath + ".kernels";
+}
+
+// One cudaName per line.  Names this build does not know are skipped by the caller.
+std::vector<std::string> readKernelList(const std::string& path)
+{
+    std::vector<std::string> names;
+    std::vector<uint8_t> bytes;
+    if (path.empty() || !pxgReadFile(path, bytes))
+        return names;
+    std::string line;
+    for (uint8_t c : bytes)
+    {
+        if (c == '\n' || c == '\r')
+        {
+            if (!line.empty())
+                names.push_back(line);
+            line.clear();
+        }
+        else
+            line += char(c);
+    }
+    if (!line.empty())
+        names.push_back(line);
+    return names;
+}
+
+// Writes the device's pipeline cache to disk when it changed, and -- withKernelList --
+// the list of launched kernels (earlier runs' order first, this run's new ones after).
+// Called when the warm-up has built every pipeline (on its last thread; cache only)
+// and when a context manager is released; serialized by its own mutex, never under
+// the API lock.
+void persistPipelineCache(bool withKernelList)
+{
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    VulkanGpuRuntime& r = runtimeState();
+    if (!r.device || r.pipelineCachePath.empty())
+        return;
+    const size_t slash = r.pipelineCachePath.find_last_of("/\\");
+    const std::string dir = slash != std::string::npos ? r.pipelineCachePath.substr(0, slash + 1) : std::string();
+    bool madeDir = false;
+    std::vector<uint8_t> data;
+    if (r.device->getPipelineCacheData(&data) && !data.empty() && data != r.pipelineCacheBytes)
+    {
+        madeDir = dir.empty() || pxgMakeDirectories(dir);
+        if (pxgWriteFileReplace(r.pipelineCachePath, data))
+            r.pipelineCacheBytes.swap(data);
+        else if (pxgVerbose())
+            std::fprintf(stderr, "[PhysXGpuVulkan] could not write the pipeline cache to %s\n",
+                         r.pipelineCachePath.c_str());
+    }
+    if (!withKernelList || !r.shim)
+        return;
+    std::vector<std::string> names = r.warmKernelNames;
+    const size_t before = names.size();
+    for (PxgKernelId id : r.shim->launchedKernels())
+    {
+        const char* n = id < r.manifest.size() ? r.manifest[id].cudaName : nullptr;
+        if (n && std::find(names.begin(), names.end(), std::string(n)) == names.end())
+            names.push_back(n);
+    }
+    if (names.size() == before)
+        return;
+    std::vector<uint8_t> text;
+    for (const std::string& n : names)
+    {
+        text.insert(text.end(), n.begin(), n.end());
+        text.push_back(uint8_t('\n'));
+    }
+    if (!madeDir && !dir.empty())
+        pxgMakeDirectories(dir);
+    if (pxgWriteFileReplace(kernelListPath(r), text))
+        r.warmKernelNames.swap(names);
+}
+
+void persistPipelineCacheOnly()
+{
+    persistPipelineCache(false);
+}
+
+// PxCudaContextManager release: the warm-up threads are joined here (a process may
+// exit right after, and a thread still inside the driver would then race its
+// teardown), and the pipeline cache and kernel list are persisted.
+void onContextManagerRelease()
+{
+    VulkanGpuRuntime& r = runtimeState();
+    if (r.shim)
+        r.shim->stopPipelineWarmup();
+    persistPipelineCache(true);
+}
+
+// PXG_PIPELINE_WARMUP: unset -> warm up the kernels earlier runs launched (the
+// .kernels list next to the pipeline cache; nothing on a first run); "0" -> off;
+// "all" -> every launchable kernel, the listed ones first; a number -> the default
+// with that many threads.  Threads by default: hardware threads - 1, at most 4.
+unsigned warmupThreadsFromEnv(bool* all)
+{
+    *all = false;
+    std::string v;
+    if (pxgGetEnv("PXG_PIPELINE_WARMUP", v) && !v.empty())
+    {
+        if (v == "all")
+            *all = true;
+        else
+        {
+            const unsigned long n = std::strtoul(v.c_str(), nullptr, 10);
+            return unsigned(n > 64 ? 64 : n);
+        }
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned n = hw > 1 ? hw - 1 : 1;
+    return n > 4 ? 4 : n;
+}
+
 // Returns the runtime, creating it once; null if no Vulkan device is available.
 VulkanGpuRuntime* ensureRuntime()
 {
@@ -255,6 +398,15 @@ VulkanGpuRuntime* ensureRuntime()
     // PXG_DEVICE_V2: unset/""/"0" -> host-visible (default), "1" -> device-local + staged;
     // anything else warns and stays default.  Same parser as gpuslang-tests.
     desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
+    // Pipeline cache across runs: the driver's compiled pipelines are reused, so a
+    // kernel's first launch in a later run skips the SPIR-V compilation.  The device
+    // ignores a blob made for another device or driver.
+    r.pipelineCachePath = pipelineCachePathFromEnv();
+    if (!r.pipelineCachePath.empty() && pxgReadFile(r.pipelineCachePath, r.pipelineCacheBytes))
+    {
+        desc.pipelineCacheData = r.pipelineCacheBytes.data();
+        desc.pipelineCacheDataSize = r.pipelineCacheBytes.size();
+    }
     r.device = PxgCreateVulkanComputeDevice(desc);
     if (!r.device)
         return nullptr;
@@ -279,6 +431,30 @@ VulkanGpuRuntime* ensureRuntime()
 
     static PxgSpirvLoader loader = &envSpirvLoader;
     r.shim = new PxgCudaShim(r.device, r.manifest.data(), uint32_t(r.manifest.size()), loader);
+
+    // Build the pipelines of the kernels earlier runs launched in the background now,
+    // in the order they were first needed, instead of at each kernel's first launch
+    // under the API lock (PxgCudaShim::startPipelineWarmup).  With the pipeline cache
+    // from those runs the driver mostly loads rather than compiles them.
+    bool warmAll = false;
+    const unsigned warmThreads = warmupThreadsFromEnv(&warmAll);
+    r.warmKernelNames = readKernelList(kernelListPath(r));
+    std::vector<PxgKernelId> order;
+    std::vector<bool> queued(r.manifest.size(), false);
+    for (const std::string& n : r.warmKernelNames)
+        for (unsigned i = 0; i < r.manifest.size(); ++i)
+            if (!queued[i] && r.manifest[i].cudaName && n == r.manifest[i].cudaName)
+            {
+                order.push_back(PxgKernelId(i));
+                queued[i] = true;
+            }
+    if (warmAll)
+        for (unsigned i = 0; i < r.manifest.size(); ++i)
+            if (!queued[i])
+                order.push_back(PxgKernelId(i));
+    if (warmThreads > 0 && r.shim->startPipelineWarmup(order, warmThreads, &persistPipelineCacheOnly) && pxgVerbose())
+        std::fprintf(stderr, "[PhysXGpuVulkan] building %zu pipelines on %u background thread(s)\n", order.size(),
+                     warmThreads);
     return &r;
 }
 
@@ -513,7 +689,8 @@ physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& fou
     if (!r)
         return NULL;
     return physx::gpuslang::PxgCreateVulkanCudaContextManager(r->device, r->shim, r->manifest.data(),
-                                                              uint32_t(r->manifest.size()));
+                                                              uint32_t(r->manifest.size()),
+                                                              &physx::gpuslang::onContextManagerRelease);
 }
 
 void PxSetPhysXGpuProfilerCallback(physx::PxProfilerCallback* profilerCallback)

@@ -70,10 +70,14 @@ physx::PxCudaContext* PxgCreateVulkanCudaContext(PxgCudaShim* shim, const PxgKer
 // above), reports device properties from `device`, and is a no-op for the
 // per-thread CUDA-context acquire/release (a single Vulkan device needs none).
 // Released via PxCudaContextManager::release(); does not own device/shim/manifest.
+// `onRelease`, when set, runs after the manager has released its context (the
+// bridge stops the pipeline warm-up and persists the pipeline cache there: the
+// device and shim are never destroyed, so no destructor would).
 physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDevice* device,
                                                                PxgCudaShim* shim,
                                                                const PxgKernelDef* manifest,
-                                                               uint32_t manifestCount);
+                                                               uint32_t manifestCount,
+                                                               void (*onRelease)() = nullptr);
 
 // Vulkan replacement for the engine's KernelWrangler: turns a kernel id
 // (PxgKernelIds::X, the manifest index) into the CUfunction the PxCudaContext

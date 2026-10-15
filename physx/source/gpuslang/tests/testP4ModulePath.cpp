@@ -145,3 +145,55 @@ PXG_TEST(p4ModulePathFiles)
     unsetenv("PXG_P4_MODULE_PATH_ENV");
     PXG_CHECK(!pxgGetEnv("PXG_P4_MODULE_PATH_ENV", v));
 }
+
+// The pipeline-cache file helpers: the per-user cache directory (XDG_CACHE_HOME, then
+// HOME/.cache), nested directory creation, and replacing a file through a temporary
+// so a reader never sees a half-written cache.
+PXG_TEST(p4ModulePathCacheFiles)
+{
+    using physx::gpuslang::pxgUserCacheDirectory;
+    using physx::gpuslang::pxgMakeDirectories;
+    using physx::gpuslang::pxgWriteFileReplace;
+    using physx::gpuslang::pxgReadFile;
+
+    std::string savedXdg, savedHome;
+    const bool hadXdg = physx::gpuslang::pxgGetEnv("XDG_CACHE_HOME", savedXdg);
+    const bool hadHome = physx::gpuslang::pxgGetEnv("HOME", savedHome);
+
+    setenv("XDG_CACHE_HOME", "/tmp/pxgXdgCache", 1);
+    PXG_CHECK_MSG(pxgUserCacheDirectory() == "/tmp/pxgXdgCache/PhysXGpuVulkan/", "XDG_CACHE_HOME wins (%s)",
+                  pxgUserCacheDirectory().c_str());
+    setenv("XDG_CACHE_HOME", "relative/dir", 1);   // the XDG spec ignores a relative value
+    setenv("HOME", "/home/pxgUser", 1);
+    PXG_CHECK_MSG(pxgUserCacheDirectory() == "/home/pxgUser/.cache/PhysXGpuVulkan/", "HOME/.cache fallback (%s)",
+                  pxgUserCacheDirectory().c_str());
+    unsetenv("XDG_CACHE_HOME");
+    unsetenv("HOME");
+    PXG_CHECK_MSG(pxgUserCacheDirectory().empty(), "no base directory -> empty");
+    if (hadXdg)
+        setenv("XDG_CACHE_HOME", savedXdg.c_str(), 1);
+    if (hadHome)
+        setenv("HOME", savedHome.c_str(), 1);
+
+    std::string base = physx::gpuslang::pxgModuleDirectory();
+    if (base.empty())
+        base = "./";
+    const std::string dir = base + "p4CacheDir/a/b/";
+    PXG_CHECK_MSG(pxgMakeDirectories(dir), "nested directories are created");
+    PXG_CHECK_MSG(pxgMakeDirectories(dir), "existing directories are fine");
+    const std::string file = dir + "cache.bin";
+    std::vector<uint8_t> one(70000), two(123), got;
+    for (size_t i = 0; i < one.size(); ++i)
+        one[i] = uint8_t(i * 13u);
+    for (size_t i = 0; i < two.size(); ++i)
+        two[i] = uint8_t(255 - i);
+    PXG_CHECK_MSG(pxgWriteFileReplace(file, one) && pxgReadFile(file, got) && got == one, "write + read back");
+    PXG_CHECK_MSG(pxgWriteFileReplace(file, two) && pxgReadFile(file, got) && got == two,
+                  "an existing file is replaced, not appended to or merged");
+    PXG_CHECK_MSG(!pxgWriteFileReplace(base + "p4CacheDir/missing/x.bin", two), "a missing directory fails");
+    PXG_CHECK_MSG(!pxgWriteFileReplace(file, std::vector<uint8_t>()), "empty data is refused");
+    std::remove(file.c_str());
+    std::remove((base + "p4CacheDir/a/b").c_str());
+    std::remove((base + "p4CacheDir/a").c_str());
+    std::remove((base + "p4CacheDir").c_str());
+}

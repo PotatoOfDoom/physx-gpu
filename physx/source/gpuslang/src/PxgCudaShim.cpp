@@ -26,6 +26,7 @@
 
 #include "PxgCudaShim.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -39,15 +40,17 @@ namespace gpuslang
 
 PxgCudaShim::PxgCudaShim(PxgSlangComputeDevice* device, const PxgKernelDef* manifest,
                          uint32_t manifestCount, PxgSpirvLoader loader)
-    : mDevice(device), mManifest(manifest), mManifestCount(manifestCount), mLoader(loader)
+    : mDevice(device), mManifest(manifest), mManifestCount(manifestCount), mLoader(loader),
+      mSlots(manifestCount), mWarmStop(false), mWarmNext(0), mWarmActive(0)
 {
 }
 
 PxgCudaShim::~PxgCudaShim()
 {
-    for (auto& kv : mPipelines)
-        if (kv.second)
-            mDevice->destroyPipeline(kv.second);
+    stopPipelineWarmup();
+    for (const PipelineSlot& slot : mSlots)
+        if (slot.handle)
+            mDevice->destroyPipeline(slot.handle);
     for (auto& kv : mAllocs)
         mDevice->destroyBuffer(kv.second.buffer);
 }
@@ -425,14 +428,27 @@ bool pxgSpirvEntryUsesDescriptorSet(const std::vector<uint8_t>& blob, const char
     return false;
 }
 
-PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
+std::shared_ptr<const std::vector<uint8_t> > PxgCudaShim::spirvBlob(const char* file)
 {
-    auto it = mPipelines.find(id);
-    if (it != mPipelines.end())
+    const std::string key = file ? file : "";
+    // Loaded under the lock, so a file is read once however many warm-up threads want
+    // it at the same moment; reading is cheap next to the compilation that follows.
+    std::lock_guard<std::mutex> lock(mBlobMutex);
+    auto it = mBlobs.find(key);
+    if (it != mBlobs.end())
         return it->second;
+    std::shared_ptr<const std::vector<uint8_t> > blob(new std::vector<uint8_t>(mLoader(file)));
+    return mBlobs.emplace(key, blob).first->second;
+}
 
+PxgPipelineHandle PxgCudaShim::buildPipeline(PxgKernelId id, bool warmup)
+{
     const PxgKernelDef& def = mManifest[id];
-    const std::vector<uint8_t> blob = mLoader(def.spirvFile);
+    static const bool pipeStats = std::getenv("PXG_PIPELINE_STATS") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::shared_ptr<const std::vector<uint8_t> > blobPtr = spirvBlob(def.spirvFile);
+    const std::vector<uint8_t>& blob = *blobPtr;
+    const auto t1 = std::chrono::steady_clock::now();
     PxgPipelineHandle pipe = 0;
     // No ENGINE row reaches this first branch: the bridge builds every row with
     // numTextures = 0 (bridge/PhysXGpuVulkan.cpp:215-218), and no fixture launches
@@ -453,8 +469,138 @@ PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
         // device address inside the parameter blob (BDA model).
         pipe = mDevice->createPipeline(blob.data(), blob.size(), def.entry, 0, nullptr,
                                        def.pushConstantSize);
-    mPipelines[id] = pipe;
+    if (pipeStats)
+    {
+        // PXG_PIPELINE_STATS=1: what building each kernel's pipeline costs, and on
+        // which thread (a launch waits for it under the API lock; warm-up does not).
+        static std::mutex statsMutex;
+        static double totalMs = 0.0;
+        static uint32_t count = 0;
+        const auto t2 = std::chrono::steady_clock::now();
+        const double loadMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double createMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        std::lock_guard<std::mutex> lock(statsMutex);
+        totalMs += loadMs + createMs;
+        ++count;
+        std::fprintf(stderr, "[pxg-pipe] %-48s load %7.2f ms  create %8.2f ms  %s (total %9.1f ms, %u pipelines)\n",
+                     def.cudaName ? def.cudaName : (def.entry ? def.entry : "?"), loadMs, createMs,
+                     warmup ? "[warm-up]" : "[launch] ",
+                     totalMs, count);
+    }
     return pipe;
+}
+
+PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
+{
+    {
+        std::unique_lock<std::mutex> lock(mSlotMutex);
+        PipelineSlot& slot = mSlots[id];
+        if (!slot.launched)
+        {
+            slot.launched = true;
+            mLaunchOrder.push_back(id);
+        }
+        for (;;)
+        {
+            if (slot.state == kPipeReady)
+                return slot.handle;
+            if (slot.state == kPipeNone)
+            {
+                slot.state = kPipeBuilding;
+                break;
+            }
+            // A warm-up thread is building exactly this pipeline.
+            static const bool pipeStats = std::getenv("PXG_PIPELINE_STATS") != nullptr;
+            const auto w0 = std::chrono::steady_clock::now();
+            mSlotCv.wait(lock);
+            if (pipeStats && slot.state == kPipeReady)
+                std::fprintf(stderr, "[pxg-pipe] %-48s waited %7.2f ms for the warm-up build\n",
+                             mManifest[id].cudaName ? mManifest[id].cudaName : "?",
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+        }
+    }
+    const PxgPipelineHandle pipe = buildPipeline(id, false);
+    {
+        std::lock_guard<std::mutex> lock(mSlotMutex);
+        mSlots[id].handle = pipe;
+        mSlots[id].state = kPipeReady;
+        ++mBuiltCount;
+    }
+    mSlotCv.notify_all();
+    return pipe;
+}
+
+void PxgCudaShim::warmupWorker()
+{
+    for (;;)
+    {
+        if (mWarmStop.load())
+            break;
+        const uint32_t next = mWarmNext.fetch_add(1);
+        if (next >= mWarmOrder.size())
+            break;
+        const PxgKernelId id = mWarmOrder[next];
+        if (id >= mManifestCount)
+            continue;
+        const PxgKernelDef& def = mManifest[id];
+        // Launchable rows only: a row without SPIR-V or push size is refused at launch.
+        if (!def.spirvFile || !def.entry || def.pushConstantSize == 0)
+            continue;
+        {
+            std::lock_guard<std::mutex> lock(mSlotMutex);
+            if (mSlots[id].state != kPipeNone)
+                continue;
+            mSlots[id].state = kPipeBuilding;
+        }
+        const PxgPipelineHandle pipe = buildPipeline(id, true);
+        {
+            std::lock_guard<std::mutex> lock(mSlotMutex);
+            mSlots[id].handle = pipe;
+            mSlots[id].state = kPipeReady;
+            ++mBuiltCount;
+        }
+        mSlotCv.notify_all();
+    }
+    // The last thread out reports completion -- unless the warm-up was stopped.
+    if (mWarmActive.fetch_sub(1) == 1 && !mWarmStop.load() && mWarmDone)
+        mWarmDone();
+}
+
+bool PxgCudaShim::startPipelineWarmup(const std::vector<PxgKernelId>& order, unsigned threadCount,
+                                      std::function<void()> onComplete)
+{
+    if (!mDevice->supportsConcurrentPipelineCreation() || threadCount == 0 || order.empty() ||
+        !mWarmThreads.empty())
+        return false;
+    mWarmOrder = order;
+    mWarmDone = onComplete;
+    mWarmStop.store(false);
+    mWarmNext.store(0);
+    mWarmActive.store(threadCount);
+    for (unsigned i = 0; i < threadCount; ++i)
+        mWarmThreads.emplace_back(&PxgCudaShim::warmupWorker, this);
+    return true;
+}
+
+void PxgCudaShim::stopPipelineWarmup()
+{
+    mWarmStop.store(true);
+    for (std::thread& t : mWarmThreads)
+        if (t.joinable())
+            t.join();
+    mWarmThreads.clear();
+}
+
+std::vector<PxgKernelId> PxgCudaShim::launchedKernels() const
+{
+    std::lock_guard<std::mutex> lock(mSlotMutex);
+    return mLaunchOrder;
+}
+
+uint32_t PxgCudaShim::builtPipelineCount() const
+{
+    std::lock_guard<std::mutex> lock(mSlotMutex);
+    return mBuiltCount;
 }
 
 PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gridY, uint32_t gridZ,

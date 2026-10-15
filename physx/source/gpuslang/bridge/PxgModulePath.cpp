@@ -33,10 +33,15 @@
 #include "foundation/windows/PxWindowsInclude.h"
 #include <cstdio>
 #include <cstdlib>
+#include <direct.h>
+#include <process.h>
 #else
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace physx
@@ -235,6 +240,104 @@ bool pxgReadFile(const std::string& path, std::vector<uint8_t>& data)
     std::fclose(f);
     if (!ok)
         data.clear();
+    return ok;
+}
+
+std::string pxgUserCacheDirectory()
+{
+    std::string base;
+#if PX_WINDOWS_FAMILY
+    if (!pxgGetEnv("LOCALAPPDATA", base) || base.empty())
+        return std::string();
+    if (base[base.size() - 1] != '\\' && base[base.size() - 1] != '/')
+        base += '\\';
+    return base + "PhysXGpuVulkan\\";
+#else
+    if (pxgGetEnv("XDG_CACHE_HOME", base) && !base.empty() && base[0] == '/')
+    {
+        if (base[base.size() - 1] != '/')
+            base += '/';
+    }
+    else if (pxgGetEnv("HOME", base) && !base.empty())
+    {
+        if (base[base.size() - 1] != '/')
+            base += '/';
+        base += ".cache/";
+    }
+    else
+        return std::string();
+    return base + "PhysXGpuVulkan/";
+#endif
+}
+
+bool pxgMakeDirectories(const std::string& dir)
+{
+    if (dir.empty())
+        return false;
+    // Create each prefix that ends at a separator, then the whole path; "already
+    // exists" is fine at every step, the final check decides.
+    for (size_t i = 1; i <= dir.size(); ++i)
+    {
+        if (i < dir.size() && dir[i] != '/' && dir[i] != '\\')
+            continue;
+        const std::string prefix = dir.substr(0, i);
+#if PX_WINDOWS_FAMILY
+        if (prefix.size() == 2 && prefix[1] == ':')
+            continue;   // a drive ("C:")
+        _wmkdir(toWide(prefix).c_str());
+#else
+        mkdir(prefix.c_str(), 0755);
+#endif
+    }
+#if PX_WINDOWS_FAMILY
+    struct _stat64 st;
+    std::string probe = dir;
+    while (probe.size() > 3 && (probe[probe.size() - 1] == '\\' || probe[probe.size() - 1] == '/'))
+        probe.erase(probe.size() - 1);
+    return _wstat64(toWide(probe).c_str(), &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+#else
+    struct stat st;
+    return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+bool pxgWriteFileReplace(const std::string& path, const std::vector<uint8_t>& data)
+{
+    if (path.empty() || data.empty())
+        return false;
+    char suffix[48];
+#if PX_WINDOWS_FAMILY
+    std::snprintf(suffix, sizeof(suffix), ".tmp%d", _getpid());
+#else
+    std::snprintf(suffix, sizeof(suffix), ".tmp%d", int(getpid()));
+#endif
+    const std::string tmp = path + suffix;
+#if PX_WINDOWS_FAMILY
+    FILE* f = _wfopen(toWide(tmp).c_str(), L"wb");
+#else
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+#endif
+    if (!f)
+        return false;
+    const bool written = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    const bool closed = std::fclose(f) == 0;
+    bool ok = written && closed;
+#if PX_WINDOWS_FAMILY
+    if (ok)
+    {
+        // _wrename does not replace an existing file: remove it first.  Another process
+        // may slip its own file in between; then this rename fails and its file stays.
+        _wremove(toWide(path).c_str());
+        ok = _wrename(toWide(tmp).c_str(), toWide(path).c_str()) == 0;
+    }
+    if (!ok)
+        _wremove(toWide(tmp).c_str());
+#else
+    if (ok)
+        ok = std::rename(tmp.c_str(), path.c_str()) == 0;   // atomic replace on POSIX
+    if (!ok)
+        std::remove(tmp.c_str());
+#endif
     return ok;
 }
 

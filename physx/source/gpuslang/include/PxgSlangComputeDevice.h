@@ -76,6 +76,13 @@ struct PxgSlangDeviceDesc
     // pipeline (shader) compilation is reused across runs.  NULL disables
     // the on-disk cache (an in-memory cache is still used within a run).
     const char* pipelineCachePath = nullptr;
+    // Alternatively the cache's initial bytes from memory (the engine bridge reads and
+    // writes the file itself, with UTF-8 paths on Windows; see getPipelineCacheData).
+    // Used only when pipelineCachePath is NULL.  A blob whose header names another
+    // vendor, device or pipelineCacheUUID is ignored -- the driver checks that too,
+    // this keeps a buggy driver from being handed a foreign cache.
+    const void* pipelineCacheData = nullptr;
+    size_t pipelineCacheDataSize = 0;
     // P9.98 test hooks: when nonzero, LOWER the corresponding device limit to this
     // value (never raise it) before any pipeline is checked against it, so a fixture
     // can show that a kernel over a smaller device's limit is REFUSED rather than
@@ -242,6 +249,15 @@ public:
     // batch has been handed to the device yet -- if not, submit() before wait()/poll().
     // Defaults keep the submit-at-record behaviour for backends without lazy tickets.
     virtual uint64_t pendingTicket() { return submit(); }
+
+    // Pipeline creation from several threads at once (createPipeline*, nothing else):
+    // true when the backend's create calls may run concurrently with each other and
+    // with recording/dispatch on the API thread.  The shim's background warm-up
+    // (PxgCudaShim::startPipelineWarmup) is only used when this is true.
+    virtual bool supportsConcurrentPipelineCreation() const { return false; }
+    // The pipeline cache's current contents (to persist across runs); false when the
+    // backend has none.  May be called while pipelines are being created.
+    virtual bool getPipelineCacheData(std::vector<uint8_t>* /*out*/) { return false; }
     virtual bool isSubmitted(uint64_t /*ticket*/) const { return true; }
 
     // ---- Phase-2 runtime capabilities (RUNTIME_PLAN.md) ----

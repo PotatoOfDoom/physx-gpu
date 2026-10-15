@@ -37,7 +37,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -510,6 +514,128 @@ PXG_TEST(p3ShimAsyncPinned)
     shim.memFree(dsync);
     shim.memFreeHost(hp);
     shim.memFreeHost(hq);
+}
+
+
+// Pipeline warm-up (PxgCudaShim::startPipelineWarmup): background threads build the
+// pipelines of a given list of rows while the API thread launches.  Each pipeline is
+// built exactly once whoever gets there first -- a launch waits for a build in
+// flight instead of starting its own -- each SPIR-V file is loaded once for all rows
+// that share it, the completion callback runs once everything is built, and
+// launchedKernels() reports first launches in order.
+static std::atomic<unsigned> gWarmLoads(0);
+static std::vector<uint8_t> countingLoader(const char* file)
+{
+    gWarmLoads.fetch_add(1);
+    return loadShaderBlob(file);
+}
+
+static std::vector<uint8_t> slowLoader(const char* file)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const char* slash = std::strrchr(file, '/');
+    return loadShaderBlob(slash ? slash + 1 : file);
+}
+
+PXG_TEST(p3ShimWarmup)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsConcurrentPipelineCreation())
+    {
+        std::printf("  NOTE: backend does not build pipelines concurrently -> skip\n");
+        return;
+    }
+    struct AxpyBuffers { uint64_t x, y, out; };
+    struct AxpyParams { AxpyBuffers bufs; float alpha; uint32_t count; };
+    const uint32_t kRows = 12;
+    std::vector<PxgKernelDef> manifest(kRows, PxgKernelDef{ "npShimAxpy.spv", "shimAxpy", uint32_t(sizeof(AxpyParams)), 0 });
+    std::vector<physx::gpuslang::PxgKernelId> order;
+    for (uint32_t i = 0; i < kRows; ++i)
+        order.push_back(i);
+
+    const uint32_t N = 1024;
+    std::vector<float> x(N), y(N), ref(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        x[i] = float(int(i % 97) - 48) * 0.25f;
+        y[i] = float(int(i % 89) - 44) * 0.5f;
+        ref[i] = 2.0f * x[i] + y[i];
+    }
+    auto launchAll = [&](PxgCudaShim& shim, const std::vector<uint32_t>& rows) {
+        PxgDevicePtr dx = 0, dy = 0, dout = 0;
+        shim.memAlloc(&dx, N * 4);
+        shim.memAlloc(&dy, N * 4);
+        shim.memAlloc(&dout, N * 4);
+        shim.memcpyHtoD(dx, x.data(), N * 4);
+        shim.memcpyHtoD(dy, y.data(), N * 4);
+        size_t bad = 0;
+        for (uint32_t row : rows)
+        {
+            shim.memsetD32(dout, 0, N);
+            AxpyParams prm = { { dx, dy, dout }, 2.0f, N };
+            if (shim.launchKernel(row, N / 64, 1, 1, &prm, sizeof(prm)) != PxgResult::Success)
+                ++bad;
+            std::vector<float> got(N);
+            shim.memcpyDtoH(got.data(), dout, N * 4);
+            if (std::memcmp(got.data(), ref.data(), N * 4) != 0)
+                ++bad;
+        }
+        shim.memFree(dx);
+        shim.memFree(dy);
+        shim.memFree(dout);
+        return bad;
+    };
+
+    // 1. Warm-up alone: completes, builds every row once, loads the file once.
+    {
+        gWarmLoads.store(0);
+        PxgCudaShim shim(dev, manifest.data(), kRows, &countingLoader);
+        std::atomic<int> done(0);
+        PXG_CHECK_MSG(shim.startPipelineWarmup(order, 4, [&done] { done.fetch_add(1); }), "warm-up starts");
+        const auto t0 = std::chrono::steady_clock::now();
+        while (done.load() == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(120))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        shim.stopPipelineWarmup();
+        PXG_CHECK_MSG(done.load() == 1, "the completion callback ran once (%d)", done.load());
+        PXG_CHECK_MSG(shim.builtPipelineCount() == kRows, "every row built once (%u of %u)",
+                      shim.builtPipelineCount(), kRows);
+        PXG_CHECK_MSG(gWarmLoads.load() == 1, "the shared SPIR-V file was loaded once (%u)", gWarmLoads.load());
+        PXG_CHECK_MSG(launchAll(shim, order) == 0, "launches through warmed pipelines compute AXPY");
+        PXG_CHECK_MSG(shim.builtPipelineCount() == kRows, "launches built nothing more");
+        PXG_CHECK_MSG(shim.launchedKernels() == order, "launchedKernels lists first launches in order");
+    }
+
+    // 2. Launches that hit builds in flight.  Each row names its own file (the slow
+    //    loader below maps them all to the AXPY module and takes 200 ms), so the first
+    //    three rows are still being built by the three warm-up threads when they are
+    //    launched: the launch must wait for that build, not start a second one.
+    {
+        std::vector<std::string> names;
+        for (uint32_t i = 0; i < kRows; ++i)
+            names.push_back("slow" + std::to_string(i) + "/npShimAxpy.spv");
+        std::vector<PxgKernelDef> slowManifest(manifest);
+        for (uint32_t i = 0; i < kRows; ++i)
+            slowManifest[i].spirvFile = names[i].c_str();
+        PxgCudaShim shim(dev, slowManifest.data(), kRows, &slowLoader);
+        PXG_CHECK(shim.startPipelineWarmup(order, 3));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // the threads claim rows 0..2
+        PXG_CHECK_MSG(launchAll(shim, order) == 0, "launches racing the warm-up compute AXPY");
+        shim.stopPipelineWarmup();
+        PXG_CHECK_MSG(shim.builtPipelineCount() == kRows, "racing: every row built exactly once (%u of %u)",
+                      shim.builtPipelineCount(), kRows);
+        PXG_CHECK_MSG(shim.launchedKernels() == order, "racing: first launches in launch order");
+    }
+
+    // 3. Stopped early: the destructor-equivalent stop joins without hanging, and
+    //    launches afterwards still build what the warm-up did not.
+    {
+        PxgCudaShim shim(dev, manifest.data(), kRows, &countingLoader);
+        PXG_CHECK(shim.startPipelineWarmup(order, 2));
+        shim.stopPipelineWarmup();
+        PXG_CHECK_MSG(launchAll(shim, order) == 0, "launches after an early stop compute AXPY");
+        PXG_CHECK_MSG(shim.builtPipelineCount() == kRows, "early stop: every row built once (%u)",
+                      shim.builtPipelineCount());
+    }
 }
 
 }  // namespace

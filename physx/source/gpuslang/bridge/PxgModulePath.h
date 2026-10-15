@@ -57,6 +57,19 @@ std::string pxgUtf16ToUtf8(const std::u16string& w);
 // Reads a whole file.  False when it cannot be opened or is empty.
 bool pxgReadFile(const std::string& path, std::vector<uint8_t>& data);
 
+// The per-user cache directory for this module, with a trailing separator:
+// %LOCALAPPDATA%\PhysXGpuVulkan\ on Windows, $XDG_CACHE_HOME/PhysXGpuVulkan/ or
+// ~/.cache/PhysXGpuVulkan/ elsewhere.  Not created; empty when no base is known.
+std::string pxgUserCacheDirectory();
+
+// Creates `dir` and its missing parents.  True when it exists afterwards.
+bool pxgMakeDirectories(const std::string& dir);
+
+// Writes `data` to `path` through a temporary file in the same directory that then
+// replaces `path`, so a reader never sees a half-written file.  False on any failure
+// (the temporary is removed).
+bool pxgWriteFileReplace(const std::string& path, const std::vector<uint8_t>& data);
+
 } // namespace gpuslang
 } // namespace physx
 

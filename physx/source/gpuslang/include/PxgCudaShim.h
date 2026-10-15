@@ -52,7 +52,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <map>
+#include <memory>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <mutex>
 #include <vector>
@@ -200,8 +206,36 @@ public:
 
     PxgSlangComputeDevice* device() const { return mDevice; }
 
+    // ---- pipeline warm-up ----
+    // A kernel's pipeline is otherwise built at its FIRST launch, under the API lock:
+    // the driver compiles the SPIR-V then (up to hundreds of ms for the large
+    // narrowphase/solver kernels on real hardware), and every thread that wants the
+    // GPU waits.  The warm-up builds the pipelines of the rows in `order` (in that
+    // order; rows that are not launchable -- no SPIR-V, entry or push size -- are
+    // skipped) on `threadCount` background threads WITHOUT the API lock.  A launch
+    // whose pipeline a warm-up thread is building waits for exactly that build; one
+    // not reached yet is built by the launch itself.  Every pipeline is built once.
+    // Only when the device supportsConcurrentPipelineCreation(); otherwise a no-op that
+    // returns false.  `onComplete` runs on the last warm-up thread once all rows are
+    // built (not when stopped early).
+    bool startPipelineWarmup(const std::vector<PxgKernelId>& order, unsigned threadCount,
+                             std::function<void()> onComplete = std::function<void()>());
+    // The rows launched so far, in order of their first launch -- what a later run
+    // should warm up, and in which order.
+    std::vector<PxgKernelId> launchedKernels() const;
+    // Lets the threads finish the pipeline each is building, then joins them.  Called
+    // by the destructor; idempotent.
+    void stopPipelineWarmup();
+    // Pipelines built so far (warm-up and launches); for diagnostics and tests.
+    uint32_t builtPipelineCount() const;
+
 private:
     PxgPipelineHandle pipelineFor(PxgKernelId id);
+    // Builds the pipeline of row `id`.  Takes no API lock: runs on warm-up threads.
+    PxgPipelineHandle buildPipeline(PxgKernelId id, bool warmup);
+    // The SPIR-V of `file`, loaded once and shared by every row that uses it.
+    std::shared_ptr<const std::vector<uint8_t> > spirvBlob(const char* file);
+    void warmupWorker();
     // P9.98 check round 1: resolve() plus "the `bytes` from ptr on lie inside the
     // allocation" -- the transfer entry points' check (InvalidValue otherwise).
     bool resolveRange(PxgDevicePtr ptr, size_t bytes, PxgBufferHandle* buffer, size_t* offset,
@@ -234,7 +268,29 @@ private:
         size_t size;
     };
     std::map<uintptr_t, HostAlloc> mHostAllocs;
-    std::unordered_map<PxgKernelId, PxgPipelineHandle> mPipelines;
+
+    // One slot per manifest row: not built, being built (by a launch or a warm-up
+    // thread), or built (handle; 0 = refused, and the launch is refused).
+    enum : uint8_t { kPipeNone = 0, kPipeBuilding = 1, kPipeReady = 2 };
+    struct PipelineSlot
+    {
+        uint8_t state = kPipeNone;
+        bool launched = false;
+        PxgPipelineHandle handle = 0;
+    };
+    std::vector<PxgKernelId> mLaunchOrder;   // first launches, guarded by mSlotMutex
+    std::vector<PxgKernelId> mWarmOrder;
+    std::vector<PipelineSlot> mSlots;
+    mutable std::mutex mSlotMutex;
+    std::condition_variable mSlotCv;
+    uint32_t mBuiltCount = 0;
+    std::mutex mBlobMutex;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t> > > mBlobs;
+    std::vector<std::thread> mWarmThreads;
+    std::atomic<bool> mWarmStop;
+    std::atomic<uint32_t> mWarmNext;
+    std::atomic<uint32_t> mWarmActive;
+    std::function<void()> mWarmDone;
 
     // CUDA arrays: host staging records, keyed by the id handed back as CUarray.
     struct CudaArray

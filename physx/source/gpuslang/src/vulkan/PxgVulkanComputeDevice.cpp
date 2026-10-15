@@ -54,6 +54,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 namespace physx
@@ -660,6 +661,9 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(mPhysicalDevice, &props);
         mDeviceName = props.deviceName;
+        mVendorId = props.vendorID;
+        mDeviceId = props.deviceID;
+        std::memcpy(mPipelineCacheUuid, props.pipelineCacheUUID, VK_UUID_SIZE);
         mTimestampPeriod = props.limits.timestampPeriod;   // ns per tick, 0 => timestamps unusable
         allocStats().maxCount = props.limits.maxMemoryAllocationCount;
 
@@ -975,6 +979,18 @@ public:
         // or foreign blob is rejected by the driver's header check, which
         // simply starts an empty cache — safe by design.
         std::vector<uint8_t> cacheSeed;
+        if (mPipelineCachePath.empty() && desc.pipelineCacheData && desc.pipelineCacheDataSize > 0)
+        {
+            // VkPipelineCacheHeaderVersionOne: length, version, vendorID, deviceID, UUID.
+            const uint8_t* d = static_cast<const uint8_t*>(desc.pipelineCacheData);
+            uint32_t hdr[4] = {};
+            if (desc.pipelineCacheDataSize >= 16 + VK_UUID_SIZE)
+                std::memcpy(hdr, d, sizeof(hdr));
+            if (hdr[0] >= 16 + VK_UUID_SIZE && hdr[1] == uint32_t(VK_PIPELINE_CACHE_HEADER_VERSION_ONE) &&
+                hdr[2] == mVendorId && hdr[3] == mDeviceId &&
+                std::memcmp(d + 16, mPipelineCacheUuid, VK_UUID_SIZE) == 0)
+                cacheSeed.assign(d, d + desc.pipelineCacheDataSize);
+        }
         if (!mPipelineCachePath.empty())
         {
             if (FILE* f = fopen(mPipelineCachePath.c_str(), "rb"))
@@ -1866,6 +1882,7 @@ public:
 
     uint32_t pipelinePushRangeBytes(PxgPipelineHandle handle) const override
     {
+        std::lock_guard<std::mutex> mapLock(mPipelineMapMutex);
         const auto it = mPipelines.find(handle);
         return it == mPipelines.end() ? ~0u : it->second.layoutPushSize;
     }
@@ -2093,6 +2110,7 @@ public:
             std::fprintf(stderr, "[PxgVulkan] createPipeline(%s): push block %u B wider than caller %u B; "
                                  "zero-filled\n", entryName ? entryName : "?", info.pushBlockBytes, pushConstantSize);
 
+        std::lock_guard<std::mutex> mapLock(mPipelineMapMutex);
         const PxgPipelineHandle handle = mNextPipelineHandle++;
         mPipelines[handle] = pipe;
         return handle;
@@ -2100,17 +2118,49 @@ public:
 
     void destroyPipeline(PxgPipelineHandle handle) override
     {
-        auto it = mPipelines.find(handle);
-        if (it == mPipelines.end())
-            return;
+        Pipeline pipe;
+        {
+            std::lock_guard<std::mutex> mapLock(mPipelineMapMutex);
+            auto it = mPipelines.find(handle);
+            if (it == mPipelines.end())
+                return;
+            pipe = it->second;
+            mPipelines.erase(it);
+        }
         // An open recording may reference this pipeline; submit it first.
         flush();
         vkDeviceWaitIdle(mDevice);
-        vkDestroyPipeline(mDevice, it->second.pipeline, nullptr);
-        vkDestroyPipelineLayout(mDevice, it->second.layout, nullptr);
-        vkDestroyDescriptorSetLayout(mDevice, it->second.setLayout, nullptr);
-        vkDestroyShaderModule(mDevice, it->second.module, nullptr);
-        mPipelines.erase(it);
+        vkDestroyPipeline(mDevice, pipe.pipeline, nullptr);
+        vkDestroyPipelineLayout(mDevice, pipe.layout, nullptr);
+        vkDestroyDescriptorSetLayout(mDevice, pipe.setLayout, nullptr);
+        vkDestroyShaderModule(mDevice, pipe.module, nullptr);
+    }
+
+    bool supportsConcurrentPipelineCreation() const override { return true; }
+
+    bool getPipelineCacheData(std::vector<uint8_t>* out) override
+    {
+        if (!out || !mPipelineCache)
+            return false;
+        // The cache object is internally synchronized (not created EXTERNALLY_SYNCHRONIZED):
+        // safe while warm-up threads build pipelines into it.  INCOMPLETE = it grew between
+        // the two calls; retry.
+        for (int attempt = 0; attempt < 4; ++attempt)
+        {
+            size_t sz = 0;
+            if (vkGetPipelineCacheData(mDevice, mPipelineCache, &sz, nullptr) != VK_SUCCESS || sz == 0)
+                return false;
+            out->resize(sz);
+            const VkResult r = vkGetPipelineCacheData(mDevice, mPipelineCache, &sz, out->data());
+            if (r == VK_SUCCESS)
+            {
+                out->resize(sz);
+                return true;
+            }
+            if (r != VK_INCOMPLETE)
+                return false;
+        }
+        return false;
     }
 
     // ---- execution ----
@@ -2138,9 +2188,11 @@ public:
     // refused launch (NotFound).
     const Pipeline* livePipeline(PxgPipelineHandle handle, uint32_t pushConstantSize, const char* caller) const
     {
+        std::unique_lock<std::mutex> mapLock(mPipelineMapMutex);
         const auto it = handle == 0 ? mPipelines.end() : mPipelines.find(handle);
         if (it == mPipelines.end())
         {
+            mapLock.unlock();
             std::fprintf(stderr, "[PxgVulkan] %s: pipeline handle %u is not a live pipeline (refused or never "
                                  "created); nothing recorded\n", caller, unsigned(handle));
             return nullptr;
@@ -2973,6 +3025,14 @@ private:
     uint64_t mLastTicket = 0;
     PxgSlangDeviceDesc mDesc;
     VkPipelineCache mPipelineCache = VK_NULL_HANDLE;
+    uint32_t mVendorId = 0;
+    uint32_t mDeviceId = 0;
+    uint8_t mPipelineCacheUuid[VK_UUID_SIZE] = {};
+    // Guards mPipelines and mNextPipelineHandle: pipelines may be created on warm-up
+    // threads while the API thread records dispatches (supportsConcurrentPipelineCreation).
+    // unordered_map keeps element references valid across rehashing, so a Pipeline
+    // found under the lock may be used after it; only destroyPipeline erases.
+    mutable std::mutex mPipelineMapMutex;
     std::string mPipelineCachePath;
 
     static const uint32_t kMaxTimestamps = 256;
