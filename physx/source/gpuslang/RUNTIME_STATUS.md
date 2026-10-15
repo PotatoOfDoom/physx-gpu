@@ -16,6 +16,8 @@ First real hardware (AMD RX 9070 XT, VS 2026): process-wide API lock (multi-thre
 pointers the kernels write mapped or ABI-marked (sb/cloth sleeping, articulation output desc, constraint
 residuals, diffuse count; address tags left alone), VK_EXT_device_fault report; transfers stream-ordered
 (pinned async copies recorded, uploads staged, lazy event tickets): PBF drained copies/step ~140 -> 0.
+Kernel start: pipelines warmed up on background threads (the kernels earlier runs launched, first-use
+order) from an on-disk VkPipelineCache; HelloGRB second run builds 0 of 69 pipelines at a launch.
 P9.99: (A) a required subgroup size is checked against the device AND the entry's workgroup shape
 (VUID 02755/02785/02760/02761/02762/02757/02756) and refused loudly instead of silently;
 check_subgroup_ops.py pins that no engine kernel depends on a subgroup width.  (C) check_push_block.py
@@ -2194,6 +2196,45 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Kernelstart — Pipeline-Warm-up im Hintergrund und Pipeline-Cache auf der Platte
+
+**Ausgangslage.** Rückmeldung vom RX-9070-XT-System: Kernel brauchen beim Start oft eine Weile. Jede
+Pipeline wurde beim ERSTEN Launch ihres Kernels gebaut, unter dem API-Lock; der Treiber kompiliert dort
+das SPIR-V. Gemessen (`PXG_PIPELINE_STATS=1`, llvmpipe): SnippetHelloGRB 69 Pipelines ≈ 0,66 s,
+`convexPlaneNphase_Kernel` allein 300–440 ms, Solver/Sortierung 20–90 ms. Jeder andere Thread wartet
+mit — ein Ruckler, sobald ein Teilsystem zum ersten Mal läuft. Kein Cache über Programmläufe.
+
+**Umsetzung (3d412d1, df49e59).**
+- Gerät: Pipeline-Tabelle unter eigenem Mutex (`supportsConcurrentPipelineCreation`),
+  `getPipelineCacheData`, Cache-Seed aus dem Speicher mit eigener Header-Prüfung (Vendor/Device/UUID).
+- Shim: ein Slot pro Manifestzeile (nicht gebaut / im Bau / gebaut). `startPipelineWarmup(order, n)` baut
+  die Liste auf n Threads OHNE API-Lock; ein Launch wartet auf einen laufenden Build statt einen zweiten
+  zu starten; jede Pipeline genau einmal, jede `.spv` einmal geladen; `launchedKernels()` in
+  Erst-Launch-Reihenfolge.
+- Bridge: `pipeline-cache.bin` im Benutzer-Cache (`%LOCALAPPDATA%\PhysXGpuVulkan`, `$XDG_CACHE_HOME`,
+  `~/.cache`), daneben `.kernels` mit den bisher gestarteten Kernels. Der Warm-up baut genau diese, in
+  Erst-Verwendungs-Reihenfolge, ab dem ersten Context Manager; Stopp mit dem letzten. Geschrieben nach
+  dem Warm-up, bei jeder Manager-Freigabe und (nicht Windows) bei Prozessende; Temp-Datei + atomares
+  Ersetzen (`MoveFileExW` / `rename`), UTF-8-Pfade. `PXG_PIPELINE_CACHE`, `PXG_PIPELINE_WARMUP`
+  (`0` / `all` / Threadzahl), `PXG_PIPELINE_STATS`.
+- Alles warmzuwärmen (`=all`) baut 390 Pipelines, wo 69 gebraucht werden (llvmpipe: 40 s → 65 s
+  Laufzeit) — darum standardmäßig nur die Liste.
+
+**Adversariale Prüfung (3 Linsen, Gegenprüfung je Befund), behoben in df49e59:** Use-after-free bei
+Prozessende ohne Manager-Freigabe (Laufzeitzustand jetzt absichtlich geleakt, `atexit` joint), doppeltes
+Join bei gleichzeitiger Freigabe zweier Manager, erster Release stoppte den Warm-up endgültig, Windows
+löschte die alte Datei vor dem Umbenennen, Temp-Namen nur pro PID eindeutig, Cache-Wachstum (> 256 MiB
+wird nicht geseedet). Widerlegt: Hänger beim Windows-Teardown, hängender Slot bei Exceptions (das SDK
+baut ohne Exceptions).
+
+**Verifikation.** HelloGRB auf llvmpipe, zweiter Lauf: 0 von 69 Pipelines beim Launch gebaut (vorher 69),
+eine Wartezeit von 2 ms auf einen laufenden Build. llvmpipe liefert nur einen 32-Byte-Cache-Header; der
+Treiber-Cache selbst wirkt erst auf echter Hardware. Neue Tests `p3ShimWarmup` (tötet die Mutanten
+„Launch baut erneut“ — deterministisch über einen 200-ms-Loader — und „kein Blob-Cache“),
+`p1PipelineCacheMemory`, `p1PipelineCacheConcurrent`, `p4ModulePathCacheFiles`. Suite **892/892** in beiden
+Modi, Szenen **85/85** plus Kontrolle (jetzt 54 statt 39 Verweigerungen: der Warm-up baut auch Kernel
+früherer Läufe; die Kontrolle verlangt mindestens eine).
 
 ## Erste echte Hardware (AMD RX 9070 XT, Windows, VS 2026) — Abstürze behoben, Transfers ohne GPU-Drain
 
