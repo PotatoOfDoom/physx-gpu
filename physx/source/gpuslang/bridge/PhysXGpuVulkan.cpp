@@ -143,7 +143,16 @@ std::vector<uint8_t> envSpirvLoader(const char* file)
     for (const std::string& path : candidates)
     {
         if (pxgReadFile(path, blob))
+        {
+            // PXG_VERBOSE=1: where the shaders come from, once -- a stale PXG_SHADER_DIR
+            // silently shadows the PhysXGpuShaders/ the build just produced.
+            static std::atomic<bool> reported(false);
+            const char* v = std::getenv("PXG_VERBOSE");
+            if (v && std::strcmp(v, "0") != 0 && !reported.exchange(true))
+                std::fprintf(stderr, "[PhysXGpuVulkan] shaders: %s%s\n", path.c_str(),
+                             candidates.size() == 1 ? " (PXG_SHADER_DIR)" : "");
             return blob;
+        }
     }
     warnMissingSpirv(file, candidates);
     return blob;

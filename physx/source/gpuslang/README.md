@@ -357,7 +357,10 @@ Notes:
   - `PXG_LAUNCH_TRACE=1` names every kernel launch on stderr;
   - `PXG_SYNC_EACH=1` waits for the GPU after every dispatch, so with the trace the
     last launch line before a device error is the kernel that caused it;
-  - `PXG_VERBOSE=1` reports how many registry kernels have no SPIR-V port, and
+  - `PXG_VERBOSE=1` prints the first shader file it loaded, which shows the
+    directory in use (a set `PXG_SHADER_DIR` wins over `PhysXGpuShaders/` next to
+    the module, so a stale one hides a fresh build), reports how many registry
+    kernels have no SPIR-V port, and
     names each unmarked kernel argument that carries a pinned host address
     (`[pxg-hostptr]`, once per argument). These are left untranslated: they are
     either address tags or pointers the engine already mapped; a kernel that
