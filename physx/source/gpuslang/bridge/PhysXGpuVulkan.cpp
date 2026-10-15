@@ -80,6 +80,7 @@
 #include "foundation/PxFoundation.h"  // PxGetErrorCallback
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -213,25 +214,45 @@ struct VulkanGpuRuntime
     PxgCudaShim* shim = nullptr;
     std::vector<PxgKernelDef> manifest;
     bool tried = false;
-    // The on-disk VkPipelineCache (empty: disabled) and the bytes last read from or
-    // written to it, so an unchanged cache is not rewritten.
+    // The on-disk VkPipelineCache (empty: disabled) and a hash of the bytes last read
+    // from or written to it, so an unchanged cache is not rewritten.
     std::string pipelineCachePath;
-    std::vector<uint8_t> pipelineCacheBytes;
-    // The kernels earlier runs launched, in first-launch order (cudaNames), read from
-    // and written to <pipelineCachePath>.kernels: what the warm-up builds next time.
+    uint64_t pipelineCacheHash = 0;
+    // The kernels earlier runs launched, in first-launch order (cudaNames this build
+    // knows), read from and written to <pipelineCachePath>.kernels: what the warm-up
+    // builds, and in which order.
     std::vector<std::string> warmKernelNames;
+    std::vector<PxgKernelId> warmOrder;
+    unsigned warmThreads = 0;
+    // Live PxCudaContextManagers (under runtimeMutex): the warm-up runs while one exists.
+    unsigned liveManagers = 0;
 };
 
+// All leaked on purpose: warm-up threads, and a manager released from a static
+// destructor, may still use them while the process exits -- a destroyed runtime
+// would be a use-after-free there.
 VulkanGpuRuntime& runtimeState()
 {
-    static VulkanGpuRuntime s;
-    return s;
+    static VulkanGpuRuntime* s = new VulkanGpuRuntime;
+    return *s;
 }
 
 std::mutex& runtimeMutex()
 {
-    static std::mutex m;
-    return m;
+    static std::mutex* m = new std::mutex;
+    return *m;
+}
+
+std::mutex& persistMutex()
+{
+    static std::mutex* m = new std::mutex;
+    return *m;
+}
+
+std::atomic<bool>& processExiting()
+{
+    static std::atomic<bool>* exiting = new std::atomic<bool>(false);
+    return *exiting;
 }
 
 // Per-kernel push-constant blob size, derived from the launch-ABI table
@@ -291,15 +312,22 @@ std::vector<std::string> readKernelList(const std::string& path)
     return names;
 }
 
+uint64_t fnv1a64(const std::vector<uint8_t>& data)
+{
+    uint64_t h = 14695981039346656037ull;
+    for (uint8_t c : data)
+        h = (h ^ c) * 1099511628211ull;
+    return h;
+}
+
 // Writes the device's pipeline cache to disk when it changed, and -- withKernelList --
 // the list of launched kernels (earlier runs' order first, this run's new ones after).
-// Called when the warm-up has built every pipeline (on its last thread; cache only)
-// and when a context manager is released; serialized by its own mutex, never under
-// the API lock.
+// Called when the warm-up has built every pipeline (on its last thread; cache only),
+// when a context manager is released and at process exit (not on Windows, see
+// onProcessExit); serialized by its own mutex, never under the API lock.
 void persistPipelineCache(bool withKernelList)
 {
-    static std::mutex m;
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<std::mutex> lock(persistMutex());
     VulkanGpuRuntime& r = runtimeState();
     if (!r.device || r.pipelineCachePath.empty())
         return;
@@ -307,14 +335,18 @@ void persistPipelineCache(bool withKernelList)
     const std::string dir = slash != std::string::npos ? r.pipelineCachePath.substr(0, slash + 1) : std::string();
     bool madeDir = false;
     std::vector<uint8_t> data;
-    if (r.device->getPipelineCacheData(&data) && !data.empty() && data != r.pipelineCacheBytes)
+    if (r.device->getPipelineCacheData(&data) && !data.empty())
     {
-        madeDir = dir.empty() || pxgMakeDirectories(dir);
-        if (pxgWriteFileReplace(r.pipelineCachePath, data))
-            r.pipelineCacheBytes.swap(data);
-        else if (pxgVerbose())
-            std::fprintf(stderr, "[PhysXGpuVulkan] could not write the pipeline cache to %s\n",
-                         r.pipelineCachePath.c_str());
+        const uint64_t h = fnv1a64(data);
+        if (h != r.pipelineCacheHash)
+        {
+            madeDir = dir.empty() || pxgMakeDirectories(dir);
+            if (pxgWriteFileReplace(r.pipelineCachePath, data))
+                r.pipelineCacheHash = h;
+            else if (pxgVerbose())
+                std::fprintf(stderr, "[PhysXGpuVulkan] could not write the pipeline cache to %s\n",
+                             r.pipelineCachePath.c_str());
+        }
     }
     if (!withKernelList || !r.shim)
         return;
@@ -340,20 +372,57 @@ void persistPipelineCache(bool withKernelList)
         r.warmKernelNames.swap(names);
 }
 
-void persistPipelineCacheOnly()
+// The warm-up's completion callback (last warm-up thread).
+void onWarmupComplete()
 {
-    persistPipelineCache(false);
+    if (!processExiting().load())
+        persistPipelineCache(false);
 }
 
-// PxCudaContextManager release: the warm-up threads are joined here (a process may
-// exit right after, and a thread still inside the driver would then race its
-// teardown), and the pipeline cache and kernel list are persisted.
+// Starts (or resumes: built rows are skipped) the warm-up.  Under runtimeMutex.
+void startWarmupLocked(VulkanGpuRuntime& r)
+{
+    if (r.shim && r.warmThreads > 0 && !r.warmOrder.empty() && !processExiting().load() &&
+        r.shim->startPipelineWarmup(r.warmOrder, r.warmThreads, &onWarmupComplete) && pxgVerbose())
+        std::fprintf(stderr, "[PhysXGpuVulkan] building %zu pipelines on %u background thread(s)\n",
+                     r.warmOrder.size(), r.warmThreads);
+}
+
+// PxCudaContextManager release.  When the last live manager goes, the warm-up
+// threads are joined (the process may exit right after, and a thread still inside
+// the driver would then race its teardown); the cache and kernel list are persisted
+// on every release.
 void onContextManagerRelease()
 {
     VulkanGpuRuntime& r = runtimeState();
+    {
+        std::lock_guard<std::mutex> lock(runtimeMutex());
+        if (r.liveManagers > 0)
+            --r.liveManagers;
+        if (r.liveManagers == 0 && r.shim)
+            r.shim->stopPipelineWarmup();
+    }
+    if (!processExiting().load())
+        persistPipelineCache(true);
+}
+
+// atexit, registered once the runtime exists: stop the warm-up so no thread is inside
+// the driver while the process tears down, then persist.  On Windows a DLL's atexit
+// handlers run at DLL_PROCESS_DETACH, after ExitProcess has already terminated the
+// other threads, under the loader lock: the join returns at once, and the cache is
+// not written there (no driver calls under the loader lock) -- only on release.
+void onProcessExit()
+{
+    processExiting().store(true);
+    VulkanGpuRuntime& r = runtimeState();
     if (r.shim)
         r.shim->stopPipelineWarmup();
-    persistPipelineCache(true);
+#if !PX_WINDOWS_FAMILY
+    {
+        // persistPipelineCache checks processExiting only in its callers.
+        persistPipelineCache(true);
+    }
+#endif
 }
 
 // PXG_PIPELINE_WARMUP: unset -> warm up the kernels earlier runs launched (the
@@ -401,11 +470,16 @@ VulkanGpuRuntime* ensureRuntime()
     // Pipeline cache across runs: the driver's compiled pipelines are reused, so a
     // kernel's first launch in a later run skips the SPIR-V compilation.  The device
     // ignores a blob made for another device or driver.
+    // A cache over 256 MiB (stale pipelines of many earlier shader builds accumulate)
+    // is not seeded: the device starts empty and the next save replaces the file.
     r.pipelineCachePath = pipelineCachePathFromEnv();
-    if (!r.pipelineCachePath.empty() && pxgReadFile(r.pipelineCachePath, r.pipelineCacheBytes))
+    std::vector<uint8_t> cacheSeed;
+    if (!r.pipelineCachePath.empty() && pxgReadFile(r.pipelineCachePath, cacheSeed) &&
+        cacheSeed.size() <= (size_t(256) << 20))
     {
-        desc.pipelineCacheData = r.pipelineCacheBytes.data();
-        desc.pipelineCacheDataSize = r.pipelineCacheBytes.size();
+        r.pipelineCacheHash = fnv1a64(cacheSeed);
+        desc.pipelineCacheData = cacheSeed.data();
+        desc.pipelineCacheDataSize = cacheSeed.size();
     }
     r.device = PxgCreateVulkanComputeDevice(desc);
     if (!r.device)
@@ -432,29 +506,27 @@ VulkanGpuRuntime* ensureRuntime()
     static PxgSpirvLoader loader = &envSpirvLoader;
     r.shim = new PxgCudaShim(r.device, r.manifest.data(), uint32_t(r.manifest.size()), loader);
 
-    // Build the pipelines of the kernels earlier runs launched in the background now,
-    // in the order they were first needed, instead of at each kernel's first launch
-    // under the API lock (PxgCudaShim::startPipelineWarmup).  With the pipeline cache
-    // from those runs the driver mostly loads rather than compiles them.
+    // The pipelines of the kernels earlier runs launched are built in the background
+    // once a context manager exists (startWarmupLocked), in the order they were first
+    // needed, instead of at each kernel's first launch under the API lock
+    // (PxgCudaShim::startPipelineWarmup).  With the pipeline cache from those runs the
+    // driver mostly loads rather than compiles them.
     bool warmAll = false;
-    const unsigned warmThreads = warmupThreadsFromEnv(&warmAll);
-    r.warmKernelNames = readKernelList(kernelListPath(r));
-    std::vector<PxgKernelId> order;
+    r.warmThreads = warmupThreadsFromEnv(&warmAll);
     std::vector<bool> queued(r.manifest.size(), false);
-    for (const std::string& n : r.warmKernelNames)
+    for (const std::string& n : readKernelList(kernelListPath(r)))
         for (unsigned i = 0; i < r.manifest.size(); ++i)
             if (!queued[i] && r.manifest[i].cudaName && n == r.manifest[i].cudaName)
             {
-                order.push_back(PxgKernelId(i));
+                r.warmOrder.push_back(PxgKernelId(i));
+                r.warmKernelNames.push_back(n);   // names of other builds are dropped
                 queued[i] = true;
             }
     if (warmAll)
         for (unsigned i = 0; i < r.manifest.size(); ++i)
             if (!queued[i])
-                order.push_back(PxgKernelId(i));
-    if (warmThreads > 0 && r.shim->startPipelineWarmup(order, warmThreads, &persistPipelineCacheOnly) && pxgVerbose())
-        std::fprintf(stderr, "[PhysXGpuVulkan] building %zu pipelines on %u background thread(s)\n", order.size(),
-                     warmThreads);
+                r.warmOrder.push_back(PxgKernelId(i));
+    std::atexit(&onProcessExit);
     return &r;
 }
 
@@ -688,6 +760,11 @@ physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& fou
     physx::gpuslang::VulkanGpuRuntime* r = physx::gpuslang::ensureRuntime();
     if (!r)
         return NULL;
+    {
+        std::lock_guard<std::mutex> lock(physx::gpuslang::runtimeMutex());
+        if (r->liveManagers++ == 0)
+            physx::gpuslang::startWarmupLocked(*r);
+    }
     return physx::gpuslang::PxgCreateVulkanCudaContextManager(r->device, r->shim, r->manifest.data(),
                                                               uint32_t(r->manifest.size()),
                                                               &physx::gpuslang::onContextManagerRelease);

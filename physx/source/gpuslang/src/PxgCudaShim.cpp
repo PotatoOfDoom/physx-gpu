@@ -519,6 +519,8 @@ PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
         }
     }
+    // The SDK builds without exceptions: a failure inside the build aborts the process
+    // rather than unwinding past this point, so a slot is never left "building".
     const PxgPipelineHandle pipe = buildPipeline(id, false);
     {
         std::lock_guard<std::mutex> lock(mSlotMutex);
@@ -569,6 +571,7 @@ void PxgCudaShim::warmupWorker()
 bool PxgCudaShim::startPipelineWarmup(const std::vector<PxgKernelId>& order, unsigned threadCount,
                                       std::function<void()> onComplete)
 {
+    std::lock_guard<std::mutex> ctl(mWarmCtlMutex);
     if (!mDevice->supportsConcurrentPipelineCreation() || threadCount == 0 || order.empty() ||
         !mWarmThreads.empty())
         return false;
@@ -584,6 +587,8 @@ bool PxgCudaShim::startPipelineWarmup(const std::vector<PxgKernelId>& order, uns
 
 void PxgCudaShim::stopPipelineWarmup()
 {
+    // Serialized: two managers released at once must not join the same thread twice.
+    std::lock_guard<std::mutex> ctl(mWarmCtlMutex);
     mWarmStop.store(true);
     for (std::thread& t : mWarmThreads)
         if (t.joinable())

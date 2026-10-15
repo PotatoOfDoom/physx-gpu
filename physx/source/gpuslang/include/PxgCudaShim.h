@@ -286,6 +286,7 @@ private:
     uint32_t mBuiltCount = 0;
     std::mutex mBlobMutex;
     std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t> > > mBlobs;
+    std::mutex mWarmCtlMutex;   // start/stop; never taken under the API lock by a warm-up thread
     std::vector<std::thread> mWarmThreads;
     std::atomic<bool> mWarmStop;
     std::atomic<uint32_t> mWarmNext;

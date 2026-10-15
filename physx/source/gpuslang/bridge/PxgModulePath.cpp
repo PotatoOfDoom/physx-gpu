@@ -27,6 +27,8 @@
 
 #include "PxgModulePath.h"
 
+#include <atomic>
+
 #include "foundation/PxPreprocessor.h"
 
 #if PX_WINDOWS_FAMILY
@@ -305,17 +307,21 @@ bool pxgWriteFileReplace(const std::string& path, const std::vector<uint8_t>& da
 {
     if (path.empty() || data.empty())
         return false;
-    char suffix[48];
+    // A temporary next to the target, unique per process AND per call, created
+    // exclusively ("x"): two writers never share one.
+    static std::atomic<unsigned> sCounter(0);
+    char suffix[64];
 #if PX_WINDOWS_FAMILY
-    std::snprintf(suffix, sizeof(suffix), ".tmp%d", _getpid());
+    std::snprintf(suffix, sizeof(suffix), ".tmp%d.%u", _getpid(), sCounter.fetch_add(1));
 #else
-    std::snprintf(suffix, sizeof(suffix), ".tmp%d", int(getpid()));
+    std::snprintf(suffix, sizeof(suffix), ".tmp%d.%u", int(getpid()), sCounter.fetch_add(1));
 #endif
     const std::string tmp = path + suffix;
 #if PX_WINDOWS_FAMILY
-    FILE* f = _wfopen(toWide(tmp).c_str(), L"wb");
+    const std::wstring wtmp = toWide(tmp);
+    FILE* f = _wfopen(wtmp.c_str(), L"wbx");
 #else
-    FILE* f = std::fopen(tmp.c_str(), "wb");
+    FILE* f = std::fopen(tmp.c_str(), "wbx");
 #endif
     if (!f)
         return false;
@@ -323,15 +329,12 @@ bool pxgWriteFileReplace(const std::string& path, const std::vector<uint8_t>& da
     const bool closed = std::fclose(f) == 0;
     bool ok = written && closed;
 #if PX_WINDOWS_FAMILY
+    // MoveFileExW replaces the target in one step: the old file stays until the new
+    // one takes its place, so a process killed here never leaves no file at all.
     if (ok)
-    {
-        // _wrename does not replace an existing file: remove it first.  Another process
-        // may slip its own file in between; then this rename fails and its file stays.
-        _wremove(toWide(path).c_str());
-        ok = _wrename(toWide(tmp).c_str(), toWide(path).c_str()) == 0;
-    }
+        ok = MoveFileExW(wtmp.c_str(), toWide(path).c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
     if (!ok)
-        _wremove(toWide(tmp).c_str());
+        _wremove(wtmp.c_str());
 #else
     if (ok)
         ok = std::rename(tmp.c_str(), path.c_str()) == 0;   // atomic replace on POSIX
