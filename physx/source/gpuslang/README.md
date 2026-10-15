@@ -365,6 +365,11 @@ Notes:
   - `PXG_PIPELINE_STATS=1` prints what building each kernel's pipeline costs
     (SPIR-V load, pipeline creation), whether a warm-up thread or a launch built
     it, and how long a launch waited for a build in flight (`[pxg-pipe]`);
+  - `PXG_KERNEL_TIMES=1` waits for the GPU after every launch and prints, once
+    per second, the launches, GPU milliseconds per second, the kernels that took
+    the largest share and the allocations/frees in that second (`[pxg-ktime]`);
+    `=2` adds a line per launch and per allocation. It serializes the GPU, so
+    absolute speed drops; it shows which kernels grow in a slow phase of a scene;
   - `PXG_SYNC_STATS=1` prints, every 2000 launches and at exit, the launches,
     host transfers (recorded, staged, drained) and synchronisations
     (`[pxg-xfer]`), plus the dispatches recorded without a barrier (`[pxg-sync]`).

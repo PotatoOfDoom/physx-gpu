@@ -27,6 +27,9 @@
 #include "PxgCudaShim.h"
 
 #include <chrono>
+#include <unordered_map>
+#include <string>
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -65,9 +68,89 @@ std::recursive_mutex& pxgGpuApiMutex()
     return *m;
 }
 
+// PXG_KERNEL_TIMES: 1 = once per second a summary line -- launches, the GPU time per
+// second of wall time, the kernels that took most of it, allocations and frees in that
+// second; 2 = additionally one line per launch and per allocation.  Every launch is
+// drained to time it, so the absolute speed drops; the shares and how they change
+// over a run are what it is for (e.g. a phase of a scene that suddenly slows down).
+namespace
+{
+int kernelTimesLevel()
+{
+    static const int level = [] {
+        const char* v = std::getenv("PXG_KERNEL_TIMES");
+        return v ? std::atoi(v) : 0;
+    }();
+    return level;
+}
+
+struct KernelTimeWindow
+{
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::unordered_map<std::string, double> ms;
+    std::unordered_map<std::string, uint32_t> count;
+    uint32_t launches = 0, allocs = 0, frees = 0;
+    size_t allocBytes = 0;
+    double total = 0.0;
+    void maybePrint()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double wall = std::chrono::duration<double>(now - start).count();
+        if (wall < 1.0)
+            return;
+        std::vector<std::pair<double, std::string> > top;
+        for (const auto& kv : ms)
+            top.push_back(std::make_pair(kv.second, kv.first));
+        std::sort(top.begin(), top.end(), [](const std::pair<double, std::string>& a,
+                                             const std::pair<double, std::string>& b) { return a.first > b.first; });
+        char line[1024];
+        int n = std::snprintf(line, sizeof(line), "[pxg-ktime] %.1fs: %u launches, GPU %.0f ms/s, alloc %u (%.1f MB) free %u |",
+                              wall, launches, total / wall, allocs, double(allocBytes) / 1e6, frees);
+        for (size_t i = 0; i < top.size() && i < 6 && n > 0 && size_t(n) < sizeof(line); ++i)
+            n += std::snprintf(line + n, sizeof(line) - size_t(n), " %s %.0f%% (%u)", top[i].second.c_str(),
+                               total > 0.0 ? 100.0 * top[i].first / total : 0.0, count[top[i].second]);
+        std::fprintf(stderr, "%s\n", line);
+        *this = KernelTimeWindow();
+    }
+};
+
+KernelTimeWindow& kernelTimeWindow()
+{
+    static KernelTimeWindow* w = new KernelTimeWindow;   // leaked: launches may run at exit
+    return *w;
+}
+
+void noteKernelTime(const char* name, double ms)
+{
+    KernelTimeWindow& w = kernelTimeWindow();
+    w.ms[name] += ms;
+    w.count[name] += 1;
+    w.launches += 1;
+    w.total += ms;
+    w.maybePrint();
+}
+
+void noteKernelAlloc(size_t bytes, bool alloc)
+{
+    if (kernelTimesLevel() == 0)
+        return;
+    KernelTimeWindow& w = kernelTimeWindow();
+    if (alloc)
+    {
+        w.allocs += 1;
+        w.allocBytes += bytes;
+    }
+    else
+        w.frees += 1;
+}
+}
+
 PxgResult PxgCudaShim::memAlloc(PxgDevicePtr* out, size_t bytes)
 {
     std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+    if (kernelTimesLevel() >= 2)
+        std::fprintf(stderr, "[pxg-ktime] <memAlloc> %zu\n", bytes);
+    noteKernelAlloc(bytes, true);
     if (!out || bytes == 0)
         return PxgResult::InvalidValue;
     const PxgBufferHandle buf = mDevice->createBuffer(bytes);
@@ -90,6 +173,9 @@ PxgResult PxgCudaShim::memAlloc(PxgDevicePtr* out, size_t bytes)
 PxgResult PxgCudaShim::memFree(PxgDevicePtr ptr)
 {
     std::lock_guard<std::recursive_mutex> apiLock(pxgGpuApiMutex());
+    if (kernelTimesLevel() >= 2)
+        std::fprintf(stderr, "[pxg-ktime] <memFree> 0\n");
+    noteKernelAlloc(0, false);
     auto it = mAllocs.find(ptr);
     if (it == mAllocs.end())
         return PxgResult::NotFound; // CUDA requires the base pointer, not an interior one
@@ -675,7 +761,20 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
     // that produced it — the launch trace's last line becomes the culprit
     // instead of a whole flushed batch.  Debug-only; off by default.
     static const bool syncEach = std::getenv("PXG_SYNC_EACH") != nullptr;
-    if (syncEach)
+    // PXG_KERNEL_TIMES=1: drain after every dispatch and print how long that took --
+    // the kernel's GPU time plus whatever was recorded in front of it since the
+    // previous launch (copies, fills).  Serializes everything; a profile, not a mode.
+    if (kernelTimesLevel() > 0)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        mDevice->flush();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const char* name = mManifest[id].cudaName ? mManifest[id].cudaName : "?";
+        if (kernelTimesLevel() >= 2)
+            std::fprintf(stderr, "[pxg-ktime] %s %.3f grid=%u,%u,%u\n", name, ms, gridX, gridY, gridZ);
+        noteKernelTime(name, ms);
+    }
+    else if (syncEach)
         mDevice->flush();
     return PxgResult::Success;
 }
