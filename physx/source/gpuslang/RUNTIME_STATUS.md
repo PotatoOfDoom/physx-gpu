@@ -12,6 +12,10 @@ Build: the official scripts build the port as the SDK's GPU module without the C
 (PX_GPU_BACKEND=VULKAN; presets linux-gcc/clang-vulkan, vc17/vc18win64-vulkan; source/compiler/cmakegpuvulkan).
 Linux verified: libPhysXGpu_64.so + PhysXGpuShaders/ (178 .spv, byte-identical to the suite's), the unmodified
 SDK loader with a static core runs a GPU scene matching the CPU; the Windows build is implemented, never compiled.
+First real hardware (AMD RX 9070 XT, VS 2026): process-wide API lock (multi-threaded launches), pinned host
+pointers the kernels write mapped or ABI-marked (sb/cloth sleeping, articulation output desc, constraint
+residuals, diffuse count; address tags left alone), VK_EXT_device_fault report; transfers stream-ordered
+(pinned async copies recorded, uploads staged, lazy event tickets): PBF drained copies/step ~140 -> 0.
 P9.99: (A) a required subgroup size is checked against the device AND the entry's workgroup shape
 (VUID 02755/02785/02760/02761/02762/02757/02756) and refused loudly instead of silently;
 check_subgroup_ops.py pins that no engine kernel depends on a subgroup width.  (C) check_push_block.py
@@ -2190,6 +2194,48 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Erste echte Hardware (AMD RX 9070 XT, Windows, VS 2026) — Abstürze behoben, Transfers ohne GPU-Drain
+
+**Ausgangslage.** Der erste Lauf außerhalb von llvmpipe. Auf llvmpipe sind Gerätadressen von Pinned-
+Speicher gleich den CPU-Adressen, und ein Command Buffer wird nie von zwei Threads gleichzeitig gefüllt —
+beides verdeckte Fehler, die auf der AMD-Karte sofort zu `VK_ERROR_DEVICE_LOST` führten.
+
+**Abstürze (c484958, d0e25fa, 71ce659, 9d3206c, 4c9ce64).**
+- PhysX startet Kernel aus mehreren Worker-Threads; ein prozessweites rekursives Lock serialisiert jetzt
+  alle Shim- und Kontextaufrufe (`p3CudaContextThreads`, Mutant ohne Lock stürzt ab/hängt).
+- `VK_EXT_device_fault`: bei DEVICE_LOST werden Fehleradressen auf Allokationen abgebildet. Damit gefunden:
+  `sb_sleeping` schrieb über einen Pinned-CPU-Zeiger (`stateChangedMask`).
+- Pinned-Zeiger, die Kernel dereferenzieren: `sb_sleeping`/`cloth_sleeping` Arg. 6 per `hostPtrMask`;
+  `PxgArticulationOutputDesc`, `dmaConstraintResidual` (PGS/TGS) und der Diffus-Zähler im Partikel-
+  Deskriptor per `getMappedDevicePtr` in der Engine (unter CUDA identisch).
+- Ein erster Versuch, JEDES 8-Byte-Argument in Pinned-Speicher zu übersetzen (17ca6b8), war falsch:
+  Narrowphase-/Friction-Basiszeiger sind Adress-Tags, die nur subtrahiert werden. Zurückgenommen;
+  `PXG_VERBOSE=1` listet unmarkierte Pinned-Argumente nur noch. Alle 15 gemeldeten Argumente geprüft
+  (je mit Gegenprüfung): Adress-Tags oder bereits gemappt.
+
+**Geschwindigkeit (3d4522e).** Gemessen mit `PXG_SYNC_STATS=1` (neue `[pxg-xfer]`-Zähler), SnippetPBF pro
+Schritt: ~95 HtoD und ~44 DtoH mit Pinned-Seite (alle async), ~85 `eventRecord`, ~16 `streamSynchronize`.
+Jede Kopie leerte die Queue (Submit + Warten): ~155 GPU-Roundtrips pro Schritt im Standardmodus, ~60 in v2.
+- Async-Kopien mit Pinned-Seite werden als Gerätekopie aufgezeichnet und lesen/schreiben die Pinned-Bytes
+  bei Ausführung (CUDA-DMA-Semantik; behebt nebenbei den v2-Snapshot einer noch beschriebenen Pinned-Quelle).
+  Pageable-Quellen: Snapshot über den Staging-Ring. Synchrone Formen und DtoH in Pageable warten weiter.
+- Uploads im Standardmodus über den Staging-Ring; Staged-Downloads mit einem statt zwei Flushes.
+- `eventRecord` submittet nicht mehr; `eventQuery`/`eventSynchronize` submitten bei Bedarf;
+  `bpSignalComplete` submittet sofort (die Engine spin-wartet auf sein Pinned-Flag, Timeout 0,1 s).
+- Batch-Ende mit Gerät→Host-Barriere. Pinned-Speicher bevorzugt CPU-gecachten RAM; Standardmodus-Puffer
+  liegen bei Resizable BAR (Heap ≥ 1 GiB) im VRAM, sonst wie bisher im System-RAM.
+- Ergebnis llvmpipe: 0 Kopien mit Drain pro PBF-Schritt (vorher ~140). llvmpipe rechnet auf der CPU,
+  die Schrittzeit ändert sich dort kaum; die Hardware-Messung steht aus.
+- Adversariale Prüfung (3 Linsen, Gegenprüfung je Befund): zwei Korrektheitsbefunde widerlegt (Ablauf in
+  ScPipeline; Batch-Grenze durch `eventRecord`), zwei Performance-Befunde eingebaut (ReBAR-Rücklesen,
+  Submit pro Event).
+
+**Verifikation.** Neuer Test `p3ShimAsyncPinned` (Pinned-Lesen zur Ausführungszeit, Pageable-Snapshot,
+synchrones HtoD nach Kernel-Schreibzugriff, Event-Fortschritt); er fängt alle drei Mutanten in beiden
+Modi. Suite **892/892** in beiden Modi, Szenen **85/85** plus Kontrolle. Snippets HelloGRB,
+DirectGPUAPIArticulation, DeformableVolume laufen auf llvmpipe. Rückmeldung vom RX-9070-XT-System
+(vor 3d4522e): die Snippets laufen, Cloth deutlich schneller, Partikel noch langsam.
 
 ## Build — Vulkan-PhysXGpu über die offiziellen Skripte, ohne CUDA (Linux verifiziert, Windows ungebaut)
 
