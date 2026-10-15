@@ -592,6 +592,245 @@ bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
     return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
 }
 
+struct PsPrimCell
+{
+    uint psId;
+    uint gridHash;
+    float cDistance;
+    float restDistance;
+    uint rigidCacheRef;
+    float4 rigidQ;
+    float3 rigidP;
+    uint rigidType;
+    float3 rigidScale;
+    uint2 rigidId;
+    uint startIndex;
+    uint endIndex;
+    uint range;
+    bool enableCCD;
+    uint64_t curPosAddr;
+    uint64_t predPosAddr;
+    uint64_t sortedToUnsortedAddr;
+};
+
+// PxgCellData::update + psPrimitivesCollision setup for one work item: the pair,
+// the rigid shape, the cell (gridHash) and its particle range.  No barriers -- the
+// compaction pass calls it per thread to find the non-empty cells.
+PsPrimCell psPrimSetup(uint workIndex, bool valid)
+{
+    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
+    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
+    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
+    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
+    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
+    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
+    // ---- PxgCellData::update ----
+    uint psId = 0u;
+    uint gridHash = 0u;
+    float cDistance = 0.0f;
+    float restDistance = 0.0f;
+    uint rigidCacheRef = 0u;
+    // rigid shape (tested against the particles)
+    float4 rigidQ = float4(0, 0, 0, 1);
+    float3 rigidP = float3(0, 0, 0);
+    uint rigidType = 0xffffffffu;
+    float3 rigidScale = float3(0, 0, 0);
+    uint2 rigidId = uint2(EMPTY_CELL, 0u);
+    uint startIndex = EMPTY_CELL;
+    uint endIndex = 0u;
+    uint range = 0u;
+    bool enableCCD = false;
+    uint64_t curPosAddr = 0ull, predPosAddr = 0ull, sortedToUnsortedAddr = 0ull;
+
+    if (valid)
+    {
+        const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
+        const uint startPairIndex = startIndices[pos];
+
+        // LoadShapePair<ePARTICLESYSTEM>: particle shape -> slot0, other -> rigid.
+        const PxgContactManagerInput cin = cmInputs[pos];
+        uint particleShapeRef = cin.shapeRef0;
+        uint particleCacheRef = cin.transformCacheRef0;
+        uint rigidShapeRef = cin.shapeRef1;
+        rigidCacheRef = cin.transformCacheRef1;
+        if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
+        {
+            particleShapeRef = cin.shapeRef1;
+            particleCacheRef = cin.transformCacheRef1;
+            rigidShapeRef = cin.shapeRef0;
+            rigidCacheRef = cin.transformCacheRef0;
+        }
+
+        const PxgShape rigidShape = shapes[rigidShapeRef];
+        rigidType = rigidShape.type;
+        rigidScale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+        const PxsCachedTransform tc = transformCache[rigidCacheRef];
+        rigidQ = float4(tc.qx, tc.qy, tc.qz, tc.qw);
+        rigidP = float3(tc.px, tc.py, tc.pz);
+        rigidId = shapeToRigidRemap[rigidCacheRef];
+
+        psId = shapes[particleShapeRef].particleOrSoftbodyId;
+
+        cDistance = contactDistance[particleCacheRef] + contactDistance[rigidCacheRef];
+        restDistance = restDistances[pos];
+
+        // combine(bounds[particleCacheRef], bounds[rigidCacheRef]).fattenFast(cDistance)
+        const uint pb = particleCacheRef * 6u;
+        const uint rb = rigidCacheRef * 6u;
+        float3 omn = max(float3(boundsArr[pb + 0u], boundsArr[pb + 1u], boundsArr[pb + 2u]),
+                         float3(boundsArr[rb + 0u], boundsArr[rb + 1u], boundsArr[rb + 2u]));
+        float3 omx = min(float3(boundsArr[pb + 3u], boundsArr[pb + 4u], boundsArr[pb + 5u]),
+                         float3(boundsArr[rb + 3u], boundsArr[rb + 4u], boundsArr[rb + 5u]));
+        omn -= float3(cDistance, cDistance, cDistance);
+        omx += float3(cDistance, cDistance, cDistance);
+
+        const float cellWidth = systems[psId].mCommonData_GridCellWidth;
+        const uint3 gridSize = uint3(systems[psId].mCommonData_GridSizeX,
+                                     systems[psId].mCommonData_GridSizeY,
+                                     systems[psId].mCommonData_GridSizeZ);
+        const uint cellOffset = workIndex - startPairIndex;
+        gridHash = calcGridHashInBounds(omn, omx, cellWidth, cellOffset, gridSize);
+
+        // ---- psPrimitivesCollision setup ----
+        enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
+        curPosAddr = systems[psId].mSortedOriginPos_InvMass;
+        predPosAddr = systems[psId].mSortedPositions_InvMass;
+        sortedToUnsortedAddr = systems[psId].mSortedToUnsortedMapping;
+
+        startIndex = Ptr<uint>(systems[psId].mCellStart)[gridHash];
+        if (startIndex != EMPTY_CELL)
+        {
+            endIndex = Ptr<uint>(systems[psId].mCellEnd)[gridHash];
+            range = endIndex - startIndex;
+        }
+    }
+
+    PsPrimCell c;
+    c.psId = psId;
+    c.gridHash = gridHash;
+    c.cDistance = cDistance;
+    c.restDistance = restDistance;
+    c.rigidCacheRef = rigidCacheRef;
+    c.rigidQ = rigidQ;
+    c.rigidP = rigidP;
+    c.rigidType = rigidType;
+    c.rigidScale = rigidScale;
+    c.rigidId = rigidId;
+    c.startIndex = startIndex;
+    c.endIndex = endIndex;
+    c.range = range;
+    c.enableCCD = enableCCD;
+    c.curPosAddr = curPosAddr;
+    c.predPosAddr = predPosAddr;
+    c.sortedToUnsortedAddr = sortedToUnsortedAddr;
+    return c;
+}
+
+// One round of the block on one cell per thread: the cell's particles against the
+// rigid shape, contacts aggregated per 32-lane tile.  Contains block barriers: the
+// whole block calls it together (block-uniform), `valid` false for idle threads.
+void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint lane, bool isTGS)
+{
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
+    const PsPrimCell c = psPrimSetup(workIndex, valid);
+    const uint psId = c.psId;
+    const uint gridHash = c.gridHash;
+    const float cDistance = c.cDistance;
+    const float restDistance = c.restDistance;
+    const uint rigidCacheRef = c.rigidCacheRef;
+    const float4 rigidQ = c.rigidQ;
+    const float3 rigidP = c.rigidP;
+    const uint rigidType = c.rigidType;
+    const float3 rigidScale = c.rigidScale;
+    const uint2 rigidId = c.rigidId;
+    const uint startIndex = c.startIndex;
+    const uint endIndex = c.endIndex;
+    const uint range = c.range;
+    const bool enableCCD = c.enableCCD;
+    const uint64_t curPosAddr = c.curPosAddr;
+    const uint64_t predPosAddr = c.predPosAddr;
+    const uint64_t sortedToUnsortedAddr = c.sortedToUnsortedAddr;
+    // ---- block-uniform max cell population (llvmpipe guard: no warp shuffle) ----
+    sRange[tid] = range;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = PS_BLOCK / 2u; s > 0u; s >>= 1)
+    {
+        if (tid < s)
+            sRange[tid] = max(sRange[tid], sRange[tid + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const uint blockMaxRange = sRange[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint ind = 0u; ind < blockMaxRange; ++ind)
+    {
+        bool intersect = false;
+        float3 normal = float3(0, 0, 0);
+        float distance = 0.0f;
+        uint2 compressed = uint2(0, 0);
+
+        if (valid && startIndex != EMPTY_CELL)
+        {
+            const uint particleIndex = startIndex + ind;
+            if (particleIndex < endIndex)
+            {
+                const float3 currentPos = Ptr<float4>(curPosAddr)[particleIndex].xyz;
+
+                float3 cVolumePos;
+                float cVolumeRadius;
+                if (enableCCD)
+                {
+                    const float3 predictedPos = Ptr<float4>(predPosAddr)[particleIndex].xyz;
+                    cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, false, isTGS);
+                }
+                else
+                {
+                    cVolumeRadius = cDistance;
+                    cVolumePos = currentPos;
+                }
+
+                compressed = uint2(particleIndex, psId); // PxEncodeParticleIndex
+                const uint2 particleMask = uint2(Ptr<uint>(sortedToUnsortedAddr)[particleIndex], psId);
+
+                if (!findPs(systems, psId, rigidId, particleMask))
+                    intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
+                                                           rigidQ, rigidP, rigidType, rigidScale,
+                                                           enableCCD, normal, distance);
+            }
+        }
+
+        // ---- per-32-lane-tile contact aggregation (one atomicAdd per tile) ----
+        const uint threadMask = (1u << lane) - 1u;
+        if (lane == 0u) sMask[warpId] = 0u;
+        GroupMemoryBarrierWithGroupSync();
+        if (intersect) InterlockedOr(sMask[warpId], 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+        const uint mask = sMask[warpId];
+        const uint nbToLock = countbits(mask);
+        const uint contactIndex = countbits(mask & threadMask);
+        if (lane == 0u)
+        {
+            uint s = 0u;
+            if (nbToLock != 0u)
+                InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], nbToLock, s);
+            sStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint contactStartIndex = sStart[warpId];
+
+        if (intersect)
+            writeContact(contactStartIndex + contactIndex,
+                         float4(normal, distance - restDistance), compressed, rigidId);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+groupshared uint sWork[PS_BLOCK];     // compacted non-empty work items (cudaParticleSystem.cu shWorkIndices)
+groupshared uint sScan[PS_BLOCK];     // block prefix sum of "this item's cell is non-empty"
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void ps_primitivesCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
@@ -602,179 +841,70 @@ void ps_primitivesCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     const bool isTGS = (gP.isTGSWord & 0xffu) != 0u;
 
     const uint totalComparison = Ptr<uint>(gP.totalNumPairs)[0];
-
-    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
-    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
-    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
-    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
-    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
-    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
-    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
-    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
-    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
-
     const uint stride = PS_BLOCK * PS_GRID;
     const uint nbIterations = (totalComparison + stride - 1u) / stride;
 
+    // The CUDA wrapper's compaction (cudaParticleSystem.cu:1189-1320): each round, the
+    // work items whose cell holds particles are appended, in thread order, to a
+    // shared queue; a full queue (PS_BLOCK items) is processed by the whole block,
+    // the remainder after the last round.  Most cells of a pair's overlap box are
+    // empty -- far more once a fluid splashes and its bounds grow -- and processing
+    // every block of raw work items with the particle loop made this kernel ~50x
+    // slower in that phase (SnippetPBFMultiMat on an RX 9070 XT).  The ballot +
+    // warpScan of the CUDA becomes a block prefix sum through groupshared; the queue
+    // order (and so which cells share a 32-lane tile) is the CUDA's.
+    uint workCount = 0u;   // block-uniform: derived from groupshared totals only
     for (uint it = 0u; it < nbIterations; ++it)
     {
         const uint workIndex = it * stride + gid.x * PS_BLOCK + tid;
         const bool valid = workIndex < totalComparison;
-
-        // ---- PxgCellData::update ----
-        uint psId = 0u;
-        uint gridHash = 0u;
-        float cDistance = 0.0f;
-        float restDistance = 0.0f;
-        uint rigidCacheRef = 0u;
-        // rigid shape (tested against the particles)
-        float4 rigidQ = float4(0, 0, 0, 1);
-        float3 rigidP = float3(0, 0, 0);
-        uint rigidType = 0xffffffffu;
-        float3 rigidScale = float3(0, 0, 0);
-        uint2 rigidId = uint2(EMPTY_CELL, 0u);
-        uint startIndex = EMPTY_CELL;
-        uint endIndex = 0u;
-        uint range = 0u;
-        bool enableCCD = false;
-        uint64_t curPosAddr = 0ull, predPosAddr = 0ull, sortedToUnsortedAddr = 0ull;
-
+        uint flag = 0u;
         if (valid)
         {
-            const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
-            const uint startPairIndex = startIndices[pos];
-
-            // LoadShapePair<ePARTICLESYSTEM>: particle shape -> slot0, other -> rigid.
-            const PxgContactManagerInput cin = cmInputs[pos];
-            uint particleShapeRef = cin.shapeRef0;
-            uint particleCacheRef = cin.transformCacheRef0;
-            uint rigidShapeRef = cin.shapeRef1;
-            rigidCacheRef = cin.transformCacheRef1;
-            if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
-            {
-                particleShapeRef = cin.shapeRef1;
-                particleCacheRef = cin.transformCacheRef1;
-                rigidShapeRef = cin.shapeRef0;
-                rigidCacheRef = cin.transformCacheRef0;
-            }
-
-            const PxgShape rigidShape = shapes[rigidShapeRef];
-            rigidType = rigidShape.type;
-            rigidScale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
-            const PxsCachedTransform tc = transformCache[rigidCacheRef];
-            rigidQ = float4(tc.qx, tc.qy, tc.qz, tc.qw);
-            rigidP = float3(tc.px, tc.py, tc.pz);
-            rigidId = shapeToRigidRemap[rigidCacheRef];
-
-            psId = shapes[particleShapeRef].particleOrSoftbodyId;
-
-            cDistance = contactDistance[particleCacheRef] + contactDistance[rigidCacheRef];
-            restDistance = restDistances[pos];
-
-            // combine(bounds[particleCacheRef], bounds[rigidCacheRef]).fattenFast(cDistance)
-            const uint pb = particleCacheRef * 6u;
-            const uint rb = rigidCacheRef * 6u;
-            float3 omn = max(float3(boundsArr[pb + 0u], boundsArr[pb + 1u], boundsArr[pb + 2u]),
-                             float3(boundsArr[rb + 0u], boundsArr[rb + 1u], boundsArr[rb + 2u]));
-            float3 omx = min(float3(boundsArr[pb + 3u], boundsArr[pb + 4u], boundsArr[pb + 5u]),
-                             float3(boundsArr[rb + 3u], boundsArr[rb + 4u], boundsArr[rb + 5u]));
-            omn -= float3(cDistance, cDistance, cDistance);
-            omx += float3(cDistance, cDistance, cDistance);
-
-            const float cellWidth = systems[psId].mCommonData_GridCellWidth;
-            const uint3 gridSize = uint3(systems[psId].mCommonData_GridSizeX,
-                                         systems[psId].mCommonData_GridSizeY,
-                                         systems[psId].mCommonData_GridSizeZ);
-            const uint cellOffset = workIndex - startPairIndex;
-            gridHash = calcGridHashInBounds(omn, omx, cellWidth, cellOffset, gridSize);
-
-            // ---- psPrimitivesCollision setup ----
-            enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
-            curPosAddr = systems[psId].mSortedOriginPos_InvMass;
-            predPosAddr = systems[psId].mSortedPositions_InvMass;
-            sortedToUnsortedAddr = systems[psId].mSortedToUnsortedMapping;
-
-            startIndex = Ptr<uint>(systems[psId].mCellStart)[gridHash];
-            if (startIndex != EMPTY_CELL)
-            {
-                endIndex = Ptr<uint>(systems[psId].mCellEnd)[gridHash];
-                range = endIndex - startIndex;
-            }
+            const PsPrimCell c = psPrimSetup(workIndex, true);
+            flag = c.range != 0u ? 1u : 0u;
         }
 
-        // ---- block-uniform max cell population (llvmpipe guard: no warp shuffle) ----
-        sRange[tid] = range;
+        // inclusive scan of `flag` over the block (Hillis-Steele)
+        sScan[tid] = flag;
         GroupMemoryBarrierWithGroupSync();
-        for (uint s = PS_BLOCK / 2u; s > 0u; s >>= 1)
+        for (uint off = 1u; off < PS_BLOCK; off <<= 1)
         {
-            if (tid < s)
-                sRange[tid] = max(sRange[tid], sRange[tid + s]);
+            const uint v = tid >= off ? sScan[tid - off] : 0u;
+            GroupMemoryBarrierWithGroupSync();
+            sScan[tid] += v;
             GroupMemoryBarrierWithGroupSync();
         }
-        const uint blockMaxRange = sRange[0];
+        const uint total = sScan[PS_BLOCK - 1u];
+        const uint outIndex = workCount + sScan[tid] - flag;
+        uint overflowIndex = 0xffffffffu;
+        if (flag != 0u)
+        {
+            if (outIndex < PS_BLOCK)
+                sWork[outIndex] = workIndex;
+            else
+                overflowIndex = outIndex - PS_BLOCK;
+        }
         GroupMemoryBarrierWithGroupSync();
 
-        for (uint ind = 0u; ind < blockMaxRange; ++ind)
+        workCount += total;
+        if (workCount >= PS_BLOCK)
         {
-            bool intersect = false;
-            float3 normal = float3(0, 0, 0);
-            float distance = 0.0f;
-            uint2 compressed = uint2(0, 0);
-
-            if (valid && startIndex != EMPTY_CELL)
-            {
-                const uint particleIndex = startIndex + ind;
-                if (particleIndex < endIndex)
-                {
-                    const float3 currentPos = Ptr<float4>(curPosAddr)[particleIndex].xyz;
-
-                    float3 cVolumePos;
-                    float cVolumeRadius;
-                    if (enableCCD)
-                    {
-                        const float3 predictedPos = Ptr<float4>(predPosAddr)[particleIndex].xyz;
-                        cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, false, isTGS);
-                    }
-                    else
-                    {
-                        cVolumeRadius = cDistance;
-                        cVolumePos = currentPos;
-                    }
-
-                    compressed = uint2(particleIndex, psId); // PxEncodeParticleIndex
-                    const uint2 particleMask = uint2(Ptr<uint>(sortedToUnsortedAddr)[particleIndex], psId);
-
-                    if (!findPs(systems, psId, rigidId, particleMask))
-                        intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
-                                                               rigidQ, rigidP, rigidType, rigidScale,
-                                                               enableCCD, normal, distance);
-                }
-            }
-
-            // ---- per-32-lane-tile contact aggregation (one atomicAdd per tile) ----
-            const uint threadMask = (1u << lane) - 1u;
-            if (lane == 0u) sMask[warpId] = 0u;
+            const uint queued = sWork[tid];
+            psPrimProcessCell(queued, true, tid, warpId, lane, isTGS);
+            workCount -= PS_BLOCK;
             GroupMemoryBarrierWithGroupSync();
-            if (intersect) InterlockedOr(sMask[warpId], 1u << lane);
-            GroupMemoryBarrierWithGroupSync();
-            const uint mask = sMask[warpId];
-            const uint nbToLock = countbits(mask);
-            const uint contactIndex = countbits(mask & threadMask);
-            if (lane == 0u)
-            {
-                uint s = 0u;
-                if (nbToLock != 0u)
-                    InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], nbToLock, s);
-                sStart[warpId] = s;
-            }
-            GroupMemoryBarrierWithGroupSync();
-            const uint contactStartIndex = sStart[warpId];
-
-            if (intersect)
-                writeContact(contactStartIndex + contactIndex,
-                             float4(normal, distance - restDistance), compressed, rigidId);
-            GroupMemoryBarrierWithGroupSync();
+            if (overflowIndex != 0xffffffffu)
+                sWork[overflowIndex] = workIndex;
         }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (workCount != 0u)
+    {
+        const bool has = tid < workCount;
+        const uint queued = has ? sWork[tid] : 0u;
+        psPrimProcessCell(queued, has, tid, warpId, lane, isTGS);
     }
 }
 

@@ -1724,4 +1724,153 @@ PXG_TEST(psContactGen_capsuleNaNTGS) { runCapsuleNaNContact(true); }
 PXG_TEST(psContactGen_p89DotOrderPGS) { runP89DotOrder(false); }
 PXG_TEST(psContactGen_p89DotOrderTGS) { runP89DotOrder(true); }
 
+
+// The work-item COMPACTION (cudaParticleSystem.cu:1189-1320): each round a block
+// appends the work items whose cell holds particles to a shared queue and processes
+// it when full; items that do not fit go to the front of the next queue (overflow),
+// and a partly filled queue is processed after the last round.  A 4x1x1 grid with
+// one empty cell makes three of four work items non-empty, so the queue fills
+// unevenly and overflows from the second round on; over 3 x PS_BLOCK x PS_GRID work
+// items every block runs four rounds.  Every non-empty work item must yield exactly
+// its cell's contact: the per-particle contact counts pin that no queued item is
+// lost or processed twice.
+static void runCompaction(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const char* lbl = isTGS ? "TGS" : "PGS";
+    const uint32_t NB_ITEMS = 3u * 256u * 1024u + 777u;
+    const uint32_t EMPTY = 0xffffffffu;
+
+    const float s = std::sin(0.78539816339744830961f);
+    const float c = std::cos(0.78539816339744830961f);
+    const float planeQ[4] = { 0.0f, 0.0f, s, c };   // PxPlane(1,0,0,0) normal +X onto +Y
+
+    // particles 0..2 just below the y = 0 plane, one per cell 0..2; cell 3 empty
+    std::vector<F4> pos = { { 0.25f, -0.1f, 0.0f, 1.0f }, { 1.25f, -0.05f, 0.0f, 1.0f }, { 2.25f, -0.2f, 0.0f, 1.0f } };
+    DevBuf bOrigin = makeDev(dev, pos);
+    DevBuf bPred = makeDev(dev, pos);
+    DevBuf bCellStart = makeDev(dev, std::vector<uint32_t>{ 0u, 1u, 2u, EMPTY });
+    DevBuf bCellEnd = makeDev(dev, std::vector<uint32_t>{ 1u, 2u, 3u, 0u });
+    DevBuf bS2U = makeDev(dev, std::vector<uint32_t>{ 0u, 1u, 2u });
+    DevBuf bRunsum = makeDev(dev, std::vector<uint32_t>{ 0u });
+    std::vector<PxgParticleSimBuffer> simBuffers(1);
+    std::memset(simBuffers.data(), 0, sizeof(PxgParticleSimBuffer));
+    DevBuf bSimBuf = makeDev(dev, simBuffers);
+
+    PxgParticleSystem ps = makeZeroPs();
+    ps.mCommonData.mGridCellWidth = 1.0f;
+    ps.mCommonData.mGridSizeX = 4u;
+    ps.mCommonData.mGridSizeY = 1u;
+    ps.mCommonData.mGridSizeZ = 1u;
+    ps.mCommonData.mNumParticles = 3u;
+    ps.mCommonData.mNumParticleBuffers = 1u;
+    ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bOrigin.addr));
+    ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPred.addr));
+    ps.mCellStart = reinterpret_cast<PxU32*>(size_t(bCellStart.addr));
+    ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(bCellEnd.addr));
+    ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bS2U.addr));
+    ps.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+    ps.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(bSimBuf.addr));
+    DevBuf bDesc = makeDev(dev, std::vector<PxgParticleSystem>{ ps });
+
+    std::vector<PxgContactManagerInput> cin(1);
+    cin[0].shapeRef0 = 0u; cin[0].transformCacheRef0 = 0u;
+    cin[0].shapeRef1 = 1u; cin[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cin);
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+    shapes[1].type = PxU32(PxGeometryType::ePLANE);
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(0.0f, 0.0f, 0.0f), PxQuat(planeQ[0], planeQ[1], planeQ[2], planeQ[3]));
+    DevBuf bTc = makeDev(dev, tcache);
+    // [-20, 20]^3 for both: the overlap spans more than four cells in x, so the
+    // wrapped range is the whole 4-wide grid and work item k lands in cell
+    // (calcGridPos(-20.3).x + k % 4) & 3 = (k + 3) % 4.
+    std::vector<float> boundsF(12);
+    for (int k = 0; k < 3; ++k) { boundsF[k] = boundsF[6 + k] = -20.0f; boundsF[3 + k] = boundsF[9 + k] = 20.0f; }
+    DevBuf bBounds = makeDev(dev, boundsF);
+    DevBuf bCd = makeDev(dev, std::vector<float>{ 0.3f, 0.0f });
+    DevBuf bRd = makeDev(dev, std::vector<float>{ 0.0f });
+    DevBuf bMat = makeDev(dev, std::vector<uint32_t>{ 0u });
+    DevBuf bStart = makeDev(dev, std::vector<uint32_t>{ 0u });
+    DevBuf bTotal = makeDev(dev, std::vector<uint32_t>{ NB_ITEMS });
+    DevBuf bRemap = makeDev(dev, std::vector<uint64_t>{ 0ull, 7ull });
+
+    // expected: one contact per work item whose cell holds a particle
+    uint32_t want[3] = { 0u, 0u, 0u };
+    for (uint32_t k = 0; k < NB_ITEMS; ++k)
+    {
+        const uint32_t cell = (k + 3u) % 4u;
+        if (cell < 3u)
+            ++want[cell];
+    }
+    const uint32_t wantTotal = want[0] + want[1] + want[2];
+
+    const uint32_t MAX_CONTACTS = wantTotal + 64u;
+    DevBuf bContacts = makeDev(dev, std::vector<HostContact>(MAX_CONTACTS));
+    DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
+    DevBuf bSbP = makeDev(dev, std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
+    DevBuf bTbP = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bIbP = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bBr = makeDev(dev, std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
+    DevBuf bTbr = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+    DevBuf bIbr = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
+
+    PsCollideBlob blob;
+    std::memset(&blob, 0, sizeof(blob));
+    blob.isTGSWord = isTGS ? 1u : 0u;
+    blob.numTests = 1u;
+    blob.toleranceLength = 1.0f;
+    blob.cmInputs = bCin.addr;             blob.shapes = bShapes.addr;
+    blob.transformCache = bTc.addr;        blob.bounds = bBounds.addr;
+    blob.contactDistance = bCd.addr;       blob.restDistances = bRd.addr;
+    blob.materials = bMat.addr;            blob.startIndices = bStart.addr;
+    blob.totalNumPairs = bTotal.addr;      blob.particleSystems = bDesc.addr;
+    blob.shapeToRigidRemap = bRemap.addr;
+    blob.w_particleContacts = bContacts.addr;
+    blob.w_numTotalContacts = bCount.addr;
+    blob.w_contactSortedByParticle = bSbP.addr;
+    blob.w_tempContactByParticle = bTbP.addr;
+    blob.w_contactIndexSortedByParticle = bIbP.addr;
+    blob.w_contactByRigid = bBr.addr;
+    blob.w_tempContactByRigid = bTbr.addr;
+    blob.w_contactIndexSortedByRigid = bIbr.addr;
+    blob.w_maxContacts = MAX_CONTACTS;
+
+    Kernel k("psContactGenBda.spv", "ps_primitivesCollisionLaunch", {}, sizeof(PsCollideBlob));
+    k.dispatch(1024u, {}, blob, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == wantTotal, "%s: %u contacts from %u work items, expected %u", lbl, gCount, NB_ITEMS,
+                  wantTotal);
+    const uint32_t n = std::min(gCount, MAX_CONTACTS);
+    const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, n);
+    uint32_t got[3] = { 0u, 0u, 0u }, bad = 0u;
+    F4 first[3] = {};
+    bool seen[3] = { false, false, false };
+    for (uint32_t a = 0; a < n; ++a)
+    {
+        const uint64_t part = gC[a].particleId & 0xffffffffull;
+        if (part >= 3u || gC[a].rigidId != 7ull) { ++bad; continue; }
+        ++got[part];
+        if (!seen[part]) { first[part] = gC[a].normal_pen; seen[part] = true; }
+        else if (std::memcmp(&first[part], &gC[a].normal_pen, sizeof(F4)) != 0) ++bad;
+    }
+    PXG_CHECK_MSG(bad == 0u, "%s: %u contacts with a wrong identity or a differing normal/penetration", lbl, bad);
+    for (uint32_t p = 0; p < 3u; ++p)
+        PXG_CHECK_MSG(got[p] == want[p], "%s: particle %u got %u contacts, expected %u (one per work item of "
+                      "its cell)", lbl, p, got[p], want[p]);
+    for (const DevBuf* b : { &bOrigin, &bPred, &bCellStart, &bCellEnd, &bS2U, &bRunsum, &bSimBuf, &bDesc, &bCin,
+                             &bShapes, &bTc, &bBounds, &bCd, &bRd, &bMat, &bStart, &bTotal, &bRemap, &bContacts,
+                             &bCount, &bSbP, &bTbP, &bIbP, &bBr, &bTbr, &bIbr })
+        dev->destroyBuffer(b->h);
+}
+
+PXG_TEST(psContactGen_compactionPGS) { runCompaction(false); }
+PXG_TEST(psContactGen_compactionTGS) { runCompaction(true); }
+
 } // namespace
