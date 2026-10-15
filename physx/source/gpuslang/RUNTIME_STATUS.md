@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+PBF neighbour lists: ps_selfCollisionLaunch wrote every neighbour past the 32 cached ones into particle
+0's mCollisionIndex column (the CUDA pointer is pre-offset by globalThreadIndex); dense fluid saw <= 32
+neighbours, drifted into the +x/+z corner of SnippetPBFMultiMat (>18000 particles in one grid cell, the
+contact kernels walked it serially: the AMD slow phase).  Fixed + particleSelfCollisionOverflowColumns.
 Build: the official scripts build the port as the SDK's GPU module without the CUDA toolkit
 (PX_GPU_BACKEND=VULKAN; presets linux-gcc/clang-vulkan, vc17/vc18win64-vulkan; source/compiler/cmakegpuvulkan).
 Linux verified: libPhysXGpu_64.so + PhysXGpuShaders/ (178 .spv, byte-identical to the suite's), the unmodified
@@ -2196,6 +2200,37 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## PBF — Nachbarlisten ab dem 33. Nachbarn landeten in der Spalte von Partikel 0
+
+**Ausgangslage.** Rückmeldung vom RX-9070-XT-System: SnippetPBFMultiMat wird langsam, sobald die
+Flüssigkeit am Boden ankommt, und erholt sich später. `PXG_KERNEL_TIMES=1`: `ps_primitivesCollisionLaunch`
+~50–60 ms pro Launch (40–57 % der GPU-Zeit), `ps_selfCollisionLaunch` ~25 %. Die zwei Umbauten des
+Kontaktkernels davor (51f6800 Kompaktierung, 2f7a7d0 eine Zelle pro Thread) halfen auf llvmpipe, auf AMD
+nicht — dort bestimmt der längste Thread die Laufzeit.
+
+**Messung (lokaler Debug-Patch, llvmpipe, 600 Frames).** Größte Gitterzelle pro Launch: 8 Partikel am
+Anfang, nach dem Aufprall 394 → 18274 und weiter steigend, immer Zelle (31, 0, 31) — die Bodenecke bei
+x ≈ z ≈ +6, Positionen bis 6,03 (Wand bei 6, Ruheabstand 0,083: die Partikel stecken in den Wänden).
+Ein Thread läuft diese Zelle zweimal seriell ab; Selbstkollision liest sie aus 26 Nachbarzellen.
+
+**Ursache (Portierungsfehler).** `collideCell` schreibt Nachbarn jenseits der 32 gecachten direkt nach
+`mCollisionIndex[index]`. CUDA übergibt den Zeiger bereits um `globalThreadIndex` versetzt
+(particlesystem.cu:1158), der Port den Basiszeiger — Slot k ≥ 32 JEDES Partikels landete in der Spalte
+von Partikel 0 (Rennen), der Zählwert (bis maxNeighborhood) blieb richtig. Dichte, Dichte-Löser und
+Viskosität lasen ab Slot 32 Müll bzw. veraltete Werte; die echten Nachbarn waren die ersten 32 in der
+Zellreihenfolge −z, −y, −x zuerst, die Dichte also auf der +x/+y/+z-Seite unterschätzt — ein
+einseitiger Druck, der dichte Flüssigkeit in die +x/+z-Ecke schob. Gefunden durch einen Workflow
+(4 Vergleichsagenten CUDA ↔ Slang: Dichte, Kontakte, Selbstkollision, Integration; adversarial
+gegengeprüft); Dichte-, Kontakt- und Integrationskernel ohne Abweichung.
+
+**Fix.** `index = particleIndex0 + currentCount * stride`. Neuer Test
+`particleSelfCollisionOverflowColumns` (48 Partikel in einer Zelle, 47 Nachbarn je Partikel, jede
+Spalte gegen die Zellreihenfolge): mit dem alten Index 713 falsche Slots, mit dem Fix grün in beiden
+Modi. Die vorhandenen Fixtures hatten 2–3 Partikel und erreichten Slot 32 nie.
+
+Die nicht committete Block-Reservierung im Kontaktkernel ist verworfen: der Engpass war die Riesenzelle,
+nicht der globale Atomic.
 
 ## Kernelstart — Pipeline-Warm-up im Hintergrund und Pipeline-Cache auf der Platte
 

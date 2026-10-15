@@ -534,6 +534,107 @@ PXG_TEST(particleSelfCollisionDivergentCounts)
     dev->destroyBuffer(bColIdx.h); dev->destroyBuffer(bColForce.h); dev->destroyBuffer(bDesc.h);
 }
 
+// particleSelfCollisionOverflowColumns -- more neighbours than the 32-entry cache.
+// collideCell writes neighbours past SelfCollideCache::MaxCachedContacts straight to
+// mCollisionIndex, at slot k of THIS particle's column (p + k * numParticles): the
+// CUDA's collisionIndex is pre-offset by globalThreadIndex (particlesystem.cu:1158).
+// The port's base pointer once dropped that offset, so every overflow neighbour of
+// every particle landed in particle 0's column; the two-and-three-particle fixtures
+// above never reach slot 32.  48 particles in one cell, all within the cell width of
+// each other: each has 47 neighbours, slots 32..46 come from the overflow branch.
+PXG_TEST(particleSelfCollisionOverflowColumns)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 48;
+    const float cellWidth = 0.3f;            // cellWidthSq = 0.09; the cluster spans < 0.12
+    const uint32_t gs = 4;
+    const uint32_t numCells = gs * gs * gs;
+    const uint32_t EMPTY = 0xffffffffu;
+
+    std::vector<F4> sortedPos(N);
+    for (uint32_t i = 0; i < N; ++i)
+        sortedPos[i] = { 0.05f + 0.02f * float(i % 4), 0.05f + 0.02f * float((i / 4) % 4),
+                         0.05f + 0.02f * float(i / 16), 1.0f };
+
+    std::vector<uint32_t> sortedPhase(N, PHASE_SELF_COLLIDE);
+    std::vector<uint32_t> mapping(N);
+    for (uint32_t i = 0; i < N; ++i)
+        mapping[i] = i;
+    std::vector<uint32_t> cellStart(numCells, EMPTY);
+    std::vector<uint32_t> cellEnd(numCells, 0u);
+    cellStart[0] = 0u; cellEnd[0] = N;
+
+    const uint32_t maxNeighborhood = 64u;    // above the 47 neighbours: no cap
+    std::vector<uint32_t> selfCount(N, 0xdeadbeefu);
+    std::vector<uint32_t> collisionIndex(N * maxNeighborhood, 0xccccccccu);
+    std::vector<F2> collisionForces(N * maxNeighborhood, { 7.0f, 7.0f });
+
+    DevBuf bPos = makeDev(dev, sortedPos);
+    DevBuf bPhase = makeDev(dev, sortedPhase);
+    DevBuf bMap = makeDev(dev, mapping);
+    DevBuf bStart = makeDev(dev, cellStart);
+    DevBuf bEnd = makeDev(dev, cellEnd);
+    DevBuf bCount = makeDev(dev, selfCount);
+    DevBuf bColIdx = makeDev(dev, collisionIndex);
+    DevBuf bColForce = makeDev(dev, collisionForces);
+
+    PxgParticleSystem ps = makeZeroDesc();
+    ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhase.addr));
+    ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bMap.addr));
+    ps.mCellStart = reinterpret_cast<PxU32*>(size_t(bStart.addr));
+    ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(bEnd.addr));
+    ps.mParticleSelfCollisionCount = reinterpret_cast<PxU32*>(size_t(bCount.addr));
+    ps.mCollisionIndex = reinterpret_cast<PxU32*>(size_t(bColIdx.addr));
+    ps.mDensityCollisionImpulses = reinterpret_cast<float2*>(size_t(bColForce.addr));
+    ps.mCommonData.mNumParticles = N;
+    ps.mCommonData.mGridCellWidth = cellWidth;
+    ps.mCommonData.mGridSizeX = gs;
+    ps.mCommonData.mGridSizeY = gs;
+    ps.mCommonData.mGridSizeZ = gs;
+    ps.mCommonData.mMaxNeighborhood = maxNeighborhood;
+    ps.mData.mSolidRestOffset = 0.1f;
+
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    struct SelfPush { uint64_t particleSystems; uint32_t id; };
+    SelfPush push = { bDesc.addr, 0u };
+    Kernel("particleSelfCollisionBda.spv", "ps_selfCollisionLaunch", {}, sizeof(SelfPush))
+        .dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gCount = downloadBuffer<uint32_t>(dev, bCount.h, N);
+    const auto gIdx = downloadBuffer<uint32_t>(dev, bColIdx.h, N * maxNeighborhood);
+    const auto gForce = downloadBuffer<F2>(dev, bColForce.h, N * maxNeighborhood);
+
+    size_t bad = 0;
+    for (uint32_t p = 0; p < N; ++p)
+    {
+        PXG_CHECK_MSG(gCount[p] == N - 1u, "particle %u must count all %u others, got %u", p, N - 1u, gCount[p]);
+        // the cell is walked in sorted order, skipping the particle itself
+        uint32_t k = 0;
+        for (uint32_t q = 0; q < N; ++q)
+        {
+            if (q == p)
+                continue;
+            const uint32_t got = gIdx[p + k * N];
+            if (got != q && bad++ < 8)
+                std::printf("  particle %u slot %u: got %u, want %u%s\n", p, k, got, q,
+                            k >= 32u ? " (overflow slot)" : "");
+            if (f2u(gForce[p + k * N].x) != f2u(0.0f) || f2u(gForce[p + k * N].y) != f2u(0.0f))
+                ++bad;
+            ++k;
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "%zu collisionIndex/collisionForces slots outside their particle's column "
+                  "or wrong -- slots >= 32 come from collideCell's overflow branch", bad);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bPhase.h); dev->destroyBuffer(bMap.h);
+    dev->destroyBuffer(bStart.h); dev->destroyBuffer(bEnd.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bColIdx.h); dev->destroyBuffer(bColForce.h); dev->destroyBuffer(bDesc.h);
+}
+
 // Helper: build a descriptor + material/phase-handle buffers for the solve path.
 struct SolveBufs
 {

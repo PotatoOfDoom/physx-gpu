@@ -179,7 +179,16 @@ uint collideCell(
 
     if (startIndex != PS_EMPTY_CELL)
     {
-        uint index = currentCount * stride;
+        // Slot k of particle particleIndex0 lives at particleIndex0 + k * stride.  The
+        // CUDA passes collisionIndex already offset by globalThreadIndex
+        // (particlesystem.cu:1158) and starts at currentCount * stride (:1080); here
+        // collisionIndex is the BASE pointer, so the column offset is added once, here.
+        // Without it every neighbour past the 32 cached ones landed in particle 0's
+        // column: dense fluid saw at most 32 neighbours, picked in the -z,-y,-x-first
+        // cell order, under-counted its density on the +x/+y/+z side and drifted into
+        // the +x/+z corner of SnippetPBFMultiMat's box -- >18000 particles in one grid
+        // cell, which ps_primitivesCollisionLaunch and this kernel then walked serially.
+        uint index = particleIndex0 + currentCount * stride;
 
         const bool selfCollide = (phase & PS_PHASE_SELF_COLLIDE) != 0u;
 
