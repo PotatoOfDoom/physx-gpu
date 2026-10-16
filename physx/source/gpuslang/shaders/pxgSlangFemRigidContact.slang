@@ -38,9 +38,10 @@
 // Extracted with it: only what the function needs -- the PxgFemRigidConstraintBlock field
 // offsets, the small vector helpers and the PxNodeIndex accessors.  Deliberately NOT a
 // tree-wide de-duplication pass: crossVec / dotVec / mat33MulVec / computeBasisVectors are
-// also defined locally in femClothRigidAttachBda, psContactSolveBda and
-// particleSelfCollisionBda, and the PxgFemOtherContactInfo (CI_*) offsets in
-// femClothClothContactBda and softBodyContactRemapBda.  Those shaders do NOT import this
+// also defined locally in psContactSolveBda and particleSelfCollisionBda, and the
+// PxgFemOtherContactInfo (CI_*) offsets in femClothClothContactBda and
+// softBodyContactRemapBda.  (femClothRigidAttachBda had copies too; tranche B of task 35
+// made it an importer -- it reuses readRigidVelocity -- and dropped them.)  Those shaders do NOT import this
 // module and keep their own copies; folding them in would be a much larger change with no
 // payoff for the kernel that motivated this one.  Importers must therefore not also define
 // these names locally.
@@ -415,10 +416,11 @@ public void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
 // ---------------------------------------------------------------------------
 public struct RigidState
 {
-    float3 linVel;
-    float3 angVel;
-    float3 linDelta;
-    float3 angDelta;
+    // public: femClothRigidAttachBda's attachment solves read the pack directly (tranche B).
+    public float3 linVel;
+    public float3 angVel;
+    public float3 linDelta;
+    public float3 angDelta;
 }
 
 public RigidState readRigidVelocity(uint64_t rigidId, bool isTGS, uint64_t solverCoreDescPtr,

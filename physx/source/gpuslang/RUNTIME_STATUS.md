@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+Cloth rigid attachments: articulation anchor + link velocity, the reaction on dynamic bodies (was
+one-way: a box hung from cloth free-fell), TRIANGLE attachments (a triangle index was used as a vertex
+index -- writes past the vertex buffers), cone branch.  Ported; PXG_SCENE=clothhangbox, clothlinkattach,
+clothtripin (+ PGS rows); femClothSimRigidAttachAllAnchors{PGS,TGS} with guard rows past nbVerts.
 FEM contacts with articulation links (cloth + softbody, shared pxgSlangFemRigidContact): prepare arm
 (link pose, pen-bias clamp, spatial-response rows), link velocity read, and the reaction on the link were
 deferred -- the link was read as an unrelated rigid solver body.  Ported; PXG_SCENE=clothonlink,
@@ -2212,6 +2216,48 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Artikulation, Tranche B — Cloth-Anhänge an Starrkörper und Links
+
+**Portiert** (`femClothRigidAttachBda.slang`, Workflow: Umsetzung → zwei adversariale Reviews → Korrektur):
+1. Prepare, Artikulations-Anker (FEMClothConstraintPrep.cu:478-527): Link-Pose und
+   `spatialResponseMatrixW[linkId]`; die CUDA-Eigenheiten übernommen (resp1/resp2 mit deltaV0, raXn roh,
+   .w = 1, kein Nullen von rigidDeltaVel).
+2. Link-Geschwindigkeit in beiden Solves (dataReadWriteHelper.cuh:105-113 / :126-141).
+3. Rückwirkung auf dynamische Körper und Links (FEMClothExternalSolve.cu:1455-1467 / :1651-1664) — vorher
+   EINSEITIG: eine an einem Tuch hängende Box fiel frei durch (11,94 m in 3 s).
+4. Dreiecks-Anhänge — LIVE-FEHLER: beide Solves nahmen den Dreiecksindex als Vertexindex, lasen/schrieben
+   Vertex #triIdx und für triIdx ≥ nbVerts über das Pufferende hinaus. Jetzt Gather/Scatter über die drei
+   Ecken mit Baryzentrik (:1417-1431 + :1474-1483, :1616-1630 + :1671-1680).
+5. Cone-Zweig (attachments.cuh:112-120 / :176-180) über die gemeinsamen Funktionen in
+   `pxgSlangFemFemAttach` — für jeden öffentlichen Cloth-Anhang aktiv (NULL-Cone → Limits 0/0), Wirkung nur
+   bitgenau (PGS ~1 ulp). Die Kopfzeile, die das Gegenteil behauptete, ist korrigiert.
+
+**Tests.** Fixture `femClothSimRigidAttachAllAnchors{PGS,TGS}`: sechs Spuren (statisch, dynamisch,
+Dreieck ≥ nbVerts auf 16 Dreiecken / 11 Vertices mit Wächterzeilen hinter nbVerts, Artikulations-Link mit
+echten Daten + Köder, kinematisch, statisches Dreieck), permutierte Aktiv-Liste; Prepare und Solve
+bitgenau gegen ein CPU-Orakel (PxSpatialMatrix::operator*). Szenen (neu / `sh_base`, TGS und PGS,
+nachgemessen):
+- `clothhangbox` — 0,1-kg-Box an einem Haken im Schwerpunkt eines oben gepinnten Tuchs: Absenkung
+  0,119 / 0,011 m (alt: freier Fall 11,94 m).
+- `clothlinkattach` — Tuch an einem Link (feste Basis, Schwenk): Ankerabstand 0,7–0,8 mm TGS,
+  1,4–2,3 cm PGS, folgt dem 0,3-m-Schwenk (alt: 1–3 m daneben, folgt nicht); PGS-Lastanteil 0,211 gegen 1/N
+  = 0,200, Band 0,18–0,25 (fängt eine fehlende Winkelzeile, 0,155).
+- `clothtripin` — sieben Dreieck-Pins mit GPU-Index ≥ 85 bei 81 Vertices: Zentren auf 0,5 mm (TGS) /
+  0,18 m (PGS) am Anker (alt: Tuch am Boden, 2,4 m).
+Mutanten (je ein Teil abgeschaltet) fallen im Fixture durch; in den Szenen bis auf die TGS-Link-
+Rückwirkung (nur dt/N des Gewichts, nur im Fixture bewacht) und die baryzentrische Gewichtung (nur im
+Fixture sichtbar).
+
+**CUDA-Semantik, die die Szenen prägt** (dokumentiert, nicht gemeldet): TGS addiert `deltaF·invMass0` —
+eine Länge — direkt als Geschwindigkeit (rigidDeltaAccum.cu:395-405), ein gehaltener Link spürt daher nur
+etwa dt/N des Tuchgewichts; PGS nutzt raXn0 dreimal (Fehler y/z = error.x), hält also nur über die
+Geschwindigkeit und kriecht (Dreieck-Pins ~0,06 m/s). Daher die weiten PGS-Schranken.
+
+**Nebenbefund (CPU, Upstream-Snippet).** SnippetArticulation / SnippetDirectGPUAPIArticulation: der Lift
+springt beim Umkehren unten (bis 9,5 cm/Frame, ~80 Frames Nachschwingen) — der prismatische Antrieb ist
+`PxArticulationDrive(100000, 0, …)`, ungedämpft; mit Dämpfung 20000 bleibt es bei 3 cm/Frame. Snippet
+und CPU-Code sind unverändert upstream — so belassen.
 
 ## Artikulation, Tranche A — Cloth/Soft-Body-Kontakte mit Artikulations-Links
 

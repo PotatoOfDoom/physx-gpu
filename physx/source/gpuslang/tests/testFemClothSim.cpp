@@ -1613,6 +1613,8 @@ PXG_TEST(femClothSimSolveTriPairClusterPGS)
 // anchor) BIT-EXACT against a CPU transcription of FEMClothConstraintPrep.cu:387 +
 // FEMClothExternalSolve.cu:1371/:1571 + attachments.cuh.  The attachment solve is
 // plain linear algebra, so every field is fully bit-exact (no transcendental seam).
+// This one keeps the cone DISABLED (limits -1); every other anchor kind, triangles and the
+// public-API cone (0, 0, angle -1) are in runRigidAttachAllAnchors (tranche B of task 35).
 // ===========================================================================
 
 // Host replica of the block-of-32 PxgFEMRigidAttachmentConstraint (PxgFEMCore.h:191,
@@ -1909,7 +1911,9 @@ static void runRigidAttach(bool isTGS)
     std::vector<uint8_t> constraintBytes(sizeof(RigidAttachConstraintHost), 0xCD);
     DevBuf bConstraint = makeDev(dev, constraintBytes);
 
-    // rigidDeltaVel: prepare zeroes [0] and [0+numAttachments]; deferred otherwise.
+    // rigidDeltaVel: the prepare's rigid arm zeroes [0] and [0+numAttachments]; the solve
+    // writes no reaction for a STATIC anchor (FEMClothExternalSolve.cu:1455).  The dynamic,
+    // kinematic and articulation reactions: runRigidAttachAllAnchors below.
     std::vector<F4> rigidDeltaVel = { { 9.f, 9.f, 9.f, 9.f }, { 9.f, 9.f, 9.f, 9.f } };
     DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
 
@@ -2020,7 +2024,7 @@ static void runRigidAttach(bool isTGS)
     if (gAttachIds[0] != staticNodeInd)
     { ++mm; std::printf("  rigidAttachmentIds MM: got %llu ref %llu\n",
                         (unsigned long long)gAttachIds[0], (unsigned long long)staticNodeInd); }
-    // rigidDeltaVel zeroed by the prepare (deferred-but-zeroed).
+    // rigidDeltaVel zeroed by the prepare (the rigid arm's unconditional zeroing, :582-586).
     for (uint32_t j = 0; j < 2; ++j)
         if (f2u(gRigidDeltaVel[j].x) != 0u || f2u(gRigidDeltaVel[j].y) != 0u ||
             f2u(gRigidDeltaVel[j].z) != 0u || f2u(gRigidDeltaVel[j].w) != 0u)
@@ -2052,7 +2056,7 @@ static void runRigidAttach(bool isTGS)
     sp.numAttachments = 1u;
     sp.prePrepDesc = bPrePrepDesc.addr;
     sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = 0ull;   // never dereferenced (articulation deferred)
+    sp.artiCoreDesc = 0ull;   // never dereferenced: readRigidVelocity reads it in the link arm only
     sp.sharedDesc = bSharedDesc.addr;
     sp.dt = dt;
     sp.rigidDeltaVel = bRigidDeltaVel.addr;
@@ -2095,6 +2099,608 @@ static void runRigidAttach(bool isTGS)
 
 PXG_TEST(femClothSimRigidAttachPGS) { runRigidAttach(/*isTGS*/ false); }
 PXG_TEST(femClothSimRigidAttachTGS) { runRigidAttach(/*isTGS*/ true); }
+
+// ---------------------------------------------------------------------------
+// TRANCHE B (task 35): the cloth rigid-attachment kernels with EVERY anchor kind and
+// BOTH element kinds, bit-exact against a CPU transcription of FEMClothConstraintPrep.cu
+// :387-587 + FEMClothExternalSolve.cu:1371-1485 / :1571-1682 + attachments.cuh.  Six
+// lanes, each on its own cloth vertices (so the atomic scatter has no contention and the
+// comparison is exact):
+//   lane 0  STATIC world anchor, VERTEX 0.
+//   lane 1  DYNAMIC rigid (node 3 -> solver body 1), VERTEX 1, rotated frame, full
+//           sqrtInvInertia: the reaction rows (deltaLinVel = deltaImpulse * invMass0,
+//           deltaAngVel from the SAME raXn rows -- raXn0 three times in PGS).
+//   lane 2  DYNAMIC rigid, TRIANGLE 10 = (5,6,7) of a 11-vertex cloth: triIdx >= nbVerts,
+//           so a solve that treats the triangle index as a vertex index reads past the
+//           end of the vertex buffers (the pre-tranche bug).
+//   lane 3  ARTICULATION link (node 5, link 1), VERTEX 2.  articulations[bodySims[5].
+//           articulationRemapId = 2] holds the link pose / response; solverBodyIndices[5]
+//           = 1 indexes outArtiVelocity -- record 1 is a DECOY, so a port that used one
+//           index for both reads wrong data.  The prepare must NOT zero its rigidDeltaVel
+//           rows (the CUDA arm has no zeroing) and the reaction uses invMass0 = 1.
+//   lane 4  KINEMATIC rigid (node 4 -> solver body 2, invMass 0), VERTEX 3: identity
+//           inertia * inertiaScale 0, and the solve writes ZERO reaction rows.
+//   lane 5  STATIC world anchor, TRIANGLE 9 = (8,9,10): triIdx < nbVerts, so the
+//           vertex-index misread stays in bounds but pulls vertex 9 alone, with the full
+//           (not barycentric) weight -- the in-bounds face of the same bug.
+// Every lane uses the PUBLIC-API cone parameters (low_high_limits = (0,0), angle = -1,
+// PxgSimulationController.cpp:3062-3063), so isConeLimitedEnabled is TRUE and the
+// cone-limited branch (attachments.cuh:112-120 / :176-180) is under test.  PGS teeth: the
+// velError -> posError -> velError round trip changes at least one lane's impulse bits.
+// ---------------------------------------------------------------------------
+namespace p7Bref
+{
+using p73ref::V3;
+using p73ref::cross3;
+using p73ref::dot3;
+
+static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 scale3(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+
+// computeConeLimitedError (attachments.cuh:48) for maxAngle <= 0 (the angle > 0 arm and its
+// PxSinCos are not exercised here).  PxClamp(v, lo, hi) = PxMax(lo, PxMin(hi, v)).
+static V3 coneLimitedError(float maxAngle, float minDist, float maxDist, V3 coneAxis, V3 relPos)
+{
+    float len = std::sqrt(dot3(relPos, relPos));
+    V3 dir;
+    if (maxAngle == 0.0f)
+        dir = coneAxis;
+    else
+        dir = (len > 1.0e-6f) ? scale3(relPos, 1.0f / len) : coneAxis;
+    const float hi = maxDist >= 0.0f ? maxDist : 3.4028235e38f;
+    const float mn = (hi < len) ? hi : len;
+    len = (minDist > mn) ? minDist : mn;
+    return V3{ relPos.x - len * dir.x, relPos.y - len * dir.y, relPos.z - len * dir.z };
+}
+static bool coneEnabled(float maxAngle, float minDist, float maxDist)
+{
+    return maxAngle >= 0.0f || minDist >= 0.0f || maxDist >= 0.0f;
+}
+
+// The articulation arm of the prepare (FEMClothConstraintPrep.cu:478-527).  The response
+// product is the ENGINE's PxSpatialMatrix::operator*, independent of asmM6MulVec.
+static void refPrepareArti(RigidAttachConstraintHost& c, int slot, F4 attachmentPose, V3 ra4, V3 axisIn,
+                           float axisAngleW, F4 lowHigh, F4 baryOrType1, uint32_t elemId, uint64_t rigidId,
+                           const physx::PxTransform& b2w, const physx::PxSpatialMatrix& resp)
+{
+    using physx::PxVec3;
+    using physx::Cm::UnAlignedSpatialVector;
+    const float invMass1 = attachmentPose.w;
+    const V3 point = V3{ attachmentPose.x, attachmentPose.y, attachmentPose.z };
+    const V3 n0 = V3{ 1.0f, 0.0f, 0.0f }, n1 = V3{ 0.0f, 1.0f, 0.0f }, n2 = V3{ 0.0f, 0.0f, 1.0f };
+    const V3 worldAxis = p73ref::getNormalized(p73ref::quatRotate(b2w.q.x, b2w.q.y, b2w.q.z, b2w.q.w, axisIn));
+    const V3 ra = p73ref::quatRotate(b2w.q.x, b2w.q.y, b2w.q.z, b2w.q.w, ra4);
+    const V3 error = V3{ ra.x + b2w.p.x - point.x, ra.y + b2w.p.y - point.y, ra.z + b2w.p.z - point.z };
+    const V3 raXn0 = cross3(ra, n0), raXn1 = cross3(ra, n1), raXn2 = cross3(ra, n2);
+    const UnAlignedSpatialVector dv0 = resp * UnAlignedSpatialVector(PxVec3(n0.x, n0.y, n0.z), PxVec3(raXn0.x, raXn0.y, raXn0.z));
+    const V3 top = V3{ dv0.top.x, dv0.top.y, dv0.top.z }, bot = V3{ dv0.bottom.x, dv0.bottom.y, dv0.bottom.z };
+    // resp1 / resp2 dot deltaV0 -- the upstream quirk.
+    const float resp0 = dot3(top, raXn0) + dot3(bot, n0) + invMass1;
+    const float resp1 = dot3(top, raXn1) + dot3(bot, n1) + invMass1;
+    const float resp2 = dot3(top, raXn2) + dot3(bot, n2) + invMass1;
+    const float vm0 = (resp0 > 0.0f) ? (1.0f / resp0) : 0.0f;
+    const float vm1 = (resp1 > 0.0f) ? (1.0f / resp1) : 0.0f;
+    const float vm2 = (resp2 > 0.0f) ? (1.0f / resp2) : 0.0f;
+    c.raXn0_biasW[slot] = F4{ raXn0.x, raXn0.y, raXn0.z, dot3(error, n0) };
+    c.raXn1_biasW[slot] = F4{ raXn1.x, raXn1.y, raXn1.z, dot3(error, n1) };
+    c.raXn2_biasW[slot] = F4{ raXn2.x, raXn2.y, raXn2.z, dot3(error, n2) };
+    c.velMultiplierXYZ_invMassW[slot] = F4{ vm0, vm1, vm2, 1.0f };
+    c.elemId[slot] = elemId;
+    c.rigidId[slot] = rigidId;
+    c.baryOrType[slot] = baryOrType1;
+    c.low_high_limits[slot] = lowHigh;
+    c.axis_angle[slot] = F4{ worldAxis.x, worldAxis.y, worldAxis.z, axisAngleW };
+}
+
+struct RigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
+struct SolveOut { V3 deltaImpulse, deltaLinVel, deltaAngVel; };
+
+// calculateAttachmentDeltaImpulsePGS (attachments.cuh:83) as CALLED at
+// FEMClothExternalSolve.cu:1451: raXn0_biasW in all three row slots.
+static SolveOut refImpulsePGS(const RigidAttachConstraintHost& c, int slot, V3 linVel1, const RigidVel& v,
+                              float invDt, bool cone)
+{
+    const F4 r0 = c.raXn0_biasW[slot];
+    const F4 vm = c.velMultiplierXYZ_invMassW[slot];
+    const F4 lh = c.low_high_limits[slot], wa = c.axis_angle[slot];
+    const V3 raXn0 = V3{ r0.x, r0.y, r0.z };
+    const float vX = v.linVel.x + dot3(v.angVel, raXn0);
+    const float vY = v.linVel.y + dot3(v.angVel, raXn0);
+    const float vZ = v.linVel.z + dot3(v.angVel, raXn0);
+    const float biasFactor = 0.5f;
+    V3 velError = V3{ linVel1.x - r0.w * biasFactor * invDt, linVel1.y - r0.w * biasFactor * invDt,
+                      linVel1.z - r0.w * biasFactor * invDt };
+    if (cone && coneEnabled(wa.w, lh.x, lh.y))
+    {
+        const float weirdScale = invDt * biasFactor;
+        V3 posError = scale3(velError, 1.0f / weirdScale);
+        posError = coneLimitedError(wa.w, lh.x, lh.y, V3{ wa.x, wa.y, wa.z }, posError);
+        velError = scale3(posError, weirdScale);
+    }
+    SolveOut o;
+    const float dF0 = (velError.x - vX) * vm.x;
+    const float dF1 = (velError.y - vY) * vm.y;
+    const float dF2 = (velError.z - vZ) * vm.z;
+    o.deltaImpulse = V3{ dF0, dF1, dF2 };
+    o.deltaLinVel = V3{ dF0 * vm.w, dF1 * vm.w, dF2 * vm.w };
+    o.deltaAngVel = add3(add3(scale3(raXn0, dF0), scale3(raXn0, dF1)), scale3(raXn0, dF2));
+    return o;
+}
+
+// calculateAttachmentDeltaImpulseTGS (attachments.cuh:147), offset overload.
+static SolveOut refImpulseTGS(const RigidAttachConstraintHost& c, int slot, V3 linDelta1, const RigidVel& v,
+                              float dt, bool cone)
+{
+    const F4 r0 = c.raXn0_biasW[slot], r1 = c.raXn1_biasW[slot], r2 = c.raXn2_biasW[slot];
+    const F4 vm = c.velMultiplierXYZ_invMassW[slot];
+    const F4 lh = c.low_high_limits[slot], wa = c.axis_angle[slot];
+    const V3 raXn0 = V3{ r0.x, r0.y, r0.z }, raXn1 = V3{ r1.x, r1.y, r1.z }, raXn2 = V3{ r2.x, r2.y, r2.z };
+    const float v0 = v.linVel.x + dot3(v.angVel, raXn0);
+    const float v1 = v.linVel.y + dot3(v.angVel, raXn1);
+    const float v2 = v.linVel.z + dot3(v.angVel, raXn2);
+    const V3 linDelta = V3{ linDelta1.x - v.linDelta.x, linDelta1.y - v.linDelta.y, linDelta1.z - v.linDelta.z };
+    V3 tgsError = V3{ linDelta.x - r0.w - dot3(v.angDelta, raXn0), linDelta.y - r1.w - dot3(v.angDelta, raXn1),
+                      linDelta.z - r2.w - dot3(v.angDelta, raXn2) };
+    if (cone && coneEnabled(wa.w, lh.x, lh.y))
+        tgsError = coneLimitedError(wa.w, lh.x, lh.y, V3{ wa.x, wa.y, wa.z }, tgsError);
+    const float BIAS = 0.7f;
+    SolveOut o;
+    const float dF0 = (tgsError.x - v0 * dt) * vm.x * BIAS;
+    const float dF1 = (tgsError.y - v1 * dt) * vm.y * BIAS;
+    const float dF2 = (tgsError.z - v2 * dt) * vm.z * BIAS;
+    o.deltaImpulse = V3{ dF0, dF1, dF2 };
+    o.deltaLinVel = V3{ dF0 * vm.w, dF1 * vm.w, dF2 * vm.w };
+    o.deltaAngVel = add3(add3(scale3(raXn0, dF0), scale3(raXn1, dF1)), scale3(raXn2, dF2));
+    return o;
+}
+
+static F4 blend(F4 a, F4 b, F4 c, F4 bary)
+{
+    return F4{ a.x * bary.x + b.x * bary.y + c.x * bary.z, a.y * bary.x + b.y * bary.y + c.y * bary.z,
+               a.z * bary.x + b.z * bary.y + c.z * bary.z, a.w * bary.x + b.w * bary.y + c.w * bary.z };
+}
+} // namespace p7Bref
+
+static void runRigidAttachAllAnchors(bool isTGS)
+{
+    using p73ref::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const uint32_t N = 6u;          // lanes
+    const uint32_t nbVerts = 11u;
+    const uint32_t nbTris = 16u;    // > nbVerts, so both triangle lanes can use triIdx >= nbVerts
+    // Guard region past nbVerts: every vertex buffer is allocated with nbVerts + guard rows.
+    // The CUDA vertex/triangle split (FEMClothExternalSolve.cu:1417-1431 / :1616-1630) never
+    // touches a row >= nbVerts; the old vertex-only misread of vertex #triIdx (triIdx 13 / 15)
+    // lands inside this guard and is caught below instead of running off the allocation.
+    const uint32_t nbGuard = 6u, nbRows = nbVerts + nbGuard;
+
+    // --- cloth: 11 vertices, distinct per lane (+ guard rows) ------------
+    std::vector<F4> positions(nbRows), velocities(nbRows), accumDelta(nbRows);
+    for (uint32_t k = 0; k < nbRows; ++k)
+    {
+        const float fk = float(k);
+        const float im = 0.4f + 0.07f * fk;
+        positions[k] = { 0.3f + 0.11f * fk, 1.9f - 0.07f * fk, -0.2f + 0.05f * fk, im };
+        velocities[k] = { 0.10f - 0.03f * fk, -0.20f + 0.02f * fk, 0.05f + 0.01f * fk, im };
+        accumDelta[k] = { 0.002f * fk - 0.01f, -0.003f + 0.001f * fk, 0.004f - 0.0005f * fk, im };
+    }
+    const F4 guardDelta = { 7.0f, 7.0f, 7.0f, 7.0f };
+    std::vector<F4> deltaPos(nbRows, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    for (uint32_t k = nbVerts; k < nbRows; ++k) deltaPos[k] = guardDelta;
+    // Triangle table (16 entries on the 11-vertex cloth): entry 13 = (5,6,7), entry 15 =
+    // (8,9,10); the rest point at vertex 4 (owned by nobody), so a wrong triangle index
+    // scatters into a vertex the check sees.
+    std::vector<uint32_t> triVtx(4u * nbTris, 4u);
+    const uint32_t triA = 13u, triB = 15u;
+    triVtx[4u * triA + 0] = 5u; triVtx[4u * triA + 1] = 6u; triVtx[4u * triA + 2] = 7u; triVtx[4u * triA + 3] = 0u;
+    triVtx[4u * triB + 0] = 8u; triVtx[4u * triB + 1] = 9u; triVtx[4u * triB + 2] = 10u; triVtx[4u * triB + 3] = 0u;
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, velocities);
+    DevBuf bAcc = makeDev(dev, accumDelta);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bTri = makeDev(dev, triVtx);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = nbVerts;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // --- lanes ------------------------------------------------------------
+    const uint64_t staticNode = 0x00000000FFFFFFFFull;
+    const uint64_t dynNode = 3ull, kinNode = 4ull;
+    const uint64_t artiNode = (3ull << 32) | 5ull;   // PxNodeIndex(5, link 1)
+    const uint64_t laneNode[N] = { staticNode, dynNode, dynNode, artiNode, kinNode, staticNode };
+    const uint32_t laneElem[N] = { 0u, 1u, triA, 2u, 3u, triB };
+    const F4 laneBary[N] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0.2f, 0.3f, 0.5f, 0.0f },
+                             { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0.6f, 0.15f, 0.25f, 0.0f } };
+    const F4 lowHigh = { 0.0f, 0.0f, 0.0f, 0.0f };     // NULL cone (PxgSimulationController.cpp:3062)
+    const float axisAngleW = -1.0f;
+    const V3 axisIn = { 0.0f, 1.0f, 0.0f };
+    std::vector<PxgFEMRigidAttachment> atts(N);
+    std::vector<V3> laneRa4(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float fi = float(i);
+        PxgFEMRigidAttachment& a = atts[i];
+        std::memset(&a, 0, sizeof(a));
+        a.index0 = laneNode[i];
+        a.index1 = uint64_t(laneElem[i]);   // clothId 0
+        laneRa4[i] = V3{ 0.12f + 0.05f * fi, -0.31f + 0.04f * fi, 0.07f - 0.03f * fi };
+        a.localPose0 = make_float4(laneRa4[i].x, laneRa4[i].y, laneRa4[i].z, 0.0f);
+        a.coneLimitParams.low_high_limits = make_float4(lowHigh.x, lowHigh.y, lowHigh.z, lowHigh.w);
+        a.coneLimitParams.axis_angle = make_float4(axisIn.x, axisIn.y, axisIn.z, axisAngleW);
+        a.baryOrType1 = make_float4(laneBary[i].x, laneBary[i].y, laneBary[i].z, laneBary[i].w);
+    }
+    // activeRigidAttachments: a non-identity permutation, so the prepare's attachmentId
+    // indirection (FEMClothConstraintPrep.cu:426-428) is live.  Lane i (= workIndex, the
+    // constraint slot the reference checks) lives at rigidAttachments[activeAtt[i]].
+    std::vector<uint32_t> activeAtt = { 2u, 0u, 5u, 1u, 4u, 3u };
+    {
+        std::vector<PxgFEMRigidAttachment> permuted(N);
+        for (uint32_t i = 0; i < N; ++i) permuted[activeAtt[i]] = atts[i];
+        atts.swap(permuted);
+    }
+    DevBuf bAtt = makeDev(dev, atts);
+    DevBuf bActiveAtt = makeDev(dev, activeAtt);
+    std::vector<uint64_t> attachIds(N, 0xBADBADBADull);
+    DevBuf bAttachIds = makeDev(dev, attachIds);
+    std::vector<uint8_t> constraintBytes(sizeof(RigidAttachConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    const F4 sentinel = { 9.0f, 9.0f, 9.0f, 9.0f };
+    std::vector<F4> rigidDeltaVel(2u * N, sentinel);
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    // --- solver bodies: 0 = world, 1 = dynamic, 2 = kinematic -------------
+    const uint32_t numSolverBodies = 3u, accOffset = 0u;
+    const float invMassOf[3] = { 0.0f, 0.25f, 0.0f };
+    // body2WorldPool: PxAlignedTransform {q, p}.  Body 1 rotated (normalised quat).
+    const float qn = 1.0f / std::sqrt(0.1f * 0.1f + 0.2f * 0.2f + 0.3f * 0.3f + 0.927f * 0.927f);
+    const F4 qDyn = { 0.1f * qn, 0.2f * qn, -0.3f * qn, 0.927f * qn };
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 },
+                                   qDyn, { 0.4f, 1.7f, -0.1f, 0.0f },
+                                   { 0, 0, 0, 1 }, { -0.5f, 2.2f, 0.3f, 0.0f } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96u * numSolverBodies, 0);
+    for (uint32_t b = 0; b < numSolverBodies; ++b)
+        std::memcpy(solverBodyData.data() + 96u * b + 28u, &invMassOf[b], 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    // sqrtInvInertia (column-major) -- body 1 full non-symmetric, body 2 a decoy that the
+    // kinematic identity * 0 path must NOT read.
+    float sqrtInv[3][9] = { { 0 }, { 0.9f, 0.05f, -0.02f, 0.03f, 1.1f, 0.04f, -0.01f, 0.06f, 0.8f },
+                            { 5, 5, 5, 5, 5, 5, 5, 5, 5 } };
+    std::vector<uint8_t> solverTxIData(64u * numSolverBodies, 0);
+    for (uint32_t b = 0; b < numSolverBodies; ++b)
+        std::memcpy(solverTxIData.data() + 64u * b + 28u, sqrtInv[b], 36);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+
+    // PGS: outSolverVelocity [lin x N][ang x N]; pool (accumulated delta) same shape.
+    // TGS: pool three planes {lin.xyz ang.x}{ang.yz linDelta.xy}{linDelta.z angDelta.xyz}.
+    std::vector<F4> outSolverVelocity(2u * numSolverBodies, F4{ 0, 0, 0, 0 });
+    std::vector<F4> solverBodyVelPool(3u * numSolverBodies + 1u, F4{ 0, 0, 0, 0 });
+    for (uint32_t b = 1; b < numSolverBodies; ++b)
+    {
+        const float fb = float(b);
+        outSolverVelocity[b] = { 0.3f * fb, -0.2f, 0.1f * fb, 0.0f };
+        outSolverVelocity[b + numSolverBodies] = { 0.05f, -0.07f * fb, 0.02f, 0.0f };
+        solverBodyVelPool[b] = { 0.01f * fb, -0.02f, 0.03f, 0.04f * fb };
+        solverBodyVelPool[b + numSolverBodies] = { -0.05f, 0.06f * fb, 0.0007f, -0.0008f };
+        solverBodyVelPool[b + 2u * numSolverBodies] = { 0.0009f * fb, 0.0011f, -0.0012f, 0.0013f };
+    }
+    solverBodyVelPool[3u * numSolverBodies] = { 61.f, 62.f, 63.f, 64.f };
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
+    std::vector<uint32_t> solverBodyIndices = { 0u, 0xEEu, 0xEEu, 1u, 2u, 1u };   // node 5 -> artic. 1
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    // --- articulation behind lane 3 (record 2 real, record 1 decoy) ------
+    const uint32_t artiLinkId = 1u, artiRemapId = 2u, artiSolverIdx = 1u;
+    const uint32_t maxLinks = 2u, nbArticulations = 3u, artiOffset = maxLinks * nbArticulations;
+    std::vector<physx::PxgArticulationLink> artiLinks(nbArticulations * maxLinks);
+    std::memset(static_cast<void*>(artiLinks.data()), 0, artiLinks.size() * sizeof(artiLinks[0]));
+    std::vector<physx::PxTransform> artiB2W(nbArticulations * maxLinks);
+    std::vector<physx::PxSpatialMatrix> artiResp(nbArticulations * maxLinks);
+    for (uint32_t k = 0; k < nbArticulations * maxLinks; ++k)
+    {
+        const float fk = float(k);
+        physx::PxQuat q(0.05f * fk, -0.1f, 0.2f + 0.01f * fk, 0.95f);
+        q.normalize();
+        artiB2W[k] = physx::PxTransform(physx::PxVec3(0.15f - 0.04f * fk, 1.25f + 0.03f * fk, 0.35f + 0.02f * fk), q);
+        for (uint32_t cc = 0; cc < 6u; ++cc)
+            for (uint32_t rr = 0; rr < 6u; ++rr)
+                artiResp[k].column[cc][rr] = (cc == rr ? 0.9f : 0.0f)
+                                           + 0.013f * float((cc * 7u + rr * 3u + k * 5u) % 11u) - 0.05f;
+    }
+    DevBuf bArtiLinks = makeDev(dev, artiLinks);
+    DevBuf bArtiB2W = makeDev(dev, artiB2W);
+    DevBuf bArtiResp = makeDev(dev, artiResp);
+    std::vector<physx::PxgArticulation> artiRecs(nbArticulations);
+    std::memset(static_cast<void*>(artiRecs.data()), 0, artiRecs.size() * sizeof(artiRecs[0]));
+    for (uint32_t r = 0; r < nbArticulations; ++r)
+    {
+        artiRecs[r].links = reinterpret_cast<physx::PxgArticulationLink*>(
+            size_t(bArtiLinks.addr + uint64_t(r * maxLinks) * sizeof(physx::PxgArticulationLink)));
+        artiRecs[r].linkBody2Worlds = reinterpret_cast<physx::PxTransform*>(
+            size_t(bArtiB2W.addr + uint64_t(r * maxLinks) * sizeof(physx::PxTransform)));
+        artiRecs[r].spatialResponseMatrixW = reinterpret_cast<physx::PxSpatialMatrix*>(
+            size_t(bArtiResp.addr + uint64_t(r * maxLinks) * sizeof(physx::PxSpatialMatrix)));
+    }
+    DevBuf bArtiRecs = makeDev(dev, artiRecs);
+    std::vector<physx::PxgBodySim> bodySims(6u);
+    std::memset(static_cast<void*>(bodySims.data()), 0, bodySims.size() * sizeof(bodySims[0]));
+    for (uint32_t n = 0; n < 6u; ++n) bodySims[n].articulationRemapId = 0xDEADu;
+    bodySims[5].articulationRemapId = artiRemapId;
+    DevBuf bBodySims = makeDev(dev, bodySims);
+    std::vector<F4> outArtiVelocity(4u * artiOffset);
+    for (uint32_t k = 0; k < 4u * artiOffset; ++k)
+    {
+        const float fk = float(k);
+        const float sc = (k >= 2u * artiOffset) ? 0.01f : 1.0f;
+        outArtiVelocity[k] = { sc * (0.12f - 0.03f * fk), sc * (-0.45f + 0.02f * fk), sc * (0.08f + 0.01f * fk), 777.0f };
+    }
+    DevBuf bOutArtiVel = makeDev(dev, outArtiVelocity);
+    std::vector<uint8_t> artiCoreDesc(sizeof(physx::PxgArticulationCoreDesc), 0xAB);
+    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, mMaxLinksPerArticulation), maxLinks);
+    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, nbArticulations), nbArticulations);
+    DevBuf bArtiCoreDesc = makeDev(dev, artiCoreDesc);
+    const uint32_t artiRecLink = artiRemapId * maxLinks + artiLinkId;
+    const uint32_t artiVelRow = artiSolverIdx * maxLinks + artiLinkId;
+
+    // --- descriptors ---------------------------------------------------------
+    std::vector<uint8_t> prepDesc(304, 0);
+    pokePtr(prepDesc, 64, bSolverBodyData.addr);
+    pokePtr(prepDesc, 72, bSolverTxIData.addr);
+    pokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    pokePtr(solverCoreDesc, 40, bOutArtiVel.addr);          // outArtiVelocity @40
+    pokeU32(solverCoreDesc, 268, numSolverBodies);
+    pokeU32(solverCoreDesc, 276, accOffset);
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
+    pokePtr(sharedDesc, 32, bBodySims.addr);                // mBodySimBufferDeviceData @32
+    pokePtr(sharedDesc, 40, bArtiRecs.addr);                // articulations @40
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ======================= PREPARE ===================================
+    struct PrepPush
+    {
+        uint64_t clothes, rigidAttachments, activeRigidAttachments, rigidAttachmentIds;
+        uint32_t numRigidAttachments, pad36;
+        uint64_t constraints, prePrepDesc, prepDesc, sharedDesc, rigidDeltaVel;
+    };
+    PrepPush pp = {};
+    pp.clothes = bDesc.addr; pp.rigidAttachments = bAtt.addr; pp.activeRigidAttachments = bActiveAtt.addr;
+    pp.rigidAttachmentIds = bAttachIds.addr; pp.numRigidAttachments = N; pp.constraints = bConstraint.addr;
+    pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr; pp.sharedDesc = bSharedDesc.addr;
+    pp.rigidDeltaVel = bRigidDeltaVel.addr;
+    Kernel kPrep("femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch", {}, sizeof(PrepPush));
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
+    dev->flush();
+
+    auto laneIsArti = [&](uint32_t i) { return ((laneNode[i] >> 32) & 1ull) != 0ull; };
+    auto laneIsTri = [&](uint32_t i) { return laneBary[i].x != 0.0f || laneBary[i].y != 0.0f || laneBary[i].z != 0.0f; };
+    auto laneBody = [&](uint32_t i) { return laneNode[i] == staticNode ? 0u : solverBodyIndices[uint32_t(laneNode[i])]; };
+    auto laneTri = [&](uint32_t i) {
+        return std::array<uint32_t, 3>{ triVtx[4u * laneElem[i]], triVtx[4u * laneElem[i] + 1u], triVtx[4u * laneElem[i] + 2u] };
+    };
+    auto lanePick = [&](uint32_t i, const std::vector<F4>& arr) {
+        if (!laneIsTri(i)) return arr[laneElem[i]];
+        const auto t = laneTri(i);
+        return p7Bref::blend(arr[t[0]], arr[t[1]], arr[t[2]], laneBary[i]);
+    };
+
+    RigidAttachConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 pose = lanePick(i, positions);
+        if (laneIsArti(i))
+        {
+            p7Bref::refPrepareArti(refC, int(i), pose, laneRa4[i], axisIn, axisAngleW, lowHigh, laneBary[i],
+                                   laneElem[i], laneNode[i], artiB2W[artiRecLink], artiResp[artiRecLink]);
+            continue;
+        }
+        // refPrepare fills slot 0; build into a scratch block and copy the slot.
+        RigidAttachConstraintHost tmp;
+        std::memset(&tmp, 0xCD, sizeof(tmp));
+        const uint32_t b = laneBody(i);
+        const F4 q = body2World[2u * b], p = body2World[2u * b + 1u];
+        p73ref::refPrepare(tmp, pose, laneRa4[i], axisIn, axisAngleW, lowHigh, laneBary[i], laneElem[i], laneNode[i],
+                           q.x, q.y, q.z, q.w, V3{ p.x, p.y, p.z }, invMassOf[b], sqrtInv[b],
+                           laneNode[i] == staticNode);
+        refC.raXn0_biasW[i] = tmp.raXn0_biasW[0]; refC.raXn1_biasW[i] = tmp.raXn1_biasW[0];
+        refC.raXn2_biasW[i] = tmp.raXn2_biasW[0]; refC.velMultiplierXYZ_invMassW[i] = tmp.velMultiplierXYZ_invMassW[0];
+        refC.elemId[i] = tmp.elemId[0]; refC.rigidId[i] = tmp.rigidId[0]; refC.baryOrType[i] = tmp.baryOrType[0];
+        refC.low_high_limits[i] = tmp.low_high_limits[0]; refC.axis_angle[i] = tmp.axis_angle[0];
+    }
+    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidAttachConstraintHost));
+    RigidAttachConstraintHost gotC;
+    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
+    size_t mm = 0;
+    auto cmp4 = [&](const char* what, uint32_t lane, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%.9g,%.9g,%.9g,%.9g) got(%.9g,%.9g,%.9g,%.9g)\n", what, lane,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmp4("prep raXn0_biasW", i, refC.raXn0_biasW[i], gotC.raXn0_biasW[i]);
+        cmp4("prep raXn1_biasW", i, refC.raXn1_biasW[i], gotC.raXn1_biasW[i]);
+        cmp4("prep raXn2_biasW", i, refC.raXn2_biasW[i], gotC.raXn2_biasW[i]);
+        cmp4("prep velMult", i, refC.velMultiplierXYZ_invMassW[i], gotC.velMultiplierXYZ_invMassW[i]);
+        cmp4("prep baryOrType", i, refC.baryOrType[i], gotC.baryOrType[i]);
+        cmp4("prep low_high", i, refC.low_high_limits[i], gotC.low_high_limits[i]);
+        cmp4("prep axis_angle", i, refC.axis_angle[i], gotC.axis_angle[i]);
+        if (gotC.elemId[i] != refC.elemId[i]) { ++mm; std::printf("  prep elemId[%u] MM\n", i); }
+        if (gotC.rigidId[i] != refC.rigidId[i]) { ++mm; std::printf("  prep rigidId[%u] MM\n", i); }
+    }
+    const auto gIds = downloadBuffer<uint64_t>(dev, bAttachIds.h, N);
+    for (uint32_t i = 0; i < N; ++i)
+        if (gIds[i] != laneNode[i]) { ++mm; std::printf("  rigidAttachmentIds[%u] MM\n", i); }
+    // The prepare zeroes rigidDeltaVel for the RIGID arm only; the link lane keeps the sentinel.
+    const auto gRdvPrep = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 want = laneIsArti(i) ? sentinel : F4{ 0, 0, 0, 0 };
+        cmp4("prep rigidDeltaVel lin", i, want, gRdvPrep[i]);
+        cmp4("prep rigidDeltaVel ang", i, want, gRdvPrep[i + N]);
+    }
+    PXG_CHECK_MSG(f2u(gotC.velMultiplierXYZ_invMassW[3].w) == f2u(1.0f),
+                  "link lane must carry invMass0 = 1 (got %g)", gotC.velMultiplierXYZ_invMassW[3].w);
+    PXG_CHECK_MSG(f2u(gotC.velMultiplierXYZ_invMassW[1].w) == f2u(invMassOf[1]),
+                  "dynamic lane must carry the body's invMass0 (got %g)", gotC.velMultiplierXYZ_invMassW[1].w);
+    PXG_CHECK_MSG(mm == 0, "all-anchor cloth_rigidAttachmentPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ======================= SOLVE =====================================
+    struct SolvePush
+    {
+        uint64_t clothes, attachments;
+        uint32_t numAttachments, pad20;
+        uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
+        float dt;
+        uint32_t pad60;
+        uint64_t rigidDeltaVel;
+    };
+    SolvePush sp = {};
+    sp.clothes = bDesc.addr; sp.attachments = bConstraint.addr; sp.numAttachments = N;
+    sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = bArtiCoreDesc.addr; sp.sharedDesc = bSharedDesc.addr; sp.dt = dt;
+    sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    const char* solveEntry = isTGS ? "cloth_solveRigidClothAttachmentTGSLaunch" : "cloth_solveRigidClothAttachmentLaunch";
+    Kernel kSolve("femClothRigidAttachBda.spv", solveEntry, {}, sizeof(SolvePush));
+    kSolve.dispatch(FEM_PREP_GRID, {}, sp, 1u, 1u);   // SB_UPDATEROTATION grid, as the engine
+    dev->flush();
+
+    // ---- reference -------------------------------------------------------------
+    auto laneVel = [&](uint32_t i) {
+        p7Bref::RigidVel v;
+        if (laneIsArti(i))
+        {
+            const F4 l = outArtiVelocity[artiVelRow], a = outArtiVelocity[artiVelRow + artiOffset];
+            v.linVel = { l.x, l.y, l.z }; v.angVel = { a.x, a.y, a.z };
+            if (isTGS)
+            {
+                const F4 ld = outArtiVelocity[artiVelRow + 2u * artiOffset], ad = outArtiVelocity[artiVelRow + 3u * artiOffset];
+                v.linDelta = { ld.x, ld.y, ld.z }; v.angDelta = { ad.x, ad.y, ad.z };
+            }
+            return v;
+        }
+        const uint32_t b = laneBody(i);
+        if (isTGS)
+        {
+            const F4 v0 = solverBodyVelPool[accOffset + b], v1 = solverBodyVelPool[accOffset + b + numSolverBodies];
+            const F4 v2 = solverBodyVelPool[accOffset + b + 2u * numSolverBodies];
+            v.linVel = { v0.x, v0.y, v0.z }; v.angVel = { v0.w, v1.x, v1.y };
+            v.linDelta = { v1.z, v1.w, v2.x }; v.angDelta = { v2.y, v2.z, v2.w };
+        }
+        else
+        {
+            const F4 iv0 = outSolverVelocity[b], iv1 = outSolverVelocity[b + numSolverBodies];
+            const F4 dv0 = solverBodyVelPool[accOffset + b], dv1 = solverBodyVelPool[accOffset + b + numSolverBodies];
+            v.linVel = { iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z };
+            v.angVel = { iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z };
+        }
+        return v;
+    };
+
+    std::vector<F4> refDelta(deltaPos.begin(), deltaPos.end());   // guard rows keep guardDelta
+    std::vector<F4> refRdv(gRdvPrep.begin(), gRdvPrep.end());
+    auto scatter = [&](uint32_t v, V3 d, float w) {
+        refDelta[v].x = 0.0f + d.x * w; refDelta[v].y = 0.0f + d.y * w; refDelta[v].z = 0.0f + d.z * w;
+        refDelta[v].w += 1.0f;
+    };
+    uint32_t coneChanged = 0u, reacting = 0u;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 st = lanePick(i, isTGS ? accumDelta : velocities);
+        const bool isStatic = laneNode[i] == staticNode;
+        if (isStatic && st.w == 0.0f)
+            continue;
+        const p7Bref::RigidVel v = laneVel(i);
+        const V3 lin1 = V3{ st.x, st.y, st.z };
+        const p7Bref::SolveOut o = isTGS ? p7Bref::refImpulseTGS(gotC, int(i), lin1, v, dt, true)
+                                         : p7Bref::refImpulsePGS(gotC, int(i), lin1, v, 1.0f / dt, true);
+        const p7Bref::SolveOut o0 = isTGS ? p7Bref::refImpulseTGS(gotC, int(i), lin1, v, dt, false)
+                                          : p7Bref::refImpulsePGS(gotC, int(i), lin1, v, 1.0f / dt, false);
+        if (f2u(o.deltaImpulse.x) != f2u(o0.deltaImpulse.x) || f2u(o.deltaImpulse.y) != f2u(o0.deltaImpulse.y) ||
+            f2u(o.deltaImpulse.z) != f2u(o0.deltaImpulse.z))
+            ++coneChanged;
+        if (!isStatic)
+        {
+            const float im0 = gotC.velMultiplierXYZ_invMassW[i].w;
+            if (im0 == 0.0f)
+            {
+                refRdv[i] = F4{ 0, 0, 0, 0 }; refRdv[i + N] = F4{ 0, 0, 0, 0 };
+            }
+            else
+            {
+                ++reacting;
+                refRdv[i] = F4{ o.deltaLinVel.x, o.deltaLinVel.y, o.deltaLinVel.z, 1.0f };
+                refRdv[i + N] = F4{ o.deltaAngVel.x, o.deltaAngVel.y, o.deltaAngVel.z, 0.0f };
+            }
+        }
+        const V3 di = o.deltaImpulse;
+        if (di.x != 0.0f || di.y != 0.0f || di.z != 0.0f)
+        {
+            const V3 dp = isTGS ? V3{ -di.x, -di.y, -di.z } : V3{ -di.x * dt, -di.y * dt, -di.z * dt };
+            if (!laneIsTri(i))
+                scatter(laneElem[i], dp, st.w);
+            else
+            {
+                const auto t = laneTri(i);
+                const std::vector<F4>& src = isTGS ? accumDelta : velocities;
+                scatter(t[0], p7Bref::scale3(dp, laneBary[i].x), src[t[0]].w);
+                scatter(t[1], p7Bref::scale3(dp, laneBary[i].y), src[t[1]].w);
+                scatter(t[2], p7Bref::scale3(dp, laneBary[i].z), src[t[2]].w);
+            }
+        }
+    }
+    PXG_CHECK_MSG(reacting == 3u, "coverage: dynamic vertex + dynamic triangle + link must react (got %u)", reacting);
+    if (!isTGS)
+        PXG_CHECK_MSG(coneChanged > 0u,
+                      "coverage: the PGS cone-limited round trip must change at least one lane's impulse bits");
+    std::printf("  [%s] cone branch changed %u of %u lanes' impulse bits\n", isTGS ? "TGS" : "PGS", coneChanged, N);
+
+    mm = 0;
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, nbRows);
+    for (uint32_t k = 0; k < nbRows; ++k)
+        cmp4("solve mDeltaPos", k, refDelta[k], gDelta[k]);
+    size_t guardHit = 0;
+    for (uint32_t k = nbVerts; k < nbRows; ++k)
+        if (f2u(gDelta[k].x) != f2u(guardDelta.x) || f2u(gDelta[k].y) != f2u(guardDelta.y) ||
+            f2u(gDelta[k].z) != f2u(guardDelta.z) || f2u(gDelta[k].w) != f2u(guardDelta.w))
+            ++guardHit;
+    PXG_CHECK_MSG(guardHit == 0, "no mDeltaPos row >= nbVerts (%u) may be written (%zu guard rows hit)", nbVerts, guardHit);
+    const auto gRdv = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
+    for (uint32_t k = 0; k < 2u * N; ++k)
+        cmp4("solve rigidDeltaVel", k, refRdv[k], gRdv[k]);
+    PXG_CHECK_MSG(f2u(gDelta[4].w) == 0u, "vertex 4 (owned by nobody) must stay untouched");
+    PXG_CHECK_MSG(gDelta[5].w == 1.0f && gDelta[6].w == 1.0f && gDelta[7].w == 1.0f,
+                  "triangle %u >= nbVerts (%u) must scatter into its three corners 5,6,7", triA, nbVerts);
+    PXG_CHECK_MSG(mm == 0, "all-anchor cloth_solveRigidClothAttachment%s bit-exact vs CPU (%zu mismatches)",
+                  isTGS ? "TGS" : "PGS", mm);
+
+    DevBuf all[] = { bPos, bVel, bAcc, bDelta, bTri, bDesc, bAtt, bActiveAtt, bAttachIds, bConstraint, bRigidDeltaVel,
+                     bBody2World, bSolverBodyData, bSolverTxIData, bOutSolverVel, bSolverBodyVelPool, bSolverBodyIndices,
+                     bArtiLinks, bArtiB2W, bArtiResp, bArtiRecs, bBodySims, bOutArtiVel, bArtiCoreDesc,
+                     bPrepDesc, bPrePrepDesc, bSolverCoreDesc, bSharedDesc };
+    for (const DevBuf& b : all) dev->destroyBuffer(b.h);
+}
+
+PXG_TEST(femClothSimRigidAttachAllAnchorsPGS) { runRigidAttachAllAnchors(/*isTGS*/ false); }
+PXG_TEST(femClothSimRigidAttachAllAnchorsTGS) { runRigidAttachAllAnchors(/*isTGS*/ true); }
 
 // ---------------------------------------------------------------------------
 // P7.1 tranche 3c: cloth_applyExternalDeltasLaunch — folds the accumulated

@@ -85,14 +85,11 @@ cloth_preIntegrateLaunch                               5@40+8:speculativeCCDCont
 cloth_psContactGenLaunch                               0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
 cloth_psMidphaseGeneratePairsLaunch                    1@4+4:toleranceLength;4@24+8:transformCache;5@32+8:bounds      # dead-upstream
 cloth_refitBoundLaunch                                 3@24+8:contactDists                                            # dead-upstream
-cloth_rigidAttachmentPrepareLaunch                     8@64+8:sharedDesc                                              # deferred
 cloth_rigidContactPrepareLaunch                        10@80+4:invDt;12@96+1:isTGS                                    # dead-upstream
 cloth_selfCollisionMidphaseEELaunch                    4@32+8:clothClothPairs;5@40+4:numClothClothPairs               # dead-upstream
 cloth_selfCollisionMidphaseVTLaunch                    4@32+8:clothClothPairs;5@40+4:numClothClothPairs               # dead-upstream
 cloth_solveClothClothDeltaEELaunch                     3@24+4:dt                                                      # dead-upstream
 cloth_solveClothClothDeltaVTLaunch                     3@24+4:dt                                                      # dead-upstream
-cloth_solveRigidClothAttachmentLaunch                  5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
-cloth_solveRigidClothAttachmentTGSLaunch               5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
 cloth_updateClothContactValidityLaunch                 7@48+4:dt                                                      # dead-upstream
 convexHeightFieldMidphase                              9@64+8:cmOutputs                                               # dead-upstream
 convexHeightfieldPostProcess                           2@16+8:cvxTriIntermPtr                                         # dead-upstream

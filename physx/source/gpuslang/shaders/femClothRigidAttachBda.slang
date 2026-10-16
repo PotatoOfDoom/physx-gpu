@@ -26,67 +26,72 @@
 
 // femClothRigidAttachBda — P7.1 tranche 3a: the FEM-cloth RIGID-ATTACHMENT
 // constraint kernels on the Vulkan engine ABI (BDA).  The machinery that PINS a
-// cloth vertex to a rigid / world anchor (toward a hanging / draping cloth),
-// ported line-for-line from
+// cloth vertex or triangle point to a world anchor, a dynamic rigid body or an
+// articulation link, ported line-for-line from
 //   gpusimulationcontroller/src/CUDA/FEMClothConstraintPrep.cu (the prepare)
 //   gpusimulationcontroller/src/CUDA/FEMClothExternalSolve.cu   (the solves)
 // with the attachment-impulse leaf from src/CUDA/attachments.cuh:
 //   - cloth_rigidAttachmentPrepareLaunch (FEMClothConstraintPrep.cu:387, launch
 //     PxgFEMClothCore.cpp:226): builds the block-of-32 PxgFEMRigidAttachment-
-//     Constraint from each PxgFEMRigidAttachment — resolves the cloth attach point,
-//     the rigid anchor frame (ra = body2World.rotate(localPose0)), the three
-//     axis responses (raXn x sqrtInvInertia) and the per-axis velocity multipliers.
+//     Constraint from each PxgFEMRigidAttachment — resolves the cloth attach point
+//     (vertex or barycentric triangle point), the anchor frame, the three axis
+//     responses and the per-axis velocity multipliers.  BOTH arms: the
+//     ARTICULATION link (:478-527) and the rigid / static body (:528-587).
 //   - cloth_solveRigidClothAttachmentLaunch (PGS) / ...TGSLaunch (TGS)
 //     (FEMClothExternalSolve.cu:1371 / :1571, launch PxgFEMClothCore.cpp:1850):
-//     read the rigid anchor velocity, compute the attachment delta impulse
-//     (calculateAttachmentDeltaImpulsePGS/TGS, attachments.cuh:83 / :147) and
-//     scatter the cloth-side position correction into mDeltaPos.
+//     read the anchor velocity (rigid body or link), compute the attachment delta
+//     impulse (calculateAttachmentDeltaImpulsePGS/TGS, attachments.cuh:83 / :147,
+//     cone-limited branch included), write the anchor's reaction into rigidDeltaVel
+//     and scatter the cloth-side position correction into mDeltaPos (one vertex, or
+//     the three corners of a triangle, barycentric * invMass weighted).
 //
-// SCOPE — rigid / WORLD anchor (the hanging-cloth pin).  For a STATIC / world
-// anchor the rigid side has zero velocity + infinite mass, so the reaction path
-// collapses: the same precedent as the particle-vs-static-floor tranches, we DEFER
-// the dynamic-rigid reaction (see the "DEVIATIONS" list).  The cloth-side pull is
-// exact (bit-exact vs the CPU transcription in testFemClothSim.cpp).
+// TRANCHE B of task 35 ported what had been deferred here:
+//   - the prepare's ARTICULATION arm (FEMClothConstraintPrep.cu:478-527): the link
+//     pose is articulations[bodySims[node].articulationRemapId].linkBody2Worlds
+//     [linkId] and the response spatialResponseMatrixW[linkId] (the same two
+//     indices, and the same asmLoad6x6Record, as prepareFEMContacts in
+//     pxgSlangFemRigidContact).  The CUDA quirks are copied as written: resp1 and
+//     resp2 dot deltaV0 (not deltaV1 / deltaV2, which the CUDA computes and never
+//     reads -- not computed here), velMultiplierXYZ_invMassW.w = 1, raXn stored
+//     WITHOUT a sqrtInvInertia factor, and this arm does NOT zero rigidDeltaVel;
+//   - the solves' ARTICULATION velocity read (dataReadWriteHelper.cuh:105-113 /
+//     :126-141) -- readRigidVelocity of pxgSlangFemRigidContact, which carries both
+//     arms (and sinks the artiCoreDesc reads into the link arm, its documented
+//     deviation);
+//   - the DYNAMIC-rigid / link REACTION (FEMClothExternalSolve.cu:1455-1467 PGS /
+//     :1651-1664 TGS): deltaLinVel = deltaImpulse * invMass0, deltaAngVel from the
+//     SAME raXn rows as the impulse (attachments.cuh:129-132 / :195-196).  The PGS
+//     call site passes raXn0_biasW THREE times (:1451), so PGS takes raXn0 for all
+//     three rows of the velocity, of the position error AND of deltaAngVel -- an
+//     upstream quirk, reproduced.  The rows are consumed by accumulateDeltaVRigid*
+//     (rigidDeltaAccumBda, PxgFEMClothCore.cpp:1888);
+//   - TRIANGLE attachments in the solves (:1417-1431 + :1474-1483 PGS, :1616-1630
+//     + :1671-1680 TGS).  Until then both solves read and scattered vertex #elemIdx
+//     for a triangle attachment -- an unrelated vertex, or past the end of the
+//     vertex buffers once the triangle index reached nbVerts;
+//   - the cone-LIMITED branch (attachments.cuh:112-120 / :176-180).  It is NOT a
+//     corner case: every public-API cloth attachment takes it (a NULL cone leaves
+//     low_high_limits = (0,0), angle = -1, PxgSimulationController.cpp:3062-3063,
+//     and isConeLimitedEnabled tests `>= 0`).  isConeLimitedEnabled /
+//     computeConeLimitedError are the shared ones of pxgSlangFemFemAttach.  With a
+//     zero-length cone (0,0) the branch returns relPos - 0 * dir; in TGS that is the
+//     input up to the sign of a zero, in PGS the velError -> posError -> velError
+//     round trip moves it by ~1 ulp.
 //
-// DEVIATIONS from the CUDA original (recipe policy; each preserves the constraint
-// semantics for a rigid / world anchor and is exercised by testFemClothSim.cpp):
+// DEVIATIONS from the CUDA original (recipe policy):
 //   - the descriptors arrive as device pointers read through Ptr<> (BDA), reusing
 //     the byte-exact pxgSlang* mirrors (FEMClothDesc / PrepDesc / SolverDesc /
 //     Common).  The block-of-32 constraint and the 96-byte PxgFEMRigidAttachment
 //     are addressed by explicit byte offset through Ptr<> (no descriptor block
 //     copy), exactly as the other BDA kernels read their SoA blocks;
-//   - the ARTICULATION anchor branch is DEFERRED (a rigid / world anchor is never
-//     an articulation: rigidId.isArticulation()==false).  Both the prepare's
-//     articulation constraint build (spatialResponseMatrixW path) and the solve's
-//     articulation link-velocity read are omitted — same precedent as
-//     psContactSolveTgsBda, which sinks the outArtiVelocity read behind the
-//     isArticulation guard so a rigid / static contact never dereferences it;
-//   - the DYNAMIC-rigid REACTION is DEFERRED.  For a static anchor the CUDA guards
-//     the rigidDeltaVel writeback behind !rigidId.isStaticBody() (never taken), so
-//     nothing is lost; for a dynamic anchor the reaction accumulation is a
-//     follow-on tranche.  The prepare still zeroes rigidDeltaVel[workIndex] and
-//     [workIndex+numRigidAttachments] when the buffer is bound (the CUDA does this
-//     unconditionally in the rigid branch), and the solve leaves the buffer
-//     untouched for a static anchor (matching the guarded CUDA);
-//   - the cone-LIMITED attachment path (isConeLimitedEnabled ->
-//     computeConeLimitedError, a PxSinCos transcendental seam, attachments.cuh:48)
-//     is DEFERRED.  For a plain pin (worldAxis_angle.w < 0 && low/high limits < 0,
-//     the world-anchor case) isConeLimitedEnabled() is false and the branch is
-//     skipped verbatim, so the plain-attachment velError / tgsError below is the
-//     exact CUDA false-path;
-//   - cloth.mDeltaPos accumulation: the CUDA AtomicAdd(float4&, PxVec3, 1.f)
-//     (atomic.cuh:46) is emitted as a plain load-add-store.  Attachments are
-//     solved one work-item per constraint; for the single-attachment unit test
-//     (and any attachment set with no two constraints sharing a cloth vertex) there
-//     is no cross-thread contention, so the read-modify-write is bit-identical to
-//     the atomic.  The general multi-attachment averaging is a follow-on scene
-//     tranche — same precedent as the particle one-way solve, whose per-contact
-//     deltaP scatter was replaced by a contention-free gather;
+//   - the artiCoreDesc reads are inside the link arm of readRigidVelocity (see
+//     pxgSlangFemRigidContact's header); no value changes;
 //   - getNormalized()'s PxRecipSqrt lowers to `v * (1.0/sqrt(m))` (the unix
 //     intrinsic recipSqrt is literally 1.0f/::sqrtf, PxUnixMathIntrinsics.h:93) —
 //     IEEE-correctly-rounded, bit-exact across backends; the CPU reference uses the
-//     identical expression, so worldAxis (dead in the plain-attachment solve) is
-//     bit-exact too.
+//     identical expression.
+//   - computeConeLimitedError's PxSinCos is sin()/cos() (the module's own seam); it
+//     is only reached for a cone with angle > 0, which no fixture or scene here uses.
 //
 // All float arithmetic is NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the raXn
 // cross / sqrtInvInertia dot responses feed the compared velMultiplier, and the
@@ -101,6 +106,12 @@ import pxgSlangCommon;         // PxgSolverBodyData, PxgSolverTxIData, PxgAligne
 import pxgSlangFemRigidAttach; // the PxgFEMRigidAttachmentConstraint / PxgFEMRigidAttachment
                                // byte layouts and the quat/normalize helpers, shared with
                                // the softbody attachment path (see that module's header)
+import pxgSlangFemRigidContact; // crossVec / dotVec / mat33MulVec, the PxNodeIndex accessors
+                                // and readRigidVelocity (PxgVelocityReader, both arms)
+import pxgSlangFemFemAttach;   // isConeLimitedEnabled / computeConeLimitedError (attachments.cuh:36/:48)
+import pxgSlangArticulationDesc;   // PXG_ARTI_*, artiPtrField
+import pxgSlangArticulationBlocks; // AbMatrix6x6
+import pxgSlangSpatialMatrix;      // AbSpatialVector, asmSVec, asmM6MulVec, asmLoad6x6Record
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h).
 static const uint RA_BLOCK = 256u;
@@ -113,26 +124,6 @@ static const float FEMCLOTH_BIAS_COEFFICIENT = 0.7f;
 // (PxgSimulationCoreDesc.h:41) — the cloth-id / element-index packing.
 static const uint PXG_CLOTH_ELEMENT_MASK = 0x000fffffu;
 static const uint PXG_CLOTH_ID_SHIFT = 20u;
-
-float3 crossVec(float3 a, float3 b)
-{
-    return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-}
-
-float dotVec(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-
-// PxMat33 (column-major sqrtInvInertia[9]) * PxVec3.
-float3 mat33MulVec(float m[9], float3 v)
-{
-    return float3(m[0] * v.x + m[3] * v.y + m[6] * v.z,
-                  m[1] * v.x + m[4] * v.y + m[7] * v.z,
-                  m[2] * v.x + m[5] * v.y + m[8] * v.z);
-}
-
-// PxNodeIndex (PxNodeIndex.h:49) packed in the low/high 32 bits of a PxU64.
-bool nodeIsStaticBody(uint64_t ind) { return uint(ind & 0xffffffffUL) == 0xffffffffu; }
-uint nodeIndex(uint64_t ind) { return uint(ind & 0xffffffffUL); }
-bool nodeIsArticulation(uint64_t ind) { return (uint(ind >> 32) & 1u) != 0u; }
 
 // ---------------------------------------------------------------------------
 // cloth_rigidAttachmentPrepareLaunch push-constant blob (FEMClothConstraintPrep.cu:387).
@@ -274,9 +265,71 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
         const float3 normal1 = float3(0.0f, 1.0f, 0.0f);
         const float3 normal2 = float3(0.0f, 0.0f, 1.0f);
 
-        // ARTICULATION anchor branch DEFERRED (see header): a rigid / world anchor
-        // is never an articulation, so the else (rigid / static) path is taken.
-        // solverBodyIdx is 0 for a static body (solverBodyIndices untouched).
+        if (nodeIsArticulation(rigidId))
+        {
+            // FEMClothConstraintPrep.cu:478-527.  Two indices from one PxNodeIndex: the
+            // ARTICULATION through the node's body sim (articulationRemapId), the LINK
+            // through articulationLinkId() -- as prepareFEMContacts' link arm.
+            Ptr<PxgSolverSharedDescPGSGpu> sharedDesc = Ptr<PxgSolverSharedDescPGSGpu>(gPrep.sharedDesc);
+            Ptr<PxgBodySim> bodySims = Ptr<PxgBodySim>(sharedDesc[0].mBodySimBufferDeviceData);
+            const uint nodeIndexA = nodeIndex(rigidId);
+            const uint artiId = bodySims[nodeIndexA].articulationRemapId;
+            const uint64_t articulation = sharedDesc[0].articulations + uint64_t(artiId) * PXG_ARTI_STRIDE;
+
+            const uint linkID = nodeArticulationLinkId(rigidId);
+            // linkBody2Worlds: PxTransform (28 B) -- q at 0, p at 16.
+            Ptr<float> body2World = Ptr<float>(artiPtrField(articulation, PXG_ARTI_LINK_BODY2WORLDS)
+                                               + uint64_t(linkID) * PXG_ARTI_TRANSFORM_SIZE);
+            const float4 b2wQ = float4(body2World[0], body2World[1], body2World[2], body2World[3]);
+            const float3 bodyFrame0p = float3(body2World[4], body2World[5], body2World[6]);
+
+            const float3 worldAxis = vecGetNormalized(quatRotateVec(b2wQ, axis));
+
+            const float3 ra = quatRotateVec(b2wQ, ra4);
+            const float3 error = float3(ra.x + bodyFrame0p.x - point.x,
+                                        ra.y + bodyFrame0p.y - point.y,
+                                        ra.z + bodyFrame0p.z - point.z);
+
+            const float3 raXn0 = crossVec(ra, normal0);
+            const float3 raXn1 = crossVec(ra, normal1);
+            const float3 raXn2 = crossVec(ra, normal2);
+
+            const AbMatrix6x6 spatialResponse =
+                asmLoad6x6Record(artiPtrField(articulation, PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W), linkID);
+            // spatialResponse * Cm::UnAlignedSpatialVector(normal0, raXn0).  The CUDA also
+            // forms deltaV1 / deltaV2 (:504-505) and never reads them: resp1 and resp2 below
+            // dot deltaV0 -- the upstream quirk, copied.
+            const AbSpatialVector deltaV0 = asmM6MulVec(spatialResponse, asmSVec(normal0, raXn0));
+
+            const float resp0 = dotVec(deltaV0.top, raXn0) + dotVec(deltaV0.bottom, normal0) + invMass1;
+            const float resp1 = dotVec(deltaV0.top, raXn1) + dotVec(deltaV0.bottom, normal1) + invMass1;
+            const float resp2 = dotVec(deltaV0.top, raXn2) + dotVec(deltaV0.bottom, normal2) + invMass1;
+
+            const float velMultiplier0 = (resp0 > 0.0f) ? (1.0f / resp0) : 0.0f;
+            const float velMultiplier1 = (resp1 > 0.0f) ? (1.0f / resp1) : 0.0f;
+            const float velMultiplier2 = (resp2 > 0.0f) ? (1.0f / resp2) : 0.0f;
+
+            const float biasedErr0 = dotVec(error, normal0);
+            const float biasedErr1 = dotVec(error, normal1);
+            const float biasedErr2 = dotVec(error, normal2);
+
+            // Raw raXn rows (no sqrtInvInertia factor), and invMass0 = 1 "so that the impulse
+            // scaling for the linear impulse to convert it to a velocity change remains an
+            // impulse" (:519-520).  No rigidDeltaVel zeroing in this arm (the CUDA has none).
+            Ptr<float4>(cBase + RAC_raXn0_biasW)[offset] = float4(raXn0.x, raXn0.y, raXn0.z, biasedErr0);
+            Ptr<float4>(cBase + RAC_raXn1_biasW)[offset] = float4(raXn1.x, raXn1.y, raXn1.z, biasedErr1);
+            Ptr<float4>(cBase + RAC_raXn2_biasW)[offset] = float4(raXn2.x, raXn2.y, raXn2.z, biasedErr2);
+            Ptr<float4>(cBase + RAC_velMult_invMass)[offset] = float4(velMultiplier0, velMultiplier1, velMultiplier2, 1.0f);
+            Ptr<uint>(cBase + RAC_elemId)[offset] = elemId;
+            Ptr<uint64_t>(cBase + RAC_rigidId)[offset] = rigidId;
+            Ptr<float4>(cBase + RAC_baryOrType)[offset] = baryOrType1;
+            Ptr<float4>(cBase + RAC_low_high_limits)[offset] = low_high_limits;
+            Ptr<float4>(cBase + RAC_axis_angle)[offset] = float4(worldAxis.x, worldAxis.y, worldAxis.z, axis_angle.w);
+            continue;
+        }
+
+        // :528 -- the rigid / static arm.  solverBodyIdx is 0 for a static body
+        // (solverBodyIndices untouched).
         uint solverBodyIdx = 0u;
         if (!isStatic)
             solverBodyIdx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(gPrep.prePrepDesc)[0].solverBodyIndices)[nodeIndex(rigidId)];
@@ -342,9 +395,7 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
         Ptr<float4>(cBase + RAC_low_high_limits)[offset] = low_high_limits;
         Ptr<float4>(cBase + RAC_axis_angle)[offset] = float4(worldAxis.x, worldAxis.y, worldAxis.z, axis_angle.w);
 
-        // DYNAMIC-rigid reaction DEFERRED: the CUDA zeroes rigidDeltaVel here in the
-        // rigid branch when the buffer is bound; the accumulation itself is a
-        // follow-on tranche.  For a static anchor this write is inert.
+        // :582-586 -- the rigid arm zeroes both reaction rows when the buffer is bound.
         if (gPrep.rigidDeltaVel != 0UL)
         {
             Ptr<float4> rigidDeltaVel = Ptr<float4>(gPrep.rigidDeltaVel);
@@ -355,14 +406,34 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
 }
 
 // ---------------------------------------------------------------------------
-// The cloth-side attachment scatter (both solves): the CUDA AtomicAdd, as a REAL
-// atomic (pxgSlangAtomicFloat).  Vertex attachment only (the world-anchor
-// pin); the triangle-barycentric scatter follows the same shape.
+// The cloth-side attachment scatter (both solves): the CUDA
+// AtomicAdd(float4&, PxVec3 v, 1.f) (atomic.cuh:46) as a REAL atomic
+// (pxgSlangAtomicFloat).  `deltaPos * w` is the CUDA's last product: for a vertex
+// `deltaPos * invMass`, for a triangle corner `(deltaPos * bary_i) * invMass_i`, the
+// caller passing `deltaPos * bary_i` (FEMClothExternalSolve.cu:1476-1482 / :1673-1679).
 // ---------------------------------------------------------------------------
-void applyClothDelta(uint64_t deltaPosBase, uint elemIdx, float3 deltaPos, float w)
+void applyClothDelta(uint64_t deltaPosBase, uint vertIdx, float3 deltaPos, float w)
 {
-    pxgAtomicAddF4XYZ(deltaPosBase, elemIdx, deltaPos * w);
-    pxgAtomicAddF4W(deltaPosBase, elemIdx, 1.0f);
+    pxgAtomicAddF4XYZ(deltaPosBase, vertIdx, deltaPos * w);
+    pxgAtomicAddF4W(deltaPosBase, vertIdx, 1.0f);
+}
+
+// The anchor's reaction rows (FEMClothExternalSolve.cu:1455-1467 / :1651-1664), consumed
+// by accumulateDeltaVRigidFirst/Second (rigidDeltaAccumBda, PxgFEMClothCore.cpp:1888).
+void writeRigidReaction(uint64_t rigidDeltaVelBase, uint workIndex, uint numAttachments,
+                        float invMass0, float3 deltaLinVel, float3 deltaAngVel)
+{
+    Ptr<float4> rigidDeltaVel = Ptr<float4>(rigidDeltaVelBase);
+    if (invMass0 == 0.0f)
+    {
+        rigidDeltaVel[workIndex] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        rigidDeltaVel[workIndex + numAttachments] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    else
+    {
+        rigidDeltaVel[workIndex] = float4(deltaLinVel.x, deltaLinVel.y, deltaLinVel.z, 1.0f);
+        rigidDeltaVel[workIndex + numAttachments] = float4(deltaAngVel.x, deltaAngVel.y, deltaAngVel.z, 0.0f);
+    }
 }
 
 // ===========================================================================
@@ -377,14 +448,6 @@ void cloth_solveRigidClothAttachmentLaunch(uint3 groupThreadId : SV_GroupThreadI
     const float invDt = 1.0f / dt;
 
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gSolve.clothes);
-    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gSolve.solverCoreDesc);
-    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc = Ptr<PxgSolverSharedDescPGSGpu>(gSolve.sharedDesc);
-    Ptr<PxgPrePrepDescGpu> prePrepDesc = Ptr<PxgPrePrepDescGpu>(gSolve.prePrepDesc);
-
-    const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
-    const uint accOffset = solverCoreDesc[0].accumulatedBodyDeltaVOffset;
-    Ptr<float4> initialVel = Ptr<float4>(solverCoreDesc[0].outSolverVelocity);
-    Ptr<float4> solverBodyVelPool = Ptr<float4>(sharedDesc[0].iter_solverBodyVelPool);
 
     const uint nbBlocksRequired = (numAttachments + RA_BLOCK - 1u) / RA_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RA_GRID - 1u) / RA_GRID;
@@ -400,66 +463,117 @@ void cloth_solveRigidClothAttachmentLaunch(uint3 groupThreadId : SV_GroupThreadI
         const uint offset = workIndex & 31u;
         const uint64_t cBase = gSolve.attachments + uint64_t(index) * RAC_STRIDE;
 
+        // Cloth info (:1406-1431)
         const uint elemId = Ptr<uint>(cBase + RAC_elemId)[offset];
         const uint clothId = elemId >> PXG_CLOTH_ID_SHIFT;
         const uint elemIdx = elemId & PXG_CLOTH_ELEMENT_MASK;
+        const float4 baryOrType = Ptr<float4>(cBase + RAC_baryOrType)[offset];
+        const bool elemIsVertex = femIsVertexType(baryOrType);
 
         Ptr<float4> clothVelocities = Ptr<float4>(clothes[clothId].mVelocity_InvMass);
 
-        // VERTEX attachment (world-anchor pin; constraint.baryOrType == 0).  The
-        // triangle-barycentric read is the same shape (deferred — see header).
-        const float4 clothVel = clothVelocities[elemIdx];
+        float4 clothVel;
+        uint4 triVertIdx = uint4(0u, 0u, 0u, 0u);
+        float3 triInvMass = float3(0.0f, 0.0f, 0.0f);
+        float4 barycentric = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        if (elemIsVertex)
+        {
+            clothVel = clothVelocities[elemIdx];
+        }
+        else
+        {
+            barycentric = baryOrType;
+            triVertIdx = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[elemIdx];
+            const float4 v0 = clothVelocities[triVertIdx.x];
+            const float4 v1 = clothVelocities[triVertIdx.y];
+            const float4 v2 = clothVelocities[triVertIdx.z];
+            clothVel = v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
+
+            triInvMass.x = v0.w;
+            triInvMass.y = v1.w;
+            triInvMass.z = v2.w;
+        }
+
         const float3 linVel1 = float3(clothVel.x, clothVel.y, clothVel.z);
 
+        // Rigid body info (:1435-1444)
         const uint64_t rigidId = Ptr<uint64_t>(cBase + RAC_rigidId)[offset];
         const bool isStatic = nodeIsStaticBody(rigidId);
         if (isStatic && clothVel.w == 0.0f)
             continue;
 
-        // PxgVelocityReader::readVelocitiesPGS (dataReadWriteHelper.cuh:101).
-        // ARTICULATION branch DEFERRED (see header).
-        uint solverBodyIdx = 0u;
-        if (!isStatic)
-            solverBodyIdx = Ptr<uint>(prePrepDesc[0].solverBodyIndices)[nodeIndex(rigidId)];
-
-        const float4 iv0 = initialVel[solverBodyIdx];
-        const float4 iv1 = initialVel[solverBodyIdx + numSolverBodies];
-        const float4 dv0 = solverBodyVelPool[accOffset + solverBodyIdx];
-        const float4 dv1 = solverBodyVelPool[accOffset + solverBodyIdx + numSolverBodies];
-        const float3 rigidLinVel = float3(iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z);
-        const float3 rigidAngVel = float3(iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z);
+        // PxgVelocityReader::readVelocitiesPGS (dataReadWriteHelper.cuh:101) -- both arms.
+        const RigidState vel0 = readRigidVelocity(rigidId, /*isTGS*/ false, gSolve.solverCoreDesc,
+                                                  gSolve.sharedDesc, gSolve.prePrepDesc, gSolve.artiCoreDesc);
 
         // calculateAttachmentDeltaImpulsePGS (attachments.cuh:83).  NOTE the CUDA
         // solve passes constraint.raXn0_biasW THREE TIMES (FEMClothExternalSolve.cu:
-        // 1451) — a faithful port of that upstream quirk, so raXn0/1/2 AND all three
-        // position-error components come from raXn0_biasW.
+        // 1451) — a faithful port of that upstream quirk, so raXn0/1/2, all three
+        // position-error components AND the three deltaAngVel terms come from raXn0_biasW.
         const float4 raXn0_biasW = Ptr<float4>(cBase + RAC_raXn0_biasW)[offset];
-        const float4 velMult = Ptr<float4>(cBase + RAC_velMult_invMass)[offset];
+        const float4 velMultiplierXYZ_invMassW = Ptr<float4>(cBase + RAC_velMult_invMass)[offset];
+        const float4 low_high_limits = Ptr<float4>(cBase + RAC_low_high_limits)[offset];
+        const float4 worldAxis_angle = Ptr<float4>(cBase + RAC_axis_angle)[offset];
 
         const float3 raXn0 = float3(raXn0_biasW.x, raXn0_biasW.y, raXn0_biasW.z);
-        const float velOfRigidX = rigidLinVel.x + dotVec(rigidAngVel, raXn0);
-        const float velOfRigidY = rigidLinVel.y + dotVec(rigidAngVel, raXn0);
-        const float velOfRigidZ = rigidLinVel.z + dotVec(rigidAngVel, raXn0);
+        const float3 raXn1 = raXn0;
+        const float3 raXn2 = raXn0;
 
-        const float positionError = raXn0_biasW.w;
+        const float velOfRigidX = vel0.linVel.x + dotVec(vel0.angVel, raXn0);
+        const float velOfRigidY = vel0.linVel.y + dotVec(vel0.angVel, raXn1);
+        const float velOfRigidZ = vel0.linVel.z + dotVec(vel0.angVel, raXn2);
+
+        const float positionErrorX = raXn0_biasW.w;
+        const float positionErrorY = raXn0_biasW.w;
+        const float positionErrorZ = raXn0_biasW.w;
         const float biasFactor = 0.5f;
-        // Cone-LIMITED branch DEFERRED (see header): for a plain pin the guard is
-        // false and velError is the CUDA false-path.
-        const float3 velError = float3(linVel1.x - positionError * biasFactor * invDt,
-                                       linVel1.y - positionError * biasFactor * invDt,
-                                       linVel1.z - positionError * biasFactor * invDt);
+        float3 velError = float3(linVel1.x - positionErrorX * biasFactor * invDt,
+                                 linVel1.y - positionErrorY * biasFactor * invDt,
+                                 linVel1.z - positionErrorZ * biasFactor * invDt);
 
-        const float deltaF0 = (velError.x - velOfRigidX) * velMult.x;
-        const float deltaF1 = (velError.y - velOfRigidY) * velMult.y;
-        const float deltaF2 = (velError.z - velOfRigidZ) * velMult.z;
+        // attachments.cuh:112-120 -- taken for every public-API attachment (see header).
+        if (isConeLimitedEnabled(worldAxis_angle.w, low_high_limits.x, low_high_limits.y))
+        {
+            // "we don't understand why we need to scale by biasFactor in order to get the
+            // right error offset for the cone." (attachments.cuh:114)
+            const float weirdScale = invDt * biasFactor;
+            float3 posError = velError * (1.0f / weirdScale);
+            const float3 worldAxis = float3(worldAxis_angle.x, worldAxis_angle.y, worldAxis_angle.z);
+            posError = computeConeLimitedError(worldAxis_angle.w, low_high_limits.x, low_high_limits.y, worldAxis, posError);
+            velError = posError * weirdScale;
+        }
+
+        const float deltaF0 = (velError.x - velOfRigidX) * velMultiplierXYZ_invMassW.x;
+        const float deltaF1 = (velError.y - velOfRigidY) * velMultiplierXYZ_invMassW.y;
+        const float deltaF2 = (velError.z - velOfRigidZ) * velMultiplierXYZ_invMassW.z;
         const float3 deltaImpulse = float3(deltaF0, deltaF1, deltaF2);
 
-        // DYNAMIC-rigid reaction DEFERRED: static anchor never writes rigidDeltaVel.
+        // attachments.cuh:129-132
+        const float invMass0 = velMultiplierXYZ_invMassW.w;
+        const float3 deltaLinVel = deltaImpulse * invMass0;
+        const float3 deltaAngVel = raXn0 * deltaF0 + raXn1 * deltaF1 + raXn2 * deltaF2;
 
+        // Update rigid body (:1455-1467)
+        if (!isStatic)
+            writeRigidReaction(gSolve.rigidDeltaVel, workIndex, numAttachments, invMass0, deltaLinVel, deltaAngVel);
+
+        // Update cloth (:1470-1484)
         if (deltaImpulse.x != 0.0f || deltaImpulse.y != 0.0f || deltaImpulse.z != 0.0f)
         {
             const float3 deltaPos = float3(-deltaImpulse.x * dt, -deltaImpulse.y * dt, -deltaImpulse.z * dt);
-            applyClothDelta(clothes[clothId].mDeltaPos, elemIdx, deltaPos, clothVel.w);
+            const uint64_t deltaPosBase = clothes[clothId].mDeltaPos;
+
+            if (elemIsVertex)
+            {
+                applyClothDelta(deltaPosBase, elemIdx, deltaPos, clothVel.w);
+            }
+            else
+            {
+                applyClothDelta(deltaPosBase, triVertIdx.x, deltaPos * barycentric.x, triInvMass.x);
+                applyClothDelta(deltaPosBase, triVertIdx.y, deltaPos * barycentric.y, triInvMass.y);
+                applyClothDelta(deltaPosBase, triVertIdx.z, deltaPos * barycentric.z, triInvMass.z);
+            }
         }
     }
 }
@@ -475,13 +589,6 @@ void cloth_solveRigidClothAttachmentTGSLaunch(uint3 groupThreadId : SV_GroupThre
     const float dt = gSolve.dt;
 
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gSolve.clothes);
-    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gSolve.solverCoreDesc);
-    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(gSolve.sharedDesc);
-    Ptr<PxgPrePrepDescGpu> prePrepDesc = Ptr<PxgPrePrepDescGpu>(gSolve.prePrepDesc);
-
-    const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
-    const uint accOffset = solverCoreDesc[0].accumulatedBodyDeltaVOffset;
-    Ptr<float4> solverBodyVelPool = Ptr<float4>(sharedDesc[0].iter_solverBodyVelPool);
 
     const uint nbBlocksRequired = (numAttachments + RA_BLOCK - 1u) / RA_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RA_GRID - 1u) / RA_GRID;
@@ -497,73 +604,115 @@ void cloth_solveRigidClothAttachmentTGSLaunch(uint3 groupThreadId : SV_GroupThre
         const uint offset = workIndex & 31u;
         const uint64_t cBase = gSolve.attachments + uint64_t(index) * RAC_STRIDE;
 
+        // Cloth info (:1605-1630)
         const uint elemId = Ptr<uint>(cBase + RAC_elemId)[offset];
         const uint clothId = elemId >> PXG_CLOTH_ID_SHIFT;
         const uint elemIdx = elemId & PXG_CLOTH_ELEMENT_MASK;
+        const float4 baryOrType = Ptr<float4>(cBase + RAC_baryOrType)[offset];
+        const bool elemIsVertex = femIsVertexType(baryOrType);
 
         Ptr<float4> clothAccumDeltas = Ptr<float4>(clothes[clothId].mAccumulatedDeltaPos);
 
-        // VERTEX attachment (world-anchor pin; constraint.baryOrType == 0).
-        const float4 clothAccumDelta = clothAccumDeltas[elemIdx];
+        float4 clothAccumDelta;
+        uint4 triVertIdx = uint4(0u, 0u, 0u, 0u);
+        float3 triInvMass = float3(0.0f, 0.0f, 0.0f);
+        float4 barycentric = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        if (elemIsVertex)
+        {
+            clothAccumDelta = clothAccumDeltas[elemIdx];
+        }
+        else
+        {
+            barycentric = baryOrType;
+            triVertIdx = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[elemIdx];
+            const float4 d0 = clothAccumDeltas[triVertIdx.x];
+            const float4 d1 = clothAccumDeltas[triVertIdx.y];
+            const float4 d2 = clothAccumDeltas[triVertIdx.z];
+            clothAccumDelta = d0 * barycentric.x + d1 * barycentric.y + d2 * barycentric.z;
+
+            triInvMass.x = d0.w;
+            triInvMass.y = d1.w;
+            triInvMass.z = d2.w;
+        }
         const float3 linDelta1 = float3(clothAccumDelta.x, clothAccumDelta.y, clothAccumDelta.z);
 
+        // Rigid body info (:1633-1641)
         const uint64_t rigidId = Ptr<uint64_t>(cBase + RAC_rigidId)[offset];
         const bool isStatic = nodeIsStaticBody(rigidId);
         if (isStatic && clothAccumDelta.w == 0.0f)
             continue;
 
-        // PxgVelocityReader::readVelocitiesTGS (dataReadWriteHelper.cuh:122).
-        // ARTICULATION branch DEFERRED (see header).
-        uint solverBodyIdx = 0u;
-        if (!isStatic)
-            solverBodyIdx = Ptr<uint>(prePrepDesc[0].solverBodyIndices)[nodeIndex(rigidId)];
-
-        const float4 v0 = solverBodyVelPool[accOffset + solverBodyIdx];
-        const float4 v1 = solverBodyVelPool[accOffset + solverBodyIdx + numSolverBodies];
-        const float4 v2 = solverBodyVelPool[accOffset + solverBodyIdx + numSolverBodies + numSolverBodies];
-        const float3 rigidLinVel = float3(v0.x, v0.y, v0.z);
-        const float3 rigidAngVel = float3(v0.w, v1.x, v1.y);
-        const float3 rigidLinDelta = float3(v1.z, v1.w, v2.x);
-        const float3 rigidAngDelta = float3(v2.y, v2.z, v2.w);
+        // PxgVelocityReader::readVelocitiesTGS (dataReadWriteHelper.cuh:122) -- both arms.
+        const RigidState vel0 = readRigidVelocity(rigidId, /*isTGS*/ true, gSolve.solverCoreDesc,
+                                                  gSolve.sharedDesc, gSolve.prePrepDesc, gSolve.artiCoreDesc);
 
         // calculateAttachmentDeltaImpulseTGS (attachments.cuh:147) — the offset
         // overload reads raXn0/1/2 correctly (distinct rows).
         const float4 raXn0_biasW = Ptr<float4>(cBase + RAC_raXn0_biasW)[offset];
         const float4 raXn1_biasW = Ptr<float4>(cBase + RAC_raXn1_biasW)[offset];
         const float4 raXn2_biasW = Ptr<float4>(cBase + RAC_raXn2_biasW)[offset];
-        const float4 velMult = Ptr<float4>(cBase + RAC_velMult_invMass)[offset];
+        const float4 velMultiplierXYZ_invMassW = Ptr<float4>(cBase + RAC_velMult_invMass)[offset];
+        const float4 low_high_limits = Ptr<float4>(cBase + RAC_low_high_limits)[offset];
+        const float4 worldAxis_angle = Ptr<float4>(cBase + RAC_axis_angle)[offset];
 
         const float3 raXn0 = float3(raXn0_biasW.x, raXn0_biasW.y, raXn0_biasW.z);
         const float3 raXn1 = float3(raXn1_biasW.x, raXn1_biasW.y, raXn1_biasW.z);
         const float3 raXn2 = float3(raXn2_biasW.x, raXn2_biasW.y, raXn2_biasW.z);
 
-        const float velOfRigid0 = rigidLinVel.x + dotVec(rigidAngVel, raXn0);
-        const float velOfRigid1 = rigidLinVel.y + dotVec(rigidAngVel, raXn1);
-        const float velOfRigid2 = rigidLinVel.z + dotVec(rigidAngVel, raXn2);
+        const float velOfRigid0 = vel0.linVel.x + dotVec(vel0.angVel, raXn0);
+        const float velOfRigid1 = vel0.linVel.y + dotVec(vel0.angVel, raXn1);
+        const float velOfRigid2 = vel0.linVel.z + dotVec(vel0.angVel, raXn2);
 
-        const float3 linDelta = float3(linDelta1.x - rigidLinDelta.x, linDelta1.y - rigidLinDelta.y, linDelta1.z - rigidLinDelta.z);
+        const float3 linDelta = float3(linDelta1.x - vel0.linDelta.x, linDelta1.y - vel0.linDelta.y,
+                                       linDelta1.z - vel0.linDelta.z);
 
         const float positionErrorX = raXn0_biasW.w;
         const float positionErrorY = raXn1_biasW.w;
         const float positionErrorZ = raXn2_biasW.w;
 
-        // Cone-LIMITED branch DEFERRED (see header): plain pin -> guard is false.
-        const float3 tgsError = float3(linDelta.x - positionErrorX - dotVec(rigidAngDelta, raXn0),
-                                       linDelta.y - positionErrorY - dotVec(rigidAngDelta, raXn1),
-                                       linDelta.z - positionErrorZ - dotVec(rigidAngDelta, raXn2));
+        float3 tgsError = float3(linDelta.x - positionErrorX - dotVec(vel0.angDelta, raXn0),
+                                 linDelta.y - positionErrorY - dotVec(vel0.angDelta, raXn1),
+                                 linDelta.z - positionErrorZ - dotVec(vel0.angDelta, raXn2));
 
-        const float velDt = dt; // isVelocityIteration == false
-        const float deltaF0 = (tgsError.x - velOfRigid0 * velDt) * velMult.x * FEMCLOTH_BIAS_COEFFICIENT;
-        const float deltaF1 = (tgsError.y - velOfRigid1 * velDt) * velMult.y * FEMCLOTH_BIAS_COEFFICIENT;
-        const float deltaF2 = (tgsError.z - velOfRigid2 * velDt) * velMult.z * FEMCLOTH_BIAS_COEFFICIENT;
+        // attachments.cuh:176-180 -- taken for every public-API attachment (see header).
+        if (isConeLimitedEnabled(worldAxis_angle.w, low_high_limits.x, low_high_limits.y))
+        {
+            const float3 worldAxis = float3(worldAxis_angle.x, worldAxis_angle.y, worldAxis_angle.z);
+            tgsError = computeConeLimitedError(worldAxis_angle.w, low_high_limits.x, low_high_limits.y, worldAxis, tgsError);
+        }
+
+        const float velDt = dt; // isVelocityIteration == false (:1645)
+        const float deltaF0 = (tgsError.x - velOfRigid0 * velDt) * velMultiplierXYZ_invMassW.x * FEMCLOTH_BIAS_COEFFICIENT;
+        const float deltaF1 = (tgsError.y - velOfRigid1 * velDt) * velMultiplierXYZ_invMassW.y * FEMCLOTH_BIAS_COEFFICIENT;
+        const float deltaF2 = (tgsError.z - velOfRigid2 * velDt) * velMultiplierXYZ_invMassW.z * FEMCLOTH_BIAS_COEFFICIENT;
         const float3 deltaImpulse = float3(deltaF0, deltaF1, deltaF2);
 
-        // DYNAMIC-rigid reaction DEFERRED: static anchor never writes rigidDeltaVel.
+        // attachments.cuh:195-196
+        const float3 deltaLinVel = deltaImpulse * velMultiplierXYZ_invMassW.w;
+        const float3 deltaAngVel = raXn0 * deltaF0 + raXn1 * deltaF1 + raXn2 * deltaF2;
 
+        // Update rigid body (:1651-1664)
+        if (!isStatic)
+            writeRigidReaction(gSolve.rigidDeltaVel, workIndex, numAttachments, velMultiplierXYZ_invMassW.w,
+                               deltaLinVel, deltaAngVel);
+
+        // Update cloth (:1667-1681)
         if (deltaImpulse.x != 0.0f || deltaImpulse.y != 0.0f || deltaImpulse.z != 0.0f)
         {
             const float3 deltaPos = float3(-deltaImpulse.x, -deltaImpulse.y, -deltaImpulse.z);
-            applyClothDelta(clothes[clothId].mDeltaPos, elemIdx, deltaPos, clothAccumDelta.w);
+            const uint64_t deltaPosBase = clothes[clothId].mDeltaPos;
+
+            if (elemIsVertex)
+            {
+                applyClothDelta(deltaPosBase, elemIdx, deltaPos, clothAccumDelta.w);
+            }
+            else
+            {
+                applyClothDelta(deltaPosBase, triVertIdx.x, deltaPos * barycentric.x, triInvMass.x);
+                applyClothDelta(deltaPosBase, triVertIdx.y, deltaPos * barycentric.y, triInvMass.y);
+                applyClothDelta(deltaPosBase, triVertIdx.z, deltaPos * barycentric.z, triInvMass.z);
+            }
         }
     }
 }

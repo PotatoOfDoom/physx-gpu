@@ -26,6 +26,7 @@
 #include "PxDeformableAttachment.h"  // PxParticleRigidAttachment (P9.76, PXG_SCENE=particleattach)
 #include "PxNodeIndex.h"             // PxNodeIndex().getInd() -- the STATIC anchor sentinel
 #include "PxDirectGPUAPI.h"          // PxDirectGPUAPI (P9.79, PXG_SCENE=directapi)
+#include "GuTriangleMesh.h"          // Gu::TriangleMesh::mGRB_faceRemap / mGRB_triIndices (PXG_SCENE=clothtripin)
 
 #include <cstdio>
 #include <cmath>
@@ -38,6 +39,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <array>
 #include <chrono>
 
 using namespace physx;
@@ -3132,6 +3134,475 @@ SoftBodyArtiContactScene buildSoftBodyArtiContactScene(PxPhysics* physics, PxSce
     twin->attachShape(*ts);
     scene->addActor(*twin);
     return r;
+}
+
+// ===========================================================================
+// TRANCHE B of task 35: FEM cloth RIGID ATTACHMENTS (femClothRigidAttachBda.slang).  Until
+// this tranche the cloth attachment kernels carried only the static / world pin: the
+// prepare's ARTICULATION arm, the solves' link velocity read, the DYNAMIC-rigid / link
+// REACTION and TRIANGLE attachments were deferred -- and the last of those was a live bug,
+// both solves reading and scattering vertex #triIdx for a triangle attachment.  Three scenes
+// observe the three: a box hanging from a cloth (the reaction on a dynamic rigid), a cloth
+// hanging from an articulation link (the link arms), and a curtain pinned by TRIANGLES whose
+// GPU index lies past the last vertex.  Deformables are GPU-only in PhysX, so the references
+// are analytic: static equilibrium (a hanging load stops; a drive-held link deflects by
+// load / stiffness) and the anchors themselves.
+// ===========================================================================
+
+// A vertical cloth curtain in the XY plane: numCol x numRow grid of sizeX x sizeY, row 0 the
+// top edge at topCentre.y, centred on topCentre.x / .z; every vertex the same inverse mass.
+// The clothhang recipe (material, cook flags, device fill), with self-collision off (a flat
+// curtain has nothing to fold onto) and no sleeping (a held curtain is still).
+struct ClothCurtain
+{
+    PxDeformableSurface* surface = nullptr;
+    PxTriangleMesh* triMesh = nullptr;
+    std::vector<PxVec3> verts;
+    PxU32 numCol = 0, numRow = 0;
+    PxU32 vid(PxU32 c, PxU32 r) const { return c * numRow + r; }
+};
+
+static bool buildClothCurtain(PxPhysics* physics, PxScene* scene, PxCudaContextManager* cudaCtx,
+                              PxU32 numCol, PxU32 numRow, float sizeX, float sizeY, const PxVec3& topCentre,
+                              float invMass, float linearDamping, ClothCurtain& out)
+{
+    out.numCol = numCol; out.numRow = numRow;
+    const float sx = sizeX / float(numCol - 1), sy = sizeY / float(numRow - 1);
+    out.verts.clear();
+    for (PxU32 c = 0; c < numCol; ++c)
+        for (PxU32 r = 0; r < numRow; ++r)
+            out.verts.push_back(PxVec3(topCentre.x + float(c) * sx - 0.5f * sizeX, topCentre.y - float(r) * sy,
+                                       topCentre.z));
+    std::vector<PxU32> tris;
+    for (PxU32 c = 1; c < numCol; ++c)
+        for (PxU32 r = 1; r < numRow; ++r)
+        {
+            tris.push_back(out.vid(c - 1, r - 1)); tris.push_back(out.vid(c, r - 1)); tris.push_back(out.vid(c - 1, r));
+            tris.push_back(out.vid(c - 1, r));     tris.push_back(out.vid(c, r - 1)); tris.push_back(out.vid(c, r));
+        }
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(out.verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = out.verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+    out.triMesh = immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!out.triMesh) { std::printf("FAIL: curtain createTriangleMesh returned null\n"); return false; }
+
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(out.triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: curtain createShape returned null\n"); return false; }
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: curtain createDeformableSurface returned null\n"); return false; }
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(1);
+    surface->setLinearDamping(linearDamping);
+    surface->setMaxLinearVelocity(1.0e6f);
+    surface->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    surface->setSleepThreshold(0.0f);
+    surface->attachShape(*shape);
+    shape->release();
+    scene->addActor(*surface);
+
+    const PxU32 nv = PxU32(out.verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f));
+    for (PxU32 v = 0; v < nv; ++v)
+        posInvMass[v] = PxVec4(out.verts[v].x, out.verts[v].y, out.verts[v].z, invMass);
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()), posInvMass.data(),
+                    nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()), vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()), posInvMass.data(),
+                    nv * sizeof(PxVec4));
+    out.surface = surface;
+    return true;
+}
+
+// DtoH-read a curtain's positions.  Returns false on a non-finite coordinate.
+static bool readCurtain(PxCudaContextManager* cudaCtx, const ClothCurtain& c, std::vector<PxVec4>& host)
+{
+    host.resize(c.verts.size());
+    cudaCtx->getCudaContext()->memcpyDtoH(host.data(),
+        reinterpret_cast<CUdeviceptr>(c.surface->getPositionInvMassBufferD()), host.size() * sizeof(PxVec4));
+    for (const PxVec4& p : host)
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return false;
+    return true;
+}
+
+// One eVERTEX -> eWORLD (actor == NULL) or eVERTEX -> eRIGID attachment per vertex, the anchor
+// given in the actor's frame (world for NULL).  The arrays must outlive the call only.
+static PxDeformableAttachment* attachCurtainVertices(PxPhysics* physics, const ClothCurtain& c,
+                                                     const std::vector<PxU32>& ids, PxRigidActor* actor,
+                                                     const std::vector<PxVec4>& anchors)
+{
+    PxDeformableAttachmentData d;
+    d.actor[0] = c.surface;
+    d.type[0] = PxDeformableAttachmentTargetType::eVERTEX;
+    d.indices[0].data = ids.data();
+    d.indices[0].count = PxU32(ids.size());
+    d.actor[1] = actor;
+    d.type[1] = actor ? PxDeformableAttachmentTargetType::eRIGID : PxDeformableAttachmentTargetType::eWORLD;
+    d.coords[1].data = anchors.data();
+    d.coords[1].count = PxU32(anchors.size());
+    d.pose[1] = PxTransform(PxIdentity);
+    return physics->createDeformableAttachment(d);
+}
+
+// PXG_SCENE=clothhangbox.  The clothhang curtain (5 x 5, 1.0 x 1.0 m, 1 kg per vertex, top
+// row eVERTEX -> eWORLD at y 4) with a 0.1 kg box hanging from its bottom-centre vertex by
+// ONE eVERTEX -> eRIGID attachment whose anchor is the box's centre of mass.
+//
+// What it observes: the REACTION on a dynamic rigid (FEMClothExternalSolve.cu:1455-1467 /
+// :1651-1664, consumed by accumulateDeltaVRigidFirst/Second).  Without it nothing holds the
+// box (it has no simulation shape, see below): it free-falls.
+//
+// WHY THIS GEOMETRY -- three properties of the CUDA attachment math, measured here first with
+// a 2 kg box on three hooks 0.1 m above its top face (it fell to the ground in both solvers;
+// 0.25 .. 0.5 kg boxes on the same hooks fell 1.4 .. 1.9 m in TGS and went NaN in PGS):
+//   - TGS: deltaF is a position error times an effective MASS (attachments.cuh:186-188), and
+//     the reaction row deltaF * invMass0 is ADDED TO THE VELOCITY by accumulateDeltaVRigid-
+//     SecondLaunch (rigidDeltaAccum.cu:395-405) -- a length, not a velocity change.  It holds
+//     a load only when velMult ~ m_box, i.e. when the box is light against the cloth vertex
+//     (then the per-iteration velocity change is 0.7 x the error, independent of the mass);
+//   - accumulateDeltaVRigidSecondLaunch divides a body's rows by its attachment COUNT
+//     (:369-370 / :391-392): three hooks hold like one;
+//   - PGS passes raXn0_biasW three times (FEMClothExternalSolve.cu:1451): the y / z position
+//     error is error.x, and every axis' impulse turns the body through raXn0 -- with the hooks
+//     off the COM that spin made the PGS runs diverge.  A hook AT the COM has ra = 0, so every
+//     raXn row vanishes and only the linear part remains: PGS then matches the box's velocity
+//     to the vertex's each iteration (a velocity-only hold, the position error being
+//     error.x).
+// Expected TGS sag: the per-iteration velocity change 0.7 x error must supply g dt over the
+// four position iterations, error = g dt / (0.7 * 4) = 5.8 cm; PGS holds the velocity, not
+// the position, so its sag is what leaks in before the first iteration of each step.
+// So: one hook at the COM, a box ten times lighter than the vertex, and a QUERY-ONLY box shape
+// (the hooked vertex sits inside it, and a cloth-vs-box contact would be a second, unrelated
+// support).
+struct ClothHangBoxScene
+{
+    ClothCurtain cloth;
+    PxRigidDynamic* box = nullptr;
+    std::vector<PxU32> topRow, hookIds;
+    std::vector<PxVec4> hookLocal;    // anchors in the box frame
+    float boxMass = 0.0f, clothMass = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+ClothHangBoxScene buildClothHangBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                         PxCudaContextManager* cudaCtx)
+{
+    ClothHangBoxScene s;
+    s.cudaCtx = cudaCtx;
+    addGroundBox(physics, scene, material);
+    // One live dynamic rigid with a simulation shape, parked far away (the FEM solve runs
+    // inside the rigid island loop).
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               0.5f, 30.0f);
+    const PxU32 n = 5;
+    const float invMass = 1.0f;
+    if (!buildClothCurtain(physics, scene, cudaCtx, n, n, 1.0f, 1.0f, PxVec3(0.0f, 4.0f, 0.0f), invMass, 0.1f, s.cloth))
+        return s;
+    s.clothMass = float(n * n) / invMass;
+
+    const float boxHalf = 0.1f;
+    const PxU32 hook = s.cloth.vid(n / 2, n - 1);
+    s.boxMass = 0.1f;
+    s.box = physics->createRigidDynamic(PxTransform(s.cloth.verts[hook]));
+    PxShape* bs = physics->createShape(PxBoxGeometry(boxHalf, boxHalf, boxHalf), *material, true,
+                                       PxShapeFlag::eSCENE_QUERY_SHAPE);
+    s.box->attachShape(*bs);
+    s.box->setMass(s.boxMass);
+    s.box->setMassSpaceInertiaTensor(boxInertia(PxVec3(boxHalf), s.boxMass));
+    // The TGS hold is a spring (a position error turned into velocity, see above) and the box
+    // bounced on it undamped (|v| 0.2 .. 0.4 m/s after 3 s, measured); damping lets "comes to
+    // rest" be checked.
+    s.box->setLinearDamping(2.0f);
+    scene->addActor(*s.box);
+
+    for (PxU32 c = 0; c < n; ++c) s.topRow.push_back(s.cloth.vid(c, 0));
+    std::vector<PxVec4> topAnchors;
+    for (PxU32 id : s.topRow) topAnchors.push_back(PxVec4(s.cloth.verts[id], 0.0f));
+    s.hookIds.push_back(hook);
+    s.hookLocal.push_back(PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    if (!attachCurtainVertices(physics, s.cloth, s.topRow, NULL, topAnchors) ||
+        !attachCurtainVertices(physics, s.cloth, s.hookIds, s.box, s.hookLocal))
+    {
+        std::printf("FAIL: clothhangbox createDeformableAttachment returned null\n");
+        s.box = nullptr;
+    }
+    return s;
+}
+
+// PXG_SCENE=clothlinkattach.  A fixed-base articulation as in clothonlink: shapeless base at
+// y 3 -> shapeless SLIDER (prismatic X, pure velocity drive) -> ARM (box 1.0 x 0.1 x 0.4,
+// 10 kg) on a revolute joint about Z at x = 0.1, held level by a stiff angular drive
+// (k = 4000 N m/rad, c = 150, target 0).  A 5 x 5 curtain of 0.6 x 0.6 m, 0.5 kg per vertex
+// (12.5 kg), hangs 0.1 m below the arm, centred under the arm's COM (x 0.6), its top row
+// eVERTEX -> eRIGID to the ARM LINK at the vertices' spawn positions.
+//
+// What it observes: the prepare's articulation arm (FEMClothConstraintPrep.cu:478-527: the
+// link's pose and spatial response), the link velocity read of both solves
+// (dataReadWriteHelper.cuh:105-113 / :126-141) and the reaction on the link.  Before the port
+// the prepare took the RIGID arm for the link's node, i.e. solverBodyIndices[artiNode] -- the
+// articulation's index used as a solver body -- so the anchors were built in an unrelated
+// body's frame, and no reaction was written.
+//
+// Expected deflection.  A rigid load of the curtain's weight, acting through five anchors
+// symmetric about the arm's COM, would deflect the drive by
+//     theta_rigid = -12.5 * 9.81 * 0.5 / 4000 = -0.0153 rad.
+// The CUDA delivers LESS, and by a computable factor:
+//   - accumulateDeltaVRigidSecondLaunch divides a link's summed rows by its constraint COUNT
+//     (rigidDeltaAccum.cu:369-377): with N = 5 attachments on the arm the link receives 1/N
+//     of the cloth's reaction.  PGS share prediction: 1/5 = 0.2 of theta_rigid (measured
+//     0.211 with this port; 0 on the old shaders, which wrote no reaction);
+//   - TGS: the attachment's deltaF is a position error times an effective mass
+//     (attachments.cuh:186-188), and it reaches the link as an IMPULSE.  In steady state the
+//     iterations' deltaF must move the hanging vertex by its weight's g dt^2 per step, so the
+//     link receives m g dt^2 per step where a force would deliver m g dt: dt / N = 0.003 of
+//     theta_rigid, below what the drive's settling resolves (measured -0.025 here, the same
+//     as the old shaders' 0.000-reaction run).  TGS therefore prints the share and checks
+//     the link through the ANCHORS only, which is where the old shaders fail (3.1 m).  The
+//     TGS reaction on a link (writeRigidReaction for an articulation node,
+//     FEMClothExternalSolve.cu:1651-1664) is verified ONLY by the fixture
+//     femClothSimRigidAttachAllAnchorsTGS (its link lane), not by any scene.
+// PGS SHARE BAND 0.18 .. 0.25 around the predicted 0.200 (measured 0.211): it also sees the
+// ANGULAR reaction row (attachments.cuh:129-132; the anchors are off the arm's COM).  With
+// deltaAngVel forced to 0 in both solves (single-.spv mutant) the share measured 0.155 and
+// every other check passed, so a 0.5 .. 2 x band would not see the row.  clothhangbox cannot
+// see it either (its hook is at the box's COM, ra = 0).
+// WHY THE ARM ALSO CARRIES A SMALL RIGID WEIGHT: the clothonlink finding -- a link's scratch
+// impulse is propagated only for an articulation that has rigid constraints in the solver
+// partitions (averageLinkImpulsesAndPropagate2, forwardDynamic2.cu:384).  A 0.5 kg box rests
+// on the arm near its tip; its weight is part of thetaOwn and loads the arm the same with old
+// and new shaders, so the curtain's share stays the discriminating quantity.
+//
+// SWEEP (60 steps after the 180 rest steps): the slider's drive velocity goes to 0.3 m/s;
+// every attached vertex must stay near its anchor in the ARM's frame throughout: 3 mm in TGS,
+// 3 cm in PGS, whose raXn0 quirk (FEMClothExternalSolve.cu:1451) makes the y / z hold a
+// velocity-only one (measured 1.4 cm at rest, 2.3 cm in the sweep).
+struct ClothLinkAttachScene
+{
+    ClothCurtain cloth;
+    PxArticulationLink* arm = nullptr;
+    PxArticulationJointReducedCoordinate* sliderJoint = nullptr;
+    PxRigidDynamic* weight = nullptr;
+    PxDeformableAttachment* attachment = nullptr;   // released before the scene (see the arm)
+    std::vector<PxU32> topRow;
+    std::vector<PxVec4> anchorLocal;   // in the arm's actor frame
+    float hingeX = 0.0f, armX = 0.0f, armMass = 0.0f, weightMass = 0.0f, stiffness = 0.0f, clothMass = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+ClothLinkAttachScene buildClothLinkAttachScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                               PxCudaContextManager* cudaCtx)
+{
+    ClothLinkAttachScene r;
+    r.cudaCtx = cudaCtx;
+    const float baseY = 3.0f, baseHalf = 0.1f;
+    const PxVec3 armHalf(0.5f, 0.05f, 0.2f);
+    r.hingeX = baseHalf;
+    r.armX = baseHalf + armHalf.x;
+    r.armMass = 10.0f;
+    r.stiffness = 4000.0f;
+
+    // One live dynamic rigid parked far away, and a ground for it.
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               0.5f, 30.0f);
+
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), 10.0f));
+    PxArticulationLink* slider = arti->createLink(base, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    slider->setMass(r.armMass);
+    slider->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), r.armMass));
+    PxArticulationJointReducedCoordinate* js = slider->getInboundJoint();
+    js->setJointType(PxArticulationJointType::ePRISMATIC);
+    js->setParentPose(PxTransform(PxIdentity));
+    js->setChildPose(PxTransform(PxIdentity));
+    js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
+    js->setDriveParams(PxArticulationAxis::eX,
+                       PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
+    r.sliderJoint = js;
+
+    PxArticulationLink* arm = arti->createLink(slider, PxTransform(PxVec3(r.armX, baseY, 0.0f)));
+    PxShape* as = physics->createShape(PxBoxGeometry(armHalf), *material);
+    arm->attachShape(*as);
+    arm->setMass(r.armMass);
+    arm->setMassSpaceInertiaTensor(boxInertia(armHalf, r.armMass));
+    PxArticulationJointReducedCoordinate* j = arm->getInboundJoint();
+    j->setJointType(PxArticulationJointType::eREVOLUTE);
+    j->setParentPose(PxTransform(PxVec3(baseHalf, 0.0f, 0.0f)));
+    j->setChildPose(PxTransform(PxVec3(-armHalf.x, 0.0f, 0.0f)));
+    j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
+    j->setDriveParams(PxArticulationAxis::eSWING2,
+                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
+    scene->addArticulation(*arti);
+    r.arm = arm;
+
+    r.weightMass = 0.5f;
+    {
+        const float wh = 0.05f;
+        PxRigidDynamic* w = physics->createRigidDynamic(
+            PxTransform(PxVec3(r.armX + 0.4f, baseY + armHalf.y + wh + 0.005f, 0.0f)));
+        PxShape* wsh = physics->createShape(PxBoxGeometry(wh, wh, wh), *material);
+        w->attachShape(*wsh);
+        w->setMass(r.weightMass);
+        w->setMassSpaceInertiaTensor(boxInertia(PxVec3(wh), r.weightMass));
+        scene->addActor(*w);
+        r.weight = w;
+    }
+
+    const PxU32 n = 5;
+    const float invMass = 2.0f;
+    const float topY = baseY - armHalf.y - 0.1f;
+    if (!buildClothCurtain(physics, scene, cudaCtx, n, n, 0.6f, 0.6f, PxVec3(r.armX, topY, 0.0f), invMass, 0.1f,
+                           r.cloth))
+        return r;
+    r.clothMass = float(n * n) / invMass;
+    const PxTransform armPose = arm->getGlobalPose();
+    for (PxU32 c = 0; c < n; ++c)
+    {
+        const PxU32 id = r.cloth.vid(c, 0);
+        r.topRow.push_back(id);
+        r.anchorLocal.push_back(PxVec4(armPose.transformInv(r.cloth.verts[id]), 0.0f));
+    }
+    r.attachment = attachCurtainVertices(physics, r.cloth, r.topRow, arm, r.anchorLocal);
+    if (!r.attachment)
+    {
+        std::printf("FAIL: clothlinkattach createDeformableAttachment (cloth vertex -> link) returned null\n");
+        r.arm = nullptr;
+    }
+    return r;
+}
+
+// PXG_SCENE=clothtripin.  A 9 x 9 curtain (81 vertices, 128 triangles, 1.6 x 1.6 m, 0.25 kg
+// per vertex, top edge at y 4) held ONLY by eTRIANGLE -> eWORLD attachments at triangle
+// centroids: every triangle of the top two bands whose GPU (BV32) index is >= 81, the vertex
+// count.  The index the solve sees is the GPU one -- PxgSimulationController::
+// addTriRigidAttachment maps the API's CPU triangle through mGRB_faceRemapInverse -- so the
+// pins are chosen on that side and handed to the API through mGRB_faceRemap.
+//
+// What it observes: the solves' vertex / triangle split (FEMClothExternalSolve.cu:1417-1431
+// + :1474-1483 PGS, :1616-1630 + :1671-1680 TGS).  Before the port both solves read the
+// velocity / accumulated delta of VERTEX #triIdx and scattered the whole correction into it:
+// for these pins that is past the end of the 81-vertex buffers, and the triangles' own
+// corners are never pulled -- the curtain falls.
+//
+// WHY 32 SOLVER ITERATIONS, AND THE PGS BOUND.  A triangle attachment's velMult is 1 / (the
+// INTERPOLATED inverse mass) (FEMClothConstraintPrep.cu:440-447 + :528-571), while the correction
+// reaches the corners barycentric-weighted (FEMClothExternalSolve.cu:1478-1482): each iteration
+// moves a centroid pin by sum(b_i^2) = 1/3 of its error.  TGS corrects the POSITION error and
+// holds with the default 4 iterations (centroid deviation 1.6 cm, measured).  PGS passes
+// raXn0_biasW three times (:1451): its y and z position errors are error.x, so the vertical hold
+// is a VELOCITY-only one, and error.x leaks into the y / z bias.  Measured on these shaders: the
+// curtain fell 2.0 m with 4 iterations; with 16 / 32 / 64 the pinned centroids drifted
+// 0.42 / 0.18 / 0.15 m over the 180 steps, linearly in time, while the curtain itself stayed up.
+// So the cloth runs 32 iterations and the PGS row allows 0.25 m of centroid drift (TGS: 2 cm);
+// the old shaders, which never pull the triangles' corners, fail by metres.
+// PGS DOES NOT SETTLE: it is a slow CREEP, not a hang.  Measured with 32 iterations: bottom
+// row y 2.3311 / 2.3116 / 2.2778 at steps 120 / 150 / 179 (about 0.07 m/s over the last 30
+// steps) and the centroid drift still growing (0.167 / 0.170 / 0.179 m); at that rate the
+// 0.25 m pin bar would be crossed after roughly 250 steps.  So the PGS row checks the creep
+// RATE of the bottom row over the last 45 steps (< 0.15 m/s; measured mean +0.055 m/s) on top
+// of the bounded drop and the 0.25 m drift at 180 steps -- the old shaders fail the drop and
+// drift rows (curtain on the ground, 2.4 m), not the rate row (they are at rest there).  TGS
+// is settled (|dy| < 3e-5 m per step, checked < 5e-4).
+// FIXTURE-ONLY: the barycentric weighting of the gather and scatter.  Every pin here uses
+// bary (1/3, 1/3, 1/3), so a gather that ignored the stored barycentrics is invisible, and an
+// UNWEIGHTED scatter (deltaPos * invMass_i instead of (deltaPos * b_i) * invMass_i, single-.spv
+// mutant) only holds harder: centroid dev 0.14 mm TGS / 5.3 cm PGS, both pass.  Those are
+// caught by femClothSimRigidAttachAllAnchorsPGS / TGS (non-uniform bary, bit-exact).
+struct ClothTriPinScene
+{
+    ClothCurtain cloth;
+    std::vector<PxU32> gpuTri;            // pinned GPU triangle indices (all >= nbVerts)
+    std::vector<std::array<PxU32, 3>> triVerts;
+    std::vector<PxVec3> anchors;           // centroids at spawn
+    std::vector<PxU32> bottomRow;
+    PxCudaContextManager* cudaCtx = nullptr;
+    bool ok = false;
+};
+
+ClothTriPinScene buildClothTriPinScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                       PxCudaContextManager* cudaCtx)
+{
+    ClothTriPinScene s;
+    s.cudaCtx = cudaCtx;
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               0.5f, 30.0f);
+    const PxU32 n = 9;
+    if (!buildClothCurtain(physics, scene, cudaCtx, n, n, 1.6f, 1.6f, PxVec3(0.0f, 4.0f, 0.0f), 4.0f, 0.1f, s.cloth))
+        return s;
+    // 32 position iterations (the cloth's own count, PxDeformableBody): see the header.
+    s.cloth.surface->setSolverIterationCounts(32, 1);
+    const PxU32 nbVerts = n * n;
+    for (PxU32 c = 0; c < n; ++c) s.bottomRow.push_back(s.cloth.vid(c, n - 1));
+
+    const Gu::TriangleMesh* gm = static_cast<const Gu::TriangleMesh*>(s.cloth.triMesh);
+    const PxU32 nbTris = s.cloth.triMesh->getNbTriangles();
+    const float bandY = s.cloth.verts[s.cloth.vid(0, 2)].y - 1.0e-4f;   // top two bands
+    std::vector<PxU32> cpuTri;
+    std::vector<PxVec4> bary, world;
+    for (PxU32 g = nbVerts; g < nbTris; ++g)
+    {
+        std::array<PxU32, 3> v;
+        if (gm->has16BitIndices())
+        {
+            const PxU16* t = reinterpret_cast<const PxU16*>(gm->mGRB_triIndices);
+            v = { t[3 * g], t[3 * g + 1], t[3 * g + 2] };
+        }
+        else
+        {
+            const PxU32* t = reinterpret_cast<const PxU32*>(gm->mGRB_triIndices);
+            v = { t[3 * g], t[3 * g + 1], t[3 * g + 2] };
+        }
+        bool inBand = true;
+        for (PxU32 k = 0; k < 3; ++k) inBand = inBand && s.cloth.verts[v[k]].y > bandY;
+        if (!inBand) continue;
+        const PxVec3 centroid = (s.cloth.verts[v[0]] + s.cloth.verts[v[1]] + s.cloth.verts[v[2]]) * (1.0f / 3.0f);
+        s.gpuTri.push_back(g);
+        s.triVerts.push_back(v);
+        s.anchors.push_back(centroid);
+        cpuTri.push_back(gm->mGRB_faceRemap[g]);
+        // The centroid is order-free, so the GPU / CPU corner order cannot matter.
+        bary.push_back(PxVec4(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f, 0.0f));
+        world.push_back(PxVec4(centroid, 0.0f));
+    }
+    if (s.gpuTri.size() < 3u)
+    {
+        std::printf("FAIL: clothtripin found only %zu top-band triangles with a GPU index >= %u\n",
+                    s.gpuTri.size(), nbVerts);
+        return s;
+    }
+    PxDeformableAttachmentData d;
+    d.actor[0] = s.cloth.surface;
+    d.type[0] = PxDeformableAttachmentTargetType::eTRIANGLE;
+    d.indices[0].data = cpuTri.data();
+    d.indices[0].count = PxU32(cpuTri.size());
+    d.coords[0].data = bary.data();
+    d.coords[0].count = PxU32(bary.size());
+    d.actor[1] = NULL;
+    d.type[1] = PxDeformableAttachmentTargetType::eWORLD;
+    d.coords[1].data = world.data();
+    d.coords[1].count = PxU32(world.size());
+    d.pose[1] = PxTransform(PxIdentity);
+    s.ok = physics->createDeformableAttachment(d) != nullptr;
+    if (!s.ok) std::printf("FAIL: clothtripin createDeformableAttachment (triangle -> world) returned null\n");
+    return s;
 }
 
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
@@ -12413,6 +12884,312 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothhangbox (tranche B of task 35): a 2 kg box hanging from a pinned curtain
+    // by three eVERTEX -> eRIGID attachments.  See buildClothHangBoxScene.  Its own arm: the
+    // observable is the BOX coming to rest under the cloth instead of free-falling.
+    if (!std::strcmp(sceneName, "clothhangbox"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothhangbox is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is static equilibrium (the box stops)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        ClothHangBoxScene hs = buildClothHangBoxScene(physics, scene, material, cudaCtx);
+        if (!hs.cloth.surface || !hs.box)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothhangbox scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothhangbox' built: %zu-vertex curtain (%.2f kg), top row pinned to "
+                    "the world, a %.2f kg box on %zu vertex -> rigid hook(s)\n", hs.cloth.verts.size(),
+                    hs.clothMass, hs.boxMass, hs.hookIds.size());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothhangbox pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 180, restWindow = 30;
+        const float boxY0 = hs.box->getGlobalPose().p.y;
+        std::vector<PxVec4> host;
+        bool finite = true;
+        float topDev = 0.0f, hookGap = 0.0f, restSpeedMax = 0.0f, restBodyVelMax = 0.0f;
+        PxVec3 prevP = hs.box->getGlobalPose().p;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            finite = readCurtain(cudaCtx, hs.cloth, host) && finite;
+            for (PxU32 id : hs.topRow) topDev = PxMax(topDev, (host[id].getXYZ() - hs.cloth.verts[id]).magnitude());
+            const PxTransform bp = hs.box->getGlobalPose();
+            float gap = 0.0f;
+            for (size_t k = 0; k < hs.hookIds.size(); ++k)
+                gap = PxMax(gap, (host[hs.hookIds[k]].getXYZ() - bp.transform(hs.hookLocal[k].getXYZ())).magnitude());
+            // REST is read from the POSE, per step: under TGS the body's reported velocity keeps
+            // the within-step balance of gravity against the reaction row, which the CUDA adds to
+            // the velocity as a length (see the builder) -- measured 0.06 m/s on a box whose
+            // pose moved 1.2 mm over the last 60 steps.
+            const float poseSpeed = (bp.p - prevP).magnitude() / dt;
+            prevP = bp.p;
+            if (i >= steps - restWindow)
+            {
+                hookGap = PxMax(hookGap, gap);
+                restSpeedMax = PxMax(restSpeedMax, poseSpeed);
+                restBodyVelMax = PxMax(restBodyVelMax, hs.box->getLinearVelocity().magnitude());
+            }
+            if (i < 3 || i % 30 == 0 || i == steps - 1)
+                std::printf("    step %3d: box y %.5f  |v| %.5f  hook gap %.5f  top-row max dev %.5f\n", i, bp.p.y,
+                            hs.box->getLinearVelocity().magnitude(), gap, topDev);
+        }
+        const float boxY = hs.box->getGlobalPose().p.y;
+        const float drop = boxY0 - boxY;
+        std::printf("  clothhangbox: box y %.5f -> %.5f (drop %+.5f m; an undamped free fall over %d steps would be %.3f m, "
+                    "nothing else holds it); last %d steps: max pose speed %.5f m/s (body velocity %.5f), max hook "
+                    "gap %.5f m; pinned top row max dev %.5f m\n", boxY0, boxY, drop, steps,
+                    0.5f * 9.81f * (steps * dt) * (steps * dt), restWindow, restSpeedMax, restBodyVelMax,
+                    hookGap, topDev);
+        int failures = 0;
+        if (!finite || !std::isfinite(boxY)) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE REACTION: the box hangs -- a bounded drop (the curtain stretches) ...
+        if (!(drop > -0.02f && drop < 0.25f))
+        { std::printf("FAIL: the box dropped %+.5f m (need -0.02 .. 0.25): it is not held by the cloth\n", drop); ++failures; }
+        // 2. ... and it comes to rest.
+        if (!(restSpeedMax < 0.05f))
+        { std::printf("FAIL: the box's pose still moves at %.5f m/s over the last %d steps (need < 0.05)\n",
+                      restSpeedMax, restWindow); ++failures; }
+        // 3. The hooked vertex sits on its box anchor: within the TGS sag the CUDA math predicts
+        //    (g dt / (0.7 * 4) = 5.8 cm, see the builder) plus 4 cm.
+        if (!(hookGap < 0.1f))
+        { std::printf("FAIL: the hooked vertex is %.5f m from its box anchor (need < 0.1)\n", hookGap); ++failures; }
+        // 4. The world pins hold the curtain (within 2 cm).
+        if (!(topDev < 0.02f))
+        { std::printf("FAIL: a pinned top-row vertex moved %.5f m (need < 0.02)\n", topDev); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'clothhangbox' stepped: the box HANGS from the cloth "
+                        "(drop %+.4f m, |v| %.5f m/s at rest)\n", drop, restSpeedMax);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothhangbox checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=clothlinkattach (tranche B of task 35): a curtain hanging from a drive-held
+    // articulation link by eVERTEX -> eRIGID attachments, then swept sideways by it.  See
+    // buildClothLinkAttachScene.
+    if (!std::strcmp(sceneName, "clothlinkattach"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothlinkattach is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is the analytic drive deflection and the link-frame anchors\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        ClothLinkAttachScene ls = buildClothLinkAttachScene(physics, scene, material, cudaCtx);
+        if (!ls.cloth.surface || !ls.arm)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothlinkattach scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothlinkattach' built: %zu-vertex curtain (%.2f kg) hanging from a revolute "
+                    "arm link (k %.0f N m/rad) by %zu vertex -> link attachments\n", ls.cloth.verts.size(),
+                    ls.clothMass, ls.stiffness, ls.topRow.size());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothlinkattach pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            ls.attachment->release();
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int restSteps = 180, sweepSteps = 60;
+        const float sweepVel = 0.3f;
+        std::vector<PxVec4> host;
+        bool finite = true;
+        float gapRest = 0.0f, gapSweep = 0.0f, px0 = 0.0f, cx0 = 0.0f, cx = 0.0f;
+        float share = 0.0f, theta = 0.0f;   // read at the end of the rest phase
+        for (int i = 0; i < restSteps + sweepSteps; ++i)
+        {
+            if (i == restSteps)
+            {
+                px0 = ls.arm->getGlobalPose().p.x;
+                cx0 = cx;
+                ls.sliderJoint->setDriveVelocity(PxArticulationAxis::eX, sweepVel);
+            }
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            finite = readCurtain(cudaCtx, ls.cloth, host) && finite;
+            const PxTransform ap = ls.arm->getGlobalPose();
+            float gap = 0.0f;
+            for (size_t k = 0; k < ls.topRow.size(); ++k)
+                gap = PxMax(gap, (host[ls.topRow[k]].getXYZ() - ap.transform(ls.anchorLocal[k].getXYZ())).magnitude());
+            double sx = 0.0;
+            for (const PxVec4& p : host) sx += double(p.x);
+            cx = float(sx / double(host.size()));
+            if (i < restSteps) gapRest = PxMax(gapRest, gap); else gapSweep = PxMax(gapSweep, gap);
+            if (i < 2 || i % 30 == 0 || i == restSteps + sweepSteps - 1)
+                std::printf("    %s %3d: arm angle %+.6f rad  arm x %+.5f  cloth mean x %+.5f  max anchor gap %.5f\n",
+                            i < restSteps ? "step " : "sweep", i < restSteps ? i : i - restSteps,
+                            linkAngleZ(ls.arm), ap.p.x, cx, gap);
+            if (i == restSteps - 1)
+            {
+                // The deflection is read at the end of the rest phase.
+                const float g = 9.81f;
+                theta = linkAngleZ(ls.arm);
+                const float leverWeight = ls.weight->getGlobalPose().p.x - ls.hingeX;
+                const float thetaOwn = -(ls.armMass * g * (ls.armX - ls.hingeX) + ls.weightMass * g * leverWeight)
+                                     / ls.stiffness;
+                const float thetaExp = thetaOwn - ls.clothMass * g * (ls.armX - ls.hingeX) / ls.stiffness;
+                share = (theta - thetaOwn) / (thetaExp - thetaOwn);
+                std::printf("  clothlinkattach: arm angle %+.6f rad, expected %+.6f (arm + rigid weight alone "
+                            "%+.6f, the curtain's share %+.6f); measured share %.3f x the prediction\n",
+                            theta, thetaExp, thetaOwn, thetaExp - thetaOwn, share);
+            }
+        }
+        const float dpx = ls.arm->getGlobalPose().p.x - px0, dcx = cx - cx0;
+        std::printf("  clothlinkattach: max anchor gap at rest %.5f m, during the sweep %.5f m; SWEEP: arm moved "
+                    "%+.5f m, cloth moved %+.5f m\n", gapRest, gapSweep, dpx, dcx);
+        int failures = 0;
+        if (!finite || !std::isfinite(theta) || !std::isfinite(dpx)) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE REACTION ON THE LINK (PGS): the curtain's share of the deflection is the CUDA's
+        //    1/N of a rigid load's (see the builder), within 0.18 .. 0.25 (measured 0.211; 0
+        //    without the reaction, 0.155 without its angular row).  TGS: printed only -- the
+        //    CUDA's dt / N is below resolution; the TGS link reaction is fixture-only.
+        const float shareExp = 1.0f / float(ls.topRow.size());
+        const float shareLo = 0.18f, shareHi = 0.25f;
+        std::printf("  clothlinkattach: share %.3f x a rigid load's; the CUDA predicts %.3f (PGS: 1/N, N = %zu "
+                    "attachments) / %.4f (TGS: dt/N)\n", share, shareExp, ls.topRow.size(), shareExp * dt);
+        if (usePgs && !(share > shareLo && share < shareHi))
+        { std::printf("FAIL: the curtain's share of the arm's deflection is %.3f x a rigid load's (need %.2f .. "
+                      "%.2f; 0 means the link does not feel the cloth, ~0.155 that the angular reaction row "
+                      "is missing)\n", share, shareLo, shareHi); ++failures; }
+        // 2. THE LINK-FRAME ANCHORS hold, at rest and while the link moves (velocity read).
+        // TGS: 3 mm.  The port holds 0.7 / 0.8 mm (rest / sweep); with the link velocity read
+        // reverted to the rigid arm the sweep gap was 5.1 mm (measured) -- 2 cm would not see it.
+        const float gapBar = usePgs ? 0.03f : 0.003f;
+        if (!(gapRest < gapBar) || !(gapSweep < gapBar))
+        { std::printf("FAIL: an attached vertex left its link-frame anchor by %.5f m (rest) / %.5f m (sweep), "
+                      "need < %.2f\n", gapRest, gapSweep, gapBar); ++failures; }
+        // 3. The sweep happened and the curtain went along.
+        if (!(dpx > 0.25f))
+        { std::printf("FAIL: the arm did not sweep (moved %+.5f m)\n", dpx); ++failures; }
+        if (!(PxAbs(dcx - dpx) < 0.05f))
+        { std::printf("FAIL: the curtain's mean x moved %+.5f m against the arm's %+.5f (need within 5 cm)\n",
+                      dcx, dpx); ++failures; }
+        // The attachment must go before the scene: releasing it afterwards dereferenced the
+        // link's freed core (a SIGSEGV at teardown, measured).
+        ls.attachment->release();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'clothlinkattach' stepped: the curtain hangs from the "
+                        "link (anchor gap %.4f / %.4f m) and follows its sweep; the link's share %.3f x a rigid "
+                        "load's (CUDA %s prediction %.4f)\n", gapRest, gapSweep, share, usePgs ? "PGS" : "TGS",
+                        usePgs ? shareExp : shareExp * dt);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothlinkattach checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=clothtripin (tranche B of task 35): a curtain held only by eTRIANGLE -> eWORLD
+    // pins on triangles whose GPU index is past the last vertex.  See buildClothTriPinScene.
+    if (!std::strcmp(sceneName, "clothtripin"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothtripin is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is the world anchors\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        ClothTriPinScene ts = buildClothTriPinScene(physics, scene, material, cudaCtx);
+        if (!ts.ok)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothtripin scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        PxU32 minTri = 0xffffffffu;
+        for (PxU32 g : ts.gpuTri) minTri = PxMin(minTri, g);
+        std::printf("  [  OK  ] scene 'clothtripin' built: %zu-vertex curtain held by %zu triangle -> world pins, "
+                    "GPU triangle indices %u.. (>= nbVerts %zu)\n", ts.cloth.verts.size(), ts.gpuTri.size(), minTri,
+                    ts.cloth.verts.size());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothtripin pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 180, restWindow = 45;
+        std::vector<PxVec4> host;
+        bool finite = true;
+        float pinDev = 0.0f, botRestMaxDy = 0.0f, bot = 0.0f, prevBot = 0.0f, botWin0 = 0.0f;
+        float bot0 = 0.0f;
+        for (PxU32 id : ts.bottomRow) bot0 += ts.cloth.verts[id].y;
+        bot0 /= float(ts.bottomRow.size());
+        prevBot = bot0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            finite = readCurtain(cudaCtx, ts.cloth, host) && finite;
+            float dev = 0.0f;
+            for (size_t k = 0; k < ts.gpuTri.size(); ++k)
+            {
+                const auto& v = ts.triVerts[k];
+                const PxVec3 c = (host[v[0]].getXYZ() + host[v[1]].getXYZ() + host[v[2]].getXYZ()) * (1.0f / 3.0f);
+                dev = PxMax(dev, (c - ts.anchors[k]).magnitude());
+            }
+            pinDev = PxMax(pinDev, dev);
+            bot = 0.0f;
+            for (PxU32 id : ts.bottomRow) bot += host[id].y;
+            bot /= float(ts.bottomRow.size());
+            if (i == steps - 1 - restWindow) botWin0 = bot;
+            if (i >= steps - restWindow) botRestMaxDy = PxMax(botRestMaxDy, PxAbs(bot - prevBot));
+            prevBot = bot;
+            if (i < 3 || i % 30 == 0 || i == steps - 1)
+                std::printf("    step %3d: max centroid dev %.5f  bottom row y %.5f\n", i, dev, bot);
+        }
+        const float botDrop = bot0 - bot;
+        const float creep = (botWin0 - bot) / (float(restWindow) * dt);   // m/s, + = falling
+        std::printf("  clothtripin: pinned centroids max dev %.5f m over the run; bottom row y %.5f -> %.5f "
+                    "(drop %+.5f m), last %d steps max |dy| %.6f, mean creep %+.5f m/s\n", pinDev, bot0, bot,
+                    botDrop, restWindow, botRestMaxDy, creep);
+        int failures = 0;
+        if (!finite || !std::isfinite(bot)) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. The pinned TRIANGLE centroids stay at their anchors: within 2 cm in TGS, 0.25 m in
+        //    PGS (the raXn0 quirk's velocity-only hold drifts, see the builder).
+        const float pinBar = usePgs ? 0.25f : 0.02f;
+        if (!(pinDev < pinBar))
+        { std::printf("FAIL: a pinned triangle centroid moved %.5f m from its anchor (need < %.2f)\n", pinDev,
+                      pinBar); ++failures; }
+        // 2. The curtain hangs: a bounded drape; TGS settled, PGS a slow creep (see the builder).
+        if (!(botDrop > -0.02f && botDrop < 0.3f))
+        { std::printf("FAIL: the bottom row dropped %+.5f m (need -0.02 .. 0.3): the curtain is not held\n", botDrop); ++failures; }
+        if (usePgs)
+        {
+            if (!(PxAbs(creep) < 0.15f))
+            { std::printf("FAIL: the bottom row creeps at %+.5f m/s over the last %d steps (need |v| < 0.15; "
+                          "measured ~0.07 with the port)\n", creep, restWindow); ++failures; }
+        }
+        else if (!(botRestMaxDy < 0.0005f))
+        { std::printf("FAIL: the curtain did not settle (bottom row |dy| %.6f per step, need < 0.0005)\n",
+                      botRestMaxDy); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'clothtripin' stepped: triangle pins past the last vertex "
+                        "hold the curtain (centroid dev %.4f m, drop %+.4f m, %s %+.4f m/s)\n", pinDev, botDrop,
+                        usePgs ? "PGS creep" : "TGS settled, creep", creep);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothtripin checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=articulationloop: two links held horizontal by D6 joints at their
     // tips (one to a sibling link of the same articulation, one to the world).  Its
     // own arm: the generic rest band (+-0.75) cannot tell held (y 3.0) from hanging
@@ -14107,7 +14884,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact|clothhangbox|clothlinkattach|clothtripin\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
