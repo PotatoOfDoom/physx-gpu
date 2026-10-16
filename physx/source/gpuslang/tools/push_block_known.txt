@@ -157,13 +157,10 @@ sb_heightfieldContactGenLaunch                         0@0+4:tolerenceLength    
 sb_primitiveContactGenLaunch                           0@0+4:tolerenceLength                                          # dead-upstream
 sb_psContactGenLaunch                                  0@0+4:toleranceLength;2@16+8:transformCache                    # dead-upstream
 sb_psMidphaseGeneratePairsLaunch                       1@4+4:toleranceLength;4@24+8:transformCache;5@32+8:bounds      # dead-upstream
-sb_rigidAttachmentPrepareLaunch                        8@64+8:sharedDesc                                              # deferred
 sb_rigidContactPrepareLaunch                           10@80+4:invDt;12@96+1:isTGS                                    # dead-upstream
 sb_sbMidphaseGeneratePairsLaunch                       0@0+4:toleranceLength;2@16+8:transformCache;3@24+8:bounds      # dead-upstream
 sb_sdfMeshMidphaseGeneratePairsLaunch                  0@0+4:tolerenceLength;3@24+8:bounds                            # dead-upstream
 sb_softbodyContactPrepareLaunch                        1@8+8:contacts                                                 # dead-upstream
-sb_solveRigidSoftAttachmentLaunch                      5@40+8:artiCoreDesc;8@64+8:rigidDeltaVel                       # deferred
-sb_solveRigidSoftAttachmentLaunchTGS                   5@40+8:artiCoreDesc;9@64+8:rigidDeltaVel                       # deferred
 solveBlockUnified                                      4@24+1:doFrictionWord                                          # dead-upstream
 solveWholeIslandTGS                                    3@20+1:doFrictionWord                                          # dead-upstream
 sphereHeightfieldNarrowphase                           15@120+4:stackSizeBytes                                        # dead-upstream

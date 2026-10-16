@@ -3605,6 +3605,348 @@ ClothTriPinScene buildClothTriPinScene(PxPhysics* physics, PxScene* scene, PxMat
     return s;
 }
 
+// ===========================================================================
+// TRANCHE C of task 35: the softbody (deformable volume) RIGID-ATTACHMENT arms that had been
+// deferred in softBodyRigidAttachBda.slang -- the prepare's articulation anchor, the solves'
+// link velocity read, the reaction on dynamic bodies and links, and the cone-limited branch.
+// Three scenes, each built so the pre-tranche shaders fail it in both solvers.
+//
+// Shared helper: the sim vertices with the largest y (the top face of a buildFemVolumeCube),
+// read from the device buffer the solver uses.
+// ===========================================================================
+static void femVolumeTopSimVerts(PxDeformableVolume* vol, PxCudaContextManager* cudaCtx,
+                                 std::vector<PxU32>& ids, std::vector<PxVec4>& pos, float& massOut)
+{
+    const PxU32 nv = vol->getSimulationMesh()->getNbVertices();
+    pos.assign(nv, PxVec4(0.0f));
+    cudaCtx->getCudaContext()->memcpyDtoH(pos.data(), reinterpret_cast<CUdeviceptr>(vol->getSimPositionInvMassBufferD()),
+                                          nv * sizeof(PxVec4));
+    float maxY = -FLT_MAX;
+    double mass = 0.0;
+    for (PxU32 i = 0; i < nv; ++i)
+    {
+        maxY = PxMax(maxY, pos[i].y);
+        if (pos[i].w > 0.0f) mass += 1.0 / double(pos[i].w);
+    }
+    massOut = float(mass);
+    ids.clear();
+    for (PxU32 i = 0; i < nv; ++i)
+        if (pos[i].y >= maxY - 1e-3f) ids.push_back(i);
+}
+
+// Scale a freshly built volume's mass by `factor` before the first step: buildFemVolumeCube
+// uploads the cooked inverse masses (density 1, so a 0.4 m cube weighs 0.064 kg) into the .w of
+// the sim position and velocity buffers the solver reads; both are rewritten here.
+static void femVolumeScaleMass(PxDeformableVolume* vol, PxCudaContextManager* cudaCtx, float factor)
+{
+    const PxU32 nv = vol->getSimulationMesh()->getNbVertices();
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    std::vector<PxVec4> buf(nv);
+    PxVec4* devs[2] = { vol->getSimPositionInvMassBufferD(), vol->getSimVelocityBufferD() };
+    for (PxVec4* d : devs)
+    {
+        ctx->memcpyDtoH(buf.data(), reinterpret_cast<CUdeviceptr>(d), nv * sizeof(PxVec4));
+        for (PxVec4& v : buf) v.w = v.w / factor;
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(d), buf.data(), nv * sizeof(PxVec4));
+    }
+}
+
+// One eVERTEX (sim mesh) -> eRIGID / eWORLD attachment per vertex, anchors in the actor frame.
+static PxDeformableAttachment* attachVolumeVertices(PxPhysics* physics, PxDeformableVolume* vol,
+                                                    const std::vector<PxU32>& ids, PxRigidActor* actor,
+                                                    const std::vector<PxVec4>& anchors)
+{
+    PxDeformableAttachmentData d;
+    d.actor[0] = vol;
+    d.type[0] = PxDeformableAttachmentTargetType::eVERTEX;
+    d.indices[0].data = ids.data();
+    d.indices[0].count = PxU32(ids.size());
+    d.actor[1] = actor;
+    d.type[1] = actor ? PxDeformableAttachmentTargetType::eRIGID : PxDeformableAttachmentTargetType::eWORLD;
+    d.coords[1].data = anchors.data();
+    d.coords[1].count = PxU32(anchors.size());
+    d.pose[1] = PxTransform(PxIdentity);
+    return physics->createDeformableAttachment(d);
+}
+
+// PXG_SCENE=softbodyrigidattach.  A FEM cube (cells 2, 0.6 m) hangs by its nine top sim
+// vertices (eVERTEX -> eRIGID) from a DYNAMIC box that has gravity DISABLED and a query-only
+// shape -- nothing touches the box but the attachments.  Nothing is under the cube.
+//
+// What it observes: the REACTION on a dynamic rigid (softBodyGM.cu:2169-2183 PGS / :2293-2307
+// TGS, consumed by accumulateDeltaVRigidFirst/Second).  Before the port the coupling was
+// one-way: the box behaved as kinematic and stayed EXACTLY where it was, and the cube hung
+// from it as from the world.
+//
+// Expected motion, from the CUDA semantics.  The two softbody solves scale the vertex-side
+// correction by dt (:2188 / :2312), so for this solver pair deltaImpulse is a real impulse in
+// BOTH PGS and TGS: in steady state the attachments deliver sum(deltaF) = M_sb (g - a) dt per
+// step, of which the box receives deltaF * invMass0 as a velocity change -- the physically
+// correct reaction, NOT the cloth TGS length-as-velocity row (FEMClothExternalSolve.cu:1668
+// has no dt; tranche B).  One CUDA quirk remains: accumulateDeltaVRigidSecondLaunch divides
+// a body's summed rows by its attachment COUNT N (rigidDeltaAccum.cu:369-370 / :391-392), so
+// the box takes 1/N of the reaction:  a = M_sb g / (N M_box + M_sb).  The box's mass is chosen
+// so that this predicted fall is large; the fall of the WHOLE system without the quirk
+// (a = M_sb g / (M_box + M_sb)) is printed beside it.
+struct SoftBodyRigidAttachScene
+{
+    PxDeformableVolume* vol = nullptr;
+    PxRigidDynamic* box = nullptr;
+    PxDeformableAttachment* attachment = nullptr;
+    std::vector<PxU32> pinIdx;
+    std::vector<PxVec4> pinLocal;   // anchors in the box frame
+    float boxMass = 0.0f, sbMass = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+SoftBodyRigidAttachScene buildSoftBodyRigidAttachScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                                       PxCudaContextManager* cudaCtx)
+{
+    SoftBodyRigidAttachScene s;
+    s.cudaCtx = cudaCtx;
+    // One live dynamic rigid with a simulation shape, parked far away (the FEM solve runs inside
+    // the rigid island loop), and a ground for it.
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 30.0f);
+    const float size = 0.6f, baseY = 4.0f;
+    s.vol = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, baseY, 0.0f);
+    if (!s.vol) return s;
+    std::vector<PxVec4> pos;
+    femVolumeTopSimVerts(s.vol, cudaCtx, s.pinIdx, pos, s.sbMass);
+
+    const PxVec3 boxHalf(0.4f, 0.05f, 0.4f);
+    const PxVec3 boxP(0.0f, baseY + size + boxHalf.y, 0.0f);
+    s.boxMass = s.sbMass;   // a = g / (N + 1) predicted, g / 2 for the whole system
+    s.box = physics->createRigidDynamic(PxTransform(boxP));
+    PxShape* bs = physics->createShape(PxBoxGeometry(boxHalf), *material, true, PxShapeFlag::eSCENE_QUERY_SHAPE);
+    s.box->attachShape(*bs);
+    s.box->setMass(s.boxMass);
+    s.box->setMassSpaceInertiaTensor(boxInertia(boxHalf, s.boxMass));
+    s.box->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+    s.box->setSleepThreshold(0.0f);
+    scene->addActor(*s.box);
+    for (PxU32 id : s.pinIdx) s.pinLocal.push_back(PxVec4(pos[id].getXYZ() - boxP, 0.0f));
+    s.attachment = attachVolumeVertices(physics, s.vol, s.pinIdx, s.box, s.pinLocal);
+    if (!s.attachment)
+    {
+        std::printf("FAIL: softbodyrigidattach createDeformableAttachment (volume vertex -> rigid) returned null\n");
+        s.box = nullptr;
+    }
+    return s;
+}
+
+// PXG_SCENE=softbodyartiattach.  The clothlinkattach articulation (fixed base at y 3 ->
+// shapeless SLIDER, prismatic X with a pure velocity drive -> ARM, box 1.0 x 0.1 x 0.4, 10 kg,
+// revolute about Z held level by a stiff drive, a 0.5 kg box resting near its tip) with a FEM
+// cube (cells 2, 0.4 m) 0.05 m under the arm, centred under its COM, its nine top sim vertices
+// eVERTEX -> eRIGID to the ARM LINK at their spawn positions.
+//
+// What it observes: the prepare's articulation arm (softBodyGM.cu:1912-1960: the link pose and
+// spatial response) and the solves' link velocity read (dataReadWriteHelper.cuh:101-118 /
+// :122-148).  Before the port the prepare took the rigid arm for the link node, with
+// solverBodyIndices[artiNode] -- the ARTICULATION's index -- as a solver body: the anchors'
+// link-local coordinates were read in an unrelated body's frame (body 0 is the static world,
+// so the anchors land near the origin) and the pins pulled the cube there.
+// SWEEP (60 steps after 180 rest steps): the slider drives at 0.3 m/s; every pinned vertex must
+// stay near its anchor in the arm's frame.  The link reaction is printed (deflection share);
+// the fixtures softBodySimRigidAttachAllAnchors{PGS,TGS} check it bit-exactly.
+struct SoftBodyArtiAttachScene
+{
+    PxDeformableVolume* vol = nullptr;
+    PxArticulationLink* arm = nullptr;
+    PxArticulationJointReducedCoordinate* sliderJoint = nullptr;
+    PxRigidDynamic* weight = nullptr;
+    PxDeformableAttachment* attachment = nullptr;   // released before the scene
+    std::vector<PxU32> pinIdx;
+    std::vector<PxVec4> anchorLocal;   // in the arm's actor frame
+    float hingeX = 0.0f, armX = 0.0f, armMass = 0.0f, weightMass = 0.0f, stiffness = 0.0f, sbMass = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+SoftBodyArtiAttachScene buildSoftBodyArtiAttachScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                                     PxCudaContextManager* cudaCtx)
+{
+    SoftBodyArtiAttachScene r;
+    r.cudaCtx = cudaCtx;
+    const float baseY = 3.0f, baseHalf = 0.1f;
+    const PxVec3 armHalf(0.5f, 0.05f, 0.2f);
+    r.hingeX = baseHalf;
+    r.armX = baseHalf + armHalf.x;
+    r.armMass = 10.0f;
+    r.stiffness = 4000.0f;
+
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 30.0f);
+
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), 10.0f));
+    PxArticulationLink* slider = arti->createLink(base, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    slider->setMass(r.armMass);
+    slider->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), r.armMass));
+    PxArticulationJointReducedCoordinate* js = slider->getInboundJoint();
+    js->setJointType(PxArticulationJointType::ePRISMATIC);
+    js->setParentPose(PxTransform(PxIdentity));
+    js->setChildPose(PxTransform(PxIdentity));
+    js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
+    js->setDriveParams(PxArticulationAxis::eX, PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
+    r.sliderJoint = js;
+
+    PxArticulationLink* arm = arti->createLink(slider, PxTransform(PxVec3(r.armX, baseY, 0.0f)));
+    PxShape* as = physics->createShape(PxBoxGeometry(armHalf), *material);
+    arm->attachShape(*as);
+    arm->setMass(r.armMass);
+    arm->setMassSpaceInertiaTensor(boxInertia(armHalf, r.armMass));
+    PxArticulationJointReducedCoordinate* j = arm->getInboundJoint();
+    j->setJointType(PxArticulationJointType::eREVOLUTE);
+    j->setParentPose(PxTransform(PxVec3(baseHalf, 0.0f, 0.0f)));
+    j->setChildPose(PxTransform(PxVec3(-armHalf.x, 0.0f, 0.0f)));
+    j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
+    j->setDriveParams(PxArticulationAxis::eSWING2,
+                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
+    scene->addArticulation(*arti);
+    r.arm = arm;
+
+    // The clothonlink finding: a link's scratch impulse is propagated only for an articulation
+    // with rigid constraints in the solver partitions (forwardDynamic2.cu:384) -- a small box
+    // resting on the arm supplies one, with old and new shaders alike.
+    r.weightMass = 0.5f;
+    {
+        const float wh = 0.05f;
+        PxRigidDynamic* w = physics->createRigidDynamic(
+            PxTransform(PxVec3(r.armX + 0.4f, baseY + armHalf.y + wh + 0.005f, 0.0f)));
+        PxShape* wsh = physics->createShape(PxBoxGeometry(wh, wh, wh), *material);
+        w->attachShape(*wsh);
+        w->setMass(r.weightMass);
+        w->setMassSpaceInertiaTensor(boxInertia(PxVec3(wh), r.weightMass));
+        scene->addActor(*w);
+        r.weight = w;
+    }
+
+    const float size = 0.4f;
+    const float topY = baseY - armHalf.y - 0.05f;
+    r.vol = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, topY - size, r.armX);
+    if (!r.vol) return r;
+    // 16 kg: heavy enough that the link's 1/N share of its weight (see the arm) deflects the
+    // drive well above the drive's own settling error.
+    femVolumeScaleMass(r.vol, cudaCtx, 250.0f);
+    std::vector<PxVec4> pos;
+    femVolumeTopSimVerts(r.vol, cudaCtx, r.pinIdx, pos, r.sbMass);
+    const PxTransform armPose = arm->getGlobalPose();
+    for (PxU32 id : r.pinIdx) r.anchorLocal.push_back(PxVec4(armPose.transformInv(pos[id].getXYZ()), 0.0f));
+    r.attachment = attachVolumeVertices(physics, r.vol, r.pinIdx, arm, r.anchorLocal);
+    if (!r.attachment)
+    {
+        std::printf("FAIL: softbodyartiattach createDeformableAttachment (volume vertex -> link) returned null\n");
+        r.arm = nullptr;
+    }
+    return r;
+}
+
+// PXG_SCENE=softbodycone.  The DEPRECATED public path that reaches a REAL cone / distance
+// limit: PxDeformableVolume::addRigidAttachment(NULL, collisionVertex, worldPose,
+// PxConeLimitedConstraint*) -> PxgSimulationController::addRigidAttachment (:4014, collision
+// vertex -> sim tet + barycentric, so the TET path) -> addRigidAttachmentInternal, which copies
+// mLowLimit / mHighLimit / mAxis / mAngle into the attachment (:3055-3058).
+//   ROPE    a FEM cube (cells 2, 0.5 m) at x = -1.5 hangs by its top-face collision vertices
+//           from world anchors at their spawn positions, each a DISTANCE ROPE: low -1, high
+//           0.3 m, angle -1 (cone off).  computeConeLimitedError clamps |relPos| to [-1, 0.3]
+//           (attachments.cuh:78), so the error is zero until the vertex is 0.3 m from its
+//           anchor: the cube falls 0.3 m and hangs there.  Pre-tranche the branch was missing
+//           and the plain pin held every vertex ON its anchor.
+//   CONE    the same cube at x = +1.5, ropes of 0.3 m about the axis (1, -1, 0)/sqrt2 with a
+//           half-angle of 0.3 rad: gravity pulls each vertex straight down, 45 degrees off the
+//           axis, so the angular arm (the PxSinCos branch, attachments.cuh:58-71) must hold it
+//           on the cone surface, 0.3 rad from the axis, at most 0.3 m out -- displaced in +x.
+struct SoftBodyConeScene
+{
+    PxDeformableVolume* rope = nullptr;
+    PxDeformableVolume* cone = nullptr;
+    std::vector<PxU32> ropeIds, coneIds;           // collision-mesh vertex ids
+    std::vector<PxVec3> ropeAnchors, coneAnchors;  // world
+    float ropeLen = 0.3f, coneAngle = 0.3f;
+    PxVec3 coneAxis;
+    PxCudaContextManager* cudaCtx = nullptr;
+    bool ok = false;
+};
+
+static void femVolumeTopCollisionVerts(PxDeformableVolume* vol, std::vector<PxU32>& ids, std::vector<PxVec3>& pos)
+{
+    const PxTetrahedronMesh* m = vol->getCollisionMesh();
+    const PxVec3* v = m->getVertices();
+    float maxY = -FLT_MAX;
+    for (PxU32 i = 0; i < m->getNbVertices(); ++i) maxY = PxMax(maxY, v[i].y);
+    ids.clear(); pos.clear();
+    for (PxU32 i = 0; i < m->getNbVertices(); ++i)
+        if (v[i].y >= maxY - 1e-3f) { ids.push_back(i); pos.push_back(v[i]); }
+}
+
+SoftBodyConeScene buildSoftBodyConeScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                         PxCudaContextManager* cudaCtx)
+{
+    SoftBodyConeScene s;
+    s.cudaCtx = cudaCtx;
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 30.0f);
+    const float size = 0.5f, baseY = 4.0f;
+    s.rope = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, baseY, -1.5f);
+    s.cone = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, baseY, 1.5f);
+    if (!s.rope || !s.cone) return s;
+    femVolumeTopCollisionVerts(s.rope, s.ropeIds, s.ropeAnchors);
+    femVolumeTopCollisionVerts(s.cone, s.coneIds, s.coneAnchors);
+    s.coneAxis = PxVec3(1.0f, -1.0f, 0.0f).getNormalized();
+    PxConeLimitedConstraint rope;
+    rope.mAxis = PxVec3(0.0f, -1.0f, 0.0f);
+    rope.mAngle = -1.0f;
+    rope.mLowLimit = -1.0f;
+    rope.mHighLimit = s.ropeLen;
+    PxConeLimitedConstraint cone;
+    cone.mAxis = s.coneAxis;
+    cone.mAngle = s.coneAngle;
+    cone.mLowLimit = -1.0f;
+    cone.mHighLimit = s.ropeLen;
+    bool ok = !s.ropeIds.empty() && !s.coneIds.empty();
+    for (size_t k = 0; k < s.ropeIds.size(); ++k)
+        ok = ok && s.rope->addRigidAttachment(NULL, s.ropeIds[k], s.ropeAnchors[k], &rope) != 0xFFFFFFFFu;
+    for (size_t k = 0; k < s.coneIds.size(); ++k)
+        ok = ok && s.cone->addRigidAttachment(NULL, s.coneIds[k], s.coneAnchors[k], &cone) != 0xFFFFFFFFu;
+    if (!ok) std::printf("FAIL: softbodycone addRigidAttachment(NULL, vertex, pose, cone) failed\n");
+    s.ok = ok;
+    return s;
+}
+
+// Tranche C scene bars, set from the measured runs (new shaders / sh_base, TGS / PGS):
+//   softbodyrigidattach  fall ratio 1.018 / 1.016 (sh_base 0.000 / 0.000); pin gap 0.00003 /
+//                        0.0266 m (PGS holds a velocity, it sags by what leaks in per step).
+//   softbodyartiattach   anchor gap rest/sweep 0.00015/0.0050 (TGS), 0.0036/0.0057 (PGS);
+//                        sh_base 3.12 / 3.05 m -- the anchors were built in body 0's frame.
+//                        The TGS sweep maximum is ONE step: sweep step 0 lags by sweepVel*dt =
+//                        0.0050 m (the velocity target lands after the step reads the link),
+//                        then the gap falls back to 0.0001.  So the sweep is also bounded from
+//                        sweep step ARTIATTACH_STEADY_FROM on ("steady").  Partial-fix mutant
+//                        (prepare + reaction ported, the solves read a link as solver body
+//                        solverBodyIndices[linkNode], the pre-tranche reader): rest 0.00238 /
+//                        steady 0.00495 / cube lag 0.0027 m (TGS) against new 0.00015 /
+//                        0.00012 / 0.0001; PGS steady 0.01524 / lag 0.0150 against new 0.00569 /
+//                        0.0050.  PGS's rest gap (0.0065 vs 0.0036) does not separate them.
+//                        Link share 0.111 (TGS) / 0.086 (PGS) of a rigid load, CUDA 1/N = 0.111;
+//                        sh_base -0.019 / -0.011.
+//   softbodycone         rope 0.3000 .. 0.3009 (TGS), 0.2973 .. 0.3026 (PGS); cone <= 0.3013 /
+//                        0.3029 rad; sh_base pinned, 0.0000 .. 0.0009 m.
+static const float RIGIDATTACH_RATIO_LO = 0.8f, RIGIDATTACH_RATIO_HI = 1.25f;
+static const float RIGIDATTACH_GAP_TGS = 0.005f, RIGIDATTACH_GAP_PGS = 0.05f;
+static const float ARTIATTACH_GAP_PGS = 0.02f, ARTIATTACH_GAP_TGS = 0.01f;            // rest + whole sweep
+static const float ARTIATTACH_REST_TGS = 0.001f;                                        // rest, TGS only
+static const float ARTIATTACH_STEADY_PGS = 0.01f, ARTIATTACH_STEADY_TGS = 0.001f;       // sweep step >= STEADY_FROM
+static const float ARTIATTACH_LAG_PGS = 0.01f, ARTIATTACH_LAG_TGS = 0.001f;             // |cube dx - arm dx|
+static const int ARTIATTACH_STEADY_FROM = 10;
+static const float ARTIATTACH_SHARE_LO = 0.07f, ARTIATTACH_SHARE_HI = 0.14f;
+static const float CONE_ROPE_LO = 0.25f, CONE_ROPE_HI = 0.35f, CONE_ANGLE_TOL = 0.03f;
+
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
 // cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
 // zero initial velocity and no ground, so it is a pure free fall with NO contacts.
@@ -13190,6 +13532,313 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=softbodyrigidattach (tranche C of task 35): a FEM cube hanging from a dynamic,
+    // gravity-free box by eVERTEX -> eRIGID attachments.  See buildSoftBodyRigidAttachScene.
+    // The observable is the BOX being pulled down by the cube it carries.
+    if (!std::strcmp(sceneName, "softbodyrigidattach"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyrigidattach is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is the analytic fall of the box\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        SoftBodyRigidAttachScene rs = buildSoftBodyRigidAttachScene(physics, scene, material, cudaCtx);
+        if (!rs.vol || !rs.box)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyrigidattach scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyrigidattach' built: a %.3f kg FEM cube hanging by %zu vertex -> rigid "
+                    "attachments from a %.3f kg gravity-free box\n", rs.sbMass, rs.pinIdx.size(), rs.boxMass);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyrigidattach pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            rs.attachment->release();
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f, g = 9.81f;
+        const int steps = 90;
+        const float boxY0 = rs.box->getGlobalPose().p.y;
+        const PxU32 nv = rs.vol->getSimulationMesh()->getNbVertices();
+        std::vector<PxVec4> host(nv);
+        bool finite = true;
+        float gapMax = 0.0f, gapEnd = 0.0f;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            cudaCtx->getCudaContext()->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(rs.vol->getSimPositionInvMassBufferD()),
+                                                  nv * sizeof(PxVec4));
+            const PxTransform bp = rs.box->getGlobalPose();
+            float gap = 0.0f;
+            for (size_t k = 0; k < rs.pinIdx.size(); ++k)
+            {
+                const PxVec3 p = host[rs.pinIdx[k]].getXYZ();
+                finite = finite && p.isFinite();
+                gap = PxMax(gap, (p - bp.transform(rs.pinLocal[k].getXYZ())).magnitude());
+            }
+            gapMax = PxMax(gapMax, gap);
+            gapEnd = gap;
+            if (i < 2 || i % 30 == 0 || i == steps - 1)
+                std::printf("    step %3d: box y %.5f  v.y %+.5f  max pin gap %.5f\n", i, bp.p.y,
+                            rs.box->getLinearVelocity().y, gap);
+        }
+        const float T = float(steps) * dt;
+        const float boxY = rs.box->getGlobalPose().p.y;
+        const float drop = boxY0 - boxY;
+        const float vy = rs.box->getLinearVelocity().y;
+        const float N = float(rs.pinIdx.size());
+        // The CUDA prediction (see the builder): a = M_sb g / (N M_box + M_sb).
+        const float aPred = rs.sbMass * g / (N * rs.boxMass + rs.sbMass);
+        const float aFull = rs.sbMass * g / (rs.boxMass + rs.sbMass);
+        const float dropPred = 0.5f * aPred * T * T;
+        const float ratio = drop / dropPred;
+        std::printf("  softbodyrigidattach: box y %.5f -> %.5f (drop %+.5f m, v.y %+.5f m/s after %.2f s); CUDA "
+                    "prediction a = M_sb g / (N M_box + M_sb) = %.4f m/s^2 -> drop %.5f m (measured %.3f x); "
+                    "without the 1/N count division %.4f m/s^2; max pin gap %.5f m (end %.5f)\n", boxY0, boxY,
+                    drop, vy, T, aPred, dropPred, ratio, aFull, gapMax, gapEnd);
+        int failures = 0;
+        if (!finite || !std::isfinite(boxY)) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE REACTION: the gravity-free box is pulled down by the cube, by the CUDA's amount.
+        //    Without the reaction it does not move at all (drop exactly 0).
+        if (!(ratio > RIGIDATTACH_RATIO_LO && ratio < RIGIDATTACH_RATIO_HI))
+        { std::printf("FAIL: the box fell %+.5f m = %.3f x the CUDA prediction %.5f (need %.2f .. %.2f; 0 means the "
+                      "box does not feel the cube)\n", drop, ratio, dropPred, RIGIDATTACH_RATIO_LO, RIGIDATTACH_RATIO_HI);
+          ++failures; }
+        // 2. The pinned vertices stay on their box anchors.
+        const float gapBar = usePgs ? RIGIDATTACH_GAP_PGS : RIGIDATTACH_GAP_TGS;
+        if (!(gapMax < gapBar))
+        { std::printf("FAIL: a pinned vertex left its box anchor by %.5f m (need < %.3f)\n", gapMax, gapBar); ++failures; }
+        rs.attachment->release();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'softbodyrigidattach' stepped: the box feels the cube "
+                        "(drop %+.4f m = %.3f x the CUDA prediction), pins within %.4f m\n", drop, ratio, gapMax);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyrigidattach checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=softbodyartiattach (tranche C of task 35): a FEM cube hanging from a drive-held
+    // articulation link by eVERTEX -> eRIGID attachments, then swept sideways by it.  See
+    // buildSoftBodyArtiAttachScene.
+    if (!std::strcmp(sceneName, "softbodyartiattach"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyartiattach is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is the link-frame anchors\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        SoftBodyArtiAttachScene as = buildSoftBodyArtiAttachScene(physics, scene, material, cudaCtx);
+        if (!as.vol || !as.arm)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyartiattach scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyartiattach' built: a %.3f kg FEM cube hanging from a revolute arm "
+                    "link (k %.0f N m/rad) by %zu vertex -> link attachments\n", as.sbMass, as.stiffness, as.pinIdx.size());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyartiattach pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            as.attachment->release();
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f, g = 9.81f;
+        const int restSteps = 180, sweepSteps = 60;
+        const float sweepVel = 0.3f;
+        const PxU32 nv = as.vol->getSimulationMesh()->getNbVertices();
+        std::vector<PxVec4> host(nv);
+        bool finite = true;
+        float gapRest = 0.0f, gapSweep = 0.0f, gapSteady = 0.0f, px0 = 0.0f, cx0 = 0.0f, cx = 0.0f, share = 0.0f, theta = 0.0f;
+        for (int i = 0; i < restSteps + sweepSteps; ++i)
+        {
+            if (i == restSteps)
+            {
+                px0 = as.arm->getGlobalPose().p.x;
+                cx0 = cx;
+                as.sliderJoint->setDriveVelocity(PxArticulationAxis::eX, sweepVel);
+            }
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            cudaCtx->getCudaContext()->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(as.vol->getSimPositionInvMassBufferD()),
+                                                  nv * sizeof(PxVec4));
+            const PxTransform ap = as.arm->getGlobalPose();
+            float gap = 0.0f;
+            double sx = 0.0;
+            for (const PxVec4& p : host) { finite = finite && p.getXYZ().isFinite(); sx += double(p.x); }
+            cx = float(sx / double(nv));
+            for (size_t k = 0; k < as.pinIdx.size(); ++k)
+                gap = PxMax(gap, (host[as.pinIdx[k]].getXYZ() - ap.transform(as.anchorLocal[k].getXYZ())).magnitude());
+            if (i < restSteps) gapRest = PxMax(gapRest, gap); else gapSweep = PxMax(gapSweep, gap);
+            if (i >= restSteps + ARTIATTACH_STEADY_FROM) gapSteady = PxMax(gapSteady, gap);
+            if (i < 2 || i % 30 == 0 || i == restSteps + sweepSteps - 1)
+                std::printf("    %s %3d: arm angle %+.6f rad  arm x %+.5f  cube mean x %+.5f  max anchor gap %.5f\n",
+                            i < restSteps ? "step " : "sweep", i < restSteps ? i : i - restSteps,
+                            linkAngleZ(as.arm), ap.p.x, cx, gap);
+            if (i == restSteps - 1)
+            {
+                theta = linkAngleZ(as.arm);
+                const float leverWeight = as.weight->getGlobalPose().p.x - as.hingeX;
+                const float thetaOwn = -(as.armMass * g * (as.armX - as.hingeX) + as.weightMass * g * leverWeight) / as.stiffness;
+                const float thetaExp = thetaOwn - as.sbMass * g * (as.armX - as.hingeX) / as.stiffness;
+                share = (theta - thetaOwn) / (thetaExp - thetaOwn);
+                std::printf("  softbodyartiattach: arm angle %+.6f rad, a rigid load of the cube would give %+.6f (arm + "
+                            "rigid weight alone %+.6f); measured share %.3f x a rigid load's (CUDA 1/N = %.3f)\n",
+                            theta, thetaExp, thetaOwn, share, 1.0f / float(as.pinIdx.size()));
+            }
+        }
+        const float dpx = as.arm->getGlobalPose().p.x - px0, dcx = cx - cx0;
+        std::printf("  softbodyartiattach: max anchor gap at rest %.5f m, during the sweep %.5f m (from sweep step %d on "
+                    "%.5f m); SWEEP: arm moved %+.5f m, cube moved %+.5f m (lag %.5f m)\n", gapRest, gapSweep,
+                    ARTIATTACH_STEADY_FROM, gapSteady, dpx, dcx, PxAbs(dcx - dpx));
+        int failures = 0;
+        if (!finite || !std::isfinite(theta) || !std::isfinite(dpx)) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE LINK-FRAME ANCHORS hold, at rest and while the link moves.  The whole-run bar
+        //    catches the prepare's link arm (sh_base: metres); the rest (TGS) and steady-sweep
+        //    bars catch the solves' link VELOCITY read (fix 2): a link read as solver body
+        //    solverBodyIndices[linkNode] lags the moving link by a constant 5 mm (TGS) / 15 mm (PGS).
+        const float gapBar = usePgs ? ARTIATTACH_GAP_PGS : ARTIATTACH_GAP_TGS;
+        if (!(gapRest < gapBar) || !(gapSweep < gapBar))
+        { std::printf("FAIL: a pinned vertex left its link-frame anchor by %.5f m (rest) / %.5f m (sweep), need < %.4f\n",
+                      gapRest, gapSweep, gapBar); ++failures; }
+        if (!usePgs && !(gapRest < ARTIATTACH_REST_TGS))
+        { std::printf("FAIL: TGS rest anchor gap %.5f m, need < %.4f (the link's velocity read)\n",
+                      gapRest, ARTIATTACH_REST_TGS); ++failures; }
+        const float steadyBar = usePgs ? ARTIATTACH_STEADY_PGS : ARTIATTACH_STEADY_TGS;
+        if (!(gapSteady < steadyBar))
+        { std::printf("FAIL: anchor gap from sweep step %d on %.5f m, need < %.4f (the link's velocity read)\n",
+                      ARTIATTACH_STEADY_FROM, gapSteady, steadyBar); ++failures; }
+        // 2. THE LINK REACTION: the link carries the CUDA's 1/N share of the cube's weight
+        //    (accumulateDeltaVRigidSecondLaunch divides a link's rows by its attachment count,
+        //    rigidDeltaAccum.cu:369-377; the softbody solves' deltaImpulse is a real impulse in
+        //    both solvers, softBodyGM.cu:2188 / :2312).
+        if (!(share > ARTIATTACH_SHARE_LO && share < ARTIATTACH_SHARE_HI))
+        { std::printf("FAIL: the cube's share of the arm's deflection is %.3f x a rigid load's (need %.2f .. %.2f, "
+                      "CUDA 1/N = %.3f)\n", share, ARTIATTACH_SHARE_LO, ARTIATTACH_SHARE_HI,
+                      1.0f / float(as.pinIdx.size())); ++failures; }
+        // 3. The sweep happened and the cube went along.
+        if (!(dpx > 0.25f))
+        { std::printf("FAIL: the arm did not sweep (moved %+.5f m)\n", dpx); ++failures; }
+        const float lagBar = usePgs ? ARTIATTACH_LAG_PGS : ARTIATTACH_LAG_TGS;
+        if (!(PxAbs(dcx - dpx) < lagBar))
+        { std::printf("FAIL: the cube's mean x moved %+.5f m against the arm's %+.5f (need within %.4f m)\n",
+                      dcx, dpx, lagBar); ++failures; }
+        as.attachment->release();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'softbodyartiattach' stepped: the cube hangs from the link "
+                        "(anchor gap %.4f / %.4f m) and follows its sweep; link share %.3f x a rigid load's\n",
+                        gapRest, gapSweep, share);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyartiattach checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=softbodycone (tranche C of task 35): deprecated addRigidAttachment with a
+    // PxConeLimitedConstraint -- a distance rope and an angular cone.  See buildSoftBodyConeScene.
+    if (!std::strcmp(sceneName, "softbodycone"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodycone is GPU-only (PhysX deformables have no CPU pipeline); "
+                        "its reference is the rope length and the cone angle\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        SoftBodyConeScene cs = buildSoftBodyConeScene(physics, scene, material, cudaCtx);
+        if (!cs.ok)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodycone scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodycone' built: ROPE cube on %zu world ropes (%.2f m), CONE cube on %zu "
+                    "ropes in a %.2f rad cone about (%.3f, %.3f, %.3f)\n", cs.ropeIds.size(), cs.ropeLen,
+                    cs.coneIds.size(), cs.coneAngle, cs.coneAxis.x, cs.coneAxis.y, cs.coneAxis.z);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodycone pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 180;
+        auto readColl = [&](PxDeformableVolume* v, std::vector<PxVec4>& out) {
+            const PxU32 n = v->getCollisionMesh()->getNbVertices();
+            out.assign(n, PxVec4(0.0f));
+            cudaCtx->getCudaContext()->memcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(v->getPositionInvMassBufferD()),
+                                                  n * sizeof(PxVec4));
+            bool f = true;
+            for (const PxVec4& p : out) f = f && p.getXYZ().isFinite();
+            return f;
+        };
+        std::vector<PxVec4> hr, hc;
+        bool finite = true;
+        float ropeMin = 0.0f, ropeMax = 0.0f, ropeMean = 0.0f, coneAngMax = 0.0f, coneGapMin = 0.0f, coneGapMax = 0.0f,
+              coneDx = 0.0f;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            finite = readColl(cs.rope, hr) && finite;
+            finite = readColl(cs.cone, hc) && finite;
+            ropeMin = FLT_MAX; ropeMax = 0.0f; ropeMean = 0.0f;
+            for (size_t k = 0; k < cs.ropeIds.size(); ++k)
+            {
+                const float d = (hr[cs.ropeIds[k]].getXYZ() - cs.ropeAnchors[k]).magnitude();
+                ropeMin = PxMin(ropeMin, d); ropeMax = PxMax(ropeMax, d); ropeMean += d;
+            }
+            ropeMean /= float(cs.ropeIds.size());
+            coneAngMax = 0.0f; coneGapMin = FLT_MAX; coneGapMax = 0.0f; coneDx = 0.0f;
+            for (size_t k = 0; k < cs.coneIds.size(); ++k)
+            {
+                const PxVec3 rel = hc[cs.coneIds[k]].getXYZ() - cs.coneAnchors[k];
+                const float d = rel.magnitude();
+                coneGapMin = PxMin(coneGapMin, d); coneGapMax = PxMax(coneGapMax, d);
+                coneDx += rel.x / float(cs.coneIds.size());
+                if (d > 1e-4f) coneAngMax = PxMax(coneAngMax, std::acos(PxClamp(rel.dot(cs.coneAxis) / d, -1.0f, 1.0f)));
+            }
+            if (i < 2 || i % 30 == 0 || i == steps - 1)
+                std::printf("    step %3d: ROPE gap min/mean/max %.5f / %.5f / %.5f   CONE gap %.5f .. %.5f, max angle "
+                            "from axis %.4f rad, mean dx %+.5f\n", i, ropeMin, ropeMean, ropeMax, coneGapMin, coneGapMax,
+                            coneAngMax, coneDx);
+        }
+        std::printf("  softbodycone: ROPE hangs %.5f .. %.5f m (mean %.5f) from its anchors (rope %.2f m; a pin would "
+                    "give ~0); CONE gap %.5f .. %.5f m at <= %.4f rad from the axis (cone %.2f rad; straight down "
+                    "would be %.4f), mean dx %+.5f m\n", ropeMin, ropeMax, ropeMean, cs.ropeLen, coneGapMin,
+                    coneGapMax, coneAngMax, cs.coneAngle, PxPi / 4.0f, coneDx);
+        int failures = 0;
+        if (!finite) { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE DISTANCE LIMIT: every roped vertex hangs at the rope's length (it stretches by
+        //    the attachment's own sag), not on its anchor.
+        if (!(ropeMin > CONE_ROPE_LO && ropeMax < CONE_ROPE_HI))
+        { std::printf("FAIL: the roped vertices hang %.5f .. %.5f m from their anchors (need %.3f .. %.3f; ~0 means "
+                      "the distance limit is ignored and the attachment is a plain pin)\n", ropeMin, ropeMax,
+                      CONE_ROPE_LO, CONE_ROPE_HI); ++failures; }
+        // 2. THE ANGULAR LIMIT: the coned vertices hang out on their ropes, within the cone.
+        if (!(coneGapMin > CONE_ROPE_LO && coneGapMax < CONE_ROPE_HI))
+        { std::printf("FAIL: the coned vertices are %.5f .. %.5f m from their anchors (need %.3f .. %.3f)\n",
+                      coneGapMin, coneGapMax, CONE_ROPE_LO, CONE_ROPE_HI); ++failures; }
+        if (!(coneAngMax < cs.coneAngle + CONE_ANGLE_TOL))
+        { std::printf("FAIL: a coned vertex is %.4f rad from the cone axis (cone %.2f rad + %.2f; straight down is "
+                      "%.4f)\n", coneAngMax, cs.coneAngle, CONE_ANGLE_TOL, PxPi / 4.0f); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'softbodycone' stepped: the ropes hang at %.4f .. %.4f m and the "
+                        "cone holds its vertices within %.4f rad of its axis\n", ropeMin, ropeMax, coneAngMax);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodycone checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=articulationloop: two links held horizontal by D6 joints at their
     // tips (one to a sibling link of the same articulation, one to the world).  Its
     // own arm: the generic rest band (+-0.75) cannot tell held (y 3.0) from hanging
@@ -14884,7 +15533,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact|clothhangbox|clothlinkattach|clothtripin\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact|clothhangbox|clothlinkattach|clothtripin|softbodyrigidattach|softbodyartiattach|softbodycone\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"

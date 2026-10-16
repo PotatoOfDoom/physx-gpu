@@ -1254,9 +1254,10 @@ def selftest(shader_dir):
             if got != ["gpuShapes", "softbodies"]:
                 fails.append("SELFTEST NS3: a CUDA-side name swap must give NAME-SWAP; got %s" % got)
         # NS3c: the check-round C1 proof -- sb_rigidAttachmentPrepareLaunch with the CUDA's
-        # prepareDesc / sharedDesc parameters swapped (softBodyGM.cu, equal-size pointers, the
-        # second never read by the shader): no offset, reach or signature moves, so only the
-        # name of the reached member over the first can see it
+        # prepareDesc / sharedDesc parameters swapped (softBodyGM.cu, equal-size pointers): no
+        # offset, reach or signature moves, so only the names of the reached members can see
+        # it.  Until tranche C of task 35 the shader never read sharedDesc and the swap showed
+        # on prepareDesc alone; the articulation arm reads it now, so BOTH members must flag
         K3c = "sb_rigidAttachmentPrepareLaunch"
         cu3 = os.path.join(ROOT, "physx", "source", "gpusimulationcontroller", "src", "CUDA", "softBodyGM.cu")
         src3 = open(cu3).read()
@@ -1278,9 +1279,9 @@ def selftest(shader_dir):
             if name_leg_entry(K3c, rows_now[K3c], lv3, rc3, sigs) != ("OK", [], ([], [], [])):
                 fails.append("SELFTEST NS3c: the tree's %s must be name-clean and decidable" % K3c)
             st3 = name_leg_entry(K3c, rows_now[K3c], lv3, rc3, fake3)
-            if st3[0] != "OK" or [x[1] for x in st3[1]] != ["prepareDesc"]:
+            if st3[0] != "OK" or sorted(x[1] for x in st3[1]) != ["prepareDesc", "sharedDesc"]:
                 fails.append("SELFTEST NS3c: %s with the CUDA's prepareDesc/sharedDesc swapped must give "
-                             "NAME-SWAP on prepareDesc; got %s" % (K3c, st3))
+                             "NAME-SWAP on prepareDesc and sharedDesc; got %s" % (K3c, st3))
         # NS12b: a second declaration with the same sizes and renamed parameters -> UNDECIDED
         decl = sigs[K][0]
         fake = dict(sigs)

@@ -93,9 +93,9 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
 #
-# Today (clothhangbox + clothlinkattach + clothtripin added): 71 named scenes below, plus
-# twenty-eight explicit rows after the loop (the settling bag, four softbody floors, the
-# softbodyhex box arm, sixteen PGS rows, three slabgrid modes, three particle2 arms) = 99.
+# Today (softbodyrigidattach + softbodyartiattach + softbodycone added): 74 named scenes
+# below, plus thirty-one explicit rows after the loop (the settling bag, four softbody floors,
+# the softbodyhex box arm, nineteen PGS rows, three slabgrid modes, three particle2 arms) = 105.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
@@ -106,7 +106,8 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spherem
         particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity slabgrid particleapply softbodydata
         directapimerge sdfquery softbodyhex particle2 articulationloop articulationstack
-        clothonlink softbodyarticontact clothhangbox clothlinkattach clothtripin"
+        clothonlink softbodyarticontact clothhangbox clothlinkattach clothtripin
+        softbodyrigidattach softbodyartiattach softbodycone"
 
 pass=0; fail=0; missing=0
 
@@ -268,6 +269,12 @@ run_one "softbodyarticontact (PGS)" PXG_SCENE=softbodyarticontact PXG_SOLVER=pgs
 run_one "clothhangbox (PGS)" PXG_SCENE=clothhangbox PXG_SOLVER=pgs
 run_one "clothlinkattach (PGS)" PXG_SCENE=clothlinkattach PXG_SOLVER=pgs
 run_one "clothtripin (PGS)" PXG_SCENE=clothtripin PXG_SOLVER=pgs
+# softbodyrigidattach / softbodyartiattach / softbodycone (tranche C of task 35): the softbody
+# rigid-attachment solves have one kernel per solver (sb_solveRigidSoftAttachmentLaunch{,TGS},
+# readVelocitiesPGS / readVelocitiesTGS, the PGS / TGS cone arms) -- hence PGS rows.
+run_one "softbodyrigidattach (PGS)" PXG_SCENE=softbodyrigidattach PXG_SOLVER=pgs
+run_one "softbodyartiattach (PGS)" PXG_SCENE=softbodyartiattach PXG_SOLVER=pgs
+run_one "softbodycone (PGS)" PXG_SCENE=softbodycone PXG_SOLVER=pgs
 
 # P9.97a: slabgrid observes the TGS averaging family (initializeSolverVelocitiesTGS,
 # computeAverageSolverBodyVelocityTGS, propagateAverageSolverBodyVelocityTGS) at the

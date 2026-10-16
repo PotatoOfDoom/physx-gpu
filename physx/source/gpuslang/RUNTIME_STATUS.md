@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+Softbody rigid attachments: articulation anchor + link velocity, the reaction on dynamic bodies (was
+one-way), and real cone / distance limits from the deprecated addRigidAttachment (were ignored: pinned).
+Ported; PXG_SCENE=softbodyrigidattach, softbodyartiattach, softbodycone (+ PGS rows);
+softBodySimRigidAttachAllAnchors{PGS,TGS} (8 lanes, bit-exact).
 Cloth rigid attachments: articulation anchor + link velocity, the reaction on dynamic bodies (was
 one-way: a box hung from cloth free-fell), TRIANGLE attachments (a triangle index was used as a vertex
 index -- writes past the vertex buffers), cone branch.  Ported; PXG_SCENE=clothhangbox, clothlinkattach,
@@ -2216,6 +2220,35 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Artikulation, Tranche C — Soft-Body-Anhänge an Starrkörper und Links
+
+**Portiert** (`softBodyRigidAttachBda.slang`, Workflow wie Tranche B):
+1. Prepare, Artikulations-Anker (softBodyGM.cu:1912-1960): Link-Pose, `spatialResponseMatrixW[linkId]`,
+   rohe raXn, .w = 1, kein Nullen von rigidDeltaVel. Anders als Cloth punktet der Soft Body jede Achse
+   gegen ihr eigenes deltaV — die Cloth-Eigenheit (deltaV0 dreimal) gibt es hier nicht.
+2. Link-Geschwindigkeit in beiden Solves über das gemeinsame `readRigidVelocity`.
+3. Rückwirkung auf dynamische Körper und Links (softBodyGM.cu:2169-2183 / :2293-2307) — vorher einseitig.
+   Beide Solves multiplizieren die Korrektur mit dt: die Rückwirkung ist (anders als Cloth-TGS) ein echter
+   Impuls in TGS und PGS.
+4. Cone-/Distanz-Limits (attachments.cuh:112-120 / :176-180) — beim Soft Body ERREICHBAR über das veraltete
+   `PxDeformableVolume::addRigidAttachment(…, PxConeLimitedConstraint*)`; vorher ignoriert (fest gepinnt).
+5. Tet-Pfad geprüft: korrekt (Gather über `mSimTetIndices`, vier Ecken) — kein Index-Fehler wie bei Cloth.
+`check_push_block.py`: der NS3c-Selbsttest erwartete `sharedDesc` als ungelesen — jetzt gelesen, Erwartung
+angepasst.
+
+**Tests.** `softBodySimRigidAttachAllAnchors{PGS,TGS}`: 8 Spuren (statisch, dynamisch, Tet ≥ nbVerts mit
+Wächterzeilen, Link + Köder, kinematisch mit Seil, statisches Tet mit Winkel-Cone, Link-Tet, inaktives
+Seil), permutierte Aktiv-Liste, bitgenau (Winkel-Cone 2e-6 relativ wegen sin/cos). Die alten Solve-
+Fixtures nutzten einen unbemerkt aktiven Cone (Winkel 0,25) — auf die deaktivierte Form gesetzt.
+Szenen (neu / `sh_base`, TGS und PGS, nachgemessen):
+- `softbodyrigidattach` — Würfel an einer schwerelosen dynamischen Box: Absenkung nach 1,5 s 1,123 /
+  1,121 m gegen 1,104 m Vorhersage (M_sb·g/(N·M_box+M_sb), N = 9; alt: 0 — die Box spürt nichts).
+- `softbodyartiattach` — Würfel an einem Link mit Schwenk: Ankerabstand im eingeschwungenen Schwenk
+  0,12 mm / 5,7 mm, Link-Lastanteil 0,111 / 0,086 (1/N = 0,111); alt: 3,1 m daneben. Ein Mutant ohne
+  Link-Geschwindigkeit fällt durch (Lücke aus dem Review, mit Eingeschwungen-Schranken geschlossen).
+- `softbodycone` — 0,3-m-Seile und ein 0,3-rad-Kegel: Seil 0,3000–0,3009 / 0,2973–0,3026 m, Winkel
+  0,3013 / 0,3029 rad; alt: fest gepinnt (≤ 3 mm), Winkel 0,9 / 2,4 rad.
 
 ## Artikulation, Tranche B — Cloth-Anhänge an Starrkörper und Links
 
