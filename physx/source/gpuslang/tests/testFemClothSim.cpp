@@ -52,6 +52,12 @@
 #include "PxNodeIndex.h"                     // PxNodeIndex (rigid/world anchor node index)
 #include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a) / PxgRigidFilterPair (4a)
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData / PxAlignedTransform
+#include "CmSpatialVector.h"                 // Cm::UnAlignedSpatialVector (tranche A: articulation prepare oracle)
+#include "PxSpatialMatrix.h"                 // PxSpatialMatrix::operator* -- the engine's own product
+#include "PxgArticulation.h"                 // PxgArticulation record (tranche A)
+#include "PxgArticulationLink.h"             // PxgArticulationLink (penBiasClamp)
+#include "PxgArticulationCoreDesc.h"         // mMaxLinksPerArticulation / nbArticulations
+#include "PxgBodySim.h"                      // articulationRemapId
 #include "PxgContactManager.h"               // PxgContactManagerInput (P7.1 tranche 4a contact gen)
 #include "PxgConvexConvexShape.h"            // PxgShape (P7.1 tranche 4a contact gen)
 #include "PxsTransformCache.h"               // PxsCachedTransform (P7.1 tranche 4a contact gen)
@@ -3935,6 +3941,45 @@ static void refPrepare(RigidContactConstraintHost& c, int slot,
     c.barycentric[slot] = barycentric;
 }
 
+// prepareFEMContacts (deformableUtils.cuh:159-198) — the ARTICULATION arm (tranche A).  The
+// three response products are the ENGINE's own PxSpatialMatrix::operator*, so the oracle is
+// independent of the shader's asmM6MulVec transcription.
+static void refPrepareArti(RigidContactConstraintHost& c, int slot,
+                           V3 normal, V3 p, float pen, V3 delta, F4 barycentric,
+                           V3 linkP, const physx::PxSpatialMatrix& spatialResponse,
+                           float penBiasClampRigid, float penBiasClampFEM)
+{
+    using physx::PxVec3;
+    using physx::Cm::UnAlignedSpatialVector;
+    V3 t0, t1;
+    computeBasis(normal, t0, t1);
+
+    const V3 ra = V3{ p.x - linkP.x, p.y - linkP.y, p.z - linkP.z };
+    const V3 raXn = cross3(ra, normal);
+    const V3 raXF0 = cross3(ra, t0);
+    const V3 raXF1 = cross3(ra, t1);
+    auto pv = [](V3 v) { return PxVec3(v.x, v.y, v.z); };
+    auto vp = [](const PxVec3& v) { return V3{ v.x, v.y, v.z }; };
+
+    const UnAlignedSpatialVector deltaV0 = spatialResponse * UnAlignedSpatialVector(pv(normal), pv(raXn));
+    const float resp0 = dot3(vp(deltaV0.top), raXn) + dot3(vp(deltaV0.bottom), normal);
+    const UnAlignedSpatialVector deltaFV0 = spatialResponse * UnAlignedSpatialVector(pv(t0), pv(raXF0));
+    const UnAlignedSpatialVector deltaFV1 = spatialResponse * UnAlignedSpatialVector(pv(t1), pv(raXF1));
+    const float respF0 = dot3(vp(deltaFV0.top), raXF0) + dot3(vp(deltaFV0.bottom), t0);
+    const float respF1 = dot3(vp(deltaFV1.top), raXF1) + dot3(vp(deltaFV1.bottom), t1);
+
+    const float maxPenBias = rmax(penBiasClampRigid, penBiasClampFEM);
+    const float error = pen + dot3(delta, normal);
+
+    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, error };
+    c.raXn_resp[slot] = F4{ raXn.x, raXn.y, raXn.z, resp0 };
+    c.raXnF0_resp[slot] = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
+    c.raXnF1_resp[slot] = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
+    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, 1.0f };   // invMass0 = 1 for a link
+    c.maxPenBias[slot] = maxPenBias;
+    c.barycentric[slot] = barycentric;
+}
+
 // FEMCollision::initialize (deformableUtils.cuh:280) — null-material (frictionless) path.
 // The rigid velocity state is a PARAMETER (P9.45): it defaults to all zeros, which is what a
 // static body at rest reads, and the dynamic case passes what PxgVelocityReader would return.
@@ -4414,11 +4459,15 @@ PXG_TEST(femClothSimRigidContactTGS) { runRigidContact(/*isTGS*/ true); }
 //   lane 3      STATIC (node 0xFFFFFFFF): globalRigidBodyId == -1, no increment, zeros.
 //   lane 4      KINEMATIC (node index 4 -> solver body 2, invMass 0): the invMass half of
 //               the guard, which the static lane cannot test on its own.
-//   lane 5      ARTICULATION LINK (node index 5 with the articulation bit): the count IS
-//               incremented, exactly as the .cu does, but the reaction is NOT written.  That
-//               is this module's articulation deferral, and pinning it here means the day
-//               prepareFEMContacts and readRigidVelocity grow their articulation branches,
-//               this assertion goes red and forces the reaction on with them.
+//   lane 5      ARTICULATION LINK (node 5, link 1).  Tranche A: the prepare builds the
+//               link's anchor rows (spatialResponseMatrixW products, raw raX* rows, invMass0
+//               = 1) from articulations[bodySims[5].articulationRemapId = 2] -- while the
+//               velocity reader indexes outArtiVelocity by solverBodyIndices[5] = 1, so a
+//               port that used one index for both reads the DECOY record / rows; the query
+//               counts it at numSolverBodies + 1, and the solve REACTS through
+//               computeRigidChange's articulation arm.  The link's count is raised to 3
+//               before the solve so that arm's missing reference-count factor on the
+//               ANGULAR row is observable (with a count of 1 the two arms agree).
 //
 // Every cloth vertex is distinct, so the cloth-side mass split stays 1 per vertex and the
 // RIGID reference count is the only multi-contact quantity under test.
@@ -4563,7 +4612,8 @@ static void runRigidContactDynamic(bool isTGS)
     const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
     const uint64_t dynNodeInd = 3ull;                    // articulation bit (high word bit0) clear
     const uint64_t kinNodeInd = 4ull;
-    const uint64_t artiNodeInd = (1ull << 32) | 5ull;    // articulation bit SET
+    // articulation bit SET, articulationLinkId() = 1 (PxNodeIndex(5, 1): mLinkID = 1 << 1 | 1)
+    const uint64_t artiNodeInd = (3ull << 32) | 5ull;
     // Lanes 6 and 7 are dynamic as well; they exist for computeBasisVectors' SECOND branch
     // (see the normal table below), and being dynamic gives them reaction coverage too.
     const uint64_t nodeInds[11] = { dynNodeInd, dynNodeInd, dynNodeInd,
@@ -4693,7 +4743,86 @@ static void runRigidContactDynamic(bool isTGS)
     solverBodyVelPool[2 + 2u * numSolverBodies] = { -0.0015f, 0.0016f, -0.0017f, 0.0018f };
     DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
 
-    // readRigidVelocity (pxgSlangFemRigidContact.slang:222) mirrored on the host.
+    // ---- tranche A: ONE articulation link behind lane 5 --------------------
+    // Three PxgArticulation records: [2] is the one bodySims[5].articulationRemapId names,
+    // [1] is a DECOY with different link data (solverBodyIndices[5] == 1 is the index the
+    // VELOCITY reader uses), [0] is never named.  Two links each; lane 5 is link 1.
+    const uint32_t artiLinkId = 1u, artiRemapId = 2u, artiSolverIdx = 1u;
+    const uint32_t maxLinks = 2u, nbArticulations = 3u;
+    const uint32_t artiOffset = maxLinks * nbArticulations;
+    std::vector<physx::PxgArticulationLink> artiLinks(nbArticulations * maxLinks);
+    std::memset(static_cast<void*>(artiLinks.data()), 0, artiLinks.size() * sizeof(artiLinks[0]));
+    std::vector<physx::PxTransform> artiB2W(nbArticulations * maxLinks);
+    std::vector<physx::PxSpatialMatrix> artiResp(nbArticulations * maxLinks);
+    for (uint32_t k = 0; k < nbArticulations * maxLinks; ++k)
+    {
+        const float fk = float(k);
+        artiLinks[k].penBiasClamp = -2.0f - 0.5f * fk;
+        artiB2W[k] = physx::PxTransform(physx::PxVec3(0.15f - 0.04f * fk, -0.25f + 0.03f * fk, 0.35f + 0.02f * fk),
+                                        physx::PxQuat(physx::PxIdentity));
+        // A full, NON-symmetric 6x6: column[j][i] != column[i][j], so a transposed product
+        // (asmM6MulVec's documented trap) cannot match.
+        for (uint32_t cc = 0; cc < 6u; ++cc)
+            for (uint32_t rr = 0; rr < 6u; ++rr)
+                artiResp[k].column[cc][rr] = (cc == rr ? 0.9f : 0.0f)
+                                           + 0.013f * float((cc * 7u + rr * 3u + k * 5u) % 11u) - 0.05f;
+    }
+    // Record r's links start at r * maxLinks in each of the three link arrays.
+    DevBuf bArtiLinks = makeDev(dev, artiLinks);
+    DevBuf bArtiB2W = makeDev(dev, artiB2W);
+    DevBuf bArtiResp = makeDev(dev, artiResp);
+    std::vector<physx::PxgArticulation> artiRecs(nbArticulations);
+    std::memset(static_cast<void*>(artiRecs.data()), 0, artiRecs.size() * sizeof(artiRecs[0]));
+    for (uint32_t r = 0; r < nbArticulations; ++r)
+    {
+        artiRecs[r].links = reinterpret_cast<physx::PxgArticulationLink*>(
+            size_t(bArtiLinks.addr + uint64_t(r * maxLinks) * sizeof(physx::PxgArticulationLink)));
+        artiRecs[r].linkBody2Worlds = reinterpret_cast<physx::PxTransform*>(
+            size_t(bArtiB2W.addr + uint64_t(r * maxLinks) * sizeof(physx::PxTransform)));
+        artiRecs[r].spatialResponseMatrixW = reinterpret_cast<physx::PxSpatialMatrix*>(
+            size_t(bArtiResp.addr + uint64_t(r * maxLinks) * sizeof(physx::PxSpatialMatrix)));
+    }
+    DevBuf bArtiRecs = makeDev(dev, artiRecs);
+    std::vector<physx::PxgBodySim> bodySims(6u);
+    std::memset(static_cast<void*>(bodySims.data()), 0, bodySims.size() * sizeof(bodySims[0]));
+    for (uint32_t n = 0; n < 6u; ++n) bodySims[n].articulationRemapId = 0xDEADu;   // only node 5 is read
+    bodySims[5].articulationRemapId = artiRemapId;
+    DevBuf bBodySims = makeDev(dev, bodySims);
+    // solverCoreDesc->outArtiVelocity: four planes (lin, ang, linDelta, angDelta) of
+    // maxLinks * nbArticulations rows; lane 5 reads row artiSolverIdx * maxLinks + artiLinkId.
+    std::vector<F4> outArtiVelocity(4u * artiOffset);
+    for (uint32_t k = 0; k < 4u * artiOffset; ++k)
+    {
+        const float fk = float(k);
+        const float sc = (k >= 2u * artiOffset) ? 0.01f : 1.0f;   // TGS deltas two orders smaller
+        outArtiVelocity[k] = { sc * (0.12f - 0.03f * fk), sc * (-0.45f + 0.02f * fk),
+                               sc * (0.08f + 0.01f * fk), 777.0f };
+    }
+    DevBuf bOutArtiVel = makeDev(dev, outArtiVelocity);
+    std::vector<uint8_t> artiCoreDesc(sizeof(physx::PxgArticulationCoreDesc), 0xAB);
+    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, mMaxLinksPerArticulation), maxLinks);
+    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, nbArticulations), nbArticulations);
+    DevBuf bArtiCoreDesc = makeDev(dev, artiCoreDesc);
+    const uint32_t artiRecLink = artiRemapId * maxLinks + artiLinkId;   // flattened link slot
+    const uint32_t artiVelRow = artiSolverIdx * maxLinks + artiLinkId;
+
+    // The link arm of readRigidVelocity (dataReadWriteHelper.cuh:105-115 / :126-141).
+    auto artiVel = [&]() {
+        p714ref::RefRigidVel rv;
+        const F4 l = outArtiVelocity[artiVelRow], a = outArtiVelocity[artiVelRow + artiOffset];
+        rv.linVel = { l.x, l.y, l.z };
+        rv.angVel = { a.x, a.y, a.z };
+        if (isTGS)
+        {
+            const F4 ld = outArtiVelocity[artiVelRow + 2u * artiOffset];
+            const F4 ad = outArtiVelocity[artiVelRow + 3u * artiOffset];
+            rv.linDelta = { ld.x, ld.y, ld.z };
+            rv.angDelta = { ad.x, ad.y, ad.z };
+        }
+        return rv;
+    };
+
+    // readRigidVelocity (pxgSlangFemRigidContact.slang) mirrored on the host.
     auto rigidVelOf = [&](uint32_t body) {
         p714ref::RefRigidVel rv;
         if (isTGS)
@@ -4733,11 +4862,19 @@ static void runRigidContactDynamic(bool isTGS)
     pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
     pokeU32(solverCoreDesc, 268, numSolverBodies);
     pokeU32(solverCoreDesc, 276, accOffset);
+    pokePtr(solverCoreDesc, 40, bOutArtiVel.addr);          // outArtiVelocity @40
     DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
 
     std::vector<uint8_t> sharedDesc(224, 0);
     pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
+    pokePtr(sharedDesc, 32, bBodySims.addr);                // mBodySimBufferDeviceData @32
+    pokePtr(sharedDesc, 40, bArtiRecs.addr);                // articulations @40
     DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // Per-lane rigid view: lane 5 is the link -- invMass0 1 and the link velocity row.
+    auto laneIsArti = [&](uint32_t i) { return ((nodeInds[i] >> 32) & 1ull) != 0ull; };
+    auto laneInvMass0 = [&](uint32_t i) { return laneIsArti(i) ? 1.0f : invMassOf[bodyOf[i]]; };
+    auto laneVel = [&](uint32_t i) { return laneIsArti(i) ? artiVel() : rigidVelOf(bodyOf[i]); };
 
     // ---- per-lane element shape.  A VERTEX lane owns one cloth vertex and blends nothing;
     // a TRIANGLE lane owns three and blends them by the barycentric.  readCloth and the
@@ -4799,6 +4936,16 @@ static void runRigidContactDynamic(bool isTGS)
         const float pen = normalPens[i].w - contacts[i].w;
         const p714ref::V3 frameP = { body2World[2u * b + 1u].x, body2World[2u * b + 1u].y,
                                      body2World[2u * b + 1u].z };
+        if (laneIsArti(i))
+        {
+            const physx::PxVec3& lp = artiB2W[artiRecLink].p;
+            p714ref::refPrepareArti(refC, int(i), solverNormal,
+                                    p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
+                                    pen, laneAccum(i), barycentrics[i], p714ref::V3{ lp.x, lp.y, lp.z },
+                                    artiResp[artiRecLink], artiLinks[artiRecLink].penBiasClamp,
+                                    penBiasClampFEM);
+            continue;
+        }
         p714ref::refPrepare(refC, int(i), solverNormal,
                             p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
                             pen, laneAccum(i),
@@ -4831,6 +4978,11 @@ static void runRigidContactDynamic(bool isTGS)
                   "lane 0 must carry the DYNAMIC inverse mass (got %g)", gotC.fricTan0_invMass0[0].w);
     PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[4].w) == 0u,
                   "lane 4 must carry the KINEMATIC zero inverse mass (got %g)", gotC.fricTan0_invMass0[4].w);
+    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[5].w) == f2u(1.0f),
+                  "lane 5 (articulation link) must carry invMass0 = 1 (got %g)", gotC.fricTan0_invMass0[5].w);
+    PXG_CHECK_MSG(f2u(gotC.maxPenBias[5]) == f2u(artiLinks[artiRecLink].penBiasClamp),
+                  "lane 5 must take its penBiasClamp from links[%u] of record %u (got %g)",
+                  artiLinkId, artiRemapId, gotC.maxPenBias[5]);
     PXG_CHECK_MSG(mm == 0, "dynamic prepare bit-exact vs CPU (%zu mismatches)", mm);
 
     // The prepare zeroes rigidLambdaNs for every contact, so the accumulated lambda the
@@ -4853,7 +5005,7 @@ static void runRigidContactDynamic(bool isTGS)
     QueryPush qp = {};
     qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
     qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
-    qp.artiCoreDesc = 0ull; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.artiCoreDesc = bArtiCoreDesc.addr; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
     qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
 
     const char* queryEntry = isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
@@ -4875,7 +5027,7 @@ static void runRigidContactDynamic(bool isTGS)
             p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
                                    laneAccum(i), invMq, /*rigidRefCount*/ 1.0f,
                                    /*wasActive*/ separatingOf[i], /*checkOnly*/ true,
-                                   rigidVelOf(bodyOf[i]), /*combinedFriction*/ 0.0f);
+                                   laneVel(i), /*combinedFriction*/ 0.0f);
         // Faithful to the .cu: everything below hangs off isActive.  The assertion is a
         // COVERAGE claim about the seeded data, not a step of the reference -- if it ever
         // fires, the data drifted, and the comparison stays honest either way.
@@ -4889,7 +5041,7 @@ static void runRigidContactDynamic(bool isTGS)
         for (uint32_t k = 0; k < nv; ++k)
             if (!isTriOf[i] || bcArr[k] > 1e-3f)
                 refVertW[vs[k]] += 1.0f;
-        if (globalIdOf[i] != -1 && invMassOf[bodyOf[i]] != 0.0f)
+        if (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f)
             refRefCounts[size_t(globalIdOf[i])] += 1u;
     }
 
@@ -4912,6 +5064,12 @@ static void runRigidContactDynamic(bool isTGS)
                   gRefCountsQ[numSolverBodies + 1u]);
     PXG_CHECK_MSG(mm == 0, "dynamic query bit-exact vs CPU (%zu mismatches)", mm);
 
+    // Tranche A: raise the link's count to 3 -- as if two more contacts touched it -- so the
+    // articulation arm of computeRigidChange (no reference-count factor on the ANGULAR row,
+    // deformableUtils.cuh:420) differs from the rigid arm.  At a count of 1 they agree.
+    refRefCounts[numSolverBodies + 1u] = 3u;
+    dev->upload(bRefCounts.h, refRefCounts.data(), refRefCounts.size() * sizeof(uint32_t));
+
     // ======================= dispatch SOLVE ============================
     struct SolvePush
     {
@@ -4924,7 +5082,7 @@ static void runRigidContactDynamic(bool isTGS)
     SolvePush sp = {};
     sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
     sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    sp.artiCoreDesc = bArtiCoreDesc.addr; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
     sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
     sp.materials = bClothMats.addr; sp.rigidBodyMaterials = bRigidMats.addr;
 
@@ -4946,10 +5104,9 @@ static void runRigidContactDynamic(bool isTGS)
     std::vector<float> laneFriction(N, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
-        const uint32_t b = bodyOf[i];
         // readRigidBody: the count is read back only for a non-static, finite-mass body.
         const float rigidRefCount =
-            (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+            (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
         // readCloth's mass split: each of the lane's vertices carries invMass times ITS OWN
         // reference count.
         uint32_t vs[3];
@@ -4971,7 +5128,7 @@ static void runRigidContactDynamic(bool isTGS)
         const p714ref::InitResult sir =
             p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
                                    laneAccum(i), deformableInvMasses, rigidRefCount,
-                                   /*wasActive*/ true, /*checkOnly*/ false, rigidVelOf(b),
+                                   /*wasActive*/ true, /*checkOnly*/ false, laneVel(i),
                                    combinedFriction);
         if (sir.deltaLambdaN < 0.0f)
             ++negativeLambdaLanes;
@@ -5003,16 +5160,17 @@ static void runRigidContactDynamic(bool isTGS)
         }
         refAccum[i] = sir.accum;
 
-        // The .cu's guard, plus this port's articulation extension.
-        const bool isArti = (nodeInds[i] >> 32) & 1ull;
-        const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+        // The .cu's guard (FEMClothExternalSolve.cu:525): fricTan0_invMass0.w != 0 and not
+        // static.  A link carries invMass0 = 1, so it reacts -- through the articulation arm.
+        const bool isArti = laneIsArti(i);
+        const bool reacts = (laneInvMass0(i) != 0.0f) && (nodeInds[i] != staticNodeInd);
         reactsOf[i] = reacts;
         p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
         float count = 0.0f;
         if (reacts)
         {
             count = 1.0f;
-            p714ref::refComputeRigidChange(sir, /*isArticulation*/ false, invMassOf[b], rigidRefCount,
+            p714ref::refComputeRigidChange(sir, isArti, laneInvMass0(i), rigidRefCount,
                                            dLin, dAng);
             ++dynamicLanes;
         }
@@ -5023,8 +5181,22 @@ static void runRigidContactDynamic(bool isTGS)
         refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
     }
-    PXG_CHECK_MSG(dynamicLanes == 8u && zeroLanes == 3u,
-                  "coverage: expected 8 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
+    PXG_CHECK_MSG(dynamicLanes == 9u && zeroLanes == 2u,
+                  "coverage: expected 9 reacting (8 rigid + the link) and 2 silent lanes, got %u / %u",
+                  dynamicLanes, zeroLanes);
+    {
+        // The articulation arm must be OBSERVABLE: with the link's count at 3 the rigid arm's
+        // angular row would be three times the articulation arm's.
+        const p714ref::InitResult s5 = p714ref::refInitialize(
+            refC, 5, isTGS, seededLambda[5], dt, laneBcVec(5), laneAccum(5),
+            p714ref::V3{ invMass * refVertW[elemOf[5]], 0.0f, 0.0f }, 3.0f, true, false, laneVel(5),
+            laneFriction[5]);
+        p714ref::V3 la, aa, lr, ar;
+        p714ref::refComputeRigidChange(s5, true, 1.0f, 3.0f, la, aa);
+        p714ref::refComputeRigidChange(s5, false, 1.0f, 3.0f, lr, ar);
+        PXG_CHECK_MSG(f2u(aa.x) != f2u(ar.x) || f2u(aa.y) != f2u(ar.y) || f2u(aa.z) != f2u(ar.z),
+                      "the link lane must tell the articulation arm from the rigid arm");
+    }
 
     // P9.46 TEETH.  Without these the material path could be silently inert again:
     // deltaLambdaT is exactly -0 whenever the combined friction is 0, and a comparison
@@ -5215,9 +5387,8 @@ static void runRigidContactDynamic(bool isTGS)
         uint32_t nullBound = 0u, nullHalved = 0u;
         for (uint32_t i = 0; i < N; ++i)
         {
-            const uint32_t b = bodyOf[i];
             const float rigidRefCount =
-                (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+                (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
             uint32_t vs[3];
             const uint32_t nv = laneVerts(i, vs);
             float im[3] = { 0.0f, 0.0f, 0.0f };
@@ -5230,19 +5401,19 @@ static void runRigidContactDynamic(bool isTGS)
             const p714ref::InitResult sir =
                 p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
                                        laneAccum(i), dim, rigidRefCount, /*wasActive*/ true,
-                                       /*checkOnly*/ false, rigidVelOf(b), mu);
+                                       /*checkOnly*/ false, laneVel(i), mu);
             if (sir.frictionBound) ++nullBound;
             // The mutant that defaults to eAVERAGE would halve mu here; count the lanes on
             // which that is actually observable, i.e. where the clamp binds on a non-zero mu.
             if (sir.frictionBound && mu != 0.0f) ++nullHalved;
-            const bool isArti = (nodeInds[i] >> 32) & 1ull;
-            const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+            const bool isArti = laneIsArti(i);
+            const bool reacts = (laneInvMass0(i) != 0.0f) && (nodeInds[i] != staticNodeInd);
             p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
             float count = 0.0f;
             if (reacts)
             {
                 count = 1.0f;
-                p714ref::refComputeRigidChange(sir, /*isArticulation*/ false, invMassOf[b],
+                p714ref::refComputeRigidChange(sir, isArti, laneInvMass0(i),
                                                rigidRefCount, dLin, dAng);
             }
             refNullVel[i] = { dLin.x, dLin.y, dLin.z, count };
@@ -5291,6 +5462,9 @@ static void runRigidContactDynamic(bool isTGS)
     dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
     dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
     dev->destroyBuffer(bClothFric.h); dev->destroyBuffer(bRigidMats.h); dev->destroyBuffer(bClothMats.h);
+    dev->destroyBuffer(bArtiLinks.h); dev->destroyBuffer(bArtiB2W.h); dev->destroyBuffer(bArtiResp.h);
+    dev->destroyBuffer(bArtiRecs.h); dev->destroyBuffer(bBodySims.h); dev->destroyBuffer(bOutArtiVel.h);
+    dev->destroyBuffer(bArtiCoreDesc.h);
 }
 
 PXG_TEST(femClothSimRigidContactDynamicPGS) { runRigidContactDynamic(/*isTGS*/ false); }

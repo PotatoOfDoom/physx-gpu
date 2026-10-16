@@ -8,6 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+FEM contacts with articulation links (cloth + softbody, shared pxgSlangFemRigidContact): prepare arm
+(link pose, pen-bias clamp, spatial-response rows), link velocity read, and the reaction on the link were
+deferred -- the link was read as an unrelated rigid solver body.  Ported; PXG_SCENE=clothonlink,
+softbodyarticontact (+ PGS rows; static, carried-load and sweep checks; base and each partial fix fail).
 Articulation D6 joints: updateJointsLaunch's articulation branch and constraint1DPrePrepLaunch's
 articulation arm were deferred no-ops, so every D6 joint touching a link prepared 0 rows (bit-identical
 to no joint; SnippetDirectGPUAPIArticulation's scissor lift collapsed).  Ported; PXG_SCENE=articulationloop
@@ -2208,6 +2212,44 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Artikulation, Tranche A — Cloth/Soft-Body-Kontakte mit Artikulations-Links
+
+**Ausgangslage.** Die Inventur aller „DEFERRED“-Stellen (Workflow: 4 Bereichs-Agenten + Vollständigkeits-
+Kritiker; 49 Fundstellen, 17 echte erreichbare Lücken) fand im gemeinsamen FEM–Starrkörper-Kontaktmodul
+`pxgSlangFemRigidContact.slang` (Cloth und Soft Body) drei fehlende Artikulationsarme. Ein Kontakt mit einer
+Form an einem `PxArticulationLink` nahm den Starrkörper-Arm mit `solverBodyIndices[artiNode]` — das ist der
+Artikulationsindex, also ein fremder Solver-Körper (Masse, Trägheit, Pose, Pen-Bias falsch).
+
+**Portiert (Workflow: Umsetzung → zwei adversariale Reviews → Korrektur).**
+1. `prepareFEMContacts`, Artikulationsarm (deformableUtils.cuh:159-198): Link-Pose aus
+   `articulations[bodySims[node].articulationRemapId].linkBody2Worlds`, Pen-Bias-Clamp des Links, drei
+   Produkte mit `spatialResponseMatrixW` für n/t0/t1, rohe raX*-Zeilen mit resp in .w, invMass0 = 1.
+2. `readRigidVelocity` / `contactInitialize`, Link-Geschwindigkeit aus `outArtiVelocity`
+   (dataReadWriteHelper.cuh:105-115 PGS, :126-141 TGS) — in Query und Solve von Cloth und Soft Body.
+3. Rückwirkung auf den Link: der Ausschluss `&& !nodeIsArticulation` vor `computeRigidChange` entfernt
+   (FEMClothExternalSolve.cu:519-528, softBody.cu:2041-2051).
+`asmLoad6x6Record` wanderte nach `pxgSlangSpatialMatrix` (SPIR-V bis auf Debug-Namen gleich).
+Fixtures in testFemClothSim/testSoftBodySim bauen jetzt echte Artikulationsdaten (mit Köder-Record gegen
+Indexverwechslung); dabei zwei latente Fehler in der Soft-Body-Referenz behoben. `push_block_known.txt`:
+8 `artiCoreDesc`-Zeilen entfernt, `sharedDesc` der Prepare-Kernel gelesen.
+
+**Szenen** (neu gegen `sh_base`, TGS / PGS, alle selbst nachgemessen):
+- `clothonlink` — 9-kg-Tuch auf einem drehgelagerten 10-kg-Paddel (k = 4000 N·m/rad) an einem
+  geschwindigkeitsgetriebenen Schlitten. Tuch-Anteil an der Auslenkung 1,041 / 1,003 der Vorhersage
+  (alt: −0,036 / −0,042), Mitnahme beim 0,3-m-Schwenk −6,8 / −9,8 mm Schlupf (alt: −0,244 / −0,257 m).
+- `softbodyarticontact` — 0,216-kg-FEM-Würfel auf einer prismatischen Plattform: Würfel-Anteil
+  1,581 / 1,320 (alt: −0,011 / −0,001), Mitnahme +4,2 / −3,3 mm (alt −0,300 m).
+Mutanten (je ein Teil abgeschaltet) fallen durch, bis auf die Winkelzeilen des Prepare: die gehen in
+CUDA nur über das 1/N-gemittelte Drehmoment ein und sind in keiner statischen Szene trennbar — sie bleiben
+von den Fixtures bewacht.
+
+**Zwei Befunde ohne Port-Fehler** (dokumentiert, nicht gemeldet): (a) In einer Artikulation ohne
+Starrkörper-Constraint im Solver gibt der Artikulations-Solver den Scratch-Impuls eines Deformables nicht
+weiter (`mLinkWithDeferredImpulse` wird nur von Starrkörper-Constraints angehoben,
+forwardDynamic2.cu:93/:384) — beide Szenen legen deshalb ein kleines Starrkörper-Gewicht auf den Link.
+(b) Das Kontaktmodell liefert 1,2–1,6× das Gewicht des Deformables; die statischen Zwillinge zeigen
+dieselben Impulse, also stammt der Überschuss aus dem (vorhandenen, fixture-geprüften) Kontaktmodell.
 
 ## Artikulation — D6-Gelenke an Links hatten auf der GPU null Wirkung
 

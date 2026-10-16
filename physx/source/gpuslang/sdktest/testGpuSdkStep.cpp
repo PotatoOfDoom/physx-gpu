@@ -2759,6 +2759,381 @@ ArticulationStackScene buildArticulationStackScene(PxPhysics* physics, PxScene* 
     return r;
 }
 
+// ===========================================================================
+// Tranche A of task 35 -- DEFORMABLES RESTING ON ARTICULATION LINKS.
+//
+// A cloth or softbody contact with a shape on a PxArticulationLink used to take the RIGID
+// arm of pxgSlangFemRigidContact (prepareFEMContacts, readRigidVelocity, the reaction) with
+// idx = solverBodyIndices[artiNode] -- the ARTICULATION index, i.e. some unrelated solver
+// body.  For the first articulation that is solver body 0, the static body: zero velocity,
+// zero inverse mass.  So the deformable rested on the link as on a static wall (the contact
+// GEOMETRY comes from the narrowphase and was right) and the link never felt the load: no
+// reaction was written for a link.  These two scenes measure exactly that: the DEFLECTION of
+// a drive-held link under a deformable's weight, against the number the drive stiffness
+// predicts.  Deformables are GPU-only in PhysX, so there is no CPU control; the reference is
+// analytic (static equilibrium of an implicit spring drive: deflection = load / stiffness),
+// plus a STATIC TWIN in the same scene -- the same deformable on a static box of the link's
+// shape at its undeflected pose -- which pins the rest height.
+//
+// WHY EACH LOADED LINK ALSO CARRIES A SMALL RIGID WEIGHT.  The deformable's reaction reaches
+// the articulation as a link SCRATCH IMPULSE plus the eHAS_IMPULSES flag
+// (accumulateDeltaVRigidSecondLaunch, rigidDeltaAccum.cu:354-385), and the articulation
+// solver folds scratch impulses toward the root in averageLinkImpulsesAndPropagate
+// (articulationImpulseResponse.cuh:141-246) -- from link index
+// mLinkWithDeferredImpulse DOWN, and nothing else raises that index: it is reset per frame
+// (forwardDynamic2.cu:93) and set only by averageLinkImpulsesAndPropagate2 for an
+// articulation that has rigid constraints in the solver PARTITIONS (:384).  artiPushImpulse,
+// which would push every link's scratch impulse, is never launched upstream.  So, in the
+// CUDA as in this port, a deformable resting on a non-root link of an articulation that
+// nothing rigid touches loads a scratch impulse that is never propagated: measured here
+// first, with the paddle alone, the deflection was the paddle's own weight to four digits
+// with the fixed shaders as with the old ones, while the dumped accumulateDeltaVRigidSecond
+// input carried the full reaction (-0.408 N s per TGS substep against a 0.368 N s weight).
+// A small rigid box resting on the same link puts the articulation into a partition, which
+// is the ordinary situation in any scene where a deformable meets a robot; its weight is
+// part of the expected deflection, and it loads the link identically with old and new
+// shaders, so the deformable's share stays the discriminating quantity.
+//
+// Forward declarations: the deformable recipes are defined with their own scenes below.
+static PxDeformableSurface* buildFlatClothSheet(PxPhysics* physics, PxScene* scene,
+                                                PxCudaContextManager* cudaCtx, PxU32 numX, PxU32 numZ,
+                                                float lenX, float lenZ, float y, float invMass,
+                                                PxU32& nvOut, float offX, float offZ);
+} // namespace -- closed for one declaration: buildFemVolumeCube is defined at file scope
+PxDeformableVolume* buildFemVolumeCube(PxPhysics* physics, PxScene* scene,
+                                       PxCudaContextManager* cudaCtx, PxU32 cells, float size,
+                                       float baseY, float offsetX);
+namespace
+{
+
+// DtoH-read a deformable's positions (xyz + invMass in w): mean x/y, total mass of the
+// finite-mass vertices.  Returns false on a non-finite coordinate.
+static bool deformableStats(PxCudaContextManager* cudaCtx, const PxVec4* devPtr, PxU32 n,
+                            float& meanX, float& meanY, float& mass)
+{
+    std::vector<PxVec4> host(n);
+    cudaCtx->getCudaContext()->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(devPtr),
+                                          n * sizeof(PxVec4));
+    double sx = 0.0, sy = 0.0, m = 0.0;
+    bool finite = true;
+    for (const PxVec4& p : host)
+    {
+        finite = finite && std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        sx += double(p.x); sy += double(p.y);
+        if (p.w > 0.0f) m += 1.0 / double(p.w);
+    }
+    meanX = float(sx / double(n)); meanY = float(sy / double(n)); mass = float(m);
+    return finite;
+}
+
+// Rotation of a link about world Z, in radians (the revolute paddle's deflection).
+static float linkAngleZ(const PxRigidActor* a)
+{
+    const PxVec3 b0 = a->getGlobalPose().q.getBasisVector0();
+    return std::atan2(b0.y, b0.x);
+}
+
+// PXG_SCENE=clothonlink.  A fixed-base articulation: base -> SLIDER (shapeless, prismatic X,
+// pure velocity drive) -> PADDLE (box 1.0 x 0.1 x 1.0, 10 kg) on a revolute joint about Z at
+// x = 0.1, held level by a stiff angular drive (k = 4000 N m/rad, c = 150, target 0).  A
+// 6 x 6 cloth sheet of 0.3 x 0.3 m, 0.25 kg per vertex (9 kg), is dropped onto the paddle
+// around x = 0.3, 0.2 m from the hinge; the 0.5 kg rigid weight (see above) sits at x = 1.0.
+// Static equilibrium of the implicit drive:
+//
+//     theta = -(m_sheet g d_sheet + m_paddle g d_paddle + m_weight g d_weight) / k
+//           = -(9 * 9.81 * 0.2 + 10 * 9.81 * 0.5 + 0.5 * 9.81 * 0.9) / 4000 = -0.0178 rad
+//
+// of which the sheet's share is -0.0044; without the reaction the paddle carries only itself
+// and the weight, -0.0134 -- for a RIGID load.  The sheet is not one, and the expected
+// deflection is not that: the sheet sits OFF the paddle's centre of mass (0.3 m inboard of
+// it), and the CUDA delivers a link only an AVERAGE of the contacts' angular impulses.
+// computeRigidChange's articulation arm leaves the reference count off the angular row
+// (deformableUtils.cuh:420-421) but keeps it on the linear one, and
+// accumulateDeltaVRigidSecondLaunch divides BOTH by the contact count before storing the
+// link's scratch impulse (rigidDeltaAccum.cu:366-377): the link gets the full force but
+// 1/N of the torque about its COM (N ~ 36 sheet contacts).  So the paddle feels the
+// sheet's weight acting at its COM lever, 0.5 m: expected sheet share
+// -9 * 9.81 * 0.5 / 4000 = -0.0110 rad, not the rigid -0.0044 (total -0.0244, not
+// -0.0178).  Check 1 is against that.
+// What the off-COM placement discriminates: keep the reference count on the angular row
+// (the rigid arm's form, i.e. pass isArticulation = false) and the torque about the COM is
+// no longer averaged away -- the share drops to leverCloth / leverCom = 0.4 x and check 1
+// fails.  (With the sheet centred on the COM, as a first draft had it, that mutation
+// passed: the contact torques about the COM cancel.)  What it does NOT discriminate: the
+// raXn rows of the prepare arm.  They enter the link only through that 1/N-averaged torque
+// and through angVel . raXn in the velocity read and error terms, which a paddle that does
+// not rotate keeps small: measured with those rows zeroed, the share is 1.22 x (TGS) and
+// 0.98 x (PGS) against 1.04 x / 1.05 x for the real shaders -- inside any band the contact's
+// bias factor allows.  Those rows are guarded by the unit fixtures only
+// (femClothSimRigidContactDynamicTGS/PGS, softBodySimRigidContactPrepare).
+// The paddle is ten times heavier than the first draft's 1 kg: the lighter the link, the
+// more of the contact's position-error bias it takes and gives back (see below) -- measured
+// at 1 kg (sheet centred on the COM), the sheet's share came out 1.47 x its weight's
+// prediction under TGS and the sheet sat 3.8 mm into the paddle under PGS.
+//
+// SWEEP (60 steps, after the 240 rest steps).  The slider's drive velocity goes to 0.3 m/s,
+// carrying the paddle 0.3 m along x.  The sheet rides on it by FRICTION only, and friction
+// sees the paddle move only through the link velocity readRigidVelocity returns to the
+// four cloth query/solve kernels (cloth_queryRigidClothContactReferenceCount{,TGS}Launch,
+// cloth_solveRigidClothCollision{,TGS}Launch): a reader that returns zero holds the sheet
+// still while the paddle slides out from under it.  The sheet must follow to within 3 cm.
+// The paddle's X velocity is its parent slider's, so this phase does not tell the link's row
+// of outArtiVelocity from its parent's -- softbodyarticontact's sweep does (the moving link
+// there is the loaded one, its parent stands still in x).
+//
+// WHAT THE DEFLECTION CAN AND CANNOT BE COMPARED WITH.  The deformable-vs-rigid contact
+// delivers MORE impulse per frame than the deformable's weight: its position-error bias
+// leaves as impulse too.  Measured with PXG_DUMP_ARGS on softbodyarticontact's
+// sb_solveRigidSoftCollisionLaunch{,TGS} appliedForces, summed over a frame's iterations:
+// the cube's contacts with the STATIC twin accumulate 0.045 .. 0.057 N s (PGS) and
+// 0.059 .. 0.062 N s (TGS) against a weight impulse of 0.0353 N s, and its contacts with the
+// LINK accumulate the same, 0.049 .. 0.050 / 0.056 .. 0.064 N s.  So the link receives what
+// the contact model computes, and the contact model is the CUDA's (its static path is
+// bit-exact against the fixtures): the deformable's share of the deflection is of the ORDER
+// its weight predicts, not equal to it.  The check is therefore 0.7 .. 2.0 times that
+// prediction; the shaders without the articulation arms give zero.
+//
+// The static twin: the same sheet on a static box of the paddle's shape at the paddle's
+// undeflected pose, 3 m away along z.  On the paddle the sheet must rest lower by exactly
+// the tilt: theta * (x_sheet - x_hinge), within 1 mm.
+struct ClothOnLinkScene
+{
+    PxArticulationLink* paddle = nullptr;
+    PxArticulationJointReducedCoordinate* sliderJoint = nullptr;
+    PxRigidDynamic* weight = nullptr;      // the rigid weight on the paddle (see the header)
+    float weightMass = 0.0f;
+    PxDeformableSurface* onLink = nullptr;
+    PxDeformableSurface* onBox = nullptr;
+    PxU32 nvLink = 0, nvBox = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+    float hingeX = 0.0f, paddleX = 0.0f, sheetX = 0.0f, paddleMass = 0.0f, stiffness = 0.0f;
+};
+
+ClothOnLinkScene buildClothOnLinkScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                       PxCudaContextManager* cudaCtx)
+{
+    ClothOnLinkScene r;
+    r.cudaCtx = cudaCtx;
+    const float baseY = 1.0f, baseHalf = 0.1f;
+    const PxVec3 paddleHalf(0.5f, 0.05f, 0.5f);
+    r.hingeX = baseHalf;
+    r.paddleX = baseHalf + paddleHalf.x;
+    r.paddleMass = 10.0f;
+    r.stiffness = 4000.0f;
+
+    // One live dynamic rigid, parked far away (the FEM solve runs inside the rigid island
+    // loop), and a ground for it.
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               0.5f, 30.0f);
+
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    // The base is SHAPELESS: the paddle is its grandchild now (base -> slider -> paddle), and
+    // PhysX filters only parent/child link pairs, so a base box at the hinge would collide
+    // with the paddle's inner face as soon as the paddle tilts.
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), 10.0f));
+
+    // The slider: shapeless, on a prismatic X joint driven by velocity only (the sweep).
+    PxArticulationLink* slider = arti->createLink(base, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    slider->setMass(r.paddleMass);
+    slider->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), r.paddleMass));
+    PxArticulationJointReducedCoordinate* js = slider->getInboundJoint();
+    js->setJointType(PxArticulationJointType::ePRISMATIC);
+    js->setParentPose(PxTransform(PxIdentity));
+    js->setChildPose(PxTransform(PxIdentity));
+    js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
+    js->setDriveParams(PxArticulationAxis::eX,
+                       PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
+    r.sliderJoint = js;
+
+    PxArticulationLink* paddle = arti->createLink(slider, PxTransform(PxVec3(r.paddleX, baseY, 0.0f)));
+    PxShape* ps = physics->createShape(PxBoxGeometry(paddleHalf), *material);
+    paddle->attachShape(*ps);
+    paddle->setMass(r.paddleMass);
+    paddle->setMassSpaceInertiaTensor(boxInertia(paddleHalf, r.paddleMass));
+    PxArticulationJointReducedCoordinate* j = paddle->getInboundJoint();
+    j->setJointType(PxArticulationJointType::eREVOLUTE);
+    j->setParentPose(PxTransform(PxVec3(baseHalf, 0.0f, 0.0f)));
+    j->setChildPose(PxTransform(PxVec3(-paddleHalf.x, 0.0f, 0.0f)));
+    j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
+    j->setDriveParams(PxArticulationAxis::eSWING2,
+                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
+    scene->addArticulation(*arti);
+    r.paddle = paddle;
+
+    // The rigid weight: a 0.5 kg box (half 0.05) on the paddle near its tip, clear of the
+    // sheet (which spans x 0.15 .. 0.45).
+    r.weightMass = 0.5f;
+    {
+        const float wh = 0.05f;
+        PxRigidDynamic* w = physics->createRigidDynamic(
+            PxTransform(PxVec3(r.paddleX + 0.4f, baseY + paddleHalf.y + wh + 0.005f, 0.0f)));
+        PxShape* wsh = physics->createShape(PxBoxGeometry(wh, wh, wh), *material);
+        w->attachShape(*wsh);
+        w->setMass(r.weightMass);
+        w->setMassSpaceInertiaTensor(boxInertia(PxVec3(wh), r.weightMass));
+        scene->addActor(*w);
+        r.weight = w;
+    }
+
+    // The static twin of the paddle, 3 m along z.
+    const float twinZ = 3.0f;
+    PxRigidStatic* twin = physics->createRigidStatic(PxTransform(PxVec3(r.paddleX, baseY, twinZ)));
+    PxShape* ts = physics->createShape(PxBoxGeometry(paddleHalf), *material);
+    twin->attachShape(*ts);
+    scene->addActor(*twin);
+
+    // Two identical sheets 3 cm above their rest height (paddle top + the 0.05 rest offset).
+    const float clothY = baseY + paddleHalf.y + 0.05f + 0.03f;
+    const float clothInvMass = 4.0f;
+    r.sheetX = r.hingeX + 0.2f;   // off the paddle's COM (see the header)
+    r.onLink = buildFlatClothSheet(physics, scene, cudaCtx, 6u, 6u, 0.3f, 0.3f, clothY, clothInvMass,
+                                   r.nvLink, r.sheetX, 0.0f);
+    r.onBox = buildFlatClothSheet(physics, scene, cudaCtx, 6u, 6u, 0.3f, 0.3f, clothY, clothInvMass,
+                                  r.nvBox, r.sheetX, twinZ);
+    return r;
+}
+
+// PXG_SCENE=softbodyarticontact.  A FEM cube (edge 0.6, the harness's 2-cell recipe) resting
+// on a PLATFORM link (box 2.0 x 0.2 x 2.0) of a fixed-base articulation: base -> LIFT
+// (shapeless, PRISMATIC Y joint, stiff position drive, target 0) -> PLATFORM (PRISMATIC X
+// joint, pure velocity drive).  The platform's OWN joint carries it sideways, so in the
+// sweep the loaded link has an x velocity its parent does not: a reader that indexes the
+// wrong row of outArtiVelocity (the parent's, linkID - 1) sees the lift standing still.
+// (A first draft had the order reversed -- the velocity-driven slider as the parent -- and
+// that mutation passed.)  Two phases:
+//
+//   REST (180 steps).  Static equilibrium of the Y drive:
+//       dy = -(m_cube + m_platform + m_lift + m_weight) g / k
+//   with k chosen at build time so the cube's share is 2 cm whatever mass the cooker gives
+//   it (0.216 kg), m_platform = m_lift = m_cube and m_weight = m_cube / 10: -0.062 m, of
+//   which -0.042 without the reaction.  The platform cannot rotate and the cube is centred
+//   on it, so this scene measures neither the raXn rows of the prepare arm nor the angular
+//   row of computeRigidChange (see clothonlink for the latter; the fixtures guard both).  As in clothonlink, the cube's share is checked to be of
+//   the order its weight predicts (0.7 .. 2.0 times), for the reason given there.  The
+//   static twin (the same cube on a static box of the platform's shape, 4 m along x) pins
+//   the rest height: on the link the cube must sit lower by the measured deflection, within
+//   1.5 mm.
+//
+//   SWEEP (60 steps).  The platform's drive velocity goes to 0.3 m/s, so it moves 0.3 m
+//   along x.  The cube rides on it by FRICTION only, and friction sees the platform
+//   move only through the link velocity readRigidVelocity returns (and, for TGS, the link's
+//   linDelta): a reader that returns the wrong body's (zero) velocity holds the cube still
+//   while the platform slides out from under it.  The cube must follow the platform to
+//   within 3 cm (slip during the start-up, at mu g = 4.9 m/s^2, is about 1 cm).
+struct SoftBodyArtiContactScene
+{
+    PxArticulationLink* platform = nullptr;
+    PxRigidDynamic* weight = nullptr;      // the rigid weight on the platform (see the header)
+    float weightMass = 0.0f;
+    PxArticulationJointReducedCoordinate* sliderJoint = nullptr;   // the platform's own X joint
+    PxArticulationJointReducedCoordinate* liftJoint = nullptr;
+    PxDeformableVolume* onLink = nullptr;
+    PxDeformableVolume* onBox = nullptr;
+    PxCudaContextManager* cudaCtx = nullptr;
+    float platformY = 0.0f, platformMass = 0.0f, liftMass = 0.0f, softMass = 0.0f, stiffness = 0.0f;
+};
+
+SoftBodyArtiContactScene buildSoftBodyArtiContactScene(PxPhysics* physics, PxScene* scene,
+                                                       PxMaterial* material, PxCudaContextManager* cudaCtx)
+{
+    SoftBodyArtiContactScene r;
+    r.cudaCtx = cudaCtx;
+    const float platformY = 1.0f;
+    const PxVec3 platformHalf(1.0f, 0.1f, 1.0f);
+    r.platformY = platformY;
+
+    addGroundBox(physics, scene, material);
+    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f),
+               0.5f, 30.0f);
+
+    // The two cubes first: the drive stiffness is derived from the cube's cooked mass.
+    const float cube = 0.6f, gap = 0.02f;
+    const float cubeBase = platformY + platformHalf.y + gap;
+    const float twinX = 4.0f;
+    r.onLink = buildFemVolumeCube(physics, scene, cudaCtx, 2u, cube, cubeBase, 0.0f);
+    r.onBox = buildFemVolumeCube(physics, scene, cudaCtx, 2u, cube, cubeBase, twinX);
+    if (!r.onLink || !r.onBox)
+        return r;
+    float mx = 0.0f, my = 0.0f;
+    deformableStats(cudaCtx, r.onLink->getSimPositionInvMassBufferD(),
+                    r.onLink->getSimulationMesh()->getNbVertices(), mx, my, r.softMass);
+    r.platformMass = r.softMass;
+    r.stiffness = r.softMass * 9.81f / 0.02f;   // the cube alone deflects the drive 2 cm
+
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, 0.1f, 0.0f)));
+    PxShape* bs = physics->createShape(PxBoxGeometry(0.1f, 0.1f, 0.1f), *material);
+    base->attachShape(*bs);
+    base->setMass(1.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.1f), 1.0f));
+
+    // The lift: shapeless, prismatic along WORLD Y -- the joint frame's x axis turned onto y --
+    // held by a stiff position drive.
+    r.liftMass = r.platformMass;
+    PxArticulationLink* lift = arti->createLink(base, PxTransform(PxVec3(0.0f, platformY, 0.0f)));
+    lift->setMass(r.liftMass);
+    lift->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.1f), r.liftMass));
+    PxArticulationJointReducedCoordinate* jp = lift->getInboundJoint();
+    const PxQuat xToY(PxHalfPi, PxVec3(0.0f, 0.0f, 1.0f));
+    jp->setJointType(PxArticulationJointType::ePRISMATIC);
+    jp->setParentPose(PxTransform(PxVec3(0.0f, platformY - 0.1f, 0.0f), xToY));
+    jp->setChildPose(PxTransform(PxVec3(0.0f), xToY));
+    jp->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
+    // critically damped against the loaded mass (cube + platform + lift)
+    const float c = 2.0f * std::sqrt(r.stiffness * (r.softMass + r.platformMass + r.liftMass));
+    jp->setDriveParams(PxArticulationAxis::eX,
+                       PxArticulationDrive(r.stiffness, c, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    jp->setDriveTarget(PxArticulationAxis::eX, 0.0f);
+    r.liftJoint = jp;
+
+    // The platform: on a prismatic X joint of its own, driven by velocity only (the sweep).
+    PxArticulationLink* platform = arti->createLink(lift, PxTransform(PxVec3(0.0f, platformY, 0.0f)));
+    PxShape* ps = physics->createShape(PxBoxGeometry(platformHalf), *material);
+    platform->attachShape(*ps);
+    platform->setMass(r.platformMass);
+    platform->setMassSpaceInertiaTensor(boxInertia(platformHalf, r.platformMass));
+    PxArticulationJointReducedCoordinate* js = platform->getInboundJoint();
+    js->setJointType(PxArticulationJointType::ePRISMATIC);
+    js->setParentPose(PxTransform(PxIdentity));
+    js->setChildPose(PxTransform(PxIdentity));
+    js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
+    js->setDriveParams(PxArticulationAxis::eX,
+                       PxArticulationDrive(0.0f, 1.0e4f * r.softMass, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
+    r.sliderJoint = js;
+    scene->addArticulation(*arti);
+    r.platform = platform;
+
+    // The rigid weight: a box of a tenth of the cube's mass (half 0.05) on the platform, clear
+    // of the cube (which spans x -0.3 .. 0.3).
+    r.weightMass = 0.1f * r.softMass;
+    {
+        const float wh = 0.05f;
+        PxRigidDynamic* w = physics->createRigidDynamic(
+            PxTransform(PxVec3(0.0f, platformY + platformHalf.y + wh + 0.005f, 0.7f)));
+        PxShape* wsh = physics->createShape(PxBoxGeometry(wh, wh, wh), *material);
+        w->attachShape(*wsh);
+        w->setMass(r.weightMass);
+        w->setMassSpaceInertiaTensor(boxInertia(PxVec3(wh), r.weightMass));
+        scene->addActor(*w);
+        r.weight = w;
+    }
+
+    // The static twin of the platform, under the second cube.
+    PxRigidStatic* twin = physics->createRigidStatic(PxTransform(PxVec3(twinX, platformY, 0.0f)));
+    PxShape* ts = physics->createShape(PxBoxGeometry(platformHalf), *material);
+    twin->attachShape(*ts);
+    scene->addActor(*twin);
+    return r;
+}
+
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
 // cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
 // zero initial velocity and no ground, so it is a pure free fall with NO contacts.
@@ -5953,10 +6328,12 @@ struct ClothClothScene
 
 // One flat cloth sheet: numX x numZ grid over lenX x lenZ centred on (0, y, 0), every vertex
 // given the same inverse mass.  Returns null on any cooking/creation failure.
+// Tranche A of task 35: `offX` / `offZ` move the sheet's centre off the origin (clothonlink
+// puts two sheets side by side); every earlier caller takes the defaults.
 static PxDeformableSurface* buildFlatClothSheet(PxPhysics* physics, PxScene* scene,
                                                 PxCudaContextManager* cudaCtx, PxU32 numX, PxU32 numZ,
                                                 float lenX, float lenZ, float y, float invMass,
-                                                PxU32& nvOut)
+                                                PxU32& nvOut, float offX = 0.0f, float offZ = 0.0f)
 {
     nvOut = 0;
     const float dx = lenX / float(numX - 1);
@@ -5967,7 +6344,7 @@ static PxDeformableSurface* buildFlatClothSheet(PxPhysics* physics, PxScene* sce
     verts.reserve(numX * numZ);
     for (PxU32 c = 0; c < numX; ++c)
         for (PxU32 r = 0; r < numZ; ++r)
-            verts.push_back(PxVec3(float(c) * dx - 0.5f * lenX, y, float(r) * dz - 0.5f * lenZ));
+            verts.push_back(PxVec3(float(c) * dx - 0.5f * lenX + offX, y, float(r) * dz - 0.5f * lenZ + offZ));
 
     std::vector<PxU32> tris;
     tris.reserve(3 * 2 * (numX - 1) * (numZ - 1));
@@ -11791,6 +12168,251 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothonlink (tranche A of task 35): a cloth sheet resting on a drive-held
+    // revolute paddle link, next to its static twin, then carried sideways by it.  See
+    // buildClothOnLinkScene.  Its own arm:
+    // the observable is the paddle's DEFLECTION under the sheet, which no generic band reads.
+    if (!std::strcmp(sceneName, "clothonlink"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothonlink is GPU-only (PhysX deformables have no CPU "
+                        "pipeline); its reference is the analytic drive deflection and the static twin\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        ClothOnLinkScene cs = buildClothOnLinkScene(physics, scene, material, cudaCtx);
+        if (!cs.onLink || !cs.onBox)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothonlink scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothonlink' built: two %u-vertex sheets, one on a revolute paddle "
+                    "link (k %.0f N m/rad), one on its static twin\n", cs.nvLink, cs.stiffness);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothonlink pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int steps = 240;
+        float xA = 0.0f, yA = 0.0f, mA = 0.0f, xB = 0.0f, yB = 0.0f, mB = 0.0f;
+        bool finite = true;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i % 40 == 0 || i == steps - 1)
+            {
+                finite = deformableStats(cudaCtx, cs.onLink->getPositionInvMassBufferD(), cs.nvLink, xA, yA, mA)
+                      && deformableStats(cudaCtx, cs.onBox->getPositionInvMassBufferD(), cs.nvBox, xB, yB, mB)
+                      && finite;
+                std::printf("    step %3d: paddle angle %+.6f rad  sheet-on-link mean y %.5f  "
+                            "sheet-on-box mean y %.5f\n", i, linkAngleZ(cs.paddle), yA, yB);
+            }
+        }
+        const float g = 9.81f;
+        const float theta = linkAngleZ(cs.paddle);
+        const float leverCloth = xA - cs.hingeX;
+        const float leverWeight = cs.weight->getGlobalPose().p.x - cs.hingeX;
+        // thetaOwn: everything but the sheet -- the paddle's own weight and the rigid weight.
+        const float thetaOwn = -(cs.paddleMass * g * (cs.paddleX - cs.hingeX) + cs.weightMass * g * leverWeight)
+                             / cs.stiffness;
+        // thetaExp: the sheet's weight acting at the paddle's COM lever, not at its own -- the
+        // CUDA averages a link's ANGULAR contact impulse over its contacts (see the builder's
+        // header); thetaRigid: what a rigid body of the sheet's mass at its own lever would do.
+        const float leverCom = cs.paddleX - cs.hingeX;
+        const float thetaExp = thetaOwn - mA * g * leverCom / cs.stiffness;
+        const float thetaRigid = thetaOwn - mA * g * leverCloth / cs.stiffness;
+        const float dropExp = theta * leverCloth;   // the sheet follows the tilt
+        const float drop = yA - yB;
+        std::printf("  clothonlink: sheet mass %.3f kg at lever %.4f m; paddle angle %+.6f rad, expected "
+                    "%+.6f (sheet share %+.6f at the COM lever %.3f; paddle + rigid weight alone %+.6f; a "
+                    "rigid load at the sheet's lever would give %+.6f)\n",
+                    mA, leverCloth, theta, thetaExp, thetaExp - thetaOwn, leverCom, thetaOwn, thetaRigid);
+        std::printf("  clothonlink: rest height on link %.5f vs static twin %.5f: drop %+.6f m, the "
+                    "tilt predicts %+.6f m (diff %+.6f)\n", yA, yB, drop, dropExp, drop - dropExp);
+
+        // SWEEP: carry the paddle 0.3 m along x (see the builder's header).
+        const int sweepSteps = 60;
+        const float sweepVel = 0.3f;
+        const float px0 = cs.paddle->getGlobalPose().p.x, cx0 = xA;
+        cs.sliderJoint->setDriveVelocity(PxArticulationAxis::eX, sweepVel);
+        for (int i = 0; i < sweepSteps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i % 15 == 0 || i == sweepSteps - 1)
+            {
+                finite = deformableStats(cudaCtx, cs.onLink->getPositionInvMassBufferD(), cs.nvLink, xA, yA, mA)
+                      && finite;
+                std::printf("    sweep %3d: paddle x %+.5f  sheet mean x %+.5f\n", i,
+                            cs.paddle->getGlobalPose().p.x, xA);
+            }
+        }
+        const float dpx = cs.paddle->getGlobalPose().p.x - px0, dcx = xA - cx0;
+        std::printf("  clothonlink SWEEP: paddle moved %+.5f m, sheet moved %+.5f m (slip %+.5f)\n",
+                    dpx, dcx, dcx - dpx);
+
+        int failures = 0;
+        if (!finite || !std::isfinite(theta) || !std::isfinite(dpx))
+        { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // 1. THE REACTION.  The sheet's SHARE of the deflection (total minus what the paddle and
+        //    the rigid weight do on their own) is of the order its weight predicts: between 0.7
+        //    and 2.0 times.  Not tighter, and not because of this port: the deformable-vs-rigid
+        //    contact delivers MORE impulse per frame than the deformable's weight -- the
+        //    position-error bias goes out as impulse too -- and it does so against the static
+        //    twin exactly as against the link (see the builder's header for the measured
+        //    numbers).  The link simply receives what the contact computes.  Without the
+        //    reaction the share is zero; with the reference count kept on the angular row
+        //    (the rigid arm of computeRigidChange) the torque about the COM is no longer
+        //    averaged away and the share drops to about leverCloth / leverCom = 0.4 x.
+        const float shareRatio = (theta - thetaOwn) / (thetaExp - thetaOwn);
+        std::printf("  clothonlink: the sheet's share of the deflection is %.3f x its weight's static "
+                    "prediction at the COM lever (%.3f x at its own lever)\n", shareRatio,
+                    (theta - thetaOwn) / (thetaRigid - thetaOwn));
+        if (!(shareRatio > 0.7f && shareRatio < 2.0f))
+        { std::printf("FAIL: the paddle deflects %+.6f rad, %+.6f without the sheet: the sheet's share is "
+                      "%.3f x the %+.6f its weight predicts at the COM lever (need 0.7 .. 2.0; 0 means "
+                      "the link does not feel the sheet, ~0.4 that the angular impulse is not averaged)\n",
+                      theta, thetaOwn, shareRatio, thetaExp - thetaOwn); ++failures; }
+        // 2. THE REST HEIGHT.  The sheet on the link rests where the static twin rests, moved by
+        //    exactly the link's tilt, within 1 mm.
+        if (!(PxAbs(drop - dropExp) < 1.0e-3f))
+        { std::printf("FAIL: the sheet on the link rests %+.6f m from its static twin, the paddle's tilt "
+                      "accounts for %+.6f (need within 1 mm)\n", drop, dropExp); ++failures; }
+        // 3. Both sheets are actually resting on their supports (not fallen off).
+        if (!(yB > 1.0f) || !(yA > 1.0f))
+        { std::printf("FAIL: a sheet fell off its support (y %.4f / %.4f)\n", yA, yB); ++failures; }
+        // 4. THE LINK VELOCITY.  The paddle swept, and the sheet went with it (friction only).
+        if (!(dpx > 0.25f))
+        { std::printf("FAIL: the paddle did not sweep (moved %+.5f m, drive velocity %.2f m/s for %d steps)\n",
+                      dpx, sweepVel, sweepSteps); ++failures; }
+        if (!(PxAbs(dcx - dpx) < 0.03f))
+        { std::printf("FAIL: the sheet slipped %+.5f m on the sweeping paddle (need within 3 cm) -- its "
+                      "friction does not see the link move\n", dcx - dpx); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'clothonlink' stepped: the paddle link carries the "
+                        "sheet (%+.6f rad vs %+.6f predicted), the sheet rests on it as on its static "
+                        "twin, and rides it along (slip %+.5f m)\n", theta, thetaExp, dcx - dpx);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothonlink checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=softbodyarticontact (tranche A of task 35): a FEM cube resting on a drive-held
+    // prismatic platform link, then carried sideways by it.  See buildSoftBodyArtiContactScene.
+    if (!std::strcmp(sceneName, "softbodyarticontact"))
+    {
+        if (cpuControl)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyarticontact is GPU-only (PhysX deformables have no "
+                        "CPU pipeline); its reference is the analytic drive deflection and the static twin\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        SoftBodyArtiContactScene ss = buildSoftBodyArtiContactScene(physics, scene, material, cudaCtx);
+        if (!ss.onLink || !ss.onBox || !ss.platform)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyarticontact scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        const PxU32 nA = ss.onLink->getSimulationMesh()->getNbVertices();
+        const PxU32 nB = ss.onBox->getSimulationMesh()->getNbVertices();
+        std::printf("  [  OK  ] scene 'softbodyarticontact' built: a %.4f kg FEM cube on a prismatic platform "
+                    "link (%.4f kg, k %.2f N/m), its twin on a static box\n",
+                    ss.softMass, ss.platformMass, ss.stiffness);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyarticontact pipeline CONSTRUCTED (set PXG_GPU_STEP=1 "
+                        "to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+        const float dt = 1.0f / 60.0f;
+        const int restSteps = 180, sweepSteps = 60;
+        const float sweepVel = 0.3f;
+        float xA = 0.0f, yA = 0.0f, mA = 0.0f, xB = 0.0f, yB = 0.0f, mB = 0.0f;
+        bool finite = true;
+        for (int i = 0; i < restSteps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i % 30 == 0 || i == restSteps - 1)
+            {
+                finite = deformableStats(cudaCtx, ss.onLink->getSimPositionInvMassBufferD(), nA, xA, yA, mA)
+                      && deformableStats(cudaCtx, ss.onBox->getSimPositionInvMassBufferD(), nB, xB, yB, mB)
+                      && finite;
+                std::printf("    rest  %3d: platform y %.6f  cube-on-link mean y %.5f  cube-on-box mean y "
+                            "%.5f\n", i, ss.platform->getGlobalPose().p.y, yA, yB);
+            }
+        }
+        const float g = 9.81f;
+        const float dy = ss.platform->getGlobalPose().p.y - ss.platformY;
+        // dyOwn: everything but the cube -- the platform's and the lift's own weight and the
+        // rigid weight.
+        const float dyOwn = -(ss.platformMass + ss.liftMass + ss.weightMass) * g / ss.stiffness;
+        const float dyExp = dyOwn - mA * g / ss.stiffness;
+        const float drop = yA - yB;
+        std::printf("  softbodyarticontact REST: platform deflection %+.6f m, expected %+.6f (cube share "
+                    "%+.6f; platform + lift + rigid weight alone %+.6f)\n", dy, dyExp, dyExp - dyOwn, dyOwn);
+        std::printf("  softbodyarticontact REST: cube on link %.5f vs static twin %.5f: drop %+.6f m, the "
+                    "deflection predicts %+.6f (diff %+.6f)\n", yA, yB, drop, dy, drop - dy);
+
+        // SWEEP: carry the platform 0.3 m along x.
+        const float px0 = ss.platform->getGlobalPose().p.x, cx0 = xA;
+        ss.sliderJoint->setDriveVelocity(PxArticulationAxis::eX, sweepVel);
+        for (int i = 0; i < sweepSteps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (i % 15 == 0 || i == sweepSteps - 1)
+            {
+                finite = deformableStats(cudaCtx, ss.onLink->getSimPositionInvMassBufferD(), nA, xA, yA, mA)
+                      && finite;
+                std::printf("    sweep %3d: platform x %+.5f  cube mean x %+.5f\n", i,
+                            ss.platform->getGlobalPose().p.x, xA);
+            }
+        }
+        const float dpx = ss.platform->getGlobalPose().p.x - px0, dcx = xA - cx0;
+        std::printf("  softbodyarticontact SWEEP: platform moved %+.5f m, cube moved %+.5f m (slip %+.5f)\n",
+                    dpx, dcx, dcx - dpx);
+
+        int failures = 0;
+        if (!finite || !std::isfinite(dy) || !std::isfinite(dpx))
+        { std::printf("FAIL: non-finite state\n"); ++failures; }
+        // The cube's SHARE of the deflection, between 0.7 and 2.0 times its weight's static
+        // prediction -- see clothonlink's check 1 and the builder's header for why not tighter.
+        const float shareRatio = (dy - dyOwn) / (dyExp - dyOwn);
+        std::printf("  softbodyarticontact REST: the cube's share of the deflection is %.3f x its weight's "
+                    "static prediction\n", shareRatio);
+        if (!(shareRatio > 0.7f && shareRatio < 2.0f))
+        { std::printf("FAIL: the platform deflects %+.6f m, %+.6f without the cube: the cube's share is %.3f x "
+                      "the %+.6f its weight predicts (need 0.7 .. 2.0; 0 means the link does not feel the "
+                      "cube)\n", dy, dyOwn, shareRatio, dyExp - dyOwn); ++failures; }
+        if (!(PxAbs(drop - dy) < 1.5e-3f))
+        { std::printf("FAIL: the cube on the link rests %+.6f m from its static twin, the platform's "
+                      "deflection accounts for %+.6f (need within 1.5 mm)\n", drop, dy); ++failures; }
+        if (!(dpx > 0.25f))
+        { std::printf("FAIL: the platform did not sweep (moved %+.5f m, drive velocity %.2f m/s for %d steps)\n",
+                      dpx, sweepVel, sweepSteps); ++failures; }
+        if (!(PxAbs(dcx - dpx) < 0.03f))
+        { std::printf("FAIL: the cube slipped %+.5f m on the sweeping platform (need within 3 cm) -- its "
+                      "friction does not see the link move\n", dcx - dpx); ++failures; }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: scene 'softbodyarticontact' stepped: the platform link carries "
+                        "the cube (%+.6f m vs %+.6f predicted) and carries it along (slip %+.5f m)\n",
+                        dy, dyExp, dcx - dpx);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyarticontact checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=articulationloop: two links held horizontal by D6 joints at their
     // tips (one to a sibling link of the same articulation, one to the world).  Its
     // own arm: the generic rest band (+-0.75) cannot tell held (y 3.0) from hanging
@@ -13485,7 +14107,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"

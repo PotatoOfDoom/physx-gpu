@@ -60,27 +60,26 @@
 //     block-of-32 PxgFemRigidConstraintBlock and the 16-byte PxgFemOtherContactInfo are
 //     addressed by explicit byte offset through Ptr<> (no descriptor block copy), exactly
 //     as the other BDA kernels read their SoA blocks;
-//   - the ARTICULATION branch is DEFERRED (a static floor / sphere is never an
-//     articulation: rigidId.isArticulation()==false).  Both prepareFEMContacts's
-//     articulation constraint build (spatialResponseMatrixW path) and the solve /
-//     query velocity-reader's articulation link-velocity read are omitted — same
-//     precedent as psContactSolveTgsBda / femClothRigidAttachBda, which sink the
-//     outArtiVelocity read behind the isArticulation guard so a rigid / static contact
-//     never dereferences it;
+//   - the ARTICULATION branch is PORTED (tranche A of task 35; it was deferred until then,
+//     and a contact with a link took the rigid arm against an unrelated solver body).
+//     prepareFEMContacts builds the link's anchor rows from spatialResponseMatrixW
+//     (deformableUtils.cuh:159-198), readRigidVelocity reads the link's outArtiVelocity row
+//     (dataReadWriteHelper.cuh:105-115 / :126-141), and the solve's reaction takes
+//     computeRigidChange's articulation arm.  The one deviation: the artiCoreDesc /
+//     outArtiVelocity reads are sunk into the articulation arm (CUDA's PxgVelocityReader
+//     constructor reads them for every contact) -- the precedent psContactSolveTgsBda set --
+//     so a rigid / static contact never dereferences them; no value changes;
 //   - the DYNAMIC-rigid REACTION is PORTED as of P9.45.  FEMCollision::computeRigidChange
 //     (deformableUtils.cuh:418) runs under the .cu's own guard
 //     (fricTan0_invMass0.w != 0 && !rigidId.isStaticBody()), writing count 1 and the two
 //     delta rows into rigidDeltaVel; the query pass's rigid reference-count increment
 //     (:404-408) is ported with it, so the mass-splitting divisor the solve reads back is
-//     the real per-body contact count instead of the default 1.  P9.44's
-//     accumulateDeltaVRigidFirst/SecondLaunch reduce those rows onto the solver body, which
-//     is what makes a cloth able to HOLD a dynamic rigid (scene `clothnet`).  A static or
-//     kinematic contact still writes (0,0,0,0) with count 0, exactly as before.  The
-//     ARTICULATION-link case is the one that stays out, and it is an extension of the
-//     articulation deferral above, not a separate one: prepareFEMContacts never builds the
-//     articulation anchor rows and readRigidVelocity never reads the link velocity, so a
-//     reaction derived from either would be WRONG rather than merely absent.  A link
-//     contact therefore keeps writing zeros, as this module always did;
+//     the real per-body contact count instead of the default 1 (an articulation link is
+//     counted at numSolverBodies + its articulation index, getGlobalRigidBodyId).
+//     P9.44's accumulateDeltaVRigidFirst/SecondLaunch reduce those rows onto the solver
+//     body -- or, for a link, into its scratch impulse -- which is what makes a cloth able
+//     to HOLD a dynamic rigid (scene `clothnet`) and load a link (scene `clothonlink`).  A
+//     static or kinematic contact still writes (0,0,0,0) with count 0, exactly as before;
 //   - FRICTION is the null-material path.  prepareFEMContacts's t0/t1 (PxComputeBasis-
 //     Vectors) and the friction response rows raXnF0/raXnF1 are built verbatim, and the
 //     solve computes the full tangent kinematics (tanVel / CT0 / CT1 / relTanDelta /
@@ -163,7 +162,7 @@ struct PrepContactParams
     uint64_t rigidLambdaNs;  // @72
     float invDt;             // @80
     uint _pad84;             // @84
-    uint64_t sharedDesc;     // @88  (DEFERRED: articulation/bodySim never dereferenced)
+    uint64_t sharedDesc;     // @88  bodySims @32 + articulations @40 (articulation arm)
     uint isTGS;              // @96  (bool, byte0)
     uint _pad100;            // @100 -> 104
 }
@@ -183,7 +182,7 @@ struct QueryContactParams
     uint64_t numContacts;               // @24
     uint64_t prePrepDesc;               // @32
     uint64_t solverCoreDesc;            // @40
-    uint64_t artiCoreDesc;              // @48 (DEFERRED: articulation never dereferenced)
+    uint64_t artiCoreDesc;              // @48 maxLinks / nbArticulations (articulation arm)
     uint64_t sharedDesc;                // @56
     float dt;                           // @64
     uint _pad68;                        // @68
@@ -208,7 +207,7 @@ struct SolveContactParams
     uint64_t numContacts;               // @24
     uint64_t prePrepDesc;               // @32
     uint64_t solverCoreDesc;            // @40
-    uint64_t artiCoreDesc;              // @48 (DEFERRED: articulation never dereferenced)
+    uint64_t artiCoreDesc;              // @48 maxLinks / nbArticulations (articulation arm)
     uint64_t sharedDesc;                // @56
     uint64_t rigidDeltaVel;             // @64
     uint64_t appliedForces;             // @72
@@ -301,7 +300,8 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
         const uint64_t cBase = gPrep.constraints + uint64_t(index) * FRC_STRIDE;
 
         prepareFEMContacts(cBase, offset, normal, p, pen, delta, rigidId, barycentric,
-                           gPrep.prepareDesc, gPrep.prePrepDesc, femClothes[clothId].mPenBiasClamp);
+                           gPrep.prepareDesc, gPrep.prePrepDesc, femClothes[clothId].mPenBiasClamp,
+                           gPrep.sharedDesc);
     }
 }
 
@@ -447,6 +447,7 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
                                                            deformableLinDelta, massSplit,
                                                            /*rigidRefCount*/ 1u, wasActive, /*checkOnly*/ true,
                                                            gQuery.solverCoreDesc, gQuery.sharedDesc, gQuery.prePrepDesc,
+                                                           gQuery.artiCoreDesc,
                                                            // The QUERY pass passes NULL for BOTH material tables
                                                            // (FEMClothExternalSolve.cu:362 readRigidBody(...,NULL,NULL)
                                                            // and readCloth(...,NULL,checkOnly)), so the combined
@@ -608,6 +609,7 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                                                            deformableLinDelta, massSplit,
                                                            rigidBodyReferenceCount, isActive, /*checkOnly*/ false,
                                                            gSolve.solverCoreDesc, gSolve.sharedDesc, gSolve.prePrepDesc,
+                                                           gSolve.artiCoreDesc,
                                                            combinedFriction);
 
                 // computeFEMChange: deltaPos = -(deltaLambdaN*normal + deltaLambdaT*tangent)*dt.
@@ -643,18 +645,17 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                     }
                 }
 
-                // computeRigidChange (FEMClothExternalSolve.cu:509-514, deformableUtils.cuh:418).
+                // computeRigidChange (FEMClothExternalSolve.cu:515-528, deformableUtils.cuh:418).
                 // P9.45.  A STATIC body still leaves count and the deltas at 0 -- that is the
                 // .cu's own guard -- and so does a kinematic one (fricTan0_invMass0.w == 0).
-                // The ARTICULATION case stays out: prepareFEMContacts defers the articulation
-                // anchor build (pxgSlangFemRigidContact.slang:143) and readRigidVelocity defers
-                // the link velocity read, so a reaction for a link would be wrong rather than
-                // merely absent.  Writing zeros for a link is what this module already did.
-                if (fricTan0_invMass0.w != 0.0f && !nodeIsStaticBody(rigidId)
-                    && !nodeIsArticulation(rigidId))
+                // An ARTICULATION link reacts too since tranche A: prepareFEMContacts builds its
+                // anchor rows with invMass0 = 1 (so the guard admits it and the linear row is an
+                // impulse), and computeRigidChange's articulation arm drops the reference-count
+                // factor from the angular row (deformableUtils.cuh:420).
+                if (fricTan0_invMass0.w != 0.0f && !nodeIsStaticBody(rigidId))
                 {
                     count = 1.0f;
-                    const RigidChange rc = computeRigidChange(cr, /*isArticulation*/ false,
+                    const RigidChange rc = computeRigidChange(cr, nodeIsArticulation(rigidId),
                                                               fricTan0_invMass0.w,
                                                               rigidBodyReferenceCount);
                     deltaLinVel0 = rc.deltaLinVel0;

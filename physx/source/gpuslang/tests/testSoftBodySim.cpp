@@ -64,6 +64,12 @@
 #include "PxDeformableBodyFlag.h"            // PxDeformableBodyFlag::eKINEMATIC / eENABLE_SPECULATIVE_CCD
 #include "PxDeformableVolumeFlag.h"          // PxDeformableVolumeFlag::ePARTIALLY_KINEMATIC
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData (P8.2 tranche d)
+#include "CmSpatialVector.h"                 // Cm::UnAlignedSpatialVector (tranche A: articulation prepare oracle)
+#include "PxSpatialMatrix.h"                 // PxSpatialMatrix::operator* -- the engine's own product
+#include "PxgArticulation.h"                 // PxgArticulation record (tranche A)
+#include "PxgArticulationLink.h"             // PxgArticulationLink (penBiasClamp)
+#include "PxgArticulationCoreDesc.h"         // mMaxLinksPerArticulation / nbArticulations
+#include "PxgBodySim.h"                      // articulationRemapId
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
@@ -5616,14 +5622,18 @@ static V3 mat33Mul(const float m[9], V3 v)
                m[1] * v.x + m[4] * v.y + m[7] * v.z,
                m[2] * v.x + m[5] * v.y + m[8] * v.z };
 }
-// PxComputeBasisVectors (PxMathUtils.h:297).
+// PxComputeBasisVectors (PxMathUtils.h:297).  Tranche A: the normalisations are ONE
+// reciprocal and three multiplies -- PxVec3::normalize scales through operator/=
+// (PxVec3.h:260), which is what the shader does since P9.45 and what the cloth reference
+// (p714ref::computeBasis) already says.  This copy still divided three times; the normals
+// this file used happened to agree in both spellings, the articulation lane's does not.
 static void computeBasis(V3 dir, V3& right, V3& up)
 {
     if (std::fabs(dir.y) <= 0.9999f)
     {
         right = V3{ dir.z, 0.0f, -dir.x };
         const float m = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        if (m > 0.0f) right = V3{ right.x / m, right.y / m, right.z / m };
+        if (m > 0.0f) { const float r = 1.0f / m; right = V3{ right.x * r, right.y * r, right.z * r }; }
         up = V3{ dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x };
     }
     else
@@ -5631,9 +5641,42 @@ static void computeBasis(V3 dir, V3& right, V3& up)
         right = V3{ 1.0f, 0.0f, 0.0f };
         up = V3{ 0.0f, dir.z, -dir.y };
         const float m = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-        if (m > 0.0f) up = V3{ up.x / m, up.y / m, up.z / m };
+        if (m > 0.0f) { const float r = 1.0f / m; up = V3{ up.x * r, up.y * r, up.z * r }; }
     }
 }
+// prepareFEMContacts (deformableUtils.cuh:159-198) — the ARTICULATION arm (tranche A), with
+// the ENGINE's own PxSpatialMatrix::operator* for the three response products.
+static void refPrepareArti(SbRigidConstraintHost& c, int slot, V3 normal, V3 p, float pen, V3 delta,
+                           F4 barycentric, V3 linkP, const physx::PxSpatialMatrix& spatialResponse,
+                           float penBiasClampRigid, float penBiasClampFEM)
+{
+    using physx::PxVec3;
+    using physx::Cm::UnAlignedSpatialVector;
+    V3 t0, t1;
+    computeBasis(normal, t0, t1);
+    const V3 ra = V3{ p.x - linkP.x, p.y - linkP.y, p.z - linkP.z };
+    const V3 raXn = cross3(ra, normal);
+    const V3 raXF0 = cross3(ra, t0);
+    const V3 raXF1 = cross3(ra, t1);
+    auto pv = [](V3 v) { return PxVec3(v.x, v.y, v.z); };
+    auto vp = [](const PxVec3& v) { return V3{ v.x, v.y, v.z }; };
+    const UnAlignedSpatialVector dV0 = spatialResponse * UnAlignedSpatialVector(pv(normal), pv(raXn));
+    const UnAlignedSpatialVector dF0 = spatialResponse * UnAlignedSpatialVector(pv(t0), pv(raXF0));
+    const UnAlignedSpatialVector dF1 = spatialResponse * UnAlignedSpatialVector(pv(t1), pv(raXF1));
+    const float resp0 = dot3(vp(dV0.top), raXn) + dot3(vp(dV0.bottom), normal);
+    const float respF0 = dot3(vp(dF0.top), raXF0) + dot3(vp(dF0.bottom), t0);
+    const float respF1 = dot3(vp(dF1.top), raXF1) + dot3(vp(dF1.bottom), t1);
+    const float maxPenBias = penBiasClampRigid > penBiasClampFEM ? penBiasClampRigid : penBiasClampFEM;
+    const float error = pen + dot3(delta, normal);
+    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, error };
+    c.raXn_resp[slot] = F4{ raXn.x, raXn.y, raXn.z, resp0 };
+    c.raXnF0_resp[slot] = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
+    c.raXnF1_resp[slot] = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
+    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, 1.0f };   // invMass0 = 1 for a link
+    c.maxPenBias[slot] = maxPenBias;
+    c.barycentric[slot] = barycentric;
+}
+
 // prepareFEMContacts (deformableUtils.cuh:132) — rigid / static (non-articulation) path.
 static void refPrepare(SbRigidConstraintHost& c, int slot, V3 normal, V3 p, float pen, V3 delta,
                        F4 barycentric, V3 bodyFrameP, float invMass0, float penBiasClampRigid,
@@ -5724,6 +5767,98 @@ static SolveRef refSolvePGS(const SbRigidConstraintHost& c, int slot, float appl
 // fixtures check one implementation from two separately written references.
 // ---------------------------------------------------------------------------
 struct SbRigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
+// Tranche A: one articulation link's device-side records, shared by the softbody fixtures.
+// Three PxgArticulation records with two links each; `remapId` names the record the PREPARE
+// reads (through bodySims[node].articulationRemapId), and every other record carries
+// different link data, so a port reading the wrong record cannot match.  `velRow` is the
+// outArtiVelocity row the VELOCITY reader uses (solverBodyIndices[node] * maxLinks + link).
+struct SbArtiFixture
+{
+    static const uint32_t maxLinks = 2u, nbArticulations = 3u;
+    std::vector<physx::PxgArticulationLink> links;
+    std::vector<physx::PxTransform> b2w;
+    std::vector<physx::PxSpatialMatrix> resp;
+    std::vector<F4> outArtiVelocity;
+    DevBuf bLinks, bB2W, bResp, bRecs, bBodySims, bOutArtiVel, bArtiCoreDesc;
+    uint32_t recLink = 0u;
+
+    void build(PxgSlangComputeDevice* dev, uint32_t nbNodes, uint32_t node, uint32_t remapId, uint32_t linkId)
+    {
+        const uint32_t n = nbArticulations * maxLinks;
+        links.resize(n);
+        std::memset(static_cast<void*>(links.data()), 0, n * sizeof(links[0]));
+        b2w.resize(n);
+        resp.resize(n);
+        for (uint32_t k = 0; k < n; ++k)
+        {
+            const float fk = float(k);
+            links[k].penBiasClamp = -2.0f - 0.5f * fk;
+            b2w[k] = physx::PxTransform(physx::PxVec3(0.15f - 0.04f * fk, -0.25f + 0.03f * fk, 0.35f + 0.02f * fk),
+                                        physx::PxQuat(physx::PxIdentity));
+            // full and NON-symmetric, so a transposed product cannot match
+            for (uint32_t cc = 0; cc < 6u; ++cc)
+                for (uint32_t rr = 0; rr < 6u; ++rr)
+                    resp[k].column[cc][rr] = (cc == rr ? 0.9f : 0.0f)
+                                           + 0.013f * float((cc * 7u + rr * 3u + k * 5u) % 11u) - 0.05f;
+        }
+        bLinks = makeDev(dev, links); bB2W = makeDev(dev, b2w); bResp = makeDev(dev, resp);
+        std::vector<physx::PxgArticulation> recs(nbArticulations);
+        std::memset(static_cast<void*>(recs.data()), 0, recs.size() * sizeof(recs[0]));
+        for (uint32_t r = 0; r < nbArticulations; ++r)
+        {
+            recs[r].links = reinterpret_cast<physx::PxgArticulationLink*>(
+                size_t(bLinks.addr + uint64_t(r * maxLinks) * sizeof(physx::PxgArticulationLink)));
+            recs[r].linkBody2Worlds = reinterpret_cast<physx::PxTransform*>(
+                size_t(bB2W.addr + uint64_t(r * maxLinks) * sizeof(physx::PxTransform)));
+            recs[r].spatialResponseMatrixW = reinterpret_cast<physx::PxSpatialMatrix*>(
+                size_t(bResp.addr + uint64_t(r * maxLinks) * sizeof(physx::PxSpatialMatrix)));
+        }
+        bRecs = makeDev(dev, recs);
+        std::vector<physx::PxgBodySim> bodySims(nbNodes);
+        std::memset(static_cast<void*>(bodySims.data()), 0, bodySims.size() * sizeof(bodySims[0]));
+        for (uint32_t k = 0; k < nbNodes; ++k) bodySims[k].articulationRemapId = 0xDEADu;
+        bodySims[node].articulationRemapId = remapId;
+        bBodySims = makeDev(dev, bodySims);
+        const uint32_t artiOffset = maxLinks * nbArticulations;
+        outArtiVelocity.resize(4u * artiOffset);
+        for (uint32_t k = 0; k < 4u * artiOffset; ++k)
+        {
+            const float fk = float(k);
+            const float sc = (k >= 2u * artiOffset) ? 0.01f : 1.0f;   // TGS deltas two orders smaller
+            outArtiVelocity[k] = { sc * (0.12f - 0.03f * fk), sc * (-0.45f + 0.02f * fk),
+                                   sc * (0.08f + 0.01f * fk), 777.0f };
+        }
+        bOutArtiVel = makeDev(dev, outArtiVelocity);
+        std::vector<uint8_t> acd(sizeof(physx::PxgArticulationCoreDesc), 0xAB);
+        const uint32_t ml = maxLinks, na = nbArticulations;
+        std::memcpy(acd.data() + offsetof(physx::PxgArticulationCoreDesc, mMaxLinksPerArticulation), &ml, 4);
+        std::memcpy(acd.data() + offsetof(physx::PxgArticulationCoreDesc, nbArticulations), &na, 4);
+        bArtiCoreDesc = makeDev(dev, acd);
+        recLink = remapId * maxLinks + linkId;
+    }
+    SbRigidVel vel(uint32_t solverIdx, uint32_t linkId, bool isTGS) const
+    {
+        const uint32_t artiOffset = maxLinks * nbArticulations;
+        const uint32_t row = solverIdx * maxLinks + linkId;
+        SbRigidVel rv;
+        const F4 l = outArtiVelocity[row], a = outArtiVelocity[row + artiOffset];
+        rv.linVel = { l.x, l.y, l.z };
+        rv.angVel = { a.x, a.y, a.z };
+        if (isTGS)
+        {
+            const F4 ld = outArtiVelocity[row + 2u * artiOffset], ad = outArtiVelocity[row + 3u * artiOffset];
+            rv.linDelta = { ld.x, ld.y, ld.z };
+            rv.angDelta = { ad.x, ad.y, ad.z };
+        }
+        return rv;
+    }
+    void release(PxgSlangComputeDevice* dev)
+    {
+        dev->destroyBuffer(bLinks.h); dev->destroyBuffer(bB2W.h); dev->destroyBuffer(bResp.h);
+        dev->destroyBuffer(bRecs.h); dev->destroyBuffer(bBodySims.h); dev->destroyBuffer(bOutArtiVel.h);
+        dev->destroyBuffer(bArtiCoreDesc.h);
+    }
+};
 struct SolveRefFull
 {
     bool isActive; float deltaLambdaN; float deltaLambdaT;
@@ -6076,8 +6211,8 @@ PXG_TEST(softBodySimRigidContactPrepare)
 
     // A THIRD contact at index 33, so the block/offset split has teeth: 33 lands in block 1
     // slot 1.  With everything at index 0 both `workIndex / 32` and `workIndex & 31` are 0,
-    // and flattening either one is invisible.  Contacts 1..32 are skipped (invalid tet), so
-    // only 0 and 33 write.
+    // and flattening either one is invisible.  Contacts 1 and 3..32 are skipped (invalid
+    // tet), so only 0, 33 and -- since tranche A -- the articulation contact 2 write.
     const uint32_t kSecond = 33u;
     const uint32_t kN = kSecond + 1u;
     const F4 bary2 = { 0.1f, 0.5f, 0.15f, 0.25f };
@@ -6106,6 +6241,28 @@ PXG_TEST(softBodySimRigidContactPrepare)
     }
     infos[0].pairInd1 = 0u;            // softbody 0, sim tet 0
     infos[kSecond].pairInd1 = 0u;      // softbody 0, sim tet 0
+
+    // Tranche A: contact 2 names an ARTICULATION LINK -- PxNodeIndex(5, link 1) -- so
+    // sb_rigidContactPrepareLaunch's articulation arm runs, through the sharedDesc this
+    // kernel now forwards (bodySims @32 -> articulationRemapId 2, articulations @40).
+    const uint32_t kArti = 2u;
+    const uint64_t artiNodeInd = (3ull << 32) | 5ull;
+    const F4 bary3 = { 0.3f, 0.3f, 0.25f, 0.15f };
+    const float restW3 = 0.005f, penW3 = -0.017f;
+    float rawN3[3] = { 0.35f, 0.85f, -0.4f };
+    const float nmag3 = std::sqrt(rawN3[0] * rawN3[0] + rawN3[1] * rawN3[1] + rawN3[2] * rawN3[2]);
+    const p82dref::V3 planeNormal3 = { rawN3[0] / nmag3, rawN3[1] / nmag3, rawN3[2] / nmag3 };
+    contacts[kArti] = F4{ 0.21f, -0.07f, 0.52f, restW3 };
+    normalPens[kArti] = F4{ planeNormal3.x, planeNormal3.y, planeNormal3.z, penW3 };
+    barycentrics[kArti] = bary3;
+    infos[kArti].pairInd0 = artiNodeInd;
+    infos[kArti].pairInd1 = 0u;        // softbody 0, sim tet 0
+    p82dref::SbArtiFixture arti;
+    arti.build(dev, /*nbNodes*/ 6u, /*node*/ 5u, /*remapId*/ 2u, /*linkId*/ 1u);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 32, arti.bBodySims.addr);   // mBodySimBufferDeviceData @32
+    sbPokePtr(sharedDesc, 40, arti.bRecs.addr);       // articulations @40
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
 
     DevBuf bContacts = makeDev(dev, contacts), bNormalPens = makeDev(dev, normalPens);
     DevBuf bBary = makeDev(dev, barycentrics), bInfos = makeDev(dev, infos);
@@ -6152,7 +6309,7 @@ PXG_TEST(softBodySimRigidContactPrepare)
     pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr;
     pp.prepDesc = bPrepDesc.addr; pp.rigidAppliedForces = bForces.addr;
     pp.invDt = 60.0f;            // DEFERRED: unread, as in CUDA
-    pp.sharedDesc = 0ull;        // DEFERRED: articulation-only, must not be dereferenced
+    pp.sharedDesc = bSharedDesc.addr;   // read by the articulation arm only (contact 2)
     pp.isTGS = 0u;
 
     Kernel("softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch", {}, sizeof(SbPrepPush))
@@ -6173,6 +6330,21 @@ PXG_TEST(softBodySimRigidContactPrepare)
     p82dref::refPrepare(refC, 0, solverNormal, p82dref::V3{ contacts[0].x, contacts[0].y, contacts[0].z },
                         pen, delta, bary, p82dref::V3{ 0, 0, 0 }, /*invMass0*/ 0.0f,
                         penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, /*isStatic*/ true);
+
+    // the ARTICULATION contact's reference, block 0 slot 2
+    {
+        const F4 b3 = bary3;
+        const p82dref::V3 delta3 = {
+            simDeltaPos[0].x * b3.x + simDeltaPos[1].x * b3.y + simDeltaPos[2].x * b3.z + simDeltaPos[3].x * b3.w,
+            simDeltaPos[0].y * b3.x + simDeltaPos[1].y * b3.y + simDeltaPos[2].y * b3.z + simDeltaPos[3].y * b3.w,
+            simDeltaPos[0].z * b3.x + simDeltaPos[1].z * b3.y + simDeltaPos[2].z * b3.z + simDeltaPos[3].z * b3.w,
+        };
+        const physx::PxVec3& lp = arti.b2w[arti.recLink].p;
+        p82dref::refPrepareArti(refC, int(kArti), p82dref::V3{ -planeNormal3.x, -planeNormal3.y, -planeNormal3.z },
+                                p82dref::V3{ contacts[kArti].x, contacts[kArti].y, contacts[kArti].z },
+                                penW3 - restW3, delta3, bary3, p82dref::V3{ lp.x, lp.y, lp.z },
+                                arti.resp[arti.recLink], arti.links[arti.recLink].penBiasClamp, penBiasClampFEM);
+    }
 
     // the second contact's reference, in block 1 slot 1
     const p82dref::V3 delta2 = {
@@ -6208,6 +6380,16 @@ PXG_TEST(softBodySimRigidContactPrepare)
     cmp4("barycentric", refC.barycentric[0], gotC.barycentric[0]);
     if (f2u(refC.maxPenBias[0]) != f2u(gotC.maxPenBias[0]))
     { ++mm; std::printf("  prep maxPenBias MM: ref %g got %g\n", refC.maxPenBias[0], gotC.maxPenBias[0]); }
+    cmp4("arti raXn_resp", refC.raXn_resp[kArti], gotC.raXn_resp[kArti]);
+    cmp4("arti raXnF0_resp", refC.raXnF0_resp[kArti], gotC.raXnF0_resp[kArti]);
+    cmp4("arti raXnF1_resp", refC.raXnF1_resp[kArti], gotC.raXnF1_resp[kArti]);
+    cmp4("arti normal_errorW", refC.normal_errorW[kArti], gotC.normal_errorW[kArti]);
+    cmp4("arti fricTan0_invMass0", refC.fricTan0_invMass0[kArti], gotC.fricTan0_invMass0[kArti]);
+    cmp4("arti barycentric", refC.barycentric[kArti], gotC.barycentric[kArti]);
+    if (f2u(refC.maxPenBias[kArti]) != f2u(gotC.maxPenBias[kArti]))
+    { ++mm; std::printf("  prep arti maxPenBias MM: ref %g got %g\n", refC.maxPenBias[kArti], gotC.maxPenBias[kArti]); }
+    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[kArti].w) == f2u(1.0f),
+                  "the articulation contact must carry invMass0 = 1 (got %g)", gotC.fricTan0_invMass0[kArti].w);
     PXG_CHECK_MSG(mm == 0, "sb_rigidContactPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
 
     // teeth: the sqrtInvInertia matrix must actually be exercised
@@ -6246,7 +6428,7 @@ PXG_TEST(softBodySimRigidContactPrepare)
     PXG_CHECK_MSG(f2u(gotC1.barycentric[0].x) == f2u(gotC1.raXn_resp[0].x),
                   "block 1 slot 0 must be untouched (only contact 33 writes block 1)");
 
-    // contacts 1..32 named the invalid tet: SKIPPED, so block 0 slot 1 keeps the sentinel...
+    // contacts 1 and 3..32 named the invalid tet: SKIPPED, so block 0 slot 1 keeps the sentinel...
     PXG_CHECK_MSG(f2u(gotC.normal_errorW[1].x) == f2u(gotC.barycentric[1].x),
                   "the skipped contact must not have written its constraint slot");
     // ...but every in-range applied-force slot was still cleared, because the clear precedes
@@ -6265,6 +6447,8 @@ PXG_TEST(softBodySimRigidContactPrepare)
     dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
     dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bPrepDesc.h);
     dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSharedDesc.h);
+    arti.release(dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -6685,9 +6869,12 @@ PXG_TEST(softBodySimRigidContactQuerySolve)
 //              atomic must reach 2 and the solve must read 2 back.
 //   lane 2     STATIC: globalRigidBodyId == -1, not counted, no reaction.
 //   lane 3     KINEMATIC (solver body 2, invMass 0): the invMass half of the guard.
-//   lane 4     ARTICULATION LINK: counted exactly as the .cu counts it, but NO reaction --
-//              this module's articulation deferral, pinned here so it must be revisited the
-//              day prepareFEMContacts and readRigidVelocity grow their link branches.
+//   lane 4     ARTICULATION LINK (node 5, link 1): counted at numSolverBodies + 1 exactly as
+//              the .cu counts it, and -- since tranche A -- REACTING through
+//              computeRigidChange's articulation arm, with the link's velocity row read from
+//              outArtiVelocity through artiCoreDesc.  Its block is the articulation arm's
+//              (raw raX* rows, invMass0 = 1), and its count is raised to 3 before the solve so
+//              the arm's missing reference-count factor on the angular row is observable.
 //
 // All five contacts sit on the SAME tet, so the four vertices are each referenced five
 // times and the mass-splitting multiply is under test at the same time.  The per-vertex
@@ -6732,7 +6919,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
     const uint64_t dynNodeInd = 3ull;
     const uint64_t kinNodeInd = 4ull;
-    const uint64_t artiNodeInd = (1ull << 32) | 5ull;
+    const uint64_t artiNodeInd = (3ull << 32) | 5ull;   // PxNodeIndex(5, link 1)
     const uint64_t nodeInds[5] = { dynNodeInd, dynNodeInd, staticNodeInd, kinNodeInd, artiNodeInd };
     std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
     const uint32_t bodyOf[5] = { 1u, 1u, 0u, 2u, 1u };
@@ -6813,6 +7000,14 @@ static void runSbRigidContactDynamic(bool isTGS)
                                      { -0.05f, 0.40f, 0.15f } };
     const float penBiasClampRigid = -5.0f;
     const F4 bary = { 0.4f, 0.2f, 0.3f, 0.1f };
+    // Tranche A: the link behind lane 4 (record 2 by articulationRemapId; the velocity reader
+    // uses solverBodyIndices[5] == 1).  Only the solve runs here, so the block is built on the
+    // host with the articulation arm's reference; softBodySimRigidContactPrepare checks the
+    // kernel's own link arm.
+    p82dref::SbArtiFixture arti;
+    arti.build(dev, /*nbNodes*/ 6u, /*node*/ 5u, /*remapId*/ 2u, /*linkId*/ 1u);
+    auto laneIsArti = [&](uint32_t i) { return ((nodeInds[i] >> 32) & 1ull) != 0ull; };
+    auto laneInvMass0 = [&](uint32_t i) { return laneIsArti(i) ? 1.0f : invMassOf[bodyOf[i]]; };
     p82dref::V3 solverNormals[5];
     for (uint32_t i = 0; i < kN; ++i)
     {
@@ -6820,6 +7015,16 @@ static void runSbRigidContactDynamic(bool isTGS)
         const float m = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
         solverNormals[i] = { raw[0] / m, raw[1] / m, raw[2] / m };   // dominant -Y: pushes +Y
         const uint32_t b = bodyOf[i];
+        if (laneIsArti(i))
+        {
+            const physx::PxVec3& lp = arti.b2w[arti.recLink].p;
+            p82dref::refPrepareArti(blk, int(i), solverNormals[i],
+                                    p82dref::V3{ 0.5f, -0.02f, 0.7f }, -0.05f - 0.004f * float(i),
+                                    p82dref::V3{ 0.001f, -0.002f, 0.0015f }, bary,
+                                    p82dref::V3{ lp.x, lp.y, lp.z }, arti.resp[arti.recLink],
+                                    arti.links[arti.recLink].penBiasClamp, penBiasClampFEM);
+            continue;
+        }
         p82dref::refPrepare(blk, int(i), solverNormals[i],
                             p82dref::V3{ 0.5f, -0.02f, 0.7f }, -0.05f - 0.004f * float(i),
                             p82dref::V3{ 0.001f, -0.002f, 0.0015f }, bary,
@@ -6910,6 +7115,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
     std::vector<uint8_t> solverCoreDesc(320, 0);
     sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    sbPokePtr(solverCoreDesc, 40, arti.bOutArtiVel.addr);   // outArtiVelocity @40
     std::memcpy(solverCoreDesc.data() + 268, &numSolverBodies, 4);
     DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
     std::vector<uint8_t> sharedDesc(224, 0);
@@ -6920,7 +7126,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     SbQueryPush qp = {};
     qp.softbodies = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
     qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr;
-    qp.solverCoreDesc = bSolverCoreDesc.addr; qp.artiCoreDesc = 0ull;
+    qp.solverCoreDesc = bSolverCoreDesc.addr; qp.artiCoreDesc = arti.bArtiCoreDesc.addr;
     qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
     qp.appliedForces = bForces.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
     Kernel("softBodyRigidContactBda.spv",
@@ -6943,11 +7149,12 @@ static void runSbRigidContactDynamic(bool isTGS)
         const p82dref::SolveRefFull qr =
             p82dref::refSolveFull(blk, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, linDelta,
                                   massSplitQ, /*rigidRefCount*/ 1.0f, /*wasActive*/ false,
-                                  /*checkOnly*/ true, rigidVelOf(bodyOf[i]),
+                                  /*checkOnly*/ true,
+                                  laneIsArti(i) ? arti.vel(1u, 1u, isTGS) : rigidVelOf(bodyOf[i]),
                                   /*combinedFriction*/ 0.0f);
         PXG_CHECK_MSG(qr.isActive, "query CPU ref: lane %u must be active (seeded data)", i);
         if (!qr.isActive) continue;
-        if (globalIdOf[i] != -1 && invMassOf[bodyOf[i]] != 0.0f)
+        if (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f)
             refRefCounts[size_t(globalIdOf[i])] += 1u;
     }
 
@@ -6969,11 +7176,17 @@ static void runSbRigidContactDynamic(bool isTGS)
                   gRefCountsQ[numSolverBodies + 1u]);
     PXG_CHECK_MSG(mm == 0, "dynamic softbody query reference counts (%zu mismatches)", mm);
 
+    // Tranche A: raise the link's count to 3 (as if two more contacts touched it), so the
+    // articulation arm of computeRigidChange -- no reference-count factor on the ANGULAR row,
+    // deformableUtils.cuh:420 -- differs from the rigid arm.  At a count of 1 they agree.
+    refRefCounts[numSolverBodies + 1u] = 3u;
+    dev->upload(bRefCounts.h, refRefCounts.data(), refRefCounts.size() * sizeof(uint32_t));
+
     // ======================= SOLVE =======================
     SbSolvePush sp = {};
     sp.softbodies = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
     sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr;
-    sp.solverCoreDesc = bSolverCoreDesc.addr; sp.artiCoreDesc = 0ull;
+    sp.solverCoreDesc = bSolverCoreDesc.addr; sp.artiCoreDesc = arti.bArtiCoreDesc.addr;
     sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
     sp.appliedForces = bForces.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr;
     sp.dt = dt; sp.materials = bSbMats.addr; sp.rigidBodyMaterials = bRigidMats.addr;
@@ -6988,8 +7201,12 @@ static void runSbRigidContactDynamic(bool isTGS)
 
     // readSoftBody multiplies each inverse mass BY the reference count the query wrote.
     const float invMassSplit = invMass * float(kN);
-    const float massSplit = (bary.x * bary.x + bary.y * bary.y + bary.z * bary.z + bary.w * bary.w)
-                          * invMassSplit;
+    // bc.multiply(bc).dot(invMasses) (deformableUtils.cuh:362): PxVec4::dot term by term,
+    // (bx*bx)*ix + ... -- NOT the factored (sum bc^2) * invMass.  The two agree for the rigid
+    // lanes' large responses and part by an ulp on the link lane, where resp0 is small
+    // enough for the mass-split term to reach the rounding (tranche A found it).
+    const float massSplit = bary.x * bary.x * invMassSplit + bary.y * bary.y * invMassSplit
+                          + bary.z * bary.z * invMassSplit + bary.w * bary.w * invMassSplit;
     const float bcArr[4] = { bary.x, bary.y, bary.z, bary.w };
     p82dref::V3 expectDelta[4] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
     std::vector<F4> refRigid(2u * kN);
@@ -7000,7 +7217,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     {
         const uint32_t b = bodyOf[i];
         const float rigidRefCount =
-            (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+            (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
         // P9.46: getCombinedFriction() = PxsCombinePxReal(rigid, softbody, the RIGID
         // material's mode).  The softbody friction comes from the per-TET material index.
         const float sbFriction = sbMatFriction[sbMatIdx[tetOf[i]]];
@@ -7011,7 +7228,7 @@ static void runSbRigidContactDynamic(bool isTGS)
         const p82dref::SolveRefFull sr =
             p82dref::refSolveFull(blk, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, linDelta,
                                   massSplit, rigidRefCount, /*wasActive*/ true, /*checkOnly*/ false,
-                                  rigidVelOf(b), combinedFriction);
+                                  laneIsArti(i) ? arti.vel(1u, 1u, isTGS) : rigidVelOf(b), combinedFriction);
         const p82dref::V3 dPos = {
             -(sr.deltaLambdaN * sr.normal.x + sr.deltaLambdaT * sr.tangent.x) * dt,
             -(sr.deltaLambdaN * sr.normal.y + sr.deltaLambdaT * sr.tangent.y) * dt,
@@ -7023,14 +7240,23 @@ static void runSbRigidContactDynamic(bool isTGS)
             expectDelta[v].y += dPos.y * s;
             expectDelta[v].z += dPos.z * s;
         }
-        const bool isArti = (nodeInds[i] >> 32) & 1ull;
-        const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+        // softBody.cu:2046: fricTan0_invMass0.w != 0 and not static -- a link (invMass0 = 1)
+        // reacts, through the articulation arm.
+        const bool isArti = laneIsArti(i);
+        const bool reacts = (laneInvMass0(i) != 0.0f) && (nodeInds[i] != staticNodeInd);
         p82dref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
         float count = 0.0f;
         if (reacts)
         {
             count = 1.0f;
-            p82dref::refRigidChange(sr, /*isArticulation*/ false, invMassOf[b], rigidRefCount, dLin, dAng);
+            p82dref::refRigidChange(sr, isArti, laneInvMass0(i), rigidRefCount, dLin, dAng);
+            if (isArti)
+            {
+                p82dref::V3 l2, a2;
+                p82dref::refRigidChange(sr, /*isArticulation*/ false, 1.0f, rigidRefCount, l2, a2);
+                PXG_CHECK_MSG(f2u(a2.x) != f2u(dAng.x) || f2u(a2.y) != f2u(dAng.y) || f2u(a2.z) != f2u(dAng.z),
+                              "the link lane must tell the articulation arm from the rigid arm");
+            }
             ++reacting;
         }
         else
@@ -7078,8 +7304,9 @@ static void runSbRigidContactDynamic(bool isTGS)
                     laneFriction[0], laneFriction[1], laneFriction[2], laneFriction[3],
                     laneFriction[4]);
     }
-    PXG_CHECK_MSG(reacting == 2u && silent == 3u,
-                  "coverage: expected 2 reacting and 3 silent lanes, got %u / %u", reacting, silent);
+    PXG_CHECK_MSG(reacting == 3u && silent == 2u,
+                  "coverage: expected 3 reacting (2 rigid + the link) and 2 silent lanes, got %u / %u",
+                  reacting, silent);
 
     // Vertex deltas: five lanes accumulate atomically onto one address, so the summation
     // order is not fixed -- relative tolerance, as softBodySimRigidContactQuerySolve does.
@@ -7104,7 +7331,7 @@ static void runSbRigidContactDynamic(bool isTGS)
         { ++mm2; std::printf("  rigidDeltaVel[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", i,
                              r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
     }
-    for (uint32_t i = 0; i < 2u; ++i)
+    for (uint32_t i : { 0u, 1u, 4u })
     {
         PXG_CHECK_MSG(f2u(gRigidDV[i].w) == f2u(1.0f),
                       "dynamic lane %u must report count 1 (got %g)", i, gRigidDV[i].w);
@@ -7116,7 +7343,7 @@ static void runSbRigidContactDynamic(bool isTGS)
                       "dynamic lane %u reaction must run along the solver normal (dot = %g, isTGS=%d)",
                       i, lin, int(isTGS));
     }
-    for (uint32_t i = 2u; i < kN; ++i)
+    for (uint32_t i = 2u; i < 4u; ++i)   // static + kinematic; lane 4 (the link) reacts
         for (uint32_t half = 0; half < 2u; ++half)
         {
             const F4 v = gRigidDV[i + half * kN];
@@ -7140,6 +7367,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
     dev->destroyBuffer(bSharedDesc.h);
     dev->destroyBuffer(bRigidMats.h); dev->destroyBuffer(bSbMats.h); dev->destroyBuffer(bSbMatIdx.h);
+    arti.release(dev);
 }
 
 PXG_TEST(softBodySimRigidContactDynamicPGS) { runSbRigidContactDynamic(/*isTGS*/ false); }

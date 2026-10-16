@@ -101,15 +101,10 @@ public struct AcpBody
 
 public static const uint ACP_RIGID_BODY_LINK = 0xffffu;   // PxSolverConstraintDesc::RIGID_BODY
 
-// PxSpatialMatrix from a RECORD array (144-byte stride, 36 floats)
-public AbMatrix6x6 acpLoad6x6Record(uint64_t base, uint index)
-{
-    Ptr<float> f = Ptr<float>(base + uint64_t(index) * 144u);
-    AbMatrix6x6 m;
-    for (uint k = 0u; k < 36u; ++k)
-        m.e[k] = f[k];
-    return m;
-}
+// The PxSpatialMatrix RECORD loader (144-byte stride, 36 floats) now lives in
+// pxgSlangSpatialMatrix as asmLoad6x6Record: prepareFEMContacts's articulation arm
+// (pxgSlangFemRigidContact) needs the same load, and this module cannot be imported
+// for it -- it declares push-constant blocks of its own.
 
 // createPxgSolverExtBody (artiConstraintPrep2.cu:55)
 public void acpCreateSolverExtBody(uint2 nodeIndex, uint solverBodyIndex,
@@ -133,7 +128,7 @@ public void acpCreateSolverExtBody(uint2 nodeIndex, uint solverBodyIndex,
             b.b2wP = float3(t[4], t[5], t[6]);
         }
 
-        b.response = acpLoad6x6Record(artiPtrField(a, PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W), linkID);
+        b.response = asmLoad6x6Record(artiPtrField(a, PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W), linkID);
         b.isKinematic = false;
         b.islandNodeIndex = nodeIndex;
 

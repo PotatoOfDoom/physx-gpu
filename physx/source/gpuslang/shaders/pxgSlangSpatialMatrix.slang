@@ -523,6 +523,21 @@ public AbSpatialVector asmM6MulVec(AbMatrix6x6 m, AbSpatialVector s)
                    float3(result[3], result[4], result[5]));
 }
 
+// PxSpatialMatrix from a RECORD array -- PxgArticulation::spatialResponseMatrixW and
+// friends: 144-byte stride, 36 floats, column[i][j] at i*6+j (the same order abM6Get
+// reads).  Moved here from npArtiConstraintPrep (where it was acpLoad6x6Record) so that
+// prepareFEMContacts's articulation arm (pxgSlangFemRigidContact) shares it instead of
+// carrying a copy: npArtiConstraintPrep declares push-constant blocks and so cannot be
+// imported by a helper module.
+public AbMatrix6x6 asmLoad6x6Record(uint64_t base, uint index)
+{
+    Ptr<float> f = Ptr<float>(base + uint64_t(index) * 144u);
+    AbMatrix6x6 m;
+    for (uint k = 0u; k < 36u; ++k)
+        m.e[k] = f[k];
+    return m;
+}
+
 // ---------------------------------------------------------------------------
 // Cm::UnAlignedSpatialVector
 // ---------------------------------------------------------------------------

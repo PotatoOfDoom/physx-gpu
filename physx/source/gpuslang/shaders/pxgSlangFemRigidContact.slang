@@ -45,12 +45,26 @@
 // payoff for the kernel that motivated this one.  Importers must therefore not also define
 // these names locally.
 //
-// ARTICULATION BRANCH DEFERRED, as in the original port.  CUDA's prepareFEMContacts has an
-// `if (rigidId.isArticulation())` anchor branch that reads
-// sharedDesc->mBodySimBufferDeviceData (deformableUtils.cuh:162) and the articulation link
-// transforms.  Neither is reachable for a rigid or static collider, which is every case the
-// port exercises, so the else path is the only one transcribed and `sharedDesc` is not a
-// parameter here.  A scene with an articulation collider needs that branch first.
+// THE ARTICULATION ARMS ARE PORTED (tranche A of task 35).  Until then a contact with a
+// shape on a PxArticulationLink took the RIGID arm of all three leaves below with
+// idx = solverBodyIndices[artiNode] -- which for an articulation node is the ARTICULATION
+// index, so the constraint was built against, and the velocity read from, an unrelated
+// solver body (index 0, the static body, for the first articulation): the deformable rested
+// on the link as on a static wall and the link never felt it.  Now, as in CUDA:
+//   prepareFEMContacts   deformableUtils.cuh:159-198 -- link pose
+//                        articulations[bodySims[node].articulationRemapId].linkBody2Worlds
+//                        [linkId], penBiasClamp from links[linkId], the three
+//                        spatialResponseMatrixW products, raw raX* rows, invMass0 = 1;
+//   readRigidVelocity    dataReadWriteHelper.cuh:105-115 (PGS) / :126-141 (TGS) -- the
+//                        link's row of solverCoreDesc->outArtiVelocity;
+//   computeRigidChange   the isArticulation arm (:420), which callers now take.
+// `sharedDesc` (prepare) and `artiCoreDesc` (query / solve) are therefore parameters now.
+//
+// ONE DEVIATION, and it changes no value: CUDA's PxgVelocityReader constructor reads
+// artiCoreDesc->{mMaxLinksPerArticulation, nbArticulations} and outArtiVelocity for EVERY
+// contact; here they are read inside the articulation arm only, so a rigid / static contact
+// never dereferences artiCoreDesc (the fixtures that seed no link pass 0 for it) -- the
+// precedent psContactSolveTgsBda set for the same reader.
 //
 // `invDt` and `isTGS` are NOT parameters, and that is not an omission: CUDA takes both but
 // never reads them.  Brace-matched over the whole 122-line body (deformableUtils.cuh:132-253)
@@ -61,6 +75,9 @@ module pxgSlangFemRigidContact;
 import pxgSlangPrepDesc;   // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangCommon;     // PxgSolverBodyData, PxgSolverTxIData
 import pxgSlangSolverDesc; // PxgSolverCoreDescGpu, PxgSolverSharedDesc{PGS,TGS}Gpu
+import pxgSlangArticulationDesc;   // PXG_ARTI_*, artiPtrField, artiU32Field
+import pxgSlangArticulationBlocks; // AbMatrix6x6
+import pxgSlangSpatialMatrix;      // AbSpatialVector, asmSVec, asmM6MulVec, asmLoad6x6Record
 
 // FEMCollision::initialize friction threshold (deformableUtils.cuh:292).
 public static const float FEMC_THRESHOLD = 1.0e-14f;
@@ -243,15 +260,21 @@ public uint femMaterialIndexAt(uint64_t base, uint elementIdx)
 public bool nodeIsStaticBody(uint64_t ind) { return uint(ind & 0xffffffffUL) == 0xffffffffu; }
 public uint nodeIndex(uint64_t ind) { return uint(ind & 0xffffffffUL); }
 public bool nodeIsArticulation(uint64_t ind) { return (uint(ind >> 32) & 1u) != 0u; }
+// PxNodeIndex::articulationLinkId() = mLinkID >> 1 (the high word).
+public uint nodeArticulationLinkId(uint64_t ind) { return uint(ind >> 32) >> 1u; }
 
 // ===========================================================================
-// prepareFEMContacts (deformableUtils.cuh:132) — the rigid / static (non-articulation)
-// path.  Writes the block-of-32 PxgFemRigidConstraintBlock slot [offset] at cBase.
+// prepareFEMContacts (deformableUtils.cuh:132) — both arms: the articulation link
+// (:159-198) and the rigid / static body (:199-243).  Writes the block-of-32
+// PxgFemRigidConstraintBlock slot [offset] at cBase.  `sharedDescPtr` is the
+// PxgSolverSharedDescBase* of the CUDA signature: only mBodySimBufferDeviceData @32 and
+// articulations @40 are read, which sit at the same offsets in the PGS and TGS instances.
 // ===========================================================================
 public void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
                                float3 p, float pen, float3 delta, uint64_t rigidId,
                                float4 barycentric, uint64_t prepDescPtr,
-                               uint64_t prePrepDescPtr, float penBiasClampFEM)
+                               uint64_t prePrepDescPtr, float penBiasClampFEM,
+                               uint64_t sharedDescPtr)
 {
     Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(prepDescPtr);
     const uint64_t bodyFramesBase = prepDesc[0].body2WorldPool;
@@ -262,58 +285,110 @@ public void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
     float3 t0, t1;
     computeBasisVectors(normal, t0, t1);
 
-    // ARTICULATION anchor branch DEFERRED (see header): a static floor / sphere is never
-    // an articulation, so the else (rigid / static) path is taken.  solverBodyIdx == 0 for
-    // a static body (solverBodyIndices untouched).
-    const bool isStatic = nodeIsStaticBody(rigidId);
-    uint idx = 0u;
-    if (!isStatic)
-        idx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(prePrepDescPtr)[0].solverBodyIndices)[nodeIndex(rigidId)];
-
-    PxgSolverTxIData txI = Ptr<PxgSolverTxIData>(solverTxIDataBase)[idx];
-    float invSqrtInertia[9];
-    for (uint k = 0; k < 9u; ++k)
-        invSqrtInertia[k] = txI.sqrtInvInertia[k];
-
-    const PxgSolverBodyData sbd = Ptr<PxgSolverBodyData>(solverBodyDataBase)[idx];
-    const float4 linVel_invMass0 = sbd.initialLinVelXYZ_invMassW;
-    const float penBiasClampRigid = sbd.initialAngVelXYZ_penBiasClamp.w;
-    const float invMass0 = linVel_invMass0.w;
-
-    // both static and kinematic objects have invMass == 0; a static body is never kinematic.
-    const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
-
-    const float4 bfP = Ptr<float4>(bodyFramesBase + uint64_t(idx) * 32u + 16u)[0];
-    const float3 bodyFrame0p = float3(bfP.x, bfP.y, bfP.z);
-
-    const float3 ra = float3(p.x - bodyFrame0p.x, p.y - bodyFrame0p.y, p.z - bodyFrame0p.z);
-    const float3 raXn = crossVec(ra, normal);
-    const float3 raXF0 = crossVec(ra, t0);
-    const float3 raXF1 = crossVec(ra, t1);
-
-    const float3 raXnSqrtInertia = mat33MulVec(invSqrtInertia, raXn);
-    const float resp0 = dotVec(raXnSqrtInertia, raXnSqrtInertia) + invMass0;
-
-    const float3 raXF0SqrtInertia = mat33MulVec(invSqrtInertia, raXF0);
-    const float3 raXF1SqrtInertia = mat33MulVec(invSqrtInertia, raXF1);
-
-    const float respF0 = dotVec(raXF0SqrtInertia, raXF0SqrtInertia) + invMass0;
-    const float respF1 = dotVec(raXF1SqrtInertia, raXF1SqrtInertia) + invMass0;
-
+    float penBiasClampRigid;
     float4 raXn_resp;
     float4 raXnF0_resp;
     float4 raXnF1_resp;
-    if (isKinematic)
+    float invMass0;
+
+    if (nodeIsArticulation(rigidId))
     {
+        // :161-167.  Two indices from one PxNodeIndex: the ARTICULATION through the node's
+        // body sim (articulationRemapId), the LINK through articulationLinkId().
+        Ptr<PxgSolverSharedDescPGSGpu> sharedDesc = Ptr<PxgSolverSharedDescPGSGpu>(sharedDescPtr);
+        Ptr<PxgBodySim> bodySims = Ptr<PxgBodySim>(sharedDesc[0].mBodySimBufferDeviceData);
+        const uint nodeIndexA = nodeIndex(rigidId);
+        const uint artiId = bodySims[nodeIndexA].articulationRemapId;
+        const uint64_t articulation = sharedDesc[0].articulations + uint64_t(artiId) * PXG_ARTI_STRIDE;
+
+        const uint linkID = nodeArticulationLinkId(rigidId);
+        // linkBody2Worlds: PxTransform (28 B) -- q at 0, p at 16; only p is read.
+        Ptr<float> body2World = Ptr<float>(artiPtrField(articulation, PXG_ARTI_LINK_BODY2WORLDS)
+                                           + uint64_t(linkID) * PXG_ARTI_TRANSFORM_SIZE);
+        // links[linkID].initialAngVelXYZ_penBiasClamp.w
+        penBiasClampRigid = Ptr<float>(artiPtrField(articulation, PXG_ARTI_LINKS)
+                                       + uint64_t(linkID) * PXG_ARTI_LINK_SIZE
+                                       + PXG_ARTI_LINKREC_INITIAL_ANGVEL_PENBIAS)[3];
+
+        const float3 bodyFrame0p = float3(body2World[4], body2World[5], body2World[6]);
+
+        const float3 ra = float3(p.x - bodyFrame0p.x, p.y - bodyFrame0p.y, p.z - bodyFrame0p.z);
+        const float3 raXn = crossVec(ra, normal);
+        const float3 raXF0 = crossVec(ra, t0);
+        const float3 raXF1 = crossVec(ra, t1);
+
+        const AbMatrix6x6 spatialResponse =
+            asmLoad6x6Record(artiPtrField(articulation, PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W), linkID);
+
+        // spatialResponse * Cm::UnAlignedSpatialVector(normal, raXn): top = normal.
+        const AbSpatialVector deltaV0 = asmM6MulVec(spatialResponse, asmSVec(normal, raXn));
+        const float resp0 = dotVec(deltaV0.top, raXn) + dotVec(deltaV0.bottom, normal);
+
+        const AbSpatialVector deltaFV0 = asmM6MulVec(spatialResponse, asmSVec(t0, raXF0));
+        const AbSpatialVector deltaFV1 = asmM6MulVec(spatialResponse, asmSVec(t1, raXF1));
+
+        const float respF0 = dotVec(deltaFV0.top, raXF0) + dotVec(deltaFV0.bottom, t0);
+        const float respF1 = dotVec(deltaFV1.top, raXF1) + dotVec(deltaFV1.bottom, t1);
+
         raXn_resp = float4(raXn.x, raXn.y, raXn.z, resp0);
         raXnF0_resp = float4(raXF0.x, raXF0.y, raXF0.z, respF0);
         raXnF1_resp = float4(raXF1.x, raXF1.y, raXF1.z, respF1);
+
+        // Articulations don't use invMass0.  It is 1 so the solve gets the linear IMPULSE
+        // rather than a velocity change (:196-197) -- and it is what makes the solve's
+        // `fricTan0_invMass0.w != 0` reaction guard admit a link.
+        invMass0 = 1.0f;
     }
     else
     {
-        raXn_resp = float4(raXnSqrtInertia.x, raXnSqrtInertia.y, raXnSqrtInertia.z, resp0);
-        raXnF0_resp = float4(raXF0SqrtInertia.x, raXF0SqrtInertia.y, raXF0SqrtInertia.z, respF0);
-        raXnF1_resp = float4(raXF1SqrtInertia.x, raXF1SqrtInertia.y, raXF1SqrtInertia.z, respF1);
+        // :199 -- solverBodyIdx == 0 for a static body (solverBodyIndices untouched).
+        const bool isStatic = nodeIsStaticBody(rigidId);
+        uint idx = 0u;
+        if (!isStatic)
+            idx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(prePrepDescPtr)[0].solverBodyIndices)[nodeIndex(rigidId)];
+
+        PxgSolverTxIData txI = Ptr<PxgSolverTxIData>(solverTxIDataBase)[idx];
+        float invSqrtInertia[9];
+        for (uint k = 0; k < 9u; ++k)
+            invSqrtInertia[k] = txI.sqrtInvInertia[k];
+
+        const PxgSolverBodyData sbd = Ptr<PxgSolverBodyData>(solverBodyDataBase)[idx];
+        const float4 linVel_invMass0 = sbd.initialLinVelXYZ_invMassW;
+        penBiasClampRigid = sbd.initialAngVelXYZ_penBiasClamp.w;
+        invMass0 = linVel_invMass0.w;
+
+        // both static and kinematic objects have invMass == 0; a static body is never kinematic.
+        const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
+
+        const float4 bfP = Ptr<float4>(bodyFramesBase + uint64_t(idx) * 32u + 16u)[0];
+        const float3 bodyFrame0p = float3(bfP.x, bfP.y, bfP.z);
+
+        const float3 ra = float3(p.x - bodyFrame0p.x, p.y - bodyFrame0p.y, p.z - bodyFrame0p.z);
+        const float3 raXn = crossVec(ra, normal);
+        const float3 raXF0 = crossVec(ra, t0);
+        const float3 raXF1 = crossVec(ra, t1);
+
+        const float3 raXnSqrtInertia = mat33MulVec(invSqrtInertia, raXn);
+        const float resp0 = dotVec(raXnSqrtInertia, raXnSqrtInertia) + invMass0;
+
+        const float3 raXF0SqrtInertia = mat33MulVec(invSqrtInertia, raXF0);
+        const float3 raXF1SqrtInertia = mat33MulVec(invSqrtInertia, raXF1);
+
+        const float respF0 = dotVec(raXF0SqrtInertia, raXF0SqrtInertia) + invMass0;
+        const float respF1 = dotVec(raXF1SqrtInertia, raXF1SqrtInertia) + invMass0;
+
+        if (isKinematic)
+        {
+            raXn_resp = float4(raXn.x, raXn.y, raXn.z, resp0);
+            raXnF0_resp = float4(raXF0.x, raXF0.y, raXF0.z, respF0);
+            raXnF1_resp = float4(raXF1.x, raXF1.y, raXF1.z, respF1);
+        }
+        else
+        {
+            raXn_resp = float4(raXnSqrtInertia.x, raXnSqrtInertia.y, raXnSqrtInertia.z, resp0);
+            raXnF0_resp = float4(raXF0SqrtInertia.x, raXF0SqrtInertia.y, raXF0SqrtInertia.z, respF0);
+            raXnF1_resp = float4(raXF1SqrtInertia.x, raXF1SqrtInertia.y, raXF1SqrtInertia.z, respF1);
+        }
     }
 
     const float maxPenBias = max(penBiasClampRigid, penBiasClampFEM);
@@ -329,9 +404,14 @@ public void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
 }
 
 // ---------------------------------------------------------------------------
-// PxgVelocityReader (dataReadWriteHelper.cuh:70) — non-articulation rigid path.
-// ARTICULATION branch DEFERRED (see header).  Returns lin/ang velocity (+ lin/ang delta
-// for TGS) of the rigid body; a static body reads solverBodyIdx 0 (zero for a floor).
+// PxgVelocityReader (dataReadWriteHelper.cuh:70) — readVelocitiesPGS (:99) and
+// readVelocitiesTGS (:120), both arms.  Returns lin/ang velocity (+ lin/ang delta for TGS)
+// of the rigid body or articulation link; a static body reads solverBodyIdx 0 (zero for a
+// floor).  For a link, solverBodyIndices[node] is the articulation's index in the solver's
+// articulation list, so its rows of outArtiVelocity start at solverBodyIdx * maxLinks, and
+// the four planes (lin, ang, and for TGS linDelta, angDelta) are maxLinks * nbArticulations
+// apart -- the read psContactSolveRigidBda and npArtiFlushVel make of the same buffer.  The
+// artiCoreDesc reads are sunk into the articulation arm (see the header).
 // ---------------------------------------------------------------------------
 public struct RigidState
 {
@@ -342,7 +422,7 @@ public struct RigidState
 }
 
 public RigidState readRigidVelocity(uint64_t rigidId, bool isTGS, uint64_t solverCoreDescPtr,
-                             uint64_t sharedDescPtr, uint64_t prePrepDescPtr)
+                             uint64_t sharedDescPtr, uint64_t prePrepDescPtr, uint64_t artiCoreDescPtr)
 {
     Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(solverCoreDescPtr);
     const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
@@ -359,7 +439,29 @@ public RigidState readRigidVelocity(uint64_t rigidId, bool isTGS, uint64_t solve
     s.linDelta = float3(0.0f, 0.0f, 0.0f);
     s.angDelta = float3(0.0f, 0.0f, 0.0f);
 
-    if (isTGS)
+    if (nodeIsArticulation(rigidId))
+    {
+        // :105-115 (PGS) / :126-141 (TGS)
+        Ptr<float4> artiLinkVelocities = Ptr<float4>(solverCoreDesc[0].outArtiVelocity);
+        const uint maxLinks = artiU32Field(artiCoreDescPtr, PXG_ARTI_CORE_MAX_LINKS);
+        const uint nbArticulations = artiU32Field(artiCoreDescPtr, PXG_ARTI_CORE_NB_ARTICULATIONS);
+        const uint artiOffset = maxLinks * nbArticulations;
+        const uint index = solverBodyIdx * maxLinks;
+        const uint linkID = nodeArticulationLinkId(rigidId);
+
+        const float4 linearVelocity = artiLinkVelocities[index + linkID];
+        const float4 angularVelocity = artiLinkVelocities[index + linkID + artiOffset];
+        s.linVel = float3(linearVelocity.x, linearVelocity.y, linearVelocity.z);
+        s.angVel = float3(angularVelocity.x, angularVelocity.y, angularVelocity.z);
+        if (isTGS)
+        {
+            const float4 linDelta = artiLinkVelocities[index + linkID + artiOffset + artiOffset];
+            const float4 angDelta = artiLinkVelocities[index + linkID + artiOffset + artiOffset + artiOffset];
+            s.linDelta = float3(linDelta.x, linDelta.y, linDelta.z);
+            s.angDelta = float3(angDelta.x, angDelta.y, angDelta.z);
+        }
+    }
+    else if (isTGS)
     {
         Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescTGSGpu>(sharedDescPtr)[0].iter_solverBodyVelPool);
         const float4 v0 = pool[accOffset + solverBodyIdx];
@@ -419,7 +521,7 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
                                 float3 deformableLinDelta, float deformableInvMass_massSplitting,
                                 uint rigidBodyReferenceCount, bool wasActive, bool checkOnlyActivity,
                                 uint64_t solverCoreDescPtr, uint64_t sharedDescPtr, uint64_t prePrepDescPtr,
-                                float combinedFriction)
+                                uint64_t artiCoreDescPtr, float combinedFriction)
 {
     ContactResult r;
     r.isActive = false;
@@ -447,7 +549,8 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
     const float3 raXn = float3(raXn_resp.x, raXn_resp.y, raXn_resp.z);
     r.raXn = raXn;   // :306, before both early returns
 
-    const RigidState st = readRigidVelocity(rigidId, isTGS, solverCoreDescPtr, sharedDescPtr, prePrepDescPtr);
+    const RigidState st = readRigidVelocity(rigidId, isTGS, solverCoreDescPtr, sharedDescPtr, prePrepDescPtr,
+                                            artiCoreDescPtr);
     const float3 linVel = st.linVel;
     const float3 angVel = st.angVel;
 
@@ -541,7 +644,8 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
 }
 
 // ---------------------------------------------------------------------------
-// FEMCollision::computeRigidChange (deformableUtils.cuh:418-429) — P9.45.
+// FEMCollision::computeRigidChange (deformableUtils.cuh:418-429) — P9.45; the
+// isArticulation arm is taken since tranche A (callers pass nodeIsArticulation(rigidId)).
 //
 //   deltaAngVel0 = isArticulation ? (raXn*dLN + raXt*dLT)
 //                                 : (raXn*dLN + raXt*dLT) * refCount;
