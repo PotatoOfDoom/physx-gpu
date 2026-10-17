@@ -40,6 +40,10 @@
 #ifndef PXG_NOCUDA_VECTOR_TYPES_H
 #define PXG_NOCUDA_VECTOR_TYPES_H
 
+// The toolkit's vector_types.h includes host_defines.h (__device__, __align__,
+// __builtin_align__, ...); 5.12 headers rely on that transitively, so do the same.
+#include "host_defines.h"
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PXG_VT_ALIGN(n) __attribute__((aligned(n)))
 #elif defined(_MSC_VER)

@@ -72,6 +72,15 @@ extern "C" CUresult cuStreamQuery(CUstream /*hStream*/)
     return CUDA_SUCCESS;
 }
 
+// cuStreamSynchronize: 5.12's SDF upload (PxgGeometryManager) waits on its stream
+// after cuMemcpy3DAsync.  Route to the live context's stream sync; with no context
+// there is no recorded work to wait for.
+extern "C" CUresult cuStreamSynchronize(CUstream hStream)
+{
+    if (!physx::gpuslang::gDriverShimContext) return CUDA_SUCCESS;
+    return CUresult(physx::gpuslang::gDriverShimContext->streamSynchronize(hStream));
+}
+
 // Raw memcpys route through the live bridge context (interior flat-address resolve).
 extern "C" CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount)
 {

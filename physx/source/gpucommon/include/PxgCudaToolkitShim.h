@@ -173,6 +173,7 @@ CUresult cuCtxGetStreamPriorityRange(int* leastPriority, int* greatestPriority);
 // PxgVulkanCudaContext); cuStreamQuery reports ready (the Vulkan submission model
 // drains synchronously).
 CUresult cuStreamQuery(CUstream hStream);
+CUresult cuStreamSynchronize(CUstream hStream);
 CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
 CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount);
 CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount);

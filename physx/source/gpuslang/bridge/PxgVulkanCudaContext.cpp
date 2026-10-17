@@ -179,7 +179,8 @@ public:
         : mShim(shim), mManifest(manifest), mManifestCount(manifestCount),
           mUnmappedLaunches(manifestCount, 0u)
     {
-        mAllocatorCallback = nullptr;
+        mDeviceAllocatorCallback = nullptr;
+        mPinnedHostAllocatorCallback = nullptr;
         // Register as the live context so the raw (context-less) CUDA-driver shim
         // entry points (bridge/PxgVulkanDriverShim.cpp) route memcpys through us.
         pxgSetVulkanDriverContext(this);
@@ -961,7 +962,14 @@ public:
         static CUmodule sModule = reinterpret_cast<CUmodule>(uintptr_t(1));
         return &sModule;
     }
-    void release() override { delete this; }
+    // 5.12: the manager is reference counted (a scene acquires a reference for its
+    // lifetime); the last release() destroys it.
+    void release() override
+    {
+        if (mRefCount.fetch_sub(1u) == 1u)
+            delete this;
+    }
+    void acquireReference() override { mRefCount.fetch_add(1u); }
 
 protected:
     ~PxgVulkanCudaContextManager() override
@@ -972,64 +980,12 @@ protected:
             mOnRelease();
     }
 
-    // ---- deprecated Internal buffer helpers: forward onto the context ----
-    void* allocDeviceBufferInternal(PxU64 numBytes, const char* /*f*/, PxI32 /*l*/) override
-    {
-        CUdeviceptr p = 0;
-        return mContext->memAlloc(&p, size_t(numBytes)) == 0 ? reinterpret_cast<void*>(uintptr_t(p)) : nullptr;
-    }
-    void* allocPinnedHostBufferInternal(PxU64 numBytes, const char* /*f*/, PxI32 /*l*/) override
-    {
-        void* p = nullptr;
-        mContext->memHostAlloc(&p, size_t(numBytes), 0);
-        return p;
-    }
-    void freeDeviceBufferInternal(void* deviceBuffer) override
-    {
-        mContext->memFree(CUdeviceptr(uintptr_t(deviceBuffer)));
-    }
-    void freePinnedHostBufferInternal(void* pinnedHostBuffer) override
-    {
-        mContext->memFreeHost(pinnedHostBuffer);
-    }
-    void clearDeviceBufferAsyncInternal(void* deviceBuffer, PxU32 numBytes, CUstream stream, PxI32 value) override
-    {
-        mContext->memsetD32Async(CUdeviceptr(uintptr_t(deviceBuffer)), PxU32(value), numBytes / 4, stream);
-    }
-    void copyDToHAsyncInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes, CUstream stream) override
-    {
-        mContext->memcpyDtoHAsync(hostBuffer, CUdeviceptr(uintptr_t(deviceBuffer)), numBytes, stream);
-    }
-    void copyHToDAsyncInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes, CUstream stream) override
-    {
-        mContext->memcpyHtoDAsync(CUdeviceptr(uintptr_t(deviceBuffer)), hostBuffer, numBytes, stream);
-    }
-    void copyDToDAsyncInternal(void* dst, const void* src, PxU32 numBytes, CUstream stream) override
-    {
-        mContext->memcpyDtoDAsync(CUdeviceptr(uintptr_t(dst)), CUdeviceptr(uintptr_t(src)), numBytes, stream);
-    }
-    void copyDToHInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes) override
-    {
-        mContext->memcpyDtoH(hostBuffer, CUdeviceptr(uintptr_t(deviceBuffer)), numBytes);
-    }
-    void copyHToDInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes) override
-    {
-        mContext->memcpyHtoD(CUdeviceptr(uintptr_t(deviceBuffer)), hostBuffer, numBytes);
-    }
-    void memsetD8AsyncInternal(void* dst, const PxU8& value, PxU32 numBytes, CUstream stream) override
-    {
-        mContext->memsetD8Async(CUdeviceptr(uintptr_t(dst)), value, numBytes, stream);
-    }
-    void memsetD32AsyncInternal(void* dst, const PxU32& value, PxU32 numIntegers, CUstream stream) override
-    {
-        mContext->memsetD32Async(CUdeviceptr(uintptr_t(dst)), value, numIntegers, stream);
-    }
-
 private:
     PxgSlangComputeDevice* mDevice;
     void (*mOnRelease)() = nullptr;
     PxgVulkanCudaContext* mContext;
     std::atomic<unsigned> mAcquireCount{0};
+    std::atomic<unsigned> mRefCount{1};
     bool mConcurrentStreams = false;
 };
 

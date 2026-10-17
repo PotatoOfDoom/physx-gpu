@@ -17,7 +17,15 @@
 #pragma clang diagnostic ignored "-Wdocumentation"
 #pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
 #endif
-#include <cuda.h>
+// The only cuda.h symbol this header needs is CUfunction, which PxCudaTypes.h
+// defines identically (typedef struct CUfunc_st*) when the CUDA toolkit is
+// absent, and defers to the real cuda.h typedef when CUDA_VERSION is already
+// defined.  Including PxCudaTypes.h instead of <cuda.h> lets this header — and
+// therefore the KernelWrangler — build in a Vulkan/no-CUDA-toolkit config while
+// staying byte-for-byte identical in a real CUDA build.  The .cpp still binds
+// the CUDA driver API (cuModuleGetFunction, ...) at link time; only header
+// compilation is decoupled here.
+#include "cudamanager/PxCudaTypes.h"
 #if PX_LINUX && PX_CLANG
 #pragma clang diagnostic pop
 #endif

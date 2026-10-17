@@ -56,7 +56,7 @@
 
 #include "PxPhysXGpu.h"               // physx/source/physxgpu/include: the interface + export decls
 #include "PxgVulkanCudaContext.h"     // bridge: PxgCreateVulkanCudaContextManager
-#include "PxgVulkanMemoryManager.h"   // bridge: the Vulkan PxsMemoryManager (P4 memory seam)
+#include "PxgMemoryManager.h"          // gpucommon: createPxgMemoryManager (P4 memory seam)
 #include "PxgCudaShim.h"              // gpuslang/include: PxgCudaShim, PxgKernelDef, PxgSpirvLoader
 #include "PxgVulkanKernelAbi.h"       // bridge: per-kernel launch-ABI table (P5 Step 4)
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
@@ -71,7 +71,7 @@
 #include "PxgAABBManager.h"                 // gpubroadphase (PxgAABBManager + PxgBoundsArray)
 #include "PxgNphaseImplementationContext.h" // gpunarrowphase
 #include "PxgSimulationController.h"        // gpusimulationcontroller
-#include "PxgParticleSystem.h"              // gpusimulationcontroller: PxgParticleBuffer (P6.0)
+#include "PxgParticleSystemBuffer.h"        // gpusimulationcontroller: PxgParticleBuffer (P6.0)
 #include "PxgDynamicsContext.h"             // gpusolver (PGS)
 #include "PxgTGSDynamicsContext.h"          // gpusolver (TGS)
 
@@ -567,81 +567,36 @@ public:
 
     void release() PX_OVERRIDE {}
 
-    // P6.0 PBD particle bring-up: mirror physxgpu/src/PxgPhysXGpu.cpp:98-102 —
+    // P6.0 PBD particle bring-up: mirror physxgpu/src/PxgPhysXGpu.cpp --
     // the concrete PxgParticleBuffer allocates its device buffers through the
-    // Vulkan shim (PxgVulkanMemoryManager) and launches no kernels, so it
-    // constructs the moment this stub is replaced.  A plain PxPBDParticleSystem +
-    // one PxParticleBuffer only ever calls createParticleBuffer (NpParticleBuffer.cpp:610);
-    // the diffuse/cloth/rigid variants stay stubbed (P6.1+).
-    PxsParticleBuffer* createParticleBuffer(PxU32 maxNumParticles, PxU32 maxVolumes, PxCudaContextManager& cudaContextManager) PX_OVERRIDE
+    // Vulkan context and launches no kernels.  5.12 folded the cloth and rigid
+    // buffers into the plain particle buffer, leaving these two factories.
+    PxsParticleBuffer* createParticleBuffer(PxU32 maxNumParticles, PxCudaContextManager& cudaContextManager) PX_OVERRIDE
     {
-        return static_cast<PxsParticleBuffer*>(PX_NEW(PxgParticleBuffer)(maxNumParticles, maxVolumes, cudaContextManager));
+        return static_cast<PxsParticleBuffer*>(PX_NEW(PxgParticleBuffer)(maxNumParticles, cudaContextManager));
     }
-    // P9.13a: the DIFFUSE buffer, third of the four and the same shape as the two
-    // above -- PxgParticleAndDiffuseBuffer allocates its device arrays through the
-    // Vulkan shim and launches no kernels (mirrors physxgpu/src/PxgPhysXGpu.cpp:104-108).
-    //
-    // This stub was the gate in front of an ELEVEN-kernel sub-chain: every
-    // ps_diffuseParticle* kernel, ps_calculateHashForDiffuseParticlesLaunch,
-    // ps_preDiffuseIntegrateLaunch, ps_updateUnsortedDiffuseArrayLaunch and the
-    // two diffuse collision launches are unreachable while the engine cannot
-    // allocate a buffer to put diffuse particles in -- exactly the situation P9.4
-    // found for cloth.  Note the diffuse pass of ps_sdfMeshCollisonLaunch and
-    // ps_meshCollisonLaunch (P9.10/P9.12h) has been mapped and swept all along and
-    // has never once run in a live scene for the same reason.
-    PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32 maxNumParticles, PxU32 maxVolumes,
-                                                               PxU32 maxNumDiffuseParticles,
+    // P9.13a: the DIFFUSE buffer -- the gate in front of the ps_diffuseParticle*
+    // sub-chain, which is unreachable while the engine cannot allocate a buffer
+    // to put diffuse particles in.
+    PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32 maxNumParticles, PxU32 maxNumDiffuseParticles,
                                                                PxCudaContextManager& cudaContextManager) PX_OVERRIDE
     {
         return static_cast<PxsParticleAndDiffuseBuffer*>(PX_NEW(PxgParticleAndDiffuseBuffer)(
-            maxNumParticles, maxVolumes, maxNumDiffuseParticles, cudaContextManager));
-    }
-    // P9.4: the PBD CLOTH buffer, the same shape as createParticleBuffer above and
-    // for the same reason -- PxgParticleClothBuffer allocates its device arrays
-    // through the Vulkan shim and launches no kernels, so it constructs as soon as
-    // the stub is replaced (mirrors physxgpu/src/PxgPhysXGpu.cpp:110-114).
-    //
-    // This stub, not any missing kernel, was what blocked PXG_SCENE=particlecloth:
-    // the whole spring chain had been mapped in P9.3a-c and nothing could reach it,
-    // because the engine could not even allocate a cloth buffer to hang springs on.
-    // Note also that returning NULL here is not survivable upstream -- NpPhysics
-    // hands the result straight to NpParticleClothBuffer's constructor, which
-    // dereferences it (NpParticleBuffer.cpp), so the warn-and-null contract of the
-    // other stubs SEGFAULTS rather than degrading.  That is worth knowing for the
-    // two that remain.
-    PxsParticleClothBuffer* createParticleClothBuffer(PxU32 maxNumParticles, PxU32 maxVolumes, PxU32 maxNumCloths, PxU32 maxNumTriangles, PxU32 maxNumSprings, PxCudaContextManager& cudaContextManager) PX_OVERRIDE
-    {
-        return static_cast<PxsParticleClothBuffer*>(PX_NEW(PxgParticleClothBuffer)(
-            maxNumParticles, maxVolumes, maxNumCloths, maxNumTriangles, maxNumSprings, cudaContextManager));
-    }
-    // P9.13a: the RIGID buffer, the last of the four (physxgpu/src/PxgPhysXGpu.cpp:116-120).
-    // Gate in front of the particle-vs-rigid ATTACHMENT sub-chain --
-    // ps_rigidAttachmentPrepareLaunch, ps_solveRigidAttachments{,TGS}Launch and
-    // ps_solvePCOutputRigidDeltaV{,TGS}Launch.
-    //
-    // With this, none of PxPhysXGpu's four particle-buffer factories returns NULL
-    // any more, and the warn-and-null contract the other stubs use is gone from
-    // this class entirely.  That contract was never survivable here: NpPhysics
-    // hands the result straight to the Np wrapper's constructor, which
-    // dereferences it, so a NULL SEGFAULTS rather than degrading.
-    PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32 maxNumParticles, PxU32 maxVolumes,
-                                                     PxU32 maxNumRigids,
-                                                     PxCudaContextManager& cudaContextManager) PX_OVERRIDE
-    {
-        return static_cast<PxsParticleRigidBuffer*>(PX_NEW(PxgParticleRigidBuffer)(
-            maxNumParticles, maxVolumes, maxNumRigids, cudaContextManager));
+            maxNumParticles, maxNumDiffuseParticles, cudaContextManager));
     }
 
-    // P4 memory seam (real): the Vulkan PxsMemoryManager (device->shim,
-    // host->malloc) feeding the REAL gpucommon buddy allocator manager, verbatim
-    // as the reference wires createGpuMemoryManager -> createGpuHeapMemoryAllocatorManager.
+    // P4 memory seam (real): gpucommon's PxgMemoryManager verbatim, as the
+    // reference wires it.  Its callbacks allocate through PxgCudaDeviceMemoryAllocate /
+    // PxgPinnedMemoryAllocate, i.e. the PxCudaContext, which is our Vulkan context.
     PxsMemoryManager* createGpuMemoryManager(PxCudaContextManager* cudaContextManager) PX_OVERRIDE
     {
-        return PX_NEW(PxgVulkanMemoryManager)(cudaContextManager->getCudaContext());
+        return createPxgMemoryManager(cudaContextManager);
     }
     PxsHeapMemoryAllocatorManager* createGpuHeapMemoryAllocatorManager(const PxU32 heapCapacity, PxsMemoryManager* memoryManager, const PxU32 /*gpuComputeVersion*/) PX_OVERRIDE
     {
-        return PX_NEW(PxgHeapMemoryAllocatorManager)(heapCapacity, memoryManager);
+        if (!memoryManager)
+            return NULL;
+        return PX_NEW(PxgHeapMemoryAllocatorManager)(heapCapacity, *static_cast<PxgMemoryManager*>(memoryManager));
     }
     // P4 wrangler seam (real): the REAL gpucommon PxgCudaKernelWranglerManager,
     // whose KernelWrangler resolves each mapped kernel id to our toFunc(id)
@@ -668,30 +623,32 @@ public:
 
     // P5 GPU-scene factories (real): each placement-news the concrete Pxg* type,
     // verbatim as physxgpu/src/PxgPhysXGpu.cpp wires them.  gpuComputeVersion==0 is
-    // the only path the CUDA reference takes too (the else returns NULL there).
+    // the only path the CUDA reference takes too.
     Bp::BroadPhase* createGpuBroadPhase(const PxGpuBroadPhaseDesc& desc, PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager,
-                                        PxU32 gpuComputeVersion, const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager* heapMemoryManager, PxU64 contextID) PX_OVERRIDE
+                                        PxU32 gpuComputeVersion, const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager& heapMemoryManager, PxU64 contextID) PX_OVERRIDE
     {
-        if (gpuComputeVersion == 0)
-            return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgCudaBroadPhaseSap), "PxgCudaBroadPhaseSap"), PxgCudaBroadPhaseSap)(desc,
-                static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, config, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), contextID);
-        return NULL;
+        if (gpuComputeVersion != 0 || !gpuKernelWrangler || !cudaContextManager)
+            return NULL;
+        PxgAllocatorDesc allocDesc = PxgCreateAllocatorDesc(static_cast<PxgHeapMemoryAllocatorManager&>(heapMemoryManager));
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgCudaBroadPhaseSap), "PxgCudaBroadPhaseSap"), PxgCudaBroadPhaseSap)(desc,
+            static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, config, allocDesc, contextID);
     }
 
     Bp::AABBManagerBase* createGpuAABBManager(PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager, const PxU32 gpuComputeVersion,
-                                              const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager* heapMemoryManager,
-                                              Bp::BroadPhase& bp, Bp::BoundsArray& boundsArray, PxFloatArrayPinnedSafe& contactDistance,
-                                              PxU32 maxNbAggregates, PxU32 maxNbShapes, PxVirtualAllocator& allocator, PxU64 contextID,
+                                              const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager& heapMemoryManager,
+                                              Bp::BroadPhase& bp, Bp::BoundsArray& boundsArray, Cm::PinnableArray<PxReal>& contactDistance,
+                                              PxU32 maxNbAggregates, PxU32 maxNbShapes, PxU64 contextID,
                                               PxPairFilteringMode::Enum kineKineFilteringMode, PxPairFilteringMode::Enum staticKineFilteringMode) PX_OVERRIDE
     {
-        if (gpuComputeVersion == 0)
-            return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgAABBManager), "PxgAABBManager"), PxgAABBManager)(
-                static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager),
-                config, bp, boundsArray, contactDistance, maxNbAggregates, maxNbShapes, allocator, contextID, kineKineFilteringMode, staticKineFilteringMode);
-        return NULL;
+        if (gpuComputeVersion != 0 || !gpuKernelWrangler || !cudaContextManager)
+            return NULL;
+        PxgAllocatorDesc allocDesc = PxgCreateAllocatorDesc(static_cast<PxgHeapMemoryAllocatorManager&>(heapMemoryManager));
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgAABBManager), "PxgAABBManager"), PxgAABBManager)(
+            static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, allocDesc,
+            config, bp, boundsArray, contactDistance, maxNbAggregates, maxNbShapes, contextID, kineKineFilteringMode, staticKineFilteringMode);
     }
 
-    Bp::BoundsArray* createGpuBounds(PxVirtualAllocator& allocator) PX_OVERRIDE
+    Bp::BoundsArray* createGpuBounds(Cm::VirtualAllocatorCallback& allocator) PX_OVERRIDE
     {
         return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgBoundsArray), "PxgBoundsArray"), PxgBoundsArray)(allocator);
     }
@@ -699,39 +656,47 @@ public:
     PxvNphaseImplementationContext* createGpuNphaseImplementationContext(PxsContext& context, PxsKernelWranglerManager* gpuKernelWrangler,
                                                                          PxvNphaseImplementationFallback* fallbackForUnsupportedCMs,
                                                                          const PxGpuDynamicsMemoryConfig& gpuDynamicsConfig, void* contactStreamBase, void* patchStreamBase, void* forceAndIndiceStreamBase,
-                                                                         PxBoundsArrayPinned& bounds, IG::IslandSim* islandSim,
+                                                                         Bp::BoundsArray& bounds, IG::IslandSim* islandSim,
                                                                          physx::Dy::Context* dynamicsContext, const PxU32 /*gpuComputeVersion*/,
-                                                                         PxsHeapMemoryAllocatorManager* heapMemoryManager, bool useGPUBP) PX_OVERRIDE
+                                                                         PxsHeapMemoryAllocatorManager& heapMemoryManager, bool useGPUBP) PX_OVERRIDE
     {
+        if (!gpuKernelWrangler)
+            return NULL;
+        PxgAllocatorDesc allocDesc = PxgCreateAllocatorDesc(static_cast<PxgHeapMemoryAllocatorManager&>(heapMemoryManager));
         return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgNphaseImplementationContext), "PxgNphaseImplementationContext"), PxgNphaseImplementationContext)(context, gpuKernelWrangler, fallbackForUnsupportedCMs, gpuDynamicsConfig, contactStreamBase, patchStreamBase, forceAndIndiceStreamBase,
-            bounds, islandSim, dynamicsContext, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), useGPUBP);
+            bounds, islandSim, dynamicsContext, allocDesc, useGPUBP);
     }
 
     PxsSimulationController* createGpuSimulationController(PxsKernelWranglerManager* gpuWranglerManagers, PxCudaContextManager* cudaContextManager,
                                                           Dy::Context* dynamicContext, PxvNphaseImplementationContext* npContext, Bp::BroadPhase* bp,
                                                           const bool useGpuBroadphase, PxsSimulationControllerCallback* callback, const PxU32 /*gpuComputeVersion*/,
-                                                          PxsHeapMemoryAllocatorManager* heapMemoryManager, const PxU32 maxSoftBodyContacts, const PxU32 maxFemClothContacts,
+                                                          PxsHeapMemoryAllocatorManager& heapMemoryManager, const PxU32 maxDeformableVolumeContacts, const PxU32 maxDeformableSurfaceContacts,
                                                           const PxU32 maxParticleContacts, const PxU32 collisionStackSizeBytes, bool enableBodyAccelerations) PX_OVERRIDE
     {
+        if (!gpuWranglerManagers || !cudaContextManager || !dynamicContext || !npContext || !bp)
+            return NULL;
+        PxgAllocatorDesc allocDesc = PxgCreateAllocatorDesc(static_cast<PxgHeapMemoryAllocatorManager&>(heapMemoryManager));
         return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgSimulationController), "PxgSimulationController"),
             PxgSimulationController)(gpuWranglerManagers, cudaContextManager, static_cast<PxgDynamicsContext*>(dynamicContext), static_cast<PxgNphaseImplementationContext*>(npContext),
-            bp, useGpuBroadphase, callback, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), maxSoftBodyContacts,
-            maxFemClothContacts, maxParticleContacts, collisionStackSizeBytes, enableBodyAccelerations);
+            bp, useGpuBroadphase, callback, allocDesc, maxDeformableVolumeContacts,
+            maxDeformableSurfaceContacts, maxParticleContacts, collisionStackSizeBytes, enableBodyAccelerations);
     }
 
     Dy::Context* createGpuDynamicsContext(Cm::FlushPool& taskPool, PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager,
                                           const PxGpuDynamicsMemoryConfig& config, IG::SimpleIslandManager& islandManager, PxU32 maxNumPartitions, PxU32 maxNumStaticPartitions,
-                                          bool enableStabilization, bool useEnhancedDeterminism, bool solveArticulationContactLast, PxReal maxBiasCoefficient, PxU32 /*gpuComputeVersion*/,
-                                          PxvSimStats& simStats, PxsHeapMemoryAllocatorManager* heapMemoryManager, bool frictionEveryIteration, bool externalForcesEveryTgsIterationEnabled,
-                                          PxSolverType::Enum solverType, PxReal lengthScale, bool enableDirectGPUAPI, PxU64 contextID, bool isResidualReportingEnabled) PX_OVERRIDE
+                                          PxReal maxBiasCoefficient, PxU32 /*gpuComputeVersion*/, PxvSimStats& simStats, PxsHeapMemoryAllocatorManager& heapMemoryManager,
+                                          PxSolverType::Enum solverType, PxReal lengthScale, PxU64 contextID, PxSceneFlags sceneFlags) PX_OVERRIDE
     {
+        if (!gpuKernelWrangler || !cudaContextManager)
+            return NULL;
+        PxgAllocatorDesc allocDesc = PxgCreateAllocatorDesc(static_cast<PxgHeapMemoryAllocatorManager&>(heapMemoryManager));
         if (solverType == PxSolverType::eTGS)
             return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgTGSDynamicsContext), "PxgDynamicsContext"), PxgTGSDynamicsContext)(taskPool, gpuKernelWrangler, cudaContextManager, config, islandManager,
-                maxNumPartitions, maxNumStaticPartitions, enableStabilization, useEnhancedDeterminism, solveArticulationContactLast, maxBiasCoefficient, simStats,
-                static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), externalForcesEveryTgsIterationEnabled, lengthScale, enableDirectGPUAPI, contextID, isResidualReportingEnabled);
+                maxNumPartitions, maxNumStaticPartitions, maxBiasCoefficient, simStats,
+                allocDesc, lengthScale, contextID, sceneFlags);
         return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgDynamicsContext), "PxgDynamicsContext"), PxgDynamicsContext)(taskPool, gpuKernelWrangler, cudaContextManager, config, islandManager,
-            maxNumPartitions, maxNumStaticPartitions, enableStabilization, useEnhancedDeterminism, solveArticulationContactLast, maxBiasCoefficient, simStats,
-            static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), frictionEveryIteration, lengthScale, enableDirectGPUAPI, contextID, isResidualReportingEnabled);
+            maxNumPartitions, maxNumStaticPartitions, maxBiasCoefficient, simStats,
+            allocDesc, lengthScale, contextID, sceneFlags);
     }
 };
 
