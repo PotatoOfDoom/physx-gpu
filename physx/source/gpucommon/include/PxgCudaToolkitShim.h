@@ -84,9 +84,9 @@ typedef int CUresult;
 #define CU_EVENT_DISABLE_TIMING 0x2
 #endif
 #ifndef CU_MEMHOSTALLOC_PORTABLE
-#define CU_MEMHOSTALLOC_PORTABLE   0x1
-#define CU_MEMHOSTALLOC_DEVICEMAP  0x2
-#define CU_MEMHOSTALLOC_WRITECOMBINED 0x4
+#define CU_MEMHOSTALLOC_PORTABLE 0x01
+#define CU_MEMHOSTALLOC_DEVICEMAP 0x02
+#define CU_MEMHOSTALLOC_WRITECOMBINED 0x04
 #endif
 
 // A few driver result codes the modules compare against by name (beyond

@@ -14,8 +14,8 @@ struct PxgSlangKernelRow
     const char* entry;      // Slang entry point, or nullptr if unmapped
 };
 
-static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 428;
+static const unsigned PXG_SLANG_KERNEL_COUNT = 487;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 401;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -134,8 +134,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "clearFrictionPatchCounts", "npContactPrePrep.spv", "clearFrictionPatchCounts" },  // CLEAR_FRICTION_PATCH_COUNTS (P5 Step 5 BDA port)
     { "dmaBackChangedElems", "solverDmaBack.spv", "dmaBackChangedElems" },  // DMA_CHANGED_ELEMS
     { "bpSignalComplete", "broadphaseClearNewFlag.spv", "bpSignalComplete" },  // BP_SIGNAL_COMPLETE
-    { "dmaConstraintResidual", "solverDmaBack.spv", "dmaConstraintResidual" },  // DMA_CONSTRAINT_RESIDUAL
-    { "dmaArticulationResidual", "dmaArtiResidualBda.spv", "dmaArticulationResidual" },  // DMA_ARTICULATION_RESIDUAL (P8.66 BDA)
     { "dmaBackArticulationDataLaunch", "npArtiLinkAccel.spv", "dmaBackArticulationDataLaunch" },  // ARTI_DMA_DATA (P8.93 BDA)
     { "artiSumInternalContactAndJointBatches1Launch", "npArtiSumBatches.spv", "artiSumInternalContactAndJointBatches1Launch" },  // ARTI_STATIC_BATCH_PREP_FIRST (P8.96a)
     { "artiSumInternalContactAndJointBatches2Launch", "npArtiSumBatches2.spv", "artiSumInternalContactAndJointBatches2Launch" },  // ARTI_STATIC_BATCH_PREP_SECOND (P8.96b)
@@ -232,6 +230,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_contactPrepareLaunch", "psContactSolveBda.spv", "ps_contactPrepareLaunch" },  // PS_CONTACT_PREPARE (P6.4b-2 BDA port: particle-vs-primitive contact constraint prep)
     { "ps_solvePCOutputParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch" },  // PS_SOLVE_PC_PARTICLE (P6.4b-2 BDA port: particle-side PC solve -> per-contact deltaV)
     { "ps_solvePCOutputRigidDeltaVLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVLaunch" },  // PS_SOLVE_PC_RIGID (P9.44)
+    { "ps_queryPCContactReferenceCountLaunch", nullptr, nullptr },  // PS_QUERY_PC_REFERENCE_COUNT (unmapped, new in 5.12)
     { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
     { "ps_findStartEndParticleFirstLaunch", "psContactSortBda.spv", "ps_findStartEndParticleFirstLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (P6.4b-1 BDA port: per-block range-start offsets)
     { "ps_findStartEndParticleSecondLaunch", "psContactSortBda.spv", "ps_findStartEndParticleSecondLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (P6.4b-1 BDA port: per-particle [start,end) ranges + pair count)
@@ -243,26 +242,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_applyDeltaLaunch", "particleSelfCollisionBda.spv", "ps_applyDeltaLaunch" },  // PS_APPLY_DELTAS (P6.3 BDA port: SOR-average mDelta -> accumDeltaP)
     { "ps_vorticityConfinementLaunch", "npPsFluidVelocity.spv", "ps_vorticityConfinementLaunch" },  // PS_VORTICITY_CONFINEMENT
     { "ps_solveVelocityLaunch", "npPsFluidVelocity.spv", "ps_solveVelocityLaunch" },  // PS_SOLVE_VELOCITIES
-    { "ps_updateRemapVertsLaunch", "npPsSprings.spv", "ps_updateRemapVertsLaunch" },  // PS_UPDATE_REMAP_VERTS
-    { "ps_solveSpringsLaunch", "npPsSprings.spv", "ps_solveSpringsLaunch" },  // PS_SOLVE_SPRINGS
-    { "ps_initializeSpringsLaunch", "npPsSprings.spv", "ps_initializeSpringsLaunch" },  // PS_INITIALIZE_SPRINGS
-    { "ps_averageVertsLaunch", "npPsSprings.spv", "ps_averageVertsLaunch" },  // PS_AVERAGEVERTS
-    { "ps_solveAerodynamics1Launch", "npPsAerodynamics.spv", "ps_solveAerodynamics1Launch" },
-    { "ps_solveAerodynamics2Launch", "npPsAerodynamics.spv", "ps_solveAerodynamics2Launch" },
-    { "ps_calculateInflatableVolume", "npPsInflatable.spv", "ps_calculateInflatableVolume" },
-    { "ps_solveInflatableVolume", "npPsInflatable.spv", "ps_solveInflatableVolume" },
-    { "ps_solveShapes", "psShapeMatchBda.spv", "ps_solveShapes" },  // PS_SOLVE_SHAPES (P9.80)
-    { "ps_rigidAttachmentPrepareLaunch", "psRigidAttachBda.spv", "ps_rigidAttachmentPrepareLaunch" },  // PS_PREP_RIGID_ATTACHMENTS (P9.76 particle attachment port)
-    { "ps_solveRigidAttachmentsLaunch", "psRigidAttachBda.spv", "ps_solveRigidAttachmentsLaunch" },  // PS_SOLVE_RIGID_ATTACHMENTS (P9.76 particle attachment port)
-    { "ps_update_volume_bound", "psVolumeBoundBda.spv", "ps_update_volume_bound" },  // PS_UPDATE_VOLUME_BOUND (P9.80)
-    // DEAD IN 5.6.1 (found in P9.4): the kernel body exists
-    // (particlesystem.cu:782) and the name is registered
-    // (PxgKernelNames.h:314), but PS_UPDATE_SPRING is never handed to
-    // getCuFunction anywhere in physx/source -- there is no launch site at
-    // all.  No scene can reach it, so it can never be validated end to end and
-    // a port of it would be unverifiable by construction.  Left unmapped
-    // deliberately; do not go looking for a scene that dispatches it.
-    { "ps_updateSprings", nullptr, nullptr },  // PS_UPDATE_SPRING (unmapped, dead)
     { "ps_accumulateStaticDensity", "npPsBoundaryDensity.spv", "ps_accumulateStaticDensity" },
     { "ps_accumulateRigidDensity", "npPsBoundaryDensity.spv", "ps_accumulateRigidDensity" },
     { "ps_diffuseParticleOneWayCollision", "psDiffuseOneWay.spv", "ps_diffuseParticleOneWayCollision" },  // PS_DIFFUSE_PARTICLES_ONE_WAY_COLLISION (P9.13f: apply the one-way contact list)
@@ -275,9 +254,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_findStartEndFEMSecondLaunch", "psContactSortBda.spv", "ps_findStartEndFEMSecondLaunch" },  // PS_RANGESTARTEND_FEM_SECONE (P9.48a: per-particle [start,end) over the FEM contact stream + the pair count)
     { "ps_accumulateFEMParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_accumulateFEMParticleDeltaVLaunch" },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (P9.48a: reduces the FEM-side per-contact deltaP onto mAccumDeltaP; recip is fcount>0?1/fcount:0, NOT the particle twin 1/max(1,fcount))
     { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
-    { "ps_solvePCOutputParticleDeltaVTGSLaunch", "psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch" },  // PS_SOLVE_PC_PARTICLE_TGS (P6.6 BDA port: TGS twin of the particle-side PC solve)
-    { "ps_solvePCOutputRigidDeltaVTGSLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVTGSLaunch" },  // PS_SOLVE_PC_RIGID_TGS (P9.44)
-    { "ps_solveRigidAttachmentsTGSLaunch", "psRigidAttachBda.spv", "ps_solveRigidAttachmentsTGSLaunch" },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (P9.76 particle attachment port)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", "npPsMaterials.spv", "ps_updateMaterials" },  // PS_UPDATE_MATERIALS
     { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
@@ -305,13 +281,18 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_clothContactPrepareLaunch", "softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch" },  // SB_SC_CONTACTPREPARE (P8.8 step 5 BDA port — softbody-vs-cloth constraint prepare)
     { "sb_particleContactPrepareLaunch", "softBodyPsPrepareBda.spv", "sb_particleContactPrepareLaunch" },  // SB_SP_CONTACTPREPARE
     { "sb_solveRigidSoftAttachmentLaunch", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (P8.3 attachment port)
+    { "sb_queryRigidSoftAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_RIGID_SOFT_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "sb_querySoftBodyAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SOFTBODY_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "sb_queryClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", "softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch" },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
     { "sb_solveOutputClothAttachmentDeltaVLaunch", "softBodyClothAttachBda.spv", "sb_solveOutputClothAttachmentDeltaVLaunch" },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (P9.33c BDA)
-    { "sb_solveOutputParticleAttachmentDeltaVLaunch", "softBodyParticleAttachBda.spv", "sb_solveOutputParticleAttachmentDeltaVLaunch" },  // SB_SOLVE_PARTICLE_ATTACHMENT_DELTA (P9.48b: softbody tet pinned to one particle; no cone limit, wTot0 is the raw particle invMass, barycentric0.x is a buffer id)
     { "sb_queryRigidSoftContactReferenceCountLaunch", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveRigidSoftCollisionLaunch", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunch" },  // SB_SOLVE_RIGID_SOFT_COLLISION (P8.2 tranche e BDA port; chain kernels 6 and 7)
+    { "sb_querySSContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SS_REFERENCE_COUNT (unmapped, new in 5.12)
     { "sb_solveOutputSSDeltaVLaunch", "softBodySelfSolveBda.spv", "sb_solveOutputSSDeltaVLaunch" },  // SB_SOLVE_SOFT_SOFT_BOTH_DELTA (P8.4 tranche b BDA port)
+    { "sb_querySCContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SC_REFERENCE_COUNT (unmapped, new in 5.12)
     { "sb_solveOutputSCDeltaVLaunch", "softBodyClothSolveBda.spv", "sb_solveOutputSCDeltaVLaunch" },  // SB_SOLVE_SOFT_CLOTH_BOTH_DELTA (P8.8 step 6 BDA port — closes the softbody-vs-cloth chain)
+    { "sb_querySBParticleContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SP_REFERENCE_COUNT (unmapped, new in 5.12)
     { "sb_solveOutputSPDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputSPDeltaVLaunch" },  // mapped P9.39e
     { "sb_solveOutputParticleDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputParticleDeltaVLaunch" },  // mapped P9.39e
     { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port; hex branch P9.95f)
@@ -326,15 +307,10 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_other_contact_remap_to_simLaunch", "softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch" },  // SB_OTHER_CONTACT_REMAP_TO_SIM (P8.2 tranche c BDA port; the llvmpipe fault was the speculated null prevContactCount load, see the shader)
     { "sb_fem_contact_remap_to_simLaunch", "softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch" },  // SB_FEM_CONTACT_REMAP_TO_SIM (P8.4 tranche b BDA port)
     { "sb_gm_stepSoftbodyLaunch", "softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch" },  // SB_GM_STEPSOFTBODY (P8.0 tranche 3 BDA port)
-    { "sb_solveRigidSoftAttachmentLaunchTGS", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunchTGS" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT_TGS (P8.3 attachment port)
-    { "sb_queryRigidSoftContactReferenceCountLaunchTGS", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunchTGS" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
-    { "sb_solveRigidSoftCollisionLaunchTGS", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunchTGS" },  // SB_SOLVE_RIGID_SOFT_COLLISION_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
-    { "sb_solveOutputSSDeltaVLaunchTGS", "softBodySelfSolveBda.spv", "sb_solveOutputSSDeltaVLaunchTGS" },  // SB_SOLVE_SOFT_SOFT_BOTH_DELTA_TGS (P8.4 tranche b BDA port)
     { "sb_calculateStressLaunch", "softBodySolveBda.spv", "sb_calculateStressLaunch" },  // SB_CALC_STRESS (P8.5 BDA port)
     { "sb_plasticDeformLaunch", nullptr, nullptr },  // SB_PLASTIC_DEFORM (DELIBERATELY unmapped: the CUDA body is gated on a hard-coded `if (false)`, softBodyGM.cu:2844 -- porting it would map an empty kernel and inflate the count)
     { "sb_initPlasticDeformLaunch", nullptr, nullptr },  // SB_INIT_PLASTIC_DEFORM (DELIBERATELY unmapped: no call site anywhere in PhysX -- the engine never launches it)
     { "sb_plasticDeformLaunch2", nullptr, nullptr },  // SB_PLASTIC_DEFORM2 (DELIBERATELY unmapped: same hard-coded `if (false)`, softBodyGM.cu:3013)
-    { "sb_copyOrApplySoftBodyDataDEPRECATED", "softBodySimBda.spv", "sb_copyOrApplySoftBodyDataDEPRECATED" },  // SB_COPY_OR_APPLY_SOFTBODY_DATA_DEPRECATED (P9.95 BDA port: PxScene::copy/applySoftBodyData; arg 0 is the 32-byte PxgTypedCudaBuffer object)
     { "sb_gm_finalizeVelocitiesLaunch", "softBodySimBda.spv", "sb_gm_finalizeVelocitiesLaunch" },  // SB_GM_FINALIZE_VELOCITIES (P8.0 tranche 3 BDA port)
     { "sb_sleeping", "softBodySimBda.spv", "sb_sleeping" },  // SB_SLEEPING (P8.0 tranche 3 BDA port)
     { "compressContactStage1", "npCompressContacts.spv", "compressContactStage1" },  // COMPRESS_CONTACT_STAGE_1
@@ -345,7 +321,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeArtiCentrifugalForces", "npArtiInverseDyn.spv", "computeArtiCentrifugalForces" },  // COMPUTE_ARTI_CENTRIFUGAL_FORCES (unmapped)
     { "computeArtiCOM", "npArtiInverseDyn.spv", "computeArtiCOM" },  // COMPUTE_ARTI_COM (unmapped)
     { "computeArtiCentroidalMomentumMatrices", "npArtiInverseDyn.spv", "computeArtiCentroidalMomentumMatrices" },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
-    { "applyParticleBufferDataDEPRECATED", "particleSim.spv", "applyParticleBufferDataDEPRECATED" },  // APPLY_PARTICLE_BUFFER_DATA_DEPRECATED (P9.95: direct-GPU-API ingest by unique id)
     { "getRigidDynamicGlobalPose", "directApiBda.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE (P9.79 BDA re-point)
     { "getRigidDynamicLinearVelocity", "directApiBda.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL (P9.79 BDA re-point)
     { "getRigidDynamicAngularVelocity", "directApiBda.spv", "getRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_GET_ANGVEL (P9.79 BDA re-point)
@@ -356,10 +331,16 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "setRigidDynamicAngularVelocity", "directApiBda.spv", "setRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_SET_ANGVEL (P9.93 BDA re-point)
     { "setRigidDynamicForce", "directApiBda.spv", "setRigidDynamicForce" },  // RIGID_DYNAMIC_SET_FORCE (P9.93 BDA re-point)
     { "setRigidDynamicTorque", "directApiBda.spv", "setRigidDynamicTorque" },  // RIGID_DYNAMIC_SET_TORQUE (P9.93 BDA re-point)
+    { "getRigidDynamicForce", nullptr, nullptr },  // RIGID_DYNAMIC_GET_FORCE (unmapped, new in 5.12)
+    { "getRigidDynamicTorque", nullptr, nullptr },  // RIGID_DYNAMIC_GET_TORQUE (unmapped, new in 5.12)
+    { "computeRigidBodyAccelerations", nullptr, nullptr },  // RIGID_DYNAMIC_COMPUTE_ACCELERATIONS (unmapped, new in 5.12)
+    { "copyRigidBodyVelocitiesToPrevious", nullptr, nullptr },  // RIGID_DYNAMIC_COPY_PREVIOUS_VELOCITIES (unmapped, new in 5.12)
     { "getArtiDofStates", "npArtiGetSet.spv", "getArtiDofStates" },  // ARTI_GET_DOF_STATES (unmapped)
     { "getArtiTransformStates", "npArtiGetSet.spv", "getArtiTransformStates" },  // ARTI_GET_TRANSFORM_STATES (unmapped)
     { "getArtiVelocityStates", "npArtiGetSet.spv", "getArtiVelocityStates" },  // ARTI_GET_VELOCITY_STATES (unmapped)
     { "getArtiSpatialForceStates", "npArtiGetSet.spv", "getArtiSpatialForceStates" },  // ARTI_GET_SPATIAL_FORCE_STATES (unmapped)
+    { "getArtiLinkForceState", nullptr, nullptr },  // ARTI_GET_LINK_FORCE_STATE (unmapped, new in 5.12)
+    { "getArtiLinkTorqueState", nullptr, nullptr },  // ARTI_GET_LINK_TORQUE_STATE (unmapped, new in 5.12)
     { "setArtiDofStates", "npArtiGetSet.spv", "setArtiDofStates" },  // ARTI_SET_DOF_STATES (unmapped)
     { "setArtiRootGlobalPoseState", "npArtiGetSet.spv", "setArtiRootGlobalPoseState" },  // ARTI_SET_ROOT_GLOBAL_POSE_STATE (unmapped)
     { "setArtiRootVelocityState", "npArtiGetSet.spv", "setArtiRootVelocityState" },  // ARTI_SET_ROOT_VELOCITY_STATE (unmapped)
@@ -386,7 +367,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "removeAggPairsStage3", "aggregateBda.spv", "removeAggPairsStage3" },  // AGG_REMOVE_AGGPAIRS_STAGE_3
     { "aggCopyReports", "aggregateBda.spv", "aggCopyReports" },  // AGG_COPY_REPORTS
     { "clearDirtyAggregates", "aggregateBda.spv", "clearDirtyAggregates" },  // CLEAR_DIRTY_AGGS
-    { "copyUserData", nullptr, nullptr },  // COPY_USER_DATA (unmapped)
     { "markAddedAndDeletedAggregatedBounds", "aggregateBda.spv", "markAddedAndDeletedAggregatedBounds" },  // AGG_MARK_ADDED_DELETED_AGGREGATED_BOUNDS
     { "cloth_preIntegrateLaunch", "femClothSimBda.spv", "cloth_preIntegrateLaunch" },  // CLOTH_SIM_PREINTEGRATION (P7.0 BDA port: FEMCloth free-fall predict + integrate)
     { "cloth_refitBoundLaunch", "femClothRefitBda.spv", "cloth_refitBoundLaunch" },  // CLOTH_REFIT_BOUND (P7.2 tranche 3a BDA port)
@@ -403,7 +383,6 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_selfCollisionMidphaseEELaunch", "femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseEELaunch" },  // CLOTH_SELFCOLLISION_MIDPHASE_EE (P7.2 tranche 1 BDA port: cloth self-collision edge-edge midphase + contact gen)
     { "cloth_differentClothCollisionVTLaunch", "femClothDifferentClothBda.spv", "cloth_differentClothCollisionVTLaunch" },  // CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_VT (P8.16 BDA port: cloth-vs-different-cloth vertex-triangle midphase)
     { "cloth_differentClothCollisionEELaunch", "femClothDifferentClothBda.spv", "cloth_differentClothCollisionEELaunch" },  // CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_EE (P8.16 BDA port: cloth-vs-different-cloth edge-edge midphase)
-    { "cloth_clothMidphaseGeneratePairsLaunch", nullptr, nullptr },  // CLOTH_CLOTH_MIDPHASE (unmapped)
     { "cloth_psMidphaseGeneratePairsLaunch", "femClothPsMidphaseBda.spv", "cloth_psMidphaseGeneratePairsLaunch" },  // CLOTH_PS_MIDPHASE (P9.30 BDA)
     { "cloth_psContactGenLaunch", "femClothPsContactGenBda.spv", "cloth_psContactGenLaunch" },  // CLOTH_PS_CG (P9.30 BDA)
     { "cloth_meshMidphaseGeneratePairsLaunch", "femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch" },  // CLOTH_MESH_MIDPHASE (P8.17 step 1 BDA port: cloth-vs-cooked-trimesh midphase pair gen)
@@ -433,14 +412,14 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_queryClothClothContactEECountLaunch", "femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch" },  // CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT (P7.2 tranche 2 BDA port: EE self-contact reference-count)
     { "cloth_applyExternalDeltasLaunch", "femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch" },  // CLOTH_APPLY_EXTERNAL_DELTAS (P7.1 tranche 3c BDA port: fold mDeltaPos into position/velocity)
     { "cloth_updateClothContactValidityLaunch", "femClothClothContactBda.spv", "cloth_updateClothContactValidityLaunch" },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (P7.2 tranche 2 BDA port: per-vertex contact-pair validity refresh)
+    { "cloth_queryCPContactReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CP_REFERENCE_COUNT (unmapped, new in 5.12)
     { "cloth_solveCPOutputClothDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputClothDeltaVLaunch" },  // CLOTH_PARTICLE_CLOTH_DELTA (P9.31 BDA)
     { "cloth_solveCPOutputParticleDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputParticleDeltaVLaunch" },  // CLOTH_PARTICLE_PARTICLE_DELTA (P9.31 BDA)
     { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)
+    { "cloth_queryRigidClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_RIGID_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "cloth_queryClothClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
     { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", "femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch" },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (P9.32 BDA)
     { "cloth_finalizeVelocitiesLaunch", "femClothSimBda.spv", "cloth_finalizeVelocitiesLaunch" },  // CLOTH_FINALIZE_VELOCITIES (P7.0 BDA port)
-    { "cloth_solveRigidClothCollisionTGSLaunch", "femClothRigidContactBda.spv", "cloth_solveRigidClothCollisionTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact solve)
-    { "cloth_queryRigidClothContactReferenceCountTGSLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountTGSLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact reference-count query)
-    { "cloth_solveRigidClothAttachmentTGSLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS (P7.1 tranche 3a BDA port: TGS rigid/world attachment solve)
     { "cloth_sleeping", "femClothSimBda.spv", "cloth_sleeping" },  // CLOTH_SLEEPING (P7.0 BDA port: wake-counter bookkeeping)
     { "cloth_accumulateInPlaneDampingDeltaVelocity", "femClothDampingBda.spv", "cloth_accumulateInPlaneDampingDeltaVelocity" },  // CLOTH_IN_PLANE_DAMPING (P9.19)
     { "cloth_accumulateBendingDampingDeltaVelocity", "femClothDampingBda.spv", "cloth_accumulateBendingDampingDeltaVelocity" },  // CLOTH_BENDING_DAMPING (P9.19)
