@@ -1,56 +1,74 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_FEMCLOTH_H
 #define PXG_FEMCLOTH_H
 
-#include "PxDeformableSurface.h"
-#include "PxgCudaBuffer.h"
-#include "PxsHeapMemoryAllocator.h"
-#include "cutil_math.h"
+#include "foundation/PxArray.h"
+#include "foundation/PxBounds3.h"
+#include <vector_types.h>
+
 #include "foundation/PxUserAllocated.h"
-#include "foundation/PxVec2.h"
-#include "foundation/PxVec4.h"
+#include "PxgSimulationCoreDesc.h" // for PxgDeformablePairInfo
 
 namespace physx
 {
 namespace Gu
 {
 class TriangleMesh;
-};
+}
+namespace Cm
+{
+class VirtualAllocatorCallback;
+}
 
-struct PxgFemRigidConstraintBlock;
 struct PxsDeformableSurfaceMaterialData;
 
 #if PX_VC
 #pragma warning(push)
 #pragma warning(disable : 4324) // padding was added at the end of a structure because of a __declspec(align) value.
 #endif
+
+// The mesh topology of one deformable surface, derived when it joins a scene. Everything but the edge
+// ownership is consumed by the upload and freed by releaseUploadData.
+class PxgDeformableSurfaceTopology : public PxUserAllocated
+{
+  public:
+	PxgDeformableSurfaceTopology(const Gu::TriangleMesh& triangleMesh);
+
+	// Frees what the upload consumed, keeping the edge ownership.
+	void releaseUploadData();
+
+	// Whether the triangle is the one that tests this edge, which is what ownsEdge reads on the device.
+	PX_FORCE_INLINE bool ownsEdge(PxU32 triangleIndex, PxU32 localEdge) const
+	{
+		return (getEdgeOwnershipBits(triangleIndex) & (1u << localEdge)) != 0;
+	}
+
+	// Unpacks the three edge ownership bits for a given triangle.
+	PX_FORCE_INLINE PxU32 getEdgeOwnershipBits(PxU32 triangleIndex) const
+	{
+		return (mEdgeOwnershipNibbles[triangleIndex >> 1] >> (4 * (triangleIndex & 1))) & 7;
+	}
+
+	PX_FORCE_INLINE PxArray<uint2>& getTrianglePairTriangleIndices() { return mTrianglePairTriangleIndices; }
+	PX_FORCE_INLINE PxArray<uint4>& getTrianglePairVertexIndices() { return mTrianglePairVertexIndices; }
+	PX_FORCE_INLINE PxU32 getNbTrianglePairs() const
+	{
+		PX_ASSERT(mTrianglePairTriangleIndices.size() == mTrianglePairVertexIndices.size());
+		return mTrianglePairTriangleIndices.size();
+	}
+
+  private:
+	PxArray<uint2> mTrianglePairTriangleIndices;
+	PxArray<uint4> mTrianglePairVertexIndices;
+
+	// The edge ownership alone, one nibble per triangle, which is all the element filters need and all
+	// that outlives the upload.
+	PxArray<PxU8> mEdgeOwnershipNibbles;
+};
 
 struct PxgFEMClothData
 {
@@ -72,7 +90,7 @@ class PxgFEMCloth
   public:
 
 	// to deallocate the host mirror. Make sure you pass in the right allocator!
-	void deallocate(PxsHeapMemoryAllocator* allocator);
+	void deallocate(Cm::VirtualAllocatorCallback& hostAlloc);
 
 	void* mTriMeshData;
 
@@ -87,8 +105,10 @@ class PxgFEMCloth
 	float* mDynamicFrictions; // dynamic friction per vertex
 	PxU16* mMaterialIndices;
 
-	PxU32* mTrianglesWithActiveEdges;
-	uint4* mTriangleVertexIndices;
+	PxU32* mTrianglesWithOwnedEdges;
+
+	// The w component holds the three edge owning bits. See ownsEdge in deformableCollision.cuh.
+	uint4* mTriangleVertexIndices_ownedEdges;
 	uint4* mOrderedNonSharedTriangleVertexIndices_triIndex;
 	float2* mOrderedSharedTriangleLambdas; // Two lambdas per triangle: ARAP, area
 	float2* mOrderedNonSharedTriangleLambdas; // Two lambdas per triangle: ARAP, area
@@ -132,15 +152,29 @@ class PxgFEMCloth
 	PxU32* mSharedTriPairAccumulatedPartitionsCP;
 	PxU32* mNonSharedTriPairAccumulatedPartitionsCP;
 
-	float4* mDeltaPos; // Initialize to zero and zero every time in the apply delta kernel
+	// Per-iteration solve scratch, the cloth analog of PxgSoftBody::mSimDelta
+	// despite the name. The solves scatter their deltas into .xyz and the
+	// count+prep kernels put the mass-splitting refCount into .w. Every iteration
+	// cloth_applyExternalDeltasLaunch consumes and zeroes it, updating
+	// mVelocity_InvMass always and mPosition_InvMass plus mAccumulatedDeltaPos in
+	// position iterations only.
+	float4* mDeltaPos;
+
+	// Accumulated position delta since step start (integration plus constraint
+	// corrections). Advances in position iterations only and stays frozen through
+	// velocity iterations. The contact solves read it for computing the separation.
 	float4* mAccumulatedDeltaPos;
 	float4* mAccumulatedDeltaVel; // Used for damping
 
 	PxBounds3* mPackedNodeBounds;
 
-	// For cloth-rigid contact preparation.
-	PxgFemRigidConstraintBlock* mRigidConstraints; // ((numVerts + 31) / 32) * maxNumContactPerVertex *
-												   // sizeof(PxgFemRigidConstraintBlock)
+	// Element filter pairs of this surface, one sorted array per pair type. The type order of each
+	// pair matches the type order expected by the find helpers in deformableElementFilter.cuh. The
+	// pointers are grouped ahead of the counts to keep the struct free of interior padding.
+	PxgDeformablePairInfo* mRigidSurfaceFilterPairs;
+	PxgDeformablePairInfo* mSurfaceSurfaceFilterPairs;
+	PxU32 mNumRigidSurfaceFilterPairs;
+	PxU32 mNumSurfaceSurfaceFilterPairs;
 
 	PxReal mLinearDamping;
 	PxReal mMaxLinearVelocity;
@@ -154,7 +188,7 @@ class PxgFEMCloth
 	PxU32 mNbVerts;
 	PxU32 mNbTriangles;
 	PxU32 mNbNonSharedTriangles;
-	PxU32 mNbTrianglesWithActiveEdges;
+	PxU32 mNbTrianglesWithOwnedEdges;
 
 	PxU32 mNbTrianglePairs;
 	PxU32 mNbSharedTrianglePairs;
@@ -179,7 +213,7 @@ class PxgFEMCloth
 	PxU16 mSurfaceFlags;
 
 	PxU32 mIsActive;
-	PxReal mRestDistance;
+	PxReal mRestOffset;
 	PxReal mOriginalContactOffset;
 
 	PxU32 mNbCollisionPairUpdatesPerTimestep;
@@ -191,123 +225,17 @@ class PxgFEMCloth
 #pragma warning(pop)
 #endif
 
-class PxgFEMClothBuffer : public PxUserAllocated
-{
-  public:
-	PxgFEMClothBuffer(PxgHeapMemoryAllocatorManager* heapMemoryManager);
-
-	PxgCudaBuffer triangleMeshData;
-
-	PxgTypedCudaBuffer<float4> deltaPos;
-	PxgTypedCudaBuffer<float4> accumulatedDeltaPos;
-	PxgTypedCudaBuffer<float4> accumulatedDeltaVel; // Used for damping
-
-	PxgTypedCudaBuffer<float4> prevPositionInContactOffset; // After contact pairs are updated, cloth vertices have moved by
-															// mPosition_InvMass - mPrevPositionInContactOffset.
-	PxgTypedCudaBuffer<float4> prevPositionInRestOffset;	// After cloth-cloth distance is measured, cloth vertices have moved by
-															// mPosition_InvMass - mPrevPositionInRestOffset.
-
-
-	PxgTypedCudaBuffer<PxU16> materialIndices;
-	PxgTypedCudaBuffer<float> dynamicfrictions;
-
-	PxgTypedCudaBuffer<PxU32> trianglesWithActiveEdges;
-	PxgTypedCudaBuffer<uint4> triangleVertexIndices;
-	PxgTypedCudaBuffer<uint4> orderedNonSharedTriangleVertexIndices_triIndex;
-
-	PxgTypedCudaBuffer<float2> orderedSharedTriangleLambdas;
-	PxgTypedCudaBuffer<float2> orderedNonSharedTriangleLambdas;
-	
-	PxgTypedCudaBuffer<float4> orderedNonSharedTriangleRestPoseInv;
-
-	PxgTypedCudaBuffer<uint4> orderedSharedTrianglePairVertexIndices;
-	PxgTypedCudaBuffer<uint4> orderedNonSharedTrianglePairVertexIndices;
-	
-	PxgTypedCudaBuffer<float4> orderedSharedRestBendingAngle_flexuralStiffness_damping;
-	PxgTypedCudaBuffer<float4> orderedNonSharedRestBendingAngle_flexuralStiffness_damping;
-
-	PxgTypedCudaBuffer<float4> orderedSharedRestEdge0_edge1;
-	PxgTypedCudaBuffer<float4> orderedSharedRestEdgeLength_material0_material1;
-
-	PxgTypedCudaBuffer<float> sharedBendingLambdas;
-	PxgTypedCudaBuffer<float> nonSharedBendingLambdas;
-
-	PxgTypedCudaBuffer<float4> position_InvMassCP;
-
-	PxgTypedCudaBuffer<PxU32> nonSharedTriAccumulatedPartitionsCP;
-
-	PxgTypedCudaBuffer<PxU32> sharedTriPairRemapOutputCP;
-	PxgTypedCudaBuffer<PxU32> nonSharedTriPairRemapOutputCP;
-
-	PxgTypedCudaBuffer<PxU32> sharedTriPairAccumulatedCopiesCP;
-	PxgTypedCudaBuffer<PxU32> nonSharedTriPairAccumulatedCopiesCP;
-
-	PxgTypedCudaBuffer<PxU32> sharedTriPairAccumulatedPartitionsCP;
-	PxgTypedCudaBuffer<PxU32> nonSharedTriPairAccumulatedPartitionsCP;
-
-	PxgTypedCudaBuffer<PxBounds3> packedNodeBounds; // for refit
-
-	PxgTypedCudaBuffer<PxU32> numPenetratedTets;
-};
-
-struct EdgeEncoding
-{
-	// TYPE0 layout (lower 16 bits)
-	static constexpr PxU32 TYPE0_EDGE_BASE_POS = 0; // Edge presence bits: 0-2
-
-	static constexpr PxU32 TYPE0_AUTH_COUNT_POS = 3;  // bits 3-4
-	static constexpr PxU32 TYPE0_FIRST_EDGE_POS = 5;  // bits 5-6
-	static constexpr PxU32 TYPE0_SECOND_EDGE_POS = 7; // bits 7-8
-	static constexpr PxU32 TYPE0_THIRD_EDGE_POS = 9;  // bits 9-10
-
-	static constexpr PxU32 TYPE0_VERTEX0_ACTIVE_POS = 11;
-	static constexpr PxU32 TYPE0_VERTEX1_ACTIVE_POS = 12;
-	static constexpr PxU32 TYPE0_VERTEX2_ACTIVE_POS = 13;
-
-	// TYPE1 layout (upper 16 bits)
-	static constexpr PxU32 TYPE1_EDGE_BASE_POS = 16; // edge presence: bits 16-18
-
-	static constexpr PxU32 TYPE1_AUTH_COUNT_POS = 19;  // bits 19-20
-	static constexpr PxU32 TYPE1_FIRST_EDGE_POS = 21;  // bits 21-22
-	static constexpr PxU32 TYPE1_SECOND_EDGE_POS = 23; // bits 23-24
-	static constexpr PxU32 TYPE1_THIRD_EDGE_POS = 25;  // bits 25-26
-
-	static constexpr PxU32 TYPE1_VERTEX0_ACTIVE_POS = 27;
-	static constexpr PxU32 TYPE1_VERTEX1_ACTIVE_POS = 28;
-	static constexpr PxU32 TYPE1_VERTEX2_ACTIVE_POS = 29;
-};
-
-struct EdgeEncodingMask
-{
-	// Type0: minimal triangle set covering all edges and vertices (compact encoding)
-	static constexpr PxU32 TYPE0_AUTH_COUNT_MASK = 0x3 << EdgeEncoding::TYPE0_AUTH_COUNT_POS;
-	static constexpr PxU32 TYPE0_FIRST_EDGE_MASK = 0x3 << EdgeEncoding::TYPE0_FIRST_EDGE_POS;
-	static constexpr PxU32 TYPE0_SECOND_EDGE_MASK = 0x3 << EdgeEncoding::TYPE0_SECOND_EDGE_POS;
-	static constexpr PxU32 TYPE0_THIRD_EDGE_MASK = 0x3 << EdgeEncoding::TYPE0_THIRD_EDGE_POS;
-
-	static constexpr PxU32 TYPE0_VERTEX0_ACTIVE_MASK = 1U << EdgeEncoding::TYPE0_VERTEX0_ACTIVE_POS;
-	static constexpr PxU32 TYPE0_VERTEX1_ACTIVE_MASK = 1U << EdgeEncoding::TYPE0_VERTEX1_ACTIVE_POS;
-	static constexpr PxU32 TYPE0_VERTEX2_ACTIVE_MASK = 1U << EdgeEncoding::TYPE0_VERTEX2_ACTIVE_POS;
-
-	// Type1: more balanced distribution of edges and vertices across triangles (balanced encoding)
-	static constexpr PxU32 TYPE1_FIRST_EDGE_MASK = 0x3 << EdgeEncoding::TYPE1_FIRST_EDGE_POS;
-	static constexpr PxU32 TYPE1_SECOND_EDGE_MASK = 0x3 << EdgeEncoding::TYPE1_SECOND_EDGE_POS;
-	static constexpr PxU32 TYPE1_THIRD_EDGE_MASK = 0x3 << EdgeEncoding::TYPE1_THIRD_EDGE_POS;
-
-	static constexpr PxU32 TYPE1_VERTEX0_ACTIVE_MASK = 1U << EdgeEncoding::TYPE1_VERTEX0_ACTIVE_POS;
-	static constexpr PxU32 TYPE1_VERTEX1_ACTIVE_MASK = 1U << EdgeEncoding::TYPE1_VERTEX1_ACTIVE_POS;
-	static constexpr PxU32 TYPE1_VERTEX2_ACTIVE_MASK = 1U << EdgeEncoding::TYPE1_VERTEX2_ACTIVE_POS;
-};
-
 class PxgFEMClothUtil
 {
   public:
 	static PxU32 computeTriangleMeshByteSize(const Gu::TriangleMesh* triangleMesh);
 	static PxU32 loadOutTriangleMesh(void* mem, const Gu::TriangleMesh* triangleMesh);
-	static PxU32 initialTriangleData(PxgFEMCloth& femCloth, PxArray<uint2>& trianglePairTriangleIndices,
-									 PxArray<uint4>& trianglePairVertexIndices, const Gu::TriangleMesh* triangleMesh,
+
+	static PxU32 initialTriangleData(PxgFEMCloth& femCloth, const Gu::TriangleMesh* triangleMesh,
+									 const PxgDeformableSurfaceTopology& topology,
 									 const PxU16* materialHandles, PxsDeformableSurfaceMaterialData* materials, const PxU32 nbMaterials,
-									 PxsHeapMemoryAllocator* alloc);
+									 Cm::VirtualAllocatorCallback& hostAlloc);
+
 	static void categorizeClothConstraints(PxArray<PxU32>& sharedTrianglePairs, PxArray<PxU32>& nonSharedTriangles,
 										   PxArray<PxU32>& nonSharedTrianglePairs, PxgFEMCloth& femCloth,
 										   const PxArray<uint2>& trianglePairTriangleIndices);

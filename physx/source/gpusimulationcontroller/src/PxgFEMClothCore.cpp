@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgFEMClothCore.h"
 #include "CudaKernelWrangler.h"
@@ -54,6 +31,7 @@
 #include "foundation/PxAssert.h"
 
 #include "PxDeformableSurfaceFlag.h"
+#include "PxgCudaHelpers.h"
 
 #define CLOTH_GPU_DEBUG 0
 
@@ -75,11 +53,20 @@ namespace physx
 
 	PxgFEMClothCore::PxgFEMClothCore(PxgCudaKernelWranglerManager* gpuKernelWrangler,
 									 PxCudaContextManager* cudaContextManager,
-									 PxgHeapMemoryAllocatorManager* heapMemoryManager, PxgSimulationController* simController,
+									 PxgAllocatorDesc& allocDesc, PxgSimulationController* simController,
 									 PxgGpuContext* gpuContext, PxU32 maxContacts, const PxU32 collisionStackSize, bool isTGS)
-	: PxgFEMCore(gpuKernelWrangler, cudaContextManager, heapMemoryManager, simController, gpuContext, maxContacts, collisionStackSize,
+	: PxgFEMCore(gpuKernelWrangler, cudaContextManager, allocDesc, simController, gpuContext, maxContacts, collisionStackSize,
 				 isTGS, PxsHeapStats::eSHARED_FEMCLOTH), 
-		mUpdateClothContactPairs(heapMemoryManager, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceVTContactInfoBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceVTContactCountBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceVTPrevContactCountPinned(allocDesc.hostAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceEEContactInfoBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceEEContactCountBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSurfaceSurfaceEEPrevContactCountPinned(allocDesc.hostAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mUpdateClothContactPairs(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_FEMCLOTH),
+		mSolveRigidEvent(NULL),
+		mConstraintPrepParticleEvent(NULL),
+		mSolveParticleEvent(NULL),
 		mPostSolveCallback(NULL)
 	{
 		mCudaContextManager->acquireContext();
@@ -92,10 +79,13 @@ namespace physx
 
 		mUpdateClothContactPairs.allocate(sizeof(PxU8), PX_FL);
 
-		// Currently unused.
-		//mFemConstraintBuf.allocate(((maxContacts + 31) / 32) * sizeof(PxgClothConstraintBlock), PX_FL);
+		mSurfaceSurfaceVTContactInfoBuffer.allocateElements(maxContacts, PX_FL);
+		mSurfaceSurfaceEEContactInfoBuffer.allocateElements(maxContacts, PX_FL);
+		mSurfaceSurfaceVTContactCountBuffer.allocateElements(1, PX_FL);
+		mSurfaceSurfaceEEContactCountBuffer.allocateElements(1, PX_FL);
+		mSurfaceSurfaceVTPrevContactCountPinned.get() = 0;
+		mSurfaceSurfaceEEPrevContactCountPinned.get() = 0;
 
-		mCudaContext->eventCreate(&mBoundUpdateEvent, CU_EVENT_DISABLE_TIMING);
 		mCudaContext->eventCreate(&mSolveRigidEvent, CU_EVENT_DISABLE_TIMING);
 		mCudaContext->eventCreate(&mConstraintPrepParticleEvent, CU_EVENT_DISABLE_TIMING);
 		mCudaContext->eventCreate(&mSolveParticleEvent, CU_EVENT_DISABLE_TIMING);
@@ -103,13 +93,19 @@ namespace physx
 		mCudaContextManager->releaseContext();
 	}
 
+	void PxgFEMClothCore::copyContactCountsToHost()
+	{
+		copyRigidAndParticleContactCountsToHost();
+
+		PxgCudaHelpers::copyDToHAsync(*mCudaContextManager->getCudaContext(), mSurfaceSurfaceVTPrevContactCountPinned.data(),
+			reinterpret_cast<PxU32*>(mSurfaceSurfaceVTContactCountBuffer.getDevicePtr()), 1, mStream);
+		PxgCudaHelpers::copyDToHAsync(*mCudaContextManager->getCudaContext(), mSurfaceSurfaceEEPrevContactCountPinned.data(),
+			reinterpret_cast<PxU32*>(mSurfaceSurfaceEEContactCountBuffer.getDevicePtr()), 1, mStream);
+	}
+
 	PxgFEMClothCore::~PxgFEMClothCore()
 	{
 		mCudaContextManager->acquireContext();
-
-		// destroy stream
-		mCudaContext->eventDestroy(mBoundUpdateEvent);
-		mBoundUpdateEvent = NULL;
 
 		mCudaContext->eventDestroy(mSolveRigidEvent);
 		mSolveRigidEvent = NULL;
@@ -155,19 +151,19 @@ namespace physx
 			const bool externalForcesEveryTgsIterationEnabled = mGpuContext->isExternalForcesEveryTgsIterationEnabled() && mGpuContext->isTGS();
 
 			PxgSimulationCore* core = mSimController->getSimulationCore();
-			const PxU32 maxNbCollisionPairUpdatesPerTimestep = core->getMaxNbCollisionPairUpdatesPerTimestep();
+			const PxU32 nbCollisionPairUpdatesPerTimestep = mIsTGS ? core->getMaxNbCollisionPairUpdatesPerTimestep() : 1;
 
-			// If maxNbCollisionPairUpdatesPerTimestep is zero, update collision pairs adaptively and automatically. Otherwise, update them
-			// maxNbCollisionPairUpdatesPerTimestep times per time step.
-			const bool adaptiveCollisionPairUpdate = maxNbCollisionPairUpdatesPerTimestep == 0u;
+			// If nbCollisionPairUpdatesPerTimestep is zero, update collision pairs adaptively and automatically. 
+			// Otherwise, update the contact pairs "nbCollisionPairUpdatesPerTimestep" times per time step.
+			const bool adaptiveCollisionPairUpdate = nbCollisionPairUpdatesPerTimestep == 0;
 
 			PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
 			
-			PxgDevicePointer<PxU32> VTContactCountsd = mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> EEContactCountsd = mEEContactCountBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> VTContactCountsd = mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> EEContactCountsd = mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 
 			CUfunction preIntegrateKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_PREINTEGRATION);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_PREINTEGRATION);
 
 			const PxU32 numThreadsPerWarp = 32;
 			const PxU32 numWarpsPerBlock = PxgFEMClothKernelBlockDim::CLOTH_PREINTEGRATION / numThreadsPerWarp;
@@ -204,7 +200,7 @@ namespace physx
 		}
 	}
 
-	void PxgFEMClothCore::prepRigidAttachmentConstraints(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgConstraintPrepareDesc> prepDescd, PxReal /*invDt*/,
+	void PxgFEMClothCore::prepRigidAttachmentBlocks(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgConstraintPrepareDesc> prepDescd, PxReal /*invDt*/,
 		PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd, CUstream stream)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
@@ -214,23 +210,25 @@ namespace physx
 		if(nbRigidAttachments)
 		{
 			PxgDevicePointer<PxgFEMCloth> clothesd = simCore->getFEMClothBuffer().getTypedDevicePtr();
-			PxgDevicePointer<PxgFEMRigidAttachment> rigidAttachments = simCore->getRigidClothAttachments();
+			PxgDevicePointer<PxgDeformableAttachment> rigidAttachments = simCore->getRigidClothAttachments();
 			PxgDevicePointer<PxU32> activeRigidAttachments = simCore->getActiveRigidClothAttachments();
-			PxgDevicePointer<PxgFEMRigidAttachmentConstraint> constraintsd = simCore->getClothRigidConstraints();
+			PxgDevicePointer<PxU32> rigidAttachmentRigidRefCounts = simCore->getRigidClothAttachmentRigidRefCounts();
+			PxgDevicePointer<PxgRigidDbAttachmentBlock> attachmentBlocksd = simCore->getClothRigidAttachmentBlocks();
 			PxgDevicePointer<PxNodeIndex> rigidAttachmentIds = simCore->getClothRigidAttachmentIds();
 			PxgDevicePointer<float4> deltaVd = mRigidDeltaVelBuf.getTypedDevicePtr();
 			PX_ASSERT(simCore->getNbActiveRigidClothAttachments() * 2 <= mRigidDeltaVelBuf.getNbElements());
 
 			// prepare primitive constraints sorted by particle id
 			{
-				const CUfunction prepAttachmentKernelFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+				const CUfunction prepAttachmentKernelFunction = mGpuKernelWranglerManager->getCuFunction(
 					PxgKernelIds::CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP);
 				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd),
 													 PX_CUDA_KERNEL_PARAM(rigidAttachments),
 													 PX_CUDA_KERNEL_PARAM(activeRigidAttachments),
+													 PX_CUDA_KERNEL_PARAM(rigidAttachmentRigidRefCounts),
 													 PX_CUDA_KERNEL_PARAM(rigidAttachmentIds),
 													 PX_CUDA_KERNEL_PARAM(nbRigidAttachments),
-													 PX_CUDA_KERNEL_PARAM(constraintsd),
+													 PX_CUDA_KERNEL_PARAM(attachmentBlocksd),
 													 PX_CUDA_KERNEL_PARAM(prePrepDescd),
 													 PX_CUDA_KERNEL_PARAM(prepDescd),
 													 PX_CUDA_KERNEL_PARAM(sharedDescd),
@@ -255,28 +253,28 @@ namespace physx
 		}
 	}
 
-	void PxgFEMClothCore::prepClothAttachmentConstraints(CUstream stream)
+	void PxgFEMClothCore::prepClothAttachmentBlocks(CUstream stream)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
 		const PxU32 nbClothAttachments = simCore->getNbActiveClothClothAttachments();
 
 		if(nbClothAttachments)
 		{
-			PxgDevicePointer<PxgFEMFEMAttachment> clothAttachments = simCore->getClothClothAttachments();
+			PxgDevicePointer<PxgDeformableAttachment> clothAttachments = simCore->getClothClothAttachments();
 			PxgDevicePointer<PxU32> activeClothAttachments = simCore->getActiveClothClothAttachments();
-			PxgDevicePointer<PxgFEMFEMAttachmentConstraint> constraintsd = simCore->getClothClothConstraints();
+			PxgDevicePointer<PxgDbDbAttachmentBlock> attachmentBlocksd = simCore->getClothClothAttachmentBlocks();
 			// PxgDevicePointer<float4> clothesd = simCore->getFEMClothBuffer().getTypedDevicePtr();
 			// PxgDevicePointer<PxU32> clothAttachmentIds = simCore->getClothClothAttachmentIds();
 
 			// prepare primitive constraints sorted by particle id
 			{
-				const CUfunction prepAttachmentKernelFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+				const CUfunction prepAttachmentKernelFunction = mGpuKernelWranglerManager->getCuFunction(
 					PxgKernelIds::FEM_ATTACHMENT_CONSTRAINT_PREP);
 
 				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothAttachments),
 													 PX_CUDA_KERNEL_PARAM(activeClothAttachments),
 													 PX_CUDA_KERNEL_PARAM(nbClothAttachments),
-													 PX_CUDA_KERNEL_PARAM(constraintsd) };
+													 PX_CUDA_KERNEL_PARAM(attachmentBlocksd) };
 
 				const PxU32 numThreadsPerBlock = PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION;
 				const PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_UPDATEROTATION;
@@ -297,7 +295,7 @@ namespace physx
 		}
 	}
 
-	void PxgFEMClothCore::prepRigidContactConstraint(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgConstraintPrepareDesc> prepDescd, PxReal invDt,
+	void PxgFEMClothCore::prepRigidContactBlocks(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgConstraintPrepareDesc> prepDescd, PxReal invDt,
 													 PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd, CUstream solverStream, PxU32 numSolverBodies, PxU32 numArticulations)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
@@ -305,30 +303,33 @@ namespace physx
 
 		// prepare rigid body vs cloth contacts
 		{
-			PxgDevicePointer<float4> contactsd = mRigidSortedContactPointBuf.getTypedDevicePtr();
-			PxgDevicePointer<float4> normalpensd = mRigidSortedContactNormalPenBuf.getTypedDevicePtr();
-			PxgDevicePointer<float4> barycentricsd = mRigidSortedContactBarycentricBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mRigidSortedContactInfoBuf.getTypedDevicePtr();
+			PxgDevicePointer<float4> contactsd = mRigidDeformableSortedContactPointBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> normalpensd = mRigidDeformableSortedContactNormalPenBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> barycentricsd = mRigidDeformableSortedContactBarycentricBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mRigidDeformableSortedContactInfoBuffer.getTypedDevicePtr();
 
-			PxgDevicePointer<PxU32> totalContactCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> totalContactCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
 
-			PxgDevicePointer<PxgFemRigidConstraintBlock> constraintsd = mRigidConstraintBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxgRigidDbContactBlock> contactBlocksd = mRigidDeformableContactBlocks.getTypedDevicePtr();
 
-			PxgDevicePointer<PxReal> rigidLambdaNs = mRigidFEMAppliedForcesBuf.getTypedDevicePtr();
+			PxgDevicePointer<float2> rigidLambdaNs = mRigidDeformableAppliedForcesBuffer.getTypedDevicePtr();
 
-			// Allocating femRigidContactCount based on the size of rigid bodies plus articulations.
-			if (mFemRigidReferenceCount.getNbElements() != numSolverBodies + numArticulations)
+			// Per-link buckets for articulations.
+			const PxU32 maxLinksPerArti = mSimController->getSimulationCore()->getMaxArticulationLinks();
+			const PxU32 femRefCountElems = numSolverBodies + numArticulations * maxLinksPerArti;
+			if (mRigidDeformableRefCountBuffer.getNbElements() != femRefCountElems)
 			{
-				mFemRigidReferenceCount.allocateElements(numSolverBodies + numArticulations, PX_FL);
+				mRigidDeformableRefCountBuffer.allocateElements(femRefCountElems, PX_FL);
 			}
 
 			const CUfunction rigidContactPrepKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_RIGID_CONTACTPREPARE);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_RIGID_CONTACTPREPARE);
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd),	  PX_CUDA_KERNEL_PARAM(contactsd),
 												 PX_CUDA_KERNEL_PARAM(normalpensd),	  PX_CUDA_KERNEL_PARAM(barycentricsd),
-												 PX_CUDA_KERNEL_PARAM(contactInfosd), PX_CUDA_KERNEL_PARAM(totalContactCountsd),
-												 PX_CUDA_KERNEL_PARAM(constraintsd),  PX_CUDA_KERNEL_PARAM(prePrepDescd),
+												 PX_CUDA_KERNEL_PARAM(contactInfosd),
+												 PX_CUDA_KERNEL_PARAM(totalContactCountsd),
+												 PX_CUDA_KERNEL_PARAM(contactBlocksd),  PX_CUDA_KERNEL_PARAM(prePrepDescd),
 												 PX_CUDA_KERNEL_PARAM(prepDescd),	  PX_CUDA_KERNEL_PARAM(rigidLambdaNs),
 												 PX_CUDA_KERNEL_PARAM(invDt),		  PX_CUDA_KERNEL_PARAM(sharedDescd),
 												 PX_CUDA_KERNEL_PARAM(mIsTGS) };
@@ -352,8 +353,8 @@ namespace physx
 		}
 	}
 
-	// prepare soft body vs particle system contact constraints
-	void PxgFEMClothCore::prepClothParticleConstraint()
+	// prepare cloth vs particle system contact constraints
+	void PxgFEMClothCore::prepClothParticleBlocks()
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
 		PxgDevicePointer<PxgFEMCloth> clothsd = simCore->getFEMClothBuffer().getTypedDevicePtr();
@@ -364,19 +365,19 @@ namespace physx
 		{
 			CUdeviceptr particlesystemsd = particleCore->getParticleSystemBuffer().getDevicePtr();
 
-			PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mParticleSortedContactInfoBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> totalContactCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mParticleDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> totalContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 
 			{
-				PxgDevicePointer<float4> contactsd = mParticleSortedContactPointBuffer.getTypedDevicePtr();
-				PxgDevicePointer<float4> normalpensd = mParticleSortedContactNormalPenBuffer.getTypedDevicePtr();
-				PxgDevicePointer<float4> barycentricd = mParticleSortedContactBarycentricBuffer.getTypedDevicePtr();
+				PxgDevicePointer<float4> contactsd = mParticleDeformableSortedContactPointBuffer.getTypedDevicePtr();
+				PxgDevicePointer<float4> normalpensd = mParticleDeformableSortedContactNormalPenBuffer.getTypedDevicePtr();
+				PxgDevicePointer<float4> barycentricd = mParticleDeformableSortedContactBarycentricBuffer.getTypedDevicePtr();
 
-				PxgDevicePointer<PxgFEMParticleConstraintBlock> constraintsd = mParticleConstraintBuf.getTypedDevicePtr();
-				PxgDevicePointer<float4> clothAppliedForced = mParticleAppliedFEMForcesBuf.getTypedDevicePtr();
-				PxgDevicePointer<float4> particleAppliedForced = mParticleAppliedParticleForcesBuf.getTypedDevicePtr();
+				PxgDevicePointer<PxgParticleDbContactBlock> contactBlocksd = mParticleDeformableContactBlocks.getTypedDevicePtr();
+				PxgDevicePointer<float2> clothAppliedForced = mParticleDeformableAppliedDeformableForcesBuffer.getTypedDevicePtr();
+				PxgDevicePointer<float2> particleAppliedForced = mParticleDeformableAppliedParticleForcesBuffer.getTypedDevicePtr();
 
-				const CUfunction femContactPrepKernelFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+				const CUfunction femContactPrepKernelFunction = mGpuKernelWranglerManager->getCuFunction(
 					PxgKernelIds::CLOTH_PARTICLE_CONTACTPREPARE);
 
 				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothsd),
@@ -386,7 +387,7 @@ namespace physx
 													 PX_CUDA_KERNEL_PARAM(barycentricd),
 													 PX_CUDA_KERNEL_PARAM(contactInfosd),
 													 PX_CUDA_KERNEL_PARAM(totalContactCountsd),
-													 PX_CUDA_KERNEL_PARAM(constraintsd),
+													 PX_CUDA_KERNEL_PARAM(contactBlocksd),
 													 PX_CUDA_KERNEL_PARAM(clothAppliedForced),
 													 PX_CUDA_KERNEL_PARAM(particleAppliedForced) };
 
@@ -416,13 +417,13 @@ namespace physx
 				PxgDevicePointer<PxU32> blockOffsetd = mTempBlockCellsHistogramBuf.getTypedDevicePtr();
 				CUdeviceptr offsetd = mTempCellsHistogramBuf.getDevicePtr();
 				PxgDevicePointer<PxU32> pairCountd = mTempHistogramCountBuf.getTypedDevicePtr();
-				PxgDevicePointer<PxU32> startd = mTempContactBuf.getTypedDevicePtr();
-				PxgDevicePointer<PxU32> endd = mTempContactRemapBuf.getTypedDevicePtr();
+				PxgDevicePointer<PxU32> startd = mTempContactBuffer.getTypedDevicePtr();
+				PxgDevicePointer<PxU32> endd = mTempContactRemapBuffer.getTypedDevicePtr();
 
 				// compute blockOffset and offset array for particle
 				{
 					const CUfunction findStartEndFirstKernelFunction =
-						mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+						mGpuKernelWranglerManager->getCuFunction(
 							PxgKernelIds::PS_FIND_RANGESTARTEND_FEM_FIRST);
 
 					PxCudaKernelParam kernelParams[] = {
@@ -452,11 +453,12 @@ namespace physx
 				// compute start and end range for particle
 				{
 					const CUfunction findStartEndSecondKernelFunction =
-						mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+						mGpuKernelWranglerManager->getCuFunction(
 							PxgKernelIds::PS_RANGESTARTEND_FEM_SECONE);
 
 					PxCudaKernelParam kernelParams[] = {
-						PX_CUDA_KERNEL_PARAM(contactInfosd), PX_CUDA_KERNEL_PARAM(totalContactCountsd),
+						PX_CUDA_KERNEL_PARAM(contactInfosd),
+						PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 						PX_CUDA_KERNEL_PARAM(blockOffsetd),  PX_CUDA_KERNEL_PARAM(offsetd),
 						PX_CUDA_KERNEL_PARAM(pairCountd),    PX_CUDA_KERNEL_PARAM(startd),
 						PX_CUDA_KERNEL_PARAM(endd)
@@ -483,21 +485,21 @@ namespace physx
 		mCudaContext->eventRecord(mConstraintPrepParticleEvent, mStream);
 	}
 
-	void PxgFEMClothCore::prepClothContactConstraint(bool isVT)
+	void PxgFEMClothCore::prepClothContactBlocks(bool isVT)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
 		PxgDevicePointer<PxgFEMCloth> clothesd = simCore->getFEMClothBuffer().getTypedDevicePtr();
 		{
-			PxgDevicePointer<PxgFemFemContactInfo> contactInfosd =
-				isVT ? mVolumeContactOrVTContactInfoBuffer.getTypedDevicePtr() : mEEContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd =
+				isVT ? mSurfaceSurfaceVTContactInfoBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactInfoBuffer.getTypedDevicePtr();
 
 			PxgDevicePointer<PxU32> totalContactCountsd =
-				isVT ? mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr() : mEEContactCountBuffer.getTypedDevicePtr();
+				isVT ? mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 
 			PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
 
 			const CUfunction clothContactPrepKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_CLOTH_CONTACTPREPARE);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_CLOTH_CONTACTPREPARE);
 
 			PxgGpuNarrowphaseCore* npCore = mGpuContext->getNarrowphaseCore();
 			CUdeviceptr materials = npCore->mGpuFEMClothMaterialManager.mGpuMaterialBuffer.getDevicePtr();
@@ -538,7 +540,7 @@ namespace physx
 	{
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		CUdeviceptr femClothesd = core->getFEMClothBuffer().getDevicePtr();
-		CUdeviceptr activeFemClothesd = core->getActiveFEMClothBuffer().getDevicePtr();
+		CUdeviceptr activeFemClothsd = core->getActiveFEMClothBuffer().getDevicePtr();
 		PxgCudaBuffer& clothElementIndexBuffer = core->getFEMClothElementIndexBuffer();
 		PxU32* clothElementIndexsd = reinterpret_cast<PxU32*>(clothElementIndexBuffer.getDevicePtr());
 
@@ -555,13 +557,13 @@ namespace physx
 			static_cast<PxReal>(core->getMaxNbCollisionPairUpdatesPerTimestep());
 
 		const CUfunction refitBoundKernelFunction =
-			mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_REFIT_BOUND);
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_REFIT_BOUND);
 
 		if(numBlocks)
 		{
 			PxCudaKernelParam kernelParams[] = {
 				PX_CUDA_KERNEL_PARAM(femClothesd),
-				PX_CUDA_KERNEL_PARAM(activeFemClothesd),
+				PX_CUDA_KERNEL_PARAM(activeFemClothsd),
 				PX_CUDA_KERNEL_PARAM(nbActiveFEMCloths),
 				PX_CUDA_KERNEL_PARAM(contactDistd),
 				PX_CUDA_KERNEL_PARAM(speculativeCCDContactOffsetd),
@@ -590,11 +592,11 @@ namespace physx
 	void PxgFEMClothCore::resetClothVsNonclothContactCounts()
 	{
 		// total contact count for particle and cloth
-		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 		mCudaContext->memsetD32Async(totalParticleContactCountsd.mPtr, 0, 1, mStream);
 
 		// total contact count for rigid body and cloth
-		PxgDevicePointer<PxU32> totalRigidContactCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalRigidContactCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
 		mCudaContext->memsetD32Async(totalRigidContactCountsd.mPtr, 0, 1, mStream);
 
 		mCudaContext->memsetD32Async(mStackSizeNeededOnDevice.getDevicePtr(), 0, 1, mStream);
@@ -603,24 +605,26 @@ namespace physx
 	void PxgFEMClothCore::checkBufferOverflows()
 	{
 		PxU32 contactCountNeeded =
-			PxMax(*mParticleContactCountPrevTimestep,
-				  PxMax(*mRigidContactCountPrevTimestep, PxMax(*mVolumeContactorVTContactCountPrevTimestep, *mEEContactCountPrevTimestep)));
+			PxMax(mParticleDeformablePrevContactCountPinned.get(),
+				  PxMax(mRigidDeformablePrevContactCountPinned.get(),
+						PxMax(mSurfaceSurfaceVTPrevContactCountPinned.get(),
+							  mSurfaceSurfaceEEPrevContactCountPinned.get())));
 
 		if (contactCountNeeded >= mMaxContacts) 
 		{
 			PxGetFoundation().error(::physx::PxErrorCode::eINTERNAL_ERROR, PX_FL, "Deformable surface contact buffer overflow detected, please increase PxGpuDynamicsMemoryConfig::maxDeformableSurfaceContacts to at least %u\n", contactCountNeeded);
 		}
 
-		if (*mStackSizeNeededPinned > mCollisionStackSizeBytes)
+		if (mStackSizeNeededPinned.get() > mCollisionStackSizeBytes)
 		{
-			PxGetFoundation().error(::physx::PxErrorCode::eINTERNAL_ERROR, PX_FL, "PxGpuDynamicsMemoryConfig::collisionStackSize buffer overflow detected, please increase its size to at least %i in the scene desc! Contacts have been dropped.\n", *mStackSizeNeededPinned);
+			PxGetFoundation().error(::physx::PxErrorCode::eINTERNAL_ERROR, PX_FL, "PxGpuDynamicsMemoryConfig::collisionStackSize buffer overflow detected, please increase its size to at least %i in the scene desc! Contacts have been dropped.\n", mStackSizeNeededPinned.get());
 		}
 
 #if PX_ENABLE_SIM_STATS
 		mContactCountStats = PxMax(mContactCountStats, contactCountNeeded);
 		mGpuContext->getSimStats().mGpuDynamicsDeformableSurfaceContacts = mContactCountStats;
 
-		mCollisionStackSizeBytesStats = PxMax(*mStackSizeNeededPinned, mCollisionStackSizeBytesStats);
+		mCollisionStackSizeBytesStats = PxMax(mStackSizeNeededPinned.get(), mCollisionStackSizeBytesStats);
 		mGpuContext->getSimStats().mGpuDynamicsCollisionStackSize = PxMax(mCollisionStackSizeBytesStats, mGpuContext->getSimStats().mGpuDynamicsCollisionStackSize); // max because we also write this from other places.
 #else
 		PX_CATCH_UNDEFINED_ENABLE_SIM_STATS
@@ -630,8 +634,8 @@ namespace physx
 	void PxgFEMClothCore::updateClothContactPairValidity(bool forceUpdateClothContactPairs, bool adaptiveCollisionPairUpdate, PxReal dt)
 	{
 		PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> VTContactCountsd = mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> EEContactCountsd = mEEContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> VTContactCountsd = mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> EEContactCountsd = mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgCudaBuffer& femClothBuffer = core->getFEMClothBuffer();
@@ -644,7 +648,7 @@ namespace physx
 		// Update contact validity
 		{
 			CUfunction updateValidityKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY);
 
 			const PxU32 numBlocks = (maxClothVerts + PxgFEMClothKernelBlockDim::CLOTH_STEP - 1) / PxgFEMClothKernelBlockDim::CLOTH_STEP;
 
@@ -684,13 +688,11 @@ namespace physx
 		PxReal* contactDistd = reinterpret_cast<PxReal*>(mGpuContext->mGpuBp->getContactDistBuffer().getDevicePtr());
 		PxU32* activeClothesd = reinterpret_cast<PxU32*>(core->getActiveFEMClothBuffer().getDevicePtr());
 
-		PxgDevicePointer<PxgFemFemContactInfo> contactInfosd =
-			isVT ? mVolumeContactOrVTContactInfoBuffer.getTypedDevicePtr() : mEEContactInfoBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgDeformablePairInfo> contactInfosd =
+			isVT ? mSurfaceSurfaceVTContactInfoBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactInfoBuffer.getTypedDevicePtr();
 		PxgDevicePointer<PxU32> totalNumContactsd =
-			isVT ? mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr() : mEEContactCountBuffer.getTypedDevicePtr();
+			isVT ? mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 
-		PxgDevicePointer<PxgNonRigidFilterPair> pairs = core->getClothClothVertTriFilters();
-		const PxU32 nbPairs = core->getNbClothClothVertTriFilters();
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 
 		PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
@@ -698,18 +700,16 @@ namespace physx
 														  PX_CUDA_KERNEL_PARAM(activeClothesd),
 														  PX_CUDA_KERNEL_PARAM(contactDistd),
 														  PX_CUDA_KERNEL_PARAM(clothesd),
-														  PX_CUDA_KERNEL_PARAM(pairs),
-														  PX_CUDA_KERNEL_PARAM(nbPairs),
 														  PX_CUDA_KERNEL_PARAM(updateClothContactPairsd),
 														  PX_CUDA_KERNEL_PARAM(contactInfosd),
 														  PX_CUDA_KERNEL_PARAM(totalNumContactsd) };
 
 		{
 			CUfunction selfCollisionFunction =
-				isVT ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SELFCOLLISION_MIDPHASE_VT)
-					 : mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SELFCOLLISION_MIDPHASE_EE);
+				isVT ? mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SELFCOLLISION_MIDPHASE_VT)
+					 : mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SELFCOLLISION_MIDPHASE_EE);
 
-			const PxU32 maxClothTriangles = core->getMaxClothTrianglesWithActiveEdges();
+			const PxU32 maxClothTriangles = core->getMaxClothTrianglesWithOwnedEdges();
 			const PxU32 maxClothVerts = core->getMaxClothVerts();
 			const PxU32 numBlocks = isVT ? (maxClothVerts + numWarpsPerBlock - 1) / numWarpsPerBlock
 										 : (maxClothTriangles + numWarpsPerBlock - 1) / numWarpsPerBlock;
@@ -732,7 +732,7 @@ namespace physx
 
 	void PxgFEMClothCore::differentClothCollision(bool isVT)
 	{
-		GPU_BUCKET_ID::Enum type = GPU_BUCKET_ID::eFemClothes;
+		GPU_BUCKET_ID::Enum type = GPU_BUCKET_ID::eFemCloths;
 		PxgGpuNarrowphaseCore* npCore = mGpuContext->getNarrowphaseCore();
 		PxgContactManagers& managers = npCore->getExistingContactManagers(type);
 		PxgGpuContactManagers& gpuManagers = npCore->getExistingGpuContactManagers(type);
@@ -754,14 +754,13 @@ namespace physx
 
 			PxgSimulationCore* core = mSimController->getSimulationCore();
 			PxgDevicePointer<PxgFEMCloth> femClothesd = core->getFEMClothBuffer().getTypedDevicePtr();
-			PxgDevicePointer<PxgNonRigidFilterPair> filterVertTriPairs = core->getClothClothVertTriFilters();
-			const PxU32 nbFilterVertTriPairs = core->getNbClothClothVertTriFilters();
 
 			CUresult result;
-			PxgDevicePointer<PxgFemFemContactInfo> contactInfosd =
-				isVT ? mVolumeContactOrVTContactInfoBuffer.getTypedDevicePtr() : mEEContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd =
+				isVT ? mSurfaceSurfaceVTContactInfoBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactInfoBuffer.getTypedDevicePtr();
+
 			PxgDevicePointer<PxU32> totalNumCountsd =
-				isVT ? mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr() : mEEContactCountBuffer.getTypedDevicePtr();
+				isVT ? mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 
 			PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
 
@@ -772,8 +771,6 @@ namespace physx
 												 PX_CUDA_KERNEL_PARAM(contactDistanced),
 												 PX_CUDA_KERNEL_PARAM(gpuShapes),
 												 PX_CUDA_KERNEL_PARAM(femClothesd),
-												 PX_CUDA_KERNEL_PARAM(filterVertTriPairs),
-												 PX_CUDA_KERNEL_PARAM(nbFilterVertTriPairs),
 												 PX_CUDA_KERNEL_PARAM(updateClothContactPairsd),
 												 PX_CUDA_KERNEL_PARAM(contactInfosd),
 												 PX_CUDA_KERNEL_PARAM(totalNumCountsd) };
@@ -781,11 +778,11 @@ namespace physx
 			const PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 
 			{
-				CUfunction fcCollisionKernelFunction = isVT ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+				CUfunction fcCollisionKernelFunction = isVT ? mGpuKernelWranglerManager->getCuFunction(
 																  PxgKernelIds::CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_VT)
-															: mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+															: mGpuKernelWranglerManager->getCuFunction(
 																  PxgKernelIds::CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_EE);
-				const PxU32 maxClothTriangles = core->getMaxClothTrianglesWithActiveEdges();
+				const PxU32 maxClothTriangles = core->getMaxClothTrianglesWithOwnedEdges();
 				const PxU32 maxClothVerts = core->getMaxClothVerts();
 				const PxU32 numBlocks = isVT ? (2 * maxClothVerts + numWarpsPerBlock - 1) / numWarpsPerBlock
 											 : (maxClothTriangles + numWarpsPerBlock - 1) / numWarpsPerBlock;
@@ -812,9 +809,9 @@ namespace physx
 	void PxgFEMClothCore::clampContactCounts()
 	{
 		// AD: we might want to do this with one kernel for all cloths.
-		PxgDevicePointer<PxU32> totalFemNumCountsd = mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> totalRigidNumCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> totalParticleNumCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalFemNumCountsd = mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalRigidNumCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalParticleNumCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 
 		// This might exceed the max contact size, we need to clamp the contact count after contact gen
 		PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(totalFemNumCountsd),
@@ -823,7 +820,7 @@ namespace physx
 											 PX_CUDA_KERNEL_PARAM(mMaxContacts) };
 
 		CUfunction clampCountactCountFun =
-			mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLAMP_MAX_VALUES);
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLAMP_MAX_VALUES);
 
 		CUresult resultR = mCudaContext->launchKernel(clampCountactCountFun, 1, 1, 1, 1, 1, 1, 0, mStream, kernelParams,
 													  sizeof(kernelParams), 0, PX_FL);
@@ -837,14 +834,14 @@ namespace physx
 	#endif
 	}
 
-	void PxgFEMClothCore::sortContacts(PxU32 nbActiveFemClothes)
+	void PxgFEMClothCore::sortContacts(PxU32 nbActiveFemCloths)
 	{
 		clampContactCounts();
 
 		// we need 2x rsDesc on the host fem cloth. The reason for this is that, while the sorting occurs synchronously
 		// on the same stream on the device, the host-side buffers could get changed prior to the DMAs having occurred
 		// due to device latency
-		const PxU32 nbRequired = (nbActiveFemClothes) + 2u;
+		const PxU32 nbRequired = (nbActiveFemCloths) + 2u;
 		mRSDesc.resize(nbRequired * 2u);
 
 		mRadixCountTotalBuf.allocate(mRadixCountSize * nbRequired, PX_FL);
@@ -855,39 +852,39 @@ namespace physx
 		}
 
 		// total number of rigid vs fem cloth contacts
-		PxgDevicePointer<PxU32> totalRFContactCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalRFContactCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
 
 		// total number of particle vs fem cloth contacts
-		PxgDevicePointer<PxU32> totalPFContactCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalPFContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 
 		// sort contacts based on rigid id
-		PxgDevicePointer<PxU32> inputKeyd = mTempContactByRigidBitBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> inputRankd = mContactRemapSortedByRigidBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> outputKeyd = mTempContactBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> outputRankd = mTempContactRemapBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> inputKeyd = mTempContactByRigidBitBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> inputRankd = mContactRemapSortedByRigidBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> outputKeyd = mTempContactBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> outputRankd = mTempContactRemapBuffer.getTypedDevicePtr();
 
 		updateGPURadixSortBlockDesc(mStream, inputKeyd, inputRankd, outputKeyd, outputRankd,
 									mRadixCountTotalBuf.getDevicePtr(), totalRFContactCountsd,
-									&mRSDesc[2 * nbActiveFemClothes], mRadixSortDescBuf[0].getDevicePtr(),
+									&mRSDesc[2 * nbActiveFemCloths], mRadixSortDescBuf[0].getDevicePtr(),
 									mRadixSortDescBuf[1].getDevicePtr());
 
 		// sorted contacts based on particle id
-		PxgDevicePointer<PxU32> inputKeyd2 = mTempContactByParticleBitBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> inputRankd2 = mContactRemapSortedByParticleBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> outputKeyd2 = mTempContactBuf2.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> outputRankd2 = mTempContactRemapBuf2.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> inputKeyd2 = mTempContactByParticleBitBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> inputRankd2 = mContactRemapSortedByParticleBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> outputKeyd2 = mTempContactBuffer2.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> outputRankd2 = mTempContactRemapBuffer2.getTypedDevicePtr();
 
 		updateGPURadixSortBlockDesc(mStream, inputKeyd2, inputRankd2, outputKeyd2, outputRankd2,
 									mRadixCountTotalBuf.getDevicePtr() + mRadixCountSize, totalPFContactCountsd,
-									&mRSDesc[2 * nbActiveFemClothes + 2],
+									&mRSDesc[2 * nbActiveFemCloths + 2],
 									mRadixSortDescBuf[0].getDevicePtr() + sizeof(PxgRadixSortBlockDesc),
 									mRadixSortDescBuf[1].getDevicePtr() + sizeof(PxgRadixSortBlockDesc));
 
 		PxgCudaBuffer* radixSortDescBuf = mRadixSortDescBuf.begin();
 
-		CUfunction radixFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_MULTIBLOCK);
+		CUfunction radixFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_MULTIBLOCK);
 		CUfunction calculateRanksFunction =
-			mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_CALCULATERANKS_MULTIBLOCK);
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_CALCULATERANKS_MULTIBLOCK);
 
 		{
 			PxU32 startBit = 0;
@@ -924,15 +921,15 @@ namespace physx
 	#endif
 		}
 
-		PxgDevicePointer<PxNodeIndex> contactByRigidd = mContactByRigidBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxNodeIndex> contactByRigidd = mContactByRigidBuffer.getTypedDevicePtr();
 
 		{
 			// copy the higher 32 bit to the temp contact rigid index buffer
-			PxgDevicePointer<PxU32> tempContactByRigidd = mTempContactByRigidBitBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> rankd = mContactRemapSortedByRigidBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> tempContactByRigidd = mTempContactByRigidBitBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> rankd = mContactRemapSortedByRigidBuffer.getTypedDevicePtr();
 
 			CUfunction copyFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_COPY_HIGH_32BITS);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_COPY_HIGH_32BITS);
 
 			PxCudaKernelParam copyKernelParams[] = { PX_CUDA_KERNEL_PARAM(contactByRigidd),
 													 PX_CUDA_KERNEL_PARAM(tempContactByRigidd), PX_CUDA_KERNEL_PARAM(rankd),
@@ -982,41 +979,17 @@ namespace physx
 			}
 		}
 
-		{
-			// copy the original rigidId to the sorted buffer based on mContactRemapSortedByRigidBuf
-			PxgDevicePointer<PxNodeIndex> outContactByRigidd = mContactSortedByRigidBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> rankd = mContactRemapSortedByRigidBuf.getTypedDevicePtr();
-
-			CUfunction copyFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_COPY_VALUE);
-
-			PxCudaKernelParam copyKernelParams[] = { PX_CUDA_KERNEL_PARAM(contactByRigidd),
-													 PX_CUDA_KERNEL_PARAM(outContactByRigidd), PX_CUDA_KERNEL_PARAM(rankd),
-													 PX_CUDA_KERNEL_PARAM(totalRFContactCountsd) };
-
-			CUresult resultR = mCudaContext->launchKernel(copyFunction, 32, 1, 1, PxgRadixSortKernelBlockDim::RADIX_SORT, 1,
-														  1, 0, mStream, copyKernelParams, sizeof(copyKernelParams), 0, PX_FL);
-			if(resultR != CUDA_SUCCESS)
-				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU radixSortCopy fail to launch kernel!!\n");
-
-	#if CLOTH_GPU_DEBUG
-			resultR = mCudaContext->streamSynchronize(mStream);
-			if(resultR != CUDA_SUCCESS)
-				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU radixSortCopy fail!!\n");
-	#endif
-		}
-
 		reorderRigidContacts();
 
-		CUdeviceptr contactByParticled = mContactSortedByParticleBuf.getDevicePtr();
+		CUdeviceptr contactByParticled = mContactByParticleBuffer.getDevicePtr();
 
 		{
 			// copy the higher 32 bit to the team contact particle buffer
-			CUdeviceptr tempContactByParticled = mTempContactByParticleBitBuf.getDevicePtr();
-			CUdeviceptr rankd = mContactRemapSortedByParticleBuf.getDevicePtr();
+			CUdeviceptr tempContactByParticled = mTempContactByParticleBitBuffer.getDevicePtr();
+			CUdeviceptr rankd = mContactRemapSortedByParticleBuffer.getDevicePtr();
 
 			CUfunction copyFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_COPY_HIGH_32BITS);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_COPY_HIGH_32BITS);
 
 			PxCudaKernelParam copyKernelParams[] = { PX_CUDA_KERNEL_PARAM(contactByParticled),
 													 PX_CUDA_KERNEL_PARAM(tempContactByParticled),
@@ -1070,12 +1043,12 @@ namespace physx
 		}
 
 		{
-			// copy the original rigidId to the sorted buffer based on mContactRemapSortedByRigidBuf
-			CUdeviceptr outContactByParticled = mContactSortedByParticleBuf.getDevicePtr();
-			CUdeviceptr rankd = mContactRemapSortedByParticleBuf.getDevicePtr();
+			// reorder the particle keys in place by the rank from mContactRemapSortedByParticleBuffer
+			CUdeviceptr outContactByParticled = mContactByParticleBuffer.getDevicePtr();
+			CUdeviceptr rankd = mContactRemapSortedByParticleBuffer.getDevicePtr();
 
 			CUfunction copyFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::RS_COPY_VALUE);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_COPY_VALUE);
 
 			PxCudaKernelParam copyKernelParams[] = { PX_CUDA_KERNEL_PARAM(contactByParticled),
 													 PX_CUDA_KERNEL_PARAM(outContactByParticled), PX_CUDA_KERNEL_PARAM(rankd),
@@ -1094,18 +1067,18 @@ namespace physx
 		}
 
 		{
-			PxgDevicePointer<float4> contactsd = mParticleContactPointBuffer.getTypedDevicePtr();
-			PxgDevicePointer<float4> normPensd = mParticleContactNormalPenBuffer.getTypedDevicePtr();
-			PxgDevicePointer<float4> barycentricsd = mParticleContactBarycentricBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxgFemOtherContactInfo> infosd = mParticleContactInfoBuffer.getTypedDevicePtr();
-			PxgDevicePointer<float4> sortedContactsd = mParticleSortedContactPointBuffer.getTypedDevicePtr();
-			PxgDevicePointer<float4> sortedNormPensd = mParticleSortedContactNormalPenBuffer.getTypedDevicePtr();
-			PxgDevicePointer<float4> sortedBarycentricsd = mParticleSortedContactBarycentricBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxgFemOtherContactInfo> sortedInfosd = mParticleSortedContactInfoBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> remapByParticleId = mContactRemapSortedByParticleBuf.getTypedDevicePtr();
+			PxgDevicePointer<float4> contactsd = mParticleDeformableContactPointBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> normPensd = mParticleDeformableContactNormalPenBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> barycentricsd = mParticleDeformableContactBarycentricBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> infosd = mParticleDeformableContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> sortedContactsd = mParticleDeformableSortedContactPointBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> sortedNormPensd = mParticleDeformableSortedContactNormalPenBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> sortedBarycentricsd = mParticleDeformableSortedContactBarycentricBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> sortedInfosd = mParticleDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> remapByParticleId = mContactRemapSortedByParticleBuffer.getTypedDevicePtr();
 
 			CUfunction reorderFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::SB_REORDER_PS_CONTACTS);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::SB_REORDER_PS_CONTACTS);
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(contactsd),
 												 PX_CUDA_KERNEL_PARAM(normPensd),
@@ -1175,28 +1148,28 @@ namespace physx
 	{
 		PxgBodySimManager& bodySimManager = mSimController->getBodySimManager();
 
-		const PxU32 nbActiveFemClothes = bodySimManager.mActiveFEMCloths.size();
+		const PxU32 nbActiveFemCloths = bodySimManager.mActiveFEMCloths.size();
 
-		if(nbActiveFemClothes == 0)
+		if(nbActiveFemCloths == 0)
 			return;
 
 		const PxU32 nbActiveParticleSystems = bodySimManager.mActivePBDParticleSystems.size();
 		if(nbActiveParticleSystems != 0)
-			prepClothParticleConstraint();
+			prepClothParticleBlocks();
 
 		// cloth contact constraints prep is done in solve()
 
 		// wait for sorting to have completed on mStream before primitivePrep can run
 		synchronizeStreams(mCudaContext, solverStream, mStream);
 
-		// wait for DMA of prePrepDescd and prepDescd before rigid body vs soft body constraint prep can run
+		// wait for DMA of prePrepDescd and prepDescd before rigid body vs cloth constraint prep can run
 		synchronizeStreams(mCudaContext, mStream, solverStream);
 
-		prepRigidContactConstraint(prePrepDescd, prepDescd, invDt, sharedDescd, solverStream, numSolverBodies, numArticulations);
+		prepRigidContactBlocks(prePrepDescd, prepDescd, invDt, sharedDescd, solverStream, numSolverBodies, numArticulations);
 
-		prepRigidAttachmentConstraints(prePrepDescd, prepDescd, invDt, sharedDescd, solverStream);
+		prepRigidAttachmentBlocks(prePrepDescd, prepDescd, invDt, sharedDescd, solverStream);
 
-		prepClothAttachmentConstraints(solverStream);
+		prepClothAttachmentBlocks(solverStream);
 
 		synchronizeStreams(mCudaContext, solverStream, mStream);
 	}
@@ -1226,7 +1199,7 @@ namespace physx
 
 		{
 			CUfunction finalizeKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_FINALIZE_VELOCITIES);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_FINALIZE_VELOCITIES);
 
 			const PxU32 numBlocks =
 				(maxClothVerts + PxgFEMClothKernelBlockDim::CLOTH_STEP - 1) / PxgFEMClothKernelBlockDim::CLOTH_STEP;
@@ -1252,10 +1225,10 @@ namespace physx
 			}
 		}
 
-
+		if(!mGpuContext->isSleepingDisabled())
 		{
 			CUfunction sleepKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SLEEPING);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SLEEPING);
 
 			const PxU32 numBlocks =
 				(nbActiveFEMCloths + PxgFEMClothKernelBlockDim::CLOTH_STEP - 1) / PxgFEMClothKernelBlockDim::CLOTH_STEP;
@@ -1285,13 +1258,13 @@ namespace physx
 
 			mCudaContext->memcpyDtoHAsync(wakeCountersCPU, wakeCountersGPU.mPtr,
 										  totalCloths * sizeof(PxReal), mStream);
-
-			// record event - wait in host code beofre reading wake counters/state changed...
-			mCudaContext->eventRecord(mFinalizeEvent, mStream);
-
-			if (mPostSolveCallback)			
-				mPostSolveCallback->onPostSolve(mFinalizeEvent);
 		}
+
+		// record event - wait in host code before reading wake counters/state changed...
+		mCudaContext->eventRecord(mFinalizeEvent, mStream);
+
+		if (mPostSolveCallback)
+			mPostSolveCallback->onPostSolve(mFinalizeEvent);
 	}
 
 	void PxgFEMClothCore::syncCloths()
@@ -1302,10 +1275,29 @@ namespace physx
 		mCudaContextManager->releaseContext();
 	}
 
+	void PxgFEMClothCore::onClothRemoved()
+	{
+		PxgSimulationCore* core = mSimController->getSimulationCore();
+
+		// Clear the GPU wake/sleep changed map so that createActivatedDeactivatedLists does not
+		// iterate stale bits left by GPU kernels that ran before this cloth was removed.
+		Cm::PinnableBitMap& clothChangedMap = core->getActiveClothStateChangedMap();
+		clothChangedMap.clear();
+
+		// Reset element-level cloth-cloth contact counts on GPU. This invalidates all VT and EE
+		// contacts generated by the previous frame's differentClothCollision / selfCollision.
+		// The next solver iteration will regenerate contacts from scratch using the cleaned-up
+		// eFemCloths bucket (which no longer contains the removed cloth's CMs).
+		PxgDevicePointer<PxU32> vtCountd = mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> eeCountd = mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
+		mCudaContext->memsetD32Async(vtCountd.mPtr, 0, 1, mStream);
+		mCudaContext->memsetD32Async(eeCountd.mPtr, 0, 1, mStream);
+	}
+
 	void PxgFEMClothCore::createActivatedDeactivatedLists()
 	{
 		PxgSimulationCore* core = mSimController->getSimulationCore();
-		PxBitMapPinned& clothChangedMap = core->getActiveClothStateChangedMap();
+		Cm::PinnableBitMap& clothChangedMap = core->getActiveClothStateChangedMap();
 
 		PxArray<Dy::DeformableSurface*>& deformableSurfaces = mSimController->getBodySimManager().mDeformableSurfaces;
 
@@ -1316,169 +1308,174 @@ namespace physx
 		mActivatingDeformableSurfaces.forceSize_Unsafe(0);
 		mDeactivatingDeformableSurfaces.forceSize_Unsafe(0);
 
-		PxBitMapPinned::Iterator iter(clothChangedMap);
+		Cm::PinnableBitMap::Iterator iter(clothChangedMap);
+
+		const PxU32 nbActiveFEMCloths = bodyManager.mActiveFEMCloths.size();
+		const PxU32 nbDeformableSurfaces = deformableSurfaces.size();
 
 		PxU32 dirtyIdx;
-		while((dirtyIdx = iter.getNext()) != PxBitMapPinned::Iterator::DONE)
+		while((dirtyIdx = iter.getNext()) != Cm::PinnableBitMap::Iterator::DONE)
 		{
-			PX_ASSERT(dirtyIdx < bodyManager.mActiveFEMClothIndex.size());
+			// clothChangedMap is sized to the total number of FEM cloths ever registered; the active
+			// list may have been compacted after removeActor. Bounds-check as a safety net - onClothRemoved
+			// clears the map on removal, so this should not normally trigger.
+			if(dirtyIdx >= nbActiveFEMCloths)
+				continue;
+
 			PxU32 idx = bodyManager.mActiveFEMCloths[dirtyIdx];
+			if(idx >= nbDeformableSurfaces)
+				continue;
+
+			Dy::DeformableSurface* surface = deformableSurfaces[idx];
+			if(!surface)
+				continue;
+
 			if(wakeCounters[idx] == 0.f)
-				mDeactivatingDeformableSurfaces.pushBack(deformableSurfaces[idx]);
+				mDeactivatingDeformableSurfaces.pushBack(surface);
 			else
-				mActivatingDeformableSurfaces.pushBack(deformableSurfaces[idx]);
+				mActivatingDeformableSurfaces.pushBack(surface);
 		}
 
 		clothChangedMap.clear();
 	}
 
-	void PxgFEMClothCore::solve(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
-								PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd,
-								PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, PxReal dt, CUstream solverStream, const PxU32 iter,
-								const PxU32 maxIter, const bool isVelocityIteration, const PxVec3& gravity)
+	// Decides this iteration's cloth-cloth contact-pair refresh cadence (adaptive vs fixed), returned in the
+	// out-params. In TGS adaptive mode it also clears the per-pair update flags (mUpdateClothContactPairs).
+	// The clear must run before step(), which repopulates the flags from this iteration's motion. It cannot
+	// move into the post-step consumer prepareClothClothCollision().
+	void PxgFEMClothCore::prepareClothContactPairUpdate(PxU32 iter, PxU32 maxIter,
+		bool& adaptiveCollisionPairUpdate, bool& forceUpdateClothContactPairs)
 	{
-		PX_UNUSED(isVelocityIteration);
-
-		const PxU32 nbActiveFEMCloths = mSimController->getBodySimManager().mActiveFEMCloths.size();
-		if(nbActiveFEMCloths == 0)
-			return;
-
-		// Ensure the relation v = (x - x0) / dt is maintained at all times, where x0 is:
-		// TGS: The position at the beginning of each sub-timestep.
-		// PGS: The position at the beginning of the entire time step.
-		// Any velocity changes or filtering, if needed, are handled separately in solve_velocity().
-		solve_position(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, dt, solverStream, iter, maxIter, gravity);
-
-		// Apply additional velocity changes or filtering, such as cloth internal energy damping.
-		solve_velocity(iter, maxIter, dt);
-
-		synchronizeStreams(mCudaContext, mStream, solverStream);
-	}
-
-	// Ensure the relation v = (x - x0) / dt is maintained at all times.
-	// Any velocity changes or filtering, if needed, are handled separately in solve_velocity().
-	void PxgFEMClothCore::solve_position(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
-										 PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd,
-										 PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, PxReal dt, CUstream solverStream,
-										 const PxU32 iter, const PxU32 maxIter, const PxVec3& gravity)
-	{
-		const PxU32 nbActiveFEMCloths = mSimController->getBodySimManager().mActiveFEMCloths.size();
-
 		PxgSimulationCore* core = mSimController->getSimulationCore();
-
 		const PxU32 nbCollisionPairUpdatesPerTimestep = mIsTGS ? core->getMaxNbCollisionPairUpdatesPerTimestep() : 1;
 
-		// If nbCollisionPairUpdatesPerTimestep is zero, update collision pairs adaptively and automatically. 
-		// Otherwise, update the contact pairs "nbCollisionPairUpdatesPerTimestep" times per time step.
-		const bool adaptiveCollisionPairUpdate = nbCollisionPairUpdatesPerTimestep == 0;
+		// A zero updates-per-timestep count selects the adaptive mode, and any other value refreshes
+		// that many times per step.
+		adaptiveCollisionPairUpdate = nbCollisionPairUpdatesPerTimestep == 0;
 
-		// When adaptive updates are not used:
-		// PGS: Update collision pairs only at the beginning of each time step.
-		// TGS: Update collision pairs multiple times per time step, based on nbCollisionPairUpdatesPerTimestep.
-		bool forceUpdateClothContactPairs = iter == 0; // PGS
+		// PGS: refresh only at the first iteration of the time step.
+		forceUpdateClothContactPairs = iter == 0;
 
 		if(mIsTGS)
 		{
 			forceUpdateClothContactPairs = false;
 			if(!adaptiveCollisionPairUpdate)
 			{
+				// Fixed cadence: refresh nbCollisionPairUpdatesPerTimestep times over maxIter iterations.
 				PxU32 divisor =
 					static_cast<PxU32>(PxCeil(static_cast<PxReal>(maxIter) / static_cast<PxReal>(nbCollisionPairUpdatesPerTimestep)));
 				divisor = PxMax(1u, divisor);
-
-				if(iter % divisor == 0)
-				{
-					forceUpdateClothContactPairs = true;
-				}
+				forceUpdateClothContactPairs = iter % divisor == 0;
 			}
 			else
 			{
+				// Adaptive: clear the per-pair flags so step() repopulates them from this iter's motion.
 				PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
 				mCudaContext->memsetD32Async(updateClothContactPairsd.mPtr, 0, mUpdateClothContactPairs.getNbElements(), mStream);
-			}
-
-			step(dt, mStream, nbActiveFEMCloths, gravity, adaptiveCollisionPairUpdate, forceUpdateClothContactPairs);
-		}
-
-		PxgFEMCloth* femClothsd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
-		PxgDevicePointer<PxU32> activeFEMClothsd = core->getActiveFEMClothBuffer().getTypedDevicePtr();
-
-		// Cloth-only: No iteraction with other actors.
-		{
-			prepareClothClothCollision(forceUpdateClothContactPairs, adaptiveCollisionPairUpdate, dt);
-
-			solveClothClothCollision(nbActiveFEMCloths, dt);
-
-			// Cloth internal energies
-			solveShellEnergy(femClothsd, activeFEMClothsd, nbActiveFEMCloths, dt);
-
-			// Cloth attachment
-			solveClothAttachmentDelta();
-
-			applyExternalDelta(nbActiveFEMCloths, dt, mStream);
-		}
-
-		// Interaction with rigid body
-		{
-			synchronizeStreams(mCudaContext, mStream, solverStream);
-
-			// Solve cloth-rigid attachment constraints (runs on solverStream)
-			solveClothRigidAttachment(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, solverStream, dt);
-
-			mCudaContext->streamWaitEvent(mStream, mSolveRigidEvent);
-
-			applyExternalDelta(nbActiveFEMCloths, dt, mStream);
-
-			synchronizeStreams(mCudaContext, mStream, solverStream);
-
-			// Solve cloth-rigid collision constraints (runs on solverStream)
-			queryRigidContactReferenceCount(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, solverStream, dt);
-			solveClothRigidContacts(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, solverStream, dt);
-
-			mCudaContext->streamWaitEvent(mStream, mSolveRigidEvent);
-
-			applyExternalDelta(nbActiveFEMCloths, dt, mStream);
-		}
-
-		// Interaction with particle system: outdated
-		{
-			const PxU32 nbActiveParticleSystem = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
-
-			if(nbActiveParticleSystem > 0)
-			{
-				PxgPBDParticleSystemCore* particleCore = mSimController->getPBDParticleSystemCore();
-				if(particleCore)
-				{
-					CUstream particleStream = particleCore->getStream();
-
-					// Solve soft body vs particle contact in soft body stream
-					solveParticleContactsOutputClothDelta(particleStream);
-
-					// Solve soft body vs particle contact in particle stream
-					solveParticleContactsOutputParticleDelta(particleStream);
-
-					// FEM cloth stream need to wait till soft body vs particle finish in the particle stream
-					mCudaContext->streamWaitEvent(mStream, mSolveParticleEvent);
-
-					// Force particle stream to wait for FEM cloth body stream to finish before updating particle states
-					synchronizeStreams(mCudaContext, mStream, particleStream);
-
-					// This function is going to update the pos and vel for the FEM verts
-					applyExternalDelta(nbActiveFEMCloths, dt, mStream);
-				}
 			}
 		}
 	}
 
-	// Apply additional velocity changes or filtering, such as cloth internal energy damping.
-	void PxgFEMClothCore::solve_velocity(PxU32 iter, PxU32 maxIter, PxReal dt)
+	void PxgFEMClothCore::solve(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd, PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
+								PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, const PxReal rigidAttachmentBiasCoefficient, const PxVec3& gravity,
+								const PxReal dt, const PxU32 iter, const PxU32 maxIter, const bool isVelocityIteration, CUstream solverStream)
 	{
 		const PxU32 nbActiveFEMCloths = mSimController->getBodySimManager().mActiveFEMCloths.size();
+		if(nbActiveFEMCloths == 0)
+			return;
 
-		if (mIsTGS || iter == maxIter - 1)
+		PxgSimulationCore* core = mSimController->getSimulationCore();
+
+		// Position iterations integrate, solve internal energies, update collision pairs, and damp.
+		// Velocity iterations (Muller SCA 2020 S3.6) skip all of that and only project residual velocity.
+		// Each block runs pre-count (query...ReferenceCount: bumps cloth.mDeltaPos[v].w) -> solve (reads .w,
+		// writes the inflated .xyz delta) -> finalize (applyExternalDelta: applies .xyz, zeroes .w), so .w
+		// is zero on entry to every block.
+		if(!isVelocityIteration)
 		{
-			applyDamping(nbActiveFEMCloths, dt, mStream);
+			bool adaptiveCollisionPairUpdate;
+			bool forceUpdateClothContactPairs;
+			prepareClothContactPairUpdate(iter, maxIter, adaptiveCollisionPairUpdate, forceUpdateClothContactPairs);
+
+			// TGS integrates per sub-step here, and repopulates the per-pair flags in adaptive mode.
+			// PGS integrates once at the start of the time step (elsewhere).
+			if(mIsTGS)
+				step(dt, mStream, nbActiveFEMCloths, gravity, adaptiveCollisionPairUpdate, forceUpdateClothContactPairs);
+
+			prepareClothClothCollision(forceUpdateClothContactPairs, adaptiveCollisionPairUpdate, dt);
 		}
+
+		// Runs the collision substep loop.
+		solveClothClothCollision(nbActiveFEMCloths, dt, isVelocityIteration);
+
+		// Cloth internal energies (position-only).
+		if(!isVelocityIteration)
+		{
+			PxgFEMCloth* femClothsd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
+			PxgDevicePointer<PxU32> activeFEMClothsd = core->getActiveFEMClothBuffer().getTypedDevicePtr();
+			solveShellEnergy(femClothsd, activeFEMClothsd, nbActiveFEMCloths, dt);
+		}
+
+		// Cloth-cloth attachment, on mStream
+		{
+			// Pre-count is geometric (mode-agnostic) onto cloth.mDeltaPos[v].w (zeroed by the preceding
+			// finalize). The solve reads the attachment delta, which is velocity * dt in velocity iterations.
+			queryClothClothAttachmentReferenceCount();
+			solveClothAttachmentDelta(dt, isVelocityIteration);
+			applyExternalDelta(nbActiveFEMCloths, dt, mStream, isVelocityIteration);
+		}
+
+		// Rigid attachment and contact, merged refcount phase, on solverStream
+		{
+			synchronizeStreams(mCudaContext, mStream, solverStream);
+
+			// Pre-count: attachment and contact both bump .w on the same buffer. Mixed-writer verts end up
+			// with the combined count.
+			queryRigidAttachmentReferenceCount(solverStream);
+			queryRigidContactReferenceCount(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt, isVelocityIteration);
+
+			// Solve both (each reads the combined .w, writes .xyz, does not bump .w).
+			PX_ASSERT(!isVelocityIteration || rigidAttachmentBiasCoefficient == 0.0f);
+			solveClothRigidAttachment(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt,
+				rigidAttachmentBiasCoefficient, isVelocityIteration);
+			solveClothRigidContacts(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt, isVelocityIteration);
+
+			mCudaContext->streamWaitEvent(mStream, mSolveRigidEvent);
+			applyExternalDelta(nbActiveFEMCloths, dt, mStream, isVelocityIteration);
+		}
+
+		// CP: cloth-particle contact, on particleStream <-> mStream, skipped if no particles
+		const PxU32 nbActiveParticleSystem = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
+		if(nbActiveParticleSystem != 0)
+		{
+			// The core is created before any system is added to the active list (addParticleSystem),
+			// so a non-zero active count guarantees it exists.
+			PxgPBDParticleSystemCore* particleCore = mSimController->getPBDParticleSystemCore();
+			CUstream particleStream = particleCore->getStream();
+
+			// CP pre-count populates cloth.mDeltaPos[v].w (zeroed by the preceding finalize).
+			queryParticleContactReferenceCount(dt, isVelocityIteration);
+
+			// The particle-side solve (particleStream) reads the count this pre-count wrote on mStream --
+			// order the streams so it can't race the write (CP barrier).
+			synchronizeStreams(mCudaContext, mStream, particleStream);
+
+			solveParticleContactsOutputClothDelta(particleStream, dt, isVelocityIteration);
+			solveParticleContactsOutputParticleDelta(particleStream, dt, isVelocityIteration);
+
+			// FEM cloth stream waits till cloth vs particle finishes in the particle stream.
+			mCudaContext->streamWaitEvent(mStream, mSolveParticleEvent);
+			synchronizeStreams(mCudaContext, mStream, particleStream);
+
+			applyExternalDelta(nbActiveFEMCloths, dt, mStream, isVelocityIteration);
+		}
+
+		// Cloth internal-energy damping after the position solve, which maintains v = (x - x0)/dt.
+		// TGS damps every sub-iteration and PGS only on the last. (Position-only.)
+		if(!isVelocityIteration && (mIsTGS || iter == maxIter - 1))
+			applyDamping(nbActiveFEMCloths, dt, mStream);
+
+		synchronizeStreams(mCudaContext, mStream, solverStream);
 	}
 
 	void PxgFEMClothCore::step(PxReal dt, CUstream stream, PxU32 nbActiveFEMCloths, const PxVec3& gravity, bool adaptiveCollisionPairUpdate, bool forceUpdateClothContactPairs)
@@ -1487,8 +1484,8 @@ namespace physx
 		PxgCudaBuffer& femClothBuffer = core->getFEMClothBuffer();
 		PxgFEMCloth* femClothsd = reinterpret_cast<PxgFEMCloth*>(femClothBuffer.getDevicePtr());
 
-		PxgDevicePointer<PxU32> VTContactCountsd = mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr();
-		PxgDevicePointer<PxU32> EEContactCountsd = mEEContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> VTContactCountsd = mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> EEContactCountsd = mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
 		PxgDevicePointer<PxU8> updateClothContactPairsd = mUpdateClothContactPairs.getTypedDevicePtr();
 
 		CUdeviceptr activeFEMClothsd = core->getActiveFEMClothBuffer().getDevicePtr();
@@ -1498,7 +1495,7 @@ namespace physx
 
 		{
 			CUfunction stepKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_STEP);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_STEP);
 
 			const PxU32 numBlocks =
 				(maxClothVerts + PxgFEMClothKernelBlockDim::CLOTH_STEP - 1) / PxgFEMClothKernelBlockDim::CLOTH_STEP;
@@ -1551,7 +1548,7 @@ namespace physx
 		for(PxU32 i = 0; i < firstClusterId; ++i)
 		{
 			CUfunction solveTriEnergyFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE);
 
 			PxCudaKernelParam solvetriEnergyKernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothsd), PX_CUDA_KERNEL_PARAM(activeFEMClothsd),
 															   PX_CUDA_KERNEL_PARAM(materials),	 PX_CUDA_KERNEL_PARAM(dt),
@@ -1567,7 +1564,7 @@ namespace physx
 		// Solving for partitions with small elements (< PxgFEMClothKernelBlockDim::CLOTH_SOLVESHELL)
 		if(firstClusterId < maxNonSharedPartitions)
 		{
-			CUfunction solveTriEnergyFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+			CUfunction solveTriEnergyFunction = mGpuKernelWranglerManager->getCuFunction(
 				PxgKernelIds::CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE_CLUSTER);
 
 			PxCudaKernelParam solvetriEnergyKernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothsd),	 PX_CUDA_KERNEL_PARAM(activeFEMClothsd),
@@ -1612,7 +1609,7 @@ namespace physx
 			for (PxU32 i = 0; i < firstClusterId; ++i)
 			{
 				CUfunction triPairEnergyFunction =
-					mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE);
+					mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE);
 
 				PxCudaKernelParam solveTriPairEnergyKernelParams[] = {
 					PX_CUDA_KERNEL_PARAM(femClothsd), PX_CUDA_KERNEL_PARAM(activeFEMClothsd),
@@ -1632,7 +1629,7 @@ namespace physx
 			if (firstClusterId < maxPartitions)
 			{
 				CUfunction triPairEnergyFunction =
-					mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE_CLUSTER);
+					mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE_CLUSTER);
 
 				PxCudaKernelParam solveTriPairEnergyKernelParams[] = {
 					PX_CUDA_KERNEL_PARAM(femClothsd), PX_CUDA_KERNEL_PARAM(activeFEMClothsd), PX_CUDA_KERNEL_PARAM(materials),
@@ -1663,7 +1660,7 @@ namespace physx
 			const PxReal dtInv = 1.f / dt;
 
 			CUfunction averageVertsFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_AVERAGE_VERTS);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SIM_TRIANGLEPAIR_AVERAGE_VERTS);
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothsd), PX_CUDA_KERNEL_PARAM(activeFEMClothsd),
 												 PX_CUDA_KERNEL_PARAM(dtInv), PX_CUDA_KERNEL_PARAM(isSharedTrianglePair) };
@@ -1717,38 +1714,43 @@ namespace physx
 
 	void PxgFEMClothCore::queryRigidContactReferenceCount(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd,
 														  PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
-														  PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd,
 														  PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, CUstream solverStream,
-														  PxReal dt)
+														  PxReal dt, bool isVelocityIteration)
 	{
-		PxgDevicePointer<PxU32> femRigidContactCount = mFemRigidReferenceCount.getDevicePtr();
-		mCudaContext->memsetD32Async(femRigidContactCount.mPtr, 0, mFemRigidReferenceCount.getNbElements(), solverStream);
+		PxgDevicePointer<PxU32> femRigidContactCount = mRigidDeformableRefCountBuffer.getDevicePtr();
+		mCudaContext->memsetD32Async(femRigidContactCount.mPtr, 0, mRigidDeformableRefCountBuffer.getNbElements(), solverStream);
 
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgDevicePointer<PxgFEMCloth> femClothesd = core->getFEMClothBuffer().getTypedDevicePtr();
 
-		PxgDevicePointer<PxU32> totalContactCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalContactCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
 
 		const CUfunction kernelFunction =
-			mIsTGS ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS)
-				   : mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT);
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT);
 
-		PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mRigidSortedContactInfoBuf.getTypedDevicePtr();
-		PxgDevicePointer<PxgFemRigidConstraintBlock> constraintsd = mRigidConstraintBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mRigidDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+		PxgDevicePointer<float4> barycentricsd = mRigidDeformableSortedContactBarycentricBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgRigidDbContactBlock> contactBlocksd = mRigidDeformableContactBlocks.getTypedDevicePtr();
 
-		PxgDevicePointer<PxReal> lambdaNs = mRigidFEMAppliedForcesBuf.getTypedDevicePtr();
+		PxgDevicePointer<float2> lambdaNs = mRigidDeformableAppliedForcesBuffer.getTypedDevicePtr();
+
+		float4* solverBodyVelPoold = mGpuContext->getGpuSolverCore()->getSolverBodyVelPoolDevPtr();
+		const bool isTGS = mIsTGS;
 
 		PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd),
 											 PX_CUDA_KERNEL_PARAM(contactInfosd),
-											 PX_CUDA_KERNEL_PARAM(constraintsd),
+											 PX_CUDA_KERNEL_PARAM(barycentricsd),
+											 PX_CUDA_KERNEL_PARAM(contactBlocksd),
 											 PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 											 PX_CUDA_KERNEL_PARAM(prePrepDescd),
 											 PX_CUDA_KERNEL_PARAM(solverCoreDescd),
 											 PX_CUDA_KERNEL_PARAM(artiCoreDescd),
-											 PX_CUDA_KERNEL_PARAM(sharedDescd),
+											 PX_CUDA_KERNEL_PARAM(solverBodyVelPoold),
 											 PX_CUDA_KERNEL_PARAM(dt),
 											 PX_CUDA_KERNEL_PARAM(lambdaNs),
-											 PX_CUDA_KERNEL_PARAM(femRigidContactCount) };
+											 PX_CUDA_KERNEL_PARAM(femRigidContactCount),
+											 PX_CUDA_KERNEL_PARAM(isTGS),
+											 PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 		CUresult result = mCudaContext->launchKernel(kernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION, 1, 1,
 													 PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION, 1, 1, 0, solverStream, kernelParams,
@@ -1765,18 +1767,54 @@ namespace physx
 #endif
 	}
 
+	// Pre-count per-vertex refCount for rigid-cloth attachments. Bumps
+	// cloth.mDeltaPos[v].w; the solve reads .w as the Jacobi mass-splitting
+	// factor (PGS + TGS). Pairs with queryRigidContactReferenceCount in the
+	// merged refcount phase.
+	void PxgFEMClothCore::queryRigidAttachmentReferenceCount(CUstream solverStream)
+	{
+		PxgSimulationCore* simCore = mSimController->getSimulationCore();
+		const PxU32 nbRigidAttachments = simCore->getNbActiveRigidClothAttachments();
+		if(nbRigidAttachments == 0)
+			return;
+
+		PxgDevicePointer<PxgFEMCloth> femClothesd = simCore->getFEMClothBuffer().getTypedDevicePtr();
+		PxgDevicePointer<PxgRigidDbAttachmentBlock> attachmentBlocksd = simCore->getClothRigidAttachmentBlocks();
+
+		const CUfunction kernelFunction =
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_RIGID_CLOTH_ATTACHMENT_REFERENCE_COUNT);
+
+		PxCudaKernelParam kernelParams[] = {
+			PX_CUDA_KERNEL_PARAM(femClothesd),
+			PX_CUDA_KERNEL_PARAM(attachmentBlocksd),
+			PX_CUDA_KERNEL_PARAM(nbRigidAttachments)
+		};
+
+		CUresult result = mCudaContext->launchKernel(kernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION, 1, 1,
+			PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION, 1, 1, 0, solverStream, kernelParams,
+			sizeof(kernelParams), 0, PX_FL);
+		PX_ASSERT(result == CUDA_SUCCESS);
+		PX_UNUSED(result);
+
+#if CLOTH_GPU_DEBUG
+		result = mCudaContext->streamSynchronize(solverStream);
+		PX_ASSERT(result == CUDA_SUCCESS);
+		if(result != CUDA_SUCCESS)
+			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,
+									"GPU cloth_queryRigidClothAttachmentReferenceCountLaunch kernel fail!\n");
+#endif
+	}
+
 	// solve cloth vs rigid body contact
 	void PxgFEMClothCore::solveClothRigidContacts(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd,
 												  PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
-												  PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd,
-												  PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, CUstream solverStream, PxReal dt)
+												  PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, CUstream solverStream, PxReal dt, bool isVelocityIteration)
 	{
-		PxgDevicePointer<PxU32> totalContactCountsd = mRigidTotalContactCountBuf.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalContactCountsd = mRigidDeformableContactCountBuffer.getTypedDevicePtr();
 
 		{
 			const CUfunction solveOutputRigidDeltaKernelFunction =
-				mIsTGS ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS)
-					   : mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_COLLISION);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_COLLISION);
 
 			PxgSimulationCore* core = mSimController->getSimulationCore();
 			PxgDevicePointer<PxgFEMCloth> femClothesd = core->getFEMClothBuffer().getTypedDevicePtr();
@@ -1786,28 +1824,37 @@ namespace physx
 			PxsMaterialData* rigidBodyMaterials =
 				reinterpret_cast<PxsMaterialData*>(npCore->mGpuMaterialManager.mGpuMaterialBuffer.getDevicePtr());
 
-			PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mRigidSortedContactInfoBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxgFemRigidConstraintBlock> constraintsd = mRigidConstraintBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mRigidDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU16> contactRigidMaterialsd = mRigidDeformableSortedContactRigidMaterialBuffer.getTypedDevicePtr();
+			PxgDevicePointer<float4> barycentricsd = mRigidDeformableSortedContactBarycentricBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgRigidDbContactBlock> contactBlocksd = mRigidDeformableContactBlocks.getTypedDevicePtr();
 
 			PxgDevicePointer<float4> deltaVd = mRigidDeltaVelBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxReal> lambdaNs = mRigidFEMAppliedForcesBuf.getTypedDevicePtr();
+			PxgDevicePointer<float2> lambdaNs = mRigidDeformableAppliedForcesBuffer.getTypedDevicePtr();
 
-			PxgDevicePointer<PxU32> femRigidContactCount = mFemRigidReferenceCount.getDevicePtr();
+			PxgDevicePointer<PxU32> femRigidContactCount = mRigidDeformableRefCountBuffer.getDevicePtr();
+
+			float4* solverBodyVelPoold = mGpuContext->getGpuSolverCore()->getSolverBodyVelPoolDevPtr();
+			const bool isTGS = mIsTGS;
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd),
 												 PX_CUDA_KERNEL_PARAM(contactInfosd),
-												 PX_CUDA_KERNEL_PARAM(constraintsd),
+												 PX_CUDA_KERNEL_PARAM(contactRigidMaterialsd),
+												 PX_CUDA_KERNEL_PARAM(barycentricsd),
+												 PX_CUDA_KERNEL_PARAM(contactBlocksd),
 												 PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 												 PX_CUDA_KERNEL_PARAM(prePrepDescd),
 												 PX_CUDA_KERNEL_PARAM(solverCoreDescd),
 												 PX_CUDA_KERNEL_PARAM(artiCoreDescd),
-												 PX_CUDA_KERNEL_PARAM(sharedDescd),
+												 PX_CUDA_KERNEL_PARAM(solverBodyVelPoold),
 												 PX_CUDA_KERNEL_PARAM(deltaVd),
 												 PX_CUDA_KERNEL_PARAM(lambdaNs),
 												 PX_CUDA_KERNEL_PARAM(femRigidContactCount),
 												 PX_CUDA_KERNEL_PARAM(dt),
 												 PX_CUDA_KERNEL_PARAM(materials),
-												 PX_CUDA_KERNEL_PARAM(rigidBodyMaterials) };
+												 PX_CUDA_KERNEL_PARAM(rigidBodyMaterials),
+												 PX_CUDA_KERNEL_PARAM(isTGS),
+												 PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 			CUresult result = mCudaContext->launchKernel(solveOutputRigidDeltaKernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION,
 														 1, 1, PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION, 1, 1, 0, solverStream,
@@ -1829,14 +1876,18 @@ namespace physx
 		}
 
 		// accumulate velocity delta for rigid body and impulse delta for articulation link
-		accumulateRigidDeltas(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, mRigidSortedRigidIdBuf.getDevicePtr(),
-							  mRigidTotalContactCountBuf.getDevicePtr(), solverStream, mIsTGS);
+		accumulateRigidDeltas(prePrepDescd, solverCoreDescd, artiCoreDescd, mRigidDeformableSortedRigidIdBuffer.getDevicePtr(),
+							  mRigidDeformableContactCountBuffer.getDevicePtr(), solverStream, mIsTGS);
+
+		// if the contact is between articulation and cloth, after accumulated all the related contact's
+		// impulse, we need to propagate the accumulated impulse to the articulation block solver
+		mGpuContext->mGpuArticulationCore->pushImpulse(solverStream);
 	}
 
 	void PxgFEMClothCore::solveClothRigidAttachment(PxgDevicePointer<PxgPrePrepDesc> prePrepDescd,
 													PxgDevicePointer<PxgSolverCoreDesc> solverCoreDescd,
-													PxgDevicePointer<PxgSolverSharedDescBase> sharedDescd,
-													PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, CUstream solverStream, PxReal dt)
+													PxgDevicePointer<PxgArticulationCoreDesc> artiCoreDescd, CUstream solverStream, PxReal dt,
+													const PxReal biasCoefficient, bool isVelocityIteration)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
 
@@ -1846,24 +1897,28 @@ namespace physx
 		{
 			PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(simCore->getFEMClothBuffer().getDevicePtr());
 
-			PxgDevicePointer<PxgFEMRigidAttachmentConstraint> constraintsd = simCore->getClothRigidConstraints();
+			PxgDevicePointer<PxgRigidDbAttachmentBlock> attachmentBlocksd = simCore->getClothRigidAttachmentBlocks();
 			PxgDevicePointer<float4> deltaVd = mRigidDeltaVelBuf.getTypedDevicePtr();
 
 			{
 				const CUfunction solvePCRigidKernelFunction =
-					mIsTGS
-						? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS)
-						: mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT);
+					mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT);
+
+				const bool isTGS = mIsTGS;
+				float4* solverBodyVelPoold = mGpuContext->getGpuSolverCore()->getSolverBodyVelPoolDevPtr();
 
 				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd),
-													 PX_CUDA_KERNEL_PARAM(constraintsd),
+													 PX_CUDA_KERNEL_PARAM(attachmentBlocksd),
 													 PX_CUDA_KERNEL_PARAM(nbRigidAttachments),
 													 PX_CUDA_KERNEL_PARAM(prePrepDescd),
 													 PX_CUDA_KERNEL_PARAM(solverCoreDescd),
 													 PX_CUDA_KERNEL_PARAM(artiCoreDescd),
-													 PX_CUDA_KERNEL_PARAM(sharedDescd),
+													 PX_CUDA_KERNEL_PARAM(solverBodyVelPoold),
 													 PX_CUDA_KERNEL_PARAM(dt),
-													 PX_CUDA_KERNEL_PARAM(deltaVd) };
+													 PX_CUDA_KERNEL_PARAM(biasCoefficient),
+													 PX_CUDA_KERNEL_PARAM(deltaVd),
+													 PX_CUDA_KERNEL_PARAM(isVelocityIteration),
+													 PX_CUDA_KERNEL_PARAM(isTGS) };
 
 				const PxU32 numThreadsPerBlock = PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION;
 				const PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_UPDATEROTATION;
@@ -1885,12 +1940,52 @@ namespace physx
 			PxgDevicePointer<PxNodeIndex> rigidAttachmentIds = simCore->getClothRigidAttachmentIds();
 			PxgDevicePointer<PxU32> totalRigidAttachmentsd = simCore->getGpuClothRigidCounter();
 
-			accumulateRigidDeltas(prePrepDescd, solverCoreDescd, sharedDescd, artiCoreDescd, rigidAttachmentIds, totalRigidAttachmentsd,
+			accumulateRigidDeltas(prePrepDescd, solverCoreDescd, artiCoreDescd, rigidAttachmentIds, totalRigidAttachmentsd,
 								  solverStream, mIsTGS);
+
+			// Flush mScratchImpulse so a same-iter contact-path pushImpulse doesn't read stale link velocity.
+			mGpuContext->mGpuArticulationCore->pushImpulse(solverStream);
 		}
 	}
 
-	void PxgFEMClothCore::solveClothAttachmentDelta()
+	// Pre-count pass for DB-DB cloth-cloth attachments: bumps
+	// cloth.mDeltaPos[v].w via atomicAdd. The .w buffer must be zero on entry
+	// (cloth_applyExternalDeltasLaunch zeros .xyz + .w as part of finalize).
+	void PxgFEMClothCore::queryClothClothAttachmentReferenceCount()
+	{
+		PxgSimulationCore* simCore = mSimController->getSimulationCore();
+		const PxU32 nbClothAttachments = simCore->getNbActiveClothClothAttachments();
+		if(nbClothAttachments == 0)
+			return;
+
+		PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(simCore->getFEMClothBuffer().getDevicePtr());
+		PxgDevicePointer<PxgDbDbAttachmentBlock> attachmentBlocksd = simCore->getClothClothAttachmentBlocks();
+
+		const CUfunction kernelFunction =
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_CLOTH_CLOTH_ATTACHMENT_REFERENCE_COUNT);
+
+		PxCudaKernelParam kernelParams[] = {
+			PX_CUDA_KERNEL_PARAM(clothesd),
+			PX_CUDA_KERNEL_PARAM(attachmentBlocksd),
+			PX_CUDA_KERNEL_PARAM(nbClothAttachments)
+		};
+
+		const PxU32 numThreadsPerBlock = PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION;
+		const PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_UPDATEROTATION;
+		CUresult result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0,
+			mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+		PX_ASSERT(result == CUDA_SUCCESS);
+		PX_UNUSED(result);
+
+#if CLOTH_GPU_DEBUG
+		result = mCudaContext->streamSynchronize(mStream);
+		if (result != CUDA_SUCCESS)
+			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,
+									"GPU cloth_queryClothClothAttachmentReferenceCountLaunch kernel fail!\n");
+#endif
+	}
+
+	void PxgFEMClothCore::solveClothAttachmentDelta(PxReal dt, bool isVelocityIteration)
 	{
 		PxgSimulationCore* simCore = mSimController->getSimulationCore();
 
@@ -1900,15 +1995,16 @@ namespace physx
 		{
 			PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(simCore->getFEMClothBuffer().getDevicePtr());
 
-			PxgDevicePointer<PxgFEMFEMAttachmentConstraint> constraintsd = simCore->getClothClothConstraints();
+			PxgDevicePointer<PxgDbDbAttachmentBlock> attachmentBlocksd = simCore->getClothClothAttachmentBlocks();
 
 			{
 				const CUfunction solveClothAttachmentKernelFunction =
-					mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+					mGpuKernelWranglerManager->getCuFunction(
 						PxgKernelIds::CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA);
 
-				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd), PX_CUDA_KERNEL_PARAM(constraintsd),
-													 PX_CUDA_KERNEL_PARAM(nbClothAttachments) };
+				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd), PX_CUDA_KERNEL_PARAM(attachmentBlocksd),
+													 PX_CUDA_KERNEL_PARAM(nbClothAttachments),
+													 PX_CUDA_KERNEL_PARAM(dt), PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 				const PxU32 numThreadsPerBlock = PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION;
 				const PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_UPDATEROTATION;
@@ -1944,42 +2040,49 @@ namespace physx
 			selfCollision(false);
 			differentClothCollision(false);
 
-			prepClothContactConstraint(true);
-			prepClothContactConstraint(false);
+			prepClothContactBlocks(true);
+			prepClothContactBlocks(false);
 		}
 	}
 
-	void PxgFEMClothCore::solveClothClothCollision(PxU32 nbActiveFEMCloths, PxReal dt)
+	void PxgFEMClothCore::solveClothClothCollision(PxU32 nbActiveFEMCloths, PxReal dt, bool isVelocityIteration)
 	{
 		PxgSimulationCore* core = mSimController->getSimulationCore();
-		const PxU32 nbCollisionSubsteps = core->getMaxNbCollisionSubsteps();
+		// Velocity iteration freezes positions, so a single projection pass suffices. Multiple
+		// substeps make no sense there. The user-controlled substep loop
+		// (PxDeformableSurface::setNbCollisionSubsteps) is a position-convergence mechanism:
+		// successive substeps move positions to resolve tight penetrations.
+		const PxU32 nbCollisionSubsteps = isVelocityIteration ? 1u : core->getMaxNbCollisionSubsteps();
 
 		for(PxU32 subIt = 0; subIt < nbCollisionSubsteps; ++subIt)
 		{
 			bool isVT = true; // Vertex-triangle pair
-			solveClothContactsOutputClothDelta(dt, isVT);
-			applyExternalDelta(nbActiveFEMCloths, dt, mStream);
+			solveClothContactsOutputClothDelta(dt, isVT, isVelocityIteration);
+			applyExternalDelta(nbActiveFEMCloths, dt, mStream, isVelocityIteration);
 
 			isVT = false; // Edge-edge pair
-			solveClothContactsOutputClothDelta(dt, isVT);
-			applyExternalDelta(nbActiveFEMCloths, dt, mStream);
+			solveClothContactsOutputClothDelta(dt, isVT, isVelocityIteration);
+			applyExternalDelta(nbActiveFEMCloths, dt, mStream, isVelocityIteration);
 		}
 	}
 
-	void PxgFEMClothCore::solveClothContactsOutputClothDelta(PxReal dt, bool isVT)
+	void PxgFEMClothCore::solveClothContactsOutputClothDelta(PxReal dt, bool isVT, bool isVelocityIteration)
 	{
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
 		PxgDevicePointer<PxU32> contactCountsd =
-			isVT ? mVolumeContactOrVTContactCountBuffer.getTypedDevicePtr() : mEEContactCountBuffer.getTypedDevicePtr();
-		PxgDevicePointer<PxgFemFemContactInfo> contactInfosd =
-			isVT ? mVolumeContactOrVTContactInfoBuffer.getTypedDevicePtr() : mEEContactInfoBuffer.getTypedDevicePtr();
+			isVT ? mSurfaceSurfaceVTContactCountBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgDeformablePairInfo> contactInfosd =
+			isVT ? mSurfaceSurfaceVTContactInfoBuffer.getTypedDevicePtr() : mSurfaceSurfaceEEContactInfoBuffer.getTypedDevicePtr();
 
-		// Query cloth vs cloth contacts
+
+		// Query cloth vs cloth contacts: activate in-collision pairs + accumulate the refcount.
+		// Runs in both position and velocity iteration: the finalize zeroes .w each pass, so
+		// the pre-count must repopulate it before every solve (even in velocity iteration).
 		{
 			const CUfunction solveOutputClothDeltaKernelFunction =
-				isVT ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT)
-					 : mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT);
+				isVT ? mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT)
+					 : mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT);
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd), PX_CUDA_KERNEL_PARAM(contactInfosd),
 												 PX_CUDA_KERNEL_PARAM(contactCountsd) };
 
@@ -2000,10 +2103,12 @@ namespace physx
 		// Solve cloth vs cloth contacts
 		{
 			const CUfunction solveOutputClothDeltaKernelFunction =
-				isVT ? mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_CLOTH_VT_COLLISION)
-					 : mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_SOLVE_CLOTH_EE_COLLISION);
+				isVT ? mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SOLVE_CLOTH_VT_COLLISION)
+					 : mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_SOLVE_CLOTH_EE_COLLISION);
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd), PX_CUDA_KERNEL_PARAM(contactInfosd),
-												 PX_CUDA_KERNEL_PARAM(contactCountsd), PX_CUDA_KERNEL_PARAM(dt) };
+												 PX_CUDA_KERNEL_PARAM(contactCountsd),
+												 PX_CUDA_KERNEL_PARAM(dt),
+												 PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 			CUresult result = mCudaContext->launchKernel(solveOutputClothDeltaKernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION,
 														 1, 1, PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION, 1, 1, 0, mStream, kernelParams,
@@ -2020,13 +2125,13 @@ namespace physx
 		}
 	}
 
-	void PxgFEMClothCore::applyDamping(PxU32 nbActiveFemClothes, PxReal dt, CUstream stream)
+	void PxgFEMClothCore::applyDamping(PxU32 nbActiveFemCloths, PxReal dt, CUstream stream)
 	{
 		//Velocity adjustment after position adjustment as described in algorithm 2 in "Detailed Rigid Body Simulation with Extended Position Based Dynamics"
 
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgFEMCloth* femClothesd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
-		PxU32* activeFemClothesd = reinterpret_cast<PxU32*>(core->getActiveFEMClothBuffer().getDevicePtr());
+		PxU32* activeFemClothsd = reinterpret_cast<PxU32*>(core->getActiveFEMClothBuffer().getDevicePtr());
 
 		//Accumulate in-plane damping
 		{
@@ -2041,16 +2146,19 @@ namespace physx
 			//PxReal inPlaneDamping = 1.0f /dt;// 0.1f;
 
 			const CUfunction kernel =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_IN_PLANE_DAMPING);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_IN_PLANE_DAMPING);
 
-			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothesd),
+			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothsd),
 												 PX_CUDA_KERNEL_PARAM(materials), PX_CUDA_KERNEL_PARAM(dt) };
 
-			CUresult result =
-				mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemClothes, 1, numThreadsPerBlock,
-					1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
-			PX_ASSERT(result == CUDA_SUCCESS);
-			PX_UNUSED(result);
+			if(numBlocks) // a cloth with no triangles would launch an empty grid (CUDA_ERROR_INVALID_VALUE)
+			{
+				CUresult result =
+					mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemCloths, 1, numThreadsPerBlock,
+						1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+				PX_ASSERT(result == CUDA_SUCCESS);
+				PX_UNUSED(result);
+			}
 		}
 
 		//Accumulate bending damping
@@ -2063,16 +2171,19 @@ namespace physx
 			//PxReal bendingDamping = 1.0f / dt;// 1.0f / dt;//0.1f;
 
 			const CUfunction kernel =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_BENDING_DAMPING);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_BENDING_DAMPING);
 
-			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothesd),
+			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothsd),
 												 /*PX_CUDA_KERNEL_PARAM(bendingDamping),*/ PX_CUDA_KERNEL_PARAM(dt) };
 
-			CUresult result =
-				mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemClothes, 1, numThreadsPerBlock,
-					1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
-			PX_ASSERT(result == CUDA_SUCCESS);
-			PX_UNUSED(result);
+			if(numBlocks) // a cloth with no triangle pairs (e.g. a single triangle) would launch an empty grid (CUDA_ERROR_INVALID_VALUE)
+			{
+				CUresult result =
+					mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemCloths, 1, numThreadsPerBlock,
+						1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+				PX_ASSERT(result == CUDA_SUCCESS);
+				PX_UNUSED(result);
+			}
 		}
 
 		//Apply the accumulated velocity change due to damping
@@ -2083,23 +2194,26 @@ namespace physx
 			const PxU32 numBlocks = (maxVerts + numThreadsPerBlock - 1) / numThreadsPerBlock;
 
 			const CUfunction kernel =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_APPLY_ACCUMULATED_DAMPING);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_APPLY_ACCUMULATED_DAMPING);
 
-			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothesd) };
+			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothsd) };
 
-			CUresult result =
-				mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemClothes, 1, numThreadsPerBlock,
-					1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
-			PX_ASSERT(result == CUDA_SUCCESS);
-			PX_UNUSED(result);
+			if(numBlocks) // no cloth verts -> empty grid (CUDA_ERROR_INVALID_VALUE)
+			{
+				CUresult result =
+					mCudaContext->launchKernel(kernel, numBlocks, nbActiveFemCloths, 1, numThreadsPerBlock,
+						1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+				PX_ASSERT(result == CUDA_SUCCESS);
+				PX_UNUSED(result);
+			}
 		}
 	}
 
-	void PxgFEMClothCore::applyExternalDelta(PxU32 nbActiveFemClothes, PxReal dt, CUstream stream)
+	void PxgFEMClothCore::applyExternalDelta(PxU32 nbActiveFemCloths, PxReal dt, CUstream stream, bool isVelocityIteration)
 	{
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgFEMCloth* femClothesd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
-		PxU32* activeFemClothesd = reinterpret_cast<PxU32*>(core->getActiveFEMClothBuffer().getDevicePtr());
+		PxU32* activeFemClothsd = reinterpret_cast<PxU32*>(core->getActiveFEMClothBuffer().getDevicePtr());
 
 		const PxU32 maxVerts = core->getMaxClothVerts();
 
@@ -2108,13 +2222,13 @@ namespace physx
 
 		{
 			const CUfunction applyDeltaKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_APPLY_EXTERNAL_DELTAS);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_APPLY_EXTERNAL_DELTAS);
 
-			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothesd),
-												 PX_CUDA_KERNEL_PARAM(dt) };
+			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(femClothesd), PX_CUDA_KERNEL_PARAM(activeFemClothsd),
+												 PX_CUDA_KERNEL_PARAM(dt), PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 			CUresult result =
-				mCudaContext->launchKernel(applyDeltaKernelFunction, numBlocks, nbActiveFemClothes, 1, numThreadsPerBlock,
+				mCudaContext->launchKernel(applyDeltaKernelFunction, numBlocks, nbActiveFemCloths, 1, numThreadsPerBlock,
 										   1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 			PX_ASSERT(result == CUDA_SUCCESS);
 			PX_UNUSED(result);
@@ -2129,8 +2243,51 @@ namespace physx
 		}
 	}
 
+	// Cloth-particle pre-count pass. Bumps cloth.mDeltaPos[v].w per touched
+	// triangle vertex for each active contact. Runs on mStream, which also
+	// owns the CP cloth-side solve.
+	void PxgFEMClothCore::queryParticleContactReferenceCount(const PxReal dt, bool isVelocityIteration)
+	{
+		PxgSimulationCore* core = mSimController->getSimulationCore();
+		PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
+
+		PxgPBDParticleSystemCore* particleCore = mSimController->getPBDParticleSystemCore();
+		PxgDevicePointer<PxgParticleSystem> particlesystemsd = particleCore->getParticleSystemBuffer().getTypedDevicePtr();
+
+		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mParticleDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgParticleDbContactBlock> contactBlocksd = mParticleDeformableContactBlocks.getTypedDevicePtr();
+
+		const CUfunction kernelFunction =
+			mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_QUERY_CP_REFERENCE_COUNT);
+
+		PxCudaKernelParam kernelParams[] = {
+			PX_CUDA_KERNEL_PARAM(clothesd),
+			PX_CUDA_KERNEL_PARAM(particlesystemsd),
+			PX_CUDA_KERNEL_PARAM(contactInfosd),
+			PX_CUDA_KERNEL_PARAM(contactBlocksd),
+			PX_CUDA_KERNEL_PARAM(totalParticleContactCountsd),
+			PX_CUDA_KERNEL_PARAM(dt),
+			PX_CUDA_KERNEL_PARAM(isVelocityIteration)
+		};
+
+		CUresult result = mCudaContext->launchKernel(kernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION, 1, 1,
+			PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION, 1, 1, 0, mStream, kernelParams,
+			sizeof(kernelParams), 0, PX_FL);
+		PX_ASSERT(result == CUDA_SUCCESS);
+		PX_UNUSED(result);
+
+#if CLOTH_GPU_DEBUG
+		result = mCudaContext->streamSynchronize(mStream);
+		PX_ASSERT(result == CUDA_SUCCESS);
+		if(result != CUDA_SUCCESS)
+			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,
+									"GPU cloth_queryCPContactReferenceCountLaunch kernel fail!\n");
+#endif
+	}
+
 	// solve cloth vs. particle contact and output to cloth delta buffer
-	void PxgFEMClothCore::solveParticleContactsOutputClothDelta(CUstream particleStream)
+	void PxgFEMClothCore::solveParticleContactsOutputClothDelta(CUstream particleStream, const PxReal dt, bool isVelocityIteration)
 	{
 		PxgPBDParticleSystemCore* particleCore = mSimController->getPBDParticleSystemCore();
 
@@ -2139,30 +2296,32 @@ namespace physx
 
 		PxgDevicePointer<PxgParticleSystem> particlesystemsd = particleCore->getParticleSystemBuffer().getTypedDevicePtr();
 
-		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 
 		synchronizeStreams(mCudaContext, mStream, particleStream);
 
-		// solve cloth vs. particle contact in the cloth stream and update delta and applied force for soft body
+		// solve cloth vs. particle contact in the cloth stream and update delta and applied force for cloth
 		{
 			const CUfunction solveOutputClothDeltaKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_PARTICLE_CLOTH_DELTA);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_PARTICLE_CLOTH_DELTA);
 
-			PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mParticleSortedContactInfoBuffer.getTypedDevicePtr();
-			PxgDevicePointer<PxgFEMParticleConstraintBlock> constraintsd = mParticleConstraintBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mParticleDeformableSortedContactInfoBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxgParticleDbContactBlock> contactBlocksd = mParticleDeformableContactBlocks.getTypedDevicePtr();
 
 			PxgGpuNarrowphaseCore* npCore = mGpuContext->getNarrowphaseCore();
 			CUdeviceptr materials = npCore->mGpuFEMClothMaterialManager.mGpuMaterialBuffer.getDevicePtr();
 
-			PxgDevicePointer<float4> appliedForced = mParticleAppliedFEMForcesBuf.getTypedDevicePtr();
+			PxgDevicePointer<float2> appliedForced = mParticleDeformableAppliedDeformableForcesBuffer.getTypedDevicePtr();
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd),
 												 PX_CUDA_KERNEL_PARAM(particlesystemsd),
 												 PX_CUDA_KERNEL_PARAM(contactInfosd),
-												 PX_CUDA_KERNEL_PARAM(constraintsd),
+												 PX_CUDA_KERNEL_PARAM(contactBlocksd),
 												 PX_CUDA_KERNEL_PARAM(totalParticleContactCountsd),
 												 PX_CUDA_KERNEL_PARAM(appliedForced),
-												 PX_CUDA_KERNEL_PARAM(materials) };
+												 PX_CUDA_KERNEL_PARAM(materials),
+												 PX_CUDA_KERNEL_PARAM(dt),
+												 PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 			CUresult result = mCudaContext->launchKernel(
 				solveOutputClothDeltaKernelFunction, PxgSoftBodyKernelGridDim::SB_UPDATEROTATION, 1, 1,
@@ -2187,9 +2346,9 @@ namespace physx
 	}
 
 	// solve cloth vs particle contact and output to particle delta buffer
-	void PxgFEMClothCore::solveParticleContactsOutputParticleDelta(CUstream particleStream)
+	void PxgFEMClothCore::solveParticleContactsOutputParticleDelta(CUstream particleStream, const PxReal dt, bool isVelocityIteration)
 	{
-		// solve soft body vs particle contact in the particle system stream and update selfCollision delta for particle
+		// solve cloth vs particle contact in the particle system stream and update selfCollision delta for particle
 		// system
 		PxgSimulationCore* core = mSimController->getSimulationCore();
 		PxgFEMCloth* clothesd = reinterpret_cast<PxgFEMCloth*>(core->getFEMClothBuffer().getDevicePtr());
@@ -2198,11 +2357,11 @@ namespace physx
 
 		PxgDevicePointer<PxgParticleSystem> particlesystemsd = particleSystemCore->getParticleSystemBuffer().getTypedDevicePtr();
 
-		PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd = mParticleSortedContactInfoBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxgDeformablePairInfo> contactInfosd = mParticleDeformableSortedContactInfoBuffer.getTypedDevicePtr();
 
 		PxgDevicePointer<float4> deltaVd = particleSystemCore->getDeltaVelParticle();
 
-		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleTotalContactCountBuffer.getTypedDevicePtr();
+		PxgDevicePointer<PxU32> totalParticleContactCountsd = mParticleDeformableContactCountBuffer.getTypedDevicePtr();
 
 	#if CLOTH_GPU_DEBUG
 		PxU32 numContacts;
@@ -2214,23 +2373,25 @@ namespace physx
 			mCudaContext->streamWaitEvent(particleStream, mConstraintPrepParticleEvent);
 
 			const CUfunction solveOutputParticleDeltaKernelFunction =
-				mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(PxgKernelIds::CLOTH_PARTICLE_PARTICLE_DELTA);
+				mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_PARTICLE_PARTICLE_DELTA);
 
-			PxgDevicePointer<PxgFEMParticleConstraintBlock> constraintsd = mParticleConstraintBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxgParticleDbContactBlock> contactBlocksd = mParticleDeformableContactBlocks.getTypedDevicePtr();
 
 			PxgGpuNarrowphaseCore* npCore = mGpuContext->getNarrowphaseCore();
 			CUdeviceptr materials = npCore->mGpuFEMClothMaterialManager.mGpuMaterialBuffer.getDevicePtr();
 
-			PxgDevicePointer<float4> appliedForced = mParticleAppliedParticleForcesBuf.getTypedDevicePtr();
+			PxgDevicePointer<float2> appliedForced = mParticleDeformableAppliedParticleForcesBuffer.getTypedDevicePtr();
 
 			PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(clothesd),
 												 PX_CUDA_KERNEL_PARAM(particlesystemsd),
 												 PX_CUDA_KERNEL_PARAM(contactInfosd),
-												 PX_CUDA_KERNEL_PARAM(constraintsd),
+												 PX_CUDA_KERNEL_PARAM(contactBlocksd),
 												 PX_CUDA_KERNEL_PARAM(totalParticleContactCountsd),
 												 PX_CUDA_KERNEL_PARAM(deltaVd),
 												 PX_CUDA_KERNEL_PARAM(appliedForced),
-												 PX_CUDA_KERNEL_PARAM(materials) };
+												 PX_CUDA_KERNEL_PARAM(materials),
+												 PX_CUDA_KERNEL_PARAM(dt),
+												 PX_CUDA_KERNEL_PARAM(isVelocityIteration) };
 
 			CUresult result = mCudaContext->launchKernel(solveOutputParticleDeltaKernelFunction,
 														 PxgSoftBodyKernelGridDim::SB_UPDATEROTATION, 1, 1,
@@ -2264,14 +2425,14 @@ namespace physx
 		}
 
 		{
-			// those temp buffer store the start and end index for the particle vs soft body range sorted by particle id
+			// those temp buffer store the start and end index for the particle vs cloth range sorted by particle id
 			PxgDevicePointer<PxU32> pairCountd = mTempHistogramCountBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> startd = mTempContactBuf.getTypedDevicePtr();
-			PxgDevicePointer<PxU32> endd = mTempContactRemapBuf.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> startd = mTempContactBuffer.getTypedDevicePtr();
+			PxgDevicePointer<PxU32> endd = mTempContactRemapBuffer.getTypedDevicePtr();
 
 			// accumulate deltaV changes for particle
 			{
-				const CUfunction accumulatedDeltaVKernelFunction = mGpuKernelWranglerManager->getKernelWrangler()->getCuFunction(
+				const CUfunction accumulatedDeltaVKernelFunction = mGpuKernelWranglerManager->getCuFunction(
 					PxgKernelIds::PS_ACCUMULATE_FEM_PARTICLE_DELTA);
 
 				PxCudaKernelParam kernelParams[] = { PX_CUDA_KERNEL_PARAM(particlesystemsd),
@@ -2294,7 +2455,7 @@ namespace physx
 		}
 	}
 
-	bool PxgFEMClothCore::updateUserData(PxPinnedArray<PxgFEMCloth>& femClothPool, PxArray<PxU32>& femClothNodeIndexPool,
+	bool PxgFEMClothCore::updateUserData(Cm::PinnableArray<PxgFEMCloth>& femClothPool, PxArray<PxU32>& femClothNodeIndexPool,
 										 const PxU32* activeFEMCloths, PxU32 nbActiveFEMCloths, void** bodySimsLL)
 	{
 		bool anyDirty = false;
@@ -2486,8 +2647,10 @@ namespace physx
 	}
 
 	void PxgFEMClothCore::partitionTriangleSimData(PxgFEMCloth& femCloth, PxgFEMClothData& clothData, PxArray<PxU32>& orderedTriangles,
-												   const PxArray<PxU32>& activeTriangles, PxsHeapMemoryAllocator* alloc)
+												   const PxArray<PxU32>& activeTriangles)
 	{
+		Cm::VirtualAllocatorCallback& hostAlloc = mAllocDesc.hostAlloc;
+
 		if (activeTriangles.empty())
 		{
 			clothData.mMaxNbNonSharedTrisPerPartition = 0;
@@ -2514,7 +2677,7 @@ namespace physx
 
 		PxMemZero(trianglesPerPartition.begin(), sizeof(PxU32) * FEMCLOTH_TEMP_PARTITION_SIZE);
 
-		classifyTriangles(femCloth.mTriangleVertexIndices, activeTriangles, nbVerts, partitionProgresses, tempTriangles,
+		classifyTriangles(femCloth.mTriangleVertexIndices_ownedEdges, activeTriangles, nbVerts, partitionProgresses, tempTriangles,
 			trianglesPerPartition);
 
 		// compute number of partitions
@@ -2526,7 +2689,7 @@ namespace physx
 		}
 
 		femCloth.mNonSharedTriAccumulatedPartitionsCP =
-			reinterpret_cast<PxU32*>(alloc->allocate(sizeof(PxU32) * maxPartition, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
+			reinterpret_cast<PxU32*>(hostAlloc.allocate(sizeof(PxU32) * maxPartition, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
 
 		// compute run sum
 		PxU32 accumulation = 0;
@@ -2558,7 +2721,7 @@ namespace physx
 		femCloth.mNbNonSharedTriPartitions = maxPartition;
 		clothData.mMaxNbNonSharedTrisPerPartition = maxTrianglesPerPartition;
 
-		writeTriangles(femCloth.mTriangleVertexIndices, activeTriangles, nbVerts, partitionProgresses, tempTriangles, orderedTriangles,
+		writeTriangles(femCloth.mTriangleVertexIndices_ownedEdges, activeTriangles, nbVerts, partitionProgresses, tempTriangles, orderedTriangles,
 			femCloth.mNonSharedTriAccumulatedPartitionsCP);
 
 		//printf("DEBUG PRINTING Non-Shared Triangle Partitions: %i Triangles: %i, First Cluster Id: %i\n", maxPartition, activeTriangles.size(), clusterId);
@@ -2785,7 +2948,7 @@ namespace physx
 	void combineTrianglePairPartitions(PxgFEMCloth& femCloth, PxArray<PxU32>& orderedTrianglePairs,
 									   PxU32* accumulatedTrianglePairsPerPartition, PxgFEMClothData& clothData, PxU32 maximumPartitions,
 									   const PxArray<PxU32>& activeTrianglePairs, const PxArray<uint4>& trianglePairVertexIndices,
-									   bool isSharedTrianglePair, PxsHeapMemoryAllocator* alloc)
+									   bool isSharedTrianglePair, Cm::VirtualAllocatorCallback& hostAlloc)
 	{
 		const PxU32 nbTrianglePairs = activeTrianglePairs.size();
 		const PxU32 nbVerts = femCloth.mNbVerts;
@@ -2800,7 +2963,7 @@ namespace physx
 		{
 			nbPartitions = femCloth.mNbSharedTriPairPartitions;
 			femCloth.mSharedTriPairAccumulatedPartitionsCP =
-				reinterpret_cast<PxU32*>(alloc->allocate(sizeof(PxU32) * nbPartitions, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
+				reinterpret_cast<PxU32*>(hostAlloc.allocate(sizeof(PxU32) * nbPartitions, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
 
 			combineAccumulatedTrianglePairsPerPartition = femCloth.mSharedTriPairAccumulatedPartitionsCP;
 			accumulatedCopiesEachVerts = femCloth.mSharedTriPairAccumulatedCopiesCP;
@@ -2809,7 +2972,7 @@ namespace physx
 		{
 			nbPartitions = femCloth.mNbNonSharedTriPairPartitions;
 			femCloth.mNonSharedTriPairAccumulatedPartitionsCP =
-				reinterpret_cast<PxU32*>(alloc->allocate(sizeof(PxU32) * nbPartitions, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
+				reinterpret_cast<PxU32*>(hostAlloc.allocate(sizeof(PxU32) * nbPartitions, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
 
 			combineAccumulatedTrianglePairsPerPartition = femCloth.mNonSharedTriPairAccumulatedPartitionsCP;
 			accumulatedCopiesEachVerts = femCloth.mNonSharedTriPairAccumulatedCopiesCP;
@@ -2952,7 +3115,7 @@ namespace physx
 			clothData.mSharedTriPairRemapOutputSize = totalNumVerts + totalCopies;
 
 			femCloth.mSharedTriPairRemapOutputCP = reinterpret_cast<PxU32*>(
-				alloc->allocate(sizeof(PxU32) * clothData.mSharedTriPairRemapOutputSize, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
+				hostAlloc.allocate(sizeof(PxU32) * clothData.mSharedTriPairRemapOutputSize, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
 
 			remapOutput = femCloth.mSharedTriPairRemapOutputCP;
 			femCloth.mSharedTriPairClusterId = clusterId;
@@ -2965,7 +3128,7 @@ namespace physx
 			clothData.mNonSharedTriPairRemapOutputSize = totalNumVerts + totalCopies;
 
 			femCloth.mNonSharedTriPairRemapOutputCP = reinterpret_cast<PxU32*>(
-				alloc->allocate(sizeof(PxU32) * clothData.mNonSharedTriPairRemapOutputSize, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
+				hostAlloc.allocate(sizeof(PxU32) * clothData.mNonSharedTriPairRemapOutputSize, PxsHeapStats::eSIMULATION_FEMCLOTH, PX_FL));
 
 			remapOutput = femCloth.mNonSharedTriPairRemapOutputCP;
 			femCloth.mNonSharedTriPairClusterId = clusterId;
@@ -3006,8 +3169,7 @@ namespace physx
 
 	void PxgFEMClothCore::partitionTrianglePairSimData(PxgFEMCloth& femCloth, PxgFEMClothData& clothData, PxU32 maximumPartitions,
 													   PxArray<PxU32>& orderedTrianglePairs, const PxArray<PxU32>& activeTrianglePairs,
-													   const PxArray<uint4>& trianglePairVertexIndices, bool isSharedTrianglePair,
-													   PxsHeapMemoryAllocator* alloc)
+													   const PxArray<uint4>& trianglePairVertexIndices, bool isSharedTrianglePair)
 	{
 		if (activeTrianglePairs.empty())
 		{
@@ -3035,7 +3197,7 @@ namespace physx
 		PxU32* accumulatedTrianglePairsPerPartition = trianglePairPartitions(femCloth, orderedTrianglePairs, activeTrianglePairs, trianglePairVertexIndices, isSharedTrianglePair);
 
 		combineTrianglePairPartitions(femCloth, orderedTrianglePairs, accumulatedTrianglePairsPerPartition, clothData, maximumPartitions,
-									  activeTrianglePairs, trianglePairVertexIndices, isSharedTrianglePair, alloc);
+									  activeTrianglePairs, trianglePairVertexIndices, isSharedTrianglePair, mAllocDesc.hostAlloc);
 
 		PX_FREE(accumulatedTrianglePairsPerPartition);
 	}
