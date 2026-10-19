@@ -28,7 +28,7 @@
 // replacement).  Proves the engine's launch path — getFunction(kernelId) ->
 // launchKernel(cuFunction, ...) — works by ID: a kernel launched via the
 // wrangler-resolved handle produces bitwise-correct results, unmapped/OOB IDs
-// resolve to null, and the wrangler built over the generated 501-entry
+// resolve to null, and the wrangler built over the generated 487-entry (PhysX 5.12)
 // registry manifest reports exactly the audited coverage.
 
 #include "pxgTestFramework.h"
@@ -39,7 +39,7 @@
 
 #include "PxgCudaShim.h"
 #include "PxgVulkanCudaContext.h"
-#include "PxgSlangKernelManifest.h"  // generated 501-entry registry manifest
+#include "PxgSlangKernelManifest.h"  // generated 487-entry registry manifest
 #include "cudamanager/PxCudaContext.h"
 
 #include <cstdint>
@@ -129,7 +129,7 @@ PXG_TEST(p3KernelWrangler)
     ctx->memFree(dx); ctx->memFree(dy); ctx->memFree(dOut);
     ctx->release();
 
-    // A wrangler over the GENERATED 501-entry registry manifest must report the
+    // A wrangler over the GENERATED 487-entry registry manifest must report the
     // audited coverage (ties the wrangler to the real PxgKernelNames.h registry).
     {
         using physx::gpuslang::gPxgSlangKernelManifest;
@@ -139,7 +139,7 @@ PXG_TEST(p3KernelWrangler)
         for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
             reg[i] = PxgKernelDef{ gPxgSlangKernelManifest[i].spirvFile, gPxgSlangKernelManifest[i].entry, 0, 0 };
         PxgVulkanKernelWrangler regWrangler(reg.data(), PXG_SLANG_KERNEL_COUNT);
-        PXG_CHECK_MSG(regWrangler.count() == PXG_SLANG_KERNEL_COUNT, "registry wrangler size == 501");
+        PXG_CHECK_MSG(regWrangler.count() == PXG_SLANG_KERNEL_COUNT, "registry wrangler size == 487");
         PXG_CHECK_MSG(regWrangler.mappedCount() == PXG_SLANG_KERNEL_MAPPED,
                       "registry wrangler resolves exactly the mapped kernels (%u vs %u)",
                       regWrangler.mappedCount(), PXG_SLANG_KERNEL_MAPPED);

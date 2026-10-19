@@ -30,7 +30,9 @@
 //
 // The second kernel of the softbody-vs-cloth chain: each midphase pair (cmIdx, tetIdx,
 // triIdx) becomes a GJK/EPA query between a TETRAHEDRON and a TRIANGLE, and every surviving
-// pair writes ONE contact with BOTH barycentric sets.
+// pair writes ONE contact.  BOTH barycentrics are computed and gate it; since PhysX 5.12 only
+// the CLOTH's (barycentric0) is written -- the softbody side is remapped later by
+// sb_fem_contact_remap_to_simLaunch from the stored point.
 //
 // It reuses the driver P8.6 extracted -- pxgSlangGjk + pxgSlangEpa + tetPrimitivesCollide2 --
 // so what is genuinely new here is the tet-vs-triangle framing around it:
@@ -45,16 +47,17 @@
 //     faces are on the surface, and the contact is kept only if at least one SURFACE face
 //     points against the GJK direction.  A tet touching the cloth through an interior face is
 //     touching it through a neighbour that already owns the contact;
-//   * the two-level FILTER.  A whole-tet-vs-whole-cloth pair kills the query outright; a
-//     per-vertex one kills it only if ALL THREE triangle vertices are filtered, each against
-//     both the tet's own mask and the softbody-wide wildcard.  The `&&` chain is upstream's
-//     and is transcribed rather than simplified -- an `||` here would drop contacts.
+//   * the FILTER (5.12): three exact searches of the softbody's mVolumeSurfaceFilterPairs --
+//     (tet, ANY triangle of the cloth), (tet, this triangle) and (ANY tet, this triangle);
+//     any hit kills the query.  5.6.1 filtered the triangle's three VERTICES with an `&&`
+//     chain; 5.12 filters the triangle as a triangle.
 //
-// THE NORMAL IS STORED NEGATED, and the point is the witness on the CLOTH.  The .cu writes
-// `outNormalPen = (-direction, pen)` with `pen = dot(witnessB - witnessA, direction)` where A
-// is the softbody and B the cloth (softbodyPrimitives.cu:1531-1543).  outContactInfo takes
-// pairInd0 = the CLOTH index and pairInd1 = the SOFTBODY index -- the opposite order to the
-// rigid path, and the solve chain downstream depends on it.
+// THE NORMAL IS STORED NEGATED, and (5.12) the point is the witness on the SOFTBODY -- "the
+// remap converts it into a simulation mesh tetrahedron and the corresponding barycentric"
+// (5.6.1 stored the cloth's witness).  The .cu writes `outNormalPen = (-direction, pen)` with
+// `pen = dot(witnessB - witnessA, direction)` where A is the softbody and B the cloth.
+// The PxgDeformablePairInfo takes ref0 = the CLOTH TRIANGLE and ref1 = the SOFTBODY
+// TETRAHEDRON -- the PxgDbDbContactWriter convention (ref1 is always the volume).
 //
 // ONE LANE, NOT A WARP: as in the rigid GJK port, the driver simulates the 32 CUDA lanes with
 // per-thread arrays, so the whole query belongs to a single thread and lane 0 runs it.
@@ -66,7 +69,9 @@
 module softBodyClothContactGenBda;
 
 import pxgSlangSoftBodyDesc;
-import pxgSlangDefFilter;   // P9.38
+import pxgSlangDefFilter;   // 5.12: findVolumeSurfaceTriangleFilter
+import pxgSlangDeformableRef;     // PxgEncodeDeformable*, PXG_DREF_ANY_FEATURE
+import pxgSlangDeformableWriters; // PxgDbDbContactWriterGpu
 import pxgSlangFEMClothDesc;
 import pxgSlangGjk;
 import pxgSlangTetCollide;
@@ -78,22 +83,15 @@ static const uint SB_CG_STRIDE = SB_MESHCG * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
-// PxEncodeSoftBodyIndex / PxEncodeClothIndex (PxgSimulationCoreDesc.h:100, :109) are the same
-// shape: (id << 20) | elementId, with the same all-ones wildcard.
-static const uint PXG_BITSHIFT_ID = 20u;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
-static const uint PX_MAX_NB_DEFORMABLE_SURFACE_VTX = 0x000fffffu;
 
 
 // ---------------------------------------------------------------------------
-// Push-constant blob — BYTE-IDENTICAL to the CUDA pack (PxgNarrowphaseCore.cpp:4683):
+// Push-constant blob — BYTE-IDENTICAL to the 5.12 CUDA pack:
 // { PxReal tolerenceLength, cmInputs*, transformCache*, contactDistance*, gpuShapes*,
 //   softbodies*, clothes*, stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes,
-//   PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs, stackSizeNeededOnDevice*,
-//   PxgSoftBodyContactWriter writer }.
-// 4 @0 (padded to 8), eight pointers @8..@64, PxU32 @72, a pointer realigned to @80, PxU32
-// @88, a pointer realigned to @96, then the 56-byte writer at @104 -> 160-byte blob.
-// ABI row {4,8,8,8,8,8,8,8,8,4,8,4,8,56}.
+//   stackSizeNeededOnDevice*, PxgDbDbContactWriter writer }.
+// 4 @0 (padded to 8), eight pointers @8..@64, PxU32 @72, a pointer realigned to @80, then the
+// 56-byte writer at @88 -> 144-byte blob.  ABI row {4,8,8,8,8,8,8,8,8,4,8,56}.
 // ---------------------------------------------------------------------------
 struct SbClothCgParams
 {
@@ -109,37 +107,22 @@ struct SbClothCgParams
     uint64_t midphasePairsNum;      // @64
     uint stackSizeBytes;            // @72
     uint _pad76;                    // @76
-    uint64_t filterPairs;           // @80
-    uint nbFilterPairs;             // @88
-    uint _pad92;                    // @92
-    uint64_t stackSizeNeededOnDevice; // @96 (ABI parity only — see below; the reason is NOT
-                                      //      the one this comment used to give)
-    // P9.78b CORRECTED THIS.  What stood here was "the .cu writes it in the tail of the
-    // driver, which is unreachable here since the stack cap is applied to numPairs
-    // instead".  That is FALSE, and the coverage checker is what asked the question.
-    // softbodyPrimitives.cu:1648 guards the write with `globalWarpIdx == 0 &&
-    // threadIdx.x == 0` -- OUTSIDE the capped loop, and reachable whatever numPairs is.
-    // Capping numPairs is precisely WHY the tail write exists: it reports the UNCAPPED
-    // requirement so the host can grow the stack next frame.
-    //
-    // The omission is still correct, for a different reason: this kernel is UPSTREAM
-    // DEAD.  Its only launch site (PxgNarrowphaseCore.cpp:4704) sits inside
-    // `if (supportClothTriangleCollision)` (:4591), and that is a hard-coded local
-    // `bool supportClothTriangleCollision = false;` (:4529) with no other mention in the
-    // tree.  The LIVE half of the pair is the VERTEX generator, and it does implement
-    // the write -- softBodyClothVertContactGenBda.slang:217.
-    //
-    // A wrong reason that reaches the right conclusion is the P9.76a shape: it survives
-    // because nothing contradicts it.  The reason is now the one that is true.
-    // --- PxgSoftBodyContactWriter, inlined (PxgSoftBodyCore.h:242) ---
-    uint64_t w_outPoint;            // @104
-    uint64_t w_outNormalPen;        // @112
-    uint64_t w_outBarycentric0;     // @120
-    uint64_t w_outBarycentric1;     // @128
-    uint64_t w_outContactInfo;      // @136
-    uint64_t w_totalContactCount;   // @144
-    uint w_maxContacts;             // @152
-    uint _pad156;                   // @156 -> 160
+    uint64_t stackSizeNeededOnDevice; // @80 (ABI parity only -- see below)
+    // The .cu writes it in the driver's tail, guarded by `globalWarpIdx == 0 &&
+    // threadIdx.x == 0` OUTSIDE the capped loop (P9.78b).  The omission here is correct
+    // because this kernel is UPSTREAM DEAD: its only launch site sits inside
+    // `if (supportClothTriangleCollision)`, a hard-coded local `false` in
+    // PxgNarrowphaseCore.cpp (still so in 5.12).  The LIVE half of the pair is the VERTEX
+    // generator, which does implement the write (softBodyClothVertContactGenBda.slang).
+    // --- PxgDbDbContactWriter, inlined (PxgDeformableContactWriters.h, 5.12) ---
+    uint64_t w_outPoint;            // @88
+    uint64_t w_outNormalPen;        // @96
+    uint64_t w_outBarycentric0;     // @104
+    uint64_t w_outBarycentric1;     // @112 (not written by this kernel in 5.12)
+    uint64_t w_outContactInfo;      // @120 PxgDeformablePairInfo*
+    uint64_t w_totalContactCount;   // @128
+    uint w_maxContacts;             // @136
+    uint _pad140;                   // @140 -> 144
 }
 
 [[vk::push_constant]] ConstantBuffer<SbClothCgParams> gCg;
@@ -156,7 +139,6 @@ struct PxgShape
     uint particleOrSoftbodyId;
 }
 
-uint encodeId(uint id, uint elementId) { return (id << PXG_BITSHIFT_ID) | elementId; }
 
 // A PxU8 array read through the containing 32-bit word.
 uint byteAt(uint64_t base, uint idx)
@@ -241,18 +223,12 @@ bool computeTriangleBarycentric(float3 t0, float3 t1, float3 t2, float3 p, out f
 }
 
 // ===========================================================================
-// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
-// null-pointer guard stays here, because only this kernel knows which of its buffers
-// is safe to point at when the filter list is null (see the module header).
-//
-// This site also had a DIFFERENT ALGORITHM -- a lower-bound search rather than the
-// engine's probe-and-accept loop.  Equivalent (the module header proves why) but not
-// the engine's, and now gone.
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+// 5.12: findVolumeSurfaceTriangleFilter over the softbody's mVolumeSurfaceFilterPairs.  The
+// array goes through dfFilterArray with the softbody descriptor as the safe address
+// (llvmpipe speculates the first load of a zero-trip search, see pxgSlangDefFilter).
+DfFilterArray sbVolumeSurfaceFilters(uint softbodyId)
 {
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    return dfFindNonRigidPair(havePairs ? pairsAddr : gCg.softbodies,
-                              havePairs ? nbPairs : 0u, id0, id1);
+    return softBodyVolumeSurfaceFilters(gCg.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE);
 }
 
 [shader("compute")]
@@ -294,32 +270,18 @@ void sb_clothContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
         const float cDistance = contactDistance[sbCacheRef] + contactDistance[clothCacheRef];
 
-        Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+        // ---- the filter (5.12, see the header) -----------------------------------
+        // Filters this tetrahedron against the whole surface, then against the input
+        // triangle; also checks whether the triangle is filtered against any tetrahedron.
+        // `||` short-circuits as in the CUDA.
+        const DfFilterArray filters = sbVolumeSurfaceFilters(softbodyId);
+        if (findVolumeSurfaceTriangleFilter(filters, softbodyId, tetrahedronInd, clothId, PXG_DREF_ANY_FEATURE) ||
+            findVolumeSurfaceTriangleFilter(filters, softbodyId, tetrahedronInd, clothId, triangleInd) ||
+            findVolumeSurfaceTriangleFilter(filters, softbodyId, PXG_DREF_ANY_FEATURE, clothId, triangleInd))
+            continue;
+
+        Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
         const uint4 triVertInds = triIndices[triangleInd];
-
-        // ---- the two-level filter (see the header) -------------------------------
-        const uint softBodyMask = encodeId(softbodyId, tetrahedronInd);
-        const uint softBodyFullMask = encodeId(softbodyId, PX_MAX_NB_DEFORMABLE_VOLUME_TET);
-        const uint clothFullMask = encodeId(clothId, PX_MAX_NB_DEFORMABLE_SURFACE_VTX);
-
-        if (findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyMask, clothFullMask))
-            continue;
-
-        const uint clothMask0 = encodeId(clothId, triVertInds.x);
-        const uint clothMask1 = encodeId(clothId, triVertInds.y);
-        const uint clothMask2 = encodeId(clothId, triVertInds.z);
-
-        // ALL THREE vertices must be filtered for the triangle to be skipped.  `&&`, as
-        // upstream has it -- an `||` silently loses contacts.
-        const bool skipTriangle =
-            (findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyFullMask, clothMask0) ||
-             findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyMask, clothMask0)) &&
-            (findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyFullMask, clothMask1) ||
-             findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyMask, clothMask1)) &&
-            (findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyFullMask, clothMask2) ||
-             findFilter(gCg.filterPairs, gCg.nbFilterPairs, softBodyMask, clothMask2));
-        if (skipTriangle)
-            continue;
 
         // ---- the two point clouds -------------------------------------------------
         const uint4 tetIdx = Ptr<uint4>(softbodies[softbodyId].mTetIndices)[tetrahedronInd];
@@ -402,25 +364,23 @@ void sb_clothContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         if (index >= gCg.w_maxContacts)
             continue;
 
-        // The witness on the CLOTH is the stored point; the normal is stored NEGATED and the
+        // 5.12: the SOFTBODY's witness is the stored point (the remap turns it into a
+        // simulation tetrahedron and barycentric); the normal is stored NEGATED and the
         // penetration is the witness separation projected on the un-negated direction.
+        // barycentric1 still gates above but is no longer written here.
         const float3 wA = o.closestPointA.xyz;   // softbody
         const float3 wB = o.closestPointB.xyz;   // cloth
         const float3 n = o.direction.xyz;
         const float pen = dot(wB - wA, n);
 
-        Ptr<float4>(gCg.w_outPoint)[index] = float4(wB.x, wB.y, wB.z, 0.0f);
+        Ptr<float4>(gCg.w_outPoint)[index] = float4(wA.x, wA.y, wA.z, 0.0f);
         Ptr<float4>(gCg.w_outNormalPen)[index] = float4(-n.x, -n.y, -n.z, pen);
         Ptr<float4>(gCg.w_outBarycentric0)[index] = barycentric0;
-        Ptr<float4>(gCg.w_outBarycentric1)[index] = barycentric1;
 
-        // PxgFemFemContactInfo (PxgFEMCore.h:51), 16 B: pairInd0 PxU64 @0, pairInd1 PxU32 @8,
-        // auxInd @12.  pairInd0 is the CLOTH and pairInd1 the SOFTBODY -- the opposite order
-        // to the rigid path, and the solve chain depends on it.
-        const uint64_t ci = gCg.w_outContactInfo + uint64_t(index) * 16UL;
-        Ptr<uint>(ci)[0] = encodeId(clothId, triangleInd);
-        Ptr<uint>(ci + 4UL)[0] = 0u;
-        Ptr<uint>(ci + 8UL)[0] = encodeId(softbodyId, tetrahedronInd);
+        // PxgDeformablePairInfo: ref0 = the CLOTH triangle, ref1 = the SOFTBODY tetrahedron.
+        PxgStorePairInfo(gCg.w_outContactInfo, index,
+                         PxgEncodeDeformableTriangle(clothId, triangleInd),
+                         PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronInd));
     }
     }
 }

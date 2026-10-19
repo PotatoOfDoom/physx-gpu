@@ -75,11 +75,11 @@
 //     when both shapes are eTRIANGLEMESH; here the types differ, and
 //     LoadShapePairWarp's own rule is the type test.
 //
-// M7 -- the CUDA warp-copies the WHOLE PxgParticleSystem (656 bytes) into shared
+// M7 -- the CUDA warp-copies the WHOLE PxgParticleSystem (608 bytes in 5.12) into shared
 //     memory before touching two of its fields.  That is a CUDA memory-traffic
 //     device, not semantics: this port reads mSortedPositions_InvMass and
 //     mCommonData_NumParticles through BDA where they are used.  Same values,
-//     no shared-memory staging, and no 656-byte groupshared array.
+//     no shared-memory staging, and no 608-byte groupshared array.
 //
 // M8 -- the particle loop strides by blockDim.y * gridDim.x -- WARPS, not
 //     threads, and NOT including blockDim.x.  Reproduced as a constant because
@@ -219,7 +219,7 @@ void cloth_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gPm.femClothes);
     const uint clothId = clothShape.particleOrSoftbodyId;
 
-    // M7: read the two fields where they are used, not a 656-byte shared copy.
+    // M7: read the two fields where they are used, not a 608-byte shared copy.
     Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gPm.particleSystems);
     const uint particleSystemId = particleShape.particleOrSoftbodyId;
     Ptr<float4> sortedPose = Ptr<float4>(particleSystems[particleSystemId].mSortedPositions_InvMass);
@@ -229,7 +229,7 @@ void cloth_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     const uint64_t meshData = clothes[clothId].mTriMeshData;
     const uint64_t treeAddr = meshData + 16UL;
     Ptr<float4> clothVerts = Ptr<float4>(clothes[clothId].mPosition_InvMass);
-    Ptr<uint4> clothTris = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+    Ptr<uint4> clothTris = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
 
     // M5: the query is a CUBE of half-side cDistance around the particle.
     const float cDistance = Ptr<float>(gPm.contactDistance)[particleCacheRef] +

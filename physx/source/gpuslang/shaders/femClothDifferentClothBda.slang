@@ -34,17 +34,24 @@
 //     CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_VT): one warp per cloth VERTEX of EITHER
 //     cloth walks the OTHER cloth's BV32 triangle BVH (femDifferentClothCollisionCoreVT
 //     + the ClothTreeVertexTraverser callback) and appends a vertex-triangle
-//     PxgFemFemContactInfo per penetrating (vertex, triangle) pair;
+//     PxgDeformablePairInfo (5.12) per penetrating (vertex, triangle) pair;
 //   - cloth_differentClothCollisionEELaunch (:1427, launch PxgFEMClothCore.cpp:768,
 //     CLOTH_DIFFERENTCLOTHCOLLISION_MIDPHASE_EE): one warp per triangle-with-active-edges
 //     of the SMALLER cloth walks the larger cloth's BVH (femDifferentClothCollisionCoreEE
 //     + ClothTreeEdgeTraverser) and appends an edge-edge record per crossing edge pair.
 //
+// PHYSX 5.12: the records are PxgDeformablePairInfo -- (vertex, triangle) refs for VT, two
+// triangle-edge refs for EE -- in place of 5.6.1's PxgFemFemContactInfo with its auxInd bit
+// field (and its validity bit).  The QUERY cloth's mSurfaceSurfaceFilterPairs are applied
+// (5.6.1 carried an unread clothClothPairs argument): VT skips a vertex filtered against
+// any triangle of the other cloth before the traversal and a (vertex, triangle) or (any,
+// triangle) pair inside it; EE skips (edge, edge), (edge, any) and (any, edge).  Edge
+// ownership is ownsEdge; the EE write is bounded by the buffer (writeCount).
+//
 // The two traversers are the SAME C++ structs the self-collision cores instantiate, so
 // the leaf/box callbacks below are the proven femClothSelfCollisionBda transcriptions.
 // Everything genuinely kernel-independent (BV32 readers, closestPtPointTriangle,
-// closestPtLineLine, boundsIntersect, isType0EdgeActive, the auxInd bit layout,
-// pxEncodeClothIndex) comes from pxgSlangClothMidphase, extracted at P8.15 precisely so
+// closestPtLineLine, boundsIntersect) comes from pxgSlangClothMidphase, extracted at P8.15 precisely so
 // this file would not fork a second copy.
 //
 // THE FIVE DIFFERENCES FROM THE SELF PATH (femClothClothMidPhase.cu:1240-1384):
@@ -62,9 +69,7 @@
 //      Both use the branchless id select the CUDA writes verbatim.
 //   4. Every `clothId0 != clothId1` guard is LIVE (and true), so the self path's three
 //      skips are disabled: the VT vertex-is-a-corner-of-the-triangle test, the EE
-//      `t0_index > primitiveIndex` half-pair dedup, and the EE connected-edge test.  The
-//      corollary is markValidity(clothId0 != clothId1) -> VALID: a different-cloth pair is
-//      final here, where a self pair is re-checked in cloth_clothContactPrepareLaunch.
+//      `t0_index > primitiveIndex` half-pair dedup, and the EE connected-edge test.
 //   5. The REST-POSE FILTER IS GONE.  The call sites pass NULL for both rest buffers and
 //      0.0f for filterDistSq (:1298-1300, :1370-1371); distSqInRestPose returns
 //      PX_MAX_REAL for a null first argument (:662-668, :685-691), so
@@ -90,12 +95,6 @@
 //   - the per-warp femMidphaseScratch (other cloth's verts / indices / bv32 root cached by
 //     lane 0 + __syncthreads) is dropped: every lane reads those addresses directly
 //     through Ptr<>;
-//   - PxgFemFemContactInfo's auxInd is zero-initialized before the mark*/setAux* sequence
-//     (CUDA leaves the untouched bits indeterminate), pinning the otherwise-dead
-//     InCollision bit 29 — and, for VT, the unused aux payload — to 0;
-//   - clothClothPairs / numClothClothPairs are carried in the push blob for ABI parity but
-//     NOT read: both traversers store them and apply no filter-pair lookup ("No filtering
-//     applied yet" — femClothClothMidPhase.cu:768, :884).
 //
 // All float arithmetic is NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the VT
 // (vertex - closestPt) dot feeds the compared `< contactDistSq`, the EE closestPtLineLine
@@ -104,17 +103,17 @@
 // No transcendental anywhere in the path — this tranche is FULLY bit-exact.
 
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mTriMeshData@0, mPosition_InvMass@16, ...)
-import pxgSlangClothMidphase;  // BV32 readers, closest-point routines, auxInd bit layout
+import pxgSlangClothMidphase;  // BV32 readers, closest-point routines
+import pxgSlangDefFilter;      // 5.12: findSurfaceSurface{VertexTriangle,EdgeEdge}Filter
+import pxgSlangDeformableRef;  // PxgEncodeDeformable*, ownsEdge, PxgStorePairInfo
 
 // ---------------------------------------------------------------------------
-// Push-constant blob — BYTE-IDENTICAL to the CUDA kernelParams pack
-// (PxgFEMClothCore.cpp:768): { PxU32 mMaxContacts, PxReal toleranceLength,
-// const PxgContactManagerInput* cmInputs, const PxsCachedTransform* transformCache,
-// const PxReal* contactDistance, const PxgShape* gpuShapes, const PxgFEMCloth* femClothes,
-// PxgNonRigidFilterPair* clothClothPairs, PxU32 numClothClothPairs,
-// const PxU8* updateContactPairs, PxgFemFemContactInfo* outContactInfo,
-// PxU32* totalContactCount } -> 88-byte natural-alignment blob.
-// (ABI row {4,4,8,8,8,8,8,8,4,8,8,8}.)
+// Push-constant blob — BYTE-IDENTICAL to the 5.12 CUDA kernelParams pack:
+// { PxU32 mMaxContacts, PxReal toleranceLength, const PxgContactManagerInput* cmInputs,
+// const PxsCachedTransform* transformCache, const PxReal* contactDistance,
+// const PxgShape* gpuShapes, const PxgFEMCloth* femClothes, const PxU8* updateContactPairs,
+// PxgDeformablePairInfo* outContactInfo, PxU32* totalContactCount } -> 72-byte blob.
+// (ABI row {4,4,8,8,8,8,8,8,8,8}.)  5.6.1 also passed clothClothPairs / numClothClothPairs.
 struct DifferentClothParams
 {
     uint maxContacts;             // @0
@@ -124,12 +123,9 @@ struct DifferentClothParams
     uint64_t contactDistance;     // @24
     uint64_t gpuShapes;           // @32
     uint64_t femClothes;          // @40
-    uint64_t clothClothPairs;     // @48  (unused; ABI parity)
-    uint numClothClothPairs;      // @56  (unused; ABI parity)
-    uint _pad60;                  // @60
-    uint64_t updateContactPairs;  // @64  PxU8*
-    uint64_t outContactInfo;      // @72  output
-    uint64_t totalContactCount;   // @80  output -> 88
+    uint64_t updateContactPairs;  // @48  PxU8*
+    uint64_t outContactInfo;      // @56  output
+    uint64_t totalContactCount;   // @64  output -> 72
 }
 
 [[vk::push_constant]] ConstantBuffer<DifferentClothParams> gD;
@@ -168,13 +164,10 @@ uint ballotGroup(bool pred, uint lane)
     return sBallot;
 }
 
-// PxgFemFemContactInfo store (16B: pairInd0 u64 @0, pairInd1 u32 @8, auxInd u32 @12).
-void writeContactInfo(uint index, uint pairInd0, uint pairInd1, uint auxInd)
+// The QUERY cloth's surface-surface filter array (5.12), the descriptor as the safe address.
+DfFilterArray myFilters(uint myClothId)
 {
-    const uint64_t infoBase = gD.outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(infoBase)[0] = uint2(pairInd0, 0u);   // pairInd0 is PxU64; encode() fits 32b -> high 0
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-    Ptr<uint>(infoBase + 12UL)[0] = auxInd;
+    return clothSurfaceSurfaceFilters(gD.femClothes + uint64_t(myClothId) * PXG_FEMCLOTH_STRIDE);
 }
 
 // The pair's two cloth ids and the summed contact distance, read once per group.
@@ -245,13 +238,16 @@ void cloth_differentClothCollisionVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 
     // The query vertex is MINE; the tree, its vertices and its indices are the OTHER's.
     Ptr<float4> verts0 = Ptr<float4>(clothes[myClothId].mPosition_InvMass);
     Ptr<float4> meshVerts = Ptr<float4>(clothes[otherClothId].mPosition_InvMass);
-    Ptr<uint4> triIndices = Ptr<uint4>(clothes[otherClothId].mTriangleVertexIndices);
+    Ptr<uint4> triIndices = Ptr<uint4>(clothes[otherClothId].mTriangleVertexIndices_ownedEdges);
     const uint64_t treeAddr = clothes[otherClothId].mTriMeshData + 16UL;   // + sizeof(uint4)
 
-    const float3 vertex = verts0[vertexIdx].xyz;
+    // 5.12: checks whether the own vertex is filtered against any triangle of the other
+    // cloth.  The CUDA returns the warp; here that is one `sub` iteration (group-uniform).
+    const DfFilterArray filters = myFilters(myClothId);
+    if (findSurfaceSurfaceVertexTriangleFilter(filters, myClothId, vertexIdx, otherClothId, PXG_DREF_ANY_FEATURE))
+        continue;
 
-    // markValidity(clothId0 != clothId1) — different cloths are valid immediately.
-    const uint validityBits = (myClothId != otherClothId) ? VALIDITY_FLAG_MASK : 0u;
+    const float3 vertex = verts0[vertexIdx].xyz;
 
     uint currentNodeIndex = 0u;   // root
     bool hasNode = true;
@@ -301,7 +297,10 @@ void cloth_differentClothCollisionVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 
                     const bool contains = !(vertex.x < bMin.x || vertex.x > bMax.x ||
                                             vertex.y < bMin.y || vertex.y > bMax.y ||
                                             vertex.z < bMin.z || vertex.z > bMax.z);
-                    if (contains)
+                    // 5.12: `bounds.contains(vertex) && !isFiltered(primitiveIndex)`.
+                    if (contains &&
+                        !(findSurfaceSurfaceVertexTriangleFilter(filters, myClothId, vertexIdx, otherClothId, primitiveIndex) ||
+                          findSurfaceSurfaceVertexTriangleFilter(filters, myClothId, PXG_DREF_ANY_FEATURE, otherClothId, primitiveIndex)))
                     {
                         float s, t;
                         const float3 closestPt = closestPtPointTriangle(vertex, x1, x2, x3, s, t);
@@ -330,9 +329,9 @@ void cloth_differentClothCollisionVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 
             const uint index = sScanStart + offset;
             if (intersect && index < gD.maxContacts)
             {
-                // markVertexTrianglePair() clears bit 30 (already 0 on the zero-init).
-                writeContactInfo(index, pxEncodeClothIndex(myClothId, vertexIdx),
-                                 pxEncodeClothIndex(otherClothId, primitiveIndex), validityBits);
+                PxgStorePairInfo(gD.outContactInfo, index,
+                                 PxgEncodeDeformableVertex(myClothId, vertexIdx),
+                                 PxgEncodeDeformableTriangle(otherClothId, primitiveIndex));
             }
         }
         else
@@ -402,8 +401,8 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
     const ClothPair pair = loadClothPair(cmIdx);
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gD.femClothes);
 
-    const uint numTriangles0 = clothes[pair.clothId0].mNbTrianglesWithActiveEdges;
-    const uint numTriangles1 = clothes[pair.clothId1].mNbTrianglesWithActiveEdges;
+    const uint numTriangles0 = clothes[pair.clothId0].mNbTrianglesWithOwnedEdges;
+    const uint numTriangles1 = clothes[pair.clothId1].mNbTrianglesWithOwnedEdges;
     const uint numQueries = min(numTriangles0, numTriangles1);
 
     const float contactDist = pair.contactDist;
@@ -417,14 +416,14 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
     const uint otherClothId = uint(selMask * (int(pair.clothId0) - int(pair.clothId1)) + int(pair.clothId1));
 
     Ptr<float4> verts0 = Ptr<float4>(clothes[myClothId].mPosition_InvMass);
-    Ptr<uint4> myTriIndices = Ptr<uint4>(clothes[myClothId].mTriangleVertexIndices);
-    Ptr<uint> trisWithActiveEdges = Ptr<uint>(clothes[myClothId].mTrianglesWithActiveEdges);
+    Ptr<uint4> myTriIndices = Ptr<uint4>(clothes[myClothId].mTriangleVertexIndices_ownedEdges);
+    Ptr<uint> trisWithActiveEdges = Ptr<uint>(clothes[myClothId].mTrianglesWithOwnedEdges);
 
     Ptr<float4> meshVerts = Ptr<float4>(clothes[otherClothId].mPosition_InvMass);
-    Ptr<uint4> triIndices = Ptr<uint4>(clothes[otherClothId].mTriangleVertexIndices);
+    Ptr<uint4> triIndices = Ptr<uint4>(clothes[otherClothId].mTriangleVertexIndices_ownedEdges);
     const uint64_t treeAddr = clothes[otherClothId].mTriMeshData + 16UL;
 
-    const uint validityBits = (myClothId != otherClothId) ? VALIDITY_FLAG_MASK : 0u;
+    const DfFilterArray filters = myFilters(myClothId);
 
     static const uint nextE_lookup[3] = { 1u, 2u, 0u };
 
@@ -438,7 +437,7 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
     // setEdge0: the query triangle (t0) at globalWarpIdx, from MY cloth.
     const uint t0_index = trisWithActiveEdges[globalWarpIdx];
     const uint4 t0_tri = myTriIndices[t0_index];        // t0_triVertIndices0
-    const uint t0_edgeAuthorship = t0_tri.w;
+    const uint t0_edgeOwnership = t0_tri.w;
     const uint vIndices0[3] = { t0_tri.x, t0_tri.y, t0_tri.z };
     const float3 t0_points[3] = { verts0[t0_tri.x].xyz, verts0[t0_tri.y].xyz, verts0[t0_tri.z].xyz };
     const float3 t0_min = min(min(t0_points[0], t0_points[1]), t0_points[2]) - contactDist;  // fattenFast
@@ -481,7 +480,7 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
                 ((myClothId != otherClothId) || (t0_index > primitiveIndex)))
             {
                 const uint4 triVertexIdx1 = triIndices[safePrim];
-                const uint edgeAuthorship1 = triVertexIdx1.w;
+                const uint edgeOwnership1 = triVertexIdx1.w;
                 const uint vIndices1[3] = { triVertexIdx1.x, triVertexIdx1.y, triVertexIdx1.z };
                 const float3 t1_points[3] = { meshVerts[vIndices1[0]].xyz, meshVerts[vIndices1[1]].xyz,
                                               meshVerts[vIndices1[2]].xyz };
@@ -493,7 +492,7 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
                     // Iterate through edges of triangle 1 (the found primitive).
                     for (uint e1 = 0u; e1 < 3u; ++e1)
                     {
-                        if (!isType0EdgeActive(edgeAuthorship1, e1))
+                        if (!ownsEdge(edgeOwnership1, e1))
                             continue;
 
                         const uint nextE1 = nextE_lookup[e1];
@@ -505,7 +504,7 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
                         // Iterate through edges of triangle 0 (the query).
                         for (uint e0 = 0u; e0 < 3u; ++e0)
                         {
-                            if (!isType0EdgeActive(t0_edgeAuthorship, e0))
+                            if (!ownsEdge(t0_edgeOwnership, e0))
                                 continue;
 
                             const uint nextE0 = nextE_lookup[e0];
@@ -531,8 +530,12 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
                             if (isOutside)
                                 continue;
 
-                            // The rest-pose filter collapses here — see the header, difference 5.
-                            if (distSq < contactDistSq && distSq > 1.0e-14f)
+                            // The rest-pose filter collapses here — see the header, difference 5 —
+                            // leaving 5.12's isFiltered(e0, primitiveIndex, e1).
+                            if (distSq < contactDistSq && distSq > 1.0e-14f &&
+                                !(findSurfaceSurfaceEdgeEdgeFilter(filters, myClothId, t0_index, e0, otherClothId, primitiveIndex, e1) ||
+                                  findSurfaceSurfaceEdgeEdgeFilter(filters, myClothId, t0_index, e0, otherClothId, PXG_DREF_ANY_FEATURE, 0u) ||
+                                  findSurfaceSurfaceEdgeEdgeFilter(filters, myClothId, PXG_DREF_ANY_FEATURE, 0u, otherClothId, primitiveIndex, e1)))
                             {
                                 localEdgeIndices[intersectCount] = uint2(e0, e1);
                                 ++intersectCount;
@@ -563,18 +566,16 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
                 }
                 GroupMemoryBarrierWithGroupSync();
                 const uint index = sScanStart + offset;
-                if (index < gD.maxContacts)
+                // 5.12: per-thread guard and the run bounded by the buffer.
+                if (index < gD.maxContacts && intersectCount != 0u)
                 {
-                    const uint pairInd0 = pxEncodeClothIndex(myClothId, t0_index);
-                    const uint pairInd1 = pxEncodeClothIndex(otherClothId, primitiveIndex);
-                    for (uint li = 0u; li < intersectCount; ++li)
+                    const uint writeCount = min(intersectCount, gD.maxContacts - index);
+                    for (uint li = 0u; li < writeCount; ++li)
                     {
-                        const uint2 aux = localEdgeIndices[li];
-                        uint auxInd = PAIR_TYPE_FLAG_MASK | validityBits;   // markEdgeEdgePair + markValidity
-                        auxInd = (auxInd & ~AUX_IND0_MASK) | (aux.x & AUX_IND0_MASK);              // setAuxInd0(e0)
-                        auxInd = (auxInd & ~AUX_IND1_MASK) |
-                                 ((aux.y & ((1u << AUX_IND1_BITS) - 1u)) << AUX_IND1_SHIFT);        // setAuxInd1(e1)
-                        writeContactInfo(index + li, pairInd0, pairInd1, auxInd);
+                        const uint2 localEdges = localEdgeIndices[li];
+                        PxgStorePairInfo(gD.outContactInfo, index + li,
+                                         PxgEncodeDeformableTriangleEdge(myClothId, t0_index, localEdges.x),
+                                         PxgEncodeDeformableTriangleEdge(otherClothId, primitiveIndex, localEdges.y));
                     }
                 }
             }

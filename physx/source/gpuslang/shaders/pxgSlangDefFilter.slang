@@ -25,247 +25,175 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // ===========================================================================
-// pxgSlangDefFilter — the deformable/rigid element filter, ONCE.
+// pxgSlangDefFilter -- the deformable element filter, PhysX 5.12.
 //
-// `find(const PxgRigidFilterPair*, nbPairs, rigidId, compressedId)`
-// (deformableElementFilter.cuh:89, over the :67 overload) was spelled NINE times
-// across this corpus when P9.34c added the ninth and said so.  P9.35c created this
-// module so it would not become a tenth, deliberately leaving the conversion of the
-// others to its own change.
+// Transcribed from gpunarrowphase/src/CUDA/deformableElementFilter.cuh (5.12).  The
+// 5.6.1 design (one global sorted PxgRigidFilterPair / PxgNonRigidFilterPair list
+// per launch, 32-bit packed ids, the ignoreIndex2 disjunct, the particle-buffer
+// runsum chain) is gone.  Every deformable now carries one sorted
+// PxgDeformablePairInfo array per pair type:
 //
-// P9.38 IS THAT CHANGE.  Every BDA-addressed copy now calls in here: seven callers on
-// dfFindRigidPair and four on dfFindNonRigidPair, all eleven compiling to one
-// arithmetic DAG apiece (gpuslang.helperUniformity checks it).
+//   PxgSoftBody   mRigidVolumeFilterPairs   (rigid  , tet    )
+//                 mVolumeVolumeFilterPairs  (vertex , tet    )
+//                 mVolumeSurfaceFilterPairs (tet    , vertex | triangle)
+//   PxgFEMCloth   mRigidSurfaceFilterPairs  (rigid  , vertex | triangle)
+//                 mSurfaceSurfaceFilterPairs(vertex , triangle | edge, edge)
 //
-// Before converting anything, all fifteen searches in the corpus were read against
-// deformableElementFilter.cuh and PxgRigidFilterPair::compare, and every one agreed
-// on the comparison order, the 64-bit keys and the ignoreIndex2 disjunct.  That is
-// the reason to collapse them rather than a reason not to: fifteen identical
-// transcriptions are fifteen future chances to re-derive one of them wrong, and the
-// two preceding tranches each ended on exactly that.  One difference did turn up --
-// see the non-rigid section below for the two algorithms.
+// and every lookup is ONE exact binary search for one fully encoded pair
+// (PxgComparePairInfo: ref0 then ref1, unsigned 64-bit).  The ANY_FEATURE wildcard
+// is not a search feature: callers that honour it issue a second (or third) exact
+// search with PXG_DREF_ANY_FEATURE in the feature id, as the CUDA does.
 //
-// WHAT DID NOT MOVE, and why it cannot:
-//   * the searches that read their pairs through a StructuredBuffer BINDING rather
-//     than a device address -- npSbSb, npSbSelf, npSbPrim, npClothCloth,
-//     fcStaticTriCloth, fcVertexConvex, psPrimCollide.  A module taking a uint64_t
-//     address cannot be handed a binding, and giving them one would mean changing
-//     how those kernels bind their filter arrays: a fixture-and-ABI change with no
-//     behavioural gain.  They stay, and they are listed here so the next reader knows
-//     the omission is a decision rather than an oversight;
-//   * npDefFilter.slang, which is the FIXTURE shader for these searches -- the
-//     reference implementation testNpDefFilter.cpp drives.  It reads through bindings
-//     for the same reason;
-//   * findParticleRigid over PxParticleRigidFilterPair, a DIFFERENT 16-byte record
-//     with its own operator== / operator< navigation, and npSbPrim's
-//     findParticleFilter, which passes ignoreIndex2 = FALSE with a bucket's mUniqueId
-//     as the third key.  Merging those into these searches is the failure mode this
-//     work had to avoid.
+// A rigid is keyed by PxgEncodeRigidFilterRef(node, transformCacheRef): bodies and
+// links by their PxNodeIndex, statics per shape by the transform cache id.
 //
-// WHAT THE TRANSCRIPTION HAS TO PRESERVE, both established in P9.34c:
-//
-//  F1. THE COMPARISON ORDER is index0, then index1, then index2, each as an
-//      UNSIGNED 64-BIT value.  The pairs are sorted by that order and the search
-//      is a binary one, so a comparison that treats the halves as two
-//      independent 32-bit words walks the wrong way.
-//
-//  F2. THE `ignoreIndex2` DISJUNCT accepts a hit on (index0, index1) alone.
-//      For the cloth-rigid and softbody-rigid filter arrays it is redundant --
-//      they are built from default-constructed pairs, whose constructor is
-//      `index2(0)` (PxgSimulationCoreDesc.h:164), and the query carries 0 too --
-//      but the SAME overload is called elsewhere with attachment handles in
-//      index2, where it decides the answer.  Transcribed because the CUDA has
-//      it, and because this module is meant to serve those callers too.
-//
-// ---------------------------------------------------------------------------
-// TWO THINGS HERE ARE UNTESTABLE, and both were established by PROOF after a mutation
-// sweep left them standing, rather than by widening a rig.  They were written for the
-// copy in femClothSdfMeshCgBda; P9.38 moved them here with the code they describe.
-//
-//   * `l = mid + 1` against `l = l + 1` -- the second still RETURNS the same answer.
-//     The invariant `l <= k < r` (k = the target's index) survives both updates:
-//     cmp > 0 means pairs[mid] < query, so k > mid >= l and therefore k >= l + 1.  The
-//     loop only exits at l >= r, which contradicts the invariant, so a present key is
-//     always found; and cmp == 0 is a real match, so an absent one is never claimed.
-//     The two differ in WORK -- O(n) against O(log n) -- and in nothing else.  A
-//     fixture cannot separate them; only this argument can.
-//
-//   * the `ignoreIndex2` disjunct is redundant FOR THE CLOTH-RIGID ARRAY.  That list
-//     is built at PxgSimulationController.cpp:4094 from a default-constructed
-//     PxgRigidFilterPair, whose constructor is `index2(0)`
-//     (PxgSimulationCoreDesc.h:164), and nothing else writes index2 into
-//     mClothRigidFilterPairs.  The query carries index2 = 0 too, so `compare` never
-//     reaches its index2 branch with a difference and `cmp == 0` already holds.  The
-//     clause is transcribed because the CUDA has it and because the SAME overload is
-//     called elsewhere WITH attachment handles in index2, where it decides the answer.
-//     That is the reason it cannot be dropped from a shared implementation even though
-//     one caller's data makes it dead.
-// ---------------------------------------------------------------------------
-// PxgRigidFilterPair is 32 bytes: PxU64 index0, PxU64 index1, PxU32 index2,
-// PxU32 padding[3].
+// THE ZERO-LENGTH ARRAY.  A deformable with no filters of a kind has a NULL array
+// and a zero count.  On llvmpipe a zero-trip `while (l < r)` still speculates the
+// first iteration's load (P9.38, softBodySelfCollisionBda), and a load from address
+// 0 faults.  So the search never sees the raw pointer: dfFilterArray() selects a
+// caller-supplied safe address (the descriptor the count was read from) when the
+// count is 0.  The search reads nothing from it -- the loop does not run -- and
+// the answer is the CUDA's.
 // ===========================================================================
 module pxgSlangDefFilter;
 
-import pxgSlangParticleDesc;   // P9.39b: PxgParticleSystemGpu / PxgParticleSimBufferGpu
+import pxgSlangDeformableRef;
+import pxgSlangFEMClothDesc;    // PxgFEMClothGpu: mRigidSurfaceFilterPairs, mSurfaceSurfaceFilterPairs
+import pxgSlangSoftBodyDesc;    // PxgSoftBodyGpu: mRigidVolumeFilterPairs, mVolume*FilterPairs
 
-public struct PxgRigidFilterPairRec
+public struct DfFilterArray
 {
-    public uint2 index0;
-    public uint2 index1;
-    public uint index2;
-    public uint pad0, pad1, pad2;
+    public uint64_t pairs;  // PxgDeformablePairInfo*, never null
+    public uint count;
 }
 
-// F1: an unsigned 64-bit comparison, high word first.
-public bool dfU64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-public bool dfU64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-// `find(pairs, nbPairs, rigidId, compressedId)` -- the query's index1 is a PxU32
-// widened to PxU64, so its high word is zero, and index2 is zero.
-public bool dfFindRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 rigidId, uint compressedId)
+// `safeAddr` must be a mapped address of at least 16 bytes (the owning descriptor).
+public DfFilterArray dfFilterArray(uint64_t pairs, uint count, uint64_t safeAddr)
 {
-    Ptr<PxgRigidFilterPairRec> pairs = Ptr<PxgRigidFilterPairRec>(pairsAddr);
-    const uint2 q0 = rigidId;
-    const uint2 q1 = uint2(compressedId, 0u);
+    DfFilterArray a;
+    a.pairs = (count == 0u) ? safeAddr : pairs;
+    a.count = count;
+    return a;
+}
 
-    uint l = 0u, r = nbPairs;
+// The per-actor arrays, read from the descriptor at `addr` (which doubles as the safe
+// address).  The CUDA passes `femCloth.mRigidSurfaceFilterPairs,
+// femCloth.mNumRigidSurfaceFilterPairs` at every call site; these are that pair.
+public DfFilterArray clothRigidSurfaceFilters(uint64_t clothAddr)
+{
+    Ptr<PxgFEMClothGpu> c = Ptr<PxgFEMClothGpu>(clothAddr);
+    return dfFilterArray(c[0].mRigidSurfaceFilterPairs, c[0].mNumRigidSurfaceFilterPairs, clothAddr);
+}
+public DfFilterArray clothSurfaceSurfaceFilters(uint64_t clothAddr)
+{
+    Ptr<PxgFEMClothGpu> c = Ptr<PxgFEMClothGpu>(clothAddr);
+    return dfFilterArray(c[0].mSurfaceSurfaceFilterPairs, c[0].mNumSurfaceSurfaceFilterPairs, clothAddr);
+}
+public DfFilterArray softBodyRigidVolumeFilters(uint64_t softBodyAddr)
+{
+    Ptr<PxgSoftBodyGpu> b = Ptr<PxgSoftBodyGpu>(softBodyAddr);
+    return dfFilterArray(b[0].mRigidVolumeFilterPairs, b[0].mNumRigidVolumeFilterPairs, softBodyAddr);
+}
+public DfFilterArray softBodyVolumeVolumeFilters(uint64_t softBodyAddr)
+{
+    Ptr<PxgSoftBodyGpu> b = Ptr<PxgSoftBodyGpu>(softBodyAddr);
+    return dfFilterArray(b[0].mVolumeVolumeFilterPairs, b[0].mNumVolumeVolumeFilterPairs, softBodyAddr);
+}
+public DfFilterArray softBodyVolumeSurfaceFilters(uint64_t softBodyAddr)
+{
+    Ptr<PxgSoftBodyGpu> b = Ptr<PxgSoftBodyGpu>(softBodyAddr);
+    return dfFilterArray(b[0].mVolumeSurfaceFilterPairs, b[0].mNumVolumeSurfaceFilterPairs, softBodyAddr);
+}
+
+// PxNodeIndex as the uint2 the port's remap-table reads produce.
+public uint64_t dfNodeU64(uint2 node)
+{
+    return uint64_t(node.x) | (uint64_t(node.y) << uint64_t(32));
+}
+
+// find(const PxgDeformablePairInfo*, nbPairs, pair).
+public bool dfFind(DfFilterArray arr, uint64_t ref0, uint64_t ref1)
+{
+    PxgDeformablePairInfoGpu pair = PxgMakePairInfo(ref0, ref1);
+    uint l = 0u, r = arr.count;
     while (l < r)
     {
         const uint mid = (l + r) / 2u;
-        const PxgRigidFilterPairRec p = pairs[mid];
+        const int cmp = PxgComparePairInfo(pair, PxgLoadPairInfo(arr.pairs, mid));
 
-        // PxgRigidFilterPair::compare, with the query on the left.
-        int cmp = 0;
-        if (dfU64Lt(q0, p.index0)) cmp = -1;
-        else if (dfU64Lt(p.index0, q0)) cmp = 1;
-        else if (dfU64Lt(q1, p.index1)) cmp = -1;
-        else if (dfU64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;      // the query's index2 is 0
-
-        // F2.
-        if (cmp == 0 || (dfU64Eq(q0, p.index0) && dfU64Eq(q1, p.index1)))
+        if (cmp == 0)
             return true;
-
-        if (cmp < 0) r = mid; else l = mid + 1u;
+        if (cmp < 0)
+            r = mid;
+        else
+            l = mid + 1u;
     }
     return false;
 }
 
-
-// ===========================================================================
-// The NON-RIGID record.  PxgNonRigidFilterPair (PxgSimulationCoreDesc.h:235) is 16
-// bytes -- PxU64 index0, PxU32 index1, PxU32 index2 -- and its find()
-// (deformableElementFilter.cuh:130) is the same probe-and-accept loop as the rigid
-// one over its own compare().
-//
-// P9.38 FOUND TWO ALGORITHMS HERE, and that is why this exists.  Of the four
-// BDA-addressed non-rigid searches in the corpus, softBodySelfCollisionBda and
-// softBodySoftBodyMidphaseBda transcribed the engine's loop, while
-// softBodyClothContactGenBda and softBodyClothVertContactGenBda wrote a LOWER-BOUND
-// search instead -- narrow to the first element >= (index0, index1), then test that
-// one element.  Both give the right answer, and the reason is worth writing down
-// rather than trusting: entries sharing an (index0, index1) form a CONTIGUOUS run
-// because index2 is the last sort key, the engine's loop keeps that run inside
-// [l, r) at every step, and a loop that only exits at l == r must therefore probe
-// into it -- where the ignoreIndex2 disjunct fires.  Equivalent, but two algorithms
-// where the engine has one is a maintenance hazard, so both are gone.
-//
-// THE NULL GUARD IS NOT HERE, DELIBERATELY.  mFilteringPairs is null whenever a body
-// registered no filter pairs, which is the common case, and on llvmpipe a zero-trip
-// `while (l < r)` still speculates the first iteration's load and faults at address
-// 0 -- with per-lane garbage that breaks warp uniformity and then a workgroup
-// barrier.  The fix is to select a non-null POINTER, and only the caller knows which
-// of its own buffers is safe to point at, so each caller keeps that choice and hands
-// this function an address it has already made safe together with r = 0.  The full
-// diagnosis is in softBodySelfCollisionBda.slang.
-public static const uint64_t DF_NRPAIR_STRIDE = 16UL;
-
-// The GENERAL form -- deformableElementFilter.cuh:128, with index2 and ignoreIndex2
-// as parameters rather than baked in.  P9.39b generalised it: the softbody-vs-particle
-// contact gen calls the SAME engine overload with a real index2 (a particle buffer's
-// mUniqueId) and ignoreIndex2 = FALSE, which is precisely the case F2 above warns is
-// load-bearing elsewhere.  Baking `true` in would have made that caller silently
-// accept pairs that differ in index2.
-public bool dfFindNonRigidPair3(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1,
-                                uint id2, bool ignoreIndex2)
+// Volume against volume: ref0 a vertex of the probing volume's collision mesh, ref1 a
+// tetrahedron of the other volume.
+public bool findVolumeVolumeFilter(DfFilterArray arr, uint volumeId0, uint volumeVertexId0,
+                                   uint volumeId1, uint volumeTetId1)
 {
-    const uint2 q0 = uint2(id0, 0u);        // the query's index0 is a widened PxU32
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const uint64_t e = pairsAddr + uint64_t(mid) * DF_NRPAIR_STRIDE;
-        const uint2 pIndex0 = uint2(Ptr<uint>(e)[0], Ptr<uint>(e + 4UL)[0]);
-        const uint pIndex1 = Ptr<uint>(e + 8UL)[0];
-        const uint pIndex2 = Ptr<uint>(e + 12UL)[0];
-
-        // PxgNonRigidFilterPair::compare.
-        int cmp = 0;
-        if (dfU64Lt(q0, pIndex0)) cmp = -1;
-        else if (dfU64Lt(pIndex0, q0)) cmp = 1;
-        else if (id1 < pIndex1) cmp = -1;
-        else if (id1 > pIndex1) cmp = 1;
-        else if (id2 < pIndex2) cmp = -1;
-        else if (id2 > pIndex2) cmp = 1;
-
-        if (cmp == 0 || (ignoreIndex2 && dfU64Eq(q0, pIndex0) && id1 == pIndex1))
-            return true;
-
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
+    return dfFind(arr, PxgEncodeDeformableVertex(volumeId0, volumeVertexId0),
+                  PxgEncodeDeformableTetrahedron(volumeId1, volumeTetId1));
 }
 
-// The two-key overload (deformableElementFilter.cuh:150): index2 = 0, ignoreIndex2 =
-// true.  A wrapper rather than a second loop, so the two cannot drift apart.
-public bool dfFindNonRigidPair(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+// Rigid against volume: ref0 the rigid's filter reference, ref1 a tetrahedron.
+public bool findRigidVolumeFilter(DfFilterArray arr, uint64_t rigidId, uint rigidCacheRef,
+                                  uint volumeId, uint volumeTetId)
 {
-    return dfFindNonRigidPair3(pairsAddr, nbPairs, id0, id1, 0u, true);
+    return dfFind(arr, PxgEncodeRigidFilterRef(rigidId, rigidCacheRef),
+                  PxgEncodeDeformableTetrahedron(volumeId, volumeTetId));
 }
 
-// findRange (deformableElementFilter.cuh:99): the upper-bound search that returns
-// r - 1.
-//
-// THE UNDERFLOW IS THE CONTRACT, not an accident.  When `value` precedes the first
-// entry the loop leaves r == 0 and the return WRAPS to 0xffffffff; the engine relies
-// on the callers never asking that question, and a port that "fixes" it with a max(0)
-// would answer a question the engine does not answer.  Transcribed as written.
-public uint dfFindRange(uint64_t valuesAddr, uint length, uint value)
+// Volume against surface, single-vertex paths: ref0 a tetrahedron, ref1 a vertex.
+public bool findVolumeSurfaceVertexFilter(DfFilterArray arr, uint volumeId, uint volumeTetId,
+                                          uint surfaceId, uint surfaceVertexId)
 {
-    if (length == 0u)
-        return 0u;
-    Ptr<uint> values = Ptr<uint>(valuesAddr);
-    uint l = 0u, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2u;
-        if (values[m] > value) r = m; else l = m + 1u;
-    }
-    return r - 1u;
+    return dfFind(arr, PxgEncodeDeformableTetrahedron(volumeId, volumeTetId),
+                  PxgEncodeDeformableVertex(surfaceId, surfaceVertexId));
 }
 
-// find(const PxgParticleSystem&, pairs, nbPairs, compressedParticleId, compressedId1)
-// -- deformableElementFilter.cuh:167.  The chain: which particle BUFFER owns this
-// particle, that buffer's mUniqueId, then the three-key search with ignoreIndex2 =
-// FALSE.
-//
-// NOT THE SAME CHAIN AS THE RIGID PARTICLE FILTER, which is the trap.  The rigid one
-// (psContactGenBda.slang:344) subtracts the runsum to get a LOCAL particle id and
-// searches THAT BUFFER'S OWN mFilterPairs array.  This one keeps the GLOBAL
-// compressed id as index0, searches a SINGLE shared array handed in by the caller,
-// and uses the buffer's mUniqueId as the third key.  Same lookup of `id`, different
-// use of it in every respect that follows.
-public bool dfFindParticleNonRigid(uint64_t particleSystemAddr, uint64_t pairsAddr,
-                                   uint nbPairs, uint compressedParticleId, uint compressedId1)
+// Volume against surface, whole-triangle paths: ref0 a tetrahedron, ref1 a triangle.
+public bool findVolumeSurfaceTriangleFilter(DfFilterArray arr, uint volumeId, uint volumeTetId,
+                                            uint surfaceId, uint surfaceTriId)
 {
-    Ptr<PxgParticleSystemGpu> ps = Ptr<PxgParticleSystemGpu>(particleSystemAddr);
-    // PxGetParticleIndex on a PxU32 argument is the identity -- the engine's parameter
-    // is PxU32 while the helper takes PxU64, so the widening drops nothing.
-    const uint particleId = compressedParticleId;
-    const uint id = dfFindRange(ps[0].mParticleBufferRunsum,
-                                ps[0].mCommonData_NumParticleBuffers, particleId);
-    Ptr<PxgParticleSimBufferGpu> simBufs = Ptr<PxgParticleSimBufferGpu>(ps[0].mParticleSimBuffers);
-    const uint uniqueId = simBufs[id].mUniqueId;
-    return dfFindNonRigidPair3(pairsAddr, nbPairs, compressedParticleId, compressedId1,
-                               uniqueId, false);
+    return dfFind(arr, PxgEncodeDeformableTetrahedron(volumeId, volumeTetId),
+                  PxgEncodeDeformableTriangle(surfaceId, surfaceTriId));
+}
+
+// Rigid against surface, single-vertex paths: ref0 the rigid's filter reference, ref1 a vertex.
+public bool findRigidSurfaceVertexFilter(DfFilterArray arr, uint64_t rigidId, uint rigidCacheRef,
+                                         uint surfaceId, uint surfaceVertexId)
+{
+    return dfFind(arr, PxgEncodeRigidFilterRef(rigidId, rigidCacheRef),
+                  PxgEncodeDeformableVertex(surfaceId, surfaceVertexId));
+}
+
+// Rigid against surface, whole-triangle paths: ref0 the rigid's filter reference, ref1 a triangle.
+public bool findRigidSurfaceTriangleFilter(DfFilterArray arr, uint64_t rigidId, uint rigidCacheRef,
+                                           uint surfaceId, uint surfaceTriId)
+{
+    return dfFind(arr, PxgEncodeRigidFilterRef(rigidId, rigidCacheRef),
+                  PxgEncodeDeformableTriangle(surfaceId, surfaceTriId));
+}
+
+// Surface against surface, vertex-triangle: ref0 a vertex of the probing surface, ref1 a
+// triangle of the other.
+public bool findSurfaceSurfaceVertexTriangleFilter(DfFilterArray arr, uint surfaceId0, uint surfaceVertexId0,
+                                                   uint surfaceId1, uint surfaceTriId1)
+{
+    return dfFind(arr, PxgEncodeDeformableVertex(surfaceId0, surfaceVertexId0),
+                  PxgEncodeDeformableTriangle(surfaceId1, surfaceTriId1));
+}
+
+// Surface against surface, edge-edge: both refs are triangle edges.
+public bool findSurfaceSurfaceEdgeEdgeFilter(DfFilterArray arr, uint surfaceId0, uint surfaceTriId0,
+                                             uint localEdge0, uint surfaceId1, uint surfaceTriId1,
+                                             uint localEdge1)
+{
+    return dfFind(arr, PxgEncodeDeformableTriangleEdge(surfaceId0, surfaceTriId0, localEdge0),
+                  PxgEncodeDeformableTriangleEdge(surfaceId1, surfaceTriId1, localEdge1));
 }

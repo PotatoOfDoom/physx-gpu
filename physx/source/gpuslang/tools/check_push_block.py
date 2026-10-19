@@ -70,7 +70,10 @@
 # and the bridge put it at @96 (paramAlign(80) = 16; push 176).  Coverage was FULL
 # and NO-MEMBER silent -- every argument was overlapped by SOME member -- while on the
 # engine path w_outPoint read bridge padding and every later writer field sat one
-# slot off.  The scene that finally reached it segfaulted.
+# slot off.  The scene that finally reached it segfaulted.  (PhysX 5.12 replaced the
+# writer with the same-sized PxgRigidDbContactWriter and dropped the filter-pair
+# arguments, so the bridge now pads the eight pointers' @72 to @80; the selftest keeps
+# the defect's shape on the 5.12 row: a writer at its natural @72 against the row's @80.)
 #
 # So every reached leaf member of the push block (nested Slang structs recursed) is
 # now laid against the row's arguments AS THE BRIDGE PLACES THEM (paramAlign), with
@@ -993,12 +996,13 @@ def _swap_member_names(m, entry, a, b):
 
 
 def _sdf_block(writer_at):
-    """sb_sdfMeshMidphaseGeneratePairsLaunch's push block with the writer at `writer_at`."""
+    """sb_sdfMeshMidphaseGeneratePairsLaunch's push block (PhysX 5.12) with the writer at
+    `writer_at`: the eight pointers end at @72 and paramAlign(80) = 16 puts the row's
+    writer at @80."""
     out = [(0, 4, "tolerenceLength", "f"), (4, 8, "_pad4", "i")]
-    out += [(8 + 8 * i, 16 + 8 * i, "ptr%d" % i, "i") for i in range(9)]
-    out += [(80, 84, "nbFilterPairs", "i"), (84, 88, "_pad84", "i")]
-    if writer_at == 96:
-        out.append((88, 96, "_pad88", "i"))
+    out += [(8 + 8 * i, 16 + 8 * i, "ptr%d" % i, "i") for i in range(8)]
+    if writer_at == 80:
+        out.append((72, 80, "_pad72", "i"))
     out += [(writer_at + 8 * i, writer_at + 8 + 8 * i, "w_ptr%d" % i, "i") for i in range(9)]
     out += [(writer_at + 72, writer_at + 76, "w_maxNumContacts", "i"),
             (writer_at + 76, writer_at + 80, "_pad%d" % (writer_at + 76), "i")]
@@ -1037,24 +1041,25 @@ def selftest(shader_dir):
                 fails.append("SELFTEST BROKEN: %s -- %s" % (label, e))
             if got is None or rule not in got:
                 fails.append("SELFTEST: %s must give %s at %s; got %s" % (label, rule, k, got))
-    # The P9.97b defect itself, synthetic: the writer at @88 over the row's writer at @96.
+    # The P9.97b defect itself, synthetic, on the 5.12 row: the writer at its natural @72
+    # over the row's writer at @80.
     name = "sb_sdfMeshMidphaseGeneratePairsLaunch"
-    row = [4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80]
+    row = [4, 8, 8, 8, 8, 8, 8, 8, 8, 80]
     flat = arg_fields(name, row, sigs)
     if flat is None:
-        fails.append("SELFTEST: the FEM writer of %s cannot be flattened" % name)
+        fails.append("SELFTEST: the rigid writer of %s cannot be flattened" % name)
     else:
-        for at in (88, 96):
+        for at in (72, 80):
             blk = _sdf_block(at)
             reached = [(a, b) for (a, b, n, _k) in blk if "pad" not in n]
             got = join_check(row, flat, blk, reached)[0]
-            if at == 88:
+            if at == 72:
                 rules = set(r for (r, _m, _d) in got)
                 if not {"PAD-READ", "CUT"} <= rules:
-                    fails.append("SELFTEST: a writer @88 against the row's @96 must give PAD-READ and CUT; "
+                    fails.append("SELFTEST: a writer @72 against the row's @80 must give PAD-READ and CUT; "
                                  "got %s" % rules)
             elif got:
-                fails.append("SELFTEST: the writer @96 must join cleanly; got %s" % got)
+                fails.append("SELFTEST: the writer @80 must join cleanly; got %s" % got)
     # STRADDLE over two 4-byte arguments, and the legal packed-bool word.
     got = set(r for (r, _m, _d) in join_check([8, 4, 4], [(0, 8, 0), (8, 12, 1), (12, 16, 2)],
                                                [(0, 8, "p", "i"), (8, 16, "two", "i")], None)[0])
@@ -1240,12 +1245,14 @@ def selftest(shader_dir):
         src = open(cu).read()
         at = src.find("void %s(" % K)
         win = src[at:at + 600]
-        old = "\tconst PxgShape* PX_RESTRICT gpuShapes,\n\tconst PxgSoftBody* PX_RESTRICT softbodies,\n"
-        new = "\tconst PxgShape* PX_RESTRICT softbodies,\n\tconst PxgSoftBody* PX_RESTRICT gpuShapes,\n"
-        if at < 0 or win.count(old) != 1:
+        # Whitespace-tolerant: the 5.12 vendored source aligns the parameter names with tabs.
+        reS = re.compile(r"(const PxgShape\* PX_RESTRICT\s+)gpuShapes,")
+        reB = re.compile(r"(const PxgSoftBody\* PX_RESTRICT\s+)softbodies,")
+        if at < 0 or len(reS.findall(win)) != 1 or len(reB.findall(win)) != 1:
             fails.append("SELFTEST BROKEN: NS3 -- CUDA anchor not found once; re-anchor")
         else:
-            mut = lap.signatures_in(src[:at] + win.replace(old, new) + src[at + 600:], "selftest:" + K)
+            winm = reB.sub(r"\1gpuShapes,", reS.sub(r"\1softbodies,", win))
+            mut = lap.signatures_in(src[:at] + winm + src[at + 600:], "selftest:" + K)
             rel, line, _p = mut[K][0]
             nms = lap._SIG_NAMES[(rel, line)]
             named3 = [(a, b, i, (nms[i] if n is not None and "." not in n else n), ty)
@@ -1333,9 +1340,10 @@ def selftest(shader_dir):
     try:
         w = names_of(K)[-10:]
         if w != ["writer." + f for f in ("outPoint", "outNormalPen", "outBarycentric", "outContactInfo",
-                                         "totalContactCount", "contactByX", "tempContactByX",
-                                         "contactIndexSortedByX", "contactSortedByX", "maxNumContacts")]:
-            fails.append("SELFTEST NS12: the FEM writer's field names, in layout order; got %s" % w)
+                                         "outRigidMaterialIndex", "totalContactCount", "contactByRigid",
+                                         "tempContactByRigid", "contactIndexSortedByRigid",
+                                         "maxNumContacts")]:
+            fails.append("SELFTEST NS12: the rigid writer's field names, in layout order; got %s" % w)
         g = [n for n in names_of("preIntegrationLaunch") if n and n.startswith("gravity")]
         if g != ["gravity.x", "gravity.y", "gravity.z"]:
             fails.append("SELFTEST NS12: a by-value PxVec3 is named per component; got %s" % g)

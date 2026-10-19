@@ -28,7 +28,7 @@
 // A CUDA-shaped parameter block carrying three raw device addresses travels
 // through push constants; the dispatch binds ZERO descriptors; the kernel
 // dereferences the addresses like CUDA device pointers.  This is the model
-// the P3 PxCudaContext shim uses to launch all 501 registry kernels without
+// the P3 PxCudaContext shim uses to launch all 487 registry kernels (PhysX 5.12) without
 // per-kernel binding-table rewrites.
 
 #include "pxgTestFramework.h"

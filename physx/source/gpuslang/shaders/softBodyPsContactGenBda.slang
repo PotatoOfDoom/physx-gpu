@@ -29,17 +29,17 @@
 // P9.39c -- sb_psContactGenLaunch
 // gpunarrowphase/src/CUDA/softbodyPrimitives.cu:2086 (wrapper), :1961
 // (sbParticleCollision), :1730 (PointOutsideOfPlane4), :1864
-// (closestPtTetrahedron), deformableCollision.cuh:96 (computeTetBarycentric),
-// deformableElementFilter.cuh:167 (the particle filter chain),
-// PxgFEMCore.h:467/:428 (PxgFEMContactWriter::writeContact) -- all read in full.
+// (closestPtTetrahedron) and, in PhysX 5.12, PxgDeformableContactWriters.h
+// (PxgParticleDbContactWriter::writeVolumeContact) -- all read in full.
 //
 // The SECOND half of the softbody-vs-particle chain, on top of P9.39a's midphase.
 // One particle against one tetrahedron, at most one contact, no warp aggregation:
 // every contact takes its own atomicAdd of 1.
 //
-// This is the kernel P9.39b existed for.  Its filter is the ONLY caller in the
-// corpus that needs `ignoreIndex2 = false` and a real index2, and it reaches it
-// through dfFindParticleNonRigid -- the particle-buffer chain, not the rigid one.
+// PhysX 5.12 REMOVED this kernel's filter (the particle-buffer filter chain P9.39b was
+// written for is gone from the engine), its rest distance, its barycentric and the
+// sorted-to-unsorted lookup that keyed the filter.  What is left is the surface-hint
+// gate, the closest point and the volume write.
 //
 // ---------------------------------------------------------------------------
 // TRAPS
@@ -48,22 +48,10 @@
 //     P9.39a's midphase pushes.  The y and z words are NOT interchangeable and the
 //     midphase fixture pins their order.
 //
-// S2 -- THREE GATES, SHORT-CIRCUITED IN THIS ORDER:
-//         surfaceMask == 0  ||  find(..., particleMask, tetFullMask)
-//                           ||  find(..., particleMask, tetMask)
-//     and any of them RETURNS -- this is a skip, not a contact.  The two finds use
-//     the SAME particle key and differ only in the second: tetFullMask names the
-//     WHOLE softbody (PX_MAX_NB_DEFORMABLE_VOLUME_TET as the tet id), tetMask names
-//     this one tetrahedron.  Collapsing them to one lookup loses whole-body
-//     filtering; swapping their order is unobservable but written as the engine
-//     writes it.
-//
-// S3 -- TWO DIFFERENT PARTICLE INDICES, AND THEY ARE NOT INTERCHANGEABLE.
-//     The FILTER key is the UNSORTED index (mSortedToUnsortedMapping[particleIndex]);
-//     the POSITION and the contact's pairInd0 use the SORTED index unchanged.  The
-//     engine spells this out by building `particleMask` from unsortedParticleIndex
-//     and `compressedParticleIndex` from particleIndex, thirty lines apart.  A port
-//     that uses one index for both compiles, runs, and filters the wrong particle.
+// S2 -- ONE GATE (5.12): surfaceMask == 0 RETURNS.  5.6.1 also skipped the pair when
+//     the (unsorted particle, whole softbody) or (unsorted particle, tet) pair was in the
+//     particle-buffer filter list; 5.12 dropped that filter, and with it 5.6.1's
+//     sorted/unsorted index split -- the particle is named by its SORTED index throughout.
 //
 // S4 -- PointOutsideOfPlane4 IS USED ONLY AS A CONJUNCTION HERE.  The engine returns
 //     a float4 of four sign products and this kernel asks only
@@ -74,13 +62,14 @@
 //     it.  Recorded so the next reader does not "simplify" that one too.
 //
 // S5 -- TWO PENETRATION BRANCHES THAT COMPUTE DIFFERENT THINGS.
-//     Inside the tetrahedron:  pen = dot(n, n2) - restDistance, and the normal
-//       becomes n2 -- the SURFACE normal from closestPtTetrahedron, not the
-//       point-to-point direction.
+//     Inside the tetrahedron:  pen = dot(n, n2), and the normal becomes n2 -- the
+//       SURFACE normal from closestPtTetrahedron, not the point-to-point direction.
 //     Outside:  the squared-distance early-out fires FIRST (sqDist > cDistance^2 is
 //       a return, and cDistance is squared, not compared against sqrt), then
-//       pen = |n| (via normalize) - restDistance, and n is replaced by n2 only when
-//       the two disagree (dot < 0.8) or the distance is degenerate (sqDist < 1e-8).
+//       pen = |n| (via normalize), and n is replaced by n2 only when the two disagree
+//       (dot < 0.8) or the distance is degenerate (sqDist < 1e-8).
+//     PhysX 5.12 moved the rest distance out of contact generation: 5.6.1 subtracted
+//     restDistances[cmIdx] in both branches.
 //     The contact distance gate exists ONLY in the outside branch: a particle inside
 //     the tetrahedron always produces a contact regardless of cDistance.
 //
@@ -112,20 +101,21 @@ module softBodyPsContactGenBda;
 
 import pxgSlangSoftBodyDesc;    // PxgSoftBodyGpu (mTetMeshSurfaceHint@8, mTetIndices@16,
                                 //                 mPosition_InvMass@64)
-import pxgSlangParticleDesc;    // PxgParticleSystemGpu (mSortedPositions_InvMass@24,
-                                //                       mSortedToUnsortedMapping@56)
-import pxgSlangDefFilter;       // P9.39b: dfFindParticleNonRigid
+import pxgSlangParticleDesc;    // PxgParticleSystemGpu (mSortedPositions_InvMass@24)
+import pxgSlangDeformableRef;   // PxgEncodeParticleRef, PxgEncodeDeformableTetrahedron
+import pxgSlangDeformableWriters; // PxgParticleDbContactWriterGpu
 import pxgSlangTetClosest;      // isPointOutsideOfPlane4 / closestPtTetrahedron
 
 static const uint GEOM_PARTICLESYSTEM = 6u;
 
-// PxgSimulationCoreDesc.h:104 -- the sentinel tet id that names the WHOLE softbody.
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0xfffffu;
 
 static const uint SBPSCG_GRID  = 512u;
 static const uint SBPSCG_BLOCK = 256u;
 static const uint SBPSCG_STRIDE = SBPSCG_GRID * SBPSCG_BLOCK;
 
+// sb_psContactGenLaunch (5.12): twelve arguments, the last of them
+// PxgParticleDbContactWriter by value (72 B, paramAlign 8) -> 160-byte blob.
+// ABI row {4,8,8,8,8,8,8,4,8,8,8,72}.
 struct SbPsCgParams
 {
     float toleranceLength;            // @0   (ABI parity only)
@@ -133,29 +123,25 @@ struct SbPsCgParams
     uint64_t cmInputs;                // @8
     uint64_t transformCache;          // @16  (ABI parity only -- nothing is transformed)
     uint64_t contactDistance;         // @24
-    uint64_t restDistance;            // @32
-    uint64_t gpuShapes;               // @40
-    uint64_t particleSystems;         // @48
-    uint64_t softbodies;              // @56
-    uint64_t filterPairs;             // @64
-    uint numFilterPairs;              // @72
-    uint stackSizeBytes;              // @76
-    uint64_t stackPtr;                // @80
-    uint64_t midphasePairsNum;        // @88
-    uint64_t stackSizeNeeded;         // @96  atomicMax output
-    uint2 _pad104;                    // @104 -> the by-value writer is 16-ALIGNED
-    // ---- PxgFEMContactWriter (by value, 80 B) @112 ----
-    uint64_t w_outPoint;              // @112
-    uint64_t w_outNormalPen;          // @120
-    uint64_t w_outBarycentric;        // @128
-    uint64_t w_outContactInfo;        // @136  PxgFemOtherContactInfo* (16 B stride)
-    uint64_t w_totalContactCount;     // @144
-    uint64_t w_contactByX;            // @152  PxU64* -- the PARTICLE sort key
-    uint64_t w_tempContactByX;        // @160
-    uint64_t w_contactIndexSortedByX; // @168
-    uint64_t w_contactSortedByX;      // @176  NULL for particles; never written
-    uint w_maxNumContacts;            // @184
-    uint _pad188;                     // @188 -> 192
+    uint64_t gpuShapes;               // @32
+    uint64_t particleSystems;         // @40
+    uint64_t softbodies;              // @48
+    uint stackSizeBytes;              // @56
+    uint _pad60;                      // @60
+    uint64_t stackPtr;                // @64
+    uint64_t midphasePairsNum;        // @72
+    uint64_t stackSizeNeeded;         // @80  atomicMax output
+    // ---- PxgParticleDbContactWriter (by value, 72 B) @88 ----
+    uint64_t w_outPoint;                     // @88
+    uint64_t w_outNormalPen;                 // @96
+    uint64_t w_outBarycentric;               // @104 (not written: writeVolumeContact)
+    uint64_t w_outContactInfo;               // @112 PxgDeformablePairInfo*
+    uint64_t w_totalContactCount;            // @120
+    uint64_t w_contactByParticle;            // @128 PxU64* -- the PARTICLE sort key
+    uint64_t w_tempContactByParticle;        // @136
+    uint64_t w_contactIndexSortedByParticle; // @144
+    uint w_maxNumContacts;                   // @152
+    uint _pad156;                            // @156 -> 160
 }
 
 [[vk::push_constant]] ConstantBuffer<SbPsCgParams> gSc;
@@ -202,60 +188,17 @@ uint surfaceHint(uint64_t hintBase, uint primIdx)
     return (word >> shift) & 0xffu;
 }
 
-// P9.86: PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146), and the float
-// PxMax/PxMin are the selects `a > b ? a : b` / `a < b ? a : b`
-// (PxUnixMathIntrinsics.h:116-125).  Slang's clamp is GLSL.std.450 FClamp, which
-// llvmpipe lowers to maxps(t, +0): +0 for t = -0 (and 0 for NaN), where the CUDA
-// keeps -0 (and NaN).  Identical to FClamp for every other input.
-float sbPsPxClamp01(float t)
+PxgParticleDbContactWriterGpu scWriter()
 {
-    const float lo = (0.0f > t) ? 0.0f : t;   // PxMax(0, t)
-    return (1.0f < lo) ? 1.0f : lo;           // PxMin(1, lo)
-}
-
-// deformableCollision.cuh:96.  Four SEPARATE divisions by detBcd -- the engine writes
-// `detPcd / detBcd` three times over and never forms a reciprocal, so this is one of
-// the few places a divide is faithful.  The sum is `((1 - v) - w) - x`, left to right.
-bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
-                           out float4 barycentric)
-{
-    const float eps = 1e-5f;
-    const float minEps = -eps, maxEps = 1.0f + eps;
-    const float3 ba = b - a, ca = c - a, da = d - a, pa = point - a;
-
-    const float detBcd = dot(ba, cross(ca, da));
-    const float v = dot(pa, cross(ca, da)) / detBcd;
-    const float w = dot(ba, cross(pa, da)) / detBcd;
-    const float x = dot(ba, cross(ca, pa)) / detBcd;
-    const float u = 1.0f - v - w - x;
-    barycentric = float4(sbPsPxClamp01(u), sbPsPxClamp01(v),
-                         sbPsPxClamp01(w), sbPsPxClamp01(x));   // P9.86: PxClamp (deformableCollision.cuh:133-136)
-    return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
-           (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
-}
-
-// PxgFEMContactWriter::writeContact (PxgFEMCore.h:467) -> writeContactNoBarycentric
-// (:428) plus outBarycentric.  Seven arrays; the word at info+12 (rigid material /
-// inCollision) is NOT touched by this overload, and contactSortedByX is null for the
-// particle writer and never written.
-void writeContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
-                  uint2 pairInd0, uint pairInd1, uint2 id)
-{
-    if (index >= gSc.w_maxNumContacts)
-        return;
-
-    Ptr<uint2>(gSc.w_contactByX)[index] = id;
-    Ptr<uint>(gSc.w_tempContactByX)[index] = id.x;      // PxU32(id & 0xffffffff)
-    Ptr<uint>(gSc.w_contactIndexSortedByX)[index] = index;
-
-    Ptr<float4>(gSc.w_outPoint)[index] = contact;
-    Ptr<float4>(gSc.w_outNormalPen)[index] = normalPen;
-
-    const uint64_t infoBase = gSc.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(infoBase + 0UL)[0] = pairInd0;
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-
-    Ptr<float4>(gSc.w_outBarycentric)[index] = barycentric;
+    PxgParticleDbContactWriterGpu w;
+    w.outPoint = gSc.w_outPoint;                 w.outNormalPen = gSc.w_outNormalPen;
+    w.outBarycentric = gSc.w_outBarycentric;     w.outContactInfo = gSc.w_outContactInfo;
+    w.totalContactCount = gSc.w_totalContactCount;
+    w.contactByParticle = gSc.w_contactByParticle;
+    w.tempContactByParticle = gSc.w_tempContactByParticle;
+    w.contactIndexSortedByParticle = gSc.w_contactIndexSortedByParticle;
+    w.maxNumContacts = gSc.w_maxNumContacts;
+    return w;
 }
 
 [shader("compute")]
@@ -290,7 +233,6 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         Ptr<float> contactDistance = Ptr<float>(gSc.contactDistance);
         const float cDistance = contactDistance[particleCacheRef] +
                                 contactDistance[softbodyCacheRef];
-        const float restDistance = Ptr<float>(gSc.restDistance)[cmIdx];
 
         const uint softbodyId = softbodyShape.particleOrSoftbodyId;
         const uint particleSystemId = particleShape.particleOrSoftbodyId;
@@ -301,37 +243,11 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
         const uint4 tetIdx = tetIndices[tetrahedronIdx];
 
-        // S3: the FILTER key is the UNSORTED index; the position below uses the sorted one.
-        const uint unsortedParticleIndex =
-            Ptr<uint>(particleSystems[particleSystemId].mSortedToUnsortedMapping)[particleIndex];
-
-        // PxEncodeParticleIndex (PxgSimulationCoreDesc.h:118): (systemId << 32) | index.
-        // The filter overload takes a PxU32 and the engine hands it this PxU64, so the
-        // system id is TRUNCATED AWAY at the call -- only the index survives.  Written
-        // as the surviving half rather than as a u64 that is immediately discarded.
-        const uint particleMask = unsortedParticleIndex;
-
-        // PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h:110): (id << 20) | tetId.
-        const uint tetMask = (softbodyId << 20u) | tetrahedronIdx;
-        const uint tetFullMask = (softbodyId << 20u) | PX_MAX_NB_DEFORMABLE_VOLUME_TET;
-
         const uint surfaceMask = surfaceHint(softbodies[softbodyId].mTetMeshSurfaceHint,
                                              tetrahedronIdx);
 
-        // S2.  The null-pair bound stays at the CALL SITE, as pxgSlangDefFilter's header
-        // requires: with no filter pairs the module is handed a known-safe address and
-        // r = 0, so the speculated load in its loop cannot fault on llvmpipe.
-        const bool havePairs = (gSc.filterPairs != 0UL) && (gSc.numFilterPairs != 0u);
-        const uint64_t pairsAddr = havePairs ? gSc.filterPairs : gSc.softbodies;
-        const uint nbPairs = havePairs ? gSc.numFilterPairs : 0u;
-
-        if (surfaceMask == 0u ||
-            dfFindParticleNonRigid(gSc.particleSystems +
-                                       uint64_t(particleSystemId) * PXG_PARTICLE_SYSTEM_STRIDE,
-                                   pairsAddr, nbPairs, particleMask, tetFullMask) ||
-            dfFindParticleNonRigid(gSc.particleSystems +
-                                       uint64_t(particleSystemId) * PXG_PARTICLE_SYSTEM_STRIDE,
-                                   pairsAddr, nbPairs, particleMask, tetMask))
+        // S2 (5.12): the only gate.
+        if (surfaceMask == 0u)
             continue;
 
         const float3 a = tetmeshVerts[tetIdx.x].xyz;
@@ -344,20 +260,17 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         // S4: the engine's float4 is consumed only as this conjunction.
         const bool inside = isPointOutsideOfPlane4(p, a, b, c, d);
 
-        float4 tBarycentric;
         float3 closestP = float3(0.0f, 0.0f, 0.0f);
         float3 n2 = float3(0.0f, 0.0f, 0.0f);
         float sqDist = 3.4028234663852886e+38f;          // PX_MAX_F32
         closestPtTetrahedron(p, surfaceMask, a, b, c, d, n2, closestP, sqDist);
-
-        computeTetBarycentric(a, b, c, d, closestP, tBarycentric);
 
         float3 n = -(p - closestP);
         float pen;
 
         if (inside)                                       // S5
         {
-            pen = dot(n, n2) - restDistance;
+            pen = dot(n, n2);
             n = n2;
         }
         else
@@ -383,8 +296,6 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
             if (sqDist < 1e-8f || dot(n, n2) < 0.8f)
                 n = n2;
-
-            pen -= restDistance;
         }
 
         // S7: the counter increments even when the write is dropped.
@@ -393,9 +304,9 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         if (index >= gSc.w_maxNumContacts)
             continue;
 
-        const uint2 compressedParticleIndex = uint2(particleIndex, particleSystemId);
-        writeContact(index, float4(p, 0.0f), float4(n, pen), tBarycentric,
-                     compressedParticleIndex, tetMask, compressedParticleIndex);
+        const uint64_t particleRef = PxgEncodeParticleRef(particleSystemId, particleIndex);
+        const uint64_t tetRef = PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx);
+        scWriter().writeVolumeContact(index, float4(p, 0.0f), float4(n, pen), particleRef, tetRef);
     }
 
     if (globalThreadIdx == 0u)                            // S10

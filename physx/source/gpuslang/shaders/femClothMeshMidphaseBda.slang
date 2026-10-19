@@ -374,7 +374,7 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
                               Ptr<float>(gCm.contactDistance)[triCacheRef];
 
     const uint nbTriangles = clothes[clothId].mNbTriangles;
-    Ptr<uint4> clothTriIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+    Ptr<uint4> clothTriIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
     Ptr<float4> clothVerts = Ptr<float4>(clothes[clothId].mPosition_InvMass);
 
     const uint stackCapacity = gCm.stackSizeBytes / 16u;

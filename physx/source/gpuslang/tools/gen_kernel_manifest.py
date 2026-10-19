@@ -26,7 +26,7 @@
 # Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 # gen_kernel_manifest.py — RUNTIME_PLAN.md P3/P4: generate the Slang kernel
-# manifest that maps each of the 501 CUDA registry kernel IDs
+# manifest that maps each of the 487 CUDA registry kernel IDs (PhysX 5.12; 501 in 5.6.1)
 # (PxgKernelNames.h, enum order) to the compiled Slang SPIR-V module + entry
 # point that replaces it.  The mapping is by exact CUDA-function-name equality:
 # the Phase-1 launch-kernel ports keep the CUDA __global__ name as the Slang

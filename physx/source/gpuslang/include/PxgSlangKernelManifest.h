@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 487;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 407;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 414;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -198,9 +198,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortCopy2", "directApiBda.spv", "radixSortCopy2" },  // RS_COPY_VALUE2 (P9.79 BDA re-point)
     { "accumulateDeltaVRigidFirstLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidFirstLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_FIRST (P9.44)
     { "accumulateDeltaVRigidSecondLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND (P9.44)
-    { "accumulateDeltaVRigidSecondLaunchMultiStage1", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunchMultiStage1" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (P9.44)
-    { "accumulateDeltaVRigidSecondLaunchMultiStage2", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunchMultiStage2" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2 (P9.44)
-    { "clearDeltaVRigidSecondLaunchMulti", "rigidDeltaAccumBda.spv", "clearDeltaVRigidSecondLaunchMulti" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (P9.44)
+    { "accumulateDeltaVRigidSecondLaunchMultiStage1", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (unmapped: orphaned in 5.12, no launch; port kept in rigidDeltaAccumBda for testRigidDeltaAccum)
+    { "accumulateDeltaVRigidSecondLaunchMultiStage2", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2 (unmapped: orphaned in 5.12, no launch; port kept in rigidDeltaAccumBda for testRigidDeltaAccum)
+    { "clearDeltaVRigidSecondLaunchMulti", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (unmapped: orphaned in 5.12, no launch; port kept in rigidDeltaAccumBda for testRigidDeltaAccum)
     { "rigidSumInternalContactAndJointBatches1", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1" },  // RIGID_SUM_STATIC_CONTACT1 (P5 Step 4 BDA port)
     { "rigidSumInternalContactAndJointBatches2", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2" },  // RIGID_SUM_STATIC_CONTACT2 (P5 Step 4 BDA port)
     { "solveStaticBlock", "solverPGS.spv", "solveStaticBlock" },  // RIGID_SOLVE_STATIC_CONSTRAINTS (P5 Step 5 BDA port)
@@ -230,7 +230,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_contactPrepareLaunch", "psContactSolveBda.spv", "ps_contactPrepareLaunch" },  // PS_CONTACT_PREPARE (P6.4b-2 BDA port: particle-vs-primitive contact constraint prep)
     { "ps_solvePCOutputParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch" },  // PS_SOLVE_PC_PARTICLE (P6.4b-2 BDA port: particle-side PC solve -> per-contact deltaV)
     { "ps_solvePCOutputRigidDeltaVLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVLaunch" },  // PS_SOLVE_PC_RIGID (P9.44)
-    { "ps_queryPCContactReferenceCountLaunch", nullptr, nullptr },  // PS_QUERY_PC_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "ps_queryPCContactReferenceCountLaunch", "psContactSolveBda.spv", "ps_queryPCContactReferenceCountLaunch" },  // PS_QUERY_PC_REFERENCE_COUNT (new in 5.12: the PC mass-splitting pre-count)
     { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
     { "ps_findStartEndParticleFirstLaunch", "psContactSortBda.spv", "ps_findStartEndParticleFirstLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (P6.4b-1 BDA port: per-block range-start offsets)
     { "ps_findStartEndParticleSecondLaunch", "psContactSortBda.spv", "ps_findStartEndParticleSecondLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (P6.4b-1 BDA port: per-particle [start,end) ranges + pair count)
@@ -256,7 +256,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", "npPsMaterials.spv", "ps_updateMaterials" },  // PS_UPDATE_MATERIALS
-    { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
+    { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (5.12: PxgDeformableAttachment -> PxgDbDbAttachmentBlock)
     { "sb_gm_preIntegrateLaunch", "softBodySimBda.spv", "sb_gm_preIntegrateLaunch" },  // SB_SIM_PREINTEGRATION (P8.0 BDA port: softbody free-fall predict/integrate)
     { "sb_refitBoundLaunch", "softBodyRefitBda.spv", "sb_refitBoundLaunch" },  // SB_REFITBOUND (P8.0 tranche 2 BDA port)
     { "sb_midphaseGeneratePairsLaunch", "softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch" },  // SB_MIDPHASE_PRIMITIVES (P8.2 tranche a BDA port)
@@ -281,18 +281,18 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_clothContactPrepareLaunch", "softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch" },  // SB_SC_CONTACTPREPARE (P8.8 step 5 BDA port — softbody-vs-cloth constraint prepare)
     { "sb_particleContactPrepareLaunch", "softBodyPsPrepareBda.spv", "sb_particleContactPrepareLaunch" },  // SB_SP_CONTACTPREPARE
     { "sb_solveRigidSoftAttachmentLaunch", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (P8.3 attachment port)
-    { "sb_queryRigidSoftAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_RIGID_SOFT_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
-    { "sb_querySoftBodyAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SOFTBODY_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
-    { "sb_queryClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
-    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", "softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch" },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
+    { "sb_queryRigidSoftAttachmentReferenceCountLaunch", "softBodyRigidAttachBda.spv", "sb_queryRigidSoftAttachmentReferenceCountLaunch" },  // SB_QUERY_RIGID_SOFT_ATTACHMENT_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
+    { "sb_querySoftBodyAttachmentReferenceCountLaunch", "softBodyFemAttachBda.spv", "sb_querySoftBodyAttachmentReferenceCountLaunch" },  // SB_QUERY_SOFTBODY_ATTACHMENT_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
+    { "sb_queryClothAttachmentReferenceCountLaunch", "softBodyClothAttachBda.spv", "sb_queryClothAttachmentReferenceCountLaunch" },  // SB_QUERY_CLOTH_ATTACHMENT_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
+    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", "softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch" },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA
     { "sb_solveOutputClothAttachmentDeltaVLaunch", "softBodyClothAttachBda.spv", "sb_solveOutputClothAttachmentDeltaVLaunch" },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (P9.33c BDA)
     { "sb_queryRigidSoftContactReferenceCountLaunch", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveRigidSoftCollisionLaunch", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunch" },  // SB_SOLVE_RIGID_SOFT_COLLISION (P8.2 tranche e BDA port; chain kernels 6 and 7)
-    { "sb_querySSContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SS_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "sb_querySSContactReferenceCountLaunch", "softBodySelfSolveBda.spv", "sb_querySSContactReferenceCountLaunch" },  // SB_QUERY_SS_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
     { "sb_solveOutputSSDeltaVLaunch", "softBodySelfSolveBda.spv", "sb_solveOutputSSDeltaVLaunch" },  // SB_SOLVE_SOFT_SOFT_BOTH_DELTA (P8.4 tranche b BDA port)
-    { "sb_querySCContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SC_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "sb_querySCContactReferenceCountLaunch", "softBodyClothSolveBda.spv", "sb_querySCContactReferenceCountLaunch" },  // SB_QUERY_SC_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
     { "sb_solveOutputSCDeltaVLaunch", "softBodyClothSolveBda.spv", "sb_solveOutputSCDeltaVLaunch" },  // SB_SOLVE_SOFT_CLOTH_BOTH_DELTA (P8.8 step 6 BDA port — closes the softbody-vs-cloth chain)
-    { "sb_querySBParticleContactReferenceCountLaunch", nullptr, nullptr },  // SB_QUERY_SP_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "sb_querySBParticleContactReferenceCountLaunch", "softBodyPsSolveBda.spv", "sb_querySBParticleContactReferenceCountLaunch" },  // SB_QUERY_SP_REFERENCE_COUNT (new in 5.12: the softbody mass-splitting pre-count)
     { "sb_solveOutputSPDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputSPDeltaVLaunch" },  // mapped P9.39e
     { "sb_solveOutputParticleDeltaVLaunch", "softBodyPsSolveBda.spv", "sb_solveOutputParticleDeltaVLaunch" },  // mapped P9.39e
     { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port; hex branch P9.95f)
@@ -412,12 +412,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_queryClothClothContactEECountLaunch", "femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch" },  // CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT (P7.2 tranche 2 BDA port: EE self-contact reference-count)
     { "cloth_applyExternalDeltasLaunch", "femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch" },  // CLOTH_APPLY_EXTERNAL_DELTAS (P7.1 tranche 3c BDA port: fold mDeltaPos into position/velocity)
     { "cloth_updateClothContactValidityLaunch", "femClothClothContactBda.spv", "cloth_updateClothContactValidityLaunch" },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (P7.2 tranche 2 BDA port: per-vertex contact-pair validity refresh)
-    { "cloth_queryCPContactReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CP_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "cloth_queryCPContactReferenceCountLaunch", "femClothPsSolveBda.spv", "cloth_queryCPContactReferenceCountLaunch" },  // CLOTH_QUERY_CP_REFERENCE_COUNT (new in 5.12: the cloth-particle mass-splitting pre-count)
     { "cloth_solveCPOutputClothDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputClothDeltaVLaunch" },  // CLOTH_PARTICLE_CLOTH_DELTA (P9.31 BDA)
     { "cloth_solveCPOutputParticleDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputParticleDeltaVLaunch" },  // CLOTH_PARTICLE_PARTICLE_DELTA (P9.31 BDA)
     { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)
-    { "cloth_queryRigidClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_RIGID_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
-    { "cloth_queryClothClothAttachmentReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CLOTH_ATTACHMENT_REFERENCE_COUNT (unmapped, new in 5.12)
+    { "cloth_queryRigidClothAttachmentReferenceCountLaunch", "femClothRigidAttachBda.spv", "cloth_queryRigidClothAttachmentReferenceCountLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_ATTACHMENT_REFERENCE_COUNT (new in 5.12: the rigid-cloth attachment pre-count)
+    { "cloth_queryClothClothAttachmentReferenceCountLaunch", "femClothAttachBda.spv", "cloth_queryClothClothAttachmentReferenceCountLaunch" },  // CLOTH_QUERY_CLOTH_CLOTH_ATTACHMENT_REFERENCE_COUNT (new in 5.12: the cloth-cloth attachment pre-count)
     { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", "femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch" },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (P9.32 BDA)
     { "cloth_finalizeVelocitiesLaunch", "femClothSimBda.spv", "cloth_finalizeVelocitiesLaunch" },  // CLOTH_FINALIZE_VELOCITIES (P7.0 BDA port)
     { "cloth_sleeping", "femClothSimBda.spv", "cloth_sleeping" },  // CLOTH_SLEEPING (P7.0 BDA port: wake-counter bookkeeping)

@@ -39,20 +39,19 @@
 //     mParticleSelfCollisionCount, zeroing mDensityCollisionImpulses.  blockDim
 //     = 64 (PxgParticleSystemCore.cpp:1050), grid (numBlocks,1,1); the `id`
 //     selects the system directly (no blockIdx.y).
-//   - ps_solveOneWayContactDeltaVLaunch (particlesystem.cu:1823) + its device
-//     helper solvePCOutputDeltaVTGS (particlesystem.cu:1473): solve the
+//   - ps_solveOneWayContactDeltaVLaunch (particlesystem.cu, PhysX 5.12): solve the
 //     accumulated per-particle one-way (particle-vs-static) contacts
-//     (mOneWayContactInfos/mOneWayContactCount/mOneWayForces) into a Jacobi
-//     position delta accumulated in mAccumDeltaP.  blockDim = PS_SOLVE = 256
+//     (mOneWayContactInfos/mOneWayContactCount/mOneWayForces) with
+//     solveRigidDbContact (pxgSlangDeformableAndParticleUtils) into a position delta
+//     accumulated in mAccumDeltaP.  blockDim = PS_SOLVE = 256
 //     (PxgParticleSystemCore.cpp:1370), grid (numBlocks,nbActive,1);
 //     activeParticleSystems[blockIdx.y] selects the system.
 //   - ps_applyDeltaLaunch (particlesystem.cu:3689): SOR-average the Jacobi delta
 //     buffer mDelta into mAccumDeltaP and clear mDelta.  blockDim = 64
 //     (PxgParticleSystemCore.cpp:1519), grid (numBlocks,nbActive,1).
-//   - ps_updateParticleLaunch (particlesystem.cu:3010): apply mAccumDeltaP to the
-//     sorted positions, recompute the sorted velocity from the position change
-//     (updateSortedVelocity), fold mAccumDeltaP into mSortedDeltaP, clear
-//     mAccumDeltaP.  blockDim = PS_SOLVE = 256 (PxgParticleSystemCore.cpp:1561),
+//   - ps_updateParticleLaunch (particlesystem.cu, PhysX 5.12): recompute the sorted
+//     velocity from mAccumDeltaP and clear it; outside velocity iterations also apply
+//     it to the sorted positions and fold it into mSortedDeltaP.  blockDim = PS_SOLVE = 256 (PxgParticleSystemCore.cpp:1561),
 //     grid (numBlocks,nbActive,1).
 //
 // Differences from CUDA (recipe policy):
@@ -90,6 +89,7 @@
 // maxParticles*maxNeighborhood.
 
 import pxgSlangParticleDesc;
+import pxgSlangDeformableAndParticleUtils; // PxgRigidPart, PxgDeformablePart, solveRigidDbContact (one-way solve)
 
 // PxgParticleSystemKernelBlockDim (PxgParticleSystemCoreKernelIndices.h):
 static const uint PS_SELFCOLLISION_BLOCK = 64u;  // selfCollision + applyDelta launch block
@@ -334,113 +334,31 @@ void ps_selfCollisionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupI
     }
 }
 
-// ---------------------------------------------------------------------------
-// solvePCOutputDeltaVTGS (particlesystem.cu:1473) — the TGS constraint-solve
-// output, transcribed as in npPsSolvePCTGS.  pmin/pmax = PxMin/PxMax ternaries,
-// quart(x)=x^4, abs=PxAbs; guarded divisions are single-rounding.
-// ---------------------------------------------------------------------------
-float pmin(float a, float b) { return (a < b) ? a : b; }
-float pmax(float a, float b) { return (a > b) ? a : b; }
-float quart(float x) { return x * x * x * x; }
-
-struct PcResult { float deltaF; float deltaFr0; float deltaFr1; float2 appliedForce; }
-
-PcResult solvePCOutputDeltaVTGS(
-    float3 normal, float error, float3 delta,
-    float3 fric0, float3 fric1,
-    float tanDelta0, float tanDelta1,
-    float tanVel0, float tanVel1,
-    float normalDelta, float normalVel,
-    float velMultiplier, float vmF0, float vmF1,
-    float frictionCoefficient, float restOffset,
-    float adhesion, float adhesionRadiusScale,
-    bool isVelocityIteration, float dt,
-    float2 appliedForce)
-{
-    const float projectionDt = isVelocityIteration ? 0.0f : dt;
-    const float separation = (error - dot(normal, delta) + normalDelta) + normalVel * projectionDt;
-    float clamp = -appliedForce.x;
-
-    if (adhesionRadiusScale > 0.0f && adhesion > 0.0f)
-    {
-        const float adhesionRadius = restOffset * adhesionRadiusScale - restOffset;
-        if (separation < adhesionRadiusScale)
-        {
-            clamp = pmin(clamp, -pmax(0.0f, adhesion * quart(1.0f - separation / adhesionRadius)
-                                             * pmax(0.0f, separation) * velMultiplier));
-        }
-    }
-
-    PcResult r;
-    r.deltaF = pmax(clamp, -separation * velMultiplier);
-    appliedForce.x = pmax(0.0f, appliedForce.x + r.deltaF);
-
-    const float maxFriction = abs(appliedForce.x) * frictionCoefficient;
-
-    const float biasedF0 = -(dot(fric0, delta) - tanDelta0);
-    const float biasedF1 = -(dot(fric1, delta) - tanDelta1);
-    const float requiredF0Force = (biasedF0 + tanVel0 * projectionDt) * vmF0;
-    const float requiredF1Force = (biasedF1 + tanVel1 * projectionDt) * vmF1;
-
-    const float requiredForce = sqrt(requiredF0Force * requiredF0Force + requiredF1Force * requiredF1Force);
-    const float recipRequiredForce = (requiredForce >= 1e-16f) ? (1.0f / requiredForce) : 0.0f;
-
-    const float ratio0 = requiredF0Force * recipRequiredForce;
-    const float ratio1 = requiredF1Force * recipRequiredForce;
-
-    const float deltaFr = pmin(requiredForce + appliedForce.y, maxFriction) - appliedForce.y;
-    appliedForce.y = appliedForce.y + deltaFr;
-
-    r.deltaFr0 = deltaFr * ratio0;
-    r.deltaFr1 = deltaFr * ratio1;
-    r.appliedForce = appliedForce;
-    return r;
-}
-
-// PxComputeBasisVectors (PxMathUtils.h:297) — two unit tangents to `dir`.
-float3 normalize3(float3 v)
-{
-    const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    // PxComputeBasisVectors calls PxVec3::normalize() (PxMathUtils.h:303, :313),
-    // which is operator/= -- 1.0/m formed ONCE, then three multiplies.  P9.36.
-    if (m > 0.0f)
-    {
-        const float inv = 1.0f / m;
-        v.x = v.x * inv;
-        v.y = v.y * inv;
-        v.z = v.z * inv;
-    }
-    return v;
-}
-void computeBasisVectors(float3 dir, out float3 right, out float3 up)
-{
-    if (abs(dir.y) <= 0.9999f)
-    {
-        right = normalize3(float3(dir.z, 0.0f, -dir.x));
-        up = float3(dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x);
-    }
-    else
-    {
-        right = float3(1.0f, 0.0f, 0.0f);
-        up = normalize3(float3(0.0f, dir.z, -dir.y));
-    }
-}
+float pmax(float a, float b) { return (a > b) ? a : b; }   // PxMax = selectMax
 
 // ---------------------------------------------------------------------------
-// ps_solveOneWayContactDeltaVLaunch — one-way (static) contact solve
-// (particlesystem.cu:1823)
+// ps_solveOneWayContactDeltaVLaunch -- one-way (particle vs static mesh) contact solve,
+// PhysX 5.12 (particlesystem.cu).
 // ---------------------------------------------------------------------------
-// argSizes (launch site PxgParticleSystemCore.cpp:1359): { particleSystems*,
-// activeParticleSystems*, PxReal invDt, PxReal dt, PxReal biasCoefficient,
-// bool isVelocityIteration } -> {8,8,4,4,4,1} -> 32-byte blob (bool at @28).
+// 5.12 routes every one-way contact through the deformable/particle solve core:
+// solveRigidDbContact with adhesion against a NODELESS static rigid
+// (PxgRigidPart::readNodelessStatic), the particle a single-vertex PxgDeformablePart.
+// The 5.6.1 solvePCOutputDeltaVTGS helper and the biasCoefficient argument are gone;
+// the pair's depenetration clamp is the particle system's mPenBiasClamp alone.  The
+// per-particle delta is the scale-averaged sum of the contacts' position deltas (the
+// velocity * dt equivalent in velocity iterations), added to mAccumDeltaP.xyz.
+//
+// argSizes (launch site PxgParticleSystemCore.cpp solveOneWayCollision):
+// { particleSystems*, activeParticleSystems*, PxReal invDt, PxReal dt,
+// bool isVelocityIteration } -> {8,8,4,4,1} -> 32-byte blob (bool at @24).
+// Grid (numBlocks, nbActiveParticleSystems, 1), block PS_SOLVE.
 struct PsSolveOneWayParams
 {
     uint64_t particleSystems;       // @0
     uint64_t activeParticleSystems; // @8
     float invDt;                    // @16 (unused by the kernel body, kept for the pack)
     float dt;                       // @20
-    float biasCoefficient;          // @24
-    uint isVelocityIterationWord;   // @28 (byte0 = bool) -> 32
+    uint isVelocityIterationWord;   // @24 (byte0 = bool) -> 32
 }
 [[vk::push_constant]]
 ConstantBuffer<PsSolveOneWayParams> gSolve;
@@ -449,39 +367,39 @@ ConstantBuffer<PsSolveOneWayParams> gSolve;
 [numthreads(256, 1, 1)]
 void ps_solveOneWayContactDeltaVLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gSolve.particleSystems);
     const uint particleId = (Ptr<uint>(gSolve.activeParticleSystems))[groupId.y];
+    Ptr<PxgParticleSystemGpu> particleSystem = Ptr<PxgParticleSystemGpu>(gSolve.particleSystems
+                                                   + uint64_t(particleId) * PXG_PARTICLE_SYSTEM_STRIDE);
 
     const float dt = gSolve.dt;
-    const float biasCoefficient = gSolve.biasCoefficient;
     const bool isVelocityIteration = (gSolve.isVelocityIterationWord & 0xffu) != 0u;
 
-    const uint numParticles = systems[particleId].mCommonData_NumParticles;
+    const uint numParticles = particleSystem[0].mCommonData_NumParticles;
     const uint groupThreadIdx = groupThreadId.x + groupId.x * PS_SOLVE;
 
     if (groupThreadIdx >= numParticles)
         return;
 
-    Ptr<float4> contacts = Ptr<float4>(systems[particleId].mOneWayContactInfos); // PxgParticleContactInfo == float4
-    Ptr<uint> contactCounts = Ptr<uint>(systems[particleId].mOneWayContactCount);
+    Ptr<float4> contacts = Ptr<float4>(particleSystem[0].mOneWayContactInfos); // PxgParticleContactInfo == float4 mNormal_PenW
+    Ptr<uint> contactCounts = Ptr<uint>(particleSystem[0].mOneWayContactCount);
 
-    Ptr<uint> phases = Ptr<uint>(systems[particleId].mSortedPhaseArray);
-    const uint64_t phaseToMat = systems[particleId].mPhaseGroupToMaterialHandle;
-    const uint64_t materials = systems[particleId].mParticleMaterials;
-    const uint materialStride = systems[particleId].mParticleMaterialStride;
+    Ptr<uint> phases = Ptr<uint>(particleSystem[0].mSortedPhaseArray);
+    const uint64_t phaseToMat = particleSystem[0].mPhaseGroupToMaterialHandle;
+    const uint64_t materials = particleSystem[0].mParticleMaterials;
+    const uint materialStride = particleSystem[0].mParticleMaterialStride;
 
     const uint phase = phases[groupThreadIdx];
     const uint group = phase & PXG_PARTICLE_PHASE_GROUP_MASK;
     const uint mi = loadPhaseToMaterial(phaseToMat, group);
 
-    const float frictionCoefficient = loadMaterialFloat(materials, mi, materialStride, 0u); // friction
-    const float adhesion = loadMaterialFloat(materials, mi, materialStride, 2u);            // adhesion
-    const float adhesionRadiusScale = loadMaterialFloat(materials, mi, materialStride, 4u); // adhesionRadiusScale
-    const float restOffset = systems[particleId].mData_RestOffset;
+    const float frictionCoefficient = loadMaterialFloat(materials, mi, materialStride, PXG_PMAT_FRICTION);
+    const float adhesionRadiusScale = loadMaterialFloat(materials, mi, materialStride, PXG_PMAT_ADHESION_RADIUS_SCALE);
+    const float adhesion = loadMaterialFloat(materials, mi, materialStride, PXG_PMAT_ADHESION);
+    const float restOffset = particleSystem[0].mData_RestOffset;
 
-    Ptr<float2> appliedForces = Ptr<float2>(systems[particleId].mOneWayForces);
-    Ptr<float4> accumDeltaP = Ptr<float4>(systems[particleId].mAccumDeltaP);
-    Ptr<float4> deltaP = Ptr<float4>(systems[particleId].mSortedDeltaP);
+    Ptr<float2> appliedForces = Ptr<float2>(particleSystem[0].mOneWayForces);
+    Ptr<float4> accumDeltaP = Ptr<float4>(particleSystem[0].mAccumDeltaP);
+    Ptr<float4> deltaP = Ptr<float4>(particleSystem[0].mSortedDeltaP);
 
     const uint rawCount = contactCounts[groupThreadIdx];
     const uint contactCount = (PS_MAX_STATIC_CONTACTS_PER_PARTICLE < rawCount)
@@ -490,12 +408,15 @@ void ps_solveOneWayContactDeltaVLaunch(uint3 groupThreadId : SV_GroupThreadID, u
     if (contactCount != 0u)
     {
         const float4 dp_ = deltaP[groupThreadIdx];
-        const float3 dp = float3(dp_.x, dp_.y, dp_.z);
-        const float invMass = dp_.w;
+        const float3 posDelta = float3(dp_.x, dp_.y, dp_.z);
+
+        // velocity * dt in velocity iterations, the position delta otherwise.
+        const float3 relParticleDelta = readParticleLinDelta(particleSystem, groupThreadIdx, dp_, dt, isVelocityIteration);
 
         float denom = 0.0f;
-        float3 thisDeltaP = float3(0.0f, 0.0f, 0.0f);
 
+        const float invMass = dp_.w;
+        float3 thisDeltaP = float3(0.0f, 0.0f, 0.0f);
         for (uint c = 0u, offset = groupThreadIdx; c < contactCount; ++c, offset += numParticles)
         {
             const float4 normalPenW = contacts[offset];
@@ -504,39 +425,51 @@ void ps_solveOneWayContactDeltaVLaunch(uint3 groupThreadId : SV_GroupThreadID, u
             // normal is flipped to be the same as for constraints.
             const float3 normal = float3(-normalPenW.x, -normalPenW.y, -normalPenW.z);
 
-            float3 t0, t1;
-            computeBasisVectors(normal, t0, t1);
+            float3 tangent0, tangent1;
+            dpComputeBasisVectors(normal, tangent0, tangent1);
 
-            const float velMultiplier = 1.0f / invMass;
+            PxgRigidPart rigid = PxgRigidPart();
+            rigid.readNodelessStatic();
 
-            PcResult res = solvePCOutputDeltaVTGS(
-                normal, normalPenW.w, dp,
-                t0, t1,
-                0.0f, 0.0f,   // tanDelta0, tanDelta1
-                0.0f, 0.0f,   // tanVel0, tanVel1
-                0.0f,         // normalDelta
-                0.0f,         // normalVel  (PxRigidStatic does not move)
-                velMultiplier,
-                velMultiplier, velMultiplier,
-                frictionCoefficient,
-                restOffset,
-                adhesion,
-                adhesionRadiusScale,
-                isVelocityIteration,
-                dt,
-                appliedForce);
+            PxgDeformablePart particle = PxgDeformablePart();
+            particle.dim = 3u;
+            particle.linDelta = relParticleDelta;
+            particle.posDelta = posDelta;
+            particle.vertexInvMasses = float4(invMass, 0.0f, 0.0f, 0.0f);
+            particle.bc = float4(1.0f, 0.0f, 0.0f, 0.0f);
+            particle.friction = frictionCoefficient;
+            particle.adhesion = adhesion;
+            particle.adhesionRadius = restOffset * (adhesionRadiusScale - 1.0f);
 
-            const float3 deltaLinVel = (float3(-(normal.x * res.deltaF), -(normal.y * res.deltaF), -(normal.z * res.deltaF))
-                                        + t0 * res.deltaFr0 + t1 * res.deltaFr1) * invMass * biasCoefficient;
-            const float scale = (res.deltaF != 0.0f) ? 1.0f : 0.0f;
+            PxgDbContactPair contactPair = PxgDbContactPair();
+            PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+            contactPair.normal = normal;
+            contactPair.tangent0 = tangent0;
+            contactPair.initPen = normalPenW.w;
+            contactPair.maxPenBiasClamp = particleSystem[0].mData_PenBiasClamp;
 
-            thisDeltaP = thisDeltaP + deltaLinVel;
-            denom = denom + scale;
-            appliedForces[offset] = res.appliedForce;
+            solveRigidDbContact(rigid, particle, contactPair, solveOut, appliedForce.x, appliedForce.y, dt,
+                                /*wasActive*/ true, /*checkOnlyActivity*/ false, isVelocityIteration,
+                                /*withAdhesion*/ true);
+            appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+            appliedForce.y += solveOut.deltaLambdaT;
+
+            float3 delta;
+            solveOut.computeDelta(contactPair, delta, dt);
+            const float scale = (solveOut.deltaLambdaN != 0.0f || solveOut.deltaLambdaT != 0.0f) ? 1.0f : 0.0f;
+
+            thisDeltaP = float3(thisDeltaP.x + delta.x * invMass, thisDeltaP.y + delta.y * invMass,
+                                thisDeltaP.z + delta.z * invMass);
+
+            denom += scale;
+            appliedForces[offset] = appliedForce;
         }
 
         if (denom != 0.0f)
-            thisDeltaP = thisDeltaP * (1.0f / denom);
+        {
+            const float r = 1.0f / denom;
+            thisDeltaP = float3(thisDeltaP.x * r, thisDeltaP.y * r, thisDeltaP.z * r);
+        }
 
         float4 delta = accumDeltaP[groupThreadIdx];
         delta.x += thisDeltaP.x;
@@ -595,18 +528,22 @@ void ps_applyDeltaLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
 }
 
 // ---------------------------------------------------------------------------
-// ps_updateParticleLaunch — apply mAccumDeltaP, recompute sorted velocity
-// (particlesystem.cu:3010)
+// ps_updateParticleLaunch -- apply mAccumDeltaP, recompute the sorted velocity
+// (particlesystem.cu, PhysX 5.12)
 // ---------------------------------------------------------------------------
-// argSizes (launch site PxgParticleSystemCore.cpp:1568): { particleSystems*,
-// activeParticleSystems*, PxReal invDt, bool skipNewPositionAdjustment } ->
-// {8,8,4,1} -> 24-byte blob (bool at @20).
+// 5.12 renames skipNewPositionAdjustment to isVelocityIteration and moves the
+// mSortedDeltaP update under it: a velocity iteration writes only the velocity
+// correction, the position and the accumulated delta are skipped together.
+//
+// argSizes (launch site PxgParticleSystemCore.cpp updateSortedVelocity):
+// { particleSystems*, activeParticleSystems*, PxReal invDt, bool isVelocityIteration }
+// -> {8,8,4,1} -> 24-byte blob (bool at @20).
 struct PsUpdateParticleParams
 {
     uint64_t particleSystems;       // @0
     uint64_t activeParticleSystems; // @8
     float invDt;                    // @16
-    uint skipWord;                  // @20 (byte0 = bool) -> 24
+    uint isVelocityIterationWord;   // @20 (byte0 = bool) -> 24
 }
 [[vk::push_constant]]
 ConstantBuffer<PsUpdateParticleParams> gUpdate;
@@ -619,7 +556,7 @@ void ps_updateParticleLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 group
     const uint particleId = (Ptr<uint>(gUpdate.activeParticleSystems))[groupId.y];
 
     const float invDt = gUpdate.invDt;
-    const bool skipNewPositionAdjustment = (gUpdate.skipWord & 0xffu) != 0u;
+    const bool isVelocityIteration = (gUpdate.isVelocityIterationWord & 0xffu) != 0u;
 
     const uint numParticles = systems[particleId].mCommonData_NumParticles;
     const uint groupThreadIdx = groupThreadId.x + groupId.x * PS_SOLVE;
@@ -639,12 +576,15 @@ void ps_updateParticleLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 group
 
         const float4 sortedPos = sortedNewPos[groupThreadIdx];
         float4 sortedNewP = sortedPos;
-        if (!skipNewPositionAdjustment)
+
+        if (!isVelocityIteration)
+        {
             sortedNewP += aDeltaP;
+            sortedDeltaP[groupThreadIdx] = dp + aDeltaP;
+        }
 
         accumDeltaP[groupThreadIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         sortedVelocity[groupThreadIdx] = newVel;
         sortedNewPos[groupThreadIdx] = float4(sortedNewP.x, sortedNewP.y, sortedNewP.z, sortedPos.w);
-        sortedDeltaP[groupThreadIdx] = dp + aDeltaP;
     }
 }

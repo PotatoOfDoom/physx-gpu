@@ -79,9 +79,10 @@
 //      equivalent.  Which is only true BECAUSE of S4, and stops being true the
 //      moment someone passes the cloth's real scale.
 //
-//  S5. THE FILTER NEEDS ALL THREE VERTICES.  `skipTriangle` is a conjunction of
-//      three finds, so a triangle survives if even one of its vertices is not
-//      filtered.  An `||` would drop triangles the engine keeps.
+//  S5. THE FILTER IS ONE (rigid, TRIANGLE) SEARCH (PhysX 5.12):
+//      findRigidSurfaceTriangleFilter over the cloth's mRigidSurfaceFilterPairs, keyed
+//      by the trimesh's transform cache ref.  5.6.1 skipped a triangle only when all
+//      three of its vertices were filtered; do not reintroduce that conjunction.
 //
 //  S6. `sep` IS RESCALED BEFORE THE SECOND GATE.  The order is: gate on
 //      `sep < cullScale`, then transform `dir` out of vertex space, then normalise
@@ -127,19 +128,20 @@
 #include "pxgSlangWarpInc.slang"
 
 import pxgSlangCommon;
-import pxgSlangDefFilter;   // P9.38
+import pxgSlangDefFilter;   // 5.12: findRigidSurfaceTriangleFilter
 import pxgSlangFEMClothDesc;
 import pxgSlangSdfTexture;
 import pxgSlangSdfCollision;
 import pxgSlangClothTriContact;   // computeBarycentric
-import pxgSlangConvexTriCloth;    // FcCtWriter + the contact write
+import pxgSlangDeformableRef;      // PxgEncodeDeformableTriangle
+import pxgSlangDeformableWriters;  // PxgRigidDbContactWriterGpu
 
 #include "pxgSlangSdfFind.slang"
 
 // cloth_sdfMeshContactGenLaunch(PxU32 numWorkItems, PxgContactManagerInput*,
 //   PxsCachedTransform*, PxReal* contactDistances, PxReal* restDistances, PxgShape*,
-//   PxgFEMCloth*, PxNodeIndex*, PxgRigidFilterPair*, PxU32 nbFilterPairs,
-//   PxgFEMContactWriter by value) -> ABI row {4,8,8,8,8,8,8,8,8,4,80}, 160-byte blob.
+//   PxgFEMCloth*, PxNodeIndex*, PxgRigidDbContactWriter by value) (5.12: the filter pair
+//   arguments are gone) -> ABI row {4,8,8,8,8,8,8,8,80}, 144-byte blob.
 struct ClothSdfCgParams
 {
     uint numWorkItems;             // @0
@@ -151,36 +153,34 @@ struct ClothSdfCgParams
     uint64_t gpuShapes;            // @40
     uint64_t femClothes;           // @48
     uint64_t shapeToRigidRemap;    // @56
-    uint64_t filterPairs;          // @64
-    uint nbFilterPairs;            // @72
-    uint _pad76;                   // @76
-    // ---- PxgFEMContactWriter (by value, 80B) @80 ----
-    uint64_t w_outPoint;             // @80
-    uint64_t w_outNormalPen;         // @88
-    uint64_t w_outBarycentric;       // @96
-    uint64_t w_outContactInfo;       // @104
-    uint64_t w_totalContactCount;    // @112
-    uint64_t w_contactByX;           // @120
-    uint64_t w_tempContactByX;       // @128
-    uint64_t w_contactIndexSortedByX; // @136
-    uint64_t w_contactSortedByX;     // @144
-    uint w_maxNumContacts;           // @152
-    uint _pad156;                    // @156 -> 160
+    // ---- PxgRigidDbContactWriter (by value, 80B) @64 ----
+    uint64_t w_outPoint;                  // @64
+    uint64_t w_outNormalPen;              // @72
+    uint64_t w_outBarycentric;            // @80
+    uint64_t w_outContactInfo;            // @88
+    uint64_t w_outRigidMaterialIndex;     // @96
+    uint64_t w_totalContactCount;         // @104
+    uint64_t w_contactByRigid;            // @112
+    uint64_t w_tempContactByRigid;        // @120
+    uint64_t w_contactIndexSortedByRigid; // @128
+    uint w_maxNumContacts;                // @136
+    uint _pad140;                         // @140 -> 144
 }
 
 [[vk::push_constant]] ConstantBuffer<ClothSdfCgParams> gCs;
 
-// PXG_BITSHIFT_ELEMENT_ID comes from pxgSlangConvexTriCloth, which already exports it.
 static const uint GEOM_TRIANGLEMESH = 8u;          // PxGeometryType::eTRIANGLEMESH
 
-FcCtWriter csWriter()
+PxgRigidDbContactWriterGpu csWriter()
 {
-    FcCtWriter w;
-    w.point = gCs.w_outPoint;          w.normalPen = gCs.w_outNormalPen;
-    w.bary = gCs.w_outBarycentric;     w.info = gCs.w_outContactInfo;
-    w.count = gCs.w_totalContactCount; w.byX = gCs.w_contactByX;
-    w.tempByX = gCs.w_tempContactByX;  w.idxByX = gCs.w_contactIndexSortedByX;
-    w.maxContacts = gCs.w_maxNumContacts;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gCs.w_outPoint;                 w.outNormalPen = gCs.w_outNormalPen;
+    w.outBarycentric = gCs.w_outBarycentric;     w.outContactInfo = gCs.w_outContactInfo;
+    w.outRigidMaterialIndex = gCs.w_outRigidMaterialIndex;
+    w.totalContactCount = gCs.w_totalContactCount;
+    w.contactByRigid = gCs.w_contactByRigid;     w.tempContactByRigid = gCs.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gCs.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gCs.w_maxNumContacts;
     return w;
 }
 
@@ -195,14 +195,13 @@ uint csGlobalScan(uint tid, bool contributes)
     return sdfGlobalScanExclusive(tid, contributes, gCs.w_totalContactCount);
 }
 
-// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
-// It was written out by hand fifteen times across this corpus; every copy was checked
-// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
-// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
-// re-derive one of them wrong.
-bool csFindRigid(uint nbPairs, uint2 q0, uint mask)
+// 5.12: findRigidSurfaceTriangleFilter(cloth->mRigidSurfaceFilterPairs, ..., rigidId,
+// trimeshCacheRef, clothId, ind); a null array is replaced by the descriptor (see
+// pxgSlangDefFilter on llvmpipe's speculated first load).
+bool csTriangleFiltered(uint clothId, uint2 rigidId, uint rigidCacheRef, uint triangleId)
 {
-    return dfFindRigidPair(gCs.filterPairs, nbPairs, q0, mask);
+    return findRigidSurfaceTriangleFilter(clothRigidSurfaceFilters(gCs.femClothes + uint64_t(clothId) * PXG_FEMCLOTH_STRIDE),
+                                          dfNodeU64(rigidId), rigidCacheRef, clothId, triangleId);
 }
 
 [shader("compute")]
@@ -270,7 +269,7 @@ void cloth_sdfMeshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
 
     const uint clothId = clothShape.particleOrSoftbodyId;
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gCs.femClothes);
-    const uint64_t triIdxAddr = clothes[clothId].mTriangleVertexIndices;
+    const uint64_t triIdxAddr = clothes[clothId].mTriangleVertexIndices_ownedEdges;
     const uint64_t posAddr = clothes[clothId].mPosition_InvMass;
     const uint nbClothTriangles = clothes[clothId].mNbTriangles;
 
@@ -296,14 +295,8 @@ void cloth_sdfMeshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
         {
             const uint4 triangle = Ptr<uint4>(triIdxAddr)[ind];
 
-            // S5: ALL THREE must be filtered for the triangle to be skipped.
-            const uint m0 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | triangle.x;
-            const uint m1 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | triangle.y;
-            const uint m2 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | triangle.z;
-            const bool skipTriangle =
-                csFindRigid(gCs.nbFilterPairs, rigidId, m0) &&
-                csFindRigid(gCs.nbFilterPairs, rigidId, m1) &&
-                csFindRigid(gCs.nbFilterPairs, rigidId, m2);
+            // S5: a filter pair for this rigid and triangle suppresses the triangle.
+            const bool skipTriangle = csTriangleFiltered(clothId, rigidId, trimeshCacheRef, ind);
 
             if (!skipTriangle)
             {
@@ -356,11 +349,11 @@ void cloth_sdfMeshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
         {
             const float3 worldNormal = quatRotate(meshQ, normal);
             const float3 worldPos = quatRotate(meshQ, pos) + meshP;
-            writeRigidVsDeformableContact(csWriter(), contactIndex,
-                                          float4(worldPos, rest),
-                                          float4(worldNormal, sep), tBarycentric,
-                                          rigidId, (clothId << PXG_BITSHIFT_ELEMENT_ID) | ind,
-                                          trimeshShape.materialIndex, rigidId);
+            const uint64_t rigidRef = dfNodeU64(rigidId);   // rigidId.getInd()
+            const uint64_t triRef = PxgEncodeDeformableTriangle(clothId, ind);
+            csWriter().writeSurfaceContact(contactIndex, float4(worldPos, rest),
+                                           float4(worldNormal, sep), rigidRef,
+                                           trimeshShape.materialIndex, triRef, tBarycentric);
         }
     }
 }

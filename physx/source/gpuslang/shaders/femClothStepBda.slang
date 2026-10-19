@@ -252,7 +252,7 @@ void cloth_stepLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             const float3 prevPosRest = prevPosInRestOffset[globalThreadIndex].xyz;
 
             const float maxLinVel = femCloths[id].mMaxLinearVelocity;
-            const float maxDistance = (maxLinVel < 0.0f) ? 0.8f * femCloths[id].mRestDistance
+            const float maxDistance = (maxLinVel < 0.0f) ? 0.8f * femCloths[id].mRestOffset
                                                          : maxLinVel * dt;
             const float maxDistanceSq = maxDistance * maxDistance;
 

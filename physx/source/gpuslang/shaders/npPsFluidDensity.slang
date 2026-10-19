@@ -47,7 +47,7 @@
 // the manifest entry name matches the kernel name and there is one body to
 // sweep rather than two.
 //
-// STAGING DROPPED.  The CUDA blockCopy<float>s the whole 656-byte
+// STAGING DROPPED.  The CUDA blockCopy<float>s the whole 608-byte
 // PxgParticleSystem into __shared__ and then reads every field from the copy.
 // Nothing writes the descriptor, so direct BDA reads are byte-identical; this is
 // the same bandwidth-only staging particleSim / particleSelfCollisionBda already

@@ -28,8 +28,8 @@
 //
 // The Phase-1 battery for the cloth VERTEX vs convex contact path
 // (femClothPrimitives.cu clothVertexConvexCollision + closestVertToConvex +
-// computeClosestPolygon + distancePointSegment, plus
-// deformableElementFilter.cuh find(PxgRigidFilterPair*)).
+// computeClosestPolygon + distancePointSegment, plus the 5.12
+// deformableElementFilter.cuh findRigidSurfaceVertexFilter).
 //
 // P9.21 -- THE ALGEBRA MOVED TO pxgSlangVertexConvexCloth.  This shader keeps
 // its entry point and its battery, which is what verifies the lift: the battery
@@ -38,13 +38,11 @@
 // copy of itself.  What remains here is exactly what the engine kernel
 // cloth_convexVertexContactGenLaunch also has to supply for itself:
 //
-//   * the LIVE attachment-filter check -- find(filterPairs, nbPairs, rigidId,
-//     PxEncodeClothIndex(clothId, vertexIdx)), a binary search over the
-//     PxgRigidFilterPair list navigated by the 3-key (index0, index1, index2)
-//     lexicographic compare and accepting on exact match OR (ignoreIndex2)
-//     index0/index1 equality.  A filtered vertex generates NOTHING, and the
-//     quantifier is a SINGLE match -- the triangle sibling next door skips only
-//     when all three corners match;
+//   * the LIVE attachment-filter check (PhysX 5.12) -- findRigidSurfaceVertexFilter:
+//     ONE exact binary search of the sorted PxgDeformablePairInfo list for
+//     (PxgEncodeRigidFilterRef(rigidId, rigidCacheRef), PxgEncodeDeformableVertex(
+//     clothId, vertexIdx)), compared ref0 then ref1 as unsigned 64-bit.  A filtered
+//     vertex generates NOTHING.  The rigid cache ref rides in FvcCase.ids2.z;
 //   * the case: the world cloth vertex, the rigid pose, the convex scale and
 //     scale rotation, the ids and the two distances.
 //
@@ -63,26 +61,23 @@
 // vRef8 = d >> 16).
 
 import pxgSlangCommon;
-// The lifted core.  FvcCase and FvcWriter live there -- one definition, two
-// users: this battery and the engine-ABI kernel.
+// The lifted core.  FvcCase lives there -- one definition, two users: this battery
+// and the engine-ABI kernel.
 import pxgSlangVertexConvexCloth;
+import pxgSlangDeformableRef;       // PxgEncodeRigidFilterRef, PxgComparePairInfo
+import pxgSlangDeformableWriters;   // PxgRigidDbContactWriterGpu
 
 struct FvcParams
 {
     uint numCases; uint maxContacts; uint nbFilterPairs; uint pad0;   // @0
     uint64_t hullAddr;        // @16  base of the hull blob (FvcCase.ids2.y is a UINT offset into it)
-    // PxgFEMContactWriter, by address (@24..@88)
+    // PxgRigidDbContactWriter, by address (@24..@96)
     uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;
+    uint64_t wRigidMat;       // @88  PxU16* outRigidMaterialIndex (5.12)
 }
 
-// PxgRigidFilterPair (32 bytes): u64 index0, u64 index1, u32 index2, pad
-struct FilterPair
-{
-    uint2 index0;
-    uint2 index1;
-    uint index2;
-    uint pad0, pad1, pad2;
-}
+// PxgDeformablePairInfo (16 bytes): u64 ref0 (x lo, y hi), u64 ref1 (z lo, w hi).
+typealias FilterPair = uint4;
 
 [[vk::push_constant]]
 ConstantBuffer<FvcParams> gParams;
@@ -91,30 +86,19 @@ RWStructuredBuffer<FvcCase> gCase;        // binding 0 (test input; not the engi
 RWStructuredBuffer<FilterPair> gFilter;   // binding 1 (sorted)
 RWStructuredBuffer<float4> gDebug;        // binding 2: (filtered, pen, wrote, insideBranch)
 
-// ---- find(PxgRigidFilterPair*) (deformableElementFilter.cuh) ----------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-// 3-key lexicographic compare; accept on exact match OR (ignoreIndex2)
-// index0/index1 equality
-bool findFilter(uint2 rigidId, uint clothMask)
+// ---- find(const PxgDeformablePairInfo*, nbPairs, pair) (deformableElementFilter.cuh, 5.12)
+bool findFilter(uint64_t ref0, uint64_t ref1)
 {
-    const uint2 q1 = uint2(clothMask, 0);
+    const PxgDeformablePairInfoGpu pair = PxgMakePairInfo(ref0, ref1);
     uint l = 0, r = gParams.nbFilterPairs;
     while (l < r)
     {
         const uint mid = (l + r) / 2;
-        const FilterPair p = gFilter[mid];
-        int cmp;
-        if (!u64Eq(rigidId, p.index0))
-            cmp = u64Lt(rigidId, p.index0) ? -1 : 1;
-        else if (!u64Eq(q1, p.index1))
-            cmp = u64Lt(q1, p.index1) ? -1 : 1;
-        else if (0u != p.index2)
-            cmp = (0u < p.index2) ? -1 : 1;
-        else
-            cmp = 0;
-        if (cmp == 0 || (u64Eq(rigidId, p.index0) && u64Eq(q1, p.index1)))
+        const uint4 e = gFilter[mid];
+        const PxgDeformablePairInfoGpu p = PxgMakePairInfo(uint64_t(e.x) | (uint64_t(e.y) << uint64_t(32)),
+                                                           uint64_t(e.z) | (uint64_t(e.w) << uint64_t(32)));
+        const int cmp = PxgComparePairInfo(pair, p);
+        if (cmp == 0)
             return true;
         if (cmp < 0)
             r = mid;
@@ -134,9 +118,9 @@ void ctFcVertexConvex(uint3 tid : SV_DispatchThreadID)
     const FvcCase cs = gCase[caseIdx];
 
     // LIVE attachment filter (a hit generates nothing)
-    const uint2 rigidId = uint2(cs.ids.x, cs.ids.y);
-    const uint clothMask = (cs.ids.z << FVC_BITSHIFT_ELEMENT_ID) | cs.ids.w;
-    if (findFilter(rigidId, clothMask))
+    // findRigidSurfaceVertexFilter(cloth filters, rigidId, rigidCacheRef, clothId, vertexIdx)
+    const uint64_t rigidId = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << uint64_t(32));
+    if (findFilter(PxgEncodeRigidFilterRef(rigidId, cs.ids2.z), PxgEncodeDeformableVertex(cs.ids.z, cs.ids.w)))
     {
         gDebug[caseIdx] = float4(1, 0, 0, 0);
         return;
@@ -145,11 +129,13 @@ void ctFcVertexConvex(uint3 tid : SV_DispatchThreadID)
     // FvcCase.ids2.y stays a UINT offset into the blob; the address is formed here.
     const uint64_t hull = gParams.hullAddr + uint64_t(cs.ids2.y) * 4UL;
 
-    FvcWriter w;
-    w.point = gParams.wPoint; w.normalPen = gParams.wNormalPen; w.bary = gParams.wBary;
-    w.info = gParams.wInfo;   w.count = gParams.wCount;
-    w.byX = gParams.wByX;     w.tempByX = gParams.wTempByX; w.idxByX = gParams.wIdxByX;
-    w.maxContacts = gParams.maxContacts;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gParams.wPoint; w.outNormalPen = gParams.wNormalPen; w.outBarycentric = gParams.wBary;
+    w.outContactInfo = gParams.wInfo; w.outRigidMaterialIndex = gParams.wRigidMat;
+    w.totalContactCount = gParams.wCount;
+    w.contactByRigid = gParams.wByX; w.tempContactByRigid = gParams.wTempByX;
+    w.contactIndexSortedByRigid = gParams.wIdxByX;
+    w.maxNumContacts = gParams.maxContacts;
 
     gDebug[caseIdx] = fcClothVertexConvexContactGen(cs, hull, w);
 }

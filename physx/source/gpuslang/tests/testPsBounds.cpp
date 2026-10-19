@@ -380,7 +380,7 @@ static PxgParticleSystem makeZeroPs()
 PXG_TEST(psBounds_updateBoundReduce)
 {
     // mirror strides / offsets the BDA kernel bakes in
-    static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
+    static_assert(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem stride");
     static_assert(offsetof(PxgParticleSystem, mData) == 248, "mData offset");
     static_assert(offsetof(PxgParticleSystemData, mBoundCenter) == 0, "mBoundCenter first in mData");
 
@@ -1277,11 +1277,16 @@ PXG_TEST(psBounds_primitivesBoundCellRange)
         for (uint32_t attempt = 0;; ++attempt)
         {
             const bool disjoint = (i % 7 == 5);
+            // PhysX 5.12: a pair whose boxes are disjoint by LESS than the contact
+            // distance.  The fattened overlap spans cells, so 5.6.1 counted them; the
+            // combine() is inverted, so 5.12's overlapBound.isValid() guard counts none.
+            const bool nearDisjoint = (i % 7 == 3);
             const float c0[3] = { 4.0f * uv(rng), 4.0f * uv(rng), 4.0f * uv(rng) };
             const float h0[3] = { 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng) };
             float c1[3] = { c0[0] + 1.3f * uv(rng), c0[1] + 1.3f * uv(rng), c0[2] + 1.3f * uv(rng) };
-            if (disjoint) c1[0] = c0[0] + h0[0] + 4.0f + 2.0f * u01(rng);
             const float h1[3] = { 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng) };
+            if (disjoint) c1[0] = c0[0] + h0[0] + 4.0f + 2.0f * u01(rng);
+            if (nearDisjoint) c1[0] = c0[0] + h0[0] + h1[0] + (0.1f + 0.8f * u01(rng)) * cd;
             float pmn[3], pmx[3], rmn[3], rmx[3];
             bool ok = true;
             for (int k = 0; k < 3; ++k)
@@ -1305,18 +1310,27 @@ PXG_TEST(psBounds_primitivesBoundCellRange)
     // CPU reference: cell counts, straight exclusive scan, per-block chunk totals
     std::vector<uint32_t> counts(NT), refOffsets(NT);
     uint32_t total = 0;
-    size_t zeroRows = 0, multiRows = 0;
+    size_t zeroRows = 0, multiRows = 0, invalidButFattenedRows = 0;
     for (uint32_t i = 0; i < NT; ++i)
     {
         const float cd = cdP[i] + cdR[i];
+        // combine(bound0, bound1) then the 5.12 PxBounds3::isValid() guard (finite and
+        // min <= max per axis; the empty sentinel cannot arise from two real boxes).
+        PxBounds3 overlap(PxVec3(std::max(pMin[i].x, rMin[i].x), std::max(pMin[i].y, rMin[i].y),
+                                 std::max(pMin[i].z, rMin[i].z)),
+                          PxVec3(std::min(pMax[i].x, rMax[i].x), std::min(pMax[i].y, rMax[i].y),
+                                 std::min(pMax[i].z, rMax[i].z)));
         uint32_t count = 1;
+        uint32_t count561 = 1;   // the same row without the guard, for coverage only
         for (int k = 0; k < 3; ++k)
         {
             const float mn = std::max((&pMin[i].x)[k], (&rMin[i].x)[k]) - cd;
             const float mx = std::min((&pMax[i].x)[k], (&rMax[i].x)[k]) + cd;
             const int32_t r = std::min(std::max(floorDivL(mx) - floorDivL(mn) + 1, 0), (int32_t)grid[k]);
-            count *= (uint32_t)r;
+            count561 *= (uint32_t)r;
         }
+        count = overlap.isValid() ? count561 : 0u;
+        if (!overlap.isValid() && count561 > 0u) ++invalidButFattenedRows;
         counts[i] = count;
         refOffsets[i] = total;
         total += count;
@@ -1424,6 +1438,9 @@ PXG_TEST(psBounds_primitivesBoundCellRange)
     PXG_CHECK_MSG(gTotal == total, "psPrimBound: total %u != %u", gTotal, total);
     PXG_CHECK_MSG(zeroRows > 400 && multiRows > 200 && total > 20000,
                   "psPrimBound: coverage thin (zero=%zu multi=%zu total=%u)", zeroRows, multiRows, total);
+    PXG_CHECK_MSG(invalidButFattenedRows > 400,
+                  "psPrimBound: only %zu rows are disjoint-but-within-reach, so the 5.12 isValid() "
+                  "guard is not separated from the 5.6.1 count", invalidButFattenedRows);
 
     dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bBounds.h);
     dev->destroyBuffer(bCdist.h); dev->destroyBuffer(bDesc.h);

@@ -279,7 +279,7 @@ void clothHfMidphaseBody(uint3 gtid, uint3 gid, bool vertexQuery)
         Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gHf.femClothes);
         const uint clothId = clothShape.particleOrSoftbodyId;
         Ptr<float4> positions = Ptr<float4>(clothes[clothId].mPosition_InvMass);
-        Ptr<uint4> triVertIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+        Ptr<uint4> triVertIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
 
         const uint numElements = vertexQuery ? clothes[clothId].mNbVerts
                                              : clothes[clothId].mNbTriangles;

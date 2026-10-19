@@ -153,13 +153,13 @@ PXG_TEST(psMaterialsLayout)
     PXG_CHECK(offsetof(PxgPBDParticleMaterialDerived, cohesion2) == 12);
 
     // The mirror fields the kernel dereferences, as absolute byte offsets.
-    PXG_CHECK(offsetof(PxgParticleSystem, mDerivedPBDMaterialData) == 624);
-    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 640);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDerivedPBDMaterialData) == 584);
+    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 600);
     PXG_CHECK(offsetof(PxgParticleSystem, mData) == 248);
     PXG_CHECK(offsetof(PxgParticleSystemData, mFluidSurfaceConstraintScale) == 44);  // abs 292
     PXG_CHECK(offsetof(PxgParticleSystemData, mFluidRestOffset) == 56);              // abs 304
     PXG_CHECK(offsetof(PxgParticleSystemData, mInvRestDensity) == 60);               // abs 308
-    PXG_CHECK(offsetof(PxgParticleSystemData, mNumPhaseToMaterials) == 76);          // abs 324
+    PXG_CHECK(offsetof(PxgParticleSystemData, mNumPhaseToMaterials) == 80);          // abs 324
     PXG_CHECK(offsetof(PxGpuParticleSystem, mCommonData) == 88);
     PXG_CHECK(offsetof(PxGpuParticleData, mParticleContactDistance) == 16);          // abs 104
 }

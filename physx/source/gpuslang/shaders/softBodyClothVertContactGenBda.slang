@@ -48,13 +48,14 @@
 // So the SIGN of pen carries the inside/outside distinction downstream, and both branches
 // write the same point -- closestP, the witness on the tet's surface.
 //
-// THE FILTER IS A THREE-WAY OR, not the two-level AND-chain of the triangle path (step 2).
-// A vertex is a single element, so there is nothing to take a conjunction over: any of
-// (whole-softbody, this vertex), (this tet, whole-cloth) or (this tet, this vertex) kills it.
+// THE FILTER IS A THREE-WAY OR (5.12: three exact searches of the softbody's
+// mVolumeSurfaceFilterPairs, findVolumeSurfaceVertexFilter): any of (ANY tet, this vertex),
+// (this tet, ANY vertex of the cloth) or (this tet, this vertex) kills it.
 //
-// barycentric0 is the CONSTANT (0, 0, 0, 1) -- the cloth side of this contact is one vertex,
-// so its "barycentric" is degenerate and upstream stores the w-slot marker rather than
-// computing anything.  barycentric1 is the real tet barycentric of closestP.
+// NO BARYCENTRIC IS WRITTEN (5.12): the vertex overload of
+// PxgDbDbContactWriter::writeSurfaceVolumeContact leaves both slots untouched -- the vertex
+// needs none, and the tet's is computed by sb_fem_contact_remap_to_simLaunch from the stored
+// point.  (5.6.1 wrote the (0,0,0,1) vertex marker and computeTetBarycentric of closestP.)
 //
 // GRID.  A plain 1D grid-stride loop over the midphase pairs (gridDim.x * blockDim.x).  The
 // bridge ignores blockDim, so the stride here is the CUDA blockDim.x * gridDim.x with
@@ -63,17 +64,15 @@
 module softBodyClothVertContactGenBda;
 
 import pxgSlangSoftBodyDesc;
-import pxgSlangDefFilter;   // P9.38
+import pxgSlangDefFilter;   // 5.12: findVolumeSurfaceVertexFilter
+import pxgSlangDeformableRef;     // PxgEncodeDeformable*, PXG_DREF_ANY_FEATURE
+import pxgSlangDeformableWriters; // PxgDbDbContactWriterGpu
 import pxgSlangFEMClothDesc;
 import pxgSlangTetClosest;   // getNormalized / isPointOutsideOfPlane4 / closestPtTetrahedron
 
 static const float PX_MAX_F32 = 3.4028235e38f;
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
-// PxEncodeSoftBodyIndex / PxEncodeClothIndex: (id << 20) | elementId.
-static const uint PXG_BITSHIFT_ID = 20u;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
-static const uint PX_MAX_NB_DEFORMABLE_SURFACE_VTX = 0x000fffffu;
 
 
 // The engine launches 512 blocks of 256 threads (PxgNarrowphaseCore.cpp:4805).  The bridge
@@ -87,17 +86,15 @@ static const uint SB_VERT_CG_BLOCK = 32u;
 static const uint SB_VERT_CG_STRIDE = SB_VERT_CG_GRID * SB_VERT_CG_BLOCK;
 
 // ---------------------------------------------------------------------------
-// Push-constant blob — BYTE-IDENTICAL to the CUDA pack (PxgNarrowphaseCore.cpp):
+// Push-constant blob — BYTE-IDENTICAL to the 5.12 CUDA pack:
 // { PxReal tolerenceLength, cmInputs*, transformCache*, contactDistance*, gpuShapes*,
 //   softbodies*, clothes*, PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*,
-//   PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs, stackSizeNeededOnDevice*,
-//   PxgSoftBodyContactWriter writer }.
-// 4 @0 (padded to 8), six pointers @8..@48, PxU32 @56, then pointers realigned to @64 and
-// @72, a pointer @80, PxU32 @88, a pointer realigned to @96, the 56-byte writer at @104
-// -> 160-byte blob.  ABI row {4,8,8,8,8,8,8,4,8,8,8,4,8,56}.
+//   stackSizeNeededOnDevice*, PxgDbDbContactWriter writer }.
+// 4 @0 (padded to 8), six pointers @8..@48, PxU32 @56, then pointers realigned to @64, @72
+// and @80, the 56-byte writer at @88 -> 144-byte blob.  ABI row {4,8,8,8,8,8,8,4,8,8,8,56}.
 //
 // NOTE the stackSizeBytes position: step 2's pack has it AFTER midphasePairsNum, this one
-// has it BEFORE stackPtr.  Same fourteen arguments, same 160 bytes, different order.
+// has it BEFORE stackPtr.  Same twelve arguments, same 144 bytes, different order.
 // ---------------------------------------------------------------------------
 struct SbClothVertCgParams
 {
@@ -113,19 +110,16 @@ struct SbClothVertCgParams
     uint _pad60;                    // @60
     uint64_t stackPtr;              // @64
     uint64_t midphasePairsNum;      // @72
-    uint64_t filterPairs;           // @80
-    uint nbFilterPairs;             // @88
-    uint _pad92;                    // @92
-    uint64_t stackSizeNeededOnDevice; // @96
-    // --- PxgSoftBodyContactWriter, inlined ---
-    uint64_t w_outPoint;            // @104
-    uint64_t w_outNormalPen;        // @112
-    uint64_t w_outBarycentric0;     // @120
-    uint64_t w_outBarycentric1;     // @128
-    uint64_t w_outContactInfo;      // @136
-    uint64_t w_totalContactCount;   // @144
-    uint w_maxContacts;             // @152
-    uint _pad156;                   // @156 -> 160
+    uint64_t stackSizeNeededOnDevice; // @80
+    // --- PxgDbDbContactWriter, inlined (PxgDeformableContactWriters.h, 5.12) ---
+    uint64_t w_outPoint;            // @88
+    uint64_t w_outNormalPen;        // @96
+    uint64_t w_outBarycentric0;     // @104 (not written: vertex overload)
+    uint64_t w_outBarycentric1;     // @112 (not written: the remap's)
+    uint64_t w_outContactInfo;      // @120 PxgDeformablePairInfo*
+    uint64_t w_totalContactCount;   // @128
+    uint w_maxContacts;             // @136
+    uint _pad140;                   // @140 -> 144
 }
 
 [[vk::push_constant]] ConstantBuffer<SbClothVertCgParams> gVc;
@@ -142,7 +136,15 @@ struct PxgShape
     uint particleOrSoftbodyId;
 }
 
-uint encodeId(uint id, uint elementId) { return (id << PXG_BITSHIFT_ID) | elementId; }
+PxgDbDbContactWriterGpu vcWriter()
+{
+    PxgDbDbContactWriterGpu w;
+    w.outPoint = gVc.w_outPoint;               w.outNormalPen = gVc.w_outNormalPen;
+    w.outBarycentric0 = gVc.w_outBarycentric0; w.outBarycentric1 = gVc.w_outBarycentric1;
+    w.outContactInfo = gVc.w_outContactInfo;   w.totalContactCount = gVc.w_totalContactCount;
+    w.maxContacts = gVc.w_maxContacts;
+    return w;
+}
 
 uint byteAt(uint64_t base, uint idx)
 {
@@ -151,11 +153,6 @@ uint byteAt(uint64_t base, uint idx)
     const uint shift = uint(addr & 3UL) * 8u;
     return (word >> shift) & 0xffu;
 }
-
-// PxgNonRigidFilterPair binary search.  SELECT THE POINTER, not the value -- see the長
-// discussion in softBodySelfCollisionBda; llvmpipe speculates the first load of a zero-trip
-// search and faults on a null filter address.
-
 
 void loadSoftbodyClothPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheRef,
                            out PxgShape clothShape, out uint clothCacheRef)
@@ -171,40 +168,6 @@ void loadSoftbodyClothPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheRef
     }
     sbShape = shapes[sRefSb]; sbCacheRef = cRefSb;
     clothShape = shapes[sRefCl]; clothCacheRef = cRefCl;
-}
-
-// P9.86: PxClamp(v, 0, 1) = PxMin(1, PxMax(0, v)) with the select intrinsics
-// (PxMath.h:142, PxUnixMathIntrinsics.h:116-125): keeps -0 as -0 and passes NaN through,
-// unlike GLSL FClamp.
-float sbcvPxClamp01(float v) { const float t = (0.0f > v) ? 0.0f : v; return (1.0f < t) ? 1.0f : t; }
-
-// computeTetBarycentric (deformableCollision.cuh:96).  The .cu here ignores the bool -- the
-// coordinates are stored whatever the window says -- so only the clamped float4 is produced.
-float4 computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point)
-{
-    const float3 ba = b - a, ca = c - a, da = d - a, pa = point - a;
-    const float detBcd = dot(ba, cross(ca, da));
-    const float v = dot(pa, cross(ca, da)) / detBcd;
-    const float w = dot(ba, cross(pa, da)) / detBcd;
-    const float x = dot(ba, cross(ca, pa)) / detBcd;
-    const float u = 1.0f - v - w - x;
-    // P9.86: select PxClamp (deformableCollision.cuh:132-135), not FClamp.
-    return float4(sbcvPxClamp01(u), sbcvPxClamp01(v),
-                  sbcvPxClamp01(w), sbcvPxClamp01(x));
-}
-
-// ===========================================================================
-// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
-// null-pointer guard stays here, because only this kernel knows which of its buffers
-// is safe to point at when the filter list is null (see the module header).
-//
-// As its sibling softBodyClothContactGenBda, this was a lower-bound search rather
-// than the engine's loop.
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
-{
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    return dfFindNonRigidPair(havePairs ? pairsAddr : gVc.softbodies,
-                              havePairs ? nbPairs : 0u, id0, id1);
 }
 
 [shader("compute")]
@@ -242,16 +205,14 @@ void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         const uint softbodyId = sbShape.particleOrSoftbodyId;
         const uint clothId = clothShape.particleOrSoftbodyId;
 
-        // A three-way OR (see the header): a vertex is one element, so there is no
-        // conjunction to take.
-        const uint softBodyMask = encodeId(softbodyId, tetrahedronIdx);
-        const uint softBodyFullMask = encodeId(softbodyId, PX_MAX_NB_DEFORMABLE_VOLUME_TET);
-        const uint clothMask = encodeId(clothId, particleIndex);
-        const uint clothFullMask = encodeId(clothId, PX_MAX_NB_DEFORMABLE_SURFACE_VTX);
-
-        if (findFilter(gVc.filterPairs, gVc.nbFilterPairs, softBodyFullMask, clothMask) ||
-            findFilter(gVc.filterPairs, gVc.nbFilterPairs, softBodyMask, clothFullMask) ||
-            findFilter(gVc.filterPairs, gVc.nbFilterPairs, softBodyMask, clothMask))
+        // A three-way OR (5.12, see the header).  The array goes through dfFilterArray with
+        // the softbody descriptor as the safe address (llvmpipe speculates the first load
+        // of a zero-trip search, see pxgSlangDefFilter).
+        const DfFilterArray filters =
+            softBodyVolumeSurfaceFilters(gVc.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE);
+        if (findVolumeSurfaceVertexFilter(filters, softbodyId, PXG_DREF_ANY_FEATURE, clothId, particleIndex) ||
+            findVolumeSurfaceVertexFilter(filters, softbodyId, tetrahedronIdx, clothId, PXG_DREF_ANY_FEATURE) ||
+            findVolumeSurfaceVertexFilter(filters, softbodyId, tetrahedronIdx, clothId, particleIndex))
             continue;
 
         const uint surfaceMask = byteAt(softbodies[softbodyId].mTetMeshSurfaceHint, tetrahedronIdx);
@@ -272,8 +233,6 @@ void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         float3 n2 = float3(0, 0, 0), closestP = float3(0, 0, 0);
         float sqDist = PX_MAX_F32;
         closestPtTetrahedron(p, surfaceMask, a, b, c, d, n2, closestP, sqDist);
-
-        const float4 tBarycentric = computeTetBarycentric(a, b, c, d, closestP);
 
         // PxVec3::normalize returns the LENGTH and leaves the vector unit.
         float3 v = closestP - p;
@@ -304,17 +263,12 @@ void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         if (index >= gVc.w_maxContacts)
             continue;
 
-        Ptr<float4>(gVc.w_outPoint)[index] = float4(closestP.x, closestP.y, closestP.z, 0.0f);
-        Ptr<float4>(gVc.w_outNormalPen)[index] = float4(n.x, n.y, n.z, pen);
-        // The cloth side is ONE vertex, so its barycentric is the degenerate (0,0,0,1).
-        Ptr<float4>(gVc.w_outBarycentric0)[index] = float4(0.0f, 0.0f, 0.0f, 1.0f);
-        Ptr<float4>(gVc.w_outBarycentric1)[index] = tBarycentric;
-
-        // PxgFemFemContactInfo, 16 B: pairInd0 PxU64 @0, pairInd1 PxU32 @8, auxInd @12.
-        // pairInd0 is the CLOTH and pairInd1 the SOFTBODY, as in step 2.
-        const uint64_t ci = gVc.w_outContactInfo + uint64_t(index) * 16UL;
-        Ptr<uint>(ci)[0] = encodeId(clothId, particleIndex);
-        Ptr<uint>(ci + 4UL)[0] = 0u;
-        Ptr<uint>(ci + 8UL)[0] = encodeId(softbodyId, tetrahedronIdx);
+        // writeSurfaceVolumeContact, the vertex overload: ref0 = the CLOTH vertex, ref1 = the
+        // SOFTBODY tetrahedron; no barycentric.
+        vcWriter().writeSurfaceVolumeContactVertex(index,
+                                                   float4(closestP.x, closestP.y, closestP.z, 0.0f),
+                                                   float4(n.x, n.y, n.z, pen),
+                                                   PxgEncodeDeformableVertex(clothId, particleIndex),
+                                                   PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx));
     }
 }

@@ -34,10 +34,11 @@
 //       clears every tetrahedron's Lagrange-multiplier spatial vector at the top of the
 //       solve.  Without it the constraint solver accumulates into last frame's
 //       multipliers and the material response drifts frame over frame.
-//   sb_gm_applyExternalDeltasLaunch (:2609, launch PxgSoftBodyCore.cpp:872)
-//       folds the accumulated per-vertex position correction (mSimDelta, written by the
-//       contact/attachment solves) back into position, velocity and mSimDeltaPos, then
-//       zeroes the delta buffer for the next iteration.  This is the softbody twin of
+//   sb_gm_applyExternalDeltasLaunch (:2222, launch PxgSoftBodyCore.cpp applyExternalTetraDelta)
+//       folds the accumulated per-vertex correction (mSimDelta, written by the
+//       contact/attachment solves; .w the mass-splitting refCount) back into velocity and,
+//       in a position iteration, position and mSimDeltaPos, then zeroes the delta buffer
+//       for the next iteration.  This is the softbody twin of
 //       cloth_applyExternalDeltasLaunch, which the cloth arc has relied on since P7.1.
 //
 // They bracket the solve: zeroTetMultipliers opens it, applyExternalDeltas closes each
@@ -48,7 +49,7 @@
 //   - the PxgSoftBody descriptor arrives as a device-pointer ARRAY read through Ptr<>
 //     (the byte-exact pxgSlangSoftBodyDesc mirror); mSimVelocity_InvMass @88,
 //     mSimPosition_InvMass @96, mSimDeltaPos @128, mSimTetraMultipliers @264,
-//     mSimDelta @272, mNumVertsGM @372 and mNumTetsGM @376 are the fields touched;
+//     mSimDelta @272, mNumVertsGM @396 and mNumTetsGM @400 (5.12) are the fields touched;
 //   - PxgSpatialVectorBlock (PxgArticulation.h:77) is the 32-lane SoA block the
 //     multipliers live in: float4 mTopxyz_bx[32] @0 (512 B) then float2 mbyz[32] @512
 //     (256 B) -> 768-byte stride.  storeSpatialVector(block, v, lane) writes
@@ -56,7 +57,7 @@
 //     zeroing a tet means two stores at block (tetIdx/32), lane (tetIdx&31).
 //
 // DEVIATIONS from CUDA:
-//   - sb_gm_applyExternalDeltasLaunch opens with a `blockCopy` of the WHOLE 432-byte
+//   - sb_gm_applyExternalDeltasLaunch opens with a `blockCopy` of the WHOLE 464-byte
 //     PxgSoftBody descriptor into __shared__ followed by __syncthreads, then reads the
 //     shared copy.  That is a pure read-caching optimisation for a block whose 64
 //     threads would otherwise each pull the same descriptor words; it is dropped here
@@ -120,17 +121,19 @@ void sb_gm_zeroTetMultipliers(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
 }
 
 // ---------------------------------------------------------------------------
-// sb_gm_applyExternalDeltasLaunch (softBodyGM.cu:2609)
+// sb_gm_applyExternalDeltasLaunch (softBodyGM.cu:2222)
 // ---------------------------------------------------------------------------
-// CUDA arg pack (PxgSoftBodyCore.cpp:874): { PxgSoftBody* gSoftbodies,
-// const PxU32* activeSoftbodies, const PxReal invDt } -> 20, rounded up to the pointer
-// alignment -> 24-byte blob.  (ABI row {8,8,4}.)
+// CUDA arg pack (PxgSoftBodyCore.cpp, applyExternalTetraDelta): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxReal invDt, bool isVelocityIteration } -> 21,
+// rounded up to the pointer alignment -> 24-byte blob.  (ABI row {8,8,4,1}.)
+// PhysX 5.12 (velocity-iteration semantics, 5.11): a velocity iteration writes only the
+// velocity correction and skips the position and mSimDeltaPos updates.
 struct ApplyExternalDeltasParams
 {
     uint64_t gSoftbodies;       // @0
     uint64_t activeSoftbodies;  // @8
     float invDt;                // @16
-    uint _pad20;                // @20  -> 24
+    uint isVelocityIteration;   // @20  bool byte0 -> 24
 }
 [[vk::push_constant]]
 ConstantBuffer<ApplyExternalDeltasParams> gApply;
@@ -159,27 +162,30 @@ void sb_gm_applyExternalDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 
         float4 delta = simDelta[vertIdx];
 
-        // delta.w counts how many constraints contributed; averaging divides by it, but
-        // never by less than 1 (an untouched vertex has delta.w == 0 and delta == 0).
-        const float scale = 1.0f / max(delta.w, 1.0f);
+        // delta.w is the mass-splitting reference count the pre-counts accumulated; the
+        // finalize divides by it, never by less than 1 (PxMax(delta.w, 1.f), selectMax).
+        const float scale = 1.0f / ((delta.w > 1.0f) ? delta.w : 1.0f);
 
         delta.x *= scale; delta.y *= scale; delta.z *= scale;
         delta.w = 0.0f;
 
-        const float4 newVel = vel + delta * gApply.invDt;
+        // Velocity iteration writes only the velocity correction, skipping the position and
+        // accumulated-delta updates (Muller SCA 2020 S3.6).
+        vels[vertIdx] = vel + delta * gApply.invDt;
 
-        // P9.86: the CUDA's w lanes are IEEE `pos.w + 0.f` / `deltaPos.w + 0.f`
-        // (softBodyGM.cu:2652/2656), which turn a -0 inverse mass into +0; llvmpipe folds the
-        // literal-zero w lane of these vector adds, so the w lane's `0 + x` is a select.
-        float4 newPos = pos + delta;
-        newPos.w = (newPos.w == 0.0f) ? 0.0f : newPos.w;
-        curPositions[vertIdx] = newPos;
+        if ((gApply.isVelocityIteration & 0xffu) == 0u)
+        {
+            // P9.86: the CUDA's w lanes are IEEE `pos.w + 0.f` / `deltaPos.w + 0.f`, which
+            // turn a -0 inverse mass into +0; llvmpipe folds the literal-zero w lane of these
+            // vector adds, so the w lane's `0 + x` is a select.
+            float4 newPos = pos + delta;
+            newPos.w = (newPos.w == 0.0f) ? 0.0f : newPos.w;
+            curPositions[vertIdx] = newPos;
 
-        vels[vertIdx] = newVel;
-
-        float4 newDeltaPos = simDeltaPos[vertIdx] + delta;
-        newDeltaPos.w = (newDeltaPos.w == 0.0f) ? 0.0f : newDeltaPos.w;
-        simDeltaPos[vertIdx] = newDeltaPos;
+            float4 newDeltaPos = simDeltaPos[vertIdx] + delta;
+            newDeltaPos.w = (newDeltaPos.w == 0.0f) ? 0.0f : newDeltaPos.w;
+            simDeltaPos[vertIdx] = newDeltaPos;
+        }
 
         // clear delta
         simDelta[vertIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -205,8 +211,8 @@ void sb_gm_applyExternalDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 //
 // They differ in exactly three places, all from the .cu:
 //   - buffers: mSimTetIndices @80 / mSimPosition_InvMass @96 / mSimTetraRestPoses @136 /
-//     mSimTetraRotations @168 / mNumTetsGM @376   -- versus --   mTetIndices @16 /
-//     mPosition_InvMass @64 / mTetraRestPoses @40 / mTetraRotations @56 / mNumTets @368;
+//     mSimTetraRotations @168 / mNumTetsGM @400   -- versus --   mTetIndices @16 /
+//     mPosition_InvMass @64 / mTetraRestPoses @40 / mTetraRotations @56 / mNumTets @392;
 //   - rest-pose LAYOUT: the sim variant loads through loadPxMat33 from a PxgMat33Block
 //     (PxgArticulation.h:70 — float4 mCol0[32] @0, float4 mCol1[32] @512, float mCol2[32]
 //     @1024 -> 1152-byte stride, the 9 elements split 4/4/1 across the three arrays),
@@ -417,7 +423,7 @@ void sb_updateTetrahedraRotationsLaunch(uint3 groupThreadId : SV_GroupThreadID, 
     const uint tetrahedronIdx = groupThreadId.x + groupId.x * 256u;
     const uint nbTets = gSoftbodies[softbodyId].mNumTets;
 
-    // The @392 fold: byte1 = mBodyFlags, bytes2..3 = mVolumeFlags.
+    // The @416 fold: byte1 = mBodyFlags, bytes2..3 = mVolumeFlags.
     const uint flagsWord = gSoftbodies[softbodyId].mFlagsWord;
     const uint bodyFlags = (flagsWord >> 8) & 0xffu;
     const uint volumeFlags = (flagsWord >> 16) & 0xffffu;
@@ -486,11 +492,11 @@ void sb_updateTetrahedraRotationsLaunch(uint3 groupThreadId : SV_GroupThreadID, 
 // Fields touched: mSimVelocity_invMassCP @176, mSimPosition_InvMassCP @184,
 // mSimRemapOutputCP @192, mSimAccumulatedPartitionsCP @208, mSimTetraMultipliers @264,
 // mOrderedMaterialIndices @288, mSimTetraRestPoses @136, mSimTetraRotations @168,
-// mSimPosition_InvMass @96, mSimVelocity_InvMass @88, mInitialRotation @348,
-// mNumTetsGM @376, mNumPartitionsGM @380, mSimPullIndices @400, mNumTetsPerElement @412,
+// mSimPosition_InvMass @96, mSimVelocity_InvMass @88, mInitialRotation @372,
+// mNumTetsGM @400, mNumPartitionsGM @404, mSimPullIndices @424, mNumTetsPerElement @436,
 // plus the external PxsDeformableVolumeMaterialData array (32-byte stride:
-// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, dampingScale @16
-// (PxU16), materialModel @18 (PxU16), deformThreshold @20, ...).
+// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, materialModel @16
+// (PxU16), _pad @18 (PxU16), deformThreshold @20, ... -- the PhysX 5.12 layout).
 //
 // TOLERANCE SEAM: inherited, and only from the rotation refresh.  The solve calls
 // computeGMTetrahedronRotations -> extractRotation, whose PxQuat(w, omega) evaluates
@@ -533,7 +539,6 @@ struct SbMaterial
     float youngs;
     float poissons;
     float elasticityDamping;
-    float dampingScale;      // toUniformReal(PxU16) already applied
     uint materialModel;
 }
 
@@ -544,11 +549,12 @@ SbMaterial sbLoadMaterial(uint64_t materials, uint index)
     m.youngs = Ptr<float>(base)[0];
     m.poissons = Ptr<float>(base)[1];
     m.elasticityDamping = Ptr<float>(base)[3];
-    // dampingScale is a PxU16 @16 and materialModel a PxU16 @18 — one 32-bit word.
+    // PhysX 5.12: materialModel is a PxU16 @16 and _pad a PxU16 @18 -- one 32-bit word.
+    // dampingScale is gone from PxsDeformableVolumeMaterialData, and the GM solve damps with
+    // elasticityDamping alone (compute_deltaLambdaXgradC's `damping * (...)`, where 5.6.1
+    // had a separate scaledDamping = damping * toUniformReal(dampingScale)).
     const uint packed = Ptr<uint>(base + 16UL)[0];
-    // toUniformReal(v) = PxReal(v) * (1.0f / 65535.0f)
-    m.dampingScale = float(packed & 0xffffu) * (1.0f / 65535.0f);
-    m.materialModel = (packed >> 16) & 0xffffu;
+    m.materialModel = packed & 0xffffu;
     return m;
 }
 
@@ -651,7 +657,7 @@ float3 sbPlusZero3(float3 v)
 // Accumulates deltaLambda * dCdx into deltaLambdaXgradC and advances lambda.
 void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
                                 SbMat33 dCdF, SbMat33 DmInv, SbTetV tv,
-                                float alphaTilde, float dtInv, float damping, float scaledDamping)
+                                float alphaTilde, float dtInv, float damping)
 {
     const SbMat33 dCdx = sbComputeDCdx(dCdF, DmInv);
     const float3 dCdx1 = dCdx.c0, dCdx2 = dCdx.c1, dCdx3 = dCdx.c2;
@@ -683,7 +689,7 @@ void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
         }
 
         deltaLambda = (-C - alphaTilde * lambda -
-                       scaledDamping * (sbDot3(dCdx0, float3(v0.x, v0.y, v0.z)) +
+                       damping * (sbDot3(dCdx0, float3(v0.x, v0.y, v0.z)) +
                                         sbDot3(dCdx1, float3(v1.x, v1.y, v1.z)) +
                                         sbDot3(dCdx2, float3(v2.x, v2.y, v2.z)) +
                                         sbDot3(dCdx3, float3(v3.x, v3.y, v3.z)))) /
@@ -705,7 +711,7 @@ void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
 // --- ARAP_constraint (softBodyGM.cu:722) ----------------------------------------------
 void sbARAPConstraint(inout SbMat33 dl, inout float lambda, SbTetV tv, float4 tetR,
                       SbMat33 F, float dtInv, SbMat33 DmInv,
-                      float alphaTilde, float damping, float scaledDamping)
+                      float alphaTilde, float damping)
 {
     const SbMat33 R = sbMat33FromQuatM(tetR);
     SbMat33 t = sbMat33(F.c0 - R.c0, F.c1 - R.c1, F.c2 - R.c2);
@@ -716,19 +722,19 @@ void sbARAPConstraint(inout SbMat33 dl, inout float lambda, SbTetV tv, float4 te
     const float inv = 1.0f / ARAP_C;
     t.c0 *= inv; t.c1 *= inv; t.c2 *= inv;   // dCdF
 
-    sbComputeDeltaLambdaXGradC(dl, lambda, ARAP_C, t, DmInv, tv, alphaTilde, dtInv, damping, scaledDamping);
+    sbComputeDeltaLambdaXGradC(dl, lambda, ARAP_C, t, DmInv, tv, alphaTilde, dtInv, damping);
 }
 
 // --- volume_constraint (softBodyGM.cu:756) --------------------------------------------
 void sbVolumeConstraint(inout SbMat33 dl, inout float lambda, SbTetV tv,
                         SbMat33 F, float invDt, SbMat33 DmInv,
-                        float alphaTilde, float damping, float scaledDamping)
+                        float alphaTilde, float damping)
 {
     const float detF = sbMat33Det(F);
     const float C = detF - 1.0f;
     const SbMat33 dCdF = sbMat33(sbCross3(F.c1, F.c2), sbCross3(F.c2, F.c0), sbCross3(F.c0, F.c1));
 
-    sbComputeDeltaLambdaXGradC(dl, lambda, C, dCdF, DmInv, tv, alphaTilde, invDt, damping, scaledDamping);
+    sbComputeDeltaLambdaXGradC(dl, lambda, C, dCdF, DmInv, tv, alphaTilde, invDt, damping);
 }
 
 // --- volumeSolve (softBodyGM.cu:621) --------------------------------------------------
@@ -855,13 +861,12 @@ SbMat33 sbTetrahedronsSolveGM(SbMat33 U, SbTetV tv, uint64_t multipliers,
         const float alphaTilde0 = invDtSq / (2.0f * mu * volume);
 
         float damping = material.elasticityDamping;
-        float scaledDamping = damping * material.dampingScale;
 
         const uint64_t mbyz = multipliers + uint64_t(workIndex >> 5) * SPATIAL_BLOCK_STRIDE +
                               SPATIAL_BLOCK_MBYZ_OFFSET + uint64_t(workIndex & 31u) * 8UL;
         float2 lambdas = isTGS ? float2(0.0f, 0.0f) : Ptr<float2>(mbyz)[0];
 
-        sbARAPConstraint(dl, lambdas.x, tv, tetR, F, invDt, Qinv, alphaTilde0, damping, scaledDamping);
+        sbARAPConstraint(dl, lambdas.x, tv, tetR, F, invDt, Qinv, alphaTilde0, damping);
 
         const float3 dx0 = -(dl.c0 + dl.c1 + dl.c2) * tv.v0.w;
         const float3 dx1 = dl.c0 * tv.v1.w;
@@ -883,10 +888,9 @@ SbMat33 sbTetrahedronsSolveGM(SbMat33 U, SbTetV tv, uint64_t multipliers,
                 ratio = 2.0f * mu / lambdaLame;   // alphaTilde1/alphaTilde0 for volume damping
             }
 
-            damping *= ratio;
-            scaledDamping *= ratio;
+            damping *= ratio;   // damping for the volume term
 
-            sbVolumeConstraint(dl, lambdas.y, tv, F, invDt, Qinv, alphaTilde1, damping, scaledDamping);
+            sbVolumeConstraint(dl, lambdas.y, tv, F, invDt, Qinv, alphaTilde1, damping);
         }
 
         if (!isTGS)
@@ -1078,7 +1082,7 @@ struct SbHexDesc
     uint64_t deltaPos;       // mSimDeltaPos @128
     uint64_t delta;          // mSimDelta @272
     uint64_t materialIdx;    // mOrderedMaterialIndices @288 (PxU16*)
-    float4 initialRotation;  // mInitialRotation @348..@360 (four scalars, not 16-aligned)
+    float4 initialRotation;  // mInitialRotation @372..@384 (four scalars, not 16-aligned)
 }
 
 SbHexDesc sbHexDescOf(Ptr<PxgSoftBodyGpu> sb, uint id)
@@ -1281,7 +1285,7 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
     Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gSolve.gSoftbodies);
     const uint softbodyId = (Ptr<uint>(gSolve.activeSoftbodies))[groupId.y];
 
-    // The @392 fold: byte1 = mBodyFlags.
+    // The @416 fold: byte1 = mBodyFlags.
     const uint bodyFlags = (gSoftbodies[softbodyId].mFlagsWord >> 8) & 0xffu;
     if ((bodyFlags & PXG_SOFTBODY_BODYFLAG_KINEMATIC) != 0u)
         return;
@@ -1449,7 +1453,7 @@ void sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch(uint3 groupThreadId : SV_Gr
     if (gSoftbodies[softbodyId].mNumPartitionsGM <= SB_PARTITION_LIMIT || gSoftbodies[softbodyId].mNumTetsPerElement == 1u)
         return;
 
-    // softBodyGM.cu:1485 -- the @392 fold: byte1 = mBodyFlags
+    // softBodyGM.cu:1485 -- the @416 fold: byte1 = mBodyFlags
     const uint bodyFlags = (gSoftbodies[softbodyId].mFlagsWord >> 8) & 0xffu;
     if ((bodyFlags & PXG_SOFTBODY_BODYFLAG_KINEMATIC) != 0u)
         return;
@@ -1503,7 +1507,7 @@ void sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch(uint3 groupThreadId : SV_Gr
 // updateTetModelVerts skins the result onto the collision mesh.
 //
 // DEVIATIONS from CUDA (identical in kind to the earlier softbody tranches):
-//   - all three open with a `blockCopy` of the whole 432-byte PxgSoftBody descriptor
+//   - all three open with a `blockCopy` of the whole 464-byte PxgSoftBody descriptor
 //     into __shared__ followed by __syncthreads, then read the shared copy.  That is
 //     a pure read-caching optimisation; it is dropped and every lane reads the
 //     descriptor directly through Ptr<>, which also removes the kernels' only
@@ -1713,7 +1717,7 @@ void sb_gm_updateTetModelVertsLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 
     const uint groupThreadIdx = groupThreadId.x + groupId.x * 1024u;
 
-    // mNumVerts @364 is the COLLISION mesh vertex count (mNumVertsGM @372 is the
+    // mNumVerts @388 is the COLLISION mesh vertex count (mNumVertsGM @396 is the
     // simulation mesh's) — this kernel is one thread per collision vertex.
     const uint numVerts = gSoftbodies[softbodyId].mNumVerts;
 

@@ -24,695 +24,456 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// P6.4b-2: the particle-SIDE contact SOLVE half of the PBD particle/primitive
-// consume path on the BDA engine ABI.  KEY PROOF: build ONE particle penetrating a
-// static plane (contact normal (0,1,0), penetration -0.1, a per-particle range
-// [0,1)) and run the full pipeline
-//   ps_contactPrepareLaunch -> ps_solvePCOutputParticleDeltaVLaunch
-//     -> ps_accumulateDeltaVParticleLaunch
-// asserting the particle receives an UPWARD position delta that resolves the
-// penetration, bit-exact vs a CPU transcription of particlesystem.cu.
+// psContactSolveBda.slang on PhysX 5.12: the particle SIDE of the particle/rigid contact
+// solve.  Every oracle here is transcribed from the 5.12 CUDA (particlesystem.cu and
+// deformableAndParticleUtils.cuh, see pxgParticleSolveRef.h), and every comparison is
+// word for word.
 //
-// The rigid body is STATIC (rigidId.mID = 0xffffffff): the constraint-prep rigid
-// response collapses to velMultiplier = 1/invMass1 (sqrtInvInertia = 0 -> resp0 =
-// 0, invMass0 = 0), and the solve reads zero body velocity, so the per-contact
-// deltaV is exactly the penetration depth * relaxation along +normal.  This is the
-// only contact kind the particle-vs-static-floor scenes generate (the articulation
-// branch is deferred to a later tranche and is unreachable here).
+//   psContactSolve_prepare            ps_contactPrepareLaunch over the shared scene
+//                                     (pxgParticleSolveWorld.h): static / dynamic /
+//                                     kinematic / articulation-link lanes, two particle
+//                                     systems, 45 contacts over two blocks, the tail
+//                                     lanes poisoned and checked untouched, the
+//                                     appliedForces and deltaVel zeroing (and its NULL
+//                                     form).
+//   psContactSolve_queryRefCount      ps_queryPCContactReferenceCountLaunch (new in
+//                                     5.12): per-rigid / per-link PC contact counts.
+//   psContactSolve_particleSolve_*    ps_solvePCOutputParticleDeltaVLaunch for PGS / TGS
+//                                     x position / velocity iterations: friction,
+//                                     adhesion, the pair penBiasClamp, the rigid
+//                                     reference count, a kinematic particle.
+//   psContactSolve_accumulate         ps_accumulateDeltaVParticleLaunch over the runs.
+//   psContactSolve_accumulateFemDeltaV ps_accumulateFEMParticleDeltaVLaunch: the FEM
+//                                     reciprocal and the 5.12 mass-split count reset.
+//   psContactSolve_penetratingParticle the end-to-end sanity: one particle in a static
+//                                     floor is pushed out, and the depenetration clamp
+//                                     (mPenBiasClamp, setMaxDepenetrationVelocity) holds.
 
 #include "pxgTestFramework.h"
+#include "pxgParticleSolveWorld.h"
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace
 {
 using namespace pxgtest;
+using namespace pxgpsref;
+using namespace pxgpsworld;
 
-struct F2 { float x, y; };
-struct F4 { float x, y, z, w; };
-// PxgParticlePrimitiveContact (PxgParticleSystem.h, 32 bytes).
-struct PsContact { F4 normal_pen; uint32_t rigidLo, rigidHi, particleLo, particleHi; };
-static_assert(sizeof(PsContact) == 32, "PsContact stride");
+static const uint32_t PC_GRID = 1024u;
+static const uint32_t AD_GRID = 32u;
+static const float kDt = 1.0f / 60.0f;
 
-// Byte-exact size of PxgParticlePrimitiveConstraintBlock (5 float4[32] + 2 u64[32]).
-static const uint32_t CB_STRIDE = 3072u;
-
-// Engine descriptor sizes (mirrors — pxgSlangParticleDesc / pxgSlangPrepDesc /
-// pxgSlangSolverDesc): only the fields these three kernels touch are poked.
-static const uint32_t SZ_PARTICLE_SYS = 656u;   // PxgParticleSystemGpu
-static const uint32_t SZ_PREP_DESC = 304u;      // PxgConstraintPrepareDescGpu
-static const uint32_t SZ_PREPREP_DESC = 760u;   // PxgPrePrepDescGpu
-static const uint32_t SZ_CORE_DESC = 320u;      // PxgSolverCoreDescGpu
-static const uint32_t SZ_SHARED_PGS = 224u;     // PxgSolverSharedDescPGSGpu
-static const uint32_t SZ_SOLVER_BODY = 96u;     // PxgSolverBodyData
-static const uint32_t SZ_TXI = 64u;             // PxgSolverTxIData
-static const uint32_t SZ_ALIGNED_XF = 32u;      // PxgAlignedTransform
-
-static uint64_t addrOf(PxgSlangComputeDevice* dev, PxgBufferHandle h)
+static std::vector<PairInfo> pairsOf(const World& W)
 {
-    return dev->getBufferDeviceAddress(h);
+    std::vector<PairInfo> v;
+    for (const HostContact& c : W.contacts) v.push_back(c.pair);
+    return v;
 }
-static void putU64(std::vector<uint8_t>& b, size_t off, uint64_t v) { std::memcpy(b.data() + off, &v, 8); }
-static void putU32(std::vector<uint8_t>& b, size_t off, uint32_t v) { std::memcpy(b.data() + off, &v, 4); }
-static void putF32(std::vector<uint8_t>& b, size_t off, float v) { std::memcpy(b.data() + off, &v, 4); }
-static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
-
-// ---------------------------------------------------------------------------
-// CPU transcription of the three .cu kernels for ONE static-floor contact.
-// Mirrors particlesystem.cu:1238 (prepare) / :1421 (solvePCOutputDeltaV core) /
-// :1531 (solve) / :2828 (accumulate) with friction/adhesion disabled and a static
-// rigid (invMass0 = 0, sqrtInvInertia = 0, body at origin, zero velocity).
-// ---------------------------------------------------------------------------
-struct CpuOut { F4 deltaPos; F2 appliedForce; F4 accumDeltaP; };
-static CpuOut cpuReference(F4 contactNormalPen, float invMass1, float dt, float relax)
+static std::vector<F4> normalPensOf(const World& W)
 {
-    // ---- contactPrepare (static rigid) ----
-    const float nx = -contactNormalPen.x, ny = -contactNormalPen.y, nz = -contactNormalPen.z;
-    const float error = contactNormalPen.w;
-    // sqrtInvInertia = 0, invMass0 = 0 -> resp0 = 0.
-    const float unitResponse = 0.0f + invMass1;
-    const float velMultiplier = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-
-    // ---- solve (zero body velocity, delta = 0) ----
-    const float deltaX = 0.0f, deltaY = 0.0f, deltaZ = 0.0f; // mSortedDeltaP.xyz
-    const float normalDotDelta = nx * deltaX + ny * deltaY + nz * deltaZ;
-    const float separation = error - normalDotDelta;
-    const float normalVel = 0.0f;
-    float appliedForceX = 0.0f, appliedForceY = 0.0f;
-    float clamp = -appliedForceX;
-    const float deltaF = (clamp > ((-separation - normalVel * dt) * velMultiplier))
-                         ? clamp : ((-separation - normalVel * dt) * velMultiplier);
-    appliedForceX = (0.0f > (deltaF + appliedForceX)) ? 0.0f : (deltaF + appliedForceX);
-    // friction disabled -> deltaFr0 = deltaFr1 = 0, appliedForceY unchanged.
-    const float dlvX = (-(nx * deltaF)) * invMass1 * relax;
-    const float dlvY = (-(ny * deltaF)) * invMass1 * relax;
-    const float dlvZ = (-(nz * deltaF)) * invMass1 * relax;
-    const float scale = (deltaF != 0.0f) ? 1.0f : 0.0f;
-
-    // ---- accumulate over range [0,1) ----
-    float ax = dlvX, ay = dlvY, az = dlvZ;
-    float fcount = scale;
-    const float recip = 1.0f / ((1.0f > fcount) ? 1.0f : fcount);
-    ax *= recip; ay *= recip; az *= recip;
-
-    CpuOut o;
-    o.deltaPos = { dlvX, dlvY, dlvZ, scale };
-    o.appliedForce = { appliedForceX, appliedForceY };
-    o.accumDeltaP = { ax, ay, az, 0.0f };
-    return o;
+    std::vector<F4> v;
+    for (const HostContact& c : W.contacts) v.push_back(c.normalPen);
+    return v;
 }
-
-// Push-constant packs (must match psContactSolveBda.slang exactly).
-struct PrepPush
+static std::vector<uint8_t> oracleBlocks(const World& W, std::vector<BlockLane>& lanes)
 {
-    uint64_t particleSystems, sortedContacts, numContacts, primitiveConstraints,
-        preDesc, prepareDesc, appliedForces;
-    float dt; uint32_t isTGSWord;
-    uint64_t deltaVel, sharedDesc;
-};
-static_assert(sizeof(PrepPush) == 80, "prepare push 80 bytes");
-
-struct SolvePush
-{
-    uint64_t particleSystems, sortedContacts, primitiveConstraints, numContacts,
-        prePrepDesc, solverCoreDesc, sharedDesc, deltaPos, appliedForces;
-    float dt, relaxationCoefficient; uint32_t isVelIterWord;
-    uint64_t artiCoreDesc;
-};
-static_assert(sizeof(SolvePush) == 96, "solve push 96 bytes");
-
-struct AccumPush
-{
-    uint64_t particleSystems, sortedContacts, totalNumPairs, rangeStart, rangeEnd, deltaPos;
-};
-static_assert(sizeof(AccumPush) == 48, "accum push 48 bytes");
-
-// Run the full prepare->solve->accumulate pipeline for one static-floor contact.
-// Returns the GPU deltaPos[0], appliedForce[0], accumDeltaP[0].
-static bool runPipeline(PxgSlangComputeDevice* dev, F4 contactNormalPen, float invMass1,
-                        float dt, float relax, CpuOut& gpu)
-{
-    // ---- particle-side buffers ----
-    std::vector<F4> sortedPos = { { 0.0f, 0.0f, 0.0f, invMass1 } };    // mSortedPositions_InvMass
-    std::vector<F4> sortedDeltaP = { { 0.0f, 0.0f, 0.0f, invMass1 } }; // mSortedDeltaP (delta.xyz, invMass.w)
-    std::vector<uint32_t> phases = { 0u };                            // mSortedPhaseArray (group 0)
-    std::vector<uint32_t> phaseToMat = { 0u };                        // mPhaseGroupToMaterialHandle (mi 0)
-    std::vector<float> materials(8, 0.0f);                            // friction/adhesion/... all 0
-    std::vector<F4> accumDeltaP = { { 0.0f, 0.0f, 0.0f, 0.0f } };     // mAccumDeltaP (output)
-
-    PxgBufferHandle bPos = createBufferFrom(dev, sortedPos);
-    PxgBufferHandle bDeltaP = createBufferFrom(dev, sortedDeltaP);
-    PxgBufferHandle bPhases = createBufferFrom(dev, phases);
-    PxgBufferHandle bPhaseToMat = createBufferFrom(dev, phaseToMat);
-    PxgBufferHandle bMaterials = createBufferFrom(dev, materials);
-    PxgBufferHandle bAccum = createBufferFrom(dev, accumDeltaP);
-    if (!addrOf(dev, bPos)) { std::printf("  NOTE: no BDA -> skip\n");
-        dev->destroyBuffer(bPos); dev->destroyBuffer(bDeltaP); dev->destroyBuffer(bPhases);
-        dev->destroyBuffer(bPhaseToMat); dev->destroyBuffer(bMaterials); dev->destroyBuffer(bAccum);
-        return false; }
-
-    // PxgParticleSystemGpu descriptor (656 bytes), only touched fields poked.
-    std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
-    putU64(psys, 24, addrOf(dev, bPos));        // mSortedPositions_InvMass
-    putU64(psys, 40, addrOf(dev, bPhases));     // mSortedPhaseArray
-    putU64(psys, 80, addrOf(dev, bMaterials));  // mParticleMaterials
-    putU64(psys, 152, addrOf(dev, bAccum));     // mAccumDeltaP
-    putU64(psys, 160, addrOf(dev, bDeltaP));    // mSortedDeltaP
-    putF32(psys, 268, 0.1f);                    // mData_RestOffset (unused: adhesion off)
-    putU32(psys, 632, 20u);                     // mParticleMaterialStride (bytes)
-    putU64(psys, 640, addrOf(dev, bPhaseToMat));// mPhaseGroupToMaterialHandle
-    PxgBufferHandle bPsys = createBufferFrom(dev, psys);
-
-    // ---- contact + constraint + per-contact scratch ----
-    PsContact contact;
-    contact.normal_pen = contactNormalPen;
-    contact.rigidLo = 0xffffffffu; contact.rigidHi = 0u; // static body, not articulation
-    contact.particleLo = 0u; contact.particleHi = 0u;    // particleId 0, systemId 0
-    std::vector<PsContact> contacts = { contact };
-    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
-    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, 1u));
-    PxgBufferHandle bConstraints = createBufferFrom(dev, std::vector<uint8_t>(CB_STRIDE, 0));
-    PxgBufferHandle bApplied = createBufferFrom(dev, std::vector<F2>(32, { 0.0f, 0.0f }));
-    PxgBufferHandle bDeltaPos = createBufferFrom(dev, std::vector<F4>(32, { 0.0f, 0.0f, 0.0f, 0.0f }));
-
-    // ---- rigid-side buffers (static body idx 0) ----
-    std::vector<uint8_t> solverBody(SZ_SOLVER_BODY, 0); // initialLinVelXYZ_invMassW.w = invMass0 = 0
-    std::vector<uint8_t> txi(SZ_TXI, 0);                // sqrtInvInertia = 0
-    std::vector<uint8_t> bodyFrame(SZ_ALIGNED_XF, 0);   // p = 0
-    PxgBufferHandle bSolverBody = createBufferFrom(dev, solverBody);
-    PxgBufferHandle bTxi = createBufferFrom(dev, txi);
-    PxgBufferHandle bBodyFrame = createBufferFrom(dev, bodyFrame);
-
-    std::vector<uint8_t> prepDesc(SZ_PREP_DESC, 0);
-    putU64(prepDesc, 64, addrOf(dev, bSolverBody)); // solverBodyDataPool
-    putU64(prepDesc, 72, addrOf(dev, bTxi));        // solverBodyTxIDataPool
-    putU64(prepDesc, 168, addrOf(dev, bBodyFrame)); // body2WorldPool
-    PxgBufferHandle bPrepDesc = createBufferFrom(dev, prepDesc);
-
-    PxgBufferHandle bPrePrepDesc = createBufferFrom(dev, std::vector<uint8_t>(SZ_PREPREP_DESC, 0));
-
-    // solver velocities: numSolverBodies = 1, accOffset = 0 -> indices 0 and 1.
-    std::vector<F4> outVel(2, { 0.0f, 0.0f, 0.0f, 0.0f });
-    std::vector<F4> velPool(2, { 0.0f, 0.0f, 0.0f, 0.0f });
-    PxgBufferHandle bOutVel = createBufferFrom(dev, outVel);
-    PxgBufferHandle bVelPool = createBufferFrom(dev, velPool);
-
-    std::vector<uint8_t> coreDesc(SZ_CORE_DESC, 0);
-    putU64(coreDesc, 0, addrOf(dev, bOutVel)); // outSolverVelocity
-    putU32(coreDesc, 268, 1u);                 // numSolverBodies
-    putU32(coreDesc, 276, 0u);                 // accumulatedBodyDeltaVOffset
-    PxgBufferHandle bCoreDesc = createBufferFrom(dev, coreDesc);
-
-    std::vector<uint8_t> sharedPgs(SZ_SHARED_PGS, 0);
-    putU64(sharedPgs, 160, addrOf(dev, bVelPool)); // iter_solverBodyVelPool
-    PxgBufferHandle bSharedPgs = createBufferFrom(dev, sharedPgs);
-
-    // range-find outputs (from P6.4b-1): one particle -> range [0,1).
-    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, 1u));
-    PxgBufferHandle bStart = createBufferFrom(dev, std::vector<uint32_t>(1, 0u));
-    PxgBufferHandle bEnd = createBufferFrom(dev, std::vector<uint32_t>(1, 1u));
-
-    // ---- dispatch prepare (grid PS_COLLISION = 1024) ----
+    const uint32_t NC = uint32_t(W.contacts.size());
+    std::vector<uint8_t> blocks(((NC + 31u) / 32u) * RPC_STRIDE, 0);
+    lanes.clear();
+    for (uint32_t w = 0; w < NC; ++w)
     {
+        lanes.push_back(W.prepare(W.contacts[w]));
+        writeLane(blocks, w, lanes.back());
+    }
+    return blocks;
+}
+
+static void countKinds(const World& W, uint32_t kinds[4])
+{
+    kinds[0] = kinds[1] = kinds[2] = kinds[3] = 0;
+    for (const HostContact& c : W.contacts)
+    {
+        const uint64_t r = c.pair.ref0;
+        if (nodeIsStatic(r)) ++kinds[0];
+        else if (nodeIsArticulation(r)) ++kinds[3];
+        else if (W.bodies[W.solverBodyIndices[nodeIndex(r)]].linVel_invMass.w == 0.0f) ++kinds[2];
+        else ++kinds[1];
+    }
+}
+
+// ===========================================================================
+// ps_contactPrepareLaunch
+// ===========================================================================
+PXG_TEST(psContactSolve_prepare)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    World W;
+    buildWorld(W, dev, 0x9e3779b9u);
+    const uint32_t NC = uint32_t(W.contacts.size());
+
+    uint32_t kinds[4];
+    countKinds(W, kinds);
+    PXG_CHECK_MSG(kinds[0] > 0 && kinds[1] > 0 && kinds[2] > 0 && kinds[3] > 0,
+                  "coverage: static %u dynamic %u kinematic %u articulation %u", kinds[0], kinds[1], kinds[2], kinds[3]);
+
+    std::vector<BlockLane> lanes;
+    const std::vector<uint8_t> ref = oracleBlocks(W, lanes);
+
+    for (int withDeltaVel = 1; withDeltaVel >= 0; --withDeltaVel)
+    {
+        // Poison every byte the kernel may not write: the tail lanes of the last block.
+        std::vector<uint8_t> poison(ref.size(), 0xA7);
+        PxgBufferHandle bBlocks = W.make(poison);
+        PxgBufferHandle bPairs = W.make(pairsOf(W));
+        PxgBufferHandle bNormalPens = W.make(normalPensOf(W));
+        PxgBufferHandle bNum = W.make(std::vector<uint32_t>(1, NC));
+        PxgBufferHandle bApplied = W.make(std::vector<F2>(NC + 8, F2{ 7.0f, -7.0f }));
+        PxgBufferHandle bDeltaVel = W.make(std::vector<F4>(2 * NC + 8, F4{ 3.0f, 3.0f, 3.0f, 3.0f }));
+
         PrepPush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.numContacts = addrOf(dev, bNum);
-        p.primitiveConstraints = addrOf(dev, bConstraints);
-        p.preDesc = addrOf(dev, bPrePrepDesc);
-        p.prepareDesc = addrOf(dev, bPrepDesc);
-        p.appliedForces = addrOf(dev, bApplied);
-        p.dt = dt;
-        p.isTGSWord = 0u;
-        p.deltaVel = 0ull;                  // null -> rigid deltaV zeroing skipped
-        p.sharedDesc = 0ull;                // unused (arti branch only)
+        p.particleSystems = W.psysPool;
+        p.sortedContactInfos = W.addr(bPairs);
+        p.sortedContactNormalPens = W.addr(bNormalPens);
+        p.numContacts = W.addr(bNum);
+        p.contactBlocks = W.addr(bBlocks);
+        p.preDesc = W.prePrepDesc;
+        p.prepareDesc = W.prepDesc;
+        p.appliedForces = W.addr(bApplied);
+        p.dt = kDt;
+        p.isTGSWord = 1u;
+        p.deltaVel = withDeltaVel ? W.addr(bDeltaVel) : 0ull;
+        p.sharedDesc = W.sharedDesc;
         Kernel k("psContactSolveBda.spv", "ps_contactPrepareLaunch", {}, sizeof(PrepPush));
-        k.dispatch(1024u, {}, p);
+        PXG_CHECK(k.isValid());
+        if (!k.isValid()) return;
+        k.dispatch(PC_GRID, {}, p);
+        dev->flush();
+
+        const std::vector<uint8_t> got = downloadBuffer<uint8_t>(dev, bBlocks, ref.size());
+        uint32_t mm = 0;
+        for (uint32_t w = 0; w < NC; ++w)
+        {
+            const BlockLane g = readLane(got, w);
+            const BlockLane& r = lanes[w];
+            const bool ok = bitsEqual(g.raXn_resp, r.raXn_resp) && bitsEqual(g.raXnF0_resp, r.raXnF0_resp) &&
+                            bitsEqual(g.raXnF1_resp, r.raXnF1_resp) && bitsEqual(g.normal_errorW, r.normal_errorW) &&
+                            bitsEqual(g.fricTan0_invMass0, r.fricTan0_invMass0) &&
+                            bitsEqual(g.penBiasClampRigid, r.penBiasClampRigid);
+            if (!ok && mm++ < 6)
+                std::printf("  lane %u (rigid %016llx): raXn_resp got(%g,%g,%g,%g) ref(%g,%g,%g,%g) clamp got %g ref %g\n", w,
+                            (unsigned long long)W.contacts[w].pair.ref0, g.raXn_resp.x, g.raXn_resp.y, g.raXn_resp.z,
+                            g.raXn_resp.w, r.raXn_resp.x, r.raXn_resp.y, r.raXn_resp.z, r.raXn_resp.w,
+                            g.penBiasClampRigid, r.penBiasClampRigid);
+        }
+        PXG_CHECK_MSG(mm == 0, "%u of %u prepared lanes differ from the 5.12 oracle", mm, NC);
+
+        // The tail lanes of the partial block are never written.
+        uint32_t tail = 0;
+        for (uint32_t w = NC; w < ((NC + 31u) / 32u) * 32u; ++w)
+        {
+            const BlockLane g = readLane(got, w);
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&g.raXn_resp);
+            for (int b = 0; b < 16; ++b) tail += bytes[b] != 0xA7;
+        }
+        PXG_CHECK_MSG(tail == 0, "%u tail bytes written past numContacts", tail);
+
+        const std::vector<F2> applied = downloadBuffer<F2>(dev, bApplied, NC + 8);
+        uint32_t badApplied = 0;
+        for (uint32_t w = 0; w < NC + 8; ++w)
+        {
+            const F2 want = (w < NC) ? F2{ 0.0f, 0.0f } : F2{ 7.0f, -7.0f };
+            badApplied += !bitsEqual(applied[w], want);
+        }
+        PXG_CHECK_MSG(badApplied == 0, "appliedForces: %u slots wrong (zeroed [0,n), untouched after)", badApplied);
+
+        const std::vector<F4> dv = downloadBuffer<F4>(dev, bDeltaVel, 2 * NC + 8);
+        uint32_t badDv = 0;
+        for (uint32_t w = 0; w < 2 * NC + 8; ++w)
+        {
+            const bool zeroed = withDeltaVel && w < 2 * NC;
+            const F4 want = zeroed ? F4{ 0.f, 0.f, 0.f, 0.f } : F4{ 3.f, 3.f, 3.f, 3.f };
+            badDv += !bitsEqual(dv[w], want);
+        }
+        PXG_CHECK_MSG(badDv == 0, "deltaVel (%s): %u slots wrong", withDeltaVel ? "non-null" : "NULL", badDv);
     }
-    // ---- dispatch solve (grid PS_COLLISION = 1024) ----
-    {
-        SolvePush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.primitiveConstraints = addrOf(dev, bConstraints);
-        p.numContacts = addrOf(dev, bNum);
-        p.prePrepDesc = addrOf(dev, bPrePrepDesc);
-        p.solverCoreDesc = addrOf(dev, bCoreDesc);
-        p.sharedDesc = addrOf(dev, bSharedPgs);
-        p.deltaPos = addrOf(dev, bDeltaPos);
-        p.appliedForces = addrOf(dev, bApplied);
-        p.dt = dt;
-        p.relaxationCoefficient = relax;
-        p.isVelIterWord = 0u;
-        p.artiCoreDesc = 0ull;              // unused (arti branch only)
-        Kernel k("psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch", {}, sizeof(SolvePush));
-        k.dispatch(1024u, {}, p);
-    }
-    // ---- dispatch accumulate (grid ACCUMULATE_DELTA = 32) ----
-    {
-        AccumPush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.totalNumPairs = addrOf(dev, bPairs);
-        p.rangeStart = addrOf(dev, bStart);
-        p.rangeEnd = addrOf(dev, bEnd);
-        p.deltaPos = addrOf(dev, bDeltaPos);
-        Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
-        k.dispatch(32u, {}, p);
-    }
+}
+
+// ===========================================================================
+// ps_queryPCContactReferenceCountLaunch (new in 5.12)
+// ===========================================================================
+PXG_TEST(psContactSolve_queryRefCount)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    World W;
+    buildWorld(W, dev, 0x51ed270bu);
+    const uint32_t NC = uint32_t(W.contacts.size());
+
+    std::vector<BlockLane> lanes;
+    const std::vector<uint8_t> blocks = oracleBlocks(W, lanes);
+    const std::vector<uint32_t> ref = W.refCounts(lanes);
+
+    // The host zeroes the buffer first (memsetD32Async); two extra slots stay untouched.
+    PxgBufferHandle bRc = W.make(std::vector<uint32_t>(W.refCountSlots() + 2, 0u));
+    PxgBufferHandle bBlocks = W.make(blocks);
+    PxgBufferHandle bPairs = W.make(pairsOf(W));
+    PxgBufferHandle bNum = W.make(std::vector<uint32_t>(1, NC));
+
+    QueryPush p{};
+    p.particleSystems = W.psysPool;
+    p.sortedContactInfos = W.addr(bPairs);
+    p.contactBlocks = W.addr(bBlocks);
+    p.numContacts = W.addr(bNum);
+    p.prePrepDesc = W.prePrepDesc;
+    p.solverCoreDesc = W.coreDesc;
+    p.solverBodyVelPool = W.velPoolAddr;
+    p.rigidRefCount = W.addr(bRc);
+    p.dt = kDt;
+    p.isTGSWord = 0u;
+    p.artiCoreDesc = W.artiCoreDesc;
+    Kernel k("psContactSolveBda.spv", "ps_queryPCContactReferenceCountLaunch", {}, sizeof(QueryPush));
+    PXG_CHECK(k.isValid());
+    if (!k.isValid()) return;
+    k.dispatch(PC_GRID, {}, p);
     dev->flush();
 
-    gpu.deltaPos = downloadBuffer<F4>(dev, bDeltaPos, 1)[0];
-    gpu.appliedForce = downloadBuffer<F2>(dev, bApplied, 1)[0];
-    gpu.accumDeltaP = downloadBuffer<F4>(dev, bAccum, 1)[0];
-
-    PxgBufferHandle all[] = { bPos, bDeltaP, bPhases, bPhaseToMat, bMaterials, bAccum, bPsys,
-        bContacts, bNum, bConstraints, bApplied, bDeltaPos, bSolverBody, bTxi, bBodyFrame,
-        bPrepDesc, bPrePrepDesc, bOutVel, bVelPool, bCoreDesc, bSharedPgs, bPairs, bStart, bEnd };
-    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
-    return true;
+    const std::vector<uint32_t> got = downloadBuffer<uint32_t>(dev, bRc, W.refCountSlots() + 2);
+    uint32_t mm = 0, linkSlots = 0, bodySlots = 0;
+    for (uint32_t i = 0; i < W.refCountSlots(); ++i)
+    {
+        if (got[i] != ref[i] && mm++ < 8)
+            std::printf("  refCount[%u] got %u ref %u\n", i, got[i], ref[i]);
+        if (ref[i] && i >= W.numSolverBodies) ++linkSlots;
+        if (ref[i] && i < W.numSolverBodies) ++bodySlots;
+    }
+    PXG_CHECK_MSG(mm == 0, "%u reference-count slots differ", mm);
+    PXG_CHECK_MSG(got[W.refCountSlots()] == 0u && got[W.refCountSlots() + 1] == 0u, "bumped past the slots");
+    // Static (body 0) and kinematic (body 2) are never counted; both dynamics and two links are.
+    PXG_CHECK_MSG(ref[0] == 0u && ref[2] == 0u, "static / kinematic must not be counted");
+    PXG_CHECK_MSG(bodySlots == 2u && linkSlots == 2u, "coverage: %u body slots, %u link slots", bodySlots, linkSlots);
 }
 
 // ===========================================================================
-// KEY PROOF — a penetrating particle is pushed OUT (upward, resolving -0.1).
+// ps_solvePCOutputParticleDeltaVLaunch
 // ===========================================================================
-PXG_TEST(psContactSolve_penetratingParticle)
+static void runParticleSolve(bool isTGS, bool isVelocityIteration, uint32_t seed)
 {
     PxgSlangComputeDevice* dev = testDevice();
+    World W;
+    buildWorld(W, dev, seed);
+    const uint32_t NC = uint32_t(W.contacts.size());
 
-    // Contact: surface normal (0,1,0) pointing UP away from the floor, penetration
-    // -0.1 (error).  invMass1 = 1, dt = 1/60, relaxation = 1 -> the correction fully
-    // resolves the penetration in one solve.
-    const F4 contactNormalPen = { 0.0f, 1.0f, 0.0f, -0.1f };
-    const float invMass1 = 1.0f, dt = 1.0f / 60.0f, relax = 1.0f;
+    std::vector<BlockLane> lanes;
+    const std::vector<uint8_t> blocks = oracleBlocks(W, lanes);
+    const std::vector<uint32_t> rc = W.refCounts(lanes);
 
-    CpuOut gpu;
-    if (!runPipeline(dev, contactNormalPen, invMass1, dt, relax, gpu))
-        return;
-    const CpuOut ref = cpuReference(contactNormalPen, invMass1, dt, relax);
+    // Applied forces from "earlier iterations": a non-negative normal accumulator and a
+    // signed tangent one.  The first lanes start at zero.
+    Rng rng{ seed ^ 0x1234567u };
+    std::vector<F2> applied(NC);
+    for (uint32_t w = 0; w < NC; ++w)
+        applied[w] = (w < 6u) ? F2{ 0.f, 0.f } : F2{ rng.uni(0.0f, 0.05f), rng.uni(-0.02f, 0.02f) };
 
-    // Direction: the particle is pushed UP and resolves the penetration.
-    PXG_CHECK_MSG(gpu.accumDeltaP.y > 0.0f,
-                  "accumDeltaP.y not upward: (%g,%g,%g)", gpu.accumDeltaP.x, gpu.accumDeltaP.y, gpu.accumDeltaP.z);
-    PXG_CHECK_MSG(gpu.deltaPos.y > 0.0f,
-                  "per-contact deltaPos.y not upward: %g", gpu.deltaPos.y);
-    // Penetration magnitude fully resolved (accumDeltaP.y == 0.1 for relax = 1).
-    PXG_CHECK_MSG(std::fabs(gpu.accumDeltaP.y - 0.1f) < 1e-6f,
-                  "accumDeltaP.y=%g does not resolve -0.1 penetration", gpu.accumDeltaP.y);
-    PXG_CHECK_MSG(gpu.accumDeltaP.x == 0.0f && gpu.accumDeltaP.z == 0.0f,
-                  "lateral drift: (%g,%g)", gpu.accumDeltaP.x, gpu.accumDeltaP.z);
+    PxgBufferHandle bBlocks = W.make(blocks);
+    PxgBufferHandle bPairs = W.make(pairsOf(W));
+    PxgBufferHandle bNum = W.make(std::vector<uint32_t>(1, NC));
+    PxgBufferHandle bApplied = W.make(applied);
+    PxgBufferHandle bDelta = W.make(std::vector<F4>(NC + 4, F4{ 9.f, 9.f, 9.f, 9.f }));
+    PxgBufferHandle bRc = W.make(rc);
 
-    // Bit-exact vs the CPU transcription of the .cu (deltaPos, appliedForce, accum).
-    PXG_CHECK_MSG(std::memcmp(&gpu.deltaPos, &ref.deltaPos, sizeof(F4)) == 0,
-                  "deltaPos gpu(%g,%g,%g,%g) != cpu(%g,%g,%g,%g)",
-                  gpu.deltaPos.x, gpu.deltaPos.y, gpu.deltaPos.z, gpu.deltaPos.w,
-                  ref.deltaPos.x, ref.deltaPos.y, ref.deltaPos.z, ref.deltaPos.w);
-    PXG_CHECK_MSG(std::memcmp(&gpu.appliedForce, &ref.appliedForce, sizeof(F2)) == 0,
-                  "appliedForce gpu(%g,%g) != cpu(%g,%g)",
-                  gpu.appliedForce.x, gpu.appliedForce.y, ref.appliedForce.x, ref.appliedForce.y);
-    PXG_CHECK_MSG(std::memcmp(&gpu.accumDeltaP, &ref.accumDeltaP, sizeof(F4)) == 0,
-                  "accumDeltaP gpu(%g,%g,%g,%g) != cpu(%g,%g,%g,%g)",
-                  gpu.accumDeltaP.x, gpu.accumDeltaP.y, gpu.accumDeltaP.z, gpu.accumDeltaP.w,
-                  ref.accumDeltaP.x, ref.accumDeltaP.y, ref.accumDeltaP.z, ref.accumDeltaP.w);
-    // The normal impulse magnitude equals the resolved penetration for a static
-    // floor (velMultiplier=1/invMass1, deltaF=|error|*velMultiplier).
-    PXG_CHECK_MSG(std::fabs(gpu.appliedForce.x - 0.1f) < 1e-6f,
-                  "appliedForce.x=%g != 0.1 (deltaF for a fully-resolved -0.1 pen)", gpu.appliedForce.x);
-}
-
-// ===========================================================================
-// P9.99b -- TWO SYSTEMS in one contact list: prepare -> PGS solve -> accumulate.
-//
-// Every fixture above holds ONE contact of system 0, so `contact id >> 32` (prepare),
-// the constraint block's system id (solve) and the run head's system id (accumulate)
-// were only ever 0, and the P9.99b force-system-0 mutants of all three survived.
-// Here the sorted list interleaves systems 0 and 2 -- 8 contacts in 6 particle runs:
-//     #  sys pid  contact (normal (0,1,0), pen)
-//     0   0   0   -0.10   penetrating
-//     1   0   1   +0.05   separated, inside the adhesion radius
-//     2   0   3   -0.08   \ one run of two
-//     3   0   3   +0.03   /
-//     4   2   3   -0.12   \ system 2's first particle == system 0's last one, so a
-//     5   2   3   +0.04   / low-32-bit-only id would merge the runs
-//     6   2   4   +0.05
-//     7   2   6   -0.06
-// and the two systems differ in everything the three kernels read per system: the
-// inverse mass (1 / 0.5, read by prepare from the sorted positions and by the solve
-// from the sorted deltaP), the running delta (tangential, so friction is live), the
-// material through each system's own phase->material map (friction 0.05 / 0.3,
-// adhesion 0.3 / 0.5, radius scale 1.5 / 2.0) and mData.mRestOffset (0.25 / 0.15),
-// which the adhesion branch reads for the two separated contacts of each system.
-// Slot 1 of the pool is a decoy no contact names; its arrays must survive.
-// The static rigid keeps the prepare at velMultiplier = 1/invMass; every dot product
-// the oracle takes is exact (the delta is orthogonal to the normal), so the CPU
-// transcription is bit-exact.
-// ===========================================================================
-// The PGS core, solvePCOutputDeltaV (particlesystem.cu:1421; psContactSolveBda.slang),
-// transcribed in full -- friction, adhesion and the rest offset included -- for the
-// two-system twin below.  pmin/pmax are the PxMin/PxMax ternaries.
-struct P99V3 { float x, y, z; };
-static float p99Dot(P99V3 a, P99V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static P99V3 p99Cross(P99V3 a, P99V3 b) { return P99V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-static float p99Min(float a, float b) { return (a < b) ? a : b; }
-static float p99Max(float a, float b) { return (a > b) ? a : b; }
-struct P99PgsOut { float deltaF, deltaFr0, deltaFr1; F2 appliedForce; };
-static P99PgsOut p99SolvePCOutputDeltaV(P99V3 normal, float error, P99V3 delta, P99V3 fric0, P99V3 fric1,
-                                        float tanVel0, float tanVel1, float normalVel, float velMultiplier,
-                                        float vmF0, float vmF1, float frictionCoefficient, float restOffset,
-                                        float adhesion, float adhesionRadiusScale, float dt, F2 appliedForce)
-{
-    const float separation = (error - p99Dot(normal, delta));
-    float clamp = -appliedForce.x;
-    if (adhesionRadiusScale > 0.0f && adhesion > 0.0f)
-    {
-        const float adhesionRadius = restOffset * adhesionRadiusScale - restOffset;
-        if (separation < adhesionRadiusScale)
-        {
-            const float q = 1.0f - separation / adhesionRadius;
-            clamp = p99Min(clamp, -p99Max(0.0f, adhesion * (q * q * q * q) * p99Max(0.0f, separation) * velMultiplier));
-        }
-    }
-    P99PgsOut r;
-    r.deltaF = p99Max(clamp, (-separation - normalVel * dt) * velMultiplier);
-    appliedForce.x = p99Max(0.0f, r.deltaF + appliedForce.x);
-    const float friction = appliedForce.x * frictionCoefficient;
-    const float biasedF0 = -(p99Dot(fric0, delta));
-    const float biasedF1 = -(p99Dot(fric1, delta));
-    const float requiredF0Force = (biasedF0 + tanVel0 * dt) * vmF0;
-    const float requiredF1Force = (biasedF1 + tanVel1 * dt) * vmF1;
-    const float requiredForce = std::sqrt(requiredF0Force * requiredF0Force + requiredF1Force * requiredF1Force);
-    const float recip = (requiredForce >= 1e-16f) ? (1.0f / requiredForce) : 0.0f;
-    const float ratio0 = requiredF0Force * recip;
-    const float ratio1 = requiredF1Force * recip;
-    const float deltaFr = p99Min(requiredForce + appliedForce.y, friction) - appliedForce.y;
-    appliedForce.y = appliedForce.y + deltaFr;
-    r.deltaFr0 = deltaFr * ratio0;
-    r.deltaFr1 = deltaFr * ratio1;
-    r.appliedForce = appliedForce;
-    return r;
-}
-
-struct P99Sys
-{
-    uint32_t n = 0;
-    float invMass = 0.f, restOffset = 0.f;
-    uint16_t mat = 0;
-    std::vector<F4> pos, deltaP, accum;
-    std::vector<uint32_t> phases, p2m;
-    PxgBufferHandle bPos = 0, bDeltaP = 0, bAccum = 0, bPhases = 0, bP2M = 0;
-};
-
-PXG_TEST(psContactSolve_p99TwoSystems)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f, relax = 0.8f;
-    // materials: friction, damping, adhesion, gravityScale, adhesionRadiusScale (stride 20)
-    const std::vector<float> materials = {
-        0.05f, 0.0f, 0.3f, 1.0f, 1.5f,     // material 0: system 0
-        0.3f,  0.0f, 0.5f, 1.0f, 2.0f,     // material 1: system 2
-        0.9f,  0.0f, 0.7f, 1.0f, 3.0f };   // material 2: the decoy
-    P99Sys s[3];
-    const uint32_t NP[3] = { 8u, 9u, 7u };
-    const float IM[3] = { 1.0f, 2.0f, 0.5f }, REST[3] = { 0.25f, 0.4f, 0.15f };
-    const uint16_t MAT[3] = { 0u, 2u, 1u };
-    PxgBufferHandle bMaterials = createBufferFrom(dev, materials);
-    if (!addrOf(dev, bMaterials)) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bMaterials); return; }
-    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
-    for (uint32_t k = 0; k < 3; ++k)
-    {
-        P99Sys& c = s[k];
-        c.n = NP[k]; c.invMass = IM[k]; c.restOffset = REST[k]; c.mat = MAT[k];
-        const float fk = float(k);
-        for (uint32_t i = 0; i < c.n; ++i)
-        {
-            const float fi = float(i);
-            c.pos.push_back({ 0.1f * fi, 0.5f + fk, -0.2f * fi, c.invMass });
-            // tangential only: delta.y = 0, so normal.dot(delta) is an exact zero
-            c.deltaP.push_back({ (k == 2u ? -0.015f : 0.01f) + 0.001f * fi, 0.0f, (k == 2u ? 0.005f : 0.02f) - 0.002f * fi, c.invMass });
-            c.accum.push_back({ 0.5f * fi - fk, -0.25f + 0.125f * fk, 0.75f, 1.0f + fi });
-        }
-        c.phases.assign(c.n, 0u);
-        c.p2m = { uint32_t(c.mat) };
-        c.bPos = createBufferFrom(dev, c.pos); c.bDeltaP = createBufferFrom(dev, c.deltaP);
-        c.bAccum = createBufferFrom(dev, c.accum); c.bPhases = createBufferFrom(dev, c.phases);
-        c.bP2M = createBufferFrom(dev, c.p2m);
-        std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
-        putU64(psys, 24, addrOf(dev, c.bPos));        // mSortedPositions_InvMass
-        putU64(psys, 40, addrOf(dev, c.bPhases));     // mSortedPhaseArray
-        putU64(psys, 80, addrOf(dev, bMaterials));    // mParticleMaterials (one shared table)
-        putU32(psys, 116, c.n);                       // mCommonData_NumParticles
-        putU64(psys, 152, addrOf(dev, c.bAccum));     // mAccumDeltaP
-        putU64(psys, 160, addrOf(dev, c.bDeltaP));    // mSortedDeltaP
-        putF32(psys, 268, c.restOffset);              // mData_RestOffset
-        putU32(psys, 632, 20u);                       // mParticleMaterialStride (bytes)
-        putU64(psys, 640, addrOf(dev, c.bP2M));       // mPhaseGroupToMaterialHandle
-        std::memcpy(pool.data() + k * SZ_PARTICLE_SYS, psys.data(), SZ_PARTICLE_SYS);
-    }
-    PxgBufferHandle bPsys = createBufferFrom(dev, pool);
-
-    struct C { uint32_t sys, pid; float pen; };
-    const C cl[8] = { { 0, 0, -0.10f }, { 0, 1, 0.05f }, { 0, 3, -0.08f }, { 0, 3, 0.03f },
-                      { 2, 3, -0.12f }, { 2, 3, 0.04f }, { 2, 4, 0.05f }, { 2, 6, -0.06f } };
-    const uint32_t NC = 8u;
-    const uint32_t runStart[6] = { 0u, 1u, 2u, 4u, 6u, 7u }, runEnd[6] = { 1u, 2u, 4u, 6u, 7u, 8u };
-    std::vector<PsContact> contacts(NC);
-    for (uint32_t c = 0; c < NC; ++c)
-    {
-        contacts[c].normal_pen = { 0.0f, 1.0f, 0.0f, cl[c].pen };
-        contacts[c].rigidLo = 0xffffffffu; contacts[c].rigidHi = 0u;   // static body, not articulation
-        contacts[c].particleLo = cl[c].pid; contacts[c].particleHi = cl[c].sys;
-    }
-    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
-    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, NC));
-    PxgBufferHandle bConstraints = createBufferFrom(dev, std::vector<uint8_t>(CB_STRIDE, 0));
-    PxgBufferHandle bApplied = createBufferFrom(dev, std::vector<F2>(32, { 9.0f, 9.0f }));
-    PxgBufferHandle bDeltaPos = createBufferFrom(dev, std::vector<F4>(32, { 0.0f, 0.0f, 0.0f, 0.0f }));
-    std::vector<uint8_t> solverBody(SZ_SOLVER_BODY, 0), txi(SZ_TXI, 0), bodyFrame(SZ_ALIGNED_XF, 0);
-    PxgBufferHandle bSolverBody = createBufferFrom(dev, solverBody);
-    PxgBufferHandle bTxi = createBufferFrom(dev, txi);
-    PxgBufferHandle bBodyFrame = createBufferFrom(dev, bodyFrame);
-    std::vector<uint8_t> prepDesc(SZ_PREP_DESC, 0);
-    putU64(prepDesc, 64, addrOf(dev, bSolverBody));
-    putU64(prepDesc, 72, addrOf(dev, bTxi));
-    putU64(prepDesc, 168, addrOf(dev, bBodyFrame));
-    PxgBufferHandle bPrepDesc = createBufferFrom(dev, prepDesc);
-    PxgBufferHandle bPrePrepDesc = createBufferFrom(dev, std::vector<uint8_t>(SZ_PREPREP_DESC, 0));
-    PxgBufferHandle bVelPool = createBufferFrom(dev, std::vector<F4>(2, { 0.0f, 0.0f, 0.0f, 0.0f }));
-    PxgBufferHandle bOutVel = createBufferFrom(dev, std::vector<F4>(2, { 0.0f, 0.0f, 0.0f, 0.0f }));
-    std::vector<uint8_t> coreDesc(SZ_CORE_DESC, 0);
-    putU64(coreDesc, 0, addrOf(dev, bOutVel)); // outSolverVelocity
-    putU32(coreDesc, 268, 1u);                 // numSolverBodies
-    putU32(coreDesc, 276, 0u);                 // accumulatedBodyDeltaVOffset
-    PxgBufferHandle bCoreDesc = createBufferFrom(dev, coreDesc);
-    std::vector<uint8_t> sharedPgs(SZ_SHARED_PGS, 0);
-    putU64(sharedPgs, 160, addrOf(dev, bVelPool));
-    PxgBufferHandle bSharedPgs = createBufferFrom(dev, sharedPgs);
-    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, 6u));
-    PxgBufferHandle bStart = createBufferFrom(dev, std::vector<uint32_t>(runStart, runStart + 6));
-    PxgBufferHandle bEnd = createBufferFrom(dev, std::vector<uint32_t>(runEnd, runEnd + 6));
-
-    {
-        PrepPush p{};
-        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
-        p.numContacts = addrOf(dev, bNum); p.primitiveConstraints = addrOf(dev, bConstraints);
-        p.preDesc = addrOf(dev, bPrePrepDesc); p.prepareDesc = addrOf(dev, bPrepDesc);
-        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.isTGSWord = 0u;
-        p.deltaVel = 0ull; p.sharedDesc = 0ull;
-        Kernel k("psContactSolveBda.spv", "ps_contactPrepareLaunch", {}, sizeof(PrepPush));
-        k.dispatch(1024u, {}, p);
-    }
-    {
-        SolvePush p{};
-        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
-        p.primitiveConstraints = addrOf(dev, bConstraints); p.numContacts = addrOf(dev, bNum);
-        p.prePrepDesc = addrOf(dev, bPrePrepDesc); p.solverCoreDesc = addrOf(dev, bCoreDesc);
-        p.sharedDesc = addrOf(dev, bSharedPgs); p.deltaPos = addrOf(dev, bDeltaPos);
-        p.appliedForces = addrOf(dev, bApplied); p.dt = dt; p.relaxationCoefficient = relax;
-        p.isVelIterWord = 0u; p.artiCoreDesc = 0ull;
-        Kernel k("psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch", {}, sizeof(SolvePush));
-        k.dispatch(1024u, {}, p);
-    }
-    {
-        AccumPush p{};
-        p.particleSystems = addrOf(dev, bPsys); p.sortedContacts = addrOf(dev, bContacts);
-        p.totalNumPairs = addrOf(dev, bPairs); p.rangeStart = addrOf(dev, bStart);
-        p.rangeEnd = addrOf(dev, bEnd); p.deltaPos = addrOf(dev, bDeltaPos);
-        Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
-        k.dispatch(32u, {}, p);
-    }
+    SolvePush p{};
+    p.particleSystems = W.psysPool;
+    p.sortedContactInfos = W.addr(bPairs);
+    p.contactBlocks = W.addr(bBlocks);
+    p.numContacts = W.addr(bNum);
+    p.prePrepDesc = W.prePrepDesc;
+    p.solverCoreDesc = W.coreDesc;
+    p.solverBodyVelPool = W.velPoolAddr;
+    p.deltaOut = W.addr(bDelta);
+    p.appliedForces = W.addr(bApplied);
+    p.rigidRefCount = W.addr(bRc);
+    p.dt = kDt;
+    p.flagsWord = (isVelocityIteration ? 1u : 0u) | (isTGS ? 0x100u : 0u);
+    p.artiCoreDesc = W.artiCoreDesc;
+    Kernel k("psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch", {}, sizeof(SolvePush));
+    PXG_CHECK(k.isValid());
+    if (!k.isValid()) return;
+    k.dispatch(PC_GRID, {}, p);
     dev->flush();
 
-    // CPU oracle: prepare (static rigid) -> p99SolvePCOutputDeltaV -> accumulate.
-    const P99V3 normal = { -0.0f, -1.0f, -0.0f };    // prepare flips the contact normal (0,1,0)
-    const P99V3 fric0 = { 1.0f, 0.0f, 0.0f };        // computeBasisVectors: |dir.y| > 0.9999
-    const P99V3 fric1 = p99Cross(normal, fric0);
-    std::vector<F4> refDeltaPos(NC);
-    std::vector<F2> refApplied(NC);
-    std::vector<F4> refAccum[3] = { s[0].accum, s[1].accum, s[2].accum };
-    for (uint32_t c = 0; c < NC; ++c)
+    // ---- oracle ----
+    const VelocityReader reader = W.reader();
+    std::vector<F4> refDelta(NC + 4, F4{ 9.f, 9.f, 9.f, 9.f });
+    std::vector<F2> refApplied = applied;
+    uint32_t nApplied = 0, nKinematic = 0, nNotApplied = 0, nFriction = 0, nAdhesive = 0;
+    for (uint32_t w = 0; w < NC; ++w)
     {
-        const P99Sys& sy = s[cl[c].sys];
-        const float invMass1 = sy.pos[cl[c].pid].w;
-        const float vm = (invMass1 > 0.0f) ? (1.0f / (0.0f + invMass1)) : 0.0f;
-        const F4 d4 = sy.deltaP[cl[c].pid];
-        const P99V3 delta = { d4.x, d4.y, d4.z };
-        const float* m = &materials[sy.mat * 5u];
-        // static rigid: zero body velocity -> tanVel0 = tanVel1 = normalVel = 0
-        const P99PgsOut r = p99SolvePCOutputDeltaV(normal, cl[c].pen, delta, fric0, fric1, 0.0f, 0.0f, 0.0f, vm, vm, vm,
-                                                   m[0], sy.restOffset, m[2], m[4], dt, F2{ 0.0f, 0.0f });
-        const float im = d4.w;
-        refDeltaPos[c] = { ((-(normal.x * r.deltaF) + fric0.x * r.deltaFr0) + fric1.x * r.deltaFr1) * im * relax,
-                           ((-(normal.y * r.deltaF) + fric0.y * r.deltaFr0) + fric1.y * r.deltaFr1) * im * relax,
-                           ((-(normal.z * r.deltaF) + fric0.z * r.deltaFr0) + fric1.z * r.deltaFr1) * im * relax,
-                           (r.deltaF != 0.0f) ? 1.0f : 0.0f };
-        refApplied[c] = r.appliedForce;
-    }
-    for (uint32_t run = 0; run < 6; ++run)
-    {
-        float ax = 0.0f, ay = 0.0f, az = 0.0f, fc = 0.0f;
-        for (uint32_t j = runStart[run]; j < runEnd[run]; ++j)
-        { ax += refDeltaPos[j].x; ay += refDeltaPos[j].y; az += refDeltaPos[j].z; fc += refDeltaPos[j].w; }
-        const float recip = 1.0f / p99Max(1.0f, fc);
-        ax *= recip; ay *= recip; az *= recip;
-        F4& a = refAccum[cl[runStart[run]].sys][cl[runStart[run]].pid];
-        a = { a.x + ax, a.y + ay, a.z + az, a.w + 0.0f };
+        const HostContact& c = W.contacts[w];
+        const uint32_t s = particleSystemIdOf(c.pair.ref1), pi = particleIndexOf(c.pair.ref1);
+        const ParticleView pv = W.particleView(s, pi);
+        if (pv.sortedDeltaP.w == 0.f)
+        {
+            refDelta[w] = F4{ 0.f, 0.f, 0.f, 0.f };
+            ++nKinematic;
+            continue;
+        }
+        const uint64_t rigidId = c.pair.ref0;
+        RigidPart rigid;
+        rigid.readBodyProperties(W.gid(rigidId), lanes[w].fricTan0_invMass0.w, rc.data());
+        rigid.readContactPrep(lanes[w]);
+        rigid.readVelocity(reader, rigidId, isTGS);
+        DeformablePart particle;
+        particle.readParticle(pv, true, false, kDt, isVelocityIteration);
+        ContactPair cp;
+        cp.readRigidParticle(lanes[w], W.sys[s].penBiasClamp);
+        SolveOut so;
+        F2 af = applied[w];
+        const bool hasApplied = solveRigidDbContact(rigid, particle, cp, so, af.x, af.y, kDt, true, false,
+                                                    isVelocityIteration, true);
+        if (hasApplied)
+        {
+            af.x = so.accumulatedDeltaLambdaN;
+            af.y += so.deltaLambdaT;
+            V3 delta;
+            so.computeDelta(cp, delta, kDt);
+            refDelta[w] = particle.writeParticle(delta, so);
+            refApplied[w] = af;
+            ++nApplied;
+            nFriction += so.deltaLambdaT != 0.0f;
+            nAdhesive += (particle.adhesion > 0.0f);
+        }
+        else
+        {
+            refDelta[w] = F4{ 0.f, 0.f, 0.f, 0.f };
+            ++nNotApplied;
+        }
     }
 
-    size_t mm = 0;
-    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos, NC);
-    const auto gApplied = downloadBuffer<F2>(dev, bApplied, NC);
-    for (uint32_t c = 0; c < NC; ++c)
+    const std::vector<F4> gotDelta = downloadBuffer<F4>(dev, bDelta, NC + 4);
+    const std::vector<F2> gotApplied = downloadBuffer<F2>(dev, bApplied, NC);
+    uint32_t mm = 0;
+    for (uint32_t w = 0; w < NC + 4; ++w)
     {
-        if (std::memcmp(&gDeltaPos[c], &refDeltaPos[c], sizeof(F4)) != 0)
-        { if (mm < 8) std::printf("  contact %u deltaPos gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", c, gDeltaPos[c].x, gDeltaPos[c].y,
-                                  gDeltaPos[c].z, gDeltaPos[c].w, refDeltaPos[c].x, refDeltaPos[c].y, refDeltaPos[c].z, refDeltaPos[c].w); ++mm; }
-        if (std::memcmp(&gApplied[c], &refApplied[c], sizeof(F2)) != 0)
-        { if (mm < 8) std::printf("  contact %u appliedForce gpu(%g,%g) cpu(%g,%g)\n", c, gApplied[c].x, gApplied[c].y,
-                                  refApplied[c].x, refApplied[c].y); ++mm; }
+        if (!bitsEqual(gotDelta[w], refDelta[w]) && mm++ < 6)
+            std::printf("  deltaPos[%u] got(%g,%g,%g,%g) ref(%g,%g,%g,%g)\n", w, gotDelta[w].x, gotDelta[w].y,
+                        gotDelta[w].z, gotDelta[w].w, refDelta[w].x, refDelta[w].y, refDelta[w].z, refDelta[w].w);
     }
-    for (uint32_t k = 0; k < 3; ++k)
+    for (uint32_t w = 0; w < NC; ++w)
     {
-        const auto gAcc = downloadBuffer<F4>(dev, s[k].bAccum, s[k].n);
-        for (uint32_t i = 0; i < s[k].n; ++i)
-            if (std::memcmp(&gAcc[i], &refAccum[k][i], sizeof(F4)) != 0)
-            { if (mm < 12) std::printf("  slot %u accumDeltaP[%u] gpu(%g,%g,%g,%g) cpu(%g,%g,%g,%g)\n", k, i, gAcc[i].x, gAcc[i].y,
-                                       gAcc[i].z, gAcc[i].w, refAccum[k][i].x, refAccum[k][i].y, refAccum[k][i].z, refAccum[k][i].w); ++mm; }
+        if (!bitsEqual(gotApplied[w], refApplied[w]) && mm++ < 12)
+            std::printf("  applied[%u] got(%g,%g) ref(%g,%g)\n", w, gotApplied[w].x, gotApplied[w].y,
+                        refApplied[w].x, refApplied[w].y);
     }
-    // the separated contacts really took the adhesion branch (else mRestOffset is not read)
-    PXG_CHECK_MSG(refDeltaPos[5].y < 0.0f && refDeltaPos[6].y < 0.0f && refDeltaPos[1].y < 0.0f,
-                  "the separated contacts must be pulled in by adhesion (dy %g %g %g)", refDeltaPos[1].y,
-                  refDeltaPos[5].y, refDeltaPos[6].y);
-    PXG_CHECK_MSG(mm == 0, "PGS pipeline over systems 0 and 2 (interleaved runs, decoy at slot 1): bit-exact vs CPU "
-                  "(%zu mismatches)", mm);
-
-    PxgBufferHandle all[] = { bMaterials, bPsys, bContacts, bNum, bConstraints, bApplied, bDeltaPos, bSolverBody, bTxi,
-        bBodyFrame, bPrepDesc, bPrePrepDesc, bVelPool, bOutVel, bCoreDesc, bSharedPgs, bPairs, bStart, bEnd };
-    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
-    for (uint32_t k = 0; k < 3; ++k)
-        for (PxgBufferHandle h : { s[k].bPos, s[k].bDeltaP, s[k].bAccum, s[k].bPhases, s[k].bP2M })
-            dev->destroyBuffer(h);
+    PXG_CHECK_MSG(mm == 0, "%s %s: %u words differ from the 5.12 oracle", isTGS ? "TGS" : "PGS",
+                  isVelocityIteration ? "velocity" : "position", mm);
+    PXG_CHECK_MSG(nApplied > 4 && nKinematic > 0 && nFriction > 0 && nAdhesive > 0,
+                  "coverage: applied %u not-applied %u kinematic %u friction %u adhesive %u",
+                  nApplied, nNotApplied, nKinematic, nFriction, nAdhesive);
 }
 
+PXG_TEST(psContactSolve_particleSolve_pgsPosition) { runParticleSolve(false, false, 0x0badf00du); }
+PXG_TEST(psContactSolve_particleSolve_pgsVelocity) { runParticleSolve(false, true, 0x0badf00du); }
+PXG_TEST(psContactSolve_particleSolve_tgsPosition) { runParticleSolve(true, false, 0x7f4a7c15u); }
+PXG_TEST(psContactSolve_particleSolve_tgsVelocity) { runParticleSolve(true, true, 0x7f4a7c15u); }
+
 // ===========================================================================
-// Under-relaxed correction (relax = 0.5) — still upward, still bit-exact, and
-// exercises a non-trivial relaxation multiply.
+// ps_accumulateDeltaVParticleLaunch
 // ===========================================================================
-PXG_TEST(psContactSolve_relaxationScaled)
+PXG_TEST(psContactSolve_accumulate)
 {
     PxgSlangComputeDevice* dev = testDevice();
-    const F4 contactNormalPen = { 0.0f, 1.0f, 0.0f, -0.1f };
-    const float invMass1 = 2.0f, dt = 1.0f / 60.0f, relax = 0.5f; // invMass1 != 1 too
+    World W;
+    buildWorld(W, dev, 0x2545f491u);
+    const uint32_t NC = uint32_t(W.contacts.size());
 
-    CpuOut gpu;
-    if (!runPipeline(dev, contactNormalPen, invMass1, dt, relax, gpu))
-        return;
-    const CpuOut ref = cpuReference(contactNormalPen, invMass1, dt, relax);
+    // Per-contact deltas with the live flag in .w (0 or 1), and the runs of equal ref1.
+    Rng rng{ 0x77u };
+    std::vector<F4> deltas(NC);
+    for (uint32_t w = 0; w < NC; ++w)
+        deltas[w] = F4{ rng.uni(-0.01f, 0.01f), rng.uni(-0.01f, 0.01f), rng.uni(-0.01f, 0.01f), (rng.next() & 1u) ? 1.f : 0.f };
+    std::vector<uint32_t> rStart, rEnd;
+    for (uint32_t w = 0; w < NC; ++w)
+    {
+        if (w == 0 || W.contacts[w].pair.ref1 != W.contacts[w - 1].pair.ref1)
+        {
+            if (w) rEnd.push_back(w);
+            rStart.push_back(w);
+        }
+    }
+    rEnd.push_back(NC);
+    const uint32_t NR = uint32_t(rStart.size());
 
-    PXG_CHECK_MSG(gpu.accumDeltaP.y > 0.0f, "relaxed accumDeltaP.y not upward: %g", gpu.accumDeltaP.y);
-    // For a static floor the invMass1 cancels: correction == |pen| * relax = 0.05.
-    PXG_CHECK_MSG(std::fabs(gpu.accumDeltaP.y - 0.05f) < 1e-6f,
-                  "relaxed accumDeltaP.y=%g != 0.05", gpu.accumDeltaP.y);
-    PXG_CHECK_MSG(std::memcmp(&gpu.accumDeltaP, &ref.accumDeltaP, sizeof(F4)) == 0,
-                  "relaxed accumDeltaP gpu(%g,%g,%g) != cpu(%g,%g,%g)",
-                  gpu.accumDeltaP.x, gpu.accumDeltaP.y, gpu.accumDeltaP.z,
-                  ref.accumDeltaP.x, ref.accumDeltaP.y, ref.accumDeltaP.z);
+    PxgBufferHandle bPairs = W.make(pairsOf(W));
+    PxgBufferHandle bDelta = W.make(deltas);
+    PxgBufferHandle bStart = W.make(rStart);
+    PxgBufferHandle bEnd = W.make(rEnd);
+    PxgBufferHandle bNR = W.make(std::vector<uint32_t>(1, NR));
+
+    AccumPush p{ W.psysPool, W.addr(bPairs), W.addr(bNR), W.addr(bStart), W.addr(bEnd), W.addr(bDelta) };
+    Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
+    PXG_CHECK(k.isValid());
+    if (!k.isValid()) return;
+    k.dispatch(AD_GRID, {}, p);
+    dev->flush();
+
+    HostSystem ref[3];
+    ref[0] = W.sys[0]; ref[2] = W.sys[2];
+    uint32_t multi = 0;
+    for (uint32_t r = 0; r < NR; ++r)
+    {
+        F4 acc = { 0.f, 0.f, 0.f, 0.f };
+        float fcount = 0.f;
+        for (uint32_t j = rStart[r]; j < rEnd[r]; ++j)
+        {
+            acc.x += deltas[j].x; acc.y += deltas[j].y; acc.z += deltas[j].z;
+            fcount += deltas[j].w;
+        }
+        multi += (rEnd[r] - rStart[r]) > 1u;
+        const float recip = 1.f / selectMax(1.f, fcount);
+        acc.x *= recip; acc.y *= recip; acc.z *= recip;
+        const uint64_t pr = W.contacts[rStart[r]].pair.ref1;
+        F4& d = ref[particleSystemIdOf(pr)].accum[particleIndexOf(pr)];
+        d.x += acc.x; d.y += acc.y; d.z += acc.z; d.w += acc.w;
+    }
+    uint32_t mm = 0;
+    for (uint32_t s = 0; s < 3; s += 2)
+    {
+        const std::vector<F4> got = downloadBuffer<F4>(dev, W.bAccum[s], W.sys[s].accum.size());
+        for (size_t i = 0; i < got.size(); ++i)
+            if (!bitsEqual(got[i], ref[s].accum[i]) && mm++ < 6)
+                std::printf("  sys %u accum[%zu] got(%g,%g,%g,%g) ref(%g,%g,%g,%g)\n", s, i, got[i].x, got[i].y,
+                            got[i].z, got[i].w, ref[s].accum[i].x, ref[s].accum[i].y, ref[s].accum[i].z, ref[s].accum[i].w);
+    }
+    PXG_CHECK_MSG(mm == 0, "%u accumulated particles differ", mm);
+    PXG_CHECK_MSG(multi > 0, "coverage: no run longer than one contact");
 }
 
 // ===========================================================================
-// Infinite-mass particle (invMass1 = 0) — the solve `continue`s, deltaPos stays
-// the init sentinel, and no correction accumulates.
-// ===========================================================================
-PXG_TEST(psContactSolve_infiniteMassNoResponse)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const F4 contactNormalPen = { 0.0f, 1.0f, 0.0f, -0.1f };
-
-    CpuOut gpu;
-    if (!runPipeline(dev, contactNormalPen, /*invMass1*/ 0.0f, 1.0f / 60.0f, 1.0f, gpu))
-        return;
-
-    // solve `continue`d: deltaPos[0] untouched (init 0,0,0,0) -> scale 0.
-    PXG_CHECK_MSG(gpu.deltaPos.x == 0.0f && gpu.deltaPos.y == 0.0f && gpu.deltaPos.z == 0.0f &&
-                  gpu.deltaPos.w == 0.0f, "infinite-mass deltaPos not zero: (%g,%g,%g,%g)",
-                  gpu.deltaPos.x, gpu.deltaPos.y, gpu.deltaPos.z, gpu.deltaPos.w);
-    // accumulate over the range with scale 0 -> zero correction (recipCount clamps).
-    PXG_CHECK_MSG(gpu.accumDeltaP.y == 0.0f,
-                  "infinite-mass particle wrongly moved: accumDeltaP.y=%g", gpu.accumDeltaP.y);
-}
-
-// ===========================================================================
-// P9.48a: ps_accumulateFEMParticleDeltaVLaunch (particlesystem.cu:2761).
+// ps_accumulateFEMParticleDeltaVLaunch
 //
-// The consumer that finally MOVES a particle a cloth or a softbody pushed.  It
-// is the FEM twin of ps_accumulateDeltaVParticleLaunch (:2828) and differs from
-// it in exactly one line of arithmetic:
-//
-//     FEM      recipCount = fcount > 0.f ? 1.f / fcount : 0.f
-//     particle recipCount = 1.f / PxMax(1.f, fcount)
-//
-// The two agree for fcount >= 1 and disagree everywhere else, so a fixture whose
-// weights all sum to 1 or more cannot tell the twins apart.  The four ranges
-// below are chosen so three of them CAN: 0.5 (the FEM form doubles where the
-// particle form leaves the sum alone), exactly 0 (the FEM form zeroes where the
-// particle form passes the raw sum through), and 1.0 (the boundary, where they
-// must agree).  The fourth is an ordinary 2.5.
+// THE TWIN TRAP: the reciprocal is fcount > 0 ? 1/fcount : 0, NOT the particle twin's
+// 1/max(1, fcount).  Four ranges separate them: fcount 0.5 (FEM doubles), 0 with a
+// non-zero sum (FEM yields 0), exactly 1 (both agree), and 2.5 in the second system.
+// 5.12 then resets the mass-split count: mAccumDeltaP.w = 0.  The key is ref0, the
+// particle side of a particle-deformable pair; ref1 is a decoy deformable ref.
 // ===========================================================================
-struct FemAccumPush
-{
-    uint64_t particleSystems, sortedContactInfo, totalNumPairs, rangeStart, rangeEnd, deltaP;
-};
-static_assert(sizeof(FemAccumPush) == 48, "FEM accum push must be 48 bytes -- the six "
-              "parameters the kernel DECLARES; the softbody launch site used to pass a "
-              "seventh (dt) that the kernel never reads");
-
-// PxgFemOtherContactInfo (PxgFEMCore.h:128, 16 bytes).
-struct FemOtherContactInfo { uint32_t pairLo, pairHi, pairInd1, rigidMatInd; };
-static_assert(sizeof(FemOtherContactInfo) == 16, "FemOtherContactInfo stride");
-
 PXG_TEST(psContactSolve_accumulateFemDeltaV)
 {
     PxgSlangComputeDevice* dev = testDevice();
 
-    // Four ranges over one contact stream.  Ranges 0..2 belong to particle SYSTEM
-    // 0 (particles 3, 7, 11), range 3 to particle SYSTEM 1 (particle 5) -- so a
-    // port that read the two halves of pairInd0 the other way round indexes a
-    // system that does not exist, or the wrong particle.
     struct Range { uint32_t sysId, partId; std::vector<F4> deltas; };
     const std::vector<Range> ranges = {
-        // fcount = 0.25 + 0.25 = 0.5  -> FEM doubles, the particle twin does not
         { 0u, 3u,  { { 1.0f, 2.0f, 3.0f, 0.25f }, { 0.5f, -1.0f, 0.25f, 0.25f } } },
-        // fcount = 0.0 with a NON-ZERO sum -> FEM yields exactly 0, the twin does not
         { 0u, 7u,  { { 4.0f, -2.0f, 1.5f, 0.0f }, { -1.0f, 3.0f, -0.5f, 0.0f } } },
-        // fcount = 1.0 exactly -> the boundary, where the two forms must agree
         { 0u, 11u, { { 2.0f, 0.5f, -3.0f, 0.5f }, { 1.0f, 1.5f, 2.0f, 0.5f } } },
-        // fcount = 2.5, an ordinary range, and a SECOND particle system
-        { 1u, 5u,  { { 1.0f, 1.0f, 1.0f, 1.5f }, { 2.0f, -2.0f, 0.5f, 0.75f },
-                     { -0.5f, 0.25f, 3.0f, 0.25f } } },
+        { 1u, 5u,  { { 1.0f, 1.0f, 1.0f, 1.5f }, { 2.0f, -2.0f, 0.5f, 0.75f }, { -0.5f, 0.25f, 3.0f, 0.25f } } },
     };
 
-    std::vector<FemOtherContactInfo> infos;
+    std::vector<PairInfo> infos;
     std::vector<F4> deltaP;
     std::vector<uint32_t> rStart, rEnd;
     for (const Range& r : ranges)
@@ -720,21 +481,16 @@ PXG_TEST(psContactSolve_accumulateFemDeltaV)
         rStart.push_back(uint32_t(infos.size()));
         for (const F4& d : r.deltas)
         {
-            FemOtherContactInfo ci;
-            ci.pairLo = r.partId;   // PxGetParticleIndex = id & 0xffffffff
-            ci.pairHi = r.sysId;    // PxGetParticleSystemId = id >> 32
-            ci.pairInd1 = 0xA5A5A5A5u;   // decoy: the FEM id, never read here
-            ci.rigidMatInd = 0x5A5A5A5Au;// decoy
-            infos.push_back(ci);
+            PairInfo pi;
+            pi.ref0 = particleRef(r.sysId, r.partId);
+            pi.ref1 = 0xA5A5A5A5A5A5A5A5ull;   // decoy: the deformable ref, never read here
+            infos.push_back(pi);
             deltaP.push_back(d);
         }
         rEnd.push_back(uint32_t(infos.size()));
     }
     const uint32_t NR = uint32_t(ranges.size());
 
-    // Two particle systems, each with its own mAccumDeltaP.  PRE-SEEDED non-zero
-    // so that an assignment in place of the accumulate dies, and with a non-zero
-    // .w so the faithful `acc.w += 0` stays visible.
     const uint32_t NP = 16u;
     std::vector<F4> accum0(NP), accum1(NP);
     for (uint32_t i = 0; i < NP; ++i)
@@ -743,36 +499,29 @@ PXG_TEST(psContactSolve_accumulateFemDeltaV)
         accum1[i] = { -100.0f - float(i), -200.0f - float(i), -300.0f - float(i), 9.5f + float(i) };
     }
 
-    PxgBufferHandle bAcc0 = createBufferFrom(dev, accum0);
-    PxgBufferHandle bAcc1 = createBufferFrom(dev, accum1);
-    PxgBufferHandle bInfos = createBufferFrom(dev, infos);
-    PxgBufferHandle bDelta = createBufferFrom(dev, deltaP);
-    PxgBufferHandle bStart = createBufferFrom(dev, rStart);
-    PxgBufferHandle bEnd = createBufferFrom(dev, rEnd);
-    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, NR));
-    if (!addrOf(dev, bAcc0)) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
+    std::vector<PxgBufferHandle> owned;
+    auto mk = [&](auto const& v) { PxgBufferHandle h = createBufferFrom(dev, v); owned.push_back(h); return h; };
+    PxgBufferHandle bAcc0 = mk(accum0), bAcc1 = mk(accum1);
     std::vector<uint8_t> systems(2u * SZ_PARTICLE_SYS, 0);
+    putU64(systems, 152, dev->getBufferDeviceAddress(bAcc0));
+    putU64(systems, SZ_PARTICLE_SYS + 152, dev->getBufferDeviceAddress(bAcc1));
+    PxgBufferHandle bSys = mk(systems), bInfos = mk(infos), bDelta = mk(deltaP), bStart = mk(rStart),
+                    bEnd = mk(rEnd), bPairs = mk(std::vector<uint32_t>(1, NR));
+
+    AccumPush push = { dev->getBufferDeviceAddress(bSys), dev->getBufferDeviceAddress(bInfos),
+                       dev->getBufferDeviceAddress(bPairs), dev->getBufferDeviceAddress(bStart),
+                       dev->getBufferDeviceAddress(bEnd), dev->getBufferDeviceAddress(bDelta) };
     {
-        std::vector<uint8_t> s0(SZ_PARTICLE_SYS, 0), s1(SZ_PARTICLE_SYS, 0);
-        putU64(s0, 152, addrOf(dev, bAcc0));   // mAccumDeltaP
-        putU64(s1, 152, addrOf(dev, bAcc1));
-        std::memcpy(systems.data(), s0.data(), SZ_PARTICLE_SYS);
-        std::memcpy(systems.data() + SZ_PARTICLE_SYS, s1.data(), SZ_PARTICLE_SYS);
+        Kernel k("psContactSolveBda.spv", "ps_accumulateFEMParticleDeltaVLaunch", {}, sizeof(AccumPush));
+        PXG_CHECK(k.isValid());
+        if (k.isValid())
+        {
+            k.dispatch(AD_GRID, {}, push);
+            dev->flush();
+        }
     }
-    PxgBufferHandle bSys = createBufferFrom(dev, systems);
 
-    FemAccumPush push = { addrOf(dev, bSys), addrOf(dev, bInfos), addrOf(dev, bPairs),
-                          addrOf(dev, bStart), addrOf(dev, bEnd), addrOf(dev, bDelta) };
-    Kernel k("psContactSolveBda.spv", "ps_accumulateFEMParticleDeltaVLaunch", {}, sizeof(FemAccumPush));
-    PXG_CHECK_MSG(k.isValid(), "the FEM per-particle accumulate pipeline must build");
-    if (!k.isValid()) return;
-    k.dispatch(32u, {}, push);
-    dev->flush();
-
-    // ---- host mirror, written from particlesystem.cu:2761-2822 ----
     std::vector<F4> ref0 = accum0, ref1 = accum1;
-    float fcountOf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (uint32_t r = 0; r < NR; ++r)
     {
         F4 acc = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -782,464 +531,124 @@ PXG_TEST(psContactSolve_accumulateFemDeltaV)
             acc.x += deltaP[j].x; acc.y += deltaP[j].y; acc.z += deltaP[j].z;
             fcount += deltaP[j].w;
         }
-        fcountOf[r] = fcount;
-        const float recip = fcount > 0.0f ? 1.0f / fcount : 0.0f;   // :2802, NOT 1/max(1,f)
+        const float recip = fcount > 0.0f ? 1.0f / fcount : 0.0f;
         acc.x *= recip; acc.y *= recip; acc.z *= recip;
         F4& dst = (ranges[r].sysId == 0u) ? ref0[ranges[r].partId] : ref1[ranges[r].partId];
-        dst.x += acc.x; dst.y += acc.y; dst.z += acc.z; dst.w += acc.w;   // acc.w is +0
+        dst.x += acc.x; dst.y += acc.y; dst.z += acc.z; dst.w += acc.w;
+        dst.w = 0.0f;   // 5.12: the mass-split count reset
     }
 
     const auto g0 = downloadBuffer<F4>(dev, bAcc0, NP);
     const auto g1 = downloadBuffer<F4>(dev, bAcc1, NP);
-    size_t mm = 0;
-    auto cmp = [&](const char* nm, uint32_t i, const F4& a, const F4& b2) {
-        if (f2u(a.x) != f2u(b2.x) || f2u(a.y) != f2u(b2.y) ||
-            f2u(a.z) != f2u(b2.z) || f2u(a.w) != f2u(b2.w))
-        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i,
-                            a.x, a.y, a.z, a.w, b2.x, b2.y, b2.z, b2.w); }
-    };
-    for (uint32_t i = 0; i < NP; ++i) { cmp("accum0", i, ref0[i], g0[i]); cmp("accum1", i, ref1[i], g1[i]); }
-    PXG_CHECK_MSG(mm == 0, "ps_accumulateFEMParticleDeltaV bit-exact vs CPU (%zu mismatches)", mm);
-
-    // TEETH.  Without these the twin's 1/max(1,fcount) would pass unnoticed.
-    PXG_CHECK_MSG(f2u(fcountOf[0]) == f2u(0.5f),
-                  "range 0 must total EXACTLY 0.5 -- below 1 is the only place the FEM "
-                  "reciprocal and the particle twin's differ upward (got %g)", fcountOf[0]);
-    PXG_CHECK_MSG(f2u(fcountOf[1]) == 0u,
-                  "range 1 must total EXACTLY 0 -- the only place the FEM form yields 0 "
-                  "and the twin passes the raw sum (got %g)", fcountOf[1]);
-    PXG_CHECK_MSG(f2u(fcountOf[2]) == f2u(1.0f), "range 2 must sit ON the 1.0 boundary (got %g)",
-                  fcountOf[2]);
-    PXG_CHECK_MSG(fcountOf[3] > 1.0f, "range 3 must exceed 1.0 (got %g)", fcountOf[3]);
-    // The zero-weight range must carry a non-zero raw sum, or "yields 0" is vacuous.
-    {
-        F4 raw = { 0.0f, 0.0f, 0.0f, 0.0f };
-        for (uint32_t j = rStart[1]; j < rEnd[1]; ++j)
-        { raw.x += deltaP[j].x; raw.y += deltaP[j].y; raw.z += deltaP[j].z; }
-        PXG_CHECK_MSG(f2u(raw.x) != 0u || f2u(raw.y) != 0u || f2u(raw.z) != 0u,
-                      "the zero-weight range must have a NON-ZERO raw sum, else the FEM "
-                      "reciprocal's 0 is indistinguishable from the twin's pass-through");
-        PXG_CHECK_MSG(f2u(g0[7].x) == f2u(accum0[7].x) && f2u(g0[7].y) == f2u(accum0[7].y) &&
-                      f2u(g0[7].z) == f2u(accum0[7].z),
-                      "particle 7 (the zero-weight range) must be left EXACTLY as seeded");
-    }
-    // Both particle SYSTEMS must be written, or the id halves are untested.
-    PXG_CHECK_MSG(f2u(g1[5].x) != f2u(accum1[5].x),
-                  "particle system 1 must be reached -- pairInd0's HIGH half is the system id");
-    PXG_CHECK_MSG(f2u(g0[3].x) != f2u(accum0[3].x),
-                  "particle system 0 must be reached too");
-    // Untouched particles keep their seed, so a stray write is visible.
+    uint32_t mm = 0;
     for (uint32_t i = 0; i < NP; ++i)
     {
-        const bool touched0 = (i == 3u || i == 7u || i == 11u);
-        if (!touched0)
-            PXG_CHECK_MSG(f2u(g0[i].x) == f2u(accum0[i].x) && f2u(g0[i].w) == f2u(accum0[i].w),
-                          "system 0 particle %u must be untouched", i);
-        if (i != 5u)
-            PXG_CHECK_MSG(f2u(g1[i].x) == f2u(accum1[i].x) && f2u(g1[i].w) == f2u(accum1[i].w),
-                          "system 1 particle %u must be untouched", i);
+        if (!bitsEqual(g0[i], ref0[i]) && mm++ < 6)
+            std::printf("  sys0[%u] got(%g,%g,%g,%g) ref(%g,%g,%g,%g)\n", i, g0[i].x, g0[i].y, g0[i].z, g0[i].w,
+                        ref0[i].x, ref0[i].y, ref0[i].z, ref0[i].w);
+        if (!bitsEqual(g1[i], ref1[i]) && mm++ < 6)
+            std::printf("  sys1[%u] got(%g,%g,%g,%g) ref(%g,%g,%g,%g)\n", i, g1[i].x, g1[i].y, g1[i].z, g1[i].w,
+                        ref1[i].x, ref1[i].y, ref1[i].z, ref1[i].w);
     }
-    std::printf("  fcount per range: %g %g %g %g\n",
-                fcountOf[0], fcountOf[1], fcountOf[2], fcountOf[3]);
-
-    dev->destroyBuffer(bAcc0); dev->destroyBuffer(bAcc1); dev->destroyBuffer(bInfos);
-    dev->destroyBuffer(bDelta); dev->destroyBuffer(bStart); dev->destroyBuffer(bEnd);
-    dev->destroyBuffer(bPairs); dev->destroyBuffer(bSys);
+    PXG_CHECK_MSG(mm == 0, "%u FEM-accumulated particles differ", mm);
+    // The trap itself, in values: particle 7's range has a non-zero sum and fcount 0.
+    PXG_CHECK_MSG(bitsEqual(g0[7].x, accum0[7].x) && g0[7].w == 0.0f, "fcount 0 must add exactly 0 and reset .w");
+    for (PxgBufferHandle h : owned) dev->destroyBuffer(h);
 }
 
 // ===========================================================================
-// P9.90: the PxVec3 dot ORDER through prepare -> solve -> accumulate.
-//
-// PxVec3::dot is (x*v.x + y*v.y) + z*v.z (PxVec3.h:173).  llvmpipe evaluates an
-// undecorated OpDot as x + (y + z) and a NoContraction-stamped one in the CUDA
-// order, so psContactSolveBda is stamped (tests/CMakeLists.txt, P9.90).  The
-// fixtures above cannot see the difference: a static body at the origin with an
-// axis-aligned normal makes every dot a single non-zero product.  Here one
-// DYNAMIC body sits off the origin with a full (non-diagonal) sqrtInvInertia,
-// non-zero linear AND angular velocity (initialVel + iter pool), the contact
-// normals are general unit vectors, every particle carries a non-zero delta, and
-// friction is on -- so the prep's three response dots (particlesystem.cu:1386,
-// :1391-1392), the solve's six velocity dots (:1654-1656) and the separation /
-// biasedF dots (:1438, :1453-1454) all carry three non-trivial products.
-//
-// Oracle: a host transcription in the CUDA order (this file is compiled with
-// -ffp-contract=off), compared bitwise on the constraint block, deltaPos,
-// appliedForces and mAccumDeltaP.  Coverage guard: the same transcription with
-// every dot summed x + (y + z) must differ from it, or the fixture could not tell
-// an unstamped build apart.
+// End to end: one particle penetrating a static floor is pushed out, and the
+// depenetration clamp holds (5.10: setMaxDepenetrationVelocity is honoured).
 // ===========================================================================
-struct P90V3 { float x, y, z; };
-static P90V3 p90Add(P90V3 a, P90V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static P90V3 p90Sub(P90V3 a, P90V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static P90V3 p90Mul(P90V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static P90V3 p90Cross(P90V3 a, P90V3 b)
-{
-    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
-}
-// oldOrder = false: PxVec3::dot, (x + y) + z.  true: the unstamped llvmpipe x + (y + z).
-static float p90Dot(P90V3 a, P90V3 b, bool oldOrder)
-{
-    const float px = a.x * b.x, py = a.y * b.y, pz = a.z * b.z;
-    return oldOrder ? (px + (py + pz)) : ((px + py) + pz);
-}
-static P90V3 p90Normalize(P90V3 v)
-{
-    // PxVec3::normalize: magnitude() = sqrt(magnitudeSquared()) -- written out as
-    // x*x + y*y + z*z, not a dot, in the shader as well -- then *= 1/m.
-    const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f) { const float r = 1.0f / m; v = { v.x * r, v.y * r, v.z * r }; }
-    return v;
-}
-static P90V3 p90MatMul(const float m[9], P90V3 v)
-{
-    // PxMat33 * PxVec3 = column0*v.x + column1*v.y + column2*v.z.
-    return { m[0] * v.x + m[3] * v.y + m[6] * v.z,
-             m[1] * v.x + m[4] * v.y + m[7] * v.z,
-             m[2] * v.x + m[5] * v.y + m[8] * v.z };
-}
-
-struct P90Out
-{
-    std::vector<F4> raXn, normalErr, fric0, raXnF0, raXnF1;   // constraint block lanes
-    std::vector<F4> deltaPos;
-    std::vector<F2> applied;
-    std::vector<F4> accum;
-};
-
-struct P90Scene
-{
-    uint32_t n;
-    std::vector<F4> pos;        // mSortedPositions_InvMass
-    std::vector<F4> deltaP;     // mSortedDeltaP (delta.xyz, invMass.w)
-    std::vector<F4> normalPen;  // contact normal_pen
-    std::vector<F4> accumSeed;  // mAccumDeltaP before the accumulate
-    float invMass0;
-    float sqrtInvInertia[9];
-    P90V3 bodyP;
-    P90V3 linVel, angVel;       // initialVel + iter pool, summed on the host
-    F4 initLin, initAng, poolLin, poolAng;
-    float friction, dt, relax;
-};
-
-static P90Out p90Mirror(const P90Scene& s, bool oldOrder)
-{
-    P90Out o;
-    // The GPU forms linVel/angVel as float4 initialVel + pool; do the same.
-    const P90V3 linVel0 = { s.initLin.x + s.poolLin.x, s.initLin.y + s.poolLin.y, s.initLin.z + s.poolLin.z };
-    const P90V3 angVel0 = { s.initAng.x + s.poolAng.x, s.initAng.y + s.poolAng.y, s.initAng.z + s.poolAng.z };
-    for (uint32_t i = 0; i < s.n; ++i)
-    {
-        // ---- ps_contactPrepareLaunch, rigid branch (particlesystem.cu:1357-1408) ----
-        const P90V3 point = { s.pos[i].x, s.pos[i].y, s.pos[i].z };
-        const float invMass1p = s.pos[i].w;
-        const P90V3 normal = { -s.normalPen[i].x, -s.normalPen[i].y, -s.normalPen[i].z };
-        const float pen = s.normalPen[i].w;
-        const float inertiaScale = 1.0f;   // idx != 0 and invMass0 != 0 -> TxI inertia
-
-        P90V3 t0, t1;   // PxComputeBasisVectors (PxMathUtils.h:297)
-        if (std::fabs(normal.y) <= 0.9999f)
-        {
-            t0 = p90Normalize({ normal.z, 0.0f, -normal.x });
-            t1 = { normal.y * t0.z, normal.z * t0.x - normal.x * t0.z, -normal.y * t0.x };
-        }
-        else
-        {
-            t0 = { 1.0f, 0.0f, 0.0f };
-            t1 = p90Normalize({ 0.0f, normal.z, -normal.y });
-        }
-        const P90V3 ra = p90Sub(point, s.bodyP);
-        const P90V3 raXn = p90Cross(ra, normal);
-        const P90V3 raXF0 = p90Cross(ra, t0);
-        const P90V3 raXF1 = p90Cross(ra, t1);
-        const P90V3 raXnSI = p90MatMul(s.sqrtInvInertia, raXn);
-        const float resp0 = (p90Dot(raXnSI, raXnSI, oldOrder)) * inertiaScale + s.invMass0;
-        const P90V3 raXF0SI = p90MatMul(s.sqrtInvInertia, raXF0);
-        const P90V3 raXF1SI = p90MatMul(s.sqrtInvInertia, raXF1);
-        const float respF0 = (p90Dot(raXF0SI, raXF0SI, oldOrder)) * inertiaScale + s.invMass0;
-        const float respF1 = (p90Dot(raXF1SI, raXF1SI, oldOrder)) * inertiaScale + s.invMass0;
-        const float ur = resp0 + invMass1p, ur0 = respF0 + invMass1p, ur1 = respF1 + invMass1p;
-        const float vm = (ur > 0.0f) ? (1.0f / ur) : 0.0f;
-        const float vmF0 = (ur0 > 0.0f) ? (1.0f / ur0) : 0.0f;
-        const float vmF1 = (ur1 > 0.0f) ? (1.0f / ur1) : 0.0f;
-        o.raXn.push_back({ raXnSI.x, raXnSI.y, raXnSI.z, vm });
-        o.normalErr.push_back({ normal.x, normal.y, normal.z, pen });
-        o.fric0.push_back({ t0.x, t0.y, t0.z, s.invMass0 });
-        o.raXnF0.push_back({ raXF0SI.x, raXF0SI.y, raXF0SI.z, vmF0 });
-        o.raXnF1.push_back({ raXF1SI.x, raXF1SI.y, raXF1SI.z, vmF1 });
-
-        // ---- ps_solvePCOutputParticleDeltaVLaunch (:1531-1680) ----
-        const float invMass1 = s.deltaP[i].w;
-        const P90V3 delta = { s.deltaP[i].x, s.deltaP[i].y, s.deltaP[i].z };
-        const P90V3 fric0 = t0;
-        const P90V3 fric1 = p90Cross(normal, fric0);
-        const float normalVel = p90Dot(linVel0, normal, oldOrder) + p90Dot(angVel0, raXnSI, oldOrder);
-        const float tanVel0 = p90Dot(linVel0, fric0, oldOrder) + p90Dot(angVel0, raXF0SI, oldOrder);
-        const float tanVel1 = p90Dot(linVel0, fric1, oldOrder) + p90Dot(angVel0, raXF1SI, oldOrder);
-
-        // solvePCOutputDeltaV (:1421), adhesion off.
-        F2 af = { 0.0f, 0.0f };   // prepare zeroed it
-        const float separation = (pen - p90Dot(normal, delta, oldOrder));
-        const float clamp = -af.x;
-        const float fcand = (-separation - normalVel * s.dt) * vm;
-        const float deltaF = (clamp > fcand) ? clamp : fcand;
-        af.x = (0.0f > deltaF + af.x) ? 0.0f : (deltaF + af.x);
-        const float fr = af.x * s.friction;
-        const float biasedF0 = -(p90Dot(fric0, delta, oldOrder));
-        const float biasedF1 = -(p90Dot(fric1, delta, oldOrder));
-        const float rF0 = (biasedF0 + tanVel0 * s.dt) * vmF0;
-        const float rF1 = (biasedF1 + tanVel1 * s.dt) * vmF1;
-        const float rF = std::sqrt(rF0 * rF0 + rF1 * rF1);
-        const float recip = (rF >= 1e-16f) ? (1.0f / rF) : 0.0f;
-        const float ratio0 = rF0 * recip, ratio1 = rF1 * recip;
-        const float a = rF + af.y;
-        const float deltaFr = ((a < fr) ? a : fr) - af.y;
-        af.y = af.y + deltaFr;
-        const float deltaFr0 = deltaFr * ratio0, deltaFr1 = deltaFr * ratio1;
-
-        // -(normal*deltaF) + fric0*deltaFr0 + fric1*deltaFr1, then *invMass1*relaxation.
-        const P90V3 negN = { -(normal.x * deltaF), -(normal.y * deltaF), -(normal.z * deltaF) };
-        const P90V3 dlv = p90Mul(p90Mul(p90Add(p90Add(negN, p90Mul(fric0, deltaFr0)), p90Mul(fric1, deltaFr1)),
-                                        invMass1), s.relax);
-        const float scale = (deltaF != 0.0f) ? 1.0f : 0.0f;
-        o.deltaPos.push_back({ dlv.x, dlv.y, dlv.z, scale });
-        o.applied.push_back(af);
-
-        // ---- ps_accumulateDeltaVParticleLaunch (:2828), range [i, i+1) ----
-        const float rc = 1.0f / ((1.0f > scale) ? 1.0f : scale);
-        F4 acc = s.accumSeed[i];
-        acc.x += (0.0f + dlv.x) * rc;
-        acc.y += (0.0f + dlv.y) * rc;
-        acc.z += (0.0f + dlv.z) * rc;
-        acc.w += 0.0f;
-        o.accum.push_back(acc);
-    }
-    return o;
-}
-
-PXG_TEST(psContactSolve_p90DotOrder)
+static F4 runFloorChain(float penBiasClamp, float pen)
 {
     PxgSlangComputeDevice* dev = testDevice();
+    World W;
+    buildWorld(W, dev, 0x13579bdfu);
+    // One contact: system 0 particle 0 (invMass 1, zero delta) in the static floor, normal up.
+    W.sys[0].deltaP[0] = F4{ 0.f, 0.f, 0.f, 1.f };
+    W.sys[0].accum[0] = F4{ 0.f, 0.f, 0.f, 0.f };
+    W.sys[0].penBiasClamp = penBiasClamp;
+    W.contacts.clear();
+    HostContact c;
+    c.pair.ref0 = staticNode();
+    c.pair.ref1 = particleRef(0, 0);
+    c.normalPen = F4{ 0.f, 1.f, 0.f, pen };
+    W.contacts.push_back(c);
+    // A floor at rest: every rigid velocity source zero.
+    for (F4& v : W.outVel) v = F4{ 0.f, 0.f, 0.f, 0.f };
+    for (F4& v : W.velPool) v = F4{ 0.f, 0.f, 0.f, 0.f };
+    W.uploadVelocities();
 
-    // ---- a deterministic, general-orientation scene ----
-    uint32_t seed = 0x9e3779b9u;
-    auto rnd = [&](float lo, float hi) {
-        seed = seed * 1664525u + 1013904223u;
-        return lo + (hi - lo) * (float((seed >> 8) & 0xffffffu) / 16777216.0f);
-    };
-    P90Scene s;
-    s.n = 64u;
-    s.invMass0 = 0.37f;
-    // A symmetric, non-diagonal sqrtInvInertia (column major).
-    const float I[9] = { 0.8137f, 0.1291f, -0.0733f,
-                         0.1291f, 0.6612f, 0.0917f,
-                         -0.0733f, 0.0917f, 0.9429f };
-    std::memcpy(s.sqrtInvInertia, I, sizeof(I));
-    s.bodyP = { 0.3147f, -1.1732f, 2.0369f };
-    s.initLin = { 0.7331f, -1.4187f, 0.2213f, 0.0f };
-    s.poolLin = { -0.0917f, 0.0439f, 0.3107f, 0.0f };
-    s.initAng = { 1.1379f, -0.6211f, 0.8843f, 0.0f };
-    s.poolAng = { 0.0713f, 0.1937f, -0.2291f, 0.0f };
-    s.friction = 0.6f;
-    s.dt = 1.0f / 60.0f;
-    s.relax = 0.8f;
-    for (uint32_t i = 0; i < s.n; ++i)
-    {
-        const float im = rnd(0.5f, 2.5f);
-        s.pos.push_back({ s.bodyP.x + rnd(-1.3f, 1.3f), s.bodyP.y + rnd(-1.3f, 1.3f),
-                          s.bodyP.z + rnd(-1.3f, 1.3f), im });
-        s.deltaP.push_back({ rnd(-0.03f, 0.03f), rnd(-0.03f, 0.03f), rnd(-0.03f, 0.03f), im });
-        const P90V3 nrm = p90Normalize({ rnd(-1.0f, 1.0f), rnd(-1.0f, 1.0f), rnd(-1.0f, 1.0f) });
-        s.normalPen.push_back({ nrm.x, nrm.y, nrm.z, rnd(-0.08f, -0.005f) });
-        s.accumSeed.push_back({ rnd(-0.5f, 0.5f), rnd(-0.5f, 0.5f), rnd(-0.5f, 0.5f), rnd(0.0f, 1.0f) });
-    }
-    const uint32_t N = s.n;
-    const uint32_t rigidIndex = 3u, bodyIdx = 1u, numSolverBodies = 2u;
+    std::vector<uint8_t> pool(3 * SZ_PARTICLE_SYS, 0);
+    std::vector<PxgBufferHandle> owned;
+    auto mk = [&](auto const& v) { PxgBufferHandle h = createBufferFrom(dev, v); owned.push_back(h); return h; };
+    PxgBufferHandle bDeltaP = mk(W.sys[0].deltaP), bAccum = mk(W.sys[0].accum), bPos = mk(W.sys[0].pos),
+                    bPhases = mk(W.sys[0].phases), bMats = mk(W.sys[0].materials),
+                    bP2m = mk(std::vector<uint32_t>{ uint32_t(W.sys[0].phaseToMat[0]) | (uint32_t(W.sys[0].phaseToMat[1]) << 16) }),
+                    bVel = mk(W.sys[0].vel);
+    putU64(pool, 24, dev->getBufferDeviceAddress(bPos));
+    putU64(pool, 32, dev->getBufferDeviceAddress(bVel));
+    putU64(pool, 40, dev->getBufferDeviceAddress(bPhases));
+    putU64(pool, 80, dev->getBufferDeviceAddress(bMats));
+    putU64(pool, 152, dev->getBufferDeviceAddress(bAccum));
+    putU64(pool, 160, dev->getBufferDeviceAddress(bDeltaP));
+    putF32(pool, 268, W.sys[0].restOffset);
+    putF32(pool, 320, penBiasClamp);
+    putU32(pool, 592, MAT_STRIDE);
+    putU64(pool, 600, dev->getBufferDeviceAddress(bP2m));
+    const uint64_t poolAddr = dev->getBufferDeviceAddress(mk(pool));
 
-    // ---- particle-side buffers ----
-    std::vector<uint32_t> phases(N, 0u), phaseToMat(1, 0u);
-    std::vector<float> materials(8, 0.0f);
-    materials[0] = s.friction;           // friction @0; adhesion @2 and radius scale @4 stay 0
-    PxgBufferHandle bPos = createBufferFrom(dev, s.pos);
-    PxgBufferHandle bDeltaP = createBufferFrom(dev, s.deltaP);
-    PxgBufferHandle bPhases = createBufferFrom(dev, phases);
-    PxgBufferHandle bPhaseToMat = createBufferFrom(dev, phaseToMat);
-    PxgBufferHandle bMaterials = createBufferFrom(dev, materials);
-    PxgBufferHandle bAccum = createBufferFrom(dev, s.accumSeed);
-    if (!addrOf(dev, bPos))
-    {
-        std::printf("  NOTE: no BDA -> skip\n");
-        for (PxgBufferHandle h : { bPos, bDeltaP, bPhases, bPhaseToMat, bMaterials, bAccum }) dev->destroyBuffer(h);
-        return;
-    }
-    std::vector<uint8_t> psys(SZ_PARTICLE_SYS, 0);
-    putU64(psys, 24, addrOf(dev, bPos));
-    putU64(psys, 40, addrOf(dev, bPhases));
-    putU64(psys, 80, addrOf(dev, bMaterials));
-    putU64(psys, 152, addrOf(dev, bAccum));
-    putU64(psys, 160, addrOf(dev, bDeltaP));
-    putF32(psys, 268, 0.1f);
-    putU32(psys, 632, 20u);
-    putU64(psys, 640, addrOf(dev, bPhaseToMat));
-    PxgBufferHandle bPsys = createBufferFrom(dev, psys);
-
-    std::vector<PsContact> contacts(N);
-    std::vector<uint32_t> rStart(N), rEnd(N);
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        contacts[i].normal_pen = s.normalPen[i];
-        contacts[i].rigidLo = rigidIndex; contacts[i].rigidHi = 0u;   // dynamic, not articulation
-        contacts[i].particleLo = i; contacts[i].particleHi = 0u;
-        rStart[i] = i; rEnd[i] = i + 1u;
-    }
-    const uint32_t nBlocks = (N + 31u) / 32u;
-    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
-    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, N));
-    PxgBufferHandle bConstraints = createBufferFrom(dev, std::vector<uint8_t>(nBlocks * CB_STRIDE, 0));
-    PxgBufferHandle bApplied = createBufferFrom(dev, std::vector<F2>(N, { 7.0f, 7.0f }));
-    PxgBufferHandle bDeltaPos = createBufferFrom(dev, std::vector<F4>(N, { 0.0f, 0.0f, 0.0f, 0.0f }));
-
-    // ---- rigid-side buffers: body 1 is the dynamic one ----
-    std::vector<uint8_t> solverBody(2 * SZ_SOLVER_BODY, 0);
-    putF32(solverBody, SZ_SOLVER_BODY + 28, s.invMass0);     // initialLinVelXYZ_invMassW.w
-    std::vector<uint8_t> txi(2 * SZ_TXI, 0);
-    for (int k = 0; k < 9; ++k) putF32(txi, SZ_TXI + 28 + 4 * k, s.sqrtInvInertia[k]);
-    std::vector<uint8_t> bodyFrame(2 * SZ_ALIGNED_XF, 0);
-    putF32(bodyFrame, SZ_ALIGNED_XF + 16, s.bodyP.x);          // p @16
-    putF32(bodyFrame, SZ_ALIGNED_XF + 20, s.bodyP.y);
-    putF32(bodyFrame, SZ_ALIGNED_XF + 24, s.bodyP.z);
-    PxgBufferHandle bSolverBody = createBufferFrom(dev, solverBody);
-    PxgBufferHandle bTxi = createBufferFrom(dev, txi);
-    PxgBufferHandle bBodyFrame = createBufferFrom(dev, bodyFrame);
-    std::vector<uint8_t> prepDesc(SZ_PREP_DESC, 0);
-    putU64(prepDesc, 64, addrOf(dev, bSolverBody));
-    putU64(prepDesc, 72, addrOf(dev, bTxi));
-    putU64(prepDesc, 168, addrOf(dev, bBodyFrame));
-    PxgBufferHandle bPrepDesc = createBufferFrom(dev, prepDesc);
-
-    std::vector<uint32_t> solverBodyIndices(rigidIndex + 1u, 0u);
-    solverBodyIndices[rigidIndex] = bodyIdx;
-    PxgBufferHandle bSolverBodyIndices = createBufferFrom(dev, solverBodyIndices);
-    std::vector<uint8_t> prePrepDesc(SZ_PREPREP_DESC, 0);
-    putU64(prePrepDesc, 272, addrOf(dev, bSolverBodyIndices));
-    PxgBufferHandle bPrePrepDesc = createBufferFrom(dev, prePrepDesc);
-
-    std::vector<F4> outVel(2 * numSolverBodies, { 0.0f, 0.0f, 0.0f, 0.0f });
-    std::vector<F4> velPool(2 * numSolverBodies, { 0.0f, 0.0f, 0.0f, 0.0f });
-    outVel[bodyIdx] = s.initLin; outVel[bodyIdx + numSolverBodies] = s.initAng;
-    velPool[bodyIdx] = s.poolLin; velPool[bodyIdx + numSolverBodies] = s.poolAng;
-    PxgBufferHandle bOutVel = createBufferFrom(dev, outVel);
-    PxgBufferHandle bVelPool = createBufferFrom(dev, velPool);
-    std::vector<uint8_t> coreDesc(SZ_CORE_DESC, 0);
-    putU64(coreDesc, 0, addrOf(dev, bOutVel));
-    putU32(coreDesc, 268, numSolverBodies);
-    putU32(coreDesc, 276, 0u);
-    PxgBufferHandle bCoreDesc = createBufferFrom(dev, coreDesc);
-    std::vector<uint8_t> sharedPgs(SZ_SHARED_PGS, 0);
-    putU64(sharedPgs, 160, addrOf(dev, bVelPool));
-    PxgBufferHandle bSharedPgs = createBufferFrom(dev, sharedPgs);
-
-    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, N));
-    PxgBufferHandle bStart = createBufferFrom(dev, rStart);
-    PxgBufferHandle bEnd = createBufferFrom(dev, rEnd);
+    const uint64_t pairs = dev->getBufferDeviceAddress(mk(std::vector<PairInfo>{ c.pair }));
+    const uint64_t normalPens = dev->getBufferDeviceAddress(mk(std::vector<F4>{ c.normalPen }));
+    const uint64_t num = dev->getBufferDeviceAddress(mk(std::vector<uint32_t>(1, 1u)));
+    const uint64_t blocks = dev->getBufferDeviceAddress(mk(std::vector<uint8_t>(RPC_STRIDE, 0)));
+    const uint64_t applied = dev->getBufferDeviceAddress(mk(std::vector<F2>(1, F2{ 0.f, 0.f })));
+    const uint64_t deltaPos = dev->getBufferDeviceAddress(mk(std::vector<F4>(1, F4{ 0.f, 0.f, 0.f, 0.f })));
+    const uint64_t rc = dev->getBufferDeviceAddress(mk(std::vector<uint32_t>(W.refCountSlots(), 0u)));
+    const uint64_t start = dev->getBufferDeviceAddress(mk(std::vector<uint32_t>(1, 0u)));
+    const uint64_t end = dev->getBufferDeviceAddress(mk(std::vector<uint32_t>(1, 1u)));
 
     {
-        PrepPush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.numContacts = addrOf(dev, bNum);
-        p.primitiveConstraints = addrOf(dev, bConstraints);
-        p.preDesc = addrOf(dev, bPrePrepDesc);
-        p.prepareDesc = addrOf(dev, bPrepDesc);
-        p.appliedForces = addrOf(dev, bApplied);
-        p.dt = s.dt;
+        PrepPush p{ poolAddr, pairs, normalPens, num, blocks, W.prePrepDesc, W.prepDesc, applied, kDt, 0u, 0ull, W.sharedDesc };
         Kernel k("psContactSolveBda.spv", "ps_contactPrepareLaunch", {}, sizeof(PrepPush));
-        k.dispatch(1024u, {}, p);
+        k.dispatch(PC_GRID, {}, p);
     }
     {
-        SolvePush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.primitiveConstraints = addrOf(dev, bConstraints);
-        p.numContacts = addrOf(dev, bNum);
-        p.prePrepDesc = addrOf(dev, bPrePrepDesc);
-        p.solverCoreDesc = addrOf(dev, bCoreDesc);
-        p.sharedDesc = addrOf(dev, bSharedPgs);
-        p.deltaPos = addrOf(dev, bDeltaPos);
-        p.appliedForces = addrOf(dev, bApplied);
-        p.dt = s.dt;
-        p.relaxationCoefficient = s.relax;
+        QueryPush p{ poolAddr, pairs, blocks, num, W.prePrepDesc, W.coreDesc, W.velPoolAddr, rc, kDt, 0u, W.artiCoreDesc };
+        Kernel k("psContactSolveBda.spv", "ps_queryPCContactReferenceCountLaunch", {}, sizeof(QueryPush));
+        k.dispatch(PC_GRID, {}, p);
+    }
+    {
+        SolvePush p{ poolAddr, pairs, blocks, num, W.prePrepDesc, W.coreDesc, W.velPoolAddr, deltaPos, applied, rc,
+                     kDt, 0x100u /*TGS, position iteration*/, W.artiCoreDesc };
         Kernel k("psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch", {}, sizeof(SolvePush));
-        k.dispatch(1024u, {}, p);
+        k.dispatch(PC_GRID, {}, p);
     }
     {
-        AccumPush p{};
-        p.particleSystems = addrOf(dev, bPsys);
-        p.sortedContacts = addrOf(dev, bContacts);
-        p.totalNumPairs = addrOf(dev, bPairs);
-        p.rangeStart = addrOf(dev, bStart);
-        p.rangeEnd = addrOf(dev, bEnd);
-        p.deltaPos = addrOf(dev, bDeltaPos);
+        AccumPush p{ poolAddr, pairs, num, start, end, deltaPos };
         Kernel k("psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch", {}, sizeof(AccumPush));
-        k.dispatch(32u, {}, p);
+        k.dispatch(AD_GRID, {}, p);
     }
     dev->flush();
+    const F4 out = downloadBuffer<F4>(dev, bAccum, 1)[0];
+    for (PxgBufferHandle h : owned) dev->destroyBuffer(h);
+    return out;
+}
 
-    const auto cb = downloadBuffer<uint8_t>(dev, bConstraints, nBlocks * CB_STRIDE);
-    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos, N);
-    const auto gApplied = downloadBuffer<F2>(dev, bApplied, N);
-    const auto gAccum = downloadBuffer<F4>(dev, bAccum, N);
-    auto lane = [&](uint32_t off, uint32_t i) {
-        F4 v; std::memcpy(&v, cb.data() + (i / 32u) * CB_STRIDE + off + (i & 31u) * 16u, 16); return v;
-    };
+PXG_TEST(psContactSolve_penetratingParticle)
+{
+    // The static floor's clamp is -1e32, so the pair clamp is the particle system's.
+    // Unbounded, the whole -0.1 penetration is resolved in one solve: CN = -0.1 / dt,
+    // deltaLambdaN = 0.1 / dt / invMass, delta = 0.1 along the floor normal.
+    const F4 unclamped = runFloorChain(-1e30f, -0.1f);
+    PXG_CHECK_MSG(std::fabs(unclamped.y - 0.1f) < 1e-6f && unclamped.x == 0.0f && unclamped.z == 0.0f,
+                  "the particle must be pushed out by the penetration: (%g,%g,%g)", unclamped.x, unclamped.y, unclamped.z);
 
-    const P90Out ref = p90Mirror(s, false);
-    const P90Out old = p90Mirror(s, true);
-    auto eq4 = [](const F4& a, const F4& b) { return std::memcmp(&a, &b, sizeof(F4)) == 0; };
-    auto eq2 = [](const F2& a, const F2& b) { return std::memcmp(&a, &b, sizeof(F2)) == 0; };
-
-    size_t mm = 0, gpuEqOld = 0, oldDiff = 0, deltaFrLive = 0;
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const F4 g[8] = { lane(0u, i), lane(512u, i), lane(1024u, i), lane(1536u, i), lane(2048u, i),
-                          gDeltaPos[i], gAccum[i], { gApplied[i].x, gApplied[i].y, 0.0f, 0.0f } };
-        const F4 r[8] = { ref.raXn[i], ref.normalErr[i], ref.fric0[i], ref.raXnF0[i], ref.raXnF1[i],
-                          ref.deltaPos[i], ref.accum[i], { ref.applied[i].x, ref.applied[i].y, 0.0f, 0.0f } };
-        const F4 q[8] = { old.raXn[i], old.normalErr[i], old.fric0[i], old.raXnF0[i], old.raXnF1[i],
-                          old.deltaPos[i], old.accum[i], { old.applied[i].x, old.applied[i].y, 0.0f, 0.0f } };
-        static const char* nm[8] = { "raXn_vm", "normal_err", "fric0_im0", "raXnF0_vm", "raXnF1_vm",
-                                     "deltaPos", "accumDeltaP", "appliedForce" };
-        bool laneOldDiff = false, laneGpuEqOld = true;
-        for (int f = 0; f < 8; ++f)
-        {
-            if (!eq4(g[f], r[f]))
-            {
-                if (++mm <= 12)
-                    std::printf("  [%u] %s MM: gpu(%.9g,%.9g,%.9g,%.9g) cuda-order(%.9g,%.9g,%.9g,%.9g)\n", i, nm[f],
-                                g[f].x, g[f].y, g[f].z, g[f].w, r[f].x, r[f].y, r[f].z, r[f].w);
-            }
-            if (!eq4(r[f], q[f])) laneOldDiff = true;
-            if (!eq4(g[f], q[f])) laneGpuEqOld = false;
-        }
-        if (laneOldDiff) { ++oldDiff; if (laneGpuEqOld) ++gpuEqOld; }
-        if (!eq2(ref.applied[i], F2{ ref.applied[i].x, 0.0f })) ++deltaFrLive;
-    }
-    std::printf("  %u contacts: %zu field mismatches vs the CUDA order; the x + (y + z) twin differs on "
-                "%zu contacts (GPU equals the twin on %zu of them); friction live on %zu\n",
-                N, mm, oldDiff, gpuEqOld, deltaFrLive);
-    PXG_CHECK_MSG(mm == 0, "psContactSolveBda prepare/solve/accumulate must be bit-exact vs the CUDA dot "
-                  "order (%zu field mismatches) -- is psContactSolveBda in PXG_NOCONTRACT_SHADERS?", mm);
-    // Coverage guard: without it an unstamped (x + (y + z)) build could pass unseen.
-    PXG_CHECK_MSG(oldDiff >= N / 4u,
-                  "the x + (y + z) twin must differ from the CUDA order on many contacts (got %zu of %u) "
-                  "-- the scene no longer exercises the dot association", oldDiff, N);
-    PXG_CHECK_MSG(deltaFrLive >= N / 2u,
-                  "friction must be live (appliedForce.y != 0) on most contacts (got %zu of %u), or the "
-                  "tangent dots never reach deltaPos", deltaFrLive, N);
-
-    PxgBufferHandle all[] = { bPos, bDeltaP, bPhases, bPhaseToMat, bMaterials, bAccum, bPsys, bContacts,
-        bNum, bConstraints, bApplied, bDeltaPos, bSolverBody, bTxi, bBodyFrame, bPrepDesc,
-        bSolverBodyIndices, bPrePrepDesc, bOutVel, bVelPool, bCoreDesc, bSharedPgs, bPairs, bStart, bEnd };
-    for (PxgBufferHandle h : all) dev->destroyBuffer(h);
+    // mPenBiasClamp = -1 m/s caps the depenetration velocity: one solve moves the
+    // particle by dt * 1 m/s.
+    const F4 clamped = runFloorChain(-1.0f, -0.1f);
+    PXG_CHECK_MSG(std::fabs(clamped.y - kDt) < 1e-6f, "the clamp must cap the push-out at dt * 1 m/s: %g", clamped.y);
 }
 
 } // namespace

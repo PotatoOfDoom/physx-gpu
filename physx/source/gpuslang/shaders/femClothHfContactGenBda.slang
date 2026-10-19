@@ -42,15 +42,11 @@
 // so what is left here is the four things that differ -- and every one of them is
 // a plausible copy-paste from the file next door:
 //
-// C1 -- THE SHAPES ARE READ POSITIONALLY, NOT ROUTED BY BODY ID.  The mesh sibling
-//     has eTRIANGLEMESH on both sides and can only tell cloth from mesh by which
-//     one carries a body id (`particleOrSoftbodyId != 0xffffffff`).  This kernel
-//     does NOT do that: it takes `gpuShapes[shapeRef0]` as the cloth and
-//     `gpuShapes[shapeRef1]` as the heightfield, full stop (:3690-3691), and the
-//     transform cache ref it uses for the rigid side is transformCacheRef1.
-//     Transcribed as it stands.  A port that "helpfully" added the id swap would
-//     silently exchange the two shapes for any pair the broadphase happened to
-//     emit the other way round.
+// C1 -- THE SHAPES ARE ROUTED BY BODY ID (PhysX 5.12).  5.6.1 read them
+//     positionally (shapeRef0 = cloth, shapeRef1 = heightfield, the rigid cache ref
+//     transformCacheRef1).  5.12 accepts either order, as the mesh sibling always
+//     did: `clothIsShape0 = shape0.particleOrSoftbodyId != 0xffffffff`, and the
+//     cloth / heightfield shapes and cache refs follow from it.
 //
 // C2 -- THE TRIANGLE COMES OUT OF THE SAMPLES ALREADY SCALED.  getTriangle
 //     multiplies the row/height/column units by the shape scale itself
@@ -59,10 +55,10 @@
 //     Applying the scale twice is the obvious error and it is silent: it moves
 //     the terrain rather than failing.
 //
-// C3 -- NO FILTER PAIRS.  The mesh sibling carries filterPairs/nbFilterPairs and
-//     drops a cloth triangle only when ALL THREE of its vertices are filtered
-//     against the rigid.  This pack has neither argument (which is also why the
-//     two ABI rows differ), so every pair the midphase produced is tested.
+// C3 -- THE FILTER (PhysX 5.12).  5.6.1 had none on this path.  5.12 searches the
+//     cloth's mRigidSurfaceFilterPairs for (rigid filter ref of the heightfield,
+//     cloth triangle) and skips the collision on a hit -- the same one-search filter
+//     as the mesh sibling, read from the cloth rather than from a kernel argument.
 //
 // C4 -- THE TRANSFORM IS hfToCloth, built as clothTransform.transformInv(hfTransform),
 //     and applied to a triangle that is already in the heightfield's SHAPE space.
@@ -86,11 +82,11 @@
 //
 //     bool hasContacts = false;                      // :2616
 //     ...
-//         if ((pen <= cDistance) && normal.dot(n) > 0.f)
+//         if (!filtered && (pen <= cDistance) && normal.dot(n) > 0.f)
 //         {
-//             pairInd0 = rigidId.getInd();
-//             pairInd1 = PxEncodeClothIndex(clothId, clothVertIndex);
-//             //hasContacts = true;                   // :2737  <-- COMMENTED OUT
+//             rigidRef = rigidId.getInd();
+//             vertRef = PxgEncodeDeformableVertex(clothId, clothVertIndex);
+//             //hasContacts = true;                   // 5.12 :2651  <-- COMMENTED OUT
 //             contact = make_float4(...);
 //         }
 //
@@ -110,13 +106,10 @@
 //
 // Upstream candidate 33's sibling.  Documented, NOT reported.
 //
-// One more, found while reading and worth a line because it is the kind of thing
-// that hides a real bug: the shape-type assertion at :2640 is
-//     assert(shape0.type = PxGeometryType::eTRIANGLEMESH && shape1.type == ...)
-// -- a single `=`, so it asserts an ASSIGNMENT and can never fail.  Harmless here
-// (the target is a local copy and asserts are compiled out in release), but it
-// means the type invariant this kernel relies on has never actually been checked.
-// Upstream candidate 38; documented, NOT reported.
+// (5.6.1's shape-type assertion here was `assert(shape0.type = ...)`, an assignment;
+// 5.12 replaced it with a PX_ASSERT accepting either shape order.  The 5.12 vertex
+// kernel also gained a per-vertex filter search -- computed, like everything else
+// in it, for a write that never happens.)
 // ===========================================================================
 module femClothHfContactGenBda;
 
@@ -124,21 +117,23 @@ import pxgSlangCommon;           // quatRotate / quatRotateInv / PxgTransform28
 import pxgSlangFEMClothDesc;     // PxgFEMClothGpu
 import pxgSlangHeightfield;      // sample format + hfGetTriangle
 import pxgSlangClothTriContact;  // staticTriangleVsClothCollision + its clipping
+import pxgSlangDefFilter;        // 5.12: findRigidSurfaceTriangleFilter
+import pxgSlangDeformableRef;    // PxgEncodeDeformableTriangle
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 
 static const uint WARP = 32u;
 static const uint HF_CG_WARPS_PER_BLOCK = 4u;                    // block (128,1,1)
 static const uint HF_CG_GRID = 2048u;
 static const uint HF_CG_STRIDE = HF_CG_GRID * HF_CG_WARPS_PER_BLOCK * WARP;   // 262144
 
-// PxgFEMCloth.h: the element id occupies the low bits of the encoded index.
-static const uint PXG_BITSHIFT_ELEMENT_ID = 20u;
 
 // ---------------------------------------------------------------------------
 // The LIVE kernel's push-constant blob -- BYTE-IDENTICAL to the CUDA pack
 // (PxgNarrowphaseCore.cpp:7006): { PxReal tolerenceLength, cmInputs*,
 // transformCache*, contactDistance*, restDistance*, gpuShapes*, clothes*,
 // shapeToRigidRemapTable*, stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes,
-// stackSizeNeededOnDevice*, PxgFEMContactWriter writer }.
+// stackSizeNeededOnDevice*, PxgRigidDbContactWriter writer } (5.12: same shape as
+// 5.6.1, the writer type changed at the same 80 bytes).
 // 4 @0, nine pointers @8..@72, PxU32 @80, a pointer @88, then the 80-byte writer
 // at @96 (already 16-aligned, so paramAlign moves nothing) -> 176 bytes.
 // ABI row { 4,8,8,8,8,8,8,8,8,8,4,8,80 }.
@@ -159,18 +154,18 @@ struct ClothHfCgParams
     uint stackSizeBytes;           // @80
     uint _pad84;                   // @84
     uint64_t stackSizeNeededOnDevice; // @88
-    // ---- PxgFEMContactWriter (by value, 80 B) @96 ----
-    uint64_t w_outPoint;           // @96
-    uint64_t w_outNormalPen;       // @104
-    uint64_t w_outBarycentric;     // @112
-    uint64_t w_outContactInfo;     // @120
-    uint64_t w_totalContactCount;  // @128
-    uint64_t w_contactByX;         // @136
-    uint64_t w_tempContactByX;     // @144
-    uint64_t w_contactIndexSortedByX; // @152
-    uint64_t w_contactSortedByX;   // @160
-    uint w_maxNumContacts;         // @168
-    uint _pad172;                  // @172 -> 176
+    // ---- PxgRigidDbContactWriter (by value, 80 B) @96 ----
+    uint64_t w_outPoint;                  // @96
+    uint64_t w_outNormalPen;              // @104
+    uint64_t w_outBarycentric;            // @112
+    uint64_t w_outContactInfo;            // @120
+    uint64_t w_outRigidMaterialIndex;     // @128
+    uint64_t w_totalContactCount;         // @136
+    uint64_t w_contactByRigid;            // @144
+    uint64_t w_tempContactByRigid;        // @152
+    uint64_t w_contactIndexSortedByRigid; // @160
+    uint w_maxNumContacts;                // @168
+    uint _pad172;                         // @172 -> 176
 }
 
 [[vk::push_constant]] ConstantBuffer<ClothHfCgParams> gCg;
@@ -197,22 +192,17 @@ uint cgBallot(bool pred, uint lane)
     return sCgBallot;
 }
 
-// PxgFEMContactWriter::writeRigidVsDeformableContact32 -- the same five stores the
-// mesh sibling makes, kept here rather than in the shared module because the
-// writer is the caller's glue and its pack differs between the two kernels.
-void writeRigidVsDeformableContact32(uint index, float4 contact, float4 normalPen, float4 bary,
-                                     uint2 pairInd0, uint pairInd1, uint rigidMatIndex,
-                                     uint rigidX)
+PxgRigidDbContactWriterGpu cgWriter()
 {
-    if (index >= gCg.w_maxNumContacts)
-        return;
-    Ptr<float4>(gCg.w_outPoint)[index] = contact;
-    Ptr<float4>(gCg.w_outNormalPen)[index] = normalPen;
-    Ptr<float4>(gCg.w_outBarycentric)[index] = bary;
-    // PxgFemOtherContactInfo: uint4 { pairInd0.lo, pairInd0.hi, pairInd1, materialIndex }
-    Ptr<uint4>(gCg.w_outContactInfo)[index] =
-        uint4(pairInd0.x, pairInd0.y, pairInd1, rigidMatIndex);
-    Ptr<uint>(gCg.w_contactByX)[index] = rigidX;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gCg.w_outPoint;                 w.outNormalPen = gCg.w_outNormalPen;
+    w.outBarycentric = gCg.w_outBarycentric;     w.outContactInfo = gCg.w_outContactInfo;
+    w.outRigidMaterialIndex = gCg.w_outRigidMaterialIndex;
+    w.totalContactCount = gCg.w_totalContactCount;
+    w.contactByRigid = gCg.w_contactByRigid;     w.tempContactByRigid = gCg.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gCg.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gCg.w_maxNumContacts;
+    return w;
 }
 
 // ===========================================================================
@@ -260,11 +250,14 @@ void cloth_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
             const uint hfTriangleIdx = curPair.z;     // the HEIGHTFIELD triangle
 
             const PxgContactManagerInput cin = Ptr<PxgContactManagerInput>(gCg.cmInputs)[cmIdx];
-            // C1: POSITIONAL, not routed by body id.  See the header.
-            const PxgShape clothShape = shapes[cin.shapeRef0];
-            const PxgShape hfShape = shapes[cin.shapeRef1];
-            const uint clothCacheRef = cin.transformCacheRef0;
-            const uint hfCacheRef = cin.transformCacheRef1;
+            const PxgShape shape0 = shapes[cin.shapeRef0];
+            const PxgShape shape1 = shapes[cin.shapeRef1];
+            // C1 (5.12): either order; the cloth is the shape carrying a deformable id.
+            const bool clothIsShape0 = shape0.particleOrSoftbodyId != 0xffffffffu;
+            const PxgShape clothShape = clothIsShape0 ? shape0 : shape1;
+            const PxgShape hfShape = clothIsShape0 ? shape1 : shape0;
+            const uint clothCacheRef = clothIsShape0 ? cin.transformCacheRef0 : cin.transformCacheRef1;
+            const uint hfCacheRef = clothIsShape0 ? cin.transformCacheRef1 : cin.transformCacheRef0;
 
             rigidMaterialIndex = hfShape.materialIndex;
             rigidId = Ptr<uint2>(gCg.shapeToRigidRemap)[hfCacheRef];   // PxNodeIndex
@@ -303,16 +296,24 @@ void cloth_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
             const float3 localB0 = transformPt(hfToCloth.q(), hfToCloth.p(), b0);
             const float3 localC0 = transformPt(hfToCloth.q(), hfToCloth.p(), c0);
 
-            // C3: no filter -- every pair the midphase produced is tested.
             const uint4 clothVertInd =
-                Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[clothTriangleIdx];
-            Ptr<float4> clothPos = Ptr<float4>(clothes[clothId].mPosition_InvMass);
-            const float3 a1 = clothPos[clothVertInd.x].xyz;
-            const float3 b1 = clothPos[clothVertInd.y].xyz;
-            const float3 c1 = clothPos[clothVertInd.z].xyz;
+                Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges)[clothTriangleIdx];
 
-            hasContact = staticTriangleVsClothCollision(localA0, localB0, localC0, a1, b1, c1,
-                                                        clothQ, clothP, cDistance, c);
+            // C3 (5.12): a filter pair for this rigid and triangle suppresses contact
+            // generation between them.
+            const bool filtered = findRigidSurfaceTriangleFilter(
+                clothRigidSurfaceFilters(gCg.femClothes + uint64_t(clothId) * PXG_FEMCLOTH_STRIDE),
+                dfNodeU64(rigidId), hfCacheRef, clothId, clothTriangleIdx);
+            if (!filtered)
+            {
+                Ptr<float4> clothPos = Ptr<float4>(clothes[clothId].mPosition_InvMass);
+                const float3 a1 = clothPos[clothVertInd.x].xyz;
+                const float3 b1 = clothPos[clothVertInd.y].xyz;
+                const float3 c1 = clothPos[clothVertInd.z].xyz;
+
+                hasContact = staticTriangleVsClothCollision(localA0, localB0, localC0, a1, b1, c1,
+                                                            clothQ, clothP, cDistance, c);
+            }
         }
 
         // globalScanExclusiveSingleWarp(hasContact, writer.totalContactCount).
@@ -331,14 +332,12 @@ void cloth_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 
         if (hasContact)
         {
-            writeRigidVsDeformableContact32(index,
-                                            float4(c.position, restDistance[cmIdx]),
-                                            float4(c.normal, c.separation),
-                                            c.barycentric,
-                                            rigidId,
-                                            (clothId << PXG_BITSHIFT_ELEMENT_ID) | clothTriangleIdx,
-                                            rigidMaterialIndex,
-                                            rigidId.x);
+            const uint64_t rigidRef = dfNodeU64(rigidId);   // shapeToRigidRemapTable[ref].getInd()
+            const uint64_t triRef = PxgEncodeDeformableTriangle(clothId, clothTriangleIdx);
+            cgWriter().writeSurfaceContact(index,
+                                           float4(c.position, restDistance[cmIdx]),
+                                           float4(c.normal, c.separation),
+                                           rigidRef, rigidMaterialIndex, triRef, c.barycentric);
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -375,18 +374,18 @@ struct ClothHfVertCgParams
     uint64_t shapeToRigidRemap;    // @56  (ABI parity only)
     uint64_t stackPtr;             // @64  (ABI parity only)
     uint64_t midphasePairsNum;     // @72
-    // ---- PxgFEMContactWriter (by value, 80 B) @80 ----
-    uint64_t w_outPoint;           // @80   (ABI parity only)
-    uint64_t w_outNormalPen;       // @88   (ABI parity only)
-    uint64_t w_outBarycentric;     // @96   (ABI parity only)
-    uint64_t w_outContactInfo;     // @104  (ABI parity only)
-    uint64_t w_totalContactCount;  // @112  (never incremented -- see the header)
-    uint64_t w_contactByX;         // @120  (ABI parity only)
-    uint64_t w_tempContactByX;     // @128  (ABI parity only)
-    uint64_t w_contactIndexSortedByX; // @136 (ABI parity only)
-    uint64_t w_contactSortedByX;   // @144  (ABI parity only)
-    uint w_maxNumContacts;         // @152
-    uint _pad156;                  // @156 -> 160
+    // ---- PxgRigidDbContactWriter (by value, 80 B) @80 ----
+    uint64_t w_outPoint;                  // @80   (ABI parity only)
+    uint64_t w_outNormalPen;              // @88   (ABI parity only)
+    uint64_t w_outBarycentric;            // @96   (ABI parity only)
+    uint64_t w_outContactInfo;            // @104  (ABI parity only)
+    uint64_t w_outRigidMaterialIndex;     // @112  (ABI parity only)
+    uint64_t w_totalContactCount;         // @120  (never incremented -- see the header)
+    uint64_t w_contactByRigid;            // @128  (ABI parity only)
+    uint64_t w_tempContactByRigid;        // @136  (ABI parity only)
+    uint64_t w_contactIndexSortedByRigid; // @144  (ABI parity only)
+    uint w_maxNumContacts;                // @152
+    uint _pad156;                         // @156 -> 160
     uint stackSizeBytes;           // @160  (ABI parity only -- see below)
     uint _pad164;                  // @164
     uint64_t stackSizeNeededOnDevice; // @168 -> 176

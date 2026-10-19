@@ -315,8 +315,8 @@ pxg_compile_shader(npGridLocation gridLocation)
 pxg_compile_shader(npAnisoOutput anisoOutput)
 pxg_compile_shader(npSmoothPos smoothPos)
 pxg_compile_shader(npIsoAvgVerts isoAvgVerts)
-pxg_compile_shader(npPsSolvePC psSolvePC)
-pxg_compile_shader(npPsSolvePCTGS psSolvePCTGS)
+# npPsSolvePC / npPsSolvePCTGS (the 5.6.1 solvePCOutputDeltaV{,TGS} helper probes) are
+# deleted: PhysX 5.12 removed both helpers (solveRigidDbContact replaces them).
 pxg_compile_shader(npPsWeightKernels psWeightKernels)
 pxg_compile_shader(npPsDiffuseUpdate psDiffuseUpdate)
 pxg_compile_shader(npPsDiffuseSpawn psDiffuseSpawn)
@@ -347,7 +347,6 @@ pxg_compile_shader(npConvexReduce ctReducePoints)
 pxg_compile_shader(npTriMesh ctTriNormal ctTriBarycentric)
 pxg_compile_shader(npClosest ctClosestPtTriangle ctClosestPtEdge)
 pxg_compile_shader(npTetra ctTriBBox ctTetBBox ctTetBary)
-pxg_compile_shader(npDefFilter ctFindParticleRigid ctFindRigid ctFindNonRigid ctFindRange ctEdgeAuth)
 pxg_compile_shader(npBv32 ctBv32Query)
 pxg_compile_shader(npMidphaseCvx ctMidphaseCvx)
 pxg_compile_shader(npMidphaseDeform ctClothTri ctSoftbodyTet ctSoftbodyBoxTet)
@@ -818,18 +817,14 @@ pxg_compile_shader(femClothSolvePairBda cloth_solveTrianglePairEnergyLaunch
 pxg_compile_shader(femClothDampingBda cloth_accumulateInPlaneDampingDeltaVelocity
                    cloth_accumulateBendingDampingDeltaVelocity
                    cloth_applyAccumulatedDeltaVelocity)
-# P7.1 tranche 3a: FEMCloth RIGID-ATTACHMENT constraint prep + PGS/TGS solve on the
-# engine ABI (BDA) — the machinery to PIN a cloth vertex to a rigid / world anchor
-# (toward a hanging cloth).  All three kernels read the PxgFEMCloth descriptor array,
-# the block-of-32 PxgFEMRigidAttachmentConstraint, the PxgFEMRigidAttachment array
-# and the prep / solver-core / solver-shared desc mirrors through Ptr<> (no HLSL
-# cs_6_0 lowering) and grid-stride via nbIterationsPerBlock, so this shader is
-# deliberately absent from PXG_HLSL_ENTRIES (same precedent as femClothSolveBda /
-# psContactSolveTgsBda).  The articulation anchor branch + dynamic-rigid reaction +
-# cone-limited attachment path are deferred (rigid / world anchor scope).
+# FEMCloth RIGID-ATTACHMENT chain on the 5.12 blocks (PxgDeformableAttachment ->
+# PxgRigidDbAttachmentBlock), the new reference-count pre-pass, the one PGS/TGS solve (the
+# TGS twin is gone in 5.12) and the per-vertex delta fold (applyExternalDeltas, which took
+# isVelocityIteration in 5.12).  Reads everything through Ptr<> (no HLSL cs_6_0 lowering),
+# so deliberately absent from PXG_HLSL_ENTRIES.
 pxg_compile_shader(femClothRigidAttachBda cloth_rigidAttachmentPrepareLaunch
+                   cloth_queryRigidClothAttachmentReferenceCountLaunch
                    cloth_solveRigidClothAttachmentLaunch
-                   cloth_solveRigidClothAttachmentTGSLaunch
                    cloth_applyExternalDeltasLaunch)
 # P7.1 tranche 4a: cloth-vertex-vs-PRIMITIVE contact GENERATION on the engine ABI
 # (BDA) — the first half of the cloth-drape-on-a-floor arc.  The midphase vertex-
@@ -858,20 +853,14 @@ pxg_compile_shader(femClothContactGenBda cloth_midphaseGenerateVertexPairsLaunch
 # gather — no float arithmetic — so deliberately absent from PXG_NOCONTRACT_SHADERS
 # too (same reasoning as ps_reorderPrimitiveContactsLaunch).
 pxg_compile_shader(femClothContactSortBda fem_reorderRigidContactsLaunch)
-# P7.1 tranche 4b-2/3: cloth-vs-rigid contact PREPARE + SOLVE on the engine ABI (BDA) —
-# the final half of the cloth-drape-on-a-floor arc.  The prepare builds the block-of-32
-# PxgFemRigidConstraintBlock from the sorted contacts; the query/solve (PGS + TGS)
-# accumulate the per-vertex reference count and scatter the cloth-side push into mDeltaPos.
+# cloth-vs-rigid contact PREPARE + pre-count + SOLVE on the 5.12 blocks (PxgDeformablePairInfo
+# + SoA streams -> PxgRigidDbContactBlock; one kernel each for PGS and TGS since 5.12).
 # Reads every descriptor / SoA block through Ptr<> (BDA, no HLSL cs_6_0 lowering) so it is
-# deliberately absent from PXG_HLSL_ENTRIES (same precedent as femClothRigidAttachBda /
-# psContactSolveTgsBda), and IS in PXG_NOCONTRACT_SHADERS (the dot/normalize-heavy contact
-# bias math needs -ffp-contract=off parity, same as psContactSolveTgsBda).  Articulation
-# branch + dynamic-rigid reaction + material friction are deferred (static-rigid scope).
+# deliberately absent from PXG_HLSL_ENTRIES, and IS in PXG_NOCONTRACT_SHADERS (the
+# dot/cross-heavy responses and the bias math need -ffp-contract=off parity).
 pxg_compile_shader(femClothRigidContactBda cloth_rigidContactPrepareLaunch
                    cloth_queryRigidClothContactReferenceCountLaunch
-                   cloth_queryRigidClothContactReferenceCountTGSLaunch
-                   cloth_solveRigidClothCollisionLaunch
-                   cloth_solveRigidClothCollisionTGSLaunch)
+                   cloth_solveRigidClothCollisionLaunch)
 # P7.2 tranche 1: cloth SELF-collision midphase + contact GENERATION on the engine ABI
 # (BDA) — the first tranche of the cloth-fold-on-itself arc.  Both kernels walk the
 # cloth's own BV32 triangle BVH (reused verbatim from the proven npBv32 / npClothCloth
@@ -894,9 +883,9 @@ pxg_compile_shader(femClothSelfCollisionBda cloth_selfCollisionMidphaseVTLaunch
 # through Ptr<> (BDA, no HLSL cs_6_0 lowering) so it is deliberately absent from
 # PXG_HLSL_ENTRIES (same precedent as femClothRigidContactBda / femClothSelfCollisionBda),
 # and IS in PXG_NOCONTRACT_SHADERS (the dot/cross/normalize-heavy closest-point + constraint
-# math needs -ffp-contract=off parity).  Material friction is the deferred null-material
-# (frictionless) path; the different-cloth pairs flow through the identical generic
-# arithmetic.
+# math needs -ffp-contract=off parity).  5.12: PxgDeformablePairInfo contacts (INVALID /
+# ACTIVE flags), the magnitude-weighted pre-count and solveDbDbContact with the vertex
+# frictions; the different-cloth pairs flow through the identical generic arithmetic.
 pxg_compile_shader(femClothClothContactBda cloth_clothContactPrepareLaunch
                    cloth_queryClothClothContactVTCountLaunch
                    cloth_queryClothClothContactEECountLaunch
@@ -988,18 +977,23 @@ pxg_compile_shader(softBodyContactRemapBda sb_other_contact_remap_to_simLaunch
 # tranche d/e: both sides are softbody tets, so every step happens twice with the sign
 # flipped.  In PXG_NOCONTRACT_SHADERS: the barycentric blends, the relative-position dot and
 # the friction terms are mul-feeding-add chains compared bit-exactly against a CPU reference.
+# PhysX 5.12: PxgDbDbContactBlock, the pre-count sb_querySSContactReferenceCountLaunch (new)
+# and one solve for PGS and TGS (the TGS twin is gone); the solve core is
+# pxgSlangDeformableAndParticleUtils.
 pxg_compile_shader(softBodySelfSolveBda sb_softbodyContactPrepareLaunch
-                   sb_solveOutputSSDeltaVLaunch
-                   sb_solveOutputSSDeltaVLaunchTGS)
+                   sb_querySSContactReferenceCountLaunch
+                   sb_solveOutputSSDeltaVLaunch)
 # P8.2 tranche d: chain kernel 5, the softbody-vs-rigid CONSTRAINT prepare.  A near-clone of
 # cloth_rigidContactPrepareLaunch -- same ABI row, same 104-byte blob -- sharing its
 # 78-line constraint-block writer through the new pxgSlangFemRigidContact module rather than
-# copying it.  In PXG_NOCONTRACT_SHADERS: the response terms are dot-of-cross chains through
+# copying it.  (5.12: both now share pxgSlangDeformableUtils::prepareRigidDbContact; the
+# 5.6.1 module pxgSlangFemRigidContact was deleted with its last importer.)  In PXG_NOCONTRACT_SHADERS: the response terms are dot-of-cross chains through
 # mat33MulVec that would otherwise fuse to FMAs and break parity with the CPU reference.
 # P8.3: the softbody-vs-rigid ATTACHMENT path -- pin a softbody to a rigid or to the world.
 # Same near-clone relationship to femClothRigidAttachBda as every other softbody tranche:
 # identical ABI rows, with the constraint/attachment byte layouts shared through
-# pxgSlangFemRigidAttach.  In PXG_NOCONTRACT_SHADERS: the responses are dot-of-cross chains
+# pxgSlangFemRigidAttach (5.12: pxgSlangDeformableUtils::prepareRigidDbAttachment; the
+# 5.6.1 module was deleted with its last importer).  In PXG_NOCONTRACT_SHADERS: the responses are dot-of-cross chains
 # and the quaternion rotate is a mul/add chain, both compared bit-exactly against a CPU
 # reference.
 # P9.33c: the softbody-vs-CLOTH attachment solve -- the THIRD and last consumer of
@@ -1011,12 +1005,17 @@ pxg_compile_shader(softBodySelfSolveBda sb_softbodyContactPrepareLaunch
 # sibling's shape, which is the one difference here a derived port carries over intact.
 # IS in PXG_NOCONTRACT_SHADERS: the barycentric blends, the mass sums and the cone projection
 # are mul-feeding-add chains a fixture compares bit-exactly against a CPU reference.
-pxg_compile_shader(softBodyClothAttachBda sb_solveOutputClothAttachmentDeltaVLaunch)
+# PhysX 5.12: PxgDbDbAttachmentBlock (no cone limits) and the pre-count
+# sb_queryClothAttachmentReferenceCountLaunch (new).
+pxg_compile_shader(softBodyClothAttachBda sb_queryClothAttachmentReferenceCountLaunch
+                   sb_solveOutputClothAttachmentDeltaVLaunch)
 # (P9.48b's softbody-PARTICLE attachment, softBodyParticleAttachBda, was removed
 # upstream in PhysX 5.12.)
+# PhysX 5.12: PxgDeformableAttachment -> PxgRigidDbAttachmentBlock, the pre-count
+# sb_queryRigidSoftAttachmentReferenceCountLaunch (new) and one solve for PGS and TGS.
 pxg_compile_shader(softBodyRigidAttachBda sb_rigidAttachmentPrepareLaunch
-                   sb_solveRigidSoftAttachmentLaunch
-                   sb_solveRigidSoftAttachmentLaunchTGS)
+                   sb_queryRigidSoftAttachmentReferenceCountLaunch
+                   sb_solveRigidSoftAttachmentLaunch)
 # (P9.76's PARTICLE-vs-rigid attachment trio, psRigidAttachBda, was removed upstream
 # in PhysX 5.12.)
 # P8.4 tranche a: the softbody SELF-collision midphase -- one warp per SURFACE vertex walks
@@ -1086,30 +1085,35 @@ pxg_compile_shader(femClothPsMidphaseBda cloth_psMidphaseGeneratePairsLaunch)
 pxg_compile_shader(softBodyPsMidphaseBda sb_psMidphaseGeneratePairsLaunch)
 pxg_compile_shader(softBodyPsContactGenBda sb_psContactGenLaunch)
 pxg_compile_shader(softBodyPsPrepareBda sb_particleContactPrepareLaunch)
-pxg_compile_shader(softBodyPsSolveBda sb_solveOutputSPDeltaVLaunch sb_solveOutputParticleDeltaVLaunch)
+# PhysX 5.12: PxgParticleDbContactBlock and the pre-count
+# sb_querySBParticleContactReferenceCountLaunch (new).
+pxg_compile_shader(softBodyPsSolveBda sb_querySBParticleContactReferenceCountLaunch
+                   sb_solveOutputSPDeltaVLaunch sb_solveOutputParticleDeltaVLaunch)
 
-# P9.39b -- the BDA fixture shader for pxgSlangDefFilter's engine-path searches.
-pxg_compile_shader(npDefFilterBda dfbRun)
+# PhysX 5.12 -- the fixture for the deformable shared modules (pxgSlangDeformableRef,
+# pxgSlangDeformableWriters, pxgSlangDefFilter) and the descriptor mirrors.  It replaces
+# npDefFilter / npDefFilterBda, whose 5.6.1 filter records 5.12 removed.
+pxg_compile_shader(npDeformableRef512 layoutPxgFEMCloth layoutPxgSoftBody layoutPxgParticleSystem
+    layoutPxgParticleSimBuffer layoutPxgParticleDiffuseSimBuffer layoutPxsDeformableSurfaceMaterialData
+    refRun writerRun filterRun)
 # P9.30: the contact gen it feeds.  Per THREAD, at most one contact per pair, and
 # no warp aggregation -- every contact takes its own atomicAdd of 1.
 pxg_compile_shader(femClothPsContactGenBda cloth_psContactGenLaunch)
 # P9.31: the constraint PREPARE that turns those contacts into solver constraints.
 pxg_compile_shader(femClothPsPrepareBda cloth_particleContactPrepareLaunch)
-# P9.31: the two delta-V outputs.  ONE body, two entry points -- and unlike the
-# box/convex pair these are NOT twins: the two differ in the sign of the impulse,
-# in an extra invMass0 factor, and in where the result lands.
-pxg_compile_shader(femClothPsSolveBda cloth_solveCPOutputClothDeltaVLaunch
+# P9.31 / 5.12: the pre-count (new in 5.12) and the two delta-V outputs.  The two solves
+# are NOT twins: they differ in the sign of the impulse, in an extra invMass0 factor, and
+# in where the result lands.
+pxg_compile_shader(femClothPsSolveBda cloth_queryCPContactReferenceCountLaunch
+                   cloth_solveCPOutputClothDeltaVLaunch
                    cloth_solveCPOutputParticleDeltaVLaunch)
-# P9.32: the cloth-vs-CLOTH ATTACHMENT solve -- pin a point inside a triangle of one cloth
-# to a point inside a triangle of another (or of the same one).  The constraint block is
-# written by femAttachmentPrepareLaunch in softBodyFemAttachBda, which makes
-# PxgFEMFEMAttachmentConstraint an ABI with three consumers; its byte layout therefore moved
-# out of that file into the new pxgSlangFemFemAttach module rather than being copied here.
-# The two SOLVE bodies stay apart -- they differ in corner count, in the cone-limit branch,
-# in what divides the impulse and in whether the scatter skips zero weights.
-# IS in PXG_NOCONTRACT_SHADERS: the barycentric blend and the scatter are mul-feeding-add
-# chains a fixture compares bit-exactly against a CPU reference.
-pxg_compile_shader(femClothAttachBda cloth_solveOutputAttachmentClothClothDeltaVLaunch)
+# P9.32 / 5.12: the cloth-vs-CLOTH ATTACHMENT pre-count (new in 5.12) and solve -- pin a
+# point of one cloth to a point of another (or of the same one).  The PxgDbDbAttachmentBlock
+# is written by femAttachmentPrepareLaunch in softBodyFemAttachBda.  IS in
+# PXG_NOCONTRACT_SHADERS: the barycentric blend and the scatter are mul-feeding-add chains a
+# fixture compares bit-exactly against a CPU reference.
+pxg_compile_shader(femClothAttachBda cloth_queryClothClothAttachmentReferenceCountLaunch
+                   cloth_solveOutputAttachmentClothClothDeltaVLaunch)
 # P9.34c: the SDF cloth contact gen -- the last unmapped cloth contact generator, deferred
 # as "large" since P9.27 and reached here as COMPOSITION rather than transcription.  Both
 # halves that carry the work landed in the two tranches before it: P9.34a's
@@ -1184,7 +1188,10 @@ pxg_compile_shader(femClothHfContactGenBda cloth_heightfieldContactGenLaunch
 # [numthreads(256,1,1)] block verbatim.  Reads everything through Ptr<> so it is deliberately
 # absent from PXG_HLSL_ENTRIES.  IS in PXG_NOCONTRACT_SHADERS: the barycentric interpolation and
 # the inverse-mass weighting are mul-feeding-add chains.
+# PhysX 5.12: PxgDeformableAttachment -> PxgDbDbAttachmentBlock and the pre-count
+# sb_querySoftBodyAttachmentReferenceCountLaunch (new).
 pxg_compile_shader(softBodyFemAttachBda femAttachmentPrepareLaunch
+                   sb_querySoftBodyAttachmentReferenceCountLaunch
                    sb_solveOutputSoftBodyAttachmentDeltaVLaunch)
 
 # softBodyClothMidphaseBda — sb_clothMidphaseGeneratePairsLaunch (P8.8).  The BV32 walk over
@@ -1226,12 +1233,14 @@ pxg_compile_shader(softBodyClothPrepareBda sb_clothContactPrepareLaunch)
 # Solves the constraints and scatters opposite-signed corrections onto both bodies through real
 # float atomics.  IS in PXG_NOCONTRACT_SHADERS (the constraint residual and the friction
 # projection are dot-feeding-mul chains).  Pure BDA, so absent from PXG_HLSL_ENTRIES.
-pxg_compile_shader(softBodyClothSolveBda sb_solveOutputSCDeltaVLaunch)
+# PhysX 5.12: PxgDbDbContactBlock and the pre-count sb_querySCContactReferenceCountLaunch (new).
+pxg_compile_shader(softBodyClothSolveBda sb_querySCContactReferenceCountLaunch
+                   sb_solveOutputSCDeltaVLaunch)
+# PhysX 5.12: the SoA pair-info / barycentric / PxU16 material streams,
+# PxgRigidDbContactBlock, and one query and one solve for PGS and TGS (isTGS).
 pxg_compile_shader(softBodyRigidContactBda sb_rigidContactPrepareLaunch
                    sb_queryRigidSoftContactReferenceCountLaunch
-                   sb_queryRigidSoftContactReferenceCountLaunchTGS
-                   sb_solveRigidSoftCollisionLaunch
-                   sb_solveRigidSoftCollisionLaunchTGS)
+                   sb_solveRigidSoftCollisionLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)
@@ -1260,8 +1269,8 @@ pxg_compile_shader(psContactGenBda ps_primitivesCollisionLaunch ps_primitivesDif
 # uses portable groupshared scans in place of warp ballots/shuffles, which have no
 # HLSL cs_6_0 lowering, so this shader is deliberately absent from PXG_HLSL_ENTRIES
 # (same precedent as particleSim / psBoundsBda / radixSortDesc).
-# P9.48a adds the FEM twins of the two range-find passes, over
-# PxgFemOtherContactInfo instead of PxgParticlePrimitiveContact.
+# P9.48a adds the FEM twins of the two range-find passes; PhysX 5.12 keys all four on
+# the PxgDeformablePairInfo refs (ref1 for the particle twins, ref0 for the FEM ones).
 pxg_compile_shader(psContactSortBda ps_reorderPrimitiveContactsLaunch
                    ps_findStartEndParticleFirstLaunch ps_findStartEndParticleSecondLaunch
                    ps_findStartEndFEMFirstLaunch ps_findStartEndFEMSecondLaunch)
@@ -1276,26 +1285,31 @@ pxg_compile_shader(psContactSortBda ps_reorderPrimitiveContactsLaunch
 # per-particle accumulate -- the consumer that finally MOVES a particle a cloth
 # or softbody pushed.  Its reciprocal is fcount>0?1/fcount:0, NOT the particle
 # twin's 1/max(1,fcount).
-pxg_compile_shader(psContactSolveBda ps_contactPrepareLaunch
+# PhysX 5.12: the pair-info + normalPen streams, PxgRigidParticleContactBlock, the
+# mass-splitting pre-count ps_queryPCContactReferenceCountLaunch (new), and one particle
+# solve for PGS and TGS (isTGS); the solve core is pxgSlangDeformableAndParticleUtils.
+pxg_compile_shader(psContactSolveBda ps_contactPrepareLaunch ps_queryPCContactReferenceCountLaunch
                    ps_solvePCOutputParticleDeltaVLaunch ps_accumulateDeltaVParticleLaunch
                    ps_accumulateFEMParticleDeltaVLaunch)
-# P6.6: the three TGS-only kernels that finish the PBD particle contact SOLVE loop
-# under the TGS solver — the TGS substep predictor (ps_stepParticlesLaunch), the
-# TGS twin of the particle-side PC solve (ps_solvePCOutputParticleDeltaVTGSLaunch),
-# and the TGS velocity-iteration finalize (ps_finalizeParticlesLaunch).  All three
+# P6.6: the TGS-only particle kernels — the TGS substep predictor
+# (ps_stepParticlesLaunch) and the TGS velocity-iteration finalize
+# (ps_finalizeParticlesLaunch).  PhysX 5.12 deleted the third, the TGS twin of the
+# particle-side PC solve (ps_solvePCOutputParticleDeltaVTGSLaunch).  Both
 # read the PxgParticleSystem descriptor array (and, for the solve, the solver
 # core/shared/prep desc mirrors) through Ptr<> (BDA) and grid-stride via
 # nbIterationsPerBlock (the solve) / SV_GroupID (step + finalize, fixed launch
 # grid, no WorkgroupCount()), which has no HLSL cs_6_0 lowering, so this shader is
 # deliberately absent from PXG_HLSL_ENTRIES (same precedent as particleSim /
 # psContactSolveBda / particleSelfCollisionBda).
-pxg_compile_shader(psContactSolveTgsBda ps_stepParticlesLaunch
-                   ps_solvePCOutputParticleDeltaVTGSLaunch ps_finalizeParticlesLaunch)
+pxg_compile_shader(psContactSolveTgsBda ps_stepParticlesLaunch ps_finalizeParticlesLaunch)
 # P9.44: the RIGID side of the particle contact solve (particlesystem.cu:1943/2123) and the
 # deformable/particle -> rigid impulse accumulation (rigidDeltaAccum.cu, all five kernels).
 # Both in PXG_NOCONTRACT_SHADERS: the reaction products and the scanned sums are compared
 # word-for-word against host mirrors.
-pxg_compile_shader(psContactSolveRigidBda ps_solvePCOutputRigidDeltaVLaunch ps_solvePCOutputRigidDeltaVTGSLaunch)
+# PhysX 5.12 folds the TGS twin ps_solvePCOutputRigidDeltaVTGSLaunch into isTGS.
+pxg_compile_shader(psContactSolveRigidBda ps_solvePCOutputRigidDeltaVLaunch)
+# PhysX 5.12 orphans the multi-stage trio (no launch left in PxgParticleSystemCore); they
+# are unmapped but stay compiled for testRigidDeltaAccum.
 pxg_compile_shader(rigidDeltaAccumBda accumulateDeltaVRigidFirstLaunch accumulateDeltaVRigidSecondLaunch
                    clearDeltaVRigidSecondLaunchMulti accumulateDeltaVRigidSecondLaunchMultiStage1
                    accumulateDeltaVRigidSecondLaunchMultiStage2)

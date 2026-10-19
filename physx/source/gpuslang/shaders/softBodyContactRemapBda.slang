@@ -33,7 +33,8 @@
 //   PxgNarrowphaseCore.cpp:4098, SB_OTHER_CONTACT_REMAP_TO_SIM) — contacts are generated
 //   on the COLLISION mesh, but the solver only knows the SIMULATION mesh.  For each
 //   contact this finds the sim tetrahedron that contains (or is nearest to) the contact
-//   point and rewrites pairInd1 to name it, storing the point's barycentric coordinates
+//   point and rewrites the pair info's ref1 (5.12: a PxgDeformableRef; 5.6.1's pairInd1) to
+//   name it, storing the point's barycentric coordinates
 //   inside that tet.  Without it every contact refers to a tetrahedron the solve cannot
 //   address.
 //
@@ -115,9 +116,7 @@
 
 import pxgSlangCommon;
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mSimTetIndices@80, mTetsRemapColToSim@232, ...)
-
-static const uint PXG_BITSHIFT_TET_ID = 20;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffff;
+import pxgSlangDeformableRef;  // PxgDeformableRef encode/decode, PxgLoadPairInfo (5.12)
 static const float PX_MAX_F32_LOCAL = 3.402823466e38f;
 
 // PxgNarrowphaseCore.cpp:4113 / PxgSoftBodyCore.cpp:713 — the engine's fixed launches.
@@ -134,9 +133,9 @@ static const uint SB_REMAP_BLOCK = 64u;
 static const uint SB_REORDER_GRID = 1024u;
 static const uint SB_REORDER_BLOCK = 256u;
 
-uint encodeSoftBody(uint sbId, uint tetId) { return (sbId << PXG_BITSHIFT_TET_ID) | tetId; }
-uint getSoftBodyId(uint compressedId) { return compressedId >> PXG_BITSHIFT_TET_ID; }
-uint getSoftBodyElementIndex(uint compressedId) { return PX_MAX_NB_DEFORMABLE_VOLUME_TET & compressedId; }
+// PxgDeformablePairInfo (16 B): ref0 u64 @0, ref1 u64 @8.  The remaps rewrite one side.
+void storeRef0(uint64_t ciBase, uint64_t ref) { Ptr<uint64_t>(ciBase)[0] = ref; }
+void storeRef1(uint64_t ciBase, uint64_t ref) { Ptr<uint64_t>(ciBase + 8UL)[0] = ref; }
 
 // closestPtPointTriangle2 (GuDistancePointTriangle.h) — the Ericson core
 float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab, float3 ac)
@@ -260,9 +259,9 @@ bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
 
 // ---------------------------------------------------------------------------
 // sb_other_contact_remap_to_simLaunch push blob.
-// CUDA arg pack (PxgNarrowphaseCore.cpp:4100): { const PxgSoftBody* softbodies,
+// CUDA arg pack (5.12): { const PxgSoftBody* softbodies,
 // PxU32 maxNumContacts, const float4* point, float4* outBarycentric,
-// PxgFemOtherContactInfo* outContactInfo, PxU32* totalContactCount,
+// PxgDeformablePairInfo* outContactInfo, PxU32* totalContactCount,
 // const PxU32* prevContactCount } -> 8@0, 4@8, then five pointers realigned to
 // @16..@48 -> 56-byte blob.  (ABI row {8,4,8,8,8,8,8}.)
 // ---------------------------------------------------------------------------
@@ -342,10 +341,10 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     {
         const float3 contact = Ptr<float4>(gRm.point)[contactIndex].xyz;
         const uint64_t ciBase = gRm.outContactInfo + uint64_t(contactIndex) * 16UL;
-        // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12.
-        const uint pairInd1 = Ptr<uint>(ciBase + 8UL)[0];
-        const uint softbodyId = getSoftBodyId(pairInd1);
-        const uint tetInd = getSoftBodyElementIndex(pairInd1);
+        // PxgDeformablePairInfo: ref1 is the collision-mesh tetrahedron (5.12).
+        const uint64_t ref1 = PxgLoadPairInfo(gRm.outContactInfo, contactIndex).ref1;
+        const uint softbodyId = PxgGetDeformableId(ref1);
+        const uint tetInd = PxgGetDeformableFeatureId(ref1);
 
         Ptr<uint4> simTets = Ptr<uint4>(softbodies[softbodyId].mSimTetIndices);
         Ptr<float4> simVerts = Ptr<float4>(softbodies[softbodyId].mSimPosition_InvMass);
@@ -371,12 +370,13 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         // pointer selected instead of the value, the arrays compile and run -- verified
         // standalone at range = 1, 32, 33, 40 and 100 -- so there is no deviation to
         // document here and the warp reduction stays bit-exact.
-        uint laneSimTet[32];
+        // simTetRef starts as PxgEncodeInvalidDeformableRef(softbodyId) in every lane (5.12).
+        uint64_t laneSimTetRef[32];
         float4 laneBary[32];
         float laneSqDist[32];
         for (uint li = 0u; li < 32u; ++li)
         {
-            laneSimTet[li] = 0xffffffffu;
+            laneSimTetRef[li] = PxgEncodeInvalidDeformableRef(softbodyId);
             laneBary[li] = float4(0, 0, 0, 0);
             laneSqDist[li] = PX_MAX_F32_LOCAL;
         }
@@ -408,7 +408,7 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
                     if (tmpDist < laneSqDist[l])
                     {
                         laneSqDist[l] = tmpDist;
-                        laneSimTet[l] = tmpSimTetInd;
+                        laneSimTetRef[l] = PxgEncodeDeformableTetrahedron(softbodyId, tmpSimTetInd);
                         float4 cb;
                         computeTetBarycentric(a, b, c, d, tmpClosest, cb);
                         laneBary[l] = cb;
@@ -423,7 +423,7 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
             }
             if (hitLane != 0xffffffffu)
             {
-                Ptr<uint>(ciBase + 8UL)[0] = encodeSoftBody(softbodyId, hitTet);
+                storeRef1(ciBase, PxgEncodeDeformableTetrahedron(softbodyId, hitTet));
                 Ptr<float4>(gRm.outBarycentric)[contactIndex] = hitBary;
                 valid = true;
             }
@@ -461,7 +461,7 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
             const float4 lb = laneBary[winner];
             const float4 bary = float4(sbcrPxClamp01(lb.x), sbcrPxClamp01(lb.y),
                                        sbcrPxClamp01(lb.z), sbcrPxClamp01(lb.w));
-            Ptr<uint>(ciBase + 8UL)[0] = encodeSoftBody(softbodyId, laneSimTet[winner]);
+            storeRef1(ciBase, laneSimTetRef[winner]);
             Ptr<float4>(gRm.outBarycentric)[contactIndex] = bary;
         }
     }
@@ -501,7 +501,7 @@ void sb_reorderPSContactsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
         Ptr<float4>(gRo.sortedContacts)[index] = Ptr<float4>(gRo.contacts)[remapIndex];
         Ptr<float4>(gRo.sortedNormalPens)[index] = Ptr<float4>(gRo.normalPens)[remapIndex];
         Ptr<float4>(gRo.sortedBarycentrics)[index] = Ptr<float4>(gRo.barycentrics)[remapIndex];
-        // PxgFemOtherContactInfo is 16 B and copied whole.
+        // PxgDeformablePairInfo (5.12; PxgFemFemContactInfo in 5.6.1) is 16 B and copied whole.
         const uint64_t src = gRo.contactInfos + uint64_t(remapIndex) * 16UL;
         const uint64_t dst = gRo.sortedContactInfos + uint64_t(index) * 16UL;
         Ptr<uint4>(dst)[0] = Ptr<uint4>(src)[0];
@@ -515,17 +515,18 @@ void sb_reorderPSContactsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
 //
 // The DEFORMABLE-vs-DEFORMABLE twin of sb_other_contact_remap_to_simLaunch above.  Same job
 // -- turn a contact expressed against the COLLISION mesh into a (sim-tet, barycentric) pair
-// against the SIMULATION mesh -- but for a contact whose BOTH sides are deformable, so it
-// runs twice over the same contact array:
+// against the SIMULATION mesh -- for a contact whose BOTH sides may be deformable.  PhysX
+// 5.12 REWROTE the two rows:
 //
-//     pairIndex = blockIdx.y;                       // gridDim.y == 2
-//     pairIndex == 0 -> remap contactInfo.pairInd1, rewriting outBarycentric1
-//     pairIndex == 1 -> remap contactInfo.pairInd0, rewriting outBarycentric0
+//     pairIndex = blockIdx.y;
+//     pairIndex == 0 -> side 1 (ref1, a collision-mesh TETRAHEDRON met at the contact
+//                       point): the warp search below, reading the point from the new
+//                       `point` stream and rewriting outBarycentric1;
+//     pairIndex == 1 -> side 0 (ref0, a collision-mesh VERTEX): a per-contact LOOKUP of
+//                       mVertsRemapInGridModel / mVertsBarycentricInGridModel, rewriting
+//                       outBarycentric0.  Launched only for a volume-volume pair.
 //
-// The barycentric slot is the INPUT as well as the output: before the remap it holds the
-// contact POINT in world space (that is exactly what the self-collision midphase stores --
-// barycentric0 = the query point, barycentric1 = the closest point), and after it holds real
-// barycentrics against the winning sim tet.
+// (5.6.1 ran the same search for both sides and read the point from the barycentric slot.)
 //
 // Everything the sibling above documents applies here unchanged and is not repeated: the
 // `min()` count clamp instead of CUDA's redefine-and-store block, the SELECT-THE-POINTER
@@ -535,13 +536,10 @@ void sb_reorderPSContactsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
 //
 // TWO THINGS THIS ONE HAS THAT THE SIBLING DOES NOT:
 //   - an `isValidTet` gate on each candidate, and a warp-wide `hasTet` ballot.  When NO
-//     candidate in the whole warp is a valid tet the contact is remapped to tet 0 with a
-//     ZERO barycentric, which is upstream's way of neutralising it rather than leaving a
-//     stale collision-mesh index behind;
-//   - a device pointer selected by pairIndex.  That is the safe direction of the
-//     speculated-load trap: both `outBarycentric0` and `outBarycentric1` are valid
-//     addresses, so whether llvmpipe speculates is irrelevant.  It is written as a pointer
-//     select anyway, to keep every selected pointer in this file the same shape.
+//     candidate in the whole warp is a valid tet, ref1 becomes the INVALID reference of the
+//     softbody (PxgEncodeInvalidDeformableRef, 5.12; 5.6.1 wrote tet 0) with a ZERO
+//     barycentric -- the participant has no feature;
+//   - the side-0 lookup row (5.12), which needs no candidate state at all.
 //
 // *** THE GRID.  READ THIS BEFORE CHANGING SB_REMAP_GRID OR THE EARLY-OUT. ***
 // This kernel is launched from THREE call sites with THREE different block shapes
@@ -551,7 +549,8 @@ void sb_reorderPSContactsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
 // blockDim, so one SPIR-V entry point cannot carry three strides.  Getting it wrong is not
 // a slowdown: the remap is NOT idempotent -- a second visit reads an ALREADY-REMAPPED sim
 // index as though it were a collision index and looks it up in the wrong table -- so an
-// over-large dispatch with an under-large stride silently corrupts contacts.
+// over-large dispatch with an under-large stride silently corrupts contacts.  The 5.12
+// side-0 row is not idempotent either: a second visit reads a TETRAHEDRON ref as a vertex.
 //
 // The fix is to pin ONE grid and refuse the rest: the loop uses stride
 // SB_REMAP_GRID * SB_REMAP_BLOCK and groups at or above SB_REMAP_GRID return immediately.
@@ -566,38 +565,21 @@ bool remapIsValidTet(float3 v0, float3 v1, float3 v2, float3 v3)
     return dot(v1 - v0, cross(v2 - v0, v3 - v0)) > 1e-9f;
 }
 
-// The three writes CUDA makes at each of its three exits, in one place.  pairIndex 1 targets
-// pairInd0, which is a PxU64 field taking a PxU32 value -- the high word must be ZEROED, not
-// left holding whatever the contact carried before.
-void femRemapWrite(uint64_t ciBase, uint64_t baryAddr, uint contactIndex, uint pairIndex,
-                   uint newPairInd, float4 bary)
-{
-    if (pairIndex == 1u)
-    {
-        Ptr<uint>(ciBase)[0] = newPairInd;
-        Ptr<uint>(ciBase + 4UL)[0] = 0u;
-    }
-    else
-    {
-        Ptr<uint>(ciBase + 8UL)[0] = newPairInd;
-    }
-    Ptr<float4>(baryAddr)[contactIndex] = bary;
-}
-
-// CUDA arg pack (PxgNarrowphaseCore.cpp:4139): { const PxgSoftBody* softbodies,
-// float4* outBarycentric0, float4* outBarycentric1, PxgFemFemContactInfo* outContactInfo,
+// CUDA arg pack (5.12): { const PxgSoftBody* softbodies, const float4* point,
+// float4* outBarycentric0, float4* outBarycentric1, PxgDeformablePairInfo* outContactInfo,
 // PxU32* totalContactCount, PxU32* prevContactCount, const PxU32 maxNbContacts }
-// -> six pointers @0..40 and a PxU32 @48 -> 56-byte blob.  (ABI row {8,8,8,8,8,8,4}.)
+// -> seven pointers @0..48 and a PxU32 @56 -> 64-byte blob.  (ABI row {8,8,8,8,8,8,8,4}.)
 struct SbFemRemapParams
 {
     uint64_t softbodies;        // @0
-    uint64_t outBarycentric0;   // @8   in/out
-    uint64_t outBarycentric1;   // @16  in/out
-    uint64_t outContactInfo;    // @24  in/out
-    uint64_t totalContactCount; // @32  in/out
-    uint64_t prevContactCount;  // @40  (optional — may be null)
-    uint maxNbContacts;         // @48
-    uint _pad52;                // @52 -> 56
+    uint64_t point;             // @8   the side-1 witness (5.12)
+    uint64_t outBarycentric0;   // @16  out (side 0)
+    uint64_t outBarycentric1;   // @24  out (side 1)
+    uint64_t outContactInfo;    // @32  in/out
+    uint64_t totalContactCount; // @40  in/out
+    uint64_t prevContactCount;  // @48  (optional in the port -- see the sibling)
+    uint maxNbContacts;         // @56
+    uint _pad60;                // @60 -> 64
 }
 [[vk::push_constant]]
 ConstantBuffer<SbFemRemapParams> gFr;
@@ -625,27 +607,44 @@ void sb_fem_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     const uint prevRaw = Ptr<uint>(prevAddr)[0];
     const uint startIndex = (gFr.prevContactCount != 0UL) ? prevRaw : 0u;
 
-    // pairIndex picks BOTH which half of the pair is remapped and which barycentric array
-    // carries it.  Both addresses are valid, so this select is the safe kind.
-    const uint64_t baryAddr = (pairIndex == 1u) ? gFr.outBarycentric0 : gFr.outBarycentric1;
-
     Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gFr.softbodies);
     const uint stride = SB_REMAP_GRID * SB_REMAP_BLOCK;
+
+    // Side 0 (5.12): a collision-mesh vertex, whose embedding in the simulation mesh is
+    // already available -- a lookup per contact.  One thread per contact; the stride is the
+    // pinned grid's, so every contact is visited exactly once (see the grid note).
+    if (pairIndex == 1u)
+    {
+        for (uint contactIndex = startIndex + gid.x * SB_REMAP_BLOCK + gtid.x;
+             contactIndex < numContacts; contactIndex += stride)
+        {
+            const uint64_t ciBase = gFr.outContactInfo + uint64_t(contactIndex) * 16UL;
+            const uint64_t vertexRef = PxgLoadPairInfo(gFr.outContactInfo, contactIndex).ref0;
+            const uint sbId = PxgGetDeformableId(vertexRef);
+            const uint vertIdx = PxgGetDeformableFeatureId(vertexRef);
+
+            storeRef0(ciBase, PxgEncodeDeformableTetrahedron(sbId,
+                          Ptr<uint>(softbodies[sbId].mVertsRemapInGridModel)[vertIdx]));
+            Ptr<float4>(gFr.outBarycentric0)[contactIndex] =
+                Ptr<float4>(softbodies[sbId].mVertsBarycentricInGridModel)[vertIdx];
+        }
+        return;
+    }
+
+    // Side 1: a tetrahedron met at the contact point -- the search.
+    const uint64_t baryAddr = gFr.outBarycentric1;
 
     for (uint contactIndex = startIndex + gid.x * SB_REMAP_BLOCK + gtid.x;
          contactIndex < numContacts; contactIndex += stride)
     {
-        // The barycentric slot holds the contact POINT until this kernel overwrites it.
-        const float3 contact = Ptr<float4>(baryAddr)[contactIndex].xyz;
+        // The witness comes from the `point` stream (5.12).
+        const float3 contact = Ptr<float4>(gFr.point)[contactIndex].xyz;
 
-        // PxgFemFemContactInfo (PxgFEMCore.h:51), 16 B: pairInd0 PxU64 @0, pairInd1 PxU32
-        // @8, auxInd @12.  Both halves carry a PxU32 encoding, so only the low word is read.
         const uint64_t ciBase = gFr.outContactInfo + uint64_t(contactIndex) * 16UL;
-        const uint64_t pairAddr = (pairIndex == 1u) ? ciBase : (ciBase + 8UL);
-        const uint pairInd = Ptr<uint>(pairAddr)[0];
+        const uint64_t featureRef = PxgLoadPairInfo(gFr.outContactInfo, contactIndex).ref1;
 
-        const uint softbodyId = getSoftBodyId(pairInd);
-        const uint tetInd = getSoftBodyElementIndex(pairInd);
+        const uint softbodyId = PxgGetDeformableId(featureRef);
+        const uint tetInd = PxgGetDeformableFeatureId(featureRef);
 
         Ptr<uint4> simTets = Ptr<uint4>(softbodies[softbodyId].mSimTetIndices);
         Ptr<float4> simVerts = Ptr<float4>(softbodies[softbodyId].mSimPosition_InvMass);
@@ -657,12 +656,13 @@ void sb_fem_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
         const uint range = endInd - startInd;
         const uint nbIterations = (range + 31u) / 32u;
 
-        uint laneSimTet[32];
+        // simTetRef starts as PxgEncodeInvalidDeformableRef(softbodyId) in every lane (5.12).
+        uint64_t laneSimTetRef[32];
         float4 laneBary[32];
         float laneSqDist[32];
         for (uint li = 0u; li < 32u; ++li)
         {
-            laneSimTet[li] = 0xffffffffu;
+            laneSimTetRef[li] = PxgEncodeInvalidDeformableRef(softbodyId);
             laneBary[li] = float4(0, 0, 0, 0);
             laneSqDist[li] = PX_MAX_F32_LOCAL;
         }
@@ -701,7 +701,7 @@ void sb_fem_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
                     if (tmpDist < laneSqDist[l])
                     {
                         laneSqDist[l] = tmpDist;
-                        laneSimTet[l] = tmpSimTetInd;
+                        laneSimTetRef[l] = PxgEncodeDeformableTetrahedron(softbodyId, tmpSimTetInd);
                         float4 cb;
                         computeTetBarycentric(a, b, c, d, tmpClosest, cb);
                         laneBary[l] = cb;
@@ -716,17 +716,18 @@ void sb_fem_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
             }
             if (hitLane != 0xffffffffu)
             {
-                femRemapWrite(ciBase, baryAddr, contactIndex, pairIndex,
-                              encodeSoftBody(softbodyId, hitTet), hitBary);
+                storeRef1(ciBase, PxgEncodeDeformableTetrahedron(softbodyId, hitTet));
+                Ptr<float4>(baryAddr)[contactIndex] = hitBary;
                 valid = true;
             }
         }
 
         if (!hasTet)
         {
-            // No valid sim tet anywhere in the range: neutralise the contact.
-            femRemapWrite(ciBase, baryAddr, contactIndex, pairIndex,
-                          encodeSoftBody(softbodyId, 0u), float4(0, 0, 0, 0));
+            // No valid sim tet anywhere in the range: the participant has no feature, and
+            // simTetRef still holds the invalid reference it started with.
+            storeRef1(ciBase, PxgEncodeInvalidDeformableRef(softbodyId));
+            Ptr<float4>(baryAddr)[contactIndex] = float4(0, 0, 0, 0);
         }
         else if (!valid)
         {
@@ -736,8 +737,8 @@ void sb_fem_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
             for (uint l = 0; l < 32u; ++l)
                 if (laneSqDist[l] == best) { winner = l; break; }
 
-            femRemapWrite(ciBase, baryAddr, contactIndex, pairIndex,
-                          encodeSoftBody(softbodyId, laneSimTet[winner]), laneBary[winner]);
+            storeRef1(ciBase, laneSimTetRef[winner]);
+            Ptr<float4>(baryAddr)[contactIndex] = laneBary[winner];
         }
     }
 }

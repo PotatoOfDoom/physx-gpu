@@ -53,13 +53,13 @@
 // ---------------------------------------------------------------------------
 // This kernel and softBodyMeshContactGenBda.slang's are the same shape -- same
 // pair stack, same LoadShapePairWarp, same computeInnerSphere / tetPrimitivesCollide2,
-// same writeContactNoBarycentricFullWarp in alternativeWriteMode -- and copying the
-// sibling gets three things wrong:
+// same writeVolumeContactFullWarp (5.12) -- and copying the sibling gets two things
+// wrong.  (5.6.1 had a third: this kernel had no filter arm.  5.12 added the same
+// rigid-volume filter as the mesh path, findRigidVolumeFilter(rigid, heightfield cache
+// ref, tetrahedron), ahead of GJK, and both packs are now the same 176 bytes.)
 //
-//   (1) NO FILTER ARM.  The mesh path takes filterPairs / nbFilterPairs and skips a
-//       pair whose (rigidId, softbodyMask) is on the list; this signature has neither
-//       parameter and tests every pair the midphase produced.  Two fewer arguments is
-//       also why the blob is 176 bytes and not the sibling's 192.
+//   (1) THE FILTER IS SHARED NOW (5.12) -- kept as a numbered point so (2) and (3)
+//       keep their names.
 //
 //   (2) NO FRONT-FACE GATE.  The mesh path does
 //           if (intersect) intersect &&= gjkOutput.direction.dot(n) >= 0
@@ -70,7 +70,7 @@
 //   (3) THE NORMAL WRITTEN IS THE TRIANGLE NORMAL, NOT THE GJK DIRECTION.  The mesh
 //       path passes `gjkOutput.direction.getNormalized()` (:886); this one passes
 //       `&n.x` (:1136), the triangle's own geometric normal.  That changes the stored
-//       normal AND the penetration, because writeContactNoBarycentricFullWarp
+//       normal AND the penetration, because writeVolumeContactFullWarp
 //       computes pen as (witnessB - witnessA) . normalPtr -- the witness separation
 //       projected on whatever normal it was handed.  Using the GJK direction here
 //       would still produce contacts, just at a different depth, which is exactly the
@@ -146,6 +146,9 @@ import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu
 import pxgSlangHeightfield;    // hfGetTriangle
 import pxgSlangGjk;            // GjkCloud / GjkOut / GJK_OVERLAP / GJK_CLOSE / GJK_MAX_CLOUD
 import pxgSlangTetCollide;     // tetPrimitivesCollide2 / computeInnerSphere
+import pxgSlangDefFilter;      // 5.12: findRigidVolumeFilter
+import pxgSlangDeformableRef;     // PxgEncodeDeformableTetrahedron
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:58 — SB_HFCG.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
@@ -154,9 +157,6 @@ static const uint SB_HFCG_STRIDE = SB_HFCG * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
-// PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h): (softBodyId << 20) | tetId.
-static const uint PXG_BITSHIFT_ID = 20u;
-
 // The triangle's inner-sphere radius, upstream's literal (softbodyPrimitives.cu:1113).
 static const float TRI_INNER_SPHERE = 0.000001f;
 
@@ -164,14 +164,13 @@ static const float TRI_INNER_SPHERE = 0.000001f;
 // Push-constant blob — BYTE-IDENTICAL to the CUDA pack (PxgNarrowphaseCore.cpp:5441).
 // { PxReal tolerenceLength, cmInputs*, transformCache*, contactDistance*, restDistance*,
 //   gpuShapes*, softbodies*, shapeToRigidRemapTable*, stackPtr*, midphasePairsNum*,
-//   PxU32 stackSizeBytes, stackSizeNeededOnDevice*, PxgFEMContactWriter writer }
+//   PxU32 stackSizeBytes, stackSizeNeededOnDevice*, PxgRigidDbContactWriter writer }
 // -> 4 @0, nine pointers @8..@72, PxU32 @80, a pointer @88, and the 80-byte writer at
 // @96 -> 176-byte blob.  ABI row { 4,8,8,8,8,8,8,8,8,8,4,8,80 }.
 //
-// It is the sibling's row with filterPairs (8) and nbFilterPairs (4) REMOVED from
-// slots 11 and 12 -- 192 bytes becomes 176.  Sharing the sibling's row would push
-// sixteen bytes of garbage into the writer and is exactly the failure P9.77's
-// check_launch_abi.py exists to catch.
+// In 5.6.1 this was the sibling's row with filterPairs (8) and nbFilterPairs (4)
+// removed; 5.12 removed them from the sibling too, so the two rows coincide.  They stay
+// separate rows, so a later divergence shows up in check_launch_abi.py.
 // ---------------------------------------------------------------------------
 struct SbHfCgParams
 {
@@ -189,18 +188,18 @@ struct SbHfCgParams
     uint stackSizeBytes;            // @80
     uint _pad84;                    // @84
     uint64_t stackSizeNeededOnDevice; // @88
-    // --- PxgFEMContactWriter, by value (PxgFEMCore.h:361) ---
-    uint64_t w_outPoint;            // @96  float4*
-    uint64_t w_outNormalPen;        // @104 float4*
-    uint64_t w_outBarycentric;      // @112 float4* (unused on the no-barycentric path)
-    uint64_t w_outContactInfo;      // @120 PxgFemOtherContactInfo* (16 B stride)
-    uint64_t w_totalContactCount;   // @128 PxU32*
-    uint64_t w_contactByX;          // @136 PxU64*   (unused in alternativeWriteMode)
-    uint64_t w_tempContactByX;      // @144 PxU32*   (unused in alternativeWriteMode)
-    uint64_t w_contactIndexSortedByX; // @152 PxU32*
-    uint64_t w_contactSortedByX;    // @160 PxU32*
-    uint w_maxNumContacts;          // @168 PxU32
-    uint _pad172;                   // @172 -> 176
+    // --- PxgRigidDbContactWriter, by value (PxgDeformableContactWriters.h, 5.12) ---
+    uint64_t w_outPoint;                  // @96  float4*
+    uint64_t w_outNormalPen;              // @104 float4*
+    uint64_t w_outBarycentric;            // @112 float4* (unused: writeVolumeContact)
+    uint64_t w_outContactInfo;            // @120 PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;     // @128 PxU16*
+    uint64_t w_totalContactCount;         // @136 PxU32*
+    uint64_t w_contactByRigid;            // @144 PxU64*
+    uint64_t w_tempContactByRigid;        // @152 PxU32*
+    uint64_t w_contactIndexSortedByRigid; // @160 PxU32*
+    uint w_maxNumContacts;                // @168 PxU32
+    uint _pad172;                         // @172 -> 176
 }
 
 [[vk::push_constant]] ConstantBuffer<SbHfCgParams> gHc;
@@ -218,35 +217,19 @@ struct PxgShape                 // PxgConvexConvexShape.h, 48 B
     uint particleOrSoftbodyId;                        // @44
 }
 
-uint encodeId(uint id, uint elementId) { return (id << PXG_BITSHIFT_ID) | elementId; }
-
-// writeContactNoBarycentricFullWarp (softbodyPrimitives.cu:297) with
-// alternativeWriteMode = true, which is what THIS call site asks for (:1136) and what
-// the mesh sibling asks for too:
-//
-//   alternativeWriteMode == false: contactByX[i] = the full 64-bit node index AND
-//                                  tempContactByX[i] = its low word
-//   alternativeWriteMode == true : contactSortedByX[i] = the low word ONLY
-//
-// contactIndexSortedByX[i] = i is written in BOTH modes.
-//
-// setRigidMaterialIndex(mat) followed by markInCollision(false) collapses to a single
-// store of (mat & 0x7fffffff).
-void writeRigidVsDeformableNoBaryAlt(uint index, float4 contact, float4 normalPen,
-                                     uint2 pairInd0, uint pairInd1, uint rigidMatId)
+PxgRigidDbContactWriterGpu hcWriter()
 {
-    if (index >= gHc.w_maxNumContacts)
-        return;
-    Ptr<uint>(gHc.w_contactSortedByX)[index] = pairInd0.x;   // PxU32(pairInd0 & 0xffffffff)
-    Ptr<uint>(gHc.w_contactIndexSortedByX)[index] = index;
-    Ptr<float4>(gHc.w_outPoint)[index] = contact;
-    Ptr<float4>(gHc.w_outNormalPen)[index] = normalPen;
-    // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12.
-    const uint64_t ci = gHc.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(ci)[0] = pairInd0;
-    Ptr<uint>(ci + 8UL)[0] = pairInd1;
-    Ptr<uint>(ci + 12UL)[0] = rigidMatId & 0x7fffffffu;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gHc.w_outPoint;                 w.outNormalPen = gHc.w_outNormalPen;
+    w.outBarycentric = gHc.w_outBarycentric;     w.outContactInfo = gHc.w_outContactInfo;
+    w.outRigidMaterialIndex = gHc.w_outRigidMaterialIndex;
+    w.totalContactCount = gHc.w_totalContactCount;
+    w.contactByRigid = gHc.w_contactByRigid;     w.tempContactByRigid = gHc.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gHc.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gHc.w_maxNumContacts;
+    return w;
 }
+
 
 // PxQuat::rotate (PxQuat.h:286), literal.
 float3 hcQuatRotate(float4 q, float3 v)
@@ -325,7 +308,13 @@ void sb_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         // PxNodeIndex is a PxU64; the remap table is indexed by the HEIGHTFIELD's cache ref.
         const uint2 rigidId = Ptr<uint2>(gHc.shapeToRigidRemapTable)[hfCacheRef];
 
-        // DIFFERENCE (1): no filter arm.  See the header.
+        // (1) 5.12: a filter pair for this rigid and tetrahedron suppresses contact
+        // generation between them (a null array is replaced by the softbody descriptor:
+        // llvmpipe speculates the first load, see pxgSlangDefFilter).
+        if (findRigidVolumeFilter(
+                softBodyRigidVolumeFilters(gHc.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE),
+                dfNodeU64(rigidId), hfCacheRef, softbodyId, tetrahedronInd))
+            continue;
 
         // ---- cloud A: the tetrahedron, already in WORLD space ---------------------
         const uint4 tetIdx = Ptr<uint4>(softbodies[softbodyId].mTetIndices)[tetrahedronInd];
@@ -387,8 +376,6 @@ void sb_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         if (!intersect)
             continue;
 
-        const uint softBodyMask = encodeId(softbodyId, tetrahedronInd);
-
         // DIFFERENCE (3): the normal handed to the writer is the TRIANGLE normal, so
         // the penetration is the witness separation projected on IT and not on the GJK
         // direction.  The stored xyz is -n (flipOutputNormal = true); the penetration is
@@ -406,10 +393,12 @@ void sb_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         if (index >= gHc.w_maxNumContacts)
             continue;
 
-        writeRigidVsDeformableNoBaryAlt(index,
-                                        float4(wB.x, wB.y, wB.z, restDistance[cmIdx]),
-                                        float4(-n.x, -n.y, -n.z, pen),
-                                        rigidId, softBodyMask, hfShape.materialIndex);
+        // 5.12: writeSortKey(index, rigidRef) on every path (5.6.1's alternativeWriteMode is gone).
+        hcWriter().writeVolumeContact(index,
+                                      float4(wB.x, wB.y, wB.z, restDistance[cmIdx]),
+                                      float4(-n.x, -n.y, -n.z, pen),
+                                      dfNodeU64(rigidId), hfShape.materialIndex,
+                                      PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronInd));
     }
     }
 

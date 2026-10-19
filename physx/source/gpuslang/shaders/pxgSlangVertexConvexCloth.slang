@@ -66,9 +66,9 @@
 //   * the outputs go back to shape space (vertex2Shape for the point,
 //     vertex2ShapeNormalVector == shape2Vertex for the normal, then
 //     PxVec3::normalizeSafe), then to world space, and a STRICT pen <
-//     contactDist gate reserves one slot and writes the contact with
-//     barycentric (0,0,0,1) -- the 1 in w is what marks a VERTEX contact
-//     downstream.
+//     contactDist gate reserves one slot and writes the contact through the
+//     5.12 vertex overload of PxgRigidDbContactWriter::writeSurfaceContact (no
+//     barycentric; the PxgDeformableRef feature type marks a VERTEX contact).
 //
 // WARP SERIALIZATION.  The CUDA runs one warp per pair and uses
 // __ballot_sync / warpReduction / __shfl_sync.  Every reduction here is
@@ -129,6 +129,8 @@
 
 import pxgSlangCommon;
 import pxgSlangConvexHull;
+import pxgSlangDeformableRef;       // PxgEncodeDeformableVertex
+import pxgSlangDeformableWriters;   // PxgRigidDbContactWriterGpu
 
 public static const uint FVC_BITSHIFT_ELEMENT_ID = 20;
 public static const float FVC_NORMALIZATION_EPSILON = 1e-20f;
@@ -142,15 +144,12 @@ public struct FvcCase
     public float4 convexScale;    // xyz
     public float4 convexScaleRot; // quaternion
     public uint4 ids;             // x = rigidId lo, y = rigidId hi, z = clothId, w = vertexIdx
-    public uint4 ids2;            // x = rigidMaterialIndex, y = hull offset (uints)
+    public uint4 ids2;            // x = rigidMaterialIndex, y = hull offset (uints),
+                                  // z = rigid transform cache ref (the fcVertexConvex filter key)
 }
 
-// PxgFEMContactWriter, by address.
-public struct FvcWriter
-{
-    public uint64_t point, normalPen, bary, info, count, byX, tempByX, idxByX;
-    public uint maxContacts;
-}
+// The writer is PxgRigidDbContactWriterGpu (pxgSlangDeformableWriters), by value as
+// in the CUDA (5.12 replaced PxgFEMContactWriter).
 
 // ---- scale/space helpers (cudaNpCommon.h:265-305) ---------------------------
 float3 fvcVertex2Shape(float3 v, float3 scale, float4 rot)
@@ -196,33 +195,11 @@ float3 fvcDistancePointSegment(float3 a, float3 b, float3 p)
     return a + ab * t;
 }
 
-// ---- writeRigidVsDeformableContact (PxgFEMCore.h:485) -----------------------
-// pairInd0 == rigidId.getInd(); the caller passes them equal, as the plane and
-// sphere siblings do.
-void fvcWriteRigidVsDeformableContact(FvcWriter w, uint index, float4 contact, float4 normalPen,
-                                      float4 bary, uint2 rigidId, uint pairInd1,
-                                      uint rigidMaterialIndex)
-{
-    if (index >= w.maxContacts) return;
-    Ptr<uint2>(w.byX)[index] = rigidId;
-    Ptr<uint>(w.tempByX)[index] = rigidId.x;
-    Ptr<uint>(w.idxByX)[index] = index;
-    Ptr<float4>(w.point)[index] = contact;
-    Ptr<float4>(w.normalPen)[index] = normalPen;
-    Ptr<float4>(w.bary)[index] = bary;
-    // PxgFemOtherContactInfo (16B): pairInd0 u64 @0, pairInd1 u32 @8, mat @12
-    const uint64_t infoBase = w.info + uint64_t(index) * 16UL;
-    Ptr<uint2>(infoBase + 0UL)[0] = rigidId;
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-    // setRigidMaterialIndex(mat) + markInCollision(false) == (mat & 0x7fffffff)
-    Ptr<uint>(infoBase + 12UL)[0] = rigidMaterialIndex & 0x7fffffffu;
-}
-
 // ---------------------------------------------------------------------------
 // The core.  Returns the debug quad (unused, pen, wrote, tookTheInsideBranch);
 // .x is left to the caller, which owns the filter verdict.
 // ---------------------------------------------------------------------------
-public float4 fcClothVertexConvexContactGen(FvcCase cs, uint64_t hull, FvcWriter w)
+public float4 fcClothVertexConvexContactGen(FvcCase cs, uint64_t hull, PxgRigidDbContactWriterGpu w)
 {
     const uint hullDesc = chHullDesc(hull);
     const uint nbPolygons = chNbPolygons(hullDesc);
@@ -394,14 +371,14 @@ public float4 fcClothVertexConvexContactGen(FvcCase cs, uint64_t hull, FvcWriter
     if (pen < contactDist)
     {
         dbg.z = 1.0f;
-        const uint2 rigidId = uint2(cs.ids.x, cs.ids.y);
-        const uint pairInd1 = (cs.ids.z << FVC_BITSHIFT_ELEMENT_ID) | cs.ids.w;
+        const uint64_t rigidRef = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << uint64_t(32)); // rigidId.getInd()
+        const uint64_t vertRef = PxgEncodeDeformableVertex(cs.ids.z, cs.ids.w);
         uint ind;
-        InterlockedAdd(Ptr<uint>(w.count)[0], 1u, ind);
-        fvcWriteRigidVsDeformableContact(w, ind, float4(worldP, cs.rigidP.w),
-            float4(worldNormal, pen),
-            float4(0.0f, 0.0f, 0.0f, 1.0f),   // the 1 in w marks a VERTEX contact
-            rigidId, pairInd1, cs.ids2.x);
+        InterlockedAdd(Ptr<uint>(w.totalContactCount)[0], 1u, ind);
+        // 5.12: the vertex overload of writeSurfaceContact -- no barycentric is written
+        // (5.6.1 wrote (0,0,0,1) to mark a vertex; the ref's feature type says it now).
+        w.writeSurfaceContactVertex(ind, float4(worldP, cs.rigidP.w), float4(worldNormal, pen),
+                                    rigidRef, cs.ids2.x, vertRef);
     }
     return dbg;
 }

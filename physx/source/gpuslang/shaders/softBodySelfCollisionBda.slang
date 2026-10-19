@@ -32,7 +32,10 @@
 //   softbodySoftbodyMidPhase.cu:959, launch PxgSoftBodyCore.cpp:411,
 //   SB_SELFCOLLISION_MIDPHASE) — one warp per SURFACE vertex of one softbody walks that
 //   same softbody's BV32 tetrahedron BVH, keeps the single deepest surviving
-//   vertex-vs-tetrahedron contact, and appends it through PxgSoftBodyContactWriter.
+//   vertex-vs-tetrahedron contact, and appends it through PxgDbDbContactWriter (5.12):
+//   writeVolumeVolumeContact with ref0 = the query VERTEX, ref1 = the tetrahedron and no
+//   barycentric (5.6.1 wrote the vertex's surface tet via mSurfaceVertToTetRemap and parked
+//   the two points in the barycentric slots).
 //
 // This is the first kernel of the softbody SELF-collision chain, the counterpart of the
 // cloth path's cloth_selfCollisionMidphaseVTLaunch.  Without it a softbody passes through
@@ -41,7 +44,8 @@
 // WHAT IS REUSED RATHER THAN REINVENTED:
 //   - the TRAVERSER body is a LIFT of npSbSelf.slang (ctSbSelfQuery), the unit-tested
 //     descriptor-set port of SbMeshTreeTraverser: the surface-hint gate, the shared-vertex
-//     skip, the PxgNonRigidFilterPair lookup, isValidTet, isPointOutsideOfPlane4,
+//     skip, the element filter (5.12: findVolumeVolumeFilter over the body's
+//     mVolumeVolumeFilterPairs, with ANY_FEATURE wildcards), isValidTet, isPointOutsideOfPlane4,
 //     closestPtTetrahedron with the surface hint, the inside/outside contact decision, the
 //     rest-pose re-check and the stress gate all come across verbatim, with the
 //     RWStructuredBuffer reads replaced by Ptr<>.  Same relationship softBodyContactRemapBda
@@ -86,9 +90,10 @@
 //     extracted.  NOTE the word address is formed with `& ~uint64_t(3)`: writing `& ~3UL`
 //     MISCOMPILES -- Slang evaluates the complement in 32 bits and clears the top half of
 //     the device address (documented at length in softBodySolveBda.slang);
-//   - PxgSoftBodyContactWriter is passed BY VALUE as the last CUDA argument, so it is
-//     INLINED into the push blob (@24..@75), giving an 80-byte blob.  Same treatment
-//     PxgFEMContactWriter gets in softBodyContactGenBda.
+//   - PxgDbDbContactWriter (5.12; the same 56 bytes as 5.6.1's PxgSoftBodyContactWriter) is
+//     passed BY VALUE as the last CUDA argument, so it is INLINED into the push blob
+//     (@24..@75), giving an 80-byte blob.  Same treatment PxgRigidDbContactWriter gets in
+//     softBodyContactGenBda.
 //
 // The tetmesh blob hanging off PxgSoftBody::mTetMeshData opens with a uint4 header
 // (nbVerts, nbTets, maxDepth, nbBv32TreeNodes), so the BV32 node array starts at
@@ -101,8 +106,10 @@
 // the one non-portable operation, and it only picks a NORMAL direction -- the accept/reject
 // decisions above are all comparisons of contracted-free products.
 
-import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mNumVerts@364, ...)
-import pxgSlangDefFilter;   // P9.38
+import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mNumVerts@388, ...)
+import pxgSlangDefFilter;   // 5.12: findVolumeVolumeFilter
+import pxgSlangDeformableRef;     // PxgEncodeDeformable*, PXG_DREF_ANY_FEATURE
+import pxgSlangDeformableWriters; // PxgDbDbContactWriterGpu
 import pxgSlangTetClosest;     // getNormalized / isValidTet / isPointOutsideOfPlane4 /
 import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
                       // private copy of both that was verbatim identical to it.
@@ -119,8 +126,6 @@ static const uint SC_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
 
-// PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h): (softBodyId << 20) | tetId.
-static const uint PXG_BITSHIFT_TET_ID = 20u;
 
 // @1024, mNbNodes @1152.
 
@@ -131,8 +136,8 @@ static const uint STACK_SIZE = 192u;
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the CUDA scMidphaseKernelParams pack
 // (PxgSoftBodyCore.cpp:400): { const PxU32* activeSoftbodies, const PxReal* contactDistance,
-// const PxgSoftBody* softbodies, PxgSoftBodyContactWriter writer } -> 80 bytes.
-// sizeof(PxgSoftBodyContactWriter) = 56 (six pointers + PxU32 maxContacts + 4 tail pad), so
+// const PxgSoftBody* softbodies, PxgDbDbContactWriter writer } -> 80 bytes.
+// sizeof(PxgDbDbContactWriter) = 56 (six pointers + PxU32 maxContacts + 4 tail pad), so
 // paramAlign gives it 8-byte alignment and it lands at @24.  ABI row {8,8,8,56}.
 // ---------------------------------------------------------------------------
 struct SelfCollisionParams
@@ -140,12 +145,12 @@ struct SelfCollisionParams
     uint64_t activeSoftbodies;    // @0
     uint64_t contactDistance;     // @8
     uint64_t softbodies;          // @16
-    // --- PxgSoftBodyContactWriter, inlined ---
+    // --- PxgDbDbContactWriter, inlined (PxgDeformableContactWriters.h, 5.12) ---
     uint64_t outPoint;            // @24
     uint64_t outNormalPen;        // @32
     uint64_t outBarycentric0;     // @40
     uint64_t outBarycentric1;     // @48
-    uint64_t outContactInfo;      // @56
+    uint64_t outContactInfo;      // @56  PxgDeformablePairInfo*
     uint64_t totalContactCount;   // @64
     uint maxContacts;             // @72
     uint _pad76;                  // @76 -> 80
@@ -162,36 +167,20 @@ uint byteAt(uint64_t base, uint idx)
     return (word >> shift) & 0xffu;
 }
 
-uint pxEncodeSoftBodyIndex(uint softBodyId, uint tetId)
+PxgDbDbContactWriterGpu scWriter()
 {
-    return (softBodyId << PXG_BITSHIFT_TET_ID) | tetId;
+    PxgDbDbContactWriterGpu w;
+    w.outPoint = gSc.outPoint;               w.outNormalPen = gSc.outNormalPen;
+    w.outBarycentric0 = gSc.outBarycentric0; w.outBarycentric1 = gSc.outBarycentric1;
+    w.outContactInfo = gSc.outContactInfo;   w.totalContactCount = gSc.totalContactCount;
+    w.maxContacts = gSc.maxContacts;
+    return w;
 }
 
 
 // ---------------------------------------------------------------------------
 // Geometry helpers — verbatim from npSbSelf.slang / npSbTet.slang.
 // ---------------------------------------------------------------------------
-// PxgSoftBodyContactWriter::writeContact (PxgSoftBodyCore.h:276).  auxInd is NOT touched by
-// the CUDA writer, so it is not written here either.
-void writeSelfContact(uint index, float4 contact, float4 normalPen,
-                      float4 barycentric0, float4 barycentric1, uint pairId0, uint pairId1)
-{
-    if (index >= gSc.maxContacts)
-        return;
-
-    Ptr<float4>(gSc.outPoint)[index] = contact;
-    Ptr<float4>(gSc.outNormalPen)[index] = normalPen;
-    Ptr<float4>(gSc.outBarycentric0)[index] = barycentric0;
-    Ptr<float4>(gSc.outBarycentric1)[index] = barycentric1;
-
-    // PxgFemFemContactInfo (PxgFEMCore.h:51), 16 B: pairInd0 PxU64 @0, pairInd1 @8,
-    // auxInd @12.  pairId0 is a PxU32 assigned into a PxU64 field -> zero-extended.
-    const uint64_t infoAddr = gSc.outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint>(infoAddr)[0] = pairId0;
-    Ptr<uint>(infoAddr + 4UL)[0] = 0u;
-    Ptr<uint>(infoAddr + 8UL)[0] = pairId1;
-}
-
 // ---------------------------------------------------------------------------
 // Warp emulation scratch: one group == one warp, so a single slot each.
 // ---------------------------------------------------------------------------
@@ -211,39 +200,29 @@ uint scBallot(bool pred, uint lane)
 // ===========================================================================
 // sb_selfCollisionMidphaseGeneratePairsLaunch
 // ===========================================================================
-// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
-// null-pointer guard stays here, because only this kernel knows which of its buffers
-// is safe to point at when the filter list is null (see the module header).
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
-{
-    // *** mFilteringPairs IS NULL WHEN THE BODY HAS NO FILTER PAIRS. ***
-    // THIS IS THE CORPUS'S REFERENCE DIAGNOSIS of that fault; several other shaders
-    // point here for it, so it stays with the guard even though P9.38 moved the search
-    // itself into pxgSlangDefFilter.
-    //
-    // PxgSimulationCore only assigns it inside the dirty-filter branch
-    // (PxgSimulationCore.cpp:1446), so a body that never registered a filter reaches this
-    // kernel with a null pointer and nbPairs == 0 -- which is the common case, and the case
-    // the first live self-collision scene hit immediately.
-    //
-    // A zero-trip `while (l < r)` is NOT enough on llvmpipe.  It speculates the first
-    // iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
-    // LANES -- so `findFilter` stops being warp-uniform, the caller's `continue` stops being
-    // group-uniform, and the workgroup barrier after it is reached by only part of the
-    // group.  That is why the symptom was a SIGSEGV whose location moved with the
-    // groupshared layout (STACK_SIZE 192 vs 193 changed it) and vanished under
-    // PXG_SYNC_EACH: the fault is a barrier divergence, not a bad store.
-    //
-    // The fix is the one softBodyContactRemapBda spells out for prevContactCount: SELECT
-    // THE POINTER, NOT THE LOADED VALUE.  Guarding with `if` cannot work -- the branch is
-    // already there and llvmpipe if-converts it -- so the faulting ADDRESS has to go.
-    // gSc.softbodies is dereferenced unconditionally by every invocation of this kernel, so
-    // it is never null and a speculated 16-byte read at its offset 0 is harmless; forcing
-    // `r` to 0 keeps the RESULT exactly what CUDA computes for an empty list.
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    return dfFindNonRigidPair(havePairs ? pairsAddr : gSc.softbodies,
-                              havePairs ? nbPairs : 0u, id0, id1);
-}
+// *** THE FILTER ARRAY IS NULL WHEN THE BODY HAS NO FILTER PAIRS. ***
+// THIS IS THE CORPUS'S REFERENCE DIAGNOSIS of that fault; several other shaders point here
+// for it.  (5.6.1's mFilteringPairs; in 5.12 the array is mVolumeVolumeFilterPairs, and
+// pxgSlangDefFilter's dfFilterArray now carries the fix for every caller.)
+//
+// The engine only assigns the array when the body has filters, so a body that never
+// registered one reaches this kernel with a null pointer and a count of 0 -- which is the
+// common case, and the case the first live self-collision scene hit immediately.
+//
+// A zero-trip `while (l < r)` is NOT enough on llvmpipe.  It speculates the first
+// iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
+// LANES -- so the filter stops being warp-uniform, the caller's `continue` stops being
+// group-uniform, and the workgroup barrier after it is reached by only part of the group.
+// That is why the symptom was a SIGSEGV whose location moved with the groupshared layout
+// (STACK_SIZE 192 vs 193 changed it) and vanished under PXG_SYNC_EACH: the fault is a
+// barrier divergence, not a bad store.
+//
+// The fix is the one softBodyContactRemapBda spells out for prevContactCount: SELECT THE
+// POINTER, NOT THE LOADED VALUE.  Guarding with `if` cannot work -- the branch is already
+// there and llvmpipe if-converts it -- so the faulting ADDRESS has to go.  The softbody
+// descriptor is dereferenced unconditionally by every invocation of this kernel, so it is
+// never null and a speculated 16-byte read there is harmless; the count stays 0, so the
+// RESULT is exactly what CUDA computes for an empty list.
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -274,11 +253,11 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
     Ptr<uint4> tetIndices = Ptr<uint4>(softbodies[softbodyId].mTetIndices);
     Ptr<float4> restTetVerts = Ptr<float4>(softbodies[softbodyId].mRestPosition);
     Ptr<float> tetraStresses = Ptr<float>(softbodies[softbodyId].mTetraStressCoefficient);
-    Ptr<uint> vertToSurfaceTetRemap = Ptr<uint>(softbodies[softbodyId].mSurfaceVertToTetRemap);
     const uint64_t surfaceVertsHint = softbodies[softbodyId].mSurfaceVertsHint;
     const uint64_t surfaceHintBase = softbodies[softbodyId].mTetMeshSurfaceHint;
-    const uint64_t pairsAddr = softbodies[softbodyId].mFilteringPairs;
-    const uint nbFilterPairs = softbodies[softbodyId].mNumFilterPairs;
+    // softbody->mVolumeVolumeFilterPairs (5.12), through dfFilterArray -- see above.
+    const DfFilterArray filters =
+        softBodyVolumeVolumeFilters(gSc.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE);
 
     // See the header on the grid: the block's two warps are walked serially, and the stride
     // stays the CUDA blockDim.y * gridDim.x.
@@ -301,10 +280,8 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
         if (byteAt(surfaceVertsHint, safeVert) == 0u)
             continue;
 
-        // The vertex-level filter: (softbodyId, vertIdx) against the whole-body wildcard.
-        if (findFilter(pairsAddr, nbFilterPairs,
-                       pxEncodeSoftBodyIndex(softbodyId, vertIdx),
-                       pxEncodeSoftBodyIndex(softbodyId, 0xfffffu)))
+        // The vertex-level filter: this vertex against ANY tetrahedron of the body.
+        if (findVolumeVolumeFilter(filters, softbodyId, vertIdx, softbodyId, PXG_DREF_ANY_FEATURE))
             continue;
 
         const float3 point = tetVerts[safeVert].xyz;
@@ -360,9 +337,13 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                     if (hint != 0u && !(tetIdx1.x == vertIdx || tetIdx1.y == vertIdx ||
                                         tetIdx1.z == vertIdx || tetIdx1.w == vertIdx))
                     {
-                        const uint softBodyMask0 = pxEncodeSoftBodyIndex(softbodyId, vertIdx);
-                        const uint softBodyMask1 = pxEncodeSoftBodyIndex(softbodyId, primitiveIndex);
-                        if (!findFilter(pairsAddr, nbFilterPairs, softBodyMask0, softBodyMask1))
+                        // A filter pair for these two elements suppresses contact generation
+                        // between them; also checks whether the tetrahedron is filtered
+                        // against any vertex (5.12).
+                        const bool filtered =
+                            findVolumeVolumeFilter(filters, softbodyId, vertIdx, softbodyId, primitiveIndex) ||
+                            findVolumeVolumeFilter(filters, softbodyId, PXG_DREF_ANY_FEATURE, softbodyId, primitiveIndex);
+                        if (!filtered)
                         {
                             float3 a = tetVerts[tetIdx1.x].xyz;
                             float3 b = tetVerts[tetIdx1.y].xyz;
@@ -505,17 +486,13 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
             InterlockedAdd(Ptr<uint>(gSc.totalContactCount)[0], 1u, index);
 
             const float pen = bestDist;
-            const uint tetrahedronIdx0 = vertToSurfaceTetRemap[safeVert];
-            // NOTE the two "barycentric" slots carry the query point and the closest point,
-            // not barycentrics — that is what the CUDA writes (softbodySoftbodyMidPhase.cu
-            // :503) and sb_fem_contact_remap_to_sim turns them into real barycentrics.
-            writeSelfContact(index,
-                             float4(bestClosestP, 0.0f),
-                             float4(bestNormal, pen),
-                             float4(point, 0.0f),
-                             float4(bestClosestP, 0.0f),
-                             pxEncodeSoftBodyIndex(softbodyId, tetrahedronIdx0),
-                             pxEncodeSoftBodyIndex(softbodyId, bestPrimIndex));
+            // 5.12: writeVolumeVolumeContact -- the barycentric slots are NOT written; the remap
+            // takes side 0 from the vertex ref and side 1 from this point.
+            scWriter().writeVolumeVolumeContact(index,
+                                                float4(bestClosestP, 0.0f),
+                                                float4(bestNormal, pen),
+                                                PxgEncodeDeformableVertex(softbodyId, vertIdx),
+                                                PxgEncodeDeformableTetrahedron(softbodyId, bestPrimIndex));
         }
     }
     }

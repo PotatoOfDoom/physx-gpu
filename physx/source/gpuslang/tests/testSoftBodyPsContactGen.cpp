@@ -26,13 +26,13 @@
 
 // Verification of softBodyPsContactGenBda.slang -- sb_psContactGenLaunch (P9.39c).
 //
-// The mirror below is transcribed from softbodyPrimitives.cu:1961 (sbParticleCollision)
-// and the helpers it calls, NOT from the Slang.  That ordering is the whole point: a
+// The mirror below is transcribed from the PhysX 5.12 softbodyPrimitives.cu
+// (sbParticleCollision) and the helpers it calls, NOT from the Slang.  That ordering is the whole point: a
 // mirror written from the port reproduces the port's mistakes, which is how four
 // bit-exact fixtures in this corpus stayed green over a defect (P9.36).
 //
-// A SECOND host transcription of closestPtTetrahedron / computeTetBarycentric /
-// closestPtPointTriangle2 already exists in testNpSbPrim.cpp, for the Phase-1 twin of
+// A SECOND host transcription of closestPtTetrahedron / closestPtPointTriangle2 already
+// exists in testNpSbPrim.cpp, for the Phase-1 twin of
 // this collision.  This one is written independently rather than shared, so that two
 // hands had to agree; the two should be consolidated the next time either is touched,
 // which is noted rather than done inside a tranche about the contact gen.
@@ -40,21 +40,13 @@
 // ---------------------------------------------------------------------------
 // WHAT THE SCENE IS BUILT TO SEPARATE
 // ---------------------------------------------------------------------------
-// G1  mSortedToUnsortedMapping IS NOT THE IDENTITY.  The filter key is the UNSORTED
-//     index and everything else is the SORTED one; with an identity permutation a port
-//     that used one for both would pass.  The permutation here is a derangement, so
-//     NO particle maps to itself.
-//
-// G2  THE TWO FILTER LOOKUPS ARE SEPARATED.  One pair is filtered by the whole-body
-//     mask (tet id PX_MAX_NB_DEFORMABLE_VOLUME_TET) and a different one by its own
-//     tet mask.  Dropping either lookup leaves the other's pair still filtered, so
-//     both are asserted to be exercised.
-//
-// G3  THE FILTER'S index2 IS A REAL mUniqueId, AND ignoreIndex2 IS FALSE.  A pair
-//     array entry carries the RIGHT uid for one query and a WRONG uid for another
-//     that is otherwise identical, so the ignoreIndex2 = false path is separable --
-//     this is the property P9.39b added to the module and nothing else in the corpus
-//     exercises.
+// PHYSX 5.12 REMOVED THREE THINGS THIS SCENE USED TO SEPARATE, and the scene now pins
+// their ABSENCE instead: the particle-buffer filter chain (G1-G3: the sorted-to-unsorted
+// lookup, the whole-body / per-tet masks and the mUniqueId key -- mSortedToUnsortedMapping
+// is NULL here, so a port that still reads it faults), the rest distance (the two
+// penetration branches no longer subtract restDistances[cmIdx]; the argument is gone) and
+// the barycentric (writeVolumeContact writes none: the slot is poisoned and must come back
+// untouched; G7's -0 clamp therefore has nothing left to check here).
 //
 // G4  BOTH PENETRATION BRANCHES, AND THE GATE THAT ONLY ONE OF THEM HAS.  A particle
 //     strictly inside a tetrahedron takes the dot(n, n2) branch with NO contact
@@ -68,14 +60,16 @@
 //     the scene generates, so the dropped writes and the still-incrementing counter
 //     are both measured.
 //
-// G7  THE BARYCENTRIC CLAMP KEEPS -0 (P9.86).  Tet 7 is INVERTED and particle 14 sits
-//     in its vertex-a region, so closestP == a exactly and v = w = x = +0 / -1 = -0.
-//     PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) on float selects keeps -0; a GLSL
-//     FClamp spelling (llvmpipe maxps) would store +0.  Compared bitwise in cm0.
+// G8  THE 5.12 RECORD.  The pair info is (PxgEncodeParticleRef(system, sorted index),
+//     PxgEncodeDeformableTetrahedron(softbody, tet)), and the particle sort key is ref0 in
+//     contactByParticle with its low 32 bits (PxgGetContactSortKey) in
+//     tempContactByParticle -- compared against the real 5.12 host encoders.
 
 #include "pxgTestFramework.h"
 #include "PxgSoftBody.h"
 #include "PxgParticleSystem.h"
+#include "PxgSimulationCoreDesc.h"   // PxgEncodeParticleRef / PxgEncodeDeformableTetrahedron
+#include "PxgDeformableContactWriters.h"   // sizeof(PxgParticleDbContactWriter)
 
 #include <algorithm>
 #include <cmath>
@@ -90,31 +84,27 @@ using namespace pxgtest;
 using namespace physx;
 
 // ---------------------------------------------------------------------------
-// push constants -- softbodyPrimitives.cu:2086, in order.  The by-value
-// PxgFEMContactWriter tail takes alignment 16 (PxgVulkanCudaContext.cpp:93-101), so
-// the blob is 192 and not the 184 a naive sum of the parts gives.
+// push constants -- softbodyPrimitives.cu (5.12) sb_psContactGenLaunch, in order.  The
+// by-value PxgParticleDbContactWriter tail is 72 bytes, paramAlign 8, so it lands at @88.
 // ---------------------------------------------------------------------------
 struct SbPsCgPush
 {
     float toleranceLength; uint32_t pad4;
-    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes,
-             particleSystems, softbodies, filterPairs;
-    uint32_t numFilterPairs, stackSizeBytes;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, particleSystems, softbodies;
+    uint32_t stackSizeBytes, pad60;
     uint64_t stackPtr, midphasePairsNum, stackSizeNeeded;
-    uint64_t pad104;
     uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo,
-             w_totalContactCount, w_contactByX, w_tempContactByX,
-             w_contactIndexSortedByX, w_contactSortedByX;
-    uint32_t w_maxNumContacts, pad188;
+             w_totalContactCount, w_contactByParticle, w_tempContactByParticle,
+             w_contactIndexSortedByParticle;
+    uint32_t w_maxNumContacts, pad156;
 };
-static_assert(sizeof(SbPsCgPush) == 192, "sb_psContactGen blob must be 192 bytes");
-static_assert(offsetof(SbPsCgPush, filterPairs) == 64, "filterPairs @64");
-static_assert(offsetof(SbPsCgPush, numFilterPairs) == 72, "numFilterPairs @72");
-static_assert(offsetof(SbPsCgPush, stackSizeBytes) == 76, "stackSizeBytes @76");
-static_assert(offsetof(SbPsCgPush, stackPtr) == 80, "stackPtr @80");
-static_assert(offsetof(SbPsCgPush, stackSizeNeeded) == 96, "stackSizeNeeded @96");
-static_assert(offsetof(SbPsCgPush, w_outPoint) == 112, "the writer is 16-ALIGNED at 112");
-static_assert(offsetof(SbPsCgPush, w_maxNumContacts) == 184, "maxNumContacts @184");
+static_assert(sizeof(SbPsCgPush) == 160, "sb_psContactGen blob must be 160 bytes (5.12)");
+static_assert(offsetof(SbPsCgPush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(SbPsCgPush, stackPtr) == 64, "stackPtr @64");
+static_assert(offsetof(SbPsCgPush, stackSizeNeeded) == 80, "stackSizeNeeded @80");
+static_assert(offsetof(SbPsCgPush, w_outPoint) == 88, "the 72-byte writer is 8-aligned at 88");
+static_assert(offsetof(SbPsCgPush, w_maxNumContacts) == 152, "maxNumContacts @152");
+static_assert(sizeof(PxgParticleDbContactWriter) == 72, "PxgParticleDbContactWriter is 72 bytes");
 
 struct CmIn { uint32_t shapeRef0, shapeRef1, cacheRef0, cacheRef1; };
 struct ShapeH
@@ -129,13 +119,6 @@ struct U4 { uint32_t x, y, z, w; };
 
 static const uint32_t GEOM_PARTICLESYSTEM_G = 6u;
 static const uint32_t GEOM_TETRAHEDRONMESH_G = 7u;
-static const uint32_t MAX_NB_TET = 0x000fffffu;   // PxDeformableVolume.h:57
-static const uint32_t BITSHIFT_TET = 20u;         // PxgSimulationCoreDesc.h:40
-
-// PxgNonRigidFilterPair (PxgSimulationCoreDesc.h:235), 16 B.
-struct PairNR { uint32_t i0lo, i0hi, i1, i2; };
-static_assert(sizeof(PairNR) == 16, "PxgNonRigidFilterPair is 16 bytes");
-
 // ---------------------------------------------------------------------------
 // host vector math -- plain float, evaluated in the engine's written order
 // ---------------------------------------------------------------------------
@@ -290,43 +273,6 @@ static bool allPlanesNonNegative(V3 p, V3 a, V3 b, V3 c, V3 d)
     return s0 >= 0.0f && s1 >= 0.0f && s2 >= 0.0f && s3 >= 0.0f;
 }
 
-// deformableCollision.cuh:96.  Four SEPARATE divides; the sum is ((1-v)-w)-x.
-static void computeTetBarycentric(V3 a, V3 b, V3 c, V3 d, V3 point, F4& bary)
-{
-    const V3 ba = vsub(b, a), ca = vsub(c, a), da = vsub(d, a), pa = vsub(point, a);
-    const float detBcd = vdot(ba, vcross(ca, da));
-    const float v = vdot(pa, vcross(ca, da)) / detBcd;
-    const float w = vdot(ba, vcross(pa, da)) / detBcd;
-    const float x = vdot(ba, vcross(ca, pa)) / detBcd;
-    const float u = 1.0f - v - w - x;
-    // PxClamp(t, 0, 1) = PxMin(1, PxMax(0, t)) (PxMath.h:142-146) with the float
-    // selects of PxUnixMathIntrinsics.h:116-125: -0 stays -0 (G7).  Never std::max/fmax.
-    auto cl = [](float t) { const float lo = (0.0f > t) ? 0.0f : t; return (1.0f < lo) ? 1.0f : lo; };
-    bary = F4{ cl(u), cl(v), cl(w), cl(x) };
-}
-
-// deformableElementFilter.cuh:128 with ignoreIndex2 = false -- the three-key search.
-static bool findNR3(const std::vector<PairNR>& p, uint32_t id0, uint32_t id1, uint32_t id2)
-{
-    uint32_t l = 0, r = uint32_t(p.size());
-    while (l < r)
-    {
-        const uint32_t mid = (l + r) / 2u;
-        const PairNR& e = p[mid];
-        int cmp = 0;
-        const uint64_t q0 = uint64_t(id0), e0 = (uint64_t(e.i0hi) << 32) | e.i0lo;
-        if (q0 < e0) cmp = -1;
-        else if (e0 < q0) cmp = 1;
-        else if (id1 < e.i1) cmp = -1;
-        else if (id1 > e.i1) cmp = 1;
-        else if (id2 < e.i2) cmp = -1;
-        else if (id2 > e.i2) cmp = 1;
-        if (cmp == 0) return true;            // ignoreIndex2 == false: no disjunct
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
-
 struct DevB { PxgBufferHandle h = 0; uint64_t addr = 0; };
 template <class T> static DevB mk(PxgSlangComputeDevice* dev, const std::vector<T>& v)
 {
@@ -440,42 +386,16 @@ PXG_TEST(softBodyPsContactGen)
     const uint32_t NB_PARTICLES = uint32_t(parts.size());
     DevB bParts = mk(dev, parts);
 
-    // ---- G1: a DERANGEMENT.  No particle maps to itself, so using the sorted index
-    // where the engine uses the unsorted one (or the reverse) changes every filter
-    // query.  With the identity here the whole S3 trap would be untestable.
-    const std::vector<uint32_t> sortedToUnsorted =
-        { 3u, 5u, 6u, 0u, 2u, 4u, 1u, 9u, 7u, 8u, 13u, 12u, 11u, 14u, 10u };
-    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
-        PXG_CHECK_MSG(sortedToUnsorted[i] != i,
-                      "sortedToUnsorted[%u] == %u is a FIXED POINT; the mapping must be a "
-                      "derangement or the sorted/unsorted confusion (G1) is invisible",
-                      i, i);
-    DevB bMap = mk(dev, sortedToUnsorted);
-
-    // ---- the particle buffers behind the filter chain (P9.39b).  Two buffers with
-    // DIFFERENT unique ids, so which one the runsum selects is observable.
-    const uint32_t SIMBUF_STRIDE = 88u;
-    const uint32_t UID[2] = { 4242u, 777u };
-    std::vector<uint32_t> simBufs(2u * SIMBUF_STRIDE / 4u, 0u);
-    for (uint32_t b = 0; b < 2u; ++b)
-        simBufs[b * (SIMBUF_STRIDE / 4u) + 80u / 4u] = UID[b];      // mUniqueId @80
-    DevB bSim = mk(dev, simBufs);
-    const std::vector<uint32_t> runsum = { 0u, 4u };                // buffer 0: 0..3, 1: 4..
-    DevB bRun = mk(dev, runsum);
-    auto uidOf = [&](uint32_t unsortedIdx) { return unsortedIdx < 4u ? UID[0] : UID[1]; };
-
     std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
     std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
     psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bParts.addr));
-    psArr[PS_ID].mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bMap.addr));
+    // 5.12 reads neither the sorted-to-unsorted map nor the particle buffers here: NULL, so
+    // a port that still runs the 5.6.1 filter chain faults rather than passing.
+    psArr[PS_ID].mSortedToUnsortedMapping = nullptr;
     psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
-    psArr[PS_ID].mCommonData.mNumParticleBuffers = 2u;
-    psArr[PS_ID].mParticleSimBuffers =
-        reinterpret_cast<PxgParticleSimBuffer*>(size_t(bSim.addr));
-    psArr[PS_ID].mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRun.addr));
     DevB bPs = mk(dev, psArr);
-    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 656,
-                  "PXG_PARTICLE_SYSTEM_STRIDE in pxgSlangParticleDesc.slang is 656 and must "
+    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 608,
+                  "PXG_PARTICLE_SYSTEM_STRIDE in pxgSlangParticleDesc.slang is 608 and must "
                   "equal sizeof(PxgParticleSystem), which is %zu", sizeof(PxgParticleSystem));
 
     // ---- softbody descriptor
@@ -505,65 +425,22 @@ PXG_TEST(softBodyPsContactGen)
     DevB bCms = mk(dev, cms);
     std::vector<float> cd = { CD_PARTICLE, CD_SOFTBODY };
     DevB bCd = mk(dev, cd);
-    // DIFFERENT per manager, and neither zero: restDistance shifts the penetration in
-    // BOTH branches, so a port that dropped it or read the wrong index is separable.
-    std::vector<float> rest = { 0.03125f, 0.0625f };
-    DevB bRest = mk(dev, rest);
     std::vector<float> xf(2 * 8, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;   // ABI parity only
     DevB bXf = mk(dev, xf);
 
-    auto encSb = [&](uint32_t tet) { return (SB_ID << BITSHIFT_TET) | tet; };
-
-    // ---- G2 / G3: the filter pairs.  index0 is the UNSORTED particle index, index1 is
-    // the softbody mask, index2 is the owning buffer's mUniqueId, and the search runs
-    // with ignoreIndex2 = FALSE.
-    //
-    //  * sorted particle 8 -> unsorted 7 (uid 777): filtered against the WHOLE BODY,
-    //    so only the tetFullMask lookup can catch it.  It must be a particle that WOULD
-    //    otherwise generate a contact, or dropping the whole-body lookup changes
-    //    nothing: the sweep's first run put it on a particle too far from every tet to
-    //    touch one, and both tetFullMask mutants stayed green.  Equally it must NOT be
-    //    the particle that exercises the inside branch -- a whole-body entry filters
-    //    against EVERY tet, and the version before that deleted the inside branch from
-    //    the scene entirely.  Particle 8 is outside tet 4 and within the shell, so it
-    //    satisfies both;
-    //  * sorted particle 2 -> unsorted 6 (uid 777): filtered against tet 2 by its OWN
-    //    tet mask, so only the tetMask lookup can catch it;
-    //  * sorted particle 0 -> unsorted 3, whose real uid is 4242: an entry carrying
-    //    777 instead, which must NOT match.  That is the ignoreIndex2 = false property
-    //    P9.39b added and nothing else in the corpus exercises.
-    std::vector<PairNR> pairs = {
-        { 7u, 0u, encSb(MAX_NB_TET), UID[1] },   // sorted 8 -> unsorted 7, uid 777
-        { 6u, 0u, encSb(2u),         UID[1] },   // sorted 2 -> unsorted 6, uid 777
-        { 3u, 0u, encSb(0u),         UID[1] },   // sorted 0 -> unsorted 3 IS uid 4242, so
-                                                 // this entry must NOT match (G3)
-    };
-    std::sort(pairs.begin(), pairs.end(), [](const PairNR& a, const PairNR& b) {
-        if (a.i0hi != b.i0hi) return a.i0hi < b.i0hi;
-        if (a.i0lo != b.i0lo) return a.i0lo < b.i0lo;
-        if (a.i1 != b.i1) return a.i1 < b.i1;
-        return a.i2 < b.i2;
-    });
-    DevB bPairs = mk(dev, pairs);
-
     // ---- the midphase pairs.  ONE MANAGER PER DISPATCH.
     //
-    // Not an arbitrary split.  The identity a contact carries is
-    // (pairInd0, pairInd1) = (particle, system, tet mask) and that does NOT mention
-    // the contact manager, so with both managers in one dispatch the two contacts for
-    // the same particle-tet pair are indistinguishable in the output while differing
-    // in restDistance.  My first version compared as one set and matched contacts
-    // against the OTHER manager's expected entry; the penetrations were off by exactly
-    // rest[1] - rest[0], which is how it was found.  One manager per dispatch keeps the
-    // key unique AND keeps rest[cmIdx] separable, since the two dispatches use
-    // different rest values.
+    // The identity a contact carries is (particle ref, tet ref) and that does NOT mention the
+    // contact manager, so with both managers in one dispatch the two contacts for the same
+    // particle-tet pair would be indistinguishable in the output.  One manager per dispatch
+    // keeps the key unique.
     struct Expect
     {
-        uint32_t pair0lo, pair0hi, pair1;
-        F4 point, normalPen, bary;
+        uint64_t ref0, ref1;
+        F4 point, normalPen;
     };
 
-    uint32_t skippedHint = 0u, filteredFull = 0u, filteredTet = 0u, wrongUidNotFiltered = 0u;
+    uint32_t skippedHint = 0u;
     uint32_t insideBranch = 0u, outsideBranch = 0u, droppedByDistance = 0u, n2Substituted = 0u;
 
     // `stackLimit` is min(numFound, stackSize) -- the kernel processes only that many
@@ -577,22 +454,18 @@ PXG_TEST(softBodyPsContactGen)
         if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM_G)
         { sP = cin.shapeRef1; cP = cin.cacheRef1; sS = cin.shapeRef0; cS = cin.cacheRef0; }
         const float cDistance = cd[cP] + cd[cS];
-        const float restDistance = rest[cmIdx];
         const uint32_t particleSystemId = shapes[sP].particleOrSoftbodyId;
+        const uint32_t softbodyId = shapes[sS].particleOrSoftbodyId;
 
         for (uint32_t particleIndex = 0; particleIndex < NB_PARTICLES; ++particleIndex)
             for (uint32_t tetrahedronIdx = 0; tetrahedronIdx < NB_TETS; ++tetrahedronIdx)
             {
                 if (seen++ >= stackLimit) continue;      // past the clamp: never read
                 const U4& ti = tets[tetrahedronIdx];
-                const uint32_t unsorted = sortedToUnsorted[particleIndex];
-                const uint32_t tetMask = encSb(tetrahedronIdx);
-                const uint32_t uid = uidOf(unsorted);
                 const uint32_t surfaceMask = hints[tetrahedronIdx];
 
+                // 5.12: the surface hint is the only gate (the filter chain is gone).
                 if (surfaceMask == 0u) { ++skippedHint; continue; }
-                if (findNR3(pairs, unsorted, encSb(MAX_NB_TET), uid)) { ++filteredFull; continue; }
-                if (findNR3(pairs, unsorted, tetMask, uid)) { ++filteredTet; continue; }
 
                 const F4& av = verts[ti.x]; const F4& bv = verts[ti.y];
                 const F4& cv = verts[ti.z]; const F4& dv = verts[ti.w];
@@ -603,18 +476,16 @@ PXG_TEST(softBodyPsContactGen)
 
                 const bool inside = allPlanesNonNegative(pp, a, b, c, d);
 
-                F4 bary{ 0, 0, 0, 0 };
                 V3 closestP{ 0, 0, 0 }, n2{ 0, 0, 0 };
                 float sqDist = 3.4028234663852886e+38f;
                 closestPtTetrahedron(pp, surfaceMask, a, b, c, d, n2, closestP, sqDist);
-                computeTetBarycentric(a, b, c, d, closestP, bary);
 
                 V3 n = vneg(vsub(pp, closestP));
                 float pen;
                 if (inside)
                 {
                     ++insideBranch;
-                    pen = vdot(n, n2) - restDistance;
+                    pen = vdot(n, n2);
                     n = n2;
                 }
                 else
@@ -624,22 +495,17 @@ PXG_TEST(softBodyPsContactGen)
                     ++outsideBranch;
                     pen = normalizeInPlace(n);
                     if (sqDist < 1e-8f || vdot(n, n2) < 0.8f) { n = n2; ++n2Substituted; }
-                    pen -= restDistance;
                 }
 
                 Expect e;
-                e.pair0lo = particleIndex; e.pair0hi = particleSystemId;
-                e.pair1 = tetMask;
+                e.ref0 = PxgEncodeParticleRef(particleSystemId, particleIndex);
+                e.ref1 = PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx);
                 e.point = F4{ pp.x, pp.y, pp.z, 0.0f };
                 e.normalPen = F4{ n.x, n.y, n.z, pen };
-                e.bary = bary;
                 out.push_back(e);
             }
         return out;
     };
-
-    for (const PairNR& pr : pairs)
-        if (pr.i2 != uidOf(pr.i0lo)) ++wrongUidNotFiltered;
 
     const uint32_t POISON = 0xCDCDCDCDu;
 
@@ -660,19 +526,19 @@ PXG_TEST(softBodyPsContactGen)
         const uint32_t slots = maxContacts + 4u;
         std::vector<F4> zero4(slots, F4{ 0, 0, 0, 0 });
         std::vector<uint32_t> poisonW(slots * 4u, POISON);
+        std::vector<uint32_t> poisonBary(slots * 4u, POISON);
         std::vector<uint32_t> poison2(slots * 2u, POISON);
         std::vector<uint32_t> poison1(slots, POISON);
         std::vector<uint32_t> one = { 0u };
-        DevB bPoint = mk(dev, zero4), bNP = mk(dev, zero4), bBary = mk(dev, zero4);
+        DevB bPoint = mk(dev, zero4), bNP = mk(dev, zero4), bBary = mk(dev, poisonBary);
         DevB bInfo = mk(dev, poisonW), bByX = mk(dev, poison2), bTemp = mk(dev, poison1);
         DevB bIdx = mk(dev, poison1), bTotal = mk(dev, one), bNeeded = mk(dev, one);
 
         SbPsCgPush p = {};
         p.toleranceLength = 1.0f;
         p.cmInputs = bCms.addr; p.transformCache = bXf.addr; p.contactDistance = bCd.addr;
-        p.restDistance = bRest.addr; p.gpuShapes = bShapes.addr;
+        p.gpuShapes = bShapes.addr;
         p.particleSystems = bPs.addr; p.softbodies = bSb.addr;
-        p.filterPairs = bPairs.addr; p.numFilterPairs = uint32_t(pairs.size());
         // stackPairs may be SMALLER than nbStack: numPairs = min(numFound, stackSize)
         // clamps the loop, while stackSizeNeededOnDevice must report the UNCLAMPED
         // count.  With the two equal, using the clamped one is unobservable, which is
@@ -682,9 +548,8 @@ PXG_TEST(softBodyPsContactGen)
         p.stackSizeNeeded = bNeeded.addr;
         p.w_outPoint = bPoint.addr; p.w_outNormalPen = bNP.addr;
         p.w_outBarycentric = bBary.addr; p.w_outContactInfo = bInfo.addr;
-        p.w_totalContactCount = bTotal.addr; p.w_contactByX = bByX.addr;
-        p.w_tempContactByX = bTemp.addr; p.w_contactIndexSortedByX = bIdx.addr;
-        p.w_contactSortedByX = 0ull;
+        p.w_totalContactCount = bTotal.addr; p.w_contactByParticle = bByX.addr;
+        p.w_tempContactByParticle = bTemp.addr; p.w_contactIndexSortedByParticle = bIdx.addr;
         p.w_maxNumContacts = maxContacts;
 
         Kernel k("softBodyPsContactGenBda.spv", "sb_psContactGenLaunch", {}, sizeof(SbPsCgPush));
@@ -704,7 +569,7 @@ PXG_TEST(softBodyPsContactGen)
         const uint32_t written = std::min<uint32_t>(maxContacts, uint32_t(exp.size()));
         const std::vector<F4> gPoint = downloadBuffer<F4>(dev, bPoint.h, slots);
         const std::vector<F4> gNP = downloadBuffer<F4>(dev, bNP.h, slots);
-        const std::vector<F4> gBary = downloadBuffer<F4>(dev, bBary.h, slots);
+        const std::vector<uint32_t> gBary = downloadBuffer<uint32_t>(dev, bBary.h, slots * 4u);
         const std::vector<uint32_t> gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, slots * 4u);
         const std::vector<uint32_t> gByX = downloadBuffer<uint32_t>(dev, bByX.h, slots * 2u);
         const std::vector<uint32_t> gTemp = downloadBuffer<uint32_t>(dev, bTemp.h, slots);
@@ -716,35 +581,37 @@ PXG_TEST(softBodyPsContactGen)
         uint32_t matched = 0u, mismatched = 0u;
         for (uint32_t i = 0; i < written; ++i)
         {
-            const uint32_t p0lo = gInfo[i * 4 + 0], p0hi = gInfo[i * 4 + 1],
-                           p1 = gInfo[i * 4 + 2];
+            const uint64_t r0 = uint64_t(gInfo[i * 4 + 0]) | (uint64_t(gInfo[i * 4 + 1]) << 32);
+            const uint64_t r1 = uint64_t(gInfo[i * 4 + 2]) | (uint64_t(gInfo[i * 4 + 3]) << 32);
             const Expect* found = nullptr;
             for (const Expect& e : exp)
-                if (e.pair0lo == p0lo && e.pair0hi == p0hi && e.pair1 == p1) { found = &e; break; }
+                if (e.ref0 == r0 && e.ref1 == r1) { found = &e; break; }
             if (!found)
             {
                 ++mismatched;
-                std::printf("  %s slot %u: pairInd0 (%u, %u) pairInd1 %u is not in the mirror\n",
-                            what, i, p0lo, p0hi, p1);
+                std::printf("  %s slot %u: refs (%016llx, %016llx) are not in the mirror\n",
+                            what, i, (unsigned long long)r0, (unsigned long long)r1);
                 continue;
             }
+            const uint64_t byX = uint64_t(gByX[i * 2 + 0]) | (uint64_t(gByX[i * 2 + 1]) << 32);
+            // G8 / writeVolumeContact: no barycentric -- the poisoned slot is untouched.
+            const bool baryUntouched = gBary[i * 4 + 0] == POISON && gBary[i * 4 + 1] == POISON &&
+                                       gBary[i * 4 + 2] == POISON && gBary[i * 4 + 3] == POISON;
             const bool ok = sameF4(gPoint[i], found->point) && sameF4(gNP[i], found->normalPen) &&
-                            sameF4(gBary[i], found->bary) &&
-                            gByX[i * 2 + 0] == found->pair0lo && gByX[i * 2 + 1] == found->pair0hi &&
-                            gTemp[i] == found->pair0lo && gIdx[i] == i;
+                            baryUntouched && byX == found->ref0 &&
+                            gTemp[i] == PxgGetContactSortKey(found->ref0) && gIdx[i] == i;
             if (!ok)
             {
                 ++mismatched;
-                std::printf("  %s slot %u (particle %u, tet-mask %u):\n", what, i, p0lo, p1);
+                std::printf("  %s slot %u (refs %016llx, %016llx):\n", what, i,
+                            (unsigned long long)r0, (unsigned long long)r1);
                 std::printf("    point  got (%a %a %a %a) want (%a %a %a %a)\n",
                             gPoint[i].x, gPoint[i].y, gPoint[i].z, gPoint[i].w,
                             found->point.x, found->point.y, found->point.z, found->point.w);
                 std::printf("    nrmPen got (%a %a %a %a) want (%a %a %a %a)\n",
                             gNP[i].x, gNP[i].y, gNP[i].z, gNP[i].w, found->normalPen.x,
                             found->normalPen.y, found->normalPen.z, found->normalPen.w);
-                std::printf("    bary   got (%a %a %a %a) want (%a %a %a %a)\n",
-                            gBary[i].x, gBary[i].y, gBary[i].z, gBary[i].w,
-                            found->bary.x, found->bary.y, found->bary.z, found->bary.w);
+                std::printf("    bary   %s\n", baryUntouched ? "untouched" : "WRITTEN (5.12 writes none)");
                 std::printf("    byX (%u,%u) temp %u idx %u\n",
                             gByX[i * 2 + 0], gByX[i * 2 + 1], gTemp[i], gIdx[i]);
                 continue;
@@ -774,43 +641,13 @@ PXG_TEST(softBodyPsContactGen)
     // Coverage FIRST: every mechanism the scene claims to separate must have fired.
     // These run before the comparison because a scene that never enters a branch makes
     // a green comparison meaningless -- which is exactly what happened on the first run,
-    // where a whole-body filter entry had silently deleted the inside branch.
+    // where a (5.6.1) whole-body filter entry had silently deleted the inside branch.
     PXG_CHECK_MSG(skippedHint > 0u, "no pair was skipped by surfaceMask == 0 (G5)");
-    PXG_CHECK_MSG(filteredFull > 0u, "no pair was filtered by the WHOLE-BODY mask (G2)");
-    PXG_CHECK_MSG(filteredTet > 0u, "no pair was filtered by its OWN tet mask (G2)");
-    PXG_CHECK_MSG(wrongUidNotFiltered > 0u,
-                  "no filter entry carries a uid that does NOT belong to its particle, so "
-                  "ignoreIndex2 = false (G3) is not separable from true");
     PXG_CHECK_MSG(insideBranch > 0u, "the inside-the-tetrahedron branch never ran (G4)");
     PXG_CHECK_MSG(outsideBranch > 0u, "the outside branch never ran (G4)");
     PXG_CHECK_MSG(droppedByDistance > 0u,
                   "no pair was dropped by the squared contact-distance test, so the gate "
                   "that exists only in the outside branch (G4) is not exercised");
-    PXG_CHECK_MSG(rest[0] != rest[1],
-                  "the two managers must carry DIFFERENT rest distances or reading the "
-                  "wrong one is invisible");
-
-    // G7 (P9.86): an inverted tet with a vertex-region particle gives -0 barycentric
-    // lanes, which PxClamp keeps and GLSL FClamp would flush to +0.
-    uint32_t baryNegZeroLanes = 0u;
-    const Expect* g7 = nullptr;
-    for (const Expect& e : expA)
-    {
-        const float lanes[3] = { e.bary.y, e.bary.z, e.bary.w };
-        for (float t : lanes) if (t == 0.0f && std::signbit(t)) ++baryNegZeroLanes;
-        if (e.pair0lo == 14u && e.pair1 == encSb(7u)) g7 = &e;
-    }
-    PXG_CHECK_MSG(baryNegZeroLanes > 0u,
-                  "no cm0 contact carries a -0 barycentric lane: PxClamp(-0,0,1) = -0 "
-                  "(float selects, deformableCollision.cuh:133-136) vs FClamp's +0 is "
-                  "unexercised (G7, P9.86)");
-    uint32_t g7b[4] = { 0u, 0u, 0u, 0u };
-    if (g7) std::memcpy(g7b, &g7->bary, sizeof(g7b));
-    PXG_CHECK_MSG(g7 && g7b[0] == 0x3f800000u && g7b[1] == 0x80000000u &&
-                  g7b[2] == 0x80000000u && g7b[3] == 0x80000000u,
-                  "particle 14 x inverted tet 7 must be a cm0 contact with mirror barycentric "
-                  "(1,-0,-0,-0); %s %08x %08x %08x %08x", g7 ? "got" : "ABSENT",
-                  g7b[0], g7b[1], g7b[2], g7b[3]);
     PXG_CHECK_MSG(mirrorFor(1u, NB_STACK).size() > expB.size(),
                   "the clamped stack tail must contain a contact");
 
@@ -825,10 +662,9 @@ PXG_TEST(softBodyPsContactGen)
     const uint32_t wroteB = runOne(1u, MAX_B, CLAMPED_B, expB, "cm1/overflow+short-stack");
 
     std::printf("    [ note ] cm0: %zu contacts (%u written); cm1: %zu contacts (%u written, "
-                "%u dropped by the writer); skipped %u by hint, %u by whole-body mask, %u by "
-                "tet mask; branches %u inside, %u outside (%u took n2), %u dropped by distance\n",
+                "%u dropped by the writer); skipped %u by hint; branches %u inside, %u outside "
+                "(%u took n2), %u dropped by distance\n",
                 expA.size(), wroteA, expB.size(), wroteB, uint32_t(expB.size()) - wroteB,
-                skippedHint, filteredFull, filteredTet, insideBranch, outsideBranch,
-                n2Substituted, droppedByDistance);
+                skippedHint, insideBranch, outsideBranch, n2Substituted, droppedByDistance);
 }
 } // namespace

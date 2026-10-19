@@ -32,7 +32,14 @@
 #     earlier in the body is dropped -- the box copy declares `triVertInds`
 #     twice from `cloth.mTriangleVertexIndices`;
 #   * `T x = PxLoad3(e); ... const PxVec3 v = x;` is folded to
-#     `const PxVec3 v = PxLoad3(e);`.
+#     `const PxVec3 v = PxLoad3(e);`;
+#   * (PhysX 5.12) a declaration whose right-hand side is a plain FIELD READ
+#     (`T* x = obj.mField;`, no call, no index, no arithmetic) is sunk to just
+#     before the first line that uses `x`.  5.12's clothConvexCollision binds
+#     `triVertInds = cloth.mTriangleVertexIndices_ownedEdges` right after
+#     `cloth`, the box twin forty lines later; reading a pointer field of a
+#     const reference has no effect to order, so where it is spelled is not part
+#     of the kernel.
 #
 # Every one of those rules exists because a real, checked-by-hand difference
 # needed it.  A rule that is not needed by some pair does not belong here: the
@@ -128,6 +135,31 @@ LOAD3 = re.compile(r'^(?:const\s+)?PxVec3\s+([A-Za-z_]\w*)\s*=\s*PxLoad3\((.+)\)
 ALIAS = re.compile(r'^(?:const\s+)?PxVec3\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*);$')
 
 
+FIELD_DECL = re.compile(r'^(?:const\s+)?[A-Za-z_][\w:<>\s]*?\**\s*'
+                        r'([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*(?:\.|->)[A-Za-z_]\w*;$')
+
+
+def sink_field_decls(lines):
+    """Move each pure field-read declaration to just before its first use."""
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        m = FIELD_DECL.match(out[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        use = re.compile(r'\b' + re.escape(name) + r'\b')
+        j = next((k for k in range(i + 1, len(out)) if use.search(out[k])), None)
+        if j is None or j == i + 1:
+            i += 1
+            continue
+        decl = out.pop(i)
+        out.insert(j - 1, decl)
+        # the line now at i is new; examine it next
+    return out
+
+
 def canonicalise(lines, renames):
     """Apply the documented normalisation rules, in order."""
     out = []
@@ -171,7 +203,7 @@ def canonicalise(lines, renames):
             final.append('PxVec3 %s = PxLoad3(%s);' % (name, expr))
             continue
         final.append(l)
-    return final
+    return sink_field_decls(final)
 
 
 def selftest():

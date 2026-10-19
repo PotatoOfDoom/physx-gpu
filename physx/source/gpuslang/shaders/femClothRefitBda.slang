@@ -132,16 +132,16 @@ static const uint WARP = 32u;
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the CUDA refitBound arg pack
-// (PxgFEMClothCore.cpp:563): { PxgFEMCloth* gFemClothes, const PxU32* activeFemClothes,
-// const PxU32 nbActiveFemClothes, PxReal* contactDists, PxReal* speculativeCCDContactOffset,
+// (PxgFEMClothCore.cpp:563): { PxgFEMCloth* gFemClothes, const PxU32* activeFemCloths,
+// const PxU32 nbActiveFemCloths (5.12 spelling; was *Clothes), PxReal* contactDists, PxReal* speculativeCCDContactOffset,
 // PxBounds3* boundArray, const PxU32* elemIndex, const PxReal nbCollisionPairUpdatesPerTimestep,
 // const PxU8* updateContactPairs } -> 72-byte natural-alignment blob.
 // (ABI row {8,8,4,8,8,8,8,4,8}.)
 struct RefitParams
 {
     uint64_t femClothes;                        // @0
-    uint64_t activeFemClothes;                  // @8
-    uint nbActiveFemClothes;                    // @16
+    uint64_t activeFemCloths;                  // @8
+    uint nbActiveFemCloths;                    // @16
     uint _pad20;                                // @20 (tail-pad realigning the next pointer)
     uint64_t contactDists;                      // @24  (unused; ABI parity — the CUDA body
                                                 //       never reads it either)
@@ -264,7 +264,7 @@ void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
 
 // ---------------------------------------------------------------------------
 // cloth_refitBoundLaunch (FEMCloth.cu:338).
-// Dispatch: grid (nbActiveFemClothes, 1, 1), block (32, 1, 1).
+// Dispatch: grid (nbActiveFemCloths, 1, 1), block (32, 1, 1).
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -276,9 +276,9 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
 
     const uint idx = gtid.x;
     const uint blockIdx = gid.x;
-    if (blockIdx >= gP.nbActiveFemClothes) return;   // group-uniform
+    if (blockIdx >= gP.nbActiveFemCloths) return;   // group-uniform
 
-    const uint femClothId = Ptr<uint>(gP.activeFemClothes)[blockIdx];
+    const uint femClothId = Ptr<uint>(gP.activeFemCloths)[blockIdx];
 
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gP.femClothes);
 
@@ -297,7 +297,7 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
     const uint64_t remapAddr = depthInfoAddr + uint64_t(maxDepth) * DEPTHINFO_STRIDE;    // PxU32[]
 
     const uint64_t meshVerts = clothes[femClothId].mPosition_InvMass;
-    const uint64_t meshVertsIndices = clothes[femClothId].mTriangleVertexIndices;
+    const uint64_t meshVertsIndices = clothes[femClothId].mTriangleVertexIndices_ownedEdges;
 
     // each warp deals with one node; walk the depth levels bottom-up
     for (uint i = maxDepth; i > 0u; i--)

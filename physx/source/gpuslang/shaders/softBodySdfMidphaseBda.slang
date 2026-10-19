@@ -68,14 +68,15 @@
 //  T5. THE FILTER IS CONSULTED LAST, and it queries ONE index.  It runs after
 //      the separation, the normal and the world-space point are all computed,
 //      INSIDE `if (candidateContact)`, and it asks about the TET -- one
-//      PxEncodeSoftBodyIndex query, not the cloth kernel's conjunction over
-//      three vertices.  Moving it earlier changes nothing observable but moving
+//      findRigidVolumeFilter query (5.12: over the softbody's
+//      mRigidVolumeFilterPairs, keyed by the trimesh's cache ref).  Moving it earlier changes nothing observable but moving
 //      it OUT of the candidate test does: a tet that failed either gate is never
 //      asked about.
 //
-//  T6. THE WRITER IS writeContactNoBarycentric.  No barycentric array, and NO
-//      MATERIAL INDEX -- the fourth info dword is left exactly as it was, where
-//      the cloth sibling writes the rigid material with bit 31 cleared.
+//  T6. THE WRITER IS PxgRigidDbContactWriter::writeVolumeContact (5.12).  No
+//      barycentric, but -- NEW in 5.12 -- the trimesh's material index IS written
+//      (to the PxU16 stream); 5.6.1's writeContactNoBarycentric left the info's
+//      fourth dword alone.
 //
 //  T7. THE WORLD TRANSFORM HAPPENS BEFORE THE FILTER, inside the candidate
 //      branch, so by the time the write runs `contactPos` and `contactDir` are
@@ -119,29 +120,27 @@ import pxgSlangCommon;
 import pxgSlangSoftBodyDesc;
 import pxgSlangSdfTexture;
 import pxgSlangSdfCollision;
-import pxgSlangDefFilter;      // P9.35c: the filter, shared rather than copied
+import pxgSlangDefFilter;      // 5.12: findRigidVolumeFilter
+import pxgSlangDeformableRef;     // PxgEncodeDeformableTetrahedron
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 
 #include "pxgSlangSdfFind.slang"
 
 // sb_sdfMeshMidphaseGeneratePairsLaunch(PxReal tolerenceLength,
 //   PxgContactManagerInput*, PxsCachedTransform*, PxBounds3*, PxReal* contactDistance,
 //   PxReal* restDistance, PxgShape*, PxgSoftBody*, PxNodeIndex*,
-//   PxgRigidFilterPair*, PxU32 nbFilterPairs, PxgFEMContactWriter by value)
-// -> ABI row {4,8,8,8,8,8,8,8,8,8,4,80}, 176-byte blob, the writer @96.
+//   PxgRigidDbContactWriter by value)   (5.12: the filter pair arguments are gone)
+// -> ABI row {4,8,8,8,8,8,8,8,8,80}, 160-byte blob, the writer @80.
 //
-// P9.97b: THE WRITER IS AT @96, NOT @88.  The bridge places every argument at
+// P9.97b: THE WRITER IS PLACED BY paramAlign.  The bridge places every argument at
 // paramAlign(size) -- the largest power of two dividing the size, capped at 16
 // (PxgVulkanCudaContext.cpp paramAlign; pxgKernelAbiPushSize in PxgVulkanKernelAbi.cpp
-// does the same) -- and paramAlign(80) is 16, although alignof(PxgFEMContactWriter) is
-// only 8 (the P9.15e trap; femClothPsContactGenBda.slang says it for its own writer).
-// nbFilterPairs ends at @84, so @84..@96 is padding and the blob is 176 bytes.  Until
-// P9.97b this struct put the writer at its natural @88 in a 168-byte block, and so did
-// the fixture's SbSdfBlob, so every fixture agreed with the shader and none with the
-// engine: on the engine path w_outPoint read the bridge's zero padding and every later
-// writer field sat one slot off (w_totalContactCount was really outContactInfo,
-// w_maxNumContacts the low half of contactSortedByX).  check_push_block.py's join (R0
-// PAD-READ / R2 CUT) and testSoftBodySdfMid's softBodySdfMidphaseBridgeSized, which
-// launches through the bridge with the engine's host pack, now hold it.
+// does the same) -- and paramAlign(80) is 16, although the writer's alignof is only 8
+// (the P9.15e trap).  In 5.6.1 nbFilterPairs ended at @84 and the writer sat at @96 after
+// 12 bytes of padding (this struct once put it at its natural @88, and every writer field
+// read one slot off on the engine path).  In 5.12 the eight pointers end at @72, and the
+// bridge pads to @80 for the writer.  check_push_block.py's join
+// and testSoftBodySdfMid's bridge-sized launch hold it.
 struct SbSdfMidParams
 {
     float tolerenceLength;         // @0    T1: never read
@@ -154,49 +153,36 @@ struct SbSdfMidParams
     uint64_t gpuShapes;            // @48
     uint64_t softbodies;           // @56
     uint64_t shapeToRigidRemap;    // @64
-    uint64_t filterPairs;          // @72
-    uint nbFilterPairs;            // @80
-    uint _pad84;                   // @84
-    uint2 _pad88;                  // @88   paramAlign(80) = 16: the writer starts at @96
-    // ---- PxgFEMContactWriter (by value, 80B) @96 ----
-    uint64_t w_outPoint;             // @96
-    uint64_t w_outNormalPen;         // @104
-    uint64_t w_outBarycentric;       // @112
-    uint64_t w_outContactInfo;       // @120
-    uint64_t w_totalContactCount;    // @128
-    uint64_t w_contactByX;           // @136
-    uint64_t w_tempContactByX;       // @144
-    uint64_t w_contactIndexSortedByX; // @152
-    uint64_t w_contactSortedByX;     // @160
-    uint w_maxNumContacts;           // @168
-    uint _pad172;                    // @172 -> 176
+    uint64_t _pad72;               // @72   paramAlign(80) = 16: the writer starts at @80
+    // ---- PxgRigidDbContactWriter (by value, 80B) @80 ----
+    uint64_t w_outPoint;                  // @80
+    uint64_t w_outNormalPen;              // @88
+    uint64_t w_outBarycentric;            // @96  (unused: writeVolumeContact)
+    uint64_t w_outContactInfo;            // @104 PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;     // @112 PxU16*
+    uint64_t w_totalContactCount;         // @120
+    uint64_t w_contactByRigid;            // @128
+    uint64_t w_tempContactByRigid;        // @136
+    uint64_t w_contactIndexSortedByRigid; // @144
+    uint w_maxNumContacts;                // @152
+    uint _pad156;                         // @156 -> 160
 }
 
 [[vk::push_constant]] ConstantBuffer<SbSdfMidParams> gSb;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;     // PxGeometryType::eTETRAHEDRONMESH
-static const uint PXG_BITSHIFT_TET_ID = 20u;     // PxgSimulationCoreDesc.h:40
 
-// PxgFEMContactWriter::writeContactNoBarycentric (PxgFEMCore.h:428).
-// T6: the barycentric array is NOT written and the info's fourth dword is left
-// alone -- this overload sets only the pair indices.
-void sbWriteContactNoBarycentric(uint index, float4 contact, float4 normalPen,
-                                 uint2 pairInd0, uint pairInd1, uint2 rigidId)
+PxgRigidDbContactWriterGpu sbWriter()
 {
-    if (index >= gSb.w_maxNumContacts) return;
-
-    Ptr<uint2>(gSb.w_contactByX)[index] = rigidId;
-    Ptr<uint>(gSb.w_tempContactByX)[index] = rigidId.x;
-    Ptr<uint>(gSb.w_contactIndexSortedByX)[index] = index;
-
-    Ptr<float4>(gSb.w_outPoint)[index] = contact;
-    Ptr<float4>(gSb.w_outNormalPen)[index] = normalPen;
-
-    const uint64_t infoBase = gSb.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint>(infoBase)[0] = pairInd0.x;
-    Ptr<uint>(infoBase + 4UL)[0] = pairInd0.y;
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-    // The fourth dword is deliberately untouched.
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gSb.w_outPoint;                 w.outNormalPen = gSb.w_outNormalPen;
+    w.outBarycentric = gSb.w_outBarycentric;     w.outContactInfo = gSb.w_outContactInfo;
+    w.outRigidMaterialIndex = gSb.w_outRigidMaterialIndex;
+    w.totalContactCount = gSb.w_totalContactCount;
+    w.contactByRigid = gSb.w_contactByRigid;     w.tempContactByRigid = gSb.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gSb.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gSb.w_maxNumContacts;
+    return w;
 }
 
 // LoadShapePairWarp<eTETRAHEDRONMESH, eTRIANGLEMESH>: the softbody is whichever
@@ -307,7 +293,7 @@ void sb_sdfMeshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID,
         float sep = 0.0f;
         float3 contactDir = float3(0.0f, 0.0f, 0.0f);
         float3 contactPos = float3(0.0f, 0.0f, 0.0f);
-        uint pairId1 = 0u;
+        uint64_t tetRef = 0;
 
         if (ind < nbTets)
         {
@@ -349,9 +335,12 @@ void sb_sdfMeshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID,
                                                    sdfVertex2Shape(contactPos, mScale, mScaleRot));
                     contactDir = quatRotate(meshQ, contactDir);
 
-                    pairId1 = (sbId << PXG_BITSHIFT_TET_ID) | ind;
-                    // T5: LAST, one query, and only for a surviving candidate.
-                    if (dfFindRigidPair(gSb.filterPairs, gSb.nbFilterPairs, rigidId, pairId1))
+                    tetRef = PxgEncodeDeformableTetrahedron(sbId, ind);
+                    // T5: LAST, one query, and only for a surviving candidate.  A filter pair
+                    // for this rigid and tetrahedron suppresses contact generation (5.12).
+                    if (findRigidVolumeFilter(
+                            softBodyRigidVolumeFilters(gSb.softbodies + uint64_t(sbId) * PXG_SOFTBODY_STRIDE),
+                            dfNodeU64(rigidId), trimeshCacheRef, sbId, ind))
                         candidateContact = false;
                 }
             }
@@ -363,10 +352,10 @@ void sb_sdfMeshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID,
 
         if (candidateContact)
         {
-            sbWriteContactNoBarycentric(contactIndex,
-                                        float4(contactPos, restDist),
-                                        float4(contactDir, sep),
-                                        rigidId, pairId1, rigidId);
+            sbWriter().writeVolumeContact(contactIndex,
+                                          float4(contactPos, restDist),
+                                          float4(contactDir, sep),
+                                          dfNodeU64(rigidId), trimeshShape.materialIndex, tetRef);
         }
     }
 }

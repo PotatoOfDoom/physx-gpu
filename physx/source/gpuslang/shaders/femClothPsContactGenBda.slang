@@ -29,8 +29,9 @@
 // P9.30 -- cloth_psContactGenLaunch
 // gpunarrowphase/src/CUDA/femClothPrimitives.cu:2866 (wrapper), :2759
 // (clothParticleCollision), :114 (computeBarycentric),
-// GuDistancePointTriangle.h:44 (closestPtPointTriangle2), PxgFEMCore.h:467
-// (PxgFEMContactWriter::writeContact) -- all read in full.
+// GuDistancePointTriangle.h:44 (closestPtPointTriangle2) and, in PhysX 5.12,
+// PxgDeformableContactWriters.h (PxgParticleDbContactWriter::writeSurfaceContact)
+// -- all read in full.
 //
 // The SECOND half of the cloth-vs-PARTICLE chain.  The simplest contact
 // generator in the cloth family: one particle against one triangle, at most one
@@ -42,24 +43,19 @@
 // ---------------------------------------------------------------------------
 // C1 -- THE PAIR IS (cmIdx, particleIndex, triangleIndex), the midphase's M1.
 //
-// C2 -- A DIFFERENT WRITER METHOD.  This calls writeContact, not
-//     writeRigidVsDeformableContact: it writes pairInd0 as a **u64** and
-//     pairInd1 as a u32 and leaves the material/inCollision word ALONE, where
-//     the rigid path sets it.  It also never touches contactSortedByX, which is
-//     NULL for the particle writer (PxgFEMCore.h:393) -- the buffer does not
-//     exist, so a port that writes it stores through a null pointer.
+// C2 -- THE PARTICLE WRITER (5.12).  PxgParticleDbContactWriter::writeSurfaceContact:
+//     the PxgDeformablePairInfo (PxgEncodeParticleRef, PxgEncodeDeformableTriangle),
+//     the point, the normal/pen, the barycentric and the particle sort key.  There is
+//     no material stream on this writer.
 //
-// C3 -- THE SORT KEY IS THE PARTICLE.  `writeContact(..., pairInd0, pairInd1,
-//     pairInd0)` passes the ENCODED PARTICLE INDEX as the id the contact is
-//     sorted by, where every rigid caller passes a rigid node index.  The host
-//     built this writer as PxgFEMContactWriter(clothCore, **true**), which is
-//     what points the buffers at the particle streams in the first place.
+// C3 -- THE SORT KEY IS THE PARTICLE: ref0 = PxgEncodeParticleRef(systemId,
+//     particleIndex), and contactByParticle / tempContactByParticle take it.
 //
 // C4 -- THE STORED NORMAL IS NEGATED.  `v = p - closestPt` points from the
-//     triangle to the particle; what is written is -n.  The penetration is
-//     `m - restDistance` and NOT `m - cDistance`, and the contact point is
-//     `p - n * restDistance` -- so restDistance appears twice and cDistance only
-//     in the gate.
+//     triangle to the particle; what is written is -n.  PhysX 5.12 moved the rest
+//     distance out of contact generation: pen = |v| and the contact point is the
+//     particle position p itself (5.6.1 wrote |v| - restDistance and
+//     p - n * restDistance; the restDistances argument is gone).
 //
 // C5 -- THE GATE IS `<=`, and it is against `cDistance * cDistance` with
 //     cDistance the SUM of the two contact distances.  Not the rest distance,
@@ -78,30 +74,23 @@
 //     grid, outside the loop.
 // ===========================================================================
 
-import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass@16, mTriangleVertexIndices@72)
+import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass@16, mTriangleVertexIndices_ownedEdges@72)
 import pxgSlangParticleDesc;   // PxgParticleSystemGpu (mSortedPositions_InvMass@24)
 import pxgSlangTetClosest;     // closestPtPointTriangle2 (P9.30 made it public)
+import pxgSlangDeformableRef;       // PxgEncodeParticleRef, PxgEncodeDeformableTriangle
+import pxgSlangDeformableWriters;   // PxgParticleDbContactWriterGpu
 
 static const uint PSCG_GRID = 512u;
 static const uint PSCG_BLOCK = 256u;
 static const uint PSCG_STRIDE = PSCG_GRID * PSCG_BLOCK;   // 131072
 
 static const uint GEOM_PARTICLESYSTEM = 6u;
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
 
 // ---------------------------------------------------------------------------
-// Push-constant blob -- BYTE-IDENTICAL to the CUDA pack
-// (PxgNarrowphaseCore.cpp:3631): thirteen arguments, the last of them
-// PxgFEMContactWriter by value (80 B) -> 176 bytes.
-// ABI row {4,8,8,8,8,8,8,8,4,8,8,8,80}.
-//
-// The writer lands at @96 and NOT at @88: paramAlign(80) is 16, not 8
-// (P9.15e), and the arguments before it end at 88.  The cloth-vs-heightfield
-// contact gen's blob is ALSO 176 bytes with its writer ALSO at @96 -- and its
-// middle is arranged differently, so sizeof and the writer offset both agree
-// while five fields sit one slot apart.  P9.29's fixture lost a day to exactly
-// that coincidence in the other direction; every offset below is asserted in
-// the fixture for that reason.
+// Push-constant blob -- BYTE-IDENTICAL to the 5.12 CUDA pack: twelve arguments
+// (restDistances is gone), the last of them PxgParticleDbContactWriter by value
+// (72 B, paramAlign 8) -> 160 bytes.
+// ABI row {4,8,8,8,8,8,8,4,8,8,8,72}.
 // ---------------------------------------------------------------------------
 struct ClothPsCgParams
 {
@@ -110,27 +99,25 @@ struct ClothPsCgParams
     uint64_t cmInputs;             // @8
     uint64_t transformCache;       // @16 (ABI parity only -- nothing is transformed)
     uint64_t contactDistance;      // @24
-    uint64_t restDistance;         // @32
-    uint64_t gpuShapes;            // @40
-    uint64_t particleSystems;      // @48
-    uint64_t femClothes;           // @56
-    uint stackSizeBytes;           // @64
-    uint _pad68;                   // @68
-    uint64_t stackPtr;             // @72
-    uint64_t midphasePairsNum;     // @80
-    uint64_t stackSizeNeeded;      // @88  atomicMax output
-    // ---- PxgFEMContactWriter (by value, 80B) @96 ----
-    uint64_t w_outPoint;            // @96
-    uint64_t w_outNormalPen;        // @104
-    uint64_t w_outBarycentric;      // @112
-    uint64_t w_outContactInfo;      // @120  PxgFemOtherContactInfo* (16 B stride)
-    uint64_t w_totalContactCount;   // @128
-    uint64_t w_contactByX;          // @136  PxU64* -- the PARTICLE sort key (C3)
-    uint64_t w_tempContactByX;      // @144
-    uint64_t w_contactIndexSortedByX; // @152
-    uint64_t w_contactSortedByX;    // @160  NULL for particles (C2); never written
-    uint w_maxNumContacts;          // @168
-    uint _pad172;                   // @172 -> 176
+    uint64_t gpuShapes;            // @32
+    uint64_t particleSystems;      // @40
+    uint64_t femClothes;           // @48
+    uint stackSizeBytes;           // @56
+    uint _pad60;                   // @60
+    uint64_t stackPtr;             // @64
+    uint64_t midphasePairsNum;     // @72
+    uint64_t stackSizeNeeded;      // @80  atomicMax output
+    // ---- PxgParticleDbContactWriter (by value, 72B) @88 ----
+    uint64_t w_outPoint;                    // @88
+    uint64_t w_outNormalPen;                // @96
+    uint64_t w_outBarycentric;              // @104
+    uint64_t w_outContactInfo;              // @112 PxgDeformablePairInfo*
+    uint64_t w_totalContactCount;           // @120
+    uint64_t w_contactByParticle;           // @128 PxU64* -- the PARTICLE sort key (C3)
+    uint64_t w_tempContactByParticle;       // @136
+    uint64_t w_contactIndexSortedByParticle; // @144
+    uint w_maxNumContacts;                  // @152
+    uint _pad156;                           // @156 -> 160
 }
 
 [[vk::push_constant]] ConstantBuffer<ClothPsCgParams> gCg;
@@ -187,28 +174,17 @@ float4 computeBarycentric(float3 a, float3 b, float3 c, float3 p)
     return float4(u, v, w, 0.0f);
 }
 
-// PxgFEMContactWriter::writeContact (PxgFEMCore.h:467) -> writeContactNoBarycentric
-// plus the barycentric store.  C2: no material word, no contactSortedByX.
-void writeContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
-                  uint2 pairInd0, uint pairInd1, uint2 id)
+PxgParticleDbContactWriterGpu cgWriter()
 {
-    if (index >= gCg.w_maxNumContacts)
-        return;
-
-    Ptr<uint2>(gCg.w_contactByX)[index] = id;
-    Ptr<uint>(gCg.w_tempContactByX)[index] = id.x;      // PxU32(id & 0xffffffff)
-    Ptr<uint>(gCg.w_contactIndexSortedByX)[index] = index;
-
-    Ptr<float4>(gCg.w_outPoint)[index] = contact;
-    Ptr<float4>(gCg.w_outNormalPen)[index] = normalPen;
-
-    // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8.  The word
-    // at @12 is the rigid material / inCollision pair and is NOT touched here.
-    const uint64_t infoBase = gCg.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(infoBase + 0UL)[0] = pairInd0;
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-
-    Ptr<float4>(gCg.w_outBarycentric)[index] = barycentric;
+    PxgParticleDbContactWriterGpu w;
+    w.outPoint = gCg.w_outPoint;                 w.outNormalPen = gCg.w_outNormalPen;
+    w.outBarycentric = gCg.w_outBarycentric;     w.outContactInfo = gCg.w_outContactInfo;
+    w.totalContactCount = gCg.w_totalContactCount;
+    w.contactByParticle = gCg.w_contactByParticle;
+    w.tempContactByParticle = gCg.w_tempContactByParticle;
+    w.contactIndexSortedByParticle = gCg.w_contactIndexSortedByParticle;
+    w.maxNumContacts = gCg.w_maxNumContacts;
+    return w;
 }
 
 // ===========================================================================
@@ -242,14 +218,13 @@ void cloth_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
         Ptr<float> contactDistance = Ptr<float>(gCg.contactDistance);
         const float cDistance = contactDistance[particleCacheRef] + contactDistance[clothCacheRef];
-        const float restDistance = Ptr<float>(gCg.restDistance)[cmIdx];
 
         const uint clothId = clothShape.particleOrSoftbodyId;
         const uint particleSystemId = particleShape.particleOrSoftbodyId;
 
         Ptr<float4> sortedPose = Ptr<float4>(particleSystems[particleSystemId].mSortedPositions_InvMass);
         Ptr<float4> meshVerts = Ptr<float4>(clothes[clothId].mPosition_InvMass);
-        Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+        Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
 
         const uint4 triVertIdx = triIndices[triangleIdx];
         const float3 a = meshVerts[triVertIdx.x].xyz;
@@ -268,27 +243,24 @@ void cloth_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
         if (sqDist <= sqContactDistance)                 // C5
         {
-            const float m = sqrt(sqDist);
-            // C6: unguarded, and a RECIPROCAL-MULTIPLY -- femClothPrimitives.cu:2837
-            // writes `PxVec3 n = v / m`, which is PxVec3::operator/(Type)
-            // (PxVec3.h:219-223): 1.0/m formed once, then three multiplies.  P9.36.
-            const float3 n = v * (1.0f / m);
-            const float pen = m - restDistance;          // C4
-            const float3 contact = p - n * restDistance; // C4
+            // C4 (5.12): pen = PxSqrt(sqDist), no rest distance.
+            const float pen = sqrt(sqDist);
+            // C6: unguarded, and a RECIPROCAL-MULTIPLY -- femClothPrimitives.cu (5.12)
+            // writes `PxVec3 n = v / pen`, which is PxVec3::operator/(Type)
+            // (PxVec3.h:219-223): 1.0/pen formed once, then three multiplies.  P9.36.
+            const float3 n = v * (1.0f / pen);
 
             const float4 tBarycentric = computeBarycentric(a, b, c, closestPt);
 
             uint index = 0u;
             InterlockedAdd(Ptr<uint>(gCg.w_totalContactCount)[0], 1u, index);
 
-            // PxEncodeParticleIndex (PxgSimulationCoreDesc.h:118):
-            // (u64(systemId) << 32) | particleId.
-            const uint2 pairInd0 = uint2(particleIndex, particleSystemId);
-            const uint pairInd1 = (clothId << PXG_CLOTH_ID_SHIFT) | triangleIdx;
+            const uint64_t particleRef = PxgEncodeParticleRef(particleSystemId, particleIndex);   // C3
+            const uint64_t triRef = PxgEncodeDeformableTriangle(clothId, triangleIdx);
 
-            writeContact(index, float4(contact, 0.0f),
-                         float4(-n.x, -n.y, -n.z, pen),  // C4: the NEGATED normal
-                         tBarycentric, pairInd0, pairInd1, pairInd0);   // C3
+            cgWriter().writeSurfaceContact(index, float4(p, 0.0f),
+                                           float4(-n.x, -n.y, -n.z, pen),   // C4: the NEGATED normal
+                                           particleRef, triRef, tBarycentric);
         }
     }
 

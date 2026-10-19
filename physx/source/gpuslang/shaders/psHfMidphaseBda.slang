@@ -242,6 +242,8 @@ import pxgSlangCommon;
 import pxgSlangParticleDesc;
 // P9.12g: the contact writer, LoadShapePair and the two records they move.
 import pxgSlangParticleContact;
+import pxgSlangDeformableRef;      // 5.12 PxgEncodeParticleRef
+import pxgSlangDeformableWriters;  // PxgRigidParticleContactWriter
 import pxgSlangHeightfield;   // P9.27b: sample format, vertex decode, getTriangle
 
 // ---------------------------------------------------------------------------
@@ -289,16 +291,18 @@ struct PsHfMidPush
     uint64_t gpuShapes;             // @40
     uint64_t particleSystems;       // @48
     uint64_t shapeToRigidRemapTable;// @56
-    // PxgParticleContactWriter, BY VALUE (PxgParticleSystem.h:604), 72 bytes @64
-    uint64_t w_particleContacts;            // @64
-    uint64_t w_numTotalContacts;            // @72
-    uint64_t w_contactSortedByParticle;     // @80
-    uint64_t w_tempContactByParticle;       // @88
-    uint64_t w_contactIndexSortedByParticle;// @96
-    uint64_t w_contactByRigid;              // @104
-    uint64_t w_tempContactByRigid;          // @112
-    uint64_t w_contactIndexSortedByRigid;   // @120
-    uint w_maxContacts;                     // @128 -> 136
+    // PxgRigidParticleContactWriter, BY VALUE (PxgParticleSystem.h, 5.12), 80 bytes @64
+    uint64_t w_particleContactInfos;        // @64  PxgDeformablePairInfo*
+    uint64_t w_particleContactNormalPens;   // @72  float4*
+    uint64_t w_numTotalContacts;            // @80
+    uint64_t w_contactSortedByParticle;     // @88
+    uint64_t w_tempContactByParticle;       // @96
+    uint64_t w_contactIndexSortedByParticle;// @104
+    uint64_t w_contactByRigid;              // @112
+    uint64_t w_tempContactByRigid;          // @120
+    uint64_t w_contactIndexSortedByRigid;   // @128
+    uint w_maxContacts;                     // @136
+    uint _pad140;                           // @140 -> 144
 }
 [[vk::push_constant]]
 ConstantBuffer<PsHfMidPush> gHf;
@@ -426,10 +430,11 @@ bool particleTriangleTest(inout float3 normal, inout float distance,
 
 // The eight writer pointers and the capacity, out of this shader's push block
 // and into the shared record pxgSlangParticleContact defines.
-PsContactWriter hfWriter()
+PxgRigidParticleContactWriterGpu hfWriter()
 {
-    PsContactWriter w;
-    w.particleContacts = gHf.w_particleContacts;
+    PxgRigidParticleContactWriterGpu w;
+    w.particleContactInfos = gHf.w_particleContactInfos;
+    w.particleContactNormalPens = gHf.w_particleContactNormalPens;
     w.numTotalContacts = gHf.w_numTotalContacts;
     w.contactSortedByParticle = gHf.w_contactSortedByParticle;
     w.tempContactByParticle = gHf.w_tempContactByParticle;
@@ -441,9 +446,10 @@ PsContactWriter hfWriter()
     return w;
 }
 
-void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, uint2 rigidId)
+// 5.12: writeContact(index, normalPen, rigidId, particleRef).
+void writeContact(uint index, float4 normalPen, uint64_t particleRef, uint2 rigidId)
 {
-    psWriteContact(hfWriter(), index, normalPen, compressedParticleIndex, rigidId);
+    hfWriter().writeContact(index, normalPen, uint64_t(rigidId.x) | (uint64_t(rigidId.y) << 32), particleRef);
 }
 
 // LoadShapePairWarp<ePARTICLESYSTEM, eHEIGHTFIELD> (particleSystemHFMidPhaseCG.cu:293).
@@ -705,12 +711,12 @@ void ps_heightfieldCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         // guard, so the diffuse pass burns no writer slots here.
         if (remaining > 0u && !isDiffuse)
         {
-            const uint2 compressedParticleIndex = uint2(particleIndex, psId);
+            const uint64_t particleRef = PxgEncodeParticleRef(psId, particleIndex);
             uint contactStartIndex;
             InterlockedAdd(Ptr<uint>(gHf.w_numTotalContacts)[0], remaining, contactStartIndex);
             const uint contactEndIndex = contactStartIndex + remaining;
             for (uint k = contactStartIndex, src = 0u; k < contactEndIndex; ++k, ++src)
-                writeContact(k, tempContacts[src], compressedParticleIndex, rigidId);
+                writeContact(k, tempContacts[src], particleRef, rigidId);
         }
     }
 }

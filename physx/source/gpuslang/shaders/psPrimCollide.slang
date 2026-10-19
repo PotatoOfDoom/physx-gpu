@@ -37,11 +37,10 @@
 // each lane tests one particle of its own cell: current position, the
 // speculative CCD contact volume (getParticleSpeculativeContactVolume with
 // isDiffuse = false) or the plain contact distance, the compressed particle
-// index PxEncodeParticleIndex(systemId, sortedIndex), the rigid filter
-// lookup find(particleSystem, rigidId, particleMask) — the mask encodes the
-// UNSORTED particle id, localized into its sim buffer via
-// findRange(mParticleBufferRunsum) and searched in that buffer's
-// PxgRigidFilterPair list — and particlePrimitiveCollision (the tranche-87
+// index (PhysX 5.12: PxgEncodeParticleRef(systemId, sortedIndex); 5.6.1 used
+// PxEncodeParticleIndex and then the rigid filter lookup find(particleSystem,
+// rigidId, particleMask) over the UNSORTED id, which 5.12 removed -- its bindings
+// and findPs stay for the 5.6.1 reference only) — and particlePrimitiveCollision (the tranche-87
 // contact core: plane/sphere/capsule/box; eCONVEXCORE deferred).  Contacts
 // are warp-aggregated: ballot, popc for the count and the lane's prefix,
 // ONE lane-0 atomicAdd, broadcast, then writeContact
@@ -441,14 +440,13 @@ void ctPsPrimCollide(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                     cVolumePos = currentPos;
                 }
 
-                compressedParticleIndex = uint2(particleIndex, w.ids.w); // PxEncodeParticleIndex
-                const uint2 particleMask = uint2(gSortedToUnsorted[particleIndex], w.ids.w);
-
-                if (!findPs(w.rigid.xy, particleMask, gParams.numBuffers))
-                {
-                    intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
-                                                           w, enableCCD, normal, distance);
-                }
+                // PhysX 5.12: PxgEncodeParticleRef(systemId, sortedIndex) = (systemId << 34)
+                // | index, i.e. the high word holds systemId << 2; and no filter lookup --
+                // 5.12 removed the particle-rigid filter (findPs below is kept only as the
+                // 5.6.1 reference and is not called).
+                compressedParticleIndex = uint2(particleIndex, w.ids.w << 2u);
+                intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
+                                                       w, enableCCD, normal, distance);
             }
         }
 

@@ -102,10 +102,10 @@ static_assert(sizeof(PsDiffAdvectBlob) == 32, "engine ABI blob size");
 
 static_assert(offsetof(PxgParticleSystem, mCellStart) == 168, "@168");
 static_assert(offsetof(PxgParticleSystem, mCellEnd) == 176, "@176");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552, "@552");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560, "@560");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOriginPos_LifeTime) == 544, "@544");
-static_assert(offsetof(PxgParticleSystem, mDiffuseUnsortedToSortedMapping) == 584, "@584");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512, "@512");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520, "@520");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOriginPos_LifeTime) == 504, "@504");
+static_assert(offsetof(PxgParticleSystem, mDiffuseUnsortedToSortedMapping) == 544, "@544");
 
 // ---------------------------------------------------------------------------
 static const uint32_t NB_SYS_SLOTS = 4u;

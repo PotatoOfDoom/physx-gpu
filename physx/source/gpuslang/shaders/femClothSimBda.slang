@@ -35,8 +35,9 @@
 //     arrays ALIAS the user buffer (PxgSimulationCore.cpp:1850), so this write is
 //     what a host DtoH read of getPositionInvMassBufferD() sees — no ingest/egress
 //     kernel exists.  Both the TGS and PGS branches are ported.
-//   - cloth_finalizeVelocitiesLaunch (FEMCloth.cu:1227): velocity settling/averaging
-//     + sets mIsActive (block-wide OR -> device atomicOr).
+//   - cloth_finalizeVelocitiesLaunch (FEMCloth.cu): velocity settling/averaging through
+//     the 5.12 shared finalizeVertexVelocity (MagnitudeClampVelocityAveraging) + sets
+//     mIsActive (block-wide OR -> device atomicOr).
 //   - cloth_sleeping (FEMCloth.cu:1313): wake-counter bookkeeping.  REQUIRED — else
 //     the cloth deactivates (wakeCounters -> 0 in ~24 frames) and the fall freezes.
 //
@@ -51,7 +52,8 @@
 //     keeps a subgroup op off the llvmpipe predictor entirely (matching the recipe
 //     guard).  maxMagVelSq (fed only by that branch) is likewise dropped.
 //   - the globalThreadIndex==0 bookkeeping writes the PxU32 VT/EE contact-count
-//     resets (4-byte, faithful) AND the `*updateContactPairs = !isTGS` gate.  That
+//     resets (4-byte, faithful) AND the `*updateContactPairs = 1` gate (5.12; it was
+//     `!isTGS` up to 5.6.1).  That
 //     gate store was elided by the original P7.0 port (nothing mapped read it then);
 //     P7.2 tranche 3b restored it, because every self-collision kernel early-outs on
 //     it.  It is a 4-byte store, not the CUDA PxU8 (no 8-bit storage on llvmpipe) —
@@ -59,6 +61,7 @@
 //     consumer reads `word & 0xFF`.
 
 import pxgSlangFEMClothDesc;
+import pxgSlangDeformableUtils;   // finalizeVertexVelocity (5.12)
 
 static const uint CLOTH_WARP_SIZE = 32u;
 // PxgFEMClothKernelBlockDim (PxgFEMClothCoreKernelIndices.h:39-40).
@@ -134,17 +137,21 @@ void cloth_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
                 (Ptr<uint>(gPre.EEContactCounts))[0] = 0u;
             }
 
-            // For TGS, updateContactPairs is updated in "cloth_stepLaunch".
+            // 5.12: the gate is set every frame for BOTH solvers (it was `!isTGS` up to
+            // 5.6.1): the pre-broadphase bound refit (cloth_refitBoundLaunch) is gated on it,
+            // and the broadphase needs a current cloth bound to pair the cloth against other
+            // actors.  cloth_stepLaunch separately drives the per-substep cloth-cloth pair
+            // cadence for TGS.  This is the 5.10 fix for the cloth bounds lagging one frame
+            // under TGS.
             // P7.2 tranche 3b: this store was ELIDED by the P7.0 port because no mapped
-            // kernel consumed it back then.  It is now the GATE every self-collision
-            // kernel reads first (cloth_selfCollisionMidphase{VT,EE}, cloth_refitBound,
-            // cloth_clothContactPrepare all early-out on `*updateContactPairs == 0`), so
-            // eliding it silently disabled the entire self-collision arc.  Written as a
-            // 4-byte store rather than the CUDA PxU8 (8-bit storage is not available on
-            // llvmpipe): the engine itself clears this buffer with memsetD32Async
-            // (PxgFEMClothCore.cpp:1397), and every consumer reads it as `word & 0xFF`,
-            // so the whole word is ours to own and the observable low byte is identical.
-            (Ptr<uint>(gPre.updateContactPairs))[0] = isTGS ? 0u : 1u;
+            // kernel consumed it back then.  It is the GATE every self-collision kernel
+            // reads first (cloth_selfCollisionMidphase{VT,EE}, cloth_refitBound,
+            // cloth_clothContactPrepare all early-out on `*updateContactPairs == 0`).
+            // Written as a 4-byte store rather than the CUDA PxU8 (8-bit storage is not
+            // available on llvmpipe): the engine itself clears this buffer with
+            // memsetD32Async, and every consumer reads it as `word & 0xFF`, so the whole
+            // word is ours to own and the observable low byte is identical.
+            (Ptr<uint>(gPre.updateContactPairs))[0] = 1u;
         }
     }
 
@@ -176,7 +183,7 @@ void cloth_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
         {
             // PGS: clamp the per-vertex displacement per the input maxVelocity.
             const float maxLinVel = femCloths[id].mMaxLinearVelocity;
-            const float restDistance = femCloths[id].mRestDistance;
+            const float restDistance = femCloths[id].mRestOffset;
             const float maxVel = (maxLinVel == PX_MAX_REAL) ? PX_MAX_REAL
                                  : (maxLinVel < 0.0f) ? (0.8f * restDistance / gPre.dt)
                                  : maxLinVel;
@@ -204,17 +211,21 @@ void cloth_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
 }
 
 // ---------------------------------------------------------------------------
-// cloth_finalizeVelocitiesLaunch — velocity settling + wake flag (FEMCloth.cu:1227)
+// cloth_finalizeVelocitiesLaunch — velocity settling + wake flag (FEMCloth.cu, PhysX 5.12)
 // ---------------------------------------------------------------------------
-// CUDA arg pack (PxgFEMClothCore.cpp:1234-1236): { PxgFEMCloth* femCloths, const
-// PxU32* activeId, PxReal invTotalDt(4), PxReal dt(4), bool
-// alwaysRunVelocityAveraging(1) } -> natural-alignment blob = 32 bytes.  NOTE:
-// invTotalDt is passed but unreferenced in the CUDA body (kept for ABI fidelity).
+// CUDA arg pack (PxgFEMClothCore.cpp finalizeVelocities): { PxgFEMCloth* femCloths, const
+// PxU32* activeId, PxReal invDt(4), PxReal dt(4), bool alwaysRunVelocityAveraging(1) }
+// -> natural-alignment blob = 32 bytes.  5.12 renamed invTotalDt to invDt and moved the
+// body into the shared finalizeVertexVelocity (pxgSlangDeformableUtils) with
+// MagnitudeClampVelocityAveraging; invDt now scales the accumulated delta into deltaVel
+// (it was `tDelta / dt`, unread invTotalDt).  The velocity is written back for every
+// vertex in range, unchanged when neither the averaging nor the settle damping applies
+// (the CUDA's unconditional store).
 struct FinalizeParams
 {
     uint64_t femCloths;                 // @0
     uint64_t activeId;                  // @8
-    float invTotalDt;                   // @16 (unused, ABI placeholder)
+    float invDt;                        // @16
     float dt;                           // @20
     uint alwaysAvgWord;                 // @24 byte0 = alwaysRunVelocityAveraging
     uint _pad28;                        // @28 -> 32
@@ -232,11 +243,6 @@ void cloth_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint
     const uint id = (Ptr<uint>(gFin.activeId))[groupId.y];
 
     const uint nbVerts = femCloths[id].mNbVerts;
-    Ptr<float4> vels = Ptr<float4>(femCloths[id].mVelocity_InvMass);
-    Ptr<float4> posDelta = Ptr<float4>(femCloths[id].mAccumulatedDeltaPos);
-    Ptr<float4> positions = Ptr<float4>(femCloths[id].mPosition_InvMass);
-
-    const float dt = gFin.dt;
     const bool alwaysRunVelocityAveraging = (gFin.alwaysAvgWord & 0xffu) != 0u;
 
     const uint globalThreadIndex = groupThreadId.x + CLOTH_STEP * groupId.x;
@@ -249,50 +255,14 @@ void cloth_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint
 
     if (globalThreadIndex < nbVerts)
     {
-        const float settleTolerance = femCloths[id].mSettlingThreshold * dt;
-        const float tolerance = femCloths[id].mSleepThreshold * dt;
-        const float sleepDamping = 1.0f - min(1.0f, femCloths[id].mSettlingDamping * dt);
-
-        const float4 delta = posDelta[globalThreadIndex];
-        const float3 tDelta = float3(delta.x, delta.y, delta.z);
-        // P9.36: FEMCloth.cu:1258 is `PxVec3 deltaVel = tDelta / dt;` on a PxVec3, i.e.
-        // PxVec3::operator/ (PxVec3.h:219) -- ONE reciprocal, three multiplies.
-        const float3 deltaVel = tDelta * (1.0f / dt);
-        const float4 pos = positions[globalThreadIndex];
-
-        if (pos.w != 0.0f) // skip kinematic / infinite-mass vertices
-        {
-            float velocityScaling = 1.0f;
-
-            const float magSq = tDelta.x * tDelta.x + tDelta.y * tDelta.y + tDelta.z * tDelta.z;
-            if (magSq < settleTolerance * settleTolerance)
-            {
-                awake = magSq >= tolerance * tolerance;
-                velocityScaling = sleepDamping;
-            }
-            else
-            {
-                awake = true;
-            }
-
-            if (alwaysRunVelocityAveraging || velocityScaling != 1.0f)
-            {
-                const float4 vel = vels[globalThreadIndex];
-                float3 tVel = float3(vel.x, vel.y, vel.z);
-
-                const float deltaVelMagSqr =
-                    deltaVel.x * deltaVel.x + deltaVel.y * deltaVel.y + deltaVel.z * deltaVel.z;
-                const float velMagSqr = tVel.x * tVel.x + tVel.y * tVel.y + tVel.z * tVel.z;
-                if (alwaysRunVelocityAveraging &&
-                    deltaVelMagSqr < (tVel.x * tVel.x + tVel.y * tVel.y + tVel.z * tVel.z))
-                {
-                    tVel = tVel * sqrt(deltaVelMagSqr / velMagSqr);
-                }
-
-                vels[globalThreadIndex] =
-                    float4(velocityScaling * tVel.x, velocityScaling * tVel.y, velocityScaling * tVel.z, vel.w);
-            }
-        }
+        Ptr<float4> vels = Ptr<float4>(femCloths[id].mVelocity_InvMass);
+        float4 vel = vels[globalThreadIndex];
+        awake = finalizeVertexVelocity(Ptr<float4>(femCloths[id].mPosition_InvMass)[globalThreadIndex], vel,
+                                       Ptr<float4>(femCloths[id].mAccumulatedDeltaPos)[globalThreadIndex],
+                                       femCloths[id].mSettlingThreshold, femCloths[id].mSleepThreshold,
+                                       femCloths[id].mSettlingDamping, gFin.dt, gFin.invDt,
+                                       alwaysRunVelocityAveraging, PXG_VEL_AVG_MAGNITUDE_CLAMP, 0.0f);
+        vels[globalThreadIndex] = vel;
     }
 
     // block-wide OR of `awake` (replaces the CUDA two-level warp __any_sync).

@@ -168,6 +168,45 @@ HOST_GATED = [
             'host launch stays inside `if (0)`; the day it does not, the capsule '
             'branch has to be written and given a fixture.',
     },
+    # PhysX 5.12 moved the two dead cloth VERTEX chains behind host `if (0)` blocks too
+    # ("Not launched: ... never raises its hasContacts flag", PxgNarrowphaseCore.cpp), so
+    # the midphases that only feed them stopped running as well.  The Slang ports stay
+    # (femClothMeshVertMidphaseBda / femClothHfMidphaseBda: full midphases with fixtures;
+    # the two contact gens: the observable no-contact behaviour, gated above), and are
+    # unreachable from the engine while these blocks stay disabled.
+    {
+        'rel': CPP,
+        'enum': 'CLOTH_MIDPHASE_VERTEX_MESH',
+        'kernel': 'cloth_midphaseVertexMeshLaunch',
+        'depends':
+            'femClothMeshVertMidphaseBda.slang is a full port with its own fixture; it feeds '
+            'only cloth_meshVertexContactGenLaunch, which emits nothing.  Re-enabled upstream, '
+            'the pair needs a scene, and the contact gen its geometry.',
+    },
+    {
+        'rel': CPP,
+        'enum': 'CLOTH_MESH_VERTEX_CG',
+        'kernel': 'cloth_meshVertexContactGenLaunch',
+        'depends':
+            'femClothMeshVertContactGenBda.slang implements the observable behaviour (no '
+            'contacts, the stack-size high-water mark) -- see the gated claim above.',
+    },
+    {
+        'rel': CPP,
+        'enum': 'CLOTH_MIDPHASE_VERTEX_HF',
+        'kernel': 'cloth_midphaseVertexHeightfieldLaunch',
+        'depends':
+            'femClothHfMidphaseBda.slang ports it with its fixture; it feeds only '
+            'cloth_heightfieldVertexContactGenLaunch, which emits nothing.',
+    },
+    {
+        'rel': CPP,
+        'enum': 'CLOTH_HF_VERTEX_CG',
+        'kernel': 'cloth_heightfieldVertexContactGenLaunch',
+        'depends':
+            'femClothHfContactGenBda.slang implements the observable behaviour (no '
+            'contacts, the stack-size high-water mark) -- see the gated claim above.',
+    },
 ]
 
 # The host-side LIVE control: the sibling launched from `if (1)` in the same
@@ -216,9 +255,9 @@ HOST_LIVE_CONTROLS = ['CLOTH_SPHERE_CG']
 # gains a fetch, it becomes a kernel the engine will call and this port will not
 # answer -- so it must be read and ported, and this checker is the thing that
 # says so.  It also puts a number on something p4Manifest's coverage figure does
-# not distinguish: under 5.6.1, 12 of the 501 registry entries could not be reached
-# at all, so 489 was the count of kernels a running engine could actually ask for
-# (under 5.12 the table holds 10 of 487).  That is
+# not distinguish: under PhysX 5.12, 13 of the 487 registry entries cannot be
+# reached at all, so 474 is the count of kernels a running engine can actually ask
+# for (5.6.1: 12 of 501, so 489).  That is
 # recorded HERE rather than folded into the percentage, because the list lives in
 # this file and a second copy in C++ would be exactly the drift this port keeps
 # refusing to introduce.
@@ -253,6 +292,14 @@ ORPHANED = [
     ('iso_CountTriIdsDCSparse', 'iso_CountTriIdsDCSparse'),
     ('iso_CreateTriIdsDC', 'iso_CreateTriIdsDC'),
     ('iso_CreateTriIdsDCSparse', 'iso_CreateTriIdsDCSparse'),
+    # Orphaned by PhysX 5.12: PxgParticleSystemCore::accumulateRigidDeltas lost its
+    # multi-stage (local-relaxation) path, the only fetch of these three, while the
+    # kernels and their KERNEL_DEFs stayed (rigidDeltaAccum.cu; Stage2 even gained the
+    # mSolverSpatialImpulse add).  Unmapped; rigidDeltaAccumBda keeps the ports and
+    # testRigidDeltaAccum drives them directly.
+    ('ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1', 'accumulateDeltaVRigidSecondLaunchMultiStage1'),
+    ('ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2', 'accumulateDeltaVRigidSecondLaunchMultiStage2'),
+    ('ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR', 'clearDeltaVRigidSecondLaunchMulti'),
 ]
 
 # The live control for the orphan scan: an enum fetched from an ordinary launch

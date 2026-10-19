@@ -210,7 +210,7 @@ void cloth_accumulateInPlaneDampingDeltaVelocity(uint3 gtid : SV_GroupThreadID,
     if (dampingFactor == 0.0f)
         return;
 
-    const uint4 triangle = Ptr<uint4>(femCloths[id].mTriangleVertexIndices)[globalThreadIndex];
+    const uint4 triangle = Ptr<uint4>(femCloths[id].mTriangleVertexIndices_ownedEdges)[globalThreadIndex];
 
     Ptr<float4> positions = Ptr<float4>(femCloths[id].mPosition_InvMass);
     Ptr<float4> velocities = Ptr<float4>(femCloths[id].mVelocity_InvMass);

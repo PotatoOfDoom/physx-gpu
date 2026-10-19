@@ -94,7 +94,7 @@
 //     for ABI parity and are never read.  The softbody-vs-MESH midphase next door
 //     does transform, and copying it here would move the body.
 //
-// T8 -- the CUDA warp-copies the WHOLE PxgParticleSystem (656 B) into shared memory
+// T8 -- the CUDA warp-copies the WHOLE PxgParticleSystem (608 B in 5.12) into shared memory
 //     before reading two fields of it.  That is CUDA memory-traffic engineering,
 //     not semantics: this port reads mSortedPositions_InvMass and
 //     mCommonData_NumParticles through BDA where they are used.
@@ -242,7 +242,7 @@ void sb_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
     loadParticleSoftbodyPair(gSp.cmInputs, gSp.gpuShapes, cmIdx,
                              particleShape, particleCacheRef, softbodyShape, softbodyCacheRef);
 
-    // T8: the two fields are read where they are used, not staged into a 656-byte
+    // T8: the two fields are read where they are used, not staged into a 608-byte
     // groupshared copy of the whole PxgParticleSystem.
     Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gSp.particleSystems);
     const uint particleSystemId = particleShape.particleOrSoftbodyId;

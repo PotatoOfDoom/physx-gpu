@@ -22,212 +22,106 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// femClothRigidContactBda — P7.1 tranche 4b-2/3: the FEM-cloth RIGID-CONTACT
-// prepare + solve kernels on the Vulkan engine ABI (BDA).  The machinery that pushes
-// a cloth vertex OUT of a rigid primitive (toward a cloth draping on a static floor /
-// sphere), ported line-for-line from
-//   gpusimulationcontroller/src/CUDA/FEMClothConstraintPrep.cu (the prepare, :70)
-//   gpusimulationcontroller/src/CUDA/FEMClothExternalSolve.cu   (the solves, :288 / :433)
-// with the prepareFEMContacts / FEMCollision leaves from src/CUDA/deformableUtils.cuh:
-//   - cloth_rigidContactPrepareLaunch (FEMClothConstraintPrep.cu:70, launch
-//     PxgFEMClothCore.cpp:326): builds the block-of-32 PxgFemRigidConstraintBlock from
-//     each SORTED cloth-vs-rigid contact (contact point, flipped normal, penetration,
-//     accumulated-delta, barycentric) via prepareFEMContacts (deformableUtils.cuh:132)
-//     — the rigid response rows (raXn x sqrtInvInertia, the friction tangents t0/t1 via
-//     PxComputeBasisVectors) and the position error.
-//   - cloth_queryRigidClothContactReferenceCount{,TGS}Launch (FEMClothExternalSolve.cu:
-//     414 / :558, launch PxgFEMClothCore.cpp:1733): a checkOnlyActivity pass that marks
-//     each penetrating contact in-collision and increments the referenced cloth
-//     vertex's mDeltaPos.w reference count (so applyExternalDeltas can mass-average).
-//   - cloth_solveRigidClothCollision{,TGS}Launch (FEMClothExternalSolve.cu:535 / :578,
-//     launch PxgFEMClothCore.cpp:1778): solves the contact constraint (FEMCollision::
-//     initialize, deformableUtils.cuh:280) and scatters the cloth-side position
-//     correction into mDeltaPos (folded next frame by the already-mapped
-//     cloth_applyExternalDeltasLaunch).
+// femClothRigidContactBda.slang -- the cloth-vs-rigid CONTACT chain, PhysX 5.12:
 //
-// SCOPE — cloth vs a STATIC floor / sphere (the drape target).  For a static body the
-// rigid side has zero velocity + infinite mass + zero inverse inertia, so the reaction
-// path collapses: the same precedent as the P7.1 tranche 3a attachment port, we DEFER
-// the dynamic-rigid reaction (see the "DEVIATIONS" list).  The cloth-side push is exact
-// (bit-exact vs the CPU transcription in testFemClothSim.cpp), PGS and TGS.
+//   cloth_rigidContactPrepareLaunch                   (FEMClothConstraintPrep.cu) turns
+//                                                     each sorted contact into one lane of a
+//                                                     PxgRigidDbContactBlock
+//                                                     (prepareRigidDbContact).
+//   cloth_queryRigidClothContactReferenceCountLaunch  (FEMClothExternalSolve.cu) the
+//                                                     mass-splitting pre-count: decides each
+//                                                     contact's activity (latched in the
+//                                                     pair's ACTIVE flag), bumps mDeltaPos.w
+//                                                     of the touched cloth vertices and the
+//                                                     rigid's reference count.
+//   cloth_solveRigidClothCollisionLaunch              (FEMClothExternalSolve.cu)
+//                                                     solveRigidDbContact, the cloth scatter
+//                                                     into mDeltaPos and the rigid writeback
+//                                                     into rigidDeltaVel.
 //
-// DEVIATIONS from the CUDA original (recipe policy; each preserves the constraint
-// semantics for a cloth-vs-STATIC-rigid contact and is exercised by testFemClothSim.cpp):
-//   - the descriptors arrive as device pointers read through Ptr<> (BDA), reusing the
-//     byte-exact pxgSlang* mirrors (FEMClothDesc / PrepDesc / SolverDesc / Common).  The
-//     block-of-32 PxgFemRigidConstraintBlock and the 16-byte PxgFemOtherContactInfo are
-//     addressed by explicit byte offset through Ptr<> (no descriptor block copy), exactly
-//     as the other BDA kernels read their SoA blocks;
-//   - the ARTICULATION branch is PORTED (tranche A of task 35; it was deferred until then,
-//     and a contact with a link took the rigid arm against an unrelated solver body).
-//     prepareFEMContacts builds the link's anchor rows from spatialResponseMatrixW
-//     (deformableUtils.cuh:159-198), readRigidVelocity reads the link's outArtiVelocity row
-//     (dataReadWriteHelper.cuh:105-115 / :126-141), and the solve's reaction takes
-//     computeRigidChange's articulation arm.  The one deviation: the artiCoreDesc /
-//     outArtiVelocity reads are sunk into the articulation arm (CUDA's PxgVelocityReader
-//     constructor reads them for every contact) -- the precedent psContactSolveTgsBda set --
-//     so a rigid / static contact never dereferences them; no value changes;
-//   - the DYNAMIC-rigid REACTION is PORTED as of P9.45.  FEMCollision::computeRigidChange
-//     (deformableUtils.cuh:418) runs under the .cu's own guard
-//     (fricTan0_invMass0.w != 0 && !rigidId.isStaticBody()), writing count 1 and the two
-//     delta rows into rigidDeltaVel; the query pass's rigid reference-count increment
-//     (:404-408) is ported with it, so the mass-splitting divisor the solve reads back is
-//     the real per-body contact count instead of the default 1 (an articulation link is
-//     counted at numSolverBodies + its articulation index, getGlobalRigidBodyId).
-//     P9.44's accumulateDeltaVRigidFirst/SecondLaunch reduce those rows onto the solver
-//     body -- or, for a link, into its scratch impulse -- which is what makes a cloth able
-//     to HOLD a dynamic rigid (scene `clothnet`) and load a link (scene `clothonlink`).  A
-//     static or kinematic contact still writes (0,0,0,0) with count 0, exactly as before;
-//   - FRICTION is the null-material path.  prepareFEMContacts's t0/t1 (PxComputeBasis-
-//     Vectors) and the friction response rows raXnF0/raXnF1 are built verbatim, and the
-//     solve computes the full tangent kinematics (tanVel / CT0 / CT1 / relTanDelta /
-//     tanMagSq and the tangent impulse), but getCombinedFriction() == 0 — the readCloth /
-//     readRigidBody NULL-material branch the CUDA's OWN query pass takes
-//     (FEMClothExternalSolve.cu:362 passes NULL,NULL).  With zero combined friction
-//     deltaLambdaT == -min(mag, 0) == -0, so the cloth-side push is bit-exact with a
-//     frictionless (zero dynamicFriction) rigid+cloth material — the drape target.  The
-//     material-strided friction read (PxsMaterialData::dynamicFriction / cloth
-//     mDynamicFrictions) is a follow-on tranche;
-//   - cloth.mDeltaPos accumulation uses REAL atomics (pxgSlangAtomicFloat), matching the
-//     CUDA atomicAdd(&mDeltaPos[v].w, 1) (query) and atomicAdd(&mDeltaPos[v].x/.y/.z, dP)
-//     (solve writeCloth).  A cloth TRIANGLE contact bumps all three of its vertices and
-//     adjacent triangles share vertices by construction, so contention here is not an
-//     edge case -- it is the normal case.  Previously plain
-//     load-add-store.  For the single-contact unit test (and any contact set with no two
-//     contacts sharing a cloth vertex within one pass) there is no cross-thread
-//     contention, so the read-modify-write is bit-identical to the atomic — same
-//     precedent as femClothRigidAttachBda::applyClothDelta / the particle one-way solve;
-//   - PxComputeBasisVectors's right.normalize() lowers to `right / sqrt(magSq)` (a true
-//     divide, PxVec3::normalize(), PxVec3.h:295) — the CPU reference uses the identical
-//     expression, so t0/t1 are bit-exact.
+// THE 5.12 DATA.  The contacts arrive as SoA streams: PxgDeformablePairInfo {ref0 = rigid
+// PxNodeIndex, ref1 = cloth PxgDeformableRef (a TRIANGLE, or a VERTEX for the vertex
+// contact generators)}, the PxU16 rigid material stream and the barycentric stream.  The
+// 5.6.1 PxgFemOtherContactInfo, the packed cloth id and PxgFemRigidConstraintBlock are
+// gone, and with them prepareFEMContacts / FEMCollision (pxgSlangFemRigidContact).  A
+// vertex ref is told by its feature type, not by barycentric.w as in 5.6.1.  A pair the
+// remap could not resolve carries the INVALID flag and is skipped; the query latches
+// activity in the ACTIVE flag (once active it stays active: a conservative reference
+// count) and the solve reads it back.  PGS and TGS share one kernel each (isTGS); the TGS
+// twins are gone, and the velocity reader takes solverBodyVelPool instead of the
+// PxgSolverSharedDesc.
 //
-// All float arithmetic is NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the raXn cross /
-// sqrtInvInertia dot responses feed the compared constraint block, and the error / CN /
-// deltaLambdaN bias math feeds the compared mDeltaPos — either would fuse to FMAs
-// otherwise, breaking bitwise parity with the -ffp-contract=off reference (same reasoning
-// as psContactSolveTgsBda).
+// SEMANTICS THAT ARE EASY TO LOSE:
+//   - the prepare zeroes rigidLambdaNs (a float2 now) for every in-range contact, before
+//     the validity guard;
+//   - the normal handed to prepareRigidDbContact is the NEGATED narrowphase normal and
+//     the penetration has the rest offset (contacts_restW.w) subtracted;
+//   - the barycentric stream is read for a TRIANGLE ref only (prepare and readCloth);
+//   - the solve writes BOTH rigidDeltaVel slots of every valid contact, inactive ones
+//     included (writeContactDeltas' invMass == 0 sentinel writes zeros with count 0): the
+//     rigid accumulate sums the whole range.  An INVALID pair writes nothing.
+//
+// DEVIATIONS (value-neutral):
+//   - getGlobalRigidBodyId and the velocity reader read artiCoreDesc inside their
+//     articulation arms only (the CUDA reads mMaxLinksPerArticulation at the call);
+//   - the PxU16 rigid material index is read through its 32-bit word (PxgLoadU16);
+//   - the strided work index is clamped to tNumContacts - 1 after the per-lane guard (the
+//     P9.23 speculated-load fix); every admitted lane keeps its own index;
+//   - invDt and isTGS of the prepare are unread, as in the CUDA.
+//
+// In PXG_NOCONTRACT_SHADERS: the responses are dot-of-cross chains and the solve is
+// compared bit-exactly against a CPU transcription of the 5.12 CUDA (testFemClothSolve512).
 
-import pxgSlangAtomicFloat;   // atomicAdd(float*) parity — see that module
-import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
-import pxgSlangPrepDesc;       // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
-import pxgSlangSolverDesc;     // PxgSolverCoreDescGpu, PxgSolverSharedDescPGSGpu, PxgSolverSharedDescTGSGpu
-import pxgSlangCommon;         // PxgSolverBodyData, PxgSolverTxIData, PxgAlignedTransform
-import pxgSlangFemRigidContact; // prepareFEMContacts + the FRC_* block layout and its helpers
-                               // (extracted so sb_rigidContactPrepareLaunch shares it byte
-                               //  for byte instead of carrying a second copy)
+import pxgSlangFEMClothDesc;                // PxgFEMClothGpu, clothAt
+import pxgSlangSolverDesc;                  // PxgSolverCoreDescGpu
+import pxgSlangPrepDesc;                    // PxgPrePrepDescGpu
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PXG_RDBC_*, PxgGet*
+import pxgSlangVelocityReader;              // PxgMakeVelocityReader
+import pxgSlangDeformableUtils;             // prepareRigidDbContact, barycentricProjectTri
+import pxgSlangDeformableAndParticleUtils;  // PxgRigidPart, PxgDeformablePart, solveRigidDbContact
 
-// PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h).
+// PxgSoftBodyKernelGridDim / BlockDim::SB_UPDATEROTATION (the host launches all three with
+// them).  The bridge forwards only the grid, so the stride is rebuilt from these constants;
+// RC_BLOCK equals [numthreads].
 static const uint RC_BLOCK = 256u;
 static const uint RC_GRID = 1024u;
 
-// PX_MAX_NB_DEFORMABLE_SURFACE_TRI (PxDeformableSurface.h:56) == the element mask /
-// invalid marker; PXG_BITSHIFT_ELEMENT_ID (PxgSimulationCoreDesc.h:41) — cloth id / elem
-// index packing (PxGetClothId / PxGetClothElementIndex, PxgSimulationCoreDesc.h:135).
-static const uint PX_MAX_NB_DEFORMABLE_SURFACE_TRI = 0x000fffffu;
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
-
-// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes):
-//   PxU64 pairInd0 @0 (rigid id), PxU32 pairInd1 @8 (cloth compressed id),
-//   PxU32 rigidMatInd_isInCollision @12 (bit31 = isInCollision).
-static const uint CI_pairInd0    = 0u;
-static const uint CI_pairInd1    = 8u;
-static const uint CI_rigidMatInd = 12u;
-static const uint CI_STRIDE      = 16u;
-static const uint CI_COLLISION_FLAG = 0x80000000u;
+// PxsMaterialData stride (PxsMaterialCore.h).
+static const uint64_t RIGID_MATERIAL_STRIDE = 24;
 
 // ===========================================================================
-// Push-constant blobs (byte-identical to the CUDA arg packs / ABI rows).
+// cloth_rigidContactPrepareLaunch
+//   (PxgFEMCloth* femClothes, float4* contacts_restW, float4* normalPens,
+//    float4* barycentrics, const PxgDeformablePairInfo* contactInfos, PxU32* numContacts,
+//    PxgRigidDbContactBlock* contactBlocks, PxgPrePrepDesc* preDesc,
+//    PxgConstraintPrepareDesc* prepareDesc, float2* rigidLambdaNs, const PxReal invDt,
+//    PxgSolverSharedDescBase* sharedDesc, bool isTGS)
+//   -> {8 x 10, 4, 8, 1} = 104-byte blob.
 // ===========================================================================
-
-// cloth_rigidContactPrepareLaunch (FEMClothConstraintPrep.cu:70).  CUDA arg pack
-// (PxgFEMClothCore.cpp:328): { PxgFEMCloth* femClothes, float4* contacts_restW,
-// float4* normalPens, float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
-// PxU32* numContacts, PxgFemRigidConstraintBlock* constraints, PxgPrePrepDesc* preDesc,
-// PxgConstraintPrepareDesc* prepareDesc, PxReal* rigidLambdaNs, PxReal invDt,
-// PxgSolverSharedDescBase* sharedDesc, bool isTGS } -> natural-alignment blob = 104 bytes.
-// (ABI row {8,8,8,8,8,8,8,8,8,8,4,8,1}.)
 struct PrepContactParams
 {
-    uint64_t femClothes;     // @0
-    uint64_t contacts;       // @8
-    uint64_t normalPens;     // @16
-    uint64_t barycentrics;   // @24
-    uint64_t contactInfos;   // @32
-    uint64_t numContacts;    // @40
-    uint64_t constraints;    // @48
-    uint64_t prePrepDesc;    // @56
-    uint64_t prepareDesc;    // @64
-    uint64_t rigidLambdaNs;  // @72
-    float invDt;             // @80
-    uint _pad84;             // @84
-    uint64_t sharedDesc;     // @88  bodySims @32 + articulations @40 (articulation arm)
-    uint isTGS;              // @96  (bool, byte0)
-    uint _pad100;            // @100 -> 104
+    uint64_t femClothes;          // @0
+    uint64_t contacts_restW;      // @8   xyz = point, w = rest offset
+    uint64_t normalPens;          // @16  xyz = normal, w = penetration
+    uint64_t barycentrics;        // @24
+    uint64_t contactInfos;        // @32
+    uint64_t numContacts;         // @40
+    uint64_t contactBlocks;       // @48  output
+    uint64_t preDesc;             // @56
+    uint64_t prepareDesc;         // @64
+    uint64_t rigidLambdaNs;       // @72  output (zeroed)
+    float invDt;                  // @80  (unread, as in CUDA)
+    uint _pad84;                  // @84
+    uint64_t sharedDesc;          // @88  articulation arm only
+    uint isTGS;                   // @96  bool byte0 (unread, as in CUDA)
+    uint _pad100;                 // @100 -> 104
 }
+[[vk::push_constant]]
+ConstantBuffer<PrepContactParams> gPrep;
 
-// cloth_queryRigidClothContactReferenceCount{,TGS}Launch (FEMClothExternalSolve.cu:414 /
-// :558).  CUDA arg pack (PxgFEMClothCore.cpp:1741): { PxgFEMCloth* femClothes,
-// PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
-// PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-// PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
-// PxReal* appliedForces, PxU32* rigidBodyReferenceCounts } -> blob = 88 bytes.
-// (ABI row {8,8,8,8,8,8,8,8,4,8,8}.)
-struct QueryContactParams
-{
-    uint64_t femClothes;                // @0
-    uint64_t contactInfos;              // @8
-    uint64_t constraints;               // @16
-    uint64_t numContacts;               // @24
-    uint64_t prePrepDesc;               // @32
-    uint64_t solverCoreDesc;            // @40
-    uint64_t artiCoreDesc;              // @48 maxLinks / nbArticulations (articulation arm)
-    uint64_t sharedDesc;                // @56
-    float dt;                           // @64
-    uint _pad68;                        // @68
-    uint64_t appliedForces;             // @72
-    uint64_t rigidBodyReferenceCounts;  // @80 -> 88
-}
-
-// cloth_solveRigidClothCollision{,TGS}Launch (FEMClothExternalSolve.cu:535 / :578).
-// CUDA arg pack (PxgFEMClothCore.cpp:1797): { PxgFEMCloth* femClothes,
-// PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
-// PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-// PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc,
-// float4* rigidDeltaVel, PxReal* appliedForces, PxU32* rigidBodyReferenceCounts,
-// PxReal dt, PxsDeformableSurfaceMaterialData* materials,
-// const PxsMaterialData* rigidBodyMaterials } -> blob = 112 bytes.
-// (ABI row {8,8,8,8,8,8,8,8,8,8,8,4,8,8}.)
-struct SolveContactParams
-{
-    uint64_t femClothes;                // @0
-    uint64_t contactInfos;              // @8
-    uint64_t constraints;               // @16
-    uint64_t numContacts;               // @24
-    uint64_t prePrepDesc;               // @32
-    uint64_t solverCoreDesc;            // @40
-    uint64_t artiCoreDesc;              // @48 maxLinks / nbArticulations (articulation arm)
-    uint64_t sharedDesc;                // @56
-    uint64_t rigidDeltaVel;             // @64
-    uint64_t appliedForces;             // @72
-    uint64_t rigidBodyReferenceCounts;  // @80
-    float dt;                           // @88
-    uint _pad92;                        // @92
-    uint64_t materials;                 // @96  PxsDeformableSurfaceMaterialData*
-    uint64_t rigidBodyMaterials;        // @104 PxsMaterialData* -> 112
-}
-
-[[vk::push_constant]] ConstantBuffer<PrepContactParams> gPrep;
-[[vk::push_constant]] ConstantBuffer<QueryContactParams> gQuery;
-[[vk::push_constant]] ConstantBuffer<SolveContactParams> gSolve;
-
-
-// ===========================================================================
-// cloth_rigidContactPrepareLaunch (FEMClothConstraintPrep.cu:70)
-// ===========================================================================
 [shader("compute")]
-[numthreads(256, 1, 1)] // SB_UPDATEROTATION
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint tNumContacts = Ptr<uint>(gPrep.numContacts)[0];
@@ -235,451 +129,315 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
     const uint idx = groupThreadId.x;
 
-    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gPrep.femClothes);
-    Ptr<float> rigidLambdaNs = Ptr<float>(gPrep.rigidLambdaNs);
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gPrep.contactInfos);
+    Ptr<float2> rigidLambdaNs = Ptr<float2>(gPrep.rigidLambdaNs);
+    const uint64_t solverBodyIndicesPtr = Ptr<PxgPrePrepDescGpu>(gPrep.preDesc)[0].solverBodyIndices;
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (rawWorkIndex >= tNumContacts)
             return;
-
-        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
-        // mask -- every read below is still ISSUED for the lanes it excludes,
-        // with an address built from the unclamped index.  That is the defect
-        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
-        // Clamping once here keeps those speculated addresses inside the
-        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
-        // so nothing computed changes.  tNumContacts is at least 1 wherever this
-        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
-        // uniform, so the loop is not entered at all.
+        // P9.23: the guard above is per-lane; the clamp keeps the speculated addresses of
+        // the excluded lanes inside the allocation.  An admitted lane keeps its index.
         const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
 
-        rigidLambdaNs[workIndex] = 0.0f;
+        rigidLambdaNs[workIndex] = float2(0.0f, 0.0f);
 
-        const uint64_t ciBase = gPrep.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint64_t pairInd0 = Ptr<uint64_t>(ciBase + CI_pairInd0)[0];
-        const uint pairInd1 = Ptr<uint>(ciBase + CI_pairInd1)[0];
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gPrep.contactBlocks + uint64_t(workIndex / 32u) * PXG_RDBC_STRIDE;
 
-        // First actor: rigid body.  Second actor: cloth.
-        const uint64_t rigidId = pairInd0;
-        const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
-        const uint elementId = pairInd1 & PX_MAX_NB_DEFORMABLE_SURFACE_TRI;
+        // First one is rigid body.
+        const uint64_t rigidId = contactInfo.ref0;   // PxgGetRigidNode
 
-        if (elementId == PX_MAX_NB_DEFORMABLE_SURFACE_TRI)
+        if (!PxgIsValidPairInfo(contactInfo))
             continue;
 
-        Ptr<float4> accumDelta_invMass = Ptr<float4>(femClothes[clothId].mAccumulatedDeltaPos);
+        // Second one is cloth.
+        Ptr<PxgFEMClothGpu> cloth = clothAt(gPrep.femClothes, PxgGetDeformableId(contactInfo.ref1));
+        const uint elementId = PxgGetDeformableFeatureId(contactInfo.ref1);
+        const bool clothIsVertex = PxgGetDeformableFeatureType(contactInfo.ref1) == PXG_DREF_eVERTEX;
 
-        const float4 contact_restW = Ptr<float4>(gPrep.contacts)[workIndex];
+        const uint64_t accumDelta_invMass = cloth[0].mAccumulatedDeltaPos;
+
+        const float4 contact_restW = Ptr<float4>(gPrep.contacts_restW)[workIndex];
         const float4 normal_pen = Ptr<float4>(gPrep.normalPens)[workIndex];
-        const float4 barycentric = Ptr<float4>(gPrep.barycentrics)[workIndex];
 
         const float3 p = float3(contact_restW.x, contact_restW.y, contact_restW.z);
 
         float4 deltaP;
-        if (barycentric.w == 0.0f)
+        if (!clothIsVertex)
         {
-            const uint4 vertexIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices)[elementId];
-            const float4 a = accumDelta_invMass[vertexIndices.x];
-            const float4 b = accumDelta_invMass[vertexIndices.y];
-            const float4 cc = accumDelta_invMass[vertexIndices.z];
-            deltaP = a * barycentric.x + b * barycentric.y + cc * barycentric.z;
+            const float4 barycentric = Ptr<float4>(gPrep.barycentrics)[workIndex];
+            const uint4 vertexIndices = Ptr<uint4>(cloth[0].mTriangleVertexIndices_ownedEdges)[elementId];
+            deltaP = barycentricProjectTri(vertexIndices, accumDelta_invMass, barycentric);
         }
         else
         {
-            deltaP = accumDelta_invMass[elementId];
+            deltaP = Ptr<float4>(accumDelta_invMass)[elementId];
         }
 
         const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);
         const float pen = normal_pen.w - contact_restW.w;
+
         const float3 delta = float3(deltaP.x, deltaP.y, deltaP.z);
 
-        const uint index = workIndex / 32u;
-        const uint offset = workIndex & 31u;
-        const uint64_t cBase = gPrep.constraints + uint64_t(index) * FRC_STRIDE;
-
-        prepareFEMContacts(cBase, offset, normal, p, pen, delta, rigidId, barycentric,
-                           gPrep.prepareDesc, gPrep.prePrepDesc, femClothes[clothId].mPenBiasClamp,
-                           gPrep.sharedDesc);
+        prepareRigidDbContact(block, workIndex & 31u, normal, gPrep.sharedDesc, p, pen, delta, rigidId,
+                              gPrep.prepareDesc, solverBodyIndicesPtr, cloth[0].mPenBiasClamp);
     }
 }
 
-// ---------------------------------------------------------------------------
-// FEMCollision::readCloth (deformableUtils.cuh:488) — cloth VERTEX / TRIANGLE contact.
-// Returns the mass-split inverse masses; also fills deformableLinDelta (out).  P9.46: it
-// also fills the deformable friction, which comes from TWO different sources -- the
-// per-triangle material table for a triangle contact (:513-514), the per-vertex
-// mDynamicFrictions array for a vertex contact (:533).  Both are gated on `materials`.
-// ---------------------------------------------------------------------------
-float3 readClothVertexInvMasses(Ptr<PxgFEMClothGpu> femClothes, uint clothId, uint elementId, float4 bc,
-                                bool countReferenceOnly, out float3 deformableLinDelta,
-                                uint64_t materials, out float deformableFriction)
+// ===========================================================================
+// cloth_queryRigidClothContactReferenceCountLaunch
+//   (PxgFEMCloth* femClothes, PxgDeformablePairInfo* contactInfos, const float4* barycentrics,
+//    PxgRigidDbContactBlock* contactBlocks, PxU32* numContacts, PxgPrePrepDesc* prePrepDesc,
+//    PxgSolverCoreDesc* solverCoreDesc, PxgArticulationCoreDesc* artiCoreDesc,
+//    float4* solverBodyVelPool, const PxReal dt, float2* appliedForces,
+//    PxU32* rigidBodyRefCounts, bool isTGS, bool isVelocityIteration)
+//   -> {8 x 9, 4, 8, 8, 1, 1} = 104-byte blob (dt @72, appliedForces @80,
+//   rigidBodyRefCounts @88, isTGS byte @96, isVelocityIteration byte @97).
+// ===========================================================================
+struct QueryContactParams
 {
-    Ptr<float4> clothPosDeltas = Ptr<float4>(femClothes[clothId].mAccumulatedDeltaPos);
-    Ptr<float4> clothDeltaPos = Ptr<float4>(femClothes[clothId].mDeltaPos);
-
-    // The CUDA's FEMCollision member default (deformableUtils.cuh:270); the
-    // countReferenceOnly path never assigns it.
-    deformableFriction = 0.0f;
-
-    float3 invM;
-    float4 clothDelta;
-    if (bc.w == 0.0f)  // Cloth triangle
-    {
-        const uint4 triVertId = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices)[elementId];
-        const float4 pd0 = clothPosDeltas[triVertId.x];
-        const float4 pd1 = clothPosDeltas[triVertId.y];
-        const float4 pd2 = clothPosDeltas[triVertId.z];
-        clothDelta = pd0 * bc.x + pd1 * bc.y + pd2 * bc.z;
-        invM = float3(pd0.w, pd1.w, pd2.w);
-        if (!countReferenceOnly)
-        {
-            // P9.46: a TRIANGLE contact takes its friction from the material table through
-            // the per-triangle index (:513-514); a VERTEX contact takes it from the
-            // per-vertex mDynamicFrictions array instead (:533).  Two different sources for
-            // the same quantity, and only the .cu says which is which.
-            deformableFriction = femMaterialFrictionAt(
-                materials, femClothes[clothId].mMaterialIndices, elementId);
-
-            // Mass-splitting by the per-vertex reference counts (mDeltaPos.w).
-            const float rc0 = clothDeltaPos[triVertId.x].w;
-            const float rc1 = clothDeltaPos[triVertId.y].w;
-            const float rc2 = clothDeltaPos[triVertId.z].w;
-            invM = float3(invM.x * rc0, invM.y * rc1, invM.z * rc2);
-        }
-    }
-    else  // Cloth vertex
-    {
-        clothDelta = clothPosDeltas[elementId];
-        invM = float3(clothDelta.w, 0.0f, 0.0f);
-        if (!countReferenceOnly)
-        {
-            if (materials != 0UL)
-                deformableFriction = Ptr<float>(femClothes[clothId].mDynamicFrictions)[elementId];
-
-            const float rc = clothDeltaPos[elementId].w;
-            invM = float3(invM.x * rc, 0.0f, 0.0f);
-        }
-    }
-    deformableLinDelta = float3(clothDelta.x, clothDelta.y, clothDelta.z);
-    return invM;
+    uint64_t femClothes;          // @0
+    uint64_t contactInfos;        // @8   in/out (ACTIVE flag)
+    uint64_t barycentrics;        // @16
+    uint64_t contactBlocks;       // @24
+    uint64_t numContacts;         // @32
+    uint64_t prePrepDesc;         // @40
+    uint64_t solverCoreDesc;      // @48
+    uint64_t artiCoreDesc;        // @56
+    uint64_t solverBodyVelPool;   // @64
+    float dt;                     // @72
+    uint _pad76;                  // @76
+    uint64_t appliedForces;       // @80
+    uint64_t rigidBodyRefCounts;  // @88  output (atomic)
+    uint isTGS_isVelocityIteration; // @96 byte0 = isTGS, byte1 = isVelocityIteration
+    uint _pad100;                 // @100 -> 104
 }
+[[vk::push_constant]]
+ConstantBuffer<QueryContactParams> gQuery;
 
-// FEMCollision::getGlobalRigidBodyId (deformableUtils.cuh:442): -1 for a static body.
-// ===========================================================================
-// cloth_queryRigidClothContactReferenceCount{,TGS}Launch (FEMClothExternalSolve.cu:414 /
-// :558).  A checkOnlyActivity pass: mark each penetrating contact in-collision and bump
-// the referenced cloth vertex's mDeltaPos.w reference count.
-// ===========================================================================
-void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
+[shader("compute")]
+[numthreads(256, 1, 1)]   // == RC_BLOCK
+void cloth_queryRigidClothContactReferenceCountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gQuery.solverCoreDesc);
-    const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
+    const uint numSolverBodies = Ptr<PxgSolverCoreDescGpu>(gQuery.solverCoreDesc)[0].numSolverBodies;
     const uint tNumContacts = Ptr<uint>(gQuery.numContacts)[0];
-    const float dt = gQuery.dt;
-
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+    const uint idx = groupThreadId.x;
 
-    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gQuery.femClothes);
-    Ptr<float> appliedForces = Ptr<float>(gQuery.appliedForces);
+    const bool isTGS = (gQuery.isTGS_isVelocityIteration & 0xffu) != 0u;
+    const bool isVelocityIteration = ((gQuery.isTGS_isVelocityIteration >> 8u) & 0xffu) != 0u;
+    const float dt = gQuery.dt;
+
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gQuery.contactInfos);
+    Ptr<float2> appliedForces = Ptr<float2>(gQuery.appliedForces);
+
+    const PxgVelocityReaderGpu velocityReader = PxgMakeVelocityReader(gQuery.prePrepDesc, gQuery.solverCoreDesc,
+                                                                      gQuery.artiCoreDesc, gQuery.solverBodyVelPool,
+                                                                      numSolverBodies);
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (rawWorkIndex >= tNumContacts)
             return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23, see the prepare
 
-        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
-        // mask -- every read below is still ISSUED for the lanes it excludes,
-        // with an address built from the unclamped index.  That is the defect
-        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
-        // Clamping once here keeps those speculated addresses inside the
-        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
-        // so nothing computed changes.  tNumContacts is at least 1 wherever this
-        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
-        // uniform, so the loop is not entered at all.
-        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const bool wasActive = PxgIsActivePairInfo(contactInfo);
 
-        const uint64_t ciBase = gQuery.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];
-        const bool wasActive = (rigidMatInd & CI_COLLISION_FLAG) != 0u;
-        const uint64_t rigidId = Ptr<uint64_t>(ciBase + CI_pairInd0)[0];
-        const uint pairInd1 = Ptr<uint>(ciBase + CI_pairInd1)[0];
+        const uint64_t block = gQuery.contactBlocks + uint64_t(workIndex / 32u) * PXG_RDBC_STRIDE;
+        const uint threadIndexInWarp = workIndex & 31u;
 
-        const uint index = workIndex / 32u;
-        const uint offset = workIndex & 31u;
-        const uint64_t cBase = gQuery.constraints + uint64_t(index) * FRC_STRIDE;
+        // First actor: rigid body.
+        const uint64_t rigidId = contactInfo.ref0;
 
-        const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
-        const float4 bc = Ptr<float4>(cBase + FRC_barycentric)[offset];
-
-        const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
-        const uint elementId = pairInd1 & PX_MAX_NB_DEFORMABLE_SURFACE_TRI;
-
-        if (elementId < PX_MAX_NB_DEFORMABLE_SURFACE_TRI)
+        if (PxgIsValidPairInfo(contactInfo))
         {
-            // :349, before the wasActive branch — a static body yields -1.
-            const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gQuery.prePrepDesc, numSolverBodies);
-            const float3 bcVec = (bc.w == 0.0f) ? float3(bc.x, bc.y, bc.z) : float3(1.0f, 0.0f, 0.0f);
+            // Only the invMass is wanted from the block here.
+            const int globalRigidBodyId = getGlobalRigidBodyId(gQuery.prePrepDesc, rigidId, numSolverBodies,
+                                                               gQuery.artiCoreDesc);
+            const float rigidInvMass = Ptr<float4>(block + PXG_RDBC_fricTan0_invMass0)[threadIndexInWarp].w;
 
-            float3 deformableLinDelta;
-            float queryFriction;   // unused: the query never reads a material table
-            const float3 deformableInvMasses = readClothVertexInvMasses(femClothes, clothId, elementId, bc,
-                                                                        /*countReferenceOnly*/ true, deformableLinDelta,
-                                                                        /*materials*/ 0UL, queryFriction);
-
+            const bool checkOnlyActivity = true;
             bool isActive = false;
+
+            // Second actor: cloth.
+            Ptr<PxgFEMClothGpu> cloth = clothAt(gQuery.femClothes, PxgGetDeformableId(contactInfo.ref1));
+
+            PxgRigidPart rigid = PxgRigidPart();
+            PxgDeformablePart db = PxgDeformablePart();
+            PxgDbContactPair contactPair = PxgDbContactPair();
+            PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+
+            db.readCloth(cloth, contactInfo.ref1, gQuery.barycentrics, workIndex, 0UL,
+                         checkOnlyActivity, dt, isVelocityIteration);
+
             if (wasActive)
             {
+                // Once activated, keep the contact pair active to maintain a conservative
+                // reference count.
                 isActive = true;
             }
             else
             {
-                // readRigidBody(NULL,NULL): rigidBodyReferenceCount == 1, friction 0.
-                // the 3-wide mass-splitting term: bc.multiply(bc).dot(invM).  Computed at
-                // the call site because a tetrahedron needs the 4-wide form (see the module).
-                const float3 bcSq = float3(bcVec.x * bcVec.x, bcVec.y * bcVec.y, bcVec.z * bcVec.z);
-                const float massSplit = dotVec(bcSq, deformableInvMasses);
-                const ContactResult cr = contactInitialize(cBase, offset, rigidId, isTGS,
-                                                           appliedForces[workIndex], dt, bcVec,
-                                                           deformableLinDelta, massSplit,
-                                                           /*rigidRefCount*/ 1u, wasActive, /*checkOnly*/ true,
-                                                           gQuery.solverCoreDesc, gQuery.sharedDesc, gQuery.prePrepDesc,
-                                                           gQuery.artiCoreDesc,
-                                                           // The QUERY pass passes NULL for BOTH material tables
-                                                           // (FEMClothExternalSolve.cu:362 readRigidBody(...,NULL,NULL)
-                                                           // and readCloth(...,NULL,checkOnly)), so the combined
-                                                           // friction is combineFriction(0, 0, eMAX) == 0.  It could
-                                                           // not matter anyway: checkOnlyActivity returns before the
-                                                           // tangent block.
-                                                           /*combinedFriction*/ 0.0f);
-                isActive = cr.isActive;
+                rigid.readBodyProperties(rigidId, globalRigidBodyId, rigidInvMass, 0UL, 0UL);
+                rigid.readContactPrep(block, threadIndexInWarp);
+                rigid.readVelocity(velocityReader, rigidId, isTGS);
+                contactPair.readContactPrepRigidDb(block, threadIndexInWarp);
+                const float2 applied = appliedForces[workIndex];
+                isActive = solveRigidDbContact(rigid, db, contactPair, solveOut, applied.x, applied.y, dt,
+                                               wasActive, checkOnlyActivity, isVelocityIteration,
+                                               /*withAdhesion*/ false);
+
                 if (isActive)
-                {
-                    // markInCollision(true): set bit31.
-                    Ptr<uint>(ciBase + CI_rigidMatInd)[0] = rigidMatInd | CI_COLLISION_FLAG;
-                }
+                    Ptr<uint64_t>(gQuery.contactInfos + uint64_t(workIndex) * PXG_PAIRINFO_STRIDE
+                                  + PXG_PAIRINFO_ref1)[0] = PxgSetActiveRef1(contactInfo.ref1, true);
             }
 
             if (isActive)
             {
-                Ptr<float4> mDeltaPos = Ptr<float4>(femClothes[clothId].mDeltaPos);
-                if (bc.w == 0.0f)  // Cloth triangle: bump the three vertices' reference counts.
-                {
-                    const uint4 triVertId = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices)[elementId];
-                    if (bc.x > 1e-3f && deformableInvMasses.x != 0.0f)
-                    {
-                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.x, 1.0f);
-                    }
-                    if (bc.y > 1e-3f && deformableInvMasses.y != 0.0f)
-                    {
-                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.y, 1.0f);
-                    }
-                    if (bc.z > 1e-3f && deformableInvMasses.z != 0.0f)
-                    {
-                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.z, 1.0f);
-                    }
-                }
-                else  // Cloth vertex: bump the single vertex's reference count.
-                {
-                    if (deformableInvMasses.x != 0.0f)
-                    {
-                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, elementId, 1.0f);
-                    }
-                }
+                // Update cloth.
+                db.bumpClothRefCountPart(cloth);
 
-                // Increment the reference count of the rigid body (:404-408).  P9.45.
-                // Guarded exactly as the .cu: a static body has globalRigidBodyId == -1 and a
-                // kinematic one has invMass 0, and both keep the solve's count at its
-                // default of 1.  The softbody query already carried this line; the cloth one
-                // did not, and the two modules now match.
-                if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
+                // Update rigid body.
+                if (rigidIsRefCounted(globalRigidBodyId, rigidInvMass))
                 {
                     uint prev;
-                    InterlockedAdd((Ptr<uint>(gQuery.rigidBodyReferenceCounts))[globalRigidBodyId], 1u, prev);
+                    InterlockedAdd(Ptr<uint>(gQuery.rigidBodyRefCounts)[uint(globalRigidBodyId)], 1u, prev);
                 }
             }
         }
     }
 }
 
-[shader("compute")]
-[numthreads(256, 1, 1)] // SB_UPDATEROTATION
-void cloth_queryRigidClothContactReferenceCountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+// ===========================================================================
+// cloth_solveRigidClothCollisionLaunch
+//   (PxgFEMCloth* femClothes, const PxgDeformablePairInfo* contactInfos,
+//    const PxU16* contactRigidMaterials, const float4* barycentrics,
+//    PxgRigidDbContactBlock* contactBlocks, PxU32* numContacts, PxgPrePrepDesc* prePrepDesc,
+//    PxgSolverCoreDesc* solverCoreDesc, PxgArticulationCoreDesc* artiCoreDesc,
+//    float4* solverBodyVelPool, float4* rigidDeltaVel, float2* appliedForces,
+//    PxU32* rigidBodyRefCounts, const PxReal dt, PxsDeformableSurfaceMaterialData* materials,
+//    const PxsMaterialData* rigidBodyMaterials, bool isTGS, bool isVelocityIteration)
+//   -> {8 x 13, 4, 8, 8, 1, 1} = 136-byte blob (dt @104, materials @112,
+//   rigidBodyMaterials @120, isTGS byte @128, isVelocityIteration byte @129).
+// ===========================================================================
+struct SolveContactParams
 {
-    queryRigidClothContactReferenceCount(false, groupThreadId.x, groupId.x);
+    uint64_t femClothes;             // @0
+    uint64_t contactInfos;           // @8
+    uint64_t contactRigidMaterials;  // @16  PxU16*
+    uint64_t barycentrics;           // @24
+    uint64_t contactBlocks;          // @32
+    uint64_t numContacts;            // @40
+    uint64_t prePrepDesc;            // @48
+    uint64_t solverCoreDesc;         // @56
+    uint64_t artiCoreDesc;           // @64
+    uint64_t solverBodyVelPool;      // @72
+    uint64_t rigidDeltaVel;          // @80  output
+    uint64_t appliedForces;          // @88  in/out
+    uint64_t rigidBodyRefCounts;     // @96
+    float dt;                        // @104
+    uint _pad108;                    // @108
+    uint64_t materials;              // @112 PxsDeformableSurfaceMaterialData*
+    uint64_t rigidBodyMaterials;     // @120 PxsMaterialData*
+    uint isTGS_isVelocityIteration;  // @128 byte0 = isTGS, byte1 = isVelocityIteration
+    uint _pad132;                    // @132 -> 136
 }
+[[vk::push_constant]]
+ConstantBuffer<SolveContactParams> gSolve;
 
 [shader("compute")]
-[numthreads(256, 1, 1)] // SB_UPDATEROTATION
-void cloth_queryRigidClothContactReferenceCountTGSLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+[numthreads(256, 1, 1)]   // == RC_BLOCK
+void cloth_solveRigidClothCollisionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    queryRigidClothContactReferenceCount(true, groupThreadId.x, groupId.x);
-}
-
-// ===========================================================================
-// cloth_solveRigidClothCollision{,TGS}Launch (FEMClothExternalSolve.cu:535 / :578).
-// Solve the contact constraint; scatter the cloth-side correction into mDeltaPos and
-// write the (zero, static) rigid reaction into rigidDeltaVel.
-// ===========================================================================
-void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
-{
-    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gSolve.solverCoreDesc);
-    const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
+    const uint numSolverBodies = Ptr<PxgSolverCoreDescGpu>(gSolve.solverCoreDesc)[0].numSolverBodies;
     const uint tNumContacts = Ptr<uint>(gSolve.numContacts)[0];
-    const float dt = gSolve.dt;
-
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+    const uint idx = groupThreadId.x;
 
-    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gSolve.femClothes);
-    Ptr<float> appliedForces = Ptr<float>(gSolve.appliedForces);
-    Ptr<float4> rigidDeltaVel = Ptr<float4>(gSolve.rigidDeltaVel);
+    const bool isTGS = (gSolve.isTGS_isVelocityIteration & 0xffu) != 0u;
+    const bool isVelocityIteration = ((gSolve.isTGS_isVelocityIteration >> 8u) & 0xffu) != 0u;
+    const float dt = gSolve.dt;
+
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gSolve.contactInfos);
+    Ptr<float2> appliedForces = Ptr<float2>(gSolve.appliedForces);
+
+    const PxgVelocityReaderGpu velocityReader = PxgMakeVelocityReader(gSolve.prePrepDesc, gSolve.solverCoreDesc,
+                                                                      gSolve.artiCoreDesc, gSolve.solverBodyVelPool,
+                                                                      numSolverBodies);
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (rawWorkIndex >= tNumContacts)
             return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23, see the prepare
 
-        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
-        // mask -- every read below is still ISSUED for the lanes it excludes,
-        // with an address built from the unclamped index.  That is the defect
-        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
-        // Clamping once here keeps those speculated addresses inside the
-        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
-        // so nothing computed changes.  tNumContacts is at least 1 wherever this
-        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
-        // uniform, so the loop is not entered at all.
-        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const bool isActive = PxgIsActivePairInfo(contactInfo);
 
-        const uint64_t ciBase = gSolve.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];
-        const bool isActive = (rigidMatInd & CI_COLLISION_FLAG) != 0u;
-        const uint64_t rigidId = Ptr<uint64_t>(ciBase + CI_pairInd0)[0];
-        const uint pairInd1 = Ptr<uint>(ciBase + CI_pairInd1)[0];
+        const uint64_t block = gSolve.contactBlocks + uint64_t(workIndex / 32u) * PXG_RDBC_STRIDE;
+        const uint threadIndexInWarp = workIndex & 31u;
 
-        const uint index = workIndex / 32u;
-        const uint offset = workIndex & 31u;
-        const uint64_t cBase = gSolve.constraints + uint64_t(index) * FRC_STRIDE;
+        // First actor: rigid body.
+        const uint64_t rigidId = contactInfo.ref0;
 
-        const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
-        const float4 bc = Ptr<float4>(cBase + FRC_barycentric)[offset];
-
-        const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
-        const uint elementId = pairInd1 & PX_MAX_NB_DEFORMABLE_SURFACE_TRI;
-
-        if (elementId < PX_MAX_NB_DEFORMABLE_SURFACE_TRI)
+        if (PxgIsValidPairInfo(contactInfo))
         {
-            const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gSolve.prePrepDesc, numSolverBodies);
-            float3 deltaLinVel0 = float3(0.0f, 0.0f, 0.0f);
-            float3 deltaAngVel0 = float3(0.0f, 0.0f, 0.0f);
-            float count = 0.0f;
+            const int globalRigidBodyId = getGlobalRigidBodyId(gSolve.prePrepDesc, rigidId, numSolverBodies,
+                                                               gSolve.artiCoreDesc);
+            const float rigidInvMass = Ptr<float4>(block + PXG_RDBC_fricTan0_invMass0)[threadIndexInWarp].w;
+
+            const bool checkOnlyActivity = false;
+
+            PxgRigidPart rigid = PxgRigidPart();
+            PxgDeformablePart db = PxgDeformablePart();
+            PxgDbContactPair contactPair = PxgDbContactPair();
+            PxgDbSolveOutput solveOut = PxgDbSolveOutput();
 
             if (isActive)
             {
-                const float3 bcVec = (bc.w == 0.0f) ? float3(bc.x, bc.y, bc.z) : float3(1.0f, 0.0f, 0.0f);
+                // Second actor: cloth.
+                Ptr<PxgFEMClothGpu> cloth = clothAt(gSolve.femClothes, PxgGetDeformableId(contactInfo.ref1));
 
-                // readRigidBody: rigidBodyReferenceCount == 1 for a static body
-                // (globalRigidBodyId == -1); the friction half follows below.
-                uint rigidBodyReferenceCount = 1u;
-                if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
-                    rigidBodyReferenceCount = Ptr<uint>(gSolve.rigidBodyReferenceCounts)[globalRigidBodyId];
+                const uint rigidMaterialIndex = PxgLoadU16(gSolve.contactRigidMaterials, workIndex);
+                rigid.readBodyProperties(rigidId, globalRigidBodyId, rigidInvMass, gSolve.rigidBodyRefCounts,
+                                         gSolve.rigidBodyMaterials + uint64_t(rigidMaterialIndex) * RIGID_MATERIAL_STRIDE);
+                db.readCloth(cloth, contactInfo.ref1, gSolve.barycentrics, workIndex, gSolve.materials,
+                             checkOnlyActivity, dt, isVelocityIteration);
 
-                float3 deformableLinDelta;
-                float clothFriction;
-                const float3 deformableInvMasses = readClothVertexInvMasses(femClothes, clothId, elementId, bc,
-                                                                            /*countReferenceOnly*/ false, deformableLinDelta,
-                                                                            gSolve.materials, clothFriction);
+                rigid.readContactPrep(block, threadIndexInWarp);
+                rigid.readVelocity(velocityReader, rigidId, isTGS);
+                contactPair.readContactPrepRigidDb(block, threadIndexInWarp);
+                const float2 applied = appliedForces[workIndex];
+                const bool hasApplied = solveRigidDbContact(rigid, db, contactPair, solveOut, applied.x, applied.y, dt,
+                                                            isActive, checkOnlyActivity, isVelocityIteration,
+                                                            /*withAdhesion*/ false);
 
-                // P9.46: getCombinedFriction() = PxsCombinePxReal(rigidFriction, clothFriction,
-                // the RIGID material's fricCombineMode).  The rigid material index is the low
-                // 31 bits of the contact info word the query ORs its in-collision flag into
-                // (PxgFEMCore.h:160), so it must be masked, not read raw.
-                const RigidFriction rf = readRigidFriction(gSolve.rigidBodyMaterials,
-                                                           rigidMatInd & ~CI_COLLISION_FLAG);
-                const float combinedFriction = combineFriction(rf.friction, clothFriction, rf.combineMode);
-
-                const float3 bcSq = float3(bcVec.x * bcVec.x, bcVec.y * bcVec.y, bcVec.z * bcVec.z);
-                const float massSplit = dotVec(bcSq, deformableInvMasses);
-                const ContactResult cr = contactInitialize(cBase, offset, rigidId, isTGS,
-                                                           appliedForces[workIndex], dt, bcVec,
-                                                           deformableLinDelta, massSplit,
-                                                           rigidBodyReferenceCount, isActive, /*checkOnly*/ false,
-                                                           gSolve.solverCoreDesc, gSolve.sharedDesc, gSolve.prePrepDesc,
-                                                           gSolve.artiCoreDesc,
-                                                           combinedFriction);
-
-                // computeFEMChange: deltaPos = -(deltaLambdaN*normal + deltaLambdaT*tangent)*dt.
-                const float3 deltaPos = float3(
-                    -(cr.deltaLambdaN * cr.normal.x + cr.deltaLambdaT * cr.tangent.x) * dt,
-                    -(cr.deltaLambdaN * cr.normal.y + cr.deltaLambdaT * cr.tangent.y) * dt,
-                    -(cr.deltaLambdaN * cr.normal.z + cr.deltaLambdaT * cr.tangent.z) * dt);
-                appliedForces[workIndex] = cr.accumulatedDeltaLambdaN;
-
-                // writeCloth: scatter the cloth-side correction (plain RMW, see header).
-                Ptr<float4> mDeltaPos = Ptr<float4>(femClothes[clothId].mDeltaPos);
-                if (bc.w == 0.0f)  // Cloth triangle
+                if (hasApplied)
                 {
-                    const uint4 triVertInds = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices)[elementId];
-                    const float bcArr[3] = { bc.x, bc.y, bc.z };
-                    const uint triArr[3] = { triVertInds.x, triVertInds.y, triVertInds.z };
-                    const float invMArr[3] = { deformableInvMasses.x, deformableInvMasses.y, deformableInvMasses.z };
-                    for (uint it = 0; it < 3u; ++it)
-                    {
-                        if (invMArr[it] > 0.0f)
-                        {
-                            const float s = invMArr[it] * bcArr[it];
-                            pxgAtomicAddF4XYZ(femClothes[clothId].mDeltaPos, triArr[it], deltaPos * s);
-                        }
-                    }
-                }
-                else  // Cloth vertex
-                {
-                    if (deformableInvMasses.x > 0.0f)
-                    {
-                        const float s = deformableInvMasses.x;
-                        pxgAtomicAddF4XYZ(femClothes[clothId].mDeltaPos, elementId, deltaPos * s);
-                    }
-                }
+                    // delta is a position delta in position iterations and velocity * dt in
+                    // velocity iterations; cloth_applyExternalDeltasLaunch applies it.
+                    float3 delta;
+                    solveOut.computeDelta(contactPair, delta, dt);
+                    appliedForces[workIndex] = float2(solveOut.accumulatedDeltaLambdaN,
+                                                      appliedForces[workIndex].y + solveOut.deltaLambdaT);
 
-                // computeRigidChange (FEMClothExternalSolve.cu:515-528, deformableUtils.cuh:418).
-                // P9.45.  A STATIC body still leaves count and the deltas at 0 -- that is the
-                // .cu's own guard -- and so does a kinematic one (fricTan0_invMass0.w == 0).
-                // An ARTICULATION link reacts too since tranche A: prepareFEMContacts builds its
-                // anchor rows with invMass0 = 1 (so the guard admits it and the linear row is an
-                // impulse), and computeRigidChange's articulation arm drops the reference-count
-                // factor from the angular row (deformableUtils.cuh:420).
-                if (fricTan0_invMass0.w != 0.0f && !nodeIsStaticBody(rigidId))
-                {
-                    count = 1.0f;
-                    const RigidChange rc = computeRigidChange(cr, nodeIsArticulation(rigidId),
-                                                              fricTan0_invMass0.w,
-                                                              rigidBodyReferenceCount);
-                    deltaLinVel0 = rc.deltaLinVel0;
-                    deltaAngVel0 = rc.deltaAngVel0;
+                    // Update cloth: .xyz weighted by the refCount-inflated vertexInvMasses.
+                    db.writeCloth(cloth, delta);
                 }
             }
 
-            // writeRigidBody: for a static contact the CUDA writes zeros with count 0.
-            rigidDeltaVel[workIndex] = float4(deltaLinVel0.x, deltaLinVel0.y, deltaLinVel0.z, count);
-            rigidDeltaVel[workIndex + tNumContacts] = float4(deltaAngVel0.x, deltaAngVel0.y, deltaAngVel0.z, 0.0f);
+            // Update rigid body.  Every valid slot is written every iteration, inactive
+            // included: invMass is still zero on that path, the no-op sentinel.
+            rigid.writeContactDeltas(gSolve.rigidDeltaVel, rigidId, contactPair, solveOut, workIndex,
+                                     workIndex + tNumContacts);
         }
     }
-}
-
-[shader("compute")]
-[numthreads(256, 1, 1)] // SB_UPDATEROTATION
-void cloth_solveRigidClothCollisionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
-{
-    solveRigidClothContact(false, groupThreadId.x, groupId.x);
-}
-
-[shader("compute")]
-[numthreads(256, 1, 1)] // SB_UPDATEROTATION
-void cloth_solveRigidClothCollisionTGSLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
-{
-    solveRigidClothContact(true, groupThreadId.x, groupId.x);
 }

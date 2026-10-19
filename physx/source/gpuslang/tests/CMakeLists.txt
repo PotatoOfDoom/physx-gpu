@@ -105,46 +105,6 @@ if(WIN32)
     target_link_libraries(gpuslang-backend PUBLIC d3d12 dxgi)
 endif()
 
-# ---- tests pending the PhysX 5.12 port ----
-# The engine tree is PhysX 5.12.0; the Slang shaders, their struct mirrors and the
-# fixtures below still describe 5.6.1.  Each file listed here fails to COMPILE only
-# because its area's layouts / kernels have not been brought to 5.12 yet (a mirrored
-# struct changed size, a field was renamed or removed, a static_assert pins a 5.6.1
-# offset).  They are excluded from gpuslang-tests -- and their suites from ctest --
-# until the area is ported; porting an area means taking its files OFF this list.
-# Purely mechanical host-API breakage (allocator, wrangler, context manager) is fixed
-# in place instead and never parked here.  Keep the list minimal.
-set(PXG_TESTS_PENDING_512
-    # rigid solver / simulation core: ported to 5.12 (none pending).
-    # articulation (gpuarticulation): ported to 5.12 (none pending).
-    # narrowphase, rigid (gpunarrowphase rigid contact paths): none -- every rigid
-    # narrowphase fixture still compiles against the 5.12 headers.
-    # deformable / particle (gpusimulationcontroller FEM cloth / softbody / PBD,
-    # gpunarrowphase deformable contact gen): PxgFEMCloth / PxgSoftBody /
-    # PxgParticleSystem layouts, PxgDeformableRef / PxgDeformablePairInfo replacing the
-    # packed ids and the FEM / particle contact types, the particle-buffer API.
-    testParticleSim.cpp
-    testFemClothSim.cpp
-    testSoftBodySim.cpp
-    testSoftBodyPsPrepare.cpp
-    testSoftBodySdfMid.cpp
-    testFemClothSdfCg.cpp
-    testNpTetTriMid.cpp
-    testFcConvexTri.cpp
-    testFcVertexConvex.cpp
-    testPsBounds.cpp
-    testPsContactGen.cpp
-    testPsConvexContactGen.cpp
-    testPsDiffuseContactGen.cpp
-    testPsBoundaryDensity.cpp
-    testPsMeshMidphase.cpp
-    testPsHfMidphase.cpp
-    testPsSdfMidphase.cpp
-    testPsDiffuseBuffers.cpp
-    testPsDiffuseCreate.cpp
-    testPsDiffuseAdvect.cpp
-    testPsDiffuseOneWay.cpp)
-
 # ---- test executable ----
 set(PXG_TEST_SOURCES
     main.cpp
@@ -335,8 +295,6 @@ set(PXG_TEST_SOURCES
     testNpAnisoOutput.cpp
     testNpSmoothPos.cpp
     testNpIsoAvgVerts.cpp
-    testNpPsSolvePC.cpp
-    testNpPsSolvePCTGS.cpp
     testNpPsWeightKernels.cpp
     testNpPsDiffuseUpdate.cpp
     testNpPsDiffuseSpawn.cpp
@@ -369,8 +327,7 @@ set(PXG_TEST_SOURCES
     testNpClosest.cpp
     testNpTetra.cpp
     testNpEdgeEdge.cpp
-    testNpDefFilter.cpp
-    testNpDefFilterBda.cpp
+    testDeformableRef512.cpp
     testNpBv32.cpp
     testNpMidphaseCvx.cpp
     testNpMidphaseDeform.cpp
@@ -382,6 +339,8 @@ set(PXG_TEST_SOURCES
     testSoftBodySim.cpp
     testSoftBodyPsContactGen.cpp
     testSoftBodyPsPrepare.cpp
+    testSoftBodySolve512.cpp
+    testFemClothSolve512.cpp
     testParticleContactSort.cpp
     testFemContactSort.cpp
     testPcmManifold.cpp
@@ -638,13 +597,6 @@ set(PXG_TEST_SOURCES
     # allocator manager now takes by reference; it allocates through the
     # PxCudaContext and therefore through the Vulkan context.
     ${GPUSLANG_ROOT}/../gpucommon/src/PxgMemoryManager.cpp)
-foreach(pendingTest ${PXG_TESTS_PENDING_512})
-    list(FIND PXG_TEST_SOURCES ${pendingTest} pendingIndex)
-    if(pendingIndex EQUAL -1)
-        message(FATAL_ERROR "PXG_TESTS_PENDING_512 names ${pendingTest}, which is not a gpuslang-tests source")
-    endif()
-endforeach()
-list(REMOVE_ITEM PXG_TEST_SOURCES ${PXG_TESTS_PENDING_512})
 add_executable(gpuslang-tests ${PXG_TEST_SOURCES})
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # PXG_NO_CUDA_TOOLKIT lets the real CudaKernelWrangler.cpp compile without <cuda.h>
@@ -759,66 +711,21 @@ endif()
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
-# The PXG_TEST names compiled into gpuslang-tests and the ones parked with
-# PXG_TESTS_PENDING_512, each joined with '|' so one string(FIND) answers "does
-# any test name contain this suite filter" -- the same substring match main.cpp
-# applies.  A source's test*.inc includes are scanned with it.
-function(pxg_collect_test_names out)
-    set(names "|")
-    foreach(src ${ARGN})
-        if(NOT src MATCHES "^test.*\\.cpp$")
-            continue()
-        endif()
-        set(files ${CMAKE_CURRENT_SOURCE_DIR}/${src})
-        file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/${src} incs REGEX "#include \"test[A-Za-z0-9_]*\\.inc\"")
-        foreach(inc ${incs})
-            string(REGEX REPLACE ".*#include \"(test[A-Za-z0-9_]*\\.inc)\".*" "\\1" incFile "${inc}")
-            list(APPEND files ${CMAKE_CURRENT_SOURCE_DIR}/${incFile})
-        endforeach()
-        foreach(f ${files})
-            file(STRINGS ${f} lines REGEX "PXG_TEST\\([A-Za-z0-9_]+\\)")
-            foreach(line ${lines})
-                string(REGEX MATCHALL "PXG_TEST\\([A-Za-z0-9_]+\\)" hits "${line}")
-                foreach(hit ${hits})
-                    string(REGEX REPLACE "PXG_TEST\\(([A-Za-z0-9_]+)\\)" "\\1" name "${hit}")
-                    string(APPEND names "${name}|")
-                endforeach()
-            endforeach()
-        endforeach()
-    endforeach()
-    set(${out} "${names}" PARENT_SCOPE)
-endfunction()
-pxg_collect_test_names(PXG_ACTIVE_TEST_NAMES ${PXG_TEST_SOURCES})
-pxg_collect_test_names(PXG_PENDING_TEST_NAMES ${PXG_TESTS_PENDING_512})
-set(PXG_PENDING_512_SUITES)
 foreach(suite scan radixSort radixSortDesc aggregateBda radixSortGather preIntegration integration updateBounds frozenHistogram memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS npCrsWrapper2 npTriTriReduce npTriTriWrite npTriTriBlock npTriTriGeom npTriTriBody npTriTriFind npTriTriTail npTriTriKernel
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npConvexEdgeSat npConvexFeature npConvexTriOut npConvexPolyClip npCvxTriEmit npCvxTriFind npCvxTriPurge npCvxTriWorldNormal npGjkSupport npGjkNewPoint npGjkBarycentric npHfTriFlags npWarpVec npGjkSimplex npGjkClosestTri npGjkClosestTet npGjkClosestSeg npGjkOutput npGjkPermute npGjkSupportStep npGjkWarmStart npGjk npEpaStart4 npEpaStart123 npEpa npGjkWarm npCvxCvxEE npCvxRayPoly npCvxFaceContacts npCvxReduceManifold npCvxWitnessPoly npCvxLocalNormal npCvxAddManifold npCvxBlob npCvxBlobRead npCvxEEDriver npCvxRefFrame npCvxPolyClip npCvxClipEmit npCvxContactDecide npCvxCollidePrep npCvxCollideDecide npCvxLostFound npCvxWriteStream npCvxFinishContacts npCvxStage1Refresh npCvxStage2Setup cvxCollide npCvxPlanePolyIndex npCvxPlaneRefresh npCvxPlaneGen npCvxPlaneOut npCvxCorrelate npCvxPostProcess npCvxTrimeshOut npTriTriOverlap npCvxTriNpSetup npCvxHfNpSetup npCvxCoreOut npCvxCoreSetup npCvxCoreSupport npCvxCoreFace npCvxCorePtsFace npCvxCoreClip npCvxCoreContact npCvxCoreGjk npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npCvxBvhGlue npCvxCoreWarpAcc cvxCoreTailBda p86SignedZero npD6JointPrep npRemapIndex npContactPrePrep npRigidSumBatches npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npSlabRefCount npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiBitfield npArtiSpatialMatMat npArtiConstructSM npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npGridIndex npJacobiRotate npClothAtan npAnisoHelpers npSparseGridHash npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridLookup npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npDefFilterBda softBodyPsContactGen softBodyPsPrepare npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal particleSim femClothSim cvxCoreClothNp softBodySim particleContactSort femContactSort pcmManifold convexTrimeshMidphase convexHfMidphase midphaseAlloc triFeature deferContact initManifolds pairMgmt polyClip convexHull convexSat convexSelect particleGrid contactReduce cvxTriEmit cvxTriSetup sphereTriNp cvxHfSetup cvxHfPostProcess sphereHfCore hfTriFlagsBda segTriangleBda capTriangleBda capsuleHfCore radixWarp sortTriIndices cvxTriPostProcess cvxTriCorrelate cvxTriFinish npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psContactGen psContactSort psContactSolve psContactSolveTgs psContactSolveRigid directApiRigidGet directApiRigidAccelGet directApiRigidGetForceTorque directApiRigidSet directApiD6JointGet directApiRadixCopy2 directApiMergeAabb directApiUpdateBodies rigidDeltaAccum psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide fcPrim2 npPolyClip4 fcConvexTri fcVertexConvex fcStaticTriCloth fcMidphase npSbPrim npSbRemap npCvxHfMid npTriPlaneNp npTriHfNp npCvxMeshNp npCvxHfNp npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce boxBoxNphase sphereNphase convexPlaneNphase broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npConvexEdgeSat npConvexFeature npConvexTriOut npConvexPolyClip npCvxTriEmit npCvxTriFind npCvxTriPurge npCvxTriWorldNormal npGjkSupport npGjkNewPoint npGjkBarycentric npHfTriFlags npWarpVec npGjkSimplex npGjkClosestTri npGjkClosestTet npGjkClosestSeg npGjkOutput npGjkPermute npGjkSupportStep npGjkWarmStart npGjk npEpaStart4 npEpaStart123 npEpa npGjkWarm npCvxCvxEE npCvxRayPoly npCvxFaceContacts npCvxReduceManifold npCvxWitnessPoly npCvxLocalNormal npCvxAddManifold npCvxBlob npCvxBlobRead npCvxEEDriver npCvxRefFrame npCvxPolyClip npCvxClipEmit npCvxContactDecide npCvxCollidePrep npCvxCollideDecide npCvxLostFound npCvxWriteStream npCvxFinishContacts npCvxStage1Refresh npCvxStage2Setup cvxCollide npCvxPlanePolyIndex npCvxPlaneRefresh npCvxPlaneGen npCvxPlaneOut npCvxCorrelate npCvxPostProcess npCvxTrimeshOut npTriTriOverlap npCvxTriNpSetup npCvxHfNpSetup npCvxCoreOut npCvxCoreSetup npCvxCoreSupport npCvxCoreFace npCvxCorePtsFace npCvxCoreClip npCvxCoreContact npCvxCoreGjk npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npCvxBvhGlue npCvxCoreWarpAcc cvxCoreTailBda p86SignedZero npD6JointPrep npRemapIndex npContactPrePrep npRigidSumBatches npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npSlabRefCount npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiBitfield npArtiSpatialMatMat npArtiConstructSM npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npGridIndex npJacobiRotate npClothAtan npAnisoHelpers npSparseGridHash npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridLookup npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge deformableRef512 softBodyPsContactGen softBodyPsPrepare npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal particleSim femClothSim cvxCoreClothNp softBodySim softBodySolve512 femClothSolve512 particleContactSort femContactSort pcmManifold convexTrimeshMidphase convexHfMidphase midphaseAlloc triFeature deferContact initManifolds pairMgmt polyClip convexHull convexSat convexSelect particleGrid contactReduce cvxTriEmit cvxTriSetup sphereTriNp cvxHfSetup cvxHfPostProcess sphereHfCore hfTriFlagsBda segTriangleBda capTriangleBda capsuleHfCore radixWarp sortTriIndices cvxTriPostProcess cvxTriCorrelate cvxTriFinish npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psContactGen psContactSort psContactSolve psContactSolveTgs psContactSolveRigid directApiRigidGet directApiRigidAccelGet directApiRigidGetForceTorque directApiRigidSet directApiD6JointGet directApiRadixCopy2 directApiMergeAabb directApiUpdateBodies rigidDeltaAccum psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide fcPrim2 npPolyClip4 fcConvexTri fcVertexConvex fcStaticTriCloth fcMidphase npSbPrim npSbRemap npCvxHfMid npTriPlaneNp npTriHfNp npCvxMeshNp npCvxHfNp npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce boxBoxNphase sphereNphase convexPlaneNphase broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda robustProbe p1DeviceV2 p4ModulePath p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations artiBlockLayout artiCoreDescLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide
+        p0Subgroup p0Bda robustProbe p1DeviceV2 p4ModulePath p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations artiBlockLayout artiCoreDescLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseNoFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide
         pipelineRefusal)
-    # A suite whose every test case lives in a PXG_TESTS_PENDING_512 file would run
-    # nothing (and main() fails a filter that matches no test), so it is held back
-    # with its files.  A suite that matches neither list still gets its add_test and
-    # fails loudly, as before.
-    string(FIND "${PXG_ACTIVE_TEST_NAMES}" "${suite}" activeHit)
-    string(FIND "${PXG_PENDING_TEST_NAMES}" "${suite}" pendingHit)
-    if(activeHit EQUAL -1 AND NOT pendingHit EQUAL -1)
-        list(APPEND PXG_PENDING_512_SUITES ${suite})
-        continue()
-    endif()
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
 endforeach()
-list(LENGTH PXG_TESTS_PENDING_512 pxgPendingFileCount)
-list(LENGTH PXG_PENDING_512_SUITES pxgPendingSuiteCount)
-message(STATUS "gpuslang-tests: ${pxgPendingFileCount} test file(s) / ${pxgPendingSuiteCount} suite(s) pending the 5.12 port: ${PXG_PENDING_512_SUITES}")
 
 # Cross-compilation check for the D3D12 backend: every kernel must also
 # compile to HLSL (SM 6.0).  Actual DXIL codegen and execution on WARP/real
@@ -1035,8 +942,6 @@ set(PXG_HLSL_ENTRIES
     "npAnisoOutput:anisoOutput"
     "npSmoothPos:smoothPos"
     "npIsoAvgVerts:isoAvgVerts"
-    "npPsSolvePC:psSolvePC"
-    "npPsSolvePCTGS:psSolvePCTGS"
     "npPsWeightKernels:psWeightKernels"
     "npPsDiffuseUpdate:psDiffuseUpdate"
     "npPsDiffuseSpawn:psDiffuseSpawn"
@@ -1068,7 +973,6 @@ set(PXG_HLSL_ENTRIES
     "npClosest:ctClosestPtTriangle" "npClosest:ctClosestPtEdge"
     "npTetra:ctTriBBox" "npTetra:ctTetBBox" "npTetra:ctTetBary"
     "npEdgeEdge:ctLineLine" "npEdgeEdge:ctEdgeEdge"
-    "npDefFilter:ctFindParticleRigid" "npDefFilter:ctFindRigid" "npDefFilter:ctFindNonRigid" "npDefFilter:ctFindRange" "npDefFilter:ctEdgeAuth"
     "npBv32:ctBv32Query"
     "npMidphaseCvx:ctMidphaseCvx"
     "npMidphaseDeform:ctClothTri" "npMidphaseDeform:ctSoftbodyTet" "npMidphaseDeform:ctSoftbodyBoxTet"
@@ -1437,6 +1341,11 @@ add_test(NAME gpuslang.launchAbi
 # failed the first.
 add_test(NAME gpuslang.helperUniformity
     COMMAND ${Python3_EXECUTABLE} ${GPUSLANG_ROOT}/tools/check_helper_uniformity.py)
+# The gate reads the BUILT SPIR-V, so it needs the shader directory the functional
+# suites get; without it the script refuses ("set PXG_SHADER_DIR") and ctest
+# reported a failure that said nothing about the shaders.
+set_tests_properties(gpuslang.helperUniformity PROPERTIES
+    ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
 
 # ---------------------------------------------------------------------------
 # A constant that names a PxGeometryType member must carry that member's value

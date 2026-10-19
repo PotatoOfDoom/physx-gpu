@@ -33,8 +33,9 @@
 //
 // The five share a name prefix and almost nothing else, and this one is the
 // clearest case yet.  Plane, convex and trimesh end in TestOutput::writeOutput and
-// share a 136-byte ABI row.  The tetmesh one (P9.72) ends in PxgFEMContactWriter
-// and needed its own 144-byte row.  This one ends in PxgFEMContactWriter TOO -- and
+// share a 136-byte ABI row.  The tetmesh one (P9.72) ends in PxgRigidDbContactWriter
+// (5.12; PxgFEMContactWriter in 5.6.1) and needed its own 144-byte row.  This one ends
+// in PxgRigidDbContactWriter TOO -- and
 // is still not the tetmesh kernel with triangles, because:
 //
 //   IT DOES NOT TRAVERSE A BVH AT ALL.  Every other kernel in the family builds a
@@ -52,29 +53,29 @@
 //   `pairIndex += gridDim.x * blockDim.x` over `numPairs`.  Every other kernel here
 //   sizes its grid to the test count.
 //
-//   FOURTEEN parameters, ending in the by-value writer -- a 176-byte blob that
+//   TWELVE parameters (5.12; fourteen in 5.6.1, which also passed the filter pair
+//   list and its count), ending in the by-value writer -- a 176-byte blob that
 //   matches no existing row.  kCvxCorePlane (136) and kCvxCoreTet (144) are both
 //   wrong, and P9.48d is why "close" is fatal rather than approximate: a missing or
 //   mismatched row gives pushConstantSizeFor() == 0 and every launch is REFUSED IN
 //   SILENCE, with fixtures, manifest test, suite and scenes all still green.
 //
-//   THE CONTACT IS WRITTEN **WITH** BARYCENTRIC (:1270-1272).  The tetmesh kernel
-//   uses writeRigidVsDeformableContactNoBarycentric; this one uses
-//   writeRigidVsDeformableContact, which additionally stores outBarycentric[index]
-//   -- and the barycentric is not a by-product, it is how the solver distributes the
-//   impulse over the triangle's three vertices.  Dropping it would leave the cloth
-//   receiving contacts that push nothing.
+//   THE CONTACT IS WRITTEN **WITH** BARYCENTRIC.  The tetmesh kernel uses
+//   writeVolumeContact (no barycentric); this one uses writeSurfaceContact, which
+//   additionally stores outBarycentric[index] -- and the barycentric is not a
+//   by-product, it is how the solver distributes the impulse over the triangle's
+//   three vertices.  Dropping it would leave the cloth receiving contacts that push
+//   nothing.  5.12 takes it at the CLOTH'S OWN WITNESS, points[i] - normal *
+//   dists[i] * 0.5, not at the written midpoint (5.6.1 used the midpoint).
 //
 //   THERE IS NO ERP HACK.  The tetmesh kernel scales penetrating distances to 40%
 //   ("VR @@@ add fake ERP. it overshoots otherwise", :1184).  This kernel writes
 //   dists[i] RAW (:1269).  Carrying the tetmesh line across would have been an easy
 //   and completely silent behaviour change.
 //
-//   THE FILTER IS A TRIPLE TEST WITH `&&` (:1235-1238).  All THREE of the
-//   triangle's vertices must be filtered against this rigid before the pair is
-//   skipped.  `||` would suppress a triangle any one of whose vertices is attached
-//   -- the difference shows up exactly at the boundary of an attachment region,
-//   which is where cloth-vs-rigid scenes actually live.
+//   THE FILTER IS ONE (rigid, TRIANGLE) SEARCH (5.12): findRigidSurfaceTriangleFilter
+//   over the cloth's mRigidSurfaceFilterPairs, keyed by the rigid's cache ref.  5.6.1
+//   skipped a triangle only when all three of its vertices were filtered.
 //
 // ===========================================================================
 // PxMeshScale ON THE CLOTH BVH: WELL-DEFINED, AND IT HAD TO BE CHECKED
@@ -111,7 +112,8 @@
 //   pxgSlangCvxCoreCvx   (P9.69a)  gjkDistanceQ / epaDepthQ / faceClipQ
 //   pxgSlangCvxCoreMake  (P9.69b)  Gu::makeConvexShape
 //   pxgSlangCvxCoreBvh   (P9.70c)  cvxBvhCreateConvex, the triangle arm
-//   pxgSlangDefFilter              dfFindRigidPair, the consolidated find()
+//   pxgSlangDefFilter              findRigidSurfaceTriangleFilter (5.12)
+//   pxgSlangDeformableWriters      PxgRigidDbContactWriterGpu (5.12)
 //   pxgSlangFEMClothDesc           the PxgFEMCloth mirror
 //
 // The GJK/EPA/clip layer comes in by #include, not `import`: P9.69a measured that
@@ -121,7 +123,9 @@
 import pxgSlangNpAbi;           // struct mirrors and quaternion helpers
 import pxgSlangCvxCoreShape;    // ShapeRef / PtsRef / supportLocalQ / contactFaceQ
 import pxgSlangFEMClothDesc;    // PxgFEMClothGpu
-import pxgSlangDefFilter;       // dfFindRigidPair over PxgRigidFilterPair
+import pxgSlangDefFilter;       // findRigidSurfaceTriangleFilter (5.12)
+import pxgSlangDeformableRef;   // PxgEncodeDeformableTriangle
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 
 #include "pxgSlangCvxCoreCvx.slang"    // gjkDistanceQ / epaDepthQ / faceClipQ
 
@@ -146,15 +150,14 @@ static const uint EGT_TRIANGLEMESH = 8u;   // PxGeometryType::eTRIANGLEMESH
 // tools/check_block_coverage.py is what holds this to the arithmetic.
 static const uint CVXCORE_CLOTH_BLOCK = 512u;
 static const uint MAX_CONVEX_CONTACTS = 4u;      // Gu::MAX_CONVEX_CONTACTS
-static const uint PXG_BITSHIFT_ELEMENT_ID = 20u; // PxgSimulationCoreDesc.h:41
 
 // ---------------------------------------------------------------------------
-// Push constant: the CUDA parameter list EXACTLY (:1196-1210).  Fourteen arguments,
-// the last of them PxgFEMContactWriter BY VALUE -- nine device pointers plus
-// PxU32 maxNumContacts plus a 4-byte tail pad, 80 bytes (PxgFEMCore.h:361-375).
+// Push constant: the 5.12 CUDA parameter list EXACTLY.  Twelve arguments, the last of
+// them PxgRigidDbContactWriter BY VALUE -- nine device pointers plus PxU32
+// maxNumContacts plus a 4-byte tail pad, 80 bytes.
 //
-//   ten pointers @0..@72, two PxU32 @80/@84, one pointer @88, the writer at @96
-//   (8-aligned, so paramAlign moves nothing) -> a 176-byte blob.
+//   nine pointers @0..@64, PxU32 stackSizeBytes @72, one pointer @80, the writer at
+//   @96 (paramAlign(80) = 16 moves it from 88) -> a 176-byte blob.
 // ---------------------------------------------------------------------------
 struct CvxCoreClothParams
 {
@@ -167,35 +170,38 @@ struct CvxCoreClothParams
     uint64_t transformCache;          // @48
     uint64_t contactDistance;         // @56
     uint64_t restDistance;            // @64
-    uint64_t filterPairs;             // @72   const PxgRigidFilterPair*
-    uint nbFilterPairs;               // @80
-    uint stackSizeBytes;              // @84
-    uint64_t stackSizeNeededOnDevice; // @88   PxU32*
-    // --- PxgFEMContactWriter, by value (PxgFEMCore.h:361) ---
-    uint64_t w_outPoint;              // @96   float4*
-    uint64_t w_outNormalPen;          // @104  float4*
-    uint64_t w_outBarycentric;        // @112  float4*  (LIVE on this path)
-    uint64_t w_outContactInfo;        // @120  PxgFemOtherContactInfo*  (16 B stride)
-    uint64_t w_totalContactCount;     // @128  PxU32*
-    uint64_t w_contactByX;            // @136  PxU64*
-    uint64_t w_tempContactByX;        // @144  PxU32*
-    uint64_t w_contactIndexSortedByX; // @152  PxU32*
-    uint64_t w_contactSortedByX;      // @160  PxU32*  (unused on this path)
-    uint w_maxNumContacts;            // @168  PxU32
-    uint _pad172;                     // @172 -> 176
+    uint stackSizeBytes;              // @72
+    uint _pad76;                      // @76
+    uint64_t stackSizeNeededOnDevice; // @80   PxU32*
+    uint64_t _pad88;                  // @88   paramAlign(80) = 16
+    // --- PxgRigidDbContactWriter, by value (PxgDeformableContactWriters.h, 5.12) ---
+    uint64_t w_outPoint;                  // @96   float4*
+    uint64_t w_outNormalPen;              // @104  float4*
+    uint64_t w_outBarycentric;            // @112  float4*  (LIVE on this path)
+    uint64_t w_outContactInfo;            // @120  PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;     // @128  PxU16*
+    uint64_t w_totalContactCount;         // @136  PxU32*
+    uint64_t w_contactByRigid;            // @144  PxU64*
+    uint64_t w_tempContactByRigid;        // @152  PxU32*
+    uint64_t w_contactIndexSortedByRigid; // @160  PxU32*
+    uint w_maxNumContacts;                // @168  PxU32
+    uint _pad172;                         // @172 -> 176
 }
 
 [[vk::push_constant]]
 ConstantBuffer<CvxCoreClothParams> gCloth;
 
-// PxEncodeClothIndex (PxgSimulationCoreDesc.h:101-108).  NOTE the shift constant:
-// PXG_BITSHIFT_ELEMENT_ID, not PXG_BITSHIFT_TET_ID.  Both happen to be 20 today
-// (PxgSimulationCoreDesc.h:40-41), which is exactly why each is spelled from its own
-// line -- if upstream ever splits them, a remembered 20 would encode cloth triangles
-// into the softbody's namespace and nothing would fail loudly.
-uint encodeCloth(uint clothId, uint elementId)
+PxgRigidDbContactWriterGpu clothWriter()
 {
-    return (clothId << PXG_BITSHIFT_ELEMENT_ID) | elementId;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gCloth.w_outPoint;                 w.outNormalPen = gCloth.w_outNormalPen;
+    w.outBarycentric = gCloth.w_outBarycentric;     w.outContactInfo = gCloth.w_outContactInfo;
+    w.outRigidMaterialIndex = gCloth.w_outRigidMaterialIndex;
+    w.totalContactCount = gCloth.w_totalContactCount;
+    w.contactByRigid = gCloth.w_contactByRigid;     w.tempContactByRigid = gCloth.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gCloth.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gCloth.w_maxNumContacts;
+    return w;
 }
 
 // Gu::ConvexShape::support (GuConvexSupport.h:539-540) -- WITH the margin.
@@ -287,36 +293,6 @@ uint cvxCoreClothGenerateContacts(ShapeRef shA, PtsRef ptsA, float marginA,
     return numPoints;
 }
 
-// PxgFEMContactWriter::writeRigidVsDeformableContact, the BARYCENTRIC variant
-// (PxgFEMCore.h:485-499).
-//
-// It is writeContactCore (:411-427) -- contactByX, tempContactByX,
-// contactIndexSortedByX, outPoint, outNormalPen -- followed by outBarycentric and the
-// four PxgFemOtherContactInfo fields.  The NoBarycentric sibling used by
-// cvxCoreTetNpBda writes the same set MINUS outBarycentric.
-//
-// setRigidMaterialIndex(mat) followed by markInCollision(false) collapses to a single
-// store of (mat & 0x7fffffff), the same way P9.72 established for the tet path.
-// contactSortedByX is NOT written here (that is writeRigidVsDeformableContact32's
-// job), and totalContactCount is the CALLER's to reserve.
-void clothWriteRigidVsDeformable(uint index, float4 contact, float4 normalPen, float4 barycentric,
-                                 uint2 pairInd0, uint pairInd1, uint2 rigidId, uint rigidMatId)
-{
-    if (index >= gCloth.w_maxNumContacts)
-        return;
-    Ptr<uint2>(gCloth.w_contactByX)[index] = rigidId;
-    Ptr<uint>(gCloth.w_tempContactByX)[index] = rigidId.x;   // PxU32(rigidId & 0xffffffff)
-    Ptr<uint>(gCloth.w_contactIndexSortedByX)[index] = index;
-    Ptr<float4>(gCloth.w_outPoint)[index] = contact;
-    Ptr<float4>(gCloth.w_outNormalPen)[index] = normalPen;
-    Ptr<float4>(gCloth.w_outBarycentric)[index] = barycentric;
-    // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12.
-    const uint64_t ci = gCloth.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(ci)[0] = pairInd0;
-    Ptr<uint>(ci + 8UL)[0] = pairInd1;
-    Ptr<uint>(ci + 12UL)[0] = rigidMatId & 0x7fffffffu;
-}
-
 // ===========================================================================
 [shader("compute")]
 [numthreads(CVXCORE_CLOTH_BLOCK, 1, 1)]
@@ -368,31 +344,23 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
         const uint clothId = shape1.particleOrSoftbodyId;
         const PxgFEMClothGpu cloth = Ptr<PxgFEMClothGpu>(gCloth.femClothes)[clothId];
         Ptr<float4> clothVerts = Ptr<float4>(cloth.mPosition_InvMass);
-        Ptr<uint4> clothTriInds = Ptr<uint4>(cloth.mTriangleVertexIndices);
+        Ptr<uint4> clothTriInds = Ptr<uint4>(cloth.mTriangleVertexIndices_ownedEdges);
         // The scale left IDENTITY by that constructor -- see the header.  Spelled out,
         // and pushed through the identity matrix at BOTH call sites below exactly as the
         // CUDA does (the transform is not a no-op on signed zeros).
         const float3 clothScale = float3(1, 1, 1);
         const float4 clothScaleRot = float4(0, 0, 0, 1);
 
-        // ---- the triple filter (:1233-1239) ----------------------------------
-        // rigidId.getInd() is the whole 64-bit word; dfFindRigidPair takes it as the
-        // uint2 the corpus carries it in.
+        // ---- the filter (5.12) -----------------------------------------------
+        // rigidId.getInd() is the whole 64-bit word.  A filter pair for this rigid and
+        // triangle suppresses contact generation between them.
         const uint64_t rigidIdW = Ptr<uint64_t>(gCloth.shapeToRigidRemapTable)[cacheRef0];
-        const uint2 rigidId = uint2(uint(rigidIdW & 0xFFFFFFFFUL), uint(rigidIdW >> 32));
+        if (findRigidSurfaceTriangleFilter(
+                clothRigidSurfaceFilters(gCloth.femClothes + uint64_t(clothId) * PXG_FEMCLOTH_STRIDE),
+                rigidIdW, cacheRef0, clothId, triIndex))
+            continue;
 
         const uint4 vertInds = clothTriInds[triIndex];
-        // `&&` AND NOT `||`: the pair is skipped only when ALL THREE vertices are
-        // filtered against this rigid.  Slang's && short-circuits exactly as C++'s
-        // does, so the second and third searches are skipped when the first misses --
-        // same work, same result.
-        if (dfFindRigidPair(gCloth.filterPairs, gCloth.nbFilterPairs, rigidId,
-                            encodeCloth(clothId, vertInds.x)) &&
-            dfFindRigidPair(gCloth.filterPairs, gCloth.nbFilterPairs, rigidId,
-                            encodeCloth(clothId, vertInds.y)) &&
-            dfFindRigidPair(gCloth.filterPairs, gCloth.nbFilterPairs, rigidId,
-                            encodeCloth(clothId, vertInds.z)))
-            continue;
 
         // ---- the two shapes (:1241-1256) -------------------------------------
         const PxsCachedTransformGpu xf0 = xfP[cacheRef0];
@@ -480,7 +448,8 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
         // every contributing thread reserves its OWN run of slots independently.
         if (numPoints != 0u)
         {
-            const uint pairInd1 = encodeCloth(clothId, triIndex);
+            const uint64_t rigidRef = rigidIdW;
+            const uint64_t triRef = PxgEncodeDeformableTriangle(clothId, triIndex);
             uint index;
             InterlockedAdd(Ptr<uint>(gCloth.w_totalContactCount)[0], numPoints, index);
             for (uint i = 0u; i < MAX_CONVEX_CONTACTS; ++i)
@@ -494,21 +463,17 @@ void convexCoreClothmeshNphase_Kernel32(uint3 dtid : SV_DispatchThreadID)
                 // RAW.  The tetmesh kernel's `if (d < 0) d *= 0.4f` ERP hack is NOT
                 // here and must not be carried across.
                 const float4 normDist = float4(-normal.x, -normal.y, -normal.z, patch[i].w);
-                // The barycentric is of the MIDPOINT `point`, not of patch[i].xyz
-                // (:1270) -- it is computed after the half-penetration shift.
-                // bvh.getTriBarycentric (:672-680) transforms the three vertices by
-                // scale.toMat33() FIRST, like createConvex; P9.94d made the port do the
-                // same instead of handing it the raw vertices (they differ on -0
-                // coordinates -- see the header).  The function is pinned bitwise by
-                // npCvxBvhGlue (incl. the zero-sign witnesses); reverting THIS call to
-                // raw vertices survives cvxCoreClothNp, whose cloth triangles are
-                // horizontal with no -0 coordinate -- an exhaustive host search over
-                // that family (x,z in {+-0.5,+-0}, contact point at a vertex or grid
-                // point) found no barycentric word that the identity transform changes.
+                // 5.12: the barycentric is taken at the CLOTH'S OWN WITNESS, half a
+                // separation back along the normal -- `clothPoint = points[i] - normal *
+                // dists[i] * 0.5f` -- not at the written midpoint (5.6.1).  "Taken
+                // anywhere else, the barycentric of a separated contact lands outside the
+                // triangle."  bvh.getTriBarycentric transforms the three vertices by
+                // scale.toMat33() FIRST, like createConvex (P9.94d, see the header).
+                const float3 clothPoint = patch[i].xyz - normal * patch[i].w * 0.5f;
                 const float4 bary = cvxBvhTriBarycentric(clothScale, clothScaleRot,
-                                                         tv0, tv1, tv2, point);
-                clothWriteRigidVsDeformable(index + i, posRest, normDist, bary,
-                                            rigidId, pairInd1, rigidId, shape0.materialIndex);
+                                                         tv0, tv1, tv2, clothPoint);
+                clothWriter().writeSurfaceContact(index + i, posRest, normDist,
+                                                  rigidRef, shape0.materialIndex, triRef, bary);
             }
         }
     }

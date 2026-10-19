@@ -1915,7 +1915,7 @@ PXG_TEST(softBodySimClothMidphase_p89NaNSelect)
     std::memset(&cloth, 0, sizeof(cloth));
     cloth.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
     cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bTriV.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bTriI.addr));
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cloth.mTriangleVertexIndices_ownedEdges)>(size_t(bTriI.addr));
     cloth.mNbVerts = uint32_t(sc.verts.size());
     cloth.mNbTriangles = uint32_t(sc.tris.size());
     const std::vector<physx::PxgFEMCloth> clothArr = { cloth };

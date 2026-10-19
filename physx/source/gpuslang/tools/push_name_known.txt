@@ -42,31 +42,8 @@ blind addAggPairsStage2 p0@0/p1@8   # aggregateBda.slang:1178-1180 p0 = aggregat
 # Generic names in the shared GetSet6 struct: maxN is the count bound, typeWord the enum.
 blind setArtiTendonState maxN@28/typeWord@32   # npArtiGetSet.slang:533 maxTendons = maxN, :541/:557 typeWord compared with eSPATIAL_TENDON 12 / eFIXED_TENDON 10 == articulationDirectGpuApi.cu:822 (..., maxTendons, operation)
 blind getArtiTendonState maxN@28/typeWord@32   # npArtiGetSet.slang:489 maxTendons = maxN, :496/:510 typeWord compared with eSPATIAL_TENDON 17 / eFIXED_TENDON 15 == articulationDirectGpuApi.cu:872 (..., maxTendons, operation)
-# Writer-field names in a struct shared with ps_primitivesCollisionLaunch, whose CUDA takes a
-# by-value PxgParticleContactWriter; this kernel's CUDA takes the same eight pointers FLAT and
-# renamed (numParticleContacts, contactRemapSortedBy*).  Order verified:
-# cudaParticleSystem.cu:1485-1493 == PxgParticleSystem.h:606-614, passed in that order to
-# psConvexCollision (cudaParticleSystem.cu:1564-1575).
-# (c): the unread `materials` (@64, a pointer) against the three reached writer pointers.
-# `materials` is DEAD UPSTREAM: threaded through the particle contact-gen kernels and their
-# helper chain (cudaParticleSystem.cu:1189-1679) and never dereferenced, so the shader does
-# not read it (push_block_known.txt) and no name of a reached member can be checked against it.
-blind ps_convexCollisionLaunch cuda:materials@64/contactRemapSortedByParticle@136;cuda:materials@64/contactRemapSortedByRigid@160;cuda:materials@64/numParticleContacts@112;w_contactIndexSortedByParticle@136/w_contactIndexSortedByRigid@160;w_numTotalContacts@112/w_contactIndexSortedByParticle@136;w_numTotalContacts@112/w_contactIndexSortedByRigid@160
 # Words over sub-word flags with generic names, beside a PxU32 of the same member size (a):
 blind translateAABBsLaunch packedShift0@36/packedShift1@40   # broadphaseSetup.slang:67-68 words [shiftX,shiftY,shiftZ,envIDX] / [envIDY,envIDZ], unpacked :83-88 == broadphase.cu:96-102 (boxesCapacity @32, six PxU8 @36..41); both words over sub-word fields only, names generic
 blind cloth_solveTrianglePairEnergyLaunch partitionOrClusterId@28/flagsWord@32   # femClothSolvePairBda.slang:123-124, :354-356 (flagsWord byte0 isSharedPartition, byte1 isTGS; partitionId = partitionOrClusterId) == FEMCloth.cu:861-868 (dt @24, partitionId @28, isSharedPartition @32, isTGS @33)
 blind cloth_solveTrianglePairEnergyClusterLaunch partitionOrClusterId@28/flagsWord@32   # same struct, :398-400 firstClusterId = partitionOrClusterId == FEMCloth.cu:1171-1178 (dt @24, firstClusterId @28, isSharedPartition @32, isTGS @33)
 # REACHED x UNREACHED inside the one host-shaped PxgCudaBuffer argument (b):
-# (c), check round: ClothBoxTriParams (femClothContactGenBda.slang:263-304) serves four kernels
-# whose CUDA spells the filter-pair arguments three ways -- cloth_SphereContactGenLaunch
-# filterPairs / nbFilterPairs (femClothPrimitives.cu:534-535), cloth_convexContactGenLaunch
-# clothRigidPairs / numClothRigidPairs (:1910-1911), cloth_convexVertexContactGenLaunch
-# (:2255-2256) and cloth_boxTriangleContactGenLaunch (:3372-3373) clothAttachmentPairs /
-# nbClothAttachmentPairs -- so no single member name is right for all four (do NOT rename:
-# it would turn into a true NAME-SWAP on the others).  The shader reads filterPairs @80 and
-# nbFilterPairs @88 only as the (pairs, count) of findRigid (:1272-1274, :1458, :1914-1916).
-# Their equal-size partners are never read: tolerenceLength @0 ("unused; ABI parity", :265)
-# and the writer's contactSortedByX @176 ("unused by this writer", :301).
-blind cloth_boxTriangleContactGenLaunch cuda:clothAttachmentPairs@80/writer.contactSortedByX@176;cuda:tolerenceLength@0/nbClothAttachmentPairs@88
-blind cloth_convexContactGenLaunch cuda:clothRigidPairs@80/writer.contactSortedByX@176;cuda:tolerenceLength@0/numClothRigidPairs@88
-blind cloth_convexVertexContactGenLaunch cuda:clothAttachmentPairs@80/writer.contactSortedByX@176;cuda:tolerenceLength@0/nbClothAttachmentPairs@88

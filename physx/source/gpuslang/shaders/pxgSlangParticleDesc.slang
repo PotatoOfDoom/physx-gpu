@@ -33,11 +33,12 @@
 // rigid path.
 //
 // PxgParticleSystem : public PxGpuParticleSystem (base [0..136)) + derived
-// members [136..656).  The base embeds PxGpuParticleData mCommonData at @88; the
+// members [136..608).  The base embeds PxGpuParticleData mCommonData at @88; the
 // derived class embeds PxgParticleSystemData mData at @248.  Both nested value
-// structs are flattened here (mCommonData_/mData_ prefixes).  sizeof = 656,
-// alignof = 16 (PX_ALIGN_PREFIX(16)); 656 is a multiple of 16, so the mirror's
-// own 8-byte size rounding lands on the same stride.  The layout was verified
+// structs are flattened here (mCommonData_/mData_ prefixes).  sizeof = 608,
+// alignof = 16 (PX_ALIGN_PREFIX(16)); 608 is a multiple of 16, so the mirror's
+// own 8-byte size rounding lands on the same stride.  PhysX 5.12: mData gained
+// mPenBiasClamp (+4 B), and the particle cloth / rigid / attachment members are gone.  The layout was verified
 // against the engine header with g++ offsetof (see testParticleSim.cpp, which
 // pushes a REAL PxgParticleSystem filled with sentinels and reads it back
 // through this mirror — any compiler/mirror drift fails that test).
@@ -45,7 +46,7 @@
 // Pointers -> uint64_t (device addresses read through Ptr<>); PxU32/PxReal/int
 // -> 4-byte scalars; PxU16 mData.mLockFlags folds into mData_lockFlagsWord (its
 // 2 tail-pad bytes are uninitialized host memory).  Explicit _padNNN members
-// reproduce the C++ inter-member padding at 322/340/484/636 and the 8-byte tail.
+// reproduce the C++ inter-member padding at 444/596.
 module pxgSlangParticleDesc;
 
 // PxParticleSystemFlag.h:89 — group is bits [0,19] of the phase.
@@ -63,26 +64,19 @@ public static const uint PXG_PARTICLE_LOCK_Z = 4u;
 public static const uint PXG_PARTICLE_MAT_DAMPING_OFFSET_FLOATS = 1u;      // byte 4
 public static const uint PXG_PARTICLE_MAT_GRAVITYSCALE_OFFSET_FLOATS = 3u; // byte 12
 
-// Byte-exact mirror of PxgParticleSimBuffer (PxgParticleSystem.h:138-156).
-// 7 device pointers (56) + 7 PxU32 (28) = 84, rounded to the pointer alignment
-// -> 88.  The array stride the ps_updateUserBufferLaunch kernel indexes.
+// Byte-exact mirror of PxgParticleSimBuffer (PxgParticleSystem.h, 5.12): 4 device
+// pointers (32) + 4 PxU32 (16) = 48.  PhysX 5.9 removed mVolumes, mFilterPairs,
+// mRigidAttachments and their counts with particle rigids / particle-rigid filtering.
 public struct PxgParticleSimBufferGpu
 {
     public uint64_t mPositionInvMasses;   // @0
     public uint64_t mVelocities;          // @8
     public uint64_t mRestPositions;       // @16
     public uint64_t mPhases;              // @24
-    public uint64_t mVolumes;             // @32
-    public uint64_t mFilterPairs;         // @40
-    public uint64_t mRigidAttachments;    // @48
-    public uint mNumActiveParticles;      // @56
-    public uint mNumVolumes;              // @60
-    public uint mNumFilterPairs;          // @64
-    public uint mNumRigidAttachments;     // @68
-    public uint mFlags;                   // @72
-    public uint mDiffuseParticleBufferIndex; // @76
-    public uint mUniqueId;                // @80
-    public uint _pad84;                   // @84 -> 88
+    public uint mNumActiveParticles;      // @32
+    public uint mFlags;                   // @36
+    public uint mDiffuseParticleBufferIndex; // @40
+    public uint mUniqueId;                // @44 -> 48
 }
 
 // The PHASE bit test, PxGetFluid (PxParticleGpu.h:65) over
@@ -137,60 +131,9 @@ public struct PxgParticleDiffuseSimBufferGpu
     public uint  mFlags;                        // @84 -> 88
 }
 
-// P9.3a -- the PBD CLOTH records.  All three layouts generated from the engine
-// headers and pinned by static_assert in testPsSprings.cpp.
-//
-// Byte-exact mirror of PxgParticleClothSimBuffer (PxgParticleSystem.h:158-181):
-// 11 device pointers (88) + 5 PxU32 (20) = 108, rounded to the pointer alignment
-// -> 112, which is the stride mClothSimBuffers is indexed at.
-public struct PxgParticleClothSimBufferGpu
-{
-    public uint64_t mAccumulatedSpringsPerPartitions;  // @0   PxU32*  numPartitions
-    public uint64_t mAccumulatedCopiesPerParticles;    // @8   PxU32*
-    public uint64_t mRemapOutput;                      // @16  PxU32*  numSprings*2
-    public uint64_t mOrderedSprings;                   // @24  PxParticleSpring*
-    public uint64_t mTriangles;                        // @32  PxU32*  numTriangles*3
-    public uint64_t mSortedClothStartIndices;          // @40  PxU32*  numCloths
-    public uint64_t mCloths;                           // @48  PxParticleCloth*
-    public uint64_t mRemapPositions;                   // @56  float4*
-    public uint64_t mRemapVelocities;                  // @64  float4*
-    public uint64_t mSpringLambda;                     // @72  PxReal*
-    public uint64_t mInflatableLambda;                 // @80  PxReal*
-    public uint mParticleBufferIndex;                  // @88
-    public uint mNumSprings;                           // @92
-    public uint mNumPartitions;                        // @96
-    public uint mNumCloths;                            // @100
-    public uint mNumTriangles;                         // @104
-    public uint _pad108;                               // @108 -> 112
-}
-
-// PxParticleBuffer.h:344-352, PX_ALIGN(8), sizeof 24.
-public struct PxParticleSpringGpu
-{
-    public uint ind0;        // @0
-    public uint ind1;        // @4
-    public float length;     // @8
-    public float stiffness;  // @12  NEGATIVE means a one-sided (tether) constraint
-    public float damping;    // @16
-    public float pad;        // @20 -> 24
-}
-
-// PxParticleBuffer.h:359-374, sizeof 28, align 4 (no trailing pad -- seven
-// 4-byte members, so the array stride is 28 and NOT rounded to 32).
-public struct PxParticleClothGpu
-{
-    public uint startVertexIndex;    // @0
-    public uint numVertices;         // @4
-    public float clothBlendScale;    // @8
-    public float restVolume;         // @12
-    public float pressure;           // @16
-    public uint startTriangleIndex;  // @20
-    public uint numTriangles;        // @24 -> 28
-}
-
-// Byte-exact mirror of PxgParticleSystem (PxgParticleSystem.h:405-488) with the
+// Byte-exact mirror of PxgParticleSystem (PxgParticleSystem.h, 5.12) with the
 // base PxGpuParticleSystem members inlined first (offsets 0..135) then the
-// derived members (136..655).  sizeof = 656.
+// derived members (136..607).  sizeof = 608.
 public struct PxgParticleSystemGpu
 {
     // ---- base PxGpuParticleSystem [0..136) ----
@@ -233,7 +176,7 @@ public struct PxgParticleSystemGpu
     public uint64_t mOneWaySurfaceVelocity;       // @224 float4*
     public uint64_t mOneWayContactCount;          // @232 PxU32*
     public uint64_t mRestArray;                   // @240 float4*
-    // ---- mData (PxgParticleSystemData, 92 bytes) @248 ----
+    // ---- mData (PxgParticleSystemData, 96 bytes) @248 ----
     public float mData_BoundCenterX;              // @248
     public float mData_BoundCenterY;              // @252
     public float mData_BoundCenterZ;              // @256
@@ -252,12 +195,12 @@ public struct PxgParticleSystemGpu
     public float mData_InvRestDensity;            // @308
     public uint  mData_Flags;                     // @312
     public float mData_MaxVelocity;               // @316
-    public uint  mData_LockFlagsWord;             // @320 (low 16 bits = PxU16 mLockFlags; hi 16 = pad @322)
-    public uint  mData_NumPhaseToMaterials;       // @324
-    public float mData_WindX;                     // @328
-    public float mData_WindY;                     // @332
-    public float mData_WindZ;                     // @336
-    public uint  _pad340;                         // @340 (mData ends at 340; next member 8-aligned)
+    public float mData_PenBiasClamp;              // @320 (5.10: = -maxDepenetrationVelocity)
+    public uint  mData_LockFlagsWord;             // @324 (low 16 bits = PxU16 mLockFlags; hi 16 = pad @326)
+    public uint  mData_NumPhaseToMaterials;       // @328
+    public float mData_WindX;                     // @332
+    public float mData_WindY;                     // @336
+    public float mData_WindZ;                     // @340 (mData ends at 344)
     public uint64_t mDensity;                     // @344 PxReal*
     public uint64_t mStaticDensity;               // @352 PxReal*
     public uint64_t mSurfaceNormal;               // @360 float4*
@@ -269,47 +212,39 @@ public struct PxgParticleSystemGpu
     public uint64_t mParticleBufferRunsum;        // @408 PxU32*
     public uint64_t mParticleBufferSortedUniqueIds;              // @416
     public uint64_t mParticleBufferSortedUniqueIdsOriginalIndex; // @424
-    public uint64_t mClothSimBuffers;             // @432
-    public uint64_t mRigidSimBuffers;             // @440
-    public uint64_t mDiffuseSimBuffers;           // @448
-    public uint64_t mAttachmentRunsum;            // @456
-    public uint  mNumClothBuffers;                // @464
-    public uint  mNumRigidBuffers;                // @468
-    public uint  mNumDiffuseBuffers;              // @472
-    public uint  mNumRigidAttachments;            // @476
-    public uint  mRigidAttachmentOffset;          // @480
-    public uint  _pad484;                         // @484 (next member 8-aligned)
-    public uint64_t mNumDiffuseParticles;         // @488 int*
-    public uint64_t mDiffusePosition_LifeTime;    // @496
-    public uint64_t mDiffuseVelocity;             // @504
-    public uint64_t mDiffusePotentials;           // @512
-    public uint64_t mDiffuseCellStart;            // @520
-    public uint64_t mDiffuseCellEnd;              // @528
-    public uint64_t mDiffuseGridParticleHash;     // @536
-    public uint64_t mDiffuseOriginPos_LifeTime;   // @544
-    public uint64_t mDiffuseSortedPos_LifeTime;   // @552
-    public uint64_t mDiffuseSortedOriginPos_LifeTime; // @560
-    public uint64_t mDiffuseSortedVel;            // @568
-    public uint64_t mDiffuseSortedToUnsortedMapping;  // @576
-    public uint64_t mDiffuseUnsortedToSortedMapping;  // @584
-    public uint64_t mDiffuseOneWayContactInfos;   // @592
-    public uint64_t mDiffuseOneWayForces;         // @600
-    public uint64_t mDiffuseOneWayNodeIndex;      // @608
-    public uint64_t mDiffuseOneWayContactCount;   // @616
-    public uint64_t mDerivedPBDMaterialData;      // @624
-    public uint  mParticleMaterialStride;         // @632
-    public uint  _pad636;                         // @636 (next member 8-aligned)
-    public uint64_t mPhaseGroupToMaterialHandle;  // @640 PxU16*
-    public uint64_t _pad648;                      // @648 tail pad to align-16 -> 656
+    public uint64_t mDiffuseSimBuffers;           // @432
+    public uint  mNumDiffuseBuffers;              // @440
+    public uint  _pad444;                         // @444 (next member 8-aligned)
+    public uint64_t mNumDiffuseParticles;         // @448 int*
+    public uint64_t mDiffusePosition_LifeTime;    // @456
+    public uint64_t mDiffuseVelocity;             // @464
+    public uint64_t mDiffusePotentials;           // @472
+    public uint64_t mDiffuseCellStart;            // @480
+    public uint64_t mDiffuseCellEnd;              // @488
+    public uint64_t mDiffuseGridParticleHash;     // @496
+    public uint64_t mDiffuseOriginPos_LifeTime;   // @504
+    public uint64_t mDiffuseSortedPos_LifeTime;   // @512
+    public uint64_t mDiffuseSortedOriginPos_LifeTime; // @520
+    public uint64_t mDiffuseSortedVel;            // @528
+    public uint64_t mDiffuseSortedToUnsortedMapping;  // @536
+    public uint64_t mDiffuseUnsortedToSortedMapping;  // @544
+    public uint64_t mDiffuseOneWayContactInfos;   // @552
+    public uint64_t mDiffuseOneWayForces;         // @560
+    public uint64_t mDiffuseOneWayNodeIndex;      // @568
+    public uint64_t mDiffuseOneWayContactCount;   // @576
+    public uint64_t mDerivedPBDMaterialData;      // @584
+    public uint  mParticleMaterialStride;         // @592
+    public uint  _pad596;                         // @596 (next member 8-aligned)
+    public uint64_t mPhaseGroupToMaterialHandle;  // @600 PxU16* -> 608
 }
 
 // P9.39c.  Indexing `Ptr<PxgParticleSystemGpu>(base)[id]` already depends on this
 // number; the constant exists because the softbody-vs-particle contact gen needs the
-// ADDRESS of one element to hand to pxgSlangDefFilter, and an open-coded 656 at that
+// ADDRESS of one element to hand to pxgSlangDefFilter, and an open-coded 608 at that
 // call site would be a second place for the layout to drift.  It must equal
 // sizeof(PxgParticleSystem) (PxgParticleSystem.h) -- gpuslang.npAbiLayout pins the
 // field offsets that make up the total.
-public static const uint64_t PXG_PARTICLE_SYSTEM_STRIDE = 656UL;
+public static const uint64_t PXG_PARTICLE_SYSTEM_STRIDE = 608UL;
 
 // ---------------------------------------------------------------------------
 // P9.31: two accessors that were file-local in psContactSolveBda and are needed

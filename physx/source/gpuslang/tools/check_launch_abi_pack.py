@@ -118,7 +118,8 @@
 # -- which REFUSES on a base class, PX_ALIGN_PREFIX, a union, a bitfield, `#if` in the
 # body, an array of non-literal size or any member it cannot size.  Struct sizing is
 # only sound WITH the lexical tier: P9.97 measured it without, and `writer` bound to the
-# 72-byte PxgParticleContactWriter& of another function gave 23 false accusations.
+# 72-byte PxgParticleContactWriter& of another function gave 23 false accusations (5.6.1;
+# the selftest now uses 5.12's PxgParticleDbContactWriter, the same 72 bytes).
 #
 # FITNESS.  Every false accusation this file has ever made was a bug in this file (P9.77
 # had twenty of twenty-one; P9.97 had twenty-three); every one is a way a plausible
@@ -191,6 +192,11 @@ KNOWN_NO_SITE = {
     #   (CUdeviceptr x2, PxU32 nbToCopy)                  {8,8,4}     == kRigidCopyPrevVel
     "computeRigidBodyAccelerations": "variadic launchKernelThreadsAutoPackParameters (PxgSimulationCore.cpp)",
     "copyRigidBodyVelocitiesToPrevious": "variadic launchKernelThreadsAutoPackParameters (PxgSimulationCore.cpp)",
+    # 5.12: ids taken from the kernelIds[2] table, PxgArticulationCore::ovdSnapshotArticulationForces;
+    # pack (CUdeviceptr coreDescptr, dataDevicePtr, indicesDevicePtr, PxU32 nbValid, PxU32 maxLinks)
+    # {8,8,8,4,4} == kGetSet5
+    "getArtiLinkForceState": "id via the kernelIds[2] table (PxgArticulationCore.cpp ovdSnapshotArticulationForces)",
+    "getArtiLinkTorqueState": "id via the kernelIds[2] table (PxgArticulationCore.cpp ovdSnapshotArticulationForces)",
 }
 
 # Host packs LONGER than the row whose extra arguments sit in the blob's tail padding
@@ -1207,7 +1213,10 @@ def member_size(member):
     return _MEMBER_CACHE[member]
 
 
-ARG_RE = r"(?:PX_CUDA_KERNEL_PARAM2?|CUDA_KERNEL_PARAM)\(\s*\(?\s*([\w\.\->\[\]]+(?:\(\))?)\s*\)?\s*\)"
+# 5.12: an argument may also read a member THROUGH an accessor call --
+# `mArticulationCoreDesc.get().articulations` (PxgArticulationCore.cpp computeArti*) --
+# so `()` may appear inside the chain, not only at its end.
+ARG_RE = r"(?:PX_CUDA_KERNEL_PARAM2?|CUDA_KERNEL_PARAM)\(\s*\(?\s*((?:[\w\.\->\[\]]+\(\)(?:\.|->))*[\w\.\->\[\]]+(?:\(\))?)\s*\)?\s*\)"
 ARG_OPEN = r"(?:PX_CUDA_KERNEL_PARAM2?|CUDA_KERNEL_PARAM)\("
 BLOCK_RE = r"(?:PxCudaKernelParam|KERNEL_PARAM_TYPE|void\s*\*)\s+%s\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;"
 
@@ -1238,6 +1247,11 @@ def _size_arg(sf, a, pos):
     mm = re.match(r"^\w+(?:\.|->)(\w+)$", a)
     if mm:
         return member_size(mm.group(1))
+    # `<obj>.<accessor>().<member>`: the member decides the size, looked up by name like
+    # the plain member form (all declarations must agree, or the pack stays unresolved).
+    am = re.match(r"^\w+(?:\.|->)\w+\(\)(?:\.|->)(\w+)$", a)
+    if am:
+        return member_size(am.group(1))
     return None
 
 
@@ -1561,10 +1575,10 @@ void A::g() { PxU64 n = 4; use(n); }
 """, {"kernelK": [("sized", [4])]}),
     ("B6 constructor form and struct layout", """
 namespace physx {
-void A::g(PxgParticleContactWriter& writer) { use(writer); }
+void A::g(PxgParticleDbContactWriter& writer) { use(writer); }
 void A::f()
 {
-    PxgFEMContactWriter writer(core);
+    PxgRigidDbContactWriter writer(core);
     CUfunction h = w->getCuFunction(PxgKernelIds::K);
     PxCudaKernelParam kp[] = { PX_CUDA_KERNEL_PARAM(writer) };
     ctx->launchKernel(h, 1, 1, 1, 1, 1, 1, 0, s, kp, sizeof(kp), 0, PX_FL);
@@ -1573,11 +1587,11 @@ void A::f()
 """, {"kernelK": [("sized", [80])]}),
     ("declaration after the handle", """
 namespace physx {
-void A::g(PxgParticleContactWriter& writer) { use(writer); }
+void A::g(PxgParticleDbContactWriter& writer) { use(writer); }
 void A::f()
 {
     CUfunction h = w->getCuFunction(PxgKernelIds::K);
-    PxgFEMContactWriter writer(core);
+    PxgRigidDbContactWriter writer(core);
     PxCudaKernelParam kp[] = { PX_CUDA_KERNEL_PARAM(writer) };
     ctx->launchKernel(h, 1, 1, 1, 1, 1, 1, 0, s, kp, sizeof(kp), 0, PX_FL);
 }
@@ -1646,7 +1660,7 @@ SELFTEST_SIGNATURES = [
     ("signature sizes, struct and #if NAME in a parameter list", """
 #define ENABLE_X 0
 extern "C" __global__ void kernelK(const float* PX_RESTRICT a, const PxU32 n,
-    PxgFEMContactWriter writer, const PxVec3 g,
+    PxgRigidDbContactWriter writer, const PxVec3 g,
 #if ENABLE_X
     PxReal dropped,
 #endif
@@ -1706,10 +1720,12 @@ def selftest(packs, sigs, abi_text):
             fails.append("SELFTEST: evaluate must report MASK-BAD for a mask bit on a 4-byte HOST argument")
     else:
         fails.append("SELFTEST BROKEN: I4 halves -- anchor not unique")
-    # struct_fields: the three by-value writers are laid out, a base class is REFUSED.
-    for nm, want in (("PxgFEMContactWriter", (80, 8, [8 * i for i in range(10)])),
-                     ("PxgSoftBodyContactWriter", (56, 8, [8 * i for i in range(7)])),
-                     ("PxgParticleContactWriter", (72, 8, [8 * i for i in range(9)]))):
+    # struct_fields: the by-value writers (PhysX 5.12, PxgDeformableContactWriters.h and
+    # PxgParticleSystem.h) are laid out, a base class is REFUSED.
+    for nm, want in (("PxgRigidDbContactWriter", (80, 8, [8 * i for i in range(10)])),
+                     ("PxgDbDbContactWriter", (56, 8, [8 * i for i in range(7)])),
+                     ("PxgParticleDbContactWriter", (72, 8, [8 * i for i in range(9)])),
+                     ("PxgRigidParticleContactWriter", (80, 8, [8 * i for i in range(10)]))):
         sf = struct_fields(nm)
         if not sf or (sf[0], sf[1], [f[0] for f in sf[2]]) != want:
             fails.append("SELFTEST: struct_fields(%s) gave %s, expected size/align/offsets %s" % (nm, sf, want))

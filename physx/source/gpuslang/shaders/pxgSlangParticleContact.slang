@@ -37,11 +37,9 @@
 // writer and copy two of the filter.  This is that tranche.
 //
 // WHAT MOVED, and from where:
-//   PxgParticleContactWriter::writeContact  psMeshMidphaseBda, psHfMidphaseBda
-//   the rigid element filter (find/findRange/findRigid)   psMeshMidphaseBda
 //   LoadShapePair<A, B>                     psMeshMidphaseBda, psHfMidphaseBda
-//   PxgParticlePrimitiveContact             both
 //   PxgContactManagerInput                  both
+// (The 5.6.1 writer and rigid filter that also lived here are gone, see below.)
 //
 // WHAT DID NOT MOVE, deliberately: psContactGenBda and femClothContactGenBda
 // carry their own filter variants over PRIVATE query structs, and neither is a
@@ -67,133 +65,12 @@ public struct PxgContactManagerInput
     public uint shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1;
 }
 
-// PxgParticlePrimitiveContact (32 bytes).
-public struct PsContact
-{
-    public float4 normal_pen;
-    public uint2 rigidId;
-    public uint2 particleId;
-}
-
-// PxgParticleContactWriter (PxgParticleSystem.h:604-635): eight pointers and a
-// capacity, passed to the kernel BY VALUE.  Held as a struct here because a
-// module cannot reach into its importer's push-constant block -- which is
-// exactly what the three private copies were doing.
-public struct PsContactWriter
-{
-    public uint64_t particleContacts;
-    public uint64_t numTotalContacts;
-    public uint64_t contactSortedByParticle;
-    public uint64_t tempContactByParticle;
-    public uint64_t contactIndexSortedByParticle;
-    public uint64_t contactByRigid;
-    public uint64_t tempContactByRigid;
-    public uint64_t contactIndexSortedByRigid;
-    public uint maxContacts;
-}
-
-// PxgParticleContactWriter::writeContact (PxgParticleSystem.h:616-634).
-// The capacity test is the CUDA's: over capacity the contact is silently
-// DROPPED, and the caller's index -- which came from a global atomic -- is
-// simply not used.
-public void psWriteContact(PsContactWriter w, uint index, float4 normalPen,
-                           uint2 compressedParticleIndex, uint2 rigidId)
-{
-    if (index < w.maxContacts)
-    {
-        (Ptr<uint2>(w.contactByRigid))[index] = rigidId;
-        // PxU32(rigidId.getInd() & 0xffffffff) -- the LOW word of the node index.
-        (Ptr<uint>(w.tempContactByRigid))[index] = rigidId.x;
-        (Ptr<uint>(w.contactIndexSortedByRigid))[index] = index;
-
-        (Ptr<uint2>(w.contactSortedByParticle))[index] = compressedParticleIndex;
-        // PxGetParticleIndex(compressed) -- also the low word.
-        (Ptr<uint>(w.tempContactByParticle))[index] = compressedParticleIndex.x;
-        (Ptr<uint>(w.contactIndexSortedByParticle))[index] = index;
-
-        PsContact ct;
-        ct.normal_pen = normalPen;
-        ct.rigidId = rigidId;
-        ct.particleId = compressedParticleIndex;
-        (Ptr<PsContact>(w.particleContacts))[index] = ct;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The rigid filter list, deformableElementFilter.cuh:118.
-//
-// THE STRUCT IS **PxParticleRigidFilterPair** (PxFiltering.h:740, 16 BYTES):
-// two PxU64 and nothing else.  NOT PxgRigidFilterPair (PxgSimulationCoreDesc.h,
-// 32 B with an index2 and three padding words) -- that one belongs to the
-// softbody/cloth attachment paths.
-//
-// deformableElementFilter.cuh carries BOTH families and an overload for each,
-// and `find(PxgParticleSystem&, PxU64, PxU64)` (:118) hands
-// `PxgParticleSimBuffer::mFilterPairs` -- a `PxParticleRigidFilterPair*` -- to
-// the 16-byte overload at :39, which compares with the struct's own
-// `operator==` / `operator<`, i.e. over (mID0, mID1) ONLY.  There is no index2
-// on this path and no `ignoreIndex2` argument.
-//
-// P9.10 got this wrong in both directions at once: the shader read a 32-byte
-// stride and its fixture WROTE one, so the two agreed and the sweep had nothing
-// to find -- the P8.49a failure mode exactly.  P9.12h's fixture builds the
-// filter list out of the engine's own `PxParticleRigidFilterPair`, which is
-// what exposed it.  A 32-byte reader over a 16-byte list picks up every other
-// entry and runs off the end of the allocation.
-// ---------------------------------------------------------------------------
-public struct PsPairR { public uint2 mID0; public uint2 mID1; }
-
-public bool psU64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-public bool psU64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-public uint psFindRange(Ptr<uint> values, uint length, uint value)
-{
-    if (length == 0u) return 0u;
-    uint l = 0u, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2u;
-        if (values[m] > value) r = m; else l = m + 1u;
-    }
-    return r - 1u;
-}
-
-// deformableElementFilter.cuh:39.  `pair == p` first, then `pair < p` -- and
-// `operator<` (PxFiltering.h:749) is NOT a total order's strict less-than
-// spelled the usual way: it is
-//     mID0 < o.mID0 || (mID0 == o.mID0 && mID1 < o.mID1)
-// which for an equal-mID0 pair falls through to the mID1 test.  Transcribed as
-// written rather than as `psU64Lt(q0,p.mID0) || (eq && psU64Lt(q1,p.mID1))`
-// collapsed into a comparator, because the equality test above it already
-// consumed the `==` case.
-public bool psFindRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PsPairR> pairs = Ptr<PsPairR>(pairsAddr);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PsPairR p = pairs[mid];
-        if (psU64Eq(q0, p.mID0) && psU64Eq(q1, p.mID1))
-            return true;
-        const bool lt = psU64Lt(q0, p.mID0) || (psU64Eq(q0, p.mID0) && psU64Lt(q1, p.mID1));
-        if (lt) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
-
-public bool psFindFilter(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint2 particleMask)
-{
-    const uint particleId = particleMask.x;   // PxGetParticleIndex = the low word
-    const uint numBuffers = systems[psId].mCommonData_NumParticleBuffers;
-    Ptr<uint> runsum = Ptr<uint>(systems[psId].mParticleBufferRunsum);
-    const uint id = psFindRange(runsum, numBuffers, particleId);
-    Ptr<PxgParticleSimBufferGpu> simBufs = Ptr<PxgParticleSimBufferGpu>(systems[psId].mParticleSimBuffers);
-    const uint64_t pairsAddr = simBufs[id].mFilterPairs;
-    const uint nbPairs = simBufs[id].mNumFilterPairs;
-    const uint localId = particleId - runsum[id];
-    return psFindRigid(pairsAddr, nbPairs, rigidId, uint2(localId, 0u));
-}
+// PhysX 5.12: the contact record and its writer moved to pxgSlangDeformableWriters
+// (PxgRigidParticleContactWriter, SoA PxgDeformablePairInfo + float4 normalPen), and the
+// particle-rigid element filter this module carried (find / findRange over
+// PxParticleRigidFilterPair) was removed with particle rigids in 5.9.  The three
+// importers build a PxgRigidParticleContactWriterGpu from their push blocks and key
+// the particle with the 64-bit PxgEncodeParticleRef.
 
 // ---------------------------------------------------------------------------
 // LoadShapePair<A, B>.  `testedType` is A: the pair's slot 0 is checked against

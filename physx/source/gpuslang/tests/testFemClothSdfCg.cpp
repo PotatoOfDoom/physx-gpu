@@ -77,6 +77,7 @@
 #include "PxgContactManager.h"
 #include "PxgConvexConvexShape.h"
 #include "PxgSimulationCoreDesc.h"
+#include "PxgDeformableContactWriters.h"
 #include "PxsTransformCache.h"
 #include "PxNodeIndex.h"
 #include "geometry/PxGeometry.h"
@@ -108,7 +109,9 @@ using namespace pxgsdfref;
 
 struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
 
-// femClothSdfMeshCgBda.slang's ClothSdfCgParams, byte for byte.
+// femClothSdfMeshCgBda.slang's ClothSdfCgParams, byte for byte (PhysX 5.12: the
+// filterPairs / nbFilterPairs arguments are gone -- the filters are per cloth -- so the
+// head ends at 64, already 16-aligned for the 80-byte writer).
 struct ClothSdfBlob
 {
     uint32_t numWorkItems;             // @0
@@ -120,24 +123,29 @@ struct ClothSdfBlob
     uint64_t gpuShapes;                // @40
     uint64_t femClothes;               // @48
     uint64_t shapeToRigidRemap;        // @56
-    uint64_t filterPairs;              // @64
-    uint32_t nbFilterPairs;            // @72
-    uint32_t pad76;                    // @76
-    uint64_t w_outPoint;               // @80
-    uint64_t w_outNormalPen;           // @88
-    uint64_t w_outBarycentric;         // @96
-    uint64_t w_outContactInfo;         // @104
-    uint64_t w_totalContactCount;      // @112
-    uint64_t w_contactByX;             // @120
-    uint64_t w_tempContactByX;         // @128
-    uint64_t w_contactIndexSortedByX;  // @136
-    uint64_t w_contactSortedByX;       // @144
-    uint32_t w_maxNumContacts;         // @152
-    uint32_t pad156;                   // -> 160
+    // ---- PxgRigidDbContactWriter (by value, 80 B) @64 ----
+    uint64_t w_outPoint;               // @64
+    uint64_t w_outNormalPen;           // @72
+    uint64_t w_outBarycentric;         // @80
+    uint64_t w_outContactInfo;         // @88  PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;  // @96  PxU16*
+    uint64_t w_totalContactCount;      // @104
+    uint64_t w_contactByRigid;         // @112
+    uint64_t w_tempContactByRigid;     // @120
+    uint64_t w_contactIndexSortedByRigid; // @128
+    uint32_t w_maxNumContacts;         // @136
+    uint32_t pad140;                   // -> 144
 };
-static_assert(sizeof(ClothSdfBlob) == 160, "engine ABI blob size");
-static_assert(offsetof(ClothSdfBlob, w_outPoint) == 80, "the writer lands at 80");
-static_assert(sizeof(PxgFEMContactWriter) == 80, "the by-value writer tail is 80 bytes");
+static_assert(sizeof(ClothSdfBlob) == 144, "engine ABI blob size");
+static_assert(offsetof(ClothSdfBlob, w_outPoint) == 64, "the writer lands at 64");
+static_assert(sizeof(PxgRigidDbContactWriter) == 80, "the by-value writer tail is 80 bytes");
+#define PXG_CLSDF_PIN(f, g) static_assert(offsetof(ClothSdfBlob, f) - offsetof(ClothSdfBlob, w_outPoint) == \
+                                          offsetof(PxgRigidDbContactWriter, g), #g)
+PXG_CLSDF_PIN(w_outContactInfo, outContactInfo); PXG_CLSDF_PIN(w_outRigidMaterialIndex, outRigidMaterialIndex);
+PXG_CLSDF_PIN(w_totalContactCount, totalContactCount); PXG_CLSDF_PIN(w_contactByRigid, contactByRigid);
+PXG_CLSDF_PIN(w_contactIndexSortedByRigid, contactIndexSortedByRigid);
+PXG_CLSDF_PIN(w_maxNumContacts, maxNumContacts);
+#undef PXG_CLSDF_PIN
 
 // npSdfFind.slang's SdfFindParams (P9.34b extended it to 176 with explicit padding).
 struct P_Find
@@ -201,10 +209,10 @@ static void hComputeBarycentric(const PxVec3& a, const PxVec3& b, const PxVec3& 
     bary = F4{ 1.0f - v - w, v, w, 0.0f };
 }
 
-static const uint32_t PXG_BITSHIFT_ELEMENT_ID_H = 20u;
-static uint32_t encodeCloth(uint32_t clothId, uint32_t elem)
+// PhysX 5.12: the cloth participant of a contact is the triangle's PxgDeformableRef.
+static uint64_t encodeClothTri(uint32_t clothId, uint32_t tri)
 {
-    return (clothId << PXG_BITSHIFT_ELEMENT_ID_H) | elem;
+    return PxgEncodeDeformableTriangle(clothId, tri);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +228,8 @@ struct ClothDef
     PxVec3 posW; PxQuat rotW;
     std::vector<F4> verts;
     std::vector<uint32_t> inds;              // uint4 per triangle
-    std::vector<uint32_t> filteredTris;      // triangle ids whose THREE verts are filtered
-    std::vector<uint32_t> partialTris;       // triangle ids with only two verts filtered
+    std::vector<uint32_t> filteredTris;      // triangle ids filtered AS TRIANGLES (5.12)
+    std::vector<uint32_t> partialTris;       // triangle ids whose three VERTICES are filtered
 };
 
 struct Scene
@@ -352,10 +360,10 @@ static void buildScene(Scene& S, bool negScale)
     S.restByPair[0] = 0.019f;
     S.restByPair[1] = 0.041f;
 
-    // S5: a triangle is skipped only when ALL THREE of its vertices are filtered.
-    // Both groups are populated for both cloths: the fully-filtered ones must
-    // actually be dropped, and the partial ones must survive, or the conjunction
-    // is indistinguishable from a disjunction.
+    // S5 (PhysX 5.12): a triangle is skipped when the (rigid, triangle) pair is in the
+    // cloth's mRigidSurfaceFilterPairs.  Both groups are populated for both cloths: the
+    // triangle-filtered ones must actually be dropped, and the ones whose three
+    // VERTICES are filtered must survive (5.6.1 skipped exactly those).
     for (uint32_t k = 0; k < 2u; ++k)
     {
         ClothDef& c = S.cloth[k];
@@ -393,11 +401,12 @@ struct Rig
     std::vector<PxgBufferHandle> owned;
     DevBuf bBlob, bCin, bShapes, bXf, bCd, bRest, bRemap, bPairs, bDesc;
     DevBuf bVerts[2], bInds[2];
-    DevBuf bPoint, bNormalPen, bBary, bInfo, bCount, bByX, bTempByX, bIdxByX, bSortedByX;
+    DevBuf bPoint, bNormalPen, bBary, bInfo, bRigidMat, bCount, bByX, bTempByX, bIdxByX;
+    DevBuf bClothPairs[2];
     ClothSdfBlob blob{};
     uint64_t texCoarse = 0, texSub = 0;
     PxNodeIndex rigidId;
-    std::vector<PxgRigidFilterPair> pairs;
+    std::vector<PxgDeformablePairInfo> pairs[2];   // each cloth's mRigidSurfaceFilterPairs
 
     template <typename T>
     DevBuf mk(PxgSlangComputeDevice* dev, const std::vector<T>& d)
@@ -429,6 +438,28 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     std::memcpy(&blob.bytes[blob.texObjSparseOffset], &R.texSub, 8);
     R.bBlob = R.mk(dev, blob.bytes);
 
+    R.rigidId = PxNodeIndex(0x51u, 3u);
+    // Each cloth's filter list, sorted with PxgComparePairInfo as the engine's binary
+    // search requires: its triangle-filtered triangles, and the three vertices of each
+    // vertex-filtered one (5.12 must ignore those for a triangle query).
+    const uint64_t rigidRef = PxgEncodeRigidFilterRef(R.rigidId, Scene::TRI_CACHE);
+    for (uint32_t k = 0; k < 2u; ++k)
+    {
+        const ClothDef& c = S.cloth[k];
+        std::vector<PxgDeformablePairInfo>& pk = R.pairs[k];
+        pk.clear();
+        for (uint32_t t : c.filteredTris)
+            pk.push_back({ rigidRef, encodeClothTri(c.clothId, t) });
+        for (uint32_t t : c.partialTris)
+            for (uint32_t j = 0; j < 3u; ++j)
+                pk.push_back({ rigidRef, PxgEncodeDeformableVertex(c.clothId, c.inds[t * 4u + j]) });
+        std::sort(pk.begin(), pk.end(), [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+            return PxgComparePairInfo(a, b) < 0; });
+        pk.erase(std::unique(pk.begin(), pk.end(), [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+            return PxgComparePairInfo(a, b) == 0; }), pk.end());
+        R.bClothPairs[k] = R.mk(dev, pk);
+    }
+
     std::vector<PxgFEMCloth> descArr(Scene::NB_CLOTHES);
     std::memset(descArr.data(), 0, descArr.size() * sizeof(PxgFEMCloth));
     for (uint32_t k = 0; k < 2u; ++k)
@@ -437,9 +468,11 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
         R.bInds[k] = R.mk(dev, S.cloth[k].inds);
         PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
         fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(R.bVerts[k].addr));
-        fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(R.bInds[k].addr));
+        fc.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(R.bInds[k].addr));
         fc.mNbVerts = uint32_t(S.cloth[k].verts.size());
         fc.mNbTriangles = S.cloth[k].nbTris;
+        fc.mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(R.bClothPairs[k].addr));
+        fc.mNumRigidSurfaceFilterPairs = uint32_t(R.pairs[k].size());
         descArr[S.cloth[k].clothId] = fc;
     }
     R.bDesc = R.mk(dev, descArr);
@@ -507,50 +540,10 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
 
     // A DYNAMIC rigid: getInd() is then a two-word value whose high half is not
     // zero, so the u64 comparison in the filter's binary search is load-bearing and
-    // the 32-bit `tempContactByX` truncation is visible.
-    R.rigidId = PxNodeIndex(0x51u, 3u);
+    // the 32-bit `tempContactByRigid` key (PxgGetContactSortKey) is visible.
     std::vector<uint64_t> remap(Scene::NB_CACHE, 0xDEADBEEFDEADBEEFull);
     remap[Scene::TRI_CACHE] = R.rigidId.getInd();
     R.bRemap = R.mk(dev, remap);
-
-    // The filter list, sorted by (index0, index1, index2) exactly as the engine's
-    // binary search requires.
-    R.pairs.clear();
-    for (uint32_t k = 0; k < 2u; ++k)
-    {
-        const ClothDef& c = S.cloth[k];
-        auto addVert = [&](uint32_t v) {
-            PxgRigidFilterPair p;
-            p.index0 = R.rigidId.getInd();
-            p.index1 = encodeCloth(c.clothId, v);
-            p.index2 = 0u;
-            R.pairs.push_back(p);
-        };
-        for (uint32_t t : c.filteredTris)
-            for (uint32_t j = 0; j < 3u; ++j) addVert(c.inds[t * 4u + j]);
-        // Two of three only.  WHICH two rotates with the triangle so that each of
-        // the three conjuncts is the surviving one somewhere.
-        for (size_t i = 0; i < c.partialTris.size(); ++i)
-        {
-            const uint32_t t = c.partialTris[i];
-            const uint32_t skip = uint32_t(i % 3u);
-            for (uint32_t j = 0; j < 3u; ++j)
-                if (j != skip) addVert(c.inds[t * 4u + j]);
-        }
-    }
-    std::sort(R.pairs.begin(), R.pairs.end(),
-              [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                  if (a.index0 != b.index0) return a.index0 < b.index0;
-                  if (a.index1 != b.index1) return a.index1 < b.index1;
-                  return a.index2 < b.index2;
-              });
-    R.pairs.erase(std::unique(R.pairs.begin(), R.pairs.end(),
-                              [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                                  return a.index0 == b.index0 && a.index1 == b.index1 &&
-                                         a.index2 == b.index2;
-                              }),
-                  R.pairs.end());
-    R.bPairs = R.mk(dev, R.pairs);
 
     const std::vector<F4> f4Init(Scene::CAP, F4{ -7.f, -7.f, -7.f, -7.f });
     const std::vector<uint32_t> u32Init(Scene::CAP, POISON_U32);
@@ -560,11 +553,11 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.bNormalPen = R.mk(dev, f4Init);
     R.bBary = R.mk(dev, f4Init);
     R.bInfo = R.mk(dev, infoInit);
+    R.bRigidMat = R.mk(dev, std::vector<uint16_t>(Scene::CAP, uint16_t(POISON_U32 & 0xffffu)));
     R.bCount = R.mk(dev, std::vector<uint32_t>(1u, opt.seedCount));
     R.bByX = R.mk(dev, u64Init);
     R.bTempByX = R.mk(dev, u32Init);
     R.bIdxByX = R.mk(dev, u32Init);
-    R.bSortedByX = R.mk(dev, u32Init);
 
     R.blob = ClothSdfBlob{};
     R.blob.numWorkItems = opt.numPairs;
@@ -575,17 +568,15 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.blob.gpuShapes = R.bShapes.addr;
     R.blob.femClothes = R.bDesc.addr;
     R.blob.shapeToRigidRemap = R.bRemap.addr;
-    R.blob.filterPairs = R.bPairs.addr;
-    R.blob.nbFilterPairs = uint32_t(R.pairs.size());
     R.blob.w_outPoint = R.bPoint.addr;
     R.blob.w_outNormalPen = R.bNormalPen.addr;
     R.blob.w_outBarycentric = R.bBary.addr;
     R.blob.w_outContactInfo = R.bInfo.addr;
+    R.blob.w_outRigidMaterialIndex = R.bRigidMat.addr;
     R.blob.w_totalContactCount = R.bCount.addr;
-    R.blob.w_contactByX = R.bByX.addr;
-    R.blob.w_tempContactByX = R.bTempByX.addr;
-    R.blob.w_contactIndexSortedByX = R.bIdxByX.addr;
-    R.blob.w_contactSortedByX = R.bSortedByX.addr;
+    R.blob.w_contactByRigid = R.bByX.addr;
+    R.blob.w_tempContactByRigid = R.bTempByX.addr;
+    R.blob.w_contactIndexSortedByRigid = R.bIdxByX.addr;
     R.blob.w_maxNumContacts = opt.capacity;
     return true;
 }
@@ -722,7 +713,7 @@ struct Contact
 {
     uint32_t tri;
     F4 point, normalPen, bary;
-    uint32_t pairInd1;
+    uint64_t ref1;   // PxgEncodeDeformableTriangle(clothId, tri)
 };
 struct Expect
 {
@@ -748,16 +739,18 @@ static Expect predictPair(const Scene& S, const ClothDef& c, const Rig& R,
     const float contactDistance = contactDistOf(S, c);
     const PxTransform meshPose = S.meshPose();
 
-    auto listed = [&](uint32_t v) {
-        PxgRigidFilterPair q;
-        q.index0 = R.rigidId.getInd();
-        q.index1 = encodeCloth(c.clothId, v);
-        q.index2 = 0u;
-        return std::binary_search(R.pairs.begin(), R.pairs.end(), q,
-                                  [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                                      if (a.index0 != b.index0) return a.index0 < b.index0;
-                                      return a.index1 < b.index1;
+    // findRigidSurfaceTriangleFilter (5.12) over this cloth's own list.
+    const std::vector<PxgDeformablePairInfo>& pk = R.pairs[&c == &S.cloth[0] ? 0 : 1];
+    auto listedTri = [&](uint32_t t) {
+        const PxgDeformablePairInfo q = { PxgEncodeRigidFilterRef(R.rigidId, Scene::TRI_CACHE),
+                                          encodeClothTri(c.clothId, t) };
+        return std::binary_search(pk.begin(), pk.end(), q,
+                                  [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+                                      return PxgComparePairInfo(a, b) < 0;
                                   });
+    };
+    auto vertsListed = [&](uint32_t t) {
+        return std::find(c.partialTris.begin(), c.partialTris.end(), t) != c.partialTris.end();
     };
 
     for (const std::vector<uint32_t>& round : rounds)
@@ -769,12 +762,9 @@ static Expect predictPair(const Scene& S, const ClothDef& c, const Rig& R,
             ++E.gathered;
             const size_t at = size_t(std::lower_bound(tris.begin(), tris.end(), t) - tris.begin());
 
-            // S5: ALL THREE.
-            const bool f0 = listed(c.inds[t * 4u + 0]);
-            const bool f1 = listed(c.inds[t * 4u + 1]);
-            const bool f2 = listed(c.inds[t * 4u + 2]);
-            if (f0 && f1 && f2) { ++E.skipped; continue; }
-            if (f0 || f1 || f2) ++E.partialKept;
+            // S5 (5.12): the triangle itself.
+            if (listedTri(t)) { ++E.skipped; continue; }
+            if (vertsListed(t)) ++E.partialKept;
 
             const PxVec3 pointV(desc[at].point.x, desc[at].point.y, desc[at].point.z);
             float sep = desc[at].sep;
@@ -823,7 +813,7 @@ static Expect predictPair(const Scene& S, const ClothDef& c, const Rig& R,
             k.point = F4{ worldP.x, worldP.y, worldP.z, rest };
             k.normalPen = F4{ worldN.x, worldN.y, worldN.z, sep };
             k.bary = bary;
-            k.pairInd1 = encodeCloth(c.clothId, t);
+            k.ref1 = encodeClothTri(c.clothId, t);
             E.contacts.push_back(k);
         }
     }
@@ -881,6 +871,7 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     const auto npen = downloadBuffer<F4>(dev, R.bNormalPen.h, Scene::CAP);
     const auto bary = downloadBuffer<F4>(dev, R.bBary.h, Scene::CAP);
     const auto info = downloadBuffer<uint32_t>(dev, R.bInfo.h, size_t(Scene::CAP) * 4u);
+    const auto rigidMat = downloadBuffer<uint16_t>(dev, R.bRigidMat.h, Scene::CAP);
     const auto byX = downloadBuffer<uint64_t>(dev, R.bByX.h, Scene::CAP);
     const auto tempByX = downloadBuffer<uint32_t>(dev, R.bTempByX.h, Scene::CAP);
     const auto idxByX = downloadBuffer<uint32_t>(dev, R.bIdxByX.h, Scene::CAP);
@@ -895,8 +886,8 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     // Coverage, DEMANDED rather than designed.
     PXG_CHECK_MSG(!exp[0].contacts.empty(), "%s: pair 0 produced no contact at all", label);
     PXG_CHECK_MSG(exp[0].skipped > 0u && exp[0].partialKept > 0u,
-                  "%s: the filter dropped %u triangles and kept %u partially-filtered ones "
-                  "(both must be > 0, or the three-way conjunction is unobservable)",
+                  "%s: the filter dropped %u triangles and kept %u vertex-filtered ones "
+                  "(both must be > 0, or the triangle-vs-vertex key is unobservable)",
                   label, exp[0].skipped, exp[0].partialKept);
     if (opt.coverage == COV_FULL)
     {
@@ -1006,11 +997,12 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
         const uint64_t rid = R.rigidId.getInd();
         if (info[size_t(at) * 4u + 0] != uint32_t(rid & 0xffffffffu)) ++bad;
         if (info[size_t(at) * 4u + 1] != uint32_t(rid >> 32)) ++bad;
-        if (info[size_t(at) * 4u + 2] != e.pairInd1) ++bad;
-        // setRigidMaterialIndex(mat) then markInCollision(false): bit 31 cleared.
-        if (info[size_t(at) * 4u + 3] != (S.materialIndex & 0x7fffffffu)) ++bad;
+        if (info[size_t(at) * 4u + 2] != uint32_t(e.ref1 & 0xffffffffu)) ++bad;
+        if (info[size_t(at) * 4u + 3] != uint32_t(e.ref1 >> 32)) ++bad;
+        // 5.12: PxU16(rigidMaterialIndex) in its own stream.
+        if (rigidMat[at] != uint16_t(S.materialIndex & 0xffffu)) ++bad;
         if (byX[at] != rid) ++bad;
-        if (tempByX[at] != uint32_t(rid & 0xffffffffu)) ++bad;
+        if (tempByX[at] != PxgGetContactSortKey(rid)) ++bad;
         if (idxByX[at] != at) ++bad;
     };
 
@@ -1022,7 +1014,7 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     else
     {
         // Slot-agnostic: pair every written slot with the expectation that carries
-        // the same pairInd1, and require the pairing to be a bijection.
+        // the same ref1, and require the pairing to be a bijection.
         std::vector<const Contact*> want;
         for (uint32_t p = 0; p < opt.numPairs; ++p)
             for (const Contact& k : exp[p].contacts) want.push_back(&k);
@@ -1033,7 +1025,8 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
             ++writtenSlots;
             size_t hit = want.size();
             for (size_t j = 0; j < want.size(); ++j)
-                if (!used[j] && want[j]->pairInd1 == info[size_t(at) * 4u + 2]) { hit = j; break; }
+                if (!used[j] && want[j]->ref1 == (uint64_t(info[size_t(at) * 4u + 2]) |
+                                                  (uint64_t(info[size_t(at) * 4u + 3]) << 32))) { hit = j; break; }
             if (hit == want.size()) { ++bad; continue; }
             used[hit] = 1u;
             checkAt(*want[hit], at);
@@ -1047,7 +1040,9 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     // exactly as it was uploaded.
     size_t spill = 0;
     for (uint32_t at = PxMin(total, opt.capacity); at < Scene::CAP; ++at)
-        if (idxByX[at] != POISON_U32 || byX[at] != ~0ull || !bitEq(point[at].x, -7.f)) ++spill;
+        if (idxByX[at] != POISON_U32 || byX[at] != ~0ull || !bitEq(point[at].x, -7.f) ||
+            rigidMat[at] != uint16_t(POISON_U32 & 0xffffu))
+            ++spill;
     PXG_CHECK_MSG(spill == 0, "%s: %zu slots beyond the reservation were written", label, spill);
 
     std::printf("    [ note ] %s: %zu round(s), %u gathered, %u filtered out (%u partial kept), "

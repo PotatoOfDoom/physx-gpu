@@ -176,6 +176,8 @@ import pxgSlangBv32;   // P8.25: the Gu::BV32DataPacked reader, shared
 // two records they move -- extracted here when ps_sdfMeshCollisonLaunch became
 // the fourth caller.  What used to sit in this file is now one import.
 import pxgSlangParticleContact;
+import pxgSlangDeformableRef;      // 5.12 PxgEncodeParticleRef
+import pxgSlangDeformableWriters;  // PxgRigidParticleContactWriter
 
 // ---------------------------------------------------------------------------
 // Constants, all pinned by the fixture's layout test.
@@ -218,16 +220,18 @@ struct PsMeshMidPush
     uint64_t gpuShapes;             // @40
     uint64_t particleSystems;       // @48
     uint64_t shapeToRigidRemapTable;// @56
-    // PxgParticleContactWriter, BY VALUE (PxgParticleSystem.h:604), 72 bytes @64
-    uint64_t w_particleContacts;            // @64
-    uint64_t w_numTotalContacts;            // @72
-    uint64_t w_contactSortedByParticle;     // @80
-    uint64_t w_tempContactByParticle;       // @88
-    uint64_t w_contactIndexSortedByParticle;// @96
-    uint64_t w_contactByRigid;              // @104
-    uint64_t w_tempContactByRigid;          // @112
-    uint64_t w_contactIndexSortedByRigid;   // @120
-    uint w_maxContacts;                     // @128 -> 136
+    // PxgRigidParticleContactWriter, BY VALUE (PxgParticleSystem.h, 5.12), 80 bytes @64
+    uint64_t w_particleContactInfos;        // @64  PxgDeformablePairInfo*
+    uint64_t w_particleContactNormalPens;   // @72  float4*
+    uint64_t w_numTotalContacts;            // @80
+    uint64_t w_contactSortedByParticle;     // @88
+    uint64_t w_tempContactByParticle;       // @96
+    uint64_t w_contactIndexSortedByParticle;// @104
+    uint64_t w_contactByRigid;              // @112
+    uint64_t w_tempContactByRigid;          // @120
+    uint64_t w_contactIndexSortedByRigid;   // @128
+    uint w_maxContacts;                     // @136
+    uint _pad140;                           // @140 -> 144
 }
 [[vk::push_constant]]
 ConstantBuffer<PsMeshMidPush> gMm;
@@ -364,10 +368,11 @@ bool particleTriangleTest(inout float3 normal, inout float distance,
 
 // The eight writer pointers and the capacity, out of this shader's push block
 // and into the shared record pxgSlangParticleContact defines.
-PsContactWriter mmWriter()
+PxgRigidParticleContactWriterGpu mmWriter()
 {
-    PsContactWriter w;
-    w.particleContacts = gMm.w_particleContacts;
+    PxgRigidParticleContactWriterGpu w;
+    w.particleContactInfos = gMm.w_particleContactInfos;
+    w.particleContactNormalPens = gMm.w_particleContactNormalPens;
     w.numTotalContacts = gMm.w_numTotalContacts;
     w.contactSortedByParticle = gMm.w_contactSortedByParticle;
     w.tempContactByParticle = gMm.w_tempContactByParticle;
@@ -379,9 +384,10 @@ PsContactWriter mmWriter()
     return w;
 }
 
-void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, uint2 rigidId)
+// 5.12: writeContact(index, normalPen, rigidId, particleRef).
+void writeContact(uint index, float4 normalPen, uint64_t particleRef, uint2 rigidId)
 {
-    psWriteContact(mmWriter(), index, normalPen, compressedParticleIndex, rigidId);
+    mmWriter().writeContact(index, normalPen, uint64_t(rigidId.x) | (uint64_t(rigidId.y) << 32), particleRef);
 }
 
 // LoadShapePair<eTRIANGLEMESH, ePARTICLESYSTEM>: the TRIANGLE MESH is the tested
@@ -506,10 +512,9 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
     const uint nbWarpsRequired = psMeshNbWarpsRequired(numParticles);
     const uint nbIterationsPerWarps = psMeshNbIterations(numParticles);
-    const uint64_t gridParticleIndexAddr = systems[psId].mSortedToUnsortedMapping;
-
-    // D2: sticky, per lane, for ALL remaining iterations -- the CUDA's `return`.
-    bool laneDone = false;
+    // 5.12: the particle-rigid filter and its early `return` are gone (particle
+    // rigids were removed in 5.9), so D1 / D2 below describe the 5.6.1 kernel; every
+    // lane below numParticles is live.
 
     for (uint it = 0u; it < nbIterationsPerWarps; ++it)
     {
@@ -523,16 +528,7 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
             const uint globalParticleIndex = lane + workIndex * WARP;
 
-            // ---- the rigid filter, D1's guard and D2's sticky flag ----
-            if (!isDiffuse && globalParticleIndex < numParticles && !laneDone)
-            {
-                const uint2 particleMask =
-                    uint2(Ptr<uint>(gridParticleIndexAddr)[globalParticleIndex], psId);
-                if (psFindFilter(systems, psId, rigidId, particleMask))
-                    laneDone = true;
-            }
-
-            const bool laneLive = (globalParticleIndex < numParticles) && !laneDone;
+            const bool laneLive = globalParticleIndex < numParticles;
 
             // ---- PsTreeContactGenTraverser's constructor ----
             float3 particlePosShapeSpace = float3(0, 0, 0);
@@ -832,12 +828,12 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                     // M1: the diffuse dispatch is SUPPRESSED at the writer.
                     if (remaining != 0u && !isDiffuse)
                     {
-                        const uint2 compressedParticleIndex = uint2(globalParticleIndex, psId);
+                        const uint64_t particleRef = PxgEncodeParticleRef(psId, globalParticleIndex);
                         for (uint k = id, index = startIndex; k < contactCount; ++k, ++index)
                         {
                             const float3 n = shLocalContacts[lane][k];
                             const float pen = shLocalContactDepths[lane][k] - restDist;
-                            writeContact(index, float4(n, pen), compressedParticleIndex, rigidId);
+                            writeContact(index, float4(n, pen), particleRef, rigidId);
                         }
                     }
                 }

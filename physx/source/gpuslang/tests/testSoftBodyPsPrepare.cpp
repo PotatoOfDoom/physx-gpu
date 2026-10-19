@@ -24,57 +24,60 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of softBodyPsPrepareBda.slang -- sb_particleContactPrepareLaunch (P9.39d).
+// Verification of softBodyPsPrepareBda.slang -- sb_particleContactPrepareLaunch, PhysX 5.12
+// (softBody.cu).
 //
-// The mirror is transcribed from softBody.cu:844 and the helpers it calls, not from the
-// Slang, for the reason P9.39c's header records: a mirror written from the port repeats
-// the port's mistakes.
+// The mirror is transcribed from softBody.cu and the helpers it calls, not from the Slang: a
+// mirror written from the port repeats the port's mistakes.
+//
+// 5.12 REWROTE THIS KERNEL.  The 5.6.1 PxgFEMParticleConstraintBlock (normal_pen, barycentric,
+// velMultiplier from getSoftBodyInvMass's L2-scaled blended mass) became a
+// PxgParticleDbContactBlock (normal_pen, barycentric, maxPenBiasClamp); the packed
+// PxgFemOtherContactInfo became a PxgDeformablePairInfo (ref0 = PxgEncodeParticleRef,
+// ref1 = the tetrahedron ref, an INVALID pair skipped after its applied forces are zeroed);
+// and the rest distance is no longer the softbody's mRestDistance but the SUM
+// particleSystem.mData.mRestOffset + softbody.mRestOffset, subtracted after the delta term:
+//
+//     pen = (normal_pen.w - dot(particleDelta - tetDelta, normal)) - restDistance
+//     maxPenBiasClamp = PxMax(softbody.mPenBiasClamp, particleSystem.mData.mPenBiasClamp)
 //
 // ---------------------------------------------------------------------------
 // WHAT THE SCENE IS BUILT TO SEPARATE
 // ---------------------------------------------------------------------------
-// H1  getSoftBodyInvMass's L2 SCALE.  The blended inverse mass is multiplied by
-//     sqrt(bx^2+by^2+bz^2+bw^2), and the CLOTH twin has no such factor.  Every
-//     barycentric here is chosen so that the scale differs measurably from 1 -- with a
-//     barycentric like (1,0,0,0) the scale IS 1 and dropping the whole function is
-//     invisible.  A coverage assertion enforces it.
-//
-// H2  THE .w OF THE BARYCENTRIC PROJECTION IS THE MASS INPUT.  mSimDeltaPos carries the
-//     per-vertex inverse mass in .w, so a port that projected only .xyz would compile
-//     and feed garbage to H1.  The four vertices of each tet carry DIFFERENT inverse
-//     masses, so the blend is not a constant.
-//
-// H3  BOTH DELTAS ARE NON-ZERO AND DIFFERENT.  pen mixes the stored penetration, the
-//     particle's accumulated delta and the tet's; with either delta zero, the sign
-//     convention of `- dot(particleDelta - tetDelta, normal)` cannot be separated from
-//     its opposite.
-//
-// H4  THE WARP-BLOCKED LAYOUT.  More than 32 contacts, so the constraint array is more
-//     than one block and `constraints[workIndex/32]` indexed by `threadIdx.x & 31` has
-//     to land in the right block AND the right lane.
-//
-// H5  THE TAIL (Q11).  The contact count is deliberately NOT a multiple of 32, and the
-//     lanes past it are poisoned and asserted untouched -- the kernel returns before
-//     writing them.
-//
-// H6  THE TWO APPLIED-FORCE BUFFERS ARE DISTINCT, and both are float2 arrays living in
-//     float4-sized allocations: the kernel fills the first HALF OF EACH BUFFER densely
-//     at stride 8, two contacts per 16-byte slot.  They are poisoned with different
-//     patterns; everything past 8 * numContacts bytes must survive.
-//
-// H7  restDistance IS PER SOFTBODY.  Two softbodies with different rest distances, and
-//     contacts against both, so reading softbody 0's value for every contact fails.
+// S1  BOTH DELTAS ARE NON-ZERO AND DIFFERENT, so the sign of `- dot(particleDelta -
+//     tetDelta, normal)` and the projection of the TET delta (all four corners, each with
+//     its own value) are observable.
+// S2  THE REST DISTANCE IS A SUM OF TWO PER-BODY TERMS.  Two softbodies (with a zero DECOY
+//     between them) and two particle systems, all with different rest offsets, so reading
+//     either term alone, or one body's term for every contact, fails.
+// S3  THE CLAMP IS A SELECT-MAX OF TWO PER-BODY TERMS, with the larger one coming from the
+//     softbody for some pairs and from the particle system for others.
+// S4  THE WARP-BLOCKED LAYOUT.  45 contacts: two blocks of 32, the second partial; the lanes
+//     past the count and the lanes of INVALID pairs keep their poison.
+// S5  INVALID PAIRS are skipped -- but only AFTER both applied-force slots are zeroed.
+// S6  THE TWO APPLIED-FORCE BUFFERS ARE DISTINCT float2 arrays, zeroed for every contact
+//     (valid or not) and untouched past the count.
+// S7  The `contacts` stream is NOT read: it is passed as a buffer of NaNs.
 
 #include "pxgTestFramework.h"
+#include "host_defines.h"
+#include "vector_functions.h"
 #include "PxgSoftBody.h"
 #include "PxgParticleSystem.h"
+#include "PxgSimulationCoreDesc.h"
+#include "PxgDeformableConstraints.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
 
 namespace
 {
@@ -85,32 +88,32 @@ struct F4 { float x, y, z, w; };
 struct F2 { float x, y; };
 struct U4 { uint32_t x, y, z, w; };
 
-// softBody.cu:845-854, ten pointers.
+// sb_particleContactPrepareLaunch (softBody.cu, 5.12), ten pointers.
 struct SbPsPrepPush
 {
     uint64_t softbodies, particleSystems, contacts, normalPens, barycentrics,
-             contactInfos, numContacts, constraints, softBodyAppliedForces,
+             contactInfos, numContacts, contactBlocks, softBodyAppliedForces,
              particleAppliedForces;
 };
 static_assert(sizeof(SbPsPrepPush) == 80, "sb prepare blob must be 80 bytes");
 static_assert(offsetof(SbPsPrepPush, contacts) == 16, "contacts @16 -- THIRD, and dead");
-static_assert(offsetof(SbPsPrepPush, constraints) == 56, "constraints @56");
+static_assert(offsetof(SbPsPrepPush, contactBlocks) == 56, "contactBlocks @56");
 static_assert(offsetof(SbPsPrepPush, particleAppliedForces) == 72, "particle forces LAST");
 
-// PxgFEMParticleConstraintBlock (PxgFEMCore.h:184): float4[32], float4[32], float[32].
+// PxgParticleDbContactBlock (PxgDeformableConstraints.h, 5.12): float4[32], float4[32], float[32].
 static const uint32_t CB_STRIDE = 1152u;
 static const uint32_t CB_NORMAL_PEN = 0u;
 static const uint32_t CB_BARYCENTRIC = 512u;
-static const uint32_t CB_VELMULT = 1024u;
-
-static const uint32_t BITSHIFT_TET = 20u;
+static const uint32_t CB_MAXPENBIASCLAMP = 1024u;
+static_assert(sizeof(PxgParticleDbContactBlock) == CB_STRIDE, "PxgParticleDbContactBlock stride");
+static_assert(offsetof(PxgParticleDbContactBlock, barycentric) == CB_BARYCENTRIC, "barycentric");
+static_assert(offsetof(PxgParticleDbContactBlock, maxPenBiasClamp) == CB_MAXPENBIASCLAMP, "maxPenBiasClamp");
+static_assert(sizeof(PxgDeformablePairInfo) == 16, "PxgDeformablePairInfo");
 
 // ---- the mirror, from softBody.cu -------------------------------------------------
-static float dot3(F4 a, float bx, float by, float bz)
-{ return a.x * bx + a.y * by + a.z * bz; }
-
-// barycentricProject (softBody.cu:640): whole float4s, left to right.
-static F4 barycentricProject(U4 tet, const std::vector<F4>& v, F4 b)
+// barycentricProjectTet (deformableUtils.cuh): a * b.x + b * b.y + c * b.z + d * b.w on
+// whole float4s, left to right.
+static F4 barycentricProjectTet(U4 tet, const std::vector<F4>& v, F4 b)
 {
     const F4 a = v[tet.x], c = v[tet.y], d = v[tet.z], e = v[tet.w];
     F4 r;
@@ -120,15 +123,7 @@ static F4 barycentricProject(U4 tet, const std::vector<F4>& v, F4 b)
     r.w = a.w * b.x + c.w * b.y + d.w * b.z + e.w * b.w;
     return r;
 }
-
-// getSoftBodyInvMass (softBody.cuh:38): baryMass * sqrt(sum of squares).  Written out
-// rather than as a 4-vector length, which is the substitution this project has already
-// measured diverging by one ULP (femClothDampingBda.slang:85-89).
-static float getSoftBodyInvMass(float baryMass, F4 b)
-{
-    const float scale = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w);
-    return baryMass * scale;
-}
+static float selectMax(float a, float b) { return (a < b) ? b : a; }   // PxMax
 
 struct DevB { PxgBufferHandle h = 0; uint64_t addr = 0; };
 template <class T> static DevB mk(PxgSlangComputeDevice* dev, const std::vector<T>& v)
@@ -137,334 +132,158 @@ template <class T> static DevB mk(PxgSlangComputeDevice* dev, const std::vector<
     return b;
 }
 
+struct Rng
+{
+    uint32_t s;
+    uint32_t next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+    float uni(float lo, float hi) { return lo + (hi - lo) * float(next() & 0xffffffu) / float(0x1000000); }
+};
+
+static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
 PXG_TEST(softBodyPsPrepare)
 {
     PxgSlangComputeDevice* dev = testDevice();
+    Rng rng{ 0x5eed1234u };
 
-    const uint32_t NB_SB = 3u, NB_PS = 1u;
-    // H7: different per softbody, neither zero, and not equal to each other.
-    const float REST[NB_SB] = { 0.0625f, 0.1875f, 0.125f };
-
-    // ---- two tet meshes, four sim vertices each, with DIFFERENT inverse masses in .w
-    // (H2).  Positions are irrelevant here -- this kernel reads mSimDeltaPos, which is
-    // an accumulated DELTA, not a position -- so the values are chosen to be dyadic and
-    // distinguishable rather than geometric.
-    std::vector<F4> simDelta0 = {
-        { 0.25f,  -0.125f,  0.5f,    0.5f   },
-        { -0.5f,   0.75f,  -0.25f,   0.25f  },
-        { 0.125f,  0.25f,   0.125f,  1.0f   },
-        { 0.75f,  -0.5f,    0.375f,  0.125f },
-    };
-    std::vector<F4> simDelta1 = {
-        { -0.375f, 0.5f,    0.25f,   0.75f  },
-        { 0.625f, -0.25f,   0.125f,  0.5f   },
-        { 0.25f,   0.125f, -0.625f,  0.25f  },
-        { -0.125f, 0.375f,  0.5f,    2.0f   },
-    };
-    DevB bDelta0 = mk(dev, simDelta0);
-    if (!bDelta0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-    DevB bDelta1 = mk(dev, simDelta1);
-
-    // H9: a THIRD tet whose four vertices all have inverse mass 0.  Paired with a
-    // zero-inverse-mass particle it makes unitResponse exactly 0, which is the only
-    // input that separates `(unitResponse > 0) ? 1/unitResponse : 0` from an
-    // unguarded divide or from a `>=` guard.  Without it both mutants survived.
-    std::vector<F4> simDelta2 = {
-        { 0.5f,  -0.25f,  0.125f, 0.0f },
-        { -0.25f, 0.5f,  -0.375f, 0.0f },
-        { 0.375f, 0.125f, 0.25f,  0.0f },
-        { -0.5f,  0.625f, 0.5f,   0.0f },
-    };
-    DevB bDelta2 = mk(dev, simDelta2);
-
-    std::vector<U4> tets0 = { { 0u, 1u, 2u, 3u } };
-    std::vector<U4> tets1 = { { 3u, 2u, 1u, 0u } };   // deliberately a different winding
-    std::vector<U4> tets2 = { { 0u, 1u, 2u, 3u } };
-    DevB bTets0 = mk(dev, tets0);
-    DevB bTets1 = mk(dev, tets1);
-    DevB bTets2 = mk(dev, tets2);
-
-    std::vector<PxgSoftBody> sbArr(NB_SB);
+    // ---- softbodies 0 and 2 (1 is a zero decoy); every tet has its own four vertices ----
+    const uint32_t NT = 12u;
+    const float SB_REST[3] = { 0.021f, 0.0f, 0.047f };
+    const float SB_CLAMP[3] = { -0.6f, 0.0f, -2.5f };
+    std::vector<U4> tets[3];
+    std::vector<F4> deltaPos[3];
+    std::vector<DevB> keep;
+    std::vector<PxgSoftBody> sbArr(3);
     std::memset(sbArr.data(), 0, sbArr.size() * sizeof(PxgSoftBody));
-    sbArr[0].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets0.addr));
-    sbArr[0].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta0.addr));
-    sbArr[0].mRestDistance = REST[0];
-    sbArr[1].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets1.addr));
-    sbArr[1].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta1.addr));
-    sbArr[1].mRestDistance = REST[1];
-    sbArr[2].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets2.addr));
-    sbArr[2].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta2.addr));
-    sbArr[2].mRestDistance = REST[2];
-    DevB bSb = mk(dev, sbArr);
-
-    // ---- the particle system: mSortedDeltaP carries the accumulated delta and the
-    // particle's inverse mass in .w (H3).  Several entries have invMass 0, which the
-    // prepare does NOT skip -- only the solve kernels do -- so they must still produce a
-    // constraint, with velMultiplier falling back on the sbMass alone.
-    std::vector<F4> sortedDeltaP;
-    for (uint32_t i = 0; i < 64u; ++i)
+    for (uint32_t s = 0; s < 3; s += 2)
     {
-        const float t = float(int32_t(i) - 32) * 0.03125f;
-        sortedDeltaP.push_back(F4{ t, -t * 0.5f, t * 0.25f,
-                                   (i % 7u == 0u) ? 0.0f : (0.125f + float(i % 5u) * 0.25f) });
+        for (uint32_t t = 0; t < NT; ++t)
+            tets[s].push_back(U4{ 4 * t + 3, 4 * t + 1, 4 * t + 0, 4 * t + 2 });
+        for (uint32_t v = 0; v < 4 * NT; ++v)
+            deltaPos[s].push_back(F4{ rng.uni(-0.05f, 0.05f), rng.uni(-0.05f, 0.05f), rng.uni(-0.05f, 0.05f),
+                                      rng.uni(0.5f, 2.0f) });
+        const DevB bt = mk(dev, tets[s]), bd = mk(dev, deltaPos[s]);
+        keep.push_back(bt); keep.push_back(bd);
+        sbArr[s].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bt.addr));
+        sbArr[s].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bd.addr));
+        sbArr[s].mRestOffset = SB_REST[s];
+        sbArr[s].mPenBiasClamp = SB_CLAMP[s];
     }
-    DevB bSdp = mk(dev, sortedDeltaP);
+    const DevB bSb = mk(dev, sbArr);
 
-    std::vector<PxgParticleSystem> psArr(NB_PS);
+    // ---- particle systems 0 and 1 ----
+    const uint32_t NP = 40u;
+    const float PS_REST[2] = { 0.013f, 0.032f };
+    const float PS_CLAMP[2] = { -1.1f, -0.3f };   // S3: vs -0.6 / -2.5 the max comes from either side
+    std::vector<F4> sortedDeltaP[2];
+    std::vector<PxgParticleSystem> psArr(2);
     std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
-    psArr[0].mSortedDeltaP = reinterpret_cast<float4*>(size_t(bSdp.addr));
-    DevB bPs = mk(dev, psArr);
-
-    // ---- the contacts.  H4/H5: more than one warp of them, and NOT a multiple of 32.
-    const uint32_t NB_CONTACTS = 77u;
-    static_assert(true, "");
-    std::vector<F4> contacts(NB_CONTACTS), normalPens(NB_CONTACTS), barys(NB_CONTACTS);
-    std::vector<uint32_t> infos(NB_CONTACTS * 4u, 0u);
-    uint32_t nonTrivialScale = 0u, equalBaryComponents = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    for (uint32_t q = 0; q < 2; ++q)
     {
-        // H9: every seventh particle has inverse mass 0; pointing some of those at
-        // softbody 2 (all sim masses 0) makes unitResponse exactly 0.
-        uint32_t particleIdx = (i * 13u) % uint32_t(sortedDeltaP.size());
-        uint32_t sbId = i % 2u;                       // H7: alternate softbodies 0 and 1
-        if (i % 11u == 3u) { particleIdx = (particleIdx / 7u) * 7u; sbId = 2u; }
-
-        // contacts[] is dead (Q7) but must still be a real buffer; poison it so a port
-        // that USED it would produce nonsense rather than something plausible.
-        contacts[i] = F4{ 1e30f, -1e30f, 1e30f, -1e30f };
-
-        const float a = 0.125f + float(i % 9u) * 0.0625f;
-        normalPens[i] = F4{ a, 1.0f - a, -0.5f + a, -0.25f + float(i % 5u) * 0.125f };
-
-        // H1: barycentrics whose L2 norm is clearly not 1.  A vertex-like (1,0,0,0)
-        // would make getSoftBodyInvMass the identity and hide it entirely.
-        //
-        // H8: and PAIRWISE DIFFERENT components.  My first version held y and z at 0.25
-        // for every contact, so swapping which barycentric multiplies which corner was a
-        // no-op and the sweep left that mutant green.  Four distinct weights make the
-        // projection order observable.
-        // Dyadic and PAIRWISE DISTINCT by construction: the three free components walk
-        // in opposite directions in steps of 1/512 so no two can meet, and w takes the
-        // remainder.  (1/16, 3/16, 5/16, 7/16) at k = 0 has L2 norm ~0.573, comfortably
-        // away from 1.
-        const float k = float(i % 8u);
-        F4 b{ 0.0625f + k * (1.0f / 256.0f),
-              0.1875f + k * (1.0f / 512.0f),
-              0.3125f - k * (1.0f / 512.0f),
-              0.0f };
-        b.w = 1.0f - b.x - b.y - b.z;
-        barys[i] = b;
-        if (!(b.x != b.y && b.x != b.z && b.x != b.w && b.y != b.z &&
-              b.y != b.w && b.z != b.w))
-            ++equalBaryComponents;
-        const float scale = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w);
-        if (std::fabs(scale - 1.0f) > 0.05f) ++nonTrivialScale;
-
-        // PxgFemOtherContactInfo: pairInd0 u64 @0 = (systemId << 32) | particleIndex,
-        // pairInd1 u32 @8 = (softbodyId << 20) | tetId.  Word 3 is the rigid
-        // material / inCollision pair this kernel must not touch.
-        infos[i * 4 + 0] = particleIdx;
-        infos[i * 4 + 1] = 0u;                        // particle system id
-        infos[i * 4 + 2] = (sbId << BITSHIFT_TET) | 0u;
-        infos[i * 4 + 3] = 0xDEADBEEFu;
+        for (uint32_t i = 0; i < NP; ++i)
+            sortedDeltaP[q].push_back(F4{ rng.uni(-0.04f, 0.04f), rng.uni(-0.04f, 0.04f), rng.uni(-0.04f, 0.04f),
+                                          rng.uni(0.5f, 2.0f) });
+        const DevB b = mk(dev, sortedDeltaP[q]);
+        keep.push_back(b);
+        psArr[q].mSortedDeltaP = reinterpret_cast<float4*>(size_t(b.addr));
+        psArr[q].mData.mRestOffset = PS_REST[q];
+        psArr[q].mData.mPenBiasClamp = PS_CLAMP[q];
     }
-    PXG_CHECK_MSG(equalBaryComponents == 0u,
-                  "%u contacts have two equal barycentric components; the projection's "
-                  "corner order (H8) is unobservable for those, and the sweep left "
-                  "Q4-swap-bary-yz green when EVERY contact was like that",
-                  equalBaryComponents);
-    PXG_CHECK_MSG(nonTrivialScale > 0u,
-                  "every barycentric has L2 norm ~1, so getSoftBodyInvMass's scale (H1) "
-                  "is the identity and dropping it would be invisible");
-    PXG_CHECK_MSG(NB_CONTACTS % 32u != 0u,
-                  "the contact count must NOT be a multiple of 32, or the partially "
-                  "written tail block (H5) is never exercised");
+    const DevB bPs = mk(dev, psArr);
 
-    DevB bContacts = mk(dev, contacts), bNP = mk(dev, normalPens), bBary = mk(dev, barys);
-    DevB bInfos = mk(dev, infos);
-    std::vector<uint32_t> numContacts = { NB_CONTACTS };
-    DevB bNum = mk(dev, numContacts);
+    // ---- 45 contacts ----
+    const uint32_t N = 45u, NB = (N + 31u) / 32u;
+    std::vector<F4> normalPens, barys, deadContacts(N + 3u, F4{ NAN, NAN, NAN, NAN });
+    std::vector<PxgDeformablePairInfo> infos;
+    for (uint32_t c = 0; c < N; ++c)
+    {
+        const uint32_t s = (c % 3u == 1u) ? 2u : 0u;
+        const uint32_t q = (c % 4u == 2u) ? 1u : 0u;
+        PxgDeformablePairInfo pi;
+        pi.ref0 = PxgEncodeParticleRef(q, (c * 7u) % NP);
+        pi.ref1 = PxgEncodeDeformableTetrahedron(s, (c * 5u) % NT);
+        if (c % 9u == 4u) pi.ref1 = PxgEncodeInvalidDeformableRef(s);   // S5
+        infos.push_back(pi);
+        float nx = rng.uni(-1.f, 1.f), ny = rng.uni(-1.f, 1.f), nz = rng.uni(-1.f, 1.f);
+        const float l = std::sqrt(nx * nx + ny * ny + nz * nz);
+        normalPens.push_back(F4{ nx / l, ny / l, nz / l, rng.uni(-0.05f, 0.05f) });
+        float b[4] = { rng.uni(0.1f, 1.f), rng.uni(0.1f, 1.f), rng.uni(0.1f, 1.f), rng.uni(0.1f, 1.f) };
+        const float sum = b[0] + b[1] + b[2] + b[3];
+        barys.push_back(F4{ b[0] / sum, b[1] / sum, b[2] / sum, b[3] / sum });
+    }
+    std::vector<uint32_t> num = { N };
+    const uint32_t POISON = 0xC5C5C5C5u;
+    std::vector<uint32_t> blocksInit(NB * CB_STRIDE / 4u, POISON);
+    std::vector<F2> sbForceInit(N + 6u, F2{ 3.0f, -3.0f }), psForceInit(N + 6u, F2{ -7.0f, 7.0f });
 
-    // ---- outputs.  The constraint array is sized for a whole extra block so the tail
-    // beyond NB_CONTACTS can be poisoned and checked (H5).
-    const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u + 1u;
-    const uint32_t POISON_U = 0xCDCDCDCDu;
-    std::vector<uint32_t> constraintsInit(NB_BLOCKS * CB_STRIDE / 4u, POISON_U);
-    DevB bCons = mk(dev, constraintsInit);
-
-    // H6: two DISTINCT buffers, poisoned with DIFFERENT patterns.  Allocated as float4
-    // like the host does, while the kernel writes float2 DENSELY -- so exactly the first
-    // 8 * NB_CONTACTS bytes are zeroed and the rest must survive.
-    std::vector<F4> sbForcesInit(NB_CONTACTS + 8u, F4{ 11.0f, 11.0f, 11.0f, 11.0f });
-    std::vector<F4> psForcesInit(NB_CONTACTS + 8u, F4{ 21.0f, 21.0f, 21.0f, 21.0f });
-    DevB bSbF = mk(dev, sbForcesInit);
-    DevB bPsF = mk(dev, psForcesInit);
+    const DevB bNp = mk(dev, normalPens), bBary = mk(dev, barys), bInfo = mk(dev, infos), bNum = mk(dev, num),
+               bDead = mk(dev, deadContacts), bBlocks = mk(dev, blocksInit), bSbF = mk(dev, sbForceInit),
+               bPsF = mk(dev, psForceInit);
 
     SbPsPrepPush p = {};
-    p.softbodies = bSb.addr; p.particleSystems = bPs.addr;
-    p.contacts = bContacts.addr; p.normalPens = bNP.addr; p.barycentrics = bBary.addr;
-    p.contactInfos = bInfos.addr; p.numContacts = bNum.addr;
-    p.constraints = bCons.addr;
+    p.softbodies = bSb.addr; p.particleSystems = bPs.addr; p.contacts = bDead.addr;
+    p.normalPens = bNp.addr; p.barycentrics = bBary.addr; p.contactInfos = bInfo.addr;
+    p.numContacts = bNum.addr; p.contactBlocks = bBlocks.addr;
     p.softBodyAppliedForces = bSbF.addr; p.particleAppliedForces = bPsF.addr;
-
-    Kernel k("softBodyPsPrepareBda.spv", "sb_particleContactPrepareLaunch",
-             {}, sizeof(SbPsPrepPush));
+    Kernel k("softBodyPsPrepareBda.spv", "sb_particleContactPrepareLaunch", {}, sizeof(SbPsPrepPush));
     k.dispatch(1024u, {}, p, 1u, 1u);
     dev->flush();
 
-    // =====================================================================
-    // the mirror
-    // =====================================================================
-    struct Want { F4 normalPen, bary; float velMult; };
-    std::vector<Want> want(NB_CONTACTS);
-    uint32_t zeroInvMass = 0u, zeroUnitResponse = 0u;
-    for (uint32_t w = 0; w < NB_CONTACTS; ++w)
+    // ---- the mirror ----
+    std::vector<uint8_t> want(NB * CB_STRIDE);
+    std::memcpy(want.data(), blocksInit.data(), want.size());
+    uint32_t nValid = 0, nClampFromSb = 0, nClampFromPs = 0;
+    for (uint32_t c = 0; c < N; ++c)
     {
-        const uint32_t particleIdx = infos[w * 4 + 0];
-        const uint32_t pairInd1 = infos[w * 4 + 2];
-        const uint32_t sbId = pairInd1 >> BITSHIFT_TET;
-        const uint32_t tetId = pairInd1 & 0x000fffffu;
-
-        const std::vector<U4>& tets = (sbId == 0u) ? tets0 : (sbId == 1u ? tets1 : tets2);
-        const std::vector<F4>& sd = (sbId == 0u) ? simDelta0 : (sbId == 1u ? simDelta1 : simDelta2);
-        const U4 tet = tets[tetId];
-
-        const F4 bary = barys[w];
-        const F4 tetDelta_invMass = barycentricProject(tet, sd, bary);
-
-        const F4 np = normalPens[w];
+        const PxgDeformablePairInfo& pi = infos[c];
+        if (!PxgIsValidPairInfo(pi))
+            continue;
+        ++nValid;
+        const uint32_t q = PxgGetParticleSystemId(pi.ref0), pidx = PxgGetParticleIndex(pi.ref0);
+        const uint32_t s = PxgGetDeformableId(pi.ref1), t = PxgGetDeformableFeatureId(pi.ref1);
+        const F4 tetDelta = barycentricProjectTet(tets[s][t], deltaPos[s], barys[c]);
+        const F4 np = normalPens[c];
         const float nx = -np.x, ny = -np.y, nz = -np.z;
-
-        const F4 dp = sortedDeltaP[particleIdx];
-        const float invMass0 = dp.w;
-        if (invMass0 == 0.0f) ++zeroInvMass;
-
-        // pen = normal_pen.w - dot(particleDelta - tetDelta, normal) - restDistance,
-        // left to right, exactly as softBody.cu:921 writes it.
-        const float dx = dp.x - tetDelta_invMass.x;
-        const float dy = dp.y - tetDelta_invMass.y;
-        const float dz = dp.z - tetDelta_invMass.z;
-        const float pen = np.w - (dx * nx + dy * ny + dz * nz) - REST[sbId];
-
-        const float sbMass = getSoftBodyInvMass(tetDelta_invMass.w, bary);
-        const float unitResponse = invMass0 + sbMass;
-        const float velMult = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-        if (unitResponse == 0.0f) ++zeroUnitResponse;
-
-        want[w].normalPen = F4{ nx, ny, nz, pen };
-        want[w].bary = bary;
-        want[w].velMult = velMult;
+        const F4 pd = sortedDeltaP[q][pidx];
+        const float rx = pd.x - tetDelta.x, ry = pd.y - tetDelta.y, rz = pd.z - tetDelta.z;
+        const float restDistance = PS_REST[q] + SB_REST[s];
+        const float pen = (np.w - (rx * nx + ry * ny + rz * nz)) - restDistance;
+        const float clamp = selectMax(SB_CLAMP[s], PS_CLAMP[q]);
+        if (SB_CLAMP[s] > PS_CLAMP[q]) ++nClampFromSb; else ++nClampFromPs;
+        const size_t base = size_t(c / 32u) * CB_STRIDE, l = c & 31u;
+        const F4 npOut = F4{ nx, ny, nz, pen };
+        std::memcpy(&want[base + CB_NORMAL_PEN + l * 16], &npOut, 16);
+        std::memcpy(&want[base + CB_BARYCENTRIC + l * 16], &barys[c], 16);
+        std::memcpy(&want[base + CB_MAXPENBIASCLAMP + l * 4], &clamp, 4);
     }
-    PXG_CHECK_MSG(zeroInvMass > 0u,
-                  "no contact has a zero-inverse-mass particle, so the velMultiplier "
-                  "fallback path is never taken");
-    PXG_CHECK_MSG(zeroUnitResponse > 0u,
-                  "no contact has unitResponse exactly 0 (H9), so the `> 0` guard cannot "
-                  "be told apart from `>= 0` or from an unguarded divide -- both mutants "
-                  "survived the sweep before this case existed");
 
-    // =====================================================================
-    // compare
-    // =====================================================================
-    const std::vector<uint32_t> gCons =
-        downloadBuffer<uint32_t>(dev, bCons.h, NB_BLOCKS * CB_STRIDE / 4u);
-    auto blockWord = [&](uint32_t blk, uint32_t byteOff, uint32_t lane, uint32_t comp) {
-        return gCons[(blk * CB_STRIDE + byteOff) / 4u + lane * 4u + comp];
-    };
-    auto blockFloat = [&](uint32_t blk, uint32_t byteOff, uint32_t lane, uint32_t comp) {
-        const uint32_t u = blockWord(blk, byteOff, lane, comp);
-        float f; std::memcpy(&f, &u, 4); return f;
-    };
-    auto sameBits = [](float a, float b) {
-        uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y;
-    };
-
-    uint32_t bad = 0u;
-    for (uint32_t w = 0; w < NB_CONTACTS; ++w)
-    {
-        const uint32_t blk = w / 32u, lane = w % 32u;
-        const F4 gotNP{ blockFloat(blk, CB_NORMAL_PEN, lane, 0), blockFloat(blk, CB_NORMAL_PEN, lane, 1),
-                        blockFloat(blk, CB_NORMAL_PEN, lane, 2), blockFloat(blk, CB_NORMAL_PEN, lane, 3) };
-        const F4 gotB{ blockFloat(blk, CB_BARYCENTRIC, lane, 0), blockFloat(blk, CB_BARYCENTRIC, lane, 1),
-                       blockFloat(blk, CB_BARYCENTRIC, lane, 2), blockFloat(blk, CB_BARYCENTRIC, lane, 3) };
-        const uint32_t vmWord = gCons[(blk * CB_STRIDE + CB_VELMULT) / 4u + lane];
-        float gotVm; std::memcpy(&gotVm, &vmWord, 4);
-
-        const Want& e = want[w];
-        const bool ok = sameBits(gotNP.x, e.normalPen.x) && sameBits(gotNP.y, e.normalPen.y) &&
-                        sameBits(gotNP.z, e.normalPen.z) && sameBits(gotNP.w, e.normalPen.w) &&
-                        sameBits(gotB.x, e.bary.x) && sameBits(gotB.y, e.bary.y) &&
-                        sameBits(gotB.z, e.bary.z) && sameBits(gotB.w, e.bary.w) &&
-                        sameBits(gotVm, e.velMult);
-        if (!ok)
+    size_t bad = 0;
+    const std::vector<uint8_t> got = downloadBuffer<uint8_t>(dev, bBlocks.h, want.size());
+    for (size_t i = 0; i < want.size(); i += 4)
+        if (std::memcmp(&got[i], &want[i], 4) != 0)
         {
-            if (++bad <= 4u)
-            {
-                std::printf("  contact %u (block %u lane %u):\n", w, blk, lane);
-                std::printf("    normalPen got (%a %a %a %a) want (%a %a %a %a)\n",
-                            gotNP.x, gotNP.y, gotNP.z, gotNP.w,
-                            e.normalPen.x, e.normalPen.y, e.normalPen.z, e.normalPen.w);
-                std::printf("    bary      got (%a %a %a %a) want (%a %a %a %a)\n",
-                            gotB.x, gotB.y, gotB.z, gotB.w,
-                            e.bary.x, e.bary.y, e.bary.z, e.bary.w);
-                std::printf("    velMult   got %a want %a\n", gotVm, e.velMult);
-            }
+            uint32_t g, w;
+            std::memcpy(&g, &got[i], 4); std::memcpy(&w, &want[i], 4);
+            if (++bad <= 8) std::printf("  block word @%zu got 0x%08x want 0x%08x\n", i, g, w);
         }
-    }
-    PXG_CHECK_MSG(bad == 0u, "%u of %u constraints disagree with the mirror", bad, NB_CONTACTS);
-
-    // H5: the lanes past the contact count, and the whole spare block, are untouched.
-    uint32_t tailTouched = 0u;
-    for (uint32_t w = NB_CONTACTS; w < NB_BLOCKS * 32u; ++w)
+    const std::vector<F2> gSbF = downloadBuffer<F2>(dev, bSbF.h, N + 6u);
+    const std::vector<F2> gPsF = downloadBuffer<F2>(dev, bPsF.h, N + 6u);
+    for (uint32_t c = 0; c < N + 6u; ++c)
     {
-        const uint32_t blk = w / 32u, lane = w % 32u;
-        for (uint32_t c = 0; c < 4u; ++c)
-            if (blockWord(blk, CB_NORMAL_PEN, lane, c) != POISON_U ||
-                blockWord(blk, CB_BARYCENTRIC, lane, c) != POISON_U)
-                ++tailTouched;
-        if (gCons[(blk * CB_STRIDE + CB_VELMULT) / 4u + lane] != POISON_U) ++tailTouched;
+        const F2 ws = (c < N) ? F2{ 0.f, 0.f } : sbForceInit[c];
+        const F2 wp = (c < N) ? F2{ 0.f, 0.f } : psForceInit[c];
+        if (f2u(gSbF[c].x) != f2u(ws.x) || f2u(gSbF[c].y) != f2u(ws.y) ||
+            f2u(gPsF[c].x) != f2u(wp.x) || f2u(gPsF[c].y) != f2u(wp.y))
+        { if (++bad <= 8) std::printf("  applied forces [%u] mismatch\n", c); }
     }
-    PXG_CHECK_MSG(tailTouched == 0u,
-                  "%u words past contact %u were written; the kernel returns before the "
-                  "three stores for those lanes (Q11)", tailTouched, NB_CONTACTS);
+    PXG_CHECK_MSG(bad == 0, "sb_particleContactPrepareLaunch bit-exact vs the 5.12 CUDA mirror (%zu mismatches)", bad);
+    PXG_CHECK_MSG(nValid > 32u && nValid < N, "coverage: %u valid of %u (both blocks, some invalid)", nValid, N);
+    PXG_CHECK_MSG(nClampFromSb > 0u && nClampFromPs > 0u, "coverage: the clamp max must come from both sides (%u / %u)",
+                  nClampFromSb, nClampFromPs);
 
-    // H6: both force buffers zeroed at stride 8, upper halves intact, and the two are
-    // distinct allocations.
-    const std::vector<float> gSbF = downloadBuffer<float>(dev, bSbF.h, (NB_CONTACTS + 8u) * 4u);
-    const std::vector<float> gPsF = downloadBuffer<float>(dev, bPsF.h, (NB_CONTACTS + 8u) * 4u);
-    const uint32_t zeroedFloats = NB_CONTACTS * 2u;      // float2 per contact, dense
-    uint32_t forceBad = 0u;
-    for (uint32_t i = 0; i < zeroedFloats; ++i)
-    {
-        if (gSbF[i] != 0.0f) ++forceBad;
-        if (gPsF[i] != 0.0f) ++forceBad;
-    }
-    for (uint32_t i = zeroedFloats; i < (NB_CONTACTS + 8u) * 4u; ++i)
-    {
-        if (gSbF[i] != 11.0f) ++forceBad;
-        if (gPsF[i] != 21.0f) ++forceBad;
-    }
-    PXG_CHECK_MSG(forceBad == 0u,
-                  "%u applied-force checks failed: each buffer must be zeroed for exactly "
-                  "its first %u floats (one float2 per contact, DENSE at stride 8) and "
-                  "untouched after -- the float4-sized allocation is simply twice as "
-                  "large, not half-used per slot (H6/Q10)",
-                  forceBad, zeroedFloats);
-
-    // the contact-info word this kernel must not touch
-    const std::vector<uint32_t> gInfos = downloadBuffer<uint32_t>(dev, bInfos.h, NB_CONTACTS * 4u);
-    uint32_t infoBad = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-        if (gInfos[i * 4 + 3] != 0xDEADBEEFu) ++infoBad;
-    PXG_CHECK_MSG(infoBad == 0u,
-                  "%u contact-info slots had their fourth word changed; this kernel only "
-                  "READS PxgFemOtherContactInfo", infoBad);
-
-    std::printf("    [ note ] %u contacts over %u blocks (%u lanes of tail poison intact), "
-                "3 softbodies with rest %g/%g/%g, %u zero-inverse-mass particles, %u with "
-                "unitResponse == 0, %u barycentrics with a non-unit L2 scale\n",
-                NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS,
-                double(REST[0]), double(REST[1]), double(REST[2]), zeroInvMass,
-                zeroUnitResponse, nonTrivialScale);
+    for (const DevB& b : keep) dev->destroyBuffer(b.h);
+    for (const DevB* b : { &bSb, &bPs, &bNp, &bBary, &bInfo, &bNum, &bDead, &bBlocks, &bSbF, &bPsF })
+        dev->destroyBuffer(b->h);
 }
+
 } // namespace

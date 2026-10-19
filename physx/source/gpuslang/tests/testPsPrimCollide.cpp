@@ -376,8 +376,10 @@ PXG_TEST(psPrimCollide_driver)
                 cvp = add(cur, off);
                 cvr = std::sqrt(dot3(off, off)) + w.shapeP.w;
             }
-            const bool blocked = refFind(rigid, s2u[pi]);
-            if (blocked) { ++itemFiltered; ++itemBufBlocked[whichBuf(s2u[pi])]; }
+            // PhysX 5.12: the particle-rigid filter is gone.  The particles the 5.6.1
+            // list names are counted (coverage) and must now produce their contacts.
+            const bool listed = refFind(rigid, s2u[pi]);
+            if (listed) { ++itemFiltered; ++itemBufBlocked[whichBuf(s2u[pi])]; }
 
             bool intersect = false;
             V3 normal = { 0, 0, 0 };
@@ -413,18 +415,11 @@ PXG_TEST(psPrimCollide_driver)
             }
             if (intersect)
             {
-                if (blocked)
-                {
-                    // a filtered particle that WOULD contact: pins the buffer
-                    // localization (a broken '- runsum' silently un-blocks)
-                    ++itemBufWouldHit[whichBuf(s2u[pi])];
-                }
-                else
-                {
-                    refC[i].push_back({ pi, normal, dist - w.scale.w });
-                    ++itemHits;
-                    if (ccd) ++itemCcdHits;
-                }
+                if (listed)
+                    ++itemBufWouldHit[whichBuf(s2u[pi])];   // a 5.6.1-filtered contact, kept in 5.12
+                refC[i].push_back({ pi, normal, dist - w.scale.w });
+                ++itemHits;
+                if (ccd) ++itemCcdHits;
             }
         }
         skip[i] = sl.near ? 1 : 0;
@@ -494,7 +489,8 @@ PXG_TEST(psPrimCollide_driver)
     for (uint32_t i = 0; i < nUsed; ++i)
     {
         const uint32_t wi = gC[i].rLo - 0x40u;
-        if (wi < NW && gC[i].rHi == 7u && gC[i].pHi == SYS) byItem[wi].push_back(i);
+        // PxgEncodeParticleRef: the high word holds systemId << 2 (bit 34 and up).
+        if (wi < NW && gC[i].rHi == 7u && gC[i].pHi == (SYS << 2)) byItem[wi].push_back(i);
         else ++bogus;
     }
     PXG_CHECK_MSG(bogus == 0, "psPrimCollide: %zu bogus contacts", bogus);

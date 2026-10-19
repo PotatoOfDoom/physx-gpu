@@ -24,242 +24,216 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// ===========================================================================
-// softBodyClothSolveBda — sb_solveOutputSCDeltaVLaunch (softBody.cu:1566), on the engine BDA
-// ABI.  Step 6 and the LAST of the softbody-vs-cloth chain: it solves the constraints step 5
-// prepared and scatters the positional corrections back onto both bodies.
+// softBodyClothSolveBda -- the softbody-vs-cloth contact SOLVE of softBody.cu, PhysX 5.12:
 //
-// The two branches mirror step 5's, and again clothBC.w chooses: a cloth TRIANGLE spreads its
-// correction over three vertices, a cloth VERTEX takes all of it.  The solver body itself is
-// the same in both -- tetTriCollisionConstraint and tetVertexCollisionConstraint
-// (softBody.cu:650, :717) differ only in how many cloth vertices they weight:
+//   sb_querySCContactReferenceCountLaunch  NEW in 5.12: the pre-count.  solveDbDbContact
+//                                          with checkOnlyActivity decides the activity,
+//                                          recorded on the pair; an active pair bumps
+//                                          cloth.mDeltaPos.w and softbody.mSimDelta.w.
+//   sb_solveOutputSCDeltaVLaunch           solveDbDbContact on PxgDeformablePart<PxVec3>
+//                                          (cloth, side 0) and <PxVec4> (softbody, side 1),
+//                                          +delta to the cloth, -delta to the softbody.  One
+//                                          kernel for PGS and TGS.
 //
-//   relDelta   = (cloth side, barycentrically weighted) - (softbody side, ditto)
-//   CN         = pen + dot(relDelta, normal)
-//   dLambdaN   = max(-CN * denomInv, -lambdaN)      <- CLAMPED so the accumulated lambda can
-//                                                      never go negative; that is what stops
-//                                                      a contact from PULLING
-//   commonVec  = dLambdaN * normal
+// THE 5.12 DATA.  PxgDeformablePairInfo {ref0 = cloth vertex/triangle, ref1 = softbody
+// tet}, the two barycentric streams and PxgDbDbContactBlock.  appliedForces is a float2
+// (lambdaN, lambdaT); the 5.6.1 constraint block and lambdaNs buffer are gone.
 //
-// then, only if there is friction AND the tangential motion is above 1e-14:
-//
-//   tanDir     = normalise(relDelta - dot(relDelta, normal) * normal)
-//   dLambdaT   = -min(max(0, dot(relDelta, tanDir) * denomInv), friction * |dLambdaN|)
-//   commonVec += 0.5 * dLambdaT * tanDir            <- the 0.5 is upstream's "arbitrary
-//                                                      scaling factor", transcribed as such
-//
-// The corrections are then `+w * bc * commonVec` on the cloth and `-w * bc * commonVec` on the
-// softbody -- OPPOSITE SIGNS, which is the whole point: one body is pushed out of the other.
-//
-// THE VERTEX PATH IS NOT THE TRIANGLE PATH WITH bc = 1.  Its cloth correction is
-// `w0 * commonVec` with NO barycentric factor at all, and its atomic is guarded only by
-// `delta.w != 0` where the triangle path also requires `bc > 1e-6`.  Both asymmetries are
-// upstream's and both are transcribed.
-//
-// The `denomInv == 0` case CONTINUES rather than returning -- a degenerate constraint skips
-// its own contact and leaves the rest of the loop's contacts alone.
-//
-// ATOMICS: every scatter is a real float atomic add (VK_EXT_shader_atomic_float), because
-// several contacts share vertices.  `AtomicAdd(dst, v, 1.f)` adds v to xyz AND 1 to .w -- the
-// .w is a COUNT of contributions that the averaging pass downstream divides by, so dropping it
-// silently changes every delta that follows.
-//
-// GRID: SB_UPDATEROTATION, 1024 blocks of 256 threads, with CUDA's two-level work split
-// reproduced exactly.
-// ===========================================================================
-module softBodyClothSolveBda;
+// The strided work index is clamped to tNumContacts - 1 after the per-lane guard (P9.23,
+// value-neutral).  In PXG_NOCONTRACT_SHADERS.
 
-import pxgSlangSoftBodyDesc;
-import pxgSlangFEMClothDesc;
-import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W
+import pxgSlangSoftBodyDesc;                // PxgSoftBodyGpu, sbAt
+import pxgSlangFEMClothDesc;                // PxgFEMClothGpu, clothAt
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PXG_DBDBC_*
+import pxgSlangDeformableAndParticleUtils;  // PxgDeformablePart, solveDbDbContact
 
+// PxgSoftBodyKernelGridDim / BlockDim::SB_UPDATEROTATION.
 static const uint SC_GRID = 1024u;
 static const uint SC_BLOCK = 256u;
 
-static const uint PXG_BITSHIFT_ID = 20u;
-static const uint PX_MAX_ELEMENT = 0x000fffffu;
-uint getId(uint compressed) { return compressed >> PXG_BITSHIFT_ID; }
-uint getElementIndex(uint compressed) { return compressed & PX_MAX_ELEMENT; }
-
-static const uint64_t FFCI_STRIDE = 16UL;
-
-// PxgSoftBodySoftBodyConstraintBlock — block-of-32 SoA, 1792 B.
-static const uint64_t SSC_barycentric0  = 0UL;
-static const uint64_t SSC_barycentric1  = 512UL;
-static const uint64_t SSC_normal_pen    = 1024UL;
-static const uint64_t SSC_velMultiplier = 1536UL;
-static const uint64_t SSC_friction      = 1664UL;
-static const uint64_t SSC_STRIDE        = 1792UL;
-
-// tetTriCollisionConstraint / tetVertexCollisionConstraint constants (softBody.cu:659, :703).
-static const float TAN_THRESHOLD = 1.0e-14f;
-static const float TAN_SCALE = 0.5f;
-static const float BC_EPS = 1e-6f;
-
-// ---------------------------------------------------------------------------
-// Push-constant blob — BYTE-IDENTICAL to the CUDA pack (PxgSoftBodyCore.cpp:1693):
-// { softbodies*, clothes*, contactInfos*, constraints*, numContacts*, lambdaNs* }
-// -> six pointers, 48-byte blob.  ABI row {8,8,8,8,8,8}.
-// ---------------------------------------------------------------------------
-struct SbClothSolveParams
+void scSetActive(uint64_t contactInfos, uint workIndex, uint64_t ref1, bool active)
 {
-    uint64_t softbodies;    // @0
-    uint64_t clothes;       // @8
-    uint64_t contactInfos;  // @16
-    uint64_t constraints;   // @24
-    uint64_t numContacts;   // @32
-    uint64_t lambdaNs;      // @40 -> 48
-}
-
-[[vk::push_constant]] ConstantBuffer<SbClothSolveParams> gSc;
-
-// The shared solver body.  `relDelta` is already the barycentrically weighted difference, so
-// the two callers differ only in how they build it and how they scatter the result.
-void solveContact(float3 relDelta, float4 normalPen, float denomInv, float frictionCoefficient,
-                  inout float lambdaN, out float3 commonVec)
-{
-    const float3 normal = normalPen.xyz;
-    const float pen = normalPen.w;
-
-    const float CN = pen + dot(relDelta, normal);
-
-    // The clamp against -lambdaN is what keeps the accumulated impulse non-negative, i.e.
-    // what stops a contact from pulling the bodies together.
-    const float deltaLambdaN = max(-CN * denomInv, -lambdaN);
-    lambdaN += deltaLambdaN;
-
-    commonVec = deltaLambdaN * normal;
-
-    float3 tanDir = relDelta - dot(relDelta, normal) * normal;
-    const float tanMagSq = dot(tanDir, tanDir);
-
-    if (frictionCoefficient != 0.0f && tanMagSq > TAN_THRESHOLD)
-    {
-        // P9.36: FEMClothExternalSolve.cu:268-269 is `invTanMag = PxRecipSqrt(tanMagSq);
-        // tanDir *= invTanMag;` -- ONE reciprocal-sqrt and three multiplies, never three
-        // divides.  femClothClothContactBda.slang:430 ports the SAME engine line and
-        // already spells it this way; this copy did not.
-        const float invTanMag = 1.0f / sqrt(tanMagSq);   // PxRecipSqrt (documented seam)
-        tanDir = tanDir * invTanMag;
-        const float CT = dot(relDelta, tanDir);
-
-        float deltaLambdaT = max(0.0f, CT * denomInv);
-        deltaLambdaT = -min(deltaLambdaT, frictionCoefficient * abs(deltaLambdaN));
-
-        commonVec += TAN_SCALE * deltaLambdaT * tanDir;
-    }
-}
-
-// AtomicAdd(dst, v, 1.f): xyz gets v, .w gets ONE -- the contribution count.
-void scatter(uint64_t base, uint index, float3 v)
-{
-    pxgAtomicAddF4XYZ(base, index, v);
-    pxgAtomicAddF4W(base, index, 1.0f);
+    Ptr<uint64_t>(contactInfos + uint64_t(workIndex) * PXG_PAIRINFO_STRIDE + PXG_PAIRINFO_ref1)[0] =
+        PxgSetActiveRef1(ref1, active);
 }
 
 // ===========================================================================
-[shader("compute")]
-[numthreads(256, 1, 1)]   // == SC_BLOCK == PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION
-void sb_solveOutputSCDeltaVLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+// sb_querySCContactReferenceCountLaunch (NEW in 5.12)
+//   (PxgSoftBody* softbodies, PxgFEMCloth* clothes, PxgDeformablePairInfo* contactInfos,
+//    const float4* barycentrics0, const float4* barycentrics1,
+//    PxgDbDbContactBlock* contactBlocks, PxU32* numContacts, const PxReal dt,
+//    bool isVelocityIteration)
+//   -> {8 x 7, 4, 1} = 64-byte blob (dt @56, isVelocityIteration byte @60).
+// ===========================================================================
+struct SbScQueryParams
 {
-    const uint tNumContacts = Ptr<uint>(gSc.numContacts)[0];
+    uint64_t softbodies;          // @0
+    uint64_t clothes;             // @8
+    uint64_t contactInfos;        // @16  in/out (ACTIVE flag)
+    uint64_t barycentrics0;       // @24
+    uint64_t barycentrics1;       // @32
+    uint64_t contactBlocks;       // @40
+    uint64_t numContacts;         // @48
+    float dt;                     // @56
+    uint isVelocityIteration;     // @60  bool byte0 -> 64
+}
+[[vk::push_constant]]
+ConstantBuffer<SbScQueryParams> gScQuery;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]   // == SC_BLOCK
+void sb_querySCContactReferenceCountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint tNumContacts = Ptr<uint>(gScQuery.numContacts)[0];
     const uint nbBlocksRequired = (tNumContacts + SC_BLOCK - 1u) / SC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + SC_GRID - 1u) / SC_GRID;
+    const uint idx = groupThreadId.x;
 
-    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSc.softbodies);
-    Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gSc.clothes);
+    const float dt = gScQuery.dt;
+    const bool isVelocityIteration = (gScQuery.isVelocityIteration & 0xffu) != 0u;
 
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gScQuery.contactInfos);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * SC_BLOCK + gtid.x + nbIterationsPerBlock * gid.x * SC_BLOCK;
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * SC_BLOCK + idx + nbIterationsPerBlock * groupId.x * SC_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
+        const uint threadIndexInWarp = workIndex & 31u;
 
-        const uint64_t blockBase = gSc.constraints + uint64_t(workIndex / 32u) * SSC_STRIDE;
-        const uint slot = workIndex & 31u;
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gScQuery.contactBlocks + uint64_t(workIndex / 32u) * PXG_DBDBC_STRIDE;
 
-        const float denomInv = Ptr<float>(blockBase + SSC_velMultiplier)[slot];
-        // CONTINUE, not return: a degenerate constraint skips only its own contact.
-        if (denomInv == 0.0f)
+        if (!PxgIsValidPairInfo(contactInfo))
+        {
+            scSetActive(gScQuery.contactInfos, workIndex, contactInfo.ref1, false);
+            continue;
+        }
+
+        // Side 0: cloth.  Side 1: softbody tet.
+        Ptr<PxgFEMClothGpu> cloth = clothAt(gScQuery.clothes, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgSoftBodyGpu> softbody = sbAt(gScQuery.softbodies, PxgGetDeformableId(contactInfo.ref1));
+
+        PxgDeformablePart dbCloth = PxgDeformablePart();
+        PxgDeformablePart dbSb = PxgDeformablePart();
+        dbCloth.readCloth(cloth, contactInfo.ref0, gScQuery.barycentrics0, workIndex, 0UL,
+                          /*countReferenceOnly*/ true, dt, isVelocityIteration);
+        dbSb.readSoftBody(softbody, contactInfo.ref1, gScQuery.barycentrics1, workIndex, 0UL,
+                          /*checkOnlyActivity*/ true, dt, isVelocityIteration);
+
+        PxgDbContactPair contactPair = PxgDbContactPair();
+        PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+        contactPair.readContactPrepDbDb(block, PXG_DBDBC_maxPenBiasClamp, threadIndexInWarp);
+
+        const bool isActive = solveDbDbContact(dbCloth, dbSb, contactPair, solveOut, 0.0f, 0.0f, 0.0f, dt,
+                                               /*checkOnlyActivity*/ true, isVelocityIteration);
+
+        scSetActive(gScQuery.contactInfos, workIndex, contactInfo.ref1, isActive);
+
+        if (isActive)
+        {
+            // Integer-count refcount bump per side, gated |bc| > 1e-3.
+            dbCloth.bumpClothRefCountPart(cloth);
+            dbSb.bumpSoftBodyRefCountPart(softbody);
+        }
+    }
+}
+
+// ===========================================================================
+// sb_solveOutputSCDeltaVLaunch
+//   (PxgSoftBody* softbodies, PxgFEMCloth* clothes, PxgDeformablePairInfo* contactInfos,
+//    const float4* barycentrics0, const float4* barycentrics1,
+//    PxgDbDbContactBlock* contactBlocks, PxU32* numContacts, const PxReal dt,
+//    float2* appliedForces, PxsDeformableVolumeMaterialData* sbMaterials,
+//    PxsDeformableSurfaceMaterialData* clothMaterials, bool isVelocityIteration)
+//   -> {8 x 7, 4, 8, 8, 8, 1} = 96-byte blob (dt @56, appliedForces @64, sbMaterials @72,
+//   clothMaterials @80, isVelocityIteration byte @88).
+// ===========================================================================
+struct SbScSolveParams
+{
+    uint64_t softbodies;          // @0
+    uint64_t clothes;             // @8
+    uint64_t contactInfos;        // @16
+    uint64_t barycentrics0;       // @24
+    uint64_t barycentrics1;       // @32
+    uint64_t contactBlocks;       // @40
+    uint64_t numContacts;         // @48
+    float dt;                     // @56
+    uint _pad60;                  // @60
+    uint64_t appliedForces;       // @64  in/out
+    uint64_t sbMaterials;         // @72
+    uint64_t clothMaterials;      // @80
+    uint isVelocityIteration;     // @88  bool byte0
+    uint _pad92;                  // @92 -> 96
+}
+[[vk::push_constant]]
+ConstantBuffer<SbScSolveParams> gScSolve;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]   // == SC_BLOCK
+void sb_solveOutputSCDeltaVLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint tNumContacts = Ptr<uint>(gScSolve.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + SC_BLOCK - 1u) / SC_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + SC_GRID - 1u) / SC_GRID;
+    const uint idx = groupThreadId.x;
+
+    const float dt = gScSolve.dt;
+    const bool isVelocityIteration = (gScSolve.isVelocityIteration & 0xffu) != 0u;
+
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gScSolve.contactInfos);
+    Ptr<float2> appliedForces = Ptr<float2>(gScSolve.appliedForces);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint rawWorkIndex = i * SC_BLOCK + idx + nbIterationsPerBlock * groupId.x * SC_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
+            return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
+        const uint threadIndexInWarp = workIndex & 31u;
+
+        // The pre-count decided this on the same positions, this iteration.
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        if (!PxgIsActivePairInfo(contactInfo))
             continue;
 
-        const uint64_t ci = gSc.contactInfos + uint64_t(workIndex) * FFCI_STRIDE;
-        const uint pairInd0 = Ptr<uint>(ci)[0];          // cloth
-        const uint pairInd1 = Ptr<uint>(ci + 8UL)[0];    // softbody
+        const uint64_t block = gScSolve.contactBlocks + uint64_t(workIndex / 32u) * PXG_DBDBC_STRIDE;
 
-        const float4 clothBC = Ptr<float4>(blockBase + SSC_barycentric0)[slot];
-        const float4 softBodyBC = Ptr<float4>(blockBase + SSC_barycentric1)[slot];
-        const float4 normalPen = Ptr<float4>(blockBase + SSC_normal_pen)[slot];
-        const float frictionCoefficient = Ptr<float>(blockBase + SSC_friction)[slot];
+        Ptr<PxgFEMClothGpu> cloth = clothAt(gScSolve.clothes, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgSoftBodyGpu> softbody = sbAt(gScSolve.softbodies, PxgGetDeformableId(contactInfo.ref1));
 
-        const uint clothId = getId(pairInd0);
-        const uint triId = getElementIndex(pairInd0);    // triangle OR vertex
-        const uint softbodyId = getId(pairInd1);
-        const uint tetId = getElementIndex(pairInd1);
+        PxgDeformablePart dbCloth = PxgDeformablePart();
+        PxgDeformablePart dbSb = PxgDeformablePart();
+        dbCloth.readCloth(cloth, contactInfo.ref0, gScSolve.barycentrics0, workIndex, gScSolve.clothMaterials,
+                          /*countReferenceOnly*/ false, dt, isVelocityIteration);
+        dbSb.readSoftBody(softbody, contactInfo.ref1, gScSolve.barycentrics1, workIndex, gScSolve.sbMaterials,
+                          /*checkOnlyActivity*/ false, dt, isVelocityIteration);
 
-        const uint4 tetVertId = Ptr<uint4>(softbodies[softbodyId].mSimTetIndices)[tetId];
+        const float frictionCoefficient = (dbCloth.friction + dbSb.friction) * 0.5f;
 
-        const uint64_t clothAccum = clothes[clothId].mAccumulatedDeltaPos;
-        const uint64_t sbAccum = softbodies[softbodyId].mSimDeltaPos;
-        const uint64_t clothOut = clothes[clothId].mDeltaPos;
-        const uint64_t sbOut = softbodies[softbodyId].mSimDelta;
+        PxgDbContactPair contactPair = PxgDbContactPair();
+        PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+        contactPair.readContactPrepDbDb(block, PXG_DBDBC_maxPenBiasClamp, threadIndexInWarp);
 
-        const float4 sd0 = Ptr<float4>(sbAccum)[tetVertId.x];
-        const float4 sd1 = Ptr<float4>(sbAccum)[tetVertId.y];
-        const float4 sd2 = Ptr<float4>(sbAccum)[tetVertId.z];
-        const float4 sd3 = Ptr<float4>(sbAccum)[tetVertId.w];
+        float2 appliedForce = appliedForces[workIndex];   // (lambdaN_accum, lambdaT_accum)
 
-        const float3 sbWeighted = softBodyBC.x * sd0.xyz + softBodyBC.y * sd1.xyz +
-                                  softBodyBC.z * sd2.xyz + softBodyBC.w * sd3.xyz;
+        const bool hasApplied = solveDbDbContact(dbCloth, dbSb, contactPair, solveOut, appliedForce.x, appliedForce.y,
+                                                 frictionCoefficient, dt, /*checkOnlyActivity*/ false,
+                                                 isVelocityIteration);
 
-        float lambdaN = Ptr<float>(gSc.lambdaNs)[workIndex];
-        float3 commonVec;
-
-        if (clothBC.w == 0.0f)
+        if (hasApplied)
         {
-            // ---- the cloth TRIANGLE path ----------------------------------
-            const uint4 triVertId = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[triId];
-            const float4 cd0 = Ptr<float4>(clothAccum)[triVertId.x];
-            const float4 cd1 = Ptr<float4>(clothAccum)[triVertId.y];
-            const float4 cd2 = Ptr<float4>(clothAccum)[triVertId.z];
+            float3 delta;
+            solveOut.computeDelta(contactPair, delta, dt);
 
-            const float3 relDelta = (clothBC.x * cd0.xyz + clothBC.y * cd1.xyz +
-                                     clothBC.z * cd2.xyz) - sbWeighted;
+            // Scatter .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
+            dbCloth.writeCloth(cloth, delta);
+            dbSb.writeSoftBody(softbody, float3(-delta.x, -delta.y, -delta.z));
 
-            solveContact(relDelta, normalPen, denomInv, frictionCoefficient, lambdaN, commonVec);
-
-            if (cd0.w != 0.0f && clothBC.x > BC_EPS)
-                scatter(clothOut, triVertId.x, cd0.w * clothBC.x * commonVec);
-            if (cd1.w != 0.0f && clothBC.y > BC_EPS)
-                scatter(clothOut, triVertId.y, cd1.w * clothBC.y * commonVec);
-            if (cd2.w != 0.0f && clothBC.z > BC_EPS)
-                scatter(clothOut, triVertId.z, cd2.w * clothBC.z * commonVec);
+            appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+            appliedForce.y += solveOut.deltaLambdaT;
+            appliedForces[workIndex] = appliedForce;
         }
-        else
-        {
-            // ---- the cloth VERTEX path ------------------------------------
-            // NOTE: no barycentric factor on the cloth correction, and the atomic is guarded
-            // by the inverse mass ALONE.  Not the triangle path with bc = 1.
-            const float4 cd0 = Ptr<float4>(clothAccum)[triId];
-
-            const float3 relDelta = cd0.xyz - sbWeighted;
-
-            solveContact(relDelta, normalPen, denomInv, frictionCoefficient, lambdaN, commonVec);
-
-            if (cd0.w != 0.0f)
-                scatter(clothOut, triId, cd0.w * commonVec);
-        }
-
-        // The softbody side is identical in both branches, and its sign is OPPOSITE.
-        if (sd0.w != 0.0f && softBodyBC.x > BC_EPS)
-            scatter(sbOut, tetVertId.x, -sd0.w * softBodyBC.x * commonVec);
-        if (sd1.w != 0.0f && softBodyBC.y > BC_EPS)
-            scatter(sbOut, tetVertId.y, -sd1.w * softBodyBC.y * commonVec);
-        if (sd2.w != 0.0f && softBodyBC.z > BC_EPS)
-            scatter(sbOut, tetVertId.z, -sd2.w * softBodyBC.z * commonVec);
-        if (sd3.w != 0.0f && softBodyBC.w > BC_EPS)
-            scatter(sbOut, tetVertId.w, -sd3.w * softBodyBC.w * commonVec);
-
-        Ptr<float>(gSc.lambdaNs)[workIndex] = lambdaN;
     }
 }

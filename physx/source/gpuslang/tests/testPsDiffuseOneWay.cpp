@@ -88,13 +88,13 @@ using namespace physx;
 static_assert(sizeof(PxgParticleContactInfo) == 16, "PxgParticleContactInfo is one float4");
 static_assert(PxgParticleContactInfo::MaxStaticContactsPerParticle == 12,
               "the static-contact cap the kernel clamps to");
-static_assert(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 488, "@488");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552, "@552");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560, "@560");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592, "@592");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayForces) == 600, "@600");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 608, "@608");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616, "@616");
+static_assert(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 448, "@448");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512, "@512");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520, "@520");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 552, "@552");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayForces) == 560, "@560");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 568, "@568");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 576, "@576");
 
 struct F4 { float x, y, z, w; };
 struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };

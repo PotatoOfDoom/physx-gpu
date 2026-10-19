@@ -46,8 +46,10 @@
 //     negative component decides all three.
 //   * the a-to-b transform is the BARE inverse of the mesh pose; the softbody's
 //     own transform cache is never read, so the fixture poisons it.
-//   * the filter runs LAST, on the TET index, inside the candidate test.
-//   * the writer is writeContactNoBarycentric: no barycentric, no material.
+//   * the filter runs LAST, on the TET, inside the candidate test (PhysX 5.12:
+//     findRigidVolumeFilter over the softbody's mRigidVolumeFilterPairs).
+//   * the writer is PxgRigidDbContactWriter::writeVolumeContact (5.12): no
+//     barycentric; the pair info {rigid, tet ref} and the PxU16 rigid material.
 
 #include "pxgTestFramework.h"
 
@@ -57,6 +59,7 @@
 #include "PxgContactManager.h"
 #include "PxgConvexConvexShape.h"
 #include "PxgSimulationCoreDesc.h"
+#include "PxgDeformableContactWriters.h"
 #include "PxsTransformCache.h"
 #include "PxNodeIndex.h"
 #include "geometry/PxGeometry.h"
@@ -111,25 +114,32 @@ struct SbSdfBlob
     uint64_t gpuShapes;                // @48
     uint64_t softbodies;               // @56
     uint64_t shapeToRigidRemap;        // @64
-    uint64_t filterPairs;              // @72
-    uint32_t nbFilterPairs;            // @80
-    uint32_t pad84;                    // @84
-    uint64_t pad88;                    // @88  paramAlign(80) = 16
-    uint64_t w_outPoint;               // @96
-    uint64_t w_outNormalPen;           // @104
-    uint64_t w_outBarycentric;         // @112
-    uint64_t w_outContactInfo;         // @120
-    uint64_t w_totalContactCount;      // @128
-    uint64_t w_contactByX;             // @136
-    uint64_t w_tempContactByX;         // @144
-    uint64_t w_contactIndexSortedByX;  // @152
-    uint64_t w_contactSortedByX;       // @160
-    uint32_t w_maxNumContacts;         // @168
-    uint32_t pad172;                   // -> 176
+    uint64_t pad72;                    // @72  paramAlign(80) = 16 (5.12: no filter arguments)
+    // ---- PxgRigidDbContactWriter (PhysX 5.12, by value, 80 B) @80 ----
+    uint64_t w_outPoint;               // @80
+    uint64_t w_outNormalPen;           // @88
+    uint64_t w_outBarycentric;         // @96
+    uint64_t w_outContactInfo;         // @104 PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;  // @112 PxU16*
+    uint64_t w_totalContactCount;      // @120
+    uint64_t w_contactByRigid;         // @128
+    uint64_t w_tempContactByRigid;     // @136
+    uint64_t w_contactIndexSortedByRigid; // @144
+    uint32_t w_maxNumContacts;         // @152
+    uint32_t pad156;                   // -> 160
 };
-static_assert(sizeof(SbSdfBlob) == 176, "engine ABI blob size (pxgKernelAbiPushSize of the row)");
-static_assert(offsetof(SbSdfBlob, w_outPoint) == 96, "the writer lands at 96: paramAlign(80) = 16");
-static_assert(offsetof(SbSdfBlob, w_maxNumContacts) == 168, "the writer's count lands at 96 + 72");
+static_assert(sizeof(SbSdfBlob) == 160, "engine ABI blob size (pxgKernelAbiPushSize of the row)");
+static_assert(offsetof(SbSdfBlob, w_outPoint) == 80, "the writer lands at 80: paramAlign(80) = 16");
+static_assert(offsetof(SbSdfBlob, w_maxNumContacts) == 152, "the writer's count lands at 80 + 72");
+#define PXG_SBSDF_PIN(f, g) static_assert(offsetof(SbSdfBlob, f) - offsetof(SbSdfBlob, w_outPoint) == \
+                                          offsetof(PxgRigidDbContactWriter, g), #g)
+PXG_SBSDF_PIN(w_outNormalPen, outNormalPen); PXG_SBSDF_PIN(w_outBarycentric, outBarycentric);
+PXG_SBSDF_PIN(w_outContactInfo, outContactInfo); PXG_SBSDF_PIN(w_outRigidMaterialIndex, outRigidMaterialIndex);
+PXG_SBSDF_PIN(w_totalContactCount, totalContactCount); PXG_SBSDF_PIN(w_contactByRigid, contactByRigid);
+PXG_SBSDF_PIN(w_tempContactByRigid, tempContactByRigid);
+PXG_SBSDF_PIN(w_contactIndexSortedByRigid, contactIndexSortedByRigid);
+PXG_SBSDF_PIN(w_maxNumContacts, maxNumContacts);
+#undef PXG_SBSDF_PIN
 
 // npSdfFind.slang's SdfFindParams.
 struct P_Find
@@ -158,7 +168,6 @@ static const uint32_t FIND_TARGET = 1024u;
 static const uint32_t FIND_MAXROUNDS = 24u;
 static const uint32_t TET_TRACE_STRIDE = 256u;
 static const uint32_t POISON_U32 = 0xEEEEEEEEu;
-static const uint32_t PXG_BITSHIFT_TET_ID_H = 20u;
 
 static bool bitEq(float a, float b) { return f2u(a) == f2u(b); }
 
@@ -174,9 +183,10 @@ static PxVec3 hShape2Vertex(const PxVec3& v, const PxVec3& scale, const PxQuat& 
     t.x /= scale.x; t.y /= scale.y; t.z /= scale.z;
     return rotation.rotateInv(t);
 }
-static uint32_t encodeSb(uint32_t sbId, uint32_t tet)
+// PhysX 5.12: the deformable participant of a contact / filter pair.
+static uint64_t encodeSb(uint32_t sbId, uint32_t tet)
 {
-    return (sbId << PXG_BITSHIFT_TET_ID_H) | tet;
+    return PxgEncodeDeformableTetrahedron(sbId, tet);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,46 +303,22 @@ struct Options
     CUfunction bridgeFn = nullptr;
 };
 
-// P9.97b -- a HOST mirror of PxgFEMContactWriter (PxgFEMCore.h:361-375), the 80-byte
-// struct the engine passes BY VALUE as the last argument.  The engine type has no
-// constructor this TU can call (it takes a PxgFEMCore*), so the mirror stands in for it,
-// pinned to it member by member: same size, same alignment, same offsets.  What the
-// bridge sees is only (pointer, sizeof) of this object, so pinning those is pinning
-// everything the launch depends on.
-struct HostFemWriter
-{
-    float4* outPoint;
-    float4* outNormalPen;
-    float4* outBarycentric;
-    PxgFemOtherContactInfo* outContactInfo;
-    PxU32* totalContactCount;
-    PxU64* contactByX;
-    PxU32* tempContactByX;
-    PxU32* contactIndexSortedByX;
-    PxU32* contactSortedByX;
-    PxU32 maxNumContacts;
-};
-static_assert(sizeof(HostFemWriter) == sizeof(PxgFEMContactWriter) && sizeof(HostFemWriter) == 80,
-              "the by-value writer is 80 bytes (9 pointers + PxU32 + 4 tail pad)");
-static_assert(alignof(HostFemWriter) == alignof(PxgFEMContactWriter) && alignof(HostFemWriter) == 8,
-              "alignof(writer) is 8 -- the bridge nevertheless places it at paramAlign(80) = 16");
-#define PXG_SBSDF_PIN(f) static_assert(offsetof(HostFemWriter, f) == offsetof(PxgFEMContactWriter, f), #f)
-PXG_SBSDF_PIN(outPoint); PXG_SBSDF_PIN(outNormalPen); PXG_SBSDF_PIN(outBarycentric);
-PXG_SBSDF_PIN(outContactInfo); PXG_SBSDF_PIN(totalContactCount); PXG_SBSDF_PIN(contactByX);
-PXG_SBSDF_PIN(tempContactByX); PXG_SBSDF_PIN(contactIndexSortedByX);
-PXG_SBSDF_PIN(contactSortedByX); PXG_SBSDF_PIN(maxNumContacts);
-#undef PXG_SBSDF_PIN
+// P9.97b / PhysX 5.12: the engine passes PxgRigidDbContactWriter (PxgDeformableContactWriters.h,
+// an aggregate with no constructor) BY VALUE as the last argument; the bridge sees only
+// (pointer, sizeof) of it.
+static_assert(sizeof(PxgRigidDbContactWriter) == 80 && alignof(PxgRigidDbContactWriter) == 8,
+              "the by-value writer is 80 bytes, aligned 8 -- the bridge places it at paramAlign(80) = 16");
 
 struct Rig
 {
     std::vector<PxgBufferHandle> owned;
     DevBuf bBlob, bCin, bShapes, bXf, bCd, bRest, bRemap, bPairs, bDesc, bBounds;
     DevBuf bVerts, bInds;
-    DevBuf bPoint, bNormalPen, bBary, bInfo, bCount, bByX, bTempByX, bIdxByX, bSortedByX;
+    DevBuf bPoint, bNormalPen, bBary, bInfo, bRigidMat, bCount, bByX, bTempByX, bIdxByX;
     SbSdfBlob blob{};
     uint64_t texCoarse = 0, texSub = 0;
     PxNodeIndex rigidId;
-    std::vector<PxgRigidFilterPair> pairs;
+    std::vector<PxgDeformablePairInfo> pairs;   // the softbody's mRigidVolumeFilterPairs
 
     template <typename T>
     DevBuf mk(PxgSlangComputeDevice* dev, const std::vector<T>& d)
@@ -367,12 +353,45 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.bVerts = R.mk(dev, S.verts);
     R.bInds = R.mk(dev, S.inds);
 
+    R.rigidId = PxNodeIndex(0x51u, 3u);
+
+    // The filter array carries FOUR distinct rigid ids, not just the one this
+    // kernel queries with, and that is what makes the comparison itself testable.
+    //
+    // With a single id, ref0 is constant across the array, so the search reduces
+    // to ref1 alone.  The decoys share low words across different high words (0x51
+    // appears with link 0 and with link 3) and high words across different low
+    // words, so the ENGINE's ordering -- PxgComparePairInfo: ref0 first, as an
+    // unsigned 64-bit value, high word significant -- is the only one under which
+    // the array is sorted and the binary search lands.  PhysX 5.12 adds one more
+    // kind of near miss: the queried rigid with the same index as a VERTEX, which
+    // must not suppress the tet.
+    R.pairs.clear();
+    const uint64_t rigidRef = PxgEncodeRigidFilterRef(R.rigidId, Scene::TRI_CACHE);
+    const PxNodeIndex decoys[3] = { PxNodeIndex(0x51u, 0u),      // same low word, link 0
+                                    PxNodeIndex(0x99u, 1u),
+                                    PxNodeIndex(0x10u, 7u) };    // sorts LAST only high-word-first
+    for (uint32_t t : S.filteredTets)
+        R.pairs.push_back({ rigidRef, encodeSb(Scene::SB_ID, t) });
+    for (uint32_t d = 0; d < 3u; ++d)
+        for (uint32_t t = 1u; t < Scene::NB_TETS; t += 17u)
+            R.pairs.push_back({ PxgEncodeRigidFilterRef(decoys[d], Scene::TRI_CACHE), encodeSb(Scene::SB_ID, t) });
+    for (uint32_t t = 2u; t < Scene::NB_TETS; t += 19u)
+        R.pairs.push_back({ rigidRef, PxgEncodeDeformableVertex(Scene::SB_ID, t) });
+    std::sort(R.pairs.begin(), R.pairs.end(),
+              [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+                  return PxgComparePairInfo(a, b) < 0;
+              });
+    R.bPairs = R.mk(dev, R.pairs);
+
     std::vector<PxgSoftBody> descArr(Scene::NB_BODIES);
     std::memset(descArr.data(), 0, descArr.size() * sizeof(PxgSoftBody));
     PxgSoftBody sb; std::memset(&sb, 0, sizeof(sb));
     sb.mPosition_InvMass = reinterpret_cast<decltype(sb.mPosition_InvMass)>(size_t(R.bVerts.addr));
     sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(R.bInds.addr));
     sb.mNumTets = Scene::NB_TETS;
+    sb.mRigidVolumeFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(R.bPairs.addr));
+    sb.mNumRigidVolumeFilterPairs = uint32_t(R.pairs.size());
     descArr[Scene::SB_ID] = sb;
     R.bDesc = R.mk(dev, descArr);
 
@@ -433,54 +452,10 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     // T1: `bounds` is never read, so it points at something that would be wrong.
     R.bBounds = R.mk(dev, std::vector<float>(Scene::NB_CACHE * 6u, -12345.f));
 
-    R.rigidId = PxNodeIndex(0x51u, 3u);
     std::vector<uint64_t> remap(Scene::NB_CACHE, 0xDEADBEEFDEADBEEFull);
     remap[Scene::TRI_CACHE] = R.rigidId.getInd();
     R.bRemap = R.mk(dev, remap);
 
-    // The filter array carries FOUR distinct rigid ids, not just the one this
-    // kernel queries with, and that is what makes the comparison itself testable.
-    //
-    // With a single id, index0 is constant across the array, so the search reduces
-    // to index1 alone -- and index1's high word is always zero, because it is a
-    // PxU32 element handle widened to PxU64.  Under those conditions comparing
-    // index1 BEFORE index0, or comparing the two 32-bit halves low-word-first,
-    // both give the same order and the same answer.  The first sweep left exactly
-    // those two mutants alive.
-    //
-    // The decoys are chosen so neither shortcut survives: they share low words
-    // across different high words (0x51 appears with link 0 and with link 3) and
-    // share high words across different low words, so the ENGINE's ordering --
-    // index0 first, as an unsigned 64-bit value, high word significant -- is the
-    // only one under which the array is sorted and the binary search lands.
-    R.pairs.clear();
-    const PxNodeIndex decoys[3] = { PxNodeIndex(0x51u, 0u),      // same low word, link 0
-                                    PxNodeIndex(0x99u, 1u),
-                                    PxNodeIndex(0x10u, 7u) };    // sorts LAST only high-word-first
-    for (uint32_t t : S.filteredTets)
-    {
-        PxgRigidFilterPair p;
-        p.index0 = R.rigidId.getInd();
-        p.index1 = encodeSb(Scene::SB_ID, t);
-        p.index2 = 0u;
-        R.pairs.push_back(p);
-    }
-    for (uint32_t d = 0; d < 3u; ++d)
-        for (uint32_t t = 1u; t < Scene::NB_TETS; t += 17u)
-        {
-            PxgRigidFilterPair p;
-            p.index0 = decoys[d].getInd();
-            p.index1 = encodeSb(Scene::SB_ID, t);
-            p.index2 = 0u;
-            R.pairs.push_back(p);
-        }
-    std::sort(R.pairs.begin(), R.pairs.end(),
-              [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                  if (a.index0 != b.index0) return a.index0 < b.index0;
-                  if (a.index1 != b.index1) return a.index1 < b.index1;
-                  return a.index2 < b.index2;
-              });
-    R.bPairs = R.mk(dev, R.pairs);
 
     const std::vector<F4> f4Init(Scene::CAP, F4{ -7.f, -7.f, -7.f, -7.f });
     const std::vector<uint32_t> u32Init(Scene::CAP, POISON_U32);
@@ -490,11 +465,11 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.bNormalPen = R.mk(dev, f4Init);
     R.bBary = R.mk(dev, f4Init);
     R.bInfo = R.mk(dev, infoInit);
+    R.bRigidMat = R.mk(dev, std::vector<uint16_t>(Scene::CAP, uint16_t(POISON_U32 & 0xffffu)));
     R.bCount = R.mk(dev, std::vector<uint32_t>(1u, opt.seedCount));
     R.bByX = R.mk(dev, u64Init);
     R.bTempByX = R.mk(dev, u32Init);
     R.bIdxByX = R.mk(dev, u32Init);
-    R.bSortedByX = R.mk(dev, u32Init);
 
     R.blob = SbSdfBlob{};
     R.blob.tolerenceLength = 1234.5f;             // T1: must never matter
@@ -506,17 +481,15 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.blob.gpuShapes = R.bShapes.addr;
     R.blob.softbodies = R.bDesc.addr;
     R.blob.shapeToRigidRemap = R.bRemap.addr;
-    R.blob.filterPairs = R.bPairs.addr;
-    R.blob.nbFilterPairs = uint32_t(R.pairs.size());
     R.blob.w_outPoint = R.bPoint.addr;
     R.blob.w_outNormalPen = R.bNormalPen.addr;
     R.blob.w_outBarycentric = R.bBary.addr;
     R.blob.w_outContactInfo = R.bInfo.addr;
+    R.blob.w_outRigidMaterialIndex = R.bRigidMat.addr;
     R.blob.w_totalContactCount = R.bCount.addr;
-    R.blob.w_contactByX = R.bByX.addr;
-    R.blob.w_tempContactByX = R.bTempByX.addr;
-    R.blob.w_contactIndexSortedByX = R.bIdxByX.addr;
-    R.blob.w_contactSortedByX = R.bSortedByX.addr;
+    R.blob.w_contactByRigid = R.bByX.addr;
+    R.blob.w_tempContactByRigid = R.bTempByX.addr;
+    R.blob.w_contactIndexSortedByRigid = R.bIdxByX.addr;
     R.blob.w_maxNumContacts = opt.capacity;
     return true;
 }
@@ -635,7 +608,7 @@ struct Contact
 {
     uint32_t tet;
     F4 point, normalPen;
-    uint32_t pairInd1;
+    uint64_t ref1;   // PxgEncodeDeformableTetrahedron(SB_ID, tet)
 };
 struct Expect
 {
@@ -656,15 +629,14 @@ static Expect predictPair(const Scene& S, const Rig& R,
     const float wcd = S.worldContactDist();
     const PxTransform meshPose = S.meshPose();
 
+    // findRigidVolumeFilter (5.12): find({PxgEncodeRigidFilterRef(rigid, trimesh cache
+    // ref), PxgEncodeDeformableTetrahedron(sb, tet)}).
     auto listed = [&](uint32_t tetId) {
-        PxgRigidFilterPair q;
-        q.index0 = R.rigidId.getInd();
-        q.index1 = encodeSb(Scene::SB_ID, tetId);
-        q.index2 = 0u;
+        const PxgDeformablePairInfo q = { PxgEncodeRigidFilterRef(R.rigidId, Scene::TRI_CACHE),
+                                          encodeSb(Scene::SB_ID, tetId) };
         return std::binary_search(R.pairs.begin(), R.pairs.end(), q,
-                                  [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                                      if (a.index0 != b.index0) return a.index0 < b.index0;
-                                      return a.index1 < b.index1;
+                                  [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+                                      return PxgComparePairInfo(a, b) < 0;
                                   });
     };
 
@@ -722,7 +694,7 @@ static Expect predictPair(const Scene& S, const Rig& R,
             k.tet = t;
             k.point = F4{ worldP.x, worldP.y, worldP.z, rest };
             k.normalPen = F4{ worldN.x, worldN.y, worldN.z, sep };
-            k.pairInd1 = encodeSb(Scene::SB_ID, t);
+            k.ref1 = encodeSb(Scene::SB_ID, t);
             E.contacts.push_back(k);
         }
     }
@@ -765,11 +737,11 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
 
     if (opt.bridgeCtx)
     {
-        // P9.97b: THE ENGINE'S HOST PACK, PxgNarrowphaseCore.cpp:4870-4903, with the
+        // P9.97b: THE ENGINE'S HOST PACK (PhysX 5.12 PxgNarrowphaseCore.cpp), with the
         // engine's own argument types and order -- not this file's SbSdfBlob.  The bridge
         // (PxgVulkanCudaContext.cpp, sized launchKernel) places each argument at
-        // paramAlign(size), so the 80-byte writer goes to @96, not to the @88 its natural
-        // alignment of 8 would give.  A shader whose push block disagrees reads the wrong
+        // paramAlign(size), so the 80-byte writer goes to @80 (5.6.1: @96 behind the two
+        // filter arguments 5.12 removed).  A shader whose push block disagrees reads the wrong
         // bytes here and nowhere else in this file.
         const PxReal toleranceLength = R.blob.tolerenceLength;
         const PxgContactManagerInput* cmInputs =
@@ -782,18 +754,17 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
         PxgShape* gpuShapes = reinterpret_cast<PxgShape*>(size_t(R.bShapes.addr));
         CUdeviceptr softBodiesd = CUdeviceptr(R.bDesc.addr);
         CUdeviceptr shapeToRigidRemapTabled = CUdeviceptr(R.bRemap.addr);
-        CUdeviceptr filterPairs = CUdeviceptr(R.bPairs.addr);
-        const PxU32 nbFilterPairs = PxU32(R.pairs.size());
-        HostFemWriter writer;
+        PxgRigidDbContactWriter writer;
+        std::memset(&writer, 0, sizeof(writer));
         writer.outPoint = reinterpret_cast<float4*>(size_t(R.bPoint.addr));
         writer.outNormalPen = reinterpret_cast<float4*>(size_t(R.bNormalPen.addr));
         writer.outBarycentric = reinterpret_cast<float4*>(size_t(R.bBary.addr));
-        writer.outContactInfo = reinterpret_cast<PxgFemOtherContactInfo*>(size_t(R.bInfo.addr));
+        writer.outContactInfo = reinterpret_cast<PxgDeformablePairInfo*>(size_t(R.bInfo.addr));
+        writer.outRigidMaterialIndex = reinterpret_cast<PxU16*>(size_t(R.bRigidMat.addr));
         writer.totalContactCount = reinterpret_cast<PxU32*>(size_t(R.bCount.addr));
-        writer.contactByX = reinterpret_cast<PxU64*>(size_t(R.bByX.addr));
-        writer.tempContactByX = reinterpret_cast<PxU32*>(size_t(R.bTempByX.addr));
-        writer.contactIndexSortedByX = reinterpret_cast<PxU32*>(size_t(R.bIdxByX.addr));
-        writer.contactSortedByX = reinterpret_cast<PxU32*>(size_t(R.bSortedByX.addr));
+        writer.contactByRigid = reinterpret_cast<PxU64*>(size_t(R.bByX.addr));
+        writer.tempContactByRigid = reinterpret_cast<PxU32*>(size_t(R.bTempByX.addr));
+        writer.contactIndexSortedByRigid = reinterpret_cast<PxU32*>(size_t(R.bIdxByX.addr));
         writer.maxNumContacts = opt.capacity;
 
         PxCudaKernelParam kernelParams[] =
@@ -808,15 +779,12 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
             PX_CUDA_KERNEL_PARAM(softBodiesd),
             PX_CUDA_KERNEL_PARAM(shapeToRigidRemapTabled),
 
-            PX_CUDA_KERNEL_PARAM(filterPairs),
-            PX_CUDA_KERNEL_PARAM(nbFilterPairs),
-
             PX_CUDA_KERNEL_PARAM(writer)
         };
         const PxCUresult lr = opt.bridgeCtx->launchKernel(opt.bridgeFn, opt.numPairs, 1, 1, 1024, 1, 1,
                                                           0, nullptr, kernelParams, sizeof(kernelParams),
                                                           nullptr, __FILE__, __LINE__);
-        PXG_CHECK_MSG(lr == 0, "%s: the bridge must accept the engine's 12-argument host pack "
+        PXG_CHECK_MSG(lr == 0, "%s: the bridge must accept the engine's 10-argument host pack "
                                "(its blob is gated against the ABI row's push size)", label);
         if (lr != 0) { R.destroy(dev); return; }
         PXG_CHECK_MSG(opt.bridgeCtx->streamSynchronize(nullptr) == 0, "%s: streamSynchronize", label);
@@ -835,6 +803,7 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
     const auto npen = downloadBuffer<F4>(dev, R.bNormalPen.h, Scene::CAP);
     const auto bary = downloadBuffer<F4>(dev, R.bBary.h, Scene::CAP);
     const auto info = downloadBuffer<uint32_t>(dev, R.bInfo.h, size_t(Scene::CAP) * 4u);
+    const auto rigidMat = downloadBuffer<uint16_t>(dev, R.bRigidMat.h, Scene::CAP);
     const auto byX = downloadBuffer<uint64_t>(dev, R.bByX.h, Scene::CAP);
     const auto tempByX = downloadBuffer<uint32_t>(dev, R.bTempByX.h, Scene::CAP);
     const auto idxByX = downloadBuffer<uint32_t>(dev, R.bIdxByX.h, Scene::CAP);
@@ -940,13 +909,14 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
         const uint64_t rid = R.rigidId.getInd();
         if (info[size_t(at) * 4u + 0] != uint32_t(rid & 0xffffffffu)) ++bad;
         if (info[size_t(at) * 4u + 1] != uint32_t(rid >> 32)) ++bad;
-        if (info[size_t(at) * 4u + 2] != e.pairInd1) ++bad;
-        // T6: the fourth dword is NOT written, and the barycentric array is not
-        // touched at all.  Both must still be exactly as uploaded.
-        if (info[size_t(at) * 4u + 3] != POISON_U32) ++bad;
+        if (info[size_t(at) * 4u + 2] != uint32_t(e.ref1 & 0xffffffffu)) ++bad;
+        if (info[size_t(at) * 4u + 3] != uint32_t(e.ref1 >> 32)) ++bad;
+        // T6 (5.12): PxU16(trimesh materialIndex) in its own stream, and the
+        // barycentric array is not touched at all.
+        if (rigidMat[at] != uint16_t(0x2Bu)) ++bad;
         if (!bitEq(bary[at].x, -7.f) || !bitEq(bary[at].w, -7.f)) ++bad;
         if (byX[at] != rid) ++bad;
-        if (tempByX[at] != uint32_t(rid & 0xffffffffu)) ++bad;
+        if (tempByX[at] != PxgGetContactSortKey(rid)) ++bad;
         if (idxByX[at] != at) ++bad;
     };
 
@@ -969,7 +939,8 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
         {
             size_t hit = want.size();
             for (size_t j = 0; j < want.size(); ++j)
-                if (!used[j] && want[j]->pairInd1 == info[size_t(at) * 4u + 2] &&
+                if (!used[j] && want[j]->ref1 == (uint64_t(info[size_t(at) * 4u + 2]) |
+                                                  (uint64_t(info[size_t(at) * 4u + 3]) << 32)) &&
                     bitEq(want[j]->point.w, point[at].w)) { hit = j; break; }
             if (hit == want.size()) { ++bad; continue; }
             used[hit] = 1u;
@@ -980,7 +951,9 @@ static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Opt
 
     size_t spill = 0;
     for (uint32_t at = PxMin(total, opt.capacity); at < Scene::CAP; ++at)
-        if (idxByX[at] != POISON_U32 || byX[at] != ~0ull || !bitEq(point[at].x, -7.f)) ++spill;
+        if (idxByX[at] != POISON_U32 || byX[at] != ~0ull || !bitEq(point[at].x, -7.f) ||
+            rigidMat[at] != uint16_t(POISON_U32 & 0xffffu))
+            ++spill;
     PXG_CHECK_MSG(spill == 0, "%s: %zu slots beyond the reservation were written", label, spill);
 
     std::printf("    [ note ] %s: %zu round(s), %u gathered, %u culled (%u exactly on the gate, "
@@ -1253,14 +1226,15 @@ PXG_TEST(softBodySdfMidphaseBridgeSized)
     if (!row)
         return;
     const uint32_t push = physx::gpuslang::pxgKernelAbiPushSize(*row);
-    // The row itself, literally: the host pack PxgNarrowphaseCore.cpp:4888-4903 pushes.
-    static const uint8_t kHostPack[12] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
-    bool rowIsHostPack = row->argCount == 12u;
-    for (uint32_t i = 0; rowIsHostPack && i < 12u; ++i)
+    // The row itself, literally: the host pack PhysX 5.12 PxgNarrowphaseCore.cpp pushes
+    // (5.6.1 had filterPairs and nbFilterPairs before the writer).
+    static const uint8_t kHostPack[10] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 80 };
+    bool rowIsHostPack = row->argCount == 10u;
+    for (uint32_t i = 0; rowIsHostPack && i < 10u; ++i)
         rowIsHostPack = row->argSizes[i] == kHostPack[i];
-    PXG_CHECK_MSG(rowIsHostPack, "the row is the host pack {4, 8 x 9, 4, 80}");
-    PXG_CHECK_MSG(push == 176u, "the row's push size is %u; the writer at paramAlign(80) = 16 "
-                                "makes it 176", push);
+    PXG_CHECK_MSG(rowIsHostPack, "the row is the host pack {4, 8 x 8, 80}");
+    PXG_CHECK_MSG(push == 160u, "the row's push size is %u; the writer at paramAlign(80) = 16 "
+                                "makes it 160", push);
     // THE LITERAL TIE: this file's own blob must BE the bridge's blob, size first.
     PXG_CHECK_MSG(sizeof(SbSdfBlob) == push,
                   "SbSdfBlob is %zu bytes but the bridge pushes %u -- the fixture's blob is not the "

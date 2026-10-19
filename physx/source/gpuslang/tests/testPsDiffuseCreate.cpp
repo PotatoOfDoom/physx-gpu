@@ -107,14 +107,14 @@ struct PsDiffCreateBlob
 };
 static_assert(sizeof(PsDiffCreateBlob) == 32, "engine ABI blob size");
 
-static_assert(offsetof(PxgParticleSimBuffer, mDiffuseParticleBufferIndex) == 76,
-              "mDiffuseParticleBufferIndex @76");
-static_assert(offsetof(PxgParticleSimBuffer, mNumActiveParticles) == 56, "@56");
+static_assert(offsetof(PxgParticleSimBuffer, mDiffuseParticleBufferIndex) == 40,
+              "mDiffuseParticleBufferIndex @40");
+static_assert(offsetof(PxgParticleSimBuffer, mNumActiveParticles) == 32, "@32");
 static_assert(offsetof(PxgParticleSystem, mSortedPositions_InvMass) == 24, "@24");
 static_assert(offsetof(PxgParticleSystem, mSortedVelocities) == 32, "@32");
 static_assert(offsetof(PxgParticleSystem, mSortedPhaseArray) == 40, "@40");
 static_assert(offsetof(PxgParticleSystem, mUnsortedToSortedMapping) == 48, "@48");
-static_assert(offsetof(PxgParticleSystem, mDiffusePotentials) == 512, "@512");
+static_assert(offsetof(PxgParticleSystem, mDiffusePotentials) == 472, "@472");
 static_assert(offsetof(PxgParticleSystem, mParticleSimBuffers) == 400, "@400");
 static_assert(offsetof(PxgParticleSystem, mParticleBufferRunsum) == 408, "@408");
 

@@ -32,8 +32,10 @@
 // pointers, exactly as pxgSlangParticleDesc did for the particle path.
 //
 // PxgFEMCloth is a flat pointer+scalar block (PX_ALIGN_PREFIX(16)), NO nested
-// value structs — simpler than the particle mirror.  sizeof = 400, alignof = 16
-// (400 is a multiple of 16, so the array stride is 400).  The layout is verified
+// value structs — simpler than the particle mirror.  sizeof = 416, alignof = 16
+// (PhysX 5.12: mRigidConstraints became the two element filter arrays + counts,
+// +16 B; mTriangleVertexIndices became mTriangleVertexIndices_ownedEdges, whose .w
+// holds the 3-bit edge ownership; mRestDistance became mRestOffset).  The layout is verified
 // byte-exact against the engine header with g++ offsetof in testFemClothSim.cpp
 // (which pushes a REAL PxgFEMCloth filled with sentinels and reads it back through
 // this mirror — any compiler/mirror drift fails that test).
@@ -43,13 +45,15 @@
 // requiring 8/16-bit storage on llvmpipe:
 //   - @160 bool mNonSharedTriPair_hasActiveBending (1 byte + 7 pad) -> a uint word
 //     @160 + explicit _pad164 so the next pointer lands at @168;
-//   - @376 PxU8 mActorFlags / PxU8 mBodyFlags / PxU16 mSurfaceFlags fold into one
+//   - @392 PxU8 mActorFlags / PxU8 mBodyFlags / PxU16 mSurfaceFlags fold into one
 //     uint mFlagsWord (low byte = mActorFlags; test mActorFlags & eDISABLE_GRAVITY).
 module pxgSlangFEMClothDesc;
 
 // PxActorFlag::eDISABLE_GRAVITY (PxActor.h:73) = (1<<1).  Tested against the low
 // byte of mFlagsWord (mActorFlags) in the pre-integrate gravity predict.
 public static const uint PXG_FEMCLOTH_ACTORFLAG_DISABLE_GRAVITY = 2u;
+// sizeof(PxgFEMCloth), 5.12: the array stride of the femClothes argument.
+public static const uint64_t PXG_FEMCLOTH_STRIDE = 416;
 
 // P7.1: byte-exact mirror of PxsDeformableSurfaceMaterialData
 // (PxsDeformableSurfaceMaterialCore.h:38, PX_ALIGN(16), sizeof == 32).  The
@@ -70,9 +74,9 @@ public struct PxsDeformableSurfaceMaterialGpu
     public float padding0;           // @28  -> 32
 }
 
-// Byte-exact mirror of class PxgFEMCloth (PxgFEMCloth.h:69).  Every pointer is
-// 8 bytes; the block is a run of device pointers (0..287), then the PxReal/PxU32
-// scalar tail (288..399).  sizeof = 400.
+// Byte-exact mirror of class PxgFEMCloth (PxgFEMCloth.h, 5.12).  Every pointer is
+// 8 bytes; the block is a run of device pointers (0..295), then the PxReal/PxU32
+// scalar tail (296..415).  sizeof = 416.
 public struct PxgFEMClothGpu
 {
     public uint64_t mTriMeshData;                                          // @0    void*
@@ -83,8 +87,8 @@ public struct PxgFEMClothGpu
     public uint64_t mPrevPositionInRestOffset;                             // @40   float4*
     public uint64_t mDynamicFrictions;                                     // @48   float*
     public uint64_t mMaterialIndices;                                      // @56   PxU16*
-    public uint64_t mTrianglesWithActiveEdges;                             // @64   PxU32*
-    public uint64_t mTriangleVertexIndices;                                // @72   uint4*
+    public uint64_t mTrianglesWithOwnedEdges;                              // @64   PxU32*
+    public uint64_t mTriangleVertexIndices_ownedEdges;                     // @72   uint4* (.w = 3-bit edge ownership)
     public uint64_t mOrderedNonSharedTriangleVertexIndices_triIndex;       // @80   uint4*
     public uint64_t mOrderedSharedTriangleLambdas;                         // @88   float2*
     public uint64_t mOrderedNonSharedTriangleLambdas;                      // @96   float2*
@@ -111,33 +115,42 @@ public struct PxgFEMClothGpu
     public uint64_t mAccumulatedDeltaPos;                                  // @256  float4* (posDelta)
     public uint64_t mAccumulatedDeltaVel;                                  // @264  float4*
     public uint64_t mPackedNodeBounds;                                     // @272  PxBounds3*
-    public uint64_t mRigidConstraints;                                     // @280  PxgFemRigidConstraintBlock*
-    public float mLinearDamping;                                           // @288
-    public float mMaxLinearVelocity;                                       // @292
-    public float mPenBiasClamp;                                            // @296
-    public float mSettlingThreshold;                                       // @300
-    public float mSleepThreshold;                                          // @304
-    public float mSettlingDamping;                                         // @308
-    public float mSelfCollisionFilterDistance;                             // @312
-    public uint mNbVerts;                                                  // @316
-    public uint mNbTriangles;                                              // @320
-    public uint mNbNonSharedTriangles;                                     // @324
-    public uint mNbTrianglesWithActiveEdges;                               // @328
-    public uint mNbTrianglePairs;                                          // @332
-    public uint mNbSharedTrianglePairs;                                    // @336
-    public uint mNbNonSharedTrianglePairs;                                 // @340
-    public uint mNbNonSharedTriPartitions;                                 // @344
-    public uint mNbSharedTriPairPartitions;                                // @348
-    public uint mNbNonSharedTriPairPartitions;                             // @352
-    public uint mNonSharedTriClusterId;                                    // @356
-    public uint mSharedTriPairClusterId;                                   // @360
-    public uint mNonSharedTriPairClusterId;                                // @364
-    public uint mElementIndex;                                             // @368
-    public uint mGpuRemapIndex;                                            // @372
-    public uint mFlagsWord;                                                // @376  PxU8 mActorFlags|PxU8 mBodyFlags|PxU16 mSurfaceFlags
-    public uint mIsActive;                                                 // @380  PxU32 (atomicOr target)
-    public float mRestDistance;                                           // @384
-    public float mOriginalContactOffset;                                  // @388
-    public uint mNbCollisionPairUpdatesPerTimestep;                        // @392
-    public uint mNbCollisionSubsteps;                                      // @396  -> 400
+    public uint64_t mRigidSurfaceFilterPairs;                              // @280  PxgDeformablePairInfo*
+    public uint64_t mSurfaceSurfaceFilterPairs;                            // @288  PxgDeformablePairInfo*
+    public uint mNumRigidSurfaceFilterPairs;                               // @296
+    public uint mNumSurfaceSurfaceFilterPairs;                             // @300
+    public float mLinearDamping;                                           // @304
+    public float mMaxLinearVelocity;                                       // @308
+    public float mPenBiasClamp;                                            // @312
+    public float mSettlingThreshold;                                       // @316
+    public float mSleepThreshold;                                          // @320
+    public float mSettlingDamping;                                         // @324
+    public float mSelfCollisionFilterDistance;                             // @328
+    public uint mNbVerts;                                                  // @332
+    public uint mNbTriangles;                                              // @336
+    public uint mNbNonSharedTriangles;                                     // @340
+    public uint mNbTrianglesWithOwnedEdges;                                // @344
+    public uint mNbTrianglePairs;                                          // @348
+    public uint mNbSharedTrianglePairs;                                    // @352
+    public uint mNbNonSharedTrianglePairs;                                 // @356
+    public uint mNbNonSharedTriPartitions;                                 // @360
+    public uint mNbSharedTriPairPartitions;                                // @364
+    public uint mNbNonSharedTriPairPartitions;                             // @368
+    public uint mNonSharedTriClusterId;                                    // @372
+    public uint mSharedTriPairClusterId;                                   // @376
+    public uint mNonSharedTriPairClusterId;                                // @380
+    public uint mElementIndex;                                             // @384
+    public uint mGpuRemapIndex;                                            // @388
+    public uint mFlagsWord;                                                // @392  PxU8 mActorFlags|PxU8 mBodyFlags|PxU16 mSurfaceFlags
+    public uint mIsActive;                                                 // @396  PxU32 (atomicOr target)
+    public float mRestOffset;                                              // @400  (5.6.1 mRestDistance; now the rest offset)
+    public float mOriginalContactOffset;                                   // @404
+    public uint mNbCollisionPairUpdatesPerTimestep;                        // @408
+    public uint mNbCollisionSubsteps;                                      // @412  -> 416
+}
+
+// &clothes[id]: the descriptor of cloth `id` in the array at `clothes`.
+public Ptr<PxgFEMClothGpu> clothAt(uint64_t clothes, uint id)
+{
+    return Ptr<PxgFEMClothGpu>(clothes + uint64_t(id) * PXG_FEMCLOTH_STRIDE);
 }

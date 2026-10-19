@@ -41,6 +41,12 @@
 //     count.  Launches: grid ACCUMULATE_DELTA (32), block ACCUMULATE_DELTA (512);
 //     PxgParticleSystemCore.cpp:1648/:1690.
 //
+// PhysX 5.12 re-keys all four range-find passes on the 64-bit participant refs of
+// the SoA PxgDeformablePairInfo stream (pxgSlangDeformableRef): the particle twins
+// read ref1 (the PxgParticleRef of a rigid-particle pair), the FEM twins read ref0
+// (the particle side of a particle-deformable pair).  The bodies are otherwise
+// textually unchanged apart from the sParticleId -> sParticleRef rename.
+//
 // P9.48a adds the FEM TWINS of the two range-find passes:
 //
 //   ps_findStartEndFEMFirstLaunch  (particlesystem.cu:2519)
@@ -53,18 +59,18 @@
 // the particle path's ACCUMULATE_DELTA).  Diffed line for line against their
 // twins; the differences are exactly three, and only the first is behavioural:
 //
-//   1. the record read is PxgFemOtherContactInfo (16 B) and the id is its
-//      pairInd0, not PxgParticlePrimitiveContact::particleId (@24 of 32 B).
-//   2. the FEM pass 1 leaves `PxU64 particleId` UNINITIALISED where the particle
+//   1. the key is PxgDeformablePairInfo::ref0, not ref1 (5.6.1: PxgFemOtherContactInfo
+//      ::pairInd0 against PxgParticlePrimitiveContact::particleId).
+//   2. the FEM pass 1 leaves `PxU64 particleRef` UNINITIALISED where the particle
 //      pass 1 seeds it with 0xffffffffffffffff.  Dead either way: every read of
 //      it sits inside `if (workIndex < tNumContacts)`, the same guard that
 //      assigns it.  The port keeps the particle twin's sentinel, which is the
 //      defined-behaviour spelling of the same dead value.
 //   3. UPSTREAM CANDIDATE: the FEM pass 2 has NO trailing __syncthreads() at the
 //      end of its iteration loop, while the particle twin has one carrying the
-//      comment "sParticleId (shared memory) is read and written in the same loop
+//      comment "sParticleRef (shared memory) is read and written in the same loop
 //      - read and write must be separated with syncs".  The FEM loop reads
-//      sParticleId[tid] and writes sParticleId[tid+1] in the same body, so
+//      sParticleRef[tid] and writes sParticleRef[tid+1] in the same body, so
 //      iteration i+1's write races iteration i's read across warps whenever
 //      numIterationPerBlock > 1.  Reproducing that would be reproducing a race,
 //      not a behaviour — the port keeps the barrier.  DOCUMENTED, NOT REPORTED.
@@ -96,10 +102,11 @@
 //     exclusive scan, no block-boundary correction — each range-start writes its
 //     own global slot.  Observable outputs (rangeStart/rangeEnd/totalNumPairs) are
 //     identical to the CUDA; only the intermediate `offsets` encoding differs.
-//   - PxU64 particleId compared as its uint2 halves; the 0xffff.. sentinel is
+//   - The PxU64 particle ref compared as its uint2 halves; the 0xffff.. sentinel is
 //     uint2(~0,~0).  Every BDA Ptr<> load sits behind a uniform-scalar guard
 //     (workIndex < tNumContacts) so nothing hoists out of a zero-trip loop.
 
+import pxgSlangDeformableRef;   // PxgDeformablePairInfoGpu (5.12)
 import pxgSlangScan;
 
 // PxgParticleSystemKernelBlockDim/GridDim (PxgParticleSystemCoreKernelIndices.h):
@@ -112,44 +119,37 @@ static const uint AD_GRID = 32u;     // ACCUMULATE_DELTA grid
 static const uint WARP = 32u;
 static const uint AD_NUM_WARPS = AD_BLOCK / WARP;  // 16
 
-// PxgParticlePrimitiveContact (PxgParticleSystem.h, PX_ALIGN(16), 32 bytes) —
-// float4 normal_pen @0, PxU64 rigidId @16, PxU64 particleId @24.  The reorder
-// copies whole structs; the range-find reads only particleId.
-struct PsContact
+// The range-find keys: a PxU64 participant ref as its (low, high) uint2 halves.
+uint2 psRefHalves(uint64_t ref)
 {
-    float4 normal_pen; // @0
-    uint2 rigidId;     // @16
-    uint2 particleId;  // @24 -> 32
-}
-
-// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes) —
-// PxU64 pairInd0 @0 (the PARTICLE side: systemId<<32 | particleIndex),
-// PxU32 pairInd1 @8 (the FEM id), PxU32 rigidMatInd_isInCollision @12.
-// The range-find reads only pairInd0; the accumulate reads it once more.
-struct FemOtherContactInfo
-{
-    uint2 pairInd0;                  // @0
-    uint pairInd1;                   // @8
-    uint rigidMatInd_isInCollision;  // @12 -> 16
+    return uint2(uint(ref & uint64_t(0xffffffffu)), uint(ref >> 32));
 }
 
 // ===========================================================================
-// 1. ps_reorderPrimitiveContactsLaunch (cudaParticleSystem.cu:1687)
-//    CUDA ABI: (const PxgParticlePrimitiveContact* particleContacts,
+// 1. ps_reorderPrimitiveContactsLaunch (cudaParticleSystem.cu, PhysX 5.12)
+//    CUDA ABI: (const PxgDeformablePairInfo* particleContactInfos,
+//               const float4* particleContactNormalPens,
 //               const PxI32* numParticleContacts, const PxU32* remapByRigid,
 //               const PxU32* remapByParticle,
-//               PxgParticlePrimitiveContact* sortedContactsByRigid,
-//               PxgParticlePrimitiveContact* sortedContactsByParticle)
-//    -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.
+//               PxgDeformablePairInfo* sortedContactInfosByRigid,
+//               float4* sortedContactNormalPensByRigid,
+//               PxgDeformablePairInfo* sortedContactInfosByParticle,
+//               float4* sortedContactNormalPensByParticle)
+//    -> 9 device pointers = 72-byte blob.  5.12 split the 32-byte
+//    PxgParticlePrimitiveContact into the SoA pair info + normalPen streams, and
+//    gathers each through the same remap, by-particle first.
 // ===========================================================================
 struct PsReorderParams
 {
-    uint64_t particleContacts;         // @0
-    uint64_t numParticleContacts;      // @8  PxI32* device pointer
-    uint64_t remapByRigid;             // @16
-    uint64_t remapByParticle;          // @24
-    uint64_t sortedContactsByRigid;    // @32 output
-    uint64_t sortedContactsByParticle; // @40 output
+    uint64_t particleContactInfos;               // @0
+    uint64_t particleContactNormalPens;          // @8
+    uint64_t numParticleContacts;                // @16 PxI32* device pointer
+    uint64_t remapByRigid;                       // @24
+    uint64_t remapByParticle;                    // @32
+    uint64_t sortedContactInfosByRigid;          // @40 output
+    uint64_t sortedContactNormalPensByRigid;     // @48 output
+    uint64_t sortedContactInfosByParticle;       // @56 output
+    uint64_t sortedContactNormalPensByParticle;  // @64 output
 }
 
 [[vk::push_constant]]
@@ -168,11 +168,10 @@ void ps_reorderPrimitiveContactsLaunch(uint3 groupThreadId : SV_GroupThreadID,
     // CUDA operator precedence preserved verbatim: ((n + B*G - 1)/B) * G.
     const uint numIternations = (totalNumContacts + RC_BLOCK * RC_GRID - 1u) / RC_BLOCK * RC_GRID;
 
-    Ptr<PsContact> src = Ptr<PsContact>(gRc.particleContacts);
+    Ptr<PxgDeformablePairInfoGpu> srcInfos = Ptr<PxgDeformablePairInfoGpu>(gRc.particleContactInfos);
+    Ptr<float4> srcNormalPens = Ptr<float4>(gRc.particleContactNormalPens);
     Ptr<uint> remapByRigid = Ptr<uint>(gRc.remapByRigid);
     Ptr<uint> remapByParticle = Ptr<uint>(gRc.remapByParticle);
-    Ptr<PsContact> outByRigid = Ptr<PsContact>(gRc.sortedContactsByRigid);
-    Ptr<PsContact> outByParticle = Ptr<PsContact>(gRc.sortedContactsByParticle);
 
     for (uint i = 0; i < numIternations; ++i)
     {
@@ -180,22 +179,28 @@ void ps_reorderPrimitiveContactsLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (index >= totalNumContacts)
             return;
 
-        outByParticle[index] = src[remapByParticle[index]];
-        outByRigid[index] = src[remapByRigid[index]];
+        const uint byParticle = remapByParticle[index];
+        Ptr<PxgDeformablePairInfoGpu>(gRc.sortedContactInfosByParticle)[index] = srcInfos[byParticle];
+        Ptr<float4>(gRc.sortedContactNormalPensByParticle)[index] = srcNormalPens[byParticle];
+
+        const uint byRigid = remapByRigid[index];
+        Ptr<PxgDeformablePairInfoGpu>(gRc.sortedContactInfosByRigid)[index] = srcInfos[byRigid];
+        Ptr<float4>(gRc.sortedContactNormalPensByRigid)[index] = srcNormalPens[byRigid];
     }
 }
 
 // ===========================================================================
-// 2. ps_findStartEndParticleFirstLaunch (particlesystem.cu:2277)
-//    CUDA ABI: (PxgParticleSystem* particleSystems, PxgParticlePrimitiveContact*
-//               sortedContacts, PxU32* numContacts, PxU32* blockOffsets,
+// 2. ps_findStartEndParticleFirstLaunch (particlesystem.cu, PhysX 5.12)
+//    CUDA ABI: (PxgParticleSystem* particleSystems, PxgDeformablePairInfo*
+//               sortedContactInfos, PxU32* numContacts, PxU32* blockOffsets,
 //               PxU32* offsets) -> 5 device pointers = {8,8,8,8,8} = 40-byte blob.
+//    The key is the pair's ref1, the PxgParticleRef.
 //    particleSystems is passed for ABI parity but never dereferenced.
 // ===========================================================================
 struct PsFindFirstParams
 {
     uint64_t particleSystems; // @0  (unused, ABI parity)
-    uint64_t sortedContacts;  // @8
+    uint64_t sortedContactInfos; // @8  PxgDeformablePairInfo*
     uint64_t numContacts;     // @16
     uint64_t blockOffsets;    // @24 output
     uint64_t offsets;         // @32 output
@@ -231,7 +236,7 @@ void ps_findStartEndParticleFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
     const uint nbTotalChunks = (tNumContacts + AD_BLOCK - 1u) / AD_BLOCK;
 
-    Ptr<PsContact> contacts = Ptr<PsContact>(gF1.sortedContacts);
+    Ptr<PxgDeformablePairInfoGpu> contacts = Ptr<PxgDeformablePairInfoGpu>(gF1.sortedContactInfos);
     Ptr<uint> offsets = Ptr<uint>(gF1.offsets);
     Ptr<uint> blockOffsets = Ptr<uint>(gF1.blockOffsets);
 
@@ -244,13 +249,13 @@ void ps_findStartEndParticleFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
     {
         const uint workIndex = i * AD_BLOCK + tid;
 
-        uint2 particleId = uint2(0xffffffffu, 0xffffffffu);
+        uint2 particleRef = uint2(0xffffffffu, 0xffffffffu);
         if (workIndex < tNumContacts)
         {
-            particleId = contacts[workIndex].particleId;
-            gsPid1[tid + 1] = particleId;
+            particleRef = psRefHalves(contacts[workIndex].ref1);
+            gsPid1[tid + 1] = particleRef;
             if (workIndex > 0u && tid == 0u)
-                gsPid1[0] = contacts[workIndex - 1].particleId;
+                gsPid1[0] = psRefHalves(contacts[workIndex - 1].ref1);
         }
 
         GroupMemoryBarrierWithGroupSync();
@@ -259,7 +264,7 @@ void ps_findStartEndParticleFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (workIndex < tNumContacts)
         {
             const uint2 prev = gsPid1[tid];
-            if (workIndex == 0u || any(particleId != prev))
+            if (workIndex == 0u || any(particleRef != prev))
                 isRangeStart = 1u;
         }
 
@@ -299,15 +304,15 @@ void ps_findStartEndParticleFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
 }
 
 // ===========================================================================
-// 3. ps_findStartEndParticleSecondLaunch (particlesystem.cu:2402)
-//    CUDA ABI: (PxgParticlePrimitiveContact* sortedContacts, PxU32* numContacts,
+// 3. ps_findStartEndParticleSecondLaunch (particlesystem.cu, PhysX 5.12)
+//    CUDA ABI: (PxgDeformablePairInfo* sortedContactInfos, PxU32* numContacts,
 //               PxU32* blockOffsets, PxU32* offsets, PxU32* totalNumPairs,
 //               PxU32* rangeStart, PxU32* rangeEnd)
 //    -> 7 device pointers = {8,8,8,8,8,8,8} = 56-byte blob.
 // ===========================================================================
 struct PsFindSecondParams
 {
-    uint64_t sortedContacts;  // @0
+    uint64_t sortedContactInfos; // @0  PxgDeformablePairInfo*
     uint64_t numContacts;     // @8
     uint64_t blockOffsets;    // @16
     uint64_t offsets;         // @24
@@ -331,7 +336,7 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
     const uint tNumContacts = Ptr<uint>(gF2.numContacts)[0];
 
-    Ptr<PsContact> contacts = Ptr<PsContact>(gF2.sortedContacts);
+    Ptr<PxgDeformablePairInfoGpu> contacts = Ptr<PxgDeformablePairInfoGpu>(gF2.sortedContactInfos);
     Ptr<uint> offsets = Ptr<uint>(gF2.offsets);
     Ptr<uint> rangeStart = Ptr<uint>(gF2.rangeStart);
     Ptr<uint> rangeEnd = Ptr<uint>(gF2.rangeEnd);
@@ -349,13 +354,13 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
     {
         const uint workIndex = i * AD_BLOCK + tid + numIterationPerBlock * blockId * AD_BLOCK;
 
-        uint2 particleId = uint2(0u, 0u);
+        uint2 particleRef = uint2(0u, 0u);
         if (workIndex < tNumContacts)
         {
-            particleId = contacts[workIndex].particleId;
-            gsPid2[tid + 1] = particleId;
+            particleRef = psRefHalves(contacts[workIndex].ref1);
+            gsPid2[tid + 1] = particleRef;
             if (workIndex > 0u && tid == 0u)
-                gsPid2[0] = contacts[workIndex - 1].particleId;
+                gsPid2[0] = psRefHalves(contacts[workIndex - 1].ref1);
         }
 
         GroupMemoryBarrierWithGroupSync();
@@ -363,7 +368,7 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (workIndex < tNumContacts)
         {
             const uint2 prev = gsPid2[tid];
-            if (workIndex == 0u || any(particleId != prev))
+            if (workIndex == 0u || any(particleRef != prev))
             {
                 rangeStart[offsets[workIndex]] = workIndex;
 
@@ -387,9 +392,9 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
 }
 
 // ===========================================================================
-// 4. ps_findStartEndFEMFirstLaunch (particlesystem.cu:2519)
+// 4. ps_findStartEndFEMFirstLaunch (particlesystem.cu, PhysX 5.12)
 //    The FEM twin of kernel 2.  CUDA ABI: (PxgParticleSystem* particleSystems,
-//    PxgFemOtherContactInfo* sortedContactsInfo, PxU32* numContacts,
+//    PxgDeformablePairInfo* sortedContactInfos, PxU32* numContacts,
 //    PxU32* blockOffsets, PxU32* offsets) -> 5 pointers = 40-byte blob.
 //    particleSystems is passed for ABI parity but never dereferenced, exactly as
 //    in the particle twin.
@@ -399,12 +404,13 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
 //    The whole restructuring of the particle twin applies unchanged and for the
 //    same reason: pass 1 is folded onto block 0 so that `offsets` comes out
 //    GLOBAL rather than within-block (see the header).  Only the record type and
-//    the field offset differ from ps_findStartEndParticleFirstLaunch.
+//    the key differ from ps_findStartEndParticleFirstLaunch: ref0, the particle side
+//    of a particle-deformable pair.
 // ===========================================================================
 struct PsFindFemFirstParams
 {
     uint64_t particleSystems;    // @0  (unused, ABI parity)
-    uint64_t sortedContactsInfo; // @8
+    uint64_t sortedContactInfos; // @8  PxgDeformablePairInfo*
     uint64_t numContacts;        // @16
     uint64_t blockOffsets;       // @24 output
     uint64_t offsets;            // @32 output -> 40
@@ -443,7 +449,7 @@ void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
     const uint nbTotalChunks = (tNumContacts + AD_BLOCK - 1u) / AD_BLOCK;
 
-    Ptr<FemOtherContactInfo> infos = Ptr<FemOtherContactInfo>(gFF1.sortedContactsInfo);
+    Ptr<PxgDeformablePairInfoGpu> infos = Ptr<PxgDeformablePairInfoGpu>(gFF1.sortedContactInfos);
     Ptr<uint> offsets = Ptr<uint>(gFF1.offsets);
     Ptr<uint> blockOffsets = Ptr<uint>(gFF1.blockOffsets);
 
@@ -459,13 +465,13 @@ void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
         // The .cu leaves this UNINITIALISED here (its particle twin seeds the
         // 0xffff.. sentinel); every read is behind the same guard that assigns
         // it, so the sentinel is the defined-behaviour spelling of a dead value.
-        uint2 particleId = uint2(0xffffffffu, 0xffffffffu);
+        uint2 particleRef = uint2(0xffffffffu, 0xffffffffu);
         if (workIndex < tNumContacts)
         {
-            particleId = infos[workIndex].pairInd0;
-            gsFemPid1[tid + 1] = particleId;
+            particleRef = psRefHalves(infos[workIndex].ref0);
+            gsFemPid1[tid + 1] = particleRef;
             if (workIndex > 0u && tid == 0u)
-                gsFemPid1[0] = infos[workIndex - 1].pairInd0;
+                gsFemPid1[0] = psRefHalves(infos[workIndex - 1].ref0);
         }
 
         GroupMemoryBarrierWithGroupSync();
@@ -474,7 +480,7 @@ void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (workIndex < tNumContacts)
         {
             const uint2 prev = gsFemPid1[tid];
-            if (workIndex == 0u || any(particleId != prev))
+            if (workIndex == 0u || any(particleRef != prev))
                 isRangeStart = 1u;
         }
 
@@ -509,8 +515,8 @@ void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
 }
 
 // ===========================================================================
-// 5. ps_findStartEndFEMSecondLaunch (particlesystem.cu:2644)
-//    The FEM twin of kernel 3.  CUDA ABI: (PxgFemOtherContactInfo*
+// 5. ps_findStartEndFEMSecondLaunch (particlesystem.cu, PhysX 5.12)
+//    The FEM twin of kernel 3.  CUDA ABI: (PxgDeformablePairInfo*
 //    sortedContactInfo, PxU32* numContacts, PxU32* blockOffsets, PxU32* offsets,
 //    PxU32* totalNumPairs, PxU32* rangeStart, PxU32* rangeEnd)
 //    -> 7 pointers = 56-byte blob.
@@ -523,7 +529,7 @@ void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
 // ===========================================================================
 struct PsFindFemSecondParams
 {
-    uint64_t sortedContactInfo; // @0
+    uint64_t sortedContactInfo; // @0  PxgDeformablePairInfo*
     uint64_t numContacts;       // @8
     uint64_t blockOffsets;      // @16
     uint64_t offsets;           // @24
@@ -547,7 +553,7 @@ void ps_findStartEndFEMSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
     const uint tNumContacts = Ptr<uint>(gFF2.numContacts)[0];
 
-    Ptr<FemOtherContactInfo> infos = Ptr<FemOtherContactInfo>(gFF2.sortedContactInfo);
+    Ptr<PxgDeformablePairInfoGpu> infos = Ptr<PxgDeformablePairInfoGpu>(gFF2.sortedContactInfo);
     Ptr<uint> offsets = Ptr<uint>(gFF2.offsets);
     Ptr<uint> rangeStart = Ptr<uint>(gFF2.rangeStart);
     Ptr<uint> rangeEnd = Ptr<uint>(gFF2.rangeEnd);
@@ -562,13 +568,13 @@ void ps_findStartEndFEMSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
     {
         const uint workIndex = i * AD_BLOCK + tid + numIterationPerBlock * blockId * AD_BLOCK;
 
-        uint2 particleId = uint2(0u, 0u);
+        uint2 particleRef = uint2(0u, 0u);
         if (workIndex < tNumContacts)
         {
-            particleId = infos[workIndex].pairInd0;
-            gsFemPid2[tid + 1] = particleId;
+            particleRef = psRefHalves(infos[workIndex].ref0);
+            gsFemPid2[tid + 1] = particleRef;
             if (workIndex > 0u && tid == 0u)
-                gsFemPid2[0] = infos[workIndex - 1].pairInd0;
+                gsFemPid2[0] = psRefHalves(infos[workIndex - 1].ref0);
         }
 
         GroupMemoryBarrierWithGroupSync();
@@ -576,7 +582,7 @@ void ps_findStartEndFEMSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
         if (workIndex < tNumContacts)
         {
             const uint2 prev = gsFemPid2[tid];
-            if (workIndex == 0u || any(particleId != prev))
+            if (workIndex == 0u || any(particleRef != prev))
             {
                 rangeStart[offsets[workIndex]] = workIndex;
 

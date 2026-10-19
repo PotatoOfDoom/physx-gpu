@@ -62,9 +62,9 @@
 //   * a SECOND particle system with mMaxDiffuseParticles == 0 but a fully
 //     populated diffuse cell range and particles placed to contact -- so the D5
 //     early-out is the only thing keeping its outputs poisoned.
-//   * a RIGID FILTER PAIR seeded to match one (particle, plane) combination.
-//     The diffuse path has no filter (D4); a port that borrows the fluid
-//     kernel's findPs suppresses exactly that one contact.
+//   * (5.6.1 also seeded a RIGID FILTER PAIR here, to catch a port borrowing the
+//     fluid kernel's findPs.  PhysX 5.12 removed that filter from every particle
+//     kernel, so there is nothing left to borrow and the pair is gone.)
 //   * per-pair rest distances that are all DIFFERENT, so a wrong pair index
 //     lands on a different penetration.
 //   * output arrays running SIXTEEN planes deep where twelve are legal, plus a
@@ -103,20 +103,19 @@ struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
 // ---------------------------------------------------------------------------
 // The ABI, pinned from the engine headers.
 // ---------------------------------------------------------------------------
-static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
+static_assert(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem stride");
 static_assert(sizeof(PxgContactManagerInput) == 16, "PxgContactManagerInput stride");
 static_assert(sizeof(PxgShape) == 48, "PxgShape stride");
 static_assert(sizeof(PxsCachedTransform) == 32, "PxsCachedTransform stride");
-static_assert(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride");
 static_assert(sizeof(PxgParticleContactInfo) == 16, "PxgParticleContactInfo is one float4");
 static_assert(PxgParticleContactInfo::MaxStaticContactsPerParticle == 12, "the static-contact cap");
 static_assert(offsetof(PxgParticleSystem, mCommonData) == 88, "mCommonData @88");
-static_assert(offsetof(PxgParticleSystem, mDiffuseCellStart) == 520, "@520");
-static_assert(offsetof(PxgParticleSystem, mDiffuseCellEnd) == 528, "@528");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552, "@552");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560, "@560");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592, "@592");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616, "@616");
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellStart) == 480, "@480");
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellEnd) == 488, "@488");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512, "@512");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520, "@520");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 552, "@552");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 576, "@576");
 
 // The 104-byte engine ABI blob: kPsPrimCollide's head with no writer.
 struct PsDiffCollideBlob
@@ -182,8 +181,6 @@ static const uint32_t TRAP_DIFFUSE = 8u;    // the mMaxDiffuseParticles == 0 sys
 static const float CONTACT_OFFSET = 0.3f;
 static const float POISON_F = -7.5e3f;
 static const uint32_t POISON_U32 = 0xEEEEEEEEu;
-static const uint32_t FILTERED_PARTICLE = 5u;   // matched by the seeded filter pair
-static const uint32_t FILTERED_PLANE = 0u;
 static const uint32_t NODE_BASE = 100u;
 
 // ---------------------------------------------------------------------------
@@ -455,7 +452,7 @@ struct Rig
     DevBuf bDesc, bCin, bShapes, bTc, bBounds, bCd, bRd, bMat, bStart, bTotal, bRemap;
     DevBuf bDOrigin, bDPred, bDCellStart, bDCellEnd, bCellStart, bCellEnd, bTwo;
     DevBuf bInfos, bForces, bNodes, bCounts;
-    DevBuf bRunsum, bSimBuf, bFilterPairs;
+    DevBuf bRunsum, bSimBuf;
     DevBuf tOrigin, tPred, tCellStart, tCellEnd, tTwo, tInfos, tForces, tNodes, tCounts;
     PsDiffCollideBlob blob{};
 
@@ -767,18 +764,12 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     for (uint32_t i = 0; i < NUM_DIFFUSE; ++i) counts[i] = 0u;
     R.bCounts = R.mk(dev, counts);
 
-    // D4: the filter machinery, seeded so a borrowed findPs would bite.
+    // D4: PhysX 5.12 removed the particle-rigid element filter altogether (with
+    // particle rigids, 5.9), so there is no fluid-kernel findPs left to borrow and no
+    // filter pair to seed; the sim buffer is a plain one.
     R.bRunsum = R.mk(dev, std::vector<uint32_t>{ 0u });
-    std::vector<PxgRigidFilterPair> pairs(1);
-    std::memset(pairs.data(), 0, sizeof(PxgRigidFilterPair));
-    pairs[0].index0 = uint64_t(NODE_BASE + FILTERED_PLANE);
-    pairs[0].index1 = uint64_t(FILTERED_PARTICLE);
-    pairs[0].index2 = 0u;
-    R.bFilterPairs = R.mk(dev, pairs);
     std::vector<PxgParticleSimBuffer> simBufs(1);
     std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBufs[0].mFilterPairs = reinterpret_cast<PxParticleRigidFilterPair*>(size_t(R.bFilterPairs.addr));
-    simBufs[0].mNumFilterPairs = 1u;
     R.bSimBuf = R.mk(dev, simBufs);
 
     // ---- the TRAP system: mMaxDiffuseParticles == 0, everything else live ----
@@ -1094,7 +1085,7 @@ static void runAll(PxgSlangComputeDevice* dev)
     // ---- coverage, demanded rather than designed ----
     {
         const std::vector<Expected> E = predict();
-        uint32_t maxPer = 0, minPer = 0xffffffffu, filtered = 0;
+        uint32_t maxPer = 0, minPer = 0xffffffffu;
         for (uint32_t i = D_START; i < D_END; ++i)
         {
             uint32_t n = 0;
@@ -1102,7 +1093,6 @@ static void runAll(PxgSlangComputeDevice* dev)
             {
                 if (e.particle != i) continue;
                 ++n;
-                if (i == FILTERED_PARTICLE && e.plane == FILTERED_PLANE) ++filtered;
             }
             maxPer = std::max(maxPer, n);
             minPer = std::min(minPer, n);
@@ -1119,8 +1109,6 @@ static void runAll(PxgSlangComputeDevice* dev)
         PXG_CHECK_MSG(minPer > 0u && minPer < MAXC,
                       "every particle has the same depth band (min %u, max %u) -- a wrong "
                       "count would not be visible", minPer, maxPer);
-        PXG_CHECK_MSG(filtered > 0u, "the seeded filter pair matches no contact -- a port "
-                      "that borrowed the fluid kernel's findPs could not be caught");
         std::printf("    [ note ] %zu contacts over %u particles; depth band %u..%u against a "
                     "cap of %u; %u trap particles held silent by mMaxDiffuseParticles == 0\n",
                     E.size(), D_END - D_START, minPer, maxPer, MAXC, TRAP_DIFFUSE);

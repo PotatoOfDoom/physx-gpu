@@ -63,8 +63,8 @@ public uint getSoftBodyElementIndex(uint compressedId) { return PX_MAX_NB_DEFORM
 
 // ---------------------------------------------------------------------------
 // PxsDeformableVolumeMaterialData (PxsDeformableVolumeMaterialCore.h:50), PX_ALIGN(16):
-// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, dampingScale (PxU16)
-// @16, materialModel (PxU16) @18, deformThreshold @20, deformLowLimitRatio @24,
+// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, materialModel (PxU16)
+// @16, _pad (PxU16) @18, deformThreshold @20, deformLowLimitRatio @24,
 // deformHighLimitRatio @28 -> 32 bytes, and 32 is already a multiple of 16 so the array
 // stride is 32.
 // ---------------------------------------------------------------------------

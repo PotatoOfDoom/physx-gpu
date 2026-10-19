@@ -308,7 +308,7 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     // BV32 node array begins immediately after it.
     const uint64_t treeAddr = clothes[clothId].mTriMeshData + 16UL;
     Ptr<float4> triVerts = Ptr<float4>(clothes[clothId].mPosition_InvMass);
-    Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices);
+    Ptr<uint4> triIndices = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices_ownedEdges);
 
     const float contactDist = Ptr<float>(gCm.contactDistance)[sbCacheRef] +
                               Ptr<float>(gCm.contactDistance)[clothCacheRef];

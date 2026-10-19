@@ -103,10 +103,11 @@ static const float FWD_PGS = 1.0f;
 PXG_TEST(particleSimDescLayout)
 {
     // sizeof / array stride: the ps_* kernels index particleSystems[particleId],
-    // so the STRIDE must match (verified in SPIR-V as ArrayStride 656 / 88).
-    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem sizeof == 656 (got %zu)",
+    // so the STRIDE must match (verified in SPIR-V as ArrayStride 608 / 48).  PhysX 5.12:
+    // the particle cloth / rigid / attachment members are gone (5.6.1: 656 / 88).
+    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem sizeof == 608 (got %zu)",
                   sizeof(PxgParticleSystem));
-    PXG_CHECK_MSG(sizeof(PxgParticleSimBuffer) == 88, "PxgParticleSimBuffer sizeof == 88 (got %zu)",
+    PXG_CHECK_MSG(sizeof(PxgParticleSimBuffer) == 48, "PxgParticleSimBuffer sizeof == 48 (got %zu)",
                   sizeof(PxgParticleSimBuffer));
 
     // base PxGpuParticleSystem members
@@ -133,17 +134,21 @@ PXG_TEST(particleSimDescLayout)
     PXG_CHECK(offsetof(PxgParticleSystem, mSortedOriginPos_InvMass) == 392);
     PXG_CHECK(offsetof(PxgParticleSystem, mParticleSimBuffers) == 400);
     PXG_CHECK(offsetof(PxgParticleSystem, mParticleBufferRunsum) == 408);
-    PXG_CHECK(offsetof(PxgParticleSystem, mParticleMaterialStride) == 632);
-    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 640);
-    // mData members (mLockFlags @320 rel-72, mMaxVelocity @316 rel-68)
+    PXG_CHECK(offsetof(PxgParticleSystem, mParticleMaterialStride) == 592);
+    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 600);
+    // mData members (mMaxVelocity @316 rel-68; 5.12 inserts mPenBiasClamp @320 rel-72,
+    // which moves mLockFlags to @324 rel-76)
     PXG_CHECK(offsetof(PxgParticleSystemData, mMaxVelocity) == 68);
-    PXG_CHECK(offsetof(PxgParticleSystemData, mLockFlags) == 72);
+    PXG_CHECK(offsetof(PxgParticleSystemData, mPenBiasClamp) == 72);
+    PXG_CHECK(offsetof(PxgParticleSystemData, mLockFlags) == 76);
 
     // PxgParticleSimBuffer members the ps_updateUserBufferLaunch kernel touches
     PXG_CHECK(offsetof(PxgParticleSimBuffer, mPositionInvMasses) == 0);
     PXG_CHECK(offsetof(PxgParticleSimBuffer, mVelocities) == 8);
-    PXG_CHECK(offsetof(PxgParticleSimBuffer, mNumActiveParticles) == 56);
-    PXG_CHECK(offsetof(PxgParticleSimBuffer, mFlags) == 72);
+    PXG_CHECK(offsetof(PxgParticleSimBuffer, mNumActiveParticles) == 32);
+    PXG_CHECK(offsetof(PxgParticleSimBuffer, mFlags) == 36);
+    PXG_CHECK(offsetof(PxgParticleSimBuffer, mDiffuseParticleBufferIndex) == 40);
+    PXG_CHECK(offsetof(PxgParticleSimBuffer, mUniqueId) == 44);
 }
 
 // Zeroes and returns a real PxgParticleSystem (no vtable — memset-safe).

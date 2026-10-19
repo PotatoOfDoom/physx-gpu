@@ -52,8 +52,10 @@
 //   static: grid (ceil(mMaxParticles / PS_COLLISION), nbActiveSystems, 1),
 //           block PS_COLLISION = 256, args (particleSystems*, active*) -> {8,8}
 //   rigid:  grid (PxgParticleSystemKernelGridDim::PS_COLLISION = 1024, 1, 1),
-//           block 256, args (particleSystems*, sortedContacts*, totalNumPairs*,
-//           rangeStart*, rangeEnd*) -> {8,8,8,8,8}
+//           block 256, args (particleSystems*, sortedContactInfos*,
+//           sortedContactNormalPens*, totalNumPairs*, rangeStart*, rangeEnd*)
+//           -> {8,8,8,8,8,8} (PhysX 5.12: the SoA PxgDeformablePairInfo + float4
+//           normalPen streams replace the 32-byte PxgParticlePrimitiveContact)
 //
 // Traps, each with a mutant:
 //  B1. The static kernel takes its system from blockIdx.Y, not blockIdx.Z.  Every
@@ -72,9 +74,8 @@
 //  B7. Both kernels early-out on `restDensityBoundary > 0`, read from the
 //      DESCRIPTOR, not from a material.
 //  B8. The rigid kernel has NO shared staging and NO active-system indirection: it
-//      recovers the system from the CONTACT, via the PxU64 `particleId` whose low
-//      word is the particle index and whose high word is the system id (the same
-//      packing psContactSolveBda.slang:633-635 already reads as a uint2).
+//      recovers the system from the CONTACT, via the PxgParticleRef in the pair's
+//      ref1 (PxgGetParticleSystemId / PxgGetParticleIndex, PhysX 5.12).
 //  B9. The rigid kernel's inner loop SHADOWS the outer loop's `i` in the CUDA.  C++
 //      scoping makes that harmless, and the port spells the two counters distinctly
 //      (`it` and `c`) purely for readability -- Slang accepts the shadowed spelling
@@ -129,6 +130,7 @@
 // The module is in PXG_NOCONTRACT_SHADERS: W() is dense float work.
 
 import pxgSlangParticleDesc;
+import pxgSlangDeformableRef;   // PxgDeformablePairInfoGpu, PxgGetParticle* (5.12)
 
 // PxgParticleSystemKernelBlockDim (…KernelIndices.h:42, :45)
 static const uint PS_COLLISION_BLOCK = 256u;
@@ -142,8 +144,6 @@ static const uint PS_COLLISION_GRID = 1024u;
 // PxgParticleContactInfo::MaxStaticContactsPerParticle (PxgParticleSystem.h:133)
 static const uint PS_MAX_STATIC_CONTACTS_PER_PARTICLE = 12u;
 
-// sizeof(PxgParticlePrimitiveContact): PxVec4 + 2 * PxU64, align 16.
-static const uint PXG_PRIMITIVE_CONTACT_STRIDE = 32u;
 
 float bdSqr(float x) { return x * x; }
 float bdMax(float a, float b) { return a > b ? a : b; }
@@ -220,10 +220,11 @@ void ps_accumulateStaticDensity(uint3 groupThreadId : SV_GroupThreadID, uint3 gr
 struct PsRigidDensityParams
 {
     uint64_t particleSystems;   // @0
-    uint64_t sortedContacts;    // @8
-    uint64_t totalNumPairs;     // @16
-    uint64_t rangeStart;        // @24
-    uint64_t rangeEnd;          // @32 -> 40
+    uint64_t sortedContactInfos;      // @8  PxgDeformablePairInfo*
+    uint64_t sortedContactNormalPens; // @16 const float4*
+    uint64_t totalNumPairs;     // @24
+    uint64_t rangeStart;        // @32
+    uint64_t rangeEnd;          // @40 -> 48
 }
 [[vk::push_constant]]
 ConstantBuffer<PsRigidDensityParams> gRd;
@@ -257,14 +258,11 @@ void ps_accumulateRigidDensity(uint3 groupThreadId : SV_GroupThreadID, uint3 gro
         const uint startIndex = rangeStart[workIndex];
         const uint endIndex = rangeEnd[workIndex];
 
-        // B8: the system comes from the CONTACT, not from an active list.  The
-        // PxU64 particleId sits at byte 24 of the 32-byte record; low word is the
-        // particle index, high word the system id.
-        const uint64_t firstContact =
-            gRd.sortedContacts + uint64_t(startIndex) * uint64_t(PXG_PRIMITIVE_CONTACT_STRIDE);
-        const uint2 combinedParticleId = (Ptr<uint2>(firstContact + 24UL))[0];
-        const uint tParticleSystemId = combinedParticleId.y;
-        const uint tParticleId = combinedParticleId.x;
+        // B8: the system comes from the CONTACT, not from an active list: the pair's
+        // ref1 is the PxgParticleRef.
+        const uint64_t particleRef = (Ptr<PxgDeformablePairInfoGpu>(gRd.sortedContactInfos))[startIndex].ref1;
+        const uint tParticleSystemId = PxgGetParticleSystemId(particleRef);
+        const uint tParticleId = PxgGetParticleIndex(particleRef);
 
         const float restDensityBoundary = systems[tParticleSystemId].mData_RestDensityBoundary;
 
@@ -283,9 +281,7 @@ void ps_accumulateRigidDensity(uint3 groupThreadId : SV_GroupThreadID, uint3 gro
             // B9: the CUDA shadows the outer `i` here; spelled distinctly.
             for (uint c = startIndex; c < endIndex; ++c)
             {
-                const uint64_t rec =
-                    gRd.sortedContacts + uint64_t(c) * uint64_t(PXG_PRIMITIVE_CONTACT_STRIDE);
-                const float4 normalPen = (Ptr<float4>(rec))[0];
+                const float4 normalPen = (Ptr<float4>(gRd.sortedContactNormalPens))[c];
                 rho += bdW(bdMax(0.0f, normalPen.w + restDistance), spiky1,
                            particleContactDistanceInv);
             }

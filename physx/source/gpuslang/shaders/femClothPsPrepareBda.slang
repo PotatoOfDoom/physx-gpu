@@ -22,198 +22,121 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// femClothPsPrepareBda.slang
+// femClothPsPrepareBda.slang -- cloth_particleContactPrepareLaunch (FEMClothConstraintPrep.cu,
+// PhysX 5.12), the prepare of the cloth-vs-particle contact chain.  Launch: grid 1024,
+// block 256.
 //
-// P9.31 -- cloth_particleContactPrepareLaunch
-// gpusimulationcontroller/src/CUDA/FEMClothConstraintPrep.cu:283 (wrapper), :271
-// (computeTriangleContact), PxgFEMCore.h:184 (PxgFEMParticleConstraintBlock),
-// PxgSimulationCoreDesc.h:118/125/135/150/155 (the id encodings) -- all read in
-// full.  Launch: PxgFEMClothCore.cpp:380, grid 1024, block 256.
+// For every in-range contact it zeroes both applied-force streams (float2, before the
+// validity guard); for every valid pair {ref0 = PxgParticleRef (system, SORTED particle
+// index), ref1 = cloth TRIANGLE ref} it writes one PxgParticleDbContactBlock lane:
 //
-// The THIRD link of the cloth-vs-particle chain P9.30 opened: the midphase
-// finds pairs, the contact gen writes contacts, and this turns each contact
-// into a solver constraint.
+//   normal_pen       the NEGATED narrowphase normal and
+//                    pen = normal_pen.w + normal.(clothDelta - particleDelta) - restDistance,
+//                    the narrowphase raw distance re-referenced to the start-of-step
+//                    configuration, restDistance = particleSystem.mRestOffset +
+//                    cloth.mRestOffset (5.12: the narrowphase writes a raw distance, and the
+//                    deformable rest offset is no longer counted twice);
+//   barycentric      the contact's triangle barycentric (the solves read the triangle from it);
+//   maxPenBiasClamp  the pair max of the cloth's and the particle system's clamps.
 //
-// ---------------------------------------------------------------------------
-// TRAPS
-// ---------------------------------------------------------------------------
-// P1 -- THE WORK INDEX IS NOT A GRID STRIDE -- and the first version of this note
-//     said that made a grid stride WRONG.  It does not, and the correction
-//     belongs here because the claim was load-bearing.  The formula is
-//         workIndex = i * blockDim.x + threadIdx.x
-//                   + nbIterationsPerBlock * blockIdx.x * blockDim.x
-//     so each BLOCK owns a CONTIGUOUS range of nbIterationsPerBlock * 256
-//     indices.  A grid-stride loop visits the SAME set -- both cover [0, N)
-//     exactly once -- and gives the SAME lane, because every term other than
-//     threadIdx.x is a multiple of 256 and hence of 32, so `workIndex % 32 ==
-//     threadIdx.x % 32` under both.  The substitution is therefore
-//     OBSERVATION-EQUIVALENT, and the sweep says so by reporting that mutant as
-//     a survivor; what the upstream formula buys is memory locality, not
-//     correctness.
+// 5.12 dropped the velMultiplier slot and the PxgFEMContactWriter-era contact layout.
+// `contacts` is unread, as in the CUDA.  The cloth-particle narrowphase encodes every
+// contact as a triangle, so there is no vertex branch.
 //
-//     What IS observable is dropping the `nbIterationsPerBlock *` factor: the
-//     per-block ranges then OVERLAP and the tail is never visited at all.  That
-//     only shows up once nbIterationsPerBlock exceeds 1, i.e. past
-//     gridDim * blockDim = 262144 contacts, which is why the fixture carries a
-//     deliberately huge coverage run alongside its small exact one.
-//
-// P2 -- THE CONSTRAINT BLOCK IS WARP-BLOCKED.  `constraints[workIndex / 32]`
-//     indexed by `threadIdx.x & 31` -- a struct of three lane-arrays
-//     (float4[32], float4[32], float[32] = 1152 bytes), NOT an array of
-//     per-contact structs.  Note the two indices come from DIFFERENT things:
-//     the block from the work index, the lane from the thread id.  They agree
-//     only because the work index formula keeps a block's threads contiguous.
-//
-// P3 -- `contacts` IS READ AND DISCARDED.  The kernel loads contacts[workIndex]
-//     into `p` and every use of `p` is commented out upstream.  The load is
-//     kept -- it is in the argument pack and a port that drops the buffer would
-//     shift every pointer after it -- but nothing depends on the value.
-//
-// P4 -- THE NORMAL IS NEGATED AGAIN.  The contact gen stored -n; this reads
-//     normal_pen and negates once more, so the constraint holds +n relative to
-//     the original v = p - closestPt.
-//
-// P5 -- `pen` MIXES THREE TERMS: the stored penetration, the CURRENT relative
-//     delta projected on the normal, and the cloth's rest distance:
-//         pen = normal_pen.w + dot(normal, delta) - cloth.mRestDistance
-//     `delta` is the cloth's accumulated delta MINUS the particle's, in that
-//     order.
-//
-// P6 -- computeTriangleContact does FLOAT4 arithmetic: v0*b.x + v1*b.y + v2*b.z
-//     over the whole float4, so the .w that falls out is the barycentrically
-//     interpolated INVERSE MASS.  A port that interpolated only .xyz and then
-//     fetched a mass separately gets a different number.
-//
-// P7 -- the early exit is a `return` INSIDE the loop, not a `break`.  There is
-//     no code after the loop, so the two agree here -- but only here.
-//
-// P8 -- both applied-force arrays are zeroed for EVERY work index, before the
-//     early exit can skip anything, and they are float2 while the host passes
-//     float4-typed buffers.  The stride is 8 bytes, not 16.
-// ===========================================================================
+// The strided work index is clamped to tNumContacts - 1 after the per-lane guard (P9.23,
+// value-neutral).  In PXG_NOCONTRACT_SHADERS.
 
-import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
-import pxgSlangParticleDesc;   // PxgParticleSystemGpu
+import pxgSlangFEMClothDesc;                // PxgFEMClothGpu, clothAt
+import pxgSlangParticleDesc;                // PxgParticleSystemGpu
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PXG_PDBC_*, PxgGetParticle*
+import pxgSlangDeformableUtils;             // barycentricProjectTri
+import pxgSlangDeformableAndParticleUtils;  // dpDot3, dpSelectMax
 
-static const uint PSP_GRID = 1024u;
-static const uint PSP_BLOCK = 256u;
+static const uint CPP_GRID = 1024u;
+static const uint CPP_BLOCK = 256u;
 
-// PxgFEMParticleConstraintBlock (PxgFEMCore.h:184): three lane-arrays, 1152 B.
-static const uint PSP_CONSTRAINT_STRIDE = 1152u;
-static const uint PSP_OFF_NORMAL_PEN = 0u;      // float4[32]
-static const uint PSP_OFF_BARYCENTRIC = 512u;   // float4[32]
-static const uint PSP_OFF_VELMULT = 1024u;      // float[32]
-
-// PXG_BITSHIFT_ELEMENT_ID / PX_MAX_NB_DEFORMABLE_SURFACE_TRI.
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
-static const uint PXG_CLOTH_ELEM_MASK = 0x000fffffu;
-
-// ---------------------------------------------------------------------------
-// Push-constant blob -- BYTE-IDENTICAL to the CUDA pack
-// (PxgFEMClothCore.cpp:382): ten pointers -> 80 bytes.  ABI row {8 x 10}.
-// ---------------------------------------------------------------------------
+// (PxgFEMCloth* clothes, PxgParticleSystem* particlesystems, float4* contacts,
+//  float4* normalPens, float4* barycentrics, PxgDeformablePairInfo* contactInfos,
+//  PxU32* numContacts, PxgParticleDbContactBlock* contactBlocks,
+//  float2* clothAppliedForces, float2* particleAppliedForces) -> 80-byte blob.
 struct ClothPsPrepareParams
 {
     uint64_t clothes;                  // @0
-    uint64_t particleSystems;          // @8
-    uint64_t contacts;                 // @16  P3: read, never used
+    uint64_t particlesystems;          // @8
+    uint64_t contacts;                 // @16  (unread, as in CUDA)
     uint64_t normalPens;               // @24
     uint64_t barycentrics;             // @32
-    uint64_t contactInfos;             // @40  PxgFemOtherContactInfo* (16 B stride)
+    uint64_t contactInfos;             // @40
     uint64_t numContacts;              // @48
-    uint64_t constraints;              // @56  PxgFEMParticleConstraintBlock*
-    uint64_t softBodyAppliedForces;    // @64  float2* -- the CUDA's name (FEMClothConstraintPrep.cu:291): the cloth's own forces
-    uint64_t particleAppliedForces;    // @72  float2* -> 80
+    uint64_t contactBlocks;            // @56  output
+    uint64_t clothAppliedForces;       // @64  float2*, zeroed
+    uint64_t particleAppliedForces;    // @72  float2*, zeroed -> 80
 }
 
-[[vk::push_constant]] ConstantBuffer<ClothPsPrepareParams> gPp;
+[[vk::push_constant]] ConstantBuffer<ClothPsPrepareParams> gCp;
 
-// computeTriangleContact (FEMClothConstraintPrep.cu:271) -- P6: float4 through.
-float4 pspTriangleContact(uint64_t velsAddr, uint4 triVertId, float4 barycentric)
-{
-    Ptr<float4> vels = Ptr<float4>(velsAddr);
-    const float4 v0 = vels[triVertId.x];
-    const float4 v1 = vels[triVertId.y];
-    const float4 v2 = vels[triVertId.z];
-    return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
-}
-
-// ===========================================================================
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void cloth_particleContactPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    const uint tNumContacts = Ptr<uint>(gPp.numContacts)[0];
-
-    const uint nbBlocksRequired = (tNumContacts + PSP_BLOCK - 1u) / PSP_BLOCK;
-    const uint nbIterationsPerBlock = (nbBlocksRequired + PSP_GRID - 1u) / PSP_GRID;
+    const uint tNumContacts = Ptr<uint>(gCp.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + CPP_BLOCK - 1u) / CPP_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + CPP_GRID - 1u) / CPP_GRID;
 
     const uint idx = gtid.x;
     const uint threadIndexInWarp = gtid.x & 31u;
 
-    Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gPp.clothes);
-    Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gPp.particleSystems);
+    Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gCp.particlesystems);
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gCp.contactInfos);
 
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        // P1: a contiguous per-block range, NOT a grid stride.
-        const uint workIndex = i * PSP_BLOCK + idx + nbIterationsPerBlock * gid.x * PSP_BLOCK;
+        const uint rawWorkIndex = i * CPP_BLOCK + idx + nbIterationsPerBlock * gid.x * CPP_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
+            return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
 
-        if (workIndex >= tNumContacts)
-            return;                                          // P7
+        // Initialize the applied forces to zero.
+        Ptr<float2>(gCp.clothAppliedForces)[workIndex] = float2(0.0f, 0.0f);
+        Ptr<float2>(gCp.particleAppliedForces)[workIndex] = float2(0.0f, 0.0f);
 
-        // P8: float2, and zeroed before anything else happens.
-        Ptr<float2>(gPp.softBodyAppliedForces)[workIndex] = float2(0.0f, 0.0f);
-        Ptr<float2>(gPp.particleAppliedForces)[workIndex] = float2(0.0f, 0.0f);
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gCp.contactBlocks + uint64_t(workIndex / 32u) * PXG_PDBC_STRIDE;
 
-        // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8.
-        const uint64_t infoBase = gPp.contactInfos + uint64_t(workIndex) * 16UL;
-        const uint2 pairInd0 = Ptr<uint2>(infoBase + 0UL)[0];
-        const uint pairInd1 = Ptr<uint>(infoBase + 8UL)[0];
+        if (!PxgIsValidPairInfo(contactInfo))
+            continue;
 
-        // PxEncodeParticleIndex: (u64(systemId) << 32) | particleId.
-        const uint tParticleSystemId = pairInd0.y;
-        const uint tParticleIndex = pairInd0.x;
+        const uint64_t particleRef = contactInfo.ref0;
+        const uint tParticleSystemId = PxgGetParticleSystemId(particleRef);
+        const uint tParticleIndex = PxgGetParticleIndex(particleRef);
 
-        const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
-        const uint triangleInd = pairInd1 & PXG_CLOTH_ELEM_MASK;
+        // Second one is the cloth.
+        Ptr<PxgFEMClothGpu> cloth = clothAt(gCp.clothes, PxgGetDeformableId(contactInfo.ref1));
+        const uint triangleInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
-        const uint4 triVertInd = Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[triangleInd];
+        const uint4 triVertInd = Ptr<uint4>(cloth[0].mTriangleVertexIndices_ownedEdges)[triangleInd];
 
-        // P3: loaded because the CUDA loads it; every use of it is commented out.
-        const float4 contact = Ptr<float4>(gPp.contacts)[workIndex];
-        const float4 normal_pen = Ptr<float4>(gPp.normalPens)[workIndex];
-        const float4 barycentric = Ptr<float4>(gPp.barycentrics)[workIndex];
+        const float4 normal_pen = Ptr<float4>(gCp.normalPens)[workIndex];
+        const float4 barycentric = Ptr<float4>(gCp.barycentrics)[workIndex];
 
-        // P6: the whole float4, so .w is the interpolated inverse mass.
-        const float4 delta1 = pspTriangleContact(clothes[clothId].mAccumulatedDeltaPos,
-                                                 triVertInd, barycentric);
-        const float invMass1 = delta1.w;
+        // The narrowphase reports pen at the predicted position; re-reference it to the
+        // start-of-step configuration, the frame the solver's live relLinDelta is measured from.
+        const float4 delta1 = barycentricProjectTri(triVertInd, cloth[0].mAccumulatedDeltaPos, barycentric);
 
-        const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);   // P4
+        const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);
 
-        const float4 deltaP_invMass =
-            Ptr<float4>(particleSystems[tParticleSystemId].mSortedDeltaP)[tParticleIndex];
-        const float invMass0 = deltaP_invMass.w;
+        const float4 deltaP_invMass = Ptr<float4>(particleSystems[tParticleSystemId].mSortedDeltaP)[tParticleIndex];
 
-        // P5: cloth delta MINUS particle delta, in that order.
-        const float3 delta = float3(delta1.x - deltaP_invMass.x,
-                                    delta1.y - deltaP_invMass.y,
-                                    delta1.z - deltaP_invMass.z);
+        const float3 delta = float3(delta1.x - deltaP_invMass.x, delta1.y - deltaP_invMass.y, delta1.z - deltaP_invMass.z);
 
-        const float pen = normal_pen.w + dot(normal, delta) - clothes[clothId].mRestDistance;
+        // The rest distance as the SS/SC prepares compute it; the narrowphase writes a raw distance.
+        const float restDistance = particleSystems[tParticleSystemId].mData_RestOffset + cloth[0].mRestOffset;
+        const float pen = normal_pen.w + dpDot3(normal, delta) - restDistance;
 
-        const float unitResponse = invMass0 + invMass1;
-        const float velMultiplier = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-
-        // P2: block from the WORK index, lane from the THREAD id.
-        const uint64_t cBase = gPp.constraints +
-                               uint64_t(workIndex / 32u) * uint64_t(PSP_CONSTRAINT_STRIDE);
-        Ptr<float4>(cBase + uint64_t(PSP_OFF_NORMAL_PEN))[threadIndexInWarp] =
-            float4(normal.x, normal.y, normal.z, pen);
-        Ptr<float4>(cBase + uint64_t(PSP_OFF_BARYCENTRIC))[threadIndexInWarp] = barycentric;
-        Ptr<float>(cBase + uint64_t(PSP_OFF_VELMULT))[threadIndexInWarp] = velMultiplier;
+        Ptr<float4>(block + PXG_PDBC_normal_pen)[threadIndexInWarp] = float4(normal.x, normal.y, normal.z, pen);
+        Ptr<float4>(block + PXG_PDBC_barycentric)[threadIndexInWarp] = barycentric;
+        Ptr<float>(block + PXG_PDBC_maxPenBiasClamp)[threadIndexInWarp] =
+            dpSelectMax(cloth[0].mPenBiasClamp, particleSystems[tParticleSystemId].mData_PenBiasClamp);
     }
 }

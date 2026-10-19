@@ -81,7 +81,7 @@
 //     by direct field loads through Ptr<> (semantically identical read-fanout).
 //   - descriptor scalar writeback (mData.mBoundCenter, the per-block PxBounds3,
 //     the broadphase bound array) is done through a raw-byte-offset Ptr<float>
-//     (stride 656 for PxgParticleSystem, 24 for PxBounds3), matching the BDA
+//     (stride 608 for PxgParticleSystem, 24 for PxBounds3), matching the BDA
 //     nested-pointer walk.
 
 import pxgSlangParticleDesc;
@@ -108,7 +108,7 @@ static const float FWD_TGS = 0.5f;
 // PxsCachedTransform stride bytes (unused field for the first pass, present only
 // for ABI parity / documentation).
 // PxgParticleSystem array stride (sizeof) — pins the descriptor walk.
-static const uint64_t PS_STRIDE = 656ull;
+static const uint64_t PS_STRIDE = 608ull;   // 5.12 sizeof(PxgParticleSystem)
 // mData.mBoundCenter byte offset within PxgParticleSystem.
 static const uint64_t BOUNDCENTER_OFF = 248ull;
 // sizeof(PxBounds3) in floats.
@@ -149,6 +149,20 @@ uint3 calcWrappedGridRangeSize(int3 mn, int3 mx, uint3 gridSize)
     return uint3(uint(clamp(mx.x - mn.x + 1, 0, int(gridSize.x))),
                  uint(clamp(mx.y - mn.y + 1, 0, int(gridSize.y))),
                  uint(clamp(mx.z - mn.z + 1, 0, int(gridSize.z))));
+}
+
+// PxBounds3::isValid (PxBounds3.h): finite, and either non-empty on every axis or the
+// exact empty() sentinel (min = PX_MAX_BOUNDS_EXTENTS, max = -PX_MAX_BOUNDS_EXTENTS).
+static const float PS_MAX_BOUNDS_EXTENTS = 3.40282347e+38f * 0.25f;
+bool boundsIsValid(float3 mn, float3 mx)
+{
+    const bool finite = isfinite(mn.x) && isfinite(mn.y) && isfinite(mn.z) &&
+                        isfinite(mx.x) && isfinite(mx.y) && isfinite(mx.z);
+    const bool ordered = (mn.x <= mx.x) && (mn.y <= mx.y) && (mn.z <= mx.z);
+    const bool emptySentinel = (mn.x == PS_MAX_BOUNDS_EXTENTS) && (mn.y == PS_MAX_BOUNDS_EXTENTS) &&
+                               (mn.z == PS_MAX_BOUNDS_EXTENTS) && (mx.x == -PS_MAX_BOUNDS_EXTENTS) &&
+                               (mx.y == -PS_MAX_BOUNDS_EXTENTS) && (mx.z == -PS_MAX_BOUNDS_EXTENTS);
+    return finite && (ordered || emptySentinel);
 }
 
 // combine(): intersection box (component max of minima, min of maxima).
@@ -531,13 +545,17 @@ void ps_primitivesBoundFirstPassLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 
             float3 mn, mx;
             combineBounds(b0min, b0max, b1min, b1max, mn, mx);
-            mn -= float3(cDistance, cDistance, cDistance); // PxBounds3::fattenFast
-            mx += float3(cDistance, cDistance, cDistance);
+            // PhysX 5.12: a disjoint (or non-finite) overlap counts no cells.
+            if (boundsIsValid(mn, mx))
+            {
+                mn -= float3(cDistance, cDistance, cDistance); // PxBounds3::fattenFast
+                mx += float3(cDistance, cDistance, cDistance);
 
-            const int3 gridPosMin = calcGridPos(mn, cellWidth);
-            const int3 gridPosMax = calcGridPos(mx, cellWidth);
-            const uint3 rangeSize = calcWrappedGridRangeSize(gridPosMin, gridPosMax, wrappedGridSize);
-            cellNumCount = rangeSize.x * rangeSize.y * rangeSize.z;
+                const int3 gridPosMin = calcGridPos(mn, cellWidth);
+                const int3 gridPosMax = calcGridPos(mx, cellWidth);
+                const uint3 rangeSize = calcWrappedGridRangeSize(gridPosMin, gridPosMax, wrappedGridSize);
+                cellNumCount = rangeSize.x * rangeSize.y * rangeSize.z;
+            }
         }
 
         gsLane[tid] = cellNumCount;

@@ -51,9 +51,9 @@
 //                              twelve-contact cap binds and the overflow reaches the
 //                              writer, and a dynamic rigid so everything does.  Plus
 //                              the LoadShapePair swap, run both ways round.
-//   psMeshMidphaseFilter    -- the rigid filter and D2's sticky laneDone, which the
-//                              Phase-1 module does not have and the differential
-//                              therefore cannot see.
+//   psMeshMidphaseNoFilter  -- PhysX 5.12 removed the rigid filter (and D2's sticky
+//                              laneDone); a NULL sorted-to-unsorted map must change
+//                              nothing.
 //   psMeshMidphaseWorkIndex -- the work loop's index arithmetic at
 //                              nbIterationsPerWarps 1, 2 and 3.  At 1 the factor is
 //                              an identity and pins nothing: that is the hole P9.9's
@@ -66,7 +66,6 @@
 #include "PxgParticleSystem.h"     // PxgParticleSystem, PxgParticleSimBuffer, PxgParticleContactWriter
 #include "PxgContactManager.h"     // PxgContactManagerInput
 #include "PxgConvexConvexShape.h"  // PxgShape
-#include "PxFiltering.h"          // PxParticleRigidFilterPair (16 B, the particle path)
 #include "PxgNpKernelIndices.h"    // PS_MIDPHASE_COLLISION_WAPRS_PER_BLOCK
 #include "PxgParticleSystemCoreKernelIndices.h"
 #include "PxsTransformCache.h"     // PxsCachedTransform
@@ -117,8 +116,9 @@ static DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
     return b;
 }
 
-// The 136-byte engine ABI blob: {1,4,8,8,8,8,8,8,8,72}.  Each argument at its
-// natural alignment, the by-value writer inlined field by field at 64.
+// The 144-byte engine ABI blob: {1,4,8,8,8,8,8,8,8,80}.  Each argument at its
+// natural alignment, the by-value PxgRigidParticleContactWriter (PhysX 5.12, 80 B)
+// inlined field by field at 64.
 struct PsMeshMidBlob
 {
     uint32_t isTGS;                            // @0   CUDA bool + 3 pad bytes
@@ -130,21 +130,22 @@ struct PsMeshMidBlob
     uint64_t gpuShapes;                        // @40
     uint64_t particleSystems;                  // @48
     uint64_t shapeToRigidRemapTable;           // @56
-    uint64_t w_particleContacts;               // @64
-    uint64_t w_numTotalContacts;               // @72
-    uint64_t w_contactSortedByParticle;        // @80
-    uint64_t w_tempContactByParticle;          // @88
-    uint64_t w_contactIndexSortedByParticle;   // @96
-    uint64_t w_contactByRigid;                 // @104
-    uint64_t w_tempContactByRigid;             // @112
-    uint64_t w_contactIndexSortedByRigid;      // @120
-    uint32_t w_maxContacts;                    // @128
-    uint32_t _pad132;                          // @132 -> 136
+    uint64_t w_particleContactInfos;           // @64
+    uint64_t w_particleContactNormalPens;      // @72
+    uint64_t w_numTotalContacts;               // @80
+    uint64_t w_contactSortedByParticle;        // @88
+    uint64_t w_tempContactByParticle;          // @96
+    uint64_t w_contactIndexSortedByParticle;   // @104
+    uint64_t w_contactByRigid;                 // @112
+    uint64_t w_tempContactByRigid;             // @120
+    uint64_t w_contactIndexSortedByRigid;      // @128
+    uint32_t w_maxContacts;                    // @136
+    uint32_t _pad140;                          // @140 -> 144
 };
-static_assert(sizeof(PsMeshMidBlob) == 136, "{1,4,8,8,8,8,8,8,8,72} blob");
+static_assert(sizeof(PsMeshMidBlob) == 144, "{1,4,8,8,8,8,8,8,8,80} blob");
 static_assert(offsetof(PsMeshMidBlob, cmInputs) == 8, "cmInputs @8");
-static_assert(offsetof(PsMeshMidBlob, w_particleContacts) == 64, "the writer starts at 64");
-static_assert(offsetof(PsMeshMidBlob, w_maxContacts) == 128, "maxContacts @128");
+static_assert(offsetof(PsMeshMidBlob, w_particleContactInfos) == 64, "the writer starts at 64");
+static_assert(offsetof(PsMeshMidBlob, w_maxContacts) == 136, "maxContacts @136");
 
 struct PsMeshWorkBlob { uint64_t coverage; uint32_t numParticles; uint32_t pad; };
 static_assert(sizeof(PsMeshWorkBlob) == 16, "the coverage entry's push block");
@@ -470,7 +471,7 @@ struct BdaRig
     DevBuf bCur, bPred, bS2U, bRunsum, bSimBuf;
     DevBuf bInfos, bNodeIdx, bCounts;
     DevBuf bDiffInfos, bDiffNodeIdx, bDiffCounts, bNumDiffuse, bDiffCur, bDiffPred;
-    DevBuf bContacts, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
+    DevBuf bContacts /* PxgDeformablePairInfo */, bNormalPens, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
     PsMeshMidBlob blob{};
 
     template <typename T>
@@ -506,13 +507,10 @@ struct BdaOptions
     bool staticRigid = true;
     bool enableCcd = true;
     bool isTgs = true;
-    uint32_t nbFilterPairs = 0u;
-    // PxParticleRigidFilterPair, NOT PxgRigidFilterPair: the particle path's
-    // find() overload (deformableElementFilter.cuh:39) is over the 16-byte
-    // PxFiltering.h struct.  See the note in pxgSlangParticleContact.slang --
-    // this fixture used to mirror the 32-byte one and so agreed with a shader
-    // that read the wrong stride.
-    std::vector<PxParticleRigidFilterPair> filterPairs;
+    // PhysX 5.12: the particle-rigid filter is gone, and with it the kernel's only
+    // read of mSortedToUnsortedMapping.  When set, the descriptor carries a NULL map
+    // (psMeshMidphaseNoFilter): a stray read faults instead of passing.
+    bool nullSortedToUnsorted = false;
     // M1: when non-zero the descriptor gets a full diffuse side, so a gridDim.z of
     // 2 runs a real second pass instead of returning early.
     uint32_t maxDiffuse = 0u;
@@ -573,29 +571,19 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bCur = R.mk(dev, opt.solidCur ? *opt.solidCur : S.curPos);
     R.bPred = R.mk(dev, opt.solidPred ? *opt.solidPred : S.predPos);
 
-    // mSortedToUnsortedMapping: a real permutation-like map, distinct from identity
-    // so a filter query built from the wrong array is visible.
+    // mSortedToUnsortedMapping: a real permutation-like map, distinct from identity.
+    // The 5.12 kernel no longer reads it (see nullSortedToUnsorted).
     std::vector<uint32_t> s2u(S.nppad);
     for (uint32_t i = 0; i < S.nppad; ++i) s2u[i] = (i * 37u + 11u) % Scene::NP;
     R.bS2U = R.mk(dev, s2u);
 
-    // TWO particle buffers with a NON-ZERO runsum.  find() resolves the buffer by
-    // runsum and then queries with the LOCAL id (particleId - runsum[buffer]); with
-    // one buffer at runsum 0 that subtraction is an identity and a port that drops
-    // it cannot be caught -- which is how d2h survived the first sweep.  Every
-    // filter pair lives in buffer ONE.
+    // TWO particle buffers with a NON-ZERO runsum, as the engine builds them.  The
+    // 5.6.1 filter resolved a buffer through it; 5.12 has no filter and reads neither.
     std::vector<uint32_t> runsum = { 0u, FILTER_BUFFER_BASE };
     R.bRunsum = R.mk(dev, runsum);
 
-    DevBuf bPairs;
-    if (!opt.filterPairs.empty()) bPairs = R.mk(dev, opt.filterPairs);
     std::vector<PxgParticleSimBuffer> simBuffers(2);
     std::memset(simBuffers.data(), 0, simBuffers.size() * sizeof(PxgParticleSimBuffer));
-    simBuffers[0].mNumFilterPairs = 0u;
-    simBuffers[0].mFilterPairs = nullptr;
-    simBuffers[1].mNumFilterPairs = opt.nbFilterPairs;
-    simBuffers[1].mFilterPairs =
-        reinterpret_cast<PxParticleRigidFilterPair*>(size_t(bPairs.addr));
     R.bSimBuf = R.mk(dev, simBuffers);
 
     // The one-way outputs.  Poisoned everywhere, including the pad rows past the
@@ -619,7 +607,8 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     ps.mData.mFlags = opt.enableCcd ? PxU32(PxParticleFlag::eENABLE_SPECULATIVE_CCD) : 0u;
     ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(R.bCur.addr));
     ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(R.bPred.addr));
-    ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(R.bS2U.addr));
+    ps.mSortedToUnsortedMapping =
+        opt.nullSortedToUnsorted ? nullptr : reinterpret_cast<PxU32*>(size_t(R.bS2U.addr));
     ps.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(R.bRunsum.addr));
     ps.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(R.bSimBuf.addr));
     ps.mOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(R.bInfos.addr));
@@ -752,8 +741,12 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bRemap = R.mk(dev, remap);
 
     // ---- writer outputs ----
-    std::vector<PsC> contacts(Scene::CAP);
-    std::memset(contacts.data(), 0xAB, contacts.size() * sizeof(PsC));
+    // PhysX 5.12: the writer's two SoA streams (PxgDeformablePairInfo + float4
+    // normalPen), poisoned; downloadWriterContacts reassembles the PsC record.
+    std::vector<PxgDeformablePairInfo> contacts(Scene::CAP);
+    std::memset(contacts.data(), 0xAB, contacts.size() * sizeof(PxgDeformablePairInfo));
+    std::vector<F4> normalPens(Scene::CAP);
+    std::memset(normalPens.data(), 0xAB, normalPens.size() * sizeof(F4));
     std::vector<uint32_t> count = { 0u };
     std::vector<uint64_t> sortedByParticle(Scene::CAP, 0xABABABABABABABABull);
     std::vector<uint32_t> tempByParticle(Scene::CAP, POISON_U32);
@@ -762,6 +755,7 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     std::vector<uint32_t> tempByRigid(Scene::CAP, POISON_U32);
     std::vector<uint32_t> idxByRigid(Scene::CAP, POISON_U32);
     R.bContacts = R.mk(dev, contacts);
+    R.bNormalPens = R.mk(dev, normalPens);
     R.bCount = R.mk(dev, count);
     R.bSbP = R.mk(dev, sortedByParticle);
     R.bTbP = R.mk(dev, tempByParticle);
@@ -785,7 +779,8 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.blob.gpuShapes = R.bShapes.addr;
     R.blob.particleSystems = R.bDesc.addr;
     R.blob.shapeToRigidRemapTable = R.bRemap.addr;
-    R.blob.w_particleContacts = R.bContacts.addr;
+    R.blob.w_particleContactInfos = R.bContacts.addr;
+    R.blob.w_particleContactNormalPens = R.bNormalPens.addr;
     R.blob.w_numTotalContacts = R.bCount.addr;
     R.blob.w_contactSortedByParticle = R.bSbP.addr;
     R.blob.w_tempContactByParticle = R.bTbP.addr;
@@ -794,6 +789,28 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.blob.w_tempContactByRigid = R.bTbr.addr;
     R.blob.w_contactIndexSortedByRigid = R.bIbr.addr;
     R.blob.w_maxContacts = opt.maxContacts;
+}
+
+// The writer's contacts as the Phase-1 record: PhysX 5.12 writes ref0 = the rigid
+// PxNodeIndex and ref1 = PxgEncodeParticleRef(system, sortedIndex) plus a separate
+// normalPen.  psMeshMid.slang keeps 5.6.1's (system << 32 | index) record, so the
+// particle half is decoded into (pHi = system, pLo = index) and the records compare
+// field by field.  Poisoned slots stay poisoned in all four id words.
+static std::vector<PsC> downloadWriterContacts(PxgSlangComputeDevice* dev, const BdaRig& R)
+{
+    const auto infos = downloadBuffer<PxgDeformablePairInfo>(dev, R.bContacts.h, Scene::CAP);
+    const auto np = downloadBuffer<F4>(dev, R.bNormalPens.h, Scene::CAP);
+    std::vector<PsC> out(Scene::CAP);
+    for (uint32_t i = 0; i < Scene::CAP; ++i)
+    {
+        out[i].normal_pen = np[i];
+        out[i].rLo = uint32_t(infos[i].ref0);
+        out[i].rHi = uint32_t(infos[i].ref0 >> 32);
+        const bool poison = infos[i].ref1 == 0xABABABABABABABABull;
+        out[i].pLo = poison ? 0xABABABABu : PxgGetParticleIndex(infos[i].ref1);
+        out[i].pHi = poison ? 0xABABABABu : PxgGetParticleSystemId(infos[i].ref1);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -915,21 +932,22 @@ static bool sameContact(const PsC& a, const PsC& b)
 PXG_TEST(psMeshMidphaseLayout)
 {
     // The ABI blob.
-    static_assert(sizeof(PxgParticleContactWriter) == 72, "the by-value writer is 72 bytes");
-    PXG_CHECK_MSG(sizeof(PxgParticleContactWriter) == 72,
-                  "PxgParticleContactWriter must be 72 bytes (got %zu)",
-                  sizeof(PxgParticleContactWriter));
-    PXG_CHECK(offsetof(PxgParticleContactWriter, particleContacts) == 0);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, numTotalContacts) == 8);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, contactSortedByParticle) == 16);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, tempContactByParticle) == 24);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, contactIndexSortedByParticle) == 32);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, contactByRigid) == 40);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, tempContactByRigid) == 48);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, contactIndexSortedByRigid) == 56);
-    PXG_CHECK_MSG(offsetof(PxgParticleContactWriter, maxContacts) == 64,
-                  "maxContacts must sit at 64 inside the writer (got %zu)",
-                  offsetof(PxgParticleContactWriter, maxContacts));
+    static_assert(sizeof(PxgRigidParticleContactWriter) == 80, "the by-value writer is 80 bytes");
+    PXG_CHECK_MSG(sizeof(PxgRigidParticleContactWriter) == 80,
+                  "PxgRigidParticleContactWriter must be 80 bytes (got %zu)",
+                  sizeof(PxgRigidParticleContactWriter));
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, particleContactInfos) == 0);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, particleContactNormalPens) == 8);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, numTotalContacts) == 16);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, contactSortedByParticle) == 24);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, tempContactByParticle) == 32);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, contactIndexSortedByParticle) == 40);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, contactByRigid) == 48);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, tempContactByRigid) == 56);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, contactIndexSortedByRigid) == 64);
+    PXG_CHECK_MSG(offsetof(PxgRigidParticleContactWriter, maxContacts) == 72,
+                  "maxContacts must sit at 72 inside the writer (got %zu)",
+                  offsetof(PxgRigidParticleContactWriter, maxContacts));
 
     // The pair-loading surface.
     PXG_CHECK(sizeof(PxgContactManagerInput) == 16);
@@ -987,15 +1005,9 @@ PXG_TEST(psMeshMidphaseLayout)
     PXG_CHECK_MSG(PxU32(PxParticleFlag::eFULL_DIFFUSE_ADVECTION) == 4u,
                   "1<<2 is eFULL_DIFFUSE_ADVECTION, which is what makes 1<<2 a trap");
 
-    // The filter list the port walks.  16 bytes, two PxU64 -- the struct the
-    // particle overload of find() actually indexes.
-    PXG_CHECK_MSG(sizeof(PxParticleRigidFilterPair) == 16,
-                  "PxParticleRigidFilterPair stride (got %zu)",
-                  sizeof(PxParticleRigidFilterPair));
-    PXG_CHECK(offsetof(PxgParticleSimBuffer, mFilterPairs) == 40);
-    PXG_CHECK(offsetof(PxgParticleSimBuffer, mNumFilterPairs) == 64);
-    PXG_CHECK_MSG(sizeof(PxgParticleSimBuffer) == 88,
-                  "PxgParticleSimBuffer stride == 88 (got %zu)", sizeof(PxgParticleSimBuffer));
+    // PhysX 5.12: no filter list any more; the sim buffer is 48 bytes.
+    PXG_CHECK_MSG(sizeof(PxgParticleSimBuffer) == 48,
+                  "PxgParticleSimBuffer stride == 48 (got %zu)", sizeof(PxgParticleSimBuffer));
 
     // The descriptor fields the glue reads.
     PXG_CHECK(offsetof(PxgParticleSystem, mSortedOriginPos_InvMass) == 392);
@@ -1004,12 +1016,12 @@ PXG_TEST(psMeshMidphaseLayout)
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactInfos) == 200);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayNodeIndex) == 216);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactCount) == 232);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 608);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560);
-    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 488);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 552);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 568);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 576);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520);
+    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 448);
     PXG_CHECK(offsetof(PxgParticleSystem, mParticleSimBuffers) == 400);
     PXG_CHECK(offsetof(PxgParticleSystem, mParticleBufferRunsum) == 408);
     PXG_CHECK(offsetof(PxGpuParticleSystem, mCommonData) + offsetof(PxGpuParticleData, mNumParticles) == 116);
@@ -1150,7 +1162,7 @@ PXG_TEST(psMeshMidphase)
         PXG_CHECK_MSG(aWc2 <= Scene::CAP, "writer overflowed its capacity (%u)", aWc2);
 
         {
-            const auto aCt = downloadBuffer<PsC>(dev, A.bContacts.h, Scene::CAP);
+            const auto aCt = downloadWriterContacts(dev, A);
             const auto bCt = downloadBuffer<PsC>(dev, B.bW, Scene::CAP);
             const auto ga = groupByParticle(aCt, aWc2);
             const auto gb = groupByParticle(bCt, bWc2);
@@ -1206,7 +1218,7 @@ PXG_TEST(psMeshMidphase)
                       "dynamic rigid: only %u writer contacts for %zu contacting particles",
                       aWc, withContacts);
 
-        const auto aCt = downloadBuffer<PsC>(dev, A.bContacts.h, Scene::CAP);
+        const auto aCt = downloadWriterContacts(dev, A);
         const auto bCt = downloadBuffer<PsC>(dev, B.bW, Scene::CAP);
         const auto ga = groupByParticle(aCt, aWc);
         const auto gb = groupByParticle(bCt, bWc);
@@ -1248,7 +1260,7 @@ PXG_TEST(psMeshMidphase)
                 // particle-sorted key is the compressed particle index the
                 // contact record carries.
                 if (aIbr[i] != i) ++bad;
-                if (aSbP[i] != (uint64_t(aCt[i].pHi) << 32) + uint64_t(aCt[i].pLo)) ++bad;
+                if (aSbP[i] != PxgEncodeParticleRef(aCt[i].pHi, aCt[i].pLo)) ++bad;
             }
             PXG_CHECK_MSG(bad == 0, "%zu writer sibling-array entries are wrong", bad);
             // Past the live count everything must still be poison.
@@ -1604,11 +1616,14 @@ PXG_TEST(psMeshMidphaseDiffuse)
 }
 
 // ===========================================================================
-// The rigid filter and D2's sticky laneDone.  psMeshMid.slang does not have the
-// filter at all -- its header lists it as unported glue -- so the differential
-// cannot see this and it needs its own test.
+// PhysX 5.12: NO FILTER.  The 5.6.1 kernel looked every non-diffuse particle up in
+// its buffer's PxParticleRigidFilterPair list through mSortedToUnsortedMapping and
+// dropped filtered lanes for good (D2's sticky laneDone); that test lived here.  5.12
+// removed particle-rigid filtering with particle rigids (5.9), and with it the
+// kernel's only read of the map.  So the descriptor's map is NULL here: a port that
+// still reads it faults, and the outputs must equal the mapped run's bit for bit.
 // ===========================================================================
-PXG_TEST(psMeshMidphaseFilter)
+PXG_TEST(psMeshMidphaseNoFilter)
 {
     PxgSlangComputeDevice* dev = testDevice();
 
@@ -1616,245 +1631,54 @@ PXG_TEST(psMeshMidphaseFilter)
     buildScene(S);
     const uint32_t nbWarps = (Scene::NP + 31u) / 32u;
 
-    // Baseline: no filters at all.
-    BdaOptions base;
-    BdaRig A;
-    buildBda(dev, S, base, A);
+    for (int dyn = 0; dyn < 2; ++dyn)
     {
+        const char* lbl = dyn ? "dynamic" : "static";
+        BdaOptions mapped;
+        mapped.staticRigid = (dyn == 0);
+        BdaOptions nulled = mapped;
+        nulled.nullSortedToUnsorted = true;
+        BdaRig A, B;
+        buildBda(dev, S, mapped, A);
+        buildBda(dev, S, nulled, B);
         Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
         k.dispatch(nbWarps, {}, A.blob, 1u, 1u);
-    }
-    dev->flush();
-    const auto baseCnt = downloadBuffer<uint32_t>(dev, A.bCounts.h, S.nppad);
-    const auto baseInfos = downloadBuffer<F4>(dev, A.bInfos.h, size_t(S.nppad) * MAXPART);
-    A.destroy(dev);
+        k.dispatch(nbWarps, {}, B.blob, 1u, 1u);
+        dev->flush();
 
-    // Which particles the filter will name.  find() is keyed on the UNSORTED index
-    // (mSortedToUnsortedMapping[i]), not on i, so a port that queries with the
-    // sorted index filters the wrong particles.  The map here is not the identity
-    // precisely so those two sets differ.
-    std::vector<uint32_t> s2u(S.nppad);
-    for (uint32_t i = 0; i < S.nppad; ++i) s2u[i] = (i * 37u + 11u) % Scene::NP;
+        const auto aCnt = downloadBuffer<uint32_t>(dev, A.bCounts.h, S.nppad);
+        const auto bCnt = downloadBuffer<uint32_t>(dev, B.bCounts.h, S.nppad);
+        const auto aInfos = downloadBuffer<F4>(dev, A.bInfos.h, size_t(S.nppad) * MAXPART);
+        const auto bInfos = downloadBuffer<F4>(dev, B.bInfos.h, size_t(S.nppad) * MAXPART);
+        PXG_CHECK_MSG(aCnt == bCnt, "%s rigid: the one-way counts depend on mSortedToUnsortedMapping", lbl);
+        PXG_CHECK_MSG(std::memcmp(aInfos.data(), bInfos.data(), aInfos.size() * sizeof(F4)) == 0,
+                      "%s rigid: the one-way infos depend on mSortedToUnsortedMapping", lbl);
 
-    // Filter every third CONTACTING particle, so the filtered set is interesting
-    // rather than a suffix, and so filtered and unfiltered lanes share warps.
-    // Only particles whose UNSORTED index lands in buffer ONE can be filtered, and
-    // that is deliberate: the filter list lives in buffer 1 at runsum
-    // FILTER_BUFFER_BASE, so the query has to resolve the buffer AND subtract the
-    // runsum to find them.
-    std::vector<uint32_t> filteredSorted;
-    for (uint32_t i = 0; i < Scene::NP; ++i)
-        if (baseCnt[i] != 0u && (i % 3u) == 1u && s2u[i] >= FILTER_BUFFER_BASE)
-            filteredSorted.push_back(i);
-    PXG_CHECK_MSG(filteredSorted.size() >= 5,
-                  "only %zu particles to filter -- too few to say anything",
-                  filteredSorted.size());
-    // ... and at least one warp must keep BOTH kinds, or the sticky-flag divergence
-    // is never exercised.
-    {
-        std::vector<uint32_t> perWarpFiltered(nbWarps, 0), perWarpLive(nbWarps, 0);
-        for (uint32_t i = 0; i < Scene::NP; ++i)
-            if (baseCnt[i] != 0u) ++perWarpLive[i / 32u];
-        for (uint32_t i : filteredSorted) ++perWarpFiltered[i / 32u];
-        size_t mixed = 0;
-        for (uint32_t w = 0; w < nbWarps; ++w)
-            if (perWarpFiltered[w] > 0 && perWarpLive[w] > perWarpFiltered[w]) ++mixed;
-        PXG_CHECK_MSG(mixed >= 2,
-                      "only %zu warps mix filtered and unfiltered contacting lanes", mixed);
-    }
-
-    BdaOptions filt;
-    const PxNodeIndex staticNode(PX_INVALID_NODE, 0u);
-    auto isFilteredSorted = [](const std::vector<uint32_t>& v, uint32_t i) {
-        return std::find(v.begin(), v.end(), i) != v.end();
-    };
-    for (uint32_t i : filteredSorted)
-    {
-        PxParticleRigidFilterPair pr;
-        std::memset(&pr, 0, sizeof(pr));
-        pr.mID0 = staticNode.getInd();
-        // The LOCAL id inside buffer 1: the unsorted index minus that buffer's
-        // runsum.  A port that queries with the unsorted index itself finds nothing.
-        pr.mID1 = s2u[i] - FILTER_BUFFER_BASE;
-        filt.filterPairs.push_back(pr);
-    }
-    // DECOYS FOR TWO OTHER RIGIDS.  Without them the list carries exactly one
-    // mID0 value and every mID1 fits in 32 bits, and three distinct wrong
-    // comparators are indistinguishable from the right one (P9.12h's module
-    // sweep measured this: `f-eq-mid1-only`, `f-lt-mid1-only` and
-    // `f-u64lt-words-swapped` all survived).
-    //
-    //   * each decoy's mID1 is the local id of a particle that must be KEPT, so
-    //     a comparator that ignores mID0 filters it and the bit-identical
-    //     baseline comparison below fails;
-    //   * the two decoy node indices are chosen so the true 64-bit order and a
-    //     low-word-first order DISAGREE.  PxNodeIndex packs mID in the low word
-    //     and mLinkID in the high one, so
-    //         real  = 0x00000000'FFFFFFFF
-    //         decoy0= 0x00000001'FFFFFFF0
-    //         decoy1= 0x00000002'00000010
-    //     sorts real < decoy0 < decoy1 by value and decoy1 < decoy0 < real by
-    //     low word.  A binary search with the words swapped walks the wrong way
-    //     and stops finding the real entries.
-    {
-        std::vector<uint32_t> keptLocal;
-        for (uint32_t i = 0; i < Scene::NP && keptLocal.size() < 6; ++i)
-            if (baseCnt[i] != 0u && !isFilteredSorted(filteredSorted, i) &&
-                s2u[i] >= FILTER_BUFFER_BASE)
-                keptLocal.push_back(s2u[i] - FILTER_BUFFER_BASE);
-        PXG_CHECK_MSG(keptLocal.size() >= 4, "only %zu kept particles to decoy with",
-                      keptLocal.size());
-        const PxNodeIndex decoy0(0xFFFFFFF0u, 1u), decoy1(0x00000010u, 2u);
-        for (size_t k = 0; k < keptLocal.size(); ++k)
+        const uint32_t aWc = downloadBuffer<uint32_t>(dev, A.bCount.h, 1)[0];
+        const uint32_t bWc = downloadBuffer<uint32_t>(dev, B.bCount.h, 1)[0];
+        PXG_CHECK_MSG(aWc == bWc, "%s rigid: writer counters differ (%u vs %u)", lbl, aWc, bWc);
+        if (dyn)
         {
-            PxParticleRigidFilterPair pr;
-            std::memset(&pr, 0, sizeof(pr));
-            pr.mID0 = (k & 1u) ? decoy1.getInd() : decoy0.getInd();
-            pr.mID1 = keptLocal[k];
-            filt.filterPairs.push_back(pr);
-        }
-        PXG_CHECK_MSG(staticNode.getInd() < decoy0.getInd() &&
-                      decoy0.getInd() < decoy1.getInd(),
-                      "the decoy node indices must bracket the real one by VALUE");
-        PXG_CHECK_MSG(uint32_t(decoy1.getInd()) < uint32_t(decoy0.getInd()) &&
-                      uint32_t(decoy0.getInd()) < uint32_t(staticNode.getInd()),
-                      "...and reverse it by LOW WORD, or the swapped comparator is invisible");
-    }
-
-    // The binary search requires the list sorted by (mID0, mID1).
-    std::sort(filt.filterPairs.begin(), filt.filterPairs.end(),
-              [](const PxParticleRigidFilterPair& a, const PxParticleRigidFilterPair& b) {
-                  if (a.mID0 != b.mID0) return a.mID0 < b.mID0;
-                  return a.mID1 < b.mID1;
-              });
-    filt.nbFilterPairs = uint32_t(filt.filterPairs.size());
-
-    BdaRig Bf;
-    buildBda(dev, S, filt, Bf);
-    {
-        Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
-        k.dispatch(nbWarps, {}, Bf.blob, 1u, 1u);
-    }
-    dev->flush();
-    const auto fCnt = downloadBuffer<uint32_t>(dev, Bf.bCounts.h, S.nppad);
-    const auto fInfos = downloadBuffer<F4>(dev, Bf.bInfos.h, size_t(S.nppad) * MAXPART);
-
-    std::vector<uint8_t> isFiltered(S.nppad, 0);
-    for (uint32_t i : filteredSorted) isFiltered[i] = 1;
-
-    size_t wrongFiltered = 0, wrongKept = 0;
-    for (uint32_t p = 0; p < Scene::NP; ++p)
-    {
-        if (isFiltered[p])
-        {
-            if (fCnt[p] != 0u) ++wrongFiltered;
+            PXG_CHECK_MSG(aWc > 0u, "the dynamic rigid wrote no contacts, so the writer path is unprobed");
+            const auto ga = groupByParticle(downloadWriterContacts(dev, A), aWc);
+            const auto gb = groupByParticle(downloadWriterContacts(dev, B), bWc);
+            size_t mism = 0;
+            for (uint32_t p = 0; p <= Scene::NP; ++p)
+            {
+                if (ga[p].size() != gb[p].size()) { ++mism; continue; }
+                for (size_t i = 0; i < ga[p].size(); ++i)
+                    if (!sameContact(ga[p][i], gb[p][i])) { ++mism; break; }
+            }
+            PXG_CHECK_MSG(mism == 0, "%zu particles' writer contacts depend on mSortedToUnsortedMapping", mism);
         }
         else
         {
-            // Every unfiltered particle must be BIT-IDENTICAL to the baseline: the
-            // filtered lanes stay in the barriers and the ballots, so their
-            // neighbours' results cannot move.  That is the whole point of D2's
-            // sticky flag over a divergent return.
-            if (fCnt[p] != baseCnt[p]) { ++wrongKept; continue; }
-            for (uint32_t k = 0; k < std::min(fCnt[p], MAXPART); ++k)
-            {
-                const size_t oi = size_t(p) + size_t(k) * Scene::NP;
-                if (std::memcmp(&fInfos[oi], &baseInfos[oi], sizeof(F4)) != 0) { ++wrongKept; break; }
-            }
+            size_t touched = 0;
+            for (uint32_t p = 0; p < S.nppad; ++p) touched += aCnt[p] ? 1u : 0u;
+            PXG_CHECK_MSG(touched > 0u, "the static rigid wrote no one-way contacts, so the path is unprobed");
         }
-    }
-    PXG_CHECK_MSG(wrongFiltered == 0,
-                  "%zu filtered particles still produced contacts", wrongFiltered);
-    PXG_CHECK_MSG(wrongKept == 0,
-                  "%zu unfiltered particles changed when their warp-mates were filtered",
-                  wrongKept);
-
-    // And the filter must actually have removed something, or both checks above
-    // are satisfied by a kernel that ignores the list entirely.
-    size_t removed = 0;
-    for (uint32_t i : filteredSorted) if (baseCnt[i] != 0u) ++removed;
-    PXG_CHECK_MSG(removed >= 5, "the filter removed only %zu particles' contacts", removed);
-
-    // A ONE-ENTRY LIST NAMING A DIFFERENT RIGID.  The binary search probes index
-    // 0 and nothing else, so this is the only construction in which "the entry the
-    // search lands on carries the query's mID1 but another rigid's mID0" is
-    // guaranteed rather than hoped for -- and it is what a comparator that tests
-    // only mID1 needs to be seen at all (`f-eq-mid1-only` survived the decoys
-    // above because they all sort past the real block and are never probed).
-    // Nothing may be filtered: this list is about a rigid this pair is not.
-    {
-        uint32_t keptLocal = 0u; bool have = false;
-        for (uint32_t i = 0; i < Scene::NP && !have; ++i)
-            if (baseCnt[i] != 0u && !isFilteredSorted(filteredSorted, i) &&
-                s2u[i] >= FILTER_BUFFER_BASE)
-            { keptLocal = s2u[i] - FILTER_BUFFER_BASE; have = true; }
-        PXG_CHECK_MSG(have, "no kept particle in buffer 1 to build the one-entry list from");
-
-        BdaOptions one;
-        PxParticleRigidFilterPair pr;
-        std::memset(&pr, 0, sizeof(pr));
-        pr.mID0 = PxNodeIndex(0x00000010u, 2u).getInd();   // NOT this pair's rigid
-        pr.mID1 = keptLocal;
-        one.filterPairs.push_back(pr);
-        one.nbFilterPairs = 1u;
-
-        BdaRig O;
-        buildBda(dev, S, one, O);
-        {
-            Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
-            k.dispatch(nbWarps, {}, O.blob, 1u, 1u);
-        }
-        dev->flush();
-        const auto oc = downloadBuffer<uint32_t>(dev, O.bCounts.h, S.nppad);
-        const auto oi = downloadBuffer<F4>(dev, O.bInfos.h, size_t(S.nppad) * MAXPART);
-        PXG_CHECK_MSG(std::memcmp(oc.data(), baseCnt.data(), oc.size() * 4) == 0,
-                      "a filter list naming ANOTHER rigid changed the contact counts");
-        PXG_CHECK_MSG(std::memcmp(oi.data(), baseInfos.data(), oi.size() * sizeof(F4)) == 0,
-                      "a filter list naming ANOTHER rigid changed the one-way infos");
-        O.destroy(dev);
-    }
-
-    Bf.destroy(dev);
-
-    // The filter is guarded by `!isDiffuse` (particleSystemMeshMidphase.cu:717), so
-    // the DIFFUSE pass ignores the list entirely.  Run the same filter list with a
-    // real diffuse side aliased onto the solid particles and require the diffuse
-    // one-way output to match the UNFILTERED baseline, not the filtered one.
-    {
-        BdaOptions df = filt;
-        df.enableCcd = false;          // the diffuse projection scale is then irrelevant
-        df.maxDiffuse = Scene::NP;
-        df.numDiffuse = Scene::NP;     // aliased positions: the same particles, undiffused
-        BdaRig Dg, Bg;
-        BdaOptions bg;                 // the unfiltered, CCD-off solid baseline
-        bg.enableCcd = false;
-        buildBda(dev, S, df, Dg);
-        buildBda(dev, S, bg, Bg);
-        {
-            Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
-            k.dispatch(nbWarps, {}, Dg.blob, 1u, 2u);
-            k.dispatch(nbWarps, {}, Bg.blob, 1u, 1u);
-        }
-        dev->flush();
-        const auto dgc = downloadBuffer<uint32_t>(dev, Dg.bDiffCounts.h, S.nppad);
-        const auto bgc = downloadBuffer<uint32_t>(dev, Bg.bCounts.h, S.nppad);
-        const auto dgi = downloadBuffer<F4>(dev, Dg.bDiffInfos.h, size_t(S.nppad) * MAXPART);
-        const auto bgi = downloadBuffer<F4>(dev, Bg.bInfos.h, size_t(S.nppad) * MAXPART);
-        PXG_CHECK_MSG(std::memcmp(dgc.data(), bgc.data(), dgc.size() * 4) == 0,
-                      "the DIFFUSE pass honoured the rigid filter; the CUDA guards find() "
-                      "with !isDiffuseParticlesThread");
-        PXG_CHECK_MSG(std::memcmp(dgi.data(), bgi.data(), dgi.size() * sizeof(F4)) == 0,
-                      "the DIFFUSE pass's one-way infos differ from the unfiltered baseline");
-        // ...and the SOLID half of the very same dispatch must still be filtered,
-        // or "ignored the list" would be indistinguishable from "there was no list".
-        const auto dgs = downloadBuffer<uint32_t>(dev, Dg.bCounts.h, S.nppad);
-        size_t stillFiltered = 0;
-        for (uint32_t i : filteredSorted) if (dgs[i] == 0u) ++stillFiltered;
-        PXG_CHECK_MSG(stillFiltered == filteredSorted.size(),
-                      "only %zu of %zu particles are filtered on the SOLID half of the "
-                      "diffuse dispatch", stillFiltered, filteredSorted.size());
-        Dg.destroy(dev);
-        Bg.destroy(dev);
+        A.destroy(dev);
+        B.destroy(dev);
     }
 }
 

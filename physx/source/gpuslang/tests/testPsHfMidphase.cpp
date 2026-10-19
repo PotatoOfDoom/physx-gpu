@@ -124,7 +124,7 @@ static DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
     return b;
 }
 
-// The 136-byte engine ABI blob: {1,4,8,8,8,8,8,8,8,72}.  Byte for byte the same
+// The 144-byte engine ABI blob: {1,4,8,8,8,8,8,8,8,80} (PhysX 5.12 writer).  Byte for byte the same
 // shape as ps_meshCollisonLaunch's -- the two kernels have identical signatures.
 struct PsHfMidBlob
 {
@@ -137,20 +137,21 @@ struct PsHfMidBlob
     uint64_t gpuShapes;                        // @40
     uint64_t particleSystems;                  // @48
     uint64_t shapeToRigidRemapTable;           // @56
-    uint64_t w_particleContacts;               // @64
-    uint64_t w_numTotalContacts;               // @72
-    uint64_t w_contactSortedByParticle;        // @80
-    uint64_t w_tempContactByParticle;          // @88
-    uint64_t w_contactIndexSortedByParticle;   // @96
-    uint64_t w_contactByRigid;                 // @104
-    uint64_t w_tempContactByRigid;             // @112
-    uint64_t w_contactIndexSortedByRigid;      // @120
-    uint32_t w_maxContacts;                    // @128
-    uint32_t _pad132;                          // @132 -> 136
+    uint64_t w_particleContactInfos;           // @64  (PhysX 5.12 writer, 80 B)
+    uint64_t w_particleContactNormalPens;      // @72
+    uint64_t w_numTotalContacts;               // @80
+    uint64_t w_contactSortedByParticle;        // @88
+    uint64_t w_tempContactByParticle;          // @96
+    uint64_t w_contactIndexSortedByParticle;   // @104
+    uint64_t w_contactByRigid;                 // @112
+    uint64_t w_tempContactByRigid;             // @120
+    uint64_t w_contactIndexSortedByRigid;      // @128
+    uint32_t w_maxContacts;                    // @136
+    uint32_t _pad140;                          // @140 -> 144
 };
-static_assert(sizeof(PsHfMidBlob) == 136, "{1,4,8,8,8,8,8,8,8,72} blob");
-static_assert(offsetof(PsHfMidBlob, w_particleContacts) == 64, "the writer starts at 64");
-static_assert(offsetof(PsHfMidBlob, w_maxContacts) == 128, "maxContacts @128");
+static_assert(sizeof(PsHfMidBlob) == 144, "{1,4,8,8,8,8,8,8,8,80} blob");
+static_assert(offsetof(PsHfMidBlob, w_particleContactInfos) == 64, "the writer starts at 64");
+static_assert(offsetof(PsHfMidBlob, w_maxContacts) == 136, "maxContacts @136");
 
 static const uint32_t MAXMESH = 6u;    // PxgParticleContactInfo::MaxStaticContactsPerMesh
 static const uint32_t MAXPART = 12u;   // ...::MaxStaticContactsPerParticle
@@ -383,7 +384,7 @@ struct BdaRig
     DevBuf bBlob, bBlob2, bCin, bShapes, bTc, bCd, bRd, bRemap, bDesc;
     DevBuf bCur, bPred, bInfos, bNodeIdx, bCounts;
     DevBuf bDiffCur, bDiffPred, bDiffInfos, bDiffNodeIdx, bDiffCounts, bNumDiffuse;
-    DevBuf bContacts, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
+    DevBuf bContacts /* PxgDeformablePairInfo */, bNormalPens, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
     PsHfMidBlob blob{};
 
     template <typename T>
@@ -590,12 +591,17 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     }
     R.bRemap = R.mk(dev, remap);
 
-    std::vector<PsC> contacts(Scene::CAP);
-    std::memset(contacts.data(), 0xAB, contacts.size() * sizeof(PsC));
+    // PhysX 5.12: the writer's two SoA streams (PxgDeformablePairInfo + float4
+    // normalPen), poisoned; downloadWriterContacts reassembles the PsC record.
+    std::vector<PxgDeformablePairInfo> contacts(Scene::CAP);
+    std::memset(contacts.data(), 0xAB, contacts.size() * sizeof(PxgDeformablePairInfo));
+    std::vector<F4> normalPens(Scene::CAP);
+    std::memset(normalPens.data(), 0xAB, normalPens.size() * sizeof(F4));
     std::vector<uint32_t> count = { 0u };
     std::vector<uint64_t> u64Poison(Scene::CAP, 0xABABABABABABABABull);
     std::vector<uint32_t> u32Poison(Scene::CAP, POISON_U32);
     R.bContacts = R.mk(dev, contacts);
+    R.bNormalPens = R.mk(dev, normalPens);
     R.bCount = R.mk(dev, count);
     R.bSbP = R.mk(dev, u64Poison);
     R.bTbP = R.mk(dev, u32Poison);
@@ -615,7 +621,8 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.blob.gpuShapes = R.bShapes.addr;
     R.blob.particleSystems = R.bDesc.addr;
     R.blob.shapeToRigidRemapTable = R.bRemap.addr;
-    R.blob.w_particleContacts = R.bContacts.addr;
+    R.blob.w_particleContactInfos = R.bContacts.addr;
+    R.blob.w_particleContactNormalPens = R.bNormalPens.addr;
     R.blob.w_numTotalContacts = R.bCount.addr;
     R.blob.w_contactSortedByParticle = R.bSbP.addr;
     R.blob.w_tempContactByParticle = R.bTbP.addr;
@@ -624,6 +631,27 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.blob.w_tempContactByRigid = R.bTbr.addr;
     R.blob.w_contactIndexSortedByRigid = R.bIbr.addr;
     R.blob.w_maxContacts = opt.maxContacts;
+}
+
+// The writer's contacts as the 5.6.1-shaped PsC record: PhysX 5.12 writes ref0 = the
+// rigid PxNodeIndex and ref1 = PxgEncodeParticleRef(system, sortedIndex) plus a separate
+// normalPen.  The reference keeps (system << 32 | index), so the particle half is
+// decoded into (pHi = system, pLo = index).  Poisoned slots stay poisoned.
+static std::vector<PsC> downloadWriterContacts(PxgSlangComputeDevice* dev, const BdaRig& R)
+{
+    const auto infos = downloadBuffer<PxgDeformablePairInfo>(dev, R.bContacts.h, Scene::CAP);
+    const auto np = downloadBuffer<F4>(dev, R.bNormalPens.h, Scene::CAP);
+    std::vector<PsC> out(Scene::CAP);
+    for (uint32_t i = 0; i < Scene::CAP; ++i)
+    {
+        out[i].normal_pen = np[i];
+        out[i].rLo = uint32_t(infos[i].ref0);
+        out[i].rHi = uint32_t(infos[i].ref0 >> 32);
+        const bool poison = infos[i].ref1 == 0xABABABABABABABABull;
+        out[i].pLo = poison ? 0xABABABABu : PxgGetParticleIndex(infos[i].ref1);
+        out[i].pHi = poison ? 0xABABABABu : PxgGetParticleSystemId(infos[i].ref1);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -730,12 +758,13 @@ PXG_TEST(psHfMidphaseLayout)
 {
     // The ABI blob -- identical in shape to the mesh twin's, which is itself the
     // claim being pinned: the two kernels take the same ten arguments.
-    PXG_CHECK_MSG(sizeof(PxgParticleContactWriter) == 72,
-                  "PxgParticleContactWriter must be 72 bytes (got %zu)",
-                  sizeof(PxgParticleContactWriter));
-    PXG_CHECK(offsetof(PxgParticleContactWriter, particleContacts) == 0);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, numTotalContacts) == 8);
-    PXG_CHECK(offsetof(PxgParticleContactWriter, maxContacts) == 64);
+    PXG_CHECK_MSG(sizeof(PxgRigidParticleContactWriter) == 80,
+                  "PxgRigidParticleContactWriter must be 80 bytes (got %zu)",
+                  sizeof(PxgRigidParticleContactWriter));
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, particleContactInfos) == 0);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, particleContactNormalPens) == 8);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, numTotalContacts) == 16);
+    PXG_CHECK(offsetof(PxgRigidParticleContactWriter, maxContacts) == 72);
 
     PXG_CHECK(sizeof(PxgContactManagerInput) == 16);
     PXG_CHECK(offsetof(PxgContactManagerInput, shapeRef0) == 0);
@@ -829,12 +858,12 @@ PXG_TEST(psHfMidphaseLayout)
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactInfos) == 200);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayNodeIndex) == 216);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactCount) == 232);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 608);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552);
-    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560);
-    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 488);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 552);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayNodeIndex) == 568);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 576);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512);
+    PXG_CHECK(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520);
+    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 448);
     PXG_CHECK(offsetof(PxGpuParticleSystem, mCommonData) + offsetof(PxGpuParticleData, mNumParticles) == 116);
     PXG_CHECK(offsetof(PxGpuParticleSystem, mCommonData) + offsetof(PxGpuParticleData, mMaxDiffuseParticles) == 128);
     PXG_CHECK(offsetof(PxgParticleSystem, mData) + offsetof(PxgParticleSystemData, mFlags) == 312);
@@ -934,7 +963,7 @@ PXG_TEST(psHfMidphase)
         const uint32_t bW = downloadBuffer<uint32_t>(dev, B.bWc, 1)[0];
         PXG_CHECK_MSG(aW == bW, "%s: writer counters differ (%u vs %u)", v.name, aW, bW);
 
-        const auto aCt = downloadBuffer<PsC>(dev, A.bContacts.h, Scene::CAP);
+        const auto aCt = downloadWriterContacts(dev, A);
         const bool capBinds = v.opt.maxContacts < Scene::CAP;
         if (!capBinds)
         {
@@ -974,7 +1003,7 @@ PXG_TEST(psHfMidphase)
                     if (aTbP[i] != aCt[i].pLo) ++bad;
                     if (aTbR[i] != uint32_t(rid.getInd() & 0xFFFFFFFFull)) ++bad;
                     if (aBr[i] != rid.getInd()) ++bad;
-                    if (aSbP[i] != (uint64_t(aCt[i].pHi) << 32 | uint64_t(aCt[i].pLo))) ++bad;
+                    if (aSbP[i] != PxgEncodeParticleRef(aCt[i].pHi, aCt[i].pLo)) ++bad;
                 }
                 PXG_CHECK_MSG(bad == 0,
                               "%s: %zu writer sibling-array entries disagree with their own "
@@ -1623,7 +1652,7 @@ PXG_TEST(psHfMidphaseBoundLiteral)
             const uint32_t bW = downloadBuffer<uint32_t>(dev, B.bWc, 1)[0];
             PXG_CHECK_MSG(aW == bW, "%s %s: writer counters differ (%u vs %u)", pose.name, mode, aW, bW);
             {
-                const auto aCt = downloadBuffer<PsC>(dev, A.bContacts.h, Scene::CAP);
+                const auto aCt = downloadWriterContacts(dev, A);
                 const auto bCt = downloadBuffer<PsC>(dev, B.bW, Scene::CAP);
                 const auto ga = groupByParticle(aCt, std::min(aW, Scene::CAP));
                 const auto gb = groupByParticle(bCt, std::min(bW, Scene::CAP));

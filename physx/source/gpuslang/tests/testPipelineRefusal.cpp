@@ -718,8 +718,9 @@ PXG_TEST(pipelineRefusal_reflect)
         { "npSdfFind.spv", "sdfFindTetRounds", 176, 8324 },
         { "npSdfCollision.spv", "sdfCollVertex", 64, 0 },   // testSdfParticle pushed 48 until P9.98, 64 since
         // F2: the engine rows push 104 and 16.
-        { "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 176, 0 },
-        { "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", 176, 0 },
+        // 5.12: the module's block grew to 192 (PxgRigidParticleContactWriter is 80 B @112; 5.6.1: 176).
+        { "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 192, 0 },
+        { "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", 192, 0 },
         { "psDiffuseBuffers.spv", "ps_updateUnsortedDiffuseArrayLaunch", 24, 4096 },
         // F3: per ENTRY, not the module's 40448 the layer reports for every entry.
         { "solverTGS.spv", "solveWholeIslandTGS", 32, 30720 },   // 5.12: the 1024 B residual-reduction scratch went with residual reporting (5.6.1: 31744)
@@ -1062,7 +1063,7 @@ PXG_TEST(pipelineRefusal_deviceLimits)
     PXG_CHECK_MSG(build(devB, "solverTGS.spv", "solveWholeIslandTGS", 32) == 0,
                   "30720 B of groupshared must be refused under the environment's 20000 B");
     const PxgPipelineHandle diffuse = build(devB, "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 104);
-    PXG_CHECK_MSG(diffuse != 0, "a 176 B push block and a 256 x 1 x 1 workgroup fit this device");
+    PXG_CHECK_MSG(diffuse != 0, "a 192 B push block and a 256 x 1 x 1 workgroup fit this device");
     if (diffuse)
         devB->destroyPipeline(diffuse);
     delete devB;
@@ -1291,8 +1292,8 @@ PXG_TEST(pipelineRefusal_pushPadding)
         uint32_t caller, range;
     };
     const Case cases[] = {
-        { "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 104, 176 },
-        { "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", 104, 176 },
+        { "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 104, 192 },   // 5.12 block (5.6.1: 176)
+        { "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", 104, 192 },
         { "psDiffuseBuffers.spv", "ps_updateUnsortedDiffuseArrayLaunch", 16, 24 },
         { "solverTGS.spv", "writeBackBodiesTGS", 24, 24 },     // exact: unchanged
         { "solverTGS.spv", "writeBackBodiesTGS", 40, 40 },     // a caller over the block keeps its size

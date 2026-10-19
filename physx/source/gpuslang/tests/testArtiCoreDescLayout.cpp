@@ -42,9 +42,8 @@
 // pins -- PxgArticulation::{internal,contact}ResidualAccumulator and
 // sizeof(Dy::ErrorAccumulator) -- went with the kernel.)
 //
-// The values below are still the 5.6.1 ones; this file is on
-// PXG_TESTS_PENDING_512 (articulation) until the area is ported, and porting it
-// means re-deriving them from the 5.12 header with offsetof.
+// The values below are the PhysX 5.12 ones, re-derived from the 5.12 header with
+// offsetof when the articulation area was ported.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"

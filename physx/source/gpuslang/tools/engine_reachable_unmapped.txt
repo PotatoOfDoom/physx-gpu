@@ -31,6 +31,11 @@
 # rediscovered.
 #
 # ---------------------------------------------------------------------------
+# (The 98 / 29 / 403 / 461 figures above are P9.65's, against the PhysX 5.6.1
+# registry of 501.  Under 5.12 the registry holds 487 and 414 are mapped; the 73
+# unmapped rows split 12 ORPHAN / 58 STANDALONE / 3 ENGINE, and the 3 are the
+# entries left below, each with the reason it is not work.)
+#
 # THE 29, GROUPED BY LAUNCHING SUBSYSTEM
 # ---------------------------------------------------------------------------
 # PxgNarrowphaseCore.cpp (12) -- the largest coherent group and the most observable:
@@ -77,23 +82,23 @@
 #
 #   *** A DISPATCH CASE FOR A BUCKET ID NO CLASSIFIER EVER PRODUCES. ***
 #
-# The kernel exists, its launcher exists, and PxgNphaseImplementationContext.cpp:225
+# The kernel exists, its launcher exists, and PxgNphaseImplementationContext.cpp:206
 # has a `case GPU_BUCKET_ID::eTriangleHeightfield:` that calls it.  Nothing reaches
-# that case.  gTable[eTRIANGLEMESH][eHEIGHTFIELD] is cndCaseMeshHeightfield (:1319-
-# 1329), which returns eFemClothHeightfield when side 0 is cloth and eFallback
+# that case.  gTable[eTRIANGLEMESH][eHEIGHTFIELD] is cndCaseMeshHeightfield (:1316-
+# 1326), which returns eFemClothHeightfield when side 0 is cloth and eFallback
 # otherwise -- so a RIGID mesh against a heightfield goes to the CPU fallback, and
 # the CPU table's slot for that pair is PxcInvalidContactPair.  Repo-wide the token
-# eTriangleHeightfield appears in exactly three places: the enum (PxgNarrowphaseCore.h
-# :117), that dispatch case, and one count variable (:609).  Never as a result.
+# eTriangleHeightfield appears in exactly three places: the enum (PxgBucket.h:36 in
+# 5.12), that dispatch case, and one count variable (:590).  Never as a result.
 #
 # THE SECOND PIECE OF EVIDENCE, and the one that makes this more than a naming
 # argument: its HOST LAUNCH PACK DOES NOT MATCH ITS OWN KERNEL.  The kernel declares
 # (toleranceLength, cmInputs, cmOutputs, shapes, transformCache, contactDistance, ...)
-# at trimeshCollision.cu:437-456; the pack at PxgNarrowphaseCore.cpp:1326-1344 passes
+# at trimeshCollision.cu:415-434; the pack at PxgNarrowphaseCore.cpp:1563-1584 passes
 # (numTests, cmInputs, transformCache, contactDistance, gpuShapes, cmOutputs, ...).
 # Slots 2..5 are a FOUR-WAY PERMUTATION of pointers.  Every one is 8 bytes, so the
 # launch would not fault -- it would read the contact-manager outputs as a transform
-# cache.  Its PLANE sibling, thirty lines earlier at :1236-1250, passes exactly the
+# cache.  Its PLANE sibling, earlier in the file at :1475-1497, passes exactly the
 # order its kernel declares, which is what identifies the heightfield pack as a
 # mis-edited copy of it rather than a different convention.  It has never fired
 # because the bucket is never populated.  Documented as an upstream bug candidate;
@@ -127,7 +132,7 @@ trimeshHeightfieldNarrowphase
 # 600 unmapped launches over 120 steps, the twin voxel's private face bit-unmoved at 0.80000.
 # sb_plasticDeformLaunch / sb_plasticDeformLaunch2 -- P9.79's liveness audit found
 # that PxgSoftBodyCore::plasticDeformation() has EXACTLY ONE call site in the tree
-# and it is COMMENTED OUT (PxgSoftBodyCore.cpp:986, `//plasticDeformation();`).
+# and it is COMMENTED OUT (PxgSoftBodyCore.cpp:960 in 5.12, `//plasticDeformation();`).
 # They stay on this ratchet because the checker's ENGINE test is "a .cpp outside
 # gpuslang names the PxgKernelIds enum", which is true -- but porting them would
 # move the manifest and move what the port can DO by nothing, and no scene could

@@ -29,7 +29,7 @@
 //   (1) particleSelfCollisionDescLayout — offsetof proof pinning every
 //       pxgSlangParticleDesc mirror field the four kernels dereference against
 //       the real engine PxgParticleSystem (the 3-way P6.0 validation: the
-//       656-byte stride == SPIR-V ArrayStride, these offsetof checks, the device
+//       608-byte (5.12) stride == SPIR-V ArrayStride, these offsetof checks, the device
 //       round-trips in the kernel tests below).  Every field was already present
 //       from P6.0/P6.2, so no mirror extension was required for P6.3.
 //   (2) particleSelfCollisionNeighborSearch — ps_selfCollisionLaunch.  A valid
@@ -40,8 +40,11 @@
 //       collideCell.
 //   (3) particleSelfCollisionSolveOneWay — ps_solveOneWayContactDeltaVLaunch.  A
 //       penetrating one-way (static) contact must resolve to a SEPARATING
-//       accumDeltaP, bit-exact against a CPU transcription of
-//       solvePCOutputDeltaVTGS.
+//       accumDeltaP, bit-exact against a host transcription of the PhysX 5.12
+//       kernel (solveRigidDbContact with adhesion against a nodeless static rigid,
+//       pxgParticleSolveRef.h).  particleSelfCollisionSolveOneWay_512 adds many
+//       contacts per particle (and the clamp to 12), friction, adhesion, applied
+//       forces from earlier iterations, the mPenBiasClamp and velocity iterations.
 //   (4) particleSelfCollisionApplyDelta — ps_applyDeltaLaunch in isolation.
 //   (5) particleSelfCollisionUpdateParticle — ps_updateParticleLaunch in
 //       isolation (position adjust + sorted-velocity recompute).
@@ -68,6 +71,8 @@
 // PxgParticleSystem.h so its device-qualified ctors parse.
 #include "host_defines.h"
 #include "PxgParticleSystem.h"   // real engine per-system descriptor
+
+#include "pxgParticleSolveRef.h"
 
 #include <cmath>
 #include <cstddef>
@@ -112,45 +117,77 @@ static PxgParticleSystem makeZeroDesc()
 static const uint32_t PHASE_SELF_COLLIDE = 0x00100000u; // 1<<20
 
 // ---------------------------------------------------------------------------
-// CPU transcription of solvePCOutputDeltaVTGS (particlesystem.cu:1473) for the
-// no-adhesion, no-friction path exercised here (mat.friction ==
-// mat.adhesion == mat.adhesionRadiusScale == 0 -> deltaFr terms vanish).
+// Host transcription of ps_solveOneWayContactDeltaVLaunch (particlesystem.cu, PhysX
+// 5.12) for one particle: its contacts sit column-major (offset += numParticles), the
+// count is clamped to MaxStaticContactsPerParticle, each one goes through
+// solveRigidDbContact<PxVec3, withAdhesion> against a nodeless static rigid, and the
+// live-contact-averaged delta is what the kernel adds to mAccumDeltaP.xyz.  `forces`
+// (the column of mOneWayForces) is updated in place.
 // ---------------------------------------------------------------------------
-static float cpuSolveDeltaF(const float normal[3], float error, const float dp[3],
-                            float velMultiplier, float dt, bool isVelIter, float appliedForceX)
+struct OneWayMaterial { float friction, adhesion, adhesionRadiusScale; };
+
+static void cpuSolveOneWay512(const F4* contacts, F2* forces, uint32_t count, uint32_t idx, uint32_t numParticles,
+                              F4 dp, F4 vel, OneWayMaterial mat, float restOffset, float penBiasClamp, float dt,
+                              bool isVelIter, float out[3])
 {
-    const float projectionDt = isVelIter ? 0.0f : dt;
-    const float dotND = normal[0] * dp[0] + normal[1] * dp[1] + normal[2] * dp[2];
-    const float separation = (error - dotND + 0.0f) + 0.0f * projectionDt;
-    const float clamp = -appliedForceX;
-    const float deltaF = std::fmax(clamp, -separation * velMultiplier);
-    return deltaF;
+    namespace R = pxgpsref;
+    const uint32_t contactCount = count < PxgParticleContactInfo::MaxStaticContactsPerParticle
+                                ? count : PxgParticleContactInfo::MaxStaticContactsPerParticle;
+    R::V3 thisDeltaP = R::v3(0.f, 0.f, 0.f);
+    if (contactCount == 0u)
+    {
+        out[0] = out[1] = out[2] = 0.f;
+        return;
+    }
+    const R::V3 posDelta = R::v3(dp.x, dp.y, dp.z);
+    const R::V3 relParticleDelta = isVelIter ? R::mul(R::v3(vel.x, vel.y, vel.z), dt) : posDelta;
+    float denom = 0.0f;
+    const float invMass = dp.w;
+    for (uint32_t c = 0, offset = idx; c < contactCount; ++c, offset += numParticles)
+    {
+        const F4 normalPenW = contacts[offset];
+        F2 af = forces[offset];
+        const R::V3 normal = R::v3(-normalPenW.x, -normalPenW.y, -normalPenW.z);
+        R::V3 t0, t1;
+        R::computeBasisVectors(normal, t0, t1);
+        R::RigidPart rigid;
+        rigid.readNodelessStatic();
+        R::DeformablePart particle;
+        particle.linDelta = relParticleDelta;
+        particle.posDelta = posDelta;
+        particle.vertexInvMasses = R::v3(invMass, 0.f, 0.f);
+        particle.bc = R::v3(1.f, 0.f, 0.f);
+        particle.friction = mat.friction;
+        particle.adhesion = mat.adhesion;
+        particle.adhesionRadius = restOffset * (mat.adhesionRadiusScale - 1.0f);
+        R::ContactPair cp;
+        cp.normal = normal;
+        cp.tangent0 = t0;
+        cp.initPen = normalPenW.w;
+        cp.maxPenBiasClamp = penBiasClamp;
+        R::SolveOut so;
+        R::solveRigidDbContact(rigid, particle, cp, so, af.x, af.y, dt, true, false, isVelIter, true);
+        af.x = so.accumulatedDeltaLambdaN;
+        af.y += so.deltaLambdaT;
+        R::V3 delta;
+        so.computeDelta(cp, delta, dt);
+        const float scale = (so.deltaLambdaN != 0.f || so.deltaLambdaT != 0.f) ? 1.f : 0.f;
+        thisDeltaP = R::add(thisDeltaP, R::mul(delta, invMass));
+        denom += scale;
+        forces[offset] = af;
+    }
+    if (denom != 0.0f)
+        thisDeltaP = R::mul(thisDeltaP, 1.f / denom);
+    out[0] = thisDeltaP.x; out[1] = thisDeltaP.y; out[2] = thisDeltaP.z;
 }
 
-// Full CPU transcription of the ps_solveOneWayContactDeltaVLaunch inner body for
-// one particle with one contact (friction/adhesion zeroed), returning the
-// accumDeltaP increment.
-static void cpuSolveOneWay(const float normalPen[4], const float dp4[4], float bias,
-                           float dt, bool isVelIter, float out[3])
+// One contact, zero material (makeMaterialBufs), position iteration.
+static void cpuSolveOneWay(const float normalPen[4], const float dp4[4], float penBiasClamp, float dt, float out[3])
 {
-    const float invMass = dp4[3];
-    const float velMultiplier = 1.0f / invMass;
-    const float normal[3] = { -normalPen[0], -normalPen[1], -normalPen[2] };
-    const float dp[3] = { dp4[0], dp4[1], dp4[2] };
-    const float deltaF = cpuSolveDeltaF(normal, normalPen[3], dp, velMultiplier, dt, isVelIter, 0.0f);
-    // friction terms are 0 (frictionCoefficient == 0), so deltaLinVel is purely
-    // the normal push: -(normal*deltaF) * invMass * bias.
-    float deltaLin[3] = { -(normal[0] * deltaF), -(normal[1] * deltaF), -(normal[2] * deltaF) };
-    const float scale = (deltaF != 0.0f) ? 1.0f : 0.0f;
-    float thisDeltaP[3] = { deltaLin[0] * invMass * bias, deltaLin[1] * invMass * bias,
-                            deltaLin[2] * invMass * bias };
-    const float denom = scale;
-    if (denom != 0.0f)
-    {
-        const float inv = 1.0f / denom;
-        thisDeltaP[0] *= inv; thisDeltaP[1] *= inv; thisDeltaP[2] *= inv;
-    }
-    out[0] = thisDeltaP[0]; out[1] = thisDeltaP[1]; out[2] = thisDeltaP[2];
+    const F4 c = { normalPen[0], normalPen[1], normalPen[2], normalPen[3] };
+    F2 f = { 0.0f, 0.0f };
+    cpuSolveOneWay512(&c, &f, 1u, 0u, 1u, F4{ dp4[0], dp4[1], dp4[2], dp4[3] }, F4{ 0.f, 0.f, 0.f, 0.f },
+                      OneWayMaterial{ 0.f, 0.f, 0.f }, 0.05f, penBiasClamp, dt, false, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +195,7 @@ static void cpuSolveOneWay(const float normalPen[4], const float dp4[4], float b
 // ---------------------------------------------------------------------------
 PXG_TEST(particleSelfCollisionDescLayout)
 {
-    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem sizeof == 656 (got %zu)",
+    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem sizeof == 608 (got %zu)",
                   sizeof(PxgParticleSystem));
 
     // ps_selfCollisionLaunch fields
@@ -181,8 +218,8 @@ PXG_TEST(particleSelfCollisionDescLayout)
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactInfos) == 200);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayForces) == 208);
     PXG_CHECK(offsetof(PxgParticleSystem, mOneWayContactCount) == 232);
-    PXG_CHECK(offsetof(PxgParticleSystem, mParticleMaterialStride) == 632);
-    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 640);
+    PXG_CHECK(offsetof(PxgParticleSystem, mParticleMaterialStride) == 592);
+    PXG_CHECK(offsetof(PxgParticleSystem, mPhaseGroupToMaterialHandle) == 600);
     PXG_CHECK(offsetof(PxgParticleSystem, mData) == 248);
     PXG_CHECK(offsetof(PxgParticleSystemData, mRestOffset) == 20);        // -> struct off 268
     PXG_CHECK(offsetof(PxgParticleSystemData, mSolidRestOffset) == 24);   // -> struct off 272
@@ -666,7 +703,7 @@ PXG_TEST(particleSelfCollisionSolveOneWay)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t N = 1;
     const float dt = 1.0f / 60.0f;
-    const float bias = 1.0f;
+    const float penBiasClamp = -1.0e30f;   // -maxDepenetrationVelocity, unbounded
     const float invMass = 1.0f;
     // Contact normal points +y, particle penetrating a floor by 0.1 (pen < 0).
     const float pen = -0.1f;
@@ -695,6 +732,7 @@ PXG_TEST(particleSelfCollisionSolveOneWay)
     ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhase.addr));
     ps.mCommonData.mNumParticles = N;
     ps.mData.mRestOffset = 0.05f;
+    ps.mData.mPenBiasClamp = penBiasClamp;
 
     std::vector<DevBuf> keep;
     makeMaterialBufs(dev, ps, keep);
@@ -704,15 +742,17 @@ PXG_TEST(particleSelfCollisionSolveOneWay)
     std::vector<uint32_t> active = { 0u };
     DevBuf bActive = makeDev(dev, active);
 
-    struct SolvePush { uint64_t systems, active; float invDt, dt, bias; uint32_t velIter; };
-    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, bias, 0u };
+    // PhysX 5.12: {systems, active, invDt, dt, isVelocityIteration} -> 32 bytes.
+    struct SolvePush { uint64_t systems, active; float invDt, dt; uint32_t velIter; };
+    static_assert(sizeof(SolvePush) == 32, "one-way solve push 32 bytes");
+    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, 0u };
 
     Kernel k("particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch", {}, sizeof(SolvePush));
     k.dispatch(1u, {}, push, /*gridY (nbActive)*/ 1u, /*gridZ*/ 1u);
     dev->flush();
 
     float ref[3];
-    cpuSolveOneWay(&normalPen.x, &sortedDeltaP[0].x, bias, dt, false, ref);
+    cpuSolveOneWay(&normalPen.x, &sortedDeltaP[0].x, penBiasClamp, dt, ref);
 
     const auto gAccum = downloadBuffer<F4>(dev, bAccum.h, N);
     size_t mm = 0;
@@ -742,7 +782,8 @@ PXG_TEST(particleSelfCollisionSolveOneWay_p99TwoSystems)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const float dt = 1.0f / 60.0f;
-    const float bias = 0.75f;
+    // Per-system mPenBiasClamp: system 2's clamps its depenetration, system 0's does not.
+    const float clampOf[3] = { -1.0e30f, -1.0e30f, -0.5f };
     const uint32_t NS[3] = { 2u, 6u, 3u };
     const uint32_t MAXC = PxgParticleContactInfo::MaxStaticContactsPerParticle;
 
@@ -790,6 +831,7 @@ PXG_TEST(particleSelfCollisionSolveOneWay_p99TwoSystems)
         ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(c.bPhase.addr));
         ps.mCommonData.mNumParticles = N;
         ps.mData.mRestOffset = (k == 2u) ? 0.15f : 0.05f;
+        ps.mData.mPenBiasClamp = clampOf[k];
         makeMaterialBufs(dev, ps, keep);
         descArr[k] = ps;
     }
@@ -797,8 +839,8 @@ PXG_TEST(particleSelfCollisionSolveOneWay_p99TwoSystems)
     const std::vector<uint32_t> active = { 2u, 0u };
     DevBuf bActive = makeDev(dev, active);
 
-    struct SolvePush { uint64_t systems, active; float invDt, dt, bias; uint32_t velIter; };
-    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, bias, 0u };
+    struct SolvePush { uint64_t systems, active; float invDt, dt; uint32_t velIter; };
+    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, 0u };
     {
         Kernel k("particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch", {}, sizeof(SolvePush));
         k.dispatch(1u, {}, push, /*gridY (nbActive)*/ 2u, /*gridZ*/ 1u);
@@ -816,7 +858,7 @@ PXG_TEST(particleSelfCollisionSolveOneWay_p99TwoSystems)
             {
                 if (c.count[i] == 0u) continue;
                 float d[3];
-                cpuSolveOneWay(&c.contacts[i].x, &c.sortedDeltaP[i].x, bias, dt, false, d);
+                cpuSolveOneWay(&c.contacts[i].x, &c.sortedDeltaP[i].x, clampOf[k], dt, d);
                 ref[i].x += d[0]; ref[i].y += d[1]; ref[i].z += d[2];
             }
         const auto g = downloadBuffer<F4>(dev, c.bAccum.h, N);
@@ -1015,7 +1057,7 @@ PXG_TEST(particleSelfCollisionUpdateParticle)
     std::vector<uint32_t> active = { 0u };
     DevBuf bActive = makeDev(dev, active);
 
-    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t skip; };
+    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t isVelocityIteration; };
     UpdatePush push = { bDesc.addr, bActive.addr, invDt, 0u };
 
     Kernel k("particleSelfCollisionBda.spv", "ps_updateParticleLaunch", {}, sizeof(UpdatePush));
@@ -1094,7 +1136,7 @@ PXG_TEST(particleSelfCollisionUpdateParticle_p99TwoSystems)
     const std::vector<uint32_t> active = { 2u, 0u };
     DevBuf bActive = makeDev(dev, active);
 
-    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t skip; };
+    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t isVelocityIteration; };
     UpdatePush push = { bDesc.addr, bActive.addr, invDt, 0u };
     {
         Kernel k("particleSelfCollisionBda.spv", "ps_updateParticleLaunch", {}, sizeof(UpdatePush));
@@ -1148,7 +1190,7 @@ PXG_TEST(particleSelfCollisionSeparates)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t N = 2;
     const float dt = 1.0f / 60.0f;
-    const float bias = 1.0f;
+    const float penBiasClamp = -1.0e30f;
     const float invMass = 1.0f;
     const float relaxation = 1.0f;
     const float cellWidth = 0.3f;
@@ -1174,8 +1216,9 @@ PXG_TEST(particleSelfCollisionSeparates)
     std::vector<F2> collisionForces(N * maxNeighborhood, { 9.0f, 9.0f });
 
     // One-way contact per particle, resolving the overlap: push #0 in -x, #1 in +x.
-    // deltaLinVel = normalPen.xyz * deltaF * invMass * bias (friction 0), so set
-    // normalPen.xyz toward the desired push direction.  penetration = -(overlap).
+    // The delta lies along normalPen.xyz (the solve's normal is its negation, and the
+    // delta is -(lambdaN * normal) * dt), so normalPen.xyz points the push direction.
+    // penetration = -(overlap).
     const float overlap = 2.0f * solidRestOffset - 0.15f; // 0.05
     std::vector<F4> oneWayContacts(N);
     oneWayContacts[0] = { -1.0f, 0.0f, 0.0f, -overlap }; // push #0 toward -x
@@ -1229,6 +1272,7 @@ PXG_TEST(particleSelfCollisionSeparates)
     ps.mData.mSolidRestOffset = solidRestOffset;
     ps.mData.mRestOffset = 0.05f;
     ps.mData.mRelaxationFactor = relaxation;
+    ps.mData.mPenBiasClamp = penBiasClamp;
 
     std::vector<DevBuf> keep;
     makeMaterialBufs(dev, ps, keep);
@@ -1239,9 +1283,9 @@ PXG_TEST(particleSelfCollisionSeparates)
     DevBuf bActive = makeDev(dev, active);
 
     struct SelfPush { uint64_t systems; uint32_t id; };
-    struct SolvePush { uint64_t systems, active; float invDt, dt, bias; uint32_t velIter; };
+    struct SolvePush { uint64_t systems, active; float invDt, dt; uint32_t velIter; };
     struct ApplyPush { uint64_t systems, active; float dt; };
-    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t skip; };
+    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t isVelocityIteration; };
 
     {
         SelfPush push = { bDesc.addr, 0u };
@@ -1250,7 +1294,7 @@ PXG_TEST(particleSelfCollisionSeparates)
         dev->flush();
     }
     {
-        SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, bias, 0u };
+        SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, 0u };
         Kernel k("particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch", {}, sizeof(SolvePush));
         k.dispatch(1u, {}, push, 1u, 1u);
         dev->flush();
@@ -1272,8 +1316,8 @@ PXG_TEST(particleSelfCollisionSeparates)
     // (a) selfCollision: each detects the other.
     // (b) solveOneWay -> accumDeltaP.
     float acc0[3], acc1[3];
-    cpuSolveOneWay(&oneWayContacts[0].x, &sortedDeltaP[0].x, bias, dt, false, acc0);
-    cpuSolveOneWay(&oneWayContacts[1].x, &sortedDeltaP[1].x, bias, dt, false, acc1);
+    cpuSolveOneWay(&oneWayContacts[0].x, &sortedDeltaP[0].x, penBiasClamp, dt, acc0);
+    cpuSolveOneWay(&oneWayContacts[1].x, &sortedDeltaP[1].x, penBiasClamp, dt, acc1);
     // (c) applyDelta with mDelta==0 keeps accumDeltaP.xyz (w -> 0).
     // (d) updateParticle: pos += accumDeltaP.
     const F4 refPos0 = { pos[0].x + acc0[0], pos[0].y + acc0[1], pos[0].z + acc0[2], pos[0].w };
@@ -1310,6 +1354,180 @@ PXG_TEST(particleSelfCollisionSeparates)
     dev->destroyBuffer(bAccum.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bMDelta.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
     for (auto& b : keep) dev->destroyBuffer(b.h);
+}
+
+// ---------------------------------------------------------------------------
+// (3'') PhysX 5.12 -- ps_solveOneWayContactDeltaVLaunch with everything the 5.12 solve
+// core reads: 20 particles with 0..14 contacts each (the count clamps at 12, column-major
+// with a numParticles stride), two materials through the phase map (friction 0.6 /
+// adhesion 0.4 radius scale 1.8, and friction 0.1 without adhesion), a kinematic
+// particle, applied forces from earlier iterations, mPenBiasClamp -0.8, separated and
+// penetrating contacts, both iteration kinds (velocity iterations read
+// mSortedVelocities * dt and no adhesion).  accumDeltaP and mOneWayForces word for word.
+// ---------------------------------------------------------------------------
+static void runOneWay512(bool isVelIter)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 20u;
+    const uint32_t MAXC = PxgParticleContactInfo::MaxStaticContactsPerParticle;
+    const float dt = 1.0f / 60.0f;
+    const float penBiasClamp = -0.8f;
+    const float restOffset = 0.12f;
+
+    uint32_t seed = 0x6d2b79f5u;
+    auto rnd = [&seed](float lo, float hi) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        return lo + (hi - lo) * float(seed & 0xffffffu) / float(0x1000000);
+    };
+
+    std::vector<uint32_t> count(N), phase(N);
+    std::vector<F4> deltaP(N), vel(N), accum(N);
+    std::vector<F4> contacts(16u * N, F4{ 0.f, 0.f, 0.f, 0.f });
+    std::vector<F2> forces(16u * N, F2{ 0.f, 0.f });
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        count[i] = i % 15u;                        // 0..14: past the clamp of 12 as well
+        phase[i] = (i % 2u) | PHASE_SELF_COLLIDE;  // group 0 or 1, flag bits above the mask
+        const float invMass = (i == 7u) ? 0.0f : 0.5f + 0.1f * float(i % 4u);
+        deltaP[i] = F4{ rnd(-0.01f, 0.01f), rnd(-0.01f, 0.01f), rnd(-0.01f, 0.01f), invMass };
+        vel[i] = F4{ rnd(-2.f, 2.f), rnd(-2.f, 2.f), rnd(-2.f, 2.f), 0.f };
+        accum[i] = F4{ rnd(-0.1f, 0.1f), rnd(-0.1f, 0.1f), rnd(-0.1f, 0.1f), 3.0f };
+        for (uint32_t c = 0; c < 16u; ++c)
+        {
+            float nx = rnd(-0.5f, 0.5f), ny = 1.0f, nz = rnd(-0.5f, 0.5f);
+            const float m = std::sqrt(nx * nx + ny * ny + nz * nz);
+            nx /= m; ny /= m; nz /= m;
+            contacts[i + c * N] = F4{ nx, ny, nz, rnd(-0.06f, 0.05f) };
+            forces[i + c * N] = (c % 3u == 0u) ? F2{ 0.f, 0.f } : F2{ rnd(0.f, 0.02f), rnd(-0.01f, 0.01f) };
+        }
+    }
+
+    // Two PxsParticleMaterialData (20 B) at a 24-byte stride.
+    std::vector<float> materials = { 0.6f, 0.0f, 0.4f, 1.0f, 1.8f, 0.0f,
+                                     0.1f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f };
+    std::vector<uint32_t> handle = { 0u | (1u << 16) };   // group 0 -> 0, group 1 -> 1
+
+    DevBuf bContacts = makeDev(dev, contacts), bCount = makeDev(dev, count), bForces = makeDev(dev, forces),
+           bDeltaP = makeDev(dev, deltaP), bAccum = makeDev(dev, accum), bPhase = makeDev(dev, phase),
+           bVel = makeDev(dev, vel), bMat = makeDev(dev, materials), bHandle = makeDev(dev, handle);
+
+    PxgParticleSystem ps = makeZeroDesc();
+    ps.mOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(bContacts.addr));
+    ps.mOneWayContactCount = reinterpret_cast<PxU32*>(size_t(bCount.addr));
+    ps.mOneWayForces = reinterpret_cast<float2*>(size_t(bForces.addr));
+    ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
+    ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(bAccum.addr));
+    ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhase.addr));
+    ps.mSortedVelocities = reinterpret_cast<float4*>(size_t(bVel.addr));
+    ps.mParticleMaterials = reinterpret_cast<PxsParticleMaterialData*>(size_t(bMat.addr));
+    ps.mParticleMaterialStride = 24u;
+    ps.mPhaseGroupToMaterialHandle = reinterpret_cast<PxU16*>(size_t(bHandle.addr));
+    ps.mCommonData.mNumParticles = N;
+    ps.mData.mRestOffset = restOffset;
+    ps.mData.mPenBiasClamp = penBiasClamp;
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+    DevBuf bActive = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+    struct SolvePush { uint64_t systems, active; float invDt, dt; uint32_t velIter; };
+    SolvePush push = { bDesc.addr, bActive.addr, 1.0f / dt, dt, isVelIter ? 1u : 0u };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch", {}, sizeof(SolvePush));
+        k.dispatch(1u, {}, push, 1u, 1u);
+    }
+    dev->flush();
+
+    std::vector<F4> refAccum = accum;
+    std::vector<F2> refForces = forces;
+    const OneWayMaterial mats[2] = { { 0.6f, 0.4f, 1.8f }, { 0.1f, 0.0f, 1.0f } };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (count[i] == 0u)
+            continue;
+        float d[3];
+        cpuSolveOneWay512(contacts.data(), refForces.data(), count[i], i, N, deltaP[i], vel[i], mats[i % 2u],
+                          restOffset, penBiasClamp, dt, isVelIter, d);
+        refAccum[i].x += d[0]; refAccum[i].y += d[1]; refAccum[i].z += d[2];
+    }
+
+    const auto gAccum = downloadBuffer<F4>(dev, bAccum.h, N);
+    const auto gForces = downloadBuffer<F2>(dev, bForces.h, 16u * N);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (std::memcmp(&gAccum[i], &refAccum[i], sizeof(F4)) != 0 && mm++ < 6)
+            std::printf("  accum[%u] got(%g %g %g %g) ref(%g %g %g %g)\n", i, gAccum[i].x, gAccum[i].y, gAccum[i].z,
+                        gAccum[i].w, refAccum[i].x, refAccum[i].y, refAccum[i].z, refAccum[i].w);
+    for (uint32_t j = 0; j < 16u * N; ++j)
+        if (std::memcmp(&gForces[j], &refForces[j], sizeof(F2)) != 0 && mm++ < 12)
+            std::printf("  forces[%u] got(%g %g) ref(%g %g)\n", j, gForces[j].x, gForces[j].y, refForces[j].x,
+                        refForces[j].y);
+    PXG_CHECK_MSG(mm == 0, "one-way 5.12 (%s iteration): %zu words differ", isVelIter ? "velocity" : "position", mm);
+    // Columns 12..15 of a particle with 13 or 14 contacts are past the clamp: untouched.
+    PXG_CHECK_MSG(std::memcmp(&gForces[13u + 12u * N], &forces[13u + 12u * N], sizeof(F2)) == 0,
+                  "a contact past MaxStaticContactsPerParticle must not be solved");
+
+    for (DevBuf* b : { &bContacts, &bCount, &bForces, &bDeltaP, &bAccum, &bPhase, &bVel, &bMat, &bHandle, &bDesc, &bActive })
+        dev->destroyBuffer(b->h);
+}
+
+PXG_TEST(particleSelfCollisionSolveOneWay_512Position) { runOneWay512(false); }
+PXG_TEST(particleSelfCollisionSolveOneWay_512Velocity) { runOneWay512(true); }
+
+// ---------------------------------------------------------------------------
+// (5'') PhysX 5.12 -- ps_updateParticleLaunch in a VELOCITY iteration: only the sorted
+// velocity takes the correction (and mAccumDeltaP is cleared); the position and the
+// accumulated mSortedDeltaP are left alone.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSelfCollisionUpdateParticle_velocityIteration)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 3;
+    const float invDt = 60.0f;
+    std::vector<F4> accum(N), vel(N), deltaP(N), pos(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        accum[i] = { 0.01f * float(i + 1), 0.02f, -0.03f * float(i), 0.5f };
+        vel[i] = { float(i), -0.5f * float(i), 0.25f, 0.0f };
+        deltaP[i] = { 0.001f, 0.002f, 0.003f, 1.0f + float(i) };
+        pos[i] = { 5.0f + float(i), 2.0f, -1.0f * float(i), 1.0f + 0.1f * float(i) };
+    }
+    DevBuf bAccum = makeDev(dev, accum), bVel = makeDev(dev, vel), bDeltaP = makeDev(dev, deltaP), bPos = makeDev(dev, pos);
+    PxgParticleSystem ps = makeZeroDesc();
+    ps.mAccumDeltaP = reinterpret_cast<float4*>(size_t(bAccum.addr));
+    ps.mSortedVelocities = reinterpret_cast<float4*>(size_t(bVel.addr));
+    ps.mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
+    ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    ps.mCommonData.mNumParticles = N;
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+    DevBuf bActive = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+    struct UpdatePush { uint64_t systems, active; float invDt; uint32_t isVelocityIteration; };
+    UpdatePush push = { bDesc.addr, bActive.addr, invDt, 1u };
+    {
+        Kernel k("particleSelfCollisionBda.spv", "ps_updateParticleLaunch", {}, sizeof(UpdatePush));
+        k.dispatch(1u, {}, push, 1u, 1u);
+    }
+    dev->flush();
+
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gAccum = downloadBuffer<F4>(dev, bAccum.h, N);
+    const auto gDeltaP = downloadBuffer<F4>(dev, bDeltaP.h, N);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 a = accum[i], v = vel[i];
+        const F4 nv = { v.x + a.x * invDt, v.y + a.y * invDt, v.z + a.z * invDt, v.w + a.w * invDt };
+        const F4 zero = { 0.f, 0.f, 0.f, 0.f };
+        mm += std::memcmp(&gVel[i], &nv, sizeof(F4)) != 0;
+        mm += std::memcmp(&gPos[i], &pos[i], sizeof(F4)) != 0;
+        mm += std::memcmp(&gDeltaP[i], &deltaP[i], sizeof(F4)) != 0;
+        mm += std::memcmp(&gAccum[i], &zero, sizeof(F4)) != 0;
+    }
+    PXG_CHECK_MSG(mm == 0, "velocity-iteration update: %zu words wrong", mm);
+    for (DevBuf* b : { &bAccum, &bVel, &bDeltaP, &bPos, &bDesc, &bActive })
+        dev->destroyBuffer(b->h);
 }
 
 }  // namespace

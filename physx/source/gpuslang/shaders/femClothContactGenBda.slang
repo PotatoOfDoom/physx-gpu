@@ -37,7 +37,7 @@
 //     intermediate stack and bumps midphasePairsNum.
 //   - cloth_planeVertContactGenLaunch (femClothPrimitives.cu:853, launch :5853,
 //     CLOTH_PLANE_VERTEX_CG): cloth-vertex-vs-PLANE contact generation (a cloth
-//     falling onto a floor) — vertPlaneCollide + the PxgFEMContactWriter append.
+//     falling onto a floor) — vertPlaneCollide + the PxgRigidDbContactWriter append.
 //   - cloth_SphereVertexContactGenLaunch (femClothPrimitives.cu:700, launch :5776,
 //     CLOTH_VERT_SPHERE_CG): cloth-vertex-vs-SPHERE contact generation (a drape
 //     over a sphere) — spheresphere + the same writer append.  (The kernel's
@@ -49,16 +49,20 @@
 //     (the byte-exact pxgSlangFEMClothDesc mirror); mPosition_InvMass @16 and
 //     mNbVerts @316 are the only fields the vertex kernels touch;
 //   - the per-pair narrowphase inputs (PxgContactManagerInput / PxgShape /
-//     PxsCachedTransform / PxgRigidFilterPair / PxNodeIndex remap) are transcribed
+//     PxsCachedTransform / PxNodeIndex remap) are transcribed
 //     locally as byte-exact mirrors (pinned by static_asserts against the real
 //     engine structs in testFemClothSim.cpp), matching the psContactGenBda
 //     precedent (keeps the rigid-common module out of the cloth-descriptor TU);
 //   - the PxBounds3 world AABB (24B: min @0, max @12) is read straight from the
 //     bounds array by float offset (rigidCacheRef*6);
-//   - the by-value PxgFEMContactWriter (PxgFEMCore.h:361) is inlined field-by-field
-//     into the contact-gen push blob and its device pointers are written directly
-//     (writeRigidVsDeformableContact -> writeContactCore + the FEM-rigid contact
-//     info tail), exactly as psContactGenBda inlined PxgParticleContactWriter.
+//   - the by-value PxgRigidDbContactWriter (PhysX 5.12, PxgDeformableContactWriters.h)
+//     is inlined field-by-field into the contact-gen push blob (w_ / b_ fields) and
+//     rebuilt as a PxgRigidDbContactWriterGpu (pxgSlangDeformableWriters), whose
+//     writeSurfaceContact overloads hold the store sequence;
+//   - PhysX 5.12: the rigid filter is per cloth (mRigidSurfaceFilterPairs, keyed by
+//     PxgEncodeRigidFilterRef); triangles are filtered as triangles (one search), the
+//     contact refs are PxgDeformableRef (PxgEncodeDeformableVertex / Triangle) and a
+//     vertex contact writes no barycentric.
 //
 // DEVIATIONS from CUDA (recipe policy; each preserves the emitted contact SET and
 // the running contact/pair total, and is exercised by testFemClothSim.cpp):
@@ -84,12 +88,6 @@
 //     drape.  For a non-sphere rigid the else-path produces no contact (the CUDA
 //     asserts eCAPSULE there; a capsule input is out of scope and never launched in
 //     the sphere test).  Same deferral shape as psContactGenBda's eCONVEXCORE;
-//   - PxgFemOtherContactInfo::setRigidMaterialIndex(mat) followed by
-//     markInCollision(false) (PxgFEMCore.h:148/:152) is emitted as a single store of
-//     (mat & 0x7fffffff): setRigidMaterialIndex writes (old & 0x80000000) | (mat &
-//     0x7fffffff) and the subsequent markInCollision(false) clears bit 31, so the
-//     net 32-bit word is provably (mat & 0x7fffffff) regardless of the prior buffer
-//     content — bit-identical, no read-modify-write needed;
 //   - the mesh-vertex-vs-mesh / capsule / box sibling kernels in the same .cu files
 //     are out of scope (this tranche is plane + sphere, the floor/sphere drape).
 //
@@ -112,7 +110,9 @@ import pxgSlangVertexConvexCloth; // P9.21: the lifted vertex-vs-convex core
 // definition of each and the compiler, not a reader, enforces it.
 import pxgSlangClothMidphase;
 
-import pxgSlangDefFilter;   // P9.38: dfFindRigidPair
+import pxgSlangDefFilter;   // 5.12: findRigidSurface{Vertex,Triangle}Filter
+import pxgSlangDeformableRef;     // PxgEncodeDeformable{Vertex,Triangle}
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
 static const uint GEOM_PLANE = 1u;
@@ -194,12 +194,14 @@ struct MidphaseParams
     uint64_t midphasePairsNum;  // @64 output (PxU32*) -> 72
 }
 
-// cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch share the
-// arg pack (femClothPrimitives.cu; launch PxgNarrowphaseCore.cpp:5853 / :5776):
-// { PxU32 numTests, cmInputs*, transformCache*, contactDistance*, restDistance*,
-// gpuShapes*, femClothes*, shapeToRigidRemapTable*, filterPairs*, PxU32 nbFilterPairs,
-// PxgFEMContactWriter writer(BY VALUE, 80B) } -> 160-byte blob.
-// (ABI row {4,8,8,8,8,8,8,8,8,4,80}.)
+// cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch /
+// cloth_boxVertexContactGenLaunch share the arg pack (femClothPrimitives.cu, 5.12):
+// { PxU32 numWorkItems, cmInputs*, transformCache*, contactDistance*, restDistance*,
+// gpuShapes*, femClothes*, shapeToRigidRemapTable*,
+// PxgRigidDbContactWriter writer(BY VALUE, 80B) } -> 144-byte blob.
+// (ABI row {4,8,8,8,8,8,8,8,80}.)  5.12 dropped the filterPairs / nbFilterPairs
+// arguments: the filter is per cloth (PxgFEMCloth::mRigidSurfaceFilterPairs).  The
+// writer lands at @64, which is 16-aligned, so paramAlign(80) = 16 adds no pad.
 struct ContactGenParams
 {
     uint numTests;                 // @0
@@ -211,21 +213,18 @@ struct ContactGenParams
     uint64_t gpuShapes;            // @40
     uint64_t femClothes;           // @48
     uint64_t shapeToRigidRemap;    // @56  PxNodeIndex* (PxU64 per shape cache ref)
-    uint64_t filterPairs;          // @64  PxgRigidFilterPair*
-    uint nbFilterPairs;            // @72
-    uint _pad76;                   // @76
-    // ---- PxgFEMContactWriter (by value, 80B) @80 ----
-    uint64_t w_outPoint;            // @80  float4*
-    uint64_t w_outNormalPen;        // @88  float4*
-    uint64_t w_outBarycentric;      // @96  float4*
-    uint64_t w_outContactInfo;      // @104 PxgFemOtherContactInfo* (16B stride)
-    uint64_t w_totalContactCount;   // @112 PxU32*
-    uint64_t w_contactByX;          // @120 PxU64* (contactByRigid)
-    uint64_t w_tempContactByX;      // @128 PxU32*
-    uint64_t w_contactIndexSortedByX; // @136 PxU32*
-    uint64_t w_contactSortedByX;    // @144 PxU32* (unused by the vertex writer; ABI parity)
-    uint w_maxNumContacts;          // @152 PxU32
-    uint _pad156;                   // @156 -> 160
+    // ---- PxgRigidDbContactWriter (by value, 80B) @64 ----
+    uint64_t w_outPoint;                  // @64  float4*
+    uint64_t w_outNormalPen;              // @72  float4*
+    uint64_t w_outBarycentric;            // @80  float4*
+    uint64_t w_outContactInfo;            // @88  PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;     // @96  PxU16*
+    uint64_t w_totalContactCount;         // @104 PxU32*
+    uint64_t w_contactByRigid;            // @112 PxU64*
+    uint64_t w_tempContactByRigid;        // @120 PxU32*
+    uint64_t w_contactIndexSortedByRigid; // @128 PxU32*
+    uint w_maxNumContacts;                // @136 PxU32
+    uint _pad140;                         // @140 -> 144
 }
 
 // cloth_midphaseGeneratePairsLaunch (femClothMidPhase.cu:191; launch pack
@@ -257,9 +256,10 @@ struct ClothTriMidphaseParams
 
 [[vk::push_constant]] ConstantBuffer<MidphaseParams> gMid;
 [[vk::push_constant]] ConstantBuffer<ContactGenParams> gCG;
-// cloth_boxTriangleContactGenLaunch (femClothPrimitives.cu:3357; launch pack
-// PxgNarrowphaseCore.cpp:5995): fifteen arguments -> 184-byte blob.
-// (ABI row {4,8,8,8,8,8,8,8,8,8,8,4,4,8,80}.)
+// cloth_boxTriangleContactGenLaunch, cloth_convexContactGenLaunch,
+// cloth_convexVertexContactGenLaunch and cloth_SphereContactGenLaunch
+// (femClothPrimitives.cu, 5.12): thirteen arguments -> 176-byte blob.
+// (ABI row {4,8,8,8,8,8,8,8,8,8,4,8,80}.)
 struct ClothBoxTriParams
 {
     float toleranceLength;         // @0  (unused; ABI parity)
@@ -273,34 +273,28 @@ struct ClothBoxTriParams
     uint64_t shapeToRigidRemap;    // @56
     uint64_t stackPtr;             // @64  the midphase's (cmIdx, triIdx) pairs
     uint64_t midphasePairsNum;     // @72
-    uint64_t filterPairs;          // @80  clothAttachmentPairs
-    uint nbFilterPairs;            // @88
-    uint stackSizeBytes;           // @92
-    uint64_t stackSizeNeeded;      // @96  atomicMax output
-    uint64_t _pad104;              // @104
-    // ---- PxgFEMContactWriter (by value, 80B) @112 ----
+    uint stackSizeBytes;           // @80
+    uint _pad84;                   // @84
+    uint64_t stackSizeNeeded;      // @88  atomicMax output
+    // ---- PxgRigidDbContactWriter (by value, 80B) @96 ----
     //
-    // @112, NOT @104, and that cost this tranche a segfault.  The bridge places
-    // each argument at paramAlign(size) (PxgVulkanCudaContext.cpp:93), and
-    // paramAlign(80) is **16**, not 8 -- 80 is a multiple of 16.  The arguments
-    // before the writer end at 104, which is 8-aligned but not 16-aligned, so the
-    // bridge pads to 112.  A struct that puts the writer at 104 reads the padding
-    // as its first pointer and stores through it: `segfault at 0`.
-    //
-    // The plane/sphere siblings above hide the rule by luck: their writer lands at
-    // 80, which is already 16-aligned, so 8- and 16-alignment agree there.  Any
-    // future kernel whose by-value tail is a multiple of 16 must check this.
-    uint64_t b_outPoint;           // @112
-    uint64_t b_outNormalPen;       // @120
-    uint64_t b_outBarycentric;     // @128
-    uint64_t b_outContactInfo;     // @136
-    uint64_t b_totalContactCount;  // @144
-    uint64_t b_contactByX;         // @152
-    uint64_t b_tempContactByX;     // @160
-    uint64_t b_contactIndexSortedByX; // @168
-    uint64_t b_contactSortedByX;   // @176 (unused by this writer; ABI parity)
-    uint b_maxNumContacts;         // @184
-    uint _pad188;                  // @188 -> 192
+    // The bridge places each argument at paramAlign(size) (PxgVulkanCudaContext.cpp),
+    // and paramAlign(80) is **16**, not 8 -- 80 is a multiple of 16.  In 5.6.1 the
+    // arguments before the writer ended at 104 and the bridge padded to 112 (a struct
+    // with the writer at 104 segfaulted).  5.12 removed the two filter arguments, the
+    // preceding arguments now end at 96, which is 16-aligned: no pad.  Any change to
+    // this pack must recheck the rule.
+    uint64_t b_outPoint;                  // @96
+    uint64_t b_outNormalPen;              // @104
+    uint64_t b_outBarycentric;            // @112
+    uint64_t b_outContactInfo;            // @120
+    uint64_t b_outRigidMaterialIndex;     // @128
+    uint64_t b_totalContactCount;         // @136
+    uint64_t b_contactByRigid;            // @144
+    uint64_t b_tempContactByRigid;        // @152
+    uint64_t b_contactIndexSortedByRigid; // @160
+    uint b_maxNumContacts;                // @168
+    uint _pad172;                         // @172 -> 176
 }
 
 [[vk::push_constant]] ConstantBuffer<ClothTriMidphaseParams> gTMid;
@@ -380,14 +374,20 @@ void loadClothRigidPair(uint64_t cmInputsAddr, uint64_t shapesAddr, uint cmIdx,
 groupshared uint sMidMask[MIDPHASE_WARPS];
 groupshared uint sMidStart[MIDPHASE_WARPS];
 
-// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
-// It was written out by hand fifteen times across this corpus; every copy was checked
-// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
-// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
-// re-derive one of them wrong.
-bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
+// 5.12: the rigid-vs-cloth filter is per cloth (PxgFEMCloth::mRigidSurfaceFilterPairs)
+// and keyed by the rigid's filter reference (PxgEncodeRigidFilterRef(rigidId,
+// rigidCacheRef)).  The vertex paths search (rigid, vertex); the triangle paths search
+// (rigid, triangle) -- ONE search, where 5.6.1 skipped a triangle only when all three
+// of its vertices were filtered.
+bool clothVertexFiltered(uint64_t femClothes, uint clothId, uint2 rigidId, uint rigidCacheRef, uint vertexId)
 {
-    return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
+    return findRigidSurfaceVertexFilter(clothRigidSurfaceFilters(femClothes + uint64_t(clothId) * PXG_FEMCLOTH_STRIDE),
+                                        dfNodeU64(rigidId), rigidCacheRef, clothId, vertexId);
+}
+bool clothTriangleFiltered(uint64_t femClothes, uint clothId, uint2 rigidId, uint rigidCacheRef, uint triangleId)
+{
+    return findRigidSurfaceTriangleFilter(clothRigidSurfaceFilters(femClothes + uint64_t(clothId) * PXG_FEMCLOTH_STRIDE),
+                                          dfNodeU64(rigidId), rigidCacheRef, clothId, triangleId);
 }
 
 [shader("compute")]
@@ -468,51 +468,32 @@ void cloth_midphaseGenerateVertexPairsLaunch(uint3 gtid : SV_GroupThreadID, uint
 }
 
 // ---------------------------------------------------------------------------
-// PxgFEMContactWriter::writeRigidVsDeformableContact (PxgFEMCore.h:485) -> the
-// capacity-gated writeContactCore staging + the FEM-rigid contact-info tail.
-// pairInd0 == rigidId.getInd() (the plane/sphere callers pass them equal).
+// The by-value PxgRigidDbContactWriter, rebuilt from whichever push block carries it:
+// gCG (the three vertex kernels) or gBTri (the four stack-driven kernels).
 // ---------------------------------------------------------------------------
-// P9.29 addressed the writer through an FcCtWriter (the public struct
-// pxgSlangConvexTriCloth already exports) rather than reading gCG directly, so
-// the SAME body serves the three vertex kernels below -- which live on the
-// ContactGenParams blob -- and cloth_SphereContactGenLaunch, which lives on the
-// ClothBoxTriParams blob.  The alternative was a second copy of these ten
-// stores differing only in which push-constant it names, which is the kind of
-// duplication that drifts silently.
-void cgWriteContact(FcCtWriter w, uint index, float4 contact, float4 normalPen, float4 barycentric,
-                    uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
+PxgRigidDbContactWriterGpu cgWriter()
 {
-    if (index >= w.maxContacts)
-        return;
-
-    // writeContactCore
-    Ptr<uint2>(w.byX)[index] = rigidId;                            // contactByX[index] = rigidId (PxU64)
-    Ptr<uint>(w.tempByX)[index] = rigidId.x;                       // PxU32(rigidId & 0xffffffff)
-    Ptr<uint>(w.idxByX)[index] = index;
-    Ptr<float4>(w.point)[index] = contact;
-    Ptr<float4>(w.normalPen)[index] = normalPen;
-
-    // result == true branch
-    Ptr<float4>(w.bary)[index] = barycentric;
-    // PxgFemOtherContactInfo (16B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12
-    const uint64_t infoBase = w.info + uint64_t(index) * 16UL;
-    Ptr<uint2>(infoBase + 0UL)[0] = rigidId;                      // pairInd0 == rigidId.getInd()
-    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
-    // setRigidMaterialIndex(mat) + markInCollision(false) == (mat & 0x7fffffff)
-    Ptr<uint>(infoBase + 12UL)[0] = rigidMaterialIndex & 0x7fffffffu;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gCG.w_outPoint;                 w.outNormalPen = gCG.w_outNormalPen;
+    w.outBarycentric = gCG.w_outBarycentric;     w.outContactInfo = gCG.w_outContactInfo;
+    w.outRigidMaterialIndex = gCG.w_outRigidMaterialIndex;
+    w.totalContactCount = gCG.w_totalContactCount;
+    w.contactByRigid = gCG.w_contactByRigid;     w.tempContactByRigid = gCG.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gCG.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gCG.w_maxNumContacts;
+    return w;
 }
-
-// The ContactGenParams-blob face of the same writer (plane / sphere / box vertex).
-void writeRigidVsDeformableContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
-                                   uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
+PxgRigidDbContactWriterGpu btWriter()
 {
-    FcCtWriter w;
-    w.point = gCG.w_outPoint;        w.normalPen = gCG.w_outNormalPen;
-    w.bary = gCG.w_outBarycentric;   w.info = gCG.w_outContactInfo;
-    w.count = gCG.w_totalContactCount; w.byX = gCG.w_contactByX;
-    w.tempByX = gCG.w_tempContactByX;  w.idxByX = gCG.w_contactIndexSortedByX;
-    w.maxContacts = gCG.w_maxNumContacts;
-    cgWriteContact(w, index, contact, normalPen, barycentric, rigidId, pairInd1, rigidMaterialIndex);
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gBTri.b_outPoint;               w.outNormalPen = gBTri.b_outNormalPen;
+    w.outBarycentric = gBTri.b_outBarycentric;   w.outContactInfo = gBTri.b_outContactInfo;
+    w.outRigidMaterialIndex = gBTri.b_outRigidMaterialIndex;
+    w.totalContactCount = gBTri.b_totalContactCount;
+    w.contactByRigid = gBTri.b_contactByRigid;   w.tempContactByRigid = gBTri.b_tempContactByRigid;
+    w.contactIndexSortedByRigid = gBTri.b_contactIndexSortedByRigid;
+    w.maxNumContacts = gBTri.b_maxNumContacts;
+    return w;
 }
 
 // ===========================================================================
@@ -567,7 +548,7 @@ void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         bool hasContact = false;
         float4 contact = float4(0, 0, 0, 0);
         float4 normalPen = float4(0, 0, 0, 0);
-        uint pairInd1 = 0u;
+        uint64_t vertRef = 0;
 
         if (i < numVerts)
         {
@@ -582,13 +563,12 @@ void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
             {
                 normalPen = float4(normal.x, normal.y, normal.z, pInPlaneSpace.x);
 
-                const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
-                // filter: drop the contact if (rigidId, clothMask) is filtered.
-                const bool filtered = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
+                // filter: drop the contact if (rigid, vertex) is filtered.
+                const bool filtered = clothVertexFiltered(gCG.femClothes, femClothId, rigidId, rigidCacheRef, i);
                 if (!filtered)
                 {
                     hasContact = true;
-                    pairInd1 = clothMask;
+                    vertRef = PxgEncodeDeformableVertex(femClothId, i);
                     const float3 rP = clothP - normalPen.w * normal;
                     contact = float4(rP.x, rP.y, rP.z, restDistance);
                 }
@@ -613,8 +593,8 @@ void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         GroupMemoryBarrierWithGroupSync();
         const uint startIndex = sPlaneStart[warpId];
         if (hasContact)
-            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
-                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+            cgWriter().writeSurfaceContactVertex(startIndex + threadOffset, contact, normalPen,
+                                                 dfNodeU64(rigidId), rigidMaterialIndex, vertRef);
         GroupMemoryBarrierWithGroupSync();
     }
 }
@@ -670,12 +650,11 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
         bool hasContact = false;
         float4 contact = float4(0, 0, 0, 0);
         float4 normalPen = float4(0, 0, 0, 0);
-        uint pairInd1 = 0u;
+        uint64_t vertRef = 0;
 
         if (i < numVerts)
         {
-            const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
-            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
+            const bool skipVertex = clothVertexFiltered(gCG.femClothes, femClothId, rigidId, rigidCacheRef, i);
             if (!skipVertex)
             {
                 const float4 cf = verts[i];
@@ -703,7 +682,7 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 
                 if (hasContact)
                 {
-                    pairInd1 = clothMask;
+                    vertRef = PxgEncodeDeformableVertex(femClothId, i);
                     contact = float4(cf.x, cf.y, cf.z, restDistance); // verts[i], w=restDistance
                 }
             }
@@ -726,8 +705,8 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
         GroupMemoryBarrierWithGroupSync();
         const uint startIndex = sSphStart[warpId];
         if (hasContact)
-            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
-                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+            cgWriter().writeSurfaceContactVertex(startIndex + threadOffset, contact, normalPen,
+                                                 dfNodeU64(rigidId), rigidMaterialIndex, vertRef);
         GroupMemoryBarrierWithGroupSync();
     }
 }
@@ -738,7 +717,7 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 // query itself at sphereCollision.cuh:371 (lifted into pxgSlangSphereBox).
 //
 // The third vertex-vs-primitive contact generator of this file and the closest
-// sibling of the two above: same 11-argument pack, same ContactGenParams blob,
+// sibling of the two above: same 9-argument pack, same ContactGenParams blob,
 // same filter, same writer, same warp-aggregation tail.  It is the ONLY kernel
 // of the three that an existing SCENE already asks for -- `cloth` emits
 // "GPU cloth_boxVertexContactGenLaunch fail to launch" every frame -- so this
@@ -849,13 +828,12 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         bool hasContact = false;
         float4 contact = float4(0, 0, 0, 0);
         float4 normalPen = float4(0, 0, 0, 0);
-        uint pairInd1 = 0u;
+        uint64_t vertRef = 0;
 
         if (i < numVerts)
         {
-            const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
             // V3: the filter runs FIRST on this path.
-            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
+            const bool skipVertex = clothVertexFiltered(gCG.femClothes, femClothId, rigidId, rigidCacheRef, i);
             if (!skipVertex)
             {
                 const float4 pf = verts[i];
@@ -865,7 +843,7 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
                                        boxHalfExtents, contactDist, normalPen) != 0u)
                 {
                     hasContact = true;
-                    pairInd1 = clothMask;
+                    vertRef = PxgEncodeDeformableVertex(femClothId, i);
                     // V1: the point on the RIGID, not the cloth vertex.
                     const float3 rP = clothP - normalPen.w * float3(normalPen.x, normalPen.y, normalPen.z);
                     contact = float4(rP.x, rP.y, rP.z, restDistance);
@@ -891,8 +869,8 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         GroupMemoryBarrierWithGroupSync();
         const uint startIndex = sBoxStart[warpId];
         if (hasContact)
-            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
-                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+            cgWriter().writeSurfaceContactVertex(startIndex + threadOffset, contact, normalPen,
+                                                 dfNodeU64(rigidId), rigidMaterialIndex, vertRef);
         GroupMemoryBarrierWithGroupSync();
     }
 }
@@ -1013,7 +991,7 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     const uint64_t treeAddr = triMeshData + 16UL;   // M4: skip the uint4 header
 
     Ptr<float4> meshVerts = Ptr<float4>(femClothes[femClothId].mPosition_InvMass);
-    Ptr<uint4> meshVertsIndices = Ptr<uint4>(femClothes[femClothId].mTriangleVertexIndices);
+    Ptr<uint4> meshVertsIndices = Ptr<uint4>(femClothes[femClothId].mTriangleVertexIndices_ownedEdges);
 
     // M5: the RIGID's world AABB, fattened by the pair's summed contact distance.
     Ptr<float> bounds = Ptr<float>(gTMid.bounds);
@@ -1149,13 +1127,12 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 // ---------------------------------------------------------------------------
 // TRAPS
 // ---------------------------------------------------------------------------
-// B1 -- THE FILTER IS AN **AND** OVER ALL THREE VERTICES.  A triangle is skipped
-//     only when EVERY one of its corners is filtered against this rigid:
-//         skip = find(v0) && find(v1) && find(v2)
-//     The vertex kernel next door skips on a SINGLE match.  Two kernels, one
-//     filter list, opposite quantifiers -- and `||` here silently drops
-//     triangles that share one attached corner, which is the common case for a
-//     cloth pinned at a few points.
+// B1 -- THE FILTER IS ONE (rigid, TRIANGLE) SEARCH (PhysX 5.12).  5.6.1 skipped a
+//     triangle only when all three of its corners were filtered (an AND of three
+//     vertex searches); 5.12 filters triangles as triangles,
+//         skip = findRigidSurfaceTriangleFilter(cloth filters, rigid, triangle)
+//     and the host is what turns an attachment into vertex and triangle pairs.
+//     Do not reintroduce the corner AND.
 //
 // B2 -- THE CLOTH IS NOT SCALED.  The CUDA has the three vertex2Shape calls
 //     COMMENTED OUT and uses the raw world vertices; only the RIGID carries a
@@ -1211,9 +1188,8 @@ static const uint BTRI_WARPS_PER_BLOCK = 2u;
 //     versus `PxLoad3` straight into v0/v1/v2.
 //
 // Their argument packs are identical, and both launch sites in
-// PxgNarrowphaseCore.cpp (:5991 box, :6262 convex) pass the SAME filter buffer --
-// simulationCore->getRigidClothFilters() -- despite naming the parameter
-// `clothAttachmentPairs` in one and `clothRigidPairs` in the other.
+// PxgNarrowphaseCore.cpp pass the same arguments (in 5.6.1 they also passed the same
+// filter buffer under two names; 5.12 moved the filter onto the cloth).
 //
 // So this port writes the body ONCE and gives it two entry points.  The
 // alternative -- pointing both manifest rows at a single entry -- would be
@@ -1237,12 +1213,7 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
     Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gBTri.transformCache);
     Ptr<float> contactDistance = Ptr<float>(gBTri.contactDistance);
 
-    FcCtWriter w;
-    w.point = gBTri.b_outPoint;  w.normalPen = gBTri.b_outNormalPen;
-    w.bary = gBTri.b_outBarycentric; w.info = gBTri.b_outContactInfo;
-    w.count = gBTri.b_totalContactCount; w.byX = gBTri.b_contactByX;
-    w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
-    w.maxContacts = gBTri.b_maxNumContacts;
+    const PxgRigidDbContactWriterGpu w = btWriter();
 
     for (uint i = globalWarpIdx; i < numPairs; i += BTRI_GRID * BTRI_WARPS_PER_BLOCK)  // B7
     {
@@ -1261,19 +1232,13 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
         const uint2 rigidId = Ptr<uint2>(gBTri.shapeToRigidRemap)[rigidCacheRef];
         const uint clothId = clothShape.particleOrSoftbodyId;
 
-        Ptr<uint4> vertIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices);
-        const uint4 triIdx = vertIndices[triangleIdx];
-
-        // B1: skip ONLY when all three corners are filtered.
-        const uint m0 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.x;
-        const uint m1 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.y;
-        const uint m2 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.z;
-        const bool skipTriangle =
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m0) &&
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m1) &&
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m2);
+        // B1 (5.12): a filter pair for this rigid and triangle suppresses the triangle.
+        const bool skipTriangle = clothTriangleFiltered(gBTri.femClothes, clothId, rigidId, rigidCacheRef, triangleIdx);
         if (skipTriangle)
             continue;
+
+        Ptr<uint4> vertIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices_ownedEdges);
+        const uint4 triIdx = vertIndices[triangleIdx];
 
         const PxsCachedTransform ctc = transformCache[clothCacheRef];
         const PxsCachedTransform rtc = transformCache[rigidCacheRef];
@@ -1429,12 +1394,7 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
     Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gBTri.transformCache);
     Ptr<float> contactDistance = Ptr<float>(gBTri.contactDistance);
 
-    FvcWriter w;
-    w.point = gBTri.b_outPoint;  w.normalPen = gBTri.b_outNormalPen;
-    w.bary = gBTri.b_outBarycentric; w.info = gBTri.b_outContactInfo;
-    w.count = gBTri.b_totalContactCount; w.byX = gBTri.b_contactByX;
-    w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
-    w.maxContacts = gBTri.b_maxNumContacts;
+    const PxgRigidDbContactWriterGpu w = btWriter();
 
     for (uint i = globalWarpIdx; i < numPairs; i += BTRI_GRID * BTRI_WARPS_PER_BLOCK)  // W6
     {
@@ -1452,10 +1412,8 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 
         const uint2 rigidId = Ptr<uint2>(gBTri.shapeToRigidRemap)[rigidCacheRef];
         const uint clothId = clothShape.particleOrSoftbodyId;
-        const uint clothMask = (clothId << PXG_CLOTH_ID_SHIFT) | vertexIdx;
-
-        // W3: a SINGLE match suppresses this vertex entirely.
-        if (findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, clothMask))
+        // W3: a (rigid, vertex) filter match suppresses this vertex entirely.
+        if (clothVertexFiltered(gBTri.femClothes, clothId, rigidId, rigidCacheRef, vertexIdx))
             continue;
 
         const PxsCachedTransform rtc = transformCache[rigidCacheRef];
@@ -1498,8 +1456,8 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 // The LAST unmapped primitive contact generator on the TRIANGLE side of the
 // cloth chain, and the sibling of cloth_boxTriangleContactGenLaunch /
 // cloth_convexContactGenLaunch above: it consumes the same midphase stack of
-// (cmIdx, triangleIdx) pairs, takes the same fifteen-argument pack, and writes
-// through the same PxgFEMContactWriter.  Despite the name it serves TWO rigid
+// (cmIdx, triangleIdx) pairs, takes the same thirteen-argument pack, and writes
+// through the same PxgRigidDbContactWriter.  Despite the name it serves TWO rigid
 // types -- eSPHERE and eCAPSULE -- against cloth triangles.
 //
 // ---------------------------------------------------------------------------
@@ -1570,8 +1528,8 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 // S6 -- restDistance is indexed by cmIdx (from the pair's .x), contactDistance
 //     by the two cache refs and summed.  Same split as B6 / V6 above.
 //
-// S7 -- the filter is an AND over all three corners, like the box/convex
-//     triangle sibling (B1) and unlike the vertex kernels.
+// S7 -- the filter is one (rigid, triangle) search, like the box/convex triangle
+//     sibling (B1); the vertex kernels search (rigid, vertex).
 //
 // S8 -- `stackSizeNeededOnDevice` gets the UNCLAMPED count times 16, from one
 //     thread of the whole grid, OUTSIDE the loop.  Same as B4.
@@ -1849,12 +1807,7 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gBTri.transformCache);
     Ptr<float> contactDistance = Ptr<float>(gBTri.contactDistance);
 
-    FcCtWriter w;
-    w.point = gBTri.b_outPoint;  w.normalPen = gBTri.b_outNormalPen;
-    w.bary = gBTri.b_outBarycentric; w.info = gBTri.b_outContactInfo;
-    w.count = gBTri.b_totalContactCount; w.byX = gBTri.b_contactByX;
-    w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
-    w.maxContacts = gBTri.b_maxNumContacts;
+    const PxgRigidDbContactWriterGpu w = btWriter();
 
     // S4: the loop runs over the BLOCK's base index, not over the thread's, and the
     // CUDA's warp-rounded bound is GONE rather than transcribed.  Both decisions are
@@ -1882,7 +1835,7 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         float4 normalPen = float4(0, 0, 0, 0);
         float4 bary = float4(0, 0, 0, 0);
         uint2 rigidId = uint2(0u, 0u);
-        uint pairInd1 = 0u;
+        uint64_t triRef = 0;
         uint rigidMaterialIndex = 0xFFFFFFFFu;
 
         // S5: clamp the ADDRESS; `i < numPairs` still decides the VALUE.
@@ -1903,20 +1856,14 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
             const uint clothId = clothShape.particleOrSoftbodyId;
             rigidMaterialIndex = rigidShape.materialIndex;
 
-            Ptr<uint4> vertIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices);
-            const uint4 triIdx = vertIndices[triangleId];
-
-            // S7: skip ONLY when all three corners are filtered.
-            const uint m0 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.x;
-            const uint m1 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.y;
-            const uint m2 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.z;
-            const bool skipTriangle =
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m0) &&
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m1) &&
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m2);
+            // S7 (5.12): a filter pair for this rigid and triangle suppresses it.
+            const bool skipTriangle = clothTriangleFiltered(gBTri.femClothes, clothId, rigidId, rigidCacheRef, triangleId);
 
             if (!skipTriangle)
             {
+                Ptr<uint4> vertIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices_ownedEdges);
+                const uint4 triIdx = vertIndices[triangleId];
+
                 const PxsCachedTransform rtc = transformCache[rigidCacheRef];
                 const float4 rigidQ = float4(rtc.qx, rtc.qy, rtc.qz, rtc.qw);
                 const float3 rigidP = float3(rtc.px, rtc.py, rtc.pz);
@@ -1944,7 +1891,7 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                 if (hit)
                 {
                     numContacts = 1u;
-                    pairInd1 = (clothId << PXG_CLOTH_ID_SHIFT) | triangleId;
+                    triRef = PxgEncodeDeformableTriangle(clothId, triangleId);
                     contact.w = Ptr<float>(gBTri.restDistance)[cmIdx];   // S6
                 }
             }
@@ -1974,8 +1921,8 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         const uint startIndex = sStStart[warpId];
 
         for (uint j = 0u; j < numContacts; ++j)
-            cgWriteContact(w, startIndex + exclusiveSum + j, contact, normalPen, bary,
-                           rigidId, pairInd1, rigidMaterialIndex);
+            w.writeSurfaceContact(startIndex + exclusiveSum + j, contact, normalPen,
+                                  dfNodeU64(rigidId), rigidMaterialIndex, triRef, bary);
 
         GroupMemoryBarrierWithGroupSync();
     }

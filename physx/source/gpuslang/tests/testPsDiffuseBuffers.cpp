@@ -99,11 +99,11 @@ static_assert(offsetof(PxgParticleDiffuseSimBuffer, mNumActiveDiffuseParticles) 
 static_assert(offsetof(PxgParticleDiffuseSimBuffer, mStartIndex) == 80, "@80");
 static_assert(offsetof(PxgParticleDiffuseSimBuffer, mFlags) == 84, "@84 -> 88");
 // The system-side fields these three walk.
-static_assert(offsetof(PxgParticleSystem, mDiffuseSimBuffers) == 448, "@448");
-static_assert(offsetof(PxgParticleSystem, mNumDiffuseBuffers) == 472, "@472");
-static_assert(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 488, "@488");
-static_assert(offsetof(PxgParticleSystem, mDiffusePosition_LifeTime) == 496, "@496");
-static_assert(offsetof(PxgParticleSystem, mDiffuseVelocity) == 504, "@504");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSimBuffers) == 432, "@432");
+static_assert(offsetof(PxgParticleSystem, mNumDiffuseBuffers) == 440, "@440");
+static_assert(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 448, "@448");
+static_assert(offsetof(PxgParticleSystem, mDiffusePosition_LifeTime) == 456, "@456");
+static_assert(offsetof(PxgParticleSystem, mDiffuseVelocity) == 464, "@464");
 
 struct F4 { float x, y, z, w; };
 struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };

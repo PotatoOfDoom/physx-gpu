@@ -59,7 +59,7 @@
 #include "PxgParticleSystem.h"     // PxgParticleSystem, PxgParticleSimBuffer, PxgParticleContactWriter, PxgParticlePrimitiveContact
 #include "PxgContactManager.h"     // PxgContactManagerInput
 #include "PxgConvexConvexShape.h"  // PxgShape
-#include "PxgSimulationCoreDesc.h" // PxgRigidFilterPair
+#include "PxgSimulationCoreDesc.h" // PxgDeformablePairInfo, PxgEncodeParticleRef
 #include "PxsTransformCache.h"     // PxsCachedTransform
 #include "PxNodeIndex.h"           // PxNodeIndex
 #include "geometry/PxGeometry.h"   // PxGeometryType
@@ -110,7 +110,8 @@ static void cpuQuatRotate(const float q[4], const float v[3], float out[3])
     out[2] = (vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2);
 }
 
-// The 176-byte engine ABI blob (15 args + the by-value 72-byte writer @104).
+// The 192-byte engine ABI blob (15 args; the by-value 80-byte PxgRigidParticleContactWriter
+// lands at @112 because the bridge aligns an 80-byte argument to 16 -- PhysX 5.12).
 struct PsCollideBlob
 {
     uint32_t isTGSWord;                        // @0
@@ -128,21 +129,52 @@ struct PsCollideBlob
     uint64_t totalNumPairs;                    // @80
     uint64_t particleSystems;                  // @88
     uint64_t shapeToRigidRemap;                // @96
-    // ---- PxgParticleContactWriter (by value, 72B) @104 ----
-    uint64_t w_particleContacts;               // @104
-    uint64_t w_numTotalContacts;               // @112
-    uint64_t w_contactSortedByParticle;        // @120
-    uint64_t w_tempContactByParticle;          // @128
-    uint64_t w_contactIndexSortedByParticle;   // @136
-    uint64_t w_contactByRigid;                 // @144
-    uint64_t w_tempContactByRigid;             // @152
-    uint64_t w_contactIndexSortedByRigid;      // @160
-    uint32_t w_maxContacts;                    // @168
-    uint32_t pad172;                           // @172 -> 176
+    uint64_t pad104;                           // @104 (paramAlign(80) = 16)
+    // ---- PxgRigidParticleContactWriter (by value, 80B) @112 ----
+    uint64_t w_particleContactInfos;           // @112
+    uint64_t w_particleContactNormalPens;      // @120
+    uint64_t w_numTotalContacts;               // @128
+    uint64_t w_contactSortedByParticle;        // @136
+    uint64_t w_tempContactByParticle;          // @144
+    uint64_t w_contactIndexSortedByParticle;   // @152
+    uint64_t w_contactByRigid;                 // @160
+    uint64_t w_tempContactByRigid;             // @168
+    uint64_t w_contactIndexSortedByRigid;      // @176
+    uint32_t w_maxContacts;                    // @184
+    uint32_t pad188;                           // @188 -> 192
 };
 
-// PxgParticlePrimitiveContact readback mirror (32 bytes).
+// The contact as the fixtures compare it (5.6.1's PxgParticlePrimitiveContact shape).
 struct HostContact { F4 normal_pen; uint64_t rigidId; uint64_t particleId; };
+
+// PhysX 5.12: PxgRigidParticleContactWriter writes the particle-rigid contact as two
+// SoA streams -- PxgDeformablePairInfo {ref0 = rigid PxNodeIndex, ref1 =
+// PxgEncodeParticleRef(system, sortedIndex)} and a float4 normalPen -- where 5.6.1
+// wrote one 32-byte PxgParticlePrimitiveContact.  The fixtures read both streams back
+// and reassemble the old record shape (rigidId = ref0, particleId = ref1).
+struct ContactStreams : DevBuf { PxgBufferHandle h2 = 0; uint64_t addr2 = 0; };
+static ContactStreams makeContacts(PxgSlangComputeDevice* dev, uint32_t n)
+{
+    ContactStreams c;
+    const DevBuf infos = makeDev(dev, std::vector<PxgDeformablePairInfo>(n, PxgDeformablePairInfo{ ~0ull, ~0ull }));
+    const DevBuf normalPens = makeDev(dev, std::vector<F4>(n, F4{ 0.0f, 0.0f, 0.0f, 0.0f }));
+    c.h = infos.h; c.addr = infos.addr;
+    c.h2 = normalPens.h; c.addr2 = normalPens.addr;
+    return c;
+}
+static std::vector<HostContact> downloadContacts(PxgSlangComputeDevice* dev, const ContactStreams& c, size_t n)
+{
+    const std::vector<PxgDeformablePairInfo> infos = downloadBuffer<PxgDeformablePairInfo>(dev, c.h, n);
+    const std::vector<F4> normalPens = downloadBuffer<F4>(dev, c.h2, n);
+    std::vector<HostContact> out(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i].normal_pen = normalPens[i];
+        out[i].rigidId = infos[i].ref0;
+        out[i].particleId = infos[i].ref1;
+    }
+    return out;
+}
 
 
 // ===========================================================================
@@ -298,23 +330,20 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
                             float approxPen, uint32_t expectPenBits, uint32_t* signCases)
 {
     // ---- pin every byte layout the ABI blob + shader bake in ----
-    static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
+    static_assert(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem stride");
     static_assert(sizeof(PxgContactManagerInput) == 16, "PxgContactManagerInput stride");
     static_assert(sizeof(PxgShape) == 48, "PxgShape stride");
     static_assert(offsetof(PxgShape, type) == 40, "PxgShape::type");
     static_assert(offsetof(PxgShape, particleOrSoftbodyId) == 44, "PxgShape::particleOrSoftbodyId");
     static_assert(sizeof(PxsCachedTransform) == 32, "PxsCachedTransform stride");
-    static_assert(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride");
-    static_assert(sizeof(PxgParticleSimBuffer) == 88, "PxgParticleSimBuffer stride");
-    static_assert(offsetof(PxgParticleSimBuffer, mFilterPairs) == 40, "mFilterPairs offset");
-    static_assert(offsetof(PxgParticleSimBuffer, mNumFilterPairs) == 64, "mNumFilterPairs offset");
-    // The by-value writer must be exactly 72 bytes so it fits the ABI blob tail.
-    static_assert(sizeof(PxgParticleContactWriter) == 72, "PxgParticleContactWriter by-value size");
-    static_assert(sizeof(PsCollideBlob) == 176, "engine ABI blob size");
+    static_assert(sizeof(PxgParticleSimBuffer) == 48, "PxgParticleSimBuffer stride");
+    // The by-value writer is 80 bytes; the bridge aligns it to 16 (@112).
+    static_assert(sizeof(PxgRigidParticleContactWriter) == 80, "PxgRigidParticleContactWriter by-value size");
+    static_assert(sizeof(PsCollideBlob) == 192, "engine ABI blob size");
     static_assert(offsetof(PsCollideBlob, cmInputs) == 16, "cmInputs @16");
-    static_assert(offsetof(PsCollideBlob, w_particleContacts) == 104, "writer @104");
-    static_assert(offsetof(PsCollideBlob, w_maxContacts) == 168, "maxContacts @168");
-    static_assert(sizeof(PxgParticlePrimitiveContact) == 32, "PxgParticlePrimitiveContact stride");
+    static_assert(offsetof(PsCollideBlob, w_particleContactInfos) == 112, "writer @112");
+    static_assert(offsetof(PsCollideBlob, w_maxContacts) == 184, "maxContacts @184");
+    static_assert(sizeof(PxgDeformablePairInfo) == 16, "PxgDeformablePairInfo stride");
 
     PxgSlangComputeDevice* dev = testDevice();
 
@@ -365,11 +394,9 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
     DevBuf bS2U       = makeDev(dev, sortedToUnsorted);
     DevBuf bRunsum    = makeDev(dev, bufferRunsum);
 
-    // one sim buffer with NO rigid filter pairs -> find() always false
+    // one sim buffer (5.12 has no particle-rigid filter pairs any more)
     std::vector<PxgParticleSimBuffer> simBuffers(1);
     std::memset(simBuffers.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBuffers[0].mNumFilterPairs = 0u;
-    simBuffers[0].mFilterPairs = nullptr;
     DevBuf bSimBuf = makeDev(dev, simBuffers);
 
     PxgParticleSystem ps = makeZeroPs();
@@ -439,16 +466,14 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
 
     // ---- writer output buffers ----
     const uint32_t MAX_CONTACTS = 64u;
-    std::vector<HostContact> contacts(MAX_CONTACTS);
-    std::memset(contacts.data(), 0, contacts.size() * sizeof(HostContact));
-    std::vector<uint32_t> count = { 0u };
+        std::vector<uint32_t> count = { 0u };
     std::vector<uint64_t> sortedByParticle(MAX_CONTACTS, 0xffffffffffffffffull);
     std::vector<uint32_t> tempByParticle(MAX_CONTACTS, 0xffffffffu);
     std::vector<uint32_t> idxByParticle(MAX_CONTACTS, 0xffffffffu);
     std::vector<uint64_t> byRigid(MAX_CONTACTS, 0xffffffffffffffffull);
     std::vector<uint32_t> tempByRigid(MAX_CONTACTS, 0xffffffffu);
     std::vector<uint32_t> idxByRigid(MAX_CONTACTS, 0xffffffffu);
-    DevBuf bContacts = makeDev(dev, contacts);
+    ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS);
     DevBuf bCount = makeDev(dev, count);
     DevBuf bSbP = makeDev(dev, sortedByParticle);
     DevBuf bTbP = makeDev(dev, tempByParticle);
@@ -474,7 +499,7 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
     blob.totalNumPairs = bTotal.addr;
     blob.particleSystems = bDesc.addr;
     blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2;
     blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr;
     blob.w_tempContactByParticle = bTbP.addr;
@@ -493,7 +518,7 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
     PXG_CHECK_MSG(gCount == 1u, "%s: writer emitted %u contacts (expected 1)", isTGS ? "TGS" : "PGS", gCount);
 
-    const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, 1);
+    const auto gC = downloadContacts(dev, bContacts, 1);
     const HostContact& ct = gC[0];
 
     size_t mm = 0;
@@ -534,7 +559,7 @@ static void runPlaneContact(bool isTGS, const float particlePosIn[3], const floa
 
     PxgBufferHandle all[] = { bOrigin.h, bPred.h, bCellStart.h, bCellEnd.h, bS2U.h, bRunsum.h, bSimBuf.h,
                               bDesc.h, bCin.h, bShapes.h, bTc.h, bBounds.h, bCd.h, bRd.h, bMat.h,
-                              bStart.h, bTotal.h, bRemap.h, bContacts.h, bCount.h, bSbP.h, bTbP.h,
+                              bStart.h, bTotal.h, bRemap.h, bContacts.h, bContacts.h2, bCount.h, bSbP.h, bTbP.h,
                               bIbP.h, bBr.h, bTbr.h, bIbr.h };
     for (PxgBufferHandle h : all)
         dev->destroyBuffer(h);
@@ -718,7 +743,7 @@ static void runGridContact(bool isTGS)
     DevBuf bRemap = makeDev(dev, remap);
 
     const uint32_t MAX_CONTACTS = 2048u;
-    DevBuf bContacts = makeDev(dev, std::vector<HostContact>(MAX_CONTACTS));
+    ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS);
     DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
     DevBuf bSbP = makeDev(dev, std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
     DevBuf bTbP = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
@@ -738,7 +763,7 @@ static void runGridContact(bool isTGS)
     blob.materials = bMat.addr;            blob.startIndices = bStart.addr;
     blob.totalNumPairs = bTotal.addr;      blob.particleSystems = bDesc.addr;
     blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2;
     blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr;
     blob.w_tempContactByParticle = bTbP.addr;
@@ -759,7 +784,7 @@ static void runGridContact(bool isTGS)
                   "oracle predicts %zu", lbl, gCount, want.size());
     if (gCount == uint32_t(want.size()) && gCount > 0u)
     {
-        const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, std::min(gCount, MAX_CONTACTS));
+        const auto gC = downloadContacts(dev, bContacts, std::min(gCount, MAX_CONTACTS));
         std::vector<bool> used(want.size(), false);
         size_t mm = 0;
         for (uint32_t a = 0; a < gCount && a < MAX_CONTACTS; ++a)
@@ -798,7 +823,7 @@ static void runGridContact(bool isTGS)
 
     for (PxgBufferHandle h : { bPos.h, bCellStart.h, bCellEnd.h, bS2U.h, bRunsum.h, bSimBuf.h,
                                bDesc.h, bCin.h, bShapes.h, bTc.h, bBounds.h, bCd.h, bRd.h,
-                               bMat.h, bStart.h, bTotal.h, bRemap.h, bContacts.h, bCount.h,
+                               bMat.h, bStart.h, bTotal.h, bRemap.h, bContacts.h, bContacts.h2, bCount.h,
                                bSbP.h, bTbP.h, bIbP.h, bBr.h, bTbr.h, bIbr.h })
         dev->destroyBuffer(h);
 }
@@ -915,12 +940,10 @@ static void runCapsuleNaNContact(bool isTGS)
     DevBuf bRemap = makeDev(dev, remap);
 
     const uint32_t MAX_CONTACTS = 64u;
-    std::vector<HostContact> contacts(MAX_CONTACTS);
-    std::memset(contacts.data(), 0, contacts.size() * sizeof(HostContact));
-    std::vector<uint32_t> count = { 0u };
+        std::vector<uint32_t> count = { 0u };
     std::vector<uint64_t> u64s(MAX_CONTACTS, 0xffffffffffffffffull);
     std::vector<uint32_t> u32s(MAX_CONTACTS, 0xffffffffu);
-    DevBuf bContacts = makeDev(dev, contacts);
+    ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS);
     DevBuf bCount = makeDev(dev, count);
     DevBuf bSbP = makeDev(dev, u64s), bTbP = makeDev(dev, u32s), bIbP = makeDev(dev, u32s);
     DevBuf bBr = makeDev(dev, u64s), bTbr = makeDev(dev, u32s), bIbr = makeDev(dev, u32s);
@@ -934,7 +957,7 @@ static void runCapsuleNaNContact(bool isTGS)
     blob.bounds = bBounds.addr; blob.contactDistance = bCd.addr; blob.restDistances = bRd.addr;
     blob.materials = bMat.addr; blob.startIndices = bStart.addr; blob.totalNumPairs = bTotal.addr;
     blob.particleSystems = bDesc.addr; blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr; blob.w_numTotalContacts = bCount.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2; blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr; blob.w_tempContactByParticle = bTbP.addr;
     blob.w_contactIndexSortedByParticle = bIbP.addr; blob.w_contactByRigid = bBr.addr;
     blob.w_tempContactByRigid = bTbr.addr; blob.w_contactIndexSortedByRigid = bIbr.addr;
@@ -949,7 +972,7 @@ static void runCapsuleNaNContact(bool isTGS)
                   isTGS ? "TGS" : "PGS", gCount);
     if (gCount == 1u)
     {
-        const HostContact ct = downloadBuffer<HostContact>(dev, bContacts.h, 1)[0];
+        const HostContact ct = downloadContacts(dev, bContacts, 1)[0];
         PXG_CHECK_MSG(fbits(ct.normal_pen.x) == fbits(refN[0]) && fbits(ct.normal_pen.y) == fbits(refN[1]) &&
                       fbits(ct.normal_pen.z) == fbits(refN[2]) && std::isnan(ct.normal_pen.w),
                       "%s: capsule NaN contact normal/pen %08x %08x %08x %08x, CUDA (1,0,0) / NaN", isTGS ? "TGS" : "PGS",
@@ -960,7 +983,7 @@ static void runCapsuleNaNContact(bool isTGS)
     }
     for (PxgBufferHandle h : { bOrigin.h, bPred.h, bCellStart.h, bCellEnd.h, bS2U.h, bRunsum.h, bSimBuf.h,
                                bDesc.h, bCin.h, bShapes.h, bTc.h, bBounds.h, bCd.h, bRd.h, bMat.h, bStart.h,
-                               bTotal.h, bRemap.h, bContacts.h, bCount.h, bSbP.h, bTbP.h, bIbP.h, bBr.h, bTbr.h, bIbr.h })
+                               bTotal.h, bRemap.h, bContacts.h, bContacts.h2, bCount.h, bSbP.h, bTbP.h, bIbP.h, bBr.h, bTbr.h, bIbr.h })
         dev->destroyBuffer(h);
 }
 
@@ -1610,7 +1633,7 @@ static void runP89DotOrder(bool isTGS)
     DevBuf bBounds = mk(boundsF);
 
     const uint32_t MAX_CONTACTS = 4096u;
-    DevBuf bContacts = mk(std::vector<HostContact>(MAX_CONTACTS));
+    ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS);
     DevBuf bCount = mk(std::vector<uint32_t>{ 0u });
     DevBuf bSbP = mk(std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
     DevBuf bTbP = mk(std::vector<uint32_t>(MAX_CONTACTS, ~0u));
@@ -1630,7 +1653,7 @@ static void runP89DotOrder(bool isTGS)
     blob.materials = bMat.addr;            blob.startIndices = bStart.addr;
     blob.totalNumPairs = bTotal.addr;      blob.particleSystems = bDesc.addr;
     blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2;
     blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr;
     blob.w_tempContactByParticle = bTbP.addr;
@@ -1649,11 +1672,11 @@ static void runP89DotOrder(bool isTGS)
         PXG_CHECK_MSG(gCount == uint32_t(want.size()), "%s: fluid kernel emitted %u contacts, the CUDA-order "
                       "mirror predicts %zu", lbl, gCount, want.size());
         const uint32_t n = std::min(gCount, MAX_CONTACTS);
-        const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, n);
+        const auto gC = downloadContacts(dev, bContacts, n);
         std::vector<Hit> got;
         for (uint32_t a = 0; a < n; ++a)
         {
-            const uint32_t sys = uint32_t(gC[a].particleId >> 32), part = uint32_t(gC[a].particleId & 0xffffffffu);
+            const uint32_t sys = PxgGetParticleSystemId(gC[a].particleId), part = PxgGetParticleIndex(gC[a].particleId);
             const uint32_t rig = uint32_t(gC[a].rigidId - NODE_BASE);
             got.push_back(Hit{ sys, part, rig, gC[a].normal_pen });
         }
@@ -1810,7 +1833,7 @@ static void runCompaction(bool isTGS)
     const uint32_t wantTotal = want[0] + want[1] + want[2];
 
     const uint32_t MAX_CONTACTS = wantTotal + 64u;
-    DevBuf bContacts = makeDev(dev, std::vector<HostContact>(MAX_CONTACTS));
+    ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS);
     DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
     DevBuf bSbP = makeDev(dev, std::vector<uint64_t>(MAX_CONTACTS, ~0ull));
     DevBuf bTbP = makeDev(dev, std::vector<uint32_t>(MAX_CONTACTS, ~0u));
@@ -1830,7 +1853,7 @@ static void runCompaction(bool isTGS)
     blob.materials = bMat.addr;            blob.startIndices = bStart.addr;
     blob.totalNumPairs = bTotal.addr;      blob.particleSystems = bDesc.addr;
     blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2;
     blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr;
     blob.w_tempContactByParticle = bTbP.addr;
@@ -1848,7 +1871,7 @@ static void runCompaction(bool isTGS)
     PXG_CHECK_MSG(gCount == wantTotal, "%s: %u contacts from %u work items, expected %u", lbl, gCount, NB_ITEMS,
                   wantTotal);
     const uint32_t n = std::min(gCount, MAX_CONTACTS);
-    const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, n);
+    const auto gC = downloadContacts(dev, bContacts, n);
     uint32_t got[3] = { 0u, 0u, 0u }, bad = 0u;
     F4 first[3] = {};
     bool seen[3] = { false, false, false };
@@ -1864,10 +1887,11 @@ static void runCompaction(bool isTGS)
     for (uint32_t p = 0; p < 3u; ++p)
         PXG_CHECK_MSG(got[p] == want[p], "%s: particle %u got %u contacts, expected %u (one per work item of "
                       "its cell)", lbl, p, got[p], want[p]);
-    for (const DevBuf* b : { &bOrigin, &bPred, &bCellStart, &bCellEnd, &bS2U, &bRunsum, &bSimBuf, &bDesc, &bCin,
-                             &bShapes, &bTc, &bBounds, &bCd, &bRd, &bMat, &bStart, &bTotal, &bRemap, &bContacts,
-                             &bCount, &bSbP, &bTbP, &bIbP, &bBr, &bTbr, &bIbr })
+    for (const DevBuf* b : std::initializer_list<const DevBuf*>{ &bOrigin, &bPred, &bCellStart, &bCellEnd, &bS2U, &bRunsum, &bSimBuf, &bDesc, &bCin,
+                             &bShapes, &bTc, &bBounds, &bCd, &bRd, &bMat, &bStart, &bTotal, &bRemap,
+                             static_cast<const DevBuf*>(&bContacts), &bCount, &bSbP, &bTbP, &bIbP, &bBr, &bTbr, &bIbr })
         dev->destroyBuffer(b->h);
+    dev->destroyBuffer(bContacts.h2);
 }
 
 PXG_TEST(psContactGen_compactionPGS) { runCompaction(false); }

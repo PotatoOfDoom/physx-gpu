@@ -37,16 +37,17 @@
 //      Sorted result compared bitwise vs a CPU stable sort (both channels).
 //  (b) psContactSort_reorder — ps_reorderPrimitiveContactsLaunch gathers the two
 //      sorted contact arrays through two independent rank permutations; checked
-//      bit-exact vs the CPU gather.
+//      bit-exact vs the CPU gather.  PhysX 5.12: each array is the SoA pair of
+//      PxgDeformablePairInfo and float4 normalPen streams (nine pointers).
 //  (c) psContactSort_findStartEnd — the 2-pass ps_findStartEndParticle{First,
 //      Second} produces each particle's [start,end) contact range + the pair
 //      count for a known sorted-by-particle contact set; checked bit-exact.
+//      PhysX 5.12: the records are PxgDeformablePairInfo {ref0, ref1} (16 B) and
+//      the key is ref1, the PxgParticleRef.
 //  (d) psContactSort_findStartEndFem (P9.48a) — the FEM twins of (c),
-//      ps_findStartEndFEM{First,Second}Launch, over PxgFemOtherContactInfo
-//      (16 B) instead of PxgParticlePrimitiveContact (32 B).  Same reference,
-//      because the CUDA is the same algorithm on a different record: what this
-//      pins is that the port reads pairInd0 at @0 with a 16-byte stride and not
-//      particleId at @24 with a 32-byte one.
+//      ps_findStartEndFEM{First,Second}Launch.  Same reference, because the CUDA
+//      is the same algorithm keyed on the other half of the pair: what this pins
+//      is that the FEM twins read ref0 @0 and the particle twins ref1 @8.
 
 #include "pxgTestFramework.h"
 
@@ -63,14 +64,10 @@ namespace
 using namespace pxgtest;
 
 struct F4 { float x, y, z, w; };
-// PxgParticlePrimitiveContact (PxgParticleSystem.h, 32 bytes).
-struct PsContact { F4 normal_pen; uint32_t rigidLo, rigidHi, particleLo, particleHi; };
-static_assert(sizeof(PsContact) == 32, "PsContact stride");
-// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes).
-struct FemOtherContactInfo { uint32_t pairLo, pairHi, pairInd1, rigidMatInd; };
-static_assert(sizeof(FemOtherContactInfo) == 16, "FemOtherContactInfo stride");
-static_assert(offsetof(FemOtherContactInfo, pairInd1) == 8, "pairInd1 @8");
-static_assert(offsetof(FemOtherContactInfo, rigidMatInd) == 12, "rigidMatInd @12");
+// PxgDeformablePairInfo (PxgSimulationCoreDesc.h, PhysX 5.12): {PxU64 ref0, ref1}, 16 B.
+struct PairInfo { uint64_t ref0, ref1; };
+static_assert(sizeof(PairInfo) == 16, "PxgDeformablePairInfo stride");
+static_assert(offsetof(PairInfo, ref1) == 8, "ref1 @8");
 
 static uint64_t addrOf(PxgSlangComputeDevice* dev, PxgBufferHandle h)
 {
@@ -191,7 +188,8 @@ PXG_TEST(psContactSort_reorder)
     PxgSlangComputeDevice* dev = testDevice();
 
     const uint32_t NC = 5000; // multiple device blocks / iterations
-    std::vector<PsContact> contacts(NC);
+    struct RawContact { F4 normal_pen; uint32_t rigidLo, rigidHi, particleLo, particleHi; };
+    std::vector<RawContact> contacts(NC);
     for (uint32_t i = 0; i < NC; ++i)
     {
         contacts[i].normal_pen = { float(rng()), float(rng()), float(rng()), float(rng()) };
@@ -204,37 +202,58 @@ PXG_TEST(psContactSort_reorder)
     std::shuffle(remapByRigid.begin(), remapByRigid.end(), rng);
     std::shuffle(remapByParticle.begin(), remapByParticle.end(), rng);
 
-    PxgBufferHandle bContacts = createBufferFrom(dev, contacts);
+    // PhysX 5.12: the contact is two SoA streams -- PxgDeformablePairInfo {ref0, ref1}
+    // and a float4 normalPen -- gathered through the same two remaps.
+    std::vector<PairInfo> infos(NC);
+    std::vector<F4> normalPens(NC);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        infos[i].ref0 = (uint64_t(contacts[i].rigidHi) << 32) | contacts[i].rigidLo;
+        infos[i].ref1 = (uint64_t(contacts[i].particleHi) << 32) | contacts[i].particleLo;
+        normalPens[i] = contacts[i].normal_pen;
+    }
+    PxgBufferHandle bInfos = createBufferFrom(dev, infos);
+    PxgBufferHandle bNp = createBufferFrom(dev, normalPens);
     PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, NC));
     PxgBufferHandle bRemapR = createBufferFrom(dev, remapByRigid);
     PxgBufferHandle bRemapP = createBufferFrom(dev, remapByParticle);
-    PxgBufferHandle bOutR = createBufferFrom(dev, std::vector<PsContact>(NC));
-    PxgBufferHandle bOutP = createBufferFrom(dev, std::vector<PsContact>(NC));
-    if (!addrOf(dev, bContacts)) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    PxgBufferHandle bOutInfoR = createBufferFrom(dev, std::vector<PairInfo>(NC, PairInfo{ ~0ull, ~0ull }));
+    PxgBufferHandle bOutNpR = createBufferFrom(dev, std::vector<F4>(NC));
+    PxgBufferHandle bOutInfoP = createBufferFrom(dev, std::vector<PairInfo>(NC, PairInfo{ ~0ull, ~0ull }));
+    PxgBufferHandle bOutNpP = createBufferFrom(dev, std::vector<F4>(NC));
+    if (!addrOf(dev, bInfos)) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
+    // The 5.12 nine-pointer pack (kPsReorderContacts).
     struct ReorderPush
     {
-        uint64_t particleContacts, numParticleContacts, remapByRigid, remapByParticle,
-            sortedContactsByRigid, sortedContactsByParticle;
+        uint64_t particleContactInfos, particleContactNormalPens, numParticleContacts, remapByRigid,
+            remapByParticle, sortedContactInfosByRigid, sortedContactNormalPensByRigid,
+            sortedContactInfosByParticle, sortedContactNormalPensByParticle;
     };
-    ReorderPush push = { addrOf(dev, bContacts), addrOf(dev, bNum), addrOf(dev, bRemapR),
-                         addrOf(dev, bRemapP), addrOf(dev, bOutR), addrOf(dev, bOutP) };
+    static_assert(sizeof(ReorderPush) == 72, "the 9-pointer reorder blob");
+    ReorderPush push = { addrOf(dev, bInfos), addrOf(dev, bNp), addrOf(dev, bNum), addrOf(dev, bRemapR),
+                         addrOf(dev, bRemapP), addrOf(dev, bOutInfoR), addrOf(dev, bOutNpR),
+                         addrOf(dev, bOutInfoP), addrOf(dev, bOutNpP) };
     Kernel k("psContactSortBda.spv", "ps_reorderPrimitiveContactsLaunch", {}, sizeof(ReorderPush));
     k.dispatch(32u, {}, push); // grid BOUNDCELLUPDATE
     dev->flush();
 
-    const auto gR = downloadBuffer<PsContact>(dev, bOutR, NC);
-    const auto gP = downloadBuffer<PsContact>(dev, bOutP, NC);
+    const auto gIR = downloadBuffer<PairInfo>(dev, bOutInfoR, NC);
+    const auto gNR = downloadBuffer<F4>(dev, bOutNpR, NC);
+    const auto gIP = downloadBuffer<PairInfo>(dev, bOutInfoP, NC);
+    const auto gNP = downloadBuffer<F4>(dev, bOutNpP, NC);
     size_t bad = 0;
     for (uint32_t i = 0; i < NC; ++i)
     {
-        if (std::memcmp(&gR[i], &contacts[remapByRigid[i]], sizeof(PsContact)) != 0) ++bad;
-        if (std::memcmp(&gP[i], &contacts[remapByParticle[i]], sizeof(PsContact)) != 0) ++bad;
+        if (std::memcmp(&gIR[i], &infos[remapByRigid[i]], sizeof(PairInfo)) != 0) ++bad;
+        if (std::memcmp(&gNR[i], &normalPens[remapByRigid[i]], sizeof(F4)) != 0) ++bad;
+        if (std::memcmp(&gIP[i], &infos[remapByParticle[i]], sizeof(PairInfo)) != 0) ++bad;
+        if (std::memcmp(&gNP[i], &normalPens[remapByParticle[i]], sizeof(F4)) != 0) ++bad;
     }
     PXG_CHECK_MSG(bad == 0, "reorder dual gather bit-exact (%zu mismatches)", bad);
 
-    dev->destroyBuffer(bContacts); dev->destroyBuffer(bNum); dev->destroyBuffer(bRemapR);
-    dev->destroyBuffer(bRemapP); dev->destroyBuffer(bOutR); dev->destroyBuffer(bOutP);
+    for (PxgBufferHandle h : { bInfos, bNp, bNum, bRemapR, bRemapP, bOutInfoR, bOutNpR, bOutInfoP, bOutNpP })
+        dev->destroyBuffer(h);
 }
 
 // ===========================================================================
@@ -250,7 +269,7 @@ PXG_TEST(psContactSort_findStartEnd)
     // Build a sorted-by-particle contact set: consecutive runs of equal 64-bit
     // particle ids (distinct per group, exercising both halves of the id).  ~40
     // device blocks -> 2 iterations per block, boundary handling exercised.
-    std::vector<PsContact> contacts;
+    std::vector<PairInfo> contacts;
     std::vector<uint64_t> groupId;   // per group
     std::uniform_int_distribution<uint32_t> runLen(1u, 9u);
     uint32_t g = 0;
@@ -261,11 +280,9 @@ PXG_TEST(psContactSort_findStartEnd)
         const uint32_t len = runLen(rng);
         for (uint32_t r = 0; r < len; ++r)
         {
-            PsContact ct;
-            ct.normal_pen = { float(rng()), float(rng()), float(rng()), float(rng()) };
-            ct.rigidLo = rng(); ct.rigidHi = rng();
-            ct.particleLo = uint32_t(pid & 0xffffffffu);
-            ct.particleHi = uint32_t(pid >> 32);
+            PairInfo ct;
+            ct.ref0 = (uint64_t(rng()) << 32) | rng();   // decoy: the rigid, changes every contact
+            ct.ref1 = pid;
             contacts.push_back(ct);
         }
         ++g;
@@ -279,9 +296,7 @@ PXG_TEST(psContactSort_findStartEnd)
         uint32_t gc = 0; // groups seen so far
         for (uint32_t i = 0; i < NC; ++i)
         {
-            const bool isStart = (i == 0) ||
-                contacts[i].particleLo != contacts[i - 1].particleLo ||
-                contacts[i].particleHi != contacts[i - 1].particleHi;
+            const bool isStart = (i == 0) || contacts[i].ref1 != contacts[i - 1].ref1;
             if (isStart)
             {
                 if (gc > 0) refEnd.push_back(i);
@@ -306,7 +321,7 @@ PXG_TEST(psContactSort_findStartEnd)
     // pass 1: particleSystems ptr is ABI-parity only (never dereferenced) -> 0.
     struct Find1Push
     {
-        uint64_t particleSystems, sortedContacts, numContacts, blockOffsets, offsets;
+        uint64_t particleSystems, sortedContactInfos, numContacts, blockOffsets, offsets;
     };
     Find1Push p1 = { 0ull, addrOf(dev, bContacts), addrOf(dev, bNum),
                      addrOf(dev, bBlockOff), addrOf(dev, bOffsets) };
@@ -323,7 +338,7 @@ PXG_TEST(psContactSort_findStartEnd)
     // pass 2: per-particle [start,end) + total pair count.
     struct Find2Push
     {
-        uint64_t sortedContacts, numContacts, blockOffsets, offsets, totalNumPairs,
+        uint64_t sortedContactInfos, numContacts, blockOffsets, offsets, totalNumPairs,
             rangeStart, rangeEnd;
     };
     Find2Push p2 = { addrOf(dev, bContacts), addrOf(dev, bNum), addrOf(dev, bBlockOff),
@@ -356,13 +371,10 @@ PXG_TEST(psContactSort_findStartEnd)
 // (d) ps_findStartEndFEM{First,Second} — the FEM twins of (c).  P9.48a.
 //
 // The reference is deliberately the SAME one (c) uses, because the CUDA twins
-// are the same algorithm.  What differs, and what this fixture pins, is the
-// RECORD: pairInd0 lives at @0 of a 16-byte PxgFemOtherContactInfo, where the
-// particle twin reads particleId at @24 of a 32-byte contact.  Both of the
-// neighbouring fields (pairInd1 @8, rigidMatInd @12) are seeded with values that
-// look like plausible particle ids, so a port that read the wrong offset or
-// strode the wrong distance produces garbage ranges rather than agreeing by
-// luck.
+// are the same algorithm.  What differs, and what this fixture pins, is the KEY:
+// ref0 (@0) of the PxgDeformablePairInfo, where the particle twin reads ref1 (@8).
+// ref1 is seeded with values that change every contact, so a port that read the
+// wrong half produces garbage ranges rather than agreeing by luck.
 // ===========================================================================
 PXG_TEST(psContactSort_findStartEndFem)
 {
@@ -371,7 +383,7 @@ PXG_TEST(psContactSort_findStartEndFem)
 
     const uint32_t BLOCK = 512u, GRID = 32u;
 
-    std::vector<FemOtherContactInfo> infos;
+    std::vector<PairInfo> infos;
     std::uniform_int_distribution<uint32_t> runLen(1u, 9u);
     uint32_t g = 0;
     uint64_t prevPid = 0;
@@ -404,31 +416,25 @@ PXG_TEST(psContactSort_findStartEndFem)
         const uint32_t len = runLen(rng);
         for (uint32_t r = 0; r < len; ++r)
         {
-            FemOtherContactInfo ci;
-            ci.pairLo = uint32_t(pid & 0xffffffffu);
-            ci.pairHi = uint32_t(pid >> 32);
-            // DECOYS: both neighbours carry values that change every contact, so
-            // a read at @8 or @12 -- or a 32-byte stride -- cannot reproduce the
-            // runs.  A stride of 32 would also skip every other record, which the
-            // range comparison sees immediately.
-            ci.pairInd1 = rng();
-            ci.rigidMatInd = rng();
+            PairInfo ci;
+            ci.ref0 = pid;
+            // DECOY: ref1 changes every contact, so a read of the wrong half cannot
+            // reproduce the runs.
+            ci.ref1 = (uint64_t(rng()) << 32) | rng();
             infos.push_back(ci);
         }
         ++g;
     }
     const uint32_t NC = uint32_t(infos.size());
 
-    // CPU reference, written from particlesystem.cu:2519/:2644: a range starts
-    // wherever pairInd0 differs from the previous contact's.
+    // CPU reference, written from particlesystem.cu (5.12): a range starts wherever
+    // ref0 differs from the previous contact's.
     std::vector<uint32_t> refOffsets(NC), refStart, refEnd;
     {
         uint32_t gc = 0;
         for (uint32_t i = 0; i < NC; ++i)
         {
-            const bool isStart = (i == 0) ||
-                infos[i].pairLo != infos[i - 1].pairLo ||
-                infos[i].pairHi != infos[i - 1].pairHi;
+            const bool isStart = (i == 0) || infos[i].ref0 != infos[i - 1].ref0;
             if (isStart)
             {
                 if (gc > 0) refEnd.push_back(i);
@@ -452,7 +458,7 @@ PXG_TEST(psContactSort_findStartEndFem)
 
     struct Find1Push
     {
-        uint64_t particleSystems, sortedContactsInfo, numContacts, blockOffsets, offsets;
+        uint64_t particleSystems, sortedContactInfos, numContacts, blockOffsets, offsets;
     };
     static_assert(sizeof(Find1Push) == 40, "FEM pass-1 blob must be 40 bytes");
     Find1Push p1 = { 0ull, addrOf(dev, bInfos), addrOf(dev, bNum),
@@ -506,12 +512,12 @@ PXG_TEST(psContactSort_findStartEndFem)
     PXG_CHECK_MSG(totalPairs > 1500u, "FEM findStartEnd coverage thin (pairs=%u NC=%u)",
                   totalPairs, NC);
     // Teeth for the 64-bit id: without transitions of BOTH kinds, a port that
-    // compared one half of pairInd0 passes.  Measured, not assumed.
+    // compared one half of ref0 passes.  Measured, not assumed.
     PXG_CHECK_MSG(highOnlyTransitions > 100u,
-                  "runs separated ONLY by the HIGH half of pairInd0: %u -- too few to "
+                  "runs separated ONLY by the HIGH half of ref0: %u -- too few to "
                   "kill a low-half-only comparison", highOnlyTransitions);
     PXG_CHECK_MSG(lowOnlyTransitions > 100u,
-                  "runs separated ONLY by the LOW half of pairInd0: %u -- too few to "
+                  "runs separated ONLY by the LOW half of ref0: %u -- too few to "
                   "kill a high-half-only comparison", lowOnlyTransitions);
     std::printf("  id transitions: %u high-only, %u low-only, %u pairs over %u contacts\n",
                 highOnlyTransitions, lowOnlyTransitions, totalPairs, NC);

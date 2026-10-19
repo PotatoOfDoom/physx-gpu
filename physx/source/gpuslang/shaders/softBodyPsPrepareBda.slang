@@ -24,136 +24,54 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// softBodyPsPrepareBda.slang
+// softBodyPsPrepareBda.slang -- sb_particleContactPrepareLaunch (softBody.cu, PhysX 5.12),
+// the prepare of the softbody-vs-particle contact chain.  Launch: grid 1024, block 256.
 //
-// P9.39d -- sb_particleContactPrepareLaunch
-// gpusimulationcontroller/src/CUDA/softBody.cu:844 (wrapper), :640
-// (barycentricProject), softBody.cuh:38 (getSoftBodyInvMass),
-// PxgFEMCore.h:184 (PxgFEMParticleConstraintBlock),
-// PxgSimulationCoreDesc.h:110/:118/:127/:150/:155 (the id encodings) -- all read in
-// full.  Launch: PxgSoftBodyCore.cpp:2315, grid 1024, block 256.
+// For every valid pair {ref0 = PxgParticleRef (system, SORTED particle index),
+// ref1 = simulation-mesh tetrahedron ref} it zeroes both applied-force streams (float2,
+// before the validity guard) and writes one PxgParticleDbContactBlock lane:
 //
-// The FOURTH link of the softbody-vs-particle chain: P9.39a finds pairs, P9.39c
-// writes contacts, sb_other_contact_remap_to_simLaunch (already mapped, P8.2) moves
-// them onto the SIMULATION mesh, and this turns each into a solver constraint.
+//   normal_pen       the NEGATED narrowphase normal and
+//                    pen = normal_pen.w - (particleDelta - tetDelta).normal - restDistance,
+//                    the narrowphase raw distance re-referenced to the start of the step,
+//                    restDistance = particleSystem.mRestOffset + softbody.mRestOffset;
+//   barycentric      the contact's tet barycentric (the solves read the tet from it);
+//   maxPenBiasClamp  the pair max of the softbody's and the particle system's clamps.
 //
-// The cloth twin is femClothPsPrepareBda (P9.31) and most of this file is that file
-// with a tetrahedron where it has a triangle.  The differences are enumerated under
-// Q3, Q4 and Q6 below, and they are the whole reason this is not a copy with three
-// identifiers renamed.
+// 5.12 dropped the velMultiplier slot (the solves build the denominator from the refCount-
+// inflated masses) and the 5.6.1 getSoftBodyInvMass L2-norm scale with it.  There is no
+// maxContacts clamp and no write-back here, unlike the two sibling prepares.  `contacts`
+// is unread, as in the CUDA.  Q-note kept from 5.6.1: the applied-force arrays are float2
+// written densely at stride 8, two distinct buffers (softbody side, particle side).
 //
-// ---------------------------------------------------------------------------
-// TRAPS
-// ---------------------------------------------------------------------------
-// Q1 -- THE TET INDEX IS A SIMULATION-MESH TET, AND THE ARRAYS ARE THE SORTED COPIES.
-//     Two separate stages sit between the contact gen and this kernel and it is worth
-//     naming both, because a fixture author who knows only one of them will build the
-//     wrong scene:
-//       * sb_other_contact_remap_to_simLaunch (softbodyPrimitives.cu:2132, mapped since
-//         P8.2) rewrites pairInd1 and the barycentric from the COLLISION-mesh tet the
-//         contact gen encoded (softbodyPrimitives.cu:2078) onto the SIMULATION mesh;
-//       * the buffers this kernel is handed are then the PARTICLE-SORTED copies --
-//         mParticleSortedContactPointBuffer / NormalPen / Barycentric / ContactInfo
-//         (PxgSoftBodyCore.cpp:2288-2295), not the remap's output arrays.
-//     So this kernel reads mSimTetIndices (@80) and mSimDeltaPos (@128), never
-//     mTetIndices (@16) or mPosition_InvMass (@64).  Both index the same descriptor and
-//     both compile.
-//
-// Q2 -- THE PARTICLE INDEX IS THE SORTED ONE.  pairInd0's low dword is the SORTED
-//     index, which is what mSortedDeltaP wants.  Its sibling contact-gen kernel uses
-//     BOTH kinds thirty lines apart -- the unsorted one only for the filter -- so
-//     "the particle index" is not a single thing in this chain.
-//
-// Q3 -- getSoftBodyInvMass SCALES BY THE L2 NORM OF THE BARYCENTRIC VECTOR, and the
-//     cloth twin has NO such scale: FEMClothConstraintPrep.cu:353 uses delta1.w raw
-//     where softBody.cuh:38 returns `baryMass * sqrt(bx^2+by^2+bz^2+bw^2)`.  Dropping
-//     it gives every softbody-particle contact the wrong stiffness, and nothing about
-//     the two files' shape suggests the difference.
-//     (The sqrt is written out, NOT `length(bary)` -- see the module.)
-//
-// Q4 -- barycentricProject IS FULL float4 ARITHMETIC and the .w that falls out is the
-//     barycentrically blended INVERSE MASS, which is then Q3's input.  A port that
-//     projected only .xyz would compile and lose the mass.
-//     Association: ((a*bx + b*by) + c*bz) + d*bw, left to right.
-//
-// Q5 -- THE BLOCK INDEX AND THE LANE INDEX COME FROM DIFFERENT VARIABLES:
-//     `spConstraints[workIndex / 32]` but `[threadIdx.x & 31]`.  They agree only
-//     because the work-index formula keeps a block's threads contiguous.
-//
-// Q6 -- pen's FORM differs from the cloth twin while the value does not:
-//         softbody: normal_pen.w - dot(normal, particleDelta - tetDelta) - restDist
-//         cloth:    normal_pen.w + dot(normal, clothDelta - particleDelta) - restDist
-//     Those are bit-identical -- negating each component before the dot and negating
-//     the sum after are the same in IEEE -- but the ENGINE's spelling is the one
-//     transcribed, because "equivalent" is a claim that has to be re-proved every
-//     time the expression changes, and the transcription does not.
-//
-// Q7 -- `contacts` IS READ AND DISCARDED, exactly as in the cloth twin: the load
-//     feeds a PxVec3 whose every use is commented out upstream.  The buffer stays in
-//     the blob because dropping it would shift every pointer after it.
-//
-// Q8 -- NO maxContacts CLAMP AND NO WRITE-BACK, unlike the two sibling prepare
-//     kernels in the same file (sb_softbodyContactPrepareLaunch at :940 and
-//     sb_clothContactPrepareLaunch at :1026 both take maxContacts, clamp at :953 and
-//     :1041, and store the clamp back through thread (0,0)).  This one does neither;
-//     transcribed as written.
-//
-// Q9 -- NO tetInd == 0xfffff GUARD, although sb_rigidContactPrepareLaunch (:773) has
-//     one at :818.  The sentinel is real -- it is what
-//     sb_other_contact_remap_to_simLaunch writes for a collision tet with no simulation
-//     counterpart -- so the unguarded mSimTetIndices[tetInd] load here is reachable in
-//     principle.  Upstream asymmetry, documented and transcribed; this port does not add
-//     a guard the engine does not have.
-//
-// Q10 -- THE APPLIED-FORCE ARRAYS ARE float2 IN float4-SIZED ALLOCATIONS, AND THEY ARE
-//     TWO DISTINCT BUFFERS.  The host allocates maxContacts float4s and the kernel
-//     writes maxContacts float2s, DENSELY at stride 8 -- so it fills the first HALF OF
-//     THE BUFFER, two contacts per 16-byte slot.  It is NOT "the lower half of each
-//     slot"; my first version of this note said that and the fixture written from it
-//     failed on 152 of 154 checks, which is how the note got corrected.  Writing at
-//     stride 16 would compile and spread the state over twice the memory.  The softbody
-//     side is
-//     mParticleAppliedFEMForcesBuf and the particle side mParticleAppliedParticleForcesBuf
-//     (PxgSoftBodyCore.cpp:2297-2298) -- swapping them couples the two solves without any
-//     type error.
+// The strided work index is clamped to tNumContacts - 1 after the per-lane guard (P9.23,
+// value-neutral).  In PXG_NOCONTRACT_SHADERS.
 
-// Q11 -- THE TAIL CONSTRAINT BLOCK IS ONLY PARTIALLY WRITTEN.  When tNumContacts is not
-//     a multiple of 32, the lanes of the last warp with workIndex >= tNumContacts take
-//     the early return before any of the three stores, so those lanes keep whatever the
-//     block held before.  The solve kernels never read them, because they apply the same
-//     bound -- but a fixture that compares the whole block instead of the first
-//     tNumContacts lanes will read uninitialised memory and blame the kernel.
-
-module softBodyPsPrepareBda;
-
-import pxgSlangSoftBodyDesc;     // PxgSoftBodyGpu (mSimTetIndices@80, mSimDeltaPos@128,
-                                 //                 mRestDistance@420)
-import pxgSlangParticleDesc;     // PxgParticleSystemGpu (mSortedDeltaP)
-import pxgSlangSoftBodySolve;    // P9.39d: getSoftBodyId / getSoftBodyElementIndex /
-                                 //         getSoftBodyInvMass / barycentricProject
+import pxgSlangSoftBodyDesc;                // PxgSoftBodyGpu, sbAt
+import pxgSlangParticleDesc;                // PxgParticleSystemGpu
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PXG_PDBC_*, PxgGetParticle*
+import pxgSlangDeformableUtils;             // barycentricProjectTet
+import pxgSlangDeformableAndParticleUtils;  // dpDot3, dpSelectMax
 
 static const uint SPP_GRID = 1024u;
 static const uint SPP_BLOCK = 256u;
 
-// PxgFEMParticleConstraintBlock (PxgFEMCore.h:184): float4 normal_pen[32],
-// float4 barycentric[32], float velMultiplier[32] -- 1152 bytes, warp-blocked.
-static const uint SPP_CONSTRAINT_STRIDE = 1152u;
-static const uint SPP_OFF_NORMAL_PEN = 0u;      // float4[32]
-static const uint SPP_OFF_BARYCENTRIC = 512u;   // float4[32]
-static const uint SPP_OFF_VELMULT = 1024u;      // float[32]
-
+// (PxgSoftBody* softbodies, PxgParticleSystem* particlesystems, float4* contacts,
+//  float4* normalPens, float4* barycentrics, PxgDeformablePairInfo* contactInfos,
+//  PxU32* numContacts, PxgParticleDbContactBlock* contactBlocks,
+//  float2* softBodyAppliedForces, float2* particleAppliedForces) -> 80-byte blob.
 struct SbPsPrepareParams
 {
     uint64_t softbodies;               // @0
-    uint64_t particleSystems;          // @8
-    uint64_t contacts;                 // @16  Q7: read, never used
+    uint64_t particlesystems;          // @8
+    uint64_t contacts;                 // @16  (unread, as in CUDA)
     uint64_t normalPens;               // @24
     uint64_t barycentrics;             // @32
-    uint64_t contactInfos;             // @40  PxgFemOtherContactInfo* (16 B stride)
+    uint64_t contactInfos;             // @40
     uint64_t numContacts;              // @48
-    uint64_t constraints;              // @56  PxgFEMParticleConstraintBlock*
-    uint64_t softBodyAppliedForces;    // @64  float2*
-    uint64_t particleAppliedForces;    // @72  float2* -> 80
+    uint64_t contactBlocks;            // @56  output
+    uint64_t softBodyAppliedForces;    // @64  float2*, zeroed
+    uint64_t particleAppliedForces;    // @72  float2*, zeroed -> 80
 }
 
 [[vk::push_constant]] ConstantBuffer<SbPsPrepareParams> gSp;
@@ -167,67 +85,56 @@ void sb_particleContactPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
     const uint nbIterationsPerBlock = (nbBlocksRequired + SPP_GRID - 1u) / SPP_GRID;
 
     const uint idx = gtid.x;
-    const uint threadIndexInWarp = gtid.x & 31u;        // Q5
+    const uint threadIndexInWarp = gtid.x & 31u;
 
-    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSp.softbodies);
-    Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gSp.particleSystems);
+    Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(gSp.particlesystems);
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gSp.contactInfos);
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * SPP_BLOCK + idx + nbIterationsPerBlock * gid.x * SPP_BLOCK;
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * SPP_BLOCK + idx + nbIterationsPerBlock * gid.x * SPP_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
 
-        // Q10: float2 stores into float4-sized slots.
         Ptr<float2>(gSp.softBodyAppliedForces)[workIndex] = float2(0.0f, 0.0f);
         Ptr<float2>(gSp.particleAppliedForces)[workIndex] = float2(0.0f, 0.0f);
 
-        // PxgFemOtherContactInfo, 16 B: pairInd0 u64 @0, pairInd1 u32 @8.
-        const uint64_t infoBase = gSp.contactInfos + uint64_t(workIndex) * 16UL;
-        const uint2 pairInd0 = Ptr<uint2>(infoBase)[0];
-        const uint pairInd1 = Ptr<uint>(infoBase + 8UL)[0];
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gSp.contactBlocks + uint64_t(workIndex / 32u) * PXG_PDBC_STRIDE;
 
-        const uint64_t cBase = gSp.constraints + uint64_t(workIndex / 32u) * SPP_CONSTRAINT_STRIDE;
+        if (!PxgIsValidPairInfo(contactInfo))
+            continue;
 
-        // PxGetParticleSystemId / PxGetParticleIndex (PxgSimulationCoreDesc.h:150/:155).
-        const uint tParticleSystemId = pairInd0.y;
-        const uint tParticleIndex = pairInd0.x;          // Q2: the SORTED index
+        const uint64_t particleRef = contactInfo.ref0;
+        const uint tParticleSystemId = PxgGetParticleSystemId(particleRef);
+        const uint tParticleIndex = PxgGetParticleIndex(particleRef);
 
-        const uint softbodyId = getSoftBodyId(pairInd1);
-        const uint tetInd = getSoftBodyElementIndex(pairInd1);   // Q9: no 0xfffff guard
+        // Second one is the soft body.
+        Ptr<PxgSoftBodyGpu> softbody = sbAt(gSp.softbodies, PxgGetDeformableId(contactInfo.ref1));
+        const uint tetInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
-        const uint4 tetrahedronIdx = Ptr<uint4>(softbodies[softbodyId].mSimTetIndices)[tetInd];  // Q1
-
-        // Q7: loaded and discarded, as upstream does.
-        const float4 contact = Ptr<float4>(gSp.contacts)[workIndex];
+        const uint4 tetrahedronIdx = Ptr<uint4>(softbody[0].mSimTetIndices)[tetInd];
 
         const float4 normal_pen = Ptr<float4>(gSp.normalPens)[workIndex];
         const float4 barycentric = Ptr<float4>(gSp.barycentrics)[workIndex];
 
-        const float4 tetDelta_invMass =
-            barycentricProject(Ptr<float4>(softbodies[softbodyId].mSimDeltaPos),
-                               tetrahedronIdx, barycentric);   // Q1/Q4
-        const float3 tetDelta = tetDelta_invMass.xyz;
+        const float4 tetDelta4 = barycentricProjectTet(tetrahedronIdx, softbody[0].mSimDeltaPos, barycentric);
+        const float3 tetDelta = float3(tetDelta4.x, tetDelta4.y, tetDelta4.z);
 
         const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);
 
-        const float4 delta_invMass =
-            Ptr<float4>(particleSystems[tParticleSystemId].mSortedDeltaP)[tParticleIndex];
-        const float3 particleDelta = delta_invMass.xyz;
-        const float invMass0 = delta_invMass.w;
+        const float4 delta_invMass = Ptr<float4>(particleSystems[tParticleSystemId].mSortedDeltaP)[tParticleIndex];
+        const float3 particleDelta = float3(delta_invMass.x, delta_invMass.y, delta_invMass.z);
+        // The rest distance as the SS/SC prepares compute it; the narrowphase writes a raw distance.
+        const float restDistance = particleSystems[tParticleSystemId].mData_RestOffset + softbody[0].mRestOffset;
+        const float3 rel = float3(particleDelta.x - tetDelta.x, particleDelta.y - tetDelta.y,
+                                  particleDelta.z - tetDelta.z);
+        const float pen = normal_pen.w - dpDot3(rel, normal) - restDistance;
 
-        // Q6: the engine's spelling, not the cloth twin's.
-        const float pen = normal_pen.w - dot(particleDelta - tetDelta, normal)
-                          - softbodies[softbodyId].mRestDistance;
-
-        const float sbMass = getSoftBodyInvMass(tetDelta_invMass.w, barycentric);   // Q3
-
-        const float unitResponse = invMass0 + sbMass;
-        const float velMultiplier = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-
-        Ptr<float4>(cBase + uint64_t(SPP_OFF_NORMAL_PEN))[threadIndexInWarp] =
-            float4(normal.x, normal.y, normal.z, pen);
-        Ptr<float4>(cBase + uint64_t(SPP_OFF_BARYCENTRIC))[threadIndexInWarp] = barycentric;
-        Ptr<float>(cBase + uint64_t(SPP_OFF_VELMULT))[threadIndexInWarp] = velMultiplier;
+        Ptr<float4>(block + PXG_PDBC_normal_pen)[threadIndexInWarp] = float4(normal.x, normal.y, normal.z, pen);
+        Ptr<float4>(block + PXG_PDBC_barycentric)[threadIndexInWarp] = barycentric;
+        Ptr<float>(block + PXG_PDBC_maxPenBiasClamp)[threadIndexInWarp] =
+            dpSelectMax(softbody[0].mPenBiasClamp, particleSystems[tParticleSystemId].mData_PenBiasClamp);
     }
 }

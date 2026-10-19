@@ -120,19 +120,21 @@ struct PsSdfMidBlob
     uint64_t gpuShapes;                        // @40
     uint64_t particleSystems;                  // @48
     uint64_t shapeToRigidRemapTable;           // @56
-    uint64_t w_particleContacts;               // @64
-    uint64_t w_numTotalContacts;               // @72
-    uint64_t w_contactSortedByParticle;        // @80
-    uint64_t w_tempContactByParticle;          // @88
-    uint64_t w_contactIndexSortedByParticle;   // @96
-    uint64_t w_contactByRigid;                 // @104
-    uint64_t w_tempContactByRigid;             // @112
-    uint64_t w_contactIndexSortedByRigid;      // @120
-    uint32_t w_maxContacts;                    // @128
-    uint32_t pad1;                             // -> 136
+    // PxgRigidParticleContactWriter (PhysX 5.12, 80 B) @64
+    uint64_t w_particleContactInfos;           // @64
+    uint64_t w_particleContactNormalPens;      // @72
+    uint64_t w_numTotalContacts;               // @80
+    uint64_t w_contactSortedByParticle;        // @88
+    uint64_t w_tempContactByParticle;          // @96
+    uint64_t w_contactIndexSortedByParticle;   // @104
+    uint64_t w_contactByRigid;                 // @112
+    uint64_t w_tempContactByRigid;             // @120
+    uint64_t w_contactIndexSortedByRigid;      // @128
+    uint32_t w_maxContacts;                    // @136
+    uint32_t pad1;                             // -> 144
 };
-static_assert(sizeof(PsSdfMidBlob) == 136, "engine ABI blob size");
-static_assert(offsetof(PsSdfMidBlob, w_particleContacts) == 64, "the writer lands at 64");
+static_assert(sizeof(PsSdfMidBlob) == 144, "engine ABI blob size");
+static_assert(offsetof(PsSdfMidBlob, w_particleContactInfos) == 64, "the writer lands at 64");
 
 // The two reference entry points' push blocks (P9.12e / P9.12f).
 // P_Find mirrors ALL of npSdfFind.slang's SdfFindParams (176 B since P9.34b/P9.35b).
@@ -323,8 +325,8 @@ struct Rig
     std::vector<PxgBufferHandle> owned;
     DevBuf bBlob, bPos, bPrev, bPosD, bPrevD, bMap, bDesc, bCin, bShapes, bXf, bCd, bRest, bRemap;
     DevBuf bInfos, bNodeIdx, bCounts, bDiffInfos, bDiffNodeIdx, bDiffCounts, bNumDiffuse;
-    DevBuf bRunsum, bSimBufs, bPairs;
-    DevBuf bContacts, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
+    DevBuf bRunsum, bSimBufs;
+    DevBuf bContacts /* PxgDeformablePairInfo */, bNormalPens, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
     PsSdfMidBlob blob{};
     uint64_t texCoarse = 0, texSub = 0;
     PxNodeIndex rigidId;
@@ -385,28 +387,15 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     const std::vector<uint32_t> nDiff(1u, Scene::NPD);
     R.bNumDiffuse = R.mk(dev, nDiff);
 
-    // The rigid filter list: one buffer, runsum {0}, pairs sorted by (rigid, local).
+    // One particle buffer, runsum {0}.  PhysX 5.12 removed the particle-rigid filter
+    // list the 5.6.1 rig seeded here (S.filteredUnsorted): those particles are now
+    // ordinary candidates, which predict() checks (W5 / W6).
     const std::vector<uint32_t> runsum(1u, 0u);
     R.bRunsum = R.mk(dev, runsum);
     R.rigidId = PxNodeIndex(opt.staticRigid ? 0xFFFFFFFFu : 0x51u, opt.staticRigid ? 0u : 3u);
-    std::vector<PxParticleRigidFilterPair> pairs;
-    for (uint32_t u : S.filteredUnsorted)
-    {
-        PxParticleRigidFilterPair p{};
-        p.mID0 = R.rigidId.getInd();
-        p.mID1 = PxU64(u);
-        pairs.push_back(p);
-    }
-    std::sort(pairs.begin(), pairs.end(), [](const PxParticleRigidFilterPair& a,
-                                             const PxParticleRigidFilterPair& b) {
-        return (a.mID0 != b.mID0) ? (a.mID0 < b.mID0) : (a.mID1 < b.mID1);
-    });
-    R.bPairs = R.mk(dev, pairs);
 
     std::vector<PxgParticleSimBuffer> simBufs(1);
     std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBufs[0].mFilterPairs = reinterpret_cast<PxParticleRigidFilterPair*>(size_t(R.bPairs.addr));
-    simBufs[0].mNumFilterPairs = uint32_t(pairs.size());
     R.bSimBufs = R.mk(dev, simBufs);
 
     std::vector<PxgParticleSystem> descArr(Scene::NB_SYS);
@@ -487,11 +476,13 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.bRemap = R.mk(dev, remap);
 
     // The writer arrays.
-    const std::vector<PsC> ctInit(Scene::CAP, PsC{ { -7, -7, -7, -7 }, POISON_U32, POISON_U32,
-                                                   POISON_U32, POISON_U32 });
+    // PhysX 5.12: two SoA streams, PxgDeformablePairInfo and float4 normalPen.
+    const std::vector<PxgDeformablePairInfo> ctInit(Scene::CAP, PxgDeformablePairInfo{ ~0ull, ~0ull });
+    const std::vector<F4> npInit(Scene::CAP, F4{ -7, -7, -7, -7 });
     const std::vector<uint32_t> u32Init(Scene::CAP, POISON_U32);
     const std::vector<uint64_t> u64Init(Scene::CAP, ~0ull);
     R.bContacts = R.mk(dev, ctInit);
+    R.bNormalPens = R.mk(dev, npInit);
     R.bCount = R.mk(dev, std::vector<uint32_t>(1u, 0u));
     R.bSbP = R.mk(dev, u64Init);
     R.bTbP = R.mk(dev, u32Init);
@@ -509,7 +500,8 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     R.blob.gpuShapes = R.bShapes.addr;
     R.blob.particleSystems = R.bDesc.addr;
     R.blob.shapeToRigidRemapTable = R.bRemap.addr;
-    R.blob.w_particleContacts = R.bContacts.addr;
+    R.blob.w_particleContactInfos = R.bContacts.addr;
+    R.blob.w_particleContactNormalPens = R.bNormalPens.addr;
     R.blob.w_numTotalContacts = R.bCount.addr;
     R.blob.w_contactSortedByParticle = R.bSbP.addr;
     R.blob.w_tempContactByParticle = R.bTbP.addr;
@@ -637,8 +629,7 @@ struct Expect
     std::vector<uint32_t> writerParticle;  // the SORTED index, in writer order
     std::vector<F4> writerNormalPen;       // world-space normal
     uint32_t reserved = 0u;                // what numTotalContacts must end at
-    uint32_t filtered = 0u;                // candidates the filter actually removed
-    uint32_t inFilterList = 0u;            // candidates the filter WOULD remove
+    uint32_t inFilterList = 0u;            // candidates the 5.6.1 filter list named
 };
 
 // One pass -- solid (isDiffuse false) or diffuse (true).  Everything that
@@ -661,8 +652,8 @@ static Expect predict(const Scene& S, const Options& opt, const Reference& ref,
             const uint32_t ind = round[tid];
             bool cand = ref.candidate[ind] != 0u;
 
-            // W5 / W6: the filter takes the UNSORTED index and never runs for
-            // the diffuse pass.
+            // W5 / W6: PhysX 5.12 has no particle-rigid filter, so a candidate the
+            // 5.6.1 list named (by its UNSORTED index) stays a candidate in both passes.
             if (cand)
             {
                 const uint32_t unsorted = S.sortedToUnsorted[ind];
@@ -670,7 +661,6 @@ static Expect predict(const Scene& S, const Options& opt, const Reference& ref,
                     std::find(S.filteredUnsorted.begin(), S.filteredUnsorted.end(), unsorted)
                     != S.filteredUnsorted.end();
                 if (listed) ++E.inFilterList;
-                if (listed && !isDiffuse) { cand = false; ++E.filtered; }
             }
 
             if (opt.staticRigid && cand)
@@ -789,7 +779,17 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
     const auto nodesD = downloadBuffer<uint64_t>(dev, R.bDiffNodeIdx.h,
                                                  size_t(Scene::NPD) * Scene::ONEWAY_COLS);
     const uint32_t total = downloadBuffer<uint32_t>(dev, R.bCount.h, 1)[0];
-    const auto ct = downloadBuffer<PsC>(dev, R.bContacts.h, Scene::CAP);
+    const auto ctInfo = downloadBuffer<PxgDeformablePairInfo>(dev, R.bContacts.h, Scene::CAP);
+    const auto ctNp = downloadBuffer<F4>(dev, R.bNormalPens.h, Scene::CAP);
+    std::vector<PsC> ct(Scene::CAP);
+    for (uint32_t i = 0; i < Scene::CAP; ++i)
+    {
+        ct[i].normal_pen = ctNp[i];
+        ct[i].rLo = uint32_t(ctInfo[i].ref0);
+        ct[i].rHi = uint32_t(ctInfo[i].ref0 >> 32);
+        ct[i].pLo = PxgGetParticleIndex(ctInfo[i].ref1);
+        ct[i].pHi = PxgGetParticleSystemId(ctInfo[i].ref1);
+    }
     const auto sbp = downloadBuffer<uint64_t>(dev, R.bSbP.h, Scene::CAP);
     const auto tbp = downloadBuffer<uint32_t>(dev, R.bTbP.h, Scene::CAP);
     const auto ibp = downloadBuffer<uint32_t>(dev, R.bIbP.h, Scene::CAP);
@@ -802,14 +802,10 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
     // reuse are both exercised.
     PXG_CHECK_MSG(refS.rounds.size() >= 2, "%s: the solid gather took %zu round(s) -- the resume "
                   "path is untested", label, refS.rounds.size());
-    // The filter must actually remove solid candidates...
-    PXG_CHECK_MSG(ES.filtered > 0u, "%s: the filter removed nothing from the solid pass", label);
-    // ...and the diffuse pass must contain candidates it WOULD have removed, or
-    // "the filter runs for the diffuse pass too" is unobservable.
-    if (diffuseRuns)
-        PXG_CHECK_MSG(ED.inFilterList > 0u && ED.filtered == 0u,
-                      "%s: the diffuse pass carries %u filter-listed candidates (want > 0) and "
-                      "%u removed (want 0)", label, ED.inFilterList, ED.filtered);
+    // PhysX 5.12: the candidates the 5.6.1 filter list named must be in the solid
+    // pass, so a port that still filtered them would lose contacts here.
+    PXG_CHECK_MSG(ES.inFilterList > 0u, "%s: no solid candidate is one the 5.6.1 filter named, so "
+                  "5.12's removal of the filter is unobservable", label);
 
     // ---- the solid pass's one-way arrays ----
     checkOneWay(label, "solid", Scene::NP, ES, counts, infos, nodes, rigidInd);
@@ -863,7 +859,7 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
         const uint32_t at = written[k];
         const F4 w = ES.writerNormalPen[k];
         const uint32_t ind = ES.writerParticle[k];
-        const uint64_t compressed = (uint64_t(Scene::SYS) << 32) | uint64_t(ind);
+        const uint64_t compressed = PxgEncodeParticleRef(Scene::SYS, ind);
         if (f2u(ct[at].normal_pen.x) != f2u(w.x) || f2u(ct[at].normal_pen.y) != f2u(w.y) ||
             f2u(ct[at].normal_pen.z) != f2u(w.z) || f2u(ct[at].normal_pen.w) != f2u(w.w))
         {

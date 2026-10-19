@@ -33,8 +33,10 @@
 //
 // PxgSoftBody is PX_ALIGN_PREFIX(16): a long run of device pointers (0..311), then
 // a PxU32/PxReal scalar tail with a PxQuat (mInitialRotation, 16 bytes) and a
-// PxU8/PxU8/PxU16 flag triple folded into one word.  sizeof = 432, alignof = 16
-// (432 is a multiple of 16, so the array stride is 432).  The layout is verified
+// PxU8/PxU8/PxU16 flag triple folded into one word.  sizeof = 464, alignof = 16
+// (PhysX 5.12: mFilteringPairs + mNumFilterPairs became three typed element filter
+// arrays + three counts, shifting the tail by 24 B; mRestDistance became
+// mRestOffset; the struct ends on 8 B of alignment padding, mirrored as _pad456/460).  The layout is verified
 // byte-exact against the engine header with g++ offsetof in testSoftBodySim.cpp
 // (which pushes a REAL PxgSoftBody filled with sentinels and reads it back through
 // this mirror — any compiler/mirror drift fails that test).
@@ -42,9 +44,9 @@
 // Pointers -> uint64_t (device addresses read through Ptr<>); PxU32/PxReal -> the
 // 4-byte scalars.  Two byte-packing folds reproduce the C++ layout without
 // requiring 8/16-bit storage on llvmpipe:
-//   - @392 PxU8 mActorFlags / PxU8 mBodyFlags / PxU16 mVolumeFlags fold into one
+//   - @416 PxU8 mActorFlags / PxU8 mBodyFlags / PxU16 mVolumeFlags fold into one
 //     uint mFlagsWord (byte0 = mActorFlags, byte1 = mBodyFlags, bytes2..3 =
-//     mVolumeFlags), plus explicit _pad396 so the following pointer lands at @400;
+//     mVolumeFlags), plus explicit _pad420 so the following pointer lands at @424;
 //   - the two `bool*` arrays (mVertsAreDeformed / mVertsCanNotDeform) are plain
 //     8-byte device pointers in the struct; the per-vertex byte STORES the kernel
 //     makes into them are elided in softBodySimBda (see that file's header) — the
@@ -65,9 +67,12 @@ public static const uint PXG_SOFTBODY_BODYFLAG_KINEMATIC = 4u;
 public static const uint PXG_SOFTBODY_VOLUMEFLAG_COMPUTE_STRESS_TENSOR = 1u;
 public static const uint PXG_SOFTBODY_VOLUMEFLAG_PARTIALLY_KINEMATIC = 2u;
 
-// Byte-exact mirror of class PxgSoftBody (PxgSoftBody.h:79).  Every pointer is 8
-// bytes; the block is a run of device pointers (0..311), then the scalar tail
-// (312..431).  sizeof = 432.  Every field the engine header carries is mirrored so
+// sizeof(PxgSoftBody), 5.12: the array stride of the softbodies argument.
+public static const uint64_t PXG_SOFTBODY_STRIDE = 464;
+
+// Byte-exact mirror of class PxgSoftBody (PxgSoftBody.h, 5.12).  Every pointer is 8
+// bytes; the block is a run of device pointers (0..327), then the scalar tail
+// (328..463).  sizeof = 464.  Every field the engine header carries is mirrored so
 // the shader "reads like a sibling" of it — the ones sb_gm_preIntegrateLaunch
 // actually dereferences are flagged (***).
 public struct PxgSoftBodyGpu
@@ -110,34 +115,46 @@ public struct PxgSoftBodyGpu
     public uint64_t mPackedNodeBounds;               // @280  PxBounds3*
     public uint64_t mOrderedMaterialIndices;         // @288  PxU16*
     public uint64_t mMaterialIndices;                // @296  PxU16*
-    public uint64_t mFilteringPairs;                 // @304  PxgNonRigidFilterPair*
-    public uint mNumFilterPairs;                     // @312  PxU32
-    public float mLinearDamping;                     // @316  *** PxReal
-    public float mMaxLinearVelocity;                 // @320  *** PxReal
-    public float mPenBiasClamp;                      // @324  PxReal (not read by pre-integrate)
-    public float mSettlingThreshold;                 // @328  PxReal
-    public float mSleepThreshold;                    // @332  PxReal
-    public float mSettlingDamping;                   // @336  PxReal
-    public float mSelfCollisionFilterDistance;       // @340  PxReal
-    public float mSelfCollisionStressTolerance;      // @344  PxReal
-    public float mInitialRotationX;                  // @348  PxQuat.x
-    public float mInitialRotationY;                  // @352  PxQuat.y
-    public float mInitialRotationZ;                  // @356  PxQuat.z
-    public float mInitialRotationW;                  // @360  PxQuat.w
-    public uint mNumVerts;                           // @364  PxU32
-    public uint mNumTets;                            // @368  PxU32
-    public uint mNumVertsGM;                         // @372  *** PxU32
-    public uint mNumTetsGM;                          // @376  PxU32
-    public uint mNumPartitionsGM;                    // @380  PxU32
-    public uint mElementIndex;                       // @384  PxU32
-    public uint mGpuRemapIndex;                      // @388  PxU32
-    public uint mFlagsWord;                          // @392  PxU8 mActorFlags|PxU8 mBodyFlags|PxU16 mVolumeFlags ***
-    public uint _pad396;                             // @396  (mVolumeFlags's tail-pad -> next ptr @400)
-    public uint64_t mSimPullIndices;                 // @400  uint4*
-    public uint mAwake;                              // @408  *** PxU32 (reset each frame)
-    public uint mNumTetsPerElement;                  // @412  PxU32
-    public uint mNumJacobiVertices;                  // @416  PxU32
-    public float mRestDistance;                      // @420  PxReal
-    public float mOriginalContactOffset;             // @424  PxReal
-    public float mJacobiScale;                       // @428  PxReal  -> 432
+    public uint64_t mRigidVolumeFilterPairs;         // @304  PxgDeformablePairInfo* (rigid, tet)
+    public uint64_t mVolumeVolumeFilterPairs;        // @312  PxgDeformablePairInfo* (vertex, tet)
+    public uint64_t mVolumeSurfaceFilterPairs;       // @320  PxgDeformablePairInfo* (tet, vertex|triangle)
+    public uint mNumRigidVolumeFilterPairs;          // @328  PxU32
+    public uint mNumVolumeVolumeFilterPairs;         // @332  PxU32
+    public uint mNumVolumeSurfaceFilterPairs;        // @336  PxU32
+    public float mLinearDamping;                     // @340  *** PxReal
+    public float mMaxLinearVelocity;                 // @344  *** PxReal
+    public float mPenBiasClamp;                      // @348  PxReal (not read by pre-integrate)
+    public float mSettlingThreshold;                 // @352  PxReal
+    public float mSleepThreshold;                    // @356  PxReal
+    public float mSettlingDamping;                   // @360  PxReal
+    public float mSelfCollisionFilterDistance;       // @364  PxReal
+    public float mSelfCollisionStressTolerance;      // @368  PxReal
+    public float mInitialRotationX;                  // @372  PxQuat.x
+    public float mInitialRotationY;                  // @376  PxQuat.y
+    public float mInitialRotationZ;                  // @380  PxQuat.z
+    public float mInitialRotationW;                  // @384  PxQuat.w
+    public uint mNumVerts;                           // @388  PxU32
+    public uint mNumTets;                            // @392  PxU32
+    public uint mNumVertsGM;                         // @396  *** PxU32
+    public uint mNumTetsGM;                          // @400  PxU32
+    public uint mNumPartitionsGM;                    // @404  PxU32
+    public uint mElementIndex;                       // @408  PxU32
+    public uint mGpuRemapIndex;                      // @412  PxU32
+    public uint mFlagsWord;                          // @416  PxU8 mActorFlags|PxU8 mBodyFlags|PxU16 mVolumeFlags ***
+    public uint _pad420;                             // @420  (mVolumeFlags's tail-pad -> next ptr @424)
+    public uint64_t mSimPullIndices;                 // @424  uint4*
+    public uint mAwake;                              // @432  *** PxU32 (reset each frame)
+    public uint mNumTetsPerElement;                  // @436  PxU32
+    public uint mNumJacobiVertices;                  // @440  PxU32
+    public float mRestOffset;                        // @444  PxReal (5.6.1 mRestDistance; now the rest offset)
+    public float mOriginalContactOffset;             // @448  PxReal
+    public float mJacobiScale;                       // @452  PxReal
+    public uint _pad456;                             // @456  (align-16 tail pad)
+    public uint _pad460;                             // @460  -> 464
+}
+
+// &softbodies[id]: the descriptor of softbody `id` in the array at `softbodies`.
+public Ptr<PxgSoftBodyGpu> sbAt(uint64_t softbodies, uint id)
+{
+    return Ptr<PxgSoftBodyGpu>(softbodies + uint64_t(id) * PXG_SOFTBODY_STRIDE);
 }

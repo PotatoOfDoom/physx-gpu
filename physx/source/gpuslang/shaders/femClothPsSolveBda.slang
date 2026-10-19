@@ -22,329 +22,376 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// femClothPsSolveBda.slang
+// femClothPsSolveBda.slang -- the cloth-vs-particle contact SOLVE of FEMClothExternalSolve.cu,
+// PhysX 5.12.  Launches: grid 1024, block 256.
 //
-// P9.31 -- cloth_solveCPOutputClothDeltaVLaunch and
-//          cloth_solveCPOutputParticleDeltaVLaunch
-// gpusimulationcontroller/src/CUDA/FEMClothExternalSolve.cu:1159 and :1266
-// (wrappers), :182 (the float4 computeTriangleContact the calls actually
-// select), :59 (updateTrianglePosDelta), :53 (FEMCLOTH_BIAS_COEFFICIENT) --
-// all read in full.  Launches: PxgFEMClothCore.cpp:2149 and :2217, both
-// grid 1024, block 256.
+//   cloth_queryCPContactReferenceCountLaunch  NEW in 5.12: the pre-count.  Activity from
+//                          solveDbDbContact(checkOnlyActivity), recorded on the pair; an
+//                          active pair bumps cloth.mDeltaPos.w per touched triangle vertex
+//                          (|bc| > 1e-3) and the particle's mAccumDeltaP.w (the particle-side
+//                          mass-split count).  An invalid pair or a kinematic particle
+//                          (invMass 0) is set inactive.
+//   cloth_solveCPOutputClothDeltaVLaunch     the cloth half: solveDbDbContact with side 0 =
+//                          cloth triangle and side 1 = the particle (bc (1,0,0)), +delta
+//                          scattered into mDeltaPos (writeCloth; the pre-count owns .w).
+//   cloth_solveCPOutputParticleDeltaVLaunch  the particle half: the same solve (both halves
+//                          read the same refCount-inflated masses and friction, so the
+//                          impulse stays equal and opposite), -delta * invMass written to the
+//                          per-contact deltaP slot with .w flagging an applied impulse.  Every
+//                          slot of a non-kinematic particle is written (zero when inactive or
+//                          not applied), and a kinematic particle's slot too: the accumulate
+//                          scan (ps_accumulateFEMParticleDeltaVLaunch) reads them all.
 //
-// The last two links of the cloth-vs-particle chain.  Both solve the SAME
-// constraint and differ only in where the result lands: one accumulates a
-// position delta onto the cloth's three vertices, the other writes a velocity
-// delta for the particle.
+// THE 5.12 DATA.  PxgDeformablePairInfo {ref0 = PxgParticleRef (system, SORTED index),
+// ref1 = cloth triangle ref} and PxgParticleDbContactBlock (normal_pen, barycentric,
+// maxPenBiasClamp); readCloth reads the barycentric from the BLOCK lane.  appliedForces is a
+// float2 (lambdaN, lambdaT), one buffer per half.  The 5.6.1 velMultiplier / packed ids /
+// PxgFemOtherContactInfo are gone.
 //
-// ---------------------------------------------------------------------------
-// THEY ARE NOT TWINS, and the difference is not only the output
-// ---------------------------------------------------------------------------
-// Everything from the work index down to `appliedForce.y += deltaFr` is the
-// same text in both, so it is written ONCE here.  What differs:
-//
-//   * the cloth side computes  deltaPos = (( normal * deltaF) - tanDir * deltaFr) * BIAS
-//     and scatters it with updateTrianglePosDelta;
-//   * the particle side computes deltaV = ((-normal * deltaF) + tanDir * deltaFr)
-//     * invMass0 * BIAS -- opposite signs AND an extra invMass0 factor -- and
-//     stores it at deltaP[workIndex] with .w a 0/1 flag;
-//   * the particle side takes one more argument (deltaP), so the two argument
-//     packs are 56 and 64 bytes and get their own ABI rows.
-//
-// ---------------------------------------------------------------------------
-// TRAPS
-// ---------------------------------------------------------------------------
-// S1 -- THE WORK INDEX.  Same formula as the prepare kernel, and the same
-//     correction: a grid-stride substitution is observation-equivalent (same
-//     set, same lane), while dropping the `nbIterationsPerBlock *` factor is
-//     not.  See P1 in femClothPsPrepareBda.slang for the argument.
-//
-// S2 -- THE CONSTRAINT BLOCK IS WARP-BLOCKED: constraints[workIndex / 32]
-//     indexed by threadIdx.x & 31.
-//
-// S3 -- EVERYTHING IS GATED ON `invMass0 != 0`.  A particle with zero inverse
-//     mass produces no force, no friction and no write -- and its
-//     appliedForces entry keeps whatever the prepare kernel zeroed it to.
-//
-// S4 -- THE NORMAL IS NEGATED A THIRD TIME.  The contact gen stored -n, the
-//     prepare negated it back to +n, and this negates the constraint's normal
-//     again.
-//
-// S5 -- computeTriangleContact here is the FLOAT4 overload (:182), which
-//     weights by (b.x, b.y, b.z) -- NOT the float2 overload (:155) twenty lines
-//     above it, which weights by (1-b.x-b.y, b.x, b.y).  The call passes a
-//     float4 and overload resolution picks the float4 one; reading the file
-//     top-down finds the float2 form first and it is a different weighting.
-//     Its out-parameter is the THREE per-vertex inverse masses, not the
-//     interpolated one.
-//
-// S6 -- `tanDir.normalize()` is PxVec3::normalize: it returns the MAGNITUDE and
-//     normalises in place, guarded on m > 0.  `fricDelta` is that magnitude.
-//
-// S7 -- THE FORCE CLAMPS.  deltaF = max(-appliedForce.x, -error * velMultiplier)
-//     keeps the accumulated normal force non-negative; the friction step is
-//     deltaFr = min(requiredForce + appliedForce.y, friction) - appliedForce.y.
-//     Both read AND write appliedForces[workIndex], so the kernel is
-//     iteration-stateful.
-//
-// S8 -- updateTrianglePosDelta skips a vertex when its inverse mass is zero OR
-//     |barycentric| <= 1e-6, and adds 1.0 to .w for each vertex it does touch.
-//
-// S9 -- the element index is decoded with PxGetClothElementIndex on the cloth
-//     side and PxGetSoftBodyElementIndex on the particle side.  Both masks are
-//     0x000fffff and both shifts are 20, so the two produce the SAME value --
-//     verified, not assumed.  It is a readability defect that would become a
-//     real one the day either constant moves; upstream candidate 40, documented
-//     and not reported.
+// DEVIATIONS (value-neutral): the PxU16 phase -> material handle is read through its 32-bit
+// word; the strided work index is clamped to tNumContacts - 1 after the per-lane guard
+// (P9.23).  In PXG_NOCONTRACT_SHADERS.
+
+import pxgSlangFEMClothDesc;                // PxgFEMClothGpu, clothAt
+import pxgSlangParticleDesc;                // PxgParticleSystemGpu, pxgLoadPhaseToMaterial
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PXG_PDBC_*, PxgGetParticle*
+import pxgSlangAtomicFloat;                 // pxgAtomicAddF4W
+import pxgSlangDeformableAndParticleUtils;  // PxgDeformablePart, solveDbDbContact
+
+static const uint CPS_GRID = 1024u;
+static const uint CPS_BLOCK = 256u;
+
+// &getParticleMaterial<PxsParticleMaterialData>(mParticleMaterials, mi, mParticleMaterialStride).
+uint64_t cpMaterialElem(Ptr<PxgParticleSystemGpu> ps, uint particleIndex)
+{
+    const uint phase = Ptr<uint>(ps[0].mSortedPhaseArray)[particleIndex];
+    const uint group = phase & PXG_PARTICLE_PHASE_GROUP_MASK;
+    const uint mi = pxgLoadPhaseToMaterial(ps[0].mPhaseGroupToMaterialHandle, group);
+    return ps[0].mParticleMaterials + uint64_t(mi) * uint64_t(ps[0].mParticleMaterialStride);
+}
+
+Ptr<PxgParticleSystemGpu> cpSystemAt(uint64_t particlesystems, uint64_t particleRef)
+{
+    return Ptr<PxgParticleSystemGpu>(particlesystems
+                                     + uint64_t(PxgGetParticleSystemId(particleRef)) * PXG_PARTICLE_SYSTEM_STRIDE);
+}
+
+void cpSetActive(uint64_t contactInfos, uint workIndex, uint64_t ref1, bool active)
+{
+    Ptr<uint64_t>(contactInfos + uint64_t(workIndex) * PXG_PAIRINFO_STRIDE + PXG_PAIRINFO_ref1)[0] =
+        PxgSetActiveRef1(ref1, active);
+}
+
 // ===========================================================================
-
-import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
-import pxgSlangParticleDesc;   // PxgParticleSystemGpu + the two material accessors
-import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W
-
-static const uint PSS_GRID = 1024u;
-static const uint PSS_BLOCK = 256u;
-
-// FEMCLOTH_BIAS_COEFFICIENT (FEMClothExternalSolve.cu:53).
-static const float FEMCLOTH_BIAS_COEFFICIENT = 0.7f;
-
-static const uint PSS_CONSTRAINT_STRIDE = 1152u;
-static const uint PSS_OFF_NORMAL_PEN = 0u;
-static const uint PSS_OFF_BARYCENTRIC = 512u;
-static const uint PSS_OFF_VELMULT = 1024u;
-
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
-static const uint PXG_CLOTH_ELEM_MASK = 0x000fffffu;   // S9
-
-// PxsDeformableSurfaceMaterialData (PxsDeformableSurfaceMaterialCore.h:38), read
-// against the header rather than from memory -- the first draft of this file said
-// index 1 and that was wrong:
-//     youngs@0  poissons@4  dynamicFriction@8  thickness@12  bendingStiffness@16
-//     elasticityDamping@20  bendingDamping@24  padding@28   -> 32 bytes, 16-aligned
-static const uint PSS_CLOTH_MAT_STRIDE = 32u;
-static const uint PSS_CLOTH_MAT_DYNFRICTION = 2u;   // float index, i.e. byte 8
-
-// PxsParticleMaterialData: friction is float index 0.
-static const uint PSS_PS_MAT_FRICTION = 0u;
-
-// ---------------------------------------------------------------------------
-// Push constants.  The two kernels take DIFFERENT packs.
-//   cloth side  (PxgFEMClothCore.cpp:2160): seven pointers -> 56 bytes.
-//   particle side (:2228):                  eight pointers -> 64 bytes, with
-//                                           deltaP inserted before appliedForces.
-// ---------------------------------------------------------------------------
-struct ClothPsSolveClothParams
+// cloth_queryCPContactReferenceCountLaunch (NEW in 5.12)
+//   (PxgFEMCloth* clothes, PxgParticleSystem* particlesystems,
+//    PxgDeformablePairInfo* contactInfos, PxgParticleDbContactBlock* contactBlocks,
+//    PxU32* numContacts, const PxReal dt, bool isVelocityIteration)
+//   -> {8 x 5, 4, 1} = 48-byte blob (dt @40, isVelocityIteration byte @44).
+// ===========================================================================
+struct ClothPsQueryParams
 {
-    uint64_t clothes;              // @0
-    uint64_t particleSystems;      // @8
-    uint64_t contactInfos;         // @16
-    uint64_t constraints;          // @24
-    uint64_t numContacts;          // @32
-    uint64_t appliedForces;        // @40  float2*
-    uint64_t materials;            // @48 -> 56
+    uint64_t clothes;             // @0
+    uint64_t particlesystems;     // @8
+    uint64_t contactInfos;        // @16  in/out (ACTIVE flag)
+    uint64_t contactBlocks;       // @24
+    uint64_t numContacts;         // @32
+    float dt;                     // @40
+    uint isVelocityIteration;     // @44  bool byte0 -> 48
 }
+[[vk::push_constant]] ConstantBuffer<ClothPsQueryParams> gCpq;
 
-struct ClothPsSolveParticleParams
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void cloth_queryCPContactReferenceCountLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    uint64_t clothes;              // @0
-    uint64_t particleSystems;      // @8
-    uint64_t contactInfos;         // @16
-    uint64_t constraints;          // @24
-    uint64_t numContacts;          // @32
-    uint64_t deltaP;               // @40  float4* output -- the extra argument
-    uint64_t appliedForces;        // @48  float2*
-    uint64_t materials;            // @56 -> 64
-}
-
-[[vk::push_constant]] ConstantBuffer<ClothPsSolveClothParams> gSc;
-[[vk::push_constant]] ConstantBuffer<ClothPsSolveParticleParams> gSp;
-
-// computeTriangleContact, the FLOAT4 overload (:182).  S5.
-float4 pssTriangleContact(uint64_t velsAddr, uint4 triVertId, float4 barycentric,
-                          out float4 invMass)
-{
-    Ptr<float4> vels = Ptr<float4>(velsAddr);
-    const float4 v0 = vels[triVertId.x];
-    const float4 v1 = vels[triVertId.y];
-    const float4 v2 = vels[triVertId.z];
-    invMass = float4(v0.w, v1.w, v2.w, 0.0f);
-    return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
-}
-
-// PxVec3::normalize (PxVec3.h:295-301) -- returns the magnitude and normalises in
-// place when m > 0.  S6.
-//
-// THE SCALING IS A RECIPROCAL-MULTIPLY, NOT THREE DIVIDES, and that is not a
-// stylistic choice.  normalize() delegates to operator/= (PxVec3.h:260-267),
-// which is `f = 1.0/f; x *= f; y *= f; z *= f` -- ONE reciprocal and three
-// multiplies.  Slang's `v / m` for scalar m is a genuine componentwise vector
-// divide (verified: a single vec3-typed OpFDiv whose divisor is an
-// OpCompositeConstruct splat), and the two forms differ in at least one
-// component for 53.5% of random vectors.  P9.36.
-float pssNormalize(inout float3 v)
-{
-    const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f)
-        v = v * (1.0f / m);
-    return m;
-}
-
-// updateTrianglePosDelta (FEMClothExternalSolve.cu:59).  S8.
-void pssUpdateTrianglePosDelta(float4 invMasses, float4 barycentric, uint4 vertInds,
-                               float3 deltaPos, uint64_t outDeltaAddr)
-{
-    if (invMasses.x > 0.0f && abs(barycentric.x) > 1e-6f)
-    {
-        pxgAtomicAddF4XYZ(outDeltaAddr, vertInds.x, deltaPos * invMasses.x * barycentric.x);
-        pxgAtomicAddF4W(outDeltaAddr, vertInds.x, 1.0f);
-    }
-    if (invMasses.y > 0.0f && abs(barycentric.y) > 1e-6f)
-    {
-        pxgAtomicAddF4XYZ(outDeltaAddr, vertInds.y, deltaPos * invMasses.y * barycentric.y);
-        pxgAtomicAddF4W(outDeltaAddr, vertInds.y, 1.0f);
-    }
-    if (invMasses.z > 0.0f && abs(barycentric.z) > 1e-6f)
-    {
-        pxgAtomicAddF4XYZ(outDeltaAddr, vertInds.z, deltaPos * invMasses.z * barycentric.z);
-        pxgAtomicAddF4W(outDeltaAddr, vertInds.z, 1.0f);
-    }
-}
-
-// Everything the two kernels share, up to and including the force update.
-// `clothSide` selects only the final store.
-void pssSolveBody(uint64_t clothes_, uint64_t particleSystems_, uint64_t contactInfos_,
-                  uint64_t constraints_, uint64_t numContacts_, uint64_t appliedForces_,
-                  uint64_t materials_, uint64_t deltaP_, bool clothSide,
-                  uint3 gtid, uint3 gid)
-{
-    const uint tNumContacts = Ptr<uint>(numContacts_)[0];
-
-    const uint nbBlocksRequired = (tNumContacts + PSS_BLOCK - 1u) / PSS_BLOCK;
-    const uint nbIterationsPerBlock = (nbBlocksRequired + PSS_GRID - 1u) / PSS_GRID;
-
+    const uint tNumContacts = Ptr<uint>(gCpq.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + CPS_BLOCK - 1u) / CPS_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + CPS_GRID - 1u) / CPS_GRID;
     const uint idx = gtid.x;
     const uint threadIndexInWarp = gtid.x & 31u;
 
-    Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(clothes_);
-    Ptr<PxgParticleSystemGpu> particleSystems = Ptr<PxgParticleSystemGpu>(particleSystems_);
+    const float dt = gCpq.dt;
+    const bool isVelocityIteration = (gCpq.isVelocityIteration & 0xffu) != 0u;
 
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gCpq.contactInfos);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * PSS_BLOCK + idx + nbIterationsPerBlock * gid.x * PSS_BLOCK;  // S1
-
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * CPS_BLOCK + idx + nbIterationsPerBlock * gid.x * CPS_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
 
-        const uint64_t infoBase = contactInfos_ + uint64_t(workIndex) * 16UL;
-        const uint2 pairInd0 = Ptr<uint2>(infoBase + 0UL)[0];
-        const uint pairInd1 = Ptr<uint>(infoBase + 8UL)[0];
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gCpq.contactBlocks + uint64_t(workIndex / 32u) * PXG_PDBC_STRIDE;
 
-        const uint64_t cBase = constraints_ +
-                               uint64_t(workIndex / 32u) * uint64_t(PSS_CONSTRAINT_STRIDE);      // S2
-        const float velMultiplier =
-            Ptr<float>(cBase + uint64_t(PSS_OFF_VELMULT))[threadIndexInWarp];
+        if (!PxgIsValidPairInfo(contactInfo))
+        {
+            cpSetActive(gCpq.contactInfos, workIndex, contactInfo.ref1, false);
+            continue;
+        }
 
-        const uint particleSystemId = pairInd0.y;
-        const uint particleIndex = pairInd0.x;
-
-        const float4 deltaP_invMass =
-            Ptr<float4>(particleSystems[particleSystemId].mSortedDeltaP)[particleIndex];
+        // ref0 = particle, ref1 = cloth triangle (matches the narrowphase).
+        const uint64_t particleRef = contactInfo.ref0;
+        Ptr<PxgParticleSystemGpu> particleSystem = cpSystemAt(gCpq.particlesystems, particleRef);
+        const uint particleIndex = PxgGetParticleIndex(particleRef);
+        const float4 deltaP_invMass = Ptr<float4>(particleSystem[0].mSortedDeltaP)[particleIndex];
         const float invMass0 = deltaP_invMass.w;
 
-        if (invMass0 != 0.0f)                                                                   // S3
+        // A kinematic particle is inactive end-to-end (the CP cloth solve skips its whole body).
+        if (invMass0 == 0.0f)
         {
-            const uint phase =
-                Ptr<uint>(particleSystems[particleSystemId].mSortedPhaseArray)[particleIndex];
-            const uint group = phase & PXG_PARTICLE_PHASE_GROUP_MASK;
-            const uint mi = pxgLoadPhaseToMaterial(
-                particleSystems[particleSystemId].mPhaseGroupToMaterialHandle, group);
-            const float dynamicFriction0 = pxgLoadParticleMaterialFloat(
-                particleSystems[particleSystemId].mParticleMaterials, mi,
-                particleSystems[particleSystemId].mParticleMaterialStride, PSS_PS_MAT_FRICTION);
+            cpSetActive(gCpq.contactInfos, workIndex, contactInfo.ref1, false);
+            continue;
+        }
 
-            const float4 barycentric =
-                Ptr<float4>(cBase + uint64_t(PSS_OFF_BARYCENTRIC))[threadIndexInWarp];
+        Ptr<PxgFEMClothGpu> cloth = clothAt(gCpq.clothes, PxgGetDeformableId(contactInfo.ref1));
 
-            const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
-            const uint elementId = pairInd1 & PXG_CLOTH_ELEM_MASK;                              // S9
-            const uint4 triVertId =
-                Ptr<uint4>(clothes[clothId].mTriangleVertexIndices)[elementId];
+        // Side 0 = cloth, side 1 = particle; the prepare stored normal = -narrowphase.
+        PxgDeformablePart clothPart = PxgDeformablePart();
+        clothPart.readCloth(cloth, contactInfo.ref1, block + PXG_PDBC_barycentric, threadIndexInWarp, 0UL,
+                            /*countReferenceOnly*/ true, dt, isVelocityIteration);
 
-            float4 invMasses1;
-            const float4 delta1 = pssTriangleContact(clothes[clothId].mAccumulatedDeltaPos,
-                                                     triVertId, barycentric, invMasses1);        // S5
+        PxgDeformablePart particlePart = PxgDeformablePart();
+        particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, 0UL,
+                                  /*inflateByRefCount*/ false, dt, isVelocityIteration);
 
-            // mMaterialIndices is a PxU16 array; the cloth material's
-            // dynamicFriction is float index 1 of a 32-byte record.
-            const uint64_t miBase = clothes[clothId].mMaterialIndices;
-            const uint miWord = Ptr<uint>(miBase)[elementId >> 1];
-            const uint globalMaterialIndex = (miWord >> ((elementId & 1u) * 16u)) & 0xffffu;
-            const float dynamicFriction1 =
-                Ptr<float>(materials_ + uint64_t(globalMaterialIndex) *
-                                        uint64_t(PSS_CLOTH_MAT_STRIDE))[PSS_CLOTH_MAT_DYNFRICTION];
+        PxgDbContactPair contactPair = PxgDbContactPair();
+        PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+        contactPair.readContactPrepDbDb(block, PXG_PDBC_maxPenBiasClamp, threadIndexInWarp);
 
-            const float frictionCoefficient = (dynamicFriction0 + dynamicFriction1) * 0.5f;
+        const bool isActive = solveDbDbContact(clothPart, particlePart, contactPair, solveOut, 0.0f, 0.0f, 0.0f, dt,
+                                               /*checkOnlyActivity*/ true, isVelocityIteration);
 
-            const float3 linDelta0 = float3(deltaP_invMass.x, deltaP_invMass.y, deltaP_invMass.z);
-            const float3 linDelta1 = float3(delta1.x, delta1.y, delta1.z);
-            const float3 delta = linDelta1 - linDelta0;
+        cpSetActive(gCpq.contactInfos, workIndex, contactInfo.ref1, isActive);
 
-            const float4 normal_pen =
-                Ptr<float4>(cBase + uint64_t(PSS_OFF_NORMAL_PEN))[threadIndexInWarp];
-            const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);           // S4
+        if (isActive)
+        {
+            // Integer-count refcount bump per touched triangle vertex (gated |bc| > 1e-3).
+            clothPart.bumpClothRefCountPart(cloth);
 
-            float2 appliedForce = Ptr<float2>(appliedForces_)[workIndex];
-
-            const float normalDelta = dot(delta, normal);
-
-            float3 tanDir = delta - normal * normalDelta;
-            const float fricDelta = pssNormalize(tanDir);                                        // S6
-
-            const float error = normal_pen.w + normalDelta;
-
-            const float deltaF = max(-appliedForce.x, -error * velMultiplier);                   // S7
-            appliedForce.x += deltaF;
-
-            const float friction = appliedForce.x * frictionCoefficient;
-            const float requiredForce = fricDelta * velMultiplier;
-
-            const float deltaFr = min(requiredForce + appliedForce.y, friction) - appliedForce.y;
-            appliedForce.y += deltaFr;
-
-            if (clothSide)
-            {
-                const float3 deltaPos =
-                    ((normal * deltaF) - tanDir * deltaFr) * FEMCLOTH_BIAS_COEFFICIENT;
-                pssUpdateTrianglePosDelta(invMasses1, barycentric, triVertId, deltaPos,
-                                          clothes[clothId].mDeltaPos);                           // S8
-            }
-            else
-            {
-                const float3 deltaV = ((-normal * deltaF) + tanDir * deltaFr) *
-                                      invMass0 * FEMCLOTH_BIAS_COEFFICIENT;
-                const float w = (deltaF != 0.0f || deltaFr != 0.0f) ? 1.0f : 0.0f;
-                Ptr<float4>(deltaP_)[workIndex] = float4(deltaV.x, deltaV.y, deltaV.z, w);
-            }
-
-            Ptr<float2>(appliedForces_)[workIndex] = appliedForce;
+            // Particle-side mass-split count, the counterpart of the cloth-vertex refCount.
+            pxgAtomicAddF4W(particleSystem[0].mAccumDeltaP, particleIndex, 1.0f);
         }
     }
 }
+
+// ===========================================================================
+// cloth_solveCPOutputClothDeltaVLaunch
+//   (PxgFEMCloth* clothes, PxgParticleSystem* particlesystems,
+//    const PxgDeformablePairInfo* contactInfos, PxgParticleDbContactBlock* contactBlocks,
+//    PxU32* numContacts, float2* appliedForces, PxsDeformableSurfaceMaterialData* materials,
+//    const PxReal dt, bool isVelocityIteration)
+//   -> {8 x 7, 4, 1} = 64-byte blob (dt @56, isVelocityIteration byte @60).
+// ===========================================================================
+struct ClothPsSolveClothParams
+{
+    uint64_t clothes;             // @0
+    uint64_t particlesystems;     // @8
+    uint64_t contactInfos;        // @16
+    uint64_t contactBlocks;       // @24
+    uint64_t numContacts;         // @32
+    uint64_t appliedForces;       // @40  in/out
+    uint64_t materials;           // @48
+    float dt;                     // @56
+    uint isVelocityIteration;     // @60  bool byte0 -> 64
+}
+[[vk::push_constant]] ConstantBuffer<ClothPsSolveClothParams> gCps;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void cloth_solveCPOutputClothDeltaVLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    pssSolveBody(gSc.clothes, gSc.particleSystems, gSc.contactInfos, gSc.constraints,
-                 gSc.numContacts, gSc.appliedForces, gSc.materials, 0UL, true, gtid, gid);
+    const uint tNumContacts = Ptr<uint>(gCps.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + CPS_BLOCK - 1u) / CPS_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + CPS_GRID - 1u) / CPS_GRID;
+    const uint idx = gtid.x;
+    const uint threadIndexInWarp = gtid.x & 31u;
+
+    const float dt = gCps.dt;
+    const bool isVelocityIteration = (gCps.isVelocityIteration & 0xffu) != 0u;
+
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gCps.contactInfos);
+    Ptr<float2> appliedForces = Ptr<float2>(gCps.appliedForces);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint rawWorkIndex = i * CPS_BLOCK + idx + nbIterationsPerBlock * gid.x * CPS_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
+            return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
+
+        // The pre-count decided this on the same positions, this iteration.
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        if (!PxgIsActivePairInfo(contactInfo))
+            continue;
+
+        const uint64_t block = gCps.contactBlocks + uint64_t(workIndex / 32u) * PXG_PDBC_STRIDE;
+
+        const uint64_t particleRef = contactInfo.ref0;
+        Ptr<PxgParticleSystemGpu> particleSystem = cpSystemAt(gCps.particlesystems, particleRef);
+        const uint particleIndex = PxgGetParticleIndex(particleRef);
+
+        const float4 deltaP_invMass = Ptr<float4>(particleSystem[0].mSortedDeltaP)[particleIndex];
+        const float invMass0 = deltaP_invMass.w;
+
+        if (invMass0 != 0.0f)
+        {
+            const uint64_t psMat = cpMaterialElem(particleSystem, particleIndex);
+
+            Ptr<PxgFEMClothGpu> cloth = clothAt(gCps.clothes, PxgGetDeformableId(contactInfo.ref1));
+
+            // Cloth side: countReferenceOnly = false consumes the refCount in .w and reads the
+            // material friction.
+            PxgDeformablePart clothPart = PxgDeformablePart();
+            clothPart.readCloth(cloth, contactInfo.ref1, block + PXG_PDBC_barycentric, threadIndexInWarp,
+                                gCps.materials, /*countReferenceOnly*/ false, dt, isVelocityIteration);
+
+            PxgDeformablePart particlePart = PxgDeformablePart();
+            particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, psMat,
+                                      /*inflateByRefCount*/ true, dt, isVelocityIteration);
+
+            PxgDbContactPair contactPair = PxgDbContactPair();
+            PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+            contactPair.readContactPrepDbDb(block, PXG_PDBC_maxPenBiasClamp, threadIndexInWarp);
+
+            const float frictionCoefficient = (clothPart.friction + particlePart.friction) * 0.5f;
+
+            float2 appliedForce = appliedForces[workIndex];
+            const bool hasApplied = solveDbDbContact(clothPart, particlePart, contactPair, solveOut, appliedForce.x,
+                                                     appliedForce.y, frictionCoefficient, dt,
+                                                     /*checkOnlyActivity*/ false, isVelocityIteration);
+
+            if (hasApplied)
+            {
+                float3 delta;
+                solveOut.computeDelta(contactPair, delta, dt);
+
+                // .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
+                clothPart.writeCloth(cloth, delta);
+
+                appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+                appliedForce.y += solveOut.deltaLambdaT;
+                appliedForces[workIndex] = appliedForce;
+            }
+        }
+    }
 }
+
+// ===========================================================================
+// cloth_solveCPOutputParticleDeltaVLaunch
+//   (PxgFEMCloth* clothes, PxgParticleSystem* particlesystems,
+//    const PxgDeformablePairInfo* contactInfos, PxgParticleDbContactBlock* contactBlocks,
+//    PxU32* numContacts, float4* deltaP, float2* appliedForces,
+//    PxsDeformableSurfaceMaterialData* materials, const PxReal dt, bool isVelocityIteration)
+//   -> {8 x 8, 4, 1} = 72-byte blob (dt @64, isVelocityIteration byte @68).
+// ===========================================================================
+struct ClothPsSolvePsParams
+{
+    uint64_t clothes;             // @0
+    uint64_t particlesystems;     // @8
+    uint64_t contactInfos;        // @16
+    uint64_t contactBlocks;       // @24
+    uint64_t numContacts;         // @32
+    uint64_t deltaP;              // @40  output, one float4 per contact
+    uint64_t appliedForces;       // @48  in/out
+    uint64_t materials;           // @56
+    float dt;                     // @64
+    uint isVelocityIteration;     // @68  bool byte0 -> 72
+}
+[[vk::push_constant]] ConstantBuffer<ClothPsSolvePsParams> gCpp;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void cloth_solveCPOutputParticleDeltaVLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    pssSolveBody(gSp.clothes, gSp.particleSystems, gSp.contactInfos, gSp.constraints,
-                 gSp.numContacts, gSp.appliedForces, gSp.materials, gSp.deltaP, false, gtid, gid);
+    const uint tNumContacts = Ptr<uint>(gCpp.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + CPS_BLOCK - 1u) / CPS_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + CPS_GRID - 1u) / CPS_GRID;
+    const uint idx = gtid.x;
+    const uint threadIndexInWarp = gtid.x & 31u;
+
+    const float dt = gCpp.dt;
+    const bool isVelocityIteration = (gCpp.isVelocityIteration & 0xffu) != 0u;
+
+    Ptr<PxgDeformablePairInfoGpu> contactInfos = Ptr<PxgDeformablePairInfoGpu>(gCpp.contactInfos);
+    Ptr<float2> appliedForces = Ptr<float2>(gCpp.appliedForces);
+    Ptr<float4> deltaP = Ptr<float4>(gCpp.deltaP);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint rawWorkIndex = i * CPS_BLOCK + idx + nbIterationsPerBlock * gid.x * CPS_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
+            return;
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);   // P9.23
+
+        const PxgDeformablePairInfoGpu contactInfo = contactInfos[workIndex];
+        const uint64_t block = gCpp.contactBlocks + uint64_t(workIndex / 32u) * PXG_PDBC_STRIDE;
+
+        const uint64_t particleRef = contactInfo.ref0;
+        Ptr<PxgParticleSystemGpu> particleSystem = cpSystemAt(gCpp.particlesystems, particleRef);
+        const uint particleIndex = PxgGetParticleIndex(particleRef);
+
+        const float4 deltaP_invMass = Ptr<float4>(particleSystem[0].mSortedDeltaP)[particleIndex];
+        const float invMass0 = deltaP_invMass.w;
+
+        if (invMass0 != 0.0f)
+        {
+            if (!PxgIsActivePairInfo(contactInfo))
+            {
+                // The accumulate scan reads every slot, so an inactive contact's is cleared.
+                deltaP[workIndex] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                continue;
+            }
+
+            const uint64_t psMat = cpMaterialElem(particleSystem, particleIndex);
+
+            Ptr<PxgFEMClothGpu> cloth = clothAt(gCpp.clothes, PxgGetDeformableId(contactInfo.ref1));
+
+            // Read in full (not activity-only) so both halves see the same invMass and friction;
+            // side-effect free here, this kernel scatters only to deltaP[], never to mDeltaPos.
+            PxgDeformablePart clothPart = PxgDeformablePart();
+            clothPart.readCloth(cloth, contactInfo.ref1, block + PXG_PDBC_barycentric, threadIndexInWarp,
+                                gCpp.materials, /*countReferenceOnly*/ false, dt, isVelocityIteration);
+
+            PxgDeformablePart particlePart = PxgDeformablePart();
+            particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, psMat,
+                                      /*inflateByRefCount*/ true, dt, isVelocityIteration);
+
+            PxgDbContactPair contactPair = PxgDbContactPair();
+            PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+            contactPair.readContactPrepDbDb(block, PXG_PDBC_maxPenBiasClamp, threadIndexInWarp);
+
+            const float frictionCoefficient = (clothPart.friction + particlePart.friction) * 0.5f;
+
+            float2 appliedForce = appliedForces[workIndex];
+            const bool hasApplied = solveDbDbContact(clothPart, particlePart, contactPair, solveOut, appliedForce.x,
+                                                     appliedForce.y, frictionCoefficient, dt,
+                                                     /*checkOnlyActivity*/ false, isVelocityIteration);
+
+            if (hasApplied)
+            {
+                // Aggregated into mAccumDeltaP by the FEM accumulate (.w flags a live contact);
+                // ps_updateParticleLaunch applies it at iteration end.
+                float3 delta;
+                solveOut.computeDelta(contactPair, delta, dt);
+                particlePart.writeParticle(gCpp.deltaP, workIndex, float3(-delta.x, -delta.y, -delta.z), solveOut);
+
+                appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+                appliedForce.y += solveOut.deltaLambdaT;
+                appliedForces[workIndex] = appliedForce;
+            }
+            else
+            {
+                deltaP[workIndex] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        else
+        {
+            // A kinematic particle takes no delta; its slot is cleared for the accumulate scan.
+            deltaP[workIndex] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
 }

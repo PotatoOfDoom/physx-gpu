@@ -31,7 +31,7 @@
 // convexTriangle.cuh convexMeshSAT<false> / satConvexFaceNormals /
 // satTriangleNormal / selectPolygonFeatureIndex, contactReduction.cuh
 // contactReduce<false, true, 5>, PxgOutputIndex, and
-// PxgFEMContactWriter::writeRigidVsDeformableContact):
+// PxgRigidDbContactWriter::writeSurfaceContact (PhysX 5.12)):
 //
 // - convexScaledVerts precompute (vertex2Shape of every hull vertex);
 // - convexMeshSAT<false>: satConvexFaceNormals (per convex face, plane
@@ -60,10 +60,10 @@
 //   the reservation happens BEFORE the `mask > 0` write gate, and that gate
 //   is a SIGNED int comparison: a kept lane-31 contact makes the whole
 //   batch unwritten while the counter still advances — faithful quirk),
-//   then writeRigidVsDeformableContact: world-space point (w = restDist)
-//   and normal (w = separation), barycentric, pairInd0 = rigidId (u64),
-//   pairInd1 = PxEncodeClothIndex(clothId, triangleId), and the info fourth
-//   dword = rigidMaterialIndex with the isInCollision bit (31) cleared.
+//   then writeSurfaceContact (5.12): world-space point (w = restDist) and
+//   normal (w = separation), rigidRef = rigidId.getInd() (u64), the PxU16
+//   rigid material index, triRef = PxgEncodeDeformableTriangle(clothId,
+//   triangleId), and the barycentric.
 //
 // WARP SERIALIZATION: the CUDA runs one warp per pair.  All reductions are
 // order-fixed (warpReduction winnerLane = LOWEST lane holding the maximum,
@@ -99,13 +99,15 @@ import pxgSlangCommon;
 // This shader keeps its entry point and its battery, which is what verifies the
 // lift -- see pxgSlangConvexTriCloth.slang.
 import pxgSlangConvexTriCloth;
+import pxgSlangDeformableWriters;   // PxgRigidDbContactWriterGpu
 
 struct FctParams
 {
     uint numCases; uint maxContacts; uint pad0; uint pad1;   // @0
     uint64_t hullAddr;        // @16  base of the hull blob (FctCase.ids2.y is a UINT offset into it)
-    // PxgFEMContactWriter, by address (@24..@88)
+    // PxgRigidDbContactWriter, by address (@24..@96)
     uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;
+    uint64_t wRigidMat;       // @88  PxU16* outRigidMaterialIndex (5.12)
 }
 
 // struct FctCase now lives in pxgSlangConvexTriCloth (public) -- one definition,
@@ -127,11 +129,13 @@ void ctFcConvexTri(uint3 tid : SV_DispatchThreadID)
     // FctCase.ids2.y stays a UINT offset into the blob; the address is formed here.
     const uint64_t hull = gParams.hullAddr + uint64_t(cs.ids2.y) * 4UL;
 
-    FcCtWriter w;
-    w.point = gParams.wPoint; w.normalPen = gParams.wNormalPen; w.bary = gParams.wBary;
-    w.info = gParams.wInfo;   w.count = gParams.wCount;
-    w.byX = gParams.wByX;     w.tempByX = gParams.wTempByX; w.idxByX = gParams.wIdxByX;
-    w.maxContacts = gParams.maxContacts;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gParams.wPoint; w.outNormalPen = gParams.wNormalPen; w.outBarycentric = gParams.wBary;
+    w.outContactInfo = gParams.wInfo; w.outRigidMaterialIndex = gParams.wRigidMat;
+    w.totalContactCount = gParams.wCount;
+    w.contactByRigid = gParams.wByX; w.tempContactByRigid = gParams.wTempByX;
+    w.contactIndexSortedByRigid = gParams.wIdxByX;
+    w.maxNumContacts = gParams.maxContacts;
 
     gDebug[caseIdx] = fcClothConvexTriContactGen(cs, hull, w);
 }

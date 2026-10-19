@@ -104,16 +104,17 @@ using namespace physx;
 struct F4 { float x, y, z, w; };
 struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
 
-static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
+static_assert(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem stride");
 static_assert(sizeof(PxgContactManagerInput) == 16, "PxgContactManagerInput stride");
 static_assert(sizeof(PxgShape) == 48, "PxgShape stride");
 static_assert(offsetof(PxgShape, hullOrMeshPtr) == 32, "PxgShape::hullOrMeshPtr @32");
 static_assert(sizeof(PxsCachedTransform) == 32, "PxsCachedTransform stride");
-static_assert(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride");
-static_assert(sizeof(PxgParticlePrimitiveContact) == 32, "contact stride");
+static_assert(sizeof(PxgDeformablePairInfo) == 16, "contact info stride");
 
-// psContactGenBda.slang's PsCollideParams, byte for byte (the 176-byte blob the
-// engine builds from 23 individual arguments -- see kPsConvexCollide).
+// psContactGenBda.slang's PsConvexParams, byte for byte (the 184-byte blob the engine
+// builds from 24 individual arguments -- see kPsConvexCollide; PhysX 5.12 split the
+// contact into PxgDeformablePairInfo + float4 normalPen streams).  The w_ names follow
+// the PxgRigidParticleContactWriter fields the arguments correspond to.
 struct PsCollideBlob
 {
     uint32_t isTGSWord;                        // @0
@@ -131,22 +132,61 @@ struct PsCollideBlob
     uint64_t totalNumPairs;                    // @80
     uint64_t particleSystems;                  // @88
     uint64_t shapeToRigidRemap;                // @96
-    uint64_t w_particleContacts;               // @104
-    uint64_t w_numTotalContacts;               // @112
-    uint64_t w_contactSortedByParticle;        // @120
-    uint64_t w_tempContactByParticle;          // @128
-    uint64_t w_contactIndexSortedByParticle;   // @136
-    uint64_t w_contactByRigid;                 // @144
-    uint64_t w_tempContactByRigid;             // @152
-    uint64_t w_contactIndexSortedByRigid;      // @160
-    uint32_t w_maxContacts;                    // @168
-    uint32_t pad172;                           // @172 -> 176
+    uint64_t w_particleContactInfos;           // @104
+    uint64_t w_particleContactNormalPens;      // @112
+    uint64_t w_numTotalContacts;               // @120
+    uint64_t w_contactSortedByParticle;        // @128
+    uint64_t w_tempContactByParticle;          // @136
+    uint64_t w_contactIndexSortedByParticle;   // @144
+    uint64_t w_contactByRigid;                 // @152
+    uint64_t w_tempContactByRigid;             // @160
+    uint64_t w_contactIndexSortedByRigid;      // @168
+    uint32_t w_maxContacts;                    // @176
+    uint32_t pad180;                           // @180 -> 184
 };
-static_assert(sizeof(PsCollideBlob) == 176, "engine ABI blob size");
-static_assert(offsetof(PsCollideBlob, w_numTotalContacts) == 112, "@112");
-static_assert(offsetof(PsCollideBlob, w_maxContacts) == 168, "@168");
+static_assert(sizeof(PsCollideBlob) == 184, "engine ABI blob size");
+static_assert(offsetof(PsCollideBlob, w_numTotalContacts) == 120, "@120");
+static_assert(offsetof(PsCollideBlob, w_maxContacts) == 176, "@176");
 
 struct HostContact { F4 normal_pen; uint64_t rigidId; uint64_t particleId; };
+
+// PhysX 5.12: PxgRigidParticleContactWriter writes the particle-rigid contact as two
+// SoA streams -- PxgDeformablePairInfo {ref0 = rigid PxNodeIndex, ref1 =
+// PxgEncodeParticleRef(system, sortedIndex)} and a float4 normalPen -- where 5.6.1
+// wrote one 32-byte PxgParticlePrimitiveContact.  The fixtures read both streams back
+// and reassemble the old record shape (rigidId = ref0, particleId = ref1).
+struct ContactStreams : DevBuf { PxgBufferHandle h2 = 0; uint64_t addr2 = 0; };
+template <typename T>
+static DevBuf mkDev(PxgSlangComputeDevice* dev, const std::vector<T>& d)
+{
+    DevBuf b;
+    b.h = createBufferFrom(dev, d);
+    b.addr = dev->getBufferDeviceAddress(b.h);
+    return b;
+}
+static ContactStreams makeContacts(PxgSlangComputeDevice* dev, uint32_t n, F4 npFill = F4{ 0.0f, 0.0f, 0.0f, 0.0f },
+                                   uint64_t idFill = ~0ull)
+{
+    ContactStreams c;
+    const DevBuf infos = mkDev(dev, std::vector<PxgDeformablePairInfo>(n, PxgDeformablePairInfo{ idFill, idFill }));
+    const DevBuf normalPens = mkDev(dev, std::vector<F4>(n, npFill));
+    c.h = infos.h; c.addr = infos.addr;
+    c.h2 = normalPens.h; c.addr2 = normalPens.addr;
+    return c;
+}
+static std::vector<HostContact> downloadContacts(PxgSlangComputeDevice* dev, const ContactStreams& c, size_t n)
+{
+    const std::vector<PxgDeformablePairInfo> infos = downloadBuffer<PxgDeformablePairInfo>(dev, c.h, n);
+    const std::vector<F4> normalPens = downloadBuffer<F4>(dev, c.h2, n);
+    std::vector<HostContact> out(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i].normal_pen = normalPens[i];
+        out[i].rigidId = infos[i].ref0;
+        out[i].particleId = infos[i].ref1;
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // The scene.
@@ -455,9 +495,10 @@ struct Rig
 {
     std::vector<PxgBufferHandle> owned;
     DevBuf bDesc, bCin, bShapes, bTc, bBounds, bCd, bRd, bMat, bStart, bTotal, bRemap;
-    DevBuf bHull, bCellStart, bCellEnd, bOrigin, bPred, bS2U, bRunsum, bSimBuf, bFilterPairs;
+    DevBuf bHull, bCellStart, bCellEnd, bOrigin, bPred, bS2U, bRunsum, bSimBuf;
     DevBuf bPredB;   // system B's predicted positions (CCD on)
-    DevBuf bContacts, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
+    ContactStreams bContacts;
+    DevBuf bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
     PsCollideBlob blob{};
 
     template <typename T>
@@ -558,18 +599,12 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     R.bCellEnd = R.mk(dev, std::vector<uint32_t>{ CELL_BOUNDS[1], CELL_BOUNDS[2],
                                                   CELL_BOUNDS[3], CELL_BOUNDS[4] });
 
-    // The filter machinery: one pair naming (node, UNSORTED id).
+    // PhysX 5.12 removed the particle-rigid element filter (with particle rigids, 5.9):
+    // the sim buffer carries no filter pairs and FILTERED_SORTED -- the slot whose
+    // unsorted id the 5.6.1 rig named in one -- is now an ordinary particle.
     R.bRunsum = R.mk(dev, std::vector<uint32_t>{ 0u });
-    std::vector<PxgRigidFilterPair> pairs(1);
-    std::memset(pairs.data(), 0, sizeof(PxgRigidFilterPair));
-    pairs[0].index0 = uint64_t(NODE_INDEX);
-    pairs[0].index1 = uint64_t(FILTERED_UNSORTED);
-    pairs[0].index2 = 0u;
-    R.bFilterPairs = R.mk(dev, pairs);
     std::vector<PxgParticleSimBuffer> simBufs(1);
     std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBufs[0].mFilterPairs = reinterpret_cast<PxParticleRigidFilterPair*>(size_t(R.bFilterPairs.addr));
-    simBufs[0].mNumFilterPairs = 1u;
     R.bSimBuf = R.mk(dev, simBufs);
 
     std::vector<PxgParticleSystem> descArr(2);
@@ -668,11 +703,9 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     R.bRemap = R.mk(dev, std::vector<uint64_t>{ 0ull, uint64_t(NODE_INDEX), 0ull });
 
     // ---- writer outputs, poisoned past the live contacts ----
-    std::vector<HostContact> contacts(MAX_CONTACTS + SLACK);
-    for (auto& c : contacts)
-    { c.normal_pen = F4{ POISON_F, POISON_F, POISON_F, POISON_F };
-      c.rigidId = POISON_U64; c.particleId = POISON_U64; }
-    R.bContacts = R.mk(dev, contacts);
+    R.bContacts = makeContacts(dev, MAX_CONTACTS + SLACK, F4{ POISON_F, POISON_F, POISON_F, POISON_F }, POISON_U64);
+    R.owned.push_back(R.bContacts.h);
+    R.owned.push_back(R.bContacts.h2);
     R.bCount = R.mk(dev, std::vector<uint32_t>{ 0u });
     R.bSbP = R.mk(dev, std::vector<uint64_t>(MAX_CONTACTS + SLACK, POISON_U64));
     R.bTbP = R.mk(dev, std::vector<uint32_t>(MAX_CONTACTS + SLACK, POISON_U32));
@@ -695,7 +728,8 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     R.blob.totalNumPairs = R.bTotal.addr;
     R.blob.particleSystems = R.bDesc.addr;
     R.blob.shapeToRigidRemap = R.bRemap.addr;
-    R.blob.w_particleContacts = R.bContacts.addr;
+    R.blob.w_particleContactInfos = R.bContacts.addr;
+    R.blob.w_particleContactNormalPens = R.bContacts.addr2;
     R.blob.w_numTotalContacts = R.bCount.addr;
     R.blob.w_contactSortedByParticle = R.bSbP.addr;
     R.blob.w_tempContactByParticle = R.bTbP.addr;
@@ -708,11 +742,10 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
 
 static void resetOutputs(PxgSlangComputeDevice* dev, Rig& R)
 {
-    std::vector<HostContact> contacts(MAX_CONTACTS + SLACK);
-    for (auto& c : contacts)
-    { c.normal_pen = F4{ POISON_F, POISON_F, POISON_F, POISON_F };
-      c.rigidId = POISON_U64; c.particleId = POISON_U64; }
-    dev->upload(R.bContacts.h, contacts.data(), contacts.size() * sizeof(HostContact));
+    const std::vector<PxgDeformablePairInfo> infos(MAX_CONTACTS + SLACK, PxgDeformablePairInfo{ POISON_U64, POISON_U64 });
+    const std::vector<F4> normalPens(MAX_CONTACTS + SLACK, F4{ POISON_F, POISON_F, POISON_F, POISON_F });
+    dev->upload(R.bContacts.h, infos.data(), infos.size() * sizeof(PxgDeformablePairInfo));
+    dev->upload(R.bContacts.h2, normalPens.data(), normalPens.size() * sizeof(F4));
     const uint32_t zero = 0u;
     dev->upload(R.bCount.h, &zero, sizeof(uint32_t));
     std::vector<uint64_t> p64(MAX_CONTACTS + SLACK, POISON_U64);
@@ -789,7 +822,7 @@ static std::vector<Want> expectedSet()
         gcCellSpan(cvxCellOfWork(w), lo, hi);
         for (uint32_t i = lo; i < hi; ++i)
         {
-            if (i == FILTERED_SORTED) continue;              // X9, on BOTH systems
+            // X9: 5.12 has no filter here -- FILTERED_SORTED is an ordinary particle.
             float p[3], dir[3]; particlePos(i, p);
             const float sdOrigin = boxSignedDistance(p, dir);
             if (sys == 0u)
@@ -810,7 +843,7 @@ static void checkRun(PxgSlangComputeDevice* dev, const Rig& R, const char* label
 {
     const std::vector<Want> want = expectedSet();
     const auto count = downloadBuffer<uint32_t>(dev, R.bCount.h, 1);
-    const auto contacts = downloadBuffer<HostContact>(dev, R.bContacts.h, MAX_CONTACTS + SLACK);
+    const auto contacts = downloadContacts(dev, R.bContacts, MAX_CONTACTS + SLACK);
     const auto sbp = downloadBuffer<uint64_t>(dev, R.bSbP.h, MAX_CONTACTS + SLACK);
     const auto tbp = downloadBuffer<uint32_t>(dev, R.bTbP.h, MAX_CONTACTS + SLACK);
     const auto ibp = downloadBuffer<uint32_t>(dev, R.bIbP.h, MAX_CONTACTS + SLACK);
@@ -834,10 +867,10 @@ static void checkRun(PxgSlangComputeDevice* dev, const Rig& R, const char* label
     size_t bad = 0;
     for (uint32_t c = 0; c < written; ++c)
     {
-        // PxEncodeParticleIndex packs (systemId << 32) | particleIndex, so the
+        // PxgEncodeParticleRef packs (systemId << 34) | particleIndex (5.12), so the
         // record names BOTH halves and the two systems cannot be confused.
-        const uint32_t pid = uint32_t(contacts[c].particleId & 0xffffffffull);
-        const uint32_t sys = uint32_t(contacts[c].particleId >> 32);
+        const uint32_t pid = PxgGetParticleIndex(contacts[c].particleId);
+        const uint32_t sys = PxgGetParticleSystemId(contacts[c].particleId);
         size_t at = want.size();
         for (size_t w = 0; w < want.size(); ++w)
             if (!claimed[w] && want[w].particle == pid && want[w].sys == sys) { at = w; break; }
@@ -900,7 +933,7 @@ static void checkRun(PxgSlangComputeDevice* dev, const Rig& R, const char* label
     // be wrong and never compared.
     uint32_t wroteA = 0, wroteB = 0;
     for (uint32_t c = 0; c < written; ++c)
-        ((contacts[c].particleId >> 32) ? wroteB : wroteA)++;
+        (PxgGetParticleSystemId(contacts[c].particleId) ? wroteB : wroteA)++;
     PXG_CHECK_MSG(wroteA > 0 && wroteB > 0,
                   "%s: the written contacts came from one system only (%u from the plain "
                   "system, %u from the CCD one) -- the cap is hiding a whole family",
@@ -944,7 +977,7 @@ static void runAll(PxgSlangComputeDevice* dev)
     // ---- coverage, demanded rather than designed ----
     {
         const std::vector<Want> want = expectedSet();
-        uint32_t separated = 0, penetrating = 0, sideFace = 0, filtered = 0;
+        uint32_t separated = 0, penetrating = 0, sideFace = 0, formerlyFiltered = 0;
         uint32_t sysA = 0, sysB = 0;
         for (const Want& w : want) (w.sys ? sysB : sysA)++;
         // The CCD system must accept a DIFFERENT set than the non-CCD one, or the
@@ -969,8 +1002,8 @@ static void runAll(PxgSlangComputeDevice* dev)
         {
             float p[3], dir[3]; particlePos(i, p);
             const float sd = boxSignedDistance(p, dir);
-            if (i == FILTERED_SORTED) { if (sd <= CONTACT_OFFSET) ++filtered; continue; }
             if (sd > CONTACT_OFFSET) continue;
+            if (i == FILTERED_SORTED) ++formerlyFiltered;
             if (sd > 0.0f) ++separated; else ++penetrating;
             if ((i % 4u) == 3u) ++sideFace;
         }
@@ -981,8 +1014,9 @@ static void runAll(PxgSlangComputeDevice* dev)
                       "and EPA are not both exercised", separated, penetrating);
         PXG_CHECK_MSG(sideFace > 0, "no particle is off the box's side -- every contact is "
                       "against the top face and a wrong closest-feature is invisible");
-        PXG_CHECK_MSG(filtered == 1u, "the seeded filter pair suppresses %u contacts, not 1 "
-                      "-- X9's unsorted-index key is untested", filtered);
+        PXG_CHECK_MSG(formerlyFiltered == 1u, "the particle the 5.6.1 filter pair suppressed is "
+                      "not within the contact offset (%u) -- 5.12's unfiltered contact for it "
+                      "(X9) is not demanded", formerlyFiltered);
 
         // ---- P9.18: the grid hash has to be OBSERVABLE, not merely computed ----
         {
@@ -1008,7 +1042,6 @@ static void runAll(PxgSlangComputeDevice* dev)
                 uint32_t lo, hi; gcCellSpan(h, lo, hi);
                 for (uint32_t i = lo; i < hi; ++i)
                 {
-                    if (i == FILTERED_SORTED) continue;
                     float p[3], dir[3]; particlePos(i, p);
                     if (boxSignedDistance(p, dir) <= CONTACT_OFFSET) acc[h]++;
                 }
@@ -1064,7 +1097,7 @@ static void runAll(PxgSlangComputeDevice* dev)
             std::printf("; cells accept %u %u %u %u\n", acc[0], acc[1], acc[2], acc[3]);
         }
         std::printf("    [ note ] %zu contacts (%u no-CCD, %u CCD) over %u cell particles; "
-                    "%u separated, %u penetrating, %u off the side, 1 filtered per system; "
+                    "%u separated, %u penetrating, %u off the side (incl. the formerly filtered one); "
                     "worst |normal|-1 %.3g, worst penetration error %.3g\n",
                     want.size(), sysA, sysB, CELL_END - CELL_START,
                     separated, penetrating, sideFace, worstNormErr, worstPenErr);
@@ -1117,12 +1150,12 @@ static void runAll(PxgSlangComputeDevice* dev)
 // ===========================================================================
 namespace diffuse
 {
-static_assert(offsetof(PxgParticleSystem, mDiffuseCellStart) == 520, "@520");
-static_assert(offsetof(PxgParticleSystem, mDiffuseCellEnd) == 528, "@528");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552, "@552");
-static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560, "@560");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592, "@592");
-static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616, "@616");
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellStart) == 480, "@480");
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellEnd) == 488, "@488");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 512, "@512");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 520, "@520");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 552, "@552");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 576, "@576");
 
 // PxgParticleContactInfo::MaxStaticContactsPerParticle
 static const uint32_t MAX_STATIC = 12u;
@@ -1171,7 +1204,7 @@ struct DRig
 {
     std::vector<PxgBufferHandle> owned;
     DevBuf bHull, bCin, bShapes, bTc, bBounds, bCd, bRd, bMat, bStart, bTotal, bRemap;
-    DevBuf bCellStart, bCellEnd, bOrigin, bS2U, bRunsum, bSimBuf, bFilterPairs, bDesc;
+    DevBuf bCellStart, bCellEnd, bOrigin, bS2U, bRunsum, bSimBuf, bDesc;
     DevBuf bFluidCellStart, bFluidCellEnd, bFluidPos;
     Sys sys[4];
     PsCollideBlob blob{};
@@ -1277,19 +1310,11 @@ static void buildRig(PxgSlangComputeDevice* dev, DRig& R)
     for (uint32_t i = 0; i < NB_PARTICLES; ++i) s2u[i] = unsortedIdOf(i);
     R.bS2U = R.mk(dev, s2u);
 
-    // XD3: the whole filter chain is wired and the pair still names
-    // FILTERED_SORTED's unsorted id -- and this kernel must IGNORE it.
+    // XD3: there is no filter in 5.12 at all (the particle-rigid filter was removed),
+    // so the sim buffer carries none and FILTERED_SORTED must still get its contact.
     R.bRunsum = R.mk(dev, std::vector<uint32_t>{ 0u });
-    std::vector<PxgRigidFilterPair> pairs(1);
-    std::memset(pairs.data(), 0, sizeof(PxgRigidFilterPair));
-    pairs[0].index0 = uint64_t(NODE_INDEX);
-    pairs[0].index1 = uint64_t(FILTERED_UNSORTED);
-    pairs[0].index2 = 0u;
-    R.bFilterPairs = R.mk(dev, pairs);
     std::vector<PxgParticleSimBuffer> simBufs(1);
     std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBufs[0].mFilterPairs = reinterpret_cast<PxParticleRigidFilterPair*>(size_t(R.bFilterPairs.addr));
-    simBufs[0].mNumFilterPairs = 1u;
     R.bSimBuf = R.mk(dev, simBufs);
 
     for (Sys& s : R.sys) makeOutputs(dev, R, s);
@@ -2244,9 +2269,9 @@ static void run(bool diffuse, bool knife = false)
     const DevBuf bTotal = mk(std::vector<uint32_t>{ 1u });
     const DevBuf bRemap = mk(std::vector<uint64_t>{ 0ull, uint64_t(NODE) });
     const uint32_t MAX_CONTACTS = 256u;
-    std::vector<HostContact> contacts(MAX_CONTACTS);
-    for (auto& ct : contacts) { ct.normal_pen = F4{ POISON_F, POISON_F, POISON_F, POISON_F }; ct.rigidId = POISON_U64; ct.particleId = POISON_U64; }
-    const DevBuf bContacts = mk(contacts);
+    const ContactStreams bContacts = makeContacts(dev, MAX_CONTACTS, F4{ POISON_F, POISON_F, POISON_F, POISON_F }, POISON_U64);
+    owned.push_back(bContacts.h);
+    owned.push_back(bContacts.h2);
     const DevBuf bCount = mk(std::vector<uint32_t>{ 0u });
     const DevBuf bSbP = mk(std::vector<uint64_t>(MAX_CONTACTS, POISON_U64));
     const DevBuf bTbP = mk(std::vector<uint32_t>(MAX_CONTACTS, POISON_U32));
@@ -2263,7 +2288,7 @@ static void run(bool diffuse, bool knife = false)
     blob.bounds = bBounds.addr; blob.contactDistance = bCd.addr; blob.restDistances = bRd.addr;
     blob.materials = bMat.addr; blob.startIndices = bStart.addr; blob.totalNumPairs = bTotal.addr;
     blob.particleSystems = bDesc.addr; blob.shapeToRigidRemap = bRemap.addr;
-    blob.w_particleContacts = bContacts.addr; blob.w_numTotalContacts = bCount.addr;
+    blob.w_particleContactInfos = bContacts.addr; blob.w_particleContactNormalPens = bContacts.addr2; blob.w_numTotalContacts = bCount.addr;
     blob.w_contactSortedByParticle = bSbP.addr; blob.w_tempContactByParticle = bTbP.addr;
     blob.w_contactIndexSortedByParticle = bIbP.addr; blob.w_contactByRigid = bBr.addr;
     blob.w_tempContactByRigid = bTbr.addr; blob.w_contactIndexSortedByRigid = bIbr.addr;
@@ -2283,11 +2308,11 @@ static void run(bool diffuse, bool knife = false)
     {
         const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
         PXG_CHECK_MSG(gCount == nContact, "p89 %s: %u contacts, the mirror predicts %u", lbl, gCount, nContact);
-        const auto gC = downloadBuffer<HostContact>(dev, bContacts.h, std::min(gCount, MAX_CONTACTS));
+        const auto gC = downloadContacts(dev, bContacts, std::min(gCount, MAX_CONTACTS));
         for (size_t a = 0; a < gC.size(); ++a)
         {
             const uint64_t pid = gC[a].particleId;
-            if ((pid >> 32) != 0ull || uint32_t(pid) >= NB_PART || gotAt[uint32_t(pid)] >= 0 || gC[a].rigidId != uint64_t(NODE))
+            if (PxgGetParticleSystemId(pid) != 0u || uint32_t(pid) >= NB_PART || gotAt[uint32_t(pid)] >= 0 || gC[a].rigidId != uint64_t(NODE))
             { ++extra; continue; }
             gotAt[uint32_t(pid)] = int(a);
             gotNp[uint32_t(pid)] = gC[a].normal_pen;

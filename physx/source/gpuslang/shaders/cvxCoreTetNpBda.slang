@@ -35,7 +35,7 @@
 // its TestBvh instantiation, its _Shared slot, its grid and its traversal -- and it
 // is a DIFFERENT KIND OF KERNEL.  The trimesh one is rigid-vs-rigid narrowphase and
 // ends in TestOutput::writeOutput.  This one is RIGID-VS-SOFTBODY and ends in
-// PxgFEMContactWriter.  Planning it as "the trimesh kernel with tetrahedra" would
+// PxgRigidDbContactWriter (5.12).  Planning it as "the trimesh kernel with tetrahedra" would
 // have been wrong in eight separate places:
 //
 //   NINE parameters, not eighteen, and the last is a STRUCT BY VALUE.  So the
@@ -75,15 +75,12 @@
 //   pxgSlangSoftBodyDesc           the PxgSoftBody mirror
 //   pxgSlangBv32         (P8.25)   the BV32DataPacked reader
 //
-// The contact write is transcribed from softBodyContactGenBda.slang:515-532, which
-// is the corpus's canonical BDA spelling of
-// PxgFEMContactWriter::writeRigidVsDeformableContactNoBarycentric.
-//
-// NOT from softBodyMeshContactGenBda.slang:206-221 `writeRigidVsDeformableNoBaryAlt`,
-// which has almost the same name and is a DIFFERENT FUNCTION: it is the
-// alternativeWriteMode variant, writing contactSortedByX and leaving contactByX and
-// tempContactByX untouched.  Lifting that one instead would produce contacts the
-// sort never sees, with nothing failing loudly.
+// The contact write is PxgRigidDbContactWriter::writeVolumeContact (PhysX 5.12,
+// pxgSlangDeformableWriters): the pair info (rigid node, PxgEncodeDeformableTetrahedron),
+// point, normal/pen, the PxU16 rigid material and the rigid sort key -- no barycentric
+// (sb_other_contact_remap_to_simLaunch computes it).  5.12 also added the per-softbody
+// rigid-volume filter (findRigidVolumeFilter over mRigidVolumeFilterPairs) in front of
+// generateContacts; 5.6.1 had no filter on this path.
 //
 // ===========================================================================
 // THE GRID IS THE TRIMESH KERNEL'S, AND SO IS THE SERIAL PARTITION
@@ -100,6 +97,9 @@ import pxgSlangNpAbi;           // struct mirrors and quaternion helpers
 import pxgSlangCvxCoreShape;    // ShapeRef / PtsRef / supportLocalQ / contactFaceQ
 import pxgSlangBv32;            // the BV32DataPacked reader
 import pxgSlangSoftBodyDesc;    // PxgSoftBodyGpu
+import pxgSlangDefFilter;       // findRigidVolumeFilter (5.12)
+import pxgSlangDeformableRef;   // PxgEncodeDeformableTetrahedron
+import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 
 #include "pxgSlangCvxCoreCvx.slang"    // gjkDistanceQ / epaDepthQ / faceClipQ
 #include "pxgSlangCvxCoreBvh.slang"    // the BVH glue, including the tet arm
@@ -126,14 +126,11 @@ static const uint CVXCORE_TET_WARP = 32u;        // blockDim.x, and the group
 static const uint CVXCORE_TET_BLOCK_WARPS = 4u;  // blockDim.y, walked serially
 static const uint CVXCORE_TET_STACK = 320u;      // TestBvh::NODE_STACK_MAX
 static const uint MAX_CONVEX_CONTACTS = 4u;      // Gu::MAX_CONVEX_CONTACTS
-static const uint PXG_BITSHIFT_TET_ID = 20u;     // PxgSimulationCoreDesc.h:40
 
 // ---------------------------------------------------------------------------
-// Push constant: the CUDA parameter list EXACTLY (:1095-1104).  Nine arguments,
-// the last of them PxgFEMContactWriter BY VALUE -- nine device pointers plus
-// PxU32 maxNumContacts plus a 4-byte tail pad, 80 bytes
-// (PxgFEMCore.h:361-375; there is a static_assert on the size at
-// tests/testFemClothSdfCg.cpp:140).
+// Push constant: the CUDA parameter list EXACTLY (5.12).  Nine arguments, the last
+// of them PxgRigidDbContactWriter BY VALUE -- nine device pointers plus PxU32
+// maxNumContacts plus a 4-byte tail pad, 80 bytes (pinned in testDeformableRef512).
 //
 //   numTests 4 @0 (+4 pad), seven pointers @8..@56, the writer at @64 -- already
 //   16-aligned, so paramAlign moves nothing -> a 144-byte blob.
@@ -148,18 +145,18 @@ struct CvxCoreTetParams
     uint64_t transformCache;          // @40
     uint64_t contactDistance;         // @48
     uint64_t restDistance;            // @56
-    // --- PxgFEMContactWriter, by value (PxgFEMCore.h:361) ---
-    uint64_t w_outPoint;              // @64   float4*
-    uint64_t w_outNormalPen;          // @72   float4*
-    uint64_t w_outBarycentric;        // @80   float4*  (unused on this path)
-    uint64_t w_outContactInfo;        // @88   PxgFemOtherContactInfo*  (16 B stride)
-    uint64_t w_totalContactCount;     // @96   PxU32*
-    uint64_t w_contactByX;            // @104  PxU64*
-    uint64_t w_tempContactByX;        // @112  PxU32*
-    uint64_t w_contactIndexSortedByX; // @120  PxU32*
-    uint64_t w_contactSortedByX;      // @128  PxU32*  (unused on this path)
-    uint w_maxNumContacts;            // @136  PxU32
-    uint _pad140;                     // @140 -> 144
+    // --- PxgRigidDbContactWriter, by value (PxgDeformableContactWriters.h, 5.12) ---
+    uint64_t w_outPoint;                  // @64   float4*
+    uint64_t w_outNormalPen;              // @72   float4*
+    uint64_t w_outBarycentric;            // @80   float4*  (unused on this path)
+    uint64_t w_outContactInfo;            // @88   PxgDeformablePairInfo*
+    uint64_t w_outRigidMaterialIndex;     // @96   PxU16*
+    uint64_t w_totalContactCount;         // @104  PxU32*
+    uint64_t w_contactByRigid;            // @112  PxU64*
+    uint64_t w_tempContactByRigid;        // @120  PxU32*
+    uint64_t w_contactIndexSortedByRigid; // @128  PxU32*
+    uint w_maxNumContacts;                // @136  PxU32
+    uint _pad140;                         // @140 -> 144
 }
 
 [[vk::push_constant]]
@@ -181,9 +178,18 @@ uint tetBallot(bool pred, uint lane)
     return sTetBallot;
 }
 
-// PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h:110-116).  Same spelling as
-// npSbPrim.slang:226 and npSbRemap.slang:146.
-uint encodeSoftBody(uint sbId, uint tetId) { return (sbId << PXG_BITSHIFT_TET_ID) | tetId; }
+PxgRigidDbContactWriterGpu tetWriter()
+{
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gTet.w_outPoint;                 w.outNormalPen = gTet.w_outNormalPen;
+    w.outBarycentric = gTet.w_outBarycentric;     w.outContactInfo = gTet.w_outContactInfo;
+    w.outRigidMaterialIndex = gTet.w_outRigidMaterialIndex;
+    w.totalContactCount = gTet.w_totalContactCount;
+    w.contactByRigid = gTet.w_contactByRigid;     w.tempContactByRigid = gTet.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gTet.w_contactIndexSortedByRigid;
+    w.maxNumContacts = gTet.w_maxNumContacts;
+    return w;
+}
 
 // Gu::ConvexShape::support (GuConvexSupport.h:539-540) -- WITH the margin.  NOT
 // pxgSlangCvxCoreCvx's convexBounds, which is Convex<Support>::getBounds: that one
@@ -265,28 +271,6 @@ uint cvxCoreTetGenerateContacts(ShapeRef shA, PtsRef ptsA, float marginA,
     for (uint i = 0u; i < 4u; ++i)
         patchOut[i] = patch[i];
     return numPoints;
-}
-
-// PxgFEMContactWriter::writeRigidVsDeformableContactNoBarycentric (PxgFEMCore.h:446-465),
-// transcribed from softBodyContactGenBda.slang:515-532.  setRigidMaterialIndex(mat)
-// followed by markInCollision(false) collapses to a single store of
-// (mat & 0x7fffffff).  outBarycentric and contactSortedByX are deliberately NOT
-// written on this path, and totalContactCount is the CALLER's to reserve.
-void tetWriteRigidVsDeformableNoBary(uint index, float4 contact, float4 normalPen,
-                                     uint2 pairInd0, uint pairInd1, uint2 rigidId, uint rigidMatId)
-{
-    if (index >= gTet.w_maxNumContacts)
-        return;
-    Ptr<uint2>(gTet.w_contactByX)[index] = rigidId;
-    Ptr<uint>(gTet.w_tempContactByX)[index] = rigidId.x;   // PxU32(rigidId & 0xffffffff)
-    Ptr<uint>(gTet.w_contactIndexSortedByX)[index] = index;
-    Ptr<float4>(gTet.w_outPoint)[index] = contact;
-    Ptr<float4>(gTet.w_outNormalPen)[index] = normalPen;
-    // PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12.
-    const uint64_t ci = gTet.w_outContactInfo + uint64_t(index) * 16UL;
-    Ptr<uint2>(ci)[0] = pairInd0;
-    Ptr<uint>(ci + 8UL)[0] = pairInd1;
-    Ptr<uint>(ci + 12UL)[0] = rigidMatId & 0x7fffffffu;
 }
 
 // ===========================================================================
@@ -376,11 +360,12 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
         const float tetMargin = cvxBvhCallbackMargin(vMin, vMax);
 
         // rigidId / softbodyId, read once by the CUDA's lane 0 (:1153-1154).
-        // PxNodeIndex is a u64; getInd() is the whole word, and the corpus carries it
-        // as a uint2 through the writer.
+        // PxNodeIndex is a u64; getInd() is the whole word.
         const uint64_t rigidIdW = Ptr<uint64_t>(gTet.shapeToRigidRemapTable)[cacheRef0];
-        const uint2 rigidId = uint2(uint(rigidIdW & 0xFFFFFFFFUL), uint(rigidIdW >> 32));
         const uint rigidMatId = shape0.materialIndex;
+        // _sh.softbody = &softbodies[softbodyId] (5.12): the rigid-volume filter array.
+        const DfFilterArray rigidVolumeFilters =
+            softBodyRigidVolumeFilters(gTet.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE);
 
         // ---- bv32TreeTraversal (bv32Traversal.cuh:64-195) --------------------
         uint currentNodeIndex = 0u;
@@ -413,7 +398,10 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
                 float4 patch[MAX_CONVEX_CONTACTS];
                 for (uint i = 0u; i < MAX_CONVEX_CONTACTS; ++i) patch[i] = float4(0, 0, 0, 0);
 
-                if (primitiveIndex != 0xffffffffu)
+                // 5.12: a filter pair for this rigid and tetrahedron suppresses contact
+                // generation between them.
+                if (primitiveIndex != 0xffffffffu &&
+                    !findRigidVolumeFilter(rigidVolumeFilters, rigidIdW, cacheRef0, softbodyId, primitiveIndex))
                 {
                     const uint4 inds = tetIndices[safePrim];
                     // RAW vertices: no mesh-scale transform anywhere (:1075-1079).
@@ -441,7 +429,8 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
                 // keys off.  Transcribed per-lane.
                 if (numPoints != 0u)
                 {
-                    const uint pairInd1 = encodeSoftBody(softbodyId, primitiveIndex);
+                    const uint64_t rigidRef = rigidIdW;
+                    const uint64_t tetRef = PxgEncodeDeformableTetrahedron(softbodyId, primitiveIndex);
                     uint index;
                     InterlockedAdd(Ptr<uint>(gTet.w_totalContactCount)[0], numPoints, index);
                     for (uint i = 0u; i < MAX_CONVEX_CONTACTS; ++i)
@@ -461,8 +450,8 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
                         // THE NORMAL IS NEGATED ON WRITE (:1186).  The FEM side wants
                         // it pointing the other way from what faceClipQ produced.
                         const float4 normDist = float4(-normal.x, -normal.y, -normal.z, d);
-                        tetWriteRigidVsDeformableNoBary(index + i, posRest, normDist,
-                                                        rigidId, pairInd1, rigidId, rigidMatId);
+                        tetWriter().writeVolumeContact(index + i, posRest, normDist,
+                                                       rigidRef, rigidMatId, tetRef);
                     }
                 }
             }

@@ -25,17 +25,18 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of fcVertexConvex.slang (clothVertexConvexCollision:
-// PxgRigidFilterPair attachment filter + closestVertToConvex +
-// computeClosestPolygon + writeRigidVsDeformableContact).  Hull blobs are
-// the tranche-96 analytic builders (box, irregular hex prism, 24-gon
-// prism).  The sorted filter table mixes real hits (~10% of cases),
-// near-miss entries (same rigid id, adjacent vertex mask; same mask,
-// different rigid id) that must NOT match, and index2-nonzero entries
-// accepted through the ignoreIndex2 rule.  gDebug pins the filter
-// verdict, the raw pen, the write decision and the all-inside branch;
-// writer slots map injectively via pairInd1 = (clothId << 20) | caseIdx
-// and verify every field including the (0,0,0,1) VERTEX barycentric
-// marker and the material dword with bit 31 cleared.  Slack taints:
+// findRigidSurfaceVertexFilter + closestVertToConvex + computeClosestPolygon +
+// PxgRigidDbContactWriter::writeSurfaceContact (vertex overload), PhysX 5.12).
+// Hull blobs are the tranche-96 analytic builders (box, irregular hex prism,
+// 24-gon prism).  The sorted PxgDeformablePairInfo filter table mixes real
+// hits (~10% of cases, static rigids keyed by their transform cache ref),
+// and near-miss entries that must NOT match: the adjacent vertex, a different
+// rigid, the same index as a TRIANGLE, and (static rigids) a different cache
+// ref.  gDebug pins the filter verdict, the raw pen, the write decision and
+// the all-inside branch; writer slots map injectively via the pair info's
+// ref1 = PxgEncodeDeformableVertex(clothId, caseIdx) and verify every field:
+// the vertex overload leaves the barycentric slot untouched (5.6.1 wrote a
+// (0,0,0,1) marker) and the material goes to a PxU16 stream.  Slack taints:
 // inside/outside membership boundaries (scaled and unscaled plane
 // distances near zero), argmax/min near-ties (winner excluded), edge
 // plane membership and degenerate edge cross products, segment-distance
@@ -78,9 +79,14 @@ struct FvcParams
     uint32_t numCases, maxContacts, nbFilterPairs, pad0;   // @0
     uint64_t hullAddr;                                     // @16
     uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;  // @24
+    uint64_t wRigidMat;                                    // @88 PxU16* (PhysX 5.12)
 };
-static_assert(sizeof(FvcParams) == 88, "FvcParams must match the shader blob");
-struct FilterPair { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
+static_assert(sizeof(FvcParams) == 96, "FvcParams must match the shader blob");
+static_assert(offsetof(FvcParams, wRigidMat) == 88, "FvcParams.wRigidMat @88");
+// PhysX 5.12: the per-cloth filter list is PxgDeformablePairInfo, searched with
+// PxgComparePairInfo (deformableElementFilter.cuh find()).
+typedef physx::PxgDeformablePairInfo FilterPair;
+static_assert(sizeof(FilterPair) == 16, "the fixture reads the filter table as uint4");
 
 struct V3 { float x, y, z; };
 static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -292,28 +298,39 @@ PXG_TEST(fcVertexConvex_closest)
     hugePrism.serialize(blob, hugeOfs);
 
     const uint32_t NC = 1500, CAP = 2048, POISON = 0xeeeeeeeeu, INFOPOISON = 0xdeadbeefu;
-    const uint32_t CLOTH = 21, SHIFT = 20;
+    const uint32_t CLOTH = 21;
 
-    // filter table: real hits for i%10==3, near-misses for i%10==6, plus
-    // index2-nonzero entries (matched through ignoreIndex2)
+    // filter table (5.12): real hits for i%10==3, near-misses for i%10==6.  Every 11th
+    // rigid is STATIC (PxNodeIndex() low word), whose filter key is its transform cache
+    // ref (PxgEncodeStaticShapeRef(ids2.z)); for the others the key is the node.
     std::vector<FilterPair> filters;
-    auto rigidOf = [&](uint32_t i) { return (uint64_t(3 + i % 3) << 32) | (0xA0u + i % 7); };
+    auto rigidOf = [&](uint32_t i) {
+        return (i % 11 == 0) ? uint64_t(PX_INVALID_NODE) : ((uint64_t(3 + i % 3) << 32) | (0xA0u + i % 7)); };
+    auto cacheRefOf = [&](uint32_t i) { return 40u + i % 13u; };
+    auto filterRefOf = [&](uint32_t i) {
+        return physx::PxgEncodeRigidFilterRef(physx::PxNodeIndex(physx::PxU64(rigidOf(i))), cacheRefOf(i)); };
+    size_t staticHits = 0;
     for (uint32_t i = 0; i < NC; ++i)
     {
-        const uint64_t mask = (uint64_t)((CLOTH << SHIFT) | i);
+        const uint64_t vref = physx::PxgEncodeDeformableVertex(CLOTH, i);
         if (i % 10 == 3)
-            filters.push_back({ rigidOf(i), mask, (i % 20 == 13) ? 7u : 0u, 0, 0, 0 });
+        {
+            filters.push_back({ filterRefOf(i), vref });
+            if (i % 11 == 0) ++staticHits;
+        }
         if (i % 10 == 6)
         {
-            filters.push_back({ rigidOf(i), mask + 1, 0, 0, 0, 0 });          // adjacent vertex
-            filters.push_back({ rigidOf(i) ^ 0x100u, mask, 0, 0, 0, 0 });     // different rigid
+            filters.push_back({ filterRefOf(i), physx::PxgEncodeDeformableVertex(CLOTH, i + 1) });   // adjacent vertex
+            filters.push_back({ physx::PxgEncodeRigidNode(physx::PxNodeIndex(physx::PxU64(rigidOf(i) ^ 0x100u))),
+                                vref });                                                             // different rigid
+            filters.push_back({ filterRefOf(i), physx::PxgEncodeDeformableTriangle(CLOTH, i) });     // a triangle
+            if (i % 11 == 0)                                                                         // other cache ref
+                filters.push_back({ physx::PxgEncodeStaticShapeRef(cacheRefOf(i) + 1u), vref });
         }
     }
     std::sort(filters.begin(), filters.end(), [](const FilterPair& a, const FilterPair& b) {
-        if (a.index0 != b.index0) return a.index0 < b.index0;
-        if (a.index1 != b.index1) return a.index1 < b.index1;
-        return a.index2 < b.index2;
-    });
+        return physx::PxgComparePairInfo(a, b) < 0; });
+    PXG_CHECK_MSG(staticHits >= 5u, "too few static-rigid filter hits (%zu)", staticHits);
 
     std::vector<FvcCase> cases(NC);
     std::vector<RefOut> ref(NC);
@@ -355,34 +372,23 @@ PXG_TEST(fcVertexConvex_closest)
         cs.rigidQ = rq;
         cs.convexScale = { scale.x, scale.y, scale.z, 0 };
         cs.convexScaleRot = srot;
-        cs.ids = { 0xA0u + i % 7, 3u + i % 3, CLOTH, i };
-        cs.ids2 = { (i % 4 == 1) ? (0x80000000u | (i & 0xfffu)) : (i & 0xfffu),
-                    which == 0 ? boxOfs : (which == 1 ? prismOfs : (useHuge ? hugeOfs : bigOfs)), 0, 0 };
+        cs.ids = { uint32_t(rigidOf(i) & 0xffffffffu), uint32_t(rigidOf(i) >> 32), CLOTH, i };
+        // 5.12 stores PxU16(rigidMaterialIndex): bit 31 (i % 4 == 1) and bits 16..30
+        // (i % 4 == 3) must both be dropped by the narrowing.
+        cs.ids2 = { (i % 4 == 1) ? (0x80000000u | (i & 0xfffu))
+                                 : ((i % 4 == 3) ? (0x00050000u | (i & 0xfffu)) : (i & 0xfffu)),
+                    which == 0 ? boxOfs : (which == 1 ? prismOfs : (useHuge ? hugeOfs : bigOfs)), cacheRefOf(i), 0 };
 
         // ---- reference ----
         Slack sl;
         RefOut& ro = ref[i];
         ro = {};
 
-        const uint64_t rid = rigidOf(i);
-        const uint64_t mask = (uint64_t)((CLOTH << SHIFT) | i);
+        // findRigidSurfaceVertexFilter (5.12): an exact pair search.
+        const FilterPair key = { filterRefOf(i), physx::PxgEncodeDeformableVertex(CLOTH, i) };
         bool filtered = false;
-        {
-            // binary search with 3-key compare, ignoreIndex2 acceptance
-            uint32_t l = 0, r = (uint32_t)filters.size();
-            while (l < r)
-            {
-                const uint32_t mid = (l + r) / 2;
-                const FilterPair& p = filters[mid];
-                int cmp;
-                if (rid != p.index0) cmp = rid < p.index0 ? -1 : 1;
-                else if (mask != p.index1) cmp = mask < p.index1 ? -1 : 1;
-                else if (0u != p.index2) cmp = -1;
-                else cmp = 0;
-                if (cmp == 0 || (rid == p.index0 && mask == p.index1)) { filtered = true; break; }
-                if (cmp < 0) r = mid; else l = mid + 1;
-            }
-        }
+        for (const FilterPair& p : filters)
+            if (physx::PxgComparePairInfo(p, key) == 0) filtered = true;
         ro.filtered = filtered;
         if (filtered) { ++filteredN; taint[i] = 0; continue; }
 
@@ -540,11 +546,13 @@ PXG_TEST(fcVertexConvex_closest)
     std::vector<U4> infoInit(CAP, { INFOPOISON, INFOPOISON, INFOPOISON, INFOPOISON });
     std::vector<uint32_t> u1Init(CAP, POISON), u2Init(CAP * 2, POISON), wc0(1, 0);
     std::vector<F4> dbgInit(NC, { -7, -7, -7, -7 });
-    std::vector<uint32_t> filterRaw(filters.size() * 8);
+    std::vector<uint32_t> filterRaw(filters.size() * 4);
     std::memcpy(filterRaw.data(), filters.data(), filters.size() * sizeof(FilterPair));
+    std::vector<uint16_t> rmInit(CAP, uint16_t(POISON & 0xffffu));
     PxgBufferHandle bC = createBufferFrom(dev, cases);
     PxgBufferHandle bH = createBufferFrom(dev, blob);
     PxgBufferHandle bF = createBufferFrom(dev, filterRaw);
+    PxgBufferHandle bRm = createBufferFrom(dev, rmInit);
     PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
     PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
     PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
@@ -565,6 +573,7 @@ PXG_TEST(fcVertexConvex_closest)
     prm.wByX = dev->getBufferDeviceAddress(bBy);
     prm.wTempByX = dev->getBufferDeviceAddress(bTb);
     prm.wIdxByX = dev->getBufferDeviceAddress(bIx);
+    prm.wRigidMat = dev->getBufferDeviceAddress(bRm);
     Kernel k("fcVertexConvex.spv", "ctFcVertexConvex",
              { (uint32_t)sizeof(FvcCase), (uint32_t)sizeof(FilterPair), 16 },
              sizeof(FvcParams));
@@ -578,6 +587,7 @@ PXG_TEST(fcVertexConvex_closest)
     const auto gBy = downloadBuffer<uint32_t>(dev, bBy, CAP * 2);
     const auto gTb = downloadBuffer<uint32_t>(dev, bTb, CAP);
     const auto gIx = downloadBuffer<uint32_t>(dev, bIx, CAP);
+    const auto gRm = downloadBuffer<uint16_t>(dev, bRm, CAP);
     const uint32_t gWc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
 
     // filter verdicts are integer-exact: compare for ALL cases
@@ -586,20 +596,26 @@ PXG_TEST(fcVertexConvex_closest)
         if ((gDbg[i].x != 0.0f) != ref[i].filtered) ++mmF;
     PXG_CHECK_MSG(mmF == 0, "fcVertexConvex: %zu filter mismatches", mmF);
 
-    // per-case slot map via pairInd1
+    // per-case slot map via the pair info's ref1 = PxgEncodeDeformableVertex(CLOTH, caseIdx)
     std::vector<int> slotOf(NC, -1);
     size_t mmW = 0;
     for (uint32_t s = 0; s < std::min(gWc, CAP); ++s)
     {
-        const uint32_t caseIdx = gIn[s].z & 0xFFFFFu;
-        if ((gIn[s].z >> 20) != CLOTH || caseIdx >= NC || slotOf[caseIdx] != -1) { ++mmW; continue; }
+        const uint64_t ref0 = uint64_t(gIn[s].x) | (uint64_t(gIn[s].y) << 32);
+        const uint64_t ref1 = uint64_t(gIn[s].z) | (uint64_t(gIn[s].w) << 32);
+        const uint32_t caseIdx = physx::PxgGetDeformableFeatureId(ref1);
+        if (caseIdx >= NC || ref1 != physx::PxgEncodeDeformableVertex(CLOTH, caseIdx) || slotOf[caseIdx] != -1)
+        { ++mmW; continue; }
         slotOf[caseIdx] = (int)s;
         const uint32_t rl = cases[caseIdx].ids.x, rh = cases[caseIdx].ids.y;
-        if (gIn[s].x != rl || gIn[s].y != rh ||
-            gBy[s * 2] != rl || gBy[s * 2 + 1] != rh || gTb[s] != rl || gIx[s] != s)
+        const uint64_t rigidRef = uint64_t(rl) | (uint64_t(rh) << 32);   // rigidId.getInd()
+        if (ref0 != rigidRef ||
+            gBy[s * 2] != rl || gBy[s * 2 + 1] != rh || gTb[s] != physx::PxgGetContactSortKey(rigidRef) || gIx[s] != s)
             ++mmW;
-        if (gIn[s].w != (cases[caseIdx].ids2.x & 0x7FFFFFFFu)) ++mmW;
+        if (gRm[s] != uint16_t(cases[caseIdx].ids2.x & 0xffffu)) ++mmW;   // PxU16(rigidMaterialIndex)
     }
+    for (uint32_t s = std::min(gWc, CAP); s < CAP; ++s)
+        if (gRm[s] != uint16_t(POISON & 0xffffu)) { ++mmW; break; }
     uint32_t sumChecked = 0, numTainted = 0;
     size_t mm = 0, checked = 0;
     for (uint32_t i = 0; i < NC; ++i)
@@ -627,7 +643,8 @@ PXG_TEST(fcVertexConvex_closest)
             !almostEqual(gNp[s].y, ro.n.y, 2e-3f, 2e-3f) ||
             !almostEqual(gNp[s].z, ro.n.z, 2e-3f, 2e-3f) ||
             !almostEqual(gNp[s].w, ro.pen, 2e-4f, 2e-4f) ||
-            gBc[s].x != 0.0f || gBc[s].y != 0.0f || gBc[s].z != 0.0f || gBc[s].w != 1.0f)
+            // 5.12 vertex overload: the barycentric slot is not written.
+            gBc[s].x != -9.0f || gBc[s].y != -9.0f || gBc[s].z != -9.0f || gBc[s].w != -9.0f)
             ++mm;
     }
     PXG_CHECK_MSG(mm == 0 && mmW == 0, "fcVertexConvex: %zu content + %zu slot mismatches", mm, mmW);
@@ -638,7 +655,7 @@ PXG_TEST(fcVertexConvex_closest)
                   "fcVertexConvex: coverage thin (f=%zu i=%zu e=%zu r=%zu w=%zu)",
                   filteredN, insideN, outsideEdgeN, gateRejN, wroteN);
 
-    for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
+    for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb, bRm })
         dev->destroyBuffer(h);
 }
 
@@ -937,6 +954,7 @@ PXG_TEST(fcVertexConvex_zeroSign)
     PxgBufferHandle bC = createBufferFrom(dev, cases);
     PxgBufferHandle bH = createBufferFrom(dev, blob);
     PxgBufferHandle bF = createBufferFrom(dev, std::vector<uint32_t>(8, 0u));
+    PxgBufferHandle bRm = createBufferFrom(dev, std::vector<uint16_t>(CAP, uint16_t(0xeeeeu)));
     PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
     PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
     PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
@@ -957,6 +975,7 @@ PXG_TEST(fcVertexConvex_zeroSign)
     prm.wByX = dev->getBufferDeviceAddress(bBy);
     prm.wTempByX = dev->getBufferDeviceAddress(bTb);
     prm.wIdxByX = dev->getBufferDeviceAddress(bIx);
+    prm.wRigidMat = dev->getBufferDeviceAddress(bRm);
     Kernel k("fcVertexConvex.spv", "ctFcVertexConvex",
              { (uint32_t)sizeof(FvcCase), (uint32_t)sizeof(FilterPair), 16 }, sizeof(FvcParams));
     k.dispatch(1, { bC, bF, bDb }, prm);
@@ -971,8 +990,9 @@ PXG_TEST(fcVertexConvex_zeroSign)
     std::vector<int> slotOf(NC, -1);
     for (uint32_t s = 0; s < std::min(gWc, CAP); ++s)
     {
-        const uint32_t ci = gIn[s].z & 0xFFFFFu;
-        if ((gIn[s].z >> 20) == CLOTH && ci < NC) slotOf[ci] = (int)s;
+        const uint64_t ref1 = uint64_t(gIn[s].z) | (uint64_t(gIn[s].w) << 32);
+        const uint32_t ci = physx::PxgGetDeformableFeatureId(ref1);
+        if (ci < NC && ref1 == physx::PxgEncodeDeformableVertex(CLOTH, ci)) slotOf[ci] = (int)s;
     }
     // zero reference components bitwise, the rest by tolerance
     auto same = [](float g, float r, float tol) {
@@ -1007,7 +1027,7 @@ PXG_TEST(fcVertexConvex_zeroSign)
     }
     PXG_CHECK_MSG(mm == 0, "fcVertexConvex_zeroSign: %zu of %u cases differ from the CUDA mirror", mm, NC);
 
-    for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
+    for (PxgBufferHandle h : { bC, bH, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb, bRm })
         dev->destroyBuffer(h);
 }
 
@@ -1058,8 +1078,10 @@ static V3c qrotc(Qc q, V3c v)
                 vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 };
 }
 
-struct FemInfoHost { uint64_t pairInd0; uint32_t pairInd1, rigidMatInd; };
-static_assert(sizeof(FemInfoHost) == 16, "PxgFemOtherContactInfo mirror");
+// PhysX 5.12: PxgDeformablePairInfo {ref0 = rigid, ref1 = the cloth vertex}; the
+// rigid material index has its own PxU16 stream.
+struct FemInfoHost { uint64_t ref0, ref1; };
+static_assert(sizeof(FemInfoHost) == sizeof(PxgDeformablePairInfo), "PxgDeformablePairInfo mirror");
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
@@ -1070,44 +1092,48 @@ static DevBuf mkBuf(PxgSlangComputeDevice* dev, const std::vector<T>& d)
     DevBuf b; b.h = createBufferFrom(dev, d); b.addr = dev->getBufferDeviceAddress(b.h);
     return b;
 }
-struct WBufs { DevBuf point, normalPen, bary, info, count, byX, tempByX, idxByX, sortedByX; };
+// PxgRigidDbContactWriter (5.12): point, normalPen, barycentric, info, PxU16 rigid
+// material, count, contactByRigid, tempContactByRigid, contactIndexSortedByRigid.
+struct WBufs { DevBuf point, normalPen, bary, info, rigidMat, count, byX, tempByX, idxByX; };
 static WBufs mkWriter(PxgSlangComputeDevice* dev, uint32_t cap)
 {
     WBufs w;
     w.point = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
     w.normalPen = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
     w.bary = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
-    w.info = mkBuf(dev, std::vector<FemInfoHost>(cap, FemInfoHost{ 0xdeadbeefull, 0xdeadbeefu, 0xdeadbeefu }));
+    w.info = mkBuf(dev, std::vector<FemInfoHost>(cap, FemInfoHost{ 0xdeadbeefdeadbeefull, 0xdeadbeefdeadbeefull }));
+    w.rigidMat = mkBuf(dev, std::vector<uint16_t>(cap, uint16_t(0xeeeeu)));
     w.count = mkBuf(dev, std::vector<uint32_t>{ 0u });
     w.byX = mkBuf(dev, std::vector<uint64_t>(cap, 0xffffffffffffffffull));
     w.tempByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
     w.idxByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
-    w.sortedByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
     return w;
 }
 static void killWriter(PxgSlangComputeDevice* dev, const WBufs& w)
 {
-    for (PxgBufferHandle h : { w.point.h, w.normalPen.h, w.bary.h, w.info.h, w.count.h,
-                               w.byX.h, w.tempByX.h, w.idxByX.h, w.sortedByX.h })
+    for (PxgBufferHandle h : { w.point.h, w.normalPen.h, w.bary.h, w.info.h, w.rigidMat.h, w.count.h,
+                               w.byX.h, w.tempByX.h, w.idxByX.h })
         dev->destroyBuffer(h);
 }
 
-// W1: byte-identical to the box-triangle blob -- same fifteen arguments, same
-// order, same ABI row.  The writer sits at 112 because paramAlign(80) is 16.
+// W1: byte-identical to the box-triangle blob -- same thirteen arguments, same
+// order, same ABI row.  PhysX 5.12 dropped filterPairs / nbFilterPairs (the
+// filters are per cloth), so the head ends at 96 and the 80-byte writer
+// (paramAlign 16) sits at 96 with no pad.
 struct CvxVertPush
 {
     float toleranceLength; uint32_t pad4;
     uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes;
-    uint64_t shapeToRigidRemap, stackPtr, midphasePairsNum, filterPairs;
-    uint32_t nbFilterPairs, stackSizeBytes;
+    uint64_t shapeToRigidRemap, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
     uint64_t stackSizeNeeded;
-    uint64_t pad104;
-    uint64_t bPoint, bNormalPen, bBary, bInfo, bCount, bByX, bTempByX, bIdxByX, bSortedByX;
-    uint32_t bMaxNumContacts, pad188;
+    uint64_t bPoint, bNormalPen, bBary, bInfo, bRigidMat, bCount, bByX, bTempByX, bIdxByX;
+    uint32_t bMaxNumContacts, pad172;
 };
-static_assert(sizeof(CvxVertPush) == 192, "cloth convex-vertex blob must be 192 bytes");
-static_assert(offsetof(CvxVertPush, stackSizeNeeded) == 96, "stackSizeNeeded @96");
-static_assert(offsetof(CvxVertPush, bPoint) == 112, "writer @112 -- paramAlign(80) is 16");
+static_assert(sizeof(CvxVertPush) == 176, "cloth convex-vertex blob must be 176 bytes");
+static_assert(offsetof(CvxVertPush, stackSizeNeeded) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(CvxVertPush, bPoint) == 96, "writer @96 -- paramAlign(80) is 16");
+static_assert(offsetof(CvxVertPush, bRigidMat) == 128, "outRigidMaterialIndex @128");
 } // namespace fvc2
 
 PXG_TEST(femClothSimConvexVertexContactGen)
@@ -1166,11 +1192,32 @@ PXG_TEST(femClothSimConvexVertexContactGen)
     std::vector<U4> ctris = { U4{ 0u, 1u, 2u, 0u } };
     DevBuf bCTris = mkBuf(dev, ctris);
 
+    // W3 (5.12): a SINGLE match in the cloth's mRigidSurfaceFilterPairs suppresses
+    // the vertex.  Two vertices are filtered, and both are ones that would otherwise
+    // write; near-miss entries -- a vertex that does not exist, a DIFFERENT rigid on a
+    // live vertex, the same index as a TRIANGLE, and a live vertex index under
+    // ANOTHER cloth id -- must not suppress anything.
+    const uint32_t FILT_A = 2u, FILT_B = 5u;
+    const uint64_t rigidFilterRef = PxgEncodeRigidFilterRef(PxNodeIndex(PxU64(rigidNodeInd)), 1u);
+    std::vector<PxgDeformablePairInfo> fpairs;
+    fpairs.push_back({ rigidFilterRef, PxgEncodeDeformableVertex(CLOTH_ID, FILT_A) });
+    fpairs.push_back({ rigidFilterRef, PxgEncodeDeformableVertex(CLOTH_ID, FILT_B) });
+    fpairs.push_back({ rigidFilterRef, PxgEncodeDeformableVertex(CLOTH_ID, NB_VERTS + 3u) });   // no such vertex
+    fpairs.push_back({ PxgEncodeRigidNode(PxNodeIndex(PxU64(rigidNodeInd ^ 0x10ull))),
+                       PxgEncodeDeformableVertex(CLOTH_ID, 1u) });                               // wrong rigid
+    fpairs.push_back({ rigidFilterRef, PxgEncodeDeformableTriangle(CLOTH_ID, 3u) });             // a triangle
+    fpairs.push_back({ rigidFilterRef, PxgEncodeDeformableVertex(0u, 4u) });                     // another cloth
+    std::sort(fpairs.begin(), fpairs.end(), [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+        return PxgComparePairInfo(a, b) < 0; });
+    DevBuf bFilters = mkBuf(dev, fpairs);
+
     PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
     fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCVerts.addr));
-    fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bCTris.addr));
+    fc.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(bCTris.addr));
     fc.mNbVerts = NB_VERTS;
     fc.mNbTriangles = 1u;
+    fc.mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFilters.addr));
+    fc.mNumRigidSurfaceFilterPairs = uint32_t(fpairs.size());
     PxgFEMCloth decoy0; std::memset(&decoy0, 0, sizeof(decoy0));
     PxgFEMCloth decoy1; std::memset(&decoy1, 0, sizeof(decoy1));
     std::vector<PxgFEMCloth> descArr = { decoy0, decoy1, fc };   // CLOTH_ID == 2
@@ -1214,33 +1261,13 @@ PXG_TEST(femClothSimConvexVertexContactGen)
     DevBuf bRd = mkBuf(dev, std::vector<float>{ rest0, rest1 });
     DevBuf bRemap = mkBuf(dev, std::vector<uint64_t>{ 0ull, rigidNodeInd });
 
-    // W3: a SINGLE match suppresses the vertex.  Two vertices are filtered, and
-    // both are ones that would otherwise write; a near-miss entry on the SAME
-    // rigid with an adjacent mask, and one on a DIFFERENT rigid with a live mask,
-    // must not suppress anything.
-    const uint32_t FILT_A = 2u, FILT_B = 5u;
-    std::vector<PxgRigidFilterPair> fpairs;
-    auto addFilter = [&](uint64_t rigid, uint32_t vert) {
-        PxgRigidFilterPair fp; std::memset(&fp, 0, sizeof(fp));
-        fp.index0 = rigid;
-        fp.index1 = uint64_t((CLOTH_ID << 20) | vert);
-        fpairs.push_back(fp);
-    };
-    addFilter(rigidNodeInd, FILT_A);
-    addFilter(rigidNodeInd, FILT_B);
-    addFilter(rigidNodeInd, NB_VERTS + 3u);              // adjacent mask, no such vertex
-    addFilter(rigidNodeInd ^ 0x10ull, 1u);               // live mask, wrong rigid
-    std::sort(fpairs.begin(), fpairs.end(), [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-        return a.index0 != b.index0 ? a.index0 < b.index0 : a.index1 < b.index1; });
-    DevBuf bFilters = mkBuf(dev, fpairs);
-
     // ---- the midphase pair stack: (cmIdx, VERTEX index) ----
     // W2 is only visible if the vertex index cannot be reconstructed from
     // anything else the loop has, so the table below is written out rather than
     // generated, and the three properties it has to have are CHECKED rather than
     // asserted in a comment:
     //   * every vertex appears exactly ONCE -- which is what makes the
-    //     pairInd1 = (clothId << 20) | vertexIdx slot map injective;
+    //     ref1 = PxgEncodeDeformableVertex(clothId, vertexIdx) slot map injective;
     //   * NO slot maps to its own index -- so reading the loop counter, or
     //     curPair.x, in place of curPair.y changes every contact;
     //   * cmIdx is neither the slot's parity nor the vertex's -- so W4's
@@ -1294,15 +1321,14 @@ PXG_TEST(femClothSimConvexVertexContactGen)
     push.contactDistance = bCd.addr; push.restDistance = bRd.addr;
     push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
     push.shapeToRigidRemap = bRemap.addr; push.stackPtr = bStack.addr;
-    push.midphasePairsNum = bPairsNum.addr; push.filterPairs = bFilters.addr;
-    push.nbFilterPairs = uint32_t(fpairs.size());
+    push.midphasePairsNum = bPairsNum.addr;
     push.stackSizeBytes = stackPairs * 16u;
     push.stackSizeNeeded = bNeeded.addr;
     push.bPoint = wa.point.addr; push.bNormalPen = wa.normalPen.addr;
-    push.bBary = wa.bary.addr; push.bInfo = wa.info.addr;
+    push.bBary = wa.bary.addr; push.bInfo = wa.info.addr; push.bRigidMat = wa.rigidMat.addr;
     push.bCount = wa.count.addr; push.bByX = wa.byX.addr;
     push.bTempByX = wa.tempByX.addr; push.bIdxByX = wa.idxByX.addr;
-    push.bSortedByX = wa.sortedByX.addr; push.bMaxNumContacts = CAP;
+    push.bMaxNumContacts = CAP;
 
     Kernel ka("femClothContactGenBda.spv", "cloth_convexVertexContactGenLaunch", {}, sizeof(CvxVertPush));
     PXG_CHECK_MSG(ka.isValid(), "the cloth convex-vertex pipeline must build");
@@ -1317,10 +1343,11 @@ PXG_TEST(femClothSimConvexVertexContactGen)
     for (uint32_t i = 0; i < stackPairs; ++i)
     {
         const uint32_t cmIdx = stack[i].x, vertexIdx = stack[i].y;
-        const uint64_t key = uint64_t((CLOTH_ID << 20) | vertexIdx);
+        // findRigidSurfaceVertexFilter (5.12): an exact pair search.
+        const PxgDeformablePairInfo key = { rigidFilterRef, PxgEncodeDeformableVertex(CLOTH_ID, vertexIdx) };
         bool filtered = false;
         for (const auto& fp : fpairs)
-            if (fp.index0 == rigidNodeInd && fp.index1 == key) filtered = true;
+            if (PxgComparePairInfo(fp, key) == 0) filtered = true;
         if (filtered) { ++skipped; continue; }                     // W3
 
         FvcCase cs{};
@@ -1353,7 +1380,7 @@ PXG_TEST(femClothSimConvexVertexContactGen)
     fp2.hullAddr = bHull.addr;
     fp2.wPoint = wb.point.addr; fp2.wNormalPen = wb.normalPen.addr; fp2.wBary = wb.bary.addr;
     fp2.wInfo = wb.info.addr; fp2.wCount = wb.count.addr; fp2.wByX = wb.byX.addr;
-    fp2.wTempByX = wb.tempByX.addr; fp2.wIdxByX = wb.idxByX.addr;
+    fp2.wTempByX = wb.tempByX.addr; fp2.wIdxByX = wb.idxByX.addr; fp2.wRigidMat = wb.rigidMat.addr;
     Kernel kb("fcVertexConvex.spv", "ctFcVertexConvex",
               { (uint32_t)sizeof(FvcCase), (uint32_t)sizeof(FilterPair), 16 }, sizeof(FvcParams));
     PXG_CHECK_MSG(kb.isValid(), "the reference core pipeline must build");
@@ -1424,10 +1451,12 @@ PXG_TEST(femClothSimConvexVertexContactGen)
         const auto nA = downloadBuffer<F4>(dev, wa.normalPen.h, n);
         const auto yA = downloadBuffer<F4>(dev, wa.bary.h, n);
         const auto iA = downloadBuffer<FemInfoHost>(dev, wa.info.h, n);
+        const auto mA = downloadBuffer<uint16_t>(dev, wa.rigidMat.h, n);
         const auto pB = downloadBuffer<F4>(dev, wb.point.h, n);
         const auto nB = downloadBuffer<F4>(dev, wb.normalPen.h, n);
         const auto yB = downloadBuffer<F4>(dev, wb.bary.h, n);
         const auto iB = downloadBuffer<FemInfoHost>(dev, wb.info.h, n);
+        const auto mB = downloadBuffer<uint16_t>(dev, wb.rigidMat.h, n);
         std::vector<bool> used(n, false);
         size_t mm = 0;
         for (uint32_t a = 0; a < n; ++a)
@@ -1442,27 +1471,31 @@ PXG_TEST(femClothSimConvexVertexContactGen)
                     f2u(nA[a].z) != f2u(nB[b].z) || f2u(nA[a].w) != f2u(nB[b].w)) continue;
                 if (f2u(yA[a].x) != f2u(yB[b].x) || f2u(yA[a].y) != f2u(yB[b].y) ||
                     f2u(yA[a].z) != f2u(yB[b].z) || f2u(yA[a].w) != f2u(yB[b].w)) continue;
-                if (iA[a].pairInd0 != iB[b].pairInd0 || iA[a].pairInd1 != iB[b].pairInd1 ||
-                    iA[a].rigidMatInd != iB[b].rigidMatInd) continue;
+                if (iA[a].ref0 != iB[b].ref0 || iA[a].ref1 != iB[b].ref1 || mA[a] != mB[b]) continue;
                 used[b] = true; found = true;
             }
             if (!found)
             { if (mm < 4) std::printf("  cvxvert contact %u (pt %g,%g,%g w %g / np %g,%g,%g,%g / "
-                                      "pair1 %u) has no match in the reference stream\n",
+                                      "ref1 %016llx) has no match in the reference stream\n",
                                       a, pA[a].x, pA[a].y, pA[a].z, pA[a].w,
-                                      nA[a].x, nA[a].y, nA[a].z, nA[a].w, iA[a].pairInd1);
+                                      nA[a].x, nA[a].y, nA[a].z, nA[a].w, (unsigned long long)iA[a].ref1);
               ++mm; }
         }
         PXG_CHECK_MSG(mm == 0, "cloth_convexVertexContactGen differs from the reference core over "
                       "the mirrored glue in %zu contacts", mm);
 
-        // the (0,0,0,1) VERTEX marker -- the one field that distinguishes this
-        // kernel's contacts from the triangle kernel's downstream
+        // PhysX 5.12: a VERTEX contact is marked by its ref1 feature type, and the
+        // vertex overload of writeSurfaceContact leaves the barycentric slot alone
+        // (5.6.1 wrote a (0,0,0,1) marker there).
         size_t mmB = 0;
         for (uint32_t a = 0; a < n; ++a)
-            if (yA[a].x != 0.0f || yA[a].y != 0.0f || yA[a].z != 0.0f || yA[a].w != 1.0f) ++mmB;
-        PXG_CHECK_MSG(mmB == 0, "%zu contacts carry a barycentric other than (0,0,0,1) -- the 1 in "
-                      "w is what marks a VERTEX contact downstream", mmB);
+        {
+            if (yA[a].x != -9.0f || yA[a].y != -9.0f || yA[a].z != -9.0f || yA[a].w != -9.0f) ++mmB;
+            if (PxgGetDeformableFeatureType(iA[a].ref1) != PxgDeformableRef::eVERTEX) ++mmB;
+            if (mA[a] != uint16_t(materialIndex)) ++mmB;
+        }
+        PXG_CHECK_MSG(mmB == 0, "%zu contacts wrote the barycentric slot, carry a non-vertex ref1 or a "
+                      "wrong PxU16 material", mmB);
     }
 
     // W7: the atomicMax carries the UNCLAMPED count, in bytes.

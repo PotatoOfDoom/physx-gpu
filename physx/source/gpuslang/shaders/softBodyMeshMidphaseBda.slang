@@ -33,7 +33,7 @@
 // static geometry instead of on a primitive.  One warp per surface tetrahedron of the softbody
 // walks the TRIANGLE MESH's BV32 tree and pushes its four closest triangles onto the shared
 // midphase stack; step 2 (sb_meshContactGenLaunch) runs GJK/EPA on each pair.  The contacts go
-// into the RIGID contact stream through PxgFEMContactWriter, so everything downstream --
+// into the RIGID contact stream through PxgRigidDbContactWriter (5.12), so everything downstream --
 // fem_reorderRigidContactsLaunch, sb_other_contact_remap_to_simLaunch,
 // sb_rigidContactPrepareLaunch, sb_solveRigidSoftCollisionLaunch -- is already mapped.
 //

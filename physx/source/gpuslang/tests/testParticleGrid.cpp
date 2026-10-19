@@ -41,7 +41,7 @@
 // A static-offset proof (particleGridDescLayout) pins the pxgSlangParticleDesc
 // mirror fields these two grid kernels dereference against the real engine
 // PxgParticleSystem (the 3-way validation P6.0 used: SPIR-V ArrayStride is
-// implied by the 656-byte stride check, offsetof here, device round-trip in the
+// implied by the 608-byte (5.12) stride check, offsetof here, device round-trip in the
 // kernel tests).  No mirror extension was needed for P6.2 — every field both
 // kernels touch was already present from P6.0.
 
@@ -137,7 +137,7 @@ static_assert(sizeof(RadixSortDescMirror) == 48, "desc mirror must be 48 bytes")
 PXG_TEST(particleGridDescLayout)
 {
     // stride (SPIR-V ArrayStride) — the kernels index particleSystems[id].
-    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem sizeof == 656 (got %zu)",
+    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 608, "PxgParticleSystem sizeof == 608 (got %zu)",
                   sizeof(PxgParticleSystem));
 
     // ps_calculateHashLaunch fields
@@ -164,7 +164,7 @@ PXG_TEST(particleGridDescLayout)
     PXG_CHECK(offsetof(PxgParticleSystem, mCellStart) == 168);
     PXG_CHECK(offsetof(PxgParticleSystem, mCellEnd) == 176);
     PXG_CHECK(offsetof(PxgParticleSystem, mSortedOriginPos_InvMass) == 392);
-    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 488);
+    PXG_CHECK(offsetof(PxgParticleSystem, mNumDiffuseParticles) == 448);
 }
 
 // ---------------------------------------------------------------------------

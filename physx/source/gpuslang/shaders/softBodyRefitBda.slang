@@ -55,7 +55,7 @@
 // Doctrine (identical to femClothRefitBda / the prior softbody tranche):
 //   - the PxgSoftBody descriptor arrives as a device-pointer ARRAY read through Ptr<>
 //     (the byte-exact pxgSlangSoftBodyDesc mirror); mTetMeshData @0, mTetIndices @16,
-//     mPosition_InvMass @64, mPackedNodeBounds @280, mFlagsWord @392 (mBodyFlags =
+//     mPosition_InvMass @64, mPackedNodeBounds @280, mFlagsWord @416 (mBodyFlags =
 //     byte 1) and mOriginalContactOffset @424 are the fields this kernel touches;
 //   - the BV32 tree layout is the SAME one the cloth refit decodes: a uint4 header
 //     (nbVerts, nbTets, maxDepth, nbBv32PackedNodes) @0, then nbBv32PackedNodes x

@@ -98,6 +98,8 @@
 import pxgSlangCommon;
 import pxgSlangParticleDesc;
 import pxgSlangParticleContact;
+import pxgSlangDeformableRef;      // 5.12 PxgEncodeParticleRef
+import pxgSlangDeformableWriters;  // PxgRigidParticleContactWriter
 import pxgSlangSdfTexture;
 import pxgSlangSdfCollision;
 import pxgSlangSdfParticle;
@@ -125,24 +127,27 @@ struct PsSdfMidPush
     uint64_t gpuShapes;                     // @40
     uint64_t particleSystems;               // @48
     uint64_t shapeToRigidRemapTable;        // @56
-    uint64_t w_particleContacts;            // @64
-    uint64_t w_numTotalContacts;            // @72
-    uint64_t w_contactSortedByParticle;     // @80
-    uint64_t w_tempContactByParticle;       // @88
-    uint64_t w_contactIndexSortedByParticle;// @96
-    uint64_t w_contactByRigid;              // @104
-    uint64_t w_tempContactByRigid;          // @112
-    uint64_t w_contactIndexSortedByRigid;   // @120
-    uint w_maxContacts;                     // @128 -> 136
+    uint64_t w_particleContactInfos;        // @64  PxgDeformablePairInfo*
+    uint64_t w_particleContactNormalPens;   // @72  float4*
+    uint64_t w_numTotalContacts;            // @80
+    uint64_t w_contactSortedByParticle;     // @88
+    uint64_t w_tempContactByParticle;       // @96
+    uint64_t w_contactIndexSortedByParticle;// @104
+    uint64_t w_contactByRigid;              // @112
+    uint64_t w_tempContactByRigid;          // @120
+    uint64_t w_contactIndexSortedByRigid;   // @128
+    uint w_maxContacts;                     // @136
+    uint _pad140;                           // @140 -> 144
 }
 
 [[vk::push_constant]]
 ConstantBuffer<PsSdfMidPush> gSd;
 
-PsContactWriter sdWriter()
+PxgRigidParticleContactWriterGpu sdWriter()
 {
-    PsContactWriter w;
-    w.particleContacts = gSd.w_particleContacts;
+    PxgRigidParticleContactWriterGpu w;
+    w.particleContactInfos = gSd.w_particleContactInfos;
+    w.particleContactNormalPens = gSd.w_particleContactNormalPens;
     w.numTotalContacts = gSd.w_numTotalContacts;
     w.contactSortedByParticle = gSd.w_contactSortedByParticle;
     w.tempContactByParticle = gSd.w_tempContactByParticle;
@@ -228,7 +233,6 @@ void ps_sdfMeshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         oneWayCounts = systems[psId].mOneWayContactCount;
     }
 
-    const uint64_t gridParticleIndex = systems[psId].mSortedToUnsortedMapping;
     const bool enableCCD = (systems[psId].mData_Flags & PX_PARTICLE_FLAG_SPECULATIVE_CCD) > 0u;
 
     const float3 scale = triShape.scale();
@@ -268,11 +272,7 @@ void ps_sdfMeshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
             candidateContact = sdfParticleContact(tex, posWorld, posPrevWorld, invP, invQ,
                                                   scale, scaleRot, cullScale, contactDist,
                                                   restDist, enableCCD, normal, finalSep);
-
-            // W5: the filter takes the UNSORTED index.  W6: never for diffuse.
-            const uint2 particleMask = uint2(Ptr<uint>(gridParticleIndex)[ind], psId);
-            if (!isDiffuse && psFindFilter(systems, psId, rigidId, particleMask))
-                candidateContact = false;
+            // W5 / W6: 5.12 removed the particle-rigid filter that ran here.
         }
 
         if (nodeIndexIsStaticBody(rigidId))
@@ -300,9 +300,10 @@ void ps_sdfMeshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         if (candidateContact && !isDiffuse)
         {
             const float3 worldNormal = quatRotate(meshQ, normal);
-            // W5 again: the contact carries the SORTED index.
-            psWriteContact(sdWriter(), contactIndex, float4(worldNormal, finalSep),
-                           uint2(ind, psId), rigidId);
+            // The contact carries the SORTED index, as PxgEncodeParticleRef (5.12).
+            sdWriter().writeContact(contactIndex, float4(worldNormal, finalSep),
+                                    uint64_t(rigidId.x) | (uint64_t(rigidId.y) << 32),
+                                    PxgEncodeParticleRef(psId, ind));
         }
     }
 }

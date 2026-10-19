@@ -74,6 +74,7 @@
 // 5.12, which has no such kernel.)
 
 import pxgSlangSoftBodyDesc;
+import pxgSlangDeformableUtils;   // finalizeVertexVelocity, linearBlendVelocityAveragingScale (5.12)
 
 static const uint WARP_SIZE = 32u;
 // PxgSoftBodyKernelBlockDim::SB_PREINTEGRATION (PxgSoftBodyCoreKernelIndices.h:39).
@@ -128,7 +129,7 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
         softbodies[id].mAwake = 0u; // reset each frame (bool false -> PxU32 store)
     }
 
-    // The @392 fold: byte0 = mActorFlags, byte1 = mBodyFlags, bytes2..3 = mVolumeFlags.
+    // The @416 fold: byte0 = mActorFlags, byte1 = mBodyFlags, bytes2..3 = mVolumeFlags.
     const uint flagsWord = softbodies[id].mFlagsWord;
     const uint actorFlags = flagsWord & 0xffu;
     const uint bodyFlags = (flagsWord >> 8) & 0xffu;
@@ -270,11 +271,12 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
 // (cloth_preIntegrate / cloth_finalizeVelocities / cloth_sleeping) and reuse its warp
 // lowerings verbatim.  Softbody-specific differences, all straight from the .cu:
 //   - every buffer is the SIMULATION mesh (mSimPosition_InvMass @96, mSimVelocity_InvMass
-//     @88, mSimDeltaPos @128, mNumVertsGM @372) — not the collision mesh the refit walks;
+//     @88, mSimDeltaPos @128, mNumVertsGM @396) — not the collision mesh the refit walks;
 //   - the awake flag is mAwake @408 (PxU32), not the cloth's mIsActive;
-//   - finalize takes an explicit `velocityScale` and blends
-//     `tVel*velocityScale + deltaVel*(1-velocityScale)`, where the cloth kernel rescales
-//     by a sqrt ratio instead.  Different formulas — do NOT copy the cloth line here.
+//   - finalize blends `tVel*scale + deltaVel*(1-scale)` (LinearBlendVelocityAveraging,
+//     scale = min(0.9, 2*sqrt(1/nbPosIters)) since 5.12), where the cloth kernel rescales
+//     by a sqrt ratio instead (MagnitudeClampVelocityAveraging).  Different formulas; both
+//     live in pxgSlangDeformableUtils' finalizeVertexVelocity.
 //
 // DEVIATIONS from CUDA:
 //   - __any_sync / __ballot_sync + the two-level shared-memory reduction become
@@ -349,7 +351,7 @@ void sb_gm_stepSoftbodyLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
         {
             if (tPos.w != 0.0f)
             {
-                // The @392 fold: byte0 = mActorFlags.
+                // The @416 fold: byte0 = mActorFlags.
                 const uint actorFlags = softbodies[id].mFlagsWord & 0xffu;
                 if ((actorFlags & PXG_SOFTBODY_ACTORFLAG_DISABLE_GRAVITY) == 0u)
                 {
@@ -380,20 +382,24 @@ void sb_gm_stepSoftbodyLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
 }
 
 // ---------------------------------------------------------------------------
-// sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3136)
+// sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu, PhysX 5.12)
 // ---------------------------------------------------------------------------
-// CUDA arg pack (PxgSoftBodyCore.cpp:922): { PxgSoftBody* gSoftbodies,
-// const PxU32* activeSoftbodies, const PxReal invDt, const PxReal velocityScale,
-// const PxReal dt, const bool alwaysRunVelocityAveraging(1) } -> 29, rounded up to the
-// pointer alignment -> 32-byte blob.  (ABI row {8,8,4,4,4,1}.)
+// CUDA arg pack (PxgSoftBodyCore.cpp finalizeVelocities): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxReal invDt, const PxReal dt,
+// const bool alwaysRunVelocityAveraging, const PxU32 nbPosIters } -> the bool @24, the
+// PxU32 realigned to @28 -> 32-byte blob.  (ABI row {8,8,4,4,1,4}.)
+// 5.12 replaced the host-computed velocityScale by nbPosIters: the shared
+// finalizeVertexVelocity (pxgSlangDeformableUtils) with LinearBlendVelocityAveraging,
+// scale = PxMin(0.9f, 2 * PxSqrt(1 / nbPosIters)).  The velocity is written back for every
+// vertex in range (unchanged when neither the averaging nor the settle damping applies).
 struct FinalizeParams
 {
-    uint64_t gSoftbodies;      // @0
-    uint64_t activeSoftbodies; // @8
-    float invDt;               // @16
-    float velocityScale;       // @20
-    float dt;                  // @24
-    uint alwaysAvgWord;        // @28  byte0 = alwaysRunVelocityAveraging  -> 32
+    uint64_t gSoftbodies;               // @0
+    uint64_t activeSoftbodies;          // @8
+    float invDt;                        // @16
+    float dt;                           // @20
+    uint alwaysRunVelocityAveraging;    // @24  bool byte0
+    uint nbPosIters;                    // @28  -> 32
 }
 [[vk::push_constant]]
 ConstantBuffer<FinalizeParams> gFin;
@@ -407,17 +413,11 @@ void sb_gm_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint
     Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gFin.gSoftbodies);
     const uint softbodyId = (Ptr<uint>(gFin.activeSoftbodies))[groupId.y];
 
-    Ptr<float4> deltaPos = Ptr<float4>(softbodies[softbodyId].mSimDeltaPos);
-    Ptr<float4> vels = Ptr<float4>(softbodies[softbodyId].mSimVelocity_InvMass);
-    Ptr<float4> positions = Ptr<float4>(softbodies[softbodyId].mSimPosition_InvMass);
-
     const uint vertIdx = groupThreadId.x + groupId.x * SB_PREINTEGRATION;
     const uint nbVerts = softbodies[softbodyId].mNumVertsGM;
 
-    const float dt = gFin.dt;
-    const float invDt = gFin.invDt;
-    const float velocityScale = gFin.velocityScale;
-    const bool alwaysRunVelocityAveraging = (gFin.alwaysAvgWord & 0xffu) != 0u;
+    const bool alwaysRunVelocityAveraging = (gFin.alwaysRunVelocityAveraging & 0xffu) != 0u;
+    const float averageScale = linearBlendVelocityAveragingScale(gFin.nbPosIters);
 
     if (groupThreadId.x == 0u)
         gSbAnyAwake = 0u;
@@ -427,45 +427,15 @@ void sb_gm_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint
 
     if (vertIdx < nbVerts)
     {
-        const float settleTolerance = softbodies[softbodyId].mSettlingThreshold * dt;
-        const float tolerance = softbodies[softbodyId].mSleepThreshold * dt;
-        const float sleepDamping = 1.0f - min(1.0f, softbodies[softbodyId].mSettlingDamping * dt);
-
-        const float4 delta = deltaPos[vertIdx];
-        const float3 tDelta = float3(delta.x, delta.y, delta.z);
-        const float3 deltaVel = tDelta * invDt;
-        const float4 pos = positions[vertIdx];
-
-        if (pos.w != 0.0f) // skip kinematic and infinite mass particles
-        {
-            float velocityScaling = 1.0f;
-
-            const float magSq = tDelta.x * tDelta.x + tDelta.y * tDelta.y + tDelta.z * tDelta.z;
-            if (magSq < settleTolerance * settleTolerance)
-            {
-                awake = magSq >= tolerance * tolerance;
-                velocityScaling = sleepDamping;
-            }
-            else
-            {
-                awake = true;
-            }
-
-            if (alwaysRunVelocityAveraging || velocityScaling != 1.0f)
-            {
-                const float4 vel = vels[vertIdx];
-                float3 tVel = float3(vel.x, vel.y, vel.z);
-
-                const float deltaVelMagSq =
-                    deltaVel.x * deltaVel.x + deltaVel.y * deltaVel.y + deltaVel.z * deltaVel.z;
-                const float velMagSq = tVel.x * tVel.x + tVel.y * tVel.y + tVel.z * tVel.z;
-                if (alwaysRunVelocityAveraging && deltaVelMagSq < velMagSq)
-                    tVel = tVel * velocityScale + deltaVel * (1.0f - velocityScale);
-
-                vels[vertIdx] = float4(velocityScaling * tVel.x, velocityScaling * tVel.y,
-                                       velocityScaling * tVel.z, vel.w);
-            }
-        }
+        Ptr<float4> vels = Ptr<float4>(softbodies[softbodyId].mSimVelocity_InvMass);
+        float4 vel = vels[vertIdx];
+        awake = finalizeVertexVelocity(Ptr<float4>(softbodies[softbodyId].mSimPosition_InvMass)[vertIdx], vel,
+                                       Ptr<float4>(softbodies[softbodyId].mSimDeltaPos)[vertIdx],
+                                       softbodies[softbodyId].mSettlingThreshold,
+                                       softbodies[softbodyId].mSleepThreshold,
+                                       softbodies[softbodyId].mSettlingDamping, gFin.dt, gFin.invDt,
+                                       alwaysRunVelocityAveraging, PXG_VEL_AVG_LINEAR_BLEND, averageScale);
+        vels[vertIdx] = vel;
     }
 
     // Block-wide OR of `awake` (replaces the CUDA two-level __any_sync + shared isAwake[]).

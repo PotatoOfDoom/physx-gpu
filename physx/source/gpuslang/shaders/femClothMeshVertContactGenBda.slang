@@ -37,15 +37,15 @@
 // throws all of it away.  The write is gated on `hasContacts`, and the ONLY
 // assignment to `hasContacts` in the whole kernel is commented out:
 //
-//     bool hasContacts = false;                       // :2938
+//     bool hasContacts = false;                       // 5.12 :2843
 //     ...
-//         if ((pen <= cDistance) && normal.dot(n) > 0.f)
+//         if (!filtered && (pen <= cDistance) && normal.dot(n) > 0.f)
 //         {
-//             pairInd0 = rigidId.getInd();
-//             pairInd1 = PxEncodeClothIndex(clothId, clothVertIndex);
+//             rigidRef = rigidId.getInd();
+//             vertRef = PxgEncodeDeformableVertex(clothId, clothVertIndex);
 //             contact  = make_float4(closestPt.x, closestPt.y, closestPt.z,
 //                                    restDistance[cmIdx]);
-//             //hasContacts = true;                   // :3056  <-- COMMENTED OUT
+//             //hasContacts = true;                   // 5.12 :2964  <-- COMMENTED OUT
 //         }
 //     }
 //     PxgOutputIndex indexer(__ballot_sync(FULL_MASK, hasContacts),
@@ -106,7 +106,7 @@ module femClothMeshVertContactGenBda;
 // (PxgNarrowphaseCore.cpp:6814): { PxReal toleranceLength, cmInputs*,
 // transformCache*, contactDistance*, restDistance*, gpuShapes*, femClothes*,
 // shapeToRigidRemapTable*, PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*,
-// stackSizeNeededOnDevice*, PxgFEMContactWriter writer (by value, 80 B) }.
+// stackSizeNeededOnDevice*, PxgRigidDbContactWriter writer (by value, 80 B) } (5.12).
 //
 // The writer lands at @96, and that is 16-aligned already, so this pack does NOT
 // hit the paramAlign(80) == 16 trap P9.15e had to find -- the arguments before it
@@ -130,16 +130,16 @@ struct ClothMeshVertCgParams
     uint64_t stackPtr;             // @72  (ABI parity only)
     uint64_t midphasePairsNum;     // @80
     uint64_t stackSizeNeeded;      // @88  atomicMax output
-    // ---- PxgFEMContactWriter (by value, 80 B) @96 ----
-    uint64_t w_outPoint;           // @96   (ABI parity only)
-    uint64_t w_outNormalPen;       // @104  (ABI parity only)
-    uint64_t w_outBarycentric;     // @112  (ABI parity only)
-    uint64_t w_outContactInfo;     // @120  (ABI parity only)
-    uint64_t w_totalContactCount;  // @128  (never incremented -- see the header)
-    uint64_t w_contactByX;         // @136  (ABI parity only)
-    uint64_t w_tempContactByX;     // @144  (ABI parity only)
-    uint64_t w_contactIndexSortedByX; // @152 (ABI parity only)
-    uint64_t w_contactSortedByX;   // @160  (ABI parity only)
+    // ---- PxgRigidDbContactWriter (by value, 80 B) @96 ----
+    uint64_t w_outPoint;                  // @96   (ABI parity only)
+    uint64_t w_outNormalPen;              // @104  (ABI parity only)
+    uint64_t w_outBarycentric;            // @112  (ABI parity only)
+    uint64_t w_outContactInfo;            // @120  (ABI parity only)
+    uint64_t w_outRigidMaterialIndex;     // @128  (ABI parity only)
+    uint64_t w_totalContactCount;         // @136  (never incremented -- see the header)
+    uint64_t w_contactByRigid;            // @144  (ABI parity only)
+    uint64_t w_tempContactByRigid;        // @152  (ABI parity only)
+    uint64_t w_contactIndexSortedByRigid; // @160  (ABI parity only)
     uint w_maxNumContacts;         // @168
     uint _pad172;                  // @172 -> 176
 }

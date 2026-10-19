@@ -427,7 +427,8 @@ static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
 //     PxVec3 by value = 12 -> natural-alignment blob = 80 bytes.
 static const uint8_t kClothPreIntegrate[] = { 8, 8, 12, 4, 1, 8, 1, 1, 8, 8, 8 };
 //   cloth_finalizeVelocitiesLaunch(PxgFEMCloth* femCloths, const PxU32* activeId,
-//     PxReal invTotalDt, PxReal dt, bool alwaysRunVelocityAveraging) -> 32-byte blob.
+//     PxReal invDt, PxReal dt, bool alwaysRunVelocityAveraging) -> 32-byte blob (5.12
+//     renamed invTotalDt to invDt; the pack is unchanged).
 static const uint8_t kClothFinalizeVel[] = { 8, 8, 4, 4, 1 };
 //   cloth_sleeping(PxgFEMCloth* femCloths, PxU32 numActiveCloths, const PxU32*
 //     activeId, PxReal dt, PxReal resetCounter, PxReal* wakeCounters,
@@ -481,57 +482,57 @@ static const uint8_t kClothSolveTriPairEnergy[] = { 8, 8, 8, 4, 4, 1, 1 };
 //     blob (bool @20, rounded to the 8-alignment).
 static const uint8_t kClothAvgPairVerts[] = { 8, 8, 4, 1 };
 
-// gpusimulationcontroller FEMCloth rigid-attachment kernels (P7.1 tranche 3a BDA):
+// gpusimulationcontroller FEMCloth rigid-attachment kernels, PhysX 5.12:
 //   cloth_rigidAttachmentPrepareLaunch(PxgFEMCloth* clothes,
-//     PxgFEMRigidAttachment* rigidAttachments, PxU32* activeRigidAttachments,
+//     PxgDeformableAttachment* rigidAttachments, PxU32* activeRigidAttachments,
+//     const PxU32* rigidAttachmentRigidRefCounts, PxNodeIndex* rigidAttachmentIds,
+//     PxU32 numRigidAttachments, PxgRigidDbAttachmentBlock* attachmentBlocks,
+//     const PxgPrePrepDesc* preDesc, const PxgConstraintPrepareDesc* prepareDesc,
+//     const PxgSolverSharedDescBase* sharedDesc, float4* rigidDeltaVel)  -- launch site
+//   PxgFEMClothCore prepRigidAttachmentBlocks.  Five pointers, PxU32 @40, five pointers
+//   realigned to @48 -> 88-byte blob (the softbody twin's pack, kept as its own row).
+static const uint8_t kClothRigidAttachPrep[] = { 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
+//   cloth_queryRigidClothAttachmentReferenceCountLaunch(PxgFEMCloth* clothes,
+//     PxgRigidDbAttachmentBlock* attachmentBlocks, const PxU32 numAttachments)  (new in
+//   5.12) -> two pointers + PxU32 @16 = 24-byte blob.
+static const uint8_t kClothRigidAttachQuery[] = { 8, 8, 4 };
+//   cloth_solveRigidClothAttachmentLaunch(PxgFEMCloth* clothes,
+//     PxgRigidDbAttachmentBlock* attachmentBlocks, const PxU32 numAttachments,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*, float4* solverBodyVelPool,
+//     const PxReal dt, const PxReal biasCoefficient, float4* rigidDeltaVel,
+//     bool isVelocityIteration, bool isTGS)  -- one kernel for PGS and TGS since 5.12 (the
+//   TGS twin is gone).  PxU32 @16, pointers @24..@48, PxReals @56/@60, pointer @64, bools
+//   @72/@73 -> 80-byte blob.
+static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 4, 8, 1, 1 };
+// gpusimulationcontroller softbody-vs-rigid ATTACHMENT, PhysX 5.12 (softBodyGM.cu):
+//   sb_rigidAttachmentPrepareLaunch(PxgSoftBody*, PxgDeformableAttachment* rigidAttachments,
+//     PxU32* activeRigidAttachments, const PxU32* rigidAttachmentRigidRefCounts,
 //     PxNodeIndex* rigidAttachmentIds, PxU32 numRigidAttachments,
-//     PxgFEMRigidAttachmentConstraint* attachmentConstraints, PxgPrePrepDesc* preDesc,
-//     PxgConstraintPrepareDesc* prepareDesc, PxgSolverSharedDescBase* sharedDesc,
-//     float4* rigidDeltaVel)  -- launch site PxgFEMClothCore.cpp:226.  Four device
-//   pointers + PxU32 (@32) + five device pointers -> natural-alignment blob = 80
-//   bytes (numRigidAttachments's 4-byte tail-pad realigns the @40 pointer).
-static const uint8_t kClothRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
-//   cloth_solveRigidClothAttachmentLaunch / ...TGSLaunch(PxgFEMCloth* clothes,
-//     PxgFEMRigidAttachmentConstraint* attachments, PxU32 numAttachments,
-//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc,
-//     PxReal dt, float4* rigidDeltaVel)  -- launch site PxgFEMClothCore.cpp:1858
-//   (both PGS and TGS share the pack).  Two device pointers + PxU32 (@16) + four
-//   device pointers + PxReal (@56) + device pointer -> natural-alignment blob = 72
-//   bytes.
-static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
-// gpusimulationcontroller softbody-vs-rigid ATTACHMENT (P8.3).  The CUDA argument packs are
-// position-for-position and type-for-type identical to the two cloth rows above apart from
-// argument 0's pointee type (PxgSoftBody vs PxgFEMCloth), 8 bytes either way, so the blobs
-// are the same 80 / 72 bytes.  Kept as their own rows rather than aliased, so a future
-// divergence in either signature cannot silently corrupt the other's blob.
-//   sb_rigidAttachmentPrepareLaunch  -- launch site PxgSoftBodyCore.cpp:2056.
-static const uint8_t kSbRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
-//   sb_solveRigidSoftAttachmentLaunch  -- launch site PxgSoftBodyCore.cpp:1810.
-//
-//   P9.76b CORRECTED WHAT STOOD HERE.  It read "sb_solveRigidSoftAttachmentLaunch{,TGS}
-//   -- launch site PxgSoftBodyCore.cpp:1810 (both PGS and TGS share the pack)", and gave
-//   BOTH kernels this 72-byte row.  That claim is TRUE OF CLOTH -- PxgFEMClothCore.cpp:1845
-//   really does build one 9-argument pack and pick the function with a ternary -- and FALSE
-//   of softbody, which has TWO separate packs at :1810 and :1866.  The claim was carried
-//   over from the cloth row above, the same way P9.76a carried over a cloth-only constraint
-//   quirk into the same file's solve.  Twice in one file pair: it looks like cloth, so it
-//   was treated as cloth.
-//
-//   The cost was total and silent.  The bridge builds the blob from the HOST pack
-//   (PxgVulkanCudaContext.cpp:443-462) and the shim gates on blobSize == pushConstantSize
-//   -- that file says so in its own comment at :459 -- so the TGS kernel was refused on
-//   EVERY launch and has never run on Vulkan.  check_launch_abi.py could not see it: it
-//   asks whether a row EXISTS, and this one did.  tools/check_launch_abi_pack.py (P9.77)
-//   is the checker that compares the row against the pack, and this is the entry it was
-//   written to catch.
-static const uint8_t kSbRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
+//     PxgRigidDbAttachmentBlock* attachmentBlocks, PxgPrePrepDesc*, PxgConstraintPrepareDesc*,
+//     PxgSolverSharedDescBase*, float4* rigidDeltaVel)  -- launch site PxgSoftBodyCore.cpp
+//   prepRigidAttachmentBlocks.  Five pointers, PxU32 @40, five pointers realigned to @48
+//   -> 88-byte blob.
+static const uint8_t kSbRigidAttachPrep[] = { 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
+//   sb_queryRigidSoftAttachmentReferenceCountLaunch(PxgSoftBody*, PxgRigidDbAttachmentBlock*,
+//     const PxU32 numAttachments) (new in 5.12) and sb_querySoftBodyAttachmentReference-
+//   CountLaunch(PxgSoftBody*, PxgDbDbAttachmentBlock*, const PxU32 numAttachments) (new):
+//   two pointers + PxU32 @16 -> 24-byte blob each.  Own rows, kept apart.
+static const uint8_t kSbRigidAttachQuery[] = { 8, 8, 4 };
+static const uint8_t kSbSoftBodyAttachQuery[] = { 8, 8, 4 };
+//   sb_solveRigidSoftAttachmentLaunch(PxgSoftBody*, PxgRigidDbAttachmentBlock*,
+//     const PxU32 numAttachments, PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
+//     float4* solverBodyVelPool, const PxReal dt, const PxReal biasCoefficient,
+//     float4* rigidDeltaVel, bool isVelocityIteration, bool isTGS)  -- one kernel for PGS and
+//   TGS since 5.12 (the TGS twin and its separate 11-argument pack, P9.76b, are gone).
+//   PxU32 @16, pointers @24..@48, PxReals @56/@60, pointer @64, bools @72/@73 -> 80 bytes.
+static const uint8_t kSbRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 4, 8, 1, 1 };
 
-// gpusimulationcontroller FEMCloth.cu apply-external-deltas (P7.1 tranche 3c):
+// gpusimulationcontroller FEMClothExternalSolve.cu apply-external-deltas, PhysX 5.12:
 //   cloth_applyExternalDeltasLaunch(PxgFEMCloth* femClothes, const PxU32*
-//     activeClothes, PxReal dt)  -- launch PxgFEMClothCore.cpp:2113.  Two device
-//   pointers + PxReal -> natural-alignment blob = 24 bytes (20 rounded to 8).
-static const uint8_t kClothApplyExtDeltas[] = { 8, 8, 4 };
+//     activeClothes, PxReal dt, bool isVelocityIteration)  -- launch
+//   PxgFEMClothCore::applyExternalDelta.  Two device pointers + PxReal @16 + bool @20 ->
+//   24-byte blob (5.12 added the bool in the 5.6.1 tail pad).
+static const uint8_t kClothApplyExtDeltas[] = { 8, 8, 4, 1 };
 
 // gpunarrowphase femClothMidPhase.cu (P7.1 tranche 4a cloth-vs-primitive contact
 // GENERATION — the broadphase->midphase pass):
@@ -543,90 +544,94 @@ static const uint8_t kClothApplyExtDeltas[] = { 8, 8, 4 };
 //   -- launch site PxgNarrowphaseCore.cpp:6317.  PxU32 + PxReal (@0/@4) + eight
 //   device pointers -> natural-alignment blob = 72 bytes.
 static const uint8_t kClothMidphaseVertPairs[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8 };
-//   cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch share the
-//   arg pack (femClothPrimitives.cu:853 / :700, launch PxgNarrowphaseCore.cpp:5853 /
-//   :5776): (PxU32 numWorkItems, const PxgContactManagerInput* cmInputs,
+//   cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch /
+//   cloth_boxVertexContactGenLaunch share the arg pack (femClothPrimitives.cu, 5.12):
+//   (PxU32 numWorkItems, const PxgContactManagerInput* cmInputs,
 //   const PxsCachedTransform* transformCache, const PxReal* contactDistance,
 //   const PxReal* restDistance, const PxgShape* gpuShapes,
 //   const PxgFEMCloth* femClothes, const PxNodeIndex* shapeToRigidRemapTable,
-//   PxgRigidFilterPair* filterPairs, PxU32 nbFilterPairs, PxgFEMContactWriter writer).
+//   PxgRigidDbContactWriter writer).  5.12 dropped the filterPairs / nbFilterPairs
+//   pair (the filter now lives on the cloth, PxgFEMCloth::mRigidSurfaceFilterPairs).
 //   The writer is passed BY VALUE (nine device pointers + PxU32 maxNumContacts +
-//   4B tail pad = 80 bytes, sizeof(PxgFEMContactWriter)).  Eight device pointers +
-//   PxU32 nbFilterPairs (@72) + the 80-byte writer (@80) -> 160-byte blob.
+//   4B tail pad = 80 bytes, sizeof(PxgRigidDbContactWriter)); paramAlign(80) = 16 and
+//   the seven pointers end at 64, so the writer sits at @64 -> 144-byte blob.
 static const uint8_t kClothTriMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
-// P9.15d: fifteen arguments, the last of them PxgFEMContactWriter by value (80 B).
-static const uint8_t kClothBoxTriCg[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 80 };
-static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+// P9.15d / 5.12: cloth_boxTriangle / convex / convexVertex / SphereContactGenLaunch,
+// thirteen arguments: (PxReal, nine pointers, PxU32 stackSizeBytes @80,
+// stackSizeNeededOnDevice @88, PxgRigidDbContactWriter by value (80 B) @96 -- 96 is
+// 16-aligned, so no pad) -> 176-byte blob.  5.6.1 had the two filter arguments between
+// midphasePairsNum and stackSizeBytes.
+static const uint8_t kClothBoxTriCg[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
+static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase softbodyPrimitives.cu:1655 (P7.1 tranche 4b-1 cloth-vs-rigid
 // contact SORT / reorder):
 //   fem_reorderRigidContactsLaunch(const float4* contacts, const float4* normalpens,
-//     const float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
-//     const PxU32* numContacts, const PxU32* remapByRigid, float4* sortedContacts,
-//     float4* sortedNormalPens, float4* sortedBarycentrics,
-//     PxgFemOtherContactInfo* sortedContactInfos, PxU64* sortedRigidIds)
-//   -> 11 device pointers = {8,8,8,8,8,8,8,8,8,8,8} = 88-byte blob.  Launch site
-//   PxgFEMCore::reorderRigidContacts() PxgFEMCore.cpp:232.
-static const uint8_t kFemReorderRSContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
+//     const float4* barycentrics, PxgDeformablePairInfo* contactInfos,
+//     const PxU16* contactMaterials, const PxU32* numContacts, const PxU32* remapByRigid,
+//     float4* sortedContacts, float4* sortedNormalPens, float4* sortedBarycentrics,
+//     PxgDeformablePairInfo* sortedContactInfos, PxU16* sortedContactMaterials,
+//     PxU64* sortedRigidIds)   (5.12: the two PxU16 material streams are new)
+//   -> 13 device pointers = 104-byte blob.  Launch site PxgFEMCore::reorderRigidContacts().
+static const uint8_t kFemReorderRSContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + SOLVE (P7.1 tranche 4b-2/3):
+// gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + SOLVE, PhysX 5.12:
 //   cloth_rigidContactPrepareLaunch(PxgFEMCloth* femClothes, float4* contacts_restW,
-//     float4* normalPens, float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
-//     PxU32* numContacts, PxgFemRigidConstraintBlock* primitiveConstraints,
-//     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc, PxReal* rigidLambdaNs,
-//     PxReal invDt, PxgSolverSharedDescBase* sharedDesc, bool isTGS)  -- launch site
-//   PxgFEMClothCore.cpp:328.  Ten device pointers + PxReal (@80) + device pointer (@88) +
-//   bool (@96) -> natural-alignment blob = 104 bytes.
+//     float4* normalPens, float4* barycentrics, const PxgDeformablePairInfo* contactInfos,
+//     PxU32* numContacts, PxgRigidDbContactBlock* contactBlocks, PxgPrePrepDesc* preDesc,
+//     PxgConstraintPrepareDesc* prepareDesc, float2* rigidLambdaNs, const PxReal invDt,
+//     PxgSolverSharedDescBase* sharedDesc, bool isTGS)  -- launch site
+//   PxgFEMClothCore prepRigidContactConstraint.  Ten device pointers + PxReal (@80) +
+//   device pointer (@88) + bool (@96) -> 104-byte blob (the 5.6.1 pack shape).
 static const uint8_t kClothRigidContactPrep[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
-//   cloth_queryRigidClothContactReferenceCount{,TGS}Launch(PxgFEMCloth* femClothes,
-//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
-//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
-//     PxReal* appliedForces, PxU32* rigidBodyReferenceCounts)  -- launch site
-//   PxgFEMClothCore.cpp:1741 (both PGS and TGS share the pack).  Eight device pointers +
-//   PxReal (@64) + two device pointers (@72/@80) -> natural-alignment blob = 88 bytes.
-static const uint8_t kClothRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
-//   cloth_solveRigidClothCollision{,TGS}Launch(PxgFEMCloth* femClothes,
-//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
-//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc,
-//     float4* rigidDeltaVel, PxReal* appliedForces, PxU32* rigidBodyReferenceCounts,
-//     PxReal dt, PxsDeformableSurfaceMaterialData* materials,
-//     const PxsMaterialData* rigidBodyMaterials)  -- launch site PxgFEMClothCore.cpp:1797
-//   (both PGS and TGS share the pack).  Eleven device pointers + PxReal (@88) + two device
-//   pointers (@96/@104) -> natural-alignment blob = 112 bytes.
-static const uint8_t kClothRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+//   cloth_queryRigidClothContactReferenceCountLaunch(PxgFEMCloth* femClothes,
+//     PxgDeformablePairInfo* contactInfos, const float4* barycentrics,
+//     PxgRigidDbContactBlock* contactBlocks, PxU32* numContacts, PxgPrePrepDesc*,
+//     PxgSolverCoreDesc*, PxgArticulationCoreDesc*, float4* solverBodyVelPool,
+//     const PxReal dt, float2* appliedForces, PxU32* rigidBodyRefCounts, bool isTGS,
+//     bool isVelocityIteration)  -- one kernel for PGS and TGS since 5.12.  Nine pointers +
+//   PxReal (@72) + two pointers (@80/@88) + bools (@96/@97) -> 104-byte blob.
+static const uint8_t kClothRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 1, 1 };
+//   cloth_solveRigidClothCollisionLaunch(PxgFEMCloth* femClothes,
+//     const PxgDeformablePairInfo* contactInfos, const PxU16* contactRigidMaterials,
+//     const float4* barycentrics, PxgRigidDbContactBlock* contactBlocks, PxU32* numContacts,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*, float4* solverBodyVelPool,
+//     float4* rigidDeltaVel, float2* appliedForces, PxU32* rigidBodyRefCounts,
+//     const PxReal dt, PxsDeformableSurfaceMaterialData* materials,
+//     const PxsMaterialData* rigidBodyMaterials, bool isTGS, bool isVelocityIteration)
+//   -- one kernel for PGS and TGS since 5.12.  Thirteen pointers + PxReal (@104) + two
+//   pointers (@112/@120) + bools (@128/@129) -> 136-byte blob.
+static const uint8_t kClothRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 1, 1 };
 
 // gpunarrowphase femClothClothMidPhase.cu (P7.2 tranche 1 cloth SELF-collision midphase
 // + contact GENERATION):
 //   cloth_selfCollisionMidphase{VT,EE}Launch(PxU32 maxContacts, const PxU32*
 //     activeClothes, const PxReal* contactDistance, const PxgFEMCloth* clothes,
-//     PxgNonRigidFilterPair* clothClothPairs, PxU32 numClothClothPairs,
-//     const PxU8* updateContactPairs, PxgFemFemContactInfo* outContactInfo,
-//     PxU32* totalContactCount)  -- launch site PxgFEMClothCore.cpp:698 (VT and EE
-//   share the pack).  PxU32 (@0) + four device pointers + PxU32 (@40) + three device
-//   pointers -> natural-alignment blob = 72 bytes (the two PxU32 4-byte tail-pads
-//   realign the following pointers).
-static const uint8_t kClothSelfCollisionMidphase[] = { 4, 8, 8, 8, 8, 4, 8, 8, 8 };
+//     const PxU8* updateContactPairs, PxgDeformablePairInfo* outContactInfo,
+//     PxU32* totalContactCount)  -- 5.12 (VT and EE share the pack; the clothClothPairs /
+//   numClothClothPairs arguments are gone).  PxU32 (@0) + six device pointers @8..@48
+//   -> 56-byte blob.
+static const uint8_t kClothSelfCollisionMidphase[] = { 4, 8, 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller FEMCloth self-contact SOLVE (P7.2 tranche 2 cloth-vs-cloth
-// self-contact prepare + count + solve + validity):
+// gpusimulationcontroller FEMCloth cloth-vs-cloth contact prepare + count + solve +
+// validity (PhysX 5.12; the contacts are PxgDeformablePairInfo since 5.12):
 //   cloth_clothContactPrepareLaunch(PxgFEMCloth* clothes,
-//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts, PxU32 maxContacts,
+//     PxgDeformablePairInfo* contactInfos, PxU32* numContacts, PxU32 maxContacts,
 //     PxsDeformableSurfaceMaterialData* clothMaterials, const PxU8* updateContactPairs)
 //   -- launch site PxgFEMClothCore.cpp:505.  Three device pointers + PxU32 (@24) + two
 //   device pointers -> natural-alignment blob = 48 bytes (the PxU32 4-byte tail-pad
 //   realigns the following pointer).
 static const uint8_t kClothClothContactPrep[] = { 8, 8, 8, 4, 8, 8 };
 //   cloth_queryClothClothContact{VT,EE}CountLaunch(PxgFEMCloth* cloths,
-//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts)  -- launch site
+//     PxgDeformablePairInfo* contactInfos, PxU32* numContacts)  -- launch site
 //   PxgFEMClothCore.cpp:1983 (VT and EE share the pack).  Three device pointers = 24-byte blob.
 static const uint8_t kClothClothContactQuery[] = { 8, 8, 8 };
 //   cloth_solveClothClothDelta{VT,EE}Launch(PxgFEMCloth* cloths,
-//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts, PxReal dt)  -- launch site
-//   PxgFEMClothCore.cpp:2005 (VT and EE share the pack).  Three device pointers + PxReal
-//   (@24) -> 32-byte blob.
-static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4 };
+//     const PxgDeformablePairInfo* contactInfos, PxU32* numContacts, PxReal dt,
+//     bool isVelocityIteration)  -- launch site PxgFEMClothCore::solveClothContacts-
+//   OutputClothDelta (VT and EE share the pack).  Three device pointers + PxReal (@24) +
+//   bool (@28) -> 32-byte blob (5.12 added the bool in the 5.6.1 tail pad).
+static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4, 1 };
 //   cloth_updateClothContactValidityLaunch(PxgFEMCloth* femCloths, const PxU32* activeIds,
 //     bool adaptiveCollisionPairUpdate, bool forceUpdateClothContactPairs,
 //     const PxU8* updateContactPairs, PxU32* VTContactCount, PxU32* EEContactCount,
@@ -635,8 +640,8 @@ static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4 };
 static const uint8_t kClothUpdateContactValidity[] = { 8, 8, 1, 1, 8, 8, 8, 4 };
 
 // gpusimulationcontroller FEMCloth.cu:338 (P7.2 tranche 3a cloth BVH bottom-up refit):
-//   cloth_refitBoundLaunch(PxgFEMCloth* gFemClothes, const PxU32* activeFemClothes,
-//     const PxU32 nbActiveFemClothes, PxReal* contactDists,
+//   cloth_refitBoundLaunch(PxgFEMCloth* gFemClothes, const PxU32* activeFemCloths,
+//     const PxU32 nbActiveFemCloths, PxReal* contactDists,
 //     PxReal* speculativeCCDContactOffset, PxBounds3* boundArray, const PxU32* elemIndex,
 //     const PxReal nbCollisionPairUpdatesPerTimestep, const PxU8* updateContactPairs)
 //   -- launch site PxgFEMClothCore.cpp:563.  Two device pointers + PxU32 (@16, its
@@ -672,11 +677,10 @@ static const uint8_t kSbRefitBound[] = { 8, 8, 4, 8, 8, 8, 8, 8 };
 //   + bool (@32) -> 33, rounded up to the pointer alignment -> 40-byte blob.
 static const uint8_t kSbStepSoftbody[] = { 8, 8, 4, 12, 1 };
 //   sb_gm_finalizeVelocitiesLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
-//     const PxReal invDt, const PxReal velocityScale, const PxReal dt,
-//     const bool alwaysRunVelocityAveraging)  -- launch site PxgSoftBodyCore.cpp:922.
-//   Two device pointers + three PxReal (@16/@20/@24) + bool (@28) -> 29, rounded up to
-//   the pointer alignment -> 32-byte blob.
-static const uint8_t kSbFinalizeVelocities[] = { 8, 8, 4, 4, 4, 1 };
+//     const PxReal invDt, const PxReal dt, const bool alwaysRunVelocityAveraging,
+//     const PxU32 nbPosIters)  -- PhysX 5.12 (velocityScale became nbPosIters).  Two device
+//   pointers + two PxReal (@16/@20) + bool (@24) + PxU32 realigned to @28 -> 32-byte blob.
+static const uint8_t kSbFinalizeVelocities[] = { 8, 8, 4, 4, 1, 4 };
 //   sb_sleeping(PxgSoftBody* softBodies, const PxU32 numActiveSoftBodies,
 //     const PxU32* activeId, const PxReal dt, const PxReal resetCounter,
 //     PxReal* wakeCounters, PxU32* stateChangedMask)  -- launch site
@@ -690,11 +694,14 @@ static const uint8_t kSbSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
 //   sb_gm_zeroTetMultipliers(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies)
 //   -- launch site PxgSoftBodyCore.cpp:198.  Two device pointers -> 16-byte blob.
 static const uint8_t kSbZeroTetMultipliers[] = { 8, 8 };
-//   sb_gm_applyExternalDeltasLaunch(PxgSoftBody* gSoftbodies,
-//     const PxU32* activeSoftbodies, const PxReal invDt)  -- launch site
-//   PxgSoftBodyCore.cpp:874.  Two device pointers + PxReal (@16) -> 20, rounded up to the
-//   pointer alignment -> 24-byte blob.
+//   sb_gm_cp_averageVertsLaunch / sb_gm_applyDeformationDeltasLaunch(PxgSoftBody*,
+//     const PxU32* activeSoftbodies, const PxReal invDt): two device pointers + PxReal (@16)
+//   -> 24-byte blob.  (sb_gm_applyExternalDeltasLaunch shared this row until PhysX 5.12
+//   appended its isVelocityIteration; it has its own row below now.)
 static const uint8_t kSbApplyExternalDeltas[] = { 8, 8, 4 };
+//   sb_gm_applyExternalDeltasLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
+//     const PxReal invDt, bool isVelocityIteration)  -- PhysX 5.12.  bool @20 -> 24 bytes.
+static const uint8_t kSbApplyExternalDeltasVel[] = { 8, 8, 4, 1 };
 //   sb_gm_cp_solveTetrahedronsPartitionLaunch(PxgSoftBody* gSoftbodies,
 //     const PxU32* activeSoftbodies, const PxU32 numActiveSoftbodies, const PxReal invDt,
 //     const PxU32 partitionId, bool isTGS, bool isFirstIteration,
@@ -733,13 +740,12 @@ static const uint8_t kSbMidphasePrimitives[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8
 //     const PxsCachedTransform*, const PxReal* contactDistance, const PxReal* restDistance,
 //     const PxgShape*, const PxgSoftBody*, const PxNodeIndex* shapeToRigidRemapTable,
 //     PxU8* stackPtr, PxU32* midphasePairsNum, PxU32 stackSizeBytes,
-//     PxgRigidFilterPair* softBodyRigidPairs, PxU32 numSoftBodyRigidPairs,
-//     PxU32* stackSizeNeededOnDevice, PxgFEMContactWriter writer)  -- launch site
-//   PxgNarrowphaseCore.cpp:4289.  The writer is passed BY VALUE (80 B, so paramAlign gives
-//   it 16-byte alignment) and lands at @112; the blob is 192 bytes -- the first kernel in
-//   the port to exceed Vulkan's GUARANTEED 128-byte push-constant minimum.  llvmpipe
+//     PxU32* stackSizeNeededOnDevice, PxgRigidDbContactWriter writer)  -- 5.12 (the
+//   softBodyRigidPairs / numSoftBodyRigidPairs filter arguments are gone).  The writer is
+//   passed BY VALUE (80 B, so paramAlign gives it 16-byte alignment) and lands at @96; the
+//   blob is 176 bytes -- over Vulkan's GUARANTEED 128-byte push-constant minimum.  llvmpipe
 //   reports maxPushConstantsSize = 256, so it fits here.
-static const uint8_t kSbPrimitiveContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
+static const uint8_t kSbPrimitiveContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
 //   sb_other_contact_remap_to_simLaunch(const PxgSoftBody*, PxU32 maxNumContacts,
 //     const float4* point, float4* outBarycentric, PxgFemOtherContactInfo* outContactInfo,
 //     PxU32* totalContactCount, const PxU32* prevContactCount)  -- launch site
@@ -754,8 +760,8 @@ static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 // midphase):
 //   sb_selfCollisionMidphaseGeneratePairsLaunch(const PxU32* activeSoftbodies,
 //     const PxReal* contactDistance, const PxgSoftBody* softbodies,
-//     PxgSoftBodyContactWriter writer)  -- launch site PxgSoftBodyCore.cpp:411.  The writer
-//   is passed BY VALUE; sizeof(PxgSoftBodyContactWriter) = 56 (six device pointers + PxU32
+//     PxgDbDbContactWriter writer)  -- launch site PxgSoftBodyCore.cpp.  The writer
+//   is passed BY VALUE; sizeof(PxgDbDbContactWriter) = 56 (5.12; six device pointers + PxU32
 //   maxContacts + 4 tail pad), so paramAlign gives it 8-byte alignment and it lands at @24
 //   -> 80-byte blob.  The launch is 2D in the GRID (x = SB_SBMIDPHASE = 1024,
 //   y = nbActiveSelfCollisionSoftbodies); the bridge forwards both.
@@ -764,7 +770,7 @@ static const uint8_t kSbSelfCollisionMidphase[] = { 8, 8, 8, 56 };
 // gpunarrowphase softbody-vs-SOFTBODY midphase (P8.9) — the WHOLE softbody-vs-softbody
 // narrowphase, one kernel:
 //   sb_sbMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
-//   bounds*, contactDistance*, gpuShapes*, softbodies*, PxgSoftBodyContactWriter writer)
+//   bounds*, contactDistance*, gpuShapes*, softbodies*, PxgDbDbContactWriter writer) (5.12)
 //   -- launch site PxgNarrowphaseCore.cpp:4443.  PxReal @0, six pointers realigned to
 //   @8..@48, then the 56-byte writer (paramAlign 8) at @56 -> 112-byte blob.
 //   The launch is 3D in the GRID (x = SB_SBMIDPHASE = 1024, y = numTests, z = 2); the bridge
@@ -782,12 +788,12 @@ static const uint8_t kSbMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 // gpunarrowphase softbody-vs-TRIANGLE-MESH contact gen (P8.10 step 2):
 //   sb_meshContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
 //   contactDistance*, restDistance*, gpuShapes*, softbodies*, shapeToRigidRemapTable*,
-//   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, filterPairs*, PxU32 nbFilterPairs,
-//   stackSizeNeededOnDevice*, PxgFEMContactWriter writer) -- launch site
-//   PxgNarrowphaseCore.cpp:5130.  This is BYTE-IDENTICAL to sb_primitiveContactGenLaunch's
-//   pack: same fifteen arguments, same order, same sizes -> the same 192-byte blob.  Kept as
-//   its own row rather than aliased, so a future divergence upstream shows up here.
-static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
+//   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, stackSizeNeededOnDevice*,
+//   PxgRigidDbContactWriter writer) -- 5.12.  This is BYTE-IDENTICAL to
+//   sb_primitiveContactGenLaunch's pack: same thirteen arguments, same order, same sizes ->
+//   the same 176-byte blob.  Kept as its own row rather than aliased, so a future divergence
+//   upstream shows up here.
+static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
 
 // gpunarrowphase softbody-vs-HEIGHTFIELD contact gen (P9.81 step 2):
 //   sb_heightfieldContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
@@ -862,14 +868,13 @@ static const uint8_t kClothStep[] = { 8, 8, 4, 12, 1, 1, 1, 8, 8, 8 };
 // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase, both entry points (P8.16):
 //   cloth_differentClothCollision{VT,EE}Launch(PxU32 maxContacts, PxReal toleranceLength,
 //   cmInputs*, transformCache*, contactDistance*, gpuShapes*, femClothes*,
-//   PxgNonRigidFilterPair* clothClothPairs, PxU32 numClothClothPairs,
-//   const PxU8* updateContactPairs, PxgFemFemContactInfo* outContactInfo,
-//   PxU32* totalContactCount) -- launch site PxgFEMClothCore.cpp:768.  Two 4-byte scalars
-//   pack at @0/@4, six pointers @8..@48, PxU32 @56, then a pointer realigned to @64 and two
-//   more -> 88-byte blob.  NOT the self-collision pack (kClothSelfCollision, 72 bytes): this
-//   one is narrowphase-driven (cmInputs/transformCache/gpuShapes instead of activeClothes)
-//   and carries toleranceLength.
-static const uint8_t kClothDifferentCloth[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8 };
+//   const PxU8* updateContactPairs, PxgDeformablePairInfo* outContactInfo,
+//   PxU32* totalContactCount) -- 5.12 (the clothClothPairs / numClothClothPairs arguments
+//   are gone).  Two 4-byte scalars pack at @0/@4, eight pointers @8..@64 -> 72-byte blob.
+//   NOT the self-collision pack (kClothSelfCollisionMidphase, 56 bytes): this one is
+//   narrowphase-driven (cmInputs/transformCache/gpuShapes instead of activeClothes) and
+//   carries toleranceLength.
+static const uint8_t kClothDifferentCloth[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8 };
 
 // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1):
 //   cloth_meshMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
@@ -884,13 +889,14 @@ static const uint8_t kClothMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH contact gen (P8.17 step 2):
 //   cloth_meshContactGenLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   contactDistance*, restDistance*, gpuShapes*, femClothes*, shapeToRigidRemapTable*,
-//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*, filterPairs*, PxU32 nbFilterPairs,
-//   stackSizeNeededOnDevice*, PxgFEMContactWriter writer) -- launch site
-//   PxgNarrowphaseCore.cpp:6671.  NOT kSbMeshContactGen's pack, even though both are 192 bytes
-//   and both end in an 80-byte writer: there stackSizeBytes sits at @80 AFTER the two stack
-//   pointers, here it sits at @64 BEFORE them.  Reading one with the other's layout hands the
-//   kernel a byte count where a device pointer belongs.
-static const uint8_t kClothMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 80 };
+//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*, stackSizeNeededOnDevice*,
+//   PxgRigidDbContactWriter writer) -- 5.12 (the filterPairs / nbFilterPairs pair is gone).
+//   NOT kSbMeshContactGen's pack, even though both end in an 80-byte writer: there
+//   stackSizeBytes sits AFTER the two stack pointers, here it sits at @64 BEFORE them.
+//   Reading one with the other's layout hands the kernel a byte count where a device pointer
+//   belongs.  The writer lands at @96 (16-aligned) -> 176-byte blob.  Byte-identical to
+//   kClothMeshVertContactGen in 5.12, and kept as its own row like the other twins.
+static const uint8_t kClothMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 80 };
 
 // gpunarrowphase cloth-VERTEX-vs-COOKED-TRIANGLE-MESH midphase (P9.26):
 //   cloth_midphaseVertexMeshLaunch(PxU32 numWorkItems, PxReal tolerenceLength, cmInputs*,
@@ -916,39 +922,55 @@ static const uint8_t kClothPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 }
 // femClothes is, so the row is identical -- 88 bytes.  Kept as its own array rather
 // than aliased: two kernels sharing one row is how a later divergence goes unnoticed.
 static const uint8_t kSbPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
-// sb_psContactGenLaunch (softbodyPrimitives.cu:2086).  Deliberately NOT aliased to any
-// existing row: the by-value PxgFEMContactWriter tail (80 B) takes alignment 16
-// (PxgVulkanCudaContext.cpp:93-101), so the blob is 192 and not the 184 a naive sum of
-// the parts gives.
-static const uint8_t kSbPsContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8, 8, 80 };
-// sb_particleContactPrepareLaunch (softBody.cu:844): ten pointers, byte-identical to the
+// sb_psContactGenLaunch (softbodyPrimitives.cu, 5.12): twelve arguments (restDistances
+// and the filter pair arguments are gone), ending in the 72-byte
+// PxgParticleDbContactWriter (paramAlign 8) at @88 -> 160-byte blob.  Byte-identical to
+// kClothPsCg, kept as its own row.
+static const uint8_t kSbPsContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 72 };
+// sb_particleContactPrepareLaunch (softBody.cu, 5.12): ten pointers, byte-identical to the
 // cloth twin's blob -- deliberately its own row rather than an alias, because the two
 // kernels are free to diverge and an alias would hide it.
 static const uint8_t kSbPsPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
-// sb_solveOutputSPDeltaVLaunch (softBody.cu:1149) and
-// sb_solveOutputParticleDeltaVLaunch (:1286).  Both carry a PxReal between pointers, so
-// each has a 4-byte hole the natural sum does not show: 64 and 72, not 60 and 68.
-static const uint8_t kSbPsSolveSb[] = { 8, 8, 8, 8, 8, 8, 4, 8 };
-static const uint8_t kSbPsSolvePs[] = { 8, 8, 8, 8, 8, 8, 8, 4, 8 };
-// P9.30: the contact gen it feeds.  Thirteen arguments, the last of them
-// PxgFEMContactWriter by value (80 B) -> the writer lands at 96, not 88, because
-// paramAlign(80) is 16 (P9.15e).
-static const uint8_t kClothPsCg[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 80 };
-// P9.31: the three SOLVE-side kernels of the same chain.  All pointers, so the
-// rows are plain -- but they are three DIFFERENT lengths and are not aliased:
-// the prepare takes ten, the cloth-side solve seven, and the particle-side solve
-// eight (deltaP is inserted before appliedForces).
+// sb_querySBParticleContactReferenceCountLaunch (new in 5.12): (PxgSoftBody*,
+// PxgParticleSystem*, PxgDeformablePairInfo*, PxgParticleDbContactBlock*, PxU32* numContacts,
+// const PxReal dt, bool isVelocityIteration) -> dt @40, bool @44 -> 48-byte blob.
+static const uint8_t kSbPsQuery[] = { 8, 8, 8, 8, 8, 4, 1 };
+// sb_solveOutputSPDeltaVLaunch (5.12): (softbodies, particlesystems, contactInfos,
+// contactBlocks, numContacts, float2* appliedForces, PxReal dt,
+// PxsDeformableVolumeMaterialData* materials, bool isVelocityIteration) -> dt @48,
+// materials @56, bool @64 -> 72 bytes.  sb_solveOutputParticleDeltaVLaunch (5.12) has
+// float4* deltaP before appliedForces -> dt @56, materials @64, bool @72 -> 80 bytes.
+static const uint8_t kSbPsSolveSb[] = { 8, 8, 8, 8, 8, 8, 4, 8, 1 };
+static const uint8_t kSbPsSolvePs[] = { 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
+// P9.30: the contact gen it feeds.  5.12: twelve arguments (restDistances is gone), the
+// last of them PxgParticleDbContactWriter by value (72 B, paramAlign 8): PxReal @0, six
+// pointers @8..@48, PxU32 stackSizeBytes @56, three pointers @64..@80, the writer @88
+// -> 160-byte blob.
+static const uint8_t kClothPsCg[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 72 };
+// P9.31 / 5.12: the consumer kernels of the same chain, four DIFFERENT packs, not aliased.
+// cloth_particleContactPrepareLaunch(clothes, particlesystems, contacts, normalPens,
+// barycentrics, PxgDeformablePairInfo*, numContacts, PxgParticleDbContactBlock*,
+// float2* clothAppliedForces, float2* particleAppliedForces): ten pointers, 80 bytes.
 static const uint8_t kClothPsPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
-static const uint8_t kClothPsSolveCloth[] = { 8, 8, 8, 8, 8, 8, 8 };
-static const uint8_t kClothPsSolveParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8 };
+// cloth_queryCPContactReferenceCountLaunch (new in 5.12): (clothes, particlesystems,
+// contactInfos, contactBlocks, numContacts, const PxReal dt, bool isVelocityIteration) ->
+// dt @40, bool @44 -> 48 bytes (the softbody twin's pack, kept as its own row).
+static const uint8_t kClothPsQuery[] = { 8, 8, 8, 8, 8, 4, 1 };
+// cloth_solveCPOutputClothDeltaVLaunch (5.12): (clothes, particlesystems, contactInfos,
+// contactBlocks, numContacts, float2* appliedForces, PxsDeformableSurfaceMaterialData*
+// materials, const PxReal dt, bool isVelocityIteration) -> dt @56, bool @60 -> 64 bytes.
+// NOT the softbody pack: the cloth puts materials BEFORE dt.  The particle-side solve
+// inserts float4* deltaP before appliedForces -> dt @64, bool @68 -> 72 bytes.
+static const uint8_t kClothPsSolveCloth[] = { 8, 8, 8, 8, 8, 8, 8, 4, 1 };
+static const uint8_t kClothPsSolveParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 1 };
 
 // gpunarrowphase cloth-VERTEX-vs-COOKED-TRIANGLE-MESH contact gen (P9.26):
 //   cloth_meshVertexContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
 //   contactDistance*, restDistance*, gpuShapes*, femClothes*, shapeToRigidRemapTable*,
 //   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*, stackSizeNeededOnDevice*,
-//   PxgFEMContactWriter writer) -- launch site PxgNarrowphaseCore.cpp:6814.  NOT
-//   kClothMeshContactGen: the triangle sibling carries a filter pair buffer and its count
-//   (@96/@104) that this one does not, so the writer lands at @96 here and @112 there.
+//   PxgRigidDbContactWriter writer) -- launch site PxgNarrowphaseCore.cpp.  In 5.6.1 the
+//   triangle sibling (kClothMeshContactGen) carried a filter pair buffer and its count that
+//   this one did not; 5.12 removed them, and the two packs now coincide.
 //   4 @0, seven pointers @8..@56, PxU32 @64, three pointers @72/@80/@88, then the 80-byte
 //   writer by value.  Its paramAlign is 16 (P9.15e), and @96 is already 16-aligned, so
 //   nothing moves -- recorded because the next by-value tail will have to check it again.
@@ -977,12 +999,13 @@ static const uint8_t kClothHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4 };
 //   cloth_heightfieldContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
 //   contactDistance*, restDistance*, gpuShapes*, clothes*, shapeToRigidRemapTable*,
 //   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, stackSizeNeededOnDevice*,
-//   PxgFEMContactWriter writer) -- launch site PxgNarrowphaseCore.cpp:7006.
+//   PxgRigidDbContactWriter writer) -- launch site PxgNarrowphaseCore.cpp (5.12: unchanged
+//   shape; the writer type changed, at the same 80 bytes).
 //   4 @0, nine pointers @8..@72, PxU32 @80, a pointer @88, then the 80-byte writer at
 //   @96 (already 16-aligned, so paramAlign moves nothing) -> 176-byte blob.
 //
-//   NOT kClothMeshContactGen, though both end in a writer: that pack carries
-//   filterPairs and nbFilterPairs which this one does not, so its writer lands at @112.
+//   NOT kClothMeshContactGen, though both end in a writer and both are 176 bytes: there
+//   stackSizeBytes sits at @64 BEFORE the two stack pointers.
 static const uint8_t kClothHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
 
 // gpunarrowphase cloth-VERTEX-vs-HEIGHTFIELD contact gen, the DISABLED one (P9.27b):
@@ -999,26 +1022,34 @@ static const uint8_t kClothHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8
 //   difference is read rather than diffed.
 static const uint8_t kClothHfVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 80, 4, 8 };
 
-// gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19):
-//   femAttachmentPrepareLaunch(PxgFEMFEMAttachment* femAttachments, PxU32* activeFemAttachments,
-//   PxU32 numFemAttachments, PxgFEMFEMAttachmentConstraint* attachmentConstraints) -- launch
-//   site PxgSoftBodyCore.cpp:2100.  8 @0, 8 @8, PxU32 @16, then a pointer realigned to @24
-//   -> 32-byte blob.
+// gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19), PhysX 5.12:
+//   femAttachmentPrepareLaunch(PxgDeformableAttachment* femAttachments,
+//   PxU32* activeFemAttachments, PxU32 numFemAttachments, PxgDbDbAttachmentBlock* attachmentBlocks)
+//   -- launched by both the softbody and the cloth core.  8 @0, 8 @8, PxU32 @16, then a
+//   pointer realigned to @24 -> 32-byte blob.
 static const uint8_t kFemAttachPrep[] = { 8, 8, 4, 8 };
+//   cloth_solveOutputAttachmentClothClothDeltaVLaunch(PxgFEMCloth* clothes,
+//   PxgDbDbAttachmentBlock* attachmentBlocks, const PxU32 numAttachments, const PxReal dt,
+//   const bool isVelocityIteration) -- PhysX 5.12 (the 5.6.1 kFemAttachSolve {8,8,4} row is
+//   gone).  PxU32 @16, PxReal @20, bool @24 -> 32 bytes.
+static const uint8_t kClothClothAttachSolve[] = { 8, 8, 4, 4, 1 };
+//   cloth_queryClothClothAttachmentReferenceCountLaunch(PxgFEMCloth* clothes,
+//   PxgDbDbAttachmentBlock* attachmentBlocks, const PxU32 numAttachments) (new in 5.12)
+//   -> PxU32 @16 -> 24 bytes.
+static const uint8_t kClothClothAttachQuery[] = { 8, 8, 4 };
 //   sb_solveOutputSoftBodyAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
-//   PxgFEMFEMAttachmentConstraint* attachments, PxU32 numAttachments) -- launch site
-//   PxgSoftBodyCore.cpp:1921.  8 @0, 8 @8, PxU32 @16 -> 24-byte blob.
-//   P9.32: cloth_solveOutputAttachmentClothClothDeltaVLaunch(PxgFEMCloth* clothes,
-//   PxgFEMFEMAttachmentConstraint* attachments, const PxU32 numAttachments) -- launch site
-//   PxgFEMClothCore.cpp:1915 -- has the SAME three-argument signature down to the types'
-//   sizes, so it shares this row rather than duplicating it.
-static const uint8_t kFemAttachSolve[] = { 8, 8, 4 };
-//   P9.33c: sb_solveOutputClothAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
-//   PxgFEMCloth* clothes, PxgFEMFEMAttachmentConstraint* attachments, PxU32 numAttachments)
-//   -- launch site PxgSoftBodyCore.cpp:2005.  FOUR arguments: 8 @0, 8 @8, 8 @16, PxU32 @24
-//   -> 32-byte blob.  It canNOT share kFemAttachSolve above: `clothes` occupies the slot that
-//   row keeps `attachments` in, so reusing it yields a plausible pointer rather than a fault.
-static const uint8_t kClothSbAttachSolve[] = { 8, 8, 8, 4 };
+//   PxgDbDbAttachmentBlock* attachmentBlocks, const PxU32 numAttachments, const PxReal dt,
+//   const bool isVelocityIteration) -- PhysX 5.12.  PxU32 @16, PxReal @20, bool @24 -> 32 bytes.
+static const uint8_t kSbFemAttachSolve[] = { 8, 8, 4, 4, 1 };
+//   sb_queryClothAttachmentReferenceCountLaunch(PxgSoftBody*, PxgFEMCloth*,
+//   PxgDbDbAttachmentBlock*, const PxU32 numAttachments) (new in 5.12) -> PxU32 @24 -> 32 bytes.
+static const uint8_t kSbClothAttachQuery[] = { 8, 8, 8, 4 };
+//   sb_solveOutputClothAttachmentDeltaVLaunch(PxgSoftBody* softbodies, PxgFEMCloth* clothes,
+//   PxgDbDbAttachmentBlock* attachmentBlocks, PxU32 numAttachments, const PxReal dt,
+//   const bool isVelocityIteration) -- PhysX 5.12.  PxU32 @24, PxReal @28, bool @32 -> 40
+//   bytes.  It canNOT share a two-pointer row: `clothes` occupies the slot the softbody row
+//   keeps `attachmentBlocks` in, so reusing it yields a plausible pointer rather than a fault.
+static const uint8_t kClothSbAttachSolve[] = { 8, 8, 8, 4, 4, 1 };
 
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
@@ -1030,11 +1061,10 @@ static const uint8_t kSbClothMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
 // sb_clothContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
 //   contactDistance*, gpuShapes*, softbodies*, clothes*, stackPtr*, midphasePairsNum*,
-//   PxU32 stackSizeBytes, PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs,
-//   stackSizeNeededOnDevice*, PxgSoftBodyContactWriter writer) -> 4 @0, eight pointers
-//   @8..@64, PxU32 @72, a pointer realigned to @80, PxU32 @88, a pointer at @96, then the
-//   56-byte writer at @104 -> 160-byte blob.
-static const uint8_t kSbClothContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 56 };
+//   PxU32 stackSizeBytes, stackSizeNeededOnDevice*, PxgDbDbContactWriter writer) (5.12: the
+//   filter pair arguments are gone) -> 4 @0, eight pointers @8..@64, PxU32 @72, a pointer
+//   realigned to @80, then the 56-byte writer at @88 -> 144-byte blob.
+static const uint8_t kSbClothContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 56 };
 
 // sb_clothVertMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1046,45 +1076,55 @@ static const uint8_t kSbClothVertMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8,
 
 // sb_clothVertContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
 //   contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes, stackPtr*,
-//   midphasePairsNum*, PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs,
-//   stackSizeNeededOnDevice*, PxgSoftBodyContactWriter writer) -> 4 @0, six pointers @8..@48,
-//   PxU32 @56, pointers @64/@72/@80, PxU32 @88, a pointer @96, the 56-byte writer at @104 ->
-//   160-byte blob.  SAME SIZE and SAME argument count as kSbClothContactGen, but
+//   midphasePairsNum*, stackSizeNeededOnDevice*, PxgDbDbContactWriter writer) (5.12) ->
+//   4 @0, six pointers @8..@48, PxU32 @56, pointers @64/@72/@80, the 56-byte writer at @88
+//   -> 144-byte blob.  SAME SIZE and SAME argument count as kSbClothContactGen, but
 //   stackSizeBytes sits BEFORE the stack pointer here and after midphasePairsNum there.
-static const uint8_t kSbClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 56 };
+static const uint8_t kSbClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 56 };
 
 // sb_clothContactPrepareLaunch(softbodies*, clothes*, normalPens*, barycentrics0*,
-//   barycentrics1*, contactInfos*, numContacts*, constraints*, lambdaNs*, PxU32 maxContacts,
-//   softbodyMaterials*, clothMaterials*) -> nine pointers @0..@64, PxU32 @72, pointers
-//   realigned to @80 and @88 -> 96-byte blob.
-static const uint8_t kSbClothContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+//   barycentrics1*, contactInfos*, numContacts*, contactBlocks*, float2* appliedForces,
+//   PxU32 maxContacts) -- PhysX 5.12 (the material pointers are gone) -> nine pointers
+//   @0..@64, PxU32 @72 -> 80-byte blob.
+static const uint8_t kSbClothContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
 
-// sb_solveOutputSCDeltaVLaunch(softbodies*, clothes*, contactInfos*, constraints*,
-//   numContacts*, lambdaNs*) -> six pointers, 48-byte blob.
-static const uint8_t kSbClothSolve[] = { 8, 8, 8, 8, 8, 8 };
+// sb_querySCContactReferenceCountLaunch(softbodies*, clothes*, contactInfos*, barycentrics0*,
+//   barycentrics1*, contactBlocks*, numContacts*, PxReal dt, bool isVelocityIteration)
+//   (new in 5.12) -> seven pointers, dt @56, bool @60 -> 64-byte blob.
+static const uint8_t kSbClothQuery[] = { 8, 8, 8, 8, 8, 8, 8, 4, 1 };
+
+// sb_solveOutputSCDeltaVLaunch(softbodies*, clothes*, contactInfos*, barycentrics0*,
+//   barycentrics1*, contactBlocks*, numContacts*, PxReal dt, float2* appliedForces,
+//   sbMaterials*, clothMaterials*, bool isVelocityIteration) -- PhysX 5.12 -> seven pointers,
+//   dt @56, pointers @64/@72/@80, bool @88 -> 96-byte blob.
+static const uint8_t kSbClothSolve[] = { 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 1 };
 
 // gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
 // tranche b):
-//   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
-//     float4* outBarycentric1, PxgFemFemContactInfo* outContactInfo, PxU32* totalContactCount,
-//     PxU32* prevContactCount, const PxU32 maxNbContacts)  -- launch site
-//   PxgNarrowphaseCore.cpp:4166.  Six device pointers @0..40 and a PxU32 @48 -> 56-byte
-//   blob.  The launch is 2D in the GRID: gridDim.y == 2 selects which half of the pair is
-//   remapped (1 for cloth-vs-softbody).
-static const uint8_t kSbFemContactRemapToSim[] = { 8, 8, 8, 8, 8, 8, 4 };
+//   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, const float4* point,
+//     float4* outBarycentric0, float4* outBarycentric1, PxgDeformablePairInfo* outContactInfo,
+//     PxU32* totalContactCount, PxU32* prevContactCount, const PxU32 maxNbContacts)  -- 5.12
+//   (the `point` stream is new).  Seven device pointers @0..48 and a PxU32 @56 -> 64-byte
+//   blob.  The launch is 2D in the GRID: gridDim.y == 2 for a volume-volume pair (row 1
+//   remaps side 0 by lookup, row 0 side 1 by search), 1 for cloth-vs-softbody.
+static const uint8_t kSbFemContactRemapToSim[] = { 8, 8, 8, 8, 8, 8, 8, 4 };
 //   sb_softbodyContactPrepareLaunch(PxgSoftBody*, float4* contacts, float4* normalPens,
-//     float4* barycentrics0, float4* barycentrics1, PxgFemFemContactInfo* contactInfos,
-//     PxU32* numContacts, PxgSoftBodySoftBodyConstraintBlock* constraints,
-//     float2* softBodyAppliedForces, const PxU32 maxContacts)  -- launch site
-//   PxgSoftBodyCore.cpp:2547.  Nine device pointers @0..64 and a PxU32 @72 -> 80-byte blob.
+//     float4* barycentrics0, float4* barycentrics1, PxgDeformablePairInfo* contactInfos,
+//     PxU32* numContacts, PxgDbDbContactBlock* contactBlocks,
+//     float2* softBodyAppliedForces, const PxU32 maxContacts)  -- PhysX 5.12.  Nine device
+//   pointers @0..64 and a PxU32 @72 -> 80-byte blob.
 static const uint8_t kSbSsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
-//   sb_solveOutputSSDeltaVLaunch{,TGS}(PxgSoftBody*, PxgFemFemContactInfo*,
-//     PxgSoftBodySoftBodyConstraintBlock*, PxU32* numContacts, const PxReal dt,
-//     const PxReal biasCoefficient, float2* appliedForces,
-//     PxsDeformableVolumeMaterialData* materials)  -- launch site PxgSoftBodyCore.cpp:1636.
-//   Four device pointers @0..24, two PxReal at @32/@36, two more pointers realigned to
-//   @40/@48 -> 56-byte blob.
-static const uint8_t kSbSolveOutputSSDeltaV[] = { 8, 8, 8, 8, 4, 4, 8, 8 };
+//   sb_querySSContactReferenceCountLaunch(PxgSoftBody*, PxgDeformablePairInfo* contactInfos,
+//     const float4* barycentrics0, const float4* barycentrics1, PxgDbDbContactBlock*,
+//     PxU32* numContacts, const PxReal dt, bool isVelocityIteration)  (new in 5.12) -> six
+//   pointers, dt @48, bool @52 -> 56-byte blob.
+static const uint8_t kSbSsQuery[] = { 8, 8, 8, 8, 8, 8, 4, 1 };
+//   sb_solveOutputSSDeltaVLaunch(PxgSoftBody*, PxgDeformablePairInfo* contactInfos,
+//     const float4* barycentrics0, const float4* barycentrics1, PxgDbDbContactBlock*,
+//     PxU32* numContacts, const PxReal dt, float2* appliedForces,
+//     PxsDeformableVolumeMaterialData* materials, bool isVelocityIteration)  -- PhysX 5.12,
+//   one kernel for PGS and TGS.  Six pointers, dt @48, pointers @56/@64, bool @72 -> 80 bytes.
+static const uint8_t kSbSolveOutputSSDeltaV[] = { 8, 8, 8, 8, 8, 8, 4, 8, 8, 1 };
 
 // gpusimulationcontroller softbody CO-ROTATED STRESS FIELD (P8.5):
 //   sb_calculateStressLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
@@ -1093,38 +1133,32 @@ static const uint8_t kSbSolveOutputSSDeltaV[] = { 8, 8, 8, 8, 4, 4, 8, 8 };
 //   (x = ceil(maxTetrahedrons / 256), y = the active softbodies); the bridge forwards both.
 static const uint8_t kSbCalculateStress[] = { 8, 8, 8 };
 
-// gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE (P8.2 tranche d):
+// gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE, PhysX 5.12:
 //   sb_rigidContactPrepareLaunch(PxgSoftBody* softbodies, float4* contacts_restW,
-//     float4* normalPens, float4* barycentrics, PxgFemOtherContactInfo* contactInfos,
-//     PxU32* numContacts, PxgFemRigidConstraintBlock* primitiveConstraints,
-//     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc,
-//     PxReal* rigidAppliedForces, PxReal invDt, PxgSolverSharedDescBase* sharedDesc,
-//     bool isTGS)  -- launch site PxgSoftBodyCore.cpp:2242.  Ten device pointers +
-//   PxReal (@80) + device pointer (@88) + bool (@96) -> natural-alignment blob = 104 bytes.
-//   BYTE-IDENTICAL to kClothRigidContactPrep: the two CUDA argument packs differ only in
-//   argument 0's pointee type (PxgSoftBody vs PxgFEMCloth), which is 8 bytes either way.
-//   Kept as its own row rather than aliased, so a future divergence in either kernel's
-//   signature cannot silently corrupt the other's blob.
+//     float4* normalPens, float4* barycentrics, PxgDeformablePairInfo* contactInfos,
+//     PxU32* numContacts, PxgRigidDbContactBlock* contactBlocks, PxgPrePrepDesc* preDesc,
+//     PxgConstraintPrepareDesc* prepareDesc, float2* rigidAppliedForces, PxReal invDt,
+//     PxgSolverSharedDescBase* sharedDesc, bool isTGS).  Ten device pointers + PxReal (@80)
+//   + device pointer (@88) + bool (@96) -> natural-alignment blob = 104 bytes.  Kept as its
+//   own row rather than aliased onto the cloth prepare's.
 static const uint8_t kSbRigidContactPrep[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
-// gpusimulationcontroller softbody-vs-rigid COLLISION SOLVE (P8.2 tranche e):
-//   sb_queryRigidSoftContactReferenceCountLaunch{,TGS}(PxgSoftBody* softbodies,
-//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
-//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
-//     PxReal* appliedForces, PxU32* rigidBodyReferenceCounts)  -- launch site
-//   PxgSoftBodyCore.cpp:1766 (PGS and TGS share the pack).  Eight device pointers + PxReal
-//   (@64) + two device pointers (@72/@80) -> natural-alignment blob = 88 bytes.
-static const uint8_t kSbRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
-//   sb_solveRigidSoftCollisionLaunch{,TGS}(... the query pack with float4* rigidDeltaVel
-//     inserted at @64, then PxReal dt, PxsDeformableVolumeMaterialData* materials,
-//     const PxsMaterialData* rigidBodyMaterials)  -- launch site PxgSoftBodyCore.cpp:1050
-//   (PGS and TGS share the pack).  Eleven device pointers + PxReal (@88) + two device
-//   pointers (@96/@104) -> natural-alignment blob = 112 bytes.
-//   Both rows are byte-identical to their cloth counterparts (kClothRigidContactQuery /
-//   kClothRigidContactSolve): the CUDA packs differ only in argument 0's pointee type and,
-//   for the solve, the deformable material type -- 8 bytes either way.  Kept separate so a
-//   future divergence in either signature cannot silently corrupt the other's blob.
-static const uint8_t kSbRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+// gpusimulationcontroller softbody-vs-rigid COLLISION SOLVE, PhysX 5.12 (one kernel each for
+// PGS and TGS; the velocity reader takes solverBodyVelPool instead of the shared desc):
+//   sb_queryRigidSoftContactReferenceCountLaunch(PxgSoftBody*, PxgDeformablePairInfo*,
+//     const float4* barycentrics, PxgRigidDbContactBlock*, PxU32* numContacts,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*, float4* solverBodyVelPool,
+//     const PxReal dt, float2* appliedForces, PxU32* rigidBodyRefCounts, bool isTGS,
+//     bool isVelocityIteration) -> nine pointers, dt @72, pointers @80/@88, bools @96/@97
+//   -> 104 bytes.
+static const uint8_t kSbRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 1, 1 };
+//   sb_solveRigidSoftCollisionLaunch(PxgSoftBody*, PxgDeformablePairInfo*,
+//     const PxU16* contactRigidMaterials, const float4* barycentrics, PxgRigidDbContactBlock*,
+//     PxU32* numContacts, PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
+//     float4* solverBodyVelPool, float4* rigidDeltaVel, float2* appliedForces,
+//     PxU32* rigidBodyRefCounts, const PxReal dt, PxsDeformableVolumeMaterialData* materials,
+//     const PxsMaterialData* rigidBodyMaterials, bool isTGS, bool isVelocityIteration)
+//   -> thirteen pointers, dt @104, pointers @112/@120, bools @128/@129 -> 136 bytes.
+static const uint8_t kSbRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 1, 1 };
 
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
@@ -1151,17 +1185,19 @@ static const uint8_t kPsReorder[] = { 8, 4 };
 //   PxU32 by value) -> {8,4}; reuses kPsReorder (identical shape).
 //   ps_solveOneWayContactDeltaVLaunch(PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems, PxReal invDt, PxReal dt,
-//     PxReal biasCoefficient, bool isVelocityIteration) — one-way contact solve.
-//   Launch site PxgParticleSystemCore.cpp:1359 -> {8,8,4,4,4,1} = 32-byte blob
-//   (bool at @28).
-static const uint8_t kPsSolveOneWay[] = { 8, 8, 4, 4, 4, 1 };
+//     bool isVelocityIteration) — one-way contact solve.  PhysX 5.12 dropped the
+//   PxReal biasCoefficient (5.6.1: {8,8,4,4,4,1}).  Launch site
+//   PxgParticleSystemCore.cpp solveOneWayCollision -> {8,8,4,4,1} = 25 data bytes,
+//   rounded to the 8-align -> 32-byte blob (bool at @24).
+static const uint8_t kPsSolveOneWay[] = { 8, 8, 4, 4, 1 };
 //   ps_applyDeltaLaunch(PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems, PxReal dt) — SOR-average mDelta into
 //   mAccumDeltaP.  Launch site PxgParticleSystemCore.cpp:1526 -> {8,8,4};
 //   reuses kPsUpdateUserBuffer (identical shape).
 //   ps_updateParticleLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems, PxReal invDt,
-//     bool skipNewPositionAdjustment) — apply accumDeltaP + recompute velocity.
+//     bool isVelocityIteration) — apply accumDeltaP + recompute velocity (5.12
+//     renamed skipNewPositionAdjustment; same pack).
 //   Launch site PxgParticleSystemCore.cpp:1568 -> {8,8,4,1} = 24-byte blob
 //   (bool at @20).
 static const uint8_t kPsUpdateParticle[] = { 8, 8, 4, 1 };
@@ -1204,12 +1240,12 @@ static const uint8_t kPsPrimBound2[] = { 4, 8, 8, 8 };
 //     const PxReal* restDistances, const PxsMaterialData* materials,
 //     const PxU32* startIndices, const PxU32* totalNumPairs,
 //     PxgParticleSystem* particleSystems, const PxNodeIndex* shapeToRigidRemapTable,
-//     PxgParticleContactWriter writer) — the writer is passed BY VALUE (8 device
-//   pointers + PxU32 maxContacts + 4B tail pad = 72 bytes, sizeof =
-//   sizeof(PxgParticleContactWriter)).  Launch site PxgNarrowphaseCore.cpp:3225.
-//   Natural-alignment blob (bool @0, u32 @4, f32 @8, first ptr @16, writer @104)
-//   -> {1,4,4,8x11,72} = 176-byte blob.
-static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 72 };
+//     PxgRigidParticleContactWriter writer) — PhysX 5.12: the writer is passed BY
+//   VALUE (9 device pointers + PxU32 maxContacts + 4B tail pad = 80 bytes,
+//   sizeof(PxgRigidParticleContactWriter), PxgParticleSystem.h).
+//   Blob: bool @0, u32 @4, f32 @8, first ptr @16, paramAlign(80) = 16 puts the
+//   writer at @112 -> {1,4,4,8x11,80} = 192-byte blob.
+static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase cudaParticleSystem.cu:1324 (P9.13g) -- the DIFFUSE twin of the
 // row above.  Identical 14-argument head and NO writer: the diffuse path writes
@@ -1219,17 +1255,15 @@ static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 //   Launch site PxgNarrowphaseCore.cpp:3300, grid (1024,1,1) block (256,1,1).
 static const uint8_t kPsPrimDiffuseCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
-// gpunarrowphase cudaParticleSystem.cu:1470 (P9.14b) -- the particle-vs-CONVEX
-// contact generator.  Same 176-byte blob as kPsPrimCollide, but the engine
-// spells the writer out as EIGHT SEPARATE POINTER ARGUMENTS plus maxContacts
-// rather than passing PxgParticleContactWriter by value
-// (PxgNarrowphaseCore.cpp:3776-3803).  The byte LAYOUT is identical -- pointers
-// at 104..160, the u32 at 168 -- so the shader reads the same push-constant
-// struct; the row is spelled out because the table's job is to record the
-// engine's actual argument list.
-//   -> {1,4,4,8x19,4}
+// gpunarrowphase cudaParticleSystem.cu (P9.14b, PhysX 5.12) -- the particle-vs-CONVEX
+// contact generator.  The kPsPrimCollide head, then the contact outputs as SEPARATE
+// arguments rather than a writer: PxgDeformablePairInfo* particleContactInfos,
+// float4* particleContactNormalPens (the 5.12 SoA split of 5.6.1's one
+// PxgParticlePrimitiveContact*), numParticleContacts, the six sort arrays and
+// maxContacts.  Pointers at 104..168, the u32 at 176.
+//   -> {1,4,4,8x20,4} = 184-byte blob (psContactGenBda's PsConvexParams).
 static const uint8_t kPsConvexCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-                                            8, 8, 8, 8, 8, 8, 8, 8, 4 };
+                                            8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
 
 // gpunarrowphase particleSystemMeshMidphase.cu:775 (P9.10) — the particle-vs-
 // TRIANGLE-MESH midphase and contact generation:
@@ -1248,7 +1282,9 @@ static const uint8_t kPsConvexCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
 //   every later offset by four bytes.
 //   Launch site PxgNarrowphaseCore.cpp:3966: grid (PS_MESH_COLLISION = 16384,
 //   numTests, 2) x block (WARP_SIZE, PS_MIDPHASE_COLLISION_WAPRS_PER_BLOCK = 1, 1).
-static const uint8_t kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
+//   PhysX 5.12: the writer is PxgRigidParticleContactWriter (80 bytes, SoA pair info +
+//   normalPen); paramAlign(80) = 16 keeps it at @64 -> {1,4,8x7,80} = 144 bytes.
+static const uint8_t kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-HEIGHTFIELD
 // midphase + contact gen):
@@ -1265,7 +1301,8 @@ static const uint8_t kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 //   Launch site PxgNarrowphaseCore.cpp:4065: grid (PS_HEIGHTFIELD_COLLISION = 4096,
 //   numTests, 2) x block (PS_HEIGHTFIELD_COLLISION = 64, 1, 1) -- 64 threads, NOT a
 //   warp shape, unlike the mesh twin.
-static const uint8_t kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
+//   PhysX 5.12: the 80-byte PxgRigidParticleContactWriter at @64 -> 144 bytes.
+static const uint8_t kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase/src/CUDA/particleSystemMeshMidphase.cu:746 (P9.12h, the SDF
 // particle midphase + contact gen):
@@ -1282,23 +1319,21 @@ static const uint8_t kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 //   Launch site PxgNarrowphaseCore.cpp:3903: grid (numTests, 2, 1) x block
 //   (1024, 1, 1).  Note the grid shape is ALSO different from the two siblings',
 //   which put the pair on Y and the diffuse pass on Z; here the pair is on X.
-static const uint8_t kPsSdfCollide[] = { 4, 8, 8, 8, 8, 8, 8, 8, 72 };
+//   PhysX 5.12: the 80-byte PxgRigidParticleContactWriter at @64 -> 144 bytes.
+static const uint8_t kPsSdfCollide[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase/src/CUDA/femClothPrimitives.cu:2310 (P9.34c, the SDF CLOTH contact gen):
 //   cloth_sdfMeshContactGenLaunch(const PxU32 numWorkItems, const PxgContactManagerInput*,
 //     const PxsCachedTransform*, const PxReal* contactDistances, const PxReal* restDistances,
 //     const PxgShape*, const PxgFEMCloth*, const PxNodeIndex* shapeToRigidRemapTable,
-//     PxgRigidFilterPair* filterPairs, const PxU32 nbFilterPairs,
-//     PxgFEMContactWriter writer)
-//   The particle sibling above is the closest relative and STILL cannot share a row: it
-//   leads with a PxReal the kernel never reads where this one leads with a real PxU32
-//   count, it has no filter-pair pair, and its by-value writer is the PARTICLE writer at
-//   72 bytes rather than the FEM one at 80.  Two 4-byte scalars in different places and a
-//   writer of a different size -- reusing kPsSdfCollide would hand this kernel the filter
-//   list where the writer's first pointer belongs.
+//     PxgRigidDbContactWriter writer)   (5.12: the filter pair arguments are gone)
+//   The particle sibling above is the closest relative: it leads with a PxReal the kernel
+//   never reads where this one leads with a real PxU32 count, and its by-value writer is PxgRigidParticleContactWriter where this one's is
+//   PxgRigidDbContactWriter.  In 5.12 both writers are 80 bytes and both land at @64, so the
+//   two rows are byte-identical; they stay separate rows, like the other twins.
 //   Launch site PxgNarrowphaseCore.cpp:6507: grid (numTests, 1, 1) x block (1024, 1, 1) --
 //   ONE BLOCK per test, whatever the "each warp deal with one test" comment above it says.
-static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpunarrowphase/src/CUDA/softbodySoftbodyMidPhase.cu:1121 (P9.35c, the SDF
 // SOFTBODY midphase):
@@ -1306,8 +1341,7 @@ static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 
 //     const PxgContactManagerInput*, const PxsCachedTransform*, const PxBounds3*,
 //     const PxReal* contactDistance, const PxReal* restDistance, const PxgShape*,
 //     const PxgSoftBody*, const PxNodeIndex* shapeToRigidRemapTable,
-//     PxgRigidFilterPair* filterPairs, const PxU32 nbFilterPairs,
-//     PxgFEMContactWriter writer)
+//     PxgRigidDbContactWriter writer)   (5.12: the filter pair arguments are gone)
 //   The cloth sibling above is the nearest relative and cannot share a row: this
 //   one LEADS with a PxReal the kernel never reads where that one leads with a
 //   real PxU32 count, and it carries an extra `bounds` pointer -- also never read
@@ -1315,9 +1349,9 @@ static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 
 //   both of them still occupy their slots.
 //   Launch site PxgNarrowphaseCore.cpp:4886: grid (numTests, 1, 1) x block
 //   (1024, 1, 1) -- one block per test, and no count argument to guard against.
-//   P9.97b: blob 176 bytes, the writer at @96 -- paramAlign(80) = 16 after
-//   nbFilterPairs ends at @84.  The shader put it at its natural @88 until P9.97b.
-static const uint8_t kSbSdfMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+//   P9.97b / 5.12: blob 160 bytes, the writer at @80 -- paramAlign(80) = 16 after the
+//   eight pointers end at @72.  (5.6.1: 176 bytes, the writer at @96 after nbFilterPairs.)
+static const uint8_t kSbSdfMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 80 };
 
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
@@ -1335,64 +1369,85 @@ static const uint8_t kRadixDescNoCount[] = { 8, 4 };
 //   entirely on-device, so this row is shared.  Launched grid (RADIX_SORT, 2, 1).
 static const uint8_t kRadixDescPlain[] = { 8, 4 };
 
-// gpunarrowphase cudaParticleSystem.cu:1687 (P6.4b-1 contact reorder):
-//   ps_reorderPrimitiveContactsLaunch(const PxgParticlePrimitiveContact* particleContacts,
-//     const PxI32* numParticleContacts, const PxU32* remapByRigid, const PxU32* remapByParticle,
-//     PxgParticlePrimitiveContact* sortedContactsByRigid,
-//     PxgParticlePrimitiveContact* sortedContactsByParticle)
-//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.  Launch PxgParticleSystemCore.cpp:1302.
-static const uint8_t kPsReorderContacts[] = { 8, 8, 8, 8, 8, 8 };
+// gpunarrowphase cudaParticleSystem.cu (P6.4b-1 contact reorder, PhysX 5.12):
+//   ps_reorderPrimitiveContactsLaunch(const PxgDeformablePairInfo* particleContactInfos,
+//     const float4* particleContactNormalPens, const PxI32* numParticleContacts,
+//     const PxU32* remapByRigid, const PxU32* remapByParticle,
+//     PxgDeformablePairInfo* sortedContactInfosByRigid, float4* sortedContactNormalPensByRigid,
+//     PxgDeformablePairInfo* sortedContactInfosByParticle, float4* sortedContactNormalPensByParticle)
+//   -> 9 device pointers = 72-byte blob (the SoA split of 5.6.1's six-pointer row).
+static const uint8_t kPsReorderContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller particlesystem.cu:2277 (P6.4b-1 range-find pass 1):
+// gpusimulationcontroller particlesystem.cu (P6.4b-1 range-find pass 1, PhysX 5.12):
 //   ps_findStartEndParticleFirstLaunch(PxgParticleSystem* particleSystems,
-//     PxgParticlePrimitiveContact* sortedContacts, PxU32* numContacts,
+//     PxgDeformablePairInfo* sortedContactInfos, PxU32* numContacts,
 //     PxU32* blockOffsets, PxU32* offsets)
 //   -> 5 device pointers = {8,8,8,8,8} = 40-byte blob (particleSystems ABI-only,
 //   never dereferenced).  Launch PxgParticleSystemCore.cpp:1648.
 static const uint8_t kPsFindStartEnd1[] = { 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller particlesystem.cu:2402 (P6.4b-1 range-find pass 2):
-//   ps_findStartEndParticleSecondLaunch(PxgParticlePrimitiveContact* sortedContacts,
+// gpusimulationcontroller particlesystem.cu (P6.4b-1 range-find pass 2, PhysX 5.12):
+//   ps_findStartEndParticleSecondLaunch(PxgDeformablePairInfo* sortedContactInfos,
 //     PxU32* numContacts, PxU32* blockOffsets, PxU32* offsets, PxU32* totalNumPairs,
 //     PxU32* rangeStart, PxU32* rangeEnd)
 //   -> 7 device pointers = {8,8,8,8,8,8,8} = 56-byte blob.  Launch PxgParticleSystemCore.cpp:1690.
 static const uint8_t kPsFindStartEnd2[] = { 8, 8, 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller particlesystem.cu:1238 (P6.4b-2 contact constraint prep):
+// gpusimulationcontroller particlesystem.cu (P6.4b-2 contact constraint prep, PhysX 5.12):
 //   ps_contactPrepareLaunch(PxgParticleSystem* particleSystems,
-//     PxgParticlePrimitiveContact* sortedContacts, PxU32* numContacts,
-//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints,
+//     PxgDeformablePairInfo* sortedContactInfos, const float4* sortedContactNormalPens,
+//     PxU32* numContacts, PxgRigidParticleContactBlock* contactBlocks,
 //     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc,
 //     float2* appliedForces, PxReal dt, bool isTGS, float4* deltaVel,
 //     PxgSolverSharedDescBase* sharedDesc)
-//   -> {8,8,8,8,8,8,8,4,1,8,8} = 80-byte blob (dt@56, isTGS byte@60, deltaVel@64
-//   after the 8-align).  Launch PxgParticleSystemCore.cpp:1609.
-static const uint8_t kPsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 4, 1, 8, 8 };
+//   -> {8,8,8,8,8,8,8,8,4,1,8,8} = 88-byte blob (dt@64, isTGS byte@68, deltaVel@72
+//   after the 8-align).  Launches PxgParticleSystemCore.cpp prepPrimitiveConstraint
+//   (by rigid, with deltaVel) and PxgPBDParticleSystemCore.cpp prepParticleConstraint
+//   (by particle, deltaVel NULL).
+static const uint8_t kPsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 1, 8, 8 };
 
-// gpusimulationcontroller particlesystem.cu:1531 (P6.4b-2 particle-side PC solve,
-// the NON-TGS variant):
+// gpusimulationcontroller particlesystem.cu (NEW in PhysX 5.12, the PC mass-splitting
+// pre-count):
+//   ps_queryPCContactReferenceCountLaunch(PxgParticleSystem* particleSystems,
+//     PxgDeformablePairInfo* sortedContactInfos, PxgRigidParticleContactBlock* contactBlocks,
+//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     float4* solverBodyVelPool, PxU32* rigidRefCount, PxReal dt, bool isTGS,
+//     PxgArticulationCoreDesc* artiCoreDesc)
+//   -> {8,8,8,8,8,8,8,8,4,1,8} = 80-byte blob (dt@64, isTGS byte@68, artiCoreDesc@72).
+//   Launch PxgParticleSystemCore.cpp solvePrimitiveCollisionForParticles.
+static const uint8_t kPsQueryPCRefCount[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 1, 8 };
+
+// gpusimulationcontroller particlesystem.cu (P6.4b-2 particle-side PC solve, PhysX 5.12;
+// the TGS twin is folded into isTGS):
 //   ps_solvePCOutputParticleDeltaVLaunch(PxgParticleSystem* particleSystems,
-//     PxgParticlePrimitiveContact* sortedContacts,
-//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints, PxU32* numContacts,
-//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgSolverSharedDesc<IterativeSolveData>* sharedDesc, float4* deltaPos,
-//     float2* appliedForces, PxReal dt, PxReal relaxationCoefficient,
-//     bool isVelocityIteration, PxgArticulationCoreDesc* artiCoreDesc)
-//   -> {8,8,8,8,8,8,8,8,8,4,4,1,8} = 96-byte blob (dt@72, coeff@76, bool byte@80,
-//   artiCoreDesc@88).  Launch PxgParticleSystemCore.cpp:1948.
-static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1, 8 };
+//     PxgDeformablePairInfo* sortedContactInfos, PxgRigidParticleContactBlock* contactBlocks,
+//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     float4* solverBodyVelPool, float4* deltaPos, float2* appliedForces,
+//     PxU32* rigidRefCount, PxReal dt, bool isVelocityIteration, bool isTGS,
+//     PxgArticulationCoreDesc* artiCoreDesc)
+//   -> {8x10, 4, 1, 1, 8} = 96-byte blob (dt@80, isVelocityIteration byte@84, isTGS
+//   byte@85, artiCoreDesc@88).  ps_solvePCOutputRigidDeltaVLaunch takes the identical
+//   pack (deltaVel in the deltaPos slot).
+static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 1, 1, 8 };
 
-// gpusimulationcontroller particlesystem.cu:2828 (P6.4b-2 per-particle deltaV accum):
+// gpusimulationcontroller particlesystem.cu (P6.4b-2 per-particle deltaV accum, PhysX 5.12):
 //   ps_accumulateDeltaVParticleLaunch(PxgParticleSystem* particleSystems,
-//     PxgParticlePrimitiveContact* sortedContacts, PxU32* totalNumPairs,
+//     PxgDeformablePairInfo* sortedContactInfos, PxU32* totalNumPairs,
 //     PxU32* rangeStart, PxU32* rangeEnd, float4* deltaPos)
-//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.  Launch
-//   PxgParticleSystemCore.cpp:2005.
+//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.
 static const uint8_t kPsAccumulateDeltaVParticle[] = { 8, 8, 8, 8, 8, 8 };
 
-// gpusimulationcontroller particlesystem.cu:2519 / :2644 / :2761 (P9.48a: the FEM
-// twins of the three above -- the same algorithms over PxgFemOtherContactInfo instead
-// of PxgParticlePrimitiveContact, launched from BOTH PxgSoftBodyCore.cpp and
+// gpusimulationcontroller particlesystem.cu (P9.8, PhysX 5.12):
+//   ps_accumulateRigidDensity(PxgParticleSystem* particleSystems,
+//     PxgDeformablePairInfo* sortedContactInfos, const float4* sortedContactNormalPens,
+//     PxU32* totalNumPairs, PxU32* rangeStart, PxU32* rangeEnd)
+//   -> 6 device pointers = 48-byte blob (5.6.1: five, the kPsFindStartEnd1 shape).
+//   Launch PxgPBDParticleSystemCore.cpp prepParticleConstraint.
+static const uint8_t kPsAccumulateRigidDensity[] = { 8, 8, 8, 8, 8, 8 };
+
+// gpusimulationcontroller particlesystem.cu (P9.48a: the FEM twins of the range-find
+// passes and the accumulate -- the same algorithms keyed on PxgDeformablePairInfo::ref0
+// instead of ref1 (PhysX 5.12), launched from BOTH PxgSoftBodyCore.cpp and
 // PxgFEMClothCore.cpp).  Byte-for-byte the same rows as their particle twins:
 //   ps_findStartEndFEMFirstLaunch  -> 5 pointers = 40 bytes  (PxgSoftBodyCore.cpp:2356,
 //                                                             PxgFEMClothCore.cpp:426)
@@ -1417,18 +1472,11 @@ static const uint8_t kAccumRigidFirst[] = { 8, 8, 8, 8, 8 };
 //   5.12 changed argument #9 from PxgSolverSharedDesc<IterativeSolveData>* to the
 //   solver body velocity pool; same width, so the row is unchanged.
 static const uint8_t kAccumRigidSecond[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 1 };
-//   clearDeltaVRigidSecondLaunchMulti(PxU64* sortedRigidIds, PxU32* numContacts,
-//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*, PxReal* tempDenom)
-//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.
-static const uint8_t kClearRigidMulti[] = { 8, 8, 8, 8, 8, 8 };
-//   accumulateDeltaVRigidSecondLaunchMultiStage1 / Stage2(PxU64* sortedRigidIds,
-//     PxU32* numContacts, float4* deltaV, float4* blockDeltaV, PxU64* blockRigidId,
-//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
-//     PxgSolverSharedDesc<IterativeSolveData>*, PxReal* tempDenom, const bool useLocalRelax,
-//     const float globalRelaxationCoefficient, bool isTGS)
-//   -> {8x10, 1, 4, 1}: useLocalRelax byte @80, coefficient @84, isTGS byte @88 -> 89
-//   data bytes, rounded to the 8-align -> 96-byte blob.
-static const uint8_t kAccumRigidMulti[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 4, 1 };
+//   clearDeltaVRigidSecondLaunchMulti / accumulateDeltaVRigidSecondLaunchMultiStage1 /
+//   Stage2 have NO row: PhysX 5.12's PxgParticleSystemCore dropped their launches, so
+//   nothing in the engine can fetch them (ORPHANED in tools/check_disabled_kernels.py,
+//   unmapped in PxgSlangKernelManifest.h).  testRigidDeltaAccum still drives their
+//   ports directly.
 
 // gpusimulationcontroller particlesystem.cu:120 (P6.6 TGS substep predictor):
 //   ps_stepParticlesLaunch(const PxgParticleSystem* particleSystems,
@@ -1439,19 +1487,6 @@ static const uint8_t kAccumRigidMulti[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 4, 
 //   bool bytes @24/25/26, gravity @28 after the 4-align).  Launch
 //   PxgParticleSystemCore.cpp:2460.
 static const uint8_t kPsStepParticles[] = { 8, 8, 4, 4, 1, 1, 1, 12 };
-
-// gpusimulationcontroller particlesystem.cu:1690 (P6.6 TGS twin of the particle-
-// side PC solve).  The launch site packs the IDENTICAL array as the non-TGS solve
-// (PxgParticleSystemCore.cpp:1947, the isTGS ? PS_SOLVE_PC_PARTICLE_TGS branch;
-// only the CUfunction differs), so it reuses kPsSolvePCParticle:
-//   ps_solvePCOutputParticleDeltaVTGSLaunch(PxgParticleSystem* particleSystems,
-//     PxgParticlePrimitiveContact* sortedContacts,
-//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints, PxU32* numContacts,
-//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
-//     PxgSolverSharedDesc<IterativeSolveData>* sharedDesc, float4* deltaPos,
-//     float2* appliedForces, PxReal dt, PxReal relaxationCoefficient,
-//     bool isVelocityIteration, PxgArticulationCoreDesc* artiCoreDesc)
-//   -> {8,8,8,8,8,8,8,8,8,4,4,1,8} = 96-byte blob (kPsSolvePCParticle).
 
 // gpusimulationcontroller particlesystem.cu:5731 (P6.6 TGS velocity-iter finalize):
 //   ps_finalizeParticlesLaunch(const PxgParticleSystem* particleSystems,
@@ -1648,10 +1683,11 @@ static const uint8_t kCvxCorePlane[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
 // convexCoreTetmeshNphase_Kernel32: numTests(4), seven pointers, an 80-byte writer.
 static const uint8_t kCvxCoreTet[] = { 4, 8, 8, 8, 8, 8, 8, 8, 80 };
 
-// convexCoreClothmeshNphase_Kernel32: ten pointers, two PxU32, one pointer, an
-// 80-byte writer.  A THIRD distinct convex-core row -- see the note at its kRows
-// entry for why neither of the two above fits.
-static const uint8_t kCvxCoreCloth[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 80 };
+// convexCoreClothmeshNphase_Kernel32 (5.12): nine pointers, PxU32 stackSizeBytes @72,
+// one pointer @80, an 80-byte PxgRigidDbContactWriter @96 (paramAlign 16) -> 176 bytes.
+// 5.6.1 also passed the filter pair list and its count.  A THIRD distinct convex-core
+// row -- see the note at its kRows entry for why neither of the two above fits.
+static const uint8_t kCvxCoreCloth[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
 
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
@@ -1697,24 +1733,23 @@ static const PxgKernelAbiRow kRows[] = {
     // P9.72: convexCoreTetmeshNphase_Kernel32 does NOT share kCvxCorePlane, and the
     // name is the only reason one would think it does.  It is a rigid-vs-SOFTBODY
     // kernel (convexCoreCollision.cu:1095-1104) with NINE arguments, the last of them
-    // PxgFEMContactWriter BY VALUE -- nine device pointers + PxU32 maxNumContacts +
-    // a 4-byte tail pad = 80 bytes (PxgFEMCore.h:361-375, static_assert at
-    // tests/testFemClothSdfCg.cpp:140).  numTests 4 @0, seven pointers @8..@56, the
+    // PxgRigidDbContactWriter (5.12; PxgFEMContactWriter in 5.6.1) BY VALUE -- nine
+    // device pointers + PxU32 maxNumContacts + a 4-byte tail pad = 80 bytes (pinned in
+    // tests/testDeformableRef512.cpp).  numTests 4 @0, seven pointers @8..@56, the
     // writer at @64 (already 16-aligned, so paramAlign moves nothing) -> 144 bytes.
     { "convexCoreTetmeshNphase_Kernel32", kCvxCoreTet, uint32_t(sizeof(kCvxCoreTet)) },
-    // P9.74: convexCoreClothmeshNphase_Kernel32 (convexCoreCollision.cu:1196-1210)
+    // P9.74: convexCoreClothmeshNphase_Kernel32 (convexCoreCollision.cu, 5.12)
     // shares NEITHER row, and both near-misses are worth naming because either would
-    // have been silent.  It is not kCvxCorePlane (136 B): it has fourteen arguments,
+    // have been silent.  It is not kCvxCorePlane (136 B): it has twelve arguments,
     // not eighteen, and ends in a struct rather than three PxU32.  It is not
     // kCvxCoreTet (144 B) either, even though both end in the same 80-byte
-    // PxgFEMContactWriter: this one leads with the midphase stack pointer and its
-    // pair count instead of a numTests scalar, and carries filterPairs + nbFilterPairs
-    // + stackSizeBytes + stackSizeNeededOnDevice that the tetmesh kernel does not
-    // take at all.
-    //   ten pointers @0..@72, nbFilterPairs 4 @80, stackSizeBytes 4 @84,
-    //   stackSizeNeededOnDevice @88, the writer at @96 (8-aligned, paramAlign moves
-    //   nothing) -> 176 bytes.
-    // Verified argument by argument against PxgNarrowphaseCore.cpp:1167-1183.
+    // PxgRigidDbContactWriter: this one leads with the midphase stack pointer and its
+    // pair count instead of a numTests scalar, and carries stackSizeBytes +
+    // stackSizeNeededOnDevice that the tetmesh kernel does not take at all.
+    //   5.12: nine pointers @0..@64, stackSizeBytes 4 @72, stackSizeNeededOnDevice
+    //   @80, the writer at @96 (paramAlign(80) = 16 pads 88 -> 96) -> 176 bytes.
+    //   (5.6.1 also had filterPairs + nbFilterPairs; 5.12 moved the filter onto the
+    //   cloth.)
     { "convexCoreClothmeshNphase_Kernel32", kCvxCoreCloth, uint32_t(sizeof(kCvxCoreCloth)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
@@ -2083,13 +2118,13 @@ static const PxgKernelAbiRow kRows[] = {
     // P9.8: the boundary-density pair, and their shapes do NOT match.
     //   ps_accumulateStaticDensity(particleSystems*, activeParticleSystems*)
     //     -> {8,8} = kTwoPtr (16 bytes).
-    //   ps_accumulateRigidDensity(particleSystems*, sortedContacts*,
-    //     totalNumPairs*, rangeStart*, rangeEnd*) -> five device pointers,
-    //     {8,8,8,8,8} = 40 bytes, the existing kPsFindStartEnd1 shape.  There is
-    //     no active-system list here: the rigid kernel recovers the system from
-    //     the contact's packed PxU64 particleId.  hostPtrMask 0 for both.
+    //   ps_accumulateRigidDensity(particleSystems*, sortedContactInfos*,
+    //     sortedContactNormalPens*, totalNumPairs*, rangeStart*, rangeEnd*) -> six
+    //     device pointers (PhysX 5.12; 5.6.1 had five).  There is no active-system
+    //     list here: the rigid kernel recovers the system from the pair's ref1
+    //     PxgParticleRef.  hostPtrMask 0 for both.
     { "ps_accumulateStaticDensity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
-    { "ps_accumulateRigidDensity", kPsFindStartEnd1, uint32_t(sizeof(kPsFindStartEnd1)) },
+    { "ps_accumulateRigidDensity", kPsAccumulateRigidDensity, uint32_t(sizeof(kPsAccumulateRigidDensity)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
@@ -2109,7 +2144,9 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller FEMCloth rigid-attachment prep + PGS/TGS solve (P7.1 tranche 3a BDA)
     { "cloth_rigidAttachmentPrepareLaunch", kClothRigidAttachPrep, uint32_t(sizeof(kClothRigidAttachPrep)) },
     { "cloth_solveRigidClothAttachmentLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
+    { "cloth_queryRigidClothAttachmentReferenceCountLaunch", kClothRigidAttachQuery, uint32_t(sizeof(kClothRigidAttachQuery)) },
     { "sb_rigidAttachmentPrepareLaunch", kSbRigidAttachPrep, uint32_t(sizeof(kSbRigidAttachPrep)) },
+    { "sb_queryRigidSoftAttachmentReferenceCountLaunch", kSbRigidAttachQuery, uint32_t(sizeof(kSbRigidAttachQuery)) },
     { "sb_solveRigidSoftAttachmentLaunch", kSbRigidAttachSolve, uint32_t(sizeof(kSbRigidAttachSolve)) },
     { "cloth_applyExternalDeltasLaunch", kClothApplyExtDeltas, uint32_t(sizeof(kClothApplyExtDeltas)) },
     // gpunarrowphase FEMCloth-vs-primitive contact GENERATION (P7.1 tranche 4a BDA)
@@ -2173,7 +2210,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)), kSleepingHostPtrMask },
     // gpusimulationcontroller softbody FEM-volume solve bracket (P8.0 tranche 4)
     { "sb_gm_zeroTetMultipliers", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
-    { "sb_gm_applyExternalDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
+    { "sb_gm_applyExternalDeltasLaunch", kSbApplyExternalDeltasVel, uint32_t(sizeof(kSbApplyExternalDeltasVel)) },
     // gpusimulationcontroller softbody tetrahedron rotation extractors (P8.0 tranche 5)
     { "sb_gm_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     { "sb_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
@@ -2220,11 +2257,13 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_psMidphaseGeneratePairsLaunch", kSbPsMidphase, uint32_t(sizeof(kSbPsMidphase)) },
     { "sb_psContactGenLaunch", kSbPsContactGen, uint32_t(sizeof(kSbPsContactGen)) },
     { "sb_particleContactPrepareLaunch", kSbPsPrepare, uint32_t(sizeof(kSbPsPrepare)) },
+    { "sb_querySBParticleContactReferenceCountLaunch", kSbPsQuery, uint32_t(sizeof(kSbPsQuery)) },
     { "sb_solveOutputSPDeltaVLaunch", kSbPsSolveSb, uint32_t(sizeof(kSbPsSolveSb)) },
     { "sb_solveOutputParticleDeltaVLaunch", kSbPsSolvePs, uint32_t(sizeof(kSbPsSolvePs)) },
     { "cloth_psContactGenLaunch", kClothPsCg, uint32_t(sizeof(kClothPsCg)) },
     // gpusimulationcontroller FEMCloth-vs-PARTICLE constraint prep + solve (P9.31 BDA)
     { "cloth_particleContactPrepareLaunch", kClothPsPrepare, uint32_t(sizeof(kClothPsPrepare)) },
+    { "cloth_queryCPContactReferenceCountLaunch", kClothPsQuery, uint32_t(sizeof(kClothPsQuery)) },
     { "cloth_solveCPOutputClothDeltaVLaunch", kClothPsSolveCloth, uint32_t(sizeof(kClothPsSolveCloth)) },
     { "cloth_solveCPOutputParticleDeltaVLaunch", kClothPsSolveParticle, uint32_t(sizeof(kClothPsSolveParticle)) },
     { "cloth_meshVertexContactGenLaunch", kClothMeshVertContactGen, uint32_t(sizeof(kClothMeshVertContactGen)) },
@@ -2235,9 +2274,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_heightfieldVertexContactGenLaunch", kClothHfVertContactGen, uint32_t(sizeof(kClothHfVertContactGen)) },
     // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
     { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
-    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
+    { "sb_querySoftBodyAttachmentReferenceCountLaunch", kSbSoftBodyAttachQuery, uint32_t(sizeof(kSbSoftBodyAttachQuery)) },
+    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kSbFemAttachSolve, uint32_t(sizeof(kSbFemAttachSolve)) },
     // gpusimulationcontroller FEMCloth-vs-FEMCloth attachment solve (P9.32 BDA), on the row above
-    { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
+    { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", kClothClothAttachSolve, uint32_t(sizeof(kClothClothAttachSolve)) },
+    { "cloth_queryClothClothAttachmentReferenceCountLaunch", kClothClothAttachQuery, uint32_t(sizeof(kClothClothAttachQuery)) },
+    { "sb_queryClothAttachmentReferenceCountLaunch", kSbClothAttachQuery, uint32_t(sizeof(kSbClothAttachQuery)) },
     { "sb_solveOutputClothAttachmentDeltaVLaunch", kClothSbAttachSolve, uint32_t(sizeof(kClothSbAttachSolve)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
@@ -2245,10 +2287,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_clothVertMidphaseGeneratePairsLaunch", kSbClothVertMidphase, uint32_t(sizeof(kSbClothVertMidphase)) },
     { "sb_clothVertContactGenLaunch", kSbClothVertContactGen, uint32_t(sizeof(kSbClothVertContactGen)) },
     { "sb_clothContactPrepareLaunch", kSbClothContactPrepare, uint32_t(sizeof(kSbClothContactPrepare)) },
+    { "sb_querySCContactReferenceCountLaunch", kSbClothQuery, uint32_t(sizeof(kSbClothQuery)) },
     { "sb_solveOutputSCDeltaVLaunch", kSbClothSolve, uint32_t(sizeof(kSbClothSolve)) },
     // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
     { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },
+    { "sb_querySSContactReferenceCountLaunch", kSbSsQuery, uint32_t(sizeof(kSbSsQuery)) },
     { "sb_solveOutputSSDeltaVLaunch", kSbSolveOutputSSDeltaV, uint32_t(sizeof(kSbSolveOutputSSDeltaV)) },
     // gpusimulationcontroller softbody stress field (P8.5)
     { "sb_calculateStressLaunch", kSbCalculateStress, uint32_t(sizeof(kSbCalculateStress)) },
@@ -2275,12 +2319,12 @@ static const PxgKernelAbiRow kRows[] = {
     // ps_selfCollisionLaunch(const PxgParticleSystem*, PxU32 id) -> {8,4}
     { "ps_selfCollisionLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
     // ps_solveOneWayContactDeltaVLaunch(PxgParticleSystem*, const PxU32*, PxReal invDt,
-    //   PxReal dt, PxReal biasCoefficient, bool isVelocityIteration) -> {8,8,4,4,4,1}
+    //   PxReal dt, bool isVelocityIteration) -> {8,8,4,4,1} (PhysX 5.12)
     { "ps_solveOneWayContactDeltaVLaunch", kPsSolveOneWay, uint32_t(sizeof(kPsSolveOneWay)) },
     // ps_applyDeltaLaunch(PxgParticleSystem*, const PxU32*, PxReal dt) -> {8,8,4}
     { "ps_applyDeltaLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     // ps_updateParticleLaunch(const PxgParticleSystem*, const PxU32*, PxReal invDt,
-    //   bool skipNewPositionAdjustment) -> {8,8,4,1}
+    //   bool isVelocityIteration) -> {8,8,4,1}
     { "ps_updateParticleLaunch", kPsUpdateParticle, uint32_t(sizeof(kPsUpdateParticle)) },
     // gpusimulationcontroller/gpunarrowphase (P6.4a-1 PBD bound / cell-range)
     { "ps_updateBoundFirstPassLaunch", kPsUpdateBound1, uint32_t(sizeof(kPsUpdateBound1)) },
@@ -2313,6 +2357,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_findStartEndParticleSecondLaunch", kPsFindStartEnd2, uint32_t(sizeof(kPsFindStartEnd2)) },
     // gpusimulationcontroller (P6.4b-2 PBD particle-side contact solve)
     { "ps_contactPrepareLaunch", kPsContactPrepare, uint32_t(sizeof(kPsContactPrepare)) },
+    // PhysX 5.12: the PC mass-splitting pre-count, launched before the particle solve.
+    { "ps_queryPCContactReferenceCountLaunch", kPsQueryPCRefCount, uint32_t(sizeof(kPsQueryPCRefCount)) },
     { "ps_solvePCOutputParticleDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_accumulateDeltaVParticleLaunch", kPsAccumulateDeltaVParticle, uint32_t(sizeof(kPsAccumulateDeltaVParticle)) },
     // gpusimulationcontroller (P9.48a: the FEM twins of the three rows above)
@@ -2322,13 +2368,10 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller rigidDeltaAccum.cu (P9.44 deformable/particle -> rigid coupling)
     { "accumulateDeltaVRigidFirstLaunch", kAccumRigidFirst, uint32_t(sizeof(kAccumRigidFirst)) },
     { "accumulateDeltaVRigidSecondLaunch", kAccumRigidSecond, uint32_t(sizeof(kAccumRigidSecond)) },
-    { "clearDeltaVRigidSecondLaunchMulti", kClearRigidMulti, uint32_t(sizeof(kClearRigidMulti)) },
-    { "accumulateDeltaVRigidSecondLaunchMultiStage1", kAccumRigidMulti, uint32_t(sizeof(kAccumRigidMulti)) },
-    { "accumulateDeltaVRigidSecondLaunchMultiStage2", kAccumRigidMulti, uint32_t(sizeof(kAccumRigidMulti)) },
-    // gpusimulationcontroller (P6.6 PBD particle-side TGS contact-solve loop)
+    // gpusimulationcontroller (P6.6 PBD particle TGS step / finalize)
     { "ps_stepParticlesLaunch", kPsStepParticles, uint32_t(sizeof(kPsStepParticles)) },
-    // P9.44: the RIGID-side kernel (5.6.1 particlesystem.cu:1943) takes the identical
-    // 96-byte pack (PxgParticleSystemCore.cpp:2074-2089).  Its 5.6.1 TGS twin (:2123)
+    // P9.44: the RIGID-side kernel takes the particle solve's 96-byte pack
+    // (PxgParticleSystemCore.cpp solvePrimitiveCollisionForRigids).  Its 5.6.1 TGS twin
     // shared the pack; 5.12 folded it into this kernel, so its row is gone.
     { "ps_solvePCOutputRigidDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_finalizeParticlesLaunch", kPsFinalizeParticles, uint32_t(sizeof(kPsFinalizeParticles)) },

@@ -31,7 +31,7 @@
 // convexTriangle.cuh convexMeshSAT<false> / satConvexFaceNormals /
 // satTriangleNormal / selectPolygonFeatureIndex, contactReduction.cuh
 // contactReduce<false, true, 5>, PxgOutputIndex, and
-// PxgFEMContactWriter::writeRigidVsDeformableContact):
+// PxgRigidDbContactWriter::writeSurfaceContact (PhysX 5.12)):
 //
 // - convexScaledVerts precompute (vertex2Shape of every hull vertex);
 // - convexMeshSAT<false>: satConvexFaceNormals (per convex face, plane
@@ -60,10 +60,10 @@
 //   the reservation happens BEFORE the `mask > 0` write gate, and that gate
 //   is a SIGNED int comparison: a kept lane-31 contact makes the whole
 //   batch unwritten while the counter still advances — faithful quirk),
-//   then writeRigidVsDeformableContact: world-space point (w = restDist)
-//   and normal (w = separation), barycentric, pairInd0 = rigidId (u64),
-//   pairInd1 = PxEncodeClothIndex(clothId, triangleId), and the info fourth
-//   dword = rigidMaterialIndex with the isInCollision bit (31) cleared.
+//   then writeSurfaceContact (5.12): world-space point (w = restDist) and
+//   normal (w = separation), rigidRef = rigidId.getInd() (u64), the PxU16
+//   rigid material index, triRef = PxgEncodeDeformableTriangle(clothId,
+//   triangleId), and the barycentric.
 //
 // WARP SERIALIZATION: the CUDA runs one warp per pair.  All reductions are
 // order-fixed (warpReduction winnerLane = LOWEST lane holding the maximum,
@@ -71,8 +71,8 @@
 // and the only atomic is the single PxgOutputIndex reservation per batch —
 // so one CASE per thread with faithful two-level (per-lane stride, then
 // lowest-lane tie) argmax loops is output-identical.  Caller glue not
-// ported (documented): LoadShapePairWarp/transform caches, the filter-pair
-// all-three-verts skip (find() ported in tranche 75), and the triangle
+// ported (documented): LoadShapePairWarp/transform caches, the rigid-triangle
+// filter skip (5.12; the callers in femClothContactGenBda), and the triangle
 // transform into convex space (cases carry triLocVerts/triangleLocNormal).
 //
 // Hull blob layout (ConvexScratch getters): centerOfMass float4, header
@@ -118,6 +118,8 @@ import pxgSlangConvexHull;
 
 import pxgSlangCommon;
 import pxgSlangConvexHull;
+import pxgSlangDeformableRef;       // PxgEncodeDeformableTriangle
+import pxgSlangDeformableWriters;   // PxgRigidDbContactWriterGpu
 
 public static const uint NUM_TMP_CONTACTS_PER_PAIR = 32;
 public static const uint TRI_FEATURE_IDX = 0x7FffFFffu;
@@ -125,13 +127,6 @@ public static const uint EDGE_FEATURE_IDX = 0x80000000u;
 public static const uint PXG_BITSHIFT_ELEMENT_ID = 20;
 public static const uint COLLISION_FLAG_MASK = 1u << 31;
 
-struct FctParams
-{
-    uint numCases; uint maxContacts; uint pad0; uint pad1;   // @0
-    uint64_t hullAddr;        // @16  base of the hull blob (FctCase.ids2.y is a UINT offset into it)
-    // PxgFEMContactWriter, by address (@24..@88)
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;
-}
 
 
 // The per-pair inputs, public so a caller can fill one.
@@ -149,12 +144,8 @@ public struct FctCase
     public uint4 ids2;            // x = rigidMaterialIndex, y = hull offset (uints)
 }
 
-// PxgFEMContactWriter, by address.
-public struct FcCtWriter
-{
-    public uint64_t point, normalPen, bary, info, count, byX, tempByX, idxByX;
-    public uint maxContacts;
-}
+// The writer is PxgRigidDbContactWriterGpu (pxgSlangDeformableWriters), by value as
+// in the CUDA (5.12 replaced PxgFEMContactWriter).
 
 // ---- hull blob accessors: aliases over pxgSlangConvexHull -------------------
 // The names below are the ones this file's algebra has always called; only their
@@ -520,33 +511,11 @@ uint contactReduce5(float3 ptRaw[32], float sep[32], float3 normal, uint allMask
                             crsConfig(false, true, 5, true));
 }
 
-// ---- writeRigidVsDeformableContact (PxgFEMCore.h) ---------------------------
-public void writeRigidVsDeformableContact(FcCtWriter w, uint index, float4 contact, float4 normalPen, float4 bary,
-                                   uint2 pairInd0, uint pairInd1, uint rigidMaterialIndex, uint2 rigidId)
-{
-    if (index >= w.maxContacts) return;
-    Ptr<uint2>(w.byX)[index] = rigidId;
-    Ptr<uint>(w.tempByX)[index] = rigidId.x;
-    Ptr<uint>(w.idxByX)[index] = index;
-    Ptr<float4>(w.point)[index] = contact;
-    Ptr<float4>(w.normalPen)[index] = normalPen;
-    Ptr<float4>(w.bary)[index] = bary;
-    const uint64_t infoBase = w.info + uint64_t(index) * 16UL;
-    uint4 info = Ptr<uint4>(infoBase)[0];
-    info.x = pairInd0.x;
-    info.y = pairInd0.y;
-    info.z = pairInd1;
-    // setRigidMaterialIndex then markInCollision(false): bit 31 cleared
-    info.w = (info.w & COLLISION_FLAG_MASK) | (rigidMaterialIndex & ~COLLISION_FLAG_MASK);
-    info.w = info.w & ~COLLISION_FLAG_MASK;
-    Ptr<uint4>(infoBase)[0] = info;
-}
-
 // ---------------------------------------------------------------------------
 
 // The whole of ctFcConvexTri's former body.  Returns the debug word the Phase-1
 // battery reads: (isSATPassed, featureIndex, faceIndex1, dbgFace2).
-public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
+public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, PxgRigidDbContactWriterGpu w)
 {
     const uint hullHeader = hdr(hull);
     const uint nbVerts = nbVertsOf(hullHeader);
@@ -843,7 +812,7 @@ public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
                     uint startIndex = 0xFFFFFFFFu;
                     const uint numOut = countbits(mask);
                     if (numOut > 0)
-                        InterlockedAdd(Ptr<uint>(w.count)[0], numOut, startIndex);
+                        InterlockedAdd(Ptr<uint>(w.totalContactCount)[0], numOut, startIndex);
 
                     if (int(mask) > 0)
                     {
@@ -853,11 +822,10 @@ public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
                             const uint ind = startIndex + warpScanExclusive(mask, lane);
                             const float3 worldP = quatRotate(cs.convexQ, pa[lane]) + cs.convexP.xyz;
                             const float3 worldNormal = quatRotate(cs.convexQ, float3(ct[8 * lane + 4], ct[8 * lane + 5], ct[8 * lane + 6]));
-                            const uint2 pairInd0 = uint2(cs.ids.x, cs.ids.y); // rigidId
-                            const uint pairInd1 = (cs.ids.z << PXG_BITSHIFT_ELEMENT_ID) | cs.ids.w;
-                            writeRigidVsDeformableContact(w, ind, float4(worldP, rest),
-                                float4(worldNormal, sep[lane]), bary[lane],
-                                pairInd0, pairInd1, cs.ids2.x, pairInd0);
+                            const uint64_t rigidRef = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << uint64_t(32)); // rigidId.getInd()
+                            const uint64_t triRef = PxgEncodeDeformableTriangle(cs.ids.z, cs.ids.w);
+                            w.writeSurfaceContact(ind, float4(worldP, rest),
+                                float4(worldNormal, sep[lane]), rigidRef, cs.ids2.x, triRef, bary[lane]);
                         }
                     }
                 }

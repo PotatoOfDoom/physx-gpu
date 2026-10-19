@@ -8,10 +8,13 @@
 # ---------------------------------------------------------------------------
 # WHY THIS EXISTS
 # ---------------------------------------------------------------------------
-# "403 of 501 mapped, 98 to go" is the number this port has quoted at itself for a
-# long time, and it is misleading.  P9.65 classified all 98 and found that most of
-# them CANNOT BE REACHED IN THIS BUILD AT ALL -- not "are not yet exercised by a
-# scene", but cannot be constructed:
+# "403 of 501 mapped, 98 to go" is the number this port quoted at itself for a long
+# time under PhysX 5.6.1, and it was misleading.  P9.65 classified all 98 and found
+# that most of them CANNOT BE REACHED IN THIS BUILD AT ALL -- not "are not yet
+# exercised by a scene", but cannot be constructed.  Under PhysX 5.12 the registry
+# holds 487 kernels and 414 are mapped; of the 73 unmapped rows this checker files
+# 12 as ORPHAN, 58 as STANDALONE and 3 as ENGINE (engine_reachable_unmapped.txt says
+# why each of the three stays):
 #
 #   * The isosurface extractors, the SDF builder, the anisotropy and smoothed-position
 #     generators and the particle neighbourhood provider are application-facing

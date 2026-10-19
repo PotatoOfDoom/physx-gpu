@@ -8110,5 +8110,473 @@
 ],
 "verdict": "NOT-A-FOLD",
 "why": "5.12 dnom0 fix (convexTriangle.cuh): shuffle(e1, index) rebuilt as v1[next] - v1[index] from the staged triangle vertices, the same subtraction of two loaded values the CUDA performs for e1 on lane `index`; the zero the scan sees is the groupshared staging, not a literal operand, exactly as for the reviewed e1 line it mirrors."
+},
+{
+"file": "constraintPrepPGS.slang",
+"code": "const float penetrationInvDtWithBiasCoefficient = max(maxPenBias, penetration * invDtWithBiasCoefficient);",
+"kinds": [
+"F4-FMax"
+],
+"verdict": "CUDA-SAME",
+"why": "5.12 closure review: Twin is fmaxf(maxPenBias, penetration * invDtWithBiasCoefficient) (contactConstraintBlockPrep.cuh:443); FMax on llvmpipe matches fmaxf."
+},
+{
+"file": "cvxCoreClothNpBda.slang",
+"code": "const float3 clothPoint = patch[i].xyz - normal * patch[i].w * 0.5f;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: 5.12 clothPoint = points[i] - normal * dists[i] * 0.5f (convexCoreCollision.cu:1251), same op. The first operand patch[i].xyz is the generated contact point read from the patch array, never a literal; the scanner's zero is the normal's 0 seed, which only reaches the second (product) operand."
+},
+{
+"file": "femClothClothContactBda.slang",
+"code": "return dpDot3(disp - relDelta, normalFromDisp) - restDist;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: disp / normalFromDisp are seeded with float3(0) in computeClothClothVT/EEContact, but the seed survives only on the return-false paths, and both callers `continue` on false before computeClothClothInitPen (femClothClothContactBda.slang:773-774 and the EE twin). On the reaching path disp = ccWeightedSum(...), a computed value."
+},
+{
+"file": "femClothPsSolveBda.slang",
+"code": "const float frictionCoefficient = (clothPart.friction + particlePart.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "femClothPsSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "femClothPsSolveBda.slang",
+"code": "const float frictionCoefficient = (clothPart.friction + particlePart.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "femClothPsSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "femClothRigidContactBda.slang",
+"code": "appliedForces[workIndex] = float2(solveOut.accumulatedDeltaLambdaN,",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: deltaLambdaT keeps its PxgDbSolveOutput default +0 when tanMagSq <= 1e-14 (a runtime branch, so a phi). Even if llvmpipe sank the add into that arm and folded y + 0 -> y, appliedForce.y is never -0: the buffer starts +0 and is only updated by y + (target - y), which yields +0 on exact cancellation. So y + (+0) == y bitwise."
+},
+{
+"file": "npArtiConstraintPrep.slang",
+"code": "const float penetrationInvDtWithBiasCoefficient =",
+"kinds": [
+"F4-FMax"
+],
+"verdict": "CUDA-SAME",
+"why": "5.12 closure review: Twin is fmaxf(maxPenBias, penetration * invDtWithBiasCoefficient) (artiConstraintPrep2.cu:317); FMax matches fmaxf."
+},
+{
+"file": "npArtiPropagateInertia.slang",
+"code": "((!isExternalForcesEveryTgsIterationEnabled && jF != 0) ? (Ptr<float>(jF))[0] : 0.0f) - stZInt;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Runtime select: (!isExternalForcesEveryTgsIterationEnabled && jF != 0) ? jF[0] : 0.0f -- jF is a device address and the flag a runtime argument on the engine entry (:648; the literal false at :524 is the probe entry and still leaves the jF != 0 test). Same spelling as forwardDynamic2.cu:1431."
+},
+{
+"file": "npArtiPropagateInertia.slang",
+"code": "((!isExternalForcesEveryTgsIterationEnabled && jF != 0) ? (Ptr<float>(jF))[ind2] : 0.0f) - stZInt;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :266 -- runtime select on the flag and jF != 0; twin forwardDynamic2.cu:1469."
+},
+{
+"file": "npArtiUpdateBodies.slang",
+"code": "zaExt = asmSVec(zaExt.top + float3(zc[0], zc[1], zc[2]),",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both operands are loads (mZAVector and the zAForces record); the scanner's zero is the root branch's asmSVec(float3(0), float3(0)) store, a different branch reaching through the shared asmSVec helper's param/ret (flow-insensitive)."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "preMomentumBottom = asmM33Transform(inertia, vel.top)",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Computed momentum terms from loads; the zero origin :438 is qstZ's seed in the leaves-to-root sweep (a different function), reaching only through shared helper params/returns. The qstZ output itself is discarded by that caller."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "preMomentumBottom = preMomentumBottom",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :253: preMomentumBottom is the root's computed value carried through the runtime linkCount loop; the scanner's origin is the unrelated qstZ seed at :438."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "vel = asmSVec(pv.top, pv.bottom + asmCross(-rw, pv.top));",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: pv is a load of the parent's rewritten velocity; no literal operand. Origin :438 is unrelated (shared helper flow)."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "postMomentumBottom = postMomentumBottom",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: postMomentumBottom accumulates computed terms in a runtime-trip loop; no literal operand. Origin :438 is unrelated."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "zp[0] = zp[0] + translated.top.x;    zp[1] = zp[1] + translated.top.y;    zp[2] = zp[2] + translated.top.z;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: zp[] is a load of zAForces[parent]; translated = aiPropagateImpulseWNullJf(...), whose 0 - dot is already spelled aiZeroMinus (P9.86). The qstZ seed at :438 feeds only qstZ, which this caller discards."
+},
+{
+"file": "npArtiUpdateBodies1T.slang",
+"code": "zp[3] = zp[3] + translated.bottom.x; zp[4] = zp[4] + translated.bottom.y; zp[5] = zp[5] + translated.bottom.z;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :453."
+},
+{
+"file": "particleSelfCollisionBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: deltaLambdaT keeps its PxgDbSolveOutput default +0 when tanMagSq <= 1e-14 (a runtime branch, so a phi). Even if llvmpipe sank the add into that arm and folded y + 0 -> y, appliedForce.y is never -0: the buffer starts +0 and is only updated by y + (target - y), which yields +0 on exact cancellation. So y + (+0) == y bitwise."
+},
+{
+"file": "particleSelfCollisionBda.slang",
+"code": "thisDeltaP = float3(thisDeltaP.x + delta.x * invMass, thisDeltaP.y + delta.y * invMass,",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: thisDeltaP's float3(0) seed (:420) reaches the add only through the phi of the contact loop, whose trip count min(PS_MAX_STATIC_CONTACTS_PER_PARTICLE, count) is a runtime load. The CUDA performs the same IEEE adds."
+},
+{
+"file": "particleSelfCollisionBda.slang",
+"code": "denom += scale;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: denom's 0 seed reaches the add only through the runtime-trip contact-loop phi; the CUDA does the same 0 + scale."
+},
+{
+"file": "psContactGenBda.slang",
+"code": "psWriter().writeContact(contactIndex, float4(normal, distance - restDistance),",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: distance is psPrimTestParticle's out parameter; its 0 seed (:793) survives only on the false returns, and the write is inside `if (psPrimTestParticle(...))`. On the true path distance is computed."
+},
+{
+"file": "psContactSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: deltaLambdaT keeps its PxgDbSolveOutput default +0 when tanMagSq <= 1e-14 (a runtime branch, so a phi). Even if llvmpipe sank the add into that arm and folded y + 0 -> y, appliedForce.y is never -0: the buffer starts +0 and is only updated by y + (target - y), which yields +0 on exact cancellation. So y + (+0) == y bitwise."
+},
+{
+"file": "psContactSolveRigidBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: deltaLambdaT keeps its PxgDbSolveOutput default +0 when tanMagSq <= 1e-14 (a runtime branch, so a phi). Even if llvmpipe sank the add into that arm and folded y + 0 -> y, appliedForce.y is never -0: the buffer starts +0 and is only updated by y + (target - y), which yields +0 on exact cancellation. So y + (+0) == y bitwise."
+},
+{
+"file": "pxgSlangCommon.slang",
+"code": "const float3 d = hasSlide",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "ALREADY-FIXED",
+"why": "5.12 closure review: The hasSlide arm's slide is the computed motion-matrix column times jPos at both callers (npArtiInverseDyn:461, npArtiJointFrame:1759); the float3(0) seed reaches only the !hasSlide arm, which is spelled as the select (childOffset == 0 ? 0 : -childOffset) exactly for this P9.86f F2 fold."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "const float3 relLinDelta = float3(rigidLinDelta.x - db.linDelta.x, rigidLinDelta.y - db.linDelta.y,",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: The one-way kernel (particleSelfCollisionBda, ps_solveOneWayContactDeltaVLaunch) is the only solveRigidDbContact caller whose rigid is LITERAL: readNodelessStatic seeds linVel/angVel/linDelta/angDelta/raXn* with +0, so after inlining rigidLinDelta is a literal float3(0) on both select arms and 0 - db.linDelta may fold to -linDelta (-0 for a +0 lane where the CUDA has +0). For every other caller rigid.linDelta is a load and the select is runtime (NOT-A-FOLD). The lane only enters dot products (relLinDelta . n, fric0/fric1 . relLinDelta), whose sign of zero differs only when every product is zero; the tangent built from CT0/CT1 is used only under tanMagSq > 1e-14. Any zero-sign difference that results can reach only (a) the +0-seeded thisDeltaP / denom loop sums (runtime trip count), (b) appliedForces, which start +0 (cleared) and are only updated by sums that cannot produce -0 from a non--0 value, and (c) the != 0 activity tests; +0 + (+-0) == +0, so no stored bit changes."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "CN = normalVel + (dpSelectMax(0.0f, separation) + dpDot3(relLinDelta, n)) * invDt;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: The one-way kernel (particleSelfCollisionBda, ps_solveOneWayContactDeltaVLaunch) is the only solveRigidDbContact caller whose rigid is LITERAL: readNodelessStatic seeds linVel/angVel/linDelta/angDelta/raXn* with +0, so after inlining normalVel = dot(0, n) + dot(0, 0) folds the literal +0 addend (the CUDA's + 0 turns a -0 into +0). CN then differs at most in its sign of zero, which reaches only the -CN * invDenom vs -accumulatedDeltaLambdaN tie in the repulsion selectMax. Any zero-sign difference that results can reach only (a) the +0-seeded thisDeltaP / denom loop sums (runtime trip count), (b) appliedForces, which start +0 (cleared) and are only updated by sums that cannot produce -0 from a non--0 value, and (c) the != 0 activity tests; +0 + (+-0) == +0, so no stored bit changes."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "CN = normalVel + dpSelectMax(contactPair.maxPenBiasClamp, separation * invDt);",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: The one-way kernel (particleSelfCollisionBda, ps_solveOneWayContactDeltaVLaunch) is the only solveRigidDbContact caller whose rigid is LITERAL: readNodelessStatic seeds linVel/angVel/linDelta/angDelta/raXn* with +0, so after inlining normalVel may carry the folded sign of zero (see :1179); maxPenBiasClamp / separation * invDt is a runtime select, so CN's sign of zero can differ only when that select is itself zero. Any zero-sign difference that results can reach only (a) the +0-seeded thisDeltaP / denom loop sums (runtime trip count), (b) appliedForces, which start +0 (cleared) and are only updated by sums that cannot produce -0 from a non--0 value, and (c) the != 0 activity tests; +0 + (+-0) == +0, so no stored bit changes."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.deltaLambdaN = repulsionIncrement + adhesionImpulse;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: adhesionImpulse is particleAdhesionImpulse's return: 0.0f under the runtime test (isVelocityIteration || adhesion <= 0 || adhesionRadius <= 0), else computed -- a runtime select, not a literal operand. Same expression as deformableAndParticleUtils.cuh solveRigidDbContact."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.accumulatedDeltaLambdaN += repulsionIncrement;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: accumulatedDeltaLambdaN is seeded from appliedForceRef, a load of appliedForces[] at every solveRigidDbContact caller (psContactSolveBda:457, psContactSolveRigidBda:174, particleSelfCollisionBda:451, softBodyRigidContactBda:277/405, femClothRigidContactBda:292/419); repulsionIncrement is a select."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.accumulatedDeltaLambdaN += solveOut.deltaLambdaN;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :1199 -- the seed is the loaded appliedForceRef at every caller; deltaLambdaN is a select result."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.deltaLambdaT = targetAccumLambdaT - appliedTanRef;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: First operand targetAccumLambdaT is a selectMax of computed values; appliedTanRef is a loaded argument at every caller. x - (+0) is exact anyway."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "CN = (dpSelectMax(0.0f, separation) + dpDot3(relLinDelta, n)) * invDt;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: dpSelectMax(0.0f, separation) is a runtime select (separation = initPen + relPosDelta . n, computed), not a literal operand; the CUDA has the same PxMax(0, separation) + dot."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.accumulatedDeltaLambdaN += solveOut.deltaLambdaN;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: femClothClothContactBda passes LITERAL 0.0f appliedNormalLambdaRef (:819, :926), so 0 + deltaLambdaN may fold; it differs only when deltaLambdaN is -0, i.e. a +-0 tie of -CN * invDenom against -0. Then frictionLimit = accN * frictionCoefficient is +-0, deltaLambdaT = selectMax(req, -+0) - 0 is +-0 or the delta's tangent lane is a zero product, and either hasApplied is false (nothing written) or the zero lane is atomically added into the +0-cleared mDeltaPos accumulators, which are never -0. Cloth-cloth stores no appliedForce. All other callers seed from loads (NOT-A-FOLD)."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "const float targetAccumLambdaT = dpSelectMax(appliedTanRef + requiredLambdaTNeg, -frictionLimit);",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: Literal appliedTanRef 0.0f at femClothClothContactBda:819/:926 lets 0 + requiredLambdaTNeg fold; it differs only for requiredLambdaTNeg == -0 (tanDelta or invDenom zero), where the result feeds selectMax(.., -frictionLimit) and then deltaLambdaT -> a zero tangent lane of the delta, absorbed by the atomic add into the +0-cleared mDeltaPos (never -0). Other callers pass the loaded appliedForce.y (NOT-A-FOLD)."
+},
+{
+"file": "pxgSlangDeformableAndParticleUtils.slang",
+"code": "solveOut.deltaLambdaT = targetAccumLambdaT - appliedTanRef;",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: First operand targetAccumLambdaT is a selectMax of computed values; x - (+0) is exact."
+},
+{
+"file": "softBodyClothSolveBda.slang",
+"code": "const float frictionCoefficient = (dbCloth.friction + dbSb.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "softBodyClothSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "softBodyPsSolveBda.slang",
+"code": "const float frictionCoefficient = (sbPart.friction + particlePart.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "softBodyPsSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "softBodyPsSolveBda.slang",
+"code": "const float frictionCoefficient = (sbPart.friction + particlePart.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "softBodyPsSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "softBodyRigidContactBda.slang",
+"code": "appliedForces[workIndex] = float2(solveOut.accumulatedDeltaLambdaN,",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "BENIGN",
+"why": "5.12 closure review: deltaLambdaT keeps its PxgDbSolveOutput default +0 when tanMagSq <= 1e-14 (a runtime branch, so a phi). Even if llvmpipe sank the add into that arm and folded y + 0 -> y, appliedForce.y is never -0: the buffer starts +0 and is only updated by y + (target - y), which yields +0 on exact cancellation. So y + (+0) == y bitwise."
+},
+{
+"file": "softBodySelfSolveBda.slang",
+"code": "const float frictionCoefficient = (db0.friction + db1.friction) * 0.5f;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: Both frictions come from readCloth/readSoftBody/readParticle with countReferenceOnly/inflate set for the full read: friction = (materials != 0) ? material friction : 0.0f, a runtime select (the default member +0 is overwritten). The CUDA computes the same (f0 + f1) * 0.5f."
+},
+{
+"file": "softBodySelfSolveBda.slang",
+"code": "appliedForce.y += solveOut.deltaLambdaT;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: solveDbDbContact writes deltaLambdaT unconditionally on its active path; the PxgDbSolveOutput default +0 survives only on the inactive early return, where hasApplied is false and this add is skipped. appliedForce is a load of appliedForces[workIndex]."
+},
+{
+"file": "solverTGS.slang",
+"code": "linVel += lin0 * appliedForce;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: linVel's float3(0) seed reaches the add only through the phi of for(i < numRows), numRows the runtime row count; not unrollable. The CUDA writeback does the same IEEE 0 + x (same verdict as the pre-5.12 lin0XYZ form of this line)."
+},
+{
+"file": "solverTGS.slang",
+"code": "angVel += cangImp0 * appliedForce;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :1147 (angVel, runtime-trip loop phi)."
+},
+{
+"file": "solverTGS.slang",
+"code": "orthoImpulse0 += proj0 * appliedForce;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: orthoImpulse0's 0 seed reaches the add only through the runtime-trip row loop's phi."
+},
+{
+"file": "solverTGS.slang",
+"code": "orthoImpulse1 += proj1 * appliedForce;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :1160."
+},
+{
+"file": "solverTGS.slang",
+"code": "orthoImpulse2 += proj2 * appliedForce;",
+"kinds": [
+"F3-zero-add"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: As :1160."
+},
+{
+"file": "solverTGS.slang",
+"code": "angVel -= orthoRawAxis[0] * orthoImpulse0 + orthoRawAxis[1] * orthoImpulse1 +",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: angVel is the loop-carried accumulator (phi over the runtime-trip row loop), not a literal; the zero arrives only when no row fired, through that phi."
+},
+{
+"file": "solverTGS.slang",
+"code": "angVel -= cross(body0WorldOffset, linVel);",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 closure review: angVel is the phi of either writeback branch's runtime-trip loop; never a literal operand at the fsub."
 }
 ]

@@ -50,7 +50,7 @@
 //
 // THREE TESTS:
 //   psBoundaryDensityLayout -- every constant the shader hard-codes, pinned against
-//     the real engine headers, including the PxU64 particleId packing.
+//     the real engine headers, including the PhysX 5.12 PxgParticleRef packing.
 //   psBoundaryDensity -- the pair, over a four-system pool with a decoy, an active
 //     list that is not a permutation, and a gate-closed system.
 //   psBoundaryDensityWorkIndex -- 262145 work indices, the smallest size at which
@@ -118,8 +118,31 @@ DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
 struct StaticPush { uint64_t particleSystems, activeParticleSystems; };
 static_assert(sizeof(StaticPush) == 16, "{8,8} = kTwoPtr");
 
-struct RigidPush { uint64_t particleSystems, sortedContacts, totalNumPairs, rangeStart, rangeEnd; };
-static_assert(sizeof(RigidPush) == 40, "{8,8,8,8,8} = kPsFindStartEnd1");
+// PhysX 5.12: the SoA PxgDeformablePairInfo + float4 normalPen streams replace the
+// 32-byte PxgParticlePrimitiveContact, so the rigid kernel takes six pointers.
+struct RigidPush { uint64_t particleSystems, sortedContactInfos, sortedContactNormalPens, totalNumPairs, rangeStart, rangeEnd; };
+static_assert(sizeof(RigidPush) == 48, "{8,8,8,8,8,8} = kPsAccumulateRigidDensity");
+
+// The fixtures below still lay each contact out as the 5.6.1 32-byte record (normal_pen
+// @0, rigid id @16, particle ref @24) -- it keeps their construction readable -- and this
+// splits it into the two 5.12 streams the kernel reads.
+struct SoaContacts { DevBuf infos, normalPens; };
+static SoaContacts splitContacts(PxgSlangComputeDevice* dev, const std::vector<uint8_t>& bytes)
+{
+    const size_t n = bytes.size() / 32u;
+    std::vector<PxgDeformablePairInfo> infos(n);
+    std::vector<float> normalPens(n * 4u);
+    for (size_t i = 0; i < n; ++i)
+    {
+        std::memcpy(&normalPens[i * 4u], &bytes[i * 32u], 16);
+        std::memcpy(&infos[i].ref0, &bytes[i * 32u + 16u], 8);
+        std::memcpy(&infos[i].ref1, &bytes[i * 32u + 24u], 8);
+    }
+    SoaContacts c;
+    c.infos = makeDev(dev, infos);
+    c.normalPens = makeDev(dev, normalPens);
+    return c;
+}
 
 static const uint32_t POISON_U32 = 0xABABABABu;
 
@@ -162,28 +185,25 @@ PXG_TEST(psBoundaryDensityLayout)
                   "sizeof(PxgParticleContactInfo) == 16 (got %zu)", sizeof(PxgParticleContactInfo));
     PXG_CHECK(offsetof(PxgParticleContactInfo, mNormal_PenW) == 0);
 
-    // PxgParticlePrimitiveContact: float4 then two PxU64, align 16.
-    PXG_CHECK_MSG(sizeof(PxgParticlePrimitiveContact) == 32,
-                  "sizeof(PxgParticlePrimitiveContact) == 32 (got %zu)",
-                  sizeof(PxgParticlePrimitiveContact));
-    PXG_CHECK(offsetof(PxgParticlePrimitiveContact, normal_pen) == 0);
-    PXG_CHECK(offsetof(PxgParticlePrimitiveContact, rigidId) == 16);
-    PXG_CHECK_MSG(offsetof(PxgParticlePrimitiveContact, particleId) == 24,
-                  "particleId must sit at byte 24 (got %zu)",
-                  offsetof(PxgParticlePrimitiveContact, particleId));
+    // PxgDeformablePairInfo (PhysX 5.12): two PxU64, the particle ref in ref1.
+    PXG_CHECK_MSG(sizeof(PxgDeformablePairInfo) == 16,
+                  "sizeof(PxgDeformablePairInfo) == 16 (got %zu)", sizeof(PxgDeformablePairInfo));
+    PXG_CHECK(offsetof(PxgDeformablePairInfo, ref0) == 0);
+    PXG_CHECK(offsetof(PxgDeformablePairInfo, ref1) == 8);
 
-    // The packing the rigid kernel reads as a uint2: LOW word is the particle index,
-    // HIGH word is the system id (PxgSimulationCoreDesc.h:118/150/155).  Checked by
-    // calling the engine's own encoder rather than by restating the shift.
+    // The PxgParticleRef the rigid kernel decodes (PxgGetParticleSystemId /
+    // PxgGetParticleIndex): the LOW word is the particle index, the system id sits
+    // above the two flag bits at bit 34.  Checked by calling the engine's own encoder
+    // rather than by restating the shift.
     {
         const PxU32 sysId = 0x12345678u, partId = 0x9ABCDEF0u;
-        const PxU64 packed = PxEncodeParticleIndex(sysId, partId);
-        PXG_CHECK(PxGetParticleSystemId(packed) == sysId);
-        PXG_CHECK(PxGetParticleIndex(packed) == partId);
+        const PxU64 packed = PxgEncodeParticleRef(sysId, partId);
+        PXG_CHECK(PxgGetParticleSystemId(packed) == sysId);
+        PXG_CHECK(PxgGetParticleIndex(packed) == partId);
         PXG_CHECK_MSG(uint32_t(packed & 0xFFFFFFFFull) == partId,
                       "the low word must be the particle index");
-        PXG_CHECK_MSG(uint32_t(packed >> 32) == sysId,
-                      "the high word must be the system id");
+        PXG_CHECK_MSG(uint32_t(packed >> 34) == sysId,
+                      "the system id must sit at bit 34");
     }
 
     // The descriptor fields both kernels walk.
@@ -201,8 +221,8 @@ PXG_TEST(psBoundaryDensityLayout)
     PXG_CHECK_MSG(offsetof(PxgParticleSystem, mData) + offsetof(PxgParticleSystemData, mFluidRestOffset) == 304,
                   "mData.mFluidRestOffset must sit at 304 (got %zu)",
                   offsetof(PxgParticleSystem, mData) + offsetof(PxgParticleSystemData, mFluidRestOffset));
-    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 656,
-                  "sizeof(PxgParticleSystem) == 656 (got %zu)", sizeof(PxgParticleSystem));
+    PXG_CHECK_MSG(sizeof(PxgParticleSystem) == 608,
+                  "sizeof(PxgParticleSystem) == 608 (PhysX 5.12; got %zu)", sizeof(PxgParticleSystem));
 
     // The launch shapes.  The rigid kernel's grid is a COMPILE-TIME constant on our
     // side (it is a fixed host constant, not a dispatch parameter), so the shader
@@ -486,7 +506,7 @@ PXG_TEST(psBoundaryDensity)
                 std::memcpy(rec + 12, &u3, 4);
                 const PxU64 rigidId = 0xDEAD0000ull | PxU64(c);
                 std::memcpy(rec + 16, &rigidId, 8);
-                const PxU64 pid = PxEncodeParticleIndex(W.sysId, W.particleId);
+                const PxU64 pid = PxgEncodeParticleRef(W.sysId, W.particleId);
                 std::memcpy(rec + 24, &pid, 8);
             }
         }
@@ -497,7 +517,7 @@ PXG_TEST(psBoundaryDensity)
             std::memcpy(rec + 12, &u3, 4);
             const PxU64 rigidId = 0xF00D0000ull | PxU64(c);
             std::memcpy(rec + 16, &rigidId, 8);
-            const PxU64 pid = PxEncodeParticleIndex(TRIPWIRE_SYS, TRIPWIRE_PARTICLE);
+            const PxU64 pid = PxgEncodeParticleRef(TRIPWIRE_SYS, TRIPWIRE_PARTICLE);
             std::memcpy(rec + 24, &pid, 8);
         }
         // The tripwire must be genuinely unreached by the real work indices, or it
@@ -507,7 +527,7 @@ PXG_TEST(psBoundaryDensity)
                           "work index %u already uses the tripwire particle", w);
     }
 
-    DevBuf bContactsR = makeDev(dev, contactBytes);
+    SoaContacts bContactsR = splitContacts(dev, contactBytes);
     DevBuf bRangeStart = makeDev(dev, rangeStart);
     DevBuf bRangeEnd = makeDev(dev, rangeEnd);
     std::vector<uint32_t> totalPairs = { NUM_TESTS };
@@ -536,7 +556,8 @@ PXG_TEST(psBoundaryDensity)
     DevBuf bDesc = makeDev(dev, descArr);
 
     StaticPush pushS = { bDesc.addr, bActive.addr };
-    RigidPush pushR = { bDesc.addr, bContactsR.addr, bTotal.addr, bRangeStart.addr, bRangeEnd.addr };
+    RigidPush pushR = { bDesc.addr, bContactsR.infos.addr, bContactsR.normalPens.addr, bTotal.addr,
+                        bRangeStart.addr, bRangeEnd.addr };
 
     // The host's grid: ceil(mMaxParticles / PS_COLLISION) blocks, one Y slice per
     // ACTIVE system.  The system is on gridDim.Y, not Z -- every cloth kernel in
@@ -809,14 +830,14 @@ static void runWorkIndexCase(PxgSlangComputeDevice* dev, uint32_t NUM_TESTS, uin
         std::memcpy(rec + 12, &u3, 4);
         const PxU64 rigidId = 0xBEEF0000ull | PxU64(w);
         std::memcpy(rec + 16, &rigidId, 8);
-        const PxU64 pid = PxEncodeParticleIndex(0u, w);     // system 0, particle w
+        const PxU64 pid = PxgEncodeParticleRef(0u, w);     // system 0, particle w
         std::memcpy(rec + 24, &pid, 8);
     }
     {   // the tripwire record, one past the live contacts
         uint8_t* rec = &contactBytes[size_t(NUM_TESTS) * 32u];
         const uint32_t u3 = f2u(0.5f / CDI - RESTD);
         std::memcpy(rec + 12, &u3, 4);
-        const PxU64 pid = PxEncodeParticleIndex(0u, TRIPWIRE_PARTICLE);
+        const PxU64 pid = PxgEncodeParticleRef(0u, TRIPWIRE_PARTICLE);
         std::memcpy(rec + 24, &pid, 8);
         for (uint32_t k = 0; k < RANGE_PAD; ++k)
         {
@@ -831,7 +852,7 @@ static void runWorkIndexCase(PxgSlangComputeDevice* dev, uint32_t NUM_TESTS, uin
     std::vector<uint32_t> dens(size_t(NUM_TESTS + PAD), POISON_U32);
     for (uint32_t i = 0; i < NUM_TESTS; ++i) dens[i] = f2u(densitySentinel(i));
     DevBuf bDensity = makeDev(dev, dens);
-    DevBuf bContacts = makeDev(dev, contactBytes);
+    SoaContacts bContacts = splitContacts(dev, contactBytes);
     DevBuf bStart = makeDev(dev, rangeStart);
     DevBuf bEnd = makeDev(dev, rangeEnd);
     std::vector<uint32_t> totalPairs = { NUM_TESTS };
@@ -849,7 +870,7 @@ static void runWorkIndexCase(PxgSlangComputeDevice* dev, uint32_t NUM_TESTS, uin
     // never read them, and a port that does faults rather than passing quietly.
     DevBuf bDesc = makeDev(dev, descArr);
 
-    RigidPush push = { bDesc.addr, bContacts.addr, bTotal.addr, bStart.addr, bEnd.addr };
+    RigidPush push = { bDesc.addr, bContacts.infos.addr, bContacts.normalPens.addr, bTotal.addr, bStart.addr, bEnd.addr };
     {
         Kernel k("npPsBoundaryDensity.spv", "ps_accumulateRigidDensity", {}, sizeof(RigidPush));
         k.dispatch(RIGID_GRID, {}, push, 1u, 1u);

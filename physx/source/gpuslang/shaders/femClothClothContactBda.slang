@@ -22,187 +22,84 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// femClothClothContactBda — P7.2 tranche 2: the cloth-vs-CLOTH self-contact SOLVE
-// kernels on the Vulkan engine ABI (BDA).  These are what turn the VT/EE self-contacts
-// the tranche-1 midphase (femClothSelfCollisionBda) emitted into an actual cloth-vertex
-// push so the cloth FOLDS on itself instead of self-intersecting.  Ported line-for-line
-// from
-//   gpusimulationcontroller/src/CUDA/FEMClothConstraintPrep.cu (the prepare, :155)
-//   gpusimulationcontroller/src/CUDA/FEMClothExternalSolve.cu   (the query + solve, :902
-//     / :964 / :651 / :760 + the updateContactValidity book-keeping :1114)
-// with the closest-point + constraint leaves from gpunarrowphase deformableCollision.cuh
-// and geomutils GuDistancePointTriangle.h:
-//   - cloth_clothContactPrepareLaunch (FEMClothConstraintPrep.cu:155, launch
-//     PxgFEMClothCore.cpp:499, CLOTH_CLOTH_CONTACTPREPARE): clamps the cloth-cloth contact
-//     count, then for every not-yet-valid contact recomputes the EXACT rest-pose distance
-//     (closestPtEdgeEdge for EE, Gu::closestPtPointTriangle2 for VT) and marks the pair
-//     valid when the rest distance clears the self-collision filter — the deferred filter
-//     the midphase left "No filtering applied yet".
-//   - cloth_queryClothClothContact{VT,EE}CountLaunch (FEMClothExternalSolve.cu:902 / :964,
-//     launch PxgFEMClothCore.cpp:1981/:1982, CLOTH_QUERY_CLOTH_CONTACT_{VT,EE}_COUNT): a
-//     count pass (countContact) that, for each valid + still-penetrating (distSq <=
-//     restDist^2) self-contact, marks it in-collision and accumulates each referenced
-//     cloth vertex's reference count into mDeltaPos.w (so applyExternalDeltas can
-//     mass-average).  Contacts that separated are marked NOT-in-collision so the solve
-//     skips them.
-//   - cloth_solveClothClothDelta{VT,EE}Launch (FEMClothExternalSolve.cu:651 / :760, launch
-//     PxgFEMClothCore.cpp:2003/:2004, CLOTH_SOLVE_CLOTH_{VT,EE}_COLLISION): solves each
-//     in-collision self-contact (triangleCollisionConstraint) and scatters BOTH endpoints'
-//     position corrections into mDeltaPos — the vertex + the triangle's three vertices
-//     (VT), or edge0's two + edge1's two vertices (EE) — folded next by the already-mapped
-//     cloth_applyExternalDeltasLaunch.
-//   - cloth_updateClothContactValidityLaunch (FEMClothExternalSolve.cu:1114, launch
-//     PxgFEMClothCore.cpp:647, CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY): per-vertex book-keeping
-//     that (on an adaptive update) resets the VT/EE contact counts and snapshots each
-//     vertex's current position into mPrevPositionInContactOffset (with w = 1 marking it
-//     set) so the next contact refresh can measure how far vertices drifted.
+// femClothClothContactBda.slang -- the cloth-vs-CLOTH contact chain (self-collision and
+// cloth-vs-different-cloth), PhysX 5.12:
 //
-// SELF SCOPE.  All four launches are the generic cloth-vs-cloth path; on the self-
-// collision launch clothId0 == clothId1 (both index the same active cloth), so cloth0 and
-// cloth1 alias the same descriptor.  The kernels are transcribed GENERICALLY (they read
-// cloth0 / cloth1 by their compressed ids exactly as the CUDA does) — no self-only fold is
-// needed here because the generic read already resolves to the same cloth for a self pair,
-// and the different-cloth pairs flow through the identical arithmetic.
+//   cloth_clothContactPrepareLaunch (FEMClothConstraintPrep.cu)  clamps the contact count
+//       to maxContacts and, for a SELF pair only, applies the exact rest-pose filter the
+//       midphase approximated: the pair is INVALIDATED when the rest distance (closestPtEdge-
+//       Edge for an edge-edge pair, Gu::closestPtPointTriangle2 for vertex-triangle) is
+//       within mSelfCollisionFilterDistance.  A pair between two cloths stands as
+//       generated.  (5.6.1 marked passing pairs VALID instead; in 5.12 the pairs arrive
+//       valid.)  The kernel runs once for the VT stream and once for the EE stream; the
+//       ref0 feature type (eTRIANGLE_EDGE) tells them apart.
+//   cloth_queryClothClothContact{VT,EE}CountLaunch (FEMClothExternalSolve.cu)  the per-
+//       substep pre-count: recomputes the contact geometry (computeClothClothVTContact /
+//       EEContact), latches the result in the pair's ACTIVE flag and, for an active pair,
+//       adds |weight| (> 1e-3) to mDeltaPos.w of each of the four vertices (the magnitude-
+//       weighted reference count, PX_CLOTH_CLOTH_INTEGER_REFCOUNT == 0).
+//   cloth_solveClothClothDelta{VT,EE}Launch (FEMClothExternalSolve.cu)  for each active
+//       pair: recompute the geometry, fill two PxgDeformablePart by hand (vertex + triangle
+//       for VT, edge + edge for EE; vertexInvMasses scaled by the .w counts), solveDbDbContact
+//       with the 0.25 * sum of the four vertices' mDynamicFrictions, and scatter +-delta
+//       (writeCloth for VT, writeClothEdge for EE).  Position iterations take the motion
+//       since the last narrowphase refresh (mPrevPositionInContactOffset) as linDelta and
+//       posDelta and the de-biased initPen (computeClothClothInitPen); velocity iterations
+//       take velocity * dt and the current separation.
+//   cloth_updateClothContactValidityLaunch (FEMClothExternalSolve.cu, unchanged in 5.12)
+//       on an adaptive pair update: resets the VT/EE counts and snapshots the positions
+//       into mPrevPositionInContactOffset (w = 1).
 //
-// DOCTRINE (identical to the prior cloth BDA tranches femClothRigidContactBda /
-// femClothSelfCollisionBda):
-//   - the PxgFEMCloth descriptor arrives as a device-pointer ARRAY read through Ptr<> (the
-//     byte-exact pxgSlangFEMClothDesc mirror): mPosition_InvMass @16, mRestPosition @24,
-//     mPrevPositionInContactOffset @32, mDynamicFrictions @48, mTriangleVertexIndices @72,
-//     mDeltaPos @248, mSelfCollisionFilterDistance @312, mRestDistance @384, mNbVerts @316,
-//     mElementIndex-adjacent scalars are the fields these kernels touch;
-//   - the 16-byte PxgFemFemContactInfo (PxgFEMCore.h:51: pairInd0 u64 @0, pairInd1 u32 @8,
-//     auxInd u32 @12) is addressed by explicit byte offset through Ptr<> (no struct block
-//     copy), exactly as femClothRigidContactBda read PxgFemOtherContactInfo.  The auxInd
-//     bit packing (bit31 Valid, bit30 PairType EE, bit29 InCollision, bits14-28 AuxInd1,
-//     bits0-13 AuxInd0) is reproduced by the same mask/shift arithmetic the header inlines.
+// THE 5.12 DATA.  The contacts are PxgDeformablePairInfo {ref0, ref1}: VT is ref0 = a cloth
+// VERTEX, ref1 = a cloth TRIANGLE; EE is ref0 / ref1 = eTRIANGLE_EDGE refs (triangle +
+// localEdge).  The 5.6.1 PxgFemFemContactInfo with its auxInd bit field is gone: validity is
+// the INVALID flag, in-collision the ACTIVE flag, both on ref1.  The cloth friction and
+// restitution are not read from the materials (clothMaterials is unread, as in the CUDA).
 //
-// DEVIATIONS from the CUDA original (recipe policy; each preserves the constraint
-// semantics for a cloth self-contact and is exercised bit-exact by testFemClothSim.cpp):
-//   - cloth.mDeltaPos accumulation uses REAL atomics (pxgSlangAtomicFloat), exactly as
-//     the CUDA atomicAdd(&mDeltaPos[v].w, coeff) / atomicAdd(&mDeltaPos[v].x/.y/.z, dx).
-//     This was previously a plain load-add-store, justified by "a single self-contact
-//     touches four DISTINCT vertices".  That is true PER CONTACT and says nothing about
-//     ACROSS contacts, which is where the contention is: in a folded cloth a vertex takes
-//     part in many self-contacts at once.  Measured consequence, see pxgSlangAtomicFloat;
-//   - the PxgFemFemContactInfo reference writes (markValid in the prepare, markInCollision
-//     in the count) touch ONLY the 4-byte auxInd word (@12).  In CUDA the prepare copies
-//     the struct, flips a bit, and writes the whole 16 bytes back (pairInd0/pairInd1
-//     unchanged), and the count kernel mutates the auxInd of a reference in place — both
-//     are byte-identical to writing just the auxInd word;
-//   - FRICTION is the null-material path.  applyContactDelta reads the per-vertex
-//     mDynamicFrictions VERBATIM and forms the same 0.25*(f0+f1+f2+f3) combined
-//     coefficient, and triangleCollisionConstraint builds the full tangent constraint —
-//     but its friction branch is gated `frictionCoefficient != 0`.  With zero cloth
-//     friction (the self-fold / drape target and the unit test) the branch is DEAD, so no
-//     value flows through PxRecipSqrt and the solve is FULLY bit-exact.  When friction IS
-//     non-zero that branch's PxRecipSqrt (a hardware reciprocal-sqrt, NOT bitwise
-//     1/sqrt) is a DOCUMENTED TOLERANCE seam — a follow-on material tranche;
-//   - the clothMaterials arg (prepare) and the dt arg (both solves) and the
-//     forceUpdateClothContactPairs + dt args (updateContactValidity) are carried in the
-//     push blob for ABI parity but NOT read: the CUDA kernel bodies never reference them.
+// DEVIATIONS (value-neutral):
+//   - mDeltaPos accumulation uses real float atomics (pxgSlangAtomicFloat via the utils),
+//     as the CUDA atomicAdd;
+//   - the flag writes rewrite the ref1 word only (the CUDA rewrites ref1 in place too);
+//   - clothMaterials (prepare), forceUpdateClothContactPairs and dt (updateValidity) are in
+//     the push blob for ABI parity and unread, as in the CUDA.
 //
-// FLOAT LOWERING.  P9.36 CORRECTED THIS, AND THE OLD RULE IS WORTH RECORDING BECAUSE IT
-// IS WHY THE DEFECT WAS EVERYWHERE.  This header used to say:
-//
-//     "a PxVec3/float scalar divide is transcribed as Slang `float3 / float`
-//      (per-component OpFDiv), and an explicit PxVec3 * (1/x) as reciprocal-multiply —
-//      each is mirrored bit-for-bit by the CPU reference."
-//
-// Both halves lower to the SAME thing in the engine.  PxVec3::operator/ (PxVec3.h:219) is
-// `f = Type(1.0)/f; return PxVec3T(x*f, y*f, z*f);` -- a reciprocal and three multiplies --
-// and so are operator/= (:260), normalize() (:295) and the CUDA float3/float4 operators the
-// GPU kernels use (cutil_math.h:342/352/485/495).  There is no per-component form to
-// transcribe.  This very kernel's own source shows it: FEMClothExternalSolve.cu:748 writes
-// `normal = disp / dist;` and :846 writes `normal = disp * (1.0f / dist);`, on the same
-// type for the same purpose, because they ARE the same operation.  The port read them as
-// two lowerings and made the difference a rule.
-//
-// "each is mirrored bit-for-bit by the CPU reference" was the justification, and it is the
-// failure mode rather than the proof: the mirror was written from this convention, so
-// shader and mirror agreed with each other while both diverged from PhysX by >=1 component
-// on 53.4595% of vectors (measured, 3e6 samples).  gpuslang.vectorDivide now checks the
-// SPIR-V directly, which is the only thing here that can.
-//
-// The rule is: a vector divided by a SCALAR is one reciprocal and three multiplies.  A
-// vector divided by a VECTOR is genuinely componentwise (cutil_math.h:337) and stays a
-// divide.  All float arithmetic is
-// NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the dot/cross/normalize-heavy closest-
-// point + constraint math (disp.dot(normal), the response denominator, the bias CN, the
-// deltaLambda scatter) feeds the compared mDeltaPos and would fuse to FMAs otherwise,
-// breaking bitwise parity with the -ffp-contract=off CPU reference (same reasoning as
-// femClothRigidContactBda).  There is NO transcendental on the live (frictionless) path
-// (pure mul/add/sub/div/sqrt/min/max/abs) — this tranche is FULLY bit-exact, no tolerance
-// seam in scope.
+// FLOAT SPELLING.  A vector divided by a scalar is one reciprocal and three multiplies
+// (PxVec3::operator/); PxMin / PxMax / PxClamp on floats are the dp* selects; PxVec3 dot is
+// (x + y) + z.  In PXG_NOCONTRACT_SHADERS; compared bit-exactly against a CPU transcription
+// of the 5.12 CUDA (testFemClothSolve512).
 
-import pxgSlangAtomicFloat;   // atomicAdd(float*) parity — see that module
-import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass@16, mDeltaPos@248, ...)
+import pxgSlangFEMClothDesc;                // PxgFEMClothGpu, clothAt
+import pxgSlangDeformableRef;               // PxgDeformablePairInfoGpu, PxgGet*, PXG_DREF_*
+import pxgSlangDeformableAndParticleUtils;  // PxgDeformablePart, solveDbDbContact, dp* helpers
+import pxgSlangAtomicFloat;                 // pxgAtomicAddF4W
 
-// PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h:42/59)
-// — the prepare / query / solve grid+block; PxgFEMClothKernelBlockDim::CLOTH_STEP
-// (PxgFEMClothCoreKernelIndices.h:40) — the updateContactValidity block.
+// PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION -- the prepare / query / solve grid
+// and block; PxgFEMClothKernelBlockDim::CLOTH_STEP -- the updateContactValidity block.
 static const uint RC_BLOCK = 256u;
 static const uint RC_GRID = 1024u;
 static const uint CLOTH_STEP = 1024u;
 
-// PX_MAX_NB_DEFORMABLE_SURFACE_TRI (PxDeformableSurface.h:56) == the element mask;
-// PXG_BITSHIFT_ELEMENT_ID (PxgSimulationCoreDesc.h:41) — cloth id / elem index packing
-// (PxGetClothId / PxGetClothElementIndex, PxgSimulationCoreDesc.h:135/140).
-static const uint PX_MAX_NB_DEFORMABLE_SURFACE_TRI = 0x000fffffu;
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
-
-// FEMCLOTH_THRESHOLD (FEMClothUtil.cuh:65).
+// FEMClothUtil.cuh.
 static const float FEMCLOTH_THRESHOLD = 1.0e-14f;
+static const float FEMCLOTH_NORMAL_FALLBACK_DISTSQ = 1.0e-10f;   // new in 5.12
 
-// deformableCollision.cuh:37/38.
+// deformableCollision.cuh.
 static const float DEFORMABLE_BARYCENTRIC_THRESHOLD = 1.0e-6f;
 static const float DEFORMABLE_ONE_MINUS_BARYCENTRIC_THRESHOLD = 1.0f - 1.0e-6f;
-
-// PxgFemFemContactInfo (PxgFEMCore.h:51, PX_ALIGN(16), 16 bytes): pairInd0 u64 @0,
-// pairInd1 u32 @8, auxInd u32 @12.  auxInd bit packing (PxgFEMCore.h:69-82).
-static const uint CI_pairInd0 = 0u;
-static const uint CI_pairInd1 = 8u;
-static const uint CI_auxInd = 12u;
-static const uint CI_STRIDE = 16u;
-
-static const uint AUX_IND0_BITS = 14u;
-static const uint AUX_IND1_BITS = 15u;
-static const uint AUX_IND0_MASK = (1u << AUX_IND0_BITS) - 1u;   // 0x00003FFF
-static const uint AUX_IND1_SHIFT = AUX_IND0_BITS;
-static const uint CONTACT_FLAG_MASK   = 1u << 29;              // isInCollision
-static const uint PAIR_TYPE_FLAG_MASK  = 1u << 30;             // 0 = VT, 1 = EE
-static const uint VALIDITY_FLAG_MASK   = 1u << 31;
-
-// ---------------------------------------------------------------------------
-// PxgFemFemContactInfo byte-offset readers / writers + auxInd bit helpers.
-// ---------------------------------------------------------------------------
-uint ciPairInd0Lo(uint64_t ciBase) { return Ptr<uint>(ciBase + CI_pairInd0)[0]; }   // PxU32(pairInd0)
-uint ciPairInd1(uint64_t ciBase)   { return Ptr<uint>(ciBase + CI_pairInd1)[0]; }
-uint ciAuxInd(uint64_t ciBase)     { return Ptr<uint>(ciBase + CI_auxInd)[0]; }
-void ciWriteAuxInd(uint64_t ciBase, uint aux) { Ptr<uint>(ciBase + CI_auxInd)[0] = aux; }
-
-bool auxIsValidPair(uint aux)     { return (aux & VALIDITY_FLAG_MASK) != 0u; }
-bool auxIsEdgeEdgePair(uint aux)  { return (aux & PAIR_TYPE_FLAG_MASK) != 0u; }
-bool auxIsInCollision(uint aux)   { return (aux & CONTACT_FLAG_MASK) != 0u; }
-uint auxGetInd0(uint aux)         { return aux & AUX_IND0_MASK; }
-uint auxGetInd1(uint aux)         { return (aux >> AUX_IND1_SHIFT) & ((1u << AUX_IND1_BITS) - 1u); }
-uint auxMarkValid(uint aux)       { return aux | VALIDITY_FLAG_MASK; }
-uint auxMarkInCollision(uint aux, bool inContact)
-{
-    return (aux & ~CONTACT_FLAG_MASK) | (inContact ? CONTACT_FLAG_MASK : 0u);
-}
-
-uint pxGetClothId(uint compressedId)      { return compressedId >> PXG_CLOTH_ID_SHIFT; }
-uint pxGetClothElementIndex(uint compressedId) { return compressedId & PX_MAX_NB_DEFORMABLE_SURFACE_TRI; }
 
 // Index x/y/z of a uint4 by a runtime edge index in {0,1,2}
 // (CUDA reinterpret_cast<const PxU32*>(&triVertInd)[localIndex]).
 uint pick3(uint4 v, uint i) { return (i == 0u) ? v.x : ((i == 1u) ? v.y : v.z); }
 
+// The pair's ref1 word, rewritten whole (PxgInvalidatePairInfo / PxgSetActivePairInfo).
+void ccWriteRef1(uint64_t contactInfos, uint workIndex, uint64_t ref1)
+{
+    Ptr<uint64_t>(contactInfos + uint64_t(workIndex) * PXG_PAIRINFO_STRIDE + PXG_PAIRINFO_ref1)[0] = ref1;
+}
+
 // ---------------------------------------------------------------------------
-// Geometry leaves (byte-exact transcriptions).
+// Geometry leaves (deformableCollision.cuh / GuDistancePointTriangle.h, unchanged in 5.12).
 // ---------------------------------------------------------------------------
 
 // closestPtPointTriangle (deformableCollision.cuh:146) — returns closest point, s/t out.
@@ -308,6 +205,10 @@ float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab
 // PxVec3::operator/, i.e. a reciprocal and three multiplies; this comment used to claim it
 // was per-component division "matching the p72ref transcription", which is the convention
 // corrected in the FLOAT LOWERING note above.
+// UPSTREAM (transcribed as written): s = (b0 - b1 * a01) * invDet scales the u1.d term by
+// 1 / r1Len where the line-line minimizer has 1 / r0Len, and t scales the u0.d term by
+// 1 / r0Len where it has 1 / r1Len, so s / t (and distSq) are the true closest points only for
+// two edges of equal length.
 bool closestPtLineLine(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out float s, out float t, out float distSq)
 {
     const float3 r0 = e0v1 - e0v0;
@@ -372,12 +273,14 @@ bool closestPtLineLine(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out f
 }
 
 // closestPtPointEdge (deformableCollision.cuh:231) — the closestPtEdgeEdge segment
-// fallback leaf.  PxClamp(x,lo,hi) == min(hi, max(lo, x)).
+// fallback leaf.
 float closestPtPointEdge(float3 v0, float3 ev0, float3 ev1)
 {
     const float3 r = ev1 - ev0;
     const float d2 = dot(r, r);
-    return (d2 > 0.0f) ? min(1.0f, max(0.0f, dot(r, v0 - ev0) / d2)) : 0.5f;
+    // PxClamp(x, 0, 1) = PxMax(0, PxMin(1, x)): the CUDA selects (a +-0 tie keeps the
+    // second operand), not GLSL FMin/FMax.
+    return (d2 > 0.0f) ? dpSelectMax(0.0f, dpSelectMin(1.0f, dot(r, v0 - ev0) / d2)) : 0.5f;
 }
 
 // closestPtEdgeEdge (deformableCollision.cuh:313) — finite-edge closest points; the EXACT
@@ -412,7 +315,7 @@ bool closestPtEdgeEdge(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out f
             const float3 p1 = e1v0 * (1.0f - tC) + e1v1 * tC;
             const float d2 = dot(p0 - p1, p0 - p1);
             minIndex = (d2 < distSq) ? i : minIndex;
-            distSq = min(d2, distSq);
+            distSq = dpSelectMin(d2, distSq);   // PxMin, a select
         }
 
         s = candidates[minIndex].x;
@@ -422,190 +325,202 @@ bool closestPtEdgeEdge(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out f
     return true;
 }
 
-// triangleCollisionConstraint (FEMClothExternalSolve.cu:243) — VT + EE shared constraint.
-// invMass here is the count-split inverse mass.  Friction branch DEAD for zero
-// frictionCoefficient (the frictionless self-fold / unit-test path); see header.  Returns
-// the four per-endpoint deltas (0 when the response denominator is degenerate).
-bool triangleCollisionConstraint(out float3 dx0, out float3 dx1, out float3 dx2, out float3 dx3,
-                                 float3 disp, float3 normal, float3 relDelta, float4 invMass,
-                                 float restDistance, float frictionCoefficient, float4 weights)
+// ---------------------------------------------------------------------------
+// computeClothClothVTContact / computeClothClothEEContact / computeClothClothInitPen
+// (FEMClothExternalSolve.cu).  weights is (w0, w1, w2, w3), cloth0 minus cloth1.
+// ---------------------------------------------------------------------------
+float3 f4xyz(float4 v) { return float3(v.x, v.y, v.z); }
+
+// disp = w0 * xx0 + w1 * xx1 + w2 * xx2 + w3 * xx3, left to right.
+float3 ccWeightedSum(float4 w, float3 xx0, float3 xx1, float3 xx2, float3 xx3)
 {
-    dx0 = float3(0.0f, 0.0f, 0.0f);
-    dx1 = float3(0.0f, 0.0f, 0.0f);
-    dx2 = float3(0.0f, 0.0f, 0.0f);
-    dx3 = float3(0.0f, 0.0f, 0.0f);
+    return float3(xx0.x * w.x + xx1.x * w.y + xx2.x * w.z + xx3.x * w.w,
+                  xx0.y * w.x + xx1.y * w.y + xx2.y * w.z + xx3.y * w.w,
+                  xx0.z * w.x + xx1.z * w.y + xx2.z * w.z + xx3.z * w.w);
+}
 
-    const float CN = dot(disp, normal) - restDistance;
+bool computeClothClothVTContact(Ptr<PxgFEMClothGpu> cloth0, Ptr<PxgFEMClothGpu> cloth1, float4 x0, float4 x1,
+                                float4 x2, float4 x3, out float4 weights, out float3 normalFromDisp, out float3 disp)
+{
+    const float3 xx0 = f4xyz(x0);
+    const float3 xx1 = f4xyz(x1);
+    const float3 xx2 = f4xyz(x2);
+    const float3 xx3 = f4xyz(x3);
 
-    const float denom = invMass.x * weights.x * weights.x + invMass.y * weights.y * weights.y +
-                        invMass.z * weights.z * weights.z + invMass.w * weights.w * weights.w;
-    if (denom < FEMCLOTH_THRESHOLD)
+    float s, t;   // Barycentric coordinates
+    closestPtPointTriangle(xx0, xx1, xx2, xx3, s, t);
+    const float r = 1.0f - s - t;
+    weights = float4(1.0f, -r, -s, -t);   // cloth0 - cloth1
+
+    disp = ccWeightedSum(weights, xx0, xx1, xx2, xx3);
+    normalFromDisp = float3(0.0f, 0.0f, 0.0f);
+    const float dispSq = dpDot3(disp, disp);
+    const float restDist = cloth0[0].mRestOffset + cloth1[0].mRestOffset;
+
+    if (dispSq > restDist * restDist)
         return false;
 
-    const float invDenom = 1.0f / denom;
-    const float deltaLambdaN = -CN * invDenom;
-
-    float3 commonVec = deltaLambdaN * normal;
-
-    // Friction constraint in the tangent direction (DEAD for frictionCoefficient == 0).
-    float3 tanDir = relDelta - dot(relDelta, normal) * normal;
-    const float tanMagSq = dot(tanDir, tanDir);
-
-    if (frictionCoefficient != 0.0f && tanMagSq > FEMCLOTH_THRESHOLD)
+    if (dispSq < FEMCLOTH_NORMAL_FALLBACK_DISTSQ)
     {
-        const float invTanMag = 1.0f / sqrt(tanMagSq);   // PxRecipSqrt (documented seam; DEAD here)
-        tanDir = tanDir * invTanMag;
-        const float CT = dot(relDelta, tanDir);
+        const float3 ab = xx2 - xx1;
+        const float3 ac = xx3 - xx1;
+        normalFromDisp = dpCross3(ab, ac);
 
-        // P9.86f: FEMClothExternalSolve.cu:274-275 PxMax(0.f, CT * invDenom) / PxMin(deltaLambdaT, lim) are
-        // selectMax / selectMin (PxMath.h:81-101, PxUnixMathIntrinsics.h:116-125), the SECOND operand winning
-        // a +-0 tie and a false (NaN) compare.  CT = -0 (relDelta and tanDir with lined-up zero lanes) keeps
-        // -0 through the max, and a -0 against lim = +0 (CN == 0) gives +0 through the min; GLSL FMax/FMin
-        // on llvmpipe give +0 and -0 there, flipping the zero lanes of deltaLambdaT * tanDir.
-        const float ctScaled = CT * invDenom;
-        float deltaLambdaT = (0.0f > ctScaled) ? 0.0f : ctScaled;
-        const float lim = frictionCoefficient * abs(deltaLambdaN);
-        deltaLambdaT = -((deltaLambdaT < lim) ? deltaLambdaT : lim);
+        const float nLenSq = dpDot3(normalFromDisp, normalFromDisp);
+        if (nLenSq < FEMCLOTH_THRESHOLD)
+            return false;   // Degenerate triangle.
 
-        commonVec = commonVec + deltaLambdaT * tanDir;
+        const float invLen = 1.0f / sqrt(nLenSq);
+        normalFromDisp = float3(normalFromDisp.x * invLen, normalFromDisp.y * invLen, normalFromDisp.z * invLen);
+
+        const float3 toVertex = xx0 - xx1;
+        if (dpDot3(normalFromDisp, toVertex) < 0.0f)
+            normalFromDisp = float3(-normalFromDisp.x, -normalFromDisp.y, -normalFromDisp.z);
     }
-
-    dx0 = invMass.x * weights.x * commonVec;
-    dx1 = invMass.y * weights.y * commonVec;
-    dx2 = invMass.z * weights.z * commonVec;
-    dx3 = invMass.w * weights.w * commonVec;
+    else
+    {
+        const float invLen = 1.0f / sqrt(dispSq);
+        normalFromDisp = float3(disp.x * invLen, disp.y * invLen, disp.z * invLen);
+    }
 
     return true;
 }
 
-// mDeltaPos accumulators — REAL atomics (pxgSlangAtomicFloat), matching the CUDA
-// atomicAdd.  These used to be a plain load-add-store on the argument that a single
-// contact touches four DISTINCT vertices; that is true per contact and irrelevant
-// across contacts, which is where the contention actually is.  See the module header.
-void deltaBumpW(uint64_t deltaBase, uint vertIdx, float coeff)
+bool computeClothClothEEContact(Ptr<PxgFEMClothGpu> cloth0, Ptr<PxgFEMClothGpu> cloth1, float4 x0, float4 x1,
+                                float4 x2, float4 x3, out float4 weights, out float3 normalFromDisp, out float3 disp)
 {
-    pxgAtomicAddF4W(deltaBase, vertIdx, coeff);
-}
-void deltaAddXYZ(uint64_t deltaBase, uint vertIdx, float3 dx)
-{
-    pxgAtomicAddF4XYZ(deltaBase, vertIdx, dx);
-}
+    const float3 xx0 = f4xyz(x0);
+    const float3 xx1 = f4xyz(x1);
+    const float3 xx2 = f4xyz(x2);
+    const float3 xx3 = f4xyz(x3);
 
-// applyContactDelta (FEMClothExternalSolve.cu:605) — the shared VT/EE scatter.  Per
-// endpoint we pass its cloth's mDeltaPos base (dp*) and mDynamicFrictions base (df*): for
-// VT ep0 -> cloth0, ep1/2/3 -> cloth1; for EE ep0/1 -> cloth0, ep2/3 -> cloth1.
-void applyContactDelta(uint64_t dp0, uint64_t dp1, uint64_t dp2, uint64_t dp3,
-                       uint64_t df0, uint64_t df1, uint64_t df2, uint64_t df3,
-                       uint4 vi, float3 disp, float3 normal, float4 invMasses, float4 weights,
-                       float3 relDelta, float restDist)
-{
-    const float count0 = Ptr<float4>(dp0)[vi.x].w;
-    const float count1 = Ptr<float4>(dp1)[vi.y].w;
-    const float count2 = Ptr<float4>(dp2)[vi.z].w;
-    const float count3 = Ptr<float4>(dp3)[vi.w].w;
+    weights = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    normalFromDisp = float3(0.0f, 0.0f, 0.0f);
+    disp = float3(0.0f, 0.0f, 0.0f);
 
-    const float4 splittedInvMasses = float4(count0 * invMasses.x, count1 * invMasses.y,
-                                            count2 * invMasses.z, count3 * invMasses.w);
+    // Vertex-edge collisions are handled in vertex-triangle collisions.
+    float s, t;
+    float distSq;
+    const bool isValid = closestPtLineLine(xx0, xx1, xx2, xx3, s, t, distSq);
+    const bool isOutside = ((s < DEFORMABLE_BARYCENTRIC_THRESHOLD) || (s > DEFORMABLE_ONE_MINUS_BARYCENTRIC_THRESHOLD) ||
+                            (t < DEFORMABLE_BARYCENTRIC_THRESHOLD) || (t > DEFORMABLE_ONE_MINUS_BARYCENTRIC_THRESHOLD));
 
-    const float frictionCoefficient = 0.25f * (Ptr<float>(df0)[vi.x] + Ptr<float>(df1)[vi.y] +
-                                               Ptr<float>(df2)[vi.z] + Ptr<float>(df3)[vi.w]);
+    if (isOutside)
+        return false;
 
-    float3 dx0, dx1, dx2, dx3;
-    triangleCollisionConstraint(dx0, dx1, dx2, dx3, disp, normal, relDelta, splittedInvMasses,
-                                restDist, frictionCoefficient, weights);
+    weights = float4(1.0f - s, s, -(1.0f - t), -t);   // cloth0 - cloth1
+    disp = ccWeightedSum(weights, xx0, xx1, xx2, xx3);
+    const float dispSq = dpDot3(disp, disp);
+    const float restDist = cloth0[0].mRestOffset + cloth1[0].mRestOffset;
 
-    if (count0 > 0.0f) deltaAddXYZ(dp0, vi.x, dx0);
-    if (count1 > 0.0f) deltaAddXYZ(dp1, vi.y, dx1);
-    if (count2 > 0.0f) deltaAddXYZ(dp2, vi.z, dx2);
-    if (count3 > 0.0f) deltaAddXYZ(dp3, vi.w, dx3);
-}
+    if (dispSq > restDist * restDist)
+        return false;
 
-// countContact (FEMClothExternalSolve.cu:861) — the shared VT/EE count.  cloth0or1 == the
-// endpoint-1 cloth (cloth1 for VT, cloth0 for EE).
-void countContact(uint64_t ciBase, uint aux, float4 coeffs, float3 xx0, float3 xx1, float3 xx2, float3 xx3,
-                  uint64_t dp0, uint64_t dp1, uint64_t dp2, uint64_t dp3, uint4 vi,
-                  float restDist)
-{
-    const float3 disp = coeffs.x * xx0 + coeffs.y * xx1 + coeffs.z * xx2 + coeffs.w * xx3;
-    const float distSq = dot(disp, disp);
-
-    if (distSq > restDist * restDist)
+    // The CUDA tests and normalizes by the closestPtLineLine distSq here, not dispSq.
+    if (distSq < FEMCLOTH_NORMAL_FALLBACK_DISTSQ)
     {
-        ciWriteAuxInd(ciBase, auxMarkInCollision(aux, false));
-        return;
+        if (!isValid)
+            return false;   // Parallel / zero-length AND close: normal undefined.
+        normalFromDisp = dpCross3(xx1 - xx0, xx3 - xx2);
+        const float nLenSq = dpDot3(normalFromDisp, normalFromDisp);
+        if (nLenSq < FEMCLOTH_THRESHOLD)
+            return false;
+        const float invLen = 1.0f / sqrt(nLenSq);
+        normalFromDisp = float3(normalFromDisp.x * invLen, normalFromDisp.y * invLen, normalFromDisp.z * invLen);
+    }
+    else
+    {
+        const float invLen = 1.0f / sqrt(distSq);
+        normalFromDisp = float3(disp.x * invLen, disp.y * invLen, disp.z * invLen);
     }
 
-    const float coeff0 = abs(coeffs.x);
-    const float coeff1 = abs(coeffs.y);
-    const float coeff2 = abs(coeffs.z);
-    const float coeff3 = abs(coeffs.w);
+    if (!isValid)
+    {
+        // Degenerate cases: re-adjust the weights so the constraint applies at the edge midpoints.
+        weights = float4(0.5f, 0.5f, -0.5f, -0.5f);
+    }
 
-    if (coeff0 > 1e-3f) deltaBumpW(dp0, vi.x, coeff0);
-    if (coeff1 > 1e-3f) deltaBumpW(dp1, vi.y, coeff1);
-    if (coeff2 > 1e-3f) deltaBumpW(dp2, vi.z, coeff2);
-    if (coeff3 > 1e-3f) deltaBumpW(dp3, vi.w, coeff3);
+    return true;
+}
 
-    ciWriteAuxInd(ciBase, auxMarkInCollision(aux, true));
+// (disp - relDelta) . normalFromDisp - restDist, relDelta the weighted motion since prevX.
+float computeClothClothInitPen(Ptr<PxgFEMClothGpu> cloth0, Ptr<PxgFEMClothGpu> cloth1, float4 x0, float4 x1,
+                               float4 x2, float4 x3, float4 prevX0, float4 prevX1, float4 prevX2, float4 prevX3,
+                               float4 weights, float3 normalFromDisp, float3 disp)
+{
+    const float4 relDelta4 = weights.x * (x0 - prevX0) + weights.y * (x1 - prevX1) +
+                             weights.z * (x2 - prevX2) + weights.w * (x3 - prevX3);
+    const float3 relDelta = float3(relDelta4.x, relDelta4.y, relDelta4.z);
+    const float restDist = cloth0[0].mRestOffset + cloth1[0].mRestOffset;
+    return dpDot3(disp - relDelta, normalFromDisp) - restDist;
+}
+
+// The four EE vertex indices: edge0 of triangle ref0, edge1 of triangle ref1.
+uint4 ccEdgeEdgeVertices(Ptr<PxgFEMClothGpu> cloth0, Ptr<PxgFEMClothGpu> cloth1, uint64_t ref0, uint64_t ref1)
+{
+    const uint e0_localIndex0 = PxgGetDeformableEdgeLocalIndex(ref0);
+    const uint e1_localIndex0 = PxgGetDeformableEdgeLocalIndex(ref1);
+    const uint e0_localIndex1 = (e0_localIndex0 + 1u) % 3u;
+    const uint e1_localIndex1 = (e1_localIndex0 + 1u) % 3u;
+    const uint4 triVertInd0 = Ptr<uint4>(cloth0[0].mTriangleVertexIndices_ownedEdges)[PxgGetDeformableEdgeTriangle(ref0)];
+    const uint4 triVertInd1 = Ptr<uint4>(cloth1[0].mTriangleVertexIndices_ownedEdges)[PxgGetDeformableEdgeTriangle(ref1)];
+    return uint4(pick3(triVertInd0, e0_localIndex0), pick3(triVertInd0, e0_localIndex1),
+                 pick3(triVertInd1, e1_localIndex0), pick3(triVertInd1, e1_localIndex1));
 }
 
 // ===========================================================================
-// Push-constant blobs (byte-identical to the CUDA arg packs / ABI rows).
+// Push blobs.
 // ===========================================================================
-
-// cloth_clothContactPrepareLaunch (FEMClothConstraintPrep.cu:155).  CUDA arg pack
-// (PxgFEMClothCore.cpp:505): { PxgFEMCloth* clothes, PxgFemFemContactInfo* contactInfos,
-// PxU32* numContacts, PxU32 maxContacts, PxsDeformableSurfaceMaterialData* clothMaterials,
-// const PxU8* updateContactPairs } -> natural-alignment blob = 48 bytes.
-// (ABI row {8,8,8,4,8,8}.)
+// cloth_clothContactPrepareLaunch(PxgFEMCloth* clothes, PxgDeformablePairInfo* contactInfos,
+//   PxU32* numContacts, PxU32 maxContacts, PxsDeformableSurfaceMaterialData* clothMaterials,
+//   const PxU8* updateContactPairs) -> {8, 8, 8, 4, 8, 8} = 48-byte blob.
 struct PrepClothClothParams
 {
     uint64_t clothes;             // @0
-    uint64_t contactInfos;        // @8
-    uint64_t numContacts;         // @16
+    uint64_t contactInfos;        // @8   in/out (INVALID flag)
+    uint64_t numContacts;         // @16  in/out (clamped)
     uint maxContacts;             // @24
     uint _pad28;                  // @28
-    uint64_t clothMaterials;      // @32  (unused; ABI parity)
+    uint64_t clothMaterials;      // @32  (unread, as in CUDA)
     uint64_t updateContactPairs;  // @40  -> 48
 }
 
-// cloth_queryClothClothContact{VT,EE}CountLaunch (FEMClothExternalSolve.cu:902 / :964).
-// CUDA arg pack (PxgFEMClothCore.cpp:1983): { PxgFEMCloth* cloths,
-// PxgFemFemContactInfo* contactInfos, PxU32* numContacts } -> 24-byte blob.
-// (ABI row {8,8,8}.)
+// cloth_queryClothClothContact{VT,EE}CountLaunch(PxgFEMCloth* cloths,
+//   PxgDeformablePairInfo* contactInfos, PxU32* numContacts) -> {8, 8, 8} = 24-byte blob.
 struct QueryClothClothParams
 {
     uint64_t cloths;         // @0
-    uint64_t contactInfos;   // @8
+    uint64_t contactInfos;   // @8   in/out (ACTIVE flag)
     uint64_t numContacts;    // @16 -> 24
 }
 
-// cloth_solveClothClothDelta{VT,EE}Launch (FEMClothExternalSolve.cu:651 / :760).  CUDA arg
-// pack (PxgFEMClothCore.cpp:2005): { PxgFEMCloth* cloths, PxgFemFemContactInfo* contactInfos,
-// PxU32* numContacts, PxReal dt } -> 32-byte blob.  (ABI row {8,8,8,4}.)
+// cloth_solveClothClothDelta{VT,EE}Launch(PxgFEMCloth* cloths,
+//   const PxgDeformablePairInfo* contactInfos, PxU32* numContacts, PxReal dt,
+//   bool isVelocityIteration) -> {8, 8, 8, 4, 1} = 32-byte blob.
 struct SolveClothClothParams
 {
-    uint64_t cloths;         // @0
-    uint64_t contactInfos;   // @8
-    uint64_t numContacts;    // @16
-    float dt;                // @24  (unused; ABI parity)
-    uint _pad28;             // @28 -> 32
+    uint64_t cloths;              // @0
+    uint64_t contactInfos;        // @8
+    uint64_t numContacts;         // @16
+    float dt;                     // @24
+    uint isVelocityIteration;     // @28  bool byte0 -> 32
 }
 
-// cloth_updateClothContactValidityLaunch (FEMClothExternalSolve.cu:1114).  CUDA arg pack
-// (PxgFEMClothCore.cpp:652): { PxgFEMCloth* femCloths, const PxU32* activeIds,
-// bool adaptiveCollisionPairUpdate, bool forceUpdateClothContactPairs,
-// const PxU8* updateContactPairs, PxU32* VTContactCount, PxU32* EEContactCount,
-// PxReal dt } -> natural-alignment blob = 56 bytes.  (ABI row {8,8,1,1,8,8,8,4}.)
+// cloth_updateClothContactValidityLaunch(PxgFEMCloth* femCloths, const PxU32* activeIds,
+//   bool adaptiveCollisionPairUpdate, bool forceUpdateClothContactPairs,
+//   const PxU8* updateContactPairs, PxU32* VTContactCount, PxU32* EEContactCount, PxReal dt)
+//   -> {8, 8, 1, 1, 8, 8, 8, 4} = 56-byte blob.
 struct UpdateValidityParams
 {
     uint64_t femCloths;                 // @0
     uint64_t activeIds;                 // @8
-    uint adaptiveFlagWord;              // @16  bool adaptiveCollisionPairUpdate (byte0)
-    uint forceUpdateFlagWord;          // @20  bool forceUpdateClothContactPairs (byte0) (unused)
+    uint adaptiveFlagWord;              // @16  byte0 = adaptiveCollisionPairUpdate,
+                                        //      byte1 = forceUpdateClothContactPairs (unread)
+    uint _pad20;                        // @20
     uint64_t updateContactPairs;        // @24
     uint64_t VTContactCount;            // @32
     uint64_t EEContactCount;            // @40
-    float dt;                           // @48  (unused; ABI parity)
+    float dt;                           // @48  (unread, as in CUDA)
     uint _pad52;                        // @52 -> 56
 }
 
@@ -615,25 +530,22 @@ struct UpdateValidityParams
 [[vk::push_constant]] ConstantBuffer<UpdateValidityParams> gUpdate;
 
 // ===========================================================================
-// cloth_clothContactPrepareLaunch (FEMClothConstraintPrep.cu:155)
+// cloth_clothContactPrepareLaunch
 // ===========================================================================
 [shader("compute")]
-[numthreads(RC_BLOCK, 1, 1)] // SB_UPDATEROTATION
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_clothContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    // Early exit if contact pairs are not updated (*updateContactPairs == 0; PxU8).
-    if ((Ptr<uint>(gPrep.updateContactPairs)[0] & 0xFFu) == 0u)
+    // Early exit if contact pairs are not updated (the PxU8 gate, read as its word's low byte).
+    if ((Ptr<uint>(gPrep.updateContactPairs)[0] & 0xffu) == 0u)
         return;
 
-    const uint numContactsRaw = Ptr<uint>(gPrep.numContacts)[0];
-    const uint tNumContacts = min(numContactsRaw, gPrep.maxContacts);
+    const uint tNumContacts = min(Ptr<uint>(gPrep.numContacts)[0], gPrep.maxContacts);
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
     const uint idx = groupThreadId.x;
 
-    Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gPrep.clothes);
-
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
 
@@ -643,399 +555,403 @@ void cloth_clothContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
         if (workIndex >= tNumContacts)
             return;
 
-        const uint64_t ciBase = gPrep.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint aux = ciAuxInd(ciBase);
-        if (auxIsValidPair(aux))   // For different cloths, already set valid.
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gPrep.contactInfos, workIndex);
+
+        const uint clothId0 = PxgGetDeformableId(contactInfo.ref0);
+        const uint clothId1 = PxgGetDeformableId(contactInfo.ref1);
+
+        // Only self-collision needs the exact test.  A contact between two cloths stands as
+        // generated, the midphase having applied the filter distance that self-collision only
+        // approximates.
+        if (clothId0 != clothId1)
             continue;
 
-        const uint pairInd0 = ciPairInd0Lo(ciBase);
-        const uint clothId0 = pxGetClothId(pairInd0);
-        const uint elementId0 = pxGetClothElementIndex(pairInd0);
+        Ptr<PxgFEMClothGpu> cloth0 = clothAt(gPrep.clothes, clothId0);
+        Ptr<PxgFEMClothGpu> cloth1 = clothAt(gPrep.clothes, clothId1);
+        const float filterDistance = cloth0[0].mSelfCollisionFilterDistance;
 
-        const uint pairInd1 = ciPairInd1(ciBase);
-        const uint clothId1 = pxGetClothId(pairInd1);
-        const uint elementId1 = pxGetClothElementIndex(pairInd1);
-
-        const float filterDistance = clothes[clothId0].mSelfCollisionFilterDistance;
-        const float filterDistSq = filterDistance * filterDistance;
-
-        if (auxIsEdgeEdgePair(aux))   // Edge-edge collision
+        if (PxgGetDeformableFeatureType(contactInfo.ref0) == PXG_DREF_eTRIANGLE_EDGE)
         {
-            const uint e0_localIndex0 = auxGetInd0(aux);
-            const uint e0_localIndex1 = (e0_localIndex0 + 1u) % 3u;
-            const uint4 triVertInd0 = Ptr<uint4>(clothes[clothId0].mTriangleVertexIndices)[elementId0];
-            const uint e0_v0 = pick3(triVertInd0, e0_localIndex0);
-            const uint e0_v1 = pick3(triVertInd0, e0_localIndex1);
+            const uint4 vertIndices = ccEdgeEdgeVertices(cloth0, cloth1, contactInfo.ref0, contactInfo.ref1);
 
-            const uint e1_localIndex0 = auxGetInd1(aux);
-            const uint e1_localIndex1 = (e1_localIndex0 + 1u) % 3u;
-            const uint4 triVertInd1 = Ptr<uint4>(clothes[clothId1].mTriangleVertexIndices)[elementId1];
-            const uint e1_v0 = pick3(triVertInd1, e1_localIndex0);
-            const uint e1_v1 = pick3(triVertInd1, e1_localIndex1);
+            // Compute the exact rest distance for filtering.
+            const float3 r0 = Ptr<float4>(cloth0[0].mRestPosition)[vertIndices.x].xyz;
+            const float3 r1 = Ptr<float4>(cloth0[0].mRestPosition)[vertIndices.y].xyz;
+            const float3 r2 = Ptr<float4>(cloth1[0].mRestPosition)[vertIndices.z].xyz;
+            const float3 r3 = Ptr<float4>(cloth1[0].mRestPosition)[vertIndices.w].xyz;
 
-            const float3 r0 = Ptr<float4>(clothes[clothId0].mRestPosition)[e0_v0].xyz;
-            const float3 r1 = Ptr<float4>(clothes[clothId0].mRestPosition)[e0_v1].xyz;
-            const float3 r2 = Ptr<float4>(clothes[clothId1].mRestPosition)[e1_v0].xyz;
-            const float3 r3 = Ptr<float4>(clothes[clothId1].mRestPosition)[e1_v1].xyz;
-
-            float s, t, restDistSq;
+            float s, t;
+            float restDistSq;
             closestPtEdgeEdge(r0, r1, r2, r3, s, t, restDistSq);
 
-            if (restDistSq > filterDistSq)
-                ciWriteAuxInd(ciBase, auxMarkValid(aux));
+            if (restDistSq <= filterDistance * filterDistance)
+                ccWriteRef1(gPrep.contactInfos, workIndex, PxgInvalidatePairInfo(contactInfo).ref1);
         }
         else   // Vertex-triangle collision
         {
-            const uint4 triVertId1 = Ptr<uint4>(clothes[clothId1].mTriangleVertexIndices)[elementId1];
+            const uint4 triVertId1 = Ptr<uint4>(cloth1[0].mTriangleVertexIndices_ownedEdges)[PxgGetDeformableFeatureId(contactInfo.ref1)];
 
-            const float3 r0 = Ptr<float4>(clothes[clothId0].mRestPosition)[elementId0].xyz;
-            const float3 r1 = Ptr<float4>(clothes[clothId1].mRestPosition)[triVertId1.x].xyz;
-            const float3 r2 = Ptr<float4>(clothes[clothId1].mRestPosition)[triVertId1.y].xyz;
-            const float3 r3 = Ptr<float4>(clothes[clothId1].mRestPosition)[triVertId1.z].xyz;
+            const float3 r0 = Ptr<float4>(cloth0[0].mRestPosition)[PxgGetDeformableFeatureId(contactInfo.ref0)].xyz;
+            const float3 r1 = Ptr<float4>(cloth1[0].mRestPosition)[triVertId1.x].xyz;
+            const float3 r2 = Ptr<float4>(cloth1[0].mRestPosition)[triVertId1.y].xyz;
+            const float3 r3 = Ptr<float4>(cloth1[0].mRestPosition)[triVertId1.z].xyz;
 
             const float3 r12 = r2 - r1;
             const float3 r13 = r3 - r1;
 
             const float3 closest = closestPtPointTriangle2(r0, r1, r2, r3, r12, r13);
-            const float3 diff = r0 - closest;
-            const float restDistSq = dot(diff, diff);
 
-            if (restDistSq > filterDistSq)
-                ciWriteAuxInd(ciBase, auxMarkValid(aux));
+            const float3 rd = r0 - closest;
+            const float restDistSq = dpDot3(rd, rd);
+            if (restDistSq <= filterDistance * filterDistance)
+                ccWriteRef1(gPrep.contactInfos, workIndex, PxgInvalidatePairInfo(contactInfo).ref1);
         }
     }
 }
 
 // ===========================================================================
-// cloth_queryClothClothContactVTCountLaunch (FEMClothExternalSolve.cu:902)
+// cloth_queryClothClothContact{VT,EE}CountLaunch
 // ===========================================================================
+// The magnitude-weighted reference-count bump (PX_CLOTH_CLOTH_INTEGER_REFCOUNT == 0).
+void ccBumpAbs(uint64_t deltaPos, uint vertIdx, float w)
+{
+    if (abs(w) > 1e-3f)
+        pxgAtomicAddF4W(deltaPos, vertIdx, abs(w));
+}
+
 [shader("compute")]
-[numthreads(RC_BLOCK, 1, 1)] // SB_UPDATEROTATION
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_queryClothClothContactVTCountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint tNumContacts = Ptr<uint>(gQuery.numContacts)[0];
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
 
-    Ptr<PxgFEMClothGpu> cloths = Ptr<PxgFEMClothGpu>(gQuery.cloths);
-
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint workIndex = i * RC_BLOCK + groupThreadId.x + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (workIndex >= tNumContacts)
             return;
 
-        const uint64_t ciBase = gQuery.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint aux = ciAuxInd(ciBase);
-        if (!auxIsValidPair(aux))
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gQuery.contactInfos, workIndex);
+        if (!PxgIsValidPairInfo(contactInfo))
+            continue;
+
+        Ptr<PxgFEMClothGpu> cloth0 = clothAt(gQuery.cloths, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgFEMClothGpu> cloth1 = clothAt(gQuery.cloths, PxgGetDeformableId(contactInfo.ref1));
+
+        const uint elementId0 = PxgGetDeformableFeatureId(contactInfo.ref0);
+        const uint elementId1 = PxgGetDeformableFeatureId(contactInfo.ref1);
+
+        const uint4 triVertId1 = Ptr<uint4>(cloth1[0].mTriangleVertexIndices_ownedEdges)[elementId1];
+        const uint4 vertIndices = uint4(elementId0, triVertId1.x, triVertId1.y, triVertId1.z);
+
+        const float4 x0 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.x];
+        const float4 x1 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.y];
+        const float4 x2 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.z];
+        const float4 x3 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.w];
+
+        float4 weights;
+        float3 normalFromDisp;
+        float3 disp;
+        if (!computeClothClothVTContact(cloth0, cloth1, x0, x1, x2, x3, weights, normalFromDisp, disp))
         {
-            ciWriteAuxInd(ciBase, auxMarkInCollision(aux, false));
+            ccWriteRef1(gQuery.contactInfos, workIndex, PxgSetActiveRef1(contactInfo.ref1, false));
             continue;
         }
 
-        const uint pairInd0 = ciPairInd0Lo(ciBase);
-        const uint pairInd1 = ciPairInd1(ciBase);
-        const uint clothId0 = pxGetClothId(pairInd0);
-        const uint clothId1 = pxGetClothId(pairInd1);
-        const uint elementId0 = pxGetClothElementIndex(pairInd0);
-        const uint elementId1 = pxGetClothElementIndex(pairInd1);
-
-        const uint4 triVertId1 = Ptr<uint4>(cloths[clothId1].mTriangleVertexIndices)[elementId1];
-        const uint4 vertIndices = uint4(elementId0, triVertId1.x, triVertId1.y, triVertId1.z);
-
-        const float3 xx0 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vertIndices.x].xyz;
-        const float3 xx1 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.y].xyz;
-        const float3 xx2 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.z].xyz;
-        const float3 xx3 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.w].xyz;
-
-        float s, t;
-        const float3 closestPt = closestPtPointTriangle(xx0, xx1, xx2, xx3, s, t);
-        const float r = 1.0f - s - t;
-        const float4 weights = float4(1.0f, -r, -s, -t);   // cloth0 - cloth1
-
-        const float restDist = cloths[clothId0].mRestDistance + cloths[clothId1].mRestDistance;
-
-        // countContact: cloth0or1 == cloth1 (ep1 belongs to cloth1).
-        const uint64_t dp0 = cloths[clothId0].mDeltaPos;
-        const uint64_t dp1 = cloths[clothId1].mDeltaPos;
-        countContact(ciBase, aux, weights, xx0, xx1, xx2, xx3, dp0, dp1, dp1, dp1, vertIndices, restDist);
+        // VT layout: vert 0 -> cloth0; verts 1..3 -> cloth1 (triangle).
+        ccBumpAbs(cloth0[0].mDeltaPos, vertIndices.x, weights.x);
+        ccBumpAbs(cloth1[0].mDeltaPos, vertIndices.y, weights.y);
+        ccBumpAbs(cloth1[0].mDeltaPos, vertIndices.z, weights.z);
+        ccBumpAbs(cloth1[0].mDeltaPos, vertIndices.w, weights.w);
+        ccWriteRef1(gQuery.contactInfos, workIndex, PxgSetActiveRef1(contactInfo.ref1, true));
     }
 }
 
-// ===========================================================================
-// cloth_queryClothClothContactEECountLaunch (FEMClothExternalSolve.cu:964)
-// ===========================================================================
 [shader("compute")]
-[numthreads(RC_BLOCK, 1, 1)] // SB_UPDATEROTATION
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_queryClothClothContactEECountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint tNumContacts = Ptr<uint>(gQuery.numContacts)[0];
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
 
-    Ptr<PxgFEMClothGpu> cloths = Ptr<PxgFEMClothGpu>(gQuery.cloths);
-
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint workIndex = i * RC_BLOCK + groupThreadId.x + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (workIndex >= tNumContacts)
             return;
 
-        const uint64_t ciBase = gQuery.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint aux = ciAuxInd(ciBase);
-        if (!auxIsValidPair(aux))
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gQuery.contactInfos, workIndex);
+        if (!PxgIsValidPairInfo(contactInfo))
+            continue;
+
+        Ptr<PxgFEMClothGpu> cloth0 = clothAt(gQuery.cloths, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgFEMClothGpu> cloth1 = clothAt(gQuery.cloths, PxgGetDeformableId(contactInfo.ref1));
+
+        const uint4 vertIndices = ccEdgeEdgeVertices(cloth0, cloth1, contactInfo.ref0, contactInfo.ref1);
+
+        const float4 x0 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.x];
+        const float4 x1 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.y];
+        const float4 x2 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.z];
+        const float4 x3 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.w];
+
+        float4 weights;
+        float3 normalFromDisp;
+        float3 disp;
+        if (!computeClothClothEEContact(cloth0, cloth1, x0, x1, x2, x3, weights, normalFromDisp, disp))
         {
-            ciWriteAuxInd(ciBase, auxMarkInCollision(aux, false));
+            ccWriteRef1(gQuery.contactInfos, workIndex, PxgSetActiveRef1(contactInfo.ref1, false));
             continue;
         }
 
-        const uint pairInd0 = ciPairInd0Lo(ciBase);
-        const uint pairInd1 = ciPairInd1(ciBase);
-        const uint e0_localIndex0 = auxGetInd0(aux);
-        const uint e1_localIndex0 = auxGetInd1(aux);
-        const uint clothId0 = pxGetClothId(pairInd0);
-        const uint clothId1 = pxGetClothId(pairInd1);
-        const uint elementId0 = pxGetClothElementIndex(pairInd0);
-        const uint elementId1 = pxGetClothElementIndex(pairInd1);
-
-        const uint e0_localIndex1 = (e0_localIndex0 + 1u) % 3u;
-        const uint4 triVertInd0 = Ptr<uint4>(cloths[clothId0].mTriangleVertexIndices)[elementId0];
-        const uint vi0 = pick3(triVertInd0, e0_localIndex0);
-        const uint vi1 = pick3(triVertInd0, e0_localIndex1);
-
-        const uint e1_localIndex1 = (e1_localIndex0 + 1u) % 3u;
-        const uint4 triVertInd1 = Ptr<uint4>(cloths[clothId1].mTriangleVertexIndices)[elementId1];
-        const uint vi2 = pick3(triVertInd1, e1_localIndex0);
-        const uint vi3 = pick3(triVertInd1, e1_localIndex1);
-        const uint4 vertIndices = uint4(vi0, vi1, vi2, vi3);
-
-        const float3 xx0 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vi0].xyz;
-        const float3 xx1 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vi1].xyz;
-        const float3 xx2 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vi2].xyz;
-        const float3 xx3 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vi3].xyz;
-
-        float s, t, distSq;
-        closestPtLineLine(xx0, xx1, xx2, xx3, s, t, distSq);
-        const bool isOutside = (s < DEFORMABLE_BARYCENTRIC_THRESHOLD) || (s > DEFORMABLE_ONE_MINUS_BARYCENTRIC_THRESHOLD) ||
-                               (t < DEFORMABLE_BARYCENTRIC_THRESHOLD) || (t > DEFORMABLE_ONE_MINUS_BARYCENTRIC_THRESHOLD);
-        if (isOutside)
-        {
-            ciWriteAuxInd(ciBase, auxMarkInCollision(aux, false));
-            continue;
-        }
-
-        const float4 weights = float4(1.0f - s, s, -(1.0f - t), -t);   // cloth0 - cloth1
-        const float restDist = cloths[clothId0].mRestDistance + cloths[clothId1].mRestDistance;
-
-        // countContact: cloth0or1 == cloth0 (ep1 belongs to cloth0).
-        const uint64_t dp0 = cloths[clothId0].mDeltaPos;
-        const uint64_t dp1 = cloths[clothId1].mDeltaPos;
-        countContact(ciBase, aux, weights, xx0, xx1, xx2, xx3, dp0, dp0, dp1, dp1, vertIndices, restDist);
+        // EE layout: verts 0..1 -> cloth0 (edge); verts 2..3 -> cloth1 (edge).
+        ccBumpAbs(cloth0[0].mDeltaPos, vertIndices.x, weights.x);
+        ccBumpAbs(cloth0[0].mDeltaPos, vertIndices.y, weights.y);
+        ccBumpAbs(cloth1[0].mDeltaPos, vertIndices.z, weights.z);
+        ccBumpAbs(cloth1[0].mDeltaPos, vertIndices.w, weights.w);
+        ccWriteRef1(gQuery.contactInfos, workIndex, PxgSetActiveRef1(contactInfo.ref1, true));
     }
 }
 
 // ===========================================================================
-// cloth_solveClothClothDeltaVTLaunch (FEMClothExternalSolve.cu:651)
+// cloth_solveClothClothDelta{VT,EE}Launch
 // ===========================================================================
 [shader("compute")]
-[numthreads(RC_BLOCK, 1, 1)] // __launch_bounds__(256, 4)
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_solveClothClothDeltaVTLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint tNumContacts = Ptr<uint>(gSolve.numContacts)[0];
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+    const float dt = gSolve.dt;
+    const bool isVelocityIteration = (gSolve.isVelocityIteration & 0xffu) != 0u;
 
-    Ptr<PxgFEMClothGpu> cloths = Ptr<PxgFEMClothGpu>(gSolve.cloths);
-
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint workIndex = i * RC_BLOCK + groupThreadId.x + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (workIndex >= tNumContacts)
             return;
 
-        const uint64_t ciBase = gSolve.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint aux = ciAuxInd(ciBase);
-        if (!auxIsInCollision(aux))
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gSolve.contactInfos, workIndex);
+        if (!PxgIsActivePairInfo(contactInfo))
             continue;
 
-        const uint pairInd0 = ciPairInd0Lo(ciBase);
-        const uint pairInd1 = ciPairInd1(ciBase);
-        const uint clothId0 = pxGetClothId(pairInd0);
-        const uint clothId1 = pxGetClothId(pairInd1);
-        const uint elementId0 = pxGetClothElementIndex(pairInd0);
-        const uint elementId1 = pxGetClothElementIndex(pairInd1);
+        Ptr<PxgFEMClothGpu> cloth0 = clothAt(gSolve.cloths, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgFEMClothGpu> cloth1 = clothAt(gSolve.cloths, PxgGetDeformableId(contactInfo.ref1));
 
-        const uint4 triVertId1 = Ptr<uint4>(cloths[clothId1].mTriangleVertexIndices)[elementId1];
+        const uint elementId0 = PxgGetDeformableFeatureId(contactInfo.ref0);
+        const uint elementId1 = PxgGetDeformableFeatureId(contactInfo.ref1);
+
+        const uint4 triVertId1 = Ptr<uint4>(cloth1[0].mTriangleVertexIndices_ownedEdges)[elementId1];
         const uint4 vertIndices = uint4(elementId0, triVertId1.x, triVertId1.y, triVertId1.z);
 
-        const float4 x0 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vertIndices.x];
-        const float4 x1 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.y];
-        const float4 x2 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.z];
-        const float4 x3 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vertIndices.w];
+        const float4 x0 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.x];
+        const float4 x1 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.y];
+        const float4 x2 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.z];
+        const float4 x3 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.w];
 
-        const float4 prevX0 = Ptr<float4>(cloths[clothId0].mPrevPositionInContactOffset)[vertIndices.x];
-        const float4 prevX1 = Ptr<float4>(cloths[clothId1].mPrevPositionInContactOffset)[vertIndices.y];
-        const float4 prevX2 = Ptr<float4>(cloths[clothId1].mPrevPositionInContactOffset)[vertIndices.z];
-        const float4 prevX3 = Ptr<float4>(cloths[clothId1].mPrevPositionInContactOffset)[vertIndices.w];
+        const float frictionCoefficient = 0.25f * (Ptr<float>(cloth0[0].mDynamicFrictions)[vertIndices.x] +
+                                                   Ptr<float>(cloth1[0].mDynamicFrictions)[vertIndices.y] +
+                                                   Ptr<float>(cloth1[0].mDynamicFrictions)[vertIndices.z] +
+                                                   Ptr<float>(cloth1[0].mDynamicFrictions)[vertIndices.w]);
 
-        const float4 invMasses = float4(x0.w, x1.w, x2.w, x3.w);
-        const float3 xx0 = x0.xyz;
-        const float3 xx1 = x1.xyz;
-        const float3 xx2 = x2.xyz;
-        const float3 xx3 = x3.xyz;
+        // Refcounts populated by the count pass (magnitude weighting).
+        const float count0 = Ptr<float4>(cloth0[0].mDeltaPos)[vertIndices.x].w;
+        const float count1 = Ptr<float4>(cloth1[0].mDeltaPos)[vertIndices.y].w;
+        const float count2 = Ptr<float4>(cloth1[0].mDeltaPos)[vertIndices.z].w;
+        const float count3 = Ptr<float4>(cloth1[0].mDeltaPos)[vertIndices.w].w;
 
-        float s, t;
-        const float3 closestPt = closestPtPointTriangle(xx0, xx1, xx2, xx3, s, t);
-        const float r = 1.0f - s - t;
-        const float4 weights = float4(1.0f, -r, -s, -t);   // cloth0 - cloth1
+        PxgDeformablePart db0 = PxgDeformablePart();
+        PxgDeformablePart db1 = PxgDeformablePart();
+        PxgDbContactPair contactPair = PxgDbContactPair();
+        PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+        float4 weights;
+        float3 normalFromDisp;
+        float3 disp;
+        if (!computeClothClothVTContact(cloth0, cloth1, x0, x1, x2, x3, weights, normalFromDisp, disp))
+            continue;   // pair separated or degenerated since the count pass
 
-        const float3 disp = weights.x * xx0 + weights.y * xx1 + weights.z * xx2 + weights.w * xx3;
-        const float dispSq = dot(disp, disp);
+        contactPair.maxPenBiasClamp = dpSelectMax(cloth0[0].mPenBiasClamp, cloth1[0].mPenBiasClamp);
+        db0.ref = contactInfo.ref0;   // cloth0 side is a single vertex
+        db1.ref = contactInfo.ref1;   // cloth1 side is a triangle
+        db0.bc = float4(1.0f, 0.0f, 0.0f, 0.0f);
+        db1.bc = float4(-weights.y, -weights.z, -weights.w, 0.0f);
+        contactPair.normal = float3(-normalFromDisp.x, -normalFromDisp.y, -normalFromDisp.z);
 
-        float3 normal;
-        if (dispSq < FEMCLOTH_THRESHOLD)
+        // Side 0: cloth0 vertex.  Side 1: cloth1 triangle.
+        db0.vertexInvMasses = float4(count0 * x0.w, 0.0f, 0.0f, 0.0f);
+        db1.vertexInvMasses = float4(count1 * x1.w, count2 * x2.w, count3 * x3.w, 0.0f);
+
+        if (!isVelocityIteration)
         {
-            // Vertex is nearly on the triangle, use triangle normal.
-            const float3 ab = xx2 - xx1;
-            const float3 ac = xx3 - xx1;
-            normal = cross(ab, ac);
+            // prevX is the baseline at the last cloth-cloth narrowphase refresh.
+            const float4 prevX0 = Ptr<float4>(cloth0[0].mPrevPositionInContactOffset)[vertIndices.x];
+            const float4 prevX1 = Ptr<float4>(cloth1[0].mPrevPositionInContactOffset)[vertIndices.y];
+            const float4 prevX2 = Ptr<float4>(cloth1[0].mPrevPositionInContactOffset)[vertIndices.z];
+            const float4 prevX3 = Ptr<float4>(cloth1[0].mPrevPositionInContactOffset)[vertIndices.w];
 
-            const float nLenSq = dot(normal, normal);
-            if (nLenSq < FEMCLOTH_THRESHOLD)
-                continue;   // Degenerate triangle.
+            db0.linDelta = float3(x0.x - prevX0.x, x0.y - prevX0.y, x0.z - prevX0.z);
+            const float4 db1Delta4 = db1.bc.x * (x1 - prevX1) + db1.bc.y * (x2 - prevX2) + db1.bc.z * (x3 - prevX3);
+            db1.linDelta = float3(db1Delta4.x, db1Delta4.y, db1Delta4.z);
 
-            normal = normal * (1.0f / sqrt(nLenSq));
+            contactPair.initPen = computeClothClothInitPen(cloth0, cloth1, x0, x1, x2, x3, prevX0, prevX1, prevX2,
+                                                           prevX3, weights, normalFromDisp, disp);
 
-            const float3 toVertex = xx0 - xx1;
-            if (dot(normal, toVertex) < 0.0f)
-                normal = -normal;
+            db0.posDelta = db0.linDelta;
+            db1.posDelta = db1.linDelta;
         }
         else
         {
-            const float dist = sqrt(dispSq);
-            // P9.36: FEMClothExternalSolve.cu:748 -- PxVec3::operator/, which is ONE
-            // reciprocal and three multiplies.  The sibling branch at :846 spells the very
-            // same operation `disp * (1.0f / dist)`; they are not two lowerings.
-            normal = disp * (1.0f / dist);
+            // linDelta holds velocity * dt; the posDeltas stay zero and initPen carries the
+            // current separation.
+            contactPair.initPen = dpDot3(disp, normalFromDisp) - (cloth0[0].mRestOffset + cloth1[0].mRestOffset);
+            const float4 vel0 = Ptr<float4>(cloth0[0].mVelocity_InvMass)[vertIndices.x];
+            db0.linDelta = float3(vel0.x * dt, vel0.y * dt, vel0.z * dt);
+            const float4 vel1 = Ptr<float4>(cloth1[0].mVelocity_InvMass)[vertIndices.y];
+            const float4 vel2 = Ptr<float4>(cloth1[0].mVelocity_InvMass)[vertIndices.z];
+            const float4 vel3 = Ptr<float4>(cloth1[0].mVelocity_InvMass)[vertIndices.w];
+            const float4 db1Vel4 = db1.bc.x * vel1 + db1.bc.y * vel2 + db1.bc.z * vel3;
+            db1.linDelta = float3(db1Vel4.x * dt, db1Vel4.y * dt, db1Vel4.z * dt);
         }
 
-        const float4 relDelta4 = weights.x * (x0 - prevX0) + weights.y * (x1 - prevX1) +
-                                 weights.z * (x2 - prevX2) + weights.w * (x3 - prevX3);
-        const float3 relDelta = float3(relDelta4.x, relDelta4.y, relDelta4.z);
+        const bool hasApplied = solveDbDbContact(db0, db1, contactPair, solveOut, 0.0f, 0.0f, frictionCoefficient, dt,
+                                                 /*checkOnlyActivity*/ false, isVelocityIteration);
 
-        const float restDist = cloths[clothId0].mRestDistance + cloths[clothId1].mRestDistance;
+        if (hasApplied)
+        {
+            float3 delta;
+            solveOut.computeDelta(contactPair, delta, dt);
 
-        // applyContactDelta: cloth0or1 == cloth1.
-        const uint64_t dp0 = cloths[clothId0].mDeltaPos;
-        const uint64_t dp1 = cloths[clothId1].mDeltaPos;
-        const uint64_t df0 = cloths[clothId0].mDynamicFrictions;
-        const uint64_t df1 = cloths[clothId1].mDynamicFrictions;
-        applyContactDelta(dp0, dp1, dp1, dp1, df0, df1, df1, df1, vertIndices, disp, normal,
-                          invMasses, weights, relDelta, restDist);
+            // writeCloth scatters .xyz only; the count pass owns .w this iteration.
+            db0.writeCloth(cloth0, delta);
+            db1.writeCloth(cloth1, float3(-delta.x, -delta.y, -delta.z));
+        }
     }
 }
 
-// ===========================================================================
-// cloth_solveClothClothDeltaEELaunch (FEMClothExternalSolve.cu:760)
-// ===========================================================================
 [shader("compute")]
-[numthreads(RC_BLOCK, 1, 1)] // __launch_bounds__(256, 4)
+[numthreads(256, 1, 1)]   // == RC_BLOCK
 void cloth_solveClothClothDeltaEELaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint tNumContacts = Ptr<uint>(gSolve.numContacts)[0];
     const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
     const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+    const float dt = gSolve.dt;
+    const bool isVelocityIteration = (gSolve.isVelocityIteration & 0xffu) != 0u;
 
-    Ptr<PxgFEMClothGpu> cloths = Ptr<PxgFEMClothGpu>(gSolve.cloths);
-
-    for (uint i = 0u; i < nbIterationsPerBlock; ++i)
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
         const uint workIndex = i * RC_BLOCK + groupThreadId.x + nbIterationsPerBlock * groupId.x * RC_BLOCK;
         if (workIndex >= tNumContacts)
             return;
 
-        const uint64_t ciBase = gSolve.contactInfos + uint64_t(workIndex) * CI_STRIDE;
-        const uint aux = ciAuxInd(ciBase);
-        if (!auxIsInCollision(aux))
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gSolve.contactInfos, workIndex);
+        if (!PxgIsActivePairInfo(contactInfo))
             continue;
 
-        const uint pairInd0 = ciPairInd0Lo(ciBase);
-        const uint pairInd1 = ciPairInd1(ciBase);
-        const uint e0_localIndex0 = auxGetInd0(aux);
-        const uint e1_localIndex0 = auxGetInd1(aux);
-        const uint clothId0 = pxGetClothId(pairInd0);
-        const uint clothId1 = pxGetClothId(pairInd1);
-        const uint elementId0 = pxGetClothElementIndex(pairInd0);
-        const uint elementId1 = pxGetClothElementIndex(pairInd1);
+        Ptr<PxgFEMClothGpu> cloth0 = clothAt(gSolve.cloths, PxgGetDeformableId(contactInfo.ref0));
+        Ptr<PxgFEMClothGpu> cloth1 = clothAt(gSolve.cloths, PxgGetDeformableId(contactInfo.ref1));
 
-        const uint e0_localIndex1 = (e0_localIndex0 + 1u) % 3u;
-        const uint4 triVertInd0 = Ptr<uint4>(cloths[clothId0].mTriangleVertexIndices)[elementId0];
-        const uint vi0 = pick3(triVertInd0, e0_localIndex0);
-        const uint vi1 = pick3(triVertInd0, e0_localIndex1);
+        const uint4 vertIndices = ccEdgeEdgeVertices(cloth0, cloth1, contactInfo.ref0, contactInfo.ref1);
 
-        const uint e1_localIndex1 = (e1_localIndex0 + 1u) % 3u;
-        const uint4 triVertInd1 = Ptr<uint4>(cloths[clothId1].mTriangleVertexIndices)[elementId1];
-        const uint vi2 = pick3(triVertInd1, e1_localIndex0);
-        const uint vi3 = pick3(triVertInd1, e1_localIndex1);
-        const uint4 vertIndices = uint4(vi0, vi1, vi2, vi3);
+        const float4 x0 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.x];
+        const float4 x1 = Ptr<float4>(cloth0[0].mPosition_InvMass)[vertIndices.y];
+        const float4 x2 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.z];
+        const float4 x3 = Ptr<float4>(cloth1[0].mPosition_InvMass)[vertIndices.w];
 
-        const float4 x0 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vi0];
-        const float4 x1 = Ptr<float4>(cloths[clothId0].mPosition_InvMass)[vi1];
-        const float4 x2 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vi2];
-        const float4 x3 = Ptr<float4>(cloths[clothId1].mPosition_InvMass)[vi3];
+        const float frictionCoefficient = 0.25f * (Ptr<float>(cloth0[0].mDynamicFrictions)[vertIndices.x] +
+                                                   Ptr<float>(cloth0[0].mDynamicFrictions)[vertIndices.y] +
+                                                   Ptr<float>(cloth1[0].mDynamicFrictions)[vertIndices.z] +
+                                                   Ptr<float>(cloth1[0].mDynamicFrictions)[vertIndices.w]);
 
-        const float4 prevX0 = Ptr<float4>(cloths[clothId0].mPrevPositionInContactOffset)[vi0];
-        const float4 prevX1 = Ptr<float4>(cloths[clothId0].mPrevPositionInContactOffset)[vi1];
-        const float4 prevX2 = Ptr<float4>(cloths[clothId1].mPrevPositionInContactOffset)[vi2];
-        const float4 prevX3 = Ptr<float4>(cloths[clothId1].mPrevPositionInContactOffset)[vi3];
+        const float count0 = Ptr<float4>(cloth0[0].mDeltaPos)[vertIndices.x].w;
+        const float count1 = Ptr<float4>(cloth0[0].mDeltaPos)[vertIndices.y].w;
+        const float count2 = Ptr<float4>(cloth1[0].mDeltaPos)[vertIndices.z].w;
+        const float count3 = Ptr<float4>(cloth1[0].mDeltaPos)[vertIndices.w].w;
 
-        const float4 invMasses = float4(x0.w, x1.w, x2.w, x3.w);
-        const float3 xx0 = x0.xyz;
-        const float3 xx1 = x1.xyz;
-        const float3 xx2 = x2.xyz;
-        const float3 xx3 = x3.xyz;
+        PxgDeformablePart db0 = PxgDeformablePart();
+        PxgDeformablePart db1 = PxgDeformablePart();
+        PxgDbContactPair contactPair = PxgDbContactPair();
+        PxgDbSolveOutput solveOut = PxgDbSolveOutput();
+        float4 weights;
+        float3 normalFromDisp;
+        float3 disp;
+        if (!computeClothClothEEContact(cloth0, cloth1, x0, x1, x2, x3, weights, normalFromDisp, disp))
+            continue;   // pair separated or degenerated since the count pass
 
-        float s, t, distSq;
-        const bool isValid = closestPtLineLine(xx0, xx1, xx2, xx3, s, t, distSq);
+        contactPair.maxPenBiasClamp = dpSelectMax(cloth0[0].mPenBiasClamp, cloth1[0].mPenBiasClamp);
+        // Each side is an edge, so only two weights are used.
+        db0.ref = contactInfo.ref0;
+        db1.ref = contactInfo.ref1;
+        db0.bc = float4(weights.x, weights.y, 0.0f, 0.0f);
+        db1.bc = float4(-weights.z, -weights.w, 0.0f, 0.0f);
+        contactPair.normal = float3(-normalFromDisp.x, -normalFromDisp.y, -normalFromDisp.z);
 
-        float4 weights = float4(1.0f - s, s, -(1.0f - t), -t);   // cloth0 - cloth1
-        const float3 disp = weights.x * xx0 + weights.y * xx1 + weights.z * xx2 + weights.w * xx3;
-        const float dist = sqrt(distSq);
+        db0.vertexInvMasses = float4(count0 * x0.w, count1 * x1.w, 0.0f, 0.0f);
+        db1.vertexInvMasses = float4(count2 * x2.w, count3 * x3.w, 0.0f, 0.0f);
 
-        const float3 normal = disp * (1.0f / dist);
+        if (!isVelocityIteration)
+        {
+            const float4 prevX0 = Ptr<float4>(cloth0[0].mPrevPositionInContactOffset)[vertIndices.x];
+            const float4 prevX1 = Ptr<float4>(cloth0[0].mPrevPositionInContactOffset)[vertIndices.y];
+            const float4 prevX2 = Ptr<float4>(cloth1[0].mPrevPositionInContactOffset)[vertIndices.z];
+            const float4 prevX3 = Ptr<float4>(cloth1[0].mPrevPositionInContactOffset)[vertIndices.w];
 
-        if (!isValid)   // Degenerate: apply at mid-points.
-            weights = float4(0.5f, 0.5f, -0.5f, -0.5f);
+            const float4 db0Delta4 = db0.bc.x * (x0 - prevX0) + db0.bc.y * (x1 - prevX1);
+            db0.linDelta = float3(db0Delta4.x, db0Delta4.y, db0Delta4.z);
+            const float4 db1Delta4 = db1.bc.x * (x2 - prevX2) + db1.bc.y * (x3 - prevX3);
+            db1.linDelta = float3(db1Delta4.x, db1Delta4.y, db1Delta4.z);
 
-        const float4 relDelta4 = weights.x * (x0 - prevX0) + weights.y * (x1 - prevX1) +
-                                 weights.z * (x2 - prevX2) + weights.w * (x3 - prevX3);
-        const float3 relDelta = float3(relDelta4.x, relDelta4.y, relDelta4.z);
+            contactPair.initPen = computeClothClothInitPen(cloth0, cloth1, x0, x1, x2, x3, prevX0, prevX1, prevX2,
+                                                           prevX3, weights, normalFromDisp, disp);
 
-        const float restDist = cloths[clothId0].mRestDistance + cloths[clothId1].mRestDistance;
+            db0.posDelta = db0.linDelta;
+            db1.posDelta = db1.linDelta;
+        }
+        else
+        {
+            contactPair.initPen = dpDot3(disp, normalFromDisp) - (cloth0[0].mRestOffset + cloth1[0].mRestOffset);
+            const float4 vel0 = Ptr<float4>(cloth0[0].mVelocity_InvMass)[vertIndices.x];
+            const float4 vel1 = Ptr<float4>(cloth0[0].mVelocity_InvMass)[vertIndices.y];
+            const float4 db0Vel4 = db0.bc.x * vel0 + db0.bc.y * vel1;
+            db0.linDelta = float3(db0Vel4.x * dt, db0Vel4.y * dt, db0Vel4.z * dt);
+            const float4 vel2 = Ptr<float4>(cloth1[0].mVelocity_InvMass)[vertIndices.z];
+            const float4 vel3 = Ptr<float4>(cloth1[0].mVelocity_InvMass)[vertIndices.w];
+            const float4 db1Vel4 = db1.bc.x * vel2 + db1.bc.y * vel3;
+            db1.linDelta = float3(db1Vel4.x * dt, db1Vel4.y * dt, db1Vel4.z * dt);
+        }
 
-        // applyContactDelta: cloth0or1 == cloth0.
-        const uint64_t dp0 = cloths[clothId0].mDeltaPos;
-        const uint64_t dp1 = cloths[clothId1].mDeltaPos;
-        const uint64_t df0 = cloths[clothId0].mDynamicFrictions;
-        const uint64_t df1 = cloths[clothId1].mDynamicFrictions;
-        applyContactDelta(dp0, dp0, dp1, dp1, df0, df0, df1, df1, vertIndices, disp, normal,
-                          invMasses, weights, relDelta, restDist);
+        const bool hasApplied = solveDbDbContact(db0, db1, contactPair, solveOut, 0.0f, 0.0f, frictionCoefficient, dt,
+                                                 /*checkOnlyActivity*/ false, isVelocityIteration);
+
+        if (hasApplied)
+        {
+            float3 delta;
+            solveOut.computeDelta(contactPair, delta, dt);
+
+            // vertexInvMasses is pre-scaled by count, so the > 0 gate inside writeClothEdge
+            // also covers count == 0.
+            db0.writeClothEdge(cloth0, vertIndices.x, vertIndices.y, delta);
+            db1.writeClothEdge(cloth1, vertIndices.z, vertIndices.w, float3(-delta.x, -delta.y, -delta.z));
+        }
     }
 }
 
 // ===========================================================================
-// cloth_updateClothContactValidityLaunch (FEMClothExternalSolve.cu:1114)
+// cloth_updateClothContactValidityLaunch
 // ===========================================================================
 [shader("compute")]
 [numthreads(CLOTH_STEP, 1, 1)]
 void cloth_updateClothContactValidityLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint id = Ptr<uint>(gUpdate.activeIds)[groupId.y];
-    Ptr<PxgFEMClothGpu> femCloths = Ptr<PxgFEMClothGpu>(gUpdate.femCloths);
-    const uint nbVerts = femCloths[id].mNbVerts;
+    Ptr<PxgFEMClothGpu> femCloth = clothAt(gUpdate.femCloths, id);
+    const uint nbVerts = femCloth[0].mNbVerts;
 
-    const uint64_t curPositions = femCloths[id].mPosition_InvMass;
-    const uint64_t prevPositionsInContactOffset = femCloths[id].mPrevPositionInContactOffset;
+    const uint64_t curPositions = femCloth[0].mPosition_InvMass;
+    const uint64_t prevPositionsInContactOffset = femCloth[0].mPrevPositionInContactOffset;
 
     const uint globalThreadIndex = groupThreadId.x + CLOTH_STEP * groupId.x;
 

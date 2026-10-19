@@ -32,7 +32,7 @@
 //   2. row i names registry kernel i (exact order + name — catches drift if a
 //      KERNEL_DEF is added/reordered without regenerating);
 //   3. every mapped row's .spv exists and has the SPIR-V magic word;
-//   4. reports the launch-kernel port coverage (mapped / 501).
+//   4. reports the launch-kernel port coverage (mapped / 487, the PhysX 5.12 registry).
 
 #include "pxgTestFramework.h"
 

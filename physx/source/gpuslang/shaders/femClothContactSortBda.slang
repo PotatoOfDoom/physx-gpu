@@ -39,9 +39,10 @@
 //     FEM_REORDER_RS_CONTACTS): grid SB_REORDERCONTACTS (1024), block
 //     SB_REORDERCONTACTS (256).  For every contact index [0, *numContacts) it
 //     reads remapIndex = remapByRigid[index] and copies contacts / normalpens /
-//     barycentrics / contactInfos[remapIndex] into the four sorted arrays, then
-//     splits the sorted contact info's pairInd0 (PxU64 rigid id) into the
-//     separate sortedRigidIds[index] array (the FEM code shares the rigid
+//     barycentrics / contactInfos / contactMaterials[remapIndex] into the five
+//     sorted arrays (5.12 added the PxU16 rigid material stream), then splits the
+//     sorted pair info's ref0 (PxU64 rigid id) into the separate
+//     sortedRigidIds[index] array (the FEM code shares the rigid
 //     delta-accumulation path with the particle system, which wants the rigid
 //     id as a plain PxU64 array — see PxgFEMCore.cpp:227).
 //
@@ -49,9 +50,10 @@
 // SORT precedent psContactSortBda / ps_reorderPrimitiveContactsLaunch):
 //   - every argument arrives as a device pointer read through Ptr<>; the four
 //     value arrays are float4 (point / normalPen / barycentric) or the 16-byte
-//     PxgFemOtherContactInfo mirror, gathered whole;
-//   - the PxU64 rigid id is the low 8 bytes of the contact-info struct (pairInd0),
-//     carried as its uint2 halves and stored to the PxU64 sortedRigidIds array.
+//     PxgDeformablePairInfo, gathered whole, and the PxU16 material stream, moved
+//     through the atomic sub-word pair (PxgLoadU16 / PxgStoreU16);
+//   - the PxU64 rigid id is the pair info's ref0, stored to the PxU64 sortedRigidIds
+//     array.
 //
 // NO NoContraction stamp: this kernel performs ZERO float arithmetic — it is a
 // pure index-remapped LOAD/STORE gather (the float4 lanes are moved as opaque bit
@@ -69,40 +71,34 @@
 static const uint RC_BLOCK = 256u;   // SB_REORDERCONTACTS block
 static const uint RC_GRID = 1024u;   // SB_REORDERCONTACTS grid
 
-// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes):
-//   PxU64 pairInd0 @0 (rigid/particle id), PxU32 pairInd1 @8 (fem id),
-//   PxU32 rigidMatInd_isInCollision @12.  The reorder copies the whole struct and
-//   splits pairInd0 out into the sortedRigidIds array.
-struct FemOtherContactInfo
-{
-    uint2 pairInd0;                    // @0  (PxU64)
-    uint pairInd1;                     // @8
-    uint rigidMatInd_isInCollision;    // @12 -> 16
-}
+import pxgSlangDeformableRef;   // PxgLoadPairInfo / PxgStorePairInfo / PxgLoadU16 / PxgStoreU16
 
 // ===========================================================================
-// fem_reorderRigidContactsLaunch (softbodyPrimitives.cu:1655)
+// fem_reorderRigidContactsLaunch (softbodyPrimitives.cu, 5.12)
 //   CUDA ABI: (const float4* contacts, const float4* normalpens,
-//              const float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
-//              const PxU32* numContacts, const PxU32* remapByRigid,
-//              float4* sortedContacts, float4* sortedNormalPens,
-//              float4* sortedBarycentrics, PxgFemOtherContactInfo* sortedContactInfos,
+//              const float4* barycentrics, PxgDeformablePairInfo* contactInfos,
+//              const PxU16* contactMaterials, const PxU32* numContacts,
+//              const PxU32* remapByRigid, float4* sortedContacts,
+//              float4* sortedNormalPens, float4* sortedBarycentrics,
+//              PxgDeformablePairInfo* sortedContactInfos, PxU16* sortedContactMaterials,
 //              PxU64* sortedRigidIds)
-//   -> 11 device pointers = {8,8,8,8,8,8,8,8,8,8,8} = 88-byte blob.
+//   -> 13 device pointers = 104-byte blob.
 // ===========================================================================
 struct FemReorderParams
 {
-    uint64_t contacts;           // @0   const float4*
-    uint64_t normalpens;         // @8   const float4*
-    uint64_t barycentrics;       // @16  const float4*
-    uint64_t contactInfos;       // @24  const PxgFemOtherContactInfo*
-    uint64_t numContacts;        // @32  const PxU32*
-    uint64_t remapByRigid;       // @40  const PxU32*
-    uint64_t sortedContacts;     // @48  float4* output
-    uint64_t sortedNormalPens;   // @56  float4* output
-    uint64_t sortedBarycentrics; // @64  float4* output
-    uint64_t sortedContactInfos; // @72  PxgFemOtherContactInfo* output
-    uint64_t sortedRigidIds;     // @80  PxU64* output -> 88
+    uint64_t contacts;               // @0   const float4*
+    uint64_t normalpens;             // @8   const float4*
+    uint64_t barycentrics;           // @16  const float4*
+    uint64_t contactInfos;           // @24  PxgDeformablePairInfo*
+    uint64_t contactMaterials;       // @32  const PxU16*
+    uint64_t numContacts;            // @40  const PxU32*
+    uint64_t remapByRigid;           // @48  const PxU32*
+    uint64_t sortedContacts;         // @56  float4* output
+    uint64_t sortedNormalPens;       // @64  float4* output
+    uint64_t sortedBarycentrics;     // @72  float4* output
+    uint64_t sortedContactInfos;     // @80  PxgDeformablePairInfo* output
+    uint64_t sortedContactMaterials; // @88  PxU16* output
+    uint64_t sortedRigidIds;         // @96  PxU64* output -> 104
 }
 
 [[vk::push_constant]]
@@ -124,14 +120,12 @@ void fem_reorderRigidContactsLaunch(uint3 groupThreadId : SV_GroupThreadID,
     Ptr<float4> contacts = Ptr<float4>(gRe.contacts);
     Ptr<float4> normalpens = Ptr<float4>(gRe.normalpens);
     Ptr<float4> barycentrics = Ptr<float4>(gRe.barycentrics);
-    Ptr<FemOtherContactInfo> contactInfos = Ptr<FemOtherContactInfo>(gRe.contactInfos);
     Ptr<uint> remapByRigid = Ptr<uint>(gRe.remapByRigid);
 
     Ptr<float4> sortedContacts = Ptr<float4>(gRe.sortedContacts);
     Ptr<float4> sortedNormalPens = Ptr<float4>(gRe.sortedNormalPens);
     Ptr<float4> sortedBarycentrics = Ptr<float4>(gRe.sortedBarycentrics);
-    Ptr<FemOtherContactInfo> sortedContactInfos = Ptr<FemOtherContactInfo>(gRe.sortedContactInfos);
-    Ptr<uint2> sortedRigidIds = Ptr<uint2>(gRe.sortedRigidIds);
+    Ptr<uint64_t> sortedRigidIds = Ptr<uint64_t>(gRe.sortedRigidIds);
 
     for (uint i = 0u; i < numIternations; ++i)
     {
@@ -145,11 +139,12 @@ void fem_reorderRigidContactsLaunch(uint3 groupThreadId : SV_GroupThreadID,
         sortedNormalPens[index] = normalpens[remapIndex];
         sortedBarycentrics[index] = barycentrics[remapIndex];
 
-        const FemOtherContactInfo contactInfo = contactInfos[remapIndex];
+        const PxgDeformablePairInfoGpu contactInfo = PxgLoadPairInfo(gRe.contactInfos, remapIndex);
 
-        const uint2 rigidId = contactInfo.pairInd0;
+        const uint64_t rigidId = contactInfo.ref0;
 
-        sortedContactInfos[index] = contactInfo;
+        PxgStorePairInfo(gRe.sortedContactInfos, index, contactInfo.ref0, contactInfo.ref1);
+        PxgStoreU16(gRe.sortedContactMaterials, index, PxgLoadU16(gRe.contactMaterials, remapIndex));
         sortedRigidIds[index] = rigidId;
     }
 }

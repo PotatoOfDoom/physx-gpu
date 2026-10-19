@@ -50,7 +50,8 @@
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.30)
 #include "PxsDeformableSurfaceMaterialCore.h" // real engine surface material data
 #include "PxNodeIndex.h"                     // PxNodeIndex (rigid/world anchor node index)
-#include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a) / PxgRigidFilterPair (4a)
+#include "PxgSimulationCoreDesc.h"           // PxgDeformablePairInfo / PxgDeformableRef (5.12)
+#include "PxgDeformableContactWriters.h"     // PxgRigidDbContactWriter (5.12)
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData / PxAlignedTransform
 #include "CmSpatialVector.h"                 // Cm::UnAlignedSpatialVector (tranche A: articulation prepare oracle)
 #include "PxSpatialMatrix.h"                 // PxSpatialMatrix::operator* -- the engine's own product
@@ -548,13 +549,14 @@ static void refSharedPair(F4& x0, F4& x1, F4& x2, F4& x3, F4 vrc,
 
 // ---------------------------------------------------------------------------
 // Descriptor mirror layout proof — pins pxgSlangFEMClothDesc against the real
-// engine PxgFEMCloth (offsets the three kernels dereference).  sizeof == 400.
+// engine PxgFEMCloth (offsets the three kernels dereference).  sizeof == 416 (5.12).
 // ---------------------------------------------------------------------------
 PXG_TEST(femClothSimDescLayout)
 {
     // sizeof / array stride: the cloth kernels index femCloths[id], so the STRIDE
-    // must match (verified in SPIR-V as ArrayStride 400).
-    PXG_CHECK_MSG(sizeof(PxgFEMCloth) == 400, "PxgFEMCloth sizeof == 400 (got %zu)", sizeof(PxgFEMCloth));
+    // must match (verified in SPIR-V as ArrayStride 416; 5.12 added the two filter-pair
+    // arrays and their counts).
+    PXG_CHECK_MSG(sizeof(PxgFEMCloth) == 416, "PxgFEMCloth sizeof == 416 (got %zu)", sizeof(PxgFEMCloth));
 
     // device-pointer members
     PXG_CHECK(offsetof(PxgFEMCloth, mVelocity_InvMass) == 8);
@@ -565,18 +567,24 @@ PXG_TEST(femClothSimDescLayout)
     PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedRestEdge0_edge1) == 168); // +8 => 7 pad after the bool
     PXG_CHECK(offsetof(PxgFEMCloth, mAccumulatedDeltaPos) == 256);
 
+    // 5.12: the per-cloth filter pairs (sorted PxgDeformablePairInfo) and their counts
+    PXG_CHECK(offsetof(PxgFEMCloth, mRigidSurfaceFilterPairs) == 280);
+    PXG_CHECK(offsetof(PxgFEMCloth, mSurfaceSurfaceFilterPairs) == 288);
+    PXG_CHECK(offsetof(PxgFEMCloth, mNumRigidSurfaceFilterPairs) == 296);
+    PXG_CHECK(offsetof(PxgFEMCloth, mNumSurfaceSurfaceFilterPairs) == 300);
+
     // scalar tail
-    PXG_CHECK(offsetof(PxgFEMCloth, mLinearDamping) == 288);
-    PXG_CHECK(offsetof(PxgFEMCloth, mMaxLinearVelocity) == 292);
-    PXG_CHECK(offsetof(PxgFEMCloth, mSettlingThreshold) == 300);
-    PXG_CHECK(offsetof(PxgFEMCloth, mSleepThreshold) == 304);
-    PXG_CHECK(offsetof(PxgFEMCloth, mSettlingDamping) == 308);
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbVerts) == 316);
-    PXG_CHECK(offsetof(PxgFEMCloth, mActorFlags) == 376);
-    PXG_CHECK(offsetof(PxgFEMCloth, mBodyFlags) == 377);
-    PXG_CHECK(offsetof(PxgFEMCloth, mSurfaceFlags) == 378);
-    PXG_CHECK(offsetof(PxgFEMCloth, mIsActive) == 380);
-    PXG_CHECK(offsetof(PxgFEMCloth, mRestDistance) == 384);
+    PXG_CHECK(offsetof(PxgFEMCloth, mLinearDamping) == 304);
+    PXG_CHECK(offsetof(PxgFEMCloth, mMaxLinearVelocity) == 308);
+    PXG_CHECK(offsetof(PxgFEMCloth, mSettlingThreshold) == 316);
+    PXG_CHECK(offsetof(PxgFEMCloth, mSleepThreshold) == 320);
+    PXG_CHECK(offsetof(PxgFEMCloth, mSettlingDamping) == 324);
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbVerts) == 332);
+    PXG_CHECK(offsetof(PxgFEMCloth, mActorFlags) == 392);
+    PXG_CHECK(offsetof(PxgFEMCloth, mBodyFlags) == 393);
+    PXG_CHECK(offsetof(PxgFEMCloth, mSurfaceFlags) == 394);
+    PXG_CHECK(offsetof(PxgFEMCloth, mIsActive) == 396);
+    PXG_CHECK(offsetof(PxgFEMCloth, mRestOffset) == 400);
 
     // P7.1: the in-plane membrane solve (cloth_solveNonSharedTriangleEnergy*) reads
     // these fields through the pxgSlangFEMClothDesc mirror — pin their offsets.
@@ -585,9 +593,9 @@ PXG_TEST(femClothSimDescLayout)
     PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTriangleLambdas) == 96);                // float2*
     PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTriangleRestPoseInv) == 104);           // float4* (QInv)
     PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriAccumulatedPartitionsCP) == 192);           // PxU32*
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPartitions) == 344);                      // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPartitions) == 360);                      // PxU32
 
-    // the byte-packed flag word (@376): low byte == mActorFlags (eDISABLE_GRAVITY test)
+    // the byte-packed flag word (@392): low byte == mActorFlags (eDISABLE_GRAVITY test)
     PXG_CHECK(PxActorFlag::eDISABLE_GRAVITY == (1 << 1));
 
     // P7.1: PxsDeformableSurfaceMaterialGpu mirror (Slang) vs the real engine
@@ -625,10 +633,10 @@ PXG_TEST(femClothSimDescLayout)
     PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPairAccumulatedCopiesCP) == 224);                  // PxU32*
     PXG_CHECK(offsetof(PxgFEMCloth, mSharedTriPairAccumulatedPartitionsCP) == 232);                 // PxU32*
     PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPairAccumulatedPartitionsCP) == 240);              // PxU32*
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTrianglePairs) == 336);                                // PxU32
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTrianglePairs) == 340);                             // PxU32
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTriPairPartitions) == 348);                            // PxU32
-    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPairPartitions) == 352);                         // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTrianglePairs) == 352);                                // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTrianglePairs) == 356);                             // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTriPairPartitions) == 364);                            // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPairPartitions) == 368);                         // PxU32
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +683,7 @@ static void runPreIntegrate(bool isTGS)
     c.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrev.addr));
     c.mLinearDamping = linearDamping;
     c.mMaxLinearVelocity = maxLinVel;
-    c.mRestDistance = restDistance;
+    c.mRestOffset = restDistance;
     c.mNbVerts = N;
     c.mActorFlags = PxU8(actorFlags);
 
@@ -1606,1271 +1614,6 @@ PXG_TEST(femClothSimSolveTriPairClusterPGS)
 }
 
 // ===========================================================================
-// P7.1 tranche 3a: the cloth RIGID-ATTACHMENT constraint kernels — the machinery
-// to PIN a cloth vertex to a rigid / world anchor (toward a hanging cloth).  ONE
-// cloth vertex + ONE static/world attachment: run prepare -> solve, and compare the
-// prepared constraint block AND the solved mDeltaPos (the cloth-side pull toward the
-// anchor) BIT-EXACT against a CPU transcription of FEMClothConstraintPrep.cu:387 +
-// FEMClothExternalSolve.cu:1371/:1571 + attachments.cuh.  The attachment solve is
-// plain linear algebra, so every field is fully bit-exact (no transcendental seam).
-// This one keeps the cone DISABLED (limits -1); every other anchor kind, triangles and the
-// public-API cone (0, 0, angle -1) are in runRigidAttachAllAnchors (tranche B of task 35).
-// ===========================================================================
-
-// Host replica of the block-of-32 PxgFEMRigidAttachmentConstraint (PxgFEMCore.h:191,
-// verbatim hand-copy — PxgFEMCore.h is not includable in this CUDA-toolkit-free test
-// TU: it pulls PxgCudaBuffer.h -> cuda.h).  The layout is a trivial fixed-array SoA
-// (float4[32] blocks + PxU32[32] + PxU64[32], each 16-byte-aligned), pinned by the
-// self static_asserts below.  This is the byte image the prepare WRITES and the
-// solve READS, matching the shader's RAC_* byte offsets (femClothRigidAttachBda.slang).
-struct RigidAttachConstraintHost
-{
-    F4 baryOrType[32];                  // @0
-    F4 raXn0_biasW[32];                 // @512
-    F4 raXn1_biasW[32];                 // @1024
-    F4 raXn2_biasW[32];                 // @1536
-    F4 velMultiplierXYZ_invMassW[32];   // @2048
-    F4 low_high_limits[32];             // @2560
-    F4 axis_angle[32];                  // @3072
-    uint32_t elemId[32];                // @3584
-    uint64_t rigidId[32];               // @3712
-};
-static_assert(sizeof(RigidAttachConstraintHost) == 3968, "PxgFEMRigidAttachmentConstraint sizeof == 3968");
-static_assert(offsetof(RigidAttachConstraintHost, raXn0_biasW) == 512, "raXn0_biasW @512");
-static_assert(offsetof(RigidAttachConstraintHost, raXn1_biasW) == 1024, "raXn1_biasW @1024");
-static_assert(offsetof(RigidAttachConstraintHost, raXn2_biasW) == 1536, "raXn2_biasW @1536");
-static_assert(offsetof(RigidAttachConstraintHost, velMultiplierXYZ_invMassW) == 2048, "velMult @2048");
-static_assert(offsetof(RigidAttachConstraintHost, low_high_limits) == 2560, "low_high_limits @2560");
-static_assert(offsetof(RigidAttachConstraintHost, axis_angle) == 3072, "axis_angle @3072");
-static_assert(offsetof(RigidAttachConstraintHost, elemId) == 3584, "elemId @3584");
-static_assert(offsetof(RigidAttachConstraintHost, rigidId) == 3712, "rigidId @3712");
-
-// ---------------------------------------------------------------------------
-// bit-exact CPU reference for the prepare + PGS/TGS attachment solves.  The rigid /
-// world-anchor math (PxQuat::rotate, getNormalized via 1/sqrt, PxMat33*PxVec3) and
-// the calculateAttachmentDeltaImpulsePGS/TGS leaves (attachments.cuh) are transcribed
-// verbatim into a private namespace.
-// ---------------------------------------------------------------------------
-namespace p73ref
-{
-struct V3 { float x, y, z; };
-static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-
-// PxQuat::rotate (PxQuat.h:286).
-static V3 quatRotate(float qx, float qy, float qz, float qw, V3 v)
-{
-    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
-    const float w2 = qw * qw - 0.5f;
-    const float d2 = qx * vx + qy * vy + qz * vz;
-    return V3{ vx * w2 + (qy * vz - qz * vy) * qw + qx * d2,
-               vy * w2 + (qz * vx - qx * vz) * qw + qy * d2,
-               vz * w2 + (qx * vy - qy * vx) * qw + qz * d2 };
-}
-// PxVec3::getNormalized (PxVec3.h:286); PxRecipSqrt == 1.0/sqrt (unix intrinsic).
-static V3 getNormalized(V3 v)
-{
-    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
-    if (m > 0.0f) { const float rs = 1.0f / std::sqrt(m); return V3{ v.x * rs, v.y * rs, v.z * rs }; }
-    return V3{ 0.0f, 0.0f, 0.0f };
-}
-// PxMat33 (column-major [9]) * PxVec3.
-static V3 mat33Mul(const float m[9], V3 v)
-{
-    return V3{ m[0] * v.x + m[3] * v.y + m[6] * v.z,
-               m[1] * v.x + m[4] * v.y + m[7] * v.z,
-               m[2] * v.x + m[5] * v.y + m[8] * v.z };
-}
-
-// cloth_rigidAttachmentPrepareLaunch (FEMClothConstraintPrep.cu:387) — the rigid /
-// static (non-articulation) path.  Fills constraint slot [0].
-static void refPrepare(RigidAttachConstraintHost& c,
-                       F4 attachmentPose,  // cloth vertex pos_invMass (invMass1 in .w)
-                       V3 ra4, V3 axisIn, float axisAngleW, F4 lowHigh, F4 baryOrType1,
-                       uint32_t elemId, uint64_t rigidId,
-                       float qx, float qy, float qz, float qw, V3 bodyFrameP,
-                       float invMass0, const float sqrtInvInertia[9], bool isStatic)
-{
-    const float invMass1 = attachmentPose.w;
-    const V3 point = V3{ attachmentPose.x, attachmentPose.y, attachmentPose.z };
-    const V3 normal0 = V3{ 1.0f, 0.0f, 0.0f };
-    const V3 normal1 = V3{ 0.0f, 1.0f, 0.0f };
-    const V3 normal2 = V3{ 0.0f, 0.0f, 1.0f };
-
-    float invSqrt[9];
-    float inertiaScale = 1.0f;
-    if (invMass0 == 0.0f && !isStatic)
-    {
-        invSqrt[0] = 1.0f; invSqrt[1] = 0.0f; invSqrt[2] = 0.0f;
-        invSqrt[3] = 0.0f; invSqrt[4] = 1.0f; invSqrt[5] = 0.0f;
-        invSqrt[6] = 0.0f; invSqrt[7] = 0.0f; invSqrt[8] = 1.0f;
-        inertiaScale = 0.0f;
-    }
-    else
-    {
-        for (int k = 0; k < 9; ++k) invSqrt[k] = sqrtInvInertia[k];
-    }
-
-    const V3 ra = quatRotate(qx, qy, qz, qw, ra4);
-    const V3 error = V3{ ra.x + bodyFrameP.x - point.x, ra.y + bodyFrameP.y - point.y, ra.z + bodyFrameP.z - point.z };
-    const V3 worldAxis = getNormalized(quatRotate(qx, qy, qz, qw, axisIn));
-
-    const V3 raXn0 = cross3(ra, normal0);
-    const V3 raXn1 = cross3(ra, normal1);
-    const V3 raXn2 = cross3(ra, normal2);
-
-    const V3 rs0 = mat33Mul(invSqrt, raXn0);
-    const V3 rs1 = mat33Mul(invSqrt, raXn1);
-    const V3 rs2 = mat33Mul(invSqrt, raXn2);
-
-    const float resp0 = dot3(rs0, rs0) * inertiaScale + invMass0 + invMass1;
-    const float resp1 = dot3(rs1, rs1) * inertiaScale + invMass0 + invMass1;
-    const float resp2 = dot3(rs2, rs2) * inertiaScale + invMass0 + invMass1;
-
-    const float vm0 = (resp0 > 0.0f) ? (1.0f / resp0) : 0.0f;
-    const float vm1 = (resp1 > 0.0f) ? (1.0f / resp1) : 0.0f;
-    const float vm2 = (resp2 > 0.0f) ? (1.0f / resp2) : 0.0f;
-
-    const float be0 = dot3(error, normal0);
-    const float be1 = dot3(error, normal1);
-    const float be2 = dot3(error, normal2);
-
-    c.raXn0_biasW[0] = F4{ rs0.x, rs0.y, rs0.z, be0 };
-    c.raXn1_biasW[0] = F4{ rs1.x, rs1.y, rs1.z, be1 };
-    c.raXn2_biasW[0] = F4{ rs2.x, rs2.y, rs2.z, be2 };
-    c.velMultiplierXYZ_invMassW[0] = F4{ vm0, vm1, vm2, invMass0 };
-    c.elemId[0] = elemId;
-    c.rigidId[0] = rigidId;
-    c.baryOrType[0] = baryOrType1;
-    c.low_high_limits[0] = lowHigh;
-    c.axis_angle[0] = F4{ worldAxis.x, worldAxis.y, worldAxis.z, axisAngleW };
-}
-
-// calculateAttachmentDeltaImpulsePGS (attachments.cuh:83) + cloth-side scatter
-// (FEMClothExternalSolve.cu:1470) — NOTE the CUDA passes raXn0_biasW THREE TIMES
-// (:1451), so raXn0/1/2 and all three position-error components come from raXn0_biasW.
-static F4 refSolvePGS(const RigidAttachConstraintHost& c, F4 clothVel, V3 rigidLinVel, V3 rigidAngVel, float dt)
-{
-    const float invDt = 1.0f / dt;
-    const V3 linVel1 = V3{ clothVel.x, clothVel.y, clothVel.z };
-    const F4 r0 = c.raXn0_biasW[0];
-    const F4 vm = c.velMultiplierXYZ_invMassW[0];
-    const V3 raXn0 = V3{ r0.x, r0.y, r0.z };
-
-    const float velOfRigidX = rigidLinVel.x + dot3(rigidAngVel, raXn0);
-    const float velOfRigidY = rigidLinVel.y + dot3(rigidAngVel, raXn0);
-    const float velOfRigidZ = rigidLinVel.z + dot3(rigidAngVel, raXn0);
-
-    const float positionError = r0.w;
-    const float biasFactor = 0.5f;
-    const V3 velError = V3{ linVel1.x - positionError * biasFactor * invDt,
-                           linVel1.y - positionError * biasFactor * invDt,
-                           linVel1.z - positionError * biasFactor * invDt };
-
-    const float dF0 = (velError.x - velOfRigidX) * vm.x;
-    const float dF1 = (velError.y - velOfRigidY) * vm.y;
-    const float dF2 = (velError.z - velOfRigidZ) * vm.z;
-
-    F4 out = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
-    if (dF0 != 0.0f || dF1 != 0.0f || dF2 != 0.0f)
-    {
-        const V3 deltaPos = V3{ (-dF0) * dt, (-dF1) * dt, (-dF2) * dt };
-        out = F4{ deltaPos.x * clothVel.w, deltaPos.y * clothVel.w, deltaPos.z * clothVel.w, 1.0f };
-    }
-    return out;
-}
-
-// calculateAttachmentDeltaImpulseTGS (attachments.cuh:147, offset overload — distinct
-// raXn rows) + cloth-side scatter (FEMClothExternalSolve.cu:1667).
-static F4 refSolveTGS(const RigidAttachConstraintHost& c, F4 clothAccumDelta,
-                      V3 rigidLinVel, V3 rigidAngVel, V3 rigidLinDelta, V3 rigidAngDelta, float dt)
-{
-    const V3 linDelta1 = V3{ clothAccumDelta.x, clothAccumDelta.y, clothAccumDelta.z };
-    const F4 r0 = c.raXn0_biasW[0], r1 = c.raXn1_biasW[0], r2 = c.raXn2_biasW[0];
-    const F4 vm = c.velMultiplierXYZ_invMassW[0];
-    const V3 raXn0 = V3{ r0.x, r0.y, r0.z }, raXn1 = V3{ r1.x, r1.y, r1.z }, raXn2 = V3{ r2.x, r2.y, r2.z };
-
-    const float vo0 = rigidLinVel.x + dot3(rigidAngVel, raXn0);
-    const float vo1 = rigidLinVel.y + dot3(rigidAngVel, raXn1);
-    const float vo2 = rigidLinVel.z + dot3(rigidAngVel, raXn2);
-
-    const V3 linDelta = V3{ linDelta1.x - rigidLinDelta.x, linDelta1.y - rigidLinDelta.y, linDelta1.z - rigidLinDelta.z };
-    const float peX = r0.w, peY = r1.w, peZ = r2.w;
-    const V3 tgsError = V3{ linDelta.x - peX - dot3(rigidAngDelta, raXn0),
-                           linDelta.y - peY - dot3(rigidAngDelta, raXn1),
-                           linDelta.z - peZ - dot3(rigidAngDelta, raXn2) };
-
-    const float velDt = dt; // isVelocityIteration == false
-    const float BIAS = 0.7f; // FEMCLOTH_BIAS_COEFFICIENT
-    const float dF0 = (tgsError.x - vo0 * velDt) * vm.x * BIAS;
-    const float dF1 = (tgsError.y - vo1 * velDt) * vm.y * BIAS;
-    const float dF2 = (tgsError.z - vo2 * velDt) * vm.z * BIAS;
-
-    F4 out = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
-    if (dF0 != 0.0f || dF1 != 0.0f || dF2 != 0.0f)
-    {
-        const V3 deltaPos = V3{ -dF0, -dF1, -dF2 };
-        out = F4{ deltaPos.x * clothAccumDelta.w, deltaPos.y * clothAccumDelta.w, deltaPos.z * clothAccumDelta.w, 1.0f };
-    }
-    return out;
-}
-} // namespace p73ref
-
-static void pokePtr(std::vector<uint8_t>& buf, size_t off, uint64_t v) { std::memcpy(buf.data() + off, &v, 8); }
-static void pokeU32(std::vector<uint8_t>& buf, size_t off, uint32_t v) { std::memcpy(buf.data() + off, &v, 4); }
-
-// ---------------------------------------------------------------------------
-// Descriptor-mirror layout proof for the NEW tranche-3a mirrors.
-// ---------------------------------------------------------------------------
-PXG_TEST(femClothSimRigidAttachDescLayout)
-{
-    // PxNodeIndex: static/world anchor is mID == PX_INVALID_NODE (low 32 bits).
-    PXG_CHECK_MSG(sizeof(PxNodeIndex) == 8, "PxNodeIndex sizeof == 8 (got %zu)", sizeof(PxNodeIndex));
-    PxNodeIndex staticNode; // default ctor -> PX_INVALID_NODE
-    PXG_CHECK(staticNode.isStaticBody());
-    PXG_CHECK(staticNode.getInd() == 0x00000000FFFFFFFFull);
-
-    // PxgFEMRigidAttachment (PxgSimulationCoreDesc.h:208) — the shader's RA_* offsets.
-    PXG_CHECK_MSG(sizeof(PxgFEMRigidAttachment) == 96, "PxgFEMRigidAttachment sizeof == 96 (got %zu)", sizeof(PxgFEMRigidAttachment));
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, index0) == 0);
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, index1) == 8);
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, localPose0) == 32);
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, coneLimitParams) + offsetof(PxgConeLimitParams, low_high_limits) == 48);
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, coneLimitParams) + offsetof(PxgConeLimitParams, axis_angle) == 64);
-    PXG_CHECK(offsetof(PxgFEMRigidAttachment, baryOrType1) == 80);
-
-    // PxgSolverBodyData / PxgSolverTxIData (PxgSolverBody.h) — the prepare's anchor
-    // frame reads.  The device float4 initialLinVelXYZ_invMassW @16 == { initialLinVel
-    // (@16, 12B), invMass (@28, 4B) } on the host (non-CUDA union branch).
-    PXG_CHECK_MSG(sizeof(PxgSolverBodyData) == 96, "PxgSolverBodyData sizeof == 96 (got %zu)", sizeof(PxgSolverBodyData));
-    PXG_CHECK(offsetof(PxgSolverBodyData, initialLinVel) == 16);
-    PXG_CHECK(offsetof(PxgSolverBodyData, invMass) == 28);
-    PXG_CHECK_MSG(sizeof(PxgSolverTxIData) == 64, "PxgSolverTxIData sizeof == 64 (got %zu)", sizeof(PxgSolverTxIData));
-    PXG_CHECK(offsetof(PxgSolverTxIData, sqrtInvInertia) == 28);
-    PXG_CHECK_MSG(sizeof(PxAlignedTransform) == 32, "PxAlignedTransform sizeof == 32 (got %zu)", sizeof(PxAlignedTransform));
-
-    // block-of-32 constraint replica pinned above by static_asserts; re-affirm the stride.
-    PXG_CHECK(sizeof(RigidAttachConstraintHost) == 3968);
-}
-
-// ---------------------------------------------------------------------------
-// cloth_rigidAttachmentPrepareLaunch -> cloth_solveRigidClothAttachment{,TGS}Launch:
-// pin ONE cloth vertex to a fixed world anchor.
-// ---------------------------------------------------------------------------
-static void runRigidAttach(bool isTGS)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-
-    // --- cloth vertex (id 0, elemIdx 0), invMass = 0.5 (movable) ----------
-    const float invMass = 0.5f;
-    std::vector<F4> positions = { { 1.0f, 2.0f, 3.0f, invMass } };
-    std::vector<F4> velocities = { { 0.10f, -0.20f, 0.05f, invMass } };
-    std::vector<F4> accumDelta = { { 0.02f, -0.03f, 0.04f, invMass } };
-    std::vector<F4> deltaPos = { { 0.0f, 0.0f, 0.0f, 0.0f } };   // solve output
-    std::vector<uint32_t> triVtx = { 0u, 0u, 0u, 0u };           // unused (vertex attach)
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, velocities);
-    DevBuf bAcc = makeDev(dev, accumDelta);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bTri = makeDev(dev, triVtx);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 1u;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // --- the world anchor: static node, identity body frame at the origin -
-    const F4 anchor = { 2.0f, 0.5f, 3.5f, 0.0f };   // localPose0 (world = local, identity frame)
-    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
-
-    // PxgFEMRigidAttachment (96 bytes) via the real engine struct.
-    PxgFEMRigidAttachment att;
-    std::memset(&att, 0, sizeof(att));
-    att.index0 = staticNodeInd;                          // rigid node index (static)
-    att.index1 = 0ull;                                   // elemId = (clothId 0 << 20) | elemIdx 0
-    att.localPose0 = make_float4(anchor.x, anchor.y, anchor.z, anchor.w);
-    att.coneLimitParams.low_high_limits = make_float4(-1.0f, -1.0f, -1.0f, -1.0f); // cone disabled
-    att.coneLimitParams.axis_angle = make_float4(1.0f, 0.0f, 0.0f, -1.0f);         // axis (1,0,0), angle -1
-    att.baryOrType1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);                         // vertex type
-    std::vector<PxgFEMRigidAttachment> atts = { att };
-    DevBuf bAtt = makeDev(dev, atts);
-
-    std::vector<uint32_t> activeAtt = { 0u };
-    DevBuf bActiveAtt = makeDev(dev, activeAtt);
-    std::vector<uint64_t> attachIds = { 0xBADBADBADull };   // output (PxNodeIndex)
-    DevBuf bAttachIds = makeDev(dev, attachIds);
-
-    // constraint block (3968 bytes) seeded with a sentinel pattern.
-    std::vector<uint8_t> constraintBytes(sizeof(RigidAttachConstraintHost), 0xCD);
-    DevBuf bConstraint = makeDev(dev, constraintBytes);
-
-    // rigidDeltaVel: the prepare's rigid arm zeroes [0] and [0+numAttachments]; the solve
-    // writes no reaction for a STATIC anchor (FEMClothExternalSolve.cu:1455).  The dynamic,
-    // kinematic and articulation reactions: runRigidAttachAllAnchors below.
-    std::vector<F4> rigidDeltaVel = { { 9.f, 9.f, 9.f, 9.f }, { 9.f, 9.f, 9.f, 9.f } };
-    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
-
-    // --- anchor rigid frame / mass / inertia (solver body 0 = world/zero) --
-    // body2WorldPool[0] = identity quat (0,0,0,1), p = (0,0,0,0).
-    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
-    DevBuf bBody2World = makeDev(dev, body2World);
-    std::vector<uint8_t> solverBodyData(96, 0);   // initialLinVelXYZ_invMassW @16 = 0 -> invMass0 = 0
-    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
-    std::vector<uint8_t> solverTxIData(64, 0);    // sqrtInvInertia @28 = 0 matrix
-    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
-
-    // --- solver-body velocity buffers (world anchor at rest) --------------
-    // numSolverBodies = 1, accumulatedBodyDeltaVOffset = 0.  Read slots (0,1 for
-    // outSolverVelocity; 0,1,2 for solverBodyVelPool) are ZERO; the trailing slots
-    // carry sentinels so a wrong reader offset would read nonzero and mismatch.
-    const uint32_t numSolverBodies = 1u;
-    const uint32_t accOffset = 0u;
-    std::vector<F4> outSolverVelocity = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
-                                          { 77.f, 78.f, 79.f, 80.f }, { 81.f, 82.f, 83.f, 84.f } };
-    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
-    std::vector<F4> solverBodyVelPool = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
-                                          { 0.f, 0.f, 0.f, 0.f }, { 61.f, 62.f, 63.f, 64.f } };
-    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
-    std::vector<uint32_t> solverBodyIndices = { 0u };   // never dereferenced for a static anchor
-    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
-
-    // --- raw descriptor buffers, pointers poked at the mirror offsets -----
-    std::vector<uint8_t> prepDesc(304, 0);          // PxgConstraintPrepareDescGpu
-    pokePtr(prepDesc, 64, bSolverBodyData.addr);    // solverBodyDataPool @64
-    pokePtr(prepDesc, 72, bSolverTxIData.addr);     // solverBodyTxIDataPool @72
-    pokePtr(prepDesc, 168, bBody2World.addr);       // body2WorldPool @168
-    DevBuf bPrepDesc = makeDev(dev, prepDesc);
-
-    std::vector<uint8_t> prePrepDesc(760, 0);       // PxgPrePrepDescGpu
-    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr); // solverBodyIndices @272 (static -> unused)
-    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
-
-    std::vector<uint8_t> solverCoreDesc(320, 0);    // PxgSolverCoreDescGpu
-    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);        // outSolverVelocity @0
-    pokeU32(solverCoreDesc, 268, numSolverBodies);         // numSolverBodies @268
-    pokeU32(solverCoreDesc, 276, accOffset);               // accumulatedBodyDeltaVOffset @276
-    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
-
-    std::vector<uint8_t> sharedDesc(224, 0);        // PxgSolverSharedDesc<IterativeSolveData(TGS)>
-    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);     // iter_solverBodyVelPool @160
-    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
-
-    // ======================= dispatch PREPARE ==========================
-    struct PrepPush
-    {
-        uint64_t clothes, rigidAttachments, activeRigidAttachments, rigidAttachmentIds;
-        uint32_t numRigidAttachments, pad36;
-        uint64_t constraints, prePrepDesc, prepDesc, sharedDesc, rigidDeltaVel;
-    };
-    static_assert(sizeof(PrepPush) == 80, "prepare push-constant blob must be 80 bytes");
-    PrepPush pp = {};
-    pp.clothes = bDesc.addr;
-    pp.rigidAttachments = bAtt.addr;
-    pp.activeRigidAttachments = bActiveAtt.addr;
-    pp.rigidAttachmentIds = bAttachIds.addr;
-    pp.numRigidAttachments = 1u;
-    pp.constraints = bConstraint.addr;
-    pp.prePrepDesc = bPrePrepDesc.addr;
-    pp.prepDesc = bPrepDesc.addr;
-    pp.sharedDesc = bSharedDesc.addr;
-    pp.rigidDeltaVel = bRigidDeltaVel.addr;
-
-    Kernel kPrep("femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the prepared constraint ----
-    RigidAttachConstraintHost refC;
-    std::memset(&refC, 0xCD, sizeof(refC));   // same sentinel seed
-    float zeroInertia[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    p73ref::refPrepare(refC, positions[0], p73ref::V3{ anchor.x, anchor.y, anchor.z },
-                       p73ref::V3{ 1.0f, 0.0f, 0.0f }, -1.0f,
-                       F4{ -1.0f, -1.0f, -1.0f, -1.0f }, F4{ 0.0f, 0.0f, 0.0f, 0.0f },
-                       /*elemId*/ 0u, /*rigidId*/ staticNodeInd,
-                       /*q*/ 0.0f, 0.0f, 0.0f, 1.0f, p73ref::V3{ 0.0f, 0.0f, 0.0f },
-                       /*invMass0*/ 0.0f, zeroInertia, /*isStatic*/ true);
-
-    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidAttachConstraintHost));
-    RigidAttachConstraintHost gotC;
-    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
-    const auto gAttachIds = downloadBuffer<uint64_t>(dev, bAttachIds.h, 1);
-    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2);
-
-    size_t mm = 0;
-    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  prep %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
-                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    cmp4("raXn0_biasW", refC.raXn0_biasW[0], gotC.raXn0_biasW[0]);
-    cmp4("raXn1_biasW", refC.raXn1_biasW[0], gotC.raXn1_biasW[0]);
-    cmp4("raXn2_biasW", refC.raXn2_biasW[0], gotC.raXn2_biasW[0]);
-    cmp4("velMult_invMass", refC.velMultiplierXYZ_invMassW[0], gotC.velMultiplierXYZ_invMassW[0]);
-    cmp4("baryOrType", refC.baryOrType[0], gotC.baryOrType[0]);
-    cmp4("low_high_limits", refC.low_high_limits[0], gotC.low_high_limits[0]);
-    cmp4("axis_angle", refC.axis_angle[0], gotC.axis_angle[0]);
-    if (gotC.elemId[0] != refC.elemId[0])
-    { ++mm; std::printf("  prep elemId MM: got %u ref %u\n", gotC.elemId[0], refC.elemId[0]); }
-    if (gotC.rigidId[0] != refC.rigidId[0])
-    { ++mm; std::printf("  prep rigidId MM: got %llu ref %llu\n",
-                        (unsigned long long)gotC.rigidId[0], (unsigned long long)refC.rigidId[0]); }
-    if (gAttachIds[0] != staticNodeInd)
-    { ++mm; std::printf("  rigidAttachmentIds MM: got %llu ref %llu\n",
-                        (unsigned long long)gAttachIds[0], (unsigned long long)staticNodeInd); }
-    // rigidDeltaVel zeroed by the prepare (the rigid arm's unconditional zeroing, :582-586).
-    for (uint32_t j = 0; j < 2; ++j)
-        if (f2u(gRigidDeltaVel[j].x) != 0u || f2u(gRigidDeltaVel[j].y) != 0u ||
-            f2u(gRigidDeltaVel[j].z) != 0u || f2u(gRigidDeltaVel[j].w) != 0u)
-        { ++mm; std::printf("  rigidDeltaVel[%u] not zeroed\n", j); }
-
-    // teeth: the prepared position error must equal (anchor - clothPos) componentwise
-    // (the pull direction), and be non-zero.
-    PXG_CHECK_MSG(f2u(gotC.raXn0_biasW[0].w) == f2u(anchor.x - positions[0].x) &&
-                  f2u(gotC.raXn1_biasW[0].w) == f2u(anchor.y - positions[0].y) &&
-                  f2u(gotC.raXn2_biasW[0].w) == f2u(anchor.z - positions[0].z),
-                  "prepared position error must be (anchor - clothPos)");
-
-    PXG_CHECK_MSG(mm == 0, "cloth_rigidAttachmentPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
-
-    // ======================= dispatch SOLVE ============================
-    struct SolvePush
-    {
-        uint64_t clothes, attachments;
-        uint32_t numAttachments, pad20;
-        uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
-        float dt;
-        uint32_t pad60;
-        uint64_t rigidDeltaVel;
-    };
-    static_assert(sizeof(SolvePush) == 72, "solve push-constant blob must be 72 bytes");
-    SolvePush sp = {};
-    sp.clothes = bDesc.addr;
-    sp.attachments = bConstraint.addr;
-    sp.numAttachments = 1u;
-    sp.prePrepDesc = bPrePrepDesc.addr;
-    sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = 0ull;   // never dereferenced: readRigidVelocity reads it in the link arm only
-    sp.sharedDesc = bSharedDesc.addr;
-    sp.dt = dt;
-    sp.rigidDeltaVel = bRigidDeltaVel.addr;
-
-    const char* solveEntry = isTGS ? "cloth_solveRigidClothAttachmentTGSLaunch"
-                                   : "cloth_solveRigidClothAttachmentLaunch";
-    Kernel kSolve("femClothRigidAttachBda.spv", solveEntry, {}, sizeof(SolvePush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the solved mDeltaPos (rigid at rest -> vel0 = 0) ----
-    const p73ref::V3 z3 = { 0.0f, 0.0f, 0.0f };
-    F4 refDelta = isTGS ? p73ref::refSolveTGS(gotC, accumDelta[0], z3, z3, z3, z3, dt)
-                        : p73ref::refSolvePGS(gotC, velocities[0], z3, z3, dt);
-
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 1);
-
-    // teeth: the solve must actually pull the vertex (mDeltaPos != 0, w == 1).
-    PXG_CHECK_MSG(f2u(gDelta[0].x) != 0u || f2u(gDelta[0].y) != 0u || f2u(gDelta[0].z) != 0u,
-                  "attachment solve should pull the cloth vertex (mDeltaPos != 0, isTGS=%d)", int(isTGS));
-
-    size_t mm2 = 0;
-    if (f2u(refDelta.x) != f2u(gDelta[0].x) || f2u(refDelta.y) != f2u(gDelta[0].y) ||
-        f2u(refDelta.z) != f2u(gDelta[0].z) || f2u(refDelta.w) != f2u(gDelta[0].w))
-    { ++mm2; std::printf("  solve mDeltaPos MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
-                         refDelta.x, refDelta.y, refDelta.z, refDelta.w,
-                         gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w); }
-    PXG_CHECK_MSG(mm2 == 0, "cloth_solveRigidClothAttachment%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm2);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bAtt.h); dev->destroyBuffer(bActiveAtt.h); dev->destroyBuffer(bAttachIds.h);
-    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bRigidDeltaVel.h);
-    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
-    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h); dev->destroyBuffer(bSolverBodyIndices.h);
-    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
-    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
-}
-
-PXG_TEST(femClothSimRigidAttachPGS) { runRigidAttach(/*isTGS*/ false); }
-PXG_TEST(femClothSimRigidAttachTGS) { runRigidAttach(/*isTGS*/ true); }
-
-// ---------------------------------------------------------------------------
-// TRANCHE B (task 35): the cloth rigid-attachment kernels with EVERY anchor kind and
-// BOTH element kinds, bit-exact against a CPU transcription of FEMClothConstraintPrep.cu
-// :387-587 + FEMClothExternalSolve.cu:1371-1485 / :1571-1682 + attachments.cuh.  Six
-// lanes, each on its own cloth vertices (so the atomic scatter has no contention and the
-// comparison is exact):
-//   lane 0  STATIC world anchor, VERTEX 0.
-//   lane 1  DYNAMIC rigid (node 3 -> solver body 1), VERTEX 1, rotated frame, full
-//           sqrtInvInertia: the reaction rows (deltaLinVel = deltaImpulse * invMass0,
-//           deltaAngVel from the SAME raXn rows -- raXn0 three times in PGS).
-//   lane 2  DYNAMIC rigid, TRIANGLE 10 = (5,6,7) of a 11-vertex cloth: triIdx >= nbVerts,
-//           so a solve that treats the triangle index as a vertex index reads past the
-//           end of the vertex buffers (the pre-tranche bug).
-//   lane 3  ARTICULATION link (node 5, link 1), VERTEX 2.  articulations[bodySims[5].
-//           articulationRemapId = 2] holds the link pose / response; solverBodyIndices[5]
-//           = 1 indexes outArtiVelocity -- record 1 is a DECOY, so a port that used one
-//           index for both reads wrong data.  The prepare must NOT zero its rigidDeltaVel
-//           rows (the CUDA arm has no zeroing) and the reaction uses invMass0 = 1.
-//   lane 4  KINEMATIC rigid (node 4 -> solver body 2, invMass 0), VERTEX 3: identity
-//           inertia * inertiaScale 0, and the solve writes ZERO reaction rows.
-//   lane 5  STATIC world anchor, TRIANGLE 9 = (8,9,10): triIdx < nbVerts, so the
-//           vertex-index misread stays in bounds but pulls vertex 9 alone, with the full
-//           (not barycentric) weight -- the in-bounds face of the same bug.
-// Every lane uses the PUBLIC-API cone parameters (low_high_limits = (0,0), angle = -1,
-// PxgSimulationController.cpp:3062-3063), so isConeLimitedEnabled is TRUE and the
-// cone-limited branch (attachments.cuh:112-120 / :176-180) is under test.  PGS teeth: the
-// velError -> posError -> velError round trip changes at least one lane's impulse bits.
-// ---------------------------------------------------------------------------
-namespace p7Bref
-{
-using p73ref::V3;
-using p73ref::cross3;
-using p73ref::dot3;
-
-static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 scale3(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
-
-// computeConeLimitedError (attachments.cuh:48) for maxAngle <= 0 (the angle > 0 arm and its
-// PxSinCos are not exercised here).  PxClamp(v, lo, hi) = PxMax(lo, PxMin(hi, v)).
-static V3 coneLimitedError(float maxAngle, float minDist, float maxDist, V3 coneAxis, V3 relPos)
-{
-    float len = std::sqrt(dot3(relPos, relPos));
-    V3 dir;
-    if (maxAngle == 0.0f)
-        dir = coneAxis;
-    else
-        dir = (len > 1.0e-6f) ? scale3(relPos, 1.0f / len) : coneAxis;
-    const float hi = maxDist >= 0.0f ? maxDist : 3.4028235e38f;
-    const float mn = (hi < len) ? hi : len;
-    len = (minDist > mn) ? minDist : mn;
-    return V3{ relPos.x - len * dir.x, relPos.y - len * dir.y, relPos.z - len * dir.z };
-}
-static bool coneEnabled(float maxAngle, float minDist, float maxDist)
-{
-    return maxAngle >= 0.0f || minDist >= 0.0f || maxDist >= 0.0f;
-}
-
-// The articulation arm of the prepare (FEMClothConstraintPrep.cu:478-527).  The response
-// product is the ENGINE's PxSpatialMatrix::operator*, independent of asmM6MulVec.
-static void refPrepareArti(RigidAttachConstraintHost& c, int slot, F4 attachmentPose, V3 ra4, V3 axisIn,
-                           float axisAngleW, F4 lowHigh, F4 baryOrType1, uint32_t elemId, uint64_t rigidId,
-                           const physx::PxTransform& b2w, const physx::PxSpatialMatrix& resp)
-{
-    using physx::PxVec3;
-    using physx::Cm::UnAlignedSpatialVector;
-    const float invMass1 = attachmentPose.w;
-    const V3 point = V3{ attachmentPose.x, attachmentPose.y, attachmentPose.z };
-    const V3 n0 = V3{ 1.0f, 0.0f, 0.0f }, n1 = V3{ 0.0f, 1.0f, 0.0f }, n2 = V3{ 0.0f, 0.0f, 1.0f };
-    const V3 worldAxis = p73ref::getNormalized(p73ref::quatRotate(b2w.q.x, b2w.q.y, b2w.q.z, b2w.q.w, axisIn));
-    const V3 ra = p73ref::quatRotate(b2w.q.x, b2w.q.y, b2w.q.z, b2w.q.w, ra4);
-    const V3 error = V3{ ra.x + b2w.p.x - point.x, ra.y + b2w.p.y - point.y, ra.z + b2w.p.z - point.z };
-    const V3 raXn0 = cross3(ra, n0), raXn1 = cross3(ra, n1), raXn2 = cross3(ra, n2);
-    const UnAlignedSpatialVector dv0 = resp * UnAlignedSpatialVector(PxVec3(n0.x, n0.y, n0.z), PxVec3(raXn0.x, raXn0.y, raXn0.z));
-    const V3 top = V3{ dv0.top.x, dv0.top.y, dv0.top.z }, bot = V3{ dv0.bottom.x, dv0.bottom.y, dv0.bottom.z };
-    // resp1 / resp2 dot deltaV0 -- the upstream quirk.
-    const float resp0 = dot3(top, raXn0) + dot3(bot, n0) + invMass1;
-    const float resp1 = dot3(top, raXn1) + dot3(bot, n1) + invMass1;
-    const float resp2 = dot3(top, raXn2) + dot3(bot, n2) + invMass1;
-    const float vm0 = (resp0 > 0.0f) ? (1.0f / resp0) : 0.0f;
-    const float vm1 = (resp1 > 0.0f) ? (1.0f / resp1) : 0.0f;
-    const float vm2 = (resp2 > 0.0f) ? (1.0f / resp2) : 0.0f;
-    c.raXn0_biasW[slot] = F4{ raXn0.x, raXn0.y, raXn0.z, dot3(error, n0) };
-    c.raXn1_biasW[slot] = F4{ raXn1.x, raXn1.y, raXn1.z, dot3(error, n1) };
-    c.raXn2_biasW[slot] = F4{ raXn2.x, raXn2.y, raXn2.z, dot3(error, n2) };
-    c.velMultiplierXYZ_invMassW[slot] = F4{ vm0, vm1, vm2, 1.0f };
-    c.elemId[slot] = elemId;
-    c.rigidId[slot] = rigidId;
-    c.baryOrType[slot] = baryOrType1;
-    c.low_high_limits[slot] = lowHigh;
-    c.axis_angle[slot] = F4{ worldAxis.x, worldAxis.y, worldAxis.z, axisAngleW };
-}
-
-struct RigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
-struct SolveOut { V3 deltaImpulse, deltaLinVel, deltaAngVel; };
-
-// calculateAttachmentDeltaImpulsePGS (attachments.cuh:83) as CALLED at
-// FEMClothExternalSolve.cu:1451: raXn0_biasW in all three row slots.
-static SolveOut refImpulsePGS(const RigidAttachConstraintHost& c, int slot, V3 linVel1, const RigidVel& v,
-                              float invDt, bool cone)
-{
-    const F4 r0 = c.raXn0_biasW[slot];
-    const F4 vm = c.velMultiplierXYZ_invMassW[slot];
-    const F4 lh = c.low_high_limits[slot], wa = c.axis_angle[slot];
-    const V3 raXn0 = V3{ r0.x, r0.y, r0.z };
-    const float vX = v.linVel.x + dot3(v.angVel, raXn0);
-    const float vY = v.linVel.y + dot3(v.angVel, raXn0);
-    const float vZ = v.linVel.z + dot3(v.angVel, raXn0);
-    const float biasFactor = 0.5f;
-    V3 velError = V3{ linVel1.x - r0.w * biasFactor * invDt, linVel1.y - r0.w * biasFactor * invDt,
-                      linVel1.z - r0.w * biasFactor * invDt };
-    if (cone && coneEnabled(wa.w, lh.x, lh.y))
-    {
-        const float weirdScale = invDt * biasFactor;
-        V3 posError = scale3(velError, 1.0f / weirdScale);
-        posError = coneLimitedError(wa.w, lh.x, lh.y, V3{ wa.x, wa.y, wa.z }, posError);
-        velError = scale3(posError, weirdScale);
-    }
-    SolveOut o;
-    const float dF0 = (velError.x - vX) * vm.x;
-    const float dF1 = (velError.y - vY) * vm.y;
-    const float dF2 = (velError.z - vZ) * vm.z;
-    o.deltaImpulse = V3{ dF0, dF1, dF2 };
-    o.deltaLinVel = V3{ dF0 * vm.w, dF1 * vm.w, dF2 * vm.w };
-    o.deltaAngVel = add3(add3(scale3(raXn0, dF0), scale3(raXn0, dF1)), scale3(raXn0, dF2));
-    return o;
-}
-
-// calculateAttachmentDeltaImpulseTGS (attachments.cuh:147), offset overload.
-static SolveOut refImpulseTGS(const RigidAttachConstraintHost& c, int slot, V3 linDelta1, const RigidVel& v,
-                              float dt, bool cone)
-{
-    const F4 r0 = c.raXn0_biasW[slot], r1 = c.raXn1_biasW[slot], r2 = c.raXn2_biasW[slot];
-    const F4 vm = c.velMultiplierXYZ_invMassW[slot];
-    const F4 lh = c.low_high_limits[slot], wa = c.axis_angle[slot];
-    const V3 raXn0 = V3{ r0.x, r0.y, r0.z }, raXn1 = V3{ r1.x, r1.y, r1.z }, raXn2 = V3{ r2.x, r2.y, r2.z };
-    const float v0 = v.linVel.x + dot3(v.angVel, raXn0);
-    const float v1 = v.linVel.y + dot3(v.angVel, raXn1);
-    const float v2 = v.linVel.z + dot3(v.angVel, raXn2);
-    const V3 linDelta = V3{ linDelta1.x - v.linDelta.x, linDelta1.y - v.linDelta.y, linDelta1.z - v.linDelta.z };
-    V3 tgsError = V3{ linDelta.x - r0.w - dot3(v.angDelta, raXn0), linDelta.y - r1.w - dot3(v.angDelta, raXn1),
-                      linDelta.z - r2.w - dot3(v.angDelta, raXn2) };
-    if (cone && coneEnabled(wa.w, lh.x, lh.y))
-        tgsError = coneLimitedError(wa.w, lh.x, lh.y, V3{ wa.x, wa.y, wa.z }, tgsError);
-    const float BIAS = 0.7f;
-    SolveOut o;
-    const float dF0 = (tgsError.x - v0 * dt) * vm.x * BIAS;
-    const float dF1 = (tgsError.y - v1 * dt) * vm.y * BIAS;
-    const float dF2 = (tgsError.z - v2 * dt) * vm.z * BIAS;
-    o.deltaImpulse = V3{ dF0, dF1, dF2 };
-    o.deltaLinVel = V3{ dF0 * vm.w, dF1 * vm.w, dF2 * vm.w };
-    o.deltaAngVel = add3(add3(scale3(raXn0, dF0), scale3(raXn1, dF1)), scale3(raXn2, dF2));
-    return o;
-}
-
-static F4 blend(F4 a, F4 b, F4 c, F4 bary)
-{
-    return F4{ a.x * bary.x + b.x * bary.y + c.x * bary.z, a.y * bary.x + b.y * bary.y + c.y * bary.z,
-               a.z * bary.x + b.z * bary.y + c.z * bary.z, a.w * bary.x + b.w * bary.y + c.w * bary.z };
-}
-} // namespace p7Bref
-
-static void runRigidAttachAllAnchors(bool isTGS)
-{
-    using p73ref::V3;
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const uint32_t N = 6u;          // lanes
-    const uint32_t nbVerts = 11u;
-    const uint32_t nbTris = 16u;    // > nbVerts, so both triangle lanes can use triIdx >= nbVerts
-    // Guard region past nbVerts: every vertex buffer is allocated with nbVerts + guard rows.
-    // The CUDA vertex/triangle split (FEMClothExternalSolve.cu:1417-1431 / :1616-1630) never
-    // touches a row >= nbVerts; the old vertex-only misread of vertex #triIdx (triIdx 13 / 15)
-    // lands inside this guard and is caught below instead of running off the allocation.
-    const uint32_t nbGuard = 6u, nbRows = nbVerts + nbGuard;
-
-    // --- cloth: 11 vertices, distinct per lane (+ guard rows) ------------
-    std::vector<F4> positions(nbRows), velocities(nbRows), accumDelta(nbRows);
-    for (uint32_t k = 0; k < nbRows; ++k)
-    {
-        const float fk = float(k);
-        const float im = 0.4f + 0.07f * fk;
-        positions[k] = { 0.3f + 0.11f * fk, 1.9f - 0.07f * fk, -0.2f + 0.05f * fk, im };
-        velocities[k] = { 0.10f - 0.03f * fk, -0.20f + 0.02f * fk, 0.05f + 0.01f * fk, im };
-        accumDelta[k] = { 0.002f * fk - 0.01f, -0.003f + 0.001f * fk, 0.004f - 0.0005f * fk, im };
-    }
-    const F4 guardDelta = { 7.0f, 7.0f, 7.0f, 7.0f };
-    std::vector<F4> deltaPos(nbRows, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
-    for (uint32_t k = nbVerts; k < nbRows; ++k) deltaPos[k] = guardDelta;
-    // Triangle table (16 entries on the 11-vertex cloth): entry 13 = (5,6,7), entry 15 =
-    // (8,9,10); the rest point at vertex 4 (owned by nobody), so a wrong triangle index
-    // scatters into a vertex the check sees.
-    std::vector<uint32_t> triVtx(4u * nbTris, 4u);
-    const uint32_t triA = 13u, triB = 15u;
-    triVtx[4u * triA + 0] = 5u; triVtx[4u * triA + 1] = 6u; triVtx[4u * triA + 2] = 7u; triVtx[4u * triA + 3] = 0u;
-    triVtx[4u * triB + 0] = 8u; triVtx[4u * triB + 1] = 9u; triVtx[4u * triB + 2] = 10u; triVtx[4u * triB + 3] = 0u;
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, velocities);
-    DevBuf bAcc = makeDev(dev, accumDelta);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bTri = makeDev(dev, triVtx);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = nbVerts;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // --- lanes ------------------------------------------------------------
-    const uint64_t staticNode = 0x00000000FFFFFFFFull;
-    const uint64_t dynNode = 3ull, kinNode = 4ull;
-    const uint64_t artiNode = (3ull << 32) | 5ull;   // PxNodeIndex(5, link 1)
-    const uint64_t laneNode[N] = { staticNode, dynNode, dynNode, artiNode, kinNode, staticNode };
-    const uint32_t laneElem[N] = { 0u, 1u, triA, 2u, 3u, triB };
-    const F4 laneBary[N] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0.2f, 0.3f, 0.5f, 0.0f },
-                             { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0.6f, 0.15f, 0.25f, 0.0f } };
-    const F4 lowHigh = { 0.0f, 0.0f, 0.0f, 0.0f };     // NULL cone (PxgSimulationController.cpp:3062)
-    const float axisAngleW = -1.0f;
-    const V3 axisIn = { 0.0f, 1.0f, 0.0f };
-    std::vector<PxgFEMRigidAttachment> atts(N);
-    std::vector<V3> laneRa4(N);
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const float fi = float(i);
-        PxgFEMRigidAttachment& a = atts[i];
-        std::memset(&a, 0, sizeof(a));
-        a.index0 = laneNode[i];
-        a.index1 = uint64_t(laneElem[i]);   // clothId 0
-        laneRa4[i] = V3{ 0.12f + 0.05f * fi, -0.31f + 0.04f * fi, 0.07f - 0.03f * fi };
-        a.localPose0 = make_float4(laneRa4[i].x, laneRa4[i].y, laneRa4[i].z, 0.0f);
-        a.coneLimitParams.low_high_limits = make_float4(lowHigh.x, lowHigh.y, lowHigh.z, lowHigh.w);
-        a.coneLimitParams.axis_angle = make_float4(axisIn.x, axisIn.y, axisIn.z, axisAngleW);
-        a.baryOrType1 = make_float4(laneBary[i].x, laneBary[i].y, laneBary[i].z, laneBary[i].w);
-    }
-    // activeRigidAttachments: a non-identity permutation, so the prepare's attachmentId
-    // indirection (FEMClothConstraintPrep.cu:426-428) is live.  Lane i (= workIndex, the
-    // constraint slot the reference checks) lives at rigidAttachments[activeAtt[i]].
-    std::vector<uint32_t> activeAtt = { 2u, 0u, 5u, 1u, 4u, 3u };
-    {
-        std::vector<PxgFEMRigidAttachment> permuted(N);
-        for (uint32_t i = 0; i < N; ++i) permuted[activeAtt[i]] = atts[i];
-        atts.swap(permuted);
-    }
-    DevBuf bAtt = makeDev(dev, atts);
-    DevBuf bActiveAtt = makeDev(dev, activeAtt);
-    std::vector<uint64_t> attachIds(N, 0xBADBADBADull);
-    DevBuf bAttachIds = makeDev(dev, attachIds);
-    std::vector<uint8_t> constraintBytes(sizeof(RigidAttachConstraintHost), 0xCD);
-    DevBuf bConstraint = makeDev(dev, constraintBytes);
-    const F4 sentinel = { 9.0f, 9.0f, 9.0f, 9.0f };
-    std::vector<F4> rigidDeltaVel(2u * N, sentinel);
-    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
-
-    // --- solver bodies: 0 = world, 1 = dynamic, 2 = kinematic -------------
-    const uint32_t numSolverBodies = 3u, accOffset = 0u;
-    const float invMassOf[3] = { 0.0f, 0.25f, 0.0f };
-    // body2WorldPool: PxAlignedTransform {q, p}.  Body 1 rotated (normalised quat).
-    const float qn = 1.0f / std::sqrt(0.1f * 0.1f + 0.2f * 0.2f + 0.3f * 0.3f + 0.927f * 0.927f);
-    const F4 qDyn = { 0.1f * qn, 0.2f * qn, -0.3f * qn, 0.927f * qn };
-    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 },
-                                   qDyn, { 0.4f, 1.7f, -0.1f, 0.0f },
-                                   { 0, 0, 0, 1 }, { -0.5f, 2.2f, 0.3f, 0.0f } };
-    DevBuf bBody2World = makeDev(dev, body2World);
-    std::vector<uint8_t> solverBodyData(96u * numSolverBodies, 0);
-    for (uint32_t b = 0; b < numSolverBodies; ++b)
-        std::memcpy(solverBodyData.data() + 96u * b + 28u, &invMassOf[b], 4);
-    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
-    // sqrtInvInertia (column-major) -- body 1 full non-symmetric, body 2 a decoy that the
-    // kinematic identity * 0 path must NOT read.
-    float sqrtInv[3][9] = { { 0 }, { 0.9f, 0.05f, -0.02f, 0.03f, 1.1f, 0.04f, -0.01f, 0.06f, 0.8f },
-                            { 5, 5, 5, 5, 5, 5, 5, 5, 5 } };
-    std::vector<uint8_t> solverTxIData(64u * numSolverBodies, 0);
-    for (uint32_t b = 0; b < numSolverBodies; ++b)
-        std::memcpy(solverTxIData.data() + 64u * b + 28u, sqrtInv[b], 36);
-    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
-
-    // PGS: outSolverVelocity [lin x N][ang x N]; pool (accumulated delta) same shape.
-    // TGS: pool three planes {lin.xyz ang.x}{ang.yz linDelta.xy}{linDelta.z angDelta.xyz}.
-    std::vector<F4> outSolverVelocity(2u * numSolverBodies, F4{ 0, 0, 0, 0 });
-    std::vector<F4> solverBodyVelPool(3u * numSolverBodies + 1u, F4{ 0, 0, 0, 0 });
-    for (uint32_t b = 1; b < numSolverBodies; ++b)
-    {
-        const float fb = float(b);
-        outSolverVelocity[b] = { 0.3f * fb, -0.2f, 0.1f * fb, 0.0f };
-        outSolverVelocity[b + numSolverBodies] = { 0.05f, -0.07f * fb, 0.02f, 0.0f };
-        solverBodyVelPool[b] = { 0.01f * fb, -0.02f, 0.03f, 0.04f * fb };
-        solverBodyVelPool[b + numSolverBodies] = { -0.05f, 0.06f * fb, 0.0007f, -0.0008f };
-        solverBodyVelPool[b + 2u * numSolverBodies] = { 0.0009f * fb, 0.0011f, -0.0012f, 0.0013f };
-    }
-    solverBodyVelPool[3u * numSolverBodies] = { 61.f, 62.f, 63.f, 64.f };
-    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
-    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
-    std::vector<uint32_t> solverBodyIndices = { 0u, 0xEEu, 0xEEu, 1u, 2u, 1u };   // node 5 -> artic. 1
-    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
-
-    // --- articulation behind lane 3 (record 2 real, record 1 decoy) ------
-    const uint32_t artiLinkId = 1u, artiRemapId = 2u, artiSolverIdx = 1u;
-    const uint32_t maxLinks = 2u, nbArticulations = 3u, artiOffset = maxLinks * nbArticulations;
-    std::vector<physx::PxgArticulationLink> artiLinks(nbArticulations * maxLinks);
-    std::memset(static_cast<void*>(artiLinks.data()), 0, artiLinks.size() * sizeof(artiLinks[0]));
-    std::vector<physx::PxTransform> artiB2W(nbArticulations * maxLinks);
-    std::vector<physx::PxSpatialMatrix> artiResp(nbArticulations * maxLinks);
-    for (uint32_t k = 0; k < nbArticulations * maxLinks; ++k)
-    {
-        const float fk = float(k);
-        physx::PxQuat q(0.05f * fk, -0.1f, 0.2f + 0.01f * fk, 0.95f);
-        q.normalize();
-        artiB2W[k] = physx::PxTransform(physx::PxVec3(0.15f - 0.04f * fk, 1.25f + 0.03f * fk, 0.35f + 0.02f * fk), q);
-        for (uint32_t cc = 0; cc < 6u; ++cc)
-            for (uint32_t rr = 0; rr < 6u; ++rr)
-                artiResp[k].column[cc][rr] = (cc == rr ? 0.9f : 0.0f)
-                                           + 0.013f * float((cc * 7u + rr * 3u + k * 5u) % 11u) - 0.05f;
-    }
-    DevBuf bArtiLinks = makeDev(dev, artiLinks);
-    DevBuf bArtiB2W = makeDev(dev, artiB2W);
-    DevBuf bArtiResp = makeDev(dev, artiResp);
-    std::vector<physx::PxgArticulation> artiRecs(nbArticulations);
-    std::memset(static_cast<void*>(artiRecs.data()), 0, artiRecs.size() * sizeof(artiRecs[0]));
-    for (uint32_t r = 0; r < nbArticulations; ++r)
-    {
-        artiRecs[r].links = reinterpret_cast<physx::PxgArticulationLink*>(
-            size_t(bArtiLinks.addr + uint64_t(r * maxLinks) * sizeof(physx::PxgArticulationLink)));
-        artiRecs[r].linkBody2Worlds = reinterpret_cast<physx::PxTransform*>(
-            size_t(bArtiB2W.addr + uint64_t(r * maxLinks) * sizeof(physx::PxTransform)));
-        artiRecs[r].spatialResponseMatrixW = reinterpret_cast<physx::PxSpatialMatrix*>(
-            size_t(bArtiResp.addr + uint64_t(r * maxLinks) * sizeof(physx::PxSpatialMatrix)));
-    }
-    DevBuf bArtiRecs = makeDev(dev, artiRecs);
-    std::vector<physx::PxgBodySim> bodySims(6u);
-    std::memset(static_cast<void*>(bodySims.data()), 0, bodySims.size() * sizeof(bodySims[0]));
-    for (uint32_t n = 0; n < 6u; ++n) bodySims[n].articulationRemapId = 0xDEADu;
-    bodySims[5].articulationRemapId = artiRemapId;
-    DevBuf bBodySims = makeDev(dev, bodySims);
-    std::vector<F4> outArtiVelocity(4u * artiOffset);
-    for (uint32_t k = 0; k < 4u * artiOffset; ++k)
-    {
-        const float fk = float(k);
-        const float sc = (k >= 2u * artiOffset) ? 0.01f : 1.0f;
-        outArtiVelocity[k] = { sc * (0.12f - 0.03f * fk), sc * (-0.45f + 0.02f * fk), sc * (0.08f + 0.01f * fk), 777.0f };
-    }
-    DevBuf bOutArtiVel = makeDev(dev, outArtiVelocity);
-    std::vector<uint8_t> artiCoreDesc(sizeof(physx::PxgArticulationCoreDesc), 0xAB);
-    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, mMaxLinksPerArticulation), maxLinks);
-    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, nbArticulations), nbArticulations);
-    DevBuf bArtiCoreDesc = makeDev(dev, artiCoreDesc);
-    const uint32_t artiRecLink = artiRemapId * maxLinks + artiLinkId;
-    const uint32_t artiVelRow = artiSolverIdx * maxLinks + artiLinkId;
-
-    // --- descriptors ---------------------------------------------------------
-    std::vector<uint8_t> prepDesc(304, 0);
-    pokePtr(prepDesc, 64, bSolverBodyData.addr);
-    pokePtr(prepDesc, 72, bSolverTxIData.addr);
-    pokePtr(prepDesc, 168, bBody2World.addr);
-    DevBuf bPrepDesc = makeDev(dev, prepDesc);
-    std::vector<uint8_t> prePrepDesc(760, 0);
-    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
-    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
-    std::vector<uint8_t> solverCoreDesc(320, 0);
-    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
-    pokePtr(solverCoreDesc, 40, bOutArtiVel.addr);          // outArtiVelocity @40
-    pokeU32(solverCoreDesc, 268, numSolverBodies);
-    pokeU32(solverCoreDesc, 276, accOffset);
-    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
-    std::vector<uint8_t> sharedDesc(224, 0);
-    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
-    pokePtr(sharedDesc, 32, bBodySims.addr);                // mBodySimBufferDeviceData @32
-    pokePtr(sharedDesc, 40, bArtiRecs.addr);                // articulations @40
-    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
-
-    // ======================= PREPARE ===================================
-    struct PrepPush
-    {
-        uint64_t clothes, rigidAttachments, activeRigidAttachments, rigidAttachmentIds;
-        uint32_t numRigidAttachments, pad36;
-        uint64_t constraints, prePrepDesc, prepDesc, sharedDesc, rigidDeltaVel;
-    };
-    PrepPush pp = {};
-    pp.clothes = bDesc.addr; pp.rigidAttachments = bAtt.addr; pp.activeRigidAttachments = bActiveAtt.addr;
-    pp.rigidAttachmentIds = bAttachIds.addr; pp.numRigidAttachments = N; pp.constraints = bConstraint.addr;
-    pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr; pp.sharedDesc = bSharedDesc.addr;
-    pp.rigidDeltaVel = bRigidDeltaVel.addr;
-    Kernel kPrep("femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-
-    auto laneIsArti = [&](uint32_t i) { return ((laneNode[i] >> 32) & 1ull) != 0ull; };
-    auto laneIsTri = [&](uint32_t i) { return laneBary[i].x != 0.0f || laneBary[i].y != 0.0f || laneBary[i].z != 0.0f; };
-    auto laneBody = [&](uint32_t i) { return laneNode[i] == staticNode ? 0u : solverBodyIndices[uint32_t(laneNode[i])]; };
-    auto laneTri = [&](uint32_t i) {
-        return std::array<uint32_t, 3>{ triVtx[4u * laneElem[i]], triVtx[4u * laneElem[i] + 1u], triVtx[4u * laneElem[i] + 2u] };
-    };
-    auto lanePick = [&](uint32_t i, const std::vector<F4>& arr) {
-        if (!laneIsTri(i)) return arr[laneElem[i]];
-        const auto t = laneTri(i);
-        return p7Bref::blend(arr[t[0]], arr[t[1]], arr[t[2]], laneBary[i]);
-    };
-
-    RigidAttachConstraintHost refC;
-    std::memset(&refC, 0xCD, sizeof(refC));
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const F4 pose = lanePick(i, positions);
-        if (laneIsArti(i))
-        {
-            p7Bref::refPrepareArti(refC, int(i), pose, laneRa4[i], axisIn, axisAngleW, lowHigh, laneBary[i],
-                                   laneElem[i], laneNode[i], artiB2W[artiRecLink], artiResp[artiRecLink]);
-            continue;
-        }
-        // refPrepare fills slot 0; build into a scratch block and copy the slot.
-        RigidAttachConstraintHost tmp;
-        std::memset(&tmp, 0xCD, sizeof(tmp));
-        const uint32_t b = laneBody(i);
-        const F4 q = body2World[2u * b], p = body2World[2u * b + 1u];
-        p73ref::refPrepare(tmp, pose, laneRa4[i], axisIn, axisAngleW, lowHigh, laneBary[i], laneElem[i], laneNode[i],
-                           q.x, q.y, q.z, q.w, V3{ p.x, p.y, p.z }, invMassOf[b], sqrtInv[b],
-                           laneNode[i] == staticNode);
-        refC.raXn0_biasW[i] = tmp.raXn0_biasW[0]; refC.raXn1_biasW[i] = tmp.raXn1_biasW[0];
-        refC.raXn2_biasW[i] = tmp.raXn2_biasW[0]; refC.velMultiplierXYZ_invMassW[i] = tmp.velMultiplierXYZ_invMassW[0];
-        refC.elemId[i] = tmp.elemId[0]; refC.rigidId[i] = tmp.rigidId[0]; refC.baryOrType[i] = tmp.baryOrType[0];
-        refC.low_high_limits[i] = tmp.low_high_limits[0]; refC.axis_angle[i] = tmp.axis_angle[0];
-    }
-    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidAttachConstraintHost));
-    RigidAttachConstraintHost gotC;
-    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
-    size_t mm = 0;
-    auto cmp4 = [&](const char* what, uint32_t lane, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  %s[%u] MM: ref(%.9g,%.9g,%.9g,%.9g) got(%.9g,%.9g,%.9g,%.9g)\n", what, lane,
-                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        cmp4("prep raXn0_biasW", i, refC.raXn0_biasW[i], gotC.raXn0_biasW[i]);
-        cmp4("prep raXn1_biasW", i, refC.raXn1_biasW[i], gotC.raXn1_biasW[i]);
-        cmp4("prep raXn2_biasW", i, refC.raXn2_biasW[i], gotC.raXn2_biasW[i]);
-        cmp4("prep velMult", i, refC.velMultiplierXYZ_invMassW[i], gotC.velMultiplierXYZ_invMassW[i]);
-        cmp4("prep baryOrType", i, refC.baryOrType[i], gotC.baryOrType[i]);
-        cmp4("prep low_high", i, refC.low_high_limits[i], gotC.low_high_limits[i]);
-        cmp4("prep axis_angle", i, refC.axis_angle[i], gotC.axis_angle[i]);
-        if (gotC.elemId[i] != refC.elemId[i]) { ++mm; std::printf("  prep elemId[%u] MM\n", i); }
-        if (gotC.rigidId[i] != refC.rigidId[i]) { ++mm; std::printf("  prep rigidId[%u] MM\n", i); }
-    }
-    const auto gIds = downloadBuffer<uint64_t>(dev, bAttachIds.h, N);
-    for (uint32_t i = 0; i < N; ++i)
-        if (gIds[i] != laneNode[i]) { ++mm; std::printf("  rigidAttachmentIds[%u] MM\n", i); }
-    // The prepare zeroes rigidDeltaVel for the RIGID arm only; the link lane keeps the sentinel.
-    const auto gRdvPrep = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const F4 want = laneIsArti(i) ? sentinel : F4{ 0, 0, 0, 0 };
-        cmp4("prep rigidDeltaVel lin", i, want, gRdvPrep[i]);
-        cmp4("prep rigidDeltaVel ang", i, want, gRdvPrep[i + N]);
-    }
-    PXG_CHECK_MSG(f2u(gotC.velMultiplierXYZ_invMassW[3].w) == f2u(1.0f),
-                  "link lane must carry invMass0 = 1 (got %g)", gotC.velMultiplierXYZ_invMassW[3].w);
-    PXG_CHECK_MSG(f2u(gotC.velMultiplierXYZ_invMassW[1].w) == f2u(invMassOf[1]),
-                  "dynamic lane must carry the body's invMass0 (got %g)", gotC.velMultiplierXYZ_invMassW[1].w);
-    PXG_CHECK_MSG(mm == 0, "all-anchor cloth_rigidAttachmentPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
-
-    // ======================= SOLVE =====================================
-    struct SolvePush
-    {
-        uint64_t clothes, attachments;
-        uint32_t numAttachments, pad20;
-        uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
-        float dt;
-        uint32_t pad60;
-        uint64_t rigidDeltaVel;
-    };
-    SolvePush sp = {};
-    sp.clothes = bDesc.addr; sp.attachments = bConstraint.addr; sp.numAttachments = N;
-    sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = bArtiCoreDesc.addr; sp.sharedDesc = bSharedDesc.addr; sp.dt = dt;
-    sp.rigidDeltaVel = bRigidDeltaVel.addr;
-    const char* solveEntry = isTGS ? "cloth_solveRigidClothAttachmentTGSLaunch" : "cloth_solveRigidClothAttachmentLaunch";
-    Kernel kSolve("femClothRigidAttachBda.spv", solveEntry, {}, sizeof(SolvePush));
-    kSolve.dispatch(FEM_PREP_GRID, {}, sp, 1u, 1u);   // SB_UPDATEROTATION grid, as the engine
-    dev->flush();
-
-    // ---- reference -------------------------------------------------------------
-    auto laneVel = [&](uint32_t i) {
-        p7Bref::RigidVel v;
-        if (laneIsArti(i))
-        {
-            const F4 l = outArtiVelocity[artiVelRow], a = outArtiVelocity[artiVelRow + artiOffset];
-            v.linVel = { l.x, l.y, l.z }; v.angVel = { a.x, a.y, a.z };
-            if (isTGS)
-            {
-                const F4 ld = outArtiVelocity[artiVelRow + 2u * artiOffset], ad = outArtiVelocity[artiVelRow + 3u * artiOffset];
-                v.linDelta = { ld.x, ld.y, ld.z }; v.angDelta = { ad.x, ad.y, ad.z };
-            }
-            return v;
-        }
-        const uint32_t b = laneBody(i);
-        if (isTGS)
-        {
-            const F4 v0 = solverBodyVelPool[accOffset + b], v1 = solverBodyVelPool[accOffset + b + numSolverBodies];
-            const F4 v2 = solverBodyVelPool[accOffset + b + 2u * numSolverBodies];
-            v.linVel = { v0.x, v0.y, v0.z }; v.angVel = { v0.w, v1.x, v1.y };
-            v.linDelta = { v1.z, v1.w, v2.x }; v.angDelta = { v2.y, v2.z, v2.w };
-        }
-        else
-        {
-            const F4 iv0 = outSolverVelocity[b], iv1 = outSolverVelocity[b + numSolverBodies];
-            const F4 dv0 = solverBodyVelPool[accOffset + b], dv1 = solverBodyVelPool[accOffset + b + numSolverBodies];
-            v.linVel = { iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z };
-            v.angVel = { iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z };
-        }
-        return v;
-    };
-
-    std::vector<F4> refDelta(deltaPos.begin(), deltaPos.end());   // guard rows keep guardDelta
-    std::vector<F4> refRdv(gRdvPrep.begin(), gRdvPrep.end());
-    auto scatter = [&](uint32_t v, V3 d, float w) {
-        refDelta[v].x = 0.0f + d.x * w; refDelta[v].y = 0.0f + d.y * w; refDelta[v].z = 0.0f + d.z * w;
-        refDelta[v].w += 1.0f;
-    };
-    uint32_t coneChanged = 0u, reacting = 0u;
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const F4 st = lanePick(i, isTGS ? accumDelta : velocities);
-        const bool isStatic = laneNode[i] == staticNode;
-        if (isStatic && st.w == 0.0f)
-            continue;
-        const p7Bref::RigidVel v = laneVel(i);
-        const V3 lin1 = V3{ st.x, st.y, st.z };
-        const p7Bref::SolveOut o = isTGS ? p7Bref::refImpulseTGS(gotC, int(i), lin1, v, dt, true)
-                                         : p7Bref::refImpulsePGS(gotC, int(i), lin1, v, 1.0f / dt, true);
-        const p7Bref::SolveOut o0 = isTGS ? p7Bref::refImpulseTGS(gotC, int(i), lin1, v, dt, false)
-                                          : p7Bref::refImpulsePGS(gotC, int(i), lin1, v, 1.0f / dt, false);
-        if (f2u(o.deltaImpulse.x) != f2u(o0.deltaImpulse.x) || f2u(o.deltaImpulse.y) != f2u(o0.deltaImpulse.y) ||
-            f2u(o.deltaImpulse.z) != f2u(o0.deltaImpulse.z))
-            ++coneChanged;
-        if (!isStatic)
-        {
-            const float im0 = gotC.velMultiplierXYZ_invMassW[i].w;
-            if (im0 == 0.0f)
-            {
-                refRdv[i] = F4{ 0, 0, 0, 0 }; refRdv[i + N] = F4{ 0, 0, 0, 0 };
-            }
-            else
-            {
-                ++reacting;
-                refRdv[i] = F4{ o.deltaLinVel.x, o.deltaLinVel.y, o.deltaLinVel.z, 1.0f };
-                refRdv[i + N] = F4{ o.deltaAngVel.x, o.deltaAngVel.y, o.deltaAngVel.z, 0.0f };
-            }
-        }
-        const V3 di = o.deltaImpulse;
-        if (di.x != 0.0f || di.y != 0.0f || di.z != 0.0f)
-        {
-            const V3 dp = isTGS ? V3{ -di.x, -di.y, -di.z } : V3{ -di.x * dt, -di.y * dt, -di.z * dt };
-            if (!laneIsTri(i))
-                scatter(laneElem[i], dp, st.w);
-            else
-            {
-                const auto t = laneTri(i);
-                const std::vector<F4>& src = isTGS ? accumDelta : velocities;
-                scatter(t[0], p7Bref::scale3(dp, laneBary[i].x), src[t[0]].w);
-                scatter(t[1], p7Bref::scale3(dp, laneBary[i].y), src[t[1]].w);
-                scatter(t[2], p7Bref::scale3(dp, laneBary[i].z), src[t[2]].w);
-            }
-        }
-    }
-    PXG_CHECK_MSG(reacting == 3u, "coverage: dynamic vertex + dynamic triangle + link must react (got %u)", reacting);
-    if (!isTGS)
-        PXG_CHECK_MSG(coneChanged > 0u,
-                      "coverage: the PGS cone-limited round trip must change at least one lane's impulse bits");
-    std::printf("  [%s] cone branch changed %u of %u lanes' impulse bits\n", isTGS ? "TGS" : "PGS", coneChanged, N);
-
-    mm = 0;
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, nbRows);
-    for (uint32_t k = 0; k < nbRows; ++k)
-        cmp4("solve mDeltaPos", k, refDelta[k], gDelta[k]);
-    size_t guardHit = 0;
-    for (uint32_t k = nbVerts; k < nbRows; ++k)
-        if (f2u(gDelta[k].x) != f2u(guardDelta.x) || f2u(gDelta[k].y) != f2u(guardDelta.y) ||
-            f2u(gDelta[k].z) != f2u(guardDelta.z) || f2u(gDelta[k].w) != f2u(guardDelta.w))
-            ++guardHit;
-    PXG_CHECK_MSG(guardHit == 0, "no mDeltaPos row >= nbVerts (%u) may be written (%zu guard rows hit)", nbVerts, guardHit);
-    const auto gRdv = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
-    for (uint32_t k = 0; k < 2u * N; ++k)
-        cmp4("solve rigidDeltaVel", k, refRdv[k], gRdv[k]);
-    PXG_CHECK_MSG(f2u(gDelta[4].w) == 0u, "vertex 4 (owned by nobody) must stay untouched");
-    PXG_CHECK_MSG(gDelta[5].w == 1.0f && gDelta[6].w == 1.0f && gDelta[7].w == 1.0f,
-                  "triangle %u >= nbVerts (%u) must scatter into its three corners 5,6,7", triA, nbVerts);
-    PXG_CHECK_MSG(mm == 0, "all-anchor cloth_solveRigidClothAttachment%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm);
-
-    DevBuf all[] = { bPos, bVel, bAcc, bDelta, bTri, bDesc, bAtt, bActiveAtt, bAttachIds, bConstraint, bRigidDeltaVel,
-                     bBody2World, bSolverBodyData, bSolverTxIData, bOutSolverVel, bSolverBodyVelPool, bSolverBodyIndices,
-                     bArtiLinks, bArtiB2W, bArtiResp, bArtiRecs, bBodySims, bOutArtiVel, bArtiCoreDesc,
-                     bPrepDesc, bPrePrepDesc, bSolverCoreDesc, bSharedDesc };
-    for (const DevBuf& b : all) dev->destroyBuffer(b.h);
-}
-
-PXG_TEST(femClothSimRigidAttachAllAnchorsPGS) { runRigidAttachAllAnchors(/*isTGS*/ false); }
-PXG_TEST(femClothSimRigidAttachAllAnchorsTGS) { runRigidAttachAllAnchors(/*isTGS*/ true); }
-
-// ---------------------------------------------------------------------------
-// P7.1 tranche 3c: cloth_applyExternalDeltasLaunch — folds the accumulated
-// external correction (mDeltaPos, .w = per-vertex count) into position / velocity
-// / accumulated-delta, then clears it.  The missing link that lets an attachment
-// (or contact) actually move a cloth vertex.  Bit-exact vs FEMClothExternalSolve.cu:1053.
-// ---------------------------------------------------------------------------
-struct ApplyExtPush { uint64_t clothes, activeClothes; float dt; uint32_t pad20; };
-static_assert(sizeof(ApplyExtPush) == 24, "applyExternalDeltas push blob must be 24 bytes");
-
-PXG_TEST(femClothSimApplyExternalDeltas)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const uint32_t N = 3;
-    const float dt = 1.0f / 60.0f;
-    const float invDt = 1.0f / dt;
-
-    std::vector<F4> positions = { {1.f,2.f,3.f,1.f}, {4.f,5.f,6.f,1.f}, {7.f,8.f,9.f,1.f} };
-    std::vector<F4> vels = { {0.1f,0.2f,0.3f,0.f}, {-0.1f,-0.2f,-0.3f,0.f}, {0.05f,-0.05f,0.15f,0.f} };
-    std::vector<F4> accum = { {0.5f,0.5f,0.5f,0.f}, {1.f,1.f,1.f,0.f}, {-1.f,-1.f,-1.f,0.f} };
-    // vert0 count=2 (apply), vert1 count=0 (skip, must stay untouched), vert2 count=3 (apply)
-    std::vector<F4> deltaPos = { {0.3f,-0.6f,0.9f,2.0f}, {9.f,9.f,9.f,0.0f}, {1.5f,0.3f,-0.9f,3.0f} };
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, vels);
-    DevBuf bAcc = makeDev(dev, accum);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mNbVerts = N;
-
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-    std::vector<uint32_t> active = { 0u };
-    DevBuf bActive = makeDev(dev, active);
-
-    ApplyExtPush push = {};
-    push.clothes = bDesc.addr;
-    push.activeClothes = bActive.addr;
-    push.dt = dt;
-
-    Kernel k("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
-    k.dispatch(/*numBlocks*/ 1u, {}, push, /*nbActive*/ 1u, 1u);
-    dev->flush();
-
-    // CPU reference (FEMClothExternalSolve.cu:1053).
-    std::vector<F4> refPos = positions, refVel = vels, refAcc = accum, refDelta = deltaPos;
-    for (uint32_t v = 0; v < N; ++v)
-    {
-        const F4 d = deltaPos[v];
-        if (d.w != 0.0f)
-        {
-            const float scale = 1.0f / d.w;
-            const F4 sd = { d.x * scale, d.y * scale, d.z * scale, 0.0f };
-            refVel[v] = { vels[v].x + sd.x * invDt, vels[v].y + sd.y * invDt, vels[v].z + sd.z * invDt, vels[v].w + sd.w * invDt };
-            refPos[v] = { positions[v].x + sd.x, positions[v].y + sd.y, positions[v].z + sd.z, positions[v].w + sd.w };
-            refAcc[v] = { accum[v].x + sd.x, accum[v].y + sd.y, accum[v].z + sd.z, accum[v].w + sd.w };
-            refDelta[v] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        }
-    }
-
-    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
-    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
-    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
-
-    PXG_CHECK_MSG(f2u(gPos[0].x) != f2u(positions[0].x), "applyExternalDeltas should move vert0 (teeth)");
-    PXG_CHECK_MSG(f2u(gPos[1].x) == f2u(positions[1].x), "vert1 (count 0) must stay untouched");
-
-    size_t mm = 0;
-    auto cmp4 = [&](const char* nm, uint32_t i, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    for (uint32_t v = 0; v < N; ++v)
-    {
-        cmp4("pos", v, refPos[v], gPos[v]);
-        cmp4("vel", v, refVel[v], gVel[v]);
-        cmp4("acc", v, refAcc[v], gAcc[v]);
-        cmp4("delta", v, refDelta[v], gDelta[v]);
-    }
-    PXG_CHECK_MSG(mm == 0, "cloth_applyExternalDeltas bit-exact vs CPU (%zu mismatches)", mm);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
-}
-
-// P9.86f: the w lanes.  FEMClothExternalSolve.cu:1101-1102 are IEEE `pos.w + 0.f` / `accumDelta.w + 0.f`
-// (delta.w = 0.f just above), which turn a -0 inverse mass into +0; llvmpipe folds the forwarded literal-zero
-// w lane of those float4 adds (F3), so the port spells the lane as a select.  Vertex 0 carries -0 in all
-// three w lanes and a non-zero count; vertex 1 the same with +0 (control).  vel.w's add is `w + 0 * invDt`,
-// a computed zero (IEEE either way).  Compared bitwise, no signed-zero forgiveness.
-PXG_TEST(femClothSimApplyExternalDeltasZeroSign)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const uint32_t N = 2;
-    const float dt = 1.0f / 60.0f;
-    const float invDt = 1.0f / dt;
-
-    std::vector<F4> positions = { {1.f, 2.f, 3.f, -0.0f}, {4.f, 5.f, 6.f, 0.0f} };
-    std::vector<F4> vels = { {0.1f, 0.2f, 0.3f, -0.0f}, {-0.1f, -0.2f, -0.3f, 0.0f} };
-    std::vector<F4> accum = { {0.5f, 0.5f, 0.5f, -0.0f}, {1.f, 1.f, 1.f, 0.0f} };
-    std::vector<F4> deltaPos = { {0.3f, -0.6f, 0.9f, 2.0f}, {1.5f, 0.3f, -0.9f, 3.0f} };
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, vels);
-    DevBuf bAcc = makeDev(dev, accum);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mNbVerts = N;
-
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-    std::vector<uint32_t> active = { 0u };
-    DevBuf bActive = makeDev(dev, active);
-
-    ApplyExtPush push = {};
-    push.clothes = bDesc.addr;
-    push.activeClothes = bActive.addr;
-    push.dt = dt;
-
-    Kernel k("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
-    k.dispatch(1u, {}, push, 1u, 1u);
-    dev->flush();
-
-    // CPU reference (FEMClothExternalSolve.cu:1085-1106), IEEE: -0 + 0.f = +0.  The twin is the folded port
-    // (`pos.w + 0` -> `pos.w`), which keeps the input's -0.
-    std::vector<F4> refPos(N), refVel(N), refAcc(N);
-    uint32_t twinKills = 0;
-    for (uint32_t v = 0; v < N; ++v)
-    {
-        const F4 d = deltaPos[v];
-        const float scale = 1.0f / d.w;
-        const F4 sd = { d.x * scale, d.y * scale, d.z * scale, 0.0f };
-        refVel[v] = { vels[v].x + sd.x * invDt, vels[v].y + sd.y * invDt, vels[v].z + sd.z * invDt, vels[v].w + sd.w * invDt };
-        refPos[v] = { positions[v].x + sd.x, positions[v].y + sd.y, positions[v].z + sd.z, positions[v].w + sd.w };
-        refAcc[v] = { accum[v].x + sd.x, accum[v].y + sd.y, accum[v].z + sd.z, accum[v].w + sd.w };
-        if (f2u(refPos[v].w) != f2u(positions[v].w)) ++twinKills;
-        if (f2u(refAcc[v].w) != f2u(accum[v].w)) ++twinKills;
-    }
-    PXG_CHECK_MSG(twinKills == 2 && f2u(refPos[0].w) == 0u && f2u(refAcc[0].w) == 0u,
-                  "applyExternalDeltasZeroSign: the -0 w lanes must reach the CUDA's +0 (%u twin kills)", twinKills);
-
-    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
-    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
-    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
-    auto same = [](const F4& r, const F4& g) {
-        return f2u(r.x) == f2u(g.x) && f2u(r.y) == f2u(g.y) && f2u(r.z) == f2u(g.z) && f2u(r.w) == f2u(g.w);
-    };
-    for (uint32_t v = 0; v < N; ++v)
-    {
-        PXG_CHECK_MSG(same(refPos[v], gPos[v]), "vert %u pos: w ref %08x gpu %08x", v, f2u(refPos[v].w), f2u(gPos[v].w));
-        PXG_CHECK_MSG(same(refVel[v], gVel[v]), "vert %u vel: w ref %08x gpu %08x", v, f2u(refVel[v].w), f2u(gVel[v].w));
-        PXG_CHECK_MSG(same(refAcc[v], gAcc[v]), "vert %u accumDelta: w ref %08x gpu %08x", v, f2u(refAcc[v].w), f2u(gAcc[v].w));
-    }
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
-}
-
-// ===========================================================================
 // P7.1 tranche 4a: cloth-vertex-vs-PRIMITIVE contact GENERATION.
 //   femClothContactGenBda.spv:
 //     cloth_midphaseGenerateVertexPairsLaunch  (femClothMidPhase.cu)
@@ -2879,20 +1622,29 @@ PXG_TEST(femClothSimApplyExternalDeltasZeroSign)
 // Bit-exact vs a CPU transcription of the .cu math (both memory modes).
 // ===========================================================================
 
-// PxgFemOtherContactInfo host mirror (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes).
-// PxgFEMCore.h is not test-includable (it pulls the CUDA buffer stack), so the
-// contact-writer's info tail is mirrored locally and pinned self-consistently
-// here (the layout the shader writes at index*16 must equal what we read back).
-struct FemOtherContactInfoHost
+// PxgDeformablePairInfo host mirror (PxgSimulationCoreDesc.h, 5.12): ref0 / ref1, 16 bytes.
+// The 5.6.1 PxgFemOtherContactInfo (pairInd0 / packed pairInd1 / rigidMatInd_isInCollision)
+// is gone: the rigid material index has its own PxU16 stream and the cloth feature is a
+// 64-bit PxgDeformableRef.
+struct FemPairInfoHost
 {
-    uint64_t pairInd0;                 // @0
-    uint32_t pairInd1;                 // @8
-    uint32_t rigidMatInd_isInCollision; // @12 -> 16
+    uint64_t ref0;   // @0  the rigid PxNodeIndex (or another participant's ref)
+    uint64_t ref1;   // @8  the PxgDeformableRef
 };
-static_assert(sizeof(FemOtherContactInfoHost) == 16, "PxgFemOtherContactInfo mirror == 16B");
-static_assert(offsetof(FemOtherContactInfoHost, pairInd0) == 0, "pairInd0 @0");
-static_assert(offsetof(FemOtherContactInfoHost, pairInd1) == 8, "pairInd1 @8");
-static_assert(offsetof(FemOtherContactInfoHost, rigidMatInd_isInCollision) == 12, "rigidMatInd @12");
+static_assert(sizeof(FemPairInfoHost) == 16, "PxgDeformablePairInfo mirror == 16B");
+static_assert(sizeof(FemPairInfoHost) == sizeof(PxgDeformablePairInfo), "PxgDeformablePairInfo stride");
+
+// PxgDeformableRef [deformable:30 @34][active][invalid][type:3 @29][localEdge:2 @27][feature:27].
+static uint64_t encClothRef(uint32_t clothId, uint32_t type, uint32_t feature)
+{
+    return (uint64_t(clothId) << 34) | (uint64_t(type) << 29) | uint64_t(feature);
+}
+static uint64_t encClothVertex(uint32_t clothId, uint32_t v) { return encClothRef(clothId, 0u, v); }
+static uint64_t encClothTriangle(uint32_t clothId, uint32_t t) { return encClothRef(clothId, 1u, t); }
+static uint64_t encClothEdge(uint32_t clothId, uint32_t t, uint32_t localEdge)
+{
+    return encClothRef(clothId, 3u, t) | (uint64_t(localEdge) << 27);
+}
 
 // midphase push blob — byte-identical to MidphaseParams (ABI row {4,4,8,8,8,8,8,8,8,8}).
 struct MidphasePush
@@ -2904,21 +1656,23 @@ struct MidphasePush
 };
 static_assert(sizeof(MidphasePush) == 72, "midphase push blob must be 72 bytes");
 
-// plane / sphere contact-gen push blob — byte-identical to ContactGenParams
-// (ABI row {4,8,8,8,8,8,8,8,8,4,80}).  The PxgFEMContactWriter (80B) inlined @80.
+// plane / sphere / box vertex contact-gen push blob — byte-identical to ContactGenParams
+// (ABI row {4,8,8,8,8,8,8,8,80}, 5.12).  The PxgRigidDbContactWriter (80B) inlined @64; the
+// 5.6.1 filterPairs / nbFilterPairs arguments are gone (the filter is per cloth,
+// PxgFEMCloth::mRigidSurfaceFilterPairs).
 struct ContactGenPush
 {
     uint32_t numTests, pad4;
     uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes;
-    uint64_t shapeToRigidRemap, filterPairs;
-    uint32_t nbFilterPairs, pad76;
-    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
-    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
-    uint32_t w_maxNumContacts, pad156;
+    uint64_t shapeToRigidRemap;
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_outRigidMaterialIndex;
+    uint64_t w_totalContactCount, w_contactByRigid, w_tempContactByRigid, w_contactIndexSortedByRigid;
+    uint32_t w_maxNumContacts, pad140;
 };
-static_assert(sizeof(ContactGenPush) == 160, "contact-gen push blob must be 160 bytes");
-static_assert(offsetof(ContactGenPush, w_outPoint) == 80, "writer @80");
-static_assert(offsetof(ContactGenPush, w_maxNumContacts) == 152, "maxNumContacts @152");
+static_assert(sizeof(ContactGenPush) == 144, "contact-gen push blob must be 144 bytes");
+static_assert(offsetof(ContactGenPush, w_outPoint) == 64, "writer @64");
+static_assert(offsetof(ContactGenPush, w_maxNumContacts) == 136, "maxNumContacts @136");
+static_assert(sizeof(PxgRigidDbContactWriter) == 80, "PxgRigidDbContactWriter sizeof");
 
 // PxQuat::rotateInv / getBasisVector0 CPU transcriptions (bit-exact; the test TU
 // is built -ffp-contract=off, matching the NoContraction shader stamp).
@@ -2950,7 +1704,7 @@ PXG_TEST(femClothSimContactGenDescLayout)
     static_assert(offsetof(PxgShape, particleOrSoftbodyId) == 44, "PxgShape::particleOrSoftbodyId @44");
     static_assert(offsetof(PxgShape, materialIndex) == 28, "PxgShape::materialIndex @28");
     static_assert(sizeof(PxsCachedTransform) == 32, "PxsCachedTransform stride");
-    static_assert(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride");
+    static_assert(sizeof(PxgDeformablePairInfo) == 16, "PxgDeformablePairInfo stride");
 
     PXG_CHECK_MSG(sizeof(PxBounds3) == 24, "PxBounds3 sizeof == 24 (got %zu)", sizeof(PxBounds3));
     PXG_CHECK(offsetof(PxBounds3, minimum) == 0);
@@ -3084,40 +1838,50 @@ PXG_TEST(femClothSimMidphaseVertexPairs)
     dev->destroyBuffer(bVertsOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bPairsNum2.h);
 }
 
-// Shared writer-buffer set for the plane / sphere contact-gen tests.
+// Shared writer-buffer set for the plane / sphere / box contact-gen tests (the 5.12
+// PxgRigidDbContactWriter).  The barycentric slots start at a sentinel: the vertex writers
+// leave them untouched.
+static const F4 kBarySentinel = { 7.0f, -7.0f, 7.0f, -7.0f };
 struct WriterBufs
 {
-    DevBuf point, normalPen, barycentric, info, count, byRigid, tempByRigid, idxByRigid, sortedByRigid;
+    DevBuf point, normalPen, barycentric, info, rigidMat, count, byRigid, tempByRigid, idxByRigid;
     uint32_t maxContacts;
 };
 static WriterBufs makeWriter(PxgSlangComputeDevice* dev, uint32_t maxContacts)
 {
     WriterBufs w; w.maxContacts = maxContacts;
     std::vector<F4> zf4(maxContacts, F4{ 0, 0, 0, 0 });
-    std::vector<FemOtherContactInfoHost> zinfo(maxContacts);
-    std::memset(zinfo.data(), 0, zinfo.size() * sizeof(FemOtherContactInfoHost));
+    std::vector<F4> bary(maxContacts, kBarySentinel);
+    std::vector<FemPairInfoHost> zinfo(maxContacts, FemPairInfoHost{ 0ull, 0ull });
+    std::vector<uint32_t> zmat((maxContacts + 1u) / 2u, 0xffffffffu);   // PxU16 stream, two per word
     std::vector<uint32_t> zc = { 0u };
     std::vector<uint64_t> zu64(maxContacts, 0xffffffffffffffffull);
     std::vector<uint32_t> zu32(maxContacts, 0xffffffffu);
-    w.point = makeDev(dev, zf4); w.normalPen = makeDev(dev, zf4); w.barycentric = makeDev(dev, zf4);
-    w.info = makeDev(dev, zinfo); w.count = makeDev(dev, zc);
+    w.point = makeDev(dev, zf4); w.normalPen = makeDev(dev, zf4); w.barycentric = makeDev(dev, bary);
+    w.info = makeDev(dev, zinfo); w.rigidMat = makeDev(dev, zmat); w.count = makeDev(dev, zc);
     w.byRigid = makeDev(dev, zu64); w.tempByRigid = makeDev(dev, zu32);
-    w.idxByRigid = makeDev(dev, zu32); w.sortedByRigid = makeDev(dev, zu32);
+    w.idxByRigid = makeDev(dev, zu32);
     return w;
 }
 static void fillWriter(ContactGenPush& p, const WriterBufs& w)
 {
     p.w_outPoint = w.point.addr; p.w_outNormalPen = w.normalPen.addr; p.w_outBarycentric = w.barycentric.addr;
-    p.w_outContactInfo = w.info.addr; p.w_totalContactCount = w.count.addr;
-    p.w_contactByX = w.byRigid.addr; p.w_tempContactByX = w.tempByRigid.addr;
-    p.w_contactIndexSortedByX = w.idxByRigid.addr; p.w_contactSortedByX = w.sortedByRigid.addr;
+    p.w_outContactInfo = w.info.addr; p.w_outRigidMaterialIndex = w.rigidMat.addr; p.w_totalContactCount = w.count.addr;
+    p.w_contactByRigid = w.byRigid.addr; p.w_tempContactByRigid = w.tempByRigid.addr;
+    p.w_contactIndexSortedByRigid = w.idxByRigid.addr;
     p.w_maxNumContacts = w.maxContacts;
+}
+// The PxU16 rigid material index of contact i.
+static uint32_t readRigidMat(PxgSlangComputeDevice* dev, const WriterBufs& w, uint32_t i)
+{
+    const std::vector<uint32_t> words = downloadBuffer<uint32_t>(dev, w.rigidMat.h, (w.maxContacts + 1u) / 2u);
+    return (words[i / 2u] >> (16u * (i & 1u))) & 0xffffu;
 }
 static void destroyWriter(PxgSlangComputeDevice* dev, const WriterBufs& w)
 {
     dev->destroyBuffer(w.point.h); dev->destroyBuffer(w.normalPen.h); dev->destroyBuffer(w.barycentric.h);
-    dev->destroyBuffer(w.info.h); dev->destroyBuffer(w.count.h); dev->destroyBuffer(w.byRigid.h);
-    dev->destroyBuffer(w.tempByRigid.h); dev->destroyBuffer(w.idxByRigid.h); dev->destroyBuffer(w.sortedByRigid.h);
+    dev->destroyBuffer(w.info.h); dev->destroyBuffer(w.rigidMat.h); dev->destroyBuffer(w.count.h);
+    dev->destroyBuffer(w.byRigid.h); dev->destroyBuffer(w.tempByRigid.h); dev->destroyBuffer(w.idxByRigid.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -3176,7 +1940,6 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     DevBuf bRd = makeDev(dev, restArr);
     std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
     DevBuf bRemap = makeDev(dev, remap);
-    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u }); // dummy buffer (nbFilterPairs=0 -> find() false)
 
     WriterBufs w = makeWriter(dev, 64u);
 
@@ -3184,7 +1947,7 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     push.numTests = 1u;
     push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
-    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    push.shapeToRigidRemap = bRemap.addr;
     fillWriter(push, w);
 
     Kernel k("femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch", {}, sizeof(ContactGenPush));
@@ -3198,7 +1961,7 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     const F4 refNormalPen = { n.x, n.y, n.z, pin.x };
     const float rpx = verts[0].x - pin.x * n.x, rpy = verts[0].y - pin.x * n.y, rpz = verts[0].z - pin.x * n.z;
     const F4 refPoint = { rpx, rpy, rpz, restDistance };
-    const uint32_t clothMask0 = (0u << 20) | 0u;
+    const uint64_t clothRef0 = encClothVertex(0u, 0u);
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
     PXG_CHECK_MSG(gCount == 1u, "plane contact-gen emitted %u contacts (expected 1)", gCount);
@@ -3206,7 +1969,8 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     const F4 gPoint = downloadBuffer<F4>(dev, w.point.h, 1)[0];
     const F4 gNP = downloadBuffer<F4>(dev, w.normalPen.h, 1)[0];
     const F4 gBary = downloadBuffer<F4>(dev, w.barycentric.h, 1)[0];
-    const FemOtherContactInfoHost gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 1)[0];
+    const FemPairInfoHost gInfo = downloadBuffer<FemPairInfoHost>(dev, w.info.h, 1)[0];
+    const uint32_t gMat = readRigidMat(dev, w, 0u);
     const uint64_t gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, 1)[0];
     const uint32_t gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, 1)[0];
     const uint32_t gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, 1)[0];
@@ -3218,13 +1982,13 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     };
     cmpF4("outPoint", refPoint, gPoint);
     cmpF4("outNormalPen", refNormalPen, gNP);
-    cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary);
+    cmpF4("outBarycentric (a vertex contact writes none)", kBarySentinel, gBary);
     if (gByRigid != rigidNodeInd) { ++mm; std::printf("  plane contactByRigid MM got %llu ref %llu\n", (unsigned long long)gByRigid, (unsigned long long)rigidNodeInd); }
     if (gTempByRigid != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  plane tempByRigid MM got %u\n", gTempByRigid); }
     if (gIdxByRigid != 0u) { ++mm; std::printf("  plane contactIndexSortedByRigid MM got %u\n", gIdxByRigid); }
-    if (gInfo.pairInd0 != rigidNodeInd) { ++mm; std::printf("  plane info.pairInd0 MM got %llu\n", (unsigned long long)gInfo.pairInd0); }
-    if (gInfo.pairInd1 != clothMask0) { ++mm; std::printf("  plane info.pairInd1 MM got %u ref %u\n", gInfo.pairInd1, clothMask0); }
-    if (gInfo.rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  plane info.rigidMatInd MM got %u\n", gInfo.rigidMatInd_isInCollision); }
+    if (gInfo.ref0 != rigidNodeInd) { ++mm; std::printf("  plane info.ref0 MM got %llu\n", (unsigned long long)gInfo.ref0); }
+    if (gInfo.ref1 != clothRef0) { ++mm; std::printf("  plane info.ref1 MM got 0x%llx ref 0x%llx\n", (unsigned long long)gInfo.ref1, (unsigned long long)clothRef0); }
+    if (gMat != (materialIndex & 0xffffu)) { ++mm; std::printf("  plane rigid material MM got %u\n", gMat); }
     PXG_CHECK_MSG(mm == 0, "cloth_planeVertContactGen bit-exact vs CPU (%zu mismatches)", mm);
 
     // teeth: a wrong normal would not satisfy this human-readable sanity.
@@ -3235,7 +1999,7 @@ PXG_TEST(femClothSimPlaneVertContactGen)
     destroyWriter(dev, w);
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
 }
 
 // non-penetrating plane case: all verts above the plane -> zero contacts.
@@ -3270,14 +2034,13 @@ PXG_TEST(femClothSimPlaneVertContactGenNoContact)
     DevBuf bRd = makeDev(dev, restArr);
     std::vector<uint64_t> remap = { 0ull, 7ull };
     DevBuf bRemap = makeDev(dev, remap);
-    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
     WriterBufs w = makeWriter(dev, 64u);
 
     ContactGenPush push = {};
     push.numTests = 1u;
     push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
-    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    push.shapeToRigidRemap = bRemap.addr;
     fillWriter(push, w);
 
     Kernel k("femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch", {}, sizeof(ContactGenPush));
@@ -3290,7 +2053,7 @@ PXG_TEST(femClothSimPlaneVertContactGenNoContact)
     destroyWriter(dev, w);
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -3346,14 +2109,13 @@ PXG_TEST(femClothSimSphereVertContactGen)
     DevBuf bRd = makeDev(dev, restArr);
     std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
     DevBuf bRemap = makeDev(dev, remap);
-    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
     WriterBufs w = makeWriter(dev, 64u);
 
     ContactGenPush push = {};
     push.numTests = 1u;
     push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
-    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    push.shapeToRigidRemap = bRemap.addr;
     fillWriter(push, w);
 
     Kernel k("femClothContactGenBda.spv", "cloth_SphereVertexContactGenLaunch", {}, sizeof(ContactGenPush));
@@ -3371,7 +2133,7 @@ PXG_TEST(femClothSimSphereVertContactGen)
     const float refPen = dist - radiusSum;
     const F4 refNormalPen = { refN.x, refN.y, refN.z, refPen };
     const F4 refPoint = { verts[0].x, verts[0].y, verts[0].z, restDistance };
-    const uint32_t clothMask0 = (0u << 20) | 0u;
+    const uint64_t clothRef0 = encClothVertex(0u, 0u);
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
     PXG_CHECK_MSG(gCount == 1u, "sphere contact-gen emitted %u contacts (expected 1)", gCount);
@@ -3379,7 +2141,8 @@ PXG_TEST(femClothSimSphereVertContactGen)
     const F4 gPoint = downloadBuffer<F4>(dev, w.point.h, 1)[0];
     const F4 gNP = downloadBuffer<F4>(dev, w.normalPen.h, 1)[0];
     const F4 gBary = downloadBuffer<F4>(dev, w.barycentric.h, 1)[0];
-    const FemOtherContactInfoHost gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 1)[0];
+    const FemPairInfoHost gInfo = downloadBuffer<FemPairInfoHost>(dev, w.info.h, 1)[0];
+    const uint32_t gMat = readRigidMat(dev, w, 0u);
     const uint64_t gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, 1)[0];
     const uint32_t gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, 1)[0];
 
@@ -3390,12 +2153,12 @@ PXG_TEST(femClothSimSphereVertContactGen)
     };
     cmpF4("outPoint", refPoint, gPoint);
     cmpF4("outNormalPen", refNormalPen, gNP);
-    cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary);
+    cmpF4("outBarycentric (a vertex contact writes none)", kBarySentinel, gBary);
     if (gByRigid != rigidNodeInd) { ++mm; std::printf("  sphere contactByRigid MM got %llu\n", (unsigned long long)gByRigid); }
     if (gTempByRigid != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  sphere tempByRigid MM got %u\n", gTempByRigid); }
-    if (gInfo.pairInd0 != rigidNodeInd) { ++mm; std::printf("  sphere info.pairInd0 MM got %llu\n", (unsigned long long)gInfo.pairInd0); }
-    if (gInfo.pairInd1 != clothMask0) { ++mm; std::printf("  sphere info.pairInd1 MM got %u\n", gInfo.pairInd1); }
-    if (gInfo.rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  sphere info.rigidMatInd MM got %u\n", gInfo.rigidMatInd_isInCollision); }
+    if (gInfo.ref0 != rigidNodeInd) { ++mm; std::printf("  sphere info.ref0 MM got %llu\n", (unsigned long long)gInfo.ref0); }
+    if (gInfo.ref1 != clothRef0) { ++mm; std::printf("  sphere info.ref1 MM got 0x%llx\n", (unsigned long long)gInfo.ref1); }
+    if (gMat != (materialIndex & 0xffffu)) { ++mm; std::printf("  sphere rigid material MM got %u\n", gMat); }
     PXG_CHECK_MSG(mm == 0, "cloth_SphereVertexContactGen bit-exact vs CPU (%zu mismatches)", mm);
 
     PXG_CHECK_MSG(almostEqual(gNP.x, 1.0f, 1e-5f, 1e-6f) && almostEqual(gNP.w, -0.5f, 1e-5f, 1e-6f),
@@ -3404,7 +2167,7 @@ PXG_TEST(femClothSimSphereVertContactGen)
     destroyWriter(dev, w);
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -3579,8 +2342,16 @@ PXG_TEST(femClothSimBoxVertContactGen)
     std::vector<F4> decoyVerts(9u, F4{ -800.0f, -800.0f, -800.0f, 1.0f });
     DevBuf bDecoy = makeDev(dev, decoyVerts);
     const uint32_t CLOTH_ID = 1u;
+    // V3: one filter pair on the cloth, keyed (rigid filter ref, the cloth vertex V_FILTERED):
+    // 5.12 keeps the rigid-surface filter per cloth (mRigidSurfaceFilterPairs, sorted
+    // PxgDeformablePairInfo, binary-searched), not as a kernel argument.  A dynamic rigid's
+    // filter ref is its node.
+    std::vector<FemPairInfoHost> fpairs = { FemPairInfoHost{ rigidNodeInd, encClothVertex(CLOTH_ID, V_FILTERED) } };
+    DevBuf bFilters = makeDev(dev, fpairs);
     std::vector<PxgFEMCloth> descArr = { makeClothDesc(bDecoy.addr, uint32_t(decoyVerts.size())),
                                          makeClothDesc(bVerts.addr, NB_VERTS) };
+    descArr[1].mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFilters.addr));
+    descArr[1].mNumRigidSurfaceFilterPairs = 1u;
     DevBuf bDesc = makeDev(dev, descArr);
 
     std::vector<PxgContactManagerInput> cmInputs(1);
@@ -3611,21 +2382,13 @@ PXG_TEST(femClothSimBoxVertContactGen)
     std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
     DevBuf bRemap = makeDev(dev, remap);
 
-    // V3: one filter pair, keyed (rigidNodeInd, clothMask(V_FILTERED)).
-    const uint32_t filteredMask = (CLOTH_ID << 20) | V_FILTERED;
-    std::vector<PxgRigidFilterPair> fpairs(1);
-    std::memset(fpairs.data(), 0, sizeof(PxgRigidFilterPair));
-    fpairs[0].index0 = rigidNodeInd;
-    fpairs[0].index1 = uint64_t(filteredMask);
-    DevBuf bFilters = makeDev(dev, fpairs);
-
     WriterBufs w = makeWriter(dev, 64u);
 
     ContactGenPush push = {};
     push.numTests = 1u;
     push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
-    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 1u;
+    push.shapeToRigidRemap = bRemap.addr;
     fillWriter(push, w);
 
     Kernel k("femClothContactGenBda.spv", "cloth_boxVertexContactGenLaunch", {}, sizeof(ContactGenPush));
@@ -3684,7 +2447,7 @@ PXG_TEST(femClothSimBoxVertContactGen)
         destroyWriter(dev, w);
         dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
         dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-        dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+        dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
         dev->destroyBuffer(bDecoy.h);
         return;
     }
@@ -3692,7 +2455,7 @@ PXG_TEST(femClothSimBoxVertContactGen)
     const auto gPoint = downloadBuffer<F4>(dev, w.point.h, w.maxContacts);
     const auto gNP = downloadBuffer<F4>(dev, w.normalPen.h, w.maxContacts);
     const auto gBary = downloadBuffer<F4>(dev, w.barycentric.h, w.maxContacts);
-    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, w.maxContacts);
+    const auto gInfo = downloadBuffer<FemPairInfoHost>(dev, w.info.h, w.maxContacts);
     const auto gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, w.maxContacts);
     const auto gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, w.maxContacts);
     const auto gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, w.maxContacts);
@@ -3705,13 +2468,13 @@ PXG_TEST(femClothSimBoxVertContactGen)
     size_t mm = 0;
     for (uint32_t sidx = 0; sidx < gCount; ++sidx)
     {
-        const uint32_t pid = gInfo[sidx].pairInd1;
+        const uint64_t pid = gInfo[sidx].ref1;
         size_t at = want.size();
         for (size_t q = 0; q < want.size(); ++q)
-            if (!claimed[q] && ((CLOTH_ID << 20) | want[q].vert) == pid) { at = q; break; }
+            if (!claimed[q] && encClothVertex(CLOTH_ID, want[q].vert) == pid) { at = q; break; }
         if (at == want.size())
-        { if (mm < 4) std::printf("  box slot %u names cloth vertex mask %u, which is not an "
-                                  "unclaimed expected contact\n", sidx, pid);
+        { if (mm < 4) std::printf("  box slot %u names cloth vertex ref 0x%llx, which is not an "
+                                  "unclaimed expected contact\n", sidx, (unsigned long long)pid);
           ++mm; continue; }
         claimed[at] = true;
         const Want& e = want[at];
@@ -3730,12 +2493,12 @@ PXG_TEST(femClothSimBoxVertContactGen)
         };
         cmpF4("outNormalPen", refNP, gNP[sidx]);
         cmpF4("outPoint", refPoint, gPoint[sidx]);
-        cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary[sidx]);
+        cmpF4("outBarycentric (a vertex contact writes none)", kBarySentinel, gBary[sidx]);
         if (gByRigid[sidx] != rigidNodeInd) { ++mm; std::printf("  box vert %u contactByRigid MM\n", e.vert); }
         if (gTempByRigid[sidx] != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  box vert %u tempByRigid MM\n", e.vert); }
         if (gIdxByRigid[sidx] != sidx) { ++mm; std::printf("  box vert %u idxByRigid MM got %u want %u\n", e.vert, gIdxByRigid[sidx], sidx); }
-        if (gInfo[sidx].pairInd0 != rigidNodeInd) { ++mm; std::printf("  box vert %u info.pairInd0 MM\n", e.vert); }
-        if (gInfo[sidx].rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  box vert %u info.rigidMatInd MM\n", e.vert); }
+        if (gInfo[sidx].ref0 != rigidNodeInd) { ++mm; std::printf("  box vert %u info.ref0 MM\n", e.vert); }
+        if (readRigidMat(dev, w, sidx) != (materialIndex & 0xffffu)) { ++mm; std::printf("  box vert %u rigid material MM\n", e.vert); }
     }
     PXG_CHECK_MSG(mm == 0, "cloth_boxVertexContactGen bit-exact vs the CPU mirror (%zu mismatches)", mm);
 
@@ -3769,8 +2532,8 @@ PXG_TEST(femClothSimBoxVertContactGen)
     destroyWriter(dev, w);
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
-    dev->destroyBuffer(bDecoy.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
+    dev->destroyBuffer(bDecoy.h); dev->destroyBuffer(bFilters.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -3860,7 +2623,6 @@ PXG_TEST(femClothSimBoxVertContactGenExactGate)
     DevBuf bRd = makeDev(dev, restArr);
     std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
     DevBuf bRemap = makeDev(dev, remap);
-    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
 
     WriterBufs w = makeWriter(dev, 16u);
 
@@ -3868,7 +2630,7 @@ PXG_TEST(femClothSimBoxVertContactGenExactGate)
     push.numTests = 1u;
     push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
-    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    push.shapeToRigidRemap = bRemap.addr;
     fillWriter(push, w);
 
     Kernel k("femClothContactGenBda.spv", "cloth_boxVertexContactGenLaunch", {}, sizeof(ContactGenPush));
@@ -3901,13 +2663,13 @@ PXG_TEST(femClothSimBoxVertContactGenExactGate)
 
     if (gCount == 3u)
     {
-        const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 3);
+        const auto gInfo = downloadBuffer<FemPairInfoHost>(dev, w.info.h, 3);
         const auto gNP = downloadBuffer<F4>(dev, w.normalPen.h, 3);
         bool sawVert0 = false; int at3 = -1;
         for (uint32_t i = 0; i < 3u; ++i)
         {
-            if (gInfo[i].pairInd1 == 0u) sawVert0 = true;
-            if (gInfo[i].pairInd1 == 3u) at3 = int(i);
+            if (gInfo[i].ref1 == encClothVertex(0u, 0u)) sawVert0 = true;
+            if (gInfo[i].ref1 == encClothVertex(0u, 3u)) at3 = int(i);
         }
         PXG_CHECK_MSG(!sawVert0, "the vertex sitting exactly on the gate produced a contact");
         PXG_CHECK_MSG(at3 >= 0, "the Y/Z tie vertex produced no contact");
@@ -3922,7 +2684,7 @@ PXG_TEST(femClothSimBoxVertContactGenExactGate)
     destroyWriter(dev, w);
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
-    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h);
 }
 
 // ---------------------------------------------------------------------------
@@ -4185,7 +2947,7 @@ PXG_TEST(femClothSimTriMidphase)
     PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
     fc.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
     fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCVerts.addr));
-    fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bCTris.addr));
+    fc.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(bCTris.addr));
     fc.mNbVerts = uint32_t(cverts.size());
     fc.mNbTriangles = NB_TRIS;
     // Cloth id 1, with a live decoy on slot 0.  The first draft made the decoy a COPY
@@ -4206,7 +2968,7 @@ PXG_TEST(femClothSimTriMidphase)
     PxgFEMCloth decoy; std::memset(&decoy, 0, sizeof(decoy));
     decoy.mTriMeshData = reinterpret_cast<void*>(size_t(bDTree.addr));
     decoy.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bDVerts.addr));
-    decoy.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bDTris.addr));
+    decoy.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(bDTris.addr));
     decoy.mNbVerts = 3u; decoy.mNbTriangles = 1u;
     std::vector<PxgFEMCloth> descArr = { decoy, fc };
     DevBuf bDesc = makeDev(dev, descArr);
@@ -4318,18 +3080,20 @@ PXG_TEST(femClothSimTriMidphase)
 // plain radix sort, and splits the sorted contact-info's pairInd0 (PxU64 rigid id)
 // into a separate sortedRigidIds array.  A PURE permutation: no float arithmetic,
 // so every moved float4 / info byte must survive verbatim.  Checked bit-exact vs a
-// CPU gather in BOTH memory modes (the FemOtherContactInfoHost mirror @2033 pins
-// the 16-byte contact-info layout the shader gathers).
+// CPU gather in BOTH memory modes (the FemPairInfoHost mirror pins the 16-byte
+// PxgDeformablePairInfo the shader gathers).  5.12 adds the PxU16 rigid material
+// stream, gathered alongside.
 // ===========================================================================
 
 // fem_reorderRigidContactsLaunch push blob — byte-identical to
-// femClothContactSortBda.slang's FemReorderParams (ABI row {8}x11 = 88 bytes).
+// femClothContactSortBda.slang's FemReorderParams (ABI row {8}x13 = 104 bytes, 5.12).
 struct FemReorderPush
 {
-    uint64_t contacts, normalpens, barycentrics, contactInfos, numContacts, remapByRigid;
-    uint64_t sortedContacts, sortedNormalPens, sortedBarycentrics, sortedContactInfos, sortedRigidIds;
+    uint64_t contacts, normalpens, barycentrics, contactInfos, contactMaterials, numContacts, remapByRigid;
+    uint64_t sortedContacts, sortedNormalPens, sortedBarycentrics, sortedContactInfos, sortedContactMaterials,
+        sortedRigidIds;
 };
-static_assert(sizeof(FemReorderPush) == 88, "fem reorder push blob must be 88 bytes");
+static_assert(sizeof(FemReorderPush) == 104, "fem reorder push blob must be 104 bytes");
 
 // Bit-exact reorder-gather proof for a given contact count.  NC is chosen by the
 // callers to cover both the single-iteration common case and the grid-stride loop
@@ -4341,7 +3105,8 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
     PxgSlangComputeDevice* dev = testDevice();
 
     std::vector<F4> contacts(NC), normalpens(NC), barycentrics(NC);
-    std::vector<FemOtherContactInfoHost> infos(NC);
+    std::vector<FemPairInfoHost> infos(NC);
+    std::vector<uint16_t> mats(NC + 1u);
     for (uint32_t i = 0; i < NC; ++i)
     {
         // Distinct finite floats per lane (rng() value-cast, the psContactSort
@@ -4349,11 +3114,11 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
         contacts[i]     = { float(rng()), float(rng()), float(rng()), float(rng()) };
         normalpens[i]   = { float(rng()), float(rng()), float(rng()), float(rng()) };
         barycentrics[i] = { float(rng()), float(rng()), float(rng()), float(rng()) };
-        // The 16-byte contact info carries raw integer bit patterns (a true bit
-        // test); pairInd0 is the PxU64 rigid id the kernel also splits out.
-        infos[i].pairInd0 = (uint64_t(rng()) << 32) | uint64_t(rng());
-        infos[i].pairInd1 = rng();
-        infos[i].rigidMatInd_isInCollision = rng();
+        // The 16-byte pair info carries raw integer bit patterns (a true bit test);
+        // ref0 is the PxU64 rigid id the kernel also splits out.
+        infos[i].ref0 = (uint64_t(rng()) << 32) | uint64_t(rng());
+        infos[i].ref1 = (uint64_t(rng()) << 32) | uint64_t(rng());
+        mats[i] = uint16_t(rng());
     }
 
     // by-rigid sort ranks: an arbitrary permutation of [0, NC) (what the upstream
@@ -4366,19 +3131,23 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
     DevBuf bNormalPens = makeDev(dev, normalpens);
     DevBuf bBarycentrics = makeDev(dev, barycentrics);
     DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> matWords((NC + 1u) / 2u);
+    std::memcpy(matWords.data(), mats.data(), matWords.size() * 4u);
+    DevBuf bMats = makeDev(dev, matWords);
+    DevBuf bSortedMats = makeDev(dev, std::vector<uint32_t>((NC + 1u) / 2u, 0xA5A5A5A5u));
     DevBuf bNum = makeDev(dev, std::vector<uint32_t>(1, NC));
     DevBuf bRemap = makeDev(dev, remapByRigid);
     DevBuf bSortedContacts = makeDev(dev, std::vector<F4>(NC));
     DevBuf bSortedNormalPens = makeDev(dev, std::vector<F4>(NC));
     DevBuf bSortedBarycentrics = makeDev(dev, std::vector<F4>(NC));
-    DevBuf bSortedInfos = makeDev(dev, std::vector<FemOtherContactInfoHost>(NC));
+    DevBuf bSortedInfos = makeDev(dev, std::vector<FemPairInfoHost>(NC));
     DevBuf bSortedRigidIds = makeDev(dev, std::vector<uint64_t>(NC));
     if (!bContacts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
     FemReorderPush push = {
-        bContacts.addr, bNormalPens.addr, bBarycentrics.addr, bInfos.addr, bNum.addr, bRemap.addr,
+        bContacts.addr, bNormalPens.addr, bBarycentrics.addr, bInfos.addr, bMats.addr, bNum.addr, bRemap.addr,
         bSortedContacts.addr, bSortedNormalPens.addr, bSortedBarycentrics.addr,
-        bSortedInfos.addr, bSortedRigidIds.addr };
+        bSortedInfos.addr, bSortedMats.addr, bSortedRigidIds.addr };
     Kernel k("femClothContactSortBda.spv", "fem_reorderRigidContactsLaunch", {}, sizeof(FemReorderPush));
     k.dispatch(/*gridX SB_REORDERCONTACTS*/ 1024u, {}, push);
     dev->flush();
@@ -4386,8 +3155,9 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
     const auto gC = downloadBuffer<F4>(dev, bSortedContacts.h, NC);
     const auto gN = downloadBuffer<F4>(dev, bSortedNormalPens.h, NC);
     const auto gB = downloadBuffer<F4>(dev, bSortedBarycentrics.h, NC);
-    const auto gI = downloadBuffer<FemOtherContactInfoHost>(dev, bSortedInfos.h, NC);
+    const auto gI = downloadBuffer<FemPairInfoHost>(dev, bSortedInfos.h, NC);
     const auto gR = downloadBuffer<uint64_t>(dev, bSortedRigidIds.h, NC);
+    const auto gM = downloadBuffer<uint32_t>(dev, bSortedMats.h, (NC + 1u) / 2u);
 
     size_t bad = 0;
     for (uint32_t i = 0; i < NC; ++i)
@@ -4396,8 +3166,9 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
         if (std::memcmp(&gC[i], &contacts[r], sizeof(F4)) != 0) ++bad;
         if (std::memcmp(&gN[i], &normalpens[r], sizeof(F4)) != 0) ++bad;
         if (std::memcmp(&gB[i], &barycentrics[r], sizeof(F4)) != 0) ++bad;
-        if (std::memcmp(&gI[i], &infos[r], sizeof(FemOtherContactInfoHost)) != 0) ++bad;
-        if (gR[i] != infos[r].pairInd0) ++bad; // sortedRigidIds[i] == sortedInfo.pairInd0
+        if (std::memcmp(&gI[i], &infos[r], sizeof(FemPairInfoHost)) != 0) ++bad;
+        if (gR[i] != infos[r].ref0) ++bad; // sortedRigidIds[i] == sortedInfo.ref0
+        if (((gM[i / 2u] >> (16u * (i & 1u))) & 0xffffu) != mats[r]) ++bad;
     }
     PXG_CHECK_MSG(bad == 0, "cloth reorder gather bit-exact NC=%u (%zu mismatches)", NC, bad);
 
@@ -4405,7 +3176,7 @@ static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
     dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bRemap.h);
     dev->destroyBuffer(bSortedContacts.h); dev->destroyBuffer(bSortedNormalPens.h);
     dev->destroyBuffer(bSortedBarycentrics.h); dev->destroyBuffer(bSortedInfos.h);
-    dev->destroyBuffer(bSortedRigidIds.h);
+    dev->destroyBuffer(bSortedRigidIds.h); dev->destroyBuffer(bMats.h); dev->destroyBuffer(bSortedMats.h);
 }
 
 // Common case: ~20 active device blocks, single grid-stride iteration.
@@ -4417,2067 +3188,35 @@ PXG_TEST(femClothSimReorderRigidContacts) { runReorderRigidContacts(5000u, 0x5EE
 PXG_TEST(femClothSimReorderRigidContactsMultiIter) { runReorderRigidContacts(262144u + 777u, 0x4B02F00Du); }
 
 // ===========================================================================
-// P7.1 tranche 4b-2/3: cloth-vs-rigid contact PREPARE + query/SOLVE.
-//   femClothRigidContactBda.spv:
-//     cloth_rigidContactPrepareLaunch                       (FEMClothConstraintPrep.cu:70)
-//     cloth_queryRigidClothContactReferenceCount{,TGS}Launch(FEMClothExternalSolve.cu:414/:558)
-//     cloth_solveRigidClothCollision{,TGS}Launch            (FEMClothExternalSolve.cu:535/:578)
-// ONE cloth vertex penetrating a STATIC floor -> a sorted contact -> prepare (build the
-// PxgFemRigidConstraintBlock) -> queryRefCount (bump mDeltaPos.w) -> solve (push the
-// vertex OUT along the plane normal into mDeltaPos).  Bit-exact vs a CPU transcription of
-// the .cu math (PGS and TGS), both memory modes.
-// ===========================================================================
-
-// Host replica of the block-of-32 PxgFemRigidConstraintBlock (PxgFEMCore.h:167, verbatim
-// hand-copy — PxgFEMCore.h is not includable in this CUDA-toolkit-free TU).  A trivial
-// fixed-array SoA (float4[32] blocks + float[32]); the byte image the prepare WRITES and
-// the solve READS, matching the shader's FRC_* byte offsets (femClothRigidContactBda.slang).
-struct RigidContactConstraintHost
-{
-    F4 raXn_resp[32];          // @0
-    F4 raXnF0_resp[32];        // @512
-    F4 raXnF1_resp[32];        // @1024
-    F4 normal_errorW[32];      // @1536
-    F4 fricTan0_invMass0[32];  // @2048
-    F4 barycentric[32];        // @2560
-    float maxPenBias[32];      // @3072 -> 3200
-};
-static_assert(sizeof(RigidContactConstraintHost) == 3200, "PxgFemRigidConstraintBlock sizeof == 3200");
-static_assert(offsetof(RigidContactConstraintHost, raXnF0_resp) == 512, "raXnF0_resp @512");
-static_assert(offsetof(RigidContactConstraintHost, raXnF1_resp) == 1024, "raXnF1_resp @1024");
-static_assert(offsetof(RigidContactConstraintHost, normal_errorW) == 1536, "normal_errorW @1536");
-static_assert(offsetof(RigidContactConstraintHost, fricTan0_invMass0) == 2048, "fricTan0_invMass0 @2048");
-static_assert(offsetof(RigidContactConstraintHost, barycentric) == 2560, "barycentric @2560");
-static_assert(offsetof(RigidContactConstraintHost, maxPenBias) == 3072, "maxPenBias @3072");
-
-// ---------------------------------------------------------------------------
-// bit-exact CPU reference for the prepare + query/solve.  prepareFEMContacts
-// (deformableUtils.cuh:132) and FEMCollision::initialize / readCloth / computeFEMChange /
-// writeCloth (deformableUtils.cuh:280 / :488) are transcribed verbatim for the STATIC /
-// null-material (frictionless) path.
-// ---------------------------------------------------------------------------
-namespace p714ref
-{
-struct V3 { float x, y, z; };
-static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static float rmax(float a, float b) { return a > b ? a : b; }
-static float rmin(float a, float b) { return a < b ? a : b; }
-// P9.86c: PxAbs(float) is intrinsics::abs = ::fabsf (PxMath.h:112, PxUnixMathIntrinsics.h:57),
-// which clears the sign of -0.  The old select spelling `a < 0 ? -a : a` returned -0 for -0,
-// so mu * |dLN| came out -0 on a dLN == -0 lane and -min(dLT, -0) gave +0 where the CUDA
-// gives -0.
-static float rabs(float a) { return std::fabs(a); }
-
-// PxMat33 (column-major [9]) * PxVec3.
-static V3 mat33Mul(const float m[9], V3 v)
-{
-    return V3{ m[0] * v.x + m[3] * v.y + m[6] * v.z,
-               m[1] * v.x + m[4] * v.y + m[7] * v.z,
-               m[2] * v.x + m[5] * v.y + m[8] * v.z };
-}
-
-// PxComputeBasisVectors (PxMathUtils.h:297).  P9.36: this comment used to say
-// "right/up .normalize() is v / sqrt(magSq)" -- it is not.  PxVec3::normalize scales
-// through operator/= (PxVec3.h:260): ONE reciprocal, three multiplies.
-static void computeBasis(V3 dir, V3& right, V3& up)
-{
-    if (rabs(dir.y) <= 0.9999f)
-    {
-        right = V3{ dir.z, 0.0f, -dir.x };
-        const float m = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        if (m > 0.0f) { const float r = 1.0f / m; right = V3{ right.x * r, right.y * r, right.z * r }; }
-        up = V3{ dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x };
-    }
-    else
-    {
-        right = V3{ 1.0f, 0.0f, 0.0f };
-        up = V3{ 0.0f, dir.z, -dir.y };
-        const float m = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-        if (m > 0.0f) { const float r = 1.0f / m; up = V3{ up.x * r, up.y * r, up.z * r }; }
-    }
-}
-
-// prepareFEMContacts (deformableUtils.cuh:132) — rigid / static (non-articulation) path.
-static void refPrepare(RigidContactConstraintHost& c, int slot,
-                       V3 normal, V3 p, float pen, V3 delta, F4 barycentric,
-                       V3 bodyFrameP, float invMass0, float penBiasClampRigid,
-                       const float sqrtInvInertia[9], float penBiasClampFEM, bool isStatic)
-{
-    V3 t0, t1;
-    computeBasis(normal, t0, t1);
-
-    const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
-
-    const V3 ra = V3{ p.x - bodyFrameP.x, p.y - bodyFrameP.y, p.z - bodyFrameP.z };
-    const V3 raXn = cross3(ra, normal);
-    const V3 raXF0 = cross3(ra, t0);
-    const V3 raXF1 = cross3(ra, t1);
-
-    const V3 raXnSI = mat33Mul(sqrtInvInertia, raXn);
-    const float resp0 = dot3(raXnSI, raXnSI) + invMass0;
-    const V3 raXF0SI = mat33Mul(sqrtInvInertia, raXF0);
-    const V3 raXF1SI = mat33Mul(sqrtInvInertia, raXF1);
-    const float respF0 = dot3(raXF0SI, raXF0SI) + invMass0;
-    const float respF1 = dot3(raXF1SI, raXF1SI) + invMass0;
-
-    F4 raXn_resp, raXnF0_resp, raXnF1_resp;
-    if (isKinematic)
-    {
-        raXn_resp = F4{ raXn.x, raXn.y, raXn.z, resp0 };
-        raXnF0_resp = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
-        raXnF1_resp = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
-    }
-    else
-    {
-        raXn_resp = F4{ raXnSI.x, raXnSI.y, raXnSI.z, resp0 };
-        raXnF0_resp = F4{ raXF0SI.x, raXF0SI.y, raXF0SI.z, respF0 };
-        raXnF1_resp = F4{ raXF1SI.x, raXF1SI.y, raXF1SI.z, respF1 };
-    }
-
-    const float maxPenBias = rmax(penBiasClampRigid, penBiasClampFEM);
-    const float error = pen + dot3(delta, normal);
-
-    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, error };
-    c.raXn_resp[slot] = raXn_resp;
-    c.raXnF0_resp[slot] = raXnF0_resp;
-    c.raXnF1_resp[slot] = raXnF1_resp;
-    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, invMass0 };
-    c.maxPenBias[slot] = maxPenBias;
-    c.barycentric[slot] = barycentric;
-}
-
-// prepareFEMContacts (deformableUtils.cuh:159-198) — the ARTICULATION arm (tranche A).  The
-// three response products are the ENGINE's own PxSpatialMatrix::operator*, so the oracle is
-// independent of the shader's asmM6MulVec transcription.
-static void refPrepareArti(RigidContactConstraintHost& c, int slot,
-                           V3 normal, V3 p, float pen, V3 delta, F4 barycentric,
-                           V3 linkP, const physx::PxSpatialMatrix& spatialResponse,
-                           float penBiasClampRigid, float penBiasClampFEM)
-{
-    using physx::PxVec3;
-    using physx::Cm::UnAlignedSpatialVector;
-    V3 t0, t1;
-    computeBasis(normal, t0, t1);
-
-    const V3 ra = V3{ p.x - linkP.x, p.y - linkP.y, p.z - linkP.z };
-    const V3 raXn = cross3(ra, normal);
-    const V3 raXF0 = cross3(ra, t0);
-    const V3 raXF1 = cross3(ra, t1);
-    auto pv = [](V3 v) { return PxVec3(v.x, v.y, v.z); };
-    auto vp = [](const PxVec3& v) { return V3{ v.x, v.y, v.z }; };
-
-    const UnAlignedSpatialVector deltaV0 = spatialResponse * UnAlignedSpatialVector(pv(normal), pv(raXn));
-    const float resp0 = dot3(vp(deltaV0.top), raXn) + dot3(vp(deltaV0.bottom), normal);
-    const UnAlignedSpatialVector deltaFV0 = spatialResponse * UnAlignedSpatialVector(pv(t0), pv(raXF0));
-    const UnAlignedSpatialVector deltaFV1 = spatialResponse * UnAlignedSpatialVector(pv(t1), pv(raXF1));
-    const float respF0 = dot3(vp(deltaFV0.top), raXF0) + dot3(vp(deltaFV0.bottom), t0);
-    const float respF1 = dot3(vp(deltaFV1.top), raXF1) + dot3(vp(deltaFV1.bottom), t1);
-
-    const float maxPenBias = rmax(penBiasClampRigid, penBiasClampFEM);
-    const float error = pen + dot3(delta, normal);
-
-    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, error };
-    c.raXn_resp[slot] = F4{ raXn.x, raXn.y, raXn.z, resp0 };
-    c.raXnF0_resp[slot] = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
-    c.raXnF1_resp[slot] = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
-    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, 1.0f };   // invMass0 = 1 for a link
-    c.maxPenBias[slot] = maxPenBias;
-    c.barycentric[slot] = barycentric;
-}
-
-// FEMCollision::initialize (deformableUtils.cuh:280) — null-material (frictionless) path.
-// The rigid velocity state is a PARAMETER (P9.45): it defaults to all zeros, which is what a
-// static body at rest reads, and the dynamic case passes what PxgVelocityReader would return.
-struct RefRigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
-struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent;
-                    V3 raXn; V3 raXt; float accum;
-                    // P9.46: did the FRICTION term bind the tangent clamp, or was the raw
-                    // tangent magnitude already the smaller of the two?  A test that only
-                    // checks deltaLambdaT != 0 cannot tell, and every mutant of the
-                    // deformable-material read survived precisely because of that.
-                    bool frictionBound; float dLTraw; float dLTlimit;
-                    // P9.86c coverage: deltaLambdaN met the (+0, -0) PxMax tie, and the
-                    // tangent branch ran (the only place the tie reaches an output).
-                    bool dlnZeroTie; bool tanBranch; };
-
-// P9.86c mutant twin of the deltaLambdaN PxMax (deformableUtils.cuh:374): 1 = the pre-fix
-// port's max(), i.e. GLSL FMax as llvmpipe evaluates it (F4: +0 on a (+0,-0) tie in either
-// operand order, the non-NaN operand for a NaN).  0 = selectMax, the CUDA.
-static int gDlnVariant = 0;
-static float llvmpipeFMax(float a, float b)
-{
-    if (a != a) return b;
-    if (b != b) return a;
-    if (a == 0.0f && b == 0.0f) return (std::signbit(a) && std::signbit(b)) ? -0.0f : 0.0f;
-    return a > b ? a : b;
-}
-// PxsCombinePxReal (PxsMaterialCombiner.h:53).  PxMin/PxMax are the intrinsic selects
-// (PxUnixMathIntrinsics.h:113/:122), not the generic templates.
-static float refCombineFriction(float val0, float val1, uint32_t mode)
-{
-    if (mode == 0u) return 0.5f * (val0 + val1);            // eAVERAGE
-    if (mode == 1u) return (val0 < val1) ? val0 : val1;     // eMIN
-    if (mode == 2u) return val0 * val1;                     // eMULTIPLY
-    if (mode == 3u) return (val0 > val1) ? val0 : val1;     // eMAX
-    return 0.0f;
-}
-
-static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, bool isTGS,
-                                float appliedForceRef, float dt, V3 bcVec, V3 deformableLinDelta,
-                                V3 deformableInvMasses, float rigidRefCount, bool wasActive, bool checkOnly,
-                                RefRigidVel rv = RefRigidVel{}, float combinedFriction = 0.0f)
-{
-    InitResult r;
-    r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
-    r.tangent = V3{ 0, 0, 0 }; r.raXt = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
-    r.frictionBound = false; r.dLTraw = 0.0f; r.dLTlimit = 0.0f;
-    r.dlnZeroTie = false; r.tanBranch = false;
-
-    const float invDt = 1.0f / dt;
-    const F4 raXn_resp = c.raXn_resp[slot];
-    const F4 normal_biasW = c.normal_errorW[slot];
-    const F4 raXnF0_resp = c.raXnF0_resp[slot];
-    const F4 raXnF1_resp = c.raXnF1_resp[slot];
-    const float maxPenBias = c.maxPenBias[slot];
-    const F4 fricTan0 = c.fricTan0_invMass0[slot];
-
-    const V3 normal = V3{ normal_biasW.x, normal_biasW.y, normal_biasW.z };
-    r.normal = normal;
-    const V3 fric0 = V3{ fricTan0.x, fricTan0.y, fricTan0.z };
-    const V3 fric1 = cross3(normal, fric0);
-    const float initPen = normal_biasW.w;
-    const V3 raXn = V3{ raXn_resp.x, raXn_resp.y, raXn_resp.z };
-    r.raXn = raXn;   // :306, live on both early-return paths
-
-    const V3 linVel = rv.linVel, angVel = rv.angVel;
-    const V3 rigidLinDelta = rv.linDelta, rigidAngDelta = rv.angDelta;
-
-    float CN; V3 relLinDelta; V3 angDelta;
-    if (isTGS)
-    {
-        const float normalVel = dot3(linVel, normal) + dot3(angVel, raXn);
-        relLinDelta = V3{ rigidLinDelta.x - deformableLinDelta.x, rigidLinDelta.y - deformableLinDelta.y,
-                          rigidLinDelta.z - deformableLinDelta.z };
-        angDelta = rigidAngDelta;
-        const float error = (initPen + dot3(relLinDelta, normal) + dot3(angDelta, raXn)) * invDt;
-        const float errorBiased = rmax(maxPenBias, error);
-        CN = errorBiased + normalVel;
-    }
-    else
-    {
-        const float normalVel = dot3(linVel, normal) + dot3(angVel, raXn);
-        relLinDelta = V3{ -deformableLinDelta.x, -deformableLinDelta.y, -deformableLinDelta.z };
-        angDelta = V3{ 0, 0, 0 };
-        const float error = (initPen + dot3(relLinDelta, normal)) * invDt;
-        const float errorBiased = rmax(maxPenBias, error);
-        CN = errorBiased + normalVel;
-    }
-
-    r.isActive = wasActive || (CN < 0.0f);
-    if (checkOnly) return r;
-    if (!r.isActive) return r;
-
-    const V3 bcSq = V3{ bcVec.x * bcVec.x, bcVec.y * bcVec.y, bcVec.z * bcVec.z };
-    const float deformableInvMass = dot3(bcSq, deformableInvMasses);
-    const float unitResponse = rigidRefCount * raXn_resp.w + deformableInvMass;
-    const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-
-    // PxMax(float) = intrinsics::selectMax (PxUnixMathIntrinsics.h:122): on a tie the
-    // SECOND operand survives, so (+0, -0) gives -0.
-    const float dlnA = -CN * invDenom, dlnB = -r.accum;
-    r.dlnZeroTie = (f2u(dlnA) == 0x00000000u && f2u(dlnB) == 0x80000000u);
-    r.deltaLambdaN = (gDlnVariant == 1) ? llvmpipeFMax(dlnA, dlnB) : rmax(dlnA, dlnB);
-    r.accum += r.deltaLambdaN;
-
-    const V3 raXnF0 = V3{ raXnF0_resp.x, raXnF0_resp.y, raXnF0_resp.z };
-    const V3 raXnF1 = V3{ raXnF1_resp.x, raXnF1_resp.y, raXnF1_resp.z };
-    const float tanVel0 = dot3(linVel, fric0) + dot3(angVel, raXnF0);
-    const float tanVel1 = dot3(linVel, fric1) + dot3(angVel, raXnF1);
-    const float CT0 = (dot3(fric0, relLinDelta) + dot3(angDelta, raXnF0)) * invDt + tanVel0;
-    const float CT1 = (dot3(fric1, relLinDelta) + dot3(angDelta, raXnF1)) * invDt + tanVel1;
-    const V3 relTanDelta = V3{ CT0 * fric0.x + CT1 * fric1.x, CT0 * fric0.y + CT1 * fric1.y,
-                               CT0 * fric0.z + CT1 * fric1.z };
-    const float tanMagSq = dot3(relTanDelta, relTanDelta);
-    if (tanMagSq > 1.0e-14f)
-    {
-        r.tanBranch = true;
-        const float CT = std::sqrt(tanMagSq);
-        const float invTanMag = 1.0f / CT;
-        r.tangent = V3{ relTanDelta.x * invTanMag, relTanDelta.y * invTanMag, relTanDelta.z * invTanMag };
-        // raXt = frac0*raXnF0 + frac1*raXnF1 (:391-394) -- P9.45; zero outside this branch.
-        const float frac0 = dot3(r.tangent, fric0);
-        const float frac1 = dot3(r.tangent, fric1);
-        r.raXt = V3{ frac0 * raXnF0.x + frac1 * raXnF1.x,
-                     frac0 * raXnF0.y + frac1 * raXnF1.y,
-                     frac0 * raXnF0.z + frac1 * raXnF1.z };
-        const float uT0 = rigidRefCount * raXnF0_resp.w + deformableInvMass;
-        const float invT0 = (uT0 > 0.0f) ? (1.0f / uT0) : 0.0f;
-        const float uT1 = rigidRefCount * raXnF1_resp.w + deformableInvMass;
-        const float invT1 = (uT1 > 0.0f) ? (1.0f / uT1) : 0.0f;
-        const float dLT0 = CT0 * invT0;
-        const float dLT1 = CT1 * invT1;
-        const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
-        const float lim = combinedFriction * rabs(r.deltaLambdaN);
-        r.dLTraw = dLT; r.dLTlimit = lim; r.frictionBound = (lim < dLT);
-        r.deltaLambdaT = -rmin(dLT, lim);
-    }
-    return r;
-}
-
-// FEMCollision::computeRigidChange (deformableUtils.cuh:418-429) — P9.45.  The reference
-// count multiplies the SUM; the linear row multiplies by rigidInvMass FIRST.
-static void refComputeRigidChange(const InitResult& r, bool isArticulation, float rigidInvMass,
-                                  float rigidRefCount, V3& deltaLinVel0, V3& deltaAngVel0)
-{
-    const V3 angBase = V3{ r.raXn.x * r.deltaLambdaN + r.raXt.x * r.deltaLambdaT,
-                           r.raXn.y * r.deltaLambdaN + r.raXt.y * r.deltaLambdaT,
-                           r.raXn.z * r.deltaLambdaN + r.raXt.z * r.deltaLambdaT };
-    deltaAngVel0 = isArticulation
-                 ? angBase
-                 : V3{ angBase.x * rigidRefCount, angBase.y * rigidRefCount, angBase.z * rigidRefCount };
-
-    const V3 linBase = V3{ r.normal.x * r.deltaLambdaN + r.tangent.x * r.deltaLambdaT,
-                           r.normal.y * r.deltaLambdaN + r.tangent.y * r.deltaLambdaT,
-                           r.normal.z * r.deltaLambdaN + r.tangent.z * r.deltaLambdaT };
-    deltaLinVel0 = V3{ (linBase.x * rigidInvMass) * rigidRefCount,
-                       (linBase.y * rigidInvMass) * rigidRefCount,
-                       (linBase.z * rigidInvMass) * rigidRefCount };
-}
-} // namespace p714ref
-
-// ---------------------------------------------------------------------------
-// cloth_rigidContactPrepareLaunch -> query -> solve: push one cloth vertex OUT of a
-// static floor.  isTGS selects the PGS / TGS solve twin.
-// ---------------------------------------------------------------------------
-static void runRigidContact(bool isTGS)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-
-    // --- cloth vertex (id 0, elemIdx 0), invMass = 0.5 (movable) ----------
-    const float invMass = 0.5f;
-    // accumulated delta (xyz) nonzero -> exercises the initialize relLinDelta term; .w = invMass.
-    const F4 accum0 = { 0.0010f, -0.0020f, 0.0015f, invMass };
-    std::vector<F4> positions = { { 0.5f, -0.02f, 0.7f, invMass } };
-    std::vector<F4> velocities = { { 0.0f, 0.0f, 0.0f, invMass } };
-    std::vector<F4> accumDelta = { accum0 };
-    std::vector<F4> deltaPos = { { 0.0f, 0.0f, 0.0f, 0.0f } };   // query/solve output
-    std::vector<uint32_t> triVtx = { 0u, 0u, 0u, 0u };           // unused (vertex contact)
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, velocities);
-    DevBuf bAcc = makeDev(dev, accumDelta);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bTri = makeDev(dev, triVtx);
-
-    const float penBiasClampFEM = -1.0e10f;
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mPenBiasClamp = penBiasClampFEM;
-    c.mNbVerts = 1u;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // --- the STATIC floor contact -----------------------------------------
-    // plane normal (unit, tilted, dominant +Y so "out of floor" ~ +Y).  Stored in
-    // normalPens.xyz; the solver normal is -planeNormal.
-    float rawN[3] = { 0.2f, 0.9f, 0.3f };
-    const float nmag = std::sqrt(rawN[0] * rawN[0] + rawN[1] * rawN[1] + rawN[2] * rawN[2]);
-    const p714ref::V3 planeNormal = { rawN[0] / nmag, rawN[1] / nmag, rawN[2] / nmag };
-    const float penW = -0.02f;   // pInPlaneSpace.x < 0 -> penetrating (pen = penW - restW).
-
-    std::vector<F4> contacts = { { positions[0].x, positions[0].y, positions[0].z, 0.0f } }; // restW = 0
-    std::vector<F4> normalPens = { { planeNormal.x, planeNormal.y, planeNormal.z, penW } };
-    std::vector<F4> barycentrics = { { 0.0f, 0.0f, 0.0f, 1.0f } };   // vertex (bc.w != 0)
-    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
-    std::vector<FemOtherContactInfoHost> infos(1);
-    infos[0].pairInd0 = staticNodeInd;         // rigid node (static)
-    infos[0].pairInd1 = 0u;                     // (clothId 0 << 20) | elemIdx 0
-    infos[0].rigidMatInd_isInCollision = 0u;    // not-yet-in-collision, rigidMatIndex 0
-
-    DevBuf bContacts = makeDev(dev, contacts);
-    DevBuf bNormalPens = makeDev(dev, normalPens);
-    DevBuf bBary = makeDev(dev, barycentrics);
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { 1u };
-    DevBuf bNum = makeDev(dev, numContacts);
-
-    // constraint block (3200 bytes) seeded with a sentinel pattern.
-    std::vector<uint8_t> constraintBytes(sizeof(RigidContactConstraintHost), 0xCD);
-    DevBuf bConstraint = makeDev(dev, constraintBytes);
-
-    std::vector<float> rigidLambdaNs = { 123.0f };   // prepare zeroes it (appliedForces)
-    DevBuf bLambda = makeDev(dev, rigidLambdaNs);
-    std::vector<F4> rigidDeltaVel = { { 9.f, 9.f, 9.f, 9.f }, { 9.f, 9.f, 9.f, 9.f } };
-    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
-    std::vector<uint32_t> refCounts = { 0u, 0u };    // femRigidContactCount (unused for static)
-    DevBuf bRefCounts = makeDev(dev, refCounts);
-
-    // --- static-body frame / mass / inertia (solver body 0) ---------------
-    // body2WorldPool[0] = identity quat, p = origin -> ra == contact point.
-    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
-    DevBuf bBody2World = makeDev(dev, body2World);
-    // solverBodyData[0]: initialLinVelXYZ_invMassW @16 = 0 (invMass0 = 0),
-    //   initialAngVelXYZ_penBiasClamp.w @12 = penBiasClampRigid.
-    const float penBiasClampRigid = -1.0e10f;
-    std::vector<uint8_t> solverBodyData(96, 0);
-    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
-    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
-    // solverTxIData[0].sqrtInvInertia @28: a NON-zero symmetric matrix so the rigid
-    // response rows (raXn x sqrtInvInertia) have teeth (a static body reads slot 0's
-    // matrix verbatim; velocities stay zero, so only the response denominator is affected).
-    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
-    std::vector<uint8_t> solverTxIData(64, 0);
-    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
-    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
-
-    // --- solver-body velocity buffers (static floor at rest) --------------
-    const uint32_t numSolverBodies = 1u;
-    const uint32_t accOffset = 0u;
-    std::vector<F4> outSolverVelocity = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
-                                          { 77.f, 78.f, 79.f, 80.f }, { 81.f, 82.f, 83.f, 84.f } };
-    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
-    std::vector<F4> solverBodyVelPool = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
-                                          { 0.f, 0.f, 0.f, 0.f }, { 61.f, 62.f, 63.f, 64.f } };
-    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
-    std::vector<uint32_t> solverBodyIndices = { 0u };   // never dereferenced for a static body
-    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
-
-    // --- raw descriptor buffers, pointers poked at the mirror offsets -----
-    std::vector<uint8_t> prepDesc(304, 0);          // PxgConstraintPrepareDescGpu
-    pokePtr(prepDesc, 64, bSolverBodyData.addr);    // solverBodyDataPool @64
-    pokePtr(prepDesc, 72, bSolverTxIData.addr);     // solverBodyTxIDataPool @72
-    pokePtr(prepDesc, 168, bBody2World.addr);       // body2WorldPool @168
-    DevBuf bPrepDesc = makeDev(dev, prepDesc);
-
-    std::vector<uint8_t> prePrepDesc(760, 0);       // PxgPrePrepDescGpu
-    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr); // solverBodyIndices @272 (static -> unused)
-    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
-
-    std::vector<uint8_t> solverCoreDesc(320, 0);    // PxgSolverCoreDescGpu
-    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);        // outSolverVelocity @0
-    pokeU32(solverCoreDesc, 268, numSolverBodies);         // numSolverBodies @268
-    pokeU32(solverCoreDesc, 276, accOffset);               // accumulatedBodyDeltaVOffset @276
-    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
-
-    std::vector<uint8_t> sharedDesc(224, 0);        // PxgSolverSharedDesc<IterativeSolveData(TGS)>
-    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);     // iter_solverBodyVelPool @160
-    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
-
-    // ======================= dispatch PREPARE ==========================
-    struct PrepPush
-    {
-        uint64_t femClothes, contacts, normalPens, barycentrics, contactInfos, numContacts;
-        uint64_t constraints, prePrepDesc, prepDesc, rigidLambdaNs;
-        float invDt; uint32_t pad84;
-        uint64_t sharedDesc;
-        uint32_t isTGS, pad100;
-    };
-    static_assert(sizeof(PrepPush) == 104, "prepare push-constant blob must be 104 bytes");
-    PrepPush pp = {};
-    pp.femClothes = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
-    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
-    pp.rigidLambdaNs = bLambda.addr; pp.invDt = 1.0f / dt; pp.sharedDesc = bSharedDesc.addr;
-    pp.isTGS = isTGS ? 1u : 0u;
-
-    Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the prepared constraint ----
-    RigidContactConstraintHost refC;
-    std::memset(&refC, 0xCD, sizeof(refC));
-    const p714ref::V3 solverNormal = { -planeNormal.x, -planeNormal.y, -planeNormal.z };
-    const float pen = penW - contacts[0].w;
-    p714ref::refPrepare(refC, 0, solverNormal, p714ref::V3{ positions[0].x, positions[0].y, positions[0].z },
-                        pen, p714ref::V3{ accum0.x, accum0.y, accum0.z }, barycentrics[0],
-                        p714ref::V3{ 0, 0, 0 }, /*invMass0*/ 0.0f, penBiasClampRigid,
-                        sqrtInvInertia, penBiasClampFEM, /*isStatic*/ true);
-
-    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidContactConstraintHost));
-    RigidContactConstraintHost gotC;
-    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
-    const auto gLambda = downloadBuffer<float>(dev, bLambda.h, 1);
-
-    size_t mm = 0;
-    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  prep %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
-                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    cmp4("raXn_resp", refC.raXn_resp[0], gotC.raXn_resp[0]);
-    cmp4("raXnF0_resp", refC.raXnF0_resp[0], gotC.raXnF0_resp[0]);
-    cmp4("raXnF1_resp", refC.raXnF1_resp[0], gotC.raXnF1_resp[0]);
-    cmp4("normal_errorW", refC.normal_errorW[0], gotC.normal_errorW[0]);
-    cmp4("fricTan0_invMass0", refC.fricTan0_invMass0[0], gotC.fricTan0_invMass0[0]);
-    cmp4("barycentric", refC.barycentric[0], gotC.barycentric[0]);
-    if (f2u(refC.maxPenBias[0]) != f2u(gotC.maxPenBias[0]))
-    { ++mm; std::printf("  prep maxPenBias MM: ref %g got %g\n", refC.maxPenBias[0], gotC.maxPenBias[0]); }
-    // appliedForces zeroed by the prepare.
-    if (f2u(gLambda[0]) != 0u)
-    { ++mm; std::printf("  rigidLambdaNs not zeroed: %g\n", gLambda[0]); }
-
-    // teeth: the response rows must be non-zero (the sqrtInvInertia matrix is exercised).
-    PXG_CHECK_MSG(f2u(gotC.raXn_resp[0].x) != 0u || f2u(gotC.raXn_resp[0].y) != 0u ||
-                  f2u(gotC.raXn_resp[0].z) != 0u,
-                  "prepared raXn response must be non-zero (sqrtInvInertia teeth)");
-    PXG_CHECK_MSG(mm == 0, "cloth_rigidContactPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
-
-    // ======================= dispatch QUERY (refcount) =================
-    struct QueryPush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc;
-        float dt; uint32_t pad68;
-        uint64_t appliedForces, rigidBodyReferenceCounts;
-    };
-    static_assert(sizeof(QueryPush) == 88, "query push-constant blob must be 88 bytes");
-    QueryPush qp = {};
-    qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
-    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
-    qp.artiCoreDesc = 0ull; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
-    qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
-
-    const char* queryEntry = isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
-                                   : "cloth_queryRigidClothContactReferenceCountLaunch";
-    Kernel kQuery("femClothRigidContactBda.spv", queryEntry, {}, sizeof(QueryPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the query (mark in-collision + bump mDeltaPos.w) ----
-    const p714ref::V3 bcVec = { 1.0f, 0.0f, 0.0f };   // vertex
-    const p714ref::V3 accumV = { accum0.x, accum0.y, accum0.z };
-    const p714ref::InitResult qir = p714ref::refInitialize(refC, 0, isTGS, /*appliedForceRef*/ 0.0f, dt,
-                                                           bcVec, accumV, p714ref::V3{ invMass, 0, 0 },
-                                                           /*rigidRefCount*/ 1.0f, /*wasActive*/ false,
-                                                           /*checkOnly*/ true);
-    PXG_CHECK_MSG(qir.isActive, "query CPU ref: the penetrating contact must be active");
-    F4 refDeltaAfterQuery = { 0.0f, 0.0f, 0.0f, (qir.isActive && invMass != 0.0f) ? 1.0f : 0.0f };
-
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 1);
-    const auto gInfoQ = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, 1);
-    if (f2u(gDeltaQ[0].w) != f2u(refDeltaAfterQuery.w))
-    { ++mm; std::printf("  query mDeltaPos.w MM: ref %g got %g\n", refDeltaAfterQuery.w, gDeltaQ[0].w); }
-    PXG_CHECK_MSG(f2u(gDeltaQ[0].w) == f2u(1.0f), "query must bump mDeltaPos.w to 1 (reference count)");
-    PXG_CHECK_MSG((gInfoQ[0].rigidMatInd_isInCollision & 0x80000000u) != 0u,
-                  "query must mark the contact in-collision (bit31)");
-    PXG_CHECK_MSG(mm == 0, "cloth_queryRigidClothContactReferenceCount%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm);
-
-    // ======================= dispatch SOLVE ============================
-    struct SolvePush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
-        float dt; uint32_t pad92;
-        uint64_t materials, rigidBodyMaterials;
-    };
-    static_assert(sizeof(SolvePush) == 112, "solve push-constant blob must be 112 bytes");
-    SolvePush sp = {};
-    sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
-    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
-    sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
-    sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;   // DEFERRED null-material path
-
-    const char* solveEntry = isTGS ? "cloth_solveRigidClothCollisionTGSLaunch"
-                                   : "cloth_solveRigidClothCollisionLaunch";
-    Kernel kSolve("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the solved mDeltaPos ----
-    // readCloth (checkOnly=false): mass-splitting by the query's refCount (mDeltaPos.w == 1).
-    const float refCount = refDeltaAfterQuery.w;   // 1
-    const p714ref::V3 deformableInvMasses = { invMass * refCount, 0.0f, 0.0f };
-    const p714ref::InitResult sir = p714ref::refInitialize(refC, 0, isTGS, /*appliedForceRef*/ 0.0f, dt,
-                                                           bcVec, accumV, deformableInvMasses,
-                                                           /*rigidRefCount*/ 1.0f, /*wasActive*/ true,
-                                                           /*checkOnly*/ false);
-    // computeFEMChange + writeCloth (vertex).
-    const p714ref::V3 deltaPosR = {
-        -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
-        -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
-        -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
-    const float sScale = deformableInvMasses.x;   // > 0
-    F4 refDeltaAfterSolve = { refDeltaAfterQuery.x + deltaPosR.x * sScale,
-                              refDeltaAfterQuery.y + deltaPosR.y * sScale,
-                              refDeltaAfterQuery.z + deltaPosR.z * sScale,
-                              refDeltaAfterQuery.w };   // .w unchanged (writeCloth touches xyz only)
-
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 1);
-    const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, 1);
-    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2);
-
-    // teeth: the solve must push the vertex OUT along the plane normal (dot > 0).
-    const float pushDot = gDelta[0].x * planeNormal.x + gDelta[0].y * planeNormal.y + gDelta[0].z * planeNormal.z;
-    PXG_CHECK_MSG(pushDot > 0.0f, "solve must push the cloth vertex OUT of the floor (dot(mDeltaPos, planeNormal) > 0, got %g, isTGS=%d)",
-                  pushDot, int(isTGS));
-
-    size_t mm2 = 0;
-    if (f2u(refDeltaAfterSolve.x) != f2u(gDelta[0].x) || f2u(refDeltaAfterSolve.y) != f2u(gDelta[0].y) ||
-        f2u(refDeltaAfterSolve.z) != f2u(gDelta[0].z) || f2u(refDeltaAfterSolve.w) != f2u(gDelta[0].w))
-    { ++mm2; std::printf("  solve mDeltaPos MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
-                         refDeltaAfterSolve.x, refDeltaAfterSolve.y, refDeltaAfterSolve.z, refDeltaAfterSolve.w,
-                         gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w); }
-    if (f2u(gLambda2[0]) != f2u(sir.accum))
-    { ++mm2; std::printf("  solve appliedForces MM: ref %g got %g\n", sir.accum, gLambda2[0]); }
-    // dynamic-rigid reaction DEFERRED: static contact writes zeros with count 0.
-    for (uint32_t j = 0; j < 2; ++j)
-        if (f2u(gRigidDeltaVel[j].x) != 0u || f2u(gRigidDeltaVel[j].y) != 0u ||
-            f2u(gRigidDeltaVel[j].z) != 0u || f2u(gRigidDeltaVel[j].w) != 0u)
-        { ++mm2; std::printf("  rigidDeltaVel[%u] not zeroed (static reaction)\n", j); }
-    PXG_CHECK_MSG(mm2 == 0, "cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm2);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
-    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
-    dev->destroyBuffer(bLambda.h); dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bRefCounts.h);
-    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
-    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h); dev->destroyBuffer(bSolverBodyIndices.h);
-    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
-    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
-}
-
-PXG_TEST(femClothSimRigidContactPGS) { runRigidContact(/*isTGS*/ false); }
-PXG_TEST(femClothSimRigidContactTGS) { runRigidContact(/*isTGS*/ true); }
-
-// ---------------------------------------------------------------------------
-// P9.45 — the DYNAMIC-rigid reaction.  runRigidContact above seeds one contact against a
-// STATIC floor, which is the only geometry the drape scenes needed and the reason
-// FEMCollision::computeRigidChange (deformableUtils.cuh:418) could be deferred: with
-// rigidId.isStaticBody() the .cu's own guard never fires.  This case seeds SIX contacts
-// that between them take every branch of that guard, plus the rigid reference-count
-// increment the query pass now performs:
-//
-//   lanes 0..2  DYNAMIC rigid body (node index 3 -> solver body 1, invMass 0.25).  Three
-//               contacts on ONE body, so the query's atomic must reach 3 and the solve must
-//               read 3 back -- a single contact would leave the count at 1, where a dropped
-//               reference-count multiply is invisible.
-//   lane 3      STATIC (node 0xFFFFFFFF): globalRigidBodyId == -1, no increment, zeros.
-//   lane 4      KINEMATIC (node index 4 -> solver body 2, invMass 0): the invMass half of
-//               the guard, which the static lane cannot test on its own.
-//   lane 5      ARTICULATION LINK (node 5, link 1).  Tranche A: the prepare builds the
-//               link's anchor rows (spatialResponseMatrixW products, raw raX* rows, invMass0
-//               = 1) from articulations[bodySims[5].articulationRemapId = 2] -- while the
-//               velocity reader indexes outArtiVelocity by solverBodyIndices[5] = 1, so a
-//               port that used one index for both reads the DECOY record / rows; the query
-//               counts it at numSolverBodies + 1, and the solve REACTS through
-//               computeRigidChange's articulation arm.  The link's count is raised to 3
-//               before the solve so that arm's missing reference-count factor on the
-//               ANGULAR row is observable (with a count of 1 the two arms agree).
-//
-// Every cloth vertex is distinct, so the cloth-side mass split stays 1 per vertex and the
-// RIGID reference count is the only multi-contact quantity under test.
-// ---------------------------------------------------------------------------
-static void runRigidContactDynamic(bool isTGS)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-
-    const uint32_t N = 11u;         // 8 VERTEX + 2 TRIANGLE + 1 SEPARATING-but-active
-    const uint32_t NV = 15u;        // 8 vertex lanes + 3 + 3 for the triangles + 1 for lane 10
-    const uint32_t numSolverBodies = 3u;
-    const uint32_t accOffset = 0u;
-    const float rigidInvMass = 0.25f;
-
-    // ---- cloth vertices.  Lanes 0..7 own vertices 0..7 one-to-one; triangle lane 8 owns
-    // vertices 8,9,10 and lane 9 owns 11,12,13.  DISJOINT on purpose: every vertex then has
-    // exactly one writer, so the scattered deltas stay bit-exactly comparable instead of
-    // needing the tolerance an atomically-shared vertex would force.
-    const float invMass = 0.5f;
-    std::vector<F4> positions(NV), velocities(NV), accumDelta(NV), deltaPos(NV);
-    for (uint32_t i = 0; i < NV; ++i)
-    {
-        const float f = float(i);
-        positions[i] = { 0.5f + 0.11f * f, -0.02f - 0.003f * f, 0.7f - 0.07f * f, invMass };
-        velocities[i] = { 0.0f, 0.0f, 0.0f, invMass };
-        accumDelta[i] = { 0.0010f + 0.0004f * f, -0.0020f + 0.0003f * f, 0.0015f - 0.0002f * f, invMass };
-        deltaPos[i] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    }
-    // Two triangles, as uint4 rows (the fourth component is unread).
-    const uint32_t triVerts[2][3] = { { 8u, 9u, 10u }, { 11u, 12u, 13u } };
-    std::vector<uint32_t> triVtx(8u, 0u);
-    for (uint32_t t = 0; t < 2u; ++t)
-        for (uint32_t k = 0; k < 3u; ++k) triVtx[t * 4u + k] = triVerts[t][k];
-
-    // P9.46: the per-vertex friction array a VERTEX contact reads (PxgFEMCloth.h:87).  A
-    // cloth has TWO friction sources and only the .cu says which applies: a TRIANGLE contact
-    // goes through mMaterialIndices into the surface material table, a VERTEX contact reads
-    // this array directly (deformableUtils.cuh:514 vs :533).  Every lane here is a vertex
-    // contact, so this is the live source; the table below still has to exist, because the
-    // read is gated on `materials != NULL` rather than on this pointer.
-    std::vector<float> clothVertFriction(NV);
-    for (uint32_t i = 0; i < NV; ++i)
-        clothVertFriction[i] = 0.10f + 0.07f * float(i);   // all distinct
-    // The triangle lanes' vertices carry POISON: a TRIANGLE contact must take its friction
-    // from the material table, never from this array.
-    for (uint32_t v = 8u; v < NV - 1u; ++v) clothVertFriction[v] = -7.5f;
-    // ...but vertex 14 belongs to the SEPARATING vertex lane 10, so it keeps a real value.
-    clothVertFriction[NV - 1u] = 0.22f;
-
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, velocities);
-    DevBuf bAcc = makeDev(dev, accumDelta);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bTri = makeDev(dev, triVtx);
-    DevBuf bClothFric = makeDev(dev, clothVertFriction);
-
-    const float penBiasClampFEM = -1.0e10f;
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bClothFric.addr));
-    c.mPenBiasClamp = penBiasClampFEM;
-    c.mNbVerts = NV;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // P9.46 -- MATERIALS.
-    // Rigid table: four PxsMaterialData records (24 B), one per PxCombineMode, so every arm
-    // of PxsCombinePxReal runs.  dynamicFriction @0; the packed word @16 is
-    // flags | fricCombineMode<<16 | restCombineMode<<24, and ONLY bits 16..23 may be read --
-    // the other bytes carry decoys, so a shader that took the whole word or the wrong byte
-    // lands on an out-of-range mode and PxsCombinePxReal's fall-through 0.
-    // Material 4 carries an OUT-OF-RANGE combine mode.  PxCombineMode has four values and
-    // the engine asserts that, so this is not a state a valid scene reaches -- but
-    // PxsCombinePxReal has a fall-through `return 0.0f` for it, and that arm is the port's
-    // answer to a corrupt or uninitialised material byte: NO friction, rather than silently
-    // one side's.  Without a lane pointing here that arm is unreachable and its mutant lives.
-    const float rigidMatFriction[5] = { 0.30f, 0.80f, 0.50f, 0.20f, 0.55f };
-    const uint32_t rigidMatMode[5] = { 0u, 1u, 2u, 3u, 7u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX, invalid
-    std::vector<uint32_t> rigidMats(5u * 6u, 0u);
-    for (uint32_t m = 0; m < 5u; ++m)
-    {
-        uint32_t* w = &rigidMats[m * 6u];
-        std::memcpy(&w[0], &rigidMatFriction[m], 4);
-        w[1] = 0x7f7f7f7fu; w[2] = 0x7f7f7f7fu; w[3] = 0x7f7f7f7fu;
-        w[4] = 0xBEEFu | (rigidMatMode[m] << 16) | (0xA5u << 24);
-        w[5] = 0x000000C3u;
-    }
-    DevBuf bRigidMats = makeDev(dev, rigidMats);
-
-    // Surface table: PxsDeformableSurfaceMaterialData, 32 B, dynamicFriction @8.  Slot 0 is
-    // a DECOY with friction 0 -- an index read that ignored mMaterialIndices and took slot 0
-    // would silently produce a frictionless triangle contact and nothing else would say so.
-    // Slots 2 and 3 are the ones the two TRIANGLE lanes read, and their values are chosen
-    // so the FRICTION binds the tangent clamp there: deltaLambdaT = -min(dLT, mu*|dLN|), and
-    // with a large mu the raw tangent magnitude is the smaller term and mu never reaches the
-    // output at all.  The first version of this fixture had 0.25 and 0.85, both large enough
-    // that every mutant of the deformable-material read survived -- measured, not guessed:
-    // lane 8 had dLT 0.0484 against a limit of 0.258, lane 9 dLT 0.0437 against 1.00.
-    // They are also DIFFERENT from each other, so the PxU16 half-selection is observable.
-    const float clothMatFriction[4] = { 0.00f, 0.65f, 0.05f, 0.03f };
-    std::vector<float> clothMats(4u * 8u, 0.0f);
-    for (uint32_t m = 0; m < 4u; ++m)
-    {
-        clothMats[m * 8u + 0u] = 1.0e6f;                 // youngs
-        clothMats[m * 8u + 1u] = 0.45f;                  // poissons (the neighbouring field)
-        clothMats[m * 8u + 2u] = clothMatFriction[m];    // dynamicFriction @8
-    }
-    DevBuf bClothMats = makeDev(dev, clothMats);
-
-    // mMaterialIndices is a PxU16 array indexed by TRIANGLE: tri 0 -> material 2 (low half
-    // of word 0), tri 1 -> material 3 (HIGH half), so femMaterialIndexAt's halving is under
-    // test as well as the table read.
-    const uint16_t clothMatIdx[2] = { 2u, 3u };
-    std::vector<uint32_t> clothMatIdxWords(1u, uint32_t(clothMatIdx[0]) | (uint32_t(clothMatIdx[1]) << 16));
-    DevBuf bClothMatIdx = makeDev(dev, clothMatIdxWords);
-    descArr[0].mMaterialIndices = reinterpret_cast<decltype(descArr[0].mMaterialIndices)>(size_t(bClothMatIdx.addr));
-    dev->upload(bDesc.h, descArr.data(), descArr.size() * sizeof(PxgFEMCloth));
-
-    // Lanes 0..7 cover all four combine modes twice.  The two TRIANGLE lanes take MULTIPLY
-    // and MIN, which keep their combined friction small enough for the clamp to bind.
-    const uint32_t rigidMatOf[11] = { 0u, 1u, 2u, 3u, 0u, 1u, 4u, 3u, 2u, 1u, 0u };
-    // Which cloth element each lane names, and whether it is a TRIANGLE contact.
-    const uint32_t elemOf[11] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0u, 1u, 14u };
-    const bool isTriOf[11] = { false, false, false, false, false,
-                               false, false, false, true, true, false };
-    // Lane 10 is SEPARATING and pre-marked in-collision, and carries an accumulated lambda
-    // from an earlier solver iteration.  That is the one shape in which deltaLambdaN goes
-    // NEGATIVE -- dLN = max(-CN*invDenom, -accum) with CN > 0 -- and it is the only way the
-    // abs() in the tangent clamp is observable.  It also covers the .cu's "once active, stay
-    // active" branch on the cloth side, which until now only the softbody fixture drove.
-    const bool separatingOf[11] = { false, false, false, false, false, false,
-                                    false, false, false, false, true };
-    const float seededLambda[11] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                                     0.0f, 0.0f, 0.0f, 0.0f, 0.75f };
-
-    // ---- the six rigid ids, and which solver body each resolves to -------
-    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
-    const uint64_t dynNodeInd = 3ull;                    // articulation bit (high word bit0) clear
-    const uint64_t kinNodeInd = 4ull;
-    // articulation bit SET, articulationLinkId() = 1 (PxNodeIndex(5, 1): mLinkID = 1 << 1 | 1)
-    const uint64_t artiNodeInd = (3ull << 32) | 5ull;
-    // Lanes 6 and 7 are dynamic as well; they exist for computeBasisVectors' SECOND branch
-    // (see the normal table below), and being dynamic gives them reaction coverage too.
-    const uint64_t nodeInds[11] = { dynNodeInd, dynNodeInd, dynNodeInd,
-                                    staticNodeInd, kinNodeInd, artiNodeInd,
-                                    dynNodeInd, dynNodeInd,
-                                    dynNodeInd, dynNodeInd,     // the two TRIANGLE lanes
-                                    dynNodeInd };               // the separating lane
-    // solverBodyIndices[nodeIndex]: node 3 -> body 1 (dynamic), node 4 -> body 2 (kinematic),
-    // node 5 -> body 1 as well, so the articulation lane carries a NON-ZERO invMass and only
-    // the articulation test can stop its reaction.
-    std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
-    const uint32_t bodyOf[11] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u, 1u, 1u, 1u }; // static reads slot 0
-    // getGlobalRigidBodyId: -1 static, solverBodyIdx rigid, numSolverBodies+idx articulation.
-    const int globalIdOf[11] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1, 1, 1, 1 };
-    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
-
-    // ---- contact geometry: a distinct tilted normal per lane -------------
-    std::vector<F4> contacts(N), normalPens(N), barycentrics(N);
-    std::vector<FemOtherContactInfoHost> infos(N);
-    // PxComputeBasisVectors branches on |dir.y| <= 0.9999f, and dir is the SOLVER normal,
-    // which prepare forms by negating the plane normal.  Lanes 0..5 spread six tilted
-    // normals across the FIRST branch (right = normalize(dir.z, 0, -dir.x)); lane 6 is
-    // near-vertical so the SECOND branch runs (right = (1,0,0), up normalised instead);
-    // lane 7 sits EXACTLY on the 0.9999 boundary, where <= and < disagree, and is left
-    // un-renormalised so that |y| is exactly the literal.  Without 6 and 7 the second
-    // normalisation and the comparison operator are both unreachable, and mutants of each
-    // survived the first sweep.
-    p714ref::V3 planeNormals[11];
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        // Lane 6's exact digits matter: the second branch normalises up = (0, dir.z, -dir.y),
-        // and for most near-vertical normals `up.k / m` and `up.k * (1/m)` happen to agree
-        // in every component, so the first near-vertical lane tried here still let the
-        // three-divide mutant through.  This one was searched for: it differs in the z
-        // component (-0.999999702 divided against -0.999999762 reciprocated).
-        if (i == 6u) { planeNormals[i] = { -0.000200001727f, -0.999999642f, -0.000800006907f }; continue; }
-        if (i == 7u) { planeNormals[i] = { 0.0099999f, -0.9999f, 0.0099999f }; continue; }
-        float raw[3] = { 0.2f + 0.09f * float(i), 0.9f - 0.05f * float(i), 0.3f - 0.04f * float(i) };
-        const float m = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
-        planeNormals[i] = { raw[0] / m, raw[1] / m, raw[2] / m };
-    }
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        contacts[i] = { positions[i].x, positions[i].y, positions[i].z, 0.0f };   // restW = 0
-        // Deep enough that the contact stays ACTIVE in BOTH modes: TGS folds the rigid
-        // position delta into the error term at invDt, so a shallow penetration flips to
-        // inactive there while staying active under PGS.
-        // A SEPARATING lane needs a POSITIVE penetration so CN comes out positive.
-        normalPens[i] = { planeNormals[i].x, planeNormals[i].y, planeNormals[i].z,
-                          separatingOf[i] ? 0.02f : (-0.05f - 0.004f * float(i)) };
-        // A TRIANGLE contact is bc.w == 0 and carries three real weights; a VERTEX contact
-        // is bc.w != 0 and only bc.x is used (as 1.0).  The two take DIFFERENT friction
-        // sources, which is the whole reason lanes 8 and 9 exist.
-        barycentrics[i] = isTriOf[i]
-                        ? (i == 8u ? F4{ 0.5f, 0.3f, 0.2f, 0.0f } : F4{ 0.25f, 0.6f, 0.15f, 0.0f })
-                        : F4{ 0.0f, 0.0f, 0.0f, 1.0f };
-        infos[i].pairInd0 = nodeInds[i];
-        infos[i].pairInd1 = elemOf[i];               // (clothId 0 << 20) | element index
-        // bits 0..30 are the rigid material index; bit 31 is isInCollision, and the
-        // separating lane is pre-marked so the query keeps it active without re-testing.
-        infos[i].rigidMatInd_isInCollision = rigidMatOf[i] | (separatingOf[i] ? 0x80000000u : 0u);
-    }
-
-    DevBuf bContacts = makeDev(dev, contacts);
-    DevBuf bNormalPens = makeDev(dev, normalPens);
-    DevBuf bBary = makeDev(dev, barycentrics);
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { N };
-    DevBuf bNum = makeDev(dev, numContacts);
-
-    std::vector<uint8_t> constraintBytes(sizeof(RigidContactConstraintHost), 0xCD);
-    DevBuf bConstraint = makeDev(dev, constraintBytes);
-
-    std::vector<float> rigidLambdaNs(N, 123.0f);
-    DevBuf bLambda = makeDev(dev, rigidLambdaNs);
-    std::vector<F4> rigidDeltaVel(2u * N, F4{ 9.f, 9.f, 9.f, 9.f });
-    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
-    // numSolverBodies + numArticulations entries, exactly as PxgFEMClothCore.cpp:320 sizes it.
-    std::vector<uint32_t> refCounts(numSolverBodies + 2u, 0u);
-    DevBuf bRefCounts = makeDev(dev, refCounts);
-
-    // ---- three solver bodies: frames, masses, sqrt inverse inertias ------
-    std::vector<F4> body2World = {
-        { 0.f, 0.f, 0.f, 1.f }, { 0.00f, 0.00f, 0.00f, 0.f },   // body 0 (static slot)
-        { 0.f, 0.f, 0.f, 1.f }, { 0.10f, -0.30f, 0.20f, 0.f },  // body 1 (dynamic)
-        { 0.f, 0.f, 0.f, 1.f }, { -0.05f, 0.40f, 0.15f, 0.f },  // body 2 (kinematic)
-    };
-    DevBuf bBody2World = makeDev(dev, body2World);
-
-    const float penBiasClampRigid = -1.0e10f;
-    const float invMassOf[3] = { 0.0f, rigidInvMass, 0.0f };
-    std::vector<uint8_t> solverBodyData(96u * numSolverBodies, 0);
-    for (uint32_t b = 0; b < numSolverBodies; ++b)
-    {
-        std::memcpy(solverBodyData.data() + 96u * b + 12, &penBiasClampRigid, 4);  // penBiasClamp @12
-        std::memcpy(solverBodyData.data() + 96u * b + 28, &invMassOf[b], 4);       // invMass @28
-    }
-    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
-
-    const float sqrtInvInertia0[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
-    const float sqrtInvInertia1[9] = { 1.3f, -0.2f, 0.05f, -0.2f, 0.9f, 0.15f, 0.05f, 0.15f, 1.7f };
-    const float sqrtInvInertia2[9] = { 0.7f, 0.3f, -0.1f, 0.3f, 1.1f, 0.0f, -0.1f, 0.0f, 0.8f };
-    const float* sqrtInvOf[3] = { sqrtInvInertia0, sqrtInvInertia1, sqrtInvInertia2 };
-    std::vector<uint8_t> solverTxIData(64u * numSolverBodies, 0);
-    for (uint32_t b = 0; b < numSolverBodies; ++b)
-        std::memcpy(solverTxIData.data() + 64u * b + 28, sqrtInvOf[b], 9 * 4);   // sqrtInvInertia @28
-    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
-
-    // ---- velocities.  Body 0 stays at rest so the STATIC lane reads zeros,
-    //      exactly as it does in runRigidContact; bodies 1 and 2 move.
-    std::vector<F4> outSolverVelocity(2u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
-    outSolverVelocity[1] = { 0.30f, -0.70f, 0.20f, 0.f };                      // body 1 linear
-    outSolverVelocity[2] = { 0.10f, 0.20f, 0.30f, 0.f };                       // body 2 linear
-    outSolverVelocity[1 + numSolverBodies] = { 0.11f, 0.22f, -0.33f, 0.f };    // body 1 angular
-    outSolverVelocity[2 + numSolverBodies] = { 0.04f, 0.05f, 0.06f, 0.f };     // body 2 angular
-    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
-
-    // The TGS rows carry velocity in v0/v1.x-y and POSITION DELTA in v1.z-w / v2, and the
-    // deltas enter the error at invDt (x60 here), so they are deliberately two orders
-    // smaller than the velocities -- large ones drive every contact inactive.
-    std::vector<F4> solverBodyVelPool(3u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
-    solverBodyVelPool[1] = { 0.05f, -0.09f, 0.03f, 0.14f };
-    solverBodyVelPool[2] = { -0.02f, 0.07f, 0.01f, -0.06f };
-    solverBodyVelPool[1 + numSolverBodies] = { 0.21f, -0.12f, 0.0033f, -0.0044f };
-    solverBodyVelPool[2 + numSolverBodies] = { 0.08f, 0.09f, -0.0010f, 0.0011f };
-    solverBodyVelPool[1 + 2u * numSolverBodies] = { 0.0055f, -0.0066f, 0.0077f, -0.0088f };
-    solverBodyVelPool[2 + 2u * numSolverBodies] = { -0.0015f, 0.0016f, -0.0017f, 0.0018f };
-    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
-
-    // ---- tranche A: ONE articulation link behind lane 5 --------------------
-    // Three PxgArticulation records: [2] is the one bodySims[5].articulationRemapId names,
-    // [1] is a DECOY with different link data (solverBodyIndices[5] == 1 is the index the
-    // VELOCITY reader uses), [0] is never named.  Two links each; lane 5 is link 1.
-    const uint32_t artiLinkId = 1u, artiRemapId = 2u, artiSolverIdx = 1u;
-    const uint32_t maxLinks = 2u, nbArticulations = 3u;
-    const uint32_t artiOffset = maxLinks * nbArticulations;
-    std::vector<physx::PxgArticulationLink> artiLinks(nbArticulations * maxLinks);
-    std::memset(static_cast<void*>(artiLinks.data()), 0, artiLinks.size() * sizeof(artiLinks[0]));
-    std::vector<physx::PxTransform> artiB2W(nbArticulations * maxLinks);
-    std::vector<physx::PxSpatialMatrix> artiResp(nbArticulations * maxLinks);
-    for (uint32_t k = 0; k < nbArticulations * maxLinks; ++k)
-    {
-        const float fk = float(k);
-        artiLinks[k].penBiasClamp = -2.0f - 0.5f * fk;
-        artiB2W[k] = physx::PxTransform(physx::PxVec3(0.15f - 0.04f * fk, -0.25f + 0.03f * fk, 0.35f + 0.02f * fk),
-                                        physx::PxQuat(physx::PxIdentity));
-        // A full, NON-symmetric 6x6: column[j][i] != column[i][j], so a transposed product
-        // (asmM6MulVec's documented trap) cannot match.
-        for (uint32_t cc = 0; cc < 6u; ++cc)
-            for (uint32_t rr = 0; rr < 6u; ++rr)
-                artiResp[k].column[cc][rr] = (cc == rr ? 0.9f : 0.0f)
-                                           + 0.013f * float((cc * 7u + rr * 3u + k * 5u) % 11u) - 0.05f;
-    }
-    // Record r's links start at r * maxLinks in each of the three link arrays.
-    DevBuf bArtiLinks = makeDev(dev, artiLinks);
-    DevBuf bArtiB2W = makeDev(dev, artiB2W);
-    DevBuf bArtiResp = makeDev(dev, artiResp);
-    std::vector<physx::PxgArticulation> artiRecs(nbArticulations);
-    std::memset(static_cast<void*>(artiRecs.data()), 0, artiRecs.size() * sizeof(artiRecs[0]));
-    for (uint32_t r = 0; r < nbArticulations; ++r)
-    {
-        artiRecs[r].links = reinterpret_cast<physx::PxgArticulationLink*>(
-            size_t(bArtiLinks.addr + uint64_t(r * maxLinks) * sizeof(physx::PxgArticulationLink)));
-        artiRecs[r].linkBody2Worlds = reinterpret_cast<physx::PxTransform*>(
-            size_t(bArtiB2W.addr + uint64_t(r * maxLinks) * sizeof(physx::PxTransform)));
-        artiRecs[r].spatialResponseMatrixW = reinterpret_cast<physx::PxSpatialMatrix*>(
-            size_t(bArtiResp.addr + uint64_t(r * maxLinks) * sizeof(physx::PxSpatialMatrix)));
-    }
-    DevBuf bArtiRecs = makeDev(dev, artiRecs);
-    std::vector<physx::PxgBodySim> bodySims(6u);
-    std::memset(static_cast<void*>(bodySims.data()), 0, bodySims.size() * sizeof(bodySims[0]));
-    for (uint32_t n = 0; n < 6u; ++n) bodySims[n].articulationRemapId = 0xDEADu;   // only node 5 is read
-    bodySims[5].articulationRemapId = artiRemapId;
-    DevBuf bBodySims = makeDev(dev, bodySims);
-    // solverCoreDesc->outArtiVelocity: four planes (lin, ang, linDelta, angDelta) of
-    // maxLinks * nbArticulations rows; lane 5 reads row artiSolverIdx * maxLinks + artiLinkId.
-    std::vector<F4> outArtiVelocity(4u * artiOffset);
-    for (uint32_t k = 0; k < 4u * artiOffset; ++k)
-    {
-        const float fk = float(k);
-        const float sc = (k >= 2u * artiOffset) ? 0.01f : 1.0f;   // TGS deltas two orders smaller
-        outArtiVelocity[k] = { sc * (0.12f - 0.03f * fk), sc * (-0.45f + 0.02f * fk),
-                               sc * (0.08f + 0.01f * fk), 777.0f };
-    }
-    DevBuf bOutArtiVel = makeDev(dev, outArtiVelocity);
-    std::vector<uint8_t> artiCoreDesc(sizeof(physx::PxgArticulationCoreDesc), 0xAB);
-    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, mMaxLinksPerArticulation), maxLinks);
-    pokeU32(artiCoreDesc, offsetof(physx::PxgArticulationCoreDesc, nbArticulations), nbArticulations);
-    DevBuf bArtiCoreDesc = makeDev(dev, artiCoreDesc);
-    const uint32_t artiRecLink = artiRemapId * maxLinks + artiLinkId;   // flattened link slot
-    const uint32_t artiVelRow = artiSolverIdx * maxLinks + artiLinkId;
-
-    // The link arm of readRigidVelocity (dataReadWriteHelper.cuh:105-115 / :126-141).
-    auto artiVel = [&]() {
-        p714ref::RefRigidVel rv;
-        const F4 l = outArtiVelocity[artiVelRow], a = outArtiVelocity[artiVelRow + artiOffset];
-        rv.linVel = { l.x, l.y, l.z };
-        rv.angVel = { a.x, a.y, a.z };
-        if (isTGS)
-        {
-            const F4 ld = outArtiVelocity[artiVelRow + 2u * artiOffset];
-            const F4 ad = outArtiVelocity[artiVelRow + 3u * artiOffset];
-            rv.linDelta = { ld.x, ld.y, ld.z };
-            rv.angDelta = { ad.x, ad.y, ad.z };
-        }
-        return rv;
-    };
-
-    // readRigidVelocity (pxgSlangFemRigidContact.slang) mirrored on the host.
-    auto rigidVelOf = [&](uint32_t body) {
-        p714ref::RefRigidVel rv;
-        if (isTGS)
-        {
-            const F4 v0 = solverBodyVelPool[accOffset + body];
-            const F4 v1 = solverBodyVelPool[accOffset + body + numSolverBodies];
-            const F4 v2 = solverBodyVelPool[accOffset + body + 2u * numSolverBodies];
-            rv.linVel = { v0.x, v0.y, v0.z };
-            rv.angVel = { v0.w, v1.x, v1.y };
-            rv.linDelta = { v1.z, v1.w, v2.x };
-            rv.angDelta = { v2.y, v2.z, v2.w };
-        }
-        else
-        {
-            const F4 iv0 = outSolverVelocity[body];
-            const F4 iv1 = outSolverVelocity[body + numSolverBodies];
-            const F4 dv0 = solverBodyVelPool[accOffset + body];
-            const F4 dv1 = solverBodyVelPool[accOffset + body + numSolverBodies];
-            rv.linVel = { iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z };
-            rv.angVel = { iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z };
-        }
-        return rv;
-    };
-
-    // ---- descriptors ------------------------------------------------------
-    std::vector<uint8_t> prepDesc(304, 0);
-    pokePtr(prepDesc, 64, bSolverBodyData.addr);
-    pokePtr(prepDesc, 72, bSolverTxIData.addr);
-    pokePtr(prepDesc, 168, bBody2World.addr);
-    DevBuf bPrepDesc = makeDev(dev, prepDesc);
-
-    std::vector<uint8_t> prePrepDesc(760, 0);
-    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
-    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
-
-    std::vector<uint8_t> solverCoreDesc(320, 0);
-    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
-    pokeU32(solverCoreDesc, 268, numSolverBodies);
-    pokeU32(solverCoreDesc, 276, accOffset);
-    pokePtr(solverCoreDesc, 40, bOutArtiVel.addr);          // outArtiVelocity @40
-    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
-
-    std::vector<uint8_t> sharedDesc(224, 0);
-    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
-    pokePtr(sharedDesc, 32, bBodySims.addr);                // mBodySimBufferDeviceData @32
-    pokePtr(sharedDesc, 40, bArtiRecs.addr);                // articulations @40
-    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
-
-    // Per-lane rigid view: lane 5 is the link -- invMass0 1 and the link velocity row.
-    auto laneIsArti = [&](uint32_t i) { return ((nodeInds[i] >> 32) & 1ull) != 0ull; };
-    auto laneInvMass0 = [&](uint32_t i) { return laneIsArti(i) ? 1.0f : invMassOf[bodyOf[i]]; };
-    auto laneVel = [&](uint32_t i) { return laneIsArti(i) ? artiVel() : rigidVelOf(bodyOf[i]); };
-
-    // ---- per-lane element shape.  A VERTEX lane owns one cloth vertex and blends nothing;
-    // a TRIANGLE lane owns three and blends them by the barycentric.  readCloth and the
-    // prepare kernel both branch on bc.w, so the reference has to as well.
-    auto laneVerts = [&](uint32_t i, uint32_t out[3]) -> uint32_t {
-        if (!isTriOf[i]) { out[0] = elemOf[i]; return 1u; }
-        for (uint32_t k = 0; k < 3u; ++k) out[k] = triVerts[elemOf[i]][k];
-        return 3u;
-    };
-    auto laneBcVec = [&](uint32_t i) {
-        return isTriOf[i] ? p714ref::V3{ barycentrics[i].x, barycentrics[i].y, barycentrics[i].z }
-                          : p714ref::V3{ 1.0f, 0.0f, 0.0f };
-    };
-    // The accumulated delta the prepare and the solve both use: the blend for a triangle
-    // (femClothRigidContactBda.slang:288), the vertex's own row otherwise.
-    auto laneAccum = [&](uint32_t i) {
-        if (!isTriOf[i])
-            return p714ref::V3{ accumDelta[elemOf[i]].x, accumDelta[elemOf[i]].y, accumDelta[elemOf[i]].z };
-        const F4 bc = barycentrics[i];
-        const uint32_t* tv = triVerts[elemOf[i]];
-        return p714ref::V3{
-            accumDelta[tv[0]].x * bc.x + accumDelta[tv[1]].x * bc.y + accumDelta[tv[2]].x * bc.z,
-            accumDelta[tv[0]].y * bc.x + accumDelta[tv[1]].y * bc.y + accumDelta[tv[2]].y * bc.z,
-            accumDelta[tv[0]].z * bc.x + accumDelta[tv[1]].z * bc.y + accumDelta[tv[2]].z * bc.z };
-    };
-    // The cloth half of getCombinedFriction: the material table through mMaterialIndices for
-    // a triangle, the per-vertex array for a vertex (deformableUtils.cuh:514 vs :533).
-    auto laneClothFriction = [&](uint32_t i) {
-        return isTriOf[i] ? clothMatFriction[clothMatIdx[elemOf[i]]] : clothVertFriction[elemOf[i]];
-    };
-
-    // ======================= dispatch PREPARE ==========================
-    struct PrepPush
-    {
-        uint64_t femClothes, contacts, normalPens, barycentrics, contactInfos, numContacts;
-        uint64_t constraints, prePrepDesc, prepDesc, rigidLambdaNs;
-        float invDt; uint32_t pad84;
-        uint64_t sharedDesc;
-        uint32_t isTGS, pad100;
-    };
-    static_assert(sizeof(PrepPush) == 104, "prepare push-constant blob must be 104 bytes");
-    PrepPush pp = {};
-    pp.femClothes = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
-    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
-    pp.rigidLambdaNs = bLambda.addr; pp.invDt = 1.0f / dt; pp.sharedDesc = bSharedDesc.addr;
-    pp.isTGS = isTGS ? 1u : 0u;
-
-    Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-
-    RigidContactConstraintHost refC;
-    std::memset(&refC, 0xCD, sizeof(refC));
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        const uint32_t b = bodyOf[i];
-        const p714ref::V3 solverNormal = { -planeNormals[i].x, -planeNormals[i].y, -planeNormals[i].z };
-        const float pen = normalPens[i].w - contacts[i].w;
-        const p714ref::V3 frameP = { body2World[2u * b + 1u].x, body2World[2u * b + 1u].y,
-                                     body2World[2u * b + 1u].z };
-        if (laneIsArti(i))
-        {
-            const physx::PxVec3& lp = artiB2W[artiRecLink].p;
-            p714ref::refPrepareArti(refC, int(i), solverNormal,
-                                    p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
-                                    pen, laneAccum(i), barycentrics[i], p714ref::V3{ lp.x, lp.y, lp.z },
-                                    artiResp[artiRecLink], artiLinks[artiRecLink].penBiasClamp,
-                                    penBiasClampFEM);
-            continue;
-        }
-        p714ref::refPrepare(refC, int(i), solverNormal,
-                            p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
-                            pen, laneAccum(i),
-                            barycentrics[i], frameP, invMassOf[b], penBiasClampRigid,
-                            sqrtInvOf[b], penBiasClampFEM, /*isStatic*/ nodeInds[i] == staticNodeInd);
-    }
-
-    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidContactConstraintHost));
-    RigidContactConstraintHost gotC;
-    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
-
-    size_t mm = 0;
-    auto cmp4 = [&](const char* nm, uint32_t lane, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  prep lane %u %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", lane, nm,
-                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        cmp4("raXn_resp", i, refC.raXn_resp[i], gotC.raXn_resp[i]);
-        cmp4("raXnF0_resp", i, refC.raXnF0_resp[i], gotC.raXnF0_resp[i]);
-        cmp4("raXnF1_resp", i, refC.raXnF1_resp[i], gotC.raXnF1_resp[i]);
-        cmp4("normal_errorW", i, refC.normal_errorW[i], gotC.normal_errorW[i]);
-        cmp4("fricTan0_invMass0", i, refC.fricTan0_invMass0[i], gotC.fricTan0_invMass0[i]);
-        cmp4("barycentric", i, refC.barycentric[i], gotC.barycentric[i]);
-        if (f2u(refC.maxPenBias[i]) != f2u(gotC.maxPenBias[i]))
-        { ++mm; std::printf("  prep lane %u maxPenBias MM\n", i); }
-    }
-    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[0].w) == f2u(rigidInvMass),
-                  "lane 0 must carry the DYNAMIC inverse mass (got %g)", gotC.fricTan0_invMass0[0].w);
-    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[4].w) == 0u,
-                  "lane 4 must carry the KINEMATIC zero inverse mass (got %g)", gotC.fricTan0_invMass0[4].w);
-    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[5].w) == f2u(1.0f),
-                  "lane 5 (articulation link) must carry invMass0 = 1 (got %g)", gotC.fricTan0_invMass0[5].w);
-    PXG_CHECK_MSG(f2u(gotC.maxPenBias[5]) == f2u(artiLinks[artiRecLink].penBiasClamp),
-                  "lane 5 must take its penBiasClamp from links[%u] of record %u (got %g)",
-                  artiLinkId, artiRemapId, gotC.maxPenBias[5]);
-    PXG_CHECK_MSG(mm == 0, "dynamic prepare bit-exact vs CPU (%zu mismatches)", mm);
-
-    // The prepare zeroes rigidLambdaNs for every contact, so the accumulated lambda the
-    // separating lane needs has to be written back afterwards -- which is exactly the state
-    // the engine is in from the second solver iteration onward.
-    {
-        std::vector<float> seeded(seededLambda, seededLambda + N);
-        dev->upload(bLambda.h, seeded.data(), seeded.size() * sizeof(float));
-    }
-
-    // ======================= dispatch QUERY (refcount) =================
-    struct QueryPush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc;
-        float dt; uint32_t pad68;
-        uint64_t appliedForces, rigidBodyReferenceCounts;
-    };
-    static_assert(sizeof(QueryPush) == 88, "query push-constant blob must be 88 bytes");
-    QueryPush qp = {};
-    qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
-    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
-    qp.artiCoreDesc = bArtiCoreDesc.addr; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
-    qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
-
-    const char* queryEntry = isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
-                                   : "cloth_queryRigidClothContactReferenceCountLaunch";
-    Kernel kQuery("femClothRigidContactBda.spv", queryEntry, {}, sizeof(QueryPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the query ----
-    std::vector<uint32_t> refRefCounts(refCounts.size(), 0u);
-    std::vector<float> refVertW(NV, 0.0f);        // per-VERTEX mDeltaPos.w after the query
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        // countReferenceOnly: readCloth returns the RAW inverse masses, without the
-        // reference-count multiply the solve applies.
-        const p714ref::V3 invMq = isTriOf[i] ? p714ref::V3{ invMass, invMass, invMass }
-                                             : p714ref::V3{ invMass, 0.0f, 0.0f };
-        const p714ref::InitResult qir =
-            p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
-                                   laneAccum(i), invMq, /*rigidRefCount*/ 1.0f,
-                                   /*wasActive*/ separatingOf[i], /*checkOnly*/ true,
-                                   laneVel(i), /*combinedFriction*/ 0.0f);
-        // Faithful to the .cu: everything below hangs off isActive.  The assertion is a
-        // COVERAGE claim about the seeded data, not a step of the reference -- if it ever
-        // fires, the data drifted, and the comparison stays honest either way.
-        PXG_CHECK_MSG(qir.isActive, "query CPU ref: lane %u must be active (seeded data)", i);
-        if (!qir.isActive)
-            continue;
-        // The vertex bumps: a triangle bumps each of its three, gated on bc.k > 1e-3.
-        uint32_t vs[3];
-        const uint32_t nv = laneVerts(i, vs);
-        const float bcArr[3] = { barycentrics[i].x, barycentrics[i].y, barycentrics[i].z };
-        for (uint32_t k = 0; k < nv; ++k)
-            if (!isTriOf[i] || bcArr[k] > 1e-3f)
-                refVertW[vs[k]] += 1.0f;
-        if (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f)
-            refRefCounts[size_t(globalIdOf[i])] += 1u;
-    }
-
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, NV);
-    const auto gRefCountsQ = downloadBuffer<uint32_t>(dev, bRefCounts.h, uint32_t(refCounts.size()));
-    for (uint32_t v = 0; v < NV; ++v)
-        if (f2u(gDeltaQ[v].w) != f2u(refVertW[v]))
-        { ++mm; std::printf("  query vertex %u mDeltaPos.w MM: ref %g got %g\n", v, refVertW[v], gDeltaQ[v].w); }
-    for (size_t k = 0; k < refRefCounts.size(); ++k)
-        if (gRefCountsQ[k] != refRefCounts[k])
-        { ++mm; std::printf("  query refCounts[%zu] MM: ref %u got %u\n", k, refRefCounts[k], gRefCountsQ[k]); }
-
-    // teeth: seven contacts share solver body 1, so its count must be 7 -- with 1 a dropped
-    // reference-count multiply in computeRigidChange would be invisible.
-    PXG_CHECK_MSG(gRefCountsQ[1] == 8u, "the eight dynamic contacts must bump body 1 to 8 (got %u)",
-                  gRefCountsQ[1]);
-    PXG_CHECK_MSG(gRefCountsQ[2] == 0u, "the KINEMATIC body must not be counted (got %u)", gRefCountsQ[2]);
-    PXG_CHECK_MSG(gRefCountsQ[numSolverBodies + 1u] == 1u,
-                  "the articulation link IS counted, as in the .cu (got %u)",
-                  gRefCountsQ[numSolverBodies + 1u]);
-    PXG_CHECK_MSG(mm == 0, "dynamic query bit-exact vs CPU (%zu mismatches)", mm);
-
-    // Tranche A: raise the link's count to 3 -- as if two more contacts touched it -- so the
-    // articulation arm of computeRigidChange (no reference-count factor on the ANGULAR row,
-    // deformableUtils.cuh:420) differs from the rigid arm.  At a count of 1 they agree.
-    refRefCounts[numSolverBodies + 1u] = 3u;
-    dev->upload(bRefCounts.h, refRefCounts.data(), refRefCounts.size() * sizeof(uint32_t));
-
-    // ======================= dispatch SOLVE ============================
-    struct SolvePush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
-        float dt; uint32_t pad92;
-        uint64_t materials, rigidBodyMaterials;
-    };
-    static_assert(sizeof(SolvePush) == 112, "solve push-constant blob must be 112 bytes");
-    SolvePush sp = {};
-    sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
-    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = bArtiCoreDesc.addr; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
-    sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
-    sp.materials = bClothMats.addr; sp.rigidBodyMaterials = bRigidMats.addr;
-
-    const char* solveEntry = isTGS ? "cloth_solveRigidClothCollisionTGSLaunch"
-                                   : "cloth_solveRigidClothCollisionLaunch";
-    Kernel kSolve("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference for the solve ----
-    std::vector<p714ref::V3> refVertDelta(NV, p714ref::V3{ 0.0f, 0.0f, 0.0f });
-    std::vector<F4> refRigidDeltaVel(2u * N);
-    std::vector<float> refAccum(N);
-    std::vector<bool> reactsOf(N, false);
-    uint32_t dynamicLanes = 0u, zeroLanes = 0u;
-    uint32_t frictionLanes = 0u, boundLanes = 0u, boundTriLanes = 0u, boundVertLanes = 0u;
-    uint32_t negativeLambdaLanes = 0u;
-    uint32_t modeSeen[5] = { 0u, 0u, 0u, 0u, 0u };
-    std::vector<float> laneFriction(N, 0.0f);
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        // readRigidBody: the count is read back only for a non-static, finite-mass body.
-        const float rigidRefCount =
-            (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
-        // readCloth's mass split: each of the lane's vertices carries invMass times ITS OWN
-        // reference count.
-        uint32_t vs[3];
-        const uint32_t nv = laneVerts(i, vs);
-        p714ref::V3 deformableInvMasses = { 0.0f, 0.0f, 0.0f };
-        {
-            float im[3] = { 0.0f, 0.0f, 0.0f };
-            for (uint32_t k = 0; k < nv; ++k) im[k] = invMass * refVertW[vs[k]];
-            deformableInvMasses = { im[0], im[1], im[2] };
-        }
-        // P9.46: getCombinedFriction() = PxsCombinePxReal(rigid, cloth, the RIGID material's
-        // mode).  The cloth half comes from a DIFFERENT source per contact kind, which is
-        // what lanes 8 and 9 are here to prove.
-        const float combinedFriction = p714ref::refCombineFriction(
-            rigidMatFriction[rigidMatOf[i]], laneClothFriction(i), rigidMatMode[rigidMatOf[i]]);
-        laneFriction[i] = combinedFriction;
-        // modeSeen[4] counts the out-of-range mode, whatever its numeric value.
-        ++modeSeen[rigidMatMode[rigidMatOf[i]] < 4u ? rigidMatMode[rigidMatOf[i]] : 4u];
-        const p714ref::InitResult sir =
-            p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
-                                   laneAccum(i), deformableInvMasses, rigidRefCount,
-                                   /*wasActive*/ true, /*checkOnly*/ false, laneVel(i),
-                                   combinedFriction);
-        if (sir.deltaLambdaN < 0.0f)
-            ++negativeLambdaLanes;
-        if (sir.deltaLambdaT != 0.0f)
-            ++frictionLanes;
-        if (sir.frictionBound)
-        {
-            ++boundLanes;
-            if (isTriOf[i]) ++boundTriLanes; else ++boundVertLanes;
-        }
-        const p714ref::V3 deltaPosR = {
-            -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
-            -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
-            -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
-        // writeCloth: a vertex contact scales by its own inverse mass, a triangle contact by
-        // invM[k] * bc[k] per vertex, each guarded on invM[k] > 0.
-        {
-            const float imArr[3] = { deformableInvMasses.x, deformableInvMasses.y, deformableInvMasses.z };
-            const float bcArr[3] = { barycentrics[i].x, barycentrics[i].y, barycentrics[i].z };
-            for (uint32_t k = 0; k < nv; ++k)
-            {
-                if (!(imArr[k] > 0.0f))
-                    continue;
-                const float sc = isTriOf[i] ? (imArr[k] * bcArr[k]) : imArr[k];
-                refVertDelta[vs[k]].x += deltaPosR.x * sc;
-                refVertDelta[vs[k]].y += deltaPosR.y * sc;
-                refVertDelta[vs[k]].z += deltaPosR.z * sc;
-            }
-        }
-        refAccum[i] = sir.accum;
-
-        // The .cu's guard (FEMClothExternalSolve.cu:525): fricTan0_invMass0.w != 0 and not
-        // static.  A link carries invMass0 = 1, so it reacts -- through the articulation arm.
-        const bool isArti = laneIsArti(i);
-        const bool reacts = (laneInvMass0(i) != 0.0f) && (nodeInds[i] != staticNodeInd);
-        reactsOf[i] = reacts;
-        p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
-        float count = 0.0f;
-        if (reacts)
-        {
-            count = 1.0f;
-            p714ref::refComputeRigidChange(sir, isArti, laneInvMass0(i), rigidRefCount,
-                                           dLin, dAng);
-            ++dynamicLanes;
-        }
-        else
-        {
-            ++zeroLanes;
-        }
-        refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
-        refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
-    }
-    PXG_CHECK_MSG(dynamicLanes == 9u && zeroLanes == 2u,
-                  "coverage: expected 9 reacting (8 rigid + the link) and 2 silent lanes, got %u / %u",
-                  dynamicLanes, zeroLanes);
-    {
-        // The articulation arm must be OBSERVABLE: with the link's count at 3 the rigid arm's
-        // angular row would be three times the articulation arm's.
-        const p714ref::InitResult s5 = p714ref::refInitialize(
-            refC, 5, isTGS, seededLambda[5], dt, laneBcVec(5), laneAccum(5),
-            p714ref::V3{ invMass * refVertW[elemOf[5]], 0.0f, 0.0f }, 3.0f, true, false, laneVel(5),
-            laneFriction[5]);
-        p714ref::V3 la, aa, lr, ar;
-        p714ref::refComputeRigidChange(s5, true, 1.0f, 3.0f, la, aa);
-        p714ref::refComputeRigidChange(s5, false, 1.0f, 3.0f, lr, ar);
-        PXG_CHECK_MSG(f2u(aa.x) != f2u(ar.x) || f2u(aa.y) != f2u(ar.y) || f2u(aa.z) != f2u(ar.z),
-                      "the link lane must tell the articulation arm from the rigid arm");
-    }
-
-    // P9.46 TEETH.  Without these the material path could be silently inert again:
-    // deltaLambdaT is exactly -0 whenever the combined friction is 0, and a comparison
-    // against a reference that ALSO produced -0 stays green either way.
-    // N - 1, not N: lane 6 carries the OUT-OF-RANGE combine mode, whose whole point is that
-    // PxsCombinePxReal returns 0 there and the tangent impulse collapses to -0.
-    PXG_CHECK_MSG(frictionLanes == N - 1u,
-                  "all but the invalid-mode lane must produce a non-zero tangent impulse, "
-                  "got %u of %u", frictionLanes, N);
-    PXG_CHECK_MSG(f2u(laneFriction[6]) == 0u,
-                  "the out-of-range combine mode must give exactly 0 friction (got %g)",
-                  laneFriction[6]);
-    // The abs() in the tangent clamp is only observable where deltaLambdaN goes negative.
-    PXG_CHECK_MSG(negativeLambdaLanes >= 1u,
-                  "at least one lane must reach a NEGATIVE deltaLambdaN (separating contact "
-                  "with an accumulated lambda), got %u", negativeLambdaLanes);
-    for (uint32_t m = 0; m < 4u; ++m)
-        PXG_CHECK_MSG(modeSeen[m] > 0u, "PxCombineMode %u is never exercised", m);
-    PXG_CHECK_MSG(modeSeen[4] > 0u, "the out-of-range combine mode is never exercised");
-    {
-        uint32_t distinct = 0u;
-        for (uint32_t a = 0; a < N; ++a)
-        {
-            bool dup = false;
-            for (uint32_t b2 = 0; b2 < a; ++b2) if (laneFriction[b2] == laneFriction[a]) dup = true;
-            if (!dup) ++distinct;
-        }
-        PXG_CHECK_MSG(distinct >= 6u, "the seeded frictions must take at least 6 distinct "
-                                      "values across the lanes, got %u", distinct);
-        // BOTH cloth friction sources must be reached.  A triangle lane's vertices carry
-        // -7.5 in mDynamicFrictions, so a port that read the per-vertex array for a triangle
-        // contact would produce a NEGATIVE combined friction and this comparison would go
-        // red -- but only if a triangle lane exists at all, which is what this pins.
-        uint32_t triLanes = 0u, vertLanes = 0u;
-        for (uint32_t a = 0; a < N; ++a) { if (isTriOf[a]) ++triLanes; else ++vertLanes; }
-        PXG_CHECK_MSG(triLanes >= 2u && vertLanes >= 6u,
-                      "coverage: %u TRIANGLE and %u VERTEX lanes -- both friction sources "
-                      "must be live", triLanes, vertLanes);
-        // AND the friction must actually BIND the clamp on both kinds.  deltaLambdaT is
-        // -min(dLT, mu*|dLN|); where the raw magnitude is the smaller term the material
-        // value never reaches the output, and a mutant of the read survives.  That is not a
-        // hypothetical: the first version of this fixture bound on no triangle lane at all,
-        // and every one of the six deformable-material mutants lived through the sweep.
-        PXG_CHECK_MSG(boundTriLanes >= 2u && boundVertLanes >= 3u,
-                      "the friction must BIND the tangent clamp on both contact kinds: "
-                      "%u triangle and %u vertex lanes bound (of %u total)",
-                      boundTriLanes, boundVertLanes, boundLanes);
-        std::printf("  friction per lane:");
-        for (uint32_t a = 0; a < N; ++a) std::printf(" %.4g", laneFriction[a]);
-        std::printf("\n");
-    }
-
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, NV);
-    const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, N);
-    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
-
-    size_t mm2 = 0;
-    auto cmpRow = [&](const char* nm, uint32_t k, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm2; std::printf("  solve %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, k,
-                             r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    // Per VERTEX, because the two triangle lanes each scatter onto three of them.  Every
-    // vertex still has exactly ONE writing lane, so this stays bit-exact.
-    for (uint32_t v = 0; v < NV; ++v)
-        cmpRow("mDeltaPos", v,
-               F4{ refVertDelta[v].x, refVertDelta[v].y, refVertDelta[v].z, refVertW[v] }, gDelta[v]);
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        cmpRow("rigidDeltaVel", i, refRigidDeltaVel[i], gRigidDeltaVel[i]);
-        cmpRow("rigidDeltaVel", i + N, refRigidDeltaVel[i + N], gRigidDeltaVel[i + N]);
-        if (f2u(gLambda2[i]) != f2u(refAccum[i]))
-        { ++mm2; std::printf("  solve appliedForces[%u] MM: ref %g got %g\n", i, refAccum[i], gLambda2[i]); }
-    }
-
-    // teeth 1: every reacting lane must produce a REACTION, and it must point INTO the
-    // floor -- the cloth is pushed out along the plane normal, the body the other way.
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        if (!reactsOf[i])
-            continue;
-        PXG_CHECK_MSG(f2u(gRigidDeltaVel[i].w) == f2u(1.0f),
-                      "dynamic lane %u must report count 1 (got %g)", i, gRigidDeltaVel[i].w);
-        const float lin = gRigidDeltaVel[i].x * planeNormals[i].x + gRigidDeltaVel[i].y * planeNormals[i].y
-                        + gRigidDeltaVel[i].z * planeNormals[i].z;
-        // Lane 10 is the SEPARATING lane: it unwinds an already-accumulated lambda, so its
-        // deltaLambdaN is negative and the reaction points the OTHER way -- the sign flip is
-        // the whole reason that lane exists, so it is asserted, not exempted.
-        if (separatingOf[i])
-            PXG_CHECK_MSG(lin > 0.0f,
-                          "separating lane %u must UNWIND, i.e. react along the normal "
-                          "(dot = %g, isTGS=%d)", i, lin, int(isTGS));
-        else
-            PXG_CHECK_MSG(lin < 0.0f,
-                          "dynamic lane %u reaction must oppose the cloth push (dot = %g, isTGS=%d)",
-                          i, lin, int(isTGS));
-        const F4 a = gRigidDeltaVel[i + N];
-        PXG_CHECK_MSG(f2u(a.x) != 0u || f2u(a.y) != 0u || f2u(a.z) != 0u,
-                      "dynamic lane %u angular reaction must be non-zero", i);
-    }
-    // teeth 2: every silent lane stays exactly zero, count included.
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        if (reactsOf[i])
-            continue;
-        for (uint32_t half = 0; half < 2u; ++half)
-        {
-            const F4 v = gRigidDeltaVel[i + half * N];
-            PXG_CHECK_MSG(f2u(v.x) == 0u && f2u(v.y) == 0u && f2u(v.z) == 0u && f2u(v.w) == 0u,
-                          "silent lane %u half %u must stay zero (got %g,%g,%g,%g)",
-                          i, half, v.x, v.y, v.z, v.w);
-        }
-    }
-    // teeth 3: the two basis branches are both reached, and the boundary lane sits exactly
-    // on the literal -- otherwise a mutant of either normalisation, or of <= vs <, survives.
-    {
-        uint32_t firstBranch = 0u, secondBranch = 0u;
-        for (uint32_t i = 0; i < N; ++i)
-        {
-            const float dy = -planeNormals[i].y;   // the SOLVER normal's y
-            if (std::fabs(dy) <= 0.9999f) ++firstBranch; else ++secondBranch;
-        }
-        PXG_CHECK_MSG(firstBranch >= 6u && secondBranch >= 1u,
-                      "computeBasisVectors coverage: %u lanes on the first branch, %u on the second",
-                      firstBranch, secondBranch);
-        PXG_CHECK_MSG(f2u(std::fabs(-planeNormals[7].y)) == f2u(0.9999f),
-                      "lane 7 must sit EXACTLY on the 0.9999 boundary (got %.9g)",
-                      double(std::fabs(-planeNormals[7].y)));
-    }
-    PXG_CHECK_MSG(mm2 == 0, "dynamic cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm2);
-
-    // ================= second solve: the NULL rigid material table ==============
-    // The .cu passes `&rigidBodyMaterials[contactInfo.getRigidMaterialIndex()]`, so the
-    // pointer readRigidBody tests is NULL only when the table is null AND the index is 0 --
-    // which is why the port guards on `base + index * stride`, not on the base.  On that
-    // path the rigid half is friction 0 with combine mode eMAX, so the combined friction is
-    // max(0, deformableFriction) = the DEFORMABLE value, unhalved.
-    //
-    // The old single-lane static fixture already ran with both tables null, but there the
-    // deformable friction was 0 too, and every combine mode returns 0 from (0, 0) -- the
-    // eMAX default was unobservable.  Here `materials` stays live and the VERTEX lanes read
-    // cloth.mDynamicFrictions, which readCloth reaches without the material table at all,
-    // so the default mode finally reaches the output.
-    // Pass 2 repeats with the DEFORMABLE table null as well.  There the .cu's
-    // `materials ? ... : 0.0f` is the only thing standing between the port and a read off
-    // address 8, and both readCloth branches carry that guard -- the vertex branch guards
-    // the mDynamicFrictions read on `materials` too, which is easy to miss because the
-    // array it reads does not come from that pointer at all.
-    for (uint32_t pass = 0; pass < 2u; ++pass)
-    {
-        const bool nullFemMats = (pass == 1u);
-        auto infosNull = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, N);
-        for (uint32_t i = 0; i < N; ++i)
-            infosNull[i].rigidMatInd_isInCollision &= 0x80000000u;   // index 0, activity kept
-        dev->upload(bInfos.h, infosNull.data(), infosNull.size() * sizeof(FemOtherContactInfoHost));
-
-        // Restore the exact post-QUERY state the first solve started from.
-        {
-            std::vector<F4> d(NV);
-            for (uint32_t v = 0; v < NV; ++v) d[v] = F4{ 0.0f, 0.0f, 0.0f, refVertW[v] };
-            dev->upload(bDelta.h, d.data(), d.size() * sizeof(F4));
-            std::vector<float> seeded(seededLambda, seededLambda + N);
-            dev->upload(bLambda.h, seeded.data(), seeded.size() * sizeof(float));
-            std::vector<F4> z(2u * N, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
-            dev->upload(bRigidDeltaVel.h, z.data(), z.size() * sizeof(F4));
-        }
-
-        SolvePush spn = sp;
-        spn.rigidBodyMaterials = 0ull;
-        if (nullFemMats)
-        {
-            spn.materials = 0ull;
-            // With the table null the .cu never dereferences it, so the per-triangle index
-            // is free -- and a port that dropped the guard would compute
-            // 0 + 65535 * 32 + 8 and fault.  That is the ONLY observable a dropped null
-            // guard has: with a small index the wild read lands in mapped memory and reads
-            // back 0, which is exactly what the guard would have produced.
-            const uint32_t poison = 65535u | (65535u << 16);
-            dev->upload(bClothMatIdx.h, &poison, sizeof(poison));
-        }
-        Kernel kSolveNull("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
-        kSolveNull.dispatch(1u, {}, spn, 1u, 1u);
-        dev->flush();
-
-        std::vector<F4> refNullVel(2u * N);
-        std::vector<float> refNullAccum(N);
-        uint32_t nullBound = 0u, nullHalved = 0u;
-        for (uint32_t i = 0; i < N; ++i)
-        {
-            const float rigidRefCount =
-                (globalIdOf[i] != -1 && laneInvMass0(i) != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
-            uint32_t vs[3];
-            const uint32_t nv = laneVerts(i, vs);
-            float im[3] = { 0.0f, 0.0f, 0.0f };
-            for (uint32_t k = 0; k < nv; ++k) im[k] = invMass * refVertW[vs[k]];
-            const p714ref::V3 dim = { im[0], im[1], im[2] };
-            // rigid friction 0, mode eMAX -- the null default, spelled out.  With the
-            // deformable table null BOTH readCloth branches return 0, vertex included.
-            const float mu = p714ref::refCombineFriction(
-                0.0f, nullFemMats ? 0.0f : laneClothFriction(i), 3u);
-            const p714ref::InitResult sir =
-                p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
-                                       laneAccum(i), dim, rigidRefCount, /*wasActive*/ true,
-                                       /*checkOnly*/ false, laneVel(i), mu);
-            if (sir.frictionBound) ++nullBound;
-            // The mutant that defaults to eAVERAGE would halve mu here; count the lanes on
-            // which that is actually observable, i.e. where the clamp binds on a non-zero mu.
-            if (sir.frictionBound && mu != 0.0f) ++nullHalved;
-            const bool isArti = laneIsArti(i);
-            const bool reacts = (laneInvMass0(i) != 0.0f) && (nodeInds[i] != staticNodeInd);
-            p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
-            float count = 0.0f;
-            if (reacts)
-            {
-                count = 1.0f;
-                p714ref::refComputeRigidChange(sir, isArti, laneInvMass0(i),
-                                               rigidRefCount, dLin, dAng);
-            }
-            refNullVel[i] = { dLin.x, dLin.y, dLin.z, count };
-            refNullVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
-            refNullAccum[i] = sir.accum;
-        }
-        // Pass 1 must bind, or eMAX and eAVERAGE are indistinguishable.  Pass 2 cannot
-        // bind at all -- every friction is 0 there, which is exactly the point.
-        if (!nullFemMats)
-            PXG_CHECK_MSG(nullHalved >= 2u,
-                          "the null-rigid-material pass must BIND the clamp on at least two "
-                          "lanes, else eMAX and eAVERAGE are indistinguishable there "
-                          "(bound %u)", nullHalved);
-        else
-            PXG_CHECK_MSG(nullHalved == 0u,
-                          "with both material tables null every friction must be 0 (%u bound)",
-                          nullHalved);
-
-        const auto gNullVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
-        const auto gNullAccum = downloadBuffer<float>(dev, bLambda.h, N);
-        size_t mmn = 0;
-        for (uint32_t k = 0; k < 2u * N; ++k)
-        {
-            const F4& r = refNullVel[k]; const F4& g = gNullVel[k];
-            if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-            { ++mmn; std::printf("  null-mat pass %u rigidDeltaVel[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
-                                 pass, k, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-        }
-        for (uint32_t i = 0; i < N; ++i)
-            if (f2u(refNullAccum[i]) != f2u(gNullAccum[i]))
-            { ++mmn; std::printf("  null-mat pass %u appliedForces[%u] MM: ref %g got %g\n",
-                                 pass, i, refNullAccum[i], gNullAccum[i]); }
-        PXG_CHECK_MSG(mmn == 0, "null material pass %u bit-exact vs CPU (%zu mismatches)", pass, mmn);
-        if (nullFemMats)
-            dev->upload(bClothMatIdx.h, clothMatIdxWords.data(), clothMatIdxWords.size() * sizeof(uint32_t));
-    }
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
-    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
-    dev->destroyBuffer(bLambda.h); dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bRefCounts.h);
-    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
-    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h);
-    dev->destroyBuffer(bSolverBodyIndices.h);
-    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
-    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
-    dev->destroyBuffer(bClothFric.h); dev->destroyBuffer(bRigidMats.h); dev->destroyBuffer(bClothMats.h);
-    dev->destroyBuffer(bArtiLinks.h); dev->destroyBuffer(bArtiB2W.h); dev->destroyBuffer(bArtiResp.h);
-    dev->destroyBuffer(bArtiRecs.h); dev->destroyBuffer(bBodySims.h); dev->destroyBuffer(bOutArtiVel.h);
-    dev->destroyBuffer(bArtiCoreDesc.h);
-}
-
-PXG_TEST(femClothSimRigidContactDynamicPGS) { runRigidContactDynamic(/*isTGS*/ false); }
-PXG_TEST(femClothSimRigidContactDynamicTGS) { runRigidContactDynamic(/*isTGS*/ true); }
-
-// ---------------------------------------------------------------------------
-// P9.86c -- the deltaLambdaN PxMax zero tie (pxgSlangFemRigidContact.slang contactInitialize,
-// CUDA FEMCollision::initialize, deformableUtils.cuh:374):
-//
-//   deltaLambdaN = PxMax(-CN * invDenom, -accumulatedDeltaLambdaN)
-//
-// PxMax(float) is intrinsics::selectMax, `a > b ? a : b` (PxUnixMathIntrinsics.h:122): on the
-// tie (a, b) = (+0, -0) it keeps b = -0.  The pre-fix port spelled it max(), GLSL FMax, which
-// llvmpipe answers with +0 (F4).  For a DYNAMIC body invDenom > 0, so a = +0 needs CN == -0
-// exactly, and b = -0 is the ordinary appliedForces = +0.  That is a cloth vertex RESTING
-// exactly on a box (pen = -0, zero relative normal motion) which slides in +x, with the
-// contact already in collision from an earlier iteration.  The tie alone is absorbed
-// (appliedForces = +0 + +-0, |dLN| in the friction clamp, mDeltaPos is a +0-seeded atomic
-// add); it surfaces in computeRigidChange, where deltaLambdaT = -min(dLT, mu*|dLN|) = -0 on
-// the live tangent branch and every n_i*dLN + t_i*(-0) / raXn_i*dLN + raXt_i*(-0) with a
-// sign-clear second factor carries the sign of dLN into rigidDeltaVel:
-//   CUDA / HEAD : rigidDeltaVel[0].xyz = (+0,+0,+0), [1].xyz = (-0,-0,+0)
-//   pre-fix port: rigidDeltaVel[0].xyz = (-0,-0,-0), [1].xyz = (+0,+0,+0)
-//
-// Every zero sign is chosen on purpose:
-//   plane normal (0,1,0), pen w = -0          -> solver normal (-0,-1,-0), initPen = -0
-//   body 1 frame p = contact p - (0,0.5,0)    -> ra = (+0,0.5,+0), raXn = (+0,+0,+0)
-//   diagonal sqrtInvInertia                   -> raXnF0 = (+0,+0,-0.6), raXnF1 = (0.75,+0,+0)
-//   PGS linVel = (+0,+0,+0) + (0.5,+0,+0), angVel = (-0)+(-0)
-//   TGS linVel = (0.5,+0,+0), angVel = linDelta = angDelta = (-0,-0,-0)
-// and the cloth vertex's accumulated delta is (+0,+0,+0) at the prepare but (-0,-0,-0) at the
-// solve (a later iteration: a zero reached through a negation).  BOTH modes need that
-// re-upload: d.n at the prepare and (-d).n (PGS) or (linDelta - d).n (TGS, with linDelta
-// = -0) at the solve cannot both be -0 for one unchanged d, and with d = +0 at the solve the
-// solve error is +0, CN = +0, a = -0 and there is no tie.
-// ---------------------------------------------------------------------------
-static void runRigidContactZeroSign(bool isTGS)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const uint32_t N = 1u, NV = 1u;
-    const uint32_t numSolverBodies = 2u;
-    const uint32_t accOffset = 0u;
-    const float rigidInvMass = 0.25f;
-    const float invMass = 0.5f;
-
-    std::vector<F4> positions = { F4{ 0.25f, 0.5f, -0.75f, invMass } };
-    std::vector<F4> velocities = { F4{ 0.0f, 0.0f, 0.0f, invMass } };
-    std::vector<F4> accumDelta = { F4{ 0.0f, 0.0f, 0.0f, invMass } };
-    std::vector<F4> deltaPos = { F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
-    std::vector<uint32_t> triVtx(4u, 0u);
-    DevBuf bPos = makeDev(dev, positions);
-    DevBuf bVel = makeDev(dev, velocities);
-    DevBuf bAcc = makeDev(dev, accumDelta);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bTri = makeDev(dev, triVtx);
-
-    const float penBiasClampFEM = -1.0e10f;
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mPenBiasClamp = penBiasClampFEM;
-    c.mNbVerts = NV;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // node 1 -> solver body 1 (dynamic).
-    std::vector<uint32_t> solverBodyIndices = { 0u, 1u };
-    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
-
-    const F4 planeNormal = { 0.0f, 1.0f, 0.0f, -0.0f };   // pen w = -0: exactly touching
-    std::vector<F4> contacts = { F4{ 0.25f, 0.5f, -0.75f, 0.0f } };
-    std::vector<F4> normalPens = { planeNormal };
-    std::vector<F4> barycentrics = { F4{ 0.0f, 0.0f, 0.0f, 1.0f } };   // VERTEX contact
-    std::vector<FemOtherContactInfoHost> infos(N);
-    infos[0].pairInd0 = 1ull;
-    infos[0].pairInd1 = 0u;
-    infos[0].rigidMatInd_isInCollision = 0x80000000u;   // in collision since an earlier iteration
-    DevBuf bContacts = makeDev(dev, contacts);
-    DevBuf bNormalPens = makeDev(dev, normalPens);
-    DevBuf bBary = makeDev(dev, barycentrics);
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { N };
-    DevBuf bNum = makeDev(dev, numContacts);
-
-    std::vector<uint8_t> constraintBytes(sizeof(RigidContactConstraintHost), 0xCD);
-    DevBuf bConstraint = makeDev(dev, constraintBytes);
-    std::vector<float> rigidLambdaNs(N, 123.0f);
-    DevBuf bLambda = makeDev(dev, rigidLambdaNs);
-    std::vector<F4> rigidDeltaVel(2u * N, F4{ 9.f, 9.f, 9.f, 9.f });
-    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
-    std::vector<uint32_t> refCounts(numSolverBodies + 2u, 0u);
-    DevBuf bRefCounts = makeDev(dev, refCounts);
-
-    std::vector<F4> body2World = {
-        { 0.f, 0.f, 0.f, 1.f }, { 0.0f, 0.0f, 0.0f, 0.f },     // body 0 (static slot)
-        { 0.f, 0.f, 0.f, 1.f }, { 0.25f, 0.0f, -0.75f, 0.f },  // body 1: ra = (+0, 0.5, +0)
-    };
-    DevBuf bBody2World = makeDev(dev, body2World);
-
-    const float penBiasClampRigid = -1.0e10f;
-    const float invMassOf[2] = { 0.0f, rigidInvMass };
-    std::vector<uint8_t> solverBodyData(96u * numSolverBodies, 0);
-    for (uint32_t b = 0; b < numSolverBodies; ++b)
-    {
-        std::memcpy(solverBodyData.data() + 96u * b + 12, &penBiasClampRigid, 4);
-        std::memcpy(solverBodyData.data() + 96u * b + 28, &invMassOf[b], 4);
-    }
-    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
-    // Diagonal (axis-aligned) sqrt inverse inertia, +0 off the diagonal.
-    const float sqrtInvInertia1[9] = { 1.5f, 0.0f, 0.0f, 0.0f, 0.8f, 0.0f, 0.0f, 0.0f, 1.2f };
-    std::vector<uint8_t> solverTxIData(64u * numSolverBodies, 0);
-    std::memcpy(solverTxIData.data() + 64u * 1u + 28, sqrtInvInertia1, 9 * 4);
-    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
-
-    // PGS: initial (+0) plus iteration delta; TGS reads the pool rows alone.
-    std::vector<F4> outSolverVelocity(2u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
-    outSolverVelocity[1] = { 0.0f, 0.0f, 0.0f, 0.f };
-    outSolverVelocity[1 + numSolverBodies] = { -0.0f, -0.0f, -0.0f, 0.f };
-    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
-    std::vector<F4> solverBodyVelPool(3u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
-    solverBodyVelPool[1] = { 0.5f, 0.0f, 0.0f, -0.0f };
-    solverBodyVelPool[1 + numSolverBodies] = { -0.0f, -0.0f, -0.0f, -0.0f };
-    solverBodyVelPool[1 + 2u * numSolverBodies] = { -0.0f, -0.0f, -0.0f, -0.0f };
-    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
-
-    p714ref::RefRigidVel rv;
-    if (isTGS)
-    {
-        const F4 v0 = solverBodyVelPool[accOffset + 1u];
-        const F4 v1 = solverBodyVelPool[accOffset + 1u + numSolverBodies];
-        const F4 v2 = solverBodyVelPool[accOffset + 1u + 2u * numSolverBodies];
-        rv.linVel = { v0.x, v0.y, v0.z };
-        rv.angVel = { v0.w, v1.x, v1.y };
-        rv.linDelta = { v1.z, v1.w, v2.x };
-        rv.angDelta = { v2.y, v2.z, v2.w };
-    }
-    else
-    {
-        const F4 iv0 = outSolverVelocity[1], iv1 = outSolverVelocity[1 + numSolverBodies];
-        const F4 dv0 = solverBodyVelPool[accOffset + 1u], dv1 = solverBodyVelPool[accOffset + 1u + numSolverBodies];
-        rv.linVel = { iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z };
-        rv.angVel = { iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z };
-    }
-
-    std::vector<uint8_t> prepDesc(304, 0);
-    pokePtr(prepDesc, 64, bSolverBodyData.addr);
-    pokePtr(prepDesc, 72, bSolverTxIData.addr);
-    pokePtr(prepDesc, 168, bBody2World.addr);
-    DevBuf bPrepDesc = makeDev(dev, prepDesc);
-    std::vector<uint8_t> prePrepDesc(760, 0);
-    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
-    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
-    std::vector<uint8_t> solverCoreDesc(320, 0);
-    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
-    pokeU32(solverCoreDesc, 268, numSolverBodies);
-    pokeU32(solverCoreDesc, 276, accOffset);
-    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
-    std::vector<uint8_t> sharedDesc(224, 0);
-    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
-    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
-
-    // ======================= PREPARE ==========================
-    struct PrepPush
-    {
-        uint64_t femClothes, contacts, normalPens, barycentrics, contactInfos, numContacts;
-        uint64_t constraints, prePrepDesc, prepDesc, rigidLambdaNs;
-        float invDt; uint32_t pad84;
-        uint64_t sharedDesc;
-        uint32_t isTGS, pad100;
-    };
-    static_assert(sizeof(PrepPush) == 104, "prepare push-constant blob must be 104 bytes");
-    PrepPush pp = {};
-    pp.femClothes = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
-    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
-    pp.rigidLambdaNs = bLambda.addr; pp.invDt = 1.0f / dt; pp.sharedDesc = bSharedDesc.addr;
-    pp.isTGS = isTGS ? 1u : 0u;
-    Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-
-    RigidContactConstraintHost refC;
-    std::memset(&refC, 0xCD, sizeof(refC));
-    const p714ref::V3 solverNormal = { -planeNormal.x, -planeNormal.y, -planeNormal.z };
-    p714ref::refPrepare(refC, 0, solverNormal, p714ref::V3{ positions[0].x, positions[0].y, positions[0].z },
-                        planeNormal.w - contacts[0].w,
-                        p714ref::V3{ accumDelta[0].x, accumDelta[0].y, accumDelta[0].z }, barycentrics[0],
-                        p714ref::V3{ body2World[3].x, body2World[3].y, body2World[3].z }, rigidInvMass,
-                        penBiasClampRigid, sqrtInvInertia1, penBiasClampFEM, /*isStatic*/ false);
-    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidContactConstraintHost));
-    RigidContactConstraintHost gotC;
-    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
-    size_t mm = 0;
-    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm; std::printf("  zero-sign %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
-                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
-    };
-    cmp4("raXn_resp", refC.raXn_resp[0], gotC.raXn_resp[0]);
-    cmp4("raXnF0_resp", refC.raXnF0_resp[0], gotC.raXnF0_resp[0]);
-    cmp4("raXnF1_resp", refC.raXnF1_resp[0], gotC.raXnF1_resp[0]);
-    cmp4("normal_errorW", refC.normal_errorW[0], gotC.normal_errorW[0]);
-    cmp4("fricTan0_invMass0", refC.fricTan0_invMass0[0], gotC.fricTan0_invMass0[0]);
-    cmp4("barycentric", refC.barycentric[0], gotC.barycentric[0]);
-    if (f2u(refC.maxPenBias[0]) != f2u(gotC.maxPenBias[0])) { ++mm; std::printf("  zero-sign maxPenBias MM\n"); }
-    PXG_CHECK_MSG(mm == 0, "zero-sign prepare bit-exact vs CPU (%zu mismatches)", mm);
-    PXG_CHECK_MSG(f2u(gotC.normal_errorW[0].w) == 0x80000000u,
-                  "coverage: the resting contact must prepare initPen = -0 (got 0x%08x)",
-                  f2u(gotC.normal_errorW[0].w));
-    PXG_CHECK_MSG(f2u(gotC.raXn_resp[0].x) == 0u && f2u(gotC.raXn_resp[0].y) == 0u
-                      && f2u(gotC.raXn_resp[0].z) == 0u,
-                  "coverage: raXn must be (+0,+0,+0)");
-
-    // A later iteration: the vertex's accumulated delta is a zero reached by negation.
-    const std::vector<F4> accumSolve = { F4{ -0.0f, -0.0f, -0.0f, invMass } };
-    dev->upload(bAcc.h, accumSolve.data(), accumSolve.size() * sizeof(F4));
-    const p714ref::V3 accumS = { accumSolve[0].x, accumSolve[0].y, accumSolve[0].z };
-
-    // ======================= QUERY (refcount) =================
-    struct QueryPush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc;
-        float dt; uint32_t pad68;
-        uint64_t appliedForces, rigidBodyReferenceCounts;
-    };
-    static_assert(sizeof(QueryPush) == 88, "query push-constant blob must be 88 bytes");
-    QueryPush qp = {};
-    qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
-    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
-    qp.artiCoreDesc = 0ull; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
-    qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
-    Kernel kQuery("femClothRigidContactBda.spv",
-                  isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
-                        : "cloth_queryRigidClothContactReferenceCountLaunch", {}, sizeof(QueryPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, NV);
-    const auto gRefCountsQ = downloadBuffer<uint32_t>(dev, bRefCounts.h, uint32_t(refCounts.size()));
-    const auto gInfosQ = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, N);
-    PXG_CHECK_MSG(f2u(gDeltaQ[0].w) == f2u(1.0f), "query must bump the vertex count to 1 (got %g)", gDeltaQ[0].w);
-    PXG_CHECK_MSG(gRefCountsQ[1] == 1u, "query must count the dynamic body once (got %u)", gRefCountsQ[1]);
-    PXG_CHECK_MSG((gInfosQ[0].rigidMatInd_isInCollision & 0x80000000u) != 0u, "contact must stay in collision");
-
-    // ======================= SOLVE (null material tables: mu = 0) =====
-    struct SolvePush
-    {
-        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
-        uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
-        float dt; uint32_t pad92;
-        uint64_t materials, rigidBodyMaterials;
-    };
-    static_assert(sizeof(SolvePush) == 112, "solve push-constant blob must be 112 bytes");
-    SolvePush sp = {};
-    sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
-    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
-    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
-    sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
-    sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
-    Kernel kSolve("femClothRigidContactBda.spv",
-                  isTGS ? "cloth_solveRigidClothCollisionTGSLaunch" : "cloth_solveRigidClothCollisionLaunch",
-                  {}, sizeof(SolvePush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    // ---- reference image, CUDA semantics (variant 0) or the pre-fix port (variant 1) ----
-    struct Image { F4 lin, ang, vert; float accum; };
-    p714ref::InitResult sir0{};
-    auto image = [&](int variant, p714ref::InitResult* out) {
-        p714ref::gDlnVariant = variant;
-        const p714ref::InitResult sir =
-            p714ref::refInitialize(refC, 0, isTGS, /*appliedForceRef*/ 0.0f, dt, p714ref::V3{ 1.0f, 0.0f, 0.0f },
-                                   accumS, p714ref::V3{ invMass * 1.0f, 0.0f, 0.0f }, /*rigidRefCount*/ 1.0f,
-                                   /*wasActive*/ true, /*checkOnly*/ false, rv,
-                                   p714ref::refCombineFriction(0.0f, 0.0f, 3u));
-        p714ref::gDlnVariant = 0;
-        if (out) *out = sir;
-        p714ref::V3 dLin, dAng;
-        p714ref::refComputeRigidChange(sir, /*isArticulation*/ false, rigidInvMass, 1.0f, dLin, dAng);
-        const p714ref::V3 dp = {
-            -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
-            -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
-            -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
-        const float s = invMass * 1.0f;
-        Image im;
-        im.lin = F4{ dLin.x, dLin.y, dLin.z, 1.0f };
-        im.ang = F4{ dAng.x, dAng.y, dAng.z, 0.0f };
-        // mDeltaPos is +0-seeded (the query only bumped w): 0 + deltaPos * s per lane.
-        im.vert = F4{ 0.0f + dp.x * s, 0.0f + dp.y * s, 0.0f + dp.z * s, 1.0f };
-        im.accum = sir.accum;
-        return im;
-    };
-    const Image want = image(0, &sir0);
-    const Image twin = image(1, nullptr);
-
-    // Coverage: the tie is presented AND the tangent branch carries it into the reaction.
-    const uint32_t zeroTieLanes = (sir0.dlnZeroTie && sir0.tanBranch && f2u(sir0.deltaLambdaN) == 0x80000000u
-                                   && f2u(sir0.deltaLambdaT) == 0x80000000u) ? 1u : 0u;
-    PXG_CHECK_MSG(zeroTieLanes == 1u,
-                  "coverage: the resting lane must present the (+0,-0) PxMax tie with the tangent branch "
-                  "live (tie %d tan %d dLN 0x%08x dLT 0x%08x, isTGS=%d)", int(sir0.dlnZeroTie),
-                  int(sir0.tanBranch), f2u(sir0.deltaLambdaN), f2u(sir0.deltaLambdaT), int(isTGS));
-    PXG_CHECK_MSG(std::memcmp(&want.lin, &twin.lin, sizeof(F4)) != 0
-                      || std::memcmp(&want.ang, &twin.ang, sizeof(F4)) != 0,
-                  "the FMax twin must change the rigid reaction image");
-    PXG_CHECK_MSG(f2u(want.lin.x) == 0u && f2u(want.lin.y) == 0u && f2u(want.lin.z) == 0u
-                      && f2u(want.ang.x) == 0x80000000u && f2u(want.ang.y) == 0x80000000u
-                      && f2u(want.ang.z) == 0u,
-                  "CUDA image: lin (+0,+0,+0), ang (-0,-0,+0)");
-    PXG_CHECK_MSG(f2u(twin.lin.x) == 0x80000000u && f2u(twin.lin.y) == 0x80000000u
-                      && f2u(twin.lin.z) == 0x80000000u
-                      && f2u(twin.ang.x) == 0u && f2u(twin.ang.y) == 0u && f2u(twin.ang.z) == 0u,
-                  "twin image: lin (-0,-0,-0), ang (+0,+0,+0)");
-
-    // ---- GPU vs the CUDA image, bitwise ----
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, NV);
-    const auto gLambda = downloadBuffer<float>(dev, bLambda.h, N);
-    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
-    size_t mm2 = 0;
-    auto cmpRow = [&](const char* nm, const F4& r, const F4& g) {
-        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
-        { ++mm2; std::printf("  zero-sign solve %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g) "
-                             "bits got %08x %08x %08x\n", nm, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w,
-                             f2u(g.x), f2u(g.y), f2u(g.z)); }
-    };
-    cmpRow("rigidDeltaVel[0]", want.lin, gRigidDeltaVel[0]);
-    cmpRow("rigidDeltaVel[1]", want.ang, gRigidDeltaVel[1]);
-    cmpRow("mDeltaPos[0]", want.vert, gDelta[0]);
-    if (f2u(gLambda[0]) != f2u(want.accum))
-    { ++mm2; std::printf("  zero-sign appliedForces MM: ref %g got %g\n", want.accum, gLambda[0]); }
-    PXG_CHECK_MSG(f2u(gRigidDeltaVel[1].x) == 0x80000000u && f2u(gRigidDeltaVel[0].y) == 0u,
-                  "GPU reaction must carry dLN = -0 (ang.x -0, lin.y +0; got 0x%08x 0x%08x, isTGS=%d)",
-                  f2u(gRigidDeltaVel[1].x), f2u(gRigidDeltaVel[0].y), int(isTGS));
-    PXG_CHECK_MSG(mm2 == 0, "zero-sign cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
-                  isTGS ? "TGS" : "PGS", mm2);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
-    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
-    dev->destroyBuffer(bLambda.h); dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bRefCounts.h);
-    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
-    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h);
-    dev->destroyBuffer(bSolverBodyIndices.h);
-    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
-    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
-}
-
-PXG_TEST(femClothSimRigidContactZeroSignPGS) { runRigidContactZeroSign(/*isTGS*/ false); }
-PXG_TEST(femClothSimRigidContactZeroSignTGS) { runRigidContactZeroSign(/*isTGS*/ true); }
-
-// ===========================================================================
 // P7.2 tranche 1: cloth SELF-collision midphase + contact GENERATION.
 //   femClothSelfCollisionBda.spv:
 //     cloth_selfCollisionMidphaseVTLaunch  (femClothClothMidPhase.cu:1163)
 //     cloth_selfCollisionMidphaseEELaunch  (femClothClothMidPhase.cu:1196)
 // Both kernels walk the cloth's own BV32 triangle BVH (one 32-thread group per
-// query) and append a PxgFemFemContactInfo for every penetrating vertex-triangle
-// (VT) / crossing edge-edge (EE) pair.  The midphase emits ONLY the integer contact
-// record (pairInd0 / pairInd1 / auxInd — the pair-type + validity bits and, for EE,
-// the local edge indices); the normal / distance / barycentric are computed later in
+// query) and append a PxgDeformablePairInfo (5.12) for every penetrating vertex-triangle
+// (VT) / crossing edge-edge (EE) pair.  The midphase emits ONLY the two references
+// (VT: vertex + triangle; EE: two triangle-edge refs carrying the local edge indices);
+// the normal / distance / barycentric are computed later in
 // the (out-of-scope) self-contact prepare.  FULLY bit-exact: the VT/EE closest-point
 // tests are pure mul/add/sub/div/sqrt/min/max — no transcendental, no tolerance seam.
 // Checked bit-exact vs a CPU transcription of the .cu math in BOTH memory modes.
 // ===========================================================================
 
-// PxgFemFemContactInfo host mirror (PxgFEMCore.h:51, PX_ALIGN(16), 16 bytes).
-// PxgFEMCore.h is not test-includable (pulls the CUDA buffer stack), so the layout
-// the shader writes at index*16 is mirrored locally and pinned self-consistently.
-struct FemFemContactInfoHost
-{
-    uint64_t pairInd0;   // @0
-    uint32_t pairInd1;   // @8
-    uint32_t auxInd;     // @12 -> 16
-};
-static_assert(sizeof(FemFemContactInfoHost) == 16, "PxgFemFemContactInfo mirror == 16B");
-static_assert(offsetof(FemFemContactInfoHost, pairInd0) == 0, "pairInd0 @0");
-static_assert(offsetof(FemFemContactInfoHost, pairInd1) == 8, "pairInd1 @8");
-static_assert(offsetof(FemFemContactInfoHost, auxInd) == 12, "auxInd @12");
-
 // self-collision push blob — byte-identical to SelfCollisionParams
-// (ABI row {4,8,8,8,8,4,8,8,8} -> 72 bytes).
+// (ABI row {4,8,8,8,8,8,8} -> 56 bytes, 5.12: the clothClothPairs / numClothClothPairs
+// arguments are gone and the output is a PxgDeformablePairInfo stream).
 struct SelfCollisionPush
 {
     uint32_t maxContacts, pad4;
-    uint64_t activeClothes, contactDistance, clothes, clothClothPairs;
-    uint32_t numClothClothPairs, pad44;
+    uint64_t activeClothes, contactDistance, clothes;
     uint64_t updateContactPairs, outContactInfo, totalContactCount;
 };
-static_assert(sizeof(SelfCollisionPush) == 72, "self-collision push blob must be 72 bytes");
-static_assert(offsetof(SelfCollisionPush, updateContactPairs) == 48, "updateContactPairs @48");
-static_assert(offsetof(SelfCollisionPush, totalContactCount) == 64, "totalContactCount @64");
+static_assert(sizeof(SelfCollisionPush) == 56, "self-collision push blob must be 56 bytes");
+static_assert(offsetof(SelfCollisionPush, updateContactPairs) == 32, "updateContactPairs @32");
+static_assert(offsetof(SelfCollisionPush, totalContactCount) == 48, "totalContactCount @48");
 
 // A four-uint triangle-index record (uint4: x/y/z vertex ids, w = edge authorship).
 struct TriIdx4 { uint32_t x, y, z, w; };
-
-// PxgFemFemContactInfo::auxInd bit packing (PxgFEMCore.h:69-82) — the exact constants
-// the shader uses, pinned here so the CPU reference builds the same word.
-static const uint32_t AUX_IND0_BITS_H = 14u;
-static const uint32_t AUX_IND1_BITS_H = 15u;
-static const uint32_t AUX_IND0_MASK_H = (1u << AUX_IND0_BITS_H) - 1u;
-static const uint32_t AUX_IND1_MASK_H = ((1u << AUX_IND1_BITS_H) - 1u) << AUX_IND0_BITS_H;
-static const uint32_t PAIR_TYPE_FLAG_MASK_H = 1u << 30;
 
 // Gu::BV32DataPacked (1168 bytes) with a SINGLE leaf child covering all nbTriangles
 // triangles (primStart 0), boxed by [boxLo, boxHi]^3.  The buffer is prefixed with a
@@ -6602,8 +3341,6 @@ static SelfCollisionPush makeSelfCollisionPush(uint32_t maxContacts, uint64_t ac
     p.activeClothes = activeClothes;
     p.contactDistance = contactDistance;
     p.clothes = clothes;
-    p.clothClothPairs = 0ull;      // unused by the traversers (ABI parity)
-    p.numClothClothPairs = 0u;
     p.updateContactPairs = updateContactPairs;
     p.outContactInfo = outContactInfo;
     p.totalContactCount = totalContactCount;
@@ -6626,7 +3363,7 @@ PXG_TEST(femClothSimSelfCollisionVT)
         { 0.25f, 0.25f, 0.05f, 1.0f },   // v3 penetrating
     };
     std::vector<F4> rest = pos; // distinct rest positions -> rest-pose filter (dist>0) passes
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u } }; // edge authorship 0x7 (VT ignores .w)
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u } }; // all three edges owned (VT ignores .w)
     std::vector<uint32_t> tree = makeBv32TreeWords(/*nbTriangles*/ 1u, -1000.0f, 1000.0f);
 
     DevBuf bPos = makeDev(dev, pos);
@@ -6638,7 +3375,7 @@ PXG_TEST(femClothSimSelfCollisionVT)
     c.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
     c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bTri.addr));
     c.mNbVerts = 4u;
     c.mElementIndex = 0u;
     c.mSelfCollisionFilterDistance = 0.0f; // filterDistSq 0 -> any positive rest distance passes
@@ -6653,8 +3390,8 @@ PXG_TEST(femClothSimSelfCollisionVT)
     DevBuf bUpd = makeDev(dev, upd);
 
     const uint32_t MAXC = 64u;
-    std::vector<FemFemContactInfoHost> outInfo(MAXC);
-    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost)); // poison
+    std::vector<FemPairInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemPairInfoHost)); // poison
     DevBuf bOut = makeDev(dev, outInfo);
     std::vector<uint32_t> count = { 0u };
     DevBuf bCount = makeDev(dev, count);
@@ -6693,14 +3430,12 @@ PXG_TEST(femClothSimSelfCollisionVT)
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
     PXG_CHECK_MSG(gCount == 1u, "VT self-collision emitted %u contacts (expected 1)", gCount);
 
-    const FemFemContactInfoHost gi = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, 1)[0];
+    const FemPairInfoHost gi = downloadBuffer<FemPairInfoHost>(dev, bOut.h, 1)[0];
     size_t mm = 0;
-    const uint64_t refPair0 = (0ull << 20) | 3ull;   // encode(cloth 0, vertex 3)
-    const uint32_t refPair1 = (0u << 20) | 0u;        // encode(cloth 0, triangle 0)
-    const uint32_t refAux = 0u;                       // VT pair (bit30=0), invalid (self, bit31=0), zero-init
-    if (gi.pairInd0 != refPair0) { ++mm; std::printf("  VT pairInd0 MM got %llu ref %llu\n", (unsigned long long)gi.pairInd0, (unsigned long long)refPair0); }
-    if (gi.pairInd1 != refPair1) { ++mm; std::printf("  VT pairInd1 MM got %u ref %u\n", gi.pairInd1, refPair1); }
-    if (gi.auxInd != refAux) { ++mm; std::printf("  VT auxInd MM got 0x%08x ref 0x%08x\n", gi.auxInd, refAux); }
+    const uint64_t refRef0 = encClothVertex(0u, 3u);     // cloth 0, vertex 3
+    const uint64_t refRef1 = encClothTriangle(0u, 0u);   // cloth 0, triangle 0 (no flag bits)
+    if (gi.ref0 != refRef0) { ++mm; std::printf("  VT ref0 MM got 0x%llx ref 0x%llx\n", (unsigned long long)gi.ref0, (unsigned long long)refRef0); }
+    if (gi.ref1 != refRef1) { ++mm; std::printf("  VT ref1 MM got 0x%llx ref 0x%llx\n", (unsigned long long)gi.ref1, (unsigned long long)refRef1); }
     PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseVT bit-exact vs CPU (%zu mismatches)", mm);
 
     // ---- non-penetrating case: lift vertex 3 above the fattened bound -> zero contacts ----
@@ -6747,7 +3482,7 @@ PXG_TEST(femClothSimSelfCollisionEE)
         { -0.2f, -0.3f, 0.03f, 1.0f },  // v5 (T1)
     };
     std::vector<F4> rest = pos;
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u }, { 3u, 4u, 5u, 0x7u } }; // all edges active
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u }, { 3u, 4u, 5u, 0x7u } }; // all edges owned (5.12 ownsEdge bits)
     std::vector<uint32_t> twae = { 0u, 1u }; // both triangles have active edges
     std::vector<uint32_t> tree = makeBv32TreeWords(/*nbTriangles*/ 2u, -1000.0f, 1000.0f);
 
@@ -6761,9 +3496,9 @@ PXG_TEST(femClothSimSelfCollisionEE)
     c.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
     c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c.mTrianglesWithActiveEdges)>(size_t(bTwae.addr));
-    c.mNbTrianglesWithActiveEdges = 2u;
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bTri.addr));
+    c.mTrianglesWithOwnedEdges = reinterpret_cast<decltype(c.mTrianglesWithOwnedEdges)>(size_t(bTwae.addr));
+    c.mNbTrianglesWithOwnedEdges = 2u;
     c.mElementIndex = 0u;
     c.mSelfCollisionFilterDistance = 0.0f;
     std::vector<PxgFEMCloth> descArr = { c };
@@ -6777,8 +3512,8 @@ PXG_TEST(femClothSimSelfCollisionEE)
     DevBuf bUpd = makeDev(dev, upd);
 
     const uint32_t MAXC = 64u;
-    std::vector<FemFemContactInfoHost> outInfo(MAXC);
-    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));
+    std::vector<FemPairInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemPairInfoHost));
     DevBuf bOut = makeDev(dev, outInfo);
     std::vector<uint32_t> count = { 0u };
     DevBuf bCount = makeDev(dev, count);
@@ -6810,9 +3545,7 @@ PXG_TEST(femClothSimSelfCollisionEE)
     const uint32_t vIndices1[3] = { tris[0].x, tris[0].y, tris[0].z }; // found = T0
     V3 t0pts[3] = { v3f(pos[vIndices0[0]]), v3f(pos[vIndices0[1]]), v3f(pos[vIndices0[2]]) };
     V3 t1pts[3] = { v3f(pos[vIndices1[0]]), v3f(pos[vIndices1[1]]), v3f(pos[vIndices1[2]]) };
-    std::vector<FemFemContactInfoHost> refContacts;
-    const uint64_t refPair0 = (0ull << 20) | 1ull;   // encode(cloth 0, t0_index 1)
-    const uint32_t refPair1 = (0u << 20) | 0u;        // encode(cloth 0, primitive 0)
+    std::vector<FemPairInfoHost> refContacts;
     for (uint32_t e1 = 0; e1 < 3; ++e1)           // edges of found T0
     {
         const uint32_t e1v0 = vIndices1[e1], e1v1 = vIndices1[nextE[e1]];
@@ -6829,11 +3562,9 @@ PXG_TEST(femClothSimSelfCollisionEE)
             if (isOutside) continue;
             if (dq < contactDistSq && dq > 1.0e-14f)
             {
-                // filterDistSq 0, distinct rest positions -> passes; build the auxInd.
-                uint32_t aux = PAIR_TYPE_FLAG_MASK_H;
-                aux = (aux & ~AUX_IND0_MASK_H) | (e0 & AUX_IND0_MASK_H);
-                aux = (aux & ~AUX_IND1_MASK_H) | ((e1 & ((1u << AUX_IND1_BITS_H) - 1u)) << AUX_IND0_BITS_H);
-                refContacts.push_back(FemFemContactInfoHost{ refPair0, refPair1, aux });
+                // filterDistSq 0, distinct rest positions -> passes; 5.12 encodes both
+                // sides as eTRIANGLE_EDGE refs (query triangle 1, found triangle 0).
+                refContacts.push_back(FemPairInfoHost{ encClothEdge(0u, 1u, e0), encClothEdge(0u, 0u, e1) });
             }
         }
     }
@@ -6843,16 +3574,16 @@ PXG_TEST(femClothSimSelfCollisionEE)
     PXG_CHECK_MSG(gCount == uint32_t(refContacts.size()), "EE self-collision emitted %u contacts (expected %zu)",
                   gCount, refContacts.size());
 
-    const auto gi = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+    const auto gi = downloadBuffer<FemPairInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
     size_t mm = 0;
     for (uint32_t i = 0; i < gCount && i < refContacts.size(); ++i)
     {
-        if (std::memcmp(&gi[i], &refContacts[i], sizeof(FemFemContactInfoHost)) != 0)
+        if (std::memcmp(&gi[i], &refContacts[i], sizeof(FemPairInfoHost)) != 0)
         {
             ++mm;
-            std::printf("  EE contact[%u] MM: got(p0=%llu,p1=%u,aux=0x%08x) ref(p0=%llu,p1=%u,aux=0x%08x)\n", i,
-                        (unsigned long long)gi[i].pairInd0, gi[i].pairInd1, gi[i].auxInd,
-                        (unsigned long long)refContacts[i].pairInd0, refContacts[i].pairInd1, refContacts[i].auxInd);
+            std::printf("  EE contact[%u] MM: got(0x%llx, 0x%llx) ref(0x%llx, 0x%llx)\n", i,
+                        (unsigned long long)gi[i].ref0, (unsigned long long)gi[i].ref1,
+                        (unsigned long long)refContacts[i].ref0, (unsigned long long)refContacts[i].ref1);
         }
     }
     PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseEE bit-exact vs CPU (%zu mismatches)", mm);
@@ -6882,52 +3613,9 @@ PXG_TEST(femClothSimSelfCollisionEE)
     dev->destroyBuffer(bPosOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bCount2.h);
 }
 
-// ===========================================================================
-// P7.2 tranche 2: cloth-vs-CLOTH self-contact SOLVE.
-//   femClothClothContactBda.spv:
-//     cloth_clothContactPrepareLaunch            (FEMClothConstraintPrep.cu:155)
-//     cloth_queryClothClothContact{VT,EE}CountLaunch (FEMClothExternalSolve.cu:902/:964)
-//     cloth_solveClothClothDelta{VT,EE}Launch    (FEMClothExternalSolve.cu:651/:760)
-//     cloth_updateClothContactValidityLaunch     (FEMClothExternalSolve.cu:1114)
-// The prepare marks a not-yet-valid self-contact valid (rest-pose distance filter); the
-// query counts each referenced cloth vertex into mDeltaPos.w and marks the pair
-// in-collision; the VT/EE solve scatters BOTH endpoints' corrections into mDeltaPos so the
-// penetrating vertex + its triangle (VT) / the two crossing edges (EE) get pushed APART.
-// Checked bit-exact vs a CPU transcription of the .cu math (PGS; the cloth self-contact
-// solve has no TGS variant) in BOTH memory modes.  FULLY bit-exact: the closest-point +
-// constraint math is pure mul/add/sub/div/sqrt/abs — the only transcendental (PxRecipSqrt)
-// is on the friction branch, DEAD for the zero-friction self-fold target.
-// ===========================================================================
-
-// auxInd flag bits beyond the tranche-1 masks (@3235): isInCollision (bit29), Valid (bit31).
-static const uint32_t CONTACT_FLAG_MASK_H  = 1u << 29;
-static const uint32_t VALIDITY_FLAG_MASK_H = 1u << 31;
-
-// Push blobs, byte-identical to femClothClothContactBda.slang's [[vk::push_constant]]
-// structs (ABI rows {8,8,8,4,8,8} / {8,8,8} / {8,8,8,4} / {8,8,1,1,8,8,8,4}).
-struct PrepClothClothPush
-{
-    uint64_t clothes, contactInfos, numContacts;
-    uint32_t maxContacts, pad28;
-    uint64_t clothMaterials, updateContactPairs;
-};
-static_assert(sizeof(PrepClothClothPush) == 48, "clothContactPrepare push blob must be 48 bytes");
-static_assert(offsetof(PrepClothClothPush, clothMaterials) == 32, "clothMaterials @32");
-
-struct QueryClothClothPush
-{
-    uint64_t cloths, contactInfos, numContacts;
-};
-static_assert(sizeof(QueryClothClothPush) == 24, "queryClothCloth push blob must be 24 bytes");
-
-struct SolveClothClothPush
-{
-    uint64_t cloths, contactInfos, numContacts;
-    float dt;
-    uint32_t pad28;
-};
-static_assert(sizeof(SolveClothClothPush) == 32, "solveClothCloth push blob must be 32 bytes");
-
+// cloth_updateClothContactValidityLaunch push blob (femClothClothContactBda.slang
+// UpdateValidityParams, ABI row {8,8,1,1,8,8,8,4}): the two bools are bytes 16 / 17 of one
+// word; the word at @20 is padding the kernel never reads.
 struct UpdateValidityPush
 {
     uint64_t femCloths, activeIds;
@@ -6938,1062 +3626,6 @@ struct UpdateValidityPush
 };
 static_assert(sizeof(UpdateValidityPush) == 56, "updateContactValidity push blob must be 56 bytes");
 static_assert(offsetof(UpdateValidityPush, updateContactPairs) == 24, "updateContactPairs @24");
-static_assert(offsetof(UpdateValidityPush, dt) == 48, "dt @48");
-
-// ---------------------------------------------------------------------------
-// Bit-exact CPU transcription of the count + solve arithmetic
-// (FEMClothExternalSolve.cu countContact + triangleCollisionConstraint +
-// applyContactDelta).  Reuses the p72ref vector helpers; built -ffp-contract=off.
-// ---------------------------------------------------------------------------
-namespace p72solve
-{
-using p72ref::V3;
-using p72ref::sub;
-using p72ref::add;
-using p72ref::mul;    // mul(v, s) = { v.x*s, v.y*s, v.z*s }
-using p72ref::dot;
-using p72ref::divv;   // P9.36: divv(v, s) = v * (1/s), as PxVec3::operator/ is
-static const float THR = 1.0e-14f;
-
-// weights-weighted displacement (cloth0 - cloth1), left-associative like the shader.
-static V3 dispFromWeights(const float w[4], V3 xx0, V3 xx1, V3 xx2, V3 xx3)
-{
-    return add(add(add(mul(xx0, w[0]), mul(xx1, w[1])), mul(xx2, w[2])), mul(xx3, w[3]));
-}
-
-// triangleCollisionConstraint (frictionless path): out dx[4].  invM = count-split masses.
-static void constraint(V3& dx0, V3& dx1, V3& dx2, V3& dx3, V3 disp, V3 normal, const float invM[4],
-                       float restDist, const float w[4])
-{
-    dx0 = dx1 = dx2 = dx3 = V3{ 0.0f, 0.0f, 0.0f };
-    const float CN = dot(disp, normal) - restDist;
-    float denom = invM[0] * w[0] * w[0];
-    denom += invM[1] * w[1] * w[1];
-    denom += invM[2] * w[2] * w[2];
-    denom += invM[3] * w[3] * w[3];
-    if (denom < THR)
-        return;
-    const float invDenom = 1.0f / denom;
-    const float deltaLambdaN = -CN * invDenom;
-    const V3 commonVec = mul(normal, deltaLambdaN);
-    dx0 = mul(commonVec, invM[0] * w[0]);
-    dx1 = mul(commonVec, invM[1] * w[1]);
-    dx2 = mul(commonVec, invM[2] * w[2]);
-    dx3 = mul(commonVec, invM[3] * w[3]);
-}
-} // namespace p72solve
-
-// A self-contact reference outcome: the four endpoints' (vertexSlot, mDeltaPos.w count,
-// mDeltaPos.xyz correction).
-struct SelfContactRef
-{
-    uint32_t slot[4];
-    float countW[4];
-    p72ref::V3 dx[4];
-    bool inCollision;
-};
-
-// Transcribe the query (countContact) + solve (constraint + applyContactDelta) for one
-// self-contact given the four endpoint positions / inverse masses / weights, the normal
-// and the total rest distance.  `vertInvMass[i]` == the endpoint's mPosition_InvMass.w.
-static SelfContactRef refSelfContact(const uint32_t slot[4], const p72ref::V3 xx[4],
-                                     const float vertInvMass[4], const float weights[4],
-                                     p72ref::V3 normal, float restDistTotal)
-{
-    using p72ref::V3;
-    SelfContactRef r;
-    for (int i = 0; i < 4; ++i) { r.slot[i] = slot[i]; r.countW[i] = 0.0f; r.dx[i] = V3{ 0, 0, 0 }; }
-
-    // countContact: mark in-collision iff distSq <= restDist^2, then bump |coeff|.
-    const V3 disp = p72solve::dispFromWeights(weights, xx[0], xx[1], xx[2], xx[3]);
-    const float distSq = p72solve::dot(disp, disp);
-    r.inCollision = !(distSq > restDistTotal * restDistTotal);
-    if (!r.inCollision)
-        return r;
-    for (int i = 0; i < 4; ++i)
-    {
-        const float coeff = std::fabs(weights[i]);
-        if (coeff > 1e-3f)
-            r.countW[i] = coeff;   // one contact -> distinct slots, so no accumulation
-    }
-
-    // solve: split masses by the query counts, run the constraint, scatter if count > 0.
-    float splitted[4];
-    for (int i = 0; i < 4; ++i)
-        splitted[i] = r.countW[i] * vertInvMass[i];
-    V3 dx0, dx1, dx2, dx3;
-    p72solve::constraint(dx0, dx1, dx2, dx3, disp, normal, splitted, restDistTotal, weights);
-    const V3 dxs[4] = { dx0, dx1, dx2, dx3 };
-    for (int i = 0; i < 4; ++i)
-        if (r.countW[i] > 0.0f)
-            r.dx[i] = dxs[i];
-    return r;
-}
-
-// cloth_clothContactPrepare -> query -> solve: push a penetrating VT self-contact apart.
-static void runClothSelfContactVT()
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float invMass = 0.5f;
-    const float restDistScalar = 0.05f;   // total rest distance = 0.1
-
-    // Triangle T0 = {0,1,2} in a TILTED plane (so the contact normal is off-axis and no
-    // delta component lands on an exact signed zero — the femClothSimRigidContact
-    // precedent); vertex 3 hovers 0.05 above the centroid along the triangle normal,
-    // projecting to the interior (barycentric ~1/3,1/3,1/3).
-    std::vector<F4> pos = {
-        { 0.00f, 0.00f, 0.00f, invMass },              // v0 (T0)
-        { 1.00f, 0.00f, 0.20f, invMass },              // v1 (T0) tilted
-        { 0.00f, 1.00f, 0.10f, invMass },              // v2 (T0) tilted
-        { 0.3235743f, 0.3284538f, 0.1487950f, invMass },  // v3 penetrating vertex
-    };
-    std::vector<F4> rest = pos;   // distinct rest -> rest-pose filter passes
-    std::vector<F4> prev = pos;   // prevPositionInContactOffset == pos -> relDelta 0
-    std::vector<F4> deltaPos(4, F4{ 0, 0, 0, 0 });
-    std::vector<float> friction(4, 0.0f);   // frictionless -> the tangent branch is dead
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
-
-    DevBuf bPos = makeDev(dev, pos);
-    DevBuf bRest = makeDev(dev, rest);
-    DevBuf bPrev = makeDev(dev, prev);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction);
-    DevBuf bTri = makeDev(dev, tris);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 4u;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // contactInfo: pairInd0 = encode(0,3) (vertex), pairInd1 = encode(0,0) (triangle),
-    // auxInd = VT (bit30=0), NOT-yet-valid (bit31=0).
-    std::vector<FemFemContactInfoHost> infos(1);
-    infos[0].pairInd0 = (0ull << 20) | 3ull;
-    infos[0].pairInd1 = (0u << 20) | 0u;
-    infos[0].auxInd = 0u;
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { 1u };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
-    const uint32_t MAXC = 64u;
-
-    // ---- prepare ----
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-    const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
-    PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
-                  "prepare must mark the VT self-contact valid (auxInd=0x%08x)", giPrep.auxInd);
-
-    // ---- query VT (count) ----
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference: closestPtPointTriangle(p=v3, a=v0, b=v1, c=v2) -> weights ----
-    using p72ref::V3;
-    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
-    float s, t;
-    p72ref::closestPtPointTriangle(v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]), s, t);
-    const float rBary = 1.0f - s - t;
-    const float weightsVT[4] = { 1.0f, -rBary, -s, -t };
-    const V3 xxVT[4] = { v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]) };
-    // normal = disp / dist (per-component division; VT path).
-    const V3 dispVT = p72solve::dispFromWeights(weightsVT, xxVT[0], xxVT[1], xxVT[2], xxVT[3]);
-    const float distVT = std::sqrt(p72solve::dot(dispVT, dispVT));
-    const V3 normalVT = p72ref::divv(dispVT, distVT);
-    const float restTotal = restDistScalar + restDistScalar;
-    const uint32_t slotVT[4] = { 3u, 0u, 1u, 2u };   // vertex, tri.x, tri.y, tri.z
-    const float vimVT[4] = { invMass, invMass, invMass, invMass };
-    const SelfContactRef ref = refSelfContact(slotVT, xxVT, vimVT, weightsVT, normalVT, restTotal);
-    PXG_CHECK_MSG(ref.inCollision, "reference: the VT self-contact must be in-collision");
-
-    // per-slot reference mDeltaPos after query (.w) — check the count pass.
-    F4 refDelta[4] = { F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 } };
-    for (int i = 0; i < 4; ++i) refDelta[ref.slot[i]].w = ref.countW[i];
-
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 4);
-    const FemFemContactInfoHost giQ = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
-    size_t mmQ = 0;
-    for (uint32_t v = 0; v < 4; ++v)
-        if (f2u(gDeltaQ[v].w) != f2u(refDelta[v].w))
-        { ++mmQ; std::printf("  VT query mDeltaPos[%u].w MM: ref %g got %g\n", v, refDelta[v].w, gDeltaQ[v].w); }
-    PXG_CHECK_MSG((giQ.auxInd & CONTACT_FLAG_MASK_H) != 0u, "query must mark the VT contact in-collision");
-    PXG_CHECK_MSG(mmQ == 0, "cloth_queryClothClothContactVTCount bit-exact vs CPU (%zu mismatches)", mmQ);
-
-    // ---- solve VT ----
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    for (int i = 0; i < 4; ++i)
-    {
-        refDelta[ref.slot[i]].x = ref.dx[i].x;
-        refDelta[ref.slot[i]].y = ref.dx[i].y;
-        refDelta[ref.slot[i]].z = ref.dx[i].z;
-    }
-
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 4);
-    size_t mm = 0;
-    for (uint32_t v = 0; v < 4; ++v)
-        if (f2u(gDelta[v].x) != f2u(refDelta[v].x) || f2u(gDelta[v].y) != f2u(refDelta[v].y) ||
-            f2u(gDelta[v].z) != f2u(refDelta[v].z) || f2u(gDelta[v].w) != f2u(refDelta[v].w))
-        { ++mm; std::printf("  VT solve mDeltaPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", v,
-                            refDelta[v].x, refDelta[v].y, refDelta[v].z, refDelta[v].w,
-                            gDelta[v].x, gDelta[v].y, gDelta[v].z, gDelta[v].w); }
-
-    // teeth: the vertex is pushed OUT along +normal and the triangle vertices are pushed
-    // along -normal -> the vertex-triangle penetration is resolved (both endpoints move apart).
-    auto dotN = [](const F4& d, const V3& nn) { return d.x * nn.x + d.y * nn.y + d.z * nn.z; };
-    PXG_CHECK_MSG(dotN(gDelta[3], normalVT) > 0.0f,
-                  "solve must push the penetrating VERTEX out along +normal (dot %g)", dotN(gDelta[3], normalVT));
-    PXG_CHECK_MSG(dotN(gDelta[0], normalVT) < 0.0f && dotN(gDelta[1], normalVT) < 0.0f && dotN(gDelta[2], normalVT) < 0.0f,
-                  "solve must push the TRIANGLE along -normal (dots %g,%g,%g)",
-                  dotN(gDelta[0], normalVT), dotN(gDelta[1], normalVT), dotN(gDelta[2], normalVT));
-    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaVT bit-exact vs CPU (%zu mismatches)", mm);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
-    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
-}
-
-// P9.86f -- the FRICTION clamp of triangleCollisionConstraint (FEMClothExternalSolve.cu:274-275):
-//   deltaLambdaT = PxMax(0.f, CT * invDenom);  deltaLambdaT = -PxMin(deltaLambdaT, fc * |deltaLambdaN|);
-// PxMax/PxMin<float> are selectMax/selectMin (PxUnixMathIntrinsics.h:116-125): a +-0 tie keeps the SECOND
-// operand, where llvmpipe's FMax gives +0 and FMin -0 in either order.  One VT self-contact, every value a
-// binary fraction so no bit depends on rounding:
-//   triangle a=(0,0,0) b=(1,-1,0) c=(1,1,0), vertex p=(-1/16, 2^-17, -0): the closest point is a (s=t=0),
-//   weights (1,-1,-0,-0), disp = (-1/16, 2^-17, -0), |disp| rounds to 1/16, normal = (-1, 2^-13, -0);
-//   prev(p) = (3/16, 2^-17, +0) and the triangle at rest give relDelta = (-1/4, +0, -0), so
-//   tanDir = (+0, -1, +0) (tanMagSq 2^-30) and CT = (-1/4)(+0) + (+0)(-1) + (-0)(+0) = -0.
-// Case A, rest distance 0.1: lim = 0.5 * 0.0375 > 0.  CUDA: PxMax(0,-0) = -0, PxMin(-0, lim) = -0, so
-//   deltaLambdaT = +0 and commonVec.z = (dLN * -0) + (+0 * +0) = +0; the FMax port gives -0 there.
-// Case B, rest distance 1/16 == |disp|: CN = +0, dLN = -0, lim = +0.  CUDA: PxMin(-0, +0) = +0, so
-//   deltaLambdaT = -0 and commonVec.y = (-0 * 2^-13) + (-0 * -1) = +0; the FMin port gives -0 there.
-// mDeltaPos only ever holds +0 or sums in the engine (cleared with make_float4(0), FEMClothExternalSolve.cu:1109,
-// then atomically added to), and +0 + (-0) = +0 -- so there the flipped zero lane of a contact's dx cannot show.
-// The fixture therefore seeds the accumulator with -0, which makes the kernel's per-contact dx bits visible:
-// -0 + dx keeps dx's sign.
-static void runClothSelfContactFrictionZeroSign(float restDistScalar, int killsVariant)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float invMass = 0.5f;
-    const float NZ = -0.0f, E = 7.62939453125e-06f;   // 2^-17
-    std::vector<F4> pos = {
-        { 0.0f, 0.0f, 0.0f, invMass },       // v0 = a
-        { 1.0f, -1.0f, 0.0f, invMass },      // v1 = b
-        { 1.0f, 1.0f, 0.0f, invMass },       // v2 = c
-        { -0.0625f, E, NZ, invMass },        // v3 = the vertex
-    };
-    std::vector<F4> rest = pos;
-    std::vector<F4> prev = pos;
-    prev[3] = F4{ 0.1875f, E, 0.0f, invMass };
-    std::vector<F4> deltaPos(4, F4{ NZ, NZ, NZ, 0.0f });
-    std::vector<float> friction(4, 0.5f);
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
-
-    // ---- host mirror (FEMClothExternalSolve.cu:243 + applyContactDelta), variant twins ----
-    using p72ref::V3;
-    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
-    float s, t;
-    p72ref::closestPtPointTriangle(v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]), s, t);
-    const float rB = 1.0f - s - t;
-    const float w[4] = { 1.0f, -rB, -s, -t };
-    const V3 xx[4] = { v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]) };
-    const V3 pv[4] = { v3f(prev[3]), v3f(prev[0]), v3f(prev[1]), v3f(prev[2]) };
-    const uint32_t slot[4] = { 3u, 0u, 1u, 2u };
-    const V3 disp = p72solve::dispFromWeights(w, xx[0], xx[1], xx[2], xx[3]);
-    const V3 dl[4] = { p72ref::sub(xx[0], pv[0]), p72ref::sub(xx[1], pv[1]), p72ref::sub(xx[2], pv[2]), p72ref::sub(xx[3], pv[3]) };
-    const V3 relDelta = p72solve::dispFromWeights(w, dl[0], dl[1], dl[2], dl[3]);
-    const float dist = std::sqrt(p72ref::dot(disp, disp));
-    const V3 normal = p72ref::mul(disp, 1.0f / dist);
-    const float restTotal = restDistScalar + restDistScalar;
-    float count[4];
-    for (int i = 0; i < 4; ++i) count[i] = (std::fabs(w[i]) > 1e-3f) ? std::fabs(w[i]) : 0.0f;
-    const float fc = 0.25f * (friction[0] + friction[1] + friction[2] + friction[3]);
-    auto solveRef = [&](int variant, F4 out[4]) {
-        float m[4];
-        for (int i = 0; i < 4; ++i) m[i] = count[i] * invMass;
-        const float CN = p72ref::dot(disp, normal) - restTotal;
-        float denom = m[0] * w[0] * w[0];
-        denom += m[1] * w[1] * w[1];
-        denom += m[2] * w[2] * w[2];
-        denom += m[3] * w[3] * w[3];
-        const float invDenom = 1.0f / denom;
-        const float dLN = -CN * invDenom;
-        V3 cv = p72ref::mul(normal, dLN);
-        V3 tanDir = p72ref::sub(relDelta, p72ref::mul(normal, p72ref::dot(relDelta, normal)));
-        const float tanMagSq = p72ref::dot(tanDir, tanDir);
-        if (fc != 0.0f && tanMagSq > p72solve::THR)
-        {
-            tanDir = p72ref::mul(tanDir, 1.0f / std::sqrt(tanMagSq));
-            const float x = p72ref::dot(relDelta, tanDir) * invDenom;
-            // 0 = the CUDA selects; 1 = llvmpipe FMax at :274; 2 = llvmpipe FMin at :275
-            float d = (variant == 1) ? ((x > 0.0f) ? x : 0.0f) : ((0.0f > x) ? 0.0f : x);
-            const float lim = fc * std::fabs(dLN);
-            d = (variant == 2) ? -((d == lim) ? (std::signbit(d) ? d : lim) : (d < lim ? d : lim))
-                               : -((d < lim) ? d : lim);
-            cv = p72ref::add(cv, p72ref::mul(tanDir, d));
-        }
-        for (int i = 0; i < 4; ++i) out[i] = deltaPos[i];
-        for (int i = 0; i < 4; ++i)
-        {
-            out[slot[i]].w = count[i];
-            if (count[i] > 0.0f)
-            {
-                const V3 dx = p72ref::mul(cv, m[i] * w[i]);
-                out[slot[i]].x = out[slot[i]].x + dx.x;
-                out[slot[i]].y = out[slot[i]].y + dx.y;
-                out[slot[i]].z = out[slot[i]].z + dx.z;
-            }
-        }
-    };
-    F4 ref[4], twin[4];
-    solveRef(0, ref);
-    PXG_CHECK_MSG(s == 0.0f && t == 0.0f && f2u(normal.x) == 0xBF800000u && f2u(normal.z) == 0x80000000u &&
-                  f2u(relDelta.y) == 0u && f2u(relDelta.z) == 0x80000000u,
-                  "friction zero-sign rig drifted (s %g t %g n %08x %08x rd %08x %08x)", s, t,
-                  f2u(normal.x), f2u(normal.z), f2u(relDelta.y), f2u(relDelta.z));
-    for (int v = 1; v <= 2; ++v)
-    {
-        solveRef(v, twin);
-        bool differs = false;
-        for (int i = 0; i < 4; ++i)
-            differs |= f2u(twin[i].x) != f2u(ref[i].x) || f2u(twin[i].y) != f2u(ref[i].y) || f2u(twin[i].z) != f2u(ref[i].z);
-        PXG_CHECK_MSG(differs == (v == killsVariant), "rest %g: the friction-clamp twin %d %s the scattered deltas",
-                      restDistScalar, v, differs ? "changes" : "does not change");
-    }
-
-    DevBuf bPos = makeDev(dev, pos);
-    DevBuf bRest = makeDev(dev, rest);
-    DevBuf bPrev = makeDev(dev, prev);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction);
-    DevBuf bTri = makeDev(dev, tris);
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 4u;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-    std::vector<FemFemContactInfoHost> infos(1);
-    infos[0].pairInd0 = (0ull << 20) | 3ull;
-    infos[0].pairInd1 = (0u << 20) | 0u;
-    infos[0].auxInd = 0u;
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { 1u };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = 64u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    const auto g = downloadBuffer<F4>(dev, bDelta.h, 4);
-    size_t mm = 0;
-    for (uint32_t v = 0; v < 4; ++v)
-        if (f2u(g[v].x) != f2u(ref[v].x) || f2u(g[v].y) != f2u(ref[v].y) || f2u(g[v].z) != f2u(ref[v].z) || f2u(g[v].w) != f2u(ref[v].w))
-        { ++mm; std::printf("  rest %g mDeltaPos[%u] MM: ref(%08x,%08x,%08x,%08x) got(%08x,%08x,%08x,%08x)\n", restDistScalar, v,
-                            f2u(ref[v].x), f2u(ref[v].y), f2u(ref[v].z), f2u(ref[v].w), f2u(g[v].x), f2u(g[v].y), f2u(g[v].z), f2u(g[v].w)); }
-    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaVT friction zero sign (rest %g): %zu slots differ bitwise from the CUDA selects",
-                  restDistScalar, mm);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
-    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
-}
-
-// cloth_clothContactPrepare -> query -> solve: push a penetrating EE self-contact apart.
-static void runClothSelfContactEE()
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float invMass = 0.5f;
-    const float restDistScalar = 0.05f;   // total rest distance = 0.1
-
-    // Two perpendicular crossing edges with a 0.03 gap, ROTATED off-axis (Rz30.Ry25.Rx20)
-    // so the contact normal has no zero component (the femClothSimRigidContact precedent —
-    // an axis-aligned separation would land the transverse delta components on signed zero).
-    // T_a = {0,1,2} (index 0): edge0 = v0->v1.  T_b = {3,4,5} (index 1): edge0 = v3->v4.
-    std::vector<F4> pos = {
-        { -0.3924428f, -0.2265770f,  0.2113091f, invMass },  // v0 (T_a, edge1 v0)
-        {  0.3924428f,  0.2265770f, -0.2113091f, invMass },  // v1 (T_a, edge1 v1)
-        { -0.5149359f,  0.0976325f, -0.8516507f, invMass },  // v2 (T_a, far)
-        { -0.0879522f,  0.2628919f,  0.1185422f, invMass },  // v3 (T_b, edge0 v0)
-        {  0.1188483f, -0.2687499f, -0.0674431f, invMass },  // v4 (T_b, edge0 v1)
-        {  0.5149359f, -0.0976325f,  0.8516507f, invMass },  // v5 (T_b, far)
-    };
-    std::vector<F4> rest = pos;
-    std::vector<F4> prev = pos;
-    std::vector<F4> deltaPos(6, F4{ 0, 0, 0, 0 });
-    std::vector<float> friction(6, 0.0f);
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u }, { 3u, 4u, 5u, 0x7u } };
-
-    DevBuf bPos = makeDev(dev, pos);
-    DevBuf bRest = makeDev(dev, rest);
-    DevBuf bPrev = makeDev(dev, prev);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction);
-    DevBuf bTri = makeDev(dev, tris);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 6u;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // contactInfo: pairInd0 = encode(0,1) (triangle0 = T_b, edge0 index 0),
-    // pairInd1 = encode(0,0) (triangle1 = T_a, edge index 0), auxInd = EE (bit30), aux0=aux1=0,
-    // NOT-yet-valid.
-    std::vector<FemFemContactInfoHost> infos(1);
-    infos[0].pairInd0 = (0ull << 20) | 1ull;
-    infos[0].pairInd1 = (0u << 20) | 0u;
-    infos[0].auxInd = PAIR_TYPE_FLAG_MASK_H;   // bit30 = EE, aux0=aux1=0
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { 1u };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
-    const uint32_t MAXC = 64u;
-
-    // ---- prepare ----
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-    const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
-    PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
-                  "prepare must mark the EE self-contact valid (auxInd=0x%08x)", giPrep.auxInd);
-
-    // ---- query EE (count) ----
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch", {}, sizeof(QueryClothClothPush));
-    kQuery.dispatch(FEM_PREP_GRID, {}, qp, 1u, 1u);
-    dev->flush();
-
-    // ---- CPU reference: closestPtLineLine(edge0 = v3->v4, edge1 = v0->v1) -> weights ----
-    using p72ref::V3;
-    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
-    // vertIndices = (T_b[0]=3, T_b[1]=4, T_a[0]=0, T_a[1]=1).
-    const uint32_t slotEE[4] = { 3u, 4u, 0u, 1u };
-    const V3 xxEE[4] = { v3f(pos[3]), v3f(pos[4]), v3f(pos[0]), v3f(pos[1]) };
-    float s, t, distSq;
-    p72ref::closestPtLineLine(xxEE[0], xxEE[1], xxEE[2], xxEE[3], s, t, distSq);
-    const float weightsEE[4] = { 1.0f - s, s, -(1.0f - t), -t };
-    // normal = disp * (1/dist) (reciprocal-multiply; EE path).
-    const V3 dispEE = p72solve::dispFromWeights(weightsEE, xxEE[0], xxEE[1], xxEE[2], xxEE[3]);
-    const float distEE = std::sqrt(distSq);
-    const V3 normalEE = p72ref::mul(dispEE, 1.0f / distEE);
-    const float restTotal = restDistScalar + restDistScalar;
-    const float vimEE[4] = { invMass, invMass, invMass, invMass };
-    const SelfContactRef ref = refSelfContact(slotEE, xxEE, vimEE, weightsEE, normalEE, restTotal);
-    PXG_CHECK_MSG(ref.inCollision, "reference: the EE self-contact must be in-collision");
-
-    F4 refDelta[6];
-    for (int v = 0; v < 6; ++v) refDelta[v] = F4{ 0, 0, 0, 0 };
-    for (int i = 0; i < 4; ++i) refDelta[ref.slot[i]].w = ref.countW[i];
-
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 6);
-    const FemFemContactInfoHost giQ = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
-    size_t mmQ = 0;
-    for (uint32_t v = 0; v < 6; ++v)
-        if (f2u(gDeltaQ[v].w) != f2u(refDelta[v].w))
-        { ++mmQ; std::printf("  EE query mDeltaPos[%u].w MM: ref %g got %g\n", v, refDelta[v].w, gDeltaQ[v].w); }
-    PXG_CHECK_MSG((giQ.auxInd & CONTACT_FLAG_MASK_H) != 0u, "query must mark the EE contact in-collision");
-    PXG_CHECK_MSG(mmQ == 0, "cloth_queryClothClothContactEECount bit-exact vs CPU (%zu mismatches)", mmQ);
-
-    // ---- solve EE ----
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaEELaunch", {}, sizeof(SolveClothClothPush));
-    kSolve.dispatch(FEM_PREP_GRID, {}, sp, 1u, 1u);
-    dev->flush();
-
-    for (int i = 0; i < 4; ++i)
-    {
-        refDelta[ref.slot[i]].x = ref.dx[i].x;
-        refDelta[ref.slot[i]].y = ref.dx[i].y;
-        refDelta[ref.slot[i]].z = ref.dx[i].z;
-    }
-
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 6);
-    size_t mm = 0;
-    for (uint32_t v = 0; v < 6; ++v)
-        if (f2u(gDelta[v].x) != f2u(refDelta[v].x) || f2u(gDelta[v].y) != f2u(refDelta[v].y) ||
-            f2u(gDelta[v].z) != f2u(refDelta[v].z) || f2u(gDelta[v].w) != f2u(refDelta[v].w))
-        { ++mm; std::printf("  EE solve mDeltaPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", v,
-                            refDelta[v].x, refDelta[v].y, refDelta[v].z, refDelta[v].w,
-                            gDelta[v].x, gDelta[v].y, gDelta[v].z, gDelta[v].w); }
-
-    // teeth: edge0 (v3,v4) is pushed along +normal and edge1 (v0,v1) along -normal -> the
-    // crossing edges separate (both endpoints move apart).
-    auto dotN = [](const F4& d, const V3& nn) { return d.x * nn.x + d.y * nn.y + d.z * nn.z; };
-    PXG_CHECK_MSG(dotN(gDelta[3], normalEE) > 0.0f && dotN(gDelta[4], normalEE) > 0.0f,
-                  "solve must push edge0 out along +normal (dots %g,%g)", dotN(gDelta[3], normalEE), dotN(gDelta[4], normalEE));
-    PXG_CHECK_MSG(dotN(gDelta[0], normalEE) < 0.0f && dotN(gDelta[1], normalEE) < 0.0f,
-                  "solve must push edge1 along -normal (dots %g,%g)", dotN(gDelta[0], normalEE), dotN(gDelta[1], normalEE));
-    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaEE bit-exact vs CPU (%zu mismatches)", mm);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
-    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
-    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
-}
-
-// ===========================================================================
-// P8.1: the SELF-CONTACT REDUNDANCY fixture — is the applied correction invariant
-// in the number of contacts describing ONE geometric overlap?
-//
-// WHY THIS EXISTS.  Fixing the midphase grid defect DOUBLES the self-collision contact
-// count (VT 76 -> 152 measured) and makes the clothselfcollide scene markedly WORSE: the
-// draping layer is pushed above its own spawn height, the layers separate, and the upper
-// one tunnels through the shelf.  Buffer overflow, contact duplication, the count pass,
-// the divisor, the clear, a downstream grid mismatch and the iteration budget were all
-// excluded by measurement, and every link that can be compared against the .cu by reading
-// matches it.  What was missing was a fixture with an ANALYTICALLY KNOWN answer -- the
-// existing self-contact tests compare the port against a CPU transcription of the same
-// logic, so they agree with each other whether or not that logic is right.
-//
-// THE ALGEBRA, for a free vertex above a PINNED triangle.  Weights are (1, -r, -s, -t)
-// with r+s+t = 1.  countContact bumps mDeltaPos.w by |coeff_i|, so with N identical
-// contacts w[free] = N.  The solve multiplies the inverse masses by those counts
-// (splittedInvMasses, femClothClothContactBda.slang:474) -- so denom = N*m and
-// deltaLambdaN = -CN/(N*m), while dx = normal * deltaLambdaN * (N*m) * 1 = -CN * normal,
-// i.e. each contact contributes the SAME correction regardless of N.  N of them accumulate
-// to N * (-CN*normal) with .w = N, and applyExternalDeltas divides by .w:
-//
-//     displacement = (restDistance - gap) * normal,   INDEPENDENT OF N.
-//
-// The pinned triangle drops out entirely (invMass 0), so the closed form is exact: after
-// one full pass the free vertex must sit at EXACTLY the rest distance from the triangle
-// plane.  That is the assertion -- an analytic outcome, not a transcription.
-//
-// If the measured displacement instead SCALES with N, that is the over-response, and it
-// is what makes the corrected (doubled) contact set destabilise the scene.
-// ===========================================================================
-static void runClothSelfContactRedundancy(uint32_t nbContacts)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float freeInvMass = 0.5f;
-    const float restDistScalar = 0.05f;    // total rest distance = 2 * 0.05 = 0.1
-    const float totalRestDist = 2.0f * restDistScalar;
-
-    // Triangle T0 = {0,1,2} in the z = 0 plane, PINNED (invMass 0 -> it cannot move, so
-    // the free vertex's displacement is the whole story).  v3 hovers `gap` above the
-    // centroid along +z, well inside the triangle.
-    const float gap = 0.04f;               // < totalRestDist -> penetrating
-    std::vector<F4> pos = {
-        { 0.00f, 0.00f, 0.00f, 0.0f },     // v0 (T0) PINNED
-        { 1.00f, 0.00f, 0.00f, 0.0f },     // v1 (T0) PINNED
-        { 0.00f, 1.00f, 0.00f, 0.0f },     // v2 (T0) PINNED
-        { 1.0f / 3.0f, 1.0f / 3.0f, gap, freeInvMass },   // v3, above the centroid
-    };
-    std::vector<F4> rest = pos;            // rest-pose filter distance 0 -> passes
-    std::vector<F4> prev = pos;            // relDelta 0
-    std::vector<F4> vel(4, F4{ 0, 0, 0, 0 });
-    std::vector<F4> accum(4, F4{ 0, 0, 0, 0 });
-    std::vector<F4> deltaPos(4, F4{ 0, 0, 0, 0 });
-    std::vector<float> friction(4, 0.0f);
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
-
-    DevBuf bPos = makeDev(dev, pos);
-    DevBuf bRest = makeDev(dev, rest);
-    DevBuf bPrev = makeDev(dev, prev);
-    DevBuf bVel = makeDev(dev, vel);
-    DevBuf bAcc = makeDev(dev, accum);
-    DevBuf bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction);
-    DevBuf bTri = makeDev(dev, tris);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 4u;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // N IDENTICAL VT contacts for the one overlap (v3 vs T0).  The midphase is skipped on
-    // purpose: the contact set is the independent variable here, so it is controlled
-    // exactly rather than produced.
-    std::vector<FemFemContactInfoHost> infos(nbContacts);
-    for (uint32_t i = 0; i < nbContacts; ++i)
-    {
-        infos[i].pairInd0 = (0ull << 20) | 3ull;   // encode(cloth 0, vertex 3)
-        infos[i].pairInd1 = (0u << 20) | 0u;       // encode(cloth 0, triangle 0)
-        infos[i].auxInd = 0u;                      // VT (bit30=0), not-yet-valid (bit31=0)
-    }
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { nbContacts };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
-    const uint32_t MAXC = 64u;
-
-    // ---- the real chain: prepare -> count -> solve -> apply --------------------
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
-    dev->flush();
-
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-
-    const auto afterCount = downloadBuffer<F4>(dev, bDelta.h, 4);
-
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    const auto afterSolve = downloadBuffer<F4>(dev, bDelta.h, 4);
-
-    ApplyExtPush ap = {};
-    ap.clothes = bDesc.addr; ap.activeClothes = 0ull; ap.dt = dt;
-    std::vector<uint32_t> activeIds = { 0u };
-    DevBuf bActive = makeDev(dev, activeIds);
-    ap.activeClothes = bActive.addr;
-    Kernel kApply("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
-    kApply.dispatch(1u, {}, ap, 1u, 1u);
-    dev->flush();
-
-    const auto finalPos = downloadBuffer<F4>(dev, bPos.h, 4);
-
-    // ---- the analytic expectation ---------------------------------------------
-    // The triangle lies in z = 0 and is pinned, so the contact normal is +z, the gap is
-    // v3.z, and one full pass must place v3 at EXACTLY the total rest distance.
-    const float movedTo = finalPos[3].z;
-    const float displacement = movedTo - gap;
-    const float expectDisp = totalRestDist - gap;
-
-    std::printf("  N=%u: mDeltaPos[3].w after count = %.4f, .z after solve = %.6f -> v3.z %.6f -> %.6f "
-                "(moved %.6f, expected %.6f)\n",
-                nbContacts, afterCount[3].w, afterSolve[3].z, gap, movedTo, displacement, expectDisp);
-
-    // The pinned triangle must not have moved at all (invMass 0).
-    for (uint32_t v = 0; v < 3u; ++v)
-        PXG_CHECK_MSG(f2u(finalPos[v].z) == f2u(0.0f),
-                      "pinned triangle vertex %u must not move (z = %g)", v, finalPos[v].z);
-
-    // The count must scale with N -- if it does not, the fixture is not testing what it
-    // claims to and every later assertion is meaningless.
-    PXG_CHECK_MSG(std::fabs(afterCount[3].w - float(nbContacts)) < 1e-4f,
-                  "the count pass must accumulate |coeff|=1 per contact: N=%u gave .w=%g",
-                  nbContacts, afterCount[3].w);
-
-    // THE ASSERTION: the applied displacement is the analytic one, independent of N.
-    PXG_CHECK_MSG(std::fabs(displacement - expectDisp) < 1.0e-5f,
-                  "N=%u: one pass must move the free vertex to the rest distance -- moved %.6f, "
-                  "expected %.6f (ratio %.3f)", nbContacts, displacement, expectDisp,
-                  expectDisp != 0.0f ? displacement / expectDisp : 0.0f);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
-    dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h); dev->destroyBuffer(bDelta.h);
-    dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
-    dev->destroyBuffer(bActive.h);
-}
-
-// ===========================================================================
-// P8.1: the TWO-DIRECTION fixture — what the grid fix actually adds.
-//
-// The redundancy fixture above proves that N copies of ONE contact are perfectly
-// mass-averaged.  But the grid fix does not add copies: it lets the OTHER layer's
-// vertices act as query vertices too, so each overlap region ends up described from BOTH
-// directions -- (layerA vertex, layerB triangle) AND (layerB vertex, layerA triangle).
-// Those are genuinely different constraints on different endpoint sets, so the averaging
-// above does not relate them.
-//
-// Two parallel FREE triangles a gap apart, gap < restDistance.  Direction 1 is a0 vs TB;
-// direction 2 is b0 vs TA.  The test reports the separation achieved after one full pass
-// with direction 1 alone (what the buggy half-coverage midphase produced) and with both
-// (what the corrected midphase produces).  The correct answer for a contact solve is that
-// the pair ends up at the rest distance EITHER WAY -- resolving one overlap twice from
-// opposite sides must not separate them twice as far.
-// ===========================================================================
-static float runClothSelfContactTwoWay(bool bothDirections, bool verbose)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float m = 0.5f;
-    const float restDistScalar = 0.05f;
-    const float totalRestDist = 2.0f * restDistScalar;
-    const float gap = 0.04f;
-
-    // TA = {0,1,2} in z = 0;  TB = {3,4,5} in z = gap, directly above and congruent.
-    std::vector<F4> pos = {
-        { 0.00f, 0.00f, 0.0f, m }, { 1.00f, 0.00f, 0.0f, m }, { 0.00f, 1.00f, 0.0f, m },
-        { 0.00f, 0.00f, gap, m }, { 1.00f, 0.00f, gap, m }, { 0.00f, 1.00f, gap, m },
-    };
-    // a0 (v0) sits directly under b0 (v3); to make each query vertex project INSIDE the
-    // opposing triangle rather than onto a corner, both are nudged to the centroid in xy.
-    pos[0] = F4{ 1.0f / 3.0f, 1.0f / 3.0f, 0.0f, m };
-    pos[3] = F4{ 1.0f / 3.0f, 1.0f / 3.0f, gap, m };
-
-    std::vector<F4> rest = pos, prev = pos;
-    std::vector<F4> vel(6, F4{ 0, 0, 0, 0 }), accum(6, F4{ 0, 0, 0, 0 }), deltaPos(6, F4{ 0, 0, 0, 0 });
-    std::vector<float> friction(6, 0.0f);
-    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u }, { 3u, 4u, 5u, 0u } };
-
-    DevBuf bPos = makeDev(dev, pos), bRest = makeDev(dev, rest), bPrev = makeDev(dev, prev);
-    DevBuf bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum), bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction), bTri = makeDev(dev, tris);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = 6u;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    std::vector<FemFemContactInfoHost> infos;
-    FemFemContactInfoHost ci = {};
-    ci.pairInd0 = (0ull << 20) | 0ull;   // vertex a0 = v0
-    ci.pairInd1 = (0u << 20) | 1u;       // triangle TB = index 1
-    ci.auxInd = 0u;
-    infos.push_back(ci);
-    if (bothDirections)
-    {
-        FemFemContactInfoHost ci2 = {};
-        ci2.pairInd0 = (0ull << 20) | 3ull;  // vertex b0 = v3
-        ci2.pairInd1 = (0u << 20) | 0u;      // triangle TA = index 0
-        ci2.auxInd = 0u;
-        infos.push_back(ci2);
-    }
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { uint32_t(infos.size()) };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-    std::vector<uint32_t> activeIds = { 0u };
-    DevBuf bActive = makeDev(dev, activeIds);
-
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return 0.0f; }
-
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = 64u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush))
-        .dispatch(1u, {}, pp, 1u, 1u);
-    dev->flush();
-
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush))
-        .dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush))
-        .dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    ApplyExtPush ap = {};
-    ap.clothes = bDesc.addr; ap.activeClothes = bActive.addr; ap.dt = dt;
-    Kernel("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush))
-        .dispatch(1u, {}, ap, 1u, 1u);
-    dev->flush();
-
-    const auto fin = downloadBuffer<F4>(dev, bPos.h, 6);
-    const float sep = fin[3].z - fin[0].z;   // the two facing query vertices
-    if (verbose)
-        std::printf("  %-14s a0.z %.6f -> %.6f | b0.z %.6f -> %.6f | separation %.6f -> %.6f "
-                    "(rest distance %.6f)\n",
-                    bothDirections ? "BOTH dirs:" : "ONE dir:",
-                    pos[0].z, fin[0].z, pos[3].z, fin[3].z, gap, sep, totalRestDist);
-
-    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
-    dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h); dev->destroyBuffer(bDelta.h);
-    dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
-    dev->destroyBuffer(bActive.h);
-    return sep;
-}
-
-// ===========================================================================
-// P8.1: the K-DISTINCT-TRIANGLES fixture — the configuration the other two miss.
-//
-// The redundancy fixture uses N copies of ONE contact and the two-way fixture uses one
-// contact per direction; both have every participant appearing in exactly ONE contact per
-// role.  That is the ONE case where the count-based mass split is neutral.
-//
-// The realistic configuration is different: one vertex penetrating K DISTINCT opposing
-// triangles at once, which is what a dense fold produces.  Then the vertex's accumulated
-// count is c_v = K (weight 1 per contact) while each triangle corner carries only c_a ~ 1/3
-// from its single contact -- a 3K-fold asymmetry.  Since the scatter is
-// dx_j = c_j * m_j * w_j * lambda * n (femClothClothContactBda.slang:474 x :440), the
-// count enters the correction as a MULTIPLIER, so the separation migrates onto the
-// vertex side as K grows and the triangle side stops moving.
-//
-// This test measures that migration directly.  It asserts nothing about which behaviour is
-// "right" -- upstream PhysX 5.6.1 does the same arithmetic and the port reproduces it
-// faithfully -- it records the K-dependence so the effect is a measured number rather than
-// an argument.
-// ===========================================================================
-static float lastOvershootFactor = 0.0f;   // set by runClothSelfContactManyTriangles
-
-static void runClothSelfContactManyTriangles(uint32_t K)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const float dt = 1.0f / 60.0f;
-    const float m = 0.5f;
-    const float restDistScalar = 0.05f;
-    const float totalRestDist = 2.0f * restDistScalar;
-    const float gap = 0.04f;
-
-    // v0 is the free penetrating vertex.  K congruent FREE triangles sit `gap` above it,
-    // stacked in the vertex buffer but all at the same height, so each contact describes
-    // the same overlap depth while touching a DISTINCT vertex set.
-    std::vector<F4> pos;
-    pos.push_back(F4{ 1.0f / 3.0f, 1.0f / 3.0f, 0.0f, m });   // v0, the vertex side
-    for (uint32_t k = 0; k < K; ++k)
-    {
-        pos.push_back(F4{ 0.0f, 0.0f, gap, m });
-        pos.push_back(F4{ 1.0f, 0.0f, gap, m });
-        pos.push_back(F4{ 0.0f, 1.0f, gap, m });
-    }
-    const uint32_t NV = uint32_t(pos.size());
-    std::vector<F4> rest = pos, prev = pos;
-    std::vector<F4> vel(NV, F4{ 0, 0, 0, 0 }), accum(NV, F4{ 0, 0, 0, 0 }), deltaPos(NV, F4{ 0, 0, 0, 0 });
-    std::vector<float> friction(NV, 0.0f);
-    std::vector<TriIdx4> tris;
-    for (uint32_t k = 0; k < K; ++k)
-        tris.push_back(TriIdx4{ 1u + 3u * k, 2u + 3u * k, 3u + 3u * k, 0u });
-
-    DevBuf bPos = makeDev(dev, pos), bRest = makeDev(dev, rest), bPrev = makeDev(dev, prev);
-    DevBuf bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum), bDelta = makeDev(dev, deltaPos);
-    DevBuf bFric = makeDev(dev, friction), bTri = makeDev(dev, tris);
-
-    PxgFEMCloth c = makeZeroDesc();
-    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
-    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
-    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
-    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
-    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
-    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
-    c.mNbVerts = NV;
-    c.mSelfCollisionFilterDistance = 0.0f;
-    c.mRestDistance = restDistScalar;
-    std::vector<PxgFEMCloth> descArr = { c };
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    std::vector<FemFemContactInfoHost> infos(K);
-    for (uint32_t k = 0; k < K; ++k)
-    {
-        infos[k].pairInd0 = (0ull << 20) | 0ull;    // vertex v0
-        infos[k].pairInd1 = (0u << 20) | k;         // triangle k
-        infos[k].auxInd = 0u;
-    }
-    DevBuf bInfos = makeDev(dev, infos);
-    std::vector<uint32_t> numContacts = { K };
-    DevBuf bNum = makeDev(dev, numContacts);
-    std::vector<uint32_t> upd = { 1u };
-    DevBuf bUpd = makeDev(dev, upd);
-    std::vector<uint32_t> activeIds = { 0u };
-    DevBuf bActive = makeDev(dev, activeIds);
-
-    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
-
-    PrepClothClothPush pp = {};
-    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
-    pp.maxContacts = 256u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
-    Kernel("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush))
-        .dispatch(1u, {}, pp, 1u, 1u);
-    dev->flush();
-
-    QueryClothClothPush qp = {};
-    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
-    Kernel("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush))
-        .dispatch(1u, {}, qp, 1u, 1u);
-    dev->flush();
-    const auto afterCount = downloadBuffer<F4>(dev, bDelta.h, NV);
-
-    SolveClothClothPush sp = {};
-    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
-    Kernel("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush))
-        .dispatch(1u, {}, sp, 1u, 1u);
-    dev->flush();
-
-    ApplyExtPush ap = {};
-    ap.clothes = bDesc.addr; ap.activeClothes = bActive.addr; ap.dt = dt;
-    Kernel("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush))
-        .dispatch(1u, {}, ap, 1u, 1u);
-    dev->flush();
-
-    const auto fin = downloadBuffer<F4>(dev, bPos.h, NV);
-    const float deficit = totalRestDist - gap;                 // 0.06, what must be closed
-    const float dVert = fin[0].z - pos[0].z;                   // vertex side (moves -z)
-    const float dCorner = fin[1].z - pos[1].z;                 // one triangle corner (+z)
-    const float sep = (fin[1].z - fin[0].z) - gap;             // achieved extra separation
-
-    lastOvershootFactor = sep / deficit;
-    std::printf("  K=%-3u count[v]=%.4f count[corner]=%.4f | vertex %+.6f  corner %+.6f | "
-                "closed %.6f of %.6f (%.4fx)\n",
-                K, afterCount[0].w, afterCount[1].w, dVert, dCorner, sep, deficit, sep / deficit);
-
-    // The count asymmetry is the mechanism, so pin it: the vertex side accumulates 1 per
-    // contact (K total) while each corner sees only its own contact's |w| (~1/3).
-    PXG_CHECK_MSG(std::fabs(afterCount[0].w - float(K)) < 1e-4f,
-                  "vertex-side count must be K=%u, got %g", K, afterCount[0].w);
-    PXG_CHECK_MSG(afterCount[1].w < 0.5f,
-                  "each corner must carry only its own contact's weight (~1/3), got %g", afterCount[1].w);
-    // MEASURED: the pass OVERSHOOTS, and the overshoot SHRINKS as K grows --
-    //   K = 1  2  4  8  16  ->  1.2000  1.1053  1.0541  1.0274  1.0138
-    // The cause is that mDeltaPos.w accumulates |coeff| rather than 1, so the effective
-    // denominator is sum_j m_j|w_j|^3 instead of the XPBD-correct sum_j m_j w_j^2; the ratio
-    // between them is the overshoot factor.  It is bounded by the vertex side's weight of 1
-    // (so <= 1.2 for a centroid VT hit) and decays as the vertex-side count comes to dominate
-    // the denominator.  This is UPSTREAM PhysX 5.6.1 arithmetic -- the .cu bumps by
-    // PxAbs(coeffs[j]) at FEMClothExternalSolve.cu:882-896 despite its own comment calling it
-    // a reference count -- and the Slang port reproduces it faithfully.  So the bound is a
-    // REGRESSION FENCE, not a correctness claim: it pins the inherited behaviour so a future
-    // port change that alters it fails loudly.
-    PXG_CHECK_MSG(sep <= deficit * 1.25f,
-                  "K=%u: separation %.6f exceeds the inherited overshoot envelope (%.4fx > 1.25x)",
-                  K, sep, deficit, sep / deficit);
-    // The corner side must lose its share as K grows -- that migration IS the mechanism.
-    PXG_CHECK_MSG(dCorner > 0.0f && dCorner < deficit,
-                  "K=%u: the triangle corner must move the other way and by less than the deficit "
-                  "(got %+.6f)", K, dCorner);
-}
-
-PXG_TEST(femClothSimSelfContactManyTriangles)
-{
-    // The K-sweep is the measurement; the per-K checks above are the teeth.  The sweep must
-    // also be MONOTONE: the overshoot decays as the vertex-side count grows, and that shape
-    // is the signature of the |coeff|-vs-1 denominator.  A port change that broke the count
-    // accumulation would keep the individual bounds but destroy the ordering.
-    float prevFactor = 1.0e30f;
-    for (uint32_t K : { 1u, 2u, 4u, 8u, 16u })
-    {
-        runClothSelfContactManyTriangles(K);
-        const float f = lastOvershootFactor;
-        PXG_CHECK_MSG(f < prevFactor,
-                      "the overshoot must decay with contact density: K=%u gave %.4fx, "
-                      "not below the previous %.4fx", K, f, prevFactor);
-        prevFactor = f;
-    }
-    PXG_CHECK_MSG(prevFactor < 1.02f,
-                  "at K=16 the overshoot should have decayed below 1.02x (got %.4fx)", prevFactor);
-}
-
-PXG_TEST(femClothSimSelfContactTwoWay)
-{
-    const float totalRestDist = 0.1f;
-    const float sepOne = runClothSelfContactTwoWay(/*bothDirections*/ false, /*verbose*/ true);
-    const float sepBoth = runClothSelfContactTwoWay(/*bothDirections*/ true, /*verbose*/ true);
-    if (sepOne == 0.0f && sepBoth == 0.0f) return;   // no-BDA skip
-
-    // A single overlap resolved from ONE side lands exactly on the rest distance -- the
-    // redundancy fixture already pins that mechanism analytically.
-    PXG_CHECK_MSG(std::fabs(sepOne - totalRestDist) < 1.0e-5f,
-                  "one direction must separate the layers to the rest distance: got %.6f, expected %.6f",
-                  sepOne, totalRestDist);
-
-    // THE QUESTION.  Resolving the SAME overlap additionally from the opposite side must
-    // not push it further apart: the second constraint sees a pair that direction 1 has
-    // already separated to the rest distance, so it should contribute nothing.  If the
-    // separation grows instead, the two directions add rather than agree -- and that is
-    // precisely what doubles the push when the midphase grid defect is fixed.
-    std::printf("  over-separation factor: %.4f\n", totalRestDist != 0.0f ? sepBoth / totalRestDist : 0.0f);
-    PXG_CHECK_MSG(std::fabs(sepBoth - totalRestDist) < 1.0e-5f,
-                  "both directions must ALSO land on the rest distance, not overshoot: got %.6f, "
-                  "expected %.6f (factor %.3f)", sepBoth, totalRestDist, sepBoth / totalRestDist);
-}
-
-PXG_TEST(femClothSimSelfContactRedundancy1) { runClothSelfContactRedundancy(1u); }
-PXG_TEST(femClothSimSelfContactRedundancy2) { runClothSelfContactRedundancy(2u); }
-PXG_TEST(femClothSimSelfContactRedundancy4) { runClothSelfContactRedundancy(4u); }
-
-PXG_TEST(femClothSimSelfContactSolveVT) { runClothSelfContactVT(); }
-PXG_TEST(femClothSimSelfContactSolveEE) { runClothSelfContactEE(); }
-PXG_TEST(femClothSimSelfContactFrictionZeroSign)
-{
-    runClothSelfContactFrictionZeroSign(0.05f, 1);      // case A: the FMax twin (:274)
-    runClothSelfContactFrictionZeroSign(0.03125f, 2);   // case B: the FMin twin (:275)
-}
 
 // cloth_updateClothContactValidityLaunch — snapshot each vertex into
 // mPrevPositionInContactOffset (w = 1) and reset the VT/EE contact counts on an adaptive
@@ -8382,7 +4014,7 @@ PXG_TEST(femClothSimRefitBound)
     PxgFEMCloth c = makeZeroDesc();
     c.mTriMeshData = reinterpret_cast<decltype(c.mTriMeshData)>(size_t(bTree.addr));
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bTri.addr));
     c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bPacked.addr));
     c.mNbVerts = uint32_t(pos.size());
     c.mNbTriangles = uint32_t(tris.size());
@@ -8649,7 +4281,7 @@ PXG_TEST(femClothSimRefitBoundZeroSign)
     PxgFEMCloth c = makeZeroDesc();
     c.mTriMeshData = reinterpret_cast<decltype(c.mTriMeshData)>(size_t(bTree.addr));
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bTri.addr));
     c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bPacked.addr));
     c.mNbVerts = uint32_t(pos.size());
     c.mNbTriangles = uint32_t(tris.size());
@@ -8813,7 +4445,7 @@ PXG_TEST(femClothSimStep)
     cloth.mNbVerts = NV;
     cloth.mLinearDamping = 2.0f;             // damping * dt = 0.5 -> the factor is 0.5
     cloth.mMaxLinearVelocity = 8.0f;         // 8 * 0.25 = 2.0 of allowed travel
-    cloth.mRestDistance = 0.0f;
+    cloth.mRestOffset = 0.0f;
     cloth.mOriginalContactOffset = 0.0f;
 
     // activeId is DELIBERATELY not the identity: gid.y 0 -> cloth 2.
@@ -9026,7 +4658,7 @@ PXG_TEST(femClothSimStepFlags)
 
 // A third run, for the three branches the first two cannot reach: the damping CLAMP (which only
 // bites when linearDamping * dt exceeds 1), the eDISABLE_GRAVITY actor flag, and the NEGATIVE
-// mMaxLinearVelocity regime that measures against 0.8 * mRestDistance instead of a velocity.
+// mMaxLinearVelocity regime that measures against 0.8 * mRestOffset instead of a velocity.
 // Two clothes and gridY = 2, since all three live on the descriptor rather than in the blob.
 PXG_TEST(femClothSimStepDampingAndFlags)
 {
@@ -9058,7 +4690,7 @@ PXG_TEST(femClothSimStepDampingAndFlags)
     // ---- cloth C: the one vertex that separates the clamp's three moving parts.
     // It starts at y = 10 with velocity -40, so dt = 0.25 gives a raw delta of -10 and an
     // unclamped position of 0.  Its REST-offset reference is deliberately NOT its start
-    // position but y = 12, and mMaxLinearVelocity is -1 with mRestDistance 5, so the cap is
+    // position but y = 12, and mMaxLinearVelocity is -1 with mRestOffset 5, so the cap is
     // 0.8 * 5 = 4.  Three readings, three distinct answers:
     //     correct        trajectory = 0 - 12 = -12, cap 4   -> pos 8.0
     //     cap = maxVel*dt (-0.25)                            -> pos 11.75
@@ -9084,7 +4716,7 @@ PXG_TEST(femClothSimStepDampingAndFlags)
     cA.mNbVerts = 1u;
     cA.mLinearDamping = 8.0f;            // 8 * 0.25 = 2 -> min() clamps it to 1, factor 0
     cA.mMaxLinearVelocity = -1.0f;       // the NEGATIVE regime
-    cA.mRestDistance = 5.0f;             // -> maxDistance = 4
+    cA.mRestOffset = 5.0f;             // -> maxDistance = 4
     cA.mActorFlags = 0u;
 
     PxgFEMCloth cB = makeZeroDesc();
@@ -9107,7 +4739,7 @@ PXG_TEST(femClothSimStepDampingAndFlags)
     cC.mNbVerts = 1u;
     cC.mLinearDamping = 0.0f;
     cC.mMaxLinearVelocity = -1.0f;       // the NEGATIVE regime, WITH travel this time
-    cC.mRestDistance = 5.0f;             // -> maxDistance = 0.8 * 5 = 4
+    cC.mRestOffset = 5.0f;             // -> maxDistance = 0.8 * 5 = 4
     cC.mActorFlags = PxU8(PxActorFlag::eDISABLE_GRAVITY);   // keep the arithmetic exact
 
     std::vector<PxgFEMCloth> descArr = { cA, cB, cC };
@@ -9167,7 +4799,7 @@ PXG_TEST(femClothSimStepDampingAndFlags)
     const auto gVelC = downloadBuffer<F4>(dev, bVelC.h, 1);
     std::printf("  C: pos.y=%.5f vel.y=%.5f\n", gPosC[0].y, gVelC[0].y);
     PXG_CHECK_MSG(near(gPosC[0].y, 8.0f, 2e-5f),
-                  "cloth C: the cap is 0.8 * mRestDistance = 4 and the trajectory is measured "
+                  "cloth C: the cap is 0.8 * mRestOffset = 4 and the trajectory is measured "
                   "from the REST-offset reference at 12, so the clamped position is 8.0; got "
                   "%.6f.  11.75 means the negative-maxVel regime used maxVel*dt instead; 6.0 "
                   "means the trajectory was measured from this substep's start", gPosC[0].y);
@@ -9197,8 +4829,9 @@ PXG_TEST(femClothSimStepDampingAndFlags)
 // pack / ABI"; the traverser bodies are the same C++ structs, so what this fixture has
 // to pin is exactly the five things that differ (femClothClothMidPhase.cu:1240-1384):
 //
-//   * the 88-byte narrowphase-driven blob (cmInputs / gpuShapes / transformCache instead
-//     of an activeClothes list), and that the two cloth ids come from
+//   * the 72-byte narrowphase-driven blob (cmInputs / gpuShapes / transformCache instead
+//     of an activeClothes list; 5.12 dropped 5.6.1's unread clothClothPairs /
+//     numClothClothPairs), and that the two cloth ids come from
 //     PxgShape::particleOrSoftbodyId;
 //   * contactDist is the SUM of the two shapes' cached distances, not one doubled --
 //     covered by a pair that is inside the sum but outside 2*cd[ref1], and another that
@@ -9212,7 +4845,10 @@ PXG_TEST(femClothSimStepDampingAndFlags)
 //     vertex share its INDEX with a corner of the triangle it hits, and the EE scene gives
 //     the two cloths triangles with identical vertex indices, so a mutant that folds
 //     either guard the self way loses contacts;
-//   * markValidity(clothId0 != clothId1) -> bit 31 SET, where the self path leaves it 0.
+//   * 5.12: the records are PxgDeformablePairInfo -- VT (vertex of MY cloth, triangle of
+//     the OTHER), EE two triangle-edge refs (MY triangle t0 / local edge e0, the OTHER's
+//     primitive / e1).  5.6.1's markValidity bit is gone with the auxInd field.  The
+//     per-cloth mSurfaceSurfaceFilterPairs are empty here (makeZeroDesc).
 //
 // The rest-pose filter is absent by construction (the call passes NULL rest buffers and
 // filterDistSq 0), so the descriptors below leave mRestPosition null -- a port that kept
@@ -9220,20 +4856,19 @@ PXG_TEST(femClothSimStepDampingAndFlags)
 // ===========================================================================
 namespace p816dc
 {
+// Byte-identical to DifferentClothParams (ABI row kClothDifferentCloth {4,4,8,8,8,8,8,8,8,8}).
 struct DifferentClothPush
 {
     uint32_t maxContacts;
     float toleranceLength;
-    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, femClothes, clothClothPairs;
-    uint32_t numClothClothPairs, pad60;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, femClothes;
     uint64_t updateContactPairs, outContactInfo, totalContactCount;
 };
-static_assert(sizeof(DifferentClothPush) == 88, "different-cloth push blob must be 88 bytes");
+static_assert(sizeof(DifferentClothPush) == 72, "different-cloth push blob must be 72 bytes");
 static_assert(offsetof(DifferentClothPush, cmInputs) == 8, "cmInputs @8");
 static_assert(offsetof(DifferentClothPush, femClothes) == 40, "femClothes @40");
-static_assert(offsetof(DifferentClothPush, numClothClothPairs) == 56, "numClothClothPairs @56");
-static_assert(offsetof(DifferentClothPush, updateContactPairs) == 64, "the next pointer realigns @64");
-static_assert(offsetof(DifferentClothPush, totalContactCount) == 80, "totalContactCount @80");
+static_assert(offsetof(DifferentClothPush, updateContactPairs) == 48, "updateContactPairs @48");
+static_assert(offsetof(DifferentClothPush, totalContactCount) == 64, "totalContactCount @64");
 
 struct CmInputHost { uint32_t shapeRef0, shapeRef1, cacheRef0, cacheRef1; };
 struct PxgShapeHost
@@ -9243,8 +4878,6 @@ struct PxgShapeHost
 };
 static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
 static const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);   // PxGeometryType::eTRIANGLEMESH
-
-static const uint32_t VALID_H = 1u << 31;         // markValidity(true)
 
 static PxgShapeHost makeClothShape(uint32_t clothId)
 {
@@ -9259,27 +4892,26 @@ static PxgShapeHost makeClothShape(uint32_t clothId)
 // Sort key for the SET comparison: unlike the self-collision fixtures (one query warp, one
 // leaf) this kernel runs several query warps against a shared atomic counter, so the output
 // ORDER is not deterministic.  The contact set is.
-static bool infoLess(const FemFemContactInfoHost& a, const FemFemContactInfoHost& b)
+static bool infoLess(const FemPairInfoHost& a, const FemPairInfoHost& b)
 {
-    if (a.pairInd0 != b.pairInd0) return a.pairInd0 < b.pairInd0;
-    if (a.pairInd1 != b.pairInd1) return a.pairInd1 < b.pairInd1;
-    return a.auxInd < b.auxInd;
+    if (a.ref0 != b.ref0) return a.ref0 < b.ref0;
+    return a.ref1 < b.ref1;
 }
 
-static size_t compareSets(std::vector<FemFemContactInfoHost> got,
-                          std::vector<FemFemContactInfoHost> ref, const char* tag)
+static size_t compareSets(std::vector<FemPairInfoHost> got,
+                          std::vector<FemPairInfoHost> ref, const char* tag)
 {
     std::sort(got.begin(), got.end(), infoLess);
     std::sort(ref.begin(), ref.end(), infoLess);
     size_t mm = 0;
     for (size_t i = 0; i < got.size() && i < ref.size(); ++i)
     {
-        if (std::memcmp(&got[i], &ref[i], sizeof(FemFemContactInfoHost)) != 0)
+        if (std::memcmp(&got[i], &ref[i], sizeof(FemPairInfoHost)) != 0)
         {
             ++mm;
-            std::printf("  %s contact[%zu] MM: got(p0=%llu,p1=%u,aux=0x%08x) ref(p0=%llu,p1=%u,aux=0x%08x)\n",
-                        tag, i, (unsigned long long)got[i].pairInd0, got[i].pairInd1, got[i].auxInd,
-                        (unsigned long long)ref[i].pairInd0, ref[i].pairInd1, ref[i].auxInd);
+            std::printf("  %s contact[%zu] MM: got(r0=0x%016llx,r1=0x%016llx) ref(r0=0x%016llx,r1=0x%016llx)\n",
+                        tag, i, (unsigned long long)got[i].ref0, (unsigned long long)got[i].ref1,
+                        (unsigned long long)ref[i].ref0, (unsigned long long)ref[i].ref1);
         }
     }
     return mm;
@@ -9339,14 +4971,14 @@ PXG_TEST(femClothSimDifferentClothVT)
     PxgFEMCloth c0 = makeZeroDesc();
     c0.mTriMeshData = reinterpret_cast<void*>(size_t(bTree0.addr));
     c0.mPosition_InvMass = reinterpret_cast<decltype(c0.mPosition_InvMass)>(size_t(bPos0.addr));
-    c0.mTriangleVertexIndices = reinterpret_cast<decltype(c0.mTriangleVertexIndices)>(size_t(bTri0.addr));
+    c0.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c0.mTriangleVertexIndices_ownedEdges)>(size_t(bTri0.addr));
     c0.mNbVerts = uint32_t(pos0.size());
     c0.mElementIndex = 0u;   // unused on this path (contactDist comes from the cache refs)
 
     PxgFEMCloth c1 = makeZeroDesc();
     c1.mTriMeshData = reinterpret_cast<void*>(size_t(bTree1.addr));
     c1.mPosition_InvMass = reinterpret_cast<decltype(c1.mPosition_InvMass)>(size_t(bPos1.addr));
-    c1.mTriangleVertexIndices = reinterpret_cast<decltype(c1.mTriangleVertexIndices)>(size_t(bTri1.addr));
+    c1.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c1.mTriangleVertexIndices_ownedEdges)>(size_t(bTri1.addr));
     c1.mNbVerts = uint32_t(pos1.size());
     c1.mElementIndex = 1u;
     // mRestPosition stays NULL: the different-cloth call has no rest-pose filter.
@@ -9364,8 +4996,8 @@ PXG_TEST(femClothSimDifferentClothVT)
     DevBuf bUpd = makeDev(dev, upd);
 
     const uint32_t MAXC = 64u;
-    std::vector<FemFemContactInfoHost> outInfo(MAXC);
-    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));   // poison
+    std::vector<FemPairInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemPairInfoHost));   // poison
     DevBuf bOut = makeDev(dev, outInfo);
     std::vector<uint32_t> count = { 0u };
     DevBuf bCount = makeDev(dev, count);
@@ -9378,8 +5010,6 @@ PXG_TEST(femClothSimDifferentClothVT)
     push.contactDistance = bCd.addr;
     push.gpuShapes = bShapes.addr;
     push.femClothes = bDesc.addr;
-    push.clothClothPairs = 0ull;     // unused (ABI parity)
-    push.numClothClothPairs = 0u;
     push.updateContactPairs = bUpd.addr;
     push.outContactInfo = bOut.addr;
     push.totalContactCount = bCount.addr;
@@ -9397,7 +5027,7 @@ PXG_TEST(femClothSimDifferentClothVT)
 
     // ---- CPU reference: the full bidirectional sweep, predicate for predicate ----
     auto v3f = [](const F4& f) { return V3{ f.x, f.y, f.z }; };
-    std::vector<FemFemContactInfoHost> ref;
+    std::vector<FemPairInfoHost> ref;
     for (uint32_t q = 0; q < uint32_t(pos0.size() + pos1.size()); ++q)
     {
         const bool isCloth0 = q < uint32_t(pos0.size());
@@ -9423,22 +5053,21 @@ PXG_TEST(femClothSimDifferentClothVT)
             const V3 dir = p72ref::sub(vtx, cp);
             const float dq = p72ref::dot(dir, dir);
             if (!(dq < contactDistSq && dq > 1.0e-14f)) continue;
-            ref.push_back(FemFemContactInfoHost{ (uint64_t(myId) << 20) | vertexIdx,
-                                                 (otherId << 20) | p, VALID_H });
+            ref.push_back(FemPairInfoHost{ encClothVertex(myId, vertexIdx), encClothTriangle(otherId, p) });
         }
     }
     PXG_CHECK_MSG(ref.size() == 2u, "reference: expected 2 bidirectional VT contacts, got %zu", ref.size());
     // Pin what each of the two IS, so a reference that drifts with the shader is caught.
-    PXG_CHECK_MSG(ref[0].pairInd0 == 4ull && ref[0].pairInd1 == (1u << 20),
+    PXG_CHECK_MSG(ref[0].ref0 == encClothVertex(0u, 4u) && ref[0].ref1 == encClothTriangle(1u, 0u),
                   "reference[0] must be cloth0 vertex 4 vs cloth1 triangle 0");
-    PXG_CHECK_MSG(ref[1].pairInd0 == (1ull << 20) && ref[1].pairInd1 == 0u,
+    PXG_CHECK_MSG(ref[1].ref0 == encClothVertex(1u, 0u) && ref[1].ref1 == encClothTriangle(0u, 0u),
                   "reference[1] must be cloth1 vertex 0 vs cloth0 triangle 0 (the corner-index case)");
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
     PXG_CHECK_MSG(gCount == uint32_t(ref.size()), "different-cloth VT emitted %u contacts (expected %zu)",
                   gCount, ref.size());
-    const auto got = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
-    const size_t mm = compareSets(std::vector<FemFemContactInfoHost>(got.begin(), got.begin() + gCount),
+    const auto got = downloadBuffer<FemPairInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+    const size_t mm = compareSets(std::vector<FemPairInfoHost>(got.begin(), got.begin() + gCount),
                                   ref, "VT");
     PXG_CHECK_MSG(mm == 0, "cloth_differentClothCollisionVT bit-exact vs CPU (%zu mismatches)", mm);
 
@@ -9525,17 +5154,17 @@ PXG_TEST(femClothSimDifferentClothEE)
     PxgFEMCloth c0 = makeZeroDesc();
     c0.mTriMeshData = reinterpret_cast<void*>(size_t(bTree0.addr));
     c0.mPosition_InvMass = reinterpret_cast<decltype(c0.mPosition_InvMass)>(size_t(bPos0.addr));
-    c0.mTriangleVertexIndices = reinterpret_cast<decltype(c0.mTriangleVertexIndices)>(size_t(bTri0.addr));
-    c0.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c0.mTrianglesWithActiveEdges)>(size_t(bTwae0.addr));
-    c0.mNbTrianglesWithActiveEdges = uint32_t(twae0.size());
+    c0.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c0.mTriangleVertexIndices_ownedEdges)>(size_t(bTri0.addr));
+    c0.mTrianglesWithOwnedEdges = reinterpret_cast<decltype(c0.mTrianglesWithOwnedEdges)>(size_t(bTwae0.addr));
+    c0.mNbTrianglesWithOwnedEdges = uint32_t(twae0.size());
     c0.mElementIndex = 0u;
 
     PxgFEMCloth c1 = makeZeroDesc();
     c1.mTriMeshData = reinterpret_cast<void*>(size_t(bTree1.addr));
     c1.mPosition_InvMass = reinterpret_cast<decltype(c1.mPosition_InvMass)>(size_t(bPos1.addr));
-    c1.mTriangleVertexIndices = reinterpret_cast<decltype(c1.mTriangleVertexIndices)>(size_t(bTri1.addr));
-    c1.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c1.mTrianglesWithActiveEdges)>(size_t(bTwae1.addr));
-    c1.mNbTrianglesWithActiveEdges = uint32_t(twae1.size());
+    c1.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c1.mTriangleVertexIndices_ownedEdges)>(size_t(bTri1.addr));
+    c1.mTrianglesWithOwnedEdges = reinterpret_cast<decltype(c1.mTrianglesWithOwnedEdges)>(size_t(bTwae1.addr));
+    c1.mNbTrianglesWithOwnedEdges = uint32_t(twae1.size());
     c1.mElementIndex = 1u;
 
     std::vector<PxgFEMCloth> descArr = { c0, c1 };
@@ -9549,8 +5178,8 @@ PXG_TEST(femClothSimDifferentClothEE)
     DevBuf bUpd = makeDev(dev, upd);
 
     const uint32_t MAXC = 64u;
-    std::vector<FemFemContactInfoHost> outInfo(MAXC);
-    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));
+    std::vector<FemPairInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemPairInfoHost));
     DevBuf bOut = makeDev(dev, outInfo);
 
     // ---- CPU reference: the 3x3 edge loop, query = cloth 0's triangle 0 ----
@@ -9562,7 +5191,7 @@ PXG_TEST(femClothSimDifferentClothEE)
                                  V3{ contactDist, contactDist, contactDist });
     const V3 t0max = p72ref::add(p72ref::vmax(p72ref::vmax(t0pts[0], t0pts[1]), t0pts[2]),
                                  V3{ contactDist, contactDist, contactDist });
-    std::vector<FemFemContactInfoHost> ref;
+    std::vector<FemPairInfoHost> ref;
     for (uint32_t p = 0; p < uint32_t(tris1.size()); ++p)
     {
         const uint32_t vIndices1[3] = { tris1[p].x, tris1[p].y, tris1[p].z };
@@ -9584,17 +5213,14 @@ PXG_TEST(femClothSimDifferentClothEE)
                 if ((s < p72ref::BARY_THR) || (s > p72ref::ONE_MINUS_BARY_THR) ||
                     (t < p72ref::BARY_THR) || (t > p72ref::ONE_MINUS_BARY_THR)) continue;
                 if (!(dq < contactDistSq && dq > 1.0e-14f)) continue;
-                uint32_t aux = PAIR_TYPE_FLAG_MASK_H | VALID_H;
-                aux = (aux & ~AUX_IND0_MASK_H) | (e0 & AUX_IND0_MASK_H);
-                aux = (aux & ~AUX_IND1_MASK_H) | ((e1 & ((1u << AUX_IND1_BITS_H) - 1u)) << AUX_IND0_BITS_H);
-                ref.push_back(FemFemContactInfoHost{ 0ull /*encode(cloth 0, triangle 0)*/,
-                                                     (1u << 20) | p, aux });
+                ref.push_back(FemPairInfoHost{ encClothEdge(0u, 0u, e0), encClothEdge(1u, p, e1) });
             }
         }
     }
     PXG_CHECK_MSG(ref.size() == 2u, "reference: expected 2 EE crossings against cloth 1's triangle 1, got %zu",
                   ref.size());
-    PXG_CHECK_MSG(ref[0].pairInd0 == 0ull && ref[0].pairInd1 == ((1u << 20) | 1u),
+    PXG_CHECK_MSG((ref[0].ref0 & ~(3ull << 27)) == encClothEdge(0u, 0u, 0u) &&
+                  (ref[0].ref1 & ~(3ull << 27)) == encClothEdge(1u, 1u, 0u),
                   "reference: the crossings must be cloth0 triangle 0 vs cloth1 PRIMITIVE 1");
 
     // GRID MIRRORS THE ENGINE: ceil(maxClothTrianglesWithActiveEdges / 2) x numTests.
@@ -9632,8 +5258,8 @@ PXG_TEST(femClothSimDifferentClothEE)
         PXG_CHECK_MSG(gCount == uint32_t(ref.size()),
                       "different-cloth EE (%s pair order) emitted %u contacts (expected %zu)",
                       swapped ? "swapped" : "natural", gCount, ref.size());
-        const auto got = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
-        const size_t mm = compareSets(std::vector<FemFemContactInfoHost>(got.begin(), got.begin() + gCount),
+        const auto got = downloadBuffer<FemPairInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+        const size_t mm = compareSets(std::vector<FemPairInfoHost>(got.begin(), got.begin() + gCount),
                                       ref, swapped ? "EE(swap)" : "EE");
         PXG_CHECK_MSG(mm == 0, "cloth_differentClothCollisionEE (%s pair order) bit-exact vs CPU (%zu mismatches)",
                       swapped ? "swapped" : "natural", mm);
@@ -9971,7 +5597,7 @@ PXG_TEST(femClothSimMeshMidphase)
 
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbTriangles = NB_CLOTH_TRI;
     c.mNbVerts = uint32_t(cv.size());
     std::vector<PxgFEMCloth> descArr = { c };
@@ -10471,7 +6097,7 @@ PXG_TEST(femClothSimMeshMidphase_p89NaNAxis)
     DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
     PxgFEMCloth cl = makeZeroDesc();
     cl.mPosition_InvMass = reinterpret_cast<decltype(cl.mPosition_InvMass)>(size_t(bCv.addr));
-    cl.mTriangleVertexIndices = reinterpret_cast<decltype(cl.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cl.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cl.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     cl.mNbTriangles = uint32_t(NC);
     cl.mNbVerts = uint32_t(cv.size());
     std::vector<PxgFEMCloth> descArr = { cl };
@@ -10900,7 +6526,7 @@ PXG_TEST(femClothSimMeshMidphase_p89SatProbe)
 // paths.  Re-transcribing all of that here would duplicate that fixture, not extend it.  What
 // this fixture covers is the part that is NEW: the BDA plumbing.
 //
-//   * the 192-byte blob, whose stackSizeBytes sits at @64 BEFORE the two stack pointers -- the
+//   * the 176-byte blob (5.12), whose stackSizeBytes sits at @64 BEFORE the two stack pointers -- the
 //     softbody sibling puts it at @80 AFTER them, and reading one pack with the other's layout
 //     hands the kernel a byte count where a device pointer belongs;
 //   * the pair-stack iteration, the ceil-to-a-warp `l` and the per-warp slot packing.  40 pairs
@@ -10912,10 +6538,13 @@ PXG_TEST(femClothSimMeshMidphase_p89SatProbe)
 //   * the transform chain -- vertex2Shape (which MULTIPLIES) then
 //     clothTransform.transformInv(trimeshToWorld) -- with a non-uniform mesh scale and two
 //     DIFFERENT non-trivial rigid transforms;
-//   * the filter skip needing ALL THREE cloth vertices;
+//   * the 5.12 filter: one (rigid filter ref, cloth TRIANGLE) search of the cloth's
+//     mRigidSurfaceFilterPairs.  A vertex ref of a triangle, or the triangle under another
+//     rigid, must NOT suppress it (5.6.1 needed all three cloth vertices filtered);
 //   * restDistance indexed by cmIdx (not by a cache ref, and not by 0);
-//   * the writer's field mapping, including that the u64 contactByX/tempContactByX keys are
-//     left UNTOUCHED by this variant.
+//   * the PxgRigidDbContactWriter field mapping (5.12): pair info {rigid node, triangle ref},
+//     the PxU16 material stream and the full rigid sort key (contactByRigid, its low word,
+//     the identity index).
 //
 // The geometry is chosen so the clip outcome is ANALYTIC: each query triangle is built from the
 // mesh triangle's own cloth-local image, offset along its normal by a chosen gap and sideways by
@@ -10926,32 +6555,27 @@ PXG_TEST(femClothSimMeshMidphase_p89SatProbe)
 // ===========================================================================
 namespace p817cg
 {
+// Byte-identical to ClothMeshCgParams (ABI row kClothMeshContactGen, 5.12).
 struct ClothMeshCgPush
 {
     float toleranceLength; uint32_t pad4;
     uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
              shapeToRigidRemapTable;
     uint32_t stackSizeBytes, pad68;
-    uint64_t stackPtr, midphasePairsNum, filterPairs;
-    uint32_t nbFilterPairs, pad100;
+    uint64_t stackPtr, midphasePairsNum;
     uint64_t stackSizeNeededOnDevice;
-    // PxgFEMContactWriter, by value
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
-    uint32_t wMaxContacts, pad188;
+    // PxgRigidDbContactWriter, by value
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wRigidMat, wCount, wByX, wTempByX, wIdxByX;
+    uint32_t wMaxContacts, pad172;
 };
-static_assert(sizeof(ClothMeshCgPush) == 192, "cloth mesh CG blob must be 192 bytes");
+static_assert(sizeof(ClothMeshCgPush) == 176, "cloth mesh CG blob must be 176 bytes");
 static_assert(offsetof(ClothMeshCgPush, shapeToRigidRemapTable) == 56, "remap table @56");
 static_assert(offsetof(ClothMeshCgPush, stackSizeBytes) == 64, "stackSizeBytes @64, BEFORE the stack pointers");
 static_assert(offsetof(ClothMeshCgPush, stackPtr) == 72, "stackPtr @72");
 static_assert(offsetof(ClothMeshCgPush, midphasePairsNum) == 80, "midphasePairsNum @80");
-static_assert(offsetof(ClothMeshCgPush, nbFilterPairs) == 96, "nbFilterPairs @96");
-static_assert(offsetof(ClothMeshCgPush, stackSizeNeededOnDevice) == 104, "stackSizeNeeded @104");
-static_assert(offsetof(ClothMeshCgPush, wPoint) == 112, "the writer starts @112");
-static_assert(offsetof(ClothMeshCgPush, wMaxContacts) == 184, "maxNumContacts @184");
-
-// PxgRigidFilterPair (32 B): u64 index0, u64 index1, u32 index2, padding.
-struct RigidFilterPairHost { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
-static_assert(sizeof(RigidFilterPairHost) == 32, "PxgRigidFilterPair mirror must be 32 bytes");
+static_assert(offsetof(ClothMeshCgPush, stackSizeNeededOnDevice) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(ClothMeshCgPush, wPoint) == 96, "the writer starts @96");
+static_assert(offsetof(ClothMeshCgPush, wMaxContacts) == 168, "maxNumContacts @168");
 
 using p817mesh::V3;
 using p817mesh::crs;
@@ -11067,7 +6691,7 @@ PXG_TEST(femClothSimMeshContactGen)
         if (i == 0u) return 0.10f;
         if (i == 2u) return -0.05f;     // penetrating: kept by the -cDistance slab
         if (i == 4u) return 0.10f;
-        if (i == 3u) return 0.10f;      // would make contact, but all three verts are filtered
+        if (i == 3u) return 0.10f;      // would make contact, but the triangle is filtered
         if (i == 35u) return 0.02f;
         return 0.25f;                   // outside the +cDistance slab -> clipped to nothing
     };
@@ -11092,9 +6716,24 @@ PXG_TEST(femClothSimMeshContactGen)
 
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbTriangles = NB_PAIRS;
     c.mNbVerts = uint32_t(cv.size());
+    // ---- the filter list (5.12, per cloth, sorted (ref0, ref1)) ------------------------------
+    // (RIGID_ID, triangle 3) suppresses pair 3.  Pair 4 carries two near misses: a VERTEX ref of
+    // one of its corners under the right rigid, and its TRIANGLE ref under another rigid.
+    const uint64_t RIGID_ID = 0x1234000056780000ull;   // dynamic: the filter ref is the node
+    std::vector<FemPairInfoHost> filters = {
+        FemPairInfoHost{ RIGID_ID, encClothVertex(0u, 12u) },
+        FemPairInfoHost{ RIGID_ID, encClothTriangle(0u, 3u) },
+        FemPairInfoHost{ RIGID_ID + 1ull, encClothTriangle(0u, 4u) },
+    };
+    std::sort(filters.begin(), filters.end(), [](const FemPairInfoHost& a, const FemPairInfoHost& b) {
+        return a.ref0 != b.ref0 ? a.ref0 < b.ref0 : a.ref1 < b.ref1;
+    });
+    DevBuf bFilters = makeDev(dev, filters);
+    c.mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFilters.addr));
+    c.mNumRigidSurfaceFilterPairs = uint32_t(filters.size());
     std::vector<PxgFEMCloth> descArr = { c };
     DevBuf bDesc = makeDev(dev, descArr);
 
@@ -11134,26 +6773,8 @@ PXG_TEST(femClothSimMeshContactGen)
     DevBuf bRd = makeDev(dev, rd);
 
     // shapeToRigidRemapTable is indexed by the TRIMESH cache ref (1).
-    const uint64_t RIGID_ID = 0x1234000056780000ull;
     std::vector<uint64_t> remap = { 0xDEADull, RIGID_ID };
     DevBuf bRemap = makeDev(dev, remap);
-
-    // ---- the filter list: all three verts of pair 3, only two of pair 4 ---------------------
-    std::vector<RigidFilterPairHost> filters;
-    auto addFilter = [&](uint32_t vertIdx) {
-        RigidFilterPairHost f = {};
-        f.index0 = RIGID_ID;
-        f.index1 = uint64_t(vertIdx);   // clothId 0 -> the mask IS the vertex index
-        f.index2 = 0u;
-        filters.push_back(f);
-    };
-    for (uint32_t v = 9u; v <= 11u; ++v) addFilter(v);    // pair 3's three vertices
-    addFilter(12u); addFilter(13u);                        // TWO of pair 4's three
-    std::sort(filters.begin(), filters.end(),
-              [](const RigidFilterPairHost& a, const RigidFilterPairHost& b) {
-                  return a.index0 != b.index0 ? a.index0 < b.index0 : a.index1 < b.index1;
-              });
-    DevBuf bFilters = makeDev(dev, filters);
 
     // ---- the pair stack ---------------------------------------------------------------------
     std::vector<uint32_t> stack(NB_PAIRS * 4u, 0u);
@@ -11177,16 +6798,15 @@ PXG_TEST(femClothSimMeshContactGen)
     std::memset(outNormalPen.data(), 0xAB, MAXC * sizeof(F4));
     std::memset(outBary.data(), 0xAB, MAXC * sizeof(F4));
     std::vector<uint32_t> outInfo(MAXC * 4u, 0xABABABABu);
-    std::vector<uint64_t> outByX(MAXC, 0xCDCDCDCDCDCDCDCDull);   // must stay UNTOUCHED
-    std::vector<uint32_t> outTempByX(MAXC, 0xCDCDCDCDu);         // must stay UNTOUCHED
+    std::vector<uint32_t> outMat(MAXC / 2u, 0xABABABABu);         // PxU16 stream
+    std::vector<uint64_t> outByX(MAXC, 0xCDCDCDCDCDCDCDCDull);
+    std::vector<uint32_t> outTempByX(MAXC, 0xCDCDCDCDu);
     std::vector<uint32_t> outIdxByX(MAXC, 0xABABABABu);
-    std::vector<uint32_t> outSorted32(MAXC, 0xABABABABu);
     std::vector<uint32_t> outCount = { 0u };
     DevBuf bPoint = makeDev(dev, outPoint), bNormalPen = makeDev(dev, outNormalPen),
-           bBary = makeDev(dev, outBary), bInfo = makeDev(dev, outInfo),
+           bBary = makeDev(dev, outBary), bInfo = makeDev(dev, outInfo), bMat = makeDev(dev, outMat),
            bByX = makeDev(dev, outByX), bTempByX = makeDev(dev, outTempByX),
-           bIdxByX = makeDev(dev, outIdxByX), bSorted32 = makeDev(dev, outSorted32),
-           bCount = makeDev(dev, outCount);
+           bIdxByX = makeDev(dev, outIdxByX), bCount = makeDev(dev, outCount);
 
     ClothMeshCgPush push = {};
     push.toleranceLength = 1.0f;
@@ -11200,13 +6820,10 @@ PXG_TEST(femClothSimMeshContactGen)
     push.stackSizeBytes = NB_PAIRS * 16u;
     push.stackPtr = bStack.addr;
     push.midphasePairsNum = bPairNum.addr;
-    push.filterPairs = bFilters.addr;
-    push.nbFilterPairs = uint32_t(filters.size());
     push.stackSizeNeededOnDevice = bNeeded.addr;
     push.wPoint = bPoint.addr; push.wNormalPen = bNormalPen.addr; push.wBary = bBary.addr;
-    push.wInfo = bInfo.addr;   push.wCount = bCount.addr;
-    push.wByX = bByX.addr;     push.wTempByX = bTempByX.addr;
-    push.wIdxByX = bIdxByX.addr; push.wSorted32 = bSorted32.addr;
+    push.wInfo = bInfo.addr;   push.wRigidMat = bMat.addr; push.wCount = bCount.addr;
+    push.wByX = bByX.addr; push.wTempByX = bTempByX.addr; push.wIdxByX = bIdxByX.addr;
     push.wMaxContacts = MAXC;
 
     Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {}, sizeof(ClothMeshCgPush));
@@ -11222,7 +6839,7 @@ PXG_TEST(femClothSimMeshContactGen)
     std::vector<Expect> expect;
     for (uint32_t i = 0; i < NB_PAIRS; ++i)
     {
-        if (i == 3u) continue;                       // filtered on all three vertices
+        if (i == 3u) continue;                       // (RIGID_ID, triangle 3) is filtered
         const float g = gapFor(i);
         if (!(g < cDistance) || g > cDistance) continue;
         if (g >= cDistance) continue;
@@ -11242,8 +6859,8 @@ PXG_TEST(femClothSimMeshContactGen)
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
     PXG_CHECK_MSG(gCount == uint32_t(expect.size()),
                   "emitted %u contacts, expected %zu.  0 usually means the blob walk or the "
-                  "transform chain is wrong; 5 means the all-three-vertices filter skip became "
-                  "an any-vertex one; 3 means the second warp's reservation was lost",
+                  "transform chain is wrong; 5 means the triangle filter was lost; 3 means the "
+                  "filter matched a vertex ref or the wrong rigid, or the second warp's reservation was lost",
                   gCount, expect.size());
 
     const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
@@ -11251,7 +6868,9 @@ PXG_TEST(femClothSimMeshContactGen)
     const auto gBary = downloadBuffer<F4>(dev, bBary.h, MAXC);
     const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
     const auto gIdx = downloadBuffer<uint32_t>(dev, bIdxByX.h, MAXC);
-    const auto gSorted = downloadBuffer<uint32_t>(dev, bSorted32.h, MAXC);
+    const auto gMat = downloadBuffer<uint32_t>(dev, bMat.h, MAXC / 2u);
+    const auto gByX = downloadBuffer<uint64_t>(dev, bByX.h, MAXC);
+    const auto gTempByX = downloadBuffer<uint32_t>(dev, bTempByX.h, MAXC);
 
     const V3 wn = qRot(clothQ, fixNormal);
     size_t mm = 0;
@@ -11277,37 +6896,37 @@ PXG_TEST(femClothSimMeshContactGen)
         if (!near1(gBary[s].x, third) || !near1(gBary[s].y, third) || !near1(gBary[s].z, third))
         { ++mm; std::printf("  slot %u barycentric MM: got (%.6f %.6f %.6f), expected thirds\n",
                             s, gBary[s].x, gBary[s].y, gBary[s].z); }
-        // PxgFemOtherContactInfo: pairInd0 = the rigid node index (u64), pairInd1 = the encoded
-        // cloth TRIANGLE, then the rigid material with bit 31 cleared.
-        const uint64_t gotPair0 = uint64_t(gInfo[s * 4 + 0]) | (uint64_t(gInfo[s * 4 + 1]) << 32);
-        if (gotPair0 != RIGID_ID)
-        { ++mm; std::printf("  slot %u pairInd0 MM: got 0x%llx ref 0x%llx\n", s,
-                            (unsigned long long)gotPair0, (unsigned long long)RIGID_ID); }
-        if (gInfo[s * 4 + 2] != e.tri)
-        { ++mm; std::printf("  slot %u pairInd1 MM: got %u ref %u (encoded cloth TRIANGLE)\n",
-                            s, gInfo[s * 4 + 2], e.tri); }
-        if (gInfo[s * 4 + 3] != 0x2Au)
-        { ++mm; std::printf("  slot %u material MM: got 0x%x ref 0x2A\n", s, gInfo[s * 4 + 3]); }
-        if (gSorted[s] != uint32_t(RIGID_ID & 0xFFFFFFFFull))
-        { ++mm; std::printf("  slot %u contactSortedByX MM: got 0x%x ref 0x%x (the LOW word)\n",
-                            s, gSorted[s], uint32_t(RIGID_ID & 0xFFFFFFFFull)); }
+        // PxgDeformablePairInfo: ref0 = the rigid node index (u64), ref1 = the cloth TRIANGLE
+        // ref; the material is its own PxU16 stream.
+        const uint64_t gotRef0 = uint64_t(gInfo[s * 4 + 0]) | (uint64_t(gInfo[s * 4 + 1]) << 32);
+        const uint64_t gotRef1 = uint64_t(gInfo[s * 4 + 2]) | (uint64_t(gInfo[s * 4 + 3]) << 32);
+        if (gotRef0 != RIGID_ID)
+        { ++mm; std::printf("  slot %u ref0 MM: got 0x%llx ref 0x%llx\n", s,
+                            (unsigned long long)gotRef0, (unsigned long long)RIGID_ID); }
+        if (gotRef1 != encClothTriangle(0u, e.tri))
+        { ++mm; std::printf("  slot %u ref1 MM: got 0x%llx ref triangle %u\n",
+                            s, (unsigned long long)gotRef1, e.tri); }
+        const uint32_t mat = (gMat[s / 2u] >> (16u * (s & 1u))) & 0xffffu;
+        if (mat != 0x2Au)
+        { ++mm; std::printf("  slot %u material MM: got 0x%x ref 0x2A\n", s, mat); }
+        if (gByX[s] != RIGID_ID)
+        { ++mm; std::printf("  slot %u contactByRigid MM: got 0x%llx\n", s, (unsigned long long)gByX[s]); }
+        if (gTempByX[s] != uint32_t(RIGID_ID & 0xFFFFFFFFull))
+        { ++mm; std::printf("  slot %u tempContactByRigid MM: got 0x%x ref 0x%x (the LOW word)\n",
+                            s, gTempByX[s], uint32_t(RIGID_ID & 0xFFFFFFFFull)); }
         if (gIdx[s] != s)
         { ++mm; std::printf("  slot %u contactIndexSortedByX MM: got %u ref %u\n", s, gIdx[s], s); }
     }
     PXG_CHECK_MSG(mm == 0, "cloth_meshContactGen contact fields (%zu mismatches)", mm);
 
-    // The u64 sort keys belong to the OTHER writer variant and must be left alone.
-    const auto gByX = downloadBuffer<uint64_t>(dev, bByX.h, MAXC);
-    const auto gTempByX = downloadBuffer<uint32_t>(dev, bTempByX.h, MAXC);
+    // Slots past the last contact keep their sort-key poison.
     size_t touched = 0;
-    for (uint32_t s = 0; s < MAXC; ++s)
+    for (uint32_t s = uint32_t(expect.size()); s < MAXC; ++s)
     {
         if (gByX[s] != 0xCDCDCDCDCDCDCDCDull) ++touched;
         if (gTempByX[s] != 0xCDCDCDCDu) ++touched;
     }
-    PXG_CHECK_MSG(touched == 0,
-                  "writeRigidVsDeformableContact32 must NOT write contactByX / tempContactByX -- "
-                  "%zu of those words changed", touched);
+    PXG_CHECK_MSG(touched == 0, "%zu sort-key words past the last contact changed", touched);
 
     // The slot BEYOND the last contact must still be poison: the reservation is per warp, so a
     // lost or double reservation shows up as a gap or an overwrite here.
@@ -11323,8 +6942,8 @@ PXG_TEST(femClothSimMeshContactGen)
 
     for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bRd.h, bRemap.h, bFilters.h, bStack.h, bPairNum.h, bNeeded.h,
-                               bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h, bTempByX.h,
-                               bIdxByX.h, bSorted32.h, bCount.h })
+                               bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bMat.h, bByX.h, bTempByX.h,
+                               bIdxByX.h, bCount.h })
         dev->destroyBuffer(h);
 }
 
@@ -11658,7 +7277,7 @@ PXG_TEST(femClothSimInPlaneDamping)
     c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
     c.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
     c.mAccumulatedDeltaVel = reinterpret_cast<float4*>(size_t(bDelta.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTri.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(bTri.addr));
     c.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bMatIdx.addr));
     c.mNbVerts = NB_V;
     c.mNbTriangles = NB_T;
@@ -12690,8 +8309,9 @@ struct ClothVertCgPush
     uint64_t shapeToRigidRemap;
     uint32_t stackSizeBytes, pad68;
     uint64_t stackPtr, midphasePairsNum, stackSizeNeeded;
-    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
-    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
+    // PxgRigidDbContactWriter (5.12), by value
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_outRigidMaterialIndex;
+    uint64_t w_totalContactCount, w_contactByRigid, w_tempContactByRigid, w_contactIndexSortedByRigid;
     uint32_t w_maxNumContacts, pad172;
 };
 static_assert(sizeof(ClothVertCgPush) == 176, "cloth vertex CG blob must be 176 bytes");
@@ -12740,9 +8360,10 @@ PXG_TEST(femClothSimMeshVertContactGen)
     p.stackSizeNeeded = bNeeded.addr;
     p.w_outPoint = w.point.addr; p.w_outNormalPen = w.normalPen.addr;
     p.w_outBarycentric = w.barycentric.addr; p.w_outContactInfo = w.info.addr;
+    p.w_outRigidMaterialIndex = w.rigidMat.addr;
     p.w_totalContactCount = bCount.addr;
-    p.w_contactByX = w.byRigid.addr; p.w_tempContactByX = w.tempByRigid.addr;
-    p.w_contactIndexSortedByX = w.idxByRigid.addr; p.w_contactSortedByX = w.sortedByRigid.addr;
+    p.w_contactByRigid = w.byRigid.addr; p.w_tempContactByRigid = w.tempByRigid.addr;
+    p.w_contactIndexSortedByRigid = w.idxByRigid.addr;
     p.w_maxNumContacts = w.maxContacts;
     // cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes and
     // shapeToRigidRemap stay null.  They are in the pack for ABI parity and the kernel
@@ -12774,7 +8395,7 @@ PXG_TEST(femClothSimMeshVertContactGen)
     for (uint32_t i = 0; i < w.maxContacts; ++i)
         PXG_CHECK_MSG(gPoint[i].x == 0.0f && gPoint[i].w == 0.0f &&
                       gNp[i].x == 0.0f && gNp[i].w == 0.0f &&
-                      gBary[i].x == 0.0f && gBary[i].w == 0.0f,
+                      gBary[i].x == kBarySentinel.x && gBary[i].w == kBarySentinel.w,
                       "contact slot %u was written.  This kernel emits NO contacts upstream; if "
                       "that has changed, tools/check_disabled_kernels.py will say so and the "
                       "geometry has to be ported for real", i);
@@ -13011,7 +8632,7 @@ PXG_TEST(femClothSimHeightfieldMidphase)
     const uint32_t CLOTH_ID = 1u;
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbVerts = NB_VERTS;
     c.mNbTriangles = NB_TRIS;
     std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
@@ -13402,7 +9023,7 @@ PXG_TEST(femClothSimHeightfieldMidphaseRotated)
     const uint32_t CLOTH_ID = 1u;
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbVerts = NB;
     c.mNbTriangles = NB;
     std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
@@ -13551,7 +9172,8 @@ struct ClothHfCgPush
              shapeToRigidRemapTable, stackPtr, midphasePairsNum;
     uint32_t stackSizeBytes, pad84;
     uint64_t stackSizeNeededOnDevice;
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    // PxgRigidDbContactWriter (5.12), by value
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wRigidMat, wCount, wByX, wTempByX, wIdxByX;
     uint32_t wMaxContacts, pad172;
 };
 static_assert(sizeof(ClothHfCgPush) == 176, "cloth hf CG blob must be 176 bytes");
@@ -13567,7 +9189,7 @@ struct ClothHfVertCgPush
     float toleranceLength; uint32_t pad4;
     uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
              shapeToRigidRemapTable, stackPtr, midphasePairsNum;
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wRigidMat, wCount, wByX, wTempByX, wIdxByX;
     uint32_t wMaxContacts, pad156;
     uint32_t stackSizeBytes, pad164;
     uint64_t stackSizeNeededOnDevice;
@@ -13713,7 +9335,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
 
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbTriangles = NB_PAIRS;
     c.mNbVerts = uint32_t(cv.size());
     // Cloth id ONE, not zero.  `pairInd1` is `(clothId << 20) | triangleIdx`, and with
@@ -13808,7 +9430,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     hp.wPoint = wHf.point.addr; hp.wNormalPen = wHf.normalPen.addr;
     hp.wBary = wHf.barycentric.addr; hp.wInfo = wHf.info.addr; hp.wCount = wHf.count.addr;
     hp.wByX = wHf.byRigid.addr; hp.wTempByX = wHf.tempByRigid.addr;
-    hp.wIdxByX = wHf.idxByRigid.addr; hp.wSorted32 = wHf.sortedByRigid.addr;
+    hp.wIdxByX = wHf.idxByRigid.addr; hp.wRigidMat = wHf.rigidMat.addr;
     hp.wMaxContacts = MAXC;
     Kernel kh("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch",
               {}, sizeof(ClothHfCgPush));
@@ -13824,12 +9446,11 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     mp.shapeToRigidRemapTable = bRemap.addr;
     mp.stackSizeBytes = NB_STACK * 16u;
     mp.stackPtr = bMeshStack.addr; mp.midphasePairsNum = bMeshNum.addr;
-    mp.filterPairs = 0ull; mp.nbFilterPairs = 0u;
     mp.stackSizeNeededOnDevice = bMeshNeeded.addr;
     mp.wPoint = wMesh.point.addr; mp.wNormalPen = wMesh.normalPen.addr;
     mp.wBary = wMesh.barycentric.addr; mp.wInfo = wMesh.info.addr; mp.wCount = wMesh.count.addr;
     mp.wByX = wMesh.byRigid.addr; mp.wTempByX = wMesh.tempByRigid.addr;
-    mp.wIdxByX = wMesh.idxByRigid.addr; mp.wSorted32 = wMesh.sortedByRigid.addr;
+    mp.wIdxByX = wMesh.idxByRigid.addr; mp.wRigidMat = wMesh.rigidMat.addr;
     mp.wMaxContacts = MAXC;
     Kernel km("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch",
               {}, sizeof(p817cg::ClothMeshCgPush));
@@ -13866,7 +9487,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
         for (uint32_t i = 0; i < n && i < MAXC; ++i)
         {
             Rec r{};
-            r.tri = info[i * 4 + 2] & ((1u << 20) - 1u);
+            r.tri = info[i * 4 + 2] & ((1u << 27) - 1u);   // the PxgDeformableRef feature
             const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
                                     np[i].x, np[i].y, np[i].z, np[i].w,
                                     ba[i].x, ba[i].y, ba[i].z, ba[i].w };
@@ -13895,13 +9516,21 @@ PXG_TEST(femClothSimHeightfieldContactGen)
                   "kernels over the identical static triangle.  Both call the same core, so "
                   "the difference is the heightfield glue", mismatches, recHf.size());
 
-    // The contact INFO words must agree too -- the rigid id, the encoded cloth index and
-    // the material all come from the glue, not from the shared core.
+    // The contact INFO must agree too -- the rigid id, the cloth triangle ref and the
+    // material all come from the glue, not from the shared core.
     for (uint32_t i = 0; i < nHf && i < MAXC; ++i)
-        PXG_CHECK_MSG(iHf[i * 4 + 3] == 0x2Au,
+    {
+        const uint32_t mat = readRigidMat(dev, wHf, i);
+        PXG_CHECK_MSG(mat == 0x2Au,
                       "contact %u carries material 0x%X, expected the HEIGHTFIELD shape's "
-                      "0x2A -- a port reading the CLOTH's materialIndex would get 0", i,
-                      iHf[i * 4 + 3]);
+                      "0x2A -- a port reading the CLOTH's materialIndex would get 0", i, mat);
+        const uint64_t r0 = uint64_t(iHf[i * 4 + 0]) | (uint64_t(iHf[i * 4 + 1]) << 32);
+        const uint64_t r1 = uint64_t(iHf[i * 4 + 2]) | (uint64_t(iHf[i * 4 + 3]) << 32);
+        PXG_CHECK_MSG(r0 == 0x00000007ull && r1 == encClothTriangle(CLOTH_ID, uint32_t(r1 & ((1u << 27) - 1u))),
+                      "contact %u pair info (0x%llx, 0x%llx): expected the remapped rigid node "
+                      "and a TRIANGLE ref of cloth %u", i, (unsigned long long)r0,
+                      (unsigned long long)r1, CLOTH_ID);
+    }
 
     // The stack high-water mark: UNCLAMPED, in bytes.
     const uint32_t needHf = downloadBuffer<uint32_t>(dev, bHfNeeded.h, 1)[0];
@@ -13922,7 +9551,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
         tp.wPoint = wt.point.addr; tp.wNormalPen = wt.normalPen.addr;
         tp.wBary = wt.barycentric.addr; tp.wInfo = wt.info.addr; tp.wCount = wt.count.addr;
         tp.wByX = wt.byRigid.addr; tp.wTempByX = wt.tempByRigid.addr;
-        tp.wIdxByX = wt.idxByRigid.addr; tp.wSorted32 = wt.sortedByRigid.addr;
+        tp.wIdxByX = wt.idxByRigid.addr; tp.wRigidMat = wt.rigidMat.addr;
         tp.wMaxContacts = TIGHT;                    // ... only the kernel's bound moves
         std::vector<uint32_t> nd2 = { 0u };
         DevBuf bNd2 = makeDev(dev, nd2);
@@ -13977,7 +9606,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
         vp.wBary = w2.barycentric.addr; vp.wInfo = w2.info.addr;
         vp.wCount = bCount.addr;
         vp.wByX = w2.byRigid.addr; vp.wTempByX = w2.tempByRigid.addr;
-        vp.wIdxByX = w2.idxByRigid.addr; vp.wSorted32 = w2.sortedByRigid.addr;
+        vp.wIdxByX = w2.idxByRigid.addr; vp.wRigidMat = w2.rigidMat.addr;
         vp.wMaxContacts = MAXC;
         // cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes and
         // shapeToRigidRemapTable stay NULL.  They are in the pack for ABI parity and the
@@ -14140,7 +9769,7 @@ static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t
     DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
     PxgFEMCloth c = makeZeroDesc();
     c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
-    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     c.mNbTriangles = 1u; c.mNbVerts = 3u;
     std::vector<PxgFEMCloth> descArr = { c };
     DevBuf bDesc = makeDev(dev, descArr);
@@ -14190,7 +9819,7 @@ static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t
         p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
         p.wInfo = w.info.addr; p.wCount = w.count.addr;
         p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
-        p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+        p.wIdxByX = w.idxByRigid.addr; p.wRigidMat = w.rigidMat.addr;
         p.wMaxContacts = w.maxContacts;
         Kernel k("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch", {},
                  sizeof(p927cg::ClothHfCgPush));
@@ -14205,12 +9834,11 @@ static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t
         p.gpuShapes = bShapes.addr; p.femClothes = bDesc.addr;
         p.shapeToRigidRemapTable = bRemap.addr;
         p.stackSizeBytes = 16u; p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
-        p.filterPairs = 0ull; p.nbFilterPairs = 0u;
         p.stackSizeNeededOnDevice = bNeeded.addr;
         p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
         p.wInfo = w.info.addr; p.wCount = w.count.addr;
         p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
-        p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+        p.wIdxByX = w.idxByRigid.addr; p.wRigidMat = w.rigidMat.addr;
         p.wMaxContacts = w.maxContacts;
         Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {},
                  sizeof(p817cg::ClothMeshCgPush));
@@ -14317,8 +9945,9 @@ PXG_TEST(femClothSimHeightfieldContactGenP94ZeroSign)
 //     comment at the launch site claims -- would see 1 pair in 32 (S1);
 //   * a midphase count that OVERSHOOTS the stack bound, so S4's clamp and S8's
 //     UNCLAMPED high-water mark pull opposite ways in one run;
-//   * a filter list naming ALL THREE corners of one triangle and TWO of
-//     another: the first must vanish, the second must survive (S7);
+//   * a filter list (5.12: the cloth's mRigidSurfaceFilterPairs) naming one
+//     triangle against both rigids, and only the corner VERTICES of another:
+//     the first must vanish, the second must survive (S7);
 //   * capsule-vs-triangle cases that reach THREE different exits of
 //     distanceSegmentTriangleSquared -- the plane-crossing early out, the
 //     both-projections-interior branch, and the edge fallback -- because the
@@ -14336,43 +9965,37 @@ using p817cg::add;
 using p817cg::scl;
 using p817cg::dot;
 
-using p817cg::RigidFilterPairHost;
-
-// The kernel shares cloth_boxTriangleContactGenLaunch's fifteen-argument pack --
-// and NOT cloth_meshContactGenLaunch's, which this fixture reached for first and
-// paid for with a deterministic segfault.  Both are 192 bytes AND both put the
-// writer at @112, so sizeof and the one static_assert everybody checks agree.
+// The kernel shares cloth_boxTriangleContactGenLaunch's pack (ABI row kClothBoxTriCg)
+// -- and NOT cloth_meshContactGenLaunch's, which this fixture reached for first and
+// paid for with a deterministic segfault.  Both are 176 bytes (5.12) AND both put the
+// writer at @96, so sizeof and the one static_assert everybody checks agree.
 // The MIDDLE does not:
 //
 //              mesh (ClothMeshCgPush)        box-triangle (this one)
 //     @64      stackSizeBytes                stackPtr
 //     @72      stackPtr                      midphasePairsNum
-//     @80      midphasePairsNum              filterPairs
-//     @88      filterPairs                   nbFilterPairs
-//     @96      nbFilterPairs                 stackSizeNeeded
-//     @104     stackSizeNeeded               (pad -- paramAlign(80) is 16)
+//     @80      midphasePairsNum              stackSizeBytes
+//     @88      stackSizeNeeded               stackSizeNeeded
 //
 // Every asserted offset below is therefore load-bearing, not decoration.
 struct ClothSphereTriPush
 {
     float toleranceLength; uint32_t pad4;
     uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
-             shapeToRigidRemapTable, stackPtr, midphasePairsNum, filterPairs;
-    uint32_t nbFilterPairs, stackSizeBytes;
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
     uint64_t stackSizeNeededOnDevice;
-    uint64_t pad104;                 // paramAlign(80) == 16, so the writer lands at 112
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
-    uint32_t wMaxContacts, pad188;
+    // PxgRigidDbContactWriter (5.12), by value
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wRigidMat, wCount, wByX, wTempByX, wIdxByX;
+    uint32_t wMaxContacts, pad172;
 };
-static_assert(sizeof(ClothSphereTriPush) == 192, "cloth sphere/capsule TRIANGLE blob must be 192 bytes");
+static_assert(sizeof(ClothSphereTriPush) == 176, "cloth sphere/capsule TRIANGLE blob must be 176 bytes");
 static_assert(offsetof(ClothSphereTriPush, stackPtr) == 64, "stackPtr @64 -- NOT stackSizeBytes");
 static_assert(offsetof(ClothSphereTriPush, midphasePairsNum) == 72, "midphasePairsNum @72");
-static_assert(offsetof(ClothSphereTriPush, filterPairs) == 80, "filterPairs @80");
-static_assert(offsetof(ClothSphereTriPush, nbFilterPairs) == 88, "nbFilterPairs @88");
-static_assert(offsetof(ClothSphereTriPush, stackSizeBytes) == 92, "stackSizeBytes @92");
-static_assert(offsetof(ClothSphereTriPush, stackSizeNeededOnDevice) == 96, "stackSizeNeeded @96");
-static_assert(offsetof(ClothSphereTriPush, wPoint) == 112, "the writer starts @112");
-static_assert(offsetof(ClothSphereTriPush, wMaxContacts) == 184, "maxNumContacts @184");
+static_assert(offsetof(ClothSphereTriPush, stackSizeBytes) == 80, "stackSizeBytes @80");
+static_assert(offsetof(ClothSphereTriPush, stackSizeNeededOnDevice) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(ClothSphereTriPush, wPoint) == 96, "the writer starts @96");
+static_assert(offsetof(ClothSphereTriPush, wMaxContacts) == 168, "maxNumContacts @168");
 
 static const uint32_t GEOM_SPHERE_H = uint32_t(physx::PxGeometryType::eSPHERE);    // PxGeometryType::eSPHERE
 static const uint32_t GEOM_CAPSULE_H = uint32_t(physx::PxGeometryType::eCAPSULE);   // PxGeometryType::eCAPSULE
@@ -14752,13 +10375,9 @@ PXG_TEST(femClothSimSphereTriContactGen)
 
     PxgFEMCloth cloth = makeZeroDesc();
     cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cloth.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     cloth.mNbTriangles = NB_TRIS;
     cloth.mNbVerts = uint32_t(cv.size());
-    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
-    descArr[CLOTH_ID] = cloth;
-    DevBuf bDesc = makeDev(dev, descArr);
-
     // ---- shapes: 0 = cloth, 1 = sphere, 2 = capsule -----------------------------------
     std::vector<PxgShapeHost> shapes(3);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
@@ -14793,35 +10412,35 @@ PXG_TEST(femClothSimSphereTriContactGen)
     std::vector<uint64_t> remap = { 0ull, NODE_SPHERE, NODE_CAPSULE };
     DevBuf bRemap = makeDev(dev, remap);
 
-    // ---- the filter list (S7) ---------------------------------------------------------
-    // Triangle 6: ALL THREE corners against BOTH rigids -> must vanish from both runs.
-    // Triangle 9: TWO corners only -> must survive, and its absence would mean the port
-    // used `||`.
+    // ---- the filter list (S7, 5.12) ---------------------------------------------------
+    // The cloth's mRigidSurfaceFilterPairs, keyed (rigid filter ref, cloth feature ref); a
+    // dynamic rigid's filter ref is its node.
+    // FILTERED_TRI: its TRIANGLE ref against BOTH rigids -> must vanish.
+    // PARTIAL_TRI: all three corner VERTEX refs against both rigids, but not the triangle
+    // -> must survive: the triangle path searches the triangle ref only.
     // Both are triangles this rig MEASURED as contacting: triangle 12 is even, so
     // it belongs to manager 0 (the SPHERE), and 21 is odd, so it belongs to
     // manager 1 (the CAPSULE).  Picking them by eye is what the first version did,
     // and it drew a filtered triangle that never touched anything -- a check that
     // cannot fail is not a check, so the non-vacuity of BOTH is asserted below.
     const uint32_t FILTERED_TRI = 12u, PARTIAL_TRI = 21u;
-    std::vector<RigidFilterPairHost> filters;
-    auto pushFilter = [&](uint64_t node, uint32_t vert) {
-        RigidFilterPairHost f{};
-        f.index0 = node;
-        f.index1 = uint64_t((CLOTH_ID << 20) | vert);
-        filters.push_back(f);
-    };
+    std::vector<FemPairInfoHost> filters;
     for (uint64_t node : { NODE_SPHERE, NODE_CAPSULE })
     {
-        for (uint32_t k = 0; k < 3u; ++k) pushFilter(node, FILTERED_TRI * 3u + k);
-        for (uint32_t k = 0; k < 2u; ++k) pushFilter(node, PARTIAL_TRI * 3u + k);
+        filters.push_back(FemPairInfoHost{ node, encClothTriangle(CLOTH_ID, FILTERED_TRI) });
+        for (uint32_t k = 0; k < 3u; ++k)
+            filters.push_back(FemPairInfoHost{ node, encClothVertex(CLOTH_ID, ci[PARTIAL_TRI].x + k) });
     }
-    // findRigid does a BINARY search: the list must be sorted by (index0, index1).
-    std::sort(filters.begin(), filters.end(),
-              [](const RigidFilterPairHost& a, const RigidFilterPairHost& b) {
-                  if (a.index0 != b.index0) return a.index0 < b.index0;
-                  return a.index1 < b.index1;
-              });
+    // find() does a BINARY search: the list must be sorted by (ref0, ref1).
+    std::sort(filters.begin(), filters.end(), [](const FemPairInfoHost& a, const FemPairInfoHost& b) {
+        return a.ref0 != b.ref0 ? a.ref0 < b.ref0 : a.ref1 < b.ref1;
+    });
     DevBuf bFilters = makeDev(dev, filters);
+    cloth.mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFilters.addr));
+    cloth.mNumRigidSurfaceFilterPairs = uint32_t(filters.size());
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
 
     // ---- the pair stack ----------------------------------------------------------------
     // S4/S8: the midphase claims MORE than the stack holds.  The surplus entries are
@@ -14853,12 +10472,11 @@ PXG_TEST(femClothSimSphereTriContactGen)
     p.shapeToRigidRemapTable = bRemap.addr;
     p.stackSizeBytes = NB_STACK * 16u;
     p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
-    p.filterPairs = bFilters.addr; p.nbFilterPairs = uint32_t(filters.size());
     p.stackSizeNeededOnDevice = bNeeded.addr;
     p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr;
     p.wBary = w.barycentric.addr; p.wInfo = w.info.addr; p.wCount = w.count.addr;
     p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
-    p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+    p.wIdxByX = w.idxByRigid.addr; p.wRigidMat = w.rigidMat.addr;
     p.wMaxContacts = MAXC;
 
     Kernel k("femClothContactGenBda.spv", "cloth_SphereContactGenLaunch",
@@ -14877,14 +10495,10 @@ PXG_TEST(femClothSimSphereTriContactGen)
         const bool isSphere = (cm == 0u);
         const uint64_t node = isSphere ? NODE_SPHERE : NODE_CAPSULE;
 
-        uint32_t nFiltered = 0u;
-        for (uint32_t kk = 0; kk < 3u; ++kk)
-        {
-            const uint64_t key = uint64_t((CLOTH_ID << 20) | (tri * 3u + kk));
-            for (const auto& f : filters)
-                if (f.index0 == node && f.index1 == key) { ++nFiltered; break; }
-        }
-        if (nFiltered == 3u) continue;        // S7: AND over all three
+        bool filtered = false;
+        for (const auto& f : filters)
+            if (f.ref0 == node && f.ref1 == encClothTriangle(CLOTH_ID, tri)) { filtered = true; break; }
+        if (filtered) continue;               // S7: one (rigid, triangle) search
 
         const V3 a{ cv[tri * 3 + 0].x, cv[tri * 3 + 0].y, cv[tri * 3 + 0].z };
         const V3 b{ cv[tri * 3 + 1].x, cv[tri * 3 + 1].y, cv[tri * 3 + 1].z };
@@ -14922,18 +10536,19 @@ PXG_TEST(femClothSimSphereTriContactGen)
     const auto ba = downloadBuffer<F4>(dev, w.barycentric.h, MAXC);
     const auto info = downloadBuffer<uint32_t>(dev, w.info.h, MAXC * 4u);
 
-    struct Rec { uint32_t key[16]; };
+    struct Rec { uint32_t key[17]; };
     auto less = [](const Rec& x, const Rec& y) {
-        for (int i = 0; i < 16; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
+        for (int i = 0; i < 17; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
         return false;
     };
     std::vector<Rec> gpu, ref;
     for (uint32_t i = 0; i < got && i < MAXC; ++i)
     {
         Rec r{};
-        r.key[0] = info[i * 4 + 2];                     // pairInd1 = (clothId<<20)|tri
-        r.key[1] = info[i * 4 + 0]; r.key[2] = info[i * 4 + 1];   // pairInd0 (u64)
-        r.key[3] = info[i * 4 + 3];                     // material
+        r.key[0] = info[i * 4 + 2];                     // ref1.lo = (TRIANGLE << 29) | tri
+        r.key[1] = info[i * 4 + 0]; r.key[2] = info[i * 4 + 1];   // ref0 = the rigid node
+        r.key[3] = readRigidMat(dev, w, i);             // the PxU16 material stream
+        r.key[16] = info[i * 4 + 3];                    // ref1.hi = clothId << 2
         const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
                                 np[i].x, np[i].y, np[i].z, np[i].w,
                                 ba[i].x, ba[i].y, ba[i].z, ba[i].w };
@@ -14943,9 +10558,11 @@ PXG_TEST(femClothSimSphereTriContactGen)
     for (const Exp& e : expected)
     {
         Rec r{};
-        r.key[0] = (CLOTH_ID << 20) | e.tri;
+        const uint64_t ref1 = encClothTriangle(CLOTH_ID, e.tri);
+        r.key[0] = uint32_t(ref1 & 0xffffffffull);
         r.key[1] = uint32_t(e.node & 0xffffffffull); r.key[2] = uint32_t(e.node >> 32);
-        r.key[3] = e.mat & 0x7fffffffu;
+        r.key[3] = e.mat & 0xffffu;
+        r.key[16] = uint32_t(ref1 >> 32);
         const float src[12] = { e.h.point.x, e.h.point.y, e.h.point.z, e.h.point.w,
                                 e.h.normalPen.x, e.h.normalPen.y, e.h.normalPen.z, e.h.normalPen.w,
                                 e.h.bary.x, e.h.bary.y, e.h.bary.z, e.h.bary.w };
@@ -14955,16 +10572,16 @@ PXG_TEST(femClothSimSphereTriContactGen)
     std::sort(gpu.begin(), gpu.end(), less);
     std::sort(ref.begin(), ref.end(), less);
 
-    static const char* const KEY_NAME[16] = {
-        "pairInd1", "pairInd0.lo", "pairInd0.hi", "material",
+    static const char* const KEY_NAME[17] = {
+        "ref1.lo", "ref0.lo", "ref0.hi", "material",
         "point.x", "point.y", "point.z", "point.w(rest)",
         "normal.x", "normal.y", "normal.z", "penetration",
-        "bary.x", "bary.y", "bary.z", "bary.w"
+        "bary.x", "bary.y", "bary.z", "bary.w", "ref1.hi"
     };
     uint32_t mismatches = 0u;
     int firstField = -1; size_t firstAt = 0;
     for (size_t i = 0; i < gpu.size() && i < ref.size(); ++i)
-        for (int j = 0; j < 16; ++j)
+        for (int j = 0; j < 17; ++j)
             if (gpu[i].key[j] != ref[i].key[j])
             {
                 ++mismatches;
@@ -14978,7 +10595,7 @@ PXG_TEST(femClothSimSphereTriContactGen)
         std::printf("    first difference at sorted slot %zu, field %s: gpu 0x%08X (%.9g) "
                     "vs mirror 0x%08X (%.9g); tri %u\n",
                     firstAt, KEY_NAME[firstField], gw, gf, rw, rf,
-                    gpu[firstAt].key[0] & ((1u << 20) - 1u));
+                    gpu[firstAt].key[0] & ((1u << 27) - 1u));
     }
     PXG_CHECK_MSG(mismatches == 0u,
                   "%u of %zu contacts differ BIT-EXACTLY from the host mirror of "
@@ -14989,7 +10606,7 @@ PXG_TEST(femClothSimSphereTriContactGen)
     uint32_t sawFiltered = 0u, sawPartial = 0u;
     for (const Rec& r : gpu)
     {
-        const uint32_t tri = r.key[0] & ((1u << 20) - 1u);
+        const uint32_t tri = r.key[0] & ((1u << 27) - 1u);
         if (tri == FILTERED_TRI) ++sawFiltered;
         if (tri == PARTIAL_TRI) ++sawPartial;
     }
@@ -15010,11 +10627,11 @@ PXG_TEST(femClothSimSphereTriContactGen)
                       "below cannot fail and proves nothing", FILTERED_TRI);
     }
     PXG_CHECK_MSG(sawFiltered == 0u,
-                  "triangle %u has ALL THREE corners filtered against both rigids and still "
-                  "produced %u contacts", FILTERED_TRI, sawFiltered);
+                  "triangle %u is filtered against both rigids and still produced %u contacts",
+                  FILTERED_TRI, sawFiltered);
     PXG_CHECK_MSG(sawPartial > 0u,
-                  "triangle %u has only TWO of three corners filtered and produced nothing: "
-                  "the filter is an AND (S7), and this is what an `||` port loses", PARTIAL_TRI);
+                  "triangle %u has only its corner VERTEX refs filtered and produced nothing: "
+                  "the triangle path searches the TRIANGLE ref (S7, 5.12)", PARTIAL_TRI);
 
     // The capsule core's branch coverage, measured rather than asserted in a comment.
     // distanceSegmentTriangleSquared has five exits and they are sixty lines apart; a
@@ -15048,7 +10665,7 @@ PXG_TEST(femClothSimSphereTriContactGen)
                   needed, NB_FOUND, NB_FOUND * 16u, NB_STACK * 16u);
 
     std::printf("    [ note ] %zu contacts (%u sphere, %u capsule) over %u clamped pairs of "
-                "%u claimed; triangle %u filtered out, %u survived on a partial filter\n",
+                "%u claimed; triangle %u filtered out, %u survived its vertex filters\n",
                 expected.size(), nSphere, nCapsule, NB_STACK, NB_FOUND, FILTERED_TRI, PARTIAL_TRI);
 
     // ---- S1, second half: the GRID STRIDE ------------------------------------------
@@ -15087,11 +10704,10 @@ PXG_TEST(femClothSimSphereTriContactGen)
         q.stackPtr = bBig.addr; q.midphasePairsNum = bBigNum.addr;
         q.stackSizeBytes = (STRIDE + TAIL) * 16u;
         q.stackSizeNeededOnDevice = bBigNeeded.addr;
-        q.filterPairs = 0ull; q.nbFilterPairs = 0u;
         q.wPoint = w2.point.addr; q.wNormalPen = w2.normalPen.addr;
         q.wBary = w2.barycentric.addr; q.wInfo = w2.info.addr; q.wCount = w2.count.addr;
         q.wByX = w2.byRigid.addr; q.wTempByX = w2.tempByRigid.addr;
-        q.wIdxByX = w2.idxByRigid.addr; q.wSorted32 = w2.sortedByRigid.addr;
+        q.wIdxByX = w2.idxByRigid.addr; q.wRigidMat = w2.rigidMat.addr;
         q.wMaxContacts = 64u;
         k.dispatch(GRID, {}, q, 1u, 1u);
         dev->flush();
@@ -15272,7 +10888,7 @@ PXG_TEST(femClothSimCapsuleTriClampZeroSign)
 
     PxgFEMCloth cloth = makeZeroDesc();
     cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cloth.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     cloth.mNbTriangles = NB_TRIS;
     cloth.mNbVerts = uint32_t(cv.size());
     std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
@@ -15321,12 +10937,11 @@ PXG_TEST(femClothSimCapsuleTriClampZeroSign)
     p.shapeToRigidRemapTable = bRemap.addr;
     p.stackSizeBytes = NB_TRIS * 16u;
     p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
-    p.filterPairs = 0ull; p.nbFilterPairs = 0u;
     p.stackSizeNeededOnDevice = bNeeded.addr;
     p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr;
     p.wBary = w.barycentric.addr; p.wInfo = w.info.addr; p.wCount = w.count.addr;
     p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
-    p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+    p.wIdxByX = w.idxByRigid.addr; p.wRigidMat = w.rigidMat.addr;
     p.wMaxContacts = MAXC;
 
     Kernel k("femClothContactGenBda.spv", "cloth_SphereContactGenLaunch",
@@ -15344,17 +10959,18 @@ PXG_TEST(femClothSimCapsuleTriClampZeroSign)
     uint32_t seen[2] = { 0u, 0u };
     for (uint32_t i = 0; i < got && i < MAXC; ++i)
     {
-        const uint32_t pairInd1 = info[i * 4 + 2];
-        const uint32_t tri = pairInd1 & ((1u << 20) - 1u);
-        PXG_CHECK_MSG(tri < NB_TRIS && (pairInd1 >> 20) == CLOTH_ID,
-                      "contact %u names pairInd1 0x%08X", i, pairInd1);
+        const uint64_t ref1 = uint64_t(info[i * 4 + 2]) | (uint64_t(info[i * 4 + 3]) << 32);
+        const uint32_t tri = uint32_t(ref1 & ((1u << 27) - 1u));
+        PXG_CHECK_MSG(tri < NB_TRIS && ref1 == encClothTriangle(CLOTH_ID, tri),
+                      "contact %u names ref1 0x%016llX", i, (unsigned long long)ref1);
         if (tri >= NB_TRIS) continue;
         ++seen[tri];
+        const uint32_t mat = readRigidMat(dev, w, i);
         PXG_CHECK_MSG(info[i * 4 + 0] == uint32_t(NODE_CAPSULE & 0xffffffffull) &&
                       info[i * 4 + 1] == uint32_t(NODE_CAPSULE >> 32) &&
-                      info[i * 4 + 3] == (MAT_CAPSULE & 0x7fffffffu),
+                      mat == (MAT_CAPSULE & 0xffffu),
                       "tri %c info record %08X %08X / mat %08X", 'A' + char(tri),
-                      info[i * 4 + 1], info[i * 4 + 0], info[i * 4 + 3]);
+                      info[i * 4 + 1], info[i * 4 + 0], mat);
         const Hit gh{ pt[i], np[i], ba[i] };
         const Img g = image(gh);
         for (int j = 0; j < 12; ++j)
@@ -15407,28 +11023,29 @@ static_assert(offsetof(ClothPsMidphasePush, stackSizeBytes) == 64, "stackSizeByt
 static_assert(offsetof(ClothPsMidphasePush, stackPtr) == 72, "stackPtr @72");
 static_assert(offsetof(ClothPsMidphasePush, midphasePairsNum) == 80, "midphasePairsNum @80");
 
-// cloth_psContactGenLaunch: thirteen arguments, writer by value -> 176 bytes.
-// The cloth-vs-heightfield contact gen's blob is ALSO 176 with its writer ALSO
-// at 96 and a different middle, so every offset here is asserted.
+// cloth_psContactGenLaunch (5.12): twelve arguments, the 72-byte
+// PxgParticleDbContactWriter by value -> 160 bytes (ABI row kClothPsCg).  5.12 dropped
+// the restDistance argument; the writer has no material stream and no 32-bit sorted lane.
 struct ClothPsCgPush
 {
     float toleranceLength; uint32_t pad4;
-    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes,
-             particleSystems, femClothes;
-    uint32_t stackSizeBytes, pad68;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, particleSystems, femClothes;
+    uint32_t stackSizeBytes, pad60;
     uint64_t stackPtr, midphasePairsNum, stackSizeNeeded;
-    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
-    uint32_t wMaxContacts, pad172;
+    // PxgParticleDbContactWriter: point, normalPen, bary, info, count, byParticle,
+    // tempByParticle, indexSortedByParticle, maxNumContacts
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;
+    uint32_t wMaxContacts, pad156;
 };
-static_assert(sizeof(ClothPsCgPush) == 176, "cloth ps CG blob must be 176 bytes");
-static_assert(offsetof(ClothPsCgPush, particleSystems) == 48, "particleSystems @48");
-static_assert(offsetof(ClothPsCgPush, femClothes) == 56, "femClothes @56 -- AFTER particleSystems");
-static_assert(offsetof(ClothPsCgPush, stackSizeBytes) == 64, "stackSizeBytes @64");
-static_assert(offsetof(ClothPsCgPush, stackPtr) == 72, "stackPtr @72");
-static_assert(offsetof(ClothPsCgPush, midphasePairsNum) == 80, "midphasePairsNum @80");
-static_assert(offsetof(ClothPsCgPush, stackSizeNeeded) == 88, "stackSizeNeeded @88");
-static_assert(offsetof(ClothPsCgPush, wPoint) == 96, "the writer starts @96 -- paramAlign(80) is 16");
-static_assert(offsetof(ClothPsCgPush, wMaxContacts) == 168, "maxNumContacts @168");
+static_assert(sizeof(ClothPsCgPush) == 160, "cloth ps CG blob must be 160 bytes");
+static_assert(offsetof(ClothPsCgPush, particleSystems) == 40, "particleSystems @40");
+static_assert(offsetof(ClothPsCgPush, femClothes) == 48, "femClothes @48 -- AFTER particleSystems");
+static_assert(offsetof(ClothPsCgPush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(ClothPsCgPush, stackPtr) == 64, "stackPtr @64");
+static_assert(offsetof(ClothPsCgPush, midphasePairsNum) == 72, "midphasePairsNum @72");
+static_assert(offsetof(ClothPsCgPush, stackSizeNeeded) == 80, "stackSizeNeeded @80");
+static_assert(offsetof(ClothPsCgPush, wPoint) == 88, "the writer starts @88 -- paramAlign(72) is 8");
+static_assert(offsetof(ClothPsCgPush, wMaxContacts) == 152, "maxNumContacts @152");
 
 static const uint32_t GEOM_PARTICLESYSTEM_H = uint32_t(physx::PxGeometryType::ePARTICLESYSTEM);   // PxGeometryType::ePARTICLESYSTEM
 
@@ -15505,7 +11122,7 @@ PXG_TEST(femClothSimPsMidphase)
     PxgFEMCloth cloth = makeZeroDesc();
     cloth.mTriMeshData = reinterpret_cast<decltype(cloth.mTriMeshData)>(size_t(bTree.addr));
     cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cloth.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     cloth.mNbTriangles = NB_TRIS;
     cloth.mNbVerts = uint32_t(cv.size());
     std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
@@ -15724,9 +11341,8 @@ PXG_TEST(femClothSimPsContactGen)
 
     const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
     // DIFFERENT contact distances per cache ref, so the SUM (C5) is separable from
-    // either one, and a rest distance that is neither (C4).
+    // either one.  (5.12: no rest distance in contact generation, C4.)
     const float CD_PARTICLE = 0.30f, CD_CLOTH = 0.10f;
-    const float REST_0 = 0.07f, REST_1 = 0.19f;      // per contact manager (C4)
 
     // ---- one cloth triangle per pair, tilted so no axis is special ----------------
     const uint32_t NB_TRIS = 8u;
@@ -15746,7 +11362,7 @@ PXG_TEST(femClothSimPsContactGen)
 
     PxgFEMCloth cloth = makeZeroDesc();
     cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(cloth.mTriangleVertexIndices_ownedEdges)>(size_t(bCi.addr));
     cloth.mNbTriangles = NB_TRIS; cloth.mNbVerts = uint32_t(cv.size());
     std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
     descArr[CLOTH_ID] = cloth;
@@ -15809,8 +11425,7 @@ PXG_TEST(femClothSimPsContactGen)
     std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 1u, 0u, 1u, 0u } };
     DevBuf bCms = makeDev(dev, cms);
     std::vector<float> cd = { CD_PARTICLE, CD_CLOTH };
-    std::vector<float> rd = { REST_0, REST_1 };
-    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+    DevBuf bCd = makeDev(dev, cd);
     std::vector<float> xf(2 * 8, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;
     DevBuf bXf = makeDev(dev, xf);
 
@@ -15836,7 +11451,7 @@ PXG_TEST(femClothSimPsContactGen)
     ClothPsCgPush p = {};
     p.toleranceLength = 1.0f;
     p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
-    p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+    p.contactDistance = bCd.addr;
     p.gpuShapes = bShapes.addr; p.particleSystems = bPs.addr; p.femClothes = bDesc.addr;
     p.stackSizeBytes = NB_STACK * 16u;
     p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
@@ -15844,7 +11459,6 @@ PXG_TEST(femClothSimPsContactGen)
     p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
     p.wInfo = w.info.addr; p.wCount = w.count.addr;
     p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr; p.wIdxByX = w.idxByRigid.addr;
-    p.wSorted32 = 0ull;                 // C2: NULL for the particle writer, and never written
     p.wMaxContacts = MAXC;
 
     Kernel k("femClothPsContactGenBda.spv", "cloth_psContactGenLaunch",
@@ -15853,14 +11467,14 @@ PXG_TEST(femClothSimPsContactGen)
     dev->flush();
 
     // ---- the mirror ----------------------------------------------------------------
-    struct Exp { F4 point, normalPen, bary; uint64_t pairInd0; uint32_t pairInd1; };
+    struct Exp { F4 point, normalPen, bary; uint64_t ref0, ref1; };
     std::vector<Exp> expected;
     uint32_t faceHits = 0u;
     for (uint32_t i = 0; i < NB_STACK; ++i)          // C8: the CLAMPED walk
     {
         const uint32_t cm = stack[i * 4 + 0], pi = stack[i * 4 + 1], tri = stack[i * 4 + 2];
         const float cDistance = CD_PARTICLE + CD_CLOTH;
-        const float rest = (cm == 0u) ? REST_0 : REST_1;
+        (void)cm;   // both managers route to the same pair (C1); only the TYPE routing differs
         const V3 a{ cv[tri * 3 + 0].x, cv[tri * 3 + 0].y, cv[tri * 3 + 0].z };
         const V3 b{ cv[tri * 3 + 1].x, cv[tri * 3 + 1].y, cv[tri * 3 + 1].z };
         const V3 c{ cv[tri * 3 + 2].x, cv[tri * 3 + 2].y, cv[tri * 3 + 2].z };
@@ -15875,14 +11489,12 @@ PXG_TEST(femClothSimPsContactGen)
         // C6: unguarded.  P9.36: `v / m` on a PxVec3 is PxVec3.h:219 -- one
         // reciprocal, three multiplies -- not three divides.
         const V3 n = scl(v, 1.0f / m);
-        const float pen = m - rest;                             // C4
-        const V3 contact = sub(pp, scl(n, rest));               // C4
         Exp e{};
-        e.point = F4{ contact.x, contact.y, contact.z, 0.0f };
-        e.normalPen = F4{ -n.x, -n.y, -n.z, pen };              // C4: NEGATED
+        e.point = F4{ pp.x, pp.y, pp.z, 0.0f };                 // C4 (5.12): the particle itself
+        e.normalPen = F4{ -n.x, -n.y, -n.z, m };                // C4: NEGATED, pen = |v|
         e.bary = computeBary(a, b, c, closest);
-        e.pairInd0 = (uint64_t(PS_ID) << 32) | pi;              // C3
-        e.pairInd1 = (CLOTH_ID << 20) | tri;
+        e.ref0 = (uint64_t(PS_ID) << 34) | pi;                  // C3: PxgEncodeParticleRef
+        e.ref1 = encClothTriangle(CLOTH_ID, tri);
         expected.push_back(e);
     }
 
@@ -15902,17 +11514,17 @@ PXG_TEST(femClothSimPsContactGen)
     const auto byX = downloadBuffer<uint64_t>(dev, w.byRigid.h, MAXC);
     const auto tmpX = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, MAXC);
 
-    struct Rec { uint32_t key[15]; };
+    struct Rec { uint32_t key[16]; };
     auto less = [](const Rec& x, const Rec& y) {
-        for (int i = 0; i < 15; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
+        for (int i = 0; i < 16; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
         return false;
     };
     std::vector<Rec> gpu, ref;
     for (uint32_t i = 0; i < got && i < MAXC; ++i)
     {
         Rec r{};
-        r.key[0] = info[i * 4 + 0]; r.key[1] = info[i * 4 + 1];   // pairInd0 (u64)
-        r.key[2] = info[i * 4 + 2];                               // pairInd1
+        r.key[0] = info[i * 4 + 0]; r.key[1] = info[i * 4 + 1];   // ref0 (the particle)
+        r.key[2] = info[i * 4 + 2]; r.key[15] = info[i * 4 + 3];  // ref1 (the triangle)
         const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
                                 np[i].x, np[i].y, np[i].z, np[i].w,
                                 ba[i].x, ba[i].y, ba[i].z, ba[i].w };
@@ -15922,9 +11534,9 @@ PXG_TEST(femClothSimPsContactGen)
     for (const Exp& e : expected)
     {
         Rec r{};
-        r.key[0] = uint32_t(e.pairInd0 & 0xffffffffull);
-        r.key[1] = uint32_t(e.pairInd0 >> 32);
-        r.key[2] = e.pairInd1;
+        r.key[0] = uint32_t(e.ref0 & 0xffffffffull);
+        r.key[1] = uint32_t(e.ref0 >> 32);
+        r.key[2] = uint32_t(e.ref1 & 0xffffffffull); r.key[15] = uint32_t(e.ref1 >> 32);
         const float src[12] = { e.point.x, e.point.y, e.point.z, e.point.w,
                                 e.normalPen.x, e.normalPen.y, e.normalPen.z, e.normalPen.w,
                                 e.bary.x, e.bary.y, e.bary.z, e.bary.w };
@@ -15934,15 +11546,15 @@ PXG_TEST(femClothSimPsContactGen)
     std::sort(gpu.begin(), gpu.end(), less);
     std::sort(ref.begin(), ref.end(), less);
 
-    static const char* const KEY_NAME[15] = {
-        "pairInd0.lo", "pairInd0.hi", "pairInd1",
+    static const char* const KEY_NAME[16] = {
+        "ref0.lo", "ref0.hi", "ref1.lo",
         "point.x", "point.y", "point.z", "point.w",
         "normal.x", "normal.y", "normal.z", "penetration",
-        "bary.x", "bary.y", "bary.z", "bary.w"
+        "bary.x", "bary.y", "bary.z", "bary.w", "ref1.hi"
     };
     uint32_t mismatches = 0u; int firstField = -1; size_t firstAt = 0;
     for (size_t i = 0; i < gpu.size() && i < ref.size(); ++i)
-        for (int j = 0; j < 15; ++j)
+        for (int j = 0; j < 16; ++j)
             if (gpu[i].key[j] != ref[i].key[j])
             { ++mismatches; if (firstField < 0) { firstField = j; firstAt = i; } break; }
     if (mismatches != 0u && firstField >= 0)
@@ -16130,1293 +11742,10 @@ PXG_TEST(femClothSimPsContactGen)
 
     destroyWriter(dev, w);
     for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bParts.h, bPs.h, bShapes.h, bCms.h,
-                               bCd.h, bRd.h, bXf.h, bStack.h, bNum.h, bNeeded.h })
+                               bCd.h, bXf.h, bStack.h, bNum.h, bNeeded.h })
         dev->destroyBuffer(h);
 }
 
-
-// ===========================================================================
-// P9.31 -- cloth_particleContactPrepareLaunch, bit-exact against a host mirror,
-// plus a COVERAGE run large enough to make the work-index formula observable.
-//
-// The small run pins the arithmetic.  The large one exists because of what the
-// shader's P1 note says: a grid-stride substitution is observation-equivalent,
-// but dropping the `nbIterationsPerBlock *` factor is not -- and neither can be
-// told apart below 262144 contacts, because that is gridDim * blockDim and
-// nbIterationsPerBlock is 1 for anything smaller.
-// ===========================================================================
-namespace p931prep
-{
-using p817cg::V3;
-
-// Ten pointers -> 80 bytes.
-struct ClothPsPreparePush
-{
-    uint64_t clothes, particleSystems, contacts, normalPens, barycentrics,
-             contactInfos, numContacts, constraints, clothAppliedForces,
-             particleAppliedForces;
-};
-static_assert(sizeof(ClothPsPreparePush) == 80, "cloth ps prepare blob must be 80 bytes");
-static_assert(offsetof(ClothPsPreparePush, contactInfos) == 40, "contactInfos @40");
-static_assert(offsetof(ClothPsPreparePush, constraints) == 56, "constraints @56");
-
-// PxgFEMParticleConstraintBlock (PxgFEMCore.h:184): float4[32], float4[32],
-// float[32] = 1152 bytes, and it is a struct of LANE ARRAYS, not an array of
-// per-contact records.
-static const uint32_t CB_STRIDE = 1152u;
-static const uint32_t CB_WORDS = CB_STRIDE / 4u;
-static const uint32_t CB_OFF_NORMAL_PEN = 0u;
-static const uint32_t CB_OFF_BARY = 128u;      // 512 bytes / 4
-static const uint32_t CB_OFF_VELMULT = 256u;   // 1024 bytes / 4
-// PxgFEMCore.h is not in this TU's include set, so the layout is pinned by
-// arithmetic against the header's declaration rather than by sizeof:
-//   float4[32] + float4[32] + float[32] = 512 + 512 + 128 = 1152.
-static_assert(CB_OFF_BARY * 4u == 512u, "barycentric lane array starts at byte 512");
-static_assert(CB_OFF_VELMULT * 4u == 1024u, "velMultiplier lane array starts at byte 1024");
-static_assert(CB_STRIDE == 512u + 512u + 128u, "the block is three lane arrays, 1152 bytes");
-} // namespace p931prep
-
-PXG_TEST(femClothSimPsContactPrepare)
-{
-    using namespace p816dc;
-    using namespace p931prep;
-    using p817cg::V3;
-    PxgSlangComputeDevice* dev = testDevice();
-
-    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
-    const float REST_DISTANCE = 0.037f;
-
-    // ---- the cloth: 24 triangles, each with its own accumulated delta ---------------
-    const uint32_t NB_TRIS = 24u;
-    std::vector<F4> accum;      // mAccumulatedDeltaPos, .w = inverse mass per vertex
-    std::vector<TriIdx4> ci;
-    for (uint32_t t = 0; t < NB_TRIS; ++t)
-    {
-        const uint32_t base = uint32_t(accum.size());
-        // Distinct per-vertex deltas AND distinct inverse masses, so P6's float4
-        // interpolation of .w is separable from any single vertex's mass.
-        // TRIANGLE 23 IS ENTIRELY PINNED.  Contact 4 pairs it with particle 28,
-        // whose inverse mass is also zero, so that contact -- and only that one --
-        // has unitResponse == 0 and takes the velMultiplier guard's else branch.
-        // Without it `(unitResponse > 0) ? 1/unitResponse : 0` and a bare
-        // reciprocal agree everywhere and the guard is untested; the sweep said so.
-        const bool pinnedTri = (t == NB_TRIS - 1u);
-        const float w0 = pinnedTri ? 0.0f : (0.5f + 0.1f * float(t % 3));
-        const float w1 = pinnedTri ? 0.0f : (0.7f + 0.1f * float(t % 5));
-        const float w2 = pinnedTri ? 0.0f : (0.9f + 0.1f * float(t % 7));
-        accum.push_back(F4{ 0.01f * float(t), 0.02f * float(t), -0.03f * float(t), w0 });
-        accum.push_back(F4{ -0.04f * float(t), 0.015f * float(t), 0.02f * float(t), w1 });
-        accum.push_back(F4{ 0.025f * float(t), -0.01f * float(t), 0.035f * float(t), w2 });
-        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
-    }
-    DevBuf bAccum = makeDev(dev, accum);
-    if (!bAccum.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bAccum.h); return; }
-    DevBuf bCi = makeDev(dev, ci);
-
-    PxgFEMCloth cloth = makeZeroDesc();
-    cloth.mAccumulatedDeltaPos = reinterpret_cast<decltype(cloth.mAccumulatedDeltaPos)>(size_t(bAccum.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
-    cloth.mNbTriangles = NB_TRIS;
-    cloth.mNbVerts = uint32_t(accum.size());
-    cloth.mRestDistance = REST_DISTANCE;
-    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
-    descArr[CLOTH_ID] = cloth;
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // ---- the particle system: sorted deltas with distinct inverse masses ------------
-    const uint32_t NB_PARTICLES = 48u;
-    std::vector<F4> sortedDeltaP(NB_PARTICLES);
-    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
-        sortedDeltaP[i] = F4{ 0.005f * float(i), -0.007f * float(i), 0.009f * float(i),
-                              // every fourth particle is IMMOVABLE, so unitResponse
-                              // is separable from invMass1 alone
-                              (i % 4u == 0u) ? 0.0f : (0.3f + 0.05f * float(i % 6)) };
-    DevBuf bDeltaP = makeDev(dev, sortedDeltaP);
-    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
-    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
-    psArr[PS_ID].mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
-    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
-    DevBuf bPs = makeDev(dev, psArr);
-
-    // ---- the contacts.  40 of them, so P2's constraint blocks are 0 and 1 and the
-    // lane index wraps.
-    const uint32_t NB_CONTACTS = 40u;
-    std::vector<FemOtherContactInfoHost> infos(NB_CONTACTS);
-    std::vector<F4> contacts(NB_CONTACTS), normalPens(NB_CONTACTS), barys(NB_CONTACTS);
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        const uint32_t particle = (i * 7u) % NB_PARTICLES;   // NOT i: P-index vs work index
-        const uint32_t tri = (i * 5u + 3u) % NB_TRIS;        // and NOT the particle either
-        infos[i].pairInd0 = (uint64_t(PS_ID) << 32) | particle;
-        infos[i].pairInd1 = (CLOTH_ID << 20) | tri;
-        infos[i].rigidMatInd_isInCollision = 0xABCDEF01u;    // must be left alone
-        // P3: read and discarded -- seeded with something recognisable so a port
-        // that used it produces garbage rather than something plausible.
-        contacts[i] = F4{ 1e9f, -1e9f, 1e9f, -1e9f };
-        normalPens[i] = F4{ 0.6f - 0.02f * float(i), -0.8f + 0.01f * float(i),
-                            0.1f + 0.005f * float(i), -0.05f + 0.004f * float(i) };
-        const float v = 0.15f + 0.01f * float(i % 5);
-        const float w = 0.25f + 0.01f * float(i % 7);
-        barys[i] = F4{ 1.0f - v - w, v, w, 0.0f };
-    }
-    DevBuf bInfos = makeDev(dev, infos), bContacts = makeDev(dev, contacts);
-    DevBuf bNormalPens = makeDev(dev, normalPens), bBarys = makeDev(dev, barys);
-    std::vector<uint32_t> nc = { NB_CONTACTS };
-    DevBuf bNum = makeDev(dev, nc);
-
-    const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u;
-    std::vector<uint32_t> constraintWords(size_t(NB_BLOCKS) * CB_WORDS, 0xEEEEEEEEu);
-    DevBuf bConstraints = makeDev(dev, constraintWords);
-    // The applied-force arrays are float2, so 2 floats per contact -- but they are
-    // allocated with FOUR and the tail seeded, because a port that wrote them as
-    // float4 zeroes bytes [16i, 16i+16) instead of [8i, 8i+8) and every word this
-    // fixture checks still comes back zero.  The sweep survived exactly that; the
-    // tail is what tells the two apart (and what a float4 write runs off the end
-    // of in the engine's own allocation).
-    std::vector<float> forcesSeed(NB_CONTACTS * 4u, -12345.0f);
-    DevBuf bClothForces = makeDev(dev, forcesSeed), bPartForces = makeDev(dev, forcesSeed);
-
-    ClothPsPreparePush p = {};
-    p.clothes = bDesc.addr; p.particleSystems = bPs.addr;
-    p.contacts = bContacts.addr; p.normalPens = bNormalPens.addr; p.barycentrics = bBarys.addr;
-    p.contactInfos = bInfos.addr; p.numContacts = bNum.addr;
-    p.constraints = bConstraints.addr;
-    p.clothAppliedForces = bClothForces.addr; p.particleAppliedForces = bPartForces.addr;
-
-    Kernel k("femClothPsPrepareBda.spv", "cloth_particleContactPrepareLaunch",
-             {}, sizeof(ClothPsPreparePush));
-    k.dispatch(1024u, {}, p, 1u, 1u);
-    dev->flush();
-
-    // ---- the mirror ------------------------------------------------------------------
-    const auto gotC = downloadBuffer<uint32_t>(dev, bConstraints.h, uint32_t(constraintWords.size()));
-    const auto gotClothF = downloadBuffer<float>(dev, bClothForces.h, NB_CONTACTS * 4u);
-    const auto gotPartF = downloadBuffer<float>(dev, bPartForces.h, NB_CONTACTS * 4u);
-
-    uint32_t mismatches = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
-        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
-        const TriIdx4& tv = ci[tri];
-        const F4& b = barys[i];
-        // P6: the whole float4, so .w is the interpolated inverse mass.
-        const F4 v0 = accum[tv.x], v1 = accum[tv.y], v2 = accum[tv.z];
-        const F4 delta1 = F4{ v0.x * b.x + v1.x * b.y + v2.x * b.z,
-                              v0.y * b.x + v1.y * b.y + v2.y * b.z,
-                              v0.z * b.x + v1.z * b.y + v2.z * b.z,
-                              v0.w * b.x + v1.w * b.y + v2.w * b.z };
-        const float invMass1 = delta1.w;
-        const F4& np = normalPens[i];
-        const V3 normal{ -np.x, -np.y, -np.z };                        // P4
-        const F4& dp = sortedDeltaP[particle];
-        const float invMass0 = dp.w;
-        const V3 delta{ delta1.x - dp.x, delta1.y - dp.y, delta1.z - dp.z };  // P5 order
-        const float pen = np.w + (normal.x * delta.x + normal.y * delta.y + normal.z * delta.z)
-                          - REST_DISTANCE;
-        const float unitResponse = invMass0 + invMass1;
-        const float velMultiplier = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
-
-        const size_t blk = size_t(i / 32u) * CB_WORDS;
-        const uint32_t lane = i & 31u;                                  // P2
-        const uint32_t* gn = &gotC[blk + CB_OFF_NORMAL_PEN + lane * 4u];
-        const uint32_t* gb = &gotC[blk + CB_OFF_BARY + lane * 4u];
-        const uint32_t gv = gotC[blk + CB_OFF_VELMULT + lane];
-        const uint32_t refN[4] = { f2u(normal.x), f2u(normal.y), f2u(normal.z), f2u(pen) };
-        const uint32_t refB[4] = { f2u(b.x), f2u(b.y), f2u(b.z), f2u(b.w) };
-        bool bad = (gv != f2u(velMultiplier));
-        for (int j = 0; j < 4; ++j) { if (gn[j] != refN[j] || gb[j] != refB[j]) bad = true; }
-        if (bad)
-        {
-            if (mismatches == 0u)
-            {
-                float gnp; std::memcpy(&gnp, &gn[3], 4);
-                float gvm; std::memcpy(&gvm, &gv, 4);
-                std::printf("    first difference at contact %u (block %u lane %u): "
-                            "pen gpu %.9g vs %.9g, velMult gpu %.9g vs %.9g\n",
-                            i, i / 32u, lane, gnp, pen, gvm, velMultiplier);
-            }
-            ++mismatches;
-        }
-        // P8: both force arrays zeroed, as float2 (stride 8, not 16).
-        if (gotClothF[i * 2] != 0.0f || gotClothF[i * 2 + 1] != 0.0f ||
-            gotPartF[i * 2] != 0.0f || gotPartF[i * 2 + 1] != 0.0f)
-        {
-            std::printf("    applied forces at %u not zeroed: cloth (%g, %g) particle (%g, %g)\n",
-                        i, gotClothF[i * 2], gotClothF[i * 2 + 1],
-                        gotPartF[i * 2], gotPartF[i * 2 + 1]);
-            ++mismatches;
-        }
-    }
-    PXG_CHECK_MSG(mismatches == 0u,
-                  "%u of %u prepared constraints differ BIT-EXACTLY from the host mirror",
-                  mismatches, NB_CONTACTS);
-
-    // Nothing past the contact count may have been touched.
-    uint32_t past = 0u;
-    for (uint32_t i = NB_CONTACTS; i < NB_BLOCKS * 32u; ++i)
-    {
-        const size_t blk = size_t(i / 32u) * CB_WORDS;
-        if (gotC[blk + CB_OFF_VELMULT + (i & 31u)] != 0xEEEEEEEEu) ++past;
-    }
-    PXG_CHECK_MSG(past == 0u, "%u constraint lanes past the contact count were written", past);
-
-    // The info records must come back untouched -- this kernel reads them only.
-    const auto gotInfos = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, NB_CONTACTS);
-    uint32_t infoTouched = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-        if (gotInfos[i].rigidMatInd_isInCollision != 0xABCDEF01u) ++infoTouched;
-    PXG_CHECK_MSG(infoTouched == 0u, "%u contact infos were modified by a read-only kernel",
-                  infoTouched);
-
-    // The float2 stride, measured: everything from 2*NB_CONTACTS on must still hold
-    // the seed.
-    uint32_t tailTouched = 0u;
-    for (uint32_t i = NB_CONTACTS * 2u; i < NB_CONTACTS * 4u; ++i)
-    {
-        if (gotClothF[i] != -12345.0f) ++tailTouched;
-        if (gotPartF[i] != -12345.0f) ++tailTouched;
-    }
-    PXG_CHECK_MSG(tailTouched == 0u,
-                  "%u words past the float2 region were written; the applied-force arrays are "
-                  "float2 (stride 8), and a float4 store covers twice the ground and runs off "
-                  "the end of the engine's allocation", tailTouched);
-
-    // The velMultiplier guard, measured rather than assumed to be reachable.
-    uint32_t zeroResponse = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
-        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
-        const TriIdx4& tv = ci[tri];
-        const F4& b = barys[i];
-        const float im1 = accum[tv.x].w * b.x + accum[tv.y].w * b.y + accum[tv.z].w * b.z;
-        if (sortedDeltaP[particle].w + im1 <= 0.0f) ++zeroResponse;
-    }
-    PXG_CHECK_MSG(zeroResponse >= 1u,
-                  "no contact has unitResponse == 0, so the velMultiplier guard's else branch "
-                  "is unreachable and a bare reciprocal would pass");
-
-    std::printf("    [ note ] %u constraints over %u blocks, %u lanes past the count untouched, "
-                "%u with zero unit response\n",
-                NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS, zeroResponse);
-
-    // ---- COVERAGE, past the point where the work-index formula matters -------------
-    // gridDim * blockDim is 1024 * 256 = 262144.  Below that nbIterationsPerBlock is 1
-    // and the formula collapses to a flat index, so NOTHING about it is observable --
-    // which is why the small run above cannot see it and why the shader's P1 note now
-    // says a grid-stride substitution is equivalent rather than wrong.
-    //
-    // Above it the factor starts to matter.  With 300000 contacts
-    // nbIterationsPerBlock is 2, so each block owns 512 contiguous indices and the
-    // grid covers 524288.  Drop the `nbIterationsPerBlock *` factor and the per-block
-    // ranges overlap instead: the grid then reaches only 1024*256 + 256 = 262400, and
-    // everything from there to 299999 is never written.  That is what this run sees.
-    {
-        const uint32_t BIG = 300000u;
-        const uint32_t BIG_BLOCKS = (BIG + 31u) / 32u;
-        std::vector<FemOtherContactInfoHost> bigInfos(BIG);
-        for (uint32_t i = 0; i < BIG; ++i)
-        {
-            bigInfos[i].pairInd0 = (uint64_t(PS_ID) << 32) | 1u;   // particle 1 is movable
-            bigInfos[i].pairInd1 = (CLOTH_ID << 20) | 0u;
-            bigInfos[i].rigidMatInd_isInCollision = 0u;
-        }
-        DevBuf bBigInfos = makeDev(dev, bigInfos);
-        std::vector<F4> bigF4(BIG, F4{ 0.1f, 0.2f, 0.3f, 0.4f });
-        DevBuf bBigContacts = makeDev(dev, bigF4);
-        DevBuf bBigNormals = makeDev(dev, bigF4);
-        std::vector<F4> bigBary(BIG, F4{ 0.5f, 0.25f, 0.25f, 0.0f });
-        DevBuf bBigBary = makeDev(dev, bigBary);
-        std::vector<uint32_t> bigNum = { BIG };
-        DevBuf bBigNum = makeDev(dev, bigNum);
-        std::vector<uint32_t> bigConstraints(size_t(BIG_BLOCKS) * CB_WORDS, 0xEEEEEEEEu);
-        DevBuf bBigConstraints = makeDev(dev, bigConstraints);
-        std::vector<float> bigForces(size_t(BIG) * 2u, -1.0f);
-        DevBuf bBigCF = makeDev(dev, bigForces), bBigPF = makeDev(dev, bigForces);
-
-        if (!bBigConstraints.addr)
-        {
-            std::printf("    NOTE: the %u-contact coverage run could not allocate; skipped\n", BIG);
-        }
-        else
-        {
-            ClothPsPreparePush q = p;
-            q.contacts = bBigContacts.addr; q.normalPens = bBigNormals.addr;
-            q.barycentrics = bBigBary.addr; q.contactInfos = bBigInfos.addr;
-            q.numContacts = bBigNum.addr; q.constraints = bBigConstraints.addr;
-            q.clothAppliedForces = bBigCF.addr; q.particleAppliedForces = bBigPF.addr;
-            k.dispatch(1024u, {}, q, 1u, 1u);
-            dev->flush();
-
-            const auto bigGot = downloadBuffer<uint32_t>(dev, bBigConstraints.h,
-                                                         uint32_t(bigConstraints.size()));
-            uint32_t unwritten = 0u, firstUnwritten = 0xffffffffu;
-            for (uint32_t i = 0; i < BIG; ++i)
-            {
-                const size_t blk = size_t(i / 32u) * CB_WORDS;
-                if (bigGot[blk + CB_OFF_VELMULT + (i & 31u)] == 0xEEEEEEEEu)
-                {
-                    if (firstUnwritten == 0xffffffffu) firstUnwritten = i;
-                    ++unwritten;
-                }
-            }
-            PXG_CHECK_MSG(unwritten == 0u,
-                          "%u of %u constraint lanes were never written, first at %u.  The grid "
-                          "reaches %u threads, so with %u contacts nbIterationsPerBlock is 2 and "
-                          "each block must own 512 contiguous indices; dropping that factor "
-                          "leaves everything past %u untouched",
-                          unwritten, BIG, firstUnwritten, 1024u * 256u, BIG, 1024u * 256u + 256u);
-            // Report the MEASURED count, not the hoped-for one: PXG_CHECK_MSG records a
-            // failure and carries on, so a note that says "all lanes written"
-            // unconditionally contradicts the check three lines above it.
-            std::printf("    [ note ] coverage run: %u contacts over %u threads, %u lanes "
-                        "unwritten\n", BIG, 1024u * 256u, unwritten);
-        }
-
-        for (PxgBufferHandle h : { bBigInfos.h, bBigContacts.h, bBigNormals.h, bBigBary.h,
-                                   bBigNum.h, bBigConstraints.h, bBigCF.h, bBigPF.h })
-            dev->destroyBuffer(h);
-    }
-
-    for (PxgBufferHandle h : { bAccum.h, bCi.h, bDesc.h, bDeltaP.h, bPs.h, bInfos.h, bContacts.h,
-                               bNormalPens.h, bBarys.h, bNum.h, bConstraints.h, bClothForces.h,
-                               bPartForces.h })
-        dev->destroyBuffer(h);
-}
-
-
-// ===========================================================================
-// P9.31 -- the two cloth_solveCPOutput*DeltaVLaunch kernels, bit-exact.
-//
-// One rig, two dispatches over the SAME constraints: the cloth side accumulates
-// a position delta onto the triangle's vertices, the particle side writes a
-// velocity delta per contact.  They share everything up to the force update, so
-// running both over identical inputs is also a check that the shared half stayed
-// shared.
-//
-// The cloth side writes through ATOMICS, so contacts are laid out one per
-// triangle with no shared vertices: every vertex has exactly one writer and the
-// comparison can be bit-exact.  One deliberately CONTENDED pair sits at the end
-// and is checked on its .w count alone, which is order-invariant.
-// ===========================================================================
-namespace p931solve
-{
-using p817cg::V3;
-
-struct ClothPsSolveClothPush
-{
-    uint64_t clothes, particleSystems, contactInfos, constraints, numContacts,
-             appliedForces, materials;
-};
-static_assert(sizeof(ClothPsSolveClothPush) == 56, "cloth-side solve blob must be 56 bytes");
-
-struct ClothPsSolveParticlePush
-{
-    uint64_t clothes, particleSystems, contactInfos, constraints, numContacts,
-             deltaP, appliedForces, materials;
-};
-static_assert(sizeof(ClothPsSolveParticlePush) == 64, "particle-side solve blob must be 64 bytes");
-static_assert(offsetof(ClothPsSolveParticlePush, deltaP) == 40,
-              "deltaP @40 -- inserted BEFORE appliedForces, which is what makes the two "
-              "packs different lengths");
-
-static const float BIAS = 0.7f;                  // FEMCLOTH_BIAS_COEFFICIENT
-static const uint32_t CLOTH_MAT_STRIDE = 32u;    // PxsDeformableSurfaceMaterialData
-static const uint32_t CLOTH_MAT_DYNFRICTION_F = 2u;   // youngs, poissons, dynamicFriction
-static const uint32_t PS_MAT_STRIDE = 32u;
-static const uint32_t PS_MAT_FRICTION_F = 0u;
-
-using p931prep::CB_STRIDE;
-using p931prep::CB_WORDS;
-using p931prep::CB_OFF_NORMAL_PEN;
-using p931prep::CB_OFF_BARY;
-using p931prep::CB_OFF_VELMULT;
-
-// PxVec3::normalize -- returns the magnitude, normalises in place if m > 0.
-// P9.36: reciprocal-then-multiply, per PxVec3.h:260.  See normalize3 above.
-static float pxNormalize(V3& v)
-{
-    const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f) { const float r = 1.0f / m; v.x *= r; v.y *= r; v.z *= r; }
-    return m;
-}
-} // namespace p931solve
-
-PXG_TEST(femClothSimPsSolveCP)
-{
-    using namespace p816dc;
-    using namespace p931prep;
-    using namespace p931solve;
-    using p817cg::V3;
-    PxgSlangComputeDevice* dev = testDevice();
-
-    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
-
-    // ---- contacts: one per triangle, no shared vertices, plus a contended pair -----
-    const uint32_t NB_SINGLE = 10u;      // contacts 0..9, one triangle each
-    const uint32_t NB_CONTENDED = 2u;    // contacts 10,11 share triangle NB_SINGLE
-    const uint32_t NB_CONTACTS = NB_SINGLE + NB_CONTENDED;
-    const uint32_t NB_TRIS = NB_SINGLE + 1u;
-
-    std::vector<F4> accum; std::vector<TriIdx4> ci;
-    std::vector<uint16_t> matIdx(NB_TRIS);
-    for (uint32_t t = 0; t < NB_TRIS; ++t)
-    {
-        const uint32_t base = uint32_t(accum.size());
-        // Vertex 1 of triangle 3 is PINNED (inverse mass 0) and vertex 2 of
-        // triangle 5 gets a barycentric of zero below -- S8's two skip conditions,
-        // one each.
-        const float m0 = 0.4f + 0.05f * float(t);
-        const float m1 = (t == 3u) ? 0.0f : (0.6f + 0.03f * float(t));
-        const float m2 = 0.8f - 0.02f * float(t);
-        accum.push_back(F4{ 0.011f * float(t), -0.021f * float(t), 0.031f * float(t), m0 });
-        accum.push_back(F4{ -0.013f * float(t), 0.023f * float(t), -0.033f * float(t), m1 });
-        accum.push_back(F4{ 0.017f * float(t), 0.027f * float(t), 0.037f * float(t), m2 });
-        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
-        matIdx[t] = uint16_t(t % 3u);          // three distinct cloth materials
-    }
-    DevBuf bAccum = makeDev(dev, accum);
-    if (!bAccum.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bAccum.h); return; }
-    DevBuf bCi = makeDev(dev, ci);
-    std::vector<uint32_t> matIdxWords((NB_TRIS + 1u) / 2u, 0u);
-    for (uint32_t t = 0; t < NB_TRIS; ++t)
-        matIdxWords[t >> 1] |= uint32_t(matIdx[t]) << ((t & 1u) * 16u);
-    DevBuf bMatIdx = makeDev(dev, matIdxWords);
-
-    // Cloth materials: three records, dynamicFriction the THIRD float of 32 bytes.
-    std::vector<float> clothMats(3u * (CLOTH_MAT_STRIDE / 4u), 0.0f);
-    const float CLOTH_FRICTION[3] = { 0.20f, 0.55f, 0.00f };
-    for (uint32_t m = 0; m < 3u; ++m)
-    {
-        clothMats[m * 8u + 0u] = 1.0e6f;                    // youngs
-        clothMats[m * 8u + 1u] = 0.45f;                     // poissons -- the field the
-                                                            // first draft of the shader read
-        clothMats[m * 8u + CLOTH_MAT_DYNFRICTION_F] = CLOTH_FRICTION[m];
-    }
-    DevBuf bClothMats = makeDev(dev, clothMats);
-
-    PxgFEMCloth cloth = makeZeroDesc();
-    cloth.mAccumulatedDeltaPos = reinterpret_cast<decltype(cloth.mAccumulatedDeltaPos)>(size_t(bAccum.addr));
-    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
-    cloth.mMaterialIndices = reinterpret_cast<decltype(cloth.mMaterialIndices)>(size_t(bMatIdx.addr));
-    cloth.mNbTriangles = NB_TRIS; cloth.mNbVerts = uint32_t(accum.size());
-    std::vector<F4> deltaPosSeed(accum.size(), F4{ 0, 0, 0, 0 });
-    DevBuf bDeltaPos = makeDev(dev, deltaPosSeed);
-    cloth.mDeltaPos = reinterpret_cast<decltype(cloth.mDeltaPos)>(size_t(bDeltaPos.addr));
-    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
-    descArr[CLOTH_ID] = cloth;
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // ---- the particle system -------------------------------------------------------
-    const uint32_t NB_PARTICLES = NB_CONTACTS;
-    std::vector<F4> sortedDeltaP(NB_PARTICLES);
-    std::vector<uint32_t> phases(NB_PARTICLES);
-    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
-    {
-        // S3: contact 7's particle is IMMOVABLE, so that contact must produce no
-        // write at all and must leave its applied force exactly as seeded.
-        const float im = (i == 7u) ? 0.0f : (0.25f + 0.04f * float(i % 5));
-        sortedDeltaP[i] = F4{ 0.006f * float(i), -0.004f * float(i), 0.008f * float(i), im };
-        // Two groups -- but with the NON-GROUP bits set, so `phase & GROUP_MASK` is
-        // not the identity.  With bare 0/1 phases the mask is a no-op and the mutant
-        // that drops it survives, which is what the sweep reported.
-        phases[i] = (i % 2u) | 0x40000000u | 0x00100000u;
-    }
-    DevBuf bDeltaP = makeDev(dev, sortedDeltaP), bPhases = makeDev(dev, phases);
-    std::vector<uint32_t> phaseToMat = { (1u << 16) | 0u };     // group 0 -> mat 0, group 1 -> mat 1
-    DevBuf bPhaseToMat = makeDev(dev, phaseToMat);
-    std::vector<float> psMats(2u * (PS_MAT_STRIDE / 4u), 0.0f);
-    const float PS_FRICTION[2] = { 0.30f, 0.90f };
-    psMats[0u * 8u + PS_MAT_FRICTION_F] = PS_FRICTION[0];
-    psMats[1u * 8u + PS_MAT_FRICTION_F] = PS_FRICTION[1];
-    DevBuf bPsMats = makeDev(dev, psMats);
-
-    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
-    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
-    psArr[PS_ID].mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
-    psArr[PS_ID].mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhases.addr));
-    psArr[PS_ID].mPhaseGroupToMaterialHandle = reinterpret_cast<PxU16*>(size_t(bPhaseToMat.addr));
-    psArr[PS_ID].mParticleMaterials = reinterpret_cast<PxsParticleMaterialData*>(size_t(bPsMats.addr));
-    psArr[PS_ID].mParticleMaterialStride = PS_MAT_STRIDE;
-    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
-    DevBuf bPs = makeDev(dev, psArr);
-
-    // ---- contact infos and constraints (as the prepare would have left them) --------
-    std::vector<FemOtherContactInfoHost> infos(NB_CONTACTS);
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        const uint32_t tri = (i < NB_SINGLE) ? i : NB_SINGLE;      // the last two share one
-        infos[i].pairInd0 = (uint64_t(PS_ID) << 32) | i;
-        infos[i].pairInd1 = (CLOTH_ID << 20) | tri;
-        infos[i].rigidMatInd_isInCollision = 0u;
-    }
-    DevBuf bInfos = makeDev(dev, infos);
-
-    const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u;
-    std::vector<uint32_t> cw(size_t(NB_BLOCKS) * CB_WORDS, 0u);
-    std::vector<F4> refNormalPen(NB_CONTACTS), refBary(NB_CONTACTS);
-    std::vector<float> refVelMult(NB_CONTACTS);
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        // A tilted normal so no component is zero, and a penetration that changes
-        // sign across the set so S7's clamp bites on some contacts and not others.
-        V3 n{ 0.3f + 0.05f * float(i), 0.8f - 0.03f * float(i), -0.5f + 0.02f * float(i) };
-        pxNormalize(n);
-        const float pen = 0.02f - 0.008f * float(i);
-        // S8's second skip condition, once in EACH of the three slots.  The first
-        // version zeroed only the third, and the mutant that drops the epsilon test
-        // from the FIRST branch then survived -- a survivor that says nothing about
-        // the code and everything about which branch the rig happened to reach.
-        //   contact 5 -> bary.z == 0   (w = 0)
-        //   contact 6 -> bary.y == 0   (v = 0)
-        //   contact 8 -> bary.x == 0   (v + w = 1)
-        float v, w;
-        if (i == 5u)      { v = 0.30f; w = 0.0f; }
-        else if (i == 6u) { v = 0.0f;  w = 0.25f; }
-        else if (i == 8u) { v = 0.40f; w = 0.60f; }
-        else              { w = 0.20f + 0.01f * float(i % 4); v = 0.30f + 0.02f * float(i % 3); }
-        refNormalPen[i] = F4{ n.x, n.y, n.z, pen };
-        refBary[i] = F4{ 1.0f - v - w, v, w, 0.0f };
-        refVelMult[i] = 0.7f + 0.05f * float(i % 6);
-        const size_t blk = size_t(i / 32u) * CB_WORDS;
-        const uint32_t lane = i & 31u;
-        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 0] = f2u(n.x);
-        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 1] = f2u(n.y);
-        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 2] = f2u(n.z);
-        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 3] = f2u(pen);
-        cw[blk + CB_OFF_BARY + lane * 4u + 0] = f2u(refBary[i].x);
-        cw[blk + CB_OFF_BARY + lane * 4u + 1] = f2u(refBary[i].y);
-        cw[blk + CB_OFF_BARY + lane * 4u + 2] = f2u(refBary[i].z);
-        cw[blk + CB_OFF_BARY + lane * 4u + 3] = f2u(refBary[i].w);
-        cw[blk + CB_OFF_VELMULT + lane] = f2u(refVelMult[i]);
-    }
-    DevBuf bConstraints = makeDev(dev, cw);
-
-    // S7: NON-ZERO seeds, so the two clamps are exercised rather than trivially
-    // satisfied.  A zero seed makes deltaF = max(0, ...) and the friction step
-    // degenerate, and the whole clamp structure becomes invisible.
-    std::vector<float> forceSeed(NB_CONTACTS * 2u);
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    { forceSeed[i * 2] = 0.004f * float(i % 5); forceSeed[i * 2 + 1] = 0.002f * float(i % 3); }
-    DevBuf bForcesA = makeDev(dev, forceSeed), bForcesB = makeDev(dev, forceSeed);
-    std::vector<uint32_t> ncv = { NB_CONTACTS };
-    DevBuf bNum = makeDev(dev, ncv);
-    std::vector<F4> deltaPOut(NB_CONTACTS, F4{ -9, -9, -9, -9 });
-    DevBuf bDeltaPOut = makeDev(dev, deltaPOut);
-
-    // ---- run the CLOTH side ---------------------------------------------------------
-    ClothPsSolveClothPush pc = {};
-    pc.clothes = bDesc.addr; pc.particleSystems = bPs.addr; pc.contactInfos = bInfos.addr;
-    pc.constraints = bConstraints.addr; pc.numContacts = bNum.addr;
-    pc.appliedForces = bForcesA.addr; pc.materials = bClothMats.addr;
-    Kernel kc("femClothPsSolveBda.spv", "cloth_solveCPOutputClothDeltaVLaunch",
-              {}, sizeof(ClothPsSolveClothPush));
-    kc.dispatch(1024u, {}, pc, 1u, 1u);
-    dev->flush();
-
-    // ---- run the PARTICLE side over the same constraints -----------------------------
-    ClothPsSolveParticlePush pp = {};
-    pp.clothes = bDesc.addr; pp.particleSystems = bPs.addr; pp.contactInfos = bInfos.addr;
-    pp.constraints = bConstraints.addr; pp.numContacts = bNum.addr;
-    pp.deltaP = bDeltaPOut.addr; pp.appliedForces = bForcesB.addr; pp.materials = bClothMats.addr;
-    Kernel kp("femClothPsSolveBda.spv", "cloth_solveCPOutputParticleDeltaVLaunch",
-              {}, sizeof(ClothPsSolveParticlePush));
-    kp.dispatch(1024u, {}, pp, 1u, 1u);
-    dev->flush();
-
-    // ---- the mirror ------------------------------------------------------------------
-    std::vector<F4> refDeltaPos(accum.size(), F4{ 0, 0, 0, 0 });
-    std::vector<F4> refDeltaP(NB_CONTACTS, F4{ -9, -9, -9, -9 });
-    std::vector<float> refForce = forceSeed;
-    uint32_t clamped = 0u, skippedByMass = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-    {
-        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
-        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
-        const F4& dp = sortedDeltaP[particle];
-        const float invMass0 = dp.w;
-        if (invMass0 == 0.0f) { ++skippedByMass; continue; }        // S3
-
-        const uint32_t group = phases[particle] & 0x000fffffu;
-        const float friction0 = PS_FRICTION[group];
-        const float friction1 = CLOTH_FRICTION[matIdx[tri]];
-        const float frictionCoefficient = (friction0 + friction1) * 0.5f;
-
-        const TriIdx4& tv = ci[tri];
-        const F4& b = refBary[i];
-        const F4 v0 = accum[tv.x], v1 = accum[tv.y], v2 = accum[tv.z];
-        const F4 invMasses1 = F4{ v0.w, v1.w, v2.w, 0.0f };          // S5
-        const F4 delta1 = F4{ v0.x * b.x + v1.x * b.y + v2.x * b.z,
-                              v0.y * b.x + v1.y * b.y + v2.y * b.z,
-                              v0.z * b.x + v1.z * b.y + v2.z * b.z,
-                              v0.w * b.x + v1.w * b.y + v2.w * b.z };
-        const V3 delta{ delta1.x - dp.x, delta1.y - dp.y, delta1.z - dp.z };
-        const F4& np = refNormalPen[i];
-        const V3 normal{ -np.x, -np.y, -np.z };                      // S4
-
-        float afx = refForce[i * 2], afy = refForce[i * 2 + 1];
-        const float normalDelta = delta.x * normal.x + delta.y * normal.y + delta.z * normal.z;
-        V3 tanDir{ delta.x - normal.x * normalDelta,
-                   delta.y - normal.y * normalDelta,
-                   delta.z - normal.z * normalDelta };
-        const float fricDelta = pxNormalize(tanDir);                 // S6
-        const float error = np.w + normalDelta;
-        const float cand = -error * refVelMult[i];
-        const float deltaF = (-afx > cand) ? -afx : cand;            // S7
-        if (deltaF == -afx && cand < -afx) ++clamped;
-        afx += deltaF;
-        const float frictionMax = afx * frictionCoefficient;
-        const float requiredForce = fricDelta * refVelMult[i];
-        const float sum = requiredForce + afy;
-        const float deltaFr = ((sum < frictionMax) ? sum : frictionMax) - afy;
-        afy += deltaFr;
-        refForce[i * 2] = afx; refForce[i * 2 + 1] = afy;
-
-        // cloth side
-        const V3 deltaPos{ (normal.x * deltaF - tanDir.x * deltaFr) * BIAS,
-                           (normal.y * deltaF - tanDir.y * deltaFr) * BIAS,
-                           (normal.z * deltaF - tanDir.z * deltaFr) * BIAS };
-        const uint32_t vi[3] = { tv.x, tv.y, tv.z };
-        const float im[3] = { invMasses1.x, invMasses1.y, invMasses1.z };
-        const float bw[3] = { b.x, b.y, b.z };
-        for (int j = 0; j < 3; ++j)
-            if (im[j] > 0.0f && std::fabs(bw[j]) > 1e-6f)             // S8
-            {
-                refDeltaPos[vi[j]].x += deltaPos.x * im[j] * bw[j];
-                refDeltaPos[vi[j]].y += deltaPos.y * im[j] * bw[j];
-                refDeltaPos[vi[j]].z += deltaPos.z * im[j] * bw[j];
-                refDeltaPos[vi[j]].w += 1.0f;
-            }
-
-        // particle side: opposite signs AND an extra invMass0 factor
-        const V3 deltaV{ (-normal.x * deltaF + tanDir.x * deltaFr) * invMass0 * BIAS,
-                         (-normal.y * deltaF + tanDir.y * deltaFr) * invMass0 * BIAS,
-                         (-normal.z * deltaF + tanDir.z * deltaFr) * invMass0 * BIAS };
-        const float wflag = (deltaF != 0.0f || deltaFr != 0.0f) ? 1.0f : 0.0f;
-        refDeltaP[i] = F4{ deltaV.x, deltaV.y, deltaV.z, wflag };
-    }
-
-    PXG_CHECK_MSG(skippedByMass == 1u,
-                  "%u contacts were skipped for zero inverse mass, expected exactly 1 -- S3 is "
-                  "not exercised otherwise", skippedByMass);
-    PXG_CHECK_MSG(clamped > 0u,
-                  "the normal-force clamp never bit; S7 is then untested and the rig's "
-                  "penetrations need re-choosing");
-
-    // Compare: the single-writer vertices bit-exactly, the contended triangle on .w.
-    const auto gotDeltaPos = downloadBuffer<F4>(dev, bDeltaPos.h, uint32_t(accum.size()));
-    const auto gotDeltaP = downloadBuffer<F4>(dev, bDeltaPOut.h, NB_CONTACTS);
-    const auto gotForceA = downloadBuffer<float>(dev, bForcesA.h, NB_CONTACTS * 2u);
-    const auto gotForceB = downloadBuffer<float>(dev, bForcesB.h, NB_CONTACTS * 2u);
-
-    uint32_t mm = 0u;
-    const uint32_t contendedBase = NB_SINGLE * 3u;    // the shared triangle's vertices
-    for (uint32_t v = 0; v < uint32_t(accum.size()); ++v)
-    {
-        const bool contended = (v >= contendedBase);
-        if (contended)
-        {
-            // Order-invariant: the count is an integer sum of 1.0f.
-            if (f2u(gotDeltaPos[v].w) != f2u(refDeltaPos[v].w))
-            { ++mm; std::printf("    contended vertex %u count %g, expected %g\n",
-                                v, gotDeltaPos[v].w, refDeltaPos[v].w); }
-            continue;
-        }
-        if (f2u(gotDeltaPos[v].x) != f2u(refDeltaPos[v].x) ||
-            f2u(gotDeltaPos[v].y) != f2u(refDeltaPos[v].y) ||
-            f2u(gotDeltaPos[v].z) != f2u(refDeltaPos[v].z) ||
-            f2u(gotDeltaPos[v].w) != f2u(refDeltaPos[v].w))
-        {
-            if (mm == 0u)
-                std::printf("    first cloth delta difference at vertex %u: gpu (%.9g %.9g %.9g | "
-                            "%.9g) vs (%.9g %.9g %.9g | %.9g)\n", v,
-                            gotDeltaPos[v].x, gotDeltaPos[v].y, gotDeltaPos[v].z, gotDeltaPos[v].w,
-                            refDeltaPos[v].x, refDeltaPos[v].y, refDeltaPos[v].z, refDeltaPos[v].w);
-            ++mm;
-        }
-    }
-    PXG_CHECK_MSG(mm == 0u, "%u cloth-side vertex deltas differ from the mirror", mm);
-
-    uint32_t mp = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
-        if (f2u(gotDeltaP[i].x) != f2u(refDeltaP[i].x) || f2u(gotDeltaP[i].y) != f2u(refDeltaP[i].y) ||
-            f2u(gotDeltaP[i].z) != f2u(refDeltaP[i].z) || f2u(gotDeltaP[i].w) != f2u(refDeltaP[i].w))
-        {
-            if (mp == 0u)
-                std::printf("    first particle delta difference at contact %u: gpu (%.9g %.9g "
-                            "%.9g | %.9g) vs (%.9g %.9g %.9g | %.9g)\n", i,
-                            gotDeltaP[i].x, gotDeltaP[i].y, gotDeltaP[i].z, gotDeltaP[i].w,
-                            refDeltaP[i].x, refDeltaP[i].y, refDeltaP[i].z, refDeltaP[i].w);
-            ++mp;
-        }
-    PXG_CHECK_MSG(mp == 0u, "%u particle-side deltas differ from the mirror", mp);
-
-    // Both runs must leave the SAME applied forces: the force update is the shared
-    // half of the two kernels, and a divergence there means the split moved.
-    uint32_t mf = 0u;
-    for (uint32_t i = 0; i < NB_CONTACTS * 2u; ++i)
-    {
-        if (f2u(gotForceA[i]) != f2u(refForce[i])) ++mf;
-        if (f2u(gotForceA[i]) != f2u(gotForceB[i])) ++mf;
-    }
-    PXG_CHECK_MSG(mf == 0u,
-                  "%u applied-force words disagree with the mirror or between the two kernels; "
-                  "everything up to the force update is one shared body", mf);
-
-    std::printf("    [ note ] %u contacts (%u skipped for zero inverse mass, %u normal-force "
-                "clamps bit); %u single-writer vertices bit-exact, %u contended checked on count\n",
-                NB_CONTACTS, skippedByMass, clamped, contendedBase,
-                uint32_t(accum.size()) - contendedBase);
-
-    for (PxgBufferHandle h : { bAccum.h, bCi.h, bMatIdx.h, bClothMats.h, bDeltaPos.h, bDesc.h,
-                               bDeltaP.h, bPhases.h, bPhaseToMat.h, bPsMats.h, bPs.h, bInfos.h,
-                               bConstraints.h, bForcesA.h, bForcesB.h, bNum.h, bDeltaPOut.h })
-        dev->destroyBuffer(h);
-}
-
-
-// ---------------------------------------------------------------------------
-// P9.32: cloth_solveOutputAttachmentClothClothDeltaVLaunch — the cloth-vs-cloth
-// ATTACHMENT solve (FEMClothExternalSolve.cu:1493, launch PxgFEMClothCore.cpp:1915).
-// ---------------------------------------------------------------------------
-namespace p932att
-{
-struct ClothAttachSolvePush
-{
-    uint64_t clothes, attachments;
-    uint32_t numAttachments, pad20;
-};
-static_assert(sizeof(ClothAttachSolvePush) == 24, "cloth attach solve blob must be 24 bytes");
-static_assert(offsetof(ClothAttachSolvePush, attachments) == 8, "attachments @8");
-static_assert(offsetof(ClothAttachSolvePush, numAttachments) == 16, "numAttachments @16");
-
-// PxgFEMFEMAttachmentConstraint (PxgFEMCore.h:204) — the warp-strided block.  This TU
-// cannot offsetof against the real struct (PxgFEMCore.h pulls the CUDA buffer stack), and
-// the layout already exists twice — in the pxgSlangFemFemAttach module and in
-// testSoftBodySim.cpp's p819att.  What this copy can do that those cannot is refuse to let
-// the offsets be TYPED: they are ACCUMULATED from the field declarations
-//
-//   union { float4 low_high_limits[32];  float4 low_high_angles[32];       }
-//   union { float4 axis_angle[32];       float4 attachmentBarycentric[32]; }
-//   float4 barycentric0[32];   float4 barycentric1[32];
-//   PxU64  elemId0[32];        PxU64  elemId1[32];
-//   float  constraintOffset[32];
-//
-// and only then compared against the numbers the SHADER carries.  A field whose size or
-// position is misread here therefore fails to agree with the shader instead of quietly
-// agreeing with a second wrong copy.
-static const size_t FAC_LANES = 32;
-static const size_t FAC_F4_ARR  = 16 * FAC_LANES;   // float4[32]
-static const size_t FAC_U64_ARR =  8 * FAC_LANES;   // PxU64[32]
-static const size_t FAC_F32_ARR =  4 * FAC_LANES;   // float[32]
-static const size_t FAC_LOW_HIGH_ANGLES = 0;
-static const size_t FAC_ATT_BARYCENTRIC = FAC_LOW_HIGH_ANGLES + FAC_F4_ARR;
-static const size_t FAC_BARYCENTRIC0    = FAC_ATT_BARYCENTRIC + FAC_F4_ARR;
-static const size_t FAC_BARYCENTRIC1    = FAC_BARYCENTRIC0 + FAC_F4_ARR;
-static const size_t FAC_ELEMID0         = FAC_BARYCENTRIC1 + FAC_F4_ARR;
-static const size_t FAC_ELEMID1         = FAC_ELEMID0 + FAC_U64_ARR;
-static const size_t FAC_CONSTR_OFFSET   = FAC_ELEMID1 + FAC_U64_ARR;
-static const size_t FAC_STRIDE          = FAC_CONSTR_OFFSET + FAC_F32_ARR;
-// The literals in pxgSlangFemFemAttach.slang, restated so a change to either side breaks.
-static_assert(FAC_ATT_BARYCENTRIC == 512, "attachmentBarycentric @512");
-static_assert(FAC_BARYCENTRIC0 == 1024, "barycentric0 @1024");
-static_assert(FAC_BARYCENTRIC1 == 1536, "barycentric1 @1536");
-static_assert(FAC_ELEMID0 == 2048, "elemId0 @2048");
-static_assert(FAC_ELEMID1 == 2304, "elemId1 @2304");
-static_assert(FAC_CONSTR_OFFSET == 2560, "constraintOffset @2560");
-static_assert(FAC_STRIDE == 2688, "the block is 2688 bytes");
-
-// PxgSimulationCoreDesc.h:41 / PxDeformableSurface.h:56 — the encoding BOTH sides of the
-// kernel decode, one through the accessors and one open-coded (trap A4).
-static const uint32_t CLOTH_ID_SHIFT = 20u;
-static const uint32_t CLOTH_ELEM_MASK = 0x000fffffu;
-static uint64_t encodeCloth(uint32_t clothId, uint32_t elem)
-{
-    return uint64_t((clothId << CLOTH_ID_SHIFT) | elem);
-}
-
-// PxgSoftBodyKernelGridDim/BlockDim::SB_UPDATEROTATION.
-static const uint32_t FCA_GRID = 1024u, FCA_BLOCK = 256u;
-} // namespace p932att
-
-PXG_TEST(femClothSimClothClothAttachment)
-{
-    using namespace p932att;
-    PxgSlangComputeDevice* dev = testDevice();
-
-    // Three clothes at ids 1, 2 and 5 — never 0.  A port that forgets the >> 20 reads
-    // descriptor 0, which stays all-zero here, so the mistake is a null dereference rather
-    // than a plausible number.
-    const uint32_t CLOTH_A = 1u, CLOTH_B = 2u, CLOTH_C = 5u;
-
-    // 70 attachments = three warp blocks of 32/32/6.  Fewer than 33 and trap A2 is
-    // invisible: `attachments[workIndex]` and `attachments[workIndex/32]` agree exactly on
-    // the first block.
-    const uint32_t NB_ATT = 70u;
-    const uint32_t NB_BLOCKS = (NB_ATT + 31u) / 32u;
-
-    // Attachment 9 has BOTH sides fully pinned -> the invMass guard fires (trap A6).
-    // Attachments 44 and 45 have exactly ONE side pinned, which is what separates the
-    // guard's `&&` from an `||`: with `&&` they are solved against the free side's mass,
-    // with `||` they would be dropped.  The first sweep had neither, and the `||` mutant
-    // survived — a survivor that says nothing about the code and everything about which
-    // states the rig reached.
-    // Attachments 33 and 58 are SELF-attachments inside cloth C and share vertices, so
-    // their scatters contend (trap A10).
-    const uint32_t PINNED_ATT = 9u, PINNED_A_ONLY = 44u, PINNED_B_ONLY = 45u;
-    auto isSelf = [&](uint32_t a) { return a == 33u || a == 58u; };
-
-    // Trap A7 needs a corner whose weight is zero in EVERY slot, for BOTH reasons — the
-    // first sweep put its zeros in corners y and z only, so a mutant that guards corner x
-    // was a no-op against this rig and survived.  Six explicit attachments now, spread over
-    // two warp blocks so a slot cannot be reached by accident.
-    auto zeroMassCorner = [](uint32_t a) -> int {   // -1 = none
-        if (a == 5u || a == 40u) return 0;
-        if (a == 3u || a == 41u) return 1;
-        if (a == 7u || a == 42u) return 2;
-        return -1;
-    };
-    auto zeroBaryCorner = [](uint32_t a) -> int {
-        if (a == 20u) return 0;
-        if (a == 21u) return 1;
-        if (a == 12u) return 2;
-        return -1;
-    };
-
-    // ---- the three clothes ----------------------------------------------------------
-    // Every attachment owns its own triangle on each side, except the self ones, which
-    // share cloth C's vertex 0..5 pool.  Positions and inverse masses are all distinct so
-    // the interpolated inverse mass (trap A5) equals no single vertex's.
-    std::vector<F4> vA, vB, vC;
-    std::vector<TriIdx4> tA, tB, tC;
-    auto pushTri = [](std::vector<F4>& v, std::vector<TriIdx4>& t, float ox, float oy,
-                      const float m[3]) {
-        const uint32_t b = uint32_t(v.size());
-        v.push_back(F4{ ox,         oy,         0.10f, m[0] });
-        v.push_back(F4{ ox + 1.3f,  oy + 0.2f,  0.30f, m[1] });
-        v.push_back(F4{ ox + 0.4f,  oy + 1.7f, -0.20f, m[2] });
-        t.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
-    };
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        const bool pinA = (a == PINNED_ATT || a == PINNED_A_ONLY);
-        const bool pinB = (a == PINNED_ATT || a == PINNED_B_ONLY);
-        float mA[3] = { 0.40f + 0.011f * float(a),
-                        0.62f + 0.007f * float(a),
-                        0.85f - 0.006f * float(a % 30u) };
-        float mB[3] = { 0.55f - 0.004f * float(a % 25u),
-                        0.31f + 0.009f * float(a),
-                        0.73f + 0.005f * float(a % 17u) };
-        const int zm = zeroMassCorner(a);
-        if (zm >= 0) mA[zm] = 0.0f;
-        for (int c = 0; c < 3; ++c) { if (pinA) mA[c] = 0.0f; if (pinB) mB[c] = 0.0f; }
-        if (isSelf(a))
-        {
-            // Both sides land in cloth C on triangles that SHARE vertices.
-            continue;
-        }
-        pushTri(vA, tA, 2.0f * float(a), 0.0f, mA);
-        pushTri(vB, tB, 2.0f * float(a), 5.0f, mB);
-    }
-    // Cloth C: six vertices, three triangles over them, so the two self-attachments write
-    // the same vertices twice from opposite sides.
-    {
-        const float mC[6] = { 0.37f, 0.0f, 0.91f, 0.48f, 0.66f, 0.24f };
-        for (uint32_t i = 0; i < 6u; ++i)
-            vC.push_back(F4{ 0.7f * float(i), 1.1f * float(i % 3u), -0.4f * float(i % 2u), mC[i] });
-        tC.push_back(TriIdx4{ 0u, 1u, 2u, 0u });
-        tC.push_back(TriIdx4{ 2u, 3u, 4u, 0u });
-        tC.push_back(TriIdx4{ 4u, 5u, 0u, 0u });
-    }
-
-    DevBuf bVA = makeDev(dev, vA);
-    if (!bVA.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bVA.h); return; }
-    DevBuf bVB = makeDev(dev, vB), bVC = makeDev(dev, vC);
-    DevBuf bTA = makeDev(dev, tA), bTB = makeDev(dev, tB), bTC = makeDev(dev, tC);
-    std::vector<F4> dA(vA.size(), F4{ 0, 0, 0, 0 }), dB(vB.size(), F4{ 0, 0, 0, 0 }),
-                    dC(vC.size(), F4{ 0, 0, 0, 0 });
-    DevBuf bDA = makeDev(dev, dA), bDB = makeDev(dev, dB), bDC = makeDev(dev, dC);
-
-    std::vector<PxgFEMCloth> descArr(CLOTH_C + 1u, makeZeroDesc());
-    auto wire = [](PxgFEMCloth& c, DevBuf& pos, DevBuf& tri, DevBuf& delta,
-                   size_t nbVerts, size_t nbTris) {
-        c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(pos.addr));
-        c.mTriangleVertexIndices =
-            reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(tri.addr));
-        c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(delta.addr));
-        c.mNbVerts = uint32_t(nbVerts);
-        c.mNbTriangles = uint32_t(nbTris);
-    };
-    wire(descArr[CLOTH_A], bVA, bTA, bDA, vA.size(), tA.size());
-    wire(descArr[CLOTH_B], bVB, bTB, bDB, vB.size(), tB.size());
-    wire(descArr[CLOTH_C], bVC, bTC, bDC, vC.size(), tC.size());
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    // ---- the constraint block ---------------------------------------------------------
-    // Seeded with a recognisable pattern so a read that misses its slot lands on garbage
-    // rather than on a zero that could pass for an answer.
-    std::vector<uint32_t> con(NB_BLOCKS * FAC_STRIDE / 4, 0xCDCDCDCDu);
-    auto putF4 = [&](size_t byteOff, F4 v) {
-        const size_t w = byteOff / 4;
-        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
-    };
-    struct Side { uint32_t clothId, elem; F4 bary; };
-    std::vector<Side> s0(NB_ATT), s1(NB_ATT);
-    uint32_t triA = 0u, triB = 0u;
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        // Barycentrics that sum to one but are never equal between the two sides — with
-        // equal weights the swap of barycentric0/barycentric1 is invisible.  Attachment 12
-        // zeroes corner 2 on side 0: trap A7's second half.
-        F4 b0{ 0.5f - 0.004f * float(a % 20u), 0.2f + 0.003f * float(a % 13u), 0.0f, 0.0f };
-        b0.z = 1.0f - b0.x - b0.y;
-        switch (zeroBaryCorner(a))
-        {
-        case 0:  b0 = F4{ 0.0f, 0.45f, 0.55f, 0.0f }; break;
-        case 1:  b0 = F4{ 0.45f, 0.0f, 0.55f, 0.0f }; break;
-        case 2:  b0 = F4{ 0.45f, 0.55f, 0.0f, 0.0f }; break;
-        default: break;
-        }
-        F4 b1{ 0.15f + 0.005f * float(a % 11u), 0.55f - 0.006f * float(a % 9u), 0.0f, 0.0f };
-        b1.z = 1.0f - b1.x - b1.y;
-
-        if (isSelf(a))
-        {
-            s0[a] = Side{ CLOTH_C, (a == 33u) ? 0u : 1u, b0 };
-            s1[a] = Side{ CLOTH_C, (a == 33u) ? 1u : 2u, b1 };
-        }
-        else
-        {
-            s0[a] = Side{ CLOTH_A, triA++, b0 };
-            s1[a] = Side{ CLOTH_B, triB++, b1 };
-        }
-
-        const size_t base = size_t(a / 32u) * FAC_STRIDE, off = a & 31u;
-        // Trap A3: the slots are PxU64 and the kernel takes the LOW word.  The upper word
-        // carries a non-zero pattern, so a port that reads a uint2, or that steps by 4
-        // bytes, produces a cloth id far outside the descriptor array.
-        const size_t w0 = (base + FAC_ELEMID0 + off * 8) / 4;
-        con[w0] = uint32_t(encodeCloth(s0[a].clothId, s0[a].elem));
-        con[w0 + 1] = 0xA5A50000u | a;
-        const size_t w1 = (base + FAC_ELEMID1 + off * 8) / 4;
-        con[w1] = uint32_t(encodeCloth(s1[a].clothId, s1[a].elem));
-        con[w1 + 1] = 0x5A5A0000u | a;
-        putF4(base + FAC_BARYCENTRIC0 + off * 16, s0[a].bary);
-        putF4(base + FAC_BARYCENTRIC1 + off * 16, s1[a].bary);
-        // The three fields this kernel must NOT read (the cone-limit trio) keep the 0xCD
-        // fill, so a body copied from the softbody solve reads NaNs rather than zeros.
-    }
-    DevBuf bCon = makeDev(dev, con);
-
-    ClothAttachSolvePush push = {};
-    push.clothes = bDesc.addr;
-    push.attachments = bCon.addr;
-    push.numAttachments = NB_ATT;
-    Kernel k("femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch",
-             {}, sizeof(ClothAttachSolvePush));
-    k.dispatch(FCA_GRID, {}, push, 1u, 1u);
-    dev->flush();
-
-    // ---- the mirror, transcribed from the .cu ------------------------------------------
-    std::vector<F4> rA(vA.size(), F4{ 0, 0, 0, 0 }), rB(vB.size(), F4{ 0, 0, 0, 0 }),
-                    rC(vC.size(), F4{ 0, 0, 0, 0 });
-    auto vertsOf = [&](uint32_t clothId) -> const std::vector<F4>& {
-        return clothId == CLOTH_A ? vA : (clothId == CLOTH_B ? vB : vC);
-    };
-    auto trisOf = [&](uint32_t clothId) -> const std::vector<TriIdx4>& {
-        return clothId == CLOTH_A ? tA : (clothId == CLOTH_B ? tB : tC);
-    };
-    auto refOf = [&](uint32_t clothId) -> std::vector<F4>& {
-        return clothId == CLOTH_A ? rA : (clothId == CLOTH_B ? rB : rC);
-    };
-    uint32_t skippedByMass = 0u, contendedWrites = 0u;
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        const TriIdx4& t0 = trisOf(s0[a].clothId)[s0[a].elem];
-        const TriIdx4& t1 = trisOf(s1[a].clothId)[s1[a].elem];
-        const std::vector<F4>& v0 = vertsOf(s0[a].clothId);
-        const std::vector<F4>& v1 = vertsOf(s1[a].clothId);
-        const F4 p00 = v0[t0.x], p01 = v0[t0.y], p02 = v0[t0.z];
-        const F4 p10 = v1[t1.x], p11 = v1[t1.y], p12 = v1[t1.z];
-        const F4& b0 = s0[a].bary; const F4& b1 = s1[a].bary;
-        // The float4 blend — .w included, and .w is what divides (trap A5).
-        const F4 pos0{ p00.x * b0.x + p01.x * b0.y + p02.x * b0.z,
-                       p00.y * b0.x + p01.y * b0.y + p02.y * b0.z,
-                       p00.z * b0.x + p01.z * b0.y + p02.z * b0.z,
-                       p00.w * b0.x + p01.w * b0.y + p02.w * b0.z };
-        const F4 pos1{ p10.x * b1.x + p11.x * b1.y + p12.x * b1.z,
-                       p10.y * b1.x + p11.y * b1.y + p12.y * b1.z,
-                       p10.z * b1.x + p11.z * b1.y + p12.z * b1.z,
-                       p10.w * b1.x + p11.w * b1.y + p12.w * b1.z };
-        if (pos1.w == 0.0f && pos0.w == 0.0f) { ++skippedByMass; continue; }   // trap A6
-
-        // The shape of the arithmetic is the observable, not just its value -- and P9.36
-        // corrected which shape.  This comment used to read:
-        //
-        //     "the CUDA writes `diff * coefficient / (invMass0 + invMass1)`, so the scale
-        //      is a multiplication FOLLOWED BY a division, not a multiplication by a
-        //      reciprocal."
-        //
-        // It is the reverse.  `diff` is a CUDA float4 (FEMClothExternalSolve.cu:1553) and
-        // `float4 operator/(float4 a, float s)` (cutil_math.h:485) is
-        // `float inv = 1.0f/s; return a * inv;` -- a multiplication BY A RECIPROCAL, which
-        // is precisely what the old text ruled out.  The trap was pointed the wrong way and
-        // pinned the port's mistake in place.
-        const float coefficient = 0.5f;                                        // trap A9
-        const float denom = pos0.w + pos1.w;
-        const float invDenom = 1.0f / denom;
-        const float dix = (pos1.x - pos0.x) * coefficient * invDenom;
-        const float diy = (pos1.y - pos0.y) * coefficient * invDenom;
-        const float diz = (pos1.z - pos0.z) * coefficient * invDenom;
-
-        // Trap A7: NO skip.  Trap A8: cloth0 gets +, cloth1 gets -.
-        auto scatter = [&](uint32_t clothId, const TriIdx4& t, const F4& b,
-                           float sx, float sy, float sz) {
-            std::vector<F4>& r = refOf(clothId);
-            const std::vector<F4>& v = vertsOf(clothId);
-            const uint32_t iv[3] = { t.x, t.y, t.z };
-            const float bw[3] = { b.x, b.y, b.z };
-            for (int c = 0; c < 3; ++c)
-            {
-                const float im = v[iv[c]].w;                                   // trap A5
-                r[iv[c]].x += sx * bw[c] * im;
-                r[iv[c]].y += sy * bw[c] * im;
-                r[iv[c]].z += sz * bw[c] * im;
-                r[iv[c]].w += 1.0f;
-            }
-        };
-        scatter(s0[a].clothId, t0, b0, dix, diy, diz);
-        scatter(s1[a].clothId, t1, b1, -dix, -diy, -diz);
-        if (isSelf(a)) ++contendedWrites;
-    }
-
-    const auto gA = downloadBuffer<F4>(dev, bDA.h, uint32_t(dA.size()));
-    const auto gB = downloadBuffer<F4>(dev, bDB.h, uint32_t(dB.size()));
-    const auto gC = downloadBuffer<F4>(dev, bDC.h, uint32_t(dC.size()));
-
-    // Cloth A and B: every vertex has exactly ONE writer, so the comparison is bitwise.
-    uint32_t mm = 0u;
-    auto cmpExact = [&](const std::vector<F4>& got, const std::vector<F4>& ref, const char* tag) {
-        for (uint32_t v = 0; v < uint32_t(ref.size()); ++v)
-            if (f2u(got[v].x) != f2u(ref[v].x) || f2u(got[v].y) != f2u(ref[v].y) ||
-                f2u(got[v].z) != f2u(ref[v].z) || f2u(got[v].w) != f2u(ref[v].w))
-            {
-                if (mm == 0u)
-                    std::printf("    first %s difference at vertex %u: gpu (%.9g %.9g %.9g | %.9g)"
-                                " vs (%.9g %.9g %.9g | %.9g)\n", tag, v,
-                                got[v].x, got[v].y, got[v].z, got[v].w,
-                                ref[v].x, ref[v].y, ref[v].z, ref[v].w);
-                ++mm;
-            }
-    };
-    cmpExact(gA, rA, "cloth A");
-    cmpExact(gB, rB, "cloth B");
-    PXG_CHECK_MSG(mm == 0u, "%u single-writer vertex deltas differ from the mirror", mm);
-
-    // Cloth C carries the two SELF-attachments, whose six scatters overlap; the atomics make
-    // the order free, so the totals are compared with a tolerance and the counters exactly.
-    uint32_t mc = 0u;
-    for (uint32_t v = 0; v < uint32_t(rC.size()); ++v)
-    {
-        if (f2u(gC[v].w) != f2u(rC[v].w))
-        { ++mc; std::printf("    cloth C vertex %u writer count %g, expected %g\n",
-                            v, gC[v].w, rC[v].w); }
-        if (std::fabs(gC[v].x - rC[v].x) > 1e-6f || std::fabs(gC[v].y - rC[v].y) > 1e-6f ||
-            std::fabs(gC[v].z - rC[v].z) > 1e-6f)
-        { ++mc; std::printf("    cloth C vertex %u delta (%.9g %.9g %.9g) expected (%.9g %.9g %.9g)\n",
-                            v, gC[v].x, gC[v].y, gC[v].z, rC[v].x, rC[v].y, rC[v].z); }
-    }
-    PXG_CHECK_MSG(mc == 0u, "%u contended cloth-C vertices disagree with the mirror", mc);
-
-    // The structural facts the mirror alone would not pin, because the mirror shares the
-    // port's reading of them.
-    PXG_CHECK_MSG(skippedByMass == 1u,
-                  "exactly one attachment must be skipped for zero inverse mass, not %u",
-                  skippedByMass);
-    const TriIdx4& tp = tA[s0[PINNED_ATT].elem];
-    PXG_CHECK_MSG(gA[tp.x].w == 0.0f && gA[tp.y].w == 0.0f && gA[tp.z].w == 0.0f,
-                  "the fully pinned attachment must leave its triangle untouched");
-    // Trap A6's `&&`: a HALF-pinned attachment is solved, not skipped.  Both of its
-    // triangles take writer counts, and the free side actually moves.
-    for (uint32_t a : { PINNED_A_ONLY, PINNED_B_ONLY })
-    {
-        const TriIdx4& ha = tA[s0[a].elem];
-        const TriIdx4& hb = tB[s1[a].elem];
-        PXG_CHECK_MSG(gA[ha.x].w == 1.0f && gB[hb.x].w == 1.0f,
-                      "attachment %u has exactly one pinned side and must still be solved "
-                      "(counts %g and %g)", a, gA[ha.x].w, gB[hb.x].w);
-    }
-    // Trap A7 in the affirmative: a corner whose weight is zero — for EITHER reason, in
-    // EACH of the three slots — still takes a writer count and a zero delta.
-    uint32_t zeroWeightChecked = 0u;
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        if (isSelf(a) || a == PINNED_ATT || a == PINNED_A_ONLY) continue;
-        const int slots[2] = { zeroMassCorner(a), zeroBaryCorner(a) };
-        for (int which = 0; which < 2; ++which)
-        {
-            const int c = slots[which];
-            if (c < 0) continue;
-            const TriIdx4& t = tA[s0[a].elem];
-            const uint32_t v = (c == 0) ? t.x : (c == 1 ? t.y : t.z);
-            PXG_CHECK_MSG(gA[v].w == 1.0f && gA[v].x == 0.0f && gA[v].y == 0.0f &&
-                          gA[v].z == 0.0f,
-                          "attachment %u corner %d carries zero weight (%s) and must still "
-                          "take a writer count and a zero delta (got count %g, xyz %g %g %g)",
-                          a, c, which == 0 ? "inverse mass" : "barycentric",
-                          gA[v].w, gA[v].x, gA[v].y, gA[v].z);
-            ++zeroWeightChecked;
-        }
-    }
-    PXG_CHECK_MSG(zeroWeightChecked == 9u,
-                  "the rig must place a zero weight in each of the three corner slots for "
-                  "both reasons; %u were found", zeroWeightChecked);
-    // Trap A8: the two sides moved in OPPOSITE directions.  Attachment 0's side-0 anchor is
-    // below its side-1 anchor in y, so cloth A's corner moves +y and cloth B's -y.
-    const TriIdx4& t0a = tA[s0[0u].elem];
-    const TriIdx4& t0b = tB[s1[0u].elem];
-    PXG_CHECK_MSG(gA[t0a.x].y > 0.0f && gB[t0b.x].y < 0.0f,
-                  "cloth0 must move toward cloth1 and cloth1 toward cloth0 (got %g and %g)",
-                  gA[t0a.x].y, gB[t0b.x].y);
-
-    std::printf("    [ note ] %u attachments over %u warp blocks, %u skipped for zero inverse "
-                "mass, 2 half-pinned, %u zero-weight corners checked, %u self-attachments "
-                "contending in cloth C; %zu single-writer vertices bit-exact\n",
-                NB_ATT, NB_BLOCKS, skippedByMass, zeroWeightChecked, contendedWrites,
-                vA.size() + vB.size());
-
-    for (PxgBufferHandle h : { bVA.h, bVB.h, bVC.h, bTA.h, bTB.h, bTC.h, bDA.h, bDB.h, bDC.h,
-                               bDesc.h, bCon.h })
-        dev->destroyBuffer(h);
-}
-
-
-// ---------------------------------------------------------------------------
-// P9.32 coverage rig.  Two properties of the work-index formula are invisible below
-// gridDim*blockDim = 1024*256 = 262144 attachments, because `nbIterationsPerBlock` is 1
-// there and the formula collapses to a flat index:
-//   - dropping the `nbIterationsPerBlock *` factor makes the per-block ranges OVERLAP,
-//     so the tail is never visited and everything else is visited twice (trap A1);
-//   - the zero-mass guard being a `return` rather than a `continue` abandons every LATER
-//     iteration of a thread that meets one fully pinned attachment (trap A6).
-// Both need nbIterationsPerBlock >= 2, so this rig runs 262400 attachments: 1025 blocks
-// required over a 1024-wide grid -> exactly two iterations per thread.
-//
-// Every attachment uses the SAME triangle on both sides with the SAME barycentric, so the
-// position delta is exactly zero and the only observable is the .w WRITER COUNT — which is
-// precisely what a coverage question asks.  Attachments 0..255 are fully pinned, which is
-// block 0's first iteration; their threads' second iteration is attachments 256..511.
-// ---------------------------------------------------------------------------
-PXG_TEST(femClothSimClothClothAttachmentCoverage)
-{
-    using namespace p932att;
-    PxgSlangComputeDevice* dev = testDevice();
-
-    const uint32_t CLOTH_ID = 3u;
-    const uint32_t NB_ATT = 262400u;                 // 1025 blocks over a 1024 grid
-    const uint32_t NB_PINNED = FCA_BLOCK;            // the whole of block 0's iteration 0
-    const uint32_t NB_BLOCKS = NB_ATT / 32u;
-    // Derived, not assumed: the dispatch this rig needs must really take two iterations.
-    const uint32_t nbBlocksRequired = (NB_ATT + FCA_BLOCK - 1u) / FCA_BLOCK;
-    const uint32_t nbIterationsPerBlock = (nbBlocksRequired + FCA_GRID - 1u) / FCA_GRID;
-    PXG_CHECK_MSG(nbIterationsPerBlock == 2u,
-                  "the rig must reach two iterations per thread, got %u", nbIterationsPerBlock);
-
-    std::vector<F4> verts(size_t(NB_ATT) * 3u);
-    std::vector<TriIdx4> tris(NB_ATT);
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        const uint32_t b = a * 3u;
-        const float im = (a < NB_PINNED) ? 0.0f : 0.5f;
-        verts[b + 0] = F4{ float(a), 0.0f, 0.0f, im };
-        verts[b + 1] = F4{ float(a) + 1.0f, 0.0f, 0.0f, im };
-        verts[b + 2] = F4{ float(a), 1.0f, 0.0f, im };
-        tris[a] = TriIdx4{ b, b + 1u, b + 2u, 0u };
-    }
-    DevBuf bV = makeDev(dev, verts);
-    if (!bV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bV.h); return; }
-    DevBuf bT = makeDev(dev, tris);
-    std::vector<F4> delta(verts.size(), F4{ 0, 0, 0, 0 });
-    DevBuf bD = makeDev(dev, delta);
-
-    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
-    descArr[CLOTH_ID].mPosition_InvMass =
-        reinterpret_cast<decltype(descArr[0].mPosition_InvMass)>(size_t(bV.addr));
-    descArr[CLOTH_ID].mTriangleVertexIndices =
-        reinterpret_cast<decltype(descArr[0].mTriangleVertexIndices)>(size_t(bT.addr));
-    descArr[CLOTH_ID].mDeltaPos =
-        reinterpret_cast<decltype(descArr[0].mDeltaPos)>(size_t(bD.addr));
-    descArr[CLOTH_ID].mNbVerts = uint32_t(verts.size());
-    descArr[CLOTH_ID].mNbTriangles = NB_ATT;
-    DevBuf bDesc = makeDev(dev, descArr);
-
-    std::vector<uint32_t> con(size_t(NB_BLOCKS) * FAC_STRIDE / 4, 0u);
-    const F4 BARY{ 0.25f, 0.35f, 0.40f, 0.0f };
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        const size_t base = size_t(a / 32u) * FAC_STRIDE, off = a & 31u;
-        const uint32_t code = uint32_t(encodeCloth(CLOTH_ID, a));
-        con[(base + FAC_ELEMID0 + off * 8) / 4] = code;
-        con[(base + FAC_ELEMID1 + off * 8) / 4] = code;
-        for (int c = 0; c < 3; ++c)
-        {
-            const float w = (c == 0) ? BARY.x : (c == 1 ? BARY.y : BARY.z);
-            con[(base + FAC_BARYCENTRIC0 + off * 16) / 4 + c] = f2u(w);
-            con[(base + FAC_BARYCENTRIC1 + off * 16) / 4 + c] = f2u(w);
-        }
-    }
-    DevBuf bCon = makeDev(dev, con);
-
-    ClothAttachSolvePush push = {};
-    push.clothes = bDesc.addr;
-    push.attachments = bCon.addr;
-    push.numAttachments = NB_ATT;
-    Kernel k("femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch",
-             {}, sizeof(ClothAttachSolvePush));
-    k.dispatch(FCA_GRID, {}, push, 1u, 1u);
-    dev->flush();
-
-    const auto got = downloadBuffer<F4>(dev, bD.h, uint32_t(verts.size()));
-
-    // Both sides scatter into the SAME triangle, so a visited attachment leaves 2.0 on each
-    // of its three corners; a skipped or unvisited one leaves 0.0.
-    uint32_t badCount = 0u, unvisited = 0u, firstUnvisited = NB_ATT, nonZeroDelta = 0u;
-    for (uint32_t a = 0; a < NB_ATT; ++a)
-    {
-        const float expect = (a < NB_PINNED) ? 0.0f : 2.0f;
-        for (uint32_t c = 0; c < 3u; ++c)
-        {
-            const F4& g = got[size_t(a) * 3u + c];
-            if (g.w != expect)
-            {
-                if (a >= NB_PINNED && g.w == 0.0f)
-                { if (firstUnvisited == NB_ATT) firstUnvisited = a; ++unvisited; }
-                else ++badCount;
-            }
-            if (g.x != 0.0f || g.y != 0.0f || g.z != 0.0f) ++nonZeroDelta;
-        }
-    }
-    PXG_CHECK_MSG(unvisited == 0u,
-                  "%u corners were never written; the first belongs to attachment %u "
-                  "(the formula's first uncovered index would be %u)",
-                  unvisited, firstUnvisited, FCA_GRID * FCA_BLOCK);
-    PXG_CHECK_MSG(badCount == 0u,
-                  "%u corners carry a writer count that is neither the expected 2 nor 0 — a "
-                  "count above 2 means a work index was visited more than once", badCount);
-    PXG_CHECK_MSG(nonZeroDelta == 0u,
-                  "%u corners moved, but both sides of every attachment interpolate the same "
-                  "anchor, so every delta must be exactly zero", nonZeroDelta);
-
-    std::printf("    [ note ] %u attachments, %u iterations per thread; %u pinned (block 0's "
-                "first iteration, whose SECOND iteration is attachments %u..%u), all %zu "
-                "remaining corners written exactly twice\n",
-                NB_ATT, nbIterationsPerBlock, NB_PINNED, NB_PINNED, NB_PINNED * 2u - 1u,
-                (size_t(NB_ATT) - NB_PINNED) * 3u);
-
-    for (PxgBufferHandle h : { bV.h, bT.h, bD.h, bDesc.h, bCon.h })
-        dev->destroyBuffer(h);
-}
 
 // ===========================================================================
 // P9.75 -- convexCoreClothmeshNphase_Kernel32 on the SHIPPED engine .spv
@@ -17436,7 +11765,7 @@ PXG_TEST(femClothSimClothClothAttachmentCoverage)
 // Classes A, B and D are all "the scene cannot see this", for three different
 // reasons, and no harder version of that scene reaches them: the scene has ONE
 // cloth (so clothId is 0 and the shift constant is unobservable), NO attachments
-// (so nbFilterPairs is 0 and `&&` cannot be told from `||`), ONE rigid (so the
+// (so the filter list is empty), ONE rigid (so the
 // 64-bit sort key is constant), and a resting contact (so half-penetration and the
 // ERP scaling are both fractions of a millimetre).
 //
@@ -17447,7 +11776,7 @@ PXG_TEST(femClothSimClothClothAttachmentCoverage)
 // WHAT IT DRIVES.  The SHIPPED cvxCoreClothNpBda.spv, not a copy.  P9.73 recorded
 // why that distinction is load-bearing: Phase-1 fixtures are self-contained by
 // convention, carrying their own copies of the shared functions, so mutants in the
-// shared modules survive them.  This one synthesises the fourteen device-side
+// shared modules survive them.  This one synthesises the twelve (5.12) device-side
 // arguments and dispatches the real entry point, exactly as the
 // cloth_planeVertContactGenLaunch fixture above does.
 //
@@ -17483,22 +11812,34 @@ PXG_TEST(femClothSimClothClothAttachmentCoverage)
 // ===========================================================================
 
 // Push blob, byte-identical to cvxCoreClothNpBda.slang's CvxCoreClothParams and to
-// the kCvxCoreCloth ABI row { 8,8,8,8,8,8,8,8,8,8,4,4,8,80 }.
+// the kCvxCoreCloth ABI row { 8,8,8,8,8,8,8,8,8,4,8,80 } (5.12: the filter pair list
+// and its count are gone; the writer is the PxgRigidDbContactWriter).
 struct CvxCoreClothPush
 {
     uint64_t stackPtr, midphasePairsNum, cmInputs, shapes, femClothes;
-    uint64_t shapeToRigidRemapTable, transformCache, contactDistance, restDistance, filterPairs;
-    uint32_t nbFilterPairs, stackSizeBytes;
+    uint64_t shapeToRigidRemapTable, transformCache, contactDistance, restDistance;
+    uint32_t stackSizeBytes, pad76;
     uint64_t stackSizeNeededOnDevice;
-    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
-    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
+    uint64_t pad88;                   // paramAlign(80) = 16
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_outRigidMaterialIndex;
+    uint64_t w_totalContactCount, w_contactByRigid, w_tempContactByRigid, w_contactIndexSortedByRigid;
     uint32_t w_maxNumContacts, pad172;
 };
 static_assert(sizeof(CvxCoreClothPush) == 176, "convex-core cloth push blob must be 176 bytes");
-static_assert(offsetof(CvxCoreClothPush, nbFilterPairs) == 80, "nbFilterPairs @80");
-static_assert(offsetof(CvxCoreClothPush, stackSizeNeededOnDevice) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(CvxCoreClothPush, stackSizeBytes) == 72, "stackSizeBytes @72");
+static_assert(offsetof(CvxCoreClothPush, stackSizeNeededOnDevice) == 80, "stackSizeNeeded @80");
 static_assert(offsetof(CvxCoreClothPush, w_outPoint) == 96, "writer @96");
 static_assert(offsetof(CvxCoreClothPush, w_maxNumContacts) == 168, "maxNumContacts @168");
+
+// Points every writer field of `p` at `w`.
+static void fillCvxWriter(CvxCoreClothPush& p, const WriterBufs& w)
+{
+    p.w_outPoint = w.point.addr; p.w_outNormalPen = w.normalPen.addr;
+    p.w_outBarycentric = w.barycentric.addr; p.w_outContactInfo = w.info.addr;
+    p.w_outRigidMaterialIndex = w.rigidMat.addr; p.w_totalContactCount = w.count.addr;
+    p.w_contactByRigid = w.byRigid.addr; p.w_tempContactByRigid = w.tempByRigid.addr;
+    p.w_contactIndexSortedByRigid = w.idxByRigid.addr; p.w_maxNumContacts = w.maxContacts;
+}
 
 // PxComputeBarycentric, the TRIANGLE overload (PxMathUtils.h:390-409), transcribed
 // operation for operation so the comparison can be BIT-EXACT.  This TU is built
@@ -17510,6 +11851,26 @@ static_assert(offsetof(CvxCoreClothPush, w_maxNumContacts) == 168, "maxNumContac
 // test has no such gate, and transcribing the windowed one would import a decision
 // that does not belong on this path.
 //
+// 5.12: the barycentric is taken at the CLOTH'S OWN WITNESS, `clothPoint = points[i] -
+// normal * dists[i] * 0.5f` (convexCoreCollision.cu:1248-1252), half a separation back
+// from the written midpoint `points[i] + normal * dists[i] * 0.5f`.  The host only sees
+// the written point, so it steps back the whole separation, (point - h) - h with
+// h = normal * dist * 0.5 -- not bit-identical to the kernel's points[i] - h, so the
+// comparisons below use a 2e-6 tolerance (the tilted case's witness shift moves the
+// barycentric by ~1e-2).
+static V3c cvxClothWitness(const F4& point, const F4& normalPen)
+{
+    // The written normal is -normal; the separation is written raw.
+    const float hx = -normalPen.x * normalPen.w * 0.5f;
+    const float hy = -normalPen.y * normalPen.w * 0.5f;
+    const float hz = -normalPen.z * normalPen.w * 0.5f;
+    return V3c{ (point.x - hx) - hx, (point.y - hy) - hy, (point.z - hz) - hz };
+}
+static bool baryNear(const F4& a, const F4& b)
+{
+    return std::fabs(a.x - b.x) <= 2e-6f && std::fabs(a.y - b.y) <= 2e-6f && std::fabs(a.z - b.z) <= 2e-6f;
+}
+
 // P9.94d: it is TrimeshBvh::getTriBarycentric (convexCoreCollision.cu:672-680) that the
 // kernel mirrors, and that transforms the three vertices by the cloth's
 // `scale.toMat33()` FIRST.  The cloth's PxMeshScale is default-constructed, i.e.
@@ -17538,13 +11899,6 @@ static F4 cpuTriBarycentricRaw(V3c a, V3c b, V3c c, V3c p)
     const float w = (d00 * d21 - d01 * d20) / denom;
     const float u = 1.0f - v - w;
     return F4{ u, v, w, 0.0f };   // bary.w = 0 on the TRIANGLE overload (PxMathUtils.h:409)
-}
-
-// PxEncodeClothIndex (PxgSimulationCoreDesc.h:101-108), spelled from its own line --
-// PXG_BITSHIFT_ELEMENT_ID, not PXG_BITSHIFT_TET_ID.
-static uint32_t cpuEncodeCloth(uint32_t clothId, uint32_t elementId)
-{
-    return (clothId << PXG_BITSHIFT_ELEMENT_ID) | elementId;
 }
 
 PXG_TEST(cvxCoreClothNp)
@@ -17583,13 +11937,29 @@ PXG_TEST(cvxCoreClothNp)
     PxgFEMCloth cloth;
     std::memset(&cloth, 0, sizeof(cloth));
     cloth.mPosition_InvMass = reinterpret_cast<float4*>(bVerts.addr);
-    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(bTris.addr);
+    cloth.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(bTris.addr);
     // mTriMeshData is deliberately left NULL: this kernel never traverses, so
     // getNodes() and scaleBounds() are unreachable from it (convexCoreCollision.cu:1195-1279).
     // The kernel indexes femClothes[clothId] directly, so the array must REACH
     // index CLOTH_ID.  Uploading one descriptor and then asking for index 3 reads
     // off the end -- which is how the first run of this fixture segfaulted, and it
     // is precisely the mistake a scene with one cloth can never teach.
+    // ---- the filter (5.12), which the scene has none of -------------------
+    // The cloth's mRigidSurfaceFilterPairs, sorted (ref0, ref1), searched once per
+    // pair for (rigid filter ref, TRIANGLE).  RIGID_NODE_IND's low word is not
+    // 0xffffffff, so the rigid is dynamic and its filter ref is the node itself.
+    // Two near misses, neither of which may suppress anything:
+    //   - triangle 0's first VERTEX under the right rigid (5.6.1's per-vertex key);
+    //   - triangle 0 under ANOTHER rigid.
+    // CASE E below adds the real (rigid, triangle 1) entry.
+    std::vector<FemPairInfoHost> filters = {
+        FemPairInfoHost{ RIGID_NODE_IND, encClothVertex(CLOTH_ID, triInds[0]) },
+        FemPairInfoHost{ RIGID_NODE_IND + 1ull, encClothTriangle(CLOTH_ID, 0u) },
+    };
+    DevBuf bFilters = makeDev(dev, filters);
+    cloth.mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFilters.addr));
+    cloth.mNumRigidSurfaceFilterPairs = uint32_t(filters.size());
+
     std::vector<PxgFEMCloth> clothArr(CLOTH_ID + 1u);
     std::memset(clothArr.data(), 0, clothArr.size() * sizeof(PxgFEMCloth));
     clothArr[CLOTH_ID] = cloth;
@@ -17635,22 +12005,6 @@ PXG_TEST(cvxCoreClothNp)
     std::vector<uint64_t> remap = { RIGID_NODE_IND, 0ull };
     DevBuf bRemap = makeDev(dev, remap);
 
-    // ---- the filter, which the scene has none of -------------------------
-    // PxgRigidFilterPair: PxU64 index0, PxU64 index1, PxU32 index2, PxU32 pad[3].
-    // ONE entry, matching triangle 0's FIRST vertex only.  find() is then true for
-    // vertex .x and false for .y and .z, so:
-    //     A && B && C  ==  false  -> the pair is NOT skipped   (the engine's meaning)
-    //     A || (B && C) == true   -> the pair IS skipped       (the mutant)
-    // Note the parse: replacing only the first `&&` gives `A || (B && C)`, not a
-    // flat three-way OR -- C precedence, which Slang follows.
-    struct FilterPairHost { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
-    static_assert(sizeof(FilterPairHost) == 32, "PxgRigidFilterPair mirror == 32B");
-    std::vector<FilterPairHost> filters(1);
-    std::memset(filters.data(), 0, filters.size() * sizeof(FilterPairHost));
-    filters[0].index0 = RIGID_NODE_IND;
-    filters[0].index1 = cpuEncodeCloth(CLOTH_ID, triInds[0]);   // triangle 0's .x
-    DevBuf bFilters = makeDev(dev, filters);
-
     // ---- the midphase pairs ---------------------------------------------
     // uint4(cmIdx, primitiveIndex, 0, 0) -- femClothMidPhase.cu:98, and the Slang
     // port agrees (femClothContactGenBda.slang:1087).  TWO pairs on the SAME contact
@@ -17675,15 +12029,9 @@ PXG_TEST(cvxCoreClothNp)
     push.transformCache = bTc.addr;
     push.contactDistance = bCd.addr;
     push.restDistance = bRd.addr;
-    push.filterPairs = bFilters.addr;
-    push.nbFilterPairs = 1u;
     push.stackSizeBytes = 4096u;           // far above 2 pairs: the clamp is a no-op here
     push.stackSizeNeededOnDevice = bStackNeeded.addr;
-    push.w_outPoint = w.point.addr; push.w_outNormalPen = w.normalPen.addr;
-    push.w_outBarycentric = w.barycentric.addr; push.w_outContactInfo = w.info.addr;
-    push.w_totalContactCount = w.count.addr; push.w_contactByX = w.byRigid.addr;
-    push.w_tempContactByX = w.tempByRigid.addr; push.w_contactIndexSortedByX = w.idxByRigid.addr;
-    push.w_contactSortedByX = w.sortedByRigid.addr; push.w_maxNumContacts = w.maxContacts;
+    fillCvxWriter(push, w);
 
     Kernel k("cvxCoreClothNpBda.spv", "convexCoreClothmeshNphase_Kernel32", {}, sizeof(CvxCoreClothPush));
     k.dispatch(/*gridX*/ 1u, {}, push, 1u, 1u);
@@ -17693,8 +12041,8 @@ PXG_TEST(cvxCoreClothNp)
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
     PXG_CHECK_MSG(gCount > 0u && gCount <= w.maxContacts,
                   "the kernel emitted %u contacts; a triangle 0.1 inside the box must produce "
-                  "some, and the filter must NOT suppress it (only one of three vertices is "
-                  "filtered, and the engine's test is &&)", gCount);
+                  "some, and the filter must NOT suppress it (its entries name a VERTEX ref and "
+                  "another rigid, and the 5.12 test is one (rigid, triangle) search)", gCount);
 
     // A mutant that suppresses every contact (the filter always skipping, the
     // convex arm never built, the swap gone) leaves gCount == 0, and
@@ -17716,8 +12064,7 @@ PXG_TEST(cvxCoreClothNp)
     const std::vector<F4> gPoint = downloadBuffer<F4>(dev, w.point.h, gCount);
     const std::vector<F4> gNP = downloadBuffer<F4>(dev, w.normalPen.h, gCount);
     const std::vector<F4> gBary = downloadBuffer<F4>(dev, w.barycentric.h, gCount);
-    const std::vector<FemOtherContactInfoHost> gInfo =
-        downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, gCount);
+    const std::vector<FemPairInfoHost> gInfo = downloadBuffer<FemPairInfoHost>(dev, w.info.h, gCount);
     const std::vector<uint64_t> gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, gCount);
     const std::vector<uint32_t> gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, gCount);
     const std::vector<uint32_t> gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, gCount);
@@ -17726,8 +12073,8 @@ PXG_TEST(cvxCoreClothNp)
     // ---- the per-contact invariants ---------------------------------------
     size_t mm = 0;
     uint32_t sawTri0 = 0u, sawTri1 = 0u, onTriPlane = 0u, onBoxPlane = 0u;
-    const uint32_t pairInd1Tri0 = cpuEncodeCloth(CLOTH_ID, 0u);
-    const uint32_t pairInd1Tri1 = cpuEncodeCloth(CLOTH_ID, 1u);
+    const uint64_t ref1Tri0 = encClothTriangle(CLOTH_ID, 0u);
+    const uint64_t ref1Tri1 = encClothTriangle(CLOTH_ID, 1u);
 
     for (uint32_t i = 0; i < gCount; ++i)
     {
@@ -17747,28 +12094,26 @@ PXG_TEST(cvxCoreClothNp)
                             "the solver read the contact as a VERTEX contact and index mDeltaPos "
                             "with a TRIANGLE index\n", i, gBary[i].w); }
 
-        // 3. THE BARYCENTRIC IS OF THE WRITTEN CONTACT POINT.  Recomputed on the host
-        //    from the kernel's OWN outPoint, so this is a cross-check and not a
-        //    re-derivation: a port that took the barycentric of the pre-shift point,
-        //    or permuted u/v/w, disagrees with its own output.
-        const uint32_t tri = (gInfo[i].pairInd1 == pairInd1Tri1) ? 1u : 0u;
+        // 3. THE BARYCENTRIC IS OF THE CLOTH'S WITNESS (5.12).  Recomputed on the host
+        //    from the kernel's OWN outPoint / outNormalPen, so this is a cross-check
+        //    and not a re-derivation: a port that took the barycentric of the written
+        //    midpoint (5.6.1), or permuted u/v/w, disagrees with its own output.
+        const uint32_t tri = (gInfo[i].ref1 == ref1Tri1) ? 1u : 0u;
         const uint32_t b0 = triInds[tri * 4u + 0u], b1 = triInds[tri * 4u + 1u], b2 = triInds[tri * 4u + 2u];
         const V3c a{ verts[b0].x, verts[b0].y, verts[b0].z };
         const V3c b{ verts[b1].x, verts[b1].y, verts[b1].z };
         const V3c c{ verts[b2].x, verts[b2].y, verts[b2].z };
-        const F4 refBary = cpuTriBarycentric(a, b, c, V3c{ gPoint[i].x, gPoint[i].y, gPoint[i].z });
-        if (f2u(refBary.x) != f2u(gBary[i].x) || f2u(refBary.y) != f2u(gBary[i].y) ||
-            f2u(refBary.z) != f2u(gBary[i].z))
+        const F4 refBary = cpuTriBarycentric(a, b, c, cvxClothWitness(gPoint[i], gNP[i]));
+        if (!baryNear(refBary, gBary[i]))
         { ++mm; std::printf("  cvxCoreCloth[%u] outBarycentric (%g,%g,%g) != PxComputeBarycentric of "
-                            "its own outPoint (%g,%g,%g)\n", i, gBary[i].x, gBary[i].y, gBary[i].z,
+                            "the cloth witness (%g,%g,%g)\n", i, gBary[i].x, gBary[i].y, gBary[i].z,
                             refBary.x, refBary.y, refBary.z); }
 
-        // 4. THE MATERIAL INDEX, WITH BIT 31 CLEARED.  setRigidMaterialIndex(mat)
-        //    followed by markInCollision(false) collapses to (mat & 0x7fffffff);
-        //    bit 31 is the isInCollision flag (PxgFEMCore.h:144-158).
-        if (gInfo[i].rigidMatInd_isInCollision != (MATERIAL_INDEX & 0x7fffffffu))
-        { ++mm; std::printf("  cvxCoreCloth[%u] rigidMatInd = 0x%08x, expected 0x%08x\n",
-                            i, gInfo[i].rigidMatInd_isInCollision, MATERIAL_INDEX & 0x7fffffffu); }
+        // 4. THE MATERIAL INDEX (5.12): its own PxU16 stream, narrowed by the store.
+        const uint32_t gMat = readRigidMat(dev, w, i);
+        if (gMat != (MATERIAL_INDEX & 0xffffu))
+        { ++mm; std::printf("  cvxCoreCloth[%u] rigidMaterialIndex = 0x%04x, expected 0x%04x\n",
+                            i, gMat, MATERIAL_INDEX & 0xffffu); }
 
         // 5. THE SORT KEY IS THE WHOLE 64-BIT NODE INDEX.  Both words of
         //    RIGID_NODE_IND are non-zero and unequal, so a swapped pair is visible --
@@ -17780,18 +12125,19 @@ PXG_TEST(cvxCoreClothNp)
         { ++mm; std::printf("  cvxCoreCloth[%u] tempContactByRigid = 0x%08x\n", i, gTempByRigid[i]); }
         if (gIdxByRigid[i] != i)
         { ++mm; std::printf("  cvxCoreCloth[%u] contactIndexSortedByRigid = %u\n", i, gIdxByRigid[i]); }
-        if (gInfo[i].pairInd0 != RIGID_NODE_IND)
-        { ++mm; std::printf("  cvxCoreCloth[%u] info.pairInd0 = 0x%016llx\n",
-                            i, (unsigned long long)gInfo[i].pairInd0); }
+        if (gInfo[i].ref0 != RIGID_NODE_IND)
+        { ++mm; std::printf("  cvxCoreCloth[%u] info.ref0 = 0x%016llx\n",
+                            i, (unsigned long long)gInfo[i].ref0); }
 
-        // 6. THE CLOTH ELEMENT ID.  CLOTH_ID is 3, not 0, so both the id itself and
-        //    the shift constant are observable here.
-        if (gInfo[i].pairInd1 != pairInd1Tri0 && gInfo[i].pairInd1 != pairInd1Tri1)
-        { ++mm; std::printf("  cvxCoreCloth[%u] info.pairInd1 = 0x%08x, expected 0x%08x (tri 0) or "
-                            "0x%08x (tri 1) -- clothId %u shifted by PXG_BITSHIFT_ELEMENT_ID\n",
-                            i, gInfo[i].pairInd1, pairInd1Tri0, pairInd1Tri1, CLOTH_ID); }
-        if (gInfo[i].pairInd1 == pairInd1Tri0) ++sawTri0;
-        if (gInfo[i].pairInd1 == pairInd1Tri1) ++sawTri1;
+        // 6. THE CLOTH TRIANGLE REF.  CLOTH_ID is 3, not 0, so both the id itself and
+        //    the PxgDeformableRef shift are observable here.
+        if (gInfo[i].ref1 != ref1Tri0 && gInfo[i].ref1 != ref1Tri1)
+        { ++mm; std::printf("  cvxCoreCloth[%u] info.ref1 = 0x%016llx, expected 0x%016llx (tri 0) or "
+                            "0x%016llx (tri 1) -- PxgEncodeDeformableTriangle(clothId %u, tri)\n",
+                            i, (unsigned long long)gInfo[i].ref1, (unsigned long long)ref1Tri0,
+                            (unsigned long long)ref1Tri1, CLOTH_ID); }
+        if (gInfo[i].ref1 == ref1Tri0) ++sawTri0;
+        if (gInfo[i].ref1 == ref1Tri1) ++sawTri1;
 
         // 7. THE NORMAL IS NEGATED ON WRITE (convexCoreCollision.cu:1269), and the
         //    SIGN is the point -- an abs() here would pin the axis and miss the
@@ -17898,11 +12244,7 @@ PXG_TEST(cvxCoreClothNp)
         CvxCoreClothPush p2 = push;
         p2.cmInputs = bCinSwap.addr;
         p2.stackSizeNeededOnDevice = bSn2.addr;
-        p2.w_outPoint = w2.point.addr; p2.w_outNormalPen = w2.normalPen.addr;
-        p2.w_outBarycentric = w2.barycentric.addr; p2.w_outContactInfo = w2.info.addr;
-        p2.w_totalContactCount = w2.count.addr; p2.w_contactByX = w2.byRigid.addr;
-        p2.w_tempContactByX = w2.tempByRigid.addr; p2.w_contactIndexSortedByX = w2.idxByRigid.addr;
-        p2.w_contactSortedByX = w2.sortedByRigid.addr;
+        fillCvxWriter(p2, w2);
 
         k.dispatch(1u, {}, p2, 1u, 1u);
         dev->flush();
@@ -17949,22 +12291,17 @@ PXG_TEST(cvxCoreClothNp)
         CvxCoreClothPush p3 = push;
         p3.stackSizeBytes = 16u;              // exactly one uint4
         p3.stackSizeNeededOnDevice = bSn3.addr;
-        p3.w_outPoint = w3.point.addr; p3.w_outNormalPen = w3.normalPen.addr;
-        p3.w_outBarycentric = w3.barycentric.addr; p3.w_outContactInfo = w3.info.addr;
-        p3.w_totalContactCount = w3.count.addr; p3.w_contactByX = w3.byRigid.addr;
-        p3.w_tempContactByX = w3.tempByRigid.addr; p3.w_contactIndexSortedByX = w3.idxByRigid.addr;
-        p3.w_contactSortedByX = w3.sortedByRigid.addr;
+        fillCvxWriter(p3, w3);
 
         k.dispatch(1u, {}, p3, 1u, 1u);
         dev->flush();
 
         const uint32_t c3 = downloadBuffer<uint32_t>(dev, w3.count.h, 1)[0];
         const uint32_t sn3v = downloadBuffer<uint32_t>(dev, bSn3.h, 1)[0];
-        const std::vector<FemOtherContactInfoHost> i3 =
-            downloadBuffer<FemOtherContactInfoHost>(dev, w3.info.h, c3 ? c3 : 1u);
+        const std::vector<FemPairInfoHost> i3 = downloadBuffer<FemPairInfoHost>(dev, w3.info.h, c3 ? c3 : 1u);
         uint32_t tri1Leaked = 0u;
         for (uint32_t i = 0; i < c3; ++i)
-            if (i3[i].pairInd1 == pairInd1Tri1) ++tri1Leaked;
+            if (i3[i].ref1 == ref1Tri1) ++tri1Leaked;
 
         PXG_CHECK_MSG(c3 == sawTri0 && tri1Leaked == 0u,
                       "with room for ONE pair the kernel produced %u contacts (%u of them from the "
@@ -17980,8 +12317,8 @@ PXG_TEST(cvxCoreClothNp)
     }
 
     // =======================================================================
-    // CASE D -- A TILTED TRIANGLE, so the half-penetration shift moves the
-    // barycentric.
+    // CASE D -- A TILTED TRIANGLE, so the witness shift moves the barycentric
+    // (5.12 takes it at the cloth's witness, not at the written midpoint).
     //
     // Cases A-C all use triangles whose plane is perpendicular to the contact
     // normal.  For those, `point = raw + normal * w * 0.5` slides along the
@@ -18007,11 +12344,7 @@ PXG_TEST(cvxCoreClothNp)
         pD.stackPtr = bPairsD.addr;
         pD.midphasePairsNum = bPairNumD.addr;
         pD.stackSizeNeededOnDevice = bSnD.addr;
-        pD.w_outPoint = wD.point.addr; pD.w_outNormalPen = wD.normalPen.addr;
-        pD.w_outBarycentric = wD.barycentric.addr; pD.w_outContactInfo = wD.info.addr;
-        pD.w_totalContactCount = wD.count.addr; pD.w_contactByX = wD.byRigid.addr;
-        pD.w_tempContactByX = wD.tempByRigid.addr; pD.w_contactIndexSortedByX = wD.idxByRigid.addr;
-        pD.w_contactSortedByX = wD.sortedByRigid.addr;
+        fillCvxWriter(pD, wD);
 
         k.dispatch(1u, {}, pD, 1u, 1u);
         dev->flush();
@@ -18029,34 +12362,68 @@ PXG_TEST(cvxCoreClothNp)
             size_t dm = 0; uint32_t moved = 0u;
             for (uint32_t i = 0; i < cD; ++i)
             {
-                const F4 refB = cpuTriBarycentric(ta, tb, tc,
-                                                  V3c{ dPoint[i].x, dPoint[i].y, dPoint[i].z });
-                if (f2u(refB.x) != f2u(dBary[i].x) || f2u(refB.y) != f2u(dBary[i].y) ||
-                    f2u(refB.z) != f2u(dBary[i].z) || f2u(dBary[i].w) != f2u(0.0f))
-                { ++dm; std::printf("  cvxCoreCloth tilted[%u] bary (%g,%g,%g,%g) != of its own point "
+                const F4 refB = cpuTriBarycentric(ta, tb, tc, cvxClothWitness(dPoint[i], dNP[i]));
+                if (!baryNear(refB, dBary[i]) || f2u(dBary[i].w) != f2u(0.0f))
+                { ++dm; std::printf("  cvxCoreCloth tilted[%u] bary (%g,%g,%g,%g) != of the cloth witness "
                                     "(%g,%g,%g,0)\n", i, dBary[i].x, dBary[i].y, dBary[i].z,
                                     dBary[i].w, refB.x, refB.y, refB.z); }
-                // The non-triviality guard: if the shift did NOT move the barycentric
-                // -- which is what happens when the normal is perpendicular to the
-                // triangle -- then this case proves nothing and must say so rather
-                // than pass quietly.  P9.73 wrote the same kind of counter after a
-                // survivor showed a fixture was measuring a degenerate configuration.
-                const V3c raw{ dPoint[i].x - 0.0f * dNP[i].w,
-                               dPoint[i].y - (-dNP[i].y) * dNP[i].w * 0.5f,
-                               dPoint[i].z };
-                const F4 rawB = cpuTriBarycentric(ta, tb, tc, raw);
-                if (f2u(rawB.x) != f2u(refB.x) || f2u(rawB.y) != f2u(refB.y)) ++moved;
+                // The non-triviality guard: if the witness shift did NOT move the
+                // barycentric -- which is what happens when the normal is perpendicular
+                // to the triangle -- then this case cannot tell 5.12's witness from
+                // 5.6.1's written midpoint and must say so rather than pass quietly.
+                const F4 midB = cpuTriBarycentric(ta, tb, tc, V3c{ dPoint[i].x, dPoint[i].y, dPoint[i].z });
+                if (!baryNear(midB, refB)) ++moved;
             }
             PXG_CHECK_MSG(dm == 0, "tilted-triangle barycentric mismatches: %zu of %u", dm, cD);
             PXG_CHECK_MSG(moved > 0u,
                           "the tilted case is DEGENERATE: for all %u contacts the barycentric of "
-                          "the shifted point equals that of the unshifted one, so this case cannot "
-                          "tell the two apart and proves nothing", cD);
+                          "the cloth witness equals that of the written midpoint, so this case "
+                          "cannot tell the two apart and proves nothing", cD);
             std::printf("    [ info ] cvxCoreCloth tilted: %u contacts, %u of them with a "
                         "shift-sensitive barycentric\n", cD, moved);
         }
         destroyWriter(dev, wD);
         dev->destroyBuffer(bPairsD.h); dev->destroyBuffer(bPairNumD.h); dev->destroyBuffer(bSnD.h);
+    }
+
+    // =======================================================================
+    // CASE E -- THE FILTER BITES (5.12).  A (rigid, triangle 1) entry is added to
+    // the cloth's sorted filter list: triangle 1 must vanish and triangle 0 keep
+    // exactly the contacts it made above.
+    // =======================================================================
+    {
+        std::vector<FemPairInfoHost> filtersE = filters;
+        filtersE.push_back(FemPairInfoHost{ RIGID_NODE_IND, encClothTriangle(CLOTH_ID, 1u) });
+        std::sort(filtersE.begin(), filtersE.end(), [](const FemPairInfoHost& a, const FemPairInfoHost& b) {
+            return a.ref0 != b.ref0 ? a.ref0 < b.ref0 : a.ref1 < b.ref1;
+        });
+        DevBuf bFiltersE = makeDev(dev, filtersE);
+        std::vector<PxgFEMCloth> clothArrE = clothArr;
+        clothArrE[CLOTH_ID].mRigidSurfaceFilterPairs = reinterpret_cast<PxgDeformablePairInfo*>(size_t(bFiltersE.addr));
+        clothArrE[CLOTH_ID].mNumRigidSurfaceFilterPairs = uint32_t(filtersE.size());
+        DevBuf bClothE = makeDev(dev, clothArrE);
+        std::vector<uint32_t> snE = { 0u };
+        DevBuf bSnE = makeDev(dev, snE);
+        WriterBufs wE = makeWriter(dev, 64u);
+
+        CvxCoreClothPush pE = push;
+        pE.femClothes = bClothE.addr;
+        pE.stackSizeNeededOnDevice = bSnE.addr;
+        fillCvxWriter(pE, wE);
+        k.dispatch(1u, {}, pE, 1u, 1u);
+        dev->flush();
+
+        const uint32_t cE = downloadBuffer<uint32_t>(dev, wE.count.h, 1)[0];
+        const std::vector<FemPairInfoHost> iE = downloadBuffer<FemPairInfoHost>(dev, wE.info.h, cE ? cE : 1u);
+        uint32_t tri1E = 0u;
+        for (uint32_t i = 0; i < cE; ++i)
+            if (iE[i].ref1 == ref1Tri1) ++tri1E;
+        PXG_CHECK_MSG(cE == sawTri0 && tri1E == 0u,
+                      "with (rigid, triangle 1) filtered the kernel produced %u contacts (%u from "
+                      "triangle 1); expected %u, all from triangle 0", cE, tri1E, sawTri0);
+
+        destroyWriter(dev, wE);
+        for (PxgBufferHandle h : { bFiltersE.h, bClothE.h, bSnE.h }) dev->destroyBuffer(h);
     }
 
     destroyWriter(dev, w);

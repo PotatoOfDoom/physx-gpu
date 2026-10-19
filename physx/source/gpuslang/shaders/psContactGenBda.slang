@@ -35,7 +35,13 @@
 // cmInputs*, gpuShapes*, transformCache*, boundsd*, contactDistance*,
 // restDistanced*, materials*, tempCellsHistogramd* (the per-pair cell run-sum
 // = "startIndices"), totalPairsd*, particleSystemsd*, shapeToRigidRemapTabled*,
-// writer (PxgParticleContactWriter BY VALUE) }.
+// writer (PxgRigidParticleContactWriter BY VALUE, PhysX 5.12) }.
+//
+// PhysX 5.12: the contact stream is SoA (PxgDeformablePairInfo {rigid node,
+// PxgEncodeParticleRef(systemId, sortedIndex)} + float4 normalPen) written through
+// PxgRigidParticleContactWriter (pxgSlangDeformableWriters), the particle key is the
+// 64-bit PxgParticleRef (system id at bit 34), and the particle-rigid element filter is
+// gone.  Notes below that mention findPs / mFilterPairs describe the 5.6.1 path.
 //
 // Reused cores / mirrors (nothing re-derived):
 //   - the particlePrimitiveCollision contact core (plane / sphere / capsule /
@@ -91,7 +97,8 @@
 //     (no particle cloud vs convex-core scene), matching the harness.
 
 import pxgSlangParticleDesc;
-import pxgSlangDefFilter;   // P9.38
+import pxgSlangDeformableRef;      // 5.12 participant encoding
+import pxgSlangDeformableWriters;  // PxgRigidParticleContactWriter
 // P9.14b: the convex particle path.  All three are already-swept modules -- the
 // cooked-hull blob reader, the GJK driver and the GJK-then-EPA policy layer that
 // the softbody-vs-rigid path goes through.  particleConvexCollision
@@ -183,18 +190,20 @@ struct PxsCachedTransform
 
 
 // ---------------------------------------------------------------------------
-// Push constant blob — BYTE-IDENTICAL to the CUDA PxCudaKernelParam pack.  Each
-// arg is placed at its natural alignment (scalar -> its size, pointer/struct ->
-// 8); the trailing 72-byte writer struct is inlined field-by-field @104.
+// Push constant blobs — laid out as the bridge places the CUDA PxCudaKernelParam pack
+// (each argument at paramAlign(size); an 80-byte by-value struct aligns to 16).
+//
+// ps_primitivesCollisionLaunch (5.12 cudaParticleSystem.cu): the head
 //   isTGS(bool)@0 numTests@4 toleranceLength@8 [pad@12]
 //   cmInputs@16 shapes@24 transformCache@32 bounds@40 contactDistance@48
 //   restDistances@56 materials@64 startIndices@72 totalNumPairs@80
-//   particleSystems@88 shapeToRigidRemap@96
-//   writer @104 : particleContacts@104 numTotalContacts@112
-//     contactSortedByParticle@120 tempContactByParticle@128
-//     contactIndexSortedByParticle@136 contactByRigid@144 tempContactByRigid@152
-//     contactIndexSortedByRigid@160 maxContacts@168 [pad@172]
-//   total = 176 bytes (sizeof(writer) = 72).
+//   particleSystems@88 shapeToRigidRemap@96 [pad@104]
+// then PxgRigidParticleContactWriter (by value, 80 B, PxgParticleSystem.h) @112:
+//   particleContactInfos@112 particleContactNormalPens@120 numTotalContacts@128
+//   contactSortedByParticle@136 tempContactByParticle@144
+//   contactIndexSortedByParticle@152 contactByRigid@160 tempContactByRigid@168
+//   contactIndexSortedByRigid@176 maxContacts@184 [pad@188] -> 192 bytes.
+// The two diffuse kernels push the head alone (104 bytes) and read only it.
 // ---------------------------------------------------------------------------
 struct PsCollideParams
 {
@@ -213,28 +222,60 @@ struct PsCollideParams
     uint64_t totalNumPairs;                // @80
     uint64_t particleSystems;              // @88
     uint64_t shapeToRigidRemap;            // @96
-    // ---- PxgParticleContactWriter (by value, 72B) @104 ----
-    uint64_t w_particleContacts;           // @104 PxgParticlePrimitiveContact*
-    uint64_t w_numTotalContacts;           // @112 PxU32*
-    uint64_t w_contactSortedByParticle;    // @120 PxU64*
-    uint64_t w_tempContactByParticle;      // @128 PxU32*
-    uint64_t w_contactIndexSortedByParticle; // @136 PxU32*
-    uint64_t w_contactByRigid;             // @144 PxNodeIndex*
-    uint64_t w_tempContactByRigid;         // @152 PxU32*
-    uint64_t w_contactIndexSortedByRigid;  // @160 PxU32*
-    uint w_maxContacts;                    // @168 PxU32
-    uint _pad172;                          // @172 -> 176
+    uint64_t _pad104;                      // @104 (paramAlign(80) = 16)
+    // ---- PxgRigidParticleContactWriter (by value, 80B) @112 ----
+    uint64_t w_particleContactInfos;       // @112 PxgDeformablePairInfo*
+    uint64_t w_particleContactNormalPens;  // @120 float4*
+    uint64_t w_numTotalContacts;           // @128 PxU32*
+    uint64_t w_contactSortedByParticle;    // @136 PxU64*
+    uint64_t w_tempContactByParticle;      // @144 PxU32*
+    uint64_t w_contactIndexSortedByParticle; // @152 PxU32*
+    uint64_t w_contactByRigid;             // @160 PxNodeIndex*
+    uint64_t w_tempContactByRigid;         // @168 PxU32*
+    uint64_t w_contactIndexSortedByRigid;  // @176 PxU32*
+    uint w_maxContacts;                    // @184 PxU32
+    uint _pad188;                          // @188 -> 192
 }
 [[vk::push_constant]]
 ConstantBuffer<PsCollideParams> gP;
 
-// PxgParticlePrimitiveContact (PxgParticleSystem.h, PX_ALIGN(16), 32 bytes)
-struct PsContact
+// ps_convexCollisionLaunch (5.12): the same head, then the SoA contact outputs as
+// separate arguments (no writer struct): particleContactInfos@104
+// particleContactNormalPens@112 numParticleContacts@120 contactSortedByParticle@128
+// tempContactByParticle@136 contactRemapSortedByParticle@144 contactByRigid@152
+// tempContactByRigid@160 contactRemapSortedByRigid@168 maxContacts@176 -> 184 bytes.
+struct PsConvexParams
 {
-    float4 normal_pen; // @0
-    uint2 rigidId;     // @16 PxU64
-    uint2 particleId;  // @24 PxU64 -> 32
+    uint isTGSWord;                        // @0  (byte0 = bool isTGS)
+    uint numTests;                         // @4
+    float toleranceLength;                 // @8  (unused; ABI parity)
+    uint _pad12;                           // @12
+    uint64_t cmInputs;                     // @16
+    uint64_t shapes;                       // @24
+    uint64_t transformCache;               // @32
+    uint64_t bounds;                       // @40
+    uint64_t contactDistance;              // @48
+    uint64_t restDistances;                // @56
+    uint64_t materials;                    // @64 (unused; ABI parity)
+    uint64_t startIndices;                 // @72
+    uint64_t totalNumPairs;                // @80
+    uint64_t particleSystems;              // @88
+    uint64_t shapeToRigidRemapTable;       // @96
+    uint64_t particleContactInfos;         // @104 PxgDeformablePairInfo*
+    uint64_t particleContactNormalPens;    // @112 float4*
+    uint64_t numParticleContacts;          // @120 PxI32*
+    uint64_t contactSortedByParticle;      // @128 PxU64*
+    uint64_t tempContactByParticle;        // @136 PxU32*
+    uint64_t contactRemapSortedByParticle; // @144 PxU32*
+    uint64_t contactByRigid;               // @152 PxU64*
+    uint64_t tempContactByRigid;           // @160 PxU32*
+    uint64_t contactRemapSortedByRigid;    // @168 PxU32*
+    uint maxContacts;                      // @176
+    uint _pad180;                          // @180 -> 184
 }
+[[vk::push_constant]]
+ConstantBuffer<PsConvexParams> gPC;
+
 
 // ---------------------------------------------------------------------------
 // quat helpers (pxgSlangCommon.slang:104/118, transcribed to keep the rigid-
@@ -343,37 +384,6 @@ uint binarySearchRunSum(Ptr<uint> data, uint n, uint value)
         if (data[m] <= value) l = m + 1u; else r = m;
     }
     return l != 0u ? l - 1u : 0u;
-}
-
-// ---------------------------------------------------------------------------
-// (particleSystem, rigidId, compressedParticleId) rigid filter lookup
-// (deformableElementFilter.cuh:118).
-// ---------------------------------------------------------------------------
-
-uint findRange(Ptr<uint> values, uint length, uint value)
-{
-    if (length == 0u) return 0u;
-    uint l = 0u, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2u;
-        if (values[m] > value) r = m; else l = m + 1u;
-    }
-    return r - 1u;
-}
-
-
-bool findPs(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint2 compressedParticleId)
-{
-    const uint particleId = compressedParticleId.x; // PxGetParticleIndex = low 32
-    const uint numBuffers = systems[psId].mCommonData_NumParticleBuffers;
-    Ptr<uint> runsum = Ptr<uint>(systems[psId].mParticleBufferRunsum);
-    const uint id = findRange(runsum, numBuffers, particleId);
-    Ptr<PxgParticleSimBufferGpu> simBufs = Ptr<PxgParticleSimBufferGpu>(systems[psId].mParticleSimBuffers);
-    const uint64_t pairsAddr = simBufs[id].mFilterPairs;
-    const uint nbPairs = simBufs[id].mNumFilterPairs;
-    const uint localId = particleId - runsum[id];
-    return findRigid(pairsAddr, nbPairs, rigidId, localId);
 }
 
 // ---------------------------------------------------------------------------
@@ -550,38 +560,21 @@ bool particlePrimitiveCollision(float3 particlePos, float3 cVolumePos, float cVo
     return intersect;
 }
 
-// PxgParticleContactWriter::writeContact — capacity-gated 7-array staging fan-out
-// through the by-value writer's BDA pointers.
-void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, uint2 rigidId)
+// The by-value PxgRigidParticleContactWriter of the primitives kernel.
+PxgRigidParticleContactWriterGpu psWriter()
 {
-    if (index < gP.w_maxContacts)
-    {
-        Ptr<uint2>(gP.w_contactByRigid)[index] = rigidId;
-        Ptr<uint>(gP.w_tempContactByRigid)[index] = rigidId.x; // rigidId.getInd() & 0xffffffff
-        Ptr<uint>(gP.w_contactIndexSortedByRigid)[index] = index;
-
-        Ptr<uint2>(gP.w_contactSortedByParticle)[index] = compressedParticleIndex;
-        Ptr<uint>(gP.w_tempContactByParticle)[index] = compressedParticleIndex.x; // PxGetParticleIndex
-        Ptr<uint>(gP.w_contactIndexSortedByParticle)[index] = index;
-
-        PsContact ct;
-        ct.normal_pen = normalPen;
-        ct.rigidId = rigidId;
-        ct.particleId = compressedParticleIndex;
-        Ptr<PsContact>(gP.w_particleContacts)[index] = ct;
-    }
-}
-
-// ---------------------------------------------------------------------------
-
-// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
-// It was written out by hand fifteen times across this corpus; every copy was checked
-// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
-// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
-// re-derive one of them wrong.
-bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
-{
-    return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
+    PxgRigidParticleContactWriterGpu w;
+    w.particleContactInfos = gP.w_particleContactInfos;
+    w.particleContactNormalPens = gP.w_particleContactNormalPens;
+    w.numTotalContacts = gP.w_numTotalContacts;
+    w.contactSortedByParticle = gP.w_contactSortedByParticle;
+    w.tempContactByParticle = gP.w_tempContactByParticle;
+    w.contactIndexSortedByParticle = gP.w_contactIndexSortedByParticle;
+    w.contactByRigid = gP.w_contactByRigid;
+    w.tempContactByRigid = gP.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gP.w_contactIndexSortedByRigid;
+    w.maxContacts = gP.w_maxContacts;
+    return w;
 }
 
 struct PsPrimCell
@@ -602,7 +595,6 @@ struct PsPrimCell
     bool enableCCD;
     uint64_t curPosAddr;
     uint64_t predPosAddr;
-    uint64_t sortedToUnsortedAddr;
 };
 
 // PxgCellData::update + psPrimitivesCollision setup for one work item: the pair,
@@ -635,7 +627,7 @@ PsPrimCell psPrimSetup(uint workIndex, bool valid)
     uint endIndex = 0u;
     uint range = 0u;
     bool enableCCD = false;
-    uint64_t curPosAddr = 0ull, predPosAddr = 0ull, sortedToUnsortedAddr = 0ull;
+    uint64_t curPosAddr = 0ull, predPosAddr = 0ull;
 
     if (valid)
     {
@@ -690,7 +682,6 @@ PsPrimCell psPrimSetup(uint workIndex, bool valid)
         enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
         curPosAddr = systems[psId].mSortedOriginPos_InvMass;
         predPosAddr = systems[psId].mSortedPositions_InvMass;
-        sortedToUnsortedAddr = systems[psId].mSortedToUnsortedMapping;
 
         startIndex = Ptr<uint>(systems[psId].mCellStart)[gridHash];
         if (startIndex != EMPTY_CELL)
@@ -717,7 +708,6 @@ PsPrimCell psPrimSetup(uint workIndex, bool valid)
     c.enableCCD = enableCCD;
     c.curPosAddr = curPosAddr;
     c.predPosAddr = predPosAddr;
-    c.sortedToUnsortedAddr = sortedToUnsortedAddr;
     return c;
 }
 
@@ -744,7 +734,6 @@ void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint l
     const bool enableCCD = c.enableCCD;
     const uint64_t curPosAddr = c.curPosAddr;
     const uint64_t predPosAddr = c.predPosAddr;
-    const uint64_t sortedToUnsortedAddr = c.sortedToUnsortedAddr;
     // Each thread walks ITS OWN cell's particles -- no block-max rounds, no barriers.
     // Pass 1 counts the cell's contacts, one atomicAdd reserves them as a contiguous
     // run, pass 2 recomputes and writes them (the test is deterministic, so the two
@@ -764,8 +753,8 @@ void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint l
         {
             float3 normal;
             float distance;
-            if (psPrimTestParticle(systems, psId, rigidId, particleIndex, curPosAddr, predPosAddr,
-                                   sortedToUnsortedAddr, enableCCD, isTGS, cDistance, rigidQ, rigidP,
+            if (psPrimTestParticle(systems, psId, particleIndex, curPosAddr, predPosAddr,
+                                   enableCCD, isTGS, cDistance, rigidQ, rigidP,
                                    rigidType, rigidScale, normal, distance))
                 ++nbContacts;
         }
@@ -778,12 +767,15 @@ void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint l
     {
         float3 normal;
         float distance;
-        if (psPrimTestParticle(systems, psId, rigidId, particleIndex, curPosAddr, predPosAddr,
-                               sortedToUnsortedAddr, enableCCD, isTGS, cDistance, rigidQ, rigidP,
+        if (psPrimTestParticle(systems, psId, particleIndex, curPosAddr, predPosAddr,
+                               enableCCD, isTGS, cDistance, rigidQ, rigidP,
                                rigidType, rigidScale, normal, distance))
         {
-            writeContact(contactIndex, float4(normal, distance - restDistance),
-                         uint2(particleIndex, psId) /* PxEncodeParticleIndex */, rigidId);
+            // 5.12: writeContact(index, normalPen, rigidId, particleRef) with the
+            // 64-bit PxgEncodeParticleRef(particleSystemId, particleIndex).
+            psWriter().writeContact(contactIndex, float4(normal, distance - restDistance),
+                                    uint64_t(rigidId.x) | (uint64_t(rigidId.y) << 32),
+                                    PxgEncodeParticleRef(psId, particleIndex));
             ++contactIndex;
         }
     }
@@ -792,8 +784,8 @@ void psPrimProcessCell(uint workIndex, bool valid, uint tid, uint warpId, uint l
 // One particle of a cell against the rigid shape (the CUDA loop body,
 // cudaParticleSystem.cu psPrimitivesCollision): speculative volume, the
 // particle-rigid filter, then the primitive test.
-bool psPrimTestParticle(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint particleIndex,
-                        uint64_t curPosAddr, uint64_t predPosAddr, uint64_t sortedToUnsortedAddr,
+bool psPrimTestParticle(Ptr<PxgParticleSystemGpu> systems, uint psId, uint particleIndex,
+                        uint64_t curPosAddr, uint64_t predPosAddr,
                         bool enableCCD, bool isTGS, float cDistance, float4 rigidQ, float3 rigidP,
                         uint rigidType, float3 rigidScale, out float3 normal, out float distance)
 {
@@ -814,9 +806,8 @@ bool psPrimTestParticle(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigi
         cVolumePos = currentPos;
     }
 
-    const uint2 particleMask = uint2(Ptr<uint>(sortedToUnsortedAddr)[particleIndex], psId);
-    if (findPs(systems, psId, rigidId, particleMask))
-        return false;
+    // 5.12: the particle-rigid element filter is gone (removed with particle rigids in
+    // 5.9), so there is no find() between the volume and the primitive test.
     return particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius, rigidQ, rigidP, rigidType, rigidScale,
                                       enableCCD, normal, distance);
 }
@@ -930,9 +921,8 @@ void ps_primitivesCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
 // D3 -- isDiffuse = TRUE in the speculative contact volume, which is NOT the
 //     same as isTGS = false: see getSpecVolume above.
 //
-// D4 -- there is NO FILTER.  The fluid kernel calls findPs to honour
-//     particle-rigid filter pairs and rigid attachments; the diffuse path has
-//     neither and calls particlePrimitiveCollision unconditionally.
+// D4 -- there is NO FILTER, here or (since 5.12, which removed the particle-rigid
+//     filter) in the fluid kernel; particlePrimitiveCollision runs unconditionally.
 //
 // D5 -- the whole kernel early-outs on mCommonData.mMaxDiffuseParticles == 0,
 //     BEFORE it reads the cell arrays.  For a particle system with no diffuse
@@ -1202,9 +1192,10 @@ void ps_primitivesDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 //     This .spv was unstamped until P9.89.  Now it is stamped, and the stamp is
 //     what keeps `dot` in the lane order (see the P9.89 note at the imports).
 //
-// X9 -- the filter IS applied here, unlike the diffuse twin, and its particle
-//     key is the UNSORTED index (mSortedToUnsortedMapping), not the sorted one
-//     the contact record carries.
+// X9 -- PhysX 5.12 removed the particle-rigid element filter (with particle
+//     rigids, 5.9), so like the diffuse twin this kernel no longer filters.  The
+//     contact goes out SoA: PxgDeformablePairInfo {rigid node, PxgEncodeParticleRef}
+//     plus a float4 normalPen, where 5.6.1 wrote one 32-byte PxgParticlePrimitiveContact.
 //
 // X10 -- the atomicAdd on numTotalContacts ALWAYS runs and only the write is
 //     capped by maxContacts -- the same overshoot contract as the one-way
@@ -1315,19 +1306,19 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
     if (gtid.x != 0u)
         return;
     const uint warpIndex = gtid.y;
-    const bool isTGS = (gP.isTGSWord & 0xffu) != 0u;
+    const bool isTGS = (gPC.isTGSWord & 0xffu) != 0u;
 
-    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
-    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
-    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
-    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
-    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
-    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
-    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
-    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
-    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
+    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gPC.cmInputs);
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(gPC.shapes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gPC.transformCache);
+    Ptr<float> boundsArr = Ptr<float>(gPC.bounds);
+    Ptr<float> contactDistance = Ptr<float>(gPC.contactDistance);
+    Ptr<float> restDistances = Ptr<float>(gPC.restDistances);
+    Ptr<uint> startIndices = Ptr<uint>(gPC.startIndices);
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gPC.particleSystems);
+    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gPC.shapeToRigidRemapTable);
 
-    const uint nbWarpsRequired = Ptr<uint>(gP.totalNumPairs)[0];
+    const uint nbWarpsRequired = Ptr<uint>(gPC.totalNumPairs)[0];
     const uint totalNumWarps = PS_GRID * WARPS_PER_BLOCK;
     const uint nbIter = (nbWarpsRequired + totalNumWarps - 1u) / totalNumWarps;
 
@@ -1338,7 +1329,7 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         if (workIndex >= nbWarpsRequired)
             continue;
 
-        const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
+        const uint pos = binarySearchRunSum(startIndices, gPC.numTests, workIndex);
         const uint startPairIndex = startIndices[pos];
 
         // LoadShapePair<ePARTICLESYSTEM>: the particle shape goes to slot 0.
@@ -1399,15 +1390,10 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         const bool enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
         Ptr<float4> curPos = Ptr<float4>(systems[psId].mSortedOriginPos_InvMass);
         Ptr<float4> predPos = Ptr<float4>(systems[psId].mSortedPositions_InvMass);
-        Ptr<uint> sortedToUnsorted = Ptr<uint>(systems[psId].mSortedToUnsortedMapping);
 
         for (uint ind = 0u; ind < range; ++ind)
         {
             const uint particleIndex = startIndex + ind;
-
-            // X9: the filter key is the UNSORTED index.
-            if (findPs(systems, psId, rigidId, uint2(sortedToUnsorted[particleIndex], psId)))
-                continue;
 
             const float3 currentPos = curPos[particleIndex].xyz;
 
@@ -1440,9 +1426,22 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
             // X10: the counter always advances; only the write is capped.
             uint index;
-            InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], 1u, index);
-            writeContact(index, float4(-o.direction.xyz, pen),
-                         uint2(particleIndex, psId), rigidId);
+            InterlockedAdd(Ptr<uint>(gPC.numParticleContacts)[0], 1u, index);
+            if (index < gPC.maxContacts)
+            {
+                // 5.12: the sort keys, then the SoA pair info (ref0 = the rigid node,
+                // ref1 = PxgEncodeParticleRef) and normalPen, as the CUDA writes them.
+                const uint64_t rigidRef = uint64_t(rigidId.x) | (uint64_t(rigidId.y) << 32);
+                const uint64_t particleRef = PxgEncodeParticleRef(psId, particleIndex);
+                Ptr<uint64_t>(gPC.contactByRigid)[index] = rigidRef;
+                Ptr<uint>(gPC.tempContactByRigid)[index] = rigidId.x;
+                Ptr<uint>(gPC.contactRemapSortedByRigid)[index] = index;
+                Ptr<uint64_t>(gPC.contactSortedByParticle)[index] = particleRef;
+                Ptr<uint>(gPC.tempContactByParticle)[index] = PxgGetParticleIndex(particleRef);
+                Ptr<uint>(gPC.contactRemapSortedByParticle)[index] = index;
+                Ptr<float4>(gPC.particleContactNormalPens)[index] = float4(-o.direction.xyz, pen);
+                PxgStorePairInfo(gPC.particleContactInfos, index, PxgEncodeRigidNode(rigidRef), particleRef);
+            }
         }
     }
 }
@@ -1472,10 +1471,8 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 //     velocity averages between UpdatePBF and Compact, but this kernel runs in
 //     narrowphase, before either.  Identical to D2.
 //
-// XD3 -- there is NO FILTER.  The fluid twin calls findPs on the UNSORTED index
-//     (X9); this path calls particleConvexCollision unconditionally.  Identical
-//     to D4, and it is the difference that makes the two bodies diverge right
-//     where they look most alike.
+// XD3 -- there is NO FILTER.  Neither is there in the fluid twin since 5.12 (X9);
+//     this path calls particleConvexCollision unconditionally.
 //
 // XD4 -- the OUTPUT is the per-particle one-way list, not the global contact
 //     stream: atomicAdd on counts[particleIndex], and if the returned slot is
