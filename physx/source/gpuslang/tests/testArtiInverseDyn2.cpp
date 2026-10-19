@@ -49,6 +49,7 @@
 
 #include "foundation/PxVec3.h"
 #include "foundation/PxQuat.h"
+#include "pxgArtiLinkRwRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -68,14 +69,16 @@ using physx::gpuslang::PxgResult;
 static std::vector<uint8_t> artiId2Loader(const char* file) { return loadShaderBlob(file); }
 
 const uint32_t ID2_NB_RECORDS = 24;
-const uint32_t ID2_RECORD_SIZE = 544;
+const uint32_t ID2_RECORD_SIZE = 496;
 const uint32_t ID2_R_NUM_LINKS = 16;    // u16
 const uint32_t ID2_R_NUM_DOFS = 18;     // u16
 const uint32_t ID2_R_FLAGS = 26;        // u8
+const uint32_t ID2_R_JOINTS = 40;          // 5.12: computeLinkRwInvDyn reads the joint cores
 const uint32_t ID2_R_JOINT_DATA = 48;
-const uint32_t ID2_R_BODY2WORLDS = 184;
-const uint32_t ID2_R_PARENTS = 208;
-const uint32_t ID2_R_MOTION_MATRIX = 216;
+const uint32_t ID2_R_JOINT_POSITIONS = 104; // 5.12: the prismatic slide
+const uint32_t ID2_R_BODY2WORLDS = 176;
+const uint32_t ID2_R_PARENTS = 200;
+const uint32_t ID2_R_MOTION_MATRIX = 208;
 const uint32_t ID2_MAX_LINKS = 7;       // pool sizes; actual counts are smaller
 const uint32_t ID2_MAX_DOFS = 15;
 
@@ -122,6 +125,8 @@ struct Id2Pool
     std::vector<uint32_t> parents;
     std::vector<float> xforms;        // 7 floats per link (q, p)
     std::vector<float> motion;        // 80-byte link stride, 24-byte dof stride
+    std::vector<uint8_t> joints;      // 5.12: Dy::ArticulationJointCore per link
+    std::vector<float> jointPositions;
 };
 
 static void id2BuildPool(Id2Pool& P)
@@ -131,6 +136,8 @@ static void id2BuildPool(Id2Pool& P)
     P.parents.assign(size_t(ID2_NB_RECORDS) * ID2_MAX_LINKS, 0xCDCDCDCDu);
     P.xforms.assign(size_t(ID2_NB_RECORDS) * ID2_MAX_LINKS * 7, -88.0f);
     P.motion.assign(size_t(ID2_NB_RECORDS) * ID2_MAX_LINKS * 20, -77.0f);   // 80B = 20 floats
+    lrBuildJoints(P.joints, ID2_NB_RECORDS, ID2_MAX_LINKS);
+    lrBuildJointPositions(P.jointPositions, ID2_NB_RECORDS, ID2_MAX_DOFS);
 
     for (uint32_t r = 0; r < ID2_NB_RECORDS; ++r)
     {
@@ -210,7 +217,10 @@ static void djMirror(const Id2Pool& P, std::vector<float>& out)
                 {
                     const uint32_t parentRow0 =
                         parentLink ? (parentLink - 1u) * 6u + baseDofs : 0u;
-                    const PxVec3 rw = id2Pos(r, link) - id2Pos(r, parentLink);
+                    // 5.12: computeLinkRwInvDyn (the engine's Dy::computeLinkRw)
+                    const float* mm0 = &P.motion[(size_t(r) * ID2_MAX_LINKS + link) * 20];
+                    const PxVec3 rw = lrLinkRw(r, link, id2Quat(r, parentLink), id2Quat(r, link),
+                                               id2JointOffset(r, link), PxVec3(mm0[3], mm0[4], mm0[5]));
                     const PxVec3 pl(jac[(parentRow0 + 0) * colCount + dof],
                                     jac[(parentRow0 + 1) * colCount + dof],
                                     jac[(parentRow0 + 2) * colCount + dof]);
@@ -332,6 +342,8 @@ PXG_TEST(artiInverseDyn2)
     PxgDevicePtr dPar = up(P.parents.data(), P.parents.size() * 4);
     PxgDevicePtr dXf = up(P.xforms.data(), P.xforms.size() * 4);
     PxgDevicePtr dMm = up(P.motion.data(), P.motion.size() * 4);
+    PxgDevicePtr dJc = up(P.joints.data(), P.joints.size());
+    PxgDevicePtr dJp = up(P.jointPositions.data(), P.jointPositions.size() * 4);
     for (uint32_t r = 0; r < ID2_NB_RECORDS; ++r)
     {
         uint8_t* R = P.rec.data() + size_t(r) * ID2_RECORD_SIZE;
@@ -343,6 +355,10 @@ PXG_TEST(artiInverseDyn2)
         std::memcpy(R + ID2_R_PARENTS, &pr, 8);
         std::memcpy(R + ID2_R_BODY2WORLDS, &xf, 8);
         std::memcpy(R + ID2_R_MOTION_MATRIX, &mo, 8);
+        const uint64_t jc = uint64_t(dJc) + uint64_t(r) * ID2_MAX_LINKS * sizeof(physx::Dy::ArticulationJointCore);
+        const uint64_t jp = uint64_t(dJp) + uint64_t(r) * ID2_MAX_DOFS * 4u;
+        std::memcpy(R + ID2_R_JOINTS, &jc, 8);
+        std::memcpy(R + ID2_R_JOINT_POSITIONS, &jp, 8);
     }
     PxgDevicePtr dRec = up(P.rec.data(), P.rec.size());
 

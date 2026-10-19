@@ -30,7 +30,8 @@
 // PxgSolverSharedDesc<IterativeSolveData> / PxgArticulationCoreDesc images.
 // Mirror: refSolveExtContactPGS / refSolveExt1DPGS (P8.122a, over the
 // engine structs) + the countActiveSlabs popcount + the 2-slot staging /
-// writeback transcription + the butterfly error reduction.
+// writeback transcription.  (5.12 removed the residual reporting: no error
+// accumulation and no warp butterfly; the solver desc must come back untouched.)
 //
 // Geometry (the P8.104 fixture's, PGS-adjusted): 2 live arti batches at
 // k=8 (contact, stride 26) and k=9 (1D, stride 13) behind
@@ -43,14 +44,13 @@
 // 2-slot 128-stride packing (lin/ang whole halves), the rigid writeback the
 // 2-slot (bottom,0)/(top,0) pair -- both DIFFERENT from the TGS 3-slot
 // packing, each a trap.  PGS reads NO deltaQ / txIData / elapsed / minPen.
-// Rounds: A partition 2 (the [idx-1] start arm, residual DISABLED ->
-// the accumulator words must come back untouched), B partition 0 (the
-// mArtiBatchStartIndex arm, residual enabled -> butterfly + atomic tail),
-// C partition 2 with doFriction=0 (the friction pools of the contact batch
-// must come back with only appliedForce untouched -- no broken write), and
-// (P9.89) six more residual-enabled rounds on fresh salts, both start arms and
-// both friction arms, so the warp butterfly is proven against the reversed
-// radius order and the linear lane sum (host twins, checked at the end).
+// Rounds: partition 2 (the [idx-1] start arm), partition 0 (the
+// mArtiBatchStartIndex arm), partition 2 with doFriction=0 (the friction pools of
+// the contact batch must come back with only appliedForce untouched -- no broken
+// write), and six more rounds on fresh salts, both start arms and both friction
+// arms.  5.12: the contact friction velMultiplier numerator is
+// islandContextPool[islandIndex].mBiasCoefficients.rigidContact (was 0.8); pool[0]
+// carries a decoy for it.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -94,6 +94,7 @@ const uint32_t APP_BODY_OFFSET = 4;
 const uint32_t APP_NB_DYN = 25;
 const uint32_t APP_TOTAL_BODIES = APP_BODY_OFFSET + APP_NB_DYN + APP_NB_ARTI;   // 77
 const uint32_t APP_BATCH_OFFSET = 3;       // islandContextPool[0].mBatchCount
+const float APP_RIGID_CONTACT_BIAS = 0.65f; // islandContextPool[1].mBiasCoefficients.rigidContact
 const uint32_t APP_K0 = 8;                 // first live batch slot
 const uint32_t APP_NB_BATCH_ALLOC = 12;
 const uint32_t APP_NB_AB_BLOCKS = 2;       // ceil(48/32)
@@ -159,7 +160,7 @@ struct AppArena
 const uint32_t APP_D_SLAB_HAS_CHANGES = 88;
 const uint32_t APP_D_ARTICULATION_BLOCKS = 128;
 const uint32_t APP_D_MAX_LINKS = 248;
-const uint32_t APP_DESC_SIZE = 360;
+const uint32_t APP_DESC_SIZE = 344;
 
 static void appSeed(AppArena& W, uint32_t salt, uint32_t partitionIndex, int32_t errCounter)
 {
@@ -210,6 +211,9 @@ static void appSeed(AppArena& W, uint32_t salt, uint32_t partitionIndex, int32_t
     W.islands[1].mStartPartitionIndex = 4;
     W.islands[1].mBatchStartIndex = 0;
     W.islands[1].mArtiBatchStartIndex = (partitionIndex == 0) ? 5 : 6;   // decoy when unused
+    // 5.12: the contact friction bias is read from pool[islandIndex]; pool[0] is a decoy
+    W.islands[1].mBiasCoefficients.rigidContact = APP_RIGID_CONTACT_BIAS;
+    W.islands[0].mBiasCoefficients.rigidContact = 0.8f;
 
     // arti partition table: live warps at k = 8, 9 (start 5, end 7 + offset 3)
     for (uint32_t i = 0; i < 8; ++i) W.acp[i] = 90u + i;     // decoys
@@ -223,9 +227,7 @@ static void appSeed(AppArena& W, uint32_t salt, uint32_t partitionIndex, int32_t
 
     // ---- solver desc ----
     W.solverDesc.numSlabs = APP_NB_SLABS;
-    W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares = 0.5f;
-    W.solverDesc.contactErrorAccumulator.mCounter = errCounter;
-    W.solverDesc.contactErrorAccumulator.mMaxError = 0.25f;
+    (void)errCounter;   // (5.12: no contactErrorAccumulator)
 
     // ---- arti desc image (scalars; pointers patched at upload) ----
     uint32_t maxLinks = APP_MAX_LINKS;
@@ -415,58 +417,10 @@ static uint32_t appCountSlabs(const AppArena& W, uint32_t bodyIndex)
     return PxMax(1u, c);
 }
 
-// P9.89: the per-warp sum of PxgErrorAccumulator::accumulateErrorGlobalFullWarp
-// (gpucommon/src/CUDA/solverResidual.cuh:85 -> warpReduction<AddOpPxReal>,
-// gpucommon/src/CUDA/reduction.cuh:188-199): a __shfl_xor_sync butterfly at
-// radius 16, 8, 4, 2, 1 in which every lane ends with op(own, partner).  The
-// lanes >= mDescStride `return`ed before it (solver.cu:100-101) and never
-// reach the FULL_MASK shuffle; PTX leaves a read of an exited lane's register
-// undefined.  They enter as +0, the AddOpPxReal identity, exactly as the port
-// feeds them -- and at radius r lane 0 only ever reads a lane m in [r, 2r)
-// whose accumulated partners m ^ S are all >= m, so it reads an exited lane
-// only when that lane's whole subtree has exited: with +0 there, lane 0 of the
-// CUDA and of the port carry the same tree bit for bit.
-//   order 0: the CUDA's butterfly (what the mirror uses);
-//   order 1: the WRONG radius order 1, 2, 4, 8, 16;
-//   order 2: the WRONG linear lane sum ((l0 + l1) + l2) + ...
-// The two wrong orders exist only as twins: the test proves its data makes
-// them round differently from the butterfly (PXG_CHECK_MSG at the end), so a
-// port that reassociates the reduction cannot pass the bitwise compare.
-static float appWarpSum(const RefError lanes[32], int order)
-{
-    if (order == 2)
-    {
-        float s = 0.0f;
-        for (uint32_t l = 0; l < 32; ++l)
-            s += lanes[l].sumOfSquares;
-        return s;
-    }
-    float sums[32];
-    for (uint32_t l = 0; l < 32; ++l)
-        sums[l] = lanes[l].sumOfSquares;
-    for (uint32_t step = 0; step < 5; ++step)
-    {
-        const uint32_t radius = (order == 0) ? (16u >> step) : (1u << step);
-        float ns[32];
-        for (uint32_t l = 0; l < 32; ++l)
-            ns[l] = sums[l] + sums[l ^ radius];
-        std::memcpy(sums, ns, sizeof(ns));
-    }
-    return sums[0];
-}
-
-// the global accumulator after the residual round under each reduction order
-struct AppTwins
-{
-    float acc[3];   // mErrorSumOfSquares with order 0 / 1 / 2
-};
-
 // the full host mirror
-static void appMirror(AppArena& W, uint32_t partitionIndex, bool doFriction, bool residual,
-                      uint32_t& artiWrites, uint32_t& rigidWrites, uint32_t& staticRefs,
-                      AppTwins& twins)
+static void appMirror(AppArena& W, uint32_t partitionIndex, bool doFriction,
+                      uint32_t& artiWrites, uint32_t& rigidWrites, uint32_t& staticRefs)
 {
-    RefError warpErrLanes[2][32];
     for (uint32_t w = 0; w < 4; ++w)   // 2 blocks x 2 warps
     {
         const uint32_t startIndex = (partitionIndex == 0)
@@ -476,7 +430,6 @@ static void appMirror(AppArena& W, uint32_t partitionIndex, bool doFriction, boo
         const uint32_t k = startIndex + w + APP_BATCH_OFFSET;
         if (k >= endIndex)
             continue;
-        const uint32_t b = k - APP_K0;
         PxgBlockConstraintBatch& BT = W.bt[k];
 
         for (uint32_t lane = 0; lane < BT.mDescStride; ++lane)
@@ -516,11 +469,10 @@ static void appMirror(AppArena& W, uint32_t partitionIndex, bool doFriction, boo
             if (BT.constraintType == PxgSolverConstraintDesc::eARTICULATION_CONTACT)
                 refSolveExtContactPGS(BT, vel0, vel1, doFriction, lane, W.ch.data(),
                                       W.fh.data(), W.cp.data(), W.fp.data(), W.rs.data(),
-                                      imp0, imp1,
-                                      residual ? &warpErrLanes[b][lane] : nullptr, ref0, ref1);
+                                      imp0, imp1, nullptr, APP_RIGID_CONTACT_BIAS, ref0, ref1);
             else
                 refSolveExt1DPGS(BT, vel0, vel1, lane, W.jh.data(), W.jr.data(), W.jm.data(),
-                                 &W.rs[BT.mArticulationResponseIndex], imp0, imp1, residual,
+                                 &W.rs[BT.mArticulationResponseIndex], imp0, imp1, false,
                                  ref0, ref1);
 
             if (!nA.isArticulation())
@@ -561,41 +513,6 @@ static void appMirror(AppArena& W, uint32_t partitionIndex, bool doFriction, boo
             }
         }
     }
-
-    // the butterfly reduction of appWarpSum (order 0), then lane 0's atomic.
-    // Only the contact warp (b = 0) carries a non-zero sum -- the 1D batch
-    // writes its residual per row -- so the atomic order stays deterministic.
-    for (int o = 0; o < 3; ++o)
-        twins.acc[o] = W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares;
-    if (residual)
-        for (uint32_t b = 0; b < 2; ++b)
-        {
-            float maxs[32];
-            uint32_t counts[32];
-            for (uint32_t l = 0; l < 32; ++l)
-            {
-                maxs[l] = warpErrLanes[b][l].maxError;
-                counts[l] = uint32_t(warpErrLanes[b][l].counter);
-            }
-            for (uint32_t radius = 16; radius > 0; radius >>= 1)
-            {
-                float nm[32];
-                uint32_t nc[32];
-                for (uint32_t l = 0; l < 32; ++l)
-                {
-                    nm[l] = PxMax(maxs[l], maxs[l ^ radius]);
-                    nc[l] = counts[l] + counts[l ^ radius];
-                }
-                std::memcpy(maxs, nm, sizeof(nm));
-                std::memcpy(counts, nc, sizeof(nc));
-            }
-            for (int o = 0; o < 3; ++o)
-                twins.acc[o] += appWarpSum(warpErrLanes[b], o);
-            W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares = twins.acc[0];
-            W.solverDesc.contactErrorAccumulator.mCounter += int(counts[0]);
-            W.solverDesc.contactErrorAccumulator.mMaxError =
-                PxMax(W.solverDesc.contactErrorAccumulator.mMaxError, maxs[0]);
-        }
 }
 
 } // namespace
@@ -608,11 +525,8 @@ PXG_TEST(artiSolvePartitionPgs)
     };
     PxgCudaShim shim(dev, manifest, 1, &appLoader);
 
-    // P9.89: rounds 3..8 add residual-enabled instances (fresh salts, both
-    // start arms, friction on and off) so the warp butterfly is compared on
-    // enough independent 26-lane sums that a reassociated reduction changes
-    // the accumulator bits in more than one round (the twin check after the
-    // loop); round 1 alone was the only reduction instance before.
+    // (errCounter is the 5.6.1 residual-accumulator seed; 5.12 has none, the
+    // rounds keep their salts and arms)
     struct Round { uint32_t partition; int32_t errCounter; uint32_t doFriction; };
     const Round rounds[] = {
         { 2u, -5, 1u },   // disabled accumulator, [idx-1] start arm
@@ -626,7 +540,6 @@ PXG_TEST(artiSolvePartitionPgs)
         { 2u, 2, 0u },
     };
     const uint32_t nbRounds = uint32_t(sizeof(rounds) / sizeof(rounds[0]));
-    uint32_t residualRounds = 0, reversedDiffers = 0, linearDiffers = 0;
 
     for (uint32_t round = 0; round < nbRounds; ++round)
     {
@@ -704,22 +617,9 @@ PXG_TEST(artiSolvePartitionPgs)
 
         // ---- mirror (mutates A in place) ----
         uint32_t artiWrites = 0, rigidWrites = 0, staticRefs = 0;
-        AppTwins twins;
-        appMirror(A, rd.partition, rd.doFriction != 0, rd.errCounter >= 0,
-                  artiWrites, rigidWrites, staticRefs, twins);
+        appMirror(A, rd.partition, rd.doFriction != 0, artiWrites, rigidWrites, staticRefs);
         PXG_CHECK_MSG(artiWrites >= 20 && rigidWrites >= 15 && staticRefs >= 2,
                       "coverage: arti %u rigid %u static %u", artiWrites, rigidWrites, staticRefs);
-        if (rd.errCounter >= 0)
-        {
-            uint32_t bits[3];
-            std::memcpy(bits, twins.acc, sizeof(bits));
-            ++residualRounds;
-            reversedDiffers += (bits[1] != bits[0]) ? 1u : 0u;
-            linearDiffers += (bits[2] != bits[0]) ? 1u : 0u;
-            std::printf("  app r%u residual sum: butterfly %a  radius-1..16 %a  linear %a\n", round,
-                        double(twins.acc[0]), double(twins.acc[1]), double(twins.acc[2]));
-        }
-
         // ---- launch: grid (2, 1, 1) x block (32, 2, 1) ----
         struct Params
         {
@@ -766,36 +666,11 @@ PXG_TEST(artiSolvePartitionPgs)
         cmp(dJm, A.jm.data(), A.jm.size() * sizeof(A.jm[0]), "jointMods");
         cmp(dRs, A.rs.data(), A.rs.size() * sizeof(A.rs[0]), "responses");
         cmp(dEnc, A.enc.data(), A.enc.size() * 4, "refCounts");
-        // the accumulator words in the downloaded solver desc
-        {
-            std::vector<uint8_t> gotSd(sizeof(A.solverDesc));
-            shim.memcpyDtoH(gotSd.data(), dSd, gotSd.size());
-            const size_t accOff = offsetof(PxgSolverCoreDesc, contactErrorAccumulator);
-            if (std::memcmp(&gotSd[accOff], &A.solverDesc.contactErrorAccumulator,
-                            sizeof(Dy::ErrorAccumulator)) != 0)
-            {
-                float gs, gm; int gc;
-                std::memcpy(&gs, &gotSd[accOff], 4);
-                std::memcpy(&gc, &gotSd[accOff + 4], 4);
-                std::memcpy(&gm, &gotSd[accOff + 8], 4);
-                std::printf("MM app r%u errorAccumulator ref (%a,%d,%a) gpu (%a,%d,%a)\n", round,
-                            double(A.solverDesc.contactErrorAccumulator.mErrorSumOfSquares),
-                            A.solverDesc.contactErrorAccumulator.mCounter,
-                            double(A.solverDesc.contactErrorAccumulator.mMaxError), gs, gc, gm);
-                ++bad;
-            }
-        }
+        // the kernel never writes the solver desc (5.12: no error accumulator)
+        cmp(dSd, &A.solverDesc, sizeof(A.solverDesc) & ~size_t(3), "solverDesc");
         std::printf("  app r%u +-0 tolerated %zu\n", round, signedZeros);
         PXG_CHECK_MSG(bad == 0, "round %u: %zu mismatches", round, bad);
 
         for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
     }
-
-    // P9.89: the data must make each wrong reduction order visible -- a fixture
-    // whose sums round the same under every association verifies no tree
-    std::printf("  app residual rounds %u: radius-1..16 differs in %u, linear differs in %u\n",
-                residualRounds, reversedDiffers, linearDiffers);
-    PXG_CHECK_MSG(reversedDiffers >= 2 && linearDiffers >= 2,
-                  "reduction-order twins: radius-1..16 differs in %u, linear in %u of %u rounds",
-                  reversedDiffers, linearDiffers, residualRounds);
 }

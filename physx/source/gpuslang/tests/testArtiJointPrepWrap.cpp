@@ -88,7 +88,7 @@ static std::vector<uint8_t> ajpLoader(const char* file) { return loadShaderBlob(
 
 const uint32_t AJP_NB_ARTI = 6;
 const uint32_t AJP_NB_RIGID = 16;
-const uint32_t AJP_REC_SIZE = 544;
+const uint32_t AJP_REC_SIZE = 496;
 
 const uint32_t AJP_RIGID_OFFSET = 3;
 const uint32_t AJP_LIVE_WARPS = 4;
@@ -105,7 +105,7 @@ static_assert(sizeof(PxgBlockConstraint1DData) == 1792, "1D data stride");
 static_assert(sizeof(PxgBlockConstraint1DVelocities) == 2048, "1D velocities stride");
 static_assert(sizeof(PxgBlockConstraint1DParameters) == 512, "1D parameters stride");
 static_assert(sizeof(PxgTGSBlockSolverConstraint1DHeader) == 4992, "TGS 1D header");
-static_assert(sizeof(PxgTGSBlockSolverConstraint1DCon) == 3328, "TGS 1D con");
+static_assert(sizeof(PxgTGSBlockSolverConstraint1DCon) == 3200, "TGS 1D con");
 static_assert(sizeof(PxgSolverConstraintManagerConstants) == 8, "manager constants");
 // AJP_MAX_ROWS mirrors Dy::MAX_CONSTRAINT_ROWS (DyConstraintPrep.h:55)
 
@@ -413,6 +413,7 @@ PXG_TEST(artiJointPrepWrap)
     const float dtF = 0.35f, stepDtF = 0.07f;
     const float invDtF = 1.0f / dtF, stepInvDtF = 1.0f / stepDtF;
     const float lengthScaleF = 1.0f, biasF = 0.7f;
+    const float jointBiasF = 0.55f;   // 5.12: the joint erp comes from biasCoefficients.joint
 
     // ---- device uploads ----
     std::vector<PxgDevicePtr> bufs;
@@ -476,7 +477,9 @@ PXG_TEST(artiJointPrepWrap)
     prep.numArtiStatic1dConstraintBatches = 1;
     prep.numArtiSelf1dConstraintBatches = 1;
     prep.numBatches = AJP_RIGID_OFFSET;
-    prep.biasCoefficient = biasF;
+    prep.biasCoefficients.rigidContact = biasF;   // 5.12: the per-kind collection
+    prep.biasCoefficients.joint = jointBiasF;
+    prep.biasCoefficients.articulation = 0.45f;
 
     PxgSolverSharedDesc<IterativeSolveDataTGS> shared;
     std::memset(&shared, 0xAB, sizeof(shared));
@@ -578,7 +581,7 @@ PXG_TEST(artiJointPrepWrap)
             if (tie) tieLanes++;
 
             // setUpArti1DConstraintBlock TGS
-            const float erp = 0.5f * biasF;
+            const float erp = jointBiasF;   // 5.12: biasCoefficients.joint (was 0.5 * biasCoefficient)
             const float cfm = PxMax(b0.cfm, b1.cfm);   // selectMax (cu:1828)
             // P9.86c: the mutant twin -- the pre-P9.86 port's FMax (llvmpipe: +0 for
             // any {+0,-0} tie) -- must differ on the directed lanes

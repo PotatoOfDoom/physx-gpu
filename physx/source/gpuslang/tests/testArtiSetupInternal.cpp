@@ -54,10 +54,9 @@
 //     prismatic (linear path + dofs[0] error), spherical 3-dof with mixed
 //     drives, spherical 2-dof driveless (stale driveError stays dead),
 //     fix joint (nbDofs = 0, cursor advance only), a zero-drive revolute
-//     (maxForce = 0 -> the zero-desc branch), a LIMITED dof, and the
+//     (maxEffort = 0 -> the zero-desc branch), a LIMITED dof, and the
 //     locked+driven revolute AFTER a spherical write (trap 1's persistence,
 //     deterministic in both implementations);
-//   * eDRIVE_LIMITS_ARE_FORCES on odd articulations (maxForceScale = dt);
 //   * negative targetQ.dot(qB2qA) via a target opposite the joint rotation;
 //   * BOTH solver modes: one TGS and one PGS dispatch over identically
 //     seeded buffers (impMul/posBias and the drive-dt select differ).
@@ -290,8 +289,7 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                      uint32_t lane, uint8_t* sphericalErr /*slice base, [block*32+lane]*/)
 {
     const PxU32 numLinks = ab.mNumLinks[lane];
-    const PxReal maxForceScale =
-        (ab.mFlags[lane] & PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES) ? dt : 1.f;
+    (void)ab;   // 5.12: no eDRIVE_LIMITS_ARE_FORCES / maxForceScale
 
     PxReal driveError[3] = { 0.f, 0.f, 0.f };
     bool driveErrIsSpherical[3] = { false, false, false };
@@ -306,14 +304,11 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
 
         PxSpatialMatrix parentResponse;
         const PxVec3 c2p(link.mRw_x[lane], link.mRw_y[lane], link.mRw_z[lane]);
-        PxReal transmissionForce = 0.f;
         PxReal cfm = 0.f;
         bool loaded = false;
 
         if (nbDofs)
         {
-            const PxReal frictionCoefficient =
-                dofs->mConstraintData.mFrictionCoefficient[lane] * stepDt;
             const PxU32 jointType = link.mJointType[lane];
             const bool isAngular = jointType == PxArticulationJointType::eREVOLUTE
                                 || jointType == PxArticulationJointType::eREVOLUTE_UNWRAPPED
@@ -340,9 +335,10 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                             && dofs[i].mConstraintData.mDriveType[lane] != PxArticulationDriveType::eNONE;
                         if (hasDrive)
                         {
-                            const float4 top = dofs[i].mLocalMotionMatrix.mTopxyz_bx[lane];
-                            driveAxis += PxVec3(top.x, top.y, top.z)
-                                       * dofs[i].mConstraintData.mDriveTargetPos[lane];
+                            // 5.12: indexed by the dof's axis (twist/swing1/swing2)
+                            // (5.6.1 summed motion-matrix top * target)
+                            const PxU32 axisIndex = dofs[i].mDofIds[lane];
+                            driveAxis[axisIndex] = dofs[i].mConstraintData.mDriveTargetPos[lane];
                             hasAngularDrives = true;
                         }
                     }
@@ -378,7 +374,6 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
             {
                 const PxU32 motion = dofs[i].mMotion[lane];
                 const PxU32 dofId = dofs[i].mDofIds[lane];
-                const PxReal maxForce = dofs[i].mConstraintData.mMaxForce[lane];
                 const PxReal maxEffort = dofs[i].mConstraintData.mMaxEffort[lane];
                 const PxReal stiffness = dofs[i].mConstraintData.mDriveStiffness[lane];
                 const PxReal damping = dofs[i].mConstraintData.mDamping[lane];
@@ -386,8 +381,6 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                 if (!loaded)
                 {
                     loadSpatialMatrix(lk[parent].mSpatialResponseMatrix, lane, parentResponse);
-                    const UnAlignedSpatialVector bias = loadSpatialVector(link.mBiasForce, lane);
-                    transmissionForce = bias.magnitude() * frictionCoefficient;
                     cfm = PxMax(lk[parent].mCfm[lane], link.mCfm[lane]);
                     loaded = true;
                 }
@@ -440,8 +433,6 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                 const PxReal unitResponse = r1 + r0;
                 const PxReal recipResponse = 1.0f / (unitResponse + cfm);
 
-                dofs[i].mConstraintData.mMaxFrictionForce[lane] = transmissionForce;
-
                 if (motion == PxArticulationMotion::eLIMITED)
                 {
                     const float2 limit = dofs[i].mConstraintData.mLimits_LowLimitX_highLimitY[lane];
@@ -449,7 +440,7 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                         make_float2(position - limit.x, limit.y - position);
                 }
 
-                if ((maxForce > 0.0f || maxEffort > 0.0f) && (stiffness > 0.0f || damping > 0.0f))
+                if (maxEffort > 0.0f && (stiffness > 0.0f || damping > 0.0f))
                 {
                     const PxReal targetVelocity = dofs[i].mConstraintData.mDriveTargetVel[lane];
                     const PxArticulationDriveType::Enum type =
@@ -459,7 +450,6 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                                                        isTGS ? stepDt : dt, dt,
                                                        unitResponse, recipResponse,
                                                        error, targetVelocity, isTGS));
-                    dofs[i].mConstraintData.mConstraintMaxImpulse[lane] = maxForce * maxForceScale;
                     if (errSpherical && sphericalErr)
                         sphericalErr[size_t(dofs + i - df) * 32 + lane] = 1;
                 }
@@ -467,7 +457,6 @@ static void refSetup(PxgArticulationBlockData& ab, PxgArticulationBlockLinkData*
                 {
                     dofs[i].mConstraintData.setImplicitDriveDesc(lane,
                         Dy::ArticulationImplicitDriveDesc(PxZero));
-                    dofs[i].mConstraintData.mConstraintMaxImpulse[lane] = 0.f;
                 }
                 dofs[i].mConstraintData.mDriveImpulse[lane] = 0.f;
                 storeSpatialVector(dofs[i].mConstraintData.mDeltaVA, deltaVA, lane);
@@ -547,7 +536,7 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
 
         const uint32_t numLinks = 1u + (a % 4u);
         B.mNumLinks[lane] = numLinks;
-        B.mFlags[lane] = (a & 1u) ? PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES : 0u;
+        B.mFlags[lane] = 0u;   // (5.12: eDRIVE_LIMITS_ARE_FORCES is gone)
 
         uint32_t dofCursor = 0;
         for (uint32_t linkID = 0; linkID < numLinks; ++linkID)
@@ -573,11 +562,6 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
                                                   fv(a, linkID, 5, 8), 0.f);
             lnk.mChildPose.p[lane] = make_float4(fv(a, linkID, 6, 8), fv(a, linkID, 7, 8),
                                                  fv(a, linkID, 8, 8), 0.f);
-            storeSpatialVector(lnk.mBiasForce,
-                               UnAlignedSpatialVector(
-                                   PxVec3(fv(a, linkID, 0, 9), fv(a, linkID, 1, 9), fv(a, linkID, 2, 9)),
-                                   PxVec3(fv(a, linkID, 3, 9), fv(a, linkID, 4, 9), fv(a, linkID, 5, 9))),
-                               lane);
             // parent's response matrix: synthetic but well-scaled
             {
                 PxSpatialMatrix m;
@@ -630,7 +614,6 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
                 dd.mInvStIsT_z[lane] = fv(a, linkID, i, 22);
 
                 PxgArticulationInternalConstraintData& ic = dd.mConstraintData;
-                ic.mFrictionCoefficient[lane] = 0.5f + 0.5f * fv(a, linkID, i, 23);
                 ic.mDriveType[lane] = j.driveType[i];
                 // a target chosen so some qB2qA dots go negative (case 6 gets a
                 // large opposing target)
@@ -653,8 +636,8 @@ static size_t siRun(PxgCudaShim& shim, bool isTGS)
                 ic.mDriveStiffness[lane] =
                     (j.zeroDrive || dampingOnly) ? 0.f : 40.f + 10.f * fv(a, linkID, i, 26);
                 ic.mDamping[lane] = 3.f + 1.f * fv(a, linkID, i, 27);
-                ic.mMaxForce[lane] = j.zeroDrive ? 0.f : 100.f + 20.f * fv(a, linkID, i, 28);
-                ic.mMaxEffort[lane] = 0.f;
+                // 5.12: the drive runs only with an effort budget (maxForce is gone)
+                ic.mMaxEffort[lane] = j.zeroDrive ? 0.f : 100.f + 20.f * fv(a, linkID, i, 28);
                 ic.mLimits_LowLimitX_highLimitY[lane] =
                     make_float2(-1.2f + 0.1f * fv(a, linkID, i, 29), 1.3f + 0.1f * fv(a, linkID, i, 30));
             }

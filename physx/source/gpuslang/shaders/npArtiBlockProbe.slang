@@ -168,9 +168,8 @@ void artiBlockProbe()
         o[i++] = uint64_t(asuint(top.x));
         abLoadSpatialVector(d, PXG_AB_DOF_mIsW, AP_LANE, top, bottom);
         o[i++] = uint64_t(asuint(top.x));
-        abLoadSpatialVector(d, PXG_AB_DOF_mJointAxis, AP_LANE, top, bottom);
-        o[i++] = uint64_t(asuint(top.x));
         o[i++] = uint64_t(asuint(bottom.z));
+        // (5.12 removed mJointAxis, the fifth spatial-vector member)
     }
 
     // ---- the embedded PxgArticulationInternalConstraintData, at lane 3 ----
@@ -210,14 +209,15 @@ void artiBlockProbe()
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mLowImpulse, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxJointVelocity, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveImpulse, AP_LANE)));
-        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mConstraintMaxImpulse, AP_LANE)));
-        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxForce, AP_LANE)));
+        // (5.12 removed mConstraintMaxImpulse and mMaxForce here)
         // the one PxU32 array in a run of PxReals
         o[i++] = uint64_t(abU32(c, PXG_AB_IC_mDriveType, AP_LANE));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxEffort, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxActuatorVelocity, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mVelocityDependentResistance, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mSpeedEffortGradient, AP_LANE)));
+        // 5.12: the per-dof external joint effort the solver now reads
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mExternalEffort, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveTargetPos, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mArmature, AP_LANE)));
         {
@@ -232,8 +232,7 @@ void artiBlockProbe()
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveTargetVel, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mTargetPosBias, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mAccumulatedFrictionImpulse, AP_LANE)));
-        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxFrictionForce, AP_LANE)));
-        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mFrictionCoefficient, AP_LANE)));
+        // (5.12 removed mMaxFrictionForce and mFrictionCoefficient here)
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mStaticFrictionEffort, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDynamicFrictionEffort, AP_LANE)));
         o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mViscousFrictionCoefficient, AP_LANE)));
@@ -290,7 +289,7 @@ void artiBlockProbe()
         AP_SVB(PXG_AB_LINK_mConstraintForces, bottom.z)
         AP_SVB(PXG_AB_LINK_mMotionAcceleration, top.x)
         AP_SVB(PXG_AB_LINK_mMotionAccelerationInternal, top.y)
-        AP_SVB(PXG_AB_LINK_mBiasForce, top.z)
+        // (5.12 removed mBiasForce, the fifteenth member)
 #undef AP_SVB
     }
 
@@ -371,10 +370,9 @@ void artiBlockProbe()
         o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_maxJointVelocity + 4u * 4u, 0u)));
         o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_jointPos + 4u * 4u, 0u)));
         o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_jointVel + 4u * 4u, 0u)));
-        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_frictionCoefficient, 0u)));
-        o[i++] = uint64_t(abU32(jc, PXG_AR_JOINT_jointOffset, 0u));
-        // PxU8[6] runs: dofIds @520, motion @526, invDofIds @532, then the two
-        // single bytes at 538 and 539.  Every one of these is a byte extract.
+        // (5.12 removed the joint record's frictionCoefficient and jointOffset)
+        // PxU8[6] runs: dofIds @488, motion @494, invDofIds @500, then the two
+        // single bytes at 506 and 507.  Every one of these is a byte extract.
         o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_dofIds + 4u) & ~3u, (PXG_AR_JOINT_dofIds + 4u) & 3u));
         o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_motion + 4u) & ~3u, (PXG_AR_JOINT_motion + 4u) & 3u));
         o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_invDofIds + 4u) & ~3u, (PXG_AR_JOINT_invDofIds + 4u) & 3u));

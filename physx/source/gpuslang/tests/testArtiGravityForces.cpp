@@ -26,22 +26,20 @@
 
 
 // P8.114: the `computeArtiGravityForces` engine entry
-// (inverseDynamic.cu:593) -- the gravity-compensation direct-API kernel,
-// both branches.  The mirror is the CUDA's structure over engine
-// primitives: Cm::transformInertiaTensor, PxMat33(quat), the pxgref
-// skew/translateInertia pair, Dy::SpatialMatrix operator+ / operator* /
-// invertInertia, Dy::FeatherstoneArticulation::translateSpatialVector,
-// UnAlignedSpatialVector::rotate(PxTransform) and the dual innerProduct --
-// every one PX_CUDA_CALLABLE or already pinned by its own P8.86 fixture.
+// (inverseDynamic.cu:582 in 5.12) -- the gravity-compensation direct-API
+// kernel.  5.12 removed the rootMotion argument and the deprecated
+// generalized-gravity branch with it: what is left is the 5.6.1
+// "rootMotion || fixBase" branch, unconditional, with rootDof = fixBase ? 0 : 6,
+// an output pitch of maxDofs + 6, and Rw from computeLinkRwInvDyn.  The
+// mirror is the CUDA's structure over engine primitives:
+// Dy::FeatherstoneArticulation::translateSpatialVector, Dy::computeLinkRw,
+// UnAlignedSpatialVector::rotate(PxTransform) and the dual innerProduct.
 //
-// Pins: the record-scratch reinterpretation (worldSpatialArticulatedInertia
-// read at the Dy::SpatialMatrix stride of 112, NOT PxSpatialMatrix's 144 --
-// the fixture pins both numbers by static_assert), the dof-index staging
-// trick through the output buffer, rootDof vs bufferDof, per-component zero
-// guards (a static link in every branch), motionVelocities[0] as a live
-// INPUT, the negated root acceleration, the engine's own zA sign
-// inconsistency between the branches, and two rounds (rootMotion on/off)
-// with fixed and floating bases mixed in both.
+// Pins: the dof-index staging trick through the output buffer, rootDof,
+// per-component zero guards (a static link in every round), the prismatic
+// slide in Rw, and that the scratch buffers the old second branch used
+// (inertia, motion velocity / acceleration) come back untouched, over two
+// salts with fixed and floating bases mixed.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -52,6 +50,7 @@
 #include "foundation/PxTransform.h"
 #include "CmUtils.h"
 #include "PxSpatialMatrix.h"
+#include "pxgArtiLinkRwRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -73,7 +72,7 @@ using physx::gpuslang::PxgResult;
 
 static_assert(sizeof(physx::Dy::SpatialMatrix) == 112, "the reinterpret stride");
 static_assert(sizeof(physx::PxSpatialMatrix) == 144, "the underlying buffer stride");
-static_assert(offsetof(physx::PxgArticulation, worldSpatialArticulatedInertia) == 168,
+static_assert(offsetof(physx::PxgArticulation, worldSpatialArticulatedInertia) == 160,
               "..WORLD_SPATIAL_ARTICULATED_INERTIA");
 
 static std::vector<uint8_t> artiGfLoader(const char* file) { return loadShaderBlob(file); }
@@ -81,11 +80,12 @@ static std::vector<uint8_t> artiGfLoader(const char* file) { return loadShaderBl
 const uint32_t GF_NB_JOBS = 12;      // 2 blocks of 8 warps: 4 guard-dead jobs
 const uint32_t GF_NB_SLOTS = 16;     // index + output cover every launched warp
 const uint32_t GF_NB_RECORDS = 18;
-const uint32_t GF_RECORD_SIZE = 544;
+const uint32_t GF_RECORD_SIZE = 496;
+const uint32_t GF_R_JOINTS = 40, GF_R_JOINT_POSITIONS = 104;   // 5.12: computeLinkRwInvDyn
 const uint32_t GF_R_NUM_LINKS = 16, GF_R_NUM_DOFS = 18, GF_R_FLAGS = 26;
 const uint32_t GF_R_JOINT_DATA = 48, GF_R_MOTION_VEL = 56, GF_R_MOTION_ACC = 64;
-const uint32_t GF_R_ZA = 88, GF_R_WORLD_INERTIA = 168, GF_R_BODY2WORLDS = 184;
-const uint32_t GF_R_PARENTS = 208, GF_R_MOTION_MATRIX = 216, GF_R_LINK_PROPS = 256;
+const uint32_t GF_R_ZA = 88, GF_R_WORLD_INERTIA = 160, GF_R_BODY2WORLDS = 176;
+const uint32_t GF_R_PARENTS = 200, GF_R_MOTION_MATRIX = 208, GF_R_LINK_PROPS = 240;
 const uint32_t GF_MAX_LINKS = 6;
 const uint32_t GF_MAX_DOFS = 12;
 const PxVec3 GF_GRAVITY(0.125f, -9.8125f, 0.375f);
@@ -145,13 +145,17 @@ struct GfArena
     std::vector<float> inertia;  // 28 per link (112 B, scratch, poisoned)
     std::vector<float> mvel;     // 6 per link (link 0 = LIVE INPUT, rest poison)
     std::vector<float> macc;     // 6 per link (scratch, poisoned)
-    std::vector<float> out;      // per-job (maxDofs + bufferDof) floats
+    std::vector<float> out;      // per-job (maxDofs + 6) floats
+    std::vector<uint8_t> joints; // 5.12: Dy::ArticulationJointCore per link (anchors, type)
+    std::vector<float> jointPositions;
     uint32_t bufferDof;
 };
 
-static void gfSeed(GfArena& A, bool rootMotion, uint32_t salt)
+static void gfSeed(GfArena& A, uint32_t salt)
 {
-    A.bufferDof = rootMotion ? 6u : 0u;
+    A.bufferDof = 6u;   // 5.12: always maxDofs + 6
+    lrBuildJoints(A.joints, GF_NB_RECORDS, GF_MAX_LINKS);
+    lrBuildJointPositions(A.jointPositions, GF_NB_RECORDS, GF_MAX_DOFS);
     A.rec.assign(size_t(GF_NB_RECORDS) * GF_RECORD_SIZE, 0xAB);
     A.jointData.assign(size_t(GF_NB_RECORDS) * GF_MAX_LINKS * 8, 0xAB);
     A.parents.assign(size_t(GF_NB_RECORDS) * GF_MAX_LINKS, 0xCDCDCDCDu);
@@ -226,7 +230,7 @@ static void gfStoreSM(float* p, const physx::Dy::SpatialMatrix& m)
 }
 
 // the mirror: the kernel's structure, sequentially, over engine primitives
-static void gfMirror(GfArena& W, bool rootMotion)
+static void gfMirror(GfArena& W)
 {
     using physx::Dy::FeatherstoneArticulation;
     const PxVec3 tGravity = -GF_GRAVITY;
@@ -236,12 +240,9 @@ static void gfMirror(GfArena& W, bool rootMotion)
         const uint32_t linkCount = gfNumLinks(r);
         const uint32_t dofCount = gfDofCount(r);
         const bool fixBase = gfFixBase(r);
-        const uint32_t rootDof = (rootMotion && !fixBase) ? 6u : 0u;
-        float* gcf = &W.out[size_t(job) * (GF_MAX_DOFS + W.bufferDof)];
+        const uint32_t rootDof = fixBase ? 0u : 6u;
+        float* gcf = &W.out[size_t(job) * (GF_MAX_DOFS + 6u)];
         float* za = &W.za[size_t(r) * GF_MAX_LINKS * 6];
-        float* mvel = &W.mvel[size_t(r) * GF_MAX_LINKS * 6];
-        float* macc = &W.macc[size_t(r) * GF_MAX_LINKS * 6];
-        float* inr = &W.inertia[size_t(r) * GF_MAX_LINKS * 28];
         auto b2w = [&](uint32_t l) {
             const float* xf = &W.xforms[(size_t(r) * GF_MAX_LINKS + l) * 7];
             return PxTransform(PxVec3(xf[4], xf[5], xf[6]), PxQuat(xf[0], xf[1], xf[2], xf[3]));
@@ -254,117 +255,45 @@ static void gfMirror(GfArena& W, bool rootMotion)
             return UnAlignedSpatialVector(PxVec3(mm[0], mm[1], mm[2]), PxVec3(mm[3], mm[4], mm[5]));
         };
 
-        if (rootMotion || fixBase)
+        for (uint32_t l = 0; l < linkCount; ++l)
         {
-            for (uint32_t l = 0; l < linkCount; ++l)
-            {
-                const float w = invIM(l).w;
-                const float mass = w == 0.f ? 0.f : 1.f / w;
-                gfStoreSV(&za[l * 6], UnAlignedSpatialVector(tGravity * mass, PxVec3(0.f)));
-            }
-            for (uint32_t l = linkCount - 1; l > 0; --l)
-            {
-                const uint32_t pl = gfParent(l);
-                const UnAlignedSpatialVector t = FeatherstoneArticulation::translateSpatialVector(
-                    b2w(l).p - b2w(pl).p, gfLoadSV(&za[l * 6]));
-                gfStoreSV(&za[pl * 6], gfLoadSV(&za[pl * 6]) + t);
-                for (uint32_t d = 0; d < nbDof(l); ++d)
-                    gcf[jointOff(l) + d + rootDof] = float(l);
-            }
-            for (uint32_t dof = 0; dof < dofCount; ++dof)
-            {
-                const uint32_t l = uint32_t(gcf[dof + rootDof]);
-                const UnAlignedSpatialVector dm =
-                    motionVec(l, dof - jointOff(l)).rotate(b2w(l));
-                gcf[dof + rootDof] = dm.innerProduct(gfLoadSV(&za[l * 6]));
-            }
-            if (rootDof == 6)
-            {
-                const UnAlignedSpatialVector z0 = gfLoadSV(&za[0]);
-                gcf[0] = z0.top.x; gcf[1] = z0.top.y; gcf[2] = z0.top.z;
-                gcf[3] = z0.bottom.x; gcf[4] = z0.bottom.y; gcf[5] = z0.bottom.z;
-            }
+            const float w = invIM(l).w;
+            const float mass = w == 0.f ? 0.f : 1.f / w;
+            gfStoreSV(&za[l * 6], UnAlignedSpatialVector(tGravity * mass, PxVec3(0.f)));
         }
-        else
+        for (uint32_t l = linkCount - 1; l > 0; --l)
         {
-            for (uint32_t l = 0; l < linkCount; ++l)
-            {
-                const physx::PxVec4 im = invIM(l);
-                const float mass = im.w == 0.f ? 0.f : 1.f / im.w;
-                const PxVec3 localInertia(im.x == 0.f ? 0.f : 1.f / im.x,
-                                          im.y == 0.f ? 0.f : 1.f / im.y,
-                                          im.z == 0.f ? 0.f : 1.f / im.z);
-                physx::Dy::SpatialMatrix sm;
-                sm.topLeft = PxMat33(physx::PxZero);
-                sm.topRight = PxMat33::createDiagonal(PxVec3(mass));
-                physx::Cm::transformInertiaTensor(localInertia, PxMat33(b2w(l).q), sm.bottomLeft);
-                gfStoreSM(&inr[l * 28], sm);
-            }
-            for (uint32_t l = linkCount - 1; l > 0; --l)
-            {
-                const uint32_t pl = gfParent(l);
-                const PxVec3 rw = b2w(l).p - b2w(pl).p;
-                physx::Dy::SpatialMatrix parentSpace = gfLoadSM(&inr[l * 28]);
-                pxgtest::refTranslateInertia(pxgtest::refSkewSymmetric(rw.x, rw.y, rw.z),
-                                             parentSpace);
-                gfStoreSM(&inr[pl * 28], gfLoadSM(&inr[pl * 28]) + parentSpace);
-            }
-            for (uint32_t l = 1; l < linkCount; ++l)
-            {
-                const uint32_t pl = gfParent(l);
-                gfStoreSV(&mvel[l * 6], FeatherstoneArticulation::translateSpatialVector(
-                                            b2w(pl).p - b2w(l).p, gfLoadSV(&mvel[pl * 6])));
-            }
-            for (uint32_t l = 0; l < linkCount; ++l)
-            {
-                const float w = invIM(l).w;
-                const float mass = w == 0.f ? 0.f : 1.f / w;
-                const PxMat33 I = gfLoadSM(&inr[l * 28]).bottomLeft;
-                const PxVec3 vA = gfLoadSV(&mvel[l * 6]).top;
-                gfStoreSV(&za[l * 6],
-                          UnAlignedSpatialVector(-tGravity * mass, vA.cross(I * vA)));
-            }
-            for (uint32_t l = linkCount - 1; l > 0; --l)
-            {
-                const uint32_t pl = gfParent(l);
-                const UnAlignedSpatialVector t = FeatherstoneArticulation::translateSpatialVector(
-                    b2w(l).p - b2w(pl).p, gfLoadSV(&za[l * 6]));
-                gfStoreSV(&za[pl * 6], gfLoadSV(&za[pl * 6]) + t);
-            }
-            {
-                physx::Dy::SpatialMatrix invInertia = gfLoadSM(&inr[0]).invertInertia();
-                const UnAlignedSpatialVector a0 = invInertia * gfLoadSV(&za[0]);
-                gfStoreSV(&macc[0], UnAlignedSpatialVector(-a0.top, -a0.bottom));
-            }
-            for (uint32_t l = 1; l < linkCount; ++l)
-            {
-                const uint32_t pl = gfParent(l);
-                const UnAlignedSpatialVector acc = FeatherstoneArticulation::translateSpatialVector(
-                    b2w(pl).p - b2w(l).p, gfLoadSV(&macc[pl * 6]));
-                gfStoreSV(&macc[l * 6], acc);
-                gfStoreSV(&za[l * 6], gfLoadSM(&inr[l * 28]) * acc + gfLoadSV(&za[l * 6]));
-                for (uint32_t d = 0; d < nbDof(l); ++d)
-                    gcf[jointOff(l) + d] = float(l);
-            }
-            for (uint32_t dof = 0; dof < dofCount; ++dof)
-            {
-                const uint32_t l = uint32_t(gcf[dof]);
-                const UnAlignedSpatialVector dm =
-                    motionVec(l, dof - jointOff(l)).rotate(b2w(l));
-                gcf[dof] = dm.innerProduct(gfLoadSV(&za[l * 6]));
-            }
+            const uint32_t pl = gfParent(l);
+            const PxVec3 rw = lrLinkRw(r, l, b2w(pl).q, b2w(l).q, jointOff(l), motionVec(l, 0).bottom);
+            const UnAlignedSpatialVector t =
+                FeatherstoneArticulation::translateSpatialVector(rw, gfLoadSV(&za[l * 6]));
+            gfStoreSV(&za[pl * 6], gfLoadSV(&za[pl * 6]) + t);
+            for (uint32_t d = 0; d < nbDof(l); ++d)
+                gcf[jointOff(l) + d + rootDof] = float(l);
+        }
+        for (uint32_t dof = 0; dof < dofCount; ++dof)
+        {
+            const uint32_t l = uint32_t(gcf[dof + rootDof]);
+            const UnAlignedSpatialVector dm = motionVec(l, dof - jointOff(l)).rotate(b2w(l));
+            gcf[dof + rootDof] = dm.innerProduct(gfLoadSV(&za[l * 6]));
+        }
+        if (rootDof == 6)
+        {
+            const UnAlignedSpatialVector z0 = gfLoadSV(&za[0]);
+            gcf[0] = z0.top.x; gcf[1] = z0.top.y; gcf[2] = z0.top.z;
+            gcf[3] = z0.bottom.x; gcf[4] = z0.bottom.y; gcf[5] = z0.bottom.z;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 
-static size_t gfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
+static size_t gfRun(PxgCudaShim& shim, uint32_t salt)
 {
     GfArena A;
-    gfSeed(A, rootMotion, salt);
+    gfSeed(A, salt);
     GfArena W = A;
-    gfMirror(W, rootMotion);
+    gfMirror(W);
 
     std::vector<PxgDevicePtr> bufs;
     auto up = [&](const void* p, size_t n) {
@@ -383,6 +312,8 @@ static size_t gfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     PxgDevicePtr dIn = up(A.inertia.data(), A.inertia.size() * 4);
     PxgDevicePtr dMv = up(A.mvel.data(), A.mvel.size() * 4);
     PxgDevicePtr dMa = up(A.macc.data(), A.macc.size() * 4);
+    PxgDevicePtr dJc = up(A.joints.data(), A.joints.size());
+    PxgDevicePtr dJp = up(A.jointPositions.data(), A.jointPositions.size() * 4);
 
     for (uint32_t r = 0; r < GF_NB_RECORDS; ++r)
     {
@@ -397,6 +328,8 @@ static size_t gfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
         put(GF_R_WORLD_INERTIA, uint64_t(dIn) + uint64_t(r) * GF_MAX_LINKS * 112u);
         put(GF_R_MOTION_VEL, uint64_t(dMv) + uint64_t(r) * GF_MAX_LINKS * 24u);
         put(GF_R_MOTION_ACC, uint64_t(dMa) + uint64_t(r) * GF_MAX_LINKS * 24u);
+        put(GF_R_JOINTS, uint64_t(dJc) + uint64_t(r) * GF_MAX_LINKS * sizeof(physx::Dy::ArticulationJointCore));
+        put(GF_R_JOINT_POSITIONS, uint64_t(dJp) + uint64_t(r) * GF_MAX_DOFS * 4u);
     }
     PxgDevicePtr dRec = up(A.rec.data(), A.rec.size());
 
@@ -418,12 +351,12 @@ static size_t gfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     {
         uint32_t nb, pad0;
         uint64_t data, idx;
-        uint32_t maxDofs, rootWord;
+        uint32_t maxDofs, pad1;   // (5.6.1: the rootMotion bool sat in pad1)
         uint64_t rec;
         float gx, gy, gz;
-        uint32_t pad1;
+        uint32_t pad2;
     } prm = { GF_NB_JOBS, 0u, uint64_t(dOut), uint64_t(dIdx), GF_MAX_DOFS,
-              rootMotion ? 1u : 0u, uint64_t(dRec), GF_GRAVITY.x, GF_GRAVITY.y, GF_GRAVITY.z, 0u };
+              0xABu, uint64_t(dRec), GF_GRAVITY.x, GF_GRAVITY.y, GF_GRAVITY.z, 0u };
     PXG_CHECK_MSG(shim.launchKernel(0, (GF_NB_JOBS + 7) / 8, 1, 1, &prm, sizeof(prm)) ==
                       PxgResult::Success,
                   "launch computeArtiGravityForces");
@@ -439,8 +372,8 @@ static size_t gfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
             if (w[k] != g[k])
             {
                 if (bad < 10)
-                    std::printf("MM gf rm=%d %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
-                                rootMotion ? 1 : 0, name, k, w[k], want[k], g[k], got[k]);
+                    std::printf("MM gf salt=%u %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
+                                salt, name, k, w[k], want[k], g[k], got[k]);
                 ++bad;
             }
     };
@@ -477,7 +410,7 @@ PXG_TEST(artiGravityForces)
     PXG_CHECK_MSG(nFixed > 2 && nFree > 2 && nStatic > 0, "coverage hole");
 
     size_t bad = 0;
-    bad += gfRun(shim, true, 3);    // branch A everywhere (rootMotion)
-    bad += gfRun(shim, false, 7);   // branch A for fixed bases, branch B for floating
+    bad += gfRun(shim, 3);
+    bad += gfRun(shim, 7);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

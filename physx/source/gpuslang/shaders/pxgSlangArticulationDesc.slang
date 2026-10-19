@@ -32,7 +32,7 @@
 // PxgArticulationSimUpdate, and the FIELD BYTE OFFSETS of PxgArticulation
 // (gpusimulationcontroller/include/PxgArticulation.h).
 //
-// Why offsets and not a struct mirror for PxgArticulation: the class is 544
+// Why offsets and not a struct mirror for PxgArticulation: the class is 496
 // bytes of ~40 device pointers plus an embedded PxgArticulationData header.
 // pxgSlangSimCoreDesc already addresses two of those pointers raw, for the
 // same reason — a full mirror is 40 fields that must each stay in step with a
@@ -50,7 +50,7 @@ module pxgSlangArticulationDesc;
 // ---------------------------------------------------------------------------
 // PxgArticulation: strides and field byte offsets
 // ---------------------------------------------------------------------------
-public static const uint PXG_ARTI_STRIDE = 544;   // sizeof(PxgArticulation)
+public static const uint PXG_ARTI_STRIDE = 496;   // sizeof(PxgArticulation)
 
 // PxgArticulationData, embedded at PxgArticulation @0 (32 bytes).  The three
 // 16-bit counts are packed, so each needs a halfword extract, not a load.
@@ -78,42 +78,39 @@ public static const uint PXG_ARTI_LINKREC_INITIAL_ANGVEL_PENBIAS = 0;   // float
 public static const uint PXG_ARTI_LINKREC_INITIAL_LINVEL_INVMASS = 16;  // float4 in PxgArticulationLink
 public static const uint PXG_ARTI_SLEEPDATA_LINVEL = 0;   // float4 in PxgArticulationLinkSleepData
 public static const uint PXG_ARTI_SLEEPDATA_ANGVEL = 16;  // float4
-public static const uint PXG_ARTI_CORIOLISE_VECTORS = 80;
+public static const uint PXG_ARTI_CORIOLISE_VECTORS = 80;   // coriolisVectors (5.12 spelling)
 // P8.84.  Despite the name this is not only an inverse-dynamics buffer: when
 // isExternalForcesEveryTgsIterationEnabled is set, computeSpatialInertiaW parks
 // the ISOLATED external Z force per link here, because externalAccelerations
 // (96) is only refreshed on demand and must not be overwritten.
 public static const uint PXG_ARTI_ZA_FORCES = 88;
 public static const uint PXG_ARTI_EXTERNAL_ACCELERATIONS = 96;
-public static const uint PXG_ARTI_ROOT_PRE_MOTION_VELOCITY = 104;  // a SINGLE
-                                                                  // Cm::UnAlignedSpatialVector,
-                                                                  // not an array
-public static const uint PXG_ARTI_JOINT_POSITIONS = 112;
-public static const uint PXG_ARTI_JOINT_VELOCITIES = 120;
-public static const uint PXG_ARTI_JOINT_FORCE = 136;
+public static const uint PXG_ARTI_JOINT_POSITIONS = 104;
+public static const uint PXG_ARTI_JOINT_VELOCITIES = 112;
+public static const uint PXG_ARTI_JOINT_FORCE = 128;
 // PxSpatialMatrix* -- the per-link 6x6 impulse-response matrices, one array per
 // articulation.  P8.89: GENERATED, not guessed.  The plan expected it between
 // pathToRoot (272) and spatialTendonParams (304); it is nowhere near, which is
 // exactly the P8.49a failure mode (shader and fixture sharing one wrong number)
 // that generating it closes.
-public static const uint PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W = 176;
+public static const uint PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W = 168;
 // sizeof(PxSpatialMatrix) -- a plain PxReal column[6][6]
 public static const uint PXG_ARTI_SPATIAL_MATRIX_6X6_SIZE = 144;
-public static const uint PXG_ARTI_JOINT_TARGET_POSITIONS = 144;
-public static const uint PXG_ARTI_JOINT_TARGET_VELOCITIES = 152;
-public static const uint PXG_ARTI_LINK_BODY2WORLDS = 184;
-public static const uint PXG_ARTI_LINK_BODY2ACTORS = 200;
-public static const uint PXG_ARTI_PARENTS = 208;
-public static const uint PXG_ARTI_LINK_WAKE_COUNTERS = 240;
-public static const uint PXG_ARTI_LINK_SLEEP_DATA = 248;
-public static const uint PXG_ARTI_LINK_PROPS = 256;
-public static const uint PXG_ARTI_CHILDREN = 264;
-public static const uint PXG_ARTI_PATH_TO_ROOT = 272;
-public static const uint PXG_ARTI_SPATIAL_TENDON_PARAMS = 304;
-public static const uint PXG_ARTI_SPATIAL_TENDONS = 312;
-public static const uint PXG_ARTI_FIXED_TENDON_PARAMS = 320;
-public static const uint PXG_ARTI_FIXED_TENDONS = 328;
-public static const uint PXG_ARTI_MIMIC_JOINT_CORES = 352;
+public static const uint PXG_ARTI_JOINT_TARGET_POSITIONS = 136;
+public static const uint PXG_ARTI_JOINT_TARGET_VELOCITIES = 144;
+public static const uint PXG_ARTI_LINK_BODY2WORLDS = 176;
+public static const uint PXG_ARTI_LINK_BODY2ACTORS = 192;
+public static const uint PXG_ARTI_PARENTS = 200;
+public static const uint PXG_ARTI_LINK_WAKE_COUNTERS = 224;
+public static const uint PXG_ARTI_LINK_SLEEP_DATA = 232;
+public static const uint PXG_ARTI_LINK_PROPS = 240;
+public static const uint PXG_ARTI_CHILDREN = 248;
+public static const uint PXG_ARTI_PATH_TO_ROOT = 256;
+public static const uint PXG_ARTI_SPATIAL_TENDON_PARAMS = 288;
+public static const uint PXG_ARTI_SPATIAL_TENDONS = 296;
+public static const uint PXG_ARTI_FIXED_TENDON_PARAMS = 304;
+public static const uint PXG_ARTI_FIXED_TENDONS = 312;
+public static const uint PXG_ARTI_MIMIC_JOINT_CORES = 336;
 
 // ---------------------------------------------------------------------------
 // Element strides of the arrays copied through those pointers
@@ -123,7 +120,7 @@ public static const uint PXG_ARTI_LINK_PROP_SIZE = 16;        // PxgArticulation
 public static const uint PXG_ARTI_LINK_SLEEP_DATA_SIZE = 32;  // PxgArticulationLinkSleepData
 public static const uint PXG_ARTI_BITFIELD_SIZE = 8;          // Dy::ArticulationBitField (PxU64)
 public static const uint PXG_ARTI_TRANSFORM_SIZE = 28;        // PxTransform
-public static const uint PXG_ARTI_JOINT_CORE_SIZE = 544;      // Dy::ArticulationJointCore
+public static const uint PXG_ARTI_JOINT_CORE_SIZE = 512;      // Dy::ArticulationJointCore
 public static const uint PXG_ARTI_JOINT_CORE_DATA_SIZE = 8;   // Dy::ArticulationJointCoreData
 public static const uint PXG_ARTI_SPATIAL_VECTOR_SIZE = 24;   // Cm::UnAlignedSpatialVector
 public static const uint PXG_ARTI_MIMIC_JOINT_CORE_SIZE = 32; // Dy::ArticulationMimicJointCore
@@ -236,7 +233,7 @@ public static const uint PXG_SIM_UPDATE_USER_FLAGS = 40;
 
 // ---------------------------------------------------------------------------
 // PxgArticulationCoreDesc (gpuarticulation/include/PxgArticulationCoreDesc.h,
-// 360 bytes) — the descriptor the WHOLE articulation solver block shares.
+// 344 bytes in 5.12, 360 in 5.6.1) — the descriptor the WHOLE articulation solver block shares.
 //
 // Addressed by named byte offset for the same reason PxgArticulation is: it
 // carries ~30 device pointers into block-layout scratch (link blocks, dof
@@ -302,6 +299,8 @@ public static const uint PXG_ARTI_CORE_PARTITION_AVERAGE_SCALE = 120;      // Px
 public static const uint PXG_ARTI_CORE_DT = 48;                 // PxReal
 public static const uint PXG_ARTI_CORE_GRAVITY = 52;            // PxVec3
 public static const uint PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER = 68;  // bool
+// 5.12: one more bool lands in the padding right behind it, so nothing moves
+public static const uint PXG_ARTI_CORE_IS_SLEEPING_DISABLED = 69;            // bool
 public static const uint PXG_ARTI_CORE_INV_LENGTH_SCALE = 64;   // PxReal
 public static const uint PXG_ARTI_CORE_ARTICULATION_BLOCKS = 128;        // PxgArticulationBlockData*
 public static const uint PXG_ARTI_CORE_LINK_BLOCKS = 136;                // PxgArticulationBlockLinkData*
@@ -343,15 +342,9 @@ public static const uint PXG_ARTI_CORE_MAX_ATTACHMENTS = 264;            // PxU3
 public static const uint PXG_ARTI_CORE_MAX_FIXED_TENDONS = 268;          // PxU32
 public static const uint PXG_ARTI_CORE_MAX_TENDON_JOINTS = 272;          // PxU32
 
-// PxgArticulation's two residual accumulators, and the stride of one.
-// Dy::ErrorAccumulator is 12 bytes of plain scalars, so the whole-struct
-// assignment the CUDA writes is a 12-byte copy at any granularity.
-public static const uint PXG_ARTI_INTERNAL_RESIDUAL = 512;
-public static const uint PXG_ARTI_CONTACT_RESIDUAL = 524;
-public static const uint PXG_ARTI_ERROR_ACCUMULATOR_SIZE = 12;
-
 // ---------------------------------------------------------------------------
-// P8.93: PxgArticulationOutputDesc (32 bytes) and what feeds it
+// P8.93: PxgArticulationOutputDesc (16 bytes; 5.12 dropped the two residual
+// accumulator pointers that made it 32) and what feeds it
 // ---------------------------------------------------------------------------
 //
 // The scene-wide staging struct `dmaBackArticulationDataLaunch` writes into.
@@ -360,22 +353,17 @@ public static const uint PXG_ARTI_ERROR_ACCUMULATOR_SIZE = 12;
 // sharing one wrong number) is closed only by generation.
 public static const uint PXG_ARTI_OUT_STATE_DATA = 0;    // PxU8*  linkAndJointAndRootStateData
 public static const uint PXG_ARTI_OUT_SLEEP_DATA = 8;    // PxgSolverBodySleepData*
-public static const uint PXG_ARTI_OUT_ERROR_ACC = 16;    // Dy::ErrorAccumulator*   per articulation
-public static const uint PXG_ARTI_OUT_CONTACT_ACC = 24;  // Dy::ErrorAccumulator*   one for the scene
-public static const uint PXG_ARTI_OUT_DESC_SIZE = 32;
-
-// PxgArticulationCoreDesc::mContactErrorAccumulator -- a VALUE, not a pointer,
-// and it sits at the very end of the 360-byte descriptor.
-public static const uint PXG_ARTI_CORE_CONTACT_ERROR_ACC = 344;
+public static const uint PXG_ARTI_OUT_DESC_SIZE = 16;
 
 // PxgArticulation::linkJointRootStateDataBuffer -- the per-articulation source
 // the scene-wide staging buffer is filled FROM.  Every one of
 // `linkBody2Worlds`, `motionVelocities`, `motionAccelerations`,
 // `linkIncomingJointForces`, `jointPositions`, `jointVelocities`,
-// `jointAccelerations` and `rootPreMotionVelocity` is a sub-range of it
+// `jointAccelerations` is a sub-range of it (5.12 dropped the trailing
+// rootPreMotionVelocity)
 // (PxgSimulationCore.cpp:893), which is why copying this one buffer copies the
 // whole articulation state.
-public static const uint PXG_ARTI_LINK_JOINT_ROOT_STATE = 192;
+public static const uint PXG_ARTI_LINK_JOINT_ROOT_STATE = 184;
 
 // PxgArticulationLinkJointRootStateData's arithmetic (PxgArticulation.h:768).
 // sizeof(PxTransform) is 28, NOT 32 -- it is a quat and a vec3 with no padding,
@@ -384,11 +372,12 @@ public static const uint PXG_ARTI_STATE_TRANSFORM_SIZE = 28;
 public static const uint PXG_ARTI_STATE_SVEC_SIZE = 24;   // Cm::UnAlignedSpatialVector
 
 // (sizeof(PxTransform) + 3 * sizeof(UnAlignedSpatialVector)) * links
-//   + 3 * sizeof(PxReal) * dofs + sizeof(UnAlignedSpatialVector)
+//   + 3 * sizeof(PxReal) * dofs
+// 5.12 removed the trailing root pre-sim velocity (one UnAlignedSpatialVector).
 public static uint artiStateBytesRaw(uint maxLinks, uint maxDofs)
 {
     return (PXG_ARTI_STATE_TRANSFORM_SIZE + 3u * PXG_ARTI_STATE_SVEC_SIZE) * maxLinks
-         + 3u * 4u * maxDofs + PXG_ARTI_STATE_SVEC_SIZE;
+         + 3u * 4u * maxDofs;
 }
 
 // The per-articulation stride, rounded UP to 16 -- and note the engine multiplies
@@ -424,12 +413,11 @@ public static const uint PXG_BODY_SIM_SLEEP_THRESHOLD = 104;
 // care.  (Widths measured, not inferred: the ArticulationJointCoreData::nbDof
 // byte in P8.70 is why.)
 // ---------------------------------------------------------------------------
-public static const uint PXG_ARTI_JOINT_AXIS                             =    232;
-public static const uint PXG_ARTI_MOTION_MATRIX                          =    216;
-public static const uint PXG_ARTI_RELATIVE_QUAT                          =    280;
-public static const uint PXG_ARTI_JOINT_OFFSETS                          =    160;
-public static const uint PXG_ARTI_CFM_SCALE                              =    344;
-public static const uint PXG_ARTI_CFMS                                   =    336;
+public static const uint PXG_ARTI_MOTION_MATRIX                          =    208;
+public static const uint PXG_ARTI_RELATIVE_QUAT                          =    264;
+public static const uint PXG_ARTI_JOINT_OFFSETS                          =    152;
+public static const uint PXG_ARTI_CFM_SCALE                              =    328;
+public static const uint PXG_ARTI_CFMS                                   =    320;
 public static const uint PXG_ARTI_DATA_FLAGS                            =     26;
 public static const uint PXG_ARTI_DATA_CONFI_DIRTY                      =     27;
 public static const uint PXG_ARTI_DATA_UPDATE_DIRTY                     =     12;
@@ -450,23 +438,23 @@ public static const uint PXG_ARTI_SUBSPACE_STRIDE                       =     80
 // Dy::SpatialMatrix* and index at ITS stride: sizeof(Dy::SpatialMatrix) is
 // 112 (measured; 108 bytes of PxMat33 triple + 4 tail padding), members
 // topLeft @0, topRight @36, bottomLeft @72, PxMat33 column-major.
-public static const uint PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA     =    168;
+public static const uint PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA     =    160;
 public static const uint PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE          =    112;
 // P8.116: worldMotionMatrix (the pointer right after motionMatrix @216;
 // pinned by static_assert in testArtiMassMatrices.cpp).  computeArtiMassMatrices
 // reinterpret_casts it to a FLAT Cm::UnAlignedSpatialVector* scratch indexed
 // [jointOffset + dof] at stride 24 -- NOT the [link][dof] stride-80 layout the
 // motionMatrix field itself uses.
-public static const uint PXG_ARTI_WORLD_MOTION_MATRIX                   =    224;
+public static const uint PXG_ARTI_WORLD_MOTION_MATRIX                   =    216;
 // P8.117 (artiUpdateKinematic), all pinned by static_assert in
 // testArtiUpdateKinematic.cpp: bodySimIndex is data-absolute (data @0,
 // index@0 bodySimIndex@4); tempParentToChilds is a PxQuat* (16-byte stride),
 // tempRs a PxVec3* (12-byte TIGHT stride).
 public static const uint PXG_ARTI_DATA_BODY_SIM_INDEX                    =      4;
-public static const uint PXG_ARTI_JOINT_ACCELERATIONS                    =    128;
+public static const uint PXG_ARTI_JOINT_ACCELERATIONS                    =    120;
 // (PXG_ARTI_LINK_BODY2ACTORS = 200 already declared above)
-public static const uint PXG_ARTI_TEMP_PARENT_TO_CHILDS                 =    288;
-public static const uint PXG_ARTI_TEMP_RS                               =    296;
+public static const uint PXG_ARTI_TEMP_PARENT_TO_CHILDS                 =    272;
+public static const uint PXG_ARTI_TEMP_RS                               =    280;
 public static const uint PXG_ARTI_QUAT_SIZE                             =     16;
 
 // reads a single byte out of a record, via the containing word

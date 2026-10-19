@@ -39,7 +39,10 @@
 // maxJointVelocity (some seeded joint velocities EXCEED their cap, some are
 // NEGATIVE and pass through untouched), motionVelocities[1..] as an
 // OBSERVABLE OUTPUT (link 0 a live input), the crossed zA halves, the
-// lane-0 staging, and the !rootMotion root-acceleration recompute.
+// lane-0 staging.  5.12: the rootMotion argument is gone (rootDof = fixBase ?
+// 0 : 6, output pitch maxDofs + 6, no root-acceleration recompute: the
+// floating-base pass re-propagates the ZERO root acceleration), and every Rw
+// comes from computeLinkRwInvDyn (joint anchors + the prismatic slide).
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -49,6 +52,7 @@
 #include "foundation/PxQuat.h"
 #include "foundation/PxTransform.h"
 #include "CmUtils.h"
+#include "pxgArtiLinkRwRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -73,14 +77,15 @@ static std::vector<uint8_t> artiCfLoader(const char* file) { return loadShaderBl
 const uint32_t CF_NB_JOBS = 12;
 const uint32_t CF_NB_SLOTS = 16;
 const uint32_t CF_NB_RECORDS = 18;
-const uint32_t CF_RECORD_SIZE = 544;
+const uint32_t CF_RECORD_SIZE = 496;
 const uint32_t CF_R_NUM_LINKS = 16, CF_R_NUM_DOFS = 18, CF_R_FLAGS = 26;
+const uint32_t CF_R_JOINT_POSITIONS = 104;   // 5.12: the prismatic slide
 const uint32_t CF_R_JOINTS = 40, CF_R_JOINT_DATA = 48, CF_R_MOTION_VEL = 56;
-const uint32_t CF_R_CORIOLIS = 80, CF_R_ZA = 88, CF_R_JOINT_VELOCITIES = 120;
-const uint32_t CF_R_WORLD_INERTIA = 168, CF_R_BODY2WORLDS = 184, CF_R_PARENTS = 208;
-const uint32_t CF_R_MOTION_MATRIX = 216, CF_R_LINK_PROPS = 256;
-const uint32_t CF_JOINT_CORE_SIZE = 544;
-const uint32_t CF_JOINT_MAX_VEL = 492;   // PXG_AR_JOINT_maxJointVelocity
+const uint32_t CF_R_CORIOLIS = 80, CF_R_ZA = 88, CF_R_JOINT_VELOCITIES = 112;
+const uint32_t CF_R_WORLD_INERTIA = 160, CF_R_BODY2WORLDS = 176, CF_R_PARENTS = 200;
+const uint32_t CF_R_MOTION_MATRIX = 208, CF_R_LINK_PROPS = 240;
+const uint32_t CF_JOINT_CORE_SIZE = 512;
+const uint32_t CF_JOINT_MAX_VEL = 464;   // PXG_AR_JOINT_maxJointVelocity (5.12)
 const uint32_t CF_MAX_LINKS = 6;
 const uint32_t CF_MAX_DOFS = 12;
 
@@ -143,18 +148,20 @@ struct CfArena
 {
     std::vector<uint8_t> rec, jointData, jointCores;
     std::vector<uint32_t> parents;
-    std::vector<float> xforms, motion, props, jvel;
+    std::vector<float> xforms, motion, props, jvel, jointPositions;
     std::vector<float> za, inertia, mvel, coriolis;
     std::vector<float> out;
     uint32_t bufferDof;
 };
 
-static void cfSeed(CfArena& A, bool rootMotion, uint32_t salt)
+static void cfSeed(CfArena& A, uint32_t salt)
 {
-    A.bufferDof = rootMotion ? 6u : 0u;
+    A.bufferDof = 6u;   // 5.12: always maxDofs + 6
     A.rec.assign(size_t(CF_NB_RECORDS) * CF_RECORD_SIZE, 0xAB);
     A.jointData.assign(size_t(CF_NB_RECORDS) * CF_MAX_LINKS * 8, 0xAB);
-    A.jointCores.assign(size_t(CF_NB_RECORDS) * CF_MAX_LINKS * CF_JOINT_CORE_SIZE, 0xAB);
+    // 5.12: real joint cores (anchors + type for computeLinkRwInvDyn), maxJointVelocity overlaid
+    lrBuildJoints(A.jointCores, CF_NB_RECORDS, CF_MAX_LINKS);
+    lrBuildJointPositions(A.jointPositions, CF_NB_RECORDS, CF_MAX_DOFS);
     A.parents.assign(size_t(CF_NB_RECORDS) * CF_MAX_LINKS, 0xCDCDCDCDu);
     A.xforms.assign(size_t(CF_NB_RECORDS) * CF_MAX_LINKS * 7, -88.f);
     A.motion.assign(size_t(CF_NB_RECORDS) * CF_MAX_LINKS * 20, -77.f);
@@ -232,7 +239,7 @@ static physx::Dy::SpatialMatrix cfLoadSM(const float* p)
 }
 static void cfStoreSM(float* p, const physx::Dy::SpatialMatrix& m) { std::memcpy(p, &m, 108); }
 
-static void cfMirror(CfArena& W, bool rootMotion)
+static void cfMirror(CfArena& W)
 {
     using physx::Dy::FeatherstoneArticulation;
     for (uint32_t job = 0; job < CF_NB_JOBS; ++job)
@@ -241,8 +248,8 @@ static void cfMirror(CfArena& W, bool rootMotion)
         const uint32_t linkCount = cfNumLinks(r);
         const uint32_t dofCount = cfDofCount(r);
         const bool fixBase = cfFixBase(r);
-        const uint32_t rootDof = (rootMotion && !fixBase) ? 6u : 0u;
-        float* out = &W.out[size_t(job) * (CF_MAX_DOFS + W.bufferDof)];
+        const uint32_t rootDof = fixBase ? 0u : 6u;
+        float* out = &W.out[size_t(job) * (CF_MAX_DOFS + 6u)];
         float* za = &W.za[size_t(r) * CF_MAX_LINKS * 6];
         float* mvel = &W.mvel[size_t(r) * CF_MAX_LINKS * 6];
         float* cor = &W.coriolis[size_t(r) * CF_MAX_LINKS * 6];   // the ALIAS: one buffer
@@ -258,12 +265,16 @@ static void cfMirror(CfArena& W, bool rootMotion)
             const float* mm = &W.motion[(size_t(r) * CF_MAX_LINKS + l) * 20 + d * 6];
             return UnAlignedSpatialVector(PxVec3(mm[0], mm[1], mm[2]), PxVec3(mm[3], mm[4], mm[5]));
         };
+        // 5.12: computeLinkRwInvDyn
+        auto linkRw = [&](uint32_t l) {
+            return lrLinkRw(r, l, b2w(cfParent(l)).q, b2w(l).q, jointOff(l), motionVec(l, 0).bottom);
+        };
 
         // S0: velocities + coriolis vectors
         for (uint32_t l = 1; l < linkCount; ++l)
         {
             const uint32_t pl = cfParent(l);
-            const PxVec3 rw = b2w(l).p - b2w(pl).p;
+            const PxVec3 rw = linkRw(l);
             const UnAlignedSpatialVector pVel = cfLoadSV(&mvel[pl * 6]);
             UnAlignedSpatialVector vel =
                 FeatherstoneArticulation::translateSpatialVector(-rw, pVel);
@@ -290,9 +301,8 @@ static void cfMirror(CfArena& W, bool rootMotion)
         for (uint32_t l = 1; l < linkCount; ++l)
         {
             const uint32_t pl = cfParent(l);
-            const PxVec3 rw = b2w(l).p - b2w(pl).p;
             const UnAlignedSpatialVector pAcc =
-                FeatherstoneArticulation::translateSpatialVector(-rw, cfLoadSV(&cor[pl * 6]));
+                FeatherstoneArticulation::translateSpatialVector(-linkRw(l), cfLoadSV(&cor[pl * 6]));
             cfStoreSV(&cor[l * 6], pAcc + cfLoadSV(&cor[l * 6]));
         }
         // S2: zA init with crossed halves
@@ -316,12 +326,12 @@ static void cfMirror(CfArena& W, bool rootMotion)
         {
             const uint32_t pl = cfParent(l);
             const UnAlignedSpatialVector t = FeatherstoneArticulation::translateSpatialVector(
-                b2w(l).p - b2w(pl).p, cfLoadSV(&za[l * 6]));
+                linkRw(l), cfLoadSV(&za[l * 6]));
             cfStoreSV(&za[pl * 6], cfLoadSV(&za[pl * 6]) + t);
             for (uint32_t d = 0; d < nbDof(l); ++d)
                 out[jointOff(l) + d + rootDof] = float(l);
         }
-        // S4..S6: the floating-base solve
+        // S4..S5: the floating-base pass (5.12: no root-acceleration recompute)
         if (!fixBase)
         {
             for (uint32_t l = 0; l < linkCount; ++l)
@@ -340,23 +350,17 @@ static void cfMirror(CfArena& W, bool rootMotion)
             for (uint32_t l = linkCount - 1; l > 0; --l)
             {
                 const uint32_t pl = cfParent(l);
-                const PxVec3 rw = b2w(l).p - b2w(pl).p;
+                const PxVec3 rw = linkRw(l);
                 physx::Dy::SpatialMatrix parentSpace = cfLoadSM(&inr[l * 28]);
                 pxgtest::refTranslateInertia(pxgtest::refSkewSymmetric(rw.x, rw.y, rw.z),
                                              parentSpace);
-                cfStoreSM(&inr[pl * 28], cfLoadSM(&inr[pl * 28]) + parentSpace);
-            }
-            if (!rootMotion)
-            {
-                physx::Dy::SpatialMatrix invInertia = cfLoadSM(&inr[0]).invertInertia();
-                const UnAlignedSpatialVector a0 = invInertia * cfLoadSV(&za[0]);
-                cfStoreSV(&cor[0], UnAlignedSpatialVector(-a0.top, -a0.bottom));
+                cfStoreSM(&inr[pl * 28], dySmAdd(cfLoadSM(&inr[pl * 28]), parentSpace));
             }
             for (uint32_t l = 1; l < linkCount; ++l)
             {
                 const uint32_t pl = cfParent(l);
                 const UnAlignedSpatialVector acc = FeatherstoneArticulation::translateSpatialVector(
-                    b2w(pl).p - b2w(l).p, cfLoadSV(&cor[pl * 6]));
+                    -linkRw(l), cfLoadSV(&cor[pl * 6]));
                 cfStoreSV(&cor[l * 6], acc);
                 cfStoreSV(&za[l * 6], cfLoadSM(&inr[l * 28]) * acc + cfLoadSV(&za[l * 6]));
             }
@@ -368,7 +372,7 @@ static void cfMirror(CfArena& W, bool rootMotion)
             const UnAlignedSpatialVector dm = motionVec(l, dof - jointOff(l)).rotate(b2w(l));
             out[dof + rootDof] = dm.innerProduct(cfLoadSV(&za[l * 6]));
         }
-        if (rootMotion && !fixBase)
+        if (!fixBase)
         {
             const UnAlignedSpatialVector z0 = cfLoadSV(&za[0]);
             out[0] = z0.top.x; out[1] = z0.top.y; out[2] = z0.top.z;
@@ -379,12 +383,12 @@ static void cfMirror(CfArena& W, bool rootMotion)
 
 // ---------------------------------------------------------------------------
 
-static size_t cfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
+static size_t cfRun(PxgCudaShim& shim, uint32_t salt)
 {
     CfArena A;
-    cfSeed(A, rootMotion, salt);
+    cfSeed(A, salt);
     CfArena W = A;
-    cfMirror(W, rootMotion);
+    cfMirror(W);
 
     std::vector<PxgDevicePtr> bufs;
     auto up = [&](const void* p, size_t n) {
@@ -405,6 +409,7 @@ static size_t cfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     PxgDevicePtr dIn = up(A.inertia.data(), A.inertia.size() * 4);
     PxgDevicePtr dMv = up(A.mvel.data(), A.mvel.size() * 4);
     PxgDevicePtr dCo = up(A.coriolis.data(), A.coriolis.size() * 4);
+    PxgDevicePtr dJp = up(A.jointPositions.data(), A.jointPositions.size() * 4);
 
     for (uint32_t r = 0; r < CF_NB_RECORDS; ++r)
     {
@@ -421,6 +426,7 @@ static size_t cfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
         put(CF_R_WORLD_INERTIA, uint64_t(dIn) + uint64_t(r) * CF_MAX_LINKS * 112u);
         put(CF_R_MOTION_VEL, uint64_t(dMv) + uint64_t(r) * CF_MAX_LINKS * 24u);
         put(CF_R_CORIOLIS, uint64_t(dCo) + uint64_t(r) * CF_MAX_LINKS * 24u);
+        put(CF_R_JOINT_POSITIONS, uint64_t(dJp) + uint64_t(r) * CF_MAX_DOFS * 4u);
     }
     PxgDevicePtr dRec = up(A.rec.data(), A.rec.size());
 
@@ -442,10 +448,10 @@ static size_t cfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     {
         uint32_t nb, pad0;
         uint64_t data, idx;
-        uint32_t maxDofs, rootWord;
+        uint32_t maxDofs, pad1;   // (5.6.1: the rootMotion bool sat in pad1)
         uint64_t rec;
     } prm = { CF_NB_JOBS, 0u, uint64_t(dOut), uint64_t(dIdx), CF_MAX_DOFS,
-              rootMotion ? 1u : 0u, uint64_t(dRec) };
+              0xABu, uint64_t(dRec) };
     PXG_CHECK_MSG(shim.launchKernel(0, (CF_NB_JOBS + 7) / 8, 1, 1, &prm, sizeof(prm)) ==
                       PxgResult::Success,
                   "launch computeArtiCentrifugalForces");
@@ -461,8 +467,8 @@ static size_t cfRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
             if (w[k] != g[k])
             {
                 if (bad < 10)
-                    std::printf("MM cf rm=%d %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
-                                rootMotion ? 1 : 0, name, k, w[k], want[k], g[k], got[k]);
+                    std::printf("MM cf salt=%u %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
+                                salt, name, k, w[k], want[k], g[k], got[k]);
                 ++bad;
             }
     };
@@ -503,7 +509,7 @@ PXG_TEST(artiCentrifugal)
     PXG_CHECK_MSG(nFixed > 2 && nFree > 2 && nAbove > 3 && nNeg > 3, "coverage hole");
 
     size_t bad = 0;
-    bad += cfRun(shim, true, 3);
-    bad += cfRun(shim, false, 7);
+    bad += cfRun(shim, 3);
+    bad += cfRun(shim, 7);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

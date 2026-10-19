@@ -75,18 +75,18 @@ static const uint64_t STATIC_ID = uint64_t(STATIC_NODE);
 // PxgArticulationBlockData / PxgArticulationBlockLinkData (pxgSlangArticulationBlocks.slang).
 static const uint32_t AB_BLOCK_SIZE = 7168u;
 static const uint32_t AB_mStateDirty = 7040u;            // PxU8[32]
-static const uint32_t AB_LINK_SIZE = 29184u;
+static const uint32_t AB_LINK_SIZE = 28416u;              // 5.12: no mBiasForce, no mJointAxis
 static const uint32_t AB_LINK_mScratchImpulse = 11776u;  // float4[32] top.xyz,bottom.x @+0, float2[32] bottom.yz @+512
 static const uint32_t AB_LINK_mSolverSpatialImpulse = 14080u;  // same block layout (5.12: also accumulated here)
 static const uint32_t AB_SVB_BYZ = 512u;
-static const uint32_t AB_LINK_mDeltaScale = 20992u;      // float[32]
+static const uint32_t AB_LINK_mDeltaScale = 20224u;      // float[32]
 static const uint8_t ARTI_STATE_HAS_IMPULSES = 2u;       // PxgArtiStateDirtyFlag::eHAS_IMPULSES
 
 // Descriptor mirrors (pxgSlangPrepDesc / pxgSlangSolverDesc / pxgSlangArticulationDesc).
 static const uint32_t SZ_PREPREP_DESC = 760u, OFF_SOLVER_BODY_INDICES = 272u;
 static const uint32_t SZ_CORE_DESC = 320u, OFF_NUM_SOLVER_BODIES = 268u, OFF_ACC_OFFSET = 276u;
 static const uint32_t SZ_SHARED_PGS = 224u, OFF_VEL_POOL = 160u;
-static const uint32_t SZ_ARTI_CORE_DESC = 352u, OFF_NB_ARTI = 44u, OFF_ARTI_BLOCKS = 128u,
+static const uint32_t SZ_ARTI_CORE_DESC = 344u, OFF_NB_ARTI = 44u, OFF_ARTI_BLOCKS = 128u,
                       OFF_LINK_BLOCKS = 136u, OFF_MAX_LINKS = 248u;
 
 static uint64_t rigidNode(uint32_t i) { return uint64_t(i); }

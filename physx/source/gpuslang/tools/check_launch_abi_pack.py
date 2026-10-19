@@ -875,6 +875,11 @@ def param_shape(p):
     p = _norm_type(p)
     if p in ("void", ""):
         return None, "void", None
+    if re.fullmatch(r"\w+(::\w+)*", p):
+        # an UNNAMED parameter, `const PxReal /*rigidContactBiasCoefficient*/` (5.12,
+        # internalConstraints2.cu): the comment is masked, the type alone is left.  It is
+        # pushed all the same, so it has a size; param_name gives it no name.
+        return param_shape(p + " __unnamed")
     m = re.match(r"^(.*?)(\w+)\s*(\[\s*\w*\s*\])?$", p)
     if not m or not m.group(1).strip():
         return None, p, None

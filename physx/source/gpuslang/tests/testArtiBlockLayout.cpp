@@ -113,7 +113,7 @@ static_assert(offsetof(PxgArticulationBlockData, mStateDirty) == 7040, "PXG_AB_m
 static_assert(offsetof(PxgArticulationBlockData, mTotalSelfConstraintCount) == 7072, "PXG_AB_mTotalSelfConstraintCount");
 static_assert(offsetof(PxgArticulationBlockData, mSelfConstraintOffset) == 7076, "PXG_AB_mSelfConstraintOffset");
 
-static_assert(sizeof(PxgArticulationBlockDofData) == 12800, "PXG_AB_DOF_SIZE");
+static_assert(sizeof(PxgArticulationBlockDofData) == 11648, "PXG_AB_DOF_SIZE");
 static_assert(offsetof(PxgArticulationBlockDofData, mJointPositions) == 0, "PXG_AB_DOF_mJointPositions");
 static_assert(offsetof(PxgArticulationBlockDofData, mJointVelocities) == 128, "PXG_AB_DOF_mJointVelocities");
 static_assert(offsetof(PxgArticulationBlockDofData, mJointUnconstrainedVelocities) == 256, "PXG_AB_DOF_mJointUnconstrainedVelocities");
@@ -127,14 +127,13 @@ static_assert(offsetof(PxgArticulationBlockDofData, mWorldMotionMatrix) == 1152,
 static_assert(offsetof(PxgArticulationBlockDofData, mLocalMotionMatrix) == 1920, "PXG_AB_DOF_mLocalMotionMatrix");
 static_assert(offsetof(PxgArticulationBlockDofData, mIsInvDW) == 2688, "PXG_AB_DOF_mIsInvDW");
 static_assert(offsetof(PxgArticulationBlockDofData, mIsW) == 3456, "PXG_AB_DOF_mIsW");
-static_assert(offsetof(PxgArticulationBlockDofData, mJointAxis) == 4224, "PXG_AB_DOF_mJointAxis");
-static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_x) == 4992, "PXG_AB_DOF_mInvStIsT_x");
-static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_y) == 5120, "PXG_AB_DOF_mInvStIsT_y");
-static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_z) == 5248, "PXG_AB_DOF_mInvStIsT_z");
-static_assert(offsetof(PxgArticulationBlockDofData, mDofIds) == 5376, "PXG_AB_DOF_mDofIds");
-static_assert(offsetof(PxgArticulationBlockDofData, mMotion) == 5408, "PXG_AB_DOF_mMotion");
-static_assert(offsetof(PxgArticulationBlockDofData, mConstraintData) == 5440, "PXG_AB_DOF_mConstraintData");
-static_assert(sizeof(PxgArticulationBlockLinkData) == 29184, "PXG_AB_LINK_SIZE");
+static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_x) == 4224, "PXG_AB_DOF_mInvStIsT_x");
+static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_y) == 4352, "PXG_AB_DOF_mInvStIsT_y");
+static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_z) == 4480, "PXG_AB_DOF_mInvStIsT_z");
+static_assert(offsetof(PxgArticulationBlockDofData, mDofIds) == 4608, "PXG_AB_DOF_mDofIds");
+static_assert(offsetof(PxgArticulationBlockDofData, mMotion) == 4640, "PXG_AB_DOF_mMotion");
+static_assert(offsetof(PxgArticulationBlockDofData, mConstraintData) == 4672, "PXG_AB_DOF_mConstraintData");
+static_assert(sizeof(PxgArticulationBlockLinkData) == 28416, "PXG_AB_LINK_SIZE");
 static_assert(sizeof(PxgSpatialMatrix6x6Block) == 4608, "PXG_AB_SPATIAL_MATRIX_6X6_BLOCK_SIZE");
 static_assert(offsetof(PxgArticulationBlockLinkData, mSpatialArticulatedInertia) == 0, "PXG_AB_LINK_mSpatialArticulatedInertia");
 static_assert(offsetof(PxgArticulationBlockLinkData, mSpatialResponseMatrix) == 3584, "PXG_AB_LINK_mSpatialResponseMatrix");
@@ -154,33 +153,32 @@ static_assert(offsetof(PxgArticulationBlockLinkData, mCoriolis) == 17152, "PXG_A
 static_assert(offsetof(PxgArticulationBlockLinkData, mConstraintForces) == 17920, "PXG_AB_LINK_mConstraintForces");
 static_assert(offsetof(PxgArticulationBlockLinkData, mMotionAcceleration) == 18688, "PXG_AB_LINK_mMotionAcceleration");
 static_assert(offsetof(PxgArticulationBlockLinkData, mMotionAccelerationInternal) == 19456, "PXG_AB_LINK_mMotionAccelerationInternal");
-static_assert(offsetof(PxgArticulationBlockLinkData, mBiasForce) == 20224, "PXG_AB_LINK_mBiasForce");
-static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaScale) == 20992, "PXG_AB_LINK_mDeltaScale");
-static_assert(offsetof(PxgArticulationBlockLinkData, mRw_x) == 21120, "PXG_AB_LINK_mRw_x");
-static_assert(offsetof(PxgArticulationBlockLinkData, mRw_y) == 21248, "PXG_AB_LINK_mRw_y");
-static_assert(offsetof(PxgArticulationBlockLinkData, mRw_z) == 21376, "PXG_AB_LINK_mRw_z");
-static_assert(offsetof(PxgArticulationBlockLinkData, mRelativeQuat) == 21504, "PXG_AB_LINK_mRelativeQuat");
-static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticContacts) == 22016, "PXG_AB_LINK_mNbStaticContacts");
-static_assert(offsetof(PxgArticulationBlockLinkData, mStaticContactStartIndex) == 22144, "PXG_AB_LINK_mStaticContactStartIndex");
-static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticJoints) == 22272, "PXG_AB_LINK_mNbStaticJoints");
-static_assert(offsetof(PxgArticulationBlockLinkData, mStaticJointStartIndex) == 22400, "PXG_AB_LINK_mStaticJointStartIndex");
-static_assert(offsetof(PxgArticulationBlockLinkData, mPreTransform) == 22528, "PXG_AB_LINK_mPreTransform");
-static_assert(offsetof(PxgArticulationBlockLinkData, mAccumulatedPose) == 23552, "PXG_AB_LINK_mAccumulatedPose");
-static_assert(offsetof(PxgArticulationBlockLinkData, mChildPose) == 24576, "PXG_AB_LINK_mChildPose");
-static_assert(offsetof(PxgArticulationBlockLinkData, mParentPose) == 25600, "PXG_AB_LINK_mParentPose");
-static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaQ) == 26624, "PXG_AB_LINK_mDeltaQ");
-static_assert(offsetof(PxgArticulationBlockLinkData, mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW) == 27136, "PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW");
-static_assert(offsetof(PxgArticulationBlockLinkData, mInvInertiaXYZ_invMassW) == 27648, "PXG_AB_LINK_mInvInertiaXYZ_invMassW");
-static_assert(offsetof(PxgArticulationBlockLinkData, mCfm) == 28160, "PXG_AB_LINK_mCfm");
-static_assert(offsetof(PxgArticulationBlockLinkData, mChildrenOffset) == 28288, "PXG_AB_LINK_mChildrenOffset");
-static_assert(offsetof(PxgArticulationBlockLinkData, mNumChildren) == 28416, "PXG_AB_LINK_mNumChildren");
-static_assert(offsetof(PxgArticulationBlockLinkData, mJointOffset) == 28544, "PXG_AB_LINK_mJointOffset");
-static_assert(offsetof(PxgArticulationBlockLinkData, mParents) == 28672, "PXG_AB_LINK_mParents");
-static_assert(offsetof(PxgArticulationBlockLinkData, mDofs) == 28800, "PXG_AB_LINK_mDofs");
-static_assert(offsetof(PxgArticulationBlockLinkData, mJointType) == 28832, "PXG_AB_LINK_mJointType");
-static_assert(offsetof(PxgArticulationBlockLinkData, mInvDofIds) == 28864, "PXG_AB_LINK_mInvDofIds");
-static_assert(offsetof(PxgArticulationBlockLinkData, mDisableGravity) == 29056, "PXG_AB_LINK_mDisableGravity");
-static_assert(offsetof(PxgArticulationBlockLinkData, mRetainsAcceleration) == 29088, "PXG_AB_LINK_mRetainsAcceleration");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaScale) == 20224, "PXG_AB_LINK_mDeltaScale");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_x) == 20352, "PXG_AB_LINK_mRw_x");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_y) == 20480, "PXG_AB_LINK_mRw_y");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_z) == 20608, "PXG_AB_LINK_mRw_z");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRelativeQuat) == 20736, "PXG_AB_LINK_mRelativeQuat");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticContacts) == 21248, "PXG_AB_LINK_mNbStaticContacts");
+static_assert(offsetof(PxgArticulationBlockLinkData, mStaticContactStartIndex) == 21376, "PXG_AB_LINK_mStaticContactStartIndex");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticJoints) == 21504, "PXG_AB_LINK_mNbStaticJoints");
+static_assert(offsetof(PxgArticulationBlockLinkData, mStaticJointStartIndex) == 21632, "PXG_AB_LINK_mStaticJointStartIndex");
+static_assert(offsetof(PxgArticulationBlockLinkData, mPreTransform) == 21760, "PXG_AB_LINK_mPreTransform");
+static_assert(offsetof(PxgArticulationBlockLinkData, mAccumulatedPose) == 22784, "PXG_AB_LINK_mAccumulatedPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mChildPose) == 23808, "PXG_AB_LINK_mChildPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mParentPose) == 24832, "PXG_AB_LINK_mParentPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaQ) == 25856, "PXG_AB_LINK_mDeltaQ");
+static_assert(offsetof(PxgArticulationBlockLinkData, mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW) == 26368, "PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW");
+static_assert(offsetof(PxgArticulationBlockLinkData, mInvInertiaXYZ_invMassW) == 26880, "PXG_AB_LINK_mInvInertiaXYZ_invMassW");
+static_assert(offsetof(PxgArticulationBlockLinkData, mCfm) == 27392, "PXG_AB_LINK_mCfm");
+static_assert(offsetof(PxgArticulationBlockLinkData, mChildrenOffset) == 27520, "PXG_AB_LINK_mChildrenOffset");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNumChildren) == 27648, "PXG_AB_LINK_mNumChildren");
+static_assert(offsetof(PxgArticulationBlockLinkData, mJointOffset) == 27776, "PXG_AB_LINK_mJointOffset");
+static_assert(offsetof(PxgArticulationBlockLinkData, mParents) == 27904, "PXG_AB_LINK_mParents");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDofs) == 28032, "PXG_AB_LINK_mDofs");
+static_assert(offsetof(PxgArticulationBlockLinkData, mJointType) == 28064, "PXG_AB_LINK_mJointType");
+static_assert(offsetof(PxgArticulationBlockLinkData, mInvDofIds) == 28096, "PXG_AB_LINK_mInvDofIds");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDisableGravity) == 28288, "PXG_AB_LINK_mDisableGravity");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRetainsAcceleration) == 28320, "PXG_AB_LINK_mRetainsAcceleration");
 static_assert(sizeof(PxgArticulationLink) == 80, "PXG_ARTI_LINK_SIZE");
 static_assert(offsetof(PxgArticulationLink, initialAngVel) == 0, "PXG_AR_LINK_initialAngVel");
 static_assert(offsetof(PxgArticulationLink, penBiasClamp) == 12, "PXG_AR_LINK_penBiasClamp");
@@ -200,33 +198,30 @@ static_assert(offsetof(PxgArticulationLink, disableGravity) == 76, "PXG_AR_LINK_
 static_assert(offsetof(PxgArticulationLink, retainsAccelerations) == 77, "PXG_AR_LINK_retainsAccelerations");
 static_assert(offsetof(PxgArticulationLink, cfmScale) == 72, "PXG_AR_LINK_cfmScale");
 
-static_assert(sizeof(Dy::ArticulationJointCore) == 544, "PXG_AR_JOINT_CORE_SIZE");
+static_assert(sizeof(Dy::ArticulationJointCore) == 512, "PXG_AR_JOINT_CORE_SIZE");
 static_assert(offsetof(Dy::ArticulationJointCore, parentPose) == 0, "PXG_AR_JOINT_parentPose");
 static_assert(offsetof(Dy::ArticulationJointCore, childPose) == 28, "PXG_AR_JOINT_childPose");
 static_assert(offsetof(Dy::ArticulationJointCore, limits) == 56, "PXG_AR_JOINT_limits");
 static_assert(offsetof(Dy::ArticulationJointCore, drives) == 104, "PXG_AR_JOINT_drives");
-static_assert(offsetof(Dy::ArticulationJointCore, targetP) == 296, "PXG_AR_JOINT_targetP");
-static_assert(offsetof(Dy::ArticulationJointCore, targetV) == 320, "PXG_AR_JOINT_targetV");
-static_assert(offsetof(Dy::ArticulationJointCore, armature) == 344, "PXG_AR_JOINT_armature");
-static_assert(offsetof(Dy::ArticulationJointCore, frictionParams) == 420, "PXG_AR_JOINT_frictionParams");
-static_assert(offsetof(Dy::ArticulationJointCore, maxJointVelocity) == 492, "PXG_AR_JOINT_maxJointVelocity");
-static_assert(offsetof(Dy::ArticulationJointCore, jointPos) == 368, "PXG_AR_JOINT_jointPos");
-static_assert(offsetof(Dy::ArticulationJointCore, jointVel) == 392, "PXG_AR_JOINT_jointVel");
-static_assert(offsetof(Dy::ArticulationJointCore, dofIds) == 520, "PXG_AR_JOINT_dofIds");
-static_assert(offsetof(Dy::ArticulationJointCore, invDofIds) == 532, "PXG_AR_JOINT_invDofIds");
-static_assert(offsetof(Dy::ArticulationJointCore, motion) == 526, "PXG_AR_JOINT_motion");
-static_assert(offsetof(Dy::ArticulationJointCore, frictionCoefficient) == 416, "PXG_AR_JOINT_frictionCoefficient");
-static_assert(offsetof(Dy::ArticulationJointCore, jointOffset) == 516, "PXG_AR_JOINT_jointOffset");
-static_assert(offsetof(Dy::ArticulationJointCore, jCalcUpdateFrames) == 538, "PXG_AR_JOINT_jCalcUpdateFrames");
-static_assert(offsetof(Dy::ArticulationJointCore, jointType) == 539, "PXG_AR_JOINT_jointType");
-static_assert(sizeof(PxArticulationDrive) == 32, "PXG_AR_DRIVE_SIZE");
+static_assert(offsetof(Dy::ArticulationJointCore, targetP) == 272, "PXG_AR_JOINT_targetP");
+static_assert(offsetof(Dy::ArticulationJointCore, targetV) == 296, "PXG_AR_JOINT_targetV");
+static_assert(offsetof(Dy::ArticulationJointCore, armature) == 320, "PXG_AR_JOINT_armature");
+static_assert(offsetof(Dy::ArticulationJointCore, frictionParams) == 392, "PXG_AR_JOINT_frictionParams");
+static_assert(offsetof(Dy::ArticulationJointCore, maxJointVelocity) == 464, "PXG_AR_JOINT_maxJointVelocity");
+static_assert(offsetof(Dy::ArticulationJointCore, jointPos) == 344, "PXG_AR_JOINT_jointPos");
+static_assert(offsetof(Dy::ArticulationJointCore, jointVel) == 368, "PXG_AR_JOINT_jointVel");
+static_assert(offsetof(Dy::ArticulationJointCore, dofIds) == 488, "PXG_AR_JOINT_dofIds");
+static_assert(offsetof(Dy::ArticulationJointCore, invDofIds) == 500, "PXG_AR_JOINT_invDofIds");
+static_assert(offsetof(Dy::ArticulationJointCore, motion) == 494, "PXG_AR_JOINT_motion");
+static_assert(offsetof(Dy::ArticulationJointCore, jCalcUpdateFrames) == 506, "PXG_AR_JOINT_jCalcUpdateFrames");
+static_assert(offsetof(Dy::ArticulationJointCore, jointType) == 507, "PXG_AR_JOINT_jointType");
+static_assert(sizeof(PxArticulationDrive) == 28, "PXG_AR_DRIVE_SIZE");
 static_assert(sizeof(PxArticulationLimit) == 8, "PXG_AR_LIMIT_SIZE");
 static_assert(sizeof(PxJointFrictionParams) == 12, "PXG_AR_FRICTION_SIZE");
 static_assert(offsetof(PxArticulationDrive, stiffness) == 0, "PXG_AR_DRIVE_stiffness");
 static_assert(offsetof(PxArticulationDrive, damping) == 4, "PXG_AR_DRIVE_damping");
-static_assert(offsetof(PxArticulationDrive, maxForce) == 8, "PXG_AR_DRIVE_maxForce");
-static_assert(offsetof(PxArticulationDrive, envelope) == 12, "PXG_AR_DRIVE_envelope");
-static_assert(offsetof(PxArticulationDrive, driveType) == 28, "PXG_AR_DRIVE_driveType");
+static_assert(offsetof(PxArticulationDrive, envelope) == 8, "PXG_AR_DRIVE_envelope");
+static_assert(offsetof(PxArticulationDrive, driveType) == 24, "PXG_AR_DRIVE_driveType");
 static_assert(sizeof(PxPerformanceEnvelope) == 16, "PXG_AR_ENV_SIZE");
 static_assert(offsetof(PxPerformanceEnvelope, maxEffort) == 0, "PXG_AR_ENV_maxEffort");
 static_assert(offsetof(PxPerformanceEnvelope, maxActuatorVelocity) == 4, "PXG_AR_ENV_maxActuatorVelocity");
@@ -242,7 +237,7 @@ static_assert(sizeof(Dy::ArticulationJointCoreData) == 8, "PXG_AR_JOINT_CORE_DAT
 static_assert(sizeof(Dy::ArticulationJointCoreData::nbDof) == 1, "nbDof is a byte");
 static_assert(offsetof(Dy::ArticulationJointCoreData, nbDof) == 4, "PXG_AR_JCD_nbDof");
 static_assert(offsetof(Dy::ArticulationJointCoreData, jointOffset) == 0, "PXG_AR_JCD_jointOffset");
-static_assert(sizeof(PxgArticulationInternalConstraintData) == 7296, "PXG_AB_IC_SIZE");
+static_assert(sizeof(PxgArticulationInternalConstraintData) == 6912, "PXG_AB_IC_SIZE");
 static_assert(offsetof(PxgArticulationInternalConstraintData, mRow0) == 0, "PXG_AB_IC_mRow0");
 static_assert(offsetof(PxgArticulationInternalConstraintData, mRow1) == 768, "PXG_AB_IC_mRow1");
 static_assert(offsetof(PxgArticulationInternalConstraintData, mDeltaVA) == 1536, "PXG_AB_IC_mDeltaVA");
@@ -255,36 +250,32 @@ static_assert(offsetof(PxgArticulationInternalConstraintData, mHighImpulse) == 3
 static_assert(offsetof(PxgArticulationInternalConstraintData, mLowImpulse) == 3968, "PXG_AB_IC_mLowImpulse");
 static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxJointVelocity) == 4096, "PXG_AB_IC_mMaxJointVelocity");
 static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveImpulse) == 4224, "PXG_AB_IC_mDriveImpulse");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mConstraintMaxImpulse) == 4352, "PXG_AB_IC_mConstraintMaxImpulse");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxForce) == 4480, "PXG_AB_IC_mMaxForce");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveType) == 4608, "PXG_AB_IC_mDriveType");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxEffort) == 4736, "PXG_AB_IC_mMaxEffort");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxActuatorVelocity) == 4864, "PXG_AB_IC_mMaxActuatorVelocity");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mVelocityDependentResistance) == 4992, "PXG_AB_IC_mVelocityDependentResistance");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mSpeedEffortGradient) == 5120, "PXG_AB_IC_mSpeedEffortGradient");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetPos) == 5248, "PXG_AB_IC_mDriveTargetPos");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mArmature) == 5376, "PXG_AB_IC_mArmature");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW) == 5504, "PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveStiffness) == 6016, "PXG_AB_IC_mDriveStiffness");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDamping) == 6144, "PXG_AB_IC_mDamping");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetVel) == 6272, "PXG_AB_IC_mDriveTargetVel");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetPosBias) == 6400, "PXG_AB_IC_mTargetPosBias");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mAccumulatedFrictionImpulse) == 6528, "PXG_AB_IC_mAccumulatedFrictionImpulse");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxFrictionForce) == 6656, "PXG_AB_IC_mMaxFrictionForce");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mFrictionCoefficient) == 6784, "PXG_AB_IC_mFrictionCoefficient");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mStaticFrictionEffort) == 6912, "PXG_AB_IC_mStaticFrictionEffort");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mDynamicFrictionEffort) == 7040, "PXG_AB_IC_mDynamicFrictionEffort");
-static_assert(offsetof(PxgArticulationInternalConstraintData, mViscousFrictionCoefficient) == 7168, "PXG_AB_IC_mViscousFrictionCoefficient");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveType) == 4352, "PXG_AB_IC_mDriveType");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxEffort) == 4480, "PXG_AB_IC_mMaxEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxActuatorVelocity) == 4608, "PXG_AB_IC_mMaxActuatorVelocity");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mVelocityDependentResistance) == 4736, "PXG_AB_IC_mVelocityDependentResistance");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mSpeedEffortGradient) == 4864, "PXG_AB_IC_mSpeedEffortGradient");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mExternalEffort) == 4992, "PXG_AB_IC_mExternalEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetPos) == 5120, "PXG_AB_IC_mDriveTargetPos");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mArmature) == 5248, "PXG_AB_IC_mArmature");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW) == 5376, "PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveStiffness) == 5888, "PXG_AB_IC_mDriveStiffness");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDamping) == 6016, "PXG_AB_IC_mDamping");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetVel) == 6144, "PXG_AB_IC_mDriveTargetVel");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetPosBias) == 6272, "PXG_AB_IC_mTargetPosBias");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mAccumulatedFrictionImpulse) == 6400, "PXG_AB_IC_mAccumulatedFrictionImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mStaticFrictionEffort) == 6528, "PXG_AB_IC_mStaticFrictionEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDynamicFrictionEffort) == 6656, "PXG_AB_IC_mDynamicFrictionEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mViscousFrictionCoefficient) == 6784, "PXG_AB_IC_mViscousFrictionCoefficient");
 
 static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_AR_SUBSPACE_SIZE");
 static_assert(offsetof(Dy::SpatialSubspaceMatrix, columns) == 0, "PXG_AR_SUBSPACE_COLUMNS");
 static_assert(sizeof(Cm::UnAlignedSpatialVector) == 24, "PXG_AR_SPATIAL_VECTOR_SIZE");
-static_assert(offsetof(PxgArticulation, jointAxis) == 232, "PXG_ARTI_jointAxis");
-static_assert(offsetof(PxgArticulation, motionMatrix) == 216, "PXG_ARTI_motionMatrix");
-static_assert(offsetof(PxgArticulation, relativeQuat) == 280, "PXG_ARTI_relativeQuat");
-static_assert(offsetof(PxgArticulation, jointOffsets) == 160, "PXG_ARTI_jointOffsets");
-static_assert(offsetof(PxgArticulation, cfmScale) == 344, "PXG_ARTI_cfmScale");
-static_assert(offsetof(PxgArticulation, cfms) == 336, "PXG_ARTI_cfms");
+static_assert(offsetof(PxgArticulation, motionMatrix) == 208, "PXG_ARTI_motionMatrix");
+static_assert(offsetof(PxgArticulation, relativeQuat) == 264, "PXG_ARTI_relativeQuat");
+static_assert(offsetof(PxgArticulation, jointOffsets) == 152, "PXG_ARTI_jointOffsets");
+static_assert(offsetof(PxgArticulation, cfmScale) == 328, "PXG_ARTI_cfmScale");
+static_assert(offsetof(PxgArticulation, cfms) == 320, "PXG_ARTI_cfms");
 static_assert(offsetof(PxgArticulationData, flags) == 26, "PXG_ARTI_DATA_FLAGS");
 static_assert(offsetof(PxgArticulationData, confiDirty) == 27, "PXG_ARTI_DATA_CONFI_DIRTY");
 static_assert(offsetof(PxgArticulationData, updateDirty) == 12, "PXG_ARTI_DATA_UPDATE_DIRTY");
@@ -480,13 +471,13 @@ PXG_TEST(artiBlockLayout)
                                                       sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
             K.mIsolatedInertia.mCol2[l] = sentF32(e, l, f++);
             K.mMass[l] = sentF32(e, l, f++);
-            PxgSpatialVectorBlock* sv[15] = {
+            PxgSpatialVectorBlock* sv[14] = {
                 &K.mMotionVelocity, &K.mPosMotionVelocity, &K.mDeltaMotion, &K.mScratchImpulse,
                 &K.mScratchDeltaV, &K.mSolverSpatialDeltaVel, &K.mSolverSpatialImpulse,
                 &K.mSolverSpatialInternalConstraintImpulse, &K.mZAVector, &K.mZAIntVector,
                 &K.mCoriolis, &K.mConstraintForces, &K.mMotionAcceleration,
-                &K.mMotionAccelerationInternal, &K.mBiasForce };
-            for (uint32_t v = 0; v < 15; ++v)
+                &K.mMotionAccelerationInternal };
+            for (uint32_t v = 0; v < 14; ++v)
             {
                 sv[v]->mTopxyz_bx[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
                                                    sentF32(e, l, f + 2), sentF32(e, l, f + 3));
@@ -601,9 +592,9 @@ PXG_TEST(artiBlockLayout)
             D.mInvStIsT_z[l] = sentF32(e, l, f++);
             D.mDofIds[l] = PxU8(0x10u + e * 8u + l % 8u);
             D.mMotion[l] = PxU8(0x90u + e * 8u + l % 8u);
-            PxgSpatialVectorBlock* svb[5] = { &D.mWorldMotionMatrix, &D.mLocalMotionMatrix,
-                                              &D.mIsInvDW, &D.mIsW, &D.mJointAxis };
-            for (uint32_t k = 0; k < 5; ++k)
+            PxgSpatialVectorBlock* svb[4] = { &D.mWorldMotionMatrix, &D.mLocalMotionMatrix,
+                                              &D.mIsInvDW, &D.mIsW };
+            for (uint32_t k = 0; k < 4; ++k)
             {
                 svb[k]->mTopxyz_bx[l] = make_float4(sentF32(e, l, 130 + k * 6), sentF32(e, l, 131 + k * 6),
                                                     sentF32(e, l, 132 + k * 6), sentF32(e, l, 133 + k * 6));
@@ -627,13 +618,12 @@ PXG_TEST(artiBlockLayout)
             C.mLowImpulse[l] = sentF32(e, l, g++);
             C.mMaxJointVelocity[l] = sentF32(e, l, g++);
             C.mDriveImpulse[l] = sentF32(e, l, g++);
-            C.mConstraintMaxImpulse[l] = sentF32(e, l, g++);
-            C.mMaxForce[l] = sentF32(e, l, g++);
             C.mDriveType[l] = sentU32(e, l, g++);   // the one PxU32 in the run
             C.mMaxEffort[l] = sentF32(e, l, g++);
             C.mMaxActuatorVelocity[l] = sentF32(e, l, g++);
             C.mVelocityDependentResistance[l] = sentF32(e, l, g++);
             C.mSpeedEffortGradient[l] = sentF32(e, l, g++);
+            C.mExternalEffort[l] = sentF32(e, l, g++);
             C.mDriveTargetPos[l] = sentF32(e, l, g++);
             C.mArmature[l] = sentF32(e, l, g++);
             C.mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW[l] =
@@ -644,8 +634,6 @@ PXG_TEST(artiBlockLayout)
             C.mDriveTargetVel[l] = sentF32(e, l, g++);
             C.mTargetPosBias[l] = sentF32(e, l, g++);
             C.mAccumulatedFrictionImpulse[l] = sentF32(e, l, g++);
-            C.mMaxFrictionForce[l] = sentF32(e, l, g++);
-            C.mFrictionCoefficient[l] = sentF32(e, l, g++);
             C.mStaticFrictionEffort[l] = sentF32(e, l, g++);
             C.mDynamicFrictionEffort[l] = sentF32(e, l, g++);
             C.mViscousFrictionCoefficient[l] = sentF32(e, l, g++);
@@ -698,8 +686,6 @@ PXG_TEST(artiBlockLayout)
             J.motion[a] = PxU8(0x60u + a * 2u + e);
             J.invDofIds[a] = PxU8(0x90u + a * 2u + e);
         }
-        J.frictionCoefficient = sentF32(e, 0, 490);
-        J.jointOffset = sentU32(e, 0, 491);
         J.jointType = PxU8(2u + e);
 
         recJointData[e].jointOffset = sentU32(e, 0, 492);
@@ -761,8 +747,7 @@ PXG_TEST(artiBlockLayout)
     expect.push_back(bits(D.mLocalMotionMatrix.mTopxyz_bx[LANE].x));
     expect.push_back(bits(D.mIsInvDW.mTopxyz_bx[LANE].x));
     expect.push_back(bits(D.mIsW.mTopxyz_bx[LANE].x));
-    expect.push_back(bits(D.mJointAxis.mTopxyz_bx[LANE].x));
-    expect.push_back(bits(D.mJointAxis.mbyz[LANE].y));
+    expect.push_back(bits(D.mIsW.mbyz[LANE].y));
     {
         const PxgArticulationInternalConstraintData& C = D.mConstraintData;
         expect.push_back(sizeof(PxgArticulationInternalConstraintData));
@@ -780,13 +765,12 @@ PXG_TEST(artiBlockLayout)
         expect.push_back(bits(C.mLowImpulse[LANE]));
         expect.push_back(bits(C.mMaxJointVelocity[LANE]));
         expect.push_back(bits(C.mDriveImpulse[LANE]));
-        expect.push_back(bits(C.mConstraintMaxImpulse[LANE]));
-        expect.push_back(bits(C.mMaxForce[LANE]));
         expect.push_back(C.mDriveType[LANE]);
         expect.push_back(bits(C.mMaxEffort[LANE]));
         expect.push_back(bits(C.mMaxActuatorVelocity[LANE]));
         expect.push_back(bits(C.mVelocityDependentResistance[LANE]));
         expect.push_back(bits(C.mSpeedEffortGradient[LANE]));
+        expect.push_back(bits(C.mExternalEffort[LANE]));
         expect.push_back(bits(C.mDriveTargetPos[LANE]));
         expect.push_back(bits(C.mArmature[LANE]));
         expect.push_back(bits(C.mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW[LANE].x));
@@ -796,8 +780,6 @@ PXG_TEST(artiBlockLayout)
         expect.push_back(bits(C.mDriveTargetVel[LANE]));
         expect.push_back(bits(C.mTargetPosBias[LANE]));
         expect.push_back(bits(C.mAccumulatedFrictionImpulse[LANE]));
-        expect.push_back(bits(C.mMaxFrictionForce[LANE]));
-        expect.push_back(bits(C.mFrictionCoefficient[LANE]));
         expect.push_back(bits(C.mStaticFrictionEffort[LANE]));
         expect.push_back(bits(C.mDynamicFrictionEffort[LANE]));
         expect.push_back(bits(C.mViscousFrictionCoefficient[LANE]));
@@ -819,15 +801,15 @@ PXG_TEST(artiBlockLayout)
     expect.push_back(bits(K.mIsolatedInertia.mCol1[LANE].w));
     expect.push_back(bits(K.mMass[LANE]));
     {
-        const PxgSpatialVectorBlock* sv[15] = {
+        const PxgSpatialVectorBlock* sv[14] = {
             &K.mMotionVelocity, &K.mPosMotionVelocity, &K.mDeltaMotion, &K.mScratchImpulse,
             &K.mScratchDeltaV, &K.mSolverSpatialDeltaVel, &K.mSolverSpatialImpulse,
             &K.mSolverSpatialInternalConstraintImpulse, &K.mZAVector, &K.mZAIntVector,
             &K.mCoriolis, &K.mConstraintForces, &K.mMotionAcceleration,
-            &K.mMotionAccelerationInternal, &K.mBiasForce };
+            &K.mMotionAccelerationInternal };
         // the probe cycles top.x/y/z then bottom.x/y/z; bottom is (w, byz.x, byz.y)
-        const int comp[15] = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2 };
-        for (uint32_t v = 0; v < 15; ++v)
+        const int comp[14] = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1 };
+        for (uint32_t v = 0; v < 14; ++v)
         {
             const float4 t = sv[v]->mTopxyz_bx[LANE];
             const float2 b = sv[v]->mbyz[LANE];
@@ -892,8 +874,6 @@ PXG_TEST(artiBlockLayout)
         expect.push_back(bits(J.maxJointVelocity[4]));
         expect.push_back(bits(J.jointPos[4]));
         expect.push_back(bits(J.jointVel[4]));
-        expect.push_back(bits(J.frictionCoefficient));
-        expect.push_back(J.jointOffset);
         expect.push_back(J.dofIds[4]);
         expect.push_back(J.motion[4]);
         expect.push_back(J.invDofIds[4]);

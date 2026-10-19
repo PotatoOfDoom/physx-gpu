@@ -34,12 +34,12 @@
 // Engineered lanes (coverage-asserted below rather than hoped for):
 //   lane 2   PIN A: isGreater2 TRUE and cTargetVel == -1 exactly
 //            (normal (1,0,0), targetVel (-1,0,0), b0 dyn linVel (-3,0,0),
-//            b1 static).  tvCond == 0 -> the :837 precedence quirk yields
-//            targetVelocity 0 where the "fixed" parenthesized form yields
-//            -1 + 1.5 = 0.5.  Asserted via the mirror's own output.
+//            b1 static).  5.12 parenthesized the 5.6.1 :837 precedence quirk
+//            (which gave targetVelocity 0 here): -1 + 1.5 = 0.5.  Asserted via
+//            the mirror's own output.
 //   lane 5   PIN B: isGreater2 FALSE and cTargetVel = 0.5 != 0 (b0 dyn
-//            linVel (+1,0,0), separating).  Quirk yields (-vrel)*rest =
-//            -0.4 where the fixed form yields 0.5.  Asserted == -0.4.
+//            linVel (+1,0,0), separating).  5.12 yields cTargetVel = 0.5 (the
+//            5.6.1 quirk gave (-vrel)*rest = -0.4).  Asserted == 0.5.
 //   lane 7   PIN C: linNorVel == 0 EXACTLY with angNorVel != 0 (b0
 //            kinematic linVel (0,2,0) against normal (1,0,0), b1 static)
 //            -- the division guard in the slop scale.
@@ -47,10 +47,11 @@
 //            ~ +3.6 -> slop scale ~360, so raXn components far above the
 //            raw solverOffsetSlop still get zeroed.
 // Per-lane variation: contactCount 0(early-out)/1..3, aCount lane%3,
-// perPointFriction (lane>>1)&1, restitution by lane%7 incl. compliant
+// hasTargetVelocity (lane>>1)&1, disableStrongFriction lane%5==1,
+// restitution by lane%7 incl. compliant
 // (negative, both accel-spring flag states) and 1e-6 (below the arti
 // path's 1e-5 threshold).  Two rounds: A with torsional data + bias 0.9
-// (p8 clamps to 0.8), B with torsional (0,0) + bias 0.5.
+// (5.12: used as is, no 0.8 clamp), B with torsional (0,0) + bias 0.5.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -92,7 +93,7 @@ static std::vector<uint8_t> acsLoader(const char* file) { return loadShaderBlob(
 const uint32_t ACS_LANES = 26;
 const uint32_t ACS_NB_ARTI = 6;
 const uint32_t ACS_NB_RIGID = 16;
-const uint32_t ACS_REC_SIZE = 544;
+const uint32_t ACS_REC_SIZE = 496;
 const uint32_t ACS_MAX_CONTACTS = 3;
 const uint32_t ACS_FRICTION_ROWS = 4;   // 2 anchors x 2 tangents; torsional reuses row 2
 const uint32_t ACS_RESP_ROWS = 8;       // max 3 contacts + 4 frictions (+1 slack)
@@ -316,8 +317,12 @@ PXG_TEST(artiConstraintPrepSetup)
         cd.contactData[lane].staticFriction = 0.6f + 0.2f * std::fabs(av(lane, 215));
         cd.contactData[lane].dynamicFriction = 0.4f + 0.2f * std::fabs(av(lane, 216));
         cd.contactData[lane].mNumContacts = PxU8(lane + 1u);          // distinct bytes so a
-        cd.contactData[lane].mSolverFlags =                            // wrong-byte unpack shows
-            PxU8(((lane & 1u) ? 8u : 0u) | ((lane & 4u) ? 1u : 0u)); // bit 3 = accel spring
+        // 5.12 bits: 16 = accel spring, 2 = eHAS_TARGET_VELOCITY (the friction anchor
+        // row index; 5.6.1 keyed it on perPointFriction), 4 = eDISABLE_STRONG_FRICTION
+        // (zero friction bias); distinct bytes so a wrong-byte unpack shows
+        cd.contactData[lane].mSolverFlags =
+            PxU8(((lane & 1u) ? 16u : 0u) | ((lane & 4u) ? 1u : 0u)
+                 | ((((lane >> 1) & 1u) != 0u) ? 2u : 0u) | ((lane % 5u == 1u) ? 4u : 0u));
         cd.contactData[lane].prevFrictionPatchCount = PxU8(lane + 7u);
         cd.damping[lane] = 20.0f + float(lane);
 
@@ -469,11 +474,11 @@ PXG_TEST(artiConstraintPrepSetup)
             const uint32_t written = refSetupExtContactsTGS(
                 cd, contacts.data(), cc, fp, fa, b0, b1,
                 rd.invDt, rd.stepDt, rd.invTotalDt, rd.bounceThreshold, rd.biasCoefficient,
-                lane, wboff, ppf, wantCh, wantFh, wantCp.data(), wantFr.data(), wantRs.data(),
+                lane, wboff, wantCh, wantFh, wantCp.data(), wantFr.data(), wantRs.data(),
                 cd.contactData[lane], rd.solverOffsetSlop, tors, rd.totalDt);
             wantIo[lane * 4u + 0u] = cc;
             wantIo[lane * 4u + 1u] = wboff;
-            wantIo[lane * 4u + 2u] = ppf ? 1u : 0u;
+            wantIo[lane * 4u + 2u] = ppf ? 1u : 0u;   // (unused by the 5.12 entry; round-trips)
             wantIo[lane * 4u + 3u] = written;
 
             // coverage bookkeeping (recomputed, NOT an oracle)
@@ -505,10 +510,10 @@ PXG_TEST(artiConstraintPrepSetup)
         }
 
         // the engineered pins, asserted through the mirror's own numbers:
-        // PIN A: tvCond == 0 exactly -> targetVelocity 0 (the quirk arm)
-        PXG_CHECK_MSG(wantCp[0].rbXn_targetVelW[2].w == 0.0f, "PIN A quirk arm");
-        // PIN B: no bounce, cTargetVel 0.5 -> quirk yields (-1)*0.4
-        PXG_CHECK_MSG(wantCp[0].rbXn_targetVelW[5].w == -0.4f, "PIN B quirk arm");
+        // PIN A: bounce with cTargetVel -1 -> -1 + (-vrel)*rest = -1 + 1.5 (5.12)
+        PXG_CHECK_MSG(wantCp[0].rbXn_targetVelW[2].w == 0.5f, "PIN A bounce + target");
+        // PIN B: no bounce, cTargetVel 0.5 -> 0.5 + 0 (5.12)
+        PXG_CHECK_MSG(wantCp[0].rbXn_targetVelW[5].w == 0.5f, "PIN B target only");
         // PIN E: bounce with cTargetVel 0 -> tvCond 1 -> (-vrel)*rest = 2*0.9
         PXG_CHECK_MSG(wantCp[0].rbXn_targetVelW[13].w == 2.0f * 0.9f, "PIN E bounce tv");
         // PIN D: bounce conditions hold but restitution 1e-6 stays sub-threshold

@@ -71,10 +71,10 @@
 //     the compiler's benefit.
 //  9. The spatial axis guards are `distance > 0.001f`, not > 0.
 // 10. FIXED root branch: angular tjAxis (< eX(3)) gives sAxis = 0, sRaXn =
-//     worldMotion.top; linear gives the FULL transform compose
-//     (sBody2World.transform(parentPose)) and ang0 = (cA2w.p - sBody2World.p)
-//     x worldMotion.bottom.  The per-joint branch uses cBody2World and
-//     mChildPose the same way.
+//     worldMotion.top; linear gives ang0 = sBody2World.q.rotate(parentPose.p)
+//     x worldMotion.bottom (5.12; 5.6.1 composed the full transform and
+//     subtracted sBody2World.p).  The per-joint branch uses cBody2World.q and
+//     mChildPose.p the same way.
 // 11. The fixed root's sBody2World is loaded ONCE from tendon joint 0's link
 //     before the loop, even though the per-joint branch reloads cLink's pose.
 // 12. FIXED reads the dof through mInvDofIds[tjAxis] (a 6x32 PxU8 table,
@@ -89,9 +89,10 @@
 //     P8.97a negates only impulse1).
 //
 // The tendon scalar family (a, x, velMultiplier, biasCoefficient, the TGS
-// impulse-multiplier select) is spelled inline exactly as the CUDA spells
-// it -- it is NOT the joint-drive family lifted in P8.97a (different guard:
-// unitResponse > 0 on x, stepDt everywhere, no simDt bias).
+// impulse-multiplier select) is computeTendonSpringParams since 5.12
+// (adComputeTendonSpringParams, same expressions as the 5.6.1 inline
+// spelling) -- it is NOT the joint-drive family lifted in P8.97a (different
+// guard: unitResponse > 0 on x, stepDt everywhere, no simDt bias).
 
 import pxgSlangCommon;
 import pxgSlangArticulationBlocks;
@@ -110,6 +111,16 @@ uint stHighestBit(uint64_t v)
 {
     const uint hi = uint(v >> 32);
     return hi != 0u ? 32u + firstbithigh(hi) : firstbithigh(uint(v));
+}
+
+// PxgArticulationInternalTendonConstraintData::setTendonImplicitSpringParams (5.12)
+void stStoreSpringParams(uint64_t constraint, uint lane, AdTendonSpringParams p)
+{
+    abStoreF32(constraint, PXG_AB_ITC_mBiasCoefficient, lane, p.biasCoefficient);
+    abStoreF32(constraint, PXG_AB_ITC_mVelMultiplier, lane, p.velMultiplier);
+    abStoreF32(constraint, PXG_AB_ITC_mImpulseMultiplier, lane, p.impulseMultiplier);
+    abStoreF32(constraint, PXG_AB_ITC_mLimitBiasCoefficient, lane, p.limitBiasCoefficient);
+    abStoreF32(constraint, PXG_AB_ITC_mLimitImpulseMultiplier, lane, p.limitImpulseMultiplier);
 }
 
 AbSpatialVector stLoadSV(uint64_t base, uint fieldOffset, uint lane)
@@ -584,27 +595,16 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
 
                 abStoreF32(constraint, PXG_AB_ITC_mRecipResponse, lane, recipResponse);
 
-                const float a = stepDt * (stepDt * stiffness + damping);
-                const float a2 = stepDt * (stepDt * limitStiffness + damping);
-                const float x = unitResponse > 0.0f ? 1.0f / (1.0f + a * unitResponse) : 0.0f;
-                const float x2 = unitResponse > 0.0f ? 1.0f / (1.0f + a2 * unitResponse) : 0.0f;
-
-                abStoreF32(constraint, PXG_AB_ITC_mVelMultiplier, lane, -x * a);
-                abStoreF32(constraint, PXG_AB_ITC_mImpulseMultiplier, lane,
-                           isTGSSolver ? 1.0f : 1.0f - x);
-                abStoreF32(constraint, PXG_AB_ITC_mBiasCoefficient, lane,
-                           -stiffness * x * stepDt);
+                // 5.12: setTendonImplicitSpringParams(computeTendonSpringParams(...))
+                stStoreSpringParams(constraint, lane,
+                                    adComputeTendonSpringParams(stepDt, isTGSSolver, unitResponse,
+                                                                stiffness, damping, limitStiffness));
                 abStoreF32(constraint, PXG_AB_ITC_mAppliedForce, lane, 0.0f);
+                abStoreF32(constraint, PXG_AB_ITC_mLimitAppliedForce, lane, 0.0f);
 
                 abStoreF32(constraint, PXG_AB_ITC_mAccumulatedLength, lane, u);
                 abStoreU32(constraint, PXG_AB_ITC_mLink0, lane, rAttachmentLinkIndex);
                 abStoreU32(constraint, PXG_AB_ITC_mLink1, lane, linkInd);
-
-                abStoreF32(constraint, PXG_AB_ITC_mLimitImpulseMultiplier, lane,
-                           isTGSSolver ? 1.0f : 1.0f - x2);
-                abStoreF32(constraint, PXG_AB_ITC_mLimitBiasCoefficient, lane,
-                           -limitStiffness * x2 * stepDt);
-                abStoreF32(constraint, PXG_AB_ITC_mLimitAppliedForce, lane, 0.0f);
 
                 abStoreF32(constraint, PXG_AB_ITC_mRestDistance, lane,
                            abF32(attachment, PXG_AB_AT_mRestDistance, lane));
@@ -704,11 +704,11 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
                 }
                 else
                 {
-                    // trap 10: full transform compose for the linear root
-                    const PxgTransform28 parentPose =
-                        stLoadPose(cLink, PXG_AB_LINK_mParentPose, lane);
-                    const PxgTransform28 cA2w = transformTransform(sB2w, parentPose);
-                    const float3 ang0 = asmCross(cA2w.p() - sB2w.p(), worldMotionVector.bottom);
+                    // trap 10 (5.12): lever arm = sBody2World.q.rotate(parentPose.p),
+                    // no world-scale subtraction (5.6.1 composed the full transform
+                    // and subtracted sBody2World.p)
+                    const float4 pp = abF4(cLink, PXG_AB_LINK_mParentPose + PXG_AB_STB_P, lane);
+                    const float3 ang0 = asmCross(quatRotate(sB2w.q(), pp.xyz), worldMotionVector.bottom);
                     sAxis = worldMotionVector.bottom;
                     sRaXn = ang0;
                 }
@@ -724,11 +724,11 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
             }
             else
             {
+                // 5.12: lever arm = cBody2World.q.rotate(childPose.p)
                 const PxgTransform28 cB2w = stLoadPose(cLink, PXG_AB_LINK_mAccumulatedPose, lane);
-                const PxgTransform28 childPose = stLoadPose(cLink, PXG_AB_LINK_mChildPose, lane);
-                const PxgTransform28 cB2wJoint = transformTransform(cB2w, childPose);
+                const float4 cp = abF4(cLink, PXG_AB_LINK_mChildPose + PXG_AB_STB_P, lane);
                 axis = worldMotionVector.bottom;
-                rbXn = asmCross(cB2wJoint.p() - cB2w.p(), axis);
+                rbXn = asmCross(quatRotate(cB2w.q(), cp.xyz), axis);
             }
 
             const AbSpatialVector axis0 = asmSVec(sAxis, sRaXn);
@@ -758,25 +758,14 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
 
             abStoreF32(constraint, PXG_AB_ITC_mRecipResponse, lane, recipResponse);
 
-            const float a = stepDt * (stepDt * stiffness + damping);
-            const float a2 = stepDt * (stepDt * limitStiffness + damping);
-            const float x = unitResponse > 0.0f ? 1.0f / (1.0f + a * unitResponse) : 0.0f;
-            const float x2 = unitResponse > 0.0f ? 1.0f / (1.0f + a2 * unitResponse) : 0.0f;
-
-            abStoreF32(constraint, PXG_AB_ITC_mVelMultiplier, lane, -x * a);
-            abStoreF32(constraint, PXG_AB_ITC_mImpulseMultiplier, lane,
-                       isTGSSolver ? 1.0f : 1.0f - x);
-            abStoreF32(constraint, PXG_AB_ITC_mBiasCoefficient, lane, -stiffness * x * stepDt);
+            stStoreSpringParams(constraint, lane,
+                                adComputeTendonSpringParams(stepDt, isTGSSolver, unitResponse,
+                                                            stiffness, damping, limitStiffness));
             abStoreF32(constraint, PXG_AB_ITC_mAppliedForce, lane, 0.0f);
+            abStoreF32(constraint, PXG_AB_ITC_mLimitAppliedForce, lane, 0.0f);
 
             abStoreU32(constraint, PXG_AB_ITC_mLink0, lane, sLinkIndex);
             abStoreU32(constraint, PXG_AB_ITC_mLink1, lane, cLinkInd);
-
-            abStoreF32(constraint, PXG_AB_ITC_mLimitImpulseMultiplier, lane,
-                       isTGSSolver ? 1.0f : 1.0f - x2);
-            abStoreF32(constraint, PXG_AB_ITC_mLimitBiasCoefficient, lane,
-                       -limitStiffness * x2 * stepDt);
-            abStoreF32(constraint, PXG_AB_ITC_mLimitAppliedForce, lane, 0.0f);
 
             // trap 2: mConstraintId assigned BEFORE the increment, every joint
             abStoreU32(tj, PXG_AB_TJ_mConstraintId, lane, numConstraints);

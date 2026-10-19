@@ -217,7 +217,7 @@ static void siSeed(SiArena& B, uint32_t salt)
                 H.restitutionXdt[lane] = ((lane + b) % 4u == 1u) ? (-0.3f + 0.1f * fv(lane, b, 70, salt))
                                                                  : (0.2f + 0.1f * fv(lane, b, 71, salt));
                 H.cfm[lane] = 0.01f + 0.005f * fv(lane, b, 72, salt);
-                H.p8[lane] = 0.9f;
+                H.biasCoefficient[lane] = 0.9f;   // 5.12 renamed p8
                 F.numFrictionConstr[lane] = ((lane + b) % 3u) * 2u + (((lane + b) % 5u == 2u) ? 1u : 0u);
                 F.dynamicFriction[lane] = 0.4f + 0.2f * fv(lane, b, 73, salt);
                 F.biasCoefficient[lane] = 0.5f + 0.2f * fv(lane, b, 74, salt);

@@ -38,14 +38,14 @@
 //   - the addPoints round loop: ballot(i < totalPoints) as allMask; while
 //     allMask: minIndex (LOWEST lane wins ties) finds the deepest point,
 //     its normal is broadcast, sameNormalMask = allMask & ballot(dot >
-//     SAME_NORMAL = 0.999, strict >); reducePoints picks <= 4 best points
+//     PXC_SAME_NORMAL = 0.999, strict >); reducePoints picks <= 4 best points
 //     (deepest, farthest, two side extremes along cross(n, p1-p0), indices
 //     OR-ed so duplicates collapse); the picks land in tmpBuffer by
 //     popcount offsets; the target patch's existing points are appended;
 //     a second reducePoints over the union writes the patch back; lane 0
 //     swaps the deepest pick to slot 0 and rebalances the counters.
 //   - findCreatePatch: maxIndex over dot(normal, patchNormal[lane]) with
-//     lanes >= mNumPatches contributing dot(normal, 0) = 0; > SAME_NORMAL
+//     lanes >= mNumPatches contributing dot(normal, 0) = 0; > PXC_SAME_NORMAL
 //     returns that patch; below MAX_PATCHES appends; at capacity each lane
 //     t scans patches t+1..15 for its closest OTHER patch, maxIndex picks
 //     the closest pair, and if that pair is closer than the new normal to

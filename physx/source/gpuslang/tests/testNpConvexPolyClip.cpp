@@ -191,8 +191,22 @@ static WarpRef polyClipRef(F4 plane0, F4 plane1, V3 axis, float maxSep, uint32_t
             const float denom = dotX(m, e0[L]);
             const float lambda = dotX(sub(triVert0, v0[L]), m) / denom;
             const V3 p = mulAdd(v0[L], lambda, e0[L]);
-            const float d = -dotX(sub(p, triVert0), V3{ plane1.x, plane1.y, plane1.z });
-            sep[L] = (denom == 0.0f || dnom0 == 0.0f) ? PC_MAX : d / dnom0;
+            // 5.12 convexTriangle.cuh :1080-1103: t / dnom0 for |dnom0| > 1e-4, else
+            // the Gram/Cramer separation in the basis {e1, axis}
+            const V3 dv = sub(p, triVert0);
+            if (std::fabs(dnom0) > 1.0e-4f)
+            {
+                const float d = -dotX(dv, V3{ plane1.x, plane1.y, plane1.z });
+                sep[L] = (denom == 0.0f) ? PC_MAX : d / dnom0;
+            }
+            else
+            {
+                const V3 e1s = e1[index];
+                const float e1MagnSqr = dotX(e1s, e1s);
+                const float mMagnSqr = dotX(m, m);
+                const float sepTmp = -((e1MagnSqr * dotX(dv, axis)) - (dotX(axis, e1s) * dotX(dv, e1s))) / mMagnSqr;
+                sep[L] = ((denom == 0.0f) || ((mMagnSqr / e1MagnSqr) < 1.0e-12f)) ? PC_MAX : sepTmp;
+            }
             pos[L] = p;
         }
         uint32_t flag3 = 0u;

@@ -41,13 +41,11 @@
 //    (w = blockIdx.x) misindexes warps 1+;
 //  * the velocity kernel's 2D grid: gridDim.y = nbSlabs, blockIdx.y IS the
 //    slab id;
-//  * **the per-partition path OVERLAP, transcribed as-is**: offset2 =
-//    globalWarpIndex + partitionId * ceil(nb/32) * wordSize -- within one
-//    partition, warp w starts at entry w (NOT w * wordSize), so with
-//    wordSize 2 adjacent warps SHARE an entry (warp 0 reads e0,e1; warp 1
-//    reads e1,e2).  Almost certainly an engine bug that only manifests
-//    above 64 links (fourth upstream-bug candidate); the fixture seeds the
-//    overlapping layout consistently on both sides;
+//  * the per-partition path slots: 5.12 addresses offset2 = (globalWarpIndex
+//    + partitionId * ceil(nb/32)) * wordSize (5.6.1's globalWarpIndex +
+//    partitionId * ceil(nb/32) * wordSize let adjacent warps SHARE an entry
+//    above 64 links -- the fourth upstream-bug candidate, fixed upstream);
+//    with wordSize 2 a w-only or unscaled mutant reads a neighbour's slot;
 //  * dirty gating: impulses2 skips a clean articulation entirely; partition
 //    0 flushes + zeroes mStateDirty (ZERO, not eVEL_DIRTY); partition != 0
 //    runs only under eHAS_IMPULSES and only when mPartitionAverageScale > 0,
@@ -111,7 +109,7 @@ const uint32_t D_ARTI_BLOCKS = 128, D_LINK_BLOCKS = 136, D_DOF_BLOCKS = 184;
 const uint32_t D_PATH_TO_ROOT = 176, D_MAX_LINKS = 248, D_MAX_DOFS = 252;
 const uint32_t SD_ISLAND_CONTEXT_POOL = 48;
 const uint32_t SH_ENC = 176;
-const uint32_t SH_SIZE = 224, SD_SIZE = 320, DESC_SIZE = 360;
+const uint32_t SH_SIZE = 224, SD_SIZE = 320, DESC_SIZE = 344;
 
 static float fv(uint32_t a, uint32_t l, uint32_t d, uint32_t salt)
 {
@@ -164,7 +162,7 @@ static void p2Seed(P2Arena& B, uint32_t salt)
     B.slab.resize(size_t(P2_NB_SLABS) * P2_NB * 2);
     B.imp.resize(size_t(P2_NB_SLABS) * P2_MAX_LINKS * P2_NB * 6);
     B.bf.resize(size_t(P2_WARPS + 1) * P2_MAX_LINKS * P2_WORDSIZE * 32);
-    B.ppp.resize(size_t(P2_WARPS + 1 + P2_NB_PARTITIONS * P2_NB_BATCH * P2_WORDSIZE) * 32);
+    B.ppp.resize(size_t((P2_NB_PARTITIONS * P2_NB_BATCH + P2_WARPS + 1) * P2_WORDSIZE) * 32);
     B.masks.resize(size_t(P2_NB_PARTITIONS) * P2_NB_SLABS * P2_NB * 4);
     B.holding.resize(size_t(P2_NB_PARTITIONS) * P2_NB);
     B.pscale.resize(size_t(P2_NB_PARTITIONS) * P2_NB);
@@ -354,8 +352,7 @@ static void p2Seed(P2Arena& B, uint32_t salt)
         }
     }
 
-    // pathToRootsPerPartition: the OVERLAPPING layout, seeded consistently --
-    // entry e, lane l carries the path-union bits for whatever reads it
+    // pathToRootsPerPartition: entry e, lane l carries the path-union bits
     for (size_t e = 0; e < B.ppp.size() / 32; ++e)
         for (uint32_t lane = 0; lane < 32; ++lane)
         {
@@ -370,31 +367,22 @@ static void p2Seed(P2Arena& B, uint32_t salt)
         }
     // clamp the per-partition path bits to each lane's live links, so the
     // walk never reads a poisoned link block: word0 bits < numLinks, word1
-    // bits < numLinks-64 (empty for lanes with <= 64 links)
+    // bits < numLinks-64 (empty for lanes with <= 64 links).  5.12 slots:
+    // (w + p * nbBatch) * wordSize + j, one per (partition, warp) -- no overlap
     for (uint32_t p = 0; p < P2_NB_PARTITIONS; ++p)
         for (uint32_t w = 0; w < P2_WARPS + 1; ++w)
             for (uint32_t j = 0; j < P2_WORDSIZE; ++j)
             {
-                const size_t e = size_t(w) + size_t(p) * P2_NB_BATCH * P2_WORDSIZE + j;
+                const size_t e = (size_t(w) + size_t(p) * P2_NB_BATCH) * P2_WORDSIZE + j;
                 if (e >= B.ppp.size() / 32) continue;
                 for (uint32_t lane = 0; lane < 32; ++lane)
                 {
                     const uint32_t a = w * 32 + lane;
                     if (a >= P2_NB) { B.ppp[e * 32 + lane] = 0; continue; }
                     const uint32_t nl = p2NumLinks(a);
-                    // this entry serves as word j for warp w AND word j-1 for
-                    // warp w+1 (the overlap) -- clamp to the TIGHTER range
-                    uint64_t m0 = (j == 0)
+                    const uint64_t m0 = (j == 0)
                         ? ((nl >= 64u) ? ~0ull : ((uint64_t(1) << nl) - 1u)) & ~1ull
                         : ((nl > 64u) ? ((uint64_t(1) << (nl - 64u)) - 1u) : 0ull);
-                    const uint32_t a2 = (w + 1) * 32 + lane;   // the overlapping reader
-                    if (j == 1 && a2 < P2_NB)
-                    {
-                        const uint32_t nl2 = p2NumLinks(a2);
-                        const uint64_t m1 =
-                            ((nl2 >= 64u) ? ~0ull : ((uint64_t(1) << nl2) - 1u)) & ~1ull;
-                        m0 &= m1;   // entry w+1 is warp w's word 1 AND warp w+1's word 0
-                    }
                     B.ppp[e * 32 + lane] &= m0;
                 }
             }
@@ -454,7 +442,8 @@ static void p2MirrorImpulses(P2Arena& W, uint32_t partitionId,
             {
                 ++partials;
                 const uint32_t dirtyLink = W.holding[off];
-                const uint32_t offset2 = w + partitionId * P2_NB_BATCH * P2_WORDSIZE;
+                // 5.12: the whole slot index is scaled by wordSize
+                const uint32_t offset2 = (w + partitionId * P2_NB_BATCH) * P2_WORDSIZE;
                 const uint32_t refCount = p2CountSlabs(W, P2_REF_OFFSET + a);
                 const float scale = 1.0f / float(refCount);
                 uint32_t slabHits = 0, walkHits = 0, lowerWordHits = 0;

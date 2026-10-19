@@ -421,12 +421,10 @@ void asiComputeSpatialInertiaW(uint64_t a, uint64_t artiBlock, uint64_t linkBloc
             zStoreBottom = zDampBottom + zExtBottom;
         }
 
-        // stored in two places on purpose: the bias force is needed later to
-        // compute the articulated transmission force
+        // (5.12: no third copy into mBiasForce -- the transmitted-friction
+        // model that read it is gone)
         abStoreSpatialVector(blk, PXG_AB_LINK_mZAVector, lane, zStoreTop, zStoreBottom);
         abStoreSpatialVector(blk, PXG_AB_LINK_mZAIntVector, lane, zIntTop, zIntBottom);
-        abStoreSpatialVector(blk, PXG_AB_LINK_mBiasForce, lane,
-                             zStoreTop + zIntTop, zStoreBottom + zIntBottom);
         abStoreF32(blk, PXG_AB_LINK_mMass, lane, m);
     }
 

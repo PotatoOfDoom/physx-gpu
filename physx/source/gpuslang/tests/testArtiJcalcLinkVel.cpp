@@ -45,7 +45,10 @@
 //     fixture puts a NON-ZERO value in every accumulated pose's p.w: the root's
 //     must survive into mPreTransform, the others' must become 0.  A port that
 //     unifies the two paths fails on one or the other.
-//  4. rootPreMotionVelocity is written through the RECORD, not the block.
+//  4. (5.12) Rw is Dy::computeLinkRw(parentQ, childQ, parentPose.p, childPose.p,
+//     slide) -- the ENGINE's host-callable function -- with the prismatic slide
+//     from the link's FIRST dof (link 2 is prismatic); the world positions no
+//     longer enter it.  5.12 also dropped the record's rootPreMotionVelocity.
 //  5. (P9.86c) THE CLAMP IS PxMin<float> = selectMin, `a < b ? a : b`
 //     (forwardDynamic2.cu:995, PxUnixMathIntrinsics.h:116-119): on a +-0 tie the
 //     SECOND operand survives, so PxMin(-0, +0) = +0.  GLSL FMin as llvmpipe runs it
@@ -65,6 +68,7 @@
 #include "PxArticulationTendonData.h"
 #include "PxgArticulation.h"
 #include "PxgArticulationLink.h"
+#include "DyCpuGpuArticulation.h"
 
 #include <cstring>
 #include <vector>
@@ -124,9 +128,10 @@ PXG_TEST(artiJcalcLinkVel)
     };
 
     // ---- inputs ----
-    struct LinkIn { PxQuat q; PxVec3 p; float pw; Cm::UnAlignedSpatialVector mv; };
+    struct LinkIn { PxQuat q; PxVec3 p; float pw; Cm::UnAlignedSpatialVector mv;
+                    PxVec3 parentOff, childOff; uint8_t jointType; };
     std::vector<LinkIn> linkIn(size_t(LANES) * NB_LINKS);
-    struct DofIn { Cm::UnAlignedSpatialVector lmm; float jVel; float maxJVel; };
+    struct DofIn { Cm::UnAlignedSpatialVector lmm; float jVel; float maxJVel; float jPos; };
     std::vector<DofIn> dofIn(size_t(LANES) * DOF_BLOCKS);
 
     for (uint32_t L = 0; L < LANES; ++L)
@@ -147,6 +152,11 @@ PXG_TEST(artiJcalcLinkVel)
             in.pw = 7.5f + float(L) + 0.25f * float(l);
             in.mv.top = PxVec3(fv(L, l, 7), fv(L, l, 8), fv(L, l, 9));
             in.mv.bottom = PxVec3(fv(L, l, 10), fv(L, l, 11), fv(L, l, 12));
+            // 5.12: the joint's link-local anchors (computeLinkRw)
+            in.parentOff = PxVec3(fv(L, l, 13) * 2.0f, -fv(L, l, 14), 0.5f * fv(L, l, 15) + 0.1f * float(l));
+            in.childOff = PxVec3(-fv(L, l, 16), fv(L, l, 17) * 3.0f, fv(L, l, 18) - 0.2f * float(l));
+            in.jointType = uint8_t(l == 2 ? PxArticulationJointType::ePRISMATIC
+                                          : PxArticulationJointType::eREVOLUTE);
         }
         for (uint32_t d = 0; d < DOF_BLOCKS; ++d)
         {
@@ -157,6 +167,7 @@ PXG_TEST(artiJcalcLinkVel)
             // the LAST used dof carries the tightest limit, so it is the one that
             // sets the ratio -- a fused single pass would miss it
             in.maxJVel = (d == USED_DOFS - 1) ? (0.5f * in.jVel) : (100.0f + float(d));
+            in.jPos = 0.3f + 0.2f * float(d) - 0.05f * float(L);   // the prismatic slide
         }
         // One dof with zero velocity AND a zero limit, which the clamp must SKIP
         // rather than divide by: unguarded that is 0/0 = NaN, and what min() does
@@ -185,14 +196,12 @@ PXG_TEST(artiJcalcLinkVel)
     const size_t DOF_BLOCK = sizeof(PxgArticulationBlockDofData);
     const size_t LINK_REGION = size_t(NB_LINKS) * LINK_BLOCK + GUARD;
     const size_t DOF_REGION = size_t(DOF_BLOCKS) * DOF_BLOCK + GUARD;
-    const size_t RPMV_REGION = size_t(LANES) * sizeof(Cm::UnAlignedSpatialVector) + GUARD;
 
-    PxgDevicePtr dArtis = 0, dLink = 0, dDof = 0, dRPMV = 0;
+    PxgDevicePtr dArtis = 0, dLink = 0, dDof = 0;
     shim.memAlloc(&dArtis, size_t(LANES) * sizeof(PxgArticulation));
     shim.memAlloc(&dLink, LINK_REGION);
     shim.memAlloc(&dDof, DOF_REGION);
-    shim.memAlloc(&dRPMV, RPMV_REGION);
-    if (!dArtis || !dLink || !dDof || !dRPMV)
+    if (!dArtis || !dLink || !dDof)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -200,9 +209,6 @@ PXG_TEST(artiJcalcLinkVel)
 
     std::vector<PxgArticulation> recs(LANES);
     std::memset(recs.data(), 0xEE, recs.size() * sizeof(PxgArticulation));
-    for (uint32_t L = 0; L < LANES; ++L)
-        recs[L].rootPreMotionVelocity = reinterpret_cast<Cm::UnAlignedSpatialVector*>(
-            dRPMV + PxgDevicePtr(size_t(L) * sizeof(Cm::UnAlignedSpatialVector)));
     shim.memcpyHtoD(dArtis, recs.data(), recs.size() * sizeof(PxgArticulation));
 
     // ---- build the poisoned block images and write the inputs into them ----
@@ -247,6 +253,15 @@ PXG_TEST(artiJcalcLinkVel)
             putSV(linkImg, blk, offsetof(LK, mMotionVelocity), L, in.mv);
             putU8(linkImg, blk + offsetof(LK, mDofs) + L, uint8_t(dofCount[l]));
             putU32(linkImg, blk + offsetof(LK, mParents) + size_t(L) * 4, parents[l]);
+            putU8(linkImg, blk + offsetof(LK, mJointType) + L, in.jointType);
+            const size_t pp = blk + offsetof(LK, mParentPose) + 512;
+            putF(linkImg, pp + size_t(L) * 16 + 0, in.parentOff.x);
+            putF(linkImg, pp + size_t(L) * 16 + 4, in.parentOff.y);
+            putF(linkImg, pp + size_t(L) * 16 + 8, in.parentOff.z);
+            const size_t cp = blk + offsetof(LK, mChildPose) + 512;
+            putF(linkImg, cp + size_t(L) * 16 + 0, in.childOff.x);
+            putF(linkImg, cp + size_t(L) * 16 + 4, in.childOff.y);
+            putF(linkImg, cp + size_t(L) * 16 + 8, in.childOff.z);
         }
         for (uint32_t d = 0; d < DOF_BLOCKS; ++d)
         {
@@ -254,14 +269,13 @@ PXG_TEST(artiJcalcLinkVel)
             const size_t db = size_t(d) * DOF_BLOCK;
             putSV(dofImg, db, offsetof(DF, mLocalMotionMatrix), L, in.lmm);
             putF(dofImg, db + offsetof(DF, mJointVelocities) + size_t(L) * 4, in.jVel);
+            putF(dofImg, db + offsetof(DF, mJointPositions) + size_t(L) * 4, in.jPos);
             putF(dofImg, db + CD + offsetof(IC, mMaxJointVelocity) + size_t(L) * 4, in.maxJVel);
         }
     }
 
-    std::vector<uint8_t> rpmvImg(RPMV_REGION, 0xAB);
     shim.memcpyHtoD(dLink, linkImg.data(), linkImg.size());
     shim.memcpyHtoD(dDof, dofImg.data(), dofImg.size());
-    shim.memcpyHtoD(dRPMV, rpmvImg.data(), rpmvImg.size());
 
     struct Params
     {
@@ -278,11 +292,9 @@ PXG_TEST(artiJcalcLinkVel)
     // device must match; 1 and 2 are mutant twins that must produce a different image.
     uint32_t negPosTie = 0, posNegTie = 0;   // coverage, counted for variant 0 only
     std::vector<uint32_t> ratioBits(LANES, 0xFFFFFFFFu);
-    auto buildExpected = [&](int variant, std::vector<uint8_t>& wLink, std::vector<uint8_t>& wDof,
-                             std::vector<uint8_t>& wRPMV) {
+    auto buildExpected = [&](int variant, std::vector<uint8_t>& wLink, std::vector<uint8_t>& wDof) {
         wLink = linkImg;
         wDof = dofImg;
-        wRPMV = rpmvImg;
         gRatioMinVariant = variant;
 
         for (uint32_t L = 0; L < LANES; ++L)
@@ -325,17 +337,6 @@ PXG_TEST(artiJcalcLinkVel)
             if (variant == 0)
                 ratioBits[L] = ratioBitsOf(ratio);
 
-            // the root's pre-motion velocity, through the record
-            {
-                const size_t off = size_t(L) * sizeof(Cm::UnAlignedSpatialVector);
-                putF(wRPMV, off + 0, root.mv.top.x);
-                putF(wRPMV, off + 4, root.mv.top.y);
-                putF(wRPMV, off + 8, root.mv.top.z);
-                putF(wRPMV, off + 12, root.mv.bottom.x);
-                putF(wRPMV, off + 16, root.mv.bottom.y);
-                putF(wRPMV, off + 20, root.mv.bottom.z);
-            }
-
             // pass two, replayed in order -- link 3 reads link 2's freshly written velocity
             std::vector<Cm::UnAlignedSpatialVector> mv(NB_LINKS);
             mv[0] = root.mv;
@@ -360,7 +361,15 @@ PXG_TEST(artiJcalcLinkVel)
                 putF(wLink, pt + 512 + size_t(L) * 16 + 8, in.p.z);
                 putF(wLink, pt + 512 + size_t(L) * 16 + 12, 0.0f);   // NOT in.pw
 
-                const PxVec3 rw = in.p - pin.p;
+                // 5.12: Dy::computeLinkRw (the engine's own), prismatic slide from
+                // the link's FIRST dof (the cursor before the dof loop)
+                PxVec3 slide(0.0f);
+                if (in.jointType == PxArticulationJointType::ePRISMATIC)
+                {
+                    const DofIn& d0 = dofIn[size_t(L) * DOF_BLOCKS + cursor];
+                    slide = d0.lmm.bottom * d0.jPos;
+                }
+                const PxVec3 rw = Dy::computeLinkRw(pin.q, in.q, in.parentOff, in.childOff, slide);
                 putF(wLink, blk + offsetof(LK, mRw_x) + size_t(L) * 4, rw.x);
                 putF(wLink, blk + offsetof(LK, mRw_y) + size_t(L) * 4, rw.y);
                 putF(wLink, blk + offsetof(LK, mRw_z) + size_t(L) * 4, rw.z);
@@ -389,8 +398,8 @@ PXG_TEST(artiJcalcLinkVel)
         gRatioMinVariant = 0;
     };
 
-    std::vector<uint8_t> wLink, wDof, wRPMV;
-    buildExpected(0, wLink, wDof, wRPMV);
+    std::vector<uint8_t> wLink, wDof;
+    buildExpected(0, wLink, wDof);
     PXG_CHECK_MSG(negPosTie == 2 && posNegTie == 1,
                   "zero-limit lanes: %u (-0,+0) and %u (+0,-0) PxMin ties, want 2 and 1",
                   negPosTie, posNegTie);
@@ -400,8 +409,8 @@ PXG_TEST(artiJcalcLinkVel)
                   ratioBits[ZL_POSNEG], ratioBits[ZL_MID]);
     for (int v = 1; v <= 2; ++v)
     {
-        std::vector<uint8_t> tl, td, tr;
-        buildExpected(v, tl, td, tr);
+        std::vector<uint8_t> tl, td;
+        buildExpected(v, tl, td);
         PXG_CHECK_MSG(td != wDof,
                       "ratio twin %d gives the same dof image -- the zero-limit lanes do not "
                       "observe PxMin's +-0 tie", v);
@@ -429,12 +438,10 @@ PXG_TEST(artiJcalcLinkVel)
     };
     region("linkBlocks", dLink, wLink, LINK_BLOCK);
     region("dofBlocks", dDof, wDof, DOF_BLOCK);
-    region("rootPreMotionVelocity", dRPMV, wRPMV, sizeof(Cm::UnAlignedSpatialVector));
 
     shim.memFree(dArtis);
     shim.memFree(dLink);
     shim.memFree(dDof);
-    shim.memFree(dRPMV);
 
     PXG_CHECK_MSG(bad == 0, "%zu byte(s) wrong", bad);
     std::printf("  jcalc link velocities: 8 articulations (3 with +-0 velocity limits: %u "

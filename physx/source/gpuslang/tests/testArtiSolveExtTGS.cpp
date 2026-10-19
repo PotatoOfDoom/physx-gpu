@@ -241,7 +241,7 @@ static size_t svxRunContact(PxgCudaShim& shim, float ref0, float ref1, bool nanR
         if (compliant) ++nCompliant;
         ch[0].restitutionXdt[l] = compliant ? -0.5f - std::fabs(fv(l, 2, 2, 73)) : 0.3f * std::fabs(fv(l, 2, 2, 73));
         ch[0].cfm[l] = 0.01f * std::fabs(fv(l, 2, 3, 73));
-        ch[0].p8[l] = 0.8f + 0.1f * fv(l, 3, 0, 74);
+        ch[0].biasCoefficient[l] = 0.8f + 0.1f * fv(l, 3, 0, 74);
         fh[0].dynamicFriction[l] = 0.4f + 0.3f * std::fabs(fv(l, 3, 1, 74));
         fh[0].biasCoefficient[l] = 0.5f * fv(l, 3, 2, 74);
         fh[0].torsionalFrictionScale[l] = 0.7f + 0.2f * std::fabs(fv(l, 3, 3, 74));
@@ -569,7 +569,6 @@ static size_t svxRun1D(PxgCudaShim& shim, float ref0, float ref1)
             c.maxBias[l] = 0.3f + 0.2f * std::fabs(fv(l, 60 + i, 2, 88));
             c.angularErrorScale[l] = (l + i) % 2 ? 1.f : 0.f;
             c.appliedForce[l] = 0.2f * fv(l, 60 + i, 3, 88);
-            c.residual[l] = 0.f;
         }
     }
     std::printf("[ info ] svx 1d(ref %g/%g): hard %u, ineq %u, spring %u, accel %u, bounce %u\n",

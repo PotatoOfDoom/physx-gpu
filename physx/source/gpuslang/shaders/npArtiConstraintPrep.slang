@@ -63,7 +63,7 @@
 //     bottom-left 3x3, everything else zero (the engine's own layout).
 //  6. **The rigid body2World drops the w components** of the
 //     PxAlignedTransform's float4 p; the quat carries over.
-//  7. **createImpulseResponseVector**: articulation OR kinematic returns
+//  7. **createImpulseResponseVector**: articulation OR static (5.12) OR kinematic returns
 //     the impulse UNCHANGED; a dynamic rigid maps the TOP through
 //     multiplyInertia (the bottom-left 3x3 of the response — the
 //     sqrtInertia trick) and keeps the bottom.
@@ -208,11 +208,14 @@ public void acpCreateSolverExtBody(uint2 nodeIndex, uint solverBodyIndex,
     }
 }
 
-// createImpulseResponseVector (:136): articulation or kinematic keeps the
-// impulse; a dynamic rigid maps the top through multiplyInertia
+// createImpulseResponseVector (:113 in 5.12): articulation, STATIC (5.12) or
+// kinematic keeps the impulse; a dynamic rigid maps the top through
+// multiplyInertia.  (5.6.1 sent a static body through multiplyInertia with its
+// zero response matrix, zeroing the angular half of its response vector.)
 public AbSpatialVector acpCreateImpulseResponseVector(AcpBody b, AbSpatialVector impulse)
 {
-    if (nodeIndexIsArticulation(b.islandNodeIndex) || b.isKinematic)
+    if (nodeIndexIsArticulation(b.islandNodeIndex) || nodeIndexIsStaticBody(b.islandNodeIndex)
+        || b.isKinematic)
         return impulse;
 
     // PxSpatialMatrix::multiplyInertia: the bottom-left 3x3, rows dotted
@@ -320,19 +323,17 @@ void acpBodyTest(uint3 dispatchThreadId : SV_DispatchThreadID)
 //      invMass0_1_angDom0_1 zero) and returns.
 // 10.  invMass0_1_angDom0_1 stores the invMassScale terms SWIZZLED:
 //      (lin0X, lin1Z, ang0Y, ang1W) — x, z, y, w of the source.
-// 11.  The friction header's biasCoefficient is invDt (not p8, not invDtp8).
+// 11.  The friction header's biasCoefficient is invDt (not p8, not invDtp8);
+//      5.12: zero when eDISABLE_STRONG_FRICTION is set.
 // 12.  The per-contact slop scales by max(angNorVel/linNorVel, 1) with a
 //      linNorVel==0 guard that substitutes 1 — component-wise zeroing of
 //      raXn/rbXn against THAT scaled slop; the friction rows use the RAW
 //      solverOffsetSlop.
-// 13.  **The engine's own precedence quirk, transcribed as-is (FIFTH
-//      upstream-bug candidate)**: `cTargetVel + isGreater2 ? -vrel*rest : 0`
-//      parses as `(cTargetVel + (float)isGreater2) != 0 ? ... : 0` — the
-//      bounce term REPLACES the target velocity whenever the sum is nonzero,
-//      and a nonzero cTargetVel with no bounce still selects the bounce arm.
-//      (The rigid twin at constraintPrepTGS has the parenthesized form; the
-//      arti path does not.)  Also isGreater2 tests restitution > 1e-5, not
-//      > 0 as the rigid twin does.
+// 13.  The FIFTH upstream-bug candidate (the 5.6.1 precedence quirk
+//      `cTargetVel + isGreater2 ? -vrel*rest : 0`) is FIXED UPSTREAM in 5.12:
+//      cTargetVel + (isGreater2 ? -vrel*rest : 0).  5.12 also moved the bounce
+//      totalError term before the kinematic target adjust.  isGreater2 still
+//      tests restitution > 1e-5, not > 0 as the rigid twin does.
 // 14.  minNormalForce = (sum of deltaF / contactCount) * 0.25 with deltaF =
 //      max((targetVelocity - penetrationInvDt - vrel) * velMultiplier, 0).
 // 15.  Kinematic bodies subtract/add their PROJECTED velocity from the
@@ -341,8 +342,9 @@ void acpBodyTest(uint3 dispatchThreadId : SV_DispatchThreadID)
 //      torsional when exactly ONE anchor and either torsional term nonzero;
 //      frictionScale halves static/dynamic friction at aCount == 2.
 // 17.  Friction anchors rotate through the body quats and the error is
-//      (ra - rb) + (frame0p - frame1p), dotted per tangent; perPointFriction
-//      reads contactID[j] for the target-velocity index, else contact 0.
+//      (ra - rb) + (frame0p - frame1p), dotted per tangent; 5.12 keys the
+//      target-velocity index on eHAS_TARGET_VELOCITY (contactID[j], else
+//      contact 0; 5.6.1 keyed it on ePER_POINT_FRICTION).
 // 18.  The torsional row writes response vectors built from (normal, 0) —
 //      no lever arms — and frictionError/targetVel 0; torsionalFrictionScale
 //      = max(torsionalData.y, sqrt(max(0, -minPen) * torsionalData.x)).
@@ -360,7 +362,7 @@ public uint acpSetupFinalizeExtTGS(
     AcpBody b0, AcpBody b1,
     float invDt, float stepDt, float invTotalDt,
     float bounceThresholdF32, float biasCoefficient,
-    uint threadIndex, uint forceWritebackBufferOffset, bool perPointFriction,
+    uint threadIndex, uint forceWritebackBufferOffset,
     Ptr<PxgTGSBlockSolverContactHeader> contactHeader, uint chi,
     Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeader, uint fhi,
     Ptr<PxgTGSBlockSolverContactPoint> contactPoints, uint cpBase,
@@ -381,9 +383,10 @@ public uint acpSetupFinalizeExtTGS(
 
     const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // P9.86c: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:660); FMax gives +0 for (+0,-0)
     const float maxPenBias = max(b0.penBiasClamp, b1.penBiasClamp);
-    const float p8 = min(0.8f, biasCoefficient);
+    // 5.12: no min(0.8, biasCoefficient) clamp -- the caller passes the
+    // collection's rigidContact coefficient and it is used as is
     const float bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invDt * p8;
+    const float invDtWithBiasCoefficient = invDt * biasCoefficient;
 
     const float4 lin0X_ang0Y_lin1Z_ang1W = contactData[cdi].mInvMassScale[threadIndex];
 
@@ -429,10 +432,12 @@ public uint acpSetupFinalizeExtTGS(
     const float linNorVel = norVel0 - norVel1;
     const float damping = contactData[cdi].damping[threadIndex];
 
-    frictionHeader[fhi].biasCoefficient[threadIndex] = invDt;   // trap 11
+    // trap 11 (5.12): invDt, or ZERO when strong friction is disabled
+    const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0u;
+    frictionHeader[fhi].biasCoefficient[threadIndex] = !disableStrongFriction ? invDt : 0.0f;
     contactHeader[chi].restitutionXdt[threadIndex] = restitution * stepDt;
     contactHeader[chi].cfm[threadIndex] = cfm;
-    contactHeader[chi].biasCoefficient[threadIndex] = p8; // 5.12 renamed the header field
+    contactHeader[chi].biasCoefficient[threadIndex] = biasCoefficient; // 5.12: was p8
 
     float normalForce = 0.0f;
     float minPen = 0.0f;
@@ -502,7 +507,7 @@ public uint acpSetupFinalizeExtTGS(
         else
         {
             velMultiplier = recipResponse;
-            scaledBias = isSeparated ? -invDt : -invDtp8;
+            scaledBias = isSeparated ? -invDt : -invDtWithBiasCoefficient;
         }
 
         contactPoints[cpBase + j].resp0[threadIndex] = resp0;
@@ -512,13 +517,25 @@ public uint acpSetupFinalizeExtTGS(
         // stamped FMin returns -0 for (-0, +0).
         minPen = (penetration < minPen) ? penetration : minPen;
 
-        // trap 13: the precedence quirk and the 1e-5 threshold, as found
+        // trap 13: the 1e-5 threshold, as found
         const bool isGreater2 = ((restitution > 1e-5f) && (bounceThreshold > vrel))
                              && ((-vrel) > penetrationInvDt);
 
         float totalError = penetration;
-        const float tvCond = cTargetVel + (isGreater2 ? 1.0f : 0.0f);
-        float targetVelocity = (tvCond != 0.0f) ? (-vrel) * restitution : 0.0f;
+        // 5.12 parenthesized the 5.6.1 precedence quirk:
+        // cTargetVel + (isGreater2 ? (-vrel)*restitution : 0.f).  Spelled as the
+        // CUDA spells it: the literal 0 reaches the add only as a select arm on a
+        // runtime condition, which llvmpipe does not fold (the PGS twin's P9.86f
+        // note, p86SignedZero rows 23-25).
+        float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
+
+        // 5.12 moved the bounce error term BEFORE the kinematic velocity
+        // adjust (5.6.1 added it after, with the adjusted target velocity)
+        if (isGreater2)
+        {
+            const float ratio = totalDt + penetration / vrel;
+            totalError += ratio * targetVelocity;
+        }
 
         const float deltaF =
             max((targetVelocity + (-penetrationInvDt - vrel)) * velMultiplier, 0.0f);
@@ -528,12 +545,6 @@ public uint acpSetupFinalizeExtTGS(
             targetVelocity -= vrel1;
         if (b1.isKinematic)
             targetVelocity += vrel2;
-
-        if (isGreater2)
-        {
-            const float ratio = totalDt + penetration / vrel;
-            totalError += ratio * targetVelocity;
-        }
 
         contactPoints[cpBase + j].raXn_extraCoeff[threadIndex] =
             float4(response0.top, compliantContactCoeff);
@@ -600,6 +611,10 @@ public uint acpSetupFinalizeExtTGS(
         frictionHeader[fhi].frictionNormals0[threadIndex] = float4(t0, 0.0f);
         frictionHeader[fhi].frictionNormals1[threadIndex] = float4(t1, 0.0f);
 
+        // 5.12: the friction target-velocity index is keyed on the contact's
+        // eHAS_TARGET_VELOCITY flag (5.6.1: on ePER_POINT_FRICTION)
+        const bool hasTargetVelocity = (flags & PXG_SC_FLAG_HAS_TARGET_VELOCITY) != 0u;
+
         const float3 relTr = bodyFrame0p - bodyFrame1p;
 
         for (uint j = 0u; j < aCount; ++j)
@@ -615,7 +630,7 @@ public uint acpSetupFinalizeExtTGS(
             const float3 ra = quatRotate(b0.b2wQ, body0Anchor4.xyz);
             const float3 rb = quatRotate(b1.b2wQ, body1Anchor4.xyz);
 
-            const uint index = perPointFriction
+            const uint index = hasTargetVelocity
                 ? ((j == 0u) ? frictionPatch[fpi].contactID0[threadIndex]
                              : frictionPatch[fpi].contactID1[threadIndex])
                 : 0u;
@@ -815,7 +830,7 @@ struct AcsParams
     uint64_t frictions;       // @104 rows
     uint64_t responses;       // @112 rows
     uint64_t io;              // @120 per-lane uint4: {contactCount, writebackOffset,
-                              //      perPointFriction, respCountOut}
+                              //      unused (5.6.1 perPointFriction), respCountOut}
     float invDt;              // @128
     float stepDt;             // @132
     float invTotalDt;         // @136
@@ -854,7 +869,6 @@ void acpSetupTest(uint3 dispatchThreadId : SV_DispatchThreadID)
     const uint4 io = pio[lane];
     const uint contactCount = io.x;
     const uint writebackOffset = io.y;
-    const bool perPointFriction = io.z != 0u;
 
     const uint written = acpSetupFinalizeExtTGS(
         Ptr<PxgBlockContactData>(gAcs.contactData), 0u,
@@ -865,7 +879,7 @@ void acpSetupTest(uint3 dispatchThreadId : SV_DispatchThreadID)
         b0, b1,
         gAcs.invDt, gAcs.stepDt, gAcs.invTotalDt,
         gAcs.bounceThreshold, gAcs.biasCoefficient,
-        lane, writebackOffset, perPointFriction,
+        lane, writebackOffset,
         Ptr<PxgTGSBlockSolverContactHeader>(gAcs.contactHeader), 0u,
         Ptr<PxgTGSBlockSolverFrictionHeader>(gAcs.frictionHeader), 0u,
         Ptr<PxgTGSBlockSolverContactPoint>(gAcs.contactPoints), 0u,
@@ -929,7 +943,7 @@ void acpTransformInvProbe(uint3 dispatchThreadId : SV_DispatchThreadID)
 // 24. **The friction-index scatter** writes createPatchIndex(descIndexBatch,
 //     lane) at edgeIndex + totalCurrentEdges * mPatchIndex[lane] -- the
 //     PREVIOUS-edge total feeds getFrictionPatches instead.
-// 25. **getFrictionPatches is gated on !(perPointFriction || disableFriction),
+// 25. **getFrictionPatches is gated on !(disableStrongFriction || disableFriction),
 //     growPatches on !disableFriction alone**; frictionPatch.broken[lane]=0
 //     always.  (The CUDA's __syncwarp() after correlate is dropped exactly as
 //     the rigid twin's port established: every lane touches only its own
@@ -1054,14 +1068,16 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
                         bodyFrame0, bodyFrame1, lane);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0; // 5.12 split; this bit equals 5.6.1 ePER_POINT_FRICTION
+    // 5.12 processFrictionPatch: getFrictionPatches is gated on
+    // !(disableStrongFriction || disableFriction) (the bit of 5.6.1's ePER_POINT_FRICTION)
+    const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0;
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     currFrictionPatches[descIndexBatch].broken[lane] = 0;
     float patchExtents = 0.0f;
 
     // trap 25
-    if (!(perPointFriction || disableFriction))
+    if (!(disableStrongFriction || disableFriction))
     {
         getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
                               prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0,
@@ -1095,7 +1111,7 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
         b0, b1,
         sharedDesc[0].stepInvDtF32, sharedDesc[0].stepDt, sharedDesc[0].invDtF32,
         prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficients.rigidContact, // 5.12 BiasCoefficientCollection
-        lane, forceWritebackOffset, perPointFriction,
+        lane, forceWritebackOffset,
         contactHeaders, descIndexBatch,
         frictionHeaders, descIndexBatch,
         outContactPoints, batches[batchIndex].startConstraintIndex,
@@ -1135,8 +1151,9 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
 //     (numFrictionConstr 0, numNormalConstr 0, forceWritebackOffset ~0) --
 //     the TGS twin (trap 9) also zeroes invMass0_1_angDom0_1; PGS leaves it
 //     POISONED.
-// 29. **p8 is FIXED at 0.8** -- the biasCoefficient parameter is DEAD in the
-//     PGS overload (the TGS twin clamps min(0.8, biasCoefficient)).
+// 29. (5.12) the bias arm uses invDt * biasCoefficient with the caller's
+//     biasCoefficients.rigidContact (5.6.1: a FIXED 0.8, the parameter dead;
+//     the TGS twin clamped min(0.8, biasCoefficient), 5.12 clamps neither).
 // 30. **The header stores restitution and cfm** (the TGS twin's
 //     restitutionXdt/p8/maxPenBias slots do not exist in the PGS header);
 //     accumNormalForce is never written by prep.
@@ -1176,7 +1193,7 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
 //     does not have).
 // 42. Friction rows use the RAW solverOffsetSlop (normal rows the scaled
 //     one) -- shared with the TGS twin, swept once more here.
-// 43. perPointFriction reads frictionPatch.contactID[j] for the
+// 43. (5.12: eHAS_TARGET_VELOCITY; 5.6.1: perPointFriction) reads frictionPatch.contactID[j] for the
 //     target-velocity contact index, else contact 0.
 // 44. **NO torsional friction in PGS**: anchorCount = aCount * 2 exactly,
 //     no torsional row, and the work unit's mTorsionalFrictionData is never
@@ -1270,8 +1287,8 @@ uint acpSetupFinalizeExtPGS(
     Ptr<PxgBlockFrictionPatch> frictionPatch, uint fpi,
     Ptr<PxgBlockFrictionAnchorPatch> fAnchor, uint fai,
     AcpBody b0, AcpBody b1,
-    float invDt, float dt, float bounceThresholdF32,
-    uint threadIndex, uint forceWritebackBufferOffset, bool perPointFriction,
+    float invDt, float dt, float bounceThresholdF32, float biasCoefficient,
+    uint threadIndex, uint forceWritebackBufferOffset,
     Ptr<AcpPgsContactHeader> contactHeader, uint chi,
     Ptr<AcpPgsFrictionHeader> frictionHeader, uint fhi,
     Ptr<AcpPgsContactPoint> contactPoints, uint cpBase,
@@ -1290,9 +1307,10 @@ uint acpSetupFinalizeExtPGS(
     const float3 bodyFrame1p = b1.b2wP;
 
     const float maxPenBias = max(b0.penBiasClamp, b1.penBiasClamp);
-    const float p8 = 0.8f;   // trap 29: FIXED; biasCoefficient is dead here
+    // trap 29 (5.12): the caller's rigid-contact bias coefficient, LIVE here
+    // (5.6.1 hard-coded p8 = 0.8f and left biasCoefficient dead in PGS)
     const float bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invDt * p8;
+    const float invDtWithBiasCoefficient = invDt * biasCoefficient;
 
     const float4 lin0X_ang0Y_lin1Z_ang1W = contactData[cdi].mInvMassScale[threadIndex];
 
@@ -1388,9 +1406,10 @@ uint acpSetupFinalizeExtPGS(
 
         const float penetration = separation - restDistance;
         const bool isSeparated = penetration >= 0.0f;   // trap 31: >=
-        // trap 32: the SAME invDt, and the p8 arm clamps at maxPenBias
+        // trap 32: the SAME invDt, and the bias arm clamps at maxPenBias
         const float penetrationInvDt = penetration * invDt;
-        const float penetrationInvDtPt8 = max(maxPenBias, penetration * invDtp8);
+        const float penetrationInvDtWithBiasCoefficient =
+            max(maxPenBias, penetration * invDtWithBiasCoefficient);
 
         const bool collidingWithVrel = (-vrel) > penetrationInvDt;
         // trap 33: > 0, not > 1e-5
@@ -1436,7 +1455,7 @@ uint acpSetupFinalizeExtPGS(
         }
         else
         {
-            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtPt8;
+            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtWithBiasCoefficient;
             if (ccdSeparationCondition && isGreater2)
                 scaledBias = 0.0f;
 
@@ -1533,8 +1552,8 @@ uint acpSetupFinalizeExtPGS(
             // trap 40: (ra + p0) - (rb + p1), NOT (ra - rb) + relTr
             const float3 error = (ra + bodyFrame0p) - (rb + bodyFrame1p);
 
-            // trap 43
-            const uint index = perPointFriction
+            // trap 43 (5.12): keyed on eHAS_TARGET_VELOCITY
+            const uint index = ((flags & PXG_SC_FLAG_HAS_TARGET_VELOCITY) != 0u)
                 ? ((j == 0u) ? frictionPatch[fpi].contactID0[threadIndex]
                              : frictionPatch[fpi].contactID1[threadIndex])
                 : 0u;
@@ -1769,14 +1788,16 @@ void artiContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupThrea
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
                         bodyFrame0, bodyFrame1, lane);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0; // 5.12 split; this bit equals 5.6.1 ePER_POINT_FRICTION
+    // 5.12 processFrictionPatch: getFrictionPatches is gated on
+    // !(disableStrongFriction || disableFriction) (the bit of 5.6.1's ePER_POINT_FRICTION)
+    const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0;
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     currFrictionPatches[descIndexBatch].broken[lane] = 0;
     float patchExtents = 0.0f;
 
     // trap 25
-    if (!(perPointFriction || disableFriction))
+    if (!(disableStrongFriction || disableFriction))
     {
         getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
                               prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0,
@@ -1809,8 +1830,8 @@ void artiContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupThrea
         currAnchors, descIndexBatch,
         b0, b1,
         sharedDesc[0].invDtF32, sharedDesc[0].dt,
-        prepDesc[0].bounceThresholdF32,
-        lane, forceWritebackOffset, perPointFriction,
+        prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficients.rigidContact,
+        lane, forceWritebackOffset,
         contactHeaders, descIndexBatch,
         frictionHeaders, descIndexBatch,
         outContactPoints, batches[batchIndex].startConstraintIndex,

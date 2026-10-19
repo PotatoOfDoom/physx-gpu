@@ -92,10 +92,10 @@ using physx::gpuslang::PxgResult;
 static_assert(sizeof(physx::PxgShapeSim) == 72, "PxgShapeSim mirror stride");
 static_assert(offsetof(physx::PxgShapeSim, mBodySimIndex) == 56, "node index @56");
 static_assert(offsetof(physx::PxgShapeSim, mHullDataIndex) == 64, "hull index @64");
-static_assert(offsetof(physx::PxgArticulation, jointAccelerations) == 128, "..JOINT_ACCELERATIONS");
-static_assert(offsetof(physx::PxgArticulation, linkBody2Actors) == 200, "..LINK_BODY2ACTORS");
-static_assert(offsetof(physx::PxgArticulation, tempParentToChilds) == 288, "..TEMP_PARENT_TO_CHILDS");
-static_assert(offsetof(physx::PxgArticulation, tempRs) == 296, "..TEMP_RS");
+static_assert(offsetof(physx::PxgArticulation, jointAccelerations) == 120, "..JOINT_ACCELERATIONS");
+static_assert(offsetof(physx::PxgArticulation, linkBody2Actors) == 192, "..LINK_BODY2ACTORS");
+static_assert(offsetof(physx::PxgArticulation, tempParentToChilds) == 272, "..TEMP_PARENT_TO_CHILDS");
+static_assert(offsetof(physx::PxgArticulation, tempRs) == 280, "..TEMP_RS");
 static_assert(offsetof(physx::PxgArticulationData, bodySimIndex) == 4, "..DATA_BODY_SIM_INDEX");
 static_assert(physx::Dy::ArticulationDirtyFlag::eNEEDS_KINEMATIC_UPDATE == (1u << 20), "dirty bit");
 
@@ -107,8 +107,9 @@ const uint32_t UK_NB_RECORDS = 16;   // + 4 guard records past the launch: eNEED
                                      // i<nb guard clears their dirty words visibly
 const uint32_t UK_MAX_LINKS = 6;
 const uint32_t UK_MAX_DOFS = 12;
-const uint32_t UK_RECORD_SIZE = 544;
-const uint32_t UK_JC_SIZE = 544;
+const uint32_t UK_RECORD_SIZE = 496;
+const uint32_t UK_JC_SIZE = 512;
+const uint32_t UK_UNUPLOADED_SLOT = 7;   // 5.12: data.index != slot -> skipped without gpuIndices   // sizeof(Dy::ArticulationJointCore), 5.12
 const uint32_t UK_NB_SHAPES = 24;   // sorted node/shape table entries
 const uint32_t UK_GRID = 4;         // 8 warps: ceil(12/8)=2 iters, slots 12..15 DEAD
 
@@ -261,7 +262,10 @@ static void ukSeed(UkArena& A, uint32_t salt)
     {
         const uint32_t nl = ukNumLinks(r);
         uint8_t* R = A.rec.data() + size_t(r) * UK_RECORD_SIZE;
-        const uint32_t idx = r, bsi = ukBodySim(r), dirty = ukDirtyWord(r);
+        // 5.12: UK_UNUPLOADED_SLOT keeps the 0xFFFFFFFF data.index fill of a
+        // slot nothing was uploaded to -- the NULL-gpuIndices walk must skip it
+        const uint32_t idx = (r == UK_UNUPLOADED_SLOT) ? 0xFFFFFFFFu : r;
+        const uint32_t bsi = ukBodySim(r), dirty = ukDirtyWord(r);
         std::memcpy(R + 0, &idx, 4);
         std::memcpy(R + 4, &bsi, 4);
         std::memcpy(R + 8, &dirty, 4);
@@ -285,7 +289,7 @@ static void ukSeed(UkArena& A, uint32_t salt)
             float cc[7] = { cq.x, cq.y, cq.z, cq.w,
                             ukf(r, 20u + l * 3u), ukf(r, 21u + l * 3u), ukf(r, 22u + l * 3u) };
             std::memcpy(jc + 28, cc, 28);  // childPose
-            jc[539] = uint8_t(ukJointType(r, l));
+            jc[offsetof(physx::Dy::ArticulationJointCore, jointType)] = uint8_t(ukJointType(r, l));   // 507 (5.12)
 
             uint8_t* jd = A.jointData.data() + (size_t(r) * UK_MAX_LINKS + l) * 8;
             const uint32_t jo = (l == 0) ? 0u : ukJointOffset(r, l);
@@ -428,6 +432,15 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
     {
         const uint32_t r = haveIndices ? jobs[j] : j;
         uint8_t* R = W.rec.data() + size_t(r) * UK_RECORD_SIZE;
+        // 5.12: without gpuIndices, a slot whose data.index is not its own (never
+        // uploaded: the 0xFFFFFFFF fill) is skipped entirely
+        if (!haveIndices)
+        {
+            uint32_t dataIndex;
+            std::memcpy(&dataIndex, R + 0, 4);
+            if (dataIndex != r)
+                continue;
+        }
         uint32_t dirty;
         std::memcpy(&dirty, R + 8, 4);
         if (!(dirty & (1u << 20)))
@@ -525,7 +538,8 @@ static void ukMirror(UkArena& W, bool zeroSim, bool haveIndices,
                 UnAlignedSpatialVector parentVel(
                     PxVec3(mvel[parent * 6 + 0], mvel[parent * 6 + 1], mvel[parent * 6 + 2]),
                     PxVec3(mvel[parent * 6 + 3], mvel[parent * 6 + 4], mvel[parent * 6 + 5]));
-                const PxVec3 c2p = p - pP;
+                // 5.12: c2p = body2World.q.rotate(r) (r is the local-frame Rw)
+                const PxVec3 c2p = q.rotate(rv);
                 UnAlignedSpatialVector linkVelocity =
                     FeatherstoneArticulation::translateSpatialVector(-c2p, parentVel);
                 const uint32_t jo = ukJointOffset(r, l);
@@ -785,19 +799,19 @@ static UkStats ukRun(PxgCudaShim& shim, bool zeroSim, bool haveIndices, uint32_t
         auto put = [&](uint32_t off, uint64_t v) { std::memcpy(R + off, &v, 8); };
         put(40, uint64_t(dJc) + uint64_t(r) * UK_MAX_LINKS * UK_JC_SIZE);
         put(48, uint64_t(dJd) + uint64_t(r) * UK_MAX_LINKS * 8u);
-        put(208, uint64_t(dPar) + uint64_t(r) * UK_MAX_LINKS * 4u);
-        put(184, uint64_t(dXf) + uint64_t(r) * UK_MAX_LINKS * 28u);
-        put(200, uint64_t(dXa) + uint64_t(r) * UK_MAX_LINKS * 28u);
-        put(216, uint64_t(dMm) + uint64_t(r) * UK_MAX_LINKS * 80u);
-        put(112, uint64_t(dJp) + uint64_t(r) * UK_MAX_DOFS * 4u);
-        put(120, uint64_t(dJv) + uint64_t(r) * UK_MAX_DOFS * 4u);
-        put(280, uint64_t(dRq) + uint64_t(r) * UK_MAX_LINKS * 16u);
+        put(200, uint64_t(dPar) + uint64_t(r) * UK_MAX_LINKS * 4u);
+        put(176, uint64_t(dXf) + uint64_t(r) * UK_MAX_LINKS * 28u);
+        put(192, uint64_t(dXa) + uint64_t(r) * UK_MAX_LINKS * 28u);
+        put(208, uint64_t(dMm) + uint64_t(r) * UK_MAX_LINKS * 80u);
+        put(104, uint64_t(dJp) + uint64_t(r) * UK_MAX_DOFS * 4u);
+        put(112, uint64_t(dJv) + uint64_t(r) * UK_MAX_DOFS * 4u);
+        put(264, uint64_t(dRq) + uint64_t(r) * UK_MAX_LINKS * 16u);
         put(56, uint64_t(dMv) + uint64_t(r) * UK_MAX_LINKS * 24u);
         put(64, uint64_t(dMa) + uint64_t(r) * UK_MAX_LINKS * 24u);
         put(72, uint64_t(dIf) + uint64_t(r) * UK_MAX_LINKS * 24u);
-        put(128, uint64_t(dJa) + uint64_t(r) * UK_MAX_DOFS * 4u);
-        put(288, uint64_t(dTq) + uint64_t(r) * UK_MAX_LINKS * 16u);
-        put(296, uint64_t(dTr) + uint64_t(r) * UK_MAX_LINKS * 12u);
+        put(120, uint64_t(dJa) + uint64_t(r) * UK_MAX_DOFS * 4u);
+        put(272, uint64_t(dTq) + uint64_t(r) * UK_MAX_LINKS * 16u);
+        put(280, uint64_t(dTr) + uint64_t(r) * UK_MAX_LINKS * 12u);
     }
     PxgDevicePtr dRec = up(A.rec.data(), A.rec.size());
     {

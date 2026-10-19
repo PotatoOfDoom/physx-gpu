@@ -456,6 +456,87 @@ void setArtiLinkTorqueState(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 // ===========================================================================
+// 5.12: getArtiLinkForceState / getArtiLinkTorqueState
+// (articulationDirectGpuApi.cu:520-579).  The OVD full-state snapshot
+// readback (PxgArticulationCore::ovdSnapshotArticulationForces, OVD builds
+// only): the inverses of the two setters above, recovering the applied link
+// force/torque from externalAccelerations.  One thread per (job, link) slot,
+// block 512, Gs5 push block ({8,8,8,4,4}).  Unlike the setters they write
+// EVERY slot of a live job: links at or beyond numLinks get zero.
+//
+//  * force = (invMass > 0) ? top * (1 / invMass) : 0 -- PxVec3 * scalar, one
+//    reciprocal (not three divides);
+//  * torque = q.rotate(localAccel ./ invInertia) with each component guarded
+//    `invInertia.c > 0 ? localAccel.c / invInertia.c : 0` -- TRUE divides.
+// ===========================================================================
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void getArtiLinkForceState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxLinks = gGs5.maxN;
+    const uint groupIndex = globalThreadIndex / maxLinks;
+    const uint linkIndex = globalThreadIndex % maxLinks;
+
+    if (groupIndex < gGs5.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs5.scDesc, gGs5.idx, groupIndex);
+        float3 force = float3(0.0f, 0.0f, 0.0f);
+        if (linkIndex < artiU16Field(record, PXG_ARTI_DATA_NUM_LINKS))
+        {
+            const float invMass =
+                (Ptr<float>(artiPtrField(record, PXG_ARTI_LINK_PROPS)
+                            + uint64_t(linkIndex) * 16u))[3];
+            Ptr<float> ea = Ptr<float>(artiPtrField(record, PXG_ARTI_EXTERNAL_ACCELERATIONS)
+                                       + uint64_t(linkIndex) * 24u);
+            const float3 linAccel = float3(ea[0], ea[1], ea[2]);   // .top
+            force = (invMass > 0.0f) ? (linAccel * (1.0f / invMass)) : float3(0.0f, 0.0f, 0.0f);
+        }
+        Ptr<float> dst = Ptr<float>(gGs5.data
+                                    + (uint64_t(groupIndex) * maxLinks + linkIndex) * 12u);
+        dst[0] = force.x; dst[1] = force.y; dst[2] = force.z;
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void getArtiLinkTorqueState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxLinks = gGs5.maxN;
+    const uint groupIndex = globalThreadIndex / maxLinks;
+    const uint linkIndex = globalThreadIndex % maxLinks;
+
+    if (groupIndex < gGs5.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs5.scDesc, gGs5.idx, groupIndex);
+        float3 torque = float3(0.0f, 0.0f, 0.0f);
+        if (linkIndex < artiU16Field(record, PXG_ARTI_DATA_NUM_LINKS))
+        {
+            Ptr<float> bw = Ptr<float>(artiPtrField(record, PXG_ARTI_LINK_BODY2WORLDS)
+                                       + uint64_t(linkIndex) * PXG_ARTI_TRANSFORM_SIZE);
+            const float4 q = float4(bw[0], bw[1], bw[2], bw[3]);
+            Ptr<float> ea = Ptr<float>(artiPtrField(record, PXG_ARTI_EXTERNAL_ACCELERATIONS)
+                                       + uint64_t(linkIndex) * 24u);
+            const float3 worldAccel = float3(ea[3], ea[4], ea[5]);   // .bottom
+            const float3 localAccel = quatRotateInv(q, worldAccel);
+            Ptr<float> pp = Ptr<float>(artiPtrField(record, PXG_ARTI_LINK_PROPS)
+                                       + uint64_t(linkIndex) * 16u);
+            const float3 invInertia = float3(pp[0], pp[1], pp[2]);
+            const float3 localTorque = float3(
+                invInertia.x > 0.0f ? localAccel.x / invInertia.x : 0.0f,
+                invInertia.y > 0.0f ? localAccel.y / invInertia.y : 0.0f,
+                invInertia.z > 0.0f ? localAccel.z / invInertia.z : 0.0f);
+            torque = quatRotate(q, localTorque);
+        }
+        Ptr<float> dst = Ptr<float>(gGs5.data
+                                    + (uint64_t(groupIndex) * maxLinks + linkIndex) * 12u);
+        dst[0] = torque.x; dst[1] = torque.y; dst[2] = torque.z;
+    }
+}
+
+// ===========================================================================
 // P8.119: the six tendon get/set kernels (articulationDirectGpuApi.cu:
 // 822-1110).  Same launch family (512-wide blocks, one thread per element).
 //

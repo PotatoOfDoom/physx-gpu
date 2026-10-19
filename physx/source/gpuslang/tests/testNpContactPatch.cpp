@@ -176,4 +176,115 @@ PXG_TEST(npContactPatch_setAndRegister)
     for (PxgBufferHandle h : binds) dev->destroyBuffer(h);
 }
 
+// 5.12 overflow hardening (contactPatchUtils.cuh:21-47 and :59-62, :106-126):
+// the contact/force tests cover the WHOLE reservation, a force overflow also
+// invalidates the contact offset, and registerContactPatch keeps the patch
+// reservation of a pair whose pointers are NULL while reporting it as a pair
+// with no contacts (no touch, no patch, patch index invalid).  The atomic order
+// is nondeterministic, so the oracle is per pair given the offsets the GPU
+// handed out: the counters still advance by the full demand, and every pair's
+// flags must match the reference evaluated with nbContacts zeroed exactly when
+// its contact offset came back invalid.
+PXG_TEST(npContactPatch_overflow512)
+{
+    const uint32_t contactSize = 16, forceSize = 4, patchSize = 64;
+    for (int run = 0; run < 3; ++run)
+    {
+        std::mt19937 rng(44011 + run);
+        const uint32_t N = 2048;
+        std::vector<uint32_t> nbContacts(N), priorAllflags(N);
+        uint32_t sumNb = 0, nbActive = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const uint32_t nb = (rng() % 4 == 0) ? 0u : (1u + rng() % 6u);
+            nbContacts[i] = nb;
+            sumNb += nb;
+            if (nb) ++nbActive;
+            const uint32_t statusFlag = rng() % 128, nbPatches = rng() % 2, prevP = rng() % 2;
+            priorAllflags[i] = (prevP << 24) | (statusFlag << 16) | (nbPatches << 8) | (rng() % 256);
+        }
+        // run 0: contact buffer holds ~half, run 1: force buffer holds ~half,
+        // run 2: both short
+        const uint32_t cLimit = (run == 1) ? (1u << 30) : contactSize * (sumNb / 2);
+        const uint32_t fLimit = (run == 0) ? (1u << 30) : forceSize * (sumNb / 2 + (run == 2 ? sumNb / 5 : 0));
+
+        PxgSlangComputeDevice* dev = testDevice();
+        const uint32_t GROUPS = (N + 255) / 256;
+        const std::vector<uint32_t> strides(9, 4);
+        ContactPatchParams p = { N, contactSize, forceSize, patchSize, cLimit, fLimit, 1u << 30 };
+        std::vector<uint32_t> counters(4, 0), outAllflags(N, 0), touch(N, 9), patchCh(N, 9),
+            cOff(N, 7), fOff(N, 7), pIdx(N, 7);
+        PxgBufferHandle bNb = createBufferFrom(dev, nbContacts);
+        PxgBufferHandle bCnt = createBufferFrom(dev, counters);
+        PxgBufferHandle bPrior = createBufferFrom(dev, priorAllflags);
+        PxgBufferHandle bOut = createBufferFrom(dev, outAllflags);
+        PxgBufferHandle bTouch = createBufferFrom(dev, touch);
+        PxgBufferHandle bPatchCh = createBufferFrom(dev, patchCh);
+        PxgBufferHandle bCOff = createBufferFrom(dev, cOff);
+        PxgBufferHandle bFOff = createBufferFrom(dev, fOff);
+        PxgBufferHandle bPIdx = createBufferFrom(dev, pIdx);
+        const std::vector<PxgBufferHandle> binds = { bNb, bCnt, bPrior, bOut, bTouch, bPatchCh, bCOff, bFOff, bPIdx };
+        Kernel kSet("npContactPatch.spv", "setContactPointAndForcePointers", strides, sizeof(ContactPatchParams));
+        kSet.dispatch(GROUPS, binds, p); dev->flush();
+        Kernel kReg("npContactPatch.spv", "registerContactPatch", strides, sizeof(ContactPatchParams));
+        kReg.dispatch(GROUPS, binds, p); dev->flush();
+        const auto gCounters = downloadBuffer<uint32_t>(dev, bCnt, 4);
+        const auto gAllflags = downloadBuffer<uint32_t>(dev, bOut, N);
+        const auto gTouch = downloadBuffer<uint32_t>(dev, bTouch, N);
+        const auto gPatchCh = downloadBuffer<uint32_t>(dev, bPatchCh, N);
+        const auto gCOff = downloadBuffer<uint32_t>(dev, bCOff, N);
+        const auto gFOff = downloadBuffer<uint32_t>(dev, bFOff, N);
+        const auto gPIdx = downloadBuffer<uint32_t>(dev, bPIdx, N);
+        for (PxgBufferHandle h : binds) dev->destroyBuffer(h);
+
+        // the counters advance by the full demand, patches included
+        PXG_CHECK_MSG(gCounters[1] == contactSize * sumNb && gCounters[2] == forceSize * sumNb &&
+                      gCounters[0] == patchSize * nbActive,
+                      "run %d: counters %u/%u/%u", run, gCounters[0], gCounters[1], gCounters[2]);
+        const uint32_t expectFlags = (run == 0) ? 1u : (run == 1) ? 2u : 3u;
+        PXG_CHECK_MSG(gCounters[3] == expectFlags, "run %d: overflow flags %u != %u", run, gCounters[3], expectFlags);
+
+        size_t bad = 0, nOk = 0, nLost = 0, nLostForceOnly = 0;
+        std::vector<uint32_t> patchOffsetsActive;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const uint32_t nbIn = nbContacts[i];
+            if (nbIn == 0)
+            {
+                if (gCOff[i] != INVALID || gFOff[i] != INVALID || gPIdx[i] != INVALID) ++bad;
+            }
+            else if (gCOff[i] != INVALID)
+            {
+                ++nOk;
+                // a kept pair fits both buffers in full and has a valid force range
+                if (gFOff[i] == INVALID || gCOff[i] + contactSize * nbIn > cLimit ||
+                    gFOff[i] + forceSize * nbIn > fLimit || gPIdx[i] == INVALID) ++bad;
+            }
+            else
+            {
+                ++nLost;
+                if (gFOff[i] != INVALID && gFOff[i] + forceSize * nbIn > fLimit) ++bad; // must have been kept
+                if (gFOff[i] == INVALID && run == 1) ++nLostForceOnly;
+                if (gPIdx[i] != INVALID) ++bad; // reserved, but reported invalid
+            }
+            // flags: the 5.6.1 reference with nbContacts zeroed for a lost pair
+            const uint32_t nb = (nbIn != 0 && gCOff[i] == INVALID) ? 0u : nbIn;
+            const uint32_t allflags = priorAllflags[i];
+            const uint32_t oldStatus = u16Low(u32High(allflags));
+            uint32_t statusFlags = oldStatus & (~FLAG_TOUCH_KNOWN);
+            statusFlags |= (nb != 0) ? FLAG_HAS_TOUCH : FLAG_HAS_NO_TOUCH;
+            const uint32_t prevPatches = u16High(u32Low(allflags));
+            const bool prevHadTouch = (oldStatus & FLAG_HAS_TOUCH) != 0;
+            const bool prevTouchKnown = (oldStatus & FLAG_TOUCH_KNOWN) != 0;
+            const uint32_t numPatches = (nb > 0) ? 1u : 0u;
+            const bool change = (prevHadTouch != (nb > 0)) || (!prevTouchKnown);
+            if (gTouch[i] != (change ? 1u : 0u) || gPatchCh[i] != ((prevPatches != numPatches) ? 1u : 0u) ||
+                gAllflags[i] != mergeU16(mergeU8(prevPatches, statusFlags), mergeU8(numPatches, 0u))) ++bad;
+        }
+        PXG_CHECK_MSG(bad == 0 && nOk > 0 && nLost > 0, "run %d: %zu bad, %zu ok, %zu lost", run, bad, nOk, nLost);
+        if (run == 1)
+            PXG_CHECK_MSG(nLostForceOnly == nLost, "run 1: %zu of %zu lost pairs not force-poisoned", nLost - nLostForceOnly, nLost);
+    }
+}
+
 } // namespace

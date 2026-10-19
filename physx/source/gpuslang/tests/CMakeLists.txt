@@ -116,52 +116,7 @@ endif()
 # in place instead and never parked here.  Keep the list minimal.
 set(PXG_TESTS_PENDING_512
     # rigid solver / simulation core: ported to 5.12 (none pending).
-    # articulation (gpuarticulation): PxgArticulation / block-link / joint-core and
-    # internal-constraint layouts, PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES gone,
-    # Dy::SpatialMatrix API, the residual fields of the TGS contact header.
-    testNewArticulations.cpp
-    testArtiBlockLayout.cpp
-    testArtiJcalcPhaseA.cpp
-    testArtiJcalcPhaseB3.cpp
-    testArtiJcalcPhaseC.cpp
-    testArtiJcalcLinkVel.cpp
-    testArtiUnconstrainedVel.cpp
-    testArtiSpatialInertia.cpp
-    testArtiSpatialMatrix.cpp
-    testArtiPropagateInertia.cpp
-    testArtiMassMatrix.cpp
-    testArtiLinkAccel.cpp
-    testArtiSetupInternal.cpp
-    testArtiDmaBack.cpp
-    testArtiSetupICLaunch.cpp
-    testArtiSolveExtTGS.cpp
-    testArtiSolveSelf.cpp
-    testArtiSolveSelfLaunch.cpp
-    testArtiSolveStatic.cpp
-    testArtiSolveDof.cpp
-    testArtiSolveDofPgs.cpp
-    testArtiSolveDFS.cpp
-    testArtiSolveDFSPgs.cpp
-    testArtiSolveInternalLaunch.cpp
-    testArtiSolveInternalLaunchPgs.cpp
-    testArtiConstraintPrepBody.cpp
-    testArtiConstraintPrepWrap.cpp
-    testArtiConstraintPrepPgs.cpp
-    testArtiJointPrepWrap.cpp
-    testArtiJointPrepPgs.cpp
-    testArtiSolvePartitionWrap.cpp
-    testArtiSolvePartitionPgs.cpp
-    testArtiSolveExtPgs.cpp
-    testArtiGravityForces.cpp
-    testArtiCentrifugal.cpp
-    testArtiMassMatrices.cpp
-    testArtiUpdateKinematic.cpp
-    testArtiCoreDescLayout.cpp
-    testArtiConstraintPrepSetup.cpp
-    testArtiPropagate2.cpp
-    testArtiSolveSelfPgs.cpp
-    testArtiSolveSelfLaunchPgs.cpp
-    testArtiSolveStaticPgs.cpp
+    # articulation (gpuarticulation): ported to 5.12 (none pending).
     # narrowphase, rigid (gpunarrowphase rigid contact paths): none -- every rigid
     # narrowphase fixture still compiles against the 5.12 headers.
     # deformable / particle (gpusimulationcontroller FEM cloth / softbody / PBD,
@@ -845,7 +800,7 @@ foreach(suite scan radixSort radixSortDesc aggregateBda radixSortGather preInteg
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda robustProbe p1DeviceV2 p4ModulePath p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations artiBlockLayout artiCoreDescLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide
+        p0Subgroup p0Bda robustProbe p1DeviceV2 p4ModulePath p1HeapAlloc npWarpLib npAtomicLib npFloatIntrinRecipSqrt npTex3d npTex3dBindless p3ShimTexture3d shimBindless shimOrdering sdfTexture sdfCollision sdfTriangleCollision sdfTetrahedronCollision sdfQuery sdfFind sdfFindTriangles sdfFindTets sdfParticle psSdfMidphase psSdfMidphaseDiffuse femClothSdfContactGen femClothSdfContactGenExactGate femClothSdfContactGenNegScale softBodySdfMidphase softBodySdfMidphaseExactGate softBodySdfMidphaseNegScale warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3UnmappedLaunch p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations artiBlockLayout artiCoreDescLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiUpdateBodies3 artiUpdateBodies1T artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch artiAvgImpulse2 artiPropagate2 artiConstraintPrepBody artiConstraintPrepSetup artiConstraintPrepWrap artiJointPrepWrap artiSolvePartitionWrap artiOutputVelocity artiPushImpulse artiApplyTgsSubstepForces artiSaveVelocityPGS artiComputeDeps artiComputeCOM artiInverseDyn2 artiGravityForces artiCentrifugal artiMassMatrices artiUpdateKinematic artiGetSet artiJointPrepPgs artiConstraintPrepPgs artiSolveExtPgs artiSolvePartitionPgs artiSolveSelfPgs artiSolveSelfLaunchPgs artiSolveStaticPgs artiSolveDofPgs artiSolveDFSPgs artiSolveInternalLaunchPgs updateArticulations psMaterials psFluidDensity psSolveDensity psFluidVelocity psBoundaryDensity psMeshMidphaseLayout psMeshMidphase psMeshMidphaseDiffuse psMeshMidphaseFilter psMeshMidphaseWorkIndex psHfMidphaseLayout psHfMidphase psHfMidphaseDiffuse psHfMidphaseClobber psHfMidphaseAccum psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay psDiffuseContactGen psConvexContactGen psConvexDiffuseContactGen bpDescLayout npTetCollide
         pipelineRefusal)
     # A suite whose every test case lives in a PXG_TESTS_PENDING_512 file would run
     # nothing (and main() fails a filter that matches no test), so it is held back

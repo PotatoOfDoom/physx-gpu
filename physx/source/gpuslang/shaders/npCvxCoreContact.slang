@@ -28,7 +28,10 @@
 //
 // Slang port of Gu::Contact (GuConvexSupport.h L895-1048), the contact-patch
 // accumulator the convex-core mesh kernels drive point-by-point:
-//   - addPoint: first patch whose normal.dot(normal) >= SAME_NORMAL (0.999)
+//   - addPoint: first patch whose normal.dot(normal) >= PXC_SAME_NORMAL (0.999; a
+//     Contact member SAME_NORMAL until 5.12, the global since).  5.12 also gives
+//     addPoint / Point::make a faceIndex argument stored in the Point; nothing in
+//     the GPU path reads it, so the (p, d) slots here are unchanged
 //     receives the point via addPatchPoint, else addPatch;
 //   - addPatch: below MAX_PATCHES (16) appends (normal, 1 point); at
 //     capacity it computes maxDot0 = max over existing normals of
@@ -147,7 +150,7 @@ void cctAddPoints(uint3 dtid : SV_DispatchThreadID)
     if (t >= gParams.numTests) return;
     const AccIn s = gIn[t];
 
-    const float SAME_NORMAL = 0.999f; // Contact member init (L953)
+    const float PXC_SAME_NORMAL = 0.999f; // GuConvexSupport.h:17 (5.12; a Contact member before)
 
     uint numPatches = 0u, numPoints = 0u;
     float3 patchNormal[MAX_PATCHES];
@@ -167,7 +170,7 @@ void cctAddPoints(uint3 dtid : SV_DispatchThreadID)
         uint target = NOIDX;
         for (uint i = 0u; i < numPatches && target == NOIDX; ++i)
         {
-            if (dot3Q(patchNormal[i], normal) >= SAME_NORMAL)
+            if (dot3Q(patchNormal[i], normal) >= PXC_SAME_NORMAL)
                 target = i;
         }
 

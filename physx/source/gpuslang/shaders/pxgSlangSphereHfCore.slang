@@ -123,25 +123,21 @@
 //     eE12 -> adj.y, tests triLocV0   (:488)
 //     eE02 -> adj.z, tests triLocV1   (:503)
 //
-// **THE BOUNDARY GUARD IS NOT IN THE CUDA.**  Upstream calls `getTriangle` on the
+// **THE BOUNDARY GUARD.**  Up to 5.6.1 upstream called `getTriangle` on the
 // adjacency index without testing it against 0xFFFFFFFF, so a sphere resting on an
-// edge of the grid's rim makes the switch decode triangle 0xFFFFFFFF: cell
-// 0x7FFFFFFF, sample indices far past the end of the blob.  Nothing faults on a
-// GPU with a large enough mapped heap; `generateContact` is then decided by
-// whatever was in that memory.  A Vulkan buffer_reference read at that offset is
-// undefined behaviour with no such luck.
+// edge of the grid's rim made the switch decode triangle 0xFFFFFFFF: cell
+// 0x7FFFFFFF, sample indices far past the end of the blob.  A Vulkan
+// buffer_reference read at that offset is undefined behaviour, so the port
+// skipped the switch on a BOUNDARY adjacency from the start, keeping the contact.
 //
-// The port therefore SKIPS the switch on a BOUNDARY adjacency, which keeps the
-// contact -- the reading upstream would have taken if the garbage happened to be
-// negative, and the one the geometry argues for: a rim edge has no neighbouring
-// face to occlude it, so there is nothing to reject.
-//
-// AND IT IS NOT THE PORT'S INVENTION.  Twenty lines above this core, in the SAME
-// FILE and over the SAME adjacency array, `computeTriangleFlags` (:583) writes
-// `if (adjTriIndices[a] != 0xFFFFFFFF)` -- the exact test the sphere arm omits.
-// The convention is upstream's; only this one arm does not follow it.  That is
-// UPSTREAM CANDIDATE 49, recorded in RUNTIME_STATUS with the twin as its evidence:
-// DOCUMENTED, NOT REPORTED, like the other 49.
+// 5.12 ADOPTED EXACTLY THAT GUARD (convexHeightfield.cu:444-479, GitHub #502: "A
+// rim edge has no neighbor triangle (BOUNDARY). It stays active and keeps the
+// result of distancePointTriangleSquared."): each arm `break`s on
+// `triAdjTriIndices.{x,y,z} == BOUNDARY` before the fetch, leaving
+// generateContact as distancePointTriangleSquared set it.  The port's
+// `mask == eEij && adj != BOUNDARY` chain is the same control flow, so the guard
+// is now a faithful transcription rather than a documented divergence.
+// (`computeTriangleFlags`, in the same file, always tested the sentinel.)
 //
 // The sweep measures what the unguarded form costs here: `C10-boundary-guard-
 // dropped` is the upstream spelling, and it segfaults 4 times out of 4.
@@ -355,8 +351,8 @@ public ShCoreOut shSphereHfCore(uint globalThreadIndex,
     const float sqInflatedSphereRadius = inflatedRadius * inflatedRadius;
     if (dist >= 0.0f && sqInflatedSphereRadius > sqDist && generateContact)
     {
-        // The edge-concavity switch (:466-516).  The BOUNDARY guards are the
-        // port's, not upstream's -- see the header.
+        // The edge-concavity switch (5.12 :444-489), with the BOUNDARY guards
+        // 5.12 added (GitHub #502) -- see the header.
         if (mask == PT_EE01 && adj.x != HF_BOUNDARY)
         {
             float3 a0, a1, a2;

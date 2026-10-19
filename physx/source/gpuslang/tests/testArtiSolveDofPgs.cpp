@@ -154,9 +154,10 @@ static void sdpSeed(SdpArena& B, uint32_t salt)
             ic.mResponse[lane] = response;
             ic.mRecipResponse[lane] = 1.0f / response;
             ic.mMaxJointVelocity[lane] = 0.4f + 0.2f * std::fabs(fv(lane, d, 35, salt));
-            ic.mConstraintMaxImpulse[lane] = 0.6f + 0.3f * std::fabs(fv(lane, d, 36, salt));
+            // 5.12: the dof solve reads the external effort the forward pass parked
+            // here (5.6.1 read articulation.jointForce[jointOffset + dof])
+            ic.mExternalEffort[lane] = 0.5f * fv(lane, d, 36, salt);
             ic.mDriveImpulse[lane] = 0.3f * fv(lane, d, 37, salt);
-            ic.mMaxFrictionForce[lane] = 0.4f + 0.2f * std::fabs(fv(lane, d, 38, salt));
             ic.mAccumulatedFrictionImpulse[lane] = 0.2f * fv(lane, d, 39, salt);
 
             // both drive arms: maxImpulse > 0 for (lane+d)%2, else the force clamp
@@ -214,10 +215,9 @@ static void sdpMirror(SdpArena& W, uint32_t flags, DofCov& cov)
 
         const uint32_t jointOffset = L.mJointOffset[lane];
         const uint32_t dofCount = L.mDofs[lane];
-        const float* jf = &W.jf[lane * SDP_MAX_DOFS];
 
         RefError err;
-        refSolveDofLanePgs(W.df.data(), jointOffset, dofCount, jf,
+        refSolveDofLanePgs(W.df.data(), jointOffset, dofCount,
                            SDP_DT, SDP_SCENE_DT, SDP_INV_DT, SDP_ELAPSED, SDP_ERP,
                            velIter, doFDPL, velBefore,
                         childDelta, parentDelta,
@@ -265,7 +265,7 @@ static size_t sdpRun(PxgCudaShim& shim, uint32_t flags, uint32_t salt)
                 cov.maxArm, cov.forceArm, cov.velHits);
     PXG_CHECK_MSG(cov.locked > 0 && cov.limited > 0 && cov.freeDof > 0, "motion coverage hole");
     if (flags & 2u)
-        PXG_CHECK_MSG(cov.oldModel > 0 && cov.newModel > 0 && cov.maxArm > 0 && cov.forceArm > 0,
+        PXG_CHECK_MSG(cov.newModel > 0 && cov.maxArm > 0 && cov.forceArm > 0,
                       "drive/friction coverage hole");
     if (flags & 4u)
         PXG_CHECK_MSG(cov.velHits > 0, "velocity-limit coverage hole");

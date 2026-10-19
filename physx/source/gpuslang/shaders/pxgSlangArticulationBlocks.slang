@@ -27,7 +27,8 @@
 // pxgSlangArticulationBlocks.slang
 //
 // The BLOCK-LAYOUT address map: PxgArticulationBlockData and
-// PxgArticulationBlockDofData (gpusimulationcontroller/include/PxgArticulation.h)
+// PxgArticulationBlockDofData (gpusimulationcontroller/include/PxgArticulationBlockData.h,
+// which 5.12 split out of PxgArticulation.h)
 // and the three sub-blocks they are built from.
 //
 // These are not ordinary structs.  Each one holds the state of THIRTY-TWO
@@ -39,8 +40,8 @@
 //     ^ struct stride    ^ field offset  ^ element stride
 //
 // — three numbers, every one of them part of the ABI, and none of them
-// inferable from the others.  `PxgArticulationBlockLinkData` alone is 29184
-// bytes of such fields.
+// inferable from the others.  `PxgArticulationBlockLinkData` alone is 28416
+// bytes of such fields (29184 in 5.6.1, before mBiasForce went).
 //
 // EVERY CONSTANT BELOW WAS GENERATED from host-side `sizeof`/`offsetof` of the
 // real engine structs rather than transcribed, and each is pinned again by
@@ -93,7 +94,7 @@ public static const uint PXG_AB_mStateDirty                             =   7040
 public static const uint PXG_AB_mTotalSelfConstraintCount               =   7072;
 public static const uint PXG_AB_mSelfConstraintOffset                   =   7076;
 
-public static const uint PXG_AB_DOF_SIZE                                =  12800;
+public static const uint PXG_AB_DOF_SIZE                                =  11648;
 public static const uint PXG_AB_DOF_mJointPositions                     =      0;
 public static const uint PXG_AB_DOF_mJointVelocities                    =    128;
 public static const uint PXG_AB_DOF_mJointUnconstrainedVelocities       =    256;
@@ -107,16 +108,16 @@ public static const uint PXG_AB_DOF_mWorldMotionMatrix                  =   1152
 public static const uint PXG_AB_DOF_mLocalMotionMatrix                  =   1920;
 public static const uint PXG_AB_DOF_mIsInvDW                            =   2688;
 public static const uint PXG_AB_DOF_mIsW                                =   3456;
-public static const uint PXG_AB_DOF_mJointAxis                          =   4224;
-public static const uint PXG_AB_DOF_mInvStIsT_x                         =   4992;
-public static const uint PXG_AB_DOF_mInvStIsT_y                         =   5120;
-public static const uint PXG_AB_DOF_mInvStIsT_z                         =   5248;
-public static const uint PXG_AB_DOF_mDofIds                             =   5376;
-public static const uint PXG_AB_DOF_mMotion                             =   5408;
-public static const uint PXG_AB_DOF_mConstraintData                     =   5440;
+public static const uint PXG_AB_DOF_mInvStIsT_x                         =   4224;
+public static const uint PXG_AB_DOF_mInvStIsT_y                         =   4352;
+public static const uint PXG_AB_DOF_mInvStIsT_z                         =   4480;
+public static const uint PXG_AB_DOF_mDofIds                             =   4608;
+public static const uint PXG_AB_DOF_mMotion                             =   4640;
+public static const uint PXG_AB_DOF_mConstraintData                     =   4672;
 
 // ---------------------------------------------------------------------------
-// PxgArticulationBlockLinkData (29184 bytes) — the largest of the three, and
+// PxgArticulationBlockLinkData (28416 bytes; 5.12 removed the 768-byte
+// mBiasForce block the old transmitted-friction model fed) — the largest of the three, and
 // the one the link loops walk.  Deferred out of the first block tranche so the
 // map's infrastructure and its biggest consumer could be reviewed separately.
 //
@@ -127,7 +128,7 @@ public static const uint PXG_AB_DOF_mConstraintData                     =   5440
 //   * mSpatialResponseMatrix is a 6x6 block (9 float4 columns, 4608 bytes), not
 //     the 7-column 3584-byte PxgSpatialMatrixBlock immediately before it.
 // ---------------------------------------------------------------------------
-public static const uint PXG_AB_LINK_SIZE                                     =  29184;
+public static const uint PXG_AB_LINK_SIZE                                     =  28416;
 public static const uint PXG_AB_SPATIAL_MATRIX_6X6_BLOCK_SIZE                 =   4608;
 public static const uint PXG_AB_LINK_mSpatialArticulatedInertia               =      0;
 public static const uint PXG_AB_LINK_mSpatialResponseMatrix                   =   3584;
@@ -147,33 +148,32 @@ public static const uint PXG_AB_LINK_mCoriolis                                = 
 public static const uint PXG_AB_LINK_mConstraintForces                        =  17920;
 public static const uint PXG_AB_LINK_mMotionAcceleration                      =  18688;
 public static const uint PXG_AB_LINK_mMotionAccelerationInternal              =  19456;
-public static const uint PXG_AB_LINK_mBiasForce                               =  20224;
-public static const uint PXG_AB_LINK_mDeltaScale                              =  20992;
-public static const uint PXG_AB_LINK_mRw_x                                    =  21120;
-public static const uint PXG_AB_LINK_mRw_y                                    =  21248;
-public static const uint PXG_AB_LINK_mRw_z                                    =  21376;
-public static const uint PXG_AB_LINK_mRelativeQuat                            =  21504;
-public static const uint PXG_AB_LINK_mNbStaticContacts                        =  22016;
-public static const uint PXG_AB_LINK_mStaticContactStartIndex                 =  22144;
-public static const uint PXG_AB_LINK_mNbStaticJoints                          =  22272;
-public static const uint PXG_AB_LINK_mStaticJointStartIndex                   =  22400;
-public static const uint PXG_AB_LINK_mPreTransform                            =  22528;
-public static const uint PXG_AB_LINK_mAccumulatedPose                         =  23552;
-public static const uint PXG_AB_LINK_mChildPose                               =  24576;
-public static const uint PXG_AB_LINK_mParentPose                              =  25600;
-public static const uint PXG_AB_LINK_mDeltaQ                                  =  26624;
-public static const uint PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW =  27136;
-public static const uint PXG_AB_LINK_mInvInertiaXYZ_invMassW                  =  27648;
-public static const uint PXG_AB_LINK_mCfm                                     =  28160;
-public static const uint PXG_AB_LINK_mChildrenOffset                          =  28288;
-public static const uint PXG_AB_LINK_mNumChildren                             =  28416;
-public static const uint PXG_AB_LINK_mJointOffset                             =  28544;
-public static const uint PXG_AB_LINK_mParents                                 =  28672;
-public static const uint PXG_AB_LINK_mDofs                                    =  28800;
-public static const uint PXG_AB_LINK_mJointType                               =  28832;
-public static const uint PXG_AB_LINK_mInvDofIds                               =  28864;
-public static const uint PXG_AB_LINK_mDisableGravity                          =  29056;
-public static const uint PXG_AB_LINK_mRetainsAcceleration                     =  29088;
+public static const uint PXG_AB_LINK_mDeltaScale                              =  20224;
+public static const uint PXG_AB_LINK_mRw_x                                    =  20352;
+public static const uint PXG_AB_LINK_mRw_y                                    =  20480;
+public static const uint PXG_AB_LINK_mRw_z                                    =  20608;
+public static const uint PXG_AB_LINK_mRelativeQuat                            =  20736;
+public static const uint PXG_AB_LINK_mNbStaticContacts                        =  21248;
+public static const uint PXG_AB_LINK_mStaticContactStartIndex                 =  21376;
+public static const uint PXG_AB_LINK_mNbStaticJoints                          =  21504;
+public static const uint PXG_AB_LINK_mStaticJointStartIndex                   =  21632;
+public static const uint PXG_AB_LINK_mPreTransform                            =  21760;
+public static const uint PXG_AB_LINK_mAccumulatedPose                         =  22784;
+public static const uint PXG_AB_LINK_mChildPose                               =  23808;
+public static const uint PXG_AB_LINK_mParentPose                              =  24832;
+public static const uint PXG_AB_LINK_mDeltaQ                                  =  25856;
+public static const uint PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW =  26368;
+public static const uint PXG_AB_LINK_mInvInertiaXYZ_invMassW                  =  26880;
+public static const uint PXG_AB_LINK_mCfm                                     =  27392;
+public static const uint PXG_AB_LINK_mChildrenOffset                          =  27520;
+public static const uint PXG_AB_LINK_mNumChildren                             =  27648;
+public static const uint PXG_AB_LINK_mJointOffset                             =  27776;
+public static const uint PXG_AB_LINK_mParents                                 =  27904;
+public static const uint PXG_AB_LINK_mDofs                                    =  28032;
+public static const uint PXG_AB_LINK_mJointType                               =  28064;
+public static const uint PXG_AB_LINK_mInvDofIds                               =  28096;
+public static const uint PXG_AB_LINK_mDisableGravity                          =  28288;
+public static const uint PXG_AB_LINK_mRetainsAcceleration                     =  28320;
 
 // ---------------------------------------------------------------------------
 // The RECORD structs the block fill reads FROM: PxgArticulationLink,
@@ -219,37 +219,35 @@ public static const uint PXG_AR_LINK_disableGravity                         =   
 public static const uint PXG_AR_LINK_retainsAccelerations                   =     77;
 public static const uint PXG_AR_LINK_cfmScale                               =     72;
 
-public static const uint PXG_AR_JOINT_CORE_SIZE                             =    544;
+public static const uint PXG_AR_JOINT_CORE_SIZE                             =    512;
 public static const uint PXG_AR_JOINT_parentPose                            =      0;
 public static const uint PXG_AR_JOINT_childPose                             =     28;
 public static const uint PXG_AR_JOINT_limits                                =     56;
 public static const uint PXG_AR_JOINT_drives                                =    104;
-public static const uint PXG_AR_JOINT_targetP                               =    296;
-public static const uint PXG_AR_JOINT_targetV                               =    320;
-public static const uint PXG_AR_JOINT_armature                              =    344;
-public static const uint PXG_AR_JOINT_frictionParams                        =    420;
-public static const uint PXG_AR_JOINT_maxJointVelocity                      =    492;
-public static const uint PXG_AR_JOINT_jointPos                              =    368;
-public static const uint PXG_AR_JOINT_jointVel                              =    392;
-public static const uint PXG_AR_JOINT_dofIds                                =    520;
-public static const uint PXG_AR_JOINT_invDofIds                             =    532;
-public static const uint PXG_AR_JOINT_motion                                =    526;
-public static const uint PXG_AR_JOINT_frictionCoefficient                   =    416;
-public static const uint PXG_AR_JOINT_jointOffset                           =    516;
-public static const uint PXG_AR_JOINT_jCalcUpdateFrames                     =    538;
-public static const uint PXG_AR_JOINT_jointType                             =    539;
-public static const uint PXG_AR_DRIVE_SIZE                                  =     32;
+public static const uint PXG_AR_JOINT_targetP                               =    272;
+public static const uint PXG_AR_JOINT_targetV                               =    296;
+public static const uint PXG_AR_JOINT_armature                              =    320;
+public static const uint PXG_AR_JOINT_frictionParams                        =    392;
+public static const uint PXG_AR_JOINT_maxJointVelocity                      =    464;
+public static const uint PXG_AR_JOINT_jointPos                              =    344;
+public static const uint PXG_AR_JOINT_jointVel                              =    368;
+public static const uint PXG_AR_JOINT_dofIds                                =    488;
+public static const uint PXG_AR_JOINT_invDofIds                             =    500;
+public static const uint PXG_AR_JOINT_motion                                =    494;
+public static const uint PXG_AR_JOINT_jCalcUpdateFrames                     =    506;
+public static const uint PXG_AR_JOINT_jointType                             =    507;
+public static const uint PXG_AR_DRIVE_SIZE                                  =     28;
 public static const uint PXG_AR_LIMIT_SIZE                                  =      8;
 public static const uint PXG_AR_FRICTION_SIZE                               =     12;
 
 // Sub-fields of the three per-axis parameter structs the per-dof fill reads
-// (P8.75).  PxPerformanceEnvelope is nested INSIDE PxArticulationDrive at +12,
+// (P8.75).  PxPerformanceEnvelope is nested INSIDE PxArticulationDrive at +8
+// (5.12 removed maxForce, so the envelope moved down from +12),
 // so an envelope field is drive[dofId] + PXG_AR_DRIVE_envelope + PXG_AR_ENV_*.
 public static const uint PXG_AR_DRIVE_stiffness                             =      0;
 public static const uint PXG_AR_DRIVE_damping                               =      4;
-public static const uint PXG_AR_DRIVE_maxForce                              =      8;
-public static const uint PXG_AR_DRIVE_envelope                              =     12;
-public static const uint PXG_AR_DRIVE_driveType                             =     28;
+public static const uint PXG_AR_DRIVE_envelope                              =      8;
+public static const uint PXG_AR_DRIVE_driveType                             =     24;
 public static const uint PXG_AR_ENV_SIZE                                    =     16;
 public static const uint PXG_AR_ENV_maxEffort                               =      0;
 public static const uint PXG_AR_ENV_maxActuatorVelocity                     =      4;
@@ -266,8 +264,8 @@ public static const uint PXG_AR_JCD_nbDof                                   =   
 public static const uint PXG_AR_JCD_jointOffset                             =      0;
 
 // ---------------------------------------------------------------------------
-// PxgArticulationInternalConstraintData (7296 bytes), embedded in every
-// PxgArticulationBlockDofData at offset 5440 -- the LAST unmapped layer of the
+// PxgArticulationInternalConstraintData (6912 bytes; 7296 in 5.6.1), embedded in every
+// PxgArticulationBlockDofData at offset 4672 -- the LAST unmapped layer of the
 // articulation solver.  Four PxgSpatialVectorBlocks then thirty scalar [32]
 // arrays: the drive, limit, friction and envelope parameters jcalc's per-dof
 // loop fills and the solver reads back.
@@ -282,7 +280,7 @@ public static const uint PXG_AR_JCD_jointOffset                             =   
 // not 4, and they sit adjacent: reading either at a 4-byte stride lands inside
 // the other.
 // ---------------------------------------------------------------------------
-public static const uint PXG_AB_IC_SIZE                                           =   7296;
+public static const uint PXG_AB_IC_SIZE                                           =   6912;
 public static const uint PXG_AB_IC_mRow0                                          =      0;
 public static const uint PXG_AB_IC_mRow1                                          =    768;
 public static const uint PXG_AB_IC_mDeltaVA                                       =   1536;
@@ -295,26 +293,25 @@ public static const uint PXG_AB_IC_mHighImpulse                                 
 public static const uint PXG_AB_IC_mLowImpulse                                    =   3968;
 public static const uint PXG_AB_IC_mMaxJointVelocity                              =   4096;
 public static const uint PXG_AB_IC_mDriveImpulse                                  =   4224;
-public static const uint PXG_AB_IC_mConstraintMaxImpulse                          =   4352;
-public static const uint PXG_AB_IC_mMaxForce                                      =   4480;
-public static const uint PXG_AB_IC_mDriveType                                     =   4608;
-public static const uint PXG_AB_IC_mMaxEffort                                     =   4736;
-public static const uint PXG_AB_IC_mMaxActuatorVelocity                           =   4864;
-public static const uint PXG_AB_IC_mVelocityDependentResistance                   =   4992;
-public static const uint PXG_AB_IC_mSpeedEffortGradient                           =   5120;
-public static const uint PXG_AB_IC_mDriveTargetPos                                =   5248;
-public static const uint PXG_AB_IC_mArmature                                      =   5376;
-public static const uint PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW =   5504;
-public static const uint PXG_AB_IC_mDriveStiffness                                =   6016;
-public static const uint PXG_AB_IC_mDamping                                       =   6144;
-public static const uint PXG_AB_IC_mDriveTargetVel                                =   6272;
-public static const uint PXG_AB_IC_mTargetPosBias                                 =   6400;
-public static const uint PXG_AB_IC_mAccumulatedFrictionImpulse                    =   6528;
-public static const uint PXG_AB_IC_mMaxFrictionForce                              =   6656;
-public static const uint PXG_AB_IC_mFrictionCoefficient                           =   6784;
-public static const uint PXG_AB_IC_mStaticFrictionEffort                          =   6912;
-public static const uint PXG_AB_IC_mDynamicFrictionEffort                         =   7040;
-public static const uint PXG_AB_IC_mViscousFrictionCoefficient                    =   7168;
+public static const uint PXG_AB_IC_mDriveType                                     =   4352;
+public static const uint PXG_AB_IC_mMaxEffort                                     =   4480;
+public static const uint PXG_AB_IC_mMaxActuatorVelocity                           =   4608;
+public static const uint PXG_AB_IC_mVelocityDependentResistance                   =   4736;
+public static const uint PXG_AB_IC_mSpeedEffortGradient                           =   4864;
+// 5.12: the per-dof external joint effort (jointForce) the forward pass parks
+// here, so the solver no longer reads articulation.jointForce directly
+public static const uint PXG_AB_IC_mExternalEffort                                =   4992;
+public static const uint PXG_AB_IC_mDriveTargetPos                                =   5120;
+public static const uint PXG_AB_IC_mArmature                                      =   5248;
+public static const uint PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW =   5376;
+public static const uint PXG_AB_IC_mDriveStiffness                                =   5888;
+public static const uint PXG_AB_IC_mDamping                                       =   6016;
+public static const uint PXG_AB_IC_mDriveTargetVel                                =   6144;
+public static const uint PXG_AB_IC_mTargetPosBias                                 =   6272;
+public static const uint PXG_AB_IC_mAccumulatedFrictionImpulse                    =   6400;
+public static const uint PXG_AB_IC_mStaticFrictionEffort                          =   6528;
+public static const uint PXG_AB_IC_mDynamicFrictionEffort                         =   6656;
+public static const uint PXG_AB_IC_mViscousFrictionCoefficient                    =   6784;
 
 public static const uint PXG_AR_SUBSPACE_SIZE                                     =     80;
 public static const uint PXG_AR_SUBSPACE_COLUMNS                                  =      0;

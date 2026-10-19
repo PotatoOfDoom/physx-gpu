@@ -171,6 +171,7 @@ struct AubRecord
     std::vector<uint8_t> motionVel;    // 24 * (maxLinks + 1)
     std::vector<uint8_t> accel;        // 24 * (maxLinks + 1)
     std::vector<uint8_t> incoming;     // 24 * (maxLinks + 1)
+    std::vector<uint8_t> zAForces;     // 24 * maxLinks: 5.12 external-Z chain (read only)
 };
 
 static void aubFillRecord(AubRecord& r, uint32_t recIdx)
@@ -183,8 +184,12 @@ static void aubFillRecord(AubRecord& r, uint32_t recIdx)
     r.motionVel.assign(24 * (AUB_MAX_LINKS + 1), 0xAB);
     r.accel.assign(24 * (AUB_MAX_LINKS + 1), 0xAB);
     r.incoming.assign(24 * (AUB_MAX_LINKS + 1), 0xAB);
+    r.zAForces.assign(24 * AUB_MAX_LINKS, 0xAB);
     for (uint32_t i = 0; i < AUB_MAX_LINKS; ++i)
     {
+        float* za = reinterpret_cast<float*>(r.zAForces.data() + 24 * i);
+        for (uint32_t k = 0; k < 6; ++k)
+            za[k] = v(i, 30 + k) * 0.5f;
         float* rec = reinterpret_cast<float*>(r.links.data() + 80 * i);
         // the two float4s: angular @0 (w = penBiasClamp), linear @16 (w = invMass)
         rec[0] = v(i, 0); rec[1] = v(i, 1); rec[2] = v(i, 2); rec[3] = v(i, 3) + 3.0f;
@@ -202,7 +207,8 @@ static void aubFillRecord(AubRecord& r, uint32_t recIdx)
 // ---------------------------------------------------------------------------
 static void aubMirror(physx::PxgArticulationBlockData* ab,
                       physx::PxgArticulationBlockLinkData* lk, AubRecord& r, uint32_t lane,
-                      uint32_t linkIndex, float dt, bool integrate)
+                      uint32_t linkIndex, float dt, bool integrate, bool extEvery,
+                      bool sleepingDisabled)
 {
     const uint32_t linkCount = ab->mNumLinks[lane];
     if (linkIndex >= linkCount)
@@ -225,7 +231,15 @@ static void aubMirror(physx::PxgArticulationBlockData* ab,
     }
     else
     {
-        const SpatialVectorF zaExt = loadSpatialVectorF(L.mZAVector, lane);
+        SpatialVectorF zaExt = loadSpatialVectorF(L.mZAVector, lane);
+        if (extEvery)
+        {
+            // 5.12: the external-Z chain updateBodiesLaunch1T accumulated into the
+            // record's zAForces is added back for the readback
+            const float* za = reinterpret_cast<const float*>(r.zAForces.data() + 24 * linkIndex);
+            zaExt.top += PxVec3(za[0], za[1], za[2]);
+            zaExt.bottom += PxVec3(za[3], za[4], za[5]);
+        }
         const SpatialVectorF zaInt = loadSpatialVectorF(L.mZAIntVector, lane);
         const SpatialVectorF accExt = loadSpatialVectorF(L.mMotionAcceleration, lane);
         const SpatialVectorF accInt = loadSpatialVectorF(L.mMotionAccelerationInternal, lane);
@@ -279,13 +293,18 @@ static void aubMirror(physx::PxgArticulationBlockData* ab,
     if (!integrate)
         posMotionV *= invDt;
 
-    const float inv4[4] = { invInertia.x, invInertia.y, invInertia.z, invInertia.w };
-    pxgref::aslMirror(reinterpret_cast<float*>(r.sleepData.data() + 32 * linkIndex), lwc, pose.q,
-                      posMotionV.bottom, posMotionV.top, dt, sleepThreshold, inv4);
-    r.wakeCounters[linkIndex] = lwc;
+    // 5.12: no sleep check (and no wake-counter write) when sleeping is disabled
+    if (!sleepingDisabled)
+    {
+        const float inv4[4] = { invInertia.x, invInertia.y, invInertia.z, invInertia.w };
+        pxgref::aslMirror(reinterpret_cast<float*>(r.sleepData.data() + 32 * linkIndex), lwc, pose.q,
+                          posMotionV.bottom, posMotionV.top, dt, sleepThreshold, inv4);
+        r.wakeCounters[linkIndex] = lwc;
+    }
 }
 
-static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signedZeros)
+static void aubRun(PxgCudaShim& shim, bool integrate, bool extEvery, bool sleepingDisabled,
+                   size_t& bad, size_t& signedZeros)
 {
     std::vector<physx::PxgArticulationBlockData> abImg(AUB_WARPS);
     std::vector<physx::PxgArticulationBlockLinkData> lkImg(size_t(AUB_WARPS) * AUB_MAX_LINKS);
@@ -322,7 +341,7 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
         return;
     }
 
-    struct RecPtrs { PxgDevicePtr links, sleep, wake, b2w, mv, acc, inc; };
+    struct RecPtrs { PxgDevicePtr links, sleep, wake, b2w, mv, acc, inc, za; };
     std::vector<RecPtrs> rp(AUB_ARTS);
     for (uint32_t k = 0; k < AUB_ARTS; ++k)
     {
@@ -334,6 +353,7 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
         rp[k].mv = up(r.motionVel.data(), r.motionVel.size());
         rp[k].acc = up(r.accel.data(), r.accel.size());
         rp[k].inc = up(r.incoming.data(), r.incoming.size());
+        rp[k].za = up(r.zAForces.data(), r.zAForces.size());
         physx::PxgArticulation& A = arts[k];
         A.links = reinterpret_cast<physx::PxgArticulationLink*>(rp[k].links);
         A.linkSleepData = reinterpret_cast<physx::PxgArticulationLinkSleepData*>(rp[k].sleep);
@@ -342,6 +362,7 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
         A.motionVelocities = reinterpret_cast<UnAlignedSpatialVector*>(rp[k].mv);
         A.motionAccelerations = reinterpret_cast<UnAlignedSpatialVector*>(rp[k].acc);
         A.linkIncomingJointForces = reinterpret_cast<UnAlignedSpatialVector*>(rp[k].inc);
+        A.zAForces = reinterpret_cast<UnAlignedSpatialVector*>(rp[k].za);
     }
     shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
     shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
@@ -355,6 +376,9 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
     desc.mArticulationBlocks = reinterpret_cast<physx::PxgArticulationBlockData*>(dAb);
     desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
     desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    // 5.12: the two flag bytes this kernel reads (the memset poison would read true)
+    desc.isExternalForcesEveryTgsIterationEnabled = extEvery;
+    desc.isSleepingDisabled = sleepingDisabled;
     shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
     // the expectation
@@ -364,7 +388,8 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
     for (uint32_t a = 0; a < AUB_ARTS; ++a)
         for (uint32_t li = 0; li < AUB_MAX_LINKS; ++li)
             aubMirror(&wantAb[a / 32u], &wantLk[size_t(a / 32u) * AUB_MAX_LINKS],
-                      wantRecs[aubArtiIndex(a)], a & 31u, li, AUB_DT, integrate);
+                      wantRecs[aubArtiIndex(a)], a & 31u, li, AUB_DT, integrate, extEvery,
+                      sleepingDisabled);
 
     // The CUDA arg pack carries the bool in ONE byte at offset 12; the three
     // bytes above it are padding with UNSPECIFIED content, so the shader must
@@ -420,6 +445,7 @@ static void aubRun(PxgCudaShim& shim, bool integrate, size_t& bad, size_t& signe
         pull(rp[k].mv, wr.motionVel, "motionVel");
         pull(rp[k].acc, wr.accel, "accel");
         pull(rp[k].inc, wr.incoming, "incoming");
+        pull(rp[k].za, wr.zAForces, "zAForces");
     }
 
     for (PxgDevicePtr dp : devBufs)
@@ -453,8 +479,11 @@ PXG_TEST(artiUpdateBodies2)
                   identity);
 
     size_t bad = 0, signedZeros = 0;
-    aubRun(shim, true, bad, signedZeros);
-    aubRun(shim, false, bad, signedZeros);
+    aubRun(shim, true, false, false, bad, signedZeros);
+    aubRun(shim, false, false, false, bad, signedZeros);
+    // 5.12: the external-Z chain readback and the sleeping-disabled skip
+    aubRun(shim, true, true, false, bad, signedZeros);
+    aubRun(shim, false, false, true, bad, signedZeros);
     std::printf("[ info ] aub: signed zeros %zu\n", signedZeros);
     PXG_CHECK_MSG(bad == 0, "updateBodiesLaunch_Part2 is not bit-exact against the engine");
 }

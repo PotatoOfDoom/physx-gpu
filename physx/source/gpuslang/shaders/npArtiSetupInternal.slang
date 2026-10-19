@@ -49,8 +49,9 @@
 //     dofs whose drive guard is false (the value is dead), so a port that
 //     zeroes it per link is behaviour-equivalent -- the port keeps the CUDA's
 //     lifetime anyway.
-//  2. The spherical drive axis accumulates the LOCAL motion top
-//     (mLocalMotionMatrix), not the world one, scaled by mDriveTargetPos.
+//  2. (5.12) The spherical drive axis takes mDriveTargetPos in the component
+//     named by mDofIds (twist/swing1/swing2 -> x/y/z), an ASSIGNMENT; 5.6.1
+//     accumulated the LOCAL motion top scaled by the target.
 //  3. PxVec3::normalize divides ONLY when magnitude > 0 (P8.84's trap 4);
 //     angle < 1e-12 falls back to axis (1,0,0), angle 0.
 //  4. targetQ flips sign when targetQ.dot(qB2qA) < 0 (4D dot).
@@ -59,16 +60,16 @@
 //     dofs[i]; only prismatic (1 dof) reaches it, so they coincide.  As-is.
 //  7. cA2w/cB2w in the linear path are the child/parent joint-pose POSITIONS
 //     rotated by the link poses' quats -- rotate only, no translation add.
-//  8. transmissionForce = |bias| * (frictionCoefficient * stepDt), where
-//     |bias| is UnAlignedSpatialVector::magnitude = |top| + |bottom| -- the
-//     SUM of two vector magnitudes, not sqrt of the total.
+//  8. (5.6.1 only: transmissionForce from mBiasForce; removed in 5.12 with the
+//     deprecated friction model.)
 //  9. cfm = max(parent.mCfm, link.mCfm); recipResponse = 1/(unitResponse+cfm)
 //     UNGUARDED (engine behaviour, transcribed).
 // 10. mRow1 stores -axis1 (axis1 is already the negated axis; the store
 //     negates again).
-// 11. Drive guard: (maxForce>0 || maxEffort>0) && (stiffness>0 || damping>0);
-//     the else branch writes a ZERO desc and zero mConstraintMaxImpulse.
-// 12. maxForceScale = (flags & eDRIVE_LIMITS_ARE_FORCES) ? dt : 1.
+// 11. Drive guard (5.12): maxEffort>0 && (stiffness>0 || damping>0); the else
+//     branch writes a ZERO desc.  (5.6.1 also took maxForce>0 and stored a
+//     clamp into mConstraintMaxImpulse.)
+// 12. (5.6.1 only: maxForceScale from eDRIVE_LIMITS_ARE_FORCES.)
 // 13. mLimitError written only for eLIMITED motion.
 // 14. computeImplicitDriveParams gets isTGSSolver ? stepDt : dt as its dt and
 //     dt as simDt.
@@ -111,8 +112,6 @@ static const uint SI_MOTION_LIMITED = 1u;
 static const uint SI_DRIVE_NONE = 2u;
 static const uint SI_DRIVE_FORCE = 0u;
 static const uint SI_DRIVE_ACCELERATION = 1u;
-// PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES (PxSolverDefs.h:315, 1<<1)
-static const uint SI_FLAG_DRIVE_LIMITS_ARE_FORCES = 2u;
 // PxArticulationAxis::eX
 static const uint SI_AXIS_EX = 3u;
 
@@ -234,9 +233,8 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
 {
     const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
 
-    const float maxForceScale =
-        (abU32(artiBlock, PXG_AB_mFlags, lane) & SI_FLAG_DRIVE_LIMITS_ARE_FORCES) != 0u
-            ? dt : 1.0f;
+    // (5.12: no maxForceScale -- PxArticulationDrive::maxForce and
+    // eDRIVE_LIMITS_ARE_FORCES are gone)
 
     // trap 1: per-lane scratch, persists across links (CUDA: __shared__)
     float driveError[3] = { 0.0f, 0.0f, 0.0f };
@@ -256,17 +254,12 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
         const float3 child2Parent = float3(abF32(link, PXG_AB_LINK_mRw_x, lane),
                                            abF32(link, PXG_AB_LINK_mRw_y, lane),
                                            abF32(link, PXG_AB_LINK_mRw_z, lane));
-        float transmissionForce = 0.0f;
         float cfm = 0.0f;
 
         bool loaded = false;
 
         if (nbDofs != 0u)
         {
-            const uint64_t ic0 = dofs + PXG_AB_DOF_mConstraintData;
-            const float frictionCoefficient =
-                abF32(ic0, PXG_AB_IC_mFrictionCoefficient, lane) * stepDt;
-
             const uint jointType = abU8(link, PXG_AB_LINK_mJointType, lane);
             const bool isAngularConstraint = jointType == SI_JOINT_REVOLUTE
                                           || jointType == SI_JOINT_REVOLUTE_UNWRAPPED
@@ -300,10 +293,19 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
 
                         if (hasDrive)
                         {
-                            // trap 2: LOCAL motion matrix top
-                            const float4 top = abF4(d, PXG_AB_DOF_mLocalMotionMatrix, lane);
+                            // trap 2 (5.12): the target is written into the
+                            // component its AXIS names (mDofIds: eTWIST/eSWING1/
+                            // eSWING2 -> x/y/z), an assignment.  5.6.1 summed
+                            // localMotionMatrix.top * targetPos instead, which
+                            // missed for non-identity joint frames.
+                            const uint axisIndex = abU8(d, PXG_AB_DOF_mDofIds, lane);
                             const float targetPos = abF32(ic, PXG_AB_IC_mDriveTargetPos, lane);
-                            driveAxis += float3(top.x, top.y, top.z) * targetPos;
+                            if (axisIndex == 0u)
+                                driveAxis.x = targetPos;
+                            else if (axisIndex == 1u)
+                                driveAxis.y = targetPos;
+                            else
+                                driveAxis.z = targetPos;
                             hasAngularDrives = true;
                         }
                     }
@@ -362,7 +364,6 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
                 const uint motion = abU8(d, PXG_AB_DOF_mMotion, lane);
                 const uint dofId = abU8(d, PXG_AB_DOF_mDofIds, lane);
 
-                const float maxForce = abF32(ic, PXG_AB_IC_mMaxForce, lane);
                 const float maxEffort = abF32(ic, PXG_AB_IC_mMaxEffort, lane);
 
                 const float stiffness = abF32(ic, PXG_AB_IC_mDriveStiffness, lane);
@@ -373,11 +374,6 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
                     parentResponse = abLoadSpatialMatrix6x6(parentLink,
                                                             PXG_AB_LINK_mSpatialResponseMatrix,
                                                             lane);
-                    const AbSpatialVector bias = siLoadSV(link, PXG_AB_LINK_mBiasForce, lane);
-                    // trap 8: |top| + |bottom|
-                    const float mag = sqrt(dot(bias.top, bias.top))
-                                    + sqrt(dot(bias.bottom, bias.bottom));
-                    transmissionForce = mag * frictionCoefficient;
                     const float pCfm = abF32(parentLink, PXG_AB_LINK_mCfm, lane);
                     const float lCfm = abF32(link, PXG_AB_LINK_mCfm, lane);
                     cfm = pCfm > lCfm ? pCfm : lCfm;
@@ -430,8 +426,6 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
 
                 const float recipResponse = 1.0f / (unitResponse + cfm);
 
-                abStoreF32(ic, PXG_AB_IC_mMaxFrictionForce, lane, transmissionForce);
-
                 if (motion == SI_MOTION_LIMITED)
                 {
                     const float2 limit = abF2(ic, PXG_AB_IC_mLimits_LowLimitX_highLimitY, lane);
@@ -439,7 +433,8 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
                               float2(position - limit.x, limit.y - position));
                 }
 
-                if ((maxForce > 0.0f || maxEffort > 0.0f) && (stiffness > 0.0f || damping > 0.0f))
+                // trap 11 (5.12): the drive needs maxEffort > 0 -- the maxForce leg is gone
+                if (maxEffort > 0.0f && (stiffness > 0.0f || damping > 0.0f))
                 {
                     const float targetVelocity = abF32(ic, PXG_AB_IC_mDriveTargetVel, lane);
                     const uint driveType = abU32(ic, PXG_AB_IC_mDriveType, lane);
@@ -458,14 +453,12 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
                     abStoreF4(ic, PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW,
                               lane, float4(desc.tvBias, desc.biasCoef, desc.velMul, desc.impMul));
                     abStoreF32(ic, PXG_AB_IC_mTargetPosBias, lane, desc.posBias);
-                    abStoreF32(ic, PXG_AB_IC_mConstraintMaxImpulse, lane, maxForce * maxForceScale);
                 }
                 else
                 {
                     abStoreF4(ic, PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW,
                               lane, float4(0.0f, 0.0f, 0.0f, 0.0f));
                     abStoreF32(ic, PXG_AB_IC_mTargetPosBias, lane, 0.0f);
-                    abStoreF32(ic, PXG_AB_IC_mConstraintMaxImpulse, lane, 0.0f);
                 }
                 abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, 0.0f);
                 abStoreSpatialVector(ic, PXG_AB_IC_mDeltaVA, lane, deltaVA.top, deltaVA.bottom);

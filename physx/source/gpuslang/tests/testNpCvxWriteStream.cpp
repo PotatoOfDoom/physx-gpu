@@ -152,7 +152,7 @@ static void refWriteStream(const WsIn& s, WsOut& o, bool& marg)
         cOff0 = cBytes; cBytes += 16 * total;
         fOff0 = fBytes; fBytes += 4 * total;
         if ((cOff0 + 16 * total) >= cLimit) { oFlags |= 1u; cOff0 = 0xFFFFFFFFu; }
-        else if ((fOff0 + 4 * total) >= fLimit) { oFlags |= 2u; fOff0 = 0xFFFFFFFFu; }
+        else if ((fOff0 + 4 * total) >= fLimit) { oFlags |= 2u; fOff0 = 0xFFFFFFFFu; cOff0 = 0xFFFFFFFFu; } // 5.12: cudaGJKEPA.cu:1780
     }
 
     const uint32_t streamBase = s.counters.x;

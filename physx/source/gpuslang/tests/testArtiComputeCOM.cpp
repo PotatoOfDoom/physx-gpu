@@ -36,9 +36,9 @@
 // then computes them in plain loop order with the engine's own PxTransform /
 // PxVec3 arithmetic for the lane-0 tail.
 //
-// The fixture keeps nbElements an exact multiple of 8 (the kernel has NO
-// jobIndex guard -- the eighth upstream-bug candidate; overhang warps would
-// read gpuIndices past the end).  gpuIndices PERMUTES jobs onto a larger
+// 5.12 passes nbIndices first and guards the job index (the eighth upstream-bug
+// candidate of 5.6.1, fixed upstream); the fixture keeps nbElements a multiple
+// of 8 regardless.  gpuIndices PERMUTES jobs onto a larger
 // record pool with unreferenced decoy records, link counts straddle 32 (the
 // warp-stride loop runs twice on some lanes), and two rounds cover
 // rootFrame off and on (fresh zeroed outputs each round -- the engine
@@ -73,10 +73,10 @@ static std::vector<uint8_t> artiComLoader(const char* file) { return loadShaderB
 const uint32_t COM_NB_JOBS = 16;     // exact multiple of 8: no overhang warps
 const uint32_t COM_NB_RECORDS = 24;  // pool larger than the job set
 const uint32_t COM_MAX_LINKS = 40;   // some articulations exceed one warp pass
-const uint32_t COM_RECORD_SIZE = 544;
+const uint32_t COM_RECORD_SIZE = 496;
 const uint32_t COM_R_DATA_NUM_LINKS = 16;   // PxU16, pinned by the desc map
-const uint32_t COM_R_LINK_BODY2WORLDS = 184;
-const uint32_t COM_R_LINK_PROPS = 256;
+const uint32_t COM_R_LINK_BODY2WORLDS = 176;
+const uint32_t COM_R_LINK_PROPS = 240;
 
 // jobs permute onto the pool; records 1, 4, 7, ... stay unreferenced decoys
 static uint32_t comArtiIndex(uint32_t job) { return (job * 5u + 3u) % COM_NB_RECORDS; }
@@ -189,10 +189,13 @@ static size_t comRun(PxgCudaShim& shim, bool rootFrame)
 
     struct Params
     {
+        uint32_t nbIndices, pad0;   // 5.12: the job guard (ABI row kArtiCom {4,8,8,1,8})
         uint64_t data, gpuIndices;
         uint32_t rootFrameWord, pad;
         uint64_t articulations;
-    } prm = { uint64_t(dOut), uint64_t(dIdx), rootFrame ? 1u : 0u, 0u, uint64_t(dRec) };
+    } prm = { COM_NB_JOBS, 0u, uint64_t(dOut), uint64_t(dIdx), rootFrame ? 1u : 0u, 0u,
+              uint64_t(dRec) };
+    static_assert(sizeof(Params) == 40, "params blob");
     const uint32_t blocks = (COM_NB_JOBS + 7) / 8;
     PXG_CHECK_MSG(shim.launchKernel(0, blocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch computeArtiCOM");
@@ -227,7 +230,7 @@ PXG_TEST(artiComputeCOM)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiInverseDyn.spv", "computeArtiCOM", 32u, 0 },
+        { "npArtiInverseDyn.spv", "computeArtiCOM", 40u, 0 },
     };
     PxgCudaShim shim(dev, manifest, 1, &artiComLoader);
 

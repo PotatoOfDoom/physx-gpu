@@ -621,12 +621,11 @@ static void refSetupFixed(PxgArticulationBlockData& ab, PxgArticulationBlockLink
                 }
                 else
                 {
+                    // 5.12: lever arm = sB2w.q.rotate(parentPose.p) (no world-scale
+                    // subtraction)
                     const float4 p = cLink.mParentPose.p[lane];
-                    const PxQuat q = reinterpret_cast<PxQuat&>(cLink.mParentPose.q[lane]);
-                    const PxTransform parentPose(PxVec3(p.x, p.y, p.z), q);
-                    const PxTransform cA2w = sB2w.transform(parentPose);
                     sAxis = wmv.bottom;
-                    sRaXn = (cA2w.p - sB2w.p).cross(wmv.bottom);
+                    sRaXn = sB2w.q.rotate(PxVec3(p.x, p.y, p.z)).cross(wmv.bottom);
                 }
             }
 
@@ -640,13 +639,11 @@ static void refSetupFixed(PxgArticulationBlockData& ab, PxgArticulationBlockLink
             }
             else
             {
+                // 5.12: lever arm = cB2w.q.rotate(childPose.p)
                 const PxTransform cB2w = loadSpatialTransform(cLink.mAccumulatedPose, lane);
                 const float4 p = cLink.mChildPose.p[lane];
-                const PxQuat q = reinterpret_cast<PxQuat&>(cLink.mChildPose.q[lane]);
-                const PxTransform childPose(PxVec3(p.x, p.y, p.z), q);
-                const PxTransform cB2wJoint = cB2w.transform(childPose);
                 axis = wmv.bottom;
-                rbXn = (cB2wJoint.p - cB2w.p).cross(axis);
+                rbXn = cB2w.q.rotate(PxVec3(p.x, p.y, p.z)).cross(axis);
             }
 
             UnAlignedSpatialVector axis0(sAxis, sRaXn);

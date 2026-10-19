@@ -37,8 +37,11 @@
 //  * **erp = biasCoefficient UNCLAMPED** (the TGS extern clamps to 0.7;
 //    round 1 passes bias 0.9 and the mirror uses 0.9 verbatim);
 //  * **doFriction (flags byte 0) is LIVE** through the static solves;
-//  * **isExternalForceEveryStep (flags byte 2) is DEAD** -- rounds 2/3 set
+//  * **isExternalForceEveryStep (flags byte 1) is DEAD** -- rounds 2/3 set
 //    the byte while the mirror ignores it (deadness proof);
+//  * (5.12) no record resolve, no residual accumulators: records / bodySims /
+//    nodes / jointForces come back untouched; the dof solve reads the parked
+//    mExternalEffort; the static contacts read rigidContactBiasCoefficient @28;
 //  * the shared desc is the PGS variant: rowsMod at 120 additionally
 //    consumed by the 1D static dispatch (with the OFFSET response base);
 //  * mDeltaQ stays POISONED (the PGS static solve never reads it);
@@ -87,16 +90,14 @@ const uint32_t ILP_NB_NODES = 80;          // bodySim pool entries
 const uint32_t ILP_NB_BATCHES = 34;        // batch 0 + per-warp 11-blocks
 const uint32_t ILP_NB_HDRS = 34;
 const uint32_t ILP_NB_CPTS = 150, ILP_NB_FPTS = 220, ILP_NB_ROWS = 220, ILP_NB_RESP = 320;
-const uint32_t ILP_REC_SIZE = 544;         // sizeof(PxgArticulation), = PXG_ARTI_STRIDE
+const uint32_t ILP_REC_SIZE = 496;         // sizeof(PxgArticulation), = PXG_ARTI_STRIDE
 const uint32_t ILP_BODYSIM_SIZE = 224;
 
 static_assert(sizeof(PxgArticulation) == ILP_REC_SIZE, "record stride pin");
-static_assert(offsetof(PxgArticulation, jointForce) == 136, "jointForce pin");
-static_assert(offsetof(PxgArticulation, internalResidualAccumulator) == 512, "internal residual pin");
-static_assert(offsetof(PxgArticulation, contactResidualAccumulator) == 524, "contact residual pin");
+static_assert(offsetof(PxgArticulation, jointForce) == 128, "jointForce pin");
 static_assert(sizeof(PxgBodySim) == ILP_BODYSIM_SIZE, "bodySim stride pin");
 
-// offsets into the 360-byte PxgArticulationCoreDesc, each pinned by
+// offsets into the 344-byte PxgArticulationCoreDesc, each pinned by
 // static_assert in testArtiCoreDescLayout.cpp against the engine header
 const uint32_t D_BODY_SIM = 0, D_ISLAND_NODES = 16, D_ARTICULATIONS = 32;
 const uint32_t D_ARTI_OFFSET = 40, D_NB_ARTICULATIONS = 44, D_DT = 48;
@@ -106,7 +107,9 @@ const uint32_t D_DOF_BLOCKS = 184, D_MAX_LINKS = 248, D_MAX_DOFS = 252;
 // PxgSolverSharedDesc<IterativeSolveDataTGS>::iterativeData.*
 const uint32_t SH_BATCH = 96, SH_JHDR = 104, SH_JROW = 112, SH_JMOD = 120, SH_CHDR = 128;
 const uint32_t SH_FHDR = 136, SH_CPTS = 144, SH_FPTS = 152, SH_RESP = 216;
-const uint32_t SH_SIZE = 224, DESC_SIZE = 360;
+// 5.12: the rigidContact bias the PGS static contacts read (5.6.1 hard-coded 0.8)
+const float ILP_RIGID_CONTACT_BIAS = 0.65f;
+const uint32_t SH_SIZE = 224, DESC_SIZE = 344;
 
 const float ILP_DT = 0.01f, ILP_SCENE_DT = 0.033f, ILP_INV_DT = 100.0f, ILP_ELAPSED = 0.017f;
 
@@ -160,7 +163,7 @@ static bool ilpAIsArti(uint32_t b, uint32_t k) { return ((b + k) % 3u) != 0u; }
 struct IlpArena
 {
     std::vector<uint8_t> desc, sharedDesc;
-    std::vector<uint8_t> rec;                 // ILP_NB * 544
+    std::vector<uint8_t> rec;                 // ILP_NB * 496
     std::vector<uint8_t> bodySims;            // ILP_NB_NODES * 224
     std::vector<PxNodeIndex> nodes;           // ILP_ARTI_OFFSET + ILP_NB + 3
     std::vector<float> jf;                    // ILP_NB * ILP_MAX_DOFS
@@ -404,9 +407,9 @@ static void ilpSeed(IlpArena& B, uint32_t salt)
             ic.mResponse[lane] = response;
             ic.mRecipResponse[lane] = 1.0f / response;
             ic.mMaxJointVelocity[lane] = 0.4f + 0.2f * std::fabs(fv(a, d, 135, salt));
-            ic.mConstraintMaxImpulse[lane] = 0.6f + 0.3f * std::fabs(fv(a, d, 136, salt));
+            // 5.12: the external joint effort the forward pass parks per dof
+            ic.mExternalEffort[lane] = 0.5f * fv(a, d, 136, salt);
             ic.mDriveImpulse[lane] = 0.3f * fv(a, d, 137, salt);
-            ic.mMaxFrictionForce[lane] = 0.4f + 0.2f * std::fabs(fv(a, d, 138, salt));
             ic.mAccumulatedFrictionImpulse[lane] = 0.2f * fv(a, d, 139, salt);
             ic.mMaxEffort[lane] = ((a + d) % 2u) ? (30.0f + 10.0f * std::fabs(fv(a, d, 140, salt))) : 0.0f;
             ic.mMaxActuatorVelocity[lane] = 2.0f + std::fabs(fv(a, d, 141, salt));
@@ -552,7 +555,6 @@ static void ilpSeed(IlpArena& B, uint32_t salt)
                                                   : 0.1f * fv(lane, b * 5 + i, 124, salt);
                     M.coeff1[lane] = 0.3f * fv(lane, b * 5 + i, 128, salt);
                     M.appliedForce[lane] = 0.2f + 0.2f * fv(lane, b * 5 + i, 143, salt);
-                    // residual stays POISONED: only reporting rounds may write it
                 }
             }
         }
@@ -585,6 +587,7 @@ static void ilpMirror(IlpArena& W, bool velIter, bool residual, bool doFriction,
                      uint32_t& rootJointsLive)
 {
     const float erp = biasCoefficient;   // UNCLAMPED on PGS (:2820)
+    (void)residual;   // 5.12: no residual reporting
 
     for (uint32_t gti = 0; gti < ILP_NB; ++gti)
     {
@@ -594,17 +597,7 @@ static void ilpMirror(IlpArena& W, bool velIter, bool residual, bool doFriction,
         PxgArticulationBlockDofData* df = &W.df[size_t(w) * ILP_MAX_DOFS];
         PxgArticulationTraversalStackData* stack = &W.stack[size_t(w) * ILP_MAX_LINKS];
 
-        // the record resolve
-        const uint32_t nodeIndex = W.nodes[ILP_ARTI_OFFSET + gti].index();
-        uint32_t remap;
-        std::memcpy(&remap, &W.bodySims[size_t(nodeIndex) * ILP_BODYSIM_SIZE + 176], 4);
-        PxgArticulation* rec = ilpRec(W, remap);
-
-        if (residual)
-        {
-            rec->internalResidualAccumulator.reset();
-            rec->contactResidualAccumulator.reset();
-        }
+        // (5.12: no record resolve -- it fed only the residual accumulators and jointForce)
 
         if (ab.mStateDirty[lane] & 2u)   // eHAS_IMPULSES
         {
@@ -636,8 +629,9 @@ static void ilpMirror(IlpArena& W, bool velIter, bool residual, bool doFriction,
             storeParentDeltaV = parentDeltaV;
             refSolveStaticLanePgs(lk[0], lane, W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(),
                                   W.fp.data(), W.jh.data(), W.jr.data(), W.jm.data(), W.rs.data(),
-                                  doFriction, residual,
-                                  rootVel, parentImp, parentDeltaV, contactErr, constraintCounts0, NULL);
+                                  doFriction, false,
+                                  rootVel, parentImp, parentDeltaV, contactErr, constraintCounts0, NULL,
+                                  ILP_RIGID_CONTACT_BIAS);
         }
         else if (fixBase && doStatic)
         {
@@ -645,27 +639,15 @@ static void ilpMirror(IlpArena& W, bool velIter, bool residual, bool doFriction,
         }
 
         const UnAlignedSpatialVector finalImp = refSolveInternalDFSLanePgs(
-            lk, df, stack, &W.jf[size_t(remap) * ILP_MAX_DOFS],
+            lk, df, stack,
             W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(), W.fp.data(),
             W.jh.data(), W.jr.data(), W.jm.data(), W.rs.data(),
             ILP_DT, ILP_SCENE_DT, ILP_INV_DT, ILP_ELAPSED, erp,
-            velIter, doFriction, doFDPL, doVelLimit, doStatic, residual,
+            velIter, doFriction, doFDPL, doVelLimit, doStatic, false,
             storeParentDeltaV, parentImp, parentDeltaV,
-            err, contactErr, lane);
+            err, contactErr, ILP_RIGID_CONTACT_BIAS, lane);
 
         storeSpatialVector(ab.mRootDeferredZ, rootDeferredZ + finalImp, lane);
-
-        if (residual)
-        {
-            Dy::ErrorAccumulator& ir = rec->internalResidualAccumulator;
-            ir.mErrorSumOfSquares += err.sumOfSquares;
-            ir.mCounter += err.counter;
-            if (err.maxError > ir.mMaxError) ir.mMaxError = err.maxError;
-            Dy::ErrorAccumulator& cr = rec->contactResidualAccumulator;
-            cr.mErrorSumOfSquares += contactErr.sumOfSquares;
-            cr.mCounter += contactErr.counter;
-            if (contactErr.maxError > cr.mMaxError) cr.mMaxError = contactErr.maxError;
-        }
     }
 }
 
@@ -678,8 +660,8 @@ struct IlpParamsHost
     float invDt;                      // @12
     uint32_t velIterWord;             // @16
     float elapsedTime;                // @20
-    float biasCoefficient;            // @24
-    uint32_t pad0;                    // @28
+    float biasCoefficient;            // @24 BiasCoefficientCollection::articulation
+    float rigidContactBiasCoefficient; // @28 (5.12)
     uint64_t staticContactUniqueIds;  // @32 dead
     uint64_t staticJointUniqueIds;    // @40 dead
     uint64_t sharedDesc;              // @48
@@ -714,7 +696,7 @@ static size_t ilpRun(PxgCudaShim& shim, bool velIter, bool residual, bool extEve
         for (uint32_t r = 0; r < ILP_NB; ++r)
         {
             uint64_t p = uint64_t(dJf) + uint64_t(r) * ILP_MAX_DOFS * 4u;
-            std::memcpy(&A.rec[size_t(r) * ILP_REC_SIZE + 136], &p, 8);
+            std::memcpy(&A.rec[size_t(r) * ILP_REC_SIZE + offsetof(PxgArticulation, jointForce)], &p, 8);
         }
         shim.memcpyHtoD(dJf, A.jf.data(), A.jf.size() * 4);
     }
@@ -789,12 +771,12 @@ static size_t ilpRun(PxgCudaShim& shim, bool velIter, bool residual, bool extEve
         return 0;
     }
 
+    // 5.12 dropped the residualReportingEnabled byte: doFriction, extEvery, doFDPL
     uint32_t flagsWord = (doFriction ? 1u : 0u)
-                       | (residual ? (1u << 8) : 0u)
-                       | (extEvery ? (1u << 16) : 0u)
-                       | (doFDPL ? (1u << 24) : 0u);
+                       | (extEvery ? (1u << 8) : 0u)
+                       | (doFDPL ? (1u << 16) : 0u);
     IlpParamsHost prm = { uint64_t(dDesc), ILP_DT, ILP_INV_DT, velIter ? 1u : 0u,
-                         ILP_ELAPSED, biasCoefficient, 0u,
+                         ILP_ELAPSED, biasCoefficient, ILP_RIGID_CONTACT_BIAS,
                          0xDEAD0000ull, 0xDEAD4000ull,   // dead UID pointers: junk
                          uint64_t(dSh), flagsWord, doVelLimit, doStatic ? 1u : 0u, 0u };
     PXG_CHECK_MSG(shim.launchKernel(0, ILP_WARPS, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
@@ -850,11 +832,11 @@ PXG_TEST(artiSolveInternalLaunchPgs)
     PxgCudaShim shim(dev, manifest, 1, &ilpLoader);
 
     size_t bad = 0;
-    // posIter, residuals on, BEFORE vel-limit, static on, bias 0.9 -- erp stays
-    // 0.9 UNCLAMPED on PGS (a min(0.7,.) mutant dies here).  doFriction !=
-    // residualReporting so a crossed byte read cannot pass as a coincidence.
+    // posIter, BEFORE vel-limit, static on, bias 0.9 -- erp stays 0.9 UNCLAMPED
+    // on PGS (a min(0.7,.) mutant dies here).  (The second argument is the
+    // 5.6.1 residualReporting flag, ignored in 5.12.)
     bad += ilpRun(shim, false, true, false, true, 1u, true, false, 0.9f, 31);
-    // velIter, residuals OFF (accumulators must stay 0xAB), AFTER vel-limit,
+    // velIter, AFTER vel-limit,
     // bias 0.5; the extEvery byte SET while the mirror ignores it (dead)
     bad += ilpRun(shim, true, false, true, true, 2u, true, true, 0.5f, 37);
     // posIter, extEvery byte set again, no static, no vel-limit, no FDPL

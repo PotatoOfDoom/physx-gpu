@@ -73,7 +73,7 @@ const uint32_t GS_NB_LIVE = 12;
 const uint32_t GS_NB_RECORDS = 16;   // + 4 guard records for the launch overhang
 const uint32_t GS_MAX_LINKS = 6;
 const uint32_t GS_MAX_DOFS = 12;
-const uint32_t GS_RECORD_SIZE = 544;
+const uint32_t GS_RECORD_SIZE = 496;
 const uint32_t GS_IDX_ENTRIES = 1024;   // covers every overhang groupIndex at grid 2
 const uint32_t GS_MAX_SPT = 2;    // maxSpatialTendonsPerArticulation (desc @260)
 const uint32_t GS_MAX_ATT = 3;    // maxAttachmentPerArticulation (desc @264)
@@ -254,10 +254,10 @@ static void gsUpload(PxgCudaShim& shim, GsArena& A, GsDev& D)
     D.dSt = up(A.sptTendons.data(), A.sptTendons.size());
     D.dFt = up(A.ftTendons.data(), A.ftTendons.size());
 
-    // record field offsets: jpos 112, jvel 120, jacc 128, jforce 136,
-    // jtpos 144, jtvel 152 -- note dofArr order is jpos jvel jacc jforce
+    // record field offsets (5.12): jpos 104, jvel 112, jacc 120, jforce 128,
+    // jtpos 136, jtvel 144 -- note dofArr order is jpos jvel jacc jforce
     // jtvel jtpos (the READ enum order)
-    const uint32_t fieldOf[6] = { 112, 120, 128, 136, 152, 144 };
+    const uint32_t fieldOf[6] = { 104, 112, 120, 128, 144, 136 };
     for (uint32_t r = 0; r < GS_NB_RECORDS; ++r)
     {
         uint8_t* R = A.rec.data() + size_t(r) * GS_RECORD_SIZE;
@@ -267,14 +267,14 @@ static void gsUpload(PxgCudaShim& shim, GsArena& A, GsDev& D)
         put(56, uint64_t(D.dMv) + uint64_t(r) * GS_MAX_LINKS * 24u);
         put(64, uint64_t(D.dMa) + uint64_t(r) * GS_MAX_LINKS * 24u);
         put(72, uint64_t(D.dIn) + uint64_t(r) * GS_MAX_LINKS * 24u);
-        put(184, uint64_t(D.dXw) + uint64_t(r) * GS_MAX_LINKS * 28u);
-        put(200, uint64_t(D.dXa) + uint64_t(r) * GS_MAX_LINKS * 28u);
-        put(256, uint64_t(D.dPr) + uint64_t(r) * GS_MAX_LINKS * 16u);
+        put(176, uint64_t(D.dXw) + uint64_t(r) * GS_MAX_LINKS * 28u);
+        put(192, uint64_t(D.dXa) + uint64_t(r) * GS_MAX_LINKS * 28u);
+        put(240, uint64_t(D.dPr) + uint64_t(r) * GS_MAX_LINKS * 16u);
         put(96, uint64_t(D.dEa) + uint64_t(r) * GS_MAX_LINKS * 24u);
-        put(304, uint64_t(D.dSp) + uint64_t(r) * GS_MAX_SPT * 16u);
-        put(312, uint64_t(D.dSt) + uint64_t(r) * GS_MAX_SPT * 24u);
-        put(320, uint64_t(D.dFp) + uint64_t(r) * GS_MAX_FT * 32u);
-        put(328, uint64_t(D.dFt) + uint64_t(r) * GS_MAX_FT * 24u);
+        put(288, uint64_t(D.dSp) + uint64_t(r) * GS_MAX_SPT * 16u);
+        put(296, uint64_t(D.dSt) + uint64_t(r) * GS_MAX_SPT * 24u);
+        put(304, uint64_t(D.dFp) + uint64_t(r) * GS_MAX_FT * 32u);
+        put(312, uint64_t(D.dFt) + uint64_t(r) * GS_MAX_FT * 24u);
     }
     D.dRec = up(A.rec.data(), A.rec.size());
     std::vector<uint8_t> desc(288, 0xAB);
@@ -359,8 +359,10 @@ PXG_TEST(artiGetSet)
         { "npArtiGetSet.spv", "setArtiSpatialTendonAttachmentState", 32u, 0 },
         { "npArtiGetSet.spv", "getArtiFixedTendonJointState", 28u, 0 },
         { "npArtiGetSet.spv", "setArtiFixedTendonJointState", 28u, 0 },
+        { "npArtiGetSet.spv", "getArtiLinkForceState", 32u, 0 },    // 5.12
+        { "npArtiGetSet.spv", "getArtiLinkTorqueState", 32u, 0 },   // 5.12
     };
-    PxgCudaShim shim(dev, manifest, 15, &artiGsLoader);
+    PxgCudaShim shim(dev, manifest, 17, &artiGsLoader);
     gsBad = 0;
 
     auto jobsOf = [&](const GsArena& A, uint32_t j) { return A.idx[j]; };
@@ -825,6 +827,81 @@ PXG_TEST(artiGetSet)
         for (auto p : D.bufs) if (p) shim.memFree(p);
     }
 
-    std::printf("[ info ] gs: 33 dispatches over 15 kernels, %zu mismatching words\n", gsBad);
+    // ---- 5.12: getArtiLinkForceState + getArtiLinkTorqueState
+    // (articulationDirectGpuApi.cu:520-579), the inverses of the two setters:
+    // every (job, link) slot of a live job is written, links at or beyond
+    // numLinks get zero; invMass == 0 and each zero invInertia component take
+    // the zero arm of their guards.  The oracle is the CUDA body on the
+    // engine's PxQuat/PxVec3. ----
+    for (uint32_t which = 0; which < 2; ++which)
+    {
+        GsArena A;
+        gsSeed(A, 191u + which);
+        for (uint32_t r = 0; r < GS_NB_RECORDS; ++r)
+            for (uint32_t l = 0; l < GS_MAX_LINKS; ++l)
+            {
+                float* ea = &A.extAccel[(size_t(r) * GS_MAX_LINKS + l) * 6];
+                for (uint32_t c = 0; c < 6; ++c)
+                    ea[c] = gsf(r, 830u + l * 6u + c + which);
+                float* pp = &A.props[(size_t(r) * GS_MAX_LINKS + l) * 4];
+                if ((r + l) % 4u == 1u)
+                    pp[3] = 0.0f;                   // a static link: force guard
+                if ((r * 3u + l) % 5u == 2u)
+                    pp[(r + l) % 3u] = 0.0f;        // one zero inertia component
+            }
+        GsDev D;
+        gsUpload(shim, A, D);
+        if (!D.ok) { for (auto p : D.bufs) if (p) shim.memFree(p); continue; }
+        const uint32_t outGroups = (2u * 512u - 1u) / GS_MAX_LINKS + 1u;
+        std::vector<float> out(size_t(outGroups) * GS_MAX_LINKS * 3, 0.f);
+        std::memset(out.data(), 0xAB, out.size() * 4);
+        PxgDevicePtr dOut = 0;
+        shim.memAlloc(&dOut, out.size() * 4);
+        shim.memcpyHtoD(dOut, out.data(), out.size() * 4);
+        P5 prm = { uint64_t(D.dDesc), uint64_t(dOut), uint64_t(D.dIdx), GS_NB_LIVE, GS_MAX_LINKS };
+        PXG_CHECK_MSG(shim.launchKernel(which == 0 ? 15 : 16, 2, 1, 1, &prm, 32u) ==
+                          PxgResult::Success,
+                      "launch getArtiLink*State");
+        shim.streamSynchronize();
+        std::vector<float> want = out;
+        for (uint32_t j = 0; j < GS_NB_LIVE; ++j)
+        {
+            const uint32_t r = jobsOf(A, j);
+            for (uint32_t l = 0; l < GS_MAX_LINKS; ++l)
+            {
+                PxVec3 v(0.0f);
+                if (l < gsNumLinks(r))
+                {
+                    const float* ea = &A.extAccel[(size_t(r) * GS_MAX_LINKS + l) * 6];
+                    const float* pp = &A.props[(size_t(r) * GS_MAX_LINKS + l) * 4];
+                    if (which == 0)
+                    {
+                        const float invMass = pp[3];
+                        const PxVec3 linAccel(ea[0], ea[1], ea[2]);
+                        v = (invMass > 0.0f) ? (linAccel * (1.0f / invMass)) : PxVec3(0.0f);
+                    }
+                    else
+                    {
+                        const PxQuat q = gsQ(&A.xw[(size_t(r) * GS_MAX_LINKS + l) * 7]);
+                        const PxVec3 localAccel = q.rotateInv(PxVec3(ea[3], ea[4], ea[5]));
+                        const PxVec3 invInertia(pp[0], pp[1], pp[2]);
+                        const PxVec3 localTorque(
+                            invInertia.x > 0.0f ? localAccel.x / invInertia.x : 0.0f,
+                            invInertia.y > 0.0f ? localAccel.y / invInertia.y : 0.0f,
+                            invInertia.z > 0.0f ? localAccel.z / invInertia.z : 0.0f);
+                        v = q.rotate(localTorque);
+                    }
+                }
+                float* o = &want[(size_t(j) * GS_MAX_LINKS + l) * 3];
+                o[0] = v.x; o[1] = v.y; o[2] = v.z;
+            }
+        }
+        gsCmp(shim, dOut, want, which == 0 ? "getLinkForce" : "getLinkTorque");
+        gsCmp(shim, D.dEa, A.extAccel, "getLink* leaves extAccel");
+        shim.memFree(dOut);
+        for (auto p : D.bufs) if (p) shim.memFree(p);
+    }
+
+    std::printf("[ info ] gs: 35 dispatches over 17 kernels, %zu mismatching words\n", gsBad);
     PXG_CHECK_MSG(gsBad == 0, "%zu mismatches", gsBad);
 }

@@ -391,18 +391,18 @@ PXG_TEST(artiSpatialMatrix)
         case SMX_M33_TRANSFORM_T: putVec3(o.vecTop, A.topLeft.transformTranspose(v.top)); break;
         case SMX_M33_DET:         o.scalarOut.x = M.getDeterminant(); break;
 
-        case SMX_SM_ADD:          putMatrix(o, A + B); break;
-        case SMX_SM_SUB:          putMatrix(o, A - B); break;
-        case SMX_SM_NEG:          putMatrix(o, -A); break;
-        case SMX_SM_SCALE:        putMatrix(o, A * s); break;
-        case SMX_SM_MUL_MATRIX:   putMatrix(o, A * B); break;
-        case SMX_SM_TRANSPOSE:    putMatrix(o, A.getTranspose()); break;
+        case SMX_SM_ADD:          putMatrix(o, dySmAdd(A, B)); break;
+        case SMX_SM_SUB:          putMatrix(o, dySmSub(A, B)); break;
+        case SMX_SM_NEG:          putMatrix(o, dySmNeg(A)); break;
+        case SMX_SM_SCALE:        putMatrix(o, dySmScale(A, s)); break;
+        case SMX_SM_MUL_MATRIX:   putMatrix(o, dySmMul(A, B)); break;
+        case SMX_SM_TRANSPOSE:    putMatrix(o, dySmGetTranspose(A)); break;
         case SMX_SM_ZERO:         putMatrix(o, SpatialMatrix(physx::PxZero)); break;
         case SMX_SM_MUL_VEC:      putSVec(o, A * v); break;
 
         case SMX_CONSTRUCT_IS_STI:
-            putMatrix(o, SpatialMatrix::constructSpatialMatrix(SpatialVectorF(v.top, v.bottom),
-                                                               SpatialVectorF(w.top, w.bottom)));
+            putMatrix(o, dySmConstruct(SpatialVectorF(v.top, v.bottom),
+                                       SpatialVectorF(w.top, w.bottom)));
             break;
 
         case SMX_CONSTRUCT_COLUMNS:
@@ -415,7 +415,7 @@ PXG_TEST(artiSpatialMatrix)
                     UnAlignedSpatialVector(A.topRight.column1, M.column1),
                     UnAlignedSpatialVector(A.topRight.column2, M.column2)
                 };
-                putMatrix(o, SpatialMatrix::constructSpatialMatrix(cols));
+                putMatrix(o, dySmConstructColumns(cols));
             }
             break;
 

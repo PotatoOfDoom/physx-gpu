@@ -74,7 +74,7 @@ static std::vector<uint8_t> artiCoreDescLoader(const char* file) { return loadSh
 namespace pin
 {
 using namespace physx;
-static_assert(sizeof(PxgArticulationCoreDesc) == 360, "PxgArticulationCoreDesc size");
+static_assert(sizeof(PxgArticulationCoreDesc) == 344, "PxgArticulationCoreDesc size");
 static_assert(offsetof(PxgArticulationCoreDesc, mBodySimBufferDeviceData) == 0, "..BODY_SIM_POOL");
 static_assert(offsetof(PxgArticulationCoreDesc, articulationSleepData) == 8, "..SLEEP_DATA");
 static_assert(offsetof(PxgArticulationCoreDesc, islandNodeIndices) == 16, "..ISLAND_NODE_INDICES");

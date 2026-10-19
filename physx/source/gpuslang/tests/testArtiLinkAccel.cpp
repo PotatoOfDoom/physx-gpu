@@ -215,216 +215,10 @@ PXG_TEST(artiTranslateInertiaMass)
 }
 
 // ===========================================================================
-// computeJointTransmittedFrictionForce
+// computeJointTransmittedFrictionForce: removed in 5.12 together with the
+// deprecated joint-friction model (mBiasForce / mMaxFrictionForce), so its
+// fixture (artiJointFriction) went with it.
 // ===========================================================================
-
-const uint32_t FR_LANES = 23;        // live lanes; nine more left poisoned
-const uint32_t FR_MAX_LINKS = 8;     // > every count, and not a lane index in use
-
-// counts 2..7, distinct from the lane index for every live lane (checked below)
-static uint32_t frNumLinks(uint32_t k) { return 2u + ((k * 5u + 1u) % 6u); }
-
-// three topologies in one warp -- see the header
-static uint32_t frParent(uint32_t k, uint32_t i)
-{
-    if (i == 0)
-        return 0;
-    switch (k % 3u)
-    {
-    case 0: return i - 1u;              // chain
-    case 1: return (i - 1u) / 2u;       // binary tree: link 1 and 2 share parent 0
-    default: return 0u;                 // star
-    }
-}
-
-static void frFill(physx::PxgArticulationBlockLinkData* lk, uint32_t k, uint32_t numLinks,
-                   uint32_t lane)
-{
-    auto v = [&](uint32_t i, uint32_t f) {
-        return (float((k * 19u + i * 11u + f) % 331u) + 1.0f) * 0.0234375f - 3.75f;
-    };
-
-    for (uint32_t i = 0; i < numLinks; ++i)
-    {
-        physx::PxgArticulationBlockLinkData& b = lk[i];
-        b.mParents[lane] = frParent(k, i);
-        b.mRw_x[lane] = v(i, 0);
-        b.mRw_y[lane] = v(i, 1);
-        b.mRw_z[lane] = v(i, 2);
-
-        // the inverse inertia / inverse mass, with the two zero cases placed on
-        // DIFFERENT links so each guard fires on its own
-        float invIx = v(i, 3) * 0.25f + 2.0f;
-        float invIy = v(i, 4) * 0.25f + 3.0f;
-        float invIz = v(i, 5) * 0.25f + 4.0f;
-        float invM = v(i, 6) * 0.125f + 1.5f;
-        if (i == 1 && (k % 5u) == 2u)
-            invM = 0.0f;                 // a static link
-        if (i == 2 && (k % 7u) == 3u)
-            invIy = 0.0f;                // one zero inertia component
-        b.mInvInertiaXYZ_invMassW[lane] = make_float4(invIx, invIy, invIz, invM);
-
-        // a general rotation, except one lane where it is the identity
-        PxQuat q(v(i, 7), v(i, 8), v(i, 9), v(i, 10) + 2.0f);
-        if ((k % 9u) == 4u)
-            q = PxQuat(physx::PxIdentity);
-        else
-            q = q.getNormalized();
-        b.mAccumulatedPose.q[lane] = make_float4(q.x, q.y, q.z, q.w);
-
-        // the two acceleration halves, non-zero and DIFFERENT
-        storeSpatialVector(b.mMotionAcceleration,
-                           UnAlignedSpatialVector(PxVec3(v(i, 11), v(i, 12), v(i, 13)),
-                                                  PxVec3(v(i, 14) * 3.0f, v(i, 15) * 3.0f,
-                                                         v(i, 16) * 3.0f)),
-                           lane);
-        storeSpatialVector(b.mMotionAccelerationInternal,
-                           UnAlignedSpatialVector(PxVec3(v(i, 17) * 0.5f, v(i, 18) * 0.5f,
-                                                         v(i, 19) * 0.5f),
-                                                  PxVec3(v(i, 20), v(i, 21), v(i, 22))),
-                           lane);
-
-        // seeded NON-ZERO, so "+=" is distinguishable from "=" and the root's
-        // final zeroing is a real change
-        storeSpatialVector(b.mBiasForce,
-                           UnAlignedSpatialVector(PxVec3(v(i, 23) * 7.0f, v(i, 24) * 7.0f,
-                                                         v(i, 25) * 7.0f),
-                                                  PxVec3(v(i, 26) * 11.0f, v(i, 27) * 11.0f,
-                                                         v(i, 28) * 11.0f)),
-                           lane);
-    }
-}
-
-// The mirror: the CUDA's structure, the engine's arithmetic.
-static void frMirror(physx::PxgArticulationBlockLinkData* lk, uint32_t numLinks, uint32_t lane)
-{
-    for (uint32_t linkID = numLinks - 1; linkID > 0; --linkID)
-    {
-        physx::PxgArticulationBlockLinkData& link = lk[linkID];
-        const PxU32 parent = link.mParents[lane];
-        const UnAlignedSpatialVector biasForce = loadSpatialVector(lk[parent].mBiasForce, lane);
-
-        const float rwx = link.mRw_x[lane];
-        const float rwy = link.mRw_y[lane];
-        const float rwz = link.mRw_z[lane];
-
-        const float4 iim = link.mInvInertiaXYZ_invMassW[lane];
-        const float4 q = link.mAccumulatedPose.q[lane];
-        const PxQuat rot(q.x, q.y, q.z, q.w);
-        const PxReal m = iim.w == 0.f ? 0.f : 1.f / iim.w;
-        const PxVec3 inertia(iim.x == 0.f ? 0.f : 1.f / iim.x, iim.y == 0.f ? 0.f : 1.f / iim.y,
-                             iim.z == 0.f ? 0.f : 1.f / iim.z);
-
-        const UnAlignedSpatialVector motionAcceleration =
-            loadSpatialVector(link.mMotionAcceleration, lane)
-            + loadSpatialVector(link.mMotionAccelerationInternal, lane);
-        UnAlignedSpatialVector Ia = loadSpatialVector(link.mBiasForce, lane);
-        Ia.bottom += rot.rotate(rot.rotateInv(motionAcceleration.top).multiply(inertia));
-        Ia.top += motionAcceleration.bottom * m;
-
-        storeSpatialVector(link.mBiasForce, Ia, lane);
-
-        storeSpatialVector(lk[parent].mBiasForce,
-                           biasForce + FeatherstoneArticulation::translateSpatialVector(
-                                           PxVec3(rwx, rwy, rwz), Ia),
-                           lane);
-    }
-
-    storeSpatialVector(lk[0].mBiasForce, UnAlignedSpatialVector::Zero(), lane);
-}
-
-PXG_TEST(artiJointFriction)
-{
-    PxgSlangComputeDevice* dev = testDevice();
-    const PxgKernelDef manifest[] = {
-        { "npArtiLinkAccel.spv", "artiJointFriction", 32u, 0 },
-    };
-    PxgCudaShim shim(dev, manifest, 1, &artiLinkAccelLoader);
-
-    std::vector<physx::PxgArticulationBlockLinkData> lkImg(FR_MAX_LINKS);
-    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
-
-    std::vector<uint32_t> numLinks(32);
-    uint32_t topo[3] = { 0, 0, 0 }, staticLinks = 0, zeroInertia = 0, identityQuat = 0;
-    for (uint32_t lane = 0; lane < 32; ++lane)
-        numLinks[lane] = (lane < FR_LANES) ? frNumLinks(lane) : 0u;
-    for (uint32_t lane = 0; lane < FR_LANES; ++lane)
-    {
-        PXG_CHECK_MSG(numLinks[lane] <= FR_MAX_LINKS, "lane %u has %u links", lane,
-                      numLinks[lane]);
-        PXG_CHECK_MSG(numLinks[lane] != lane, "lane %u's link count equals its index", lane);
-        frFill(lkImg.data(), lane, numLinks[lane], lane);
-        topo[lane % 3u] += 1u;
-        if ((lane % 5u) == 2u && numLinks[lane] > 1) ++staticLinks;
-        if ((lane % 7u) == 3u && numLinks[lane] > 2) ++zeroInertia;
-        if ((lane % 9u) == 4u) ++identityQuat;
-    }
-    std::printf("[ info ] fr: topo chain/tree/star %u/%u/%u, %u static, %u zero-inertia, "
-                "%u identity-quat\n",
-                topo[0], topo[1], topo[2], staticLinks, zeroInertia, identityQuat);
-    PXG_CHECK(topo[0] > 4 && topo[1] > 4 && topo[2] > 4);
-    PXG_CHECK(staticLinks > 1 && zeroInertia > 1 && identityQuat > 1);
-    // some tree lane must actually have a node with two children: with the
-    // binary-tree parent map that needs three links, so links 1 and 2 both hang
-    // off link 0 and it receives TWO accumulations
-    uint32_t forkedTrees = 0;
-    for (uint32_t lane = 0; lane < FR_LANES; ++lane)
-        if ((lane % 3u) == 1u && numLinks[lane] >= 3)
-            ++forkedTrees;
-    PXG_CHECK_MSG(forkedTrees > 2, "only %u tree lanes have a forked node", forkedTrees);
-
-    PxgDevicePtr dLk = 0, dCounts = 0;
-    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
-    shim.memAlloc(&dCounts, numLinks.size() * sizeof(uint32_t));
-    if (!dLk || !dCounts)
-    {
-        std::printf("  NOTE: no BDA -> skip\n");
-        return;
-    }
-    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
-    shim.memcpyHtoD(dCounts, numLinks.data(), numLinks.size() * sizeof(uint32_t));
-
-    struct Params
-    {
-        uint64_t linkBlocks, numLinksPer;
-        uint32_t nbLanes, pad0, pad1, pad2;
-    } prm = { uint64_t(dLk), uint64_t(dCounts), FR_LANES, 0, 0, 0 };
-    PXG_CHECK_MSG(sizeof(prm) == 32, "push-constant blob is %zu bytes", sizeof(prm));
-
-    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
-                  "launch artiJointFriction");
-    shim.streamSynchronize();
-
-    std::vector<physx::PxgArticulationBlockLinkData> want = lkImg;
-    for (uint32_t lane = 0; lane < FR_LANES; ++lane)
-        frMirror(want.data(), numLinks[lane], lane);
-
-    std::vector<physx::PxgArticulationBlockLinkData> got(lkImg.size());
-    shim.memcpyDtoH(got.data(), dLk, got.size() * sizeof(physx::PxgArticulationBlockLinkData));
-
-    const uint32_t* w = reinterpret_cast<const uint32_t*>(want.data());
-    const uint32_t* g = reinterpret_cast<const uint32_t*>(got.data());
-    const size_t words = want.size() * sizeof(physx::PxgArticulationBlockLinkData) / 4;
-    size_t bad = 0, signedZeros = 0;
-    for (size_t k = 0; k < words; ++k)
-    {
-        if (w[k] == g[k])
-            continue;
-        if ((w[k] == 0u && g[k] == 0x80000000u) || (w[k] == 0x80000000u && g[k] == 0u))
-        {
-            ++signedZeros;
-            continue;
-        }
-        if (bad < 12)
-            std::printf("MM fr word %zu  ref %08x  gpu %08x\n", k, w[k], g[k]);
-        ++bad;
-    }
-    std::printf("[ info ] fr: signed zeros forgiven %zu\n", signedZeros);
-    PXG_CHECK_MSG(bad == 0, "the bias-force sweep matches the engine-built mirror");
-
-    shim.memFree(dLk);
-    shim.memFree(dCounts);
-}
 
 
 // ===========================================================================
@@ -483,8 +277,8 @@ static void laFill(physx::PxgArticulationBlockLinkData* lk, physx::PxgArticulati
     const bool massless = laMassless(k);
 
     ab.mNumLinks[lane] = numLinks;
-    ab.mFlags[lane] = laFixBase(k) ? PxU32(physx::PxArticulationFlag::eFIX_BASE
-                                           | physx::PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES)
+    ab.mFlags[lane] = laFixBase(k) ? (PxU32(physx::PxArticulationFlag::eFIX_BASE)
+                                           | (1u << 2))   // the 5.6.1 eDRIVE_LIMITS_ARE_FORCES bit, unassigned in 5.12
                                    : PxU32(physx::PxArticulationFlag::eDISABLE_SELF_COLLISION);
     ab.mCOM_TotalInvMassW[lane] = make_float4(v(0, 90), v(0, 91), v(0, 92), v(0, 93) * 0.1f + 0.4f);
 
@@ -1058,8 +852,8 @@ PXG_TEST(artiLinkAcceleration_compoundZeroSign)
 // 130 articulations, grid `num1TBlocks` = 3, block (32, `2`, 1) — the shape of
 // the PARTIAL kernel, not of the two (32, 1, 1) kernels between them.  Five live
 // warp slices and a sixth allocated and left entirely poisoned.  The mirror is
-// the same `laMirror` the body test uses, followed by `frMirror`, in that order:
-// the friction sweep reads both acceleration fields the acceleration sweep wrote.
+// the same `laMirror` the body test uses (5.12 removed the transmitted-force
+// friction sweep that followed it).
 
 const uint32_t LAK_NB_ARTI = 130;
 const uint32_t LAK_WARPS_ALLOC = 6;
@@ -1154,8 +948,8 @@ PXG_TEST(artiAccelerationLaunch)
                  reinterpret_cast<UnAlignedSpatialVector*>(wantVel.data())
                      + size_t(sliceOf[k]) * LA_VEL_SLOTS,
                  numLinks[k], LA_DT, lane);
-        // AFTER the sweep, and reading what it wrote
-        frMirror(lk, numLinks[k], lane);
+        // (5.12: the transmitted-force friction sweep after it is gone)
+        (void)lk;
     }
 
     std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());

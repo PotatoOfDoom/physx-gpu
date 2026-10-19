@@ -55,7 +55,8 @@
 //   * stateDirty 0..3, dirty slab pairs on both alignments (the P8.94d seeds);
 //   * every joint type, with revolute positions seeded beyond +-2pi (the wrap),
 //     limited prismatic dofs whose positions sit below AND above their limits
-//     (both clamps), and spherical dofs (the atan2 re-derivation);
+//     (5.12 dropped the clamp: they must stay put), and spherical dofs (the
+//     atan2 re-derivation);
 //   * a free-base articulation AT REST -- every velocity zero, no dirty flags --
 //     which drives conserveMomentum's aDenom == 0 guard and makes every
 //     accumulator's first term a signed zero;
@@ -358,15 +359,15 @@ static void refComputeAndEnforceJointPositions(physx::PxgArticulationBlockLinkDa
         }
         else if (jointType == J_PRISMATIC)
         {
+            // 5.12 removed the limit clamp: the positions outside the limits must
+            // come back untouched (the coverage counts still classify them)
             if (dof->mMotion[lane] == A1_MOTION_LIMITED)
             {
                 const float2 lim = dof->mConstraintData.mLimits_LowLimitX_highLimitY[lane];
-                PxReal jPosition = dof->mJointPositions[lane];
-                bool moved = false;
-                if (jPosition < lim.x) { jPosition = lim.x; ++cov.prismaticLow; moved = true; }
-                if (jPosition > lim.y) { jPosition = lim.y; ++cov.prismaticHigh; moved = true; }
-                if (!moved) ++cov.prismaticInside;
-                dof->mJointPositions[lane] = jPosition;
+                const PxReal jPosition = dof->mJointPositions[lane];
+                if (jPosition < lim.x) ++cov.prismaticLow;
+                else if (jPosition > lim.y) ++cov.prismaticHigh;
+                else ++cov.prismaticInside;
             }
         }
         else if (jointType == J_SPHERICAL)
@@ -581,10 +582,48 @@ static void a1Mirror(uint32_t* isSlabDirty, float* impulses, physx::PxgArticulat
     }
 }
 
+// accumulateExternalZAcrossChainW (forwardDynamic2.cu:2993, new in 5.12): the
+// leaves-to-root sweep updateBodiesLaunch1T runs under
+// isExternalForcesEveryTgsIterationEnabled, over the record's zAForces, AFTER
+// updateBodiesInternal.  propagateImpulseW<WriteToProvidedQstZ> with
+// jointForce == NULL and providedQstZ == NULL: per dof
+// `stZ = 0.0f - sas.innerProduct(Z)` (jf is the 0.0f literal), nothing written
+// back to the dofs; zAForces[parent] += translateSpatialVector(rw, temp).
+static void refAccumulateExternalZAcrossChainW(UnAlignedSpatialVector* zAForces,
+                                               const physx::PxgArticulationBlockLinkData* lk,
+                                               const physx::PxgArticulationBlockDofData* df,
+                                               uint32_t numLinks, uint32_t lane)
+{
+    for (uint32_t linkID = numLinks - 1u; linkID > 0u; --linkID)
+    {
+        const physx::PxgArticulationBlockLinkData& L = lk[linkID];
+        const uint32_t parent = L.mParents[lane];
+        const PxVec3 rw(L.mRw_x[lane], L.mRw_y[lane], L.mRw_z[lane]);
+        const uint32_t dofCount = L.mDofs[lane];
+        const physx::PxgArticulationBlockDofData* dofData = &df[L.mJointOffset[lane]];
+
+        const UnAlignedSpatialVector Z = zAForces[linkID];
+        UnAlignedSpatialVector temp = Z;
+        for (uint32_t ind = 0; ind < 3; ++ind)
+        {
+            if (ind < dofCount)
+            {
+                const UnAlignedSpatialVector sas = loadSpatialVector(dofData[ind].mWorldMotionMatrix, lane);
+                const UnAlignedSpatialVector isInvD = loadSpatialVector(dofData[ind].mIsInvDW, lane);
+                const PxReal jf = 0.0f;
+                const PxReal stZ = jf - sas.innerProduct(Z);
+                temp += isInvD * stZ;
+            }
+        }
+        zAForces[parent] += physx::Dy::FeatherstoneArticulation::translateSpatialVector(rw, temp);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// one dispatch per `integrate` value
+// one dispatch per `integrate` value; extEvery (5.12) adds the external-Z chain
+// sweep into each record's zAForces
 // ---------------------------------------------------------------------------
-static void a1Run(PxgCudaShim& shim, bool integrate)
+static void a1Run(PxgCudaShim& shim, bool integrate, bool extEvery = false)
 {
     std::vector<physx::PxgArticulationBlockData> abImg(A1_WARPS);
     std::vector<physx::PxgArticulationBlockLinkData> lkImg(size_t(A1_WARPS) * A1_MAX_LINKS);
@@ -642,12 +681,40 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
     std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
     std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
     std::vector<A1Record> wantRecs = recs;
+    // 5.12: each record's zAForces (the isolated external Z per link), seeded;
+    // one canary spatial vector past the last link
+    std::vector<std::vector<UnAlignedSpatialVector>> zaf(A1_ARTS);
+    for (uint32_t r = 0; r < A1_ARTS; ++r)
+    {
+        zaf[r].resize(A1_MAX_LINKS + 1);
+        for (uint32_t l = 0; l <= A1_MAX_LINKS; ++l)
+            zaf[r][l] = UnAlignedSpatialVector(PxVec3(a1V(r, 600u + 6u * l), a1V(r, 601u + 6u * l),
+                                                      a1V(r, 602u + 6u * l)),
+                                               PxVec3(a1V(r, 603u + 6u * l), a1V(r, 604u + 6u * l),
+                                                      a1V(r, 605u + 6u * l)) * 0.5f);
+    }
+    std::vector<std::vector<UnAlignedSpatialVector>> wantZaf = zaf;
     A1Coverage cov;
-    uint32_t alignedHits = 0, unalignedHits = 0;
+    uint32_t alignedHits = 0, unalignedHits = 0, chainHops = 0;
     for (uint32_t a = 0; a < A1_ARTS; ++a)
+    {
         a1Mirror(wantDirty.data(), wantImp.data(), &wantAb[a / 32u], &wantLk[size_t(a / 32u) * A1_MAX_LINKS],
                  &wantDf[size_t(a / 32u) * A1_MAX_DOFS], wantRecs[a1ArtiIndex(a)], a, A1_DT, integrate, a & 31u, cov,
                  alignedHits, unalignedHits);
+        if (extEvery)
+        {
+            // updateBodiesLaunch1T: the record by the BLOCK's mArticulationIndex,
+            // the link count by its mNumLinks, after updateBodiesInternal
+            const uint32_t lane = a & 31u;
+            const physx::PxgArticulationBlockData& B = wantAb[a / 32u];
+            refAccumulateExternalZAcrossChainW(wantZaf[B.mArticulationIndex[lane]].data(),
+                                               &wantLk[size_t(a / 32u) * A1_MAX_LINKS],
+                                               &wantDf[size_t(a / 32u) * A1_MAX_DOFS], B.mNumLinks[lane], lane);
+            chainHops += B.mNumLinks[lane] - 1u;
+        }
+    }
+    if (extEvery)
+        PXG_CHECK_MSG(chainHops > 100, "the external-Z chain sweep runs (%u hops)", chainHops);
     std::printf("[ info ] au1 int=%d: impulse reads 16-aligned %u, 8-aligned %u; revolute wraps %u, prismatic "
                 "clamps low %u / high %u / inside %u, spherical re-derivations %u, zero-denominator %u "
                 "(of which %u with a non-zero momentum vector)\n",
@@ -682,7 +749,7 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         std::printf("  NOTE: no BDA -> skip\n");
         return;
     }
-    struct RecPtrs { PxgDevicePtr p, v, a; };
+    struct RecPtrs { PxgDevicePtr p, v, a, za; };
     std::vector<RecPtrs> rp(A1_ARTS);
     auto up = [&](const std::vector<float>& src) {
         PxgDevicePtr dp = 0;
@@ -698,6 +765,11 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         arts[r].jointPositions = reinterpret_cast<PxReal*>(rp[r].p);
         arts[r].jointVelocities = reinterpret_cast<PxReal*>(rp[r].v);
         arts[r].jointAccelerations = reinterpret_cast<PxReal*>(rp[r].a);
+        rp[r].za = 0;
+        shim.memAlloc(&rp[r].za, zaf[r].size() * sizeof(UnAlignedSpatialVector));
+        if (rp[r].za)
+            shim.memcpyHtoD(rp[r].za, zaf[r].data(), zaf[r].size() * sizeof(UnAlignedSpatialVector));
+        arts[r].zAForces = reinterpret_cast<UnAlignedSpatialVector*>(rp[r].za);
     }
     shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
     shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
@@ -718,6 +790,9 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
     desc.slabHasChanges = reinterpret_cast<uint2*>(dDirty);
     desc.impulses = reinterpret_cast<UnAlignedSpatialVector*>(dImp);
     desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    // 5.12: the external-Z chain sweep runs only under this flag (poison reads true)
+    desc.isExternalForcesEveryTgsIterationEnabled = extEvery;
+    desc.isSleepingDisabled = false;
     shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
     // the bool in ONE byte at offset 12, its padding poisoned (the P8.95b pattern)
@@ -828,6 +903,10 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         cmp("jointVelocities", wantRecs[r].jointV.data(), tmp.data(), tmp.size() * 4, 0);
         shim.memcpyDtoH(tmp.data(), rp[r].a, tmp.size() * 4);
         cmp("jointAccelerations", wantRecs[r].jointA.data(), tmp.data(), tmp.size() * 4, 0);
+        // the record's zAForces: untouched unless extEvery, then the chain (exact)
+        std::vector<UnAlignedSpatialVector> gotZa(zaf[r].size());
+        shim.memcpyDtoH(gotZa.data(), rp[r].za, gotZa.size() * sizeof(UnAlignedSpatialVector));
+        cmp("zAForces", wantZaf[r].data(), gotZa.data(), gotZa.size() * sizeof(UnAlignedSpatialVector), 0);
     }
 
     std::printf("[ info ] au1 int=%d: signed zeros %zu, tolerated %zu words, max %u ulp, max abs %.3g\n",
@@ -845,7 +924,7 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         PXG_CHECK_MSG(signedZeros == 0, "integrate=0: %zu signed-zero mismatches", signedZeros);
 
     for (uint32_t r = 0; r < A1_ARTS; ++r)
-        for (PxgDevicePtr p : { rp[r].p, rp[r].v, rp[r].a }) if (p) shim.memFree(p);
+        for (PxgDevicePtr p : { rp[r].p, rp[r].v, rp[r].a, rp[r].za }) if (p) shim.memFree(p);
     for (PxgDevicePtr p : { dAb, dLk, dDf, dDirty, dImp, dArts, dDesc }) shim.memFree(p);
 }
 
@@ -1005,6 +1084,9 @@ static void a1RunSingleLink(PxgCudaShim& shim, bool integrate)
     desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
     desc.mArticulationDofBlocks = reinterpret_cast<physx::PxgArticulationBlockDofData*>(dDf);
     desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    // 5.12: the external-Z chain sweep runs only under this flag (poison reads true)
+    desc.isExternalForcesEveryTgsIterationEnabled = false;
+    desc.isSleepingDisabled = false;
     shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
     struct Params { uint64_t desc; float dt; uint32_t integrateWord; } prm = {
@@ -1176,6 +1258,9 @@ static void a1RunWideDofs(PxgCudaShim& shim)
     desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
     desc.mArticulationDofBlocks = reinterpret_cast<physx::PxgArticulationBlockDofData*>(dDf);
     desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    // 5.12: the external-Z chain sweep runs only under this flag (poison reads true)
+    desc.isExternalForcesEveryTgsIterationEnabled = false;
+    desc.isSleepingDisabled = false;
     shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
     struct Params { uint64_t desc; float dt; uint32_t integrateWord; } prm = {
@@ -1249,6 +1334,9 @@ PXG_TEST(artiUpdateBodies1T)
 
     a1Run(shim, /*integrate*/ false); // TGS: the path every scene runs
     a1Run(shim, /*integrate*/ true);  // PGS
+    // 5.12: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -- the external-Z chain
+    // sweep (a TGS flag, so the integrate == false path)
+    a1Run(shim, /*integrate*/ false, /*extEvery*/ true);
     a1RunSingleLink(shim, /*integrate*/ false);
     a1RunWideDofs(shim);
 }

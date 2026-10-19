@@ -46,6 +46,9 @@
 
 #include <cmath>
 
+#include "foundation/PxPreprocessor.h"
+#include "PxgSolverFlags.h"
+
 namespace pxgtest
 {
 using namespace physx;
@@ -195,7 +198,8 @@ inline void refCreateExtBody(const PxNodeIndex& node, uint32_t bi,
 inline UnAlignedSpatialVector refCreateImpulseResponseVector(const PxgSolverExtBody2& b,
                                                              const UnAlignedSpatialVector& impulse)
 {
-    if (b.islandNodeIndex.isArticulation() || b.isKinematic)
+    // 5.12 also skips static bodies (artiConstraintPrep2.cu createPxgSolverExtBody)
+    if (b.islandNodeIndex.isArticulation() || b.islandNodeIndex.isStaticBody() || b.isKinematic)
         return impulse;
     return UnAlignedSpatialVector(b.mSpatialResponse.multiplyInertia(impulse.top), impulse.bottom);
 }
@@ -229,7 +233,7 @@ inline uint32_t refSetupExtContactsTGS(
     const PxgSolverExtBody2& b0, const PxgSolverExtBody2& b1,
     float invDt, float stepDt, float invTotalDt,
     float bounceThresholdF32, float biasCoefficient,
-    uint32_t threadIndex, uint32_t forceWritebackBufferOffset, bool perPointFriction,
+    uint32_t threadIndex, uint32_t forceWritebackBufferOffset,
     PxgTGSBlockSolverContactHeader& contactHeader,
     PxgTGSBlockSolverFrictionHeader& frictionHeader,
     PxgTGSBlockSolverContactPoint* contactPoints,
@@ -246,9 +250,9 @@ inline uint32_t refSetupExtContactsTGS(
 
     const PxReal cfm = acpMax(b0.cfm, b1.cfm, 16);
     const float maxPenBias = PxMax(b0.penBiasClamp, b1.penBiasClamp);
-    const float p8 = PxMin(0.8f, biasCoefficient);
+    // 5.12: no PxMin(0.8f, biasCoefficient) clamp
     const float bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invDt * p8;
+    const float invDtWithBiasCoefficient = invDt * biasCoefficient;
 
     const PxgConstraintInvMassScale& ims = contactData.mInvMassScale[threadIndex];
     const float4 lin0X_ang0Y_lin1Z_ang1W = make_float4(ims.linear0, ims.angular0, ims.linear1, ims.angular1);
@@ -293,10 +297,12 @@ inline uint32_t refSetupExtContactsTGS(
     const PxReal linNorVel = norVel0 - norVel1;
     const PxReal damping = contactData.damping[threadIndex];
 
-    frictionHeader.biasCoefficient[threadIndex] = invDt;
+    // 5.12: zero friction bias when strong friction is disabled
+    const bool disableStrongFriction = (flags & PxgSolverContactFlags::eDISABLE_STRONG_FRICTION) != 0;
+    frictionHeader.biasCoefficient[threadIndex] = !disableStrongFriction ? invDt : 0.0f;
     contactHeader.restitutionXdt[threadIndex] = restitution * stepDt;
     contactHeader.cfm[threadIndex] = cfm;
-    contactHeader.p8[threadIndex] = p8;
+    contactHeader.biasCoefficient[threadIndex] = biasCoefficient;   // 5.12: was p8
 
     PxReal normalForce = 0.f;
     PxReal minPen = 0.f;
@@ -367,7 +373,7 @@ inline uint32_t refSetupExtContactsTGS(
         else
         {
             velMultiplier = recipResponse;
-            scaledBias = isSeparated ? -invDt : -invDtp8;
+            scaledBias = isSeparated ? -invDt : -invDtWithBiasCoefficient;
         }
 
         contactPoints[j].resp0[threadIndex] = resp0;
@@ -380,9 +386,15 @@ inline uint32_t refSetupExtContactsTGS(
 
         float totalError = penetration;
 
-        // the :837 precedence quirk, kept literally
-        const float tvCond = cTargetVel + (isGreater2 ? 1.0f : 0.0f);
-        float targetVelocity = (tvCond != 0.0f) ? (-vrel) * restitution : 0.f;
+        // 5.12 parenthesized the 5.6.1 precedence quirk
+        float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
+
+        // 5.12 moved the bounce error term before deltaF and the kinematic adjust
+        if (isGreater2)
+        {
+            const PxReal ratio = totalDt + penetration / vrel;
+            totalError += ratio * targetVelocity;
+        }
 
         const PxReal deltaF =
             fmaxf((targetVelocity + (-penetrationInvDt - vrel)) * velMultiplier, 0.f);
@@ -392,12 +404,6 @@ inline uint32_t refSetupExtContactsTGS(
             targetVelocity -= vrel1;
         if (b1.isKinematic)
             targetVelocity += vrel2;
-
-        if (isGreater2)
-        {
-            const PxReal ratio = totalDt + penetration / vrel;
-            totalError += ratio * targetVelocity;
-        }
 
         contactPoints[j].raXn_extraCoeff[threadIndex] =
             make_float4(response0.top.x, response0.top.y, response0.top.z, compliantContactCoeff);
@@ -480,7 +486,9 @@ inline uint32_t refSetupExtContactsTGS(
             const PxVec3 ra = b0.body2World.q.rotate(body0Anchor);
             const PxVec3 rb = b1.body2World.q.rotate(body1Anchor);
 
-            const PxU32 index = perPointFriction ? frictionPatch.contactID[j][threadIndex] : 0;
+            // 5.12: keyed on eHAS_TARGET_VELOCITY (was perPointFriction)
+            const bool hasTargetVelocity = (flags & PxgSolverContactFlags::eHAS_TARGET_VELOCITY) != 0;
+            const PxU32 index = hasTargetVelocity ? frictionPatch.contactID[j][threadIndex] : 0;
 
             const float4 targetVel4 = contacts[index].targetVel_maxImpulseW[threadIndex];
             const PxVec3 tvel(targetVel4.x, targetVel4.y, targetVel4.z);
@@ -604,7 +612,8 @@ inline uint32_t refSetupExtContactsTGS(
 // ---------------------------------------------------------------------------
 // P8.121: setupFinalizeExtSolverConstraintsBlock, PGS overload
 // (artiConstraintPrep2.cu:169-613) -- one lane.  The differences from the
-// TGS mirror above are the module's traps 28-45: fixed p8 = 0.8, >= in
+// TGS mirror above are the module's traps 28-45: (5.6.1: fixed p8 = 0.8; 5.12
+// passes the rigidContact bias coefficient), >= in
 // isSeparated, restitution > 0, the parenthesized targetVelocity (no
 // precedence quirk), !isArticulation-keyed velocity adjusts, coeff0/coeff1
 // rows, the (ra + p0) - (rb + p1) error spelling, per-row bias * invDt,
@@ -638,8 +647,8 @@ inline uint32_t refSetupExtContactsPGS(
     const PxgBlockContactPoint* contacts, uint32_t contactCount,
     const PxgBlockFrictionPatch& frictionPatch, const PxgBlockFrictionAnchorPatch& fAnchor,
     const PxgSolverExtBody2& b0, const PxgSolverExtBody2& b1,
-    float invDt, float dt, float bounceThresholdF32,
-    uint32_t threadIndex, uint32_t forceWritebackBufferOffset, bool perPointFriction,
+    float invDt, float dt, float bounceThresholdF32, float biasCoefficient,
+    uint32_t threadIndex, uint32_t forceWritebackBufferOffset,
     PxgBlockSolverContactHeader& contactHeader,
     PxgBlockSolverFrictionHeader& frictionHeader,
     PxgBlockSolverContactPoint* contactPoints,
@@ -658,9 +667,9 @@ inline uint32_t refSetupExtContactsPGS(
     const PxVec3& bodyFrame1p = b1.body2World.p;
 
     const float maxPenBias = PxMax(b0.penBiasClamp, b1.penBiasClamp);
-    const float p8 = 0.8f;   // FIXED (trap 29); biasCoefficient is dead in PGS
+    // 5.12: the rigidContact bias coefficient (5.6.1 hard-coded p8 = 0.8)
     const float bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invDt * p8;
+    const float invDtp8 = invDt * biasCoefficient;
 
     const PxgConstraintInvMassScale& ims = contactData.mInvMassScale[threadIndex];
     const float4 lin0X_ang0Y_lin1Z_ang1W =
@@ -911,7 +920,9 @@ inline uint32_t refSetupExtContactsPGS(
             // trap 40: (ra + p0) - (rb + p1)
             const PxVec3 error = (ra + bodyFrame0p) - (rb + bodyFrame1p);
 
-            const PxU32 index = perPointFriction ? frictionPatch.contactID[j][threadIndex] : 0;
+            // 5.12: keyed on eHAS_TARGET_VELOCITY (was perPointFriction)
+            const bool hasTargetVelocity = (flags & PxgSolverContactFlags::eHAS_TARGET_VELOCITY) != 0;
+            const PxU32 index = hasTargetVelocity ? frictionPatch.contactID[j][threadIndex] : 0;
 
             const float4 targetVel4 = contacts[index].targetVel_maxImpulseW[threadIndex];
             const PxVec3 tvel3(targetVel4.x, targetVel4.y, targetVel4.z);

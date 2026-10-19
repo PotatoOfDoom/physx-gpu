@@ -90,7 +90,11 @@
 //     ITS points, in patch order -- `baseContactStream++` walks a single cursor.
 //     Point i of the record is NOT point i of the stream.
 //  4. THE PATCH RESERVATION IS numPatches * 64 BYTES (:386), and the overflow test
-//     uses that same product (:388) rather than one patch's worth.
+//     uses that same product (:388) rather than one patch's worth.  Since 5.12 it
+//     is the REQUESTED count (nbRequestedPatches), taken before a failed contact
+//     or force allocation zeroes numPatches and numPoints.
+//  (Line numbers in this header are 5.6.1's; the 5.12 bodies sit about 20 lines
+//  higher after the licence-header change.)
 //  5. THE PxContactPatch ARRAY IS WRITTEN INLINE, numPatches of them, each with its
 //     OWN normal and nbContacts and a RUNNING startContactIndex (:421-443).  The
 //     single-patch tail inlines `insertIntoPatchStream`, which writes exactly one.
@@ -131,8 +135,10 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
     // accumulator so the PxU8 can never bite, but numPoints is written into an
     // eight-bit patch field further down and into a sixteen-bit output field here;
     // the masks are transcribed rather than assumed away.
-    const uint numPatches = c.numPatches & 0xFFu;
-    const uint numPoints = c.numPoints & 0xFFFFu;
+    uint numPatches = c.numPatches & 0xFFu;
+    uint numPoints = c.numPoints & 0xFFFFu;
+    // 5.12 (:296): the patch demand survives a failed contact/force allocation.
+    const uint nbRequestedPatches = numPatches;
 
     uint contactByteOffset = INVALID;
     uint forceByteOffset = INVALID;
@@ -141,20 +147,19 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
         InterlockedAdd(counters[0].contactsBytes, CONTACT_SIZE * numPoints, contactByteOffset);
         InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * numPoints, forceByteOffset);
 
-        // The limit test is against ONE PxContact / ONE PxU32 (:321, :327), not
-        // against the whole reservation.  That is upstream's test and it is kept:
-        // widening it to `+ CONTACT_SIZE * numPoints` would reject allocations CUDA
-        // accepts, and the two implementations would disagree only under pressure --
-        // the hardest condition to get a scene to reproduce on purpose.
-        if ((uint64_t(contactByteOffset) + uint64_t(CONTACT_SIZE)) > uint64_t(o.contactBytesLimit))
+        // 5.12 (:304-315): the limit test covers the WHOLE reservation (it was ONE
+        // PxContact / ONE PxU32 up to 5.6.1), and a force overflow also drops the
+        // contact offset.
+        if ((uint64_t(contactByteOffset) + uint64_t(CONTACT_SIZE) * uint64_t(numPoints)) > uint64_t(o.contactBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
             contactByteOffset = INVALID;
         }
-        if ((uint64_t(forceByteOffset) + uint64_t(FORCE_SIZE)) > uint64_t(o.forceBytesLimit))
+        if ((uint64_t(forceByteOffset) + uint64_t(FORCE_SIZE) * uint64_t(numPoints)) > uint64_t(o.forceBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
             forceByteOffset = INVALID;
+            contactByteOffset = INVALID;
         }
     }
 
@@ -173,11 +178,9 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
                 baseContactStream[slot++] = c.points[i * MAX_PATCH_POINTS + j];
         }
 
-        // A SHARP EDGE, AND IT IS UPSTREAM'S: the gate is `contactByteOffset`, so if
-        // the FORCE stream alone overflowed, `forceByteOffset` is still the INVALID
-        // sentinel here and this line stores `startContactForces + 0xFFFFFFFF` -- not
-        // null.  cu:349 uses `forceAndIndiceByteOffset` unchecked in exactly the same
-        // way.  Writing 0 instead would be the sane thing and the wrong thing.
+        // Since 5.12 a force overflow also invalidates contactByteOffset, so the
+        // force offset is always valid here (5.6.1 stored startContactForces +
+        // 0xFFFFFFFF after a force-only overflow).
         cmOutputs[testIndex].contactForces = o.startContactForces + uint64_t(forceByteOffset);
         cmOutputs[testIndex].contactPoints = o.startContactPoints + uint64_t(contactByteOffset);
     }
@@ -185,6 +188,8 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
     {
         cmOutputs[testIndex].contactForces = 0uL;
         cmOutputs[testIndex].contactPoints = 0uL;
+        numPoints = 0u;  // 5.12 (:337-338)
+        numPatches = 0u;
     }
 
     const uint allflags = cmOutputs[testIndex].allflagsWord;
@@ -211,11 +216,11 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
     }
 
     uint patchIndex = INVALID;
-    if (numPatches != 0u)
+    if (nbRequestedPatches != 0u)
     {
-        // difference 4: numPatches patches reserved, and the SAME product tested.
-        InterlockedAdd(counters[0].patchesBytes, numPatches * PATCH_SIZE, patchIndex);
-        if ((uint64_t(patchIndex) + uint64_t(numPatches) * uint64_t(PATCH_SIZE)) > uint64_t(o.patchBytesLimit))
+        // difference 4: the REQUESTED patches reserved, and the SAME product tested.
+        InterlockedAdd(counters[0].patchesBytes, nbRequestedPatches * PATCH_SIZE, patchIndex);
+        if ((uint64_t(patchIndex) + uint64_t(nbRequestedPatches) * uint64_t(PATCH_SIZE)) > uint64_t(o.patchBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_PATCH);
             patchIndex = INVALID;
@@ -231,10 +236,12 @@ void cvxCoreWriteOutput32(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1
             touchChangeFlags[testIndex] = previouslyHadTouch ? 1u : 0u;
             patchChangeFlags[testIndex] = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (numPatches != 0u)
         {
             cmOutputs[testIndex].contactPatches = o.startContactPatches + uint64_t(patchIndex);
         }
+        else
+            patchIndex = INVALID;
     }
 
     // difference 5: the PxContactPatch ARRAY (:408-444), 64 bytes = 16 words each:

@@ -67,7 +67,8 @@ using physx::Cm::UnAlignedSpatialVector;
 
 const float SVX_EPS_REAL = 1.192092896e-07f;
 const uint32_t DY_FLAG_SPRING = 1u << 5, DY_FLAG_INEQ = 1u << 6, DY_FLAG_ACCEL = 1u << 7;
-const uint32_t COMPLIANT_ACCEL = 1u << 3;
+// PxgSolverContactFlags::eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4; 5.6.1: 1 << 3)
+const uint32_t COMPLIANT_ACCEL = 1u << 4;
 
 // the __device__-only reduced compliant-coefficient overload, transcribed
 inline void refCompliantCoeffsTGS(uint32_t flags, float nrdt, float unitResponse,
@@ -188,7 +189,7 @@ inline void refSolveExtContactTGS(const PxgBlockConstraintBatch& batch,
     const float4 invMass0_1_angDom0_1 = contactHeader->invMass0_1_angDom0_1[ti];
     const float4 normal_staticFriction = contactHeader->normal_staticFriction[ti];
     const float restitutionXdt = contactHeader->restitutionXdt[ti];
-    const float p8 = contactHeader->p8[ti];
+    const float p8 = contactHeader->biasCoefficient[ti];   // 5.12 renamed the header field
     const float cfm = contactHeader->cfm[ti];
     const PxU8 flags = PxU8(contactHeader->flags[ti]);
 
@@ -557,8 +558,8 @@ inline void refSolveExt1DTGS(const PxgBlockConstraintBatch& batch,
         const float deltaF = clampedForce - appliedForce;
 
         ccon.appliedForce[ti] = clampedForce;
-        if (residualReportingEnabled)
-            ccon.residual[ti] = vMul == 0.f ? 0.f : deltaF / vMul;
+        // (5.12: no per-row residual; PxgTGSBlockSolverConstraint1DCon lost the field)
+        (void)residualReportingEnabled;
 
         li0 = clinVel0 * deltaF + li0;
         ai0 = cangVel0 * deltaF + ai0;
@@ -637,7 +638,7 @@ inline void refSolveExtContactPGS(const PxgBlockConstraintBatch& batch,
                                   PxgArticulationBlockResponse* responses,
                                   UnAlignedSpatialVector& impulse0,
                                   UnAlignedSpatialVector& impulse1,
-                                  RefError* error, float ref0, float ref1)
+                                  RefError* error, float biasCoefficient, float ref0, float ref1)
 {
     UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
 
@@ -650,7 +651,7 @@ inline void refSolveExtContactPGS(const PxgBlockConstraintBatch& batch,
     const PxU32 numFrictionConstr = frictionHeader.numFrictionConstr[ti];
 
     const float restitution = contactHeader.restitution[ti];
-    const float p8 = 0.8f;   // FIXED (module trap 2)
+    const float p8 = biasCoefficient;   // 5.12: the island's rigidContact bias (was a fixed 0.8)
     const float cfm = contactHeader.cfm[ti];
     const PxU8 flags = PxU8(contactHeader.flags[ti]);
 
@@ -899,8 +900,8 @@ inline void refSolveExt1DPGS(const PxgBlockConstraintBatch& batch,
         const float deltaF = clampedForce - appliedForce;
 
         cmod.appliedForce[ti] = clampedForce;
-        if (residualReportingEnabled)
-            cmod.residual[ti] = (vMul == 0.f) ? 0.f : deltaF / vMul;
+        // (5.12: no per-row residual; PxgBlockSolverConstraint1DMod lost the field)
+        (void)residualReportingEnabled;
 
         li0 = clinVel0 * deltaF + li0;
         ai0 = cangVel0 * deltaF + ai0;

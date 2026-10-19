@@ -329,9 +329,9 @@ static void sfSeed(SfArena& B, uint32_t salt)
             ic.mResponse[lane] = response;
             ic.mRecipResponse[lane] = 1.0f / response;
             ic.mMaxJointVelocity[lane] = 0.4f + 0.2f * std::fabs(fv(lane, d, 135, salt));
-            ic.mConstraintMaxImpulse[lane] = 0.6f + 0.3f * std::fabs(fv(lane, d, 136, salt));
+            // 5.12: the dof solve reads the parked external effort (was jointForce)
+            ic.mExternalEffort[lane] = 0.5f * fv(lane, d, 136, salt);
             ic.mDriveImpulse[lane] = 0.3f * fv(lane, d, 137, salt);
-            ic.mMaxFrictionForce[lane] = 0.4f + 0.2f * std::fabs(fv(lane, d, 138, salt));
             ic.mAccumulatedFrictionImpulse[lane] = 0.2f * fv(lane, d, 139, salt);
             ic.mMaxEffort[lane] = ((lane + d) % 2u) ? (30.0f + 10.0f * std::fabs(fv(lane, d, 140, salt))) : 0.0f;
             ic.mMaxActuatorVelocity[lane] = 2.0f + std::fabs(fv(lane, d, 141, salt));
@@ -407,7 +407,7 @@ static void sfSeed(SfArena& B, uint32_t salt)
                 H.restitutionXdt[lane] = ((lane + b) % 4u == 1u) ? (-0.3f + 0.1f * fv(lane, b, 70, salt))
                                                                  : (0.2f + 0.1f * fv(lane, b, 71, salt));
                 H.cfm[lane] = 0.01f + 0.005f * fv(lane, b, 72, salt);
-                H.p8[lane] = 0.9f;
+                H.biasCoefficient[lane] = 0.9f;   // 5.12 renamed p8
                 F.numFrictionConstr[lane] = ((lane + b) % 3u) * 2u + (((lane + b) % 5u == 2u) ? 1u : 0u);
                 F.dynamicFriction[lane] = 0.4f + 0.2f * fv(lane, b, 73, salt);
                 F.biasCoefficient[lane] = 0.5f + 0.2f * fv(lane, b, 74, salt);
@@ -526,11 +526,10 @@ static void sfMirror(SfArena& W, uint32_t flags)
         const UnAlignedSpatialVector parentImpIn(PxVec3(fin[6], fin[7], fin[8]), PxVec3(fin[9], fin[10], fin[11]));
         const UnAlignedSpatialVector parentDeltaVIn(PxVec3(fin[12], fin[13], fin[14]), PxVec3(fin[15], fin[16], fin[17]));
 
-        const float* jf = &W.jf[lane * SF_MAX_DOFS];
         RefError err, contactErr;
 
         const UnAlignedSpatialVector parentImp = refSolveInternalDFSLane(
-            W.lk.data(), W.df.data(), W.stack.data(), jf,
+            W.lk.data(), W.df.data(), W.stack.data(),
             W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(), W.fp.data(),
             W.jh.data(), W.jr.data(), W.rs.data(),
             SF_DT, SF_SCENE_DT, SF_INV_DT, SF_ELAPSED, SF_ERP,

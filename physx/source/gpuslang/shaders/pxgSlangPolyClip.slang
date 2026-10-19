@@ -279,9 +279,35 @@ public uint pcPolyClip(uint lane, float4 plane0, float3 v0, uint nbVerts0,
         const float3 triVert0 = pcReadV1(index);
         const float lambda = dot(triVert0 - v0, m) / denom;
         const float3 p = v0 + lambda * e0;
-        const float t = -dot(p - triVert0, plane1.xyz);
 
-        const float sep = ((denom == 0.0f) || (dnom0 == 0.0f)) ? PC_MAX_F32 : t / dnom0;
+        // 5.10+ (convexTriangle.cuh, 5.12 :1024-1103): the separation along `axis`
+        // of d = p - triVert0.  The plane-normal formula t / dnom0 distorts as
+        // dnom0 -> 0, so below |dnom0| = 1e-4 the 2x2 Gram/Cramer solve in the
+        // basis {e1, axis} is used instead, and the contact is discarded when
+        // |m|^2 / |e1|^2 (sin^2 of the e1/axis angle) is below 1e-12.  dnom0 is
+        // warp-uniform, so the branch is too.
+        const float3 d = p - triVert0;
+
+        float sep;
+        if (abs(dnom0) > 1.0e-4f)
+        {
+            const float t = -dot(d, plane1.xyz);
+            sep = (denom == 0.0f) ? PC_MAX_F32 : t / dnom0;
+        }
+        else
+        {
+            // shuffle(FULL_MASK, e1, index): lane `index`'s e1 is
+            // v1[next(index)] - v1[index], rebuilt from the staged v1 with the
+            // same subtraction (index < 3, so next() is the CUDA's tI + 1 == 3 ? 0).
+            const float3 e1FromShuffle = pcReadV1((index + 1u == 3u) ? 0u : index + 1u) - pcReadV1(index);
+
+            const float e1MagnSqr = dot(e1FromShuffle, e1FromShuffle);
+            const float mMagnSqr = dot(m, m);
+            const float sepTmp = -((e1MagnSqr * dot(d, axis)) - (dot(axis, e1FromShuffle) * dot(d, e1FromShuffle))) / mMagnSqr;
+
+            // discard the contact for ill-defined configurations
+            sep = ((denom == 0.0f) || ((mMagnSqr / e1MagnSqr) < 1.0e-12f)) ? PC_MAX_F32 : sepTmp;
+        }
 
         pcAddContacts(tI, pcBallot(tI, (c & (a & (0u - a))) != 0u), p, sep, maxSep, nbContacts);
     }

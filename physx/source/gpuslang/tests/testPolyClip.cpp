@@ -122,6 +122,10 @@ void refAddContacts(uint32_t flags, const V3* pos, const float* sep, float maxSe
     nbContacts += popc(addMask);
 }
 
+// 5.12 dnom0-fix coverage: edge-edge lanes flagged for a contact whose separation
+// came from the Gram/Cramer branch (|dnom0| <= 1e-4), finite and accepted.
+uint32_t gGramAccepted = 0;
+
 // exitPath: 0 = returned at !any(out1), 1 = at !any(out0), 2 = ran the edge loop
 uint32_t refPolyClip(const ClipInput& in, float* contacts, uint32_t& exitPath)
 {
@@ -252,8 +256,24 @@ uint32_t refPolyClip(const ClipInput& in, float* contacts, uint32_t& exitPath)
             const float denom = dot3(m, e0[l]);
             const float lambda = dot3(sub(triVert0, in.v0[l]), m) / denom;
             pos[l] = add3(in.v0[l], scl(e0[l], lambda));
-            const float t = -dot3(sub(pos[l], triVert0), n1);
-            sep[l] = ((denom == 0.0f) || (dnom0 == 0.0f)) ? MAXF : t / dnom0;
+            // 5.12 convexTriangle.cuh :1080-1103: t / dnom0 for |dnom0| > 1e-4, else
+            // the Gram/Cramer separation in the basis {e1, axis}, with e1 the
+            // triangle edge of lane `index` (shuffle(FULL_MASK, e1, index))
+            const V3 d = sub(pos[l], triVert0);
+            if (std::fabs(dnom0) > 1.0e-4f)
+            {
+                const float t = -dot3(d, n1);
+                sep[l] = (denom == 0.0f) ? MAXF : t / dnom0;
+            }
+            else
+            {
+                const V3 e1s = sub(in.v1[(index + 1 == 3) ? 0 : (index + 1) % LANES], in.v1[index]);
+                const float e1MagnSqr = dot3(e1s, e1s);
+                const float mMagnSqr = dot3(m, m);
+                const float sepTmp = -((e1MagnSqr * dot3(d, in.axis)) - (dot3(in.axis, e1s) * dot3(d, e1s))) / mMagnSqr;
+                sep[l] = ((denom == 0.0f) || ((mMagnSqr / e1MagnSqr) < 1.0e-12f)) ? MAXF : sepTmp;
+                if ((c[l] & lowBit) && sep[l] < MAXF && !(sep[l] > in.maxSep)) ++gGramAccepted;
+            }
             if (c[l] & lowBit) flags |= 1u << l;
         }
         refAddContacts(flags, pos, sep, in.maxSep, contacts, nbContacts);
@@ -453,6 +473,30 @@ PXG_TEST(polyClipCases)
         cases.push_back(ci); names.push_back("NaN vertex");
     }
 
+    // 12/13: the 5.10+ dnom0 fix.  The triangle stands almost upright in the
+    //        plane y = 0.1 + k*z, so its normal is (0, 1, -k)/|.| and dnom0 =
+    //        n1.axis is about -k: 5e-5 (below the 1e-4 switch, where 5.6.1's
+    //        t / dnom0 blew up) and exactly 0 (the old PX_MAX_F32 arm).  Seen
+    //        along +z the triangle is a thin sliver across the quad, so the quad's
+    //        x = +-1 edges cross the triangle's long edges and the edge-edge loop
+    //        takes the Gram/Cramer separation.  Case 14 keeps k = 2e-4, just ABOVE
+    //        the switch, where the plane formula still applies.
+    for (const float k : { 5.0e-5f, 0.0f, 2.0e-4f })
+    {
+        ClipInput ci{}; frame(ci, 0.0f, 4.0f);
+        ngon(ci, 4, 1.4142135f, 0.0f, 0.0f);   // the square with corners at (+-1, +-1)
+        const V3 a = mk(-3.0f, 0.1f - k * 0.5f, -0.5f), b = mk(3.0f, 0.1f + k * 0.25f, 0.25f),
+                 cc = mk(0.5f, 0.1f + k * 0.75f, 0.75f);
+        triangle(ci, a, b, cc);
+        V3 n = cross3(sub(b, a), sub(cc, a));
+        const float len = std::sqrt(dot3(n, n));
+        n = mk(n.x / len, n.y / len, n.z / len);
+        ci.plane1[0] = n.x; ci.plane1[1] = n.y; ci.plane1[2] = n.z; ci.plane1[3] = -dot3(n, a);
+        cases.push_back(ci);
+        names.push_back(k == 0.0f ? "upright triangle, dnom0 == 0"
+                        : (k < 1.0e-4f ? "upright triangle, |dnom0| < 1e-4" : "upright triangle, |dnom0| > 1e-4"));
+    }
+
     const uint32_t numPairs = uint32_t(cases.size());
     std::vector<float> input;
     for (const ClipInput& ci : cases) packInput(ci, input);
@@ -474,6 +518,7 @@ PXG_TEST(polyClipCases)
 
     const auto got = downloadBuffer<float>(dev, bOut, output.size());
 
+    gGramAccepted = 0;
     size_t bad = 0, pathsHit = 0;
     bool sawEarly1 = false, sawEarly2 = false, sawEdgeLoop = false, sawEmpty = false;
     for (uint32_t p = 0; p < numPairs; ++p)
@@ -529,6 +574,7 @@ PXG_TEST(polyClipCases)
     PXG_CHECK_MSG(sawEarly2, "some pair returns at !any(out0)");
     PXG_CHECK_MSG(sawEdgeLoop, "some pair runs the edge-edge loop");
     PXG_CHECK_MSG(sawEmpty, "some pair produces no contacts at all");
+    PXG_CHECK_MSG(gGramAccepted > 0, "some edge-edge contact takes the 5.12 Gram/Cramer separation (|dnom0| <= 1e-4)");
     PXG_CHECK_MSG(bad == 0, "polyClip matches the scalar oracle over %u pairs (%zu mismatches)",
                   numPairs, bad);
     PXG_CHECK_MSG(pathsHit == numPairs, "every pair compared (%zu/%u)", pathsHit, numPairs);

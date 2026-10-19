@@ -67,7 +67,6 @@ struct StaticCov
 };
 
 inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, PxU32 dofCount,
-                            const float* jf,
                             float dt, float sceneDt, float invDt, float elapsedTime, float erp,
                             bool velIter, bool extEvery, bool doFDPL, bool velBefore,
                             const UnAlignedSpatialVector& childDelta,
@@ -88,11 +87,9 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
         const float maxJointVel = ic.mMaxJointVelocity[lane];
         const UnAlignedSpatialVector row0 = loadSpatialVector(ic.mRow0, lane);
         const UnAlignedSpatialVector row1 = loadSpatialVector(ic.mRow1, lane);
-        const float maxDriveForce = ic.mConstraintMaxImpulse[lane];
         const float appliedDriveImpulseOrig = ic.mDriveImpulse[lane];
         const float recipResponse = ic.mRecipResponse[lane];
         const float response = ic.mResponse[lane];
-        const float maxFrictionForce = ic.mMaxFrictionForce[lane];
         const UnAlignedSpatialVector dVA = loadSpatialVector(ic.mDeltaVA, lane);
         const UnAlignedSpatialVector dVB = loadSpatialVector(ic.mDeltaVB, lane);
 
@@ -105,7 +102,8 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
         const float maxImpulse = ic.mMaxEffort[lane] * effectiveDt;
         const float speedImpulseGradient = ic.mSpeedEffortGradient[lane] / effectiveDt;
         const float velocityDependentResistance = ic.mVelocityDependentResistance[lane] * effectiveDt;
-        const float externalJointImpulse = jf[jointOffset + dof] * effectiveDt;
+        // 5.12: the external joint effort the forward pass parked per dof
+        const float externalJointImpulse = ic.mExternalEffort[lane] * effectiveDt;
         const float maxActuatorVelocity = ic.mMaxActuatorVelocity[lane];
 
         Dy::ArticulationImplicitDriveDesc driveDesc(PxZero);
@@ -118,20 +116,8 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
         float frictionDeltaF = 0.0f, driveDeltaF = 0.0f, posLimitDeltaF = 0.0f;
         if (doFDPL)
         {
-            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
-            if (!newFrictionModel)
-            {
-                if (cov) ++cov->oldModel;
-                const float appliedFriction = 0.0f;   // TGS
-                { const float p = -jointV * recipResponse; PxU32 pb; std::memcpy(&pb, &p, 4);
-                  if (pb == 0x80000000u) ++gTgsOldFrictionNegZero; }
-                const float frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
-                                                    -maxFrictionForce, maxFrictionForce);
-                ic.mAccumulatedFrictionImpulse[lane] = frictionForce;
-                frictionDeltaF = frictionForce - appliedFriction;
-                jointV += frictionDeltaF * response;
-            }
-
+            // 5.12: the deprecated (transmitted-force) friction model and the
+            // maxForce drive clamp are gone; the friction below is unconditional.
             if (maxImpulse > 0.0f)
             {
                 if (cov) ++cov->maxArm;
@@ -145,18 +131,10 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
                 driveDeltaF = clampedImpulse - appliedDriveImpulse;
                 ic.mDriveImpulse[lane] = appliedDriveImpulseOrig + driveDeltaF;
             }
-            else
-            {
-                if (cov) ++cov->forceArm;
-                const float unclampedForce = velIter ? appliedDriveImpulseOrig
-                    : Dy::computeDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
-                const float clampedForce = PxClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
-                ic.mDriveImpulse[lane] = clampedForce;
-            }
+            else if (cov)
+                ++cov->forceArm;   // no effort budget: 5.12 skips the drive
             jointV += driveDeltaF * response;
 
-            if (newFrictionModel)
             {
                 if (cov) ++cov->newModel;
                 const float appliedFriction = perSubset ? 0.0f : ic.mAccumulatedFrictionImpulse[lane];
@@ -220,7 +198,6 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
 // ===========================================================================
 
 inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffset, PxU32 dofCount,
-                               const float* jf,
                                float dt, float sceneDt, float invDt, float elapsedTime, float erp,
                                bool velIter, bool doFDPL, bool velBefore,
                                const UnAlignedSpatialVector& childDelta,
@@ -241,11 +218,9 @@ inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffse
         const float maxJointVel = ic.mMaxJointVelocity[lane];
         const UnAlignedSpatialVector row0 = loadSpatialVector(ic.mRow0, lane);
         const UnAlignedSpatialVector row1 = loadSpatialVector(ic.mRow1, lane);
-        const float maxDriveForce = ic.mConstraintMaxImpulse[lane];
         const float appliedDriveImpulseOrig = ic.mDriveImpulse[lane];
         const float recipResponse = ic.mRecipResponse[lane];
         const float response = ic.mResponse[lane];
-        const float maxFrictionForce = ic.mMaxFrictionForce[lane];
         const UnAlignedSpatialVector dVA = loadSpatialVector(ic.mDeltaVA, lane);
         const UnAlignedSpatialVector dVB = loadSpatialVector(ic.mDeltaVB, lane);
 
@@ -257,7 +232,8 @@ inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffse
         const float maxImpulse = ic.mMaxEffort[lane] * effectiveDt;
         const float speedImpulseGradient = ic.mSpeedEffortGradient[lane] / effectiveDt;
         const float velocityDependentResistance = ic.mVelocityDependentResistance[lane] * effectiveDt;
-        const float externalJointImpulse = jf[jointOffset + dof] * effectiveDt;
+        // 5.12: the external joint effort the forward pass parked per dof
+        const float externalJointImpulse = ic.mExternalEffort[lane] * effectiveDt;
         const float maxActuatorVelocity = ic.mMaxActuatorVelocity[lane];
 
         // loaded UNCONDITIONALLY on PGS (:1778)
@@ -270,18 +246,7 @@ inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffse
         float frictionDeltaF = 0.0f, driveDeltaF = 0.0f, posLimitDeltaF = 0.0f;
         if (doFDPL)
         {
-            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
-            if (!newFrictionModel)
-            {
-                if (cov) ++cov->oldModel;
-                const float appliedFriction = ic.mAccumulatedFrictionImpulse[lane];   // PGS accumulates
-                const float frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
-                                                    -maxFrictionForce, maxFrictionForce);
-                ic.mAccumulatedFrictionImpulse[lane] = frictionForce;
-                frictionDeltaF = frictionForce - appliedFriction;
-                jointV += frictionDeltaF * response;
-            }
-
+            // 5.12: the deprecated friction model and the maxForce clamp are gone.
             if (maxImpulse > 0.0f)
             {
                 if (cov) ++cov->maxArm;
@@ -295,18 +260,10 @@ inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffse
                 driveDeltaF = clampedImpulse - appliedDriveImpulse;
                 ic.mDriveImpulse[lane] = appliedDriveImpulseOrig + driveDeltaF;
             }
-            else
-            {
-                if (cov) ++cov->forceArm;
-                const float unclampedForce =
-                    Dy::computeDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
-                const float clampedForce = PxClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
-                ic.mDriveImpulse[lane] = clampedForce;
-            }
+            else if (cov)
+                ++cov->forceArm;   // no effort budget: 5.12 skips the drive
             jointV += driveDeltaF * response;
 
-            if (newFrictionModel)
             {
                 if (cov) ++cov->newModel;
                 const float appliedFriction = ic.mAccumulatedFrictionImpulse[lane];   // PGS accumulates
@@ -448,7 +405,8 @@ inline void refSolveStaticLanePgs(const PxgArticulationBlockLinkData& L, PxU32 l
                                   bool doFriction, bool accumErr,
                                   UnAlignedSpatialVector& vel, UnAlignedSpatialVector& impulse,
                                   UnAlignedSpatialVector& deltaV,
-                                  RefError& err, PxU32 constraintCounts, StaticCov* cov)
+                                  RefError& err, PxU32 constraintCounts, StaticCov* cov,
+                                  float rigidContactBiasCoefficient)
 {
     const PxU32 jStart = L.mStaticJointStartIndex[lane];
     const PxU32 cStart = L.mStaticContactStartIndex[lane];
@@ -486,7 +444,7 @@ inline void refSolveStaticLanePgs(const PxgArticulationBlockLinkData& L, PxU32 l
         UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
         refSolveExtContactPGS(batch, vel0, vel1, doFriction, offset,
                               ch, fh, cp, fp, rs, imp0, imp1,
-                              accumErr ? &err : NULL, 1.f, 1.f);
+                              accumErr ? &err : NULL, rigidContactBiasCoefficient, 1.f, 1.f);
         if (aIsArti) { impulse += imp0; vel = vel0; }
         else         { impulse += imp1; vel = vel1; }
     }
@@ -536,7 +494,7 @@ inline Cm::UnAlignedSpatialVector refPropImpulseNoWrite(
 // parentImp (what the epilogue adds onto mRootDeferredZ)
 inline Cm::UnAlignedSpatialVector refSolveInternalDFSLane(
     PxgArticulationBlockLinkData* lk, PxgArticulationBlockDofData* df,
-    PxgArticulationTraversalStackData* stack, const float* jf,
+    PxgArticulationTraversalStackData* stack,
     PxgBlockConstraintBatch* bt,
     PxgTGSBlockSolverContactHeader* ch, PxgTGSBlockSolverFrictionHeader* fh,
     PxgTGSBlockSolverContactPoint* cp, PxgTGSBlockSolverContactFriction* fp,
@@ -613,7 +571,7 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLane(
 
             UnAlignedSpatialVector impulse(PxVec3(0.f), PxVec3(0.f));
 
-            refSolveDofLane(df, jointOffset, dofCount, jf,
+            refSolveDofLane(df, jointOffset, dofCount,
                             dt, sceneDt, invDt, elapsedTime, erp,
                             velIter, extEvery, doFDPL, doVelLimit == 1u,
                             childDelta, parentDelta,
@@ -708,7 +666,7 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLane(
 
 inline Cm::UnAlignedSpatialVector refSolveInternalDFSLanePgs(
     PxgArticulationBlockLinkData* lk, PxgArticulationBlockDofData* df,
-    PxgArticulationTraversalStackData* stack, const float* jf,
+    PxgArticulationTraversalStackData* stack,
     PxgBlockConstraintBatch* bt,
     PxgBlockSolverContactHeader* ch, PxgBlockSolverFrictionHeader* fh,
     PxgBlockSolverContactPoint* cp, PxgBlockSolverContactFriction* fp,
@@ -720,7 +678,7 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLanePgs(
     bool residual,
     const Cm::UnAlignedSpatialVector& storeParentDeltaV,
     Cm::UnAlignedSpatialVector parentImp, Cm::UnAlignedSpatialVector parentDeltaV,
-    RefError& err, RefError& contactErr, PxU32 lane)
+    RefError& err, RefError& contactErr, float rigidContactBiasCoefficient, PxU32 lane)
 {
     using Cm::UnAlignedSpatialVector;
 
@@ -786,7 +744,7 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLanePgs(
 
             UnAlignedSpatialVector impulse(PxVec3(0.f), PxVec3(0.f));
 
-            refSolveDofLanePgs(df, jointOffset, dofCount, jf,
+            refSolveDofLanePgs(df, jointOffset, dofCount,
                                dt, sceneDt, invDt, elapsedTime, erp,
                                velIter, doFDPL, doVelLimit == 1u,
                                childDelta, parentDelta,
@@ -803,7 +761,8 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLanePgs(
                 const UnAlignedSpatialVector before = impulse;
                 refSolveStaticLanePgs(L, lane, bt, ch, fh, cp, fp, jh, jr, jm, rs,
                                       doFriction, residual,
-                                      childV, impulse, deltaV, contactErr, constraintCounts, NULL);
+                                      childV, impulse, deltaV, contactErr, constraintCounts, NULL,
+                                      rigidContactBiasCoefficient);
                 childImpulseFromStatic = impulse - before;
             }
 

@@ -125,17 +125,26 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
     PlaneOutOut r;
     for (uint j = 0u; j < 4u; ++j) r.stream[j] = float4(0, 0, 0, 0);
 
-    // contact/force reservation (lane 0), single-element overflow tests, NO else-if
+    // contact/force reservation (lane 0), NO else-if.  5.12 (cudaGJKEPA.cu:3050-3070):
+    // the tests cover the WHOLE reservation, a force overflow also drops the
+    // contact offset, and patchRequested keeps the patch demand of a pair whose
+    // allocation failed.
     uint contactByteOffset = 0xFFFFFFFFu;
     uint forceByteOffset = 0xFFFFFFFFu;
+    const bool patchRequested = nbContacts > 0u;
     if (nbContacts != 0u)
     {
         contactByteOffset = contactsBytes;
         contactsBytes += 16u * nbContacts;
         forceByteOffset = forceBytes;
         forceBytes += 4u * nbContacts;
-        if ((uint64_t(contactByteOffset) + 16ULL) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
-        if ((uint64_t(forceByteOffset) + 4ULL) > uint64_t(s.cfg.y)) { ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(contactByteOffset) + 16ULL * uint64_t(nbContacts)) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4ULL * uint64_t(nbContacts)) > uint64_t(s.cfg.y))
+        {
+            ovf |= FORCE_BUFFER_OVERFLOW;
+            forceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu;
+        }
     }
 
     uint outForces, outPoints;
@@ -158,6 +167,7 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
     {
         outForces = NULL_SENTINEL; // NULL
         outPoints = NULL_SENTINEL;
+        nbContacts = 0u; // 5.12 (cudaGJKEPA.cu:3095)
     }
 
     // allflags / touch / patch change
@@ -181,7 +191,7 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
     // patch reservation (lane 0), rollback inside the gate
     uint patchIndex = 0xFFFFFFFFu;
     uint cpOut = NULL_SENTINEL;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         patchIndex = patchesBytes;
         patchesBytes += 64u; // sizeof(PxContactPatch)
@@ -197,10 +207,12 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
             touchChange = previouslyHadTouch ? 1u : 0u;
             patchChange = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (nbContacts != 0u)
         {
             cpOut = patchIndex;
         }
+        else
+            patchIndex = 0xFFFFFFFFu;
     }
 
     // insertIntoPatchStream args (the stream write is the tranche-45 shader)

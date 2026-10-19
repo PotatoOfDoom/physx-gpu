@@ -346,7 +346,6 @@ void jcalcRecomputeRecord(uint64_t a, float invLengthScale, bool confiDirty, boo
     const uint64_t props = artiPtrField(a, PXG_ARTI_LINK_PROPS);
     const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
     const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
-    const uint64_t jointAxis = artiPtrField(a, PXG_ARTI_JOINT_AXIS);
     const uint64_t motionMatrix = artiPtrField(a, PXG_ARTI_MOTION_MATRIX);
     const uint64_t relativeQuat = artiPtrField(a, PXG_ARTI_RELATIVE_QUAT);
     Ptr<uint> jointOffsets = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_OFFSETS));
@@ -361,7 +360,11 @@ void jcalcRecomputeRecord(uint64_t a, float invLengthScale, bool confiDirty, boo
         cfms[0] = fixBase ? 0.0f
             : asfloat((Ptr<uint>(props + PXG_ARTI_LINK_PROP_INV_MASS))[0]) * cfmScale[0];
 
-    uint totalDofs = 0u;
+    // 5.12: computeJointAxis writes a LOCAL Cm::UnAlignedSpatialVector[3] that only
+    // setJointFrame reads (PxgArticulation lost its jointAxis buffer), and the
+    // motion matrix below is built from the same dofIds, so nothing is stored.
+    // nextDof/nextOffset are PxU32 now (5.6.1 carried them as PxReal; exact for
+    // dof counts and offsets either way).
     for (uint linkID = 1u; linkID < numLinks; ++linkID)
     {
         const uint64_t jd = jointData + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_DATA_SIZE;
@@ -370,15 +373,6 @@ void jcalcRecomputeRecord(uint64_t a, float invLengthScale, bool confiDirty, boo
 
         const uint64_t jc = joints + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_SIZE;
         const uint dofIdWord = artiU32Field(jc, PXG_AR_JOINT_dofIds);
-
-        // computeJointAxis: dof unit spatial vectors at jointAxis[totalDofs..]
-        for (uint i = 0u; i < 3u; ++i)
-        {
-            if (i < dof)
-                ajStoreSpatialVector(
-                    jointAxis + uint64_t(totalDofs + i) * PXG_ARTI_SPATIAL_VECTOR_SIZE,
-                    ajAxisTop(dofIdWord, i), ajAxisBottom(dofIdWord, i));
-        }
 
         // setJointFrame, flag and all
         if (artiU8Field(jc, PXG_AR_JOINT_jCalcUpdateFrames) != 0u)
@@ -424,8 +418,6 @@ void jcalcRecomputeRecord(uint64_t a, float invLengthScale, bool confiDirty, boo
         if (dataDirty)
             cfms[linkID] = asfloat((Ptr<uint>(props + uint64_t(linkID) * PXG_ARTI_LINK_PROP_SIZE
                                               + PXG_ARTI_LINK_PROP_INV_MASS))[0]) * cfmScale[linkID];
-
-        totalDofs += dof;
     }
 
     // confiDirty is cleared; updateDirty deliberately is NOT -- the CUDA holds on
@@ -766,7 +758,6 @@ void jcalcFillDofBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks, uin
 
     const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
     const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
-    const uint64_t jointAxis = artiPtrField(a, PXG_ARTI_JOINT_AXIS);
     const uint64_t motionMatrix = artiPtrField(a, PXG_ARTI_MOTION_MATRIX);
     const Ptr<uint> jointPositions = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_POSITIONS));
     const Ptr<uint> jointVelocities = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_VELOCITIES));
@@ -788,16 +779,7 @@ void jcalcFillDofBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks, uin
             const uint64_t dof = dofBlocks + uint64_t(jointOffset + i) * PXG_AB_DOF_SIZE;
             const uint64_t ic = dof + PXG_AB_DOF_mConstraintData;
 
-            // the joint axis phase A computed, in block form
-            const uint64_t ax =
-                jointAxis + uint64_t(jointOffset + i) * PXG_ARTI_SPATIAL_VECTOR_SIZE;
-            abStoreSpatialVector(dof, PXG_AB_DOF_mJointAxis, lane,
-                                 float3(asfloat(artiU32Field(ax, 0u)),
-                                        asfloat(artiU32Field(ax, 4u)),
-                                        asfloat(artiU32Field(ax, 8u))),
-                                 float3(asfloat(artiU32Field(ax, 12u)),
-                                        asfloat(artiU32Field(ax, 16u)),
-                                        asfloat(artiU32Field(ax, 20u))));
+            // (5.12: the dof block lost mJointAxis, so the per-dof joint-axis copy is gone)
 
             // dofIds is a PxU8[6]; the axis it names indexes every per-axis array
             const uint dofId = artiU8Field(jc, PXG_AR_JOINT_dofIds + i);
@@ -825,9 +807,7 @@ void jcalcFillDofBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks, uin
                       float2(asfloat(artiU32Field(lim, PXG_AR_LIMIT_low)),
                              asfloat(artiU32Field(lim, PXG_AR_LIMIT_high))));
 
-            // the old scalar friction coefficient is per JOINT, not per axis
-            abStoreU32(ic, PXG_AB_IC_mFrictionCoefficient, lane,
-                       artiU32Field(jc, PXG_AR_JOINT_frictionCoefficient));
+            // (5.12: the scalar joint frictionCoefficient and the drive maxForce are gone)
             abStoreU32(ic, PXG_AB_IC_mStaticFrictionEffort, lane,
                        artiU32Field(fp, PXG_AR_FRICTION_staticFrictionEffort));
             abStoreU32(ic, PXG_AB_IC_mDynamicFrictionEffort, lane,
@@ -835,7 +815,6 @@ void jcalcFillDofBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks, uin
             abStoreU32(ic, PXG_AB_IC_mViscousFrictionCoefficient, lane,
                        artiU32Field(fp, PXG_AR_FRICTION_viscousFrictionCoefficient));
 
-            abStoreU32(ic, PXG_AB_IC_mMaxForce, lane, artiU32Field(dr, PXG_AR_DRIVE_maxForce));
             abStoreU32(ic, PXG_AB_IC_mMaxEffort, lane, artiU32Field(env, PXG_AR_ENV_maxEffort));
             abStoreU32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane,
                        artiU32Field(env, PXG_AR_ENV_maxActuatorVelocity));
@@ -888,7 +867,7 @@ void artiJcalcPhaseB3(uint3 groupThreadId : SV_GroupThreadID)
 // this tranche.  Phase C does NOT touch
 //
 //     mRetainsAcceleration, mDofs, mJointType, mJointOffset, mParents,
-//     mChildrenOffset, mNumChildren, mInvDofIds, mDofIds, mMotion, mJointAxis
+//     mChildrenOffset, mNumChildren, mInvDofIds, mDofIds, mMotion
 //
 // even though phase B writes every one of them, because those are structural and
 // the structure has not changed.  Writing one of them here would be invisible in
@@ -989,7 +968,6 @@ void jcalcRefreshBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
             const uint nbDofs = artiU8Field(jd, PXG_AR_JCD_nbDof);
             const uint jointOffset = artiU32Field(jd, PXG_AR_JCD_jointOffset);
             const uint64_t mmBase = motionMatrix + uint64_t(linkID) * PXG_ARTI_SUBSPACE_STRIDE;
-            const uint frictionCoefficient = artiU32Field(jc, PXG_AR_JOINT_frictionCoefficient);
 
             for (uint i = 0u; i < nbDofs; ++i)
             {
@@ -1013,15 +991,12 @@ void jcalcRefreshBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
                 abStoreF2(ic, PXG_AB_IC_mLimits_LowLimitX_highLimitY, lane,
                           float2(asfloat(artiU32Field(lim, PXG_AR_LIMIT_low)),
                                  asfloat(artiU32Field(lim, PXG_AR_LIMIT_high))));
-                abStoreU32(ic, PXG_AB_IC_mFrictionCoefficient, lane, frictionCoefficient);
                 abStoreU32(ic, PXG_AB_IC_mStaticFrictionEffort, lane,
                            artiU32Field(fp, PXG_AR_FRICTION_staticFrictionEffort));
                 abStoreU32(ic, PXG_AB_IC_mDynamicFrictionEffort, lane,
                            artiU32Field(fp, PXG_AR_FRICTION_dynamicFrictionEffort));
                 abStoreU32(ic, PXG_AB_IC_mViscousFrictionCoefficient, lane,
                            artiU32Field(fp, PXG_AR_FRICTION_viscousFrictionCoefficient));
-                abStoreU32(ic, PXG_AB_IC_mMaxForce, lane,
-                           artiU32Field(dr, PXG_AR_DRIVE_maxForce));
                 abStoreU32(ic, PXG_AB_IC_mMaxEffort, lane,
                            artiU32Field(env, PXG_AR_ENV_maxEffort));
                 abStoreU32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane,
@@ -1667,8 +1642,8 @@ void artiJcalcInit(uint3 groupThreadId : SV_GroupThreadID)
 //     `p.w = 0`.  That asymmetry is observable, and a port that unifies the two
 //     code paths silently changes the root's fourth component.
 //
-//  4. rootPreMotionVelocity is written THROUGH THE RECORD, not the block, and it
-//     is a single Cm::UnAlignedSpatialVector rather than an array.
+//  4. (5.6.1 only) rootPreMotionVelocity was written THROUGH THE RECORD; 5.12
+//     removed it, and Rw is now computeLinkRw rather than a position difference.
 //
 // The parent's motion velocity is read from the block after an earlier iteration
 // wrote it, so the link loop is strictly sequential -- `parents[linkID] < linkID`
@@ -1715,9 +1690,6 @@ void jcalcComputeLinkVelocities(uint64_t a, uint64_t linkBlocks, uint64_t dofBlo
     abStoreF4(linkBlocks, PXG_AB_LINK_mPreTransform + PXG_AB_STB_Q, lane, rootQ);
     abStoreF4(linkBlocks, PXG_AB_LINK_mPreTransform + PXG_AB_STB_P, lane, rootP);
 
-    float3 rootTop, rootBottom;
-    abLoadSpatialVector(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, rootTop, rootBottom);
-
     // ---- PASS ONE: the clamp ratio over every dof ----
     float ratio = 1.0f;
     {
@@ -1747,9 +1719,7 @@ void jcalcComputeLinkVelocities(uint64_t a, uint64_t linkBlocks, uint64_t dofBlo
         }
     }
 
-    // ---- the root's pre-motion velocity, through the RECORD ----
-    ajStoreSpatialVector(artiPtrField(a, PXG_ARTI_ROOT_PRE_MOTION_VELOCITY),
-                         rootTop, rootBottom);
+    // (5.12 removed the root pre-motion velocity the record used to receive here)
 
     // ---- PASS TWO ----
     uint cursor = 0u;
@@ -1766,11 +1736,27 @@ void jcalcComputeLinkVelocities(uint64_t a, uint64_t linkBlocks, uint64_t dofBlo
 
         float3 vTop, vBottom;
         abLoadSpatialVector(pblk, PXG_AB_LINK_mMotionVelocity, lane, vTop, vBottom);
-        const float4 pp = abF4(pblk, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane);
 
         abStoreSpatialTransform(blk, PXG_AB_LINK_mPreTransform, lane, q, p.xyz);
 
-        const float3 rw = float3(p.x - pp.x, p.y - pp.y, p.z - pp.z);
+        // 5.12 (OMPE-94459): computeLinkRwGpu -- Rw from the parent's and this
+        // link's world orientations and the joint's link-local anchors, no
+        // world-scale subtraction.  The prismatic slide reads this link's FIRST
+        // dof (the cursor, before the dof loop below advances it).
+        const float4 pq = abF4(pblk, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_Q, lane);
+        const float4 co = abF4(blk, PXG_AB_LINK_mChildPose + PXG_AB_STB_P, lane);
+        const float4 po = abF4(blk, PXG_AB_LINK_mParentPose + PXG_AB_STB_P, lane);
+        float3 slide = float3(0.0f, 0.0f, 0.0f);
+        const bool isPrismatic = abU8(blk, PXG_AB_LINK_mJointType, lane) == AJ_PRISMATIC;
+        if (isPrismatic)
+        {
+            const uint64_t d0 = dofBlocks + uint64_t(cursor) * PXG_AB_DOF_SIZE;
+            const float jPos = abF32(d0, PXG_AB_DOF_mJointPositions, lane);
+            float3 mmTop0, mmBottom0;
+            abLoadSpatialVector(d0, PXG_AB_DOF_mLocalMotionMatrix, lane, mmTop0, mmBottom0);
+            slide = mmBottom0 * jPos;
+        }
+        const float3 rw = dyComputeLinkRw(pq, q, po.xyz, co.xyz, slide, isPrismatic);
         abStoreF32(blk, PXG_AB_LINK_mRw_x, lane, rw.x);
         abStoreF32(blk, PXG_AB_LINK_mRw_y, lane, rw.y);
         abStoreF32(blk, PXG_AB_LINK_mRw_z, lane, rw.z);

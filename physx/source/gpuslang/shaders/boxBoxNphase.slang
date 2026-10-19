@@ -32,6 +32,8 @@
 // (4 threads per pair, blockDim 64 = 16 pairs / block), the collaborative
 // separating-axis test + feature selection, the incident-face polygon, the
 // box-box clipping core (calculateContacts), the 4-point manifold reduction,
+// the 5.12 edge-edge fallback (BOXBOX_EDGE_EDGE_FIX: one contact at the closest
+// points of the winning edge pair when clipping yields none, Stage 5b),
 // and the contact-stream / patch-stream output tail with the atomic offset
 // reservation on PxgPatchAndContactCounters.
 //
@@ -59,6 +61,7 @@
 // writes raw device pointers there.
 
 import pxgSlangCommon; // PxgShape, PxsCachedTransform, PxgMat33, mat33FromQuat, PXG_MAX_F32
+import npSpherePrimitives; // distanceSegmentSegmentSquared (distanceSegmentSegment.cuh)
 
 static const uint  INVALID = 0xffffffffu;
 static const uint  MAXP = 6u;                 // PXG_MAX_NUM_POINTS_PER_CONTACT_PATCH
@@ -177,6 +180,8 @@ groupshared uint   gsArea2[64];     // calculateContacts: corner-inside flag
 groupshared uint   gsCount[64];     // per-lane contact count
 groupshared float4 gsLC[64];        // reduction: chosen local-space contacts
 groupshared uint   gsCByte[64];     // output: contactByteOffset broadcast (lane 3)
+groupshared float  gsEdgeM[64];     // 5.12 edge-edge fix: bestEdgeMarginT per lane
+groupshared uint   gsEdgeUa[64];    // 5.12 edge-edge fix: bestEdgeUaIdxT per lane
 
 float comp3(float3 v, uint i) { return i == 0u ? v.x : (i == 1u ? v.y : v.z); }
 
@@ -291,6 +296,79 @@ float combineScalars(float a, float b, uint mode)
 }
 
 // ---------------------------------------------------------------------------
+// computeEdgeEdgeContactWorld (5.12 cudaBox.cu:415-480, BOXBOX_EDGE_EDGE_FIX = 1).
+// Given the winning edge pair (ua_i of box0, ub_j of box1), one world-space
+// edge-edge contact at the midpoint of the closest points on the two edges.
+// Normal = (ua x ub) normalized, oriented box0 -> box1.  Returns (point,
+// separation); w == PX_MAX_F32 flags a degenerate (parallel) pair.
+// (&transform.m.column0)[i] / (&extent.x)[i] become column/component selects.
+// rsqrtf is the CUDA's approximate reciprocal square root; rsqrt is the port's
+// spelling of it (neither is correctly rounded, so this one value is not a
+// bit-exact twin).
+// ---------------------------------------------------------------------------
+float3 boxCol3(float3 c0, float3 c1, float3 c2, uint i) { return i == 0u ? c0 : (i == 1u ? c1 : c2); }
+
+float4 computeEdgeEdgeContactWorld(float3 box0Extent, float3 box1Extent,
+                                   float3 a0, float3 a1, float3 a2, float3 p0,
+                                   float3 b0, float3 b1, float3 b2, float3 p1,
+                                   uint uaIdx, uint ubIdx,
+                                   float edgeMargin,     // positive; = radiusSum - |signedProj|
+                                   float contactDist,
+                                   out float3 outNormalWorld)
+{
+    const float3 uaAxis = boxCol3(a0, a1, a2, uaIdx); // unit
+    const float3 ubAxis = boxCol3(b0, b1, b2, ubIdx); // unit
+
+    // Contact normal along ua x ub, oriented box0 -> box1.
+    float3 n = cross(uaAxis, ubAxis);
+    const float mag2 = dot(n, n);
+    if (mag2 < 1e-12f)
+    {
+        // Edges parallel: degenerate, signal caller to fall through.
+        outNormalWorld = float3(0.0f, 1.0f, 0.0f);
+        return float4(0.0f, 0.0f, 0.0f, BIG);
+    }
+    n *= rsqrt(mag2);
+    if (dot(n, p1 - p0) < 0.0f) n = -n;
+    outNormalWorld = n;
+
+    // Out of box0's 4 edges parallel to uaAxis, pick the one on the +n side
+    // (closest to box1).  Analogously for box1, pick the edge on the -n side.
+    const uint ja = (uaIdx + 1u) % 3u;
+    const uint ka = (uaIdx + 2u) % 3u;
+    const uint jb = (ubIdx + 1u) % 3u;
+    const uint kb = (ubIdx + 2u) % 3u;
+    const float3 axJa = boxCol3(a0, a1, a2, ja);
+    const float3 axKa = boxCol3(a0, a1, a2, ka);
+    const float3 axJb = boxCol3(b0, b1, b2, jb);
+    const float3 axKb = boxCol3(b0, b1, b2, kb);
+    const float exA = comp3(box0Extent, uaIdx);
+    const float exB = comp3(box1Extent, ubIdx);
+
+    const float3 off0 = axJa * ((dot(n, axJa) >= 0.0f) ? comp3(box0Extent, ja) : -comp3(box0Extent, ja))
+                      + axKa * ((dot(n, axKa) >= 0.0f) ? comp3(box0Extent, ka) : -comp3(box0Extent, ka));
+    const float3 off1 = axJb * ((dot(n, axJb) <= 0.0f) ? comp3(box1Extent, jb) : -comp3(box1Extent, jb))
+                      + axKb * ((dot(n, axKb) <= 0.0f) ? comp3(box1Extent, kb) : -comp3(box1Extent, kb));
+
+    // Parameterise each edge as start + s*dir with s in [0,1] so we can use
+    // the shared distanceSegmentSegmentSquared helper.
+    const float3 dir0 = uaAxis * (2.0f * exA);
+    const float3 dir1 = ubAxis * (2.0f * exB);
+    const float3 start0 = p0 + off0 - uaAxis * exA;
+    const float3 start1 = p1 + off1 - ubAxis * exB;
+
+    float s, t;
+    distanceSegmentSegmentSquared(start0, dir0, start1, dir1, s, t);
+
+    const float3 c0 = start0 + dir0 * s;
+    const float3 c1 = start1 + dir1 * t;
+    const float3 contactPoint = (c0 + c1) * 0.5f;
+    const float separation = -edgeMargin + contactDist; // <0 for interpenetration
+
+    return float4(contactPoint, separation);
+}
+
+// ---------------------------------------------------------------------------
 // boxBoxNphase_Kernel : full box-box narrow phase on the engine ABI.
 // ---------------------------------------------------------------------------
 [shader("compute")]
@@ -356,6 +434,8 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
     uint feat = 0u;
     float sgn = 0.0f;
     bool sep = false;
+    float bestEdgeMarginT = BIG;   // PX_MAX_F32
+    uint bestEdgeUaIdxT = 0u;
 
     if (lane < 3u)
     {
@@ -388,25 +468,39 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
         const float as1 = abs(col.y * tp.z - col.z * tp.y);
         const float ra1 = abCol.z * box0e.y + abCol.y * box0e.z;
         const float rb1 = comp3(ab0, iHi) * b1Lo + comp3(ab0, iLo) * b1Hi;
-        const bool sep1 = as1 > (ra1 + rb1 + cDist);
+        const float radiusSum1 = ra1 + rb1 + cDist;
+        const bool sep1 = as1 > radiusSum1;
 
         const float as2 = abs(col.z * tp.x - col.x * tp.z);
         const float ra2 = abCol.z * box0e.x + abCol.x * box0e.z;
         const float rb2 = comp3(ab1, iHi) * b1Lo + comp3(ab1, iLo) * b1Hi;
-        const bool sep2 = as2 > (ra2 + rb2 + cDist);
+        const float radiusSum2 = ra2 + rb2 + cDist;
+        const bool sep2 = as2 > radiusSum2;
 
         const float as3 = abs(col.x * tp.y - col.y * tp.x);
         const float ra3 = abCol.y * box0e.x + abCol.x * box0e.y;
         const float rb3 = comp3(ab2, iHi) * b1Lo + comp3(ab2, iLo) * b1Hi;
-        const bool sep3 = as3 > (ra3 + rb3 + cDist);
+        const float radiusSum3 = ra3 + rb3 + cDist;
+        const bool sep3 = as3 > radiusSum3;
 
         sep = sepFace || sep1 || sep2 || sep3;
+
+        // 5.12 BOXBOX_EDGE_EDGE_FIX (cudaBox.cu:580-680): each lane keeps the
+        // smallest edge-axis margin radiusSum - absSign over the three edge
+        // blocks, which test ua0/ua1/ua2 x ub[lane]; uaIdx is the block.  The
+        // CUDA returns at the first separating block, but the margins are only
+        // read when no axis separates, so evaluating all three is the same.
+        if (radiusSum1 - as1 < bestEdgeMarginT) { bestEdgeMarginT = radiusSum1 - as1; bestEdgeUaIdxT = 0u; }
+        if (radiusSum2 - as2 < bestEdgeMarginT) { bestEdgeMarginT = radiusSum2 - as2; bestEdgeUaIdxT = 1u; }
+        if (radiusSum3 - as3 < bestEdgeMarginT) { bestEdgeMarginT = radiusSum3 - as3; bestEdgeUaIdxT = 2u; }
     }
 
     gsA[lt] = minO;
     gsFeat[lt] = feat;
     gsB[lt] = sgn;
     gsSep[lt] = sep ? 1u : 0u;
+    gsEdgeM[lt] = bestEdgeMarginT;
+    gsEdgeUa[lt] = bestEdgeUaIdxT;
     GroupMemoryBarrierWithGroupSync();
 
     const bool separated = (gsSep[gbase] | gsSep[gbase + 1u] | gsSep[gbase + 2u]) != 0u;
@@ -736,7 +830,45 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
         gTempBuff[lbase + lane] = float4(xform(nc0, nc1, nc2, np, lc.xyz), lc.w);
     }
 
-    uint nbContacts = active ? (caseB ? 4u : total) : 0u;
+    // =======================================================================
+    // Stage 5b : 5.12 BOXBOX_EDGE_EDGE_FIX (cudaBox.cu:898-946).  If face
+    //            clipping produced 0 contacts across the whole group but SAT
+    //            found no separating axis, emit one edge-edge contact at the
+    //            closest points of the winning edge pair.  `total` is the
+    //            group's count butterfly; lane 0 computes the contact and the
+    //            group reads it back through groupshared (the CUDA shuffles).
+    //            total == 0 means caseB is false and Stage 5 wrote nothing.
+    // =======================================================================
+    float3 patchNormal = normal;
+    bool edgeEdge = false;
+    {
+        const bool needEE = active && total == 0u;
+        const float em0 = gsEdgeM[gbase], em1 = gsEdgeM[gbase + 1u], em2 = gsEdgeM[gbase + 2u];
+        uint winUb = 0u; float winEdgeMargin = em0;
+        if (em1 < winEdgeMargin) { winUb = 1u; winEdgeMargin = em1; }
+        if (em2 < winEdgeMargin) { winUb = 2u; winEdgeMargin = em2; }
+        const uint winUa = gsEdgeUa[gbase + winUb];
+
+        if (needEE && lane == 0u)
+        {
+            float3 worldNormal;
+            const float4 worldContact = computeEdgeEdgeContactWorld(box0e, box1e,
+                c00, c01, c02, tp0, c10, c11, c12, tp1,
+                winUa, winUb, winEdgeMargin, cDist, worldNormal);
+            gsLC[gbase] = worldContact;
+            gExch[gbase] = worldNormal;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (needEE && gsLC[gbase].w < BIG)
+        {
+            patchNormal = gExch[gbase];
+            edgeEdge = true;
+            if (lane == 0u)
+                gTempBuff[lbase + 0u] = gsLC[gbase];   // localContacts[0] = worldContact
+        }
+    }
+
+    uint nbContacts = active ? (edgeEdge ? 1u : (caseB ? 4u : total)) : 0u;
     GroupMemoryBarrierWithGroupSync();
 
     // =======================================================================
@@ -755,15 +887,18 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
             InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * nbContacts, fOff);
             contactByteOffset = cOff;
             uint forceOffset = fOff;
-            if ((cOff + CONTACT_SIZE) > gParams.contactBytesLimit)
+            // 5.12 (contactPatchUtils.cuh:27-38): the WHOLE reservation is tested
+            // (size_t sums in the CUDA), and a force overflow also drops the contacts.
+            if ((uint64_t(cOff) + uint64_t(CONTACT_SIZE) * uint64_t(nbContacts)) > uint64_t(gParams.contactBytesLimit))
             {
                 InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
                 contactByteOffset = INVALID;
             }
-            if ((fOff + FORCE_SIZE) > gParams.forceBytesLimit)
+            if ((uint64_t(fOff) + uint64_t(FORCE_SIZE) * uint64_t(nbContacts)) > uint64_t(gParams.forceBytesLimit))
             {
                 InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
                 forceOffset = INVALID;
+                contactByteOffset = INVALID;
             }
             if (contactByteOffset != INVALID)
             {
@@ -778,17 +913,23 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
         }
 
         // --- registerContactPatch ---
+        // 5.12 (contactPatchUtils.cuh:59-62): preserve patch demand even if the
+        // contact or force allocation failed; the pair then reports no contacts,
+        // reserves its patch anyway and returns the patch index as invalid.
+        const bool patchRequested = nbContacts > 0u;
+        const uint nbContactsReg = (patchRequested && (cmOutputs[workIndex].contactPoints == 0uL ||
+                                   cmOutputs[workIndex].contactForces == 0uL)) ? 0u : nbContacts;
         const uint allflags = cmOutputs[workIndex].allflagsWord;
         const uint oldStatusFlags = (allflags >> 16u) & 0xffu;    // statusFlag byte
         uint statusFlags = oldStatusFlags & (~FLAG_TOUCH_KNOWN);
-        if (nbContacts != 0u) statusFlags |= FLAG_HAS_TOUCH;
+        if (nbContactsReg != 0u) statusFlags |= FLAG_HAS_TOUCH;
         else                  statusFlags |= FLAG_HAS_NO_TOUCH;
 
         const uint prevPatches = (allflags >> 8u) & 0xffu;        // current nbPatches byte
         const bool previouslyHadTouch = (oldStatusFlags & FLAG_HAS_TOUCH) != 0u;
         const bool prevTouchKnown = (oldStatusFlags & FLAG_TOUCH_KNOWN) != 0u;
-        const uint numPatches = (nbContacts > 0u) ? 1u : 0u;
-        const bool currentlyHasTouch = nbContacts > 0u;
+        const uint numPatches = (nbContactsReg > 0u) ? 1u : 0u;
+        const bool currentlyHasTouch = nbContactsReg > 0u;
         const bool change = (previouslyHadTouch != currentlyHasTouch) || (!prevTouchKnown);
 
         touchChangeFlags[workIndex] = change ? 1u : 0u;
@@ -800,11 +941,11 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
         // set nbContacts (low 16), preserve flags (high 16)
         {
             const uint nf = cmOutputs[workIndex].nbContacts_flags;
-            cmOutputs[workIndex].nbContacts_flags = (nf & 0xffff0000u) | (nbContacts & 0xffffu);
+            cmOutputs[workIndex].nbContacts_flags = (nf & 0xffff0000u) | (nbContactsReg & 0xffffu);
         }
 
         uint patchIndex = INVALID;
-        if (nbContacts != 0u)
+        if (patchRequested)
         {
             InterlockedAdd(counters[0].patchesBytes, PATCH_SIZE, patchIndex);
             if ((patchIndex + PATCH_SIZE) > gParams.patchBytesLimit)
@@ -819,10 +960,12 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
                 touchChangeFlags[workIndex] = previouslyHadTouch ? 1u : 0u;
                 patchChangeFlags[workIndex] = (prevPatches != 0u) ? 1u : 0u;
             }
-            else
+            else if (nbContactsReg != 0u)
             {
                 cmOutputs[workIndex].contactPatches = gParams.startContactPatches + uint64_t(patchIndex);
             }
+            else
+                patchIndex = INVALID;
         }
 
         // --- insertIntoPatchStream ---
@@ -892,9 +1035,9 @@ void boxBoxNphase_Kernel(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_Group
             Ptr<uint> patchBase = Ptr<uint>(gParams.patchStream + uint64_t(patchIndex));
             const uint one = asuint(1.0f);
             patchBase[0] = one; patchBase[1] = one; patchBase[2] = one; patchBase[3] = one;
-            patchBase[4] = asuint(normal.x);
-            patchBase[5] = asuint(normal.y);
-            patchBase[6] = asuint(normal.z);
+            patchBase[4] = asuint(patchNormal.x);
+            patchBase[5] = asuint(patchNormal.y);
+            patchBase[6] = asuint(patchNormal.z);
             patchBase[7] = asuint(rest);
             patchBase[8] = asuint(dyn);
             patchBase[9] = asuint(sta);

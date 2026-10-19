@@ -359,7 +359,7 @@ static void asiMirror(PxgArticulationBlockLinkData* lk,
 
         storeSpatialVector(linkData.mZAVector, zExtToStore, lane);
         storeSpatialVector(linkData.mZAIntVector, zInt, lane);
-        storeSpatialVector(linkData.mBiasForce, zExtToStore + zInt, lane);
+        // (5.12: no mBiasForce -- it only fed the removed transmitted-force friction)
         linkData.mMass[lane] = m;
     }
 

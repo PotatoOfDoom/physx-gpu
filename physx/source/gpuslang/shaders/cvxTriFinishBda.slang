@@ -26,21 +26,17 @@
 // THE QUIRKS, PORTED VERBATIM
 // ===========================================================================
 //
-//   * THE RESERVATION IS LANE 0's ALONE, and `insertAveragePoint` inflates
-//     `totalNumContacts` by `nbManifolds` ON LANE 0 ONLY (cu:190-191).  The
-//     inflated count feeds the reservation sizes, the stored `nbContacts`, and
-//     LANE 0's face-index base — while lanes 1..31 keep the un-inflated popcount.
-//     The face-index region base is therefore PER-LANE DIVERGENT, and lane 0's
-//     slot can collide with another lane's.  That is a genuine unordered
-//     intra-warp write conflict in the CUDA; it is reproduced, not repaired.
-//     The average contacts themselves are never written (`getAvgContactValue`,
-//     cu:84-98, is dead code) — the slots are reserved and left stale.
+//   * THE RESERVATION IS LANE 0's ALONE.  `insertAveragePoint` is IGNORED since
+//     5.12 (convexMeshOutput.cu:165-171, PX_UNUSED): up to 5.6.1 it inflated
+//     `totalNumContacts` by `nbManifolds` on lane 0 only, which over-reported
+//     nbContacts, reserved average-point slots that were never written, and made
+//     lane 0's face-index base diverge from the other lanes'.  The parameter
+//     stays in the push block because the launch signature keeps it.
 //   * THE OVERFLOW TESTS ARE A CHAINED else-if over the FULL reservation sizes,
 //     so at most one error bit is ever set even when two limits are blown.
 //     Rollback zeroes `nbManifolds` AND `totalNumContacts`, rewrites
 //     HAS_NO_TOUCH, and NULLs the three output pointers.
-//   * A PAIR WITH MANIFOLDS BUT NO CONTACTS and no average insertion skips the
-//     reservation entirely, leaving the offsets at 0xFFFFFFFF — yet still passes
+//   * A PAIR WITH MANIFOLDS BUT NO CONTACTS skips the reservation entirely, leaving the offsets at 0xFFFFFFFF — yet still passes
 //     the cu:257 gate and stores `base + 0xFFFFFFFF` as its output pointers
 //     (wrapped).  The `hasContacts` guards then suppress every stream write, so
 //     nothing is dereferenced.  Ported exactly.
@@ -215,7 +211,7 @@ void cfCombineMaterials(PxsMaterialDataGpu m0, PxsMaterialDataGpu m1,
 void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint lane = gtid.x;
-    const bool insertAveragePoint = (gCf.insertAveragePointWord & 0xFFu) != 0u;
+    // insertAveragePoint (gCf.insertAveragePointWord) is unused since 5.12 -- see the header.
 
     for (uint sub = 0u; sub < CF_WARPS_PER_BLOCK; ++sub)
     {
@@ -251,13 +247,11 @@ void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
         uint contactByteOffset = 0xFFFFFFFFu;
         uint forceByteOffset = 0xFFFFFFFFu;
         bool overflow = false;
-        uint totalNumContacts = popcContacts;   // lane 0 inflates this; others do not
+        uint totalNumContacts = popcContacts;   // lane 0 zeroes it on overflow
         uint nbManifoldsL0 = nbManifolds;
 
         if (lane == 0u)
         {
-            totalNumContacts += insertAveragePoint ? nbManifoldsL0 : 0u;
-
             if (totalNumContacts != 0u)
             {
                 Ptr<PxgPatchAndContactCountersGpu> ctr =
@@ -355,9 +349,9 @@ void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
         patchByteOffset = cfExchange(lane, patchByteOffset, 0u);
         contactByteOffset = cfExchange(lane, contactByteOffset, 0u);
         forceByteOffset = cfExchange(lane, forceByteOffset, 0u);
-        // `totalNumContacts` is NOT shuffled: lane 0 keeps the inflated value and
-        // the others the plain popcount, which is what makes the face-index base
-        // per-lane divergent (cu:191 vs cu:290).
+        // `totalNumContacts` is NOT shuffled; since 5.12 it is the popcount on every
+        // lane that gets here (lane 0's copy only changes on overflow, which returns
+        // above), so the face-index base is uniform.
 
         const PxsCachedTransformGpu triXf = cache[tcRef1];
         const PxsCachedTransformGpu sphXf = cache[tcRef0];

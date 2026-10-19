@@ -26,8 +26,10 @@
 
 
 // P8.106: the `artiPushImpulse` engine entry (forwardDynamic2.cu:4139) --
-// leaf-to-root scratch-impulse propagation into mDeferredQstZ, then the
-// free-base root solve through the 6x6 response matrix.
+// leaf-to-root scratch-impulse propagation into mDeferredQstZ, then (5.12,
+// OMPE-42519) the root scratch impulse flushed into mRootDeferredZ for BOTH
+// base kinds -- impulse space, mRootDeferredZ += mScratchImpulse[0], scratch
+// zeroed (5.6.1 stored mat * -scratch, a velocity, on free bases only).
 //
 // PxgArticulationCore::pushImpulse has NO caller in PhysX 5.6.1, so no scene
 // can ever dispatch this kernel -- THIS fixture and its sweep are the whole
@@ -38,8 +40,8 @@
 //
 // WHAT THE FIXTURE IS SHAPED TO SEE
 //
-//   * mStateDirty (period 4) against fixBase (period 3): dirty-fixed lanes
-//     run the walk but NOT the root tail; clean lanes run NOTHING (all their
+//   * mStateDirty (period 4) against fixBase (period 3): dirty lanes of both
+//     base kinds run the walk and the root flush; clean lanes run NOTHING (all their
 //     seeded state must come back byte-identical, including mStateDirty --
 //     unlike artiOutputVelocity this kernel does not clear it);
 //   * mJointOffset windows assigned in REVERSED link order, so they are
@@ -48,8 +50,8 @@
 //   * re-parented links (parent != i-1), so the parent accumulation target
 //     comes from mParents and grandchild contributions stack leaf-first;
 //   * mRootDeferredZ seeded with LARGE distinct values (the P8.97c poison
-//     lesson): it must survive fixed-base and clean lanes and be OVERWRITTEN
-//     (not accumulated) on free dirty lanes;
+//     lesson): it must survive clean lanes and be ACCUMULATED (5.12) on
+//     dirty lanes;
 //   * two warp slices, 41 live articulations, guard lanes past the end;
 //   * P9.86c, articulation PI_REST_ARTI: a RESTING fixed-base two-link
 //     articulation.  Root and link 1 hold six -0 scratch words (rigidDeltaAccum
@@ -58,8 +60,10 @@
 //     product against the all -0 Z is exactly +0.  propagateImpulseW with a
 //     NULL jointForce (forwardDynamic2.cu:4184-4186 -> articulationDynamic.cuh
 //     :143-144) gives stZ = 0.0f - (+0) = +0, the preloaded `-dot` gives -0;
-//     isInvD of mixed sign carries that into the root's scratch, which a FIXED
-//     base never zeroes: (+0,-0,+0 | +0,+0,+0) against (-0,+0,-0 | -0,+0,+0).
+//     isInvD of mixed sign carries that into the root's scratch, which 5.12
+//     flushes into an mRootDeferredZ seeded -0 (a resting root): -0 + x keeps
+//     x, so the root deferred Z carries (+0,-0,+0 | +0,+0,+0) against
+//     (-0,+0,-0 | -0,+0,+0).
 //     The host twin pxgref::gAiNullJfNegDot must reproduce that split.
 
 #include "pxgTestFramework.h"
@@ -110,7 +114,7 @@ const uint32_t PI_D_LINK_BLOCKS = 136;
 const uint32_t PI_D_DOF_BLOCKS = 184;
 const uint32_t PI_D_MAX_LINKS = 248;
 const uint32_t PI_D_MAX_DOFS = 252;
-const uint32_t PI_DESC_SIZE = 360;
+const uint32_t PI_DESC_SIZE = 344;
 
 static uint32_t piNumLinks(uint32_t k) { return (k == PI_REST_ARTI) ? 2u : 1u + (k % 7u); }
 static bool piFixBase(uint32_t k) { return (k % 3u) == 1u; }
@@ -207,6 +211,7 @@ static void piFill(physx::PxgArticulationBlockData* ab,
                                              PxVec3(-0.0f, -0.0f, -0.0f));
         storeSpatialVector(lk[0].mScratchImpulse, negZero, lane);
         storeSpatialVector(lk[1].mScratchImpulse, negZero, lane);
+        storeSpatialVector(ab->mRootDeferredZ, negZero, lane);   // a resting root
         physx::PxgArticulationBlockDofData& d = df[lk[1].mJointOffset[lane]];
         storeSpatialVector(d.mWorldMotionMatrix,
                            UnAlignedSpatialVector(PxVec3(0.0f, 0.0f, -1.0f), PxVec3(0.0f, 0.0f, 0.0f)),
@@ -255,13 +260,12 @@ static void piMirror(physx::PxgArticulationBlockData* ab,
         storeSpatialVector(L.mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
     }
 
-    if (!(ab->mFlags[lane] & 1u))
+    // 5.12 (OMPE-42519): flush the root scratch impulse into mRootDeferredZ,
+    // for free and fixed bases alike (addSpatialVector, then zero the scratch)
     {
-        physx::PxSpatialMatrix mat;
-        physx::loadSpatialMatrix(lk[0].mSpatialResponseMatrix, lane, mat);
-        const UnAlignedSpatialVector deltaV =
-            mat * (-loadSpatialVector(lk[0].mScratchImpulse, lane));
-        storeSpatialVector(ab->mRootDeferredZ, deltaV, lane);
+        const UnAlignedSpatialVector rootZ = loadSpatialVector(lk[0].mScratchImpulse, lane);
+        storeSpatialVector(ab->mRootDeferredZ,
+                           loadSpatialVector(ab->mRootDeferredZ, lane) + rootZ, lane);
         storeSpatialVector(lk[0].mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
     }
 }
@@ -368,13 +372,12 @@ PXG_TEST(artiPushImpulse)
         diffWords(wantLk.data(), twLk.data(), lkBytes);
         diffWords(wantDf.data(), twDf.data(), dfBytes);
         const uint32_t rw = PI_REST_ARTI / 32u, rl = PI_REST_ARTI % 32u;
-        const UnAlignedSpatialVector a =
-            loadSpatialVector(wantLk[size_t(rw) * PI_MAX_LINKS].mScratchImpulse, rl);
-        const UnAlignedSpatialVector b =
-            loadSpatialVector(twLk[size_t(rw) * PI_MAX_LINKS].mScratchImpulse, rl);
+        (void)PI_MAX_LINKS;
+        const UnAlignedSpatialVector a = loadSpatialVector(wantAb[rw].mRootDeferredZ, rl);
+        const UnAlignedSpatialVector b = loadSpatialVector(twAb[rw].mRootDeferredZ, rl);
         auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
         std::printf("[ info ] pi: +0 dual products %u; -dot twin changes %zu words; resting root "
-                    "scratch top %08x %08x %08x bottom.x %08x (twin %08x %08x %08x / %08x)\n",
+                    "deferredZ top %08x %08x %08x bottom.x %08x (twin %08x %08x %08x / %08x)\n",
                     posZeroDotHits, twinWords, bits(a.top.x), bits(a.top.y), bits(a.top.z),
                     bits(a.bottom.x), bits(b.top.x), bits(b.top.y), bits(b.top.z), bits(b.bottom.x));
         PXG_CHECK_MSG(posZeroDotHits > 0, "no +0 dual product reached the push hop");

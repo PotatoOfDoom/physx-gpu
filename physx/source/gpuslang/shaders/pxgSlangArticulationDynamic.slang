@@ -397,7 +397,7 @@ public float adClampDriveImpulse(float jointVel0, float driveImpulse0, float dri
     return adPClamp(driveImpulse, lowerBound, upperBound);
 }
 
-// computeLimitImpulse (DyCpuGpuArticulation.h:352-455) — the joint-limit
+// computeLimitImpulse (DyCpuGpuArticulation.h:352-474 in 5.12) — the joint-limit
 // impulse with the future-violation lookahead, the repulsive-only clamps and
 // the pull-back branch when no limit is active.  The impulse WRITEBACK is
 // conditional (newLow/newHigh) — an unconditional write of the unchanged
@@ -425,44 +425,60 @@ public float adLimitImpulse(float dt, float recipDt, bool isVelIter,
 
     const float tolerance = 0.0f;
 
+    // 5.12: `limited` is set only when an impulse is actually applied -- the
+    // bias impulse on a position iteration, or the predictive one.  A velocity
+    // iteration inside a breached limit therefore falls through to the
+    // pull-back branch below (5.6.1 set `limited` on entry and skipped it).
     float deltaF = 0.0f;
     if (currErrLow < tolerance || nextErrLow < tolerance)
     {
         float newJointV = jointV;
-        limited = true;
         if (currErrLow < tolerance)
         {
             if (!isVelIter)
+            {
+                limited = true;
                 newJointV = -currErrLow * recipDt * erp;
+            }
         }
         else
         {
+            limited = true;
             newJointV = -currErrLow * recipDt;
         }
 
-        const float deltaV = newJointV - jointV;
-        deltaF = adPMax(lowImpulse + deltaV * recipResponse, 0.0f) - lowImpulse;
-        lowImpulse += deltaF;
-        newLow = true;
+        if (limited)
+        {
+            const float deltaV = newJointV - jointV;
+            deltaF = adPMax(lowImpulse + deltaV * recipResponse, 0.0f) - lowImpulse;
+            lowImpulse += deltaF;
+            newLow = true;
+        }
     }
     else if (currErrHigh < tolerance || nextErrHigh < tolerance)
     {
         float newJointV = jointV;
-        limited = true;
         if (currErrHigh < tolerance)
         {
             if (!isVelIter)
+            {
+                limited = true;
                 newJointV = currErrHigh * recipDt * erp;
+            }
         }
         else
         {
+            limited = true;
             newJointV = currErrHigh * recipDt;
         }
 
-        const float deltaV = newJointV - jointV;
-        deltaF = adPMin(highImpulse + deltaV * recipResponse, 0.0f) - highImpulse;
-        highImpulse += deltaF;
-        newHigh = true;
+        if (limited)
+        {
+            const float deltaV = newJointV - jointV;
+            deltaF = adPMin(highImpulse + deltaV * recipResponse, 0.0f) - highImpulse;
+            highImpulse += deltaF;
+            newHigh = true;
+        }
     }
 
     if (!limited)
@@ -491,4 +507,67 @@ public float adLimitImpulse(float dt, float recipDt, bool isVelIter,
     jointV_ = jointV;
 
     return deltaF;
+}
+
+// ===========================================================================
+// 5.12: the tendon spring helpers moved into DyCpuGpuArticulation.h
+// (TendonImplicitSpringParams, computeSpringParams, computeTendonSpringParams,
+// computeTendonImpulse).  The arithmetic is the 5.6.1 inline spelling
+// expression for expression, so the bit patterns are unchanged; the
+// structure is mirrored so the setup and solve sites read like the CUDA.
+// ===========================================================================
+public struct AdTendonSpringParams
+{
+    public float biasCoefficient;
+    public float velMultiplier;
+    public float impulseMultiplier;
+    public float limitBiasCoefficient;
+    public float limitImpulseMultiplier;
+};
+
+// computeSpringParams
+public void adComputeSpringParams(float stepDt, bool isTGSSolver, float unitResponse,
+                                  float stiffness, float damping,
+                                  out float biasCoefficient, out float velMultiplier,
+                                  out float impulseMultiplier)
+{
+    const float a = stepDt * (stepDt * stiffness + damping);
+    const float x = unitResponse > 0.0f ? 1.0f / (1.0f + a * unitResponse) : 0.0f;
+    biasCoefficient = (-stiffness * x * stepDt);
+    velMultiplier = -x * a;
+    impulseMultiplier = isTGSSolver ? 1.0f : 1.0f - x;
+}
+
+// computeTendonSpringParams: the rest-length spring, then the limit spring
+// (whose velMultiplier is computed and discarded)
+public AdTendonSpringParams adComputeTendonSpringParams(float dt, bool isTGSSolver,
+                                                        float unitResponse, float stiffness,
+                                                        float damping, float limitStiffness)
+{
+    AdTendonSpringParams params;
+    adComputeSpringParams(dt, isTGSSolver, unitResponse, stiffness, damping,
+                          params.biasCoefficient, params.velMultiplier, params.impulseMultiplier);
+    float limitVelMultiplier;
+    adComputeSpringParams(dt, isTGSSolver, unitResponse, limitStiffness, damping,
+                          params.limitBiasCoefficient, limitVelMultiplier,
+                          params.limitImpulseMultiplier);
+    return params;
+}
+
+// computeTendonImpulse
+public void adComputeTendonImpulse(float recipCoefficient, AdTendonSpringParams p,
+                                   float restLengthError, float tendonSpeed, float limitError,
+                                   float accumulatedRestLengthImpulse, float accumulatedLimitImpulse,
+                                   out float restLengthImpulse, out float limitImpulse,
+                                   out float deltaF)
+{
+    restLengthImpulse =
+        (restLengthError * p.biasCoefficient + tendonSpeed * p.velMultiplier) * recipCoefficient
+        + accumulatedRestLengthImpulse * p.impulseMultiplier;
+
+    limitImpulse =
+        limitError * p.limitBiasCoefficient * recipCoefficient
+        + accumulatedLimitImpulse * p.limitImpulseMultiplier;
+
+    deltaF = (restLengthImpulse - accumulatedRestLengthImpulse) + (limitImpulse - accumulatedLimitImpulse);
 }

@@ -122,6 +122,31 @@ public float3 quatRotate(float4 q, float3 v)
         (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
 }
 
+// Dy::computeLinkRw (DyCpuGpuArticulation.h, 5.12, OMPE-94459): the
+// parent-to-child world translation rebuilt from the two world orientations and
+// the link-local joint anchors instead of subtracting world-scale positions.
+//   Rw = parentQW.rotate(parentOffset) + childQW.rotate(slide - childOffset)
+// childOffset is joint.childPose.p UNNEGATED; slide is the prismatic
+// translation (zero for every other joint type).  Same operation order as the
+// template: the subtraction first, then the two rotations, then one add.
+//
+// hasSlide is false when the caller's slide is still the PxVec3(0.f) literal
+// (every non-prismatic joint).  There the CUDA evaluates the IEEE
+// 0 - childOffset (+0 for a +0 component); with the literal reaching the fsub
+// through the caller's phi, llvmpipe folds it to -childOffset (-0), the P9.86f
+// F2 class.  That arm is therefore spelled as the select it amounts to.
+public float3 dyComputeLinkRw(float4 parentQW, float4 childQW,
+                              float3 parentOffset, float3 childOffset, float3 slide,
+                              bool hasSlide)
+{
+    const float3 d = hasSlide
+        ? (slide - childOffset)
+        : float3((childOffset.x == 0.0f) ? 0.0f : -childOffset.x,
+                 (childOffset.y == 0.0f) ? 0.0f : -childOffset.y,
+                 (childOffset.z == 0.0f) ? 0.0f : -childOffset.z);
+    return quatRotate(parentQW, parentOffset) + quatRotate(childQW, d);
+}
+
 public float3 quatRotateInv(float4 q, float3 v)
 {
     // mirrors PxQuat::rotateInv()

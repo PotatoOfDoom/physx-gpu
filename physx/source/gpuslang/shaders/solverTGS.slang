@@ -2470,20 +2470,14 @@ void solveBlockUnified(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
     // P8.104: the articulation branch (blockIdx.y != 0 ->
     // artiSolveBlockPartitionTGSInternal, solverMultiBlockTGS.cu:756) lives in
     // npArtiSolvePartition.slang.  5.12 dropped the shared residual error tail
-    // (accumulateErrorGlobalFullWarp); the module's error outputs are ignored
-    // until the articulation area strips them.
+    // (accumulateErrorGlobalFullWarp).
     if (groupId.y != 0)
     {
-        float aErrSumSq;
-        float aErrMax;
-        uint aErrCount;
-        bool aResidual;
         aspSolveBlockPartitionTGS(gSolveUnifiedAbi.solverCoreDesc, gSolveUnifiedAbi.sharedDesc,
                                   gSolveUnifiedAbi.islandIndex, gSolveUnifiedAbi.partitionIndex,
                                   gSolveUnifiedAbi.elapsedTime, gSolveUnifiedAbi.minPen,
                                   gSolveUnifiedAbi.artiDesc,
-                                  groupId.x * 2u + groupThreadId.y, groupThreadId.x,
-                                  aErrSumSq, aErrMax, aErrCount, aResidual);
+                                  groupId.x * 2u + groupThreadId.y, groupThreadId.x);
         return;
     }
 

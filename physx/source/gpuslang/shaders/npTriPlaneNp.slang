@@ -329,6 +329,7 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
         {
             InterlockedOr(gCounters[2], OVERFLOW_FORCE);
             forceAndIndiceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu; // 5.12: a force overflow also drops the contacts
         }
     }
     uint4 rec;

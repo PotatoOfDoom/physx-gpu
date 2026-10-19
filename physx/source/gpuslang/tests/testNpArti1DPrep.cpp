@@ -238,7 +238,7 @@ static void refA1dPGS(const J1In& s, J1Out& o, RefStats& st)
     for (uint32_t i = 0; i < numRows; ++i)
         (&o.sorted[i / 4].x)[i % 4] = sorted[i];
 
-    const float erp = 1.0f;
+    const float erp = s.scal.z;   // 5.12: biasCoefficients.joint (5.6.1: a fixed 1.0)
     uint32_t outCount = 0;
 
     for (uint32_t i = 0; i < numRows; ++i)
@@ -401,7 +401,8 @@ PXG_TEST(npArti1DPrep_pgs)
         s.invMassScale = F4{ rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f) };
         // dt > 1 stripe: unphysical but representable; the ONLY way the
         // fminf(dt, 1) clamp in driveScale is observable (review-182 find)
-        s.scal = F4{ (i % 9 == 7) ? rf(1.2f, 2.5f) : rf(0.002f, 0.02f), rf(50.f, 500.f), 0, 0 };
+        s.scal = F4{ (i % 9 == 7) ? rf(1.2f, 2.5f) : rf(0.002f, 0.02f), rf(50.f, 500.f),
+                     rf(0.3f, 0.9f), 0 };   // z: the 5.12 joint bias coefficient (erp)
 
         static const uint32_t hintPool[6] = { 0u, 1u, 2u, 5u, 6u, 256u };
         bool dupHint = false;
@@ -634,7 +635,7 @@ static void refA1dTGS(const T1In& s, T1Out& o, RefStats& st)
     for (uint32_t i = 0; i < numRows; ++i)
         (&o.sorted[i / 4].x)[i % 4] = sorted[i];
 
-    const float erp = 0.5f * biasCoefficient;
+    const float erp = biasCoefficient;   // 5.12 (5.6.1: 0.5f * biasCoefficient)
     uint32_t outCount = 0;
 
     for (uint32_t i = 0; i < numRows; ++i)

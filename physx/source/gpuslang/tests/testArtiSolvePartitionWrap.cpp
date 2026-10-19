@@ -43,14 +43,11 @@
 // so the 1D deltaQ loads exercise BOTH the block mDeltaQ and the
 // txIData.deltaBody2World.q arm.  (artiId, slab) pairs are globally unique
 // per side so the deferredZ / slabDirty scatters never collide.
-// Rounds: A partition 2 (the artiConstraintsPerPartition[idx-1] arm,
-// residual disabled -> the accumulator must stay untouched), B partition 0
-// (the mArtiBatchStartIndex arm, residual enabled -- only the contact warp
-// contributes, so the atomic tail stays deterministic), and (P9.89) six more
-// residual-enabled rounds on fresh salts, both start arms and both minPen
-// arms: round B alone rounded identically under the reversed radius order and
-// the linear lane sum, so solveUnifiedErrorTail's butterfly had no
-// association coverage; host twins now prove the data tells them apart.
+// Rounds: partition 2 (the artiConstraintsPerPartition[idx-1] arm),
+// partition 0 (the mArtiBatchStartIndex arm), and six more rounds on fresh
+// salts, both start arms and both minPen arms.  5.12 removed the residual
+// reporting (no error accumulation, no warp butterfly, no atomic tail): the
+// solver desc must come back untouched.
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -163,7 +160,7 @@ const uint32_t ASW_D_SLAB_HAS_CHANGES = 88;
 const uint32_t ASW_D_ARTICULATION_BLOCKS = 128;
 const uint32_t ASW_D_LINK_BLOCKS = 136;
 const uint32_t ASW_D_MAX_LINKS = 248;
-const uint32_t ASW_DESC_SIZE = 360;
+const uint32_t ASW_DESC_SIZE = 344;
 
 static void aswSeed(AswArena& W, uint32_t salt, uint32_t partitionIndex, int32_t errCounter)
 {
@@ -231,9 +228,7 @@ static void aswSeed(AswArena& W, uint32_t salt, uint32_t partitionIndex, int32_t
 
     // ---- solver desc ----
     W.solverDesc.numSlabs = ASW_NB_SLABS;
-    W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares = 0.5f;
-    W.solverDesc.contactErrorAccumulator.mCounter = errCounter;
-    W.solverDesc.contactErrorAccumulator.mMaxError = 0.25f;
+    (void)errCounter;   // (5.12: no contactErrorAccumulator)
 
     // ---- arti desc image (scalars; pointers patched at upload) ----
     uint32_t maxLinks = ASW_MAX_LINKS;
@@ -352,7 +347,7 @@ static void aswSeed(AswArena& W, uint32_t salt, uint32_t partitionIndex, int32_t
             H.restitutionXdt[lane] = (lane % 4u == 1u) ? (-0.3f + 0.1f * fv(lane, bi, 70, salt))
                                                        : (0.2f + 0.1f * std::fabs(fv(lane, bi, 71, salt)));
             H.cfm[lane] = 0.01f + 0.005f * std::fabs(fv(lane, bi, 72, salt));
-            H.p8[lane] = 0.9f;
+            H.biasCoefficient[lane] = 0.9f;   // 5.12 renamed p8
             F.numFrictionConstr[lane] = (lane % 3u) * 2u + ((lane % 5u == 2u) ? 1u : 0u);
             F.dynamicFriction[lane] = 0.4f + 0.2f * std::fabs(fv(lane, bi, 73, salt));
             F.biasCoefficient[lane] = 0.5f + 0.2f * std::fabs(fv(lane, bi, 74, salt));
@@ -440,7 +435,6 @@ static void aswSeed(AswArena& W, uint32_t salt, uint32_t partitionIndex, int32_t
                 C.resp0[lane] = 0.5f + 0.3f * std::fabs(fv(lane, r, 141, salt));
                 C.resp1[lane] = 0.5f + 0.3f * std::fabs(fv(lane, r, 142, salt));
                 C.flags[lane] = (r == 1u) ? 32u : ((r == 3u) ? (32u | 128u) : 0u);   // SPRING / ACCEL_SPRING
-                C.residual[lane] = 0.0f;
             }
         }
     }
@@ -464,58 +458,10 @@ static uint32_t aswCountSlabs(const AswArena& W, uint32_t bodyIndex)
     return PxMax(1u, c);
 }
 
-// P9.89: the per-warp sum of PxgErrorAccumulator::accumulateErrorGlobalFullWarp
-// (gpucommon/src/CUDA/solverResidual.cuh:85 -> warpReduction<AddOpPxReal>,
-// gpucommon/src/CUDA/reduction.cuh:188-199): a __shfl_xor_sync butterfly at
-// radius 16, 8, 4, 2, 1 in which every lane ends with op(own, partner).  The
-// lanes >= mDescStride `return`ed before it (solverMultiBlockTGS.cu:806-807)
-// and never reach the FULL_MASK shuffle; PTX leaves a read of an exited lane's
-// register undefined.  They enter as +0, the AddOpPxReal identity, exactly as
-// the port feeds them -- and at radius r lane 0 only ever reads a lane m in
-// [r, 2r) whose accumulated partners m ^ S are all >= m, so it reads an exited
-// lane only when that lane's whole subtree has exited: with +0 there, lane 0
-// of the CUDA and of the port carry the same tree bit for bit.
-//   order 0: the CUDA's butterfly (what the mirror uses);
-//   order 1: the WRONG radius order 1, 2, 4, 8, 16;
-//   order 2: the WRONG linear lane sum ((l0 + l1) + l2) + ...
-// The two wrong orders exist only as twins: the test proves its data makes
-// them round differently from the butterfly (PXG_CHECK_MSG at the end), so a
-// port that reassociates the reduction cannot pass the bitwise compare.
-static float aswWarpSum(const RefError lanes[32], int order)
-{
-    if (order == 2)
-    {
-        float s = 0.0f;
-        for (uint32_t l = 0; l < 32; ++l)
-            s += lanes[l].sumOfSquares;
-        return s;
-    }
-    float sums[32];
-    for (uint32_t l = 0; l < 32; ++l)
-        sums[l] = lanes[l].sumOfSquares;
-    for (uint32_t step = 0; step < 5; ++step)
-    {
-        const uint32_t radius = (order == 0) ? (16u >> step) : (1u << step);
-        float ns[32];
-        for (uint32_t l = 0; l < 32; ++l)
-            ns[l] = sums[l] + sums[l ^ radius];
-        std::memcpy(sums, ns, sizeof(ns));
-    }
-    return sums[0];
-}
-
-// the global accumulator after the residual round under each reduction order
-struct AswTwins
-{
-    float acc[3];   // mErrorSumOfSquares with order 0 / 1 / 2
-};
-
 // the full host mirror of the articulation branch
 static void aswMirror(AswArena& W, uint32_t partitionIndex, float elapsedTime, float minPen,
-                      bool residual, uint32_t& artiWrites, uint32_t& rigidWrites,
-                      uint32_t& staticRefs, AswTwins& twins)
+                      uint32_t& artiWrites, uint32_t& rigidWrites, uint32_t& staticRefs)
 {
-    RefError warpErrLanes[2][32];
     for (uint32_t w = 0; w < 4; ++w)   // 2 blocks x 2 warps
     {
         const uint32_t startIndex = (partitionIndex == 0)
@@ -525,7 +471,6 @@ static void aswMirror(AswArena& W, uint32_t partitionIndex, float elapsedTime, f
         const uint32_t k = startIndex + w + ASW_BATCH_OFFSET;
         if (k >= endIndex)
             continue;
-        const uint32_t b = k - ASW_K0;
         PxgBlockConstraintBatch& BT = W.bt[k];
 
         for (uint32_t lane = 0; lane < BT.mDescStride; ++lane)
@@ -591,10 +536,10 @@ static void aswMirror(AswArena& W, uint32_t partitionIndex, float elapsedTime, f
                 refSolveExtContactTGS(BT, vel0, vel1, delta0, delta1, lane, W.ch.data(),
                                       W.fh.data(), W.cp.data(), W.fp.data(), W.rs.data(),
                                       elapsedTime, minPen, imp0, imp1,
-                                      residual ? &warpErrLanes[b][lane] : nullptr, ref0, ref1);
+                                      nullptr, ref0, ref1);
             else
                 refSolveExt1DTGS(BT, vel0, vel1, delta0, delta1, lane, W.jh.data(), W.jr.data(),
-                                 W.rs.data(), dq0, dq1, elapsedTime, imp0, imp1, residual,
+                                 W.rs.data(), dq0, dq1, elapsedTime, imp0, imp1, false,
                                  ref0, ref1);
 
             if (!nA.isArticulation())
@@ -637,45 +582,6 @@ static void aswMirror(AswArena& W, uint32_t partitionIndex, float elapsedTime, f
             }
         }
     }
-
-    // the global accumulator: the device reduces each warp's 32 lanes with the
-    // BUTTERFLY of aswWarpSum (order 0), then lane 0 accumulates atomically.
-    // Only the contact warp (b = 0) carries a non-zero sum -- the 1D batch
-    // writes its residual per row -- so the atomic order stays deterministic.
-    // (P9.89: the old note "a linear lane sum is 1 ULP off" was measured false
-    // for the single residual round this fixture had: both the reversed radius
-    // order and the linear sum survived.  The twins below keep that honest.)
-    for (int o = 0; o < 3; ++o)
-        twins.acc[o] = W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares;
-    if (residual)
-        for (uint32_t b = 0; b < 2; ++b)
-        {
-            float maxs[32];
-            uint32_t counts[32];
-            for (uint32_t l = 0; l < 32; ++l)
-            {
-                maxs[l] = warpErrLanes[b][l].maxError;
-                counts[l] = uint32_t(warpErrLanes[b][l].counter);
-            }
-            for (uint32_t radius = 16; radius > 0; radius >>= 1)
-            {
-                float nm[32];
-                uint32_t nc[32];
-                for (uint32_t l = 0; l < 32; ++l)
-                {
-                    nm[l] = PxMax(maxs[l], maxs[l ^ radius]);
-                    nc[l] = counts[l] + counts[l ^ radius];
-                }
-                std::memcpy(maxs, nm, sizeof(nm));
-                std::memcpy(counts, nc, sizeof(nc));
-            }
-            for (int o = 0; o < 3; ++o)
-                twins.acc[o] += aswWarpSum(warpErrLanes[b], o);
-            W.solverDesc.contactErrorAccumulator.mErrorSumOfSquares = twins.acc[0];
-            W.solverDesc.contactErrorAccumulator.mCounter += int(counts[0]);
-            W.solverDesc.contactErrorAccumulator.mMaxError =
-                PxMax(W.solverDesc.contactErrorAccumulator.mMaxError, maxs[0]);
-        }
 }
 
 } // namespace
@@ -688,12 +594,8 @@ PXG_TEST(artiSolvePartitionWrap)
     };
     PxgCudaShim shim(dev, manifest, 1, &aswLoader);
 
-    // P9.89: rounds 2..7 add residual-enabled instances (fresh salts, both
-    // start arms, both minPen arms) so the warp butterfly of
-    // solveUnifiedErrorTail is compared on enough independent 26-lane sums that
-    // a reassociated reduction changes the accumulator bits (the twin check
-    // after the loop); with round 1 alone the reversed-radius and linear-sum
-    // mutants of solverTGS.slang both passed.
+    // (errCounter is the 5.6.1 residual-accumulator seed; 5.12 has none, the
+    // rounds keep their salts and arms)
     struct Round { uint32_t partition; int32_t errCounter; float elapsed, minPen; };
     const Round rounds[] = {
         { 2u, -5, 0.13f, -PX_MAX_F32 },   // disabled accumulator, [idx-1] start arm
@@ -706,7 +608,6 @@ PXG_TEST(artiSolvePartitionWrap)
         { 2u, 2, 0.31f, -PX_MAX_F32 },
     };
     const uint32_t nbRounds = uint32_t(sizeof(rounds) / sizeof(rounds[0]));
-    uint32_t residualRounds = 0, reversedDiffers = 0, linearDiffers = 0;
 
     for (uint32_t round = 0; round < nbRounds; ++round)
     {
@@ -787,22 +688,9 @@ PXG_TEST(artiSolvePartitionWrap)
 
         // ---- mirror (mutates A in place) ----
         uint32_t artiWrites = 0, rigidWrites = 0, staticRefs = 0;
-        AswTwins twins;
-        aswMirror(A, rd.partition, rd.elapsed, rd.minPen, rd.errCounter >= 0,
-                  artiWrites, rigidWrites, staticRefs, twins);
+        aswMirror(A, rd.partition, rd.elapsed, rd.minPen, artiWrites, rigidWrites, staticRefs);
         PXG_CHECK_MSG(artiWrites >= 20 && rigidWrites >= 15 && staticRefs >= 2,
                       "coverage: arti %u rigid %u static %u", artiWrites, rigidWrites, staticRefs);
-        if (rd.errCounter >= 0)
-        {
-            uint32_t bits[3];
-            std::memcpy(bits, twins.acc, sizeof(bits));
-            ++residualRounds;
-            reversedDiffers += (bits[1] != bits[0]) ? 1u : 0u;
-            linearDiffers += (bits[2] != bits[0]) ? 1u : 0u;
-            std::printf("  asw r%u residual sum: butterfly %a  radius-1..16 %a  linear %a\n", round,
-                        double(twins.acc[0]), double(twins.acc[1]), double(twins.acc[2]));
-        }
-
         // ---- launch: grid (2, 2, 1) ----
         struct Params
         {
@@ -850,36 +738,11 @@ PXG_TEST(artiSolvePartitionWrap)
         cmp(dJr, A.jr.data(), A.jr.size() * sizeof(A.jr[0]), "jointRows");
         cmp(dRs, A.rs.data(), A.rs.size() * sizeof(A.rs[0]), "responses");
         cmp(dEnc, A.enc.data(), A.enc.size() * 4, "refCounts");
-        // the accumulator words in the downloaded solver desc
-        {
-            std::vector<uint8_t> gotSd(sizeof(A.solverDesc));
-            shim.memcpyDtoH(gotSd.data(), dSd, gotSd.size());
-            const size_t accOff = offsetof(PxgSolverCoreDesc, contactErrorAccumulator);
-            if (std::memcmp(&gotSd[accOff], &A.solverDesc.contactErrorAccumulator,
-                            sizeof(Dy::ErrorAccumulator)) != 0)
-            {
-                float gs, gm; int gc;
-                std::memcpy(&gs, &gotSd[accOff], 4);
-                std::memcpy(&gc, &gotSd[accOff + 4], 4);
-                std::memcpy(&gm, &gotSd[accOff + 8], 4);
-                std::printf("MM asw r%u errorAccumulator ref (%a,%d,%a) gpu (%a,%d,%a)\n", round,
-                            double(A.solverDesc.contactErrorAccumulator.mErrorSumOfSquares),
-                            A.solverDesc.contactErrorAccumulator.mCounter,
-                            double(A.solverDesc.contactErrorAccumulator.mMaxError), gs, gc, gm);
-                ++bad;
-            }
-        }
+        // the kernel never writes the solver desc (5.12: no error accumulator)
+        cmp(dSd, &A.solverDesc, sizeof(A.solverDesc) & ~size_t(3), "solverDesc");
         std::printf("  asw r%u +-0 tolerated %zu\n", round, signedZeros);
         PXG_CHECK_MSG(bad == 0, "round %u: %zu mismatches", round, bad);
 
         for (PxgDevicePtr p : bufs) if (p) shim.memFree(p);
     }
-
-    // P9.89: the data must make each wrong reduction order visible -- a fixture
-    // whose sums round the same under every association verifies no tree
-    std::printf("  asw residual rounds %u: radius-1..16 differs in %u, linear differs in %u\n",
-                residualRounds, reversedDiffers, linearDiffers);
-    PXG_CHECK_MSG(reversedDiffers >= 2 && linearDiffers >= 2,
-                  "reduction-order twins: radius-1..16 differs in %u, linear in %u of %u rounds",
-                  reversedDiffers, linearDiffers, residualRounds);
 }

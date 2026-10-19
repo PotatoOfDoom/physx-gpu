@@ -34,8 +34,9 @@
 //      else (0,0,0)  -- computed BEFORE the witness is added (pre-add count);
 //   2. addManifoldPoint(aToB.transformInv(witnessA), witnessB, -normal,
 //      (witnessB-witnessA).dot(normal), rbt, ...)  -- mutates the manifold + count;
-//   3. fullContactGen = (0.707106781 > localNor.dot(-normal)) || (numContacts < 4)
-//      where numContacts is the POST-add count.
+//   3. fullContactGen = (initialNbContacts > 1) || (0.707106781 > localNor.dot(-normal))
+//      || (numContacts < 4) where numContacts is the POST-add count.  The
+//      initialNbContacts term is 5.12's (cudaGJKEPA.cu:864, the PCM jitter fix).
 // Composes calculateLocalNormal (tranche 139) + addManifoldPoint (tranche 140).
 
 uint lowestSetIndex(uint mask) { return firstbitlow(mask); }
@@ -86,7 +87,8 @@ struct ContactDecideIn
     float4 aToBq;
     float4 aToBp;    // .xyz translation; .w = replaceBreakingThreshold
     uint numContacts;
-    uint pad0, pad1, pad2;
+    uint initialNbContacts;  // ss_scratch.initialNbContacts (5.12 predicate term)
+    uint pad1, pad2;
 }
 
 struct ContactDecideOut
@@ -211,7 +213,8 @@ void cvxContactDecide(uint3 dtid : SV_DispatchThreadID)
     }
 
     // 3. fullContactGen decision (numContacts is the post-add count)
-    const bool fullContactGen = (0.707106781f > dot(localNor, -normal)) || (numContacts < 4u);
+    const bool fullContactGen = (s.initialNbContacts > 1u)   // 5.12: "added to fix a jittering bug"
+                                || (0.707106781f > dot(localNor, -normal)) || (numContacts < 4u);
 
     ContactDecideOut r;
     for (uint j = 0u; j < 4u; ++j)

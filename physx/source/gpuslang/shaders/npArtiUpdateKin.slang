@@ -165,11 +165,17 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
         uint64_t tempNtc = 0uL, tempRs = 0uL, motionVel = 0uL;
         Ptr<uint> parents;
 
+        bool valid = false;
         if (live)
         {
             const uint articulationIndex =
                 haveIndices ? (Ptr<uint>(gUk.gpuIndices))[i] : i;
             record = articulations + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+            // 5.12: with no index buffer, a slot whose data.index is not its own
+            // (the 0xFFFFFFFF fill of an articulation removed before upload) is
+            // skipped -- the `continue` of the CUDA, predicated here so the
+            // block-wide barriers below stay uniform.
+            valid = haveIndices || artiU32Field(record, PXG_ARTI_DATA_INDEX) == articulationIndex;
         }
 
         // trap 2, and the SECOND deviation: the CUDA has every lane of the
@@ -180,7 +186,7 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
         // off (measured: only lanes 0..7 ran the zeroing pass).  The port
         // stages the pre-clear value through groupshared: lane 0 reads,
         // stages, and clears; every lane gates on the staged value.
-        if (live && threadIndexInWarp == 0u)
+        if (live && valid && threadIndexInWarp == 0u)
         {
             Ptr<uint> dirty = Ptr<uint>(record + PXG_ARTI_DATA_gpuDirtyFlag);
             const uint f = dirty[0];
@@ -189,7 +195,7 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
                 dirty[0] = f & ~PXG_ARTI_DIRTY_NEEDS_KINEMATIC_UPDATE;
         }
         AllMemoryBarrierWithGroupSync();   // slot 0 (the staging)
-        if (live)
+        if (live && valid)
         {
             const uint f = gUkDirty[groupThreadId.y];
             if ((f & PXG_ARTI_DIRTY_NEEDS_KINEMATIC_UPDATE) != 0u)
@@ -243,9 +249,8 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
                 Ptr<float> rq = Ptr<float>(relativeQuats + uint64_t(linkID) * 16u);
                 const float4 relativeQuat = float4(rq[0], rq[1], rq[2], rq[3]);
 
-                // jointType: PxU8 at core offset 539
-                const uint jointType =
-                    ((Ptr<uint>(jc + 536u))[0] >> 24) & 0xFFu;
+                // jointType: the PxU8 at PXG_AR_JOINT_jointType (507 in 5.12; 539 in 5.6.1)
+                const uint jointType = artiU8Field(jc, PXG_AR_JOINT_jointType);
 
                 Ptr<float> mm0 = Ptr<float>(motionMatrix + uint64_t(linkID) * PXG_ARTI_SUBSPACE_STRIDE);
 
@@ -348,7 +353,9 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
                     Ptr<float> pmv = Ptr<float>(motionVel + uint64_t(parent) * 24u);
                     const AbSpatialVector parentVel =
                         asmSVec(float3(pmv[0], pmv[1], pmv[2]), float3(pmv[3], pmv[4], pmv[5]));
-                    const float3 c2p = p - pP;
+                    // 5.12: c2p = body2World.q.rotate(r) -- r is already the
+                    // local-frame Rw; no world-scale subtraction
+                    const float3 c2p = quatRotate(q, r);
                     AbSpatialVector linkVelocity = adTranslateSpatialVector(-c2p, parentVel);
 
                     const uint jo =

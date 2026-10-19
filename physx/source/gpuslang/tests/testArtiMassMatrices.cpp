@@ -44,13 +44,14 @@
 //    translated inertias sum non-associatively -- the level-scheduled
 //    order provably equals descending link order, and the mirror does
 //    descending);
-//  * rootDof vs bufferDof as matrix PITCH vs INDEX (a fixed-base job in
-//    the rootMotion round has matSize = dofCount but pitch (maxDofs+6)^2,
-//    and only matSize^2 entries of the window are zeroed -- the rest of
-//    the pitch must come back poisoned);
+//  * rootDof vs the PITCH (a fixed-base job has matSize = dofCount but
+//    pitch (maxDofs+6)^2 -- 5.12 always -- and only matSize^2 entries of the
+//    window are zeroed: the rest of the pitch must come back poisoned);
 //  * the inward walk mutating the wm scratch hop by hop (final state =
-//    root-translated I*m vectors), consumed by the !rootMotion free-base
-//    correction (-=) over stride dofCount;
+//    root-translated I*m vectors), with Rw from computeLinkRwInvDyn of the
+//    tracked CHILD link at each hop (5.12; the joint anchors + prismatic
+//    slide), the free-base root coupling and root 6x6 tail (5.12 dropped
+//    rootMotion and the !rootMotion correction with it);
 //  * the root 6x6 tail's raw-float linear/angular inversion index map;
 //  * a single-link free-base articulation (rec 5: the root tail is the
 //    whole matrix) and static links (all-zero inertia rows).
@@ -63,6 +64,7 @@
 #include "foundation/PxQuat.h"
 #include "foundation/PxTransform.h"
 #include "CmUtils.h"
+#include "pxgArtiLinkRwRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -84,7 +86,7 @@ using physx::gpuslang::PxgResult;
 
 static_assert(sizeof(physx::Dy::SpatialMatrix) == 112, "the reinterpret stride");
 static_assert(offsetof(physx::Dy::SpatialMatrix, padding) == 108, "the level-scratch word");
-static_assert(offsetof(physx::PxgArticulation, worldMotionMatrix) == 224,
+static_assert(offsetof(physx::PxgArticulation, worldMotionMatrix) == 216,
               "..WORLD_MOTION_MATRIX");
 
 static std::vector<uint8_t> artiMmLoader(const char* file) { return loadShaderBlob(file); }
@@ -92,18 +94,18 @@ static std::vector<uint8_t> artiMmLoader(const char* file) { return loadShaderBl
 const uint32_t MM_NB_JOBS = 12;
 const uint32_t MM_NB_SLOTS = 16;
 const uint32_t MM_NB_RECORDS = 18;
-const uint32_t MM_RECORD_SIZE = 544;
+const uint32_t MM_RECORD_SIZE = 496;
 const uint32_t MM_R_NUM_LINKS = 16, MM_R_NUM_DOFS = 18, MM_R_FLAGS = 26;
 const uint32_t MM_R_JOINT_DATA = 48;
-const uint32_t MM_R_WORLD_INERTIA = 168, MM_R_BODY2WORLDS = 184, MM_R_PARENTS = 208;
-const uint32_t MM_R_MOTION_MATRIX = 216, MM_R_WORLD_MOTION_MATRIX = 224;
-const uint32_t MM_R_LINK_PROPS = 256;
+const uint32_t MM_R_JOINTS = 40, MM_R_JOINT_POSITIONS = 104;   // 5.12: computeLinkRwInvDyn
+const uint32_t MM_R_WORLD_INERTIA = 160, MM_R_BODY2WORLDS = 176, MM_R_PARENTS = 200;
+const uint32_t MM_R_MOTION_MATRIX = 208, MM_R_WORLD_MOTION_MATRIX = 216;
+const uint32_t MM_R_LINK_PROPS = 240;
 const uint32_t MM_MAX_LINKS = 6;
 const uint32_t MM_MAX_DOFS = 12;
 
 static uint32_t mmArti(uint32_t job) { return (job * 5u + 1u) % MM_NB_RECORDS; }
-// rec 5 is the single-link free-base case (job 8): with rootMotion the root
-// tail is the whole 6x6, without it matSize is 0 and the slot stays poison.
+// rec 5 is the single-link free-base case (job 8): the root tail is the whole 6x6.
 static uint32_t mmNumLinks(uint32_t rec) { return rec == 5u ? 1u : 2u + (rec % 5u); }
 static bool mmFixBase(uint32_t rec) { return (rec % 3u) == 1u; }
 static uint32_t mmDofs(uint32_t rec, uint32_t link) { return 1u + ((rec + link) % 3u); }
@@ -150,15 +152,18 @@ struct MmArena
 {
     std::vector<uint8_t> rec, jointData;
     std::vector<uint32_t> parents;
-    std::vector<float> xforms, motion, props;
+    std::vector<float> xforms, motion, props, jointPositions;
+    std::vector<uint8_t> joints;   // 5.12: Dy::ArticulationJointCore per link
     std::vector<float> inertia, wms;
     std::vector<float> out;
     uint32_t bufferDof;
 };
 
-static void mmSeed(MmArena& A, bool rootMotion, uint32_t salt)
+static void mmSeed(MmArena& A, uint32_t salt)
 {
-    A.bufferDof = rootMotion ? 6u : 0u;
+    A.bufferDof = 6u;   // 5.12: the pitch is always (maxDofs + 6)^2
+    lrBuildJoints(A.joints, MM_NB_RECORDS, MM_MAX_LINKS);
+    lrBuildJointPositions(A.jointPositions, MM_NB_RECORDS, MM_MAX_DOFS);
     A.rec.assign(size_t(MM_NB_RECORDS) * MM_RECORD_SIZE, 0xAB);
     A.jointData.assign(size_t(MM_NB_RECORDS) * MM_MAX_LINKS * 8, 0xAB);
     A.parents.assign(size_t(MM_NB_RECORDS) * MM_MAX_LINKS, 0xCDCDCDCDu);
@@ -233,7 +238,7 @@ static void mmSetPad(float* base, uint32_t link, uint32_t v)
     std::memcpy(base + link * 28 + 27, &v, 4);
 }
 
-static void mmMirror(MmArena& W, bool rootMotion)
+static void mmMirror(MmArena& W)
 {
     using physx::Dy::FeatherstoneArticulation;
     const uint32_t pitch = MM_MAX_DOFS + W.bufferDof;
@@ -243,7 +248,7 @@ static void mmMirror(MmArena& W, bool rootMotion)
         const uint32_t linkCount = mmNumLinks(r);
         const uint32_t dofCount = mmDofCount(r);
         const bool fixBase = mmFixBase(r);
-        const uint32_t rootDof = (rootMotion && !fixBase) ? 6u : 0u;
+        const uint32_t rootDof = fixBase ? 0u : 6u;
         const uint32_t matSize = dofCount + rootDof;
         float* out = &W.out[size_t(job) * pitch * pitch];
         float* inr = &W.inertia[size_t(r) * MM_MAX_LINKS * 28];
@@ -257,6 +262,11 @@ static void mmMirror(MmArena& W, bool rootMotion)
         auto motionVec = [&](uint32_t l, uint32_t d) {
             const float* mm = &W.motion[(size_t(r) * MM_MAX_LINKS + l) * 20 + d * 6];
             return UnAlignedSpatialVector(PxVec3(mm[0], mm[1], mm[2]), PxVec3(mm[3], mm[4], mm[5]));
+        };
+        // 5.12: computeLinkRwInvDyn(child, parentQ, childQ)
+        auto linkRw = [&](uint32_t child, uint32_t parent) {
+            return lrLinkRw(r, child, b2w(parent).q, b2w(child).q, jointOff(child),
+                            motionVec(child, 0).bottom);
         };
 
         // S0: the matSize^2 window is zeroed; the rest of the pitch stays
@@ -291,10 +301,10 @@ static void mmMirror(MmArena& W, bool rootMotion)
         for (uint32_t l = linkCount - 1; l > 0; --l)
         {
             const uint32_t pl = mmParent(l);
-            const PxVec3 rw = b2w(l).p - b2w(pl).p;
+            const PxVec3 rw = linkRw(l, pl);
             physx::Dy::SpatialMatrix parentSpace = mmLoadSM(&inr[l * 28]);
             pxgtest::refTranslateInertia(pxgtest::refSkewSymmetric(rw.x, rw.y, rw.z), parentSpace);
-            mmStoreSM(&inr[pl * 28], mmLoadSM(&inr[pl * 28]) + parentSpace);
+            mmStoreSM(&inr[pl * 28], dySmAdd(mmLoadSM(&inr[pl * 28]), parentSpace));
         }
 
         // S3: the per-link bands + inward walks
@@ -318,20 +328,20 @@ static void mmMirror(MmArena& W, bool rootMotion)
                     out[row * matSize + (jo + dof1 + rootDof)] = wm[dof1].innerProduct(Im0);
             }
 
-            PxVec3 childP = b2w(link).p;
+            uint32_t childLink = link;   // 5.12: Rw of the tracked child at each hop
             uint32_t pl = mmParent(link);
             for (;;)
             {
-                const PxVec3 rw = childP - b2w(pl).p;
+                const PxVec3 rw = linkRw(childLink, pl);
                 for (uint32_t d = 0; d < nd; ++d)
                     mmStoreSV(&wms[(jo + d) * 6],
                               FeatherstoneArticulation::translateSpatialVector(
                                   rw, mmLoadSV(&wms[(jo + d) * 6])));
-                childP = b2w(pl).p;
+                childLink = pl;
 
                 if (pl == 0)
                 {
-                    if (!fixBase && rootMotion)
+                    if (!fixBase)
                     {
                         for (uint32_t dof0 = 0; dof0 < nd; ++dof0)
                         {
@@ -372,8 +382,8 @@ static void mmMirror(MmArena& W, bool rootMotion)
             }
         }
 
-        // the rootMotion root 6x6 tail: raw floats + the inversion index map
-        if (!fixBase && rootMotion)
+        // the root 6x6 tail: raw floats + the inversion index map
+        if (!fixBase)
         {
             const float* rootI = &inr[0];
             for (uint32_t row = 0; row < 6; ++row)
@@ -389,31 +399,17 @@ static void mmMirror(MmArena& W, bool rootMotion)
                 }
             }
         }
-        // the !rootMotion free-base correction over the root-translated scratch
-        else if (!fixBase && !rootMotion)
-        {
-            physx::Dy::SpatialMatrix baseInvI = mmLoadSM(&inr[0]).invertInertia();
-            for (uint32_t row = 0; row < dofCount; ++row)
-            {
-                const UnAlignedSpatialVector m0 = mmLoadSV(&wms[row * 6]);
-                for (uint32_t col = 0; col < dofCount; ++col)
-                {
-                    const UnAlignedSpatialVector m1 = mmLoadSV(&wms[col * 6]);
-                    out[row * dofCount + col] -= m0.innerProduct(baseInvI * m1);
-                }
-            }
-        }
     }
 }
 
 // ---------------------------------------------------------------------------
 
-static size_t mmRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
+static size_t mmRun(PxgCudaShim& shim, uint32_t salt)
 {
     MmArena A;
-    mmSeed(A, rootMotion, salt);
+    mmSeed(A, salt);
     MmArena W = A;
-    mmMirror(W, rootMotion);
+    mmMirror(W);
 
     std::vector<PxgDevicePtr> bufs;
     auto up = [&](const void* p, size_t n) {
@@ -430,6 +426,8 @@ static size_t mmRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     PxgDevicePtr dPr = up(A.props.data(), A.props.size() * 4);
     PxgDevicePtr dIn = up(A.inertia.data(), A.inertia.size() * 4);
     PxgDevicePtr dWm = up(A.wms.data(), A.wms.size() * 4);
+    PxgDevicePtr dJc = up(A.joints.data(), A.joints.size());
+    PxgDevicePtr dJp = up(A.jointPositions.data(), A.jointPositions.size() * 4);
 
     for (uint32_t r = 0; r < MM_NB_RECORDS; ++r)
     {
@@ -442,6 +440,8 @@ static size_t mmRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
         put(MM_R_LINK_PROPS, uint64_t(dPr) + uint64_t(r) * MM_MAX_LINKS * 16u);
         put(MM_R_WORLD_INERTIA, uint64_t(dIn) + uint64_t(r) * MM_MAX_LINKS * 112u);
         put(MM_R_WORLD_MOTION_MATRIX, uint64_t(dWm) + uint64_t(r) * MM_MAX_DOFS * 24u);
+        put(MM_R_JOINTS, uint64_t(dJc) + uint64_t(r) * MM_MAX_LINKS * sizeof(physx::Dy::ArticulationJointCore));
+        put(MM_R_JOINT_POSITIONS, uint64_t(dJp) + uint64_t(r) * MM_MAX_DOFS * 4u);
     }
     PxgDevicePtr dRec = up(A.rec.data(), A.rec.size());
 
@@ -463,10 +463,10 @@ static size_t mmRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
     {
         uint32_t nb, pad0;
         uint64_t data, idx;
-        uint32_t maxDofs, rootWord;
+        uint32_t maxDofs, pad1;   // (5.6.1: the rootMotion bool sat in pad1)
         uint64_t rec;
     } prm = { MM_NB_JOBS, 0u, uint64_t(dOut), uint64_t(dIdx), MM_MAX_DOFS,
-              rootMotion ? 1u : 0u, uint64_t(dRec) };
+              0xABu, uint64_t(dRec) };
     PXG_CHECK_MSG(shim.launchKernel(0, (MM_NB_JOBS + 7) / 8, 1, 1, &prm, sizeof(prm)) ==
                       PxgResult::Success,
                   "launch computeArtiMassMatrices");
@@ -482,8 +482,8 @@ static size_t mmRun(PxgCudaShim& shim, bool rootMotion, uint32_t salt)
             if (w[k] != g[k])
             {
                 if (bad < 10)
-                    std::printf("MM mm rm=%d %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
-                                rootMotion ? 1 : 0, name, k, w[k], want[k], g[k], got[k]);
+                    std::printf("MM mm salt=%u %s word %zu  ref %08x (%g)  gpu %08x (%g)\n",
+                                salt, name, k, w[k], want[k], g[k], got[k]);
                 ++bad;
             }
     };
@@ -518,7 +518,7 @@ PXG_TEST(artiMassMatrices)
     PXG_CHECK_MSG(nFixed > 2 && nFree > 2 && nMultiChild > 3 && nSingle > 0, "coverage hole");
 
     size_t bad = 0;
-    bad += mmRun(shim, true, 5);
-    bad += mmRun(shim, false, 9);
+    bad += mmRun(shim, 5);
+    bad += mmRun(shim, 9);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

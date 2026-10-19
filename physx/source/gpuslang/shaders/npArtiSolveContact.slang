@@ -51,7 +51,6 @@ import pxgSlangPrepCommon;
 
 static const uint MAX_NC = 6u;
 static const uint MAX_NF = 6u;
-static const float P8_Q = 0.8f;
 static const float PX_EPS_REAL_Q = 1.192092896e-07f;
 static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 4; // 5.12 PxgSolverFlags.h (5.6.1: 1 << 3)
 
@@ -79,7 +78,7 @@ struct AscIn
     float4 normalSF;     // normal.xyz, staticCof
     float4 hdr;          // restitution, cfm, minNormalForce, dynamicFriction
     float4 fricN[2];     // frictionNormals[0], frictionNormals[1]
-    float4 refs;         // ref0, ref1, 0, 0
+    float4 refs;         // ref0, ref1, biasCoefficient (5.12), 0
     float4 vel0Top, vel0Bot, vel1Top, vel1Bot;
     CRow contacts[6];
     FRow frictions[6];
@@ -181,7 +180,10 @@ void asCtPGS(uint3 dtid : SV_DispatchThreadID)
     const float staticCof = s.normalSF.w;
     const float restitution = s.hdr.x;
     const float cfm = s.hdr.y;
-    const float p8 = P8_Q;
+    // 5.12 (solver.cuh solveExtContactsBlock): the friction velMultiplier
+    // numerator is the caller's rigid-contact bias coefficient
+    // (island.mBiasCoefficients.rigidContact); 5.6.1 hard-coded p8 = 0.8f.
+    const float p8 = s.refs.z;
 
     // imp0/imp1 start at zero
     float3 imp0Top = float3(0, 0, 0), imp0Bot = float3(0, 0, 0);

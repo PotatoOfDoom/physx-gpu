@@ -315,7 +315,8 @@ inline void refSolveSelfLanePgs(PxgArticulationBlockData& ab,
                                 PxgBlockSolverConstraint1DMod* jm,
                                 PxgArticulationBlockResponse* rs,
                                 bool doFriction, bool accumErr,
-                                RefError& err, SelfCoverage& cov, PxU32 lane)
+                                RefError& err, SelfCoverage& cov, PxU32 lane,
+                                float rigidContactBiasCoefficient)
 {
     const PxU32 nbSelf = ab.mTotalSelfConstraintCount;
     const PxU32 start = ab.mSelfConstraintOffset;
@@ -426,7 +427,7 @@ inline void refSolveSelfLanePgs(PxgArticulationBlockData& ab,
             if (C0.resp0[offset] == 0.f && C0.resp1[offset] == 0.f) ++cov.zeroResp;
             refSolveExtContactPGS(batch, velA, velB, doFriction, offset,
                                   ch, fh, cp, fp, rs, impulse0, impulse1,
-                                  accumErr ? &err : NULL, 1.f, 1.f);
+                                  accumErr ? &err : NULL, rigidContactBiasCoefficient, 1.f, 1.f);
         }
         else
         {

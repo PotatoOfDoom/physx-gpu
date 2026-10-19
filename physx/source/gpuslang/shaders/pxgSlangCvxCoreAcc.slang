@@ -62,12 +62,25 @@
 //   patchCount[MAX_PATCHES]   per-patch point count
 //   mPoints[MAX_PATCHES * MAX_PATCH_POINTS]   (xyz = world point, w = dist)
 //
+// 5.12's Gu::Contact::Point GAINS `PxU32 faceIndex` (GuConvexSupport.h:886-897),
+// which grows Point from 16 to 20 bytes and with it the CUDA's shared-memory
+// Contact32.  This kernel's NewPoint::make always stores PXC_CONTACT_NO_FACE_INDEX
+// (convexCoreCollision.cu:689), the reduction only copies whole Points, and
+// neither writeOutput reads the field (the GPU takes both materials from the
+// shapes; per-triangle-material meshes are routed to the CPU narrowphase).  So
+// the field is constant and unobservable here, and the float4 (p, d) slot keeps
+// the port's layout: no output bit depends on it.  The port's Contact32 is its
+// own representation, not a byte mirror of the CUDA's shared struct.
+//
 // COVERAGE NOTE, because it is a real limit and not a detail: the fixture drives
 // at most TWO successive calls (WIn::meta.x is clamped to 2).  A BVH traversal
 // makes as many as it has leaf batches.  The state machine is the same one, but
 // "many calls" is exercised by the scene, not by the bitwise fixture.
 
-static const float SAME_NORMAL = 0.999f;
+// 5.12: Gu::Contact's member `SAME_NORMAL = 0.999f` became the global
+// PXC_SAME_NORMAL (GuConvexSupport.h:17, same value); convexCoreCollision.cu
+// :723/:837 compare against it.
+static const float PXC_SAME_NORMAL = 0.999f;
 static const uint WARP_SIZE = 32u;
 static const uint MAX_PATCHES = 16u;
 static const uint MAX_PATCH_POINTS = 4u;
@@ -200,7 +213,7 @@ void cvxCoreAddPoints32(inout uint mNumPatches, inout uint mNumPoints,
             // lanes whose normal matches the deepest one's
             uint sameNormalMask = 0u;
             for (uint l = 0u; l < WARP_SIZE; ++l)
-                if (dot3Q(ln[l], minDistNormal) > SAME_NORMAL) sameNormalMask |= (1u << l);
+                if (dot3Q(ln[l], minDistNormal) > PXC_SAME_NORMAL) sameNormalMask |= (1u << l);
             sameNormalMask &= allMask;
 
             // ---- reducePoints over sameNormalMask ----
@@ -241,7 +254,7 @@ void cvxCoreAddPoints32(inout uint mNumPatches, inout uint mNumPoints,
                 float maxDot;
                 const uint maxDotThread = maxIndexQ(dots, 0xFFFFFFFFu, maxDot);
 
-                if (maxDot > SAME_NORMAL)
+                if (maxDot > PXC_SAME_NORMAL)
                     patchIndex = maxDotThread;
                 else if (mNumPatches < MAX_PATCHES)
                 {

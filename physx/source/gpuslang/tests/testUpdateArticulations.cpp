@@ -240,7 +240,7 @@ static size_t runRound(PxgCudaShim& shim, bool directAPI)
         s.oChildren = ar.take(8u * s.nbLinks + guard);
         s.oB2W = ar.take(28u * s.nbLinks + guard);
         s.oB2A = ar.take(28u * s.nbLinks + guard);
-        s.oJoints = ar.take(544u * s.nbLinks + guard);
+        s.oJoints = ar.take(512u * s.nbLinks + guard);
         s.oJointData = ar.take(8u * s.nbLinks + guard);
         s.oSpatialTendons = ar.take(24u * s.nbSpatial + guard);
         s.oSpatialParams = ar.take(16u * s.nbSpatial + guard);
@@ -288,7 +288,7 @@ static size_t runRound(PxgCudaShim& shim, bool directAPI)
     const uint32_t LINK_POOL = 8;
     std::vector<uint8_t> pLinks(80u * LINK_POOL), pWake(4u * LINK_POOL), pProps(16u * LINK_POOL);
     std::vector<uint8_t> pParents(4u * LINK_POOL), pChildren(8u * LINK_POOL);
-    std::vector<uint8_t> pJoints(544u * LINK_POOL), pJointData(8u * LINK_POOL);
+    std::vector<uint8_t> pJoints(512u * LINK_POOL), pJointData(8u * LINK_POOL);
     std::vector<uint8_t> pExtAccel(24u * LINK_POOL);
     patternFill(pLinks, 1); patternFill(pWake, 2); patternFill(pProps, 3);
     patternFill(pParents, 4); patternFill(pChildren, 5);
@@ -513,7 +513,7 @@ static size_t runRound(PxgCudaShim& shim, bool directAPI)
 
         if (f & uint32_t(Dy::ArticulationDirtyFlag::eDIRTY_JOINTS))
         {
-            copyIn(s.oJoints, pJoints.data() + 544u * s.linkStart, 544u * s.nbLinks);
+            copyIn(s.oJoints, pJoints.data() + 512u * s.linkStart, 512u * s.nbLinks);
             copyIn(s.oJointData, pJointData.data() + 8u * s.linkStart, 8u * s.nbLinks);
         }
         if (f & uint32_t(Dy::ArticulationDirtyFlag::eDIRTY_MIMIC_JOINT))

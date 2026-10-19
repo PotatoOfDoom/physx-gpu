@@ -28,10 +28,10 @@
 // writeCompressedContact (convexMeshOutput.cu L50-82, L116-346).  The CPU
 // reference transcribes the CUDA exactly, including: the lane/6 manifold
 // layout; the lane-0 reservation with CHAINED else-if full-size overflow
-// tests and its rollback; the insertAveragePoint count inflation that lives
-// on lane 0 only (making the faceIndex region base per-lane divergent -- the
-// one word where lane 0's slot can collide with another lane's is a genuine
-// unordered CUDA write conflict and is masked from comparison); the
+// tests and its rollback; insertAveragePoint IGNORED since 5.12
+// (convexMeshOutput.cu L165-171 -- 5.6.1 inflated the count on lane 0 only,
+// over-reporting nbContacts and making the faceIndex base per-lane divergent;
+// the cases still set the flag and the outputs must not depend on it); the
 // no-reservation path that stores base + 0xFFFFFFFF wrapped pointers yet
 // passes the early-return gate; the flip swap and patch-normal negation; the
 // first-contact worldNormal; the sphere/capsule radius adjustments; and the
@@ -161,7 +161,7 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
 
     const uint32_t nbManifolds = s.hdr.x;
     const uint32_t allflags = s.hdr.y;
-    const bool insertAvg = s.hdr.z != 0;
+    // s.hdr.z (insertAveragePoint) is PX_UNUSED since 5.12
 
     uint32_t contactMask = 0;
     for (int L = 0; L < 32; ++L)
@@ -182,7 +182,6 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
     bool overflow = false;
     uint32_t total0 = pc, nbMan0 = nbManifolds;
     {
-        total0 += insertAvg ? nbMan0 : 0;
         if (total0)
         {
             patchOff = patchesB;  patchesB += 64 * nbMan0;
@@ -295,11 +294,7 @@ static uint32_t refTrimeshOut(const TmoIn& s, const std::vector<MaterialData>& m
         if (forceOff != 0xFFFFFFFFu)
         {
             const uint32_t word = totalLocal + wI;
-            // lane 0 collides with lane word==pc+nbManifolds when insertAvg inflates:
-            if (L == 0 && insertAvg && total0 != pc && word >= pc + 1 && word <= pc + pc - 1)
-                conflictWord = word;
-            if (L != 0 && insertAvg && total0 != pc && (contactMask & 1u) && word == total0)
-                conflictWord = word;
+            // 5.12: no inflation, so no lane-0 face-index collision either
             (&o.fstream[word / 4].x)[word & 3] = triIndex;
         }
     }
@@ -378,7 +373,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
             s.contacts[c * 3 + 2] = F4{ q.x, q.y, q.z, 0 };
         }
 
-        const uint32_t total0 = pcExpect + (insertAvg ? nbMan : 0);
+        const uint32_t total0 = pcExpect; // 5.12: no average-point inflation
         const uint32_t initP = 64 * (rng() % 16), initC = 16 * (rng() % 32), initF = 8 * (rng() % 32);
         uint32_t limP = initP + 64 * 20, limC = initC + 16 * 40, limF = initF + 8 * 40;
         const uint32_t v = rng() % 8;
@@ -397,7 +392,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
         if (f & 1u) ++cOvfC;
         if (f & 2u) ++cOvfF;
         if (nbMan == 0) ++cZeroMan;
-        if (nbMan > 0 && pcExpect == 0 && !insertAvg) ++cNoRes;
+        if (nbMan > 0 && pcExpect == 0) ++cNoRes;
         if (insertAvg) ++cAvg;
         if (flip) ++cFlip;
         if (!flip && other == T_SPHERE) ++cSphere;
@@ -462,7 +457,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
     PXG_CHECK_MSG(mmF == 0, "trimeshOut: %zu face-index mismatches", mmF);
     PXG_CHECK_MSG(cOvfP > N / 50 && cOvfC > N / 60 && cOvfF > N / 60 && cZeroMan > N / 20 &&
                   cNoRes > N / 100 && cAvg > N / 5 && cFlip > N / 4 && cSphere > N / 30 &&
-                  cCapsule > N / 30 && cConflict > N / 100 && cEmptyMan > N / 10 && cExact > N / 20,
+                  cCapsule > N / 30 && cConflict == 0 && cEmptyMan > N / 10 && cExact > N / 20,
                   "trimeshOut: coverage thin (ovfP %zu ovfC %zu ovfF %zu zeroMan %zu noRes %zu avg %zu flip %zu sph %zu cap %zu conf %zu emptyMan %zu exact %zu)",
                   cOvfP, cOvfC, cOvfF, cZeroMan, cNoRes, cAvg, cFlip, cSphere, cCapsule, cConflict, cEmptyMan, cExact);
 
@@ -757,7 +752,7 @@ PXG_TEST(cvxTriFinish)
             s.contacts[c * 3 + 2] = F4{ q.x, q.y, q.z, 0 };
         }
 
-        const uint32_t total0 = pcExpect + (insertAvg ? nbMan : 0);
+        const uint32_t total0 = pcExpect; // 5.12: no average-point inflation
         const uint32_t initP = 64 * (rng() % 8), initC = 16 * (rng() % 16), initF = 8 * (rng() % 16);
         uint32_t limP = initP + 64 * 20, limC = initC + 16 * 40, limF = initF + 8 * 40;
         const uint32_t v = rng() % 8;
@@ -788,7 +783,7 @@ PXG_TEST(cvxTriFinish)
         if (f & 1u) ++cOvfC;
         if (f & 2u) ++cOvfF;
         if (nbMan == 0) ++cZeroMan;
-        if (nbMan > 0 && pcExpect == 0 && !insertAvg) ++cNoRes;
+        if (nbMan > 0 && pcExpect == 0) ++cNoRes;
         if (insertAvg) ++cAvg;
         if (flip) ++cFlip;
         if (!flip && other == T_SPHERE) ++cSphere;

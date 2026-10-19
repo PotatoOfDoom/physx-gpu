@@ -49,7 +49,8 @@
 //     into friction row 0 if numNormalConstr were 0 with frictions present —
 //     unreachable: the prep's zero-contact early-out also zeroes
 //     numFrictionConstr, so both forms agree on all reachable states.)
-//  2. **p8 is a FIXED 0.8 constant** — the TGS twin reads the header's p8
+//  2. (5.6.1) **p8 was a FIXED 0.8 constant**; 5.12 passes the rigid-contact
+//     bias coefficient in.  The TGS twin reads the header's p8
 //     slot; the PGS contact header has no such field.
 //  3. **The normal update carries the IMPULSE MULTIPLIER**:
 //     _newForce = appliedForce * impulseMul + _deltaF (the TGS twin has no
@@ -322,6 +323,7 @@ public void svpSolveExtContactsBlock(
     Ptr<PxgArticulationBlockResponse> responses,
     out AbSpatialVector impulse0, out AbSpatialVector impulse1,
     inout SvpError error, bool accumulateError,
+    float biasCoefficient,
     float ref0, float ref1)
 {
     AbSpatialVector imp0 = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
@@ -336,7 +338,10 @@ public void svpSolveExtContactsBlock(
 
     // trap 3: the RAW restitution feeds the coefficient recompute
     const float restitution = contactHeaders[batchIndex].restitution[threadIndex];
-    const float p8 = 0.8f;   // trap 2: FIXED (the PGS header has no p8 slot)
+    // trap 2 (5.12): the friction velMultiplier numerator is the CALLER's
+    // rigid-contact bias coefficient (island.mBiasCoefficients.rigidContact /
+    // the kernel argument); 5.6.1 hard-coded p8 = 0.8f here.
+    const float p8 = biasCoefficient;
     const float cfm = contactHeaders[batchIndex].cfm[threadIndex];
     const uint flags = contactHeaders[batchIndex].flags[threadIndex];
 
@@ -687,6 +692,8 @@ struct SvpParams
     float ref1;        // @60
     uint nbLanes;      // @64
     uint flagsWord;    // @68: bit0 accumulateError/residualReporting, bit1 doFriction
+    float biasCoefficient; // @72: 5.12 rigidContact bias (contact entry only)
+    uint pad1;         // @76 -> 80
 }
 
 [[vk::push_constant]]
@@ -750,7 +757,8 @@ void svpContactTest(uint3 groupThreadId : SV_GroupThreadID)
                              Ptr<SvpPgsContactFriction>(gSvp.p1),
                              Ptr<PxgArticulationBlockResponse>(gSvp.responses),
                              imp0, imp1,
-                             err, (gSvp.flagsWord & 1u) != 0u, gSvp.ref0, gSvp.ref1);
+                             err, (gSvp.flagsWord & 1u) != 0u, gSvp.biasCoefficient,
+                             gSvp.ref0, gSvp.ref1);
 
     svpStoreIo(lane, vel0, vel1, imp0, imp1, err);
 }
@@ -854,11 +862,6 @@ struct SvpPartParams
 [[vk::push_constant]]
 ConstantBuffer<SvpPartParams> gSvpPart;
 
-// per-warp residual-reduction scratch: block = (32,2) -> 2 warps
-groupshared float shSvpErrSum[64];
-groupshared float shSvpErrMax[64];
-groupshared uint  shSvpErrCount[64];
-
 [shader("compute")]
 [numthreads(32, 2, 1)]
 void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
@@ -867,7 +870,6 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
     const uint lane = groupThreadId.x;
     const uint warpIndex = groupThreadId.y;
     const uint globalWarpIndex = groupId.x * 2u + warpIndex;
-    const uint threadInBlock = warpIndex * 32u + lane;
 
     Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(gSvpPart.solverCoreDesc);
     Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
@@ -919,7 +921,8 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
         const uint descStride = batch[0].descStride_constraintType & 0xFFFFu;
         const uint constraintType = batch[0].descStride_constraintType >> 16u;
 
-        // trap 19: guard, not return -- the butterfly below needs every lane
+        // trap 19: the lanes >= descStride do nothing (5.6.1 also kept them
+        // for the residual butterfly, gone in 5.12)
         if (lane < descStride)
         {
             const uint nbArticulations = islandPool[0].mArticulationCount;
@@ -1002,7 +1005,9 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
                                          Ptr<SvpPgsContactFriction>(sharedDesc[0].iter_blockFrictions),
                                          Ptr<PxgArticulationBlockResponse>(sharedDesc[0].iter_artiResponse),
                                          impulse0, impulse1,
-                                         error, accumulateError, curRef0, curRef1);
+                                         error, accumulateError,
+                                         islandPool[gSvpPart.islandIndex].mBiasCoefficients.rigidContact,
+                                         curRef0, curRef1);
             }
             else
             {
@@ -1066,39 +1071,6 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
         }
     }
 
-    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp: per-warp butterfly,
-    // then lane 0 of each warp accumulates atomically (the solverPGS
-    // solveBlockPartition arrangement; uniform control flow around barriers)
-    // P9.89: the sum is warpReduction<AddOpPxReal> (gpucommon/src/CUDA/
-    // solverResidual.cuh:85, reduction.cuh:188-199): __shfl_xor_sync at radius
-    // 16, 8, 4, 2, 1, op(own, partner) -- this loop, in that order.  The CUDA's
-    // lanes >= mDescStride `return`ed before it (solver.cu:100-101), so its
-    // FULL_MASK shuffle reads their registers, which PTX leaves undefined.  Here
-    // they carry error = {0, 0, 0}: +0 is the AddOpPxReal identity, and lane 0
-    // only ever reads an exited lane whose whole xor-subtree has exited (the
-    // exited lanes are the suffix descStride..31), so if the hardware hands back
-    // +0 the CUDA's lane 0 holds this tree bit for bit.  Pinned by
-    // testArtiSolvePartitionPgs (seven residual rounds; the radius-1..16 and
-    // linear-sum twins must differ).
-    GroupMemoryBarrierWithGroupSync();
-    shSvpErrSum[threadInBlock] = error.sumOfSquares;
-    shSvpErrMax[threadInBlock] = error.maxError;
-    shSvpErrCount[threadInBlock] = uint(error.counter);
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint radius = 16u; radius > 0u; radius >>= 1)
-    {
-        const uint partner = threadInBlock ^ radius;   // stays inside the warp
-        const float s = shSvpErrSum[partner];
-        const float m = shSvpErrMax[partner];
-        const uint c = shSvpErrCount[partner];
-        GroupMemoryBarrierWithGroupSync();
-        shSvpErrSum[threadInBlock] += s;
-        shSvpErrMax[threadInBlock] = max(shSvpErrMax[threadInBlock], m);
-        shSvpErrCount[threadInBlock] += c;
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    // (5.12: the lane-0 atomic accumulation into
-    // solverDesc->contactErrorAccumulator is gone with the accumulator.)
+    // (5.12: the residual reporting is gone -- no per-warp butterfly and no
+    // lane-0 atomic into solverDesc->contactErrorAccumulator.)
 }

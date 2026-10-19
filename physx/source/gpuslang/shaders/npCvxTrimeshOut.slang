@@ -38,18 +38,13 @@
 //     AND totalNumContacts and rewrites HAS_NO_TOUCH; overflow also NULLs the
 //     three output pointers (modeled as the 0xFFFFFFFE sentinel -- a CUDA
 //     null pointer, distinct from a legitimate 0 byte offset);
-//   - insertAveragePoint adds nbManifolds to totalNumContacts ON LANE 0 ONLY
-//     (cu L190-191): the inflated count enters the reservation sizes, the
-//     stored output->nbContacts and lane 0's faceIndex base, while lanes
-//     1..31 keep the un-inflated popc -- the faceIndex region base
-//     (forceOffset + totalNumContacts*4, cu L290) is therefore PER-LANE
-//     divergent, and lane 0's face-index slot can collide with another
-//     lane's (a genuine unordered intra-warp write conflict in CUDA; the
-//     test masks conflicted words from comparison).  The average contacts
-//     themselves are NEVER written by this kernel (reserved-but-stale slots;
-//     getAvgContactValue at cu L84-98 is dead code);
-//   - a pair with manifolds but zero real contacts and no average insertion
-//     skips the reservation entirely, leaving the offsets 0xFFFFFFFF, yet
+//   - insertAveragePoint is IGNORED since 5.12 (convexMeshOutput.cu
+//     L165-171, PX_UNUSED): 5.6.1 added nbManifolds to totalNumContacts on
+//     lane 0 only, over-reporting nbContacts, reserving average-point slots
+//     it never wrote and making lane 0's faceIndex base diverge.  Now
+//     totalNumContacts is the plain popc on every lane (the hdr.z input is
+//     kept, as the launch signature keeps the parameter);
+//   - a pair with manifolds but zero real contacts skips the reservation entirely, leaving the offsets 0xFFFFFFFF, yet
 //     still passes the L257 gate (nbManifolds != 0, no overflow) and stores
 //     output pointers base + 0xFFFFFFFF (wrapped -- ported exactly); the
 //     hasContacts guards then suppress every stream write;
@@ -194,7 +189,7 @@ void cvxTrimeshOut(uint3 dtid : SV_DispatchThreadID)
 
     uint nbManifolds = s.hdr.x;                    // uniform pre-rollback value
     const uint allflags = s.hdr.y;
-    const bool insertAveragePoint = s.hdr.z != 0u;
+    // s.hdr.z (insertAveragePoint) is unused since 5.12 -- see the header
 
     // per-lane classification
     uint contactMask = 0u;
@@ -224,9 +219,6 @@ void cvxTrimeshOut(uint3 dtid : SV_DispatchThreadID)
     uint totalNumContactsL0 = popcContacts;        // lane 0's private copy
     uint nbManifoldsL0 = nbManifolds;              // lane 0's private copy
     {
-        const uint nbInsertAveragePoint = insertAveragePoint ? nbManifoldsL0 : 0u;
-        totalNumContactsL0 = totalNumContactsL0 + nbInsertAveragePoint;
-
         if (totalNumContactsL0 != 0u)
         {
             patchByteOffset = patchesBytes;   patchesBytes += 64u * nbManifoldsL0;
@@ -298,8 +290,8 @@ void cvxTrimeshOut(uint3 dtid : SV_DispatchThreadID)
     const uint materialIndex0 = s.shapeInfo.z, materialIndex1 = s.shapeInfo.w;
 
     // offsets shfl'd from lane 0 (cu L284-286)
-    // totalNumContacts is NOT shfl'd: lane 0 keeps the inflated value, all
-    // other lanes the plain popc (cu L191 vs L290)
+    // totalNumContacts is NOT shfl'd; since 5.12 every lane past the gate holds
+    // the plain popc (lane 0's copy only changes on overflow, which returned)
 
     for (uint L = 0; L < 32; ++L)
     {

@@ -62,6 +62,7 @@
 #include "PxgSimulationCoreKernelIndices.h"
 #include "PxgSolverBody.h"
 #include "DyArticulationCore.h"
+#include "DyArticulationMimicJointCore.h"
 
 #include <cstring>
 #include <vector>
@@ -84,7 +85,7 @@ namespace pin
 {
 using namespace physx;
 
-static_assert(sizeof(PxgArticulation) == 544, "PXG_ARTI_STRIDE");
+static_assert(sizeof(PxgArticulation) == 496, "PXG_ARTI_STRIDE");
 static_assert(offsetof(PxgArticulationData, index) == 0, "PXG_ARTI_DATA_INDEX");
 static_assert(offsetof(PxgArticulationData, numLinks) == 16, "PXG_ARTI_DATA_NUM_LINKS");
 static_assert(offsetof(PxgArticulationData, numJointDofs) == 18, "PXG_ARTI_DATA_NUM_JOINT_DOFS");
@@ -106,40 +107,40 @@ static_assert(offsetof(PxgArticulation, joints) == 40, "PXG_ARTI_JOINTS");
 static_assert(offsetof(PxgArticulation, jointData) == 48, "PXG_ARTI_JOINT_DATA");
 static_assert(offsetof(PxgArticulation, motionVelocities) == 56, "PXG_ARTI_MOTION_VELOCITIES");
 static_assert(offsetof(PxgArticulation, motionAccelerations) == 64, "PXG_ARTI_MOTION_ACCELERATIONS");
-static_assert(offsetof(PxgArticulation, corioliseVectors) == 80, "PXG_ARTI_CORIOLISE_VECTORS");
+static_assert(offsetof(PxgArticulation, coriolisVectors) == 80, "PXG_ARTI_CORIOLISE_VECTORS");   // 5.12 renamed
 static_assert(offsetof(PxgArticulation, externalAccelerations) == 96, "PXG_ARTI_EXTERNAL_ACCELERATIONS");
-static_assert(offsetof(PxgArticulation, jointPositions) == 112, "PXG_ARTI_JOINT_POSITIONS");
-static_assert(offsetof(PxgArticulation, jointVelocities) == 120, "PXG_ARTI_JOINT_VELOCITIES");
-static_assert(offsetof(PxgArticulation, jointForce) == 136, "PXG_ARTI_JOINT_FORCE");
+static_assert(offsetof(PxgArticulation, jointPositions) == 104, "PXG_ARTI_JOINT_POSITIONS");
+static_assert(offsetof(PxgArticulation, jointVelocities) == 112, "PXG_ARTI_JOINT_VELOCITIES");
+static_assert(offsetof(PxgArticulation, jointForce) == 128, "PXG_ARTI_JOINT_FORCE");
 // P8.89: the per-link 6x6 impulse-response matrices computeMassMatrix1T writes
 // through.  GENERATED, not guessed -- the plan's estimate for this one was off by
 // a hundred bytes, which is precisely why it is pinned here rather than trusted.
-static_assert(offsetof(PxgArticulation, spatialResponseMatrixW) == 176,
+static_assert(offsetof(PxgArticulation, spatialResponseMatrixW) == 168,
               "PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W");
 static_assert(sizeof(PxSpatialMatrix) == 144, "PXG_ARTI_SPATIAL_MATRIX_6X6_SIZE");
 static_assert(sizeof(PxgSpatialMatrix6x6Block) == 4608, "the 6x6 block is 9 float4 columns");
-static_assert(offsetof(PxgArticulation, jointTargetPositions) == 144, "PXG_ARTI_JOINT_TARGET_POSITIONS");
-static_assert(offsetof(PxgArticulation, jointTargetVelocities) == 152, "PXG_ARTI_JOINT_TARGET_VELOCITIES");
-static_assert(offsetof(PxgArticulation, linkBody2Worlds) == 184, "PXG_ARTI_LINK_BODY2WORLDS");
-static_assert(offsetof(PxgArticulation, linkBody2Actors) == 200, "PXG_ARTI_LINK_BODY2ACTORS");
-static_assert(offsetof(PxgArticulation, parents) == 208, "PXG_ARTI_PARENTS");
-static_assert(offsetof(PxgArticulation, linkWakeCounters) == 240, "PXG_ARTI_LINK_WAKE_COUNTERS");
-static_assert(offsetof(PxgArticulation, linkSleepData) == 248, "PXG_ARTI_LINK_SLEEP_DATA");
-static_assert(offsetof(PxgArticulation, linkProps) == 256, "PXG_ARTI_LINK_PROPS");
-static_assert(offsetof(PxgArticulation, children) == 264, "PXG_ARTI_CHILDREN");
-static_assert(offsetof(PxgArticulation, pathToRoot) == 272, "PXG_ARTI_PATH_TO_ROOT");
-static_assert(offsetof(PxgArticulation, spatialTendonParams) == 304, "PXG_ARTI_SPATIAL_TENDON_PARAMS");
-static_assert(offsetof(PxgArticulation, spatialTendons) == 312, "PXG_ARTI_SPATIAL_TENDONS");
-static_assert(offsetof(PxgArticulation, fixedTendonParams) == 320, "PXG_ARTI_FIXED_TENDON_PARAMS");
-static_assert(offsetof(PxgArticulation, fixedTendons) == 328, "PXG_ARTI_FIXED_TENDONS");
-static_assert(offsetof(PxgArticulation, mimicJointCores) == 352, "PXG_ARTI_MIMIC_JOINT_CORES");
+static_assert(offsetof(PxgArticulation, jointTargetPositions) == 136, "PXG_ARTI_JOINT_TARGET_POSITIONS");
+static_assert(offsetof(PxgArticulation, jointTargetVelocities) == 144, "PXG_ARTI_JOINT_TARGET_VELOCITIES");
+static_assert(offsetof(PxgArticulation, linkBody2Worlds) == 176, "PXG_ARTI_LINK_BODY2WORLDS");
+static_assert(offsetof(PxgArticulation, linkBody2Actors) == 192, "PXG_ARTI_LINK_BODY2ACTORS");
+static_assert(offsetof(PxgArticulation, parents) == 200, "PXG_ARTI_PARENTS");
+static_assert(offsetof(PxgArticulation, linkWakeCounters) == 224, "PXG_ARTI_LINK_WAKE_COUNTERS");
+static_assert(offsetof(PxgArticulation, linkSleepData) == 232, "PXG_ARTI_LINK_SLEEP_DATA");
+static_assert(offsetof(PxgArticulation, linkProps) == 240, "PXG_ARTI_LINK_PROPS");
+static_assert(offsetof(PxgArticulation, children) == 248, "PXG_ARTI_CHILDREN");
+static_assert(offsetof(PxgArticulation, pathToRoot) == 256, "PXG_ARTI_PATH_TO_ROOT");
+static_assert(offsetof(PxgArticulation, spatialTendonParams) == 288, "PXG_ARTI_SPATIAL_TENDON_PARAMS");
+static_assert(offsetof(PxgArticulation, spatialTendons) == 296, "PXG_ARTI_SPATIAL_TENDONS");
+static_assert(offsetof(PxgArticulation, fixedTendonParams) == 304, "PXG_ARTI_FIXED_TENDON_PARAMS");
+static_assert(offsetof(PxgArticulation, fixedTendons) == 312, "PXG_ARTI_FIXED_TENDONS");
+static_assert(offsetof(PxgArticulation, mimicJointCores) == 336, "PXG_ARTI_MIMIC_JOINT_CORES");
 
 static_assert(sizeof(PxgArticulationLink) == 80, "PXG_ARTI_LINK_SIZE");
 static_assert(sizeof(PxgArticulationLinkProp) == 16, "PXG_ARTI_LINK_PROP_SIZE");
 static_assert(sizeof(PxgArticulationLinkSleepData) == 32, "PXG_ARTI_LINK_SLEEP_DATA_SIZE");
 static_assert(sizeof(Dy::ArticulationBitField) == 8, "PXG_ARTI_BITFIELD_SIZE");
 static_assert(sizeof(PxTransform) == 28, "PXG_ARTI_TRANSFORM_SIZE");
-static_assert(sizeof(Dy::ArticulationJointCore) == 544, "PXG_ARTI_JOINT_CORE_SIZE");
+static_assert(sizeof(Dy::ArticulationJointCore) == 512, "PXG_ARTI_JOINT_CORE_SIZE");
 static_assert(sizeof(Dy::ArticulationJointCoreData) == 8, "PXG_ARTI_JOINT_CORE_DATA_SIZE");
 static_assert(sizeof(Cm::UnAlignedSpatialVector) == 24, "PXG_ARTI_SPATIAL_VECTOR_SIZE");
 static_assert(sizeof(Dy::ArticulationMimicJointCore) == 32, "PXG_ARTI_MIMIC_JOINT_CORE_SIZE");
@@ -154,8 +155,6 @@ static_assert(sizeof(PxGpuFixedTendonData) == 32, "PXG_ARTI_FIXED_TENDON_DATA_SI
 static_assert(offsetof(PxgArticulationTendon, mFixedElements) == 0, "PXG_TENDON_FIXED_ELEMENTS");
 static_assert(offsetof(PxgArticulationTendon, mModElements) == 8, "PXG_TENDON_MOD_ELEMENTS");
 static_assert(offsetof(PxgArticulationTendon, mNbElements) == 16, "PXG_TENDON_NB_ELEMENTS");
-static_assert(offsetof(PxgArticulation, rootPreMotionVelocity) == 104,
-              "PXG_ARTI_ROOT_PRE_MOTION_VELOCITY");
 
 static_assert(sizeof(PxgArticulationSimUpdate) == 48, "PxgArticulationSimUpdateGpu stride");
 static_assert(offsetof(PxgArticulationSimUpdate, dirtyFlags) == 0, "dirtyFlags");
@@ -337,7 +336,7 @@ PXG_TEST(newArticulations)
         s.oChildren = ar.take(8u * s.nbLinks + guard);
         s.oB2W = ar.take(28u * s.nbLinks + guard);
         s.oB2A = ar.take(28u * s.nbLinks + guard);
-        s.oJoints = ar.take(544u * s.nbLinks + guard);
+        s.oJoints = ar.take(uint32_t(sizeof(Dy::ArticulationJointCore)) * s.nbLinks + guard);
         s.oJointData = ar.take(8u * s.nbLinks + guard);
         s.oSpatialTendons = ar.take(24u * s.nbSpatial + guard);
         s.oSpatialParams = ar.take(16u * s.nbSpatial + guard);
@@ -371,7 +370,7 @@ PXG_TEST(newArticulations)
     std::vector<uint8_t> pLinks(80u * LINK_POOL), pWake(4u * LINK_POOL), pProps(16u * LINK_POOL);
     std::vector<uint8_t> pParents(4u * LINK_POOL), pChildren(8u * LINK_POOL);
     std::vector<uint8_t> pB2W(28u * LINK_POOL), pB2A(28u * LINK_POOL);
-    std::vector<uint8_t> pJoints(544u * LINK_POOL), pJointData(8u * LINK_POOL);
+    std::vector<uint8_t> pJoints(uint32_t(sizeof(Dy::ArticulationJointCore)) * LINK_POOL), pJointData(8u * LINK_POOL);
     std::vector<uint8_t> pExtAccel(24u * LINK_POOL);
     patternFill(pLinks, 1); patternFill(pWake, 2); patternFill(pProps, 3);
     patternFill(pParents, 4); patternFill(pChildren, 5);
@@ -471,7 +470,7 @@ PXG_TEST(newArticulations)
         rec.pathToRoot = reinterpret_cast<PxU32*>(dAr + s.oPathToRoot);
         rec.motionVelocities = reinterpret_cast<Cm::UnAlignedSpatialVector*>(dAr + s.oMotionVel);
         rec.motionAccelerations = reinterpret_cast<Cm::UnAlignedSpatialVector*>(dAr + s.oMotionAccel);
-        rec.corioliseVectors = reinterpret_cast<Cm::UnAlignedSpatialVector*>(dAr + s.oCoriolise);
+        rec.coriolisVectors = reinterpret_cast<Cm::UnAlignedSpatialVector*>(dAr + s.oCoriolise);
         rec.linkSleepData = reinterpret_cast<PxgArticulationLinkSleepData*>(dAr + s.oLinkSleep);
         rec.jointPositions = reinterpret_cast<PxReal*>(dAr + s.oJointPos);
         rec.jointVelocities = reinterpret_cast<PxReal*>(dAr + s.oJointVel);
@@ -669,8 +668,8 @@ PXG_TEST(newArticulations)
         guardIntact(n("body2Worlds"), s.oB2W, 28u * s.nbLinks);
         copied(n("body2Actors"), s.oB2A, pB2A, 28u * s.linkStart, 28u * s.nbLinks);
         guardIntact(n("body2Actors"), s.oB2A, 28u * s.nbLinks);
-        copied(n("joints"), s.oJoints, pJoints, 544u * s.linkStart, 544u * s.nbLinks);
-        guardIntact(n("joints"), s.oJoints, 544u * s.nbLinks);
+        copied(n("joints"), s.oJoints, pJoints, uint32_t(sizeof(Dy::ArticulationJointCore)) * s.linkStart, uint32_t(sizeof(Dy::ArticulationJointCore)) * s.nbLinks);
+        guardIntact(n("joints"), s.oJoints, uint32_t(sizeof(Dy::ArticulationJointCore)) * s.nbLinks);
         copied(n("jointData"), s.oJointData, pJointData, 8u * s.linkStart, 8u * s.nbLinks);
         guardIntact(n("jointData"), s.oJointData, 8u * s.nbLinks);
         copied(n("pathToRoot"), s.oPathToRoot, pPathToRoot, 4u * s.pathStart, 4u * s.numPathToRoots);

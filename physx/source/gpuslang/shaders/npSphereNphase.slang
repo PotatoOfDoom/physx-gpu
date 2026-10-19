@@ -307,15 +307,18 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
         InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * nbContacts, fOff);
         contactByteOffset = cOff;
         uint forceOffset = fOff;
-        if ((cOff + CONTACT_SIZE) > gParams.contactBytesLimit)
+        // 5.12 (contactPatchUtils.cuh:27-38): the WHOLE reservation is tested
+        // (size_t sums in the CUDA), and a force overflow also drops the contacts.
+        if ((uint64_t(cOff) + uint64_t(CONTACT_SIZE) * uint64_t(nbContacts)) > uint64_t(gParams.contactBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
             contactByteOffset = INVALID;
         }
-        if ((fOff + FORCE_SIZE) > gParams.forceBytesLimit)
+        if ((uint64_t(fOff) + uint64_t(FORCE_SIZE) * uint64_t(nbContacts)) > uint64_t(gParams.forceBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
             forceOffset = INVALID;
+            contactByteOffset = INVALID;
         }
         if (contactByteOffset != INVALID)
         {
@@ -330,17 +333,23 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
     }
 
     // --- registerContactPatch ---
+    // 5.12 (contactPatchUtils.cuh:59-62): preserve patch demand even if the
+    // contact or force allocation failed; the pair then reports no contacts,
+    // reserves its patch anyway and returns the patch index as invalid.
+    const bool patchRequested = nbContacts > 0u;
+    const uint nbContactsReg = (patchRequested && (cmOutputs[workIndex].contactPoints == 0uL ||
+                               cmOutputs[workIndex].contactForces == 0uL)) ? 0u : nbContacts;
     const uint allflags = cmOutputs[workIndex].allflagsWord;
     const uint oldStatusFlags = (allflags >> 16u) & 0xffu;    // statusFlag byte
     uint statusFlags = oldStatusFlags & (~FLAG_TOUCH_KNOWN);
-    if (nbContacts != 0u) statusFlags |= FLAG_HAS_TOUCH;
+    if (nbContactsReg != 0u) statusFlags |= FLAG_HAS_TOUCH;
     else                  statusFlags |= FLAG_HAS_NO_TOUCH;
 
     const uint prevPatches = (allflags >> 8u) & 0xffu;        // current nbPatches byte
     const bool previouslyHadTouch = (oldStatusFlags & FLAG_HAS_TOUCH) != 0u;
     const bool prevTouchKnown = (oldStatusFlags & FLAG_TOUCH_KNOWN) != 0u;
-    const uint numPatches = (nbContacts > 0u) ? 1u : 0u;
-    const bool currentlyHasTouch = nbContacts > 0u;
+    const uint numPatches = (nbContactsReg > 0u) ? 1u : 0u;
+    const bool currentlyHasTouch = nbContactsReg > 0u;
     const bool change = (previouslyHadTouch != currentlyHasTouch) || (!prevTouchKnown);
 
     touchChangeFlags[workIndex] = change ? 1u : 0u;
@@ -350,11 +359,11 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
         (prevPatches << 24u) | (statusFlags << 16u) | (numPatches << 8u);
     {
         const uint nf = cmOutputs[workIndex].nbContacts_flags;
-        cmOutputs[workIndex].nbContacts_flags = (nf & 0xffff0000u) | (nbContacts & 0xffffu);
+        cmOutputs[workIndex].nbContacts_flags = (nf & 0xffff0000u) | (nbContactsReg & 0xffffu);
     }
 
     uint patchIndex = INVALID;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         InterlockedAdd(counters[0].patchesBytes, PATCH_SIZE, patchIndex);
         if ((patchIndex + PATCH_SIZE) > gParams.patchBytesLimit)
@@ -369,10 +378,12 @@ void sphereNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
             touchChangeFlags[workIndex] = previouslyHadTouch ? 1u : 0u;
             patchChangeFlags[workIndex] = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (nbContactsReg != 0u)
         {
             cmOutputs[workIndex].contactPatches = gParams.startContactPatches + uint64_t(patchIndex);
         }
+        else
+            patchIndex = INVALID;
     }
 
     // --- insertIntoPatchStream ---

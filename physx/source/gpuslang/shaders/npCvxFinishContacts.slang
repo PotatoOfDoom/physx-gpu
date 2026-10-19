@@ -375,6 +375,7 @@ void finishContactsKernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThread
                     uint prev;
                     InterlockedOr(counters[0].overflowError, FORCE_BUFFER_OVERFLOW, prev);
                     forceByteOffset0 = 0xFFFFFFFFu;
+                    contactByteOffset0 = 0xFFFFFFFFu; // 5.12 (cudaGJKEPA.cu:1780)
                 }
             }
         }

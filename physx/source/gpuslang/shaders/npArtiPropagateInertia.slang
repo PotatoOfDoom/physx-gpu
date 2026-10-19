@@ -212,13 +212,19 @@ public void apiComputeIs(uint dofs, AbSpatialMatrix spatialInertia, uint64_t dof
 // computePropagateSpatialInertia_ZA_ZIc (forwardDynamic2.cu:1401)
 // ---------------------------------------------------------------------------
 //
-// `jF` is a POINTER in the CUDA and NULL when
-// `isExternalForcesEveryTgsIterationEnabled` is set, in which case the joint force
-// reads as zero.  It is carried here as a device address where **0 means NULL**,
-// which is the natural port and the reason the null test is a real branch rather
-// than a flag.
+// `jF` is a POINTER in the CUDA.  It is carried here as a device address where
+// **0 means NULL**, which is the natural port and the reason the null test is a
+// real branch rather than a flag.
+//
+// 5.12: the wrapper always passes jF now (5.6.1 passed NULL under
+// `isExternalForcesEveryTgsIterationEnabled`), and the flag comes in as its own
+// argument instead: it zeroes the joint force in qstZIcInternal only, while the
+// raw per-dof force is parked in mConstraintData.mExternalEffort either way (the
+// solver reads it from there instead of from articulation.jointForce).
 public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint64_t dofBlocks,
-                                                       AbSpatialVector msIs[3], uint64_t jF,
+                                                       AbSpatialVector msIs[3],
+                                                       bool isExternalForcesEveryTgsIterationEnabled,
+                                                       uint64_t jF,
                                                        AbSpatialVector Z, AbSpatialVector ZIcInt,
                                                        inout AbSpatialVector ZA,
                                                        inout AbSpatialVector ZAInt, uint lane)
@@ -256,10 +262,14 @@ public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint6
 
         // qstZ ignores the joint force; qstZIcInternal does not
         const float qstZ = -stZ;
-        const float qstZIcInternal = ((jF != 0) ? (Ptr<float>(jF))[0] : 0.0f) - stZInt;
+        const float qstZIcInternal =
+            ((!isExternalForcesEveryTgsIterationEnabled && jF != 0) ? (Ptr<float>(jF))[0] : 0.0f) - stZInt;
 
         abStoreF32(dof0, PXG_AB_DOF_mQstZ, lane, qstZ);
         abStoreF32(dof0, PXG_AB_DOF_mQstZIcInternal, lane, qstZIcInternal);
+        // `jF ? jF[0] : 0.0` -- a double literal in the CUDA, exact either way
+        abStoreF32(dof0 + PXG_AB_DOF_mConstraintData, PXG_AB_IC_mExternalEffort, lane,
+                   (jF != 0) ? (Ptr<float>(jF))[0] : 0.0f);
 
         ZA = asmSVecAdd(ZA, asmSVecScale(isInvD, qstZ));
         ZAInt = asmSVecAdd(ZAInt, asmSVecScale(isInvD, qstZIcInternal));
@@ -311,12 +321,15 @@ public AbSpatialMatrix apiPropagateSpatialInertiaZaZIc(uint64_t linkBlock, uint6
                 const float stZInt = asmInnerProduct(sa, ZIcInt);
 
                 const float qstZ = -stZ;
-                const float qstZicInt = ((jF != 0) ? (Ptr<float>(jF))[ind2] : 0.0f) - stZInt;
+                const float qstZicInt =
+                    ((!isExternalForcesEveryTgsIterationEnabled && jF != 0) ? (Ptr<float>(jF))[ind2] : 0.0f) - stZInt;
 
                 qstZG[ind2] = qstZ;
                 qstZIcIntG[ind2] = qstZicInt;
                 abStoreF32(dof, PXG_AB_DOF_mQstZ, lane, qstZ);
                 abStoreF32(dof, PXG_AB_DOF_mQstZIcInternal, lane, qstZicInt);
+                abStoreF32(dof + PXG_AB_DOF_mConstraintData, PXG_AB_IC_mExternalEffort, lane,
+                           (jF != 0) ? (Ptr<float>(jF))[ind2] : 0.0f);
             }
         }
 
@@ -508,7 +521,7 @@ void artiPropagateInertia(uint3 groupThreadId : SV_GroupThreadID)
 
     apiComputeIs(dofs, spatialInertia, dofBlocks, lane, Is);
 
-    const AbSpatialMatrix r = apiPropagateSpatialInertiaZaZIc(linkBlock, dofBlocks, Is, jF,
+    const AbSpatialMatrix r = apiPropagateSpatialInertiaZaZIc(linkBlock, dofBlocks, Is, false, jF,
                                                               Z, ZIcInt, ZA, ZAInt, lane);
 
     apiStoreVec(s, 12u, ZA);
@@ -614,8 +627,8 @@ public void apiComputeArticulatedSpatialInertiaW(uint numLinks, uint64_t linkBlo
         AbSpatialVector translatedZA = spatialZA;
         AbSpatialVector translatedZAInt = ZIcInt;
 
-        // NULL when the external forces are applied every TGS iteration
-        const uint64_t jF = extEveryIter ? 0 : (jointForces + uint64_t(jointOffset) * 4);
+        // 5.12: never NULL here any more; the flag travels separately
+        const uint64_t jF = jointForces + uint64_t(jointOffset) * 4;
 
         // the CUDA leaves msIs uninitialised; nothing reads an entry at or beyond
         // `dof`, and the seed here is deliberately not zero so that a dropped guard
@@ -632,7 +645,7 @@ public void apiComputeArticulatedSpatialInertiaW(uint numLinks, uint64_t linkBlo
 
         AbSpatialMatrix spatialInertiaW =
             asmSub(articulatedInertia,
-                   apiPropagateSpatialInertiaZaZIc(blk, dofData, msIs, jF, spatialZA, ZIcInt,
+                   apiPropagateSpatialInertiaZaZIc(blk, dofData, msIs, extEveryIter, jF, spatialZA, ZIcInt,
                                                    translatedZA, translatedZAInt, lane));
 
         // shift the children's accumulated zero-acceleration forces to the parent

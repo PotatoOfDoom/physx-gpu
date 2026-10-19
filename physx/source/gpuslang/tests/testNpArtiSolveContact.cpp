@@ -45,7 +45,6 @@ using namespace pxgtest;
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 
-static const float P8 = 0.8f;
 static const float PX_EPS_REAL = 1.192092896e-07f;
 static const uint32_t CONTACT_FLAG_ACCEL_SPRING = 1u << 4; // 5.12 PxgSolverContactFlags (5.6.1: 1 << 3)
 
@@ -209,7 +208,8 @@ static void refAscPGS(const AscIn& s, AscOut& o, RefStats& st)
             const float resp0 = f.frm.y, resp1 = f.frm.z;
 
             const float respF = ref0 * resp0 + ref1 * resp1;
-            const float velMultiplier = (respF > PX_EPS_REAL) ? (P8 / respF) : 0.f;
+            // 5.12: biasCoefficient (island rigidContact bias), 5.6.1's fixed 0.8
+            const float velMultiplier = (respF > PX_EPS_REAL) ? (s.refs.z / respF) : 0.f;
             if (!(respF > PX_EPS_REAL)) st.epsGuard = true;
 
             const float dvATop[3] = { ref0 * f.dRA.w, ref0 * f.dRA2.x, ref0 * f.dRA2.y };
@@ -297,7 +297,9 @@ PXG_TEST(npArtiSolveContact_pgs)
 
         const bool refScale = (i % 5 == 2);
         if (refScale) ++cRefScale;
-        s.refs = F4{ refScale ? rf(0.3f, 1.5f) : 1.f, refScale ? rf(0.3f, 1.5f) : 1.f, 0.f, 0.f };
+        // refs.z: the 5.12 rigid-contact bias coefficient (0.8 is the PGS default)
+        s.refs = F4{ refScale ? rf(0.3f, 1.5f) : 1.f, refScale ? rf(0.3f, 1.5f) : 1.f,
+                     (i % 3 == 0) ? 0.8f : rf(0.1f, 0.9f), 0.f };
         s.invMassAngDom = F4{ rf(0.f, 1.5f), rf(0.f, 1.5f), rf(0.f, 1.5f), rf(0.f, 1.5f) };
 
         float n[3] = { rf(-1, 1), rf(-1, 1), rf(-1, 1) };

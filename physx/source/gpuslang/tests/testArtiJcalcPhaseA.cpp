@@ -40,8 +40,9 @@
 //   link 2  spherical  2 dof   jointOffset 1   <- jointOffset != linkID from here
 //   link 3  prismatic  1 dof   jointOffset 3
 //
-// so `totalDofs` accumulates 0 -> 1 -> 3 and a shader that used `linkID` as its
-// axis index, or forgot to accumulate, writes to the wrong slots.  Link 3 also
+// (5.12 keeps the joint axes in a local [3] array -- no record jointAxis, no
+// totalDofs accumulation -- so only the motion matrices / relative quats carry
+// them out.)  Link 3 also
 // has `jCalcUpdateFrames` CLEAR, which the engine treats as "frames already
 // current": its relative quat and motion matrix must stay untouched while its
 // joint offset and cfm are still written.
@@ -144,24 +145,22 @@ PXG_TEST(artiJcalcPhaseA)
         joints.push_back(j);
     }
 
-    const size_t AXIS_BYTES = TOTAL_DOFS * sizeof(Cm::UnAlignedSpatialVector);
     const size_t MM_BYTES = NB_LINKS * sizeof(SpatialSubspaceMatrix);
     const size_t GUARD = 64;
 
     PxgDevicePtr dLinks = 0, dProps = 0, dJoints = 0, dJData = 0;
-    PxgDevicePtr dAxis = 0, dMM = 0, dRQ = 0, dOff = 0, dScale = 0, dCfms = 0, dArti = 0;
+    PxgDevicePtr dMM = 0, dRQ = 0, dOff = 0, dScale = 0, dCfms = 0, dArti = 0;
     shim.memAlloc(&dLinks, links.size() * sizeof(PxgArticulationLink));
     shim.memAlloc(&dProps, props.size() * sizeof(PxgArticulationLinkProp));
     shim.memAlloc(&dJoints, NB_LINKS * sizeof(ArticulationJointCore));
     shim.memAlloc(&dJData, jdata.size() * sizeof(ArticulationJointCoreData));
-    shim.memAlloc(&dAxis, AXIS_BYTES + GUARD);
     shim.memAlloc(&dMM, MM_BYTES + GUARD);
     shim.memAlloc(&dRQ, NB_LINKS * sizeof(PxQuat) + GUARD);
     shim.memAlloc(&dOff, NB_LINKS * 4 + GUARD);
     shim.memAlloc(&dScale, NB_LINKS * 4 + GUARD);
     shim.memAlloc(&dCfms, NB_LINKS * 4 + GUARD);
     shim.memAlloc(&dArti, sizeof(PxgArticulation));
-    if (!dLinks || !dProps || !dJoints || !dJData || !dAxis || !dMM || !dRQ || !dOff ||
+    if (!dLinks || !dProps || !dJoints || !dJData || !dMM || !dRQ || !dOff ||
         !dScale || !dCfms || !dArti)
     {
         std::printf("  NOTE: no BDA -> skip\n");
@@ -176,7 +175,6 @@ PXG_TEST(artiJcalcPhaseA)
     rec.linkProps = reinterpret_cast<PxgArticulationLinkProp*>(dProps);
     rec.joints = reinterpret_cast<ArticulationJointCore*>(dJoints);
     rec.jointData = reinterpret_cast<ArticulationJointCoreData*>(dJData);
-    rec.jointAxis = reinterpret_cast<Cm::UnAlignedSpatialVector*>(dAxis);
     rec.motionMatrix = reinterpret_cast<SpatialSubspaceMatrix*>(dMM);
     rec.relativeQuat = reinterpret_cast<PxQuat*>(dRQ);
     rec.jointOffsets = reinterpret_cast<PxU32*>(dOff);
@@ -206,11 +204,9 @@ PXG_TEST(artiJcalcPhaseA)
     for (const Sub& sub : subs)
     {
         // ---- fresh poisoned destinations and a fresh joint array every run ----
-        std::vector<uint8_t> poisonAxis(AXIS_BYTES + GUARD, 0xAB);
         std::vector<uint8_t> poisonMM(MM_BYTES + GUARD, 0xAB);
         std::vector<uint8_t> poisonRQ(NB_LINKS * sizeof(PxQuat) + GUARD, 0xAB);
         std::vector<uint8_t> poison4(NB_LINKS * 4 + GUARD, 0xAB);
-        shim.memcpyHtoD(dAxis, poisonAxis.data(), poisonAxis.size());
         shim.memcpyHtoD(dMM, poisonMM.data(), poisonMM.size());
         shim.memcpyHtoD(dRQ, poisonRQ.data(), poisonRQ.size());
         shim.memcpyHtoD(dOff, poison4.data(), poison4.size());
@@ -231,7 +227,6 @@ PXG_TEST(artiJcalcPhaseA)
         shim.streamSynchronize();
 
         // ---- the ORACLE: the engine's own functions, on the host ----
-        std::vector<uint8_t> wantAxis(AXIS_BYTES + GUARD, 0xAB);
         std::vector<uint8_t> wantMM(MM_BYTES + GUARD, 0xAB);
         std::vector<uint8_t> wantRQ(NB_LINKS * sizeof(PxQuat) + GUARD, 0xAB);
         std::vector<uint8_t> wantOff(NB_LINKS * 4 + GUARD, 0xAB);
@@ -256,7 +251,6 @@ PXG_TEST(artiJcalcPhaseA)
                 std::memcpy(wantCfms.data(), &c0, 4);
             }
 
-            uint32_t totalDofs = 0;
             for (uint32_t linkID = 1; linkID < NB_LINKS; ++linkID)
             {
                 const uint32_t dof = spec[linkID].dof;
@@ -273,9 +267,6 @@ PXG_TEST(artiJcalcPhaseA)
                             axis[k][ind] = 1.0f;
                     }
                 }
-                for (uint32_t k = 0; k < dof; ++k)
-                    std::memcpy(wantAxis.data() + (totalDofs + k) * sizeof(Cm::UnAlignedSpatialVector),
-                                &axis[k], sizeof(Cm::UnAlignedSpatialVector));
 
                 if (spec[linkID].updateFrames)
                 {
@@ -304,7 +295,6 @@ PXG_TEST(artiJcalcPhaseA)
                     const float c = linkInvMass[linkID] * scale[linkID];
                     std::memcpy(wantCfms.data() + linkID * 4, &c, 4);
                 }
-                totalDofs += dof;
             }
         }
 
@@ -327,7 +317,6 @@ PXG_TEST(artiJcalcPhaseA)
                 }
             }
         };
-        region("jointAxis", dAxis, wantAxis);
         region("motionMatrix", dMM, wantMM);
         region("relativeQuat", dRQ, wantRQ);
         region("jointOffsets", dOff, wantOff);

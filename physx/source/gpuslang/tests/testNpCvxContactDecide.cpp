@@ -27,7 +27,8 @@
 // Verification of npCvxContactDecide.slang: the front half of
 // generateConvexContacts (cudaGJKEPA.cu L858-887).  Computes localNor over the
 // pre-add manifold, adds the GJK/EPA witness contact via addManifoldPoint, then
-// derives fullContactGen = (0.707 > localNor.dot(-normal)) || (numContacts<4).
+// derives fullContactGen = (initialNbContacts > 1) || (0.707 > localNor.dot(-normal))
+// || (numContacts<4) (the first term is 5.12's PCM jitter fix, cudaGJKEPA.cu:864).
 // The reference transcribes the CUDA; manifold slots + numContacts are exact,
 // localNor to tolerance, fullContactGen exact, with reduce/match near-ties and
 // the 0.707 boundary margin-skipped.
@@ -45,7 +46,7 @@ using namespace pxgtest;
 
 struct F4 { float x, y, z, w; };
 struct V3 { float x, y, z; };
-struct DecIn { F4 mA[4], mB[4], mNp[4], witnessA, witnessB, normal, aToBq, aToBp; uint32_t numContacts, pad0, pad1, pad2; };
+struct DecIn { F4 mA[4], mB[4], mNp[4], witnessA, witnessB, normal, aToBq, aToBp; uint32_t numContacts, initialNbContacts, pad1, pad2; };
 struct DecOut { F4 mA[4], mB[4], mNp[4], localNor; uint32_t numContacts, fullContactGen, pad0, pad1; };
 
 const float FLTMAX = 3.4028235e38f;
@@ -162,7 +163,8 @@ static void refDecide(const DecIn& s, DecOut& o, bool& marg)
     // 3. fullContactGen (post-add count)
     const float align = dot3(localNor, mul(normal, -1.f));
     if (std::fabs(0.707106781f - align) < TIE) marg = true; // 0.707 boundary near-tie
-    const bool fullContactGen = (0.707106781f > align) || (numContacts < 4);
+    // 5.12 cudaGJKEPA.cu:864-865: `ss_scratch.initialNbContacts > 1` in front (PCM jitter fix)
+    const bool fullContactGen = (s.initialNbContacts > 1) || (0.707106781f > align) || (numContacts < 4);
 
     for (uint32_t j = 0; j < 4; ++j)
     {
@@ -188,7 +190,7 @@ PXG_TEST(npCvxContactDecide_decide)
     std::vector<DecIn> in(N);
     std::vector<uint8_t> skip(N, 0);
     std::vector<DecOut> ref(N);
-    size_t nSkip = 0, pMatch = 0, pAppend = 0, pReduce = 0, fcT = 0, fcF = 0;
+    size_t nSkip = 0, pMatch = 0, pAppend = 0, pReduce = 0, fcT = 0, fcF = 0, fcJitter = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -198,6 +200,9 @@ PXG_TEST(npCvxContactDecide_decide)
         const uint32_t scen = i % 3; // 0 append, 1 match, 2 reduce
         if (scen == 2) nc = 4; else nc = (scen == 1) ? (1 + rng() % 4) : (rng() % 4);
         s.numContacts = nc;
+        // stage 1's pre-refresh count: 0 or 1 mostly (the 5.6.1 predicate decides),
+        // 2..4 in every fourth case (the 5.12 term forces the full gen)
+        s.initialNbContacts = (i % 4 == 3) ? 2u + rng() % 3u : rng() % 2u;
 
         // half the time make manifold normals coherent about a common axis and
         // set the separating normal ~ -axis, so localNor.dot(-normal) ~ 1 (>0.707)
@@ -262,6 +267,12 @@ PXG_TEST(npCvxContactDecide_decide)
         if (marg) { ++nSkip; continue; }
         // path bookkeeping uses the reference's realized behaviour
         if (ref[i].fullContactGen) ++fcT; else ++fcF;
+        {
+            // the cases where only the 5.12 term turns the full gen on
+            const F4 n = s.normal; const F4 l = ref[i].localNor;
+            const float align = l.x * -n.x + l.y * -n.y + l.z * -n.z;
+            if (s.initialNbContacts > 1 && !(0.707106781f > align) && !(ref[i].numContacts < 4)) ++fcJitter;
+        }
         if (scen == 1 && nc > 0) ++pMatch; else if (nc < 4) ++pAppend; else ++pReduce;
     }
 
@@ -296,6 +307,7 @@ PXG_TEST(npCvxContactDecide_decide)
     PXG_CHECK_MSG(pMatch > N / 20 && pAppend > N / 20 && pReduce > N / 20,
                   "contactDecide: path coverage thin (match %zu / append %zu / reduce %zu)", pMatch, pAppend, pReduce);
     PXG_CHECK_MSG(fcT > N / 20 && fcF > N / 20, "contactDecide: fullContactGen coverage thin (T %zu / F %zu)", fcT, fcF);
+    PXG_CHECK_MSG(fcJitter > N / 100, "contactDecide: the 5.12 initialNbContacts > 1 term never decides (%zu)", fcJitter);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

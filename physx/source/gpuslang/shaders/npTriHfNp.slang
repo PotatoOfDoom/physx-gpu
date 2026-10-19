@@ -270,10 +270,12 @@ void thNarrowphase(uint3 dtid : SV_DispatchThreadID)
         retainedCount = k2;
     }
 
-    // contact-stream tail; FAITHFUL upstream quirks: the overflow checks
-    // test ONE element (not nbContacts * 16 / * 4), the force check is an
-    // ELSE-IF (skipped when the contact buffer overflowed), and nbContacts
-    // is never zeroed — a poisoned pair only NULLs the output pointers
+    // contact-stream tail (trimeshCollision.cu:598-620, 5.12): the overflow
+    // checks cover the WHOLE reservation (offset + 16 * nbContacts / + 4 *
+    // nbContacts, size_t sums in the CUDA), both checks run (the 5.6.1 force
+    // check was an else-if), and a force overflow also poisons the contact
+    // offset.  nbContacts is still never zeroed here -- a poisoned pair only
+    // NULLs the output pointers, and registerContactPatch zeroes its own copy
     const uint nbContacts = retainedCount;
     uint contactByteOffset = 0xFFFFFFFFu;
     uint forceAndIndiceByteOffset = 0xFFFFFFFFu;
@@ -281,15 +283,16 @@ void thNarrowphase(uint3 dtid : SV_DispatchThreadID)
     {
         InterlockedAdd(gCounters[0], 16u * nbContacts, contactByteOffset);
         InterlockedAdd(gCounters[1], 4u * nbContacts, forceAndIndiceByteOffset);
-        if ((contactByteOffset + 16u) > gParams.contactBytesLimit)
+        if ((uint64_t(contactByteOffset) + 16uL * uint64_t(nbContacts)) > uint64_t(gParams.contactBytesLimit))
         {
             InterlockedOr(gCounters[2], OVERFLOW_CONTACT);
             contactByteOffset = 0xFFFFFFFFu;
         }
-        else if ((forceAndIndiceByteOffset + 4u) > gParams.forceBytesLimit)
+        if ((uint64_t(forceAndIndiceByteOffset) + 4uL * uint64_t(nbContacts)) > uint64_t(gParams.forceBytesLimit))
         {
             InterlockedOr(gCounters[2], OVERFLOW_FORCE);
             forceAndIndiceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu;
         }
     }
     uint4 rec;

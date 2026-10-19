@@ -32,13 +32,15 @@
 //
 // Entry ccoWriteContacts (cu L177-290, the PxContact-array variant used by the
 // plane and convex-convex kernels):
-//   - contact/force reservations of 16*nb / 4*nb bytes with SINGLE-element
-//     64-bit-promoted overflow tests (offset + sizeof(PxContact) resp.
-//     sizeof(PxU32); independent ifs, both flags can set);
+//   - contact/force reservations of 16*nb / 4*nb bytes; since 5.12 the
+//     64-bit-promoted overflow tests cover the WHOLE reservation (offset +
+//     sizeof(PxContact) * nb resp. sizeof(PxU32) * nb; independent ifs, both
+//     flags can set) and a force overflow also drops the contact offset;
 //   - on a valid contact offset the nb contacts are written serially as
-//     (p.xyz, separation) float4s; outputs get startForces+forceOffset (which
-//     can be the wrapped 0xFFFFFFFF) / startPoints+contactOffset, else both
-//     NULL;
+//     (p.xyz, separation) float4s; outputs get startForces+forceOffset /
+//     startPoints+contactOffset, else both NULL and (5.12) nbContacts = 0,
+//     while the patch demand (patchRequested) is kept for the reservation
+//     below, whose index is then returned as invalid;
 //   - allflags rewrite (clear eTOUCH_KNOWN, set eHAS_TOUCH/eHAS_NO_TOUCH,
 //     ((prevPatches<<8|status)<<16)|(numPatches<<8)) with numPatches =
 //     nbContacts ? 1 : 0 and touch/patch change flags;
@@ -47,7 +49,7 @@
 //     touchChange=previouslyHadTouch, patchChange=prevPatches!=0);
 //   - the trailing insertIntoPatchStream is the separately-verified
 //     tranche-45 shader, so this port emits its call arguments (patchIndex,
-//     the caller's normal, the ORIGINAL nbContacts).
+//     the caller's normal, and nbContacts after the 5.12 zeroing).
 //
 // Entry ccoWriteContact (cu L292-445, the Gu::Contact variant used by the
 // trimesh/heightfield/cloth kernels): same skeleton with the multi-patch
@@ -58,7 +60,9 @@
 //     prevPatches != numPatches;
 //   - the contact stream is written patch-major (i < numPatches, j <
 //     numPatchPoints(i), sequential slots) from mPoints[i*4+j];
-//   - patch reservation of numPatches*64 bytes, 64-bit overflow compare;
+//   - patch reservation of numPatches*64 bytes, 64-bit overflow compare; since
+//     5.12 the REQUESTED count, taken before a failed allocation zeroes
+//     numPatches/numPoints;
 //   - on a valid patchIndex the PxContactPatch array is written INLINE (no
 //     insertIntoPatchStream): combineMaterials (the tranche-43 core,
 //     reproduced verbatim) then per patch mass 1.0f x4, patch normal,
@@ -67,7 +71,7 @@
 //     materialIndex0/1.
 //
 // One test per thread.  NULL pointers are modelled as the 0xFFFFFFFE
-// sentinel (distinct from a legitimately wrapped 0xFFFFFFFF).
+// sentinel.
 
 static const uint HAS_NO_TOUCH = 1u;
 static const uint HAS_TOUCH = 2u;
@@ -196,8 +200,9 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
     if (t >= gParams.numTests) return;
     const CoreOutIn s = gIn[t];
 
-    const uint nbContacts = s.misc.x;
+    uint nbContacts = s.misc.x;
     const uint allflags = s.misc.y;
+    const bool patchRequested = nbContacts > 0u; // 5.12 (cu :173)
 
     uint contactsBytes = s.counters.x, forceBytes = s.counters.y, patchesBytes = s.counters.z;
     uint ovf = 0u;
@@ -205,7 +210,8 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
     CoreOutOut r;
     for (uint j = 0u; j < 64u; ++j) { r.stream[j] = float4(0, 0, 0, 0); r.patchImg[j] = uint4(0, 0, 0, 0); }
 
-    // contact/force reservation, single-element 64-bit overflow tests, independent ifs
+    // contact/force reservation, 5.12 whole-reservation 64-bit overflow tests, independent
+    // ifs, a force overflow also drops the contact offset
     uint contactByteOffset = 0xFFFFFFFFu;
     uint forceByteOffset = 0xFFFFFFFFu;
     if (nbContacts != 0u)
@@ -214,8 +220,12 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
         contactsBytes += 16u * nbContacts;
         forceByteOffset = forceBytes;
         forceBytes += 4u * nbContacts;
-        if ((uint64_t(contactByteOffset) + 16ULL) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
-        if ((uint64_t(forceByteOffset) + 4ULL) > uint64_t(s.cfg.y)) { ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(contactByteOffset) + 16ULL * uint64_t(nbContacts)) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4ULL * uint64_t(nbContacts)) > uint64_t(s.cfg.y))
+        {
+            ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu;
+        }
     }
 
     uint outForces, outPoints;
@@ -224,13 +234,14 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
         const uint base = (contactByteOffset - s.counters.x) / 16u;
         for (uint i = 0u; i < nbContacts; ++i)
             r.stream[base + i] = s.contacts[i]; // make_float4(p.contact, p.separation)
-        outForces = forceByteOffset; // may be the wrapped 0xFFFFFFFF -- ported exactly
+        outForces = forceByteOffset;
         outPoints = contactByteOffset;
     }
     else
     {
         outForces = NULL_SENTINEL; // NULL
         outPoints = NULL_SENTINEL;
+        nbContacts = 0u; // 5.12 (cu :213)
     }
 
     const uint oldStatusFlags = (allflags >> 16u) & 0xFFu;
@@ -253,7 +264,7 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
     // single 64-byte patch reservation with the in-gate rollback
     uint patchIndex = 0xFFFFFFFFu;
     uint cpOut = NULL_SENTINEL;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         patchIndex = patchesBytes;
         patchesBytes += 64u; // sizeof(PxContactPatch)
@@ -269,10 +280,12 @@ void ccoWriteContacts(uint3 dtid : SV_DispatchThreadID)
             touchChange = previouslyHadTouch ? 1u : 0u;
             patchChange = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (nbContacts != 0u)
         {
             cpOut = patchIndex;
         }
+        else
+            patchIndex = 0xFFFFFFFFu;
     }
 
     r.counters = uint4(contactsBytes, forceBytes, patchesBytes, ovf);
@@ -290,8 +303,9 @@ void ccoWriteContact(uint3 dtid : SV_DispatchThreadID)
     if (t >= gParams.numTests) return;
     const CoreOutIn s = gIn[t];
 
-    const uint numPatches = s.misc.z & 0xFFu;  // PxU8(contact.numPatches())
-    const uint numPoints = s.misc.w & 0xFFFFu; // PxU16(contact.numPoints())
+    uint numPatches = s.misc.z & 0xFFu;  // PxU8(contact.numPatches())
+    uint numPoints = s.misc.w & 0xFFFFu; // PxU16(contact.numPoints())
+    const uint nbRequestedPatches = numPatches; // 5.12 (cu :296)
     const uint allflags = s.misc.y;
 
     uint contactsBytes = s.counters.x, forceBytes = s.counters.y, patchesBytes = s.counters.z;
@@ -308,8 +322,13 @@ void ccoWriteContact(uint3 dtid : SV_DispatchThreadID)
         contactsBytes += 16u * numPoints;
         forceByteOffset = forceBytes;
         forceBytes += 4u * numPoints;
-        if ((uint64_t(contactByteOffset) + 16ULL) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
-        if ((uint64_t(forceByteOffset) + 4ULL) > uint64_t(s.cfg.y)) { ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu; }
+        // 5.12 (cu :304-315): whole reservation; force overflow drops the contacts too
+        if ((uint64_t(contactByteOffset) + 16ULL * uint64_t(numPoints)) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4ULL * uint64_t(numPoints)) > uint64_t(s.cfg.y))
+        {
+            ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu;
+        }
     }
 
     uint outForces, outPoints;
@@ -327,6 +346,8 @@ void ccoWriteContact(uint3 dtid : SV_DispatchThreadID)
     {
         outForces = NULL_SENTINEL;
         outPoints = NULL_SENTINEL;
+        numPoints = 0u;  // 5.12 (cu :337-338)
+        numPatches = 0u;
     }
 
     const uint oldStatusFlags = (allflags >> 16u) & 0xFFu;
@@ -348,11 +369,11 @@ void ccoWriteContact(uint3 dtid : SV_DispatchThreadID)
     // numPatches * 64-byte patch reservation with the in-gate rollback
     uint patchIndex = 0xFFFFFFFFu;
     uint cpOut = NULL_SENTINEL;
-    if (numPatches != 0u)
+    if (nbRequestedPatches != 0u)
     {
         patchIndex = patchesBytes;
-        patchesBytes += numPatches * 64u;
-        if ((uint64_t(patchIndex) + uint64_t(numPatches) * 64ULL) > uint64_t(s.cfg.z))
+        patchesBytes += nbRequestedPatches * 64u;
+        if ((uint64_t(patchIndex) + uint64_t(nbRequestedPatches) * 64ULL) > uint64_t(s.cfg.z))
         {
             ovf |= PATCH_BUFFER_OVERFLOW;
             patchIndex = 0xFFFFFFFFu;
@@ -364,10 +385,12 @@ void ccoWriteContact(uint3 dtid : SV_DispatchThreadID)
             touchChange = previouslyHadTouch ? 1u : 0u;
             patchChange = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (numPatches != 0u)
         {
             cpOut = patchIndex;
         }
+        else
+            patchIndex = 0xFFFFFFFFu;
     }
 
     // inline PxContactPatch array write (cu L408-444), 4 uint4 words per patch:

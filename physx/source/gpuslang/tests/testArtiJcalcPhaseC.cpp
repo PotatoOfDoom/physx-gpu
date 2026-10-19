@@ -31,7 +31,7 @@
 // subset is the content of this test.  Phase C must leave
 //
 //     mRetainsAcceleration, mDofs, mJointType, mJointOffset, mParents,
-//     mChildrenOffset, mNumChildren, mInvDofIds, mDofIds, mMotion, mJointAxis
+//     mChildrenOffset, mNumChildren, mInvDofIds, mDofIds, mMotion (5.12: no mJointAxis)
 //
 // untouched -- all of them fields phase B writes.  Since the destinations are
 // poisoned and compared byte for byte, an extra write is a failure here, which is
@@ -117,7 +117,6 @@ PXG_TEST(artiJcalcPhaseC)
     std::memset(jdata.data(), 0xEE, jdata.size() * sizeof(ArticulationJointCoreData));
     std::vector<ArticulationJointCore> joints;
     joints.reserve(size_t(LANES) * NB_LINKS);
-    std::vector<Cm::UnAlignedSpatialVector> jointAxis(size_t(LANES) * MAX_DOFS);
     std::vector<SpatialSubspaceMatrix> motionMatrix(size_t(LANES) * NB_LINKS);
     std::vector<float> jPos(size_t(LANES) * MAX_DOFS), jVel(size_t(LANES) * MAX_DOFS);
     std::vector<float> jTPos(size_t(LANES) * MAX_DOFS), jTVel(size_t(LANES) * MAX_DOFS);
@@ -137,12 +136,10 @@ PXG_TEST(artiJcalcPhaseC)
             const PxTransform idT(PxIdentity);   // named: `j(PxTransform(...), ...)` parses
             ArticulationJointCore j(idT, idT);    // as a function declaration
 
-            j.frictionCoefficient = val(L, link, 0, 99);
             for (uint32_t ax = 0; ax < PxArticulationAxis::eCOUNT; ++ax)
             {
                 j.drives[ax].stiffness = val(L, link, ax, 1);
                 j.drives[ax].damping = val(L, link, ax, 2);
-                j.drives[ax].maxForce = val(L, link, ax, 3);
                 j.drives[ax].envelope.maxEffort = val(L, link, ax, 4);
                 j.drives[ax].envelope.maxActuatorVelocity = val(L, link, ax, 5);
                 j.drives[ax].envelope.velocityDependentResistance = val(L, link, ax, 6);
@@ -172,8 +169,6 @@ PXG_TEST(artiJcalcPhaseC)
         for (uint32_t d = 0; d < MAX_DOFS; ++d)
         {
             const size_t k = size_t(L) * MAX_DOFS + d;
-            jointAxis[k].top = PxVec3(val(L, 9, d, 30), val(L, 9, d, 31), val(L, 9, d, 32));
-            jointAxis[k].bottom = PxVec3(val(L, 9, d, 33), val(L, 9, d, 34), val(L, 9, d, 35));
             jPos[k] = val(L, 9, d, 40);
             jVel[k] = val(L, 9, d, 41);
             jTPos[k] = val(L, 9, d, 42);
@@ -392,16 +387,12 @@ PXG_TEST(artiJcalcPhaseC)
                             ic + offsetof(IC, mLimits_LowLimitX_highLimitY) + size_t(L) * 8;
                         putF(wantDof, lim + 0, j.limits[dofId].low);
                         putF(wantDof, lim + 4, j.limits[dofId].high);
-                        putF(wantDof, ic + offsetof(IC, mFrictionCoefficient) + size_t(L) * 4,
-                             j.frictionCoefficient);
                         putF(wantDof, ic + offsetof(IC, mStaticFrictionEffort) + size_t(L) * 4,
                              j.frictionParams[dofId].staticFrictionEffort);
                         putF(wantDof, ic + offsetof(IC, mDynamicFrictionEffort) + size_t(L) * 4,
                              j.frictionParams[dofId].dynamicFrictionEffort);
                         putF(wantDof, ic + offsetof(IC, mViscousFrictionCoefficient) + size_t(L) * 4,
                              j.frictionParams[dofId].viscousFrictionCoefficient);
-                        putF(wantDof, ic + offsetof(IC, mMaxForce) + size_t(L) * 4,
-                             j.drives[dofId].maxForce);
                         putF(wantDof, ic + offsetof(IC, mMaxEffort) + size_t(L) * 4,
                              j.drives[dofId].envelope.maxEffort);
                         putF(wantDof, ic + offsetof(IC, mMaxActuatorVelocity) + size_t(L) * 4,

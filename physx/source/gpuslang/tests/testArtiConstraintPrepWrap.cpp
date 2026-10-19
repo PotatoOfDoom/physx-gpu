@@ -92,7 +92,7 @@ const uint32_t ACW_NB_RIGID = 16;
 // passes the API's >= 0 check), 17 has +0 -- the zero-tie bodies of the
 // directed lanes below
 const uint32_t ACW_NB_RIGID_POOL = ACW_NB_RIGID + 2;
-const uint32_t ACW_REC_SIZE = 544;
+const uint32_t ACW_REC_SIZE = 496;
 
 const uint32_t ACW_RIGID_OFFSET = 3;      // prepDesc.numBatches
 const uint32_t ACW_LIVE_WARPS = 4;        // 2 contact + 1 static + 1 self
@@ -110,7 +110,7 @@ const uint32_t ACW_NB_PREV_FIDX = ACW_TOTAL_PREV_EDGES * 2;
 
 static_assert(sizeof(PxgBlockConstraintBatch) == 1536, "batch stride");
 static_assert(sizeof(PxgBlockWorkUnit) == 1024, "work unit stride");
-static_assert(sizeof(PxgConstraintPrepareDesc) == 304, "prep desc");
+static_assert(sizeof(PxgConstraintPrepareDesc) == 320, "prep desc");
 static_assert(sizeof(PxgSolverSharedDesc<IterativeSolveDataTGS>) == 224, "TGS shared desc");
 static_assert(sizeof(PxgBlockFrictionIndex) == 8, "friction index");
 
@@ -350,8 +350,8 @@ PXG_TEST(artiConstraintPrepWrap)
                 (l % 2u) ? make_float2(0.7f, 0.3f) : make_float2(0.0f, 0.0f);
 
             const uint32_t nb = acwNbContacts(w, l);
-            const uint32_t flags = (acwPerPoint(w, l) ? 2u : 0u)
-                                 | (acwDisable(w, l) ? 4u : 0u) | ((l & 1u) ? 8u : 0u);
+            const uint32_t flags = (acwPerPoint(w, l) ? (2u | 4u) : 0u)
+                                 | (acwDisable(w, l) ? 8u : 0u) | ((l & 1u) ? 16u : 0u);
             cd.contactData[l].restDistance = 0.005f * av(l, 300 + d);
             cd.contactData[l].staticFriction = 0.6f + 0.2f * std::fabs(av(l, 301));
             cd.contactData[l].dynamicFriction = 0.4f + 0.2f * std::fabs(av(l, 302));
@@ -575,7 +575,9 @@ PXG_TEST(artiConstraintPrepWrap)
     prep.bounceThresholdF32 = bounceF;
     prep.frictionOffsetThreshold = fricOffThresh;
     prep.correlationDistance = correlDist;
-    prep.biasCoefficient = biasF;
+    prep.biasCoefficients.rigidContact = biasF;   // 5.12: the per-kind collection
+    prep.biasCoefficients.joint = 0.55f;
+    prep.biasCoefficients.articulation = 0.45f;
     prep.totalPreviousEdges = ACW_TOTAL_PREV_EDGES;
     prep.totalCurrentEdges = ACW_TOTAL_CURR_EDGES;
 
@@ -658,8 +660,11 @@ PXG_TEST(artiConstraintPrepWrap)
             const PxgMaterialContactData& data = cdPool[d].contactData[lane];
             const uint32_t nb = data.mNumContacts;
             const uint32_t flags = data.mSolverFlags;
+            // 5.12 flags: a target-velocity lane raises eHAS_TARGET_VELOCITY (2) and
+            // eDISABLE_STRONG_FRICTION (4), as the engine does; eDISABLE_FRICTION is 8
             const bool perPoint = (flags & 2u) != 0u;
-            const bool disable = (flags & 4u) != 0u;
+            const bool disableStrong = (flags & 4u) != 0u;
+            const bool disable = (flags & 8u) != 0u;
 
             const float4 n4 = cdPool[d].normal_restitutionW[lane];
             const PxVec3 normal(n4.x, n4.y, n4.z);
@@ -672,7 +677,7 @@ PXG_TEST(artiConstraintPrepWrap)
             float patchExtents = 0.f;
 
             bool inh = false, kept = false;
-            if (!(perPoint || disable))
+            if (!(disableStrong || disable))
                 refGetFrictionPatches(wantP[d], wantA[d], lane, prevIdx.data(), true, edge,
                                       prevPatches.data(), prevAnchors.data(),
                                       data.prevFrictionPatchCount, bf0, bf1, correlDist,
@@ -692,7 +697,7 @@ PXG_TEST(artiConstraintPrepWrap)
             const float offsetSlop = PxMax(b0.offsetSlop, b1.offsetSlop);
             refSetupExtContactsTGS(cdPool[d], &contacts[ACW_CONTACT_BASE[w]], nb, wantP[d],
                                    wantA[d], b0, b1, stepInvDtF, stepDtF, invDtF, bounceF, biasF,
-                                   lane, wu.mWriteback[lane], perPoint, wantCH[d], wantFH[d],
+                                   lane, wu.mWriteback[lane], wantCH[d], wantFH[d],
                                    &wantCP[b.startConstraintIndex], &wantFR[b.startFrictionIndex],
                                    &wantRS[b.mArticulationResponseIndex], data, offsetSlop,
                                    wu.mTorsionalFrictionData[lane], dtF);
@@ -776,8 +781,7 @@ PXG_TEST(artiConstraintPrepWrap)
             const float offsetSlop = PxMax(b0.offsetSlop, b1.offsetSlop);
             refSetupExtContactsTGS(cdPool[d], &contacts[ACW_CONTACT_BASE[0]], data.mNumContacts,
                                    wantP[d], wantA[d], b0, b1, stepInvDtF, stepDtF, invDtF,
-                                   bounceF, biasF, lane, wu.mWriteback[lane],
-                                   (data.mSolverFlags & 2u) != 0u, tCH[d], tFH[d],
+                                   bounceF, biasF, lane, wu.mWriteback[lane], tCH[d], tFH[d],
                                    &tCP[b.startConstraintIndex], &tFR[b.startFrictionIndex],
                                    &tRS[b.mArticulationResponseIndex], data, offsetSlop,
                                    wu.mTorsionalFrictionData[lane], dtF);

@@ -86,7 +86,7 @@ static std::vector<uint8_t> acpLoader(const char* file) { return loadShaderBlob(
 const uint32_t ACP_LANES = 26;
 const uint32_t ACP_NB_ARTI = 6;         // record pool entries
 const uint32_t ACP_NB_RIGID = 16;       // solver-body pool entries
-const uint32_t ACP_REC_SIZE = 544;
+const uint32_t ACP_REC_SIZE = 496;
 const uint32_t ACP_IO_STRIDE = 72;      // floats per lane (70 written + slack)
 
 static_assert(sizeof(PxgArticulation) == ACP_REC_SIZE, "record stride");

@@ -313,7 +313,6 @@ public void siAccumulate(float deltaF,
 
 public void siSolveDofConstraints(
     uint64_t dofBlocks, uint jointOffset, uint dofCount,
-    uint64_t jointForces,               // the RECORD's jointForce array (float[dof])
     float dt, float sceneDt, float invDt, float elapsedTime, float erp,
     bool isVelIter, bool isExternalForceEveryStep,
     bool doFrictionDrivePosLimit, bool velLimitBefore,
@@ -335,11 +334,9 @@ public void siSolveDofConstraints(
         const float maxJointVel = abF32(ic, PXG_AB_IC_mMaxJointVelocity, lane);
         const AbSpatialVector row0 = svLoadSV(ic, PXG_AB_IC_mRow0, lane);
         const AbSpatialVector row1 = svLoadSV(ic, PXG_AB_IC_mRow1, lane);
-        const float maxDriveForce = abF32(ic, PXG_AB_IC_mConstraintMaxImpulse, lane);
         const float appliedDriveImpulseOrig = abF32(ic, PXG_AB_IC_mDriveImpulse, lane);
         const float recipResponse = abF32(ic, PXG_AB_IC_mRecipResponse, lane);
         const float response = abF32(ic, PXG_AB_IC_mResponse, lane);
-        const float maxFrictionForce = abF32(ic, PXG_AB_IC_mMaxFrictionForce, lane);
         const AbSpatialVector deltaVA = svLoadSV(ic, PXG_AB_IC_mDeltaVA, lane);
         const AbSpatialVector deltaVB = svLoadSV(ic, PXG_AB_IC_mDeltaVB, lane);
 
@@ -353,7 +350,9 @@ public void siSolveDofConstraints(
         const float maxImpulse = abF32(ic, PXG_AB_IC_mMaxEffort, lane) * effectiveDt;
         const float speedImpulseGradient = abF32(ic, PXG_AB_IC_mSpeedEffortGradient, lane) / effectiveDt;
         const float velocityDependentResistance = abF32(ic, PXG_AB_IC_mVelocityDependentResistance, lane) * effectiveDt;
-        const float externalJointImpulse = (Ptr<float>(jointForces))[jointOffset + dof] * effectiveDt;
+        // 5.12: the external joint effort the forward pass parked per dof
+        // (5.6.1 read articulation.jointForce[jointOffset + dof] directly)
+        const float externalJointImpulse = abF32(ic, PXG_AB_IC_mExternalEffort, lane) * effectiveDt;
         const float maxActuatorVelocity = abF32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane);
 
         AdDriveDesc driveDesc;
@@ -377,21 +376,9 @@ public void siSolveDofConstraints(
         float posLimitDeltaF = 0.0f;
         if (doFrictionDrivePosLimit)
         {
-            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
-
-            // deprecated friction model; appliedFriction is 0 on TGS
-            if (!newFrictionModel)
-            {
-                const float appliedFriction = 0.0f;
-                // `+ appliedFriction` with appliedFriction == 0 (internalConstraints2.cu:1796-1798,
-                // isTGS): nvcc keeps the add, which turns a -0 into +0; slangc folds it away
-                // (P9.86), so it is spelled as the select it amounts to.
-                const float frictionForce = adPClamp(isPlusZero(-jointV * recipResponse), -maxFrictionForce, maxFrictionForce);
-                abStoreF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane, frictionForce);
-                frictionDeltaF = frictionForce - appliedFriction;
-                jointV += frictionDeltaF * response;
-            }
-
+            // 5.12: the deprecated (transmitted-force) friction model and the
+            // maxForce drive clamp are gone; the drive runs only with an effort
+            // budget and the static/dynamic/viscous friction is unconditional.
             if (maxImpulse > 0.0f)
             {
                 const float appliedDriveImpulse = perSubset ? 0.0f : appliedDriveImpulseOrig;
@@ -401,16 +388,8 @@ public void siSolveDofConstraints(
                 // trap 1: the RMW base is the ORIGINAL stored value
                 abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, appliedDriveImpulseOrig + driveDeltaF);
             }
-            else
-            {
-                const float unclampedForce = isVelIter ? appliedDriveImpulseOrig : adDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
-                const float clampedForce = adPClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
-                abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, clampedForce);
-            }
             jointV += driveDeltaF * response;
 
-            if (newFrictionModel)
             {
                 const float appliedFriction = perSubset ? 0.0f : abF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane);
                 float totalImpulse = appliedFriction - jointV * recipResponse;
@@ -458,7 +437,7 @@ public void siSolveDofConstraints(
 struct SdParams
 {
     uint64_t dofBlocks;    // @0
-    uint64_t jointForces;  // @8   fixture scaffolding: per-lane slices
+    uint64_t unused0;      // @8   (5.6.1 jointForces scaffolding; 5.12 reads mExternalEffort)
     uint64_t link;         // @16  jointOffset/dofCount come from here, as in the kernel
     uint64_t io;           // @24
     float dt;              // @32
@@ -468,7 +447,7 @@ struct SdParams
     float erp;             // @48
     uint flagsWord;        // @52  bit0 velIter, bit1 extEvery, bit2 doFDPL, bit3 velBefore, bit4 residual
     uint nbLanes;          // @56
-    uint maxDofs;          // @60  the per-lane jointForces slice stride (scaffolding)
+    uint pad0;             // @60
 }
 
 [[vk::push_constant]]
@@ -498,9 +477,6 @@ void siDofTest(uint3 groupThreadId : SV_GroupThreadID)
     const uint jointOffset = abU32(gSd.link, PXG_AB_LINK_mJointOffset, lane);
     const uint dofCount = abU8(gSd.link, PXG_AB_LINK_mDofs, lane);
 
-    // fixture scaffolding: the kernel passes the articulation's own record
-    const uint64_t jf = gSd.jointForces + uint64_t(lane) * uint64_t(gSd.maxDofs) * 4u;
-
     const bool velIter = (gSd.flagsWord & 1u) != 0u;
     const bool extEvery = (gSd.flagsWord & 2u) != 0u;
     const bool doFDPL = (gSd.flagsWord & 4u) != 0u;
@@ -508,7 +484,7 @@ void siDofTest(uint3 groupThreadId : SV_GroupThreadID)
     const bool residual = (gSd.flagsWord & 16u) != 0u;
 
     SvxError error = { 0.0f, 0, 0.0f };
-    siSolveDofConstraints(gSd.dofBlocks, jointOffset, dofCount, jf,
+    siSolveDofConstraints(gSd.dofBlocks, jointOffset, dofCount,
                           gSd.dt, gSd.sceneDt, gSd.invDt, gSd.elapsedTime, gSd.erp,
                           velIter, extEvery, doFDPL, velBefore,
                           childDelta, parentDelta,
@@ -567,7 +543,6 @@ void siDofTest(uint3 groupThreadId : SV_GroupThreadID)
 
 public AbSpatialVector siSolveInternalDFS(
     uint64_t linkBase, uint64_t dofBlocks, uint64_t stackBase,
-    uint64_t jointForces,
     uint64_t batches,
     uint64_t contactHeaders, uint64_t frictionHeaders,
     uint64_t contactPoints, uint64_t frictionPoints,
@@ -667,7 +642,7 @@ public AbSpatialVector siSolveInternalDFS(
 
             AbSpatialVector impulse = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
 
-            siSolveDofConstraints(dofBlocks, jointOffset, dofCount, jointForces,
+            siSolveDofConstraints(dofBlocks, jointOffset, dofCount,
                                   dt, sceneDt, invDt, elapsedTime, erp,
                                   isVelIter, isExternalForceEveryStep,
                                   doFrictionDrivePosLimit, doVelLimit == 1u,
@@ -781,7 +756,7 @@ struct SfParams
     uint64_t linkBase;        // @0
     uint64_t dofBlocks;       // @8
     uint64_t stackBase;       // @16
-    uint64_t jointForces;     // @24  fixture scaffolding: per-lane slices
+    uint64_t unused0;         // @24  (5.6.1 jointForces scaffolding)
     uint64_t batches;         // @32
     uint64_t contactHeaders;  // @40
     uint64_t frictionHeaders; // @48
@@ -800,7 +775,7 @@ struct SfParams
     uint flagsWord;           // @128  bit0 velIter, bit1 extEvery, bit2 doFDPL,
                               //       bits 3-4 doVelLimit, bit5 doStatic, bit6 residual
     uint nbLanes;             // @132
-    uint maxDofs;             // @136  jointForces slice stride (scaffolding)
+    uint pad1;                // @136
     uint pad0;                // @140
 }
 
@@ -823,8 +798,6 @@ void siDfsTest(uint3 groupThreadId : SV_GroupThreadID)
     const AbSpatialVector parentImpIn = asmSVec(float3(fin[6], fin[7], fin[8]), float3(fin[9], fin[10], fin[11]));
     const AbSpatialVector parentDeltaVIn = asmSVec(float3(fin[12], fin[13], fin[14]), float3(fin[15], fin[16], fin[17]));
 
-    const uint64_t jf = gSf.jointForces + uint64_t(lane) * uint64_t(gSf.maxDofs) * 4u;
-
     const bool velIter = (gSf.flagsWord & 1u) != 0u;
     const bool extEvery = (gSf.flagsWord & 2u) != 0u;
     const bool doFDPL = (gSf.flagsWord & 4u) != 0u;
@@ -835,7 +808,7 @@ void siDfsTest(uint3 groupThreadId : SV_GroupThreadID)
     SvxError error = { 0.0f, 0, 0.0f };
     SvxError contactError = { 0.0f, 0, 0.0f };
     const AbSpatialVector finalImp = siSolveInternalDFS(
-        gSf.linkBase, gSf.dofBlocks, gSf.stackBase, jf,
+        gSf.linkBase, gSf.dofBlocks, gSf.stackBase,
         gSf.batches, gSf.contactHeaders, gSf.frictionHeaders,
         gSf.contactPoints, gSf.frictionPoints,
         gSf.jointHeaders, gSf.jointRowsCon, gSf.responses,
@@ -903,15 +876,15 @@ struct SipParams
     float invDt;                     // @12
     uint velIterWord;                // @16 bool byte 0 (bridge zero-pads 17..19)
     float elapsedTime;               // @20
-    float biasCoefficient;           // @24
-    uint pad0;                       // @28 natural-alignment hole before the pointer
+    float articulationBiasCoefficient; // @24 (5.12: Dy::BiasCoefficientCollection::articulation)
+    float rigidContactBiasCoefficient; // @28 (5.12; read by the PGS static contacts, dead on TGS)
     uint64_t staticContactUniqueIds; // @32 DEAD — the body reads link-block windows
     uint64_t staticJointUniqueIds;   // @40 DEAD
     uint64_t sharedDesc;             // @48 PxgSolverSharedDesc<IterativeSolveDataTGS>*
     uint solveFlagsWord;             // @56: byte0 doFriction (dead on TGS),
-                                     //      byte1 residualReportingEnabled,
-                                     //      byte2 isExternalForceEveryStep,
-                                     //      byte3 doFrictionDrivePosLimit
+                                     //      byte1 isExternalForceEveryStep,
+                                     //      byte2 doFrictionDrivePosLimit
+                                     //      (5.12 dropped residualReportingEnabled)
     uint doVelLimit;                 // @60 VelLimit enum: 0 none / 1 before / 2 after
     uint doStaticWord;               // @64 bool byte 0
     uint pad1;                       // @68 -> 72 B blob
@@ -937,37 +910,23 @@ void artiSolveInternalConstraintsTGS1T(uint3 groupThreadId : SV_GroupThreadID,
         return;
 
     const bool velocityIteration = (gSip.velIterWord & 0xFFu) != 0u;
-    const bool residualReporting = ((gSip.solveFlagsWord >> 8u) & 0xFFu) != 0u;
-    const bool isExternalForceEveryStep = ((gSip.solveFlagsWord >> 16u) & 0xFFu) != 0u;
-    const bool doFrictionDrivePosLimit = ((gSip.solveFlagsWord >> 24u) & 0xFFu) != 0u;
+    const bool isExternalForceEveryStep = ((gSip.solveFlagsWord >> 8u) & 0xFFu) != 0u;
+    const bool doFrictionDrivePosLimit = ((gSip.solveFlagsWord >> 16u) & 0xFFu) != 0u;
     const bool doStatic = (gSip.doStaticWord & 0xFFu) != 0u;
+    // 5.12 removed residual reporting: every residual path below stays off
+    const bool residualReporting = false;
 
-    const float erp = min(0.7f, gSip.biasCoefficient);              // :2852
+    // 5.12: the TGS extern no longer clamps (5.6.1: erp = PxMin(0.7f, biasCoefficient));
+    // the host passes BiasCoefficientCollection::articulation = min(0.9, 2*sqrt(1/n)).
+    const float erp = gSip.articulationBiasCoefficient;
     const float minPen = velocityIteration ? 0.0f : -3.402823466e+38f;  // -PX_MAX_F32
     const float sceneDt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));   // :1766
 
     SvxError error = { 0.0f, 0, 0.0f };
     SvxError contactError = { 0.0f, 0, 0.0f };
 
-    // record resolve (:1605-1610)
-    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
-    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
-    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
-    const uint nodeIndex = nodeIndexIndex(node);
-    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
-                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
-    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
-    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
-                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
-
-    if (residualReporting)
-    {
-        // Dy::ErrorAccumulator::reset() on both record accumulators (:1614-1615)
-        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        ir[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL))[1] = 0; ir[2] = 0.0f;
-        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        cr[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL))[1] = 0; cr[2] = 0.0f;
-    }
+    // (5.12: no record resolve -- it only fed the residual accumulators and
+    // the jointForce pointer, both gone from this kernel)
 
     const uint64_t w = uint64_t(groupId.x);   // the per-warp slice index, DIRECTLY
     const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
@@ -1031,10 +990,9 @@ void artiSolveInternalConstraintsTGS1T(uint3 groupThreadId : SV_GroupThreadID,
 
     const uint64_t stackBase = artiPtrField(d, PXG_ARTI_CORE_TRAVERSAL_STACK)
                              + w * uint64_t(maxLinks) * PXG_AB_TRAVERSAL_STACK_SIZE;
-    const uint64_t jointForces = artiPtrField(a, PXG_ARTI_JOINT_FORCE);
 
     const AbSpatialVector finalImp = siSolveInternalDFS(
-        linkBase, dofBase, stackBase, jointForces,
+        linkBase, dofBase, stackBase,
         batches, contactHeaders, frictionHeaders, contactPoints, frictionPoints,
         jointHeaders, jointRowsCon, responses,
         gSip.dt, sceneDt, gSip.invDt, gSip.elapsedTime, erp, minPen,
@@ -1047,22 +1005,7 @@ void artiSolveInternalConstraintsTGS1T(uint3 groupThreadId : SV_GroupThreadID,
     const AbSpatialVector newRootZ = asmSVecAdd(rootDeferredZ, finalImp);
     abStoreSpatialVector(artiBlock, PXG_AB_mRootDeferredZ, lane, newRootZ.top, newRootZ.bottom);
 
-    if (residualReporting)
-    {
-        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        ir[0] = ir[0] + error.sumOfSquares;
-        Ptr<int> irc = Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        irc[1] = irc[1] + error.counter;
-        if (error.maxError > ir[2])
-            ir[2] = error.maxError;
-
-        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        cr[0] = cr[0] + contactError.sumOfSquares;
-        Ptr<int> crc = Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        crc[1] = crc[1] + contactError.counter;
-        if (contactError.maxError > cr[2])
-            cr[2] = contactError.maxError;
-    }
+    // (5.12: no residual epilogue)
 }
 
 // ===========================================================================
@@ -1096,7 +1039,8 @@ public void siSolveStaticConstraintsPgs(
     uint64_t responses,
     inout AbSpatialVector vel, inout AbSpatialVector impulse, inout AbSpatialVector deltaV,
     uint lane, bool doFriction, bool accumulateError,
-    inout SvpError error, uint constraintCounts)
+    inout SvpError error, uint constraintCounts,
+    float rigidContactBiasCoefficient)
 {
     const uint constraintBatchOffset = abU32(link, PXG_AB_LINK_mStaticJointStartIndex, lane);
     const uint contactBatchOffset = abU32(link, PXG_AB_LINK_mStaticContactStartIndex, lane);
@@ -1158,7 +1102,8 @@ public void siSolveStaticConstraintsPgs(
                                  Ptr<SvpPgsContactPoint>(contactPoints),
                                  Ptr<SvpPgsContactFriction>(frictionPoints),
                                  Ptr<PxgArticulationBlockResponse>(responses),
-                                 impulse0, impulse1, error, accumulateError, 1.0f, 1.0f);
+                                 impulse0, impulse1, error, accumulateError,
+                                 rigidContactBiasCoefficient, 1.0f, 1.0f);
 
         if (aIsArti) { impulse = asmSVecAdd(impulse, impulse0); vel = vel0; }
         else         { impulse = asmSVecAdd(impulse, impulse1); vel = vel1; }
@@ -1189,7 +1134,7 @@ struct SipgParams
     uint doFrictionWord;      // @88
     uint accumulateError;     // @92
     uint nbLanes;             // @96
-    uint pad0;                // @100 -> 104 B blob
+    float rigidContactBiasCoefficient; // @100 (5.12) -> 104 B blob
 }
 
 [[vk::push_constant]]
@@ -1219,7 +1164,8 @@ void siStaticPgsTest(uint3 groupThreadId : SV_GroupThreadID)
                                 gSipg.responses,
                                 vel, impulse, deltaV,
                                 lane, (gSipg.doFrictionWord & 0xFFu) != 0u,
-                                gSipg.accumulateError != 0u, error, constraintCounts);
+                                gSipg.accumulateError != 0u, error, constraintCounts,
+                                gSipg.rigidContactBiasCoefficient);
 
     Ptr<float> fout = Ptr<float>(gSipg.io + uint64_t(SI_IO_OUT_BASE + lane * SI_IO_STRIDE) * 4u);
     fout[0] = vel.top.x; fout[1] = vel.top.y; fout[2] = vel.top.z;
@@ -1254,7 +1200,6 @@ void siStaticPgsTest(uint3 groupThreadId : SV_GroupThreadID)
 
 public void siSolveDofConstraintsPgs(
     uint64_t dofBlocks, uint jointOffset, uint dofCount,
-    uint64_t jointForces,               // the RECORD's jointForce array (float[dof])
     float dt, float sceneDt, float invDt, float elapsedTime, float erp,
     bool isVelIter,
     bool doFrictionDrivePosLimit, bool velLimitBefore,
@@ -1276,11 +1221,9 @@ public void siSolveDofConstraintsPgs(
         const float maxJointVel = abF32(ic, PXG_AB_IC_mMaxJointVelocity, lane);
         const AbSpatialVector row0 = svLoadSV(ic, PXG_AB_IC_mRow0, lane);
         const AbSpatialVector row1 = svLoadSV(ic, PXG_AB_IC_mRow1, lane);
-        const float maxDriveForce = abF32(ic, PXG_AB_IC_mConstraintMaxImpulse, lane);
         const float appliedDriveImpulseOrig = abF32(ic, PXG_AB_IC_mDriveImpulse, lane);
         const float recipResponse = abF32(ic, PXG_AB_IC_mRecipResponse, lane);
         const float response = abF32(ic, PXG_AB_IC_mResponse, lane);
-        const float maxFrictionForce = abF32(ic, PXG_AB_IC_mMaxFrictionForce, lane);
         const AbSpatialVector deltaVA = svLoadSV(ic, PXG_AB_IC_mDeltaVA, lane);
         const AbSpatialVector deltaVB = svLoadSV(ic, PXG_AB_IC_mDeltaVB, lane);
 
@@ -1294,7 +1237,8 @@ public void siSolveDofConstraintsPgs(
         const float maxImpulse = abF32(ic, PXG_AB_IC_mMaxEffort, lane) * effectiveDt;
         const float speedImpulseGradient = abF32(ic, PXG_AB_IC_mSpeedEffortGradient, lane) / effectiveDt;
         const float velocityDependentResistance = abF32(ic, PXG_AB_IC_mVelocityDependentResistance, lane) * effectiveDt;
-        const float externalJointImpulse = (Ptr<float>(jointForces))[jointOffset + dof] * effectiveDt;
+        // 5.12: mExternalEffort, not articulation.jointForce
+        const float externalJointImpulse = abF32(ic, PXG_AB_IC_mExternalEffort, lane) * effectiveDt;
         const float maxActuatorVelocity = abF32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane);
 
         // trap 2: loaded unconditionally on PGS
@@ -1316,18 +1260,7 @@ public void siSolveDofConstraintsPgs(
         float posLimitDeltaF = 0.0f;
         if (doFrictionDrivePosLimit)
         {
-            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
-
-            // deprecated friction model; trap 3: PGS accumulates
-            if (!newFrictionModel)
-            {
-                const float appliedFriction = abF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane);
-                const float frictionForce = adPClamp(-jointV * recipResponse + appliedFriction, -maxFrictionForce, maxFrictionForce);
-                abStoreF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane, frictionForce);
-                frictionDeltaF = frictionForce - appliedFriction;
-                jointV += frictionDeltaF * response;
-            }
-
+            // 5.12: no deprecated friction model, no maxForce clamp (see the TGS twin)
             if (maxImpulse > 0.0f)
             {
                 const float appliedDriveImpulse = appliedDriveImpulseOrig;   // no perSubset zero
@@ -1337,16 +1270,8 @@ public void siSolveDofConstraintsPgs(
                 driveDeltaF = clampedImpulse - appliedDriveImpulse;
                 abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, appliedDriveImpulseOrig + driveDeltaF);
             }
-            else
-            {
-                const float unclampedForce = adDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
-                const float clampedForce = adPClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
-                abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, clampedForce);
-            }
             jointV += driveDeltaF * response;
 
-            if (newFrictionModel)
             {
                 // trap 5: the accumulated impulse, always
                 const float appliedFriction = abF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane);
@@ -1394,7 +1319,7 @@ public void siSolveDofConstraintsPgs(
 struct SdpParams
 {
     uint64_t dofBlocks;    // @0
-    uint64_t jointForces;  // @8   fixture scaffolding: per-lane slices
+    uint64_t unused0;      // @8   (5.6.1 jointForces scaffolding; 5.12 reads mExternalEffort)
     uint64_t link;         // @16  jointOffset/dofCount come from here, as in the kernel
     uint64_t io;           // @24
     float dt;              // @32
@@ -1404,7 +1329,7 @@ struct SdpParams
     float erp;             // @48
     uint flagsWord;        // @52  bit0 velIter, bit1 doFDPL, bit2 velBefore, bit3 residual
     uint nbLanes;          // @56
-    uint maxDofs;          // @60  the per-lane jointForces slice stride (scaffolding)
+    uint pad0;             // @60
 }
 
 [[vk::push_constant]]
@@ -1430,10 +1355,9 @@ void siDofPgsTest(uint3 groupThreadId : SV_GroupThreadID)
 
     const uint jointOffset = abU32(gSdp.link, PXG_AB_LINK_mJointOffset, lane);
     const uint dofCount = abU8(gSdp.link, PXG_AB_LINK_mDofs, lane);
-    const uint64_t jf = gSdp.jointForces + uint64_t(lane * gSdp.maxDofs) * 4u;
 
     SvxError error = { 0.0f, 0, 0.0f };
-    siSolveDofConstraintsPgs(gSdp.dofBlocks, jointOffset, dofCount, jf,
+    siSolveDofConstraintsPgs(gSdp.dofBlocks, jointOffset, dofCount,
                              gSdp.dt, gSdp.sceneDt, gSdp.invDt, gSdp.elapsedTime, gSdp.erp,
                              (gSdp.flagsWord & 1u) != 0u,
                              (gSdp.flagsWord & 2u) != 0u,
@@ -1474,7 +1398,6 @@ void siDofPgsTest(uint3 groupThreadId : SV_GroupThreadID)
 
 public AbSpatialVector siSolveInternalDFSPgs(
     uint64_t linkBase, uint64_t dofBlocks, uint64_t stackBase,
-    uint64_t jointForces,
     uint64_t batches,
     uint64_t contactHeaders, uint64_t frictionHeaders,
     uint64_t contactPoints, uint64_t frictionPoints,
@@ -1487,6 +1410,7 @@ public AbSpatialVector siSolveInternalDFSPgs(
     AbSpatialVector storeParentDeltaV, AbSpatialVector parentImpIn,
     AbSpatialVector parentDeltaVIn,
     bool residualReporting, inout SvxError error, inout SvpError contactError,
+    float rigidContactBiasCoefficient,
     uint lane)
 {
     AbSpatialVector parentDeltaV = parentDeltaVIn;
@@ -1575,7 +1499,7 @@ public AbSpatialVector siSolveInternalDFSPgs(
 
             AbSpatialVector impulse = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
 
-            siSolveDofConstraintsPgs(dofBlocks, jointOffset, dofCount, jointForces,
+            siSolveDofConstraintsPgs(dofBlocks, jointOffset, dofCount,
                                      dt, sceneDt, invDt, elapsedTime, erp,
                                      isVelIter,
                                      doFrictionDrivePosLimit, doVelLimit == 1u,
@@ -1599,7 +1523,8 @@ public AbSpatialVector siSolveInternalDFSPgs(
                                             responses,
                                             childV, impulse, deltaV,
                                             lane, doFriction,
-                                            residualReporting, contactError, constraintCounts);
+                                            residualReporting, contactError, constraintCounts,
+                                            rigidContactBiasCoefficient);
                 childImpulseFromStatic = asmSVecSub(impulse, before);
             }
 
@@ -1690,7 +1615,7 @@ struct SfpParams
     uint64_t linkBase;        // @0
     uint64_t dofBlocks;       // @8
     uint64_t stackBase;       // @16
-    uint64_t jointForces;     // @24  fixture scaffolding: per-lane slices
+    uint64_t unused0;         // @24  (5.6.1 jointForces scaffolding)
     uint64_t batches;         // @32
     uint64_t contactHeaders;  // @40
     uint64_t frictionHeaders; // @48
@@ -1709,7 +1634,7 @@ struct SfpParams
     uint flagsWord;           // @132  bit0 velIter, bit1 doFriction, bit2 doFDPL,
                               //       bits 3-4 doVelLimit, bit5 doStatic, bit6 residual
     uint nbLanes;             // @136
-    uint maxDofs;             // @140  jointForces slice stride (scaffolding) -> 144 B
+    float rigidContactBiasCoefficient; // @140 (5.12) -> 144 B
 }
 
 [[vk::push_constant]]
@@ -1728,8 +1653,6 @@ void siDfsPgsTest(uint3 groupThreadId : SV_GroupThreadID)
     const AbSpatialVector parentImpIn = asmSVec(float3(fin[6], fin[7], fin[8]), float3(fin[9], fin[10], fin[11]));
     const AbSpatialVector parentDeltaVIn = asmSVec(float3(fin[12], fin[13], fin[14]), float3(fin[15], fin[16], fin[17]));
 
-    const uint64_t jf = gSfp.jointForces + uint64_t(lane) * uint64_t(gSfp.maxDofs) * 4u;
-
     const bool velIter = (gSfp.flagsWord & 1u) != 0u;
     const bool doFriction = (gSfp.flagsWord & 2u) != 0u;
     const bool doFDPL = (gSfp.flagsWord & 4u) != 0u;
@@ -1740,14 +1663,14 @@ void siDfsPgsTest(uint3 groupThreadId : SV_GroupThreadID)
     SvxError error = { 0.0f, 0, 0.0f };
     SvpError contactError = { 0.0f, 0, 0.0f };
     const AbSpatialVector finalImp = siSolveInternalDFSPgs(
-        gSfp.linkBase, gSfp.dofBlocks, gSfp.stackBase, jf,
+        gSfp.linkBase, gSfp.dofBlocks, gSfp.stackBase,
         gSfp.batches, gSfp.contactHeaders, gSfp.frictionHeaders,
         gSfp.contactPoints, gSfp.frictionPoints,
         gSfp.jointHeaders, gSfp.jointRowsCon, gSfp.jointRowsMod, gSfp.responses,
         gSfp.dt, gSfp.sceneDt, gSfp.invDt, gSfp.elapsedTime, gSfp.erp,
         velIter, doFriction, doFDPL, doVelLimit, doStatic,
         storeParentDeltaV, parentImpIn, parentDeltaVIn,
-        residual, error, contactError, lane);
+        residual, error, contactError, gSfp.rigidContactBiasCoefficient, lane);
 
     Ptr<float> fout = Ptr<float>(gSfp.io + uint64_t(SF_IO_OUT_BASE + lane * SF_IO_STRIDE) * 4u);
     fout[0] = finalImp.top.x; fout[1] = finalImp.top.y; fout[2] = finalImp.top.z;
@@ -1771,7 +1694,7 @@ void siDfsPgsTest(uint3 groupThreadId : SV_GroupThreadID)
 //    on it (dead on the TGS path).
 //  * **minPen does not exist** — the template computes it (:1597) but the
 //    PGS static overload never reads it; not computed here.
-//  * **isExternalForceEveryStep (flags byte 2) is DEAD** — the PGS dof solve
+//  * **isExternalForceEveryStep (flags byte 1) is DEAD** — the PGS dof solve
 //    has no perSubset; the ABI byte is carried, the fixture varies it and
 //    expects identity (deadness proof, not swept — no code to mutate).
 //  * elapsedTime is LIVE on both iteration types (adDriveImpulse always runs).
@@ -1795,35 +1718,16 @@ void artiSolveInternalConstraints1T(uint3 groupThreadId : SV_GroupThreadID,
 
     const bool velocityIteration = (gSip.velIterWord & 0xFFu) != 0u;
     const bool doFriction = (gSip.solveFlagsWord & 0xFFu) != 0u;   // LIVE on PGS
-    const bool residualReporting = ((gSip.solveFlagsWord >> 8u) & 0xFFu) != 0u;
-    const bool doFrictionDrivePosLimit = ((gSip.solveFlagsWord >> 24u) & 0xFFu) != 0u;
+    const bool doFrictionDrivePosLimit = ((gSip.solveFlagsWord >> 16u) & 0xFFu) != 0u;
     const bool doStatic = (gSip.doStaticWord & 0xFFu) != 0u;
+    const bool residualReporting = false;   // 5.12 removed residual reporting
 
-    const float erp = gSip.biasCoefficient;                          // UNCLAMPED (:2820)
+    const float erp = gSip.articulationBiasCoefficient;              // UNCLAMPED
+    const float rigidContactBiasCoefficient = gSip.rigidContactBiasCoefficient;  // 5.12
     const float sceneDt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));   // :1766
 
     SvxError error = { 0.0f, 0, 0.0f };
     SvpError contactError = { 0.0f, 0, 0.0f };
-
-    // record resolve (:1605-1610)
-    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
-    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
-    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
-    const uint nodeIndex = nodeIndexIndex(node);
-    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
-                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
-    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
-    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
-                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
-
-    if (residualReporting)
-    {
-        // Dy::ErrorAccumulator::reset() on both record accumulators (:1614-1615)
-        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        ir[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL))[1] = 0; ir[2] = 0.0f;
-        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        cr[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL))[1] = 0; cr[2] = 0.0f;
-    }
 
     const uint64_t w = uint64_t(groupId.x);   // the per-warp slice index, DIRECTLY
     const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
@@ -1884,41 +1788,26 @@ void artiSolveInternalConstraints1T(uint3 groupThreadId : SV_GroupThreadID,
                                     responses,
                                     rootVel, parentImp, parentDeltaV,
                                     lane, doFriction,
-                                    residualReporting, contactError, constraintCounts0);
+                                    residualReporting, contactError, constraintCounts0,
+                                    rigidContactBiasCoefficient);
     }
 
     const uint64_t stackBase = artiPtrField(d, PXG_ARTI_CORE_TRAVERSAL_STACK)
                              + w * uint64_t(maxLinks) * PXG_AB_TRAVERSAL_STACK_SIZE;
-    const uint64_t jointForces = artiPtrField(a, PXG_ARTI_JOINT_FORCE);
 
     const AbSpatialVector finalImp = siSolveInternalDFSPgs(
-        linkBase, dofBase, stackBase, jointForces,
+        linkBase, dofBase, stackBase,
         batches, contactHeaders, frictionHeaders, contactPoints, frictionPoints,
         jointHeaders, jointRowsCon, jointRowsMod, responses,
         gSip.dt, sceneDt, gSip.invDt, gSip.elapsedTime, erp,
         velocityIteration, doFriction,
         doFrictionDrivePosLimit, gSip.doVelLimit, doStatic,
         storeParentDeltaV, parentImp, parentDeltaV,
-        residualReporting, error, contactError, lane);
+        residualReporting, error, contactError, rigidContactBiasCoefficient, lane);
 
     // epilogue (:2004-2010)
     const AbSpatialVector newRootZ = asmSVecAdd(rootDeferredZ, finalImp);
     abStoreSpatialVector(artiBlock, PXG_AB_mRootDeferredZ, lane, newRootZ.top, newRootZ.bottom);
 
-    if (residualReporting)
-    {
-        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        ir[0] = ir[0] + error.sumOfSquares;
-        Ptr<int> irc = Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL);
-        irc[1] = irc[1] + error.counter;
-        if (error.maxError > ir[2])
-            ir[2] = error.maxError;
-
-        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        cr[0] = cr[0] + contactError.sumOfSquares;
-        Ptr<int> crc = Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL);
-        crc[1] = crc[1] + contactError.counter;
-        if (contactError.maxError > cr[2])
-            cr[2] = contactError.maxError;
-    }
+    // (5.12: no residual epilogue)
 }

@@ -104,92 +104,11 @@ void pxgSyncWarpAla() { GroupMemoryBarrierWithGroupSync(); }
 // The per-component reciprocal with its own zero guard -- trap 3.
 float alaRecip(float v) { return v == 0.0f ? 0.0f : 1.0f / v; }
 
-// computeJointTransmittedFrictionForce (forwardDynamic2.cu:2317).
-public void alaJointTransmittedFrictionForce(uint64_t linkBlocks, uint numLinks, uint lane)
-{
-    // leaf to root, strictly sequential -- trap 1
-    for (uint linkID = numLinks - 1u; linkID > 0u; --linkID)
-    {
-        const uint64_t link = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
-        const uint parent = abU32(link, PXG_AB_LINK_mParents, lane);
-        const uint64_t parentLink = linkBlocks + uint64_t(parent) * PXG_AB_LINK_SIZE;
-
-        // loaded BEFORE this link's own Ia is stored -- trap 2
-        float3 bfTop, bfBottom;
-        abLoadSpatialVector(parentLink, PXG_AB_LINK_mBiasForce, lane, bfTop, bfBottom);
-        const AbSpatialVector biasForce = asmSVec(bfTop, bfBottom);
-
-        const float3 rw = float3(abF32(link, PXG_AB_LINK_mRw_x, lane),
-                                 abF32(link, PXG_AB_LINK_mRw_y, lane),
-                                 abF32(link, PXG_AB_LINK_mRw_z, lane));
-
-        const float4 invInertiaXYZ_invMassW = abF4(link, PXG_AB_LINK_mInvInertiaXYZ_invMassW, lane);
-        const float4 rot = abF4(link, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_Q, lane);
-
-        const float m = alaRecip(invInertiaXYZ_invMassW.w);
-        const float3 inertia = float3(alaRecip(invInertiaXYZ_invMassW.x),
-                                      alaRecip(invInertiaXYZ_invMassW.y),
-                                      alaRecip(invInertiaXYZ_invMassW.z));
-
-        // the SUM of the two acceleration fields -- trap 6
-        float3 aTop, aBottom, iTop, iBottom;
-        abLoadSpatialVector(link, PXG_AB_LINK_mMotionAcceleration, lane, aTop, aBottom);
-        abLoadSpatialVector(link, PXG_AB_LINK_mMotionAccelerationInternal, lane, iTop, iBottom);
-        const AbSpatialVector motionAcceleration =
-            asmSVecAdd(asmSVec(aTop, aBottom), asmSVec(iTop, iBottom));
-
-        float3 iaTop, iaBottom;
-        abLoadSpatialVector(link, PXG_AB_LINK_mBiasForce, lane, iaTop, iaBottom);
-
-        // the dual basis and the body-frame inertia -- traps 4 and 5.
-        // `PxVec3::multiply` is the COMPONENTWISE product, not a dot.
-        iaBottom = iaBottom
-                 + quatRotate(rot, quatRotateInv(rot, motionAcceleration.top) * inertia);
-        iaTop = iaTop + motionAcceleration.bottom * m;
-
-        abStoreSpatialVector(link, PXG_AB_LINK_mBiasForce, lane, iaTop, iaBottom);
-
-        // NOT negated -- into the parent's frame
-        const AbSpatialVector translated =
-            adTranslateSpatialVector(rw, asmSVec(iaTop, iaBottom));
-        const AbSpatialVector parentBias = asmSVecAdd(biasForce, translated);
-        abStoreSpatialVector(parentLink, PXG_AB_LINK_mBiasForce, lane, parentBias.top,
-                             parentBias.bottom);
-    }
-
-    // the root's accumulation is DISCARDED -- trap 7
-    abStoreSpatialVector(linkBlocks, PXG_AB_LINK_mBiasForce, lane, float3(0.0f, 0.0f, 0.0f),
-                         float3(0.0f, 0.0f, 0.0f));
-}
-
-// ===========================================================================
-// The fixture entry points
-// ===========================================================================
-
-struct AlaFrictionParams
-{
-    uint64_t linkBlocks;   // @0
-    uint64_t numLinksPer;  // @8   uint32[nbLanes] -- a DIFFERENT count per lane
-    uint nbLanes;          // @16
-    uint pad0;             // @20 -> 24, padded to 32 by the shim's alignment
-    uint pad1;             // @24
-    uint pad2;             // @28
-};
-
-[[vk::push_constant]]
-ConstantBuffer<AlaFrictionParams> gAlaFriction;
-
-[shader("compute")]
-[numthreads(32, 1, 1)]
-void artiJointFriction(uint3 groupThreadId : SV_GroupThreadID)
-{
-    const uint lane = groupThreadId.x;
-    if (lane >= gAlaFriction.nbLanes)
-        return;
-
-    const uint numLinks = (Ptr<uint>(gAlaFriction.numLinksPer))[lane];
-    alaJointTransmittedFrictionForce(gAlaFriction.linkBlocks, numLinks, lane);
-}
+// computeJointTransmittedFrictionForce (forwardDynamic2.cu:2317 in 5.6.1) is gone
+// in 5.12: the deprecated joint-friction model it fed (mBiasForce ->
+// mMaxFrictionForce) was removed together with PxArticulationJointReducedCoordinate's
+// frictionCoefficient, and computeUnconstrainedAccelerationsLaunch1T now ends
+// with computeLinkAcceleration.
 
 // The parallel-axis theorem, dumped so `asmTranslateInertiaMass` has a fixture of
 // its own rather than being checked only through the compound inertia it feeds.
@@ -756,9 +675,7 @@ void computeUnconstrainedAccelerationsLaunch1T(uint3 groupThreadId : SV_GroupThr
     const float dt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));
 
     alaComputeLinkAcceleration(artiBlock, linkBlocks, dofBlocks, numLinks, dt, lane);
-
-    // AFTER the sweep: it reads both acceleration fields the sweep just wrote
-    alaJointTransmittedFrictionForce(linkBlocks, numLinks, lane);
+    // (5.12: no computeJointTransmittedFrictionForce sweep after it any more)
 }
 
 // ===========================================================================
@@ -816,7 +733,8 @@ void computeUnconstrainedAccelerationsLaunch1T(uint3 groupThreadId : SV_GroupThr
 //     padding.  Rounding it up puts every link's velocity at the wrong offset.
 //  3. **The 16-byte rounding is PER ARTICULATION**, applied before the multiply
 //     by the count — not once for the whole ensemble.
-//  4. **Both accumulator writes are guarded by their pointer being non-null**,
+//  4. (5.6.1 only; 5.12 removed residual reporting and both writes with it.)
+//     **Both accumulator writes are guarded by their pointer being non-null**,
 //     and they are two different pointers: `errorAccumulator` is per articulation
 //     and indexed by the REMAP id (twice, at `index` and `index + nbArticulations`),
 //     while `contactResidualAccumulator` is one value for the scene written by
@@ -879,15 +797,7 @@ void dmaBackArticulationDataLaunch(uint3 groupThreadId : SV_GroupThreadID,
     const uint64_t articulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS);
     const uint64_t sleepDataIn = artiPtrField(d, PXG_ARTI_CORE_SLEEP_DATA);
 
-    const uint64_t contactAcc = artiPtrField(o, PXG_ARTI_OUT_CONTACT_ACC);
-    if (globalThreadIndex == 0u && contactAcc != 0)
-    {
-        // Dy::ErrorAccumulator is 12 bytes -- three words, copied as three words
-        // rather than as a struct, because there is no struct to copy through.
-        Ptr<uint> dstAcc = Ptr<uint>(contactAcc);
-        for (uint k = 0u; k < 3u; ++k)
-            dstAcc[k] = artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + k * 4u);
-    }
+    // (5.12 removed the scene contact-residual copy that used to sit here)
 
     // ---- ONE THREAD per articulation ----
     if (globalThreadIndex < nbArticulations)
@@ -916,18 +826,7 @@ void dmaBackArticulationDataLaunch(uint3 groupThreadId : SV_GroupThreadID,
 
         const uint64_t a = articulations + uint64_t(index) * PXG_ARTI_STRIDE;
 
-        const uint64_t errorAcc = artiPtrField(o, PXG_ARTI_OUT_ERROR_ACC);
-        if (errorAcc != 0)
-        {
-            Ptr<uint> dstAcc = Ptr<uint>(errorAcc);
-            for (uint k = 0u; k < 3u; ++k)
-            {
-                dstAcc[uint(index) * 3u + k] =
-                    artiU32Field(a, PXG_ARTI_INTERNAL_RESIDUAL + k * 4u);
-                dstAcc[(uint(index) + nbArticulations) * 3u + k] =
-                    artiU32Field(a, PXG_ARTI_CONTACT_RESIDUAL + k * 4u);
-            }
-        }
+        // (5.12 removed the per-articulation residual copy that used to sit here)
 
         // the destination stride uses the DESCRIPTOR's maxima -- trap 1
         const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);

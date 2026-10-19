@@ -35,7 +35,7 @@
 // asserts !(rigid0 && rigid1), which the fixture's rigid-rigid lanes
 // legitimately violate), and everything else over pxgArtiPrepRef.h.
 //
-// PGS-vs-TGS pins: erp = 1, the pre-skip ang0Writeback (a TRAILING
+// PGS-vs-TGS pins: (5.12: erp = biasCoefficients.joint, was 1), the pre-skip ang0Writeback (a TRAILING
 // degenerate row's cang0 remains in slot outCount), driveScale =
 // fminf(dt,1) applied directly, the gated rigid-dynamic-keyed joint speed,
 // the PGS header sign asymmetry on the SCALES alone, and the Mod rows
@@ -94,7 +94,7 @@ static std::vector<uint8_t> ajpPgsLoader(const char* file) { return loadShaderBl
 
 const uint32_t AJP_NB_ARTI = 6;
 const uint32_t AJP_NB_RIGID = 16;
-const uint32_t AJP_REC_SIZE = 544;
+const uint32_t AJP_REC_SIZE = 496;
 
 const uint32_t AJP_RIGID_OFFSET = 3;
 const uint32_t AJP_LIVE_WARPS = 4;
@@ -112,7 +112,7 @@ static_assert(sizeof(PxgBlockConstraint1DVelocities) == 2048, "1D velocities str
 static_assert(sizeof(PxgBlockConstraint1DParameters) == 512, "1D parameters stride");
 static_assert(sizeof(PxgBlockSolverConstraint1DHeader) == 1664, "PGS 1D header");
 static_assert(sizeof(PxgBlockSolverConstraint1DCon) == 2304, "PGS 1D con");
-static_assert(sizeof(PxgBlockSolverConstraint1DMod) == 1024, "PGS 1D mod");
+static_assert(sizeof(PxgBlockSolverConstraint1DMod) == 896, "PGS 1D mod");
 static_assert(sizeof(PxgSolverConstraintManagerConstants) == 8, "manager constants");
 // AJP_MAX_ROWS mirrors Dy::MAX_CONSTRAINT_ROWS (DyConstraintPrep.h:55)
 
@@ -416,6 +416,7 @@ PXG_TEST(artiJointPrepPgs)
     const float dtF = 1.3f, stepDtF = 0.07f;
     const float invDtF = 1.0f / dtF, stepInvDtF = 1.0f / stepDtF;
     const float lengthScaleF = 1.0f, biasF = 0.7f;
+    const float jointBiasF = 0.55f;   // 5.12: the joint erp comes from biasCoefficients.joint
 
     // ---- device uploads ----
     std::vector<PxgDevicePtr> bufs;
@@ -481,7 +482,9 @@ PXG_TEST(artiJointPrepPgs)
     prep.numArtiStatic1dConstraintBatches = 1;
     prep.numArtiSelf1dConstraintBatches = 1;
     prep.numBatches = AJP_RIGID_OFFSET;
-    prep.biasCoefficient = biasF;
+    prep.biasCoefficients.rigidContact = biasF;   // 5.12: the per-kind collection
+    prep.biasCoefficients.joint = jointBiasF;
+    prep.biasCoefficients.articulation = 0.45f;
 
     PxgSolverSharedDesc<IterativeSolveData> shared;
     std::memset(&shared, 0xAB, sizeof(shared));
@@ -585,7 +588,7 @@ PXG_TEST(artiJointPrepPgs)
             if (tie) tieLanes++;
 
             // setUpArti1DConstraintBlock PGS (:1424)
-            const float erp = 1.0f;
+            const float erp = jointBiasF;   // 5.12: biasCoefficients.joint (was a fixed 1.0)
             const float cfm = PxMax(b0.cfm, b1.cfm);   // selectMax (cu:1758)
             // P9.86c: the mutant twin -- the pre-P9.86 port's FMax (llvmpipe: +0 for
             // any {+0,-0} tie) -- must differ on the directed lanes
@@ -704,7 +707,6 @@ PXG_TEST(artiJointPrepPgs)
                 M.coeff0[lane] = coeff0;
                 M.coeff1[lane] = coeff1;
                 M.appliedForce[lane] = 0.f;
-                M.residual[lane] = 0.f;
 
                 PxU32 flags = 0;
                 if (rpFlags & PxU32(Px1DConstraintFlag::eSPRING))

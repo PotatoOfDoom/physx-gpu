@@ -31,7 +31,9 @@
 //   - setContactPointAndForcePointers: atomically reserves the per-pair contact
 //     and force/indice byte ranges from the shared counters (with overflow
 //     detection), returning the contact byte offset.
-//   - registerContactPatch: recomputes the per-pair status-flag word packed into
+//   - registerContactPatch (5.12: keeps the patch reservation of a pair whose
+//     contact or force allocation failed, but reports it with no contacts):
+//     recomputes the per-pair status-flag word packed into
 //     PxsContactManagerOutput (allflagsStart / nbPatches / statusFlag /
 //     prevPatches), the touch- and patch-change flags, the contact count, and
 //     atomically reserves the contact patch.
@@ -109,15 +111,18 @@ void setContactPointAndForcePointers(uint3 dtid : SV_DispatchThreadID)
         InterlockedAdd(gCounters[1], gParams.contactSize * nbContacts, contactByteOffset);
         InterlockedAdd(gCounters[2], gParams.forceSize * nbContacts, forceByteOffset);
 
-        if ((contactByteOffset + gParams.contactSize) > gParams.contactBytesLimit)
+        // 5.12: the WHOLE reservation is tested (size_t sums in the CUDA), and
+        // a force overflow also invalidates the contact offset.
+        if ((uint64_t(contactByteOffset) + uint64_t(gParams.contactSize) * uint64_t(nbContacts)) > uint64_t(gParams.contactBytesLimit))
         {
             InterlockedOr(gCounters[3], OVERFLOW_CONTACT);
             contactByteOffset = INVALID;
         }
-        if ((forceByteOffset + gParams.forceSize) > gParams.forceBytesLimit)
+        if ((uint64_t(forceByteOffset) + uint64_t(gParams.forceSize) * uint64_t(nbContacts)) > uint64_t(gParams.forceBytesLimit))
         {
             InterlockedOr(gCounters[3], OVERFLOW_FORCE);
             forceByteOffset = INVALID;
+            contactByteOffset = INVALID;
         }
     }
 
@@ -135,7 +140,15 @@ void registerContactPatch(uint3 dtid : SV_DispatchThreadID)
     const uint workIndex = dtid.x;
     if (workIndex >= gParams.numTests) return;
 
-    const uint nbContacts = gNbContacts[workIndex];
+    // 5.12: preserve patch demand even if contact or force allocation failed.
+    // The CUDA tests cmOutputs[workIndex].contactPoints / contactForces for
+    // NULL; setContactPointAndForcePointers NULLs both exactly when it returns
+    // an invalid contact offset, which is what the set stage left in
+    // gContactOffset (this stage runs after it on the same buffers).
+    uint nbContacts = gNbContacts[workIndex];
+    const bool patchRequested = nbContacts > 0u;
+    if (patchRequested && gContactOffset[workIndex] == INVALID)
+        nbContacts = 0u;
     const uint allflags = gPriorAllflags[workIndex];
 
     const uint oldStatusFlags = u16Low(u32High(allflags));
@@ -159,7 +172,7 @@ void registerContactPatch(uint3 dtid : SV_DispatchThreadID)
     gOutAllflags[workIndex] = mergeU16(mergeU8(prevPatches, statusFlags), mergeU8(numPatches, 0u));
 
     uint patchIndex = INVALID;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         InterlockedAdd(gCounters[0], gParams.patchSize, patchIndex);
         if ((patchIndex + gParams.patchSize) > gParams.patchBytesLimit)
@@ -174,6 +187,8 @@ void registerContactPatch(uint3 dtid : SV_DispatchThreadID)
             gTouchChange[workIndex] = previouslyHadTouch ? 1u : 0u;
             gPatchChange[workIndex] = (prevPatches != 0u) ? 1u : 0u;
         }
+        else if (nbContacts == 0u)
+            patchIndex = INVALID; // reserved, but the pair has no contacts to patch
     }
     gPatchIndex[workIndex] = patchIndex;
 }

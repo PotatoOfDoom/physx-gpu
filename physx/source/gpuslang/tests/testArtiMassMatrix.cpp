@@ -437,8 +437,8 @@ static void mmtFillBlocks(physx::PxgArticulationBlockLinkData* lk,
     ab.mNumLinks[lane] = numLinks;
     // Both flag words are NON-ZERO and differ in more than the fix bit, so a test
     // of `flags != 0` cannot stand in for the bit test -- the sweep caught that.
-    ab.mFlags[lane] = fixBase ? PxU32(physx::PxArticulationFlag::eFIX_BASE
-                                      | physx::PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES)
+    ab.mFlags[lane] = fixBase ? (PxU32(physx::PxArticulationFlag::eFIX_BASE)
+                                      | (1u << 2))   // the 5.6.1 eDRIVE_LIMITS_ARE_FORCES bit, unassigned in 5.12
                               : PxU32(physx::PxArticulationFlag::eDISABLE_SELF_COLLISION);
     ab.mArticulationIndex[lane] = articulationIndex;
 

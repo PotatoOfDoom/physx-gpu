@@ -174,20 +174,8 @@ void au1ComputeAndEnforceJointPositions(uint64_t linkBlocks, uint64_t dofBlocks,
             jPos = (hi < mx) ? hi : mx;
             abStoreF32(dof, PXG_AB_DOF_mJointPositions, lane, jPos);
         }
-        else if (jointType == AU1_JOINT_PRISMATIC)
-        {
-            if (abU8(dof, PXG_AB_DOF_mMotion, lane) == AU1_MOTION_LIMITED)
-            {
-                // trap T15: a float2 at stride 8 inside mConstraintData
-                const float2 limits = abF2(dof, PXG_AB_DOF_mConstraintData + PXG_AB_IC_mLimits_LowLimitX_highLimitY, lane);
-                float jPosition = abF32(dof, PXG_AB_DOF_mJointPositions, lane);
-                if (jPosition < limits.x)
-                    jPosition = limits.x;
-                if (jPosition > limits.y)
-                    jPosition = limits.y;
-                abStoreF32(dof, PXG_AB_DOF_mJointPositions, lane, jPosition);
-            }
-        }
+        // (5.12 removed the ePRISMATIC limit clamp that sat here: prismatic
+        // limit breaches are left to the solver, as on the CPU.)
         else if (jointType == AU1_JOINT_SPHERICAL)
         {
             const uint parent = abU32(link, PXG_AB_LINK_mParents, lane);
@@ -414,6 +402,60 @@ void au1ConserveMomentum(uint64_t artiBlock, uint64_t linkBlocks, uint64_t dofBl
 }
 
 // ---------------------------------------------------------------------------
+// accumulateExternalZAcrossChainW (forwardDynamic2.cu:2993, new in 5.12)
+// ---------------------------------------------------------------------------
+// Under eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS, articulation.zAForces[link]
+// holds only the link's isolated external Z.  This leaves-to-root sweep folds
+// each child's (dof-projected) Z into its parent so that
+// updateBodiesLaunch_Part2's joint-force readback sees the cumulative chain.
+// propagateImpulseW<WriteToProvidedQstZ> with jointForce == NULL and
+// providedQstZ == NULL: `0.0f - dot` per dof (the select-spelled helper) and
+// the qstZ accumulation discarded.  zAForces is a flat Cm::UnAlignedSpatialVector
+// array in the RECORD (24-byte stride), not a block field.
+void au1AccumulateExternalZAcrossChainW(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
+                                        uint numLinks, uint lane)
+{
+    const uint64_t zAForces = artiPtrField(a, PXG_ARTI_ZA_FORCES);
+    for (uint linkID = numLinks - 1u; linkID > 0u; --linkID)
+    {
+        const uint64_t link = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const uint parent = abU32(link, PXG_AB_LINK_mParents, lane);
+        const float3 rw = float3(abF32(link, PXG_AB_LINK_mRw_x, lane),
+                                 abF32(link, PXG_AB_LINK_mRw_y, lane),
+                                 abF32(link, PXG_AB_LINK_mRw_z, lane));
+        const uint dofCount = abU8(link, PXG_AB_LINK_mDofs, lane);
+        const uint jointOffset = abU32(link, PXG_AB_LINK_mJointOffset, lane);
+        const uint64_t dofData = dofBlocks + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+
+        Ptr<float> zc = Ptr<float>(zAForces + uint64_t(linkID) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+        const AbSpatialVector childZ = asmSVec(float3(zc[0], zc[1], zc[2]), float3(zc[3], zc[4], zc[5]));
+
+        AbSpatialVector isInvD[3];
+        AbSpatialVector motionMatrix[3];
+        float qstZ[3];
+        for (uint ind = 0u; ind < 3u; ++ind)
+        {
+            isInvD[ind] = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+            motionMatrix[ind] = isInvD[ind];
+            qstZ[ind] = 0.0f;
+            if (ind < dofCount)
+            {
+                const uint64_t dd = dofData + uint64_t(ind) * PXG_AB_DOF_SIZE;
+                isInvD[ind] = au1LoadSV(dd, PXG_AB_DOF_mIsInvDW, lane);
+                motionMatrix[ind] = au1LoadSV(dd, PXG_AB_DOF_mWorldMotionMatrix, lane);
+            }
+        }
+        const AbSpatialVector translated =
+            aiPropagateImpulseWNullJf(isInvD, rw, motionMatrix, childZ, dofCount, qstZ);
+
+        // zAForces[parent] += translated (Cm::UnAlignedSpatialVector::operator+=)
+        Ptr<float> zp = Ptr<float>(zAForces + uint64_t(parent) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+        zp[0] = zp[0] + translated.top.x;    zp[1] = zp[1] + translated.top.y;    zp[2] = zp[2] + translated.top.z;
+        zp[3] = zp[3] + translated.bottom.x; zp[4] = zp[4] + translated.bottom.y; zp[5] = zp[5] + translated.bottom.z;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the kernel (forwardDynamic2.cu:3047-3075 -> updateBodiesInternal :2984-3045)
 // ---------------------------------------------------------------------------
 [shader("compute")]
@@ -490,4 +532,8 @@ void updateBodiesLaunch1T(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_G
         jointA[i] = abF32(dof, PXG_AB_DOF_mJointAccel, lane)
                   + (v - abF32(dof, PXG_AB_DOF_mJointUnconstrainedVelocities, lane)) * invDt;
     }
+
+    // 5. (5.12) the TGS-ext joint-force readback chain, into the same record
+    if (artiU8Field(d, PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER) != 0u)
+        au1AccumulateExternalZAcrossChainW(a, linkBlocks, dofBlocks, linkCount, lane);
 }

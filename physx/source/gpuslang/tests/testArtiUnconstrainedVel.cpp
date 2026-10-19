@@ -109,6 +109,7 @@
 #include "PxgBodySim.h"
 #include "DyArticulationJointCore.h"
 #include "DyArticulationMimicJointCore.h"
+#include "DyCpuGpuArticulation.h"
 
 #include <cstring>
 #include <vector>
@@ -202,6 +203,22 @@ PXG_TEST(artiUnconstrainedVel)
 
     auto fval = [](uint32_t k, uint32_t f) {
         return float(1000 * (k + 1)) + 0.03125f * float(f + 1);
+    };
+    // 5.12: the joint anchors computeLinkRw reads (small, per-component distinct)
+    // Every fourth articulation anchors its joints at the body origins: both
+    // offsets exactly +0, so computeLinkRw's `PxVec3(0.f) - childOffset` is the
+    // IEEE 0 - (+0) = +0 (a literal-zero fold gives -0) and the parent term
+    // rotates a zero vector.
+    auto zeroAnchor = [](uint32_t k) { return (k % 4u) == 3u; };
+    auto jointParentOffset = [zeroAnchor](uint32_t k, uint32_t i) {
+        if (zeroAnchor(k))
+            return PxVec3(0.0f);
+        return PxVec3(0.25f + 0.125f * float(k % 5), -0.5f + 0.0625f * float(i), 0.375f);
+    };
+    auto jointChildOffset = [zeroAnchor](uint32_t k, uint32_t i) {
+        if (zeroAnchor(k))
+            return PxVec3(0.0f);
+        return PxVec3(-0.125f, 0.75f - 0.0625f * float(k % 3), 0.5f + 0.25f * float(i));
     };
 
     // ---- the index chain: three hops, none of them the identity ----
@@ -308,12 +325,16 @@ PXG_TEST(artiUnconstrainedVel)
             props[x].invInertia = PxVec3(fval(k, 80), fval(k, 81), fval(k, 82));
             props[x].invMass = fval(k, 83);
 
-            ArticulationJointCore j(idT, idT);
+            // 5.12: Rw = Dy::computeLinkRw over the joint's link-local anchors, so
+            // the frames carry distinct per-component translations (rotations
+            // stay identity: the motion-matrix witnesses are unchanged)
+            const PxTransform parentFrame(jointParentOffset(k, i), PxQuat(PxIdentity));
+            const PxTransform childFrame(jointChildOffset(k, i), PxQuat(PxIdentity));
+            ArticulationJointCore j(parentFrame, childFrame);
             j.jointType = PxU8(PxArticulationJointType::eREVOLUTE);
             j.dofIds[0] = PxU8(PxArticulationAxis::eTWIST);
             j.jCalcUpdateFrames = true;
             j.maxJointVelocity[0] = fval(k, 84);
-            j.frictionCoefficient = fval(k, 85);
             joints.push_back(j);
         }
         jointPositions[size_t(k) * D_STRIDE] = fval(k, 100);
@@ -570,14 +591,12 @@ PXG_TEST(artiUnconstrainedVel)
             reinterpret_cast<PxReal*>(dJTPos + PxgDevicePtr(dofo * sizeof(PxReal)));
         r.jointTargetVelocities =
             reinterpret_cast<PxReal*>(dJTVel + PxgDevicePtr(dofo * sizeof(PxReal)));
-        r.jointAxis = reinterpret_cast<Cm::UnAlignedSpatialVector*>(
-            dJAxis + PxgDevicePtr(dofo * sizeof(Cm::UnAlignedSpatialVector)));
+        // (5.12: no record jointAxis / rootPreMotionVelocity; the two pools
+        // below stay allocated and must come back as uploaded)
         r.motionMatrix = reinterpret_cast<SpatialSubspaceMatrix*>(
             dMM + PxgDevicePtr(lo * sizeof(SpatialSubspaceMatrix)));
         r.motionVelocities = reinterpret_cast<Cm::UnAlignedSpatialVector*>(
             dMotionVel + PxgDevicePtr(lo * sizeof(Cm::UnAlignedSpatialVector)));
-        r.rootPreMotionVelocity = reinterpret_cast<Cm::UnAlignedSpatialVector*>(
-            dRootPre + PxgDevicePtr(size_t(k) * sizeof(Cm::UnAlignedSpatialVector)));
         r.spatialTendonParams = reinterpret_cast<PxGpuSpatialTendonData*>(
             dSParams + PxgDevicePtr(sIdx(k, 0) * sizeof(PxGpuSpatialTendonData)));
         r.spatialTendons = reinterpret_cast<PxgArticulationTendon*>(
@@ -935,17 +954,21 @@ PXG_TEST(artiUnconstrainedVel)
                 getU32(lk, blk1 + offsetof(PxgArticulationBlockLinkData, mParents) + lane * 4);
             if (par != 0u) fail("link1 mParents", k, par, 0u);
 
-            const PxVec3 p0 = body2Worlds[size_t(k) * L_STRIDE + 0].p;
-            const PxVec3 p1 = body2Worlds[size_t(k) * L_STRIDE + 1].p;
+            // 5.12: Dy::computeLinkRw (the engine's own) from the two world
+            // orientations and the joint anchors; link 1 is revolute (no slide)
+            const PxVec3 rw = Dy::computeLinkRw(body2Worlds[size_t(k) * L_STRIDE + 0].q,
+                                                body2Worlds[size_t(k) * L_STRIDE + 1].q,
+                                                jointParentOffset(k, 1), jointChildOffset(k, 1),
+                                                PxVec3(0.0f));
             const uint32_t rwx =
                 getU32(lk, blk1 + offsetof(PxgArticulationBlockLinkData, mRw_x) + lane * 4);
             const uint32_t rwy =
                 getU32(lk, blk1 + offsetof(PxgArticulationBlockLinkData, mRw_y) + lane * 4);
             const uint32_t rwz =
                 getU32(lk, blk1 + offsetof(PxgArticulationBlockLinkData, mRw_z) + lane * 4);
-            if (rwx != bits(p1.x - p0.x)) fail("link1 mRw_x", k, rwx, bits(p1.x - p0.x));
-            if (rwy != bits(p1.y - p0.y)) fail("link1 mRw_y", k, rwy, bits(p1.y - p0.y));
-            if (rwz != bits(p1.z - p0.z)) fail("link1 mRw_z", k, rwz, bits(p1.z - p0.z));
+            if (rwx != bits(rw.x)) fail("link1 mRw_x", k, rwx, bits(rw.x));
+            if (rwy != bits(rw.y)) fail("link1 mRw_y", k, rwy, bits(rw.y));
+            if (rwz != bits(rw.z)) fail("link1 mRw_z", k, rwz, bits(rw.z));
 
             // link 1 goes through storeSpatialTransform, which writes p.w = 0 --
             // the asymmetry with the root's raw copy

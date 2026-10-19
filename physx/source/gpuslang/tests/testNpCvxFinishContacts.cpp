@@ -273,7 +273,7 @@ static void refFinish(const std::vector<Pair>& pr, uint32_t numTests, bool inser
             cOff0 = contactsBytes; contactsBytes += 16 * total;
             fOff0 = forceBytes; forceBytes += 4 * total;
             if ((cOff0 + 16 * total) >= contactLimit) { ovf |= 1u; cOff0 = 0xFFFFFFFFu; }
-            else if ((fOff0 + 4 * total) >= forceLimit) { ovf |= 2u; fOff0 = 0xFFFFFFFFu; }
+            else if ((fOff0 + 4 * total) >= forceLimit) { ovf |= 2u; fOff0 = 0xFFFFFFFFu; cOff0 = 0xFFFFFFFFu; } // 5.12: cudaGJKEPA.cu:1780
         }
 
         for (uint32_t g = 0; g < 8; ++g)

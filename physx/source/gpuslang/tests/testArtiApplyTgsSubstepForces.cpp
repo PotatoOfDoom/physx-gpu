@@ -95,7 +95,7 @@ const uint32_t ATS_NB_ARTI = 40;
 const uint32_t ATS_NB_WARPS = 2;
 const uint32_t ATS_MAX_LINKS = 7;
 const uint32_t ATS_MAX_DOFS = 15;
-const uint32_t ATS_RECORD_SIZE = 544;       // sizeof(PxgArticulation), pinned in the desc map
+const uint32_t ATS_RECORD_SIZE = 496;       // sizeof(PxgArticulation), pinned in the desc map
 const float ATS_STEP_DT = 0.0234375f;       // exactly representable, not 1
 
 // PXG_ARTI_CORE_* offsets, pinned by testArtiCoreDescLayout
@@ -106,10 +106,10 @@ const uint32_t ATS_D_LINK_BLOCKS = 136;
 const uint32_t ATS_D_DOF_BLOCKS = 184;
 const uint32_t ATS_D_MAX_LINKS = 248;
 const uint32_t ATS_D_MAX_DOFS = 252;
-const uint32_t ATS_DESC_SIZE = 360;
+const uint32_t ATS_DESC_SIZE = 344;
 // PxgArticulation record offsets, pinned by the desc map's static_asserts
 const uint32_t ATS_R_ZA_FORCES = 88;
-const uint32_t ATS_R_JOINT_FORCE = 136;
+const uint32_t ATS_R_JOINT_FORCE = 128;
 
 static uint32_t atsNumLinks(uint32_t k) { return 1u + (k % 7u); }
 static bool atsFixBase(uint32_t k) { return (k % 3u) == 1u; }
@@ -346,7 +346,7 @@ PXG_TEST(artiApplyTgsSubstepForces)
         return;
     }
 
-    // the 544-byte record images: only the two pointers live
+    // the 496-byte record images: only the two pointers live
     std::vector<uint8_t> recImg(recBytes, 0xAB);
     for (uint32_t k = 0; k < ATS_NB_ARTI; ++k)
     {

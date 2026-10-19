@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 487;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 405;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 407;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -339,8 +339,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "getArtiTransformStates", "npArtiGetSet.spv", "getArtiTransformStates" },  // ARTI_GET_TRANSFORM_STATES (unmapped)
     { "getArtiVelocityStates", "npArtiGetSet.spv", "getArtiVelocityStates" },  // ARTI_GET_VELOCITY_STATES (unmapped)
     { "getArtiSpatialForceStates", "npArtiGetSet.spv", "getArtiSpatialForceStates" },  // ARTI_GET_SPATIAL_FORCE_STATES (unmapped)
-    { "getArtiLinkForceState", nullptr, nullptr },  // ARTI_GET_LINK_FORCE_STATE (unmapped, new in 5.12)
-    { "getArtiLinkTorqueState", nullptr, nullptr },  // ARTI_GET_LINK_TORQUE_STATE (unmapped, new in 5.12)
+    { "getArtiLinkForceState", "npArtiGetSet.spv", "getArtiLinkForceState" },  // ARTI_GET_LINK_FORCE_STATE (new in 5.12; OVD snapshot)
+    { "getArtiLinkTorqueState", "npArtiGetSet.spv", "getArtiLinkTorqueState" },  // ARTI_GET_LINK_TORQUE_STATE (new in 5.12; OVD snapshot)
     { "setArtiDofStates", "npArtiGetSet.spv", "setArtiDofStates" },  // ARTI_SET_DOF_STATES (unmapped)
     { "setArtiRootGlobalPoseState", "npArtiGetSet.spv", "setArtiRootGlobalPoseState" },  // ARTI_SET_ROOT_GLOBAL_POSE_STATE (unmapped)
     { "setArtiRootVelocityState", "npArtiGetSet.spv", "setArtiRootVelocityState" },  // ARTI_SET_ROOT_VELOCITY_STATE (unmapped)

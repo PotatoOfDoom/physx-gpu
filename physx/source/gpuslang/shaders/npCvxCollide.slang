@@ -1510,9 +1510,13 @@ void generateConvexContacts(inout CollideScratch s, inout uint numManifoldContac
                       -normal, dot3(witnessB - witnessA, normal),
                       numManifoldContacts);
 
-    // full contact-gen decision (cu L887, the ACTIVE line: post-add count < 4;
-    // the initialNbContacts variant is the commented-out cu L886)
-    const bool fullContactGen = (0.707106781f > dot3(localNor, -normal)) || (numManifoldContacts < 4u);
+    // full contact-gen decision (5.12 cudaGJKEPA.cu:864-865, post-add count < 4).
+    // 5.12 adds `initialNbContacts > 1` in front -- "added to fix a jittering
+    // bug" (5.9 changelog: rare jittering case in PCM); 5.6.1 had only the last
+    // two terms.  initialNbContacts is the pre-refresh manifold count stage 1
+    // packed into bits 8.. of nbContacts (npCvxStage2Core).
+    const bool fullContactGen = (s.initialNbContacts > 1u)
+                                || (0.707106781f > dot3(localNor, -normal)) || (numManifoldContacts < 4u);
     if (!fullContactGen)
         return;
 

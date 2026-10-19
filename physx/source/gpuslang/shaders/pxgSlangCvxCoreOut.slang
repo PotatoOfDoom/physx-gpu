@@ -170,8 +170,11 @@ struct CvxCoreOutRefs
 // generator considered "first".
 void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
                         float3 patchNormal, float3 pointsOut[4], float distsOut[4],
-                        uint nbContacts, CvxCoreOutRefs o)
+                        uint nbContactsIn, CvxCoreOutRefs o)
 {
+    uint nbContacts = nbContactsIn;
+    // 5.12 (:173): the patch demand survives a failed contact/force allocation.
+    const bool patchRequested = nbContacts > 0u;
     // ---- TestOutput::writeOutput (:177-290) --------------------------------
     Ptr<PxgPatchAndContactCountersGpu> counters =
         Ptr<PxgPatchAndContactCountersGpu>(o.patchAndContactCounters);
@@ -186,15 +189,18 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     {
         InterlockedAdd(counters[0].contactsBytes, CONTACT_SIZE * nbContacts, contactByteOffset);
         InterlockedAdd(counters[0].forceAndIndiceBytes, FORCE_SIZE * nbContacts, forceByteOffset);
-        if ((uint64_t(contactByteOffset) + uint64_t(CONTACT_SIZE)) > uint64_t(o.contactBytesLimit))
+        // 5.12 (:181-192): the WHOLE reservation is tested, and a force overflow
+        // also drops the contact offset.
+        if ((uint64_t(contactByteOffset) + uint64_t(CONTACT_SIZE) * uint64_t(nbContacts)) > uint64_t(o.contactBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_CONTACT);
             contactByteOffset = INVALID;
         }
-        if ((uint64_t(forceByteOffset) + uint64_t(FORCE_SIZE)) > uint64_t(o.forceBytesLimit))
+        if ((uint64_t(forceByteOffset) + uint64_t(FORCE_SIZE) * uint64_t(nbContacts)) > uint64_t(o.forceBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, OVERFLOW_FORCE);
             forceByteOffset = INVALID;
+            contactByteOffset = INVALID;
         }
     }
 
@@ -215,6 +221,7 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     {
         cmOutputs[testIndex].contactForces = 0uL;
         cmOutputs[testIndex].contactPoints = 0uL;
+        nbContacts = 0u; // 5.12 (:213)
     }
 
     const uint allflags = cmOutputs[testIndex].allflagsWord;
@@ -240,7 +247,7 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
     }
 
     uint patchIndex = INVALID;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         InterlockedAdd(counters[0].patchesBytes, PATCH_SIZE, patchIndex);
         if ((uint64_t(patchIndex) + uint64_t(PATCH_SIZE)) > uint64_t(o.patchBytesLimit))
@@ -255,10 +262,12 @@ void cvxCoreWriteOutput(uint testIndex, PxgShapeGpu shape0, PxgShapeGpu shape1,
             touchChangeFlags[testIndex] = previouslyHadTouch ? 1u : 0u;
             patchChangeFlags[testIndex] = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (nbContacts != 0u)
         {
             cmOutputs[testIndex].contactPatches = o.startContactPatches + uint64_t(patchIndex);
         }
+        else
+            patchIndex = INVALID;
     }
 
     // insertIntoPatchStream(materials, patchStream, shape0, shape1, patchIndex,

@@ -53,6 +53,7 @@
 #include "DyFeatherstoneArticulationUtils.h"
 #include "DyFeatherstoneArticulation.h"
 #include "PxgArticulation.h"
+#include "pxgDySpatialMatrixRef.h"
 
 #include <cstdint>
 #include <cstring>
@@ -475,9 +476,10 @@ inline void fvMirror(physx::PxgArticulationBlockData* ab,
 }
 
 // P8.105: the EIGHT-argument PxcFsFlushVelocity overload
-// (forwardDynamic2.cu:3990) -- fvMirror minus the two mSolverSpatialDeltaVel
-// accumulations, plus the solver outVelocity writes (linear at [i], angular
-// at [i + offset], w = 0).
+// (forwardDynamic2.cu:3953) -- 5.12: fvMirror (both mSolverSpatialDeltaVel
+// accumulations now included, parity with articulationDynamic.cuh) plus the
+// solver outVelocity writes (linear at [i], angular at [i + offset], w = 0);
+// the root's velocity is published on BOTH paths, ZERO for a fixed base.
 inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
                         physx::PxgArticulationBlockLinkData* lk,
                         physx::PxgArticulationBlockDofData* df, uint32_t linkCount, bool fixBase,
@@ -486,24 +488,28 @@ inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
     UnAlignedSpatialVector deltaV = UnAlignedSpatialVector::Zero();
     const UnAlignedSpatialVector deferredZ = -loadSpatialVector(ab->mRootDeferredZ, lane);
 
+    UnAlignedSpatialVector vel = UnAlignedSpatialVector::Zero();
+
     if (!fixBase)
     {
-        const UnAlignedSpatialVector motionVelocity0 = loadSpatialVector(lk[0].mMotionVelocity,
-                                                                         lane);
+        vel = loadSpatialVector(lk[0].mMotionVelocity, lane);
+        const UnAlignedSpatialVector solverSpatialDeltaVel0 =
+            loadSpatialVector(lk[0].mSolverSpatialDeltaVel, lane);
 
         physx::Dy::SpatialMatrix invInertia;
         loadSpatialMatrix(ab->mInvSpatialArticulatedInertia, lane, invInertia);
 
         deltaV = invInertia * deferredZ;
 
-        const UnAlignedSpatialVector vel = motionVelocity0 + deltaV;
-
-        outVelocity[0] = make_float4(vel.bottom.x, vel.bottom.y, vel.bottom.z, 0.f);
-        outVelocity[offset] = make_float4(vel.top.x, vel.top.y, vel.top.z, 0.f);
+        vel += deltaV;
 
         storeSpatialVector(lk[0].mMotionVelocity, vel, lane);
         storeSpatialVector(ab->mRootDeferredZ, UnAlignedSpatialVector::Zero(), lane);
+        storeSpatialVector(lk[0].mSolverSpatialDeltaVel, solverSpatialDeltaVel0 + deltaV, lane);
     }
+
+    outVelocity[0] = make_float4(vel.bottom.x, vel.bottom.y, vel.bottom.z, 0.f);
+    outVelocity[offset] = make_float4(vel.top.x, vel.top.y, vel.top.z, 0.f);
 
     storeSpatialVector(lk[0].mScratchDeltaV, deltaV, lane);
     storeSpatialVector(lk[0].mConstraintForces,
@@ -524,8 +530,8 @@ inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
             const PxU32 nbDofs = nextNbDofs;
             const PxU32 parent = nextParent;
 
-            const UnAlignedSpatialVector preloadedConstraintForces =
-                loadSpatialVector(tLink.mConstraintForces, lane);
+            const UnAlignedSpatialVector preloadedSolverSpatialDeltaVel =
+                loadSpatialVector(tLink.mSolverSpatialDeltaVel, lane);
 
             UnAlignedSpatialVector motionV = nextMotionV;
 
@@ -541,6 +547,9 @@ inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
 
             deltaV = fvPropagateAccel(tLink, dofs, nbDofs, deltaV, lane);
 
+            storeSpatialVector(tLink.mSolverSpatialDeltaVel,
+                               preloadedSolverSpatialDeltaVel + deltaV, lane);
+
             for (PxU32 ind = 0; ind < nbDofs; ++ind)
                 dofs[ind].mDeferredQstZ[lane] = 0.f;
 
@@ -552,7 +561,9 @@ inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
             outVelocity[i + offset] = make_float4(motionV.top.x, motionV.top.y, motionV.top.z, 0.f);
 
             storeSpatialVector(tLink.mMotionVelocity, motionV, lane);
-            storeSpatialVector(tLink.mConstraintForces, preloadedConstraintForces + deltaV, lane);
+            // addSpatialVector: a load-add-store at this point (5.12)
+            storeSpatialVector(tLink.mConstraintForces,
+                               loadSpatialVector(tLink.mConstraintForces, lane) + deltaV, lane);
 
             dofs += nbDofs;
         }

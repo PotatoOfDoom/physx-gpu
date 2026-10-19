@@ -46,10 +46,8 @@
 //  2. **articulationBatchOffset and nbArticulations read islandContextPool[0]**
 //     (the CUDA derefs the POINTER: `islandContextPool->mBatchCount` /
 //     `->mArticulationCount`), while island itself is pool[islandIndex].
-//  3. **The lane guard must not skip the error reduction**: the CUDA's
-//     `return` for lanes >= mDescStride never reaches the accumulate, which
-//     contributes exactly zero -- the port guards the body instead so the
-//     caller's groupshared butterfly stays in uniform control flow.
+//  3. The lanes >= mDescStride do nothing (the CUDA `return`s; 5.6.1's port
+//     guarded the body for the caller's residual butterfly, gone in 5.12).
 //  4. **The 3-slot velocity staging** at readIndex = k*192 + lane, slots
 //     0/32/64 (body A) and 96/128/160 (body B), TGS packing
 //     (vb.xyz|vt.x, vt.yz|db.xy, db.z|dt.xyz).
@@ -96,21 +94,16 @@ public void aspSolveBlockPartitionTGS(
     uint64_t solverDescA, uint64_t sharedDescA,
     uint islandIndex, uint partitionIndex,
     float elapsedTime, float minPen, uint64_t artiDescA,
-    uint globalWarpIndex, uint lane,
-    out float errSumSq, out float errMax, out uint errCount, out bool accumulateError)
+    uint globalWarpIndex, uint lane)
 {
-    errSumSq = 0.0f;
-    errMax = 0.0f;
-    errCount = 0u;
 
     Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(solverDescA);
     Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(sharedDescA);
     Ptr<PxgIslandContextGpu> islandPool = Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
 
     // 5.12 removed the solver residual reporting and PxgSolverCoreDesc's
-    // contactErrorAccumulator: nothing accumulates any more (the error outputs
-    // stay until the articulation area strips them; solveBlockUnified ignores them).
-    accumulateError = false;
+    // contactErrorAccumulator: nothing accumulates any more.
+    const bool accumulateError = false;
 
     const uint64_t d = artiDescA;
     const uint64_t gArticulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS);
@@ -146,7 +139,7 @@ public void aspSolveBlockPartitionTGS(
     const uint descStride = batch[0].descStride_constraintType & 0xFFFFu;
     const uint constraintType = batch[0].descStride_constraintType >> 16u;
 
-    // trap 3: guard, not return -- the caller's butterfly needs every lane
+    // trap 3: the lanes >= mDescStride return (as the CUDA)
     if (lane >= descStride)
         return;
 
@@ -324,8 +317,4 @@ public void aspSolveBlockPartitionTGS(
         abStoreU8(gArticulations + uint64_t(articBlockId) * PXG_AB_BLOCK_SIZE,
                   PXG_AB_mStateDirty, solverBodyId1 & 31u, ASP_DIRTY);
     }
-
-    errSumSq = error.sumOfSquares;
-    errMax = error.maxError;
-    errCount = uint(error.counter);
 }

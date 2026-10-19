@@ -460,6 +460,10 @@ static void ssSeed(SsArena& B, uint32_t salt)
 
 // ---- mirror (hoisted to pxgArtiSelfRef.h in P8.99c; this fixture is a user) ----
 
+// 5.12: the PGS contact friction velMultiplier reads the island's rigidContact bias
+// coefficient (5.6.1 hard-coded 0.8); a non-0.8 value keeps the old constant visible
+static const float SS_RIGID_CONTACT_BIAS = 0.65f;
+
 static void refSolveSelf(SsArena& W, bool doFriction, bool accumErr, SelfCoverage& cov)
 {
     for (PxU32 lane = 0; lane < SS_LANES; ++lane)
@@ -469,7 +473,7 @@ static void refSolveSelf(SsArena& W, bool doFriction, bool accumErr, SelfCoverag
                             W.tmpA.data(), W.tmpB.data(), W.tmpC.data(),
                             W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(), W.fp.data(),
                             W.jh.data(), W.jr.data(), W.jm.data(), W.rs.data(),
-                            doFriction, accumErr, err, cov, lane);
+                            doFriction, accumErr, err, cov, lane, SS_RIGID_CONTACT_BIAS);
     }
 }
 
@@ -481,8 +485,10 @@ struct SsParamsHost
     uint64_t batches, contactHeaders, frictionHeaders, contactPoints, frictionPoints;
     uint64_t jointHeaders, jointRowsCon, jointRowsMod, responses;
     uint32_t wordSize, accumulateError, doFriction, nbLanes;
+    float rigidContactBiasCoefficient;   // @144 (5.12)
+    uint32_t pad0;
 };
-static_assert(sizeof(SsParamsHost) == 144, "params blob");
+static_assert(sizeof(SsParamsHost) == 152, "params blob");
 
 static size_t ssRun(PxgCudaShim& shim, bool doFriction, bool accumErr, uint32_t salt)
 {
@@ -554,7 +560,8 @@ static size_t ssRun(PxgCudaShim& shim, bool doFriction, bool accumErr, uint32_t 
                          uint64_t(dBt), uint64_t(dCh), uint64_t(dFh), uint64_t(dCp),
                          uint64_t(dFp), uint64_t(dJh), uint64_t(dJr), uint64_t(dJm),
                          uint64_t(dRs),
-                         SS_WORDSIZE, accumErr ? 1u : 0u, doFriction ? 1u : 0u, SS_LANES };
+                         SS_WORDSIZE, accumErr ? 1u : 0u, doFriction ? 1u : 0u, SS_LANES,
+                         SS_RIGID_CONTACT_BIAS, 0u };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch self solve");
     shim.streamSynchronize();
@@ -600,7 +607,7 @@ PXG_TEST(artiSolveSelfPgs)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiSolveSelf.spv", "ssSolveSelfPgsTest", 144u, 0 },
+        { "npArtiSolveSelf.spv", "ssSolveSelfPgsTest", 152u, 0 },
     };
     PxgCudaShim shim(dev, manifest, 1, &sspLoader);
 

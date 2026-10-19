@@ -50,10 +50,17 @@
 //
 // THE THREE THINGS THAT ARE EASY TO GET WRONG, all preserved:
 //
-//   * THE OVERFLOW TEST IS ON ONE RECORD, NOT THE WHOLE RESERVATION.  Upstream
-//     compares `offset + sizeof(PxContact)` against the limit, not
-//     `offset + sizeof(PxContact) * nbContacts`.  It is a weaker test than it
-//     looks, and it is upstream's.
+//   * THE OVERFLOW TEST IS ON THE WHOLE RESERVATION (5.12).  Up to 5.6.1 upstream
+//     compared `offset + sizeof(PxContact)` (one record) against the limit; 5.12
+//     ("illegal memory accesses ... when GPU rigid-body contact buffers
+//     overflow") compares `offset + sizeof(PxContact) * nbContacts`, and the
+//     same for the force range.  The sum is size_t arithmetic in the CUDA, so it
+//     is evaluated in 64 bits here.  A FORCE overflow now also invalidates the
+//     contact offset, so the pair gets NULL contact pointers.
+//   * registerContactPatch KEEPS THE PATCH DEMAND (5.12).  When the contact or
+//     force allocation failed (either cmOutputs pointer is NULL) the count is
+//     zeroed for the status word and nbContacts, but the patch is still
+//     reserved (`patchRequested`), and then returned as invalid.
 //   * A PATCH OVERFLOW REWRITES THE STATUS WORD THAT WAS ALREADY WRITTEN.  When
 //     the patch reservation fails the code goes back and clears the touch flag,
 //     zeroes the contact count and re-derives BOTH change flags -- so the pair
@@ -119,16 +126,17 @@ public uint nptReserveContacts(uint64_t countersAddr, uint64_t cmOutputsAddr,
     {
         InterlockedAdd(counters[0].contactsBytes, NPT_CONTACT_SIZE * nbContacts, contactByteOffset);
         InterlockedAdd(counters[0].forceAndIndiceBytes, NPT_FORCE_SIZE * nbContacts, forceByteOffset);
-        // ONE RECORD, not the whole reservation -- see the header.
-        if ((contactByteOffset + NPT_CONTACT_SIZE) > contactBytesLimit)
+        // the WHOLE reservation, in size_t (64-bit) arithmetic -- see the header.
+        if ((uint64_t(contactByteOffset) + uint64_t(NPT_CONTACT_SIZE) * uint64_t(nbContacts)) > uint64_t(contactBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, NPT_OVERFLOW_CONTACT);
             contactByteOffset = NPT_INVALID;
         }
-        if ((forceByteOffset + NPT_FORCE_SIZE) > forceBytesLimit)
+        if ((uint64_t(forceByteOffset) + uint64_t(NPT_FORCE_SIZE) * uint64_t(nbContacts)) > uint64_t(forceBytesLimit))
         {
             InterlockedOr(counters[0].overflowError, NPT_OVERFLOW_FORCE);
             forceByteOffset = NPT_INVALID;
+            contactByteOffset = NPT_INVALID; // 5.12
         }
     }
 
@@ -150,12 +158,18 @@ public uint nptReserveContacts(uint64_t countersAddr, uint64_t cmOutputsAddr,
 public uint nptRegisterContactPatch(uint64_t countersAddr, uint64_t cmOutputsAddr,
                                     uint64_t touchChangeAddr, uint64_t patchChangeAddr,
                                     uint64_t startContactPatches, uint patchBytesLimit,
-                                    uint workIndex, uint nbContacts)
+                                    uint workIndex, uint nbContactsIn)
 {
     Ptr<PxgPatchAndContactCountersGpu> counters = Ptr<PxgPatchAndContactCountersGpu>(countersAddr);
     Ptr<PxsContactManagerOutputGpu> cmOutputs = Ptr<PxsContactManagerOutputGpu>(cmOutputsAddr);
     Ptr<uint> touchChangeFlags = Ptr<uint>(touchChangeAddr);
     Ptr<uint> patchChangeFlags = Ptr<uint>(patchChangeAddr);
+
+    // 5.12: preserve patch demand even if contact or force allocation failed.
+    uint nbContacts = nbContactsIn;
+    const bool patchRequested = nbContacts > 0u;
+    if (patchRequested && (cmOutputs[workIndex].contactPoints == 0uL || cmOutputs[workIndex].contactForces == 0uL))
+        nbContacts = 0u;
 
     const uint allflags = cmOutputs[workIndex].allflagsWord;
     const uint oldStatusFlags = (allflags >> 16u) & 0xFFu;
@@ -180,7 +194,7 @@ public uint nptRegisterContactPatch(uint64_t countersAddr, uint64_t cmOutputsAdd
     }
 
     uint patchIndex = NPT_INVALID;
-    if (nbContacts != 0u)
+    if (patchRequested)
     {
         InterlockedAdd(counters[0].patchesBytes, NPT_PATCH_SIZE, patchIndex);
         if ((patchIndex + NPT_PATCH_SIZE) > patchBytesLimit)
@@ -196,10 +210,12 @@ public uint nptRegisterContactPatch(uint64_t countersAddr, uint64_t cmOutputsAdd
             touchChangeFlags[workIndex] = previouslyHadTouch ? 1u : 0u;
             patchChangeFlags[workIndex] = (prevPatches != 0u) ? 1u : 0u;
         }
-        else
+        else if (nbContacts != 0u)
         {
             cmOutputs[workIndex].contactPatches = startContactPatches + uint64_t(patchIndex);
         }
+        else
+            patchIndex = NPT_INVALID;
     }
     return patchIndex;
 }

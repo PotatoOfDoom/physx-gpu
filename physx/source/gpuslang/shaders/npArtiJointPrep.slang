@@ -61,7 +61,7 @@
 //  7. **rowCounts is the SETUP RETURN** (degenerate rows skipped), packed as
 //     uchar4(rowCounts, breakable, 0, 0); breakable tests both break forces
 //     against PX_MAX_F32.
-//  8. **erp = 0.5f * biasCoefficient**; a degenerate row (unitResponse <=
+//  8. **erp = biasCoefficient** (5.12; 5.6.1: 0.5f * biasCoefficient); a degenerate row (unitResponse <=
 //     1e-12) writes NOTHING in the TGS variant (the PGS twin writes
 //     ang0Writeback first).
 //  9. **computeJointSpeedTGS runs UNGATED and keys on isKinematic** (the PGS
@@ -180,8 +180,8 @@ void artiTGSJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_G
     const float recipSimDt = sharedDesc[0].invDtF32;
     const float lengthScale = sharedDesc[0].lengthScale;
     // 5.12: the prepare desc carries Dy::BiasCoefficientCollection; the
-    // articulation joint prep reads biasCoefficients.joint (the erp formula
-    // below is still 5.6.1's -- articulation area)
+    // articulation joint prep reads biasCoefficients.joint and uses it
+    // directly as the erp (fillJointBlockParams)
     const float biasCoefficient = prepDesc[0].biasCoefficients.joint;
 
     headers[hdi].writeBackOffset[lane] = constants[uniqueIndex].mConstraintWriteBackIndex;
@@ -219,7 +219,9 @@ void artiTGSJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_G
     }
 
     // ---- setUpArti1DConstraintBlock, TGS (:1594) ----
-    const float erp = 0.5f * biasCoefficient;   // trap 8
+    // trap 8 (5.12): erp = biasCoefficient, the host's
+    // BiasCoefficientCollection::joint (5.6.1: 0.5f * biasCoefficient)
+    const float erp = biasCoefficient;
     const float cfm = (b0.cfm > b1.cfm) ? b0.cfm : b1.cfm;   // P9.86: PxMax = selectMax a>b?a:b (artiConstraintPrep2.cu:1828); FMax gives +0 for (+0,-0)
     const float4 imsRow = cdata[cdi].mInvMassScale[lane];
 
@@ -351,7 +353,8 @@ void artiTGSJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_G
 // declarations -- the rigid PGS joint prep runs on them).
 //
 // PGS-vs-TGS traps, each a sweep mutant unless marked:
-//  P1. erp = 1.0f (TGS: 0.5f * biasCoefficient).
+//  P1. erp = biasCoefficients.joint (5.12; 5.6.1 hard-coded 1.0f; TGS: the same
+//      coefficient, 5.6.1 0.5f * biasCoefficient).
 //  P2. ang0Writeback is written into slot (conBase + outCount) BEFORE the
 //      degenerate skip -- a degenerate row leaves its cang0 behind in the
 //      slot the next surviving row then overwrites; a TRAILING degenerate
@@ -554,7 +557,9 @@ void artiJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_Grou
     }
 
     // ---- setUpArti1DConstraintBlock, PGS (:1424) ----
-    const float erp = 1.0f;   // trap P1
+    // trap P1 (5.12): erp = params.biasCoefficient = biasCoefficients.joint
+    // (fillJointBlockParams, PGS); 5.6.1 hard-coded 1.0f
+    const float erp = prepDesc[0].biasCoefficients.joint;
 
     uint outCount = 0u;
     for (uint r = 0u; r < numRows; ++r)

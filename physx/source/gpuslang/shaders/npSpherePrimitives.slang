@@ -92,8 +92,10 @@ float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
     return dot(v, v);
 }
 
-// mirrors distanceSegmentSegment.cuh distanceSegmentSegmentSquared
-void distanceSegmentSegmentSquared(float3 p1, float3 d1, float3 p2, float3 d2, out float s, out float t)
+// mirrors distanceSegmentSegment.cuh distanceSegmentSegmentSquared.  Public since
+// 5.12: boxBoxNphase's edge-edge fallback (cudaBox.cu computeEdgeEdgeContactWorld)
+// calls the same helper, so it imports this body rather than retyping it.
+public void distanceSegmentSegmentSquared(float3 p1, float3 d1, float3 p2, float3 d2, out float s, out float t)
 {
     const float eps = 1e-6f;
     const float3 r = p1 - p2;

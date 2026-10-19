@@ -44,9 +44,8 @@
 //    eHAS_IMPULSES; resetSlabCount ALWAYS; eVEL_DIRTY stored always;
 //  * per-warp scalar batch windows (3@1 / 2@4 / 1@6) in ONE global batch
 //    array; poison entries 0 and 7 must stay 0xAB;
-//  * minPen from the velocityIteration bool; accumulateError from the
-//    SIGNED mCounter at CONTACT_ERROR_ACC+4 (round B: -1, 1D residuals must
-//    stay poisoned);
+//  * minPen from the velocityIteration bool; (5.12: no accumulateError --
+//    the desc lost mContactErrorAccumulator and nothing accumulates);
 //  * doFriction passed both ways and IGNORED (TGS path).
 
 #include "pxgTestFramework.h"
@@ -103,13 +102,13 @@ const uint32_t D_NB_ARTICULATIONS = 44, D_NB_SLABS = 80, D_IMPULSES = 72;
 const uint32_t D_SLAB_HAS_CHANGES = 88, D_ARTI_BLOCKS = 128, D_LINK_BLOCKS = 136;
 const uint32_t D_DOF_BLOCKS = 184, D_PATH_TO_ROOT = 176;
 const uint32_t D_TEMP_PATH_TO_ROOT = 152, D_TEMP_SHARED = 160, D_TEMP_ROOT = 168;
-const uint32_t D_MAX_LINKS = 248, D_MAX_DOFS = 252, D_ERROR_COUNTER = 348;
+const uint32_t D_MAX_LINKS = 248, D_MAX_DOFS = 252;
 // PxgSolverCoreDesc::islandContextPool -- pinned by testSolverDescLayout
 const uint32_t SD_ISLAND_CONTEXT_POOL = 48;
 // PxgSolverSharedDesc<IterativeSolveDataTGS>::iterativeData.* -- ditto
 const uint32_t SH_BATCH = 96, SH_JHDR = 104, SH_JROW = 112, SH_CHDR = 128;
 const uint32_t SH_FHDR = 136, SH_CPTS = 144, SH_FPTS = 152, SH_ENC = 176, SH_RESP = 216;
-const uint32_t SH_SIZE = 224, SD_SIZE = 320, DESC_SIZE = 360;
+const uint32_t SH_SIZE = 224, SD_SIZE = 320, DESC_SIZE = 344;
 
 static float fv(uint32_t a, uint32_t l, uint32_t d, uint32_t salt)
 {
@@ -231,7 +230,7 @@ static void slSeed(SlArena& B, uint32_t salt, int32_t errCounter)
     w32(B.desc, D_NB_SLABS, SL_NB_SLABS);
     w32(B.desc, D_MAX_LINKS, SL_MAX_LINKS);
     w32(B.desc, D_MAX_DOFS, SL_MAX_DOFS);
-    w32(B.desc, D_ERROR_COUNTER, uint32_t(errCounter));
+    (void)errCounter;   // 5.12: no mContactErrorAccumulator (the desc ends at 344)
 
     B.islands[0].mBodyStartIndex = SL_BODY_START;
     B.islands[0].mBodyCount = SL_BODY_COUNT;
@@ -421,7 +420,7 @@ static void slSeed(SlArena& B, uint32_t salt, int32_t errCounter)
                 H.restitutionXdt[lane] = ((lane + b) % 4u == 1u) ? (-0.3f + 0.1f * fv(lane, b, 70, salt))
                                                                  : (0.2f + 0.1f * fv(lane, b, 71, salt));
                 H.cfm[lane] = 0.01f + 0.005f * fv(lane, b, 72, salt);
-                H.p8[lane] = 0.9f;
+                H.biasCoefficient[lane] = 0.9f;   // 5.12 renamed p8
                 F.numFrictionConstr[lane] = ((lane + b) % 3u) * 2u + (((lane + b) % 5u == 2u) ? 1u : 0u);
                 F.dynamicFriction[lane] = 0.4f + 0.2f * fv(lane, b, 73, salt);
                 F.biasCoefficient[lane] = 0.5f + 0.2f * fv(lane, b, 74, salt);
@@ -520,6 +519,10 @@ static void slSeed(SlArena& B, uint32_t salt, int32_t errCounter)
 
 // ---- mirror ----
 
+// 5.12: the island's rigidContact bias coefficient (5.6.1 hard-coded 0.8 in the PGS
+// contact friction); a non-0.8 value keeps the old constant visible
+static const float SL_RIGID_CONTACT_BIAS = 0.65f;
+
 static void slMirrorCountSlabs(const SlArena& W, uint32_t bodyIndex, uint32_t& refCount)
 {
     refCount = 0;
@@ -589,7 +592,7 @@ struct SlParamsHost
     float elapsedTime;    // @20
     uint64_t sharedDesc;  // @24
     uint32_t doFrictionWord; // @32
-    uint32_t pad0;        // @36
+    float rigidContactBiasCoefficient; // @36 (5.12): read by the PGS twin only
 };
 static_assert(sizeof(SlParamsHost) == 40, "params blob");
 
@@ -602,7 +605,8 @@ static size_t slRun(PxgCudaShim& shim, bool velIter, bool doFriction, int32_t er
     SlArena W = A;
     SelfCoverage cov;
     uint32_t hasImpulses = 0, refGt1 = 0, refClamped = 0, alignedHits = 0, unalignedHits = 0;
-    const bool accumErr = errCounter >= 0;
+    // 5.12 removed the residual reporting: the kernel never accumulates
+    const bool accumErr = false;
     slMirror(W, velIter, accumErr, cov, hasImpulses, refGt1, refClamped, alignedHits,
              unalignedHits);
 
@@ -683,7 +687,7 @@ static size_t slRun(PxgCudaShim& shim, bool velIter, bool doFriction, int32_t er
     }
 
     SlParamsHost prm = { uint64_t(dDesc), uint64_t(dSd), velIter ? 1u : 0u, SL_ELAPSED,
-                         uint64_t(dSh), doFriction ? 1u : 0u, 0u };
+                         uint64_t(dSh), doFriction ? 1u : 0u, SL_RIGID_CONTACT_BIAS };
     PXG_CHECK_MSG(shim.launchKernel(0, SL_WARPS, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch self-solve kernel");
     shim.streamSynchronize();

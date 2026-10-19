@@ -43,11 +43,11 @@
 //
 // WHAT THE CASES HAVE TO CONSTRUCT, over and above random content:
 //   * each overflow on its own (patch, contact, force) and patch+force together;
-//     force-only overflow is the case where contactForces is stored as
-//     startContactForces + 0xFFFFFFFF, upstream's sharp edge (cu:230, :349);
-//   * a contact limit of exactly offset + 16 with several points, which the CUDA
-//     accepts because it tests ONE PxContact (:201, :321) -- a port that tested the
-//     whole reservation would reject it;
+//     since 5.12 a force-only overflow drops the contacts too (NULL pointers,
+//     count zeroed, patch still reserved and returned invalid);
+//   * a contact limit of exactly offset + 16 with several points, which 5.6.1
+//     accepted (it tested ONE PxContact) and 5.12 rejects (:181, :304 test the
+//     whole reservation);
 //   * material indices with non-zero bits 8-15 (words 12/13 store the full PxU16)
 //     and with bit 16 set (the lookup narrows to PxU16 first, cuh:149-150 / cu:415-416):
 //     materials[k] and materials[0x10000 + k] differ, so an unnarrowed lookup reads a
@@ -244,20 +244,30 @@ struct FlagsIn
 
 struct FlagsOut { uint32_t contactOff, patchIndex; };
 
-FlagsOut refOutputAndFlags(uint32_t t, const CctCaseH& c, const FlagsIn& f, Expected& e, Coverage& cov)
+FlagsOut refOutputAndFlags(uint32_t t, const CctCaseH& c, const FlagsIn& fIn, Expected& e, Coverage& cov)
 {
     uint32_t* ctr = &e.ctr[t * 4];
     uint32_t* out = &e.out[t * OUT_WORDS];
 
+    // 5.12: the patch demand is taken before the allocation (single: patchRequested =
+    // nbContacts > 0, :173; multi: nbRequestedPatches, :296).  Both equal the
+    // requested patch count passed in.
+    FlagsIn f = fIn;
+    const uint32_t reqPatches = fIn.numPatches;
+    const uint32_t reqPatchBytes = fIn.patchBytes;
+
     uint32_t contactOff = INVALID, forceOff = INVALID;
+    bool cOvfBit = false, fOvfBit = false;
     if (f.numPoints)
     {
         contactOff = ctr[1]; ctr[1] += 16u * f.numPoints;
         forceOff = ctr[2]; ctr[2] += 4u * f.numPoints;
-        // sizeof() is a size_t: the sums are 64-bit (:201, :207).
-        if (uint64_t(contactOff) + 16u > c.lim[1]) { ctr[3] |= 1u; contactOff = INVALID; }
-        if (uint64_t(forceOff) + 4u > c.lim[2]) { ctr[3] |= 2u; forceOff = INVALID; }
+        // 5.12 (:181-192 / :304-315): sizeof() is a size_t, the sums are 64-bit, and
+        // they cover the WHOLE reservation; a force overflow also drops the contacts.
+        if (uint64_t(contactOff) + 16ull * f.numPoints > c.lim[1]) { ctr[3] |= 1u; contactOff = INVALID; cOvfBit = true; }
+        if (uint64_t(forceOff) + 4ull * f.numPoints > c.lim[2]) { ctr[3] |= 2u; forceOff = INVALID; contactOff = INVALID; fOvfBit = true; }
     }
+    const uint32_t numPointsIn = f.numPoints;
     if (contactOff != INVALID)
     {
         put64(e.out, t * OUT_WORDS + 4, START_FORCES + uint64_t(forceOff));
@@ -267,6 +277,10 @@ FlagsOut refOutputAndFlags(uint32_t t, const CctCaseH& c, const FlagsIn& f, Expe
     {
         put64(e.out, t * OUT_WORDS + 4, 0);
         put64(e.out, t * OUT_WORDS + 2, 0);
+        // 5.12 (:210-214 / :333-339): the count goes to zero, and with it the touch.
+        f.numPoints = 0;
+        f.numPatches = 0;
+        f.currentlyHasTouch = false;
     }
 
     const uint32_t allflags = out[8];
@@ -285,12 +299,14 @@ FlagsOut refOutputAndFlags(uint32_t t, const CctCaseH& c, const FlagsIn& f, Expe
     out[9] = (out[9] & 0xFFFF0000u) | (f.numPoints & 0xFFFFu);
 
     uint32_t patchIndex = INVALID;
-    if (f.numPatches)
+    bool pOvfBit = false;
+    if (reqPatches)
     {
-        patchIndex = ctr[0]; ctr[0] += f.patchBytes;
-        if (uint64_t(patchIndex) + f.patchBytes > c.lim[0])
+        patchIndex = ctr[0]; ctr[0] += reqPatchBytes;
+        if (uint64_t(patchIndex) + reqPatchBytes > c.lim[0])
         {
             ctr[3] |= 4u;
+            pOvfBit = true;
             patchIndex = INVALID;
             status = (status & ~3u) | 1u;
             out[8] = (prevPatches << 24) | (status << 16);
@@ -298,19 +314,21 @@ FlagsOut refOutputAndFlags(uint32_t t, const CctCaseH& c, const FlagsIn& f, Expe
             e.touch[t] = prevHadTouch ? 1u : 0u;
             e.pchg[t] = (prevPatches != 0) ? 1u : 0u;
         }
-        else
+        else if (f.numPatches)
             put64(e.out, t * OUT_WORDS + 0, START_PATCHES + uint64_t(patchIndex));
+        else
+            patchIndex = INVALID;   // 5.12: reserved, but nothing to patch
     }
 
-    if (f.numPoints)
+    if (numPointsIn)
     {
-        const bool cOvf = contactOff == INVALID, fOvf = forceOff == INVALID, pOvf = f.numPatches && patchIndex == INVALID;
-        if (pOvf && !fOvf && !cOvf) ++cov.ovfPatch;
-        if (cOvf && !pOvf) ++cov.ovfContact;
-        if (fOvf && !cOvf && !pOvf) ++cov.ovfForceOnly;
-        if (pOvf && fOvf) ++cov.ovfPatchForce;
-        if (!cOvf && f.numPoints >= 2 && c.lim[1] == t * CONTACT_WORDS * 4 + 16u) ++cov.contactQuirk;
-        if (!cOvf && !fOvf && !pOvf && limitClass(t) == L_EXACT) ++cov.exact;
+        const bool pOvf = pOvfBit;
+        if (pOvf && !fOvfBit && !cOvfBit) ++cov.ovfPatch;
+        if (cOvfBit && !pOvf) ++cov.ovfContact;
+        if (fOvfBit && !cOvfBit && !pOvf) ++cov.ovfForceOnly;
+        if (pOvf && fOvfBit) ++cov.ovfPatchForce;
+        if (cOvfBit && numPointsIn >= 2 && c.lim[1] == t * CONTACT_WORDS * 4 + 16u) ++cov.contactQuirk;
+        if (!cOvfBit && !fOvfBit && !pOvf && limitClass(t) == L_EXACT) ++cov.exact;
     }
     return { contactOff, patchIndex };
 }

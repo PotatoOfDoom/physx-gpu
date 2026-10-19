@@ -142,7 +142,7 @@ const LaneCfg CFG[LANES] = {
 // The mirror: the CUDA's control flow, the engine's arithmetic and stores
 // ---------------------------------------------------------------------------
 static void apiMirror(PxgArticulationBlockLinkData& lk, PxgArticulationBlockDofData* df,
-                      const SpatialMatrix& spatialInertia, const PxReal* jF,
+                      const SpatialMatrix& spatialInertia, bool isExtEvery, const PxReal* jF,
                       const UnAlignedSpatialVector& Z, const UnAlignedSpatialVector& ZIcInt,
                       UnAlignedSpatialVector& ZA, UnAlignedSpatialVector& ZAInt,
                       SpatialMatrix& out, uint32_t lane)
@@ -189,15 +189,18 @@ static void apiMirror(PxgArticulationBlockLinkData& lk, PxgArticulationBlockDofD
         const PxReal stZInt = sa.innerProduct(ZIcInt);
 
         const PxReal qstZ = -stZ;
-        const PxReal qstZIcInternal = (jF ? jF[0] : 0.0f) - stZInt;
+        // 5.12: the joint force enters qstZIcInternal only when it is not applied
+        // every TGS iteration, and is parked in mExternalEffort for the dof solve
+        const PxReal qstZIcInternal = ((!isExtEvery && jF) ? jF[0] : 0.0f) - stZInt;
         df[0].mQstZ[lane] = qstZ;
         df[0].mQstZIcInternal[lane] = qstZIcInternal;
+        df[0].mConstraintData.mExternalEffort[lane] = jF ? jF[0] : 0.0f;
 
         ZA += isInvD * qstZ;
         ZAInt += isInvD * qstZIcInternal;
 
-        out = SpatialMatrix::constructSpatialMatrix(SpatialVectorF(isInvD.top, isInvD.bottom),
-                                                    SpatialVectorF(stI.top, stI.bottom));
+        out = dySmConstruct(SpatialVectorF(isInvD.top, isInvD.bottom),
+                            SpatialVectorF(stI.top, stI.bottom));
         return;
     }
 
@@ -222,11 +225,12 @@ static void apiMirror(PxgArticulationBlockLinkData& lk, PxgArticulationBlockDofD
                 const PxReal stZ = sa.innerProduct(Z);
                 const PxReal stZInt = sa.innerProduct(ZIcInt);
                 const PxReal qstZ = -stZ;
-                const PxReal qstZicInt = (jF ? jF[ind2] : 0.0f) - stZInt;
+                const PxReal qstZicInt = ((!isExtEvery && jF) ? jF[ind2] : 0.0f) - stZInt;
                 qstZG[ind2] = qstZ;
                 qstZIcIntG[ind2] = qstZicInt;
                 df[ind2].mQstZ[lane] = qstZ;
                 df[ind2].mQstZIcInternal[lane] = qstZicInt;
+                df[ind2].mConstraintData.mExternalEffort[lane] = jF ? jF[ind2] : 0.0f;
             }
         }
 
@@ -270,7 +274,7 @@ static void apiMirror(PxgArticulationBlockLinkData& lk, PxgArticulationBlockDofD
             }
         }
 
-        out = SpatialMatrix::constructSpatialMatrix(columns);
+        out = dySmConstructColumns(columns);
         return;
     }
 
@@ -558,7 +562,7 @@ PXG_TEST(artiPropagateInertia)
             UnAlignedSpatialVector ZAInt = ZAIntIn[L];
             SpatialMatrix out(PxZero);
             const PxReal* jF = withJf ? (jointForces.data() + size_t(L) * JF_PER_LANE) : NULL;
-            apiMirror(wantLk[0], wantDf.data(), inertia[L], jF, Zin[L], ZIcIn[L], ZA, ZAInt, out, L);
+            apiMirror(wantLk[0], wantDf.data(), inertia[L], false, jF, Zin[L], ZIcIn[L], ZA, ZAInt, out, L);
 
             float* s = wantScratch.data() + size_t(L) * SCRATCH_FLOATS;
             putVec(s + 12, ZA);
@@ -730,12 +734,13 @@ static void apiLoopMirror(PxgArticulationBlockLinkData* lk, PxgArticulationBlock
         UnAlignedSpatialVector translatedZA = spatialZA;
         UnAlignedSpatialVector translatedZAInt = ZIcInt;
 
-        const PxReal* jF = extEveryIter ? NULL : (jointForces + jointOffset);
+        // 5.12: jF is always the record's slice; extEveryIter gates its use inside
+        const PxReal* jF = jointForces + jointOffset;
 
         SpatialMatrix sub(PxZero);
-        apiMirror(blk, dofData, articulatedInertia, jF, spatialZA, ZIcInt, translatedZA,
+        apiMirror(blk, dofData, articulatedInertia, extEveryIter, jF, spatialZA, ZIcInt, translatedZA,
                   translatedZAInt, sub, lane);
-        SpatialMatrix spatialInertiaW = articulatedInertia - sub;
+        SpatialMatrix spatialInertiaW = dySmSub(articulatedInertia, sub);
 
         refTranslateSpatialVectorInPlace(rw, translatedZA);
         refTranslateSpatialVectorInPlace(rw, translatedZAInt);
@@ -765,7 +770,7 @@ static void apiLoopMirror(PxgArticulationBlockLinkData* lk, PxgArticulationBlock
         }
 
         storeSpatialMatrix(lk[parent].mSpatialArticulatedInertia, lane,
-                           parentInertia + spatialInertiaW);
+                           dySmAdd(parentInertia, spatialInertiaW));
     }
 
     SpatialMatrix inertia;

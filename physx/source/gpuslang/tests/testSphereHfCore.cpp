@@ -870,7 +870,7 @@ PXG_TEST(sphereHfCore)
     PXG_CHECK_MSG(sawE12Kept > 0, "no E12 case has a CONVEX neighbour (see the E01 note)");
     PXG_CHECK_MSG(sawE02Kept > 0, "no E02 case has a CONVEX neighbour (see the E01 note)");
     PXG_CHECK_MSG(sawE01BoundarySkip > 0,
-                  "no E01 case has adj.x == BOUNDARY -- the port's deliberate guard is untested");
+                  "no E01 case has adj.x == BOUNDARY -- the 5.12 rim guard (convexHeightfield.cu:451) is untested");
     PXG_CHECK_MSG(sawE12ZOnlyBoundary > 0,
                   "no E12 case has a REAL adj.y and a BOUNDARY adj.z -- an arm that fetched the "
                   "wrong slot would then decode a valid triangle either way");

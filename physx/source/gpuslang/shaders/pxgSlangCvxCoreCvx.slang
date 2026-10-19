@@ -774,6 +774,12 @@ void makePlanesQ(const float3 facePoints[4], uint numPoints, float3 axis,
             if (posCount != 0u)
                 n = -n;
 
+            // 5.12 (GuConvexSupport.h:753-756, the 5.9 crash fix): degenerate
+            // (e.g. collinear) face points can produce more pairs than actual
+            // edges, cap to avoid buffer overrun
+            if (numPlanes >= MAX_CLIP_PLANES)
+                return;
+
             planes[numPlanes++] = float4(-n, dot3Q(n, s));
         }
     }

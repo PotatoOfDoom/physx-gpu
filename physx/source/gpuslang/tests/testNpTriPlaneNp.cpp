@@ -48,8 +48,9 @@
 // manifold 0 only; three seeded manifolds pin the manifold-1/2 refresh
 // arms).  A second test pins the contact-stream overflow
 // tail: contact-buffer overflow poisons the offset and zeroes
-// nbContacts, while a force-buffer-only overflow FAITHFULLY keeps the
-// contacts and the count, carrying the poisoned force offset;
+// nbContacts, and since 5.12 (trimeshCollision.cu:353-358) a force-buffer-only
+// overflow poisons the contact offset too (it used to keep the contacts and
+// the count, carrying the poisoned force offset);
 // reservations are ungated; single-case runs with limits exactly at /
 // one short of the reservation pin the strict > gates and the combined
 // overflow flag.
@@ -823,8 +824,8 @@ PXG_TEST(npTriPlaneNp_narrowphase)
 PXG_TEST(npTriPlaneNp_overflow)
 {
     // all-full-gen fleet; overflow of the CONTACT buffer poisons the pair
-    // (offset 0xFFFFFFFF, nbContacts zeroed, nothing written); overflow of
-    // the FORCE buffer alone keeps contacts and count (faithful quirk)
+    // (offset 0xFFFFFFFF, nbContacts zeroed, nothing written); since 5.12 an
+    // overflow of the FORCE buffer alone poisons the pair the same way
     const uint32_t NC = 24;
     TpFixture fx = buildFixture(NC, 1030702);
     // force every case into full gen with contacts: rebuild prev far for all
@@ -885,29 +886,42 @@ PXG_TEST(npTriPlaneNp_overflow)
                       "overflow A: %zu bad, %zu ok, %zu poisoned", bad, nOk, nPoison);
     }
 
-    // run B: force buffer alone overflows -> contacts and count survive
+    // run B: force buffer alone overflows -> 5.12 poisons the whole pair
+    // (contact offset invalidated too, nbContacts zeroed, nothing written)
     {
         const uint32_t limit = 4 * (total / 2);
         const TpRun r = runTp(fx.cases, fx.verts, fx.root, fx.manA, fx.manB, fx.manN, fx.meta, fx.rel,
                               streamSlots, 0x10000000u, limit);
         PXG_CHECK_MSG(r.counters[1] == 4 * total && r.counters[2] == OVERFLOW_FORCE,
                       "overflow B: counters %u/%u", r.counters[1], r.counters[2]);
-        size_t bad = 0, nPoisonF = 0;
+        size_t bad = 0, nOk = 0, nPoisonF = 0;
+        std::vector<bool> slotWritten(streamSlots, false);
         for (uint32_t i = 0; i < NC; ++i)
         {
             const TpRef& ro = fx.ref[i];
             const U4 rec = r.rec[i];
-            if (rec.x == 0xFFFFFFFFu || rec.z != ro.retained) { ++bad; continue; }
-            if (rec.y == 0xFFFFFFFFu) ++nPoisonF;
-            else if (rec.y + 4 * ro.retained > limit) ++bad;
+            if (rec.x == 0xFFFFFFFFu)
+            {
+                ++nPoisonF;
+                if (rec.y != 0xFFFFFFFFu || rec.z != 0) ++bad;
+                continue;
+            }
+            ++nOk;
+            if (rec.z != ro.retained || rec.y == 0xFFFFFFFFu || rec.y + 4 * ro.retained > limit) { ++bad; continue; }
             for (uint32_t k = 0; k < ro.retained; ++k)
             {
                 const F4 got = r.stream[rec.x / 16 + k];
+                slotWritten[rec.x / 16 + k] = true;
                 if (got.x != ro.pts[k].x || got.y != ro.pts[k].y || got.z != ro.pts[k].z ||
                     got.w != ro.seps[k]) ++bad;
             }
         }
-        PXG_CHECK_MSG(bad == 0 && nPoisonF > 0, "overflow B: %zu bad, %zu force-poisoned", bad, nPoisonF);
+        // a pair poisoned by the force overflow writes nothing: every slot not
+        // owned by a surviving pair keeps the -777 fill
+        for (uint32_t k = 0; k < streamSlots; ++k)
+            if (!slotWritten[k] && r.stream[k].x != -777.0f) ++bad;
+        PXG_CHECK_MSG(bad == 0 && nOk > 0 && nPoisonF > 0, "overflow B: %zu bad, %zu ok, %zu force-poisoned",
+                      bad, nOk, nPoisonF);
     }
 
     // runs C/D: single case -> deterministic offsets pin the STRICT > gates

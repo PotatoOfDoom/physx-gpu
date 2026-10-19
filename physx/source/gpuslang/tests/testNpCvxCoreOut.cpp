@@ -26,8 +26,9 @@
 
 // Verification of npCvxCoreOut.slang: the two TestOutput::writeOutput
 // overloads of convexCoreCollision.cu (L177-445).  Exact CPU transcription of
-// both: the single-element 64-bit-promoted overflow tests, the wrapped-vs-NULL
-// output pointer quirks, the allflags/touch/patch-change rewrites, the patch
+// both: the 5.12 whole-reservation 64-bit-promoted overflow tests (a force
+// overflow also drops the contact offset; a failed allocation zeroes the count
+// but keeps the patch demand), the NULL output pointers, the allflags/touch/patch-change rewrites, the patch
 // rollbacks, the patch-major sequential contact stream of the Gu::Contact
 // variant with its numPoints-vs-numPatches gate split, and the inline
 // PxContactPatch array write over the tranche-43 combineMaterials core.
@@ -144,7 +145,9 @@ struct Tail
 
 static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
 {
-    const uint32_t nb = s.misc.x, allflags = s.misc.y;
+    uint32_t nb = s.misc.x;
+    const uint32_t allflags = s.misc.y;
+    const bool patchRequested = nb > 0; // 5.12 cu :173
     uint32_t cBytes = s.counters.x, fBytes = s.counters.y, pBytes = s.counters.z, ovf = 0;
 
     std::memset(&o, 0, sizeof(o));
@@ -154,8 +157,8 @@ static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
     {
         cOff = cBytes; cBytes += 16 * nb;
         fOff = fBytes; fBytes += 4 * nb;
-        if ((uint64_t(cOff) + 16ull) > uint64_t(s.cfg.x)) { ovf |= OVF_CONTACT; cOff = 0xFFFFFFFFu; }
-        if ((uint64_t(fOff) + 4ull) > uint64_t(s.cfg.y)) { ovf |= OVF_FORCE; fOff = 0xFFFFFFFFu; }
+        if ((uint64_t(cOff) + 16ull * nb) > uint64_t(s.cfg.x)) { ovf |= OVF_CONTACT; cOff = 0xFFFFFFFFu; }
+        if ((uint64_t(fOff) + 4ull * nb) > uint64_t(s.cfg.y)) { ovf |= OVF_FORCE; fOff = 0xFFFFFFFFu; cOff = 0xFFFFFFFFu; }
     }
 
     uint32_t outF, outP;
@@ -165,7 +168,7 @@ static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
         for (uint32_t i = 0; i < nb; ++i) o.stream[base + i] = s.contacts[i];
         outF = fOff; outP = cOff;
     }
-    else { outF = NULL_SENTINEL; outP = NULL_SENTINEL; }
+    else { outF = NULL_SENTINEL; outP = NULL_SENTINEL; nb = 0; } // 5.12 cu :213
 
     const uint32_t oldStatus = (allflags >> 16) & 0xFF;
     uint32_t status = oldStatus & ~TOUCH_KNOWN;
@@ -182,7 +185,7 @@ static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
     uint32_t nbOut = nb;
 
     uint32_t patchIndex = 0xFFFFFFFFu, cpOut = NULL_SENTINEL;
-    if (nb)
+    if (patchRequested)
     {
         patchIndex = pBytes; pBytes += 64;
         if ((uint64_t(patchIndex) + 64ull) > uint64_t(s.cfg.z))
@@ -194,7 +197,8 @@ static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
             touchChange = prevTouch ? 1 : 0;
             patchChange = (prevPatches != 0) ? 1 : 0;
         }
-        else cpOut = patchIndex;
+        else if (nb) cpOut = patchIndex;
+        else patchIndex = 0xFFFFFFFFu;
     }
 
     o.counters = U4{ cBytes, fBytes, pBytes, ovf };
@@ -205,8 +209,9 @@ static void refWriteContacts(const CoreOutIn& s, CoreOutOut& o)
 
 static void refWriteContact(const CoreOutIn& s, CoreOutOut& o)
 {
-    const uint32_t numPatches = s.misc.z & 0xFF;   // PxU8
-    const uint32_t numPoints = s.misc.w & 0xFFFF;  // PxU16
+    uint32_t numPatches = s.misc.z & 0xFF;   // PxU8
+    uint32_t numPoints = s.misc.w & 0xFFFF;  // PxU16
+    const uint32_t nbRequestedPatches = numPatches; // 5.12 cu :296
     const uint32_t allflags = s.misc.y;
     uint32_t cBytes = s.counters.x, fBytes = s.counters.y, pBytes = s.counters.z, ovf = 0;
 
@@ -217,8 +222,8 @@ static void refWriteContact(const CoreOutIn& s, CoreOutOut& o)
     {
         cOff = cBytes; cBytes += 16 * numPoints;
         fOff = fBytes; fBytes += 4 * numPoints;
-        if ((uint64_t(cOff) + 16ull) > uint64_t(s.cfg.x)) { ovf |= OVF_CONTACT; cOff = 0xFFFFFFFFu; }
-        if ((uint64_t(fOff) + 4ull) > uint64_t(s.cfg.y)) { ovf |= OVF_FORCE; fOff = 0xFFFFFFFFu; }
+        if ((uint64_t(cOff) + 16ull * numPoints) > uint64_t(s.cfg.x)) { ovf |= OVF_CONTACT; cOff = 0xFFFFFFFFu; }
+        if ((uint64_t(fOff) + 4ull * numPoints) > uint64_t(s.cfg.y)) { ovf |= OVF_FORCE; fOff = 0xFFFFFFFFu; cOff = 0xFFFFFFFFu; }
     }
 
     uint32_t outF, outP;
@@ -230,7 +235,7 @@ static void refWriteContact(const CoreOutIn& s, CoreOutOut& o)
                 o.stream[slot++] = s.points[i * 4 + j];
         outF = fOff; outP = cOff;
     }
-    else { outF = NULL_SENTINEL; outP = NULL_SENTINEL; }
+    else { outF = NULL_SENTINEL; outP = NULL_SENTINEL; numPoints = 0; numPatches = 0; } // 5.12 cu :337-338
 
     const uint32_t oldStatus = (allflags >> 16) & 0xFF;
     uint32_t status = oldStatus & ~TOUCH_KNOWN;
@@ -246,10 +251,10 @@ static void refWriteContact(const CoreOutIn& s, CoreOutOut& o)
     uint32_t nbOut = numPoints;
 
     uint32_t patchIndex = 0xFFFFFFFFu, cpOut = NULL_SENTINEL;
-    if (numPatches)
+    if (nbRequestedPatches)
     {
-        patchIndex = pBytes; pBytes += numPatches * 64;
-        if ((uint64_t(patchIndex) + uint64_t(numPatches) * 64ull) > uint64_t(s.cfg.z))
+        patchIndex = pBytes; pBytes += nbRequestedPatches * 64;
+        if ((uint64_t(patchIndex) + uint64_t(nbRequestedPatches) * 64ull) > uint64_t(s.cfg.z))
         {
             ovf |= OVF_PATCH; patchIndex = 0xFFFFFFFFu;
             status &= ~TOUCH_KNOWN; status |= HAS_NO_TOUCH;
@@ -258,7 +263,8 @@ static void refWriteContact(const CoreOutIn& s, CoreOutOut& o)
             touchChange = prevTouch ? 1 : 0;
             patchChange = (prevPatches != 0) ? 1 : 0;
         }
-        else cpOut = patchIndex;
+        else if (numPatches) cpOut = patchIndex;
+        else patchIndex = 0xFFFFFFFFu;
     }
 
     if (patchIndex != 0xFFFFFFFFu)
@@ -317,8 +323,9 @@ static void fillCommon(CoreOutIn& s, std::mt19937& rng, uint32_t i,
     // counters/limits: mostly roomy, with targeted tight and high-region cases
     uint32_t initC = 16 * (rng() % 256), initF = 4 * (rng() % 256), initP = 64 * (rng() % 64);
     uint32_t limC = 1u << 20, limF = 1u << 18, limP = 1u << 18;
-    if (i % 5 == 1) { limC = initC + 16 * (rng() % 3); ++cOvfC; }         // contact tight
-    if (i % 7 == 2) { limF = initF + 4 * (rng() % 3); ++cOvfF; }          // force tight
+    if (i % 5 == 1) { limC = initC + 16 * (rng() % 3); ++cOvfC; }         // contact tight (overflows any nb > 2 since 5.12)
+    if (i % 7 == 2) { limF = initF + 4 * (rng() % 3); ++cOvfF; }          // force tight (5.12: poisons the contacts too)
+    if (i % 13 == 5) { limC = initC + 16 * (1 + rng() % 8); limF = initF + 4 * (1 + rng() % 8); } // around the whole-reservation edge
     if (i % 6 == 3) { limP = initP + 64 * (rng() % 3); ++cOvfP; }         // patch tight
     if (i % 11 == 4) { initC = 0xFFFFFFF0u; limC = 0xFFFFFFFFu; ++cHigh; } // 64-bit promote region
     if (i % 11 == 7) { initF = 0xFFFFFFFCu; limF = 0xFFFFFFFFu; ++cHighF; } // force counter high region (review 162)

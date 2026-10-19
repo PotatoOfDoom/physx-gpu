@@ -37,13 +37,13 @@
 //    omits + ind): a >32-packed-contacts family (many accepted warps in
 //    one iteration) pins that slots >= 32 never participate — a
 //    "corrected" readIndex + ind mutant reads them and diverges;
-// 3. the overflow tail checks a SINGLE element (offset + 16 / + 4, not
-//    * nbContacts), the force check is an ELSE-IF (unreachable when the
-//    contact buffer overflows), and nbContacts is NEVER zeroed: exact
-//    single-case boundary runs pin all three (a 16-byte contact limit
-//    accepts a 6-contact case and writes 96 bytes; a 15-byte limit
-//    poisons the pair but leaves the force flag unraised and the count
-//    raw).
+// 3. the 5.12 overflow tail checks the WHOLE reservation (offset +
+//    16 * nbContacts / + 4 * nbContacts), runs BOTH checks (the 5.6.1
+//    force check was an else-if), lets a force overflow poison the
+//    contact offset too, and still never zeroes nbContacts: exact
+//    single-case boundary runs pin all four (an exact-fit pair passes,
+//    one byte short raises both flags, and the 5.6.1 single-element fit
+//    of 16/4 bytes now overflows both).
 // Exact-arithmetic fixtures as established: 1/64-grid vertices,
 // signed-permutation quaternions, pow2 scales; the deepest-accepted
 // vertex sits EXACTLY on cDistance in one family (inclusive gate);
@@ -665,9 +665,10 @@ PXG_TEST(npTriHfNp_narrowphase)
 
 PXG_TEST(npTriHfNp_overflow)
 {
-    // 16 accept-all cases (retained 6 each): the pass criterion is
-    // offset + 16 <= limit (SINGLE element), so with offsets partitioning
-    // multiples of 96 the number of surviving cases is deterministic
+    // 16 accept-all cases (retained 6 each): the 5.12 pass criterion is
+    // offset + 96 <= limit (the WHOLE reservation), so with offsets
+    // partitioning multiples of 96 the number of surviving cases is
+    // deterministic
     const uint32_t NC = 16;
     ThFixture fx = buildFixture(NC, 1040702);
     for (uint32_t i = 0; i < NC; ++i)
@@ -689,7 +690,26 @@ PXG_TEST(npTriHfNp_overflow)
     }
     const uint32_t streamSlots = total + 16;
 
-    // run A: contact limit passes exactly 8 of 16 (offset <= 96*8 - 16)
+    // a poisoned pair writes nothing; a surviving one writes its 6 contacts
+    auto checkStream = [&](const ThRun& r, size_t& bad) {
+        std::vector<bool> owned(streamSlots, false);
+        for (uint32_t i = 0; i < NC; ++i)
+        {
+            const U4 rec = r.rec[i];
+            if (rec.x == 0xFFFFFFFFu) continue;
+            for (uint32_t k = 0; k < fx.ref[i].retained; ++k)
+            {
+                owned[rec.x / 16 + k] = true;
+                const F4 got = r.stream[rec.x / 16 + k];
+                if (got.x != fx.ref[i].pts[k].x || got.y != fx.ref[i].pts[k].y ||
+                    got.z != fx.ref[i].pts[k].z || got.w != fx.ref[i].seps[k]) ++bad;
+            }
+        }
+        for (uint32_t k = 0; k < streamSlots; ++k)
+            if (!owned[k] && r.stream[k].x != -777.0f) ++bad;
+    };
+
+    // run A: contact limit passes exactly 8 of 16 (offset + 96 <= 96*8)
     {
         const uint32_t limit = 96 * 8;
         const ThRun r = runTh(fx.cases, fx.verts, streamSlots, limit, 0x10000000u);
@@ -698,7 +718,6 @@ PXG_TEST(npTriHfNp_overflow)
         size_t bad = 0, nOk = 0, nPoison = 0;
         for (uint32_t i = 0; i < NC; ++i)
         {
-            const ThRef& ro = fx.ref[i];
             const U4 rec = r.rec[i];
             if (rec.z != 6) ++bad; // count stays RAW even when poisoned
             if (rec.x == 0xFFFFFFFFu)
@@ -709,52 +728,50 @@ PXG_TEST(npTriHfNp_overflow)
             else
             {
                 ++nOk;
-                if (rec.x + 16 > limit) ++bad; // pass criterion is one element
-                for (uint32_t k = 0; k < ro.retained; ++k)
-                {
-                    const F4 got = r.stream[rec.x / 16 + k];
-                    if (got.x != ro.pts[k].x || got.y != ro.pts[k].y || got.z != ro.pts[k].z ||
-                        got.w != ro.seps[k]) ++bad;
-                }
+                if (rec.x + 16 * 6 > limit) ++bad; // whole reservation
             }
         }
+        checkStream(r, bad);
         PXG_CHECK_MSG(bad == 0 && nOk == 8 && nPoison == 8,
                       "overflow A: %zu bad, %zu ok, %zu poisoned", bad, nOk, nPoison);
     }
 
-    // run B: force-only overflow (8 of 16): contacts still written, count raw
+    // run B: force-only overflow (8 of 16): since 5.12 the force overflow
+    // poisons the contact offset too -- nothing written, count raw
     {
         const uint32_t limit = 24 * 8;
         const ThRun r = runTh(fx.cases, fx.verts, streamSlots, 0x10000000u, limit);
         PXG_CHECK_MSG(r.counters[1] == 4 * total && r.counters[2] == OVERFLOW_FORCE,
                       "overflow B: counters %u/%u", r.counters[1], r.counters[2]);
-        size_t bad = 0, nPoisonF = 0;
+        size_t bad = 0, nOk = 0, nPoisonF = 0;
         for (uint32_t i = 0; i < NC; ++i)
         {
-            const ThRef& ro = fx.ref[i];
             const U4 rec = r.rec[i];
-            if (rec.x == 0xFFFFFFFFu || rec.z != 6) { ++bad; continue; }
-            if (rec.y == 0xFFFFFFFFu) ++nPoisonF;
-            else if (rec.y + 4 > limit) ++bad;
-            for (uint32_t k = 0; k < ro.retained; ++k)
+            if (rec.z != 6) ++bad;
+            if (rec.x == 0xFFFFFFFFu)
             {
-                const F4 got = r.stream[rec.x / 16 + k];
-                if (got.x != ro.pts[k].x || got.y != ro.pts[k].y || got.z != ro.pts[k].z ||
-                    got.w != ro.seps[k]) ++bad;
+                ++nPoisonF;
+                if (rec.y != 0xFFFFFFFFu) ++bad;
+            }
+            else
+            {
+                ++nOk;
+                if (rec.y == 0xFFFFFFFFu || rec.y + 4 * 6 > limit) ++bad;
             }
         }
-        PXG_CHECK_MSG(bad == 0 && nPoisonF == 8, "overflow B: %zu bad, %zu force-poisoned", bad, nPoisonF);
+        checkStream(r, bad);
+        PXG_CHECK_MSG(bad == 0 && nOk == 8 && nPoisonF == 8,
+                      "overflow B: %zu bad, %zu ok, %zu force-poisoned", bad, nOk, nPoisonF);
     }
 
-    // runs C/D: single case pins the SINGLE-ELEMENT checks and the else-if
+    // runs C/D/E: single case pins the whole-reservation gates (strict >)
+    // and the two independent checks
     {
         const std::vector<ThCase> one = { fx.cases[0] };
         const ThRef& ro = fx.ref[0];
-        // C: contact limit of ONE PxContact accepts a 6-contact case and
-        //    writes all 96 bytes past the limit (faithful quirk); force
-        //    limit of ONE PxU32 likewise passes
+        // C: both limits EXACTLY at the reservation -> kept
         {
-            const ThRun r = runTh(one, fx.verts, 6 + 4, 16, 4);
+            const ThRun r = runTh(one, fx.verts, 6 + 4, 96, 24);
             size_t bad = 0;
             if (r.counters[2] != 0) ++bad;
             if (r.rec[0].x != 0 || r.rec[0].y != 0 || r.rec[0].z != 6) ++bad;
@@ -764,19 +781,40 @@ PXG_TEST(npTriHfNp_overflow)
                 if (got.x != ro.pts[k].x || got.y != ro.pts[k].y || got.z != ro.pts[k].z ||
                     got.w != ro.seps[k]) ++bad;
             }
-            PXG_CHECK_MSG(bad == 0, "overflow C (single-element fit): %zu bad", bad);
+            PXG_CHECK_MSG(bad == 0, "overflow C (exact fit): %zu bad", bad);
         }
-        // D: contact limit one byte short -> poisoned pair; the force check
-        //    is SKIPPED (else-if), so its flag stays unraised even though
-        //    the force buffer would also overflow; count stays raw
+        // D: both limits one byte short -> BOTH flags (no else-if any more),
+        //    poisoned pair, count raw
         {
-            const ThRun r = runTh(one, fx.verts, 6 + 4, 15, 3);
+            const ThRun r = runTh(one, fx.verts, 6 + 4, 95, 23);
             size_t bad = 0;
-            if (r.counters[2] != OVERFLOW_CONTACT) ++bad;
+            if (r.counters[2] != (OVERFLOW_CONTACT | OVERFLOW_FORCE)) ++bad;
             if (r.rec[0].x != 0xFFFFFFFFu || r.rec[0].y != 0xFFFFFFFFu || r.rec[0].z != 6) ++bad;
             for (uint32_t k = 0; k < 6 + 4; ++k)
                 if (r.stream[k].x != -777.0f) ++bad;
-            PXG_CHECK_MSG(bad == 0, "overflow D (else-if skip): %zu bad", bad);
+            PXG_CHECK_MSG(bad == 0, "overflow D (both one byte short): %zu bad", bad);
+        }
+        // E: the 5.6.1 single-element fit (16 / 4 bytes) no longer passes a
+        //    6-contact pair
+        {
+            const ThRun r = runTh(one, fx.verts, 6 + 4, 16, 4);
+            size_t bad = 0;
+            if (r.counters[2] != (OVERFLOW_CONTACT | OVERFLOW_FORCE)) ++bad;
+            if (r.rec[0].x != 0xFFFFFFFFu || r.rec[0].y != 0xFFFFFFFFu || r.rec[0].z != 6) ++bad;
+            for (uint32_t k = 0; k < 6 + 4; ++k)
+                if (r.stream[k].x != -777.0f) ++bad;
+            PXG_CHECK_MSG(bad == 0, "overflow E (single-element limit): %zu bad", bad);
+        }
+        // F: force limit alone one byte short -> force flag only, contact
+        //    offset poisoned anyway
+        {
+            const ThRun r = runTh(one, fx.verts, 6 + 4, 96, 23);
+            size_t bad = 0;
+            if (r.counters[2] != OVERFLOW_FORCE) ++bad;
+            if (r.rec[0].x != 0xFFFFFFFFu || r.rec[0].y != 0xFFFFFFFFu || r.rec[0].z != 6) ++bad;
+            for (uint32_t k = 0; k < 6 + 4; ++k)
+                if (r.stream[k].x != -777.0f) ++bad;
+            PXG_CHECK_MSG(bad == 0, "overflow F (force only): %zu bad", bad);
         }
     }
 }

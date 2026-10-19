@@ -97,7 +97,6 @@ PXG_TEST(artiJcalcPhaseB3)
     std::memset(jdata.data(), 0xEE, jdata.size() * sizeof(ArticulationJointCoreData));
     std::vector<ArticulationJointCore> joints;
     joints.reserve(size_t(LANES) * NB_LINKS);
-    std::vector<Cm::UnAlignedSpatialVector> jointAxis(size_t(LANES) * MAX_DOFS);
     std::vector<SpatialSubspaceMatrix> motionMatrix(size_t(LANES) * NB_LINKS);
     std::vector<float> jPos(size_t(LANES) * MAX_DOFS), jVel(size_t(LANES) * MAX_DOFS);
     std::vector<float> jTPos(size_t(LANES) * MAX_DOFS), jTVel(size_t(LANES) * MAX_DOFS);
@@ -117,12 +116,10 @@ PXG_TEST(artiJcalcPhaseB3)
             const PxTransform idT(PxIdentity);   // named: `j(PxTransform(...), ...)` parses
             ArticulationJointCore j(idT, idT);    // as a function declaration
 
-            j.frictionCoefficient = val(L, link, 0, 99);
             for (uint32_t ax = 0; ax < PxArticulationAxis::eCOUNT; ++ax)
             {
                 j.drives[ax].stiffness = val(L, link, ax, 1);
                 j.drives[ax].damping = val(L, link, ax, 2);
-                j.drives[ax].maxForce = val(L, link, ax, 3);
                 j.drives[ax].envelope.maxEffort = val(L, link, ax, 4);
                 j.drives[ax].envelope.maxActuatorVelocity = val(L, link, ax, 5);
                 j.drives[ax].envelope.velocityDependentResistance = val(L, link, ax, 6);
@@ -152,8 +149,6 @@ PXG_TEST(artiJcalcPhaseB3)
         for (uint32_t d = 0; d < MAX_DOFS; ++d)
         {
             const size_t k = size_t(L) * MAX_DOFS + d;
-            jointAxis[k].top = PxVec3(val(L, 9, d, 30), val(L, 9, d, 31), val(L, 9, d, 32));
-            jointAxis[k].bottom = PxVec3(val(L, 9, d, 33), val(L, 9, d, 34), val(L, 9, d, 35));
             jPos[k] = val(L, 9, d, 40);
             jVel[k] = val(L, 9, d, 41);
             jTPos[k] = val(L, 9, d, 42);
@@ -166,12 +161,11 @@ PXG_TEST(artiJcalcPhaseB3)
     const size_t LINK_REGION = size_t(NB_LINKS) * LINK_BLOCK + GUARD;
     const size_t DOF_REGION = size_t(MAX_DOFS) * DOF_BLOCK + GUARD;
 
-    PxgDevicePtr dJData = 0, dJoints = 0, dAxis = 0, dMM = 0;
+    PxgDevicePtr dJData = 0, dJoints = 0, dMM = 0;
     PxgDevicePtr dPos = 0, dVel = 0, dTPos = 0, dTVel = 0;
     PxgDevicePtr dArtis = 0, dLinkBlocks = 0, dDofBlocks = 0;
     shim.memAlloc(&dJData, jdata.size() * sizeof(ArticulationJointCoreData));
     shim.memAlloc(&dJoints, joints.size() * sizeof(ArticulationJointCore));
-    shim.memAlloc(&dAxis, jointAxis.size() * sizeof(Cm::UnAlignedSpatialVector));
     shim.memAlloc(&dMM, motionMatrix.size() * sizeof(SpatialSubspaceMatrix));
     shim.memAlloc(&dPos, jPos.size() * 4);
     shim.memAlloc(&dVel, jVel.size() * 4);
@@ -180,7 +174,7 @@ PXG_TEST(artiJcalcPhaseB3)
     shim.memAlloc(&dArtis, size_t(LANES) * sizeof(PxgArticulation));
     shim.memAlloc(&dLinkBlocks, LINK_REGION);
     shim.memAlloc(&dDofBlocks, DOF_REGION);
-    if (!dJData || !dJoints || !dAxis || !dMM || !dPos || !dVel || !dTPos || !dTVel ||
+    if (!dJData || !dJoints || !dMM || !dPos || !dVel || !dTPos || !dTVel ||
         !dArtis || !dLinkBlocks || !dDofBlocks)
     {
         std::printf("  NOTE: no BDA -> skip\n");
@@ -201,8 +195,6 @@ PXG_TEST(artiJcalcPhaseB3)
             dJoints + PxgDevicePtr(l * sizeof(ArticulationJointCore)));
         recs[L].motionMatrix = reinterpret_cast<SpatialSubspaceMatrix*>(
             dMM + PxgDevicePtr(l * sizeof(SpatialSubspaceMatrix)));
-        recs[L].jointAxis = reinterpret_cast<Cm::UnAlignedSpatialVector*>(
-            dAxis + PxgDevicePtr(d * sizeof(Cm::UnAlignedSpatialVector)));
         recs[L].jointPositions = reinterpret_cast<PxReal*>(dPos + PxgDevicePtr(d * 4));
         recs[L].jointVelocities = reinterpret_cast<PxReal*>(dVel + PxgDevicePtr(d * 4));
         recs[L].jointTargetPositions = reinterpret_cast<PxReal*>(dTPos + PxgDevicePtr(d * 4));
@@ -211,7 +203,6 @@ PXG_TEST(artiJcalcPhaseB3)
 
     shim.memcpyHtoD(dJData, jdata.data(), jdata.size() * sizeof(ArticulationJointCoreData));
     shim.memcpyHtoD(dJoints, joints.data(), joints.size() * sizeof(ArticulationJointCore));
-    shim.memcpyHtoD(dAxis, jointAxis.data(), jointAxis.size() * sizeof(Cm::UnAlignedSpatialVector));
     shim.memcpyHtoD(dMM, motionMatrix.data(), motionMatrix.size() * sizeof(SpatialSubspaceMatrix));
     shim.memcpyHtoD(dPos, jPos.data(), jPos.size() * 4);
     shim.memcpyHtoD(dVel, jVel.data(), jVel.size() * 4);
@@ -272,8 +263,7 @@ PXG_TEST(artiJcalcPhaseB3)
                 const size_t ic = db + CD;
                 const size_t ak = size_t(L) * MAX_DOFS + slot;
 
-                putSV(wantDof, db, offsetof(PxgArticulationBlockDofData, mJointAxis), L,
-                      jointAxis[ak].top, jointAxis[ak].bottom);
+                // (5.12: no mJointAxis in the dof block)
                 putU8(wantDof, db + offsetof(PxgArticulationBlockDofData, mDofIds) + L,
                       uint8_t(dofId));
                 putU8(wantLink, lblk + offsetof(PxgArticulationBlockLinkData, mInvDofIds) +
@@ -297,9 +287,6 @@ PXG_TEST(artiJcalcPhaseB3)
                 putF(wantDof, lim + 0, j.limits[dofId].low);
                 putF(wantDof, lim + 4, j.limits[dofId].high);
                 putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData,
-                                            mFrictionCoefficient) + size_t(L) * 4,
-                     j.frictionCoefficient);
-                putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData,
                                             mStaticFrictionEffort) + size_t(L) * 4,
                      j.frictionParams[dofId].staticFrictionEffort);
                 putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData,
@@ -308,8 +295,6 @@ PXG_TEST(artiJcalcPhaseB3)
                 putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData,
                                             mViscousFrictionCoefficient) + size_t(L) * 4,
                      j.frictionParams[dofId].viscousFrictionCoefficient);
-                putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData, mMaxForce) +
-                                  size_t(L) * 4, j.drives[dofId].maxForce);
                 putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData, mMaxEffort) +
                                   size_t(L) * 4, j.drives[dofId].envelope.maxEffort);
                 putF(wantDof, ic + offsetof(PxgArticulationInternalConstraintData,
@@ -365,7 +350,6 @@ PXG_TEST(artiJcalcPhaseB3)
 
     shim.memFree(dJData);
     shim.memFree(dJoints);
-    shim.memFree(dAxis);
     shim.memFree(dMM);
     shim.memFree(dPos);
     shim.memFree(dVel);

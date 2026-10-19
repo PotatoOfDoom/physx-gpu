@@ -119,6 +119,7 @@ static uint32_t reduce4(const F4 pts[MAX_POLY], uint32_t count, V3 normal, uint3
     return n;
 }
 
+static uint32_t gPlaneCapHits = 0;   // 5.12 makePlanes cap reached (collinear faces)
 static void makePlanesRef(const V3 face[4], uint32_t numPoints, V3 axis, F4 planes[MAX_CLIP_PLANES], uint32_t& numPlanes)
 {
     if (numPoints < 3) return;
@@ -142,6 +143,8 @@ static void makePlanesRef(const V3 face[4], uint32_t numPoints, V3 axis, F4 plan
             }
             if (posCount && negCount) continue;
             if (posCount) n = neg(n);
+            // 5.12 GuConvexSupport.h:753-756: cap on degenerate (collinear) faces
+            if (numPlanes >= MAX_CLIP_PLANES) { ++gPlaneCapHits; return; }
             planes[numPlanes++] = F4{ -n.x, -n.y, -n.z, dot3(n, s) };
         }
     }
@@ -347,7 +350,8 @@ PXG_TEST(npCvxCoreClip_clip)
 
     std::vector<ClipIn> in(N);
     std::vector<ClipOut> ref(N);
-    size_t cNone = 0, c22 = 0, cNN = 0, c2N = 0, cPar = 0;
+    size_t cNone = 0, c22 = 0, cNN = 0, c2N = 0, cPar = 0, cCollinear = 0;
+    gPlaneCapHits = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -406,6 +410,25 @@ PXG_TEST(npCvxCoreClip_clip)
         }
         makeFace(s.fp1, n1, fn1, rf(-0.3f, 0.f));
 
+        if (n0 == 4 && n1 == 4 && (i % 3 == 0))
+        {
+            // 5.12 makePlanes cap (GuConvexSupport.h:753-756, the 5.9 crash fix):
+            // four COLLINEAR points per face make every pair a viable plane (all
+            // other points sit on the line, d <= eps -> negCount), 6 per face and
+            // 12 for the two -- past MAX_CLIP_PLANES = 8 without the cap.
+            V3 dir = cross3(axis, V3{ 0.3f, 0.9f, -0.2f }); normRecip(dir);
+            const V3 c0{ s.fp0[0].x, s.fp0[0].y, s.fp0[0].z }, c1{ s.fp1[0].x, s.fp1[0].y, s.fp1[0].z };
+            const float step[4] = { 0.0f, 0.5f, 1.25f, 2.0f };
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                const V3 a = add(c0, mul(dir, step[k] - 1.0f));
+                const V3 b = add(c1, mul(dir, step[3 - k] - 0.9f));
+                s.fp0[k] = F4{ a.x, a.y, a.z, 0 };
+                s.fp1[k] = F4{ b.x, b.y, b.z, 0 };
+            }
+            ++cCollinear;
+        }
+
         if (n0 == 2 && n1 == 2 && (i % 5 < 3))
         {
             // parallel segments so clip2x2 proceeds past the gate: both along
@@ -458,6 +481,9 @@ PXG_TEST(npCvxCoreClip_clip)
         if (!ok) ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "cccClip: %zu mismatches", mm);
+    PXG_CHECK_MSG(cCollinear > N / 50 && gPlaneCapHits > N / 100,
+                  "cccClip: the 5.12 makePlanes cap is never reached (collinear %zu, cap hits %u)",
+                  cCollinear, gPlaneCapHits);
     PXG_CHECK_MSG(cNone > N / 16 && c22 > N / 8 && cNN > N / 8 && c2N > N / 8 && cPar > N / 16,
                   "cccClip: coverage thin (none %zu 22 %zu NN %zu 2N %zu par %zu)", cNone, c22, cNN, c2N, cPar);
 

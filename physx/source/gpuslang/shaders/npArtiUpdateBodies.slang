@@ -189,7 +189,17 @@ void updateBodiesLaunch_Part2(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
     }
     else
     {
-        const AbSpatialVector zaExt = aubLoadSV(link, PXG_AB_LINK_mZAVector, lane);
+        AbSpatialVector zaExt = aubLoadSV(link, PXG_AB_LINK_mZAVector, lane);
+        if (artiU8Field(d, PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER) != 0u)
+        {
+            // 5.12: under eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS mZAVector lacks
+            // the external Z; updateBodiesLaunch1T's leaves-to-root sweep left the
+            // cumulative chain in the record's zAForces[link], added back here.
+            Ptr<float> zc = Ptr<float>(artiPtrField(a, PXG_ARTI_ZA_FORCES)
+                                       + uint64_t(linkIndex) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+            zaExt = asmSVec(zaExt.top + float3(zc[0], zc[1], zc[2]),
+                            zaExt.bottom + float3(zc[3], zc[4], zc[5]));
+        }
         const AbSpatialVector zaInt = aubLoadSV(link, PXG_AB_LINK_mZAIntVector, lane);
         const AbSpatialVector accExt = aubLoadSV(link, PXG_AB_LINK_mMotionAcceleration, lane);
         const AbSpatialVector accInt =
@@ -258,11 +268,16 @@ void updateBodiesLaunch_Part2(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
     if (!integrate)
         posMotionV = asmSVecScale(posMotionV, invDt);
 
-    aslSleepCheck1T(sleepData + uint64_t(linkIndex) * PXG_ARTI_LINK_SLEEP_DATA_SIZE, lwc, poseQ,
-                    posMotionV.bottom, posMotionV.top, dt, sleepThreshold,
-                    inverseInertiaXYZ_invMass);
+    // 5.12: scDesc->isSleepingDisabled (a bool at 69) skips the sleep check AND
+    // the wake-counter write-back
+    if (artiU8Field(d, PXG_ARTI_CORE_IS_SLEEPING_DISABLED) == 0u)
+    {
+        aslSleepCheck1T(sleepData + uint64_t(linkIndex) * PXG_ARTI_LINK_SLEEP_DATA_SIZE, lwc, poseQ,
+                        posMotionV.bottom, posMotionV.top, dt, sleepThreshold,
+                        inverseInertiaXYZ_invMass);
 
-    wcPtr[0] = lwc;
+        wcPtr[0] = lwc;
+    }
 }
 
 // ===========================================================================

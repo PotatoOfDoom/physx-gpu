@@ -683,11 +683,15 @@ PXG_TEST(cvxCollide_hullRot45)
 }
 
 // ---------------------------------------------------------------------------
-// 12. preloaded steady-state manifold (y0 = 1.05): countsWord = 4 | 4<<8, 4
-// preloaded contacts with normal (0,-1,0) -> localNor = (0,-1,0),
-// dot(localNor, -normal) = 1 >= 0.707 and post-add count = 4, so
-// fullContactGen is FALSE (cu L887) -> NO polyClip regen; the manifold is
-// exactly the addManifoldPoint result.
+// 12. preloaded steady-state manifold (y0 = 1.05): 4 preloaded contacts with
+// normal (0,-1,0) -> localNor = (0,-1,0), dot(localNor, -normal) = 1 >= 0.707
+// and post-add count = 4.  5.12 puts `initialNbContacts > 1` in front of the
+// predicate (cudaGJKEPA.cu:864, the PCM jitter fix), so the no-regen path needs
+// the counts word's initial-count byte <= 1: (a)/(b) use countsWord = 4 (byte
+// 1 zero) and fullContactGen is FALSE -> NO polyClip regen; the manifold is
+// exactly the addManifoldPoint result.  (c) is (a) with the stage-1 packing of
+// a 4-contact manifold, 4 | 4<<8: 5.6.1 skipped the regen there, 5.12 forces
+// it, and the clip rebuilds the four corner contacts.
 //   (a) REPLACE: slot 0 preloaded at the GJK witness (A (-0.5, .5, -.5) /
 //       B (-0.5,-.5,-.5); the witness is the corner-most segment point —
 //       GJK's tie-breaks pick support verts vA[2]/vA[7]/vB[0], the segment
@@ -712,7 +716,7 @@ PXG_TEST(cvxCollide_hullManifoldSteady)
 {
     // (a) replace
     Scene rep = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
-    rep.countsWord = 4u | (4u << 8);
+    rep.countsWord = 4u;   // initialNbContacts 0: the 5.12 jitter term stays off
     rep.preloadCount = 4;
     rep.pre[0] = { V3{ -0.5f, 0.5f, -0.5f }, V3{ -0.5f, -0.5f, -0.5f }, V3{ 0, -1, 0 }, 0.2f };
     rep.pre[1] = { V3{ 0.45f, 0.5f, -0.45f }, V3{ 0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.05f };
@@ -729,7 +733,7 @@ PXG_TEST(cvxCollide_hullManifoldSteady)
 
     // (b) reduce-drop
     Scene drop = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
-    drop.countsWord = 4u | (4u << 8);
+    drop.countsWord = 4u;
     drop.preloadCount = 4;
     drop.pre[0] = { V3{ -0.45f, 0.5f, -0.45f }, V3{ -0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.04f };
     drop.pre[1] = { V3{ 0.45f, 0.5f, -0.45f }, V3{ 0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.04f };
@@ -739,6 +743,13 @@ PXG_TEST(cvxCollide_hullManifoldSteady)
     bad = checkScene(drop, 4u, expD, false, "steadyDrop");
     PXG_CHECK_MSG(bad == 0, "hull steady reduce-drop: %zu mismatches", bad);
     std::printf("  [steadyDrop] 5-candidate reduce dropped the witness, manifold intact ok\n");
+
+    // (c) the 5.12 jitter fix: same preload as (a), initialNbContacts = 4
+    Scene jit = rep;
+    jit.countsWord = 4u | (4u << 8);
+    bad = checkScene(jit, 4u, cvxCornerContacts(0.05f), false, "steadyJitter512");
+    PXG_CHECK_MSG(bad == 0, "hull steady, initialNbContacts 4 (5.12 forces the regen): %zu mismatches", bad);
+    std::printf("  [steadyJitter512] initialNbContacts > 1 forced the clip regen ok\n");
 }
 
 // ---------------------------------------------------------------------------

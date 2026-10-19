@@ -41,6 +41,7 @@
 #include "pxgRefMath.h"
 #include "PxgCudaShim.h"
 
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -84,6 +85,7 @@ struct RefPair
     int total = 0;               // pre-reduction contact count (> 6 => caseB reduction)
     Vec3 pts[6];                 // global-space, ordered as written to the stream
     float pen[6] = {};
+    bool edgeEdge = false;       // 5.12: the one-contact edge-edge fallback produced the output
 };
 
 // P9.90: every dot of the reference goes through rdot.  0 = the CUDA's PxVec3::dot,
@@ -156,6 +158,58 @@ static int argmin4(const float v[4])
     return (v[0] == m) ? 0 : ((v[1] == m) ? 1 : ((v[2] == m) ? 2 : 3));
 }
 
+// distanceSegmentSegment.cuh distanceSegmentSegmentSquared, PxClamp as the float
+// selects PxMin(1, PxMax(0, x)).
+static void refSegSegSq(Vec3 p1, Vec3 d1, Vec3 p2, Vec3 d2, float& s, float& t)
+{
+    auto clamp01 = [](float x) { const float lo = (0.f > x) ? 0.f : x; return (1.f < lo) ? 1.f : lo; };
+    const float eps = 1e-6f;
+    const Vec3 r = p1 - p2;
+    const float a = rdot(d1, d1), e = rdot(d2, d2), b = rdot(d1, d2), c = rdot(d1, r);
+    const float aRecip = a > eps ? (1.f / a) : 0.f;
+    const float eRecip = e > eps ? (1.f / e) : 0.f;
+    const float f = rdot(d2, r);
+    const float denom = a * e - b * b;
+    const float temp = b * f - c * e;
+    const float s0 = clamp01(temp / denom);
+    const float sTmp = eps > denom ? 0.5f : s0;
+    const float tTmp = (b * sTmp + f) * eRecip;
+    const float t2 = clamp01(tTmp);
+    const float comp = (b * t2 - c) * aRecip;
+    s = clamp01(comp);
+    t = t2;
+}
+
+// 5.12 cudaBox.cu computeEdgeEdgeContactWorld (BOXBOX_EDGE_EDGE_FIX = 1).  rsqrtf is
+// approximate on the GPU; 1/sqrt here, compared with the fixture's tolerance.
+static bool refEdgeEdge(Vec3 box0e, Vec3 box1e, const Vec3 a[3], Vec3 p0, const Vec3 b[3], Vec3 p1,
+                        uint32_t uaIdx, uint32_t ubIdx, float edgeMargin, float contactDist,
+                        Vec3& outPoint, float& outSep, Vec3& outNormal)
+{
+    const Vec3 uaAxis = a[uaIdx], ubAxis = b[ubIdx];
+    Vec3 n = uaAxis.cross(ubAxis);
+    const float mag2 = rdot(n, n);
+    if (mag2 < 1e-12f) return false;
+    n = n * (1.0f / std::sqrt(mag2));
+    if (rdot(n, p1 - p0) < 0.f) n = -n;
+    outNormal = n;
+    const uint32_t ja = (uaIdx + 1) % 3, ka = (uaIdx + 2) % 3, jb = (ubIdx + 1) % 3, kb = (ubIdx + 2) % 3;
+    const float exA = comp3(box0e, int(uaIdx)), exB = comp3(box1e, int(ubIdx));
+    const Vec3 off0 = a[ja] * ((rdot(n, a[ja]) >= 0.f) ? comp3(box0e, int(ja)) : -comp3(box0e, int(ja)))
+                    + a[ka] * ((rdot(n, a[ka]) >= 0.f) ? comp3(box0e, int(ka)) : -comp3(box0e, int(ka)));
+    const Vec3 off1 = b[jb] * ((rdot(n, b[jb]) <= 0.f) ? comp3(box1e, int(jb)) : -comp3(box1e, int(jb)))
+                    + b[kb] * ((rdot(n, b[kb]) <= 0.f) ? comp3(box1e, int(kb)) : -comp3(box1e, int(kb)));
+    const Vec3 dir0 = uaAxis * (2.f * exA), dir1 = ubAxis * (2.f * exB);
+    const Vec3 start0 = p0 + off0 - uaAxis * exA;
+    const Vec3 start1 = p1 + off1 - ubAxis * exB;
+    float s, t;
+    refSegSegSq(start0, dir0, start1, dir1, s, t);
+    const Vec3 c0 = start0 + dir0 * s, c1 = start1 + dir1 * t;
+    outPoint = (c0 + c1) * 0.5f;
+    outSep = -edgeMargin + contactDist;
+    return true;
+}
+
 static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const TransformV& xf1, float cDist)
 {
     RefPair R;
@@ -175,6 +229,7 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
     const Vec3 ab2(std::fabs(r0.z) + eps, std::fabs(r1.z) + eps, std::fabs(r2.z) + eps);
 
     float minOv[3]; uint32_t featv[3]; float sgnv[3]; bool sepv[3];
+    float edgeM[3]; uint32_t edgeUa[3];   // 5.12 edge-edge fix: per-lane best edge margin / ua
     for (int tid = 0; tid < 3; ++tid)
     {
         const Vec3 col = (tid == 0) ? r0 : (tid == 1 ? r1 : r2);
@@ -193,15 +248,23 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
         const float as1 = std::fabs(col.y * tp.z - col.z * tp.y);
         const float ra1 = abCol.z * box0e.y + abCol.y * box0e.z;
         const float rb1 = comp3(ab0, iHi) * b1Lo + comp3(ab0, iLo) * b1Hi;
-        const bool sep1 = as1 > (ra1 + rb1 + cDist);
+        const float rs1 = ra1 + rb1 + cDist;
+        const bool sep1 = as1 > rs1;
         const float as2 = std::fabs(col.z * tp.x - col.x * tp.z);
         const float ra2 = abCol.z * box0e.x + abCol.x * box0e.z;
         const float rb2 = comp3(ab1, iHi) * b1Lo + comp3(ab1, iLo) * b1Hi;
-        const bool sep2 = as2 > (ra2 + rb2 + cDist);
+        const float rs2 = ra2 + rb2 + cDist;
+        const bool sep2 = as2 > rs2;
         const float as3 = std::fabs(col.x * tp.y - col.y * tp.x);
         const float ra3 = abCol.y * box0e.x + abCol.x * box0e.y;
         const float rb3 = comp3(ab2, iHi) * b1Lo + comp3(ab2, iLo) * b1Hi;
-        const bool sep3 = as3 > (ra3 + rb3 + cDist);
+        const float rs3 = ra3 + rb3 + cDist;
+        const bool sep3 = as3 > rs3;
+        float bm = FMAX; uint32_t bu = 0;
+        if (rs1 - as1 < bm) { bm = rs1 - as1; bu = 0; }
+        if (rs2 - as2 < bm) { bm = rs2 - as2; bu = 1; }
+        if (rs3 - as3 < bm) { bm = rs3 - as3; bu = 2; }
+        edgeM[tid] = bm; edgeUa[tid] = bu;
         minOv[tid] = minO; featv[tid] = feat; sgnv[tid] = sgn;
         sepv[tid] = sepFace || sep1 || sep2 || sep3;
     }
@@ -322,6 +385,25 @@ static RefPair refBoxBox(Vec3 box0e, Vec3 box1e, const TransformV& xf0, const Tr
     // ---- Stage 5 : reduction ----
     const int total = cnt[0] + cnt[1] + cnt[2] + cnt[3];
     R.total = total;
+
+    // ---- 5.12 BOXBOX_EDGE_EDGE_FIX (cudaBox.cu:898-946) ----
+    if (total == 0)
+    {
+        uint32_t winUb = 0; float winM = edgeM[0];
+        if (edgeM[1] < winM) { winUb = 1; winM = edgeM[1]; }
+        if (edgeM[2] < winM) { winUb = 2; winM = edgeM[2]; }
+        const uint32_t winUa = edgeUa[winUb];
+        const Vec3 aCols[3] = { c00, c01, c02 }, bCols[3] = { c10, c11, c12 };
+        Vec3 pt, nrm; float sepv0;
+        if (refEdgeEdge(box0e, box1e, aCols, tp0, bCols, tp1, winUa, winUb, winM, cDist, pt, sepv0, nrm))
+        {
+            R.edgeEdge = true;
+            R.normal = nrm;
+            R.pts[0] = pt; R.pen[0] = sepv0;
+            R.nbContacts = 1;
+            return R;
+        }
+    }
     auto gl = [&](const Vec4& c) { return xform(nc0, nc1, nc2, np, Vec3(c.x, c.y, c.z)); };
     if (total <= 6)
     {
@@ -466,6 +548,15 @@ static HMaterial zeroSignMaterial(uint32_t k)
 // BITWISE against the -ffp-contract=off mirror instead of with a tolerance.
 static bool gBitwise = false;
 
+// 5.12 overflow hardening (contactPatchUtils.cuh:21-47, :59-62, :106-126).  When non-zero,
+// checkBoxBox launches with these contact / force byte limits.  They are chosen below
+// ANY pair's reservation (15 / 3 bytes), so every pair with contacts loses its
+// allocation regardless of the atomic order: the oracle then expects NULL contact
+// pointers, nbContacts 0, eHAS_NO_TOUCH with numPatches 0 -- and, since 5.12, the
+// pair's patch still RESERVED (patchesBytes advances) but never written, and
+// contactPatches left as it was.  gLostFlags is the overflowError the run must raise.
+static uint32_t gContactLimit = 0, gForceLimit = 0, gLostFlags = 0;
+
 static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags, bool mutate, const char* label)
 {
     using namespace physx::gpuslang;
@@ -573,7 +664,9 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
                  patchStream, counters, touch, patch, startPatch, startPoint, startForce;
         uint32_t patchLimit, contactLimit, forceLimit; float tolerance;
     } blob = { n, dIn, dOut, dShapes, dXf, dCd, dMat, dCStream, dPStream, dCounters, dTouch, dPatch,
-               dStartPatch, dStartPoint, dStartForce, PATCH_LIMIT, CONTACT_LIMIT, FORCE_LIMIT, 1.0f };
+               dStartPatch, dStartPoint, dStartForce, PATCH_LIMIT,
+               gContactLimit ? gContactLimit : CONTACT_LIMIT, gForceLimit ? gForceLimit : FORCE_LIMIT, 1.0f };
+    const bool lostRun = gContactLimit != 0 || gForceLimit != 0;
     static_assert(sizeof(BlobT) == 136, "boxBoxNphase blob is 136 bytes");
 
     if (mutate) { const uint64_t s = blob.startPoint; blob.startPoint = blob.startForce; blob.startForce = s; }
@@ -604,15 +697,23 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     const bool prevHadTouch = (oldStatus & 2u) != 0u;
     const bool prevKnown = (oldStatus & 3u) != 0u;
 
-    uint32_t caseBPairs = 0, bitLanes = 0, pairsDiff = 0, pairsOld = 0, normalsDiff = 0;
+    uint32_t caseBPairs = 0, bitLanes = 0, pairsDiff = 0, pairsOld = 0, normalsDiff = 0, lostPairs = 0;
     for (uint32_t i = 0; i < n; ++i)
     {
         const RefPair R = refBoxBox(cfgs[i].box0e, cfgs[i].box1e, cfgs[i].xf0, cfgs[i].xf1, cfgs[i].cDist);
         RefPair Rold;
         if (gBitwise) { gDotOld = 1; Rold = refBoxBox(cfgs[i].box0e, cfgs[i].box1e, cfgs[i].xf0, cfgs[i].xf1, cfgs[i].cDist); gDotOld = 0; }
-        const uint32_t nb = uint32_t(R.nbContacts);
+        const uint32_t nbRef = uint32_t(R.nbContacts);
         if (R.total > 6) caseBPairs++;
-        expTotalContacts += nb; if (nb) expTotalPatches++;
+        expTotalContacts += nbRef; if (nbRef) expTotalPatches++;
+        // a lost allocation reports the pair with no contacts (5.12 registerContactPatch)
+        const uint32_t nb = lostRun ? 0u : nbRef;
+        if (lostRun && nbRef)
+        {
+            ++lostPairs;
+            if (gOut[i].contactPoints != 0u || gOut[i].contactForces != 0u || gOut[i].contactPatches != 0u)
+            { ++bad; if (bad < 12) std::printf("  [%s] pair %u lost allocation: pointers not NULL / patch written\n", label, i); }
+        }
 
         // cmOutput nbContacts
         const uint32_t gNb = gOut[i].nbContacts_flags & 0xffffu;
@@ -731,18 +832,26 @@ static void checkBoxBox(const std::vector<PairCfg>& cfgs, uint32_t priorAllflags
     }
 
     // Patches are packed from offset 0 by the atomic reservation (counters start at 0): nothing past
-    // the last reserved slot may be written.
-    for (size_t b = size_t(expTotalPatches) * 64u; b < gPStream.size(); ++b)
+    // the last reserved slot may be written -- and in a lost run nothing at all.
+    for (size_t b = lostRun ? 0u : size_t(expTotalPatches) * 64u; b < gPStream.size(); ++b)
         if (gPStream[b] != patchStream[b]) { ++bad; std::printf("  [%s] patch stream written past reserved slots at byte %zu\n", label, b); break; }
 
     // counters : deterministic totals (order-independent partition)
     if (gCnt.contactsBytes != expTotalContacts * 16u) { ++bad; std::printf("  [%s] contactsBytes gpu=%u ref=%u\n", label, gCnt.contactsBytes, expTotalContacts * 16u); }
     if (gCnt.patchesBytes != expTotalPatches * 64u) { ++bad; std::printf("  [%s] patchesBytes gpu=%u ref=%u\n", label, gCnt.patchesBytes, expTotalPatches * 64u); }
     if (gCnt.forceAndIndiceBytes != expTotalContacts * 4u) ++bad;
-    if (gCnt.overflowError != 0u) ++bad;
+    if (gCnt.overflowError != (lostRun ? gLostFlags : 0u))
+    { ++bad; std::printf("  [%s] overflowError gpu=%u ref=%u\n", label, gCnt.overflowError, lostRun ? gLostFlags : 0u); }
+    if (lostRun)
+    {
+        // nothing reaches the contact stream
+        for (size_t b = 0; b < gCStream.size(); ++b)
+            if (gCStream[b] != contactStream[b]) { ++bad; std::printf("  [%s] contact stream written at byte %zu\n", label, b); break; }
+        if (lostPairs == 0) { ++bad; std::printf("  [%s] lost run without a contacting pair\n", label); }
+    }
 
-    std::printf("  [%s] pairs=%u contacts=%u patches=%u caseB(>6->4)=%u\n",
-                label, n, expTotalContacts, expTotalPatches, caseBPairs);
+    std::printf("  [%s] pairs=%u contacts=%u patches=%u caseB(>6->4)=%u lost=%u\n",
+                label, n, expTotalContacts, expTotalPatches, caseBPairs, lostPairs);
 
     if (gBitwise)
         std::printf("  [%s] bitwise: %u contact lanes differ in %u pairs (%u equal the old-order twin), %u normals differ\n",
@@ -980,6 +1089,74 @@ PXG_TEST(boxBoxNphase_p90DotOrder)
     gBitwise = true;
     checkBoxBox(cfgs, 0x00000000u, false, "p90DotOrder");
     gBitwise = false;
+}
+
+// 5.12 BOXBOX_EDGE_EDGE_FIX (cudaBox.cu, 5.9 changelog "box-box missing contacts in
+// edge-edge configurations"): two unit-ish boxes crossed edge to edge.  Box A is rolled
+// 45 deg about x so its top is an edge along x; box B is yawed 45 deg about z, so its
+// bottom is an edge along z, and sits just above.  The minimum axis is the edge pair
+// x cross z, the incident face projects outside the reference face, and 5.6.1's face
+// clipping found NO contact for the pair; 5.12 emits one edge-edge contact at the
+// midpoint of the closest points, normal ua x ub oriented A -> B, separation
+// -margin + contactDist.  Small extra tilts and offsets vary the winning pair and the
+// closest-point parameters; every case must agree with the oracle, and the fallback
+// must decide a healthy share of them.
+PXG_TEST(boxBoxNphase_edgeEdge512)
+{
+    std::mt19937 rng(51201);
+    std::uniform_real_distribution<float> jit(-0.05f, 0.05f);
+    std::uniform_real_distribution<float> pen(-0.02f, 0.08f);
+    const float s45 = std::sin(0.3926990817f), c45 = std::cos(0.3926990817f);   // half of 45 deg
+    std::vector<PairCfg> cfgs;
+    size_t nEE = 0, nSep = 0;
+    for (int i = 0; i < 48; ++i)
+    {
+        const Vec3 b0(1.0f + 0.1f * float(i % 3), 1.0f, 1.0f), b1(1.0f, 1.0f, 1.0f + 0.1f * float(i % 4));
+        QuatV qa(s45, 0, 0, c45);                       // 45 deg about x
+        QuatV qb(0, 0, s45, c45);                       // 45 deg about z
+        if (i % 2)
+        {
+            const QuatV tilt(jit(rng), jit(rng), jit(rng), 1.0f);
+            qb = (tilt * qb);
+        }
+        // top edge of A at y = sqrt(2) * b0.y-ish; bottom edge of B at y - sqrt(2) * b1
+        const float hA = 1.41421356f * 1.0f, hB = 1.41421356f * 1.0f;
+        const float y = hA + hB - pen(rng);
+        const Vec3 p(jit(rng), y, jit(rng));
+        PairCfg c{ b0, b1, xfQ(qa, Vec3(0, 0, 0)), xfQ(qb, p), 0.03f, uint32_t(i % 7), uint32_t((i + 2) % 7) };
+        const RefPair R = refBoxBox(c.box0e, c.box1e, c.xf0, c.xf1, c.cDist);
+        if (R.edgeEdge) ++nEE;
+        if (R.separated) ++nSep;
+        cfgs.push_back(c);
+    }
+    PXG_CHECK_MSG(nEE >= 12, "edge-edge fixture: only %zu of %zu cases take the 5.12 fallback (%zu separated)",
+                  nEE, cfgs.size(), nSep);
+    checkBoxBox(cfgs, 0x00000001u, false, "edgeEdge512");
+}
+
+// 5.12 overflow hardening through the ENGINE tail of boxBoxNphase.  Run 1: the contact
+// buffer is 15 bytes, below any pair's 16 * nb.  Run 2: the force buffer alone is 3 bytes;
+// 5.6.1 kept such a pair's contacts (offset + sizeof(PxContact) passed) and stored
+// startContactForces + 0xFFFFFFFF, 5.12 drops it entirely.  Run 3: both.  In all three the
+// patch demand is kept: patchesBytes advances by 64 per contacting pair although no patch
+// is written.
+PXG_TEST(boxBoxNphase_overflow512)
+{
+    std::vector<PairCfg> cfgs;
+    cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(1.8f, 0, 0), 0.02f, 1, 2 });
+    cfgs.push_back({ Vec3(1.5f, 1, 0.8f), Vec3(0.6f, 0.7f, 1.2f), xfT(0, 0, 0), xfT(0.3f, 1.5f, 0.2f), 0.05f, 3, 4 });
+    cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(5.0f, 0, 0), 0.01f, 0, 5 });   // separated
+    cfgs.push_back({ Vec3(1, 1, 1), Vec3(1, 1, 1), xfT(0, 0, 0), xfT(0, 1.9f, 0.1f), 0.02f, 2, 6 });
+    struct Run { uint32_t c, f, flags; const char* label; };
+    const Run runs[3] = { { 15u, 0u, 1u, "overflow512/contact" },
+                          { 0u, 3u, 2u, "overflow512/forceOnly" },
+                          { 15u, 3u, 3u, "overflow512/both" } };
+    for (const Run& r : runs)
+    {
+        gContactLimit = r.c; gForceLimit = r.f; gLostFlags = r.flags;
+        checkBoxBox(cfgs, 0x00020103u, false, r.label);   // prior: eHAS_TOUCH, 1 patch
+    }
+    gContactLimit = gForceLimit = gLostFlags = 0;
 }
 
 PXG_TEST(boxBoxNphase_mutation)

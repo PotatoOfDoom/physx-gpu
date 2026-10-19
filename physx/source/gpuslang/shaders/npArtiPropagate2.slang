@@ -45,8 +45,9 @@
 //     eVEL_DIRTY);
 //  3. partitionId != 0 runs ONLY under eHAS_IMPULSES, then ONLY when
 //     mPartitionAverageScale[gti + partitionId*nb] > 0;
-//  4. the per-partition path base: offset2 = globalWarpIndex + partitionId *
-//     ceil(nb/32) * wordSize, in units of PxgArticulationBitFieldStackData;
+//  4. the per-partition path base: offset2 = (globalWarpIndex + partitionId *
+//     ceil(nb/32)) * wordSize, in units of PxgArticulationBitFieldStackData
+//     (5.12; 5.6.1 scaled only the partition term, see below);
 //  5. scale = 1/countActiveSlabs(...) -- the P8.99c helper over the shared
 //     desc's encodedReferenceCount, offset by islandContextPool[0].mBodyCount
 //     + mBodyStartIndex;
@@ -151,8 +152,9 @@ void p2iPropagateImpulses2(uint64_t d, uint64_t solverDescA, uint64_t encodedRef
 
             const uint nbArticulationBatchPerPartition = (nbArticulations + 31u) / 32u;
             const uint wordSize = (maxLinks + 63u) / 64u;
-            const uint offset2 = globalWarpIndex
-                               + partitionId * nbArticulationBatchPerPartition * wordSize;
+            // 5.12 (overlap fix): the whole slot index is scaled by wordSize
+            const uint offset2 = (globalWarpIndex
+                                  + partitionId * nbArticulationBatchPerPartition) * wordSize;
             const uint64_t pathToRootPerPartition =
                 artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOTS_PER_PARTITION)
                 + uint64_t(offset2) * PXG_AB_BITFIELD_STACK_SIZE;
@@ -454,14 +456,12 @@ void artiSaveVelocity1TPGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId
 //  7. count counts SLABS with at least one dirty index (x or z);
 //     scale = count < 1 ? 0 : 1/count.
 //
-// SEVENTH UPSTREAM-BUG CANDIDATE (transcribed verbatim, not fixed): the
-// zero loop indexes mPathToRootsPerPartition at `w * wordSize`, but the
-// per-partition write (and the propagate2 READ, :3609) at
-// `w + partition * nbArticulationBatchPerPartition * wordSize` -- for
-// wordSize >= 2 (more than 64 links) adjacent warps' slots OVERLAP, a
-// cross-warp data race on the same (slot, lane) words.  Invisible at
-// wordSize == 1, which is every scene today.  The fixture's rounds are
-// chosen race-free (multi-warp only at wordSize 1; wordSize 2 single-warp).
+// SEVENTH UPSTREAM-BUG CANDIDATE, FIXED UPSTREAM IN 5.12: 5.6.1 zeroed
+// mPathToRootsPerPartition at `w * wordSize` but wrote (and propagate2 read)
+// `w + partition * nbArticulationBatchPerPartition * wordSize`, so for
+// wordSize >= 2 (more than 64 links) adjacent warps' slots overlapped.  5.12
+// addresses `(w + partition * nbArticulationBatchPerPartition) * wordSize`
+// on both sides, consistent with the zero loop's partition-0 slot.
 // ===========================================================================
 
 struct CdParams
@@ -622,8 +622,8 @@ void artiComputeDependencies(uint3 groupThreadId : SV_GroupThreadID, uint3 group
         if (nextPartition < nbPartitions)
         {
             const uint64_t outSlot = pathsPerPartition
-                + uint64_t(globalWarpIndex
-                           + nextPartition * nbArticulationBatchPerPartition * wordSize)
+                + uint64_t((globalWarpIndex
+                            + nextPartition * nbArticulationBatchPerPartition) * wordSize)
                       * PXG_AB_BITFIELD_STACK_SIZE;
             for (uint j = 0u; j < wordSize; ++j)
             {

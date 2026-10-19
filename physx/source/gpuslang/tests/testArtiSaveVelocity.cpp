@@ -97,7 +97,7 @@ const uint32_t SVP_D_LINK_BLOCKS = 136;
 const uint32_t SVP_D_DOF_BLOCKS = 184;
 const uint32_t SVP_D_MAX_LINKS = 248;
 const uint32_t SVP_D_MAX_DOFS = 252;
-const uint32_t SVP_DESC_SIZE = 360;
+const uint32_t SVP_DESC_SIZE = 344;
 const uint32_t SVP_NONE = 0xFFFFFFFFu;
 
 static uint32_t svpNumLinks(uint32_t k) { return 1u + (k % 7u); }

@@ -76,7 +76,7 @@ const uint32_t CD_D_TEMP_PATH = 152;
 const uint32_t CD_D_TEMP_SHARED = 160;
 const uint32_t CD_D_TEMP_ROOT = 168;
 const uint32_t CD_D_MAX_LINKS = 248;
-const uint32_t CD_DESC_SIZE = 360;
+const uint32_t CD_DESC_SIZE = 344;
 const uint32_t CD_NONE = 0xFFFFFFFFu;
 const uint32_t CD_STACK = 256;   // PxgArticulationBitFieldStackData: PxU64[32]
 

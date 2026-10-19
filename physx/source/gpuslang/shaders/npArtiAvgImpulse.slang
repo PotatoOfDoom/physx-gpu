@@ -166,9 +166,9 @@ void aiStoreSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
 // `0 - x` spelled as a select (a literal-zero OpFSub is rewritten to -x by
 // llvmpipe, including via adPropagateImpulseWJf's inlined hasJf = false).
 // Otherwise adPropagateImpulseW's body, expression for expression.
-float aiZeroMinus(float x) { return (x == 0.0f) ? 0.0f : -x; }
+public float aiZeroMinus(float x) { return (x == 0.0f) ? 0.0f : -x; }
 
-AbSpatialVector aiPropagateImpulseWNullJf(AbSpatialVector isInvD[3], float3 childToParent,
+public AbSpatialVector aiPropagateImpulseWNullJf(AbSpatialVector isInvD[3], float3 childToParent,
                                           AbSpatialVector motionMatrix[3], AbSpatialVector Z,
                                           uint dofCount, inout float qstZ[3])
 {
@@ -609,13 +609,11 @@ void aiAvg2Test(uint3 dispatchThreadId : SV_DispatchThreadID)
 //     (aiPropagateImpulseWNullJf since P9.86c), not the preloaded `-dot`.
 //  5. Each link's mScratchImpulse is zeroed AFTER propagating; the parent
 //     target comes from mParents, not index - 1.
-//  6. The root tail runs only for a FREE base (eFIX_BASE is bit 0 with
-//     decoys above it): deltaV = response6x6 * (-scratch0), STORED to
-//     mRootDeferredZ (an overwrite, NOT an add), scratch0 zeroed.
-//     The engine stores a VELOCITY-dimension quantity into a field every
-//     reader treats as an impulse (PxcFsFlushVelocity computes
-//     invInertia * (-mRootDeferredZ)) -- transcribed verbatim; flagged in
-//     RUNTIME_STATUS as the sixth upstream-bug candidate.
+//  6. 5.12 (OMPE-42519): the root tail runs for BOTH bases and ADDS scratch0
+//     into mRootDeferredZ (impulse units), then zeroes scratch0.  This is the
+//     upstream fix of the sixth upstream-bug candidate (5.6.1 stored the
+//     velocity-dimension response6x6 * (-scratch0) into mRootDeferredZ, free
+//     base only).
 // ===========================================================================
 
 struct PiParams
@@ -708,16 +706,14 @@ void artiPushImpulse(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
         aiStoreSV(tLink, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
     }
 
-    const bool fixedBase = (abU32(artiBlock, PXG_AB_mFlags, lane) & 1u) != 0u;   // trap 6
-    if (!fixedBase)
+    // trap 6 (5.12, OMPE-42519): mScratchImpulse[0] is flushed into
+    // mRootDeferredZ as an IMPULSE (addSpatialVector) for both fixed and free
+    // bases, replacing 5.6.1's free-base-only `response6x6 * (-scratch0)`
+    // velocity overwrite.
     {
-        const AbMatrix6x6 mat =
-            abLoadSpatialMatrix6x6(linkBase, PXG_AB_LINK_mSpatialResponseMatrix, lane);
-        const AbSpatialVector scratch0 = aiLoadSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane);
-        const AbSpatialVector deltaV =
-            asmM6MulVec(mat, asmSVec(-scratch0.top, -scratch0.bottom));
-
-        aiStoreSV(artiBlock, PXG_AB_mRootDeferredZ, lane, deltaV);   // a STORE, not an add
+        const AbSpatialVector rootZ = aiLoadSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane);
+        aiStoreSV(artiBlock, PXG_AB_mRootDeferredZ, lane,
+                  asmSVecAdd(aiLoadSV(artiBlock, PXG_AB_mRootDeferredZ, lane), rootZ));
         aiStoreSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
     }
 }

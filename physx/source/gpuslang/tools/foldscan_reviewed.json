@@ -8083,5 +8083,32 @@
 ],
 "verdict": "BENIGN",
 "why": "P9.96: the coordinate clamp to [0.5, N - 0.5] (K4 of the module). Slang min/max are GLSL FMin/FMax, which differ from a select only on a +-0 tie or a NaN operand. Neither bound is ever zero (0.5, and float(n) - 0.5 = -0.5 for an empty extent), so no +-0 tie exists; a NaN coordinate is documented (K5) as giving an unspecified value at a clamped, in-range address, and the fixture checks such lanes for 'written' only. No CUDA source twin exists (hardware addressing)."
+},
+{
+"file": "boxBoxNphase.slang",
+"code": "const float3 dpp = deepestPt - faceNormal * dot(deepestPt, faceNormal);",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 rigid narrowphase: newly flagged because Stage 5b (the BOXBOX_EDGE_EDGE_FIX fallback) stores computeEdgeEdgeContactWorld's degenerate float4(0, 0, 0, PX_MAX_F32) into gsLC[gbase], which the conservative dataflow joins with the Stage 5 read deepestPt = gsLC[gbase].xyz. That store happens only after the Stage 5 barrier and only when total == 0 (caseB false), so the caseB read always sees origC[dI], a clipped contact; the subtraction is the CUDA's deepestPt - n * dot(...) on loaded values (cudaBox.cu:990)."
+},
+{
+"file": "boxBoxNphase.slang",
+"code": "const float3 dir = cross(faceNormal, furthestPt - deepestPt);",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "Same origin as the dpp site: the Stage 5b gsLC store of the degenerate edge-edge result is joined into deepestPt by the scan, but it is written after Stage 5 and only for total == 0; on the caseB path both operands are clipped contacts, as in the CUDA (cudaBox.cu:1013)."
+},
+{
+"file": "pxgSlangPolyClip.slang",
+"code": "const float3 e1FromShuffle = pcReadV1((index + 1u == 3u) ? 0u : index + 1u) - pcReadV1(index);",
+"kinds": [
+"F2-zero-minus"
+],
+"verdict": "NOT-A-FOLD",
+"why": "5.12 dnom0 fix (convexTriangle.cuh): shuffle(e1, index) rebuilt as v1[next] - v1[index] from the staged triangle vertices, the same subtraction of two loaded values the CUDA performs for e1 on lane `index`; the zero the scan sees is the groupshared staging, not a literal operand, exactly as for the reviewed e1 line it mirrors."
 }
 ]

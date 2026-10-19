@@ -277,8 +277,23 @@ void ctPolyClip(uint3 dtid : SV_DispatchThreadID)
             const float denom = dotX(m, e0[L]);
             const float lambda = dotX(triVert0 - v0[L], m) / denom;
             const float3 p = v0[L] + lambda * e0[L];
-            const float d = -dotX(p - triVert0, plane1.xyz);
-            wp.sep[L] = (denom == 0.0f || dnom0 == 0.0f) ? PC_MAX_F32 : d / dnom0;
+            // 5.10+ (convexTriangle.cuh, 5.12 :1024-1103): t / dnom0 for
+            // |dnom0| > 1e-4, else the Gram/Cramer separation in the basis
+            // {e1, axis} with the sin^2 < 1e-12 discard -- see pxgSlangPolyClip.
+            const float3 dv = p - triVert0;
+            if (abs(dnom0) > 1.0e-4f)
+            {
+                const float d = -dotX(dv, plane1.xyz);
+                wp.sep[L] = (denom == 0.0f) ? PC_MAX_F32 : d / dnom0;
+            }
+            else
+            {
+                const float3 e1FromShuffle = e1[index];   // shuffle(FULL_MASK, e1, index)
+                const float e1MagnSqr = dotX(e1FromShuffle, e1FromShuffle);
+                const float mMagnSqr = dotX(m, m);
+                const float sepTmp = -((e1MagnSqr * dotX(dv, axis)) - (dotX(axis, e1FromShuffle) * dotX(dv, e1FromShuffle))) / mMagnSqr;
+                wp.sep[L] = ((denom == 0.0f) || ((mMagnSqr / e1MagnSqr) < 1.0e-12f)) ? PC_MAX_F32 : sepTmp;
+            }
             wp.pos[L] = p;
         }
         uint flag3 = 0u;

@@ -54,8 +54,8 @@
 //   * every destination starts poisoned and is compared whole, so the bytes
 //     between one articulation's copy length and the next one's stride must come
 //     back poisoned;
-//   * both accumulator pointers are exercised null and non-null, in two
-//     dispatches.
+//   * (5.12 removed the residual reporting: no error / contact accumulator
+//     pointers in the output desc, nothing else is written.)
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -86,17 +86,11 @@ using physx::PxgArticulationOutputDesc;
 using physx::PxgArticulationLinkJointRootStateData;
 
 // ---- the ABI, pinned ----
-static_assert(sizeof(PxgArticulationOutputDesc) == 32, "PXG_ARTI_OUT_DESC_SIZE");
+static_assert(sizeof(PxgArticulationOutputDesc) == 16, "PXG_ARTI_OUT_DESC_SIZE");
 static_assert(offsetof(PxgArticulationOutputDesc, linkAndJointAndRootStateData) == 0,
               "PXG_ARTI_OUT_STATE_DATA");
 static_assert(offsetof(PxgArticulationOutputDesc, sleepData) == 8, "PXG_ARTI_OUT_SLEEP_DATA");
-static_assert(offsetof(PxgArticulationOutputDesc, errorAccumulator) == 16,
-              "PXG_ARTI_OUT_ERROR_ACC");
-static_assert(offsetof(PxgArticulationOutputDesc, contactResidualAccumulator) == 24,
-              "PXG_ARTI_OUT_CONTACT_ACC");
-static_assert(offsetof(PxgArticulationCoreDesc, mContactErrorAccumulator) == 344,
-              "PXG_ARTI_CORE_CONTACT_ERROR_ACC");
-static_assert(offsetof(PxgArticulation, linkJointRootStateDataBuffer) == 192,
+static_assert(offsetof(PxgArticulation, linkJointRootStateDataBuffer) == 184,
               "PXG_ARTI_LINK_JOINT_ROOT_STATE");
 static_assert(sizeof(physx::PxgSolverBodySleepData) == 8, "PXG_ARTI_SLEEP_DATA_SIZE");
 // 28, not 32: a quat and a vec3 with no padding.
@@ -181,15 +175,8 @@ PXG_TEST(artiDmaBack)
     std::vector<uint32_t> sleepPoison(size_t(DB_NB_ARTI + 5) * 2);
     for (size_t j = 0; j < sleepPoison.size(); ++j)
         sleepPoison[j] = 0xAC000000u | uint32_t(j & 0xFFFFFFu);
-    std::vector<uint32_t> errPoison(size_t(DB_ARTI_SLOTS * 2 + 4) * 3);
-    for (size_t j = 0; j < errPoison.size(); ++j)
-        errPoison[j] = 0xAD000000u | uint32_t(j & 0xFFFFFFu);
-    std::vector<uint32_t> conPoison(6);
-    for (size_t j = 0; j < conPoison.size(); ++j)
-        conPoison[j] = 0xAE000000u | uint32_t(j);
-
     PxgDevicePtr dIsland = 0, dBody = 0, dArtis = 0, dSrc = 0, dSleepIn = 0;
-    PxgDevicePtr dOut = 0, dSleepOut = 0, dErr = 0, dCon = 0, dDesc = 0, dOutDesc = 0;
+    PxgDevicePtr dOut = 0, dSleepOut = 0, dDesc = 0, dOutDesc = 0;
     shim.memAlloc(&dIsland, island.size() * sizeof(physx::PxNodeIndex));
     shim.memAlloc(&dBody, bodySims.size() * sizeof(physx::PxgBodySim));
     shim.memAlloc(&dArtis, size_t(DB_ARTI_SLOTS) * sizeof(PxgArticulation));
@@ -197,12 +184,10 @@ PXG_TEST(artiDmaBack)
     shim.memAlloc(&dSleepIn, sleepIn.size() * 4);
     shim.memAlloc(&dOut, outPoison.size() * 4);
     shim.memAlloc(&dSleepOut, sleepPoison.size() * 4);
-    shim.memAlloc(&dErr, errPoison.size() * 4);
-    shim.memAlloc(&dCon, conPoison.size() * 4);
     shim.memAlloc(&dDesc, sizeof(PxgArticulationCoreDesc));
     shim.memAlloc(&dOutDesc, sizeof(PxgArticulationOutputDesc));
-    if (!dIsland || !dBody || !dArtis || !dSrc || !dSleepIn || !dOut || !dSleepOut || !dErr
-        || !dCon || !dDesc || !dOutDesc)
+    if (!dIsland || !dBody || !dArtis || !dSrc || !dSleepIn || !dOut || !dSleepOut || !dDesc
+        || !dOutDesc)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -218,12 +203,6 @@ PXG_TEST(artiDmaBack)
         r.data.numJointDofs = physx::PxU16(dbNumDofs(k));
         r.linkJointRootStateDataBuffer =
             reinterpret_cast<physx::PxU8*>(dSrc + PxgDevicePtr(size_t(REMAP[k]) * srcStride));
-        r.internalResidualAccumulator.mErrorSumOfSquares = 1.0f + float(k);
-        r.internalResidualAccumulator.mMaxError = 2.0f + float(k);
-        r.internalResidualAccumulator.mCounter = int(100 + k);
-        r.contactResidualAccumulator.mErrorSumOfSquares = 3.0f + float(k);
-        r.contactResidualAccumulator.mMaxError = 4.0f + float(k);
-        r.contactResidualAccumulator.mCounter = int(200 + k);
     }
 
     shim.memcpyHtoD(dIsland, island.data(), island.size() * sizeof(physx::PxNodeIndex));
@@ -235,12 +214,8 @@ PXG_TEST(artiDmaBack)
     size_t bad = 0;
     for (uint32_t pass = 0; pass < 2; ++pass)
     {
-        const bool withAccumulators = (pass == 1);
-
         shim.memcpyHtoD(dOut, outPoison.data(), outPoison.size() * 4);
         shim.memcpyHtoD(dSleepOut, sleepPoison.data(), sleepPoison.size() * 4);
-        shim.memcpyHtoD(dErr, errPoison.data(), errPoison.size() * 4);
-        shim.memcpyHtoD(dCon, conPoison.data(), conPoison.size() * 4);
 
         PxgArticulationCoreDesc desc;
         std::memset(&desc, 0x5A, sizeof(desc));
@@ -252,19 +227,12 @@ PXG_TEST(artiDmaBack)
         desc.nbArticulations = DB_NB_ARTI;
         desc.mMaxLinksPerArticulation = DB_MAX_LINKS;
         desc.mMaxDofsPerArticulation = DB_MAX_DOFS;
-        desc.mContactErrorAccumulator.mErrorSumOfSquares = 7.5f;
-        desc.mContactErrorAccumulator.mMaxError = 8.25f;
-        desc.mContactErrorAccumulator.mCounter = 4242;
         shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
         PxgArticulationOutputDesc outDesc;
         std::memset(&outDesc, 0, sizeof(outDesc));
         outDesc.linkAndJointAndRootStateData = reinterpret_cast<physx::PxU8*>(dOut);
         outDesc.sleepData = reinterpret_cast<physx::PxgSolverBodySleepData*>(dSleepOut);
-        outDesc.errorAccumulator =
-            withAccumulators ? reinterpret_cast<physx::Dy::ErrorAccumulator*>(dErr) : NULL;
-        outDesc.contactResidualAccumulator =
-            withAccumulators ? reinterpret_cast<physx::Dy::ErrorAccumulator*>(dCon) : NULL;
         shim.memcpyHtoD(dOutDesc, &outDesc, sizeof(outDesc));
 
         struct Params { uint64_t desc, outDesc; } prm = { uint64_t(dDesc), uint64_t(dOutDesc) };
@@ -275,8 +243,7 @@ PXG_TEST(artiDmaBack)
         shim.streamSynchronize();
 
         // ---- the expectation ----
-        std::vector<uint32_t> wantOut = outPoison, wantSleep = sleepPoison, wantErr = errPoison,
-                              wantCon = conPoison;
+        std::vector<uint32_t> wantOut = outPoison, wantSleep = sleepPoison;
         for (uint32_t k = 0; k < DB_NB_ARTI; ++k)
         {
             // ONE THREAD per articulation: the sleep data, indexed by the remap id
@@ -290,24 +257,11 @@ PXG_TEST(artiDmaBack)
                     dbNumLinks(k), dbNumDofs(k), 1);
             for (uint32_t w = 0; w < len / 4; ++w)
                 wantOut[size_t(k) * outStride / 4 + w] = srcImg[size_t(REMAP[k]) * srcStride / 4 + w];
-
-            if (withAccumulators)
-            {
-                const float* ir = &recs[REMAP[k]].internalResidualAccumulator.mErrorSumOfSquares;
-                const float* cr = &recs[REMAP[k]].contactResidualAccumulator.mErrorSumOfSquares;
-                std::memcpy(&wantErr[size_t(REMAP[k]) * 3], ir, 12);
-                std::memcpy(&wantErr[size_t(REMAP[k] + DB_NB_ARTI) * 3], cr, 12);
-            }
         }
-        if (withAccumulators)
-            std::memcpy(wantCon.data(), &desc.mContactErrorAccumulator, 12);
 
-        std::vector<uint32_t> gotOut(outPoison.size()), gotSleep(sleepPoison.size()),
-            gotErr(errPoison.size()), gotCon(conPoison.size());
+        std::vector<uint32_t> gotOut(outPoison.size()), gotSleep(sleepPoison.size());
         shim.memcpyDtoH(gotOut.data(), dOut, gotOut.size() * 4);
         shim.memcpyDtoH(gotSleep.data(), dSleepOut, gotSleep.size() * 4);
-        shim.memcpyDtoH(gotErr.data(), dErr, gotErr.size() * 4);
-        shim.memcpyDtoH(gotCon.data(), dCon, gotCon.size() * 4);
 
         auto cmp = [&](const char* what, const std::vector<uint32_t>& w,
                        const std::vector<uint32_t>& g) {
@@ -323,8 +277,6 @@ PXG_TEST(artiDmaBack)
         };
         cmp("state", wantOut, gotOut);
         cmp("sleep", wantSleep, gotSleep);
-        cmp("error acc", wantErr, gotErr);
-        cmp("contact acc", wantCon, gotCon);
     }
 
     PXG_CHECK_MSG(bad == 0, "the DMA-back image matches the engine's own layout");
@@ -336,8 +288,6 @@ PXG_TEST(artiDmaBack)
     shim.memFree(dSleepIn);
     shim.memFree(dOut);
     shim.memFree(dSleepOut);
-    shim.memFree(dErr);
-    shim.memFree(dCon);
     shim.memFree(dDesc);
     shim.memFree(dOutDesc);
 }

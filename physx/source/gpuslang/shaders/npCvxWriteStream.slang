@@ -267,6 +267,7 @@ void cvxWriteStream(uint3 dtid : SV_DispatchThreadID)
             {
                 overflowFlags |= FORCE_BUFFER_OVERFLOW;
                 forceByteOffset0 = 0xFFFFFFFFu;
+                contactByteOffset0 = 0xFFFFFFFFu; // 5.12 (cudaGJKEPA.cu:1780)
             }
         }
     }

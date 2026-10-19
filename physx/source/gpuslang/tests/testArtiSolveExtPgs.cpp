@@ -102,7 +102,7 @@ static_assert(sizeof(PxgBlockSolverContactPoint) == 1664, "PGS contact point");
 static_assert(sizeof(PxgBlockSolverContactFriction) == 1408, "PGS contact friction");
 static_assert(sizeof(PxgBlockSolverConstraint1DHeader) == 1664, "PGS 1D header");
 static_assert(sizeof(PxgBlockSolverConstraint1DCon) == 2304, "PGS 1D con");
-static_assert(sizeof(PxgBlockSolverConstraint1DMod) == 1024, "PGS 1D mod");
+static_assert(sizeof(PxgBlockSolverConstraint1DMod) == 896, "PGS 1D mod");
 
 static float fv(uint32_t a, uint32_t l, uint32_t d, uint32_t salt)
 {
@@ -193,8 +193,14 @@ struct SvpParamsHost
     uint64_t batch, h0, h1, p0, p1, responses, io;
     float ref0, ref1;
     uint32_t nbLanes, flagsWord;
+    float biasCoefficient;   // @72 (5.12: the contact entry's rigidContact bias)
+    uint32_t pad1;
 };
-static_assert(sizeof(SvpParamsHost) == 72, "params blob");
+static_assert(sizeof(SvpParamsHost) == 80, "params blob");
+
+// 5.12: the friction velMultiplier numerator is the island's rigidContact bias
+// coefficient (5.6.1 hard-coded 0.8); a non-0.8 value keeps the old constant visible
+static const float SVP_RIGID_CONTACT_BIAS = 0.65f;
 
 static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, float ref1,
                             bool nanResiduals = false)
@@ -336,7 +342,7 @@ static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, floa
             RefError err;
             refSolveExtContactPGS(batch, lio.vel0, lio.vel1, doFriction, l, w.ch.data(),
                                   w.fh.data(), w.cp.data(), w.fp.data(), rsp.data(), imp0, imp1,
-                                  &err, ref0, ref1);
+                                  &err, SVP_RIGID_CONTACT_BIAS, ref0, ref1);
             float* o = &w.io[32 * 32 + l * 32];
             const UnAlignedSpatialVector* vs[4] = { &lio.vel0, &lio.vel1, &imp0, &imp1 };
             for (int v = 0; v < 4; ++v)
@@ -421,7 +427,7 @@ static size_t svpRunContact(PxgCudaShim& shim, bool doFriction, float ref0, floa
     const uint32_t flagsWord = 1u | (doFriction ? 2u : 0u);
     SvpParamsHost prm = { uint64_t(dB), uint64_t(dCh), uint64_t(dFh), uint64_t(dCp),
                           uint64_t(dFp), uint64_t(dR), uint64_t(dIo),
-                          ref0, ref1, SVP_LANES, flagsWord };
+                          ref0, ref1, SVP_LANES, flagsWord, SVP_RIGID_CONTACT_BIAS, 0u };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch svpContactTest");
     shim.streamSynchronize();
@@ -571,7 +577,7 @@ static size_t svpRun1D(PxgCudaShim& shim, bool residual, float ref0, float ref1)
 
     SvpParamsHost prm = { uint64_t(dB), uint64_t(dHd), uint64_t(dRows), uint64_t(dMods), 0,
                           uint64_t(dR), uint64_t(dIo),
-                          ref0, ref1, SVP_LANES, residual ? 1u : 0u };
+                          ref0, ref1, SVP_LANES, residual ? 1u : 0u, 0.0f, 0u };
     PXG_CHECK_MSG(shim.launchKernel(1, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch svp1DTest");
     shim.streamSynchronize();
@@ -605,8 +611,8 @@ PXG_TEST(artiSolveExtPgs)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiSolveExtPGS.spv", "svpContactTest", 72u, 0 },
-        { "npArtiSolveExtPGS.spv", "svp1DTest", 72u, 0 },
+        { "npArtiSolveExtPGS.spv", "svpContactTest", 80u, 0 },
+        { "npArtiSolveExtPGS.spv", "svp1DTest", 80u, 0 },
     };
     PxgCudaShim shim(dev, manifest, 2, &svpLoader);
 
@@ -626,8 +632,8 @@ PXG_TEST(artiSolveExtPgsMaxErrorNaN)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiSolveExtPGS.spv", "svpContactTest", 72u, 0 },
-        { "npArtiSolveExtPGS.spv", "svp1DTest", 72u, 0 },
+        { "npArtiSolveExtPGS.spv", "svpContactTest", 80u, 0 },
+        { "npArtiSolveExtPGS.spv", "svp1DTest", 80u, 0 },
     };
     PxgCudaShim shim(dev, manifest, 2, &svpLoader);
 

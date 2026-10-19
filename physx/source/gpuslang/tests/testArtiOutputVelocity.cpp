@@ -34,7 +34,7 @@
 // ===========================================================================
 //
 // The eight-argument overload's mirror is `pxgref::fvMirrorOut` -- P8.94b's
-// fvMirror minus the two mSolverSpatialDeltaVel accumulations, plus the
+// fvMirror (5.12: with both mSolverSpatialDeltaVel accumulations) plus the
 // solver outVelocity writes.  Everything numeric in it is a PX_CUDA_CALLABLE
 // engine primitive (`SpatialMatrix::operator*`, `loadSpatialVector`, ...).
 // The kernel around it -- the guard, the dirty dispatch, the clean copy, the
@@ -112,7 +112,7 @@ const uint32_t OV_D_LINK_BLOCKS = 136;
 const uint32_t OV_D_DOF_BLOCKS = 184;
 const uint32_t OV_D_MAX_LINKS = 248;
 const uint32_t OV_D_MAX_DOFS = 252;
-const uint32_t OV_DESC_SIZE = 360;
+const uint32_t OV_DESC_SIZE = 344;
 
 // 1..7, never equal to the articulation index (see testArtiFlushVel.cpp).
 static uint32_t ovNumLinks(uint32_t k) { return 1u + (k % 7u); }

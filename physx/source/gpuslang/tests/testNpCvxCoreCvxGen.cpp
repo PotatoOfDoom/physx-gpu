@@ -1175,6 +1175,8 @@ static void makePlanesRef(const V3 face[4], uint32_t numPoints, V3 axis, F4 plan
             }
             if (posCount && negCount) continue;
             if (posCount) n = neg(n);
+            // 5.12 GuConvexSupport.h:753-756: cap on degenerate (collinear) faces
+            if (numPlanes >= MAX_CLIP_PLANES) return;
             planes[numPlanes++] = F4{ -n.x, -n.y, -n.z, dot3(n, s) };
         }
     }

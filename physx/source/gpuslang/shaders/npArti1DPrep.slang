@@ -83,7 +83,7 @@ struct J1In
     float4 b1p;
     uint4 cfg;          // numRows, constraintData->mFlags, 0, 0
     float4 invMassScale;  // lin0X_ang0Y_lin1Z_ang1W
-    float4 scal;        // dt, recipdt, 0, 0
+    float4 scal;        // dt, recipdt, biasCoefficient (5.12 erp), 0
     float4 rvel[80];    // 4 per row: linear0XYZ_geometricErrorW, linear1XYZ_minImpulseW,
                         //   angular0XYZ_velocityTargetW, angular1XYZ_maxImpulseW
     uint4 rparU[20];    // x = flags, y = solveHint
@@ -246,7 +246,9 @@ void a1dPGS(uint3 dtid : SV_DispatchThreadID)
         o.sorted[i / 4u][i & 3u] = sortedRows[i];
 
     // ---- setUpArti1DConstraintBlock, PGS (cu L1424-1540) ----
-    const float erp = 1.0f;
+    // 5.12: erp = biasCoefficient (params.biasCoefficient = biasCoefficients.joint);
+    // 5.6.1 hard-coded 1.0f
+    const float erp = s.scal.z;
     uint outCount = 0u;
 
     // cfm = PxMax(b0.cfm, b1.cfm) is computed by the CUDA (L1449) and passed
@@ -370,7 +372,8 @@ void a1dPGS(uint3 dtid : SV_DispatchThreadID)
 // stepInvDtF32, recipSimDt = invDtF32, lengthScale, biasCoefficient.
 //
 // TGS-vs-PGS differences (all verified against the CUDA):
-//   - erp = 0.5f * biasCoefficient (PGS: 1.0f);
+//   - erp = biasCoefficient (5.12, both solvers; 5.6.1: TGS 0.5f * biasCoefficient,
+//     PGS 1.0f);
 //   - NO ang0Writeback and NO pre-skip write of any kind: a degenerate row
 //     (unitResponse <= DY_ARTICULATION_MIN_RESPONSE) writes nothing;
 //   - resp0/resp1 stored into the row (L1658) after the skip;
@@ -471,7 +474,7 @@ void a1dTGS(uint3 dtid : SV_DispatchThreadID)
         o.sorted[i / 4u][i & 3u] = sortedRows[i];
 
     // ---- setUpArti1DConstraintBlock, TGS (cu L1594-1714) ----
-    const float erp = 0.5f * biasCoefficient;
+    const float erp = biasCoefficient;   // 5.12 (5.6.1: 0.5f * biasCoefficient)
     uint outCount = 0u;
 
     // cfm = PxMax(b0.cfm, b1.cfm) (cu L1621) feeds intializeTGSBlock1D's cfm

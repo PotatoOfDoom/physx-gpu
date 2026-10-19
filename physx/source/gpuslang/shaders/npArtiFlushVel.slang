@@ -329,11 +329,12 @@ void artiFlushVelocity(uint3 dispatchThreadId : SV_DispatchThreadID)
 // (linear at [i], angular at [i + offset], w = 0).
 //
 // TRAPS (continuing the module's numbering; each carries a sweep mutant):
-// 10. **No mSolverSpatialDeltaVel writes anywhere** -- the six-argument
-//     overload accumulates it at the root and per link, this one must NOT.
-// 11. **outVelocity[0] takes the UPDATED root velocity** (vel + deltaV), and
-//     only on the free-base path -- a fixed base leaves out[0]/out[offset]
-//     UNWRITTEN in the dirty branch.
+// 10. (5.12) mSolverSpatialDeltaVel is accumulated at the root (free base only)
+//     and per link, exactly like the six-argument overload.  5.6.1 wrote it
+//     nowhere here.
+// 11. **outVelocity[0] takes the UPDATED root velocity** (vel + deltaV) on the
+//     free-base path; 5.12 writes ZERO for a fixed base (5.6.1 left
+//     out[0]/out[offset] UNWRITTEN in the dirty branch).
 // 12. **The kernel's else-branch** (mStateDirty == 0) copies mMotionVelocity
 //     straight out WITHOUT flushing, for every link including the root.
 // 13. **The isTGS tail writes mDeltaMotion at [i + 2*offset] / [i + 3*offset]**
@@ -352,10 +353,18 @@ public void fvFlushVelocityOut(uint64_t artiBlock, uint64_t linkBlocks, uint64_t
     AbSpatialVector deltaV = FV_ZERO;
     const AbSpatialVector deferredZ = fvNeg(fvLoadSV(artiBlock, PXG_AB_mRootDeferredZ, lane));
 
+    // 5.12: a fixed base publishes ZERO to outVelocity (mMotionVelocity[0] is
+    // zero by invariant, so the load is skipped), a free base the updated one.
+    AbSpatialVector vel = FV_ZERO;
+
     if (!fixBase)
     {
-        const AbSpatialVector motionVelocity0 =
-            fvLoadSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane);
+        vel = fvLoadSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane);
+
+        // 5.12: the root's mSolverSpatialDeltaVel is accumulated too (parity
+        // with the six-argument overload in articulationDynamic.cuh)
+        const AbSpatialVector solverSpatialDeltaVel0 =
+            fvLoadSV(linkBlocks, PXG_AB_LINK_mSolverSpatialDeltaVel, lane);
 
         AbMat33 tl, tr, bl;
         abLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane, tl, tr, bl);
@@ -363,16 +372,17 @@ public void fvFlushVelocityOut(uint64_t artiBlock, uint64_t linkBlocks, uint64_t
 
         deltaV = asmMulVec(invInertia, deferredZ);
 
-        const AbSpatialVector vel = asmSVecAdd(motionVelocity0, deltaV);
-
-        // trap 11
-        outVel[0] = float4(vel.bottom, 0.0f);
-        outVel[offset] = float4(vel.top, 0.0f);
+        vel = asmSVecAdd(vel, deltaV);
 
         fvStoreSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, vel);
         fvStoreSV(artiBlock, PXG_AB_mRootDeferredZ, lane, FV_ZERO);
-        // trap 10: NO mSolverSpatialDeltaVel accumulation
+        fvStoreSV(linkBlocks, PXG_AB_LINK_mSolverSpatialDeltaVel, lane,
+                  asmSVecAdd(solverSpatialDeltaVel0, deltaV));
     }
+
+    // trap 11 (5.12): written on BOTH paths now
+    outVel[0] = float4(vel.bottom, 0.0f);
+    outVel[offset] = float4(vel.top, 0.0f);
 
     fvStoreSV(linkBlocks, PXG_AB_LINK_mScratchDeltaV, lane, deltaV);
     fvAddSpatialVector(linkBlocks, PXG_AB_LINK_mConstraintForces, lane, deferredZ);
@@ -395,6 +405,9 @@ public void fvFlushVelocityOut(uint64_t artiBlock, uint64_t linkBlocks, uint64_t
 
             const AbSpatialVector preloadedConstraintForces =
                 fvLoadSV(tLink, PXG_AB_LINK_mConstraintForces, lane);
+            // 5.12: parity with the six-argument overload
+            const AbSpatialVector preloadedSolverSpatialDeltaVel =
+                fvLoadSV(tLink, PXG_AB_LINK_mSolverSpatialDeltaVel, lane);
 
             AbSpatialVector motionV = nextMotionV;
 
@@ -453,6 +466,9 @@ public void fvFlushVelocityOut(uint64_t artiBlock, uint64_t linkBlocks, uint64_t
                     abStoreF32(d, PXG_AB_DOF_mJointVelocities, lane, jVel[ind] + jDelta[ind]);
                 }
             }
+
+            fvStoreSV(tLink, PXG_AB_LINK_mSolverSpatialDeltaVel, lane,
+                      asmSVecAdd(preloadedSolverSpatialDeltaVel, deltaV));
 
             for (uint ind = 0u; ind < nbDofs; ++ind)
                 abStoreF32(dofs + uint64_t(ind) * PXG_AB_DOF_SIZE, PXG_AB_DOF_mDeferredQstZ, lane,

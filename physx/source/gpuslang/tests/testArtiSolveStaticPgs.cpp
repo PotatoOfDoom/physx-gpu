@@ -323,6 +323,9 @@ static void spgSeed(SpgArena& B, uint32_t salt)
 
 // ---- mirror ----
 
+// 5.12: the rigidContact bias of the PGS static contacts (5.6.1 hard-coded 0.8)
+static const float SPG_RIGID_CONTACT_BIAS = 0.65f;
+
 static void spgMirror(SpgArena& W, bool doFriction, bool accumErr,
                       uint32_t& aSide, uint32_t& bSide, uint32_t& bothZero)
 {
@@ -347,7 +350,7 @@ static void spgMirror(SpgArena& W, bool doFriction, bool accumErr,
         refSolveStaticLanePgs(L, lane, W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(),
                               W.fp.data(), W.jh.data(), W.jr.data(), W.jm.data(), W.rs.data(),
                               doFriction, accumErr, vel, impulse, deltaV, err,
-                              constraintCounts, &scov);
+                              constraintCounts, &scov, SPG_RIGID_CONTACT_BIAS);
         aSide += scov.aSide;
         bSide += scov.bSide;
 
@@ -367,7 +370,8 @@ static void spgMirror(SpgArena& W, bool doFriction, bool accumErr,
 struct SpgParamsHost
 {
     uint64_t link, batches, ch, fh, cp, fp, jh, jr, jm, rs, io;
-    uint32_t doFriction, accumErr, nbLanes, pad0;
+    uint32_t doFriction, accumErr, nbLanes;
+    float rigidContactBiasCoefficient;   // @100 (5.12: was pad0)
 };
 static_assert(sizeof(SpgParamsHost) == 104, "params blob");
 
@@ -416,7 +420,8 @@ static size_t spgRun(PxgCudaShim& shim, bool doFriction, bool accumErr, uint32_t
     SpgParamsHost prm = { uint64_t(dLk), uint64_t(dBt), uint64_t(dCh), uint64_t(dFh),
                           uint64_t(dCp), uint64_t(dFp), uint64_t(dJh), uint64_t(dJr),
                           uint64_t(dJm), uint64_t(dRs), uint64_t(dIo),
-                          doFriction ? 1u : 0u, accumErr ? 1u : 0u, SPG_LANES, 0u };
+                          doFriction ? 1u : 0u, accumErr ? 1u : 0u, SPG_LANES,
+                          SPG_RIGID_CONTACT_BIAS };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch static solve pgs");
     shim.streamSynchronize();

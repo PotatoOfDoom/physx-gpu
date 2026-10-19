@@ -434,8 +434,11 @@ void ssSolveSelfTest(uint3 groupThreadId : SV_GroupThreadID)
 //    accumulated time; doFriction is IGNORED on the TGS path (the CUDA's
 //    solveConstraints TGS overload never reads it) — the ABI row still
 //    carries the byte.
-//  * accumulateError = scDesc->mContactErrorAccumulator.mCounter >= 0 — the
-//    PxI32 at CONTACT_ERROR_ACC + 4, compared SIGNED.
+//  * (5.6.1) accumulateError = scDesc->mContactErrorAccumulator.mCounter >= 0;
+//    5.12 removed residual reporting, so it is false.
+//  * (5.12) a trailing rigidContactBiasCoefficient argument @36: PGS feeds it
+//    to solveExtContactsBlock as the friction velMultiplier numerator (5.6.1
+//    hard-coded 0.8); the TGS extern ignores it.
 // ===========================================================================
 
 struct SskParams
@@ -446,7 +449,8 @@ struct SskParams
     float elapsedTime;    // @20
     uint64_t sharedDesc;  // @24 PxgSolverSharedDesc<IterativeSolveDataTGS>*
     uint doFrictionWord;  // @32 bool byte 0 — unused on the TGS path
-    uint pad0;            // @36
+    float rigidContactBiasCoefficient; // @36 (5.12) — PGS static-contact friction
+                                       // velMultiplier numerator; dead on TGS
 }
 
 [[vk::push_constant]]
@@ -519,7 +523,8 @@ void artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(uint3 groupThreadId 
     const uint64_t tmpB = artiPtrField(d, PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
     const uint64_t tmpCommon = artiPtrField(d, PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
 
-    const bool accumulateError = int(artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + 4u)) >= 0;
+    // 5.12 removed residual reporting (and mContactErrorAccumulator with it)
+    const bool accumulateError = false;
 
     ssSolveSelfConstraints(artiBlock, linkBase, dofBase,
                            linkBitFields, tmpA, tmpB, tmpCommon,
@@ -571,6 +576,7 @@ public void ssSolveSelfConstraintsPgs(
     uint64_t jointHeaders, uint64_t jointRowsCon, uint64_t jointRowsMod,
     uint64_t responses,
     bool doFriction, bool accumulateError,
+    float rigidContactBiasCoefficient,
     uint lane)
 {
     // trap 7: per-block scalars, lane 0
@@ -688,7 +694,8 @@ public void ssSolveSelfConstraintsPgs(
                                              Ptr<SvpPgsContactFriction>(frictionPoints),
                                              Ptr<PxgArticulationBlockResponse>(responses),
                                              impulse0, impulse1,
-                                             error, accumulateError, 1.0f, 1.0f);
+                                             error, accumulateError,
+                                             rigidContactBiasCoefficient, 1.0f, 1.0f);
                 }
                 else
                 {
@@ -780,7 +787,9 @@ struct SspParams
     uint wordSize;             // @128
     uint accumulateError;      // @132
     uint doFriction;           // @136
-    uint nbLanes;              // @140 -> 144
+    uint nbLanes;              // @140
+    float rigidContactBiasCoefficient; // @144 (5.12)
+    uint pad0;                 // @148 -> 152
 }
 
 [[vk::push_constant]]
@@ -803,6 +812,7 @@ void ssSolveSelfPgsTest(uint3 groupThreadId : SV_GroupThreadID)
                               gSsp.jointHeaders, gSsp.jointRowsCon, gSsp.jointRowsMod,
                               gSsp.responses,
                               gSsp.doFriction != 0u, gSsp.accumulateError != 0u,
+                              gSsp.rigidContactBiasCoefficient,
                               lane);
 }
 
@@ -870,7 +880,7 @@ void artiPropagateRigidImpulsesAndSolveSelfConstraints1T(uint3 groupThreadId : S
     const uint64_t tmpB = artiPtrField(d, PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
     const uint64_t tmpCommon = artiPtrField(d, PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
 
-    const bool accumulateError = int(artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + 4u)) >= 0;
+    const bool accumulateError = false;   // 5.12 removed residual reporting
     const bool doFriction = (gSsk.doFrictionWord & 0xFFu) != 0u;   // trap 14: LIVE in PGS
 
     ssSolveSelfConstraintsPgs(artiBlock, linkBase, dofBase,
@@ -886,5 +896,6 @@ void artiPropagateRigidImpulsesAndSolveSelfConstraints1T(uint3 groupThreadId : S
                               sharedDesc[0].iter_blockJointConstraintRowsMod,
                               sharedDesc[0].iter_artiResponse,
                               doFriction, accumulateError,
+                              gSsk.rigidContactBiasCoefficient,
                               lane);
 }

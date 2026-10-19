@@ -187,7 +187,7 @@ static void sicSeed(SicArena& B)
 
         const uint32_t numLinks = sicNumLinks(a);
         AB.mNumLinks[lane] = numLinks;
-        AB.mFlags[lane] = (a & 1u) ? PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES : 0u;
+        AB.mFlags[lane] = 0u;   // (5.12: eDRIVE_LIMITS_ARE_FORCES is gone)
         AB.mNumSpatialTendons[lane] = numLinks >= 5 ? 2 : 1;
         AB.mNumFixedTendons[lane] = 1;
         AB.mNumMimicJoints[lane] = numLinks >= 5 ? 2 : 1;
@@ -238,10 +238,6 @@ static void sicSeed(SicArena& B)
             lnk.mRw_x[lane] = 0.5f * fv(a, l, 0, 38);
             lnk.mRw_y[lane] = 0.5f * fv(a, l, 1, 38);
             lnk.mRw_z[lane] = 0.5f * fv(a, l, 2, 38);
-            storeSpatialVector(lnk.mBiasForce,
-                UnAlignedSpatialVector(
-                    PxVec3(fv(a, l, 0, 9), fv(a, l, 1, 9), fv(a, l, 2, 9)),
-                    PxVec3(fv(a, l, 3, 9), fv(a, l, 4, 9), fv(a, l, 5, 9))), lane);
 
             const uint32_t nbDofs = sicDofs(a, l);
             lnk.mJointOffset[lane] = dofCursor;
@@ -310,7 +306,6 @@ static void sicSeed(SicArena& B)
                 dd.mInvStIsT_z[lane] = fv(a, l, d, 48);
 
                 PxgArticulationInternalConstraintData& ic = dd.mConstraintData;
-                ic.mFrictionCoefficient[lane] = 0.5f + 0.5f * fv(a, l, d, 23);
                 ic.mDriveType[lane] = driveType[d];
                 ic.mDriveTargetPos[lane] =
                     (jointType == PxArticulationJointType::eSPHERICAL && (a % 8u) == 7u)
@@ -319,8 +314,8 @@ static void sicSeed(SicArena& B)
                 ic.mDriveStiffness[lane] =
                     (zeroDrive || dampingOnly) ? 0.f : 40.f + 10.f * fv(a, l, d, 26);
                 ic.mDamping[lane] = 3.f + 1.f * fv(a, l, d, 27);
-                ic.mMaxForce[lane] = zeroDrive ? 0.f : 100.f + 20.f * fv(a, l, d, 28);
-                ic.mMaxEffort[lane] = 0.f;
+                // 5.12: the drive runs only with an effort budget (maxForce is gone)
+                ic.mMaxEffort[lane] = zeroDrive ? 0.f : 100.f + 20.f * fv(a, l, d, 28);
                 ic.mLimits_LowLimitX_highLimitY[lane] =
                     make_float2(-1.2f + 0.1f * fv(a, l, d, 29), 1.3f + 0.1f * fv(a, l, d, 30));
             }

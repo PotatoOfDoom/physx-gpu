@@ -25,15 +25,15 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of npCvxPlaneOut.slang: the convexPlaneNphase_kernel_core
-// output tail (cudaGJKEPA.cu L3072-3181).  The CPU reference below is an
+// output tail (cudaGJKEPA.cu, 5.12 L3048-3165).  The CPU reference below is an
 // exact transcription of the CUDA source, including its quirks:
-//   - contact/force reservations add 16*nb / 4*nb but the overflow tests add
-//     only ONE element ((offset+16) > limit / (offset+4) > limit), and the two
-//     tests are INDEPENDENT ifs (both flags can set in the same pass);
-//   - on a valid contact offset the wrapped force offset (0xFFFFFFFF after a
-//     force-only overflow) is written to the output verbatim; on contact
-//     overflow BOTH output pointers become NULL (0xFFFFFFFE sentinel here,
-//     distinct from the legitimate wrapped 0xFFFFFFFF);
+//   - 5.12: the overflow tests cover the WHOLE reservation ((offset + 16*nb)
+//     > limit / (offset + 4*nb) > limit, size_t sums), the two tests are
+//     INDEPENDENT ifs (both flags can set in the same pass), and a force
+//     overflow also invalidates the contact offset;
+//   - on an invalid contact offset BOTH output pointers become NULL
+//     (0xFFFFFFFE sentinel here) and nbContacts is zeroed, while the patch is
+//     still reserved (patchRequested) and then returned as 0xFFFFFFFF;
 //   - the patch rollback lives INSIDE the lane-0 reservation gate (no ballot):
 //     HAS_NO_TOUCH rewrite with numPatches = 0, nbContacts = 0, touchChange =
 //     previouslyHadTouch, patchChange = prevPatches != 0;
@@ -80,16 +80,18 @@ static void quatRotate(const F4& q, float vx, float vy, float vz, float* o)
 static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
 {
     const uint32_t mask = s.misc.x;
-    const uint32_t nbContacts = s.misc.y;
+    uint32_t nbContacts = s.misc.y;
     const uint32_t allflags = s.misc.z;
 
     uint32_t contactsBytes = s.counters.x, forceBytes = s.counters.y, patchesBytes = s.counters.z;
     uint32_t ovf = 0;
     for (int j = 0; j < 4; ++j) o.stream[j] = F4{ 0, 0, 0, 0 };
 
-    // L3072-3091: reservation, single-element overflow tests, independent ifs
+    // 5.12 L3048-3070: reservation, WHOLE-reservation overflow tests, independent
+    // ifs; a force overflow also drops the contact offset
     uint32_t contactByteOffset = 0xFFFFFFFFu;
     uint32_t forceByteOffset = 0xFFFFFFFFu;
+    const bool patchRequested = nbContacts > 0;
     if (nbContacts)
     {
         contactByteOffset = contactsBytes;
@@ -97,8 +99,12 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
         forceByteOffset = forceBytes;
         forceBytes += 4u * nbContacts;          // sizeof(PxU32) * nb
         // CUDA: offset + sizeof(...) promotes to size_t -> 64-bit compare, no wrap
-        if ((uint64_t(contactByteOffset) + 16u) > s.cfg.x) { ovf |= 1u; contactByteOffset = 0xFFFFFFFFu; }
-        if ((uint64_t(forceByteOffset) + 4u) > s.cfg.y) { ovf |= 2u; forceByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(contactByteOffset) + 16ull * nbContacts) > s.cfg.x) { ovf |= 1u; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4ull * nbContacts) > s.cfg.y)
+        {
+            ovf |= 2u; forceByteOffset = 0xFFFFFFFFu;
+            contactByteOffset = 0xFFFFFFFFu;
+        }
     }
 
     // L3099-3117: world-space stream write / output pointers
@@ -121,6 +127,7 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
     {
         outForces = NULL_SENTINEL; // NULL
         outPoints = NULL_SENTINEL;
+        nbContacts = 0; // 5.12 L3095
     }
 
     // L3119-3148: status flags / touch / patch change / allflags rewrite
@@ -142,7 +149,7 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
     // L3151-3177: patch reservation with in-gate rollback
     uint32_t patchIndex = 0xFFFFFFFFu;
     uint32_t cpOut = NULL_SENTINEL;
-    if (nbContacts)
+    if (patchRequested) // 5.12 L3131: the patch demand survives a failed allocation
     {
         patchIndex = patchesBytes;
         patchesBytes += 64u; // sizeof(PxContactPatch)
@@ -156,8 +163,10 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
             touchChange = previouslyHadTouch ? 1u : 0u;
             patchChange = (prevPatches != 0) ? 1u : 0u;
         }
-        else
+        else if (nbContacts)
             cpOut = patchIndex;
+        else
+            patchIndex = 0xFFFFFFFFu; // 5.12 L3159-3160
     }
 
     // L3179-3180: insertIntoPatchStream args (world normal, nbContacts)
@@ -180,7 +189,7 @@ PXG_TEST(npCvxPlaneOut_outputTail)
 
     std::vector<PlaneOutIn> in(N);
     std::vector<PlaneOutOut> ref(N);
-    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cBoth = 0, cWrapForce = 0, cEmpty = 0, cExactC = 0, cExactF = 0, cExactP = 0, cSparse = 0, cHigh = 0;
+    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cBoth = 0, cWrapForce = 0, cEmpty = 0, cExactC = 0, cExactF = 0, cExactP = 0, cSparse = 0, cHigh = 0, cSingleC = 0, cSingleOvf = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -214,10 +223,12 @@ PXG_TEST(npCvxPlaneOut_outputTail)
         uint32_t limC = initC + 16 * 40, limF = initF + 4 * 40, limP = initP + 64 * 8;
         const uint32_t vC = rng() % 6, vF = rng() % 6, vP = rng() % 6;
         if (vC == 1) limC = initC + rng() % 16;            // (initC + 16) > lim -> overflow
-        else if (vC == 2) { limC = initC + 16; ++cExactC; }  // exact single-element fit: NO overflow even for nb > 1 (quirk)
+        else if (vC == 2) { limC = initC + 16 * nb; ++cExactC; } // exact fit of the whole reservation: no overflow
+        else if (vC == 4) { limC = initC + 16; ++cSingleC; }     // the 5.6.1 single-element fit: overflows for nb > 1 since 5.12
         else if (vC == 3) { initC = 0xFFFFFFF0u + rng() % 16; limC = 0xFFFFFF00u + rng() % 256; ++cHigh; } // 64-bit compare region: initC + 16 >= 2^32 > any limit (a 32-bit wrap would see a tiny offset and pass)
         if (vF == 1) limF = initF + rng() % 4;
-        else if (vF == 2) { limF = initF + 4; ++cExactF; }
+        else if (vF == 2) { limF = initF + 4 * nb; ++cExactF; }
+        else if (vF == 4) { limF = initF + 4; }
         else if (vF == 3) { initF = 0xFFFFFFFCu + rng() % 4; limF = 0xFFFFFF00u + rng() % 256; ++cHigh; }
         if (vP == 1) limP = initP + rng() % 64;            // (initP + 64) > lim -> rollback
         else if (vP == 2) { limP = initP + 64; ++cExactP; }
@@ -232,7 +243,8 @@ PXG_TEST(npCvxPlaneOut_outputTail)
         if (f & 2u) ++cOvfF;
         if (f & 4u) ++cOvfP;
         if ((f & 3u) == 3u) ++cBoth;
-        if ((f & 3u) == 2u) ++cWrapForce; // force-only: wrapped 0xFFFFFFFF written to outputs.x
+        if ((f & 3u) == 2u) ++cWrapForce; // force-only: since 5.12 the pair is dropped (NULL outputs, nbContacts 0)
+        if (nb > 1 && vC == 4 && (f & 1u)) ++cSingleOvf;
         if (nb == 0) ++cEmpty;
     }
 
@@ -273,9 +285,9 @@ PXG_TEST(npCvxPlaneOut_outputTail)
     PXG_CHECK_MSG(mmA == 0, "planeOut: %zu patch-arg mismatches", mmA);
     PXG_CHECK_MSG(cOvfC > N / 20 && cOvfF > N / 20 && cOvfP > N / 20 && cBoth > N / 100 &&
                   cWrapForce > N / 100 && cEmpty > N / 20 && cExactC > N / 15 && cExactF > N / 15 &&
-                  cExactP > N / 15 && cSparse > N / 8 && cHigh > N / 10,
-                  "planeOut: coverage thin (ovfC %zu ovfF %zu ovfP %zu both %zu wrapF %zu empty %zu exactC %zu exactF %zu exactP %zu sparse %zu high %zu)",
-                  cOvfC, cOvfF, cOvfP, cBoth, cWrapForce, cEmpty, cExactC, cExactF, cExactP, cSparse, cHigh);
+                  cExactP > N / 15 && cSparse > N / 8 && cHigh > N / 10 && cSingleC > N / 15 && cSingleOvf > N / 30,
+                  "planeOut: coverage thin (ovfC %zu ovfF %zu ovfP %zu both %zu forceOnly %zu empty %zu exactC %zu exactF %zu exactP %zu sparse %zu high %zu singleC %zu singleOvf %zu)",
+                  cOvfC, cOvfF, cOvfP, cBoth, cWrapForce, cEmpty, cExactC, cExactF, cExactP, cSparse, cHigh, cSingleC, cSingleOvf);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

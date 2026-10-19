@@ -56,9 +56,9 @@
 accumulateDeltaVRigidSecondLaunchMultiStage1           6@48+8:solverCoreDesc;8@64+8:sharedDesc;12@88+1:isTGSWord      # dead-upstream
 accumulateDeltaVRigidSecondLaunchMultiStage2           10@80+1:useLocalRelaxWord;11@84+4:globalRelaxationCoefficient  # dead-upstream
 artiPropagateRigidImpulsesAndSolveSelfConstraints1T    2@16+1:velIterWord;3@20+4:elapsedTime                          # dead-upstream+deferred
-artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T 5@32+1:doFrictionWord                                          # dead-upstream
-artiSolveInternalConstraints1T                         6@32+8:staticContactUniqueIds;7@40+8:staticJointUniqueIds      # dead-upstream
-artiSolveInternalConstraintsTGS1T                      6@32+8:staticContactUniqueIds;7@40+8:staticJointUniqueIds      # dead-upstream
+artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T 5@32+1:doFrictionWord;6@36+4:rigidContactBiasCoefficient     # dead-upstream (5.12: the TGS extern leaves rigidContactBiasCoefficient unnamed, internalConstraints2.cu:3849)
+artiSolveInternalConstraints1T                         7@32+8:staticContactUniqueIds;8@40+8:staticJointUniqueIds      # dead-upstream (5.12 inserted rigidContactBiasCoefficient @28: indices +1)
+artiSolveInternalConstraintsTGS1T                      6@28+4:rigidContactBiasCoefficient;7@32+8:staticContactUniqueIds;8@40+8:staticJointUniqueIds # dead-upstream (5.12: TGS passes 0.0f for the unnamed rigidContactBiasCoefficient, internalConstraints2.cu:2634/2644)
 boxBoxNphase_Kernel                                    18@132+4:toleranceLength                                       # dead-upstream
 clearDeltaVRigidSecondLaunchMulti                      3@24+8:solverCoreDesc                                          # dead-upstream
 clearDirtyAggregates                                   1@8+4:numAggregates                                            # dead-upstream
@@ -95,6 +95,7 @@ convexHeightFieldMidphase                              9@64+8:cmOutputs         
 convexHeightfieldPostProcess                           2@16+8:cvxTriIntermPtr                                         # dead-upstream
 convexTrimeshCorrelate                                 5@40+8:cmOutputs;10@72+8:pTempContactIndex                     # dead-upstream
 convexTrimeshPostProcess                               2@16+8:cvxTriIntermPtr                                         # dead-upstream
+convexTrimeshFinishContacts                            11@88+1:insertAveragePointWord                                 # dead-upstream (5.12: PX_UNUSED(insertAveragePoint), convexMeshOutput.cu:171)
 markActiveSlabPGS                                      4@24+8:artiDesc                                                # dead-upstream
 markActiveSlabTGS                                      6@32+8:artiDesc                                                # dead-upstream
 markAddedAndDeletedAggregatedBounds                    1@8+8:aggDesc                                                  # dead-upstream

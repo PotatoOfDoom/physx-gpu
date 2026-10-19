@@ -99,25 +99,31 @@ static const uint8_t kArtiSetupInternal[] = { 8, 4, 4, 4, 1 };
 // isTGS in byte 1 -- the P8.83 two-bool arrangement).  (P8.98c)
 static const uint8_t kArtiSolveTM[] = { 8, 4, 4, 4, 1, 1 };
 
-// internalConstraints2.cu:4107 artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(
+// internalConstraints2.cu:3847 artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(
 //     PxgArticulationCoreDesc*, const PxgSolverCoreDesc*, const bool velocityIteration,
 //     const PxReal elapsedTime, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
-//     bool doFriction)
-static const uint8_t kArtiSolveSelf[] = { 8, 8, 1, 4, 8, 1 };
+//     bool doFriction, const PxReal rigidContactBiasCoefficient)
+// 5.12 appended rigidContactBiasCoefficient: bool @32, float @36 -> 40-byte
+// blob (5.6.1: {8,8,1,4,8,1}, 33 -> 40).  The PGS twin reads it as the
+// static-contact friction velMultiplier numerator; the TGS twin ignores it.
+static const uint8_t kArtiSolveSelf[] = { 8, 8, 1, 4, 8, 1, 4 };
 
-// internalConstraints2.cu:2841 artiSolveInternalConstraintsTGS1T(
+// internalConstraints2.cu:2633 artiSolveInternalConstraintsTGS1T(
 //     PxgArticulationCoreDesc*, PxReal dt, PxReal invDt, bool velocityIteration,
-//     PxReal elapsedTime, PxReal biasCoefficient, const PxU32* staticContactUniqueIds,
+//     PxReal elapsedTime, PxReal articulationBiasCoefficient,
+//     PxReal rigidContactBiasCoefficient, const PxU32* staticContactUniqueIds,
 //     const PxU32* staticJointUniqueIds, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
-//     bool doFriction, bool residualReportingEnabled, bool isExternalForceEveryStep,
+//     bool doFriction, bool isExternalForceEveryStep,
 //     bool doFrictionDrivePosLimit, Dy::...::VelLimit::Enum doVelLimit,
 //     bool doStaticContactsAnd1dConstraints)
-// -> pointer @0, floats @8/@12, bool @16, floats @20/@24, three pointers
-// @32/@40/@48 (the 4-byte tail-pad after @24 realigns @32), FOUR adjacent bool
-// bytes @56..@59 (one word read in the shader), enum word @60, bool @64 =
-// 65 -> 72-byte blob.  The two UID pointers and doFriction are dead on the TGS
+// -> pointer @0, floats @8/@12, bool @16, floats @20/@24/@28, three pointers
+// @32/@40/@48, THREE adjacent bool bytes @56..@58 (one word read in the
+// shader), enum word @60, bool @64 = 65 -> 72-byte blob.  5.12 split the bias
+// coefficient in two (the new float fills 5.6.1's tail pad @28) and dropped
+// residualReportingEnabled (5.6.1 bytes @56..@59 were doFriction, residual,
+// extEvery, doFDPL).  The two UID pointers and doFriction are dead on the TGS
 // path but stay in the row.  (P8.100d)
-static const uint8_t kArtiSolveInternalTGS[] = { 8, 4, 4, 1, 4, 4, 8, 8, 8, 1, 1, 1, 1, 4, 1 };
+static const uint8_t kArtiSolveInternalTGS[] = { 8, 4, 4, 1, 4, 4, 4, 8, 8, 8, 1, 1, 1, 4, 1 };
 
 // forwardDynamic2.cu:3643 artiPropagateImpulses2TGS(PxgArticulationCoreDesc*,
 //     const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
@@ -147,9 +153,11 @@ static const uint8_t kTwoPtr[] = { 8, 8 };
 static const uint8_t kTwoPtrVec3[] = { 8, 8, 12 };
 
 static const uint8_t kTwoPtrBool[] = { 8, 8, 1 };
-// computeArtiCOM(PxVec3* data, PxArticulationGPUIndex* gpuIndices, bool rootFrame,
-//   const PxgArticulation* articulations) -- P8.112
-static const uint8_t kTwoPtrBoolPtr[] = { 8, 8, 1, 8 };
+// computeArtiCOM(PxU32 nbIndices, PxVec3* data, PxArticulationGPUIndex* gpuIndices,
+//   bool rootFrame, const PxgArticulation* articulations) -- P8.112; 5.12 added
+//   the leading nbIndices (the job guard): u32 @0, ptrs @8/@16, bool @24,
+//   ptr @32 -> 40 (5.6.1: {8,8,1,8}).
+static const uint8_t kArtiCom[] = { 4, 8, 8, 1, 8 };
 // computeArtiDenseJacobians(float*, PxArticulationGPUIndex*, PxU32 nbIndices,
 //   PxU32 maxLinks, PxU32 maxDofs, const PxgArticulation*) -- P8.113a
 static const uint8_t kDenseJac[] = { 8, 8, 4, 4, 4, 8 };
@@ -157,12 +165,13 @@ static const uint8_t kDenseJac[] = { 8, 8, 4, 4, 4, 8 };
 //   PxU32 nbIndices, PxU32 maxDofs, const PxgArticulation*) -- P8.113b
 static const uint8_t kCentroidal[] = { 8, 8, 4, 4, 8 };
 // computeArtiGravityForces(PxU32 nbIndices, float* data, PxArticulationGPUIndex*,
-//   PxU32 maxDofs, bool rootMotion, const PxgArticulation*, PxVec3 gravity) -- P8.114
-static const uint8_t kGravityForces[] = { 4, 8, 8, 4, 1, 8, 12 };
+//   PxU32 maxDofs, const PxgArticulation*, PxVec3 gravity) -- P8.114; 5.12 dropped
+//   the rootMotion bool (it sat in the pad before the pointer, so nothing moves)
+static const uint8_t kGravityForces[] = { 4, 8, 8, 4, 8, 12 };
 // computeArtiCentrifugalForces(PxU32 nbIndices, float* data,
-//   PxArticulationGPUIndex*, PxU32 maxDofs, bool rootMotion,
-//   const PxgArticulation*) -- P8.115
-static const uint8_t kCentrifugal[] = { 4, 8, 8, 4, 1, 8 };
+//   PxArticulationGPUIndex*, PxU32 maxDofs, const PxgArticulation*) -- P8.115;
+//   5.12 dropped the rootMotion bool (same pad, nothing moves)
+static const uint8_t kCentrifugal[] = { 4, 8, 8, 4, 8 };
 // P8.117: artiUpdateKinematic -- six pointers, u32, pointer, pointer, u32, bool
 static const uint8_t kUpdateKin[] = { 8, 8, 8, 8, 8, 8, 4, 8, 8, 4, 1 };
 // P8.118: the direct-API get/set family -- three pointers plus one to three u32
@@ -1987,12 +1996,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "artiPropagateVelocity", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
     { "artiSaveVelocity1TPGS", kOnePtr, 1u },
     { "artiComputeDependencies", kPtrU32, uint32_t(sizeof(kPtrU32)) },
-    { "computeArtiCOM", kTwoPtrBoolPtr, uint32_t(sizeof(kTwoPtrBoolPtr)) },
+    { "computeArtiCOM", kArtiCom, uint32_t(sizeof(kArtiCom)) },
     { "computeArtiDenseJacobians", kDenseJac, uint32_t(sizeof(kDenseJac)) },
     { "computeArtiCentroidalMomentumMatrices", kCentroidal, uint32_t(sizeof(kCentroidal)) },
     { "computeArtiGravityForces", kGravityForces, uint32_t(sizeof(kGravityForces)) },
     { "computeArtiCentrifugalForces", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },
-    { "computeArtiMassMatrices", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },  // P8.116: same six params
+    { "computeArtiMassMatrices", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },  // P8.116: same five params (5.12)
     { "artiUpdateKinematic", kUpdateKin, uint32_t(sizeof(kUpdateKin)) },
     { "getArtiDofStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
     { "getArtiTransformStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
@@ -2003,6 +2012,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "setArtiRootVelocityState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "setArtiLinkForceState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "setArtiLinkTorqueState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    // 5.12, OVD snapshot readback (articulationDirectGpuApi.cu:520/:549):
+    // (scDesc, PxVec3* data, PxArticulationGPUIndex*, PxU32 nbElements, PxU32 maxLinks)
+    { "getArtiLinkForceState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "getArtiLinkTorqueState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "getArtiTendonState", kGetSet6, uint32_t(sizeof(kGetSet6)) },
     { "setArtiTendonState", kGetSet6, uint32_t(sizeof(kGetSet6)) },
     { "getArtiSpatialTendonAttachmentState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
