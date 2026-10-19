@@ -96,18 +96,25 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # Today (softbodyrigidattach + softbodyartiattach + softbodycone added): 74 named scenes
 # below, plus thirty-one explicit rows after the loop (the settling bag, four softbody floors,
 # the softbodyhex box arm, nineteen PGS rows, three slabgrid modes, three particle2 arms) = 105.
+# The 5.12 migration retired five scenes whose API 5.12 removed (CHANGELOG 5.12): particlecloth
+# and particleinflatable (particle cloth), particlerigid (particle rigids + volumes),
+# particleattach (particle-rigid attachments) and softbodycone (PxConeLimitedConstraint), and
+# softbodycone's PGS row with it: 69 named scenes + 30 explicit run_one rows = 99 (from
+# 74 + 31 = 105 above; the full 5.12 run scores 99).  particleapply and
+# softbodydata stay, ported from the removed applyParticleBufferData / copy+applySoftBodyData
+# to the buffer flags / buffer writes + markDirty that 5.12 leaves.
 # sdfquery (evaluatePointDistancesSDFBatch, PxDirectGPUAPI::evaluateSDFDistances) has
 # NO PGS row: it is a query between steps, and the solver never touches its output.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
-        particlecloth particleinflatable particlediffuse particleconvex
+        particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach softbodyhang
-        particlepush articulationjoint clothnet particlesoftbody particleattach directapi particlerigid
+        particlepush articulationjoint clothnet particlesoftbody directapi
         sdfmesh forcethreshold aggregate directapiwrite extforce substepgravity slabgrid particleapply softbodydata
         directapimerge sdfquery softbodyhex particle2 articulationloop articulationstack
         clothonlink softbodyarticontact clothhangbox clothlinkattach clothtripin
-        softbodyrigidattach softbodyartiattach softbodycone"
+        softbodyrigidattach softbodyartiattach"
 
 pass=0; fail=0; missing=0
 
@@ -204,14 +211,17 @@ run_one "directapiwrite (PGS)" PXG_SCENE=directapiwrite PXG_SOLVER=pgs
 run_one "extforce (PGS)" PXG_SCENE=extforce PXG_SOLVER=pgs
 # P9.95: substepgravity (applyTGSSubstepGravity) has NO PGS row, deliberately: the
 # kernel is launched only by PxgTGSCudaSolverCore, and its scene flag
-# eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is rejected with PGS by
-# PxSceneDesc::isValid (PxSceneDesc.h:1129), so the scene refuses PXG_SOLVER=pgs.
-# P9.95: particleapply (applyParticleBufferDataDEPRECATED, the direct-API particle
-# ingest) is the same kernel under both solvers, but the first step that integrates what
-# it ingested runs through the TGS or the PGS particle path, so it is scored under both.
+# eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS has no effect under PGS (5.6.1's
+# PxSceneDesc::isValid rejected the pair; 5.12 accepts and ignores it), so the scene
+# refuses PXG_SOLVER=pgs.  5.12 makes the flag the PxSceneDesc default, so every TGS row
+# now runs this kernel; extforce clears it to keep updateBodyExternalVelocitiesLaunch.
+# P9.95: particleapply (the per-buffer particle ingest in a direct-API scene; before 5.12
+# applyParticleBufferDataDEPRECATED) is the same ingest under both solvers, but the first
+# step that integrates what it ingested runs through the TGS or the PGS particle path, so
+# it is scored under both.
 run_one "particleapply (PGS)" PXG_SCENE=particleapply PXG_SOLVER=pgs
-# P9.95: softbodydata (sb_copyOrApplySoftBodyDataDEPRECATED, PxScene::copy/applySoftBodyData)
-# is one kernel under both solvers, but the steps that carry the applied velocity and
+# P9.95: softbodydata (sim buffers written + markDirty; before 5.12 PxScene::copy/
+# applySoftBodyData) is one write path under both solvers, but the steps that carry the applied velocity and
 # position (and the skinning that moves the collision mesh after them) run through the TGS
 # or the PGS softbody path, so it is scored under both.
 run_one "softbodydata (PGS)" PXG_SCENE=softbodydata PXG_SOLVER=pgs
@@ -269,12 +279,12 @@ run_one "softbodyarticontact (PGS)" PXG_SCENE=softbodyarticontact PXG_SOLVER=pgs
 run_one "clothhangbox (PGS)" PXG_SCENE=clothhangbox PXG_SOLVER=pgs
 run_one "clothlinkattach (PGS)" PXG_SCENE=clothlinkattach PXG_SOLVER=pgs
 run_one "clothtripin (PGS)" PXG_SCENE=clothtripin PXG_SOLVER=pgs
-# softbodyrigidattach / softbodyartiattach / softbodycone (tranche C of task 35): the softbody
+# softbodyrigidattach / softbodyartiattach (tranche C of task 35): the softbody
 # rigid-attachment solves have one kernel per solver (sb_solveRigidSoftAttachmentLaunch{,TGS},
-# readVelocitiesPGS / readVelocitiesTGS, the PGS / TGS cone arms) -- hence PGS rows.
+# readVelocitiesPGS / readVelocitiesTGS) -- hence PGS rows.  (softbodycone, the cone arms,
+# was retired with 5.12's removal of PxConeLimitedConstraint.)
 run_one "softbodyrigidattach (PGS)" PXG_SCENE=softbodyrigidattach PXG_SOLVER=pgs
 run_one "softbodyartiattach (PGS)" PXG_SCENE=softbodyartiattach PXG_SOLVER=pgs
-run_one "softbodycone (PGS)" PXG_SCENE=softbodycone PXG_SOLVER=pgs
 
 # P9.97a: slabgrid observes the TGS averaging family (initializeSolverVelocitiesTGS,
 # computeAverageSolverBodyVelocityTGS, propagateAverageSolverBodyVelocityTGS) at the
@@ -322,8 +332,6 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo "=== diagnostics (NOT scored: these controls exist to fail the checks they"
     echo "    are the reference for -- read their numbers, not their verdicts) ==="
     for spec in "particlefluid PXG_PARTICLE_FLUID_CONTROL" \
-                "particlecloth PXG_PARTICLE_CLOTH_CONTROL" \
-                "particleinflatable PXG_PARTICLE_INFL_CONTROL" \
                 "particlefluidboundary PXG_PARTICLE_BOUNDARY_CONTROL" \
                 "particlemeshfloor PXG_PARTICLE_BOUNDARY_CONTROL" \
                 "particlediffuse PXG_DIFFUSE_CONTROL"; do
@@ -332,16 +340,6 @@ if [ "${1:-}" = "--diagnostics" ]; then
         env PXG_SCENE=$sc $var=1 PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
             | grep -E '^  particle |^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
     done
-
-    # P9.95: particleapply's control ingests the same edits through raiseFlags (the mapped
-    # ps_updateUnsortedArrayLaunch) instead of applyParticleBufferData.  The live run dumps
-    # its final user arrays and the control counts the words that differ (measured 0).
-    pa_dump=$(mktemp)
-    echo "--- particleapply + PXG_PARTICLE_APPLY_CONTROL=1"
-    env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 ./gpu-sdk-step >/dev/null 2>&1
-    env PXG_SCENE=particleapply PXG_PARTICLE_APPLY_CONTROL=1 PXG_PARTICLE_APPLY_DUMP="$pa_dump" PXG_GPU_STEP=1 \
-        ./gpu-sdk-step 2>&1 | grep -E '^  \[ control \]|^FAIL:|^\[ *(OK|FAIL|control) *\] gpu-sdk-step' | sed 's/^/    /'
-    rm -f "$pa_dump"
 
     # P9.99b: upstream note U1 -- ps_stepParticlesLaunch steps pool slot blockIdx.y, not
     # act[blockIdx.y] (particlesystem.cu:130).  With system A (slot 0) removed before step
@@ -354,16 +352,8 @@ if [ "${1:-}" = "--diagnostics" ]; then
             | grep -E '^  B remove/both|^\[ *(OK|FAIL|diagnostic) *\] gpu-sdk-step' | sed 's/^/    /'
     done
 
-    # P9.95: softbodydata's control makes the same reads and writes with plain DtoH/HtoD on
-    # the aliased public buffers instead of copySoftBodyData / applySoftBodyData.  Its final
-    # sim-position hash must equal the live run's (measured equal under TGS and PGS).
-    for solver in tgs pgs; do
-        echo "--- softbodydata ($solver) live vs PXG_SBDATA_CONTROL=1: final sim-position hashes"
-        for ctl in "" PXG_SBDATA_CONTROL=1; do
-            env $ctl PXG_SCENE=softbodydata PXG_SOLVER=$solver PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-                | grep -E 'final sim-position hash' | sed 's/^/    /'
-        done
-    done
+    # (P9.95's particleapply and softbodydata controls are gone: under 5.12 the scenes
+    # themselves take the path the controls took, see their headers.)
 
     # P9.95: directapimerge's control builds the same lanes without the direct-GPU API (the
     # merge kernel never runs there) and reads the ordinary API; its lane line is the

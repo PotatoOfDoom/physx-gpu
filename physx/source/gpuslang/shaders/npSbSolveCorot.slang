@@ -38,7 +38,8 @@
 //   volumeSqrt = sqrt(volume)
 //   G = (F + F^T)*0.5;  G.diag -= 1;  G *= volumeSqrt      (Cauchy strain)
 //   alpha = invDtSq * (1/youngs)
-//   scaledDamping = elasticityDamping * (float(dampingScaleU16) * (1/65535))
+//   damping = elasticityDamping (PhysX 5.12: the 5.6.1 scaledDamping = damping *
+//   toUniformReal(dampingScale) is gone with PxsDeformableVolumeMaterialData::dampingScale)
 //   uv_i = (v_i - v0).xyz
 //   Vg = RTranspose * ((uv1|uv2|uv3) * Qinv)               (velocity gradient)
 //   E = (Vg + Vg^T)*0.5;  E *= volumeSqrt                  (strain rate)
@@ -47,10 +48,10 @@
 //   scale = 1/(common + alpha)
 //   PGS (!isTGS): lambda_k = computeLambda<a,b,si> strain overload
 //                 -(G(a,b) + invDtSq*multiplyStrainByCompliance(invE,nu,si,totalLambda)
-//                   + scaledDamping*E(a,b)) * scale, (a,b,si) in
+//                   + damping*E(a,b)) * scale, (a,b,si) in
 //                 {(0,0,0),(1,1,1),(2,2,2),(1,2,3),(0,2,4),(0,1,5)};
 //                 totalLambda += lambda (written back)
-//   TGS:          lambda_k = -(G(a,b) + scaledDamping*E(a,b))*scale
+//   TGS:          lambda_k = -(G(a,b) + damping*E(a,b))*scale
 //   Voigt gradient assembly (outer(a,b) = (a*b.x, a*b.y, a*b.z)):
 //     delta  = outer((volumeSqrt,0,0), Qc0) * lambda.top.x
 //     delta += outer((0,volumeSqrt,0), Qc1) * lambda.top.y
@@ -117,7 +118,7 @@ struct CrIn
     float4 qc0, qc1, qc2;    // Qinv columns
     float4 rt0, rt1, rt2;    // RTranspose columns
     float4 v0, v1, v2, v3;   // velocities .xyz, inverse masses .w
-    float4 mat;              // youngs, poissons, elasticityDamping, asfloat(dampingScale u16 value)
+    float4 mat;              // youngs, poissons, elasticityDamping, unused (5.6.1 dampingScale)
     float4 prm;              // invDtSq, invDt, asfloat(isTGS), _
     float4 tlTop;            // totalLambda.top.xyz (in)
     float4 tlBot;            // totalLambda.bottom.xyz (in)
@@ -150,7 +151,6 @@ void sbSolveCorot(uint3 dtid : SV_DispatchThreadID)
     const float3 Q0 = s.qc0.xyz, Q1 = s.qc1.xyz, Q2 = s.qc2.xyz;
     const float3 R0 = s.rt0.xyz, R1 = s.rt1.xyz, R2 = s.rt2.xyz;
     const float youngs = s.mat.x, poissons = s.mat.y, damping = s.mat.z;
-    const uint dampingScaleU16 = asuint(s.mat.w);
     const float invDtSq = s.prm.x, invDt = s.prm.y;
     const bool isTGS = asuint(s.prm.z) == 1u;
     float3 tlTop = s.tlTop.xyz;
@@ -177,7 +177,6 @@ void sbSolveCorot(uint3 dtid : SV_DispatchThreadID)
 
     const float alpha = invDtSq * (1.0f / youngs);
 
-    const float scaledDamping = damping * (float(dampingScaleU16) * (1.0f / 65535.0f));
 
     // uv_i = (v_i - v0).xyz
     const float3 uv1 = s.v1.xyz - s.v0.xyz;
@@ -213,23 +212,23 @@ void sbSolveCorot(uint3 dtid : SV_DispatchThreadID)
         const float invE = 1.0f / youngs;
         const float nu = poissons;
 
-        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + invDtSq * multiplyStrainByCompliance(invE, nu, 0u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 0u)) * scale;
-        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 1u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 1u, 1u)) * scale;
-        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 2u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 2u, 2u)) * scale;
-        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 3u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 1u, 2u)) * scale;
-        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 4u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 2u)) * scale;
-        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 5u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 1u)) * scale;
+        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + invDtSq * multiplyStrainByCompliance(invE, nu, 0u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 0u)) * scale;
+        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 1u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 1u, 1u)) * scale;
+        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 2u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 2u, 2u)) * scale;
+        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 3u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 1u, 2u)) * scale;
+        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 4u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 2u)) * scale;
+        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 5u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 1u)) * scale;
         tlTop += lamTop;
         tlBot += lamBot;
     }
     else
     {
-        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + scaledDamping * matElem(E0, E1, E2, 0u, 0u)) * scale;
-        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + scaledDamping * matElem(E0, E1, E2, 1u, 1u)) * scale;
-        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + scaledDamping * matElem(E0, E1, E2, 2u, 2u)) * scale;
-        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + scaledDamping * matElem(E0, E1, E2, 1u, 2u)) * scale;
-        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + scaledDamping * matElem(E0, E1, E2, 0u, 2u)) * scale;
-        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + scaledDamping * matElem(E0, E1, E2, 0u, 1u)) * scale;
+        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + damping * matElem(E0, E1, E2, 0u, 0u)) * scale;
+        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + damping * matElem(E0, E1, E2, 1u, 1u)) * scale;
+        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + damping * matElem(E0, E1, E2, 2u, 2u)) * scale;
+        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + damping * matElem(E0, E1, E2, 1u, 2u)) * scale;
+        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + damping * matElem(E0, E1, E2, 0u, 2u)) * scale;
+        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + damping * matElem(E0, E1, E2, 0u, 1u)) * scale;
     }
 
     // Voigt gradient assembly.  outer(a,b) = (a*b.x, a*b.y, a*b.z).

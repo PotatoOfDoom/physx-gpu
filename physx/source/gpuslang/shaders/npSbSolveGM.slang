@@ -46,9 +46,10 @@
 //     lames: lambda = Y*nu/((1+nu)*(1-2nu)), mu = Y/(2*(1+nu))
 //     det = Qinv.getDeterminant();  volume = 1/(6*det)
 //     F = (u1|u2|u3) * Qinv;  alphaTilde0 = invDtSq / (2*mu*volume)
-//     damping = elasticityDamping;  scaledDamping = damping * toUniformReal(u16)
+//     damping = elasticityDamping  (PhysX 5.12: no separate scaledDamping -- the 5.6.1
+//       damping * toUniformReal(dampingScale) is gone with the material field)
 //     lambdas = isTGS ? (0,0) : multiplier slot (float2)
-//     ARAP_constraint(acc, lambdas.x, ..., alphaTilde0, damping, scaledDamping)
+//     ARAP_constraint(acc, lambdas.x, ..., alphaTilde0, damping)
 //       (tranche 233 core: tensor = F - R, C = sqrt(sum||t||^2 + 1e-18),
 //        dCdF = tensor*(1/C), then compute_deltaLambdaXgradC ACCUMULATES into
 //        the caller-provided accumulator; degenerate |denom|<1e-15: no-damping
@@ -58,7 +59,7 @@
 //     if (poissons > 1e-18f):
 //       ratio/alphaTilde1 = 0;  if (poissons < 0.5f - 1e-18f):
 //         alphaTilde1 = invDtSq/(lambda*volume);  ratio = 2*mu/lambda
-//       damping *= ratio;  scaledDamping *= ratio
+//       damping *= ratio
 //       volume_constraint(acc, lambdas.y, ..., F, alphaTilde1, ...)
 //         (C = det(F) - 1, dCdF = (F.c1 x F.c2 | F.c2 x F.c0 | F.c0 x F.c1))
 //     if (!isTGS) store lambdas back
@@ -97,7 +98,7 @@ void computeDLXG(inout float3 a0, inout float3 a1, inout float3 a2, inout float 
                  float C, float3 dFc0, float3 dFc1, float3 dFc2,
                  float3 q0, float3 q1, float3 q2,
                  float4 v0, float4 v1, float4 v2, float4 v3,
-                 float alphaTilde, float dtInv, float damping, float scaledDamping)
+                 float alphaTilde, float dtInv, float damping)
 {
     // row vectors of DmInv and dCdF (column-major: column_k[row])
     const float3 r0 = float3(q0.x, q1.x, q2.x);
@@ -130,7 +131,7 @@ void computeDLXG(inout float3 a0, inout float3 a1, inout float3 a2, inout float 
             return;
         }
         const float dampDot = dot3(dCdx0, v0.xyz) + dot3(dCdx1, v1.xyz) + dot3(dCdx2, v2.xyz) + dot3(dCdx3, v3.xyz);
-        deltaLambda = (-C - alphaTilde * lambda - scaledDamping * dampDot) / denom;
+        deltaLambda = (-C - alphaTilde * lambda - damping * dampDot) / denom;
     }
 
     lambda = lambda + deltaLambda;
@@ -145,7 +146,7 @@ struct GmIn
     float4 v0, v1, v2, v3;   // .xyz velocities, .w inverse masses
     float4 qc0, qc1, qc2;    // Qinv columns
     float4 quat;             // tetR (x,y,z,w)
-    float4 mat;              // youngs, poissons, elasticityDamping, asfloat(dampingScale u16)
+    float4 mat;              // youngs, poissons, elasticityDamping, unused (5.6.1 dampingScale)
     float4 prm;              // invDtSq, invDt, asfloat(isTGS), asfloat(isNeoHookean)
     float4 mul;              // multiplier slot float2 in (.xy)
     float4 acc0, acc1, acc2; // deltaLambdaXgradC accumulator columns (in)
@@ -176,7 +177,6 @@ void sbSolveGM(uint3 dtid : SV_DispatchThreadID)
     const float3 u1 = s.gu1.xyz, u2 = s.gu2.xyz, u3 = s.gu3.xyz;
     const float3 Q0 = s.qc0.xyz, Q1 = s.qc1.xyz, Q2 = s.qc2.xyz;
     const float youngs = s.mat.x, poissons = s.mat.y;
-    const uint dampingScaleU16 = asuint(s.mat.w);
     const float invDtSq = s.prm.x, invDt = s.prm.y;
     const bool isTGS = asuint(s.prm.z) == 1u;
     const bool isNeoHookean = asuint(s.prm.w) == 1u;
@@ -297,7 +297,6 @@ void sbSolveGM(uint3 dtid : SV_DispatchThreadID)
         const float alphaTilde0 = invDtSq / (2.0f * mu * volume);
 
         float damping = s.mat.z;
-        float scaledDamping = damping * (float(dampingScaleU16) * (1.0f / 65535.0f));
 
         float2 lambdas = isTGS ? float2(0.0f, 0.0f) : mul;
 
@@ -310,7 +309,7 @@ void sbSolveGM(uint3 dtid : SV_DispatchThreadID)
             const float inv = 1.0f / arapC;
             const float3 dF0 = t0 * inv, dF1 = t1 * inv, dF2 = t2 * inv;
             computeDLXG(dl0, dl1, dl2, lambdas.x, arapC, dF0, dF1, dF2,
-                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde0, invDt, damping, scaledDamping);
+                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde0, invDt, damping);
         }
 
         const float3 dx0 = -(dl0 + dl1 + dl2) * s.v0.w;
@@ -338,7 +337,6 @@ void sbSolveGM(uint3 dtid : SV_DispatchThreadID)
             }
 
             damping *= ratio;
-            scaledDamping *= ratio;
 
             // volume_constraint (softBodyGM.cu L756-767)
             const float detF = dot3(F0, cross3(F1, F2));
@@ -347,7 +345,7 @@ void sbSolveGM(uint3 dtid : SV_DispatchThreadID)
             const float3 dF1 = cross3(F2, F0);
             const float3 dF2 = cross3(F0, F1);
             computeDLXG(dl0, dl1, dl2, lambdas.y, Cv, dF0, dF1, dF2,
-                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde1, invDt, damping, scaledDamping);
+                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde1, invDt, damping);
         }
 
         if (!isTGS)

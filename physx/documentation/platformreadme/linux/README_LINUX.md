@@ -53,6 +53,8 @@ Compile errors on unsupported compilers or platforms are frequently caused by ad
 * Additionally required: the Vulkan loader and headers 1.3 or newer (e.g. `libvulkan-dev`), `slangc` 2026.14.1 or newer (validated with 2026.14.1; taken from `-DPXG_SLANGC=`, else `$SLANG_DIR/bin` and `$SLANG_DIR`, then `PATH`, then `$VULKAN_SDK/bin` — when none is found or it is older, the configure step downloads the pinned release from GitHub once into `compiler/_slang/`, SHA-256 checked; `-DPXG_SLANG_DOWNLOAD=OFF` disables that), and Python 3 (the packman Python that `generate_projects.sh` uses is passed through; needed separately only when CMake is run by hand).
 * Output: `bin/linux.x86_64/<config>/libPhysXGpu_64.so` and next to it `PhysXGpuShaders/` with the compiled `.spv` files, which belong to the module (`make install` copies both). At run time the shaders are looked up in `$PXG_SHADER_DIR` when that is set, else in `PhysXGpuShaders/` next to the library, else in the working directory.
 * `PxGetPhysicsGpu()` returns NULL with this backend, so the skinning and isosurface snippets are not generated; `PX_GENERATE_GPU_STATIC_LIBRARIES` and `PX_USE_NVTX` are not available. See `source/gpuslang/README.md` and `source/gpuslang/MIGRATION_STATUS.md`.
+* `PxCudaContextManagerDesc::deviceAllocator` and `pinnedHostAllocator` are ignored, with a warning: all GPU and pinned host memory comes from Vulkan.
+* The Vulkan presets are for `generate_projects.sh`; the CMake FetchContent entry point (`physx/CMakeLists.txt`) builds the CUDA module only and stops with a message when `PX_GPU_BACKEND=VULKAN` is requested.
 
 ## Required Packages for Building and Running PhysX Snippets:
 

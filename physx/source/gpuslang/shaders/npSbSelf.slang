@@ -27,43 +27,63 @@
 // npSbSelf.slang
 //
 // Slang port of the softbody SELF-collision midphase traverser
-// (SbMeshTreeTraverser, gpunarrowphase/src/CUDA/softbodySoftbodyMidPhase.cu)
-// on the BV32 walk — one 32-thread group per query vertex:
+// (SbMeshTreeTraverser, gpunarrowphase/src/CUDA/softbodySoftbodyMidPhase.cu,
+// PhysX 5.12) on the BV32 walk -- one 32-thread group per query vertex:
 //
 // - intersectBoxFullWarp: the query point's clamped distance to the child box
 //   must be below the contact distance ((clamp(p) - p).magSq < distance^2).
 // - intersectPrimitiveFullWarp, per lane: surface-hint gate; skip tets sharing
-//   the query vertex; PxgNonRigidFilterPair lookup over
-//   PxEncodeSoftBodyIndex(softbodyId, vertIdx) vs (softbodyId, tetIndex);
-//   isValidTet; isPointOutsideOfPlane4 (true = the point is INSIDE all four
-//   face half-spaces); closestPtTetrahedron with the surface hint; then the
-//   contact decision — inside: dist = v.dot(-normal); outside: dist = |v|,
-//   the normal replaced by v when their dot exceeds 0.707, accepted when
-//   dist < distance; accepted contacts re-checked in the REST pose (point
-//   outside the rest tet and farther than the self-collision filter distance)
-//   and dropped when the tetrahedron stress exceeds the tolerance.  The
-//   surviving contact updates the per-lane running best (strict <).
+//   the query vertex; the 5.12 element filter -- two exact searches of the
+//   softbody's mVolumeVolumeFilterPairs, (vertex, tet) and (ANY, tet), through
+//   the ENGINE's findVolumeVolumeFilter (pxgSlangDefFilter); isValidTet;
+//   isPointOutsideOfPlane4 (true = the point is INSIDE all four face
+//   half-spaces); closestPtTetrahedron with the surface hint; then the contact
+//   decision -- inside: dist = v.dot(-normal); outside: dist = |v|, the normal
+//   replaced by v when their dot exceeds 0.707, accepted when dist < distance;
+//   accepted contacts re-checked in the REST pose (point outside the rest tet
+//   and farther than the self-collision filter distance) and dropped when the
+//   tetrahedron stress exceeds the tolerance.  The surviving contact updates
+//   the per-lane running best (strict <).
 // - finalizeFullWarp: warp argmin over the lane bests (lowest lane wins ties);
-//   the winner with bestDist < distance appends ONE contact
-//   (closestP, normal+pen, point, closestP, pairId0 = encoded surface tet of
-//   the vertex, pairId1 = encoded best tet) via an atomic counter.
+//   the winner with bestDist < distance appends ONE contact through the ENGINE's
+//   PxgDbDbContactWriter::writeVolumeVolumeContact (pxgSlangDeformableWriters):
+//   point = (closestP, 0), normalPen = (normal, pen), pair info
+//   (PxgEncodeDeformableVertex(sb, vertIdx), PxgEncodeDeformableTetrahedron(sb,
+//   bestTet)), no barycentric (sb_fem_contact_remap_to_simLaunch writes both).
 //
-// INTEGRATION NOTES (kernel-entry responsibilities NOT part of this shader —
+// 5.12 vs the 5.6.1 transcription this fixture used to carry: the 32-bit
+// PxEncodeSoftBodyIndex ids, the PxgNonRigidFilterPair list and the
+// vertToSurfaceTetRemap lookup (pairId0 was the vertex's surface TET) are gone.
+//
+// INTEGRATION NOTES (kernel-entry responsibilities NOT part of this shader --
 // see sb_selfCollisionMidphaseGeneratePairsLaunch in the CUDA):
 // - params.x (distance) is the 2x-fattened contact distance
 //   (contactDistance[elementInd] * 2.f in the CUDA driver).
 // - params.y (filterDistanceSq) is the SQUARE of mSelfCollisionFilterDistance
 //   (the CUDA traverser squares it in its constructor).
 // - The driver applies two per-VERTEX gates before running the traverser:
-//   mSurfaceVertsHint[vertIdx] != 0 and a vertex-level filter lookup with
-//   PxEncodeSoftBodyIndex(id, PX_MAX_NB_DEFORMABLE_VOLUME_TET); the host-side
-//   work-item builder must replicate both.
+//   mSurfaceVertsHint[vertIdx] != 0 and the (vertex, ANY tet) filter search;
+//   the host-side work-item builder must replicate both.
+
+import pxgSlangDeformableRef;       // PxgEncodeDeformableVertex / Tetrahedron, PXG_DREF_ANY_FEATURE
+import pxgSlangDefFilter;           // findVolumeVolumeFilter, the engine's
+import pxgSlangDeformableWriters;   // PxgDbDbContactWriterGpu, the engine's
 
 static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11;
-static const uint PXG_BITSHIFT_TET_ID = 20;
 static const float PX_MAX_F32 = 3.4028235e38f;
 
-struct SsParams { uint numWorkItems; uint numFilterPairs; uint maxContacts; uint pad0; }
+// The filter list and the writer's streams are device addresses (BDA), the way the
+// engine kernel reads them from the PxgSoftBody and the PxgDbDbContactWriter.
+struct SsParams
+{
+    uint numWorkItems; uint numFilterPairs; uint maxContacts; uint pad0;
+    uint64_t filterPairs;       // PxgDeformablePairInfo*, sorted (PxgComparePairInfo)
+    uint64_t filterSafeAddr;    // any mapped address, read in place of a NULL list
+    uint64_t outPoint;          // float4*
+    uint64_t outNormalPen;      // float4*
+    uint64_t outContactInfo;    // PxgDeformablePairInfo*
+    uint64_t totalContactCount; // PxU32*
+}
 
 // Gu::BV32DataPacked (1168 bytes)
 struct Bv32Node
@@ -76,23 +96,12 @@ struct Bv32Node
     uint pad0, pad1;
 }
 
-struct PairNR { uint2 index0; uint index1; uint index2; }
-
 struct SsWork
 {
     float4 point;      // query vertex position (world)
     float4 restP;      // rest-pose position
     uint4 ids;         // x = vertIdx, y = softbodyId, z/w unused
     float4 params;     // x = distance, y = filterDistanceSq, z = stressTolerance
-}
-
-struct SsContact
-{
-    float4 closestP0;  // closest point
-    float4 normal_pen; // xyz normal, w penetration
-    float4 point;      // query point
-    float4 closestP1;  // closest point (again, as the CUDA writes)
-    uint4 pairIds;     // x = pairId0, y = pairId1
 }
 
 [[vk::push_constant]]
@@ -104,11 +113,7 @@ RWStructuredBuffer<float4> gTetVerts;       // binding 2 (world)
 RWStructuredBuffer<float4> gRestVerts;      // binding 3 (rest pose)
 RWStructuredBuffer<uint> gSurfaceHint;      // binding 4 (PxU8 widened)
 RWStructuredBuffer<float> gStress;          // binding 5 (per tet)
-RWStructuredBuffer<uint> gVertToSurfaceTet; // binding 6 (per vertex)
-RWStructuredBuffer<PairNR> gFilterPairs;    // binding 7 (sorted)
-RWStructuredBuffer<SsWork> gWork;           // binding 8
-RWStructuredBuffer<SsContact> gContacts;    // binding 9
-RWStructuredBuffer<uint> gContactCount;     // binding 10 (single element)
+RWStructuredBuffer<SsWork> gWork;           // binding 6
 
 groupshared int sBv32Nodes[1024];
 groupshared uint sMask;
@@ -122,36 +127,6 @@ uint ballot32(bool pred, uint idx)
     if (pred) InterlockedOr(sMask, 1u << idx);
     GroupMemoryBarrierWithGroupSync();
     return sMask;
-}
-
-// --- filter find (deformableElementFilter.cuh 2-arg wrapper) ---------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findFilter(uint nbPairs, uint id0, uint id1)
-{
-    const uint2 q0 = uint2(id0, 0);
-    uint l = 0, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2;
-        const PairNR p = gFilterPairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (id1 < p.index1) cmp = -1;
-        else if (id1 > p.index1) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || (u64Eq(q0, p.index0) && id1 == p.index1))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1;
-    }
-    return false;
-}
-
-uint pxEncodeSoftBodyIndex(uint softBodyId, uint tetId)
-{
-    return (softBodyId << PXG_BITSHIFT_TET_ID) | tetId;
 }
 
 // --- geometry helpers (npSbTet.slang) ---------------------------------------
@@ -340,9 +315,15 @@ void ctSbSelfQuery(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                 // don't generate contacts with a neighbouring vertex
                 if (hint != 0 && !(tetIdx1.x == vertIdx || tetIdx1.y == vertIdx || tetIdx1.z == vertIdx || tetIdx1.w == vertIdx))
                 {
-                    const uint softBodyMask0 = pxEncodeSoftBodyIndex(softbodyId, vertIdx);
-                    const uint softBodyMask1 = pxEncodeSoftBodyIndex(softbodyId, primitiveIndex);
-                    if (!findFilter(gParams.numFilterPairs, softBodyMask0, softBodyMask1))
+                    // A filter pair for these two elements suppresses contact generation
+                    // between them; the second search checks whether the tetrahedron is
+                    // filtered against any vertex.
+                    const DfFilterArray filters = dfFilterArray(gParams.filterPairs, gParams.numFilterPairs,
+                                                                gParams.filterSafeAddr);
+                    const bool filtered =
+                        findVolumeVolumeFilter(filters, softbodyId, vertIdx, softbodyId, primitiveIndex) ||
+                        findVolumeVolumeFilter(filters, softbodyId, PXG_DREF_ANY_FEATURE, softbodyId, primitiveIndex);
+                    if (!filtered)
                     {
                         float3 a = gTetVerts[tetIdx1.x].xyz;
                         float3 b = gTetVerts[tetIdx1.y].xyz;
@@ -482,20 +463,21 @@ void ctSbSelfQuery(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 
     if (winnerLane == idxInWarp && bestDist < distance)
     {
+        PxgDbDbContactWriterGpu writer;
+        writer.outPoint = gParams.outPoint;
+        writer.outNormalPen = gParams.outNormalPen;
+        writer.outBarycentric0 = 0;   // writeVolumeVolumeContact writes neither barycentric
+        writer.outBarycentric1 = 0;
+        writer.outContactInfo = gParams.outContactInfo;
+        writer.totalContactCount = gParams.totalContactCount;
+        writer.maxContacts = gParams.maxContacts;
+
         uint index;
-        InterlockedAdd(gContactCount[0], 1, index);
-        if (index < gParams.maxContacts)
-        {
-            const float pen = bestDist;
-            const uint tetrahedronIdx0 = gVertToSurfaceTet[vertIdx];
-            SsContact ct;
-            ct.closestP0 = float4(bestClosestP, 0.0f);
-            ct.normal_pen = float4(bestNormal, pen);
-            ct.point = float4(point, 0.0f);
-            ct.closestP1 = float4(bestClosestP, 0.0f);
-            ct.pairIds = uint4(pxEncodeSoftBodyIndex(softbodyId, tetrahedronIdx0),
-                               pxEncodeSoftBodyIndex(softbodyId, bestPrimIndex), 0, 0);
-            gContacts[index] = ct;
-        }
+        InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], 1, index);
+        const float pen = bestDist;
+        const uint64_t vertexRef0 = PxgEncodeDeformableVertex(softbodyId, vertIdx);
+        const uint64_t tetRef1 = PxgEncodeDeformableTetrahedron(softbodyId, bestPrimIndex);
+        writer.writeVolumeVolumeContact(index, float4(bestClosestP, 0.0f), float4(bestNormal, pen),
+                                        vertexRef0, tetRef1);
     }
 }

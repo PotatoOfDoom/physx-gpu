@@ -43,9 +43,9 @@
 // The body arrived in this port as a LIFT of fcStaticTriCloth.slang's mode 0 --
 // already fixture-verified against a CPU transcription for the descriptor-set
 // engine -- and P8.17 copied it into femClothMeshContactGenBda.  That copy is what
-// moves here.  Phase 1 keeps its own, deliberately, for the reason recorded when
-// the BV32 module was made: the descriptor-set shaders are a separate rig with
-// separate fixtures, and moving them buys nothing and risks a bit-exact test.
+// moves here.  Phase 1 kept its own copy until the 5.12 port, when fcStaticTriCloth
+// became a harness around THIS module: its random battery (testFcStaticTriCloth.cpp)
+// now lands on the code the engine ships, not on a copy.
 //
 // WHAT IS IN HERE is the clipping pipeline (trimLoop, trimTriangleByTriangle,
 // getDeepestPointSimplified), the small plane/barycentric helpers it needs, and

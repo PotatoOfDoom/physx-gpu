@@ -58,7 +58,7 @@
 //      this substep's start, so it bounds the trajectory over the WHOLE step and not per
 //      substep.  Three regimes, and the middle one is easy to miss:
 //          mMaxLinearVelocity == PX_MAX_REAL  -> no limit at all (the whole block is skipped)
-//          mMaxLinearVelocity <  0            -> clamp to 80% of mRestDistance
+//          mMaxLinearVelocity <  0            -> clamp to 80% of mRestOffset (5.6.1: mRestDistance)
 //          otherwise                          -> clamp to mMaxLinearVelocity * dt
 //      The correction is applied to the position, the accumulated delta AND (scaled by 1/dt) to
 //      the velocity, so a clamped vertex does not carry the excess into the next substep.

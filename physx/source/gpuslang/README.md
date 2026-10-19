@@ -1,6 +1,6 @@
 # PhysX GPU — Slang/Vulkan port (gpuslang)
 
-This directory contains the port of the PhysX 5.6.1 GPU pipeline from CUDA to
+This directory contains the port of the PhysX 5.12.0 GPU pipeline from CUDA to
 [Slang](https://shader-slang.org/). The kernels run on an explicit **Vulkan**
 compute backend, with a **Direct3D 12** backend alongside it, instead of the
 CUDA driver API. The unmodified engine host code (the `gpu*` modules:
@@ -64,9 +64,9 @@ gpuslang/
 
 ## Coverage
 
-The kernel registry (`PxgKernelNames.h`) has **501** kernels.
-`include/PxgSlangKernelManifest.h` maps **428** of them to an entry point in 178
-SPIR-V modules. Of those, **415** have a launch-ABI row in
+The kernel registry (`PxgKernelNames.h`) has **487** kernels.
+`include/PxgSlangKernelManifest.h` maps **414** of them to an entry point in 170
+SPIR-V modules. Of those, **401** have a launch-ABI row in
 `bridge/PxgVulkanKernelAbi.cpp`, which makes them launchable by the engine
 (`tools/check_launch_abi.py`). Everything that is not both mapped and wired is
 unreachable in this build. `tools/check_unmapped_reachability.py` and the
@@ -314,7 +314,8 @@ A full run takes over an hour on llvmpipe.
 
 Requirements:
 
-- C++17 compiler and CMake ≥ 3.16;
+- C++17 compiler and CMake ≥ 3.16 (≥ 3.21 for the SDK build through
+  `generate_projects`, as PhysX 5.12 requires);
 - Vulkan SDK headers and loader;
 - a Vulkan ≥ 1.2 ICD (Mesa llvmpipe is what everything has been run on). The
   engine path needs `bufferDeviceAddress` and `shaderInt64`, and SDF textures
@@ -419,7 +420,7 @@ cmake --build compiler/linux-gcc-vulkan-release -j
     from `cmakegpu/PhysXGpuDependencies.cmake`).
 - On Linux the module links with `-Wl,--no-undefined`, so a missing symbol fails
   at link time as it would under MSVC.
-- It compiles the 178 shader files the kernel manifest maps
+- It compiles the 170 shader files the kernel manifest maps
   (`cmake/PxgEngineShaders.cmake`) into `PhysXGpuShaders/` next to the library.
   It uses the same `pxg_compile_shader` calls as the suite: `cmake/PxgShaderList.cmake`
   is the one list, and the configure step fails if the manifest names a file or
@@ -431,6 +432,12 @@ cmake --build compiler/linux-gcc-vulkan-release -j
   application's foundation to the module, as the CUDA module does. Without that, a
   separately loaded module dereferences a null foundation: on Windows always, and
   on Linux with the static SDK libraries.
+- `PxCudaContextManagerDesc::deviceAllocator` and `pinnedHostAllocator` are
+  ignored with a warning: memory from a user allocator is not a Vulkan buffer and
+  has no device address the shim can resolve.
+- The FetchContent entry point `physx/CMakeLists.txt` (new in PhysX 5.9) builds
+  the CUDA module only; it stops with a message for `PX_GPU_BACKEND=VULKAN` or a
+  `*-vulkan` `PHYSX_PRESET`.
 - The Linux loader (`PxPhysXGpuModuleLoader.cpp`) still loads `libcuda.so.1` first
   when it exists, but no longer refuses to load the GPU module without it.
 - `PxGetPhysicsGpu()` is NULL (see below), so the skinning and isosurface snippets

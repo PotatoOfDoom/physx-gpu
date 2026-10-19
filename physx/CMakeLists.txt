@@ -20,6 +20,25 @@ if(PHYSX_PRESET)
   physx_apply_preset_switches(${PHYSX_PRESET})
 endif()
 
+# The Slang/Vulkan PhysXGpu (PX_GPU_BACKEND=VULKAN, the *-vulkan presets) is generated
+# through compiler/public only (generate_projects.bat/.sh); this entry point builds the
+# CUDA PhysXGpu and would otherwise require the CUDA toolkit for a Vulkan preset.
+set(_PX_VULKAN_GPU_BACKEND FALSE)
+if(PX_GPU_BACKEND MATCHES "^[Vv][Uu][Ll][Kk][Aa][Nn]$")
+  set(_PX_VULKAN_GPU_BACKEND TRUE)
+elseif(PHYSX_PRESET AND _PHYSX_PRESET_FILE)
+  file(READ "${_PHYSX_PRESET_FILE}" _PX_PRESET_XML)
+  if(_PX_PRESET_XML MATCHES "cmakeSwitch name=\"PX_GPU_BACKEND\" value=\"VULKAN\"")
+    set(_PX_VULKAN_GPU_BACKEND TRUE)
+  endif()
+endif()
+if(_PX_VULKAN_GPU_BACKEND AND PX_GENERATE_GPU_PROJECTS)
+  message(FATAL_ERROR
+    "PX_GPU_BACKEND=VULKAN is not supported by the FetchContent/top-level CMakeLists.txt.\n"
+    "Generate the Vulkan build with generate_projects.bat/.sh and a *-vulkan preset,\n"
+    "or configure physx/compiler/public directly, or set -DPX_GENERATE_GPU_PROJECTS=OFF.")
+endif()
+
 # Detect top-level before project() - PROJECT_IS_TOP_LEVEL is only available
 # after project() is called, so we check manually here.
 # When used as a subproject via FetchContent, we use enable_language(CUDA)

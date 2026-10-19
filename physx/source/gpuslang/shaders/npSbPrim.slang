@@ -27,103 +27,72 @@
 // npSbPrim.slang
 //
 // Slang port of the non-GJK contact-generation cores of
-// softbodyPrimitives.cu (tranche 100):
+// softbodyPrimitives.cu, PhysX 5.12 (tranche 100, ported to 5.12):
 //
-// sbTetPlane — the PLANE branch of sb_primitiveContactGenLaunch:
-// the caller's per-pair attachment filter find(PxgRigidFilterPair*,
-// rigidId, PxEncodeSoftBodyIndex(sbId, tetIdx)) (3-key compare,
-// ignoreIndex2 accept, query index2 = 0), then tetPlaneCollide: each of
-// the tet's 4 world verts taken to plane space (transformInv); accept is
-// INCLUSIVE `contactDist >= pInPlaneSpace.x`; worldPoint = the
-// UNTRANSFORMED vertex, worldNormal = planeTransform.q.getBasisVector0()
-// (closed form), pen = the RAW plane-space x (no contactDist/restDist
-// subtraction).  One globalScanExclusiveSingleWarp reservation per warp
-// (= per pair; ballot + exclusive popc + lane-0 atomicAdd skipped when
-// empty), caller-side capacity gate `index < maxNumContacts` STRICT plus
-// the method's own `>= maxNumContacts` gate (double gate, both kept).
-// writeRigidVsDeformableContactNoBarycentric: contactByX = rigidId u64,
-// tempContactByX = its low dword, contactIndexSortedByX = index, point
-// (w = restDist), normalPen (w = pen), info pairInd0/pairInd1 and the
-// material dword via the two-step RMW (setRigidMaterialIndex preserving
-// bit 31, then markInCollision(false) clearing it => net mat &
-// 0x7FFFFFFF); the BARYCENTRIC buffer is NOT touched.
+// sbTetPlane -- the PLANE branch of sb_primitiveContactGenLaunch: the
+// caller's per-pair element filter, ONE exact search of the softbody's
+// mRigidVolumeFilterPairs for (PxgEncodeRigidFilterRef(rigidId,
+// rigidCacheRef), PxgEncodeDeformableTetrahedron(sbId, tetIdx)) --
+// findRigidVolumeFilter, the ENGINE's (pxgSlangDefFilter) -- then
+// tetPlaneCollide: each of the tet's 4 world verts taken to plane space
+// (transformInv); accept is INCLUSIVE `contactDist >= pInPlaneSpace.x`;
+// worldPoint = the UNTRANSFORMED vertex, worldNormal =
+// planeTransform.q.getBasisVector0() (closed form), pen = the RAW
+// plane-space x (no contactDist/restDist subtraction).  One
+// globalScanExclusiveSingleWarp reservation per warp (= per pair; ballot +
+// exclusive popc + lane-0 atomicAdd skipped when empty), the caller-side
+// capacity gate `index < maxNumContacts` STRICT plus the writer's own
+// `>= maxNumContacts` gate (double gate, both kept), then
+// PxgRigidDbContactWriter::writeVolumeContact (the ENGINE's,
+// pxgSlangDeformableWriters): point (w = restDist), normalPen (w = pen),
+// pair info (rigidId.getInd(), tet ref), the PxU16 rigid material, the
+// rigid sort key; no barycentric.
 //
-// sbEmit — writeContactNoBarycentricFullWarp (:297-362), the shared
-// emitter of the four (deferred) GJK/EPA kernels, ported and verified now
-// against synthetic GjkOutput fixtures so those kernels only await the
-// GJK core: ONE UNGATED atomicAdd(+1) per contact (the counter
-// intentionally overshoots capacity; downstream clamps), sentinel when
-// `index >= maxNumContacts` (INCLUSIVE) => nothing written; pen =
-// dot(closestPointB - closestPointA, normal) + penOffset (the CUDA sums
-// three per-lane products via shfl — a plain dot in serial form); point =
-// (closestPointB, restDist); normalPen = (flipOutputNormal ? -n : n,
-// pen); alternativeWriteMode writes ONLY contactSortedByX =
-// PxU32(pairInd0 & 0xffffffff) while the normal mode writes contactByX =
-// pairInd0 (u64) + tempContactByX = its low dword — the respective other
-// lanes stay UNTOUCHED; contactIndexSortedByX = index in both; info via
-// the same two-step RMW.  Call-site parameterization to preserve for the
-// deferred kernels: :567 penOffset = -radius, flip = false, normal mode;
-// :888/:1135 penOffset = 0, flip = true, altMode (with :888 gating on
-// direction.dot(n) >= 0 against the reversed-winding triangle normal).
-// The CUDA broadcasts the writes from lanes 0-3 of the warp; the
-// serialized port collapses the redundant all-lane stores to single
-// stores (benign-race removal, output-identical).
+// sbEmit -- writeVolumeContactFullWarp (5.12), the shared emitter of the
+// GJK/EPA kernels against synthetic GjkOutput fixtures: ONE UNGATED
+// atomicAdd(+1) per contact (the counter intentionally overshoots
+// capacity; downstream clamps), sentinel when `index >= maxNumContacts`
+// (INCLUSIVE) => nothing written; pen = dot(closestPointB - closestPointA,
+// normal) + penOffset (the CUDA sums three per-lane products via shfl -- a
+// plain dot in serial form); point = (closestPointB, restDist); normalPen
+// = (flipOutputNormal ? -n : n, pen); then writeVolumeContact's store set
+// (sort key, pair info, PxU16 material).  The 5.6.1 alternativeWriteMode
+// (a 32-bit contactSortedByX lane) is gone with the PxgFEMContactWriter.
 //
-// sbParticle — sbParticleCollision + sb_psContactGenLaunch (:1962-2128),
-// a plain PER-THREAD grid-stride kernel (the "each warp" comment upstream
-// is stale): the particle filter chain — the u64 particle mask
-// PxEncodeParticleIndex(sysId, UNSORTED index) is passed into a PxU32
-// parameter (UPSTREAM IMPLICIT TRUNCATION to the unsorted particle index;
-// reproduced deliberately), findRange over mParticleBufferRunsum picks
-// the sim-buffer bucket whose mUniqueId becomes the 3rd filter key
-// (ignoreIndex2 = false), queried once with tetFullMask =
-// PxEncodeSoftBodyIndex(sbId, PX_MAX_NB_DEFORMABLE_VOLUME_TET) and once
-// with the exact tet mask; surfaceMask == 0 exits first.  Geometry:
+// sbParticle -- sbParticleCollision + sb_psContactGenLaunch, a plain
+// PER-THREAD grid-stride kernel: surfaceMask == 0 exits first; 5.12 has NO
+// particle filter chain and NO rest distance here.  Geometry:
 // PointOutsideOfPlane4 (four sign products; INSIDE iff all four >= 0,
-// INCLUSIVE), closestPtTetrahedron restricted to the surface-hint faces
-// (identical to the npSbTet.slang port), computeTetBarycentric (eps 1e-5,
-// per-component CLAMP after the bool), n = -(p - closestP); INSIDE path:
-// pen = n.dot(n2) - restDistance with the UNNORMALIZED n, n = n2, and NO
-// contact-distance gate (an inside particle beyond cDistance still
-// emits); OUTSIDE path: reject sqDist > cDistance^2 STRICT, pen =
-// n.normalize() (guarded m > 0 divide) minus restDistance, direction
+// INCLUSIVE), closestPtTetrahedron restricted to the surface-hint faces,
+// n = -(p - closestP); INSIDE path: pen = n.dot(n2) with the UNNORMALIZED
+// n, n = n2, and NO contact-distance gate; OUTSIDE path: reject sqDist >
+// cDistance^2 STRICT, pen = n.normalize() (guarded m > 0 divide), direction
 // replaced by n2 when sqDist < 1e-8 OR n.dot(n2) < 0.8 (both STRICT).
 // Per-contact UNGATED atomicAdd + `>= max` drop, then
-// PxgFEMContactWriter::writeContact (barycentric overload): contactByX =
-// PxEncodeParticleIndex(sysId, SORTED index) u64, tempContactByX = its
-// low dword, contactIndexSortedByX = index, point = (p, 0), normalPen =
-// (n, pen), barycentric = tet bary, info pairInd0 = the same u64,
-// pairInd1 = tet mask — the material/isInCollision dword is NOT written
-// (preserved).
+// PxgParticleDbContactWriter::writeVolumeContact: point = (p, 0),
+// normalPen = (n, pen), pair info (PxgEncodeParticleRef(sysId, SORTED
+// index), tet ref), the particle sort key; no barycentric.
 //
-// sbClothVert — sbClothVertCollision + sb_clothVertContactGenLaunch
-// (:2449-2620), per-thread: TRIPLE PxgNonRigidFilterPair filter
-// (softBodyFullMask+clothMask, softBodyMask+clothFullMask,
-// softBodyMask+clothMask; 2-arg form, index2 = 0, ignoreIndex2 = true),
-// surfaceMask != 0 gate, same tet geometry, v = closestP - p with m =
+// sbClothVert -- sbClothVertCollision + sb_clothVertContactGenLaunch,
+// per-thread: the 5.12 element filter -- THREE exact searches of the
+// softbody's mVolumeSurfaceFilterPairs, (ANY tet, vertex), (tet, ANY
+// vertex) and (tet, vertex), findVolumeSurfaceVertexFilter -- BEFORE the
+// surfaceMask != 0 gate; same tet geometry, v = closestP - p with m =
 // v.normalize(); INSIDE: n = n2, pen = -m; OUTSIDE: reject sqDist >
-// cDistance^2 STRICT, pen = m, n = (m > 1e-10f && v.dot(n2) > 0.707f) ?
-// v : n2 (both STRICT; NOTE upstream has NO isValidTet gate — a
-// degenerate tet propagates NaN barycentrics into the output).
-// Per-contact UNGATED atomicAdd + inclusive `>= max` sentinel;
-// PxgSoftBodyContactWriter::writeContact: point = (closestP, 0),
-// normalPen = (n, pen), barycentric0 = (0,0,0,1) VERTEX marker,
-// barycentric1 = tet bary, info pairInd0 = PxEncodeClothIndex(clothId,
-// vertIdx) WIDENED u32->u64, pairInd1 = PxEncodeSoftBodyIndex — cloth is
-// pairInd0 (REVERSED vs the PxgFEMCore.h field comment); the auxInd
-// dword is untouched, and there are no sort-key buffers in this writer
-// at all.
+// cDistance^2 STRICT, pen = m, n = (m > 1e-10f && v.dot(n2) > 0.707f) ? v :
+// n2 (both STRICT).  Per-contact UNGATED atomicAdd + inclusive `>= max`
+// sentinel; PxgDbDbContactWriter::writeSurfaceVolumeContact, the VERTEX
+// overload: point = (closestP, 0), normalPen = (n, pen), pair info
+// (PxgEncodeDeformableVertex(clothId, vertIdx), tet ref); no barycentric
+// (sb_fem_contact_remap_to_simLaunch computes the tet's).
 //
 // KNOWN LIMITS: the caller-side capacity gate of sbTetPlane is not
-// independently pinnable — the writer method re-checks the identical
+// independently pinnable -- the writer method re-checks the identical
 // bound, so loosening the caller gate is masked (upstream redundancy;
 // both gates are kept, verified textually).  sbClothVert's `m > 1e-10f`
 // guard is likewise unpinnable: an outside classification with m below
 // 1e-10 is reachable only through float rounding noise (verified
-// textually).  computeTetBarycentric's post-window clamps are
-// transcribed but unobservable through these kernels (closestP always
-// lies on the tet surface, so raw barycentrics exceed [0,1] only by
-// float noise below the compare tolerance).
+// textually).
 //
 // WARP SERIALIZATION: sbTetPlane serializes one warp-pair per thread
 // (lane order = vert order, one reservation per pair); sbEmit serializes
@@ -132,70 +101,55 @@
 //
 // Engine glue not ported (documented): LoadShapePair/transform caches,
 // PxgSoftBody/PxgFEMCloth/PxgParticleSystem loads (cases carry verts,
-// poses, masks and ids), the 12-lane shared-memory vert staging, the
-// pair-stack iteration and stackSizeNeededOnDevice atomicMax.  DEFERRED
-// (GJK/EPA, standing): the sphere/capsule/box/convex arm of
-// sbPrimitiveCollision (tetPrimitivesCollide2), sbMeshCollision,
-// sbHeightfieldCollision and sbClothCollision — their shared emitter is
-// sbEmit above.  DEAD upstream, intentionally NOT ported (zero callers,
-// grep-verified): isTetrahedronValid (:110), computeSurfaceNormal (:160,
-// which also carries stale-`n` reuse bugs and an uninitialized return
-// for hint == 0), getClosestPtPointTetrahedron (:1763), checkNormals
-// (:1823).
+// poses and ids; the filter list is passed directly), the 12-lane
+// shared-memory vert staging, the pair-stack iteration and
+// stackSizeNeededOnDevice atomicMax.  The engine kernels themselves are
+// driven by softBodySimPrimitiveContactGen*, softBodyPsContactGen and
+// softBodySimClothVertContactGen.
 
 import pxgSlangCommon;
+import pxgSlangDeformableRef;       // PxgEncodeDeformable* / PxgEncodeParticleRef, PXG_DREF_ANY_FEATURE
+import pxgSlangDefFilter;           // findRigidVolumeFilter / findVolumeSurfaceVertexFilter, the engine's
+import pxgSlangDeformableWriters;   // the 5.12 contact writers, the engine's
 
-static const uint PXG_BITSHIFT_TET_ID = 20;      // PxgSimulationCoreDesc.h
-static const uint PXG_BITSHIFT_ELEMENT_ID = 20;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffff;
-static const uint PX_MAX_NB_DEFORMABLE_SURFACE_VTX = 0x000fffff;
-static const uint COLLISION_FLAG_MASK = 1u << 31;
 static const float PXG_MAX_F32_LOCAL = 3.402823466e38f;
 
-struct SbParams { uint numCases; uint maxContacts; uint nbRFilter; uint nbNRFilter; uint nbRunsum; uint pad0, pad1, pad2; }
+// The filter list and every writer stream are device addresses (BDA), the way the
+// engine kernels read them from the descriptors and the writers.  One stream set
+// serves all four entries; each maps it onto the writer its kernel uses.
+struct SbParams
+{
+    uint numCases; uint maxContacts; uint nbFilter; uint pad0;
+    uint64_t filterPairs;       // PxgDeformablePairInfo*, sorted (PxgComparePairInfo)
+    uint64_t filterSafeAddr;    // any mapped address, read in place of a NULL list
+    uint64_t outPoint;          // float4*
+    uint64_t outNormalPen;      // float4*
+    uint64_t outBarycentric0;   // float4*  (no entry writes one in 5.12)
+    uint64_t outBarycentric1;   // float4*
+    uint64_t outContactInfo;    // PxgDeformablePairInfo*
+    uint64_t outMaterial;       // PxU16*   (rigid writer only)
+    uint64_t totalContactCount; // PxU32*
+    uint64_t sortKey;           // PxU64*   contactByRigid / contactByParticle
+    uint64_t sortKeyTemp;       // PxU32*
+    uint64_t sortIndex;         // PxU32*
+}
 
 struct SbCase
 {
     float4 a, b, c, d; // tet verts (a.w = contactDist, b.w = restDist) | sbEmit: closestPointA/closestPointB/normal, d = (penOffset, restDist, -, -)
     float4 p;          // particle / cloth-vertex position | sbTetPlane: plane transform position
     float4 q;          // sbTetPlane: plane transform quaternion | sbEmit: unused
-    uint4 ids;         // sbTetPlane: (rigidLo, rigidHi, softbodyId, tetIdx) | sbEmit: (pairInd0 lo, pairInd0 hi, pairInd1, materialIndex)
+    uint4 ids;         // sbTetPlane: (rigidLo, rigidHi, softbodyId, tetIdx) | sbEmit: (rigidLo, rigidHi, tetIdx, materialIndex)
                        // sbParticle: (softbodyId, tetIdx, particleSystemId, sortedParticleIndex) | sbClothVert: (softbodyId, tetIdx, clothId, vertIndex)
-    uint4 ids2;        // sbTetPlane: (materialIndex, -, -, -) | sbEmit: (intersect, flip, altMode, -)
-                       // sbParticle: (surfaceMask, unsortedParticleIndex, -, -) | sbClothVert: (surfaceMask, -, -, -)
+    uint4 ids2;        // sbTetPlane: (materialIndex, rigidCacheRef, -, -) | sbEmit: (intersect, flip, softbodyId, -)
+                       // sbParticle: (surfaceMask, -, -, -) | sbClothVert: (surfaceMask, -, -, -)
 }
-
-// PxgRigidFilterPair (32B): u64 index0, u64 index1, u32 index2, pad
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
-// PxgNonRigidFilterPair (16B): u64 index0, u32 index1, u32 index2
-struct PairNR { uint2 index0; uint index1; uint index2; }
 
 [[vk::push_constant]]
 ConstantBuffer<SbParams> gParams;
 
 RWStructuredBuffer<SbCase> gCase;         // binding 0
-RWStructuredBuffer<PairR> gRFilter;       // binding 1 (sorted)
-RWStructuredBuffer<PairNR> gNRFilter;     // binding 2 (sorted)
-RWStructuredBuffer<uint> gRunsum;         // binding 3: mParticleBufferRunsum
-RWStructuredBuffer<uint> gBufUid;         // binding 4: per-buffer mUniqueId
-// PxgFEMContactWriter
-RWStructuredBuffer<float4> gFemPoint;     // binding 5
-RWStructuredBuffer<float4> gFemNormalPen; // binding 6
-RWStructuredBuffer<float4> gFemBary;      // binding 7
-RWStructuredBuffer<uint4> gFemInfo;       // binding 8
-RWStructuredBuffer<uint> gFemCount;       // binding 9
-RWStructuredBuffer<uint2> gFemByX;        // binding 10
-RWStructuredBuffer<uint> gFemTempByX;     // binding 11
-RWStructuredBuffer<uint> gFemIdxByX;      // binding 12
-RWStructuredBuffer<uint> gFemSorted32;    // binding 13
-// PxgSoftBodyContactWriter (no sort keys)
-RWStructuredBuffer<float4> gSbPoint;      // binding 14
-RWStructuredBuffer<float4> gSbNormalPen;  // binding 15
-RWStructuredBuffer<float4> gSbBary0;      // binding 16
-RWStructuredBuffer<float4> gSbBary1;      // binding 17
-RWStructuredBuffer<uint4> gSbInfo;        // binding 18
-RWStructuredBuffer<uint> gSbCount;        // binding 19
-RWStructuredBuffer<float4> gDebug;        // binding 20
+RWStructuredBuffer<float4> gDebug;        // binding 1
 
 // ---- small helpers -----------------------------------------------------------
 float3 getNormalized(float3 v)
@@ -223,90 +177,54 @@ float3 getBasisVector0(float4 q)
                   (q.z * w2) + q.y * x2,
                   (-q.y * w2) + q.z * x2);
 }
-uint encodeSoftBody(uint sbId, uint tetId) { return (sbId << PXG_BITSHIFT_TET_ID) | tetId; }
-uint encodeCloth(uint clothId, uint elemId) { return (clothId << PXG_BITSHIFT_ELEMENT_ID) | elemId; }
 
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-// find(PxgRigidFilterPair*) — deformableElementFilter.cuh, query index2 = 0
-bool findRigidFilter(uint2 rigidId, uint mask)
+DfFilterArray caseFilters()
 {
-    const uint2 q1 = uint2(mask, 0);
-    uint l = 0, r = gParams.nbRFilter;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2;
-        const PairR p = gRFilter[mid];
-        int cmp;
-        if (!u64Eq(rigidId, p.index0))
-            cmp = u64Lt(rigidId, p.index0) ? -1 : 1;
-        else if (!u64Eq(q1, p.index1))
-            cmp = u64Lt(q1, p.index1) ? -1 : 1;
-        else if (0u != p.index2)
-            cmp = -1;
-        else
-            cmp = 0;
-        if (cmp == 0 || (u64Eq(rigidId, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid;
-        else l = mid + 1;
-    }
-    return false;
+    return dfFilterArray(gParams.filterPairs, gParams.nbFilter, gParams.filterSafeAddr);
 }
 
-// PxgNonRigidFilterPair::compare — (index0 u64, index1 u32, index2 u32)
-bool findNonRigid(uint2 q0, uint q1, uint q2, bool ignoreIndex2)
+PxgRigidDbContactWriterGpu rigidWriter()
 {
-    uint l = 0, r = gParams.nbNRFilter;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2;
-        const PairNR p = gNRFilter[mid];
-        int cmp;
-        if (!u64Eq(q0, p.index0))
-            cmp = u64Lt(q0, p.index0) ? -1 : 1;
-        else if (q1 != p.index1)
-            cmp = (q1 < p.index1) ? -1 : 1;
-        else if (q2 != p.index2)
-            cmp = (q2 < p.index2) ? -1 : 1;
-        else
-            cmp = 0;
-        if (cmp == 0 || (ignoreIndex2 && u64Eq(q0, p.index0) && q1 == p.index1))
-            return true;
-        if (cmp < 0) r = mid;
-        else l = mid + 1;
-    }
-    return false;
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gParams.outPoint;
+    w.outNormalPen = gParams.outNormalPen;
+    w.outBarycentric = gParams.outBarycentric0;
+    w.outContactInfo = gParams.outContactInfo;
+    w.outRigidMaterialIndex = gParams.outMaterial;
+    w.totalContactCount = gParams.totalContactCount;
+    w.contactByRigid = gParams.sortKey;
+    w.tempContactByRigid = gParams.sortKeyTemp;
+    w.contactIndexSortedByRigid = gParams.sortIndex;
+    w.maxNumContacts = gParams.maxContacts;
+    return w;
 }
 
-// findRange: upper-bound search returning r-1
-uint findRange(uint value, uint length)
+PxgParticleDbContactWriterGpu particleWriter()
 {
-    if (length == 0)
-        return 0;
-    uint l = 0, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2;
-        if (gRunsum[m] > value)
-            r = m;
-        else
-            l = m + 1;
-    }
-    return r - 1;
+    PxgParticleDbContactWriterGpu w;
+    w.outPoint = gParams.outPoint;
+    w.outNormalPen = gParams.outNormalPen;
+    w.outBarycentric = gParams.outBarycentric0;
+    w.outContactInfo = gParams.outContactInfo;
+    w.totalContactCount = gParams.totalContactCount;
+    w.contactByParticle = gParams.sortKey;
+    w.tempContactByParticle = gParams.sortKeyTemp;
+    w.contactIndexSortedByParticle = gParams.sortIndex;
+    w.maxNumContacts = gParams.maxContacts;
+    return w;
 }
 
-// find(PxgParticleSystem&, ...): the compressedParticleId parameter is PxU32 —
-// callers pass the u64 particle mask, which TRUNCATES to the unsorted particle
-// index (upstream implicit conversion, reproduced); the bucket's mUniqueId
-// becomes the third key with ignoreIndex2 = false
-bool findParticleFilter(uint compressedParticleId, uint compressedId1)
+PxgDbDbContactWriterGpu dbDbWriter()
 {
-    const uint particleId = compressedParticleId; // PxGetParticleIndex of the u32
-    const uint id = findRange(particleId, gParams.nbRunsum);
-    const uint uniqueId = gBufUid[id];
-    return findNonRigid(uint2(compressedParticleId, 0), compressedId1, uniqueId, false);
+    PxgDbDbContactWriterGpu w;
+    w.outPoint = gParams.outPoint;
+    w.outNormalPen = gParams.outNormalPen;
+    w.outBarycentric0 = gParams.outBarycentric0;
+    w.outBarycentric1 = gParams.outBarycentric1;
+    w.outContactInfo = gParams.outContactInfo;
+    w.totalContactCount = gParams.totalContactCount;
+    w.maxContacts = gParams.maxContacts;
+    return w;
 }
 
 // ---- geometry (softbodyPrimitives.cu / deformableCollision.cuh) --------------
@@ -446,91 +364,8 @@ void closestPtTetrahedron(float3 point, uint hint, float3 a, float3 b, float3 c,
     }
 }
 
-// computeTetBarycentric (deformableCollision.cuh :96): bool = eps window,
-// per-component clamp applied AFTER the unclamped window test
-bool computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 point,
-                           out float4 barycentric)
-{
-    const float eps = 1e-5f;
-    const float minEps = -eps;
-    const float maxEps = 1.0f + eps;
-    const float3 ba = b - a;
-    const float3 ca = c - a;
-    const float3 da = d - a;
-    const float3 pa = point - a;
-
-    const float detBcd = dot(ba, cross(ca, da));
-    const float detPcd = dot(pa, cross(ca, da));
-    const float v = detPcd / detBcd;
-    const float detBpd = dot(ba, cross(pa, da));
-    const float w = detBpd / detBcd;
-    const float detBcp = dot(ba, cross(ca, pa));
-    const float x = detBcp / detBcd;
-    const float u = 1.0f - v - w - x;
-    barycentric = float4(clamp(u, 0.0f, 1.0f), clamp(v, 0.0f, 1.0f),
-                         clamp(w, 0.0f, 1.0f), clamp(x, 0.0f, 1.0f));
-    return (u >= minEps && u <= maxEps) && (v >= minEps && v <= maxEps) &&
-           (w >= minEps && w <= maxEps) && (x >= minEps && x <= maxEps);
-}
-
-// ---- writers (PxgFEMCore.h / PxgSoftBodyCore.h) -------------------------------
-// writeRigidVsDeformableContactNoBarycentric (PxgFEMCore.h :446)
-void writeRigidVsDeformableContactNoBarycentric(uint index, float4 contact, float4 normalPen,
-                                                uint2 pairInd0, uint pairInd1, uint2 rigidId,
-                                                uint rigidBodyMaterialId)
-{
-    if (index >= gParams.maxContacts) return;
-    gFemByX[index] = rigidId;
-    gFemTempByX[index] = rigidId.x;
-    gFemIdxByX[index] = index;
-    gFemPoint[index] = contact;
-    gFemNormalPen[index] = normalPen;
-    uint4 info = gFemInfo[index];
-    info.x = pairInd0.x;
-    info.y = pairInd0.y;
-    info.z = pairInd1;
-    info.w = (info.w & COLLISION_FLAG_MASK) | (rigidBodyMaterialId & ~COLLISION_FLAG_MASK);
-    info.w = info.w & ~COLLISION_FLAG_MASK;
-    gFemInfo[index] = info;
-}
-
-// PxgFEMContactWriter::writeContact (barycentric overload, :467): the info
-// material dword is NOT written (writeContactNoBarycentric only sets the pair)
-void femWriteContactBary(uint index, float4 contact, float4 normalPen, float4 bary,
-                         uint2 pairInd0, uint pairInd1, uint2 id)
-{
-    if (index >= gParams.maxContacts) return;
-    gFemByX[index] = id;
-    gFemTempByX[index] = id.x;
-    gFemIdxByX[index] = index;
-    gFemPoint[index] = contact;
-    gFemNormalPen[index] = normalPen;
-    gFemBary[index] = bary;
-    uint4 info = gFemInfo[index];
-    info.x = pairInd0.x;
-    info.y = pairInd0.y;
-    info.z = pairInd1;
-    gFemInfo[index] = info; // fourth dword untouched
-}
-
-// PxgSoftBodyContactWriter::writeContact (PxgSoftBodyCore.h :277)
-void sbWriteContact(uint index, float4 contact, float4 normalPen, float4 bary0, float4 bary1,
-                    uint pairId0, uint pairId1)
-{
-    if (index >= gParams.maxContacts) return;
-    gSbPoint[index] = contact;
-    gSbNormalPen[index] = normalPen;
-    gSbBary0[index] = bary0;
-    gSbBary1[index] = bary1;
-    uint4 info = gSbInfo[index];
-    info.x = pairId0; // u32 -> u64 widen: high dword zero
-    info.y = 0;
-    info.z = pairId1;
-    gSbInfo[index] = info; // auxInd (w) untouched
-}
-
 // ============================================================================
-// sbTetPlane — one thread serializes one warp-pair (4 verts, one reservation)
+// sbTetPlane -- one thread serializes one warp-pair (4 verts, one reservation)
 // ============================================================================
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -539,14 +374,15 @@ void sbTetPlane(uint3 dtid : SV_DispatchThreadID)
     const uint i = dtid.x;
     if (i >= gParams.numCases) return;
     const SbCase cs = gCase[i];
-    const uint2 rigidId = cs.ids.xy;
+    const uint64_t rigidId = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << 32);
     const uint softbodyId = cs.ids.z;
     const uint tetrahedronIdx = cs.ids.w;
+    const uint rigidCacheRef = cs.ids2.y;
     const float contactDist = cs.a.w;
     const float restDist = cs.b.w;
 
-    const uint softBodyMask = encodeSoftBody(softbodyId, tetrahedronIdx);
-    if (findRigidFilter(rigidId, softBodyMask))
+    // A filter pair for this rigid and tetrahedron suppresses contact generation.
+    if (findRigidVolumeFilter(caseFilters(), rigidId, rigidCacheRef, softbodyId, tetrahedronIdx))
     {
         gDebug[i] = float4(1, 0, 0, 0);
         return;
@@ -568,9 +404,11 @@ void sbTetPlane(uint3 dtid : SV_DispatchThreadID)
 
     uint startIndex = 0;
     if (count > 0)
-        InterlockedAdd(gFemCount[0], count, startIndex);
+        InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], count, startIndex);
 
     const float3 worldNormal = getBasisVector0(cs.q);
+    const uint64_t tetRef = PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx);
+    PxgRigidDbContactWriterGpu writer = rigidWriter();
     uint offset = 0;
     for (uint k = 0; k < 4; ++k)
     {
@@ -579,15 +417,14 @@ void sbTetPlane(uint3 dtid : SV_DispatchThreadID)
         ++offset;
         if (index < gParams.maxContacts) // caller gate, STRICT
         {
-            writeRigidVsDeformableContactNoBarycentric(
-                index, float4(verts[k], restDist), float4(worldNormal, pen[k]),
-                rigidId, softBodyMask, rigidId, cs.ids2.x);
+            writer.writeVolumeContact(index, float4(verts[k], restDist), float4(worldNormal, pen[k]),
+                                      rigidId, cs.ids2.x, tetRef);
         }
     }
 }
 
 // ============================================================================
-// sbEmit — writeContactNoBarycentricFullWarp against synthetic GjkOutput
+// sbEmit -- writeVolumeContactFullWarp against synthetic GjkOutput
 // ============================================================================
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -598,55 +435,38 @@ void sbEmit(uint3 dtid : SV_DispatchThreadID)
     const SbCase cs = gCase[i];
     const bool intersect = cs.ids2.x != 0;
     const bool flipOutputNormal = cs.ids2.y != 0;
-    const bool alternativeWriteMode = cs.ids2.z != 0;
     const float penOffset = cs.d.x;
     const float restDist = cs.d.y;
-    const uint2 pairInd0 = cs.ids.xy;
-    const uint pairInd1 = cs.ids.z;
+    const uint64_t rigidRef = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << 32);
+    const uint64_t tetRef = PxgEncodeDeformableTetrahedron(cs.ids2.z, cs.ids.z);
     const uint materialId = cs.ids.w;
 
     uint index = 0xffffffffu;
     if (intersect)
     {
-        InterlockedAdd(gFemCount[0], 1, index); // UNGATED: counter overshoots
-        if (index >= gParams.maxContacts)       // INCLUSIVE sentinel
+        InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], 1, index); // UNGATED: counter overshoots
+        if (index >= gParams.maxContacts)                                    // INCLUSIVE sentinel
             index = 0xffffffffu;
     }
     gDebug[i] = float4(intersect ? 1 : 0, asfloat(index), 0, 0);
 
     if (index != 0xffffffffu)
     {
-        if (alternativeWriteMode)
-        {
-            gFemSorted32[index] = pairInd0.x; // PxU32(pairInd0 & 0xffffffff)
-        }
-        else
-        {
-            gFemByX[index] = pairInd0;
-            gFemTempByX[index] = pairInd0.x;
-        }
-        gFemIdxByX[index] = index;
-
         const float3 witnessA = cs.a.xyz;
         const float3 witnessB = cs.b.xyz;
         const float3 n = cs.c.xyz;
         const float pen = dot(witnessB - witnessA, n) + penOffset;
 
-        gFemPoint[index] = float4(witnessB, restDist);
-        gFemNormalPen[index] = float4(flipOutputNormal ? -n : n, pen);
-
-        uint4 info = gFemInfo[index];
-        info.x = pairInd0.x;
-        info.y = pairInd0.y;
-        info.z = pairInd1;
-        info.w = (info.w & COLLISION_FLAG_MASK) | (materialId & ~COLLISION_FLAG_MASK);
-        info.w = info.w & ~COLLISION_FLAG_MASK;
-        gFemInfo[index] = info;
+        // writeSortKey, the point, normal/pen, pair info and PxU16 material:
+        // writeVolumeContact's store set, which the full-warp form splits across lanes.
+        rigidWriter().writeVolumeContact(index, float4(witnessB, restDist),
+                                         float4(flipOutputNormal ? -n : n, pen),
+                                         rigidRef, materialId, tetRef);
     }
 }
 
 // ============================================================================
-// sbParticle — sbParticleCollision, per-thread
+// sbParticle -- sbParticleCollision, per-thread
 // ============================================================================
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -660,17 +480,9 @@ void sbParticle(uint3 dtid : SV_DispatchThreadID)
     const uint particleSystemId = cs.ids.z;
     const uint sortedParticleIndex = cs.ids.w;
     const uint surfaceMask = cs.ids2.x;
-    const uint unsortedParticleIndex = cs.ids2.y;
     const float cDistance = cs.a.w;
-    const float restDistance = cs.b.w;
 
-    // PxEncodeParticleIndex(sysId, unsorted) truncated to PxU32 = the unsorted id
-    const uint particleMaskLo = unsortedParticleIndex;
-    const uint tetMask = encodeSoftBody(softbodyId, tetrahedronIdx);
-    const uint tetFullMask = encodeSoftBody(softbodyId, PX_MAX_NB_DEFORMABLE_VOLUME_TET);
-
-    if (surfaceMask == 0 || findParticleFilter(particleMaskLo, tetFullMask) ||
-        findParticleFilter(particleMaskLo, tetMask))
+    if (surfaceMask == 0)
     {
         gDebug[i] = float4(1, 0, 0, 0);
         return;
@@ -681,19 +493,17 @@ void sbParticle(uint3 dtid : SV_DispatchThreadID)
 
     const float4 result = PointOutsideOfPlane4(p, a, b, c, d);
 
-    float4 tBarycentric;
     float3 closestP = float3(0, 0, 0);
     float3 n2 = float3(0, 0, 0);
     float sqDist = PXG_MAX_F32_LOCAL;
     closestPtTetrahedron(p, surfaceMask, a, b, c, d, n2, closestP, sqDist);
-    computeTetBarycentric(a, b, c, d, closestP, tBarycentric);
 
     float3 n = -(p - closestP);
     float pen;
     const bool inside = result.x >= 0.0f && result.y >= 0.0f && result.z >= 0.0f && result.w >= 0.0f;
     if (inside)
     {
-        pen = dot(n, n2) - restDistance; // UNNORMALIZED n; no cDistance gate
+        pen = dot(n, n2); // UNNORMALIZED n; no cDistance gate
         n = n2;
     }
     else
@@ -707,22 +517,21 @@ void sbParticle(uint3 dtid : SV_DispatchThreadID)
         pen = pxNormalize(n);
         if (sqDist < 1e-8f || dot(n, n2) < 0.8f)
             n = n2;
-        pen -= restDistance;
     }
     gDebug[i] = float4(0, 1, pen, inside ? 1 : 0);
 
     uint index;
-    InterlockedAdd(gFemCount[0], 1, index); // UNGATED
+    InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], 1, index); // UNGATED
     if (index >= gParams.maxContacts)
         return;
 
-    const uint2 compressedParticleIndex = uint2(sortedParticleIndex, particleSystemId); // u64 (SORTED)
-    femWriteContactBary(index, float4(p, 0.0f), float4(n, pen), tBarycentric,
-                        compressedParticleIndex, tetMask, compressedParticleIndex);
+    const uint64_t particleRef = PxgEncodeParticleRef(particleSystemId, sortedParticleIndex);
+    const uint64_t tetRef = PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx);
+    particleWriter().writeVolumeContact(index, float4(p, 0.0f), float4(n, pen), particleRef, tetRef);
 }
 
 // ============================================================================
-// sbClothVert — sbClothVertCollision, per-thread
+// sbClothVert -- sbClothVertCollision, per-thread
 // ============================================================================
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -738,14 +547,13 @@ void sbClothVert(uint3 dtid : SV_DispatchThreadID)
     const uint surfaceMask = cs.ids2.x;
     const float cDistance = cs.a.w;
 
-    const uint softBodyMask = encodeSoftBody(softbodyId, tetrahedronIdx);
-    const uint softBodyFullMask = encodeSoftBody(softbodyId, PX_MAX_NB_DEFORMABLE_VOLUME_TET);
-    const uint clothMask = encodeCloth(clothId, vertIndex);
-    const uint clothFullMask = encodeCloth(clothId, PX_MAX_NB_DEFORMABLE_SURFACE_VTX);
-
-    if (findNonRigid(uint2(softBodyFullMask, 0), clothMask, 0, true) ||
-        findNonRigid(uint2(softBodyMask, 0), clothFullMask, 0, true) ||
-        findNonRigid(uint2(softBodyMask, 0), clothMask, 0, true))
+    // A filter pair for this tetrahedron and this cloth vertex suppresses contact
+    // generation between them; the first two searches check whether either of the
+    // two is filtered against any.
+    const DfFilterArray filters = caseFilters();
+    if (findVolumeSurfaceVertexFilter(filters, softbodyId, PXG_DREF_ANY_FEATURE, clothId, vertIndex) ||
+        findVolumeSurfaceVertexFilter(filters, softbodyId, tetrahedronIdx, clothId, PXG_DREF_ANY_FEATURE) ||
+        findVolumeSurfaceVertexFilter(filters, softbodyId, tetrahedronIdx, clothId, vertIndex))
     {
         gDebug[i] = float4(1, 0, 0, 0);
         return;
@@ -762,12 +570,10 @@ void sbClothVert(uint3 dtid : SV_DispatchThreadID)
 
     const float4 result = PointOutsideOfPlane4(p, a, b, c, d);
 
-    float4 tBarycentric;
     float3 closestP = float3(0, 0, 0);
     float3 n2 = float3(0, 0, 0);
     float sqDist = PXG_MAX_F32_LOCAL;
     closestPtTetrahedron(p, surfaceMask, a, b, c, d, n2, closestP, sqDist);
-    computeTetBarycentric(a, b, c, d, closestP, tBarycentric);
 
     float3 v = closestP - p;
     const float m = pxNormalize(v);
@@ -795,10 +601,11 @@ void sbClothVert(uint3 dtid : SV_DispatchThreadID)
     gDebug[i] = float4(0, 1, pen, inside ? 1 : 0);
 
     uint index;
-    InterlockedAdd(gSbCount[0], 1, index); // UNGATED
+    InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], 1, index); // UNGATED
     if (index >= gParams.maxContacts)
         return;
 
-    sbWriteContact(index, float4(contact, 0.0f), float4(n, pen),
-                   float4(0, 0, 0, 1), tBarycentric, clothMask, softBodyMask);
+    const uint64_t vertRef = PxgEncodeDeformableVertex(clothId, vertIndex);
+    const uint64_t tetRef = PxgEncodeDeformableTetrahedron(softbodyId, tetrahedronIdx);
+    dbDbWriter().writeSurfaceVolumeContactVertex(index, float4(contact, 0.0f), float4(n, pen), vertRef, tetRef);
 }

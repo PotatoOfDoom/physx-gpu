@@ -37,7 +37,7 @@
 # mirrors ../cmakegpu: those are directory-scoped and are NOT inherited from the
 # sibling ../cmake tree.
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 
 PROJECT(PhysXGpu C CXX)
 
@@ -163,10 +163,8 @@ SOURCE_GROUP("backend" FILES ${PXG_VK_BACKEND_SOURCES})
 SOURCE_GROUP("dependencies" FILES ${PXG_VK_DEPENDENCY_SOURCES})
 
 IF(TARGET_BUILD_PLATFORM STREQUAL "windows")
-	SET(PHYSXGPU_RESOURCE
-		${PHYSX_SOURCE_DIR}/compiler/windows/resource/PhysXGpu.rc
-		${PHYSX_SOURCE_DIR}/compiler/windows/resource/resource.h
-	)
+	# PHYSXGPU_RESOURCE: the same version resource as the CUDA module.
+	INCLUDE(${PHYSX_ROOT_DIR}/${PROJECT_CMAKE_FILES_DIR}/windows/PhysXGpuPlatformFiles.cmake)
 	SOURCE_GROUP(resource FILES ${PHYSXGPU_RESOURCE})
 ENDIF()
 
@@ -284,10 +282,12 @@ ENDIF()
 # Lower-cased like the output directories (CMAKE_LIBRARY_OUTPUT_DIRECTORY_<CFG> are
 # lower-case paths), so -DCMAKE_BUILD_TYPE=Release still puts the shaders next to the library.
 SET(PXG_SHADER_BIN_DIR "${PX_OUTPUT_LIB_DIR}/${PX_ROOT_LIB_DIR}/$<LOWER_CASE:$<CONFIG>>/PhysXGpuShaders")
-# copy_directory, not one copy_if_different with every file: 178 paths overflow
+# copy_directory, not one copy_if_different with every file: 170 paths overflow
 # cmd.exe's 8191-character command line on Windows.  The directory holds exactly the
-# engine shaders (PXG_SHADER_ONLY).
+# engine shaders (PXG_SHADER_ONLY); it is emptied first, so modules a newer manifest
+# no longer maps (PhysX 5.12 dropped 8) do not linger next to the library.
 ADD_CUSTOM_TARGET(PhysXGpuShaders ALL
+	COMMAND ${CMAKE_COMMAND} -E rm -rf "${PXG_SHADER_BIN_DIR}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${PXG_SHADER_BIN_DIR}"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${PXG_ENGINE_SHADER_DIR}" "${PXG_SHADER_BIN_DIR}"
 	DEPENDS ${PXG_ENGINE_SHADER_OUTPUTS}
@@ -300,12 +300,17 @@ SET_PROPERTY(TARGET PhysXGpuShaders PROPERTY FOLDER "PhysX SDK/GPU")
 
 SET(PXG_INSTALL_LIB_DIR $<$<CONFIG:debug>:${PX_ROOT_LIB_DIR}/debug>$<$<CONFIG:release>:${PX_ROOT_LIB_DIR}/release>$<$<CONFIG:checked>:${PX_ROOT_LIB_DIR}/checked>$<$<CONFIG:profile>:${PX_ROOT_LIB_DIR}/profile>)
 
-INSTALL(
-	TARGETS PhysXGpu
-	EXPORT PhysXSDK
-	DESTINATION ${PXG_INSTALL_LIB_DIR}
-)
-INSTALL(FILES ${PXG_ENGINE_SHADER_OUTPUTS} DESTINATION ${PXG_INSTALL_LIB_DIR}/PhysXGpuShaders)
-IF(TARGET_BUILD_PLATFORM STREQUAL "windows")
-	INSTALL(FILES $<TARGET_PDB_FILE:PhysXGpu> DESTINATION ${PXG_INSTALL_LIB_DIR} OPTIONAL)
+# Only the legacy PhysXSDK export set of the standalone build (compiler/public), as
+# in ../cmakegpu: the FetchContent entry point (physx/CMakeLists.txt) defines
+# PX_ENABLE_INSTALL and installs through its own export set.
+IF(NOT DEFINED PX_ENABLE_INSTALL)
+	INSTALL(
+		TARGETS PhysXGpu
+		EXPORT PhysXSDK
+		DESTINATION ${PXG_INSTALL_LIB_DIR}
+	)
+	INSTALL(FILES ${PXG_ENGINE_SHADER_OUTPUTS} DESTINATION ${PXG_INSTALL_LIB_DIR}/PhysXGpuShaders)
+	IF(TARGET_BUILD_PLATFORM STREQUAL "windows")
+		INSTALL(FILES $<TARGET_PDB_FILE:PhysXGpu> DESTINATION ${PXG_INSTALL_LIB_DIR} OPTIONAL)
+	ENDIF()
 ENDIF()

@@ -38,10 +38,24 @@
 // points sampled off hinted AND non-hinted faces (outside contacts, both
 // ternary branches, vd-gate blocks) and random points.  Filter pairs target
 // the tets NEAR the query point so a broken lookup manufactures contacts.
-// Contacts are matched exactly by the injective encoded pairId0; the
-// atomic counter is bounded by the reference contact count +/- skips.
+// Contacts are matched exactly by the injective vertex ref0; the atomic
+// counter is bounded by the reference contact count +/- skips.
+//
+// PhysX 5.12: the element filter is softbody0's sorted PxgDeformablePairInfo
+// list, searched for (vertex of softbody0, tet of softbody1) and (ANY, tet)
+// per candidate through the engine's findVolumeVolumeFilter, and the contact
+// goes through the engine's PxgDbDbContactWriter::writeVolumeVolumeContact --
+// ref0 the query VERTEX of softbody0, ref1 the TETRAHEDRON of softbody1, no
+// barycentric and no query point (5.6.1 wrote the vertex's surface tet via
+// vertToSurfaceTetRemap0).  References and pair order come from the real
+// engine host helpers.
 
 #include "pxgTestFramework.h"
+
+// no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers; must precede the
+// engine headers.
+#include "host_defines.h"
+#include "PxgSimulationCoreDesc.h"   // PxgDeformablePairInfo, PxgEncodeDeformable*, PxgComparePairInfo
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +67,7 @@
 namespace
 {
 using namespace pxgtest;
+using namespace physx;
 
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
@@ -63,10 +78,16 @@ struct Bv32Node
     uint32_t mData[32];
     uint32_t mNbNodes, mDepth, pad0, pad1;
 };
-struct PairNR { uint32_t i0lo, i0hi, index1, index2; };
 struct SsbWork { F4 point; U4 ids; F4 params; };
-struct SsbContact { F4 closestP0, normal_pen, point, closestP1; U4 pairIds; };
-struct SsbParams { uint32_t numWorkItems, numFilterPairs, maxContacts, pad0; };
+// Byte-identical to npSbSb.slang's SsbParams: the filter list and the writer's
+// streams are device addresses.
+struct SsbParams
+{
+    uint32_t numWorkItems, numFilterPairs, maxContacts, pad0;
+    uint64_t filterPairs, filterSafeAddr, outPoint, outNormalPen, outContactInfo, totalContactCount;
+};
+static_assert(sizeof(SsbParams) == 64, "npSbSb push block");
+static_assert(sizeof(PxgDeformablePairInfo) == 16, "PxgDeformablePairInfo");
 
 struct V3 { float x, y, z; };
 static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -198,25 +219,17 @@ static void refClosestTet(V3 point, uint32_t hint, V3 a, V3 b, V3 c, V3 d,
     }
 }
 
-static uint32_t encodeSb(uint32_t id, uint32_t tet) { return (id << 20) | tet; }
-static bool refFind(const std::vector<PairNR>& pairs, uint32_t id0, uint32_t id1)
+static uint64_t vertRef(uint32_t id, uint32_t v) { return PxgEncodeDeformableVertex(id, v); }
+static uint64_t tetRef(uint32_t id, uint32_t t) { return PxgEncodeDeformableTetrahedron(id, t); }
+static bool pairLess(const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b)
 {
-    uint32_t l = 0, r = (uint32_t)pairs.size();
-    while (l < r)
-    {
-        const uint32_t mid = (l + r) / 2;
-        const PairNR& p = pairs[mid];
-        const uint64_t p0 = ((uint64_t)p.i0hi << 32) | p.i0lo;
-        int cmp = 0;
-        if ((uint64_t)id0 < p0) cmp = -1;
-        else if ((uint64_t)id0 > p0) cmp = 1;
-        else if (id1 < p.index1) cmp = -1;
-        else if (id1 > p.index1) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || ((uint64_t)id0 == p0 && id1 == p.index1)) return true;
-        if (cmp < 0) r = mid; else l = mid + 1;
-    }
-    return false;
+    return PxgComparePairInfo(a, b) < 0;
+}
+// find() over the sorted list (deformableElementFilter.cuh): one exact search.
+static bool refFind(const std::vector<PxgDeformablePairInfo>& pairs, uint64_t ref0, uint64_t ref1)
+{
+    const PxgDeformablePairInfo key = { ref0, ref1 };
+    return std::binary_search(pairs.begin(), pairs.end(), key, pairLess);
 }
 
 // ---- builder ----------------------------------------------------------
@@ -275,7 +288,7 @@ PXG_TEST(npSbSb_traverser)
     const uint32_t NT = 500, NQ = 96, NV0 = 2000;
     std::vector<F4> verts(NT * 4);
     std::vector<U4> tets(NT);
-    std::vector<uint32_t> hints(NT), v2t0(NV0);
+    std::vector<uint32_t> hints(NT);
     std::vector<AABB> bounds(NT);
     for (uint32_t t = 0; t < NT; ++t)
     {
@@ -298,7 +311,6 @@ PXG_TEST(npSbSb_traverser)
         }
         bounds[t] = bb;
     }
-    for (uint32_t v = 0; v < NV0; ++v) v2t0[v] = v % NT; // softbody0 surface remap (injective per query)
 
     // Morton sort tets
     {
@@ -330,10 +342,10 @@ PXG_TEST(npSbSb_traverser)
     // queries
     const uint32_t sbId0 = 7, sbId1 = 13;
     std::vector<SsbWork> work(NQ);
-    std::vector<PairNR> filters;
+    std::vector<PxgDeformablePairInfo> filters;
     {
         auto popcount4 = [](uint32_t v) { int n = 0; for (; v; v >>= 1) n += v & 1; return n; };
-        std::vector<std::pair<uint32_t, uint32_t>> fset;
+        std::vector<PxgDeformablePairInfo> fset;
         for (uint32_t q = 0; q < NQ; ++q)
         {
             const uint32_t vertIdx = (q * 977) % NV0;
@@ -376,7 +388,11 @@ PXG_TEST(npSbSb_traverser)
             w.point = f4(p);
             if (q % 6 == 3)
             {
-                // filter the tets NEAR the query point (would-be winners)
+                // filter the tets NEAR the query point (would-be winners).
+                // q % 12 == 3: the (vertex, tet) pair; q % 24 == 9: the (ANY, tet)
+                // wildcard, which the traverser's SECOND search must find; q % 24 == 21:
+                // only NEAR MISSES -- the same pair keyed on the wrong softbody on either
+                // side -- which must filter nothing.
                 uint32_t added = 0;
                 for (uint32_t t = 0; t < NT && added < 40; ++t)
                 {
@@ -389,27 +405,32 @@ PXG_TEST(npSbSb_traverser)
                     }
                     if (d2 < w.params.x * w.params.x)
                     {
-                        fset.push_back({ encodeSb(sbId0, vertIdx), encodeSb(sbId1, t) });
+                        if (q % 24 != 21)
+                        {
+                            const uint32_t v0 = (q % 24 == 9) ? uint32_t(PxgDeformableRef::ANY_FEATURE) : vertIdx;
+                            fset.push_back({ vertRef(sbId0, v0), tetRef(sbId1, t) });
+                        }
+                        else
+                        {
+                            fset.push_back({ vertRef(sbId1, vertIdx), tetRef(sbId1, t) });
+                            fset.push_back({ vertRef(sbId0, vertIdx), tetRef(sbId0, t) });
+                        }
                         ++added;
                     }
                 }
             }
         }
-        std::sort(fset.begin(), fset.end());
-        fset.erase(std::unique(fset.begin(), fset.end()), fset.end());
-        // the CUDA passes (mask0, mask1) UNordered to find() - build with that key order
-        for (const auto& f : fset)
-            filters.push_back({ f.first, 0, f.second, 0 });
-        std::sort(filters.begin(), filters.end(), [](const PairNR& a, const PairNR& b) {
-            if (a.i0lo != b.i0lo) return a.i0lo < b.i0lo;
-            return a.index1 < b.index1; });
+        std::sort(fset.begin(), fset.end(), pairLess);
+        fset.erase(std::unique(fset.begin(), fset.end(), [](const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b) {
+            return PxgComparePairInfo(a, b) == 0; }), fset.end());
+        filters = fset;
     }
 
     // ---- reference ----
-    struct RefContact { bool has = false; V3 closestP, normal; float pen; uint32_t pairId1; int tag = -1; bool obs = false, vdClose = false; };
+    struct RefContact { bool has = false; V3 closestP, normal; float pen; uint64_t ref1; int tag = -1; bool obs = false, vdClose = false; };
     std::vector<RefContact> refC(NQ);
     std::vector<uint8_t> skip(NQ, 0);
-    size_t hintBlocked = 0, filtered = 0, contacts = 0;
+    size_t hintBlocked = 0, filtered = 0, filteredAny = 0, contacts = 0;
     size_t insideContacts = 0, outsideContacts = 0, vdBlocked = 0, normReplaced = 0, normKept = 0;
 
     for (uint32_t q = 0; q < NQ; ++q)
@@ -474,7 +495,10 @@ PXG_TEST(npSbSb_traverser)
                 const U4& ti = tets[t];
                 const uint32_t hint = hints[t];
                 if (hint == 0) { ++hintBlocked; continue; }
-                if (refFind(filters, encodeSb(sbId0, vertIdx), encodeSb(sbId1, t))) { ++filtered; continue; }
+                // findVolumeVolumeFilter(vertex, tet) || findVolumeVolumeFilter(ANY, tet)
+                if (refFind(filters, vertRef(sbId0, vertIdx), tetRef(sbId1, t))) { ++filtered; continue; }
+                if (refFind(filters, vertRef(sbId0, PxgDeformableRef::ANY_FEATURE), tetRef(sbId1, t)))
+                { ++filtered; ++filteredAny; continue; }
                 const V3 a = v3(verts[ti.x]), b = v3(verts[ti.y]), c = v3(verts[ti.z]), d = v3(verts[ti.w]);
                 {
                     const float det = dot3(sub(b, a), cross3(sub(c, a), sub(d, a)));
@@ -576,7 +600,7 @@ PXG_TEST(npSbSb_traverser)
             rc.closestP = laneP[winner];
             rc.normal = laneN[winner];
             rc.pen = best;
-            rc.pairId1 = encodeSb(sbId1, lanePrim[winner]);
+            rc.ref1 = tetRef(sbId1, lanePrim[winner]);
             rc.tag = laneTag[winner];
             rc.obs = laneObs[winner];
             rc.vdClose = anyVdClose;
@@ -588,35 +612,48 @@ PXG_TEST(npSbSb_traverser)
     // ---- GPU run ----
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t CAP = NQ + 32;
-    std::vector<SsbContact> ctInit(CAP);
+    std::vector<F4> f4Init(CAP, F4{ -7.0f, -7.0f, -7.0f, -7.0f });
+    std::vector<PxgDeformablePairInfo> infoInit(CAP, PxgDeformablePairInfo{ ~0ull, ~0ull });
     std::vector<uint32_t> cnt(1, 0);
+    PXG_CHECK(!filters.empty());
     PxgBufferHandle bN = createBufferFrom(dev, nodes);
     PxgBufferHandle bT = createBufferFrom(dev, tets);
     PxgBufferHandle bV = createBufferFrom(dev, verts);
     PxgBufferHandle bH = createBufferFrom(dev, hints);
-    PxgBufferHandle bM = createBufferFrom(dev, v2t0);
-    PxgBufferHandle bF = createBufferFrom(dev, filters);
     PxgBufferHandle bW = createBufferFrom(dev, work);
-    PxgBufferHandle bC = createBufferFrom(dev, ctInit);
+    PxgBufferHandle bF = createBufferFrom(dev, filters);
+    PxgBufferHandle bP = createBufferFrom(dev, f4Init);
+    PxgBufferHandle bNp = createBufferFrom(dev, f4Init);
+    PxgBufferHandle bI = createBufferFrom(dev, infoInit);
     PxgBufferHandle bCc = createBufferFrom(dev, cnt);
 
-    SsbParams prm = { NQ, (uint32_t)filters.size(), CAP, 0 };
+    SsbParams prm = {};
+    prm.numWorkItems = NQ;
+    prm.numFilterPairs = (uint32_t)filters.size();
+    prm.maxContacts = CAP;
+    prm.filterPairs = dev->getBufferDeviceAddress(bF);
+    prm.filterSafeAddr = prm.filterPairs;
+    prm.outPoint = dev->getBufferDeviceAddress(bP);
+    prm.outNormalPen = dev->getBufferDeviceAddress(bNp);
+    prm.outContactInfo = dev->getBufferDeviceAddress(bI);
+    prm.totalContactCount = dev->getBufferDeviceAddress(bCc);
     Kernel k("npSbSb.spv", "ctSbSbQuery",
-             { (uint32_t)sizeof(Bv32Node), 16, 16, 4, 4, 16, (uint32_t)sizeof(SsbWork), (uint32_t)sizeof(SsbContact), 4 },
+             { (uint32_t)sizeof(Bv32Node), 16, 16, 4, (uint32_t)sizeof(SsbWork) },
              sizeof(SsbParams));
-    k.dispatch(NQ, { bN, bT, bV, bH, bM, bF, bW, bC, bCc }, prm);
+    k.dispatch(NQ, { bN, bT, bV, bH, bW }, prm);
     dev->flush();
 
-    const auto gC = downloadBuffer<SsbContact>(dev, bC, CAP);
+    const auto gP = downloadBuffer<F4>(dev, bP, CAP);
+    const auto gNp = downloadBuffer<F4>(dev, bNp, CAP);
+    const auto gI = downloadBuffer<PxgDeformablePairInfo>(dev, bI, CAP);
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCc, 1)[0];
-    dev->destroyBuffer(bN); dev->destroyBuffer(bT); dev->destroyBuffer(bV); dev->destroyBuffer(bH);
-    dev->destroyBuffer(bM); dev->destroyBuffer(bF); dev->destroyBuffer(bW); dev->destroyBuffer(bC);
-    dev->destroyBuffer(bCc);
+    for (PxgBufferHandle h : { bN, bT, bV, bH, bW, bF, bP, bNp, bI, bCc })
+        dev->destroyBuffer(h);
 
-    // group GPU contacts by pairId0 (injective per query)
-    std::map<uint32_t, const SsbContact*> byPair;
+    // group GPU contacts by ref0 (injective per query: every query has its own vertex)
+    std::map<uint64_t, uint32_t> byPair;
     for (uint32_t i = 0; i < gCount && i < CAP; ++i)
-        byPair[gC[i].pairIds.x] = &gC[i];
+        byPair[gI[i].ref0] = i;
 
     size_t mm = 0, checked = 0, skipped = 0;
     size_t refSkippedContacts = 0;
@@ -626,8 +663,7 @@ PXG_TEST(npSbSb_traverser)
         if (skip[q]) { ++skipped; if (refC[q].has) ++refSkippedContacts; continue; }
         ++checked;
         const RefContact& rc = refC[q];
-        const uint32_t pid0 = encodeSb(sbId0, v2t0[work[q].ids.x]);
-        auto it = byPair.find(pid0);
+        auto it = byPair.find(vertRef(sbId0, work[q].ids.x));
         if (rc.has)
         {
             if (rc.tag == 0) ++checkedInsideWin;
@@ -635,21 +671,17 @@ PXG_TEST(npSbSb_traverser)
             if (rc.tag == 2) ++checkedKeptWin;
             if (rc.vdClose) ++checkedVdClose;
             if (it == byPair.end()) { ++mm; continue; }
-            const SsbContact& g = *it->second;
-            if (g.pairIds.y != rc.pairId1 ||
-                !almostEqual(g.normal_pen.w, rc.pen, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP0.x, rc.closestP.x, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP0.y, rc.closestP.y, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP0.z, rc.closestP.z, 1e-4f, 1e-4f) ||
-                !almostEqual(g.normal_pen.x, rc.normal.x, 1e-4f, 1e-4f) ||
-                !almostEqual(g.normal_pen.y, rc.normal.y, 1e-4f, 1e-4f) ||
-                !almostEqual(g.normal_pen.z, rc.normal.z, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP1.x, rc.closestP.x, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP1.y, rc.closestP.y, 1e-4f, 1e-4f) ||
-                !almostEqual(g.closestP1.z, rc.closestP.z, 1e-4f, 1e-4f) ||
-                g.point.x != work[q].point.x ||
-                g.point.y != work[q].point.y ||
-                g.point.z != work[q].point.z) ++mm;
+            const F4& gp = gP[it->second];
+            const F4& gn = gNp[it->second];
+            if (gI[it->second].ref1 != rc.ref1 ||
+                !almostEqual(gn.w, rc.pen, 1e-4f, 1e-4f) ||
+                !almostEqual(gp.x, rc.closestP.x, 1e-4f, 1e-4f) ||
+                !almostEqual(gp.y, rc.closestP.y, 1e-4f, 1e-4f) ||
+                !almostEqual(gp.z, rc.closestP.z, 1e-4f, 1e-4f) ||
+                gp.w != 0.0f ||
+                !almostEqual(gn.x, rc.normal.x, 1e-4f, 1e-4f) ||
+                !almostEqual(gn.y, rc.normal.y, 1e-4f, 1e-4f) ||
+                !almostEqual(gn.z, rc.normal.z, 1e-4f, 1e-4f)) ++mm;
         }
         else if (it != byPair.end()) ++mm;
     }
@@ -658,8 +690,9 @@ PXG_TEST(npSbSb_traverser)
                   "npSbSb: counter %u outside [%zu, %zu]", gCount, contacts - refSkippedContacts,
                   contacts - refSkippedContacts + skipped);
     PXG_CHECK_MSG(checked > NQ * 2 / 3, "npSbSb: too many skipped (%zu)", skipped);
-    PXG_CHECK_MSG(contacts > 15 && hintBlocked > 50 && filtered > 5,
-                  "npSbSb: coverage thin (ct=%zu hint=%zu filt=%zu)", contacts, hintBlocked, filtered);
+    PXG_CHECK_MSG(contacts > 15 && hintBlocked > 50 && filtered > 5 && filteredAny > 2,
+                  "npSbSb: coverage thin (ct=%zu hint=%zu filt=%zu any=%zu)", contacts, hintBlocked, filtered,
+                  filteredAny);
     PXG_CHECK_MSG(insideContacts > 3 && outsideContacts > 10 && vdBlocked > 10 && normReplaced > 3 && normKept > 3,
                   "npSbSb: branch coverage thin (in=%zu out=%zu vd=%zu rep=%zu kept=%zu)",
                   insideContacts, outsideContacts, vdBlocked, normReplaced, normKept);

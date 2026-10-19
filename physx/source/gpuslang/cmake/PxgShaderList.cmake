@@ -351,7 +351,6 @@ pxg_compile_shader(npBv32 ctBv32Query)
 pxg_compile_shader(npMidphaseCvx ctMidphaseCvx)
 pxg_compile_shader(npMidphaseDeform ctClothTri ctSoftbodyTet ctSoftbodyBoxTet)
 pxg_compile_shader(npMidphaseAlloc ctMidphaseAlloc ctCvxTriAccessors)
-pxg_compile_shader(npClothCloth ctClothClothQuery)
 pxg_compile_shader(gridCal ctGridCal)
 # P6.0: PBD particle free-fall bring-up — the first three particle orchestration
 # kernels on the engine ABI (BDA).  Vulkan-only (BDA reads the PxgParticleSystem
@@ -864,7 +863,8 @@ pxg_compile_shader(femClothRigidContactBda cloth_rigidContactPrepareLaunch
 # P7.2 tranche 1: cloth SELF-collision midphase + contact GENERATION on the engine ABI
 # (BDA) — the first tranche of the cloth-fold-on-itself arc.  Both kernels walk the
 # cloth's own BV32 triangle BVH (reused verbatim from the proven npBv32 / npClothCloth
-# ports) reading the PxgFEMCloth descriptor array + the BV32DataPacked nodes through
+# ports; npClothCloth was retired in the 5.12 port) reading the PxgFEMCloth descriptor
+# array + the BV32DataPacked nodes through
 # Ptr<> (BDA, no HLSL cs_6_0 lowering) and lower the warp ballot/shuffle contact-
 # compaction to portable groupshared tile scans, so this shader is deliberately absent
 # from PXG_HLSL_ENTRIES (same precedent as femClothContactGenBda / psContactGenBda).  IS
@@ -963,7 +963,10 @@ pxg_compile_shader(softBodyContactGenBda sb_midphaseGeneratePairsLaunch
                    sb_primitiveContactGenLaunch)
 # P8.2 tranche c: the collision-mesh -> simulation-mesh contact remap and the sorted-order
 # gather.  Both are LIFTS of npSbRemap.slang's unit-tested descriptor-set ports onto the
-# engine BDA ABI; the geometry helpers are copied from it verbatim.
+# engine BDA ABI; the geometry helpers are copied from it verbatim.  (npSbRemap was
+# retired in the 5.12 port: its 5.6.1 semantics are gone and the softBodySimContactRemap*,
+# softBodySimFemContactRemap* and softBodySimReorderPSContacts fixtures cover the engine
+# kernels.)
 # P8.4 tranche b adds sb_fem_contact_remap_to_simLaunch to this file: the
 # DEFORMABLE-vs-DEFORMABLE twin of the remap above, run twice over the same contact array
 # (gridDim.y == 2 selects which half of the pair is remapped).  It shares every helper and
@@ -1318,14 +1321,12 @@ pxg_compile_shader(psDiffuseCollide ctPsDiffuseCollide)
 pxg_compile_shader(fcPrim ctFcPrim)
 pxg_compile_shader(psMeshMid ctPsMeshMid)
 pxg_compile_shader(psHfCollide ctPsHfCollide)
-pxg_compile_shader(fcPrim2 ctFcPrim2)
 pxg_compile_shader(npPolyClip4 ctPolyClip4)
 pxg_compile_shader(fcConvexTri ctFcConvexTri)
 pxg_compile_shader(fcVertexConvex ctFcVertexConvex)
 pxg_compile_shader(fcStaticTriCloth fcStaticTriClothKernel)
 pxg_compile_shader(fcMidphase fmVertexAabb fmSphereTree fmHfBound sbHfBound)
 pxg_compile_shader(npSbPrim sbTetPlane sbEmit sbParticle sbClothVert)
-pxg_compile_shader(npSbRemap rmOther rmFem rmReorder)
 pxg_compile_shader(npCvxHfMid chMidphase sbShrink)
 pxg_compile_shader(npTriPlaneNp tpNarrowphase)
 pxg_compile_shader(npTriHfNp thNarrowphase)

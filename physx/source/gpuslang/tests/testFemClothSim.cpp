@@ -11845,7 +11845,7 @@ static void fillCvxWriter(CvxCoreClothPush& p, const WriterBufs& w)
 // operation for operation so the comparison can be BIT-EXACT.  This TU is built
 // -ffp-contract=off, which is what the shaders' NoContraction stamp matches.
 //
-// NOT the corpus's `computeBarycentric` (fcPrim2.slang:309, fcStaticTriCloth.slang:215):
+// NOT the corpus's `computeBarycentric` (pxgSlangClothTriContact.slang, from femClothPrimitives.cu):
 // those are femClothPrimitives.cu's function, the same Cramer arithmetic plus a
 // [-1e-4, 1+1e-4] acceptance window whose bool gates a contact.  The kernel under
 // test has no such gate, and transcribing the windowed one would import a decision

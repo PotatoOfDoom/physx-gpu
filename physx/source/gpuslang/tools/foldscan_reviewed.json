@@ -3995,51 +3995,6 @@
 "why": "Both operands are loads."
 },
 {
-"file": "psShapeMatchBda.slang",
-"code": "gSmNewCom = gSmNewCom + float3(cx, cy, cz);",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "The CUDA really does add its +0 seed, so this is a genuine 0+x in the twin. But the port cannot fold it. The +0 is stored to groupshared gSmNewCom at :367, and a GroupMemoryBarrierWithGroupSync separates it from a loop whose trip count `passes` comes from runtime data. slangc (F1) and llvmpipe (F3) "
-},
-{
-"file": "psShapeMatchBda.slang",
-"code": "gSmQR0 = gSmQR0 + float3(c0x, c0y, c0z);",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "Same as :393. The +0 seed at :369 goes to groupshared memory before a barrier and a runtime-trip loop, so it cannot be forwarded as a literal. The addend c0* is a blockReduction sum that always gets a +0 padding addend on lane 0's first butterfly step, so it is never -0, and +0 + x == x exactly even"
-},
-{
-"file": "psShapeMatchBda.slang",
-"code": "gSmQR1 = gSmQR1 + float3(c1x, c1y, c1z);",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "Same as :449. The groupshared seed at :370 cannot be forwarded across the barrier and runtime-trip loop, and the reduced addend c1* is never -0, so no fold could change the bits."
-},
-{
-"file": "psShapeMatchBda.slang",
-"code": "gSmQR2 = gSmQR2 + float3(c2x, c2y, c2z);",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "Same as :449. The groupshared seed at :371 cannot be forwarded, and the reduced addend c2* is never -0."
-},
-{
-"file": "psShapeMatchBda.slang",
-"code": "const float3 rigidPos = smQuatRotate(gSmNewRot, localPositions[localOffset].xyz) + gSmNewCom;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "By this point thread 0 has overwritten gSmNewCom with the computed centre of mass c at :407 (before the barrier at :409), and threads read it back from groupshared memory. The literal +0 from :367 can never reach this add, and the scanner only linked them through a flow-insensitive store. The CUDA p"
-},
-{
 "file": "npArtiSleep.slang",
 "code": "sleepLinVelAcc.x += sleepLinVelAccXYZ.x;",
 "kinds": [
@@ -5064,69 +5019,6 @@
 ],
 "verdict": "NOT-A-FOLD",
 "why": "Same as 712."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "return 0.5f * (val0 + val1);",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "val0 is rf.friction = select(elem != 0, loaded, 0.0) from readRigidFriction (a runtime select after inlining, never a literal operand; and on the null path the mode is eMAX, so the literal never feeds the average arm). CUDA performs the same IEEE add."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "const float maxPenBias = max(penBiasClampRigid, penBiasClampFEM);",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "CUDA-SAME",
-"why": "CUDA uses fmaxf."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "relLinDelta = float3(st.linDelta.x - deformableLinDelta.x, st.linDelta.y - deformableLinDelta.y,",
-"kinds": [
-"F2-zero-minus"
-],
-"verdict": "NOT-A-FOLD",
-"why": "st.linDelta is the TGS pool load on this (isTGS) path; its float3(0) seed in readRigidVelocity is overwritten under the same isTGS condition, so after inlining the operand is a phi/select or the load, never a literal +0."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "const float errorBiased = max(maxPenBias, error);",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "Divergent spelling: on a +-0 tie the select returns error, FMax +0. But errorBiased only feeds CN = errorBiased + normalVel, and CN only feeds (CN < 0) (sign-blind) and deltaLambdaN = PxMax(-CN*invDenom, -acc), a select whose +-0 tie always returns the second operand -acc, so CN's zero sign never re"
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "const float errorBiased = max(maxPenBias, error);",
-"kinds": [
-"F4-FMax"
-],
-"verdict": "BENIGN",
-"why": "As 464 (PGS branch)."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "r.accumulatedDeltaLambdaN += r.deltaLambdaN;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "accumulatedDeltaLambdaN is seeded from appliedForceRef = appliedForces[workIndex] (a load at every caller: femClothRigidContactBda.slang:445/606, softBodyRigidContactBda.slang:460/585); deltaLambdaN is the select result. No literal operand."
-},
-{
-"file": "pxgSlangFemRigidContact.slang",
-"code": "r.deltaLambdaT = -min(dLT, combinedFriction * abs(r.deltaLambdaN));",
-"kinds": [
-"F4-FMin"
-],
-"verdict": "BENIGN",
-"why": "Divergent spelling, but dLT = sqrt(..) and combinedFriction*|dLN| are both >= +0 (friction coefficients are non-negative, null path +0), so a tie is +0/+0 and bitwise identical; NaN would need an infinite deltaLambdaN times 0 friction."
 },
 {
 "file": "pxgSlangSdfFind.slang",
@@ -6447,42 +6339,6 @@
 "why": "Divergent spelling (FMax/FMin vs select), but the overlap bound only feeds calcGridHashInBounds after fattenFast (-/+ cDistance): int(floor(v / cellWidth)) maps +0 and -0 to the same cell, so a +/-0 tie cannot change the hash; bounds are finite (no NaN). Output (grid hash / cell range) identical."
 },
 {
-"file": "npPsInflatable.slang",
-"code": "gInfCom0 = gInfCom0 + bx;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "gInfCom0 is GROUPSHARED, zeroed by thread 0 then separated from the add by GroupMemoryBarrierWithGroupSync and a runtime numPasses loop; a shared store is not forwarded across a barrier, so the fadd sees a shared-memory load, not a literal. CUDA does the same +0 + bx on pass 0 and so does the port."
-},
-{
-"file": "npPsInflatable.slang",
-"code": "gInfCom1 = gInfCom1 + by;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "As 324."
-},
-{
-"file": "npPsInflatable.slang",
-"code": "gInfCom2 = gInfCom2 + bz;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "As 324."
-},
-{
-"file": "npPsInflatable.slang",
-"code": "gInfVolume = gInfVolume + blockVolume;",
-"kinds": [
-"F3-zero-add"
-],
-"verdict": "NOT-A-FOLD",
-"why": "As 324 (gInfVolume groupshared, barrier + runtime loop)."
-},
-{
 "file": "femClothMeshVertMidphaseBda.slang",
 "code": "const float3 tMin = min(min(b0, b1), b2);",
 "kinds": [
@@ -7760,15 +7616,6 @@
 ],
 "verdict": "NOT-A-FOLD",
 "why": "Runtime loop; and 0+1 is exact regardless."
-},
-{
-"file": "pxgSlangFemFemAttach.slang",
-"code": "len = clamp(len, minDist, maxDist >= 0.0f ? maxDist : FAC_MAX_F32);",
-"kinds": [
-"F4-FClamp"
-],
-"verdict": "BENIGN",
-"why": "Twin IS a select-clamp. len = relPos.magnitude() is +0 or positive (never -0, never NaN for finite positions). With lo = +-0: PxMax(lo, +0) returns +0 (second) and FMax gives +0 -- same. The only divergent tie is hi == -0 with len == +0 (select keeps +0, FClamp gives -0), which needs a user-supplied"
 },
 {
 "file": "pxgSlangTriBox.slang",

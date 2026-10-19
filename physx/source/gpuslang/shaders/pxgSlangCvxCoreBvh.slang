@@ -219,7 +219,7 @@ float3 cvxBvhTriNormal(float3 scale, float4 scaleRot, float3 v0, float3 v1, floa
 // from cvxCoreClothNpBda by P9.94d so the fixture drives it.
 //
 // TRANSCRIBED FROM PxMathUtils.h, NOT from the corpus's `computeBarycentric`
-// (fcPrim2.slang:309, fcStaticTriCloth.slang:215).  Those are femClothPrimitives.cu's
+// (pxgSlangClothTriContact.slang, from femClothPrimitives.cu).  Those are femClothPrimitives.cu's
 // function: the same Cramer arithmetic plus a [-1e-4, 1+1e-4] acceptance window whose
 // bool result gates a contact.  This call site has no gate and wants the raw
 // coordinates, so lifting one of those and ignoring its return would have imported a

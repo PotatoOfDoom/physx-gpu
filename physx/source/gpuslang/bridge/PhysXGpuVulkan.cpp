@@ -716,7 +716,7 @@ physx::PxPhysXGpu* PxCreatePhysXGpu()
 }
 
 physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& foundation,
-                                                        const physx::PxCudaContextManagerDesc& /*desc*/,
+                                                        const physx::PxCudaContextManagerDesc& desc,
                                                         physx::PxProfilerCallback* profilerCallback,
                                                         bool /*launchSynchronous*/)
 {
@@ -728,6 +728,19 @@ physx::PxCudaContextManager* PxCreateCudaContextManager(physx::PxFoundation& fou
     // every Windows build there is no symbol interposition to paper over that.
     PxSetFoundationInstance(foundation);
     PxSetProfilerCallback(profilerCallback);
+
+    // User allocators return memory that is not a Vulkan buffer: the shim cannot
+    // resolve it to a buffer device address, so the context always allocates
+    // through the Vulkan device (mDeviceAllocatorCallback and
+    // mPinnedHostAllocatorCallback stay NULL).
+    if (desc.deviceAllocator)
+        foundation.error(physx::PxErrorCode::eDEBUG_WARNING, PX_FL,
+                         "PxCreateCudaContextManager: PxCudaContextManagerDesc::deviceAllocator is not supported by "
+                         "the Vulkan PhysXGpu and is ignored; device memory is allocated through Vulkan.");
+    if (desc.pinnedHostAllocator)
+        foundation.error(physx::PxErrorCode::eDEBUG_WARNING, PX_FL,
+                         "PxCreateCudaContextManager: PxCudaContextManagerDesc::pinnedHostAllocator is not supported by "
+                         "the Vulkan PhysXGpu and is ignored; pinned host memory is allocated through Vulkan.");
 
     // desc.deviceOrdinal maps onto the (single) Vulkan device selected at runtime
     // creation.

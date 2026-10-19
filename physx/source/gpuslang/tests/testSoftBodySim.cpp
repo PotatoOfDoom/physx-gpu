@@ -4480,10 +4480,12 @@ static uint64_t sbTetRef(uint32_t softbodyId, uint32_t tet) { return PxgEncodeDe
 // P8.2 tranche c — the collision-mesh -> simulation-mesh contact REMAP
 // (softbodyPrimitives.cu:2134) and the sorted-order GATHER (:1695).
 //
-// Both are lifts of npSbRemap.slang's unit-tested descriptor-set ports onto the BDA ABI,
-// so the arithmetic is already covered there.  What these fixtures pin is what the LIFT
-// can get wrong: the push-blob layout, the optional prevContactCount pointer, the grid
-// stride, and the three tie-breaks that are easy to lose in translation.
+// Both are lifts of npSbRemap.slang's descriptor-set ports onto the BDA ABI.  That
+// Phase-1 fixture was retired in the 5.12 port (its 5.6.1 remap semantics are gone); the
+// 5.12 arithmetic is pinned by softBodySimContactRemapZeroSign's host mirror of both
+// kernels.  What these fixtures pin is what the LIFT can get wrong: the push-blob layout,
+// the optional prevContactCount pointer, the grid stride, the three tie-breaks that are
+// easy to lose in translation, and the batch loop's exit at the first containing batch.
 //
 // The remap fixture uses THREE sim tets behind one collision tet:
 //   candidate 0  does NOT contain the point, nearest distance LARGE
@@ -4687,6 +4689,11 @@ PXG_TEST(softBodySimContactRemapToSim)
 //   contact 2 -> collision tet 2, candidates [50, 54): TWO CONTAINING candidates, a unit
 //     tet and a double-size tet sharing the origin corner.  Both contain the point, so
 //     only the ballot's first-hit guard decides, and the two give different barycentrics.
+//   contact 3 -> collision tet 3, candidates [54, 88): the same two containing tets, but
+//     in DIFFERENT 32-wide batches (candidate 2 and candidate 33).  The batch loop must stop
+//     at the first batch with any hit, so the later batch's containing tet never gets to
+//     overwrite the result -- the observation the retired Phase-1 npSbRemap fixture carried
+//     and this one did not (a mutant dropping the `!valid` exit survived it).
 //
 // The ties are exact because the tied candidates are the SAME tet duplicated at different
 // sim indices -- identical coordinates run identical arithmetic, so the comparison is
@@ -4720,13 +4727,20 @@ PXG_TEST(softBodySimContactRemapTieBreaks)
     pushTet(0.0f, 0.0f, 0.0f, 2.0f);                   // tet 51: double-size, also contains
     pushTet(20.0f, 0.0f, 0.0f, 1.0f);                  // tet 52: far
     pushTet(30.0f, 0.0f, 0.0f, 1.0f);                  // tet 53: far
-    PXG_CHECK_MSG(simTets.size() == 54u, "the tie-break fixture needs 54 sim tets, built %zu",
+    const uint32_t kBatch0Hit = 56u, kBatch1Hit = 87u; // candidates 2 and 33 of collision tet 3
+    for (uint32_t t = 54u; t < 88u; ++t)
+    {
+        if (t == kBatch0Hit) pushTet(0.0f, 0.0f, 0.0f, 1.0f);        // unit tet: contains
+        else if (t == kBatch1Hit) pushTet(0.0f, 0.0f, 0.0f, 2.0f);   // double-size: contains too
+        else pushTet(20.0f + float(t), 0.0f, 0.0f, 1.0f);            // far
+    }
+    PXG_CHECK_MSG(simTets.size() == 88u, "the tie-break fixture needs 88 sim tets, built %zu",
                   simTets.size());
 
-    // collision tet 0 -> [0,40), collision tet 1 -> [40,50), collision tet 2 -> [50,54).
-    std::vector<uint32_t> remapColToSim(54);
-    for (uint32_t i = 0; i < 54u; ++i) remapColToSim[i] = i;
-    std::vector<uint32_t> accumRemap = { 40u, 50u, 54u, 54u };   // inclusive prefix sum
+    // collision tet 0 -> [0,40), 1 -> [40,50), 2 -> [50,54), 3 -> [54,88).
+    std::vector<uint32_t> remapColToSim(88);
+    for (uint32_t i = 0; i < 88u; ++i) remapColToSim[i] = i;
+    std::vector<uint32_t> accumRemap = { 40u, 50u, 54u, 88u };   // inclusive prefix sum
 
     DevBuf bSv = makeDev(dev, simVerts), bSt = makeDev(dev, simTets);
     DevBuf bRc = makeDev(dev, remapColToSim), bAr = makeDev(dev, accumRemap);
@@ -4743,17 +4757,18 @@ PXG_TEST(softBodySimContactRemapTieBreaks)
     std::vector<F4> points = { { 0.0f, 0.0f, 0.0f, 0.0f },      // outside every candidate
                                { 0.0f, 0.0f, 0.0f, 0.0f },
                                { 0.1f, 0.1f, 0.1f, 0.0f },      // inside tets 50 AND 51
-                               { 0, 0, 0, 0 } };
+                               { 0.1f, 0.1f, 0.1f, 0.0f } };    // inside tets 56 AND 87
     DevBuf bPt = makeDev(dev, points);
     std::vector<PxgDeformablePairInfo> infos(4);
     std::memset(infos.data(), 0, infos.size() * sizeof(PxgDeformablePairInfo));
     infos[0].ref1 = sbTetRef(0u, 0u);   // softbody 0, collision tet 0
     infos[1].ref1 = sbTetRef(0u, 1u);   // softbody 0, collision tet 1
     infos[2].ref1 = sbTetRef(0u, 2u);   // softbody 0, collision tet 2
+    infos[3].ref1 = sbTetRef(0u, 3u);   // softbody 0, collision tet 3
     DevBuf bInfo = makeDev(dev, infos);
     std::vector<F4> bary(4, F4{ -1, -1, -1, -1 });
     DevBuf bBary = makeDev(dev, bary);
-    std::vector<uint32_t> count = { 3u, 0u, 0u, 0u };
+    std::vector<uint32_t> count = { 4u, 0u, 0u, 0u };
     DevBuf bCount = makeDev(dev, count);
 
     SbRemapPush push = {};
@@ -4771,7 +4786,7 @@ PXG_TEST(softBodySimContactRemapTieBreaks)
 
     const auto gInfo = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, 4);
     const auto gBary = downloadBuffer<F4>(dev, bBary.h, 4);
-    for (uint32_t i = 0; i < 3u; ++i)
+    for (uint32_t i = 0; i < 4u; ++i)
         std::printf("  contact %u -> sim tet %u, bary(%.4f, %.4f, %.4f, %.4f)\n",
                     i, PxgGetDeformableFeatureId(gInfo[i].ref1), gBary[i].x, gBary[i].y, gBary[i].z, gBary[i].w);
 
@@ -4792,6 +4807,10 @@ PXG_TEST(softBodySimContactRemapTieBreaks)
                   std::fabs(gBary[2].z - 0.1f) < 1e-4f && std::fabs(gBary[2].w - 0.1f) < 1e-4f,
                   "the containing tet's barycentric must be (0.7, 0.1, 0.1, 0.1), got "
                   "(%.4f, %.4f, %.4f, %.4f)", gBary[2].x, gBary[2].y, gBary[2].z, gBary[2].w);
+    PXG_CHECK_MSG(gInfo[3].ref1 == sbTetRef(0u, kBatch0Hit) && std::fabs(gBary[3].x - 0.7f) < 1e-4f,
+                  "a containing candidate in batch 0 (tet %u) must end the search; the one in "
+                  "batch 1 (tet %u) must not overwrite it -- got tet %u, bary.x %.4f",
+                  kBatch0Hit, kBatch1Hit, PxgGetDeformableFeatureId(gInfo[3].ref1), gBary[3].x);
 
     // ---- the count clamp must actually BOUND the loop, not just write itself back ----
     // The clamp write-back alone is checked in the fixture above.  What is checked here is
@@ -6297,6 +6316,102 @@ PXG_TEST(softBodySimFemContactRemap)
 
     for (DevBuf* b : { &bSv, &bSt, &bRc, &bAr, &bVr, &bVb, &bDesc, &bInfo, &bPt, &bB0, &bB1, &bCount, &bPrev0 })
         dev->destroyBuffer(b->h);
+}
+
+// ===========================================================================
+// sb_fem_contact_remap_to_simLaunch: the batch loop ends at the FIRST 32-wide batch
+// with any containing candidate.  Two containing sim tets sit in different batches of one
+// collision tet's candidate range (candidates 2 and 33); only the first may win.  The
+// fixture above has three candidates per collision tet, one batch, so a port that kept
+// searching past a hit -- and let a later batch overwrite it -- passed it.  The retired
+// Phase-1 npSbRemap fixture carried this observation for its descriptor-set copy; this is
+// it on the engine kernel (softBodySimContactRemapTieBreaks has the same case for the
+// sibling sb_other_contact_remap_to_simLaunch).
+// ===========================================================================
+PXG_TEST(softBodySimFemContactRemapBatchBreak)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<F4> simVerts;
+    std::vector<TetIdx4> simTets;
+    auto pushTet = [&](float ox, float s) {
+        const uint32_t base = uint32_t(simVerts.size());
+        simVerts.push_back(F4{ ox, 0.0f, 0.0f, 1.0f });
+        simVerts.push_back(F4{ ox + s, 0.0f, 0.0f, 1.0f });
+        simVerts.push_back(F4{ ox, s, 0.0f, 1.0f });
+        simVerts.push_back(F4{ ox, 0.0f, s, 1.0f });
+        simTets.push_back(TetIdx4{ base, base + 1u, base + 2u, base + 3u });
+    };
+    const uint32_t NB = 34u, kHit0 = 2u, kHit1 = 33u;
+    for (uint32_t t = 0; t < NB; ++t)
+    {
+        if (t == kHit0) pushTet(0.0f, 1.0f);          // unit tet at the origin: contains
+        else if (t == kHit1) pushTet(0.0f, 2.0f);     // double size: contains as well
+        else pushTet(10.0f + float(t), 1.0f);         // far
+    }
+    std::vector<uint32_t> remapColToSim(NB);
+    for (uint32_t i = 0; i < NB; ++i) remapColToSim[i] = i;
+    std::vector<uint32_t> accumRemap = { NB, NB };        // collision tet 0 -> [0, 34)
+    std::vector<uint32_t> vertRemap = { 0u, 0u };
+    std::vector<F4> vertBary = { F4{ 1, 0, 0, 0 }, F4{ 1, 0, 0, 0 } };
+
+    DevBuf bSv = makeDev(dev, simVerts), bSt = makeDev(dev, simTets);
+    DevBuf bRc = makeDev(dev, remapColToSim), bAr = makeDev(dev, accumRemap);
+    DevBuf bVr = makeDev(dev, vertRemap), bVb = makeDev(dev, vertBary);
+    if (!bSv.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bSt.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSv.addr));
+    sb.mTetsRemapColToSim = reinterpret_cast<PxU32*>(size_t(bRc.addr));
+    sb.mTetsAccumulatedRemapColToSim = reinterpret_cast<PxU32*>(size_t(bAr.addr));
+    sb.mVertsRemapInGridModel = reinterpret_cast<PxU32*>(size_t(bVr.addr));
+    sb.mVertsBarycentricInGridModel = reinterpret_cast<float4*>(size_t(bVb.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgDeformablePairInfo> infos(2);
+    std::memset(infos.data(), 0, infos.size() * sizeof(PxgDeformablePairInfo));
+    infos[0].ref0 = PxgEncodeDeformableVertex(0u, 0u);
+    infos[0].ref1 = PxgEncodeDeformableTetrahedron(0u, 0u);
+    DevBuf bInfo = makeDev(dev, infos);
+    std::vector<F4> points = { { 0.1f, 0.1f, 0.1f, 0.0f }, { 0, 0, 0, 0 } };   // inside both
+    DevBuf bPt = makeDev(dev, points);
+    const F4 SENT = { -7.0f, -7.0f, -7.0f, -7.0f };
+    std::vector<F4> bary(2, SENT);
+    DevBuf bB0 = makeDev(dev, bary), bB1 = makeDev(dev, bary);
+    std::vector<uint32_t> count = { 1u, 0u, 0u, 0u }, prevZero = { 0u, 0u, 0u, 0u };
+    DevBuf bCount = makeDev(dev, count), bPrev0 = makeDev(dev, prevZero);
+
+    SbFemRemapPush push = {};
+    push.softbodies = bDesc.addr;
+    push.point = bPt.addr;
+    push.outBarycentric0 = bB0.addr;
+    push.outBarycentric1 = bB1.addr;
+    push.outContactInfo = bInfo.addr;
+    push.totalContactCount = bCount.addr;
+    push.prevContactCount = bPrev0.addr;
+    push.maxNbContacts = 64u;
+    // gridY = 1: row 0 only, the side-1 search this case is about.
+    Kernel("softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch", {}, sizeof(SbFemRemapPush))
+        .dispatch(1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gInfo = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, 2);
+    const auto g1 = downloadBuffer<F4>(dev, bB1.h, 2);
+    std::printf("  contact 0 -> sim tet %u, bary1(%.4f, %.4f, %.4f, %.4f)\n",
+                PxgGetDeformableFeatureId(gInfo[0].ref1), g1[0].x, g1[0].y, g1[0].z, g1[0].w);
+    // tet 2 (unit) gives (0.7, 0.1, 0.1, 0.1); tet 33 (double) would give (0.85, 0.05, 0.05, 0.05).
+    PXG_CHECK_MSG(gInfo[0].ref1 == PxgEncodeDeformableTetrahedron(0u, kHit0) &&
+                  std::fabs(g1[0].x - 0.7f) < 1e-4f && std::fabs(g1[0].y - 0.1f) < 1e-4f,
+                  "a containing candidate in batch 0 (sim tet %u) must end the search; the one in "
+                  "batch 1 (sim tet %u) must not overwrite it -- got tet %u, bary1.x %.4f",
+                  kHit0, kHit1, PxgGetDeformableFeatureId(gInfo[0].ref1), g1[0].x);
+
+    for (PxgBufferHandle h : { bSv.h, bSt.h, bRc.h, bAr.h, bVr.h, bVb.h, bDesc.h, bInfo.h, bPt.h,
+                               bB0.h, bB1.h, bCount.h, bPrev0.h })
+        dev->destroyBuffer(h);
 }
 
 // ===========================================================================

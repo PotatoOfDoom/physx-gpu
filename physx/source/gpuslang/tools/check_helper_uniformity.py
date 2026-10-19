@@ -182,7 +182,7 @@ KNOWN_MULTI = {
     "getNormalizedQ": "same three spellings as getNormalized.",
     "computeBarycentric":
         "with and without the eps acceptance predicate.  Several call sites discard the "
-        "engine's bool (fcStaticTriCloth.slang:214 says so), and those copies return the "
+        "engine's bool (pxgSlangClothTriContact.slang says so), and those copies return the "
         "float4 alone; the barycentric arithmetic itself is identical.",
     "computeTetBarycentric":
         "as computeBarycentric, plus out-parameter versus returned float4.",

@@ -43,8 +43,9 @@
 //   contact arrays into the order the radix sort produced, so the solve can walk contacts
 //   grouped by rigid body.
 //
-// THIS IS A LIFT, NOT A FRESH PORT.  npSbRemap.slang already carries unit-tested
-// descriptor-set ports of both (rmOther / rmReorder, with testNpSbRemap.cpp), and the
+// THIS IS A LIFT, NOT A FRESH PORT.  npSbRemap.slang carried unit-tested
+// descriptor-set ports of both (rmOther / rmReorder, with testNpSbRemap.cpp; both retired
+// in the 5.12 port, see softBodySimContactRemapTieBreaks), and the
 // geometry helpers below — closestPtPointTriangle2, Gu::closestPtPointTetrahedron,
 // computeTetBarycentric — are copied from it VERBATIM.  What changes is only how the data
 // is reached: Ptr<> reads off a push-constant blob instead of bound buffers.

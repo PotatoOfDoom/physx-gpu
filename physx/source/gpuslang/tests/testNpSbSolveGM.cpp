@@ -90,7 +90,7 @@ static void computeDLXG(V3& a0, V3& a1, V3& a2, float& lambda,
                         float C, V3 dFc0, V3 dFc1, V3 dFc2,
                         V3 q0, V3 q1, V3 q2,
                         const F4& v0, const F4& v1, const F4& v2, const F4& v3,
-                        float alphaTilde, float dtInv, float damping, float scaledDamping)
+                        float alphaTilde, float dtInv, float damping)
 {
     const V3 r0 = V3{ q0.x, q1.x, q2.x };
     const V3 r1 = V3{ q0.y, q1.y, q2.y };
@@ -123,7 +123,7 @@ static void computeDLXG(V3& a0, V3& a1, V3& a2, float& lambda,
         }
         const float dampDot = dot3(dCdx0, V3{ v0.x, v0.y, v0.z }) + dot3(dCdx1, V3{ v1.x, v1.y, v1.z })
                             + dot3(dCdx2, V3{ v2.x, v2.y, v2.z }) + dot3(dCdx3, V3{ v3.x, v3.y, v3.z });
-        deltaLambda = (-C - alphaTilde * lambda - scaledDamping * dampDot) / denom;
+        deltaLambda = (-C - alphaTilde * lambda - damping * dampDot) / denom;
     }
 
     lambda = lambda + deltaLambda;
@@ -137,7 +137,6 @@ static void refGm(const GmIn& s, GmOut& o)
     const V3 u1 = V3{ s.gu1.x, s.gu1.y, s.gu1.z }, u2 = V3{ s.gu2.x, s.gu2.y, s.gu2.z }, u3 = V3{ s.gu3.x, s.gu3.y, s.gu3.z };
     const V3 Q0 = V3{ s.qc0.x, s.qc0.y, s.qc0.z }, Q1 = V3{ s.qc1.x, s.qc1.y, s.qc1.z }, Q2 = V3{ s.qc2.x, s.qc2.y, s.qc2.z };
     const float youngs = s.mat.x, poissons = s.mat.y;
-    const uint32_t dampingScaleU16 = f2u(s.mat.w);
     const float invDtSq = s.prm.x, invDt = s.prm.y;
     const bool isTGS = f2u(s.prm.z) == 1u;
     const bool isNeoHookean = f2u(s.prm.w) == 1u;
@@ -249,7 +248,6 @@ static void refGm(const GmIn& s, GmOut& o)
         const float alphaTilde0 = invDtSq / (2.0f * mu * volume);
 
         float damping = s.mat.z;
-        float scaledDamping = damping * (float(dampingScaleU16) * (1.0f / 65535.0f));
 
         float lambdasX = isTGS ? 0.f : mulX;
         float lambdasY = isTGS ? 0.f : mulY;
@@ -263,7 +261,7 @@ static void refGm(const GmIn& s, GmOut& o)
             const float inv = 1.0f / arapC;
             const V3 dF0 = muls(t0, inv), dF1 = muls(t1, inv), dF2 = muls(t2, inv);
             computeDLXG(dl0, dl1, dl2, lambdasX, arapC, dF0, dF1, dF2,
-                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde0, invDt, damping, scaledDamping);
+                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde0, invDt, damping);
         }
 
         const V3 dx0 = muls(neg(add(add(dl0, dl1), dl2)), s.v0.w);
@@ -291,7 +289,6 @@ static void refGm(const GmIn& s, GmOut& o)
             }
 
             damping *= ratio;
-            scaledDamping *= ratio;
 
             // volume_constraint
             const float detF = dot3(F0, cross3(F1, F2));
@@ -300,7 +297,7 @@ static void refGm(const GmIn& s, GmOut& o)
             const V3 dF1 = cross3(F2, F0);
             const V3 dF2 = cross3(F0, F1);
             computeDLXG(dl0, dl1, dl2, lambdasY, Cv, dF0, dF1, dF2,
-                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde1, invDt, damping, scaledDamping);
+                        Q0, Q1, Q2, s.v0, s.v1, s.v2, s.v3, alphaTilde1, invDt, damping);
         }
 
         if (!isTGS)
@@ -353,7 +350,8 @@ PXG_TEST(npSbSolveGM)
             s.quat = F4{ qx, qy, qz, qw };
         }
         const uint32_t dampScale = rng() % 65536u;
-        s.mat = F4{ rf(1e4f, 1e8f), rf(0.f, 0.49f), rf(0.f, 2.f), u2f(dampScale) };  // youngs, poissons, damping, dampingScale
+        // mat.w carried the 5.6.1 dampingScale; 5.12 has none and the shader ignores the slot.
+        s.mat = F4{ rf(1e4f, 1e8f), rf(0.f, 0.49f), rf(0.f, 2.f), u2f(dampScale) };  // youngs, poissons, damping, (unused)
         const float invDt = rf(10.f, 200.f);
         const uint32_t isTGS = i % 2u;
         const uint32_t isNeo = (i / 2u) % 2u;

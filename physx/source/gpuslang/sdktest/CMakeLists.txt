@@ -75,20 +75,20 @@ target_include_directories(physx-sdk PUBLIC
     ${PXROOT}/include/pvd
     ${PXROOT}/include/solver
     ${PXROOT}/include/task
-    ${PXROOT}/include/vehicle2
-    ${PXROOT}/include/vehicle2/braking
-    ${PXROOT}/include/vehicle2/commands
-    ${PXROOT}/include/vehicle2/drivetrain
-    ${PXROOT}/include/vehicle2/physxActor
-    ${PXROOT}/include/vehicle2/physxConstraints
-    ${PXROOT}/include/vehicle2/physxRoadGeometry
-    ${PXROOT}/include/vehicle2/pvd
-    ${PXROOT}/include/vehicle2/rigidBody
-    ${PXROOT}/include/vehicle2/roadGeometry
-    ${PXROOT}/include/vehicle2/steering
-    ${PXROOT}/include/vehicle2/suspension
-    ${PXROOT}/include/vehicle2/tire
-    ${PXROOT}/include/vehicle2/wheel
+    ${PXROOT}/include/vehicle
+    ${PXROOT}/include/vehicle/braking
+    ${PXROOT}/include/vehicle/commands
+    ${PXROOT}/include/vehicle/drivetrain
+    ${PXROOT}/include/vehicle/physxActor
+    ${PXROOT}/include/vehicle/physxConstraints
+    ${PXROOT}/include/vehicle/physxRoadGeometry
+    ${PXROOT}/include/vehicle/pvd
+    ${PXROOT}/include/vehicle/rigidBody
+    ${PXROOT}/include/vehicle/roadGeometry
+    ${PXROOT}/include/vehicle/steering
+    ${PXROOT}/include/vehicle/suspension
+    ${PXROOT}/include/vehicle/tire
+    ${PXROOT}/include/vehicle/wheel
     ${SRC}/common/include/omnipvd
     ${SRC}/common/include/windows
     ${SRC}/common/src
@@ -134,7 +134,6 @@ target_include_directories(physx-sdk PUBLIC
     ${SRC}/physx/src/omnipvd
     ${SRC}/physx/src/opensource/cudamanager/include
     ${SRC}/physxcharacterkinematic/src
-    ${SRC}/physxcooking/src
     ${SRC}/physxextensions/src
     ${SRC}/physxextensions/src/omnipvd
     ${SRC}/physxextensions/src/serialization

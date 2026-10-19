@@ -26,82 +26,60 @@
 
 // fcStaticTriCloth.slang
 //
-// Slang port of the static-triangle vs cloth-triangle contact path of
-// femClothPrimitives.cu — the shared core of cloth_meshContactGenLaunch
-// and cloth_heightfieldContactGenLaunch — plus the per-vertex box path
-// of cloth_boxVertexContactGenLaunch:
+// Fixture harness for the static-triangle vs cloth-triangle contact path of
+// femClothPrimitives.cu (PhysX 5.12) -- the shared core of
+// cloth_meshContactGenLaunch and cloth_heightfieldContactGenLaunch -- plus the
+// per-vertex box path of cloth_boxVertexContactGenLaunch.  One case per lane,
+// driven by testFcStaticTriCloth.cpp's random battery against a CPU
+// transcription.
+//
+// WHAT RUNS HERE IS THE ENGINE'S CODE.  The clipping core is
+// pxgSlangClothTriContact (staticTriangleVsClothCollision, the module
+// femClothMeshContactGenBda and femClothHfContactGenBda import), the box query
+// is pxgSlangSphereBox, the filter is pxgSlangDefFilter and the writer is
+// pxgSlangDeformableWriters' PxgRigidDbContactWriter.  This file only carries
+// the per-case glue the engine kernels wrap around them, so the battery's
+// hundreds of trim / averaging-band / degenerate cases land on the modules the
+// engine ships, not on a copy.  (Until the 5.12 port this shader carried its
+// own transcription of the core plus the 5.6.1 PxgRigidFilterPair filter and
+// PxgFEMContactWriter.)
 //
 // MODE 0 (cloth_meshContactGenLaunch per-pair core):
-// - the all-three-verts filter skip: the triangle is dropped only when
-//   find(filterPairs, rigidId, PxEncodeClothIndex(clothId, v)) hits for
-//   ALL THREE cloth triangle vertices (same 3-key PxgRigidFilterPair
-//   binary search as fcVertexConvex.slang, query index2 = 0);
+// - the 5.12 filter: ONE exact search of the cloth's mRigidSurfaceFilterPairs
+//   for (PxgEncodeRigidFilterRef(rigidId, rigidCacheRef),
+//   PxgEncodeDeformableTriangle(clothId, triangleIdx)) --
+//   findRigidSurfaceTriangleFilter (5.6.1 needed all three cloth VERTICES
+//   filtered);
 // - the static mesh triangle brought into cloth space:
 //   vertex2Shape(triV, trimeshScale) then trimeshToClothTransform =
 //   clothTransform.transformInv(trimeshToWorld) applied to each vertex;
-// - staticTriangleVsClothCollision:
-//   * convexPoly[8] seeded with the three CLOTH triangle positions
-//     (cloth-local mPosition_InvMass values, used untransformed);
-//   * fixNormal = getNormalized((b0-a0) x (c0-a0)) of the STATIC
-//     triangle, staticTrianglePlane = PxPlane(localA0, fixNormal)
-//     (d = -p.n; distance = n.p + d);
-//   * trimTriangleByTriangle (the 5-plane, 8-element variant): its OWN
-//     normal n = cross(...) with PxVec3::normalizeSafe (n left UNCHANGED
-//     below 1e-20); three edge planes createEdgePlane(n, e0, e1) with
-//     n_e = getNormalized((e1-e0) x n), plus the two +-cDistance slab
-//     planes PxPlane(triA +- cDistance*n, +-n).  Each trim() clips the
-//     loop in place: points STRICTLY outside (distance > 0) are removed;
-//     the walk records the first two sign-change edges (changeA/changeB),
-//     lerps intersection points by |distA|/(|distA|+|distB|), and
-//     rebuilds the loop — including the in-place insert() branch when
-//     the intersection lands on the still-unshifted index — loops with
-//     < 3 points pass through unchanged, and a crossing-free all-outside
-//     loop collapses to 0;
-//   * getDeepestPointSimplified with tolerance 0.01*cDistance: a running
-//     min over plane.distance with a +-tolerance tie band — a strictly
-//     deeper point (d < minDist - tol) RESTARTS the average, a near-tie
-//     (d < minDist + tol) ACCUMULATES into the returned average without
-//     updating minDist.  (The CUDA stores d in a double; both compare
-//     operands are exactly-widened floats, so float compares are
-//     bit-identical — ported in float.)  A fully clipped-away polygon
-//     leaves minDist at 1e9 => no contact (the 0/count NaN is unused);
-//   * hasContact = sep < cDistance STRICT; on contact: computeBarycentric
-//     of the deepest point in the CLOTH triangle (bary written even when
-//     outside the eps window; the bool is unused here), position =
-//     clothTransform.transform(deepestPoint), normal =
-//     clothTransform.rotate(fixNormal), separation = sep;
-// - the write: globalScanExclusiveSingleWarp — one ballot over the warp,
+// - staticTriangleVsClothCollision (the convexPoly seeded with the cloth
+//   triangle, the static triangle's plane, trimTriangleByTriangle's 5-plane
+//   clip with the in-place insert branch, getDeepestPointSimplified's
+//   +-0.01*cDistance averaging band, hasContact = sep < cDistance STRICT);
+//   see pxgSlangClothTriContact for the per-step notes;
+// - the write: globalScanExclusiveSingleWarp -- one ballot over the warp,
 //   exclusive-popc lane offsets, a SINGLE lane-0 atomicAdd reservation
-//   (skipped when the warp has no contacts) — then capacity-gated
-//   PxgFEMContactWriter::writeRigidVsDeformableContact32: point
-//   (w = restDistance), normalPen (w = separation), barycentric, info
-//   pairInd0 = rigidId, pairInd1 = PxEncodeClothIndex(clothId,
-//   clothTriangleIdx) — a TRIANGLE element id — info fourth dword =
-//   rigidMaterialIndex with the isInCollision bit 31 cleared, and the
-//   32-bit sort lane: contactSortedByX[index] = PxU32(rigidId.getInd())
-//   (low dword only), contactIndexSortedByX[index] = index.  The 64-bit
-//   contactByX/tempContactByX keys are NOT written by this variant.
+//   (skipped when the warp has no contacts) -- then
+//   PxgRigidDbContactWriter::writeSurfaceContact: point (w = restDistance),
+//   normalPen (w = separation), barycentric, pair info (rigidId.getInd(),
+//   PxgEncodeDeformableTriangle(clothId, triangleIdx)), the PxU16 rigid
+//   material, and the rigid sort key (contactByRigid = the node index,
+//   tempContactByRigid = its low word, contactIndexSortedByRigid = index).
 //
 // MODE 1 (cloth_boxVertexContactGenLaunch per-vertex core):
-// - single-vertex filter skip (one find());
-// - spherebox with sphereRadius = 0 (sphereCollision.cuh, the
-//   PxVec3-origin variant): the cloth vertex clamped into the box in box
-//   space; inside-the-box picks the min-distance face (x-first <= tie
-//   order) with pen = -distToSurface - 0, outside normalizes the
-//   center-to-clamp vector with pen = |v|; both rotate the normal to
-//   world; gate sqInflatedSum > lengthSq STRICT (inflation = 0 +
-//   contactDist);
-// - contact point = clothP - pen * normal, w = restDistance, barycentric
-//   (0, 0, 0, 1) = VERTEX marker, pairInd1 = PxEncodeClothIndex(clothId,
-//   vertexIdx); same ballot + single-reservation slot packing (the CUDA
-//   uses an explicit __ballot_sync/warpScanExclusive/lane-0 atomicAdd —
-//   identical semantics), but through the 64-bit-key
-//   writeRigidVsDeformableContact (contactByX = rigidId u64,
-//   tempContactByX = its low dword, contactIndexSortedByX = index).
+// - the 5.12 filter: findRigidSurfaceVertexFilter, (rigid filter ref,
+//   PxgEncodeDeformableVertex(clothId, vertexIdx));
+// - spherebox with sphereRadius = 0 (pxgSlangSphereBox);
+// - contact point = clothP - pen * normal, w = restDistance; the same ballot +
+//   single-reservation slot packing, then the VERTEX overload of
+//   writeSurfaceContact: no barycentric is written (5.6.1 wrote the
+//   (0, 0, 0, 1) vertex marker), pair info (rigid, vertex ref), material,
+//   sort key.
 //
 // KNOWN LIMITS (verified textually, not pinnable by tests): the
 // +cDistance slab plane in trimTriangleByTriangle is OUTPUT-NEUTRAL
-// redundancy — any surviving deepest point already satisfies
+// redundancy -- any surviving deepest point already satisfies
 // sep <= cDistance, and everything the slab would remove is rejected by
 // the sep < cDistance gate (or never enters the +-0.01*cDistance
 // averaging band of a deeper point); only cases with sep inside that
@@ -109,11 +87,10 @@
 // boundary.  The -cDistance slab IS live (it clamps deep penetration)
 // and is pinned by the deep-penetration fixtures.  The normalizeSafe
 // (trimTriangleByTriangle) vs getNormalized (fixNormal) distinction is
-// pinnable only for 0 < |cross| < 1e-20 — a subnormal window that cannot
-// survive the O(1) vertex transform chain (sub-ulp vertex differences
-// collapse to exact zero, where both functions return the same zero) —
-// so it is verified textually; the exact-zero degenerate path (zero
-// normal, zero planes, centroid contact) IS pinned by fixtures.
+// pinnable only for 0 < |cross| < 1e-20 -- a subnormal window that cannot
+// survive the O(1) vertex transform chain -- so it is verified textually;
+// the exact-zero degenerate path (zero normal, zero planes, centroid
+// contact) IS pinned by fixtures.
 //
 // WARP SERIALIZATION: both launches are data-parallel one-CASE-per-thread
 // kernels whose only cross-lane effect is the slot-packing ballot; a
@@ -121,37 +98,33 @@
 // order = ascending case index within the batch, one reservation per
 // batch), which is output-identical per the established doctrine.
 //
-// Engine glue not ported (documented): LoadShapePair/transform caches,
-// the shape0/shape1 cloth-identification branch of
-// cloth_meshContactGenLaunch (either shape order resolved via
-// particleOrSoftbodyId != 0xffffffff — cases carry the resolved roles),
-// PxgFEMCloth loads, the trimesh blob walk (uint4 header + BV32 node
-// skip to verts/indices — cases carry the triangle verts directly), the
-// pair-stack iteration and the stackSizeNeededOnDevice atomicMax.
-// The heightfield flavour cloth_heightfieldContactGenLaunch differs from
-// mode 0 only upstream of this core: the static triangle comes from
-// getTriangle (hf sample decode — ported/tested in npHfTriangle.slang,
-// tranche 60), there is NO filter skip and no vertex2Shape, and the
-// hf->cloth transform is built the same way — documented as composition
-// glue.  Two sibling kernels are DEAD upstream and documented, not
-// ported: cloth_meshVertexContactGenLaunch and
-// cloth_heightfieldVertexContactGenLaunch both declare
-// `bool hasContacts = false;` and the only assignment is commented out
-// (`//hasContacts = true;` inside the accept gate), so their ballot is
-// always 0 and their writers are unreachable.  (Their bodies also carry
-// pre-dead quirks: p0 and p1 load the SAME position array, pen is
-// computed via sqrt then immediately redefined as ap1.n, and the
-// backface test dots a mesh-VERTEX-space triangle normal against a
-// WORLD-space direction.)
+// Engine glue not reproduced (documented): LoadShapePair/transform caches,
+// the shape0/shape1 cloth-identification branch (cases carry the resolved
+// roles), PxgFEMCloth loads (the filter list is passed directly), the trimesh
+// blob walk, the pair-stack iteration and the stackSizeNeededOnDevice
+// atomicMax -- femClothSimMeshContactGen and femClothSimBoxVertContactGen
+// drive those on the engine kernels.  The heightfield flavour
+// cloth_heightfieldContactGenLaunch differs from mode 0 only upstream of
+// this core (getTriangle, no filter, no vertex2Shape).
 
 import pxgSlangCommon;
-import pxgSlangSphereBox;   // P9.15a: sphereboxNormalPen, lifted out of this file
+import pxgSlangSphereBox;          // sphereboxNormalPen (the engine's box query)
+import pxgSlangClothTriContact;    // staticTriangleVsClothCollision (the engine's clipping core)
+import pxgSlangDeformableRef;      // PxgEncodeDeformableTriangle / Vertex
+import pxgSlangDefFilter;          // findRigidSurfaceTriangleFilter / VertexFilter
+import pxgSlangDeformableWriters;  // PxgRigidDbContactWriterGpu
 
-static const uint PXG_BITSHIFT_ELEMENT_ID = 20; // PxgSimulationCoreDesc.h
-static const uint COLLISION_FLAG_MASK = 1u << 31;
-static const float PX_NORMALIZATION_EPSILON = 1e-20f;
-
-struct FstParams { uint numCases; uint maxContacts; uint nbFilterPairs; uint mode; }
+// The filter list and the writer's streams are device addresses (BDA), the way
+// the engine kernels read them from the PxgFEMCloth and the writer.
+struct FstParams
+{
+    uint numCases; uint maxContacts; uint nbFilterPairs; uint mode;
+    uint64_t filterPairs;       // PxgDeformablePairInfo*, sorted
+    uint64_t filterSafeAddr;    // any mapped address, read in place of a NULL list
+    // PxgRigidDbContactWriter
+    uint64_t outPoint, outNormalPen, outBarycentric, outContactInfo, outRigidMaterialIndex;
+    uint64_t totalContactCount, contactByRigid, tempContactByRigid, contactIndexSortedByRigid;
+}
 
 struct FstCase
 {
@@ -166,15 +139,7 @@ struct FstCase
     float4 scaleRot; // mode 0: trimesh scale rotation quat
     uint4 ids;       // x = rigidId lo, y = rigidId hi, z = clothId, w = clothTriangleIdx (mode 0) / vertexIdx (mode 1)
     uint4 ids2;      // x = rigidMaterialIndex, y/z/w = cloth triangle vertex indices (mode 0)
-}
-
-// PxgRigidFilterPair (32 bytes): u64 index0, u64 index1, u32 index2, pad
-struct FilterPair
-{
-    uint2 index0;
-    uint2 index1;
-    uint index2;
-    uint pad0, pad1, pad2;
+    uint4 ids3;      // x = the rigid's transform cache ref (keys a STATIC rigid's filter ref)
 }
 
 [[vk::push_constant]]
@@ -182,241 +147,29 @@ ConstantBuffer<FstParams> gParams;
 
 RWStructuredBuffer<FstCase> gCase;        // binding 0
 RWStructuredBuffer<float4> gClothPos;     // binding 1: cloth mPosition_InvMass
-RWStructuredBuffer<FilterPair> gFilter;   // binding 2 (sorted)
-// PxgFEMContactWriter
-RWStructuredBuffer<float4> gFemPoint;     // binding 3
-RWStructuredBuffer<float4> gFemNormalPen; // binding 4
-RWStructuredBuffer<float4> gFemBary;      // binding 5
-RWStructuredBuffer<uint4> gFemInfo;       // binding 6
-RWStructuredBuffer<uint> gFemCount;       // binding 7
-RWStructuredBuffer<uint2> gFemByX;        // binding 8: contactByX (u64 keys, mode 1)
-RWStructuredBuffer<uint> gFemTempByX;     // binding 9
-RWStructuredBuffer<uint> gFemIdxByX;      // binding 10
-RWStructuredBuffer<uint> gFemSorted32;    // binding 11: contactSortedByX (u32, mode 0)
-RWStructuredBuffer<float4> gDebug;        // binding 12: (skipped, hasContact, sep|pen, polyCorners)
+RWStructuredBuffer<float4> gDebug;        // binding 2: (skipped, hasContact, sep|pen, polyCorners)
 
-// ---- shared small helpers ----------------------------------------------------
-float3 getNormalized(float3 v)
+PxgRigidDbContactWriterGpu fstWriter()
 {
-    const float m = dot(v, v);
-    return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
-}
-// PxPlane(point, normal): n, d = -p.n ; distance(p) = n.p + d
-float4 makePlane(float3 p, float3 n) { return float4(n, -dot(p, n)); }
-float planeDistance(float4 pl, float3 p) { return dot(pl.xyz, p) + pl.w; }
-
-float3 vertex2Shape(float3 v, float3 scale, float4 rot)
-{
-    return quatRotateInv(rot, quatRotate(rot, v) * scale);
-}
-float3 transformPt(float4 q, float3 p, float3 v) { return quatRotate(q, v) + p; }
-
-// femClothPrimitives.cu computeBarycentric (bool result unused here)
-void computeBarycentric(float3 a, float3 b, float3 c, float3 p, out float4 barycentric)
-{
-    const float3 v0 = b - a;
-    const float3 v1 = c - a;
-    const float3 v2 = p - a;
-    const float d00 = dot(v0, v0);
-    const float d01 = dot(v0, v1);
-    const float d11 = dot(v1, v1);
-    const float d20 = dot(v2, v0);
-    const float d21 = dot(v2, v1);
-    const float denom = d00 * d11 - d01 * d01;
-    const float v = (d11 * d20 - d01 * d21) / denom;
-    const float w = (d00 * d21 - d01 * d20) / denom;
-    const float u = 1.0f - v - w;
-    barycentric = float4(u, v, w, 0.0f);
+    PxgRigidDbContactWriterGpu w;
+    w.outPoint = gParams.outPoint;
+    w.outNormalPen = gParams.outNormalPen;
+    w.outBarycentric = gParams.outBarycentric;
+    w.outContactInfo = gParams.outContactInfo;
+    w.outRigidMaterialIndex = gParams.outRigidMaterialIndex;
+    w.totalContactCount = gParams.totalContactCount;
+    w.contactByRigid = gParams.contactByRigid;
+    w.tempContactByRigid = gParams.tempContactByRigid;
+    w.contactIndexSortedByRigid = gParams.contactIndexSortedByRigid;
+    w.maxNumContacts = gParams.maxContacts;
+    return w;
 }
 
-// ---- find(PxgRigidFilterPair*) (deformableElementFilter.cuh) ----------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findFilter(uint2 rigidId, uint clothMask)
-{
-    const uint2 q1 = uint2(clothMask, 0);
-    uint l = 0, r = gParams.nbFilterPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2;
-        const FilterPair p = gFilter[mid];
-        int cmp;
-        if (!u64Eq(rigidId, p.index0))
-            cmp = u64Lt(rigidId, p.index0) ? -1 : 1;
-        else if (!u64Eq(q1, p.index1))
-            cmp = u64Lt(q1, p.index1) ? -1 : 1;
-        else if (0u != p.index2)
-            cmp = (0u < p.index2) ? -1 : 1;
-        else
-            cmp = 0;
-        if (cmp == 0 || (u64Eq(rigidId, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0)
-            r = mid;
-        else
-            l = mid + 1;
-    }
-    return false;
-}
-
-// ---- polygon trim pipeline (femClothPrimitives.cu 3436-3641) ----------------
-
-// Only correct when a and b straddle the plane (one may lie exactly on it)
-float3 intersectionPoint(float4 plane, float3 a, float3 b)
-{
-    const float distA = abs(planeDistance(plane, a));
-    const float distB = abs(planeDistance(plane, b));
-    const float f = distA / (distA + distB);
-    return (1.0f - f) * a + f * b;
-}
-
-void insertPt(inout float3 arr[8], int arrCount, int index, float3 element)
-{
-    for (int i = arrCount; i > index; --i)
-        arr[i] = arr[i - 1];
-    arr[index] = element;
-}
-
-// In-place convex-loop clip: points with distance > 0 (STRICT) are removed
-int trimLoop(float4 plane, inout float3 loop[8], int loopCount)
-{
-    if (loopCount < 3)
-        return loopCount;
-
-    float3 intersectionA = float3(0, 0, 0);
-    int changeA = -1;
-    float3 intersectionB = float3(0, 0, 0);
-    int changeB = -1;
-
-    bool keep = false;
-
-    bool prevOutside = planeDistance(plane, loop[0]) > 0.0f;
-    for (int i = 0; i < loopCount; ++i)
-    {
-        const bool outside = planeDistance(plane, loop[(i + 1) % loopCount]) > 0.0f;
-        if (outside != prevOutside)
-        {
-            const float3 inter = intersectionPoint(plane, loop[i], loop[(i + 1) % loopCount]);
-            if (changeA < 0)
-            {
-                changeA = i;
-                keep = !prevOutside;
-                intersectionA = inter;
-            }
-            else
-            {
-                changeB = i;
-                intersectionB = inter;
-            }
-        }
-        prevOutside = outside;
-    }
-
-    if (changeA >= 0 && changeB >= 0)
-    {
-        int loopIndexer = -1;
-        for (int i = 0; i < loopCount; ++i)
-        {
-            if (keep)
-            {
-                ++loopIndexer;
-                loop[loopIndexer] = loop[i];
-            }
-            if (i == changeA || i == changeB)
-            {
-                const float3 pt = (i == changeA) ? intersectionA : intersectionB;
-                if (loopIndexer == i && !keep)
-                {
-                    ++loopIndexer;
-                    insertPt(loop, loopCount, loopIndexer, pt);
-                    ++loopCount;
-                    ++i;
-                    ++changeB;
-                }
-                else
-                {
-                    ++loopIndexer;
-                    loop[loopIndexer] = pt;
-                }
-                keep = !keep;
-            }
-        }
-        loopCount = loopIndexer + 1;
-    }
-    else if (prevOutside)
-        loopCount = 0; // no crossing and all points outside
-
-    return loopCount;
-}
-
-float4 createEdgePlane(float3 triNormal, float3 edgeStart, float3 edgeEnd)
-{
-    const float3 n = getNormalized(cross(edgeEnd - edgeStart, triNormal));
-    return makePlane(edgeStart, n);
-}
-
-// the 5-plane, 8-element variant (3 edge planes + two +-distance slabs)
-int trimTriangleByTriangle(inout float3 poly[8], int polyLength, float3 triA, float3 triB, float3 triC,
-                           float maxDistanceLimitPosNormalDir, float maxDistanceLimitNegNormalDir)
-{
-    float3 n = cross(triB - triA, triC - triA);
-    // PxVec3::normalizeSafe: n left UNCHANGED below the epsilon
-    const float mag = sqrt(dot(n, n));
-    if (mag >= PX_NORMALIZATION_EPSILON)
-        n = n * (1.0f / mag);
-
-    polyLength = trimLoop(createEdgePlane(n, triA, triB), poly, polyLength);
-    polyLength = trimLoop(createEdgePlane(n, triB, triC), poly, polyLength);
-    polyLength = trimLoop(createEdgePlane(n, triC, triA), poly, polyLength);
-
-    polyLength = trimLoop(makePlane(triA + maxDistanceLimitPosNormalDir * n, n), poly, polyLength);
-    polyLength = trimLoop(makePlane(triA - maxDistanceLimitNegNormalDir * n, -n), poly, polyLength);
-
-    return polyLength;
-}
-
-// running-min with a +-tolerance averaging band (see header notes; the
-// CUDA double is a no-op over exactly-widened float operands)
-float3 getDeepestPointSimplified(float3 poly[8], int polyLength, float4 plane, float tolerance,
-                                 out float minDist)
-{
-    minDist = 1000000000.0f;
-    float3 deepestPoint = float3(0, 0, 0);
-    int count = 0;
-    for (int i = 0; i < polyLength; ++i)
-    {
-        const float d = planeDistance(plane, poly[i]);
-        if (d < minDist - tolerance)
-        {
-            minDist = d;
-            deepestPoint = poly[i];
-            count = 1;
-        }
-        else if (d < minDist + tolerance)
-        {
-            deepestPoint += poly[i];
-            count++;
-        }
-    }
-    // P9.36: femClothPrimitives.cu:3591 is `deepestPoint /= count;` on a PxVec3, i.e.
-    // PxVec3::operator/= (PxVec3.h:260) -- ONE reciprocal, three multiplies.
-    deepestPoint = deepestPoint * (1.0f / float(count));
-    return deepestPoint;
-}
-
-struct FemContact
-{
-    float3 position;
-    float3 normal;
-    float separation;
-    float4 barycentric;
-}
-
-bool staticTriangleVsClothCollision(float3 localA0, float3 localB0, float3 localC0,
-                                    float3 a1, float3 b1, float3 c1,
-                                    float4 clothQ, float3 clothP, float cDistance,
-                                    out FemContact contact, out int dbgCorners)
+// The clip's corner count, for the debug lane only: the same engine
+// trimTriangleByTriangle call staticTriangleVsClothCollision makes, repeated
+// because the module does not export its intermediate.
+int debugPolyCorners(float3 localA0, float3 localB0, float3 localC0, float3 a1, float3 b1, float3 c1,
+                     float cDistance)
 {
     float3 convexPoly[8];
     convexPoly[0] = a1;
@@ -424,79 +177,7 @@ bool staticTriangleVsClothCollision(float3 localA0, float3 localB0, float3 local
     convexPoly[2] = c1;
     for (int k = 3; k < 8; ++k)
         convexPoly[k] = float3(0, 0, 0);
-
-    const float3 fixNormal = getNormalized(cross(localB0 - localA0, localC0 - localA0));
-    const float4 staticTrianglePlane = makePlane(localA0, fixNormal);
-
-    const int numPolyCorners = trimTriangleByTriangle(convexPoly, 3, localA0, localB0, localC0, cDistance, cDistance);
-    dbgCorners = numPolyCorners;
-
-    float sep;
-    const float3 deepestPoint = getDeepestPointSimplified(convexPoly, numPolyCorners, staticTrianglePlane,
-                                                          0.01f * cDistance, sep);
-
-    const bool hasContact = sep < cDistance;
-
-    contact.position = float3(0, 0, 0);
-    contact.normal = float3(0, 0, 0);
-    contact.separation = 0.0f;
-    contact.barycentric = float4(0, 0, 0, 0);
-    if (hasContact)
-    {
-        computeBarycentric(a1, b1, c1, deepestPoint, contact.barycentric);
-        contact.position = transformPt(clothQ, clothP, deepestPoint);
-        contact.normal = quatRotate(clothQ, fixNormal);
-        contact.separation = sep;
-    }
-    return hasContact;
-}
-
-// ---- spherebox: LIFTED to pxgSlangSphereBox.slang in P9.15a ----------------
-// The body moved out verbatim so cloth_boxVertexContactGenLaunch (the engine-ABI
-// kernel) can call the SAME query instead of a second transcription.  This
-// shader's battery keeps verifying it -- that is the point of lifting rather
-// than copying: the mode-1 cases below still drive sphereboxNormalPen, now
-// through the module.
-
-// ---- PxgFEMContactWriter variants (PxgFEMCore.h) ----------------------------
-// writeRigidVsDeformableContact32: 32-bit sort lane, no u64 key
-void writeRigidVsDeformableContact32(uint index, float4 contact, float4 normalPen, float4 bary,
-                                     uint2 pairInd0, uint pairInd1, uint rigidMaterialIndex,
-                                     uint contactSortedByRigid)
-{
-    if (index >= gParams.maxContacts) return;
-    gFemPoint[index] = contact;
-    gFemNormalPen[index] = normalPen;
-    gFemBary[index] = bary;
-    uint4 info = gFemInfo[index];
-    info.x = pairInd0.x;
-    info.y = pairInd0.y;
-    info.z = pairInd1;
-    info.w = (info.w & COLLISION_FLAG_MASK) | (rigidMaterialIndex & ~COLLISION_FLAG_MASK);
-    info.w = info.w & ~COLLISION_FLAG_MASK;
-    gFemInfo[index] = info;
-    gFemSorted32[index] = contactSortedByRigid;
-    gFemIdxByX[index] = index;
-}
-
-// writeRigidVsDeformableContact: 64-bit sort key
-void writeRigidVsDeformableContact(uint index, float4 contact, float4 normalPen, float4 bary,
-                                   uint2 pairInd0, uint pairInd1, uint rigidMaterialIndex, uint2 rigidId)
-{
-    if (index >= gParams.maxContacts) return;
-    gFemByX[index] = rigidId;
-    gFemTempByX[index] = rigidId.x;
-    gFemIdxByX[index] = index;
-    gFemPoint[index] = contact;
-    gFemNormalPen[index] = normalPen;
-    gFemBary[index] = bary;
-    uint4 info = gFemInfo[index];
-    info.x = pairInd0.x;
-    info.y = pairInd0.y;
-    info.z = pairInd1;
-    info.w = (info.w & COLLISION_FLAG_MASK) | (rigidMaterialIndex & ~COLLISION_FLAG_MASK);
-    info.w = info.w & ~COLLISION_FLAG_MASK;
-    gFemInfo[index] = info;
+    return trimTriangleByTriangle(convexPoly, 3, localA0, localB0, localC0, cDistance, cDistance);
 }
 
 // ---------------------------------------------------------------------------
@@ -515,10 +196,12 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
     float4 lanePoint[32];
     float4 laneNormalPen[32];
     float4 laneBary[32];
-    uint2 lanePair0[32];
-    uint lanePair1[32];
+    uint64_t laneRigid[32];
+    uint64_t laneRef1[32];
     uint laneMat[32];
-    uint laneSorted[32];
+
+    const DfFilterArray filters = dfFilterArray(gParams.filterPairs, gParams.nbFilterPairs,
+                                                gParams.filterSafeAddr);
 
     uint totalCount = 0;
     for (uint lane = 0; lane < 32; ++lane)
@@ -528,15 +211,15 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
         lanePoint[lane] = float4(0, 0, 0, 0);
         laneNormalPen[lane] = float4(0, 0, 0, 0);
         laneBary[lane] = float4(0, 0, 0, 0);
-        lanePair0[lane] = uint2(0, 0);
-        lanePair1[lane] = 0;
+        laneRigid[lane] = 0;
+        laneRef1[lane] = 0;
         laneMat[lane] = 0;
-        laneSorted[lane] = 0;
         if (i >= gParams.numCases)
             continue;
 
         const FstCase cs = gCase[i];
-        const uint2 rigidId = cs.ids.xy;
+        const uint64_t rigidId = uint64_t(cs.ids.x) | (uint64_t(cs.ids.y) << 32);
+        const uint rigidCacheRef = cs.ids3.x;
         const uint clothId = cs.ids.z;
         const float cDistance = cs.clothP.w;
         const float restDist = cs.meshP.w;
@@ -546,14 +229,8 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
             const uint clothTriangleIdx = cs.ids.w;
             const uint3 vi = cs.ids2.yzw;
 
-            const uint clothMask0 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | vi.x;
-            const uint clothMask1 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | vi.y;
-            const uint clothMask2 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | vi.z;
-
-            const bool skipTriangle = findFilter(rigidId, clothMask0) &&
-                                      findFilter(rigidId, clothMask1) &&
-                                      findFilter(rigidId, clothMask2);
-            if (skipTriangle)
+            // A filter pair for this rigid and triangle suppresses contact generation.
+            if (findRigidSurfaceTriangleFilter(filters, rigidId, rigidCacheRef, clothId, clothTriangleIdx))
             {
                 gDebug[i] = float4(1, 0, 0, 0);
                 continue;
@@ -576,10 +253,9 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
             const float3 c1 = gClothPos[vi.z].xyz;
 
             FemContact c;
-            int dbgCorners;
             const bool hasContact = staticTriangleVsClothCollision(localA0, localB0, localC0, a1, b1, c1,
-                                                                   cs.clothQ, cs.clothP.xyz, cDistance,
-                                                                   c, dbgCorners);
+                                                                   cs.clothQ, cs.clothP.xyz, cDistance, c);
+            const int dbgCorners = debugPolyCorners(localA0, localB0, localC0, a1, b1, c1, cDistance);
             gDebug[i] = float4(0, hasContact ? 1 : 0, c.separation, float(dbgCorners));
             if (hasContact)
             {
@@ -587,19 +263,16 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
                 lanePoint[lane] = float4(c.position, restDist);
                 laneNormalPen[lane] = float4(c.normal, c.separation);
                 laneBary[lane] = c.barycentric;
-                lanePair0[lane] = rigidId;
-                lanePair1[lane] = (clothId << PXG_BITSHIFT_ELEMENT_ID) | clothTriangleIdx;
+                laneRigid[lane] = rigidId;
+                laneRef1[lane] = PxgEncodeDeformableTriangle(clothId, clothTriangleIdx);
                 laneMat[lane] = cs.ids2.x;
-                laneSorted[lane] = rigidId.x; // PxU32(rigidId.getInd())
                 ++totalCount;
             }
         }
         else
         {
             const uint vertexIdx = cs.ids.w;
-            const uint clothMask = (clothId << PXG_BITSHIFT_ELEMENT_ID) | vertexIdx;
-            const bool skipVertex = findFilter(rigidId, clothMask);
-            if (skipVertex)
+            if (findRigidSurfaceVertexFilter(filters, rigidId, rigidCacheRef, clothId, vertexIdx))
             {
                 gDebug[i] = float4(1, 0, 0, 0);
                 continue;
@@ -615,9 +288,8 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
                 laneHas[lane] = true;
                 lanePoint[lane] = float4(rigidP, restDist);
                 laneNormalPen[lane] = normalPen;
-                laneBary[lane] = float4(0, 0, 0, 1); // vertex contact marker
-                lanePair0[lane] = rigidId;
-                lanePair1[lane] = clothMask;
+                laneRigid[lane] = rigidId;
+                laneRef1[lane] = PxgEncodeDeformableVertex(clothId, vertexIdx);
                 laneMat[lane] = cs.ids2.x;
                 ++totalCount;
             }
@@ -627,8 +299,9 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
     // one reservation per batch, skipped when the ballot is empty
     uint startIndex = 0;
     if (totalCount > 0)
-        InterlockedAdd(gFemCount[0], totalCount, startIndex);
+        InterlockedAdd(Ptr<uint>(gParams.totalContactCount)[0], totalCount, startIndex);
 
+    PxgRigidDbContactWriterGpu writer = fstWriter();
     uint offset = 0;
     for (uint lane = 0; lane < 32; ++lane)
     {
@@ -637,10 +310,10 @@ void fcStaticTriClothKernel(uint3 dtid : SV_DispatchThreadID)
         const uint index = startIndex + offset;
         ++offset;
         if (gParams.mode == 0)
-            writeRigidVsDeformableContact32(index, lanePoint[lane], laneNormalPen[lane], laneBary[lane],
-                                            lanePair0[lane], lanePair1[lane], laneMat[lane], laneSorted[lane]);
+            writer.writeSurfaceContact(index, lanePoint[lane], laneNormalPen[lane], laneRigid[lane],
+                                       laneMat[lane], laneRef1[lane], laneBary[lane]);
         else
-            writeRigidVsDeformableContact(index, lanePoint[lane], laneNormalPen[lane], laneBary[lane],
-                                          lanePair0[lane], lanePair1[lane], laneMat[lane], lanePair0[lane]);
+            writer.writeSurfaceContactVertex(index, lanePoint[lane], laneNormalPen[lane], laneRigid[lane],
+                                             laneMat[lane], laneRef1[lane]);
     }
 }

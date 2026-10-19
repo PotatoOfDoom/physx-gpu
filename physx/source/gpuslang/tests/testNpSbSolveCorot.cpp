@@ -102,7 +102,6 @@ static void refCr(const CrIn& s, CrOut& o)
     const V3 Q0 = V3{ s.qc0.x, s.qc0.y, s.qc0.z }, Q1 = V3{ s.qc1.x, s.qc1.y, s.qc1.z }, Q2 = V3{ s.qc2.x, s.qc2.y, s.qc2.z };
     const V3 R0 = V3{ s.rt0.x, s.rt0.y, s.rt0.z }, R1 = V3{ s.rt1.x, s.rt1.y, s.rt1.z }, R2 = V3{ s.rt2.x, s.rt2.y, s.rt2.z };
     const float youngs = s.mat.x, poissons = s.mat.y, damping = s.mat.z;
-    const uint32_t dampingScaleU16 = f2u(s.mat.w);
     const float invDtSq = s.prm.x, invDt = s.prm.y;
     const bool isTGS = f2u(s.prm.z) == 1u;
     V3 tlTop = V3{ s.tlTop.x, s.tlTop.y, s.tlTop.z };
@@ -125,7 +124,6 @@ static void refCr(const CrIn& s, CrOut& o)
     G0 = muls(G0, volumeSqrt); G1 = muls(G1, volumeSqrt); G2 = muls(G2, volumeSqrt);
 
     const float alpha = invDtSq * (1.0f / youngs);
-    const float scaledDamping = damping * (float(dampingScaleU16) * (1.0f / 65535.0f));
 
     const V3 uv1 = sub(V3{ s.v1.x, s.v1.y, s.v1.z }, V3{ s.v0.x, s.v0.y, s.v0.z });
     const V3 uv2 = sub(V3{ s.v2.x, s.v2.y, s.v2.z }, V3{ s.v0.x, s.v0.y, s.v0.z });
@@ -156,23 +154,23 @@ static void refCr(const CrIn& s, CrOut& o)
     {
         const float invE = 1.0f / youngs;
         const float nu = poissons;
-        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + invDtSq * multiplyStrainByCompliance(invE, nu, 0u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 0u)) * scale;
-        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 1u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 1u, 1u)) * scale;
-        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 2u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 2u, 2u)) * scale;
-        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 3u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 1u, 2u)) * scale;
-        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 4u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 2u)) * scale;
-        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 5u, tlTop, tlBot) + scaledDamping * matElem(E0, E1, E2, 0u, 1u)) * scale;
+        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + invDtSq * multiplyStrainByCompliance(invE, nu, 0u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 0u)) * scale;
+        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 1u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 1u, 1u)) * scale;
+        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 2u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 2u, 2u)) * scale;
+        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 3u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 1u, 2u)) * scale;
+        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + invDtSq * multiplyStrainByCompliance(invE, nu, 4u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 2u)) * scale;
+        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + invDtSq * multiplyStrainByCompliance(invE, nu, 5u, tlTop, tlBot) + damping * matElem(E0, E1, E2, 0u, 1u)) * scale;
         tlTop = add(tlTop, lamTop);
         tlBot = add(tlBot, lamBot);
     }
     else
     {
-        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + scaledDamping * matElem(E0, E1, E2, 0u, 0u)) * scale;
-        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + scaledDamping * matElem(E0, E1, E2, 1u, 1u)) * scale;
-        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + scaledDamping * matElem(E0, E1, E2, 2u, 2u)) * scale;
-        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + scaledDamping * matElem(E0, E1, E2, 1u, 2u)) * scale;
-        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + scaledDamping * matElem(E0, E1, E2, 0u, 2u)) * scale;
-        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + scaledDamping * matElem(E0, E1, E2, 0u, 1u)) * scale;
+        lamTop.x = -(matElem(G0, G1, G2, 0u, 0u) + damping * matElem(E0, E1, E2, 0u, 0u)) * scale;
+        lamTop.y = -(matElem(G0, G1, G2, 1u, 1u) + damping * matElem(E0, E1, E2, 1u, 1u)) * scale;
+        lamTop.z = -(matElem(G0, G1, G2, 2u, 2u) + damping * matElem(E0, E1, E2, 2u, 2u)) * scale;
+        lamBot.x = -(matElem(G0, G1, G2, 1u, 2u) + damping * matElem(E0, E1, E2, 1u, 2u)) * scale;
+        lamBot.y = -(matElem(G0, G1, G2, 0u, 2u) + damping * matElem(E0, E1, E2, 0u, 2u)) * scale;
+        lamBot.z = -(matElem(G0, G1, G2, 0u, 1u) + damping * matElem(E0, E1, E2, 0u, 1u)) * scale;
     }
 
     const float hs = (0.5f * volumeSqrt);
@@ -242,7 +240,8 @@ PXG_TEST(npSbSolveCorot)
         s.v2 = F4{ rf(-3.f, 3.f), rf(-3.f, 3.f), rf(-3.f, 3.f), rf(0.f, 3.f) };
         s.v3 = F4{ rf(-3.f, 3.f), rf(-3.f, 3.f), rf(-3.f, 3.f), rf(0.f, 3.f) };
         const uint32_t dampScale = rng() % 65536u;
-        s.mat = F4{ rf(1e4f, 1e8f), rf(0.f, 0.49f), rf(0.f, 2.f), u2f(dampScale) };  // youngs, poissons, damping, dampingScale u16
+        // mat.w carried the 5.6.1 dampingScale; 5.12 has none and the shader ignores the slot.
+        s.mat = F4{ rf(1e4f, 1e8f), rf(0.f, 0.49f), rf(0.f, 2.f), u2f(dampScale) };  // youngs, poissons, damping, (unused)
         const float invDt = rf(10.f, 200.f);
         s.prm = F4{ invDt * invDt, invDt, u2f(i % 2u), 0.f };                        // invDtSq, invDt, isTGS
         s.tlTop = F4{ rf(-2.f, 2.f), rf(-2.f, 2.f), rf(-2.f, 2.f), 0.f };

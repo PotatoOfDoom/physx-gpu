@@ -33,7 +33,7 @@ Compilers and C++ Standard:
 
 The `vc17win64-vulkan` and `vc18win64-vulkan` presets build `PhysXGpu_64.dll` from the Slang/SPIR-V port of the GPU kernels (source/gpuslang) over Vulkan compute, instead of from the CUDA kernels. No CUDA toolkit or NVIDIA driver is needed. Building needs the Vulkan 1.3 headers; at run time a device with a Vulkan 1.2 or newer driver is accepted. So far only Mesa llvmpipe (on Linux) has run it; a device whose subgroup-size or compute limits a kernel cannot meet refuses that kernel. The presets set the CMake switch `PX_GPU_BACKEND=VULKAN` (default: `CUDA`).
 
-Status: built with Visual Studio 2026 (`vc18win64-vulkan`); the GPU snippets run on an AMD Radeon RX 9070 XT. That is the only Windows and the only real-GPU run so far: VS 2022 and other GPUs are untried, and the port's bitwise verification runs on Linux (Mesa llvmpipe). `gpuslang/tools/check_msvc_portability.py` (a ctest of the gpuslang suite) guards the MSVC-specific failure classes from Linux. Please report problems with the output of a run with `PXG_LAUNCH_TRACE=1` and `PXG_SYNC_EACH=1` set.
+Status: built with Visual Studio 2026 (`vc18win64-vulkan`) on the PhysX 5.6.1 base; the GPU snippets run on an AMD Radeon RX 9070 XT. That is the only Windows and the only real-GPU run so far; the PhysX 5.12 base has been built and run on Linux only: VS 2022 and other GPUs are untried, and the port's bitwise verification runs on Linux (Mesa llvmpipe). `gpuslang/tools/check_msvc_portability.py` (a ctest of the gpuslang suite) guards the MSVC-specific failure classes from Linux. Please report problems with the output of a run with `PXG_LAUNCH_TRACE=1` and `PXG_SYNC_EACH=1` set.
 
 Required in addition to the packages above:
   * The LunarG Vulkan SDK 1.3 or newer (https://vulkan.lunarg.com), for the Vulkan headers and `vulkan-1.lib`. It sets `VULKAN_SDK`.
@@ -42,7 +42,7 @@ Required in addition to the packages above:
 
 Generating and building:
   * `generate_projects.bat vc18win64-vulkan` (or `vc17win64-vulkan`), then build `compiler/vc18win64-vulkan/PhysXSDK.sln`.
-  * Output: `bin/win.x86_64.vc145.mt/<config>/PhysXGpu_64.dll` (vc143 for Visual Studio 2022) and next to it `PhysXGpuShaders\` with the compiled `.spv` files. The shaders are part of the GPU module: ship the directory together with the DLL. `INSTALL` copies both.
+  * Output: `bin/win.x86_64.vc145.md/<config>/PhysXGpu_64.dll` (vc143 for Visual Studio 2022; `.mt` instead of `.md` when `NV_USE_STATIC_WINCRT` is switched on: like the CUDA presets since PhysX 5.9, the Vulkan presets use the dynamic CRT, /MD) and next to it `PhysXGpuShaders\` with the compiled `.spv` files. The shaders are part of the GPU module: ship the directory together with the DLL. `INSTALL` copies both.
 
 Shader lookup at run time:
   * If `PXG_SHADER_DIR` is set and not empty (development builds), shaders are loaded only from `%PXG_SHADER_DIR%\<file>`, with no fallback.
@@ -53,4 +53,6 @@ Behaviour and limitations:
   * `PxGetPhysicsGpu()` returns NULL with this backend, so the skinning and isosurface snippets are not generated. See `source/gpuslang/MIGRATION_STATUS.md` for which GPU features are ported.
   * `PhysXGpu_64.dll` is loaded through the PhysX update loader (`PhysXUpdateLoader64.dll`) when one is installed with the NVIDIA PhysX System Software, which may substitute the driver's CUDA `PhysXGpu_64.dll`. To make sure the Vulkan DLL is used, load it with `LoadLibrary` and its full path before the first SDK call that loads the GPU module (`PxCreateCudaContextManager`, `PxGetSuggestedCudaDeviceOrdinal`, or creating a GPU scene); the SDK then uses the already loaded `PhysXGpu_64.dll` and does not ask the update loader. `PxSetPhysXGpuLoadHook` only changes the requested file name; with the update loader installed, the request still goes through it.
   * `PX_GENERATE_GPU_STATIC_LIBRARIES` and `PX_USE_NVTX` are not available with this backend.
+  * `PxCudaContextManagerDesc::deviceAllocator` and `pinnedHostAllocator` are ignored, with a warning: the module allocates all GPU and pinned host memory through Vulkan, because memory from a user allocator has no Vulkan device address.
+  * The Vulkan presets are for `generate_projects.bat`. The CMake FetchContent / `find_package` entry point (`physx/CMakeLists.txt`, see `documentation/fetchcontent`) builds the CUDA module only and stops with a message when `PX_GPU_BACKEND=VULKAN` is requested.
 

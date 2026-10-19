@@ -23,7 +23,7 @@
 #include "cooking/PxCooking.h"
 #include "extensions/PxD6Joint.h"   // PxD6JointCreate + PxD6Axis/PxD6Motion (jointed scene)
 #include "cudamanager/PxCudaContext.h" // PxCudaContext::memcpyHtoD/DtoH (particle buffer fill/read)
-#include "PxDeformableAttachment.h"  // PxParticleRigidAttachment (P9.76, PXG_SCENE=particleattach)
+#include "PxDeformableAttachment.h"  // PxDeformableAttachmentData (volume / cloth attachments)
 #include "PxNodeIndex.h"             // PxNodeIndex().getInd() -- the STATIC anchor sentinel
 #include "PxDirectGPUAPI.h"          // PxDirectGPUAPI (P9.79, PXG_SCENE=directapi)
 #include "GuTriangleMesh.h"          // Gu::TriangleMesh::mGRB_faceRemap / mGRB_triIndices (PXG_SCENE=clothtripin)
@@ -1694,11 +1694,14 @@ DirectApiScene buildDirectApiScene(PxPhysics* physics, PxScene* scene, PxMateria
 //   Q  (x=10)  eTORQUE 30000 N m about z: alpha = 180 rad/s^2 for one step,
 //              omega_z = 3, 3 rad after sixty steps.
 //   R  (x=14)  the reference: nothing written; it drops 5.152975 in 61 steps.
+// (These are the PGS figures, and 5.6.1's under both solvers.  5.12 TGS applies gravity and
+// the force/torque per position iteration by default; see the final checks for its values.)
 //
 // The acceleration getters are read after the warm-up (R: (0, -9.81, 0) from a
-// zeroed previous-velocity buffer), right after the velocity writes (exactly 0: the
-// setters also write the previous velocity), and after the next two steps (F's
-// force for one step only, Q's torque likewise).
+// zeroed previous-velocity buffer), right after the velocity writes (on 5.6.1 exactly 0:
+// the setters also write the previous velocity; on 5.12 unchanged from the warm-up, since
+// the getters now gather a buffer filled once per step), and after the next two steps
+// (F's force for one step only, Q's torque likewise).
 //
 // Every body keeps linear damping 0; W, Q and R also get angular damping 0 (the
 // default 0.05 would bleed the spin), and all seven a sleep threshold of 0, so no
@@ -2152,8 +2155,8 @@ ExtForceScene buildExtForceScene(PxPhysics* physics, PxScene* scene, PxMaterial*
 // iteration (PxgTGSCudaSolverCore.cpp:1354-1374) and only when the scene raised
 // PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS.  That flag is not in
 // eMUTABLE_FLAGS (PxSceneDesc.h:373), so it is raised before createScene, and it is
-// TGS-only (PxSceneDesc::isValid rejects it with PGS, PxSceneDesc.h:1129).  Under the
-// flag preIntegration skips gravity and the external accelerations
+// TGS-only (5.6.1's PxSceneDesc::isValid rejected it with PGS; 5.12 makes it the
+// default and a PGS scene ignores it).  Under the flag preIntegration skips gravity and the external accelerations
 // (skipGravityApplication, PxgTGSCudaSolverCore.cpp:826,850) and this kernel adds them
 // per substep instead; ScBodySim.cpp:681-711 turns velocity changes and impulses into
 // accelerations (v/dt).  So a REFUSED kernel leaves every body hovering at y = 100.
@@ -2273,8 +2276,9 @@ SubstepGravityScene buildSubstepGravityScene(PxPhysics* physics, PxScene* scene,
 // THE WHEEL.  A free-falling hub (10 kg box, spinning at w = 2 about y) with K satellites
 // (1 kg spheres) at radius R, each joined to the hub by a fully LOCKED D6.  The K joints
 // share the hub, so the partitioner needs K partitions and numSlabs = ceil(K / 8)
-// (PxgContext.cpp:1632-1633).  Correct: the hub falls freely (yFree = 50 - g dt^2 n(n+1)/2
-// = 48.73288 after n = 30 steps of 1/60), turns by ~w t = 1 rad, and every satellite stays
+// (PxgContext.cpp:1632-1633).  Correct: the hub falls freely (yFree = 48.76353 after n = 30
+// steps of 1/60 under 5.12's default per-iteration gravity, 48.73288 = 50 - g dt^2 n(n+1)/2
+// on 5.6.1; see the check), turns by ~w t = 1 rad, and every satellite stays
 // on the wheel.  Measured on the shipped port: the hub frozen at y = 50 (slab path) or at
 // 49.479 with every satellite off the wheel (whole-island path).
 //
@@ -2607,7 +2611,10 @@ buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     joint->setParentPose(PxTransform(PxVec3(baseHalf, 0.0f, 0.0f)));
     joint->setChildPose(PxTransform(PxVec3(-linkHalf, 0.0f, 0.0f)));
     joint->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
-    joint->setFrictionCoefficient(0.5f);
+    // 5.6.1 set joint->setFrictionCoefficient(0.5f) here.  5.12 removed the coefficient
+    // and the friction model behind it (CHANGELOG 5.12, Articulations / Removed) with no
+    // conversion to the per-axis PxJointFrictionParams, whose constant efforts would hold
+    // the link off the vertical rest target.  The angular damping above still settles it.
 
     scene->addArticulation(*arti);
 
@@ -2846,27 +2853,34 @@ static float linkAngleZ(const PxRigidActor* a)
 //           = -(9 * 9.81 * 0.2 + 10 * 9.81 * 0.5 + 0.5 * 9.81 * 0.9) / 4000 = -0.0178 rad
 //
 // of which the sheet's share is -0.0044; without the reaction the paddle carries only itself
-// and the weight, -0.0134 -- for a RIGID load.  The sheet is not one, and the expected
-// deflection is not that: the sheet sits OFF the paddle's centre of mass (0.3 m inboard of
-// it), and the CUDA delivers a link only an AVERAGE of the contacts' angular impulses.
-// computeRigidChange's articulation arm leaves the reference count off the angular row
-// (deformableUtils.cuh:420-421) but keeps it on the linear one, and
-// accumulateDeltaVRigidSecondLaunch divides BOTH by the contact count before storing the
-// link's scratch impulse (rigidDeltaAccum.cu:366-377): the link gets the full force but
-// 1/N of the torque about its COM (N ~ 36 sheet contacts).  So the paddle feels the
-// sheet's weight acting at its COM lever, 0.5 m: expected sheet share
-// -9 * 9.81 * 0.5 / 4000 = -0.0110 rad, not the rigid -0.0044 (total -0.0244, not
-// -0.0178).  Check 1 is against that.
-// What the off-COM placement discriminates: keep the reference count on the angular row
-// (the rigid arm's form, i.e. pass isArticulation = false) and the torque about the COM is
-// no longer averaged away -- the share drops to leverCloth / leverCom = 0.4 x and check 1
-// fails.  (With the sheet centred on the COM, as a first draft had it, that mutation
-// passed: the contact torques about the COM cancel.)  What it does NOT discriminate: the
-// raXn rows of the prepare arm.  They enter the link only through that 1/N-averaged torque
-// and through angVel . raXn in the velocity read and error terms, which a paddle that does
-// not rotate keeps small: measured with those rows zeroed, the share is 1.22 x (TGS) and
-// 0.98 x (PGS) against 1.04 x / 1.05 x for the real shaders -- inside any band the contact's
-// bias factor allows.  Those rows are guarded by the unit fixtures only
+// and the weight, -0.0134.  Check 1 is against that sheet share at the sheet's OWN lever.
+// The sheet sits OFF the paddle's centre of mass (0.3 m inboard of it), which is what lets
+// the check tell a correct angular reaction from an averaged one:
+//   - 5.6.1 delivered a link only an AVERAGE of the contacts' angular impulses:
+//     computeRigidChange's articulation arm left the reference count off the angular row
+//     (5.6.1 deformableUtils.cuh:420-421) but kept it on the linear one, and
+//     accumulateDeltaVRigidSecondLaunch divides BOTH by the contact count, so the link got
+//     the full force but 1/N of the torque about its COM.  The paddle then felt the sheet's
+//     weight at its COM lever, 0.5 m: share -0.0110 rad, 2.5 x the rigid prediction, and
+//     this scene's expectation (check 1 against the COM lever) was written for that.
+//   - 5.12 scales the linear AND the angular row by the reference count
+//     (PxgRigidPart::writeContactDeltas, deformableAndParticleUtils.cuh: "refCount scales
+//     lin AND ang symmetrically ... so the contact path must match"; the 5.12 rewrite of the
+//     deformable-rigid contact around mass splitting, per-link reference counts and
+//     getGlobalRigidBodyId).  The link now gets the sheet's true torque about its COM, and
+//     the share is the RIGID one at the sheet's own lever.  Measured on 5.12 (llvmpipe):
+//     1.206 x (TGS) and 0.993 x (PGS) of that prediction, 0.478 x / 0.397 x of the old
+//     COM-lever one.
+// What the off-COM placement discriminates: the 5.6.1 averaging (the reference count off
+// the angular row) gives leverCom / leverCloth = 2.5 x and check 1 fails.  (With the sheet
+// centred on the COM, as a first draft had it, that mutation passed: the contact torques
+// about the COM cancel.)  What it does NOT discriminate: the
+// raXn rows of the prepare arm -- on 5.6.1.  There they entered the link only through the
+// 1/N-averaged torque and through angVel . raXn in the velocity read and error terms, which a
+// paddle that does not rotate keeps small: measured on 5.6.1 with those rows zeroed, the
+// share (COM lever) was 1.22 x (TGS) and 0.98 x (PGS) against 1.04 x / 1.05 x for the real
+// shaders.  On 5.12 the rows carry the full torque, so they now reach check 1 too (not
+// re-measured as a mutation).  They are guarded by the unit fixtures as well
 // (femClothSimRigidContactDynamicTGS/PGS, softBodySimRigidContactPrepare).
 // The paddle is ten times heavier than the first draft's 1 kg: the lighter the link, the
 // more of the contact's position-error bias it takes and gives back (see below) -- measured
@@ -2948,7 +2962,7 @@ ClothOnLinkScene buildClothOnLinkScene(PxPhysics* physics, PxScene* scene, PxMat
     js->setChildPose(PxTransform(PxIdentity));
     js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
     js->setDriveParams(PxArticulationAxis::eX,
-                       PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                       PxArticulationDrive(0.0f, 1.0e5f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
     r.sliderJoint = js;
 
@@ -2963,7 +2977,7 @@ ClothOnLinkScene buildClothOnLinkScene(PxPhysics* physics, PxScene* scene, PxMat
     j->setChildPose(PxTransform(PxVec3(-paddleHalf.x, 0.0f, 0.0f)));
     j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
     j->setDriveParams(PxArticulationAxis::eSWING2,
-                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                      PxArticulationDrive(r.stiffness, 150.0f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
     scene->addArticulation(*arti);
     r.paddle = paddle;
@@ -3091,7 +3105,7 @@ SoftBodyArtiContactScene buildSoftBodyArtiContactScene(PxPhysics* physics, PxSce
     // critically damped against the loaded mass (cube + platform + lift)
     const float c = 2.0f * std::sqrt(r.stiffness * (r.softMass + r.platformMass + r.liftMass));
     jp->setDriveParams(PxArticulationAxis::eX,
-                       PxArticulationDrive(r.stiffness, c, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                       PxArticulationDrive(r.stiffness, c, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     jp->setDriveTarget(PxArticulationAxis::eX, 0.0f);
     r.liftJoint = jp;
 
@@ -3107,7 +3121,7 @@ SoftBodyArtiContactScene buildSoftBodyArtiContactScene(PxPhysics* physics, PxSce
     js->setChildPose(PxTransform(PxIdentity));
     js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
     js->setDriveParams(PxArticulationAxis::eX,
-                       PxArticulationDrive(0.0f, 1.0e4f * r.softMass, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                       PxArticulationDrive(0.0f, 1.0e4f * r.softMass, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
     r.sliderJoint = js;
     scene->addArticulation(*arti);
@@ -3373,6 +3387,9 @@ ClothHangBoxScene buildClothHangBoxScene(PxPhysics* physics, PxScene* scene, PxM
 //     TGS reaction on a link (writeRigidReaction for an articulation node,
 //     FEMClothExternalSolve.cu:1651-1664) is verified ONLY by the fixture
 //     femClothSimRigidAttachAllAnchorsTGS (its link lane), not by any scene.
+// 5.12: mass-splitting in the attachment solve makes the link carry the whole load under both
+// solvers (measured 1.047 PGS / 1.171 TGS); the band below is the 5.6.1 record, the check site
+// carries the 5.12 bar.
 // PGS SHARE BAND 0.18 .. 0.25 around the predicted 0.200 (measured 0.211): it also sees the
 // ANGULAR reaction row (attachments.cuh:129-132; the anchors are off the arm's COM).  With
 // deltaAngVel forced to 0 in both solves (single-.spv mutant) the share measured 0.155 and
@@ -3432,7 +3449,7 @@ ClothLinkAttachScene buildClothLinkAttachScene(PxPhysics* physics, PxScene* scen
     js->setChildPose(PxTransform(PxIdentity));
     js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
     js->setDriveParams(PxArticulationAxis::eX,
-                       PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                       PxArticulationDrive(0.0f, 1.0e5f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
     r.sliderJoint = js;
 
@@ -3447,7 +3464,7 @@ ClothLinkAttachScene buildClothLinkAttachScene(PxPhysics* physics, PxScene* scen
     j->setChildPose(PxTransform(PxVec3(-armHalf.x, 0.0f, 0.0f)));
     j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
     j->setDriveParams(PxArticulationAxis::eSWING2,
-                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                      PxArticulationDrive(r.stiffness, 150.0f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
     scene->addArticulation(*arti);
     r.arm = arm;
@@ -3683,11 +3700,14 @@ static PxDeformableAttachment* attachVolumeVertices(PxPhysics* physics, PxDeform
 // BOTH PGS and TGS: in steady state the attachments deliver sum(deltaF) = M_sb (g - a) dt per
 // step, of which the box receives deltaF * invMass0 as a velocity change -- the physically
 // correct reaction, NOT the cloth TGS length-as-velocity row (FEMClothExternalSolve.cu:1668
-// has no dt; tranche B).  One CUDA quirk remains: accumulateDeltaVRigidSecondLaunch divides
+// has no dt; tranche B).  5.6.1 had one CUDA quirk: accumulateDeltaVRigidSecondLaunch divides
 // a body's summed rows by its attachment COUNT N (rigidDeltaAccum.cu:369-370 / :391-392), so
-// the box takes 1/N of the reaction:  a = M_sb g / (N M_box + M_sb).  The box's mass is chosen
-// so that this predicted fall is large; the fall of the WHOLE system without the quirk
-// (a = M_sb g / (M_box + M_sb)) is printed beside it.
+// the box took 1/N of the reaction:  a = M_sb g / (N M_box + M_sb).  5.12 keeps the division
+// but adds mass-splitting to the attachment solve (rigidBodyRefCount, PxgDeformableConstraints.h;
+// CHANGELOG 5.12, Deformables: "Fixed momentum non-conservation when multiple
+// PxDeformableAttachment instances share the same rigid body by applying mass-splitting"), so
+// the box now takes the WHOLE reaction:  a = M_sb g / (M_box + M_sb).  Measured on 5.12 (TGS):
+// drop 2.544 m after 61 steps against 2.535 predicted; the 1/N prediction is printed beside it.
 struct SoftBodyRigidAttachScene
 {
     PxDeformableVolume* vol = nullptr;
@@ -3791,7 +3811,7 @@ SoftBodyArtiAttachScene buildSoftBodyArtiAttachScene(PxPhysics* physics, PxScene
     js->setParentPose(PxTransform(PxIdentity));
     js->setChildPose(PxTransform(PxIdentity));
     js->setMotion(PxArticulationAxis::eX, PxArticulationMotion::eFREE);
-    js->setDriveParams(PxArticulationAxis::eX, PxArticulationDrive(0.0f, 1.0e5f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+    js->setDriveParams(PxArticulationAxis::eX, PxArticulationDrive(0.0f, 1.0e5f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     js->setDriveVelocity(PxArticulationAxis::eX, 0.0f);
     r.sliderJoint = js;
 
@@ -3806,7 +3826,7 @@ SoftBodyArtiAttachScene buildSoftBodyArtiAttachScene(PxPhysics* physics, PxScene
     j->setChildPose(PxTransform(PxVec3(-armHalf.x, 0.0f, 0.0f)));
     j->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
     j->setDriveParams(PxArticulationAxis::eSWING2,
-                      PxArticulationDrive(r.stiffness, 150.0f, PX_MAX_F32, PxArticulationDriveType::eFORCE));
+                      PxArticulationDrive(r.stiffness, 150.0f, PxPerformanceEnvelope(PX_MAX_F32), PxArticulationDriveType::eFORCE));
     j->setDriveTarget(PxArticulationAxis::eSWING2, 0.0f);
     scene->addArticulation(*arti);
     r.arm = arm;
@@ -3831,7 +3851,7 @@ SoftBodyArtiAttachScene buildSoftBodyArtiAttachScene(PxPhysics* physics, PxScene
     const float topY = baseY - armHalf.y - 0.05f;
     r.vol = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, topY - size, r.armX);
     if (!r.vol) return r;
-    // 16 kg: heavy enough that the link's 1/N share of its weight (see the arm) deflects the
+    // 16 kg: heavy enough that the link's share of its weight (1/N on 5.6.1) deflects the
     // drive well above the drive's own settling error.
     femVolumeScaleMass(r.vol, cudaCtx, 250.0f);
     std::vector<PxVec4> pos;
@@ -3847,77 +3867,11 @@ SoftBodyArtiAttachScene buildSoftBodyArtiAttachScene(PxPhysics* physics, PxScene
     return r;
 }
 
-// PXG_SCENE=softbodycone.  The DEPRECATED public path that reaches a REAL cone / distance
-// limit: PxDeformableVolume::addRigidAttachment(NULL, collisionVertex, worldPose,
-// PxConeLimitedConstraint*) -> PxgSimulationController::addRigidAttachment (:4014, collision
-// vertex -> sim tet + barycentric, so the TET path) -> addRigidAttachmentInternal, which copies
-// mLowLimit / mHighLimit / mAxis / mAngle into the attachment (:3055-3058).
-//   ROPE    a FEM cube (cells 2, 0.5 m) at x = -1.5 hangs by its top-face collision vertices
-//           from world anchors at their spawn positions, each a DISTANCE ROPE: low -1, high
-//           0.3 m, angle -1 (cone off).  computeConeLimitedError clamps |relPos| to [-1, 0.3]
-//           (attachments.cuh:78), so the error is zero until the vertex is 0.3 m from its
-//           anchor: the cube falls 0.3 m and hangs there.  Pre-tranche the branch was missing
-//           and the plain pin held every vertex ON its anchor.
-//   CONE    the same cube at x = +1.5, ropes of 0.3 m about the axis (1, -1, 0)/sqrt2 with a
-//           half-angle of 0.3 rad: gravity pulls each vertex straight down, 45 degrees off the
-//           axis, so the angular arm (the PxSinCos branch, attachments.cuh:58-71) must hold it
-//           on the cone surface, 0.3 rad from the axis, at most 0.3 m out -- displaced in +x.
-struct SoftBodyConeScene
-{
-    PxDeformableVolume* rope = nullptr;
-    PxDeformableVolume* cone = nullptr;
-    std::vector<PxU32> ropeIds, coneIds;           // collision-mesh vertex ids
-    std::vector<PxVec3> ropeAnchors, coneAnchors;  // world
-    float ropeLen = 0.3f, coneAngle = 0.3f;
-    PxVec3 coneAxis;
-    PxCudaContextManager* cudaCtx = nullptr;
-    bool ok = false;
-};
-
-static void femVolumeTopCollisionVerts(PxDeformableVolume* vol, std::vector<PxU32>& ids, std::vector<PxVec3>& pos)
-{
-    const PxTetrahedronMesh* m = vol->getCollisionMesh();
-    const PxVec3* v = m->getVertices();
-    float maxY = -FLT_MAX;
-    for (PxU32 i = 0; i < m->getNbVertices(); ++i) maxY = PxMax(maxY, v[i].y);
-    ids.clear(); pos.clear();
-    for (PxU32 i = 0; i < m->getNbVertices(); ++i)
-        if (v[i].y >= maxY - 1e-3f) { ids.push_back(i); pos.push_back(v[i]); }
-}
-
-SoftBodyConeScene buildSoftBodyConeScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
-                                         PxCudaContextManager* cudaCtx)
-{
-    SoftBodyConeScene s;
-    s.cudaCtx = cudaCtx;
-    addGroundBox(physics, scene, material);
-    addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f), boxInertia(PxVec3(0.5f), 1000.0f), 0.5f, 30.0f);
-    const float size = 0.5f, baseY = 4.0f;
-    s.rope = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, baseY, -1.5f);
-    s.cone = buildFemVolumeCube(physics, scene, cudaCtx, 2u, size, baseY, 1.5f);
-    if (!s.rope || !s.cone) return s;
-    femVolumeTopCollisionVerts(s.rope, s.ropeIds, s.ropeAnchors);
-    femVolumeTopCollisionVerts(s.cone, s.coneIds, s.coneAnchors);
-    s.coneAxis = PxVec3(1.0f, -1.0f, 0.0f).getNormalized();
-    PxConeLimitedConstraint rope;
-    rope.mAxis = PxVec3(0.0f, -1.0f, 0.0f);
-    rope.mAngle = -1.0f;
-    rope.mLowLimit = -1.0f;
-    rope.mHighLimit = s.ropeLen;
-    PxConeLimitedConstraint cone;
-    cone.mAxis = s.coneAxis;
-    cone.mAngle = s.coneAngle;
-    cone.mLowLimit = -1.0f;
-    cone.mHighLimit = s.ropeLen;
-    bool ok = !s.ropeIds.empty() && !s.coneIds.empty();
-    for (size_t k = 0; k < s.ropeIds.size(); ++k)
-        ok = ok && s.rope->addRigidAttachment(NULL, s.ropeIds[k], s.ropeAnchors[k], &rope) != 0xFFFFFFFFu;
-    for (size_t k = 0; k < s.coneIds.size(); ++k)
-        ok = ok && s.cone->addRigidAttachment(NULL, s.coneIds[k], s.coneAnchors[k], &cone) != 0xFFFFFFFFu;
-    if (!ok) std::printf("FAIL: softbodycone addRigidAttachment(NULL, vertex, pose, cone) failed\n");
-    s.ok = ok;
-    return s;
-}
+// PXG_SCENE=softbodycone (tranche C of task 35) is retired: it reached the cone / distance
+// limit only through PxDeformableVolume::addRigidAttachment(..., PxConeLimitedConstraint*),
+// and 5.12 removed that method together with PxConeLimitedConstraint (CHANGELOG 5.12,
+// Deformables / Removed).  PxDeformableAttachmentData carries no cone or distance limit, so
+// the limit has no 5.12 entry point.
 
 // Tranche C scene bars, set from the measured runs (new shaders / sh_base, TGS / PGS):
 //   softbodyrigidattach  fall ratio 1.018 / 1.016 (sh_base 0.000 / 0.000); pin gap 0.00003 /
@@ -3935,17 +3889,19 @@ SoftBodyConeScene buildSoftBodyConeScene(PxPhysics* physics, PxScene* scene, PxM
 //                        0.0050.  PGS's rest gap (0.0065 vs 0.0036) does not separate them.
 //                        Link share 0.111 (TGS) / 0.086 (PGS) of a rigid load, CUDA 1/N = 0.111;
 //                        sh_base -0.019 / -0.011.
-//   softbodycone         rope 0.3000 .. 0.3009 (TGS), 0.2973 .. 0.3026 (PGS); cone <= 0.3013 /
-//                        0.3029 rad; sh_base pinned, 0.0000 .. 0.0009 m.
 static const float RIGIDATTACH_RATIO_LO = 0.8f, RIGIDATTACH_RATIO_HI = 1.25f;
-static const float RIGIDATTACH_GAP_TGS = 0.005f, RIGIDATTACH_GAP_PGS = 0.05f;
+// 5.12: PGS's gap is a one-step velocity lag (|v| dt); with the whole reaction the box reaches
+// 4.9 m/s in the 60-step window (5.6.1: ~1.5 m/s in 90), measured 0.0825 m = 4.945 * dt, so the
+// PGS bar went from 0.05 to 0.12.  TGS measured 0.0001 m on 5.12.
+static const float RIGIDATTACH_GAP_TGS = 0.005f, RIGIDATTACH_GAP_PGS = 0.12f;
 static const float ARTIATTACH_GAP_PGS = 0.02f, ARTIATTACH_GAP_TGS = 0.01f;            // rest + whole sweep
 static const float ARTIATTACH_REST_TGS = 0.001f;                                        // rest, TGS only
 static const float ARTIATTACH_STEADY_PGS = 0.01f, ARTIATTACH_STEADY_TGS = 0.001f;       // sweep step >= STEADY_FROM
 static const float ARTIATTACH_LAG_PGS = 0.01f, ARTIATTACH_LAG_TGS = 0.001f;             // |cube dx - arm dx|
 static const int ARTIATTACH_STEADY_FROM = 10;
-static const float ARTIATTACH_SHARE_LO = 0.07f, ARTIATTACH_SHARE_HI = 0.14f;
-static const float CONE_ROPE_LO = 0.25f, CONE_ROPE_HI = 0.35f, CONE_ANGLE_TOL = 0.03f;
+// 5.12: the link takes the WHOLE reaction (mass-splitting, see softbodyrigidattach's builder):
+// share measured 1.126 (TGS) on 5.12 against 5.6.1's 1/N = 0.111, so the bar moved to ~1.
+static const float ARTIATTACH_SHARE_LO = 0.8f, ARTIATTACH_SHARE_HI = 1.35f;
 
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
 // cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
@@ -3994,15 +3950,6 @@ static const float FLUID_BOUNDARY_SCALE = 1.0f;
 // arrays; DIFFUSE_THRESHOLD is the potential a fluid particle must exceed to
 // spawn one.  Both are overridable (PXG_DIFFUSE_THRESHOLD), and the CONTROL mode
 // raises the threshold out of reach rather than changing anything else.
-// P9.80 -- PXG_SCENE=particlerigid.  The cluster spawns just above the ground box
-// so it LANDS inside the run: the whole observable is what the landing does to its
-// shape.  RIGID_STIFFNESS is the shape-matching coefficient (1 = fully rigid); the
-// control sets it to 0, which is the same cluster with the matching switched off.
-// RIGID_VOLUME_POISON is written into the PxParticleVolume bound before stepping,
-// so a kernel that never ran is an impossible number and not a plausible one.
-static const float RIGID_START_Y = 2.0f;
-static const float RIGID_STIFFNESS = 1.0f;
-static const float RIGID_VOLUME_POISON = -999.0f;
 
 static const PxU32 MAX_DIFFUSE = 4096;
 static const float DIFFUSE_THRESHOLD = 1.0f;
@@ -4099,32 +4046,12 @@ struct ParticleScene
     PxParticleBuffer* buffer = nullptr;
     PxU32 numParticles = 0;
     PxCudaContextManager* cudaCtx = nullptr;
-    // P9.4: the PINNED prefix of the particle array.  buildParticleClothScene
-    // orders the sheet row-major with the pinned row FIRST, so indices
-    // [0, numPinned) are the invMass == 0 particles and [numPinned, numParticles)
-    // are the free ones.  Every cloth assertion is over the FREE range only --
-    // the pinned particles never move, so including them would dilute exactly the
-    // signal the scene exists to measure.
-    PxU32 numPinned = 0;
     // P9.13a: non-null only for PXG_SCENE=particlediffuse.  Aliases `buffer`; kept
     // separately because the diffuse accessors are on the derived type.
     PxParticleAndDiffuseBuffer* diffuse = nullptr;
     // P9.41: non-null only for PXG_SCENE=particlepush -- the 10 kg box the cloud is
     // fired at.  It doubles as the scene's one live dynamic rigid.
     PxRigidDynamic* pushBox = nullptr;
-    // P9.76: non-null only for PXG_SCENE=particleattach -- the static anchor every
-    // pinned particle hangs from.  `freeParticle` is the ONE index deliberately left
-    // unpinned, which is this scene's internal control: if gravity were not running at
-    // all, "the cloud did not fall" would prove nothing.
-    PxRigidStatic* anchor = nullptr;
-    PxU32 numAttached = 0;
-    PxU32 freeParticle = 0;
-    // P9.80: non-null only for PXG_SCENE=particlerigid.  `rigidBuffer` aliases
-    // `buffer`; the volume array and the spawn AABB are kept so the scene can
-    // compare what ps_update_volume_bound wrote against what the particles are.
-    PxParticleRigidBuffer* rigidBuffer = nullptr;
-    PxBounds3 spawnBound = PxBounds3::empty();
-    float spawnExtentY = 0.0f;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -4147,30 +4074,18 @@ struct ParticleScene
 // the scene touches the box.  Whether the box moves is the observable.
 static const float PUSH_SPEED = 4.0f;
 static const float PUSH_BOX_X = 2.5f;
-// P9.76 -- attachMode (PXG_SCENE=particleattach): the solid 4x4x4 cloud, with every
-// particle but ONE pinned to a STATIC anchor at its own spawn position through
-// PxParticleBuffer::setRigidAttachments.  That is the only application entry point
-// into ps_rigidAttachmentPrepareLaunch and ps_solveRigidAttachments{,TGS}Launch, and
-// no other scene in this tree reaches them.
-//
-// The scene carries its OWN control, so it needs no second run and no environment
-// variable: particle 0 is deliberately left unpinned.  If the attachment chain is
-// live, the 63 pinned particles stay at y = 4 and particle 0 falls to the floor.  If
-// it is dead, all 64 fall together -- and if gravity were somehow not running, the
-// free particle would stay too, which is the reading "nothing moved" cannot
-// distinguish on its own.
-static const float ATTACH_START_Y = 4.0f;
-static const PxU32 ATTACH_FREE_PARTICLE = 0u;
+// P9.76 attachMode (PXG_SCENE=particleattach, PxParticleBuffer::setRigidAttachments) and
+// P9.80 rigidMode (PXG_SCENE=particlerigid, PxParticleRigidBuffer shape matching and
+// PxParticleVolume bounds) are retired: 5.12 removed particle-rigid attachments, particle
+// rigids and particle volumes (CHANGELOG 5.12, Particles / Removed).
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
                                  bool boundaryMode = false, bool meshFloorMode = false,
                                  bool hfFloorMode = false, bool diffuseMode = false,
-                                 bool convexFloorMode = false, bool pushMode = false,
-                                 bool attachMode = false, bool rigidMode = false)
+                                 bool convexFloorMode = false, bool pushMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
-    PxRigidStatic* groundStatic = nullptr;   // P9.76: the attach scene's anchor
 
     // A minimal rigid body (box on ground) FAR BELOW the cloud.  The engine drives
     // the rigid solver core for the particle island's iteration loop; with zero
@@ -4208,7 +4123,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     }
     else
     {
-        groundStatic = addGroundBox(physics, scene, rigidMat);
+        addGroundBox(physics, scene, rigidMat);
     }
     // The engine drives the rigid solver core for the particle island, so one live
     // dynamic rigid body is required (else rigidSumInternalContactAndJointBatches2
@@ -4231,14 +4146,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         scene->addActor(*target);
         out.pushBox = target;
     }
-    // P9.80: rigidMode joins this branch for exactly the reason the comment above
-    // gives.  Its cluster settles at x = 0 like the bag does, and the free-fall
-    // placement below drops a 1000 kg box from y = 5 straight onto it -- which is
-    // what the scene's first run measured (the cluster scattered 160 units wide,
-    // where the plain bag at the identical spawn settles tidily).  That was the
-    // harness hitting its own scene, not the port: with both features switched off
-    // the number was bit-identical, and so was an ordinary PxParticleBuffer.
-    else if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode || rigidMode)
+    else if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
     {
         // On the mesh floor the puddle spreads to an RMS radius near 10, so the usual
         // x=20 parking spot is INSIDE the puddle and the aside box would start
@@ -4352,26 +4260,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         ps->setSolidRestOffset(restOffset);
         ps->setMaxVelocity(1e6f); // do not clamp the free fall
 
-        // P9.80 -- rigidMode DELIBERATELY CLEARS eParticlePhaseSelfCollide.
-        //
-        // The scene's first honest run said the shape observable was worthless: with
-        // ps_solveShapes skipped entirely, the 4x4x4 cluster still landed with a
-        // y-extent of 1.4990 against a spawn of 1.5000.  Self-collision plus eight
-        // position iterations is quite enough to hold a small granular cube together
-        // when it is dropped two metres onto a floor, so "the cube is still a cube"
-        // was true under the NULL HYPOTHESIS and measured nothing.
-        //
-        // Turning self-collision off removes the confound instead of trying to
-        // out-shout it with a bigger drop.  With it off there is nothing between the
-        // particles at all: gravity takes every one of them to the floor and the
-        // cluster collapses into a single layer.  The ONLY thing that can keep it a
-        // cube is the shape matching, which is exactly the claim the scene makes.
-        // NOTE eParticlePhaseSelfCollideFilter is NOT the flag for this: it filters
-        // out neighbours that were close in the REST pose and needs rest positions
-        // set.  What this scene wants is no self-collision at all -- empty flags.
-        phase = rigidMode
-            ? ps->createPhase(pbdMat, PxParticlePhaseFlags())
-            : ps->createPhase(pbdMat,
+        phase = ps->createPhase(pbdMat,
                   PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
     }
 
@@ -4389,16 +4278,10 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // pushMode: the bottom row sits exactly one rest offset above the ground, so the
     // cloud slides rather than drops, and the box face at x = 2.0 is 0.75 m from the
     // cloud's leading row -- eleven steps at PUSH_SPEED.
-    // attachMode: y = 4, well clear of the ground box at 0.5 but close enough that a
-    // free fall reaches it inside the run -- so "did not fall" and "fell" are two
-    // numbers a metre apart, not a tolerance argument.
-    // rigidMode: low enough that the cluster LANDS inside the run -- the whole
-    // observable is what the landing does to its shape.
-    const float startY = fluidMode ? 0.6f : pushMode ? 0.25f : attachMode ? ATTACH_START_Y
-                        : rigidMode ? RIGID_START_Y
-                                                             : (startYEnv ? float(atof(startYEnv)) : 100.0f);
+    const float startY = fluidMode ? 0.6f : pushMode ? 0.25f
+                                         : (startYEnv ? float(atof(startYEnv)) : 100.0f);
     const float cloudX = pushMode ? 0.5f : 0.0f;
-    if (startYEnv || fluidMode || pushMode || attachMode || rigidMode)
+    if (startYEnv || fluidMode || pushMode)
         ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
     std::vector<PxVec4> hostPos(N), hostVel(N, pushMode ? PxVec4(PUSH_SPEED, 0.0f, 0.0f, 0.0f)
                                                           : PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -4424,7 +4307,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     if (diffuseMode)
     {
         PxParticleAndDiffuseBuffer* db =
-            physics->createParticleAndDiffuseBuffer(N, /*maxVolumes*/ 0, MAX_DIFFUSE, cudaCtx);
+            physics->createParticleAndDiffuseBuffer(N, MAX_DIFFUSE, cudaCtx);
         if (!db)
         {
             std::printf("FAIL: createParticleAndDiffuseBuffer returned null "
@@ -4452,39 +4335,9 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         out.diffuse = db;
         buffer = db;
     }
-    else if (rigidMode)
-    {
-        // P9.80 -- a PxParticleRigidBuffer, which this harness had never created.
-        // It carries BOTH features this tranche exists for: the shape-matching
-        // rigid arrays AND (as a plain PxParticleBuffer) the particle volumes.
-        // One buffer therefore drives both ps_solveShapes and
-        // ps_update_volume_bound, whose host guards are mMaxRigidsPerBuffer > 0
-        // and mMaxVolumesPerBuffer > 0 -- neither ever true before today.
-        // PXG_PARTICLE_RIGID_PLAIN=1 builds the identical scene with an ORDINARY
-        // PxParticleBuffer instead.  A DIAGNOSTIC: it isolates the buffer TYPE from
-        // everything the two features do, which is the one difference the
-        // NO_RIGIDS/NO_VOLUMES knobs cannot switch off.
-        if (std::getenv("PXG_PARTICLE_RIGID_PLAIN"))
-        {
-            buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
-            if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
-        }
-        else
-        {
-            PxParticleRigidBuffer* rb =
-                physics->createParticleRigidBuffer(N, /*maxVolumes*/ 1, /*maxRigids*/ 1, cudaCtx);
-            if (!rb)
-            {
-                std::printf("FAIL: createParticleRigidBuffer returned null (bridge stub not replaced?)\n");
-                return out;
-            }
-            out.rigidBuffer = rb;
-            buffer = rb;
-        }
-    }
     else
     {
-        buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+        buffer = physics->createParticleBuffer(N, cudaCtx);
         if (!buffer)
         {
             std::printf("FAIL: createParticleBuffer returned null (bridge stub not replaced?)\n");
@@ -4506,153 +4359,8 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
     buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
 
-    // P9.80 -- the SHAPE-MATCHING rigid and the VOLUME, both filled here because
-    // every array a PxParticleRigidBuffer exposes is a DEVICE pointer.
-    if (rigidMode && out.rigidBuffer)
-    {
-        PxParticleRigidBuffer* rb = out.rigidBuffer;
-
-        // ONE rigid covering every particle.  mRigidOffsets is a runsum with
-        // numRigids + 1 entries: the CUDA reads rigidOffsets[rigidId] and
-        // [rigidId + 1] (particlesystem.cu:5178).
-        const PxU32 offsets[2] = { 0u, N };
-
-        // The shape-matching stiffness.  PXG_PARTICLE_RIGID_CONTROL=1 sets it to
-        // ZERO, which is the same cluster with the matching switched off -- the
-        // A/B this scene rests on.  With 0 the kernel still RUNS (its host guard is
-        // the rigid COUNT, not the coefficient) and lerps by 0, so the cluster
-        // behaves as loose granular material.
-        const bool rigidControl = std::getenv("PXG_PARTICLE_RIGID_CONTROL") != nullptr;
-        const float coeff = rigidControl ? 0.0f : RIGID_STIFFNESS;
-
-        // Local positions are RELATIVE TO THE CLUSTER'S CENTRE OF MASS, because
-        // that is what the kernel reconstructs against:
-        //   rigidPos = Rotate(newRot, localPositions[i]) + newCom
-        // (particlesystem.cu:5395).  The initial translation must be that same COM
-        // and the initial rotation the identity, or the first solve would yank the
-        // cluster toward a pose it was never in.
-        PxVec3 com(0.0f);
-        for (PxU32 i = 0; i < N; ++i) com += PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z);
-        com /= float(N);
-
-        std::vector<PxVec4> localPos(N), localNrm(N);
-        for (PxU32 i = 0; i < N; ++i)
-        {
-            const PxVec3 p(hostPos[i].x, hostPos[i].y, hostPos[i].z);
-            const PxVec3 d = p - com;
-            localPos[i] = PxVec4(d, 0.0f);
-            // The kernel rotates these into mNormalArray every step
-            // (particlesystem.cu:5411).  A radial normal makes them distinguishable
-            // per particle; .w is carried through untouched and is left at 0.
-            const float m = d.magnitude();
-            localNrm[i] = PxVec4(m > 0.0f ? d / m : PxVec3(0.0f, 1.0f, 0.0f), 0.0f);
-        }
-        const PxVec4 translation(com, 0.0f);
-        const PxVec4 rotation(0.0f, 0.0f, 0.0f, 1.0f);   // identity quaternion
-
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidOffsets()), offsets, sizeof(offsets));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidCoefficients()), &coeff, sizeof(float));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidLocalPositions()), localPos.data(),
-                        N * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidLocalNormals()), localNrm.data(),
-                        N * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidTranslations()), &translation, sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getRigidRotations()), &rotation, sizeof(PxVec4));
-        // Two DIAGNOSTIC knobs, not scored modes, kept because they earned their
-        // place.  The scene's first run showed the cluster not merely failing to hold
-        // its shape but flying apart -- 160 units wide, where the plain
-        // PXG_SCENE=particle bag at the identical spawn settles tidily at mean y
-        // 0.9992.  "The kernels are skipped" does not by itself explain that, and
-        // guessing which feature caused it would have been guessing.  Switching each
-        // one off in turn said NEITHER: the number was bit-identical with both off,
-        // and PXG_PARTICLE_RIGID_PLAIN said it was not the buffer type either.  What
-        // was left was the harness's own companion rigid body falling on the cluster
-        // (see the aside-placement branch above).  The knobs stay: they are what made
-        // that a measurement instead of a theory.
-        const bool noRigids = std::getenv("PXG_PARTICLE_RIGID_NO_RIGIDS") != nullptr;
-        const bool noVolumes = std::getenv("PXG_PARTICLE_RIGID_NO_VOLUMES") != nullptr;
-        rb->setNbRigids(noRigids ? 0u : 1u);
-        rb->raiseFlags(PxParticleBufferFlag::eUPDATE_RIGID);
-
-        // ONE volume over the same particles.  Its bound is POISONED: the kernel
-        // overwrites it every step, so anything still holding -999 after the run
-        // means ps_update_volume_bound never ran.  There is no flag for volumes --
-        // mNumParticleVolumes on the buffer is what raises mMaxVolumesPerBuffer
-        // (PxgPBDParticleSystemCore.cpp:1699).
-        PxParticleVolume vol;
-        vol.bound = PxBounds3(PxVec3(RIGID_VOLUME_POISON), PxVec3(RIGID_VOLUME_POISON + 1.0f));
-        vol.particleIndicesOffset = 0;
-        vol.numParticles = N;
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(rb->getParticleVolumes()), &vol,
-                        sizeof(PxParticleVolume));
-        rb->setNbParticleVolumes(noVolumes ? 0u : 1u);
-
-        // the spawn AABB and y-extent, for the assertions
-        out.spawnBound = PxBounds3::empty();
-        for (PxU32 i = 0; i < N; ++i)
-            out.spawnBound.include(PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z));
-        out.spawnExtentY = out.spawnBound.maximum.y - out.spawnBound.minimum.y;
-    }
-    else if (rigidMode)
-    {
-        out.spawnBound = PxBounds3::empty();
-        for (PxU32 i = 0; i < N; ++i)
-            out.spawnBound.include(PxVec3(hostPos[i].x, hostPos[i].y, hostPos[i].z));
-        out.spawnExtentY = out.spawnBound.maximum.y - out.spawnBound.minimum.y;
-    }
-
     ps->addParticleBuffer(buffer);
     scene->addActor(*ps);
-
-    // P9.76 -- the rigid ATTACHMENTS.  This is the recipe PxParticleAttachmentBuffer
-    // uses (ExtParticleExt.cpp:269-303), open-coded so the scene owns every byte:
-    //   - a STATIC anchor takes mID0 = PxNodeIndex().getInd() (the 0xffffffff
-    //     sentinel the prepare tests with isStaticBody) and mLocalPose0 in WORLD
-    //     space, not body space ("attachments to rigid static work in global space");
-    //   - mID1 is the BUFFER-LOCAL particle id;
-    //   - the cone limit is left default-constructed, i.e. DISABLED
-    //     (mAngle/mLowLimit/mHighLimit all -1), which is the branch this port defers;
-    //   - the array must live in DEVICE memory: setRigidAttachments takes a device
-    //     pointer and the prepare dereferences it from the GPU.
-    // The system must also be told the anchor participates, or the island manager has
-    // no reason to keep it around (NpPBDParticleSystem::addRigidAttachment).
-    if (attachMode)
-    {
-        if (!groundStatic)
-        {
-            std::printf("FAIL: particleattach needs the ground box as its anchor\n");
-            return out;
-        }
-        ps->addRigidAttachment(groundStatic);
-
-        std::vector<PxParticleRigidAttachment> att;
-        att.reserve(N - 1u);
-        for (PxU32 i = 0; i < N; ++i)
-        {
-            if (i == ATTACH_FREE_PARTICLE) continue;   // the scene's internal control
-            PxParticleRigidAttachment a(PxConeLimitedConstraint(), PxVec4(0.0f));
-            a.mID0 = PxNodeIndex().getInd();
-            a.mID1 = i;
-            // world position = where the particle was spawned, so the constraint's
-            // position error starts at zero and the cloud is asked to STAY, not move.
-            a.mLocalPose0 = PxVec4(hostPos[i].x, hostPos[i].y, hostPos[i].z, 0.0f);
-            att.push_back(a);
-        }
-        CUdeviceptr devAtt = 0;
-        const size_t bytes = att.size() * sizeof(PxParticleRigidAttachment);
-        if (ctx->memAlloc(&devAtt, bytes) != 0 || !devAtt)
-        {
-            std::printf("FAIL: memAlloc for %zu attachment bytes failed\n", bytes);
-            return out;
-        }
-        ctx->memcpyHtoD(devAtt, att.data(), bytes);
-        buffer->setRigidAttachments(reinterpret_cast<PxParticleRigidAttachment*>(devAtt),
-                                    PxU32(att.size()));
-        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_ATTACHMENTS);
-        out.anchor = groundStatic;
-        out.numAttached = PxU32(att.size());
-        out.freeParticle = ATTACH_FREE_PARTICLE;
-    }
 
     out.system = ps;
     out.buffer = buffer;
@@ -4730,30 +4438,6 @@ float particleMeanY(const ParticleScene& psc)
     return float(sum / double(psc.numParticles));
 }
 
-// P9.76 -- DtoH-read the particle buffer and split it into the PINNED mean y, the
-// pinned MINIMUM y and the ONE free particle's y.  Splitting is the whole point: the
-// mean over all 64 would blend the control into the signal it is meant to separate.
-struct AttachY { float pinnedMean, pinnedMin, freeY; bool finite; };
-AttachY particleAttachY(const ParticleScene& psc)
-{
-    std::vector<PxVec4> host(psc.numParticles);
-    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
-    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
-                    psc.numParticles * sizeof(PxVec4));
-    AttachY r; r.pinnedMean = 0.0f; r.pinnedMin = FLT_MAX; r.freeY = 0.0f; r.finite = true;
-    double sum = 0.0; PxU32 n = 0;
-    for (PxU32 i = 0; i < psc.numParticles; ++i)
-    {
-        if (!std::isfinite(host[i].x) || !std::isfinite(host[i].y) || !std::isfinite(host[i].z))
-            r.finite = false;
-        if (i == psc.freeParticle) { r.freeY = host[i].y; continue; }
-        sum += double(host[i].y);
-        if (host[i].y < r.pinnedMin) r.pinnedMin = host[i].y;
-        ++n;
-    }
-    r.pinnedMean = n ? float(sum / double(n)) : 0.0f;
-    return r;
-}
 
 // DtoH-read the particle buffer and return the mean x of the cloud (P9.41: the
 // pushed cloud's progress toward the box).
@@ -4788,28 +4472,22 @@ float diffuseMinY(const ParticleScene& psc)
 }
 
 // ---------------------------------------------------------------------------
-// P9.95 -- PXG_SCENE=particleapply: the direct-GPU-API particle ingest,
-// PxScene::applyParticleBufferData -> PxgPBDParticleSystemCore::
-// applyParticleBufferDataDEPRECATED (:2267-2309) -> applyParticleBufferDataDEPRECATED
-// (particlesystem.cu:5831-5866).  The only application entry point into that kernel,
-// and the first scene in this tree that combines eENABLE_DIRECT_GPU_API with a PBD
-// particle system.
+// P9.95 -- PXG_SCENE=particleapply: per-buffer ingest of edited user arrays in a scene
+// with eENABLE_DIRECT_GPU_API and a PBD particle system.
 //
-// THREE CLOUDS IN ONE SYSTEM, NAMED BY UNIQUE ID.  The kernel resolves each slot's
-// PxGpuParticleBufferIndexPair through two indirections: indices[blockIdx.y] picks the
-// SLOT, and the slot's unique id goes through findBufferIndexFromUniqueId (an
-// upper-bound search over the sorted ids, then the ORIGINAL-INDEX table) to the buffer.
-// The buffers are created C, B, A and added A, B, C, so the unique ids run backwards
-// against the buffer order and the original-index table is a real permutation.
+// 5.12: the scene was built on PxScene::applyParticleBufferData (PxGpuParticleBufferIndexPair
+// slots resolved by unique id -> applyParticleBufferDataDEPRECATED), which 5.12 removed with
+// no direct replacement (CHANGELOG 5.12, Particles / Removed; 5.5 deprecation note: the data
+// is exposed on the PxParticleBuffer itself).  The ingest now goes through the buffers' own
+// flags, which is what the old control mode (PXG_PARTICLE_APPLY_CONTROL) did and measured
+// word-identical to the apply run; every check below is unchanged.
 //
-// The write window edits all three clouds' user arrays and raises NO flags, then
-// applies two of three slots:
-//     pairs   = { {sys, uid(A)}, {sys, uid(C)}, {sys, uid(B)} }
-//     flags   = {  VEL,           POS|VEL,       POS|VEL      }
-//     indices = { 2, 0 }                      -> slots 2 (B, POS|VEL) and 0 (A, VEL)
-// Slot 1 (C) is a decoy that is never named.  The per-step egress
-// (ps_updateUserBufferLaunch) overwrites every user array after each step, so an edit
-// the kernel did not apply is simply lost -- which is what makes the clouds the
+// THREE CLOUDS IN ONE SYSTEM.  The buffers are created C, B, A and added A, B, C, so the
+// unique ids run backwards against the buffer order.  The write window edits all three
+// clouds' user arrays, then raises flags on two of them:
+//     B  POS|VEL      A  VEL      C  nothing (the decoy)
+// The per-step egress (ps_updateUserBufferLaunch) overwrites every user array after each
+// step, so an edit no flag covered is simply lost -- which is what makes the clouds the
 // observable.  Every particle is free (empty phase flags, damping 0), so a cloud keeps
 // its shape and its mean moves only by what was applied.
 static const float PAPPLY_DZ_B = 7.0f, PAPPLY_VX_B = 3.0f;
@@ -4859,7 +4537,7 @@ ParticleApplyScene buildParticleApplyScene(PxPhysics* physics, PxScene* scene, P
     PxCudaContext* ctx = cudaCtx->getCudaContext();
     auto makeCloud = [&](float centreX) -> PxParticleBuffer*
     {
-        PxParticleBuffer* buf = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+        PxParticleBuffer* buf = physics->createParticleBuffer(N, cudaCtx);
         if (!buf) return nullptr;
         std::vector<PxVec4> pos(N), vel(N, PxVec4(0.0f));
         std::vector<PxU32> ph(N, phase);
@@ -4933,7 +4611,8 @@ static PxVec3 particleApplyMean(const std::vector<PxVec4>& v)
 //     accumulateDeltaV (one contact list for ALL systems, sorted by (system, particle));
 //   * system = blockIdx.y DIRECTLY -- ps_stepParticlesLaunch (particlesystem.cu:130), the
 //     TGS predictor; it indexes the POOL, not act[] (upstream note U1 below);
-//   * system = the user's PxGpuParticleBufferIndexPair -- applyParticleBufferData.
+//   * system = the user's PxGpuParticleBufferIndexPair -- applyParticleBufferData (removed
+//     in 5.12; the apply arm now ingests through B's buffer flags).
 // 33 "force system index 0" mutants of those reads are value-identical in every
 // single-system scene by construction.  This scene is where they are not.
 //
@@ -4970,8 +4649,8 @@ static PxVec3 particleApplyMean(const std::vector<PxVec4>& v)
 // Rows (tools/run_scenes.sh): split TGS, split PGS, fluid (B = SnippetPBF fluid with 2048
 // diffuse particles on the ground box: the fluid/vorticity/material kernels at index 1;
 // its diffuse arrays compare as MULTISETS, U4), apply (eENABLE_DIRECT_GPU_API,
-// applyParticleBufferData naming ONLY B's slot with pairs from getGpuParticleSystemIndex,
-// A's edit must be lost), push (each system pushes its own 10 kg box: the rigid delta-V
+// only B's buffer flags raised -- 5.12 removed applyParticleBufferData, which named B's
+// slot with pairs from getGpuParticleSystemIndex -- A's edit must be lost), push (each system pushes its own 10 kg box: the rigid delta-V
 // decode; scored physically, U2).  `PXG_P2_ARM=remove` is a diagnostic, never scored.
 //
 // MEASURED (P9.99b): every C1/C2 comparison 0 of 512 (A) and 0 of 1000 (B) words, TGS and
@@ -5182,7 +4861,7 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
                                       z * c.spacing - c.off, c.invMass);
         if (c.diffuse)
         {
-            dbuf[k] = physics->createParticleAndDiffuseBuffer(N, 0, P2_MAX_DIFFUSE, cudaCtx);
+            dbuf[k] = physics->createParticleAndDiffuseBuffer(N, P2_MAX_DIFFUSE, cudaCtx);
             if (dbuf[k])
             {
                 PxDiffuseParticleParams dp; dp.threshold = 1.0f; dp.lifetime = 2.0f;
@@ -5192,7 +4871,7 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
             buf[k] = dbuf[k];
         }
         else
-            buf[k] = physics->createParticleBuffer(N, 0, cudaCtx);
+            buf[k] = physics->createParticleBuffer(N, cudaCtx);
         if (!buf[k]) { built = false; break; }
         ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getPositionInvMasses()), pos.data(), N * sizeof(PxVec4));
         ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buf[k]->getVelocities()), vel.data(), N * sizeof(PxVec4));
@@ -5211,7 +4890,6 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
         ctx->memcpyDtoH(p.data(), reinterpret_cast<CUdeviceptr>(buf[k]->getPositionInvMasses()), r.n[k] * sizeof(PxVec4));
         ctx->memcpyDtoH(v.data(), reinterpret_cast<CUdeviceptr>(buf[k]->getVelocities()), r.n[k] * sizeof(PxVec4));
     };
-    CUdeviceptr devIdx = 0, devPairs = 0, devFlags = 0;
     if (built)
     {
         const int order[2] = { who == P2_SWAP ? 1 : 0, who == P2_SWAP ? 0 : 1 };
@@ -5221,9 +4899,11 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
         {
             if (armApply && i == 1)
             {
-                // The write window after the warm-up step: both user arrays are edited and NO
-                // flag is raised.  Only B's slot is applied (indices = {1}); A's edit must be
-                // lost to the next egress.
+                // The write window after the warm-up step: both user arrays are edited, and
+                // only B's buffer raises POS|VEL; A's edit must be lost to the next egress.
+                // (5.12 removed applyParticleBufferData, which named B's slot by
+                // {getGpuParticleSystemIndex, getUniqueId}; the buffer flags are its
+                // replacement, see particleapply.)
                 for (int k = 0; k < 2; ++k)
                 {
                     if (!ps[k]) continue;
@@ -5240,25 +4920,8 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
                 std::printf("  [%s] apply: gpu index A %u B %u\n", P2_WHO_NAME[who], r.gpuIdx[0], r.gpuIdx[1]);
                 if (ps[1])
                 {
-                    const PxGpuParticleBufferIndexPair pairs[2] = {
-                        { r.gpuIdx[0], ps[0] ? buf[0]->getUniqueId() : 0u }, { r.gpuIdx[1], buf[1]->getUniqueId() } };
-                    const PxParticleBufferFlags flags[2] = {
-                        PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_VELOCITY),
-                        PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY };
-                    const PxU32 indices[1] = { 1u };
-                    if (ctx->memAlloc(&devIdx, sizeof(indices)) != 0 || !devIdx ||
-                        ctx->memAlloc(&devPairs, sizeof(pairs)) != 0 || !devPairs ||
-                        ctx->memAlloc(&devFlags, sizeof(flags)) != 0 || !devFlags)
-                    {
-                        std::printf("FAIL: particle2 apply: memAlloc failed\n");
-                        built = false; break;
-                    }
-                    ctx->memcpyHtoD(devIdx, indices, sizeof(indices));
-                    ctx->memcpyHtoD(devPairs, pairs, sizeof(pairs));
-                    ctx->memcpyHtoD(devFlags, flags, sizeof(flags));
-                    scene->applyParticleBufferData(reinterpret_cast<const PxU32*>(devIdx),
-                                                   reinterpret_cast<const PxGpuParticleBufferIndexPair*>(devPairs),
-                                                   reinterpret_cast<const PxParticleBufferFlags*>(devFlags), 1u);
+                    buf[1]->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+                    buf[1]->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
                 }
             }
             if (who == P2_REMOVE_A && i == P2_REMOVE_STEP && aLive)
@@ -5333,9 +4996,6 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
     }
     for (PxRigidActor* a : rigids) a->release();
     if (patch) patch->release();
-    if (devIdx) ctx->memFree(devIdx);
-    if (devPairs) ctx->memFree(devPairs);
-    if (devFlags) ctx->memFree(devFlags);
     return r;
 }
 
@@ -5403,650 +5063,12 @@ static bool particle2CompareDiffuse(const char* what, const P2Run& x, const P2Ru
 }
 
 // ---------------------------------------------------------------------------
-// P9.4 -- PXG_SCENE=particlecloth: the PBD CLOTH sheet.
-//
-// This is the scene that makes the spring chain observable.  Four kernels were
-// mapped for it across P9.3a-c -- ps_initializeSpringsLaunch (zero the XPBD
-// multipliers), ps_updateRemapVertsLaunch (gather each spring's endpoints out of
-// the sorted arrays), ps_solveSpringsLaunch (the per-partition XPBD solve) and
-// ps_averageVertsLaunch (fold the scattered copies back into one delta per
-// particle) -- and until now NOTHING dispatched them: the host gates the entire
-// chain on getMaxSpringsPerBuffer() > 0 (PxgPBDParticleSystemCore.cpp:958) and no
-// scene built a PxParticleClothBuffer.
-//
-// THE OBSERVABLE IS A HANGING CURTAIN, and it was chosen because it fails loudly.
-// The sheet is built horizontally in the XZ plane with its FIRST ROW pinned
-// (invMass = 0).  Gravity then rotates the free part down about that edge until
-// it hangs as a vertical curtain.  The springs are the ONLY thing connecting a
-// free particle to the pinned row -- there is no other constraint in the scene
-// that could hold it up -- so:
-//
-//     springs working  -> the sheet hangs, free particles stay near the pins
-//     springs absent   -> every free particle free-falls to the floor
-//
-// The control (PXG_PARTICLE_CLOTH_CONTROL=1) builds the IDENTICAL geometry,
-// material, phase, pinning and step count, but as a plain PxParticleBuffer with no
-// springs at all.  That is exactly the host's own gate, so the control isolates
-// the chain under test rather than some proxy for it.
-//
-// Two things this scene does NOT establish, stated up front.  It does not check
-// the resting SHAPE against CUDA -- what carries bit-exactness is the three P9.3
-// fixtures, not this scene.  And it does not exercise the multi-cloth path: one
-// cloth buffer with one cloth means mParticleBufferRunsum[0] == 0, which is the
-// only configuration in which ps_averageVertsLaunch's binarySearch (over
-// BUFFER-LOCAL start indices, keyed by a GLOBAL index -- upstream candidate 14)
-// agrees with its own guard.  A second particle buffer would be needed to reach
-// that, and it is left to a later tranche rather than smuggled in here.
-//
-// CALIBRATION.  Both numbers are MEASURED on this scene, the only difference
-// between the two runs being whether the buffer carries springs:
-//
-//                              springs      no-spring control    threshold
-//   free mean y (final)        4.2009       0.2000
-//   free mean y (min)          3.7693       0.0981               > 2.5
-//   bbox diagonal (max)        3.1551       5.8059               < 4.0
-//
-// The control's 0.2000 is exactly the rest offset: every free particle ends flat
-// on the floor, which is what "the springs did nothing" looks like.  Both
-// thresholds sit between the two columns, and the control run FAILS BOTH of them
-// (0.0981 is not > 2.5; 5.8059 is not < 4.0) -- that is what makes them checks
-// rather than decoration.  The two are also independent: the hang check catches a
-// solve that applies NO force, the diagonal catches one that applies the WRONG
-// force, and neither implies the other.
-//
-// The sheet does NOT come to rest, and no rest check is asserted.  It is a
-// pendulum with springDamping 0.001 and no aerodynamic drag (ps_solveAerodynamics
-// 1/2Launch are both still unmapped, PxgSlangKernelManifest.h:250-251, and are
-// switched off anyway because this material's lift and drag are 0), so the free
-// mean y oscillates in [3.78, 4.58] for as long as it is stepped.  Asserting a
-// rest here would be asserting damping the scene deliberately does not have.
-static const float CLOTH_HANG_MIN = 2.5f;        // free-particle mean y must stay above this
-static const float CLOTH_HANG_CONTROL = 0.2000f; // measured, no-spring control
-static const float CLOTH_DIAG_MAX = 4.0f;        // bbox diagonal: catches an EXPLODING solve
-static const float CLOTH_DIAG_REST = 3.11f;      // sqrt(2.2^2 + 2.2^2), the flat sheet's diagonal
-static const float CLOTH_DIAG_CONTROL = 5.8059f; // measured, no-spring control
-
-// The sheet: 12 x 12 at 0.2 spacing, so it spans 2.2 x 2.2 and drops 2.2 when it
-// hangs.  144 particles, 12 pinned.  Spring topology is SnippetPBDCloth's
-// (SnippetPBDCloth.cpp:145-175): structural springs along both axes plus both
-// diagonals of every cell, and the two boundary runs -- 4*(nX-1)*(nZ-1) + (nX-1)
-// + (nZ-1) = 506 springs, enough that the partitioner produces several partitions
-// and ps_solveSpringsLaunch is dispatched more than once per iteration.
-// P9.5 aerodynamics.  Values are not from the snippet (which uses 0/0); they were
-// chosen to be large enough to damp the pendulum within the step budget and then
-// MEASURED, like every other threshold in this file.
-static const float CLOTH_LIFT = 0.6f;
-static const float CLOTH_DRAG = 1.2f;
-// MEASURED on this scene, the only difference between the two runs being whether
-// the material carries lift and drag (PXG_PARTICLE_CLOTH_NOAERO=1 zeroes both):
-//
-//                          aero on      no-aero control
-//   free mean y (end)      3.8840       4.2009
-//   free mean y (min)      3.8840       3.7693
-//   rest |dy|              0.002460     0.021391      threshold < 0.010
-//
-// The aero run's minimum EQUALS its final value: with air resistance the sheet
-// descends to its hanging position and stays, where the undamped control is still
-// swinging through a 0.43 band at step 240.  The rest check is therefore the
-// aerodynamics observable, and the no-spring control fails it too (it lands on the
-// floor and reads 0.000000 only because it is dead, which the hang check catches
-// first).  Margin is 4x below and 2.1x above -- narrower than the P9.4 checks, and
-// stated rather than dressed up.
-static const float CLOTH_REST_MAX = 0.010f;
-static const float CLOTH_REST_NOAERO = 0.021391f;   // measured
-
-static const PxU32 CLOTH_NX = 12;
-static const PxU32 CLOTH_NZ = 12;
-static const float CLOTH_SPACING = 0.2f;
-static const float CLOTH_PIN_Y = 5.0f;
-
-static PX_FORCE_INLINE PxU32 clothId(PxU32 x, PxU32 y, PxU32 numY) { return x * numY + y; }
-
-// springsMode == false builds the CONTROL: same everything, no springs, plain
-// particle buffer.  Returns an empty ParticleScene on failure.
-ParticleScene buildParticleClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                                      PxCudaContextManager* cudaCtx, bool springsMode)
-{
-    ParticleScene out;
-    out.cudaCtx = cudaCtx;
-
-    // A floor for the control run to land on, and one live dynamic rigid body --
-    // with zero dynamic rigids the rigid batch-sum kernel null-derefs on the
-    // particle island's solver descriptors (see buildParticleScene's note).  The
-    // box sits far aside at x=20 so it never touches the sheet.
-    addGroundBox(physics, scene, rigidMat);
-    {
-        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
-        PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
-        aside->attachShape(*s);
-        aside->setMass(1000.0f);
-        aside->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
-        s->release();
-        scene->addActor(*aside);
-    }
-
-    const PxU32 numParticles = CLOTH_NX * CLOTH_NZ;
-    const PxU32 numSprings = (CLOTH_NX - 1) * (CLOTH_NZ - 1) * 4 + (CLOTH_NX - 1) + (CLOTH_NZ - 1);
-    const PxU32 numTriangles = (CLOTH_NX - 1) * (CLOTH_NZ - 1) * 2;
-    const float restOffset = CLOTH_SPACING;
-    const float totalClothMass = 10.0f;
-    const float particleMass = totalClothMass / float(numParticles);
-
-    // SnippetPBDCloth.cpp:107-112 -- the snippet's own stiffnesses and material.
-    const float stretchStiffness = 10000.0f;
-    const float shearStiffness = 100.0f;
-    const float springDamping = 0.001f;
-
-    // P9.5: the last two arguments are LIFT and DRAG (PxPhysics.h:980).  The
-    // snippet leaves both at 0, which makes ps_solveAerodynamics1/2Launch compute a
-    // zero impulse and the whole aero path a no-op.  Turning them on is what makes
-    // the pair observable -- and it is also what finally gives the hanging sheet
-    // some air resistance, which P9.4 explicitly did not have.
-    // PXG_PARTICLE_CLOTH_NOAERO=1 restores the snippet's 0/0 and is the control the
-    // rest threshold is calibrated against.
-    const bool noAero = std::getenv("PXG_PARTICLE_CLOTH_NOAERO") != nullptr;
-    const float clothLift = noAero ? 0.0f : CLOTH_LIFT;
-    const float clothDrag = noAero ? 0.0f : CLOTH_DRAG;
-    PxPBDMaterial* pbdMat = physics->createPBDMaterial(0.8f, 0.05f, 1e+6f, 0.001f, 0.5f,
-                                                       0.005f, 0.05f, clothLift, clothDrag);
-    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
-    ps->setRestOffset(restOffset);
-    ps->setContactOffset(restOffset + 0.02f);
-    ps->setParticleContactOffset(restOffset + 0.02f);
-    ps->setSolidRestOffset(restOffset);
-    ps->setFluidRestOffset(0.0f);
-    // A hanging sheet needs a converged solve; the snippet leaves the default, but
-    // the default is tuned for a sheet resting ON something, not one suspended
-    // from a single row.  Both runs use the same count so the control is fair.
-    ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
-    scene->addActor(*ps);
-
-    const PxU32 phase = ps->createPhase(pbdMat, PxParticlePhaseFlags(
-        PxParticlePhaseFlag::eParticlePhaseSelfCollideFilter |
-        PxParticlePhaseFlag::eParticlePhaseSelfCollide));
-
-    // Lay the sheet out row-major in i (the hang direction) so that row i == 0 --
-    // the pinned row -- occupies indices [0, CLOTH_NZ).
-    std::vector<PxVec4> hostPos(numParticles), hostVel(numParticles, PxVec4(0.0f));
-    std::vector<PxU32> hostPhase(numParticles, phase);
-    std::vector<PxParticleSpring> springs;
-    std::vector<PxU32> triangles;
-    springs.reserve(numSprings);
-    triangles.reserve(size_t(numTriangles) * 3u);
-
-    const float z0 = -0.5f * float(CLOTH_NZ - 1) * CLOTH_SPACING;
-    for (PxU32 i = 0; i < CLOTH_NX; ++i)
-    {
-        for (PxU32 j = 0; j < CLOTH_NZ; ++j)
-        {
-            const PxU32 index = clothId(i, j, CLOTH_NZ);
-            // The pinned row has invMass 0, which makes it immovable in the
-            // integrator (particlesystem.cu:3143 guards on pos4.w > 0) and
-            // weightless in the spring solve (wsum is the sum of the two inverse
-            // masses).  ps_averageVertsLaunch skips it outright
-            // (particlesystem.cu:4379), which is why the assertions read the FREE
-            // range only.
-            const float invMass = (i == 0) ? 0.0f : (1.0f / particleMass);
-            hostPos[index] = PxVec4(float(i) * CLOTH_SPACING, CLOTH_PIN_Y,
-                                    z0 + float(j) * CLOTH_SPACING, invMass);
-
-            if (i > 0)
-                springs.push_back({ clothId(i - 1, j, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
-                                    CLOTH_SPACING, stretchStiffness, springDamping, 0.0f });
-            if (j > 0)
-                springs.push_back({ clothId(i, j - 1, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
-                                    CLOTH_SPACING, stretchStiffness, springDamping, 0.0f });
-            if (i > 0 && j > 0)
-            {
-                const float diag = PxSqrt(2.0f) * CLOTH_SPACING;
-                springs.push_back({ clothId(i - 1, j - 1, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
-                                    diag, shearStiffness, springDamping, 0.0f });
-                springs.push_back({ clothId(i - 1, j, CLOTH_NZ), clothId(i, j - 1, CLOTH_NZ),
-                                    diag, shearStiffness, springDamping, 0.0f });
-                triangles.push_back(clothId(i - 1, j - 1, CLOTH_NZ));
-                triangles.push_back(clothId(i - 1, j, CLOTH_NZ));
-                triangles.push_back(clothId(i, j - 1, CLOTH_NZ));
-                triangles.push_back(clothId(i - 1, j, CLOTH_NZ));
-                triangles.push_back(clothId(i, j - 1, CLOTH_NZ));
-                triangles.push_back(clothId(i, j, CLOTH_NZ));
-            }
-        }
-    }
-    if (springs.size() != numSprings || triangles.size() != size_t(numTriangles) * 3u)
-    {
-        std::printf("FAIL: cloth topology count mismatch (springs %zu vs %u, tris %zu vs %u)\n",
-                    springs.size(), numSprings, triangles.size() / 3u, numTriangles);
-        return out;
-    }
-
-    PxCudaContext* ctx = cudaCtx->getCudaContext();
-
-    if (!springsMode)
-    {
-        // The CONTROL: identical particles, no springs, plain buffer.  This is the
-        // host's own gate (getMaxSpringsPerBuffer() > 0) expressed as a scene.
-        PxParticleBuffer* buffer = physics->createParticleBuffer(numParticles, 0, cudaCtx);
-        if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
-                        hostPos.data(), numParticles * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
-                        hostVel.data(), numParticles * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
-                        hostPhase.data(), numParticles * sizeof(PxU32));
-        buffer->setNbActiveParticles(numParticles);
-        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
-        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
-        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
-        ps->addParticleBuffer(buffer);
-        out.system = ps;
-        out.buffer = buffer;
-        out.numParticles = numParticles;
-        out.numPinned = CLOTH_NZ;
-        return out;
-    }
-
-    // --- the real cloth path ---
-    //
-    // SnippetPBDCloth routes this through two physxextensions helpers
-    // (PxParticleClothBufferHelper and PxCreateAndPopulateParticleClothBuffer).
-    // Neither is available here -- the sdktest links the CPU SDK core only, not
-    // physxextensions -- and neither needs to be: the first is pure bookkeeping
-    // that fills a PxParticleClothDesc, and the second is a transparent wrapper
-    // over createParticleClothBuffer + six memcpys + setCloths
-    // (ExtParticleExt.cpp:92-126).  Both are inlined below rather than dragging in
-    // the extensions library for twenty lines of struct filling.
-    PxParticleCloth cloth;
-    cloth.startVertexIndex = 0;
-    cloth.numVertices = numParticles;
-    cloth.clothBlendScale = 0.0f;   // filled in by partitionSprings
-    cloth.restVolume = 0.0f;        // inflatable only, and this sheet is not one
-    cloth.pressure = 0.0f;
-    cloth.startTriangleIndex = 0;
-    cloth.numTriangles = numTriangles;
-
-    std::vector<PxVec4> restPositions = hostPos;
-
-    PxParticleClothDesc clothDesc;
-    clothDesc.cloths = &cloth;
-    clothDesc.triangles = triangles.data();
-    clothDesc.springs = springs.data();
-    clothDesc.restPositions = restPositions.data();
-    clothDesc.nbCloths = 1;
-    clothDesc.nbSprings = numSprings;
-    clothDesc.nbTriangles = numTriangles;
-    clothDesc.nbParticles = numParticles;
-
-    // partitionSprings is PURE CPU -- PX_ALLOC, partitions(), combinePartitions(),
-    // PxSort (NpParticleBuffer.cpp:543-596).  It launches no CUDA kernels, which is
-    // what makes this scene buildable on the port at all.  It is also where
-    // clothBlendScale comes from: 1 / (maxCopiesOverThisCloth + 1), with the
-    // engine's own "AD Todo: figure out why blendScale is computed like this"
-    // sitting above it (:562).
-    PxParticleClothPreProcessor* pre = PxCreateParticleClothPreProcessor(cudaCtx);
-    if (!pre) { std::printf("FAIL: PxCreateParticleClothPreProcessor returned null\n"); return out; }
-    PxPartitionedParticleCloth partitioned;
-    pre->partitionSprings(clothDesc, partitioned);
-    pre->release();
-
-    std::printf("  cloth partitioning: %u springs -> %u partitions, maxSpringsPerPartition %u, "
-                "remapOutputSize %u, clothBlendScale %.6f\n",
-                partitioned.nbSprings, partitioned.nbPartitions,
-                partitioned.maxSpringsPerPartition, partitioned.remapOutputSize,
-                cloth.clothBlendScale);
-
-    PxParticleClothBuffer* buffer = physics->createParticleClothBuffer(
-        numParticles, /*maxVolumes*/ 0, clothDesc.nbCloths, clothDesc.nbTriangles,
-        clothDesc.nbSprings, cudaCtx);
-    if (!buffer) { std::printf("FAIL: createParticleClothBuffer returned null\n"); return out; }
-
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
-                    hostPos.data(), numParticles * sizeof(PxVec4));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
-                    hostVel.data(), numParticles * sizeof(PxVec4));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
-                    hostPhase.data(), numParticles * sizeof(PxU32));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getTriangles()),
-                    triangles.data(), size_t(numTriangles) * 3u * sizeof(PxU32));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getRestPositions()),
-                    restPositions.data(), numParticles * sizeof(PxVec4));
-    buffer->setNbActiveParticles(numParticles);
-    buffer->setNbTriangles(numTriangles);
-    buffer->setCloths(partitioned);
-    ps->addParticleBuffer(buffer);
-
-    out.system = ps;
-    out.buffer = buffer;
-    out.numParticles = numParticles;
-    out.numPinned = CLOTH_NZ;
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// P9.7 -- PXG_SCENE=particleinflatable: the PRESSURISED closed mesh.
-//
-// P9.6 landed ps_calculateInflatableVolume and ps_solveInflatableVolume with a 39/39
-// sweep, and both were physically inert in every scene: particlecloth has
-// pressure = 0, which is exactly the engine's marker for "solve this as ordinary
-// cloth", so both kernels launch and return at their early-out.  This scene gives
-// them something to do.
-//
-// AN INFLATABLE NEEDS A CLOSED MESH.  A flat sheet encloses no volume, so the
-// P9.4 geometry cannot be reused at all.  SnippetPBDInflatable builds a sphere by
-// projecting a cube onto it and then calling PxRemeshingExt::limitMaxEdgeLength --
-// which lives in physxextensions, not linked here.  This builds the same shape by
-// SUBDIVIDING instead: the snippet's 8-vertex / 12-triangle cube, each triangle
-// split into four at its edge midpoints, every new vertex projected back onto the
-// sphere, twice.  That gives 12*4*4 = 192 triangles over 98 vertices, closed and
-// watertight by construction.
-//
-// THE REST VOLUME IS SIX TIMES THE GEOMETRIC VOLUME, and this is not a guess: the
-// cooker computes `Gu::computeTriangleMeshVolume(...) * 6.0f` with the engine's own
-// comment "the physx api takes volume*6 now"
-// (ExtParticleClothCooker.cpp:449-453), and Gu's formula is
-// `sum (v0 x v1) . v2 / 6` (GuInternal.h:204-221).  The two sixes cancel, so
-// restVolume is simply the sum of (v0 x v1) . v2 -- which is also exactly the
-// quantity ps_calculateInflatableVolume accumulates without dividing (P9.6's trap
-// I3).  The producer side therefore confirms the port's spelling.
-//
-// Springs are the mesh's unique EDGES; there is no cooker here to generate
-// bending constraints, and none is needed to make the pair observable.
-
-struct InflMesh
-{
-    std::vector<PxVec3> verts;
-    std::vector<PxU32> tris;      // 3 per triangle
-};
-
-// One level of 4-to-1 subdivision with midpoint sharing, then re-projection.
-static void inflSubdivide(InflMesh& m, const PxVec3& centre, float radius)
-{
-    std::map<std::pair<PxU32, PxU32>, PxU32> midCache;
-    auto midpoint = [&](PxU32 a, PxU32 b) -> PxU32
-    {
-        const std::pair<PxU32, PxU32> key = (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
-        auto it = midCache.find(key);
-        if (it != midCache.end()) return it->second;
-        PxVec3 p = (m.verts[a] + m.verts[b]) * 0.5f;
-        PxVec3 dir = p - centre;
-        dir.normalize();
-        p = centre + dir * radius;
-        const PxU32 idx = PxU32(m.verts.size());
-        m.verts.push_back(p);
-        midCache[key] = idx;
-        return idx;
-    };
-
-    std::vector<PxU32> out;
-    out.reserve(m.tris.size() * 4u);
-    for (size_t t = 0; t + 2 < m.tris.size(); t += 3)
-    {
-        const PxU32 a = m.tris[t + 0], b = m.tris[t + 1], c = m.tris[t + 2];
-        const PxU32 ab = midpoint(a, b), bc = midpoint(b, c), ca = midpoint(c, a);
-        const PxU32 f[4][3] = { { a, ab, ca }, { ab, b, bc }, { ca, bc, c }, { ab, bc, ca } };
-        for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 3; ++j) out.push_back(f[i][j]);
-    }
-    m.tris.swap(out);
-}
-
-static InflMesh buildInflSphere(const PxVec3& centre, float radius, int levels)
-{
-    // SnippetPBDInflatable.cpp:96-99 -- the same cube and the same winding.
-    static const float CV[8][3] = {
-        { 0.5f, -0.5f, -0.5f }, { 0.5f, -0.5f, 0.5f }, { -0.5f, -0.5f, 0.5f }, { -0.5f, -0.5f, -0.5f },
-        { 0.5f,  0.5f, -0.5f }, { 0.5f,  0.5f, 0.5f }, { -0.5f,  0.5f, 0.5f }, { -0.5f,  0.5f, -0.5f }
-    };
-    static const PxU32 CI[36] = { 1,2,3, 7,6,5, 4,5,1, 5,6,2, 2,6,7, 0,3,7,
-                                  0,1,3, 4,7,5, 0,4,1, 1,5,2, 3,2,7, 4,0,7 };
-    InflMesh m;
-    for (int i = 0; i < 8; ++i)
-    {
-        PxVec3 dir(CV[i][0], CV[i][1], CV[i][2]);
-        dir.normalize();
-        m.verts.push_back(centre + dir * radius);
-    }
-    for (int i = 0; i < 36; ++i) m.tris.push_back(CI[i]);
-    for (int l = 0; l < levels; ++l) inflSubdivide(m, centre, radius);
-    return m;
-}
-
-// sum (v0 x v1) . v2 over the triangles -- six times the enclosed volume, which is
-// the unit both PxParticleCloth::restVolume and the kernel use.
-static float inflMeshVolume6(const std::vector<PxVec3>& v, const std::vector<PxU32>& tris)
-{
-    float acc = 0.0f;
-    for (size_t t = 0; t + 2 < tris.size(); t += 3)
-        acc += v[tris[t]].cross(v[tris[t + 1]]).dot(v[tris[t + 2]]);
-    return acc;
-}
-
-static const float INFL_RADIUS = 0.8f;
-static const PxVec3 INFL_CENTRE = PxVec3(0.0f, 5.0f, 0.0f);
-// The mesh is spawned SQUASHED along y; pressure has to puff it back out.
-static const float INFL_SQUASH = 0.35f;
-static const float INFL_PRESSURE = 1.0f;   // target volume = rest volume
-// CALIBRATION.  Measured on this scene, the only difference between the two runs
-// being the cloth's `pressure` field (PXG_PARTICLE_INFL_CONTROL=1 zeroes it):
-//
-//                                pressure 1.0    pressure 0 (control)
-//   volume at the end             100.0% of rest    28.9% of rest
-//   volume at its peak            283.5%            80.4%
-//
-// The pressurised mesh does not merely get bigger -- it CONVERGES ON ITS TARGET.
-// The constraint drives the enclosed volume to restVolume * pressure, and with
-// pressure 1.0 that is the rest volume exactly: 12.0252 against a rest of 12.0235.
-// So the check is target convergence, not growth, which discriminates by a factor
-// of about seven thousand rather than by a ratio.  The control run misses the
-// target by 0.711 and fails it outright.
-//
-// The overshoot to 283% is real and is stated rather than hidden: the mesh is
-// spawned at 35% of its volume with deliberately soft springs, so the volume
-// constraint's first correction is large.  It converges within about thirty steps
-// and stays.  The second check bounds that transient, so a wrong-signed or
-// wrong-scaled constraint that diverges is caught even if it happened to pass
-// through the target on its way out.
-static const float INFL_VOL_TARGET_TOL = 0.05f;   // |end/rest - pressure|
-static const float INFL_VOL_CONTROL = 0.289f;     // measured, pressure 0
-static const float INFL_VOL_MAX = 5.0f;           // measured peak 2.835
-
-ParticleScene buildParticleInflatableScene(PxPhysics* physics, PxScene* scene,
-                                           PxMaterial* rigidMat, PxCudaContextManager* cudaCtx,
-                                           bool pressurised)
-{
-    ParticleScene out;
-    out.cudaCtx = cudaCtx;
-
-    addGroundBox(physics, scene, rigidMat);
-    {
-        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
-        PxShape* sh = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
-        aside->attachShape(*sh);
-        aside->setMass(1000.0f);
-        aside->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
-        sh->release();
-        scene->addActor(*aside);
-    }
-
-    const InflMesh mesh = buildInflSphere(INFL_CENTRE, INFL_RADIUS, 2);
-    const PxU32 numParticles = PxU32(mesh.verts.size());
-    const PxU32 numTriangles = PxU32(mesh.tris.size() / 3u);
-
-    // The REST volume is the un-squashed sphere's.
-    const float restVolume6 = inflMeshVolume6(mesh.verts, mesh.tris);
-
-    // Springs = the unique edges of the closed mesh.
-    std::vector<PxParticleSpring> springs;
-    {
-        std::set<std::pair<PxU32, PxU32>> edges;
-        for (size_t t = 0; t + 2 < mesh.tris.size(); t += 3)
-        {
-            const PxU32 idx[3] = { mesh.tris[t], mesh.tris[t + 1], mesh.tris[t + 2] };
-            for (int e = 0; e < 3; ++e)
-            {
-                PxU32 a = idx[e], b = idx[(e + 1) % 3];
-                if (a > b) { const PxU32 tmp = a; a = b; b = tmp; }
-                edges.insert(std::make_pair(a, b));
-            }
-        }
-        for (auto& e : edges)
-        {
-            PxParticleSpring sp;
-            std::memset(&sp, 0, sizeof(sp));
-            sp.ind0 = e.first;
-            sp.ind1 = e.second;
-            sp.length = (mesh.verts[e.first] - mesh.verts[e.second]).magnitude();
-            // DELIBERATELY SOFT.  Stiff springs would restore the squashed sphere on
-            // their own and the pressure's contribution would be invisible -- the
-            // scene would pass for the wrong reason.
-            sp.stiffness = 200.0f;
-            sp.damping = 0.05f;
-            springs.push_back(sp);
-        }
-    }
-    const PxU32 numSprings = PxU32(springs.size());
-
-    const float restOffset = 0.10f;
-    const float totalMass = 4.0f;
-    const float particleMass = totalMass / float(numParticles);
-
-    PxPBDMaterial* pbdMat = physics->createPBDMaterial(0.8f, 0.05f, 1e+6f, 0.001f, 0.5f,
-                                                       0.005f, 0.05f, 0.0f, 0.0f);
-    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
-    ps->setRestOffset(restOffset);
-    ps->setContactOffset(restOffset + 0.02f);
-    ps->setParticleContactOffset(restOffset + 0.02f);
-    ps->setSolidRestOffset(restOffset);
-    ps->setFluidRestOffset(0.0f);
-    ps->setSolverIterationCounts(8, 1);
-    scene->addActor(*ps);
-
-    const PxU32 phase = ps->createPhase(pbdMat, PxParticlePhaseFlags(
-        PxParticlePhaseFlag::eParticlePhaseSelfCollideFilter |
-        PxParticlePhaseFlag::eParticlePhaseSelfCollide));
-
-    // Spawn SQUASHED along y.  With pressure the volume constraint has to push it
-    // back out; without it, only the soft springs pull.
-    std::vector<PxVec4> hostPos(numParticles);
-    std::vector<PxVec4> hostVel(numParticles, PxVec4(0.0f));
-    std::vector<PxU32> hostPhase(numParticles, phase);
-    for (PxU32 i = 0; i < numParticles; ++i)
-    {
-        PxVec3 p = mesh.verts[i];
-        p.y = INFL_CENTRE.y + (p.y - INFL_CENTRE.y) * INFL_SQUASH;
-        hostPos[i] = PxVec4(p.x, p.y, p.z, 1.0f / particleMass);
-    }
-
-    PxParticleCloth cloth;
-    cloth.startVertexIndex = 0;
-    cloth.numVertices = numParticles;
-    cloth.clothBlendScale = 0.0f;              // filled in by partitionSprings
-    cloth.restVolume = restVolume6;            // SIX TIMES the geometric volume
-    cloth.pressure = pressurised ? INFL_PRESSURE : 0.0f;
-    cloth.startTriangleIndex = 0;              // an INDEX-ARRAY offset (P9.6, I2)
-    cloth.numTriangles = numTriangles;
-
-    std::vector<PxVec4> restPositions(numParticles);
-    for (PxU32 i = 0; i < numParticles; ++i)
-        restPositions[i] = PxVec4(mesh.verts[i].x, mesh.verts[i].y, mesh.verts[i].z,
-                                  1.0f / particleMass);
-
-    PxParticleClothDesc clothDesc;
-    clothDesc.cloths = &cloth;
-    clothDesc.triangles = const_cast<PxU32*>(mesh.tris.data());
-    clothDesc.springs = springs.data();
-    clothDesc.restPositions = restPositions.data();
-    clothDesc.nbCloths = 1;
-    clothDesc.nbSprings = numSprings;
-    clothDesc.nbTriangles = numTriangles;
-    clothDesc.nbParticles = numParticles;
-
-    PxParticleClothPreProcessor* pre = PxCreateParticleClothPreProcessor(cudaCtx);
-    if (!pre) { std::printf("FAIL: PxCreateParticleClothPreProcessor returned null\n"); return out; }
-    PxPartitionedParticleCloth partitioned;
-    pre->partitionSprings(clothDesc, partitioned);
-    pre->release();
-
-    std::printf("  inflatable: %u verts, %u tris, %u springs, restVolume(x6)=%.6g, "
-                "pressure=%.2f, %u partitions\n",
-                numParticles, numTriangles, numSprings, restVolume6, cloth.pressure,
-                partitioned.nbPartitions);
-
-    PxParticleClothBuffer* buffer = physics->createParticleClothBuffer(
-        numParticles, 0, clothDesc.nbCloths, clothDesc.nbTriangles, clothDesc.nbSprings, cudaCtx);
-    if (!buffer) { std::printf("FAIL: createParticleClothBuffer returned null\n"); return out; }
-
-    PxCudaContext* ctx = cudaCtx->getCudaContext();
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
-                    hostPos.data(), numParticles * sizeof(PxVec4));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
-                    hostVel.data(), numParticles * sizeof(PxVec4));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
-                    hostPhase.data(), numParticles * sizeof(PxU32));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getTriangles()),
-                    mesh.tris.data(), size_t(numTriangles) * 3u * sizeof(PxU32));
-    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getRestPositions()),
-                    restPositions.data(), numParticles * sizeof(PxVec4));
-    buffer->setNbActiveParticles(numParticles);
-    buffer->setNbTriangles(numTriangles);
-    buffer->setCloths(partitioned);
-    ps->addParticleBuffer(buffer);
-
-    out.system = ps;
-    out.buffer = buffer;
-    out.numParticles = numParticles;
-    out.numPinned = 0;
-    return out;
-}
-
-// The scene's observable: the enclosed volume of the live mesh, in the same
-// six-times unit as restVolume.  Read the positions back and re-run the mesh
-// formula over the SAME triangle list.
-float inflLiveVolume6(const ParticleScene& psc, const std::vector<PxU32>& tris)
-{
-    std::vector<PxVec4> host(psc.numParticles);
-    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
-    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
-                    psc.numParticles * sizeof(PxVec4));
-    std::vector<PxVec3> v(psc.numParticles);
-    for (PxU32 i = 0; i < psc.numParticles; ++i) v[i] = PxVec3(host[i].x, host[i].y, host[i].z);
-    return inflMeshVolume6(v, tris);
-}
-
-// DtoH-read the particle buffer and return the mean y over the FREE particles
-// (indices [numPinned, numParticles)).  The pinned row never moves, so averaging
-// it in would blunt the very signal being measured.
-float clothFreeMeanY(const ParticleScene& psc)
-{
-    std::vector<PxVec4> host(psc.numParticles);
-    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
-    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
-                    psc.numParticles * sizeof(PxVec4));
-    double sum = 0.0;
-    PxU32 n = 0;
-    for (PxU32 i = psc.numPinned; i < psc.numParticles; ++i) { sum += double(host[i].y); ++n; }
-    return n ? float(sum / double(n)) : 0.0f;
-}
-
-// The diagonal of the axis-aligned bounding box over ALL particles.  This is the
-// EXPLOSION check and it is independent of the hang check: a spring solve with the
-// wrong sign or the wrong scale blows the sheet apart, which raises the diagonal
-// without necessarily lowering the mean y.  A flat 2.2 x 2.2 sheet has a diagonal
-// of 3.11; hanging it folds the sheet, which can only shrink the bound.
-float clothBBoxDiag(const ParticleScene& psc)
-{
-    std::vector<PxVec4> host(psc.numParticles);
-    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
-    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
-                    psc.numParticles * sizeof(PxVec4));
-    PxVec3 lo(1e30f), hi(-1e30f);
-    for (PxU32 i = 0; i < psc.numParticles; ++i)
-    {
-        lo.x = PxMin(lo.x, host[i].x); hi.x = PxMax(hi.x, host[i].x);
-        lo.y = PxMin(lo.y, host[i].y); hi.y = PxMax(hi.y, host[i].y);
-        lo.z = PxMin(lo.z, host[i].z); hi.z = PxMax(hi.z, host[i].z);
-    }
-    return (hi - lo).magnitude();
-}
+// P9.4 PXG_SCENE=particlecloth (the PBD spring cloth, PxParticleClothBuffer) and P9.7
+// PXG_SCENE=particleinflatable (a pressurised particle cloth) are retired: 5.12 removed
+// particle cloth (CHANGELOG 5.12, Particles / Removed; PxDeformableSurface is the named
+// replacement, and the cloth* scenes below already cover it).  What both scenes existed
+// to reach -- the PBD spring / aerodynamics / inflatable kernels -- has no 5.12 entry
+// point, so a PxDeformableSurface rebuild would not preserve their purpose.
 
 // PXG_SCENE=cloth (P7.0): the first FEMCloth/deformable-surface scene — the exact
 // analog of the PBD particle free fall (buildParticleScene above).  A small
@@ -8738,7 +7760,7 @@ SoftBodyParticleScene buildSoftBodyParticleScene(PxPhysics* physics, PxScene* sc
                                         spawnBaseY + float(y) * particleSpacing,
                                         float(z) * particleSpacing - c, particleInvMass);
 
-    PxParticleBuffer* buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+    PxParticleBuffer* buffer = physics->createParticleBuffer(N, cudaCtx);
     if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
     PxCudaContext* ctx = cudaCtx->getCudaContext();
     ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()), hostPos.data(),
@@ -9065,6 +8087,38 @@ static void collisionTetCentroids(PxDeformableVolume* vol, std::vector<PxVec3>& 
     }
 }
 
+// The SIMULATION tetrahedron containing a point given in the meshes' common frame, and the
+// point's barycentric coordinates in it.  5.12's PxDeformableAttachment addresses a volume's
+// eTETRAHEDRON targets on the simulation mesh, where the removed addSoftBodyAttachment took
+// collision-mesh tetrahedra; this carries the same attachment POINT across.  The tetrahedron
+// whose smallest barycentric coordinate is largest wins, so a point on a shared face still
+// resolves.  (PxDeformableVolumeExt::convertCollisionToSimulationTet does the same, but the
+// harness does not link the extensions beyond the D6 joint.)
+static bool simTetAtPoint(PxDeformableVolume* vol, const PxVec3& p, PxU32& tetOut, PxVec4& baryOut)
+{
+    const PxTetrahedronMesh* mesh = vol->getSimulationMesh();
+    const PxVec3* v = mesh->getVertices();
+    const bool is16 = (mesh->getTetrahedronMeshFlags() & PxTetrahedronMeshFlag::e16_BIT_INDICES);
+    float best = -FLT_MAX;
+    for (PxU32 t = 0; t < mesh->getNbTetrahedrons(); ++t)
+    {
+        PxU32 idx[4];
+        for (int k = 0; k < 4; ++k)
+            idx[k] = is16 ? PxU32(reinterpret_cast<const PxU16*>(mesh->getTetrahedrons())[4 * t + k])
+                          : reinterpret_cast<const PxU32*>(mesh->getTetrahedrons())[4 * t + k];
+        const PxVec3 a = v[idx[0]], ab = v[idx[1]] - a, ac = v[idx[2]] - a, ad = v[idx[3]] - a, ap = p - a;
+        const float det = ab.dot(ac.cross(ad));
+        if (std::fabs(det) < 1e-12f) continue;
+        const float b1 = ap.dot(ac.cross(ad)) / det;
+        const float b2 = ab.dot(ap.cross(ad)) / det;
+        const float b3 = ab.dot(ac.cross(ap)) / det;
+        const PxVec4 b(1.0f - b1 - b2 - b3, b1, b2, b3);
+        const float worst = PxMin(PxMin(b.x, b.y), PxMin(b.z, b.w));
+        if (worst > best) { best = worst; tetOut = t; baryOut = b; }
+    }
+    return best >= -1e-4f;
+}
+
 SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                              PxCudaContextManager* cudaCtx)
 {
@@ -9133,7 +8187,11 @@ SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene,
     std::sort(lowTop.begin(), lowTop.end(), [&](PxU32 a, PxU32 b) { return lowC[a].x > lowC[b].x; });
     std::sort(upBottom.begin(), upBottom.end(), [&](PxU32 a, PxU32 b) { return upC[a].x < upC[b].x; });
 
-    const PxVec4 centroidBary(0.25f, 0.25f, 0.25f, 0.25f);
+    // 5.12: the per-actor addSoftBodyAttachment is gone (CHANGELOG 5.12, Deformables / Removed);
+    // the same four centroid pairs go into ONE PxDeformableAttachment, eTETRAHEDRON on both
+    // volumes, each collision-tet centroid carried to the simulation tetrahedron holding it.
+    std::vector<PxU32> upSimTets, lowSimTets;
+    std::vector<PxVec4> upSimBary, lowSimBary;
     const PxU32 nbPairs = PxMin(PxU32(4), PxMin(PxU32(lowTop.size()), PxU32(upBottom.size())));
     for (PxU32 k = 0; k < nbPairs; ++k)
     {
@@ -9148,10 +8206,30 @@ SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene,
             const float d = dy * dy + dz * dz;
             if (d < bestD) { bestD = d; best = lt; }
         }
-        // upper->addSoftBodyAttachment(lower, tetIdxLower, baryLower, tetIdxUpper, baryUpper)
-        const PxU32 handle = out.upper->addSoftBodyAttachment(out.lower, best, centroidBary,
-                                                              upTet, centroidBary);
-        if (handle != 0xFFFFFFFFu) ++out.nbAttachments;
+        PxU32 ut = 0, lt = 0;
+        PxVec4 ub, lb;
+        if (!simTetAtPoint(out.upper, upC[upTet], ut, ub) || !simTetAtPoint(out.lower, lowC[best], lt, lb))
+            continue;
+        upSimTets.push_back(ut); upSimBary.push_back(ub);
+        lowSimTets.push_back(lt); lowSimBary.push_back(lb);
+    }
+    if (!upSimTets.empty())
+    {
+        PxDeformableAttachmentData d;
+        d.actor[0] = out.upper;
+        d.type[0] = PxDeformableAttachmentTargetType::eTETRAHEDRON;
+        d.indices[0].data = upSimTets.data();
+        d.indices[0].count = PxU32(upSimTets.size());
+        d.coords[0].data = upSimBary.data();
+        d.coords[0].count = PxU32(upSimBary.size());
+        d.actor[1] = out.lower;
+        d.type[1] = PxDeformableAttachmentTargetType::eTETRAHEDRON;
+        d.indices[1].data = lowSimTets.data();
+        d.indices[1].count = PxU32(lowSimTets.size());
+        d.coords[1].data = lowSimBary.data();
+        d.coords[1].count = PxU32(lowSimBary.size());
+        if (physics->createDeformableAttachment(d))
+            out.nbAttachments = PxU32(upSimTets.size());
     }
 
     return out;
@@ -9162,7 +8240,7 @@ SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene,
 // vertices, with nothing beneath it.
 //
 // WHY A NEW SCENE WHEN softbodyattach ALREADY EXISTS.  That one (P8.19) is FEM-vs-FEM:
-// its attachment is addSoftBodyAttachment(volume, volume), which routes to the
+// its attachment is volume-volume (addSoftBodyAttachment before 5.12), which routes to the
 // sb_solveFemFemAttachment kernels.  It does NOT touch the RIGID attachment chain --
 // sb_rigidAttachmentPrepareLaunch and sb_solveRigidSoftAttachmentLaunch{,TGS} -- and
 // that is exactly why nothing in this tree noticed that the TGS half had never run.
@@ -9243,7 +8321,20 @@ SoftBodyAttachScene buildSoftBodyHangScene(PxPhysics* physics, PxScene* scene,
 }
 
 // ===========================================================================
-// PXG_SCENE=softbodydata (P9.95): the deprecated direct softbody-data API,
+// PXG_SCENE=softbodydata (P9.95).
+//
+// 5.12 PORT.  5.12 removed PxScene::copySoftBodyData / applySoftBodyData and
+// PxSoftBodyGpuDataFlag with no direct replacement (CHANGELOG 5.12, Deformables / Removed;
+// 5.5 deprecation note: the data is exposed on the PxDeformableVolume device buffers), and
+// PxDirectGPUAPI has no deformable data.  The scene now makes the supported 5.12 writes:
+// memcpyHtoD into getSimVelocityBufferD / getSimPositionInvMassBufferD followed by the
+// mandatory PxDeformableVolume::markDirty -- what the old control (PXG_SBDATA_CONTROL)
+// did, minus markDirty, and measured hash-equal to the API run.  The three COPY checks are
+// gone: in 5.12 a copy is the plain read of the buffer the checks used as their reference.
+// The apply / step checks and their bars are unchanged.  The text below is the 5.6.1
+// design record.
+//
+// 5.6.1: the deprecated direct softbody-data API,
 // PxScene::copySoftBodyData / applySoftBodyData (PxScene.h:1761/:1776) ->
 // PxgSimulationController (:564-582) -> PxgSoftBodyCore::copy/applySoftBodyDataDEPRECATED
 // (:3157/:3175) -> copyOrApplySoftBodyDataDEPRECATED (:3118) ->
@@ -9507,26 +8598,45 @@ int main()
         if (sn && !std::strcmp(sn, "forcethreshold"))
             gForceThresholdPairs = true;
         // P9.95 -- PXG_SCENE=substepgravity: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is
-        // not in eMUTABLE_FLAGS (PxSceneDesc.h:373), so it is raised here.  It is TGS-only:
-        // PxSceneDesc::isValid rejects it with PGS (PxSceneDesc.h:1129) and createScene
-        // would return null.  PXG_CPU_CONTROL=1 stays legal (the CPU TGS supports the flag,
-        // DyTGSDynamics.cpp:1478); it is reported and not scored.
+        // not in eMUTABLE_FLAGS (PxSceneDesc.h:373), so it is raised here (5.12 makes it the
+        // default, so this is now explicit rather than necessary).  It is TGS-only: 5.6.1's
+        // PxSceneDesc::isValid rejected it with PGS; 5.12 accepts it and a PGS scene ignores
+        // it, so a PGS row would measure nothing and the scene still refuses one.
+        // PXG_CPU_CONTROL=1 stays legal (the CPU TGS supports the flag, DyTGSDynamics.cpp:1478);
+        // it is reported and not scored.
         if (sn && !std::strcmp(sn, "substepgravity"))
         {
             if (usePgs)
             {
-                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=substepgravity is TGS-only (PxSceneDesc::isValid "
-                            "rejects eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS with PGS, PxSceneDesc.h:1129)\n");
+                std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE=substepgravity is TGS-only (a PGS scene ignores "
+                            "eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS, PxSceneDesc.h)\n");
                 physics->release(); cudaCtx->release(); foundation->release();
                 return 1;
             }
             sceneDesc.flags |= PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS;
             std::printf("  [ P9.95 ] eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS raised\n");
         }
-        // P9.95 -- PXG_SCENE=particleapply: applyParticleBufferData is legal only once the
-        // direct-GPU API is initialized (NpScene.cpp:3735), so the flag is raised here.  It
-        // is raised for the control (PXG_PARTICLE_APPLY_CONTROL=1) as well: the control
-        // differs from the live run only in how the edits are ingested, not in the pipeline.
+        // 5.12 -- PXG_SCENE=extforce CLEARS eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS, which
+        // 5.12 made the PxSceneDesc default (CHANGELOG 5.12, General).  Under the flag a TGS
+        // scene turns addForce / addTorque into external accelerations (ScBodySim.cpp:660-663)
+        // and applyTGSSubstepGravity applies them -- substepgravity's path, measured there with
+        // these same bodies -- so updateBodyExternalVelocitiesLaunch, the kernel this scene
+        // exists for, would not launch under TGS at all.  Measured on 5.12 with the flag left at
+        // its default: K.x 1.48125, K.y 95.07457, F.z 0.252083, exactly substepgravity's
+        // figures.  The flag is deprecated; when upstream removes it, the TGS row loses this
+        // kernel and only the PGS row keeps it.
+        // PXG_TGS_FORCES_ONCE=1 (diagnostic, never scored): clear the flag in ANY scene, to
+        // tell a 5.12 difference that comes from the new default from one that does not.
+        if (std::getenv("PXG_TGS_FORCES_ONCE") || (sn && !std::strcmp(sn, "extforce")))
+        {
+            sceneDesc.flags.clear(PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS);
+            std::printf("  [ 5.12 ] eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS cleared (%s)\n",
+                        std::getenv("PXG_TGS_FORCES_ONCE") ? "PXG_TGS_FORCES_ONCE diagnostic" : "extforce");
+        }
+        // P9.95 -- PXG_SCENE=particleapply runs under the direct-GPU API (the flag is immutable
+        // after createScene, so it is raised here).  Under 5.6.1 that was what made
+        // applyParticleBufferData legal; 5.12 removed that call, and the scene keeps the flag
+        // so the buffer-flag ingest is still measured in a direct-API scene.
         if (sn && !std::strcmp(sn, "particleapply"))
         {
             if (cpuControl)
@@ -9540,9 +8650,9 @@ int main()
             std::printf("  [ P9.95 ] eENABLE_DIRECT_GPU_API raised (particle direct-API ingest)\n");
         }
         // P9.99b -- PXG_SCENE=particle2: PBD particle systems exist only on the GPU pipeline,
-        // so PXG_CPU_CONTROL=1 is refused for every arm.  The `apply` arm calls
-        // applyParticleBufferData, legal only under the direct-GPU API (NpScene.cpp:3735);
-        // the flag is immutable after createScene, so it is raised here, for every sub-scene.
+        // so PXG_CPU_CONTROL=1 is refused for every arm.  The `apply` arm runs under the
+        // direct-GPU API (it called applyParticleBufferData before 5.12 removed it); the flag
+        // is immutable after createScene, so it is raised here, for every sub-scene.
         if (sn && !std::strcmp(sn, "particle2"))
         {
             if (cpuControl)
@@ -9587,227 +8697,6 @@ int main()
     // PXG_SCENE=particle (P6.0): the deformable/particle free-fall path.  Wholly
     // separate observable from the rigid RestTarget path — a PBD cloud that falls
     // under gravity, verified by DtoH-reading its mean y across steps.
-    // P9.7 -- PXG_SCENE=particleinflatable: a pressurised closed mesh.
-    if (!std::strcmp(sceneName, "particleinflatable"))
-    {
-        // The control zeroes the PRESSURE, which is the engine's own marker for
-        // "solve as ordinary cloth" and makes both P9.6 kernels return at their
-        // early-out.  Everything else -- mesh, springs, masses, iterations -- is
-        // identical, so the difference is the inflatable pair and nothing else.
-        const bool noPressure = std::getenv("PXG_PARTICLE_INFL_CONTROL") != nullptr;
-        const InflMesh mesh = buildInflSphere(INFL_CENTRE, INFL_RADIUS, 2);
-        ParticleScene psc = buildParticleInflatableScene(physics, scene, material, cudaCtx,
-                                                         !noPressure);
-        if (!psc.system)
-        {
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        const float restVol6 = inflMeshVolume6(mesh.verts, mesh.tris);
-        std::printf("  [  OK  ] scene 'particleinflatable' built: %u particles, pressure %s\n",
-                    psc.numParticles, noPressure ? "ZERO (control run)" : "on");
-
-        if (!std::getenv("PXG_GPU_STEP"))
-        {
-            std::printf("[  OK  ] gpu-sdk-step: particle inflatable GPU pipeline CONSTRUCTED + "
-                        "live over Vulkan (set PXG_GPU_STEP=1 to step the inflation)\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
-        }
-
-        const float dt = 1.0f / 60.0f;
-        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 180;
-        const float v0 = inflLiveVolume6(psc, mesh.tris);
-        std::printf("  stepping the inflatable (%d x %.4fs): rest volume(x6) %.6g, "
-                    "squashed start %.6g (%.1f%% of rest)\n",
-                    steps, dt, restVol6, v0, 100.0f * v0 / restVol6);
-
-        float volMax = v0, volEnd = v0;
-        for (int i = 0; i < steps; ++i)
-        {
-            scene->simulate(dt);
-            scene->fetchResults(true);
-            const float v = inflLiveVolume6(psc, mesh.tris);
-            if (v > volMax) volMax = v;
-            volEnd = v;
-            if (i < 5 || i == steps - 1 || (i % 30 == 0))
-                std::printf("    step %3d: volume(x6)=%.6g (%.1f%% of rest)\n",
-                            i, v, 100.0f * v / restVol6);
-        }
-        const float fracEnd = volEnd / restVol6;
-        const float fracMax = volMax / restVol6;
-        std::printf("  particle INFLATABLE: volume(x6) %.6g -> %.6g (max %.6g); "
-                    "%.1f%% -> %.1f%% of rest (max %.1f%%)\n",
-                    v0, volEnd, volMax, 100.0f * v0 / restVol6, 100.0f * fracEnd,
-                    100.0f * fracMax);
-
-        int failures = 0;
-        if (noPressure)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: particleinflatable CONTROL run (pressure 0) "
-                        "measured: %.1f%% of rest volume at the end, %.1f%% at most\n",
-                        100.0f * fracEnd, 100.0f * fracMax);
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-            return 0;
-        }
-
-        if (!(PxAbs(fracEnd - INFL_PRESSURE) < INFL_VOL_TARGET_TOL))
-        {
-            std::printf("FAIL: the mesh did not reach its TARGET volume -- the volume "
-                        "constraint is not converging (%.4f of rest, target %.2f +/- %.2f, "
-                        "pressure-0 control %.4f)\n",
-                        fracEnd, INFL_PRESSURE, INFL_VOL_TARGET_TOL, INFL_VOL_CONTROL);
-            ++failures;
-        }
-        if (!(fracMax < INFL_VOL_MAX))
-        {
-            std::printf("FAIL: the inflatable DIVERGED -- peak volume %.4f of rest exceeds "
-                        "%.2f\n", fracMax, INFL_VOL_MAX); ++failures;
-        }
-        if (!std::isfinite(volEnd))
-        {
-            std::printf("FAIL: the inflatable volume is not finite (%.6g)\n", volEnd);
-            ++failures;
-        }
-        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-        failures += unmappedPenalty();
-        if (failures == 0)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: the PRESSURISED mesh INFLATED to its TARGET "
-                        "volume on Vulkan (%.1f%% of rest vs %.1f%% for the pressure-0 "
-                        "control, peak %.1f%%) -- the inflatable pair runs end to end\n",
-                        100.0f * fracEnd, 100.0f * INFL_VOL_CONTROL, 100.0f * fracMax);
-            return 0;
-        }
-        std::printf("[ FAIL ] gpu-sdk-step: particleinflatable checks failed (%d)\n", failures);
-        return 2;
-    }
-
-    // P9.4 -- PXG_SCENE=particlecloth: the PBD cloth sheet hanging from a pinned
-    // row.  See buildParticleClothScene for why this observable and this control.
-    if (!std::strcmp(sceneName, "particlecloth"))
-    {
-        const bool control = std::getenv("PXG_PARTICLE_CLOTH_CONTROL") != nullptr;
-        // The no-aero arm is a CALIBRATION run, not a pass/fail one: it exists to
-        // measure the number the rest threshold is set against, so it must not be
-        // held to that threshold itself.
-        const bool noAeroScene = std::getenv("PXG_PARTICLE_CLOTH_NOAERO") != nullptr;
-        ParticleScene psc = buildParticleClothScene(physics, scene, material, cudaCtx, !control);
-        if (!psc.system)
-        {
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        std::printf("  [  OK  ] scene 'particlecloth' built: %u PBD particles (%u pinned), "
-                    "springs %s\n", psc.numParticles, psc.numPinned,
-                    control ? "ABSENT (control run)" : "present");
-
-        if (!std::getenv("PXG_GPU_STEP"))
-        {
-            std::printf("[  OK  ] gpu-sdk-step: particle cloth GPU pipeline CONSTRUCTED + live "
-                        "over Vulkan (set PXG_GPU_STEP=1 to step the drape)\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
-        }
-
-        const float dt = 1.0f / 60.0f;
-        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 240;
-        const float y0 = clothFreeMeanY(psc);
-        const float diag0 = clothBBoxDiag(psc);
-        std::printf("  stepping the cloth sheet (%d x %.4fs), initial free mean y=%.4f, "
-                    "bbox diagonal=%.4f\n", steps, dt, y0, diag0);
-
-        // The hang is tracked as a MINIMUM OVER EVERY STEP, not just the final
-        // value.  The sheet swings, so a check on the last step alone could be
-        // satisfied by a run that blew out transiently and happened to be on the
-        // way back up when the loop ended.  Settling for the weaker check would be
-        // settling for a test that passes for the wrong reason.
-        //
-        // The first 20 steps are excluded from the minimum: the sheet starts flat
-        // at y = 5.0 and has to swing DOWN to its hanging position, and during that
-        // swing it legitimately passes through low mean-y values that say nothing
-        // about whether the springs hold.  20 steps is a third of a second, well
-        // inside the measured swing period and far short of the 60 steps the
-        // control needs to reach the floor.
-        const int settleIn = 20;
-        const int restWindow = steps / 4;
-        float prevY = y0, diagMax = diag0, yMin = 1e30f, restMaxDy = 0.0f;
-        for (int i = 0; i < steps; ++i)
-        {
-            scene->simulate(dt);
-            scene->fetchResults(true);
-            const float y = clothFreeMeanY(psc);
-            const float dg = clothBBoxDiag(psc);
-            if (dg > diagMax) diagMax = dg;
-            if (i >= settleIn) yMin = PxMin(yMin, y);
-            // P9.5: with aerodynamics mapped the sheet finally has air resistance,
-            // so a REST check is meaningful for the first time.  P9.4 deliberately
-            // omitted it because the undamped pendulum never settled.
-            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
-            if (i < 5 || i == steps - 1 || (i % 30 == 0))
-                std::printf("    step %3d: free mean y=%.4f (dy %+.5f), bbox diag=%.4f\n",
-                            i, y, y - prevY, dg);
-            prevY = y;
-        }
-        const float yEnd = clothFreeMeanY(psc);
-        const float diagEnd = clothBBoxDiag(psc);
-        std::printf("  particle CLOTH: free mean y %.4f -> %.4f (min after step %d: %.4f), "
-                    "bbox diag %.4f -> %.4f (max %.4f), rest |dy| over last %d steps = %.6f\n",
-                    y0, yEnd, settleIn, yMin, diag0, diagEnd, diagMax, restWindow, restMaxDy);
-
-        int failures = 0;
-        if (control)
-        {
-            // The control is not asserted on -- it is MEASURED, and its number is
-            // what justifies the threshold the real run is held to.  Printing it
-            // in the same format keeps the two comparable by eye.
-            std::printf("[  OK  ] gpu-sdk-step: particlecloth CONTROL run (no springs) "
-                        "measured: free mean y %.4f (min %.4f), bbox diag %.4f (max %.4f), "
-                        "rest |dy| %.6f\n", yEnd, yMin, diagEnd, diagMax, restMaxDy);
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-            return 0;
-        }
-
-        if (!(yMin > CLOTH_HANG_MIN))
-        {
-            std::printf("FAIL: the sheet did not HANG -- the free particles fell away from the "
-                        "pinned row (free mean y dropped to %.4f, threshold %.2f, no-spring "
-                        "control %.4f)\n", yMin, CLOTH_HANG_MIN, CLOTH_HANG_CONTROL); ++failures;
-        }
-        if (!(diagMax < CLOTH_DIAG_MAX))
-        {
-            std::printf("FAIL: the sheet EXPLODED -- max bbox diagonal %.4f exceeds %.2f "
-                        "(the flat sheet's own diagonal is %.2f, the no-spring control reaches "
-                        "%.4f)\n", diagMax, CLOTH_DIAG_MAX, CLOTH_DIAG_REST, CLOTH_DIAG_CONTROL);
-            ++failures;
-        }
-        if (!noAeroScene && !(restMaxDy < CLOTH_REST_MAX))
-        {
-            std::printf("FAIL: the sheet did not come to REST -- aerodynamic drag is not "
-                        "damping the swing (rest |dy|=%.6f, threshold %.4f, no-aero "
-                        "control %.6f)\n", restMaxDy, CLOTH_REST_MAX, CLOTH_REST_NOAERO);
-            ++failures;
-        }
-        if (!std::isfinite(yEnd) || !std::isfinite(diagEnd))
-        {
-            std::printf("FAIL: cloth state is not finite (y=%.4f, diag=%.4f)\n", yEnd, diagEnd);
-            ++failures;
-        }
-        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-        failures += unmappedPenalty();
-        if (failures == 0)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: the PBD cloth sheet HANGS from its pinned row on "
-                        "Vulkan (free mean y never below %.4f vs %.4f for the no-spring control, "
-                        "bbox diag max %.4f vs %.4f, rest |dy| %.6f vs %.6f without "
-                        "aerodynamics) -- the spring chain AND the aerodynamics pair run "
-                        "end to end\n",
-                        yMin, CLOTH_HANG_CONTROL, diagMax, CLOTH_DIAG_CONTROL,
-                        restMaxDy, CLOTH_REST_NOAERO);
-            return 0;
-        }
-        std::printf("[ FAIL ] gpu-sdk-step: particlecloth checks failed (%d)\n", failures);
-        return 2;
-    }
-
     // P9.9: particlefluidboundary IS the fluid scene, with one extra call.  It takes
     // the same code path and the same assertions, plus the boundary-specific pair.
     const bool boundaryScene = !std::strcmp(sceneName, "particlefluidboundary");
@@ -10019,239 +8908,6 @@ int main()
         return 2;
     }
 
-    // P9.76 -- PXG_SCENE=particleattach: the particle-vs-RIGID ATTACHMENT chain, and
-    // the first scene in this tree that reaches it at all.  63 of 64 particles are
-    // pinned to a static anchor at their spawn positions through
-    // PxParticleBuffer::setRigidAttachments; particle 0 is left free.
-    //
-    // What the three kernels have to do for this to pass:
-    //   ps_rigidAttachmentPrepareLaunch  turns each PxParticleRigidAttachment into a
-    //                                    three-axis constraint block;
-    //   ps_solveRigidAttachments{,TGS}Launch  drags the particle back to its anchor.
-    // If any of them is refused or unmapped, all 64 particles fall together.
-    // P9.80 -- PXG_SCENE=particlerigid: the FIRST PxParticleRigidBuffer this
-    // harness has ever created, and therefore the first thing that makes
-    // ps_solveShapes and ps_update_volume_bound reachable at all.
-    //
-    // *** WHY NEITHER KERNEL WAS EVER LAUNCHED. ***
-    //
-    // Both are guarded on the HOST by a count that no scene had ever raised above
-    // zero: solveShapes on mMaxRigidsPerBuffer (PxgPBDParticleSystemCore.cpp:825)
-    // and updateVolumeBound on mMaxVolumesPerBuffer (:81).  Eight particle scenes,
-    // and every one of them creates a plain PxParticleBuffer with maxVolumes = 0
-    // and no rigids -- so the two kernels sat in the engine-reachable ratchet
-    // reporting nothing, invisible even to the [pxg-unmapped] machinery, because a
-    // kernel that is never launched is never reported.
-    //
-    // *** THE TWO OBSERVABLES. ***
-    //
-    //   SHAPE MATCHING.  A 4x4x4 cluster is spawned as ONE shape-matched rigid and
-    //   dropped onto the ground box.  ps_solveShapes fits a rotation+translation to
-    //   the deformed cluster each substep (a polar decomposition of the moment
-    //   matrix) and lerps every particle back toward that rigid pose.  With it, the
-    //   cluster LANDS AND KEEPS ITS SHAPE; without it, the same cluster is loose
-    //   granular material and spreads into a puddle.  PXG_PARTICLE_RIGID_CONTROL=1
-    //   is exactly that second run -- same scene, coefficient 0 -- so the claim is
-    //   an A/B and not a tolerance argument.
-    //
-    //   VOLUME BOUNDS.  One PxParticleVolume covers the same particles, and its
-    //   bound is POISONED with -999 before stepping.  ps_update_volume_bound
-    //   recomputes that AABB every step from the unsorted positions, so the check
-    //   is against the particles the scene reads back itself -- and a kernel that
-    //   never ran leaves an impossible number, not a plausible one (P9.48d).
-    if (!std::strcmp(sceneName, "particlerigid"))
-    {
-        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
-                                               false, false, false, false, false, false, false,
-                                               false, /*rigidMode*/ true);
-        const bool plainDiag = std::getenv("PXG_PARTICLE_RIGID_PLAIN") != nullptr;
-        if (!psc.system || !psc.buffer || (!psc.rigidBuffer && !plainDiag))
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: particlerigid scene build failed\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        const bool rigidControl = std::getenv("PXG_PARTICLE_RIGID_CONTROL") != nullptr;
-        std::printf("  [  OK  ] scene 'particlerigid' built: %u PBD particles as ONE shape-matched rigid "
-                    "(coefficient %.1f%s) plus ONE particle volume, spawn y-extent %.4f\n",
-                    psc.numParticles, rigidControl ? 0.0f : RIGID_STIFFNESS,
-                    rigidControl ? ", PXG_PARTICLE_RIGID_CONTROL" : "", psc.spawnExtentY);
-
-        if (!std::getenv("PXG_GPU_STEP"))
-        {
-            std::printf("[  OK  ] gpu-sdk-step: particlerigid pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
-        }
-
-        const float dt = 1.0f / 60.0f;
-        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 240;
-        const float y0 = particleMeanY(psc);
-        std::printf("  stepping particlerigid (%d x %.4fs): mean y0 = %.4f\n", steps, dt, y0);
-        for (int i = 0; i < steps; ++i) { scene->simulate(dt); scene->fetchResults(true); }
-
-        PxCudaContext* ctx = cudaCtx->getCudaContext();
-        std::vector<PxVec4> host(psc.numParticles);
-        ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
-                        psc.numParticles * sizeof(PxVec4));
-        PxParticleVolume volOut;
-        volOut.bound = PxBounds3(PxVec3(RIGID_VOLUME_POISON), PxVec3(RIGID_VOLUME_POISON + 1.0f));
-        if (psc.rigidBuffer)
-            ctx->memcpyDtoH(&volOut, reinterpret_cast<CUdeviceptr>(psc.rigidBuffer->getParticleVolumes()),
-                            sizeof(PxParticleVolume));
-
-        // the AABB the scene computes from the particles it just read back -- the
-        // oracle ps_update_volume_bound is checked against
-        PxBounds3 ref = PxBounds3::empty();
-        for (PxU32 i = 0; i < psc.numParticles; ++i)
-            ref.include(PxVec3(host[i].x, host[i].y, host[i].z));
-        const float extentY = ref.maximum.y - ref.minimum.y;
-        const float meanY = particleMeanY(psc);
-
-        std::printf("  cluster: mean y %.4f -> %.4f, y-extent %.4f -> %.4f (spawn %.4f)\n",
-                    y0, meanY, psc.spawnExtentY, extentY, psc.spawnExtentY);
-        std::printf("  volume : bound min=(%.4f, %.4f, %.4f) max=(%.4f, %.4f, %.4f)\n",
-                    volOut.bound.minimum.x, volOut.bound.minimum.y, volOut.bound.minimum.z,
-                    volOut.bound.maximum.x, volOut.bound.maximum.y, volOut.bound.maximum.z);
-        std::printf("  particles: bound min=(%.4f, %.4f, %.4f) max=(%.4f, %.4f, %.4f)  [the oracle]\n",
-                    ref.minimum.x, ref.minimum.y, ref.minimum.z,
-                    ref.maximum.x, ref.maximum.y, ref.maximum.z);
-
-        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-
-        if (plainDiag)
-        {
-            std::printf("  [ control ] PXG_PARTICLE_RIGID_PLAIN=1: an ORDINARY PxParticleBuffer, same spawn, "
-                        "not scored\n");
-            std::printf("[ control ] gpu-sdk-step: particlerigid plain-buffer control run, not scored\n");
-            return 0;
-        }
-
-        int failures = 0;
-        bool finite = true;
-        for (PxU32 i = 0; i < psc.numParticles; ++i)
-            finite = finite && std::isfinite(host[i].x) && std::isfinite(host[i].y) && std::isfinite(host[i].z);
-        if (!finite) { std::printf("FAIL: a particle position is not finite\n"); ++failures; }
-        // the internal control: gravity ran at all
-        if (!(meanY < y0 - 0.25f))
-        { std::printf("FAIL: the cluster did not fall (mean y %.4f -> %.4f)\n", y0, meanY); ++failures; }
-        // ps_update_volume_bound: the poison is gone and the bound IS the particles'
-        for (int c = 0; c < 3; ++c)
-        {
-            const float bmin = (&volOut.bound.minimum.x)[c], bmax = (&volOut.bound.maximum.x)[c];
-            const float rmin = (&ref.minimum.x)[c], rmax = (&ref.maximum.x)[c];
-            if (bmin == RIGID_VOLUME_POISON || bmax == RIGID_VOLUME_POISON + 1.0f)
-            { std::printf("FAIL: volume bound component %d is still POISONED -- ps_update_volume_bound "
-                          "never ran (its host guard is mMaxVolumesPerBuffer > 0)\n", c); ++failures; break; }
-            if (!(std::fabs(bmin - rmin) < 1e-3f && std::fabs(bmax - rmax) < 1e-3f))
-            { std::printf("FAIL: volume bound component %d is (%.4f, %.4f), the particles are (%.4f, %.4f)\n",
-                          c, bmin, bmax, rmin, rmax); ++failures; }
-        }
-        // ps_solveShapes: the cluster kept its shape, or (control) it did not
-        if (rigidControl)
-        {
-            std::printf("  [ control ] PXG_PARTICLE_RIGID_CONTROL=1: shape-matching coefficient 0, "
-                        "not scored -- the y-extent above is the loose-granular number\n");
-            std::printf("[ control ] gpu-sdk-step: particlerigid control run, not scored\n");
-            return 0;
-        }
-        if (!(extentY > 0.6f * psc.spawnExtentY))
-        { std::printf("FAIL: the cluster COLLAPSED -- y-extent %.4f of a spawn %.4f.  Shape matching did "
-                      "not hold it; ps_solveShapes is the only thing that does\n",
-                      extentY, psc.spawnExtentY); ++failures; }
-        if (!(extentY < 1.6f * psc.spawnExtentY))
-        { std::printf("FAIL: the cluster EXPANDED -- y-extent %.4f of a spawn %.4f\n",
-                      extentY, psc.spawnExtentY); ++failures; }
-
-        failures += unmappedPenalty();
-        if (failures == 0)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: a PBD SHAPE-MATCHED cluster landed and KEPT ITS SHAPE "
-                        "(y-extent %.4f of a spawn %.4f) and its particle volume's AABB matches the "
-                        "particles to 1e-3 -- both kernels are live on Vulkan\n",
-                        extentY, psc.spawnExtentY);
-            return 0;
-        }
-        std::printf("[ FAIL ] gpu-sdk-step: particlerigid checks failed (%d)\n", failures);
-        return 2;
-    }
-
-    if (!std::strcmp(sceneName, "particleattach"))
-    {
-        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
-                                               false, false, false, false, false, false, false,
-                                               /*attachMode*/ true);
-        if (!psc.system || !psc.buffer || !psc.anchor || psc.numAttached == 0)
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: particleattach scene build failed\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        std::printf("  [  OK  ] scene 'particleattach' built: %u of %u PBD particles pinned to a STATIC "
-                    "anchor at y=%.1f; particle %u left free as the scene's own control\n",
-                    psc.numAttached, psc.numParticles, ATTACH_START_Y, psc.freeParticle);
-        if (!std::getenv("PXG_GPU_STEP"))
-        {
-            std::printf("[  OK  ] gpu-sdk-step: particleattach pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
-        }
-
-        const float dt = 1.0f / 60.0f;
-        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
-        AttachY a = particleAttachY(psc);
-        const float mean0 = a.pinnedMean, free0 = a.freeY;
-        bool finite = a.finite;
-        std::printf("  stepping particleattach (%d x %.4fs): pinned mean y0 = %.4f, free particle y0 = %.4f\n",
-                    steps, dt, mean0, free0);
-        for (int i = 0; i < steps; ++i)
-        {
-            scene->simulate(dt);
-            scene->fetchResults(true);
-            a = particleAttachY(psc);
-            finite = finite && a.finite;
-            if (i < 3 || i == steps - 1 || (i % 20 == 0))
-                std::printf("    step %3d: pinned mean y = %.5f (min %.5f) | free y = %.5f\n",
-                            i, a.pinnedMean, a.pinnedMin, a.freeY);
-        }
-        std::printf("  particleattach: pinned mean y %.4f -> %.4f (sag %+.4f, min %.4f); free particle "
-                    "y %.4f -> %.4f (fell %+.4f)\n",
-                    mean0, a.pinnedMean, a.pinnedMean - mean0, a.pinnedMin, free0, a.freeY, a.freeY - free0);
-
-        int failures = 0;
-        // (1) THE PINNED PARTICLES HELD.  Free fall over 120 steps from y = 4 reaches
-        //     the floor, so the two outcomes are a metre apart and this bound is not a
-        //     tuned tolerance.
-        if (!(std::fabs(a.pinnedMean - mean0) < 0.15f))
-        { std::printf("FAIL: the pinned particles moved %+.4f (need |dy| < 0.15).  If the "
-                      "[pxg-unmapped] lines below name ps_rigidAttachmentPrepareLaunch or "
-                      "ps_solveRigidAttachments{,TGS}Launch, this is that; if they do not, the "
-                      "attachment chain ran and computed the wrong thing\n", a.pinnedMean - mean0);
-          ++failures; }
-        if (!(a.pinnedMin > ATTACH_START_Y - 0.6f))
-        { std::printf("FAIL: some pinned particle sank to y = %.4f -- the mean can hide one that "
-                      "let go\n", a.pinnedMin); ++failures; }
-        // (2) THE CONTROL FELL.  Without this, "nothing moved" would also be the reading
-        //     for a scene in which gravity never ran.
-        if (!(a.freeY < free0 - 2.0f))
-        { std::printf("FAIL: the UNPINNED particle only moved %+.4f -- gravity is not reaching the "
-                      "cloud, so the pinned particles standing still proves nothing\n",
-                      a.freeY - free0); ++failures; }
-        if (!finite) { std::printf("FAIL: a particle coordinate went non-finite\n"); ++failures; }
-
-        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-        failures += unmappedPenalty();
-        if (failures == 0)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: %u particles HANG from their rigid attachments (mean y "
-                        "%.4f, sag %+.4f) while the one unpinned particle fell to %.4f -- the particle "
-                        "attachment chain is live on Vulkan: ps_rigidAttachmentPrepareLaunch and "
-                        "ps_solveRigidAttachments{,TGS}Launch\n",
-                        psc.numAttached, a.pinnedMean, a.pinnedMean - mean0, a.freeY);
-            return 0;
-        }
-        std::printf("[ FAIL ] gpu-sdk-step: particleattach checks failed (%d)\n", failures);
-        return 2;
-    }
-
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
@@ -10284,7 +8940,15 @@ int main()
         // passed through itself and reached its (collapsed) rest in well under 120
         // steps.  With the solve live the pile has real mutual overlaps to resolve
         // and needs roughly 150; 240 leaves margin and a 60-step rest window.
-        const int steps = stepsEnv ? atoi(stepsEnv) : (fluidScene ? 300 : (bagMode ? 240 : 120));
+        // 5.12 CHANGE: 300.  eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is now the PxSceneDesc
+        // default (CHANGELOG 5.12, General), and under it PxgPBDParticleSystemCore::
+        // finalizeVelocities returns before ps_finalizeParticles ("skipping the velocity mixing
+        // ... towards momentum conservation"), so the TGS pile keeps more of its impact energy:
+        // measured on 5.12 it rebounds to a mean y of 2.55 at step 90 and is still settling at
+        // step 180 (|dy| 0.0114 in the 240-step window), then rests from ~step 200 (|dy| 0.0011
+        // over steps 225..299, mean y 0.9991).  PGS ignores the flag and rests at 0.9939 with
+        // |dy| 0 either way.  The rest bar itself is unchanged.
+        const int steps = stepsEnv ? atoi(stepsEnv) : (fluidScene ? 300 : (bagMode ? 300 : 120));
         const float y0 = particleMeanY(psc);
         std::printf("  stepping the particle cloud (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
 
@@ -12276,11 +10940,10 @@ int main()
         return 1;
     }
 
-    // PXG_SCENE=softbodydata (P9.95): PxScene::copySoftBodyData / applySoftBodyData ->
-    // sb_copyOrApplySoftBodyDataDEPRECATED.  See buildSoftBodyDataScene's header.
+    // PXG_SCENE=softbodydata (P9.95): edited sim velocities / positions written into the
+    // public device buffers + markDirty (5.12; see buildSoftBodyDataScene's header).
     if (!std::strcmp(sceneName, "softbodydata"))
     {
-        const bool control = std::getenv("PXG_SBDATA_CONTROL") != nullptr;
         SoftBodyDataScene sd = buildSoftBodyDataScene(physics, scene, material, cudaCtx);
         if (!sd.a || !sd.b || sd.nbSimA == 0 || sd.nbSimB == 0)
         {
@@ -12289,14 +10952,6 @@ int main()
         }
         std::printf("  [  OK  ] scene 'softbodydata' built: FEM volume A (%u sim / %u collision vertices) at "
                     "x=-3, B (%u / %u) at x=+3, no floor\n", sd.nbSimA, sd.nbCollA, sd.nbSimB, sd.nbCollB);
-        // B's size is a constant (cells = 4), not tuned to the cooker; if the cooker ever
-        // gives fewer than 65 simulation vertices the block straddle is gone, so say so.
-        if (!(sd.nbSimB > 64u))
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: softbodydata: B has %u simulation vertices; tps = nbSimB must "
-                        "exceed 64 so the two-section copies straddle a 128-thread block\n", sd.nbSimB);
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
         if (!std::getenv("PXG_GPU_STEP"))
         {
             std::printf("[  OK  ] gpu-sdk-step: softbodydata pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
@@ -12311,92 +10966,8 @@ int main()
         // 1. The mandatory warm-up step (see the header).
         scene->simulate(dt);
         scene->fetchResults(true);
-        const PxU32 gpuA = sd.a->getGpuDeformableVolumeIndex();
-        const PxU32 gpuB = sd.b->getGpuDeformableVolumeIndex();
-        std::printf("  warm-up done: GPU indices A=%u B=%u%s\n", gpuA, gpuB,
-                    control ? "  [ control ] PXG_SBDATA_CONTROL=1: plain DtoH/HtoD instead of the API" : "");
-
-        // Device memory for the calls.  The tables are padded to 8 zeroed entries; every
-        // destination carries one poisoned slot past the largest size it is asked for.
-        const float POISON = -999.0f;
-        const PxU32 slotsB = PxMax(sd.nbSimB, sd.nbCollB) + 1u;
-        const PxU32 slotsA = PxMax(sd.nbSimA, sd.nbCollA) + 1u;
-        const PxU32 applySlots = PxMax(sd.nbSimA, sd.nbSimB);
-        CUdeviceptr dTab = 0, dSizes = 0, dIdx = 0, dDstB = 0, dDstA = 0, dApply = 0;
-        if (ctx->memAlloc(&dTab, 8 * sizeof(CUdeviceptr)) != 0 || !dTab ||
-            ctx->memAlloc(&dSizes, 8 * sizeof(PxU32)) != 0 || !dSizes ||
-            ctx->memAlloc(&dIdx, 8 * sizeof(PxU32)) != 0 || !dIdx ||
-            ctx->memAlloc(&dDstB, slotsB * sizeof(PxVec4)) != 0 || !dDstB ||
-            ctx->memAlloc(&dDstA, slotsA * sizeof(PxVec4)) != 0 || !dDstA ||
-            ctx->memAlloc(&dApply, applySlots * sizeof(PxVec4)) != 0 || !dApply)
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: softbodydata memAlloc failed\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        auto setTables = [&](std::vector<CUdeviceptr> tab, std::vector<PxU32> sizes, std::vector<PxU32> idx) {
-            tab.resize(8, 0); sizes.resize(8, 0u); idx.resize(8, 0u);
-            ctx->memcpyHtoD(dTab, tab.data(), 8 * sizeof(CUdeviceptr));
-            ctx->memcpyHtoD(dSizes, sizes.data(), 8 * sizeof(PxU32));
-            ctx->memcpyHtoD(dIdx, idx.data(), 8 * sizeof(PxU32));
-        };
-        auto poison = [&](CUdeviceptr d, PxU32 n) {
-            std::vector<PxVec4> p(n, PxVec4(POISON));
-            ctx->memcpyHtoD(d, p.data(), n * sizeof(PxVec4));
-        };
-
-        // 2. COPY, three flags.  Indices REVERSED {B, A}; A's section is half its vertices.
-        // dataIndex = offsetof(PxgSoftBody, field) / 8 (PxgSoftBody.cpp:580-608), for the log.
-        struct CopyCase { PxSoftBodyGpuDataFlag::Enum flag; const char* name; bool collision; PxU32 field;
-                          PxU32 dataIndex; };
-        const CopyCase copies[3] = {
-            { PxSoftBodyGpuDataFlag::eSIM_POSITION_INV_MASS, "sim positions", false, 0u, 12u },
-            { PxSoftBodyGpuDataFlag::eSIM_VELOCITY_INV_MASS, "sim velocities", false, 1u, 11u },
-            { PxSoftBodyGpuDataFlag::eTET_POSITION_INV_MASS, "collision positions", true, 2u, 8u } };
-        auto aliased = [](PxDeformableVolume* v, PxU32 field) -> PxVec4* {
-            return field == 0u ? v->getSimPositionInvMassBufferD()
-                 : field == 1u ? v->getSimVelocityBufferD() : v->getPositionInvMassBufferD(); };
-        PxU32 copyBad = 0;
-        for (const CopyCase& c : copies)
-        {
-            const PxU32 nB = c.collision ? sd.nbCollB : sd.nbSimB;
-            const PxU32 nA = c.collision ? sd.nbCollA : sd.nbSimA;
-            const PxU32 halfA = nA / 2u;
-            poison(dDstB, slotsB);
-            poison(dDstA, slotsA);
-            setTables({ dDstB, dDstA }, { nB * 16u, halfA * 16u }, { gpuB, gpuA });
-            std::vector<PxVec4> refB, refA;
-            if (control)
-            {
-                sbDataRead(ctx, aliased(sd.b, c.field), nB, refB);
-                sbDataRead(ctx, aliased(sd.a, c.field), halfA, refA);
-                ctx->memcpyHtoD(dDstB, refB.data(), nB * sizeof(PxVec4));
-                ctx->memcpyHtoD(dDstA, refA.data(), halfA * sizeof(PxVec4));
-            }
-            else
-            {
-                scene->copySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
-                                        reinterpret_cast<void*>(dIdx), c.flag, 2u, nB * 16u);
-            }
-            sbDataRead(ctx, aliased(sd.b, c.field), nB, refB);
-            sbDataRead(ctx, aliased(sd.a, c.field), nA, refA);
-            std::vector<PxVec4> gotB(slotsB), gotA(slotsA);
-            ctx->memcpyDtoH(gotB.data(), dDstB, slotsB * sizeof(PxVec4));
-            ctx->memcpyDtoH(gotA.data(), dDstA, slotsA * sizeof(PxVec4));
-            const std::vector<PxVec4> poisonV(PxMax(slotsA, slotsB), PxVec4(POISON));
-            const PxU32 badB = sbDataBitDiff(gotB.data(), refB.data(), nB);
-            const PxU32 badA = sbDataBitDiff(gotA.data(), refA.data(), halfA);
-            const PxU32 badTail = sbDataBitDiff(&gotB[nB], poisonV.data(), slotsB - nB) +
-                                  sbDataBitDiff(&gotA[halfA], poisonV.data(), slotsA - halfA);
-            std::printf("  copy %-19s (dataIndex %2u): B %u/%u vertices bit-equal, A %u/%u of its first half, "
-                        "%u poisoned slots overwritten\n", c.name,
-                        c.dataIndex, nB - badB, nB, halfA - badA, halfA, badTail);
-            if (badB || badA || badTail)
-            {
-                std::printf("FAIL: copySoftBodyData(%s) is not the aliased buffer bit for bit (B %u, A %u, "
-                            "tail %u differ)\n", c.name, badB, badA, badTail);
-                ++failures; ++copyBad;
-            }
-        }
+        std::printf("  warm-up done: GPU indices A=%u B=%u\n", sd.a->getGpuDeformableVolumeIndex(),
+                    sd.b->getGpuDeformableVolumeIndex());
 
         // Pre-apply state (the reference every scored observable is measured from).
         std::vector<PxVec4> posA0, posB0, velA0, velB0, collB0;
@@ -12408,19 +10979,13 @@ int main()
         const PxVec3 mA0 = sbDataMean(posA0), mB0 = sbDataMean(posB0), mcB0 = sbDataMean(collB0);
         const float vx0 = sbDataMean(velA0).x;
 
-        // 3. APPLY (a): A's sim velocities with v.x += 3 -- y, z and w (invMass) bitwise.
+        // 2. APPLY (a): A's sim velocities with v.x += 3 -- y, z and w (invMass) bitwise.
         const float KICK = 3.0f, TELEPORT = 2.0f;
         std::vector<PxVec4> kickA = velA0;
         for (PxVec4& v : kickA) v.x += KICK;
-        ctx->memcpyHtoD(dApply, kickA.data(), sd.nbSimA * sizeof(PxVec4));
-        setTables({ dApply }, { sd.nbSimA * 16u }, { gpuA });
-        if (control)
-            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.a->getSimVelocityBufferD()), kickA.data(),
-                            sd.nbSimA * sizeof(PxVec4));
-        else
-            scene->applySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
-                                     reinterpret_cast<void*>(dIdx), PxSoftBodyGpuDataFlag::eSIM_VELOCITY_INV_MASS,
-                                     1u, sd.nbSimA * 16u);
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.a->getSimVelocityBufferD()), kickA.data(),
+                        sd.nbSimA * sizeof(PxVec4));
+        sd.a->markDirty(PxDeformableVolumeDataFlag::eSIM_VELOCITY);
         {
             std::vector<PxVec4> velA1, velB1;
             sbDataRead(ctx, sd.a->getSimVelocityBufferD(), sd.nbSimA, velA1);
@@ -12430,22 +10995,16 @@ int main()
             std::printf("  apply (a) A sim velocities v.x += %.1f: %u/%u bit-equal at once; B untouched: %u/%u\n",
                         KICK, sd.nbSimA - badA, sd.nbSimA, sd.nbSimB - badB, sd.nbSimB);
             if (badA || badB)
-            { std::printf("FAIL: applySoftBodyData(velocities) did not land bitwise (A %u, B %u differ)\n", badA, badB);
+            { std::printf("FAIL: the velocity write did not land bitwise (A %u, B %u differ)\n", badA, badB);
               ++failures; }
         }
 
-        // 4. APPLY (b): B's sim positions with z += 2 -- w bitwise.
+        // 3. APPLY (b): B's sim positions with z += 2 -- w bitwise.
         std::vector<PxVec4> moveB = posB0;
         for (PxVec4& p : moveB) p.z += TELEPORT;
-        ctx->memcpyHtoD(dApply, moveB.data(), sd.nbSimB * sizeof(PxVec4));
-        setTables({ dApply }, { sd.nbSimB * 16u }, { gpuB });
-        if (control)
-            ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.b->getSimPositionInvMassBufferD()), moveB.data(),
-                            sd.nbSimB * sizeof(PxVec4));
-        else
-            scene->applySoftBodyData(reinterpret_cast<void**>(dTab), reinterpret_cast<void*>(dSizes),
-                                     reinterpret_cast<void*>(dIdx), PxSoftBodyGpuDataFlag::eSIM_POSITION_INV_MASS,
-                                     1u, sd.nbSimB * 16u);
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(sd.b->getSimPositionInvMassBufferD()), moveB.data(),
+                        sd.nbSimB * sizeof(PxVec4));
+        sd.b->markDirty(PxDeformableVolumeDataFlag::eSIM_POSITION_INVMASS);
         {
             std::vector<PxVec4> posA1, posB1;
             sbDataRead(ctx, sd.a->getSimPositionInvMassBufferD(), sd.nbSimA, posA1);
@@ -12455,11 +11014,11 @@ int main()
             std::printf("  apply (b) B sim positions z += %.1f: %u/%u bit-equal at once; A untouched: %u/%u\n",
                         TELEPORT, sd.nbSimB - badB, sd.nbSimB, sd.nbSimA - badA, sd.nbSimA);
             if (badA || badB)
-            { std::printf("FAIL: applySoftBodyData(positions) did not land bitwise (B %u, A %u differ)\n", badB, badA);
+            { std::printf("FAIL: the position write did not land bitwise (B %u, A %u differ)\n", badB, badA);
               ++failures; }
         }
 
-        // 5. Step.  After the FIRST step B's COLLISION mesh -- written only by the skinning
+        // 4. Step.  After the FIRST step B's COLLISION mesh -- written only by the skinning
         // from the sim mesh -- must stand 2 further in z.
         float collDz = 0.0f;
         bool finite = true;
@@ -12487,8 +11046,7 @@ int main()
         std::printf("  after %d steps: A dx = %.6f (kick %.1f * %.3f s + warm-up vx %.6f), B dx = %.6f, B dz = %.6f, "
                     "B collision dz after step 1 = %.6f, dy A = %.6f, B = %.6f\n", steps, dxA, KICK, t, vx0, dxB, dzB,
                     collDz, dyA, dyB);
-        std::printf("  final sim-position hash (A then B, FNV-1a): %016llx%s\n", (unsigned long long)hash,
-                    control ? "  [ control ]" : "");
+        std::printf("  final sim-position hash (A then B, FNV-1a): %016llx\n", (unsigned long long)hash);
 
         auto near = [&](const char* what, float got, float want, float tol) {
             if (!(std::fabs(got - want) <= tol))
@@ -12504,21 +11062,12 @@ int main()
         near("B sim mean dz since the apply (teleport kept)", dzB, TELEPORT, 1e-3f);
         near("A vs B mean y drop since the apply (both keep their warm-up vy)", dyA - dyB, 0.0f, 1e-3f);
 
-        ctx->memFree(dTab); ctx->memFree(dSizes); ctx->memFree(dIdx);
-        ctx->memFree(dDstB); ctx->memFree(dDstA); ctx->memFree(dApply);
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         failures += unmappedPenalty();
-        if (control)
-        {
-            std::printf("[ control ] gpu-sdk-step: softbodydata control run (%d check(s) failed), not scored\n",
-                        failures);
-            return 0;
-        }
         if (failures == 0)
         {
-            std::printf("[  OK  ] gpu-sdk-step: softbodydata: 3 copies bit-exact, A kicked %.4f along x, B "
-                        "teleported %.4f in z (collision mesh %.4f after one step) -- "
-                        "sb_copyOrApplySoftBodyDataDEPRECATED runs on Vulkan\n", dxA, dzB, collDz);
+            std::printf("[  OK  ] gpu-sdk-step: softbodydata: buffer writes + markDirty -- A kicked %.4f along x, "
+                        "B teleported %.4f in z (collision mesh %.4f after one step)\n", dxA, dzB, collDz);
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: softbodydata: %d check(s) failed\n", failures);
@@ -13030,18 +11579,19 @@ int main()
         // thetaOwn: everything but the sheet -- the paddle's own weight and the rigid weight.
         const float thetaOwn = -(cs.paddleMass * g * (cs.paddleX - cs.hingeX) + cs.weightMass * g * leverWeight)
                              / cs.stiffness;
-        // thetaExp: the sheet's weight acting at the paddle's COM lever, not at its own -- the
-        // CUDA averages a link's ANGULAR contact impulse over its contacts (see the builder's
-        // header); thetaRigid: what a rigid body of the sheet's mass at its own lever would do.
+        // thetaExp: the sheet's weight acting at its own lever, as a rigid load would -- 5.12
+        // delivers the link the full angular contact impulse (see the builder's header);
+        // thetaCom: the sheet's weight at the paddle's COM lever, what 5.6.1's averaging of a
+        // link's ANGULAR contact impulse over its contacts gave.
         const float leverCom = cs.paddleX - cs.hingeX;
-        const float thetaExp = thetaOwn - mA * g * leverCom / cs.stiffness;
-        const float thetaRigid = thetaOwn - mA * g * leverCloth / cs.stiffness;
+        const float thetaExp = thetaOwn - mA * g * leverCloth / cs.stiffness;
+        const float thetaCom = thetaOwn - mA * g * leverCom / cs.stiffness;
         const float dropExp = theta * leverCloth;   // the sheet follows the tilt
         const float drop = yA - yB;
         std::printf("  clothonlink: sheet mass %.3f kg at lever %.4f m; paddle angle %+.6f rad, expected "
-                    "%+.6f (sheet share %+.6f at the COM lever %.3f; paddle + rigid weight alone %+.6f; a "
-                    "rigid load at the sheet's lever would give %+.6f)\n",
-                    mA, leverCloth, theta, thetaExp, thetaExp - thetaOwn, leverCom, thetaOwn, thetaRigid);
+                    "%+.6f (sheet share %+.6f at its own lever; paddle + rigid weight alone %+.6f; the "
+                    "5.6.1 angular averaging, the COM lever %.3f, would give %+.6f)\n",
+                    mA, leverCloth, theta, thetaExp, thetaExp - thetaOwn, thetaOwn, leverCom, thetaCom);
         std::printf("  clothonlink: rest height on link %.5f vs static twin %.5f: drop %+.6f m, the "
                     "tilt predicts %+.6f m (diff %+.6f)\n", yA, yB, drop, dropExp, drop - dropExp);
 
@@ -13076,17 +11626,21 @@ int main()
         //    position-error bias goes out as impulse too -- and it does so against the static
         //    twin exactly as against the link (see the builder's header for the measured
         //    numbers).  The link simply receives what the contact computes.  Without the
-        //    reaction the share is zero; with the reference count kept on the angular row
-        //    (the rigid arm of computeRigidChange) the torque about the COM is no longer
-        //    averaged away and the share drops to about leverCloth / leverCom = 0.4 x.
+        //    reaction the share is zero; with the reference count left off the angular row
+        //    (5.6.1's articulation arm of computeRigidChange) the torque about the COM is
+        //    averaged away and the share rises to about leverCom / leverCloth = 2.5 x.
+        //    5.12 CHANGE: before the 5.12 migration this check was against the COM lever
+        //    (5.6.1's averaging); 5.12's writeContactDeltas scales both rows by the reference
+        //    count, so it is against the sheet's own lever now (see the builder's header).
         const float shareRatio = (theta - thetaOwn) / (thetaExp - thetaOwn);
         std::printf("  clothonlink: the sheet's share of the deflection is %.3f x its weight's static "
-                    "prediction at the COM lever (%.3f x at its own lever)\n", shareRatio,
-                    (theta - thetaOwn) / (thetaRigid - thetaOwn));
+                    "prediction at its own lever (%.3f x at the COM lever)\n", shareRatio,
+                    (theta - thetaOwn) / (thetaCom - thetaOwn));
         if (!(shareRatio > 0.7f && shareRatio < 2.0f))
         { std::printf("FAIL: the paddle deflects %+.6f rad, %+.6f without the sheet: the sheet's share is "
-                      "%.3f x the %+.6f its weight predicts at the COM lever (need 0.7 .. 2.0; 0 means "
-                      "the link does not feel the sheet, ~0.4 that the angular impulse is not averaged)\n",
+                      "%.3f x the %+.6f its weight predicts at its own lever (need 0.7 .. 2.0; 0 means "
+                      "the link does not feel the sheet, ~2.5 that the angular impulse is averaged as "
+                      "in 5.6.1)\n",
                       theta, thetaOwn, shareRatio, thetaExp - thetaOwn); ++failures; }
         // 2. THE REST HEIGHT.  The sheet on the link rests where the static twin rests, moved by
         //    exactly the link's tilt, within 1 mm.
@@ -13395,18 +11949,20 @@ int main()
                     "%+.5f m, cloth moved %+.5f m\n", gapRest, gapSweep, dpx, dcx);
         int failures = 0;
         if (!finite || !std::isfinite(theta) || !std::isfinite(dpx)) { std::printf("FAIL: non-finite state\n"); ++failures; }
-        // 1. THE REACTION ON THE LINK (PGS): the curtain's share of the deflection is the CUDA's
-        //    1/N of a rigid load's (see the builder), within 0.18 .. 0.25 (measured 0.211; 0
-        //    without the reaction, 0.155 without its angular row).  TGS: printed only -- the
-        //    CUDA's dt / N is below resolution; the TGS link reaction is fixture-only.
-        const float shareExp = 1.0f / float(ls.topRow.size());
-        const float shareLo = 0.18f, shareHi = 0.25f;
-        std::printf("  clothlinkattach: share %.3f x a rigid load's; the CUDA predicts %.3f (PGS: 1/N, N = %zu "
-                    "attachments) / %.4f (TGS: dt/N)\n", share, shareExp, ls.topRow.size(), shareExp * dt);
+        // 1. THE REACTION ON THE LINK (PGS).  5.6.1: the curtain's share was the CUDA's 1/N of a
+        //    rigid load's (see the builder), bar 0.18 .. 0.25 (measured 0.211; 0 without the
+        //    reaction, 0.155 without its angular row).  5.12 mass-splits the attachment solve
+        //    (rigidBodyRefCount; CHANGELOG 5.12, Deformables) and fixes the under-correction, so
+        //    the link carries the WHOLE load: measured 1.047 (PGS) and 1.171 (TGS) on 5.12.  The
+        //    bar moved to ~1; the angular-row mutant (0.155 on 5.6.1) is not re-measured on 5.12.
+        //    TGS: printed only, as before.
+        const float shareExp = 1.0f;
+        const float shareLo = 0.85f, shareHi = 1.3f;
+        std::printf("  clothlinkattach: share %.3f x a rigid load's; 5.12 predicts %.3f (the whole load; 5.6.1: "
+                    "1/N, N = %zu attachments, TGS dt/N)\n", share, shareExp, ls.topRow.size());
         if (usePgs && !(share > shareLo && share < shareHi))
         { std::printf("FAIL: the curtain's share of the arm's deflection is %.3f x a rigid load's (need %.2f .. "
-                      "%.2f; 0 means the link does not feel the cloth, ~0.155 that the angular reaction row "
-                      "is missing)\n", share, shareLo, shareHi); ++failures; }
+                      "%.2f; 0 means the link does not feel the cloth)\n", share, shareLo, shareHi); ++failures; }
         // 2. THE LINK-FRAME ANCHORS hold, at rest and while the link moves (velocity read).
         // TGS: 3 mm.  The port holds 0.7 / 0.8 mm (rest / sweep); with the link velocity read
         // reverted to the rigid arm the sweep gap was 5.1 mm (measured) -- 2 cm would not see it.
@@ -13429,8 +11985,8 @@ int main()
         {
             std::printf("[  OK  ] gpu-sdk-step: scene 'clothlinkattach' stepped: the curtain hangs from the "
                         "link (anchor gap %.4f / %.4f m) and follows its sweep; the link's share %.3f x a rigid "
-                        "load's (CUDA %s prediction %.4f)\n", gapRest, gapSweep, share, usePgs ? "PGS" : "TGS",
-                        usePgs ? shareExp : shareExp * dt);
+                        "load's (5.12 %s prediction %.4f)\n", gapRest, gapSweep, share, usePgs ? "PGS" : "TGS",
+                        shareExp);
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: clothlinkattach checks failed (%d)\n", failures);
@@ -13558,7 +12114,9 @@ int main()
             scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
         }
         const float dt = 1.0f / 60.0f, g = 9.81f;
-        const int steps = 90;
+        // 60, not 5.6.1's 90: at the 5.12 (whole-reaction) acceleration the cube reaches the
+        // ground box after about 76 steps (step 89 read v.y > 0), and the fall must stay free.
+        const int steps = 60;
         const float boxY0 = rs.box->getGlobalPose().p.y;
         const PxU32 nv = rs.vol->getSimulationMesh()->getNbVertices();
         std::vector<PxVec4> host(nv);
@@ -13589,15 +12147,15 @@ int main()
         const float drop = boxY0 - boxY;
         const float vy = rs.box->getLinearVelocity().y;
         const float N = float(rs.pinIdx.size());
-        // The CUDA prediction (see the builder): a = M_sb g / (N M_box + M_sb).
-        const float aPred = rs.sbMass * g / (N * rs.boxMass + rs.sbMass);
-        const float aFull = rs.sbMass * g / (rs.boxMass + rs.sbMass);
+        // The 5.12 CUDA prediction (see the builder): a = M_sb g / (M_box + M_sb).
+        const float aSplit = rs.sbMass * g / (N * rs.boxMass + rs.sbMass);   // 5.6.1's 1/N quirk
+        const float aPred = rs.sbMass * g / (rs.boxMass + rs.sbMass);
         const float dropPred = 0.5f * aPred * T * T;
         const float ratio = drop / dropPred;
         std::printf("  softbodyrigidattach: box y %.5f -> %.5f (drop %+.5f m, v.y %+.5f m/s after %.2f s); CUDA "
-                    "prediction a = M_sb g / (N M_box + M_sb) = %.4f m/s^2 -> drop %.5f m (measured %.3f x); "
-                    "without the 1/N count division %.4f m/s^2; max pin gap %.5f m (end %.5f)\n", boxY0, boxY,
-                    drop, vy, T, aPred, dropPred, ratio, aFull, gapMax, gapEnd);
+                    "prediction a = M_sb g / (M_box + M_sb) = %.4f m/s^2 -> drop %.5f m (measured %.3f x); "
+                    "5.6.1's 1/N count division gave %.4f m/s^2; max pin gap %.5f m (end %.5f)\n", boxY0, boxY,
+                    drop, vy, T, aPred, dropPred, ratio, aSplit, gapMax, gapEnd);
         int failures = 0;
         if (!finite || !std::isfinite(boxY)) { std::printf("FAIL: non-finite state\n"); ++failures; }
         // 1. THE REACTION: the gravity-free box is pulled down by the cube, by the CUDA's amount.
@@ -13713,13 +12271,13 @@ int main()
         if (!(gapSteady < steadyBar))
         { std::printf("FAIL: anchor gap from sweep step %d on %.5f m, need < %.4f (the link's velocity read)\n",
                       ARTIATTACH_STEADY_FROM, gapSteady, steadyBar); ++failures; }
-        // 2. THE LINK REACTION: the link carries the CUDA's 1/N share of the cube's weight
-        //    (accumulateDeltaVRigidSecondLaunch divides a link's rows by its attachment count,
-        //    rigidDeltaAccum.cu:369-377; the softbody solves' deltaImpulse is a real impulse in
-        //    both solvers, softBodyGM.cu:2188 / :2312).
+        // 2. THE LINK REACTION: on 5.6.1 the link carried the CUDA's 1/N share of the cube's
+        //    weight (accumulateDeltaVRigidSecondLaunch divides a link's rows by its attachment
+        //    count, rigidDeltaAccum.cu:369-377).  5.12 keeps the division but mass-splits the
+        //    attachment solve (rigidBodyRefCount), so the link now carries the whole weight.
         if (!(share > ARTIATTACH_SHARE_LO && share < ARTIATTACH_SHARE_HI))
         { std::printf("FAIL: the cube's share of the arm's deflection is %.3f x a rigid load's (need %.2f .. %.2f, "
-                      "CUDA 1/N = %.3f)\n", share, ARTIATTACH_SHARE_LO, ARTIATTACH_SHARE_HI,
+                      "5.12 whole load = 1; 5.6.1's 1/N was %.3f)\n", share, ARTIATTACH_SHARE_LO, ARTIATTACH_SHARE_HI,
                       1.0f / float(as.pinIdx.size())); ++failures; }
         // 3. The sweep happened and the cube went along.
         if (!(dpx > 0.25f))
@@ -13739,103 +12297,6 @@ int main()
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: softbodyartiattach checks failed (%d)\n", failures);
-        return 2;
-    }
-
-    // PXG_SCENE=softbodycone (tranche C of task 35): deprecated addRigidAttachment with a
-    // PxConeLimitedConstraint -- a distance rope and an angular cone.  See buildSoftBodyConeScene.
-    if (!std::strcmp(sceneName, "softbodycone"))
-    {
-        if (cpuControl)
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: softbodycone is GPU-only (PhysX deformables have no CPU pipeline); "
-                        "its reference is the rope length and the cone angle\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        SoftBodyConeScene cs = buildSoftBodyConeScene(physics, scene, material, cudaCtx);
-        if (!cs.ok)
-        {
-            std::printf("[ FAIL ] gpu-sdk-step: softbodycone scene build failed\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-        }
-        std::printf("  [  OK  ] scene 'softbodycone' built: ROPE cube on %zu world ropes (%.2f m), CONE cube on %zu "
-                    "ropes in a %.2f rad cone about (%.3f, %.3f, %.3f)\n", cs.ropeIds.size(), cs.ropeLen,
-                    cs.coneIds.size(), cs.coneAngle, cs.coneAxis.x, cs.coneAxis.y, cs.coneAxis.z);
-        if (!std::getenv("PXG_GPU_STEP"))
-        {
-            std::printf("[  OK  ] gpu-sdk-step: softbodycone pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
-            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
-        }
-        const float dt = 1.0f / 60.0f;
-        const int steps = 180;
-        auto readColl = [&](PxDeformableVolume* v, std::vector<PxVec4>& out) {
-            const PxU32 n = v->getCollisionMesh()->getNbVertices();
-            out.assign(n, PxVec4(0.0f));
-            cudaCtx->getCudaContext()->memcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(v->getPositionInvMassBufferD()),
-                                                  n * sizeof(PxVec4));
-            bool f = true;
-            for (const PxVec4& p : out) f = f && p.getXYZ().isFinite();
-            return f;
-        };
-        std::vector<PxVec4> hr, hc;
-        bool finite = true;
-        float ropeMin = 0.0f, ropeMax = 0.0f, ropeMean = 0.0f, coneAngMax = 0.0f, coneGapMin = 0.0f, coneGapMax = 0.0f,
-              coneDx = 0.0f;
-        for (int i = 0; i < steps; ++i)
-        {
-            scene->simulate(dt);
-            scene->fetchResults(true);
-            finite = readColl(cs.rope, hr) && finite;
-            finite = readColl(cs.cone, hc) && finite;
-            ropeMin = FLT_MAX; ropeMax = 0.0f; ropeMean = 0.0f;
-            for (size_t k = 0; k < cs.ropeIds.size(); ++k)
-            {
-                const float d = (hr[cs.ropeIds[k]].getXYZ() - cs.ropeAnchors[k]).magnitude();
-                ropeMin = PxMin(ropeMin, d); ropeMax = PxMax(ropeMax, d); ropeMean += d;
-            }
-            ropeMean /= float(cs.ropeIds.size());
-            coneAngMax = 0.0f; coneGapMin = FLT_MAX; coneGapMax = 0.0f; coneDx = 0.0f;
-            for (size_t k = 0; k < cs.coneIds.size(); ++k)
-            {
-                const PxVec3 rel = hc[cs.coneIds[k]].getXYZ() - cs.coneAnchors[k];
-                const float d = rel.magnitude();
-                coneGapMin = PxMin(coneGapMin, d); coneGapMax = PxMax(coneGapMax, d);
-                coneDx += rel.x / float(cs.coneIds.size());
-                if (d > 1e-4f) coneAngMax = PxMax(coneAngMax, std::acos(PxClamp(rel.dot(cs.coneAxis) / d, -1.0f, 1.0f)));
-            }
-            if (i < 2 || i % 30 == 0 || i == steps - 1)
-                std::printf("    step %3d: ROPE gap min/mean/max %.5f / %.5f / %.5f   CONE gap %.5f .. %.5f, max angle "
-                            "from axis %.4f rad, mean dx %+.5f\n", i, ropeMin, ropeMean, ropeMax, coneGapMin, coneGapMax,
-                            coneAngMax, coneDx);
-        }
-        std::printf("  softbodycone: ROPE hangs %.5f .. %.5f m (mean %.5f) from its anchors (rope %.2f m; a pin would "
-                    "give ~0); CONE gap %.5f .. %.5f m at <= %.4f rad from the axis (cone %.2f rad; straight down "
-                    "would be %.4f), mean dx %+.5f m\n", ropeMin, ropeMax, ropeMean, cs.ropeLen, coneGapMin,
-                    coneGapMax, coneAngMax, cs.coneAngle, PxPi / 4.0f, coneDx);
-        int failures = 0;
-        if (!finite) { std::printf("FAIL: non-finite state\n"); ++failures; }
-        // 1. THE DISTANCE LIMIT: every roped vertex hangs at the rope's length (it stretches by
-        //    the attachment's own sag), not on its anchor.
-        if (!(ropeMin > CONE_ROPE_LO && ropeMax < CONE_ROPE_HI))
-        { std::printf("FAIL: the roped vertices hang %.5f .. %.5f m from their anchors (need %.3f .. %.3f; ~0 means "
-                      "the distance limit is ignored and the attachment is a plain pin)\n", ropeMin, ropeMax,
-                      CONE_ROPE_LO, CONE_ROPE_HI); ++failures; }
-        // 2. THE ANGULAR LIMIT: the coned vertices hang out on their ropes, within the cone.
-        if (!(coneGapMin > CONE_ROPE_LO && coneGapMax < CONE_ROPE_HI))
-        { std::printf("FAIL: the coned vertices are %.5f .. %.5f m from their anchors (need %.3f .. %.3f)\n",
-                      coneGapMin, coneGapMax, CONE_ROPE_LO, CONE_ROPE_HI); ++failures; }
-        if (!(coneAngMax < cs.coneAngle + CONE_ANGLE_TOL))
-        { std::printf("FAIL: a coned vertex is %.4f rad from the cone axis (cone %.2f rad + %.2f; straight down is "
-                      "%.4f)\n", coneAngMax, cs.coneAngle, CONE_ANGLE_TOL, PxPi / 4.0f); ++failures; }
-        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-        failures += unmappedPenalty();
-        if (failures == 0)
-        {
-            std::printf("[  OK  ] gpu-sdk-step: scene 'softbodycone' stepped: the ropes hang at %.4f .. %.4f m and the "
-                        "cone holds its vertices within %.4f rad of its axis\n", ropeMin, ropeMax, coneAngMax);
-            return 0;
-        }
-        std::printf("[ FAIL ] gpu-sdk-step: softbodycone checks failed (%d)\n", failures);
         return 2;
     }
 
@@ -14040,7 +12501,6 @@ int main()
 
     if (!std::strcmp(sceneName, "particleapply"))
     {
-        const bool control = std::getenv("PXG_PARTICLE_APPLY_CONTROL") != nullptr;
         ParticleApplyScene pa = buildParticleApplyScene(physics, scene, material, cudaCtx);
         if (!pa.system)
         {
@@ -14088,41 +12548,12 @@ int main()
                             pa.n * sizeof(PxVec4));
         }
 
-        // 3. The ingest: applyParticleBufferData, or (control) the ordinary flags.
-        CUdeviceptr devIdx = 0, devPairs = 0, devFlags = 0;
-        if (control)
-        {
-            pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
-            pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
-            pa.a->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
-            std::printf("  [ control ] PXG_PARTICLE_APPLY_CONTROL=1: B POS|VEL and A VEL raised as buffer flags\n");
-        }
-        else
-        {
-            const PxU32 sys = pa.system->getGpuParticleSystemIndex();
-            const PxGpuParticleBufferIndexPair pairs[3] = {
-                { sys, pa.a->getUniqueId() }, { sys, pa.c->getUniqueId() }, { sys, pa.b->getUniqueId() } };
-            const PxParticleBufferFlags flags[3] = {
-                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_VELOCITY),
-                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY,
-                PxParticleBufferFlags(PxParticleBufferFlag::eUPDATE_POSITION) | PxParticleBufferFlag::eUPDATE_VELOCITY };
-            const PxU32 indices[2] = { 2u, 0u };
-            std::printf("  apply: system %u, unique ids A=%u B=%u C=%u, indices {2, 0}\n", sys,
-                        pa.a->getUniqueId(), pa.b->getUniqueId(), pa.c->getUniqueId());
-            if (ctx->memAlloc(&devIdx, sizeof(indices)) != 0 || !devIdx ||
-                ctx->memAlloc(&devPairs, sizeof(pairs)) != 0 || !devPairs ||
-                ctx->memAlloc(&devFlags, sizeof(flags)) != 0 || !devFlags)
-            {
-                std::printf("[ FAIL ] gpu-sdk-step: particleapply memAlloc failed\n");
-                scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
-            }
-            ctx->memcpyHtoD(devIdx, indices, sizeof(indices));
-            ctx->memcpyHtoD(devPairs, pairs, sizeof(pairs));
-            ctx->memcpyHtoD(devFlags, flags, sizeof(flags));
-            scene->applyParticleBufferData(reinterpret_cast<const PxU32*>(devIdx),
-                                           reinterpret_cast<const PxGpuParticleBufferIndexPair*>(devPairs),
-                                           reinterpret_cast<const PxParticleBufferFlags*>(devFlags), 2u);
-        }
+        // 3. The ingest: B POS|VEL and A VEL as buffer flags; C's edit is never flagged.
+        pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+        pa.b->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+        pa.a->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+        std::printf("  ingest: B POS|VEL and A VEL raised as buffer flags (unique ids A=%u B=%u C=%u)\n",
+                    pa.a->getUniqueId(), pa.b->getUniqueId(), pa.c->getUniqueId());
 
         // 4. Thirty steps, then read every cloud back.
         for (int i = 0; i < PAPPLY_STEPS; ++i)
@@ -14149,35 +12580,6 @@ int main()
                         mp[k].x, mp[k].y, mp[k].z, mv[k].x, mv[k].y, mv[k].z, shapeDev[k]);
         }
 
-        // PXG_PARTICLE_APPLY_DUMP=<file>: the live run writes its final user arrays there,
-        // and the control compares against them word by word.  Reported, never scored.
-        if (const char* dumpPath = std::getenv("PXG_PARTICLE_APPLY_DUMP"))
-        {
-            std::vector<PxU32> words;
-            for (int k = 0; k < 3; ++k)
-                for (const std::vector<PxVec4>* v : { &pos[k], &vel[k] })
-                {
-                    const size_t base = words.size();
-                    words.resize(base + v->size() * 4);
-                    std::memcpy(words.data() + base, v->data(), v->size() * sizeof(PxVec4));
-                }
-            if (!control)
-            {
-                if (FILE* f = std::fopen(dumpPath, "wb"))
-                { std::fwrite(words.data(), sizeof(PxU32), words.size(), f); std::fclose(f); }
-            }
-            else if (FILE* f = std::fopen(dumpPath, "rb"))
-            {
-                std::vector<PxU32> ref(words.size(), 0u);
-                const size_t got = std::fread(ref.data(), sizeof(PxU32), ref.size(), f);
-                std::fclose(f);
-                size_t mism = 0;
-                for (size_t i = 0; i < words.size(); ++i) mism += (i >= got || ref[i] != words[i]) ? 1u : 0u;
-                std::printf("  [ control ] %zu of %zu final user-array words differ from the apply run\n",
-                            mism, words.size());
-            }
-        }
-
         auto near = [&](const char* what, float got, float want, float tol) {
             if (!(std::fabs(got - want) <= tol))
             { std::printf("FAIL: %s = %.6f, expected %.6f +- %g\n", what, got, want, tol); ++failures; }
@@ -14189,27 +12591,18 @@ int main()
         near("B.v.x", mv[1].x, PAPPLY_VX_B, 1e-3f);
         near("A.y - C.y (A's VEL applied)", mp[0].y - mp[2].y, PAPPLY_DVY_A * t, 1e-3f);
         near("A.v.y - C.v.y", mv[0].y - mv[2].y, PAPPLY_DVY_A, 2e-3f);
-        near("A.z - C.z (A's POS NOT applied: flags are per slot)", mp[0].z - mp[2].z, 0.0f, 1e-3f);
+        near("A.z - C.z (A's POS NOT applied: flags are per buffer)", mp[0].z - mp[2].z, 0.0f, 1e-3f);
         near("A.x - (C.x - 40)", mp[0].x - (mp[2].x - 40.0f), 0.0f, 1e-3f);
         near("B.y - C.y", mp[1].y - mp[2].y, 0.0f, 1e-3f);
-        near("C.x (decoy slot never read)", mp[2].x, 20.0f, 1e-3f);
-        near("C.z (decoy slot never read)", mp[2].z, 0.0f, 1e-3f);
+        near("C.x (decoy never flagged)", mp[2].x, 20.0f, 1e-3f);
+        near("C.z (decoy never flagged)", mp[2].z, 0.0f, 1e-3f);
         near("C.v.z", mv[2].z, 0.0f, 1e-3f);
         for (int k = 0; k < 3; ++k)
             if (!(shapeDev[k] <= 1e-3f))
             { std::printf("FAIL: cloud %s lost its shape (max offset change %.6f)\n", names[k], shapeDev[k]); ++failures; }
 
-        if (devIdx) ctx->memFree(devIdx);
-        if (devPairs) ctx->memFree(devPairs);
-        if (devFlags) ctx->memFree(devFlags);
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         failures += unmappedPenalty();
-        if (control)
-        {
-            std::printf("[ control ] gpu-sdk-step: particleapply control run (%d check(s) failed), not scored\n",
-                        failures);
-            return 0;
-        }
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: particleapply: B.z-C.z = %.4f, B moved %.4f along x, A rose %.4f "
@@ -14584,7 +12977,14 @@ int main()
         }
 
         int failures = 0;
-        const float yFree = 50.0f - 9.81f * dt * dt * 0.5f * float(steps) * float(steps + 1);   // 48.73288
+        // 5.12 CHANGE: PxSceneDesc::flags now defaults to eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS
+        // (CHANGELOG 5.12, General), so gravity is applied per position iteration (the hub's 4,
+        // see the builder) and a frame moves a body by v0 dt + g dt^2 (N+1)/(2N), not
+        // v0 dt + g dt^2: yFree = 50 - g dt^2 (n(n-1)/2 + n (N+1)/(2N)) = 48.76353 (5.6.1, once
+        // per step: 50 - g dt^2 n(n+1)/2 = 48.73288).  Measured on 5.12: 48.76353.
+        const float subN = 4.0f;
+        const float yFree = 50.0f - 9.81f * dt * dt
+                          * (0.5f * float(steps) * float(steps - 1) + float(steps) * (subN + 1.0f) / (2.0f * subN));
         if (sg.hub)
         {
             const PxTransform H = sg.hub->getGlobalPose();
@@ -15138,6 +13538,9 @@ int main()
         std::printf("  after warm-up: R lin accel=(%.5f, %.5f, %.5f)\n", aR1[0], aR1[1], aR1[2]);
         near("R lin accel.y after warm-up", aR1[1], -9.81f, 1e-3f);
         near("R lin accel.x after warm-up", aR1[0], 0.0f, 1e-5f);
+        // The warm-up's accelerations of V and R, which the write window must leave as they are
+        // under 5.12 (see "lin accel right after the write" below).
+        const std::vector<float> aVR1 = rd(RT::eLINEAR_ACCELERATION, { iV, iR }, 3, "V,R lin accel after warm-up");
         const std::vector<float> vR = rd(RT::eLINEAR_VELOCITY, { iR }, 3, "R lin vel");
         const std::vector<float> wR = rd(RT::eANGULAR_VELOCITY, { iR }, 3, "R ang vel");
 
@@ -15150,12 +13553,22 @@ int main()
         const std::vector<float> vel = { 4.0f, 0.0f, -2.0f, vR[0], vR[1], vR[2] };
         wr(WT::eLINEAR_VELOCITY, { iV, iR }, vel, "lin vel V,R");
         same("lin vel read-back V,R", rd(RT::eLINEAR_VELOCITY, { iV, iR }, 3, "lin vel read-back"), vel);
-        same("lin accel right after the write V,R",
-             rd(RT::eLINEAR_ACCELERATION, { iV, iR }, 3, "lin accel after write"), { 0, 0, 0, 0, 0, 0 });
+        // 5.12 CHANGE: the acceleration getters no longer differentiate at read time.  They
+        // gather a buffer computeRigidBodyAccelerations fills once per step during the DMA
+        // back (5.12 updateBodiesAndShapes.cu, PxgSimulationCore.cpp:2713-2719, 2805-2809), so
+        // a velocity write between steps leaves them at the last step's value, bit for bit:
+        // the warm-up's free fall, (0, -9.81, 0) for both.  (5.6.1 recomputed (v - prev) / dt at
+        // the read, and the setter's previous-velocity write made that exactly 0.)  The setters
+        // still write the previous velocity, which step 2's accelerations below observe.
+        same("lin accel right after the write V,R (the warm-up step's)",
+             rd(RT::eLINEAR_ACCELERATION, { iV, iR }, 3, "lin accel after write"), aVR1);
+        near("V lin accel.y after the warm-up", aVR1[1], -9.81f, 1e-3f);
 
         const std::vector<float> ang = { 0.0f, 3.0f, 0.0f, wR[0], wR[1], wR[2] };
         wr(WT::eANGULAR_VELOCITY, { iW, iR }, ang, "ang vel W,R");
         same("ang vel read-back W,R", rd(RT::eANGULAR_VELOCITY, { iW, iR }, 3, "ang vel read-back"), ang);
+        // 5.12: the warm-up's angular accelerations, which are 0 for both (neither turned), so
+        // this no longer tells a refreshed getter from a stale one; W's step-2 check does.
         same("ang accel right after the write W,R",
              rd(RT::eANGULAR_ACCELERATION, { iW, iR }, 3, "ang accel after write"), { 0, 0, 0, 0, 0, 0 });
 
@@ -15207,19 +13620,37 @@ int main()
                         fin[b * 7 + 0], fin[b * 7 + 1], fin[b * 7 + 2], fin[b * 7 + 3]);
         auto P = [&](int b, int c) { return fin[b * 7 + 4 + c]; };
         auto Qc = [&](int b, int c) { return fin[b * 7 + c]; };
-        const float yFree61 = 20.0f - 5.152975f;       // g dt^2 * 61*62/2
+        // 5.12 CHANGE: PxSceneDesc::flags now defaults to eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS
+        // (CHANGELOG 5.12, General).  Under TGS, gravity and the eFORCE / eTORQUE writes are then
+        // applied per position iteration (N = 4, the default count), so within a frame an
+        // acceleration a moves a body by a dt^2 (N+1)/(2N) instead of a dt^2: sub = 0.625 under
+        // TGS, 1 under PGS (which ignores the flag) and on 5.6.1.  The velocities are unchanged.
+        //   free fall, 61 steps from rest:          20 - g dt^2 (61*60/2 + 61 sub)
+        //   T2 (v0 = -g dt after the warm-up), 60:  30 - g dt^2 (60 + 60*59/2 + 60 sub)
+        //   V (warm-up, then v.y written to 0), 60: 20 - g dt^2 (60*59/2 + 61 sub)
+        //   F, Q (one step of a, then 59 at a dt):  a dt^2 (sub + 59)
+        // Measured on 5.12 TGS: T2.y 24.911064, V.y 15.072861, R.y 14.909361, F.z 0.082813,
+        // Q.q.w 0.080085 -- each the formula's value; PGS keeps the 5.6.1 figures.
+        const float g = 9.81f, gdt2 = g * dt * dt;
+        const float sub = (scene->getSolverType() == PxSolverType::eTGS) ? 0.625f : 1.0f;
+        const float yFree61 = 20.0f - gdt2 * (1830.0f + 61.0f * sub);   // 5.6.1: 20 - 5.152975
+        const float yT2 = 30.0f - gdt2 * (60.0f + 1770.0f + 60.0f * sub);   // 5.6.1: 24.84975
+        const float yV = 20.0f - gdt2 * (1770.0f + 61.0f * sub);            // 5.6.1: 15.010525
+        const float zF = 5.0f * dt * dt * (sub + 59.0f);                     // 5.6.1: 5 / 60
+        const float angQ = 180.0f * dt * dt * (sub + 59.0f);                 // 5.6.1: 3 rad
         near("T.x", P(0, 0), -10.0f, 0.05f);  near("T.y (rests on the ground)", P(0, 1), 0.5f, 0.05f);
         near("T.z", P(0, 2), 3.0f, 0.05f);
         near("T.q.y", std::fabs(Qc(0, 1)), 0.38268343f, 1e-2f); near("T.q.w", std::fabs(Qc(0, 3)), 0.92387953f, 1e-2f);
-        near("T2.x", P(1, 0), -6.0f, 1e-4f);  near("T2.y", P(1, 1), 24.84975f, 2e-3f);
+        near("T2.x", P(1, 0), -6.0f, 1e-4f);  near("T2.y", P(1, 1), yT2, 2e-3f);
         near("T2.z", P(1, 2), -4.0f, 1e-4f);
         near("T2.q.x", std::fabs(Qc(1, 0)), 0.70710677f, 1e-4f); near("T2.q.w", std::fabs(Qc(1, 3)), 0.70710677f, 1e-4f);
-        near("V.x", P(2, 0), 2.0f, 1e-3f);    near("V.y", P(2, 1), 15.010525f, 2e-3f);
+        near("V.x", P(2, 0), 2.0f, 1e-3f);    near("V.y", P(2, 1), yV, 2e-3f);
         near("V.z", P(2, 2), -2.0f, 1e-3f);
         near("W.q.y", std::fabs(Qc(3, 1)), 0.9974950f, 2e-3f); near("W.q.w", std::fabs(Qc(3, 3)), 0.0707372f, 2e-3f);
         near("W.y", P(3, 1), yFree61, 2e-3f);
-        near("F.z", P(4, 2), 5.0f / 60.0f, 1e-4f); near("F.y", P(4, 1), yFree61, 2e-3f);
-        near("Q.q.z", std::fabs(Qc(5, 2)), 0.9974950f, 2e-3f); near("Q.q.w", std::fabs(Qc(5, 3)), 0.0707372f, 2e-3f);
+        near("F.z", P(4, 2), zF, 1e-4f); near("F.y", P(4, 1), yFree61, 2e-3f);
+        near("Q.q.z", std::fabs(Qc(5, 2)), std::sin(0.5f * angQ), 2e-3f);
+        near("Q.q.w", std::fabs(Qc(5, 3)), std::cos(0.5f * angQ), 2e-3f);
         near("R.y", P(6, 1), yFree61, 2e-3f); near("R.x", P(6, 0), 14.0f, 1e-5f);
         failures += unmappedPenalty();
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
@@ -15415,15 +13846,20 @@ int main()
         // made the GPU print (-39240.00, +0.00, +78479.99): the CPU answer to the
         // last digit.  See the long note at that writeback site.
         //
-        // So the number this scene asserts under TGS is the CUDA's, deliberately.
+        // So the number this scene asserted under TGS was the CUDA's, deliberately.
+        //
+        // 5.12 (CHANGELOG 5.11, Rigid Body / Fixed): "With the TGS solver,
+        // PxConstraint::getForce() could report a much too small torque ... The reported
+        // values now match the PGS solver, on CPU and GPU."  The 5.12 TGS writeback (and
+        // this port's, which follows it) reports the torque about the attachment, as PGS
+        // does: measured (0, 0, -4905) under TGS on 5.12.  Both solvers now use PGS's arm.
         const float mass = ds.hangerMass, g = 9.81f;
         const float expF = mass * g;
         const PxVec3 F(jForce[0], jForce[1], jForce[2]);
         const PxVec3 T(jTorque[0], jTorque[1], jTorque[2]);
         const PxVec3 expFv(0.0f, -expF, 0.0f);
-        // the moment arm each solver core uses, as measured above
-        const PxVec3 torqueArm = usePgs ? PxVec3(ds.hangerAttachOffsetX, 0.0f, 0.0f)
-                                        : ds.anchorWorld;
+        // the moment arm both solver cores use since 5.11 (the anchor arm was 5.6.1's TGS)
+        const PxVec3 torqueArm = PxVec3(ds.hangerAttachOffsetX, 0.0f, 0.0f);
         const PxVec3 expT = -torqueArm.cross(F);   // the convention, applied to the MEASURED force
         const float expTmag = expT.magnitude();
 
@@ -15437,7 +13873,7 @@ int main()
         std::printf("  joint : torque=(%+9.2f, %+9.2f, %+9.2f) |T|=%.2f   expected -(%s x F) = "
                     "(%+9.2f, %+9.2f, %+9.2f)\n",
                     T.x, T.y, T.z, T.magnitude(),
-                    usePgs ? "attachment" : "anchor", expT.x, expT.y, expT.z);
+                    "attachment", expT.x, expT.y, expT.z);
         std::printf("  api returned: pose=%d linVel=%d angVel=%d force=%d torque=%d\n",
                     int(okPose), int(okLin), int(okAng), int(okF), int(okT));
 
@@ -15474,14 +13910,13 @@ int main()
         { std::printf("FAIL: joint force (%+.2f, %+.2f, %+.2f), expected (%+.2f, %+.2f, %+.2f) -- "
                       "static equilibrium of a %.0f kg box\n",
                       F.x, F.y, F.z, expFv.x, expFv.y, expFv.z, mass); ++failures; }
-        // The torque is asserted componentwise against -(arm x F) for this solver's
-        // arm.  Under TGS the anchor is off TWO axes, so two components have to come
-        // out right, not one; under PGS the single-axis attachment gives one.
+        // The torque is asserted componentwise against -(arm x F), the attachment arm under
+        // both solvers since 5.11 (5.6.1's TGS used the anchor, which is off two axes).
         if (!((T - expT).magnitude() < 0.02f * expTmag))
         { std::printf("FAIL: joint torque (%+.2f, %+.2f, %+.2f), expected (%+.2f, %+.2f, %+.2f) = "
                       "-(%s x F) with arm (%.2f, %.2f, %.2f)\n",
                       T.x, T.y, T.z, expT.x, expT.y, expT.z,
-                      usePgs ? "attachment" : "anchor",
+                      "attachment",
                       torqueArm.x, torqueArm.y, torqueArm.z); ++failures; }
         // ...and the torque must not be the trivially-right answer a refused kernel
         // also gives.  The joint frame is off-centre precisely so this is non-zero.
@@ -15495,7 +13930,7 @@ int main()
             std::printf("[  OK  ] gpu-sdk-step: the DIRECT-GPU API is live on Vulkan -- the box's pose and "
                         "velocity came back from the GPU with host writeback off, and the D6 joint reports "
                         "%.0f N and a torque of %.0f N m matching -(%s x F) to within 2%%\n",
-                        F.magnitude(), T.magnitude(), usePgs ? "attachment" : "anchor");
+                        F.magnitude(), T.magnitude(), "attachment");
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: directapi checks failed (%d)\n", failures);
@@ -15532,15 +13967,24 @@ int main()
     // [ FAIL ] reads the miss as a pass -- hence the [ FAIL ] marker below.
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
+    // Scenes retired with the 5.12 migration: the API each one existed to reach is gone.
+    // Named explicitly so a stale runner reads why, not "unknown".
+    else if (!std::strcmp(sceneName, "particlecloth") || !std::strcmp(sceneName, "particleinflatable") ||
+             !std::strcmp(sceneName, "particlerigid") || !std::strcmp(sceneName, "particleattach") ||
+             !std::strcmp(sceneName, "softbodycone"))
+    {
+        std::printf("[ FAIL ] gpu-sdk-step: PXG_SCENE='%s' was retired in the 5.12 migration: 5.12 removed "
+                    "particle cloth / inflatables, particle rigids and volumes, particle-rigid attachments and "
+                    "PxConeLimitedConstraint (CHANGELOG 5.12)\n", sceneName);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+    }
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact|clothhangbox|clothlinkattach|clothtripin|softbodyrigidattach|softbodyartiattach|softbodycone\n"
-                       "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation|articulationloop|articulationstack|clothonlink|softbodyarticontact|clothhangbox|clothlinkattach|clothtripin|softbodyrigidattach|softbodyartiattach\n"
+                       "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlehffloor|particlediffuse|particleconvex\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "          clothnet|particlepush|articulationjoint   (P9.41: pending-work, not scored)\n"
-                       "          particleattach                          (P9.76: the particle ATTACHMENT chain)\n"
-                       "          particlerigid                           (P9.80: PBD shape matching + volume bounds)\n"
                        "          directapi                               (P9.79: the DIRECT-GPU API, host writeback off)\n"
                        "          forcethreshold                          (P9.91: FOUND/PERSISTS/LOST force-threshold events)\n"
                        "          aggregate                               (P9.92: PxAggregate self / actor / aggregate pairs)\n"
@@ -15548,15 +13992,13 @@ int main()
                        "          extforce                                (P9.93: addForce / addTorque -> external velocities)\n"
                        "          substepgravity                          (P9.95: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS -> applyTGSSubstepGravity)\n"
                        "          slabgrid                                (P9.97a: TGS init/average/propagate at the engine grid; PXG_SLABGRID=slab|whole|one|slab5)\n"
-                       "          particleapply                           (P9.95: PxScene::applyParticleBufferData -> applyParticleBufferDataDEPRECATED)\n"
-                       "          softbodydata                            (P9.95: PxScene::copy/applySoftBodyData -> sb_copyOrApplySoftBodyDataDEPRECATED)\n"
+                       "          particleapply                           (P9.95: edited particle buffers ingested by buffer flags, direct-API scene)\n"
+                       "          softbodydata                            (P9.95: softbody sim buffers written + markDirty)\n"
                        "          directapimerge                          (P9.95: shapes added / re-inserted between steps -> mergeTransformCacheAndBoundArrayChanges)\n"
                        "          sdfquery                                (P9.95: PxDirectGPUAPI::evaluateSDFDistances -> evaluatePointDistancesSDFBatch)\n"
                        "          particle2                               (P9.99b: TWO PBD particle systems; PXG_P2_ARM=split|fluid|apply|push|remove)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
-                       "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"
-                       "          PXG_SCENE=particleinflatable + PXG_PARTICLE_INFL_CONTROL=1 (pressure-0 control)\n"
                        "          PXG_SCENE=particlefluidboundary + PXG_PARTICLE_BOUNDARY_CONTROL=1 (scale-0 control)\n",
                        sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }

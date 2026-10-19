@@ -24,16 +24,21 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of fcStaticTriCloth.slang against a CPU transcription of
-// femClothPrimitives.cu.  Mode 0 (cloth_meshContactGenLaunch core): the
-// all-three-verts filter skip, vertex2Shape + trimeshToClothTransform,
-// staticTriangleVsClothCollision (trim pipeline + tolerance-averaged
-// deepest point) and writeRigidVsDeformableContact32 (32-bit sort lane
-// only; the u64 contactByX/tempContactByX must stay untouched).  Mode 1
-// (cloth_boxVertexContactGenLaunch core): single-vertex filter skip,
-// spherebox with radius 0, contact = clothP - pen*n, (0,0,0,1) vertex
-// barycentric, writeRigidVsDeformableContact (u64 keys; the 32-bit
-// contactSortedByX lane must stay untouched).  Both modes serialize a
+// Verification of fcStaticTriCloth.slang -- a harness around the ENGINE's
+// pxgSlangClothTriContact / pxgSlangSphereBox / pxgSlangDefFilter /
+// pxgSlangDeformableWriters modules -- against a CPU transcription of
+// femClothPrimitives.cu (PhysX 5.12).  Mode 0 (cloth_meshContactGenLaunch
+// core): the (rigid filter ref, cloth TRIANGLE) filter search, vertex2Shape +
+// trimeshToClothTransform, staticTriangleVsClothCollision (trim pipeline +
+// tolerance-averaged deepest point) and PxgRigidDbContactWriter::
+// writeSurfaceContact (pair info, PxU16 material, barycentric, the u64 rigid
+// sort key).  Mode 1 (cloth_boxVertexContactGenLaunch core): the (rigid filter
+// ref, cloth VERTEX) filter search, spherebox with radius 0, contact = clothP -
+// pen*n, and the vertex overload of writeSurfaceContact, which writes NO
+// barycentric.  The filter references come from the engine's host helpers
+// (PxgEncodeRigidFilterRef keys a STATIC rigid on its transform cache id), and
+// the near misses include the 5.6.1 keys -- all three triangle VERTICES, the raw
+// static node index -- which must no longer filter anything.  Both modes serialize a
 // 32-case warp batch per thread with ONE reservation per batch: batches
 // whose cases are all untainted must occupy consecutive ascending slots.
 // A small-capacity re-dispatch checks the capacity gate (reservation
@@ -47,6 +52,12 @@
 
 #include "pxgTestFramework.h"
 
+// no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers; must precede the
+// engine headers.
+#include "host_defines.h"
+#include "PxNodeIndex.h"
+#include "PxgSimulationCoreDesc.h"   // PxgDeformablePairInfo, PxgEncode*, PxgComparePairInfo
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -57,12 +68,22 @@
 namespace
 {
 using namespace pxgtest;
+using namespace physx;
 
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
-struct FstCase { F4 triA, triB, triC, clothQ, clothP, meshQ, meshP, scale, scaleRot; U4 ids, ids2; };
-struct FstParams { uint32_t numCases, maxContacts, nbFilterPairs, mode; };
-struct FilterPair { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
+struct FstCase { F4 triA, triB, triC, clothQ, clothP, meshQ, meshP, scale, scaleRot; U4 ids, ids2, ids3; };
+// Byte-identical to fcStaticTriCloth.slang's FstParams: the filter list and the
+// PxgRigidDbContactWriter streams are device addresses.
+struct FstParams
+{
+    uint32_t numCases, maxContacts, nbFilterPairs, mode;
+    uint64_t filterPairs, filterSafeAddr;
+    uint64_t outPoint, outNormalPen, outBarycentric, outContactInfo, outRigidMaterialIndex;
+    uint64_t totalContactCount, contactByRigid, tempContactByRigid, contactIndexSortedByRigid;
+};
+static_assert(sizeof(FstParams) == 104, "fcStaticTriCloth push block");
+static_assert(sizeof(PxgDeformablePairInfo) == 16, "PxgDeformablePairInfo");
 
 struct V3 { float x, y, z; };
 static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -257,24 +278,22 @@ static void baryRef(V3 a, V3 b, V3 c, V3 p, F4& bary, Slack& sl)
     bary = { 1.0f - v - w, v, w, 0.0f };
 }
 
-// ---- filter table ------------------------------------------------------------
+// ---- filter table (5.12: one sorted PxgDeformablePairInfo list per cloth) ------
 static uint64_t rigid64(uint32_t lo, uint32_t hi) { return (uint64_t(hi) << 32) | lo; }
-static bool findRef(const std::vector<FilterPair>& t, uint64_t rigid, uint32_t clothMask)
+// PxgEncodeRigidFilterRef: a body by its node, a STATIC (low word PX_INVALID_NODE) by
+// its shape's transform cache id.
+static uint64_t filterKey(uint64_t rigid, uint32_t cacheRef)
 {
-    size_t l = 0, r = t.size();
-    while (l < r)
-    {
-        const size_t mid = (l + r) / 2;
-        const FilterPair& p = t[mid];
-        int cmp;
-        if (rigid != p.index0) cmp = rigid < p.index0 ? -1 : 1;
-        else if (uint64_t(clothMask) != p.index1) cmp = uint64_t(clothMask) < p.index1 ? -1 : 1;
-        else if (0u != p.index2) cmp = -1;
-        else cmp = 0;
-        if (cmp == 0 || (rigid == p.index0 && uint64_t(clothMask) == p.index1)) return true;
-        if (cmp < 0) r = mid; else l = mid + 1;
-    }
-    return false;
+    return PxgEncodeRigidFilterRef(PxNodeIndex(PxU64(rigid)), cacheRef);
+}
+static bool pairLess(const PxgDeformablePairInfo& a, const PxgDeformablePairInfo& b)
+{
+    return PxgComparePairInfo(a, b) < 0;
+}
+static bool findRef(const std::vector<PxgDeformablePairInfo>& t, uint64_t ref0, uint64_t ref1)
+{
+    const PxgDeformablePairInfo key = { ref0, ref1 };
+    return std::binary_search(t.begin(), t.end(), key, pairLess);
 }
 
 static F4 randQuat(std::mt19937& rng)
@@ -324,8 +343,81 @@ static Mode0Chain refMode0Chain(const FstCase& cs, V3* poly, Slack& sl)
 }
 
 static const uint32_t POISON = 0xCDCDCDCDu;
-static const uint32_t INFOPOISON = 0xDEADBEEFu;
+static const uint64_t INFOPOISON = 0xDEADBEEFDEADBEEFull;
+static const uint32_t MATPOISON = 0xFFFFu;
 static const uint32_t CLOTH0 = 3, CLOTH1 = 5;
+
+// Everything one dispatch wrote through the PxgRigidDbContactWriter.
+struct Run
+{
+    std::vector<F4> pt, np, bc, dbg;
+    std::vector<PxgDeformablePairInfo> in;
+    std::vector<uint64_t> by;
+    std::vector<uint32_t> tb, ix, mat;
+    uint32_t wc;
+};
+static Run runFst(PxgSlangComputeDevice* dev, const Kernel& k, const std::vector<FstCase>& cc,
+                  const std::vector<F4>& cp, const std::vector<PxgDeformablePairInfo>& filters,
+                  uint32_t mode, uint32_t cap, uint32_t bufCap)
+{
+    const uint32_t n = (uint32_t)cc.size();
+    std::vector<F4> femF4Init(bufCap, { -9, -9, -9, -9 });
+    std::vector<PxgDeformablePairInfo> infoInit(bufCap, PxgDeformablePairInfo{ INFOPOISON, INFOPOISON });
+    std::vector<uint32_t> u1Init(bufCap, POISON), matInit((bufCap + 1) / 2, 0xFFFFFFFFu), wc0(1, 0);
+    std::vector<uint64_t> u64Init(bufCap, (uint64_t(POISON) << 32) | POISON);
+    std::vector<F4> dbgInit(n, { -7, -7, -7, -7 });
+    // An empty list still needs a mapped address: one dummy entry, nbFilterPairs = 0.
+    const std::vector<PxgDeformablePairInfo> fl =
+        filters.empty() ? std::vector<PxgDeformablePairInfo>(1, PxgDeformablePairInfo{ 0, 0 }) : filters;
+    PxgBufferHandle bC = createBufferFrom(dev, cc);
+    PxgBufferHandle bP = createBufferFrom(dev, cp);
+    PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
+    PxgBufferHandle bF = createBufferFrom(dev, fl);
+    PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
+    PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
+    PxgBufferHandle bMat = createBufferFrom(dev, matInit);
+    PxgBufferHandle bWc = createBufferFrom(dev, wc0);
+    PxgBufferHandle bBy = createBufferFrom(dev, u64Init);
+    PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
+    PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
+    FstParams prm = {};
+    prm.numCases = n;
+    prm.maxContacts = cap;
+    prm.nbFilterPairs = (uint32_t)filters.size();
+    prm.mode = mode;
+    prm.filterPairs = dev->getBufferDeviceAddress(bF);
+    prm.filterSafeAddr = prm.filterPairs;
+    prm.outPoint = dev->getBufferDeviceAddress(bPt);
+    prm.outNormalPen = dev->getBufferDeviceAddress(bNp);
+    prm.outBarycentric = dev->getBufferDeviceAddress(bBc);
+    prm.outContactInfo = dev->getBufferDeviceAddress(bIn);
+    prm.outRigidMaterialIndex = dev->getBufferDeviceAddress(bMat);
+    prm.totalContactCount = dev->getBufferDeviceAddress(bWc);
+    prm.contactByRigid = dev->getBufferDeviceAddress(bBy);
+    prm.tempContactByRigid = dev->getBufferDeviceAddress(bTb);
+    prm.contactIndexSortedByRigid = dev->getBufferDeviceAddress(bIx);
+    const uint32_t batches = (n + 31) / 32;
+    k.dispatch((batches + 63) / 64, { bC, bP, bDb }, prm);
+    dev->flush();
+    Run r;
+    r.pt = downloadBuffer<F4>(dev, bPt, bufCap);
+    r.np = downloadBuffer<F4>(dev, bNp, bufCap);
+    r.bc = downloadBuffer<F4>(dev, bBc, bufCap);
+    r.in = downloadBuffer<PxgDeformablePairInfo>(dev, bIn, bufCap);
+    r.by = downloadBuffer<uint64_t>(dev, bBy, bufCap);
+    r.tb = downloadBuffer<uint32_t>(dev, bTb, bufCap);
+    r.ix = downloadBuffer<uint32_t>(dev, bIx, bufCap);
+    const std::vector<uint32_t> matWords = downloadBuffer<uint32_t>(dev, bMat, (bufCap + 1) / 2);
+    for (uint32_t s = 0; s < bufCap; ++s)
+        r.mat.push_back((matWords[s / 2] >> (16u * (s & 1u))) & 0xFFFFu);
+    r.dbg = downloadBuffer<F4>(dev, bDb, n);
+    r.wc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+    for (PxgBufferHandle h : { bC, bP, bDb, bF, bPt, bNp, bBc, bIn, bMat, bWc, bBy, bTb, bIx })
+        dev->destroyBuffer(h);
+    return r;
+}
 
 PXG_TEST(fcStaticTriCloth_meshBoxVertex)
 {
@@ -336,7 +428,7 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
     // ================= MODE 0: static mesh triangle vs cloth triangle =========
     std::vector<FstCase> cases(NC);
     std::vector<F4> clothPos(NC * 3);
-    std::vector<FilterPair> filters;
+    std::vector<PxgDeformablePairInfo> filters;
 
     for (uint32_t i = 0; i < NC; ++i)
     {
@@ -412,19 +504,25 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
         cs.triB = { mB.x, mB.y, mB.z, 0 };
         cs.triC = { mC.x, mC.y, mC.z, 0 };
 
-        const uint32_t rlo = 0x40u + i % 11, rhi = 2 + i % 5;
+        // Every ninth case pair is a STATIC rigid (PxNodeIndex low word PX_INVALID_NODE),
+        // whose filter reference is its transform cache id, not its node.
+        const bool isStatic = (i % 9 == 2 || i % 9 == 7) && (i % 2 == 1);
+        const uint32_t rlo = isStatic ? 0xFFFFFFFFu : 0x40u + i % 11, rhi = 2 + i % 5;
+        const uint32_t cacheRef = 100u + i % 7;
         cs.ids = { rlo, rhi, CLOTH0, i };
         cs.ids2 = { (0x90u + i % 13) | ((i % 6 == 1) ? 0x80000000u : 0u), i * 3 + 0, i * 3 + 1, i * 3 + 2 };
+        cs.ids3 = { cacheRef, 0, 0, 0 };
 
         const uint64_t r64 = rigid64(rlo, rhi);
-        if (i % 9 == 2) // real skip: all three verts filtered
+        const uint64_t key = filterKey(r64, cacheRef);
+        const uint64_t triRef = PxgEncodeDeformableTriangle(CLOTH0, i);
+        if (i % 9 == 2) // real skip: the (rigid, triangle) pair
+            filters.push_back({ key, triRef });
+        else if (i % 9 == 5) // near miss: all three VERTICES (the 5.6.1 key) -- must NOT skip
             for (uint32_t k = 0; k < 3; ++k)
-                filters.push_back({ r64, uint64_t((CLOTH0 << 20) | (i * 3 + k)), 0, 0, 0, 0 });
-        else if (i % 9 == 5) // near miss: only two of three — must NOT skip
-            for (uint32_t k = 0; k < 2; ++k)
-                filters.push_back({ r64, uint64_t((CLOTH0 << 20) | (i * 3 + k)), 0, 0, 0, 0 });
-        else if (i % 9 == 7) // decoy: wrong rigid id
-            filters.push_back({ r64 ^ 0x1000u, uint64_t((CLOTH0 << 20) | (i * 3)), 0, 0, 0, 0 });
+                filters.push_back({ key, PxgEncodeDeformableVertex(CLOTH0, i * 3 + k) });
+        else if (i % 9 == 7) // decoys: another rigid's key, and a static's RAW node index
+            filters.push_back({ isStatic ? r64 : filterKey(r64 ^ 0x1000u, cacheRef), triRef });
     }
 
     // mode 1 cases share the filter table (different clothId => disjoint masks)
@@ -458,16 +556,22 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
         const V3 wp = add(quatRotate(cs.clothQ, lp), bp);
         cs.triA = { wp.x, wp.y, wp.z, 0 };
 
-        const uint32_t rlo = 0xA00u + i % 9, rhi = 1 + i % 4;
+        const bool isStatic = (i % 20 == 13 || i % 20 == 19);
+        const uint32_t rlo = isStatic ? 0xFFFFFFFFu : 0xA00u + i % 9, rhi = 1 + i % 4;
+        const uint32_t cacheRef = 200u + i % 5;
         cs.ids = { rlo, rhi, CLOTH1, i };
         cs.ids2 = { (0x11u + i % 7) | ((i % 5 == 2) ? 0x80000000u : 0u), 0, 0, 0 };
+        cs.ids3 = { cacheRef, 0, 0, 0 };
+        const uint64_t key = filterKey(rigid64(rlo, rhi), cacheRef);
         if (i % 10 == 3)
-            filters.push_back({ rigid64(rlo, rhi), uint64_t((CLOTH1 << 20) | i), 0, 0, 0, 0 });
+            filters.push_back({ key, PxgEncodeDeformableVertex(CLOTH1, i) });
         else if (i % 10 == 6) // near miss: adjacent vertex id
-            filters.push_back({ rigid64(rlo, rhi), uint64_t((CLOTH1 << 20) | (i + 1)) | 0x80000000ull, 0, 0, 0, 0 });
+            filters.push_back({ key, PxgEncodeDeformableVertex(CLOTH1, i + 1) });
+        else if (i % 10 == 9) // near misses: the TRIANGLE of the same id, and a static's raw node
+            filters.push_back({ isStatic ? rigid64(rlo, rhi) : key, isStatic ? PxgEncodeDeformableVertex(CLOTH1, i)
+                                                                             : PxgEncodeDeformableTriangle(CLOTH1, i) });
     }
-    std::sort(filters.begin(), filters.end(), [](const FilterPair& a, const FilterPair& b)
-              { return a.index0 != b.index0 ? a.index0 < b.index0 : a.index1 < b.index1; });
+    std::sort(filters.begin(), filters.end(), pairLess);
 
     // ---- CPU reference, mode 0 ----
     std::vector<RefOut> ref(NC);
@@ -478,10 +582,8 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
         const FstCase& cs = cases[i];
         Slack sl;
         RefOut& ro = ref[i];
-        const uint64_t r64 = rigid64(cs.ids.x, cs.ids.y);
-        ro.filtered = findRef(filters, r64, (CLOTH0 << 20) | cs.ids2.y) &&
-                      findRef(filters, r64, (CLOTH0 << 20) | cs.ids2.z) &&
-                      findRef(filters, r64, (CLOTH0 << 20) | cs.ids2.w);
+        ro.filtered = findRef(filters, filterKey(rigid64(cs.ids.x, cs.ids.y), cs.ids3.x),
+                              PxgEncodeDeformableTriangle(CLOTH0, cs.ids.w));
         if (ro.filtered) { ++skipN; continue; }
 
         const V3 a1 = v3f(clothPos[cs.ids2.y]);
@@ -532,7 +634,8 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
         const FstCase& cs = bcases[i];
         Slack sl;
         RefOut& ro = bref[i];
-        ro.filtered = findRef(filters, rigid64(cs.ids.x, cs.ids.y), (CLOTH1 << 20) | i);
+        ro.filtered = findRef(filters, filterKey(rigid64(cs.ids.x, cs.ids.y), cs.ids3.x),
+                              PxgEncodeDeformableVertex(CLOTH1, i));
         if (ro.filtered) { ++bSkipN; continue; }
 
         const V3 he = v3f(cs.triB);
@@ -590,59 +693,14 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
 
     // ---- GPU ----
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint32_t> filterRaw(filters.size() * 8);
-    std::memcpy(filterRaw.data(), filters.data(), filters.size() * sizeof(FilterPair));
     Kernel k("fcStaticTriCloth.spv", "fcStaticTriClothKernel",
-             { (uint32_t)sizeof(FstCase), 16, (uint32_t)sizeof(FilterPair),
-               16, 16, 16, 16, 4, 8, 4, 4, 4, 16 }, sizeof(FstParams));
+             { (uint32_t)sizeof(FstCase), 16, 16 }, sizeof(FstParams));
 
-    struct Run
-    {
-        std::vector<F4> pt, np, bc, dbg;
-        std::vector<U4> in;
-        std::vector<uint32_t> by, tb, ix, s32;
-        uint32_t wc;
-    };
     // buffers always sized CAP; `cap` only sets the writer's maxContacts gate,
     // so slots in [cap, CAP) must stay poison
     auto runMode = [&](const std::vector<FstCase>& cc, const std::vector<F4>& cp, uint32_t mode, uint32_t cap) -> Run
     {
-        const uint32_t n = (uint32_t)cc.size();
-        std::vector<F4> femF4Init(CAP, { -9, -9, -9, -9 });
-        std::vector<U4> infoInit(CAP, { INFOPOISON, INFOPOISON, INFOPOISON, INFOPOISON });
-        std::vector<uint32_t> u1Init(CAP, POISON), u2Init(CAP * 2, POISON), wc0(1, 0);
-        std::vector<F4> dbgInit(n, { -7, -7, -7, -7 });
-        PxgBufferHandle bC = createBufferFrom(dev, cc);
-        PxgBufferHandle bP = createBufferFrom(dev, cp);
-        PxgBufferHandle bF = createBufferFrom(dev, filterRaw);
-        PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
-        PxgBufferHandle bWc = createBufferFrom(dev, wc0);
-        PxgBufferHandle bBy = createBufferFrom(dev, u2Init);
-        PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bS3 = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
-        FstParams prm = { n, cap, (uint32_t)filters.size(), mode };
-        const uint32_t batches = (n + 31) / 32;
-        k.dispatch((batches + 63) / 64, { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb }, prm);
-        dev->flush();
-        Run r;
-        r.pt = downloadBuffer<F4>(dev, bPt, CAP);
-        r.np = downloadBuffer<F4>(dev, bNp, CAP);
-        r.bc = downloadBuffer<F4>(dev, bBc, CAP);
-        r.in = downloadBuffer<U4>(dev, bIn, CAP);
-        r.by = downloadBuffer<uint32_t>(dev, bBy, CAP * 2);
-        r.tb = downloadBuffer<uint32_t>(dev, bTb, CAP);
-        r.ix = downloadBuffer<uint32_t>(dev, bIx, CAP);
-        r.s32 = downloadBuffer<uint32_t>(dev, bS3, CAP);
-        r.dbg = downloadBuffer<F4>(dev, bDb, n);
-        r.wc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
-        for (PxgBufferHandle h : { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb })
-            dev->destroyBuffer(h);
-        return r;
+        return runFst(dev, k, cc, cp, filters, mode, cap, CAP);
     };
 
     const Run r0 = runMode(cases, clothPos, 0, CAP);
@@ -655,14 +713,18 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
     std::vector<int> slotOf(NC, -1);
     for (uint32_t s = 0; s < std::min(r0.wc, CAP); ++s)
     {
-        const uint32_t caseIdx = r0.in[s].z & 0xFFFFFu;
-        if ((r0.in[s].z >> 20) != CLOTH0 || caseIdx >= NC || slotOf[caseIdx] != -1) { ++mmW; continue; }
+        const uint64_t ref1 = r0.in[s].ref1;
+        const uint32_t caseIdx = PxgGetDeformableFeatureId(ref1);
+        if (PxgGetDeformableId(ref1) != CLOTH0 || PxgGetDeformableFeatureType(ref1) != PxgDeformableRef::eTRIANGLE ||
+            ref1 != PxgEncodeDeformableTriangle(CLOTH0, caseIdx) || caseIdx >= NC || slotOf[caseIdx] != -1)
+        { ++mmW; continue; }
         slotOf[caseIdx] = (int)s;
-        if (r0.in[s].x != cases[caseIdx].ids.x || r0.in[s].y != cases[caseIdx].ids.y) ++mmW;
-        if (r0.in[s].w != (cases[caseIdx].ids2.x & 0x7FFFFFFFu)) ++mmW;
-        if (r0.s32[s] != cases[caseIdx].ids.x || r0.ix[s] != s) ++mmW;
-        // the 32-variant must NOT touch the u64 key lanes
-        if (r0.by[s * 2] != POISON || r0.by[s * 2 + 1] != POISON || r0.tb[s] != POISON) ++mmW;
+        const uint64_t r64 = rigid64(cases[caseIdx].ids.x, cases[caseIdx].ids.y);
+        // ref0 is the rigid's NODE (rigidId.getInd()), static or not -- the filter key is
+        // not what the contact carries.
+        if (r0.in[s].ref0 != r64) ++mmW;
+        if (r0.mat[s] != (cases[caseIdx].ids2.x & 0xFFFFu)) ++mmW;
+        if (r0.by[s] != r64 || r0.tb[s] != PxgGetContactSortKey(r64) || r0.ix[s] != s) ++mmW;
     }
     uint32_t sumChecked = 0, numTainted = 0;
     size_t checked = 0;
@@ -725,9 +787,8 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
     for (uint32_t s = 0; s < TINY; ++s)
         if (r0t.ix[s] != s) ++mmC; // all slots below TINY are claimed and written
     for (uint32_t s = TINY; s < CAP; ++s) // beyond the gate: EVERY writer lane poison
-        if (r0t.ix[s] != POISON || r0t.s32[s] != POISON || r0t.tb[s] != POISON ||
-            r0t.by[s * 2] != POISON || r0t.by[s * 2 + 1] != POISON ||
-            r0t.in[s].x != INFOPOISON || r0t.in[s].w != INFOPOISON ||
+        if (r0t.ix[s] != POISON || r0t.tb[s] != POISON || r0t.by[s] != ((uint64_t(POISON) << 32) | POISON) ||
+            r0t.in[s].ref0 != INFOPOISON || r0t.in[s].ref1 != INFOPOISON || r0t.mat[s] != MATPOISON ||
             r0t.pt[s].x != -9.0f || r0t.np[s].x != -9.0f || r0t.bc[s].x != -9.0f)
             ++mmC;
     PXG_CHECK_MSG(mmC == 0, "fcStaticTriCloth cap: %zu capacity-gate leaks", mmC);
@@ -737,15 +798,15 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
     std::vector<int> bslotOf(NB, -1);
     for (uint32_t s = 0; s < std::min(r1.wc, CAP); ++s)
     {
-        const uint32_t caseIdx = r1.in[s].z & 0xFFFFFu;
-        if ((r1.in[s].z >> 20) != CLOTH1 || caseIdx >= NB || bslotOf[caseIdx] != -1) { ++bmmW; continue; }
+        const uint64_t ref1 = r1.in[s].ref1;
+        const uint32_t caseIdx = PxgGetDeformableFeatureId(ref1);
+        if (ref1 != PxgEncodeDeformableVertex(CLOTH1, caseIdx) || caseIdx >= NB || bslotOf[caseIdx] != -1)
+        { ++bmmW; continue; }
         bslotOf[caseIdx] = (int)s;
-        const uint32_t rl = bcases[caseIdx].ids.x, rh = bcases[caseIdx].ids.y;
-        if (r1.in[s].x != rl || r1.in[s].y != rh ||
-            r1.by[s * 2] != rl || r1.by[s * 2 + 1] != rh || r1.tb[s] != rl || r1.ix[s] != s)
+        const uint64_t r64 = rigid64(bcases[caseIdx].ids.x, bcases[caseIdx].ids.y);
+        if (r1.in[s].ref0 != r64 || r1.by[s] != r64 || r1.tb[s] != PxgGetContactSortKey(r64) || r1.ix[s] != s)
             ++bmmW;
-        if (r1.in[s].w != (bcases[caseIdx].ids2.x & 0x7FFFFFFFu)) ++bmmW;
-        if (r1.s32[s] != POISON) ++bmmW; // u64-key variant must not touch contactSortedByX
+        if (r1.mat[s] != (bcases[caseIdx].ids2.x & 0xFFFFu)) ++bmmW;
     }
     uint32_t bSumChecked = 0, bNumTainted = 0;
     size_t bchecked = 0;
@@ -772,7 +833,8 @@ PXG_TEST(fcStaticTriCloth_meshBoxVertex)
             !almostEqual(r1.np[s].y, ro.n.y, 2e-3f, 2e-3f) ||
             !almostEqual(r1.np[s].z, ro.n.z, 2e-3f, 2e-3f) ||
             !almostEqual(r1.np[s].w, ro.sep, 5e-4f, 5e-4f) ||
-            r1.bc[s].x != 0.0f || r1.bc[s].y != 0.0f || r1.bc[s].z != 0.0f || r1.bc[s].w != 1.0f)
+            // 5.12: the vertex overload writes NO barycentric (5.6.1 wrote (0,0,0,1))
+            r1.bc[s].x != -9.0f || r1.bc[s].y != -9.0f || r1.bc[s].z != -9.0f || r1.bc[s].w != -9.0f)
             ++bmm;
     }
     PXG_CHECK_MSG(bmm == 0 && bmmW == 0, "fcStaticTriCloth m1: %zu content + %zu slot mismatches", bmm, bmmW);
@@ -824,8 +886,7 @@ PXG_TEST(fcStaticTriCloth_p94ZeroSign)
 
     PxgSlangComputeDevice* dev = testDevice();
     Kernel k("fcStaticTriCloth.spv", "fcStaticTriClothKernel",
-             { (uint32_t)sizeof(FstCase), 16, (uint32_t)sizeof(FilterPair),
-               16, 16, 16, 16, 4, 8, 4, 4, 4, 16 }, sizeof(FstParams));
+             { (uint32_t)sizeof(FstCase), 16, 16 }, sizeof(FstParams));
     const uint32_t CAPD = 4;
 
     for (const Variant& v : variants)
@@ -865,33 +926,11 @@ PXG_TEST(fcStaticTriCloth_p94ZeroSign)
                       "fcStaticTriCloth p94 %s: twin sep 0x%08x == literal 0x%08x (case does not discriminate)",
                       v.name, twinBits, litBits);
 
-        // GPU: one case, empty filter table (one dummy entry, nbFilterPairs = 0)
-        const std::vector<FilterPair> dummyFilter(1, FilterPair{ 0, 0, 0, 0, 0, 0 });
-        std::vector<F4> femF4Init(CAPD, { -9, -9, -9, -9 });
-        std::vector<U4> infoInit(CAPD, { INFOPOISON, INFOPOISON, INFOPOISON, INFOPOISON });
-        std::vector<uint32_t> u1Init(CAPD, POISON), u2Init(CAPD * 2, POISON), wc0(1, 0);
-        std::vector<F4> dbgInit(1, { -7, -7, -7, -7 });
-        PxgBufferHandle bC = createBufferFrom(dev, cc);
-        PxgBufferHandle bP = createBufferFrom(dev, cp);
-        PxgBufferHandle bF = createBufferFrom(dev, dummyFilter);
-        PxgBufferHandle bPt = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bNp = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bBc = createBufferFrom(dev, femF4Init);
-        PxgBufferHandle bIn = createBufferFrom(dev, infoInit);
-        PxgBufferHandle bWc = createBufferFrom(dev, wc0);
-        PxgBufferHandle bBy = createBufferFrom(dev, u2Init);
-        PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bS3 = createBufferFrom(dev, u1Init);
-        PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
-        FstParams prm = { 1, CAPD, 0, 0 };
-        k.dispatch(1, { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb }, prm);
-        dev->flush();
-        const std::vector<F4> np = downloadBuffer<F4>(dev, bNp, CAPD);
-        const std::vector<F4> dbg = downloadBuffer<F4>(dev, bDb, 1);
-        const uint32_t wc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
-        for (PxgBufferHandle h : { bC, bP, bF, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bS3, bDb })
-            dev->destroyBuffer(h);
+        // GPU: one case, empty filter table
+        const Run r = runFst(dev, k, cc, cp, std::vector<PxgDeformablePairInfo>(), 0, CAPD, CAPD);
+        const std::vector<F4>& np = r.np;
+        const std::vector<F4>& dbg = r.dbg;
+        const uint32_t wc = r.wc;
 
         PXG_CHECK_MSG(wc == 1 && dbg[0].y == 1.0f && dbg[0].w == 3.0f,
                       "fcStaticTriCloth p94 %s: wc %u hasContact %g corners %g", v.name, wc, dbg[0].y, dbg[0].w);
