@@ -181,6 +181,16 @@ KNOWN_NO_SITE = {
     # handle conditionally re-assigned to UPDATE_BODIES_DIRECT_API (PxgSimulationCore.cpp);
     # {8} == kOnePtr
     "updateBodiesLaunch": "handle conditionally re-assigned inside an if (PxgSimulationCore.cpp)",
+    # 5.12: ids taken from the kernelIds[2] table, PxgSimulationCore::ovdSnapshotRigidDynamicForces;
+    # PX_CUDA_KERNEL_PARAM pack (CUdeviceptr x3, PxU32) {8,8,8,4} == kRigidGet
+    "getRigidDynamicForce": "id via the kernelIds[2] table (PxgSimulationCore.cpp ovdSnapshotRigidDynamicForces)",
+    "getRigidDynamicTorque": "id via the kernelIds[2] table (PxgSimulationCore.cpp ovdSnapshotRigidDynamicForces)",
+    # 5.12: launched through the variadic PxgKernelLauncher::launchKernelThreadsAutoPackParameters
+    # (PxgKernelLauncher.h), whose PxCudaKernelParam pack is the argument types in order:
+    #   (CUdeviceptr x3, PxU32 nbBodies, float oneOverDt) {8,8,8,4,4} == kRigidComputeAccel
+    #   (CUdeviceptr x2, PxU32 nbToCopy)                  {8,8,4}     == kRigidCopyPrevVel
+    "computeRigidBodyAccelerations": "variadic launchKernelThreadsAutoPackParameters (PxgSimulationCore.cpp)",
+    "copyRigidBodyVelocitiesToPrevious": "variadic launchKernelThreadsAutoPackParameters (PxgSimulationCore.cpp)",
 }
 
 # Host packs LONGER than the row whose extra arguments sit in the blob's tail padding
@@ -198,17 +208,12 @@ KNOWN_TAIL_EXTRA = {
 KNOWN_ROW_FOLLOWS_HOST = {
     "propagateStaticSolverBodyVelocitiesTGS":
         "the host pushes solveStaticBlockTGS's 7-argument pack; signature has 5",
-    "ps_solveRigidAttachmentsLaunch":
-        "the host pack carries two trailing scalars the 8-argument signature lacks",
     "ps_updateUserBufferLaunch":
         "the host pushes a trailing PxU32 the 2-pointer signature lacks",
     "removeContactManagers_Stage1": "one 2-argument pack fired at all five stages; signature has 1",
     "removeContactManagers_Stage2": "one 2-argument pack fired at all five stages; signature has 1",
     "removeContactManagers_Stage3": "one 2-argument pack fired at all five stages; signature has 1",
     "removeContactManagers_Stage4": "one 2-argument pack fired at all five stages; signature has 1",
-    "sb_copyOrApplySoftBodyDataDEPRECATED":
-        "argument 0 is the 32-byte PxgTypedCudaBuffer OBJECT the host pushes (P9.95), not the "
-        "8-byte PxgSoftBody* of the signature",
 }
 
 # Kernels whose CUDA signature this file cannot size.  Empty: ps_solveShapes' `#if
@@ -216,19 +221,15 @@ KNOWN_ROW_FOLLOWS_HOST = {
 KNOWN_SIG_UNDECIDED = set()
 
 # Field layouts for HOST-SHAPED by-value arguments (row != signature), which the join in
-# check_push_block.py flattens.  PxgCudaBuffer: mPtr @0, mHeapMemoryAllocator* @8, mSize @16,
-# mStatGroup (an enum) @24 + 4 pad (PxgCudaBuffer.h; sizeof 32 is static_assert'ed in
-# testSoftBodySim.cpp).
-HOST_ARG_FIELDS = {
-    ("sb_copyOrApplySoftBodyDataDEPRECATED", 0): [(0, 8, "i"), (8, 8, "i"), (16, 8, "i"), (24, 4, "i")],
-}
+# check_push_block.py flattens, keyed (kernel, argument index) -> [(offset, size, kind)].
+# Empty since 5.12: its only entry was sb_copyOrApplySoftBodyDataDEPRECATED's argument 0,
+# the 32-byte PxgTypedCudaBuffer<PxgSoftBody> OBJECT the host pushed by value (P9.95), and
+# 5.12 removed that kernel.  check_push_block.py's selftest keeps the mechanism awake with
+# a synthetic entry of the same shape.
+HOST_ARG_FIELDS = {}
 # P9.99: the same fields' NAMES (and types) for check_push_block.py's name leg, parallel to
-# HOST_ARG_FIELDS entry by entry (PxgCudaBuffer.h:104-107).
-HOST_ARG_FIELD_NAMES = {
-    ("sb_copyOrApplySoftBodyDataDEPRECATED", 0): [("mPtr", "CUdeviceptr"),
-                                                  ("mHeapMemoryAllocator", "PxgHeapMemoryAllocator*"),
-                                                  ("mSize", "PxU64"), ("mStatGroup", "PxsHeapStats::Enum")],
-}
+# HOST_ARG_FIELDS entry by entry.
+HOST_ARG_FIELD_NAMES = {}
 
 # ---------------------------------------------------------------------------
 # sizes

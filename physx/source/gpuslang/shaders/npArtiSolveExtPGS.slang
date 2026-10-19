@@ -99,7 +99,7 @@ static const float SVP_PX_EPS_REAL = 1.192092896e-07f;
 static const uint SVP_DY_SC_FLAG_SPRING = 1u << 5;
 static const uint SVP_DY_SC_FLAG_ACCELERATION_SPRING = 1u << 7;
 static const float SVP_DY_MIN_RESPONSE = 1e-12f;
-static const uint SVP_COMPLIANT_ACCEL_SPRING = 1u << 3;   // contact header flag
+static const uint SVP_COMPLIANT_ACCEL_SPRING = 1u << 4;   // contact header flag (5.12 PxgSolverFlags.h; 5.6.1: 1 << 3)
 
 // ---------------------------------------------------------------------------
 // the PGS solver block mirrors (PxgConstraintBlock.h /
@@ -181,16 +181,15 @@ public struct SvpPgs1DCon
     uint pad0[32];                 // 2176
 }                                  // = 2304
 
-// mirrors PxgBlockSolverConstraint1DMod (1024 bytes)
+// mirrors PxgBlockSolverConstraint1DMod (896 bytes; 5.12 removed residual[32])
 public struct SvpPgs1DMod
 {
     float ang0Writeback[96]; // 0: PxVec3[32], tightly packed
     float appliedForce[32];  // 384
     uint flags[32];          // 512
-    float residual[32];      // 640
-    float coeff0[32];        // 768
-    float coeff1[32];        // 896
-}                            // = 1024
+    float coeff0[32];        // 640
+    float coeff1[32];        // 768
+}                            // = 896
 
 // ---------------------------------------------------------------------------
 // helpers (the proven solverPGS spellings)
@@ -631,8 +630,7 @@ public void svpSolveExt1DBlock(
         const float deltaF = clampedForce - appliedForce;
 
         rowsMod[c].appliedForce[threadIndex] = clampedForce;
-        if (residualReportingEnabled)
-            rowsMod[c].residual[threadIndex] = svpCalculateResidual(deltaF, vMul);
+        // (5.12: no per-row residual; PxgBlockSolverConstraint1DMod lost the field)
 
         li0 = clinVel0 * deltaF + li0;
         ai0 = cangVel0 * deltaF + ai0;
@@ -877,7 +875,9 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
     Ptr<PxgIslandContextGpu> islandPool =
         Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
 
-    const bool accumulateError = solverDesc[0].contactErrorAccumulator_mCounter >= 0;
+    // 5.12 removed the solver residual reporting and PxgSolverCoreDesc's
+    // contactErrorAccumulator (see the tail of this kernel).
+    const bool accumulateError = false;
 
     const uint64_t d = gSvpPart.artiDesc;
     const uint64_t gArticulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS);
@@ -1099,40 +1099,6 @@ void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
         GroupMemoryBarrierWithGroupSync();
     }
 
-    if (accumulateError && lane == 0u)
-    {
-        const float sumSq = shSvpErrSum[threadInBlock];
-        const uint count = shSvpErrCount[threadInBlock];
-        const float maxErr = shSvpErrMax[threadInBlock];
-
-        uint assumed = solverDesc[0].contactErrorAccumulator_mErrorSumOfSquares;
-        for (;;)
-        {
-            const uint newBits = asuint(asfloat(assumed) + sumSq);
-            uint old;
-            InterlockedCompareExchange(solverDesc[0].contactErrorAccumulator_mErrorSumOfSquares,
-                                       assumed, newBits, old);
-            if (old == assumed)
-                break;
-            assumed = old;
-        }
-
-        int oldCount;
-        InterlockedAdd(solverDesc[0].contactErrorAccumulator_mCounter, int(count), oldCount);
-
-        if (maxErr > asfloat(solverDesc[0].contactErrorAccumulator_mMaxError))
-        {
-            assumed = solverDesc[0].contactErrorAccumulator_mMaxError;
-            for (;;)
-            {
-                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
-                uint old;
-                InterlockedCompareExchange(solverDesc[0].contactErrorAccumulator_mMaxError,
-                                           assumed, newBits, old);
-                if (old == assumed)
-                    break;
-                assumed = old;
-            }
-        }
-    }
+    // (5.12: the lane-0 atomic accumulation into
+    // solverDesc->contactErrorAccumulator is gone with the accumulator.)
 }

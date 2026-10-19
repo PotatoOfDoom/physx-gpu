@@ -98,7 +98,7 @@ const uint32_t ATS_MAX_DOFS = 15;
 const uint32_t ATS_RECORD_SIZE = 544;       // sizeof(PxgArticulation), pinned in the desc map
 const float ATS_STEP_DT = 0.0234375f;       // exactly representable, not 1
 
-// PXG_ARTI_CORE_* offsets, pinned by testDmaArtiResidual
+// PXG_ARTI_CORE_* offsets, pinned by testArtiCoreDescLayout
 const uint32_t ATS_D_ARTICULATIONS = 32;
 const uint32_t ATS_D_NB_ARTICULATIONS = 44;
 const uint32_t ATS_D_ARTICULATION_BLOCKS = 128;

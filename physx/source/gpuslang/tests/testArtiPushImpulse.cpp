@@ -103,7 +103,7 @@ const uint32_t PI_NB_WARPS = 2;
 const uint32_t PI_MAX_LINKS = 7;
 const uint32_t PI_MAX_DOFS = 15;
 
-// PXG_ARTI_CORE_* offsets, pinned by testDmaArtiResidual
+// PXG_ARTI_CORE_* offsets, pinned by testArtiCoreDescLayout
 const uint32_t PI_D_NB_ARTICULATIONS = 44;
 const uint32_t PI_D_ARTICULATION_BLOCKS = 128;
 const uint32_t PI_D_LINK_BLOCKS = 136;

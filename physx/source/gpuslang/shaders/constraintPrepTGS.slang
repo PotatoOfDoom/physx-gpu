@@ -52,8 +52,9 @@
 // contact port's `hasPrevFrictionIndices` push flag becomes the
 // blockPreviousFrictionIndices != NULL pointer check.  The joint port reads
 // stepDt/stepInvDtF32/dt/invDtF32/lengthScale from the shared desc and
-// biasCoefficient (erp = 0.5 * biasCoefficient) from the prepare desc, exactly
-// as setupSolverConstraintBlockGPUTGS's argument list does.
+// biasCoefficients.joint (5.12: erp = biasCoefficient; 5.6.1 had
+// erp = 0.5 * biasCoefficient) from the prepare desc, exactly as
+// setupSolverConstraintBlockGPUTGS's argument list does.
 
 import pxgSlangCommon;
 import pxgSlangPrepCommon;
@@ -98,7 +99,7 @@ struct PxgTGSBlockSolverContactHeader
     uint forceWritebackOffset[32];    // 1536
     float restitutionXdt[32];         // 1664
     float cfm[32];                    // 1792
-    float p8[32];                     // 1920
+    float biasCoefficient[32];        // 1920 (5.6.1: p8)
 }                                     // = 2048
 
 // mirrors PxgTGSBlockSolverFrictionHeader (1664 bytes)
@@ -172,8 +173,7 @@ struct PxgTGSBlockSolverConstraint1DCon
     float angularErrorScale[32];              // 2816
     uint flags[32];                           // 2944
     float appliedForce[32];                   // 3072
-    float residual[32];                       // 3200
-}                                             // = 3328
+}                                             // = 3200 (5.12 removed residual[32] @3200)
 
 // ---------------------------------------------------------------------------
 // engine-ABI push constant (shared by both entries: the CUDA parameter pack is
@@ -218,7 +218,7 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
                                             float invStepDtF32, float stepDt, float totalDt,
                                             float invTotalDtF32, float bounceThresholdF32,
                                             float biasCoefficient, uint threadIndex,
-                                            uint forceWritebackBufferOffset, bool perPointFriction,
+                                            uint forceWritebackBufferOffset,
                                             uint headerIndex, uint outContactBase, uint outFrictionBase,
                                             float restDistance, float staticFrictionCof,
                                             float dynamicFrictionCof, uint flags, float solverOffsetSlop,
@@ -235,10 +235,11 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
     const float3 angVel1 = initialAngVel1_penBiasClamp.xyz;
 
     const float invStepDt = invStepDtF32;
-    const float p8 = min(0.8f, biasCoefficient);
     const float bounceThreshold = bounceThresholdF32;
 
-    const float invDtp8 = invStepDt * p8;
+    // 5.12: biasCoefficient is the prepare desc's biasCoefficients.rigidContact,
+    // used directly (5.6.1: p8 = PxMin(0.8f, biasCoefficient))
+    const float invDtWithBiasCoefficient = invStepDt * biasCoefficient;
 
     const float4 lin0X_ang0Y_lin1Z_ang1W = gContactPrepData[prepIndex].mInvMassScale[threadIndex];
 
@@ -285,7 +286,7 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
     float maxPenetration = PREP_PX_MAX_F32;
 
     gContactHeaders[headerIndex].restitutionXdt[threadIndex] = restitution * stepDt;
-    gContactHeaders[headerIndex].p8[threadIndex] = p8;
+    gContactHeaders[headerIndex].biasCoefficient[threadIndex] = biasCoefficient;
 
     for (uint j = 0; j < contactCount; j++)
     {
@@ -351,7 +352,7 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         else
         {
             velMultiplier = recipResponse;
-            scaledBias = isSeparated ? -invStepDt : -invDtp8;
+            scaledBias = isSeparated ? -invStepDt : -invDtWithBiasCoefficient;
         }
 
         gContactPoints[outContactBase + j].resp0[threadIndex] = resp0;
@@ -368,16 +369,20 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         const float bounceVel = isGreater2 ? (-vrel) * restitution : 0.0f;
         float targetVelocity = isGreater2 ? (cTargetVel + bounceVel) : tgsPlusZero(cTargetVel);
 
-        if (isKinematic0)
-            targetVelocity -= (norVel0 + angNorVel0);
-        if (isKinematic1)
-            targetVelocity += (norVel1 + angNorVel1);
-
+        // 5.12 (CHANGELOG v5.8, positive restitution against kinematic bodies): the
+        // bounce penetration correction is applied BEFORE the kinematic normal
+        // velocities are added to targetVelocity (5.6.1 applied it after).
         if (isGreater2)
         {
             const float ratio = totalDt + penetration / vrel;
             penetration += targetVelocity * ratio;
         }
+
+        // Now add on bias for any kinematic velocities...
+        if (isKinematic0)
+            targetVelocity -= (norVel0 + angNorVel0);
+        if (isKinematic1)
+            targetVelocity += (norVel1 + angNorVel1);
 
         gContactPoints[outContactBase + j].raXn_extraCoeff[threadIndex] = float4(raXnSqrtInertia, contactCoeff);
         gContactPoints[outContactBase + j].rbXn_targetVelW[threadIndex] = float4(rbXnSqrtInertia, targetVelocity);
@@ -432,7 +437,12 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
         gFrictionHeaders[headerIndex].broken[threadIndex] = 0;
         gFrictionHeaders[headerIndex].frictionNormals0[threadIndex] = float4(t0, 0.0f);
         gFrictionHeaders[headerIndex].frictionNormals1[threadIndex] = float4(t1, 0.0f);
-        gFrictionHeaders[headerIndex].biasCoefficient[threadIndex] = invStepDt;
+
+        const bool hasTargetVelocity = (flags & PXG_SC_FLAG_HAS_TARGET_VELOCITY) != 0;
+        const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0;
+
+        // 5.12: no geometric friction bias when strong friction is disabled
+        gFrictionHeaders[headerIndex].biasCoefficient[threadIndex] = !disableStrongFriction ? invStepDt : 0.0f;
 
         for (uint j = 0; j < aCount; j++)
         {
@@ -449,7 +459,7 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
 
             const float3 error = (ra + bodyFrame0p) - (rb + bodyFrame1p);
 
-            const uint index = perPointFriction
+            const uint index = hasTargetVelocity
                 ? (j == 0 ? gCurrFrictionPatches[prepIndex].contactID0[threadIndex]
                           : gCurrFrictionPatches[prepIndex].contactID1[threadIndex])
                 : 0;
@@ -676,17 +686,20 @@ void contactConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Gro
 
     const uint contactBase = batches[batchIndex].blockContactIndex;
 
+    // processFrictionPatch() (5.12 factors correlate / getFrictionPatches /
+    // growPatches out of createFinalizeSolverContactsBlockGPUTGS; same sequence;
+    // its two broken = 0 stores are one here)
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal, bodyFrame0, bodyFrame1,
                         threadIndexInWarp);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0;
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     float patchExtents = 0.0f;
 
     currFrictionPatches[descIndexBatch].broken[threadIndexInWarp] = 0;
 
-    if (!(perPointFriction || disableFriction))
+    if (!(disableStrongFriction || disableFriction))
     {
         getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
                               prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0, edgeIndex,
@@ -707,8 +720,9 @@ void contactConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Gro
                                            angVelXYZ_penBiasClamp0, linVel_invMass1, angVelXYZ_penBiasClamp1,
                                            invInertia0, invInertia1, sharedDesc[0].stepInvDtF32,
                                            sharedDesc[0].stepDt, sharedDesc[0].dt, sharedDesc[0].invDtF32,
-                                           prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficient,
-                                           threadIndexInWarp, forceWritebackOffset, perPointFriction,
+                                           prepDesc[0].bounceThresholdF32,
+                                           prepDesc[0].biasCoefficients.rigidContact,
+                                           threadIndexInWarp, forceWritebackOffset,
                                            descIndexBatch, batches[batchIndex].startConstraintIndex,
                                            batches[batchIndex].startFrictionIndex, restDistance,
                                            staticFrictionCof, dynamicFrictionCof, flags, offsetSlop,
@@ -936,7 +950,6 @@ uint intializeBlock1DTGS(Ptr<PxgBlockConstraint1DVelocities> gJointVel,
     gJointRowsCon[outRow].maxBias[threadIndex] = maxBiasVelocity;
     gJointRowsCon[outRow].angularErrorScale[threadIndex] = angularErrorScale;
     gJointRowsCon[outRow].appliedForce[threadIndex] = 0.0f;
-    gJointRowsCon[outRow].residual[threadIndex] = 0.0f;
 
     {
         const bool hasDriveLimit = (flags & PX1D_FLAG_HAS_DRIVE_LIMIT) != 0;
@@ -1074,14 +1087,16 @@ void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Group
     const PxgSolverBodyData bodyData1 = solverBodyDatas[bodyBIndex];
 
     // stepDt/stepInvDtF32/dt/invDtF32/lengthScale from the shared desc;
-    // biasCoefficient from the prepare desc (setupSolverConstraintBlockGPUTGS args)
+    // biasCoefficients.joint from the prepare desc (setupSolverConstraintBlockGPUTGS args)
     const float stepDt = sharedDesc[0].stepDt;
     const float recipStepDt = sharedDesc[0].stepInvDtF32;
     const float simDt = sharedDesc[0].dt;
     const float recipSimDt = sharedDesc[0].invDtF32;
     const float lengthScale = sharedDesc[0].lengthScale;
-    const float biasCoefficient = prepDesc[0].biasCoefficient;
-    const float erp = 0.5f * biasCoefficient;
+    const float biasCoefficient = prepDesc[0].biasCoefficients.joint;
+    // 5.12 (CHANGELOG v5.8, CPU/GPU-consistent joint bias): erp = biasCoefficient
+    // (5.6.1: 0.5f * biasCoefficient)
+    const float erp = biasCoefficient;
 
     // ---- setupSolverConstraintBlockGPUTGS ----
 

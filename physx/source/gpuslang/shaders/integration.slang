@@ -75,8 +75,11 @@ void updateWakeCounter(inout bool freeze, inout float4 solverBodyLinVel, inout f
 
     float wc = freezeThresholdX_wakeCounterY_sleepThresholdZ_bodySimIndex.y;
 
-    uint flags = bodySim.internalFlags &
-        (PXG_BODY_DISABLE_GRAVITY_GPU | PXG_BODY_FROZEN | PXG_BODY_ENABLE_GYROSCOPIC | PXG_BODY_RETAIN_ACCELERATION);
+    // 5.12 keep-mask: eFROZEN | eGPU_FLAGS | eFREE_FLAGS (bits 0, 6..15).  5.6.1
+    // kept eDISABLE_GRAVITY_GPU (bit 5, removed in 5.12) | eFROZEN |
+    // eENABLE_GYROSCOPIC | eRETAIN_ACCELERATION, so the copy flags (9, 10) and the
+    // free bits (11..15) now survive and bit 5 no longer does.
+    uint flags = bodySim.internalFlags & (PXG_BODY_FROZEN | PXG_BODY_GPU_FLAGS | PXG_BODY_FREE_FLAGS);
     float freezeCount = sleepLinVelAccXYZ_freezeCountW.w;
     float accelScale = sleepAngVelAccXYZ_accelScaleW.w;
 
@@ -152,7 +155,7 @@ void updateWakeCounter(inout bool freeze, inout float4 solverBodyLinVel, inout f
         else
         {
             const bool wasFrozen = (flags & PXG_BODY_FROZEN) != 0;
-            flags &= (PXG_BODY_DISABLE_GRAVITY_GPU | PXG_BODY_ENABLE_GYROSCOPIC | PXG_BODY_RETAIN_ACCELERATION);
+            flags &= PXG_BODY_GPU_FLAGS | PXG_BODY_FREE_FLAGS;
             if (wasFrozen)
                 flags |= PXG_BODY_UNFREEZE_THIS_FRAME;
         }
@@ -265,7 +268,7 @@ void updateWakeCounter(inout bool freeze, inout float4 solverBodyLinVel, inout f
     bodySim.sleepLinVelAccXYZ_freezeCountW = float4(sleepLinVelAcc, freezeCount);
     bodySim.sleepAngVelAccXYZ_accelScaleW = float4(sleepAngVelAcc, accelScale);
 
-    if ((flags & PXG_BODY_RETAIN_ACCELERATION) == 0)
+    if ((flags & PXG_BODY_RETAIN_ACCELERATION_GPU) == 0)
     {
         bodySim.externalLinearAcceleration = float4(0.0f);
         bodySim.externalAngularAcceleration = float4(0.0f);

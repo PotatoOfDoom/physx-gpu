@@ -27,8 +27,10 @@
 // RUNTIME_PLAN.md P4 test: the memory-manager coupling seam.  It runs the REAL
 // gpucommon buddy allocator (PxgHeapMemoryAllocator / PxgHeapMemoryAllocatorManager)
 // — the exact engine type the gpu subsystems demand — over the Vulkan bridge,
-// via a ~30-line PxgVulkanMemoryManager whose device callback wraps the
-// PxCudaContext's memAlloc/memFree.  It allocates several device buffers through
+// via gpucommon's own PxgMemoryManager (createPxgMemoryManager), whose device
+// callback calls the PxCudaContext's memAlloc/memFree -- i.e. the Vulkan
+// context's.  (Until 5.6.1 this was a ~30-line bridge-side PxgVulkanMemoryManager;
+// 5.12's heap manager takes a PxgMemoryManager&, which made it obsolete.)  It allocates several device buffers through
 // the buddy allocator, proves each interior (buddy-split) address round-trips a
 // host<->device memcpy (the shim's interval map resolving it), and frees them.
 // This is the first real engine-code-over-Vulkan integration in P4.
@@ -47,7 +49,7 @@
 
 #include "PxgCudaShim.h"
 #include "PxgVulkanCudaContext.h"
-#include "PxgVulkanMemoryManager.h"
+#include "PxgMemoryManager.h"                // gpucommon: createPxgMemoryManager
 #include "PxgHeapMemAllocator.h"               // gpucommon: the REAL buddy allocator
 #include "cudamanager/PxCudaContext.h"
 #include "cudamanager/PxCudaContextManager.h"
@@ -65,7 +67,7 @@ using physx::PxCudaContextManager;
 using physx::PxgHeapMemoryAllocatorManager;
 using physx::gpuslang::PxgCudaShim;
 using physx::gpuslang::PxgKernelDef;
-using physx::gpuslang::PxgVulkanMemoryManager;
+using physx::PxgMemoryManager;
 
 struct HeapAllocator : physx::PxAllocatorCallback
 {
@@ -106,14 +108,16 @@ PXG_TEST(p4Heap)
 
         if (ctx)
         {
-            // The Vulkan memory manager (device->shim, host->malloc) feeding the
-            // REAL gpucommon buddy allocator manager, exactly as the engine wires
-            // createGpuMemoryManager -> createGpuHeapMemoryAllocatorManager.
-            PxgVulkanMemoryManager memMgr(ctx);
+            // gpucommon's memory manager (device -> ctx->memAlloc, i.e. the shim)
+            // feeding the REAL gpucommon buddy allocator manager, exactly as the
+            // engine wires createGpuMemoryManager -> createGpuHeapMemoryAllocatorManager.
+            physx::PxsMemoryManager* memMgr = physx::createPxgMemoryManager(ccm);
+            PXG_CHECK_MSG(memMgr != nullptr, "createPxgMemoryManager");
+            if (memMgr)
             {
                 const physx::PxU32 heapCapacity = 2u * 1024u * 1024u;  // buddy block size
-                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, &memMgr);
-                PXG_CHECK_MSG(heapMgr.mDeviceMemoryAllocators != nullptr, "device buddy allocator built");
+                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, *static_cast<PxgMemoryManager*>(memMgr));
+                PXG_CHECK_MSG(heapMgr.mDeviceMemoryAllocator != nullptr, "device buddy allocator built");
 
                 // Allocate several device buffers through the buddy allocator and
                 // round-trip data through each interior (split) device address.
@@ -124,7 +128,7 @@ PXG_TEST(p4Heap)
                 size_t bad = 0, nulls = 0;
                 for (int b = 0; b < NBUF; ++b)
                 {
-                    dptr[b] = heapMgr.mDeviceMemoryAllocators->allocate(bytes, physx::PxsHeapStats::eOTHER, PX_FL);
+                    dptr[b] = heapMgr.mDeviceMemoryAllocator->allocate(bytes, physx::PxsHeapStats::eOTHER, PX_FL);
                     if (!dptr[b]) { ++nulls; continue; }
 
                     std::vector<uint32_t> in(N), out(N, 0);
@@ -153,10 +157,11 @@ PXG_TEST(p4Heap)
 
                 for (int b = 0; b < NBUF; ++b)
                     if (dptr[b])
-                        heapMgr.mDeviceMemoryAllocators->deallocate(dptr[b]);
+                        heapMgr.mDeviceMemoryAllocator->deallocate(dptr[b]);
 
-                std::printf("  real gpucommon buddy allocator runs over the Vulkan memory manager (P4 seam)\n");
+                std::printf("  real gpucommon buddy allocator runs over the Vulkan context (P4 seam)\n");
             }  // heapMgr destroyed here (frees its blocks via ctx->memFree), ctx still alive
+            PX_DELETE(memMgr);
         }
 
         if (ccm)

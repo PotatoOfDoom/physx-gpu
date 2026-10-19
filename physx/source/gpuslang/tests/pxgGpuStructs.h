@@ -181,10 +181,16 @@ enum BodyInternalFlags : uint32_t
     eUNFREEZE_THIS_FRAME = 1u << 2,
     eACTIVATE_THIS_FRAME = 1u << 3,
     eDEACTIVATE_THIS_FRAME = 1u << 4,
-    eDISABLE_GRAVITY_GPU = 1u << 5,
+    // 5.12: eDISABLE_GRAVITY_GPU (1 << 5) is gone; the *_GPU names below are
+    // PxsRigidBody::eSPECULATIVE_CCD_GPU / eENABLE_GYROSCOPIC_GPU / eRETAIN_ACCELERATION_GPU
     eSPECULATIVE_CCD = 1u << 6,
     eENABLE_GYROSCOPIC = 1u << 7,
-    eRETAIN_ACCELERATION = 1u << 8
+    eRETAIN_ACCELERATION = 1u << 8,
+    eFIRST_BODY_COPY_GPU = 1u << 9,
+    eVELOCITY_COPY_GPU = 1u << 10,
+    eGPU_FLAGS = eSPECULATIVE_CCD | eENABLE_GYROSCOPIC | eRETAIN_ACCELERATION | eFIRST_BODY_COPY_GPU |
+                 eVELOCITY_COPY_GPU,
+    eFREE_FLAGS = 0x1Fu << 11   // eFREE_FLAG_1..5
 };
 
 enum LockFlags : uint32_t

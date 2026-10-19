@@ -105,7 +105,7 @@ const uint32_t OV_MAX_LINKS = 7;
 const uint32_t OV_MAX_DOFS = 15;
 const uint32_t OV_OFFSET = OV_NB_ARTI * OV_MAX_LINKS;   // 280 float4s per region
 
-// PXG_ARTI_CORE_* offsets, pinned by testDmaArtiResidual
+// PXG_ARTI_CORE_* offsets, pinned by testArtiCoreDescLayout
 const uint32_t OV_D_NB_ARTICULATIONS = 44;
 const uint32_t OV_D_ARTICULATION_BLOCKS = 128;
 const uint32_t OV_D_LINK_BLOCKS = 136;

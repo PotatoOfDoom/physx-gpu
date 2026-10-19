@@ -486,7 +486,7 @@ static void refFinalizePGS(const FzIn& s, FzOut& o)
         float coeff0, coeff1;
         if (restitution < 0.f)
         {
-            const bool accelSpring = (flags & 8u) != 0;
+            const bool accelSpring = (flags & 16u) != 0;  // eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4)
             const float massIfAccelElseOne = accelSpring ? recipResponse : 1.f;
             const float oneIfAccelElseR = accelSpring ? 1.f : unitResponse;
             const float nrdt = dt * restitution;
@@ -668,8 +668,9 @@ PXG_TEST(npArtiExtBody_finalizePGS)
         const uint32_t contactCount = (i % 13 == 7) ? 0u : (1u + rng() % 6u);
         const uint32_t aCount = rng() % 3u;
         const bool ppf = (rng() % 2) != 0;
+        // PxgSolverContactFlags bits 0..4 (5.12 numbering; bit 4 = eCOMPLIANT_ACCELERATION_SPRING)
         uint32_t solverFlags = (rng() % 2 ? 1u : 0u) | (rng() % 2 ? 2u : 0u) |
-                               (rng() % 2 ? 4u : 0u) | (rng() % 2 ? 8u : 0u);
+                               (rng() % 2 ? 4u : 0u) | (rng() % 2 ? 8u : 0u) | (rng() % 2 ? 16u : 0u);
         s.cfgU = U4{ solverFlags, contactCount, aCount, ppf ? 1u : 0u };
         if (contactCount == 0) ++cEarly;
         if (aCount > 0 && contactCount) ++cFric; else if (contactCount) ++cNoFric;
@@ -917,7 +918,7 @@ static void refFinalizeTGS(const TzIn& s, TzOut& o)
         if (restitution < 0.f)
         {
             const bool collidingWithVrel = ((-vrel) * totalDt) > penetration;
-            const bool accelSpring = (flags & 8u) != 0;
+            const bool accelSpring = (flags & 16u) != 0;  // eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4)
             const float massIfAccelElseOne = accelSpring ? recipResponse : 1.f;
             const float oneIfAccelElseR = accelSpring ? 1.f : unitResponse;
             const float dampingIfEnabled = (isSeparated && !collidingWithVrel) ? 0.f : damping;
@@ -1147,8 +1148,9 @@ PXG_TEST(npArtiExtBody_finalizeTGS)
         const uint32_t contactCount = (i % 13 == 7) ? 0u : (1u + rng() % 6u);
         const uint32_t aCount = rng() % 3u;
         const bool ppf = (rng() % 2) != 0;
+        // PxgSolverContactFlags bits 0..4 (5.12 numbering; bit 4 = eCOMPLIANT_ACCELERATION_SPRING)
         uint32_t solverFlags = (rng() % 2 ? 1u : 0u) | (rng() % 2 ? 2u : 0u) |
-                               (rng() % 2 ? 4u : 0u) | (rng() % 2 ? 8u : 0u);
+                               (rng() % 2 ? 4u : 0u) | (rng() % 2 ? 8u : 0u) | (rng() % 2 ? 16u : 0u);
         s.cfgU = U4{ solverFlags, contactCount, aCount, ppf ? 1u : 0u };
         if (contactCount == 0) ++cEarly;
         if (aCount > 0 && contactCount) ++cFric;

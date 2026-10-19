@@ -158,7 +158,7 @@ void refJointPGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
     refPreprocessRows(sorted, jd, jdIndex, rvs, rps, rowBase, angS0, angS1, il0.w, il1.w, ims, i0, i1, lane,
                       disablePreprocessing);
 
-    const float erp = 1.0f;
+    const float erp = PGS_JOINT_BIAS; // 5.12: biasCoefficients.joint (5.6.1: 1.0f)
     for (uint32_t r = 0; r < numRows; r++)
     {
         const uint32_t index = rowBase + sorted[r];
@@ -210,7 +210,6 @@ void refJointPGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
         mods[outRow].coeff0[lane] = coeff0;
         mods[outRow].coeff1[lane] = coeff1;
         mods[outRow].appliedForce[lane] = 0.f;
-        mods[outRow].residual[lane] = 0.f;
         uint32_t modFlags = 0;
         if (rpFlags & PX1D_SPRING) modFlags |= DY_SC_SPRING;
         if (rpFlags & PX1D_ACCELERATION_SPRING) modFlags |= DY_SC_ACCELERATION_SPRING;
@@ -269,7 +268,7 @@ void refJointTGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
 
     const bool isKin0 = (b0.flags & RB_KINEMATIC) != 0;
     const bool isKin1 = (b1.flags & RB_KINEMATIC) != 0;
-    const float erp = 0.5f * biasCoefficient;
+    const float erp = biasCoefficient; // 5.12: biasCoefficients.joint (5.6.1: 0.5f * biasCoefficient)
 
     uint32_t eqCount = 0;
     for (uint32_t r = 0; r < numRows; r++)
@@ -348,7 +347,6 @@ void refJointTGS(const std::vector<BlockConstraint1DData>& jd, uint32_t jdIndex,
         cons[outRow].maxBias[lane] = maxBiasVelocity;
         cons[outRow].angularErrorScale[lane] = angularErrorScale;
         cons[outRow].appliedForce[lane] = 0.f;
-        cons[outRow].residual[lane] = 0.f;
 
         const bool hasDriveLimit = (flags & PX1D_HAS_DRIVE_LIMIT) != 0;
         const bool driveLimitsAreForces = (jd[jdIndex].mFlags[lane] & CFLAG_DRIVE_LIMITS_ARE_FORCES) != 0;

@@ -48,7 +48,7 @@ struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 
 static const float PX_EPS_REAL = 1.192092896e-07f;
-static const uint32_t CONTACT_FLAG_ACCEL_SPRING = 1u << 3;
+static const uint32_t CONTACT_FLAG_ACCEL_SPRING = 1u << 4; // 5.12 PxgSolverContactFlags (5.6.1: 1 << 3)
 
 struct CRow
 {

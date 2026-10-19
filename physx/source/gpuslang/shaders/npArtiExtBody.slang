@@ -371,7 +371,7 @@ float compliantCoeffsQ(float dt, uint flags, float restitution, float damping, f
                        float recipResponse, float penetration, float targetVelocity,
                        bool isSeparated, bool collidingWithVrel, out float velMultiplier)
 {
-    const bool accelSpring = (flags & 8u) != 0u;  // eCOMPLIANT_ACCELERATION_SPRING
+    const bool accelSpring = (flags & 16u) != 0u;  // eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4; 5.6.1: 1 << 3)
     const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
     const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
 
@@ -930,7 +930,7 @@ void aebFinalizeTGS(uint3 dtid : SV_DispatchThreadID)
         {
             const bool collidingWithVrel = ((-vrel) * totalDt) > penetration;
             // computeCompliantContactCoefficientsTGS
-            const bool accelSpring = (flags & 8u) != 0u;
+            const bool accelSpring = (flags & 16u) != 0u;  // eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4)
             const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
             const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
             const float dampingIfEnabled = compliantDampingQ(isSeparated, collidingWithVrel, damping);

@@ -113,7 +113,7 @@ static_assert(offsetof(PxgArticulation, contactResidualAccumulator) == 524, "con
 static_assert(sizeof(PxgBodySim) == IL_BODYSIM_SIZE, "bodySim stride pin");
 
 // offsets into the 360-byte PxgArticulationCoreDesc, each pinned by
-// static_assert in testDmaArtiResidual.cpp against the engine header
+// static_assert in testArtiCoreDescLayout.cpp against the engine header
 const uint32_t D_BODY_SIM = 0, D_ISLAND_NODES = 16, D_ARTICULATIONS = 32;
 const uint32_t D_ARTI_OFFSET = 40, D_NB_ARTICULATIONS = 44, D_DT = 48;
 const uint32_t D_IMPULSES = 72, D_NB_SLABS = 80, D_SLAB_HAS_CHANGES = 88;

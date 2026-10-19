@@ -43,7 +43,8 @@
 #include "PxNodeIndex.h"
 #include "PxgSolverCoreDesc.h"      // PxgPrePrepDesc, PxgSolverSharedDesc, IterativeSolveData
 #include "PxgSolverConstraintDesc.h"
-#include "PxgConstraintPrep.h"      // PxgConstraintData, PxgConstraintPrePrep, PxgD6JointData
+#include "PxgConstraintPrep.h"      // PxgConstraintData, PxgConstraintPrePrep
+#include "PxgD6JointData.h"         // PxgD6JointData (5.12: no longer reached through PxgConstraintPrep.h)
 #include "PxgSolverBody.h"          // PxgSolverBodyData
 #include "PxConstraintDesc.h"       // Px1DConstraint
 
@@ -109,6 +110,12 @@ static bool eqTol(float a, float b)
 static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed
 static bool eqF4FZ(const F4& a, const F4& b)
 { return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
+
+// PxgD6Drive bits, 5.12 (5.6.1: eSWING 3, eTWIST 4, eSLERP 5, eSWING1 6, eSWING2 7)
+const uint32_t DR_TWIST = 3, DR_SWING1 = 4, DR_SWING2 = 5, DR_SLERP = 6;
+// drive data entries (constraintBlockPrePrep.cu gDrive*DataIndex)
+const uint32_t DRIVE_DATA_TWIST = 3, DRIVE_DATA_SWING1 = 4, DRIVE_DATA_SWING2 = 5,
+               DRIVE_DATA_SLERP = DRIVE_DATA_SWING2;
 
 // ---- exact CPU transcription (namespace d6ref) ----
 namespace d6ref
@@ -369,11 +376,11 @@ inline void chAddLimit(C1D& c, const F4& lp)
     {
         c.hint = H_INEQUALITY;
         c.m0 = lp.x; c.m1 = lp.y;
+        c.minI = 0.0f;   // 5.12: hard limits only (5.6.1 also cleared it for soft limits)
         if (c.geo > 0.0f) flags |= E_KEEPBIAS;
         if (lp.x > 0.0f) flags |= E_RESTITUTION;
     }
     c.flags = flags;
-    c.minI = 0.0f;
 }
 
 inline void chAddDrive(C1D& c, float velTarget, const F4& drv)
@@ -491,65 +498,54 @@ void solverPrep(const D6In& s, D6Out& o)
         }
     }
 
-    // angular drives
-    if (driving & ((1u << 5) | (1u << 3) | (1u << 4) | (1u << 6) | (1u << 7)))
+    // angular drives (5.12 PxgD6Drive: eTWIST 3, eSWING1 4, eSWING2 5, eSLERP 6; the
+    // legacy eSWING drive is gone; drive data entries twist 3, swing1 4, swing2 5,
+    // slerp = the swing2 entry)
+    if (driving & ((1u << DR_SLERP) | (1u << DR_TWIST) | (1u << DR_SWING1) | (1u << DR_SWING2)))
     {
         const Q4 drvq{ s.drvPq.x, s.drvPq.y, s.drvPq.z, s.drvPq.w };
         const Q4 d2cA_q = dot4(cB2cAq, drvq) > 0.0f ? drvq : qneg(drvq);
-        const V3 v{ s.angVel.x, s.angVel.y, s.angVel.z };
-        const Q4 delta = qmul(qconj(d2cA_q), cB2cAq);
 
-        if (driving & (1u << 5))  // SLERP
+        if (driving & (1u << DR_SLERP))
         {
+            const Q4 delta = qmul(qconj(d2cA_q), cB2cAq);
+            const V3 v{ s.angVel.x, s.angVel.y, s.angVel.z };
             const V3 velTarget = neg(qrot(cA2wq, v));
             V3 axis[3] = { V3{ 1, 0, 0 }, V3{ 0, 1, 0 }, V3{ 0, 0, 1 } };
-            if (s.drives[5].x != 0.0f)
+            if (s.drives[DRIVE_DATA_SLERP].x != 0.0f)
                 jacobianAxes(qmul(cA2wq, d2cA_q), cB2wq, axis);
             const float de[3] = { delta.x, delta.y, delta.z };
             for (uint32_t i = 0; i < 3; ++i)
             {
                 C1D c = chAngular(axis[i], -de[i], H_SLERP_SPRING, 0);
-                chAddDrive(c, dot3(axis[i], velTarget), s.drives[5]);
+                chAddDrive(c, dot3(axis[i], velTarget), s.drives[DRIVE_DATA_SLERP]);
                 buf.r[buf.n++] = c;
             }
         }
         else
         {
-            if (driving & (1u << 4))  // TWIST
+            const V3 v{ s.angVel.x, s.angVel.y, s.angVel.z };
+            // 5.12: twist / swing error from delta = cB2cA * conj(drivePose)
+            const Q4 delta = qmul(cB2cAq, qconj(d2cA_q));
+            if (driving & (1u << DR_TWIST))
             {
                 C1D c = chAngular(am[0], -2.0f * delta.x, H_NONE, 0);
-                chAddDrive(c, v.x, s.drives[4]);
+                chAddDrive(c, v.x, s.drives[DRIVE_DATA_TWIST]);
                 buf.r[buf.n++] = c;
             }
-            if (driving & (1u << 3))  // SWING
+            if (driving & ((1u << DR_SWING1) | (1u << DR_SWING2)))
             {
                 const V3 err = basis0(delta);
-                if (!(locked & SWING1_FLAG))
+                if (driving & (1u << DR_SWING1))
                 {
                     C1D c = chAngular(aY, err.z, H_NONE, 0);
-                    chAddDrive(c, v.y, s.drives[3]);
+                    chAddDrive(c, v.y, s.drives[DRIVE_DATA_SWING1]);
                     buf.r[buf.n++] = c;
                 }
-                if (!(locked & SWING2_FLAG))
+                if (driving & (1u << DR_SWING2))
                 {
                     C1D c = chAngular(aZ, -err.y, H_NONE, 0);
-                    chAddDrive(c, v.z, s.drives[3]);
-                    buf.r[buf.n++] = c;
-                }
-            }
-            else if (driving & ((1u << 6) | (1u << 7)))  // SWING1 / SWING2
-            {
-                const V3 err = basis0(delta);
-                if (driving & (1u << 6))
-                {
-                    C1D c = chAngular(aY, err.z, H_NONE, 0);
-                    chAddDrive(c, v.y, s.drives[3]);  // gDriveSwing1DataIndex = eSWING entry
-                    buf.r[buf.n++] = c;
-                }
-                if (driving & (1u << 7))
-                {
-                    C1D c = chAngular(aZ, -err.y, H_NONE, 0);
-                    chAddDrive(c, v.z, s.drives[5]);  // gDriveSwing2DataIndex = eSLERP entry
+                    chAddDrive(c, v.z, s.drives[DRIVE_DATA_SWING2]);
                     buf.r[buf.n++] = c;
                 }
             }
@@ -822,16 +818,16 @@ static bool genFixture(std::mt19937& rng, uint32_t i, D6In& s)
         const uint32_t angDrvKind = rng() % 5;
         if (angDrvKind == 1)
         {
-            driving |= (1u << 5);                                        // SLERP
+            driving |= (1u << DR_SLERP);
             // review-174 gap: SLERP together with SWING/TWIST bits pins the
-            // if/else precedence (SLERP wins, cu L579-591)
-            if (rng() % 2) driving |= (1u << 4) | (1u << 3);
+            // if/else precedence (SLERP wins)
+            if (rng() % 2) driving |= (1u << DR_TWIST) | (1u << DR_SWING1);
         }
-        else if (angDrvKind == 2) driving |= (1u << 4) | (rng() % 2 ? (1u << 3) : 0u);
-        else if (angDrvKind == 3) driving |= (1u << 3);                  // SWING
+        else if (angDrvKind == 2) driving |= (1u << DR_TWIST) | (rng() % 2 ? (1u << DR_SWING1) : 0u);
+        else if (angDrvKind == 3) driving |= (1u << DR_SWING1) | (1u << DR_SWING2);   // 5.6.1: legacy eSWING
         else if (angDrvKind == 4)
-            driving |= (rng() % 2 ? (1u << 6) : 0u) | (rng() % 2 ? (1u << 7) : 0u) |
-                       (rng() % 3 == 0 ? (1u << 4) : 0u);                // SWING1/SWING2 (+TWIST)
+            driving |= (rng() % 2 ? (1u << DR_SWING1) : 0u) | (rng() % 2 ? (1u << DR_SWING2) : 0u) |
+                       (rng() % 3 == 0 ? (1u << DR_TWIST) : 0u);         // SWING1/SWING2 (+TWIST)
 
         if (i % 43 == 21)
         {
@@ -858,7 +854,7 @@ static bool genFixture(std::mt19937& rng, uint32_t i, D6In& s)
 
         for (int d = 0; d < 6; ++d)
         {
-            const bool zeroStiff = (d == 5) && (rng() % 2 == 0);  // slerp identity-axes branch
+            const bool zeroStiff = (d == int(DRIVE_DATA_SLERP)) && (rng() % 2 == 0);  // slerp identity-axes branch
             s.drives[d] = F4{ zeroStiff ? 0.f : rf(0.f, 300.f), rf(0.f, 30.f), rf(1.f, 1e6f),
                               asF(rng() % 4u) };
         }

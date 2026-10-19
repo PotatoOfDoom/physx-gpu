@@ -33,8 +33,10 @@
 //     very last fields (mTempConstraintBlockHeader @752) and WRITES
 //     numStaticBatches (@12); the pre-prep kernel atomically bumps the four
 //     shared counters (@256..272).  No truncation is possible.
-//   - PxgConstraintPrepareDescGpu:  FULL 304-byte mirror.  The TGS contact
-//     prep reads the last field (biasCoefficient @296); rigidSum2 writes
+//   - PxgConstraintPrepareDescGpu:  FULL 320-byte mirror.  The prep kernels
+//     read the last field (5.12: Dy::BiasCoefficientCollection
+//     biasCoefficients @296, 20 bytes; 5.6.1 had one PxReal biasCoefficient
+//     there and the struct was 304 bytes); rigidSum2 writes
 //     numStatic*Batches (@216/@220) and numStaticBatches (@256).
 //   - PxgSolverSharedDescIterGpu:   PxgSolverSharedDesc<IterativeSolveData>,
 //     TRUNCATED after the PxgSolverSharedDescBase (96 bytes).
@@ -64,6 +66,8 @@
 // strides).
 
 module pxgSlangPrepDesc;
+
+import pxgSlangSolverDesc; // BiasCoefficientCollectionGpu
 
 // GPU_BUCKET_ID::eCount (gpunarrowphase/include/PxgNarrowphaseCore.h)
 public static const uint PXG_GPU_BUCKET_COUNT = 38;
@@ -216,9 +220,11 @@ public struct PxgConstraintPrepareDescGpu
     public uint articContactIndex;                   // @284
     public uint articJointIndex;                     // @288
     public uint nbElementsPerBody;                   // @292
-    public float biasCoefficient;                    // @296
-    public uint tailPad;                             // @300 (sizeof rounds to 304 on host: 8-align)
-}                                                    // = 304
+    public BiasCoefficientCollectionGpu biasCoefficients; // @296 (rigidContact @296, joint @300,
+                                                     //  articulation @304, particle @308,
+                                                     //  deformableRigidAttachment @312)
+    public uint tailPad;                             // @316 (sizeof rounds to 320 on host: 8-align)
+}                                                    // = 320
 
 // mirrors PxgSolverSharedDesc<IterativeSolveData> — TRUNCATED at the end of
 // PxgSolverSharedDescBase (96 bytes): the converted kernels dereference the

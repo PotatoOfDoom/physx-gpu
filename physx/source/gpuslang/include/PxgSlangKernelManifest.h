@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 487;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 401;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 405;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -331,10 +331,10 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "setRigidDynamicAngularVelocity", "directApiBda.spv", "setRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_SET_ANGVEL (P9.93 BDA re-point)
     { "setRigidDynamicForce", "directApiBda.spv", "setRigidDynamicForce" },  // RIGID_DYNAMIC_SET_FORCE (P9.93 BDA re-point)
     { "setRigidDynamicTorque", "directApiBda.spv", "setRigidDynamicTorque" },  // RIGID_DYNAMIC_SET_TORQUE (P9.93 BDA re-point)
-    { "getRigidDynamicForce", nullptr, nullptr },  // RIGID_DYNAMIC_GET_FORCE (unmapped, new in 5.12)
-    { "getRigidDynamicTorque", nullptr, nullptr },  // RIGID_DYNAMIC_GET_TORQUE (unmapped, new in 5.12)
-    { "computeRigidBodyAccelerations", nullptr, nullptr },  // RIGID_DYNAMIC_COMPUTE_ACCELERATIONS (unmapped, new in 5.12)
-    { "copyRigidBodyVelocitiesToPrevious", nullptr, nullptr },  // RIGID_DYNAMIC_COPY_PREVIOUS_VELOCITIES (unmapped, new in 5.12)
+    { "getRigidDynamicForce", "directApiBda.spv", "getRigidDynamicForce" },  // RIGID_DYNAMIC_GET_FORCE (5.12, engine ABI)
+    { "getRigidDynamicTorque", "directApiBda.spv", "getRigidDynamicTorque" },  // RIGID_DYNAMIC_GET_TORQUE (5.12, engine ABI)
+    { "computeRigidBodyAccelerations", "directApiBda.spv", "computeRigidBodyAccelerations" },  // RIGID_DYNAMIC_COMPUTE_ACCELERATIONS (5.12, engine ABI)
+    { "copyRigidBodyVelocitiesToPrevious", "directApiBda.spv", "copyRigidBodyVelocitiesToPrevious" },  // RIGID_DYNAMIC_COPY_PREVIOUS_VELOCITIES (5.12, engine ABI)
     { "getArtiDofStates", "npArtiGetSet.spv", "getArtiDofStates" },  // ARTI_GET_DOF_STATES (unmapped)
     { "getArtiTransformStates", "npArtiGetSet.spv", "getArtiTransformStates" },  // ARTI_GET_TRANSFORM_STATES (unmapped)
     { "getArtiVelocityStates", "npArtiGetSet.spv", "getArtiVelocityStates" },  // ARTI_GET_VELOCITY_STATES (unmapped)

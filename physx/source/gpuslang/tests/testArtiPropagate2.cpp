@@ -102,7 +102,7 @@ const uint32_t P2_REF_OFFSET = P2_BODY_START + P2_BODY_COUNT;
 const uint32_t P2_TOTAL_BODIES = P2_REF_OFFSET + P2_NB;
 const uint32_t P2_NUM32 = (P2_NB_SLABS + 31) / 32;     // 1
 
-// desc offsets, each pinned by static_assert in testDmaArtiResidual.cpp
+// desc offsets, each pinned by static_assert in testArtiCoreDescLayout.cpp
 const uint32_t D_NB_ARTICULATIONS = 44, D_NB_SLABS = 80, D_IMPULSES = 72;
 const uint32_t D_SLAB_HAS_CHANGES = 88, D_SLAB_DIRTY_MASKS = 96;
 const uint32_t D_PATHS_PER_PARTITION = 104, D_IMPULSE_HOLDING_LINK = 112;

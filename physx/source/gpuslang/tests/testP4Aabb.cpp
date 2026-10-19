@@ -47,7 +47,7 @@
 #include "foundation/PxPhysicsVersion.h"
 #include "foundation/PxAllocator.h"
 #include "foundation/PxArray.h"
-#include "foundation/PxPinnedArray.h"
+#include "CmPinnableArray.h"                  // Cm::PinnableArray (5.12: replaces PxPinnedArray)
 
 #include "PxBroadPhase.h"                      // PxGpuBroadPhaseDesc
 #include "PxSceneDesc.h"                       // PxGpuDynamicsMemoryConfig
@@ -55,7 +55,7 @@
 
 #include "PxgCudaShim.h"
 #include "PxgVulkanCudaContext.h"
-#include "PxgVulkanMemoryManager.h"
+#include "PxgMemoryManager.h"                // gpucommon: createPxgMemoryManager
 #include "PxgHeapMemAllocator.h"
 #include "PxgSlangKernelManifest.h"
 #include "PxgKernelWrangler.h"
@@ -80,11 +80,9 @@ using physx::PxgAABBManager;
 using physx::PxgBoundsArray;
 using physx::PxGpuBroadPhaseDesc;
 using physx::PxGpuDynamicsMemoryConfig;
-using physx::PxVirtualAllocator;
-using physx::PxFloatArrayPinnedSafe;
 using physx::gpuslang::PxgCudaShim;
 using physx::gpuslang::PxgKernelDef;
-using physx::gpuslang::PxgVulkanMemoryManager;
+using physx::PxgMemoryManager;
 using physx::gpuslang::gPxgSlangKernelManifest;
 using physx::gpuslang::PXG_SLANG_KERNEL_COUNT;
 
@@ -128,10 +126,13 @@ PXG_TEST(p4Aabb)
 
         if (ctx)
         {
-            PxgVulkanMemoryManager memMgr(ctx);
+            physx::PxsMemoryManager* memMgr = physx::createPxgMemoryManager(ccm);
+            PXG_CHECK_MSG(memMgr != nullptr, "createPxgMemoryManager");
+            if (memMgr)
             {
                 const physx::PxU32 heapCapacity = 2u * 1024u * 1024u;
-                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, &memMgr);
+                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, *static_cast<PxgMemoryManager*>(memMgr));
+                physx::PxgAllocatorDesc allocDesc = physx::PxgCreateAllocatorDesc(heapMgr);
                 PxgCudaKernelWranglerManager wranglerMgr(*ccm, err);
 
                 PxGpuBroadPhaseDesc bpDesc;
@@ -142,25 +143,24 @@ PXG_TEST(p4Aabb)
                 // The concrete broadphase (P4.4) the AABB manager wraps.
                 void* bpMem = PX_ALLOC(sizeof(PxgCudaBroadPhaseSap), "PxgCudaBroadPhaseSap");
                 PxgCudaBroadPhaseSap* bp = PX_PLACEMENT_NEW(bpMem, PxgCudaBroadPhaseSap)(
-                    bpDesc, &wranglerMgr, ccm, memCfg, &heapMgr, 0);
+                    bpDesc, &wranglerMgr, ccm, memCfg, allocDesc, 0);
                 PXG_CHECK_MSG(bp != nullptr, "broadphase constructed");
                 PXG_CHECK_MSG(bp->getAABBManager() == nullptr, "broadphase starts with no AABB manager");
 
-                // The virtual allocator + pinned contact-distance array + bounds
-                // array the AABB manager takes, all over the heap manager's mapped
-                // (host) allocators — exactly as the engine wires them.
-                PxVirtualAllocator vAlloc(heapMgr.mMappedMemoryAllocators, physx::PxsHeapStats::eBROADPHASE);
-                PxFloatArrayPinnedSafe contactDistance(
-                    physx::PxPinnedAllocator<physx::PxReal>(heapMgr.mMappedMemoryAllocators, physx::PxsHeapStats::eBROADPHASE));
+                // The pinned contact-distance array + bounds array the AABB manager
+                // takes, over the heap manager's pinned host allocators -- exactly as
+                // the 5.12 engine wires them (ScScene.cpp:834/843: mapped bounds for
+                // the direct-API pipeline, contact distance on the pinned allocator).
+                physx::Cm::PinnableArray<physx::PxReal> contactDistance(*heapMgr.mPinnedHostMemoryAllocator);
 
                 void* baMem = PX_ALLOC(sizeof(PxgBoundsArray), "PxgBoundsArray");
-                PxgBoundsArray* boundsArray = PX_PLACEMENT_NEW(baMem, PxgBoundsArray)(vAlloc);
+                PxgBoundsArray* boundsArray = PX_PLACEMENT_NEW(baMem, PxgBoundsArray)(*heapMgr.mPinnedHostMappedMemoryAllocator);
 
                 // Construct the REAL concrete AABB manager exactly as the factory does.
                 void* amMem = PX_ALLOC(sizeof(PxgAABBManager), "PxgAABBManager");
                 PxgAABBManager* aabb = PX_PLACEMENT_NEW(amMem, PxgAABBManager)(
-                    &wranglerMgr, ccm, &heapMgr, memCfg, *bp, *boundsArray, contactDistance,
-                    /*maxNbAggregates*/ 8u, /*maxNbShapes*/ 64u, vAlloc, /*contextID*/ 0,
+                    &wranglerMgr, ccm, allocDesc, memCfg, *bp, *boundsArray, contactDistance,
+                    /*maxNbAggregates*/ 8u, /*maxNbShapes*/ 64u, /*contextID*/ 0,
                     physx::PxPairFilteringMode::eKEEP, physx::PxPairFilteringMode::eKEEP);
                 PXG_CHECK_MSG(aabb != nullptr, "real PxgAABBManager constructed over Vulkan");
 
@@ -178,6 +178,7 @@ PXG_TEST(p4Aabb)
                 bp->~PxgCudaBroadPhaseSap();
                 PX_FREE(bpMem);
             }
+            PX_DELETE(memMgr);
         }
 
         if (ccm)

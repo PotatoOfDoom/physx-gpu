@@ -99,7 +99,7 @@ const uint32_t SL_NB_CPTS = 28, SL_NB_FPTS = 40, SL_NB_ROWS = 34, SL_NB_RESP = 6
 const float SL_ELAPSED = 0.017f;
 
 // offsets into the 360-byte PxgArticulationCoreDesc, each pinned by
-// static_assert in testDmaArtiResidual.cpp against the engine header
+// static_assert in testArtiCoreDescLayout.cpp against the engine header
 const uint32_t D_NB_ARTICULATIONS = 44, D_NB_SLABS = 80, D_IMPULSES = 72;
 const uint32_t D_SLAB_HAS_CHANGES = 88, D_ARTI_BLOCKS = 128, D_LINK_BLOCKS = 136;
 const uint32_t D_DOF_BLOCKS = 184, D_PATH_TO_ROOT = 176;

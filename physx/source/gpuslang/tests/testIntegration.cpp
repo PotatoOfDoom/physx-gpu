@@ -94,8 +94,9 @@ void refUpdateWakeCounter(bool& freeze, Float4& solverBodyLinVel, Float4& solver
 
     float wc = freezeThreshold_wc_sleepThreshold.y;
 
-    uint32_t flags = bodySim.internalFlags &
-        (eDISABLE_GRAVITY_GPU | eFROZEN | eENABLE_GYROSCOPIC | eRETAIN_ACCELERATION);
+    // 5.12: keeps eFROZEN | eGPU_FLAGS | eFREE_FLAGS (5.6.1: eDISABLE_GRAVITY_GPU |
+    // eFROZEN | eENABLE_GYROSCOPIC | eRETAIN_ACCELERATION)
+    uint32_t flags = bodySim.internalFlags & (eFROZEN | eGPU_FLAGS | eFREE_FLAGS);
     float freezeCount = sleepLinVelAcc_freezeCount.w;
     float accelScale = sleepAngVelAcc_accelScale.w;
 
@@ -169,7 +170,7 @@ void refUpdateWakeCounter(bool& freeze, Float4& solverBodyLinVel, Float4& solver
         else
         {
             const bool wasFrozen = (flags & eFROZEN) != 0;
-            flags &= (eDISABLE_GRAVITY_GPU | eENABLE_GYROSCOPIC | eRETAIN_ACCELERATION);
+            flags &= (eGPU_FLAGS | eFREE_FLAGS);
             if (wasFrozen)
                 flags |= eUNFREEZE_THIS_FRAME;
         }
@@ -573,8 +574,14 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
             flags |= eFROZEN;
         if (unit(rng) < 0.2f)
             flags |= eRETAIN_ACCELERATION;
+        // 5.12: GPU and free-slot bits survive integration; bit 5 (5.6.1's
+        // eDISABLE_GRAVITY_GPU) and the *_THIS_FRAME bits do not
         if (unit(rng) < 0.2f)
-            flags |= eDISABLE_GRAVITY_GPU;
+            flags |= (1u << 5);
+        if (unit(rng) < 0.2f)
+            flags |= eSPECULATIVE_CCD | (1u << 13);
+        if (unit(rng) < 0.2f)
+            flags |= eACTIVATE_THIS_FRAME | eVELOCITY_COPY_GPU;
         b.internalFlags = flags;
         b.lockFlags = uint16_t(rng() & 0x3Fu & (unit(rng) < 0.25f ? 0x3Fu : 0u));
         b.externalLinearAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };

@@ -84,7 +84,7 @@ static const uint SVX_DY_SC_FLAG_SPRING = 1u << 5;
 static const uint SVX_DY_SC_FLAG_INEQUALITY = 1u << 6;
 static const uint SVX_DY_SC_FLAG_ACCELERATION_SPRING = 1u << 7;
 static const float SVX_DY_ARTICULATION_MIN_RESPONSE = 1e-12f;
-static const uint SVX_COMPLIANT_ACCEL_SPRING = 1u << 3;  // contact header flag
+static const uint SVX_COMPLIANT_ACCEL_SPRING = 1u << 4;  // contact header flag (5.12 PxgSolverFlags.h; 5.6.1: 1 << 3)
 
 public struct SvxError
 {
@@ -250,7 +250,7 @@ public void svxSolveExtContactBlockTGS(
         const float4 normal_staticFriction = contactHeaders[batchIndex].normal_staticFriction[threadIndex];
 
         const float restitutionXdt = contactHeaders[batchIndex].restitutionXdt[threadIndex];
-        const float p8 = contactHeaders[batchIndex].p8[threadIndex];
+        const float p8 = contactHeaders[batchIndex].biasCoefficient[threadIndex]; // 5.12 renamed the header field
         const float cfm = contactHeaders[batchIndex].cfm[threadIndex];
         const uint flags = contactHeaders[batchIndex].flags[threadIndex];
 
@@ -712,11 +712,7 @@ public void svxSolveExt1DBlockTGS(
         const float deltaF = clampedForce - appliedForce;
 
         rowsCon[r].appliedForce[threadIndex] = clampedForce;
-        if (residualReportingEnabled)
-        {
-            const float res = vMul == 0.0f ? 0.0f : deltaF / vMul;
-            rowsCon[r].residual[threadIndex] = res;
-        }
+        // (5.12: no per-row residual; PxgTGSBlockSolverConstraint1DCon lost the field)
 
         li0 = clinVel0 * deltaF + li0;
         ai0 = cangVel0 * deltaF + ai0;

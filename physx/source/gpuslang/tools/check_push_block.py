@@ -1339,12 +1339,35 @@ def selftest(shader_dir):
         g = [n for n in names_of("preIntegrationLaunch") if n and n.startswith("gravity")]
         if g != ["gravity.x", "gravity.y", "gravity.z"]:
             fails.append("SELFTEST NS12: a by-value PxVec3 is named per component; got %s" % g)
-        h = names_of("sb_copyOrApplySoftBodyDataDEPRECATED")[:4]
-        if h != ["mPtr", "mHeapMemoryAllocator", "mSize", "mStatGroup"]:
-            fails.append("SELFTEST NS12: the host-shaped PxgCudaBuffer argument is named from "
-                         "HOST_ARG_FIELD_NAMES; got %s" % h)
     except (KeyError, TypeError) as e:
         fails.append("SELFTEST BROKEN: NS12 -- %s" % e)
+    # NS12h: a HOST-SHAPED by-value argument (the row follows the host pack, not the
+    # signature) is named from HOST_ARG_FIELD_NAMES.  Until 5.6.1 this used the real
+    # sb_copyOrApplySoftBodyDataDEPRECATED, whose argument 0 was the 32-byte
+    # PxgTypedCudaBuffer object; 5.12 removed that kernel and left HOST_ARG_FIELDS empty,
+    # so a synthetic kernel of the same shape keeps the mechanism under test.
+    hkey = ("SelftestHostShaped", 0)
+    hsigs = {"SelftestHostShaped": [("selftest:H", 1, [(8, "PxgSoftBody*", None), (4, "PxU32", None)])]}
+    hrow = [32, 4]
+    lap._SIG_NAMES[("selftest:H", 1)] = ["softbodies", "n"]
+    lap.HOST_ARG_FIELDS[hkey] = [(0, 8, "i"), (8, 8, "i"), (16, 8, "i"), (24, 4, "i")]
+    lap.HOST_ARG_FIELD_NAMES[hkey] = [("mPtr", "CUdeviceptr"),
+                                      ("mHeapMemoryAllocator", "PxgHeapMemoryAllocator*"),
+                                      ("mSize", "PxU64"), ("mStatGroup", "PxsHeapStats::Enum")]
+    try:
+        h = [n for per in lap.arg_field_names(hkey[0], hrow, hsigs) for (n, _t) in per]
+        if h != ["mPtr", "mHeapMemoryAllocator", "mSize", "mStatGroup", "n"]:
+            fails.append("SELFTEST NS12h: the host-shaped PxgCudaBuffer argument is named from "
+                         "HOST_ARG_FIELD_NAMES; got %s" % h)
+        lap.HOST_ARG_FIELD_NAMES[hkey] = lap.HOST_ARG_FIELD_NAMES[hkey][:3]
+        if arg_field_names(hkey[0], hrow, hsigs) is not None:
+            fails.append("SELFTEST NS12h: names that do not cover every field are UNDECIDED, never zipped short")
+    except (KeyError, TypeError) as e:
+        fails.append("SELFTEST BROKEN: NS12h -- %s" % e)
+    finally:
+        del lap.HOST_ARG_FIELDS[hkey]
+        del lap.HOST_ARG_FIELD_NAMES[hkey]
+        _drop_selftest_sig_names()
     fake = {"SelftestK": [("selftest:K", 1, [(8, "PxU32*", None), (4, "PxU32", None)])],
             "SelftestK2": [("selftest:A", 1, [(8, "PxU32*", None)]), ("selftest:B", 2, [(8, "PxU32*", None)])],
             "SelftestK3": [("selftest:C", 1, [(8, "PxU32*", None), (4, "PxU32", None)])]}
@@ -1387,14 +1410,6 @@ def selftest(shader_dir):
                     fails.append("SELFTEST NS14: %r must parse" % text)
         finally:
             os.unlink(tmp)
-    key = ("sb_copyOrApplySoftBodyDataDEPRECATED", 0)
-    saved = lap.HOST_ARG_FIELD_NAMES[key]
-    lap.HOST_ARG_FIELD_NAMES[key] = saved[:3]
-    try:
-        if arg_field_names(key[0], rows_now[key[0]], sigs) is not None:
-            fails.append("SELFTEST NS12: names that do not cover every field are UNDECIDED, never zipped short")
-    finally:
-        lap.HOST_ARG_FIELD_NAMES[key] = saved
     # NS13: one layout, two spellings -> the layout stands, the names are undecided
     hdr = lap._header_texts()
     extra = ["struct SelftestDup { PxU32 a; PxU32 b; };", "struct SelftestDup { PxU32 x; PxU32 y; };",

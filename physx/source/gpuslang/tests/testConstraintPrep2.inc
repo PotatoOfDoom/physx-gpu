@@ -201,7 +201,7 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
                  uint32_t contactCount, BlockFrictionPatch& fp, BlockFrictionAnchorPatch& fa, const AFrame& bf0,
                  const AFrame& bf1, const SolverBodyData& d0, const SolverBodyData& d1, const Mat33& si0,
                  const Mat33& si1, float invDtF32, float dtF32, float bounceThresholdF32, uint32_t lane,
-                 uint32_t forceWritebackOffset, bool perPointFriction, BlockSolverContactHeader& ch,
+                 uint32_t forceWritebackOffset, bool hasTargetVelocity, BlockSolverContactHeader& ch,
                  BlockSolverFrictionHeader& fh, std::vector<BlockSolverContactPoint>& cpoints, uint32_t outCBase,
                  std::vector<BlockSolverContactFriction>& fricts, uint32_t outFBase, float restDistance,
                  float staticFrictionCof, float dynamicFrictionCof, uint32_t flags, float ccdMaxSeparationThreshold,
@@ -220,8 +220,9 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
     const Vec3 angVel0(initAng0.x, initAng0.y, initAng0.z);
     const Vec3 angVel1(initAng1.x, initAng1.y, initAng1.z);
 
-    const float invDt = invDtF32, p8 = 0.8f, bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invDt * p8;
+    // 5.12: the prepare desc's biasCoefficients.rigidContact (5.6.1: p8 = 0.8f)
+    const float invDt = invDtF32, bounceThreshold = bounceThresholdF32;
+    const float invDtp8 = invDt * PGS_RIGID_CONTACT_BIAS;
 
     const Float4 ims = cd.mInvMassScale[lane];
     const float invMass0D0 = initLin0.w * ims.x;
@@ -349,7 +350,7 @@ void refSetupPGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
             const Vec3 ra = aRotate(bf0.q, Vec3(b0a.x, b0a.y, b0a.z));
             const Vec3 rb = aRotate(bf1.q, Vec3(b1a.x, b1a.y, b1a.z));
             const Vec3 error = (ra + bf0p) - (rb + bf1p);
-            const uint32_t idx = perPointFriction ? (j == 0 ? fp.contactID0[lane] : fp.contactID1[lane]) : 0;
+            const uint32_t idx = hasTargetVelocity ? (j == 0 ? fp.contactID0[lane] : fp.contactID1[lane]) : 0;
             const Float4 tv4 = contacts[contactBase + idx].targetVel_maxImpulseW[lane];
             const Vec3 tvel(tv4.x, tv4.y, tv4.z);
 
@@ -395,7 +396,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
                  const AFrame& bf1, const SolverBodyData& d0, const SolverBodyData& d1, const Mat33& si0,
                  const Mat33& si1, float invStepDtF32, float stepDt, float totalDt, float invTotalDtF32,
                  float bounceThresholdF32, float biasCoefficient, uint32_t lane, uint32_t forceWritebackOffset,
-                 bool perPointFriction, TGSContactHeader& ch, TGSFrictionHeader& fh,
+                 bool hasTargetVelocity, TGSContactHeader& ch, TGSFrictionHeader& fh,
                  std::vector<TGSContactPoint>& cpoints, uint32_t outCBase, std::vector<TGSFriction>& fricts,
                  uint32_t outFBase, float restDistance, float staticFrictionCof, float dynamicFrictionCof,
                  uint32_t flags, float solverOffsetSlop, const Float2& torsionalFrictionData)
@@ -411,9 +412,9 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
     const Vec3 angVel1(initAng1.x, initAng1.y, initAng1.z);
 
     const float invStepDt = invStepDtF32;
-    const float p8 = cpSelMin(0.8f, biasCoefficient); // PxMin (contactConstraintBlockPrep.cuh:814)
+    // 5.12: the bias coefficient is used directly (5.6.1: p8 = PxMin(0.8f, biasCoefficient))
     const float bounceThreshold = bounceThresholdF32;
-    const float invDtp8 = invStepDt * p8;
+    const float invDtp8 = invStepDt * biasCoefficient;
 
     const Float4 ims = cd.mInvMassScale[lane];
     const float invMass0D0 = initLin0.w * ims.x;
@@ -450,7 +451,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
     const float invMassNorLenSq1 = invMass1D1 * normalLenSq;
     float maxPenetration = PX_MAX_F32;
     ch.restitutionXdt[lane] = restitution * stepDt;
-    ch.p8[lane] = p8;
+    ch.biasCoefficient[lane] = biasCoefficient;
 
     for (uint32_t j = 0; j < contactCount; j++)
     {
@@ -502,15 +503,16 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         const bool isGreater2 = ((restitution > 0.f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
         // the CUDA's IEEE add (cuh:951): cTargetVel = -0 plus the selected +0 gives +0
         float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
-        if (isKin0)
-            targetVelocity -= (norVel0 + angNorVel0);
-        if (isKin1)
-            targetVelocity += (norVel1 + angNorVel1);
+        // 5.12: the bounce penetration correction comes BEFORE the kinematic terms
         if (isGreater2)
         {
             const float ratio = totalDt + penetration / vrel;
             penetration += targetVelocity * ratio;
         }
+        if (isKin0)
+            targetVelocity -= (norVel0 + angNorVel0);
+        if (isKin1)
+            targetVelocity += (norVel1 + angNorVel1);
         cpoints[outCBase + j].raXn_extraCoeff[lane] = Float4{ raI.x, raI.y, raI.z, contactCoeff };
         cpoints[outCBase + j].rbXn_targetVelW[lane] = Float4{ rbI.x, rbI.y, rbI.z, targetVelocity };
         cpoints[outCBase + j].separation[lane] = penetration;
@@ -543,7 +545,8 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
         fh.broken[lane] = 0;
         fh.frictionNormals0[lane] = Float4{ t0.x, t0.y, t0.z, 0.f };
         fh.frictionNormals1[lane] = Float4{ t1.x, t1.y, t1.z, 0.f };
-        fh.biasCoefficient[lane] = invStepDt;
+        // 5.12: no geometric friction bias when strong friction is disabled
+        fh.biasCoefficient[lane] = (flags & SC_DISABLE_STRONG_FRICTION) ? 0.0f : invStepDt;
 
         for (uint32_t j = 0; j < aCount; j++)
         {
@@ -552,7 +555,7 @@ void refSetupTGS(BlockContactData& cd, const std::vector<BlockContactPoint>& con
             const Vec3 ra = aRotate(bf0.q, Vec3(b0a.x, b0a.y, b0a.z));
             const Vec3 rb = aRotate(bf1.q, Vec3(b1a.x, b1a.y, b1a.z));
             const Vec3 error = (ra + bf0p) - (rb + bf1p);
-            const uint32_t idx = perPointFriction ? (j == 0 ? fp.contactID0[lane] : fp.contactID1[lane]) : 0;
+            const uint32_t idx = hasTargetVelocity ? (j == 0 ? fp.contactID0[lane] : fp.contactID1[lane]) : 0;
             const Float4 tv4 = contacts[contactBase + idx].targetVel_maxImpulseW[lane];
             const Vec3 tvel(tv4.x, tv4.y, tv4.z);
             const Vec3 vel1 = linVel0 + angVel0.cross(ra);

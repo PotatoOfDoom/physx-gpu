@@ -107,7 +107,10 @@ public void aspSolveBlockPartitionTGS(
     Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(sharedDescA);
     Ptr<PxgIslandContextGpu> islandPool = Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
 
-    accumulateError = solverDesc[0].contactErrorAccumulator_mCounter >= 0;
+    // 5.12 removed the solver residual reporting and PxgSolverCoreDesc's
+    // contactErrorAccumulator: nothing accumulates any more (the error outputs
+    // stay until the articulation area strips them; solveBlockUnified ignores them).
+    accumulateError = false;
 
     const uint64_t d = artiDescA;
     const uint64_t gArticulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS);

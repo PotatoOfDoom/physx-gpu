@@ -52,6 +52,7 @@
 #include "PxgConvexConvexShape.h"
 #include "PxgArticulation.h"
 
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -144,10 +145,15 @@ PXG_TEST(simCoreDescLayout)
     std::memset(&nb, 0xEE, sizeof(nb));
     nb.mNewBodySim = reinterpret_cast<const PxgBodySim*>(sent(p++));
     nb.mBodySimBufferDeviceData = reinterpret_cast<PxgBodySim*>(sent(p++));
+    nb.mPrevVelocitiesBuffer = reinterpret_cast<PxgBodySimVelocities*>(sent(p++));
     nb.mNbNewBodies = sent32(u++);
+    // 5.12 inserted mPrevVelocitiesBuffer before mNbNewBodies (24 -> 32 bytes)
+    static_assert(sizeof(PxgNewBodiesDesc) == 32, "5.12 PxgNewBodiesDesc size");
+    static_assert(offsetof(PxgNewBodiesDesc, mNbNewBodies) == 24, "mNbNewBodies @24");
 
     expect.push_back(uint64_t(nb.mNewBodySim));
     expect.push_back(uint64_t(nb.mBodySimBufferDeviceData));
+    expect.push_back(uint64_t(nb.mPrevVelocitiesBuffer));
     expect.push_back(nb.mNbNewBodies);
 
     // ---- C) REAL element arrays (element [1] is probed -> stride proof) ----

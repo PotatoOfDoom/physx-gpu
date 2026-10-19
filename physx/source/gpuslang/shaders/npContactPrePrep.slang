@@ -34,8 +34,10 @@
 // the modifiable stride is 2, so pairs never straddle a chunk; also
 // matches the commented-out reference form at L410-422) and the
 // mWriteback = forceIndex + contactStartIndex store (L1044):
-//   - perPointFriction = internalFlags & eHAS_TARGET_VELOCITY(16) ||
-//     wuFlags & eDISABLE_STRONG_FRICTION(1<<2);
+//   - hasTargetVelocity = internalFlags & eHAS_TARGET_VELOCITY(16);
+//     disableStrongFriction = hasTargetVelocity ||
+//     wuFlags & eDISABLE_STRONG_FRICTION(1<<2) (5.12 writes them as two
+//     solver flags; 5.6.1 wrote the latter as ePER_POINT_FRICTION);
 //   - the eFORCE_NO_RESPONSE(4) gate; inside it: the modifiable stride
 //     (eCOMPRESSED_MODIFIED_CONTACT(128) -> contact pointer advanced by
 //     startContactIndex a SECOND time, stride 2), numContacts/
@@ -44,9 +46,10 @@
 //     dynamic/staticFriction, disableFriction = materialFlags &
 //     eDISABLE_FRICTION(1) and isAccelerationSpring = materialFlags &
 //     eCOMPLIANT_ACCELERATION_SPRING(16);
-//   - solver flags: ePER_POINT_FRICTION(2), eHAS_FORCE_THRESHOLDS(1) from
-//     wuFlags & eFORCE_THRESHOLD(1<<9), eDISABLE_FRICTION(4),
-//     eCOMPLIANT_ACCELERATION_SPRING(8) (PxgSolverFlags.h L34-54);
+//   - solver flags (5.12 PxgSolverFlags.h): eHAS_TARGET_VELOCITY(2),
+//     eDISABLE_STRONG_FRICTION(4), eHAS_FORCE_THRESHOLDS(1) from
+//     wuFlags & eFORCE_THRESHOLD(1<<9), eDISABLE_FRICTION(8),
+//     eCOMPLIANT_ACCELERATION_SPRING(16);
 //   - the PxgMaterialContactData image (PxgConstraintPrep.h L85-94):
 //     (restDistance, staticFriction, dynamicFriction,
 //      mNumContacts | mSolverFlags<<8 | prevFrictionPatchCount<<16);
@@ -120,7 +123,7 @@ struct CpOut
     float4 nrOut;        // normal_restitutionW
     float4 dampDataOut;  // x = damping, y = asfloat(writeback), zw = 0
     float4 dataOut;      // PxgMaterialContactData image
-    uint4 counts;        // numContacts, contactStartIndex, stride, perPointFriction
+    uint4 counts;        // numContacts, contactStartIndex, stride, disableStrongFriction
     float4 pointsOut[12];  // per contact: (point_separationW, targetVel_maxImpulseW)
 }
 
@@ -158,12 +161,13 @@ void cppPack(uint3 dtid : SV_DispatchThreadID)
     float dynamicFriction = 0.0f, staticFriction = 0.0f;
     uint solverFlags = 0u;
     float damping = 0.0f;
-    bool perPointFriction = false;
+    bool disableStrongFriction = false;
 
     if (hasPatch != 0u)
     {
-        perPointFriction = (internalFlags & 16u) != 0u ||    // eHAS_TARGET_VELOCITY
-                           (wuFlags & (1u << 2u)) != 0u;     // eDISABLE_STRONG_FRICTION
+        const bool hasTargetVelocity = (internalFlags & 16u) != 0u;  // PxContactPatch::eHAS_TARGET_VELOCITY
+        disableStrongFriction = hasTargetVelocity ||
+                                (wuFlags & (1u << 2u)) != 0u;        // PxgNpWorkUnitFlag::eDISABLE_STRONG_FRICTION
         bool disableFriction = false;
         bool isAccelerationSpring = false;
 
@@ -203,14 +207,16 @@ void cppPack(uint3 dtid : SV_DispatchThreadID)
             isAccelerationSpring = (materialFlags & 16u) != 0u;  // eCOMPLIANT_ACCELERATION_SPRING
         }
 
-        if (perPointFriction)
-            solverFlags |= 2u;                               // ePER_POINT_FRICTION
+        if (hasTargetVelocity)
+            solverFlags |= 2u;                               // eHAS_TARGET_VELOCITY
+        if (disableStrongFriction)
+            solverFlags |= 4u;                               // eDISABLE_STRONG_FRICTION
         if ((wuFlags & (1u << 9u)) != 0u)                    // eFORCE_THRESHOLD
             solverFlags |= 1u;                               // eHAS_FORCE_THRESHOLDS
         if (disableFriction)
-            solverFlags |= 4u;                               // eDISABLE_FRICTION
+            solverFlags |= 8u;                               // eDISABLE_FRICTION
         if (isAccelerationSpring)
-            solverFlags |= 8u;                               // eCOMPLIANT_ACCELERATION_SPRING
+            solverFlags |= 16u;                              // eCOMPLIANT_ACCELERATION_SPRING
     }
 
     // PxgMaterialContactData image: restDistance, staticFriction,
@@ -221,7 +227,7 @@ void cppPack(uint3 dtid : SV_DispatchThreadID)
     // n.mWriteback = forceIndex + contactStartIndex (uint wrap allowed:
     // forceIndex defaults to 0xFFFFFFFF when no force buffer exists)
     o.dampDataOut = float4(damping, asfloat(s.cnt.w + contactStartIndex), 0.0f, 0.0f);
-    o.counts = uint4(numContacts, contactStartIndex, stride, perPointFriction ? 1u : 0u);
+    o.counts = uint4(numContacts, contactStartIndex, stride, disableStrongFriction ? 1u : 0u);
 
     // contact emission (flat-equivalent form of the shared-mem chunk loop)
     for (uint j = 0u; j < 12u; ++j)
@@ -617,8 +623,9 @@ void constraintContactBlockPrePrepLaunch(uint3 groupId : SV_GroupID,
             const uint materialFlags = patch.cnt0 >> 24;
             const uint wuFlags = laneFlags;
 
-            const bool perPointFriction = (internalFlags & 16u) != 0u ||   // eHAS_TARGET_VELOCITY
-                                          (wuFlags & (1u << 2u)) != 0u;    // eDISABLE_STRONG_FRICTION
+            const bool hasTargetVelocity = (internalFlags & 16u) != 0u;     // PxContactPatch::eHAS_TARGET_VELOCITY
+            const bool disableStrongFriction = hasTargetVelocity ||
+                                               (wuFlags & (1u << 2u)) != 0u; // PxgNpWorkUnitFlag::eDISABLE_STRONG_FRICTION
             bool disableFriction = false;
             bool isAccelerationSpring = false;
 
@@ -659,14 +666,16 @@ void constraintContactBlockPrePrepLaunch(uint3 groupId : SV_GroupID,
                 isAccelerationSpring = (materialFlags & 16u) != 0u;        // eCOMPLIANT_ACCELERATION_SPRING
             }
 
-            if (perPointFriction)
-                solverFlags |= 2u;                                         // ePER_POINT_FRICTION
+            if (hasTargetVelocity)
+                solverFlags |= 2u;                                         // eHAS_TARGET_VELOCITY
+            if (disableStrongFriction)
+                solverFlags |= 4u;                                         // eDISABLE_STRONG_FRICTION
             if ((wuFlags & (1u << 9u)) != 0u)                              // eFORCE_THRESHOLD
                 solverFlags |= 1u;                                         // eHAS_FORCE_THRESHOLDS
             if (disableFriction)
-                solverFlags |= 4u;                                         // eDISABLE_FRICTION
+                solverFlags |= 8u;                                         // eDISABLE_FRICTION
             if (isAccelerationSpring)
-                solverFlags |= 8u;                                         // eCOMPLIANT_ACCELERATION_SPRING
+                solverFlags |= 16u;                                        // eCOMPLIANT_ACCELERATION_SPRING
         }
 
         // PxgMaterialContactData image: restDistance, staticFriction,

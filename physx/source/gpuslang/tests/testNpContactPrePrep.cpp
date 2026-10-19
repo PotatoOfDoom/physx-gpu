@@ -99,11 +99,13 @@ static void refPack(const CpIn& s, CpOut& o)
     uint32_t numContacts = 0, stride = 1, contactStartIndex = 0, ptOffset = 0;
     float dynamicFriction = 0.f, staticFriction = 0.f, damping = 0.f;
     uint32_t solverFlags = 0;
-    bool perPointFriction = false;
+    bool disableStrongFriction = false;
 
     if (s.meta.x)
     {
-        perPointFriction = (s.meta.z & 16u) != 0 || (s.meta.y & (1u << 2)) != 0;
+        // 5.12: hasTargetVelocity and disableStrongFriction are separate solver flags
+        const bool hasTargetVelocity = (s.meta.z & 16u) != 0;
+        disableStrongFriction = hasTargetVelocity || (s.meta.y & (1u << 2)) != 0;
         bool disableFriction = false;
         bool isAccelerationSpring = false;
 
@@ -131,16 +133,18 @@ static void refPack(const CpIn& s, CpOut& o)
             isAccelerationSpring = (s.meta.w & 16u) != 0;
         }
 
-        if (perPointFriction) solverFlags |= 2u;
-        if (s.meta.y & (1u << 9)) solverFlags |= 1u;
-        if (disableFriction) solverFlags |= 4u;
-        if (isAccelerationSpring) solverFlags |= 8u;
+        // PxgSolverContactFlags, 5.12 numbering
+        if (hasTargetVelocity) solverFlags |= 2u;        // eHAS_TARGET_VELOCITY
+        if (disableStrongFriction) solverFlags |= 4u;    // eDISABLE_STRONG_FRICTION
+        if (s.meta.y & (1u << 9)) solverFlags |= 1u;     // eHAS_FORCE_THRESHOLDS
+        if (disableFriction) solverFlags |= 8u;          // eDISABLE_FRICTION
+        if (isAccelerationSpring) solverFlags |= 16u;    // eCOMPLIANT_ACCELERATION_SPRING
     }
 
     const uint32_t packed = (numContacts & 0xFFu) | (solverFlags << 8) | ((s.cnt.z & 0xFFu) << 16);
     o.dataOut = F4{ s.mat.w, staticFriction, dynamicFriction, asFl(packed) };
     o.dampDataOut = F4{ damping, asFl(s.cnt.w + contactStartIndex), 0.f, 0.f };
-    o.counts = U4{ numContacts, contactStartIndex, stride, perPointFriction ? 1u : 0u };
+    o.counts = U4{ numContacts, contactStartIndex, stride, disableStrongFriction ? 1u : 0u };
 
     uint32_t emit = 0;
     for (uint32_t a = 0; a < numContacts * stride; a += stride)
@@ -807,9 +811,8 @@ PXG_TEST(npContactPrePrep_engineKernel)
                     const PxContactPatch& cp =
                         patches[size_t((li.patchAddr - dPatches) / sizeof(PxContactPatch))];
                     const uint32_t internalFlags = cp.internalFlags;
-                    const bool perPointFriction =
-                        (internalFlags & PxContactPatch::eHAS_TARGET_VELOCITY) != 0 ||
-                        (laneFlags & (1u << 2)) != 0;
+                    const bool hasTargetVelocity = (internalFlags & PxContactPatch::eHAS_TARGET_VELOCITY) != 0;
+                    const bool disableStrongFriction = hasTargetVelocity || (laneFlags & (1u << 2)) != 0;
                     bool disableFriction = false, isAccelerationSpring = false;
                     if ((internalFlags & PxContactPatch::eFORCE_NO_RESPONSE) == 0)
                     {
@@ -839,10 +842,11 @@ PXG_TEST(npContactPrePrep_engineKernel)
                         disableFriction = (cp.materialFlags & 1) != 0;
                         isAccelerationSpring = (cp.materialFlags & 16) != 0;
                     }
-                    if (perPointFriction) solverFlags |= 2;
+                    if (hasTargetVelocity) solverFlags |= 2;
+                    if (disableStrongFriction) solverFlags |= 4;
                     if (laneFlags & (1u << 9)) solverFlags |= 1;
-                    if (disableFriction) solverFlags |= 4;
-                    if (isAccelerationSpring) solverFlags |= 8;
+                    if (disableFriction) solverFlags |= 8;
+                    if (isAccelerationSpring) solverFlags |= 16;
                 }
                 const uint32_t packed = (numContacts & 0xFF) | (solverFlags << 8) |
                                         ((li.prevFric & 0xFF) << 16);

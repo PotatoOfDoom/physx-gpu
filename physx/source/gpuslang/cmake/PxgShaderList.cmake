@@ -55,15 +55,14 @@ pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch setRigid
                    mergeChangedAABBMgrHandlesLaunch mergeTransformCacheAndBoundArrayChanges)
 # P9.79: the DIRECT-GPU API on the engine launch ABI.  directApi.slang keeps the
 # Phase-1 bound-buffer ports and testDirectApi; these are what the engine gets.
-# P9.80: the PBD particle-VOLUME bounds -- the other half of the PxParticleRigidBuffer
-# that PXG_SCENE=particlerigid is the first scene to create.
-pxg_compile_shader(psVolumeBoundBda ps_update_volume_bound)
-pxg_compile_shader(psShapeMatchBda ps_solveShapes)
+# (P9.80's particle-volume bounds and shape matching, psVolumeBoundBda /
+# psShapeMatchBda, went with PxParticleRigidBuffer in PhysX 5.12.)
 pxg_compile_shader(directApiBda getRigidDynamicGlobalPose getRigidDynamicLinearVelocity
                    getRigidDynamicAngularVelocity getD6JointForces getD6JointTorques
                    radixSortCopy2 radixSortCopyBits2 updateBodiesLaunchDirectAPI
                    getRigidDynamicLinearAcceleration getRigidDynamicAngularAcceleration setRigidDynamicGlobalPose
-                   setRigidDynamicLinearVelocity setRigidDynamicAngularVelocity setRigidDynamicForce setRigidDynamicTorque)
+                   setRigidDynamicLinearVelocity setRigidDynamicAngularVelocity setRigidDynamicForce setRigidDynamicTorque
+                   computeRigidBodyAccelerations copyRigidBodyVelocitiesToPrevious getRigidDynamicForce getRigidDynamicTorque)
 # P9.42: the frozen/unfrozen shape compaction (updateTransformAndBoundArray.cu:245-428)
 pxg_compile_shader(frozenHistogram computeFrozenAndUnfrozenHistogramLaunch outputFrozenAndUnfrozenHistogram
                    createFrozenAndUnfrozenArray)
@@ -115,7 +114,7 @@ pxg_compile_shader(aggregateBda updateDirtyAggregate clearDirtyAggregates markAg
 pxg_compile_shader(solverZeroBodies ZeroBodies ZeroBodiesTGS)
 pxg_compile_shader(solverInitVelocitiesTGS initializeSolverVelocitiesTGS)
 pxg_compile_shader(solverApplyGravityTGS applyTGSSubstepGravity)
-pxg_compile_shader(solverDmaBack dmaBackChangedElems dmaConstraintResidual)
+pxg_compile_shader(solverDmaBack dmaBackChangedElems)
 pxg_compile_shader(npPairManagement initializeKeepDropBuffer markKeepDropBuff processKeepDropBuff
                    accumulateKeepDrop initializeManifolds)
 pxg_compile_shader(npPairRemoveSwap removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
@@ -359,7 +358,7 @@ pxg_compile_shader(gridCal ctGridCal)
 # kernels on the engine ABI (BDA).  Vulkan-only (BDA reads the PxgParticleSystem
 # descriptor array through Ptr<>, which does not lower to HLSL cs_6_0), so
 # deliberately absent from PXG_HLSL_ENTRIES (same precedent as solveBlockUnified).
-pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch ps_preDiffuseIntegrateLaunch applyParticleBufferDataDEPRECATED)
+pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch ps_preDiffuseIntegrateLaunch)
 # P6.1: particle contact-sort bring-up — the three contact-sort orchestration
 # kernels on the engine ABI (BDA), re-pointed off the Phase-1 harness
 # (radixSortGather / clampValues).  The radix double-copies grid-stride via
@@ -630,11 +629,12 @@ pxg_compile_shader(cvxTriFinishBda convexTrimeshFinishContacts)
 # PXG_NOCONTRACT_SHADERS.
 pxg_compile_shader(newArticulationsBda newArticulationsLaunch)
 pxg_compile_shader(updateArticulationsBda updateArticulationsLaunch)
-# P8.66: dmaArticulationResidual (forwardDynamic2.cu:3766) -- one thread per
-# articulation, and the kernel that forces the PxgArticulationCoreDesc address
-# map the rest of the articulation block needs.  Ptr<> throughout (no HLSL
-# lowering); integer/copy only (no float contraction to pin).
-pxg_compile_shader(dmaArtiResidualBda dmaArticulationResidual artiCoreDescProbe)
+# P8.82's artiCoreDescProbe: a test-only read-back of the PxgArticulationCoreDesc
+# address map (testArtiCoreDescLayout).  Until 5.6.1 it shared dmaArtiResidualBda with
+# P8.66's dmaArticulationResidual, which went with the solver residual reporting PhysX
+# removed.  Ptr<> throughout (no HLSL lowering); integer/copy only (no float
+# contraction to pin).
+pxg_compile_shader(artiCoreDescProbe artiCoreDescProbe)
 # P8.67: the articulation BLOCK-LAYOUT address map, proven functionally.  The
 # probe reads element [1] of a two-element array at lane 3, so struct stride,
 # field offset and lane stride are each independently wrong-able.
@@ -736,11 +736,8 @@ pxg_compile_shader(npPsFluidDensity ps_calculateDensityAndPotentialLaunch ps_sol
 # IS in PXG_NOCONTRACT_SHADERS: dense SPH float work.
 pxg_compile_shader(npPsFluidVelocity ps_vorticityConfinementLaunch ps_solveVelocityLaunch)
 
-# P9.3a: the first two kernels of the PBD cloth spring chain (particlesystem.cu
-# :4111 and :4043).  A 3D grid -- system on Z, cloth buffer on Y.
-pxg_compile_shader(npPsSprings ps_initializeSpringsLaunch ps_updateRemapVertsLaunch ps_solveSpringsLaunch ps_averageVertsLaunch)
-pxg_compile_shader(npPsAerodynamics ps_solveAerodynamics1Launch ps_solveAerodynamics2Launch)
-pxg_compile_shader(npPsInflatable ps_calculateInflatableVolume ps_solveInflatableVolume)
+# (P9.3a's PBD particle-cloth chain -- npPsSprings, npPsAerodynamics and
+# npPsInflatable -- went with PxParticleClothBuffer in PhysX 5.12.)
 # P9.8: the PBD fluid BOUNDARY density pair (particlesystem.cu :2894 and :2944).
 # The two are CHAINED -- the rigid kernel seeds its accumulator from what the
 # static one wrote into mStaticDensity.  IS in PXG_NOCONTRACT_SHADERS: W() is
@@ -926,16 +923,12 @@ pxg_compile_shader(femClothRefitBda cloth_refitBoundLaunch)
 # (the speculative-CCD AtomicMax reduction) is omitted as dead on the free-fall
 # scene, so there is no groupshared / barrier and no subgroup lowering (see the
 # shader header).
-# P9.95: sb_copyOrApplySoftBodyDataDEPRECATED joins as the fifth entry -- the word copy
-# behind PxScene::copySoftBodyData / applySoftBodyData.  Its argument 0 is the 32-byte
-# PxgTypedCudaBuffer OBJECT the host pushes by value (PxgSoftBodyCore.cpp:3134), so its
-# push block is 80 bytes (ABI row kSbCopyOrApplyData).  It has no float op at all, so the
-# file's NoContraction stamp is moot for it and still covers the file.
+# (P9.95's fifth entry, sb_copyOrApplySoftBodyDataDEPRECATED, was removed with the
+# deprecated PxScene::copySoftBodyData / applySoftBodyData in PhysX 5.12.)
 pxg_compile_shader(softBodySimBda sb_gm_preIntegrateLaunch
                    sb_gm_stepSoftbodyLaunch
                    sb_gm_finalizeVelocitiesLaunch
-                   sb_sleeping
-                   sb_copyOrApplySoftBodyDataDEPRECATED)
+                   sb_sleeping)
 # P8.0 tranche 2: the SOFTBODY BVH bounds refit (sb_refitBoundLaunch) — second kernel of
 # the free-fall chain.  Direct sibling of femClothRefitBda (same algorithm over
 # tetrahedra instead of triangles), same BDA Ptr<> reads and same groupshared warp
@@ -1019,21 +1012,13 @@ pxg_compile_shader(softBodySelfSolveBda sb_softbodyContactPrepareLaunch
 # IS in PXG_NOCONTRACT_SHADERS: the barycentric blends, the mass sums and the cone projection
 # are mul-feeding-add chains a fixture compares bit-exactly against a CPU reference.
 pxg_compile_shader(softBodyClothAttachBda sb_solveOutputClothAttachmentDeltaVLaunch)
-# P9.48b: the FOURTH consumer of PxgFEMFEMAttachmentConstraint -- a softbody
-# tetrahedron pinned to a single PARTICLE.  No cone limit, an asymmetric wTot0, a
-# buffer id hiding in barycentric0.x, and a three-indirection particle index.
-pxg_compile_shader(softBodyParticleAttachBda sb_solveOutputParticleAttachmentDeltaVLaunch)
+# (P9.48b's softbody-PARTICLE attachment, softBodyParticleAttachBda, was removed
+# upstream in PhysX 5.12.)
 pxg_compile_shader(softBodyRigidAttachBda sb_rigidAttachmentPrepareLaunch
                    sb_solveRigidSoftAttachmentLaunch
                    sb_solveRigidSoftAttachmentLaunchTGS)
-# P9.76: the PARTICLE-vs-rigid attachment trio, the third and last attachment
-# family.  Its two solve entry points have DIFFERENT CUDA signatures (8 and 10
-# parameters) and ONE shared host pack, so both declare the same 72-byte push
-# block -- transcribing the signature instead of the pack would refuse the PGS
-# entry on every launch, which is P9.76b's failure in mirror image.
-pxg_compile_shader(psRigidAttachBda ps_rigidAttachmentPrepareLaunch
-                   ps_solveRigidAttachmentsLaunch
-                   ps_solveRigidAttachmentsTGSLaunch)
+# (P9.76's PARTICLE-vs-rigid attachment trio, psRigidAttachBda, was removed upstream
+# in PhysX 5.12.)
 # P8.4 tranche a: the softbody SELF-collision midphase -- one warp per SURFACE vertex walks
 # its own softbody's BV32 tetrahedron BVH and keeps the single deepest surviving
 # vertex-vs-tetrahedron contact.  The traverser body is a LIFT of npSbSelf.slang's

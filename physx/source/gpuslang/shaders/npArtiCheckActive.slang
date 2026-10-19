@@ -55,7 +55,7 @@ import pxgSlangPrepCommon;
 
 static const uint MAX_NC = 6u;
 static const float ACTIVE_EPS = 1.0e-8f;
-static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 3;
+static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 4; // 5.12 PxgSolverFlags.h (5.6.1: 1 << 3)
 
 float dot3C(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 float pxMaxQ(float a, float b) { return (a > b) ? a : b; }  // PxMax float = selectMax

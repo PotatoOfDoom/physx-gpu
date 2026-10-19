@@ -119,10 +119,6 @@ trimeshHeightfieldNarrowphase
 # the shared parts into pxgSlangTriPlane / pxgSlangNpPatchTail and composed them.
 
 # PxgSoftBodyCore.cpp (3)
-# sb_copyOrApplySoftBodyDataDEPRECATED -- MAPPED in P9.95 (softBodySimBda.spv); driven by
-# PXG_SCENE=softbodydata through PxScene::copySoftBodyData / applySoftBodyData, which no
-# scene had called.  Its host pack pushes the 32-byte PxgTypedCudaBuffer OBJECT as
-# argument 0, so its ABI row is the 80-byte host pack, not the 56-byte signature.
 # sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch -- MAPPED in P9.95f (softBodySolveBda.spv),
 # DRIVEN by PXG_SCENE=softbodyhex (fork arm): the 9th ("Jacobi") partition the cooker emits
 # only for a VOXEL simulation mesh with a duplicated voxel -- no scene had ever built a hex
@@ -152,18 +148,8 @@ sb_plasticDeformLaunch2
 # under `if (isDirectGPUAPIInitialized())`, 239 times in a 240-step directapi run.
 
 # PxgPBDParticleSystemCore.cpp (0)
-# P9.80 removed ps_solveShapes and ps_update_volume_bound: both are mapped and
-# both are now DRIVEN, by PXG_SCENE=particlerigid -- the first scene in this
-# harness to create a PxParticleRigidBuffer (a shape-matched cluster) and the
-# first to ask its PxParticleBuffer for a volume.  Neither was reachable before,
-# and neither was reported as [pxg-unmapped] either: a kernel whose HOST GUARD is
-# false is never LAUNCHED, and the P9.40 machinery only sees launches.  Measured,
-# not asserted: with ps_solveShapes skipped the cluster's y-extent collapses from
-# 1.4999 to 0.0000, and with ps_update_volume_bound skipped the volume bound still
-# holds the -999 the scene poisoned it with.
-# applyParticleBufferDataDEPRECATED -- MAPPED in P9.95 (particleSim.spv); driven by
-# PXG_SCENE=particleapply through PxScene::applyParticleBufferData, the first scene
-# to combine eENABLE_DIRECT_GPU_API with a PBD particle system.
+# (P9.80's ps_solveShapes / ps_update_volume_bound and P9.95's
+# applyParticleBufferDataDEPRECATED were removed upstream in PhysX 5.12.)
 
 # PxgParticleSystemCore.cpp (3)
 
@@ -181,20 +167,3 @@ sb_plasticDeformLaunch2
 # steps under eENABLE_DIRECT_GPU_API (PxScene::addActor, PxScene::resetFiltering).
 # Every other scene changes its shapes only before the first step, when the whole
 # arrays are copied instead, so the merge had never run.
-
-# PxgMemCopyDispatcher.cpp (1)
-# copyUserData -- a FIFTH kind of unreachability, found by P9.79 and named here
-# because no existing bucket covers it: its launch site
-# (PxgMemCopyDispatcher::flushCommands) is compiled, but PxgMemCopyDispatcher is
-# CONSTRUCTED NOWHERE -- not as a member, not as a local, not via PX_NEW.  The
-# owner class is dead, so the call site can never run.
-#
-# check_unmapped_reachability.py cannot see this: its ENGINE test is a
-# `PxgKernelIds::<ENUM>` text match over .cpp files outside gpuslang, and that match
-# succeeds.  The entry therefore STAYS on the ratchet -- shrinking it by hand on a
-# hand-verified argument is how a ratchet stops ratcheting -- but the measurement is
-# recorded so the next tranche does not spend a day porting a kernel nothing runs.
-# Turning this into a SIXTH checker bucket (DEAD_OWNER, re-derived per run like
-# STANDALONE's three legs) is worth doing when a second instance shows up; one
-# instance does not justify a checker that could itself be wrong.
-copyUserData

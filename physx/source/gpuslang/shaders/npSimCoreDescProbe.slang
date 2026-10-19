@@ -96,7 +96,8 @@ void simCoreDescProbe(uint3 dtid : SV_DispatchThreadID)
     // ---- B) PxgNewBodiesDesc ----
     o[i++] = nb.mNewBodySim;
     o[i++] = nb.mBodySimBufferDeviceData;
-    o[i++] = uint64_t(nb.mNbNewBodies);
+    o[i++] = nb.mPrevVelocitiesBuffer;      // 5.12, @16
+    o[i++] = uint64_t(nb.mNbNewBodies);     // 5.12: @24 (5.6.1: @16)
 
     // ---- C) element [1] of every indexed array (offset + STRIDE proof) ----
 

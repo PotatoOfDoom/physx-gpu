@@ -247,11 +247,16 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
         const bool firstTransfer = (internalFlags & PXG_BODY_FIRST_BODY_COPY_GPU) != 0;
         const bool copyVel = (internalFlags & PXG_BODY_VELOCITY_COPY_GPU) != 0;
 
+        // 5.12: the transfer flags are cleared before the flags word is stored
+        // (see the engine twin in directApiBda.slang, which also seeds the
+        // previous velocities; this bound-buffer harness has no such binding)
+        const uint storedFlags = internalFlags & ~(PXG_BODY_FIRST_BODY_COPY_GPU | PXG_BODY_VELOCITY_COPY_GPU);
+
         if (firstTransfer)
         {
             // on the first DMA, we copy the transform data that the user setup on CPU
             for (uint w = 0; w < BODYSIM_WORDS; ++w)
-                gBodySimPool[dstBase + w] = gNewData[srcBase + w];
+                gBodySimPool[dstBase + w] = (w == W_INTERNAL_FLAGS) ? storedFlags : gNewData[srcBase + w];
             continue;   // CUDA: `continue` inside the grid-stride loop, not `return`
         }
 
@@ -272,7 +277,8 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
             else
             {
                 for (uint c = 0; c < 4; ++c)
-                    gBodySimPool[dstBase + w0 + c] = gNewData[srcBase + w0 + c];
+                    gBodySimPool[dstBase + w0 + c] =
+                        (w0 + c == W_INTERNAL_FLAGS) ? storedFlags : gNewData[srcBase + w0 + c];
             }
         }
 

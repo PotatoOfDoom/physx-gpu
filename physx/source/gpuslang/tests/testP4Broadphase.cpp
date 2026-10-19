@@ -28,8 +28,8 @@
 // constructs the REAL, unmodified engine broadphase — PxgCudaBroadPhaseSap, the
 // exact concrete type PxgPhysXGpu::createGpuBroadPhase static_casts to — over the
 // Vulkan context, driven by BOTH prior seams: the real PxgCudaKernelWranglerManager
-// (P4.3) and the real PxgHeapMemoryAllocatorManager over PxgVulkanMemoryManager
-// (P4.2).  The broadphase ctor takes the context lock, allocates its ~40 device
+// (P4.3) and the real PxgHeapMemoryAllocatorManager over gpucommon's
+// PxgMemoryManager on the Vulkan context (P4.2).  The broadphase ctor takes the context lock, allocates its ~40 device
 // buffers + host-mapped descriptors through the buddy allocator, and creates its
 // stream + event through the bridge (including the first direct-driver seam,
 // cuCtxGetStreamPriorityRange, shimmed by PxgVulkanDriverShim.cpp).  The test
@@ -62,7 +62,7 @@
 
 #include "PxgCudaShim.h"
 #include "PxgVulkanCudaContext.h"
-#include "PxgVulkanMemoryManager.h"
+#include "PxgMemoryManager.h"                // gpucommon: createPxgMemoryManager
 #include "PxgHeapMemAllocator.h"               // gpucommon: the REAL buddy allocator manager
 #include "PxgSlangKernelManifest.h"            // generated registry manifest (for the wrangler)
 #include "PxgKernelWrangler.h"                 // gpucommon: the REAL PxgCudaKernelWranglerManager
@@ -86,7 +86,7 @@ using physx::PxGpuBroadPhaseDesc;
 using physx::PxGpuDynamicsMemoryConfig;
 using physx::gpuslang::PxgCudaShim;
 using physx::gpuslang::PxgKernelDef;
-using physx::gpuslang::PxgVulkanMemoryManager;
+using physx::PxgMemoryManager;
 using physx::gpuslang::gPxgSlangKernelManifest;
 using physx::gpuslang::PXG_SLANG_KERNEL_COUNT;
 
@@ -134,14 +134,27 @@ PXG_TEST(p4Broadphase)
 
         if (ctx)
         {
-            PxgVulkanMemoryManager memMgr(ctx);
+            physx::PxsMemoryManager* memMgr = physx::createPxgMemoryManager(ccm);
+            PXG_CHECK_MSG(memMgr != nullptr, "createPxgMemoryManager");
+            if (memMgr)
             {
                 // Both prior seams, exactly as the engine wires them.
                 const physx::PxU32 heapCapacity = 2u * 1024u * 1024u;
-                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, &memMgr);
+                PxgHeapMemoryAllocatorManager heapMgr(heapCapacity, *static_cast<PxgMemoryManager*>(memMgr));
+                physx::PxgAllocatorDesc allocDesc = physx::PxgCreateAllocatorDesc(heapMgr);
                 PxgCudaKernelWranglerManager wranglerMgr(*ccm, err);
-                PXG_CHECK_MSG(heapMgr.mDeviceMemoryAllocators != nullptr, "device buddy allocator built");
-                PXG_CHECK_MSG(wranglerMgr.getKernelWrangler() != nullptr, "real KernelWrangler built");
+                PXG_CHECK_MSG(heapMgr.mDeviceMemoryAllocator != nullptr, "device buddy allocator built");
+                // 5.12: the manager IS the KernelWrangler (no getKernelWrangler() to
+                // null-check).  hadError() is set by the registry's unmapped kernels, so
+                // prove the wrangler instead by resolving the first mapped registry id.
+                {
+                    unsigned firstMapped = 0;
+                    while (firstMapped < PXG_SLANG_KERNEL_COUNT && !gPxgSlangKernelManifest[firstMapped].spirvFile)
+                        ++firstMapped;
+                    PXG_CHECK_MSG(firstMapped < PXG_SLANG_KERNEL_COUNT &&
+                                      wranglerMgr.getCuFunction(uint16_t(firstMapped)) != nullptr,
+                                  "real KernelWrangler built (resolves mapped id %u)", firstMapped);
+                }
 
                 // A modest found/lost capacity keeps the buffer footprint small but
                 // still forces real device allocations through the buddy allocator.
@@ -160,7 +173,7 @@ PXG_TEST(p4Broadphase)
                 // static concrete wrangler + heap manager, on the Vulkan context.
                 void* mem = PX_ALLOC(sizeof(PxgCudaBroadPhaseSap), "PxgCudaBroadPhaseSap");
                 PxgCudaBroadPhaseSap* bp = PX_PLACEMENT_NEW(mem, PxgCudaBroadPhaseSap)(
-                    bpDesc, &wranglerMgr, ccm, memCfg, &heapMgr, /*contextID*/ 0);
+                    bpDesc, &wranglerMgr, ccm, memCfg, allocDesc, /*contextID*/ 0);
                 PXG_CHECK_MSG(bp != nullptr, "real PxgCudaBroadPhaseSap constructed over Vulkan");
 
                 const physx::PxU64 bpAfter =
@@ -184,7 +197,7 @@ PXG_TEST(p4Broadphase)
                 // AFTER the broadphase took its buffers.  A broken device memAlloc
                 // (NULL base) makes the flat address unresolvable -> the copy mismatches.
                 const uint32_t N = 256, probeBytes = N * 4;
-                void* probe = heapMgr.mDeviceMemoryAllocators->allocate(probeBytes, physx::PxsHeapStats::eOTHER, PX_FL);
+                void* probe = heapMgr.mDeviceMemoryAllocator->allocate(probeBytes, physx::PxsHeapStats::eOTHER, PX_FL);
                 PXG_CHECK_MSG(probe != nullptr, "probe device buffer from the post-broadphase pool");
                 size_t badProbe = 0;
                 if (probe)
@@ -195,7 +208,7 @@ PXG_TEST(p4Broadphase)
                     ctx->memcpyHtoD(d, in.data(), probeBytes);
                     ctx->memcpyDtoH(out.data(), d, probeBytes);
                     for (uint32_t i = 0; i < N; ++i) if (out[i] != in[i]) ++badProbe;
-                    heapMgr.mDeviceMemoryAllocators->deallocate(probe);
+                    heapMgr.mDeviceMemoryAllocator->deallocate(probe);
                 }
                 PXG_CHECK_MSG(badProbe == 0,
                               "the broadphase's Vulkan device pool round-trips real data (%zu mismatches)", badProbe);
@@ -206,6 +219,7 @@ PXG_TEST(p4Broadphase)
                 bp->~PxgCudaBroadPhaseSap();  // frees its buffers via the buddy allocator + ctx
                 PX_FREE(mem);
             }  // heapMgr / wranglerMgr destroyed here, ctx still alive
+            PX_DELETE(memMgr);
         }
 
         if (ccm)

@@ -168,16 +168,15 @@ struct PxgBlockSolverConstraint1DCon
     uint pad0[32];                 // 2176
 }                                  // = 2304
 
-// mirrors PxgBlockSolverConstraint1DMod (1024 bytes)
+// mirrors PxgBlockSolverConstraint1DMod (896 bytes; 5.12 removed residual[32])
 struct PxgBlockSolverConstraint1DMod
 {
     float ang0Writeback[96]; // 0: PxVec3[32], tightly packed
     float appliedForce[32];  // 384
     uint flags[32];          // 512
-    float residual[32];      // 640
-    float coeff0[32];        // 768
-    float coeff1[32];        // 896
-}                            // = 1024
+    float coeff0[32];        // 640
+    float coeff1[32];        // 768
+}                            // = 896
 
 // ---------------------------------------------------------------------------
 // engine-ABI push constants (shared by both entries: the CUDA parameter pack
@@ -214,8 +213,8 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
                                          float4 initialLinVel0_invMassW, float4 initialAngVel0_penBiasClamp,
                                          float4 initialLinVel1_invMassW, float4 initialAngVel1_penBiasClamp,
                                          PxgMat33 sqrtInvInertia0, PxgMat33 sqrtInvInertia1, float invDtF32,
-                                         float dtF32, float bounceThresholdF32, uint threadIndex,
-                                         uint forceWritebackBufferOffset, bool perPointFriction,
+                                         float dtF32, float bounceThresholdF32, float biasCoefficient,
+                                         uint threadIndex, uint forceWritebackBufferOffset,
                                          uint headerIndex, uint outContactBase, uint outFrictionBase,
                                          float restDistance, float staticFrictionCof, float dynamicFrictionCof,
                                          uint flags, float ccdMaxSeparationThreshold, float solverOffsetSlop)
@@ -234,10 +233,10 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
     const float3 angVel1 = initialAngVel1_penBiasClamp.xyz;
 
     const float invDt = invDtF32;
-    const float p8 = 0.8f;
     const float bounceThreshold = bounceThresholdF32;
 
-    const float invDtp8 = invDt * p8;
+    // 5.12: the prepare desc's biasCoefficients.rigidContact (5.6.1: p8 = 0.8)
+    const float invDtWithBiasCoefficient = invDt * biasCoefficient;
 
     const float4 lin0X_ang0Y_lin1Z_ang1W = gContactPrepData[prepIndex].mInvMassScale[threadIndex];
 
@@ -319,7 +318,7 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
         const float penetration = separation - restDistance;
         const bool isSeparated = (penetration >= 0.0f);
         const float penetrationInvDt = penetration * invDt;
-        const float penetrationInvDtPt8 = max(maxPenBias, penetration * invDtp8);
+        const float penetrationInvDtWithBiasCoefficient = max(maxPenBias, penetration * invDtWithBiasCoefficient);
 
         const bool collidingWithVrel = ((-vrel) > penetrationInvDt);
         const bool isGreater2 = ((restitution > 0.0f) && (bounceThreshold > vrel)) && collidingWithVrel;
@@ -340,7 +339,7 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
         }
         else
         {
-            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtPt8;
+            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtWithBiasCoefficient;
             if (ccdSeparationCondition && isGreater2)
                 scaledBias = 0.0f;
 
@@ -411,6 +410,8 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
         gFrictionHeaders[headerIndex].frictionNormals0[threadIndex] = float4(t0, 0.0f);
         gFrictionHeaders[headerIndex].frictionNormals1[threadIndex] = float4(t1, 0.0f);
 
+        const bool hasTargetVelocity = (flags & PXG_SC_FLAG_HAS_TARGET_VELOCITY) != 0;
+
         for (uint j = 0; j < aCount; j++)
         {
             const uint f0 = outFrictionBase + 2 * j;
@@ -426,7 +427,7 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
 
             const float3 error = (ra + bodyFrame0p) - (rb + bodyFrame1p);
 
-            const uint index = perPointFriction
+            const uint index = hasTargetVelocity
                 ? (j == 0 ? gCurrFrictionPatches[prepIndex].contactID0[threadIndex]
                           : gCurrFrictionPatches[prepIndex].contactID1[threadIndex])
                 : 0;
@@ -618,10 +619,12 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
 
     const uint contactBase = batches[batchIndex].blockContactIndex;
 
+    // processFrictionPatch() (5.12 factors correlate / getFrictionPatches /
+    // growPatches out of createFinalizeSolverContactsBlockGPU; same sequence)
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal, bodyFrame0, bodyFrame1,
                         threadIndexInWarp);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool disableStrongFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0;
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     // KS - ensure that the friction patch broken bit is set to 0
@@ -632,7 +635,7 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
     // (the CUDA __syncwarp() here guards only same-lane data; no cross-lane
     // accesses exist in the correlation functions)
 
-    if (!(perPointFriction || disableFriction))
+    if (!(disableStrongFriction || disableFriction))
     {
         getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
                               prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0, edgeIndex,
@@ -652,8 +655,9 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
                                         bodyData0, bodyData1, linVel_invMass0, angVelXYZ_penBiasClamp0,
                                         linVel_invMass1, angVelXYZ_penBiasClamp1, invInertia0, invInertia1,
                                         sharedDesc[0].invDtF32, sharedDesc[0].dt,
-                                        prepDesc[0].bounceThresholdF32, threadIndexInWarp,
-                                        forceWritebackOffset, perPointFriction, descIndexBatch,
+                                        prepDesc[0].bounceThresholdF32,
+                                        prepDesc[0].biasCoefficients.rigidContact, threadIndexInWarp,
+                                        forceWritebackOffset, descIndexBatch,
                                         batches[batchIndex].startConstraintIndex,
                                         batches[batchIndex].startFrictionIndex, restDistance,
                                         staticFrictionCof, dynamicFrictionCof, flags,
@@ -961,7 +965,8 @@ void jointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThr
 
     // ---- setUp1DConstraintBlock ----
 
-    const float erp = 1.0f;
+    // 5.12: erp = biasCoefficients.joint (5.6.1: the literal 1.0f)
+    const float erp = prepDesc[0].biasCoefficients.joint;
 
     for (uint r = 0; r < numRows; r++)
     {
@@ -1027,7 +1032,6 @@ void jointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThr
             gJointRowsMod[outRow].coeff0[threadIndexInWarp] = coeff0;
             gJointRowsMod[outRow].coeff1[threadIndexInWarp] = coeff1;
             gJointRowsMod[outRow].appliedForce[threadIndexInWarp] = 0.0f;
-            gJointRowsMod[outRow].residual[threadIndexInWarp] = 0.0f;
 
             uint modFlags = 0;
             if ((rpFlags & PX1D_FLAG_SPRING) != 0)

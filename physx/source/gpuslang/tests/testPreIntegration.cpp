@@ -59,10 +59,11 @@ float preDot(const Vec3& a, const Vec3& b)
 // CPU reference: direct transcription of preIntegration.cuh
 // ---------------------------------------------------------------------------
 
+// 5.12 dropped the `v == 0 ? 0 : sqrt(v)` guard (5.6.1); only -0.0 differs
+// (sqrt(-0) = -0), which the tolerance compares below do not distinguish.
 Vec3 computeSafeSqrtInertia(const Vec3& v)
 {
-    return Vec3(v.x == 0.f ? 0.f : std::sqrt(v.x), v.y == 0.f ? 0.f : std::sqrt(v.y),
-                v.z == 0.f ? 0.f : std::sqrt(v.z));
+    return Vec3(std::sqrt(v.x), std::sqrt(v.y), std::sqrt(v.z));
 }
 
 // mirrors transformInertiaTensor(): M * diag(invD) * M^T (symmetric result)

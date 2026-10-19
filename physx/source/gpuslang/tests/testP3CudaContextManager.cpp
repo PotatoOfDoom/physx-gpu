@@ -26,9 +26,9 @@
 
 // RUNTIME_PLAN.md P3 test: the PxCudaContextManager wrapper (the object the
 // scene receives via PxSceneDesc::cudaContextManager).  Verifies the manager
-// hands out a working PxCudaContext, reports device properties, and that the
-// deprecated buffer helper templates (which drive the protected *Internal
-// virtuals) alloc / copy / run a real kernel end-to-end.
+// hands out a working PxCudaContext, reports device properties, runs a real
+// kernel end-to-end through it, and honours the 5.12 reference count
+// (acquireReference / release, the manager dies at the last release).
 
 #include "pxgTestFramework.h"
 
@@ -131,19 +131,25 @@ PXG_TEST(p3CudaContextManager)
     PXG_CHECK_MSG(mm == 0, "kernel via the manager's context is bitwise correct (%zu bad)", mm);
     ctx->memFree(dx); ctx->memFree(dy); ctx->memFree(dOut);
 
-    // Deprecated buffer-helper templates drive the protected *Internal virtuals:
-    // allocDeviceBuffer -> allocDeviceBufferInternal, copyHToD/copyDToH -> the
-    // copy*Internal pair.  A host->device->host round-trip must be exact.
+    // 5.12 reference counting (PxCudaContextManager.h:299-308): the scene,
+    // the deformables and the particle core each take a reference, and the
+    // manager is destroyed only at the last release().  One extra reference
+    // must keep it (and its context) fully usable after the first release.
+    // (5.12 removed the deprecated allocDeviceBuffer / copyHToD helpers and
+    // their protected *Internal virtuals that this block exercised before.)
+    mgr->acquireReference();
+    mgr->release();
+    PXG_CHECK_MSG(mgr->contextIsValid(), "manager survives a release while a reference is held");
     {
-        float* db = nullptr;
-        mgr->allocDeviceBuffer<float>(db, N);
-        PXG_CHECK_MSG(db != nullptr, "allocDeviceBuffer (Internal) returns a device pointer");
-        mgr->copyHToD<float>(db, x.data(), N);
+        CUdeviceptr db = 0;
+        ctx->memAlloc(&db, N * 4);
+        PXG_CHECK_MSG(db != 0, "context still allocates while a reference is held");
+        ctx->memcpyHtoD(db, x.data(), N * 4);
         std::vector<float> back(N, 0.f);
-        mgr->copyDToH<float>(back.data(), db, N);
+        ctx->memcpyDtoH(back.data(), db, N * 4);
         PXG_CHECK_MSG(std::memcmp(back.data(), x.data(), N * 4) == 0,
-                      "Internal H2D/D2H round-trip is exact");
-        mgr->freeDeviceBuffer(db);
+                      "H2D/D2H round-trip is exact after the first release");
+        ctx->memFree(db);
     }
 
     mgr->release();

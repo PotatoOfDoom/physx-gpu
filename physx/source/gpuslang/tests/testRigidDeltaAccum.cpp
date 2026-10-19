@@ -77,6 +77,7 @@ static const uint32_t AB_BLOCK_SIZE = 7168u;
 static const uint32_t AB_mStateDirty = 7040u;            // PxU8[32]
 static const uint32_t AB_LINK_SIZE = 29184u;
 static const uint32_t AB_LINK_mScratchImpulse = 11776u;  // float4[32] top.xyz,bottom.x @+0, float2[32] bottom.yz @+512
+static const uint32_t AB_LINK_mSolverSpatialImpulse = 14080u;  // same block layout (5.12: also accumulated here)
 static const uint32_t AB_SVB_BYZ = 512u;
 static const uint32_t AB_LINK_mDeltaScale = 20992u;      // float[32]
 static const uint8_t ARTI_STATE_HAS_IMPULSES = 2u;       // PxgArtiStateDirtyFlag::eHAS_IMPULSES
@@ -244,18 +245,26 @@ static uint32_t blockOf(uint32_t w, uint32_t n)
     return (w / AD_BLOCK) / nbIter;
 }
 
-static void writeScratchImpulse(std::vector<uint8_t>& linkBlocks, size_t linkBase, uint32_t aib, const float top[3], const float bottom[3], bool accumulate)
+static void writeSpatialBlock(std::vector<uint8_t>& linkBlocks, size_t linkBase, uint32_t field, uint32_t aib,
+                              const float top[3], const float bottom[3], bool accumulate)
 {
-    const size_t f4 = linkBase + AB_LINK_mScratchImpulse + size_t(aib) * 16;
-    const size_t f2 = linkBase + AB_LINK_mScratchImpulse + AB_SVB_BYZ + size_t(aib) * 8;
+    const size_t f4 = linkBase + field + size_t(aib) * 16;
+    const size_t f2 = linkBase + field + AB_SVB_BYZ + size_t(aib) * 8;
     const float vals4[4] = { top[0], top[1], top[2], bottom[0] };
     const float vals2[2] = { bottom[1], bottom[2] };
     for (int k = 0; k < 4; ++k) putF32(linkBlocks, f4 + 4 * k, accumulate ? getF32(linkBlocks, f4 + 4 * k) + vals4[k] : vals4[k]);
     for (int k = 0; k < 2; ++k) putF32(linkBlocks, f2 + 4 * k, accumulate ? getF32(linkBlocks, f2 + 4 * k) + vals2[k] : vals2[k]);
 }
 
+// 5.12: the link impulse goes to mScratchImpulse AND mSolverSpatialImpulse
+static void writeScratchImpulse(std::vector<uint8_t>& linkBlocks, size_t linkBase, uint32_t aib, const float top[3], const float bottom[3], bool accumulate)
+{
+    writeSpatialBlock(linkBlocks, linkBase, AB_LINK_mScratchImpulse, aib, top, bottom, accumulate);
+    writeSpatialBlock(linkBlocks, linkBase, AB_LINK_mSolverSpatialImpulse, aib, top, bottom, accumulate);
+}
+
 // ---------------------------------------------------------------------------
-// accumulateDeltaVRigidSecondLaunch (rigidDeltaAccum.cu:224-429) on the World.
+// accumulateDeltaVRigidSecondLaunch (rigidDeltaAccum.cu, 5.12) on the World.
 // ---------------------------------------------------------------------------
 static void refSecond(World& W, const FirstOut& f, bool isTGS)
 {
@@ -284,7 +293,8 @@ static void refSecond(World& W, const FirstOut& f, bool isTGS)
             const float ratio = 1.0f / denom;
             const float top[3] = { -(linVel.x * ratio), -(linVel.y * ratio), -(linVel.z * ratio) };
             const float bottom[3] = { -(angVel.x * ratio), -(angVel.y * ratio), -(angVel.z * ratio) };
-            writeScratchImpulse(W.linkBlocks, linkBase, aib, top, bottom, false);
+            // 5.12: addSpatialVector into both blocks (5.6.1: storeSpatialVector into mScratchImpulse)
+            writeScratchImpulse(W.linkBlocks, linkBase, aib, top, bottom, true);
         }
         else
         {
@@ -514,7 +524,8 @@ struct FirstPush { uint64_t sortedRigidIds, numContacts, deltaV, blockDeltaV, bl
 static_assert(sizeof(FirstPush) == 40, "First push 40 bytes");
 struct SecondPush
 {
-    uint64_t sortedRigidIds, numContacts, deltaV, blockDeltaV, blockRigidId, prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
+    uint64_t sortedRigidIds, numContacts, deltaV, blockDeltaV, blockRigidId, prePrepDesc, solverCoreDesc, artiCoreDesc,
+        solverBodyVelPool;   // 5.12: float4* (5.6.1: PxgSolverSharedDesc<IterativeSolveData>*)
     uint32_t isTGSWord; uint32_t pad;
 };
 static_assert(sizeof(SecondPush) == 80, "Second push 80 bytes");
@@ -593,7 +604,7 @@ struct Gpu
         p.sortedRigidIds = addrOf(dev, bIds); p.numContacts = addrOf(dev, bNum); p.deltaV = addrOf(dev, bDeltaV);
         p.blockDeltaV = addrOf(dev, bBlockDeltaV); p.blockRigidId = addrOf(dev, bBlockRid);
         p.prePrepDesc = addrOf(dev, bPrePrep); p.solverCoreDesc = addrOf(dev, bCore); p.artiCoreDesc = addrOf(dev, bArtiCore);
-        p.sharedDesc = addrOf(dev, bShared); p.isTGSWord = isTGS ? 1u : 0u;
+        p.solverBodyVelPool = addrOf(dev, bPool); p.isTGSWord = isTGS ? 1u : 0u;
         Kernel k("rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunch", {}, sizeof(SecondPush));
         k.dispatch(AD_GRID, {}, p);
         dev->flush();

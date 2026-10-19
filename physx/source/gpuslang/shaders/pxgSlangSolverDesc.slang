@@ -34,19 +34,12 @@
 // trailing `bool enableStabilization` -> masked word read (its 3 padding bytes
 // are uninitialized host memory).
 //
-// PxgSolverCoreDescGpu now mirrors the FULL engine struct: the scalar tail
-// past enableStabilization (nbExceededThresholdElements ..
-// maxLinksPerArticulation, then the Dy::ErrorAccumulator
-// contactErrorAccumulator at 304) is required by solveWholeIslandTGS, which
-// tests contactErrorAccumulator.mCounter >= 0 and atomically accumulates the
-// per-launch contact residual statistics into the accumulator.  The two float
-// members of the accumulator are declared as raw uint BITS so the kernel can
-// CAS-emulate CUDA's float atomicAdd / AtomicMax on them
-// (InterlockedCompareExchange has no float overload); mCounter keeps its int
-// type for the plain InterlockedAdd and the signed >= 0 enable test.  The
-// engine struct is 316 bytes rounded up to 320 by its pointer alignment; the
-// desc is only ever dereferenced as desc[0] (never indexed), so the mirror's
-// own 8-byte size rounding is inert.
+// PxgSolverCoreDescGpu mirrors the FULL engine struct, including the scalar
+// tail past enableStabilization (nbExceededThresholdElements ..
+// maxLinksPerArticulation).  5.12 removed the trailing Dy::ErrorAccumulator
+// contactErrorAccumulator (solver residual reporting is gone), so the engine
+// struct is 304 bytes.  The desc is only ever dereferenced as desc[0] (never
+// indexed), so the mirror's own 8-byte size rounding is inert.
 //
 // The layout is verified EMPIRICALLY, not by inspection:
 // tests/testSolverDescLayout.cpp fills the REAL engine structs with sentinels
@@ -100,13 +93,7 @@ public struct PxgSolverCoreDescGpu
     public uint nbPrevExceededThresholdElements;                // @292
     public uint nbForceChangeElements;                          // @296
     public uint maxLinksPerArticulation;                        // @300
-    // ---- Dy::ErrorAccumulator contactErrorAccumulator @304 ----
-    // float members held as raw bits (uint) for the CAS-loop float atomics;
-    // see the file header.
-    public uint contactErrorAccumulator_mErrorSumOfSquares;     // @304 float bits
-    public int  contactErrorAccumulator_mCounter;               // @308 PxI32
-    public uint contactErrorAccumulator_mMaxError;              // @312 float bits
-}
+}                                                               // = 304
 
 // PxgSolverSharedDesc<IterativeSolveDataTGS> = PxgSolverSharedDescBase (96
 // bytes) + IterativeSolveDataTGS (16 pointers, 128 bytes) = 224 bytes total.
@@ -193,7 +180,19 @@ public struct PxgSolverSharedDescPGSGpu
     public uint64_t iter_artiResponse;                 // @216 PxgArticulationBlockResponse*
 }                                                      // = 224
 
-// PxgIslandContext (gpusolver/include/PxgIslandContext.h), 68 bytes.  The
+// Dy::BiasCoefficientCollection (lowleveldynamics/shared/DyCpuGpuBiasCoefficient.h),
+// 20 bytes: the per-feature bias coefficients that 5.12 carries in
+// PxgIslandContext and PxgConstraintPrepareDesc instead of one biasCoefficient.
+public struct BiasCoefficientCollectionGpu
+{
+    public float rigidContact;              // @0  contacts (incl. articulation contacts, sticky friction)
+    public float joint;                     // @4  maximal-coordinate joints
+    public float articulation;              // @8  articulation internal constraints
+    public float particle;                  // @12 PBD particle solve
+    public float deformableRigidAttachment; // @16 FEM-rigid attachments
+}                                           // = 20
+
+// PxgIslandContext (gpusolver/include/PxgIslandContext.h), 84 bytes.  The
 // kernels index islandContextPool[islandIndex], so this mirror's SIZE (array
 // stride) matters, not only the field offsets — the layout test probes
 // element [1] to pin the stride.
@@ -215,8 +214,8 @@ public struct PxgIslandContextGpu
     public uint mStaticArtiBatchCount;  // @52
     public uint mSelfArtiBatchCount;    // @56
     public uint mStaticRigidBatchCount; // @60
-    public float mBiasCoefficient;      // @64
-}                                       // = 68 (4-aligned; the array stride)
+    public BiasCoefficientCollectionGpu mBiasCoefficients; // @64 (5.6.1: PxReal mBiasCoefficient)
+}                                       // = 84 (4-aligned; the array stride)
 
 // ---------------------------------------------------------------------------
 // P8.99c: countActiveSlabs / resetSlabCount (solverBlock.cuh:84/:100) as

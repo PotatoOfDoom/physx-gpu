@@ -180,7 +180,7 @@ HOST_LIVE_CONTROLS = ['CLOTH_SPHERE_CG']
 #
 # Two shapes reach it.  The first:
 #
-# cloth_clothMidphaseGeneratePairsLaunch (femClothClothMidPhase.cu:624) is a
+# cloth_clothMidphaseGeneratePairsLaunch (5.6.1 femClothClothMidPhase.cu:624) was a
 # complete, live device function with a live registry entry --
 #
 #     KERNEL_DEF(CLOTH_CLOTH_MIDPHASE, "cloth_clothMidphaseGeneratePairsLaunch")
@@ -207,14 +207,18 @@ HOST_LIVE_CONTROLS = ['CLOTH_SPHERE_CG']
 # not `getCuFunction` -- the scan counts any mention of the enum for exactly that
 # reason, because there is more than one way to ask for a kernel.
 #
-# WHAT THE PORT DEPENDS ON.  All eleven orphans are UNMAPPED in
+# (PhysX 5.12 deleted that kernel and its KERNEL_DEF, and ps_updateSprings with the
+# particle cloth, so both left the table below; the shape stays documented here.)
+#
+# WHAT THE PORT DEPENDS ON.  All the orphans below are UNMAPPED in
 # PxgSlangKernelManifest.h, and that is the claim being kept true: they need no
 # Slang port because no `getCuFunction` can ask for one.  The day any of them
 # gains a fetch, it becomes a kernel the engine will call and this port will not
 # answer -- so it must be read and ported, and this checker is the thing that
 # says so.  It also puts a number on something p4Manifest's coverage figure does
-# not distinguish: 12 of the 501 registry entries cannot be reached at all, so
-# 489 is the count of kernels a running engine can actually ask for.  That is
+# not distinguish: under 5.6.1, 12 of the 501 registry entries could not be reached
+# at all, so 489 was the count of kernels a running engine could actually ask for
+# (under 5.12 the table holds 10 of 487).  That is
 # recorded HERE rather than folded into the percentage, because the list lives in
 # this file and a second copy in C++ would be exactly the drift this port keeps
 # refusing to introduce.
@@ -233,9 +237,7 @@ KERNEL_REF_ROOT = 'physx/source'
 KERNEL_REF_EXCLUDE = 'physx/source/gpuslang'
 
 ORPHANED = [
-    ('PS_UPDATE_SPRING', 'ps_updateSprings'),
     ('SB_INIT_PLASTIC_DEFORM', 'sb_initPlasticDeformLaunch'),
-    ('CLOTH_CLOTH_MIDPHASE', 'cloth_clothMidphaseGeneratePairsLaunch'),
     # Orphaned by a COMMENTED-OUT launch, which is a fifth shape and the one this scan
     # found on its first run.  PxgSDFBuilder.cpp:306 wraps the only
     # `launchKernelPtr(PxgKernelIds::bvh_CalculateKeyDeltas, ...)` in a block comment, with
@@ -633,7 +635,7 @@ def orphan_selftest():
     if not os.path.exists(names_path):
         return 0                       # check_orphans already said so
     control = ORPHAN_LIVE_CONTROLS[0]
-    orphan = ORPHANED[2][0]            # CLOTH_CLOTH_MIDPHASE
+    orphan = ORPHANED[0][0]            # SB_INIT_PLASTIC_DEFORM (5.6.1 used CLOTH_CLOTH_MIDPHASE, gone in 5.12)
 
     # find the one file that fetches the control
     root = os.path.join(ROOT, KERNEL_REF_ROOT)

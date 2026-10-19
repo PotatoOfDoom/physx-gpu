@@ -432,7 +432,7 @@ public uint acpSetupFinalizeExtTGS(
     frictionHeader[fhi].biasCoefficient[threadIndex] = invDt;   // trap 11
     contactHeader[chi].restitutionXdt[threadIndex] = restitution * stepDt;
     contactHeader[chi].cfm[threadIndex] = cfm;
-    contactHeader[chi].p8[threadIndex] = p8;
+    contactHeader[chi].biasCoefficient[threadIndex] = p8; // 5.12 renamed the header field
 
     float normalForce = 0.0f;
     float minPen = 0.0f;
@@ -1054,7 +1054,7 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
                         bodyFrame0, bodyFrame1, lane);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool perPointFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0; // 5.12 split; this bit equals 5.6.1 ePER_POINT_FRICTION
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     currFrictionPatches[descIndexBatch].broken[lane] = 0;
@@ -1094,7 +1094,7 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
         currAnchors, descIndexBatch,
         b0, b1,
         sharedDesc[0].stepInvDtF32, sharedDesc[0].stepDt, sharedDesc[0].invDtF32,
-        prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficient,
+        prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficients.rigidContact, // 5.12 BiasCoefficientCollection
         lane, forceWritebackOffset, perPointFriction,
         contactHeaders, descIndexBatch,
         frictionHeaders, descIndexBatch,
@@ -1769,7 +1769,7 @@ void artiContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupThrea
     correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
                         bodyFrame0, bodyFrame1, lane);
 
-    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool perPointFriction = (flags & PXG_SC_FLAG_DISABLE_STRONG_FRICTION) != 0; // 5.12 split; this bit equals 5.6.1 ePER_POINT_FRICTION
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     currFrictionPatches[descIndexBatch].broken[lane] = 0;

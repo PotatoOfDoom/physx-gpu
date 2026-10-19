@@ -109,11 +109,11 @@ static_assert(offsetof(physx::PxgBodySim, body2Actor_maxImpulseW) == BS_BODY2ACT
 // PxgConstraintWriteback (gpusolver/include/PxgConstraintWriteBack.h, 32 B)
 static const uint32_t SZ_WRITEBACK = 32u;
 static const uint32_t WB_LINEAR = 0u;   // linearImpulse_broken
-static const uint32_t WB_ANGULAR = 16u; // angularImpulse_residual
+static const uint32_t WB_ANGULAR = 16u; // angularImpulse (5.12: .w unused)
 
 static_assert(sizeof(physx::PxgConstraintWriteback) == SZ_WRITEBACK, "PxgConstraintWriteback stride");
 static_assert(offsetof(physx::PxgConstraintWriteback, linearImpulse_broken) == WB_LINEAR, "WB_LINEAR");
-static_assert(offsetof(physx::PxgConstraintWriteback, angularImpulse_residual) == WB_ANGULAR, "WB_ANGULAR");
+static_assert(offsetof(physx::PxgConstraintWriteback, angularImpulse) == WB_ANGULAR, "WB_ANGULAR");
 
 // PxgConstraintIdMapEntry is one PxU32; eINVALID_ID is 0xffffFFFF.
 static const uint32_t CONSTRAINT_ID_INVALID = 0xffffffffu;
@@ -415,7 +415,7 @@ PXG_TEST(directApiD6JointGet)
     {
         const size_t o = size_t(i) * SZ_WRITEBACK;
         putF4(wb, o + WB_LINEAR, F4{ 1.0f + float(i), -2.5f - float(i), 0.75f * float(i), 1.0f /*broken*/ });
-        putF4(wb, o + WB_ANGULAR, F4{ -0.5f * float(i), 3.25f + float(i), -1.125f - float(i), 0.25f /*residual*/ });
+        putF4(wb, o + WB_ANGULAR, F4{ -0.5f * float(i), 3.25f + float(i), -1.125f - float(i), 0.25f /*.w, unused*/ });
     }
 
     //                                  valid, valid, INVALID entry, PAST the map, valid
@@ -683,13 +683,15 @@ PXG_TEST(directApiUpdateBodies)
     std::vector<PxgBufferHandle> all;
     auto mk = [&](auto const& vec) { PxgBufferHandle h = createBufferFrom(dev, vec); all.push_back(h); return h; };
 
-    // PxgNewBodiesDesc (24 B incl. tail padding) -- pxgSlangSimCoreDesc's mirror.
-    const uint32_t SZ_NEW_BODIES_DESC = 24u;
-    const uint32_t NBD_NEW_BODY_SIM = 0u, NBD_POOL = 8u, NBD_COUNT = 16u;
-    static_assert(sizeof(physx::PxgNewBodiesDesc) == 24u, "PxgNewBodiesDesc size");
+    // PxgNewBodiesDesc (32 B incl. tail padding) -- pxgSlangSimCoreDesc's mirror.
+    const uint32_t SZ_NEW_BODIES_DESC = 32u;
+    const uint32_t NBD_NEW_BODY_SIM = 0u, NBD_POOL = 8u, NBD_PREV = 16u, NBD_COUNT = 24u;
+    static_assert(sizeof(physx::PxgNewBodiesDesc) == 32u, "PxgNewBodiesDesc size");
     static_assert(offsetof(physx::PxgNewBodiesDesc, mNewBodySim) == 0u, "NBD_NEW_BODY_SIM");
     static_assert(offsetof(physx::PxgNewBodiesDesc, mBodySimBufferDeviceData) == 8u, "NBD_POOL");
-    static_assert(offsetof(physx::PxgNewBodiesDesc, mNbNewBodies) == 16u, "NBD_COUNT");
+    static_assert(offsetof(physx::PxgNewBodiesDesc, mPrevVelocitiesBuffer) == 16u, "NBD_PREV");
+    static_assert(offsetof(physx::PxgNewBodiesDesc, mNbNewBodies) == 24u, "NBD_COUNT");
+    const uint32_t PREV_VEL_WORDS = 8u;   // PxgBodySimVelocities, 32 B
 
     const uint32_t BS_INTERNAL_FLAGS_BYTE = 180u;   // word 45
     const uint32_t BS_INDEX_BYTE = 108u;            // word 27: ..._bodySimIndex.w
@@ -704,7 +706,8 @@ PXG_TEST(directApiUpdateBodies)
     // record 0: first transfer (copies everything)
     // record 1: subsequent, velocity NOT copied, body2Actor CHANGED (re-derive)
     // record 2: subsequent, velocity copied, body2Actor UNCHANGED (no re-derive)
-    const uint32_t FLAGS[NB_NEW] = { FIRST_BODY_COPY_GPU, 0u, VELOCITY_COPY_GPU };
+    // Each also carries unrelated bits that must survive the 5.12 transfer-flag clear.
+    const uint32_t FLAGS[NB_NEW] = { FIRST_BODY_COPY_GPU | 0x41u, 0x2u, VELOCITY_COPY_GPU | 0x880u };
 
     std::vector<uint8_t> staged(size_t(NB_NEW) * SZ_BODYSIM, 0u);
     std::vector<uint8_t> pool(size_t(POOL_BODIES) * SZ_BODYSIM, 0u);
@@ -748,9 +751,15 @@ PXG_TEST(directApiUpdateBodies)
     PxgBufferHandle bStaged = mk(staged);
     if (!addrOf(dev, bStaged)) { std::printf("  NOTE: no BDA -> skip\n"); for (PxgBufferHandle h : all) dev->destroyBuffer(h); return; }
     PxgBufferHandle bPool = mk(pool);
+    // previous velocities: a pattern, so only the first-transfer seed shows up
+    std::vector<uint32_t> prev(size_t(POOL_BODIES) * PREV_VEL_WORDS);
+    for (size_t w = 0; w < prev.size(); ++w)
+        prev[w] = 0xC0000000u + uint32_t(w);
+    PxgBufferHandle bPrev = mk(prev);
     std::vector<uint8_t> desc(SZ_NEW_BODIES_DESC, 0u);
     putU64(desc, NBD_NEW_BODY_SIM, addrOf(dev, bStaged));
     putU64(desc, NBD_POOL, addrOf(dev, bPool));
+    putU64(desc, NBD_PREV, addrOf(dev, bPrev));
     putU32(desc, NBD_COUNT, NB_NEW);
     PxgBufferHandle bDesc = mk(desc);
 
@@ -764,10 +773,12 @@ PXG_TEST(directApiUpdateBodies)
     dev->flush();
 
     const std::vector<uint8_t> got = downloadBuffer<uint8_t>(dev, bPool, pool.size());
+    const std::vector<uint32_t> gotPrev = downloadBuffer<uint32_t>(dev, bPrev, prev.size());
     for (PxgBufferHandle h : all) dev->destroyBuffer(h);
 
-    // reference, transcribed from updateBodiesAndShapes.cu:105
+    // reference, transcribed from updateBodiesAndShapes.cu (5.12 updateBodiesLaunchDirectAPI)
     std::vector<uint8_t> ref = pool;
+    std::vector<uint32_t> refPrev = prev;
     auto loadF4At = [](const std::vector<uint8_t>& b, size_t off) {
         F4 v; std::memcpy(&v, b.data() + off, 16); return v;
     };
@@ -777,9 +788,14 @@ PXG_TEST(directApiUpdateBodies)
         const size_t dst = size_t(DST[n]) * SZ_BODYSIM;
         const bool firstTransfer = (FLAGS[n] & FIRST_BODY_COPY_GPU) != 0u;
         const bool copyVel = (FLAGS[n] & VELOCITY_COPY_GPU) != 0u;
+        // 5.12: the transfer flags are cleared in the stored internalFlags word
+        const uint32_t storedFlags = FLAGS[n] & ~(FIRST_BODY_COPY_GPU | VELOCITY_COPY_GPU);
         if (firstTransfer)
         {
             std::memcpy(ref.data() + dst, staged.data() + src, SZ_BODYSIM);
+            std::memcpy(ref.data() + dst + BS_INTERNAL_FLAGS_BYTE, &storedFlags, 4);
+            // 5.12: seed previous velocities with the staged lin/ang velocity float4s
+            std::memcpy(refPrev.data() + size_t(DST[n]) * PREV_VEL_WORDS, staged.data() + src, 32);
             continue;
         }
         const F4 oldW_q = loadF4At(ref, dst + BS_BODY2WORLD);
@@ -795,6 +811,7 @@ PXG_TEST(directApiUpdateBodies)
             else
                 std::memcpy(ref.data() + dst + w0, staged.data() + src + w0, 16);
         }
+        std::memcpy(ref.data() + dst + BS_INTERNAL_FLAGS_BYTE, &storedFlags, 4);
 
         const F4 newA_q = loadF4At(ref, dst + BS_BODY2ACTOR);
         const F4 newA_p = loadF4At(ref, dst + BS_BODY2ACTOR + 16u);
@@ -823,6 +840,10 @@ PXG_TEST(directApiUpdateBodies)
         PXG_CHECK_MSG(got[i] == ref[i],
                       "pool byte %zu (body %zu, offset %zu): got 0x%02x, expected 0x%02x",
                       i, i / SZ_BODYSIM, i % SZ_BODYSIM, got[i], ref[i]);
+
+    for (size_t w = 0; w < refPrev.size(); ++w)
+        PXG_CHECK_MSG(gotPrev[w] == refPrev[w], "prevVelocities word %zu (body %zu): got 0x%08x, expected 0x%08x",
+                      w, w / PREV_VEL_WORDS, gotPrev[w], refPrev[w]);
 
     // Untouched pool slots must still carry their 0xB0.. pattern: the scatter goes
     // to the index the RECORD names, not to the loop index.

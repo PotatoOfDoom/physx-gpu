@@ -30,7 +30,8 @@
 // the Vulkan bridge.  The wrangler ctor name-matches every registry kernel
 // against the live function table (PxgVulkanKernelTable.cpp, built from the
 // manifest) and calls our PxCudaContext::moduleGetFunction, which returns
-// toFunc(id) = id+1.  So getKernelWrangler()->getCuFunction(id) yields our
+// toFunc(id) = id+1.  So getCuFunction(id) (5.12: the manager IS the
+// KernelWrangler) yields our
 // launch encoding for each of the 123 mapped kernels — the exact
 // getCuFunction(id) -> launchKernel path every gpu* launch site uses, now driven
 // by REAL engine code.  (The launch-by-id path itself is proven bit-exact in
@@ -118,10 +119,12 @@ PXG_TEST(p4Wrangler)
         if (ccm)
         {
             // The REAL engine wrangler manager over the Vulkan context.  Its
-            // KernelWrangler ctor resolves all 501 registry names through the
-            // live function table + our moduleGetFunction.
+            // KernelWrangler base ctor resolves all PXG_SLANG_KERNEL_COUNT registry
+            // names through the live function table + our moduleGetFunction.
+            // (5.12: PxgCudaKernelWranglerManager derives from KernelWrangler
+            // instead of owning one behind getKernelWrangler().)
             PxgCudaKernelWranglerManager wranglerMgr(*ccm, err);
-            KernelWrangler* kw = wranglerMgr.getKernelWrangler();
+            KernelWrangler* kw = &wranglerMgr;
             PXG_CHECK_MSG(kw != nullptr, "real KernelWrangler constructed");
 
             if (kw)

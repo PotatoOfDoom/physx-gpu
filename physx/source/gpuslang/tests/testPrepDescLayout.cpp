@@ -49,6 +49,7 @@
 #include "PxsContactManagerState.h"
 #include "PxContact.h"
 
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -81,7 +82,10 @@ PXG_TEST(prepDescLayout)
 
     // Host-side proof that the engine structs are what the mirrors assume.
     static_assert(sizeof(PxgPrePrepDesc) == 760, "PxgPrePrepDesc drifted");
-    static_assert(sizeof(PxgConstraintPrepareDesc) == 304, "PxgConstraintPrepareDesc drifted");
+    // 5.12: the trailing PxReal biasCoefficient became Dy::BiasCoefficientCollection
+    // biasCoefficients (20 B @296), so 304 -> 320
+    static_assert(sizeof(PxgConstraintPrepareDesc) == 320, "PxgConstraintPrepareDesc drifted");
+    static_assert(offsetof(PxgConstraintPrepareDesc, biasCoefficients) == 296, "biasCoefficients @296");
     static_assert(sizeof(PxgSolverSharedDesc<IterativeSolveData>) == 224, "PGS shared desc drifted");
     static_assert(sizeof(PxgConstraintBatchHeader) == 16, "PxgConstraintBatchHeader drifted");
     static_assert(sizeof(PartitionIndexData) == 8, "PartitionIndexData drifted");
@@ -346,7 +350,11 @@ PXG_TEST(prepDescLayout)
     c.articContactIndex = sent32(u++);
     c.articJointIndex = sent32(u++);
     c.nbElementsPerBody = sent32(u++);
-    c.biasCoefficient = sentF(f++);
+    c.biasCoefficients.rigidContact = sentF(f++);
+    c.biasCoefficients.joint = sentF(f++);
+    c.biasCoefficients.articulation = sentF(f++);
+    c.biasCoefficients.particle = sentF(f++);
+    c.biasCoefficients.deformableRigidAttachment = sentF(f++);
 
     expect.push_back(uint64_t(c.jointConstraintBatchIndices));
     expect.push_back(uint64_t(c.contactConstraintBatchIndices));
@@ -396,7 +404,11 @@ PXG_TEST(prepDescLayout)
     expect.push_back(c.articContactIndex);
     expect.push_back(c.articJointIndex);
     expect.push_back(c.nbElementsPerBody);
-    expect.push_back(bitsOf(c.biasCoefficient));
+    expect.push_back(bitsOf(c.biasCoefficients.rigidContact));
+    expect.push_back(bitsOf(c.biasCoefficients.joint));
+    expect.push_back(bitsOf(c.biasCoefficients.articulation));
+    expect.push_back(bitsOf(c.biasCoefficients.particle));
+    expect.push_back(bitsOf(c.biasCoefficients.deformableRigidAttachment));
 
     // ---- the REAL engine PxgSolverSharedDesc<IterativeSolveData> ----
     PxgSolverSharedDesc<IterativeSolveData> s;

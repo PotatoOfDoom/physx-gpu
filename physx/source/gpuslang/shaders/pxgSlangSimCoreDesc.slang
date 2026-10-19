@@ -40,7 +40,7 @@
 // are mirrored fully below (PxBounds3Gpu, PxgShapeGpu, PxgNewShapeSimGpu) or
 // reused from pxgSlangCommon (PxgShapeSim 72 B, PxsCachedTransform 32 B,
 // PxgSolverBodySleepData 8 B, PxgBodySim 224 B — all scalar-packed, so their
-// physical-storage layout equals the C++ layout).  PxgArticulation (544 B,
+// physical-storage layout equals the C++ layout).  PxgArticulation (496 B,
 // ~40 device pointers) is NOT mirrored: the articulation branch reads exactly
 // two pointer fields, addressed through the raw stride/offset constants at
 // the bottom of this file.
@@ -93,13 +93,26 @@ public struct PxgUpdatedBodiesDescGpu
     public uint mNbUpdatedBodies;             // @16 (+4 bytes pad -> 24)
 }
 
-// mirrors PxgNewBodiesDesc (24 bytes incl. 4 tail-padding bytes; only ever
-// dereferenced as desc[0])
+// mirrors PxgNewBodiesDesc (32 bytes incl. 4 tail-padding bytes; only ever
+// dereferenced as desc[0]).  5.12 inserted mPrevVelocitiesBuffer at @16, which
+// moved mNbNewBodies from @16 to @24 (5.6.1: 24 bytes).
 public struct PxgNewBodiesDescGpu
 {
     public uint64_t mNewBodySim;              // @0  const PxgBodySim*
     public uint64_t mBodySimBufferDeviceData; // @8  PxgBodySim*
-    public uint mNbNewBodies;                 // @16 (+4 bytes pad -> 24)
+    public uint64_t mPrevVelocitiesBuffer;    // @16 PxgBodySimVelocities* (may be null)
+    public uint mNbNewBodies;                 // @24 (+4 bytes pad -> 32)
+}
+
+// mirrors PxgRigidBodyAcceleration (PxgSimulationCore.h, new in 5.12, 32 bytes):
+// written by computeRigidBodyAccelerations, gathered by the direct-GPU-API
+// get{Linear,Angular}Acceleration kernels.
+public struct PxgRigidBodyAccelerationGpu
+{
+    public float3 linear;   // @0  PxVec3
+    public float pad0;      // @12
+    public float3 angular;  // @16 PxVec3
+    public float pad1;      // @28
 }
 
 // mirrors PxgUpdateActorDataDesc (80 bytes incl. 4 bytes of padding after
@@ -177,12 +190,13 @@ public static const uint PXG_BODY_SIM_BODYSIM_INDEX_IND = 6;  // 96 / 16
 // ---------------------------------------------------------------------------
 // The articulation branch indexes scDesc->mArticulationPool[articulationId]
 // and reads only linkBody2Worlds / linkBody2Actors (PxTransform* fields), so
-// instead of mirroring the whole 544-byte class the pool is addressed with a
+// instead of mirroring the whole 496-byte class the pool is addressed with a
 // byte stride + field byte offsets.  All three constants are checked against
-// host-side sizeof/offsetof by the layout test.
-public static const uint PXG_ARTICULATION_STRIDE = 544;           // sizeof(PxgArticulation)
-public static const uint PXG_ARTI_LINK_BODY2WORLDS_OFFSET = 184;  // offsetof(..., linkBody2Worlds)
-public static const uint PXG_ARTI_LINK_BODY2ACTORS_OFFSET = 200;  // offsetof(..., linkBody2Actors)
+// host-side sizeof/offsetof by the layout test.  (5.12 values; 5.6.1: 544 /
+// 184 / 200.)
+public static const uint PXG_ARTICULATION_STRIDE = 496;           // sizeof(PxgArticulation)
+public static const uint PXG_ARTI_LINK_BODY2WORLDS_OFFSET = 176;  // offsetof(..., linkBody2Worlds)
+public static const uint PXG_ARTI_LINK_BODY2ACTORS_OFFSET = 192;  // offsetof(..., linkBody2Actors)
 
 // loads the PxTransform* linkBody2Worlds / linkBody2Actors array pointer of
 // articulation [articulationId] out of the raw PxgArticulation pool

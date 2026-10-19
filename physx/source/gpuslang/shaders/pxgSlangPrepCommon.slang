@@ -72,11 +72,19 @@ public static const uint PX_CONSTRAINT_FLAG_DISABLE_PREPROCESSING = 1u << 8;
 public static const uint PX_RIGID_BODY_FLAG_KINEMATIC = 1u << 0;
 public static const uint PX_RIGID_BODY_FLAG_ENABLE_SPECULATIVE_CCD = 1u << 4;
 
-// PxgSolverContactFlags (PxgSolverFlags.h)
+// PxgSolverContactFlags (PxgSolverFlags.h).  5.12 split 5.6.1's
+// ePER_POINT_FRICTION (1<<1) into eHAS_TARGET_VELOCITY (1<<1: read the target
+// velocities from the friction anchor contact points) and
+// eDISABLE_STRONG_FRICTION (1<<2: no patch correlation, no TGS friction bias),
+// moving eDISABLE_FRICTION to 1<<3 and eCOMPLIANT_ACCELERATION_SPRING to 1<<4.
+// The solver / articulation shaders duplicate these values (solverPGS,
+// solverTGS, npArtiSolveContact(TGS), npArtiCheckActive, npArtiSolveExtPGS/TGS,
+// npArtiExtBody); they must change together.
 public static const uint PXG_SC_FLAG_HAS_FORCE_THRESHOLDS = 1u << 0;
-public static const uint PXG_SC_FLAG_PER_POINT_FRICTION = 1u << 1;
-public static const uint PXG_SC_FLAG_DISABLE_FRICTION = 1u << 2;
-public static const uint PXG_SC_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 3;
+public static const uint PXG_SC_FLAG_HAS_TARGET_VELOCITY = 1u << 1;
+public static const uint PXG_SC_FLAG_DISABLE_STRONG_FRICTION = 1u << 2;
+public static const uint PXG_SC_FLAG_DISABLE_FRICTION = 1u << 3;
+public static const uint PXG_SC_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 4;
 
 // DySolverConstraintTypes.h internal flags
 public static const uint DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;

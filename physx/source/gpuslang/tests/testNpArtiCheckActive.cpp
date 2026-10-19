@@ -49,7 +49,7 @@ struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 
 static const float ACTIVE_EPS = 1.0e-8f;
-static const uint32_t CONTACT_FLAG_ACCEL_SPRING = 1u << 3;
+static const uint32_t CONTACT_FLAG_ACCEL_SPRING = 1u << 4; // 5.12 PxgSolverContactFlags (5.6.1: 1 << 3)
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static bool eqFZ(float a, float b) { return f2u(a) == f2u(b); }   // P9.86: bitwise -- the +-0 class is closed

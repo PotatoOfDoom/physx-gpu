@@ -48,7 +48,7 @@
 // dereferenced as the raw device pointer it is under CUDA (vertices start at
 // byte 48, vertex count packed in the uint4 at byte 16 — see convexFormat.h).
 // The articulation branch is transcribed faithfully: it indexes
-// mArticulationPool by the 544-byte PxgArticulation stride and reads the
+// mArticulationPool by the 496-byte PxgArticulation stride and reads the
 // linkBody2Worlds / linkBody2Actors PxTransform arrays through the embedded
 // device pointers (stride/offset constants proven by testSimCoreDescLayout).
 //
@@ -570,10 +570,13 @@ void mergeChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
 }
 
 // ENGINE launch ABI of mergeTransformCacheAndBoundArrayChanges (P9.95):
-// exactly the CUDA parameter list (updateTransformAndBoundArray.cu:52-59),
-// packed by PxgSimulationController.cpp:752-754 -> {8,8,8,8,8,4} = 44 -> 48 B.
+// exactly the CUDA parameter list (updateTransformAndBoundArray.cu:29-37),
+// packed by PxgSimulationController::mergeBoundsAndTransformsChanges ->
+// {8,8,8,8,8,8,4} = 52 -> 56 B.  5.12 inserted the PxgUpdateActorDataDesc*
+// as argument #2 (5.6.1: {8,8,8,8,8,4} = 48 B).
 // The three "CPU" arrays are pinned host allocations (the scene's host
-// allocator is PxgVulkanMemoryManager's memHostAlloc callback) that reach the
+// allocator is gpucommon PxgMemoryManager's pinned callback, i.e. memHostAlloc
+// on the Vulkan context) that reach the
 // blob ALREADY translated to device addresses by getMappedDevicePtr
 // (:730-737); the ABI row's hostPtrMask is therefore 0, as for every other
 // argument here.
@@ -581,10 +584,11 @@ struct MergeTcBoundParams
 {
     uint64_t deviceBounds;     // @0  PxBounds3*                     (GPU-BP mBoxFpBoundsBuf)
     uint64_t deviceTransforms; // @8  PxsCachedTransform*            (NP transform cache)
-    uint64_t boundsArray;      // @16 const PxBounds3*               (mapped PxgBoundsArray::mBounds)
-    uint64_t transformsArray;  // @24 const PxsCachedTransform*      (mapped PxsTransformCache)
-    uint64_t changes;          // @32 const PxBoundTransformUpdate*  (mapped staging, 8 B per record)
-    uint numChanges;           // @40 (+4 pad -> 48)
+    uint64_t updateActorDesc;  // @16 PxgUpdateActorDataDesc*        (device copy, mUpdated @48)
+    uint64_t boundsArray;      // @24 const PxBounds3*               (mapped PxgBoundsArray::mBounds)
+    uint64_t transformsArray;  // @32 const PxsCachedTransform*      (mapped PxsTransformCache)
+    uint64_t changes;          // @40 const PxgBoundTransformUpdate* (mapped staging, 8 B per record)
+    uint numChanges;           // @48 (+4 pad -> 56)
 };
 
 [[vk::push_constant]]
@@ -726,6 +730,12 @@ void mergeTransformCacheAndBoundArrayChanges(uint3 dispatchThreadId : SV_Dispatc
         {
             mergeCopyBounds(gMergeTcBound.deviceBounds, indexTo, gMergeTcBound.deviceBounds, indexFrom);
             mergeCopyTransform(gMergeTcBound.deviceTransforms, indexTo, gMergeTcBound.deviceTransforms, indexFrom);
+            // 5.12: a re-inserted bound (e.g. a kinematic/dynamic switch) carries its
+            // direct-GPU-API mUpdated flag from indexFrom to indexTo, and the source
+            // flag is reset.
+            Ptr<uint> updated = Ptr<uint>((Ptr<PxgUpdateActorDataDescGpu>(gMergeTcBound.updateActorDesc))[0].mUpdated);
+            updated[indexTo] = updated[indexFrom];
+            updated[indexFrom] = 0u;
         }
     }
 }

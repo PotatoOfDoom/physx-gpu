@@ -103,11 +103,7 @@ void solverDescProbe(uint3 dtid : SV_DispatchThreadID)
     o[i++] = uint64_t(d.nbPrevExceededThresholdElements);
     o[i++] = uint64_t(d.nbForceChangeElements);
     o[i++] = uint64_t(d.maxLinksPerArticulation);
-    // Dy::ErrorAccumulator contactErrorAccumulator (float members mirrored as
-    // raw bits for the CAS-loop atomics in solveWholeIslandTGS)
-    o[i++] = uint64_t(d.contactErrorAccumulator_mErrorSumOfSquares);
-    o[i++] = uint64_t(uint(d.contactErrorAccumulator_mCounter));
-    o[i++] = uint64_t(d.contactErrorAccumulator_mMaxError);
+    // (5.12 removed the trailing Dy::ErrorAccumulator contactErrorAccumulator)
 
     // ---- PxgSolverSharedDesc<IterativeSolveDataTGS> ----
     o[i++] = s.blockCurrentFrictionPatches;
@@ -142,14 +138,20 @@ void solverDescProbe(uint3 dtid : SV_DispatchThreadID)
     o[i++] = s.iter_frictions;
     o[i++] = s.iter_artiResponse;
 
-    // ---- PxgIslandContext[2]: fields + the 68-byte array stride ----
+    // ---- PxgIslandContext[2]: fields + the 84-byte array stride ----
     o[i++] = uint64_t(isl[0].mBodyStartIndex);
     o[i++] = uint64_t(isl[0].mBodyCount);
     o[i++] = uint64_t(isl[0].mArticulationCount);
     o[i++] = uint64_t(uint(isl[0].mNumVelocityIterations));
     o[i++] = uint64_t(isl[0].mStaticRigidBatchCount);
-    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficient));
+    // 5.12: Dy::BiasCoefficientCollection mBiasCoefficients (20 bytes @64)
+    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficients.rigidContact));
+    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficients.joint));
+    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficients.articulation));
+    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficients.particle));
+    o[i++] = uint64_t(asuint(isl[0].mBiasCoefficients.deformableRigidAttachment));
     o[i++] = uint64_t(isl[1].mBodyStartIndex);
     o[i++] = uint64_t(isl[1].mBodyCount);
-    o[i++] = uint64_t(asuint(isl[1].mBiasCoefficient));
+    o[i++] = uint64_t(asuint(isl[1].mBiasCoefficients.rigidContact));
+    o[i++] = uint64_t(asuint(isl[1].mBiasCoefficients.deformableRigidAttachment));
 }

@@ -43,6 +43,7 @@
 #include "PxgSolverCoreDesc.h"
 #include "PxgIslandContext.h"
 
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -132,9 +133,9 @@ PXG_TEST(solverDescLayout)
     d.nbPrevExceededThresholdElements = sent32(u++);
     d.nbForceChangeElements = sent32(u++);
     d.maxLinksPerArticulation = sent32(u++);
-    d.contactErrorAccumulator.mErrorSumOfSquares = sentF(f++);
-    d.contactErrorAccumulator.mCounter = -55667788; // PxI32, negative on purpose
-    d.contactErrorAccumulator.mMaxError = sentF(f++);
+    // 5.12: the trailing Dy::ErrorAccumulator contactErrorAccumulator is gone
+    static_assert(sizeof(PxgSolverCoreDesc) == 304, "5.12 PxgSolverCoreDesc size");
+    static_assert(offsetof(PxgSolverCoreDesc, maxLinksPerArticulation) == 300, "maxLinksPerArticulation @300");
 
     // ---- the REAL engine PxgSolverSharedDesc<IterativeSolveDataTGS> ----
     PxgSolverSharedDesc<IterativeSolveDataTGS> s;
@@ -172,7 +173,10 @@ PXG_TEST(solverDescLayout)
     s.iterativeData.artiResponse = reinterpret_cast<PxgArticulationBlockResponse*>(sent(p++));
 
     // ---- a REAL engine PxgIslandContext[2] (the probe reads element [1] to
-    // pin the 68-byte array stride) ----
+    // pin the 84-byte array stride) ----
+    static_assert(sizeof(PxgIslandContext) == 84, "5.12 PxgIslandContext size (BiasCoefficientCollection)");
+    static_assert(offsetof(PxgIslandContext, mBiasCoefficients) == 64, "mBiasCoefficients @64");
+    static_assert(sizeof(Dy::BiasCoefficientCollection) == 20, "BiasCoefficientCollection = 5 floats");
     PxgIslandContext isl[2];
     std::memset(isl, 0xEE, sizeof(isl));
     isl[0].mBodyStartIndex = sent32(u++);
@@ -180,10 +184,15 @@ PXG_TEST(solverDescLayout)
     isl[0].mArticulationCount = sent32(u++);
     isl[0].mNumVelocityIterations = -424242;
     isl[0].mStaticRigidBatchCount = sent32(u++);
-    isl[0].mBiasCoefficient = sentF(f++);
+    isl[0].mBiasCoefficients.rigidContact = sentF(f++);
+    isl[0].mBiasCoefficients.joint = sentF(f++);
+    isl[0].mBiasCoefficients.articulation = sentF(f++);
+    isl[0].mBiasCoefficients.particle = sentF(f++);
+    isl[0].mBiasCoefficients.deformableRigidAttachment = sentF(f++);
     isl[1].mBodyStartIndex = sent32(u++);
     isl[1].mBodyCount = sent32(u++);
-    isl[1].mBiasCoefficient = sentF(f++);
+    isl[1].mBiasCoefficients.rigidContact = sentF(f++);
+    isl[1].mBiasCoefficients.deformableRigidAttachment = sentF(f++);
 
     // Expected values in EXACTLY the probe kernel's write order.
     std::vector<uint64_t> expect;
@@ -231,9 +240,6 @@ PXG_TEST(solverDescLayout)
     expect.push_back(d.nbPrevExceededThresholdElements);
     expect.push_back(d.nbForceChangeElements);
     expect.push_back(d.maxLinksPerArticulation);
-    expect.push_back(bitsOf(d.contactErrorAccumulator.mErrorSumOfSquares));
-    expect.push_back(uint64_t(uint32_t(d.contactErrorAccumulator.mCounter)));
-    expect.push_back(bitsOf(d.contactErrorAccumulator.mMaxError));
 
     expect.push_back(uint64_t(s.blockCurrentFrictionPatches));
     expect.push_back(uint64_t(s.blockPreviousFrictionPatches));
@@ -272,10 +278,15 @@ PXG_TEST(solverDescLayout)
     expect.push_back(isl[0].mArticulationCount);
     expect.push_back(uint64_t(uint32_t(isl[0].mNumVelocityIterations)));
     expect.push_back(isl[0].mStaticRigidBatchCount);
-    expect.push_back(bitsOf(isl[0].mBiasCoefficient));
+    expect.push_back(bitsOf(isl[0].mBiasCoefficients.rigidContact));
+    expect.push_back(bitsOf(isl[0].mBiasCoefficients.joint));
+    expect.push_back(bitsOf(isl[0].mBiasCoefficients.articulation));
+    expect.push_back(bitsOf(isl[0].mBiasCoefficients.particle));
+    expect.push_back(bitsOf(isl[0].mBiasCoefficients.deformableRigidAttachment));
     expect.push_back(isl[1].mBodyStartIndex);
     expect.push_back(isl[1].mBodyCount);
-    expect.push_back(bitsOf(isl[1].mBiasCoefficient));
+    expect.push_back(bitsOf(isl[1].mBiasCoefficients.rigidContact));
+    expect.push_back(bitsOf(isl[1].mBiasCoefficients.deformableRigidAttachment));
 
     PxgDevicePtr dCore = 0, dShared = 0, dIsl = 0, dOut = 0;
     PXG_CHECK_MSG(shim.memAlloc(&dCore, sizeof(d)) == PxgResult::Success, "memAlloc core");

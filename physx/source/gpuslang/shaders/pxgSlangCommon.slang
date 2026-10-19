@@ -46,10 +46,17 @@ public static const uint PXG_BODY_FREEZE_THIS_FRAME     = 1u << 1;
 public static const uint PXG_BODY_UNFREEZE_THIS_FRAME   = 1u << 2;
 public static const uint PXG_BODY_ACTIVATE_THIS_FRAME   = 1u << 3;
 public static const uint PXG_BODY_DEACTIVATE_THIS_FRAME = 1u << 4;
-public static const uint PXG_BODY_DISABLE_GRAVITY_GPU   = 1u << 5;
-public static const uint PXG_BODY_SPECULATIVE_CCD       = 1u << 6;
-public static const uint PXG_BODY_ENABLE_GYROSCOPIC     = 1u << 7;
-public static const uint PXG_BODY_RETAIN_ACCELERATION   = 1u << 8;
+// 5.12 removed eDISABLE_GRAVITY_GPU (1 << 5; gravity is PxgBodySim::disableGravity)
+// and renamed the next three *_GPU (same bits).
+public static const uint PXG_BODY_SPECULATIVE_CCD_GPU   = 1u << 6;
+public static const uint PXG_BODY_ENABLE_GYROSCOPIC_GPU = 1u << 7;
+public static const uint PXG_BODY_RETAIN_ACCELERATION_GPU = 1u << 8;
+public static const uint PXG_BODY_SLEEPING_FLAGS        = PXG_BODY_FROZEN | PXG_BODY_FREEZE_THIS_FRAME |
+    PXG_BODY_UNFREEZE_THIS_FRAME | PXG_BODY_ACTIVATE_THIS_FRAME | PXG_BODY_DEACTIVATE_THIS_FRAME;
+public static const uint PXG_BODY_GPU_FLAGS             = PXG_BODY_SPECULATIVE_CCD_GPU |
+    PXG_BODY_ENABLE_GYROSCOPIC_GPU | PXG_BODY_RETAIN_ACCELERATION_GPU |
+    (1u << 9) | (1u << 10); // | eFIRST_BODY_COPY_GPU | eVELOCITY_COPY_GPU (named in bodyUpdate / directApiBda)
+public static const uint PXG_BODY_FREE_FLAGS            = 0x1Fu << 11; // eFREE_FLAG_1..5 (1 << 11 .. 1 << 15)
 
 // PxRigidBodyFlag (public API flags written to PxgSolverBodyData::flags)
 public static const uint PXG_RB_FLAG_ENABLE_SPECULATIVE_CCD  = 1u << 3; // PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD

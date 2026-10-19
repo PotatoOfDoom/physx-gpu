@@ -26,12 +26,12 @@
 
 // Verification of solverDmaBack.slang on the ENGINE ABI (P5 Step 5):
 // dmaBackChangedElems (word-wise copy of the 40-byte force-change threshold
-// elements, source pointer + count read from a REAL PxgSolverCoreDesc) and
-// dmaConstraintResidual (gather the .w of each writeback's
-// angularImpulse_residual float4; 3-arg CUDA pack).  Both are compared
-// bit-exactly against C++ references; a preserved tail catches over-copying
+// elements, source pointer + count read from a REAL PxgSolverCoreDesc),
+// compared bit-exactly against a C++ reference; a preserved tail catches over-copying
 // and a short grid (fewer groups than words / 512) forces the copy loop to
-// iterate, exercising the blockDim * gridDim stride.
+// iterate, exercising the blockDim * gridDim stride.  (Its sibling
+// dmaConstraintResidual went with PhysX 5.8's removal of solver residual
+// reporting; 5.12 no longer has the kernel, and its fixture was deleted.)
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -112,62 +112,6 @@ PXG_TEST(solverDmaBack_changedElems)
     PXG_CHECK_MSG(mm == 0, "dmaBackChangedElems: %zu mismatches", mm);
 
     for (PxgDevicePtr p : { dSrc, dDst, dDesc }) shim.memFree(p);
-}
-
-PXG_TEST(solverDmaBack_constraintResidual)
-{
-    using physx::gpuslang::PxgCudaShim;
-    using physx::gpuslang::PxgKernelDef;
-    using physx::gpuslang::PxgDevicePtr;
-    using physx::gpuslang::PxgResult;
-
-    std::mt19937 rng(38020);
-    const uint32_t count = 4000;
-
-    // PxgConstraintWriteback = { float4 linearImpulse_broken; float4 angularImpulse_residual; }
-    std::vector<float> writebacks(8 * count);
-    auto rf = [&]() { return float(int(rng() % 20000) - 10000) * 0.01f; };
-    for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t c = 0; c < 8; ++c) writebacks[8 * i + c] = rf();
-
-    std::vector<float> residInit(count + 500, -123.f); // preserve a tail
-
-    PxgSlangComputeDevice* dev = testDevice();
-    const PxgKernelDef manifest[] = { { "solverDmaBack.spv", "dmaConstraintResidual", 24u, 0 } };
-    PxgCudaShim shim(dev, manifest, 1, &dmaBackLoader);
-
-    PxgDevicePtr dWb = 0, dResid = 0;
-    shim.memAlloc(&dWb, writebacks.size() * 4);
-    shim.memAlloc(&dResid, residInit.size() * 4);
-    if (!dWb || !dResid)
-    {
-        std::printf("  NOTE: no BDA -> skip\n");
-        return;
-    }
-    shim.memcpyHtoD(dWb, writebacks.data(), writebacks.size() * 4);
-    shim.memcpyHtoD(dResid, residInit.data(), residInit.size() * 4);
-
-    // the engine's exact param pack: (writebacks*, residuals*, PxU32 count) ->
-    // 24-byte blob (count @16, tail rounded to the 8-alignment); grid = the
-    // engine's ceil(count / 256)
-    struct { uint64_t wb, resid; uint32_t count, pad; } prm = { dWb, dResid, count, 0 };
-    static_assert(sizeof(prm) == 24, "dmaConstraintResidual blob is 24 bytes");
-    const uint32_t GROUPS = (count + 255) / 256; // one thread per constraint
-    PXG_CHECK_MSG(shim.launchKernel(0, GROUPS, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
-                  "launch dmaConstraintResidual");
-    shim.streamSynchronize();
-
-    std::vector<float> g(count + 500);
-    shim.memcpyDtoH(g.data(), dResid, g.size() * 4);
-    size_t mm = 0;
-    for (uint32_t i = 0; i < count + 500; ++i)
-    {
-        const float exp = (i < count) ? writebacks[8 * i + 7] : -123.f; // angularImpulse_residual.w
-        if (g[i] != exp) ++mm;
-    }
-    PXG_CHECK_MSG(mm == 0, "dmaConstraintResidual: %zu mismatches", mm);
-
-    for (PxgDevicePtr p : { dWb, dResid }) shim.memFree(p);
 }
 
 } // namespace

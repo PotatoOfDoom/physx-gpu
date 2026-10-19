@@ -179,7 +179,10 @@ void artiTGSJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_G
     const float recipStepDt = sharedDesc[0].stepInvDtF32;
     const float recipSimDt = sharedDesc[0].invDtF32;
     const float lengthScale = sharedDesc[0].lengthScale;
-    const float biasCoefficient = prepDesc[0].biasCoefficient;
+    // 5.12: the prepare desc carries Dy::BiasCoefficientCollection; the
+    // articulation joint prep reads biasCoefficients.joint (the erp formula
+    // below is still 5.6.1's -- articulation area)
+    const float biasCoefficient = prepDesc[0].biasCoefficients.joint;
 
     headers[hdi].writeBackOffset[lane] = constants[uniqueIndex].mConstraintWriteBackIndex;
 
@@ -402,15 +405,14 @@ struct AjpPgs1DCon
     uint pad0[32];                 // 2176
 }                                  // = 2304
 
-struct AjpPgs1DMod
+struct AjpPgs1DMod           // PxgBlockSolverConstraint1DMod (5.12: residual[32] removed)
 {
     float ang0Writeback[96]; // 0: PxVec3[32], tightly packed
     float appliedForce[32];  // 384
     uint flags[32];          // 512
-    float residual[32];      // 640
-    float coeff0[32];        // 768
-    float coeff1[32];        // 896
-}                            // = 1024
+    float coeff0[32];        // 640
+    float coeff1[32];        // 768
+}                            // = 896
 
 // u16-lane store into the packed rowCounts/breakable words (the sub-word
 // store hazard: four u8 / two u16 lanes share a word across subgroups)
@@ -656,7 +658,6 @@ void artiJointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_Grou
         mods[c].coeff0[lane] = coeff0;
         mods[c].coeff1[lane] = coeff1;
         mods[c].appliedForce[lane] = 0.0f;
-        mods[c].residual[lane] = 0.0f;
 
         // trap P6: flags fresh from zero -- the pre-call raises are dead
         uint rowFlags = 0u;

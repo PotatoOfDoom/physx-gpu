@@ -69,14 +69,9 @@
 //     (PXG_NOCONTRACT_SHADERS) so the gravity/damping mul+add chains match the
 //     -ffp-contract=off CPU reference bit-for-bit.
 //
-// P9.95 -- the fifth entry, sb_copyOrApplySoftBodyDataDEPRECATED (end of file), is the
-// word copy behind the deprecated PxScene::copySoftBodyData / applySoftBodyData.  Its host
-// pack pushes the 32-byte PxgTypedCudaBuffer<PxgSoftBody> OBJECT as argument 0
-// (PxgSoftBodyCore.cpp:3134), not a device pointer, so its push block is 80 bytes and it
-// reads the object's first 8 bytes -- the RAW mPtr -- as the descriptor base, exactly as
-// CUDA does.  It moves uint words only (no float op), and every table read plus the inner
-// load is clamped (P9.23 / P9.49) so the lanes llvmpipe executes masked never follow an
-// unbounded pointer.  Details at the entry.
+// (P9.95's fifth entry, sb_copyOrApplySoftBodyDataDEPRECATED -- the word copy behind the
+// deprecated PxScene::copySoftBodyData / applySoftBodyData -- went with that API in PhysX
+// 5.12, which has no such kernel.)
 
 import pxgSlangSoftBodyDesc;
 
@@ -556,109 +551,4 @@ void sb_sleeping(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_Grou
     const uint nbWords = (gSleep.numActiveSoftBodies + 31u) / 32u;
     if (groupThreadId.x < SB_STEP_NUM_WARPS && (startIdx + groupThreadId.x) < nbWords)
         stateChangedMask[startIdx + groupThreadId.x] = gSbSleepMasks[groupThreadId.x];
-}
-
-// ---------------------------------------------------------------------------
-// sb_copyOrApplySoftBodyDataDEPRECATED (softBodyGM.cu:3094) -- P9.95
-// ---------------------------------------------------------------------------
-// Driven ONLY by PxScene::copySoftBodyData / applySoftBodyData (PxScene.h:1761/:1776)
-// -> PxgSoftBodyCore::copyOrApplySoftBodyDataDEPRECATED (PxgSoftBodyCore.cpp:3118), never
-// inside simulate().  Pure 32-bit word moves (uint, never float): -0, NaN payloads and
-// denormals survive by construction.
-//
-// ARGUMENT 0 IS A HOST OBJECT: PX_CUDA_KERNEL_PARAM(core->getSoftBodyBuffer()) pushes the
-// 32-byte PxgTypedCudaBuffer<PxgSoftBody> (PxgSoftBodyCore.cpp:3134).  CUDA drops sizes
-// (CudaContextManager.cpp:1165-1169) and reads the first 8 bytes -- the RAW mPtr, not
-// getDevicePtr() -- as PxgSoftBody*.  Sized path: arg 0 @0..@31, blob 80 (kSbCopyOrApplyData).
-// The shim gates on the ROW's size, never on this struct (PhysXGpuVulkan.cpp:178-182), so
-// the host words @8..@31 are declared for discipline: a shorter struct would launch and
-// misread, not be refused.
-//
-// P9.23/P9.49 (llvmpipe loads masked lanes UNPREDICATED): every table read uses the clamped
-// tableSection, so an overshoot lane (section >= n) reads section n-1's entries -- valid
-// pointers -- instead of whatever lies past the user's tables; an empty section (end == 0)
-// loads from a known-valid base.  Both are value-identical for every lane that stores.
-// They are DEFENSIVE, not measured: on this llvmpipe build (LLVM 20.1.2, 256-bit) the
-// masked lanes of this kernel's guard block and loop were never dereferenced -- the
-// unclamped mutant (tableSection = sectionIndex) stayed 3/3 green with every table entry
-// past n made a non-canonical descriptor pointer, and a NULL source in an empty section
-// never faulted.  No fixture can show the clamps are needed; they stay because the
-// P9.23/P9.49 hazard is real elsewhere and costs nothing here.
-//
-// Deviations and notes:
-//   - tps == 0 (maxSize 0) is not guarded, as in CUDA: the host grid is then 0 and the
-//     bridge records an EMPTY-GRID no-op where CUDA returns INVALID_VALUE
-//     (CudaContextManager.cpp:1160-1162).  The division never executes.
-//   - With the clamp, an overshoot lane that passed the guard would only repeat section
-//     n-1's identical stores, so the guard is no longer what keeps memory safe; it is kept
-//     because CUDA has it (testSoftBodySim.cpp softBodySimCopyApplyTraps).
-//   - Rounding the byte size up to words writes up to 3 bytes past dataSizes, as CUDA does
-//     (upstream, documented; the size-6 fixture case pins it).
-struct CopyApplyParams
-{
-    uint64_t softbodiesRaw;          // @0   PxgCudaBuffer::mPtr (raw; CUDA's PxgSoftBody*)
-    uint64_t hostHeapAllocator;      // @8   PxgCudaBuffer::mHeapMemoryAllocator (host; unread)
-    uint64_t hostSize;               // @16  PxgCudaBuffer::mSize (unread)
-    uint hostStatGroup;              // @24  PxgCudaBuffer::mStatGroup (unread)
-    uint hostObjectTailPad;          // @28  object tail pad -> sizeof 32 (unread)
-    uint dataIndex;                  // @32  PX_OFFSET_OF_RT(PxgSoftBody, field) / 8
-    uint _pad36;                     // @36
-    uint64_t softBodyIndices;        // @40  const PxU32*
-    uint softBodyIndicesSize;        // @48
-    uint _pad52;                     // @52
-    uint64_t data;                   // @56  PxU32** (device array of device pointers)
-    uint64_t dataSizes;              // @64  const PxU32* (bytes; host calls it dataEndIndices)
-    uint threadsPerSoftBody;         // @72
-    uint applyDataToSoftBodies;      // @76  -> 80
-}
-[[vk::push_constant]]
-ConstantBuffer<CopyApplyParams> gCopy;
-
-// PxgSoftBodyCore.cpp:3128 threadsPerBlock; the bridge forwards only the grid.
-static const uint SB_COPY_BLOCK = 128u;
-// sizeof(PxgSoftBody) == array stride (pinned by softBodySimDescLayout).
-static const uint64_t SB_DESC_STRIDE = 432ull;
-
-[shader("compute")]
-[numthreads(128, 1, 1)]
-void sb_copyOrApplySoftBodyDataDEPRECATED(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
-{
-    const uint threadsPerSoftBody = gCopy.threadsPerSoftBody;
-    const uint globalThreadIndex = groupThreadId.x + SB_COPY_BLOCK * groupId.x;   // :3104
-    const uint sectionIndex = globalThreadIndex / threadsPerSoftBody;             // :3105
-    // P9.23: n >= 1 whenever the grid is nonzero (grid = ceil(n*tps/128)).
-    const uint tableSection = min(sectionIndex, gCopy.softBodyIndicesSize - 1u);
-
-    if (sectionIndex < gCopy.softBodyIndicesSize)                                 // :3108
-    {
-        const uint softBodyIndex = Ptr<uint>(gCopy.softBodyIndices)[tableSection]; // :3110
-        const uint64_t softbodyAddr = gCopy.softbodiesRaw + uint64_t(softBodyIndex) * SB_DESC_STRIDE; // :3111
-        const uint64_t fieldPtr = Ptr<uint64_t>(softbodyAddr)[gCopy.dataIndex];    // ((void**)&softbody)[dataIndex]
-        const uint64_t userPtr = Ptr<uint64_t>(gCopy.data)[tableSection];          // data[sectionIndex]
-
-        uint64_t dest;
-        uint64_t source;
-        if (gCopy.applyDataToSoftBodies != 0u)                                     // :3115
-        {
-            dest = fieldPtr;
-            source = userPtr;
-        }
-        else
-        {
-            source = fieldPtr;
-            dest = userPtr;
-        }
-
-        uint index = globalThreadIndex % threadsPerSoftBody;                       // :3126
-        const uint end = (Ptr<uint>(gCopy.dataSizes)[tableSection] + 4u - 1u) / 4u; // :3127 (PxU32 wrap kept)
-        // P9.49: a lane may start past end; its masked load is clamped to the last word.  An
-        // empty section has no last word, so it loads from the dataSizes table (valid, >= 4 B).
-        const uint lastWord = (end == 0u) ? 0u : end - 1u;
-        const uint64_t loadBase = (end == 0u) ? gCopy.dataSizes : source;
-        while (index < end)                                                        // :3128
-        {
-            Ptr<uint>(dest)[index] = Ptr<uint>(loadBase)[min(index, lastWord)];    // :3130
-            index += threadsPerSoftBody;                                           // :3131
-        }
-    }
 }

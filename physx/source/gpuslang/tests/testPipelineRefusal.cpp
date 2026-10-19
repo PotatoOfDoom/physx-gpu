@@ -722,7 +722,7 @@ PXG_TEST(pipelineRefusal_reflect)
         { "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", 176, 0 },
         { "psDiffuseBuffers.spv", "ps_updateUnsortedDiffuseArrayLaunch", 24, 4096 },
         // F3: per ENTRY, not the module's 40448 the layer reports for every entry.
-        { "solverTGS.spv", "solveWholeIslandTGS", 32, 31744 },
+        { "solverTGS.spv", "solveWholeIslandTGS", 32, 30720 },   // 5.12: the 1024 B residual-reduction scratch went with residual reporting (5.6.1: 31744)
         { "solverTGS.spv", "writeBackBodiesTGS", 24, 0 },
         { "p98PushPad.spv", "pushPadEcho", 64, 0 },
     };
@@ -972,7 +972,7 @@ PXG_TEST(pipelineRefusal_deviceLimits)
                           rl.maxComputeWorkGroupSize[0], pl.maxComputeWorkGroupSize[0]);
         }
     }
-    if (rl.maxPushConstantsSize < 176 || rl.maxComputeSharedMemorySize < 31744 ||
+    if (rl.maxPushConstantsSize < 176 || rl.maxComputeSharedMemorySize < 30720 ||
         rl.maxComputeWorkGroupInvocations < 1024 || rl.maxComputeWorkGroupSize[0] < 1024)
     {
         std::printf("  NOTE: this device's limits are below the probe kernels' -> skip the lowered-limit half\n");
@@ -1002,9 +1002,9 @@ PXG_TEST(pipelineRefusal_deviceLimits)
                   "the hooks must lower the limits (push %u, shared %u, invocations %u)", l.maxPushConstantsSize,
                   l.maxComputeSharedMemorySize, l.maxComputeWorkGroupInvocations);
 
-    // Shared memory: 31744 B > 16384 refused; its module sibling with 0 B builds.
+    // Shared memory: 30720 B > 16384 refused; its module sibling with 0 B builds.
     PXG_CHECK_MSG(build(dev, "solverTGS.spv", "solveWholeIslandTGS", 32) == 0,
-                  "31744 B of groupshared must be refused under a 16384 B limit");
+                  "30720 B of groupshared must be refused under a 16384 B limit");
     const PxgPipelineHandle wb = build(dev, "solverTGS.spv", "writeBackBodiesTGS", 24);
     PXG_CHECK_MSG(wb != 0, "writeBackBodiesTGS (0 B, same module) must build: the limit is per entry");
     // Push: the engine row pushes 104 of a 176-byte block -- over 128, refused.
@@ -1060,7 +1060,7 @@ PXG_TEST(pipelineRefusal_deviceLimits)
     PXG_CHECK_MSG(build(devB, "aggregateBda.spv", "addAggPairsStage1", 16) == 0,
                   "a 1024 x 1 x 1 workgroup must be refused under a 512 per-dimension limit");
     PXG_CHECK_MSG(build(devB, "solverTGS.spv", "solveWholeIslandTGS", 32) == 0,
-                  "31744 B of groupshared must be refused under the environment's 20000 B");
+                  "30720 B of groupshared must be refused under the environment's 20000 B");
     const PxgPipelineHandle diffuse = build(devB, "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch", 104);
     PXG_CHECK_MSG(diffuse != 0, "a 176 B push block and a 256 x 1 x 1 workgroup fit this device");
     if (diffuse)

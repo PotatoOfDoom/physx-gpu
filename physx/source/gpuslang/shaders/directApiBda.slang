@@ -116,6 +116,7 @@ static const uint W_BODY2ACTOR = 36;             // PxAlignedTransform (8 words)
 static const uint W_INTERNAL_FLAGS = 45;         // internalFlags
 static const uint MAX_LIN_VEL_UINT4 = 2;         // PXG_BODY_SIM_MAX_LIN_VEL_IND
 static const uint SIZE_WITHOUT_ACCEL_UINT4 = 12; // PXG_BODY_SIM_SIZE_WITHOUT_ACCELERATION
+static const uint PREV_VEL_WORDS = 8;            // PxgBodySimVelocities { float4 lin; float4 ang; } = 32 bytes
 
 // PxsRigidBody internal flags used by the direct-API DMA
 static const uint PXG_BODY_FIRST_BODY_COPY_GPU = 1u << 9;
@@ -204,6 +205,9 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     Ptr<uint> gNewData = Ptr<uint>(scDesc.mNewBodySim);
     Ptr<uint> gBodySimPool = Ptr<uint>(scDesc.mBodySimBufferDeviceData);
+    // 5.12: previous velocities for the acceleration computation (null when
+    // eENABLE_BODY_ACCELERATIONS is off)
+    const uint64_t gPrevVelocities = scDesc.mPrevVelocitiesBuffer;
     const uint totalNbBodies = scDesc.mNbNewBodies;
 
     for (uint i = dispatchThreadId.x; i < totalNbBodies; i += BLOCK_SIZE * WorkgroupCount().x)
@@ -216,11 +220,28 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
         const bool firstTransfer = (internalFlags & PXG_BODY_FIRST_BODY_COPY_GPU) != 0;
         const bool copyVel = (internalFlags & PXG_BODY_VELOCITY_COPY_GPU) != 0;
 
+        // 5.12: the lane holding PXG_BODY_SIM_FLAGS_IND clears the transfer flags
+        // (eFIRST_BODY_COPY_GPU | eVELOCITY_COPY_GPU) in data.y before any store,
+        // so they never persist on the device; both copy paths below store this
+        // word instead of the raw one.
+        const uint storedFlags = internalFlags & ~(PXG_BODY_FIRST_BODY_COPY_GPU | PXG_BODY_VELOCITY_COPY_GPU);
+
         if (firstTransfer)
         {
             // on the first DMA, we copy the transform data the user set up on CPU
             for (uint w = 0; w < BODYSIM_WORDS; ++w)
-                gBodySimPool[dstBase + w] = gNewData[srcBase + w];
+                gBodySimPool[dstBase + w] = (w == W_INTERNAL_FLAGS) ? storedFlags : gNewData[srcBase + w];
+
+            // 5.12: new bodies also seed their previous velocities with the initial
+            // velocities (uint4 0 = linearVelocityXYZ_inverseMassW, uint4 1 =
+            // angularVelocityXYZ_maxPenBiasW, both whole float4s), so the first
+            // frame's accelerations are correct.
+            if (gPrevVelocities != 0)
+            {
+                Ptr<uint> prev = Ptr<uint>(gPrevVelocities);
+                for (uint w = 0; w < PREV_VEL_WORDS; ++w)
+                    prev[bodyIndex * PREV_VEL_WORDS + w] = gNewData[srcBase + w];
+            }
             continue;   // CUDA: `continue` inside the grid-stride loop, not `return`
         }
 
@@ -241,7 +262,8 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
             else
             {
                 for (uint c = 0; c < 4; ++c)
-                    gBodySimPool[dstBase + w0 + c] = gNewData[srcBase + w0 + c];
+                    gBodySimPool[dstBase + w0 + c] =
+                        (w0 + c == W_INTERNAL_FLAGS) ? storedFlags : gNewData[srcBase + w0 + c];
             }
         }
 
@@ -386,54 +408,41 @@ static const uint W_ANGVEL = 4;            // angularVelocityXYZ_maxPenBiasW
 static const uint W_INV_INERTIA = 12;      // inverseInertiaXYZ_contactReportThresholdW
 static const uint W_EXT_LIN_ACCEL = 48;    // externalLinearAcceleration
 static const uint W_EXT_ANG_ACCEL = 52;    // externalAngularAcceleration
-static const uint PREV_VEL_WORDS = 8;      // PxgBodySimVelocities { float4 lin; float4 ang; } = 32 bytes
 
 // ---------------------------------------------------------------------------
-// The acceleration getters (updateBodiesAndShapes.cu:1063 / :1086).
+// The acceleration getters (updateBodiesAndShapes.cu getRigidDynamicLinear- /
+// AngularAcceleration).
 //
-// ENGINE launch pack, identical for both
-// (PxgSimulationCore::getRigidDynamicData, PxgSimulationCore.cpp:2806 / :2827):
+// 5.12 turned them into plain gathers from the PxgRigidBodyAcceleration buffer
+// that computeRigidBodyAccelerations (below) fills once per step.  ENGINE launch
+// pack, identical for both (PxgSimulationCore::getRigidDynamicData):
 //   (PxVec3* data, const PxRigidDynamicGPUIndex* gpuIndices,
-//    const PxgBodySim* bodySimBufferDeviceData,
-//    const PxgBodySimVelocities* prevVelocities, PxU32 nbElements, float oneOverDt)
-// -> argSizes {8,8,8,8,4,4} = a 40-byte blob with no padding.
-//
-// prevVelocities is dereferenced UNCONDITIONALLY, exactly as in the CUDA: the
-// host only PX_ASSERTs it (PxgSimulationCore.cpp:2804 / :2825) and it is null
-// whenever eENABLE_BODY_ACCELERATIONS is off (see RUNTIME_STATUS P9.93).
+//    const PxgRigidBodyAcceleration* accelerations, PxU32 nbElements)
+// -> argSizes {8,8,8,4} = 28, rounded to a 32-byte blob.  (5.6.1 computed the
+// acceleration here from bodySim and prevVelocities: {8,8,8,8,4,4} = 40 B.)
 // ---------------------------------------------------------------------------
 struct RigidGetAccelParams
 {
-    uint64_t data;           // @0  PxVec3*  (user device memory)
-    uint64_t gpuIndices;     // @8  const PxRigidDynamicGPUIndex*
-    uint64_t bodySims;       // @16 const PxgBodySim*
-    uint64_t prevVelocities; // @24 const PxgBodySimVelocities*
-    uint nbElements;         // @32
-    float oneOverDt;         // @36 -> 40
+    uint64_t data;          // @0  PxVec3*  (user device memory)
+    uint64_t gpuIndices;    // @8  const PxRigidDynamicGPUIndex*
+    uint64_t accelerations; // @16 const PxgRigidBodyAcceleration*
+    uint nbElements;        // @24 (+4 pad -> 32)
 };
 
 [[vk::push_constant]]
 ConstantBuffer<RigidGetAccelParams> gRigidGetAccel;
 
-// (vel - prevVelocities[index].vel) * oneOverDt, all four lanes in the CUDA, of
-// which PxLoad3 keeps x, y, z.  `word` selects linear (0) or angular (4) in both
-// the body sim and the PxgBodySimVelocities record -- the two structs put the
-// two velocities at the same word offsets.
+// data[i] = accelerations[index].linear / .angular: a PxVec3 copy, moved as raw
+// words (the P9.93 convention for pure moves).  `word` is 0 (linear) or 4
+// (angular) in the 8-word PxgRigidBodyAcceleration record.
+static const uint RB_ACCEL_WORDS = 8;
 void rigidGetAcceleration(uint i, uint word)
 {
     const uint index = (Ptr<uint>(gRigidGetAccel.gpuIndices))[i];
-    Ptr<uint> pool = Ptr<uint>(gRigidGetAccel.bodySims);
-    Ptr<uint> prev = Ptr<uint>(gRigidGetAccel.prevVelocities);
-
-    const float4 vel = loadF4Ptr(pool, index * BODYSIM_WORDS + word);
-    const float4 prevVel = loadF4Ptr(prev, index * PREV_VEL_WORDS + word);
-    const float4 delta = vel - prevVel;
-    const float4 accel = delta * gRigidGetAccel.oneOverDt;
-
-    Ptr<float> data = Ptr<float>(gRigidGetAccel.data);
-    data[i * 3 + 0] = accel.x;
-    data[i * 3 + 1] = accel.y;
-    data[i * 3 + 2] = accel.z;
+    Ptr<uint> accel = Ptr<uint>(gRigidGetAccel.accelerations);
+    Ptr<uint> data = Ptr<uint>(gRigidGetAccel.data);
+    for (uint c = 0; c < 3; ++c)
+        data[i * 3 + c] = accel[index * RB_ACCEL_WORDS + word + c];
 }
 
 // mirrors getRigidDynamicLinearAcceleration()
@@ -444,7 +453,7 @@ void getRigidDynamicLinearAcceleration(uint3 dispatchThreadId : SV_DispatchThrea
     const uint i = dispatchThreadId.x;
     if (i >= gRigidGetAccel.nbElements)
         return;
-    rigidGetAcceleration(i, W_LINVEL);
+    rigidGetAcceleration(i, 0u);
 }
 
 // mirrors getRigidDynamicAngularAcceleration()
@@ -455,7 +464,159 @@ void getRigidDynamicAngularAcceleration(uint3 dispatchThreadId : SV_DispatchThre
     const uint i = dispatchThreadId.x;
     if (i >= gRigidGetAccel.nbElements)
         return;
-    rigidGetAcceleration(i, W_ANGVEL);
+    rigidGetAcceleration(i, 4u);
+}
+
+// ---------------------------------------------------------------------------
+// computeRigidBodyAccelerations (updateBodiesAndShapes.cu, new in 5.12).
+//
+// Launched at the end of PxgSimulationCore::update() whenever the scene has
+// acceleration buffers (eENABLE_BODY_ACCELERATIONS), on the CPU-frontend path
+// too, through launchKernelThreadsAutoPackParameters:
+//   (PxgRigidBodyAcceleration* accelerations, const PxgBodySim* bodySims,
+//    const PxgBodySimVelocities* prevVelocities, PxU32 nbElements, float oneOverDt)
+// -> argSizes {8,8,8,4,4} = 32 bytes, block RIGID_DYNAMIC_COMPUTE_ACCELERATIONS
+// (256), grid ceil(nbElements / 256); a bare `if (index < nbElements)`.
+//
+// The CUDA computes all four lanes of (vel - prev) * oneOverDt and PxLoad3 keeps
+// x, y, z; the record's pad words are never written.
+// ---------------------------------------------------------------------------
+struct ComputeAccelParams
+{
+    uint64_t accelerations;  // @0  PxgRigidBodyAcceleration*
+    uint64_t bodySims;       // @8  const PxgBodySim*
+    uint64_t prevVelocities; // @16 const PxgBodySimVelocities*
+    uint nbElements;         // @24
+    float oneOverDt;         // @28 -> 32
+};
+
+[[vk::push_constant]]
+ConstantBuffer<ComputeAccelParams> gComputeAccel;
+
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void computeRigidBodyAccelerations(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint index = dispatchThreadId.x;
+    if (index >= gComputeAccel.nbElements)
+        return;
+
+    Ptr<uint> pool = Ptr<uint>(gComputeAccel.bodySims);
+    Ptr<uint> prev = Ptr<uint>(gComputeAccel.prevVelocities);
+    Ptr<float> accel = Ptr<float>(gComputeAccel.accelerations);
+
+    // Linear Acceleration
+    const float4 linVel = loadF4Ptr(pool, index * BODYSIM_WORDS + W_LINVEL);
+    const float4 deltaLinVel = linVel - loadF4Ptr(prev, index * PREV_VEL_WORDS + 0u);
+    const float4 linAccel = deltaLinVel * gComputeAccel.oneOverDt;
+    accel[index * RB_ACCEL_WORDS + 0u] = linAccel.x;
+    accel[index * RB_ACCEL_WORDS + 1u] = linAccel.y;
+    accel[index * RB_ACCEL_WORDS + 2u] = linAccel.z;
+
+    // Angular Acceleration
+    const float4 angVel = loadF4Ptr(pool, index * BODYSIM_WORDS + W_ANGVEL);
+    const float4 deltaAngVel = angVel - loadF4Ptr(prev, index * PREV_VEL_WORDS + 4u);
+    const float4 angAccel = deltaAngVel * gComputeAccel.oneOverDt;
+    accel[index * RB_ACCEL_WORDS + 4u] = angAccel.x;
+    accel[index * RB_ACCEL_WORDS + 5u] = angAccel.y;
+    accel[index * RB_ACCEL_WORDS + 6u] = angAccel.z;
+}
+
+// ---------------------------------------------------------------------------
+// copyRigidBodyVelocitiesToPrevious (updateBodiesAndShapes.cu, new in 5.12).
+//
+// Launched from PxgSimulationController::updateBodies() BEFORE copyToGpuBodySim,
+// so the snapshot is the end-of-last-frame state and a host setVelocity / addForce
+// between frames shows up in the next acceleration.  Auto-packed:
+//   (PxgBodySimVelocities* prevVelocities, const PxgBodySim* bodySims,
+//    PxU32 nbElements) -> argSizes {8,8,4} = 20, rounded to 24 bytes, block 256.
+// Whole float4 copies (w included), moved as raw words.
+// ---------------------------------------------------------------------------
+struct CopyPrevVelParams
+{
+    uint64_t prevVelocities; // @0  PxgBodySimVelocities*
+    uint64_t bodySims;       // @8  const PxgBodySim*
+    uint nbElements;         // @16 (+4 pad -> 24)
+};
+
+[[vk::push_constant]]
+ConstantBuffer<CopyPrevVelParams> gCopyPrevVel;
+
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void copyRigidBodyVelocitiesToPrevious(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint index = dispatchThreadId.x;
+    if (index >= gCopyPrevVel.nbElements)
+        return;
+
+    Ptr<uint> pool = Ptr<uint>(gCopyPrevVel.bodySims);
+    Ptr<uint> prev = Ptr<uint>(gCopyPrevVel.prevVelocities);
+    for (uint w = 0; w < 4u; ++w)
+        prev[index * PREV_VEL_WORDS + w] = pool[index * BODYSIM_WORDS + W_LINVEL + w];
+    for (uint w = 0; w < 4u; ++w)
+        prev[index * PREV_VEL_WORDS + 4u + w] = pool[index * BODYSIM_WORDS + W_ANGVEL + w];
+}
+
+// ---------------------------------------------------------------------------
+// getRigidDynamicForce / getRigidDynamicTorque (updateBodiesAndShapes.cu, new
+// in 5.12).  Launched only by PxgSimulationCore::ovdSnapshotRigidDynamicForces
+// (OmniPVD late attach), each pass followed by a stream synchronize, with the
+// same (data, gpuIndices, bodySims, nbElements) pack as the rigid getters above
+// -> RigidGetParams, {8,8,8,4} -> 32 bytes, block 256, bare guard.
+//
+//   force  = invMass > 0 ? externalLinearAcceleration * (1 / invMass) : 0
+//   torque = (R diag(inertia) R^T) * externalAngularAcceleration,
+//            inertia = invInertia > 0 ? 1 / invInertia : 0 per axis,
+//            R = PxMat33(body2World.q) (Cm::transformInertiaTensor)
+// ---------------------------------------------------------------------------
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void getRigidDynamicForce(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidGet.nbElements)
+        return;
+
+    const uint index = (Ptr<uint>(gRigidGet.gpuIndices))[i];
+    Ptr<uint> pool = Ptr<uint>(gRigidGet.bodySims);
+    const uint base = index * BODYSIM_WORDS;
+
+    const float invMass = asfloat(pool[base + W_LINVEL + 3]);
+    const float3 accel = loadF4Ptr(pool, base + W_EXT_LIN_ACCEL).xyz;
+    // PxVec3 operator*(PxReal): three multiplies by the one reciprocal
+    const float3 f = (invMass > 0.0f) ? (accel * (1.0f / invMass)) : float3(0.0f, 0.0f, 0.0f);
+
+    Ptr<float> data = Ptr<float>(gRigidGet.data);
+    data[i * 3 + 0] = f.x;
+    data[i * 3 + 1] = f.y;
+    data[i * 3 + 2] = f.z;
+}
+
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void getRigidDynamicTorque(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gRigidGet.nbElements)
+        return;
+
+    const uint index = (Ptr<uint>(gRigidGet.gpuIndices))[i];
+    Ptr<uint> pool = Ptr<uint>(gRigidGet.bodySims);
+    const uint base = index * BODYSIM_WORDS;
+
+    const float3 invInertia = loadF4Ptr(pool, base + W_INV_INERTIA).xyz;
+    const float3 inertia = float3(invInertia.x > 0.0f ? 1.0f / invInertia.x : 0.0f,
+                                  invInertia.y > 0.0f ? 1.0f / invInertia.y : 0.0f,
+                                  invInertia.z > 0.0f ? 1.0f / invInertia.z : 0.0f);
+    const float4 q = loadF4Ptr(pool, base + W_BODY2WORLD);
+    const PxgMat33 inertiaWorldSpace = transformInertiaTensor(inertia, mat33FromQuat(q));
+    const float3 t = mat33Transform(inertiaWorldSpace, loadF4Ptr(pool, base + W_EXT_ANG_ACCEL).xyz);
+
+    Ptr<float> data = Ptr<float>(gRigidGet.data);
+    data[i * 3 + 0] = t.x;
+    data[i * 3 + 1] = t.y;
+    data[i * 3 + 2] = t.z;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,13 +905,13 @@ struct D6JointGetParams
 ConstantBuffer<D6JointGetParams> gD6Get;
 
 // mirrors PxgConstraintWriteback (gpusolver/include/PxgConstraintWriteBack.h):
-// two float4, 32 bytes.  The `broken` flag rides in linearImpulse_broken.w and
-// the solver residual in angularImpulse_residual.w; the getters read .xyz only,
-// which is what PxLoad3 does.
+// two float4, 32 bytes.  The `broken` flag rides in linearImpulse_broken.w;
+// 5.12 renamed angularImpulse_residual to angularImpulse (.w is now always 0,
+// the residual is gone).  The getters read .xyz only, which is what PxLoad3 does.
 struct PxgConstraintWritebackGpu
 {
     float4 linearImpulse_broken;    // @0
-    float4 angularImpulse_residual; // @16
+    float4 angularImpulse;          // @16
 };                                  // = 32
 
 // PxgConstraintIdMapEntry (gpusimulationcontroller/include/PxgConstraintIdMap.h)
@@ -788,7 +949,7 @@ void d6JointGetForceOrTorque(uint i, bool wantTorque)
             const PxgConstraintWritebackGpu wb =
                 (Ptr<PxgConstraintWritebackGpu>(gD6Get.constraintWriteBackBuffer))[index];
 
-            const float4 row = wantTorque ? wb.angularImpulse_residual : wb.linearImpulse_broken;
+            const float4 row = wantTorque ? wb.angularImpulse : wb.linearImpulse_broken;
             out = row.xyz * gD6Get.oneOverDt;
         }
     }
@@ -809,7 +970,7 @@ void getD6JointForces(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 // mirrors getD6JointTorques(): getD6JointForceOrTorque<gExtractTorque>, i.e.
-//     data[i] = PxLoad3(constraintWriteBack.angularImpulse_residual) * oneOverDt;
+//     data[i] = PxLoad3(constraintWriteBack.angularImpulse) * oneOverDt;
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void getD6JointTorques(uint3 dispatchThreadId : SV_DispatchThreadID)

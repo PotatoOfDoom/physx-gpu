@@ -78,9 +78,17 @@ const uint32_t CFLAG_DISABLE_PREPROCESSING = 1u << 8;  // PxConstraintFlag::eDIS
 const uint32_t RB_KINEMATIC = 1u << 0;
 const uint32_t RB_SPEC_CCD = 1u << 4;
 
+// PxgSolverContactFlags, 5.12 numbering (5.6.1: ePER_POINT_FRICTION = 1 << 1,
+// eDISABLE_FRICTION = 1 << 2, eCOMPLIANT_ACCELERATION_SPRING = 1 << 3)
 const uint32_t SC_HAS_FORCE_THRESHOLDS = 1u << 0;
-const uint32_t SC_PER_POINT_FRICTION = 1u << 1;
-const uint32_t SC_DISABLE_FRICTION = 1u << 2;
+const uint32_t SC_HAS_TARGET_VELOCITY = 1u << 1;
+const uint32_t SC_DISABLE_STRONG_FRICTION = 1u << 2;
+const uint32_t SC_DISABLE_FRICTION = 1u << 3;
+
+// 5.12: the PGS preps read Dy::BiasCoefficientCollection from the prepare desc
+// (5.6.1: the literals 0.8f / 1.0f); non-default values pin the field reads.
+const float PGS_RIGID_CONTACT_BIAS = 0.75f;
+const float PGS_JOINT_BIAS = 0.9f;
 
 const uint32_t DY_SC_OUTPUT_FORCE = 1u << 1;
 const uint32_t DY_SC_KEEP_BIAS = 1u << 2;
@@ -286,11 +294,10 @@ struct BlockSolverConstraint1DMod
     float ang0Writeback[96];
     float appliedForce[32];
     uint32_t flags[32];
-    float residual[32];
     float coeff0[32];
     float coeff1[32];
 };
-static_assert(sizeof(BlockSolverConstraint1DMod) == 1024, "pgs jmod");
+static_assert(sizeof(BlockSolverConstraint1DMod) == 896, "pgs jmod (5.12: residual[32] removed)");
 
 // ---- TGS output ----
 struct TGSContactHeader
@@ -304,7 +311,7 @@ struct TGSContactHeader
     uint32_t forceWritebackOffset[32];
     float restitutionXdt[32];
     float cfm[32];
-    float p8[32];
+    float biasCoefficient[32]; // 5.6.1: p8
 };
 static_assert(sizeof(TGSContactHeader) == 2048, "tgs cheader");
 
@@ -374,9 +381,8 @@ struct TGSJointRowCon
     float angularErrorScale[32];
     uint32_t flags[32];
     float appliedForce[32];
-    float residual[32];
 };
-static_assert(sizeof(TGSJointRowCon) == 3328, "tgs jcon");
+static_assert(sizeof(TGSJointRowCon) == 3200, "tgs jcon (5.12: residual[32] removed)");
 
 struct PrepParams
 {

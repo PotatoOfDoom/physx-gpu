@@ -24,7 +24,7 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// solverDmaBack.slang — the two solver DMA-back glue kernels from
+// solverDmaBack.slang — the solver DMA-back glue kernel from
 // gpusolver/src/CUDA/solverMultiBlock.cu on the BDA ENGINE ABI (P5 Step 5):
 //   - dmaBackChangedElems: word-wise grid-stride copy of the force-change
 //     threshold-element array (produced by createForceChangeThresholdElements)
@@ -34,9 +34,9 @@
 //     element count are read from the PxgSolverCoreDesc on-device
 //     (forceChangeThresholdElements / nbForceChangeElements), exactly like
 //     the .cu; the destination is the host-mapped pointer the engine passes.
-//   - dmaConstraintResidual: gather each constraint's residual — the .w of
-//     PxgConstraintWriteback::angularImpulse_residual (the second float4) —
-//     into a flat residuals array, one thread per constraint.
+//   (Its 5.6.1 sibling dmaConstraintResidual went with the solver residual
+//   reporting PhysX removed in 5.8; 5.12 has no such kernel, so neither does
+//   this module.)
 //
 // Engine launch packs (PxgCudaSolverCore.cpp, sized PxCudaKernelParam form;
 // argSizes transcribed in bridge/PxgVulkanKernelAbi.cpp):
@@ -44,18 +44,9 @@
 //     -> {8,8} = 16-byte blob; grid = PxgKernelGridDim::DMA_CHANGED_ELEMS,
 //     block = PxgKernelBlockDim::DMA_CHANGED_ELEMS = 512; the CUDA
 //     blockDim.x * gridDim.x stride becomes 512 * WorkgroupCount().x.
-//   dmaConstraintResidual(const PxgConstraintWriteback*, PxReal*, PxU32 count)
-//     -> {8,8,4} = 24-byte blob (count @16, tail padded to 8); block = 256.
 
 import pxgSlangCommon;
 import pxgSlangSolverDesc;
-
-// mirrors PxgConstraintWriteback (32 bytes)
-struct PxgConstraintWriteback
-{
-    float4 linearImpulse_broken;
-    float4 angularImpulse_residual;
-}
 
 // Dy::ThresholdStreamElement is 40 bytes = 10 uint words
 static const uint ELEMENT_WORDS = 10u;
@@ -92,31 +83,4 @@ void dmaBackChangedElems(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
 
     for (uint i = globalThreadIdx; i < nbWords; i += stride)
         dst[i] = src[i];
-}
-
-// ---------------------------------------------------------------------------
-// dmaConstraintResidual (BDA engine ABI)
-// ---------------------------------------------------------------------------
-struct DmaConstraintResidualAbiParams
-{
-    uint64_t writebacks; // @0  const PxgConstraintWriteback*
-    uint64_t residuals;  // @8  PxReal* (host-mapped)
-    uint count;          // @16 (bytes 20..23 blob tail padding)
-    uint abiPad0;        // @20 (never read)
-}                        // = 24
-[[vk::push_constant]]
-ConstantBuffer<DmaConstraintResidualAbiParams> gDmaResidualAbi;
-
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void dmaConstraintResidual(uint3 dtid : SV_DispatchThreadID)
-{
-    if (dtid.x >= gDmaResidualAbi.count)
-        return;
-    if (gDmaResidualAbi.writebacks == 0 || gDmaResidualAbi.residuals == 0)
-        return;
-
-    Ptr<PxgConstraintWriteback> writebacks = Ptr<PxgConstraintWriteback>(gDmaResidualAbi.writebacks);
-    Ptr<float> residuals = Ptr<float>(gDmaResidualAbi.residuals);
-    residuals[dtid.x] = writebacks[dtid.x].angularImpulse_residual.w;
 }

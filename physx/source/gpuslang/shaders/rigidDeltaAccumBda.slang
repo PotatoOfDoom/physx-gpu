@@ -439,13 +439,27 @@ uint64_t rdaLoadRunEnds(uint tid, uint workIndex, uint tNumContacts, Ptr<uint64_
     return rigidId;
 }
 
+// addSpatialVector(PxgSpatialVectorBlock&, v, lane) (PxgArticulationBlockData.h):
+// a plain (non-atomic) mTopxyz_bx[lane] += (top.xyz, bottom.x),
+// mbyz[lane] += (bottom.yz).
+void rdaAddSpatialVector(uint64_t base, uint fieldOffset, uint lane, float3 top, float3 bottom)
+{
+    Ptr<float4> t = Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_SVB_TOPXYZ_BX));
+    Ptr<float2> b = Ptr<float2>(base + uint64_t(fieldOffset + PXG_AB_SVB_BYZ));
+    t[lane] = t[lane] + float4(top.x, top.y, top.z, bottom.x);
+    b[lane] = b[lane] + float2(bottom.y, bottom.z);
+}
+
 // ===========================================================================
 // 2. accumulateDeltaVRigidSecondLaunch (.cu:224-429)
 //    (const PxU64* sortedRigidIds, const PxU32* numContacts, const float4* deltaV,
 //     const float4* blockDeltaV, const PxU64* blockRigidId, PxgPrePrepDesc*,
 //     PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
-//     PxgSolverSharedDesc<IterativeSolveData>*, const bool isTGS)
-//    -> {8x9, 1} = 80 B (isTGS byte @72)
+//     float4* solverBodyVelPool, const bool isTGS)
+//    -> {8x9, 1} = 80 B (isTGS byte @72).  5.12 changed argument #9 from
+//    PxgSolverSharedDesc<IterativeSolveData>* to the solver body velocity pool
+//    itself (the launch sites in PxgFEMCore / PxgParticleSystemCore pass
+//    getGpuSolverCore()->getSolverBodyVelPoolDevPtr()); the pack size is the same.
 // ===========================================================================
 struct AccumSecondParams
 {
@@ -457,7 +471,7 @@ struct AccumSecondParams
     uint64_t prePrepDesc;    // @40
     uint64_t solverCoreDesc; // @48
     uint64_t artiCoreDesc;   // @56
-    uint64_t sharedDesc;     // @64
+    uint64_t solverBodyVelPool; // @64 float4* (5.6.1: PxgSolverSharedDesc<IterativeSolveData>*)
     uint isTGSWord;          // @72 (bool byte0) -> 80
 };
 [[vk::push_constant]]
@@ -484,10 +498,9 @@ void accumulateDeltaVRigidSecondLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     // hands real descriptors here; the pointers they hold are dereferenced only on
     // their own branch).
     Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(gS.solverCoreDesc);
-    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc = Ptr<PxgSolverSharedDescPGSGpu>(gS.sharedDesc);
     Ptr<PxgPrePrepDescGpu> prePrepDesc = Ptr<PxgPrePrepDescGpu>(gS.prePrepDesc);
     const uint accOffset = solverCoreDesc[0].accumulatedBodyDeltaVOffset;
-    Ptr<float4> solverBodyVelPool = Ptr<float4>(sharedDesc[0].iter_solverBodyVelPool);
+    Ptr<float4> solverBodyVelPool = Ptr<float4>(gS.solverBodyVelPool);
     const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
     Ptr<uint> solverBodyIndices = Ptr<uint>(prePrepDesc[0].solverBodyIndices);
     const uint64_t artiBlocks = artiPtrField(gS.artiCoreDesc, PXG_ARTI_CORE_ARTICULATION_BLOCKS);
@@ -536,7 +549,13 @@ void accumulateDeltaVRigidSecondLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
                     // linVel and angVel accumulate an IMPULSE here; stored negated.
                     const float3 top = float3(linVel.x * ratio, linVel.y * ratio, linVel.z * ratio);
                     const float3 bottom = float3(angVel.x * ratio, angVel.y * ratio, angVel.z * ratio);
-                    abStoreSpatialVector(link, PXG_AB_LINK_mScratchImpulse, artiIndexInBlock, -top, -bottom);
+                    // 5.12: accumulateRigidDeltas runs twice per iteration (attach pass +
+                    // contact pass), so the impulse is ADDED (addSpatialVector; 5.6.1
+                    // stored it) into both mScratchImpulse (link velocity propagation)
+                    // and mSolverSpatialImpulse (incomingJointForce readback).  Both are
+                    // reset at the iteration start in initialize() (forwardDynamic2.cu).
+                    rdaAddSpatialVector(link, PXG_AB_LINK_mScratchImpulse, artiIndexInBlock, -top, -bottom);
+                    rdaAddSpatialVector(link, PXG_AB_LINK_mSolverSpatialImpulse, artiIndexInBlock, -top, -bottom);
                 }
                 else
                 {
@@ -822,6 +841,17 @@ void accumulateDeltaVRigidSecondLaunchMultiStage2(uint3 gtid : SV_GroupThreadID,
                     rdaAtomicAddF32(topWords, artiIndexInBlock * 4u + 3u, -bottom.x);
                     rdaAtomicAddF32(byzWords, artiIndexInBlock * 2u + 0u, -bottom.y);
                     rdaAtomicAddF32(byzWords, artiIndexInBlock * 2u + 1u, -bottom.z);
+
+                    // 5.12: the same atomic add into mSolverSpatialImpulse (see
+                    // accumulateDeltaVRigidSecondLaunch above).
+                    Ptr<uint> sTopWords = Ptr<uint>(link + uint64_t(PXG_AB_LINK_mSolverSpatialImpulse + PXG_AB_SVB_TOPXYZ_BX));
+                    Ptr<uint> sByzWords = Ptr<uint>(link + uint64_t(PXG_AB_LINK_mSolverSpatialImpulse + PXG_AB_SVB_BYZ));
+                    rdaAtomicAddF32(sTopWords, artiIndexInBlock * 4u + 0u, -top.x);
+                    rdaAtomicAddF32(sTopWords, artiIndexInBlock * 4u + 1u, -top.y);
+                    rdaAtomicAddF32(sTopWords, artiIndexInBlock * 4u + 2u, -top.z);
+                    rdaAtomicAddF32(sTopWords, artiIndexInBlock * 4u + 3u, -bottom.x);
+                    rdaAtomicAddF32(sByzWords, artiIndexInBlock * 2u + 0u, -bottom.y);
+                    rdaAtomicAddF32(sByzWords, artiIndexInBlock * 2u + 1u, -bottom.z);
                 }
                 else
                 {

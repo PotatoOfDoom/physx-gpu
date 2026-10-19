@@ -79,9 +79,16 @@ static const uint H_INEQUALITY = 2049u;
 
 // PxgD6Axis bit positions (locked/limited bitmaps)
 static const uint AX_X = 0u, AX_Y = 1u, AX_Z = 2u, AX_TWIST = 3u, AX_SWING1 = 4u, AX_SWING2 = 5u;
-// PxgD6Drive bit positions (driving bitmap)
-static const uint DR_X = 0u, DR_Y = 1u, DR_Z = 2u, DR_SWING = 3u, DR_TWIST = 4u, DR_SLERP = 5u,
-                  DR_SWING1 = 6u, DR_SWING2 = 7u;
+// PxgD6Drive bit positions (driving bitmap).  5.12 removed the legacy eSWING
+// drive: eTWIST = 3, eSWING1 = 4, eSWING2 = 5, eSLERP = 6 (5.6.1: eSWING = 3,
+// eTWIST = 4, eSLERP = 5, eSWING1 = 6, eSWING2 = 7).
+static const uint DR_X = 0u, DR_Y = 1u, DR_Z = 2u, DR_TWIST = 3u, DR_SWING1 = 4u, DR_SWING2 = 5u,
+                  DR_SLERP = 6u;
+// drive data entries (constraintBlockPrePrep.cu gDrive*DataIndex): the slerp
+// drive shares the eSWING2 entry (5.6.1: swing1 shared the eSWING entry 3,
+// swing2 the eSLERP entry 5, twist was 4)
+static const uint DRIVE_DATA_TWIST = 3u, DRIVE_DATA_SWING1 = 4u, DRIVE_DATA_SWING2 = 5u,
+                  DRIVE_DATA_SLERP = DRIVE_DATA_SWING2;
 
 struct D6In
 {
@@ -414,13 +421,15 @@ void chAddLimit(inout C1D c, float4 lp)
         c.hint = H_INEQUALITY;
         c.m0 = lp.x;   // bounce.restitution
         c.m1 = lp.y;   // bounce.velocityThreshold
+        // 5.12: minImpulse = 0 only for hard (inequality) limits; 5.6.1 set it
+        // after the branch, so soft limits lost their -FLT_MAX lower bound
+        c.minI = 0.0f;
         if (c.geo > 0.0f)
             flags |= E_KEEPBIAS;
         if (lp.x > 0.0f)
             flags |= E_RESTITUTION;
     }
     c.flags = flags;
-    c.minI = 0.0f;
 }
 
 // PxgConstraintHelper::addDrive (L289-310); drv = (stiffness, damping, forceLimit, asuint(flags))
@@ -538,66 +547,59 @@ void d6SolveQ(const D6In s, uint useExtendedLimits, inout RowBuf buf, inout uint
     }
 
     // ---- angular drives ----
-    if ((driving & ((1u << DR_SLERP) | (1u << DR_SWING) | (1u << DR_TWIST) |
-                    (1u << DR_SWING1) | (1u << DR_SWING2))) != 0u)
+    if ((driving & ((1u << DR_SLERP) | (1u << DR_TWIST) | (1u << DR_SWING1) | (1u << DR_SWING2))) != 0u)
     {
         const float4 d2cA_q = dot4Q(cB2cAq, s.drvPq) > 0.0f ? s.drvPq : -s.drvPq;
-        const float3 v = s.angVel.xyz;
-        const float4 delta = quatMulQ(quatConjQ(d2cA_q), cB2cAq);
 
         if ((driving & (1u << DR_SLERP)) != 0u)
         {
+            const float4 delta = quatMulQ(quatConjQ(d2cA_q), cB2cAq);
+
             const float3 velTarget = -quatRotQ(cA2wq, s.angVel.xyz);
             float3 ax0 = float3(1, 0, 0), ax1 = float3(0, 1, 0), ax2 = float3(0, 0, 1);
-            if (s.drives[5].x != 0.0f)  // slerp drive stiffness
+            if (s.drives[DRIVE_DATA_SLERP].x != 0.0f)  // slerp drive stiffness
                 computeJacobianAxesQ(quatMulQ(cA2wq, d2cA_q), cB2wq, ax0, ax1, ax2);
             for (uint i = 0u; i < 3u; ++i)
             {
                 const float3 axis = i == 0u ? ax0 : (i == 1u ? ax1 : ax2);
                 const float de = i == 0u ? delta.x : (i == 1u ? delta.y : delta.z);
                 C1D c = chAngular(axis, -de, H_SLERP_SPRING, 0u);
-                chAddDrive(c, dot3Q(axis, velTarget), s.drives[5]);
+                chAddDrive(c, dot3Q(axis, velTarget), s.drives[DRIVE_DATA_SLERP]);
                 buf.r[buf.n] = c; buf.n += 1u;
             }
         }
         else
         {
+            const float3 v = s.angVel.xyz;
+
+            // 5.12 (CHANGELOG v5.7, drive targets beyond 90 degrees): the twist /
+            // swing error uses delta = cB2cA * conj(drivePose) (5.6.1 and the SLERP
+            // branch above: conj(drivePose) * cB2cA)
+            const float4 delta = quatMulQ(cB2cAq, quatConjQ(d2cA_q));
+
             if ((driving & (1u << DR_TWIST)) != 0u)
             {
-                C1D c = chAngular(amc0, -2.0f * delta.x, H_NONE, 0u);
-                chAddDrive(c, v.x, s.drives[4]);
+                const float errX = -2.0f * delta.x;
+                C1D c = chAngular(amc0, errX, H_NONE, 0u);
+                chAddDrive(c, v.x, s.drives[DRIVE_DATA_TWIST]);
                 buf.r[buf.n] = c; buf.n += 1u;
             }
 
-            if ((driving & (1u << DR_SWING)) != 0u)
-            {
-                const float3 err = basisVector0Q(delta);
-                if ((locked & SWING1_FLAG) == 0u)
-                {
-                    C1D c = chAngular(aY, err.z, H_NONE, 0u);
-                    chAddDrive(c, v.y, s.drives[3]);
-                    buf.r[buf.n] = c; buf.n += 1u;
-                }
-                if ((locked & SWING2_FLAG) == 0u)
-                {
-                    C1D c = chAngular(aZ, -err.y, H_NONE, 0u);
-                    chAddDrive(c, v.z, s.drives[3]);
-                    buf.r[buf.n] = c; buf.n += 1u;
-                }
-            }
-            else if ((driving & ((1u << DR_SWING1) | (1u << DR_SWING2))) != 0u)
+            if ((driving & ((1u << DR_SWING1) | (1u << DR_SWING2))) != 0u)
             {
                 const float3 err = basisVector0Q(delta);
                 if ((driving & (1u << DR_SWING1)) != 0u)
                 {
-                    C1D c = chAngular(aY, err.z, H_NONE, 0u);
-                    chAddDrive(c, v.y, s.drives[3]);  // gDriveSwing1DataIndex = eSWING entry
+                    const float errY = err.z;
+                    C1D c = chAngular(aY, errY, H_NONE, 0u);
+                    chAddDrive(c, v.y, s.drives[DRIVE_DATA_SWING1]);
                     buf.r[buf.n] = c; buf.n += 1u;
                 }
                 if ((driving & (1u << DR_SWING2)) != 0u)
                 {
-                    C1D c = chAngular(aZ, -err.y, H_NONE, 0u);
-                    chAddDrive(c, v.z, s.drives[5]);  // gDriveSwing2DataIndex = eSLERP entry
+                    const float errZ = -err.y;
+                    C1D c = chAngular(aZ, errZ, H_NONE, 0u);
+                    chAddDrive(c, v.z, s.drives[DRIVE_DATA_SWING2]);
                     buf.r[buf.n] = c; buf.n += 1u;
                 }
             }

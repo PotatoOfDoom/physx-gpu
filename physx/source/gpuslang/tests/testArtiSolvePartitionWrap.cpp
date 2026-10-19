@@ -158,7 +158,7 @@ struct AswArena
     std::vector<uint8_t> artiDesc;         // 360-byte PxgArticulationCoreDesc image
 };
 
-// PXG_ARTI_CORE_* offsets, pinned by testDmaArtiResidual
+// PXG_ARTI_CORE_* offsets, pinned by testArtiCoreDescLayout
 const uint32_t ASW_D_SLAB_HAS_CHANGES = 88;
 const uint32_t ASW_D_ARTICULATION_BLOCKS = 128;
 const uint32_t ASW_D_LINK_BLOCKS = 136;

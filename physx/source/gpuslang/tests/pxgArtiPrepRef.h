@@ -50,7 +50,8 @@ namespace pxgtest
 {
 using namespace physx;
 
-const uint32_t SC_COMPLIANT_ACCEL_SPRING = 1u << 3;
+// PxgSolverContactFlags::eCOMPLIANT_ACCELERATION_SPRING (5.12: 1 << 4; 5.6.1: 1 << 3)
+const uint32_t SC_COMPLIANT_ACCEL_SPRING = 1u << 4;
 
 inline float computeCompliantDamping(bool isSeparated, bool collidingWithVrel, float damping)
 {

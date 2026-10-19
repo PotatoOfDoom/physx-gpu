@@ -128,7 +128,8 @@ ContactSetup buildContactSetup(std::mt19937& rng)
 
             const uint32_t nc = 1 + rng() % cs.rowsPerBatch;
             uint32_t flags = 0;
-            if (u(rng) < 0.15f) flags |= SC_PER_POINT_FRICTION;
+            if (u(rng) < 0.15f) flags |= SC_HAS_TARGET_VELOCITY;
+            if (u(rng) < 0.15f) flags |= SC_DISABLE_STRONG_FRICTION;
             if (u(rng) < 0.1f) flags |= SC_DISABLE_FRICTION;
             if (u(rng) < 0.5f) flags |= SC_HAS_FORCE_THRESHOLDS;
             if (u(rng) < 0.3f) flags |= SC_COMPLIANT_ACCEL_SPRING;
@@ -297,6 +298,7 @@ PXG_TEST(constraintPrepPGS_contact)
     prepDesc.frictionOffsetThreshold = frictionOffsetThreshold;
     prepDesc.correlationDistance = correlationDistance;
     prepDesc.ccdMaxSeparation = ccdMaxSeparation;
+    prepDesc.biasCoefficients.rigidContact = PGS_RIGID_CONTACT_BIAS; // 5.12 (5.6.1: the literal 0.8f)
     prepDesc.totalPreviousEdges = 0;
     prepDesc.totalCurrentEdges = cs.numBatches * 32;
 
@@ -354,11 +356,12 @@ PXG_TEST(constraintPrepPGS_contact)
             const uint32_t contactBase = b.blockContactIndex;
 
             refCorrelatePatches(refPatches[k], lane, nbContacts, normal, bf0, bf1);
-            const bool perPointFriction = (flags & SC_PER_POINT_FRICTION) != 0;
+            const bool disableStrongFriction = (flags & SC_DISABLE_STRONG_FRICTION) != 0;
+            const bool hasTargetVelocity = (flags & SC_HAS_TARGET_VELOCITY) != 0;
             const bool disableFriction = (flags & SC_DISABLE_FRICTION) != 0;
             refPatches[k].broken[lane] = 0;
             float patchExtents = 0.f;
-            if (!(perPointFriction || disableFriction))
+            if (!(disableStrongFriction || disableFriction))
                 refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
                                       prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance,
                                       /*totalPreviousEdges*/ 0u, patchExtents, nbContacts);
@@ -368,7 +371,7 @@ PXG_TEST(constraintPrepPGS_contact)
 
             refSetupPGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
                         cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invDt, dt, bounceThreshold, lane,
-                        cs.workUnits[k].mWriteback[lane], perPointFriction, refCH[k], refFH[k], refCP, contactBase,
+                        cs.workUnits[k].mWriteback[lane], hasTargetVelocity, refCH[k], refFH[k], refCP, contactBase,
                         refFR, b.startFrictionIndex, restDistance, staticF, dynamicF, flags, ccdMaxSeparation,
                         std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop));
 
@@ -598,7 +601,7 @@ PXG_TEST(constraintPrepTGS_contact)
             b.bodyBIndex[lane] = l5 ? kBncB : (l1 ? kImpPos : kImpNeg);
             Float4& cd = cs.cdata[k].contactData[lane];
             uint32_t mw; std::memcpy(&mw, &cd.w, 4);
-            const uint32_t fl = ((mw >> 8) & 0xFFu) & ~(SC_DISABLE_FRICTION | SC_PER_POINT_FRICTION);
+            const uint32_t fl = ((mw >> 8) & 0xFFu) & ~(SC_DISABLE_FRICTION | SC_DISABLE_STRONG_FRICTION | SC_HAS_TARGET_VELOCITY);
             mw = (l5 ? cs.rowsPerBatch : (l1 ? 1u : 2u)) | (fl << 8); // prevFrictionPatchCount 0
             std::memcpy(&cd.w, &mw, 4);
             cd.x = 0.0f; // restDistance +0
@@ -710,7 +713,7 @@ PXG_TEST(constraintPrepTGS_contact)
     prepDesc.ccdMaxSeparation = ccdMaxSeparation;
     prepDesc.totalPreviousEdges = 0;
     prepDesc.totalCurrentEdges = cs.numBatches * 32;
-    prepDesc.biasCoefficient = biasCoefficient;
+    prepDesc.biasCoefficients.rigidContact = biasCoefficient;
 
     PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
     std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
@@ -767,11 +770,12 @@ PXG_TEST(constraintPrepTGS_contact)
             const uint32_t contactBase = b.blockContactIndex;
 
             refCorrelatePatches(refPatches[k], lane, nbContacts, normal, bf0, bf1);
-            const bool perPointFriction = (flags & SC_PER_POINT_FRICTION) != 0;
+            const bool disableStrongFriction = (flags & SC_DISABLE_STRONG_FRICTION) != 0;
+            const bool hasTargetVelocity = (flags & SC_HAS_TARGET_VELOCITY) != 0;
             const bool disableFriction = (flags & SC_DISABLE_FRICTION) != 0;
             refPatches[k].broken[lane] = 0;
             float patchExtents = 0.f;
-            if (!(perPointFriction || disableFriction))
+            if (!(disableStrongFriction || disableFriction))
                 refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
                                       prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance,
                                       /*totalPreviousEdges*/ 0u, patchExtents, nbContacts);
@@ -781,7 +785,7 @@ PXG_TEST(constraintPrepTGS_contact)
 
             refSetupTGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
                         cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invStepDt, stepDt, totalDt, invTotalDt,
-                        bounceThreshold, biasCoefficient, lane, cs.workUnits[k].mWriteback[lane], perPointFriction,
+                        bounceThreshold, biasCoefficient, lane, cs.workUnits[k].mWriteback[lane], hasTargetVelocity,
                         refCH[k], refFH[k], refCP, contactBase, refFR, b.startFrictionIndex, restDistance, staticF,
                         dynamicF, flags, std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop),
                         cs.workUnits[k].mTorsionalFrictionData[lane]);
@@ -820,7 +824,7 @@ PXG_TEST(constraintPrepTGS_contact)
             if (gCH[k].flags[l] != refCH[k].flags[l]) ++mism;
             if (!eq(gCH[k].maxPenBias[l], refCH[k].maxPenBias[l])) ++mism;
             if (!eq(gCH[k].restitutionXdt[l], refCH[k].restitutionXdt[l])) ++mism;
-            if (!eq(gCH[k].p8[l], refCH[k].p8[l])) ++mism;
+            if (!eq(gCH[k].biasCoefficient[l], refCH[k].biasCoefficient[l])) ++mism;
             if (!eq4(gCH[k].invMass0_1_angDom0_1[l], refCH[k].invMass0_1_angDom0_1[l])) ++mism;
             if (!eq4(gCH[k].normal_staticFriction[l], refCH[k].normal_staticFriction[l])) ++mism;
             if (gFH[k].numFrictionConstr[l] != refFH[k].numFrictionConstr[l]) { PXG_CHECK_MSG(false, "b%u l%u numFric g%u r%u", k, l, gFH[k].numFrictionConstr[l], refFH[k].numFrictionConstr[l]); ++mism; }
@@ -1139,6 +1143,7 @@ PXG_TEST(constraintPrepPGS_joint)
     // numStatic1dConstraintBatches) to pin the full expression
     prepDesc.num1dConstraintBatches = js.numBatches - 1;
     prepDesc.numStatic1dConstraintBatches = 1;
+    prepDesc.biasCoefficients.joint = PGS_JOINT_BIAS; // 5.12 (5.6.1: erp = 1.0f)
 
     PxgSolverSharedDesc<IterativeSolveData> sharedDesc;
     std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
@@ -1308,7 +1313,7 @@ PXG_TEST(constraintPrepTGS_joint)
     gTgsJsKin1NegZero = gTgsJsKin1TwinDiff = 0;
 
     const float stepDt = 1.f / 240.f, recipStepDt = 240.f, simDt = 1.f / 60.f, recipSimDt = 60.f;
-    const float lengthScale = 1.f, biasCoefficient = 2.f;
+    const float lengthScale = 1.f, biasCoefficient = 0.7f; // a 5.12-plausible sqrt(1/nbPosIters)
     PxgSlangComputeDevice* dev = testDevice();
 
     std::vector<TGSJointHeader> hdrs(js.numBatches);
@@ -1366,8 +1371,8 @@ PXG_TEST(constraintPrepTGS_joint)
     // numStatic1dConstraintBatches) to pin the full expression
     prepDesc.num1dConstraintBatches = js.numBatches - 1;
     prepDesc.numStatic1dConstraintBatches = 1;
-    // TGS reads erp = 0.5 * biasCoefficient from the prepare desc
-    prepDesc.biasCoefficient = biasCoefficient;
+    // TGS reads erp = biasCoefficients.joint from the prepare desc (5.12; 5.6.1: 0.5 * biasCoefficient)
+    prepDesc.biasCoefficients.joint = biasCoefficient;
 
     PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
     std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
@@ -1767,6 +1772,7 @@ static void frictionCarryoverPGS(bool framed)
     prepDesc.frictionOffsetThreshold = frictionOffsetThreshold;
     prepDesc.correlationDistance = correlationDistance;
     prepDesc.ccdMaxSeparation = ccdMaxSeparation;
+    prepDesc.biasCoefficients.rigidContact = PGS_RIGID_CONTACT_BIAS; // 5.12 (5.6.1: the literal 0.8f)
     prepDesc.totalPreviousEdges = totalPreviousEdges;
     prepDesc.totalCurrentEdges = numBatches * 32;
 
@@ -1989,7 +1995,7 @@ P90Row p90NormalRow(bool oldOrder, const BlockContactData& cd, const BlockContac
     const float maxPenBias = std::fmax(initAng0.w, initAng1.w);
     const Vec3 linVel0(initLin0.x, initLin0.y, initLin0.z), linVel1(initLin1.x, initLin1.y, initLin1.z);
     const Vec3 angVel0(initAng0.x, initAng0.y, initAng0.z), angVel1(initAng1.x, initAng1.y, initAng1.z);
-    const float invDtp8 = invDt * 0.8f;
+    const float invDtp8 = invDt * PGS_RIGID_CONTACT_BIAS; // 5.12 (5.6.1: 0.8f)
     const Float4 ims = cd.mInvMassScale[lane];
     const float invMass0D0 = initLin0.w * ims.x, invMass1D1 = initLin1.w * ims.z;
     const float maxImpulse = (d0.maxImpulse < d1.maxImpulse) ? d0.maxImpulse : d1.maxImpulse;
@@ -2130,6 +2136,7 @@ PXG_TEST(constraintPrepPGS_p90DotOrder)
     prepDesc.frictionOffsetThreshold = frictionOffsetThreshold;
     prepDesc.correlationDistance = correlationDistance;
     prepDesc.ccdMaxSeparation = ccdMaxSeparation;
+    prepDesc.biasCoefficients.rigidContact = PGS_RIGID_CONTACT_BIAS; // 5.12 (5.6.1: the literal 0.8f)
     prepDesc.totalPreviousEdges = 0;
     prepDesc.totalCurrentEdges = cs.numBatches * 32;
 
@@ -2180,11 +2187,12 @@ PXG_TEST(constraintPrepPGS_p90DotOrder)
             const Vec3 normal(n4.x, n4.y, n4.z);
             const uint32_t contactBase = b.blockContactIndex;
             refCorrelatePatches(refPatches[k], lane, nbContacts, normal, bf0, bf1);
-            const bool perPointFriction = (flags & SC_PER_POINT_FRICTION) != 0;
+            const bool disableStrongFriction = (flags & SC_DISABLE_STRONG_FRICTION) != 0;
+            const bool hasTargetVelocity = (flags & SC_HAS_TARGET_VELOCITY) != 0;
             const bool disableFriction = (flags & SC_DISABLE_FRICTION) != 0;
             refPatches[k].broken[lane] = 0;
             float patchExtents = 0.f;
-            if (!(perPointFriction || disableFriction))
+            if (!(disableStrongFriction || disableFriction))
                 refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
                                       prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance, 0u,
                                       patchExtents, nbContacts);
@@ -2193,7 +2201,7 @@ PXG_TEST(constraintPrepPGS_p90DotOrder)
                                frictionOffsetThreshold + restDistance, patchExtents);
             refSetupPGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
                         cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invDt, dt, bounceThreshold, lane,
-                        cs.workUnits[k].mWriteback[lane], perPointFriction, refCH[k], refFH[k], refCP, contactBase,
+                        cs.workUnits[k].mWriteback[lane], hasTargetVelocity, refCH[k], refFH[k], refCP, contactBase,
                         refFR, b.startFrictionIndex, restDistance, staticF, dynamicF, flags, ccdMaxSeparation,
                         std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop));
         }
@@ -2327,7 +2335,7 @@ P90TgsRow p90TgsNormalRow(bool oldOrder, const BlockContactData& cd, const Block
     const Float4 initLin1 = d1.initialLinVelXYZ_invMassW, initAng1 = d1.initialAngVelXYZ_penBiasClamp;
     const Vec3 linVel0(initLin0.x, initLin0.y, initLin0.z), linVel1(initLin1.x, initLin1.y, initLin1.z);
     const Vec3 angVel0(initAng0.x, initAng0.y, initAng0.z), angVel1(initAng1.x, initAng1.y, initAng1.z);
-    const float invDtp8 = invStepDt * cpSelMin(0.8f, biasCoefficient);
+    const float invDtp8 = invStepDt * biasCoefficient; // 5.12 (5.6.1: PxMin(0.8f, biasCoefficient))
     const Float4 ims = cd.mInvMassScale[lane];
     const float invMass0D0 = initLin0.w * ims.x, invMass1D1 = initLin1.w * ims.z;
     const bool isKin0 = (d0.flags & RB_KINEMATIC) != 0, isKin1 = (d1.flags & RB_KINEMATIC) != 0;
@@ -2378,12 +2386,12 @@ P90TgsRow p90TgsNormalRow(bool oldOrder, const BlockContactData& cd, const Block
         scaledBias = isSeparated ? -invStepDt : -invDtp8;
     const bool isGreater2 = ((restitution > 0.f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
     float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
+    if (isGreater2) // 5.12: before the kinematic terms
+        penetration += targetVelocity * (totalDt + penetration / vrel);
     if (isKin0)
         targetVelocity -= (norVel0 + angNorVel0);
     if (isKin1)
         targetVelocity += (norVel1 + angNorVel1);
-    if (isGreater2)
-        penetration += targetVelocity * (totalDt + penetration / vrel);
     row.raXn_extraCoeff = Float4{ raI.x, raI.y, raI.z, contactCoeff };
     row.rbXn_targetVelW = Float4{ rbI.x, rbI.y, rbI.z, targetVelocity };
     row.separation = penetration;
@@ -2473,7 +2481,7 @@ PXG_TEST(constraintPrepTGS_p90DotOrder)
     prepDesc.ccdMaxSeparation = ccdMaxSeparation;
     prepDesc.totalPreviousEdges = 0;
     prepDesc.totalCurrentEdges = cs.numBatches * 32;
-    prepDesc.biasCoefficient = biasCoefficient;
+    prepDesc.biasCoefficients.rigidContact = biasCoefficient;
 
     PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
     std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
@@ -2524,11 +2532,12 @@ PXG_TEST(constraintPrepTGS_p90DotOrder)
             const Vec3 normal(n4.x, n4.y, n4.z);
             const uint32_t contactBase = b.blockContactIndex;
             refCorrelatePatches(refPatches[k], lane, nbContacts, normal, bf0, bf1);
-            const bool perPointFriction = (flags & SC_PER_POINT_FRICTION) != 0;
+            const bool disableStrongFriction = (flags & SC_DISABLE_STRONG_FRICTION) != 0;
+            const bool hasTargetVelocity = (flags & SC_HAS_TARGET_VELOCITY) != 0;
             const bool disableFriction = (flags & SC_DISABLE_FRICTION) != 0;
             refPatches[k].broken[lane] = 0;
             float patchExtents = 0.f;
-            if (!(perPointFriction || disableFriction))
+            if (!(disableStrongFriction || disableFriction))
                 refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
                                       prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance, 0u,
                                       patchExtents, nbContacts);
@@ -2537,7 +2546,7 @@ PXG_TEST(constraintPrepTGS_p90DotOrder)
                                frictionOffsetThreshold + restDistance, patchExtents);
             refSetupTGS(cs.cdata[k], cs.cpoints, contactBase, nbContacts, refPatches[k], refAnchors[k], bf0, bf1,
                         cs.bodyData[bA], cs.bodyData[bB], cs.si[bA], cs.si[bB], invStepDt, stepDt, totalDt, invTotalDt,
-                        bounceThreshold, biasCoefficient, lane, cs.workUnits[k].mWriteback[lane], perPointFriction,
+                        bounceThreshold, biasCoefficient, lane, cs.workUnits[k].mWriteback[lane], hasTargetVelocity,
                         refCH[k], refFH[k], refCP, contactBase, refFR, b.startFrictionIndex, restDistance, staticF,
                         dynamicF, flags, std::fmax(cs.bodyData[bA].offsetSlop, cs.bodyData[bB].offsetSlop),
                         cs.workUnits[k].mTorsionalFrictionData[lane]);
@@ -2610,10 +2619,13 @@ PXG_TEST(constraintPrepTGS_p90DotOrder)
                 if (!gpuExact)
                 {
                     if (rowBits < 4)
-                        std::printf("  b%u l%u c%u: tv g%08x r%08x  resp0 g%08x r%08x  sep g%08x r%08x\n", k, l, i,
+                        std::printf("  b%u l%u c%u: tv g%08x r%08x  resp0 g%08x r%08x  sep g%08x r%08x  bias g%08x r%08x"
+                                    "  maxImp g%08x r%08x  resp1 g%08x r%08x\n", k, l, i,
                                     bitsOf(gCP[r].rbXn_targetVelW[l].w), bitsOf(refCP[r].rbXn_targetVelW[l].w),
                                     bitsOf(gCP[r].resp0[l]), bitsOf(refCP[r].resp0[l]), bitsOf(gCP[r].separation[l]),
-                                    bitsOf(refCP[r].separation[l]));
+                                    bitsOf(refCP[r].separation[l]), bitsOf(gCP[r].biasCoefficient[l]),
+                                    bitsOf(refCP[r].biasCoefficient[l]), bitsOf(gCP[r].maxImpulse[l]),
+                                    bitsOf(refCP[r].maxImpulse[l]), bitsOf(gCP[r].resp1[l]), bitsOf(refCP[r].resp1[l]));
                     ++rowBits;
                     if (sameRow(old, gCP[r], l)) ++gpuIsOldTwin;
                 }

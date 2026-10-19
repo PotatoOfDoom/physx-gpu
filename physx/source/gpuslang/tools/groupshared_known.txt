@@ -13,10 +13,12 @@
 # when P5 had to cap solveWholeIslandTGS's staging 944 -> 640.
 #
 # ONE ENTRY POINT IN 171 IS ABOVE THE WATERMARK, and it is that same one.  At 31744
-# it sits 1024 bytes under a hard pipeline-creation failure -- 96.9% -- which is
+# it sat 1024 bytes under a hard pipeline-creation failure -- 96.9% -- which is
 # the P5 cap having landed only just inside.  Four float3[640] staging arrays are
 # 30720 of it.  Nothing was watching that margin until this checker existed.
-solverTGS:solveWholeIslandTGS    31744
+# 5.12 removed the solver residual reporting and with it the 1024 B
+# residual-reduction scratch, so the entry is now the 30720 B of staging alone.
+solverTGS:solveWholeIslandTGS    30720
 
 # P9.83b-4: the MEASURED budget for doTriangleTriangleCollision
 # (convexMeshMidphase.cu:972-1231), taken from a probe that computes nothing --

@@ -70,7 +70,7 @@ public struct PxgTGSBlockSolverContactHeader   // 2048 bytes
     public uint forceWritebackOffset[32];    // 1536
     public float restitutionXdt[32];         // 1664
     public float cfm[32];                    // 1792
-    public float p8[32];                     // 1920
+    public float biasCoefficient[32];        // 1920 (5.6.1: p8)
 }
 
 public struct PxgTGSBlockSolverFrictionHeader  // 1664 bytes
@@ -124,7 +124,7 @@ public struct PxgTGSBlockSolverConstraint1DHeader  // 4992 bytes
     public float cfm[32];                               // 4864
 }
 
-public struct PxgTGSBlockSolverConstraint1DCon     // 3328 bytes
+public struct PxgTGSBlockSolverConstraint1DCon     // 3200 bytes
 {
     public float4 lin0XYZ_initBiasOrCoeff0[32];      // 0
     public float4 lin1XYZ_biasScaleOrCoeff1[32];     // 512
@@ -139,7 +139,7 @@ public struct PxgTGSBlockSolverConstraint1DCon     // 3328 bytes
     public float angularErrorScale[32];              // 2816
     public uint flags[32];                           // 2944
     public float appliedForce[32];                   // 3072
-    public float residual[32];                       // 3200
+    // 5.12 removed the trailing residual[32] (row stride 3328 -> 3200)
 }
 
 // mirrors PxgArticulationBlockResponse (PxgConstraintBlock.h:99, 1536 bytes):

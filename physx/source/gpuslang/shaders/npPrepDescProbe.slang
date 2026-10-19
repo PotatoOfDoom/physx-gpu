@@ -206,7 +206,12 @@ void prepDescProbe(uint3 dtid : SV_DispatchThreadID)
     o[i++] = uint64_t(c.articContactIndex);
     o[i++] = uint64_t(c.articJointIndex);
     o[i++] = uint64_t(c.nbElementsPerBody);
-    o[i++] = uint64_t(asuint(c.biasCoefficient));
+    // 5.12: Dy::BiasCoefficientCollection biasCoefficients (20 bytes @296)
+    o[i++] = uint64_t(asuint(c.biasCoefficients.rigidContact));
+    o[i++] = uint64_t(asuint(c.biasCoefficients.joint));
+    o[i++] = uint64_t(asuint(c.biasCoefficients.articulation));
+    o[i++] = uint64_t(asuint(c.biasCoefficients.particle));
+    o[i++] = uint64_t(asuint(c.biasCoefficients.deformableRigidAttachment));
 
     // ---- PxgSolverSharedDesc<IterativeSolveData>: the truncated base ----
     o[i++] = s.blockCurrentFrictionPatches;

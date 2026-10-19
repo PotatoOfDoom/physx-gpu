@@ -57,7 +57,6 @@ blind translateAABBsLaunch packedShift0@36/packedShift1@40   # broadphaseSetup.s
 blind cloth_solveTrianglePairEnergyLaunch partitionOrClusterId@28/flagsWord@32   # femClothSolvePairBda.slang:123-124, :354-356 (flagsWord byte0 isSharedPartition, byte1 isTGS; partitionId = partitionOrClusterId) == FEMCloth.cu:861-868 (dt @24, partitionId @28, isSharedPartition @32, isTGS @33)
 blind cloth_solveTrianglePairEnergyClusterLaunch partitionOrClusterId@28/flagsWord@32   # same struct, :398-400 firstClusterId = partitionOrClusterId == FEMCloth.cu:1171-1178 (dt @24, firstClusterId @28, isSharedPartition @32, isTGS @33)
 # REACHED x UNREACHED inside the one host-shaped PxgCudaBuffer argument (b):
-blind sb_copyOrApplySoftBodyDataDEPRECATED softbodiesRaw@0/hostHeapAllocator@8;softbodiesRaw@0/hostSize@16   # softBodySimBda.slang:599-602 == HOST_ARG_FIELDS / PxgCudaBuffer.h:104-107 (mPtr @0, mHeapMemoryAllocator @8, mSize @16, mStatGroup @24); only mPtr is read (:635), as softBodyGM.cu:3094 takes PxgSoftBody* softbodies
 # (c), check round: ClothBoxTriParams (femClothContactGenBda.slang:263-304) serves four kernels
 # whose CUDA spells the filter-pair arguments three ways -- cloth_SphereContactGenLaunch
 # filterPairs / nbFilterPairs (femClothPrimitives.cu:534-535), cloth_convexContactGenLaunch

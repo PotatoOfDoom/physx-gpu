@@ -38,10 +38,15 @@
 // same buffers, and EVERY buffer -- inputs, descriptors and decoys included -- is
 // compared bit for bit after every launch (poisoned identically on both sides first).
 //
-//   directApiRigidAccelGet       both acceleration getters: body-indexed previous
-//                                velocities, a query list with duplicates, a
+//   directApiRigidAccelGet       5.12: computeRigidBodyAccelerations over a pool
+//                                with a tail past nbElements, then both gather
+//                                getters: a query list with duplicates, a
 //                                non-power-of-two 1/dt, vel == prev (+0) and
-//                                -0 - +0 (-0), a grid tail with trap indices past it
+//                                -0 - +0 (-0), a grid tail with trap indices past it;
+//                                then copyRigidBodyVelocitiesToPrevious
+//   directApiRigidGetForceTorque 5.12 getRigidDynamicForce / Torque: zero and
+//                                non-zero inverse mass / inertia components,
+//                                non-axis rotations, duplicate queries
 //   directApiRigidSetVel         both velocity setters, with and without the
 //                                previous-velocity buffer, -0 / NaN payload / inf
 //                                moves, .w of the pool and of prev
@@ -145,9 +150,24 @@ static_assert(offsetof(physx::PxsCachedTransform, flags) == 28, "cache flags");
 static_assert(sizeof(PxBounds3) == 24, "PxBounds3");
 static_assert(sizeof(physx::PxNodeIndex) == 8, "PxNodeIndex");
 
+// PxgRigidBodyAcceleration (PxgSimulationCore.h, 5.12): { PxVec3 linear; pad; PxVec3 angular; pad },
+// 16-aligned, 32 bytes.  Not pinned by sizeof: that header drags in the CUDA host side.
+static const uint32_t SZ_ACCEL = 32u, RA_LINEAR = 0u, RA_ANGULAR = 16u;
+
 // ---- push blobs, byte for byte the host packs (PxgSimulationCore.cpp) ----
-struct AccelPush { uint64_t data, gpuIndices, bodySims, prev; uint32_t nb; float oneOverDt; };
-static_assert(sizeof(AccelPush) == 40 && offsetof(AccelPush, nb) == 32 && offsetof(AccelPush, oneOverDt) == 36, "accel");
+// 5.12 getRigidDynamic{Linear,Angular}Acceleration: a gather from PxgRigidBodyAcceleration
+struct AccelPush { uint64_t data, gpuIndices, accelerations; uint32_t nb, pad; };
+static_assert(sizeof(AccelPush) == 32 && offsetof(AccelPush, nb) == 24, "accel");
+// computeRigidBodyAccelerations (accelerations, bodySims, prevVelocities, nb, oneOverDt)
+struct ComputeAccelPush { uint64_t accelerations, bodySims, prev; uint32_t nb; float oneOverDt; };
+static_assert(sizeof(ComputeAccelPush) == 32 && offsetof(ComputeAccelPush, nb) == 24 &&
+              offsetof(ComputeAccelPush, oneOverDt) == 28, "computeAccel");
+// copyRigidBodyVelocitiesToPrevious (prevVelocities, bodySims, nb)
+struct CopyPrevPush { uint64_t prev, bodySims; uint32_t nb, pad; };
+static_assert(sizeof(CopyPrevPush) == 24 && offsetof(CopyPrevPush, nb) == 16, "copyPrev");
+// getRigidDynamic{Force,Torque} (data, gpuIndices, bodySims, nb)
+struct GetPush { uint64_t data, gpuIndices, bodySims; uint32_t nb, pad; };
+static_assert(sizeof(GetPush) == 32 && offsetof(GetPush, nb) == 24, "get");
 struct PosePush { uint64_t data, gpuIndices, desc; uint32_t nb, totalNumShapes; };
 static_assert(sizeof(PosePush) == 32 && offsetof(PosePush, nb) == 24 && offsetof(PosePush, totalNumShapes) == 28, "pose");
 struct VelPush { uint64_t data, gpuIndices, desc, prev; uint32_t nb, pad; };
@@ -155,20 +175,25 @@ static_assert(sizeof(VelPush) == 40 && offsetof(VelPush, prev) == 24 && offsetof
 struct ForcePush { uint64_t data, gpuIndices, desc; uint32_t nb, pad; };
 static_assert(sizeof(ForcePush) == 32 && offsetof(ForcePush, nb) == 24, "force");
 
-enum : uint32_t { K_LIN_ACC, K_ANG_ACC, K_SET_POSE, K_SET_LIN, K_SET_ANG, K_SET_FORCE, K_SET_TORQUE, K_COUNT };
+enum : uint32_t { K_LIN_ACC, K_ANG_ACC, K_SET_POSE, K_SET_LIN, K_SET_ANG, K_SET_FORCE, K_SET_TORQUE,
+                  K_COMPUTE_ACC, K_COPY_PREV, K_GET_FORCE, K_GET_TORQUE, K_COUNT };
 
 static std::vector<uint8_t> dawLoader(const char* file) { return loadShaderBlob(file); }
 
 PxgCudaShim* makeShim(PxgSlangComputeDevice* dev)
 {
     static const PxgKernelDef manifest[K_COUNT] = {
-        { "directApiBda.spv", "getRigidDynamicLinearAcceleration", 40u, 0 },
-        { "directApiBda.spv", "getRigidDynamicAngularAcceleration", 40u, 0 },
+        { "directApiBda.spv", "getRigidDynamicLinearAcceleration", 32u, 0 },
+        { "directApiBda.spv", "getRigidDynamicAngularAcceleration", 32u, 0 },
         { "directApiBda.spv", "setRigidDynamicGlobalPose", 32u, 0 },
         { "directApiBda.spv", "setRigidDynamicLinearVelocity", 40u, 0 },
         { "directApiBda.spv", "setRigidDynamicAngularVelocity", 40u, 0 },
         { "directApiBda.spv", "setRigidDynamicForce", 32u, 0 },
         { "directApiBda.spv", "setRigidDynamicTorque", 32u, 0 },
+        { "directApiBda.spv", "computeRigidBodyAccelerations", 32u, 0 },
+        { "directApiBda.spv", "copyRigidBodyVelocitiesToPrevious", 24u, 0 },
+        { "directApiBda.spv", "getRigidDynamicForce", 32u, 0 },
+        { "directApiBda.spv", "getRigidDynamicTorque", 32u, 0 },
     };
     return new PxgCudaShim(dev, manifest, K_COUNT, &dawLoader);
 }
@@ -286,21 +311,86 @@ static std::vector<uint32_t> uniqueIndices(uint32_t n, uint32_t traps, uint32_t 
 // the literal CUDA transcriptions (updateBodiesAndShapes.cu)
 // ===========================================================================
 
-// getRigidDynamic{Linear,Angular}Acceleration: (vel - prev) * oneOverDt, 4 lanes,
-// PxLoad3 keeps xyz
-static void oAccel(Mem& m, const AccelPush& p, uint32_t velOff)
+// computeRigidBodyAccelerations: (vel - prev) * oneOverDt, 4 lanes, PxLoad3 keeps
+// xyz; the record's pad words are not written
+static void oComputeAccel(Mem& m, const ComputeAccelPush& p)
+{
+    for (uint32_t index = 0; index < p.nb; ++index)
+    {
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            const uint32_t velOff = k ? BS_ANGVEL : BS_LINVEL;
+            const float* v = &m.at<float>(p.bodySims + uint64_t(index) * SZ_BODYSIM + velOff);
+            const float* pv = &m.at<float>(p.prev + uint64_t(index) * SZ_PREV + velOff);
+            float* out = &m.at<float>(p.accelerations + uint64_t(index) * SZ_ACCEL + (k ? RA_ANGULAR : RA_LINEAR));
+            for (uint32_t c = 0; c < 3; ++c)
+            {
+                const float delta = v[c] - pv[c];
+                out[c] = delta * p.oneOverDt;
+            }
+        }
+    }
+}
+
+// getRigidDynamic{Linear,Angular}Acceleration: data[i] = accelerations[index].linear / .angular
+static void oAccel(Mem& m, const AccelPush& p, uint32_t accelOff)
 {
     for (uint32_t i = 0; i < p.nb; ++i)
     {
         const uint32_t index = m.at<uint32_t>(p.gpuIndices + 4ull * i);
-        const float* v = &m.at<float>(p.bodySims + uint64_t(index) * SZ_BODYSIM + velOff);
-        const float* pv = &m.at<float>(p.prev + uint64_t(index) * SZ_PREV + velOff);
-        float* out = &m.at<float>(p.data + 12ull * i);
-        for (uint32_t c = 0; c < 3; ++c)
+        const uint32_t* a = &m.at<uint32_t>(p.accelerations + uint64_t(index) * SZ_ACCEL + accelOff);
+        uint32_t* out = &m.at<uint32_t>(p.data + 12ull * i);
+        for (uint32_t c = 0; c < 3; ++c) out[c] = a[c];
+    }
+}
+
+// copyRigidBodyVelocitiesToPrevious: both whole float4s
+static void oCopyPrev(Mem& m, const CopyPrevPush& p)
+{
+    for (uint32_t index = 0; index < p.nb; ++index)
+        for (uint32_t k = 0; k < 2; ++k)
         {
-            const float delta = v[c] - pv[c];
-            out[c] = delta * p.oneOverDt;
+            const uint32_t velOff = k ? BS_ANGVEL : BS_LINVEL;
+            const uint32_t* v = &m.at<uint32_t>(p.bodySims + uint64_t(index) * SZ_BODYSIM + velOff);
+            uint32_t* pv = &m.at<uint32_t>(p.prev + uint64_t(index) * SZ_PREV + velOff);
+            for (uint32_t c = 0; c < 4; ++c) pv[c] = v[c];
         }
+}
+
+// getRigidDynamicForce: invMass > 0 ? externalLinearAcceleration * (1 / invMass) : 0
+static void oGetForce(Mem& m, const GetPush& p)
+{
+    for (uint32_t i = 0; i < p.nb; ++i)
+    {
+        const uint32_t index = m.at<uint32_t>(p.gpuIndices + 4ull * i);
+        const float* bs = &m.at<float>(p.bodySims + uint64_t(index) * SZ_BODYSIM);
+        const float invMass = bs[3];
+        const float* e = bs + BS_EXTLIN / 4;
+        const PxVec3 accel(e[0], e[1], e[2]);
+        const PxVec3 f = (invMass > 0.f) ? (accel * (1.f / invMass)) : PxVec3(0.f);
+        float* out = &m.at<float>(p.data + 12ull * i);
+        out[0] = f.x; out[1] = f.y; out[2] = f.z;
+    }
+}
+
+// getRigidDynamicTorque: Cm::transformInertiaTensor(1 / invInertia (0 where not > 0),
+// PxMat33(body2World.q)) * externalAngularAcceleration
+static void oGetTorque(Mem& m, const GetPush& p)
+{
+    for (uint32_t i = 0; i < p.nb; ++i)
+    {
+        const uint32_t index = m.at<uint32_t>(p.gpuIndices + 4ull * i);
+        const float* bs = &m.at<float>(p.bodySims + uint64_t(index) * SZ_BODYSIM);
+        const float* ii = bs + BS_INVINERTIA / 4;
+        const PxVec3 inertia(ii[0] > 0.f ? 1.f / ii[0] : 0.f, ii[1] > 0.f ? 1.f / ii[1] : 0.f,
+                             ii[2] > 0.f ? 1.f / ii[2] : 0.f);
+        const float* q = bs + BS_B2W / 4;
+        PxMat33 inertiaWorldSpace;
+        physx::Cm::transformInertiaTensor(inertia, PxMat33(PxQuat(q[0], q[1], q[2], q[3])), inertiaWorldSpace);
+        const float* e = bs + BS_EXTANG / 4;
+        const PxVec3 t = inertiaWorldSpace * PxVec3(e[0], e[1], e[2]);
+        float* out = &m.at<float>(p.data + 12ull * i);
+        out[0] = t.x; out[1] = t.y; out[2] = t.z;
     }
 }
 
@@ -569,13 +659,16 @@ PXG_TEST(directApiRigidAccelGet)
 
     const uint64_t pool = m.alloc(size_t(POOL) * SZ_BODYSIM);
     const uint64_t prev = m.alloc(size_t(POOL) * SZ_PREV);
+    const uint64_t accel = m.alloc(size_t(POOL) * SZ_ACCEL);   // 0xA5: pads and the tail must survive
     fillBodies(m, pool, POOL, rng);
     for (uint32_t k = 0; k < POOL * 8; ++k) m.at<float>(prev + 4ull * k) = sym(rng);
 
     // the query list: a non-monotone walk with DUPLICATES (the getters only read),
-    // then valid trap indices past the launch
+    // then valid trap indices past the launch; all below NB_ACC, the bodies the
+    // compute pass covers
+    const uint32_t NB_ACC = POOL - 37u;   // a compute grid tail, and bodies past it left alone
     const uint64_t idx = m.alloc(4ull * (NQ + TRAPS));
-    for (uint32_t i = 0; i < NQ + TRAPS; ++i) m.at<uint32_t>(idx + 4ull * i) = (i * 7919u + 13u) % POOL;
+    for (uint32_t i = 0; i < NQ + TRAPS; ++i) m.at<uint32_t>(idx + 4ull * i) = (i * 7919u + 13u) % NB_ACC;
     m.at<uint32_t>(idx + 4ull * 17) = m.at<uint32_t>(idx + 4ull * 5);
     m.at<uint32_t>(idx + 4ull * 299) = m.at<uint32_t>(idx + 4ull * 0);
 
@@ -593,25 +686,87 @@ PXG_TEST(directApiRigidAccelGet)
     }
 
     const uint64_t data = m.alloc(12ull * (NQ + TRAPS));   // 0xA5 past the launch: must survive
-    AccelPush p = { data, idx, pool, prev, NQ, 59.7f };
     m.upload();
 
     size_t bad = 0;
+    // 1. the per-step compute pass over the body pool (index == body index)
+    const ComputeAccelPush pc = { accel, pool, prev, NB_ACC, 59.7f };
+    PXG_CHECK_MSG(L(shim, K_COMPUTE_ACC, NB_ACC, &pc, sizeof(pc)), "launch computeRigidBodyAccelerations");
+    shim->streamSynchronize();
+    oComputeAccel(m, pc);
+    bad += m.compare("compute accelerations");
+
+    // 2. the two gathers
+    const AccelPush p = { data, idx, accel, NQ, 0u };
     PXG_CHECK_MSG(L(shim, K_LIN_ACC, NQ, &p, sizeof(p)), "launch getRigidDynamicLinearAcceleration");
     shim->streamSynchronize();
-    oAccel(m, p, BS_LINVEL);
+    oAccel(m, p, RA_LINEAR);
     bad += m.compare("linear acceleration");
 
     PXG_CHECK_MSG(L(shim, K_ANG_ACC, NQ, &p, sizeof(p)), "launch getRigidDynamicAngularAcceleration");
     shim->streamSynchronize();
-    oAccel(m, p, BS_ANGVEL);
+    oAccel(m, p, RA_ANGULAR);
     bad += m.compare("angular acceleration");
-    PXG_CHECK_MSG(bad == 0, "acceleration getters: %zu word(s) differ", bad);
 
     // the directed lanes really are the zeros they were set up to be
     const float* out = &m.at<float>(data + 12ull * 4);
     PXG_CHECK_MSG(fBits(out[0]) == 0x80000000u && fBits(out[1]) == 0u, "the -0 / +0 lanes (%08x %08x)",
                   fBits(out[0]), fBits(out[1]));
+
+    // 3. the end-of-step snapshot into prevVelocities (raw float4 moves; a NaN
+    // payload and -0 on a covered body, so a float copy would show)
+    m.at<uint32_t>(pool + 0ull * SZ_BODYSIM + BS_LINVEL + 4) = 0x7FC0ABCDu;
+    m.at<uint32_t>(pool + 1ull * SZ_BODYSIM + BS_ANGVEL + 12) = 0x80000000u;
+    m.upload();
+    const CopyPrevPush pp = { prev, pool, NB_ACC, 0u };
+    PXG_CHECK_MSG(L(shim, K_COPY_PREV, NB_ACC, &pp, sizeof(pp)), "launch copyRigidBodyVelocitiesToPrevious");
+    shim->streamSynchronize();
+    oCopyPrev(m, pp);
+    bad += m.compare("copy velocities to previous");
+    PXG_CHECK_MSG(bad == 0, "acceleration kernels: %zu word(s) differ", bad);
+}
+
+// ===========================================================================
+PXG_TEST(directApiRigidGetForceTorque)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    std::unique_ptr<PxgCudaShim> shimOwner(makeShim(dev));
+    PxgCudaShim* shim = shimOwner.get();
+    Mem m;
+    m.shim = shim;
+    std::mt19937 rng(9305);
+
+    const uint64_t pool = m.alloc(size_t(POOL) * SZ_BODYSIM);
+    fillBodies(m, pool, POOL, rng);
+    // inverse mass / inverse inertia: positive, +0, -0 and negative, so both
+    // sides of every `> 0` guard are taken
+    for (uint32_t b = 0; b < POOL; ++b)
+    {
+        float* w = &m.at<float>(pool + uint64_t(b) * SZ_BODYSIM);
+        if (b % 5u == 1u) w[3] = 0.0f;
+        if (b % 7u == 2u) w[3] = -0.0f;
+        if (b % 11u == 3u) w[12] = 0.0f;
+        if (b % 13u == 4u) { w[13] = 0.0f; w[14] = -0.5f; }
+    }
+
+    const uint64_t idx = m.alloc(4ull * (NQ + TRAPS));
+    for (uint32_t i = 0; i < NQ + TRAPS; ++i) m.at<uint32_t>(idx + 4ull * i) = (i * 6151u + 29u) % POOL;
+    m.at<uint32_t>(idx + 4ull * 40) = m.at<uint32_t>(idx + 4ull * 2);   // a duplicate
+    const uint64_t data = m.alloc(12ull * (NQ + TRAPS));
+    m.upload();
+
+    size_t bad = 0;
+    const GetPush p = { data, idx, pool, NQ, 0u };
+    PXG_CHECK_MSG(L(shim, K_GET_FORCE, NQ, &p, sizeof(p)), "launch getRigidDynamicForce");
+    shim->streamSynchronize();
+    oGetForce(m, p);
+    bad += m.compare("get force");
+
+    PXG_CHECK_MSG(L(shim, K_GET_TORQUE, NQ, &p, sizeof(p)), "launch getRigidDynamicTorque");
+    shim->streamSynchronize();
+    oGetTorque(m, p);
+    bad += m.compare("get torque");
+    PXG_CHECK_MSG(bad == 0, "force / torque getters: %zu word(s) differ", bad);
 }
 
 // ===========================================================================

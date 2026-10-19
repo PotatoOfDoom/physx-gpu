@@ -60,7 +60,7 @@ import pxgSlangPrepCommon;
 static const uint MAX_NC = 6u;
 static const uint MAX_NF = 6u;
 static const float PX_EPS_REAL_Q = 1.192092896e-07f;
-static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 3;
+static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 4; // 5.12 PxgSolverFlags.h (5.6.1: 1 << 3)
 
 struct CRow
 {

@@ -48,12 +48,14 @@ import pxgSlangCommon;
 
 static const uint BLOCK_SIZE = 128; // PxgKernelBlockDim::PRE_INTEGRATION
 
-// mirrors computeSafeSqrtInertia() in preIntegration.cuh
+// mirrors computeSafeSqrtInertia() in preIntegration.cuh.  5.12 dropped the
+// `v == 0 ? 0 : sqrt(v)` guard: the only input it changes is -0.0, which the
+// guard turned into +0 and IEEE sqrt (CUDA sqrtf, SPIR-V Sqrt) returns as -0;
+// the -0 then reaches transformInertiaTensor's products.  The sqrtInertiaV
+// reciprocal below keeps its `== 0` guard, and -0 == 0 there.
 float3 computeSafeSqrtInertia(float3 v)
 {
-    return float3(v.x == 0.0f ? 0.0f : sqrt(v.x),
-                  v.y == 0.0f ? 0.0f : sqrt(v.y),
-                  v.z == 0.0f ? 0.0f : sqrt(v.z));
+    return float3(sqrt(v.x), sqrt(v.y), sqrt(v.z));
 }
 
 // mirrors getGravityAcceleration() in preIntegration.cuh
@@ -164,7 +166,7 @@ void preIntegrateBodyCompute(PxgBodySim bodySim, uint a, uint nbSolverBodies, fl
 
     float3 angVel = angularVelocityXYZ_maxPenBiasW.xyz;
 
-    if ((internalFlags & PXG_BODY_ENABLE_GYROSCOPIC) != 0)
+    if ((internalFlags & PXG_BODY_ENABLE_GYROSCOPIC_GPU) != 0)
     {
         const float3 localInertia = float3(
             inverseInertia.x == 0.0f ? 0.0f : 1.0f / inverseInertia.x,
@@ -200,9 +202,9 @@ void preIntegrateBodyCompute(PxgBodySim bodySim, uint a, uint nbSolverBodies, fl
     data.islandNodeIndex = islandNodeIndex;
     data.maxImpulse = maxImpulse;
     uint flags = 0;
-    if ((internalFlags & PXG_BODY_SPECULATIVE_CCD) != 0)
+    if ((internalFlags & PXG_BODY_SPECULATIVE_CCD_GPU) != 0)
         flags |= PXG_RB_FLAG_ENABLE_SPECULATIVE_CCD;
-    if ((internalFlags & PXG_BODY_ENABLE_GYROSCOPIC) != 0)
+    if ((internalFlags & PXG_BODY_ENABLE_GYROSCOPIC_GPU) != 0)
         flags |= PXG_RB_FLAG_ENABLE_GYROSCOPIC;
     data.flags = flags;
     data.pad = uint2(0, 0);
