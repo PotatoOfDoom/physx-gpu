@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **892/892** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **867/867** green in both modes (`ctest -N` in `build-gpuslang`).
+PhysX 5.12.0 (upstream b97365c6): engine migrated from 5.6.1; every device area ported (rigid solver/prep/
+integration/simcore, articulation, rigid + deformable narrowphase, particles, softbody, FEM cloth) against the
+5.12 CUDA, 487-kernel registry (414 mapped), all checkers green.  Scenes 99/99 after retiring the features 5.12
+removed (particle cloth/rigids/volumes/attachments, cone attachments) and calibrating the rows whose physics 5.12
+changed (attachment mass splitting, TGS torque reporting, fluid rows under the TGS external-forces default).
 Softbody rigid attachments: articulation anchor + link velocity, the reaction on dynamic bodies (was
 one-way), and real cone / distance limits from the deprecated addRigidAttachment (were ignored: pinned).
 Ported; PXG_SCENE=softbodyrigidattach, softbodyartiattach, softbodycone (+ PGS rows);
@@ -2220,6 +2225,70 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Migration auf PhysX 5.12.0 — Engine-Import, alle Device-Bereiche portiert, Szenen 99/99
+
+**Import.** Upstream `NVIDIA-Omniverse/PhysX` main (b97365c6, 2026-10-15) per Drei-Wege-Merge (Basis: der
+5.6.1-Baum mit unseren Dateien) übernommen. Port-Patches neu angewendet: `CudaKernelWrangler.h`
+(`PxCudaTypes.h` statt `<cuda.h>` — der Root-Snapshot-Patch, den die Stichwortsuche übersehen hatte),
+`maxBodies = 640` im TGS-Solver, die gemappten Device-Zeiger im Artikulations-Output-Desc, der optionale
+libcuda-Load im Modul-Loader. Bridge: `PxCudaContextManager` mit Refcount/`acquireReference`, die
+`*Internal`-Helfer entfallen, Fabriken mit `PxgAllocatorDesc`/`PxSceneFlags`, der eigene Memory-Manager
+durch gpucommons `PxgMemoryManager` ersetzt (läuft über den `PxCudaContext`, also über Vulkan).
+`nocuda/vector_types.h` zieht `host_defines.h` nach (wie das Toolkit), `cuStreamSynchronize` im Driver-Shim.
+
+**Device-Seite** (pro Bereich: Umsetzung → adversarialer Review gegen den 5.12-CUDA):
+- Registry 501 → 487 Kernel (30 entfernt, 16 neu), 414 gemappt; Manifest per CUDA-Name umgemappt,
+  manuelle BDA-Re-Points erhalten.
+- Rigid: 1D-Zeilen ohne `residual[32]` (−128 B Stride), Bias-Koeffizienten-Sammlung in Prep-Desc und
+  Island-Context, umnummerierte `PxgSolverContactFlags` an allen Kopien, D6-Drive-Slots + neue
+  Swing/Twist-Formel, TGS-Restitution-Reihenfolge, Joint-Kraft-Rekonstruktion im TGS-Writeback, vier neue
+  Accelerations-/Force-Kernel.
+- Artikulation: `PxgArticulation` 544 → 496, Link-Block 29184 → 28416, `computeLinkRw`, Limit-Impulse,
+  `mExternalEffort`, Bias-Split, die vier Arti-Prep-Kernel im Solver; neue Direct-API-Getter
+  `getArtiLinkForceState`/`TorqueState`. Port-Fehler unterwegs behoben: `npArtiUpdateKin` las `jointType`
+  an einem festen falschen Offset.
+- Rigid-Narrowphase: Overflow-Härtung aller Patch-/Kontakt-Tails, Box-Box-Edge-Edge-Fallback,
+  Polygon-Clip-`dnom0`, Convex-Jitter-Prädikat, Average-Point-Fix, Convex-Core-`makePlanes`-Kappe.
+- Deformables/Partikel: 64-Bit-`PxgDeformableRef`, `PxgDeformablePairInfo`, neue Contact-Writer und
+  Constraint-Blöcke, Filter-Arrays pro Akteur, Mass-Splitting über die neuen Reference-Count-Kernel,
+  TGS-Zwillinge in `isTGS`-Pfade gefaltet; Spiegel `PxgFEMCloth` 416, `PxgSoftBody` 464,
+  `PxgParticleSystem` 608.
+- Entfernt mit 5.12: Residual-Reporting, Particle-Springs/Aerodynamik/Inflatables/Shape-Matching/Volumes/
+  Rigid-Attachments samt Tests und Shadern.
+
+**Tests.** 867/867 in beiden Modi; alle Checker grün (Pending-Mechanismus der Migration wieder entfernt).
+Neu u. a. `cvxCoreTetNp` (End-to-End), Overflow-/Edge-Edge-Fixtures, `testArtiGetSet`. Drei Phase-1-Fixtures
+mit 5.6.1-Typen stillgelegt (Abdeckung durch Engine-Tests, eine Lücke im Remap vorher geschlossen), vier auf
+5.12-Filter/Writer portiert.
+
+**Harness und Szenen.** `gpu-sdk-step` auf 5.12-APIs (`PxPerformanceEnvelope`, `createDeformableAttachment`,
+Device-Buffer + `markDirty` statt `copySoftBodyData`, `raiseFlags` statt `applyParticleBufferData`).
+Stillgelegt, weil 5.12 das Feature entfernt hat: particlecloth, particleinflatable, particlerigid,
+particleattach, softbodycone (+PGS). Lauf: 96/99, nach Kalibrierung 99/99 (+ Refusal-Kontrolle).
+Neu eingemessen, jeweils mit Ursache im Code:
+- Rigid↔Deformable-Anhänge (softbodyrigidattach, softbodyartiattach, clothlinkattach): Mass-Splitting —
+  der Starrkörper trägt jetzt die volle Reaktion statt 1/N.
+- directapi (TGS): das Gelenkmoment entspricht jetzt PGS (Changelog 5.11).
+- particlemeshfloor, particlediffuse, particle2 (fluid): `eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS` ist
+  Standard (Finalize entfällt, Schwerkraft pro Substep) und Velocity-Iterationen lösen keine Dichte mehr.
+  Belegt durch Einzel-Rückbau im Scratch-Build: jede Rücknahme zieht die Werte Richtung 5.6.1; die
+  Kernel-Zwillinge sind bitgenau gegen 5.12. particlediffuse prüft das Altern jetzt direkt (Abklingphase
+  ohne Spawning: Population wächst nie, Lebensdauer fällt um 60·dt in 60 Steps, Puffer läuft leer); der
+  Mutant ohne Altern fällt durch. Spread-Grenze von particlemeshfloor 7,0 → 9,7, weil die
+  Boundary-off-Kontrolle unter 5.12 auf 7,99/8,47 streut.
+
+**Offizieller Build.** `generate_projects.sh linux-gcc-vulkan` + Release-Build sauber (keine Warnungen,
+170 Shader), clang `-Weverything -Werror` sauber; neun GPU-Snippets headless auf llvmpipe ohne Fehler.
+Windows-Presets aus den 5.12-vc17-Presets neu aufgebaut (/MD statt /MT → Ausgabe `win.x86_64.vc145.md`;
+alte 5.6.1-Artefakte in `bin/` vorher löschen). Windows/MSVC und echte Hardware unter 5.12 ungetestet.
+
+**Offen.**
+- Der erste Device→Host-Read nach `fetchResults(true)` lieferte in particlediffuse gelegentlich das
+  Diffuse-Array des Vorframes (der zweite Read ist aktuell). Ursache nicht gefunden; die Altern-Prüfung
+  toleriert einen Frame. Möglicher Port-Fehler, zu untersuchen.
+- Upstream-5.12-Fehler (dokumentiert): in `physx/CMakeLists.txt` greift `option(PX_GENERATE_GPU_PROJECTS ON)`
+  vor den Preset-Schaltern, ein frisches `-DPHYSX_PRESET=*-cpu-only` aktiviert trotzdem CUDA.
 
 ## Artikulation, Tranche C — Soft-Body-Anhänge an Starrkörper und Links
 
