@@ -3953,6 +3953,17 @@ static const float FLUID_BOUNDARY_SCALE = 1.0f;
 
 static const PxU32 MAX_DIFFUSE = 4096;
 static const float DIFFUSE_THRESHOLD = 1.0f;
+// PxDiffuseParticleParams::lifetime.  ps_diffuseParticleCreate draws each new particle's
+// lifetime from [1, DIFFUSE_LIFETIME] and ps_diffuseParticleUpdate subtracts dt every frame,
+// dropping it at zero (diffuseParticles.cu:340, :465-467).
+static const float DIFFUSE_LIFETIME = 4.0f;
+// The AGING check (5.12 recalibration, see the note at the assertion): after the scored run
+// the spawn threshold is raised out of reach and the scene is stepped on, so the population
+// can only decay.  DRAIN covers a full lifetime at 60 Hz (240 frames) plus a margin for the
+// float residue of 240 subtractions of 1/60; the rate probe compares the oldest particle's
+// lifetime DIFFUSE_DRAIN_PROBE frames apart.
+static const int DIFFUSE_DRAIN_STEPS = 250;
+static const int DIFFUSE_DRAIN_PROBE = 60;
 
 // P9.10c -- PXG_SCENE=particlemeshfloor.  The boundary scene with the ground BOX
 // swapped for a cooked TRIANGLE MESH at the same height, and the box sunk to -40
@@ -3970,19 +3981,61 @@ static const float DIFFUSE_THRESHOLD = 1.0f;
 //
 // So on this scene the boundary density can only arrive through the STATIC half of
 // the P9.8 pair, and the separation below is the first evidence that half does
-// anything at all.  Measured, 240 steps, both runs on the identical 60 x 60 mesh:
+// anything at all.  Measured on 5.6.1, 240 steps, both runs on the identical 60 x 60 mesh:
 //
 //     scale     resting spread     resting nn
 //       0            5.2148          0.0918      (PXG_PARTICLE_BOUNDARY_CONTROL=1)
 //       1.0          9.6288          0.2010
 //
-// a 1.85x separation, wider than the box floor's 1.63x.  The gate is a one-sided
+// a 1.85x separation, wider than the box floor's 1.63x.  The 5.6.1 gate was a one-sided
 // minimum at 7.0, clear of both ends -- the same shape as the box scene's, and for
 // the same reason: what is being asserted is that the effect ARRIVES, not that it
 // has a particular magnitude.
-static const float MESHFLOOR_SPREAD_MIN = 7.0f;
-static const float MESHFLOOR_SPREAD_CONTROL = 5.2148f;
-static const float MESHFLOOR_SPREAD_LIVE = 9.6288f;
+//
+// 5.12 CHANGE: the same two 5.12 particle changes named at MESHFLOOR_NN_MAX below (the
+// eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS default with its skipped finalizeVelocities, and
+// velocity iterations without the density solve) widen BOTH ends, and the old 7.0 no longer
+// sat clear of the control.  Measured on 5.12, 300 steps:
+//
+//                                   live (scale 1)    control (scale 0)
+//     TGS (defaults)                   13.3482            7.9936
+//     PGS                              10.9616            8.4748
+//     TGS + PXG_TGS_FORCES_ONCE=1      11.0414            5.7628
+//
+// so 7.0 would have PASSED both 5.12 default-solver controls.  9.7 sits 14% above the highest
+// control (PGS, 8.4748) and 11% below the lowest live run (PGS, 10.9616), near the geometric
+// middle of the only gap that separates every live run from every control.
+static const float MESHFLOOR_SPREAD_MIN = 9.7f;
+static const float MESHFLOOR_SPREAD_CONTROL = 7.9936f;  // measured, 5.12 TGS (5.6.1: 5.2148)
+static const float MESHFLOOR_SPREAD_LIVE = 13.3482f;    // measured, 5.12 TGS (5.6.1: 9.6288)
+// The fluid assertion block's nn MAXIMUM (density constraint running at all, against the
+// solid-phase control) is FLUID_NN_MAX = 0.26 everywhere else; this scene has its own.
+//
+// 5.12 CHANGE: two 5.12 particle changes widen this puddle.  (1) eENABLE_EXTERNAL_FORCES_
+// EVERY_ITERATION_TGS is now the PxSceneDesc default (CHANGELOG 5.12, General): gravity every
+// substep, and PxgPBDParticleSystemCore::finalizeVelocities skips ps_finalizeParticlesLaunch.
+// (2) Velocity iterations no longer run the density solve or move positions
+// (PxgPBDParticleSystemCore.cpp ~357-362, CHANGELOG 5.12, Particles).  Measured, 300 steps:
+//
+//                                                  spread      nn
+//     5.6.1 TGS                                    9.6288    0.2010
+//     5.12  TGS (defaults)                        13.3482    0.3471
+//     5.12  TGS + PXG_TGS_FORCES_ONCE=1                -     0.2612
+//     5.12  TGS, ONCE + 5.6.1 velocity iterations  9.7893    0.2458
+//     5.12  TGS, all of the above reverted (+bias) 9.7783    0.2179
+//     5.12  PGS (defaults)                        10.9616    0.2482
+//     solid-phase control (PXG_PARTICLE_FLUID_CONTROL=1), this scene on 5.12:
+//                                       TGS       27.4217    2.2859   (runs off the mesh rim)
+//                                       PGS       22.4032    2.2854
+//
+// The residual 0.2179 vs 0.2010 is unattributed; it is consistent with the parts of the 5.12
+// one-way contact rewrite that were NOT reverted (mass splitting, the one-way divisor counting
+// tangent-only contacts, the friction form -- the ~0.707 bias scaling WAS put back in that
+// row), and it is under the old 0.26 bar anyway.  0.45
+// sits 30% above the 5.12 TGS figure and a factor of five below the control on both solvers,
+// so it still says exactly what the check is for: the density constraint runs.
+static const float MESHFLOOR_NN_MAX = 0.45f;
+static const float MESHFLOOR_NN_CONTROL = 2.2859f;   // measured, 5.12 TGS solid-phase control
 
 // P9.11c -- PXG_SCENE=particlehffloor.  particlemeshfloor again with the cooked
 // triangle mesh swapped for a cooked HEIGHTFIELD, so the particle-vs-static contacts
@@ -4328,7 +4381,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         const char* thrEnv = std::getenv("PXG_DIFFUSE_THRESHOLD");
         dp.threshold = std::getenv("PXG_DIFFUSE_CONTROL") ? 1.0e12f
                      : (thrEnv ? float(atof(thrEnv)) : DIFFUSE_THRESHOLD);
-        dp.lifetime = 4.0f;            // long enough to survive the whole run
+        dp.lifetime = DIFFUSE_LIFETIME;  // long enough to survive the whole run
         dp.useAccurateVelocity = true;
         db->setDiffuseParticleParams(dp);
         db->setMaxActiveDiffuseParticles(MAX_DIFFUSE);
@@ -4469,6 +4522,23 @@ float diffuseMinY(const ParticleScene& psc)
     float lo = FLT_MAX;
     for (PxU32 i = 0; i < n; ++i) lo = PxMin(lo, host[i].y);
     return lo;
+}
+
+// The largest remaining LIFETIME (the .w of the diffuse position array) among the live
+// diffuse particles, read the same way as diffuseMinY.  Returns 0 when there are none.
+float diffuseMaxLifetime(const ParticleScene& psc)
+{
+    if (!psc.diffuse) return 0.0f;
+    const PxU32 n = psc.diffuse->getNbActiveDiffuseParticles();
+    if (n == 0u) return 0.0f;
+    std::vector<PxVec4> host(n);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(),
+                    reinterpret_cast<CUdeviceptr>(psc.diffuse->getDiffusePositionLifeTime()),
+                    n * sizeof(PxVec4));
+    float hi = 0.0f;
+    for (PxU32 i = 0; i < n; ++i) hi = PxMax(hi, host[i].w);
+    return hi;
 }
 
 // ---------------------------------------------------------------------------
@@ -9037,11 +9107,14 @@ int main()
             { std::printf("FAIL: fluid state is not finite\n"); ++failures; }
             if (!(drop > 0.2f))
             { std::printf("FAIL: the column did not settle downwards (drop=%.4f)\n", drop); ++failures; }
-            if (!(nnEnd < FLUID_NN_MAX))
+            // particlemeshfloor carries its own 5.12-calibrated bar; see MESHFLOOR_NN_MAX.
+            const float nnMax = meshFloorScene ? MESHFLOOR_NN_MAX : FLUID_NN_MAX;
+            const float nnControl = meshFloorScene ? MESHFLOOR_NN_CONTROL : FLUID_NN_CONTROL;
+            if (!(nnEnd < nnMax))
             { std::printf("FAIL: the cloud settled at the SOLID rest distance or wider -- the fluid "
                           "density constraint is not running (nn=%.4f, need <%.4f; the "
                           "solid-phase control measures %.4f)\n",
-                          nnEnd, FLUID_NN_MAX, FLUID_NN_CONTROL); ++failures; }
+                          nnEnd, nnMax, nnControl); ++failures; }
             if (!(rise < FLUID_RISE_MAX))
             { std::printf("FAIL: the fluid was launched upward like the overlapping solid control "
                           "(rise=%+.4f, need <%.4f; the control measures %+.4f)\n",
@@ -9274,15 +9347,101 @@ int main()
                       ++failures; }
                     // AGING.  A saturated buffer whose particles never expire stays
                     // saturated: Compact would re-append all of them every frame.
-                    // The count can only fall back from its peak if lifetimes decay
-                    // and the `lifeTime > 0` survivor test drops particles.  Require
-                    // a 5% fall; measured 22% (4096 -> 3197, reproducible).
-                    else if (endDiffuseSeen * 100u >= maxDiffuseSeen * 95u)
-                    { std::printf("FAIL: the diffuse population did not fall back from its peak "
-                                  "(%u at the last step vs a peak of %u) -- nothing is expiring, "
-                                  "so the lifetime is not being decayed\n",
-                                  endDiffuseSeen, maxDiffuseSeen);
-                      ++failures; }
+                    //
+                    // 5.12 CHANGE: this used to require the population to fall 5% from
+                    // its peak by the last scored step (5.6.1: 4096 -> 3197, 22%).  That
+                    // figure measures how long SPAWNING lasts as much as whether lifetimes
+                    // decay, and two 5.12 particle changes keep this fluid agitated, and
+                    // spawning, for longer: eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is
+                    // now the PxSceneDesc default (CHANGELOG 5.12, General; gravity every
+                    // substep and PxgPBDParticleSystemCore::finalizeVelocities skips
+                    // ps_finalizeParticlesLaunch), and velocity iterations no longer run
+                    // the density solve (CHANGELOG 5.12, Particles).  Measured end counts
+                    // (peak 4096 in every run):
+                    //     5.6.1 TGS                                3197
+                    //     5.12  TGS (defaults)                     4032   (1.6% fall)
+                    //     5.12  TGS + PXG_TGS_FORCES_ONCE=1        3827
+                    //     5.12  TGS, those changes reverted        3726
+                    //     5.12  PGS (defaults)                     3981   (2.8% fall)
+                    //     5.12  PGS, small shader perturbations    3591 .. 4092
+                    // The diffuse kernels themselves are unchanged from 5.6.1 and match their
+                    // 5.12 oracles bit for bit; the lowest diffuse y with the changes
+                    // reverted is -0.1886, 5.6.1's figure to four digits.  A 5.12 bound on
+                    // the fall would have to sit near 1% and would still ride on a chaotic
+                    // spawn history, so the check now isolates aging instead: after the
+                    // scored run the threshold is raised out of reach (the buffer's
+                    // other diffuse params are read back and kept) and the scene steps on.  With no new particles,
+                    //   (a) the population may never grow,
+                    //   (b) the OLDEST survivor's lifetime must fall by dt per frame
+                    //       (DIFFUSE_DRAIN_PROBE frames -> 1.0 s, tolerance one frame), and
+                    //   (c) after one full DIFFUSE_LIFETIME the buffer must be EMPTY.
+                    // A chain that never decays fails (b) and (c) (flat lifetime, full
+                    // buffer); one that decays at the wrong rate fails (b).  Measured: TGS
+                    // 4032 -> 0 (2495 at the probe), PGS 3981 -> 0 (2159), ONCE 3827 -> 0
+                    // (2206), oldest lifetime falling 1.0167 / 1.0167 / 1.0000 over the probe
+                    // (TGS also 0.9833 and 1.0000 in other runs -- see the tolerance note);
+                    // a no-aging mutant (lifeDelta zeroed in psDiffuseAdvect.slang, one .spv)
+                    // stays at 4096 -> 4096 with decay 0.0000 on both solvers and fails (b)
+                    // and (c).  PXG_DIFFUSE_DRAIN_TRACE=1 prints the drain step by step.
+                    else
+                    {
+                        PxDiffuseParticleParams drainDp = psc.diffuse->getDiffuseParticleParams();
+                        drainDp.threshold = 1.0e12f;
+                        psc.diffuse->setDiffuseParticleParams(drainDp);
+                        PxU32 prevN = endDiffuseSeen, grew = 0u, nAtProbe = 0u;
+                        float life1 = 0.0f, lifeProbe = 0.0f;
+                        if (std::getenv("PXG_DIFFUSE_DRAIN_TRACE"))
+                            std::printf("    drain step   0: %u diffuse, oldest lifetime %.5f\n",
+                                        endDiffuseSeen, diffuseMaxLifetime(psc));
+                        for (int k = 1; k <= DIFFUSE_DRAIN_STEPS; ++k)
+                        {
+                            scene->simulate(dt);
+                            scene->fetchResults(true);
+                            const PxU32 n = psc.diffuse->getNbActiveDiffuseParticles();
+                            if (n > prevN) ++grew;
+                            prevN = n;
+                            if (std::getenv("PXG_DIFFUSE_DRAIN_TRACE") && (k <= 6 || k % 30 == 0))
+                                std::printf("    drain step %3d: %u diffuse, oldest lifetime %.5f\n",
+                                            k, n, diffuseMaxLifetime(psc));
+                            if (k == 1) life1 = diffuseMaxLifetime(psc);
+                            if (k == 1 + DIFFUSE_DRAIN_PROBE)
+                            { lifeProbe = diffuseMaxLifetime(psc); nAtProbe = n; }
+                        }
+                        const float decay = life1 - lifeProbe;
+                        const float wantDecay = float(DIFFUSE_DRAIN_PROBE) * dt;
+                        std::printf("  particle DIFFUSE drain (threshold raised to 1e12 after the "
+                                    "scored run): %u -> %u after %d steps (%u at step %d); oldest "
+                                    "lifetime %.4f -> %.4f over %d steps (decay %.4f, expected "
+                                    "%.4f); %u step(s) grew\n",
+                                    endDiffuseSeen, prevN, DIFFUSE_DRAIN_STEPS, nAtProbe,
+                                    1 + DIFFUSE_DRAIN_PROBE, life1, lifeProbe, DIFFUSE_DRAIN_PROBE,
+                                    decay, wantDecay, grew);
+                        if (grew != 0u)
+                        { std::printf("FAIL: the diffuse population GREW in %u drain step(s) with "
+                                      "the spawn threshold out of reach\n", grew);
+                          ++failures; }
+                        // The tolerance is ONE FRAME (dt), not float noise: the first DtoH read
+                        // after fetchResults(true) occasionally returns the PREVIOUS frame's
+                        // diffuse array -- measured by reading twice in a row (drain steps 1,
+                        // 56, 105, 110, 125, 228 of one TGS run: first read = the step before,
+                        // second read = this step), so either probe may be one frame stale and
+                        // the decay reads 59, 60 or 61 frames' worth (0.9833 / 1.0000 / 1.0167
+                        // measured).  That is a read-ordering issue of this port, not aging, and
+                        // it is open.  One frame is still 60x finer than the no-aging mutant's
+                        // 0.0000 and catches any decay at the wrong rate (substep dt, dt/2, 2dt).
+                        if (!(nAtProbe > 0u && std::fabs(decay - wantDecay) < 1.05f * dt))
+                        { std::printf("FAIL: the oldest diffuse particle's lifetime fell by %.4f "
+                                      "over %d steps, expected %.4f (dt per step) -- the lifetime "
+                                      "is not being decayed at the frame rate\n",
+                                      decay, DIFFUSE_DRAIN_PROBE, wantDecay);
+                          ++failures; }
+                        if (prevN != 0u)
+                        { std::printf("FAIL: %u diffuse particles are still alive %d steps after "
+                                      "spawning stopped, longer than the %.1f s maximum lifetime -- "
+                                      "nothing is expiring\n",
+                                      prevN, DIFFUSE_DRAIN_STEPS, DIFFUSE_LIFETIME);
+                          ++failures; }
+                    }
                     // COLLISION (P9.13h).  Carry-over and aging both happen with no
                     // contact at all -- neither needs the floor.  This one does: a
                     // diffuse particle that is never pushed out keeps falling for the
@@ -9292,7 +9451,9 @@ int main()
                     // correction and -55.54 with it neutralised (same build, one
                     // mutated shader), so the bar sits at -2.0: ten times the
                     // corrected figure and a twenty-seventh of the uncorrected one.
-                    else if (minDiffuseY < -2.0f)
+                    // (5.12: -0.2001 TGS on defaults; it reads the scored run only, the
+                    // drain above does not update it.)
+                    if (maxDiffuseSeen >= MAX_DIFFUSE / 2u && minDiffuseY < -2.0f)
                     { std::printf("FAIL: a diffuse particle reached y = %.4f -- the spray is "
                                   "falling through the floor, so the one-way contact path is "
                                   "not correcting it (need > -2.0; the fluid rests at %.4f)\n",
@@ -9336,7 +9497,8 @@ int main()
                     // that kernel is mapped too -- so no part of the diffuse chain is
                     // unmapped any more.
                     std::printf("[  OK  ] gpu-sdk-step: the PBD fluid carried a DIFFUSE population "
-                                "up to %u of %u and back down to %u, and the spray STOPPED AT THE "
+                                "up to %u of %u (%u at the last scored step), AGED IT OUT to zero "
+                                "once spawning stopped, and the spray STOPPED AT THE "
                                 "FLOOR (lowest y %.4f, vs -55.54 measured with the one-way "
                                 "correction neutralised) -- spawn, publish, age and collide all "
                                 "run on Vulkan over a PRIMITIVE floor; the convex floor is "
@@ -12737,8 +12899,30 @@ int main()
         }
         if (ran && armFluid)
         {
-            inRange("B y_min (one fluid layer)", both.yMin[1], 0.1666f, 0.1667f);
-            inRange("B y_max (one fluid layer)", both.yMax[1], 0.1666f, 0.1667f);
+            // One fluid layer resting on the ground box at the rest offset r = 0.08333 (centre
+            // height 2r = 0.16667).  A second layer would sit at least a fluid rest distance
+            // (2 * 0.6r = 0.1) higher, near 0.267, so a y_max bar anywhere below ~0.2 still
+            // separates "one layer" from "stacked".
+            //
+            // 5.12 CHANGE (y_max only): eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS is now the
+            // PxSceneDesc default (CHANGELOG 5.12, General), and under it
+            // PxgPBDParticleSystemCore::finalizeVelocities skips ps_finalizeParticlesLaunch; 5.12
+            // also stopped running the density solve in velocity iterations (CHANGELOG 5.12,
+            // Particles).  Together they leave one straggler still settling at step 120;
+            // reverting EITHER one alone removes it.  Measured y_min / y_max:
+            //   5.6.1 TGS                                    0.166666 / 0.166666
+            //   5.12  TGS (defaults)                         0.166667 / 0.167216
+            //   5.12  TGS + PXG_TGS_FORCES_ONCE=1 (control)  0.166667 / 0.166667
+            //   5.12  TGS, finalize forced back on           0.166667 / 0.166667
+            //   5.12  TGS, velocity-iteration density back   0.166667 / 0.166667
+            // So TGS keeps the 5.6.1 floor and gets y_max <= 0.1675.
+            //   PGS: 5.12 measures 0.166147 / 0.167186 (no 5.6.1 reference: the fluid arm was
+            //   only ever measured under TGS; no revert of the 5.12 particle changes moves it into
+            //   the TGS band -- 0.166148 / 0.167186 with the velocity iterations reverted).  PGS
+            //   is not a run_scenes.sh row; its band [0.1660, 0.1680] is a first calibration
+            //   that keeps the one-layer separation, not a rebaseline.
+            inRange("B y_min (one fluid layer)", both.yMin[1], usePgs ? 0.1660f : 0.1666f, 0.1667f);
+            inRange("B y_max (one fluid layer)", both.yMax[1], 0.1666f, usePgs ? 0.1680f : 0.1675f);
             if (both.diffusePeak[1] != P2_MAX_DIFFUSE)
             { std::printf("FAIL: B diffuse peak %u, expected the cap %u\n", both.diffusePeak[1], P2_MAX_DIFFUSE); ++failures; }
             if (both.diffuseEnd[1] == 0) { std::printf("FAIL: B has no diffuse particles at the end\n"); ++failures; }
