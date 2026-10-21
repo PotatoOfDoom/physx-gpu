@@ -4353,6 +4353,206 @@ PXG_TEST(femClothSimRefitBoundZeroSign)
     dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bDesc.h);
 }
 
+// ---------------------------------------------------------------------------
+// cloth_refitBoundLaunch over a WIDE tree: more nodes per depth level than the kernel has
+// warps.  The two cases above have at most two nodes per level, so they cannot tell a
+// group that walks a level's nodes in parallel warps from one that walks them serially.
+// This tree has 3 levels with 1, 6 and 75 nodes (the bottom level is two full 32-node
+// trips plus a partial one), node leaf counts from 1 to 32 with gaps in the slot pattern,
+// leaf sizes from 1 to 32 triangles, a level-1 node with leaf AND internal children, and
+// a shuffled remap -- so the leaf walks of the warps sharing a trip have different trip
+// counts and different slots.  Bit-exact against the same CPU transcription, node by node.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimRefitBoundWide)
+{
+    using namespace p72refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    uint32_t rng = 0x2545F491u;
+    auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto frand = [&]() { return float(next() % 200001u) / 100000.0f - 1.0f; };
+
+    const uint32_t nbMid = 6u, nbBottom = 75u;
+    const uint32_t nbNodes = 1u + nbMid + nbBottom, maxDepth = 3u;
+    // node numbering: 0 = root, 1..6 = level 1, 7..81 = level 2
+    std::vector<TriIdx4> tris;
+    std::vector<F4> pos;
+    auto addLeaf = [&](uint32_t nbPrims) {
+        const uint32_t start = uint32_t(tris.size());
+        for (uint32_t p = 0; p < nbPrims; ++p)
+        {
+            const uint32_t v = uint32_t(pos.size());
+            for (uint32_t q = 0; q < 3u; ++q)
+                pos.push_back(F4{ frand() * 4.0f, frand() * 4.0f, frand() * 4.0f, 0.5f });
+            tris.push_back(TriIdx4{ v, v + 1u, v + 2u, 0u });
+        }
+        return leafWord(start, nbPrims);
+    };
+
+    TreeBlob tree;
+    tree.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes, 0u);
+    const float POISON = -7777.0f;
+    for (uint32_t n = 0; n < nbNodes; ++n)
+        for (uint32_t k = 0; k < 32u * 4u; ++k)
+        {
+            tree.w[tree.nodeWord(n) + W_MMIN + k] = f2u(POISON);
+            tree.w[tree.nodeWord(n) + W_MMAX + k] = f2u(POISON);
+        }
+    auto setChild = [&](uint32_t node, uint32_t slot, uint32_t word) { tree.w[tree.nodeWord(node) + W_MDATA + slot] = word; };
+
+    // root: the six level-1 nodes
+    for (uint32_t c = 0; c < nbMid; ++c) setChild(0u, c, internalWord(1u + c));
+    tree.w[tree.nodeWord(0) + W_NBNODES] = nbMid;
+    // level 1: the bottom nodes dealt out 15/14/13/12/11/10; node 1 also gets three LEAF
+    // children in slots between its internal ones
+    uint32_t bottom = 1u + nbMid;
+    for (uint32_t m = 0; m < nbMid; ++m)
+    {
+        const uint32_t node = 1u + m, nbInternal = 15u - m;
+        uint32_t slot = 0u;
+        for (uint32_t c = 0; c < nbInternal; ++c)
+        {
+            if (m == 0u && (c == 2u || c == 5u || c == 9u))
+                setChild(node, slot++, addLeaf(1u + c));
+            setChild(node, slot++, internalWord(bottom++));
+        }
+        tree.w[tree.nodeWord(node) + W_NBNODES] = slot;
+    }
+    PXG_CHECK_MSG(bottom == nbNodes, "wide tree: %u bottom nodes dealt, expected %u", bottom - 1u - nbMid, nbBottom);
+    // level 2: leaf children only, 1..32 of them, leaf sizes 1..32
+    for (uint32_t b = 1u + nbMid; b < nbNodes; ++b)
+    {
+        const uint32_t nbLeaves = (b * 7u) % 32u + 1u;
+        for (uint32_t c = 0; c < nbLeaves; ++c)
+            setChild(b, c, addLeaf((b + c * 5u) % 32u + 1u));
+        tree.w[tree.nodeWord(b) + W_NBNODES] = nbLeaves;
+    }
+    tree.w[0] = uint32_t(pos.size());
+    tree.w[1] = uint32_t(tris.size());
+    tree.w[2] = maxDepth;
+    tree.w[3] = nbNodes;
+
+    // depth info {offset, count} and a remap that is shuffled within each level
+    const uint32_t wDepthInfo = 4u + nbNodes * BV32_WORDS;
+    const uint32_t levelOffset[3] = { 0u, 1u, 1u + nbMid }, levelCount[3] = { 1u, nbMid, nbBottom };
+    const uint32_t wRemap = wDepthInfo + maxDepth * 2u;
+    for (uint32_t l = 0; l < 3u; ++l)
+    {
+        tree.w[wDepthInfo + l * 2u + 0] = levelOffset[l];
+        tree.w[wDepthInfo + l * 2u + 1] = levelCount[l];
+        std::vector<uint32_t> ids(levelCount[l]);
+        for (uint32_t i = 0; i < levelCount[l]; ++i) ids[i] = levelOffset[l] + i;
+        for (uint32_t i = levelCount[l]; i > 1u; --i) std::swap(ids[i - 1u], ids[next() % i]);
+        for (uint32_t i = 0; i < levelCount[l]; ++i) tree.w[wRemap + levelOffset[l] + i] = ids[i];
+    }
+
+    // --- CPU reference ---------------------------------------------------------------
+    TreeBlob refTree = tree;
+    std::vector<Bounds> refPacked(nbNodes, Bounds{ p72ref::V3{ POISON, POISON, POISON }, p72ref::V3{ POISON, POISON, POISON } });
+    for (uint32_t i = maxDepth; i > 0u; --i)
+    {
+        const uint32_t off = refTree.w[wDepthInfo + (i - 1u) * 2u + 0];
+        const uint32_t cnt = refTree.w[wDepthInfo + (i - 1u) * 2u + 1];
+        for (uint32_t j = 0; j < cnt; ++j)
+            refitNodeRef(refTree.w[wRemap + j + off], refTree, refPacked, pos, tris);
+    }
+
+    // --- device --------------------------------------------------------------------------
+    const uint32_t clothId = 0u, elemIdx = 1u;
+    const float origContactOffset = 0.021f, specCCD = 0.004f, nbUpdatesPerStep = 1.0f;
+    std::vector<float> packedBoundsInit(nbNodes * 6u, POISON);
+    std::vector<float> boundArrayInit((elemIdx + 1u) * 6u, POISON);
+    // 16-byte trailer: see femClothSimRefitBound (llvmpipe widens the last remap load).
+    std::vector<uint32_t> treePad = tree.w; treePad.resize(tree.w.size() + 4u, 0u);
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bTri = makeDev(dev, tris);
+    DevBuf bTree = makeDev(dev, treePad);
+    DevBuf bPacked = makeDev(dev, packedBoundsInit);
+    DevBuf bBounds = makeDev(dev, boundArrayInit);
+    std::vector<uint32_t> active = { clothId };
+    DevBuf bActive = makeDev(dev, active);
+    std::vector<uint32_t> elemIndices = { elemIdx };
+    DevBuf bElem = makeDev(dev, elemIndices);
+    std::vector<float> spec = { specCCD };
+    DevBuf bSpec = makeDev(dev, spec);
+    std::vector<float> contactDists = { 0.0f };
+    DevBuf bCd = makeDev(dev, contactDists);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mTriMeshData = reinterpret_cast<decltype(c.mTriMeshData)>(size_t(bTree.addr));
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mTriangleVertexIndices_ownedEdges = reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bTri.addr));
+    c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bPacked.addr));
+    c.mNbVerts = uint32_t(pos.size());
+    c.mNbTriangles = uint32_t(tris.size());
+    c.mOriginalContactOffset = origContactOffset;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    RefitPush rp{};
+    rp.femClothes = bDesc.addr;
+    rp.activeFemClothes = bActive.addr;
+    rp.nbActive = 1u;
+    rp.contactDists = bCd.addr;
+    rp.speculativeCCD = bSpec.addr;
+    rp.boundArray = bBounds.addr;
+    rp.elemIndex = bElem.addr;
+    rp.nbCollisionPairUpdatesPerTimestep = nbUpdatesPerStep;
+    rp.updateContactPairs = bUpd.addr;
+
+    Kernel k("femClothRefitBda.spv", "cloth_refitBoundLaunch", {}, sizeof(RefitPush));
+    k.dispatch(1u, {}, rp, 1u, 1u);
+    dev->flush();
+
+    const auto gTree = downloadBuffer<uint32_t>(dev, bTree.h, treePad.size());
+    const auto gPacked = downloadBuffer<float>(dev, bPacked.h, packedBoundsInit.size());
+    const auto gBounds = downloadBuffer<float>(dev, bBounds.h, boundArrayInit.size());
+
+    size_t mm = 0, printed = 0;
+    for (uint32_t n = 0; n < nbNodes; ++n)
+    {
+        const uint32_t nw = refTree.nodeWord(n);
+        for (uint32_t k2 = 0; k2 < 32u * 4u; ++k2)
+            for (uint32_t base : { W_MMIN, W_MMAX })
+                if (gTree[nw + base + k2] != refTree.w[nw + base + k2])
+                {
+                    ++mm;
+                    if (printed++ < 16)
+                        std::printf("  node %u %s word %u MM: ref %08x got %08x\n", n, base == W_MMIN ? "mMin" : "mMax",
+                                    k2, refTree.w[nw + base + k2], gTree[nw + base + k2]);
+                }
+        const float r[6] = { refPacked[n].mn.x, refPacked[n].mn.y, refPacked[n].mn.z,
+                             refPacked[n].mx.x, refPacked[n].mx.y, refPacked[n].mx.z };
+        for (uint32_t e = 0; e < 6u; ++e)
+            if (f2u(gPacked[n * 6 + e]) != f2u(r[e]))
+            {
+                ++mm;
+                if (printed++ < 16)
+                    std::printf("  packedNodeBounds[%u][%u] MM: ref %08x got %08x\n", n, e, f2u(r[e]), f2u(gPacked[n * 6 + e]));
+            }
+    }
+    const float expansion = (nbUpdatesPerStep > 1.0f ? nbUpdatesPerStep : 1.0f) * (origContactOffset + specCCD);
+    const float refBound[6] = {
+        refPacked[0].mn.x - expansion, refPacked[0].mn.y - expansion, refPacked[0].mn.z - expansion,
+        refPacked[0].mx.x + expansion, refPacked[0].mx.y + expansion, refPacked[0].mx.z + expansion };
+    for (uint32_t e = 0; e < 6u; ++e)
+    {
+        if (f2u(gBounds[elemIdx * 6 + e]) != f2u(refBound[e]))
+        { ++mm; std::printf("  boundArray[%u][%u] MM: ref %g got %g\n", elemIdx, e, refBound[e], gBounds[elemIdx * 6 + e]); }
+        if (f2u(gBounds[e]) != f2u(POISON)) { ++mm; std::printf("  boundArray[0][%u] clobbered\n", e); }
+    }
+    PXG_CHECK_MSG(f2u(gPacked[0]) != f2u(POISON), "root packedNodeBounds must be overwritten (refit did not run)");
+    PXG_CHECK_MSG(mm == 0, "cloth_refitBoundLaunch wide tree (%u nodes, %zu triangles) bit-exact vs CPU (%zu mismatches)",
+                  nbNodes, tris.size(), mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bTree.h);
+    dev->destroyBuffer(bPacked.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bActive.h);
+    dev->destroyBuffer(bElem.h); dev->destroyBuffer(bSpec.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bDesc.h);
+}
+
 // ===========================================================================
 // P8.12 -- cloth_stepLaunch, the TGS cloth substep integrator.
 //

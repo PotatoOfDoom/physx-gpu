@@ -61,22 +61,25 @@
 //
 // DEVIATIONS from CUDA (recipe policy; each is bit-exactness-preserving, and the
 // whole set is exercised by testFemClothSim.cpp's femClothSimRefitBound case):
-//   - ONE 32-thread group per cloth (numthreads(32,1,1)) in place of the CUDA
-//     (32, SB_REFIT_WAPRS_PER_BLOCK=32, 1) block, i.e. warpIndex is pinned to 0 and
-//     the per-depth-level node loop `for (j = warpIndex; j < count; j += 32)` runs
-//     SERIALLY over j = 0..count-1 in the single warp.  Required, not cosmetic: the
-//     CUDA block synchronizes 32 warps with __syncthreads() between depth levels while
-//     each warp independently runs a data-dependent inner loop (the leaf ballot walk
-//     `for (k = resultWarp; k; k = clearLowestSetBit(k))` and a j-trip-count that
-//     differs by one across warps).  Lowering __ballot_sync/__shfl_xor_sync to
-//     groupshared needs a GroupMemoryBarrierWithGroupSync, which must be reached
-//     UNIFORMLY by the whole workgroup — impossible with 32 divergent warps in one
-//     group.  With group == warp, resultWarp / count / maxDepth are all group-uniform
-//     and every barrier is uniform.  Serializing is OUTPUT-IDENTICAL: nodes at the
-//     same depth level have no data dependency on each other (each reads only its
-//     children — written in a PREVIOUS level, behind the level barrier — and writes
-//     only its own mMin/mMax[0..31] and mPackedNodeBounds[nodeIndex]), so the order
-//     in which a level's nodes are processed cannot change any result;
+//   - REFIT_WARPS = 32 warps per group (numthreads(32,32,1)), the CUDA
+//     (32, SB_REFIT_WAPRS_PER_BLOCK=32, 1) block: the per-depth-level node loop is
+//     `for (j = warpIndex; j < count; j += 32)` as in the CUDA.  The CUDA warps run a
+//     data-dependent inner loop each (the leaf ballot walk and a j-trip-count that
+//     differs by one across warps), and the groupshared lowering of __ballot_sync /
+//     __shfl_xor_sync needs barriers the WHOLE group reaches.  So the trip counts are
+//     made group-uniform: every warp makes ceil(count / 32) node trips (a warp past
+//     the end runs its last one with `active` false and writes nothing), and the leaf
+//     walk makes as many trips as the group's node with the most leaves, a trip past
+//     a warp's own leaf count being a no-op for it (its reduction result is
+//     discarded).  Each warp has its own
+//     ballot word and reduction slice.  OUTPUT-IDENTICAL to the CUDA and to a single
+//     warp: nodes at the same depth level have no data dependency on each other (each
+//     reads only its children — written in a PREVIOUS level, behind the level barrier
+//     — and writes only its own mMin/mMax[0..31] and mPackedNodeBounds[nodeIndex]),
+//     so which warp takes which node, and in what order, cannot change any result.
+//     Until the 2026-10 profile of SnippetDeformableSurface this was ONE warp per group
+//     walking every node of a level serially: a 79202-triangle sheet then refit its
+//     ~2500 leaves one after another, twice per step, in a single wave;
 //   - __ballot_sync(FULL_MASK, pred) -> groupshared InterlockedOr mask (order-
 //     independent); warpShuffleMin/Max (shuffle.cuh:49/62, an XOR butterfly over all
 //     32 lanes leaving the result in every lane) -> a groupshared 32-slot exchange
@@ -207,20 +210,26 @@ float3 pxMax3(float3 a, float3 b) { return float3(pxMax(a.x, b.x), pxMax(a.y, b.
 // ---------------------------------------------------------------------------
 // Warp (== group) collectives, groupshared-lowered.
 // ---------------------------------------------------------------------------
-groupshared uint sMask;
-groupshared float sRedMin[WARP * 3];
-groupshared float sRedMax[WARP * 3];
+// REFIT_WARPS warps per group (SB_REFIT_WAPRS_PER_BLOCK), each with its own slice of the
+// exchange storage below (~24 KB in all; see the header note on the multi-warp layout).
+static const uint REFIT_WARPS = 32u;
 
-// __ballot_sync(FULL_MASK, pred) over the 32-thread group.  The leading barrier orders
-// the zero-write after every read of the previous ballot's mask.
-uint ballot32(bool pred, uint idx)
+groupshared uint sMask[REFIT_WARPS];
+groupshared uint sMaxLeaves;
+groupshared float sRedMin[REFIT_WARPS * WARP * 3];
+groupshared float sRedMax[REFIT_WARPS * WARP * 3];
+
+// __ballot_sync(FULL_MASK, pred) over one warp (`warp`) of the group.  Every warp calls
+// it together (group-uniform control flow); the leading barrier orders the zero-write
+// after every read of the previous ballot's mask.
+uint ballot32(bool pred, uint idx, uint warp)
 {
     GroupMemoryBarrierWithGroupSync();
-    if (idx == 0) sMask = 0u;
+    if (idx == 0) sMask[warp] = 0u;
     GroupMemoryBarrierWithGroupSync();
-    if (pred) InterlockedOr(sMask, 1u << idx);
+    if (pred) InterlockedOr(sMask[warp], 1u << idx);
     GroupMemoryBarrierWithGroupSync();
-    return sMask;
+    return sMask[warp];
 }
 
 // P9.86: warpShuffleMin/Max (shuffle.cuh:48-70) reduce with CUDA fminf/fmaxf, NOT the
@@ -240,23 +249,25 @@ float fcrFmaxf(float a, float b)
 float3 fcrFmin3(float3 a, float3 b) { return float3(fcrFminf(a.x, b.x), fcrFminf(a.y, b.y), fcrFminf(a.z, b.z)); }
 float3 fcrFmax3(float3 a, float3 b) { return float3(fcrFmaxf(a.x, b.x), fcrFmaxf(a.y, b.y), fcrFmaxf(a.z, b.z)); }
 
-// warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62): both reduce over
-// all 32 lanes and leave the result in EVERY lane.  fminf/fmaxf (fcrFmin3/fcrFmax3) are
-// exact + associative + commutative (incl. +/-0 and NaN), so the linear scan below is
-// bit-identical to CUDA's XOR butterfly.
-void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
+// warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62) over one warp of the
+// group: both reduce over all 32 lanes and leave the result in EVERY lane.  fminf/fmaxf
+// (fcrFmin3/fcrFmax3) are exact + associative + commutative (incl. +/-0 and NaN), so the
+// linear scan below is bit-identical to CUDA's XOR butterfly.  Called by every warp
+// together, like ballot32.
+void warpMinMax32(inout float3 mn, inout float3 mx, uint idx, uint warp)
 {
+    const uint base = warp * WARP * 3u;
     GroupMemoryBarrierWithGroupSync();
-    sRedMin[idx * 3 + 0] = mn.x; sRedMin[idx * 3 + 1] = mn.y; sRedMin[idx * 3 + 2] = mn.z;
-    sRedMax[idx * 3 + 0] = mx.x; sRedMax[idx * 3 + 1] = mx.y; sRedMax[idx * 3 + 2] = mx.z;
+    sRedMin[base + idx * 3 + 0] = mn.x; sRedMin[base + idx * 3 + 1] = mn.y; sRedMin[base + idx * 3 + 2] = mn.z;
+    sRedMax[base + idx * 3 + 0] = mx.x; sRedMax[base + idx * 3 + 1] = mx.y; sRedMax[base + idx * 3 + 2] = mx.z;
     GroupMemoryBarrierWithGroupSync();
-    float3 rn = float3(sRedMin[0], sRedMin[1], sRedMin[2]);
-    float3 rx = float3(sRedMax[0], sRedMax[1], sRedMax[2]);
+    float3 rn = float3(sRedMin[base + 0], sRedMin[base + 1], sRedMin[base + 2]);
+    float3 rx = float3(sRedMax[base + 0], sRedMax[base + 1], sRedMax[base + 2]);
     for (uint i = 1u; i < WARP; ++i)
     {
         // P9.86: CUDA fminf/fmaxf (shuffle.cuh:48-70, FEMCloth.cu:469-470/487-488), not PxMin/PxMax.
-        rn = fcrFmin3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));
-        rx = fcrFmax3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));
+        rn = fcrFmin3(rn, float3(sRedMin[base + i * 3 + 0], sRedMin[base + i * 3 + 1], sRedMin[base + i * 3 + 2]));
+        rx = fcrFmax3(rx, float3(sRedMax[base + i * 3 + 0], sRedMax[base + i * 3 + 1], sRedMax[base + i * 3 + 2]));
     }
     GroupMemoryBarrierWithGroupSync();
     mn = rn; mx = rx;
@@ -264,10 +275,10 @@ void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
 
 // ---------------------------------------------------------------------------
 // cloth_refitBoundLaunch (FEMCloth.cu:338).
-// Dispatch: grid (nbActiveFemCloths, 1, 1), block (32, 1, 1).
+// Dispatch: grid (nbActiveFemCloths, 1, 1), block (32, REFIT_WARPS, 1).
 // ---------------------------------------------------------------------------
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(32, REFIT_WARPS, 1)]
 void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     // Early exit if contact pairs are not updated.  (PxU8 read as the low byte.)
@@ -275,6 +286,7 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
         return;
 
     const uint idx = gtid.x;
+    const uint warpIndex = gtid.y;
     const uint blockIdx = gid.x;
     if (blockIdx >= gP.nbActiveFemCloths) return;   // group-uniform
 
@@ -306,18 +318,29 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
         const uint offset = info.x;
         const uint count = info.y;
 
-        // CUDA: for (j = warpIndex; j < count; j += SB_REFIT_WAPRS_PER_BLOCK).  One warp
-        // per group here -> warpIndex == 0, stride 1 (see the header note: same-level
-        // nodes are independent, so the serialization is output-identical).
-        for (uint j = 0u; j < count; j++)
+        // CUDA: for (j = warpIndex; j < count; j += SB_REFIT_WAPRS_PER_BLOCK).  The loop
+        // is driven by the group-uniform base jj so every warp makes the same number of
+        // trips (and reaches every barrier); a warp past the end of the level runs the
+        // trip on node 0 with `active` false and writes nothing.
+        for (uint jj = 0u; jj < count; jj += REFIT_WARPS)
         {
-            const uint nodeIndex = Ptr<uint>(remapAddr + uint64_t(j + offset) * 4UL)[0];
+            const uint j = jj + warpIndex;
+            const bool active = j < count;
+            const uint nodeIndex = active ? Ptr<uint>(remapAddr + uint64_t(j + offset) * 4UL)[0] : 0u;
             const uint nodeData = bvData(treeAddr, nodeIndex, idx);
-            const uint nbChildren = bvNbNodes(treeAddr, nodeIndex);
+            const uint nbChildren = active ? bvNbNodes(treeAddr, nodeIndex) : 0u;
             const bool isLeafLane = (nodeData & 1u) != 0u;
 
             // compute the bitMask for all the leaf nodes
-            const uint resultWarp = ballot32(idx < nbChildren && isLeafLane, idx);
+            const uint resultWarp = ballot32(idx < nbChildren && isLeafLane, idx, warpIndex);
+
+            // The trip count of the leaf walk below must be the same for every warp,
+            // because it holds barriers: the largest leaf count of the group's nodes.
+            if (idx == 0u && warpIndex == 0u) sMaxLeaves = 0u;
+            GroupMemoryBarrierWithGroupSync();
+            if (idx == 0u) InterlockedMax(sMaxLeaves, countbits(resultWarp));
+            GroupMemoryBarrierWithGroupSync();
+            const uint maxLeaves = sMaxLeaves;
 
             float3 mn = float3(PX_MAX_F32, PX_MAX_F32, PX_MAX_F32);
             float3 mx = float3(-PX_MAX_F32, -PX_MAX_F32, -PX_MAX_F32);
@@ -331,16 +354,24 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
             // each alone reproduces it) the driver worker thread takes a SIGSEGV.  The
             // equivalent fixed 32-iteration scan below sidesteps the idiom entirely and is
             // OUTPUT-IDENTICAL: it visits exactly the same set bits in the same ascending
-            // order, and the skipped slots contribute nothing.  (An empty-body bit walk
-            // runs fine, so this is a codegen bug, not a Slang/SPIR-V semantics issue.)
-            for (uint kk = 0u; kk < WARP; ++kk)
+            // order.  (An empty-body bit walk runs fine, so this is a codegen bug, not a
+            // Slang/SPIR-V semantics issue.)  Here trip r visits this warp's r-th set bit,
+            // located by a fixed 32-step scan rather than the `k &= k-1` idiom; a trip
+            // past this warp's own leaf count (another warp's node has more leaves) is a
+            // no-op for it: it takes part in the reduction's barriers and keeps its mn/mx.
+            for (uint r = 0u; r < maxLeaves; ++r)
             {
-                if (((resultWarp >> kk) & 1u) == 0u) continue;   // group-uniform: resultWarp is the ballot
-                const uint indexInWarp = kk;
+                uint indexInWarp = 0u;
+                for (uint kk = 0u; kk < WARP; ++kk)
+                {
+                    if (((resultWarp >> kk) & 1u) != 0u && countbits(resultWarp & ((1u << kk) - 1u)) == r)
+                        indexInWarp = kk;
+                }
+                const bool mine = r < countbits(resultWarp);   // warp-uniform
 
                 // primitive: triangle
                 const uint childData = bvData(treeAddr, nodeIndex, indexInWarp);
-                const uint nbPrimitives = (childData >> 1u) & 63u;
+                const uint nbPrimitives = mine ? ((childData >> 1u) & 63u) : 0u;
                 const uint startIndex = childData >> 7u;
 
                 float3 tMin = mn;
@@ -383,9 +414,12 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
                 }
 
                 // min = warpShuffleMin(tMin);  max = warpShuffleMax(tMax);
-                warpMinMax32(tMin, tMax, idx);
-                mn = tMin;
-                mx = tMax;
+                warpMinMax32(tMin, tMax, idx, warpIndex);
+                if (mine)
+                {
+                    mn = tMin;
+                    mx = tMax;
+                }
             }
 
             if (idx < nbChildren && !isLeafLane)
@@ -406,17 +440,19 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
             // sPackedNodeBounds[nodeIndex] = { warpShuffleMin(min), warpShuffleMax(max) }
             float3 rn = mn;
             float3 rx = mx;
-            warpMinMax32(rn, rx, idx);
-            if (idx == 0u)
+            warpMinMax32(rn, rx, idx, warpIndex);
+            if (idx == 0u && active)
                 boundsStore(sPackedNodeBounds, nodeIndex, rn, rx);
         }
 
-        // __syncthreads() between depth levels.  Group-uniform: maxDepth and count are
-        // block-uniform, and the whole group is one warp.
-        GroupMemoryBarrierWithGroupSync();
+        // __syncthreads() between depth levels: the next level reads the
+        // mPackedNodeBounds this one wrote.  The global writes are made visible to the
+        // other warps of the group by the full memory barrier.
+        AllMemoryBarrierWithGroupSync();
     }
 
-    // update the broad-phase bound (CUDA: `if (warpIndex == 0)`, always true here).
+    // update the broad-phase bound (CUDA: `if (warpIndex == 0)`).
+    if (warpIndex == 0u)
     {
         const uint index = Ptr<uint>(gP.elemIndex)[femClothId];
 

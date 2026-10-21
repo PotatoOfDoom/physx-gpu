@@ -8796,9 +8796,20 @@ int main()
             }
         }
     }
-    // Keep the GPU memory footprint modest for a two-body scene.
-    sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
-    sceneDesc.gpuDynamicsConfig.maxRigidPatchCount = 1024;
+    // PXG_SCENE=snippetsurface reproduces SnippetDeformableSurface, whose scene keeps the
+    // default GPU dynamics config and sets these two itself.
+    const bool snippetSurfaceScene = std::getenv("PXG_SCENE") && !std::strcmp(std::getenv("PXG_SCENE"), "snippetsurface");
+    if (snippetSurfaceScene)
+    {
+        sceneDesc.flags |= PxSceneFlag::eENABLE_PCM;
+        sceneDesc.gpuMaxNumPartitions = 8;
+    }
+    else
+    {
+        // Keep the GPU memory footprint modest for a two-body scene.
+        sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
+        sceneDesc.gpuDynamicsConfig.maxRigidPatchCount = 1024;
+    }
 
     std::printf("  creating GPU scene (eENABLE_GPU_DYNAMICS + eGPU broadphase, %s)...\n",
                 usePgs ? "PGS" : "TGS");
@@ -10371,6 +10382,215 @@ int main()
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: clothselfcollide checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=snippetsurface: SnippetDeformableSurface's scene, step for step, as a
+    // PROFILE driver (it asserts only that the sheet stays finite).  One 200 x 200 vertex
+    // sheet (79202 triangles, 15 x 15 m) at y = 10 with self-collision on, a kinematic
+    // sphere (r 3, y 5) turned every step, a ground plane, TGS, gpuMaxNumPartitions 8, and
+    // the snippet's per-step 640 KB position readback.  PXG_CLOTH_STEPS (default 100, the
+    // snippet's frame count) sets the length; the wall time per step is printed per 10.
+    if (!std::strcmp(sceneName, "snippetsurface"))
+    {
+        PxMaterial* snipMat = physics->createMaterial(0.5f, 0.5f, 0.0f);
+        {
+            // PxCreatePlane(PxPlane(0, 1, 0, 0)), spelled out (the extension is not linked).
+            PxRigidStatic* groundPlane = physics->createRigidStatic(PxTransformFromPlaneEquation(PxPlane(0, 1, 0, 0)));
+            PxShape* planeShape = physics->createShape(PxPlaneGeometry(), *snipMat);
+            groundPlane->attachShape(*planeShape);
+            planeShape->release();
+            scene->addActor(*groundPlane);
+        }
+        const PxU32 numX = 200, numZ = 200;
+        const float size = 15.0f, thickness = 0.01f, density = 500.0f;
+        const PxVec3 origin(-0.5f * size, 10.0f, -0.5f * size);
+        const float scX = size / float(numX - 1), scZ = size / float(numZ - 1);
+        std::vector<PxVec3> verts;
+        verts.reserve(numX * numZ);
+        for (PxU32 i = 0; i < numX; ++i)
+            for (PxU32 j = 0; j < numZ; ++j)
+                verts.push_back(PxVec3(float(i) * scX, 0.0f, float(j) * scZ));
+        std::vector<PxU32> tris;
+        tris.reserve(6 * (numX - 1) * (numZ - 1));
+        auto vid = [numZ](PxU32 x, PxU32 y) { return x * numZ + y; };
+        for (PxU32 i = 1; i < numX; ++i)
+            for (PxU32 j = 1; j < numZ; ++j)
+            {
+                tris.push_back(vid(i - 1, j - 1)); tris.push_back(vid(i, j - 1)); tris.push_back(vid(i - 1, j));
+                tris.push_back(vid(i - 1, j));     tris.push_back(vid(i, j - 1)); tris.push_back(vid(i, j));
+            }
+        PxTriangleMeshDesc meshDesc;
+        meshDesc.points.count = PxU32(verts.size());
+        meshDesc.points.stride = sizeof(PxVec3);
+        meshDesc.points.data = verts.data();
+        meshDesc.triangles.count = PxU32(tris.size() / 3);
+        meshDesc.triangles.stride = 3 * sizeof(PxU32);
+        meshDesc.triangles.data = tris.data();
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.meshWeldTolerance = 0.001f;
+        ck.meshPreprocessParams = PxMeshPreprocessingFlags(PxMeshPreprocessingFlag::eWELD_VERTICES) |
+                                  PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+        ck.buildTriangleAdjacencies = false;
+        ck.buildGPUData = true;
+        ck.midphaseDesc = PxMeshMidPhase::eBVH34;
+        PxTriangleMesh* triMesh = immediateCooking::createTriangleMesh(ck, meshDesc, physics->getPhysicsInsertionCallback());
+        PxDeformableSurfaceMaterial* clothMat = physics->createDeformableSurfaceMaterial(1.e10f, 0.3f, 0.5f, thickness, 0.00001f);
+        PxDeformableSurface* surface = triMesh ? physics->createDeformableSurface(*cudaCtx) : nullptr;
+        if (!surface)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: snippetsurface scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        {
+            PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), &clothMat, 1, true,
+                PxShapeFlag::eVISUALIZATION | PxShapeFlag::eSCENE_QUERY_SHAPE | PxShapeFlag::eSIMULATION_SHAPE);
+            surface->attachShape(*shape);
+            shape->release();
+        }
+        scene->addActor(*surface);
+        // PxDeformableSurfaceExt::allocateAndInitializeHostMirror + distributeTriangleMassToVertices
+        // (the extension is not linked here): positions moved by the transform, the triangle mass
+        // (area * thickness * density) spread a third to each corner, invMass = 1 / mass.
+        const PxU32 nv = triMesh->getNbVertices();
+        const PxVec3* cv = triMesh->getVertices();
+        const PxU32 nt = triMesh->getNbTriangles();
+        const bool idx16 = triMesh->getTriangleMeshFlags() & PxTriangleMeshFlag::e16_BIT_INDICES;
+        std::vector<float> vmass(nv, 0.0f);
+        for (PxU32 t = 0; t < nt; ++t)
+        {
+            PxU32 ix[3];
+            for (PxU32 k = 0; k < 3; ++k)
+                ix[k] = idx16 ? PxU32(static_cast<const PxU16*>(triMesh->getTriangles())[3 * t + k])
+                              : static_cast<const PxU32*>(triMesh->getTriangles())[3 * t + k];
+            const float m = 0.5f * (cv[ix[1]] - cv[ix[0]]).cross(cv[ix[2]] - cv[ix[0]]).magnitude() * thickness * density;
+            for (PxU32 k = 0; k < 3; ++k)
+                vmass[ix[k]] += m / 3.0f;
+        }
+        // The mirror's uniform invMass (nbVertices / clothMass 0.5) stays in the velocity and
+        // rest .w; only the position .w is redistributed.
+        const float mirrorInvMass = float(nv) / 0.5f;
+        std::vector<PxVec4> pos(nv), vel(nv, PxVec4(0.0f, 0.0f, 0.0f, mirrorInvMass)), rest(nv);
+        for (PxU32 v = 0; v < nv; ++v)
+        {
+            pos[v] = PxVec4(cv[v] + origin, 1.0f / vmass[v]);
+            rest[v] = PxVec4(cv[v], mirrorInvMass);
+        }
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()), pos.data(), nv * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()), vel.data(), nv * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()), rest.data(), nv * sizeof(PxVec4));
+        surface->markDirty(PxDeformableSurfaceDataFlag::eALL);
+        {
+            PxShape* ss = surface->getShape();
+            ss->setContactOffset(2.0f * thickness);
+            ss->setRestOffset(thickness);
+        }
+        surface->setSelfCollisionFilterDistance(thickness * 2.5f);
+        surface->setLinearDamping(0.0f);
+        surface->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, false);
+        surface->setMaxLinearVelocity(1000.0f);
+        surface->setNbCollisionPairUpdatesPerTimestep(1);
+        surface->setNbCollisionSubsteps(1);
+
+        PxRigidDynamic* sphere = nullptr;
+        {
+            PxShape* s = physics->createShape(PxSphereGeometry(3.0f), *snipMat);
+            sphere = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, 5.0f, 0.0f)));
+            sphere->attachShape(*s);
+            sphere->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+            scene->addActor(*sphere);
+            s->release();
+        }
+        std::printf("  [  OK  ] scene 'snippetsurface' built: %u-vertex %u-triangle sheet, self-collision on, "
+                    "kinematic sphere + plane\n", nv, nt);
+        // The shape of the BV32 tree cloth_refitBoundLaunch walks level by level, and the
+        // self-collision midphase walks per vertex / per triangle.
+        if (const Gu::BV32Tree* bv = static_cast<const Gu::TriangleMesh*>(triMesh)->mGRB_BV32Tree)
+        {
+            PxU32 leaves = 0;
+            for (PxU32 n = 0; n < bv->mNbPackedNodes; ++n)
+                for (PxU32 c = 0; c < bv->mPackedNodes[n].mNbNodes; ++c)
+                    leaves += bv->mPackedNodes[n].mData[c] & 1u;
+            std::printf("  BV32 tree: %u packed nodes, %u leaves, depth %u, nodes per level:", bv->mNbPackedNodes,
+                        leaves, bv->mMaxTreeDepth);
+            for (PxU32 d = 0; d < bv->mMaxTreeDepth; ++d)
+                std::printf(" %u", bv->mTreeDepthInfo[d].count);
+            // The refit's critical path in warp reductions: one warp walking every node
+            // (ballot + one reduction per leaf + the node aggregate), against 32 warps that
+            // take 32 nodes per trip and walk as many leaves as the trip's fullest node.
+            PxU32 serialRounds = 0, parallelRounds = 0;
+            for (PxU32 d = 0; d < bv->mMaxTreeDepth; ++d)
+            {
+                const Gu::BV32DataDepthInfo& info = bv->mTreeDepthInfo[d];
+                for (PxU32 j0 = 0; j0 < info.count; j0 += 32)
+                {
+                    PxU32 maxLeaves = 0;
+                    for (PxU32 j = j0; j < PxMin(info.count, j0 + 32); ++j)
+                    {
+                        const Gu::BV32DataPacked& node = bv->mPackedNodes[bv->mRemapPackedNodeIndexWithDepth[info.offset + j]];
+                        PxU32 nodeLeaves = 0;
+                        for (PxU32 c = 0; c < node.mNbNodes; ++c)
+                            nodeLeaves += node.mData[c] & 1u;
+                        serialRounds += 2 + nodeLeaves;
+                        maxLeaves = PxMax(maxLeaves, nodeLeaves);
+                    }
+                    parallelRounds += 3 + maxLeaves;
+                }
+            }
+            std::printf("; refit critical path %u warp rounds on one warp, %u on 32 warps\n", serialRounds, parallelRounds);
+        }
+
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 100;
+        std::vector<PxVec4> host(nv);
+        const float dt = 1.0f / 60.0f;
+        float simTime = 0.0f;
+        bool finite = true;
+        auto tWin = std::chrono::steady_clock::now();
+        const auto tAll = tWin;
+        for (int i = 0; i < steps; ++i)
+        {
+            const PxTransform pose = sphere->getGlobalPose();
+            sphere->setKinematicTarget(PxTransform(pose.p, PxQuat(PxCos(simTime * 2.0f), PxVec3(0, 1, 0))));
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()), nv * sizeof(PxVec4));
+            simTime += dt;
+            if ((i % 10) == 9 || i == steps - 1)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                double sum = 0.0;
+                float lo = 1.0e30f;
+                for (PxU32 v = 0; v < nv; ++v)
+                {
+                    sum += double(host[v].y);
+                    lo = PxMin(lo, host[v].y);
+                    finite = finite && std::isfinite(host[v].x) && std::isfinite(host[v].y) && std::isfinite(host[v].z);
+                }
+                std::printf("    step %3d: mean y = %.4f | min y = %.4f | %.1f ms/step over the last %d\n", i,
+                            float(sum / double(nv)), lo,
+                            std::chrono::duration<double, std::milli>(now - tWin).count() / double((i % 10) + 1),
+                            (i % 10) + 1);
+                tWin = now;
+            }
+        }
+        const double totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tAll).count();
+        // FNV-1a over the last readback: a bit-exact fingerprint for A/B runs of a port change.
+        uint64_t posHash = 1469598103934665603ULL;
+        for (size_t b = 0; b < host.size() * sizeof(PxVec4); ++b)
+            posHash = (posHash ^ reinterpret_cast<const uint8_t*>(host.data())[b]) * 1099511628211ULL;
+        std::printf("  snippetsurface: %d steps, %.1f ms/step average, position hash %016llx\n", steps,
+                    totalMs / double(steps), (unsigned long long)posHash);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        int failures = unmappedPenalty();
+        if (!finite) { std::printf("FAIL: cloth went non-finite\n"); ++failures; }
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: snippetsurface stepped %d frames\n", steps);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: snippetsurface (%d)\n", failures);
         return 2;
     }
 

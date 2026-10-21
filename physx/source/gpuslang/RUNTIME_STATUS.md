@@ -5,7 +5,9 @@ Phase 1 (bit-exact CUDA→Slang math port, 673 kernels) is closed; see
 MIGRATION_STATUS.md.  Every item below is committed on
 `claude/physx-cuda-slang-migration-mqbz7u` and verified against the standalone
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
-(host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
+(device-local + staged + timeline; unset or `PXG_DEVICE_V2=1`) and `PXG_DEVICE_V2=0`
+(host-visible).  Until the default flip, host-visible was the default and `=1` the
+opt-in, so entries below that say "default mode" mean host-visible.
 
 Test count: **867/867** green in both modes (`ctest -N` in `build-gpuslang`).
 PhysX 5.12.0 (upstream b97365c6): engine migrated from 5.6.1; every device area ported (rigid solver/prep/
@@ -2225,6 +2227,41 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## Cloth-Refit auf 32 Warps — SnippetDeformableSurface lief auf der RX 9070 XT mit 10 fps
+
+**Befund** (Nutzer: konstant 10 fps, auch vor dem Kontakt mit der Kugel). Nachgestellt als
+`PXG_SCENE=snippetsurface` (200×200-Tuch, 79 202 Dreiecke, Selbstkollision, Positions-Readback jedes Frame;
+nicht in `run_scenes.sh`, ~3 min auf llvmpipe). Host-Seite unauffällig (~5 Stream-Syncs, 1 Readback/Frame,
+Wandzeit ≈ Kernelzeit). Ursache auf Port-Seite: `cloth_refitBoundLaunch` lief mit EINER 32er-Gruppe pro Tuch
+und ging den ganzen BVH-Baum (1 057 Knoten, 3 969 Blätter) Knoten für Knoten durch — 6 083 abhängige
+Warp-Reduktionen hintereinander, zweimal pro Frame, unabhängig von Kontakten. Die CUDA nutzt einen
+1024-Thread-Block (32 Warps), die sich die Knoten einer Ebene teilen.
+
+**Fix** (`femClothRefitBda.slang`): 32 Warps pro Tuch wie in der CUDA, ein Knoten pro Warp und Runde, alle
+Barrieren von der ganzen Gruppe erreicht, eigene Ballot-/Reduktions-Slots pro Warp. Bitgleiche Ergebnisse
+(Knoten einer Ebene sind unabhängig); kritischer Pfad 6 083 → 230 Reduktionen. Groupshared 24 708 B
+(`groupshared_known.txt`, 8 KB unter dem Limit); die Refusal-Kontrolle verweigert jetzt 57 statt 55 Pipelines.
+Auf llvmpipe langsamer (85 → 184 ms/Frame, alle Warps teilen einen CPU-Thread) — der Gewinn ist nur auf
+echter Hardware messbar, auf der RX 9070 XT noch ungemessen. Neuer Test `femClothSimRefitBoundWide`
+(3 Ebenen, gemischte Reihenfolge, 1–32 Blätter/Dreiecke, bitgenau; fängt einen geteilten Ballot-Mutanten, den
+die alten Refit-Tests nicht fangen). Cloth-Suites und -Szenen grün.
+
+**Nächste Kandidaten**, falls es auf AMD noch langsam ist: die beiden Selbstkollisions-Midphases
+(~20 000 Gruppen à 32 Threads, auf 64-breiten Waves halb leer, 4–5 Barrieren pro BVH-Knoten); vermutlich
+dieselbe Ein-Warp-Struktur in `softBodyRefitBda`. Messen mit `PXG_KERNEL_TIMES=1` (Anteile pro Kernel),
+`PXG_SYNC_STATS=1`, `PXG_KERNEL_TIMES=2` (pro Launch mit Grid).
+
+## Speicher — device-local ist der Standard-Modus
+
+`PXG_DEVICE_V2`: ungesetzt, leer oder `1` → device-local + Staging (jetzt Standard), `0` → host-visible, sonst
+einmalige Warnung und Standard. Passt der Buffer nicht mehr in den VRAM, fällt er mit einem einmaligen Hinweis
+auf Systemspeicher zurück statt zu scheitern. `p1DeviceV2HostVisible` hält host-visible auch im normalen
+`ctest` abgedeckt; `run_suite.sh`/`run_validation.sh` setzen beide Modi explizit, `run_scenes.sh` nennt den
+Modus und ein fortgesetztes Log lässt sich erneut fortsetzen (vorher begann der zweite `--resume` von vorn).
+ctest 866/867 (+1 Skip, kein Validation-Layer) in beiden Modi, Szenen im neuen Standard 99/99. Weitere
+Performance-Schalter geprüft: alle Laufzeit-Defaults stehen schon auf schnell; offen ist nur optimiertes SPIR-V
+(`-O0`), das erst nach Umbau der Stamp-Reihenfolge (NoContraction/SZINP vor spirv-opt) sicher wäre.
 
 ## Migration auf PhysX 5.12.0 — Engine-Import, alle Device-Bereiche portiert, Szenen 99/99
 
