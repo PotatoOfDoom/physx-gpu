@@ -62,9 +62,11 @@ run_mode() {
 
     local out
     out="$(mktemp)"
-    # The env arguments are per-invocation.  The default mode REMOVES an inherited
-    # PXG_DEVICE_V2 (env -u), so a caller that exported =1 still gets a real default
-    # run.  Unset, "" and "0" all mean the default mode (include/PxgSlangEnv.h).
+    # The env arguments are per-invocation.  The device-local run REMOVES an inherited
+    # PXG_DEVICE_V2 (env -u), so a caller that exported =0 still gets a real default
+    # run, and it exercises the default exactly as a user gets it (unset).  The
+    # host-visible run sets PXG_DEVICE_V2=0 explicitly: since the default flip, "0" is
+    # the only value that selects it (include/PxgSlangEnv.h: unset/""/"1" device-local).
     ( cd "$BUILD_DIR" && env "$@" ctest -j4 ) > "$out" 2>&1
     local rc=$?
 
@@ -96,8 +98,8 @@ run_mode() {
     rm -f "$out"
 }
 
-run_mode default -u PXG_DEVICE_V2
-run_mode v2 PXG_DEVICE_V2=1
+run_mode device-local -u PXG_DEVICE_V2
+run_mode host-visible PXG_DEVICE_V2=0
 
 if [ $FAILURES -ne 0 ]; then
     echo "run_suite.sh: $FAILURES of 2 modes failed; evidence under $ARCHIVE_ROOT"

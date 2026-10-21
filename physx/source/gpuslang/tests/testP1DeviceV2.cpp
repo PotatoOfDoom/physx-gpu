@@ -30,7 +30,10 @@
 //     a real kernel dispatch reading/writing device-local storage;
 //   - timeline submission (P1.1): submit()/wait()/poll() ticket semantics.
 // Runs a dedicated device with useDeviceLocalMemory = true regardless of the
-// suite-wide PXG_DEVICE_V2 mode, so the staged path is covered on every run.
+// suite-wide PXG_DEVICE_V2 mode, so the device-local path is covered even by a
+// PXG_DEVICE_V2=0 (host-visible) run.  p1DeviceV2HostVisible is the mirror: a
+// dedicated host-visible device, so the default (device-local) run still covers
+// the host-visible memory-type selection and transfers.
 
 #include "pxgTestFramework.h"
 
@@ -48,19 +51,21 @@ namespace
 {
 using namespace pxgtest;
 
-static PxgSlangComputeDevice* createV2Device()
+static PxgSlangComputeDevice* createModeDevice(bool deviceLocal)
 {
     PxgSlangDeviceDesc desc;
     const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
     desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
-    desc.useDeviceLocalMemory = true;
+    desc.useDeviceLocalMemory = deviceLocal;
     return physx::gpuslang::PxgCreateVulkanComputeDevice(desc);
 }
 
-PXG_TEST(p1DeviceV2)
+// The checks below are mode-agnostic (both modes stage their bulk transfers); they run
+// once per memory mode on a dedicated device.
+static void checkMemoryMode(bool deviceLocal)
 {
-    std::unique_ptr<PxgSlangComputeDevice> dev(createV2Device());
-    PXG_CHECK_MSG(dev != nullptr, "v2 (device-local) device creation succeeds");
+    std::unique_ptr<PxgSlangComputeDevice> dev(createModeDevice(deviceLocal));
+    PXG_CHECK_MSG(dev != nullptr, "%s device creation succeeds", deviceLocal ? "device-local" : "host-visible");
     if (!dev)
         return;
 
@@ -142,7 +147,7 @@ PXG_TEST(p1DeviceV2)
         dev->destroyBuffer(b);
     }
 
-    // --- dispatch through device-local storage + ticket semantics ---
+    // --- dispatch through the mode's storage + ticket semantics ---
     {
         const uint32_t N = 4096;
         const uint32_t GROUPS = N / 64;
@@ -153,7 +158,7 @@ PXG_TEST(p1DeviceV2)
         const uint32_t stride = uint32_t(sizeof(SgOut));
         const PxgPipelineHandle pipe = dev->createPipeline(blob.data(), blob.size(), "spikeSubgroup",
                                                            1, &stride, sizeof(P));
-        PXG_CHECK_MSG(pipe != 0, "pipeline creation on the v2 device succeeds");
+        PXG_CHECK_MSG(pipe != 0, "pipeline creation on the %s device succeeds", deviceLocal ? "device-local" : "host-visible");
 
         std::vector<SgOut> init(N);
         PxgBufferHandle bOut = dev->createBuffer(N * sizeof(SgOut));
@@ -186,7 +191,7 @@ PXG_TEST(p1DeviceV2)
                   g[i].z == laneCount && g[i].w == laneCount))
                 ++bad;
         }
-        PXG_CHECK_MSG(bad == 0, "kernel results through device-local buffers are correct");
+        PXG_CHECK_MSG(bad == 0, "kernel results through %s buffers are correct", deviceLocal ? "device-local" : "host-visible");
 
         dev->destroyBuffer(bOut);
         dev->destroyPipeline(pipe);
@@ -256,9 +261,21 @@ PXG_TEST(p1DeviceV2)
     }
 }
 
+PXG_TEST(p1DeviceV2)
+{
+    checkMemoryMode(true);
+}
+
+PXG_TEST(p1DeviceV2HostVisible)
+{
+    checkMemoryMode(false);
+}
+
 // PXG_DEVICE_V2 parsing (include/PxgSlangEnv.h), the one parser the engine bridge and this
-// suite share: unset/""/"0" -> off, "1" -> on, anything else -> off plus ONE stderr warning
-// per process.  (Before it the bridge took any set value, "0" included, as on.)
+// suite share: unset/""/"1" -> device-local (the default), "0" -> host-visible, anything
+// else -> device-local plus ONE stderr warning per process.  (Before it the bridge took any
+// set value, "0" included, as device-local; until the default flip, unset meant
+// host-visible.)
 namespace envparse
 {
 struct ScopedEnv
@@ -328,11 +345,11 @@ PXG_TEST(p1DeviceV2EnvParse)
     using physx::gpuslang::pxgDeviceV2FromEnv;
 
     // The pure table.
-    PXG_CHECK_MSG(pxgParseDeviceV2(nullptr) == PxgDeviceV2Value::eOFF, "unset -> off");
-    PXG_CHECK_MSG(pxgParseDeviceV2("") == PxgDeviceV2Value::eOFF, "\"\" -> off");
-    PXG_CHECK_MSG(pxgParseDeviceV2("0") == PxgDeviceV2Value::eOFF, "\"0\" -> off");
-    PXG_CHECK_MSG(pxgParseDeviceV2("1") == PxgDeviceV2Value::eON, "\"1\" -> on");
-    const char* const invalid[] = { "2", "true", "yes", "on", "00", "01", " 1", "1 ", "-1", "v2" };
+    PXG_CHECK_MSG(pxgParseDeviceV2(nullptr) == PxgDeviceV2Value::eDEVICE_LOCAL, "unset -> device-local");
+    PXG_CHECK_MSG(pxgParseDeviceV2("") == PxgDeviceV2Value::eDEVICE_LOCAL, "\"\" -> device-local");
+    PXG_CHECK_MSG(pxgParseDeviceV2("1") == PxgDeviceV2Value::eDEVICE_LOCAL, "\"1\" -> device-local");
+    PXG_CHECK_MSG(pxgParseDeviceV2("0") == PxgDeviceV2Value::eHOST_VISIBLE, "\"0\" -> host-visible");
+    const char* const invalid[] = { "2", "true", "yes", "on", "off", "00", "01", " 0", "0 ", " 1", "1 ", "-1", "v2" };
     for (const char* v : invalid)
         PXG_CHECK_MSG(pxgParseDeviceV2(v) == PxgDeviceV2Value::eINVALID, "\"%s\" -> invalid", v);
 
@@ -340,14 +357,19 @@ PXG_TEST(p1DeviceV2EnvParse)
     // warning has been spent by the suite device and cannot be observed here)?
     const bool warnedAlready = pxgParseDeviceV2(std::getenv("PXG_DEVICE_V2")) == PxgDeviceV2Value::eINVALID;
 
-    // Through the environment.
+    // Through the environment.  Every valid value is silent.
     {
         envparse::ScopedEnv e("PXG_DEVICE_V2", nullptr);
-        PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env unset -> host-visible");
+        const std::string err = envparse::captureStderr([] { PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env unset -> device-local"); });
+        PXG_CHECK_MSG(err.find("PXG_DEVICE_V2") == std::string::npos, "unset is silent (got '%s')", err.c_str());
     }
     {
         envparse::ScopedEnv e("PXG_DEVICE_V2", "");
-        PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"\" -> host-visible");
+        PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"\" -> device-local");
+    }
+    {
+        envparse::ScopedEnv e("PXG_DEVICE_V2", "1");
+        PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"1\" -> device-local");
     }
     {
         envparse::ScopedEnv e("PXG_DEVICE_V2", "0");
@@ -355,27 +377,31 @@ PXG_TEST(p1DeviceV2EnvParse)
         PXG_CHECK_MSG(err.find("PXG_DEVICE_V2") == std::string::npos, "\"0\" is silent (got '%s')", err.c_str());
     }
     {
-        envparse::ScopedEnv e("PXG_DEVICE_V2", "1");
-        PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"1\" -> device-local");
-    }
-    {
-        // Unrecognised: off, and warned at most once per process however often it is read.
+        // Unrecognised: the default (device-local), and warned at most once per process
+        // however often it is read.
         std::string err;
         {
             envparse::ScopedEnv e("PXG_DEVICE_V2", "true");
-            err += envparse::captureStderr([] { PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"true\" -> host-visible"); });
+            err += envparse::captureStderr([] { PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"true\" -> device-local"); });
         }
         {
-            envparse::ScopedEnv e("PXG_DEVICE_V2", "2");
-            err += envparse::captureStderr([] { PXG_CHECK_MSG(!pxgDeviceV2FromEnv(), "env \"2\" -> host-visible"); });
+            envparse::ScopedEnv e("PXG_DEVICE_V2", "off");
+            err += envparse::captureStderr([] { PXG_CHECK_MSG(pxgDeviceV2FromEnv(), "env \"off\" -> device-local"); });
         }
         const size_t warnings = envparse::countOf(err, "is not recognised");
         if (warnedAlready)
             PXG_CHECK_MSG(warnings == 0, "warning is once per process (%zu more seen)", warnings);
         else
-            PXG_CHECK_MSG(warnings == 1 && err.find("PXG_DEVICE_V2='true'") != std::string::npos,
-                          "exactly one warning naming the first bad value (%zu seen: '%s')", warnings, err.c_str());
+            PXG_CHECK_MSG(warnings == 1 && err.find("PXG_DEVICE_V2='true'") != std::string::npos &&
+                              err.find("default device-local") != std::string::npos,
+                          "exactly one warning naming the first bad value and the device-local default "
+                          "(%zu seen: '%s')",
+                          warnings, err.c_str());
     }
+
+    // The desc default matches the environment default, so a device created without
+    // consulting PXG_DEVICE_V2 (testP1PipelineCache, embedders) is device-local too.
+    PXG_CHECK_MSG(PxgSlangDeviceDesc().useDeviceLocalMemory, "PxgSlangDeviceDesc defaults to device-local");
 }
 
 }  // namespace

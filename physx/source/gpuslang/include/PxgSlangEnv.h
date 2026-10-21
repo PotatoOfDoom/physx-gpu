@@ -31,12 +31,22 @@
 // gpuslang-tests, so the two cannot drift apart again.
 //
 // PXG_DEVICE_V2 selects the device memory mode (PxgSlangDeviceDesc::useDeviceLocalMemory):
-//   unset, ""  or "0"  -> off: host-visible buffers (the default mode)
-//   "1"                -> on:  device-local buffers + staged transfers
-//   anything else      -> off, with a one-time warning on stderr naming the value.
-// Until this header the bridge took ANY set value (including "0") as on, while the suite
-// took anything but "0" as on; both now follow this table.  An unrecognised value falls
-// back to the default rather than guessing, and says so loudly.
+//   unset or ""        -> device-local buffers + staged transfers (the default mode)
+//   "1"                -> device-local buffers + staged transfers (same as the default)
+//   "0"                -> host-visible buffers (the opt-out)
+//   anything else      -> the default (device-local), with a one-time warning on stderr
+//                         naming the value.
+// The default used to be host-visible, with "1" opting into device-local.  It was flipped
+// because device-local is the production path on discrete GPUs: with host-visible bulk
+// buffers every kernel reads and writes system memory over PCIe unless the whole of VRAM
+// is host-visible (resizable BAR), so the old default cost the most exactly on the
+// hardware the module is for.  "0" therefore no longer means "the default"; it is the
+// explicit opt-out that keeps the host-visible mode reachable (UMA/software devices,
+// bisecting a mode-dependent result).  "1" stays accepted so existing scripts keep
+// working.  Before this header the bridge took ANY set value (including "0") as
+// device-local, while the suite took anything but "0" as device-local; both now follow
+// this table.  An unrecognised value falls back to the default rather than guessing,
+// and says so loudly.
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,23 +59,23 @@ namespace gpuslang
 
 enum class PxgDeviceV2Value
 {
-    eOFF,     // unset, "" or "0"
-    eON,      // "1"
-    eINVALID  // anything else (treated as off)
+    eDEVICE_LOCAL,  // unset, "" or "1" (the default)
+    eHOST_VISIBLE,  // "0"
+    eINVALID        // anything else (treated as the default, device-local)
 };
 
 // Pure parse of a PXG_DEVICE_V2 value (nullptr = unset); no side effects.
 inline PxgDeviceV2Value pxgParseDeviceV2(const char* value)
 {
-    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0)
-        return PxgDeviceV2Value::eOFF;
-    if (std::strcmp(value, "1") == 0)
-        return PxgDeviceV2Value::eON;
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "1") == 0)
+        return PxgDeviceV2Value::eDEVICE_LOCAL;
+    if (std::strcmp(value, "0") == 0)
+        return PxgDeviceV2Value::eHOST_VISIBLE;
     return PxgDeviceV2Value::eINVALID;
 }
 
 // Reads PXG_DEVICE_V2 and returns whether device-local memory is requested.  An
-// unrecognised value warns once per process and yields false (the default mode).
+// unrecognised value warns once per process and yields true (the default mode).
 inline bool pxgDeviceV2FromEnv()
 {
     const char* value = std::getenv("PXG_DEVICE_V2");
@@ -77,12 +87,12 @@ inline bool pxgDeviceV2FromEnv()
         {
             warned = true;
             std::fprintf(stderr,
-                         "[gpuslang] WARNING: PXG_DEVICE_V2='%s' is not recognised (use 0 or 1); "
-                         "using the default host-visible memory mode\n",
+                         "[gpuslang] WARNING: PXG_DEVICE_V2='%s' is not recognised (use 0 for host-visible, "
+                         "1 or unset for device-local); using the default device-local memory mode\n",
                          value);
         }
     }
-    return v == PxgDeviceV2Value::eON;
+    return v != PxgDeviceV2Value::eHOST_VISIBLE;
 }
 
 } // namespace gpuslang

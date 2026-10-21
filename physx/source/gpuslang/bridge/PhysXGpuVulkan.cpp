@@ -473,7 +473,7 @@ VulkanGpuRuntime* ensureRuntime()
     // when no discrete GPU is present, so a software-only CI box still comes up.
     const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
     desc.preferSoftwareDevice = (preferSw != nullptr) && (std::strcmp(preferSw, "0") != 0);
-    // PXG_DEVICE_V2: unset/""/"0" -> host-visible (default), "1" -> device-local + staged;
+    // PXG_DEVICE_V2: unset/""/"1" -> device-local + staged (default), "0" -> host-visible;
     // anything else warns and stays default.  Same parser as gpuslang-tests.
     desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
     // Pipeline cache across runs: the driver's compiled pipelines are reused, so a
@@ -494,8 +494,8 @@ VulkanGpuRuntime* ensureRuntime()
     if (!r.device)
         return nullptr;
     std::fprintf(stderr, "[PhysXGpuVulkan] device: %s, memory mode: %s\n", r.device->getDeviceName(),
-                 desc.useDeviceLocalMemory ? "device-local + staged (PXG_DEVICE_V2=1)"
-                                           : "host-visible (default)");
+                 desc.useDeviceLocalMemory ? "device-local + staged (default)"
+                                           : "host-visible (PXG_DEVICE_V2=0)");
 
     // Build the enum-indexed kernel manifest from the generated registry.  The
     // spirvFile/entry pointers reference static string data in the generated

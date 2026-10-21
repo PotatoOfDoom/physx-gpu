@@ -65,12 +65,14 @@ struct PxgSlangDeviceDesc
     // When true, prefer a software/CPU device (llvmpipe, WARP) if present —
     // used by the verification test suite.
     bool preferSoftwareDevice = false;
-    // When true, storage buffers live in device-local memory and all
-    // host<->device transfers go through persistently mapped staging rings
+    // When true (the default), storage buffers live in device-local memory and
+    // all host<->device transfers go through persistently mapped staging rings
     // (the production path for discrete GPUs).  When false, buffers are
-    // host-visible and transfers are direct maps (fast on UMA/software
-    // devices).  Kernel results are identical either way.
-    bool useDeviceLocalMemory = false;
+    // host-visible (VRAM under resizable BAR / UMA, else system memory).
+    // Kernel results are identical either way.  The engine bridge and
+    // gpuslang-tests set it from PXG_DEVICE_V2 (include/PxgSlangEnv.h: unset or
+    // "1" true, "0" false); the default here matches that table.
+    bool useDeviceLocalMemory = true;
     // Optional path to a VkPipelineCache blob on disk.  When set, the cache
     // is loaded at device creation and written back at destruction, so
     // pipeline (shader) compilation is reused across runs.  NULL disables

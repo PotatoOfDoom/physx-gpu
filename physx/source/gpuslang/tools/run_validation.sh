@@ -9,7 +9,9 @@
 #     subset[:0|:1]      gpuslang-tests on a small, fast set of suites (default both modes)
 #     scene:<label>|<env...>   one gpu-sdk-step row in build-sdk, e.g.
 #                        'scene:box|PXG_SCENE=box'  'scene:sb|PXG_SCENE=softbody PXG_SB_FLOOR=mesh'
-#                        (prefix the label with v1/ for PXG_DEVICE_V2=1: 'scene:v1/box|PXG_SCENE=box')
+#                        runs in mode 1 (device-local, the default); prefix the label with v0/
+#                        for mode 0 (host-visible): 'scene:v0/box|PXG_SCENE=box'.  v1/ is
+#                        still accepted and means mode 1.
 #   --best-practices     use validation/vk_layer_settings_bp.txt (perf advice; F5/F6 waived,
 #                        and the debug_utils special-use warning PXG_VK_DEBUG_NAMES causes)
 #   --out DIR            where the logs go (default: a fresh mktemp -d, removed on a PASS)
@@ -24,10 +26,13 @@
 # layer is a usage error (exit 2), not a skip: the caller asked for a layer.  The P9.98
 # baseline was measured with VVL 1.3.275.
 #
-# Memory modes: mode 0 runs with PXG_DEVICE_V2 UNSET (an inherited value is removed), mode
-# 1 with PXG_DEVICE_V2=1.  The bridge and the suite share one parser (include/PxgSlangEnv.h:
-# unset/""/"0" off, "1" on, anything else warns and is off), so "set to 0" is mode 0 too;
-# unsetting is kept so an inherited odd value cannot leak in.
+# Memory modes (the numbers are the PXG_DEVICE_V2 values): mode 0 = host-visible, run with
+# PXG_DEVICE_V2=0; mode 1 = device-local + staged, the default, run with PXG_DEVICE_V2 UNSET
+# (an inherited value is removed), i.e. exactly as a user gets it.  The bridge and the suite
+# share one parser (include/PxgSlangEnv.h: unset/""/"1" device-local, "0" host-visible,
+# anything else warns and is device-local), so "set to 1" is mode 1 too; unsetting is kept
+# so an inherited odd value cannot leak in.  Mode 0 must be set explicitly: since the
+# default flip, an unset variable no longer selects it.
 #
 # What it sets: VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation, VK_LAYER_SETTINGS_PATH to
 # the project config (core + sync + thread safety, no message cap), PXG_VK_DEBUG_NAMES=1 so
@@ -143,9 +148,10 @@ if ! grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$OUT/preflig
 fi
 
 SUBSET="pipelineRefusal scan p6Indirect solverTGS sdfFind sdfParticle psSdfMidphase psDiffuseContactGen shimBindless"
-# Run "$@" in memory mode $1: 0 = PXG_DEVICE_V2 removed from the environment, 1 = set to 1.
+# Run "$@" in memory mode $1: 0 = PXG_DEVICE_V2=0 (host-visible), 1 = PXG_DEVICE_V2 removed
+# from the environment (device-local, the default).
 in_mode() {
-    if [ "$1" = 1 ]; then shift; env PXG_DEVICE_V2=1 "$@"; else shift; env -u PXG_DEVICE_V2 "$@"; fi
+    if [ "$1" = 0 ]; then shift; env PXG_DEVICE_V2=0 "$@"; else shift; env -u PXG_DEVICE_V2 "$@"; fi
 }
 runfail=0
 logs=""
@@ -172,8 +178,8 @@ while IFS= read -r w; do
             done
             echo "run_validation.sh: subset ($SUBSET) ran in modes $modes" ;;
         scene:*)
-            row="${w#scene:}"; lab="${row%%|*}"; envs="${row#*|}"; m=0
-            case "$lab" in v1/*) m=1; lab="${lab#v1/}" ;; esac
+            row="${w#scene:}"; lab="${row%%|*}"; envs="${row#*|}"; m=1
+            case "$lab" in v0/*) m=0; lab="${lab#v0/}" ;; v1/*) m=1; lab="${lab#v1/}" ;; esac
             log="$OUT/scene_v${m}_$lab.log"
             # shellcheck disable=SC2086
             ( cd "$BUILD_S" && in_mode $m $envs PXG_GPU_STEP=1 ./gpu-sdk-step ) > "$log" 2>&1

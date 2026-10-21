@@ -866,8 +866,8 @@ PXG_TEST(convexSatStages)
         // The probe reads convexPlaneN/D at `probeIndex`, and stage 1 only writes
         // the first nbPolygons entries of that groupshared array.  An out-of-range
         // probe therefore reads whatever the previous dispatch left behind -- which
-        // happened to be zero in the default allocator and was NOT zero under
-        // PXG_DEVICE_V2, so the first version of the "separated by an edge-cross
+        // happened to be zero in the host-visible memory mode and was NOT zero in
+        // the device-local one, so the first version of the "separated by an edge-cross
         // axis only" case passed one memory mode and failed the other.
         PXG_CHECK_MSG(c.probeIndex < c.nbPolygons && c.probeIndex < c.nbVerts,
                       "[%s] probeIndex %u is inside the hull (%u polygons, %u vertices)",

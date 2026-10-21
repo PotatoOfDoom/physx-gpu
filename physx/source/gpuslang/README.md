@@ -114,14 +114,20 @@ into a bound blob.
 
 The device has two memory modes, and the suite runs in both:
 
-- **Default:** host-visible buffers.
-- **`PXG_DEVICE_V2=1`:** device-local buffers with staged transfers and
-  timeline-semaphore synchronisation.
+- **Default (unset, or `PXG_DEVICE_V2=1`):** device-local buffers with staged
+  transfers and timeline-semaphore synchronisation. This is the production path on
+  discrete GPUs. A buffer that no longer fits in VRAM falls back to system memory
+  (slower, still correct), with a one-time note on stderr.
+- **`PXG_DEVICE_V2=0`:** host-visible buffers. Bulk buffers are placed in VRAM when
+  the whole of it is host-visible (resizable BAR / UMA: a `DEVICE_LOCAL|HOST_VISIBLE`
+  type on a heap of at least 1 GiB), otherwise in host-visible system memory, where
+  every kernel access crosses PCIe.
 
-In the default mode, bulk buffers are placed in VRAM when the whole of it is
-host-visible (resizable BAR / UMA: a `DEVICE_LOCAL|HOST_VISIBLE` type on a heap of
-at least 1 GiB), otherwise in host-visible system memory. Pinned
-(`cuMemHostAlloc`) memory prefers CPU-cached system memory in both modes.
+Until this change the default was host-visible and `PXG_DEVICE_V2=1` opted into
+device-local. The default was flipped because host-visible bulk buffers are slowest
+exactly on the discrete GPUs the module targets; `0` is now the explicit opt-out
+(UMA/software devices, or bisecting a result that differs between the modes).
+Pinned (`cuMemHostAlloc`) memory prefers CPU-cached system memory in both modes.
 
 Kernel pipelines are built when first needed, and a build compiles the SPIR-V
 in the driver -- hundreds of milliseconds for the largest kernels on real
@@ -155,15 +161,30 @@ does a `bpSignalComplete` launch, whose pinned flag the engine spin-waits on.
 The engine bridge and `gpuslang-tests` parse `PXG_DEVICE_V2` with the same
 helper (`include/PxgSlangEnv.h`):
 
-- unset, empty or `0`: default mode;
-- `1`: device-local mode;
-- any other value: default mode, with a one-time warning on stderr that names
-  the value.
+- unset, empty or `1`: device-local mode (the default);
+- `0`: host-visible mode;
+- any other value: the default (device-local), with a one-time warning on stderr
+  that names the value.
+
+`PxgSlangDeviceDesc::useDeviceLocalMemory` defaults to `true` to match, so a device
+created without consulting the variable is device-local too.
 
 The bridge prints the chosen mode once at startup, for example
-`[PhysXGpuVulkan] device: llvmpipe (...), memory mode: host-visible (default)`.
-`gpuslang-tests` appends `[v2: device-local + staged]` to its backend line.
-Earlier versions of the bridge treated any set value, `0` included, as on.
+`[PhysXGpuVulkan] device: llvmpipe (...), memory mode: device-local + staged (default)`
+or `... memory mode: host-visible (PXG_DEVICE_V2=0)`. `gpuslang-tests` appends
+`[memory: device-local + staged]` or `[memory: host-visible, PXG_DEVICE_V2=0]` to its
+backend line. Earlier versions of the bridge treated any set value, `0` included, as
+device-local, and before the default flip an unset variable meant host-visible.
+
+`ctest` does not pin a mode: the tests inherit `PXG_DEVICE_V2` from the caller.
+A plain `ctest` therefore tests the device-local default, and `PXG_DEVICE_V2=0 ctest`
+the host-visible mode. `tools/run_suite.sh` runs both (device-local with the variable
+removed, host-visible with `=0`). Independent of the suite-wide mode, `p1DeviceV2`
+always checks a dedicated device-local device and `p1DeviceV2HostVisible` a dedicated
+host-visible one, so every run covers both memory paths. `tools/run_scenes.sh` also
+inherits the mode and prints it at the top of its log (`--resume` refuses a log
+from the other mode); run it again with
+`PXG_DEVICE_V2=0` for the host-visible sweep.
 
 ### Warp-level code
 
@@ -327,7 +348,8 @@ Requirements:
 # 1. Kernels + verification suite (also builds the shaders into build-gpuslang/shaders)
 cmake -S physx/source/gpuslang/tests -B build-gpuslang -DCMAKE_BUILD_TYPE=Release
 cmake --build build-gpuslang -j
-ctest --test-dir build-gpuslang -j4 --output-on-failure      # sets PXG_SHADER_DIR itself
+ctest --test-dir build-gpuslang -j4 --output-on-failure      # sets PXG_SHADER_DIR itself; device-local
+PXG_DEVICE_V2=0 ctest --test-dir build-gpuslang -j4 --output-on-failure   # host-visible
 sh physx/source/gpuslang/tools/run_suite.sh build-gpuslang   # both memory modes, archives failures
 
 # 2. Full SDK + GPU scene harness (CPU SDK and the unmodified gpu* host modules, no CUDA toolkit)
@@ -335,14 +357,16 @@ cmake -S physx/source/gpuslang/sdktest -B build-sdk -DCMAKE_BUILD_TYPE=Release
 cmake --build build-sdk -j --target gpu-sdk-step
 cd build-sdk
 PXG_SHADER_DIR=../build-gpuslang/shaders PXG_SCENE=box PXG_GPU_STEP=1 ./gpu-sdk-step
-sh ../physx/source/gpuslang/tools/run_scenes.sh              # all 85 rows + refusal control
+sh ../physx/source/gpuslang/tools/run_scenes.sh              # all 85 rows + refusal control (device-local)
+PXG_DEVICE_V2=0 sh ../physx/source/gpuslang/tools/run_scenes.sh   # the same in host-visible mode
 cd ..
 
 # 3. Validation-layer run (needs VK_LAYER_KHRONOS_validation; PXG_VVL_DIR = extracted
 #    vulkan-validationlayers package if none is installed)
 sh physx/source/gpuslang/tools/run_validation.sh subset            # fast, both modes
 sh physx/source/gpuslang/tools/run_validation.sh suite             # whole suite, both modes
-sh physx/source/gpuslang/tools/run_validation.sh 'scene:box|PXG_SCENE=box'
+sh physx/source/gpuslang/tools/run_validation.sh 'scene:box|PXG_SCENE=box'     # device-local
+sh physx/source/gpuslang/tools/run_validation.sh 'scene:v0/box|PXG_SCENE=box'  # host-visible
 ```
 
 Notes:

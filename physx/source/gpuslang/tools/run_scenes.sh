@@ -59,6 +59,19 @@ if [ -z "${PXG_SHADER_DIR:-}" ] || [ ! -d "$PXG_SHADER_DIR" ]; then
 fi
 export PXG_SHADER_DIR
 echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR" 
+# The memory mode is inherited from the caller, so name it in the log: a LOG is only
+# comparable with (and only --resume-able from) a run in the same mode.  Unset, "" and
+# "1" are device-local + staged (the default); PXG_DEVICE_V2=0 is host-visible
+# (include/PxgSlangEnv.h).  Run the sweep with PXG_DEVICE_V2=0 to cover the other mode.
+case "${PXG_DEVICE_V2-}" in
+    0) MEM_MODE="host-visible" ;;
+    *) MEM_MODE="device-local + staged" ;;
+esac
+case "${PXG_DEVICE_V2-}" in
+    ""|1) echo "run_scenes.sh: memory mode: $MEM_MODE (default; PXG_DEVICE_V2='${PXG_DEVICE_V2-}')" ;;
+    0)    echo "run_scenes.sh: memory mode: $MEM_MODE (PXG_DEVICE_V2=0)" ;;
+    *)    echo "run_scenes.sh: memory mode: $MEM_MODE (PXG_DEVICE_V2='$PXG_DEVICE_V2' is not recognised; the bridge warns and uses the default)" ;;
+esac
 
 # The 32 named scenes.  The settling bag below makes 33 -- the figure
 # RUNTIME_STATUS.md's header carries.  clothbox joined in P9.15a: `cloth` is a
@@ -132,11 +145,30 @@ if [ "${1:-}" = "--strict" ]; then export PXG_REQUIRE_MAPPED=1; shift; fi
 # ok the same way a fresh run would.  Only use a log produced from the same shaders.
 RESUME_LOG=""
 if [ "${1:-}" = "--resume" ]; then RESUME_LOG="${2:?--resume needs a log file}"; shift 2; fi
+# An "ok" carried over from a run in the other memory mode would vouch for a mode that
+# was never run.  A log that names a different mode is refused; one from before the
+# mode line (when unset meant host-visible) cannot be checked, so it is only flagged.
+if [ -n "$RESUME_LOG" ]; then
+    prev_mode="$(grep -m1 '^run_scenes.sh: memory mode: ' "$RESUME_LOG" 2>/dev/null)"
+    case "$prev_mode" in
+        "") echo "run_scenes.sh: WARNING: $RESUME_LOG names no memory mode (it predates the line);" \
+                 "only resume from it if it ran in $MEM_MODE mode" >&2 ;;
+        "run_scenes.sh: memory mode: $MEM_MODE "*) ;;
+        *)  echo "run_scenes.sh: --resume $RESUME_LOG ran in another memory mode:" >&2
+            echo "  $prev_mode" >&2
+            echo "  this run is $MEM_MODE; start a fresh log or set PXG_DEVICE_V2 to match" >&2
+            exit 2 ;;
+    esac
+fi
 carried=0
 
 run_one() {
     label="$1"; shift
-    if [ -n "$RESUME_LOG" ] && grep -qxF "ok       $label" "$RESUME_LOG"; then
+    # A row that <log> itself carried over counts too, so a resume can be resumed
+    # (a sweep that outlives two time limits): "ok       <label>" exactly, or that
+    # followed by the "   (carried over from ...)" suffix -- never a longer label.
+    if [ -n "$RESUME_LOG" ] && awk -v want="ok       $label" -v pre="ok       $label   (carried over from " \
+            '$0 == want || index($0, pre) == 1 { found = 1; exit } END { exit !found }' "$RESUME_LOG"; then
         echo "ok       $label   (carried over from $RESUME_LOG)"
         pass=$((pass+1)); carried=$((carried+1))
         return

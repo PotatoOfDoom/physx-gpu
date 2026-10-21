@@ -50,15 +50,22 @@ PxgSlangComputeDevice* testDevice()
         // PXG_PREFER_SOFTWARE_DEVICE is not set.
         const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
         desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
-        // v2 device mode (RUNTIME_PLAN.md P1): device-local buffers + staged
-        // transfers; lets the whole bit-exact suite re-run through the
-        // production memory path.  PXG_DEVICE_V2 is parsed by the helper the
-        // engine bridge shares (include/PxgSlangEnv.h): unset/""/"0" off, "1" on.
+        // Memory mode (RUNTIME_PLAN.md P1): device-local buffers + staged
+        // transfers by default (the production path); PXG_DEVICE_V2=0 re-runs
+        // the whole bit-exact suite with host-visible buffers.  PXG_DEVICE_V2 is
+        // parsed by the helper the engine bridge shares (include/PxgSlangEnv.h):
+        // unset/""/"1" device-local, "0" host-visible.
         desc.useDeviceLocalMemory = physx::gpuslang::pxgDeviceV2FromEnv();
+        // Only the Vulkan backend honours useDeviceLocalMemory; the D3D12 backend always
+        // allocates custom-heap (CPU write-back) buffers, so it gets no memory label.
+        bool vulkan = true;
 #if defined(_WIN32)
         const char* backend = std::getenv("PXG_TEST_BACKEND");
         if (backend && std::strcmp(backend, "dx12") == 0)
+        {
             device = physx::gpuslang::PxgCreateDx12ComputeDevice(desc);
+            vulkan = false;
+        }
         else
             device = physx::gpuslang::PxgCreateVulkanComputeDevice(desc);
 #else
@@ -67,7 +74,9 @@ PxgSlangComputeDevice* testDevice()
         if (device)
             std::printf("[gpuslang-tests] backend: %s, device: %s%s\n", device->getBackendName(),
                         device->getDeviceName(),
-                        desc.useDeviceLocalMemory ? " [v2: device-local + staged]" : "");
+                        !vulkan                     ? ""
+                        : desc.useDeviceLocalMemory ? " [memory: device-local + staged]"
+                                                    : " [memory: host-visible, PXG_DEVICE_V2=0]");
     }
     return device;
 }

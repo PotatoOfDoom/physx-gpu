@@ -33,7 +33,7 @@
 //     wait()/poll() synchronize on tickets; flush() == wait(submit()).  A
 //     blocking-fence fallback covers devices without timeline semaphores.
 //   - Memory (RUNTIME_PLAN.md P1.2): PxgSlangDeviceDesc.useDeviceLocalMemory
-//     selects DEVICE_LOCAL storage buffers with all host<->device transfers
+//     (the default; PXG_DEVICE_V2=0 turns it off) selects DEVICE_LOCAL storage buffers with all host<->device transfers
 //     staged through a persistently mapped per-frame ring (the discrete-GPU
 //     production path; transfer<->compute edges use per-buffer barriers).
 //     Otherwise buffers are HOST_VISIBLE|HOST_COHERENT and transfers are
@@ -1025,8 +1025,9 @@ public:
 
         vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProperties);
         // Resizable BAR / UMA: a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type on a large
-        // heap (a plain BAR window is 256 MiB).  The default memory mode then keeps its
-        // host-visible bulk buffers in VRAM.
+        // heap (a plain BAR window is 256 MiB).  The host-visible memory mode
+        // (PXG_DEVICE_V2=0) then keeps its bulk buffers in VRAM.  The device-local mode
+        // (the default) does not consult this.
         for (uint32_t i = 0; i < mMemoryProperties.memoryTypeCount; ++i)
         {
             const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -1047,7 +1048,8 @@ public:
 
     PxgBufferHandle createBuffer(size_t sizeBytes) override
     {
-        // v2 memory mode: DEVICE_LOCAL storage with staged transfers.  The
+        // Device-local memory mode (the default): DEVICE_LOCAL storage with staged
+        // transfers; PXG_DEVICE_V2=0 selects host-visible storage instead.  The
         // staged path is taken even when the winning memory type happens to
         // also be host-visible (UMA/software devices) so the production
         // transfer path is exercised everywhere, CI included.
@@ -1109,10 +1111,12 @@ public:
         //   pinned (persistentMap): system memory, CPU-cached when offered -- the engine
         //     reads results back through these mappings, and reads from write-combined
         //     memory are an order of magnitude slower;
-        //   default-mode bulk buffers (hostVisible): VRAM when all of it is host-visible
-        //     (resizable BAR, UMA), else system memory -- kernels read and write these,
-        //     and over PCIe that bounds every kernel;
-        //   v2 bulk buffers: DEVICE_LOCAL.
+        //   host-visible-mode bulk buffers (hostVisible, PXG_DEVICE_V2=0): VRAM when all
+        //     of it is host-visible (resizable BAR, UMA), else system memory -- kernels
+        //     read and write these, and over PCIe that bounds every kernel;
+        //   device-local-mode bulk buffers (the default): DEVICE_LOCAL, falling back to
+        //     system memory when VRAM cannot take the allocation.  Both modes stage their
+        //     transfers (upload/download never map a bulk buffer), so any type is correct.
         const VkMemoryPropertyFlags hostFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         uint32_t memoryType = kNoMemoryType;
         uint32_t fallbackType = kNoMemoryType;
@@ -1130,7 +1134,14 @@ public:
             fallbackType = findMemoryType(memReq.memoryTypeBits, hostFlags);
         }
         else
+        {
             memoryType = findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            // VRAM exhausted (the device-local mode is the default, so a large scene on a
+            // smaller card lands here): system memory is slower over PCIe but correct,
+            // where refusing the buffer would fail the scene.
+            fallbackType = findMemoryTypePreferred(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
         if (memoryType == kNoMemoryType)
         {
             memoryType = fallbackType;
@@ -1151,9 +1162,16 @@ public:
         r = madeOrNull(allocateMemoryCounted(&allocInfo, &buf.memory), &buf.memory);
         if (r != VK_SUCCESS && fallbackType != kNoMemoryType)
         {
-            // e.g. the host-visible VRAM heap is full: the slower type still works.
+            // e.g. the (host-visible) VRAM heap is full: the slower type still works.
             allocInfo.memoryTypeIndex = fallbackType;
             r = madeOrNull(allocateMemoryCounted(&allocInfo, &buf.memory), &buf.memory);
+            if (r == VK_SUCCESS && !hostVisible && !persistentMap && !mWarnedDeviceLocalFallback)
+            {
+                mWarnedDeviceLocalFallback = true;
+                std::fprintf(stderr, "[PxgVulkan] %s(%zu B): device-local memory exhausted; this and later "
+                                     "buffers may live in system memory (slower, still correct)\n",
+                             caller, sizeBytes);
+            }
         }
         if (r != VK_SUCCESS)
             return refuseBuffer(buf, caller, sizeBytes, "vkAllocateMemory", r);
@@ -1321,7 +1339,7 @@ public:
             memcpy(data, static_cast<const uint8_t*>(buf.mappedPtr) + srcOffset, sizeBytes);
             return;
         }
-        // Host-visible bulk buffers (default memory mode) take the staged path too:
+        // Host-visible bulk buffers (PXG_DEVICE_V2=0) take the staged path too:
         // with resizable BAR they live in VRAM, and CPU reads through that mapping are
         // uncached PCIe reads; the staging ring is CPU-cached system memory.
         // Staged path: the readback copy is recorded after everything recorded so far
@@ -3004,6 +3022,7 @@ private:
     VkFence mFence = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties mMemoryProperties = {};
     bool mLargeHostVisibleVram = false;
+    bool mWarnedDeviceLocalFallback = false;  // one note per device, not per buffer
 
     std::unordered_map<PxgBufferHandle, Buffer> mBuffers;
     std::unordered_map<PxgPipelineHandle, Pipeline> mPipelines;
