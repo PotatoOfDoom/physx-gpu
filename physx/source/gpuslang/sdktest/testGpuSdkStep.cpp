@@ -4541,6 +4541,58 @@ float diffuseMaxLifetime(const ParticleScene& psc)
     return hi;
 }
 
+// PXG_DIFFUSE_STALE_PROBE -- the repro for the "first read after fetchResults(true) is one
+// frame stale" observation of the particlediffuse drain.  Per drain step it takes TWO
+// back-to-back snapshots exactly the way diffuseMaxLifetime does -- the published count
+// (getNbActiveDiffuseParticles, a plain CPU load of the pinned word ps_diffuseParticleCopy
+// writes through its mapped pointer) and then a memcpyDtoH of the WHOLE MAX_DIFFUSE array --
+// and splits the two inputs of the reading apart:
+//   count  : n0 (read before any copy) vs n1 (read after the first memcpyDtoH drained the queue)
+//   array  : the two full-array copies, bitwise
+//   reading: max lifetime over [0, n0) of copy A vs over [0, n1) of copy B, and over [0, n1) of A
+// so a stale reading is attributed to the count or to the array.  Mode 2 calls
+// PxScene::fetchResultsParticleSystem() -- the upstream API that synchronizes the particle
+// finalize stream (NpSceneFetchResults.cpp, PxgSimulationController::syncParticleData) --
+// before the first snapshot; mode 1 does not, which is what the drain loop did before it
+// made that call itself (the probe runs ahead of it, so mode 1 still shows the stale count).
+//
+// PXG_DIFFUSE_NO_PARTICLE_SYNC=1 drops the fetchResultsParticleSystem() calls every PBD
+// particle scene's loop makes after fetchResults(true) (the shared scored loop, the
+// particlediffuse drain, particle2, particlepush, particlesoftbody, particleapply) -- the harness as it was before the call was
+// added, kept so the drain's "count is final" check can be shown red on demand.
+static bool particleSyncSkipped() { return std::getenv("PXG_DIFFUSE_NO_PARTICLE_SYNC") != nullptr; }
+
+struct DiffuseStaleCounts
+{
+    PxU32 steps = 0, countMoved = 0, arrayMoved = 0, readingStale = 0, readingStaleCorrectN = 0;
+};
+
+void diffuseStaleProbe(const ParticleScene& psc, PxScene* scene, int mode, int step, DiffuseStaleCounts& c)
+{
+    if (!psc.diffuse) return;
+    if (mode == 2) scene->fetchResultsParticleSystem();
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    const CUdeviceptr d = reinterpret_cast<CUdeviceptr>(psc.diffuse->getDiffusePositionLifeTime());
+    std::vector<PxVec4> a(MAX_DIFFUSE), b(MAX_DIFFUSE);
+    const PxU32 n0 = PxMin(psc.diffuse->getNbActiveDiffuseParticles(), MAX_DIFFUSE);
+    ctx->memcpyDtoH(a.data(), d, MAX_DIFFUSE * sizeof(PxVec4));
+    const PxU32 n1 = PxMin(psc.diffuse->getNbActiveDiffuseParticles(), MAX_DIFFUSE);
+    ctx->memcpyDtoH(b.data(), d, MAX_DIFFUSE * sizeof(PxVec4));
+    float lifeA = 0.0f, lifeB = 0.0f, lifeAn1 = 0.0f;
+    for (PxU32 i = 0; i < n0; ++i) lifeA = PxMax(lifeA, a[i].w);
+    for (PxU32 i = 0; i < n1; ++i) { lifeB = PxMax(lifeB, b[i].w); lifeAn1 = PxMax(lifeAn1, a[i].w); }
+    const bool arrayMoved = std::memcmp(a.data(), b.data(), MAX_DIFFUSE * sizeof(PxVec4)) != 0;
+    ++c.steps;
+    c.countMoved += n0 != n1 ? 1u : 0u;
+    c.arrayMoved += arrayMoved ? 1u : 0u;
+    c.readingStale += lifeA != lifeB ? 1u : 0u;
+    c.readingStaleCorrectN += lifeAn1 != lifeB ? 1u : 0u;
+    if (n0 != n1 || arrayMoved || lifeA != lifeB)
+        std::printf("    stale-probe step %3d: count %u -> %u, array %s, max lifetime %.5f [0,n0) of A vs "
+                    "%.5f [0,n1) of B (A over [0,n1): %.5f)\n",
+                    step, n0, n1, arrayMoved ? "MOVED" : "identical", lifeA, lifeB, lifeAn1);
+}
+
 // ---------------------------------------------------------------------------
 // P9.95 -- PXG_SCENE=particleapply: per-buffer ingest of edited user arrays in a scene
 // with eENABLE_DIRECT_GPU_API and a PBD particle system.
@@ -5002,6 +5054,10 @@ static P2Run runParticle2(PxPhysics* physics, const PxSceneDesc& desc, PxMateria
             }
             scene->simulate(1.0f / 60.0f);
             scene->fetchResults(true);
+            // The diffuse counts below are pinned words the particle stream writes;
+            // fetchResults(true) does not wait for that stream, this does (see
+            // the particle scenes' scored loop in main()).
+            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
             for (int k = 0; k < 2; ++k)
                 if (dbuf[k]) r.diffusePeak[k] = PxMax(r.diffusePeak[k], dbuf[k]->getNbActiveDiffuseParticles());
             if (i == 1 || i == 20 || i == 30)
@@ -8934,6 +8990,8 @@ int main()
         {
             scene->simulate(dt);
             scene->fetchResults(true);
+            // The particle arrays are only final after this call (see the scored loop below).
+            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
             box = psc.pushBox->getGlobalPose().p;
             cloudX = particleMeanX(psc);
             finite = finite && box.isFinite() && std::isfinite(cloudX);
@@ -9046,6 +9104,12 @@ int main()
         {
             scene->simulate(dt);
             scene->fetchResults(true);
+            // fetchResults(true) waits for the CPU tasks only, not for the PBD particle
+            // streams; the published buffer counts (getNbActiveDiffuseParticles, a CPU load
+            // of a pinned word the GPU writes) are only final after this call, in 5.6.1 and
+            // 5.12 alike -- SnippetPBF.cpp calls it right after fetchResults for the same
+            // reason.  See the drain-loop note on the diffuse aging check.
+            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
             const float y = particleMeanY(psc);
             if (i < 5 || i == steps - 1 || ((bagMode || fluidScene) && (i % 30 == 0)))
             {
@@ -9373,13 +9437,16 @@ int main()
                     // other diffuse params are read back and kept) and the scene steps on.  With no new particles,
                     //   (a) the population may never grow,
                     //   (b) the OLDEST survivor's lifetime must fall by dt per frame
-                    //       (DIFFUSE_DRAIN_PROBE frames -> 1.0 s, tolerance one frame), and
+                    //       (DIFFUSE_DRAIN_PROBE frames -> 1.0 s, exactly: tolerance a tenth
+                    //       of a frame, see the tolerance note), and
                     //   (c) after one full DIFFUSE_LIFETIME the buffer must be EMPTY.
                     // A chain that never decays fails (b) and (c) (flat lifetime, full
-                    // buffer); one that decays at the wrong rate fails (b).  Measured: TGS
-                    // 4032 -> 0 (2495 at the probe), PGS 3981 -> 0 (2159), ONCE 3827 -> 0
-                    // (2206), oldest lifetime falling 1.0167 / 1.0167 / 1.0000 over the probe
-                    // (TGS also 0.9833 and 1.0000 in other runs -- see the tolerance note);
+                    // buffer); one that decays at the wrong rate fails (b).  Measured with the
+                    // particle sync in place (both memory modes alike): TGS 4032 -> 0 (2467 at
+                    // the probe), PGS 3981 -> 0 (2123), oldest lifetime falling 1.0000 on both.
+                    // Before the sync (see the tolerance note) the probe counts read one frame
+                    // late -- TGS 2495, PGS 2159, ONCE 3827 -> 0 (2206) -- and the decay read
+                    // 0.9833 / 1.0000 / 1.0167 from run to run;
                     // a no-aging mutant (lifeDelta zeroed in psDiffuseAdvect.slang, one .spv)
                     // stays at 4096 -> 4096 with decay 0.0000 on both solvers and fails (b)
                     // and (c).  PXG_DIFFUSE_DRAIN_TRACE=1 prints the drain step by step.
@@ -9388,16 +9455,34 @@ int main()
                         PxDiffuseParticleParams drainDp = psc.diffuse->getDiffuseParticleParams();
                         drainDp.threshold = 1.0e12f;
                         psc.diffuse->setDiffuseParticleParams(drainDp);
-                        PxU32 prevN = endDiffuseSeen, grew = 0u, nAtProbe = 0u;
+                        PxU32 prevN = endDiffuseSeen, grew = 0u, nAtProbe = 0u, countLagged = 0u;
                         float life1 = 0.0f, lifeProbe = 0.0f;
                         if (std::getenv("PXG_DIFFUSE_DRAIN_TRACE"))
                             std::printf("    drain step   0: %u diffuse, oldest lifetime %.5f\n",
                                         endDiffuseSeen, diffuseMaxLifetime(psc));
+                        const char* staleEnv = std::getenv("PXG_DIFFUSE_STALE_PROBE");
+                        const int staleMode = staleEnv ? std::atoi(staleEnv) : 0;
+                        DiffuseStaleCounts stale;
                         for (int k = 1; k <= DIFFUSE_DRAIN_STEPS; ++k)
                         {
                             scene->simulate(dt);
                             scene->fetchResults(true);
+                            // The probe runs BEFORE the particle sync, so mode 1 still
+                            // reproduces the unsynchronized read this loop used to make.
+                            if (staleMode > 0) diffuseStaleProbe(psc, scene, staleMode, k, stale);
+                            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
                             const PxU32 n = psc.diffuse->getNbActiveDiffuseParticles();
+                            // COUNT IS FINAL: a one-element memcpyDtoH submits and waits for
+                            // everything recorded so far, so a count that changes across it was
+                            // read before the GPU had published it.  After
+                            // fetchResultsParticleSystem() it must never change.
+                            {
+                                PxVec4 one;
+                                psc.cudaCtx->getCudaContext()->memcpyDtoH(&one,
+                                    reinterpret_cast<CUdeviceptr>(psc.diffuse->getDiffusePositionLifeTime()),
+                                    sizeof(PxVec4));
+                                if (psc.diffuse->getNbActiveDiffuseParticles() != n) ++countLagged;
+                            }
                             if (n > prevN) ++grew;
                             prevN = n;
                             if (std::getenv("PXG_DIFFUSE_DRAIN_TRACE") && (k <= 6 || k % 30 == 0))
@@ -9407,29 +9492,61 @@ int main()
                             if (k == 1 + DIFFUSE_DRAIN_PROBE)
                             { lifeProbe = diffuseMaxLifetime(psc); nAtProbe = n; }
                         }
+                        if (staleMode > 0)
+                            std::printf("  particle DIFFUSE stale-probe (mode %d, %s): %u steps; count moved "
+                                        "between the reads in %u, array moved in %u, max-lifetime reading "
+                                        "differed in %u (%u with the post-drain count applied to the first "
+                                        "copy)\n",
+                                        staleMode, staleMode == 2 ? "fetchResultsParticleSystem first"
+                                                                  : "fetchResults(true) only",
+                                        stale.steps, stale.countMoved, stale.arrayMoved, stale.readingStale,
+                                        stale.readingStaleCorrectN);
                         const float decay = life1 - lifeProbe;
                         const float wantDecay = float(DIFFUSE_DRAIN_PROBE) * dt;
                         std::printf("  particle DIFFUSE drain (threshold raised to 1e12 after the "
                                     "scored run): %u -> %u after %d steps (%u at step %d); oldest "
                                     "lifetime %.4f -> %.4f over %d steps (decay %.4f, expected "
-                                    "%.4f); %u step(s) grew\n",
+                                    "%.4f); %u step(s) grew; count changed after the read in %u\n",
                                     endDiffuseSeen, prevN, DIFFUSE_DRAIN_STEPS, nAtProbe,
                                     1 + DIFFUSE_DRAIN_PROBE, life1, lifeProbe, DIFFUSE_DRAIN_PROBE,
-                                    decay, wantDecay, grew);
+                                    decay, wantDecay, grew, countLagged);
+                        // The deterministic half of the regression for the stale-read report
+                        // (see the tolerance note below): without the particle sync this
+                        // measured 227 of 250 in both memory modes, with it 0.
+                        if (countLagged != 0u)
+                        { std::printf("FAIL: the published diffuse count changed after it was read in "
+                                      "%u drain step(s) -- it was read before the particle stream had "
+                                      "finished (fetchResultsParticleSystem() missing?)\n", countLagged);
+                          ++failures; }
                         if (grew != 0u)
                         { std::printf("FAIL: the diffuse population GREW in %u drain step(s) with "
                                       "the spawn threshold out of reach\n", grew);
                           ++failures; }
-                        // The tolerance is ONE FRAME (dt), not float noise: the first DtoH read
-                        // after fetchResults(true) occasionally returns the PREVIOUS frame's
-                        // diffuse array -- measured by reading twice in a row (drain steps 1,
-                        // 56, 105, 110, 125, 228 of one TGS run: first read = the step before,
-                        // second read = this step), so either probe may be one frame stale and
-                        // the decay reads 59, 60 or 61 frames' worth (0.9833 / 1.0000 / 1.0167
-                        // measured).  That is a read-ordering issue of this port, not aging, and
-                        // it is open.  One frame is still 60x finer than the no-aging mutant's
-                        // 0.0000 and catches any decay at the wrong rate (substep dt, dt/2, 2dt).
-                        if (!(nAtProbe > 0u && std::fabs(decay - wantDecay) < 1.05f * dt))
+                        // The tolerance is a TENTH OF A FRAME: the decay must be exactly
+                        // DIFFUSE_DRAIN_PROBE frames' worth, so 59 or 61 frames (0.9833 / 1.0167)
+                        // fail.  It used to be one frame, because either probe read could be one
+                        // frame stale.  That was THIS HARNESS, not the port and not a 5.12 change
+                        // (PXG_DIFFUSE_STALE_PROBE=1 vs =2, both memory modes): the stale input was
+                        // the COUNT, not the array.  The memcpyDtoH copies are always current (they
+                        // drain the one queue); getNbActiveDiffuseParticles() is a CPU load of the
+                        // pinned word ps_diffuseParticleCopy writes on the PBD core's non-blocking
+                        // stream, and fetchResults(true) waits only for the CPU tasks
+                        // (NpSceneFetchResults.cpp, mPhysicsDone).  UPSTREAM CONTRACT, 5.6.1 and
+                        // 5.12 alike: only PxScene::fetchResultsParticleSystem() (->
+                        // PxgSimulationController::syncParticleData -> streamSynchronize(
+                        // mFinalizeStream)) makes the particle results final, which is why
+                        // SnippetPBF / SnippetPBFMultiMat / SnippetIsosurface call it right after
+                        // fetchResults.  Without it the count read first was the previous frame's
+                        // in every step whose count changed (227 of 250), and the max over that
+                        // longer range picked up stale tail slots whenever the youngest particle
+                        // sat there (13-18 of 250).  On CUDA the same read is a race the GPU usually
+                        // wins (and the legacy-stream cuMemcpyDtoH does not wait for the
+                        // non-blocking particle stream either); here recorded work waits for the
+                        // next submit, so it always lost.  This loop, the scored loop and every
+                        // other PBD particle scene's loop now call
+                        // fetchResultsParticleSystem() after every fetchResults(true); mode 1 of
+                        // the probe still reads before that call, to keep the repro.
+                        if (!(nAtProbe > 0u && std::fabs(decay - wantDecay) < 0.1f * dt))
                         { std::printf("FAIL: the oldest diffuse particle's lifetime fell by %.4f "
                                       "over %d steps, expected %.4f (dt per step) -- the lifetime "
                                       "is not being decayed at the frame rate\n",
@@ -10866,6 +10983,9 @@ int main()
             const float prev = y;
             scene->simulate(dt);
             scene->fetchResults(true);
+            // The particle arrays are only final after this call (see the particle scenes'
+            // scored loop in main()).
+            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
             y = sbParticleMeanY(sc);
             lastDy = y - prev;
             lowest = PxMin(lowest, y);
@@ -12686,6 +12806,9 @@ int main()
         // 1. Warm-up step: it initializes the direct-GPU API (ScPipeline.cpp:2813-2815).
         scene->simulate(dt);
         scene->fetchResults(true);
+        // The particle arrays are only final after this call (see the particle scenes'
+        // scored loop in main()).
+        if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
         // The egress must have refreshed the user arrays, or every observable below is void.
         particleApplyRead(pa, pa.b, pos[1], vel[1]);
         const float warmDy = particleApplyMean(pos[1]).y - particleApplyMean(spawn[1]).y;
@@ -12722,6 +12845,7 @@ int main()
         {
             scene->simulate(dt);
             scene->fetchResults(true);
+            if (!particleSyncSkipped()) scene->fetchResultsParticleSystem();
         }
         PxVec3 mp[3], mv[3];
         float shapeDev[3] = { 0.0f, 0.0f, 0.0f };
