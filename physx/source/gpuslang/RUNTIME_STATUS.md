@@ -2284,9 +2284,14 @@ Windows-Presets aus den 5.12-vc17-Presets neu aufgebaut (/MD statt /MT → Ausga
 alte 5.6.1-Artefakte in `bin/` vorher löschen). Windows/MSVC und echte Hardware unter 5.12 ungetestet.
 
 **Offen.**
-- Der erste Device→Host-Read nach `fetchResults(true)` lieferte in particlediffuse gelegentlich das
-  Diffuse-Array des Vorframes (der zweite Read ist aktuell). Ursache nicht gefunden; die Altern-Prüfung
-  toleriert einen Frame. Möglicher Port-Fehler, zu untersuchen.
+- ~~Veralteter Read nach `fetchResults(true)` in particlediffuse~~ — geklärt: kein Port-Fehler, sondern
+  ein Harness-Fehler. `fetchResults(true)` wartet nur auf die CPU-Tasks; auf den PBD-Partikel-Stream wartet
+  erst `PxScene::fetchResultsParticleSystem()` (in 5.6.1 und 5.12 gleich, die Snippets rufen es auf). Veraltet
+  war die Diffuse-Anzahl (CPU-Load eines gepinnten Worts), nicht das Array. Der Harness ruft es jetzt in
+  allen Partikel-Schleifen auf; particlediffuse prüft pro Abklingschritt, dass sich die Anzahl nach einem
+  flushenden Copy nicht mehr ändert (ohne den Aufruf 227/250 Fehler), Altern jetzt exakt.
+- `helperUniformity`: Mindestanzahl `closestPtPointTriangle2` 19 → 18 (die stillgelegte fcPrim2-Fixture trug
+  eine Kopie; grün war die Prüfung vorher nur wegen eines liegengebliebenen `fcPrim2.spv`).
 - Upstream-5.12-Fehler (dokumentiert): in `physx/CMakeLists.txt` greift `option(PX_GENERATE_GPU_PROJECTS ON)`
   vor den Preset-Schaltern, ein frisches `-DPHYSX_PRESET=*-cpu-only` aktiviert trotzdem CUDA.
 

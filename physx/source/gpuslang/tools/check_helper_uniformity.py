@@ -163,9 +163,12 @@ def canon(entry, consts):
 # The value is the count as much as the uniformity.  If a name's copies drop below
 # the recorded minimum, either a call site was rewritten or the name changed, and
 # either way this table has stopped describing the corpus.
+#
+# closestPtPointTriangle2 19 -> 18: the 5.12 migration retired the fcPrim2 fixture shader,
+# which carried one copy (its cloth-vs-primitive coverage moved to the engine kernels).
 REQUIRE_UNIFORM = {
     "quatRotate": 69, "quatRotateInv": 62, "quatRotQ": 13, "quatRotInvQ": 10,
-    "closestPtPointTriangle2": 19, "closestPtTetrahedron": 7, "closestPtLineLine": 4,
+    "closestPtPointTriangle2": 18, "closestPtTetrahedron": 7, "closestPtLineLine": 4,
     "closestPtPointTriangle": 5, "closestPtPointBaryTriangle": 2,
     "extractRotation2D": 5, "getNormalized3": 4,
 }
