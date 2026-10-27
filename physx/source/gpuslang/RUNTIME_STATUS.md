@@ -2250,7 +2250,10 @@ Ebenen mit 1 und >1000 Knoten, wiederholte Launches (Zähler-Reset), bitgenau ge
 Grenzen auf llvmpipe: Sichtbarkeitsfehler über CUs kann llvmpipe nicht zeigen (Review per Mutanten
 dokumentiert). ctest 867/867 in beiden Modi (+1 Skip ohne Validation-Layer), Szenen 99/99 + Kontrolle,
 `snippetsurface` in beiden Modi. Geschwindigkeit nur auf echter Hardware messbar (llvmpipe teilt alle
-Workgroups auf 4 CPU-Threads); Messung auf der RX 9070 XT steht aus.
+Workgroups auf 4 CPU-Threads). **Gemessen auf der RX 9070 XT:** SnippetDeformableSurface 60 fps (vorher 30,
+ursprünglich 10; 60 kann die Vsync-Grenze des Fensters sein). Refit unter `PXG_KERNEL_TIMES=1` nur noch ~3 %;
+oben stehen jetzt `cloth_solveTrianglePairEnergyLaunch` (~20 %, 64 Launches/Step wie in der CUDA),
+`cloth_midphaseGeneratePairsLaunch` (7–13 %) und die Radix-Sorts (je ~7 %).
 
 ## Cloth-Refit auf 32 Warps — SnippetDeformableSurface lief auf der RX 9070 XT mit 10 fps
 
