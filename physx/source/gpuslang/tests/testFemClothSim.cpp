@@ -68,6 +68,7 @@
 #include "foundation/PxBounds3.h"            // PxBounds3 (P7.1 tranche 4a midphase AABB)
 #include "geometry/PxMeshScale.h"           // P9.94d: getTriBarycentric's scale.toMat33()
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
+#include "pxgBv32TreeGen.h"                // synthetic BV32 trees for the multi-workgroup refit
 
 #include <cstdint>
 #include <cstddef>
@@ -3778,6 +3779,20 @@ struct TreeBlob
     uint32_t nodeWord(uint32_t node) const { return 4u + node * BV32_WORDS; }
 };
 
+// Every PhysX tree has mMin[k].w == mMax[k].w == 0.0f in its VALID child slots
+// (BV32Tree::createSOAformatNode writes PxVec4(min, 0.f); the refit itself writes
+// make_float4(min, 0.f)).  The multi-workgroup refit keeps its per-node arrival counter
+// in mMin[0].w and relies on that, so the poisoned fixtures keep those words cooked.
+static void zeroValidW(TreeBlob& tree, uint32_t nbNodes)
+{
+    for (uint32_t n = 0; n < nbNodes; ++n)
+        for (uint32_t k = 0; k < tree.w[tree.nodeWord(n) + W_NBNODES]; ++k)
+        {
+            tree.w[tree.nodeWord(n) + W_MMIN + k * 4u + 3u] = 0u;
+            tree.w[tree.nodeWord(n) + W_MMAX + k * 4u + 3u] = 0u;
+        }
+}
+
 // P9.86c: the two warp reductions (FEMCloth.cu:470-471 leaf walk, :490-491 node aggregate)
 // are warpShuffleMin/Max (shuffle.cuh:49-72): a 5-step __shfl_xor_sync butterfly with
 // CUDA fminf/fmaxf, NOT the PxMin/PxMax selects the per-triangle gather uses.  On NVIDIA
@@ -3977,6 +3992,8 @@ PXG_TEST(femClothSimRefitBound)
     // remapPackedNodeIndex[nbNodes]: identity (level 0 = node 0, level 1 = nodes 1,2)
     const uint32_t wRemap = wDepthInfo + maxDepth * 2u;
     tree.w[wRemap + 0] = 0u; tree.w[wRemap + 1] = 1u; tree.w[wRemap + 2] = 2u;
+
+    zeroValidW(tree, nbNodes);
 
     // --- device state -----------------------------------------------------------
     const uint32_t clothId = 0u, elemIdx = 2u;
@@ -4202,6 +4219,8 @@ PXG_TEST(femClothSimRefitBoundZeroSign)
     tree.w[wDepthInfo + 2] = 1u; tree.w[wDepthInfo + 3] = 2u;
     const uint32_t wRemap = wDepthInfo + maxDepth * 2u;
     tree.w[wRemap + 0] = 0u; tree.w[wRemap + 1] = 1u; tree.w[wRemap + 2] = 2u;
+
+    zeroValidW(tree, nbNodes);
 
     // --- CPU reference + mutant twins -------------------------------------------
     TreeBlob refTree;
@@ -4446,6 +4465,8 @@ PXG_TEST(femClothSimRefitBoundWide)
         for (uint32_t i = 0; i < levelCount[l]; ++i) tree.w[wRemap + levelOffset[l] + i] = ids[i];
     }
 
+    zeroValidW(tree, nbNodes);
+
     // --- CPU reference ---------------------------------------------------------------
     TreeBlob refTree = tree;
     std::vector<Bounds> refPacked(nbNodes, Bounds{ p72ref::V3{ POISON, POISON, POISON }, p72ref::V3{ POISON, POISON, POISON } });
@@ -4551,6 +4572,249 @@ PXG_TEST(femClothSimRefitBoundWide)
     dev->destroyBuffer(bPacked.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bActive.h);
     dev->destroyBuffer(bElem.h); dev->destroyBuffer(bSpec.h); dev->destroyBuffer(bCd.h);
     dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bDesc.h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_refitBoundLaunch's multi-workgroup schedule (femClothRefitBda.slang header):
+// grid (nbActive, nbSlices), one warp per group, and a node is refit by the LAST of its
+// internal children to arrive (a device-scope atomic counter in mMin[0].w), never
+// behind a level barrier.  The cases above run one slice (gridY = 1), where one group
+// walks the whole tree; this one drives the schedule the engine launches and the ways
+// it can break:
+//   - a parent refit before all of its children finished would read a stale child
+//     bound.  Every launch after the first moves every vertex, so a stale bound is the
+//     PREVIOUS launch's and cannot match the reference by accident.  This catches a
+//     parent refit that is NOT redone later (wrong child count, see the mutations in
+//     the shader review).  It cannot catch an EXTRA early refit: "refit on first
+//     arrival" or "every arrival refits" still pass, because each early refit resets
+//     the counter and the chronologically last arrival refits again from complete
+//     children; only arrivals overlapping a parent refit (real GPU concurrency, which
+//     llvmpipe practically never produces) expose them.  Missing release/acquire
+//     barriers are invisible on llvmpipe as well (coherent CPU memory);
+//   - the counter must be back to 0.0f after every launch (the parent's own
+//     mMin[0] = float4(min, 0) store is the reset): five launches in a row, with 1, 3,
+//     256 (the engine's), 2000 (more slices than nodes) and 256 slices again;
+//   - the trees: the SnippetDeformableSurface shape (levels of 1, 32 and 1024 nodes), a
+//     12-level unbalanced chain whose nodes have ONE internal child among leaves, with
+//     leaf-only side nodes refit at launch start next to the deepest node, one of them
+//     filed two levels below its depth (the depth info only promises "deeper"), a
+//     random tree, and a one-node tree (the root refits itself at once).  Four cloths
+//     in one launch, activated out of order, and a fifth INACTIVE one that must stay
+//     untouched;
+//   - the parent-link cache in padding[0] starts as garbage, including real internal
+//     slots of the WRONG node, and is scrambled again before the third launch so the
+//     parent search also runs under 256 concurrent slices; after every launch it must
+//     hold each node's true parent link.
+// Every word of every tree (mMin/mMax incl. the w words and the poisoned unused slots,
+// mData, mNbNodes, mDepth, padding[1], depth info, remap), mPackedNodeBounds and the
+// broad-phase slots are compared bit-exact against the CPU transcription, launch by
+// launch.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimRefitBoundLastArriver)
+{
+    using namespace p72refit;
+    namespace g = pxgbv32gen;
+    PxgSlangComputeDevice* dev = testDevice();
+    g::Rng rng{ 0x6A09E667u };
+    const float POISON = -7777.0f;
+
+    std::vector<g::Spec> specs;
+    specs.push_back(g::wideSpec(32u, 32u, rng));   // levels 1 / 32 / 1024
+    specs.push_back(g::chainSpec(12u, rng));       // 12 levels, unbalanced
+    specs.push_back(g::randomSpec(5u, rng));
+    specs.push_back(g::singleSpec(rng));           // the root alone
+    specs.push_back(g::randomSpec(4u, rng));       // INACTIVE
+    const uint32_t nbBodies = uint32_t(specs.size());
+    const std::vector<uint32_t> active = { 3u, 0u, 2u, 1u };
+    const std::vector<uint32_t> elemIndices = { 5u, 1u, 7u, 3u, 0u };
+    const uint32_t nbSlots = 9u;
+
+    struct Body
+    {
+        g::Tree tree;
+        std::vector<F4> pos;
+        std::vector<TriIdx4> tris;
+        TreeBlob ref;
+        std::vector<Bounds> refPacked;
+        DevBuf bPos, bTri, bTree, bPacked;
+        bool isActive = false;
+    };
+    std::vector<Body> bodies(nbBodies);
+    auto randomPos = [&](Body& b) {
+        for (F4& p : b.pos) p = F4{ rng.unit() * 5.0f, rng.unit() * 5.0f, rng.unit() * 5.0f, 0.5f };
+    };
+    uint32_t wrongLinks = 0u;
+    for (uint32_t i = 0; i < nbBodies; ++i)
+    {
+        Body& b = bodies[i];
+        b.tree = g::build(specs[i], rng, POISON);
+        const uint32_t nv = 3u + b.tree.nbPrims;
+        b.pos.resize(nv);
+        randomPos(b);
+        for (uint32_t t = 0; t < b.tree.nbPrims; ++t)
+            b.tris.push_back(TriIdx4{ rng.below(nv), rng.below(nv), rng.below(nv), 0u });
+        b.tree.w[0] = nv;
+        b.ref.w = b.tree.w;
+        b.refPacked.assign(b.tree.nbNodes, Bounds{ p72ref::V3{ POISON, POISON, POISON }, p72ref::V3{ POISON, POISON, POISON } });
+        b.isActive = std::find(active.begin(), active.end(), i) != active.end();
+        for (uint32_t n = 0; n < b.tree.nbNodes; ++n)
+        {
+            const uint32_t link = b.tree.w[b.tree.nodeWord(n) + g::W_PADDING0];
+            const uint32_t p = link >> 5, k = link & 31u;
+            if (link != b.tree.parentLink[n] && p < b.tree.nbNodes && k < b.tree.w[b.tree.nodeWord(p) + g::W_NBNODES] &&
+                (b.tree.w[b.tree.nodeWord(p) + g::W_MDATA + k] & 1u) == 0u)
+                ++wrongLinks;
+        }
+    }
+    // the shapes this case claims
+    const g::Tree& wide = bodies[0].tree;
+    PXG_CHECK_MSG(wide.maxDepth == 3u && wide.levelCount[0] == 1u && wide.levelCount[2] == 1024u,
+                  "wide tree must have levels of 1 and 1024 nodes (%u levels)", wide.maxDepth);
+    PXG_CHECK_MSG(bodies[1].tree.maxDepth >= 12u, "chain tree must be at least 12 levels deep (%u)", bodies[1].tree.maxDepth);
+    PXG_CHECK_MSG(bodies[3].tree.nbNodes == 1u, "single-node tree must be one node");
+    PXG_CHECK_MSG(wrongLinks > 0u, "the padding garbage must include links to a real slot of the wrong node");
+
+    for (Body& b : bodies)
+    {
+        b.bPos = makeDev(dev, b.pos);
+        b.bTri = makeDev(dev, b.tris);
+        b.bTree = makeDev(dev, b.tree.w);
+        b.bPacked = makeDev(dev, std::vector<float>(b.tree.nbNodes * 6u, POISON));
+    }
+    std::vector<float> specCCD(nbBodies), origOffset(nbBodies);
+    std::vector<PxgFEMCloth> descArr;
+    for (uint32_t i = 0; i < nbBodies; ++i)
+    {
+        specCCD[i] = 0.001f * float(i + 1u);
+        origOffset[i] = 0.013f * float(i + 2u);
+        PxgFEMCloth c = makeZeroDesc();
+        c.mTriMeshData = reinterpret_cast<decltype(c.mTriMeshData)>(size_t(bodies[i].bTree.addr));
+        c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bodies[i].bPos.addr));
+        c.mTriangleVertexIndices_ownedEdges =
+            reinterpret_cast<decltype(c.mTriangleVertexIndices_ownedEdges)>(size_t(bodies[i].bTri.addr));
+        c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bodies[i].bPacked.addr));
+        c.mNbVerts = uint32_t(bodies[i].pos.size());
+        c.mNbTriangles = uint32_t(bodies[i].tris.size());
+        c.mOriginalContactOffset = origOffset[i];
+        descArr.push_back(c);
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    DevBuf bActive = makeDev(dev, active);
+    DevBuf bElem = makeDev(dev, elemIndices);
+    DevBuf bSpec = makeDev(dev, specCCD);
+    DevBuf bBounds = makeDev(dev, std::vector<float>(nbSlots * 6u, POISON));
+    DevBuf bCd = makeDev(dev, std::vector<float>(nbBodies, 0.0f));
+    DevBuf bUpd = makeDev(dev, std::vector<uint32_t>(1, 1u));
+
+    const float nbUpdatesPerStep = 2.0f;
+    RefitPush rp{};
+    rp.femClothes = bDesc.addr;
+    rp.activeFemClothes = bActive.addr;
+    rp.nbActive = uint32_t(active.size());
+    rp.contactDists = bCd.addr;
+    rp.speculativeCCD = bSpec.addr;
+    rp.boundArray = bBounds.addr;
+    rp.elemIndex = bElem.addr;
+    rp.nbCollisionPairUpdatesPerTimestep = nbUpdatesPerStep;
+    rp.updateContactPairs = bUpd.addr;
+
+    Kernel k("femClothRefitBda.spv", "cloth_refitBoundLaunch", {}, sizeof(RefitPush));
+    const uint32_t slicesPerLaunch[] = { 1u, 3u, 256u, 2000u, 256u };
+    std::vector<float> refBounds(nbSlots * 6u, POISON);
+    for (uint32_t launch = 0; launch < 5u; ++launch)
+    {
+        const uint32_t slices = slicesPerLaunch[launch];
+        for (uint32_t i = 0; i < nbBodies && launch > 0u; ++i)
+        {
+            if (!bodies[i].isActive) continue;
+            randomPos(bodies[i]);
+            dev->upload(bodies[i].bPos.h, bodies[i].pos.data(), bodies[i].pos.size() * sizeof(F4));
+            if (launch == 2u)   // fresh garbage in the parent-link cache, searched by 256 slices
+                for (uint32_t n = 0; n < bodies[i].tree.nbNodes; ++n)
+                {
+                    const uint32_t gword = (n & 1u) ? rng.next() : 0xFFFFFFFFu;
+                    dev->upload(bodies[i].bTree.h, &gword, 4u, size_t(bodies[i].tree.nodeWord(n) + g::W_PADDING0) * 4u);
+                }
+        }
+        k.dispatch(uint32_t(active.size()), {}, rp, slices, 1u);
+        dev->flush();
+
+        size_t mm = 0, printed = 0;
+        for (uint32_t i = 0; i < nbBodies; ++i)
+        {
+            Body& b = bodies[i];
+            const g::Tree& t = b.tree;
+            if (b.isActive)
+            {
+                for (uint32_t l = t.maxDepth; l > 0u; --l)
+                {
+                    const uint32_t off = t.w[t.wDepthInfo + (l - 1u) * 2u + 0];
+                    const uint32_t cnt = t.w[t.wDepthInfo + (l - 1u) * 2u + 1];
+                    for (uint32_t j = 0; j < cnt; ++j)
+                        refitNodeRef(t.w[t.wRemap + off + j], b.ref, b.refPacked, b.pos, b.tris);
+                }
+                const p72ref::V3 rn = b.refPacked[0].mn, rx = b.refPacked[0].mx;
+                const float expansion = (nbUpdatesPerStep > 1.0f ? nbUpdatesPerStep : 1.0f) * (origOffset[i] + specCCD[i]);
+                const float r6[6] = { rn.x - expansion, rn.y - expansion, rn.z - expansion,
+                                      rx.x + expansion, rx.y + expansion, rx.z + expansion };
+                for (uint32_t e = 0; e < 6u; ++e) refBounds[elemIndices[i] * 6u + e] = r6[e];
+            }
+            const auto gTree = downloadBuffer<uint32_t>(dev, b.bTree.h, t.w.size());
+            const auto gPacked = downloadBuffer<float>(dev, b.bPacked.h, t.nbNodes * 6u);
+            for (uint32_t w = 0; w < uint32_t(t.w.size()); ++w)
+            {
+                const bool pad0 = w >= 4u && w < t.wDepthInfo && (w - 4u) % g::BV32_WORDS == g::W_PADDING0;
+                uint32_t want = b.ref.w[w];
+                if (pad0 && b.isActive)
+                {
+                    const uint32_t n = (w - 4u) / g::BV32_WORDS;
+                    if (n == 0u) continue;   // the root has no parent; its padding is never read
+                    want = t.parentLink[n];
+                }
+                if (gTree[w] != want)
+                {
+                    ++mm;
+                    if (printed++ < 16)
+                        std::printf("  launch %u (%u slices) body %u tree word %u (node %u word %u) MM: ref %08x got %08x\n",
+                                    launch, slices, i, w, w >= 4u ? (w - 4u) / g::BV32_WORDS : 0u,
+                                    w >= 4u ? (w - 4u) % g::BV32_WORDS : w, want, gTree[w]);
+                }
+            }
+            for (uint32_t n = 0; n < t.nbNodes; ++n)
+            {
+                const float r[6] = { b.refPacked[n].mn.x, b.refPacked[n].mn.y, b.refPacked[n].mn.z,
+                                     b.refPacked[n].mx.x, b.refPacked[n].mx.y, b.refPacked[n].mx.z };
+                for (uint32_t e = 0; e < 6u; ++e)
+                    if (f2u(gPacked[n * 6u + e]) != f2u(r[e]))
+                    {
+                        ++mm;
+                        if (printed++ < 16)
+                            std::printf("  launch %u (%u slices) body %u packedNodeBounds[%u][%u] MM: ref %08x got %08x\n",
+                                        launch, slices, i, n, e, f2u(r[e]), f2u(gPacked[n * 6u + e]));
+                    }
+            }
+        }
+        const auto gBounds = downloadBuffer<float>(dev, bBounds.h, nbSlots * 6u);
+        for (uint32_t e = 0; e < nbSlots * 6u; ++e)
+            if (f2u(gBounds[e]) != f2u(refBounds[e]))
+            {
+                ++mm;
+                if (printed++ < 16)
+                    std::printf("  launch %u boundArray[%u][%u] MM: ref %08x got %08x\n", launch, e / 6u, e % 6u,
+                                f2u(refBounds[e]), f2u(gBounds[e]));
+            }
+        PXG_CHECK_MSG(mm == 0, "cloth_refitBoundLaunch last-arriver launch %u (%u slices) bit-exact vs CPU (%zu mismatches)",
+                      launch, slices, mm);
+    }
+
+    for (Body& b : bodies)
+    {
+        dev->destroyBuffer(b.bPos.h); dev->destroyBuffer(b.bTri.h);
+        dev->destroyBuffer(b.bTree.h); dev->destroyBuffer(b.bPacked.h);
+    }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bElem.h);
+    dev->destroyBuffer(bSpec.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bUpd.h);
 }
 
 // ===========================================================================

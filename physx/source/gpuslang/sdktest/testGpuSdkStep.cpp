@@ -41,6 +41,7 @@
 #include <utility>
 #include <array>
 #include <chrono>
+#include <functional>
 
 using namespace physx;
 
@@ -10538,7 +10539,65 @@ int main()
                     parallelRounds += 3 + maxLeaves;
                 }
             }
-            std::printf("; refit critical path %u warp rounds on one warp, %u on 32 warps\n", serialRounds, parallelRounds);
+            std::printf("; refit critical path %u warp rounds on one warp, %u on 32 warps", serialRounds, parallelRounds);
+            // The port's last-arriver schedule (femClothRefitBda.slang): 256 one-warp groups
+            // (PxgFEMClothCore::refitBound's numSlicesPerCloth), group s owning remap positions
+            // s, s + 256, ...; it refits its nodes without internal children (a node with
+            // internal children costs it one ballot round to skip) and, after each refit,
+            // arrives at the parent (one round); the LAST arriving child refits the parent
+            // and climbs on.  Simulated event by event in time order.
+            {
+                const PxU32 nbSlices = 256, n = bv->mNbPackedNodes;
+                std::vector<PxU32> parent(n, ~0u), internalKids(n, 0u), arrived(n, 0u), cost(n, 0u);
+                for (PxU32 p = 0; p < n; ++p)
+                {
+                    const Gu::BV32DataPacked& node = bv->mPackedNodes[p];
+                    PxU32 nodeLeaves = 0;
+                    for (PxU32 c = 0; c < node.mNbNodes; ++c)
+                    {
+                        if (node.mData[c] & 1u) ++nodeLeaves;
+                        else { parent[node.mData[c] >> 11] = p; ++internalKids[p]; }
+                    }
+                    cost[p] = 2 + nodeLeaves;
+                }
+                // per slice: the start nodes still to do, and the time spent skipping
+                std::vector<std::vector<PxU32>> todo(nbSlices);
+                std::vector<PxU32> skip(nbSlices, 0u);
+                for (PxU32 j = 0; j < n; ++j)
+                {
+                    const PxU32 node = bv->mRemapPackedNodeIndexWithDepth[j];
+                    if (internalKids[node]) ++skip[j % nbSlices];
+                    else todo[j % nbSlices].push_back(node);
+                }
+                // events: (finish time, slice, node); the earliest finish arrives first
+                typedef std::pair<PxU32, std::pair<PxU32, PxU32>> Ev;
+                std::vector<Ev> heap;
+                std::vector<PxU32> next(nbSlices, 0u);
+                auto push = [&heap](PxU32 t, PxU32 s, PxU32 node) {
+                    heap.push_back(Ev(t, std::make_pair(s, node)));
+                    std::push_heap(heap.begin(), heap.end(), std::greater<Ev>());
+                };
+                PxU32 groups = 0, lastRound = 0;
+                for (PxU32 s = 0; s < nbSlices; ++s)
+                    if (!todo[s].empty()) { push(skip[s] + cost[todo[s][0]], s, todo[s][0]); next[s] = 1; ++groups; }
+                while (!heap.empty())
+                {
+                    std::pop_heap(heap.begin(), heap.end(), std::greater<Ev>());
+                    const Ev e = heap.back();
+                    heap.pop_back();
+                    const PxU32 t = e.first, s = e.second.first, node = e.second.second;
+                    lastRound = PxMax(lastRound, t);
+                    const PxU32 p = parent[node];
+                    if (p != ~0u && ++arrived[p] == internalKids[p])
+                        push(t + 1 + cost[p], s, p);
+                    else if (next[s] < todo[s].size())
+                    {
+                        push(t + (p != ~0u ? 1 : 0) + cost[todo[s][next[s]]], s, todo[s][next[s]]);
+                        ++next[s];
+                    }
+                }
+                std::printf(", %u on the last-arriver schedule (%u busy one-warp groups)\n", lastRound, groups);
+            }
         }
 
         const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");

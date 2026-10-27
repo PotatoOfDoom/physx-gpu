@@ -24,20 +24,20 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
+
 // femClothRefitBda.slang
 //
 // P7.2 tranche 3a — the cloth BVH BOUNDS REFIT on the Vulkan engine ABI (BDA).
-// Ported line-for-line from gpusimulationcontroller/src/CUDA/FEMCloth.cu:338
+// Ported from gpusimulationcontroller/src/CUDA/FEMCloth.cu:321
 // (cloth_refitBoundLaunch, CLOTH_REFIT_BOUND, launch site PxgFEMClothCore.cpp:558).
 //
 // This is the missing link of the cloth self-collision arc: the tranche-1 midphase
 // (femClothSelfCollisionBda) walks the cloth's OWN BV32 triangle tree, but that tree
 // is built once at cook time in REST pose.  Without a per-step refit the live midphase
-// queries a stale BVH and finds NULL contacts.  This kernel walks the tree bottom-up
-// (deepest depth level first) and rewrites, for every packed node, the 32 per-child
-// AABBs (mMin/mMax) plus the node's own aggregate bound in mPackedNodeBounds — from
-// the CURRENT mPosition_InvMass — then expands the root bound into the broad-phase
-// boundArray slot.
+// queries a stale BVH and finds NULL contacts.  This kernel refits the tree bottom-up
+// and rewrites, for every packed node, the 32 per-child AABBs (mMin/mMax) plus the
+// node's own aggregate bound in mPackedNodeBounds — from the CURRENT mPosition_InvMass
+// — then expands the root bound into the broad-phase boundArray slot.
 //
 // Doctrine (identical to the prior cloth BDA tranches femClothSelfCollisionBda /
 // femClothContactGenBda):
@@ -48,10 +48,10 @@
 //   - the BV32 tree hangs off mTriMeshData with the SAME layout the midphase decodes:
 //     a uint4 header (nbVerts, nbTriangles, maxDepth, nbBv32PackedNodes) @0, then
 //     nbBv32PackedNodes x Gu::BV32DataPacked (1168 B: mMin[32] float4 @0, mMax[32]
-//     float4 @512, mData[32] uint @1024, mNbNodes @1152), then maxDepth x
-//     Gu::BV32DataDepthInfo (8 B: offset, count), then nbBv32PackedNodes x PxU32
-//     remapPackedNodeIndex.  Read/written field-by-field by explicit byte offset
-//     through Ptr<> (no whole-node copy);
+//     float4 @512, mData[32] uint @1024, mNbNodes @1152, mDepth @1156, padding[2]
+//     @1160), then maxDepth x Gu::BV32DataDepthInfo (8 B: offset, count), then
+//     nbBv32PackedNodes x PxU32 remapPackedNodeIndex.  Read/written field-by-field by
+//     explicit byte offset through Ptr<> (no whole-node copy);
 //   - Gu::BV32DataPacked child decode is verbatim: isLeaf(k) = mData[k]&1,
 //     getNbReferencedPrimitives(k) = (mData[k]>>1)&63, getPrimitiveStartIndex(k) =
 //     mData[k]>>7, getChildOffset(k) = mData[k]>>11;
@@ -59,39 +59,80 @@
 //     CUDA tail writes 6 consecutive floats through `float* r = &root.minimum.x`), so
 //     mPackedNodeBounds / boundArray are addressed as stride-24 float runs.
 //
-// DEVIATIONS from CUDA (recipe policy; each is bit-exactness-preserving, and the
-// whole set is exercised by testFemClothSim.cpp's femClothSimRefitBound case):
-//   - REFIT_WARPS = 32 warps per group (numthreads(32,32,1)), the CUDA
-//     (32, SB_REFIT_WAPRS_PER_BLOCK=32, 1) block: the per-depth-level node loop is
-//     `for (j = warpIndex; j < count; j += 32)` as in the CUDA.  The CUDA warps run a
-//     data-dependent inner loop each (the leaf ballot walk and a j-trip-count that
-//     differs by one across warps), and the groupshared lowering of __ballot_sync /
-//     __shfl_xor_sync needs barriers the WHOLE group reaches.  So the trip counts are
-//     made group-uniform: every warp makes ceil(count / 32) node trips (a warp past
-//     the end runs its last one with `active` false and writes nothing), and the leaf
-//     walk makes as many trips as the group's node with the most leaves, a trip past
-//     a warp's own leaf count being a no-op for it (its reduction result is
-//     discarded).  Each warp has its own
-//     ballot word and reduction slice.  OUTPUT-IDENTICAL to the CUDA and to a single
-//     warp: nodes at the same depth level have no data dependency on each other (each
-//     reads only its children — written in a PREVIOUS level, behind the level barrier
-//     — and writes only its own mMin/mMax[0..31] and mPackedNodeBounds[nodeIndex]),
-//     so which warp takes which node, and in what order, cannot change any result.
-//     Until the 2026-10 profile of SnippetDeformableSurface this was ONE warp per group
-//     walking every node of a level serially: a 79202-triangle sheet then refit its
-//     ~2500 leaves one after another, twice per step, in a single wave;
+// SCHEDULE — many one-warp workgroups per cloth, bottom-up "last arriver" (2026-10).
+// The CUDA kernel is ONE 1024-thread block per cloth walking the depth levels with a
+// __syncthreads between them.  That is one compute unit per cloth: on the RX 9070 XT
+// SnippetDeformableSurface (one 79202-triangle sheet, tree levels 1/32/1024) spent ~4 ms
+// per launch in it, two launches per step, while the rest of the GPU idled.  Here the
+// SAME per-node computation is scheduled across the whole GPU:
+//   - grid (nbActiveFemCloths, nbSlices, 1), group = ONE warp (numthreads(32,1,1)).
+//     Group (x, s) owns the nodes at remap positions s, s + nbSlices, ... of cloth x
+//     (nbSlices = WorkgroupCount().y; the host launches numSlicesPerCloth = 256, see the
+//     PXG_NO_CUDA_TOOLKIT block in PxgFEMClothCore::refitBound; ANY slice count >= 1 is
+//     correct, the old one-group-per-cloth grid included — fewer slices only serialise);
+//   - an owned node with NO internal child (only leaf children: every deepest-level
+//     node, and any shallower node of an unbalanced tree) is refit right away.  An owned
+//     node WITH internal children is skipped: it is refit by its last-arriving child;
+//   - after refitting node c the group ARRIVES at c's parent p: an atomic increment of
+//     p's arrival counter.  The group whose increment completes p's count of internal
+//     children (the LAST arriver) refits p and climbs on; every other group stops there.
+//     Nobody ever waits for another workgroup, so this needs no forward-progress
+//     guarantee across workgroups (no spin, no grid barrier);
+//   - the group that refits the root (packed node 0, the node the CUDA tail reads)
+//     writes the broad-phase bound.
+// BIT-EXACTNESS: each node is refit by exactly ONE warp running the unchanged per-node
+// body (leaf ballot walk in ascending child order, child bounds read from
+// mPackedNodeBounds for internal lanes, the two 32-lane reductions), and a parent is
+// refit only after ALL its internal children have published their bounds.  It reads
+// the children in fixed lane order, so which child arrived last cannot change a bit.
+// That is exactly the CUDA's data dependency (a level reads only the level below it);
+// the level barrier only over-constrained it.
+// MEMORY ORDERING: a child's stores (its mMin/mMax lanes and mPackedNodeBounds[c]) are
+// released by a device-scope AllMemoryBarrierWithGroupSync before lane 0's atomic, and
+// the last arriver's lanes acquire with the same device-scope barrier after it, before
+// they read any child bound.  The atomic itself is a device-scope InterlockedAdd on
+// global memory, so arrivals from different compute units are totally ordered.  The
+// handed-over data itself, mPackedNodeBounds[c], is stored and loaded with device-scope
+// atomics (boundsStore / boundsMin / boundsMax): the module uses the GLSL450 memory
+// model and Ptr<> accesses are not Coherent, so plain accesses would carry no
+// cross-workgroup visibility guarantee.  Nothing else crosses workgroups within a launch
+// (c's mMin/mMax lanes are not read by the parent; the parent-link cache of c is read
+// and written only by the group refitting c).
+// STORAGE (no new buffer, no ABI change):
+//   - the arrival counter of node p is the w word of p.mMin[0] (as uint bits).  That
+//     word is 0.0f in every tree PhysX produces — BV32Tree::createSOAformatNode writes
+//     PxVec4(min, 0.f), the cooked stream round-trips it, PxgGeometryManager /
+//     PxgSimulationController copy it verbatim — and the refit itself writes
+//     make_float4(min, 0.f) into it (CUDA and here alike).  So the counter is 0 at every
+//     launch entry, and the consumer resets it with no extra store: the last arriver's
+//     refit of p rewrites p.mMin[0] = float4(min, 0) AFTER every increment.  After the
+//     launch the tree is bit-identical to the CUDA's, w words included;
+//   - the parent link of node c is cached in c's padding[0] (@1160: never serialised,
+//     never read by any engine or port kernel) as (p << 5) | lane.  The cache is
+//     VALIDATED before use — p in range, lane < p.mNbNodes, p.mData[lane] is an internal
+//     child pointing at c — and a tree has exactly one such (p, lane), so stale or
+//     garbage padding (a fresh upload) can only miss, never mislead.  A miss searches the
+//     level above c (BV32DataDepthInfo; then, if the tree breaks the depth+1 rule, every
+//     node) one candidate per lane and caches the result: the first launch on a tree pays
+//     the search, later launches pay two loads.
+//
+// DEVIATIONS from CUDA (recipe policy; each is bit-exactness-preserving, and the whole
+// set is exercised by testFemClothSim.cpp's femClothSimRefitBound* cases):
+//   - the schedule above, in place of the CUDA (32, SB_REFIT_WAPRS_PER_BLOCK=32) block
+//     and its level loop `for (j = warpIndex; j < count; j += 32)` + __syncthreads.
+//     Until 115945c this was ONE warp per cloth walking every node serially; 115945c
+//     made it the CUDA's 32 warps, still one group per cloth (one CU per cloth);
 //   - __ballot_sync(FULL_MASK, pred) -> groupshared InterlockedOr mask (order-
 //     independent); warpShuffleMin/Max (shuffle.cuh:49/62, an XOR butterfly over all
 //     32 lanes leaving the result in every lane) -> a groupshared 32-slot exchange
-//     reduced identically in every lane.  min/max are exact, associative and
-//     commutative on floats (no NaN reaches here: every input is a mesh vertex or a
-//     +-PX_MAX_F32 identity), so ANY reduction order gives the SAME bits — the
-//     lowering is bit-exact, not merely equivalent.  Both butterflies are fused into
-//     one warpMinMax32() call since CUDA issues them back-to-back on independent data;
-//   - the per-warp femClothRefitMidphaseScratch (meshVerts / indices / bv32 pointers
-//     cached by lane 0 + __syncthreads) is dropped: every lane recomputes those
-//     addresses directly from the header through Ptr<> (semantically identical read
-//     fan-out; same as femClothSelfCollisionBda);
+//     reduced identically in every lane.  The reducers are CUDA fminf/fmaxf, which are
+//     exact, associative and commutative (incl. +/-0 and NaN), so ANY reduction order
+//     gives the SAME bits — the lowering is bit-exact, not merely equivalent.  Both
+//     butterflies are fused into one warpMinMax32() call since CUDA issues them
+//     back-to-back on independent data;
+//   - the femClothRefitMidphaseScratch (meshVerts / indices / bv32 pointers cached by
+//     lane 0 + __syncthreads) is dropped: every lane recomputes those addresses directly
+//     from the header through Ptr<> (semantically identical read fan-out);
 //   - CUDA computes `offset = warpScanExclusive(resultWarp, idx)` and `validCount =
 //     __popc(resultWarp)` inside the node loop and NEVER READS EITHER (dead in the
 //     .cu — the leaf walk is driven by the `k = resultWarp` bit loop, not by a
@@ -115,23 +156,29 @@
 
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mTriMeshData@0, mPosition_InvMass@16, ...)
 
-// Gu::BV32DataPacked (GuBV32.h:88) layout, 1168 bytes — identical constants to
+// Gu::BV32DataPacked (GuBV32.h:65) layout, 1168 bytes — identical constants to
 // femClothSelfCollisionBda.slang.
 static const uint64_t BV32_STRIDE          = 1168UL;
 static const uint64_t BV32_MMIN_OFFSET     = 0UL;
 static const uint64_t BV32_MMAX_OFFSET     = 512UL;
 static const uint64_t BV32_MDATA_OFFSET    = 1024UL;
 static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
+static const uint64_t BV32_PADDING_OFFSET  = 1160UL;   // padding[0]: the parent-link cache
+static const uint64_t BV32_COUNTER_OFFSET  = 12UL;     // mMin[0].w: the arrival counter
 static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
 
 // PxBounds3: { PxVec3 minimum; PxVec3 maximum; } — 24 bytes, no padding.
 static const uint64_t BOUNDS3_STRIDE = 24UL;
 
-// Gu::BV32DataDepthInfo (GuBV32.h:114): { PxU32 offset; PxU32 count; } — 8 bytes.
+// Gu::BV32DataDepthInfo (GuBV32.h:91): { PxU32 offset; PxU32 count; } — 8 bytes.
 static const uint64_t DEPTHINFO_STRIDE = 8UL;
 
 static const float PX_MAX_F32 = 3.4028234663852886e+38f;
 static const uint WARP = 32u;
+
+// "no parent found" / "level unknown".
+static const uint NO_LINK = 0xFFFFFFFFu;
+static const uint NO_LEVEL = 0xFFFFFFFFu;
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the CUDA refitBound arg pack
@@ -183,21 +230,31 @@ void bvStoreMax(uint64_t treeAddr, uint nodeIdx, uint k, float3 v)
 }
 
 // PxBounds3 accessors (stride-24 float runs; NOT float3-aligned).
+// mPackedNodeBounds[c] is the one datum handed from workgroup to workgroup (written by
+// the group that refits c, read by the group that refits c's parent), so it is moved
+// with device-scope (relaxed) atomic loads/stores of the float bits: the module is on
+// the GLSL450 memory model and these Ptr<> accesses carry no Coherent decoration, so a
+// plain load in the parent's group is not guaranteed to see another group's plain
+// store even after the barriers (it may hit a stale per-CU cache line holding a
+// neighbouring node's entry).  Atomics are coherent at their scope; the barriers in
+// arriveAtParent order them.  Same bits in, same bits out.
+float boundsWordLoad(uint64_t a) { return asfloat(Ptr<Atomic<uint>>(a)[0].load()); }
+void boundsWordStore(uint64_t a, float v) { Ptr<Atomic<uint>>(a)[0].store(asuint(v)); }
 float3 boundsMin(uint64_t base, uint idx)
 {
     const uint64_t a = base + uint64_t(idx) * BOUNDS3_STRIDE;
-    return float3(Ptr<float>(a)[0], Ptr<float>(a)[1], Ptr<float>(a)[2]);
+    return float3(boundsWordLoad(a), boundsWordLoad(a + 4UL), boundsWordLoad(a + 8UL));
 }
 float3 boundsMax(uint64_t base, uint idx)
 {
     const uint64_t a = base + uint64_t(idx) * BOUNDS3_STRIDE + 12UL;
-    return float3(Ptr<float>(a)[0], Ptr<float>(a)[1], Ptr<float>(a)[2]);
+    return float3(boundsWordLoad(a), boundsWordLoad(a + 4UL), boundsWordLoad(a + 8UL));
 }
 void boundsStore(uint64_t base, uint idx, float3 mn, float3 mx)
 {
     const uint64_t a = base + uint64_t(idx) * BOUNDS3_STRIDE;
-    Ptr<float>(a)[0] = mn.x; Ptr<float>(a)[1] = mn.y; Ptr<float>(a)[2] = mn.z;
-    Ptr<float>(a)[3] = mx.x; Ptr<float>(a)[4] = mx.y; Ptr<float>(a)[5] = mx.z;
+    boundsWordStore(a, mn.x); boundsWordStore(a + 4UL, mn.y); boundsWordStore(a + 8UL, mn.z);
+    boundsWordStore(a + 12UL, mx.x); boundsWordStore(a + 16UL, mx.y); boundsWordStore(a + 20UL, mx.z);
 }
 
 // PxMin/PxMax (PxMath.h) — `a < b ? a : b`, NOT the HLSL intrinsic (identical for the
@@ -208,28 +265,35 @@ float3 pxMin3(float3 a, float3 b) { return float3(pxMin(a.x, b.x), pxMin(a.y, b.
 float3 pxMax3(float3 a, float3 b) { return float3(pxMax(a.x, b.x), pxMax(a.y, b.y), pxMax(a.z, b.z)); }
 
 // ---------------------------------------------------------------------------
-// Warp (== group) collectives, groupshared-lowered.
+// Warp (== group) collectives, groupshared-lowered.  Every helper below is called by
+// all 32 lanes together (group-uniform control flow: every branch around a call
+// depends only on ballot results, broadcast words or values every lane loaded from
+// the same address).
 // ---------------------------------------------------------------------------
-// REFIT_WARPS warps per group (SB_REFIT_WAPRS_PER_BLOCK), each with its own slice of the
-// exchange storage below (~24 KB in all; see the header note on the multi-warp layout).
-static const uint REFIT_WARPS = 32u;
+groupshared uint sMask;
+groupshared uint sWord;            // lane-0 -> group broadcast (parent link, last-arriver flag)
+groupshared float sRedMin[WARP * 3];
+groupshared float sRedMax[WARP * 3];
 
-groupshared uint sMask[REFIT_WARPS];
-groupshared uint sMaxLeaves;
-groupshared float sRedMin[REFIT_WARPS * WARP * 3];
-groupshared float sRedMax[REFIT_WARPS * WARP * 3];
-
-// __ballot_sync(FULL_MASK, pred) over one warp (`warp`) of the group.  Every warp calls
-// it together (group-uniform control flow); the leading barrier orders the zero-write
-// after every read of the previous ballot's mask.
-uint ballot32(bool pred, uint idx, uint warp)
+// __ballot_sync(FULL_MASK, pred).  The leading barrier orders the zero-write after
+// every read of the previous ballot's mask.
+uint ballot32(bool pred, uint idx)
 {
     GroupMemoryBarrierWithGroupSync();
-    if (idx == 0) sMask[warp] = 0u;
+    if (idx == 0) sMask = 0u;
     GroupMemoryBarrierWithGroupSync();
-    if (pred) InterlockedOr(sMask[warp], 1u << idx);
+    if (pred) InterlockedOr(sMask, 1u << idx);
     GroupMemoryBarrierWithGroupSync();
-    return sMask[warp];
+    return sMask;
+}
+
+// The value `v` of lane `srcLane` in every lane.
+uint broadcast32(uint v, uint srcLane, uint idx)
+{
+    GroupMemoryBarrierWithGroupSync();
+    if (idx == srcLane) sWord = v;
+    GroupMemoryBarrierWithGroupSync();
+    return sWord;
 }
 
 // P9.86: warpShuffleMin/Max (shuffle.cuh:48-70) reduce with CUDA fminf/fmaxf, NOT the
@@ -249,36 +313,249 @@ float fcrFmaxf(float a, float b)
 float3 fcrFmin3(float3 a, float3 b) { return float3(fcrFminf(a.x, b.x), fcrFminf(a.y, b.y), fcrFminf(a.z, b.z)); }
 float3 fcrFmax3(float3 a, float3 b) { return float3(fcrFmaxf(a.x, b.x), fcrFmaxf(a.y, b.y), fcrFmaxf(a.z, b.z)); }
 
-// warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62) over one warp of the
-// group: both reduce over all 32 lanes and leave the result in EVERY lane.  fminf/fmaxf
-// (fcrFmin3/fcrFmax3) are exact + associative + commutative (incl. +/-0 and NaN), so the
-// linear scan below is bit-identical to CUDA's XOR butterfly.  Called by every warp
-// together, like ballot32.
-void warpMinMax32(inout float3 mn, inout float3 mx, uint idx, uint warp)
+// warpShuffleMin(mn) + warpShuffleMax(mx) fused (shuffle.cuh:49/62): both reduce over
+// all 32 lanes and leave the result in EVERY lane.  fminf/fmaxf (fcrFmin3/fcrFmax3) are
+// exact + associative + commutative (incl. +/-0 and NaN), so the linear scan below is
+// bit-identical to CUDA's XOR butterfly.
+void warpMinMax32(inout float3 mn, inout float3 mx, uint idx)
 {
-    const uint base = warp * WARP * 3u;
     GroupMemoryBarrierWithGroupSync();
-    sRedMin[base + idx * 3 + 0] = mn.x; sRedMin[base + idx * 3 + 1] = mn.y; sRedMin[base + idx * 3 + 2] = mn.z;
-    sRedMax[base + idx * 3 + 0] = mx.x; sRedMax[base + idx * 3 + 1] = mx.y; sRedMax[base + idx * 3 + 2] = mx.z;
+    sRedMin[idx * 3 + 0] = mn.x; sRedMin[idx * 3 + 1] = mn.y; sRedMin[idx * 3 + 2] = mn.z;
+    sRedMax[idx * 3 + 0] = mx.x; sRedMax[idx * 3 + 1] = mx.y; sRedMax[idx * 3 + 2] = mx.z;
     GroupMemoryBarrierWithGroupSync();
-    float3 rn = float3(sRedMin[base + 0], sRedMin[base + 1], sRedMin[base + 2]);
-    float3 rx = float3(sRedMax[base + 0], sRedMax[base + 1], sRedMax[base + 2]);
+    float3 rn = float3(sRedMin[0], sRedMin[1], sRedMin[2]);
+    float3 rx = float3(sRedMax[0], sRedMax[1], sRedMax[2]);
     for (uint i = 1u; i < WARP; ++i)
     {
         // P9.86: CUDA fminf/fmaxf (shuffle.cuh:48-70, FEMCloth.cu:469-470/487-488), not PxMin/PxMax.
-        rn = fcrFmin3(rn, float3(sRedMin[base + i * 3 + 0], sRedMin[base + i * 3 + 1], sRedMin[base + i * 3 + 2]));
-        rx = fcrFmax3(rx, float3(sRedMax[base + i * 3 + 0], sRedMax[base + i * 3 + 1], sRedMax[base + i * 3 + 2]));
+        rn = fcrFmin3(rn, float3(sRedMin[i * 3 + 0], sRedMin[i * 3 + 1], sRedMin[i * 3 + 2]));
+        rx = fcrFmax3(rx, float3(sRedMax[i * 3 + 0], sRedMax[i * 3 + 1], sRedMax[i * 3 + 2]));
     }
     GroupMemoryBarrierWithGroupSync();
     mn = rn; mx = rx;
 }
 
 // ---------------------------------------------------------------------------
-// cloth_refitBoundLaunch (FEMCloth.cu:338).
-// Dispatch: grid (nbActiveFemCloths, 1, 1), block (32, REFIT_WARPS, 1).
+// The CUDA per-node body (FEMCloth.cu:393-474), unchanged: refit packed node
+// `nodeIndex` from the current triangle positions (leaf lanes) and the already refit
+// mPackedNodeBounds of its children (internal lanes).
+// ---------------------------------------------------------------------------
+void refitNode(uint64_t treeAddr, uint nodeIndex, uint idx, uint64_t meshVerts, uint64_t meshVertsIndices,
+               uint64_t sPackedNodeBounds)
+{
+    const uint nodeData = bvData(treeAddr, nodeIndex, idx);
+    const uint nbChildren = bvNbNodes(treeAddr, nodeIndex);
+    const bool isLeafLane = (nodeData & 1u) != 0u;
+
+    // compute the bitMask for all the leaf nodes
+    const uint resultWarp = ballot32(idx < nbChildren && isLeafLane, idx);
+
+    float3 mn = float3(PX_MAX_F32, PX_MAX_F32, PX_MAX_F32);
+    float3 mx = float3(-PX_MAX_F32, -PX_MAX_F32, -PX_MAX_F32);
+
+    // using one warp to compute all leaf nodes' (under the same current node) min and max.
+    // CUDA walks the set bits with `for (k = resultWarp; k; k = clearLowestSetBit(k))`;
+    // the fixed 32-iteration scan visits the same bits in the same ascending order (see
+    // the header: llvmpipe miscompiles the `k &= k-1` idiom with this body).
+    for (uint kk = 0u; kk < WARP; ++kk)
+    {
+        if (((resultWarp >> kk) & 1u) == 0u) continue;   // group-uniform: resultWarp is the ballot
+        const uint indexInWarp = kk;
+
+        // primitive: triangle
+        const uint childData = bvData(treeAddr, nodeIndex, indexInWarp);
+        const uint nbPrimitives = (childData >> 1u) & 63u;
+        const uint startIndex = childData >> 7u;
+
+        float3 tMin = mn;
+        float3 tMax = mx;
+
+        // each thread in a warp deals with one primitive (maximum 32 primitives)
+        const uint primitiveIndex = idx + startIndex;
+
+        if (idx < nbPrimitives)
+        {
+            const uint4 primitiveIdx = Ptr<uint4>(meshVertsIndices)[primitiveIndex];
+
+            const float3 worldV0 = Ptr<float4>(meshVerts)[primitiveIdx.x].xyz;
+            const float3 worldV1 = Ptr<float4>(meshVerts)[primitiveIdx.y].xyz;
+            const float3 worldV2 = Ptr<float4>(meshVerts)[primitiveIdx.z].xyz;
+
+            float tx = pxMin(worldV0.x, worldV1.x);
+            float ty = pxMin(worldV0.y, worldV1.y);
+            float tz = pxMin(worldV0.z, worldV1.z);
+
+            tx = pxMin(tx, worldV2.x);
+            ty = pxMin(ty, worldV2.y);
+            tz = pxMin(tz, worldV2.z);
+
+            tMin.x = pxMin(tMin.x, tx);
+            tMin.y = pxMin(tMin.y, ty);
+            tMin.z = pxMin(tMin.z, tz);
+
+            tx = pxMax(worldV0.x, worldV1.x);
+            ty = pxMax(worldV0.y, worldV1.y);
+            tz = pxMax(worldV0.z, worldV1.z);
+
+            tx = pxMax(tx, worldV2.x);
+            ty = pxMax(ty, worldV2.y);
+            tz = pxMax(tz, worldV2.z);
+
+            tMax.x = pxMax(tMax.x, tx);
+            tMax.y = pxMax(tMax.y, ty);
+            tMax.z = pxMax(tMax.z, tz);
+        }
+
+        // min = warpShuffleMin(tMin);  max = warpShuffleMax(tMax);
+        warpMinMax32(tMin, tMax, idx);
+        mn = tMin;
+        mx = tMax;
+    }
+
+    if (idx < nbChildren && !isLeafLane)
+    {
+        const uint childOffset = nodeData >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT;
+
+        mn = boundsMin(sPackedNodeBounds, childOffset);
+        mx = boundsMax(sPackedNodeBounds, childOffset);
+    }
+
+    if (idx < nbChildren)
+    {
+        // We already updated the bounds in the previous iterations
+        bvStoreMin(treeAddr, nodeIndex, idx, mn);
+        bvStoreMax(treeAddr, nodeIndex, idx, mx);
+    }
+
+    // sPackedNodeBounds[nodeIndex] = { warpShuffleMin(min), warpShuffleMax(max) }
+    float3 rn = mn;
+    float3 rx = mx;
+    warpMinMax32(rn, rx, idx);
+    if (idx == 0u)
+        boundsStore(sPackedNodeBounds, nodeIndex, rn, rx);
+}
+
+// ---------------------------------------------------------------------------
+// The last-arriver schedule (see the header).
+// ---------------------------------------------------------------------------
+
+// Depth level (BV32DataDepthInfo index, 0 = root) of remap position j; NO_LEVEL if no
+// level covers it.
+uint levelOfRemapPos(uint64_t depthInfoAddr, uint maxDepth, uint j)
+{
+    uint level = NO_LEVEL;
+    for (uint i = 0u; i < maxDepth; ++i)
+    {
+        const uint2 info = Ptr<uint2>(depthInfoAddr + uint64_t(i) * DEPTHINFO_STRIDE)[0];
+        if (j >= info.x && j - info.x < info.y)
+            level = i;
+    }
+    return level;
+}
+
+// A cached parent link (p << 5) | lane is valid for node c iff p.mData[lane] really is
+// an internal child pointing at c.  A tree has exactly one such slot, so a valid link
+// IS c's parent, whatever wrote it.  Uniform: every lane loads the same words.
+bool parentLinkValid(uint64_t treeAddr, uint nbNodes, uint c, uint link)
+{
+    if (link == NO_LINK)
+        return false;
+    const uint p = link >> 5u;
+    const uint lane = link & 31u;
+    if (p >= nbNodes || p == c)
+        return false;
+    if (lane >= bvNbNodes(treeAddr, p))
+        return false;
+    const uint d = bvData(treeAddr, p, lane);
+    return (d & 1u) == 0u && (d >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) == c;
+}
+
+// Search the nodes at remap positions [begin, end) for c's parent, one candidate per
+// lane; returns its link (p << 5) | lane, or NO_LINK.
+uint searchParent(uint64_t treeAddr, uint64_t remapAddr, uint begin, uint end, uint c, uint idx)
+{
+    uint link = NO_LINK;
+    for (uint base = begin; base < end && link == NO_LINK; base += WARP)   // group-uniform
+    {
+        const uint pos = base + idx;
+        uint found = NO_LINK;
+        if (pos < end)
+        {
+            const uint p = Ptr<uint>(remapAddr + uint64_t(pos) * 4UL)[0];
+            const uint nb = min(bvNbNodes(treeAddr, p), WARP);
+            for (uint k = 0u; k < nb; ++k)
+            {
+                const uint d = bvData(treeAddr, p, k);
+                if ((d & 1u) == 0u && (d >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) == c)
+                    found = (p << 5u) | k;
+            }
+        }
+        const uint hits = ballot32(found != NO_LINK, idx);
+        if (hits != 0u)
+            link = broadcast32(found, firstbitlow(hits), idx);
+    }
+    return link;
+}
+
+// Node c's parent link; `level` is c's depth level or NO_LEVEL, `parentLevel` receives
+// the parent's when known.  Caches a searched link in c's padding[0].
+uint findParent(uint64_t treeAddr, uint64_t depthInfoAddr, uint64_t remapAddr, uint nbNodes, uint c,
+                uint level, out uint parentLevel, uint idx)
+{
+    const uint64_t cacheAddr = bvNodeBase(treeAddr, c) + BV32_PADDING_OFFSET;
+    // PhysX trees put a node's parent exactly one level up (BV32Tree::createSOAformatNode);
+    // that is only a search hint here, the validation does not rely on it.
+    parentLevel = (level != NO_LEVEL && level > 0u) ? level - 1u : NO_LEVEL;
+
+    const uint cached = Ptr<uint>(cacheAddr)[0];
+    if (parentLinkValid(treeAddr, nbNodes, c, cached))
+        return cached;
+
+    uint link = NO_LINK;
+    if (parentLevel != NO_LEVEL)
+    {
+        const uint2 info = Ptr<uint2>(depthInfoAddr + uint64_t(parentLevel) * DEPTHINFO_STRIDE)[0];
+        link = searchParent(treeAddr, remapAddr, info.x, info.x + info.y, c, idx);
+    }
+    if (link == NO_LINK)
+    {
+        parentLevel = NO_LEVEL;
+        link = searchParent(treeAddr, remapAddr, 0u, nbNodes, c, idx);
+    }
+    if (link != NO_LINK && idx == 0u)
+        Ptr<uint>(cacheAddr)[0] = link;
+    return link;
+}
+
+// Arrive at parent p after refitting one of its internal children; true in every lane
+// iff this group is the LAST of p's internal children to arrive (it then refits p).
+bool arriveAtParent(uint64_t treeAddr, uint p, uint idx)
+{
+    const uint d = bvData(treeAddr, p, idx);
+    const uint internalMask = ballot32(idx < bvNbNodes(treeAddr, p) && (d & 1u) == 0u, idx);
+
+    // Release: every lane's stores of the child (mMin/mMax lanes, mPackedNodeBounds)
+    // happen before lane 0's arrival, at device scope.
+    AllMemoryBarrierWithGroupSync();
+    if (idx == 0u)
+    {
+        uint old;
+        InterlockedAdd(Ptr<uint>(bvNodeBase(treeAddr, p) + BV32_MMIN_OFFSET + BV32_COUNTER_OFFSET)[0], 1u, old);
+        sWord = (old + 1u == countbits(internalMask)) ? 1u : 0u;
+    }
+    // Acquire: the last arriver's lanes see every sibling's stores before refitting p.
+    AllMemoryBarrierWithGroupSync();
+    const bool last = sWord != 0u;
+    GroupMemoryBarrierWithGroupSync();   // sWord is reused by the next broadcast
+    return last;
+}
+
+// ---------------------------------------------------------------------------
+// cloth_refitBoundLaunch (FEMCloth.cu:321).
+// Dispatch: grid (nbActiveFemCloths, nbSlices >= 1, 1), block (32, 1, 1).
 // ---------------------------------------------------------------------------
 [shader("compute")]
-[numthreads(32, REFIT_WARPS, 1)]
+[numthreads(32, 1, 1)]
 void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     // Early exit if contact pairs are not updated.  (PxU8 read as the low byte.)
@@ -286,7 +563,6 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
         return;
 
     const uint idx = gtid.x;
-    const uint warpIndex = gtid.y;
     const uint blockIdx = gid.x;
     if (blockIdx >= gP.nbActiveFemCloths) return;   // group-uniform
 
@@ -311,164 +587,65 @@ void cloth_refitBoundLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
     const uint64_t meshVerts = clothes[femClothId].mPosition_InvMass;
     const uint64_t meshVertsIndices = clothes[femClothId].mTriangleVertexIndices_ownedEdges;
 
-    // each warp deals with one node; walk the depth levels bottom-up
-    for (uint i = maxDepth; i > 0u; i--)
+    const uint nbSlices = WorkgroupCount().y;
+    for (uint j = gid.y; j < nbBv32PackedNodes; j += nbSlices)
     {
-        const uint2 info = Ptr<uint2>(depthInfoAddr + uint64_t(i - 1u) * DEPTHINFO_STRIDE)[0];
-        const uint offset = info.x;
-        const uint count = info.y;
+        uint c = Ptr<uint>(remapAddr + uint64_t(j) * 4UL)[0];
 
-        // CUDA: for (j = warpIndex; j < count; j += SB_REFIT_WAPRS_PER_BLOCK).  The loop
-        // is driven by the group-uniform base jj so every warp makes the same number of
-        // trips (and reaches every barrier); a warp past the end of the level runs the
-        // trip on node 0 with `active` false and writes nothing.
-        for (uint jj = 0u; jj < count; jj += REFIT_WARPS)
+        // A node with internal children is refit by its last-arriving child, not here.
+        const uint cData = bvData(treeAddr, c, idx);
+        if (ballot32(idx < bvNbNodes(treeAddr, c) && (cData & 1u) == 0u, idx) != 0u)
+            continue;
+
+        uint level = levelOfRemapPos(depthInfoAddr, maxDepth, j);
+        bool climbing = true;
+        while (climbing)
         {
-            const uint j = jj + warpIndex;
-            const bool active = j < count;
-            const uint nodeIndex = active ? Ptr<uint>(remapAddr + uint64_t(j + offset) * 4UL)[0] : 0u;
-            const uint nodeData = bvData(treeAddr, nodeIndex, idx);
-            const uint nbChildren = active ? bvNbNodes(treeAddr, nodeIndex) : 0u;
-            const bool isLeafLane = (nodeData & 1u) != 0u;
+            refitNode(treeAddr, c, idx, meshVerts, meshVertsIndices, sPackedNodeBounds);
 
-            // compute the bitMask for all the leaf nodes
-            const uint resultWarp = ballot32(idx < nbChildren && isLeafLane, idx, warpIndex);
-
-            // The trip count of the leaf walk below must be the same for every warp,
-            // because it holds barriers: the largest leaf count of the group's nodes.
-            if (idx == 0u && warpIndex == 0u) sMaxLeaves = 0u;
-            GroupMemoryBarrierWithGroupSync();
-            if (idx == 0u) InterlockedMax(sMaxLeaves, countbits(resultWarp));
-            GroupMemoryBarrierWithGroupSync();
-            const uint maxLeaves = sMaxLeaves;
-
-            float3 mn = float3(PX_MAX_F32, PX_MAX_F32, PX_MAX_F32);
-            float3 mx = float3(-PX_MAX_F32, -PX_MAX_F32, -PX_MAX_F32);
-
-            // using one warp to compute all leaf nodes' (under the same current node)
-            // min and max
-            // CUDA walks the set bits with `for (k = resultWarp; k; k = clearLowestSetBit(k))`
-            // and lowestSetIndex(k).  That is the canonical popcount loop idiom
-            // (`k &= k-1`), and llvmpipe's LLVM 20.1 backend MISCOMPILES it here: with a
-            // non-trivial body (either the primitive gather or the groupshared reduction —
-            // each alone reproduces it) the driver worker thread takes a SIGSEGV.  The
-            // equivalent fixed 32-iteration scan below sidesteps the idiom entirely and is
-            // OUTPUT-IDENTICAL: it visits exactly the same set bits in the same ascending
-            // order.  (An empty-body bit walk runs fine, so this is a codegen bug, not a
-            // Slang/SPIR-V semantics issue.)  Here trip r visits this warp's r-th set bit,
-            // located by a fixed 32-step scan rather than the `k &= k-1` idiom; a trip
-            // past this warp's own leaf count (another warp's node has more leaves) is a
-            // no-op for it: it takes part in the reduction's barriers and keeps its mn/mx.
-            for (uint r = 0u; r < maxLeaves; ++r)
+            if (c == 0u)
             {
-                uint indexInWarp = 0u;
-                for (uint kk = 0u; kk < WARP; ++kk)
+                // The root is done, the whole tree is: update the broad-phase bound.
+                // lane 0's mPackedNodeBounds[0] store must reach lanes 1..5.
+                AllMemoryBarrierWithGroupSync();
+
+                const uint index = Ptr<uint>(gP.elemIndex)[femClothId];
+
+                // Expand the bound for broad phase.
+                // Unlike soft bodies, the contact distance remains unchanged; otherwise,
+                // contact buffers easily overflow for cloth.
+                const float contactDist = clothes[femClothId].mOriginalContactOffset +
+                                          Ptr<float>(gP.speculativeCCDContactOffset)[femClothId];
+                const float broadPhaseExpansion = pxMax(gP.nbCollisionPairUpdatesPerTimestep, 1.0f) * contactDist;
+
+                // PxBounds3& root = sPackedNodeBounds[0];  compute min(0-2) max(3-5)
+                if (idx < 6u)
                 {
-                    if (((resultWarp >> kk) & 1u) != 0u && countbits(resultWarp & ((1u << kk) - 1u)) == r)
-                        indexInWarp = kk;
+                    const float r = boundsWordLoad(sPackedNodeBounds + uint64_t(idx) * 4UL);   // pairs with lane 0's atomic store
+                    const float value = idx < 3u ? (r - broadPhaseExpansion) : (r + broadPhaseExpansion);
+                    Ptr<float>(gP.boundArray + uint64_t(index) * BOUNDS3_STRIDE)[idx] = value;
                 }
-                const bool mine = r < countbits(resultWarp);   // warp-uniform
-
-                // primitive: triangle
-                const uint childData = bvData(treeAddr, nodeIndex, indexInWarp);
-                const uint nbPrimitives = mine ? ((childData >> 1u) & 63u) : 0u;
-                const uint startIndex = childData >> 7u;
-
-                float3 tMin = mn;
-                float3 tMax = mx;
-
-                // each thread in a warp deals with one primitive (maximum 32 primitives)
-                const uint primitiveIndex = idx + startIndex;
-
-                if (idx < nbPrimitives)
+                climbing = false;
+            }
+            else
+            {
+                uint parentLevel;
+                const uint link = findParent(treeAddr, depthInfoAddr, remapAddr, nbBv32PackedNodes, c, level,
+                                             parentLevel, idx);
+                // No parent (a malformed tree): nothing above c can be refit.
+                bool last = false;
+                if (link != NO_LINK)
+                    last = arriveAtParent(treeAddr, link >> 5u, idx);
+                if (last)
                 {
-                    const uint4 primitiveIdx = Ptr<uint4>(meshVertsIndices)[primitiveIndex];
-
-                    const float3 worldV0 = Ptr<float4>(meshVerts)[primitiveIdx.x].xyz;
-                    const float3 worldV1 = Ptr<float4>(meshVerts)[primitiveIdx.y].xyz;
-                    const float3 worldV2 = Ptr<float4>(meshVerts)[primitiveIdx.z].xyz;
-
-                    float tx = pxMin(worldV0.x, worldV1.x);
-                    float ty = pxMin(worldV0.y, worldV1.y);
-                    float tz = pxMin(worldV0.z, worldV1.z);
-
-                    tx = pxMin(tx, worldV2.x);
-                    ty = pxMin(ty, worldV2.y);
-                    tz = pxMin(tz, worldV2.z);
-
-                    tMin.x = pxMin(tMin.x, tx);
-                    tMin.y = pxMin(tMin.y, ty);
-                    tMin.z = pxMin(tMin.z, tz);
-
-                    tx = pxMax(worldV0.x, worldV1.x);
-                    ty = pxMax(worldV0.y, worldV1.y);
-                    tz = pxMax(worldV0.z, worldV1.z);
-
-                    tx = pxMax(tx, worldV2.x);
-                    ty = pxMax(ty, worldV2.y);
-                    tz = pxMax(tz, worldV2.z);
-
-                    tMax.x = pxMax(tMax.x, tx);
-                    tMax.y = pxMax(tMax.y, ty);
-                    tMax.z = pxMax(tMax.z, tz);
+                    c = link >> 5u;
+                    level = parentLevel;
                 }
-
-                // min = warpShuffleMin(tMin);  max = warpShuffleMax(tMax);
-                warpMinMax32(tMin, tMax, idx, warpIndex);
-                if (mine)
+                else
                 {
-                    mn = tMin;
-                    mx = tMax;
+                    climbing = false;
                 }
             }
-
-            if (idx < nbChildren && !isLeafLane)
-            {
-                const uint childOffset = nodeData >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT;
-
-                mn = boundsMin(sPackedNodeBounds, childOffset);
-                mx = boundsMax(sPackedNodeBounds, childOffset);
-            }
-
-            if (idx < nbChildren)
-            {
-                // We already updated the bounds in the previous iterations
-                bvStoreMin(treeAddr, nodeIndex, idx, mn);
-                bvStoreMax(treeAddr, nodeIndex, idx, mx);
-            }
-
-            // sPackedNodeBounds[nodeIndex] = { warpShuffleMin(min), warpShuffleMax(max) }
-            float3 rn = mn;
-            float3 rx = mx;
-            warpMinMax32(rn, rx, idx, warpIndex);
-            if (idx == 0u && active)
-                boundsStore(sPackedNodeBounds, nodeIndex, rn, rx);
-        }
-
-        // __syncthreads() between depth levels: the next level reads the
-        // mPackedNodeBounds this one wrote.  The global writes are made visible to the
-        // other warps of the group by the full memory barrier.
-        AllMemoryBarrierWithGroupSync();
-    }
-
-    // update the broad-phase bound (CUDA: `if (warpIndex == 0)`).
-    if (warpIndex == 0u)
-    {
-        const uint index = Ptr<uint>(gP.elemIndex)[femClothId];
-
-        // Expand the bound for broad phase.
-        // Unlike soft bodies, the contact distance remains unchanged; otherwise, contact
-        // buffers easily overflow for cloth.
-        const float contactDist = clothes[femClothId].mOriginalContactOffset +
-                                  Ptr<float>(gP.speculativeCCDContactOffset)[femClothId];
-        const float broadPhaseExpansion = pxMax(gP.nbCollisionPairUpdatesPerTimestep, 1.0f) * contactDist;
-
-        // PxBounds3& root = sPackedNodeBounds[0];  compute min(0-2) max(3-5)
-        if (idx < 6u)
-        {
-            const float r = Ptr<float>(sPackedNodeBounds)[idx];
-            const float value = idx < 3u ? (r - broadPhaseExpansion) : (r + broadPhaseExpansion);
-            Ptr<float>(gP.boundArray + uint64_t(index) * BOUNDS3_STRIDE)[idx] = value;
         }
     }
 }

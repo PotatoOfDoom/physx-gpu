@@ -2228,6 +2228,30 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## Cloth- und Softbody-Refit über viele Workgroups (Last-Arriver)
+
+**Anlass.** Nach dem 32-Warp-Refit lief SnippetDeformableSurface auf der RX 9070 XT mit 30 statt 10 fps; laut
+`PXG_KERNEL_TIMES=1` war `cloth_refitBoundLaunch` aber weiter der teuerste Kernel (27–28 %, ~4 ms pro Launch,
+2 Launches pro Step, GPU zu 82 % ausgelastet): eine Workgroup pro Tuch belegt eine Compute-Unit, der Rest wartet.
+
+**Umbau** (`femClothRefitBda.slang`, `softBodyRefitBda.slang` — der Softbody-Refit hatte dieselbe Struktur):
+256 Ein-Warp-Workgroups pro Körper refitten die Blattebene parallel; ein atomarer Ankunftszähler pro Knoten
+lässt den zuletzt fertigen Kind-Warp den Elternknoten refitten (Kinder in fester Indexreihenfolge gelesen →
+bitgleich, unabhängig von der Ankunftsreihenfolge); der letzte Ankömmling setzt den Zähler für den nächsten
+Launch zurück. Keine Workgroup wartet auf eine andere (kein Deadlock ohne Forward-Progress-Garantie). Die
+Bounds wandern über Workgroup-Grenzen mit Device-Scope-Atomics (das Modul hat kein Vulkan-Speichermodell,
+plain Stores wären für andere CUs nicht garantiert sichtbar). Host-Patch nur Grid-Größe, unter
+`#ifdef PXG_NO_CUDA_TOOLKIT` in `PxgFEMClothCore.cpp` / `PxgSoftBodyCore.cpp` (Argumente/ABI unverändert).
+Kritischer Pfad für das Snippet-Tuch: 6 083 (eine Warp) → 230 (32 Warps) → 43 Runden über 256 Workgroups.
+Groupshared pro Workgroup wieder klein, beide Einträge aus `groupshared_known.txt` entfernt.
+
+**Tests.** Neue Baum-Generatoren (`pxgBv32TreeGen.h`): tiefe/unbalancierte Bäume, viele Tücher/Softbodies,
+Ebenen mit 1 und >1000 Knoten, wiederholte Launches (Zähler-Reset), bitgenau gegen die CPU-Referenz.
+Grenzen auf llvmpipe: Sichtbarkeitsfehler über CUs kann llvmpipe nicht zeigen (Review per Mutanten
+dokumentiert). ctest 867/867 in beiden Modi (+1 Skip ohne Validation-Layer), Szenen 99/99 + Kontrolle,
+`snippetsurface` in beiden Modi. Geschwindigkeit nur auf echter Hardware messbar (llvmpipe teilt alle
+Workgroups auf 4 CPU-Threads); Messung auf der RX 9070 XT steht aus.
+
 ## Cloth-Refit auf 32 Warps — SnippetDeformableSurface lief auf der RX 9070 XT mit 10 fps
 
 **Befund** (Nutzer: konstant 10 fps, auch vor dem Kontakt mit der Kugel). Nachgestellt als

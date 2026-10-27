@@ -71,6 +71,7 @@
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
+#include "pxgBv32TreeGen.h"                // synthetic BV32 trees for the multi-workgroup refit
 #include "PxgSimulationCoreDesc.h"           // 5.12: PxgDeformablePairInfo, PxgEncodeDeformable*
 #include "PxgDeformableContactWriters.h"     // 5.12: PxgRigidDbContactWriter / PxgDbDbContactWriter
 #include "PxsDeformableVolumeMaterialCore.h" // 5.12: PxsDeformableVolumeMaterialData
@@ -683,6 +684,16 @@ static void runSbRefitBound(bool speculativeCCD, bool zeroSign = false)
     const uint32_t wRemap = wDepthInfo + maxDepth * 2u;
     for (uint32_t n = 0; n < nbNodes; ++n) tree.w[wRemap + n] = n;   // identity
 
+    // Every PhysX tree has mMin[k].w == mMax[k].w == 0.0f in its VALID child slots
+    // (BV32Tree::createSOAformatNode: PxVec4(min, 0.f)); the multi-workgroup refit keeps
+    // its per-node arrival counter in mMin[0].w and relies on that.
+    for (uint32_t n = 0; n < nbNodes; ++n)
+        for (uint32_t k = 0; k < tree.w[tree.nodeWord(n) + W_NBNODES]; ++k)
+        {
+            tree.w[tree.nodeWord(n) + W_MMIN + k * 4u + 3u] = 0u;
+            tree.w[tree.nodeWord(n) + W_MMAX + k * 4u + 3u] = 0u;
+        }
+
     const uint32_t sbId = 0u, elemIdx = 2u;
     const float origContactOffset = 0.037f, specCCD = 0.011f;
 
@@ -848,6 +859,231 @@ static void runSbRefitBound(bool speculativeCCD, bool zeroSign = false)
 PXG_TEST(softBodySimRefitBound) { runSbRefitBound(/*speculativeCCD*/ false); }
 PXG_TEST(softBodySimRefitBoundCCD) { runSbRefitBound(/*speculativeCCD*/ true); }
 PXG_TEST(softBodySimRefitBoundZeroSign) { runSbRefitBound(/*speculativeCCD*/ false, /*zeroSign*/ true); }
+
+// ---------------------------------------------------------------------------
+// sb_refitBoundLaunch's multi-workgroup schedule (softBodyRefitBda.slang header; the
+// cloth sibling femClothSimRefitBoundLastArriver documents the failure modes): grid
+// (nbActive, nbSlices), one warp per group, a node refit by the LAST of its internal
+// children to arrive.  Same trees, same five launches (1, 3, 256, 2000, 256 slices) with
+// every vertex moved between launches, the parent-link cache scrambled before the third,
+// four softbodies activated out of order plus an inactive one — and the softbody tail:
+// the root bound copied verbatim, and the bp/np contact distances republished only for
+// the bodies flagged eENABLE_SPECULATIVE_CCD.  Bit-exact against the CPU transcription.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimRefitBoundLastArriver)
+{
+    using namespace p80refit;
+    namespace g = pxgbv32gen;
+    PxgSlangComputeDevice* dev = testDevice();
+    g::Rng rng{ 0xBB67AE85u };
+    const float POISON = -7777.0f;
+
+    std::vector<g::Spec> specs;
+    specs.push_back(g::wideSpec(32u, 32u, rng));   // levels 1 / 32 / 1024
+    specs.push_back(g::chainSpec(12u, rng));       // 12 levels, unbalanced
+    specs.push_back(g::randomSpec(5u, rng));
+    specs.push_back(g::singleSpec(rng));           // the root alone
+    specs.push_back(g::randomSpec(4u, rng));       // INACTIVE
+    const uint32_t nbBodies = uint32_t(specs.size());
+    const std::vector<uint32_t> active = { 3u, 0u, 2u, 1u };
+    const std::vector<uint32_t> elemIndices = { 5u, 1u, 7u, 3u, 0u };
+    const uint32_t nbSlots = 9u;
+
+    struct Body
+    {
+        g::Tree tree;
+        std::vector<F4> pos;
+        std::vector<TetIdx4> tets;
+        TreeBlob ref;
+        std::vector<Bounds> refPacked;
+        DevBuf bPos, bTet, bTree, bPacked;
+        bool isActive = false;
+    };
+    std::vector<Body> bodies(nbBodies);
+    auto randomPos = [&](Body& b) {
+        for (F4& p : b.pos) p = F4{ rng.unit() * 5.0f, rng.unit() * 5.0f, rng.unit() * 5.0f, 0.5f };
+    };
+    uint32_t wrongLinks = 0u;
+    for (uint32_t i = 0; i < nbBodies; ++i)
+    {
+        Body& b = bodies[i];
+        b.tree = g::build(specs[i], rng, POISON);
+        const uint32_t nv = 3u + b.tree.nbPrims;
+        b.pos.resize(nv);
+        randomPos(b);
+        for (uint32_t t = 0; t < b.tree.nbPrims; ++t)
+            b.tets.push_back(TetIdx4{ rng.below(nv), rng.below(nv), rng.below(nv), rng.below(nv) });
+        b.tree.w[0] = nv;
+        b.ref.w = b.tree.w;
+        b.refPacked.assign(b.tree.nbNodes, Bounds{ V3{ POISON, POISON, POISON }, V3{ POISON, POISON, POISON } });
+        b.isActive = std::find(active.begin(), active.end(), i) != active.end();
+        for (uint32_t n = 0; n < b.tree.nbNodes; ++n)
+        {
+            const uint32_t link = b.tree.w[b.tree.nodeWord(n) + g::W_PADDING0];
+            const uint32_t p = link >> 5, k = link & 31u;
+            if (link != b.tree.parentLink[n] && p < b.tree.nbNodes && k < b.tree.w[b.tree.nodeWord(p) + g::W_NBNODES] &&
+                (b.tree.w[b.tree.nodeWord(p) + g::W_MDATA + k] & 1u) == 0u)
+                ++wrongLinks;
+        }
+    }
+    // the shapes this case claims
+    const g::Tree& wide = bodies[0].tree;
+    PXG_CHECK_MSG(wide.maxDepth == 3u && wide.levelCount[0] == 1u && wide.levelCount[2] == 1024u,
+                  "wide tree must have levels of 1 and 1024 nodes (%u levels)", wide.maxDepth);
+    PXG_CHECK_MSG(bodies[1].tree.maxDepth >= 12u, "chain tree must be at least 12 levels deep (%u)", bodies[1].tree.maxDepth);
+    PXG_CHECK_MSG(bodies[3].tree.nbNodes == 1u, "single-node tree must be one node");
+    PXG_CHECK_MSG(wrongLinks > 0u, "the padding garbage must include links to a real slot of the wrong node");
+
+    for (Body& b : bodies)
+    {
+        b.bPos = makeDev(dev, b.pos);
+        b.bTet = makeDev(dev, b.tets);
+        b.bTree = makeDev(dev, b.tree.w);
+        b.bPacked = makeDev(dev, std::vector<float>(b.tree.nbNodes * 6u, POISON));
+    }
+    std::vector<float> specCCD(nbBodies), origOffset(nbBodies);
+    std::vector<PxgSoftBody> descArr;
+    const std::vector<bool> ccd = { false, true, false, true, true };
+    for (uint32_t i = 0; i < nbBodies; ++i)
+    {
+        specCCD[i] = 0.001f * float(i + 1u);
+        origOffset[i] = 0.013f * float(i + 2u);
+        PxgSoftBody c = makeZeroDesc();
+        c.mTetMeshData = reinterpret_cast<decltype(c.mTetMeshData)>(size_t(bodies[i].bTree.addr));
+        c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bodies[i].bPos.addr));
+        c.mTetIndices = reinterpret_cast<decltype(c.mTetIndices)>(size_t(bodies[i].bTet.addr));
+        c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bodies[i].bPacked.addr));
+        c.mOriginalContactOffset = origOffset[i];
+        if (ccd[i])
+            c.mBodyFlags = PxDeformableBodyFlags(PxDeformableBodyFlag::eENABLE_SPECULATIVE_CCD);
+        descArr.push_back(c);
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    DevBuf bActive = makeDev(dev, active);
+    DevBuf bElem = makeDev(dev, elemIndices);
+    DevBuf bSpec = makeDev(dev, specCCD);
+    DevBuf bBounds = makeDev(dev, std::vector<float>(nbSlots * 6u, POISON));
+    DevBuf bBp = makeDev(dev, std::vector<float>(nbSlots, POISON));
+    DevBuf bNp = makeDev(dev, std::vector<float>(nbSlots, POISON));
+
+    SbRefitPush rp{};
+    rp.softBodies = bDesc.addr;
+    rp.activeSoftBodies = bActive.addr;
+    rp.nbActive = uint32_t(active.size());
+    rp.bpContactDistance = bBp.addr;
+    rp.npContactDistance = bNp.addr;
+    rp.speculativeCCD = bSpec.addr;
+    rp.boundArray = bBounds.addr;
+    rp.elemIndex = bElem.addr;
+
+    Kernel k("softBodyRefitBda.spv", "sb_refitBoundLaunch", {}, sizeof(SbRefitPush));
+    const uint32_t slicesPerLaunch[] = { 1u, 3u, 256u, 2000u, 256u };
+    std::vector<float> refBounds(nbSlots * 6u, POISON), refDist(nbSlots, POISON);
+    for (uint32_t launch = 0; launch < 5u; ++launch)
+    {
+        const uint32_t slices = slicesPerLaunch[launch];
+        for (uint32_t i = 0; i < nbBodies && launch > 0u; ++i)
+        {
+            if (!bodies[i].isActive) continue;
+            randomPos(bodies[i]);
+            dev->upload(bodies[i].bPos.h, bodies[i].pos.data(), bodies[i].pos.size() * sizeof(F4));
+            if (launch == 2u)   // fresh garbage in the parent-link cache, searched by 256 slices
+                for (uint32_t n = 0; n < bodies[i].tree.nbNodes; ++n)
+                {
+                    const uint32_t gword = (n & 1u) ? rng.next() : 0xFFFFFFFFu;
+                    dev->upload(bodies[i].bTree.h, &gword, 4u, size_t(bodies[i].tree.nodeWord(n) + g::W_PADDING0) * 4u);
+                }
+        }
+        k.dispatch(uint32_t(active.size()), {}, rp, slices, 1u);
+        dev->flush();
+
+        size_t mm = 0, printed = 0;
+        for (uint32_t i = 0; i < nbBodies; ++i)
+        {
+            Body& b = bodies[i];
+            const g::Tree& t = b.tree;
+            if (b.isActive)
+            {
+                for (uint32_t l = t.maxDepth; l > 0u; --l)
+                {
+                    const uint32_t off = t.w[t.wDepthInfo + (l - 1u) * 2u + 0];
+                    const uint32_t cnt = t.w[t.wDepthInfo + (l - 1u) * 2u + 1];
+                    for (uint32_t j = 0; j < cnt; ++j)
+                        refitNodeRef(t.w[t.wRemap + off + j], b.ref, b.refPacked, b.pos, b.tets);
+                }
+                // the root bound verbatim; the contact distance only under speculative CCD
+                const V3 rn = b.refPacked[0].mn, rx = b.refPacked[0].mx;
+                const float r6[6] = { rn.x, rn.y, rn.z, rx.x, rx.y, rx.z };
+                for (uint32_t e = 0; e < 6u; ++e) refBounds[elemIndices[i] * 6u + e] = r6[e];
+                if (ccd[i]) refDist[elemIndices[i]] = specCCD[i] + origOffset[i];
+            }
+            const auto gTree = downloadBuffer<uint32_t>(dev, b.bTree.h, t.w.size());
+            const auto gPacked = downloadBuffer<float>(dev, b.bPacked.h, t.nbNodes * 6u);
+            for (uint32_t w = 0; w < uint32_t(t.w.size()); ++w)
+            {
+                const bool pad0 = w >= 4u && w < t.wDepthInfo && (w - 4u) % g::BV32_WORDS == g::W_PADDING0;
+                uint32_t want = b.ref.w[w];
+                if (pad0 && b.isActive)
+                {
+                    const uint32_t n = (w - 4u) / g::BV32_WORDS;
+                    if (n == 0u) continue;   // the root has no parent; its padding is never read
+                    want = t.parentLink[n];
+                }
+                if (gTree[w] != want)
+                {
+                    ++mm;
+                    if (printed++ < 16)
+                        std::printf("  launch %u (%u slices) body %u tree word %u (node %u word %u) MM: ref %08x got %08x\n",
+                                    launch, slices, i, w, w >= 4u ? (w - 4u) / g::BV32_WORDS : 0u,
+                                    w >= 4u ? (w - 4u) % g::BV32_WORDS : w, want, gTree[w]);
+                }
+            }
+            for (uint32_t n = 0; n < t.nbNodes; ++n)
+            {
+                const float r[6] = { b.refPacked[n].mn.x, b.refPacked[n].mn.y, b.refPacked[n].mn.z,
+                                     b.refPacked[n].mx.x, b.refPacked[n].mx.y, b.refPacked[n].mx.z };
+                for (uint32_t e = 0; e < 6u; ++e)
+                    if (f2u(gPacked[n * 6u + e]) != f2u(r[e]))
+                    {
+                        ++mm;
+                        if (printed++ < 16)
+                            std::printf("  launch %u (%u slices) body %u packedNodeBounds[%u][%u] MM: ref %08x got %08x\n",
+                                        launch, slices, i, n, e, f2u(r[e]), f2u(gPacked[n * 6u + e]));
+                    }
+            }
+        }
+        const auto gBounds = downloadBuffer<float>(dev, bBounds.h, nbSlots * 6u);
+        for (uint32_t e = 0; e < nbSlots * 6u; ++e)
+            if (f2u(gBounds[e]) != f2u(refBounds[e]))
+            {
+                ++mm;
+                if (printed++ < 16)
+                    std::printf("  launch %u boundArray[%u][%u] MM: ref %08x got %08x\n", launch, e / 6u, e % 6u,
+                                f2u(refBounds[e]), f2u(gBounds[e]));
+            }
+        const auto gBp = downloadBuffer<float>(dev, bBp.h, nbSlots);
+        const auto gNp = downloadBuffer<float>(dev, bNp.h, nbSlots);
+        for (uint32_t e = 0; e < nbSlots; ++e)
+            if (f2u(gBp[e]) != f2u(refDist[e]) || f2u(gNp[e]) != f2u(refDist[e]))
+            {
+                ++mm;
+                if (printed++ < 16)
+                    std::printf("  launch %u bp/npContactDistance[%u] MM: ref %08x got %08x / %08x\n", launch, e,
+                                f2u(refDist[e]), f2u(gBp[e]), f2u(gNp[e]));
+            }
+        PXG_CHECK_MSG(mm == 0, "sb_refitBoundLaunch last-arriver launch %u (%u slices) bit-exact vs CPU (%zu mismatches)",
+                      launch, slices, mm);
+    }
+
+    for (Body& b : bodies)
+    {
+        dev->destroyBuffer(b.bPos.h); dev->destroyBuffer(b.bTet.h);
+        dev->destroyBuffer(b.bTree.h); dev->destroyBuffer(b.bPacked.h);
+    }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bElem.h);
+    dev->destroyBuffer(bSpec.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bBp.h);
+    dev->destroyBuffer(bNp.h);
+}
 
 
 // ===========================================================================

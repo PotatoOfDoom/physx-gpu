@@ -150,9 +150,3 @@ npTriTriBlock:ttbAssignProbe    29060
 # serial tail adds nothing (pxgSlangTriTriTail, design A).  1652 bytes spare.
 triTriCollisionBda:triangleTriangleCollision    31116
 
-# femClothRefitBda: cloth_refitBoundLaunch widened from one warp to the CUDA's 32
-# warps per cloth (one node per warp per round), so each warp needs its own
-# reduction slots: sRedMin/sRedMax are float3[32 warps][32 lanes] = 2 x 12288 B,
-# plus the per-warp ballot words (128) and sMaxLeaves.  Fixed by construction;
-# 8060 B below the 32768 limit.
-femClothRefitBda:cloth_refitBoundLaunch    24708

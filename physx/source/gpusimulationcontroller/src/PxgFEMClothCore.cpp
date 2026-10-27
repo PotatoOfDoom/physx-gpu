@@ -573,9 +573,22 @@ namespace physx
 				PX_CUDA_KERNEL_PARAM(updateClothContactPairsd),
 			};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: cloth_refitBoundLaunch refits the BV32 tree bottom-up with
+			// many one-warp workgroups per cloth (grid y = node slices; the last child to
+			// finish refits its parent, see femClothRefitBda.slang), so one large cloth no
+			// longer runs on a single compute unit.  Any slice count >= 1 is correct; same
+			// arguments, same results.
+			const PxU32 numSlicesPerCloth = 256;
+			PX_UNUSED(numWarpsPerBlock);
+			CUresult result =
+				mCudaContext->launchKernel(refitBoundKernelFunction, numBlocks, numSlicesPerCloth, 1, numThreadsPerWarp, 1,
+										   1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			CUresult result =
 				mCudaContext->launchKernel(refitBoundKernelFunction, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlock,
 										   1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 			PX_ASSERT(result == CUDA_SUCCESS);
 			PX_UNUSED(result);
 
