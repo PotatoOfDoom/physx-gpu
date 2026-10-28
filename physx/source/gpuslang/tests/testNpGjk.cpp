@@ -829,4 +829,209 @@ PXG_TEST(npTetCollide_p89InnerSphereSelect)
     for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// npTetCollide_warpDifferential -- the WARP-COOPERATIVE driver (pxgSlangGjkWarp, the
+// CUDA's shape: 32 threads, lane L holding CUDA lane L's registers, shuffles as
+// groupshared exchanges) against the SERIAL one (pxgSlangTetCollide over pxgSlangGjk /
+// pxgSlangEpa, one thread simulating the warp), bit for bit on every output field.
+//
+// The serial driver is the reference: its GJK and EPA are pinned against CPU
+// transcriptions (npGjk_driver, npEpa_*), and sb_primitiveContactGenLaunch ran on it until
+// the cooperative rework.  So one fixture certifies the new driver against everything the
+// old one was certified against, without a third GJK.
+//
+// Families, all through the driver's whole policy (GJK, the anomaly gate, EPA from a
+// tetrahedron or from a 1-3 vertex simplex, the degenerate-EPA retry from +y):
+//   point / segment / hull (4..64 vertices) vs a tetrahedron, integer and non-integer
+//   coordinates, separated, close, touching and overlapping; FLAT hulls (one coordinate
+//   constant), whose overlap leaves GJK a triangle so EPA seeds from epaStart123;
+//   FLAT or collapsed tetrahedra; and general clouds of up to 64 vertices on BOTH sides
+//   (two 32-vertex chunks per support).  The warp entry reports which branches ran in
+//   `pad`; the fixture requires every one of them to be reached.
+// ===========================================================================
+namespace warpdiff
+{
+// GW_PATH_* (pxgSlangGjkWarp), reported in TcOut::pad by ctTetCollideWarp
+static const uint32_t PATH_EPA = 1u, PATH_ANOMALY = 2u, PATH_RETRY = 4u, PATH_START4 = 8u;
+}
+
+PXG_TEST(npTetCollide_warpDifferential)
+{
+    using namespace warpdiff;
+    const uint32_t MAXV = 64u;
+    std::mt19937 rng(20261028u);
+    std::vector<float> VA, VB;
+    std::vector<TcIn> in;
+
+    auto uni = [&](float lo, float hi) { return lo + (hi - lo) * float(rng() % 1000001u) / 1000000.0f; };
+    auto ivr = [&](int r) { return float(int(rng() % uint32_t(2 * r + 1)) - r); };
+    // one test: A has nA points, B has nB points; `flatA` zeroes A's z, `flatB` B's
+    auto emit = [&](uint32_t nA, uint32_t nB, bool integer, float spread, V3 shiftB, bool flatA, bool flatB,
+                    float cDist)
+    {
+        V3 a[64], b[64];
+        for (uint32_t k = 0; k < MAXV; ++k)
+        {
+            a[k] = integer ? V3{ ivr(int(spread)), ivr(int(spread)), ivr(int(spread)) }
+                           : V3{ uni(-spread, spread), uni(-spread, spread), uni(-spread, spread) };
+            b[k] = integer ? V3{ ivr(int(spread)), ivr(int(spread)), ivr(int(spread)) }
+                           : V3{ uni(-spread, spread), uni(-spread, spread), uni(-spread, spread) };
+            if (flatA) a[k].z = 0.0f;
+            if (flatB) b[k].z = 0.0f;
+            b[k] = { b[k].x + shiftB.x, b[k].y + shiftB.y, b[k].z + shiftB.z };
+            if (k >= nA) a[k] = { 0, 0, 0 };
+            if (k >= nB) b[k] = { 0, 0, 0 };
+        }
+        for (uint32_t k = 0; k < MAXV; ++k)
+        {
+            VA.push_back(a[k].x); VA.push_back(a[k].y); VA.push_back(a[k].z); VA.push_back(0);
+            VB.push_back(b[k].x); VB.push_back(b[k].y); VB.push_back(b[k].z); VB.push_back(0);
+        }
+        // the kernel's search direction: rigid centre minus tet centroid
+        V3 ca = { 0, 0, 0 }, cb = { 0, 0, 0 };
+        for (uint32_t k = 0; k < nA; ++k) { ca.x += a[k].x; ca.y += a[k].y; ca.z += a[k].z; }
+        for (uint32_t k = 0; k < nB; ++k) { cb.x += b[k].x; cb.y += b[k].y; cb.z += b[k].z; }
+        TcIn e;
+        std::memset(&e, 0, sizeof(e));
+        e.searchDir[0] = ca.x / float(nA) - cb.x / float(nB);
+        e.searchDir[1] = ca.y / float(nA) - cb.y / float(nB);
+        e.searchDir[2] = ca.z / float(nA) - cb.z / float(nB);
+        if (rng() % 16u == 0u) { e.searchDir[0] = 0; e.searchDir[1] = 0; e.searchDir[2] = 0; }  // the +x fallback
+        e.searchDir[3] = cDist;
+        e.spheres[0] = (rng() % 4u == 0u) ? 0.0f : uni(0.0f, 0.5f);
+        e.spheres[1] = uni(0.01f, 0.5f);
+        e.counts[0] = nA; e.counts[1] = nB;
+        in.push_back(e);
+    };
+    auto shift = [&](float lo, float hi) { return V3{ uni(lo, hi) * ((rng() & 1u) ? 1.0f : -1.0f), uni(-hi, hi), uni(-hi, hi) }; };
+
+    for (uint32_t it = 0; it < 300; ++it) emit(1, 4, it & 1, 3.0f, shift(0.0f, 3.0f), false, false, uni(0.0f, 1.0f));     // sphere
+    for (uint32_t it = 0; it < 300; ++it) emit(2, 4, it & 1, 3.0f, shift(0.0f, 3.0f), false, false, uni(0.0f, 1.0f));     // capsule
+    for (uint32_t it = 0; it < 600; ++it) emit(4 + rng() % 61u, 4, it & 1, 4.0f, shift(0.0f, 6.0f), false, false, uni(0.0f, 1.5f));
+    for (uint32_t it = 0; it < 300; ++it) emit(8, 4, true, 2.0f, shift(0.0f, 1.0f), false, false, uni(0.0f, 0.5f));   // deep overlap
+    for (uint32_t it = 0; it < 300; ++it) emit(3 + rng() % 30u, 4, it & 1, 3.0f, shift(0.0f, 2.0f), true, false, uni(0.0f, 1.0f));  // flat hull
+    for (uint32_t it = 0; it < 200; ++it) emit(4 + rng() % 20u, 4, it & 1, 3.0f, shift(0.0f, 2.0f), false, true, uni(0.0f, 1.0f));  // flat tet
+    for (uint32_t it = 0; it < 200; ++it) emit(1 + rng() % 64u, 1 + rng() % 64u, it & 1, 5.0f, shift(0.0f, 8.0f), false, false, uni(0.0f, 2.0f));
+    for (uint32_t it = 0; it < 200; ++it) emit(33 + rng() % 32u, 33 + rng() % 32u, true, 4.0f, shift(0.0f, 2.0f), false, false, uni(0.0f, 1.0f));
+    // both clouds in the plane z = 0: the Minkowski difference is planar, so an overlap
+    // ends GJK on a triangle or a segment and EPA seeds from epaStart123
+    for (uint32_t it = 0; it < 300; ++it) emit(3 + rng() % 20u, 3 + rng() % 20u, true, 3.0f, V3{ ivr(1), ivr(1), 0.0f }, true, true, uni(0.0f, 1.0f));
+    // touching: A at z <= 0, B at z >= 0 sharing the plane z = 0 (integer, so exact)
+    for (uint32_t it = 0; it < 200; ++it)
+    {
+        emit(4 + rng() % 12u, 4, true, 2.0f, V3{ ivr(1), ivr(1), 0.0f }, false, false, uni(0.0f, 0.5f));
+        const size_t vb = (in.size() - 1) * MAXV * 4;
+        for (uint32_t k = 0; k < in.back().counts[0]; ++k) VA[vb + k * 4 + 2] = -std::fabs(VA[vb + k * 4 + 2]);
+        for (uint32_t k = 0; k < in.back().counts[1]; ++k) VB[vb + k * 4 + 2] = std::fabs(VB[vb + k * 4 + 2]);
+    }
+    // a hull a few ULP across against a point near it: GJK stops early on a degenerate
+    // simplex about once in a hundred, which is the only way the anomaly gate fires
+    // (testPsConvexContactGen's P9.89 rig shrinks its hull the same way)
+    for (uint32_t it = 0; it < 1500; ++it)
+    {
+        const float kScale = 1.3e-6f;
+        const V3 c = { 0.37f, -0.21f, 0.52f };
+        TcIn e;
+        std::memset(&e, 0, sizeof(e));
+        const uint32_t nB = 12u;
+        V3 b[12];
+        for (uint32_t k = 0; k < nB; ++k)
+        {
+            V3 d = { uni(-1.0f, 1.0f), uni(-1.0f, 1.0f), uni(-1.0f, 1.0f) };
+            const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) + 1e-3f;
+            const float r = (0.55f + 0.25f * uni(0.0f, 1.0f)) * kScale;
+            b[k] = { c.x + d.x / m * r * 1.3f, c.y + d.y / m * r * 0.9f, c.z + d.z / m * r };
+        }
+        V3 d = { uni(-1.0f, 1.0f), uni(-1.0f, 1.0f), uni(-1.0f, 1.0f) };
+        const float m = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) + 1e-3f;
+        const float r = kScale * (0.3f + 2.0f * uni(0.0f, 1.0f));
+        const V3 pt = { c.x + d.x / m * r, c.y + d.y / m * r, c.z + d.z / m * r };
+        for (uint32_t k = 0; k < MAXV; ++k)
+        {
+            const V3 a = (k == 0) ? pt : V3{ 0, 0, 0 };
+            const V3 bb = (k < nB) ? b[k] : V3{ 0, 0, 0 };
+            VA.push_back(a.x); VA.push_back(a.y); VA.push_back(a.z); VA.push_back(0);
+            VB.push_back(bb.x); VB.push_back(bb.y); VB.push_back(bb.z); VB.push_back(0);
+        }
+        e.searchDir[0] = pt.x - c.x; e.searchDir[1] = pt.y - c.y; e.searchDir[2] = pt.z - c.z;
+        e.searchDir[3] = 0.01f;
+        e.spheres[0] = 0.0f;
+        e.spheres[1] = 0.4f * kScale;
+        e.counts[0] = 1u; e.counts[1] = nB;
+        in.push_back(e);
+    }
+    // collapsed tets: two coincident corners (integer, so they really coincide)
+    for (uint32_t it = 0; it < 200; ++it)
+    {
+        emit(4 + rng() % 12u, 4, true, 2.0f, shift(0.0f, 1.5f), false, false, uni(0.0f, 0.5f));
+        const size_t vb = (in.size() - 1) * MAXV * 4;
+        for (int c = 0; c < 3; ++c) VB[vb + 4 + c] = VB[vb + c];
+    }
+
+    const uint32_t N = (uint32_t)in.size();
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bVA = createBufferFrom(dev, VA);
+    PxgBufferHandle bVB = createBufferFrom(dev, VB);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    std::vector<TcOut> outInit(N);
+    std::memset(outInit.data(), 0xEE, outInit.size() * sizeof(TcOut));
+    PxgBufferHandle bOutS = createBufferFrom(dev, outInit);
+    PxgBufferHandle bOutW = createBufferFrom(dev, outInit);
+
+    struct TcParams { uint32_t numTests, p0, p1, p2; } prm = { N, 0, 0, 0 };
+    {
+        Kernel k("npTetCollide.spv", "ctTetCollide",
+                 { 16, 16, (uint32_t)sizeof(TcIn), (uint32_t)sizeof(TcOut) }, sizeof(TcParams));
+        k.dispatch((N + 63u) / 64u, { bVA, bVB, bIn, bOutS }, prm);
+        dev->flush();
+    }
+    {
+        Kernel k("npTetCollide.spv", "ctTetCollideWarp",
+                 { 16, 16, (uint32_t)sizeof(TcIn), (uint32_t)sizeof(TcOut) }, sizeof(TcParams));
+        k.dispatch(N, { bVA, bVB, bIn, bOutW }, prm);
+        dev->flush();
+    }
+    const auto gS = downloadBuffer<TcOut>(dev, bOutS, N);
+    const auto gW = downloadBuffer<TcOut>(dev, bOutW, N);
+
+    size_t mm = 0, nRes[3] = { 0, 0, 0 }, nEpa = 0, nStart4 = 0, nStart123 = 0, nAnomaly = 0, nRetry = 0,
+           nDegen = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const TcOut& s = gS[t];
+        const TcOut& w = gW[t];
+        TcOut sc = s, wc = w;
+        sc.pad = 0; wc.pad = 0;
+        if (std::memcmp(&sc, &wc, sizeof(TcOut)) != 0)
+        {
+            if (mm < 8)
+                std::printf("  test %u (nA %u nB %u path %x): serial r%u d%u s%u lb %08x ub %08x dir %08x %08x %08x A %08x %08x %08x"
+                            " | warp r%u d%u s%u lb %08x ub %08x dir %08x %08x %08x A %08x %08x %08x\n",
+                            t, in[t].counts[0], in[t].counts[1], w.pad, s.result, s.degenerate, s.size,
+                            asU32(s.lowerBound), asU32(s.upperBound), asU32(s.direction[0]), asU32(s.direction[1]),
+                            asU32(s.direction[2]), asU32(s.closestPointA[0]), asU32(s.closestPointA[1]),
+                            asU32(s.closestPointA[2]), w.result, w.degenerate, w.size, asU32(w.lowerBound),
+                            asU32(w.upperBound), asU32(w.direction[0]), asU32(w.direction[1]), asU32(w.direction[2]),
+                            asU32(w.closestPointA[0]), asU32(w.closestPointA[1]), asU32(w.closestPointA[2]));
+            ++mm;
+        }
+        if (s.result < 3) ++nRes[s.result];
+        if (w.pad & PATH_EPA) { ++nEpa; if (w.pad & PATH_START4) ++nStart4; else ++nStart123; }
+        if (w.pad & PATH_ANOMALY) ++nAnomaly;
+        if (w.pad & PATH_RETRY) ++nRetry;
+        if (s.degenerate) ++nDegen;
+    }
+    std::printf("  %u queries: distant %zu close %zu overlap %zu; EPA %zu (from a tet %zu, from 1-3 vertices %zu), "
+                "anomaly %zu, degenerate-EPA retry %zu, degenerate out %zu; %zu mismatches\n",
+                N, nRes[0], nRes[1], nRes[2], nEpa, nStart4, nStart123, nAnomaly, nRetry, nDegen, mm);
+    PXG_CHECK_MSG(mm == 0, "warp-cooperative tetPrimitivesCollide2: %zu of %u queries differ from the serial driver",
+                  mm, N);
+    PXG_CHECK_MSG(nRes[0] > 100 && nRes[1] > 100 && nRes[2] > 100 && nStart4 > 50 && nStart123 > 20 &&
+                  nAnomaly > 0 && nRetry > 0,
+                  "warp differential coverage thin (distant %zu close %zu overlap %zu start4 %zu start123 %zu "
+                  "anomaly %zu retry %zu)", nRes[0], nRes[1], nRes[2], nStart4, nStart123, nAnomaly, nRetry);
+
+    for (PxgBufferHandle h : { bVA, bVB, bIn, bOutS, bOutW }) dev->destroyBuffer(h);
+}
+
 } // namespace

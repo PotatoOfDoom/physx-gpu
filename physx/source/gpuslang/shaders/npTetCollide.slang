@@ -34,6 +34,7 @@
 // a different seed.
 import pxgSlangGjk;
 import pxgSlangTetCollide;
+import pxgSlangGjkWarp;
 
 struct TcParams { uint numTests; uint pad0, pad1, pad2; }
 struct TcIn
@@ -123,4 +124,54 @@ void ctInnerSphere(uint3 dtid : SV_DispatchThreadID)
     out0.closestPointB = float4(0.0f, 0.0f, 0.0f, 0.0f);
     out0.tetCenter = float4(center, 0.0f);
     gOut[t] = out0;
+}
+
+// The WARP-COOPERATIVE driver (pxgSlangGjkWarp) on the same inputs as ctTetCollide: one
+// 32-thread group per test (dispatch exactly numTests groups), the clouds loaded into
+// groupshared by all lanes, lane 0 writing the result.  testNpGjk's
+// npTetCollide_warpDifferential compares the two entries bit for bit.  `pad` carries the
+// driver's path bits (GW_PATH_*) for the fixture's coverage count; it is the only field
+// that differs by design.
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void ctTetCollideWarp(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    const uint t = gid.x;
+    const uint lane = gtid.x;
+    if (t >= gParams.numTests) return;   // group-uniform
+    const uint vbase = t * GJK_MAX_CLOUD;
+    const TcIn e = gIn[t];
+
+    for (uint i = lane; i < GJK_MAX_CLOUD; i += 32u)
+    {
+        if (i < e.counts.x) gwCloudPut(0u, i, gVA[vbase + i].xyz);
+        if (i < e.counts.y) gwCloudPut(1u, i, gVB[vbase + i].xyz);
+    }
+
+    GjkOut o;
+    uint path;
+    const uint r = gwTetPrimitivesCollide2(lane, e.counts.x, e.counts.y, e.searchDir.xyz, e.searchDir.w,
+                                           e.spheres.x, e.spheres.y, o, path);
+
+    float3 bv[4];
+    for (uint i = 0u; i < 4u; ++i) bv[i] = (i < e.counts.y) ? gVB[vbase + i].xyz : float3(0.0f, 0.0f, 0.0f);
+    float3 center;
+    const float inner = computeInnerSphere(bv[0], bv[1], bv[2], bv[3], center);
+
+    if (lane == 0u)
+    {
+        TcOut out0;
+        out0.result = r;
+        out0.degenerate = o.degenerate;
+        out0.size = o.size;
+        out0.pad = path; out0.pad2 = 0.0f;
+        out0.lowerBound = o.lowerBound;
+        out0.upperBound = o.upperBound;
+        out0.innerSphere = inner;
+        out0.direction = o.direction;
+        out0.closestPointA = o.closestPointA;
+        out0.closestPointB = o.closestPointB;
+        out0.tetCenter = float4(center, 0.0f);
+        gOut[t] = out0;
+    }
 }

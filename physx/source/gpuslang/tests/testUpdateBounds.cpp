@@ -2066,6 +2066,11 @@ PXG_TEST(setRigidDynamicGlobalPose_p90PoseOrder)
 // bitmap (bit j of word w = updated[w*32+j] != 0).  Without this the broadphase
 // never learns which shapes moved and early-outs forever.  ABI = one desc
 // pointer {8}; verified bit-exact against a CPU reference of the __ballot pack.
+// The kernel is the CUDA's 256-thread block (8 warps, one word each per pass) and
+// grid-strides over words, so the configurations pin one pass at the engine's grid of
+// 64 groups (37 words), several passes at one group (37 words: 5 passes, the last
+// partial), and several passes at the engine's grid (1100 and 513 words: 512 words per
+// pass, partial last passes of 76 and 1 words).
 PXG_TEST(updateBounds_changedAABBMgrHandles)
 {
     using physx::gpuslang::PxgCudaShim;
@@ -2073,17 +2078,21 @@ PXG_TEST(updateBounds_changedAABBMgrHandles)
     using physx::gpuslang::PxgDevicePtr;
     using physx::gpuslang::PxgResult;
 
+    struct Cfg { uint32_t numWords, grid; };
+    const Cfg cfgs[] = { { 37u, 8u }, { 37u, 1u }, { 1100u, 64u }, { 513u, 64u } };
     std::mt19937 rng(0xB17B17);
-    const uint32_t numWords = 37;                 // 37 words -> 1184 shape bits
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &updateBoundsAbiLoader);
+
+    for (const Cfg& cfg : cfgs)
+    {
+    const uint32_t numWords = cfg.numWords;
     const uint32_t numElements = numWords * 32;
 
     std::vector<uint32_t> updated(numElements);
     for (uint32_t i = 0; i < numElements; ++i)
         updated[i] = (rng() & 3u) == 0u ? (rng() | 0u) : 0u;   // ~25% nonzero, arbitrary values
-
-    PxgSlangComputeDevice* dev = testDevice();
-    const PxgKernelDef manifest[] = { { "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch", 8u, 0 } };
-    PxgCudaShim shim(dev, manifest, 1, &updateBoundsAbiLoader);
 
     PxgDevicePtr dUpdated = 0, dChanged = 0, dDesc = 0;
     shim.memAlloc(&dUpdated, numElements * 4);
@@ -2107,9 +2116,9 @@ PXG_TEST(updateBounds_changedAABBMgrHandles)
     blob.finish();
     PXG_CHECK_MSG(blob.bytes.size() == 8, "engine blob is 8 bytes (got %zu)", blob.bytes.size());
 
-    // engine grid: UPDATE_AABBMGR_HANDLES is a fixed grid; the kernel is
+    // UPDATE_AABBMGR_HANDLES is a fixed grid of 64 in the engine; the kernel is
     // grid-strided over words, so any group count covers all words.
-    PXG_CHECK_MSG(shim.launchKernel(0, 8, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+    PXG_CHECK_MSG(shim.launchKernel(0, cfg.grid, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
                       PxgResult::Success, "launch updateChangedAABBMgrHandlesLaunch");
     shim.streamSynchronize();
 
@@ -2126,11 +2135,12 @@ PXG_TEST(updateBounds_changedAABBMgrHandles)
     size_t bad = 0;
     for (uint32_t w = 0; w < numWords; ++w)
         if (got[w] != ref[w]) ++bad;
-    PXG_CHECK_MSG(bad == 0, "changed-handle bitmap mismatch (%zu / %u words)", bad, numWords);
+    PXG_CHECK_MSG(bad == 0, "changed-handle bitmap mismatch (%zu / %u words, grid %u)", bad, numWords, cfg.grid);
 
     shim.memFree(dUpdated);
     shim.memFree(dChanged);
     shim.memFree(dDesc);
+    }
 }
 
 // ---------------------------------------------------------------------------

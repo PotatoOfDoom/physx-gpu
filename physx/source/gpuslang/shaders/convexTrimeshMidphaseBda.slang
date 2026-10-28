@@ -44,10 +44,13 @@
 // GRID.  CUDA launches grid (numBlocks,1,1) x block (32, MIDPHASE_WARPS_PER_BLOCK=2, 1)
 // and derives `cmIdx = threadIdx.y + blockIdx.x * blockDim.y`, i.e. ONE WARP PER
 // CONTACT MANAGER, two per block.  The two warps never interact — separate
-// s_warpScratch slots, separate cmIdx — so the port walks them SERIALLY inside a
-// 32-thread group, the same shape softBodyMeshMidphaseBda uses and for the same
-// reason: the engine picks the grid, and a 32-lane group is this port's virtual
-// warp.
+// s_warpScratch slots, separate cmIdx.  The bridge forwards only gridDim, so this
+// port used to walk a block's two warps SERIALLY inside one 32-thread group; the
+// launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one
+// 32-thread group per CUDA warp, numBlocks * 2 of them, so every contact manager is
+// walked by its own group, as by its own warp in CUDA.  The managers are taken in a
+// group-stride loop (stride WorkgroupCount().x), which at that grid makes exactly one
+// pass and at any smaller grid still covers every manager.
 //
 // STACK DEPTH IS 320, NOT 192.  The deformable midphases use 192 because their
 // own `femMidphaseScratch` declares `int sBv32Nodes[192]`.  The convex path has a
@@ -224,13 +227,16 @@ void midphaseGeneratePairs(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
     Ptr<PxgShape> shapes = Ptr<PxgShape>(gMp.gpuShapes);
 
-    // The block's two warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One contact manager per group at the port's launch grid (one group per CUDA warp, see
+    // the header on the grid), and a group-stride loop so any smaller grid still covers them
+    // all -- at the CUDA's own grid a group takes its block's two managers in turn.
+    for (uint cmLoop = gid.x; cmLoop < gMp.numContactManagers; cmLoop += WorkgroupCount().x)
     {
-        const uint cmIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
         GroupMemoryBarrierWithGroupSync();      // scratch is reused per contact manager
-        if (cmIdx >= gMp.numContactManagers)
-            continue;                            // group-uniform
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and still
+        // issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.  Every live
+        // iteration has cmIdx == cmLoop.
+        const uint cmIdx = min(cmLoop, gMp.numContactManagers - 1u);
 
         const PxgContactManagerInput cin = Ptr<PxgContactManagerInput>(gMp.cmInputs)[cmIdx];
         uint transformCacheRef0 = cin.transformCacheRef0;

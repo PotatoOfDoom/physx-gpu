@@ -523,10 +523,12 @@ static void dispatchMidphase(PxgSlangComputeDevice* dev, Built& b)
     p.midphasePairsNum = b.pairsNum.addr; p.midphasePairsNumPadded = b.pairsNumPadded.addr;
     p.stackSizeBytes = 16u * 1024u;
 
-    // grid ((numTests + warpsPerBlock - 1) / warpsPerBlock, 1, 1), the engine's
-    // own arithmetic at PxgNarrowphaseCore.cpp:2856.
+    // grid ((numTests + warpsPerBlock - 1) / warpsPerBlock, 1, 1) x block (32, 2, 1), the
+    // engine's own arithmetic in PxgNarrowphaseCore.cpp; the port's launch site
+    // (PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp: 2 * 2 = 4 groups for
+    // three contact managers, the fourth past the end.
     Kernel k("convexHfMidphaseBda.spv", "convexHeightFieldMidphase", {}, sizeof(MidphasePush));
-    k.dispatch(2u, {}, p, 1u, 1u);
+    k.dispatch(4u, {}, p, 1u, 1u);
     dev->flush();
 }
 

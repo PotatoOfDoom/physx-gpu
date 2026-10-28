@@ -256,6 +256,7 @@ struct TpRef
 {
     bool fullGen = false, lost = false, reduced = false;
     uint32_t retained = 0, iters = 0;
+    uint32_t maxTotal = 0;   // largest shared-buffer fill seen by the batching loop
     V3 pts[6];
     float seps[6];
     uint32_t manX = 0;
@@ -378,6 +379,7 @@ static TpRef refTp(const TpCase& cs, const std::vector<F4>& verts, const std::ve
                 offset += counters[w];
             }
             const uint32_t total = offset + retained;
+            ro.maxTotal = std::max(ro.maxTotal, total);
             V3 lanePt[32];
             float laneSep[32];
             bool has[32];
@@ -1283,6 +1285,376 @@ PXG_TEST(npTriPlaneNp_engineAbiP94dZeroSign)
 
     for (PxgDevicePtr p : { dBlob, dIn, dOut, dShapes, dXf, dCd, dMat, dMf, dCS, dPS, dCnt, dTouch, dPatch, dForce })
         shim.memFree(p);
+}
+
+// ===========================================================================
+// npTriPlaneNp_engineAbiFleet -- the ENGINE kernel (triPlaneNpBda) over the whole
+// Phase-1 case fleet, bit for bit against refTp.
+//
+// WHY.  triPlaneNpBda runs the CUDA's block shape since the 1024-thread rework: one
+// vertex per thread, contactReduce6 on each warp's lane 0, a parallel pack behind
+// retainedCount and the batching loop on thread 0 over a GROUPSHARED buffer.  The
+// only engine fixture until then (P9.94d above) had three vertices in one warp, so
+// it could not see the pack, the per-warp reductions, the retainedCount carry or
+// the buffer filling up; npTriPlaneNp_narrowphase sees all of them but drives the
+// Phase-1 twin, not the engine kernel.  This drives the ENGINE kernel with
+// buildFixture's families -- invalidate by position / rotation, cached, refresh
+// LOST (the path that turns a cached pair into a full gen), the inclusive gate,
+// all-rejected, empty-cached, the threshold probes, multi-manifold seeds,
+// multi-iteration (1200 / 2112 vertices) -- plus four large invalidated meshes
+// (3000..8192 vertices, all accepted) that fill the shared buffer to its 198-slot
+// capacity on every iteration.
+//
+// The fleet runs in one launch per tolerance (toleranceLength is a launch
+// argument, buildFixture varies it per case) and the large meshes in a launch of
+// their own, so PXG_KERNEL_TIMES=2 shows the full-gen cost separately.
+//
+// Checked bitwise: the whole 1216-byte manifold record (24 contact slots, the
+// four counts, the relative transform, mNbManifolds), the cmOutput count, the
+// emitted contact stream, the zeroed patch pointer of an empty pair, and the
+// reservation counters.  The serial kernel this replaced passes it too.
+// ===========================================================================
+namespace tpfleet
+{
+using namespace p94dtp;
+
+static const uint64_t PCM_CSTRIDE = 48;
+
+// A large invalidated full-gen case: every vertex accepted (the plane is pushed 16
+// along its normal), prev transform far away.
+static void appendBigCase(TpFixture& fx, uint32_t numVerts, uint32_t seed, bool clustered)
+{
+    std::mt19937 rng(seed);
+    TpCase cs;
+    std::memset(&cs, 0, sizeof(cs));
+    cs.meshQ = exactQuat(rng);
+    cs.meshP = { grid64(rng, -1, 1), grid64(rng, -1, 1), grid64(rng, -1, 1), 0.5f };
+    cs.planeQ = exactQuat(rng);
+    cs.scale = { 1.0f, 0.5f, 2.0f, 0.0625f };
+    cs.scaleRot = exactQuat(rng);
+    fx.verts.push_back({ 99, 99, 99, 0 });
+    fx.verts.push_back({ 99, 99, 99, 0 });
+    cs.verts = { (uint32_t)fx.verts.size(), numVerts, 0, 0 };
+    for (uint32_t k = 0; k < numVerts; ++k)
+    {
+        const float r = (clustered && (k / 512u) % 2u == 1u) ? 0.25f : 2.0f;
+        fx.verts.push_back({ grid64(rng, -r, r), grid64(rng, -r, r), grid64(rng, -r, r), 0 });
+    }
+    fx.root.push_back({ 88, 88, 88, 0 });
+    fx.root.push_back({ 88, 88, 88, 0 });
+    cs.rootMeta = { 1, (uint32_t)(fx.root.size() / 2), 0, 0 };
+    fx.root.push_back({ -2, -2, -2, 0 });
+    fx.root.push_back({ 2, 2, 2, 0 });
+    const V3 b0q = basis0(cs.planeQ);
+    V3 pp = { grid64(rng, -1, 1), grid64(rng, -1, 1), grid64(rng, -1, 1) };
+    pp = add(pp, mul(b0q, 16.0f));
+    cs.planeP = { pp.x, pp.y, pp.z, 0.25f };
+    const F4 ttpQ = quatMul(quatConj(cs.planeQ), cs.meshQ);
+    const V3 ttpP = transformInvP(cs.planeQ, sub(v3(cs.meshP), v3(cs.planeP)));
+    fx.cases.push_back(cs);
+    fx.rel.push_back(ttpQ);
+    fx.rel.push_back({ ttpP.x + 4.0f, ttpP.y, ttpP.z, 5.0f });
+    fx.meta.push_back({ 1, 3, 0, 0 });
+    for (uint32_t s = 0; s < 24; ++s)
+    {
+        fx.manA.push_back({ grid64(rng, -1, 1), grid64(rng, -1, 1), grid64(rng, -1, 1), 3.0f });
+        fx.manB.push_back({ grid64(rng, -1, 1), grid64(rng, -1, 1), grid64(rng, -1, 1), 0 });
+        fx.manN.push_back({ 1, 0, 0, 0.25f });
+    }
+    const uint32_t i = (uint32_t)fx.cases.size() - 1;
+    fx.ref.push_back(refTp(fx.cases[i], fx.verts, fx.root, &fx.manA[i * 24], &fx.manB[i * 24],
+                           &fx.manN[i * 24], fx.meta[i], fx.rel[i * 2], v3(fx.rel[i * 2 + 1])));
+}
+
+// One launch of trimeshPlaneNarrowphase over the cases `ids` of `fx`, all with the
+// launch's toleranceLength.  Returns the number of mismatches against refTp.
+static size_t runEngineFleet(const TpFixture& fx, const std::vector<uint32_t>& ids, float tol,
+                             const char* label)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    const uint32_t NC = (uint32_t)ids.size();
+    const float CLUSTER = 0.0625f;
+    PxgSlangComputeDevice* dev = testDevice();
+    static const PxgKernelDef manifest[] = { { "triPlaneNpBda.spv", "trimeshPlaneNarrowphase", 144u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &shaderLoader);
+
+    // ---- one cooked-mesh blob per case: header | root node | verts | 2 poison verts
+    std::vector<uint64_t> blobOff(NC);
+    std::vector<uint8_t> blob;
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        const TpCase& cs = fx.cases[ids[c]];
+        PXG_CHECK_MSG(cs.scale.w == CLUSTER && cs.meshP.w == tol, "fleet case %u: launch arguments", ids[c]);
+        const uint32_t nv = cs.verts.y;
+        blobOff[c] = blob.size();
+        blob.resize(blob.size() + 16 + BV32_STRIDE + 16 * (nv + 2), 0);
+        uint8_t* b = &blob[blobOff[c]];
+        const uint32_t hdr[4] = { nv, 0u, 0u, 1u };
+        std::memcpy(b, hdr, 16);
+        for (uint32_t s = 0; s < cs.rootMeta.x; ++s)
+        {
+            std::memcpy(b + 16 + 16 * s, &fx.root[(cs.rootMeta.y + s) * 2 + 0], 16);
+            std::memcpy(b + 16 + BV32_MMAX + 16 * s, &fx.root[(cs.rootMeta.y + s) * 2 + 1], 16);
+        }
+        std::memcpy(b + 16 + BV32_MNBNODES, &cs.rootMeta.x, 4);
+        std::memcpy(b + 16 + BV32_STRIDE, &fx.verts[cs.verts.x], 16 * nv);
+        const F4 poison[2] = { { 99, 99, 99, 0 }, { -99, -99, -99, 0 } };
+        std::memcpy(b + 16 + BV32_STRIDE + 16 * nv, poison, 32);
+        while (blob.size() % 16) blob.push_back(0);
+    }
+    PxgDevicePtr dBlob = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dBlob, blob.size()) == PxgResult::Success, "memAlloc mesh blobs");
+    if (!dBlob) { std::printf("  NOTE: no BDA -> skip\n"); return 0; }
+
+    std::vector<HInput> in(NC);
+    std::vector<HShape> shapes(2 * NC);
+    std::vector<HCachedTransform> xf(2 * NC);
+    std::vector<float> cd(2 * NC, 0.0f);
+    std::vector<uint8_t> mf(NC * PCM_STRIDE, 0);
+    uint32_t totalContacts = 0;
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        const uint32_t i = ids[c];
+        const TpCase& cs = fx.cases[i];
+        in[c] = { 2 * c, 2 * c + 1, 2 * c, 2 * c + 1 };
+        shapes[2 * c] = { 1, 1, 1, 0, 0, 0, 1, 0u, 0u, GEOM_PLANE, 0u };
+        shapes[2 * c + 1] = { cs.scale.x, cs.scale.y, cs.scale.z, cs.scaleRot.x, cs.scaleRot.y, cs.scaleRot.z,
+                              cs.scaleRot.w, 1u, uint64_t(dBlob) + blobOff[c], GEOM_TRIANGLEMESH, 0u };
+        xf[2 * c] = { cs.planeQ.x, cs.planeQ.y, cs.planeQ.z, cs.planeQ.w, cs.planeP.x, cs.planeP.y, cs.planeP.z, 0u };
+        xf[2 * c + 1] = { cs.meshQ.x, cs.meshQ.y, cs.meshQ.z, cs.meshQ.w, cs.meshP.x, cs.meshP.y, cs.meshP.z, 0u };
+        cd[2 * c] = cs.planeP.w;   // cDistance = cd[mesh] + cd[plane] = 0 + planeP.w
+        uint8_t* m = &mf[c * PCM_STRIDE];
+        for (uint32_t s = 0; s < 24; ++s)
+        {
+            uint8_t* slot = m + s * PCM_CSTRIDE;
+            const F4 a = fx.manA[i * 24 + s], b = fx.manB[i * 24 + s], n = fx.manN[i * 24 + s];
+            const float fa[3] = { a.x, a.y, a.z }, fb[3] = { b.x, b.y, b.z }, fn[4] = { n.x, n.y, n.z, n.w };
+            const uint32_t tri = 0xA5A50000u + s, pad = 0x5A5A5A5Au;
+            std::memcpy(slot + 0, fa, 12);
+            std::memcpy(slot + 12, fb, 12);
+            std::memcpy(slot + 24, fn, 16);
+            std::memcpy(slot + 40, &tri, 4);
+            std::memcpy(slot + 44, &pad, 4);
+        }
+        const U4 meta = fx.meta[i];
+        const uint32_t counts[4] = { meta.y, meta.z, meta.w, 0u };
+        std::memcpy(m + PCM_NBCONTACTS, counts, 16);
+        std::memcpy(m + PCM_RELQ, &fx.rel[i * 2 + 0], 16);
+        std::memcpy(m + PCM_RELP, &fx.rel[i * 2 + 1], 16);
+        std::memcpy(m + PCM_NBMAN, &meta.x, 4);
+        const uint32_t tailPad[3] = { 0x77777777u, 0x77777777u, 0x77777777u };
+        std::memcpy(m + PCM_NBMAN + 4, tailPad, 12);
+        totalContacts += fx.ref[i].retained;
+    }
+    std::vector<HMaterial> mats(2);
+    mats[0] = { 0.5f, 0.6f, 0.1f, 0.0f, 0u, 0u };
+    mats[1] = { 0.3f, 0.4f, 0.2f, 0.0f, 0u, 0u };
+    std::vector<HOutput> outs(NC);
+    std::memset(outs.data(), 0, outs.size() * sizeof(HOutput));
+    for (HOutput& o : outs) o.contactPatches = 0xDEADBEEFull;
+    const HCounters counters = { 0, 0, 0, 0 };
+    const uint32_t streamBytes = 16u * (totalContacts + 64u) + 4096u;
+
+    PxgDevicePtr dIn = 0, dOut = 0, dShapes = 0, dXf = 0, dCd = 0, dMat = 0, dMf = 0, dCS = 0, dPS = 0, dCnt = 0,
+                 dTouch = 0, dPatch = 0, dForce = 0;
+    shim.memAlloc(&dIn, in.size() * sizeof(HInput));
+    shim.memAlloc(&dOut, outs.size() * sizeof(HOutput));
+    shim.memAlloc(&dShapes, shapes.size() * sizeof(HShape));
+    shim.memAlloc(&dXf, xf.size() * sizeof(HCachedTransform));
+    shim.memAlloc(&dCd, cd.size() * 4);
+    shim.memAlloc(&dMat, mats.size() * sizeof(HMaterial));
+    shim.memAlloc(&dMf, mf.size());
+    shim.memAlloc(&dCS, streamBytes);
+    shim.memAlloc(&dPS, streamBytes);
+    shim.memAlloc(&dCnt, sizeof(HCounters));
+    shim.memAlloc(&dTouch, NC * 4);
+    shim.memAlloc(&dPatch, NC * 4);
+    shim.memAlloc(&dForce, streamBytes);
+    shim.memcpyHtoD(dBlob, blob.data(), blob.size());
+    shim.memcpyHtoD(dIn, in.data(), in.size() * sizeof(HInput));
+    shim.memcpyHtoD(dOut, outs.data(), outs.size() * sizeof(HOutput));
+    shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(HShape));
+    shim.memcpyHtoD(dXf, xf.data(), xf.size() * sizeof(HCachedTransform));
+    shim.memcpyHtoD(dCd, cd.data(), cd.size() * 4);
+    shim.memcpyHtoD(dMat, mats.data(), mats.size() * sizeof(HMaterial));
+    shim.memcpyHtoD(dMf, mf.data(), mf.size());
+    shim.memsetD32(dCS, 0xCDCDCDCDu, streamBytes / 4);
+    shim.memsetD32(dPS, 0, streamBytes / 4);
+    shim.memcpyHtoD(dCnt, &counters, sizeof(HCounters));
+    shim.memsetD32(dTouch, 0, NC);
+    shim.memsetD32(dPatch, 0, NC);
+    shim.memsetD32(dForce, 0, streamBytes / 4);
+
+    Push push = { tol, 0u, dIn, dOut, dShapes, dXf, dCd, dMat, dMf, dCS, dPS, dCnt, dTouch, dPatch,
+                  dPS, dCS, dForce, streamBytes, streamBytes, streamBytes, CLUSTER };
+    PXG_CHECK_MSG(shim.launchKernel(0, NC, 1, 1, &push, sizeof(push)) == PxgResult::Success,
+                  "launch trimeshPlaneNarrowphase (%s)", label);
+    shim.streamSynchronize();
+
+    std::vector<uint8_t> gMf(mf.size());
+    shim.memcpyDtoH(gMf.data(), dMf, gMf.size());
+    std::vector<HOutput> gOut(NC);
+    shim.memcpyDtoH(gOut.data(), dOut, gOut.size() * sizeof(HOutput));
+    HCounters gCnt;
+    shim.memcpyDtoH(&gCnt, dCnt, sizeof(HCounters));
+
+    size_t mm = 0;
+    if (gCnt.contactsBytes != 16u * totalContacts || gCnt.forceAndIndiceBytes != 4u * totalContacts ||
+        gCnt.overflowError != 0u)
+    {
+        std::printf("  fleet %s: counters %u/%u/%u, want %u/%u/0\n", label, gCnt.contactsBytes,
+                    gCnt.forceAndIndiceBytes, gCnt.overflowError, 16u * totalContacts, 4u * totalContacts);
+        ++mm;
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> ranges;
+    for (uint32_t c = 0; c < NC; ++c)
+    {
+        const uint32_t i = ids[c];
+        const TpRef& ro = fx.ref[i];
+        const TpCase& cs = fx.cases[i];
+        const uint8_t* m = &gMf[c * PCM_STRIDE];
+        const uint8_t* m0 = &mf[c * PCM_STRIDE];
+        size_t bad = 0;
+        const bool stored = ro.fullGen && ro.retained > 0;
+        // the record's header: nbManifolds, the four counts, the relative transform
+        uint32_t nbMan, counts[4], counts0[4];
+        std::memcpy(&nbMan, m + PCM_NBMAN, 4);
+        std::memcpy(counts, m + PCM_NBCONTACTS, 16);
+        std::memcpy(counts0, m0 + PCM_NBCONTACTS, 16);
+        if (nbMan != (stored ? 1u : ro.manX)) ++bad;
+        if (counts[0] != (stored ? ro.retained : counts0[0])) ++bad;
+        if (std::memcmp(&counts[1], &counts0[1], 12) != 0) ++bad;
+        if (std::memcmp(m + PCM_NBMAN + 4, m0 + PCM_NBMAN + 4, 12) != 0) ++bad;
+        F4 rq, rp;
+        std::memcpy(&rq, m + PCM_RELQ, 16);
+        std::memcpy(&rp, m + PCM_RELP, 16);
+        if (stored)
+        {
+            if (asU32(rq.x) != asU32(ro.ttpQ.x) || asU32(rq.y) != asU32(ro.ttpQ.y) ||
+                asU32(rq.z) != asU32(ro.ttpQ.z) || asU32(rq.w) != asU32(ro.ttpQ.w) ||
+                asU32(rp.x) != asU32(ro.ttpP.x) || asU32(rp.y) != asU32(ro.ttpP.y) ||
+                asU32(rp.z) != asU32(ro.ttpP.z) || asU32(rp.w) != 0u) ++bad;
+        }
+        else if (std::memcmp(m + PCM_RELQ, m0 + PCM_RELQ, 32) != 0) ++bad;
+        // the 24 contact slots
+        for (uint32_t s = 0; s < 24; ++s)
+        {
+            const uint8_t* g = m + s * PCM_CSTRIDE;
+            const uint8_t* g0 = m0 + s * PCM_CSTRIDE;
+            float gf[10];
+            uint32_t gTri;
+            std::memcpy(gf, g, 40);
+            std::memcpy(&gTri, g + 40, 4);
+            if (std::memcmp(g + 44, g0 + 44, 4) != 0) ++bad;
+            if (stored && s < ro.retained)
+            {
+                const V3 eA = quatRotateInv(cs.meshQ, sub(ro.pts[s], v3(cs.meshP)));
+                V3 eB = quatRotateInv(cs.planeQ, sub(ro.pts[s], v3(cs.planeP)));
+                eB.x = 0.0f;
+                const float want[10] = { eA.x, eA.y, eA.z, eB.x, eB.y, eB.z, 1.0f, 0.0f, 0.0f, ro.seps[s] };
+                for (int k = 0; k < 10; ++k)
+                    if (asU32(gf[k]) != asU32(want[k])) ++bad;
+                if (gTri != 0xFFFFFFFFu) ++bad;
+            }
+            else
+            {
+                if (std::memcmp(g, g0, 36) != 0 || std::memcmp(g + 40, g0 + 40, 4) != 0) ++bad;
+                float pen0;
+                std::memcpy(&pen0, g0 + 36, 4);
+                const float expPen = std::isnan(ro.penOut[s]) ? pen0 : ro.penOut[s];
+                if (asU32(gf[9]) != asU32(expPen)) ++bad;
+            }
+        }
+        // the cmOutput and the contact stream
+        const uint32_t gNb = gOut[c].nbContacts_flags & 0xffffu;
+        if (gNb != ro.retained) ++bad;
+        else if (gNb == 0)
+        {
+            if (gOut[c].contactPatches != 0ull) ++bad;
+        }
+        else if (gOut[c].contactPoints < dCS || gOut[c].contactPoints + 16u * gNb > dCS + streamBytes) ++bad;
+        else
+        {
+            ranges.push_back({ gOut[c].contactPoints - dCS, 16u * gNb });
+            std::vector<F4> st(gNb);
+            shim.memcpyDtoH(st.data(), gOut[c].contactPoints, 16u * gNb);
+            for (uint32_t k = 0; k < gNb && k < 6; ++k)
+                if (asU32(st[k].x) != asU32(ro.pts[k].x) || asU32(st[k].y) != asU32(ro.pts[k].y) ||
+                    asU32(st[k].z) != asU32(ro.pts[k].z) || asU32(st[k].w) != asU32(ro.seps[k])) ++bad;
+        }
+        if (bad)
+            std::printf("  fleet %s case %u (fullGen %d lost %d iters %u retained %u, gpu nb %u): %zu bad\n",
+                        label, i, int(ro.fullGen), int(ro.lost), ro.iters, ro.retained, gNb, bad);
+        mm += bad;
+    }
+    // the reservations partition [0, 16 * totalContacts) of the contact stream
+    std::sort(ranges.begin(), ranges.end());
+    uint64_t cursor = 0;
+    for (const auto& r : ranges)
+    {
+        if (r.first != cursor) ++mm;
+        cursor = r.first + r.second;
+    }
+    if (cursor != 16u * totalContacts) ++mm;
+
+    for (PxgDevicePtr p : { dBlob, dIn, dOut, dShapes, dXf, dCd, dMat, dMf, dCS, dPS, dCnt, dTouch, dPatch, dForce })
+        shim.memFree(p);
+    return mm;
+}
+} // namespace tpfleet
+
+PXG_TEST(npTriPlaneNp_engineAbiFleet)
+{
+    using namespace tpfleet;
+    const uint32_t NC = 192;
+    TpFixture fx = buildFixture(NC, 1030703);
+    appendBigCase(fx, 3000, 77001, false);
+    appendBigCase(fx, 4096, 77002, false);
+    appendBigCase(fx, 4097, 77003, true);
+    appendBigCase(fx, 8192, 77004, true);
+    const uint32_t NT = (uint32_t)fx.cases.size();
+
+    // coverage of the paths the 1024-thread layout changed (and of the ones it kept)
+    size_t nFull = 0, nCached = 0, nLost = 0, nZero = 0, nReduce = 0, nMulti = 0, nFull198 = 0, nEmptyCached = 0;
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        const TpRef& ro = fx.ref[i];
+        if (ro.fullGen) ++nFull; else if (ro.retained > 0) ++nCached; else ++nEmptyCached;
+        if (ro.lost) ++nLost;
+        if (ro.fullGen && ro.retained == 0) ++nZero;
+        if (ro.reduced) ++nReduce;
+        if (ro.iters > 1) ++nMulti;
+        if (ro.maxTotal == 198u) ++nFull198;
+    }
+    std::printf("  fleet: %u cases: full %zu (lost %zu, zero %zu, multi-iteration %zu, buffer full %zu), "
+                "cached %zu, empty-cached %zu, reduced %zu\n",
+                NT, nFull, nLost, nZero, nMulti, nFull198, nCached, nEmptyCached, nReduce);
+    PXG_CHECK_MSG(nFull > 90 && nCached > 20 && nEmptyCached > 5 && nLost > 15 && nZero > 15 && nReduce > 80 &&
+                  nMulti >= 14 && nFull198 >= 4,
+                  "fleet coverage thin (%zu %zu %zu %zu %zu %zu %zu %zu)", nFull, nCached, nEmptyCached, nLost,
+                  nZero, nReduce, nMulti, nFull198);
+
+    size_t mm = 0;
+    const float tols[3] = { 0.5f, 1.0f, 1.5f };
+    for (uint32_t t = 0; t < 3; ++t)
+    {
+        std::vector<uint32_t> ids;
+        for (uint32_t i = 0; i < NC; ++i)
+            if (i % 3 == t) ids.push_back(i);
+        char label[32];
+        std::snprintf(label, sizeof(label), "tol %.1f", tols[t]);
+        mm += runEngineFleet(fx, ids, tols[t], label);
+    }
+    {
+        std::vector<uint32_t> ids;
+        for (uint32_t i = NC; i < NT; ++i) ids.push_back(i);
+        mm += runEngineFleet(fx, ids, 0.5f, "large meshes");
+    }
+    PXG_CHECK_MSG(mm == 0, "trimeshPlaneNarrowphase fleet: %zu mismatches against refTp", mm);
 }
 
 } // namespace

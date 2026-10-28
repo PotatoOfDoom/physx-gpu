@@ -2228,6 +2228,136 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## Trimesh-Plane auf 1024 Threads, warp-kooperatives GJK/EPA für Softbody-Primitive, eine Workgroup pro CUDA-Warp in den Mesh/HF-Midphases
+
+**Anlass.** Die drei offenen Kandidaten aus dem Audit des folgenden Eintrags („Deformable-vs-Rigid-Midphase auf
+1024 Threads …"), dazu `update/mergeChangedAABBMgrHandlesLaunch`. Alle Ergebnisse bitgleich zum bisherigen Port
+und damit zur 5.12-CUDA (wo die CUDA selbst nichtdeterministisch ist – Reihenfolge zwischen Warps –, ist das
+benannt).
+
+**1. `trimeshPlaneNarrowphase` (SnippetSDF), `triPlaneNpBda.slang`.** Bisher Thread 0 einer 32er-Gruppe: bei
+Manifold-Invalidierung 1 024 Vertex-Tests pro Iteration, 32 `contactReduce6` und die Batching-Schleife
+nacheinander, Puffer (198 Punkte + 32×6 Warp-Überlebende) als private Arrays. Jetzt `[numthreads(1024)]` wie der
+CUDA-Block: Stufe 1a ein Vertex pro Thread → Groupshared; 1b `contactReduce6` auf Lane 0 jedes Warps (derselbe
+serielle Körper auf denselben Lane-Arrays, 32 parallel); 1c jede überlebende Lane schreibt sich an
+`retainedCount + exklusiver Präfix der Warp-Zähler + Rang in der Warp-Maske` (warp-major, Lane-Reihenfolge = die
+Slots des seriellen Packens); 2 Thread 0 führt die Batching-Schleife über den Groupshared-Puffer.
+`tpBatchReduce` in `pxgSlangTriPlane` ist dafür generisch über `ITpContactStore` (ein Körper für Phase-1-Fixture
+und Engine-Kernel; der Phase-1-Kernel nutzt den Array-Store). Prolog und Manifold-Gate auf Thread 0, die
+Vertex-Eingaben werden als Kopien über Groupshared verteilt; Cached-Pfad und Stream-Tail bleiben auf Thread 0.
+Groupshared ~20 KB. **Bitgleich:** jeder Wert aus demselben Ausdruck auf denselben Operanden, jeder Puffer-Slot
+in derselben Reihenfolge. **Test** `npTriPlaneNp_engineAbiFleet`: der Engine-Kernel über buildFixtures Familien
+(Invalidierung Position/Rotation, Cached, Refresh-LOST, inklusive Gate, alle verworfen, leer-cached,
+Schwellen-Sonden, Multi-Manifold, 1 200/2 112 Vertices) plus vier große Meshes (3 000–8 192 Vertices), die den
+198er-Puffer jede Iteration füllen; 196 Fälle in vier Launches (eine pro toleranceLength + große Meshes),
+bitweise gegen `refTp`: ganzer 1216-Byte-Manifold-Record, cmOutput-Zahl, Kontakt-Stream, genullter
+Patch-Zeiger, Reservierungs-Partition. Der alte (HEAD-)Kernel besteht ihn ebenfalls (Orakel validiert).
+Szene `sdfmesh` mit altem/neuem Shader: Ausgabe identisch (9-stellige Endlagen).
+
+**2. `sb_primitiveContactGenLaunch` (DeformableVolumeAttachment/Kinematic, Boxen/Konvexe/Kugeln/Kapseln).** Neues
+Modul `pxgSlangGjkWarp`: `tetPrimitivesCollide2` mit GJK und EPA in der warp-kooperativen CUDA-Form (Thread L =
+CUDA-Lane L, Clouds und EPA-Polytop in Groupshared wie TetCollideScratch/EpaScratch). Es ist eine
+Lane-für-Lane-Transkription des SERIELLEN Treibers (`pxgSlangGjk`/`pxgSlangEpa`/`pxgSlangTetCollide`, ein Thread
+simuliert den Warp): jedes `o[L] = f(a[L], a[g(L)])` wird `o = f(a, exchange(a, g(lane)))`, Lesestellen an festen
+Lanes (`lD[0]`, `aS[4]`, `dmc[0]` …) werden aus dem Austauschpuffer mit dotW's eigenem Ausdruck nachgerechnet
+(`gwDotAt`). Austausch = Put, EINE Barriere, Get; zwei alternierende Puffer, deshalb keine zweite Barriere
+(Parität `par`, nie aus der Lane abgeleitet). Geordnete Seiteneffekte bleiben seriell: die Silhouetten-Schreiber
+(`nxt`/`edg`, auf entarteten Polytopen kollidierend) wendet Thread 0 in Lane-Reihenfolge an (Last-Writer wie die
+serielle Schleife), das EPA-Minimum bleibt die Select-Kette (P9.86). Die Skalar-Helfer beider seriellen Module
+(`dot3`, `crossX/cross3`, `getNormalized`, `barycentrics`, Vec3I8, Start4-Tabellen …) sind wörtlich nach
+`pxgSlangGjkShared` verschoben, damit der kooperative Treiber dieselben Körper kompiliert (keine dritte Kopie).
+Gegenprobe HEAD gegen jetzt, SPIR-V ohne Debug-Ops: `npGjk`, `npEpa`, `triTriOverlapBda`, `npTriTriOverlap`
+identisch; `psContactGenBda` und `softBody{Mesh,Hf,Cloth}ContactGenBda` verlieren nur die zweite Kopie von
+`dot3`/`getNormalized`/`absX` (vorher je eine aus pxgSlangGjk und pxgSlangEpa), keine neue Funktionsform.
+Der Kernel lädt die Rigid-Cloud mit einer Lane pro Vertex (`prepareVertices`), alle Lanes rechnen
+Inkugel/Schwerpunkt uniform, Lane 0 schreibt den Kontakt. Groupshared ~4 KB.
+**Tests.** `npTetCollide_warpDifferential` (neuer Eintrag `ctTetCollideWarp` im Leaf-Shader): kooperativ gegen
+seriell, alle Ausgabefelder bitweise, 4 600 Anfragen (Punkt/Segment/Hull 4–64 Vertices gegen Tetraeder,
+ganzzahlig und nicht, getrennt/nah/berührend/überlappend, flache Hulls und Tetraeder, kollabierte Tetraeder,
+allgemeine Clouds bis 64 auf beiden Seiten, Hulls von wenigen ULP Größe): distant 1 169, close 1 611, overlap
+1 820; EPA ab Tetraeder 1 505, ab 1–3 Vertices 323, Anomalie-Gate 7, Degenerate-Retry 6 – 0 Abweichungen.
+Mutanten: 5 von 6 sterben (dotW-Assoziation, Support-Tie-Break, Silhouetten-Reihenfolge, lb-Assoziation,
+Kegel-Adjazenz); `min()` statt Select-Kette überlebt, äquivalent auf llvmpipe (P9.86f: FMin im SZINP-gestempelten
+Shader liefert −0 unabhängig von der Reihenfolge). `softBodySimPrimitiveContactGenWarp`: der Kernel über
+1 440 Paare (> 1 024 Warps, Grid-Stride) mit 24 Rigids aller vier Typen und 96 Tetraedern gegen den seriellen
+Leaf-Treiber auf Host-gebauten Clouds (`ctInnerSphere` + `ctTetCollide`): 154 Kontakte bitgleich (Punkt, Normale,
+Penetration, Rest, Refs, Material); der HEAD-Kernel besteht ihn ebenfalls. Szene `softbody` (Box-Boden):
+Ausgabe identisch.
+
+**3. Eine Workgroup pro CUDA-Warp: Mesh/HF-Midphases und `sb_primitiveContactGenLaunch`.** Die Host-Blöcke
+dieser Kernel haben 2 Warps (64 Threads); die Bridge verwirft blockDim, also liefen beide Warps eines Blocks
+nacheinander in einer 32er-Gruppe – bei nicht gesättigter GPU doppelte Latenz. Statt die Gruppe auf 64 zu
+verbreitern (beide Warps müssten dann jede Barriere der BVH-Walks gemeinsam nehmen) startet der Port jetzt eine
+32er-Gruppe pro CUDA-Warp: Host-Patch nur Grid, unter `#ifdef PXG_NO_CUDA_TOOLKIT` in `PxgNarrowphaseCore.cpp`
+(11 Launch-Stellen: CONVEX_TRIMESH_MIDPHASE ×2, CONVEX_HEIGHTFIELD_MIDPHASE ×2, SB_MESH_MIDPHASE, SB_HF_MIDPHASE,
+CLOTH_MESH_MIDPHASE, CLOTH_MIDPHASE_VERTEX_MESH, CLOTH_HF_MIDPHASE, CLOTH_MIDPHASE_VERTEX_HF, SB_PRIMITIVES_CG;
+`numBlocks * numWarpsPerBlock` Gruppen, blockDim.y 1, Argumente unverändert). Shader: Warp-Index = Gruppenindex,
+Stride = `WorkgroupCount().x` (beim gepatchten Grid genau die CUDA-Warpzahl 2 048 bzw. 1 024, und bei jedem Grid
+noch vollständig); die beiden Rigid-Midphases nehmen die Contact-Manager in einer Gruppen-Stride-Schleife (eine
+Runde beim Port-Grid, vollständig auch beim CUDA-Grid), Ladeindex geklemmt (P9.22, llvmpipe läuft nach der
+uniformen Schleifenkante mit leerer Maske weiter). **Bitgleich pro Warp:** jeder Warp bearbeitet exakt die
+Elemente seines CUDA-Warps mit unverändertem Code. Neu ist nur, dass die zwei Warps eines Blocks parallel um die
+globalen Zähler konkurrieren – wie in der CUDA; die Verbraucher adressieren die Paare eines Managers über seinen
+eigenen Record (`sortTriangleIndices` sortiert im Bereich des Managers), die Reihenfolge zwischen Gruppen war auf
+llvmpipe schon bisher nicht festgelegt. `convexTrimeshMidphasePairs` prüfte als einziges Fixture, dass Manager 0
+zuerst alloziert; es prüft jetzt, dass beide Bereiche [0, total) in beliebiger Reihenfolge partitionieren.
+**Tests.** Alle Fixtures dispatchen das gepatchte Engine-Grid (2 048 statt 1 024, 1 024 statt 512, 2/4 statt
+1/2); `convexTrimeshMidphasePairsCudaGrid` (eine Gruppe nimmt beide Manager über die Stride-Schleife),
+`softBodySimMeshMidphase` bei Grid 2 048/4/1 (Mehrfach-Stride). Partikel-Mesh-Midphase: in der CUDA schon ein Warp
+pro Block, nichts serialisiert.
+Nicht geändert (gleiches Muster, außerhalb der Mesh/HF-Midphase-Klasse, Folgekandidaten): sb_sb/sb_cloth/
+sb_cloth_vert/sb_ps/cloth_ps-Midphases, Cloth-Selbst-/Fremdkollision, SB_MESH_CG/SB_HF_CG/SB_CLOTH_CG,
+convexTrimesh/HF-Core, cvxCore*_32, cvxTriCorrelate/Finish, sortTriangleIndices.
+
+**4. `update/mergeChangedAABBMgrHandlesLaunch`, `updateBounds.slang`.** `[numthreads(256)]` wie der CUDA-Block
+(8 Warps, ein 32-Flag-Wort pro Warp und Durchlauf, Grid-Stride über Wörter); bisher ein Wort pro 32er-Gruppe, also
+beim festen Grid 64 nur 64 statt 512 Wörter pro Durchlauf. Jedes Wort aus seinen 32 Flags, von genau einem Thread
+geschrieben → dieselben Bits. Fixtures erweitert (37 Wörter bei Grid 8 und 1, 1 100 und 513 Wörter bei Grid 64,
+Merge 3/9/1 100 Wörter); alte und neue Kernel bestehen sie.
+
+**Messungen (llvmpipe, `PXG_KERNEL_TIMES=2`, Summe / Median / Max in ms).** `sb_primitiveContactGenLaunch`
+(`softbody`, 149 Launches): HEAD 426,3 / 2,53 / 16,9; kooperativ bei Grid 512 191,8 / 1,10 / 10,3; mit Grid 1 024
+(final, drei Läufe) 241–256 / 1,40–1,49 / 11–18 – die zweite Hälfte der Gruppen ist in der Szene leer und kostet
+auf llvmpipe ~0,35 ms Fixkosten. `trimeshPlaneNarrowphase` (`sdfmesh`, 172 Launches): HEAD 57,9 / 0,20 / 16,9,
+neu 125–128 / 0,63 / 7,5–11,1; Fixture-Launch über die vier großen Meshes 8,5 → 9,0–10,6. Der Median steigt,
+weil auch der Cached-Pfad jetzt eine 1024er-Gruppe startet (128 SIMD8-Fasern und eine Barriere auf einem
+CPU-Kern); der Volllauf (Max) fällt. Midphases: `midphaseGeneratePairs` (`meshfloor`, 33) 9,7 / 0,14 bei Grid 1 →
+9,5 / 0,12 bei Grid 2, `convexHeightFieldMidphase` (`hffloor`, 33) 9,3 / 0,10 → 5,8 / 0,08 (ein Manager, die
+zweite Gruppe ist leer; Unterschied im Rauschen); `sb_meshMidphaseGeneratePairsLaunch` (`softbody`
+`PXG_SB_FLOOR=mesh`, 149) 114,0 / 0,70 und `sb_heightfieldMidphaseGeneratePairsLaunch` (`heightfield`, 148)
+128,2 / 0,84 bei Grid 2 048 – kein Vorher-Wert, der Host-Patch ist nicht zur Laufzeit schaltbar, und llvmpipe hat
+4 Kerne, die schon 1 024 Gruppen sättigen. `updateChangedAABBMgrHandlesLaunch` (`softbody`, 200, gleicher Host,
+nur `updateBounds.spv` getauscht): 37,2 / 0,19 → 87–107 / 0,41–0,43 – auf llvmpipe teurer (64 Gruppen à 256
+statt à 32 Threads, bei einer Handvoll Shapes arbeitet ein Warp). Ausgaben von `softbody`, `sdfmesh`,
+`meshfloor`, `hffloor` alt gegen neu identisch (bis auf Pufferadressen).
+Auf llvmpipe teilen sich alle Threads einer Workgroup einen CPU-Kern (SIMD8-Fasern, Barriere = Faserwechsel);
+ein Lane-0-Reduktionsschritt kostet dort so viel wie vorher, deshalb zählt für 1, 3 und 4 die echte Hardware.
+Erwartung RX 9070 XT: trimeshPlane-Volllauf statt ~1 Thread mit Scratch-Arrays für 1 024·k Vertices + 32·k
+Reduktionen nur noch ~k·(1 + ~8) serielle Reduktionen (der Cached-Pfad bleibt ein Reload, jetzt in einer
+1024er-Gruppe – wenige µs); GJK/EPA eine Lane pro CUDA-Lane in Registern statt 32er-Schleifen über dynamisch
+indizierte private Arrays (Scratch); die 2-Warp-Kernel halbe Latenz, sobald der Block zwei Warps Arbeit hat;
+AABB-Handles: CUDA-Form, 8× weniger Durchläufe ab > 2 048 Shapes, darunter vernachlässigbar.
+
+**Werkzeuge.** foldscan (`tools/foldscan_all.py -j3`): 28 neue Kandidatenstellen (das neue Modul, die
+verschobenen `barycentrics`-Zeilen, zwei umbenannte triPlane-Zeilen), alle in `foldscan_reviewed.json` mit
+Begründung (keine MATTERS-FIX; die w-Lane-Nullen von `supportVertexV` sind tote Lanes wie im seriellen Treiber,
+`gwGet` ist ein dynamisch indizierter Groupshared-Load); Schlusslauf 831 Stellen, 862 Baseline-Einträge,
+0 unreviewed, 0 offene MATTERS-FIX. FALLE: `foldscan_all.py` muss im Build-Verzeichnis
+laufen – build.make nennt slangc relativ; aus dem Quellbaum scheitert jede Kompilierung, und der Lauf meldet
+„0 Stellen, 0 unreviewed, exit 0". Barrier-Checker: `workIndex` ist ein Warp-Seed-Name, der Gruppenindex heißt
+im triPlane-Kernel deshalb `pairIdx`; Negativkontrolle im neuen Modul: eine lane-abhängige Barriere und ein
+lane-abhängiger `return` vor einer Barriere werden gemeldet, ein lane-abhängiger `return` vor einem
+barrier-tragenden AUFRUF nicht (bestehende Lücke des Escape-Passes, dokumentiert, nicht behoben). groupshared,
+launchAbi, launchAbiPack, pushBlock, barrierUniformity, helperUniformity, blockCoverage (fing die zunächst
+schleifenlosen Rigid-Midphases beim CUDA-Grid – daher die Stride-Schleife), fixtureGrid, speculatedLoads,
+disabledKernels, cudaTwinKernels grün.
+
+**Ergebnisse.** ctest 867/867 in beiden Modi (+1 Skip ohne Validation-Layer; die Laufzeit stieg auf
+1 028 / 982 s gegen 620 s beim Lauf in der Nacht davor – über alle Tests verteilt, auch die reinen
+Python-Checker, also die Maschine, nicht die Shader). Vorab 16 Szenen der geänderten Kernel (Mesh/HF-Boden, Kugel/Kapsel/Konvex-Core auf
+Mesh/HF, Softbody auf Box/Mesh/HF, Softbody-Attachments, `sdfmesh`, Partikel auf Mesh/HF, `clothbox`) grün.
+Szenen 99/99 + Kontrolle (device-local; der Container wurde nach 73 Szenen neu gestartet, Rest per `--resume`).
+
 ## Deformable-vs-Rigid-Midphase auf 1024 Threads, Radix-Rang-Scan mit einer Barriere, Audit der Engine-Kernel
 
 **Anlass.** Profil des Nutzers (RX 9070 XT, SnippetDeformableSurface, `PXG_KERNEL_TIMES=1`):

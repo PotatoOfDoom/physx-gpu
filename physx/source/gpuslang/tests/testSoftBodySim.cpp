@@ -88,6 +88,8 @@
 #include <set>
 #include <algorithm>
 #include <string>
+#include <map>
+#include <random>
 
 namespace
 {
@@ -7561,12 +7563,12 @@ PXG_TEST(softBodySimPrimitiveContactGenGjk)
     push.w.maxNumContacts = MAXC;
 
     Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
-    // THE ENGINE'S GRID (PxgNarrowphaseCore.cpp:4300): SB_CG_GRID = 512 blocks.  The kernel
-    // strides by SB_CG_GRID * MIDPHASE_WARPS_PER_BLOCK = 1024, so a one-group dispatch covers
-    // only warps 0 and 1 -- i.e. the first TWO pairs.  The plane fixture has exactly two and
-    // never noticed; this one has three, and its third pair vanished until the grid was
-    // right.  Dispatch what the engine dispatches.
-    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);
+    // THE ENGINE'S GRID: 512 blocks of two warps, which the port launches as 512 * 2 = 1024
+    // one-warp groups (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT).  When the kernel still
+    // strode by a constant 1024, a one-group dispatch covered only the first two pairs; the
+    // plane fixture has exactly two and never noticed, this one has three, and its third
+    // pair vanished until the grid was right.  Dispatch what the engine dispatches.
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
@@ -7943,7 +7945,7 @@ PXG_TEST(softBodySimPrimitiveContactGenHull)
                   want2.x, naive2.x);
 
     Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
-    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);     // the engine's grid, SB_CG_GRID
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);    // the engine's grid: 512 blocks x 2 one-warp groups
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
@@ -8007,6 +8009,367 @@ PXG_TEST(softBodySimPrimitiveContactGenHull)
                                bCms.h, bXf.h, bCd.h, bRest.h, bRemap.h, bStack.h, bPairNum.h,
                                bNeeded.h, bPt.h, bNp.h, bBary.h, bInfo.h, bByX.h, bTmp.h,
                                bIdx.h, bSorted.h, bTotal.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// softBodySimPrimitiveContactGenWarp -- sb_primitiveContactGenLaunch's GJK/EPA branch on
+// the WHOLE WARP (pxgSlangGjkWarp) against the SERIAL driver, bit for bit, through the
+// kernel.
+//
+// npTetCollide_warpDifferential pins the two drivers against each other on prepared
+// clouds.  This pins what the kernel feeds them and what it does with the answer: the
+// rigid cloud (sphere centre, capsule segment, hull vertices through vertex2Shape and the
+// pose), the tet corners, the inner sphere and its centroid, the search direction, the
+// contact distance with or without the radius folded in, inSphereRadius0, and the stored
+// contact (the witness on the tet, the direction, dot(wB - wA, n) - radius, the rest
+// distance, the refs and the material) -- and that every pair is visited when there are
+// more pairs than the engine grid's 1024 warps (the grid-stride loop).
+//
+// The reference is built WITHOUT the kernel: the host builds each pair's two clouds with
+// the PxQuat / vertex2Shape transcriptions above, ctInnerSphere supplies the tet's inner
+// sphere and centroid, and ctTetCollide -- the serial driver this kernel ran on until the
+// cooperative rework -- answers the query.  The pre-rework kernel passes it too.
+// ===========================================================================
+PXG_TEST(softBodySimPrimitiveContactGenWarp)
+{
+    using namespace p80refit;
+    using namespace p87hull;
+    PxgSlangComputeDevice* dev = testDevice();
+    std::mt19937 rng(0x5b9c0de5u);
+    auto uni = [&](float lo, float hi) { return lo + (hi - lo) * float(rng() % 1000001u) / 1000000.0f; };
+
+    // ---- one softbody: NT separate tetrahedra, 4 vertices each ----------------
+    const uint32_t NT = 96u;
+    std::vector<F4> verts;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < NT; ++t)
+    {
+        const HV3 c = { uni(-1.2f, 1.2f), uni(-1.2f, 1.2f), uni(-1.2f, 1.2f) };
+        HV3 v[4];
+        for (;;)
+        {
+            for (int k = 0; k < 4; ++k) v[k] = { c.x + uni(-0.5f, 0.5f), c.y + uni(-0.5f, 0.5f), c.z + uni(-0.5f, 0.5f) };
+            const HV3 a = { v[1].x - v[0].x, v[1].y - v[0].y, v[1].z - v[0].z };
+            const HV3 b = { v[2].x - v[0].x, v[2].y - v[0].y, v[2].z - v[0].z };
+            const HV3 d = { v[3].x - v[0].x, v[3].y - v[0].y, v[3].z - v[0].z };
+            const float vol = (a.y * b.z - a.z * b.y) * d.x + (a.z * b.x - a.x * b.z) * d.y + (a.x * b.y - a.y * b.x) * d.z;
+            if (std::fabs(vol) > 0.02f) break;
+        }
+        for (int k = 0; k < 4; ++k) verts.push_back(F4{ v[k].x, v[k].y, v[k].z, 1.0f });
+        tets.push_back(TetIdx4{ 4 * t, 4 * t + 1, 4 * t + 2, 4 * t + 3 });
+    }
+    DevBuf bVerts = makeDev(dev, verts), bTets = makeDev(dev, tets);
+    if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = NT;
+    sb.mNumVerts = 4u * NT;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- two hull blobs: the unit cube (a box) and an irregular 20-vertex hull ----
+    auto asF = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+    auto makeBlob = [&](const std::vector<HV3>& hv, float inner) {
+        std::vector<F4> blob;
+        const uint32_t hdr0 = (uint32_t(hv.size()) << 8) | 6u;
+        blob.push_back(F4{ 9.0f, 9.0f, 9.0f, 9.0f });
+        blob.push_back(F4{ asF(hdr0), asF(0u), asF(0u), asF(0u) });
+        blob.push_back(F4{ 0.0f, 0.0f, 0.0f, inner });
+        for (const HV3& v : hv) blob.push_back(F4{ v.x, v.y, v.z, 0.0f });
+        for (int k = 0; k < 4; ++k) blob.push_back(F4{ 777.0f, 777.0f, 777.0f, 0.0f });   // past the end
+        return blob;
+    };
+    std::vector<HV3> cube, lumpy;
+    for (uint32_t m = 0; m < 8; ++m)
+        cube.push_back(HV3{ (m & 1u) ? 1.0f : -1.0f, (m & 2u) ? 1.0f : -1.0f, (m & 4u) ? 1.0f : -1.0f });
+    for (uint32_t m = 0; m < 20; ++m)
+    {
+        HV3 d = { uni(-1.0f, 1.0f), uni(-1.0f, 1.0f), uni(-1.0f, 1.0f) };
+        const float l = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) + 1e-3f;
+        const float r = uni(0.35f, 0.6f);
+        lumpy.push_back(HV3{ d.x / l * r * 1.2f, d.y / l * r * 0.8f, d.z / l * r });
+    }
+    const float CUBE_INNER = 1.0f, LUMPY_INNER = 0.3f;
+    DevBuf bCube = makeDev(dev, makeBlob(cube, CUBE_INNER));
+    DevBuf bLumpy = makeDev(dev, makeBlob(lumpy, LUMPY_INNER));
+
+    // ---- NR rigids, one contact manager each ----------------------------------
+    const uint32_t NR = 24u;
+    const uint32_t T_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE), T_CAPSULE = uint32_t(physx::PxGeometryType::eCAPSULE),
+                   T_BOX = uint32_t(physx::PxGeometryType::eBOX), T_CONVEX = uint32_t(physx::PxGeometryType::eCONVEXMESH);
+    std::vector<PxgShapeHost> shapes(1 + NR);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+    std::vector<float> xf((1 + NR) * 8, 0.0f);
+    xf[3] = 1.0f;
+    std::vector<float> cd(1 + NR, 0.0f);
+    cd[0] = 0.05f;
+    std::vector<float> rest(NR);
+    std::vector<uint64_t> remap(1 + NR, 0ull);
+    std::vector<CmInputHost> cms(NR);
+    struct Rigid { uint32_t type; HQ4 q; HV3 p; HV3 s; HQ4 sr; const std::vector<HV3>* hull; float inner; };
+    std::vector<Rigid> rig(NR);
+    for (uint32_t r = 0; r < NR; ++r)
+    {
+        Rigid& g = rig[r];
+        const uint32_t kind = r % 4u;
+        g.type = kind == 0 ? T_SPHERE : kind == 1 ? T_CAPSULE : kind == 2 ? T_BOX : T_CONVEX;
+        g.q = qnorm(uni(-1, 1), uni(-1, 1), uni(-1, 1), uni(-1, 1));
+        g.p = { uni(-1.2f, 1.2f), uni(-1.2f, 1.2f), uni(-1.2f, 1.2f) };
+        g.sr = { 0.0f, 0.0f, 0.0f, 1.0f };
+        g.hull = nullptr;
+        g.inner = 0.0f;
+        if (kind == 0) { const float rad = uni(0.1f, 0.6f); g.s = { rad, rad, rad }; }
+        else if (kind == 1) g.s = { uni(0.1f, 0.6f), uni(0.05f, 0.4f), 0.0f };
+        else if (kind == 2) { g.s = { uni(0.1f, 0.6f), uni(0.1f, 0.6f), uni(0.1f, 0.6f) }; g.hull = &cube; g.inner = CUBE_INNER; }
+        else { g.s = { uni(0.5f, 1.5f), uni(0.5f, 1.5f), uni(0.5f, 1.5f) };
+               g.sr = qnorm(uni(-1, 1), uni(-1, 1), uni(-1, 1), uni(-1, 1)); g.hull = &lumpy; g.inner = LUMPY_INNER; }
+        if (kind == 1) g.s.z = g.s.y;
+        PxgShapeHost& sh = shapes[1 + r];
+        sh.type = g.type;
+        sh.sx = g.s.x; sh.sy = g.s.y; sh.sz = g.s.z;
+        sh.srx = g.sr.x; sh.sry = g.sr.y; sh.srz = g.sr.z; sh.srw = g.sr.w;
+        sh.materialIndex = 100u + r;
+        sh.particleOrSoftbodyId = 0xFFFFFFFFu;
+        const uint64_t hull = (kind == 2) ? bCube.addr : (kind == 3) ? bLumpy.addr : 0ull;
+        sh.hullLo = uint32_t(hull & 0xFFFFFFFFull); sh.hullHi = uint32_t(hull >> 32);
+        float* x = &xf[(1 + r) * 8];
+        x[0] = g.q.x; x[1] = g.q.y; x[2] = g.q.z; x[3] = g.q.w; x[4] = g.p.x; x[5] = g.p.y; x[6] = g.p.z;
+        cd[1 + r] = (r % 5u == 0u) ? 0.0f : uni(0.0f, 0.2f);
+        rest[r] = uni(0.0f, 0.05f);
+        remap[1 + r] = 0x1000ull + r;
+        cms[r] = CmInputHost{ 0u, 1u + r, 0u, 1u + r };
+    }
+    DevBuf bShapes = makeDev(dev, shapes), bXf = makeDev(dev, xf), bCd = makeDev(dev, cd);
+    DevBuf bRest = makeDev(dev, rest), bRemap = makeDev(dev, remap), bCms = makeDev(dev, cms);
+
+    // ---- the midphase pairs: 60 distinct tets per rigid, shuffled -> 1440 > 1024 ----
+    std::vector<uint32_t> stack;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    for (uint32_t r = 0; r < NR; ++r)
+    {
+        std::vector<uint32_t> ts(NT);
+        for (uint32_t t = 0; t < NT; ++t) ts[t] = t;
+        std::shuffle(ts.begin(), ts.end(), rng);
+        for (uint32_t k = 0; k < 60u; ++k) pairs.push_back({ r, ts[k] });
+    }
+    std::shuffle(pairs.begin(), pairs.end(), rng);
+    const uint32_t NP = (uint32_t)pairs.size();
+    for (const auto& pr : pairs) { stack.push_back(pr.first); stack.push_back(pr.second); stack.push_back(0u); stack.push_back(0u); }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { NP }, needed = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum), bNeeded = makeDev(dev, needed);
+
+    // ---- the reference: host clouds, ctInnerSphere, ctTetCollide (the serial driver) ----
+    struct TcInH { float searchDir[4]; float spheres[4]; uint32_t counts[4]; };
+    struct TcOutH
+    {
+        uint32_t result, degenerate, size, pad;
+        float lowerBound, upperBound, innerSphere, pad2;
+        float direction[4], closestPointA[4], closestPointB[4], tetCenter[4];
+    };
+    struct TcParamsH { uint32_t numTests, p0, p1, p2; };
+    const uint32_t MAXV = 64u;
+    std::vector<float> isVB(NT * 4 * 4, 0.0f);
+    for (uint32_t t = 0; t < NT; ++t)
+        for (int k = 0; k < 4; ++k)
+        {
+            const F4& v = verts[4 * t + k];
+            isVB[(t * 4 + k) * 4 + 0] = v.x; isVB[(t * 4 + k) * 4 + 1] = v.y; isVB[(t * 4 + k) * 4 + 2] = v.z;
+        }
+    std::vector<TcOutH> inner;
+    {
+        std::vector<float> dummyA(4, 0.0f);
+        std::vector<TcInH> dummyIn(1);
+        std::memset(dummyIn.data(), 0, sizeof(TcInH));
+        std::vector<TcOutH> init(NT);
+        std::memset(init.data(), 0xEE, init.size() * sizeof(TcOutH));
+        PxgBufferHandle a = createBufferFrom(dev, dummyA), b = createBufferFrom(dev, isVB);
+        PxgBufferHandle i = createBufferFrom(dev, dummyIn), o = createBufferFrom(dev, init);
+        TcParamsH prm = { NT, 0, 0, 0 };
+        Kernel k("npTetCollide.spv", "ctInnerSphere", { 16, 16, (uint32_t)sizeof(TcInH), (uint32_t)sizeof(TcOutH) },
+                 sizeof(TcParamsH));
+        k.dispatch((NT + 63u) / 64u, { a, b, i, o }, prm);
+        dev->flush();
+        inner = downloadBuffer<TcOutH>(dev, o, NT);
+        for (PxgBufferHandle h : { a, b, i, o }) dev->destroyBuffer(h);
+    }
+    std::vector<float> VA(NP * MAXV * 4, 0.0f), VB(NP * MAXV * 4, 0.0f);
+    std::vector<TcInH> tin(NP);
+    std::memset(tin.data(), 0, tin.size() * sizeof(TcInH));
+    std::vector<float> radius(NP, 0.0f);
+    for (uint32_t pi = 0; pi < NP; ++pi)
+    {
+        const uint32_t r = pairs[pi].first, t = pairs[pi].second;
+        const Rigid& g = rig[r];
+        const float cDistance = cd[0] + cd[1 + r];
+        float* va = &VA[pi * MAXV * 4];
+        float* vb = &VB[pi * MAXV * 4];
+        for (int k = 0; k < 4; ++k)
+        {
+            const F4& v = verts[4 * t + k];
+            vb[k * 4 + 0] = v.x; vb[k * 4 + 1] = v.y; vb[k * 4 + 2] = v.z;
+        }
+        uint32_t nA = 0;
+        float contactDist = cDistance, inSphere0 = 0.0f;
+        if (g.type == T_SPHERE)
+        {
+            nA = 1; va[0] = g.p.x; va[1] = g.p.y; va[2] = g.p.z;
+            contactDist = cDistance + g.s.x;
+            radius[pi] = g.s.y;
+        }
+        else if (g.type == T_CAPSULE)
+        {
+            nA = 2;
+            const HV3 w = qrot(g.q, HV3{ g.s.x, 0.0f, 0.0f });
+            va[0] = g.p.x + w.x; va[1] = g.p.y + w.y; va[2] = g.p.z + w.z;
+            va[4] = g.p.x - w.x; va[5] = g.p.y - w.y; va[6] = g.p.z - w.z;
+            contactDist = cDistance + g.s.y;
+            radius[pi] = g.s.y;
+        }
+        else
+        {
+            nA = (uint32_t)g.hull->size();
+            const float minimumScale = (g.type == T_BOX) ? std::min(g.s.z, std::min(g.s.x, g.s.y)) : 1.0f;
+            inSphere0 = g.inner * minimumScale;
+            for (uint32_t k = 0; k < nA; ++k)
+            {
+                const HV3 w = qrot(g.q, vertex2Shape((*g.hull)[k], g.s, g.sr));
+                va[k * 4 + 0] = w.x + g.p.x; va[k * 4 + 1] = w.y + g.p.y; va[k * 4 + 2] = w.z + g.p.z;
+            }
+        }
+        const TcOutH& is = inner[t];
+        TcInH& e = tin[pi];
+        e.searchDir[0] = g.p.x - is.tetCenter[0];
+        e.searchDir[1] = g.p.y - is.tetCenter[1];
+        e.searchDir[2] = g.p.z - is.tetCenter[2];
+        e.searchDir[3] = contactDist;
+        e.spheres[0] = inSphere0;
+        e.spheres[1] = is.innerSphere;
+        e.counts[0] = nA; e.counts[1] = 4u;
+    }
+    std::vector<TcOutH> ref;
+    {
+        std::vector<TcOutH> init(NP);
+        std::memset(init.data(), 0xEE, init.size() * sizeof(TcOutH));
+        PxgBufferHandle a = createBufferFrom(dev, VA), b = createBufferFrom(dev, VB);
+        PxgBufferHandle i = createBufferFrom(dev, tin), o = createBufferFrom(dev, init);
+        TcParamsH prm = { NP, 0, 0, 0 };
+        Kernel k("npTetCollide.spv", "ctTetCollide", { 16, 16, (uint32_t)sizeof(TcInH), (uint32_t)sizeof(TcOutH) },
+                 sizeof(TcParamsH));
+        k.dispatch((NP + 63u) / 64u, { a, b, i, o }, prm);
+        dev->flush();
+        ref = downloadBuffer<TcOutH>(dev, o, NP);
+        for (PxgBufferHandle h : { a, b, i, o }) dev->destroyBuffer(h);
+    }
+    struct Want { F4 pt, np; uint16_t mat; bool seen; };
+    std::map<std::pair<uint64_t, uint64_t>, Want> want;
+    size_t nClose = 0, nOverlap = 0, nByType[4] = { 0, 0, 0, 0 };
+    for (uint32_t pi = 0; pi < NP; ++pi)
+    {
+        const TcOutH& o = ref[pi];
+        if (!(o.result == 1u || o.result == 2u)) continue;
+        const uint32_t r = pairs[pi].first, t = pairs[pi].second;
+        const float dx = o.closestPointB[0] - o.closestPointA[0], dy = o.closestPointB[1] - o.closestPointA[1],
+                    dz = o.closestPointB[2] - o.closestPointA[2];
+        const float pen = ((dx * o.direction[0] + dy * o.direction[1]) + dz * o.direction[2]) - radius[pi];
+        Want w;
+        w.pt = F4{ o.closestPointB[0], o.closestPointB[1], o.closestPointB[2], rest[r] };
+        w.np = F4{ o.direction[0], o.direction[1], o.direction[2], pen };
+        w.mat = uint16_t(100u + r);
+        w.seen = false;
+        want[{ 0x1000ull + r, sbTetRef(0u, t) }] = w;
+        if (o.result == 1u) ++nClose; else ++nOverlap;
+        ++nByType[r % 4u];
+    }
+    std::printf("  %u pairs: %zu contacts expected (close %zu, overlap %zu; sphere %zu capsule %zu box %zu convex %zu)\n",
+                NP, want.size(), nClose, nOverlap, nByType[0], nByType[1], nByType[2], nByType[3]);
+    PXG_CHECK_MSG(nClose > 40 && nOverlap > 40 && nByType[0] > 10 && nByType[1] > 10 && nByType[2] > 10 && nByType[3] > 10,
+                  "coverage thin: close %zu overlap %zu, by type %zu %zu %zu %zu", nClose, nOverlap,
+                  nByType[0], nByType[1], nByType[2], nByType[3]);
+
+    // ---- the kernel, on the engine grid ---------------------------------------
+    const uint32_t MAXC = NP + 8u;
+    std::vector<F4> outPoint(MAXC, F4{ -1, -1, -1, -1 }), outNormal(MAXC, F4{ -1, -1, -1, -1 });
+    std::vector<F4> outBary(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<PxgDeformablePairInfo> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(PxgDeformablePairInfo));
+    std::vector<uint16_t> outMat(MAXC + 8u, 0xEEEEu);
+    std::vector<uint64_t> byX(MAXC, 0ull);
+    std::vector<uint32_t> tempByX(MAXC, 0u), idxSorted(MAXC, 0u), total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNormal), bBary = makeDev(dev, outBary);
+    DevBuf bInfo = makeDev(dev, outInfo), bOutMat = makeDev(dev, outMat), bByX = makeDev(dev, byX);
+    DevBuf bTmp = makeDev(dev, tempByX), bIdx = makeDev(dev, idxSorted), bTotal = makeDev(dev, total);
+
+    SbContactGenPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRest.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 16u * NP;
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.w.outPoint = bPt.addr; push.w.outNormalPen = bNp.addr; push.w.outBarycentric = bBary.addr;
+    push.w.outContactInfo = bInfo.addr; push.w.totalContactCount = bTotal.addr;
+    push.w.outRigidMaterialIndex = bOutMat.addr;
+    push.w.contactByRigid = bByX.addr; push.w.tempContactByRigid = bTmp.addr;
+    push.w.contactIndexSortedByRigid = bIdx.addr;
+    push.w.maxNumContacts = MAXC;
+
+    Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);    // the engine's grid: 512 blocks x 2 one-warp groups
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gInfo = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, MAXC);
+    const auto gMat = downloadBuffer<uint16_t>(dev, bOutMat.h, MAXC);
+    const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+
+    size_t bad = 0, unknown = 0, dup = 0;
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+    {
+        auto it = want.find({ gInfo[i].ref0, gInfo[i].ref1 });
+        if (it == want.end()) { ++unknown; continue; }
+        Want& w = it->second;
+        if (w.seen) { ++dup; continue; }
+        w.seen = true;
+        const bool same = f2u(gPt[i].x) == f2u(w.pt.x) && f2u(gPt[i].y) == f2u(w.pt.y) && f2u(gPt[i].z) == f2u(w.pt.z) &&
+                          f2u(gPt[i].w) == f2u(w.pt.w) && f2u(gNp[i].x) == f2u(w.np.x) && f2u(gNp[i].y) == f2u(w.np.y) &&
+                          f2u(gNp[i].z) == f2u(w.np.z) && f2u(gNp[i].w) == f2u(w.np.w) && gMat[i] == w.mat;
+        if (!same)
+        {
+            if (bad < 6)
+                std::printf("  contact %u (rigid %llu tet %llu): gpu (%08x %08x %08x %08x | %08x %08x %08x %08x) "
+                            "serial (%08x %08x %08x %08x | %08x %08x %08x %08x)\n", i,
+                            (unsigned long long)(gInfo[i].ref0 - 0x1000ull), (unsigned long long)gInfo[i].ref1,
+                            f2u(gPt[i].x), f2u(gPt[i].y), f2u(gPt[i].z), f2u(gPt[i].w),
+                            f2u(gNp[i].x), f2u(gNp[i].y), f2u(gNp[i].z), f2u(gNp[i].w),
+                            f2u(w.pt.x), f2u(w.pt.y), f2u(w.pt.z), f2u(w.pt.w),
+                            f2u(w.np.x), f2u(w.np.y), f2u(w.np.z), f2u(w.np.w));
+            ++bad;
+        }
+    }
+    size_t missing = 0;
+    for (const auto& kv : want) if (!kv.second.seen) ++missing;
+    std::printf("  kernel: %u contacts, %zu differ, %zu unexpected, %zu duplicated, %zu missing\n",
+                n, bad, unknown, dup, missing);
+    PXG_CHECK_MSG(n == want.size() && bad == 0 && unknown == 0 && dup == 0 && missing == 0,
+                  "sb_primitiveContactGenLaunch vs the serial driver: %u contacts for %zu expected, %zu differ, "
+                  "%zu unexpected, %zu duplicated, %zu missing", n, want.size(), bad, unknown, dup, missing);
+    PXG_CHECK_MSG(gNeeded == NP * 16u, "stackSizeNeededOnDevice %u, want %u", gNeeded, NP * 16u);
+
+    for (PxgBufferHandle h : { bVerts.h, bTets.h, bDesc.h, bCube.h, bLumpy.h, bShapes.h, bXf.h, bCd.h, bRest.h,
+                               bRemap.h, bCms.h, bStack.h, bPairNum.h, bNeeded.h, bPt.h, bNp.h, bBary.h, bInfo.h,
+                               bOutMat.h, bByX.h, bTmp.h, bIdx.h, bTotal.h })
         dev->destroyBuffer(h);
 }
 
@@ -10014,7 +10377,10 @@ static_assert(offsetof(SbMeshMidPush, stackSizeBytes) == 56, "stackSizeBytes @56
 static_assert(offsetof(SbMeshMidPush, stackPtr) == 64, "stackPtr @64");
 } // namespace p810mesh
 
-PXG_TEST(softBodySimMeshMidphase)
+// gridX: 2048 is the port's launch (one 32-thread group per CUDA warp, PXG_NO_CUDA_TOOLKIT);
+// 4 and 1 make each group stride over several tetrahedra (stride = the group count), which the
+// engine grid never does with six tets.
+static void runSbMeshMidphase(uint32_t gridX)
 {
     using namespace p80refit;
     using namespace p88cloth;      // Bv32NodeHost
@@ -10211,8 +10577,10 @@ PXG_TEST(softBodySimMeshMidphase)
 
     Kernel k("softBodyMeshMidphaseBda.spv", "sb_meshMidphaseGeneratePairsLaunch",
              {}, sizeof(SbMeshMidPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:5055): x = SB_SBMIDPHASE = 1024, y = numTests.
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+    // y = numTests; the port launches one 32-thread group per CUDA warp, x = 2048.
+    std::printf("  grid x = %u\n", gridX);
+    k.dispatch(gridX, {}, push, /*gridY*/ 1u, 1u);
     dev->flush();
 
     const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -10273,6 +10641,13 @@ PXG_TEST(softBodySimMeshMidphase)
     for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bDesc.h, bShapes.h,
                                bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })
         dev->destroyBuffer(h);
+}
+
+PXG_TEST(softBodySimMeshMidphase)
+{
+    runSbMeshMidphase(2048u);
+    runSbMeshMidphase(4u);
+    runSbMeshMidphase(1u);
 }
 
 // ===========================================================================
@@ -11229,8 +11604,9 @@ PXG_TEST(softBodySimHeightfieldMidphase)
 
     Kernel k("softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch",
              {}, sizeof(SbHfMidPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:5360): x = SB_SBMIDPHASE = 1024, y = 1.
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+    // y = 1; the port launches one 32-thread group per CUDA warp, x = 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -11463,7 +11839,7 @@ PXG_TEST(softBodySimHeightfieldMidphaseRotated)
 
     Kernel k("softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch",
              {}, sizeof(SbHfMidPush));
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);          // PxgNarrowphaseCore.cpp:5360
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);          // PxgNarrowphaseCore.cpp: 1024 x 2 one-warp groups (PXG_NO_CUDA_TOOLKIT launch: one group per CUDA warp)
     dev->flush();
 
     const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];

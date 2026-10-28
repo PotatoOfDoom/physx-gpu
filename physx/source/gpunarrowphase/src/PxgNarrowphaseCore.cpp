@@ -2281,7 +2281,15 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(stackSizeBytes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// midphaseGeneratePairs (convexTrimeshMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexTrimeshMidphase fail to launch kernel!!\n");
@@ -2588,7 +2596,15 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// convexHeightFieldMidphase (convexHfMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sphere(convex)HeightFieldMidphase fail to launch kernel!!\n");
@@ -2889,7 +2905,15 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(stackSizeBytes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// midphaseGeneratePairs (convexTrimeshMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if(result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexTrimeshMidphase fail to launch kernel!!\n");
@@ -3198,7 +3222,15 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 		
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// convexHeightFieldMidphase (convexHfMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexHeightFieldMidphase fail to launch kernel!!\n");
@@ -4617,7 +4649,15 @@ void PxgGpuNarrowphaseCore::testSDKSoftbody(PxgGpuContactManagers& gpuManagers, 
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = 512;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a block
+		// would share one 32-thread workgroup and run one after the other.  One workgroup
+		// per CUDA warp instead: the same 1024 warps with the same warp-to-pair mapping (see
+		// softBodyContactGenBda.slang); same arguments, same results.
+		result = mCudaContext->launchKernel(sbCollisionKernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbCollisionKernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_primitiveContactGenLaunch fail to launch kernel!!\n");
@@ -5348,7 +5388,15 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyTrimesh(PxgGpuContactManagers& gpuMan
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// sb_meshMidphaseGeneratePairsLaunch (softBodyMeshMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(sbmeshMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbmeshMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_meshMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -5649,7 +5697,15 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyHeightfield(PxgGpuContactManagers& gp
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// sb_heightfieldMidphaseGeneratePairsLaunch (softBodyHfMidphaseBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		result = mCudaContext->launchKernel(sbHFMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbHFMidphaseFirstkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_meshMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -6845,7 +6901,15 @@ void PxgGpuNarrowphaseCore::testSDKFemClothTrimesh(PxgGpuContactManagers& gpuMan
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// cloth_meshMidphaseGeneratePairsLaunch (femClothMeshMidphaseBda.slang) takes its warp index from
+			// the group index and its stride from the group count; same arguments, same per-warp work.
+			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_meshMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -6987,7 +7051,15 @@ void PxgGpuNarrowphaseCore::testSDKFemClothTrimesh(PxgGpuContactManagers& gpuMan
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// cloth_midphaseVertexMeshLaunch (femClothMeshVertMidphaseBda.slang) takes its warp index from
+			// the group index and its stride from the group count; same arguments, same per-warp work.
+			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseVertexMeshLaunch fail to launch kernel!!\n");
@@ -7170,7 +7242,15 @@ void PxgGpuNarrowphaseCore::testSDKFemClothHeightfield(PxgGpuContactManagers& gp
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// cloth_heightfieldMidphaseGeneratePairsLaunch (femClothHfMidphaseBda.slang) takes its warp index from
+			// the group index and its stride from the group count; same arguments, same per-warp work.
+			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_heightfieldMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -7324,7 +7404,15 @@ void PxgGpuNarrowphaseCore::testSDKFemClothHeightfield(PxgGpuContactManagers& gp
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// cloth_midphaseVertexHeightfieldLaunch (femClothHfMidphaseBda.slang) takes its warp index from
+			// the group index and its stride from the group count; same arguments, same per-warp work.
+			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseVertexHeightfieldLaunch fail to launch kernel!!\n");

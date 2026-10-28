@@ -86,9 +86,11 @@
 //     const PxU32 NbWarps       = blockDim.y * gridDim.x;                  // 2048
 //
 // The bridge forwards gridDimX/Y/Z but DROPS blockDim, so a [numthreads(32,1,1)] group is ONE
-// warp: cmIdx = gid.y, the block's two warps are walked serially in a group-uniform `sub` loop,
-// and the stride stays the CUDA 2048 rather than the group count.  Deriving the stride from gid
-// alone would either double-visit or skip tetrahedra.
+// warp, cmIdx = gid.y.  The block's two warps used to be walked serially in one group; the
+// launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per CUDA
+// warp, (SB_SBMIDPHASE * 2, numTests, 1), so globalWarpIdx = gid.x and the stride is the group
+// count WorkgroupCount().x -- the CUDA's 2048, and at any other grid still a stride that
+// visits every element exactly once.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted pair SET and the atomic
 // total): no 32-lane intrinsics (__ballot_sync -> groupshared InterlockedOr, minIndex -> a
@@ -109,7 +111,6 @@ import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:55.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_SBMIDPHASE = 1024u;
-static const uint SM_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
@@ -351,12 +352,12 @@ void sb_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 
     const uint stackCapacity = gMm.stackSizeBytes / 16u;
 
-    // The block's two warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint tetrahedronIdx = globalWarpIdx; tetrahedronIdx < nbTets; tetrahedronIdx += SM_NB_WARPS)
+    for (uint tetrahedronIdx = globalWarpIdx; tetrahedronIdx < nbTets; tetrahedronIdx += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

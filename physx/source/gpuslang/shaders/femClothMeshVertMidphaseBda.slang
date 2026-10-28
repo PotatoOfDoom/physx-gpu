@@ -61,7 +61,9 @@
 //
 // V4 -- the grid is (SB_SBMIDPHASE, numTests, 1) x (WARP, MIDPHASE_WARPS_PER_BLOCK, 1),
 //     so `cmIdx` is blockIdx.Y and the warp stride is blockDim.y * gridDim.x =
-//     2 * 1024.  Same shape as the sibling.
+//     2 * 1024.  The port's launch site (PXG_NO_CUDA_TOOLKIT) launches one group per
+//     CUDA warp, (2 * 1024, numTests, 1), so the warp index is gid.x and the stride
+//     the group count.  Same shape as the sibling.
 //
 // V5 -- the vertex goes into the mesh's VERTEX space
 //     (`shape2Vertex(trimeshToWorld.transformInv(p), scale, scaleRot)`) but the
@@ -71,8 +73,8 @@
 //
 // ---------------------------------------------------------------------------
 // WARP EMULATION: one dispatched group is ONE warp of 32 (the bridge forwards
-// gridDim but drops blockDim), so the block's two warps are walked serially in
-// an outer loop, exactly as the sibling does.  The ballot is groupshared +
+// gridDim but drops blockDim), and the launch site launches one group per CUDA
+// warp, exactly as for the sibling.  The ballot is groupshared +
 // GroupMemoryBarrierWithGroupSync, so its control flow must be block-uniform --
 // the loops below are over quantities uniform across the group (nbVerts, the
 // node stack), and the only per-lane predicate is the one being balloted.
@@ -84,7 +86,6 @@ import pxgSlangBv32;           // P8.25: the BV32 reader, shared
 
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_SBMIDPHASE = 1024u;
-static const uint SM_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 static const uint WARP = 32u;
 static const uint STACK_SIZE = 192u;    // femMidphaseScratch.sBv32Nodes[192]
 
@@ -264,12 +265,12 @@ void cloth_midphaseVertexMeshLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 
     const uint stackCapacity = gVm.stackSizeBytes / 16u;
 
-    // The block's two warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint vertexIdx = globalWarpIdx; vertexIdx < numVerts; vertexIdx += SM_NB_WARPS)
+    for (uint vertexIdx = globalWarpIdx; vertexIdx < numVerts; vertexIdx += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
@@ -283,7 +284,7 @@ void cloth_midphaseVertexMeshLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         // no active lane".  Lane 0 then carries `vertexIdx` PAST the bound the loop
         // condition just rejected.  Measured, not reasoned: the faulting address was
         // base + 0xe000 = index 3584 = 1536 + 2048, i.e. globalWarpIdx 1536 (numVerts
-        // is 1100) after one `+= SM_NB_WARPS`.  The value is discarded -- the mask is
+        // is 1100) after one `+= 2048`, the stride.  The value is discarded -- the mask is
         // empty -- so only the ADDRESS matters, and clamping it changes nothing for
         // any lane the condition admits.
         // `max(numVerts, 1u)` and not `numVerts`: at zero the subtraction wraps to

@@ -144,7 +144,6 @@ import pxgSlangHeightfield;    // P9.27: format, bound transform, rectangle, qua
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:55.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_SBMIDPHASE = 1024u;
-static const uint TOTAL_NUM_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;   // 2048
 
 static const uint WARP = 32u;
 static const uint NB_WARPS_PER_CM = 64u;                        // femClothHFMidPhase.cu:206
@@ -234,16 +233,20 @@ void clothHfMidphaseBody(uint3 gtid, uint3 gid, bool vertexQuery)
     const uint lane = gtid.x;
 
     const uint stackSize = gHf.stackSizeBytes / 16u;
+    // The CUDA's warp count, blockDim.y * gridDim.x = 2 * SB_SBMIDPHASE = 2048: the port's launch
+    // sites (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launch one group per CUDA warp, so it
+    // is the group count, and the CUDA's warp index `warpIndex + 2 * blockIdx.x` is gid.x.
+    const uint totalNumWarps = WorkgroupCount().x;
     const uint nbWarpsRequired = NB_WARPS_PER_CM * gHf.numNPWorkItems;
     const uint nbIterationsPerWarps =
-        (nbWarpsRequired + TOTAL_NUM_WARPS - 1u) / TOTAL_NUM_WARPS;
+        (nbWarpsRequired + totalNumWarps - 1u) / totalNumWarps;
 
     // H2: gid.y is NOT read.  The engine launches gridDim.y = numTests and the
     // CUDA ignores it, so every y-block repeats this whole partition and every
     // pair is emitted numTests times.  Reproduced deliberately.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see above); the block's two warps used to be walked serially here.
     {
-    const uint warpIndex = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint warpIndex = gid.x;
 
     for (uint i = 0u; i < nbIterationsPerWarps; ++i)
     {

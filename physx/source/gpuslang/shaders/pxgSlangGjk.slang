@@ -45,6 +45,8 @@
 // vector L>>2), exactly as the leaf shader did.
 module pxgSlangGjk;
 
+import pxgSlangGjkShared;   // next3/prev3/ffs/encodeIndices, crossX/absX/dot3/getNormalized
+
 // The two convex point clouds.  64 is CONVEX_MAX_VERTICES_POLYGONS, the largest hull the
 // narrowphase admits; a tetrahedron uses four of them.
 public static const uint GJK_MAX_CLOUD = 64u;
@@ -104,9 +106,9 @@ public static const uint GJK_OVERLAP = 2u;
 
 
 // ---- layout primitives (per-lane serialised warp) --------------------------
-uint next3(uint x) { return x == 2u ? 0u : x + 1u; }
-uint prev3(uint x) { return x == 0u ? 2u : x - 1u; }
-uint ffs(uint m) { return m == 0u ? 0u : firstbitlow(m) + 1u; }
+// next3 / prev3 / ffs / encodeIndices and the scalar helpers crossX / absX / dot3 /
+// getNormalized live in pxgSlangGjkShared (moved there verbatim, so the cooperative
+// driver pxgSlangGjkWarp compiles the same bodies).
 
 void dotW(float a[32], float b[32], out float o[32])
 {
@@ -132,18 +134,6 @@ void magW(float v[32], out float cm[32])
 {
     float dv[32]; dotW(v, v, dv);
     for (uint L = 0u; L < 32u; ++L) cm[L] = sqrt(dv[L & 28u]);
-}
-uint encodeIndices(uint a, uint b) { return 0x3f800000u | ((b & 0xffu) << 8) | (a & 0xffu); }
-
-// scalar helpers for the output stage
-float3 crossX(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
-float3 absX(float3 a) { return float3(abs(a.x), abs(a.y), abs(a.z)); }
-float dot3(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-float3 getNormalized(float3 v)
-{
-    const float m = dot3(v, v);
-    if (m > 0.0f) { const float r = 1.0f / sqrt(m); return float3(v.x * r, v.y * r, v.z * r); }
-    return float3(0.0f, 0.0f, 0.0f);
 }
 
 // ---- closestPointTri (tranche 122) : line simplex (slots 0,1) + apex cV ------

@@ -36,6 +36,7 @@
 module pxgSlangEpa;
 
 import pxgSlangGjk;   // GjkCloud, GJK_MAX_CLOUD, and the GJK_* result enum
+import pxgSlangGjkShared;   // the scalar helpers, Vec3I8, barycentrics, the start4 tables
 
 public struct EpaOut
 {
@@ -101,17 +102,10 @@ struct Lanes
 
 
 // ---- scalar helpers --------------------------------------------------------
-float dot3(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-float3 cross3(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
-float3 absX(float3 a) { return float3(abs(a.x), abs(a.y), abs(a.z)); }
-float magSq3(float3 v) { return dot3(v, v); }
-float mag3(float3 v) { return sqrt(dot3(v, v)); }
-float3 getNormalized(float3 v) { const float m = dot3(v, v); if (m > 0.0f) { const float r = 1.0f / sqrt(m); return float3(v.x * r, v.y * r, v.z * r); } return float3(0.0f, 0.0f, 0.0f); }
-
-// Vec3I8
-uint mk3(uint a, uint b, uint c) { return (a & 0xffu) | ((b & 0xffu) << 8) | ((c & 0xffu) << 16); }
-uint g3(uint p, uint i) { return (p >> (i * 8u)) & 0xffu; }
-uint s3(uint p, uint i, uint val) { return (p & ~(0xffu << (i * 8u))) | ((val & 0xffu) << (i * 8u)); }
+// dot3 / cross3 / absX / magSq3 / mag3 / getNormalized, the Vec3I8 accessors
+// mk3 / g3 / s3, barycentrics and the epaStart4 seed tables live in
+// pxgSlangGjkShared (moved there verbatim, so the cooperative driver
+// pxgSlangGjkWarp compiles the same bodies).
 
 // support argmax over a cloud (vec3 dir, lowest-index tie-break)
 uint supportIdxA(float3 dir, GjkCloud a)
@@ -150,23 +144,7 @@ void newPoint(float3 dir, float3 ref, GjkCloud a, GjkCloud b, out float3 vertex,
     else { vertex = vn; indices = ((iBn << 8) | (iAn & 0xffu)) & 0xffffu; }
 }
 
-// schlock::barycentrics
-void barycentrics(float3 a, float3 b, float3 c, float3 p, out float u, out float v, out float w)
-{
-    const float3 m = cross3(b - a, c - a);
-    const float3 ma = absX(m);
-    const float3 a1 = cross3(b - p, c - p);
-    const float3 a2 = cross3(c - p, a - p);
-    float d;
-    if (ma.x >= ma.y && ma.x >= ma.z) { d = 1.0f / m.x; u = a1.x * d; v = a2.x * d; }
-    else if (ma.y >= ma.z)            { d = 1.0f / m.y; u = a1.y * d; v = a2.y * d; }
-    else                              { d = 1.0f / m.z; u = a1.z * d; v = a2.z * d; }
-    w = 1.0f - u - v;
-}
-
 // ---- seed: epaStart4 (tranche 130) -----------------------------------------
-static const uint SV4_0 = 0x020100u, SV4_1 = 0x000103u, SV4_2 = 0x010203u, SV4_3 = 0x020003u;
-static const uint SA4_0 = 0x010302u, SA4_1 = 0x020300u, SA4_2 = 0x030100u, SA4_3 = 0x010200u;
 void epaStart4(float input[32], inout Scratch S, inout Lanes L)
 {
     for (uint tI = 0u; tI < 16u; ++tI)

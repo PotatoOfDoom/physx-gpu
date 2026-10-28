@@ -116,9 +116,24 @@ public uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint 
 // upstream's arithmetic and it terminates the loop one round earlier than a
 // "count what was actually read" version would.  Transcribed, not tidied.
 //
-// Returns the number of survivors, compacted to the FRONT of contacts/seps.
-public uint tpBatchReduce(inout float3 contacts[198], inout float seps[198],
-                          uint totalContacts, float3 worldNormal, float clusterTolerance)
+// Returns the number of survivors, compacted to the FRONT of the store.
+//
+// THE LOOP IS GENERIC OVER WHERE THE BUFFER LIVES.  The Phase-1 fixture keeps the
+// CUDA's shared `contacts`/`separations` buffer in per-thread arrays; the engine
+// kernel (triPlaneNpBda) keeps it in groupshared, because since its stage 1 runs on
+// the whole 1024-thread group the buffer is FILLED by many threads and only this
+// loop runs on one.  Both compile this one body -- the storage is the only thing an
+// ITpContactStore supplies, so the readMask/overshoot arithmetic cannot drift
+// between the two (the P9.15d rule this module exists for).
+public interface ITpContactStore
+{
+    float3 tpPoint(uint i);
+    float tpSep(uint i);
+    [mutating] void tpStore(uint i, float3 p, float s);
+}
+
+public uint tpBatchReduceStore<S : ITpContactStore>(inout S store, uint totalContacts,
+                                                    float3 worldNormal, float clusterTolerance)
 {
     float3 lanePt[32];
     float laneSep[32];
@@ -135,8 +150,8 @@ public uint tpBatchReduce(inout float3 contacts[198], inout float seps[198],
             const uint readIndex = countbits(readMask & ((1u << l) - 1u)) + ind;
             if (readIndex < totalContacts)
             {
-                lanePt[l] = contacts[readIndex];
-                laneSep[l] = seps[readIndex];
+                lanePt[l] = store.tpPoint(readIndex);
+                laneSep[l] = store.tpSep(readIndex);
                 laneHas[l] = true;
             }
         }
@@ -152,10 +167,31 @@ public uint tpBatchReduce(inout float3 contacts[198], inout float seps[198],
     for (uint l = 0; l < 32; ++l)
     {
         if (!laneHas[l]) continue;
-        contacts[k2] = lanePt[l];
-        seps[k2] = laneSep[l];
+        store.tpStore(k2, lanePt[l], laneSep[l]);
         ++k2;
     }
+    return k2;
+}
+
+// The per-thread array store (the Phase-1 fixture's shape).
+struct TpArrayStore : ITpContactStore
+{
+    float3 pts[198];
+    float seps[198];
+    float3 tpPoint(uint i) { return pts[i]; }
+    float tpSep(uint i) { return seps[i]; }
+    [mutating] void tpStore(uint i, float3 p, float s) { pts[i] = p; seps[i] = s; }
+}
+
+public uint tpBatchReduce(inout float3 contacts[198], inout float seps[198],
+                          uint totalContacts, float3 worldNormal, float clusterTolerance)
+{
+    TpArrayStore store;
+    store.pts = contacts;
+    store.seps = seps;
+    const uint k2 = tpBatchReduceStore(store, totalContacts, worldNormal, clusterTolerance);
+    contacts = store.pts;
+    seps = store.seps;
     return k2;
 }
 

@@ -166,7 +166,9 @@ pxg_compile_shader(npEpa ctEpa)
 # short-circuits, when EPA is entered, and the degenerate re-run -- while ctGjk and ctEpa
 # pin the arithmetic underneath it.
 # P9.89: ctInnerSphere, computeInnerSphere alone (npTetCollide_p89InnerSphereSelect).
-pxg_compile_shader(npTetCollide ctTetCollide ctInnerSphere)
+# ctTetCollideWarp: the warp-cooperative driver (pxgSlangGjkWarp) on ctTetCollide's
+# inputs, for npTetCollide_warpDifferential.
+pxg_compile_shader(npTetCollide ctTetCollide ctInnerSphere ctTetCollideWarp)
 pxg_compile_shader(npGjkWarm ctGjkWarm)
 pxg_compile_shader(npCvxCvxEE cvxCvxGenEE)
 pxg_compile_shader(npCvxRayPoly cvxRayPoly)

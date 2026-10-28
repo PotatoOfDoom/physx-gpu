@@ -548,7 +548,7 @@ static std::vector<uint32_t> expectedTriangles(const Scene& sc, float boxY)
     return out;
 }
 
-static void dispatchMidphase(PxgSlangComputeDevice* dev, Built& b)
+static void dispatchMidphase(PxgSlangComputeDevice* dev, Built& b, uint32_t groups = 2u)
 {
     MidphasePush p{};
     p.numContactManagers = 2u;
@@ -561,14 +561,18 @@ static void dispatchMidphase(PxgSlangComputeDevice* dev, Built& b)
     p.midphasePairsNum = b.pairsNum.addr; p.midphasePairsNumPadded = b.pairsNumPadded.addr;
     p.stackSizeBytes = 16u * 1024u;
 
-    // grid ((numTests+1)/2, 1, 1) mirrors PxgNarrowphaseCore.cpp:1973.
+    // grid ((numTests+1)/2, 1, 1) x block (32, 2, 1) mirrors PxgNarrowphaseCore.cpp; the port's
+    // launch site (PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp, i.e.
+    // ((numTests+1)/2) * 2 groups, one contact manager each.
     Kernel k("convexTrimeshMidphaseBda.spv", "midphaseGeneratePairs", {}, sizeof(MidphasePush));
-    k.dispatch(1u, {}, p, 1u, 1u);
+    k.dispatch(groups, {}, p, 1u, 1u);
     dev->flush();
 }
 
 // ---------------------------------------------------------------------------
-PXG_TEST(convexTrimeshMidphasePairs)
+// `groups`: 2 is the port's launch (one group per CUDA warp, i.e. per manager); 1 is the
+// CUDA's own grid, where one group takes both managers through the group-stride loop.
+static void runPairs(uint32_t groups)
 {
     PxgSlangComputeDevice* dev = testDevice();
     const Scene sc = makeScene(/*includeDownFacing*/ false);
@@ -582,7 +586,7 @@ PXG_TEST(convexTrimeshMidphasePairs)
     BuildOpts opts = defaultOpts(boxY);
     opts.boxP = Vec3(-0.0f, boxY, -0.0f);
     Built b = build(dev, sc, boxY, /*cached*/ false, &opts);
-    dispatchMidphase(dev, b);
+    dispatchMidphase(dev, b, groups);
 
     const auto exp = expectedTriangles(sc, boxY);
     const uint32_t total = 2u * uint32_t(exp.size());   // two managers, same pair
@@ -646,11 +650,29 @@ PXG_TEST(convexTrimeshMidphasePairs)
         if (pu(r + 48) != 7u || pu(r + 52) != 11u)
         { ++mm; std::printf("  record %d materials got=(%u,%u) exp=(7,11)\n", cm, pu(r + 48), pu(r + 52)); }
     }
-    if (pi(28) != 0) { ++mm; std::printf("  record startIndex got=%d exp=0\n", pi(28)); }
+    // startIndex: the two managers' ranges partition [0, total), in EITHER order.  Each manager
+    // has its own 32-thread group (one per CUDA warp), and the two race for midphasePairsNum
+    // exactly as the CUDA's two warps of the block do; which one allocates first is not
+    // specified, and the consumers address a manager's pairs through its own record.
+    {
+        const int32_t s0 = pi(28), s1 = pi(56 + 28), n = int32_t(exp.size());
+        if (!((s0 == 0 && s1 == n) || (s1 == 0 && s0 == n)))
+        { ++mm; std::printf("  record startIndex got=(%d,%d) exp={0,%d}\n", s0, s1, n); }
+    }
 
-    PXG_CHECK_MSG(mm == 0, "midphaseGeneratePairs matches CPU (%zu mismatches, %zu triangles)",
-                  mm, exp.size());
+    PXG_CHECK_MSG(mm == 0, "midphaseGeneratePairs matches CPU at %u group(s) (%zu mismatches, %zu triangles)",
+                  groups, mm, exp.size());
     destroy(dev, b);
+}
+
+PXG_TEST(convexTrimeshMidphasePairs)
+{
+    runPairs(2u);
+}
+
+PXG_TEST(convexTrimeshMidphasePairsCudaGrid)
+{
+    runPairs(1u);
 }
 
 // ---------------------------------------------------------------------------

@@ -594,7 +594,7 @@ PXG_TEST(directApiRadixCopy2)
 // ===========================================================================
 // mergeChangedAABBMgrHandlesLaunch -- the `|=` twin.
 // ===========================================================================
-PXG_TEST(directApiMergeAabb)
+static void runMergeAabb(uint32_t NB_WORDS, uint32_t grid)
 {
     PxgSlangComputeDevice* dev = testDevice();
     std::vector<PxgBufferHandle> all;
@@ -612,10 +612,6 @@ PXG_TEST(directApiMergeAabb)
     static_assert(offsetof(physx::PxgUpdateActorDataDesc, mBitMapWordCounts) == 64u, "UAD_WORDCOUNTS");
     static_assert(offsetof(physx::PxgUpdateActorDataDesc, mShapeSimsBufferDeviceData) == 72u, "UAD_SHAPESIMS");
 
-    // Three words, i.e. 96 shapes -- more than one workgroup's word so the
-    // grid-stride `w += WorkgroupCount().x` has to advance, and the engine's grid
-    // is 64 so the loop exits on the first pass for all three.
-    const uint32_t NB_WORDS = 3u;
     std::vector<uint32_t> updated(size_t(NB_WORDS) * 32u, 0u);
     for (uint32_t i = 0; i < updated.size(); ++i)
         updated[i] = ((i * 7u + 3u) % 5u == 0u) ? (1u + i) : 0u;   // NON-BOOLEAN truthy values
@@ -624,9 +620,8 @@ PXG_TEST(directApiMergeAabb)
     // about.  THIS is what `|=` protects and `=` would destroy, and the check
     // below fails loudly for a port that wrote `=`.
     std::vector<uint32_t> changedInit(NB_WORDS);
-    changedInit[0] = 0x0000000Fu;
-    changedInit[1] = 0x80000000u;
-    changedInit[2] = 0xA5A5A5A5u;
+    for (uint32_t w = 0; w < NB_WORDS; ++w)
+        changedInit[w] = (w % 3u == 0u) ? 0x0000000Fu : (w % 3u == 1u) ? 0x80000000u : 0xA5A5A5A5u;
 
     std::vector<uint8_t> desc(SZ_UPDATE_ACTOR_DESC, 0u);
     PxgBufferHandle bUpdated = mk(updated);
@@ -640,9 +635,9 @@ PXG_TEST(directApiMergeAabb)
     struct MergePush { uint64_t updateActorDesc; };
     MergePush p{ addrOf(dev, bDesc) };
     {
-        // the engine's grid (PxgSimulationCore.cpp:2124): UPDATE_AABBMGR_HANDLES = 64
+        // the engine's grid (PxgSimulationCore.cpp): UPDATE_AABBMGR_HANDLES = 64
         Kernel k("updateBounds.spv", "mergeChangedAABBMgrHandlesLaunch", {}, sizeof(MergePush));
-        k.dispatch(64u, {}, p);
+        k.dispatch(grid, {}, p);
     }
     dev->flush();
 
@@ -660,7 +655,7 @@ PXG_TEST(directApiMergeAabb)
     }
 
     for (uint32_t w = 0; w < NB_WORDS; ++w)
-        PXG_CHECK_MSG(got[w] == ref[w], "changed word %u: got 0x%08x, expected 0x%08x", w, got[w], ref[w]);
+        PXG_CHECK_MSG(got[w] == ref[w], "changed word %u of %u (grid %u): got 0x%08x, expected 0x%08x", w, NB_WORDS, grid, got[w], ref[w]);
 
     // The pre-existing CPU-side bits must all have survived.  A port that wrote
     // `=` passes the ballot comparison above only if this scene happened to set
@@ -672,6 +667,17 @@ PXG_TEST(directApiMergeAabb)
     bool added = false;
     for (uint32_t w = 0; w < NB_WORDS; ++w) added = added || (got[w] != changedInit[w]);
     PXG_CHECK_MSG(added, "the merge changed nothing -- the ballot never contributed a bit");
+}
+
+// The kernel is the CUDA's 256-thread block, 8 warps of one word each per pass, grid-
+// strided over words: 3 words (one partial pass at the engine's grid of 64), 9 words at one
+// group (two passes, the second of one word), and 1100 words at the engine's grid (512
+// words per pass, a partial third pass of 76).
+PXG_TEST(directApiMergeAabb)
+{
+    runMergeAabb(3u, 64u);
+    runMergeAabb(9u, 1u);
+    runMergeAabb(1100u, 64u);
 }
 
 // ===========================================================================

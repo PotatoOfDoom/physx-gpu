@@ -96,8 +96,9 @@ import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mTetIndices@16
 import pxgSlangDefFilter;   // 5.12: findRigidVolumeFilter
 import pxgSlangDeformableRef;     // PxgEncodeDeformableTetrahedron
 import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
-import pxgSlangGjk;          // GjkCloud / GjkOut
-import pxgSlangTetCollide;   // tetPrimitivesCollide2, computeInnerSphere
+import pxgSlangGjk;          // GjkOut, GJK_* results, GJK_MAX_CLOUD
+import pxgSlangTetCollide;   // computeInnerSphere
+import pxgSlangGjkWarp;      // gwTetPrimitivesCollide2: GJK/EPA on the whole warp
 import pxgSlangBv32Batched;   // the 1024-thread midphase walk (sb_midphaseGeneratePairsLaunch)
 import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
                       // private copy of both that was verbatim identical to it.
@@ -339,13 +340,14 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 // test.
 //
 // DEVIATIONS from CUDA:
-//   - the fixed grid is reproduced as a constant.  The engine hard-codes numBlocks = 512
-//     (PxgNarrowphaseCore.cpp:4300) and blockDim (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK, 1);
-//     the bridge forwards only gridDim, so the grid-stride `i += gridDim.x * blockDim.y`
-//     becomes `i += SB_CG_GRID * MIDPHASE_WARPS_PER_BLOCK`.  Same precedent as
-//     femClothRigidContactBda's RC_GRID / RC_BLOCK;
-//   - as in the midphase above, the block's two warps are walked SERIALLY in a
-//     group-uniform loop rather than packed into one group;
+//   - ONE WORKGROUP PER CUDA WARP.  The engine launches 512 blocks of (WARP_SIZE,
+//     MIDPHASE_WARPS_PER_BLOCK = 2, 1); the bridge forwards only gridDim, so the block's
+//     two warps used to share one 32-thread group and run one after the other (half the
+//     CUDA's warps in flight, every pair behind another).  The port's launch site
+//     (PxgNarrowphaseCore.cpp, under PXG_NO_CUDA_TOOLKIT) now launches 512 * 2 = 1024
+//     one-warp groups: globalWarpIdx = gid.x and the CUDA's grid-stride
+//     `i += gridDim.x * blockDim.y` is `i += WorkgroupCount().x`, so every warp walks
+//     exactly the pairs its CUDA warp walks (and at any grid the loop still covers them);
 //   - the per-warp sbTetDataScratch pointer cache and the 12-lane cooperative load of the
 //     tet's four vertices into ss_scratch.vB are dropped: lanes 0..3 each read their own
 //     corner directly through Ptr<>.  Same values, no shared scratch, no barrier;
@@ -362,9 +364,6 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 // NoContraction-stamped: transformInv's rotate-by-conjugate and the plane-space dot are
 // mul-feeding-add chains.  No transcendental -- fully bit-exact, no tolerance seam.
 // ===========================================================================
-
-// PxgNarrowphaseCore.cpp:4300 — the engine hard-codes this grid for SB_PRIMITIVES_CG.
-static const uint SB_CG_GRID = 512u;
 
 // PxGeometryType (PxGeometry.h:48-64): eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3,
 // eCONVEXCORE 4, eCONVEXMESH 5, ePARTICLESYSTEM 6, eTETRAHEDRONMESH 7,
@@ -536,18 +535,27 @@ float3 quatBasisVector0(float4 q)
 // engine stores the same radius in x and y, so the two agree; the asymmetry is upstream's
 // and is transcribed rather than tidied.
 //
-// ONE LANE, NOT A WARP.  CUDA runs GJK cooperatively across 32 lanes; the ported driver
-// simulates those lanes with per-thread arrays (see pxgSlangGjk's header), so the whole
-// query belongs to a single thread.  Lane 0 runs it and writes the one contact the pair can
-// produce -- which is what writeVolumeContactFullWarp does anyway: it lets lane 0 take
-// the atomic and broadcasts the index, and only lanes 0..3 store.
+// THE WHOLE WARP, AS THE CUDA.  Until the cooperative rework the query ran on lane 0 with
+// the serial driver (pxgSlangTetCollide: one thread simulating the warp in 32-element
+// per-lane arrays) while 31 lanes waited.  It now runs on all 32 lanes through
+// pxgSlangGjkWarp -- the same GJK and EPA, lane L holding what CUDA lane L holds, the
+// clouds in groupshared like the CUDA's TetCollideScratch, each shuffle an exchange
+// through groupshared -- and returns the same bits (npTetCollide_warpDifferential pins
+// the two drivers against each other; softBodySimPrimitiveContactGenWarp pins this
+// kernel against the serial driver).  The CUDA's 12-lane cooperative vertex load and
+// its shuffled inner sphere are not reproduced: every lane reads the four corners and
+// computes the inner sphere itself, the serial arithmetic on the same inputs, so the
+// value is uniform.  Lane 0 then writes the one contact the pair can produce -- which is
+// what writeVolumeContactFullWarp does anyway: it lets lane 0 take the atomic and
+// broadcasts the index, and only lanes 0..3 store.
+//
+// Group-uniform by construction: every value the exchanges branch on is read back at a
+// fixed lane, so all 32 threads run the same barriers.  The caller's per-pair barrier
+// separates this pair's cloud writes from the previous pair's reads.
 void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint softbodyId,
                     uint tetrahedronIdx, float cDistance, float restDist,
                     uint2 rigidId, uint64_t tetRef, Ptr<PxgSoftBodyGpu> softbodies)
 {
-    if (lane != 0u)
-        return;
-
     // PxsCachedTransform (32 B): PxQuat q @0, PxVec3 p @16.
     const uint64_t xf = gCG.transformCache + uint64_t(rigidCacheRef) * 32UL;
     const float4 rigidQ = Ptr<float4>(xf)[0];
@@ -557,20 +565,19 @@ void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint sof
 
     const uint4 tetIdx = Ptr<uint4>(softbodies[softbodyId].mTetIndices)[tetrahedronIdx];
     Ptr<float4> verts = Ptr<float4>(softbodies[softbodyId].mPosition_InvMass);
+    const float3 b0 = verts[tetIdx.x].xyz;
+    const float3 b1 = verts[tetIdx.y].xyz;
+    const float3 b2 = verts[tetIdx.z].xyz;
+    const float3 b3 = verts[tetIdx.w].xyz;
 
-    GjkCloud b;
-    b.n = 4u;
-    for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) b.v[i] = float3(0.0f, 0.0f, 0.0f);
-    b.v[0] = verts[tetIdx.x].xyz;
-    b.v[1] = verts[tetIdx.y].xyz;
-    b.v[2] = verts[tetIdx.z].xyz;
-    b.v[3] = verts[tetIdx.w].xyz;
+    // The tet is cloud B, one corner per lane 0..3.
+    if (lane < 4u)
+        gwCloudPut(1u, lane, (lane == 0u) ? b0 : (lane == 1u) ? b1 : (lane == 2u) ? b2 : b3);
 
     float3 tetCenter;
-    const float innerSphere = computeInnerSphere(b.v[0], b.v[1], b.v[2], b.v[3], tetCenter);
+    const float innerSphere = computeInnerSphere(b0, b1, b2, b3, tetCenter);
 
-    GjkCloud a;
-    for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) a.v[i] = float3(0.0f, 0.0f, 0.0f);
+    uint nbA;
     float contactDist;
     float inSphereRadius0 = 0.0f;
     // `radius` is scale.y for a sphere and a capsule and ZERO for a hull — the hull carries
@@ -579,17 +586,17 @@ void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint sof
     float radius = 0.0f;
     if (rigidShape.type == GEOM_SPHERE)
     {
-        a.n = 1u;
-        a.v[0] = rigidP;
+        nbA = 1u;
+        if (lane == 0u) gwCloudPut(0u, 0u, rigidP);
         contactDist = cDistance + rigidShape.scaleX;
         radius = rigidShape.scaleY;
     }
     else if (rigidShape.type == GEOM_CAPSULE)
     {
-        a.n = 2u;
+        nbA = 2u;
         const float3 wHalfHeight = cgQuatRotate(rigidQ, float3(rigidShape.scaleX, 0.0f, 0.0f));
-        a.v[0] = rigidP + wHalfHeight;
-        a.v[1] = rigidP - wHalfHeight;
+        if (lane == 0u) gwCloudPut(0u, 0u, rigidP + wHalfHeight);
+        if (lane == 1u) gwCloudPut(0u, 1u, rigidP - wHalfHeight);
         contactDist = cDistance + rigidShape.scaleY;
         radius = rigidShape.scaleY;
     }
@@ -610,7 +617,7 @@ void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint sof
         uint nbVertices0 = (((header.x & 0xffffu) >> 8) & 0xffu);
         // CONVEX_MAX_VERTICES_POLYGONS (convexNpCommon.h:52) is 64, which is exactly
         // GJK_MAX_CLOUD; upstream asserts the bound, we clamp it so a corrupt header cannot
-        // walk off the end of the per-thread cloud.
+        // walk off the end of the cloud.
         nbVertices0 = min(nbVertices0, GJK_MAX_CLOUD);
 
         // extents.w is the hull's stored inner-sphere radius in VERTEX space.  A box is the
@@ -625,25 +632,30 @@ void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint sof
         // NO radius inflation for a hull.
         contactDist = cDistance;
 
-        // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world.
+        // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world, one
+        // vertex per lane as the CUDA's `for (i = threadIdx.x; i < nb; i += WARP_SIZE)`.
         const float3 scale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
         const float4 scaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
                                        rigidShape.scaleRotZ, rigidShape.scaleRotW);
         Ptr<float4> hullVerts = Ptr<float4>(convexPtr + 32UL);
-        for (uint i = 0u; i < nbVertices0; ++i)
+        for (uint i = lane; i < nbVertices0; i += WARP)
         {
-            const float3 vv = hullVerts[i].xyz;
-            a.v[i] = cgQuatRotate(rigidQ, cgVertex2Shape(vv, scale, scaleRot)) + rigidP;
+            // The clamp bounds the address the masked-off SIMD lanes form (P9.22).
+            const float3 vv = hullVerts[min(i, max(nbVertices0, 1u) - 1u)].xyz;
+            gwCloudPut(0u, i, cgQuatRotate(rigidQ, cgVertex2Shape(vv, scale, scaleRot)) + rigidP);
         }
-        a.n = nbVertices0;
+        nbA = nbVertices0;
     }
 
     GjkOut o;
-    const uint result = tetPrimitivesCollide2(a, b, rigidP - tetCenter, contactDist,
-                                              inSphereRadius0, innerSphere, o);
+    uint path;
+    const uint result = gwTetPrimitivesCollide2(lane, nbA, 4u, rigidP - tetCenter, contactDist,
+                                                inSphereRadius0, innerSphere, o, path);
 
     // Both OVERLAP and CLOSE mean "touching" to the caller (softbodyPrimitives.cu:561).
     if (!(result == GJK_OVERLAP || result == GJK_CLOSE))
+        return;
+    if (lane != 0u)
         return;
 
     // writeVolumeContactFullWarp (softbodyPrimitives.cu, 5.12): the stored point is the
@@ -681,11 +693,12 @@ void sb_primitiveContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     Ptr<float> contactDistance = Ptr<float>(gCG.contactDistance);
     Ptr<float> restDistance = Ptr<float>(gCG.restDistance);
 
-    // The block's two warps, walked serially (see the header).
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One workgroup per CUDA warp (see the header): globalWarpIdx = threadIdx.y +
+    // blockIdx.x * blockDim.y is the group index, the stride gridDim.x * blockDim.y the
+    // group count.
     {
-        const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
-        const uint stride = SB_CG_GRID * MIDPHASE_WARPS_PER_BLOCK;
+        const uint globalWarpIdx = gid.x;
+        const uint stride = WorkgroupCount().x;
 
         for (uint i = globalWarpIdx; i < numPairs; i += stride)
         {

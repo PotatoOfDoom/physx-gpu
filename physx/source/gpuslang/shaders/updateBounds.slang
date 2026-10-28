@@ -472,12 +472,18 @@ void setRigidDynamicGlobalPose(uint3 dispatchThreadId : SV_DispatchThreadID)
 //
 // CUDA uses __ballot_sync(FULL_MASK, updated[i]) so lane j of a 32-lane warp
 // contributes bit j; lane 0 writes the packed word.  The llvmpipe subgroup
-// width is not a fixed 32, so reproduce the ballot with a groupshared OR over
-// a 32-thread workgroup (one output word per group), grid-strided over words.
-groupshared uint gAabbMgrWord;
+// width is not a fixed 32, so reproduce the ballot with a groupshared OR per
+// warp.  The group is the CUDA's block, UPDATE_AABBMGR_HANDLES = 256 threads =
+// 8 warps, one output word per warp per pass, grid-strided over words: until
+// 256 threads it was one 32-thread group, i.e. one word per group per pass, so
+// a grid of 64 packed 64 words per pass where the CUDA packs 512.  Each word is
+// still built from its own 32 flags and written by one thread, so the bitmap is
+// the same bits.
+static const uint AABB_HANDLES_WARPS = 8u;   // PxgSimulationCoreKernelBlockDim::UPDATE_AABBMGR_HANDLES / 32
+groupshared uint gAabbMgrWord[AABB_HANDLES_WARPS];
 
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]   // PxgSimulationCoreKernelBlockDim::UPDATE_AABBMGR_HANDLES
 void updateChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
                                        uint3 groupId : SV_GroupID)
 {
@@ -489,21 +495,27 @@ void updateChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
     Ptr<uint> updated = Ptr<uint>(scDesc.mUpdated);
     Ptr<uint> changed = Ptr<uint>(scDesc.mChangedAABBMgrHandles);
 
-    const uint lane = groupThreadId.x;
+    const uint lane = groupThreadId.x & 31u;
+    const uint warpInGroup = groupThreadId.x >> 5;
 
-    for (uint w = groupId.x; w < numWords; w += WorkgroupCount().x)
+    // group-uniform trip count: a pass is the group's 8 words, base .. base + 7
+    for (uint base = groupId.x * AABB_HANDLES_WARPS; base < numWords;
+         base += WorkgroupCount().x * AABB_HANDLES_WARPS)
     {
         if (lane == 0)
-            gAabbMgrWord = 0u;
+            gAabbMgrWord[warpInGroup] = 0u;
         GroupMemoryBarrierWithGroupSync();
 
+        const uint w = base + warpInGroup;
         const uint i = w * 32u + lane;
-        if (i < numElements && updated[i] != 0u)
-            InterlockedOr(gAabbMgrWord, 1u << lane);
+        // The clamp bounds the address the masked-off SIMD lanes form past the last word
+        // (P9.22); a live lane's index is unchanged.
+        if (w < numWords && updated[min(i, numElements - 1u)] != 0u)
+            InterlockedOr(gAabbMgrWord[warpInGroup], 1u << lane);
         GroupMemoryBarrierWithGroupSync();
 
-        if (lane == 0)
-            changed[w] = gAabbMgrWord;
+        if (lane == 0 && w < numWords)
+            changed[w] = gAabbMgrWord[warpInGroup];
         GroupMemoryBarrierWithGroupSync();
     }
 }
@@ -532,12 +544,13 @@ void updateChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
 //
 // The groupshared-OR stands in for __ballot_sync for the same reason as in the
 // sibling: the llvmpipe subgroup width is not a fixed 32.  The read-modify-write
-// is done by lane 0 alone, exactly as the CUDA does it -- one thread per word,
-// so no atomic is needed and none is used.
-groupshared uint gAabbMgrMergeWord;
+// is done by each warp's lane 0 alone, exactly as the CUDA does it -- one thread
+// per word, so no atomic is needed and none is used.  Like the sibling, the group
+// is the CUDA's 256-thread block, one word per warp per pass.
+groupshared uint gAabbMgrMergeWord[AABB_HANDLES_WARPS];
 
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]   // PxgSimulationCoreKernelBlockDim::UPDATE_AABBMGR_HANDLES
 void mergeChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
                                       uint3 groupId : SV_GroupID)
 {
@@ -550,21 +563,26 @@ void mergeChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
     Ptr<uint> updated = Ptr<uint>(desc.mUpdated);
     Ptr<uint> changed = Ptr<uint>(desc.mChangedAABBMgrHandles);
 
-    const uint lane = groupThreadId.x;
+    const uint lane = groupThreadId.x & 31u;
+    const uint warpInGroup = groupThreadId.x >> 5;
 
-    for (uint w = groupId.x; w < numWords; w += WorkgroupCount().x)
+    for (uint base = groupId.x * AABB_HANDLES_WARPS; base < numWords;
+         base += WorkgroupCount().x * AABB_HANDLES_WARPS)
     {
         if (lane == 0)
-            gAabbMgrMergeWord = 0u;
+            gAabbMgrMergeWord[warpInGroup] = 0u;
         GroupMemoryBarrierWithGroupSync();
 
+        const uint w = base + warpInGroup;
         const uint shape = w * 32u + lane;
-        if (shape < numElements && updated[shape] != 0u)
-            InterlockedOr(gAabbMgrMergeWord, 1u << lane);
+        // The clamp bounds the address the masked-off SIMD lanes form past the last word
+        // (P9.22); a live lane's index is unchanged.
+        if (w < numWords && updated[min(shape, numElements - 1u)] != 0u)
+            InterlockedOr(gAabbMgrMergeWord[warpInGroup], 1u << lane);
         GroupMemoryBarrierWithGroupSync();
 
-        if (lane == 0)
-            changed[w] = changed[w] | gAabbMgrMergeWord;   // CUDA: |=, not =
+        if (lane == 0 && w < numWords)
+            changed[w] = changed[w] | gAabbMgrMergeWord[warpInGroup];   // CUDA: |=, not =
         GroupMemoryBarrierWithGroupSync();
     }
 }

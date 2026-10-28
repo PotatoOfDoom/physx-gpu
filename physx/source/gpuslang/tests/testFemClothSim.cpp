@@ -6388,8 +6388,9 @@ PXG_TEST(femClothSimMeshMidphase)
 
     Kernel k("femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch",
              {}, sizeof(ClothMeshMidPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:6597): x = SB_SBMIDPHASE = 1024, y = numTests.
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+    // y = numTests; the port launches one 32-thread group per CUDA warp, x = 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU reference: the leaf predicate, per lane, exactly as the warp runs it -----------
@@ -6872,7 +6873,7 @@ PXG_TEST(femClothSimMeshMidphase_p89NaNAxis)
     push.midphasePairsNum = bPairNum.addr;
     Kernel k("femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch",
              {}, sizeof(p817mesh::ClothMeshMidPush));
-    k.dispatch(1024u, {}, push, 1u, 1u);
+    k.dispatch(2048u, {}, push, 1u, 1u);   // one group per CUDA warp: 1024 blocks x 2
     dev->flush();
 
     // Each query's pairs occupy one contiguous block (one atomicAdd), written in emission
@@ -8858,9 +8859,10 @@ PXG_TEST(femClothSimMeshVertMidphase)
 
     Kernel k("femClothMeshVertMidphaseBda.spv", "cloth_midphaseVertexMeshLaunch",
              {}, sizeof(ClothVertMidPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:6742): x = SB_SBMIDPHASE = 1024,
-    // y = numTests.  One dispatched group is ONE warp; the block's two are serial.
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+    // y = numTests.  One dispatched group is ONE warp, and the port launches one group per
+    // CUDA warp: x = 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ 1u, 1u);
     dev->flush();
 
     const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -9515,9 +9517,9 @@ PXG_TEST(femClothSimHeightfieldMidphase)
         p.stackSizeBytes = stackPairs * 16u;
 
         Kernel k("femClothHfMidphaseBda.spv", entry, {}, sizeof(ClothHfMidPush));
-        // The engine's grid (PxgNarrowphaseCore.cpp:6927 and :7078):
-        // x = SB_SBMIDPHASE = 1024, y = numTests.
-        k.dispatch(/*gridX*/ 1024u, {}, p, gridY, 1u);
+        // The engine's grid (PxgNarrowphaseCore.cpp, both launches): x = SB_SBMIDPHASE = 1024
+        // blocks of two warps, y = numTests; the port launches one group per CUDA warp, x = 2048.
+        k.dispatch(/*gridX*/ 2048u, {}, p, gridY, 1u);
         dev->flush();
 
         const uint32_t n = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -9808,7 +9810,7 @@ PXG_TEST(femClothSimHeightfieldMidphaseRotated)
         p.midphasePairsNum = bPairNum.addr;
         p.stackSizeBytes = CAP * 16u;
         Kernel k("femClothHfMidphaseBda.spv", entry, {}, sizeof(ClothHfMidPush));
-        k.dispatch(/*gridX*/ 1024u, {}, p, 1u, 1u);       // PxgNarrowphaseCore.cpp:6927
+        k.dispatch(/*gridX*/ 2048u, {}, p, 1u, 1u);       // PxgNarrowphaseCore.cpp: 1024 x 2 one-warp groups
         dev->flush();
         const uint32_t n = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
         const auto s = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
