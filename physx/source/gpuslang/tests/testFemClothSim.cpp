@@ -42,6 +42,7 @@
 //   femClothSimSleeping          — cloth_sleeping wake-counter bookkeeping
 
 #include "pxgTestFramework.h"
+#include "pxgBv32WalkModel.h"
 
 // no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers the engine
 // descriptor header decorates its inline members with; must precede PxgFEMCloth.h.
@@ -3069,6 +3070,278 @@ PXG_TEST(femClothSimTriMidphase)
     dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bTc.h);
     dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
     dev->destroyBuffer(bDTree.h); dev->destroyBuffer(bDVerts.h); dev->destroyBuffer(bDTris.h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_midphaseGeneratePairsLaunch -- the SLOT ORDER of the batched walk.
+//
+// femClothSimTriMidphase above matches the written pairs as a SET.  Since the
+// kernel walks the tree with the whole 1024-thread group (pxgSlangBv32Batched)
+// instead of one serial warp, the claim is stronger: for the contact managers of
+// one group the slots are EXACTLY those of the CUDA's one-warp walk, pair for
+// pair.  The oracle is that walk on the host (pxgBv32WalkModel.h), and the trees
+// are built to reach every regime of the batched schedule:
+//   * a cloth-like sheet of 32,000 triangles, few per leaf, under a rigid box
+//     that reaches thousands of leaves: many 1024-leaf flushes, full windows;
+//   * random trees (fan-out 1..32, leaves of 1..32 triangles, mixed leaf and
+//     internal children, LYING child boxes that cull overlapping triangles and
+//     boxes that cover everything), one leaf with a count field above 32 (the
+//     CUDA's lanes stop at 31), a stack that CUTS the stream (the counter keeps
+//     counting, the writes past the stack are dropped), and a three-manager
+//     launch over two groups (the managers interleave by batch, so only each
+//     manager's own subsequence is ordered there);
+//   * a DAG of shared nodes whose walk visits 98,304 leaves and drives the
+//     batched stack over its reserve line, so the one-entry-per-round fallback
+//     runs for thousands of rounds.
+// Two managers per group: manager 1 has the cloth as shape1 (the swap) and its
+// own rigid box, and its stream must follow manager 0's directly.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimTriMidphaseOrder)
+{
+    namespace W = pxgbv32walk;
+    PxgSlangComputeDevice* dev = testDevice();
+    struct Tri4 { uint32_t x, y, z, w; };
+    struct U4 { uint32_t x, y, z, w; };
+    const uint32_t POISON = 0xEEEEEEEEu;
+    const float cd[3] = { 0.25f, 0.125f, 0.0625f };   // cloth, rigid A, rigid B
+
+    // nbTests 1..3; stackPairs 0 = room for everything.
+    auto runCase = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
+                       const std::vector<F4>& verts, const std::vector<Tri4>& tris,
+                       const W::Box rawA, const W::Box rawB, uint32_t nbTests, uint32_t stackPairs)
+    {
+        // The fattened boxes, in float exactly as the kernel forms them.
+        W::Box fat[2] = { rawA, rawB };
+        const float cdSum[2] = { cd[0] + cd[1], cd[0] + cd[2] };
+        for (int b = 0; b < 2; ++b)
+            for (int a = 0; a < 3; ++a) { fat[b].lo[a] = fat[b].lo[a] - cdSum[b]; fat[b].hi[a] = fat[b].hi[a] + cdSum[b]; }
+        auto triBox = [&](uint32_t i) {
+            const Tri4& t = tris[i];
+            const F4 v0 = verts[t.x], v1 = verts[t.y], v2 = verts[t.z];
+            W::Box r;
+            r.lo[0] = PxMin(v0.x, PxMin(v1.x, v2.x)); r.hi[0] = PxMax(v0.x, PxMax(v1.x, v2.x));
+            r.lo[1] = PxMin(v0.y, PxMin(v1.y, v2.y)); r.hi[1] = PxMax(v0.y, PxMax(v1.y, v2.y));
+            r.lo[2] = PxMin(v0.z, PxMin(v1.z, v2.z)); r.hi[2] = PxMax(v0.z, PxMax(v1.z, v2.z));
+            return r;
+        };
+        // manager -> rigid: 0 -> A, 1 -> B (swapped shapes), 2 -> A
+        const uint32_t rigidOf[3] = { 0u, 1u, 0u };
+        std::vector<std::vector<uint32_t>> want(nbTests);
+        uint32_t maxStack = 0u;
+        for (uint32_t c = 0; c < nbTests; ++c)
+        {
+            const W::Box& box = fat[rigidOf[c]];
+            uint32_t ms = 0u;
+            want[c] = W::walkOneWarp(nodes, box, [&](uint32_t p) { return W::intersects(triBox(p), box); }, &ms);
+            maxStack = PxMax(maxStack, ms);
+        }
+        PXG_CHECK_MSG(maxStack <= 192u, "[%s] the one-warp walk needs %u stack entries, past the "
+                      "CUDA's 192 -- the case is outside what the CUDA defines", name, maxStack);
+        uint32_t total = 0u;
+        for (auto& v : want) total += uint32_t(v.size());
+        const uint32_t cap = stackPairs ? stackPairs : total;
+        const uint32_t SLACK = 8u;
+
+        DevBuf bTree = makeDev(dev, W::buildBlob(nodes, uint32_t(tris.size())));
+        DevBuf bVerts = makeDev(dev, verts);
+        DevBuf bTris = makeDev(dev, tris);
+        PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
+        fc.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+        fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+        fc.mTriangleVertexIndices_ownedEdges = reinterpret_cast<uint4*>(size_t(bTris.addr));
+        fc.mNbVerts = uint32_t(verts.size());
+        fc.mNbTriangles = uint32_t(tris.size());
+        DevBuf bDesc = makeDev(dev, std::vector<PxgFEMCloth>{ fc });
+
+        std::vector<PxgContactManagerInput> cms(3);
+        std::memset(cms.data(), 0, cms.size() * sizeof(PxgContactManagerInput));
+        cms[0].shapeRef0 = 0u; cms[0].shapeRef1 = 1u; cms[0].transformCacheRef0 = 0u; cms[0].transformCacheRef1 = 1u;
+        cms[1].shapeRef0 = 2u; cms[1].shapeRef1 = 0u; cms[1].transformCacheRef0 = 2u; cms[1].transformCacheRef1 = 0u;
+        cms[2] = cms[0];
+        DevBuf bCin = makeDev(dev, cms);
+        std::vector<PxgShape> shapes(3);
+        std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+        shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH); shapes[0].particleOrSoftbodyId = 0u;
+        shapes[1].type = PxU32(PxGeometryType::eBOX); shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+        shapes[2].type = PxU32(PxGeometryType::eSPHERE); shapes[2].particleOrSoftbodyId = 0xFFFFFFFFu;
+        DevBuf bShapes = makeDev(dev, shapes);
+        std::vector<float> boundsArr = { -9e9f, -9e9f, -9e9f, 9e9f, 9e9f, 9e9f };   // the cloth's: never read
+        for (const W::Box* b : { &rawA, &rawB })
+            for (int a = 0; a < 6; ++a) boundsArr.push_back(a < 3 ? b->lo[a] : b->hi[a - 3]);
+        DevBuf bBounds = makeDev(dev, boundsArr);
+        DevBuf bCd = makeDev(dev, std::vector<float>{ cd[0], cd[1], cd[2] });
+        DevBuf bTc = makeDev(dev, std::vector<PxsCachedTransform>(3));
+        DevBuf bStack = makeDev(dev, std::vector<U4>(cap + SLACK, U4{ POISON, POISON, POISON, POISON }));
+        DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+        TriMidPush push = {};
+        push.numTests = nbTests; push.toleranceLength = 1.0f;
+        push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.bounds = bBounds.addr;
+        push.contactDistance = bCd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+        push.stackPtr = bStack.addr; push.midphasePairsNum = bCount.addr;
+        push.stackSizeBytes = cap * 16u;
+        Kernel k("femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch", {}, sizeof(TriMidPush));
+        PXG_CHECK_MSG(k.isValid(), "[%s] the pipeline must build", name);
+        if (!k.isValid()) return;
+        // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK).
+        k.dispatch((nbTests + 1u) / 2u, {}, push, 1u, 1u);
+        dev->flush();
+
+        const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        const auto gStack = downloadBuffer<U4>(dev, bStack.h, cap + SLACK);
+        PXG_CHECK_MSG(gCount == total, "[%s] the counter says %u pairs, the one-warp walk emits %u",
+                      name, gCount, total);
+        const uint32_t written = PxMin(gCount, cap);
+        size_t mm = 0;
+        if (nbTests <= 2u)
+        {
+            // one group: manager 0's stream, then manager 1's, slot for slot
+            std::vector<U4> seq;
+            for (uint32_t c = 0; c < nbTests; ++c)
+                for (uint32_t p : want[c]) seq.push_back(U4{ c, p, 0u, 0u });
+            for (uint32_t i = 0; i < written && i < seq.size(); ++i)
+                if (std::memcmp(&gStack[i], &seq[i], sizeof(U4)) != 0)
+                {
+                    if (mm < 8)
+                        std::printf("  [%s] slot %u: (%u, %u, %u, %u), the one-warp walk has (%u, %u)\n", name, i,
+                                    gStack[i].x, gStack[i].y, gStack[i].z, gStack[i].w, seq[i].x, seq[i].y);
+                    ++mm;
+                }
+        }
+        else
+        {
+            // two groups race: each manager's own subsequence is still in walk order
+            std::vector<std::vector<uint32_t>> got(nbTests);
+            for (uint32_t i = 0; i < written; ++i)
+            {
+                if (gStack[i].x >= nbTests || gStack[i].z != 0u || gStack[i].w != 0u) { ++mm; continue; }
+                got[gStack[i].x].push_back(gStack[i].y);
+            }
+            for (uint32_t c = 0; c < nbTests; ++c)
+                if (got[c] != want[c]) { ++mm; std::printf("  [%s] manager %u: subsequence differs (%zu vs %zu)\n",
+                                                           name, c, got[c].size(), want[c].size()); }
+        }
+        size_t badPoison = 0;
+        for (uint32_t i = written; i < cap + SLACK; ++i)
+            if (gStack[i].x != POISON || gStack[i].y != POISON) ++badPoison;
+        PXG_CHECK_MSG(mm == 0, "[%s] %zu slots differ from the CUDA's one-warp walk", name, mm);
+        PXG_CHECK_MSG(badPoison == 0, "[%s] %zu slots past the written range were touched", name, badPoison);
+        std::printf("    [ note ] %-10s %u managers, %u pairs (%u written), one-warp stack peak %u\n",
+                    name, nbTests, total, written, maxStack);
+
+        dev->destroyBuffer(bTree.h); dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTris.h);
+        dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h);
+        dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bTc.h);
+        dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+    };
+
+    auto boxOf = [](float x0, float y0, float z0, float x1, float y1, float z1) {
+        return W::Box{ { x0, y0, z0 }, { x1, y1, z1 } };
+    };
+
+    // ---- the sheet: 160 x 200 triangles, coherent in primitive order ----
+    {
+        W::Rng rng{ 0x5eed0001u };
+        std::vector<F4> verts; std::vector<Tri4> tris;
+        const uint32_t NX = 160u, NZ = 200u;
+        for (uint32_t i = 0; i < NX * NZ; ++i)
+        {
+            const float x = float(i % NX), z = float(i / NX), y = 0.3f * rng.unit();
+            const uint32_t b = uint32_t(verts.size());
+            verts.push_back(F4{ x, y, z, 1.0f });
+            verts.push_back(F4{ x + 0.9f, y + 0.1f * rng.unit(), z, 1.0f });
+            verts.push_back(F4{ x + 0.4f, y, z + 0.9f, 1.0f });
+            tris.push_back(Tri4{ b, b + 1u, b + 2u, b });
+        }
+        const W::TreeShape sh = { 2u, 24u, 4u, 30u, 8u };
+        uint32_t used = 0u;
+        auto nodes = W::randomTree(sh, rng, uint32_t(tris.size()),
+            [&](uint32_t i) { const F4& a = verts[3 * i]; return W::Box{ { a.x, a.y - 0.1f, a.z }, { a.x + 0.9f, a.y + 0.2f, a.z + 0.9f } }; },
+            &used);
+        // the leaf hulls above are generous approximations; the walk only needs boxes,
+        // and the per-triangle test decides with the real corners
+        tris.resize(used);
+        runCase("sheet", nodes, verts, tris, boxOf(20.f, -1.f, 30.f, 120.f, 1.f, 150.f),
+                boxOf(50.f, -1.f, 50.f, 60.f, 1.f, 55.f), 2u, 0u);
+    }
+
+    // ---- random trees ----
+    for (uint32_t seed = 0; seed < 3u; ++seed)
+    {
+        W::Rng rng{ 0xabc00000u + seed * 7919u };
+        std::vector<F4> verts; std::vector<Tri4> tris;
+        const uint32_t NB = 6000u;
+        for (uint32_t i = 0; i < NB; ++i)
+        {
+            const float x = 100.f * rng.unit(), y = 100.f * rng.unit(), z = 100.f * rng.unit();
+            const uint32_t b = uint32_t(verts.size());
+            verts.push_back(F4{ x, y, z, 1.0f });
+            verts.push_back(F4{ x + 2.f * rng.unit(), y + 2.f * rng.unit(), z, 1.0f });
+            verts.push_back(F4{ x, y + 2.f * rng.unit(), z + 2.f * rng.unit(), 1.0f });
+            tris.push_back(Tri4{ b, b + 1u, b + 2u, b });
+        }
+        auto triHull = [&](uint32_t i) {
+            const Tri4& t = tris[i]; const F4 v[3] = { verts[t.x], verts[t.y], verts[t.z] };
+            W::Box r = { { v[0].x, v[0].y, v[0].z }, { v[0].x, v[0].y, v[0].z } };
+            for (int q = 1; q < 3; ++q)
+            { r.lo[0] = PxMin(r.lo[0], v[q].x); r.lo[1] = PxMin(r.lo[1], v[q].y); r.lo[2] = PxMin(r.lo[2], v[q].z);
+              r.hi[0] = PxMax(r.hi[0], v[q].x); r.hi[1] = PxMax(r.hi[1], v[q].y); r.hi[2] = PxMax(r.hi[2], v[q].z); }
+            return r;
+        };
+        const W::TreeShape sh = { 3u, 1u, 32u, 300u, 40u };
+        uint32_t used = 0u;
+        auto nodes = W::randomTree(sh, rng, NB, triHull, &used);
+        tris.resize(NB);   // keep every triangle addressable for the oversized leaf below
+        // One reached-looking leaf whose 6-bit count is above 32: the CUDA's lanes stop at 31.
+        bool patched = false;
+        for (auto& n : nodes)
+        {
+            for (auto& c : n)
+                if (c.leaf && c.primStart + 63u < NB && c.nbField + 32u <= 63u)
+                { c.nbField += 32u; c.box = boxOf(-1e6f, -1e6f, -1e6f, 1e6f, 1e6f, 1e6f); patched = true; break; }
+            if (patched) break;
+        }
+        PXG_CHECK_MSG(patched, "random tree %u: no leaf could carry an oversized count", seed);
+        const W::Box a = boxOf(10.f, 5.f, 20.f, 70.f, 80.f, 65.f);
+        const W::Box b = boxOf(40.f, 40.f, 40.f, 60.f, 60.f, 60.f);
+        if (seed == 0u) runCase("random0", nodes, verts, tris, a, b, 2u, 0u);
+        if (seed == 1u)
+        {
+            // the cut: well inside manager 1's stream
+            uint32_t n0 = 0u;
+            {
+                W::Box fa = a;
+                for (int q = 0; q < 3; ++q) { fa.lo[q] -= cd[0] + cd[1]; fa.hi[q] += cd[0] + cd[1]; }
+                n0 = uint32_t(W::walkOneWarp(nodes, fa, [&](uint32_t p) { return W::intersects(triHull(p), fa); }).size());
+            }
+            runCase("random1cut", nodes, verts, tris, a, b, 2u, n0 + 17u);
+        }
+        if (seed == 2u) runCase("random2x3", nodes, verts, tris, a, b, 3u, 0u);
+    }
+
+    // ---- the shared-node DAG: 98,304 leaf visits, the stack past its reserve ----
+    {
+        std::vector<F4> verts; std::vector<Tri4> tris;
+        const uint32_t PER_LEAF = 3u;
+        for (uint32_t i = 0; i < 32u * PER_LEAF; ++i)
+        {
+            // every third triangle sits outside both rigid boxes
+            const float x = (i % 3u == 2u) ? 500.0f : float(i % 7u);
+            const uint32_t b = uint32_t(verts.size());
+            verts.push_back(F4{ x, 0.0f, 0.0f, 1.0f });
+            verts.push_back(F4{ x + 0.5f, 0.0f, 0.0f, 1.0f });
+            verts.push_back(F4{ x, 0.5f, 0.0f, 1.0f });
+            tris.push_back(Tri4{ b, b + 1u, b + 2u, b });
+        }
+        const W::Box everywhere = boxOf(-1e6f, -1e6f, -1e6f, 1e6f, 1e6f, 1e6f);
+        const W::Box nowhere = boxOf(9000.f, 9000.f, 9000.f, 9001.f, 9001.f, 9001.f);
+        // THREE reached leaves under each of the 32,768 bottom entries: a window of 32
+        // of those grows the stack by 64, which is what carries an unreserved window
+        // past the 2048 entries (the reserve mutant dies here and nowhere else).
+        auto nodes = W::sharedDag(everywhere, nowhere, (1u << 3) | (1u << 17) | (1u << 30), PER_LEAF);
+        runCase("dag", nodes, verts, tris, boxOf(-1.f, -1.f, -1.f, 10.f, 1.f, 1.f),
+                boxOf(2.f, -1.f, -1.f, 3.f, 1.f, 1.f), 2u, 0u);
+    }
 }
 
 // ===========================================================================

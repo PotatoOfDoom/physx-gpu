@@ -245,7 +245,9 @@ void radixSortCalculateRanks(uint3 groupThreadId : SV_GroupThreadID,
                     accum += 1u << (rel << 3);
             }
 
-            const uint inclusive = warp32InclusiveScan(tid, accum);
+            // ONE barrier, not eleven (pxgSlangScan): the barrier that closes this
+            // digit group below is the one its caller contract asks for.
+            const uint inclusive = warp32InclusiveScanOneBarrier(tid, accum);
 
             if ((tid & 31u) == 31u)
             {

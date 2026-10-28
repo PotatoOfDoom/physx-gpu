@@ -40,9 +40,9 @@
 // (PXG_SCENE=softbody, which is a contact-free free fall until this chain lands).
 //
 // WHAT IS REUSED RATHER THAN REINVENTED:
-//   - the BV32 warp-cooperative tree walk and the BV32DataPacked leaf/child decode come
-//     VERBATIM from femClothSelfCollisionBda (this file's direct BDA sibling): same
-//     groupshared stack, same ballot/scan lowering, same barrier placement;
+//   - the BV32DataPacked leaf/child decode is pxgSlangBv32's; the tree walk is the shared
+//     pxgSlangBv32Batched one (also cloth_midphaseGeneratePairsLaunch's), which replaced a
+//     one-warp transcription of femClothSelfCollisionBda's walk;
 //   - the SoftbodyTreeTraverser body (surface-hint gate, isValidTet, tetBoundingBox) is the
 //     already-unit-tested transcription from npMidphaseDeform.slang, lifted onto Ptr<>
 //     reads;
@@ -58,9 +58,9 @@
 // indexing by gid.x alone would silently process only HALF the contact-manager pairs.
 // That exact bug shipped in femClothSelfCollisionBda and cost a long investigation; it is
 // avoided here from the first line.  The block's warps are walked SERIALLY in a
-// group-uniform loop, which keeps one group == one warp (so the traversal's barriers stay
-// uniform — packing two warps into a group would put them in divergent control flow) while
-// still covering every pair.
+// group-uniform loop (so the traversal's barriers stay uniform) while still covering every
+// pair.  Since the batched walk (pxgSlangBv32Batched) the group is 1024 threads, and EACH
+// contact manager is walked by the whole group, not by one 32-thread warp.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted pair SET and the atomic
 // total):
@@ -98,6 +98,7 @@ import pxgSlangDeformableRef;     // PxgEncodeDeformableTetrahedron
 import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 import pxgSlangGjk;          // GjkCloud / GjkOut
 import pxgSlangTetCollide;   // tetPrimitivesCollide2, computeInnerSphere
+import pxgSlangBv32Batched;   // the 1024-thread midphase walk (sb_midphaseGeneratePairsLaunch)
 import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
                       // private copy of both that was verbatim identical to it.
 
@@ -110,8 +111,6 @@ static const uint GEOM_TETRAHEDRONMESH = 7u;
 
 // @1024, mNbNodes @1152.
 
-// femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
-static const uint STACK_SIZE = 192u;
 
 // ---------------------------------------------------------------------------
 // Byte-exact narrowphase ABI mirrors (identical to femClothContactGenBda's).
@@ -213,44 +212,80 @@ void loadSoftbodyRigidPair(uint64_t cmInputsAddr, uint64_t shapesAddr, uint cmId
 }
 
 // ---------------------------------------------------------------------------
-// Warp emulation scratch: one group == one warp, so a single slot each.
+// SoftbodyTreeTraverser::intersectPrimitiveFullWarp (softbodyMidPhase.cu:82) for one
+// tetrahedron: only SURFACE tets, only valid ones, bound from the four live corners.
 // ---------------------------------------------------------------------------
-groupshared int sStack[STACK_SIZE];   // bv32 to-be-expanded node stack
-groupshared uint sBallot;             // __ballot_sync mask
-groupshared uint sScanStart;          // atomicAdd result broadcast
-
-uint ballotGroup(bool pred, uint lane)
+struct SbTetLeaf : IBv32BatchedLeaf
 {
-    if (lane == 0u) sBallot = 0u;
-    GroupMemoryBarrierWithGroupSync();
-    if (pred) InterlockedOr(sBallot, 1u << lane);
-    GroupMemoryBarrierWithGroupSync();
-    return sBallot;
+    Ptr<float4> tetmeshVerts;
+    Ptr<uint4> tetmeshTetIndices;
+    uint64_t hintBase;
+    float3 boxMin;
+    float3 boxMax;
+
+    bool overlaps(uint primitiveIndex)
+    {
+        bool intersect = false;
+        // Only SURFACE tetrahedra can touch a rigid; the interior is skipped.
+        if (surfaceHint(hintBase, primitiveIndex) != 0u)
+        {
+            const uint4 tetIdx = tetmeshTetIndices[primitiveIndex];
+            const float3 w0 = tetmeshVerts[tetIdx.x].xyz;
+            const float3 w1 = tetmeshVerts[tetIdx.y].xyz;
+            const float3 w2 = tetmeshVerts[tetIdx.z].xyz;
+            const float3 w3 = tetmeshVerts[tetIdx.w].xyz;
+
+            if (isValidTet(w0, w1, w2, w3))
+            {
+                // tetBoundingBox (deformableCollision.cuh:64) — pairwise min/max,
+                // transcribed in the same association order as the .cu.
+                const float3 tMin = min(min(w0, w1), min(w2, w3));
+                const float3 tMax = max(max(w0, w1), max(w2, w3));
+                intersect = boundsIntersect(tMin, tMax, boxMin, boxMax);
+            }
+        }
+        return intersect;
+    }
 }
 
 // ===========================================================================
-// sb_midphaseGeneratePairsLaunch — one 32-thread group per warp, walked serially over
-// the block's MIDPHASE_WARPS_PER_BLOCK warps.
+// sb_midphaseGeneratePairsLaunch — the block's MIDPHASE_WARPS_PER_BLOCK contact managers
+// walked one after the other, each by the whole 1024-thread group (pxgSlangBv32Batched).
+//
+// The CUDA's one warp pops the tree one node at a time: one serial dependent iteration
+// per LEAF (hint -> tet indices -> corners -> atomicAdd).  For a softbody on a ground
+// PLANE every surface leaf is reached, so that was the whole surface walked serially on
+// one compute unit, per softbody, per step.  The batched walk expands up to 32 nodes per
+// round and evaluates up to 1024 leaves per flush with one atomicAdd, and emits the same
+// pairs into the same slots for a contact manager, in the same order (the module header
+// has the argument; softBodySimMidphaseOrder pins it against a host model of the
+// one-warp walk).  The CUDA's 192-entry stack is the module's BV32B_RESERVE.
 // ===========================================================================
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(1024, 1, 1)]   // BV32B_THREADS
 void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    const uint lane = gtid.x;
+    const uint tid = gtid.x;
 
     // See the header: the engine packs MIDPHASE_WARPS_PER_BLOCK warps per block and the
-    // bridge forwards only gridDim, so the block's warps are walked serially here.  `sub`
-    // and the break are group-uniform, so every barrier below is reached uniformly.
+    // bridge forwards only gridDim, so the block's managers are walked serially here.
+    // `sub` and the break are group-uniform, so every barrier in the walk is reached
+    // uniformly.
     for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
     {
-    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
     const uint cmIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
     if (cmIdx >= gMid.numWorkItems)
         break;
+    // llvmpipe runs the rest of this iteration with an EMPTY mask after the uniform
+    // break and still issues its loads (P9.22): reading cmInputs[numWorkItems] and
+    // then a shape at whatever index that garbage names faulted in the
+    // three-manager fixture.  The loads use a clamped index; every store and
+    // atomic is masked, so the clamp is unobservable.
+    const uint cmLoad = min(cmIdx, gMid.numWorkItems - 1u);
 
     PxgShape sbShape, rigidShape;
     uint sbCacheRef, rigidCacheRef;
-    loadSoftbodyRigidPair(gMid.cmInputs, gMid.gpuShapes, cmIdx,
+    loadSoftbodyRigidPair(gMid.cmInputs, gMid.gpuShapes, cmLoad,
                           sbShape, sbCacheRef, rigidShape, rigidCacheRef);
 
     const uint softbodyId = sbShape.particleOrSoftbodyId;
@@ -258,10 +293,6 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 
     const uint64_t tetMeshData = softbodies[softbodyId].mTetMeshData;
     const uint64_t treeAddr = tetMeshData + 16UL;   // + sizeof(uint4) header
-
-    Ptr<float4> tetmeshVerts = Ptr<float4>(softbodies[softbodyId].mPosition_InvMass);
-    Ptr<uint4> tetmeshTetIndices = Ptr<uint4>(softbodies[softbodyId].mTetIndices);
-    const uint64_t hintBase = softbodies[softbodyId].mTetMeshSurfaceHint;
 
     // The RIGID's world AABB, fattened by the pair's total contact distance
     // (softbodyMidPhase.cu:186-190).  PxBounds3 is 24 B: min @0, max @12.
@@ -272,119 +303,16 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
     const float3 boxMin = float3(bounds[rb + 0u], bounds[rb + 1u], bounds[rb + 2u]) - contactDist;
     const float3 boxMax = float3(bounds[rb + 3u], bounds[rb + 4u], bounds[rb + 5u]) + contactDist;
 
-    const uint stackSize = gMid.stackSizeBytes / 16u;   // stackSizeBytes / sizeof(uint4)
+    SbTetLeaf leaf;
+    leaf.tetmeshVerts = Ptr<float4>(softbodies[softbodyId].mPosition_InvMass);
+    leaf.tetmeshTetIndices = Ptr<uint4>(softbodies[softbodyId].mTetIndices);
+    leaf.hintBase = softbodies[softbodyId].mTetMeshSurfaceHint;
+    leaf.boxMin = boxMin;
+    leaf.boxMax = boxMax;
 
-    uint currentNodeIndex = 0u;   // root
-    bool hasNode = true;
-    uint nbStack = 0u;
-
-    while (hasNode)
-    {
-        const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
-
-        if (bvIsLeaf(currentNodeIndex))
-        {
-            // Leaf: the primitive range lives in the PARENT node's mData slot.
-            const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
-            const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-            const uint nbPrimitives = bvDataNbPrimitives(data);
-            const uint primStartIndex = bvDataPrimStart(data);
-            uint primitiveIndex = 0xffffffffu;
-            if (lane < nbPrimitives)
-                primitiveIndex = lane + primStartIndex;
-            // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
-            // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
-            // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
-            // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
-            // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
-            // SIGSEGV, not from reading.
-            const uint safePrim = min(primitiveIndex,
-                                      primStartIndex + max(nbPrimitives, 1u) - 1u);
-
-            // SoftbodyTreeTraverser::intersectPrimitiveFullWarp (softbodyMidPhase.cu:82).
-            bool intersect = false;
-            if (primitiveIndex != 0xffffffffu)
-            {
-                // Only SURFACE tetrahedra can touch a rigid; the interior is skipped.
-                if (surfaceHint(hintBase, primitiveIndex) != 0u)
-                {
-                    const uint4 tetIdx = tetmeshTetIndices[safePrim];
-                    const float3 w0 = tetmeshVerts[tetIdx.x].xyz;
-                    const float3 w1 = tetmeshVerts[tetIdx.y].xyz;
-                    const float3 w2 = tetmeshVerts[tetIdx.z].xyz;
-                    const float3 w3 = tetmeshVerts[tetIdx.w].xyz;
-
-                    if (isValidTet(w0, w1, w2, w3))
-                    {
-                        // tetBoundingBox (deformableCollision.cuh:64) — pairwise min/max,
-                        // transcribed in the same association order as the .cu.
-                        const float3 tMin = min(min(w0, w1), min(w2, w3));
-                        const float3 tMax = max(max(w0, w1), max(w2, w3));
-                        intersect = boundsIntersect(tMin, tMax, boxMin, boxMax);
-                    }
-                }
-            }
-
-            // pushOntoStackFullWarp (bv32Traversal.cuh:197): reserve a run with one
-            // atomicAdd, scatter by the exclusive prefix, DROP anything past stackSize.
-            const uint mask = ballotGroup(intersect, lane);
-            const uint offset = countbits(mask & ((1u << lane) - 1u));
-            const uint validCount = countbits(mask);
-            if (lane == 0u)
-            {
-                uint start = 0u;
-                if (validCount > 0u)
-                    InterlockedAdd(Ptr<uint>(gMid.midphasePairsNum)[0], validCount, start);
-                sScanStart = start;
-            }
-            GroupMemoryBarrierWithGroupSync();
-            const uint stackIndex = sScanStart + offset;
-            if (intersect && stackIndex < stackSize)
-                Ptr<uint4>(gMid.stackPtr)[stackIndex] = uint4(cmIdx, primitiveIndex, 0u, 0u);
-        }
-        else
-        {
-            // Internal node: test the rigid box against each child's bounds.
-            const uint nbChildren = bvNbNodes(treeAddr, nodeIdx);
-            float3 mn = float3(0, 0, 0), mx = float3(0, 0, 0);
-            const bool hasBox = lane < nbChildren;
-            if (hasBox)
-            {
-                mn = bvMin(treeAddr, nodeIdx, lane);
-                mx = bvMax(treeAddr, nodeIdx, lane);
-            }
-            // SoftbodyTreeTraverser::intersectBoxFullWarp: mBox.intersects(childBounds).
-            bool intersect = false;
-            if (hasBox)
-                intersect = boundsIntersect(boxMin, boxMax, mn, mx);
-
-            uint currentIndex = bvChildIndex(currentNodeIndex, lane);
-            bool isValidNode = false;
-            if (lane < nbChildren)
-            {
-                const uint data = bvData(treeAddr, nodeIdx, lane);
-                isValidNode = intersect;
-                if (isValidNode && bvDataIsInternal(data))
-                    currentIndex = bvDataChildNodeIndex(data);
-            }
-
-            const uint mask = ballotGroup(isValidNode, lane);
-            const uint offset = countbits(mask & ((1u << lane) - 1u));
-            const uint validCount = countbits(mask);
-            if (isValidNode)
-                sStack[nbStack + offset] = int(currentIndex);
-            nbStack += validCount;
-        }
-
-        GroupMemoryBarrierWithGroupSync();
-        if (nbStack > 0u)
-        {
-            nbStack -= 1u;
-            currentNodeIndex = uint(sStack[nbStack]);
-        }
-        else
-            hasNode = false;
-    }
+    // stackSizeBytes / sizeof(uint4); the counter overshoot contract lives in the flush.
+    bv32BatchedMidphase(leaf, tid, treeAddr, boxMin, boxMax, cmIdx,
+                        gMid.stackPtr, gMid.midphasePairsNum, gMid.stackSizeBytes / 16u);
     }
 }
 

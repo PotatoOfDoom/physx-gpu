@@ -71,6 +71,7 @@
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
 #include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
 #include "pxgHfLocalBoundRef.h"              // P9.89: transformFast(getInverse()) oracle + twins
+#include "pxgBv32WalkModel.h"               // the one-warp BV32 walk: the batched midphase's order oracle
 #include "pxgBv32TreeGen.h"                // synthetic BV32 trees for the multi-workgroup refit
 #include "PxgSimulationCoreDesc.h"           // 5.12: PxgDeformablePairInfo, PxgEncodeDeformable*
 #include "PxgDeformableContactWriters.h"     // 5.12: PxgRigidDbContactWriter / PxgDbDbContactWriter
@@ -4660,6 +4661,174 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
     dev->destroyBuffer(bHints.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bShapes.h);
     dev->destroyBuffer(bCms.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
     dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+}
+
+// ---------------------------------------------------------------------------
+// sb_midphaseGeneratePairsLaunch -- the SLOT ORDER of the batched walk.
+//
+// The kernel walks the tetrahedron tree with the whole 1024-thread group
+// (pxgSlangBv32Batched, shared with cloth_midphaseGeneratePairsLaunch, whose
+// femClothSimTriMidphaseOrder carries the schedule's harder cases).  This one pins
+// the SOFTBODY leaf test inside the batched schedule against the CUDA's one-warp
+// walk (pxgBv32WalkModel.h), slot for slot:
+//   * the DeformableVolume-on-a-ground-plane shape: a rigid box that covers the
+//     whole body, so EVERY leaf is reached and the walk is pure flush work;
+//   * a random tree under a partial box;
+// each over interior tetrahedra (hint 0), exactly degenerate ones (zero volume,
+// dropped by isValidTet) and the surface hint read at all four byte offsets of
+// its word; two managers in one group (the second with the tet mesh as shape1),
+// then three over two groups (each manager's own subsequence in order).
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimMidphaseOrder)
+{
+    namespace W = pxgbv32walk;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t POISON = 0xCDCDCDCDu;
+    const float cd[3] = { 0.08f, 0.02f, 0.05f };   // softbody, rigid A, rigid B
+
+    const uint32_t NB = 9000u;
+    W::Rng rng{ 0x7e7a0001u };
+    std::vector<F4> verts;
+    std::vector<TetIdx4> tets;
+    std::vector<uint8_t> hint(NB);
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        // coherent in primitive order, like a cooked mesh: a 30 x 30 x 10 block
+        const float x = float(i % 30u), y = float((i / 30u) % 10u), z = float(i / 300u);
+        const uint32_t b = uint32_t(verts.size());
+        verts.push_back(F4{ x, y, z, 1.0f });
+        verts.push_back(F4{ x + 1.0f, y, z, 1.0f });
+        verts.push_back(F4{ x, y + 1.0f, z, 1.0f });
+        const bool degenerate = rng.below(10u) == 0u;
+        // degenerate: the fourth corner IS the first, so the signed volume is exactly 0
+        verts.push_back(degenerate ? F4{ x, y, z, 1.0f } : F4{ x, y, z + 1.0f, 1.0f });
+        tets.push_back(TetIdx4{ b, b + 1u, b + 2u, b + 3u });
+        hint[i] = uint8_t(rng.below(4u) == 0u ? 0u : 1u + rng.below(200u));
+    }
+    std::vector<uint32_t> hintWords((NB + 3u) / 4u + 1u, 0u);
+    for (uint32_t i = 0; i < NB; ++i) hintWords[i / 4u] |= uint32_t(hint[i]) << (8u * (i % 4u));
+    auto tetBox = [&](uint32_t i) {
+        const TetIdx4& t = tets[i];
+        const F4 v[4] = { verts[t.x], verts[t.y], verts[t.z], verts[t.w] };
+        W::Box r = { { v[0].x, v[0].y, v[0].z }, { v[0].x, v[0].y, v[0].z } };
+        for (int q = 1; q < 4; ++q)
+        { r.lo[0] = PxMin(r.lo[0], v[q].x); r.lo[1] = PxMin(r.lo[1], v[q].y); r.lo[2] = PxMin(r.lo[2], v[q].z);
+          r.hi[0] = PxMax(r.hi[0], v[q].x); r.hi[1] = PxMax(r.hi[1], v[q].y); r.hi[2] = PxMax(r.hi[2], v[q].z); }
+        return r;
+    };
+    // isValidTet on exact inputs: the valid tets have volume 1, the degenerate ones 0.
+    auto validTet = [&](uint32_t i) { return verts[tets[i].w].z != verts[tets[i].x].z; };
+
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bHints = makeDev(dev, hintWords);
+
+    auto runCase = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
+                       const W::Box rawA, const W::Box rawB, uint32_t nbTests)
+    {
+        W::Box fat[2] = { rawA, rawB };
+        const float cdSum[2] = { cd[0] + cd[1], cd[0] + cd[2] };
+        for (int b = 0; b < 2; ++b)
+            for (int a = 0; a < 3; ++a) { fat[b].lo[a] = fat[b].lo[a] - cdSum[b]; fat[b].hi[a] = fat[b].hi[a] + cdSum[b]; }
+        const uint32_t rigidOf[3] = { 0u, 1u, 0u };
+        std::vector<std::vector<uint32_t>> want(nbTests);
+        uint32_t total = 0u, maxStack = 0u;
+        for (uint32_t c = 0; c < nbTests; ++c)
+        {
+            const W::Box& box = fat[rigidOf[c]];
+            uint32_t ms = 0u;
+            want[c] = W::walkOneWarp(nodes, box, [&](uint32_t p) {
+                return hint[p] != 0u && validTet(p) && W::intersects(tetBox(p), box); }, &ms);
+            total += uint32_t(want[c].size());
+            maxStack = PxMax(maxStack, ms);
+        }
+        PXG_CHECK_MSG(maxStack <= 192u, "[%s] the one-warp walk needs %u stack entries", name, maxStack);
+
+        DevBuf bTree = makeDev(dev, W::buildBlob(nodes, NB));
+        PxgSoftBody sb = makeZeroDesc();
+        sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+        sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+        sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+        sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+        sb.mNumTets = NB;
+        sb.mNumVerts = uint32_t(verts.size());
+        DevBuf bDesc = makeDev(dev, std::vector<PxgSoftBody>{ sb });
+        std::vector<PxgShapeHost> shapes(3);
+        std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+        shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+        shapes[1].type = 3u /* eBOX */;          shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+        shapes[2].type = 1u /* ePLANE */;        shapes[2].particleOrSoftbodyId = 0xFFFFFFFFu;
+        DevBuf bShapes = makeDev(dev, shapes);
+        std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 2u, 0u, 2u, 0u }, { 0u, 1u, 0u, 1u } };
+        DevBuf bCms = makeDev(dev, cms);
+        std::vector<float> boundsArr = { -50.f, -50.f, -50.f, 50.f, 50.f, 50.f };   // the softbody's: never read
+        for (const W::Box* b : { &rawA, &rawB })
+            for (int a = 0; a < 6; ++a) boundsArr.push_back(a < 3 ? b->lo[a] : b->hi[a - 3]);
+        DevBuf bBounds = makeDev(dev, boundsArr);
+        DevBuf bCd = makeDev(dev, std::vector<float>{ cd[0], cd[1], cd[2] });
+        const uint32_t SLACK = 8u;
+        DevBuf bStack = makeDev(dev, std::vector<uint32_t>((total + SLACK) * 4u, POISON));
+        DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+        SbMidphasePush push = {};
+        push.numTests = nbTests; push.toleranceLength = 1.0f;
+        push.cmInputs = bCms.addr; push.bounds = bBounds.addr; push.contactDistance = bCd.addr;
+        push.gpuShapes = bShapes.addr; push.softbodies = bDesc.addr;
+        push.stackSizeBytes = total * 16u; push.stackPtr = bStack.addr; push.midphasePairsNum = bCount.addr;
+        Kernel k("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
+        PXG_CHECK_MSG(k.isValid(), "[%s] the pipeline must build", name);
+        if (!k.isValid()) return;
+        k.dispatch((nbTests + 1u) / 2u, {}, push, 1u, 1u);   // ceil(numTests / MIDPHASE_WARPS_PER_BLOCK)
+        dev->flush();
+
+        const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        const auto g = downloadBuffer<uint32_t>(dev, bStack.h, (total + SLACK) * 4u);
+        PXG_CHECK_MSG(gCount == total, "[%s] the counter says %u pairs, the one-warp walk emits %u", name, gCount, total);
+        size_t mm = 0;
+        std::vector<std::vector<uint32_t>> got(nbTests);
+        for (uint32_t i = 0; i < PxMin(gCount, total); ++i)
+        {
+            if (g[4u * i] >= nbTests || g[4u * i + 2u] != 0u || g[4u * i + 3u] != 0u) { ++mm; continue; }
+            got[g[4u * i]].push_back(g[4u * i + 1u]);
+        }
+        for (uint32_t c = 0; c < nbTests; ++c)
+            if (got[c] != want[c]) { ++mm; std::printf("  [%s] manager %u differs (%zu vs %zu pairs)\n", name, c, got[c].size(), want[c].size()); }
+        if (nbTests <= 2u)
+        {
+            // one group: manager 0's whole stream comes first
+            for (uint32_t i = 0; i < uint32_t(want[0].size()) && i < gCount; ++i)
+                if (g[4u * i] != 0u) { ++mm; break; }
+        }
+        for (uint32_t i = total; i < total + SLACK; ++i)
+            if (g[4u * i] != POISON) ++mm;
+        PXG_CHECK_MSG(mm == 0, "[%s] %zu mismatches against the CUDA's one-warp walk", name, mm);
+        std::printf("    [ note ] %-8s %u managers, %u pairs, one-warp stack peak %u\n", name, nbTests, total, maxStack);
+
+        dev->destroyBuffer(bTree.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bShapes.h);
+        dev->destroyBuffer(bCms.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
+        dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+    };
+
+    const W::Box plane = { { -1e6f, -1e6f, -1e6f }, { 1e6f, 0.5f, 1e6f } };   // y <= 0.5: the bottom layer
+    const W::Box all = { { -1e6f, -1e6f, -1e6f }, { 1e6f, 1e6f, 1e6f } };
+    const W::Box part = { { 4.0f, 2.0f, 3.0f }, { 21.0f, 7.5f, 20.0f } };
+    {
+        const W::TreeShape sh = { 2u, 16u, 4u, 20u, 0u };   // honest boxes: a cooked tree
+        uint32_t used = 0u;
+        auto nodes = W::randomTree(sh, rng, NB, tetBox, &used);
+        PXG_CHECK_MSG(used == NB, "the plane tree placed %u of %u tets", used, NB);
+        runCase("plane", nodes, all, plane, 2u);
+    }
+    {
+        const W::TreeShape sh = { 3u, 1u, 32u, 300u, 40u };
+        uint32_t used = 0u;
+        auto nodes = W::randomTree(sh, rng, NB, tetBox, &used);
+        runCase("random", nodes, part, plane, 2u);
+        runCase("random3", nodes, part, plane, 3u);
+    }
+
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bHints.h);
 }
 
 // ===========================================================================

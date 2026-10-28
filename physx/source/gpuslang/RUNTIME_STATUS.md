@@ -2228,6 +2228,60 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## Deformable-vs-Rigid-Midphase auf 1024 Threads, Radix-Rang-Scan mit einer Barriere, Audit der Engine-Kernel
+
+**Anlass.** Profil des Nutzers (RX 9070 XT, SnippetDeformableSurface, `PXG_KERNEL_TIMES=1`):
+`cloth_midphaseGeneratePairsLaunch` 7–13 % bei ~1 Launch/Step, also 2–4 ms für einen einzigen Launch.
+
+**Ursache (Port und CUDA gleich).** Ein Warp pro Contact-Manager poppt den BV32-Baum Knoten für Knoten: eine
+serielle, abhängige Iteration pro erreichtem Knoten UND Blatt (Blattwort → Dreiecksindizes → Vertices →
+atomicAdd → nächster Pop). Der Snippet-Baum hat 1 057 Knoten / 3 969 Blätter (~20 Dreiecke je Blatt); die Kugel
+erreicht ~1 000–2 500 davon. Der Port lief dazu in EINER 32er-Gruppe mit per Groupshared emuliertem Ballot
+(3 Barrieren pro Knoten). Der Softbody-Zwilling `sb_midphaseGeneratePairsLaunch` hat dieselbe Struktur und läuft
+bei einem Softbody auf der Bodenebene über ALLE Oberflächenblätter (DeformableVolume-Snippets).
+
+**Fix** (`pxgSlangBv32Batched.slang`, neues Modul, von beiden Kerneln benutzt; Herleitung im Modulkopf): die ganze
+1024er-Gruppe läuft pro Contact-Manager. Runde = DRAIN (führende Blätter des Stacks in Pop-Reihenfolge in einen
+Batch) + EXPAND (die obersten ≤32 Einträge gleichzeitig, je ein 32-Lane-Slot, Lane k testet Kind k wie CUDA-Lane
+k, Expansionen in Push-Reihenfolge an Ort und Stelle). FLUSH: 32 Blätter pro Pass mit der CUDA-Lane-Abbildung
+(koaleszierte Lesezugriffe), Zählscan, EIN atomicAdd pro Batch, Scatter in Lane-Reihenfolge. Beide Operationen
+lassen `emittiert ++ Seq(Stack)` invariant → gleiche Paare, gleiche Slots, gleicher Zähler (inkl. Overshoot bei
+vollem Stack) wie der One-Warp-Walk, pro Contact-Manager. Stack 2048 statt 192; Fenster >1 nur solange danach
+≤ 2048−192 belegt sind, sonst W=1 (CUDA-Schritt). Host unverändert (gleiches Grid). Kritischer Pfad im Snippet:
+~1 000–2 500 serielle Pops → ~10–20 Expand-Runden + 1–2 Flushes à ≤32 Pässe.
+Zwei llvmpipe-Fallen dabei gefunden und im Code dokumentiert: (1) auch GROUPSHARED-Lesezugriffe unter
+Per-Lane-Guard werden spekulativ ausgeführt (Index `nbStack-1-tid` lief über → SIGSEGV), Indizes jetzt geklemmt;
+(2) nach dem uniformen `break` der Sub-Warp-Schleife läuft der Rest der Iteration mit leerer Maske weiter und lädt
+`cmInputs[numWorkItems]` → Shape-Index aus Müll; Ladeindex jetzt `min(cmIdx, numWorkItems-1)` (das alte
+32er-Layout hatte dieselbe Lücke, wurde nur nie getroffen).
+
+**Tests.** `femClothSimTriMidphaseOrder` / `softBodySimMidphaseOrder` + Orakel `tests/pxgBv32WalkModel.h`
+(der One-Warp-Walk auf dem Host): Slot-für-Slot-Vergleich auf einem 32 000-Dreieck-Sheet (viele volle
+Flushes), Zufallsbäumen mit lügenden Knoten, Blatt mit 6-Bit-Zähler >32, abgeschnittenem Stack, 3 Managern über 2
+Gruppen (Teilfolgen geordnet), und einem DAG mit 98 304 Blattbesuchen, der den Stack über die Reserve treibt. Die
+ALTEN Kernel (HEAD) bestehen beide Tests ebenfalls (Orakel validiert). Mutanten (Platzierungsreihenfolge,
+Kind-Rang, ohne Reserve, ohne 32-Klemme, Scatter-Reihenfolge, Surface-Hint) sterben; zwei äquivalente Mutanten
+überleben erwartungsgemäß. `snippetsurface`-Hash ist schon auf HEAD von Lauf zu Lauf verschieden (zwei
+Baseline-Läufe: 3f4f07b1…, 0c836a07…) und taugt daher nicht als Bitvergleich.
+
+**Radix-Rang-Kernel.** `warp32InclusiveScan` (Hillis-Steele, 11 Workgroup-Barrieren) lief viermal pro
+4096-Key-Iteration in `radixSortMultiCalculateRanks*` (radixSortDesc, radixSort, thresholdStreamBda) — die CUDA
+nutzt dort Shuffles ohne Barriere. Neu `warp32InclusiveScanOneBarrier` (pxgSlangScan): schreiben, eine Barriere,
+32 unbedingte Broadcast-Lesezugriffe; Ganzzahlsumme → bitgleich; Aufrufervertrag (Barriere vor dem nächsten
+Schreiben) im Modul dokumentiert und an allen fünf Stellen durch die Gruppen-Schlussbarriere erfüllt.
+llvmpipe, Szene `box`: Rang-Kernel 44 → 17 ms/Launch, GPU-Zeit gesamt 38,2 → 18,3 s. Auf echter Hardware
+kleiner zu erwarten (Barrieren sind dort billiger), aber die Kernel laufen in jeder Szene 8–24× pro Step.
+
+**Audit der übrigen Engine-Kernel** (Startgrid/Blockgröße Port vs. CUDA aus den Host-Launches, plus
+`PXG_KERNEL_TIMES=2`-Profile von softbody, softbodyattach, sdfmesh, particlefluid, box, articulation,
+clothdrape): offen, nicht umgesetzt —
+`trimeshPlaneNarrowphase` (SnippetSDF; Thread 0 serialisiert den 1024er-Block inkl. großer privater Arrays, nur
+bei Manifold-Invalidierung, meist Cache-Pfad: Median 0,13 ms auf llvmpipe; Vorschlag: Stufe 1 auf 32 Warps,
+contactReduce6 pro Warp-Lane-0); `sb_primitiveContactGenLaunch` GJK auf einer Lane statt warp-kooperativ
+(DeformableVolumeAttachment/Kinematic, Boxen); 2-Warp-Blöcke seriell auf 32 Threads (diverse Mesh/HF-Midphases,
+Faktor 2, breites Grid → gering); `update/mergeChangedAABBMgrHandlesLaunch` 32 statt 256 Threads bei festem Grid
+(gering). `triangleTriangleCollision` (SnippetSDF) hat dieselbe Launch-Form wie die CUDA.
+
 ## Cloth- und Softbody-Refit über viele Workgroups (Last-Arriver)
 
 **Anlass.** Nach dem 32-Warp-Refit lief SnippetDeformableSurface auf der RX 9070 XT mit 30 statt 10 fps; laut

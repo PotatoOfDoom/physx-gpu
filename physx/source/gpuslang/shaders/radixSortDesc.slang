@@ -251,7 +251,9 @@ void radixSortMultiCalculateRanksLaunchWithCount(uint3 groupThreadId : SV_GroupT
                     accum += 1u << (rel << 3);
             }
 
-            const uint inclusive = warp32InclusiveScan(tid, accum);
+            // ONE barrier, not eleven (pxgSlangScan): the barrier that closes this
+            // digit group below is the one its caller contract asks for.
+            const uint inclusive = warp32InclusiveScanOneBarrier(tid, accum);
 
             if ((tid & 31u) == 31u)
             {
@@ -460,7 +462,9 @@ void radixSortMultiCalculateRanksLaunchWithoutCount(uint3 groupThreadId : SV_Gro
                     accum += 1u << (rel << 3);
             }
 
-            const uint inclusive = warp32InclusiveScan(tid, accum);
+            // ONE barrier, not eleven (pxgSlangScan): the barrier that closes this
+            // digit group below is the one its caller contract asks for.
+            const uint inclusive = warp32InclusiveScanOneBarrier(tid, accum);
 
             if ((tid & 31u) == 31u)
             {
@@ -674,7 +678,9 @@ void radixSortMultiCalculateRanksLaunch(uint3 groupThreadId : SV_GroupThreadID,
                     accum += 1u << (rel << 3);
             }
 
-            const uint inclusive = warp32InclusiveScan(tid, accum);
+            // ONE barrier, not eleven (pxgSlangScan): the barrier that closes this
+            // digit group below is the one its caller contract asks for.
+            const uint inclusive = warp32InclusiveScanOneBarrier(tid, accum);
 
             if ((tid & 31u) == 31u)
             {

@@ -90,6 +90,46 @@ public uint warp32InclusiveScan(uint tid, uint value)
     return gsScanTemp[tid];
 }
 
+// The same inclusive 32-lane segment scan with ONE barrier instead of eleven.
+//
+// warp32InclusiveScan above is a Hillis-Steele scan: five rounds of read, barrier,
+// add, barrier, every one a WORKGROUP barrier because Vulkan gives a 32-lane segment
+// no lockstep.  In the radix-sort rank kernels (radixSortDesc, radixSort,
+// thresholdStreamBda) it runs four times per 4096-key iteration of a 1024-thread
+// group, i.e. 44 full-group barriers per iteration where the CUDA's __shfl_up_sync
+// scan needs none -- and those kernels are the most launched and, under
+// PXG_KERNEL_TIMES, the most expensive ones in every rigid, cloth, softbody and
+// particle scene.  Here every thread publishes its value, one barrier, and then sums
+// its own segment up to itself: 32 reads per thread, all in range, unconditional
+// (no masked groupshared read for llvmpipe to speculate), and every lane of a
+// segment reads the same word at the same step, which the hardware broadcasts.
+// Integer addition, so the result is the same bits as warp32InclusiveScan for any
+// input, packed multi-counter words included.
+//
+// CALLER CONTRACT (the price of the eleven barriers saved): this function returns
+// while other threads may still be READING gsScanTemp, so the caller must pass a
+// workgroup barrier before anything writes gsScanTemp again -- including the next
+// call of any scan in this module.  warp32ScanTotal is not valid after it (use the
+// returned value of lane 31 instead).  All threads must call it (uniform control).
+public uint warp32InclusiveScanOneBarrier(uint tid, uint value)
+{
+    const uint lane = tid & 31u;
+    const uint segment = tid & ~31u;
+
+    gsScanTemp[tid] = value;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint sum = 0u;
+    [ForceUnroll]
+    for (uint j = 0u; j < 32u; ++j)
+    {
+        const uint v = gsScanTemp[segment + j];
+        if (j <= lane)
+            sum += v;
+    }
+    return sum;
+}
+
 // Reads the inclusive-scan total of the 32-lane segment containing `tid`.
 // Only valid immediately after warp32InclusiveScan (before gsScanTemp is
 // overwritten by another scan).
