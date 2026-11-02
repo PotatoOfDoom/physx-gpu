@@ -80,11 +80,16 @@
 //
 // with `l = ceil(numPairs / 32) * 32` — rounded UP to a warp multiple so every lane of every
 // partially-filled warp still reaches the ballot.  The bridge drops blockDim, so a
-// [numthreads(32,1,1)] group is ONE warp and the block's FOUR warps are walked serially in a
-// group-uniform `sub` loop.  The loop is driven on the warp BASE rather than on the per-lane
-// index: `base` and the stride are both multiples of 32 and `l` is too, so `base + lane < l`
-// is the same for every lane and the ballot's barriers stay uniform.  Deriving the stride from
-// the group count instead of the CUDA 262144 would double-visit or skip pairs.
+// [numthreads(32,1,1)] group is ONE warp; the block's FOUR warps used to be walked serially in
+// a group-uniform `sub` loop.  The launch site now (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp, 2048 * 4 groups, so group g is CUDA
+// warp g -- threads g * 32 + lane, the CUDA's `threadIdx.x + blockIdx.x * blockDim.x` with
+// warp g = blockIdx.x * 4 + threadIdx.x / 32 -- and the stride is the thread count actually
+// launched, WorkgroupCount().x * 32 (the CUDA 262144 at that grid; at any other grid still
+// every pair exactly once, as the start is below the stride).  The loop is driven on the warp
+// BASE rather than on the per-lane index: `base` and the stride are both multiples of 32 and
+// `l` is too, so `base + lane < l` is the same for every lane and the ballot's barriers stay
+// uniform.  A block-scaled start with a group-count stride would double-visit pairs.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted contact SET and the atomic
 // total): globalScanExclusiveSingleWarp -> a groupshared InterlockedOr ballot plus
@@ -111,7 +116,6 @@ static const uint64_t BV32_STRIDE = 1168UL;
 
 // The engine's launch shape (PxgNarrowphaseCore.cpp:6694).
 static const uint CLOTH_CG_WARPS_PER_BLOCK = 4u;    // blockDim.x 128 / WARP_SIZE 32
-static const uint CLOTH_CG_STRIDE = 2048u * 128u;   // gridDim.x * blockDim.x
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the 5.12 CUDA pack:
@@ -227,14 +231,14 @@ void cloth_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
     Ptr<float> restDistance = Ptr<float>(gCg.restDistance);
     Ptr<PxgShape> shapes = Ptr<PxgShape>(gCg.gpuShapes);
 
-    // The block's four warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < CLOTH_CG_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): the warp's first thread is
+    // gid.x * 32 and the stride the launched thread count, gridDim.x * blockDim.x.
     {
-    const uint warpBase = gid.x * (CLOTH_CG_WARPS_PER_BLOCK * 32u) + sub * 32u;
+    const uint warpBase = gid.x * 32u;
 
     // `base`, the stride and `l` are all multiples of 32, so this condition is the same for
     // every lane and the ballot's barriers below stay group-uniform.
-    for (uint base = warpBase; base < l; base += CLOTH_CG_STRIDE)
+    for (uint base = warpBase; base < l; base += WorkgroupCount().x * 32u)
     {
         const uint i = base + lane;
 

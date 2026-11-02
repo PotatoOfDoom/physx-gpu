@@ -106,7 +106,14 @@ import pxgSlangCvxCoreShape;    // ShapeRef / supportLocalQ / contactFaceQ
 #include "pxgSlangCvxCoreOut.slang"    // the shared writeOutput tail + its constants
 
 // The group size, named once so the stride below cannot drift from the
-// [numthreads] that produced it.
+// [numthreads] that produced it.  The launch site (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT) launches 512 / CVXCORE_CVX_BLOCK groups per CUDA block, so
+// the flat thread index is the CUDA's and each thread takes the test of its CUDA
+// thread; the threads never cooperate (one test each, no shared memory).  Before,
+// the group ran two of the block's 16 warps and the other fourteen as further
+// passes of the loop.  Widening the group to the block (512) instead was tried and
+// dropped: GJK/EPA keep ~3 KB of private arrays per thread, and on llvmpipe the
+// first launch of the 512-wide group took 29 s against 0.1 s at 64 (convexcoremesh).
 static const uint CVXCORE_CVX_BLOCK = 64u;
 
 // P9.57: FROM THE ENGINE ENUM's numbering, never a remembered literal.

@@ -452,7 +452,6 @@ PXG_TEST(cvxHfPostProcess)
 
     PxgBufferHandle bShapes = createBufferFrom(dev, shapeBuf);
     PxgBufferHandle bPairs = createBufferFrom(dev, pairBuf);
-    PxgBufferHandle bNI = createBufferFrom(dev, niBuf);
     PxgBufferHandle bOrdered = createBufferFrom(dev, ordered);
     PxgBufferHandle bStack = createBufferFrom(dev, stackBuf);
     PxgBufferHandle bSecond = createBufferFrom(dev, secondPass);
@@ -461,18 +460,16 @@ PXG_TEST(cvxHfPostProcess)
     PxgBufferHandle bNb = createBufferFrom(dev, nbBuf);
 
     // The double-indirect arguments: each is a buffer holding ONE device address.
-    std::vector<uint64_t> pNI(1, dev->getBufferDeviceAddress(bNI));
+    // (The NI one is made per run below: the kernel clears NI words in place.)
     std::vector<uint64_t> pOrdered(1, dev->getBufferDeviceAddress(bOrdered));
     std::vector<uint64_t> pSecond(1, dev->getBufferDeviceAddress(bSecond));
     std::vector<uint64_t> pInterm(1, 0ull);   // read by the core's dead variant only
-    PxgBufferHandle bPNI = createBufferFrom(dev, pNI);
     PxgBufferHandle bPOrdered = createBufferFrom(dev, pOrdered);
     PxgBufferHandle bPSecond = createBufferFrom(dev, pSecond);
     PxgBufferHandle bPInterm = createBufferFrom(dev, pInterm);
 
     PpPush push{};
     push.cvxTrimeshPair = dev->getBufferDeviceAddress(bPairs);
-    push.cvxTriNIPtr = dev->getBufferDeviceAddress(bPNI);
     push.cvxTriIntermPtr = dev->getBufferDeviceAddress(bPInterm);
     push.orderedCvxTriIntermPtr = dev->getBufferDeviceAddress(bPOrdered);
     push.cvxTriSecondPassPairsPtr = dev->getBufferDeviceAddress(bPSecond);
@@ -480,17 +477,28 @@ PXG_TEST(cvxHfPostProcess)
     push.nbSecondPassPairs = dev->getBufferDeviceAddress(bNb);
     push.shapes = dev->getBufferDeviceAddress(bShapes);
 
+    // One thread per queue entry, and then ONE group: its 64 threads each take a no-op
+    // first (no contacts -> the CUDA core's `return`, an iteration's end) and a real case
+    // on the next trip of the grid-stride loop.  A port that ends the thread there instead
+    // of the iteration (`return` in the loop body) loses every real case at one group.
     const uint32_t groups = (uint32_t(secondPass.size()) + 63u) / 64u;
+    size_t bad = 0, strayBad = 0;
+    uint32_t sawClear = 0, sawKeep = 0, sawBoundaryClear = 0, sawShared = 0, sawWrongHanded = 0;
+    for (uint32_t gx : { groups, 1u })
+    {
+    PxgBufferHandle bNI = createBufferFrom(dev, niBuf);
+    std::vector<uint64_t> pNI(1, dev->getBufferDeviceAddress(bNI));
+    PxgBufferHandle bPNI = createBufferFrom(dev, pNI);
+    PpPush q = push;
+    q.cvxTriNIPtr = dev->getBufferDeviceAddress(bPNI);
     {
         Kernel k("convexHfPostProcessBda.spv", "convexHeightfieldPostProcess", {}, sizeof(PpPush));
-        k.dispatch(groups, {}, push, 1u, 1u);
+        k.dispatch(gx, {}, q, 1u, 1u);
         dev->flush();
     }
 
     const auto got = downloadBuffer<uint32_t>(dev, bNI, niBuf.size());
 
-    size_t bad = 0;
-    uint32_t sawClear = 0, sawKeep = 0, sawBoundaryClear = 0, sawShared = 0, sawWrongHanded = 0;
     for (uint32_t i = 0; i < nbCases; ++i)
     {
         const Case& c = cases[i];
@@ -500,44 +508,48 @@ PXG_TEST(cvxHfPostProcess)
         const uint32_t exp = c.expectClear ? (was & 0x00FFFFFFu) : was;
         const uint32_t g = got[slot * 4 + 3];
 
-        c.expectClear ? ++sawClear : ++sawKeep;
-        if (c.shapeID == 1u) ++sawWrongHanded;
-        if ((c.triangleIdx >> 1) == 7u) ++sawShared;
+        if (gx == groups)
+        {
+            c.expectClear ? ++sawClear : ++sawKeep;
+            if (c.shapeID == 1u) ++sawWrongHanded;
+            if ((c.triangleIdx >> 1) == 7u) ++sawShared;
+        }
 
         if (g != exp)
         {
             ++bad;
-            std::printf("  [%s] index word: got=%08x exp=%08x was=%08x\n    (%s)\n",
-                        c.name, g, exp, was, c.why);
+            std::printf("  [%s, %u group(s)] index word: got=%08x exp=%08x was=%08x\n    (%s)\n",
+                        c.name, gx, g, exp, was, c.why);
         }
         for (uint32_t k = 0; k < 3; ++k)
             if (got[slot * 4 + k] != niBuf[slot * 4 + k])
             {
                 ++bad;
-                std::printf("  [%s] normal word %u moved: got=%08x was=%08x\n",
-                            c.name, k, got[slot * 4 + k], niBuf[slot * 4 + k]);
+                std::printf("  [%s, %u group(s)] normal word %u moved: got=%08x was=%08x\n",
+                            c.name, gx, k, got[slot * 4 + k], niBuf[slot * 4 + k]);
             }
     }
-    for (const Case& c : cases)
-        if (c.expectClear && c.boundaryAdj) ++sawBoundaryClear;
 
     // Every NI slot no case owns must be untouched -- including the one the 64
     // no-op entries point at.
     std::vector<bool> owned(NI_SLOTS, false);
     for (const Case& c : cases)
         owned[cmOf(c.cm).startIndex + c.testOffset] = true;
-    size_t strayBad = 0;
     for (uint32_t s = 0; s < NI_SLOTS; ++s)
     {
         if (owned[s]) continue;
         for (uint32_t k = 0; k < 4; ++k)
             if (got[s * 4 + k] != niBuf[s * 4 + k]) ++strayBad;
     }
+    dev->destroyBuffer(bNI); dev->destroyBuffer(bPNI);
+    }
+    for (const Case& c : cases)
+        if (c.expectClear && c.boundaryAdj) ++sawBoundaryClear;
 
     dev->destroyBuffer(bHf); dev->destroyBuffer(bShapes); dev->destroyBuffer(bPairs);
-    dev->destroyBuffer(bNI); dev->destroyBuffer(bOrdered); dev->destroyBuffer(bStack);
+    dev->destroyBuffer(bOrdered); dev->destroyBuffer(bStack);
     dev->destroyBuffer(bSecond); dev->destroyBuffer(bNb);
-    dev->destroyBuffer(bPNI); dev->destroyBuffer(bPOrdered); dev->destroyBuffer(bPSecond);
+    dev->destroyBuffer(bPOrdered); dev->destroyBuffer(bPSecond);
     dev->destroyBuffer(bPInterm);
 
     PXG_CHECK_MSG(bad == 0, "cvxHfPostProcess: %zu mismatches", bad);

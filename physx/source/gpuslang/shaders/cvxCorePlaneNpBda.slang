@@ -139,7 +139,15 @@ import pxgSlangCvxCoreShape;    // P9.67b: ShapeRef / supportLocalQ / contactFac
 // The group size, named once so the stride below cannot drift from the
 // [numthreads] that produced it.  Its VALUE is this port's choice; what makes
 // the kernel correct is the stride derived from it, not agreement with the
-// engine's 1024 (see the header).
+// engine's 1024 (see the header).  The launch site (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT) launches 1024 / CVXCORE_PLANE_BLOCK groups per CUDA block,
+// so the flat thread index is the CUDA's and each thread takes the test of its
+// CUDA thread; the threads never cooperate (one test each, the output tail on the
+// owning thread, no shared memory).  Before, the group ran two of the block's 32
+// warps and the other thirty as further passes of the loop.  Widening the group
+// to the block instead was tried and dropped: every thread carries the
+// support/clip state in private arrays, and on llvmpipe the first launch of the
+// 512-wide convex-vs-convex sibling took 29 s against 0.1 s at 64.
 static const uint CVXCORE_PLANE_BLOCK = 64u;
 // P9.57: FROM THE ENGINE ENUM's numbering, never a remembered literal.
 // tools/check_geom_type_constants.py reads PxGeometry.h and checks these.
@@ -333,9 +341,9 @@ void convexCorePlaneOneTest(uint testIndex)
                        nbContacts, orefs);
 }
 
-// The engine's block is 1024 and this group is CVXCORE_PLANE_BLOCK, so the loop
-// runs 1024/BLOCK times per test batch; at the sizes the scenes reach it runs
-// once and costs a compare.  `threadIndex / 1; // 1 tread per test` (:470-471) --
+// The engine's block is 1024 and the port launches 1024 / CVXCORE_PLANE_BLOCK
+// groups per block, so at that grid the loop makes exactly one pass; it stays for
+// any other grid.  `threadIndex / 1; // 1 tread per test` (:470-471) --
 // upstream's typo kept -- is why the index is the flat thread id and not a warp.
 [shader("compute")]
 [numthreads(CVXCORE_PLANE_BLOCK, 1, 1)]

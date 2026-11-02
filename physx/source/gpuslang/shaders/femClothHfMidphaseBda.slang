@@ -130,8 +130,9 @@
 //
 // ---------------------------------------------------------------------------
 // WARP EMULATION: the bridge forwards gridDim and drops blockDim, so a
-// [numthreads(32,1,1)] group is ONE warp and the block's two warps are walked
-// serially in a group-uniform `sub` loop.  The warp scan becomes a groupshared
+// [numthreads(32,1,1)] group is ONE warp; the block's two warps used to be walked
+// serially in a group-uniform `sub` loop and are now one group each (the launch
+// site, PXG_NO_CUDA_TOOLKIT; see the kernel).  The warp scan becomes a groupshared
 // prefix sum and the lane-0 broadcast a groupshared slot.  Both loops are over
 // group-uniform quantities (nbIterationsPerWarps, nbIter), so nothing here puts
 // a barrier in divergent control flow.

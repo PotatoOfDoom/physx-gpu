@@ -2228,6 +2228,313 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## Eine Workgroup pro CUDA-Warp in den übrigen Mehr-Warp-Kerneln: Deformable-Midphases und Contact-Gen, Konvex/Kugel-Mesh/HF-Kette, Convex-Core, Aggregate
+
+**Anlass.** Abschnitt 3 des folgenden Eintrags („Trimesh-Plane auf 1024 Threads …") ließ dasselbe Muster außerhalb
+der Mesh/HF-Midphases offen („Folgekandidaten"); das Audit der Host-Launches fand dazu die Aggregat-Kernel des
+AABB-Managers, die Kugel-Mesh/HF-Kerne und die Convex-Core-Kernel. Alle 36 Kernel (`cand_re.txt` in den Logs) haben
+CUDA-Blöcke aus mehreren Warps; die Bridge verwirft blockDim, also liefen die Warps eines Blocks bisher nacheinander
+in einer 32er-Gruppe (Convex-Core-Plane/Convex: 2 von 32 bzw. 16 Warps parallel in einer 64er-Gruppe).
+
+**Muster** (wie im folgenden Eintrag). Host: Grid `numBlocks · Warps pro Block`, blockDim 32×1, Argumente unverändert,
+unter `#ifdef PXG_NO_CUDA_TOOLKIT` (45 neue Launch-Stellen: PxgNarrowphaseCore.cpp 35, PxgAABBManager.cpp 7,
+PxgFEMClothCore.cpp 2, PxgSoftBodyCore.cpp 1). Wo das Grid mit der Arbeit wächst, ist es auf 65 535 gedeckelt
+(Vulkans garantiertes `maxComputeWorkGroupCount[0]`, die Bridge verweigert mehr; nachgezogen auch an den vier
+Rigid-Midphase-Stellen des folgenden Eintrags und, im zweiten Review, als reine Deckel unter eigenem
+`#ifdef PXG_NO_CUDA_TOOLKIT` an den vier Post-Process-Launches der Kugel/Konvex-Mesh/HF-Kette, siehe 5), die
+Schleife im Shader deckt den Rest. Shader: Warp-Index = Gruppenindex, Stride = `WorkgroupCount().x`
+(Thread-pro-Paar-Kernel: `·32` bzw. `·256`); wo die CUDA keinen
+Grid-Stride hat (ein Warp pro Element, Tail per `if (idx >= n)`), eine Gruppen-Stride-Schleife mit P9.22-Klemme des
+Ladeindex – eine Runde beim Port-Grid, vollständig bei jedem kleineren, auch beim CUDA-Grid. **Bitgleich pro Warp:**
+jeder Warp bearbeitet beim Port-Grid genau die Elemente seines CUDA-Warps mit unverändertem Code; neu ist nur, dass
+die Warps eines Blocks parallel um die globalen Zähler konkurrieren, wie in der CUDA.
+
+**Unabhängigkeit der Warps, je Kernel gegen die 5.12-CUDA geprüft** (Kernelkörper und alle aufgerufenen Helfer
+transitiv nach `__syncthreads`, `__shared__`, `threadIdx.y`, Block-Reduktionen): überall nur Warp-Primitive und
+Shared-Slots `[threadIdx.y]` bzw. `[WarpsPerBlock]` (bv32TreeTraversal `shNode[warpId]`, radixSortSingleWarp
+`radixExclusiveRunsum[threadIdx.y]`, Midphase-Scratch `scratchMem[threadIdx.y]`, Convex-Core `blockShared[warp]`).
+Wo die CUDA `__syncthreads` hat, ordnet es nur Lane 0s Schreiben in den EIGENEN Warp-Scratch (Deformable-Midphases,
+Cloth-Selbst-/Fremdkollision) oder einen Broadcast identischer Werte: die PS-Midphases kopiert jeder Warp die ganze
+`PxgParticleSystem` selbst in den blockweiten Puffer (`warpCopy`), die Mesh/HF-Cores lädt Thread (0,0) sieben
+Zeiger, die jede Gruppe des Ports selbst berechnet (`maCompute`). Kein Warp liest, was nur ein anderer schreibt;
+eine Verbreiterung auf die volle Blockform war deshalb nirgends nötig.
+
+**1. Deformable-Midphases mit Warp-Stride (2D/3D-Grid).** `sb_sbMidphaseGeneratePairsLaunch` (CUDA
+(1024, numTests, 2)×(32, 2)), `sb_selfCollisionMidphaseGeneratePairsLaunch` ((1024, nbActive)×(32, 2),
+PxgSoftBodyCore.cpp), `sb_clothMidphaseGeneratePairsLaunch` (upstream-tot), `sb_clothVertMidphaseGeneratePairsLaunch`,
+`sb_psMidphaseGeneratePairsLaunch`, `cloth_psMidphaseGeneratePairsLaunch` (je (1024, numTests)×(32, 2)); Stride über
+Vertices/Tets/Partikel blockDim.y·gridDim.x = 2 048. **Zwei Gruppen:** x = 2 048, `globalWarpIdx = gid.x`, Stride
+`WorkgroupCount().x` statt der Konstante 2 048 (beim Port-Grid genau die CUDA-Partition: Warp w nimmt w, w+2 048, …;
+die Kombination Block-Start `gid.x·2+sub` mit Gruppen-Stride würde doppelt besuchen, im Header dokumentiert).
+Shader `softBody{SoftBody,Self,Cloth,ClothVert,Ps}MidphaseBda`, `femClothPsMidphaseBda`.
+
+**2. Cloth-Selbst- und Fremdkollision VT/EE** (`femClothSelfCollisionBda`, `femClothDifferentClothBda`,
+PxgFEMClothCore.cpp). CUDA (ceil(N/2), nbActive bzw. numTests)×(32, 2), ein Warp pro Abfrage ohne Stride.
+**Zwei Gruppen**, `min(numBlocks·2, 65 535)` (der Deckel greift bei Selbst-VT ab 64 K Vertices, bei Fremd-VT ab
+32 K Vertices des größeren Cloths – eine Gruppe pro Vertex beider Cloths –, bei EE ab 64 K Dreiecken mit eigenen
+Kanten; PxgFEMClothCore.cpp), Gruppen-Stride-Schleife; der CUDA-`return` eines gefilterten Vertex bleibt ein
+`continue` der Schleife (gruppenuniform; seit dem zweiten Review durch Filter-Läufe der VT-Fixtures belegt).
+
+**3. Deformable-Contact-Gen.** `sb_meshContactGenLaunch`, `sb_heightfieldContactGenLaunch`,
+`sb_clothContactGenLaunch` (upstream-tot): CUDA 1 024×(32, 2), Warp-Stride 2 048, EPA-/TetCollide-Scratch je Warp,
+im Port rechnet Lane 0 die Abfrage → **zwei Gruppen**, 2 048, Stride Gruppenzahl. `cloth_meshContactGenLaunch`,
+`cloth_heightfieldContactGenLaunch`: CUDA 2 048×128 (4 Warps), ein Thread pro Paar, Ballot/Scan nur im Warp →
+**vier Gruppen pro Block**, 8 192, Thread `gid.x·32 + lane`, Stride `WorkgroupCount().x·32` (= 262 144).
+`sb_clothVertContactGenLaunch`: CUDA 512×256, ein Thread pro Paar ohne jede Kooperation → hier **die Gruppe auf
+die CUDA-Form verbreitert**, `[numthreads(256)]`, Host unverändert, Stride `WorkgroupCount().x·256` (vorher 32
+Threads mit Stride-Konstante 512·32: korrekt, nur 8× schmaler).
+
+**4. Rigid-vs-Deformable-Midphase (1024er-Batch-Walk).** `cloth_midphaseGeneratePairsLaunch` (Kugel/Box/Konvex
+gegen Cloth und CLOTH_MIDPHASE_PRIMITIVES der Convex-Core-Cloth-Kette, 4 Stellen), `sb_midphaseGeneratePairsLaunch`:
+CUDA ceil(numTests/2)×(32, 2), ein Warp pro Contact-Manager; der Port läuft seit 7d06ef1 jeden Manager mit der
+ganzen 1024er-Gruppe und nahm bisher beide Manager eines Blocks nacheinander. Jetzt **eine 1024er-Gruppe pro
+Manager**, `min(numBlocks·2, 65 535)`, Gruppen-Stride-Schleife (beim CUDA-Grid zwei Manager eine Grid-Breite
+auseinander). Die Slot-Reihenfolge je Manager bleibt die des One-Warp-Walks (`…MidphaseOrder` prüfen es bei beiden
+Grids).
+
+**5. Konvex/Kugel-Mesh/HF-Kette.** `convexTrimeshNarrowphase` (CUDA max(2 048, 16·numTests)×(32, 2)) und
+`convexHeightfieldNarrowphase` (16·numTests×(32, 2)), CUDA-Grid-Stride über die Midphase-Paare → **zwei Gruppen**,
+Stride Gruppenzahl (4 096 statt 2 048 Gruppen in kleinen Szenen). `sortTriangleIndices`, `convexTrimeshCorrelate`
+(je 4 Stellen – Kugel-Mesh, Kugel-HF, Konvex-Mesh, Konvex-HF –, (32, 2)) und `convexTrimeshFinishContacts`
+(dieselben 4 Stellen, 64×1, Paar = Thread/32) ohne CUDA-Stride → zwei Gruppen + Gruppen-Stride-Schleife.
+`convexTrimeshPostProcess`/`convexHeightfieldPostProcess` (dieselben 4 Ketten, ceil(8·numTests/2) Blöcke à 64,
+Konvex-Mesh mindestens 8 192) behalten Grid und Block; ihr Grid wuchs aber ungedeckelt mit numTests und überschritt
+ab 16 384 Managern 65 535 – die Bridge verweigerte den Launch, verzögerte Paare blieben unaufgelöst (vorbestehend,
+zweiter Review). Jetzt wie alle anderen `PxMin(numBlocks, 65 535)` unter `#ifdef PXG_NO_CUDA_TOOLKIT`, den Rest
+deckt der vorhandene CUDA-Grid-Stride `ppStride = WorkgroupCount().x·64` – erst seit der Nachprüfung wirklich: der
+Port-Rumpf beendete bei einem Zweitpass-Paar ohne Kontakte den ganzen Thread (`return`), in der CUDA verlässt dieses
+`return` nur `convex{Trimesh,Heightfield}PostProcessCore`, also eine Iteration. Jetzt `continue` in
+`cvxTriPostProcessBda`/`convexHfPostProcessBda` (vorbestehend seit P9.59; sichtbar, sobald die Zweitpass-Queue mehr
+Einträge hat als das Grid Threads – 256 je Manager, Konvex-Mesh mindestens 524 288 –, oder beim Deckel).
+`sphereTrimeshNarrowphase`, `sphereHeightfieldNarrowphase`
+(ceil(numTests/64)×64, ein Thread pro Paar, Shared nur je Thread `[threadIdx.x*2]`, Ballot/Scan je Warp): **nur
+Host**, zwei Gruppen pro Block; der Shader nummerierte schon `gid.x·32 + lane` mit Stride `WorkgroupCount().x·32`,
+das ist jetzt die CUDA-Nummerierung. **llvmpipe-Falle (P9.49) in den zwei Cores:** auch eine leere
+barrier-tragende Schleife läuft dort einmal mit leerer Maske (auf dem geklemmten echten Paar); bei 4 096 Gruppen für
+eine Handvoll Paare stieg der Median in `meshfloor` von 0,92 auf 16,5 ms. Daher `if (gid.x >= nbPairs) return;`
+nach dem Block-0-Teil (Zeiger-Export, InterlockedMax in den Pinned-Speicher) und vor der ersten Barriere,
+gruppenuniform.
+
+**6. Convex-Core.** `convexCoreTrimeshNphase_Kernel32`, `convexCoreTetmeshNphase_Kernel32`: CUDA
+ceil(numTests/4)×(32, 4), `_Shared` je Warp, nur `__syncwarp` → **vier Gruppen pro Block**, `min(·4, 65 535)`,
+Gruppen-Stride-Schleife. `convexCorePlaneNphase_Kernel` (ceil(n/1024)×1024) und `convexCoreConvexNphase_Kernel`
+(ceil(n/512)×512): ein Thread pro Test, keine Kooperation; die 64er-Gruppe bleibt, **nur Host**: 16 bzw. 8 Gruppen
+pro Block, flacher Thread-Index = CUDA. Verbreitern auf den Block wurde versucht und verworfen: ~3 KB private Arrays
+je Thread, der erste Launch der 512er-Gruppe dauerte auf llvmpipe 29 s statt 0,1 s (`convexcoremesh`).
+
+**7. Aggregate** (`aggregateBda.slang`, PxgAABBManager.cpp, `_launch`/void**-Form, ABI-Zeilen unverändert).
+`updateDirtyAggregate`/`clearDirtyAggregates` (ceil(nDirty/16)×(32, 16)), `markAggregateBoundsUpdatedBitmap`
+(ceil(slots/8)×(32, 8)), `updateAggregateBounds` (ceil(slots/16)×(32, 16)), `sortAndUpdateAggregateProjections`
+(ceil(slots/2)×(32, 2)), `doSelfCollision` (ceil(slots/16)×(32, 16)), `doAggPairCollisions` (8 192×(32, 2),
+Grid-Stride): nur Warp-Primitive und Slots je Warp; die Bitmap-Atomics (Or auf das Aggregat-Bit, And auf die
+Shape-Bits) treffen disjunkte Bits. → **eine Gruppe pro Warp**, Gruppen-Stride-Schleife mit Klemme;
+`doAggPairCollisions` behält den CUDA-Stride über die Gruppenzahl (16 384, die Konstante `PAIR_GRID` entfällt) und
+klemmt seit dem zweiten Review ebenfalls den Ladeindex (`iL = min(i, max(nbAggregatePairs, 1)−1)`, Stores bei `i`):
+das Host-Grid ist konstant 8 192·2, jede Gruppe ab `nbAggregatePairs` begann hinter dem Paar-Pool (Standardkapazität
+1 024 Paare = 12 288 Byte, Reichweite bis 196 596 Byte) und folgte im leeren Masken-Durchlauf von llvmpipe den dort
+gelesenen Handles (P9.49-Klasse, vorbestehend, nie als Absturz beobachtet). Bitgleich, auf jeder lebenden Iteration
+ist `iL == i`.
+Unverändert: `removeAggPairsStage1/2` (echte Block-Barrieren, schon volle Blockform).
+
+**Reihenfolge, Verbraucher.** Aggregat-Paare: found/lost sortiert der Host (`gpuBP.sortPairs` in
+`processFoundPairs`/`processLostPairs`); Kontakt- und Patch-Ströme der Narrowphase adressieren die Verbraucher über
+den eigenen Record des Managers (cmOutputs, Manifold), `sortTriangleIndices` sortiert im Bereich des Managers.
+Deformable-Kontakte verbraucht der Solver in Pufferreihenfolge – dort verschiebt die neue Reihenfolge die
+Gleitkomma-Summen (siehe Ergebnisse); in der CUDA ist sie ebenso offen. Über dem Puffer-Limit hängt, WELCHE Paare
+landen, vom Rennen ab (CUDA ebenso); die Fixtures vergleichen dort nur Präfixe bzw. nur mit Platz für alle.
+
+**Tests.** Alle Fixtures dispatchen das gepatchte Port-Grid. Dazu laufen sie gegen dieselbe Referenz (CPU-Spiegel
+bzw. das Ergebnis beim Port-Grid), ordnungsfrei und bitweise, bei weiteren Grids – nach dem zweiten Review genau so:
+beim CUDA-Grid sowie bei 1 und 3 Gruppen `aggregateBda_{dirtyBounds,sortSelf,pairs}CudaGrid` (Report als Multimenge,
+`compareReport`), `cvxTriFinishCudaGrid`, die neuen Engine-Fixtures `npCvxCorePlaneGen_engineKernel{,CudaGrid}`
+(`convexCorePlaneNphase_Kernel`, 1 100 Tests über zwei CUDA-Blöcke, gegen refPlaneGen) und
+`npCvxCoreCvxGen_engineKernel{,CudaGrid}` (`convexCoreConvexNphase_Kernel`, 600 Tests über zwei Blöcke, gegen
+refCvxGen), der neue Engine-Abschnitt in `sphereHfCore` (`sphereHeightfieldNarrowphase`, die Falltabelle viermal = 112
+Paare über zwei CUDA-Blöcke, gegen den Kern-Spiegel; Zweitpass-Queue als Menge), `sphereTriNp_p94dIdtScaleRot` (128
+Paare bei 4/2/3/1 Gruppen), die softBodySim-Sweeps (Ps/Self/Cloth/ClothVert-Midphase, Cloth/ClothVert/Mesh/Hf-ContactGen,
+SbSb; `gridRows`) und femClothSim `PsMidphase` (Stride-Lauf bei 2 048/1 024/3/1, ein emittierendes Partikel in
+[1 024, 2 048), `gridRows`) und `MeshContactGen` (8 192/2 048/3/1); beim CUDA-Grid und bei 1 Gruppe
+`sortTriIndicesCudaGrid`, `cvxTriCorrelateCudaGrid`, `npCvxCoreCvxGen_triNpAtoBSignCudaGrid`, femClothSim
+SelfCollisionVT (4/2/1) und -EE (2/1), DifferentClothVT (10/5/1) und -EE (2/1/1) sowie `HfContactGen` (2 048/1);
+`cvxCoreTetNp` und die `…MidphaseOrder`-Fixtures bei beiden Grids. Filter: SelfCollisionVT und DifferentClothVT laufen
+zusätzlich mit einelementigen `mSurfaceSurfaceFilterPairs`-Listen (früher Filter je Vertex, beide Suchen der
+Traversierung; Port-, CUDA-Grid und 1 Gruppe), SelfCollisionEE mit einem gefilterten Kantenpaar. Seit der
+Nachprüfung laufen `cvxTriPostProcess` und `cvxHfPostProcess` zusätzlich bei 1 Gruppe (jeder Thread erst ein
+Paar ohne Kontakte, dann ein echter Fall; frischer NI-Puffer je Lauf). Ohne eigene Fixture
+bleiben `convexTrimeshNarrowphase`/`convexHeightfieldNarrowphase` (P8.46c) – sie sind nur über Szenen gedeckt.
+
+**Messungen (llvmpipe, `PXG_KERNEL_TIMES=2`, 28 Szenen, Summe ohne ersten Launch / Median in ms, vorher → nachher).**
+`ktime_compare.py ktime_before ktime_after2` (Stand des Autors); die Szenen, deren Kernel sich danach noch änderten
+(Mesh/HF-Cores mit Early Exit, `cloth_midphase` mit Gruppen-Stride-Schleife), in `ktime_after3` nachgemessen. Der
+erste Launch eines geänderten Shaders enthält auf llvmpipe dessen JIT (Mesa-Shader-Cache-Miss): in der jeweils ERSTEN
+Szene 5,1–5,9 s für die beiden Cores, danach 14 ms – das ist der Max-Wert, den der Rohvergleich zeigt, keine
+Kernelzeit. Gleich oder schneller: Aggregate außer Paaren (sort 452 → 398, self 56 → 45, Bitmap/Bounds im Rauschen),
+`sortTriangleIndices` 190 → 160, `convexTrimeshCorrelate` 187 → 154, Finish 110 → 109, Mesh-Core 191 → 187 (Median
+`meshfloor` 0,92 → 1,15; ohne Early Exit waren es 16,5), HF-Core 482 → 435, `convexCoreTrimesh/Tetmesh` 2 061 → 1 984
+bzw. 97 → 95, Cloth-Selbstkollision VT/EE 1 410/1 571 → 1 382/1 602, sb_sb 170 → 155, sb_self 237 → 234,
+`cloth_midphase` 208 → 204. Teurer auf llvmpipe (mehr Gruppen bei fester oder kaum genutzter Arbeit, ~0,1–3 µs
+Fixkosten je zusätzlicher Gruppe): `sb_meshContactGenLaunch` 581 → 1 115 (1 024 → 2 048 Gruppen, Lane 0 mit
+GJK-Clouds in privaten Arrays), `sb_heightfieldContactGenLaunch` 913 → 1 272, `sb_clothVertContactGenLaunch` 36 → 70
+(256er-Gruppen), `cloth_meshContactGenLaunch` 862 → 1 051 (2 048 → 8 192), `doAggPairCollisions` 1 159 → 1 425
+(8 192 → 16 384), `convexCoreConvex` 163 → 193, `sb_psMidphase` 117 → 137, `sb_midphase` 426 → 455, Fremdkollision
+VT/EE +6 %. Summe aller gemessenen Kernel über die 28 Szenen 12,7 → 14,0 s (+10 %). llvmpipe kann den Gewinn nicht zeigen:
+4 Kerne sind schon von 1 024 Gruppen gesättigt, eine zweite Gruppe pro Block ist dort nur zusätzliche Fixarbeit.
+Erwartung RX 9070 XT: die Latenz eines Blocks halbiert (2 Warps) bzw. geviertelt (4 Warps, Convex-Core-Mesh/Tet,
+Cloth-Mesh/HF-Contact-Gen), bei Aggregaten mit 16 Warps pro Block bis 1/16, sobald der Block so viele Warps Arbeit
+hat; noch nicht gemessen.
+
+**Review (unabhängig, nach dem Abbruch des Autors durch das Rate-Limit).** Gegen die 5.12-CUDA und die
+Host-Launches je Kernel geprüft: Unabhängigkeit der Warps (siehe oben), Warp-Index + Stride gegen jedes Grid, das der
+Host jetzt startet (2D/3D-Grids: gid.y/gid.z unverändert Manager bzw. Flip; Deckel; Tails), Verbraucher-Reihenfolge,
+Host-Patches (CUDA-Sicht der vier Host-Dateien mit `PXG_NO_CUDA_TOOLKIT` undefiniert identisch zu HEAD), ABI-Zeilen
+und `push_block_known` (keine Argument- oder Push-Änderung; pushBlock/launchAbi/launchAbiPack grün).
+Behoben:
+(1) **Nicht verifizierter Endstand.** `femClothContactGenBda` (17:44, Gruppen-Stride-Schleife von
+`cloth_midphase`), `convexTrimeshCoreBda` und `convexHfCoreBda` (17:51, Early Exit) wurden NACH dem letzten Build
+(17:33) geändert; Checker, foldscan, die betroffenen ctests und `ktime_after2` liefen mit den älteren SPIR-V
+(`cloth_midphase` noch mit der seriellen `sub`-Schleife beim verdoppelten Grid – korrekt, die zweite Hälfte der
+Gruppen leer; die Cores ohne Early Exit, daher die 16,5 ms Median in `meshfloor`). Neu gebaut, alles unten neu
+gelaufen, die betroffenen Szenen nachgemessen.
+(2) **Fixture-Lücken, per Mutanten gefunden** (38 Mutanten über 22 Shader – falscher Stride, Block-skalierter Start,
+übersprungener Tail, Schleife entfernt): vier überlebten, drei davon Fixture-Lücken.
+`softBodySimClothVertContactGen` (6 Paare: bei jedem Grid fällt jedes Paar auf einen eigenen Thread, Stride oder
+Thread-Index der alten 32er-Gruppe unsichtbar) bekommt einen Sweep über 384 Paare (sechs Paare ×64) bei Grid
+512/3/1; `softBodySimMeshContactGen` und `softBodySimClothContactGen` (nur Stack-Eintrag 0 erzeugt einen Kontakt,
+übersprungene Einträge unsichtbar) je einen Sweep über sieben Kopien des emittierenden Paars bei Grid
+2 048/1 024/3/1. Die drei Mutanten und zwei weitere Index-Mutanten dieser Kernel sterben jetzt (der vierte: (b));
+`sortAndUpdateAggregateProjections` mit falschem Stride stirbt durch SIGSEGV statt an einem Check.
+(3) `sphereTrimesh/sphereHeightfieldNarrowphase`: Host-Grid wuchs ungedeckelt mit numTests (ab ~2 Mio. Managern über
+65 535) → wie alle anderen auf 65 535 gedeckelt.
+Offen (nicht behoben):
+(a) Für `convexTrimeshNarrowphase`/`convexHeightfieldNarrowphase` gibt es weiterhin keine Fixture – Early Exit und
+Gruppen-Stride nur über Szenen gedeckt (`meshfloor`, `hffloor`, `hfbigbox`, Softbody/Cloth auf Mesh/HF); ihre Eingaben
+sind die Stapel-Sektionen der Midphase. Die drei anderen Kernel ohne Fixture, die der zweite Review fand
+(`sphereHeightfieldNarrowphase`, `convexCorePlaneNphase_Kernel`, `convexCoreConvexNphase_Kernel`), haben jetzt eine.
+(b) `femClothSimDifferentClothEE` hat genau eine Abfrage (min der beiden Dreieckszahlen = 1): ein falscher
+Warp-Index der EE-Schleife ist dort äquivalent; der VT-Zwilling mit derselben Schleife tötet ihn.
+(c) Kein ctest sieht das Host-Grid selbst: die Shader sind grid-agnostisch, ein vergessener Host-Patch kostet nur die
+Parallelität, ein fehlender Deckel erst ab 65 536 Gruppen.
+(d) Die zusätzlichen llvmpipe-Fixkosten (oben); der Gewinn auf echter Hardware ist unbelegt.
+(e) Ordnung der Deformable-Kontakte, siehe Ergebnisse.
+(f) Arbeitsproportionale x-Grids ohne Grid-Stride im Shader in den berührten Ketten, NICHT gedeckelt (ein Deckel
+würde Arbeit verlieren), nur notiert: `cloth_SphereVertexContactGenLaunch`, `cloth_planeVertContactGenLaunch`,
+`cloth_boxVertexContactGenLaunch`, `cloth_sdfMeshContactGenLaunch`, `sb_sdfMeshMidphaseGeneratePairsLaunch` (je ein
+Block pro Manager, Grid = numTests) und `markAddedAndDeletedAggregatedBounds` (PxgAABBManager.cpp: Grid =
+max(hinzugefügte, entfernte aggregierte Bounds) – upstream steht `(n + (128 − 1) / 128)`, durch den Vorrang also n
+Blöcke statt ceil(n/128); dokumentiert, nicht geändert). Sie überschreiten 65 535 erst ab 65 536 Managern bzw.
+aggregierten Bounds pro Frame; dann verweigert die Bridge, wo CUDA läuft. Die y-Dimensionen (numTests, nbActive)
+haben in CUDA dasselbe Limit 65 535.
+
+**Zweiter Review (unabhängig, zehn bestätigte Befunde, `review2_findings.json` in den Logs).** Alle behoben, die
+Mutanten mit `run_mutation_sweep.sh` (`r5_mut_*.log`):
+(1) femClothSim `PsMidphase` sah keinen Grid unter dem Port-Grid: der Mutant „Start `gid.x`, Stride konstant 2 048"
+überlebte (die Partikel 1 024..2 047 emittierten nichts). Stride-Lauf jetzt bei 2 048/1 024/3/1, Partikel 1 500 über
+Dreieck 5, `gridRows` gegen das Port-Grid, frischer Stapel je Lauf; der Mutant stirbt. Der veraltete
+`PS_NB_WARPS`-Kommentar ist ersetzt.
+(2) Der Tests-Absatz nannte für `PsMidphase` einen 1/3-Gruppen-Lauf, den es nicht gab – mit (1) jetzt wahr, der Absatz
+nennt je Fixture die tatsächlichen Grids.
+(3) Das Filter-`continue` (CUDA: `return`) war ungeprüft, kein Fixture füllte `mSurfaceSurfaceFilterPairs`.
+SelfCollisionVT läuft jetzt mit vier einelementigen Listen bei 4/2/1 Gruppen, DifferentClothVT mit dreien bei
+10/5/1, SelfCollisionEE mit einem gefilterten Kantenpaar bei 2/1. Getötet: `continue`→`return`/`break` (Selbst-VT am
+Check; Fremd-VT stürzt damit auf llvmpipe in jedem Lauf im JIT-Code ab, die gleichwertige Variante
+`queryLoop = numQueries; continue;` stirbt am Check), der gelöschte frühe Filter, beide Suchen der Traversierung, die
+Liste des falschen Cloths, die EE-Kantenpaar-Suche. Die EE-Kernel haben keinen frühen Filter (CUDA ebenso).
+(4) Deckel-Satz in Abschnitt 2 korrigiert (Fremd-VT ab 32 K Vertices, EE nach Dreiecken), die Host-Kommentare in
+PxgFEMClothCore.cpp ebenso.
+(5) Post-Process-Launches ungedeckelt (Bug, vorbestehend) → gedeckelt, Abschnitt 5; die übrigen Host-Launches der
+Ketten durchgesehen, Rest siehe (f).
+(6) `sphereTrimeshNarrowphase`: die Nummerierung je Gruppe war unbeobachtet (jede Fixture lief mit einer Gruppe oder
+leerer zweiter Gruppe). `runStn` nimmt eine Gruppenzahl, 128 Paare laufen bei 4/2/3/1; Start `gid.x·64` und Stride
+`·64` sterben. `sphereHeightfieldNarrowphase` siehe (10).
+(7) `doAggPairCollisions` ohne Ladeklemme (latent, vorbestehend) → geklemmt, Abschnitt 7. `check_speculated_loads.py`
+sah die Stelle nicht und ist verschärft (Werkzeuge); mit zurückgenommener Klemme schlägt der speculatedLoads-ctest
+fehl (geprüft; der Selbsttest tut dasselbe in jedem Lauf).
+(8) Die Aggregat-Zwillinge und `cvxTriFinishCudaGrid` liefen nur beim CUDA-Grid; jetzt zusätzlich bei 1 und 3
+Gruppen (`gAggGroups`, `runCvxTriFinish("one-group"/"three-group")`).
+(9) Stellenzahl in Abschnitt 5: je 4 Stellen (Kugel-Mesh, Kugel-HF, Konvex-Mesh, Konvex-HF), nicht 3.
+(10) Keine Fixture für `sphereHeightfieldNarrowphase`, `convexCorePlaneNphase_Kernel`,
+`convexCoreConvexNphase_Kernel` → Engine-Fixtures (siehe Tests), jede gegen den vorhandenen CPU-Spiegel bei Port-Grid,
+CUDA-Grid, 3 und 1 Gruppen. Getötet je Kernel: Block-skalierter Start (`gid.x·64` bzw. `gid.x·1024`/`·512 + gtid.x`),
+Block-skalierter Stride, eine einzige Runde ohne Schleife.
+Zusammen 25 Mutanten, alle getötet (zwei davon durch Absturz, siehe (3)).
+
+**Nachprüfung der Behebungen (unabhängig).** Gegengeprüft: CUDA-Sicht der vier Host-Dateien weiter identisch zu
+HEAD (die vier Post-Process-Deckel ändern unter 65 535 Gruppen nichts); `iL == i` auf jeder lebenden Iteration;
+alter und neuer `check_speculated_loads.py` über HEAD und den Endstand liefern dieselben Stellen, einzige Änderung
+`doAggPairCollisions` auf HEAD LOW-loop → HIGH, also nichts abgeschwächt; 179 Konstant-Grid-Entries nachgezählt.
+Die Mutanten selbst neu gefahren (`run_mutation_sweep.sh`, `r5_rv_mut_*.log`, Quelle danach per sha256 und
+`git diff` unverändert): 23 der 25 (ohne die zwei Absturz-Mutanten aus (3)) plus zwei für die neuen 1/3-Gruppen-Läufe
+aus (8) – konstanter Stride 8 192 in `doAggPairCollisions`, konstanter Stride 2 in `updateDirtyAggregate` (beim
+Port- und CUDA-Grid äquivalent, stirbt nur bei 1/3 Gruppen) –, alle getötet. Behoben:
+(i) Post-Process: der Deckel stützte sich auf einen Grid-Stride, den der Port-Rumpf mit `return` abbrach (siehe 5).
+`continue`; `cvxTriPostProcess`/`cvxHfPostProcess` laufen zusätzlich bei 1 Gruppe, der Mutant `continue`→`return`
+stirbt in beiden (vorher hatte dort jeder Thread genau eine Iteration).
+(ii) Der neue Aggregat-Selbsttest trat zur Seite, wenn der Baum die ungeklemmte Ladung schon trug, ohne etwas zu
+prüfen: ungeklemmter Baum plus abgeklemmte Konstant-Grid-Regel im Scan gab rc 0 und „OK" (vorgeführt). Jetzt muss
+der Scan des Baums den Befund dann selbst enthalten, sonst SELFTEST FAILED (vorgeführt, rc 2); mit intakter Regel
+wie bisher rc 1 mit dem HIGH-Befund `aggregateBda.slang:1028` (`r5_rv_specloads_*.log`).
+(iii) `port_view()` blendete auch den `#else`-Zweig eines `#if 0` aus und hätte dort eine Launch-Stelle versteckt
+(heute nur CPU-Dateien betroffen, 179 unverändert).
+(iv) Zahlen: zehn statt neun LOW-loop-Köpfe (Werkzeuge, Checker-Kommentar). `cvxTriFinishCudaGrid` trägt je
+Dispatch höchstens zwei Paare: 1 Gruppe IST dort das CUDA-Grid, 3 Gruppen geben jedem Paar eine eigene – die beiden
+Läufe aus (8) prüfen dieselben Partitionen erneut, keinen Stride-Fall (Testkommentar „many pairs" korrigiert).
+Nicht geändert: die GCC-Warnung `-Wnonnull` in `testSphereTriNp.cpp` (memmove aus einer Initialisierungsliste in
+einen leeren Vektor nach Inlining, GCC 13) an unberührten Zeilen; nach Augenschein ein Fehlalarm, nicht weiter belegt.
+
+**Werkzeuge.** foldscan (`tools/foldscan_all.py -j3` im Build-Verzeichnis) auf dem Endstand: 831 Stellen,
+862 Baseline-Einträge, 0 unreviewed, 0 offene MATTERS-FIX (die geänderten Schleifen sind reine Ganzzahl-Indizes).
+Die 19 Checker (barrierUniformity – der Early Exit der Cores ist gruppenuniform und liegt vor der ersten Barriere –,
+blockCoverage und gridStride akzeptieren den `WorkgroupCount()`-Stride, fixtureGrid nimmt ihn von der
+Grid-Gleichheit aus, groupshared, launchAbi, launchAbiPack, pushBlock, speculatedLoads …) grün.
+Zweiter Review: `check_speculated_loads.py` verschärft. `GRIDWIDE_START` kennt jetzt beide Schreibweisen
+(`globalWarpIdx`/`globalWarpIndex`, `globalThreadIdx`/`globalThreadIndex`, dazu `groupID`/`groupIdx`,
+`dispatchThreadID`), und die Ausnahme für einen `WorkgroupCount()`-Stride („Launch auf die Daten bemessen") gilt nicht
+mehr für einen Entry, den der Host mit konstantem Grid startet: `host_constant_grids()` liest die Port-Sicht der
+Host-Launches (`#else`-Zweige von `PXG_NO_CUDA_TOOLKIT` ausgeblendet, Auflösung wie blockCoverage, aber nur über
+Deklarationen der umschließenden Funktion) und findet 179 solche Entries, darunter `doAggPairCollisions` (16 384).
+Die Selbsttests decken beide Regeln ab und nehmen die Klemme aus `doAggPairCollisions`, der Befund muss HIGH sein.
+Auf dem Endstand meldet der strengere Checker keine weitere Stelle; zehn LOW-loop-Köpfe in Konstant-Grid-Entries
+bleiben LOW, weil Start oder Stride über eine lokale Variable laufen oder der Bereich je Element gebunden ist
+(updateBounds, bodyUpdate, thresholdStreamBda ×3, solverTGS, psContactSolveBda ×2, npRigidSumBatches ×2;
+nachgezählt, der zweite Review schrieb „neun") – keiner hat eine
+Barriere oder ein Warp-Primitiv im Rumpf, llvmpipe führt sie also nie mit leerer Maske aus (im Checker vermerkt). foldscan nach dem
+zweiten Review unverändert: 831 Stellen, 862 Baseline-Einträge, 0 unreviewed, 0 offene MATTERS-FIX (die Klemme ist
+reine Ganzzahl-Arithmetik).
+
+**Ergebnisse.** Die 42 betroffenen ctests (die Fixtures der geänderten Kernel, soweit es welche gab – siehe Tests –,
+ihre Ketten und die Checker-nahen Narrowphase-Suiten) device-local grün, die zehn Kernsuiten (aggregateBda, softBodySim, femClothSim, cvxTriCorrelate,
+cvxTriFinish, sortTriIndices, npCvxCoreCvxGen, cvxCoreTetNp, sphereTriNp, npTetTriMid) auch host-visible; volle
+Suite und Szenen-Sweep stehen aus. 28 Szenen mit `PXG_KERNEL_TIMES=2` grün (12 auf dem Endstand nachgefahren; die
+übrigen 16 nutzen keinen der drei spät geänderten Shader, ihr Binär unterscheidet sich nur um den Kugel-Deckel, der
+unter ~2 Mio. Managern nicht greift); Ausgabe gegen HEAD identisch bis auf `clothselfcollide`, `softbody` mit
+`PXG_SB_FLOOR=heightfield` und `softbodystack` (5. Nachkommastelle, z. B. Endhöhe 0,98370 ↔ 0,98372). Diese drei sind schon auf HEAD von Lauf zu
+Lauf verschieden (zweiter Lauf des alten Binärs mit den alten Shadern: 2, 5 und 4 Zeilen anders, in denselben
+Stellen) – Deformable-Kontakte aus mehreren Gruppen landen in Rennreihenfolge, der Solver summiert in
+Pufferreihenfolge; die neue Aufteilung ändert daran nichts Grundsätzliches. Die übrigen 25 Szenen bitgleich (bis auf
+Pufferadressen).
+Nach dem zweiten Review (beide Build-Verzeichnisse neu gebaut): foldscan 0 unreviewed (`r5_foldscan.log`), 23
+Checker-ctests grün, `validationSubset` mangels Validation-Layern übersprungen (`r5_checkers.log`); 52 ctests – die 42
+von oben, die neun Aggregat-Broadphase-Suiten und speculatedLoads – in beiden Speichermodi grün (`r5_ctest_dl.log`,
+`r5_ctest_hv.log`); `aggregate`, `meshfloor`, `hffloor`, `spheremesh`, `capsulemesh`, `spherehf` grün und in der
+Ausgabe identisch zu `ktime_after2`/`ktime_after3` (`r5_scenes.run.txt`). Volle Suite und Szenen-Sweep stehen aus.
+Nach der Nachprüfung (beide Build-Verzeichnisse neu gebaut): die 52 ctests plus `cvxHfPostProcess`,
+`npCvxPostProcess`, `hlsl.cvxPostProcess` – 55 – in beiden Speichermodi grün (`r5_rv_ctest_dl.log`,
+`r5_rv_ctest_hv.log`), 23 Checker-ctests grün, `validationSubset` übersprungen (`r5_rv_checkers.log`), foldscan
+831 Stellen, 0 unreviewed, 0 offene MATTERS-FIX (`r5_rv_foldscan.log`); `meshfloor`, `hffloor`, `hfbigbox`,
+`spheremesh`, `capsulemesh`, `spherehf` (alle mit Post-Process) grün und in der Ausgabe identisch zu `r5_scenes`,
+`ktime_after2` und `ktime_after3` (`r5_rv_scenes.run.txt`).
+**Audit „`return` in Arbeitsschleifen" (anlässlich des Post-Process-Befunds A, nur lesend).** Jede Shader-Schleife,
+deren Rumpf ein `return` enthält (Vorscan `loopret_scan_all.txt`: 77 Schleifen in 40 Dateien), gegen die CUDA
+geprüft: ist das `return` dort ein Kernel-`return` (gleichwertig – der Arbeitsindex wächst je Thread streng, alle
+späteren Runden scheitern an derselben Schranke, nach der Schleife folgt weder Barriere noch Reduktion) oder das
+Ende einer pro Element aufgerufenen `__device__`-Funktion (dann müsste es ein `continue` sein)? Ergebnis: kein
+weiterer Fall (`loopret_audit.json`); die Post-Process-Kerne waren die einzigen, deren Kernfunktion inline in die
+Grid-Stride-Schleife gezogen wurde.
+**Endstand** (beide Build-Verzeichnisse nach der letzten Änderung neu gebaut): ctest 867/867 device-local
+(`final2_ctest_dl.log`) und 867/867 host-visible (`final2_ctest_hv.log`), je +1 Skip (`validationSubset`, ohne
+Validation-Layer); voller Szenen-Sweep device-local 99/99 ok, 0 fail, 0 missing, Refusal-Kontrolle ok
+(`final2_scenes.log` + `--resume` `final2_scenes_r1.log`).
+
 ## Trimesh-Plane auf 1024 Threads, warp-kooperatives GJK/EPA für Softbody-Primitive, eine Workgroup pro CUDA-Warp in den Mesh/HF-Midphases
 
 **Anlass.** Die drei offenen Kandidaten aus dem Audit des folgenden Eintrags („Deformable-vs-Rigid-Midphase auf

@@ -82,8 +82,12 @@
 //     no shared-memory staging, and no 608-byte groupshared array.
 //
 // M8 -- the particle loop strides by blockDim.y * gridDim.x -- WARPS, not
-//     threads, and NOT including blockDim.x.  Reproduced as a constant because
-//     the bridge forwards only gridDim.
+//     threads, and NOT including blockDim.x.  The bridge forwards only gridDim, so
+//     this used to be a constant (1024 * 2) with the block's two warps walked serially
+//     in one 32-thread group; the launch site now (PXG_NO_CUDA_TOOLKIT) launches one
+//     group per CUDA warp, (1024 * 2, numTests, 1), so the warp index is gid.x and the
+//     stride the group count WorkgroupCount().x -- the CUDA's 2048 at that grid, and at
+//     any other grid still every particle exactly once.
 // ===========================================================================
 
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mTriMeshData@0, mPosition_InvMass@16)
@@ -92,7 +96,6 @@ import pxgSlangBv32;           // P8.25: the BV32 reader, shared
 
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint PS_MIDPHASE_GRID = 1024u;
-static const uint PS_NB_WARPS = PS_MIDPHASE_GRID * MIDPHASE_WARPS_PER_BLOCK;   // M8
 static const uint WARP = 32u;
 static const uint STACK_SIZE = 192u;    // femMidphaseScratch.sBv32Nodes[192]
 
@@ -237,14 +240,13 @@ void cloth_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 
     const uint stackCapacity = gPm.stackSizeBytes / 16u;
 
-    // The block's two warps, walked serially: the CUDA block is (32, 2, 1) and
-    // this group is one warp, so the group covers both of the block's warps in
-    // turn.  Same arrangement, and same reason, as the mesh vertex sibling.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (M8): globalWarpIdx is the group index and the stride
+    // the group count, i.e. blockDim.y * gridDim.x.  Same arrangement as the mesh
+    // vertex sibling.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint particleIndex = globalWarpIdx; particleIndex < nbParticles; particleIndex += PS_NB_WARPS)
+    for (uint particleIndex = globalWarpIdx; particleIndex < nbParticles; particleIndex += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

@@ -12,11 +12,14 @@
 // The reservations become real `InterlockedAdd`s on the shared
 // `PxgPatchAndContactCounters`, and the three streams become real writes.
 //
-// ONE WARP PER PAIR.  The host launches `ceil(numTests / 2)` blocks of two warps
-// (PxgNarrowphaseCore.cpp:2742-2744) and derives the pair from
-// `globalThreadIndex / WARP_SIZE` — no grid-stride loop, so one workgroup per CUDA
-// block and a constant-trip-2 loop over its warps covers every pair exactly once,
-// the shape P8.48 and P8.50b already use.
+// ONE WARP PER PAIR.  The host launches `ceil(numTests / 2)` blocks of 64 threads
+// (PxgNarrowphaseCore.cpp) and derives the pair from `globalThreadIndex / WARP_SIZE`
+// — no grid-stride loop in the CUDA.  The port's launch site (PXG_NO_CUDA_TOOLKIT)
+// launches one 32-thread group per CUDA warp, so the group index IS the CUDA's pair
+// index; a group-stride loop (stride WorkgroupCount().x, a group-uniform trip count)
+// makes one pass at that grid and still covers every pair at any smaller one -- at
+// the CUDA's own grid a group takes up to two pairs one grid-width apart.  (It used to
+// be one group per CUDA block walking its two warps serially, as P8.48 and P8.50b did.)
 //
 // THE LANE LAYOUT is the CUDA's: `singleManifoldIndex = lane / 6` and
 // `threadIndexInManifold = lane % 6`, so lanes 0..23 cover four manifolds of six
@@ -213,13 +216,16 @@ void convexTrimeshFinishContacts(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
     const uint lane = gtid.x;
     // insertAveragePoint (gCf.insertAveragePointWord) is unused since 5.12 -- see the header.
 
-    for (uint sub = 0u; sub < CF_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header), and a group-stride loop so any smaller
+    // grid still covers every pair.  The loop bound is group-uniform.
+    for (uint pairLoop = gid.x; pairLoop < gCf.numPairs; pairLoop += WorkgroupCount().x)
     {
         AllMemoryBarrierWithGroupSync();
 
-        const uint pairIndex = gid.x * CF_WARPS_PER_BLOCK + sub;
-        if (pairIndex >= gCf.numPairs)
-            continue;
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.
+        // Every live iteration has pairIndex == pairLoop.
+        const uint pairIndex = min(pairLoop, max(gCf.numPairs, 1u) - 1u);
 
         const uint64_t manBase = gCf.cmMultiManifold + uint64_t(pairIndex) * uint64_t(CF_MANIFOLD_STRIDE);
         uint nbManifolds = Ptr<uint>(manBase + uint64_t(CF_NB_MANIFOLDS_OFF))[0];

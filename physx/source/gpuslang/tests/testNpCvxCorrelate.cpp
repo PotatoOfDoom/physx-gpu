@@ -677,7 +677,12 @@ const uint32_t NBC_W = 1152 / 4;    // mNbContacts[0]
 const uint32_t RELXF_W = 1168 / 4;  // mRelativeTransform.q
 const uint32_t NBMAN_W = 1200 / 4;  // mNbManifolds
 
-PXG_TEST(cvxTriCorrelate)
+// `groupsFor`: the dispatch for a pair count.  The engine launches ceil(numTests / 2) blocks of
+// two warps (PxgNarrowphaseCore.cpp); the port's launch site (PXG_NO_CUDA_TOOLKIT) launches one
+// 32-thread group per CUDA warp, twice that, and the shader's group-stride loop covers any
+// smaller grid -- the CUDA's own (a group takes two pairs one grid-width apart) and one group.
+// Every pair writes its own records, so the outputs are compared per pair at every grid.
+static void runCvxTriCorrelate(const char* gridName, uint32_t (*groupsFor)(uint32_t))
 {
     PxgSlangComputeDevice* dev = testDevice();
 
@@ -971,7 +976,8 @@ PXG_TEST(cvxTriCorrelate)
 
     {
         Kernel k("cvxTriCorrelateBda.spv", "convexTrimeshCorrelate", {}, sizeof(CcPush));
-        k.dispatch((N + 1) / 2, {}, push, 1u, 1u);
+        k.dispatch(groupsFor(N), {}, push, 1u, 1u);
+        std::printf("    [ note ] %s grid: %u groups for %u pairs\n", gridName, groupsFor(N), N);
         dev->flush();
     }
 
@@ -1053,6 +1059,17 @@ PXG_TEST(cvxTriCorrelate)
                   "cvxTriCorrelate: coverage thin (cached %zu zeroTri %zu cm1 %zu reduce %zu "
                   "multi %zu quirk8 %zu blocks2 %zu tie %zu)",
                   cCached, cZeroTri, cCm1, cReduce, cMultiPatch, cQuirk8, cTwoBlocks, cTie);
+}
+
+PXG_TEST(cvxTriCorrelate)
+{
+    runCvxTriCorrelate("port", [](uint32_t n) { return 2u * ((n + 1u) / 2u); });
+}
+
+PXG_TEST(cvxTriCorrelateCudaGrid)
+{
+    runCvxTriCorrelate("CUDA", [](uint32_t n) { return (n + 1u) / 2u; });
+    runCvxTriCorrelate("one-group", [](uint32_t) { return 1u; });
 }
 
 } // namespace

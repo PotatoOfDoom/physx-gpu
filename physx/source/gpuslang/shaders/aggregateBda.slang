@@ -44,15 +44,24 @@
 // binding ports (broadphaseAgg*.slang, broadphaseAggregate*.slang) proved the algorithms
 // on flat pooled layouts; this file is what the manifest maps.
 //
-// ONE VIRTUAL WARP AT A TIME.  The CUDA kernels are warp-per-item with blockDim.y warps
-// per block and only warp-level synchronization (__syncwarp, ballots, shuffles).  Here a
-// workgroup is ONE warp of 32 lanes and walks its block's warps in turn (the pattern of
-// softBodyPsMidphaseBda / convexTrimeshMidphaseBda): the block's warps never talk to
-// each other in these kernels, so running them one after another changes nothing but the
-// order of the global atomics that allocate report slots -- which is unordered across
-// warps in the CUDA too.  Every warp primitive is the groupshared emulation, so every
-// loop that contains one has a warp-uniform trip count, exactly as the CUDA requires of
-// its FULL_MASK primitives.
+// ONE WORKGROUP PER CUDA WARP.  The CUDA kernels are warp-per-item with blockDim.y warps
+// per block and only warp-level synchronization (__syncwarp, ballots, shuffles; per-warp
+// __shared__ slots, no __syncthreads).  Here a workgroup is ONE warp of 32 lanes.  The
+// block's warps used to be walked in turn inside one group; the launch sites now
+// (PxgAABBManager.cpp, PXG_NO_CUDA_TOOLKIT) launch one group per CUDA warp,
+// numBlocks * blockDim.y of them, so the group index IS the CUDA's globalWarpIndex (the
+// pattern of softBodyMeshMidphaseBda / convexTrimeshMidphaseBda).  The block's warps never
+// talk to each other in these kernels, so running them as separate groups changes nothing
+// but the order of the global atomics that allocate report slots -- which is unordered
+// across warps in the CUDA too.  The kernels without a CUDA grid-stride loop take their
+// items in a group-stride loop (stride WorkgroupCount().x): one pass at the port's grid,
+// and every item at any smaller grid (at the CUDA's own grid a group takes blockDim.y
+// items one grid-width apart, not its own block's).  The loop index is clamped for
+// the loads: llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask
+// and still issue them (P9.22, P9.49), and an unclamped index would read an aggregate
+// record past the array and follow its pointers.  Every warp primitive is
+// the groupshared emulation, so every loop that contains one has a warp-uniform trip
+// count, exactly as the CUDA requires of its FULL_MASK primitives.
 //
 // Sub-word stores (the PxgAggregate::isNew, PxgAggregatePair::isNew/isDead and the
 // aggregate desc's three overflow bools) are the InterlockedAnd/InterlockedOr pair
@@ -63,13 +72,14 @@ import pxgSlangScan;
 import pxgSlangRadixWarp;
 
 static const uint WARP = 32u;
+// The CUDA blockDim.y of each launch; the port's launch sites multiply their grid by it
+// (one group per CUDA warp, see above).
 static const uint W_DIRTY = 16u;      // updateDirtyAggregate / clearDirtyAggregates
 static const uint W_BITMAP = 8u;      // markAggregateBoundsUpdatedBitmap
 static const uint W_BOUNDS = 16u;     // updateAggregateBounds
 static const uint W_SORT = 2u;        // BP_AGGREGATE_SORT (64) / WARP_SIZE
 static const uint W_SELF = 16u;       // doSelfCollision
 static const uint W_PAIR = 2u;        // doAggPairCollisions: BP_AGGREGATE_SORT / WARP_SIZE
-static const uint PAIR_GRID = 8192u;  // doAggPairCollisions: the host's fixed grid (PxgAABBManager.cpp:734)
 static const uint ADD_GRID = 64u;     // addAggPairsStage1 grid
 static const uint ADD_BLOCK = 1024u;  // addAggPairsStage1 block
 static const uint REMOVE_GRID = 32u;  // PxgBPKernelGridDim::BP_AGGREGATE_REMOVE
@@ -342,11 +352,10 @@ struct UpdateDirtyParams
 void updateDirtyAggregate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint lane = gtid.x;
-    for (uint sub = 0u; sub < W_DIRTY; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < gUd.numDirtyAggregates; itemLoop += WorkgroupCount().x)
     {
-        const uint globalWarpIndex = gid.x * W_DIRTY + sub;
-        if (globalWarpIndex >= gUd.numDirtyAggregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have globalWarpIndex == itemLoop.
+        const uint globalWarpIndex = min(itemLoop, max(gUd.numDirtyAggregates, 1u) - 1u);
 
         const uint index = Ptr<uint>(gUd.dirtyAggregateIndices)[globalWarpIndex];
         const uint64_t agg = aggAddr(gUd.aggregates, index);
@@ -399,11 +408,10 @@ void clearDirtyAggregates(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     if (gtid.x != 0u)
         return;
-    for (uint sub = 0u; sub < W_DIRTY; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < gCd.numDirtyAggregates; itemLoop += WorkgroupCount().x)
     {
-        const uint globalWarpIndex = gid.x * W_DIRTY + sub;
-        if (globalWarpIndex >= gCd.numDirtyAggregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have globalWarpIndex == itemLoop.
+        const uint globalWarpIndex = min(itemLoop, max(gCd.numDirtyAggregates, 1u) - 1u);
         const uint index = Ptr<uint>(gCd.dirtyAggregateIndices)[globalWarpIndex];
         const uint64_t agg = aggAddr(gCd.aggregates, index);
         storeByte(agg + uint64_t(AGG_ISNEW_OFF), 0u);
@@ -432,11 +440,10 @@ void markAggregateBoundsUpdatedBitmap(uint3 gtid : SV_GroupThreadID, uint3 gid :
     const uint lane = gtid.x;
     const PxgAggregateDescGpu desc = Ptr<PxgAggregateDescGpu>(gTwo.p0)[0];
     Ptr<uint> changed = Ptr<uint>(gTwo.p1);
-    for (uint sub = 0u; sub < W_BITMAP; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < desc.numAgregates; itemLoop += WorkgroupCount().x)
     {
-        const uint warpIdx = sub + gid.x * W_BITMAP;
-        if (warpIdx >= desc.numAgregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have warpIdx == itemLoop.
+        const uint warpIdx = min(itemLoop, max(desc.numAgregates, 1u) - 1u);
         const PxgAggregateGpu agg = Ptr<PxgAggregateGpu>(aggAddr(desc.aggregates, warpIdx))[0];
         if (!aggIsValid(agg))
             continue;
@@ -473,11 +480,10 @@ void updateAggregateBounds(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
     const PxgAggregateDescGpu desc = Ptr<PxgAggregateDescGpu>(gThree.p0)[0];
     Ptr<float> bounds = Ptr<float>(gThree.p1);
     Ptr<float> contactDistance = Ptr<float>(gThree.p2);
-    for (uint sub = 0u; sub < W_BOUNDS; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < desc.numAgregates; itemLoop += WorkgroupCount().x)
     {
-        const uint warpIdx = sub + gid.x * W_BOUNDS;
-        if (warpIdx >= desc.numAgregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have warpIdx == itemLoop.
+        const uint warpIdx = min(itemLoop, max(desc.numAgregates, 1u) - 1u);
         const PxgAggregateGpu agg = Ptr<PxgAggregateGpu>(aggAddr(desc.aggregates, warpIdx))[0];
         if (!aggIsValid(agg))
             continue;
@@ -568,11 +574,10 @@ void sortAndUpdateAggregateProjections(uint3 gtid : SV_GroupThreadID, uint3 gid 
     const uint lane = gtid.x;
     const PxgBroadPhaseDescGpu bp = Ptr<PxgBroadPhaseDescGpu>(gTwo.p0)[0];
     const PxgAggregateDescGpu desc = Ptr<PxgAggregateDescGpu>(gTwo.p1)[0];
-    for (uint sub = 0u; sub < W_SORT; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < desc.numAgregates; itemLoop += WorkgroupCount().x)
     {
-        const uint globalWarpIndex = sub + W_SORT * gid.x;
-        if (globalWarpIndex >= desc.numAgregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have globalWarpIndex == itemLoop.
+        const uint globalWarpIndex = min(itemLoop, max(desc.numAgregates, 1u) - 1u);
         const uint64_t aggA = aggAddr(desc.aggregates, globalWarpIndex);
         const PxgAggregateGpu agg = Ptr<PxgAggregateGpu>(aggA)[0];
         if (!aggIsValid(agg))
@@ -717,11 +722,10 @@ void doSelfCollision(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     const PxgBroadPhaseDescGpu bp = Ptr<PxgBroadPhaseDescGpu>(gTwo.p0)[0];
     const uint64_t descA = gTwo.p1;
     const PxgAggregateDescGpu desc = Ptr<PxgAggregateDescGpu>(descA)[0];
-    for (uint sub = 0u; sub < W_SELF; ++sub)
+    for (uint itemLoop = gid.x; itemLoop < desc.numAgregates; itemLoop += WorkgroupCount().x)
     {
-        const uint globalWarpIndex = sub + W_SELF * gid.x;
-        if (globalWarpIndex >= desc.numAgregates)
-            continue;
+        // The P9.22 clamp (see the header): live iterations have globalWarpIndex == itemLoop.
+        const uint globalWarpIndex = min(itemLoop, max(desc.numAgregates, 1u) - 1u);
         const uint64_t aggA = aggAddr(desc.aggregates, globalWarpIndex);
         const PxgAggregateGpu agg = Ptr<PxgAggregateGpu>(aggA)[0];
         const uint maxPairs = desc.max_found_lost_pairs;
@@ -1010,12 +1014,18 @@ void doAggPairCollisions(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     const uint maxFoundLostPairs = desc.max_found_lost_pairs;
     Ptr<uint> aggBitmap = Ptr<uint>(desc.removeBitmap);
 
-    for (uint sub = 0u; sub < W_PAIR; ++sub)
+    // The CUDA's own grid-stride loop, `i += blockDim.y * gridDim.x`: one group per CUDA
+    // warp, so the warp index is gid.x and the stride the group count.
     {
-        const uint globalWarpIndex = sub + W_PAIR * gid.x;
-        for (uint i = globalWarpIndex; i < nbAggregatePairs; i += W_PAIR * PAIR_GRID)
+        const uint globalWarpIndex = gid.x;
+        for (uint i = globalWarpIndex; i < nbAggregatePairs; i += WorkgroupCount().x)
         {
-            const PxgAggregatePairGpu pair = pairs[i];
+            // The P9.22 clamp of the load index (see the header).  The host grid is a constant
+            // 8192 * 2 groups, so every group past the live pair count starts out of range, and
+            // llvmpipe's empty-mask pass would read pairs[gid.x] past the pool and follow its
+            // handles.  Live iterations have iL == i; the (masked) stores stay at i.
+            const uint iL = min(i, max(nbAggregatePairs, 1u) - 1u);
+            const PxgAggregatePairGpu pair = pairs[iL];
             const bool pairIsNew = (pair.flagsWord & 0xffu) != 0u;
             const bool pairIsDead = ((pair.flagsWord >> 8) & 0xffu) != 0u;
             bool shouldRemove = false;

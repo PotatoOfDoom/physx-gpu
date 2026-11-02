@@ -115,8 +115,11 @@
 // emitted contact set and the atomic total are identical.
 //
 // THE GRID: SB_HFCG = 1024 blocks of (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK = 2).  The
-// bridge drops blockDim, so the block's two warps are walked serially and the stride
-// stays the CUDA `gridDim.x * blockDim.y` = 2048.
+// bridge drops blockDim, so the block's two warps used to be walked serially in one group.
+// The launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per
+// CUDA warp, 2048 groups, so the warp index is gid.x and the stride the group count
+// WorkgroupCount().x -- the CUDA's `gridDim.x * blockDim.y` = 2048 at that grid, and at any
+// other grid still every stack entry exactly once.
 //
 // THE TAIL: atomicMax(stackSizeNeededOnDevice, numMidphasePairsFound * sizeof(uint4))
 // on the UNCLAMPED count, so the host can grow the stack even on a truncated frame.
@@ -153,7 +156,6 @@ import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:58 — SB_HFCG.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_HFCG = 1024u;
-static const uint SB_HFCG_STRIDE = SB_HFCG * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
@@ -287,11 +289,12 @@ void sb_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
     // Lane 0 runs the whole query (see the header); the other 31 have nothing to do.
     if (lane == 0u)
     {
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. gridDim.x * blockDim.y.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint i = globalWarpIdx; i < numPairs; i += SB_HFCG_STRIDE)
+    for (uint i = globalWarpIdx; i < numPairs; i += WorkgroupCount().x)
     {
         const uint4 curPair = Ptr<uint4>(gHc.stackPtr)[i];
         const uint cmIdx = curPair.x;

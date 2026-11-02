@@ -310,9 +310,37 @@ def loop_induction(header):
 
 # A start that grows with the LAUNCH rather than with the block.  These are the
 # names this corpus builds a grid-wide index from.
-GRIDWIDE_START = re.compile(r'\bglobalWarpIdx\b|\bglobalThreadIdx\b|\bgid\b'
-                            r'|\bgroupId\b|\bdtid\b|\bblockIdx\b|\bdispatchThreadId\b')
+#
+# Both spellings of each name, `...Idx` AND `...Index`.  The first version listed
+# only globalWarpIdx / globalThreadIdx, and doAggPairCollisions spells its start
+# `globalWarpIndex`: its loop -- a persistent grid of 8192 x 2 groups over a pair
+# pool sized from a capacity of 1024 -- was tiered LOW-loop for as long as this
+# file has existed.  Found by the second review of the one-group-per-warp tranche,
+# not by this checker.  The names below are the ones the corpus actually uses as a
+# loop start (measured over every `for (uint v = <start>;` header).
+GRIDWIDE_START = re.compile(r'\bglobal(?:Warp|Thread)I(?:dx|ndex)\b|\bgid\b'
+                            r'|\bgroupI(?:d|D|dx)\b|\bdtid\b|\bblockIdx\b'
+                            r'|\bdispatchThreadI(?:d|D)\b')
 # A stride that is sized to the DATA: the engine computed the grid from the count.
+#
+# That premise is the HOST'S, not the shader's, and it is false wherever the host
+# launches a constant grid: `WorkgroupCount().x` is then a constant too, only one
+# the shader cannot spell.  doAggPairCollisions is the case that showed it (the
+# engine launches AGG_PAIR_COLLISION with 8192 blocks, "KS - we have no idea how many
+# agg-actor pairs we might have"; the port 8192 x 2 groups), so a group-index start
+# with a WorkgroupCount() stride is a persistent grid exactly like P9.49's constant
+# 2048.  persistent_grid_loop() therefore only accepts this stride for an entry
+# point whose host grid is NOT a compile-time constant -- see host_constant_grids().
+#
+# Still NOT seen, written down for the reason given at the top of this file: a start
+# or a stride that reaches the header through a LOCAL alias (`idx = gtid.x + gid.x *
+# B`, `stride = ...`), and a loop in a helper rather than in the entry itself (the
+# host lookup is by entry point).  When this rule went in, ten LOW-loop headers sat
+# in constant-grid entries, some of them through such an alias (updateBounds,
+# bodyUpdate updateShapesLaunch, thresholdStreamBda x3, solverTGS solveWholeIslandTGS,
+# psContactSolveBda x2, npRigidSumBatches x2), none with a barrier or warp primitive in
+# its body -- so llvmpipe never runs them with an EMPTY mask, which is P9.49's
+# mechanism; the speculated lanes stay within one SIMD batch of a live one.
 DATA_SIZED_STRIDE = re.compile(r'WorkgroupCount|GroupCount|gridDim|gridStride|numWarps')
 
 
@@ -367,7 +395,110 @@ def const_uint(src, name):
     return m.group(1).strip() if m else None
 
 
-def persistent_grid_loop(src, header):
+def port_view(text):
+    """Host source as the port compiles it: the CUDA (`#else`) branch of every
+    `#ifdef PXG_NO_CUDA_TOOLKIT`, the body of `#ifndef PXG_NO_CUDA_TOOLKIT` and every
+    `#if 0` region blanked, line numbering kept.  Any other conditional keeps both
+    branches -- this cannot decide it, and dropping one could hide a launch site."""
+    out = []
+    stack = []            # per open #if: [kind, active]
+    for line in text.split('\n'):
+        s = line.strip()
+        live = all(a for _k, a in stack)
+        if re.match(r'#\s*if', s):
+            if re.match(r'#\s*ifdef\s+PXG_NO_CUDA_TOOLKIT\b', s):
+                stack.append(['port', True])
+            elif re.match(r'#\s*ifndef\s+PXG_NO_CUDA_TOOLKIT\b', s):
+                stack.append(['port', False])
+            elif re.match(r'#\s*if\s+0\s*$', s):
+                stack.append(['zero', False])
+            else:
+                stack.append(['other', True])
+            out.append('')
+            continue
+        if re.match(r'#\s*el(?:se|if)\b', s) and stack:
+            # The other branch of `#if 0` is live code (an `#elif` is kept, as any
+            # other undecided condition is); blanking it could hide a launch site.
+            if stack[-1][0] == 'port':
+                stack[-1][1] = not stack[-1][1]
+            elif stack[-1][0] == 'zero':
+                stack[-1][1] = True
+            out.append('')
+            continue
+        if re.match(r'#\s*endif\b', s) and stack:
+            stack.pop()
+            out.append('')
+            continue
+        out.append(line if live else '')
+    return '\n'.join(out)
+
+
+# `_launch<DEBUG>(PROLOG, PxgKernelIds::ID, gx, ...)` -- the AABB manager's form; the
+# launchKernel(fn, gx, ...) form is check_block_coverage.LAUNCH.
+LAUNCH_ID = re.compile(r'_launch\s*<[^>]*>\s*\(\s*PROLOG\s*,\s*PxgKernelIds::(\w+)\s*,\s*([^,]+),')
+_HOST_FIXED = None
+
+
+def host_constant_grids():
+    """(shader basename without .slang, entry) -> 'file:line grid = N' for every
+    mapped kernel that the engine launches, in the PORT's view of the host code, with
+    a grid x that resolves to a compile-time constant.
+
+    That is the set for which a WorkgroupCount() stride is NOT sized to the data.
+    Resolution is check_block_coverage's (nearest preceding declaration, the
+    *BlockDim / *GridDim enums, the integer macros), so a `PxMin(..., 65535u)` cap or
+    anything derived from a count stays unresolved and keeps the exemption -- which is
+    the direction a static check has to err in here: it may miss a constant it cannot
+    evaluate, and it only resolves through the enclosing function's own declarations
+    (a later reassignment is not followed).  One constant launch site is enough to lose
+    the exemption; the shader cannot know which site launched it."""
+    global _HOST_FIXED
+    if _HOST_FIXED is not None:
+        return _HOST_FIXED
+    import check_block_coverage as cbc
+    cbc.CONSTS = cbc.dim_constants()
+    cbc.DEFINES = cbc.int_defines()
+    names = cbc.kernel_names()
+    byname = {}
+    for cuda, spv, entry, _line in cbc.load_manifest():
+        byname.setdefault(cuda, set()).add((spv[:-4] if spv.endswith('.spv') else spv, entry))
+    out = {}
+    for dirpath, _d, files in os.walk(cbc.SRC):
+        if os.sep + 'gpuslang' in dirpath:
+            continue
+        for fn in files:
+            if not fn.endswith('.cpp'):
+                continue
+            raw = open(os.path.join(dirpath, fn), encoding='utf-8', errors='replace').read()
+            text = port_view(strip_comments(raw))
+            decls = [(m.start(), m.group(1), m.group(2)) for m in cbc.DECL.finditer(text)]
+            sites = []
+            assigns = [(m.start(), m.group(1), m.group(2)) for m in cbc.GETFN_VAR.finditer(text)]
+            marks = [(m.start(), m.group(1)) for m in cbc.GETFN.finditer(text)]
+            for m in cbc.LAUNCH.finditer(text):
+                byvar = [a for a in assigns if a[1] == m.group(1) and a[0] < m.start()]
+                prev = [nm for pos, nm in marks if pos < m.start()]
+                enum = byvar[-1][2] if byvar else (prev[-1] if prev else None)
+                sites.append((m.start(), enum, m.group(2)))
+            for m in LAUNCH_ID.finditer(text):
+                sites.append((m.start(), m.group(1), m.group(2)))
+            for pos, enum, gx in sites:
+                # Only declarations of the ENCLOSING function (host bodies open with a
+                # `{` in column 0).  check_block_coverage resolves a name to its nearest
+                # preceding declaration anywhere in the file, which is fine for a block
+                # size; for a grid it would turn `numVertBlocks = numTests` into another
+                # function's `numTests = 0` and invent a constant.
+                fstart = text.rfind('\n{', 0, pos)
+                val = cbc.resolve(gx, [d for d in decls if d[0] > fstart], pos)
+                if val is None or enum not in names:
+                    continue
+                for key in byname.get(names[enum], ()):
+                    out.setdefault(key, '%s:%d grid x = %d' % (fn, text.count('\n', 0, pos) + 1, val))
+    _HOST_FIXED = out
+    return out
+
+
+def persistent_grid_loop(src, header, fixed_grid=None):
     """Does this loop's FIRST index already sit past its own bound?
 
     P9.49.  LOW-loop's whole claim is "overshoot <= one stride", and that claim
@@ -385,7 +516,9 @@ def persistent_grid_loop(src, header):
     against a 1100-element buffer, 39 KB past the end, faulting about one run in
     twenty.  A start of `lane` or `tid` cannot exceed the bound by more than a
     block, and a stride built from WorkgroupCount() means the launch was sized to
-    the data; neither is reported.
+    the data; neither is reported -- UNLESS `fixed_grid` says the host launches this
+    entry with a constant grid (host_constant_grids()), when the WorkgroupCount()
+    stride is a persistent grid's constant the shader merely cannot spell.
     """
     m = FOR_PARTS.match(header)
     if not m:
@@ -412,6 +545,8 @@ def persistent_grid_loop(src, header):
             break
         expanded = nxt
     if DATA_SIZED_STRIDE.search(expanded):
+        if fixed_grid:
+            return init, '%s (host grid a constant: %s)' % (step, fixed_grid)
         return None
     if not re.fullmatch(r'[\s\d\(\)\*\+u]+', expanded):
         return None       # cannot show it is a constant -- do not claim it is
@@ -547,7 +682,13 @@ def analyse_helper_calls(sh):
         var, _cond = loop_induction(header)
         if not var:
             continue
-        pg = persistent_grid_loop(src, header)
+        loopfn = '?'
+        for fn, occ in sh.funcs.items():
+            for (fs, fe) in occ:
+                if fs <= m.start() < fe:
+                    loopfn = fn
+        pg = persistent_grid_loop(src, header,
+                                  host_constant_grids().get((sh.name[:-6], loopfn)))
         if not pg:
             continue
         i, j = _brace_range(src, m.end())
@@ -638,7 +779,8 @@ def analyse_shader(sh):
                     kind, cond, root = hit
                     tier, why = 'HIGH', None
                     if kind == 'loop' and loop_induction(cond)[0] == root:
-                        pg = persistent_grid_loop(src, cond)
+                        pg = persistent_grid_loop(src, cond,
+                                                  host_constant_grids().get((sh.name[:-6], name)))
                         if pg:
                             tier = 'HIGH'
                             why = ("P9.49: this loop STARTS at a grid-wide id (%s) and "
@@ -734,6 +876,11 @@ SELFTEST_TO = """    if (workIndex >= nbBodies)
     return counts[workIndex];"""
 
 
+AGG_SELFTEST_FILE = 'aggregateBda.slang'
+AGG_SELFTEST_FROM = 'const PxgAggregatePairGpu pair = pairs[iL];'
+AGG_SELFTEST_TO = 'const PxgAggregatePairGpu pair = pairs[i];'
+
+
 def selftest_persistent_grid():
     """Negative control for the P9.49 split.
 
@@ -756,6 +903,12 @@ def selftest_persistent_grid():
          'a BLOCK-LOCAL start cannot exceed the bound by more than a block'),
         ('for (uint i = idx; i < gNumShapes; i += BLK * WorkgroupCount().x)', False,
          'a stride built from WorkgroupCount() means the launch was sized to the data'),
+        # The second review of the one-group-per-warp tranche: the other spelling of
+        # the start, and a WorkgroupCount() stride whose host grid is a constant.
+        ('for (uint i = globalWarpIndex; i < n; i += STRIDE)', True,
+         'globalWarpIndex is the same grid-wide start as globalWarpIdx'),
+        ('for (uint i = globalWarpIndex; i < n; i += WorkgroupCount().x)', False,
+         'WorkgroupCount() over a data-sized host grid keeps the exemption'),
     ]
     ok = True
     for header, want, why in cases:
@@ -763,6 +916,30 @@ def selftest_persistent_grid():
         if got != want:
             print('SELFTEST FAILED (P9.49): %r -> %s, expected %s\n  case: %s'
                   % (header, got, want, why))
+            ok = False
+    if not persistent_grid_loop(src, 'for (uint i = globalWarpIndex; i < n; i += WorkgroupCount().x)',
+                                'PxgAABBManager.cpp grid x = 16384'):
+        print('SELFTEST FAILED: a WorkgroupCount() stride over a CONSTANT host grid kept '
+              'the data-sized exemption.  doAggPairCollisions (8192 x 2 groups) is a '
+              'persistent grid whatever the shader spells its stride.')
+        ok = False
+    # The host side of that rule: the constant has to be read off the launch site.
+    fixed = host_constant_grids().get(('aggregateBda', 'doAggPairCollisions'))
+    if not fixed:
+        print('SELFTEST BROKEN: host_constant_grids() no longer resolves the '
+              'AGG_PAIR_COLLISION launch (PxgAABBManager.cpp, numBlocks = 8192) to a '
+              'constant.  Re-anchor it on that launch; do NOT delete the selftest.')
+        ok = False
+    for key in (('softBodyMeshMidphaseBda', 'sb_meshMidphaseGeneratePairsLaunch'),):
+        if not host_constant_grids().get(key):
+            print('SELFTEST BROKEN: %s:%s (host grid 1024 x 2) is not resolved as a '
+                  'constant grid.' % key)
+            ok = False
+    for key in (('sortTriIndicesBda', 'sortTriangleIndices'),
+                ('aggregateBda', 'sortAndUpdateAggregateProjections')):
+        if host_constant_grids().get(key):
+            print('SELFTEST FAILED: %s:%s is launched with a count-derived, capped grid '
+                  'and was read as a constant -- the resolver invents constants.' % key)
             ok = False
     # A stride this checker cannot resolve to a constant must NOT be claimed as
     # one: an unresolvable name is unknown, not proven fixed.
@@ -850,6 +1027,38 @@ def selftest():
         return 2
     print('selftest: re-injecting the P9.22 read makes countAt a HIGH finding.  '
           'The check can still see it.')
+    # The second negative control: take the clamp back out of doAggPairCollisions
+    # (the site the second review of the one-group-per-warp tranche found) and
+    # demand the finding.  Both halves of that rule have to be awake for it -- the
+    # `globalWarpIndex` spelling and the constant-host-grid stride.
+    aggSrc = open(os.path.join(SHADERS, AGG_SELFTEST_FILE)).read()
+    if AGG_SELFTEST_FROM not in aggSrc and AGG_SELFTEST_TO in aggSrc:
+        # The tree itself carries the unclamped load: nothing to inject.  The tree's own
+        # scan is then the negative control -- it must already hold the finding, which
+        # the main scan below reports as the real failure.  Standing aside WITHOUT this
+        # check would let an unclamped tree and a broken rule pass together.
+        if not any('doAggPairCollisions' in g for g in base):
+            print('SELFTEST FAILED: %s carries the unclamped pairs[i] load and the scan does '
+                  'NOT report it as HIGH.  The constant-host-grid rule is not awake.'
+                  % AGG_SELFTEST_FILE)
+            return 2
+        print('selftest: %s already has the unclamped pair load and the scan reports it; '
+              'the main scan below fails on it.' % AGG_SELFTEST_FILE)
+        return 0
+    broken = load_corpus((AGG_SELFTEST_FILE, AGG_SELFTEST_FROM, AGG_SELFTEST_TO))
+    if broken is None:
+        print('SELFTEST BROKEN: the anchor is no longer in %s.' % AGG_SELFTEST_FILE)
+        print('  Re-anchor it on the current spelling of the doAggPairCollisions pair '
+              'load; do NOT delete the selftest.')
+        return 2
+    after = {f.key() for f in sum((analyse_shader(s) for s in broken), [])
+             if f.tier == 'HIGH'}
+    if not any('doAggPairCollisions' in g for g in after - base):
+        print('SELFTEST FAILED: the unclamped pairs[i] in doAggPairCollisions (a '
+              'group-index start over a constant 8192 x 2 grid) is not a HIGH finding.')
+        return 2
+    print('selftest: unclamping doAggPairCollisions makes it a HIGH finding.  The '
+          'constant-host-grid rule is awake.')
     return 0
 
 

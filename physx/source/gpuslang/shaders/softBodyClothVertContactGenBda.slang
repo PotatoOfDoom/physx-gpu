@@ -58,8 +58,12 @@
 // point.  (5.6.1 wrote the (0,0,0,1) vertex marker and computeTetBarycentric of closestP.)
 //
 // GRID.  A plain 1D grid-stride loop over the midphase pairs (gridDim.x * blockDim.x).  The
-// bridge ignores blockDim, so the stride here is the CUDA blockDim.x * gridDim.x with
-// blockDim.x = 32 folded in.
+// bridge ignores blockDim, so the group IS the block: it used to be 32 threads, i.e. one of
+// the CUDA block's eight warps, the other seven walked as further passes of the stride loop.
+// The threads never cooperate (no ballot, no shared memory, one atomicAdd per contact), so the
+// group is now the CUDA block itself, 256 threads, and the stride the launched thread count
+// WorkgroupCount().x * 256 -- the CUDA's 512 * 256 at the engine's fixed grid, so every thread
+// takes exactly the pairs of its CUDA thread.
 // ===========================================================================
 module softBodyClothVertContactGenBda;
 
@@ -75,15 +79,14 @@ static const uint GEOM_TETRAHEDRONMESH = 7u;
 
 
 
-// The engine launches 512 blocks of 256 threads (PxgNarrowphaseCore.cpp:4805).  The bridge
-// ignores blockDim and dispatches groups of 32, so the thread-to-pair MAPPING differs from
-// CUDA's -- which is harmless here and only here: this is a grid-stride loop over independent
-// pairs, so all that matters is that every index below numPairs is visited exactly once, and
-// any (base, stride) with base < stride does that.  The kernels that ballot within a warp do
-// NOT have that freedom, which is why they walk the block's warps serially instead.
+// The engine launches 512 blocks of 256 threads (PxgNarrowphaseCore.cpp).  The bridge ignores
+// blockDim, so [numthreads] is the block, and it is the CUDA's 256: the thread-to-pair MAPPING
+// is then the CUDA's exactly.  (With independent pairs any (base, stride) with base < stride
+// visits every index once, which is why the old 32-thread group was correct, only eight times
+// narrower.  The kernels that ballot within a warp do NOT have that freedom; they launch one
+// 32-thread group per CUDA warp instead.)
 static const uint SB_VERT_CG_GRID = 512u;
-static const uint SB_VERT_CG_BLOCK = 32u;
-static const uint SB_VERT_CG_STRIDE = SB_VERT_CG_GRID * SB_VERT_CG_BLOCK;
+static const uint SB_VERT_CG_BLOCK = 256u;
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the 5.12 CUDA pack:
@@ -171,7 +174,7 @@ void loadSoftbodyClothPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheRef
 }
 
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(SB_VERT_CG_BLOCK, 1, 1)]
 void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint globalThreadIdx = gid.x * SB_VERT_CG_BLOCK + gtid.x;
@@ -189,7 +192,7 @@ void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     Ptr<PxgFEMClothGpu> clothes = Ptr<PxgFEMClothGpu>(gVc.clothes);
     Ptr<float> contactDistance = Ptr<float>(gVc.contactDistance);
 
-    for (uint i = globalThreadIdx; i < numPairs; i += SB_VERT_CG_STRIDE)
+    for (uint i = globalThreadIdx; i < numPairs; i += WorkgroupCount().x * SB_VERT_CG_BLOCK)
     {
         const uint4 curPair = Ptr<uint4>(gVc.stackPtr)[i];
         const uint cmIdx = curPair.x;

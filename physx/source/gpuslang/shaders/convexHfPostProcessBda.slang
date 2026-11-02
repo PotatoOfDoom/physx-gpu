@@ -234,8 +234,12 @@ void convexHeightfieldPostProcess(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     const uint64_t niIndexAddr = cvxTriNI + uint64_t(convexTriPairOffset) * 16UL + 12UL;
     const uint niWord = Ptr<uint>(niIndexAddr)[0];
 
+    // The CUDA's `return` here leaves convexHeightfieldPostProcessCore, i.e. it ends one
+    // iteration of the caller's grid-stride loop; this body IS that loop's body, so it is
+    // a `continue`.  A `return` dropped every later pair of the thread whenever the grid
+    // is smaller than the queue (the 65535 cap, or 256 threads per manager exceeded).
     if (ppGetNbContacts(niWord) == 0u)
-        return;
+        continue;
 
     // ---- the heightfield blob ---------------------------------------------
     // THE SHAPE COMES FROM curPair.w, NOT FROM THE CONTACT MANAGER.  The midphase

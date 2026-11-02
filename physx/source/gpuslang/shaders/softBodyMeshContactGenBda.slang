@@ -90,8 +90,11 @@
 // so the emitted contact set and the atomic total are identical.
 //
 // THE GRID: SB_MESHCG = 1024 blocks of (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK = 2), gridDim.y = 1.
-// The bridge drops blockDim, so the block's two warps are walked serially and the stride stays
-// the CUDA `gridDim.x * blockDim.y` = 2048.
+// The bridge drops blockDim, so the block's two warps used to be walked serially in one group.
+// The launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per
+// CUDA warp, 2048 groups, so the warp index is gid.x and the stride the group count
+// WorkgroupCount().x -- the CUDA's `gridDim.x * blockDim.y` = 2048 at that grid, and at any
+// other grid still every stack entry exactly once.
 //
 // THE TAIL: `atomicMax(stackSizeNeededOnDevice, numMidphasePairsFound * sizeof(uint4))` uses the
 // UNCLAMPED count, so the host learns how much stack the frame actually wanted even when the
@@ -114,7 +117,6 @@ import pxgSlangTetCollide;     // tetPrimitivesCollide2 / computeInnerSphere
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h — SB_MESHCG.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_MESHCG = 1024u;
-static const uint SB_CG_STRIDE = SB_MESHCG * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
@@ -265,11 +267,12 @@ void sb_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
     // Lane 0 runs the whole query (see the header); the other 31 have nothing to do.
     if (lane == 0u)
     {
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. gridDim.x * blockDim.y.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint i = globalWarpIdx; i < numPairs; i += SB_CG_STRIDE)
+    for (uint i = globalWarpIdx; i < numPairs; i += WorkgroupCount().x)
     {
         const uint4 curPair = Ptr<uint4>(gMc.stackPtr)[i];
         const uint cmIdx = curPair.x;

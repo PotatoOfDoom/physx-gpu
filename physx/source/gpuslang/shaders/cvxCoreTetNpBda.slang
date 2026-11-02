@@ -83,15 +83,19 @@
 // generateContacts; 5.6.1 had no filter on this path.
 //
 // ===========================================================================
-// THE GRID IS THE TRIMESH KERNEL'S, AND SO IS THE SERIAL PARTITION
+// THE GRID IS THE TRIMESH KERNEL'S, AND SO IS THE PARTITION
 // ===========================================================================
 //
 //     const PxU32 testIndex = threadIdx.y + blockIdx.x * blockDim.y;   // :1113
 //
-// block (32, 4, 1), grid ceil(numTests/4), one warp per test.  The bridge forwards
-// gridDim only and drops blockDim, so [numthreads] IS the block and the four warps
-// are walked SERIALLY -- 32 x 4 = 128 = the block, exactly.  tools/check_block_coverage.py
-// is what holds this to the arithmetic.
+// block (32, 4, 1), grid ceil(numTests/4), one warp per test, the four warps
+// independent (per-warp `_Shared` slots, __syncwarp only).  The bridge forwards
+// gridDim only and drops blockDim, so [numthreads] IS the block; the four warps used
+// to be walked SERIALLY in one 32-thread group.  The launch site now
+// (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp,
+// ceil(numTests/4) * 4 groups, and a group-stride loop (stride WorkgroupCount().x)
+// covers every test at any smaller grid.  tools/check_block_coverage.py is what
+// holds this to the arithmetic.
 
 import pxgSlangNpAbi;           // struct mirrors and quaternion helpers
 import pxgSlangCvxCoreShape;    // ShapeRef / PtsRef / supportLocalQ / contactFaceQ
@@ -123,7 +127,7 @@ static const uint EGT_TETRAHEDRONMESH = 7u;   // PxGeometryType::eTETRAHEDRONMES
 #include "pxgSlangCvxCoreMake.slang"   // Gu::makeConvexShape, all five arms
 
 static const uint CVXCORE_TET_WARP = 32u;        // blockDim.x, and the group
-static const uint CVXCORE_TET_BLOCK_WARPS = 4u;  // blockDim.y, walked serially
+static const uint CVXCORE_TET_BLOCK_WARPS = 4u;  // blockDim.y, one group per warp
 static const uint CVXCORE_TET_STACK = 320u;      // TestBvh::NODE_STACK_MAX
 static const uint MAX_CONVEX_CONTACTS = 4u;      // Gu::MAX_CONVEX_CONTACTS
 
@@ -163,8 +167,9 @@ struct CvxCoreTetParams
 ConstantBuffer<CvxCoreTetParams> gTet;
 
 // ---------------------------------------------------------------------------
-// Warp emulation scratch.  One group == one virtual warp; the four tests reuse it
-// in turn, separated by the barrier at the top of each trip.
+// Warp emulation scratch.  One group == one virtual warp; the tests a group takes
+// (one at the port's grid, more at a smaller one) reuse it in turn, separated by the
+// barrier at the top of each trip.
 // ---------------------------------------------------------------------------
 groupshared int sTetStack[CVXCORE_TET_STACK];
 groupshared uint sTetBallot;
@@ -283,12 +288,15 @@ void convexCoreTetmeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
     Ptr<PxgShapeGpu> shapesP = Ptr<PxgShapeGpu>(gTet.shapes);
     Ptr<PxsCachedTransformGpu> xfP = Ptr<PxsCachedTransformGpu>(gTet.transformCache);
 
-    for (uint sub = 0u; sub < CVXCORE_TET_BLOCK_WARPS; ++sub)
+    // One group per CUDA warp (see the header on the grid), and a group-stride loop so
+    // any smaller grid still covers every test.  The loop bound is group-uniform.
+    for (uint testLoop = gid.x; testLoop < gTet.numTests; testLoop += WorkgroupCount().x)
     {
-        const uint testIndex = gid.x * CVXCORE_TET_BLOCK_WARPS + sub;
         GroupMemoryBarrierWithGroupSync();   // the scratch is reused per test
-        if (testIndex >= gTet.numTests)
-            continue;                        // group-uniform
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.
+        // Every live iteration has testIndex == testLoop.
+        const uint testIndex = min(testLoop, max(gTet.numTests, 1u) - 1u);
 
         // ---- TestInput (:66-96) + checkTypes (:98-108) ----------------------
         const PxgContactManagerInputGpu cin = Ptr<PxgContactManagerInputGpu>(gTet.cmInputs)[testIndex];

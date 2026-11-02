@@ -89,6 +89,7 @@
 
 #include "geometry/PxGeometry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -139,6 +140,40 @@ struct CorePush
     uint64_t ni, maxDepth, interm, ordered, pairs, output;
     uint32_t numPairs, pad;
 };
+
+// The ENGINE kernel's blob: the 21-argument pack of convexHeightfield.cu:791-818, the
+// shared kCvxTriCore 168 bytes (sphereHfNpBda.slang's SphereHfNpParams).
+struct ShnPush
+{
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes;
+    uint64_t sphereTrimeshPair;
+    uint64_t niPtr, contactsPtr, maxDepthPtr, intermPtr, orderedPtr, secondPassPtr;
+    uint64_t stackPtr, nbPairsGlobal, nbPaddedPairsGlobal, nbSecondPassPairs;
+    uint32_t stackSizeBytes, pad124;
+    uint64_t tempContacts, pTempContactIndex, maxTempMemRequirement, midphasePairsNeeded;
+    uint32_t nbContactManagers, pad164;
+};
+static_assert(sizeof(ShnPush) == 168, "the shared kCvxTriCore blob is 168 bytes");
+
+// maCompute (pxgSlangMidphaseAlloc.slang:90-105), mirrored so the fixture knows where
+// the engine kernel put each section of the stack (same mirror as testSphereTriNp.cpp).
+struct ShnStack { uint64_t pairs, ni, contacts, ordered, maxDepth, interm, secondPass, total; };
+static ShnStack shnStackLayout(uint32_t nbPairs, uint32_t nbPaddedPairs)
+{
+    const uint64_t n = uint64_t((nbPairs + 3u) & ~3u);
+    const uint64_t nPadded = uint64_t(nbPaddedPairs);
+    ShnStack s{};
+    uint64_t p = 0;
+    s.pairs = p;      p += n * 16;
+    s.ni = p;         p += n * 16;
+    s.contacts = p;   p += n * 4;
+    s.ordered = p;    p += nPadded * 4;
+    s.maxDepth = p;   p += n * 4;
+    s.interm = p;     p += n * 4;
+    s.secondPass = p; p += n * 4;
+    s.total = p;
+    return s;
+}
 
 // ---------------------------------------------------------------------------
 // distancePointTriangleSquared (sphereTriangle.cuh:41-140)
@@ -837,6 +872,138 @@ PXG_TEST(sphereHfCore)
             if (!claimedOrd[k] && gotOrd[k] != U_SENTINEL) ++stray;
         if (stray != 0)
         { bad += stray; std::printf("  %zu record slots written outside their pair offset\n", stray); }
+    }
+
+    // ---- the ENGINE kernel, sphereHeightfieldNarrowphase (sphereHfNpBda.slang) ----
+    // Second review of the one-group-per-warp tranche: no fixture loaded sphereHfNpBda.spv.
+    // Its core is the arithmetic verified above; what only the engine kernel has is the
+    // per-thread numbering `gid.x * 32 + lane` with stride `WorkgroupCount().x * 32`, the
+    // warp output stage (scan + one atomic per warp into the temp contacts, the second-pass
+    // queue) and the maCompute layout.  The port's launch site issues two 32-thread groups
+    // per 64-thread CUDA block.  The case table four times over -- each copy its own
+    // contact manager, so 4n pairs over two CUDA blocks -- runs at that port grid, at the
+    // CUDA's block count, and at 3 and 1 groups, each checked against the mirror: the
+    // per-pair records directly, the contacts through each pair's own `contacts` slot,
+    // and the second-pass queue as a set (its order is the warps' race, as in CUDA).
+    {
+        const uint32_t COPIES = 4u;
+        const uint32_t M = COPIES * n;
+        std::vector<CmInput> cmsE(M);
+        for (uint32_t j = 0; j < M; ++j) cmsE[j] = cms[j % n];
+        const ShnStack so = shnStackLayout(M, M);
+        std::vector<uint8_t> stackInit(size_t(so.total) + 256, 0xA5);
+        std::vector<uint8_t> pairRecs(size_t(M) * 56, 0);
+        for (uint32_t j = 0; j < M; ++j)
+        {
+            // pair j is contact manager j's only pair: startIndex = roundedStartIndex = j,
+            // testOffset 0, so every record lands at slot j
+            const uint32_t v[4] = { j, specs[j % n].tri, 0u, 0u };
+            std::memcpy(&stackInit[size_t(so.pairs) + size_t(j) * 16], v, 16);
+            std::memcpy(&pairRecs[size_t(j) * 56 + 28], &j, 4);
+            std::memcpy(&pairRecs[size_t(j) * 56 + 40], &j, 4);
+        }
+        uint32_t wantTotal = 0, wantDeferred = 0;
+        std::vector<uint32_t> wantSecond;
+        for (uint32_t j = 0; j < M; ++j)
+        {
+            const Expected& e = exp[j % n];
+            wantTotal += e.nb;
+            if (e.outMask != 0u) { ++wantDeferred; wantSecond.push_back(j | e.mask); }
+        }
+        std::sort(wantSecond.begin(), wantSecond.end());
+        // contacts in both 32-pair halves of both CUDA blocks, so a block-scaled start or
+        // stride has something to lose
+        size_t perQuarter[4] = { 0, 0, 0, 0 };
+        for (uint32_t j = 0; j < M && j < 128u; ++j)
+            if (exp[j % n].nb) ++perQuarter[j / 32u];
+        PXG_CHECK_MSG(M > 64u && perQuarter[0] && perQuarter[1] && perQuarter[2] && perQuarter[3] &&
+                      wantDeferred > 0, "engine run: contacts not spread over both warps of both blocks");
+
+        const uint32_t numBlocks = (M + 63u) / 64u;
+        const uint32_t grids[4] = { 2u * numBlocks, numBlocks, 3u, 1u };
+        const char* gridNames[4] = { "port", "CUDA", "three-group", "one-group" };
+        PxgBufferHandle bCmE = createBufferFrom(dev, cmsE);
+        PxgBufferHandle bRecE = createBufferFrom(dev, pairRecs);
+        for (uint32_t gi = 0; gi < 4; ++gi)
+        {
+            std::vector<uint32_t> counters = { M, M, 0u, 0u };
+            std::vector<uint32_t> scratch(16, 0u);
+            std::vector<uint64_t> outPtrs(8, 0u);
+            std::vector<float> temp(size_t(M) * 2 * 4 + 64, -99.0f);
+            PxgBufferHandle bStackE = createBufferFrom(dev, stackInit);
+            PxgBufferHandle bCtrE = createBufferFrom(dev, counters);
+            PxgBufferHandle bScratchE = createBufferFrom(dev, scratch);
+            PxgBufferHandle bPtrE = createBufferFrom(dev, outPtrs);
+            PxgBufferHandle bTempE = createBufferFrom(dev, temp);
+            const uint64_t aCtr = dev->getBufferDeviceAddress(bCtrE);
+            const uint64_t aScr = dev->getBufferDeviceAddress(bScratchE);
+            const uint64_t aPtr = dev->getBufferDeviceAddress(bPtrE);
+
+            ShnPush p{};
+            p.cmInputs = dev->getBufferDeviceAddress(bCmE);
+            p.transformCache = dev->getBufferDeviceAddress(bXf);
+            p.contactDistance = dev->getBufferDeviceAddress(bCd);
+            p.gpuShapes = dev->getBufferDeviceAddress(bShapes);
+            p.sphereTrimeshPair = dev->getBufferDeviceAddress(bRecE);
+            p.niPtr = aPtr; p.contactsPtr = aPtr + 8; p.maxDepthPtr = aPtr + 16;
+            p.intermPtr = aPtr + 24; p.orderedPtr = aPtr + 32; p.secondPassPtr = aPtr + 40;
+            p.stackPtr = dev->getBufferDeviceAddress(bStackE);
+            p.nbPairsGlobal = aCtr;
+            p.nbPaddedPairsGlobal = aCtr + 4;
+            p.nbSecondPassPairs = aScr;
+            p.stackSizeBytes = uint32_t(stackInit.size());
+            p.tempContacts = dev->getBufferDeviceAddress(bTempE);
+            p.pTempContactIndex = aScr + 4;
+            p.maxTempMemRequirement = aScr + 8;
+            p.midphasePairsNeeded = aScr + 12;
+            p.nbContactManagers = M;
+
+            Kernel ke("sphereHfNpBda.spv", "sphereHeightfieldNarrowphase", {}, sizeof(ShnPush));
+            ke.dispatch(grids[gi], {}, p, 1u, 1u);
+            dev->flush();
+            const auto st = downloadBuffer<uint8_t>(dev, bStackE, stackInit.size());
+            const auto tp = downloadBuffer<uint32_t>(dev, bTempE, temp.size());
+            const auto sc = downloadBuffer<uint32_t>(dev, bScratchE, scratch.size());
+            auto word = [&](uint64_t off) { uint32_t v; std::memcpy(&v, &st[size_t(off)], 4); return v; };
+
+            size_t eBad = 0;
+            auto chk = [&](uint32_t j, const char* w, uint32_t g, uint32_t e) {
+                if (g != e && ++eBad <= 8)
+                    std::printf("  [engine %s, pair %u: case %u %s] %s: got=0x%08x exp=0x%08x\n",
+                                gridNames[gi], j, j % n, specs[j % n].why, w, g, e); };
+            for (uint32_t j = 0; j < M; ++j)
+            {
+                const Expected& e = exp[j % n];
+                chk(j, "ni.normal.x", word(so.ni + j * 16 + 0), bitsF(e.niNormal.x));
+                chk(j, "ni.normal.y", word(so.ni + j * 16 + 4), bitsF(e.niNormal.y));
+                chk(j, "ni.normal.z", word(so.ni + j * 16 + 8), bitsF(e.niNormal.z));
+                chk(j, "ni.index", word(so.ni + j * 16 + 12), e.niIndex);
+                chk(j, "maxDepth", word(so.maxDepth + j * 4), bitsF(e.maxDepth));
+                chk(j, "interm", word(so.interm + j * 4), e.interm);
+                chk(j, "ordered", word(so.ordered + j * 4), e.ordered);
+                if (e.nb)
+                {
+                    // the contact is the sphere's own origin, the separation the distance
+                    const uint32_t cs = word(so.contacts + j * 4);
+                    if (cs >= M) { chk(j, "contact slot", cs, 0u); continue; }
+                    chk(j, "contact.x", tp[size_t(cs) * 4 + 0], bitsF(e.contact.x));
+                    chk(j, "contact.y", tp[size_t(cs) * 4 + 1], bitsF(e.contact.y));
+                    chk(j, "contact.z", tp[size_t(cs) * 4 + 2], bitsF(e.contact.z));
+                    chk(j, "contact.sep", tp[size_t(cs) * 4 + 3], bitsF(e.sep));
+                }
+            }
+            std::vector<uint32_t> gotSecond(sc[0]);
+            for (uint32_t q = 0; q < sc[0] && q < M; ++q) gotSecond[q] = word(so.secondPass + q * 4);
+            std::sort(gotSecond.begin(), gotSecond.end());
+            if (sc[0] != wantDeferred || gotSecond != wantSecond)
+            { ++eBad; std::printf("  [engine %s] second-pass queue: %u entries, want %u\n", gridNames[gi], sc[0], wantDeferred); }
+            if (sc[1] != wantTotal)
+            { ++eBad; std::printf("  [engine %s] temp contact count %u, want %u\n", gridNames[gi], sc[1], wantTotal); }
+            PXG_CHECK_MSG(eBad == 0, "sphereHeightfieldNarrowphase at the %s grid (%u groups): %zu mismatches "
+                          "against the mirror", gridNames[gi], grids[gi], eBad);
+            for (PxgBufferHandle h : { bStackE, bCtrE, bScratchE, bPtrE, bTempE }) dev->destroyBuffer(h);
+        }
+        dev->destroyBuffer(bCmE); dev->destroyBuffer(bRecE);
     }
 
     dev->destroyBuffer(bHfA); dev->destroyBuffer(bHfB); dev->destroyBuffer(bShapes);

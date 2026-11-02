@@ -105,7 +105,11 @@
 //     other softbody midphase in that file uses, though it has the same value), and
 //     the comment directly above it -- "each warp deal with one test" -- is
 //     copy-pasted from the softbody-vs-softbody launch and does not describe this
-//     kernel, which gives each warp a STRIDE of particles.
+//     kernel, which gives each warp a STRIDE of particles.  The bridge drops blockDim, so the
+//     block's two warps used to be walked serially in one 32-thread group; the launch site
+//     now (PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp, (1024 * 2, numTests, 1),
+//     so the warp index is gid.x and the stride the group count WorkgroupCount().x -- the
+//     CUDA's 2048 at that grid, and at any other grid still every particle exactly once.
 // ===========================================================================
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mTetIndices@16,
@@ -116,7 +120,6 @@ import pxgSlangTetClosest;     // isValidTet -- T2
 
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SBPS_MIDPHASE_GRID = 1024u;                                   // T9
-static const uint SBPS_NB_WARPS = SBPS_MIDPHASE_GRID * MIDPHASE_WARPS_PER_BLOCK;
 static const uint STACK_SIZE = 192u;    // femMidphaseScratch.sBv32Nodes[192]
 
 static const uint GEOM_PARTICLESYSTEM = 6u;   // T4
@@ -263,15 +266,14 @@ void sb_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
 
     const uint stackCapacity = gSp.stackSizeBytes / 16u;
 
-    // The block's two warps, walked serially: the CUDA block is (32, 2, 1) and this
-    // group is one warp, so the group covers both of the block's warps in turn.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see T9): globalWarpIdx is the group index and the stride
+    // the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
     // T9: strided by WARPS.
     for (uint particleIndex = globalWarpIdx; particleIndex < nbParticles;
-         particleIndex += SBPS_NB_WARPS)
+         particleIndex += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

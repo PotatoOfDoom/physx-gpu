@@ -75,9 +75,10 @@
 // the grid is computed on the HOST, and the CUDA shim exposes only a direct
 // dispatch.
 //
-// So this takes the shape the midphase and the trimesh core already ship green:
+// So this took the shape the midphase and the trimesh core then shipped green:
 // one workgroup per CUDA BLOCK, and a loop of CONSTANT trip count over that
-// block's two warps.
+// block's two warps.  (All three now launch one workgroup per CUDA WARP instead, see
+// the loop; the grid-stride loop below is what covers the pairs.)
 //
 // **THE GRID-STRIDE LOOP IS BACK, AND A SCENE HAD TO PROVE IT WAS NEEDED.**
 //
@@ -98,7 +99,7 @@
 // convexTrimeshCorrelate.
 //
 // And it needs neither indirect dispatch nor a host-side grid: `WorkgroupCount()` is
-// available in Slang, the trip count `ceil(nbPairs / (WorkgroupCount().x * 2))` is
+// available in Slang, the trip count `ceil(nbPairs / WorkgroupCount().x)` is
 // WORKGROUP-UNIFORM, and the loop is three lines.
 //
 // ON THE P8.40 HAZARD, precisely.  This file previously recorded that a chained
@@ -110,11 +111,15 @@
 // a measurement of THIS shape, not a refutation of whatever P8.40 tested; the earlier
 // finding may well hold for a per-thread grid-stride written differently.  What can
 // be said is that the hazard as stated was too broad to justify dropping the loop.
+// Since the launch site went to one group per CUDA warp the sub-warp loop is gone and
+// this is a plain group-stride loop; its index is clamped for the loads (the P9.49
+// empty-mask pass, see the loop), which keeps every chained address a real one.
 //
 // ONE WARP PER WORKGROUP is not a choice either: `pxgSlangPolyClip` and
 // `pxgSlangContactReduce` both require `[numthreads(32,1,1)]` because their
 // early-outs are warp-uniform but not group-uniform, and llvmpipe HANGS on a
-// divergent barrier rather than erroring.
+// divergent barrier rather than erroring.  The launch site launches one such group
+// per CUDA warp (see the loop).
 //
 // ===========================================================================
 // THE ABI ROW IS SHARED WITH THE TRIMESH CORE, AND THAT IS CHECKED
@@ -217,28 +222,43 @@ void convexHeightfieldNarrowphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
 
     const uint tempContactSize = gCh.stackSizeBytes / 16u;   // sizeof(ConvexTriContact)
 
-    // A CONSTANT trip count, so the barriers inside are reached by the whole group
-    // on every iteration.  The guard uses `continue`, not `return`, for the same
-    // reason.
+    // A trip count uniform across the group, so the barriers inside are reached by
+    // the whole group on every iteration.  The one `return` below is group-uniform and
+    // comes before the first barrier.
     // convexHeightfield.cu:330 / convexMesh.cu -- the CUDA's loop is
     //   `for (globalWarpIndex = blockIdx.x*blockDim.y + threadIdx.y;
     //         globalWarpIndex < nbPairs;
     //         globalWarpIndex += gridDim.x * blockDim.y)`
-    // with blockDim.y == NP_TRIMESH_WARPS_PER_BLOCK.  The `sub` loop below covers
-    // `threadIdx.y`; THIS loop covers the stride, and it is not optional -- see the
-    // header.  Its trip count, `ceil(nbPairs / (WorkgroupCount().x * 2))`, is
-    // WORKGROUP-UNIFORM, so the barriers inside stay in uniform control flow.
-    const uint gridStride = WorkgroupCount().x * NP_TRIMESH_WARPS_PER_BLOCK;
+    // with blockDim.y == NP_TRIMESH_WARPS_PER_BLOCK.  The port's launch site
+    // (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per
+    // CUDA warp, gridDim.x * blockDim.y of them, so the group index IS the CUDA's
+    // globalWarpIndex and the group count its stride: each group takes exactly the pairs
+    // of its CUDA warp (the block's two warps used to be walked serially in one group).
+    // THIS loop covers the stride, and it is not optional -- see the header.  Its trip
+    // count, `ceil(nbPairs / WorkgroupCount().x)`, is WORKGROUP-UNIFORM, so the barriers
+    // inside stay in uniform control flow.
+    const uint gridStride = WorkgroupCount().x;
 
-    for (uint base = 0u; base < nbPairs; base += gridStride)
+    // A group with no pair at all leaves before the loop.  On hardware that only skips a
+    // loop test, but on llvmpipe the barrier-bearing body below still runs once with an
+    // EMPTY mask (P9.49), on the clamped -- i.e. a real -- pair, and the engine launches
+    // 32 groups per contact manager whatever the pair count: without this exit every
+    // idle one did that masked pass (the trimesh sibling, with its 4096-group floor,
+    // went from ~1 ms to 16.5 ms per launch in meshfloor, median).
+    if (gid.x >= nbPairs)
+        return;
+
+    for (uint warpLoop = gid.x; warpLoop < nbPairs; warpLoop += gridStride)
     {
-    for (uint sub = 0u; sub < NP_TRIMESH_WARPS_PER_BLOCK; ++sub)
     {
         GroupMemoryBarrierWithGroupSync();
 
-        const uint globalWarpIndex = base + gid.x * NP_TRIMESH_WARPS_PER_BLOCK + sub;
-        if (globalWarpIndex >= nbPairs)
-            continue;
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49); here they are chained (the pair names a
+        // contact manager, whose shapes name a hull or a mesh), so the clamp keeps the
+        // first of them inside the pair array.  Every live iteration has
+        // globalWarpIndex == warpLoop.
+        const uint globalWarpIndex = min(warpLoop, max(nbPairs, 1u) - 1u);
 
         const uint4 curPair = Ptr<uint4>(a.pairs)[globalWarpIndex];
 

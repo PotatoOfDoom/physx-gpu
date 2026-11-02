@@ -229,7 +229,7 @@ void midphaseGeneratePairs(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
     // One contact manager per group at the port's launch grid (one group per CUDA warp, see
     // the header on the grid), and a group-stride loop so any smaller grid still covers them
-    // all -- at the CUDA's own grid a group takes its block's two managers in turn.
+    // all -- at the CUDA's own grid a group takes two managers one grid-width apart.
     for (uint cmLoop = gid.x; cmLoop < gMp.numContactManagers; cmLoop += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();      // scratch is reused per contact manager

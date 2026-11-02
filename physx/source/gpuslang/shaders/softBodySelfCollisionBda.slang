@@ -67,12 +67,16 @@
 // so a [numthreads(32,1,1)] group is ONE warp.  Two things follow, and BOTH are needed:
 //   - blockIdx.y is a real dimension here, so cmIdx = gid.y.  (femClothSelfCollisionBda is
 //     the precedent -- this is not the first 2D grid in the port);
-//   - the block's two warps are walked SERIALLY in a group-uniform `sub` loop, exactly as
-//     in softBodyContactGenBda, and the grid stride stays the CUDA value 2048 rather than
-//     the group count.  Deriving the stride from gid alone would either double-visit or
-//     skip vertices; hard-coding SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK reproduces the
-//     CUDA partition exactly.  Missing that on the cloth side covered only half the
-//     vertices and cost a long investigation.
+//   - the block's two warps used to be walked SERIALLY in a group-uniform `sub` loop with
+//     the CUDA stride 2048 hard-coded.  The launch site now (PxgSoftBodyCore.cpp,
+//     PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp, (SB_SBMIDPHASE * 2,
+//     nbActiveSelfCollisionSoftbodies, 1), so globalWarpIdx = gid.x and the stride is the
+//     group count WorkgroupCount().x: at that grid exactly the CUDA partition (warp w takes
+//     vertices w, w + 2048, ...), at any other grid still every vertex exactly once.  What
+//     must NOT be mixed is a block-scaled start (gid.x * 2 + sub) with a group-count stride,
+//     or a gid.x start with a stride larger than the group count: the first double-visits,
+//     the second skips.  Missing the second warp altogether on the cloth side covered only
+//     half the vertices and cost a long investigation.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted contact SET and the
 // atomic total):
@@ -120,8 +124,6 @@ import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 // PxgSoftBodyCoreKernelIndices.h:55 — SB_SBMIDPHASE, the fixed x-grid of this launch.
 static const uint SB_SBMIDPHASE = 1024u;
-// blockDim.y * gridDim.x, the CUDA grid stride over vertices.
-static const uint SC_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
@@ -259,13 +261,12 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
     const DfFilterArray filters =
         softBodyVolumeVolumeFilters(gSc.softbodies + uint64_t(softbodyId) * PXG_SOFTBODY_STRIDE);
 
-    // See the header on the grid: the block's two warps are walked serially, and the stride
-    // stays the CUDA blockDim.y * gridDim.x.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint vertIdx = globalWarpIdx; vertIdx < numVerts; vertIdx += SC_NB_WARPS)
+    for (uint vertIdx = globalWarpIdx; vertIdx < numVerts; vertIdx += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

@@ -87,6 +87,7 @@
 #include <array>
 #include <set>
 #include <algorithm>
+#include <initializer_list>
 #include <string>
 #include <map>
 #include <random>
@@ -131,6 +132,24 @@ DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
     b.h = createBufferFrom(dev, data);
     b.addr = dev->getBufferDeviceAddress(b.h);
     return b;
+}
+
+// The rows a contact or pair kernel wrote, ORDER-FREE: `count` rows, each the concatenation of
+// `words` 32-bit words from every column (a downloaded output array), sorted.  Kernels whose
+// warps race for a global counter -- the port launches one 32-thread group per CUDA warp, so
+// the two (or four) warps of a CUDA block now race as they do in CUDA -- write the same rows
+// in an unspecified order; two dispatches of such a kernel at different grids must agree on
+// this view bit for bit.
+struct GridCol { const std::vector<uint32_t>* words; uint32_t perRow; };
+static std::vector<std::vector<uint32_t>> gridRows(uint32_t count, std::initializer_list<GridCol> cols)
+{
+    std::vector<std::vector<uint32_t>> rows(count);
+    for (uint32_t i = 0; i < count; ++i)
+        for (const GridCol& c : cols)
+            for (uint32_t w = 0; w < c.perRow; ++w)
+                rows[i].push_back((*c.words)[size_t(i) * c.perRow + w]);
+    std::sort(rows.begin(), rows.end());
+    return rows;
 }
 
 // Same literal the shader uses for PX_MAX_REAL; keeping both sides identical makes
@@ -4270,7 +4289,9 @@ PXG_TEST(softBodySimPsMidphase)
 
     Kernel k("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
              {}, sizeof(SbPsMidphasePush));
-    k.dispatch(1024u, {}, p, uint32_t(cms.size()), 1u);   // grid (1024, numWorkItems, 1)
+    // The engine's grid (1024, numWorkItems, 1) x block (32, 2, 1); the port launches one group
+    // per CUDA warp (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT): (2048, numWorkItems, 1).
+    k.dispatch(2048u, {}, p, uint32_t(cms.size()), 1u);
     dev->flush();
 
     // ---- the expected set -----------------------------------------------------
@@ -4384,7 +4405,7 @@ PXG_TEST(softBodySimPsMidphase)
         q.stackPtr = bBig.addr; q.midphasePairsNum = bBigNum.addr;
         Kernel k2("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
                   {}, sizeof(SbPsMidphasePush));
-        k2.dispatch(1024u, {}, q, uint32_t(cms.size()), 1u);
+        k2.dispatch(2048u, {}, q, uint32_t(cms.size()), 1u);
         dev->flush();
 
         const uint32_t n2 = downloadBuffer<uint32_t>(dev, bBigNum.h, 1)[0];
@@ -4410,6 +4431,27 @@ PXG_TEST(softBodySimPsMidphase)
         PXG_CHECK_MSG(cm0 > 0u && cm1 > 0u,
                       "both managers must appear in the output (cm0 %u, cm1 %u), or the "
                       "manager index is not load-bearing", cm0, cm1);
+
+        // The same stack, order-free and bitwise, at the CUDA's own grid (1024: a group strides
+        // by 1024 instead of 2048, taking two CUDA warps' worth of particles) and at three groups
+        // and one (every group strides through the particles many times).
+        const auto ref = gridRows(PxMin(n2, NB_ALLOC), { { &b2, 4u } });
+        for (uint32_t gx : { 1024u, 3u, 1u })
+        {
+            DevBuf bG = makeDev(dev, bigStack);
+            DevBuf bGNum = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbPsMidphasePush r = q;
+            r.stackPtr = bG.addr; r.midphasePairsNum = bGNum.addr;
+            Kernel("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
+                   {}, sizeof(SbPsMidphasePush)).dispatch(gx, {}, r, uint32_t(cms.size()), 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bGNum.h, 1)[0];
+            const auto bg = downloadBuffer<uint32_t>(dev, bG.h, NB_ALLOC * 4u);
+            PXG_CHECK_MSG(nG == n2 && gridRows(PxMin(nG, NB_ALLOC), { { &bg, 4u } }) == ref,
+                          "at %u groups the particle midphase wrote %u pairs that differ from the "
+                          "port grid's %u (order-free, bitwise)", gx, nG, n2);
+            dev->destroyBuffer(bG.h); dev->destroyBuffer(bGNum.h);
+        }
     }
 
     // ---- the numWorkItems GUARD ---------------------------------------------------
@@ -4427,7 +4469,7 @@ PXG_TEST(softBodySimPsMidphase)
         q.stackPtr = bWide.addr; q.midphasePairsNum = bWideNum.addr;
         Kernel k3("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
                   {}, sizeof(SbPsMidphasePush));
-        k3.dispatch(1024u, {}, q, uint32_t(cms.size()) + 3u, 1u);   // THREE extra y-groups
+        k3.dispatch(2048u, {}, q, uint32_t(cms.size()) + 3u, 1u);   // THREE extra y-groups
         dev->flush();
         const uint32_t nWide = downloadBuffer<uint32_t>(dev, bWideNum.h, 1)[0];
         PXG_CHECK_MSG(nWide == uint32_t(expected.size()),
@@ -4570,9 +4612,11 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
     push.midphasePairsNum = bCount.addr;
 
     Kernel k("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
-    // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK) = ceil(2/2) = 1.
-    // One group must cover BOTH pairs.
-    k.dispatch(/*gridX*/ 1u, {}, push, 1u, 1u);
+    // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK) = ceil(2/2) = 1 block of two
+    // warps, which the port launches as one group per CUDA warp (PxgNarrowphaseCore.cpp,
+    // PXG_NO_CUDA_TOOLKIT): 2 groups, one manager each.  The overflow pass below dispatches the
+    // CUDA's own grid of 1, where one group must cover BOTH pairs through its group-stride loop.
+    k.dispatch(/*gridX*/ 2u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
@@ -4582,8 +4626,7 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
     // tets 0 and 4 for each of the two contact managers.
     PXG_CHECK_MSG(gCount == 4u,
                   "midphase must emit exactly 4 pairs (tets 0 and 4 for each of the two "
-                  "contact managers), got %u -- a count of 2 means the sub-warp loop is "
-                  "missing and only pair 0 was processed", gCount);
+                  "contact managers), got %u -- a count of 2 means only pair 0 was processed", gCount);
 
     bool sawPair0 = false, sawPair1 = false;
     bool sawFattenTet[2] = { false, false };
@@ -4606,10 +4649,11 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
                   "tet 4 is reachable ONLY by the fattened box -- a port that dropped "
                   "aabb.fattenFast(contactDist) loses it (cm0 %d, cm1 %d)",
                   int(sawFattenTet[0]), int(sawFattenTet[1]));
-    // THE GRID TEETH: pair 1 only exists if the block's SECOND warp was walked.
+    // THE GRID TEETH: pair 1 only exists if the block's SECOND warp was walked -- here by the
+    // second group; the overflow pass below (one group) needs the group-stride loop for it.
     PXG_CHECK_MSG(sawPair1,
                   "contact-manager pair 1 produced no entry -- the engine packs 2 warps per "
-                  "block and the bridge forwards only gridDim, so the shader must walk both");
+                  "block and the bridge forwards only gridDim, so the shader must reach both");
     // ...and pair 1 also proves the shape swap: its tetmesh is shape1, so a port that always
     // took shape0 would have read the rigid box's particleOrSoftbodyId (0xFFFFFFFF) as the
     // softbody index and faulted or produced nothing.
@@ -4637,7 +4681,7 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
         p2.stackPtr = bSmall.addr;
         p2.midphasePairsNum = bCount2.addr;
         Kernel k2("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
-        k2.dispatch(1u, {}, p2, 1u, 1u);
+        k2.dispatch(1u, {}, p2, 1u, 1u);   // the CUDA's grid: one group, both managers in turn
         dev->flush();
         const uint32_t n2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
         const auto s2 = downloadBuffer<uint32_t>(dev, bSmall.h, smallStack.size());
@@ -4726,8 +4770,12 @@ PXG_TEST(softBodySimMidphaseOrder)
     DevBuf bTets = makeDev(dev, tets);
     DevBuf bHints = makeDev(dev, hintWords);
 
+    // `cudaGrid`: true dispatches the CUDA's own grid, ceil(numTests / 2) -- a group takes up to
+    // two managers, one grid-width apart, through the group-stride loop; false dispatches the port's
+    // launch (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT), one group per CUDA warp, i.e. per
+    // manager, so the managers race for the pair counter as the CUDA's two warps do.
     auto runCase = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
-                       const W::Box rawA, const W::Box rawB, uint32_t nbTests)
+                       const W::Box rawA, const W::Box rawB, uint32_t nbTests, bool cudaGrid)
     {
         W::Box fat[2] = { rawA, rawB };
         const float cdSum[2] = { cd[0] + cd[1], cd[0] + cd[2] };
@@ -4781,12 +4829,15 @@ PXG_TEST(softBodySimMidphaseOrder)
         Kernel k("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
         PXG_CHECK_MSG(k.isValid(), "[%s] the pipeline must build", name);
         if (!k.isValid()) return;
-        k.dispatch((nbTests + 1u) / 2u, {}, push, 1u, 1u);   // ceil(numTests / MIDPHASE_WARPS_PER_BLOCK)
+        const uint32_t blocks = (nbTests + 1u) / 2u;   // ceil(numTests / MIDPHASE_WARPS_PER_BLOCK)
+        const uint32_t groups = cudaGrid ? blocks : blocks * 2u;
+        k.dispatch(groups, {}, push, 1u, 1u);
         dev->flush();
 
         const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
         const auto g = downloadBuffer<uint32_t>(dev, bStack.h, (total + SLACK) * 4u);
-        PXG_CHECK_MSG(gCount == total, "[%s] the counter says %u pairs, the one-warp walk emits %u", name, gCount, total);
+        PXG_CHECK_MSG(gCount == total, "[%s, %u groups] the counter says %u pairs, the one-warp walk emits %u",
+                      name, groups, gCount, total);
         size_t mm = 0;
         std::vector<std::vector<uint32_t>> got(nbTests);
         for (uint32_t i = 0; i < PxMin(gCount, total); ++i)
@@ -4794,9 +4845,16 @@ PXG_TEST(softBodySimMidphaseOrder)
             if (g[4u * i] >= nbTests || g[4u * i + 2u] != 0u || g[4u * i + 3u] != 0u) { ++mm; continue; }
             got[g[4u * i]].push_back(g[4u * i + 1u]);
         }
+        // Per manager the slots keep the one-warp walk's order at either grid: a group allocates
+        // its own batches in order, whichever group gets the counter first.
         for (uint32_t c = 0; c < nbTests; ++c)
-            if (got[c] != want[c]) { ++mm; std::printf("  [%s] manager %u differs (%zu vs %zu pairs)\n", name, c, got[c].size(), want[c].size()); }
-        if (nbTests <= 2u)
+            if (got[c] != want[c])
+            {
+                ++mm;
+                std::printf("  [%s, %u groups] manager %u differs (%zu vs %zu pairs)\n",
+                            name, groups, c, got[c].size(), want[c].size());
+            }
+        if (nbTests <= 2u && groups == 1u)
         {
             // one group: manager 0's whole stream comes first
             for (uint32_t i = 0; i < uint32_t(want[0].size()) && i < gCount; ++i)
@@ -4804,8 +4862,10 @@ PXG_TEST(softBodySimMidphaseOrder)
         }
         for (uint32_t i = total; i < total + SLACK; ++i)
             if (g[4u * i] != POISON) ++mm;
-        PXG_CHECK_MSG(mm == 0, "[%s] %zu mismatches against the CUDA's one-warp walk", name, mm);
-        std::printf("    [ note ] %-8s %u managers, %u pairs, one-warp stack peak %u\n", name, nbTests, total, maxStack);
+        PXG_CHECK_MSG(mm == 0, "[%s, %u groups] %zu mismatches against the CUDA's one-warp walk",
+                      name, groups, mm);
+        std::printf("    [ note ] %-8s %u managers, %u groups, %u pairs, one-warp stack peak %u\n",
+                    name, nbTests, groups, total, maxStack);
 
         dev->destroyBuffer(bTree.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bShapes.h);
         dev->destroyBuffer(bCms.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
@@ -4820,14 +4880,17 @@ PXG_TEST(softBodySimMidphaseOrder)
         uint32_t used = 0u;
         auto nodes = W::randomTree(sh, rng, NB, tetBox, &used);
         PXG_CHECK_MSG(used == NB, "the plane tree placed %u of %u tets", used, NB);
-        runCase("plane", nodes, all, plane, 2u);
+        runCase("plane", nodes, all, plane, 2u, /*cudaGrid*/ true);
+        runCase("plane", nodes, all, plane, 2u, /*cudaGrid*/ false);
     }
     {
         const W::TreeShape sh = { 3u, 1u, 32u, 300u, 40u };
         uint32_t used = 0u;
         auto nodes = W::randomTree(sh, rng, NB, tetBox, &used);
-        runCase("random", nodes, part, plane, 2u);
-        runCase("random3", nodes, part, plane, 3u);
+        runCase("random", nodes, part, plane, 2u, /*cudaGrid*/ true);
+        runCase("random", nodes, part, plane, 2u, /*cudaGrid*/ false);
+        runCase("random3", nodes, part, plane, 3u, /*cudaGrid*/ true);
+        runCase("random3", nodes, part, plane, 3u, /*cudaGrid*/ false);
     }
 
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bHints.h);
@@ -6295,12 +6358,14 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
 
     Kernel k("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
              {}, sizeof(SbSelfPush));
-    // THE ENGINE'S GRID, reproduced exactly: x = SB_SBMIDPHASE = 1024 (fixed, independent
-    // of the vertex count), y = the number of active self-collision softbodies.  With the
-    // CUDA stride (blockDim.y * gridDim.x = 2048) every vertex is visited EXACTLY ONCE; a
-    // stride derived from the dispatch size instead would visit most of them 1024 times
-    // and the contact count below would explode.
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ uint32_t(active.size()), 1u);
+    // THE ENGINE'S GRID: x = SB_SBMIDPHASE = 1024 blocks of two warps (fixed, independent of
+    // the vertex count), y = the number of active self-collision softbodies; the port launches
+    // one group per CUDA warp (PxgSoftBodyCore.cpp, PXG_NO_CUDA_TOOLKIT), x = 2048, and the
+    // shader strides by the group count, the CUDA's blockDim.y * gridDim.x.  Every vertex is
+    // visited EXACTLY ONCE; a block-scaled start with a group-count stride would visit some
+    // twice and the contact count below would grow.  The grid sweep further down repeats
+    // this at the CUDA's own grid and at three groups.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ uint32_t(active.size()), 1u);
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
@@ -6398,6 +6463,43 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
         PXG_CHECK_MSG(gInfoW[i * 4u + 0u] == POISON,
                       "contact info slot %u was written past the contact count", i);
 
+    // ---- the same contacts at any grid -----------------------------------------
+    // One group per CUDA warp (2048, above) is the port's launch.  At the CUDA's own grid of
+    // 1024 a group strides by 1024 instead of 2048 (two CUDA warps' vertices), and at three
+    // groups and one group every group strides through the body many times: the loop must
+    // visit every vertex once at each, and the contacts must be bit-identical -- only their
+    // ORDER may differ, since the warps race for the counter as the CUDA's do.
+    {
+        auto runAt = [&](uint32_t gridX, std::vector<std::vector<uint32_t>>& rows) {
+            DevBuf bP = makeDev(dev, zeroF4), bN = makeDev(dev, zeroF4), bI = makeDev(dev, poison);
+            DevBuf bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbSelfPush q = push;
+            q.outPoint = bP.addr; q.outNormalPen = bN.addr; q.outContactInfo = bI.addr;
+            q.totalContactCount = bC.addr;
+            Kernel("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
+                   {}, sizeof(SbSelfPush)).dispatch(gridX, {}, q, uint32_t(active.size()), 1u);
+            dev->flush();
+            const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+            const auto wp = downloadBuffer<uint32_t>(dev, bP.h, MAXC * 4u);
+            const auto wn = downloadBuffer<uint32_t>(dev, bN.h, MAXC * 4u);
+            const auto wi = downloadBuffer<uint32_t>(dev, bI.h, MAXC * 4u);
+            rows = gridRows(PxMin(n, MAXC), { { &wp, 4u }, { &wn, 4u }, { &wi, 4u } });
+            dev->destroyBuffer(bP.h); dev->destroyBuffer(bN.h); dev->destroyBuffer(bI.h);
+            dev->destroyBuffer(bC.h);
+            return n;
+        };
+        std::vector<std::vector<uint32_t>> ref, got;
+        const uint32_t nRef = runAt(2048u, ref);
+        PXG_CHECK_MSG(nRef == gCount, "a second dispatch at the port's grid counted %u, the first %u", nRef, gCount);
+        for (uint32_t gx : { 1024u, 3u, 1u })
+        {
+            const uint32_t n = runAt(gx, got);
+            PXG_CHECK_MSG(n == nRef && got == ref,
+                          "at %u groups the self-collision midphase wrote %u contacts that differ from "
+                          "the port grid's %u (order-free, bitwise)", gx, n, nRef);
+        }
+    }
+
     // ---- maxContacts: the counter keeps counting, the writes are DROPPED -----
     // PxgSoftBodyContactWriter::writeContact reserves the index with the atomic FIRST and
     // only then checks `index >= maxContacts`, so an undersized buffer must still report
@@ -6413,7 +6515,7 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
         p2.maxContacts = 1u;
         Kernel k2("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
                   {}, sizeof(SbSelfPush));
-        k2.dispatch(1024u, {}, p2, uint32_t(active.size()), 1u);
+        k2.dispatch(2048u, {}, p2, uint32_t(active.size()), 1u);
         dev->flush();
         const uint32_t n2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
         const auto i2 = downloadBuffer<uint32_t>(dev, bInfo2.h, MAXC * 4u);
@@ -6462,7 +6564,7 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
         p4.totalContactCount = bCount4.addr;
         Kernel("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
                {}, sizeof(SbSelfPush))
-            .dispatch(1024u, {}, p4, uint32_t(active.size()), 1u);
+            .dispatch(2048u, {}, p4, uint32_t(active.size()), 1u);
         dev->flush();
         const uint32_t n4 = downloadBuffer<uint32_t>(dev, bCount4.h, 1)[0];
 
@@ -6487,7 +6589,7 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
         p3.totalContactCount = bCount3.addr;
         Kernel k3("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
                   {}, sizeof(SbSelfPush));
-        k3.dispatch(1024u, {}, p3, 2u, 1u);
+        k3.dispatch(2048u, {}, p3, 2u, 1u);
         dev->flush();
         const uint32_t n3 = downloadBuffer<uint32_t>(dev, bCount3.h, 1)[0];
         PXG_CHECK_MSG(n3 == 0u,
@@ -8642,8 +8744,9 @@ PXG_TEST(softBodySimClothMidphase)
 
     Kernel k("softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch",
              {}, sizeof(SbClothMidPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:4617): x = SB_SBMIDPHASE = 1024, y = numTests.
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+    // y = numTests; the port launches one group per CUDA warp (PXG_NO_CUDA_TOOLKIT), x = 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ 1u, 1u);
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -8700,6 +8803,32 @@ PXG_TEST(softBodySimClothMidphase)
     PXG_CHECK_MSG(got[5].empty(),
                   "tet 5 is the CLOSEST of all (0.01) but its surface hint is 0, so it is an "
                   "interior tetrahedron and must generate nothing");
+
+    // The same stack, order-free and bitwise, at the CUDA's own grid (a group takes two CUDA
+    // warps' queries, one grid-width apart) and at three groups and one (every group strides
+    // through the queries many times).  Only with room for every pair: past the capacity
+    // WHICH pairs land depends on the order of the racing warps, in CUDA as here.
+    if (n <= CAP)
+    {
+        const auto ref = gridRows(n, { { &gStack, 4u } });
+        for (uint32_t gx : { 1024u, 3u, 1u })
+        {
+            DevBuf bG = makeDev(dev, stack);
+            DevBuf bGNum = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothMidPush r = push;
+            r.stackPtr = bG.addr; r.midphasePairsNum = bGNum.addr;
+            Kernel("softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch", {}, sizeof(SbClothMidPush))
+                .dispatch(gx, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bGNum.h, 1)[0];
+            const auto bg = downloadBuffer<uint32_t>(dev, bG.h, size_t(CAP) * 4u);
+            PXG_CHECK_MSG(nG == n && gridRows(PxMin(nG, uint32_t(CAP)), { { &bg, 4u } }) == ref,
+                          "at %u groups the softbody-vs-cloth midphase wrote %u pairs "
+                          "that differ from the port grid's %u "
+                          "(order-free, bitwise)", gx, nG, n);
+            dev->destroyBuffer(bG.h); dev->destroyBuffer(bGNum.h);
+        }
+    }
 
     for (PxgBufferHandle h : { bTriVerts.h, bTriIdx.h, bTree.h, bCloth.h, bTetVerts.h, bTets.h,
                                bHints.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h,
@@ -8920,7 +9049,9 @@ PXG_TEST(softBodySimClothContactGen)
     push.maxContacts = MAXC;
 
     Kernel k("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush));
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);   // the engine's SB_MESHCG grid
+    // The engine's SB_MESHCG grid, 1024 blocks of two warps; the port launches one group per CUDA
+    // warp (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT), 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
@@ -8989,6 +9120,101 @@ PXG_TEST(softBodySimClothContactGen)
     }
     PXG_CHECK_MSG(gPt[1].x == -9.0f,
                   "nothing may be written past the contact count");
+
+    // The same contacts, order-free and bitwise, at the CUDA's own grid (a group takes two CUDA
+    // warps' pairs, one grid-width apart) and at three groups and one (every group strides
+    // through the pairs many times).  Only with room for every contact: past the capacity
+    // WHICH contacts land depends on the order of the racing warps, in CUDA as here.
+    if (n <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 1024u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, outPoint);
+            DevBuf bC1 = makeDev(dev, outNp);
+            DevBuf bC2 = makeDev(dev, outB0);
+            DevBuf bC3 = makeDev(dev, outB1);
+            DevBuf bC4 = makeDev(dev, outInfo);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothCgPush r = push;
+            r.outPoint = bC0.addr; r.outNormalPen = bC1.addr; r.outBarycentric0 = bC2.addr;
+            r.outBarycentric1 = bC3.addr; r.outContactInfo = bC4.addr;
+            r.totalContactCount = bCnt.addr;
+            Kernel("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush))
+                .dispatch(gx ? gx : 2048u, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 4u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 4u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == n,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, n);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == n && rows == ref,
+                              "at %u groups the softbody-vs-cloth contact gen wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, n);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bCnt.h);
+        }
+    }
+
+    // The same sweep on a stack where EVERY entry emits: KK copies of tet 0's pair.  Above, only
+    // stack entry 0 emits, so a group that skipped the others (a stride twice the group count,
+    // or a block-scaled start) wrote the same single contact at every grid.  Here each skipped
+    // or doubled entry changes the count.
+    if (n == 1u)
+    {
+        const uint32_t KK = 7u;
+        std::vector<uint32_t> keptStack;
+        for (uint32_t i = 0; i < KK; ++i)
+            keptStack.insert(keptStack.end(), stack.begin(), stack.begin() + 4);
+        DevBuf bKStack = makeDev(dev, keptStack);
+        DevBuf bKNum = makeDev(dev, std::vector<uint32_t>{ KK });
+        DevBuf bKNeeded = makeDev(dev, std::vector<uint32_t>{ 0u });
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 2048u, 1024u, 3u, 1u })   // 2048, the port grid, first: the reference
+        {
+            DevBuf bC0 = makeDev(dev, outPoint), bC1 = makeDev(dev, outNp), bC2 = makeDev(dev, outB0);
+            DevBuf bC3 = makeDev(dev, outB1), bC4 = makeDev(dev, outInfo);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothCgPush r = push;
+            r.stackPtr = bKStack.addr; r.midphasePairsNum = bKNum.addr; r.stackSizeBytes = KK * 16u;
+            r.stackSizeNeededOnDevice = bKNeeded.addr;
+            r.outPoint = bC0.addr; r.outNormalPen = bC1.addr; r.outBarycentric0 = bC2.addr;
+            r.outBarycentric1 = bC3.addr; r.outContactInfo = bC4.addr;
+            r.totalContactCount = bCnt.addr;
+            Kernel("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush))
+                .dispatch(gx, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 4u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 4u } });
+            PXG_CHECK_MSG(nG == KK, "at %u groups the %u-entry kept-pair stack gave %u contacts", gx, KK, nG);
+            if (gx == 2048u)
+                ref = rows;
+            else
+                PXG_CHECK_MSG(rows == ref,
+                              "at %u groups the softbody-vs-cloth contact gen wrote other contacts than at "
+                              "the port grid on the kept-pair stack (order-free, bitwise)", gx);
+            for (PxgBufferHandle h : { bC0.h, bC1.h, bC2.h, bC3.h, bC4.h, bCnt.h })
+                dev->destroyBuffer(h);
+        }
+        dev->destroyBuffer(bKStack.h); dev->destroyBuffer(bKNum.h); dev->destroyBuffer(bKNeeded.h);
+    }
 
     for (PxgBufferHandle h : { bTriVerts.h, bTriIdx.h, bCloth.h, bTetVerts.h, bTets.h, bHints.h,
                                bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h, bFilters.h, bStack.h,
@@ -9145,7 +9371,7 @@ PXG_TEST(softBodySimClothContactGenBaryNegZero)
     push.maxContacts = MAXC;
 
     Kernel k("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush));
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);   // 1024 blocks x 2 one-warp groups
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
@@ -9386,7 +9612,9 @@ PXG_TEST(softBodySimClothVertMidphase)
 
     Kernel k("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
              {}, sizeof(SbClothVertMidPush));
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    // The engine's grid, SB_SBMIDPHASE = 1024 blocks of two warps; the port launches one group
+    // per CUDA warp (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT), 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ 1u, 1u);
     dev->flush();
 
     const uint32_t nVm = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
@@ -9433,6 +9661,32 @@ PXG_TEST(softBodySimClothVertMidphase)
                   "passes; tet 4 is degenerate -- its four corners are coplanar -- and only "
                   "isValidTet can drop it");
 
+    // The same stack, order-free and bitwise, at the CUDA's own grid (a group takes two CUDA
+    // warps' queries, one grid-width apart) and at three groups and one (every group strides
+    // through the queries many times).  Only with room for every pair: past the capacity
+    // WHICH pairs land depends on the order of the racing warps, in CUDA as here.
+    if (nVm <= CAP)
+    {
+        const auto ref = gridRows(nVm, { { &gVmStack, 4u } });
+        for (uint32_t gx : { 1024u, 3u, 1u })
+        {
+            DevBuf bG = makeDev(dev, stack);
+            DevBuf bGNum = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothVertMidPush r = push;
+            r.stackPtr = bG.addr; r.midphasePairsNum = bGNum.addr;
+            Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch", {}, sizeof(SbClothVertMidPush))
+                .dispatch(gx, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bGNum.h, 1)[0];
+            const auto bg = downloadBuffer<uint32_t>(dev, bG.h, size_t(CAP) * 4u);
+            PXG_CHECK_MSG(nG == nVm && gridRows(PxMin(nG, uint32_t(CAP)), { { &bg, 4u } }) == ref,
+                          "at %u groups the cloth-vertex-vs-softbody midphase wrote %u pairs "
+                          "that differ from the port grid's %u "
+                          "(order-free, bitwise)", gx, nG, nVm);
+            dev->destroyBuffer(bG.h); dev->destroyBuffer(bGNum.h);
+        }
+    }
+
     // ---- the broadphase early-out ---------------------------------------------------------
     // With n > 1 the cloth's bounds shrink by (n-1) * contactDistance[cloth].  A shrink of
     // 4 * 0.1875 = 0.75 per side pulls the cloth box in to [-0.25, 24.25] x [-0.25, 1.25],
@@ -9446,7 +9700,7 @@ PXG_TEST(softBodySimClothVertMidphase)
         p2.nbCollisionPairUpdatesPerTimestep = 5.0f;
         p2.midphasePairsNum = bPn2.addr;
         Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
-               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p2, 1u, 1u);
+               {}, sizeof(SbClothVertMidPush)).dispatch(2048u, {}, p2, 1u, 1u);
         dev->flush();
         const uint32_t n2 = downloadBuffer<uint32_t>(dev, bPn2.h, 1)[0];
         PXG_CHECK_MSG(n2 == 6u,
@@ -9471,7 +9725,7 @@ PXG_TEST(softBodySimClothVertMidphase)
         p3.bounds = bB2.addr;
         p3.midphasePairsNum = bPn3.addr;
         Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
-               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p3, 1u, 1u);
+               {}, sizeof(SbClothVertMidPush)).dispatch(2048u, {}, p3, 1u, 1u);
         dev->flush();
         const uint32_t n3 = downloadBuffer<uint32_t>(dev, bPn3.h, 1)[0];
         PXG_CHECK_MSG(n3 == 0u,
@@ -9497,7 +9751,7 @@ PXG_TEST(softBodySimClothVertMidphase)
         p4.stackPtr = bSmall.addr;
         p4.midphasePairsNum = bPn4.addr;
         Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
-               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p4, 1u, 1u);
+               {}, sizeof(SbClothVertMidPush)).dispatch(2048u, {}, p4, 1u, 1u);
         dev->flush();
         const uint32_t n4 = downloadBuffer<uint32_t>(dev, bPn4.h, 1)[0];
         const auto gSmall = downloadBuffer<uint32_t>(dev, bSmall.h, CAP * 4u);
@@ -9715,7 +9969,7 @@ PXG_TEST(softBodySimClothVertContactGen)
 
     Kernel k("softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch",
              {}, sizeof(SbClothVertCgPush));
-    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);   // the engine's grid
+    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);   // the engine's grid, 512 blocks of 256 = the group
     dev->flush();
 
     const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
@@ -9725,6 +9979,106 @@ PXG_TEST(softBodySimClothVertContactGen)
     const auto gB1 = downloadBuffer<F4>(dev, bB1.h, MAXC);
     const auto gInfo = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, MAXC);
     const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+
+    // The group is the CUDA's 256-thread block (it was 32 threads, one of the block's eight
+    // warps).  The same contacts, order-free and bitwise, at three groups and at one: every
+    // thread then strides through the pairs, so the stride must be the launched thread count.
+    if (n <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, outPoint);
+            DevBuf bC1 = makeDev(dev, outNp);
+            DevBuf bC2 = makeDev(dev, outB0);
+            DevBuf bC3 = makeDev(dev, outB1);
+            DevBuf bC4 = makeDev(dev, outInfo);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothVertCgPush r = push;
+            r.outPoint = bC0.addr; r.outNormalPen = bC1.addr; r.outBarycentric0 = bC2.addr;
+            r.outBarycentric1 = bC3.addr; r.outContactInfo = bC4.addr;
+            r.totalContactCount = bCnt.addr;
+            Kernel("softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch", {}, sizeof(SbClothVertCgPush))
+                .dispatch(gx ? gx : 512u, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 4u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 4u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == n,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, n);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == n && rows == ref,
+                              "at %u groups the cloth-vertex-vs-softbody contact gen wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, n);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bCnt.h);
+        }
+    }
+
+    // The same sweep on a stack WIDER than one group: the six pairs repeated REP times, 384
+    // pairs against 256 threads per group.  With the six-pair stack every pair falls to its own
+    // thread at any grid, so a stride or a thread index left at the old 32-thread group (a thread
+    // walking i, i + 32, ... inside a 256-wide group, or groups starting 32 threads apart) visits
+    // no pair twice and the sweep above cannot see it.  Here one group must stride, and either
+    // mistake double-counts.
+    if (n <= MAXC)
+    {
+        const uint32_t REP = 64u, NW = REP * NTET, MAXCW = 512u;
+        std::vector<uint32_t> wideStack;
+        for (uint32_t r = 0; r < REP; ++r)
+            wideStack.insert(wideStack.end(), stack.begin(), stack.end());
+        DevBuf bWStack = makeDev(dev, wideStack);
+        DevBuf bWNum = makeDev(dev, std::vector<uint32_t>{ NW });
+        DevBuf bWNeeded = makeDev(dev, std::vector<uint32_t>{ 0u });
+        std::vector<F4> wF4(MAXCW, F4{ -9, -9, -9, -9 });
+        std::vector<PxgDeformablePairInfo> wInfo(MAXCW);
+        std::memset(wInfo.data(), 0xEE, wInfo.size() * sizeof(PxgDeformablePairInfo));
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 512u, 3u, 1u })   // 512, the port grid, first: the reference
+        {
+            DevBuf bC0 = makeDev(dev, wF4), bC1 = makeDev(dev, wF4), bC2 = makeDev(dev, wF4);
+            DevBuf bC3 = makeDev(dev, wF4), bC4 = makeDev(dev, wInfo);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbClothVertCgPush r = push;
+            r.stackSizeBytes = NW * 16u; r.stackPtr = bWStack.addr; r.midphasePairsNum = bWNum.addr;
+            r.stackSizeNeededOnDevice = bWNeeded.addr;
+            r.outPoint = bC0.addr; r.outNormalPen = bC1.addr; r.outBarycentric0 = bC2.addr;
+            r.outBarycentric1 = bC3.addr; r.outContactInfo = bC4.addr;
+            r.totalContactCount = bCnt.addr; r.maxContacts = MAXCW;
+            Kernel("softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch", {}, sizeof(SbClothVertCgPush))
+                .dispatch(gx, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXCW) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXCW) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXCW) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXCW) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXCW) * 4u);
+            auto rows = gridRows(PxMin(nG, MAXCW),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 4u } });
+            PXG_CHECK_MSG(nG == n * REP,
+                          "at %u groups the %u-pair stack gave %u contacts, %u x %u expected", gx, NW, nG, n, REP);
+            if (gx == 512u)
+                ref = rows;
+            else
+                PXG_CHECK_MSG(rows == ref,
+                              "at %u groups the cloth-vertex-vs-softbody contact gen wrote other contacts "
+                              "than at the port grid on the %u-pair stack (order-free, bitwise)", gx, NW);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bCnt.h);
+        }
+        dev->destroyBuffer(bWStack.h); dev->destroyBuffer(bWNum.h); dev->destroyBuffer(bWNeeded.h);
+    }
 
     // Index the results by the cloth vertex they name.
     int slot[7] = { -1, -1, -1, -1, -1, -1, -1 };
@@ -9872,7 +10226,8 @@ PXG_TEST(softBodySimClothVertContactGen)
                       "filter term %d alone must suppress the (vertex 2, tet 1) contact -- the three tests are "
                       "an OR, so any one of them is enough.  Expected 3 of the 4 contacts, "
                       "got %u", term, n2);
-        dev->destroyBuffer(bF.h); dev->destroyBuffer(bFDesc.h); dev->destroyBuffer(bT2.h); dev->destroyBuffer(bI2.h);
+        dev->destroyBuffer(bF.h); dev->destroyBuffer(bFDesc.h); dev->destroyBuffer(bT2.h);
+        dev->destroyBuffer(bI2.h);
     }
 
     // ---- P9.86c (softBodyClothVertContactGenBda-r1): the -0 barycentric lane ---------------
@@ -10236,10 +10591,12 @@ PXG_TEST(softBodySimSoftBodySoftBodyMidphase)
 
     Kernel k("softBodySoftBodyMidphaseBda.spv", "sb_sbMidphaseGeneratePairsLaunch",
              {}, sizeof(SbSbPush));
-    // THE ENGINE'S GRID, reproduced exactly: x = SB_SBMIDPHASE = 1024 (fixed, independent of
-    // the vertex count), y = numTests, z = 2 (the bidirectional flip).  With the CUDA stride
-    // (blockDim.y * gridDim.x = 2048) every vertex is visited EXACTLY ONCE per (y, z).
-    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ uint32_t(cms.size()), /*gridZ*/ 2u);
+    // THE ENGINE'S GRID: x = SB_SBMIDPHASE = 1024 blocks of two warps (fixed, independent of
+    // the vertex count), y = numTests, z = 2 (the bidirectional flip); the port launches one
+    // group per CUDA warp (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT), x = 2048, and strides
+    // by the group count, the CUDA's blockDim.y * gridDim.x.  Every vertex is visited EXACTLY
+    // ONCE per (y, z); the grid sweep below repeats it at the CUDA's own grid and at 3 and 1.
+    k.dispatch(/*gridX*/ 2048u, {}, push, /*gridY*/ uint32_t(cms.size()), /*gridZ*/ 2u);
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, dbCount.h, 1)[0];
@@ -10329,6 +10686,45 @@ PXG_TEST(softBodySimSoftBodySoftBodyMidphase)
     PXG_CHECK_MSG(sawB1,
                   "the flip=1 pass must emit b1 -- if this is the only failure, blockIdx.z is "
                   "being ignored and half the contact set is missing");
+
+    // The same contacts, order-free and bitwise, at the CUDA's own grid (1024: a group takes two
+    // CUDA warps' vertices, one grid-width apart) and at three groups and one (every group strides
+    // through the vertices many times); only their ORDER may differ.
+    if (gCount <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 1024u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, zeroF4);
+            DevBuf bC1 = makeDev(dev, zeroF4);
+            DevBuf bC2 = makeDev(dev, poison);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbSbPush r = push;
+            r.outPoint = bC0.addr; r.outNormalPen = bC1.addr; r.outContactInfo = bC2.addr;
+            r.totalContactCount = bCnt.addr;
+            Kernel("softBodySoftBodyMidphaseBda.spv", "sb_sbMidphaseGeneratePairsLaunch", {}, sizeof(SbSbPush))
+                .dispatch(gx ? gx : 2048u, {}, r, uint32_t(cms.size()), 2u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)), { { &w0, 4u }, { &w1, 4u }, { &w2, 4u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == gCount,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, gCount);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == gCount && rows == ref,
+                              "at %u groups the softbody-vs-softbody midphase wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, gCount);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bCnt.h);
+        }
+    }
 
     for (PxgBufferHandle h : { dbATree.h, dbBTree.h, dbAVerts.h, dbBVerts.h, dbATets.h,
                                dbBTets.h, dbAVertHint.h, dbBVertHint.h, dbATetHint.h,
@@ -10914,8 +11310,9 @@ PXG_TEST(softBodySimMeshContactGen)
     push.wMaxContacts = MAXC;
 
     Kernel k("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:5152): x = SB_MESHCG = 1024, y = 1.
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_MESHCG = 1024 blocks of two warps, y = 1;
+    // the port launches one group per CUDA warp (PXG_NO_CUDA_TOOLKIT), x = 2048.
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
@@ -10928,6 +11325,101 @@ PXG_TEST(softBodySimMeshContactGen)
     const auto gMat = downloadBuffer<uint16_t>(dev, bSorted.h, MAXC * 8u);
     const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
     const auto gPair = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, MAXC);
+
+    // The same contacts, order-free and bitwise (point, normal/pen, barycentric, refs, sort key;
+    // the slot-index arrays name the slot and so legitimately follow the order), at the CUDA's
+    // own grid (1024: a group takes two CUDA warps' pairs, one grid-width apart) and at three groups
+    // and one (every group strides through the stack).
+    if (gCount <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 1024u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, zeroF4);
+            DevBuf bC1 = makeDev(dev, zeroF4);
+            DevBuf bC2 = makeDev(dev, zeroF4);
+            DevBuf bC3 = makeDev(dev, poison);
+            DevBuf bC4 = makeDev(dev, poison2);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbMeshCgPush r = push;
+            r.wPoint = bC0.addr; r.wNormalPen = bC1.addr; r.wBarycentric = bC2.addr;
+            r.wContactInfo = bC3.addr; r.wContactByRigid = bC4.addr; r.wTotalCount = bCnt.addr;
+            Kernel("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush))
+                .dispatch(gx ? gx : 2048u, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 2u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 2u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == gCount,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, gCount);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == gCount && rows == ref,
+                              "at %u groups the softbody-vs-mesh contact gen wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, gCount);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bCnt.h);
+        }
+    }
+
+    // The same sweep on a stack where EVERY entry emits: KK copies of the kept pair.  Above,
+    // only stack entry 0 emits, so a group that skipped entries 1 and 2 (a stride twice the
+    // group count, or a block-scaled start) wrote the same single contact at every grid.  Here
+    // each skipped or doubled entry changes the count.
+    {
+        const uint32_t KK = 7u;
+        std::vector<uint32_t> keptStack;
+        for (uint32_t i = 0; i < KK; ++i)
+            keptStack.insert(keptStack.end(), stack.begin(), stack.begin() + 4);
+        DevBuf bKStack = makeDev(dev, keptStack);
+        DevBuf bKNum = makeDev(dev, std::vector<uint32_t>{ KK });
+        DevBuf bKNeeded = makeDev(dev, std::vector<uint32_t>{ 0u });
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 2048u, 1024u, 3u, 1u })   // 2048, the port grid, first: the reference
+        {
+            DevBuf bC0 = makeDev(dev, zeroF4), bC1 = makeDev(dev, zeroF4), bC2 = makeDev(dev, zeroF4);
+            DevBuf bC3 = makeDev(dev, poison), bC4 = makeDev(dev, poison2), bC5 = makeDev(dev, poison);
+            DevBuf bC6 = makeDev(dev, poison), bC7 = makeDev(dev, poison);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbMeshCgPush r = push;
+            r.stackPtr = bKStack.addr; r.midphasePairsNum = bKNum.addr; r.stackSizeBytes = KK * 16u;
+            r.stackSizeNeededOnDevice = bKNeeded.addr;
+            r.wPoint = bC0.addr; r.wNormalPen = bC1.addr; r.wBarycentric = bC2.addr;
+            r.wContactInfo = bC3.addr; r.wContactByRigid = bC4.addr; r.wTotalCount = bCnt.addr;
+            r.wRigidMaterialIndex = bC5.addr; r.wTempContactByRigid = bC6.addr;
+            r.wContactIndexSortedByRigid = bC7.addr;
+            Kernel("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush))
+                .dispatch(gx, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 2u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 2u } });
+            PXG_CHECK_MSG(nG == KK, "at %u groups the %u-entry kept-pair stack gave %u contacts", gx, KK, nG);
+            if (gx == 2048u)
+                ref = rows;
+            else
+                PXG_CHECK_MSG(rows == ref,
+                              "at %u groups the softbody-vs-mesh contact gen wrote other contacts than at "
+                              "the port grid on the kept-pair stack (order-free, bitwise)", gx);
+            for (PxgBufferHandle h : { bC0.h, bC1.h, bC2.h, bC3.h, bC4.h, bC5.h, bC6.h, bC7.h, bCnt.h })
+                dev->destroyBuffer(h);
+        }
+        dev->destroyBuffer(bKStack.h); dev->destroyBuffer(bKNum.h); dev->destroyBuffer(bKNeeded.h);
+    }
 
     for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
         std::printf("  contact %u: p=(%.5f %.5f %.5f) rest=%.5f n=(%.5f %.5f %.5f) pen=%.6f "
@@ -11283,7 +11775,7 @@ PXG_TEST(softBodySimMeshContactGen_p89PenOffset)
     push.wMaxContacts = MAXC;
 
     Kernel k("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush));
-    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);   // 1024 blocks x 2 one-warp groups
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
@@ -12217,9 +12709,10 @@ PXG_TEST(softBodySimHeightfieldContactGen)
     {
         Kernel k("softBodyHfContactGenBda.spv", "sb_heightfieldContactGenLaunch",
                  {}, sizeof(SbHfCgPush));
-        // The engine's grid (PxgNarrowphaseCore.cpp:5462): x = SB_HFCG = 1024, y = z = 1,
-        // block (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK).
-        k.dispatch(/*gridX*/ 1024u, {}, p, 1u, 1u);
+        // The engine's grid (PxgNarrowphaseCore.cpp): x = SB_HFCG = 1024, y = z = 1, block
+        // (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK); the port launches one group per CUDA warp
+        // (PXG_NO_CUDA_TOOLKIT), x = 2048.
+        k.dispatch(/*gridX*/ 2048u, {}, p, 1u, 1u);
     }
     dev->flush();
 
@@ -12233,6 +12726,51 @@ PXG_TEST(softBodySimHeightfieldContactGen)
     const auto gMat = downloadBuffer<uint16_t>(dev, bSorted.h, MAXC * 8u);   // PxU16 materials (5.12)
     const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
     const auto gPair = downloadBuffer<PxgDeformablePairInfo>(dev, bInfo.h, MAXC);
+
+    // The same contacts, order-free and bitwise (point, normal/pen, barycentric, refs, sort key;
+    // the slot-index arrays name the slot and so legitimately follow the order), at the CUDA's
+    // own grid (1024: a group takes two CUDA warps' pairs, one grid-width apart) and at three groups
+    // and one (every group strides through the stack).
+    if (gCount <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 1024u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, zeroF4);
+            DevBuf bC1 = makeDev(dev, zeroF4);
+            DevBuf bC2 = makeDev(dev, zeroF4);
+            DevBuf bC3 = makeDev(dev, poison);
+            DevBuf bC4 = makeDev(dev, poison);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SbHfCgPush r = p;
+            r.wPoint = bC0.addr; r.wNormalPen = bC1.addr; r.wBarycentric = bC2.addr;
+            r.wContactInfo = bC3.addr; r.wContactByRigid = bC4.addr; r.wTotalCount = bCnt.addr;
+            Kernel("softBodyHfContactGenBda.spv", "sb_heightfieldContactGenLaunch", {}, sizeof(SbHfCgPush))
+                .dispatch(gx ? gx : 2048u, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 2u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 2u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == gCount,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, gCount);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == gCount && rows == ref,
+                              "at %u groups the softbody-vs-heightfield contact gen wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, gCount);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bCnt.h);
+        }
+    }
 
     for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
         std::printf("  contact %u: p=(%.5f %.5f %.5f) rest=%.5f n=(%.6f %.6f %.6f) pen=%.6f "
@@ -12464,14 +13002,15 @@ PXG_TEST(softBodySimHeightfieldContactGen)
         p2.wTotalCount = bC2.addr;
         p2.wContactInfo = bI2.addr;
         Kernel("softBodyHfContactGenBda.spv", "sb_heightfieldContactGenLaunch", {}, sizeof(SbHfCgPush))
-            .dispatch(1024u, {}, p2, 1u, 1u);
+            .dispatch(2048u, {}, p2, 1u, 1u);
         dev->flush();
         const uint32_t n2 = downloadBuffer<uint32_t>(dev, bC2.h, 1)[0];
         const auto i2 = downloadBuffer<PxgDeformablePairInfo>(dev, bI2.h, MAXC);
         PXG_CHECK_MSG(n2 == 5u, "the (heightfield, T_ABOVE) filter must drop exactly one of the six contacts; got %u", n2);
         for (uint32_t i = 0; i < n2 && i < MAXC; ++i)
             PXG_CHECK_MSG(PxgGetDeformableFeatureId(i2[i].ref1) != T_ABOVE, "T_ABOVE is filtered and must not emit");
-        dev->destroyBuffer(bF.h); dev->destroyBuffer(bFDesc.h); dev->destroyBuffer(bC2.h); dev->destroyBuffer(bI2.h);
+        dev->destroyBuffer(bF.h); dev->destroyBuffer(bFDesc.h); dev->destroyBuffer(bC2.h);
+        dev->destroyBuffer(bI2.h);
     }
 
     for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h,

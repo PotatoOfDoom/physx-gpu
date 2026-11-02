@@ -63,8 +63,12 @@
 // per-thread arrays, so the whole query belongs to a single thread and lane 0 runs it.
 //
 // GRID.  The engine launches gridDim = (SB_MESHCG = 1024, 1, 1) with blockDim = (32, 2, 1)
-// (PxgNarrowphaseCore.cpp:4695), so the stride over midphase pairs is gridDim.x * blockDim.y
-// = 2048 and the block's two warps are walked serially here.
+// (PxgNarrowphaseCore.cpp), so the stride over midphase pairs is gridDim.x * blockDim.y = 2048.
+// The block's two warps used to be walked serially here; the launch site now
+// (PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp, 2048 groups, so the warp index is
+// gid.x and the stride the group count WorkgroupCount().x (at any other grid still every
+// stack entry exactly once).  The launch sits in upstream-dead code (see the blob note
+// below); it is kept in the same shape as its live siblings.
 // ===========================================================================
 module softBodyClothContactGenBda;
 
@@ -79,7 +83,6 @@ import pxgSlangTetCollide;
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 // PxgSoftBodyCoreKernelIndices.h:57 — the engine's fixed grid for SB_CLOTH_CG.
 static const uint SB_MESHCG = 1024u;
-static const uint SB_CG_STRIDE = SB_MESHCG * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
@@ -250,11 +253,12 @@ void sb_clothContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
     if (lane != 0u)
         return;
 
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. gridDim.x * blockDim.y.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint i = globalWarpIdx; i < numPairs; i += SB_CG_STRIDE)
+    for (uint i = globalWarpIdx; i < numPairs; i += WorkgroupCount().x)
     {
         const uint4 curPair = Ptr<uint4>(gCg.stackPtr)[i];
         const uint cmIdx = curPair.x;

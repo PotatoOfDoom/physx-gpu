@@ -66,10 +66,14 @@
 // THE GRID: the engine launches (2048, 1, 1) x (128, 1, 1)
 // (PxgNarrowphaseCore.cpp:7024) and grid-strides by gridDim.x * blockDim.x =
 // 262144 over `l = ceil(numPairs / 32) * 32`.  The bridge drops blockDim, so a
-// [numthreads(32,1,1)] group is ONE warp and the block's FOUR warps are walked
-// serially.  `base`, the stride and `l` are all multiples of 32, so the loop
-// condition is identical in every lane and the ballot's barriers stay
-// group-uniform.
+// [numthreads(32,1,1)] group is ONE warp; the block's FOUR warps used to be walked
+// serially.  The launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT)
+// launches one group per CUDA warp, 2048 * 4 groups, so group g is CUDA warp g
+// (threads g * 32 + lane) and the stride is the launched thread count,
+// WorkgroupCount().x * 32 -- 262144 at that grid, and at any other grid still every
+// pair exactly once.  `base`, the stride and `l` are all multiples of 32, so the
+// loop condition is identical in every lane and the ballot's barriers stay
+// group-uniform.  Same shape as the mesh sibling (femClothMeshContactGenBda).
 //
 // ===========================================================================
 // THE DEAD ONE: cloth_heightfieldVertexContactGenLaunch
@@ -124,7 +128,6 @@ import pxgSlangDeformableWriters; // PxgRigidDbContactWriterGpu
 static const uint WARP = 32u;
 static const uint HF_CG_WARPS_PER_BLOCK = 4u;                    // block (128,1,1)
 static const uint HF_CG_GRID = 2048u;
-static const uint HF_CG_STRIDE = HF_CG_GRID * HF_CG_WARPS_PER_BLOCK * WARP;   // 262144
 
 
 // ---------------------------------------------------------------------------
@@ -222,11 +225,12 @@ void cloth_heightfieldContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     Ptr<float> restDistance = Ptr<float>(gCg.restDistance);
     Ptr<PxgShape> shapes = Ptr<PxgShape>(gCg.gpuShapes);
 
-    for (uint sub = 0u; sub < HF_CG_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): the warp's first thread is
+    // gid.x * WARP and the stride the launched thread count, gridDim.x * blockDim.x.
     {
-    const uint warpBase = gid.x * (HF_CG_WARPS_PER_BLOCK * WARP) + sub * WARP;
+    const uint warpBase = gid.x * WARP;
 
-    for (uint base = warpBase; base < l; base += HF_CG_STRIDE)
+    for (uint base = warpBase; base < l; base += WorkgroupCount().x * WARP)
     {
         const uint i = base + lane;
 

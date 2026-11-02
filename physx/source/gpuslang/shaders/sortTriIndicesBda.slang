@@ -8,15 +8,19 @@
 //
 // THE DISPATCH REPRODUCES THE CUDA EXACTLY, with no ceiling — unlike the core
 // kernel of P8.46c.  The host launches ceil(numTests / 2) blocks of two warps and
-// passes numTests as `nbPairs` (PxgNarrowphaseCore.cpp:2649-2654), so the grid
-// covers every contact manager and the CUDA has NO grid-stride loop to give up.
-// One workgroup per block, a constant-trip loop over its two warps, and the
-// coverage is identical.
+// passes numTests as `nbPairs` (PxgNarrowphaseCore.cpp), so the grid covers every
+// contact manager and the CUDA has NO grid-stride loop to give up.  The port's
+// launch site (PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp,
+// 2 * ceil(numTests / 2) groups, so the group index IS the CUDA's globalWarpIndex
+// (the block's two warps used to be walked serially in one group).  A group-stride
+// loop (stride WorkgroupCount().x, a group-uniform trip count) makes exactly one
+// pass at that grid and still covers every manager at any smaller one -- at the
+// CUDA's own grid a group takes up to two managers one grid-width apart.
 //
 // THE CHAINED LOAD IS FINE HERE.  `*orderedCvxTriIntermPtr` is an address read out
-// of memory and then dereferenced, which is the P8.40 pattern — but the hazard is
-// the GRID-STRIDE form, and this loop has a constant trip count, the same shape
-// convexTrimeshMidphaseBda and convexTrimeshCoreBda already ship green with.
+// of memory and then dereferenced, which is the P8.40 pattern — read once, outside
+// the loop.  The per-manager chained loads inside the loop are the shape
+// convexTrimeshCoreBda's grid-stride loop ships green with.
 //
 // SIX OF THE TWENTY-TWO SWEEP MUTANTS SURVIVE, and none of them is a fixture gap.
 // They are recorded here so a later reader does not go hunting for a test that
@@ -35,11 +39,9 @@
 //     overrun the region.  What it does clobber is the sanitised tail, and the
 //     scatter re-sanitises on every read (pxgSlangRadixWarp.slang:208), so the
 //     clobber is erased before it is used.
-//   * raising NP_TRIMESH_WARPS_PER_BLOCK to four.  The HOST fixes the grid at
-//     ceil(nbPairs / 2); a wider block only stretches each block's range of
-//     UNIQUE warp indices, so every pair is still covered exactly once and the
-//     extra indices fall out on the bounds check.  Equivalent modulo wasted
-//     workgroups — unkillable from inside the shader.
+//   * (retired) raising NP_TRIMESH_WARPS_PER_BLOCK to four.  The constant no longer
+//     enters the index: the group index is the warp index, and the group-stride loop
+//     covers every manager at any grid.
 //   * dropping the barrier at the top of the loop.  Every groupshared access in
 //     the sort is already bracketed by its own barriers (rsPass:192, the scatter's
 //     tail at :256 and :266, rsReduceAdd at :94 and :96), so this one is provably
@@ -48,7 +50,8 @@
 //
 // The one survivor that WAS a fixture gap — dropping `globalWarpIndex >= nbPairs`
 // — is now killed by a decoy ConvexMeshPair one entry past nbPairs, which is what
-// the engine's capacity-sized array really holds.
+// the engine's capacity-sized array really holds.  (That guard is now the bound of
+// the group-stride loop, and the clamp below keeps every access inside [0, nbPairs).)
 
 import pxgSlangRadixWarp;
 
@@ -76,13 +79,16 @@ void sortTriangleIndices(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     // grid-stride loop.
     const uint64_t ordered = Ptr<uint64_t>(gSt.orderedCvxTriIntermPtr)[0];
 
-    for (uint sub = 0u; sub < NP_TRIMESH_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header), and a group-stride loop so any smaller
+    // grid still covers every manager.  The loop bound is group-uniform.
+    for (uint warpLoop = gid.x; warpLoop < gSt.nbPairs; warpLoop += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();
 
-        const uint globalWarpIndex = gid.x * NP_TRIMESH_WARPS_PER_BLOCK + sub;
-        if (globalWarpIndex >= gSt.nbPairs)
-            continue;
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.
+        // Every live iteration has globalWarpIndex == warpLoop.
+        const uint globalWarpIndex = min(warpLoop, max(gSt.nbPairs, 1u) - 1u);
 
         // ConvexMeshPair, 56-byte stride: count @32, roundedStartIndex @40.  The
         // declaration's trailing numbers are running END offsets -- reading them

@@ -3062,9 +3062,16 @@ static std::vector<uint8_t> triNpMeshBlob(const trinp::MeshH& m)
     return blob;
 }
 
-PXG_TEST(npCvxCoreCvxGen_triNpAtoBSign)
+// `groupsFor`: the dispatch for a test count.  The engine launches ceil(numTests / 4) blocks of
+// four warps, one test each (PxgNarrowphaseCore.cpp); the port's launch site
+// (PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp, four times that, and the
+// shader's group-stride loop covers the CUDA's own grid, where a group takes up to four tests
+// one grid-width apart.  Every case reads its contacts back through its own output record, so the
+// order in which the tests reserve stream space does not matter.
+static void runTriNpAtoBSign(const char* gridName, uint32_t (*groupsFor)(uint32_t))
 {
     using namespace trinp;
+    std::printf("    [ note ] %s grid\n", gridName);
     static_assert(sizeof(physx::Gu::BV32DataPacked) == 1168, "BV32DataPacked (pxgSlangBv32's BV32_STRIDE)");
     static_assert(uint32_t(physx::PxGeometryType::eCONVEXCORE) == 4u &&
                   uint32_t(physx::PxGeometryType::eTRIANGLEMESH) == 8u, "PxGeometryType numbering");
@@ -3220,9 +3227,8 @@ PXG_TEST(npCvxCoreCvxGen_triNpAtoBSign)
     push.contactBytesLimit = N * CONTACT_WORDS * 4u;
     push.forceBytesLimit = N * 256u;
 
-    // grid = ceil(numTests / 4): one group walks the block's four warps (tests) serially
     Kernel k("cvxCoreTriNpBda.spv", "convexCoreTrimeshNphase_Kernel32", {}, sizeof(TriPush));
-    k.dispatch((N + 3u) / 4u, {}, push, 1u, 1u);
+    k.dispatch(groupsFor(N), {}, push, 1u, 1u);
     dev->flush();
 
     const auto gOut = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
@@ -3320,6 +3326,335 @@ PXG_TEST(npCvxCoreCvxGen_triNpAtoBSign)
     for (PxgBufferHandle hb : meshBufs) dev->destroyBuffer(hb);
     for (PxgBufferHandle hb : { bShapes, bXf, bCd, bCms, bMat, bOut, bContact, bPatch, bCtr, bTouch, bPchg })
         dev->destroyBuffer(hb);
+}
+
+PXG_TEST(npCvxCoreCvxGen_triNpAtoBSign)
+{
+    runTriNpAtoBSign("port", [](uint32_t n) { return 4u * ((n + 3u) / 4u); });
+}
+
+PXG_TEST(npCvxCoreCvxGen_triNpAtoBSignCudaGrid)
+{
+    runTriNpAtoBSign("CUDA", [](uint32_t n) { return (n + 3u) / 4u; });
+    runTriNpAtoBSign("one-group", [](uint32_t) { return 1u; });
+}
+
+// ===========================================================================
+// convexCoreConvexNphase_Kernel (cvxCoreCvxNpBda.slang) -- the ENGINE kernel, end to
+// end, at every grid it can be launched with.  Second review of the one-group-per-warp
+// tranche: generateContacts is refCvxGen above (verified bitwise against the same
+// layers by npCvxCoreCvxGen_contacts), but no fixture loaded cvxCoreCvxNpBda.spv, so
+// the kernel's own wiring (TestInput without a swap, the mid-point shift and its
+// return on the contacts, makeConvexShape's arms, writeOutput with the un-negated
+// normal) and its LAUNCH SHAPE were seen only by scenes.  The port's launch site
+// issues 512 / 64 = 8 groups of 64 per CUDA block and the shader takes the flat thread
+// id as the CUDA's, striding by WorkgroupCount().x * 64.  600 tests -- two CUDA blocks
+// -- run at that port grid, at the CUDA's own block count (2), and at 3 and 1 groups,
+// each against refCvxGen bitwise and order-free through each test's own cmOutputs.
+// ===========================================================================
+namespace ccnp
+{
+struct GpuShape
+{
+    float sx, sy, sz, rx, ry, rz, rw;
+    uint32_t materialIndex, hullLo, hullHi, type, particleOrSoftbodyId;
+};
+static_assert(sizeof(GpuShape) == 48, "PxgShape mirror");
+struct CmInput { uint32_t shapeRef0, shapeRef1, tcRef0, tcRef1; };
+struct CachedXf { float qx, qy, qz, qw, px, py, pz; uint32_t flags; };
+static_assert(sizeof(CachedXf) == 32, "PxsCachedTransform mirror");
+struct MaterialH { float dyn, sta, rest, damping; uint32_t flagsModes0, modes1; };
+static_assert(sizeof(MaterialH) == 24, "PxsMaterialData mirror");
+
+// cvxCoreCvxNpBda.slang's CvxCoreCvxParams == the CUDA parameter list (:497-516),
+// byte-identical to the plane kernel's.
+struct NpPush
+{
+    uint32_t numTests, pad4;
+    uint64_t cmInputs, cmOutputs, shapes, transformCache, contactDistance, materials;
+    uint64_t contactStream, patchStream, counters, touchFlags, patchFlags;
+    uint64_t startPatches, startPoints, startForces;
+    uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit, pad132;
+};
+static_assert(sizeof(NpPush) == 136, "the kCvxCorePlane ABI row is 136 bytes");
+
+struct Side { uint32_t geom, coreType; float core[6]; float margin; F4 q; V3 p; float cd; };
+} // namespace ccnp
+
+static void runCoreConvexEngine(const char* gridName, uint32_t (*groupsFor)(uint32_t))
+{
+    using namespace ccnp;
+    std::printf("    [ note ] %s grid\n", gridName);
+    const uint32_t G_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE);
+    const uint32_t G_CAPSULE = uint32_t(physx::PxGeometryType::eCAPSULE);
+    const uint32_t G_BOX = uint32_t(physx::PxGeometryType::eBOX);
+    const uint32_t G_CORE = uint32_t(physx::PxGeometryType::eCONVEXCORE);
+    const uint32_t CORE_POINT_ = uint32_t(physx::PxConvexCore::ePOINT);
+    const uint32_t CORE_SEGMENT_ = uint32_t(physx::PxConvexCore::eSEGMENT);
+    const uint32_t CORE_BOX_ = uint32_t(physx::PxConvexCore::eBOX);
+    const uint32_t CORE_ELLIPSOID_ = uint32_t(physx::PxConvexCore::eELLIPSOID);
+
+    std::mt19937 rng(0xCC0C0E51u);
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() {
+        float a[4]; float m2 = 0;
+        for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
+        const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+        return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i };
+    };
+    const uint32_t coreTypes[4] = { CORE_POINT_, CORE_SEGMENT_, CORE_BOX_, CORE_ELLIPSOID_ };
+    auto makeSide = [&](uint32_t kind, uint32_t sel) {
+        Side sd;
+        std::memset(&sd, 0, sizeof(sd));
+        sd.geom = kind == 0 ? G_CORE : (kind == 1 ? G_SPHERE : (kind == 2 ? G_CAPSULE : G_BOX));
+        sd.coreType = coreTypes[sel % 4u];
+        for (float& w : sd.core) w = rf(0.2f, 0.8f);
+        if (kind == 0 && sd.coreType == CORE_POINT_) for (float& w : sd.core) w = 0.0f;
+        if (kind == 1) sd.core[1] = sd.core[2] = sd.core[0];
+        if (kind == 2) sd.core[2] = sd.core[1];
+        sd.margin = (kind == 0 && (sel % 3u) != 0u) ? rf(0.02f, 0.25f) : 0.0f;
+        if (kind == 0 && sd.coreType == CORE_POINT_) sd.margin = rf(0.2f, 0.6f);   // a sphere core
+        sd.q = randQuat();
+        sd.cd = rf(0.0f, 0.05f);
+        return sd;
+    };
+    // What makeConvexShape (pxgSlangCvxCoreMake.slang) builds from a side, in refCvxGen's words.
+    auto toRef = [&](const Side& sd, U4& meta, U4 core[3], float& margin) {
+        std::memset(core, 0, sizeof(U4) * 3);
+        margin = 0.0f;
+        if (sd.geom == G_CORE)
+        {
+            meta = U4{ sd.coreType, 0, 0, 0 };
+            core[0] = U4{ f2u(sd.core[0]), f2u(sd.core[1]), f2u(sd.core[2]), f2u(sd.core[3]) };
+            core[1] = U4{ f2u(sd.core[4]), f2u(sd.core[5]), 0, 0 };
+            margin = sd.margin;
+        }
+        else if (sd.geom == G_SPHERE) { meta = U4{ CORE_POINT_, 0, 0, 0 }; margin = sd.core[0]; }
+        else if (sd.geom == G_CAPSULE)
+        { meta = U4{ CORE_SEGMENT_, 0, 0, 0 }; core[0].x = f2u(sd.core[0] * 2.0f); margin = sd.core[1]; }
+        else
+        {
+            meta = U4{ CORE_BOX_, 0, 0, 0 };
+            core[0] = U4{ f2u(sd.core[0] * 2.0f), f2u(sd.core[1] * 2.0f), f2u(sd.core[2] * 2.0f), 0 };
+        }
+    };
+
+    // ---- the cases and their oracle -----------------------------------------
+    const uint32_t N = 600;
+    std::vector<Side> sideA(N), sideB(N);
+    std::vector<CvxOut> ref(N);
+    std::vector<V3> shiftOf(N);
+    size_t cHit = 0, cMiss = 0, cMulti = 0, lowHalf = 0, highHalf = 0, block1 = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        Side& a = sideA[i];
+        Side& b = sideB[i];
+        a = makeSide(i % 4u, i / 4u);
+        b = makeSide((i / 4u) % 4u, i / 16u + 1u);
+        a.p = V3{ rf(-3, 3), rf(-3, 3), rf(-3, 3) };
+        V3 d{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+        const float dm = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        d = dm > 1e-3f ? V3{ d.x / dm, d.y / dm, d.z / dm } : V3{ 1, 0, 0 };
+        const float sep = rf(0.0f, 2.2f);
+        b.p = V3{ a.p.x + d.x * sep, a.p.y + d.y * sep, a.p.z + d.z * sep };
+
+        // the kernel's frame: both poses shifted to their mid-point (:525)
+        const V3 shift{ (a.p.x + b.p.x) * 0.5f, (a.p.y + b.p.y) * 0.5f, (a.p.z + b.p.z) * 0.5f };
+        shiftOf[i] = shift;
+        CvxIn s;
+        std::memset(&s, 0, sizeof(s));
+        float mA, mB;
+        toRef(a, s.metaA, s.coreA, mA);
+        toRef(b, s.metaB, s.coreB, mB);
+        s.poseAq = a.q;
+        s.poseAp = F4{ a.p.x - shift.x, a.p.y - shift.y, a.p.z - shift.z, mA };
+        s.poseBq = b.q;
+        s.poseBp = F4{ b.p.x - shift.x, b.p.y - shift.y, b.p.z - shift.z, mB };
+        s.cfg = F4{ a.cd + b.cd, 0, 0, 0 };   // the six-argument overload: no cull direction
+        refCvxGen(s, ref[i]);
+        PXG_CHECK_MSG(ref[i].counts.y == 0u, "case %u reached a trig path", i);
+        if (ref[i].counts.x)
+        {
+            ++cHit;
+            if (i < 64) ++lowHalf; else if (i < 512) ++highHalf; else ++block1;
+        }
+        else ++cMiss;
+        if (ref[i].counts.x >= 2) ++cMulti;
+    }
+    std::printf("    [ note ] %u tests: %zu with contacts (%zu multi-point), %zu without\n",
+                N, cHit, cMulti, cMiss);
+    PXG_CHECK_MSG(cHit > N / 4 && cMiss > N / 10 && cMulti >= 15, "coverage thin");
+    PXG_CHECK_MSG(lowHalf > 4 && highHalf > 50 && block1 > 4, "contacts not spread over the grid");
+
+    // ---- the device run --------------------------------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t MAT_A = 1u, MAT_B = 2u;
+    std::vector<MaterialH> mats(3);
+    std::memset(mats.data(), 0, mats.size() * sizeof(MaterialH));
+    mats[MAT_A] = MaterialH{ 0.5f, 0.75f, 0.25f, 0.125f, 0u, 0u };   // average combine
+    mats[MAT_B] = MaterialH{ 0.25f, 0.5f, 0.5f, 0.375f, 0u, 0u };
+
+    std::vector<GpuShape> shapes(2 * N);
+    std::vector<CachedXf> xf(2 * N);
+    std::vector<float> cdist(2 * N);
+    std::vector<CmInput> cms(N);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    std::memset(xf.data(), 0, xf.size() * sizeof(CachedXf));
+    auto setShape = [&](GpuShape& sh, const Side& sd, uint32_t mat) {
+        sh.sx = sd.core[0]; sh.sy = sd.core[1]; sh.sz = sd.core[2];
+        sh.materialIndex = mat; sh.type = sd.geom;
+        if (sd.geom == G_CORE)
+        { sh.rx = sd.core[3]; sh.ry = sd.core[4]; sh.rz = sd.core[5]; sh.rw = sd.margin; sh.hullLo = sd.coreType; }
+        else
+            sh.rw = 1.0f;
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const Side& a = sideA[i];
+        const Side& b = sideB[i];
+        setShape(shapes[2 * i], a, MAT_A);
+        setShape(shapes[2 * i + 1], b, MAT_B);
+        xf[2 * i] = CachedXf{ a.q.x, a.q.y, a.q.z, a.q.w, a.p.x, a.p.y, a.p.z, 0u };
+        xf[2 * i + 1] = CachedXf{ b.q.x, b.q.y, b.q.z, b.q.w, b.p.x, b.p.y, b.p.z, 0u };
+        cdist[2 * i] = a.cd; cdist[2 * i + 1] = b.cd;
+        cms[i] = CmInput{ 2 * i, 2 * i + 1, 2 * i, 2 * i + 1 };
+    }
+
+    const uint32_t PATCH_WORDS = 16u, CONTACT_WORDS = 16u;
+    const uint64_t START_PATCHES = 0x0000100000000000ull, START_POINTS = 0x0000200000000040ull,
+                   START_FORCES = 0x0000300000000080ull;   // never dereferenced by the tail
+    std::vector<uint32_t> patchInit(size_t(N) * PATCH_WORDS, 0u), contactInit(size_t(N) * CONTACT_WORDS, 0xCDCDCDCDu);
+    std::vector<uint32_t> outInit(size_t(N) * 12u, 0u), flagInit(N, 0xFFFFFFFFu), ctrInit(4, 0u);
+
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCms = createBufferFrom(dev, cms);
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bContact = createBufferFrom(dev, contactInit);
+    PxgBufferHandle bPatch = createBufferFrom(dev, patchInit);
+    PxgBufferHandle bCtr = createBufferFrom(dev, ctrInit);
+    PxgBufferHandle bTouch = createBufferFrom(dev, flagInit);
+    PxgBufferHandle bPchg = createBufferFrom(dev, flagInit);
+
+    NpPush push{};
+    push.numTests = N;
+    push.cmInputs = dev->getBufferDeviceAddress(bCms);
+    push.cmOutputs = dev->getBufferDeviceAddress(bOut);
+    push.shapes = dev->getBufferDeviceAddress(bShapes);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.materials = dev->getBufferDeviceAddress(bMat);
+    push.contactStream = dev->getBufferDeviceAddress(bContact);
+    push.patchStream = dev->getBufferDeviceAddress(bPatch);
+    push.counters = dev->getBufferDeviceAddress(bCtr);
+    push.touchFlags = dev->getBufferDeviceAddress(bTouch);
+    push.patchFlags = dev->getBufferDeviceAddress(bPchg);
+    push.startPatches = START_PATCHES;
+    push.startPoints = START_POINTS;
+    push.startForces = START_FORCES;
+    push.patchBytesLimit = N * PATCH_WORDS * 4u;
+    push.contactBytesLimit = N * CONTACT_WORDS * 4u;
+    push.forceBytesLimit = N * 16u;
+
+    Kernel k("cvxCoreCvxNpBda.spv", "convexCoreConvexNphase_Kernel", {}, sizeof(NpPush));
+    k.dispatch(groupsFor(N), {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gOut = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+    const auto gContact = downloadBuffer<uint32_t>(dev, bContact, contactInit.size());
+    const auto gPatch = downloadBuffer<uint32_t>(dev, bPatch, patchInit.size());
+    const auto gCtr = downloadBuffer<uint32_t>(dev, bCtr, 4);
+    const auto gTouch = downloadBuffer<uint32_t>(dev, bTouch, N);
+    const auto gPchg = downloadBuffer<uint32_t>(dev, bPchg, N);
+
+    // combine (PxsMaterialCombiner, average mode on both sides), transcribed
+    const MaterialH& m0 = mats[MAT_A]; const MaterialH& m1 = mats[MAT_B];
+    const float eRest = 1.0f * (0.5f * (m0.rest + m1.rest));
+    const float eDamp = 0.5f * (m0.damping + m1.damping);
+    const float eDyn = 0.5f * (m0.dyn + m1.dyn);
+    const float eStaF = 0.5f * (m0.sta + m1.sta);
+    const float eSta = (eStaF - eDyn) >= 0.0f ? eStaF : eDyn;
+
+    uint64_t sumPoints = 0, sumPatches = 0;
+    size_t mm = 0;
+    auto bad = [&](uint32_t i, const char* what, uint32_t got, uint32_t want) {
+        if (mm < 12)
+            std::printf("  coreConvex test %u: %s got 0x%08x want 0x%08x\n", i, what, got, want);
+        ++mm;
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const CvxOut& e = ref[i];
+        const uint32_t nPts = e.counts.x, nPatch = nPts ? 1u : 0u;
+        sumPoints += nPts; sumPatches += nPatch;
+        const uint32_t* o = &gOut[size_t(i) * 12u];
+        const uint32_t status = nPts ? 2u : 1u;    // eHAS_TOUCH / eHAS_NO_TOUCH, prior 0
+        if (o[8] != ((status << 16) | (nPatch << 8))) bad(i, "allflags", o[8], (status << 16) | (nPatch << 8));
+        if ((o[9] & 0xFFFFu) != nPts) bad(i, "nbContacts", o[9] & 0xFFFFu, nPts);
+        if (gTouch[i] != 1u) bad(i, "touchChange", gTouch[i], 1u);   // prior touch unknown
+        if (gPchg[i] != nPatch) bad(i, "patchChange", gPchg[i], nPatch);
+        const uint64_t cp = uint64_t(o[2]) | (uint64_t(o[3]) << 32);
+        if (nPts == 0)
+        {
+            if (cp != 0) bad(i, "contactPoints (none expected)", uint32_t(cp), 0u);
+            continue;
+        }
+        const uint64_t cOff = cp - START_POINTS;
+        if ((cOff & 15u) != 0 || cOff + 16u * nPts > uint64_t(contactInit.size()) * 4u)
+        { bad(i, "contactPoints offset", uint32_t(cOff), 0u); continue; }
+        const V3& sh = shiftOf[i];
+        for (uint32_t s = 0; s < nPts; ++s)
+        {
+            // contacts[i] = { points[i] + shift, dists[i] } (:537-538)
+            const uint32_t want[4] = { f2u(e.points[s].x + sh.x), f2u(e.points[s].y + sh.y),
+                                       f2u(e.points[s].z + sh.z), f2u(e.points[s].w) };
+            for (uint32_t kk = 0; kk < 4; ++kk)
+            {
+                const uint32_t got = gContact[size_t(cOff / 4u) + s * 4u + kk];
+                if (got != want[kk]) bad(i, "contact word", got, want[kk]);
+            }
+        }
+        const uint64_t pp = uint64_t(o[0]) | (uint64_t(o[1]) << 32);
+        const uint64_t pOff = pp - START_PATCHES;
+        if ((pOff & 63u) != 0 || pOff + 64u > uint64_t(patchInit.size()) * 4u)
+        { bad(i, "contactPatches offset", uint32_t(pOff), 0u); continue; }
+        // the kernel passes `normal` itself, not its negation (:540)
+        const uint32_t* w = &gPatch[size_t(pOff / 4u)];
+        const uint32_t want[14] = { f2u(1.0f), f2u(1.0f), f2u(1.0f), f2u(1.0f),
+                                    f2u(e.normal.x), f2u(e.normal.y), f2u(e.normal.z),
+                                    f2u(eRest), f2u(eDyn), f2u(eSta), f2u(eDamp),
+                                    (nPts & 0xFFu) << 16,                       // matFlags 0
+                                    MAT_A << 16, MAT_B };
+        for (uint32_t kk = 0; kk < 14; ++kk)
+            if (w[kk] != want[kk]) bad(i, "patch word", w[kk], want[kk]);
+    }
+    PXG_CHECK_MSG(gCtr[0] == 64u * sumPatches && gCtr[1] == 16u * sumPoints && gCtr[2] == 4u * sumPoints && gCtr[3] == 0u,
+                  "counters: patches %u contacts %u forces %u overflow %u (want %llu %llu %llu 0)",
+                  gCtr[0], gCtr[1], gCtr[2], gCtr[3], (unsigned long long)(64u * sumPatches),
+                  (unsigned long long)(16u * sumPoints), (unsigned long long)(4u * sumPoints));
+    PXG_CHECK_MSG(mm == 0, "convexCoreConvexNphase_Kernel (%s grid, %u groups): %zu mismatching words "
+                  "against refCvxGen", gridName, groupsFor(N), mm);
+
+    for (PxgBufferHandle hb : { bShapes, bXf, bCd, bCms, bMat, bOut, bContact, bPatch, bCtr, bTouch, bPchg })
+        dev->destroyBuffer(hb);
+}
+
+// The port's grid: 512 / 64 = 8 groups of 64 per CUDA block (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT).
+PXG_TEST(npCvxCoreCvxGen_engineKernel)
+{
+    runCoreConvexEngine("port", [](uint32_t n) { return 8u * ((n + 511u) / 512u); });
+}
+
+// The CUDA's own block count (each 64-wide group then strides over its share), and
+// 3 and 1 groups.
+PXG_TEST(npCvxCoreCvxGen_engineKernelCudaGrid)
+{
+    runCoreConvexEngine("CUDA", [](uint32_t n) { return (n + 511u) / 512u; });
+    runCoreConvexEngine("three-group", [](uint32_t) { return 3u; });
+    runCoreConvexEngine("one-group", [](uint32_t) { return 1u; });
 }
 
 } // namespace

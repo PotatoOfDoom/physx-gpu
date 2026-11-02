@@ -50,9 +50,12 @@
 //     transcribed rather than dropped: "usually identity" is not "identity".
 //
 // GRID.  The engine launches gridDim = (SB_SBMIDPHASE = 1024, numTests, 1) with blockDim =
-// (32, MIDPHASE_WARPS_PER_BLOCK = 2, 1) (PxgNarrowphaseCore.cpp:4617).  The bridge forwards
-// the grid and ignores blockDim, so blockIdx.y is the contact-manager index and the block's
-// two warps are walked SERIALLY here, with the CUDA stride blockDim.y * gridDim.x preserved.
+// (32, MIDPHASE_WARPS_PER_BLOCK = 2, 1) (PxgNarrowphaseCore.cpp).  The bridge forwards the grid
+// and ignores blockDim, so blockIdx.y is the contact-manager index.  The block's two warps used
+// to be walked SERIALLY here; the launch site now (PXG_NO_CUDA_TOOLKIT) launches one group per
+// CUDA warp, (SB_SBMIDPHASE * 2, numTests, 1), so the warp index is gid.x and the stride the
+// group count WorkgroupCount().x -- the CUDA's blockDim.y * gridDim.x = 2048 at that grid, and
+// at any other grid still a stride that visits every tetrahedron exactly once.
 //
 // NoContraction-stamped: satIntersect is dot-of-cross throughout and the plane distances are
 // mul-feeding-add chains; getNormalized's rsqrt only picks a direction and never a decision.
@@ -67,7 +70,6 @@ import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:55.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_SBMIDPHASE = 1024u;
-static const uint SC_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
@@ -320,12 +322,12 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 
     const uint stackCapacity = gCm.stackSizeBytes / 16u;
 
-    // The block's two warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint tetrahedronIdx = globalWarpIdx; tetrahedronIdx < nbTets; tetrahedronIdx += SC_NB_WARPS)
+    for (uint tetrahedronIdx = globalWarpIdx; tetrahedronIdx < nbTets; tetrahedronIdx += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

@@ -1979,8 +1979,9 @@ PXG_TEST(softBodySimClothMidphase_p89NaNSelect)
     push.midphasePairsNum = bCnt.addr;
     {
         Kernel k("softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch", {}, sizeof(SbClothMidPush));
-        // the engine grid (PxgNarrowphaseCore.cpp:4617): x = SB_SBMIDPHASE = 1024, y = numTests
-        k.dispatch(1024u, {}, push, NQ, 1u);
+        // the engine grid (PxgNarrowphaseCore.cpp): x = SB_SBMIDPHASE = 1024 blocks of two warps,
+        // y = numTests; the port launches one group per CUDA warp (PXG_NO_CUDA_TOOLKIT), x = 2048
+        k.dispatch(2048u, {}, push, NQ, 1u);
         dev->flush();
     }
     const auto gS = downloadBuffer<U4>(dev, bStack.h, CAP);

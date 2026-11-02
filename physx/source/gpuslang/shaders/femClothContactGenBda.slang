@@ -936,9 +936,13 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
 //     is read straight through BDA here, so the cache and its barrier are
 //     dropped; they have no observable effect;
 //   - the engine packs MIDPHASE_WARPS_PER_BLOCK warps per block and the bridge
-//     forwards only gridDim, so the block's contact managers are walked SERIALLY
-//     in a group-uniform loop.  `sub` and its break are group-uniform, so every
-//     barrier below is reached uniformly -- the P9.15a rule;
+//     forwards only gridDim; the block's contact managers used to be walked
+//     SERIALLY in one group.  The launch sites now (PxgNarrowphaseCore.cpp,
+//     PXG_NO_CUDA_TOOLKIT) launch one group per CUDA warp, i.e. per contact
+//     manager, so cmIdx = gid.x, and a group-stride loop (stride
+//     WorkgroupCount().x) still covers every manager at any smaller grid.  The
+//     loop bound is group-uniform, so every barrier below is reached uniformly --
+//     the P9.15a rule;
 //   - THE WALK IS SPREAD OVER 1024 THREADS (pxgSlangBv32Batched, which documents
 //     it).  The one-warp walk was one serial dependent iteration per LEAF, and a
 //     cooked cloth tree has a few triangles per leaf: on the RX 9070 XT the
@@ -984,13 +988,12 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 {
     const uint tid = gtid.x;
 
-    for (uint sub = 0u; sub < TMID_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the deviations above), and a group-stride loop.
+    for (uint cmLoop = gid.x; cmLoop < gTMid.numWorkItems; cmLoop += WorkgroupCount().x)
     {
-    const uint cmIdx = gid.x * TMID_WARPS_PER_BLOCK + sub;
-    if (cmIdx >= gTMid.numWorkItems)
-        break;
-    // llvmpipe runs the rest of this iteration with an EMPTY mask after the uniform
-    // break and still issues its loads (P9.22): reading cmInputs[numWorkItems] and
+    const uint cmIdx = cmLoop;
+    // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask after the
+    // uniform loop exit and still issue its loads (P9.22): reading cmInputs[numWorkItems] and
     // then a shape at whatever index that garbage names faulted in the
     // three-manager fixture.  The loads use a clamped index; every store and
     // atomic is masked, so the clamp is unobservable.

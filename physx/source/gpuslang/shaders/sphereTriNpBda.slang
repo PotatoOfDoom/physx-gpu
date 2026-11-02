@@ -698,7 +698,12 @@ void sphereTrimeshNarrowphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
     // convexMesh.cu:831.  See the header: this launch has NO grid multiplier, and
     // the grid is sized to the CONTACT MANAGER count while the loop runs over
     // PAIRS.  The trip count is workgroup-uniform, which is what keeps the
-    // output stage's barriers in uniform control flow.
+    // output stage's barriers in uniform control flow.  The CUDA block is 64
+    // threads, two warps; the port's launch site (PxgNarrowphaseCore.cpp,
+    // PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp, so
+    // `gid.x * 32 + lane` is the CUDA thread index and this stride the CUDA's
+    // `gridDim.x * blockDim.x` (the block's two warps used to run as two passes of
+    // this loop in one group).
     const uint gridStride = WorkgroupCount().x * PXG_WARP_SIZE;
 
     for (uint base = 0u; base < nbPairs; base += gridStride)

@@ -79,16 +79,18 @@
 //
 // DEVIATIONS from CUDA (recipe policy; identical set to femClothSelfCollisionBda, each
 // preserving the emitted contact SET and the running total):
-//   - ONE 32-thread group per warp-query with the block's MIDPHASE_WARPS_PER_BLOCK warps
-//     walked SERIALLY in a group-uniform `sub` loop, in place of the CUDA
+//   - ONE 32-thread group per warp-query in place of the CUDA
 //     (WARP_SIZE, MIDPHASE_WARPS_PER_BLOCK, 1) block.  The bv32 walk is warp-cooperative
 //     with a per-warp groupshared stack and a data-dependent loop, so packing >1 warp per
 //     group would put GroupMemoryBarrierWithGroupSync in control flow that is non-uniform
-//     ACROSS warps; the serial loop keeps every barrier group-uniform.  The engine
-//     launches ceil(2*maxClothVerts / 2) x numTests (VT) and
+//     ACROSS warps.  The engine launches ceil(2*maxClothVerts / 2) x numTests (VT) and
 //     ceil(maxClothTrianglesWithActiveEdges / 2) x numTests (EE) blocks and the Vulkan
-//     bridge drops blockDim, so the loop is what covers the second half of the range —
-//     the same bug-and-fix femClothSelfCollisionBda records;
+//     bridge drops blockDim; the block's warps used to be walked SERIALLY in a
+//     group-uniform `sub` loop (the same bug-and-fix femClothSelfCollisionBda records).
+//     The launch site now (PxgFEMClothCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group
+//     per CUDA warp, so the query index is gid.x, and a group-stride loop (stride
+//     WorkgroupCount().x, a group-uniform bound) still covers the whole range at any
+//     smaller grid;
 //   - __ballot_sync -> groupshared InterlockedOr mask; warpScanExclusive ->
 //     countbits(mask & lanemask_lt) (VT, single-element) / a groupshared prefix sum over
 //     the per-lane count (EE, multi-element);
@@ -218,14 +220,16 @@ void cloth_differentClothCollisionVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 
     const float contactDistSq = contactDist * contactDist;
 
     // See the header: the engine packs MIDPHASE_WARPS_PER_BLOCK warps into one block and
-    // launches ceil(2 * maxClothVerts / MIDPHASE_WARPS_PER_BLOCK) of them, so the group
-    // walks its block's warps serially.  `sub` and the break are group-uniform.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // launches ceil(2 * maxClothVerts / MIDPHASE_WARPS_PER_BLOCK) of them; the port's launch
+    // site launches one group per CUDA warp, and the group-stride loop covers any smaller
+    // grid.  The loop bound is group-uniform.
+    for (uint queryLoop = gid.x; queryLoop < numQueries; queryLoop += WorkgroupCount().x)
     {
-    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
-    if (globalWarpIdx >= numQueries)
-        break;
+    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
+    // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and still
+    // issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.  Every live
+    // iteration has globalWarpIdx == queryLoop.
+    const uint globalWarpIdx = min(queryLoop, max(numQueries, 1u) - 1u);
 
     const bool isCloth0 = globalWarpIdx < numVertices0;
     const uint vertexIdx = isCloth0 ? globalWarpIdx : globalWarpIdx - numVertices0;
@@ -242,7 +246,7 @@ void cloth_differentClothCollisionVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 
     const uint64_t treeAddr = clothes[otherClothId].mTriMeshData + 16UL;   // + sizeof(uint4)
 
     // 5.12: checks whether the own vertex is filtered against any triangle of the other
-    // cloth.  The CUDA returns the warp; here that is one `sub` iteration (group-uniform).
+    // cloth.  The CUDA returns the warp; here that is one loop iteration (group-uniform).
     const DfFilterArray filters = myFilters(myClothId);
     if (findSurfaceSurfaceVertexTriangleFilter(filters, myClothId, vertexIdx, otherClothId, PXG_DREF_ANY_FEATURE))
         continue;
@@ -427,12 +431,12 @@ void cloth_differentClothCollisionEELaunch(uint3 gtid : SV_GroupThreadID, uint3 
 
     static const uint nextE_lookup[3] = { 1u, 2u, 0u };
 
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp and a group-stride loop, as in the VT kernel above.
+    for (uint queryLoop = gid.x; queryLoop < numQueries; queryLoop += WorkgroupCount().x)
     {
-    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
-    if (globalWarpIdx >= numQueries)
-        break;
+    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
+    // The P9.22 clamp, as in the VT kernel: every live iteration has globalWarpIdx == queryLoop.
+    const uint globalWarpIdx = min(queryLoop, max(numQueries, 1u) - 1u);
 
     // setEdge0: the query triangle (t0) at globalWarpIdx, from MY cloth.
     const uint t0_index = trisWithActiveEdges[globalWarpIdx];

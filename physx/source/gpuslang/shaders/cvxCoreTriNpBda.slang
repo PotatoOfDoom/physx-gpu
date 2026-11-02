@@ -62,21 +62,25 @@
 //
 // i.e. ONE WARP PER TEST, four tests per block, each with its OWN `_Shared` slot
 // (`__shared__ PxU8 blockShared[BLOCK_WARP_COUNT][sizeof(_Shared)]`, :966).  The
-// four warps never interact.  The bridge forwards gridDim only and DROPS blockDim
-// (PxgVulkanCudaContext::launchKernel), so the Slang [numthreads] IS the block --
-// and this port therefore walks the block's four warps SERIALLY inside a 32-thread
-// group, the shape convexTrimeshMidphaseBda and softBodyMeshMidphaseBda both use.
+// four warps never interact (only __syncwarp, no __syncthreads, no shared slot read
+// across warps).  The bridge forwards gridDim only and DROPS blockDim
+// (PxgVulkanCudaContext::launchKernel), so the Slang [numthreads] IS the block.
+// This port used to walk the block's four warps SERIALLY inside one 32-thread group;
+// the launch site now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one
+// 32-thread group per CUDA warp, the shape convexTrimeshMidphaseBda and
+// softBodyMeshMidphaseBda use.
 //
 //     CUDA           block (32,4,1) = 128 threads, 4 tests, one warp each
-//     port           [numthreads(32,1,1)], 4 tests, walked serially
-//     grid           ceil(numTests/4), forwarded unchanged
-//     coverage       32 x 4 = 128 = the block -- exact
+//     port           [numthreads(32,1,1)], one test per group
+//     grid           ceil(numTests/4) * 4 groups, one per CUDA warp
+//     coverage       a group-stride loop (stride WorkgroupCount().x): one pass at
+//                    that grid, and every test at any smaller one -- at the CUDA's
+//                    own grid ceil(numTests/4) a group takes up to four tests
+//                    one grid-width apart
 //
 // tools/check_block_coverage.py is what holds this to the arithmetic: it is the
 // P9.68 checker, written after I shipped a [numthreads(64)] against a block of
-// 1024 in P9.67c, and its `serial_factor` condition requires exactly the pairing
-// below -- the trip count times the group must cover the block AND the loop
-// variable must be added to a group offset scaled by that same bound.
+// 1024 in P9.67c; the WorkgroupCount() stride is what it accepts as covering.
 //
 // ===========================================================================
 // THE SETUP IS COMPUTED BY ALL 32 LANES, NOT BY LANE 0 AND BROADCAST
@@ -163,7 +167,7 @@ static const uint EGT_TRIANGLEMESH = 8u;
 #include "pxgSlangCvxCoreMake.slang"   // Gu::makeConvexShape, all five arms
 
 static const uint CVXCORE_TRI_WARP = 32u;      // blockDim.x, and the group
-static const uint CVXCORE_TRI_BLOCK_WARPS = 4u; // blockDim.y, walked serially
+static const uint CVXCORE_TRI_BLOCK_WARPS = 4u; // blockDim.y, one group per warp
 static const uint CVXCORE_TRI_STACK = 320u;    // TestBvh::NODE_STACK_MAX
 
 // ---------------------------------------------------------------------------
@@ -204,8 +208,9 @@ struct CvxCoreTriParams
 ConstantBuffer<CvxCoreTriParams> gParams;
 
 // ---------------------------------------------------------------------------
-// Warp emulation scratch.  One group == one virtual warp; the four tests reuse it
-// in turn, separated by the barrier at the top of each trip.
+// Warp emulation scratch.  One group == one virtual warp; the tests a group takes
+// (one at the port's grid, more at a smaller one) reuse it in turn, separated by the
+// barrier at the top of each trip.
 // ---------------------------------------------------------------------------
 groupshared int sStack[CVXCORE_TRI_STACK];
 groupshared uint sBallot;
@@ -326,13 +331,15 @@ void convexCoreTrimeshNphase_Kernel32(uint3 gtid : SV_GroupThreadID, uint3 gid :
     Ptr<PxgShapeGpu> shapesP = Ptr<PxgShapeGpu>(gParams.shapes);
     Ptr<PxsCachedTransformGpu> xfP = Ptr<PxsCachedTransformGpu>(gParams.transformCache);
 
-    // The block's four warps, walked serially (see the header on the grid).
-    for (uint sub = 0u; sub < CVXCORE_TRI_BLOCK_WARPS; ++sub)
+    // One group per CUDA warp (see the header on the grid), and a group-stride loop so
+    // any smaller grid still covers every test.  The loop bound is group-uniform.
+    for (uint testLoop = gid.x; testLoop < gParams.numTests; testLoop += WorkgroupCount().x)
     {
-        const uint testIndex = gid.x * CVXCORE_TRI_BLOCK_WARPS + sub;
         GroupMemoryBarrierWithGroupSync();   // the scratch is reused per test
-        if (testIndex >= gParams.numTests)
-            continue;                        // group-uniform
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.
+        // Every live iteration has testIndex == testLoop.
+        const uint testIndex = min(testLoop, max(gParams.numTests, 1u) - 1u);
 
         // ---- TestInput (:66-96) + checkTypes (:98-108) ----------------------
         const PxgContactManagerInputGpu cin = Ptr<PxgContactManagerInputGpu>(gParams.cmInputs)[testIndex];

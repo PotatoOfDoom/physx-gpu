@@ -727,9 +727,23 @@ namespace physx
 			const PxU32 numBlocks = isVT ? (maxClothVerts + numWarpsPerBlock - 1) / numWarpsPerBlock
 										 : (maxClothTriangles + numWarpsPerBlock - 1) / numWarpsPerBlock;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// cloth_selfCollisionMidphaseVT/EELaunch (femClothSelfCollisionBda.slang) take their query
+			// from the group index and cover any grid with a group-stride loop; same arguments, same
+			// per-warp work.  The count is capped at 65535, Vulkan's guaranteed
+			// maxComputeWorkGroupCount[0] (one group per query passes it at 64K vertices for VT,
+			// 64K triangles with owned edges for EE); the loop covers the rest.
+			const PxU32 numWarpGroups = PxMin(numBlocks * numWarpsPerBlock, 65535u);
+			CUresult result =
+				mCudaContext->launchKernel(selfCollisionFunction, numWarpGroups, nbActiveClothes, 1, WARP_SIZE, 1, 1, 0, mStream,
+										   selfCollisionKernelParams, sizeof(selfCollisionKernelParams), 0, PX_FL);
+#else
 			CUresult result =
 				mCudaContext->launchKernel(selfCollisionFunction, numBlocks, nbActiveClothes, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream,
 										   selfCollisionKernelParams, sizeof(selfCollisionKernelParams), 0, PX_FL);
+#endif
 
 			if(result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,
@@ -801,8 +815,22 @@ namespace physx
 											 : (maxClothTriangles + numWarpsPerBlock - 1) / numWarpsPerBlock;
 
 				// each warp deal with one test.
+#ifdef PXG_NO_CUDA_TOOLKIT
+				// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+				// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+				// instead: cloth_differentClothCollisionVT/EELaunch (femClothDifferentClothBda.slang) take
+				// their query from the group index and cover any grid with a group-stride loop; same
+				// arguments, same per-warp work.  The count is capped at 65535, Vulkan's guaranteed
+				// maxComputeWorkGroupCount[0] (the VT launch has two groups per vertex of the larger
+				// cloth, so it passes it at 32K vertices; EE at 64K triangles with owned edges); the
+				// loop covers the rest.
+				const PxU32 numWarpGroups = PxMin(numBlocks * numWarpsPerBlock, 65535u);
+				result = mCudaContext->launchKernel(fcCollisionKernelFunction, numWarpGroups, numTests, 1, WARP_SIZE, 1, 1, 0,
+													mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 				result = mCudaContext->launchKernel(fcCollisionKernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0,
 													mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 				if(result != CUDA_SUCCESS)
 					PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,

@@ -1092,7 +1092,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexCorePlaneGjkEpaGpu(
 		const PxU32 numThreadsPerTest = 1;
 		const PxU32 numTestsPerBlock = numThreadsPerBlock / numThreadsPerTest;
 		const PxU32 numBlocks = (numTests + (numTestsPerBlock - 1)) / numTestsPerBlock;
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, and convexCorePlaneNphase_Kernel
+		// (cvxCorePlaneNpBda.slang) runs 64-thread groups, so the block's 32 warps would run two at a
+		// time, the rest as further passes of its stride loop.  1024 / 64 groups per block instead:
+		// the flat thread index is the CUDA's, one test per thread; same arguments.  The count is
+		// capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the bridge refuses a
+		// larger grid); the stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * (numThreadsPerBlock / 64), 65535u), 1, 1, 64, 1, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexCorePlaneNphase_Kernel fail to launch!!\n");
 
@@ -1161,7 +1171,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexCoreConvexGjkEpaGpu(
 		const PxU32 numThreadsPerTest = 1;
 		const PxU32 numTestsPerBlock = numThreadsPerBlock / numThreadsPerTest;
 		const PxU32 numBlocks = (numTests + (numTestsPerBlock - 1)) / numTestsPerBlock;
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, and convexCoreConvexNphase_Kernel
+		// (cvxCoreCvxNpBda.slang) runs 64-thread groups, so the block's 16 warps would run two at a
+		// time, the rest as further passes of its stride loop.  512 / 64 groups per block instead:
+		// the flat thread index is the CUDA's, one test per thread; same arguments.  The count is
+		// capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the bridge refuses a
+		// larger grid); the stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * (numThreadsPerBlock / 64), 65535u), 1, 1, 64, 1, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexCoreConvexNphase_Kernel fail to launch!!\n");
 
@@ -1229,7 +1249,18 @@ void PxgGpuNarrowphaseCore::testSDKConvexCoreTrimeshGjkEpaGpu(
 		const PxU32 blockTests = blockWarpCount;
 		const PxU32 numBlocks = (numTests + (blockTests - 1)) / blockTests;
 		CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CONVEXCORE_TRIMESH_KERNEL32_MAIN);
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the four warps of a block would
+		// share one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexCoreTrimeshNphase_Kernel32 (cvxCoreTriNpBda.slang) takes its test from
+		// the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * blockWarpCount, 65535u), 1, 1, warpThreadCount, 1, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, warpThreadCount, blockWarpCount, 1, 0, mStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexCoreTrimeshNphase_Kernel fail to launch!!\n");
 
@@ -1291,7 +1322,18 @@ void PxgGpuNarrowphaseCore::testSDKConvexCoreTetmeshGjkEpaGpu(
 		const PxU32 blockTests = blockWarpCount;
 		const PxU32 numBlocks = (numTests + (blockTests - 1)) / blockTests;
 		CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CONVEXCORE_TETMESH_KERNEL32_MAIN);
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the four warps of a block would
+		// share one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexCoreTetmeshNphase_Kernel32 (cvxCoreTetNpBda.slang) takes its test from
+		// the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * blockWarpCount, 65535u), 1, 1, warpThreadCount, 1, 1, 0, softbodyStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, warpThreadCount, blockWarpCount, 1, 0, softbodyStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexCoreTetmeshNphase_Kernel fail to launch!!\n");
 
@@ -1384,7 +1426,19 @@ void PxgGpuNarrowphaseCore::testSDKConvexCoreClothmeshGjkEpaGpu(
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = (numTests + numWarpsPerBlock - 1) / numWarpsPerBlock;
 		CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::CLOTH_MIDPHASE_PRIMITIVES);
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one workgroup and run one after the other.  One workgroup per CUDA warp instead (each
+		// 1024 threads wide, the batched BV32 walk of one contact manager):
+		// cloth_midphaseGeneratePairsLaunch (femClothContactGenBda.slang) takes its contact
+		// manager from the group index and covers any grid with a group-stride loop; same
+		// arguments, same per-manager work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -2286,7 +2340,9 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
 		// midphaseGeneratePairs (convexTrimeshMidphaseBda.slang) takes its warp index from
 		// the group index and its stride from the group count; same arguments, same per-warp work.
-		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #endif
@@ -2342,7 +2398,18 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a block would
+		// share one 32-thread workgroup and run one after the other (as further passes of its
+		// grid-stride loop).  One workgroup per CUDA warp instead: sphereTrimeshNarrowphase
+		// (sphereTriNpBda.slang) numbers its threads gid.x * 32 + lane and strides by the launched
+		// thread count, so every warp takes the pairs of its CUDA warp; same arguments.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the grid-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * (numThreadsPerBlock / WARP_SIZE), 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sphereTrimeshCore fail to launch kernel!!\n");
@@ -2365,7 +2432,17 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sortTriangleIndices (sortTriIndicesBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * NP_TRIMESH_WARPS_PER_BLOCK, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, NP_TRIMESH_WARPS_PER_BLOCK, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sortTriangles fail to launch kernel!!\n");
@@ -2399,7 +2476,15 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(gpuShapes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the count is capped at 65535, Vulkan's guaranteed
+		// maxComputeWorkGroupCount[0] (the bridge refuses a larger grid, which 16384 tests
+		// reach); convexTrimeshPostProcess (cvxTriPostProcessBda.slang) keeps the CUDA's
+		// grid-stride loop (ppStride = WorkgroupCount().x * 64), which covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks, 65535u), 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sphereTrimeshPostProcess fail to launch kernel!!\n");
@@ -2434,7 +2519,17 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(gpuTempContactIndex)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexTrimeshCorrelate (cvxTriCorrelateBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sphereTrimeshCorrelate fail to launch kernel!!\n");
 
@@ -2485,7 +2580,18 @@ void PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(forceBytesLimit)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a 64-thread
+		// block would share one 32-thread workgroup and run one after the other.  One workgroup per
+		// CUDA warp instead: convexTrimeshFinishContacts (cvxTriFinishBda.slang) takes its item
+		// from the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexTrimesh finishContacts fail to launch kernel!!\n");
@@ -2601,7 +2707,9 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
 		// convexHeightFieldMidphase (convexHfMidphaseBda.slang) takes its warp index from
 		// the group index and its stride from the group count; same arguments, same per-warp work.
-		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #endif
@@ -2652,7 +2760,18 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a block would
+		// share one 32-thread workgroup and run one after the other (as further passes of its
+		// grid-stride loop).  One workgroup per CUDA warp instead: sphereHeightfieldNarrowphase
+		// (sphereHfNpBda.slang) numbers its threads gid.x * 32 + lane and strides by the launched
+		// thread count, so every warp takes the pairs of its CUDA warp; same arguments.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the grid-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * (numThreadsPerBlock / WARP_SIZE), 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexHeightfieldCore fail to launch kernel!!\n");
@@ -2676,7 +2795,17 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sortTriangleIndices (sortTriIndicesBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * NP_TRIMESH_WARPS_PER_BLOCK, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, NP_TRIMESH_WARPS_PER_BLOCK, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sortTriangles fail to launch kernel!!\n");
@@ -2710,7 +2839,15 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(gpuShapes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the count is capped at 65535, Vulkan's guaranteed
+		// maxComputeWorkGroupCount[0] (the bridge refuses a larger grid, which 16384 tests
+		// reach); convexHeightfieldPostProcess (convexHfPostProcessBda.slang) keeps the CUDA's
+		// grid-stride loop (ppStride = WorkgroupCount().x * 64), which covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks, 65535u), 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexTrimeshPostProcess fail to launch kernel!!\n");
@@ -2744,7 +2881,17 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(gpuTempContactIndex),
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexTrimeshCorrelate (cvxTriCorrelateBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexHeightfieldCorrelate fail to launch kernel!!\n");
 
@@ -2797,7 +2944,18 @@ void PxgGpuNarrowphaseCore::testSDKSphereHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(forceBytesLimit)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a 64-thread
+		// block would share one 32-thread workgroup and run one after the other.  One workgroup per
+		// CUDA warp instead: convexTrimeshFinishContacts (cvxTriFinishBda.slang) takes its item
+		// from the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexHeightfield finishContacts fail to launch kernel!!\n");
@@ -2910,7 +3068,9 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
 		// midphaseGeneratePairs (convexTrimeshMidphaseBda.slang) takes its warp index from
 		// the group index and its stride from the group count; same arguments, same per-warp work.
-		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #endif
@@ -2968,7 +3128,19 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexTrimeshNarrowphase (convexTrimeshCoreBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (32 warps
+		// per test pass it from 2048 tests on, the uncapped CUDA grid from 4096); the grid-stride
+		// loop covers the rest.
+		const PxU32 numWarpGroups = PxMin(numBlocks * numWarpsPerBlock, 65535u);
+		result = mCudaContext->launchKernel(kernelFunction, numWarpGroups, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if(result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexTrimeshCore fail to launch kernel!!\n");
@@ -2992,7 +3164,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sortTriangleIndices (sortTriIndicesBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * NP_TRIMESH_WARPS_PER_BLOCK, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, NP_TRIMESH_WARPS_PER_BLOCK, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sortTriangles fail to launch kernel!!\n");
@@ -3026,7 +3208,15 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(gpuShapes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the count is capped at 65535, Vulkan's guaranteed
+		// maxComputeWorkGroupCount[0] (the bridge refuses a larger grid, which 16384 tests
+		// reach); convexTrimeshPostProcess (cvxTriPostProcessBda.slang) keeps the CUDA's
+		// grid-stride loop (ppStride = WorkgroupCount().x * 64), which covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks, 65535u), 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexTrimeshPostProcess fail to launch kernel!!\n");
@@ -3061,7 +3251,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(gpuTempContactIndex)
 		};  
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexTrimeshCorrelate (cvxTriCorrelateBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 		if(result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexTrimeshCorrelate fail to launch kernel!!\n");
 
@@ -3112,7 +3312,18 @@ void PxgGpuNarrowphaseCore::testSDKConvexTriMeshSATGpu(PxgGpuContactManagers& gp
 			PX_CUDA_KERNEL_PARAM(forceBytesLimit)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a 64-thread
+		// block would share one 32-thread workgroup and run one after the other.  One workgroup per
+		// CUDA warp instead: convexTrimeshFinishContacts (cvxTriFinishBda.slang) takes its item
+		// from the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if(result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexTrimesh finishContacts fail to launch kernel!!\n");
@@ -3227,7 +3438,9 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
 		// convexHeightFieldMidphase (convexHfMidphaseBda.slang) takes its warp index from
 		// the group index and its stride from the group count; same arguments, same per-warp work.
-		result = mCudaContext->launchKernel(kernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
 #endif
@@ -3280,7 +3493,19 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexHeightfieldNarrowphase (convexHfCoreBda.slang) takes its warp index from
+		// the group index and its stride from the group count; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (32 warps
+		// per test pass it from 2048 tests on, the uncapped CUDA grid from 4096); the grid-stride
+		// loop covers the rest.
+		const PxU32 numWarpGroups = PxMin(numBlocks * numWarpsPerBlock, 65535u);
+		result = mCudaContext->launchKernel(kernelFunction, numWarpGroups, 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexHeightfieldCore fail to launch kernel!!\n");
@@ -3304,7 +3529,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(numTests)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sortTriangleIndices (sortTriIndicesBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * NP_TRIMESH_WARPS_PER_BLOCK, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, NP_TRIMESH_WARPS_PER_BLOCK, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sortTriangles fail to launch kernel!!\n");
@@ -3338,7 +3573,15 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(gpuShapes)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the count is capped at 65535, Vulkan's guaranteed
+		// maxComputeWorkGroupCount[0] (the bridge refuses a larger grid, which 16384 tests
+		// reach); convexHeightfieldPostProcess (convexHfPostProcessBda.slang) keeps the CUDA's
+		// grid-stride loop (ppStride = WorkgroupCount().x * 64), which covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks, 65535u), 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU convexTrimeshPostProcess fail to launch kernel!!\n");
@@ -3372,7 +3615,17 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(gpuTempContactIndex)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: convexTrimeshCorrelate (cvxTriCorrelateBda.slang) takes its item from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexHeightfieldCorrelate fail to launch kernel!!\n");
 
@@ -3425,7 +3678,18 @@ void PxgGpuNarrowphaseCore::testSDKConvexHeightfieldGpu(PxgGpuContactManagers& g
 			PX_CUDA_KERNEL_PARAM(forceBytesLimit)
 		};
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the two warps of a 64-thread
+		// block would share one 32-thread workgroup and run one after the other.  One workgroup per
+		// CUDA warp instead: convexTrimeshFinishContacts (cvxTriFinishBda.slang) takes its item
+		// from the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(kernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, WARP_SIZE*numWarpsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL,"GPU convexHeightfield finishContacts fail to launch kernel!!\n");
@@ -3734,7 +3998,16 @@ void PxgGpuNarrowphaseCore::testSDKParticleSoftbody(PxgGpuContactManagers& gpuMa
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sb_psMidphaseGeneratePairsLaunch (softBodyPsMidphaseBda.slang) takes its warp
+		// index from the group index and its stride from the group count; same arguments, same
+		// per-warp work.
+		result = mCudaContext->launchKernel(sbMidphaseKernelFunction, 1024 * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbMidphaseKernelFunction, 1024, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_psMidphaseGeneratePairsLaunch fail to launch!!\n");
@@ -3940,7 +4213,16 @@ void PxgGpuNarrowphaseCore::testSDKParticleFemCloth(PxgGpuContactManagers& gpuMa
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: cloth_psMidphaseGeneratePairsLaunch (femClothPsMidphaseBda.slang) takes its
+		// warp index from the group index and its stride from the group count; same arguments,
+		// same per-warp work.
+		result = mCudaContext->launchKernel(clothMidphaseKernelFunction, 1024 * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, clothStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(clothMidphaseKernelFunction, 1024, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, clothStream, kernelParams_stage, sizeof(kernelParams_stage), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_psMidphaseGeneratePairsLaunch fail to launch!!\n");
@@ -4584,7 +4866,19 @@ void PxgGpuNarrowphaseCore::testSDKSoftbody(PxgGpuContactManagers& gpuManagers, 
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = (numTests + numWarpsPerBlock - 1) / numWarpsPerBlock;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one workgroup and run one after the other.  One workgroup per CUDA warp instead (each
+		// 1024 threads wide, the batched BV32 walk of one contact manager):
+		// sb_midphaseGeneratePairsLaunch (softBodyContactGenBda.slang) takes its contact manager
+		// from the group index and covers any grid with a group-stride loop; same arguments, same
+		// per-manager work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(sbMidphasekernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbMidphasekernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_midphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -4804,7 +5098,16 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodies(PxgGpuContactManagers& gpuManagers
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 		//blockIdx.y deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sb_sbMidphaseGeneratePairsLaunch (softBodySoftBodyMidphaseBda.slang) takes its
+		// warp index from the group index and its stride from the group count; same arguments,
+		// same per-warp work.
+		result = mCudaContext->launchKernel(sbsbMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 2, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbsbMidphaseFirstkernelFunction, numBlocks, numTests, 2, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_sbMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -4959,7 +5262,17 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyCloth(PxgGpuContactManagers& gpuManag
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would
+			// share one 32-thread workgroup and run one after the other.  One workgroup per CUDA
+			// warp instead: sb_clothMidphaseGeneratePairsLaunch (softBodyClothMidphaseBda.slang)
+			// takes its warp index from the group index and its stride from the group count; same
+			// arguments, same per-warp work.  (Upstream-dead: supportClothTriangleCollision is
+			// false; kept in the shape of its live siblings.)
+			result = mCudaContext->launchKernel(sbmeshMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(sbmeshMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_clothMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -5045,7 +5358,17 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyCloth(PxgGpuContactManagers& gpuManag
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_MESHCG;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would
+			// share one 32-thread workgroup and run one after the other.  One workgroup per CUDA
+			// warp instead: sb_clothContactGenLaunch (softBodyClothContactGenBda.slang) takes its
+			// warp index from the group index and its stride from the group count; same arguments,
+			// same per-warp work.  (Upstream-dead: supportClothTriangleCollision is false; kept in
+			// the shape of its live siblings.)
+			result = mCudaContext->launchKernel(sbClothContactGenkernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(sbClothContactGenkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_clothContactGenLaunch fail to launch kernel!!\n");
@@ -5102,7 +5425,16 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyCloth(PxgGpuContactManagers& gpuManag
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 			//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would
+			// share one 32-thread workgroup and run one after the other.  One workgroup per CUDA
+			// warp instead: sb_clothVertMidphaseGeneratePairsLaunch
+			// (softBodyClothVertMidphaseBda.slang) takes its warp index from the group index and
+			// its stride from the group count; same arguments, same per-warp work.
+			result = mCudaContext->launchKernel(sbClothMidphaseFirstkernelFunction, numBlocks * numWarpsPerBlock, numTests, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(sbClothMidphaseFirstkernelFunction, numBlocks, numTests, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_clothVertMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -5489,7 +5821,16 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyTrimesh(PxgGpuContactManagers& gpuMan
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_MESHCG;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sb_meshContactGenLaunch (softBodyMeshContactGenBda.slang) takes its warp index
+		// from the group index and its stride from the group count; same arguments, same per-warp
+		// work.
+		result = mCudaContext->launchKernel(sbmeshContactGenkernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbmeshContactGenkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_meshContactGenLaunch fail to launch kernel!!\n");
@@ -5807,7 +6148,16 @@ void PxgGpuNarrowphaseCore::testSDKSoftbodyHeightfield(PxgGpuContactManagers& gp
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_HFCG;
 		//each 64 warps deal with one cm
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp
+		// instead: sb_heightfieldContactGenLaunch (softBodyHfContactGenBda.slang) takes its warp
+		// index from the group index and its stride from the group count; same arguments, same
+		// per-warp work.
+		result = mCudaContext->launchKernel(sbHFContactGenkernelFunction, numBlocks * numWarpsPerBlock, 1, 1, WARP_SIZE, 1, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(sbHFContactGenkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, softbodyStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_heightfieldContactGenLaunch fail to launch kernel!!\n");
@@ -6004,7 +6354,19 @@ void PxgGpuNarrowphaseCore::testSDKFemClothSphere(PxgGpuContactManagers& gpuMana
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = (numTests + numWarpsPerBlock - 1) / numWarpsPerBlock;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one workgroup and run one after the other.  One workgroup per CUDA warp instead (each
+		// 1024 threads wide, the batched BV32 walk of one contact manager):
+		// cloth_midphaseGeneratePairsLaunch (femClothContactGenBda.slang) takes its contact
+		// manager from the group index and covers any grid with a group-stride loop; same
+		// arguments, same per-manager work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -6294,7 +6656,19 @@ void PxgGpuNarrowphaseCore::testSDKFemClothBox(PxgGpuContactManagers& gpuManager
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = (numTests + numWarpsPerBlock - 1) / numWarpsPerBlock;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one workgroup and run one after the other.  One workgroup per CUDA warp instead (each
+		// 1024 threads wide, the batched BV32 walk of one contact manager):
+		// cloth_midphaseGeneratePairsLaunch (femClothContactGenBda.slang) takes its contact
+		// manager from the group index and covers any grid with a group-stride loop; same
+		// arguments, same per-manager work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -6520,7 +6894,19 @@ void PxgGpuNarrowphaseCore::testSDKFemClothConvexes(PxgGpuContactManagers& gpuMa
 		PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 		PxU32 numBlocks = (numTests + numWarpsPerBlock - 1) / numWarpsPerBlock;
 		//each warp deal with one test. 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one workgroup and run one after the other.  One workgroup per CUDA warp instead (each
+		// 1024 threads wide, the batched BV32 walk of one contact manager):
+		// cloth_midphaseGeneratePairsLaunch (femClothContactGenBda.slang) takes its contact
+		// manager from the group index and covers any grid with a group-stride loop; same
+		// arguments, same per-manager work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, PxMin(numBlocks * numWarpsPerBlock, 65535u), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 		result = mCudaContext->launchKernel(femClothMidphaseFirstkernelFunction, numBlocks, 1, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 		if (result != CUDA_SUCCESS)
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_midphaseGeneratePairsLaunch fail to launch kernel!!\n");
@@ -6997,7 +7383,17 @@ void PxgGpuNarrowphaseCore::testSDKFemClothTrimesh(PxgGpuContactManagers& gpuMan
 			};
 
 			PxU32 numBlocks = 2048;
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the four warps of a block
+			// would share one 32-thread workgroup and run one after the other (as further passes
+			// of its grid-stride loop).  One workgroup per CUDA warp instead:
+			// cloth_meshContactGenLaunch (femClothMeshContactGenBda.slang) numbers its threads
+			// gid.x * 32 + lane and strides by the launched thread count, so every warp takes the
+			// pairs of its CUDA warp; same arguments.
+			result = mCudaContext->launchKernel(fcCollisionKernelFunction, numBlocks * (128 / WARP_SIZE), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(fcCollisionKernelFunction, numBlocks, 1, 1, 128, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_meshContactGenLaunch fail to launch kernel!!\n");
@@ -7347,7 +7743,17 @@ void PxgGpuNarrowphaseCore::testSDKFemClothHeightfield(PxgGpuContactManagers& gp
 			};
 		
 			PxU32 numBlocks = 2048; 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the four warps of a block
+			// would share one 32-thread workgroup and run one after the other (as further passes
+			// of its grid-stride loop).  One workgroup per CUDA warp instead:
+			// cloth_heightfieldContactGenLaunch (femClothHfContactGenBda.slang) numbers its
+			// threads gid.x * 32 + lane and strides by the launched thread count, so every warp
+			// takes the pairs of its CUDA warp; same arguments.
+			result = mCudaContext->launchKernel(fcCollisionKernelFunction, numBlocks * (128 / WARP_SIZE), 1, 1, WARP_SIZE, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#else
 			result = mCudaContext->launchKernel(fcCollisionKernelFunction, numBlocks, 1, 1, 128, 1, 1, 0, femClothStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+#endif
 
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU cloth_heightfieldContactGenLaunch fail to launch kernel!!\n");

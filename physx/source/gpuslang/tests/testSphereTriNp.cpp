@@ -314,10 +314,14 @@ PXG_TEST(sphereTriNp_faceRemapAsymmetry)
     p.midphasePairsNeeded = aScratch + 12;
     p.nbContactManagers = 3u;
 
-    // ONE workgroup of one warp: the shader is [numthreads(32,1,1)] and three pairs
-    // fit in a single pass, so the grid-stride loop runs exactly once.
+    // The engine launches ceil(3 / 64) = 1 block of 64 threads; the port's launch site
+    // (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp,
+    // 2.  The three pairs fall to group 0 and the grid-stride loop runs exactly once; group 1
+    // (threads 32..63) finds nothing.  The other fixtures in this file dispatch the CUDA's own
+    // block count, one group; p94dIdtScaleRot also runs 128 pairs at 4, 2, 3 and 1 groups,
+    // where every group has work.
     Kernel k("sphereTriNpBda.spv", "sphereTrimeshNarrowphase", {}, sizeof(StnPush));
-    k.dispatch(1u, {}, p, 1u, 1u);
+    k.dispatch(2u, {}, p, 1u, 1u);
     dev->flush();
 
     const std::vector<uint8_t> got = downloadBuffer<uint8_t>(dev, bStack, stack.size());
@@ -572,9 +576,13 @@ struct StnRun
     { uint32_t v; std::memcpy(&v, &temp[size_t(contact) * 4 + w], 4); return v; }
 };
 
+// `groups` is the dispatch width.  The port's launch site (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT) issues two 32-thread groups per 64-thread CUDA block,
+// 2 * ceil(numTests / 64); the shader numbers its threads gid.x * 32 + lane and strides by
+// WorkgroupCount().x * 32, so any width must give the same per-pair output.
 static StnRun runStn(PxgSlangComputeDevice* dev, const std::vector<GpuShape>& shapes,
                      const std::vector<CachedXf>& xf, const std::vector<CmInput>& cms,
-                     const std::vector<uint32_t>& tri)
+                     const std::vector<uint32_t>& tri, uint32_t groups = 1u)
 {
     const uint32_t N = uint32_t(cms.size());
     StnRun r;
@@ -634,7 +642,7 @@ static StnRun runStn(PxgSlangComputeDevice* dev, const std::vector<GpuShape>& sh
     p.nbContactManagers = N;
 
     Kernel k("sphereTriNpBda.spv", "sphereTrimeshNarrowphase", {}, sizeof(StnPush));
-    k.dispatch(1u, {}, p, 1u, 1u);
+    k.dispatch(groups, {}, p, 1u, 1u);
     dev->flush();
     r.stack = downloadBuffer<uint8_t>(dev, bStack, r.stack.size());
     r.temp = downloadBuffer<float>(dev, bTemp, r.temp.size());
@@ -788,6 +796,39 @@ PXG_TEST(sphereTriNp_p94dIdtScaleRot)
     PXG_CHECK_MSG(twinDiffB[0] > 0 && twinDiffB[1] > 0 && twinDiffB[2] > 0 && twinDiffB[3] > 0,
                   "p94d: some non-unit scale stores the raw-vertex normal -- a bypass keyed on "
                   "ANY unit component, on two of the three, or on the product would pass");
+
+    // THE GRID.  The run above is one group, so gid.x is always 0 and the per-group thread
+    // numbering is invisible: `gid.x * 64 + lane` (the CUDA's block-scaled index) and the
+    // shader's `gid.x * 32 + lane` agree there.  The same pairs twice over (128 pairs, two
+    // 64-thread CUDA blocks) at the port's grid 2 * ceil(128 / 64) = 4, at the CUDA's block
+    // count 2, and at 3 and 1 groups, against the same oracle: every group now does real
+    // work, and a block-scaled start skips pairs 32..63 of each block.
+    {
+        std::vector<CmInput> cms2 = cms;
+        cms2.insert(cms2.end(), cms.begin(), cms.end());
+        std::vector<uint32_t> tri2 = tri;
+        tri2.insert(tri2.end(), tri.begin(), tri.end());
+        const uint32_t N2 = uint32_t(cms2.size());
+        for (uint32_t groups : { 2u * ((N2 + 63u) / 64u), (N2 + 63u) / 64u, 3u, 1u })
+        {
+            const StnRun g = runStn(dev, shapes, xf, cms2, tri2, groups);
+            size_t gBad = 0;
+            for (uint32_t i = 0; i < N2; ++i)
+            {
+                const uint32_t j = i % N;
+                const uint32_t idx = g.niWord(i, 3);
+                bool ok = nbContactsOf(idx) == 1u && triangleIndexOf(idx) == mesh.remap[j % T]
+                          && (idx >> 31) == 0u;
+                ok = ok && g.niWord(i, 0) == u32(expNi[j].x) && g.niWord(i, 1) == u32(expNi[j].y)
+                        && g.niWord(i, 2) == u32(expNi[j].z);
+                if (!ok && ++gBad <= 8)
+                    std::printf("  [%u groups, pair %u] niIndex 0x%08x normal (0x%08x 0x%08x 0x%08x)\n",
+                                groups, i, idx, g.niWord(i, 0), g.niWord(i, 1), g.niWord(i, 2));
+            }
+            PXG_CHECK_MSG(gBad == 0, "p94d: at %u groups %zu of %u pairs miss the oracle's single face "
+                          "contact or normal", groups, gBad, N2);
+        }
+    }
     dev->destroyBuffer(bMesh);
 }
 

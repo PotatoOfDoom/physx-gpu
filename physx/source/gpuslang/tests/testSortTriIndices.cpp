@@ -50,7 +50,11 @@ const uint32_t TEMP_WORD = 0xEEEEEEEEu;  // the ping-pong half
 const uint32_t GUARD_WORD = 0x7E577E57u; // between regions: must never move
 const uint32_t SCRATCH_WORD = 0x5C5A7C40u;
 
-PXG_TEST(sortTriIndices)
+// `groupsFor`: the dispatch for a pair count.  The engine launches ceil(nbPairs / 2) blocks of
+// two warps (PxgNarrowphaseCore.cpp); the port's launch site (PXG_NO_CUDA_TOOLKIT) launches one
+// 32-thread group per CUDA warp, twice that, and the shader's group-stride loop covers any
+// smaller grid -- the CUDA's own (a group takes two pairs one grid-width apart) and one group.
+static void runSortTriIndices(const char* gridName, uint32_t (*groupsFor)(uint32_t))
 {
     PxgSlangComputeDevice* dev = testDevice();
 
@@ -182,7 +186,7 @@ PXG_TEST(sortTriIndices)
 
     {
         Kernel k("sortTriIndicesBda.spv", "sortTriangleIndices", {}, sizeof(SortTriPush));
-        k.dispatch((nbPairs + 1u) / 2u, {}, push, 1u, 1u);
+        k.dispatch(groupsFor(nbPairs), {}, push, 1u, 1u);
         dev->flush();
     }
 
@@ -250,7 +254,7 @@ PXG_TEST(sortTriIndices)
     dev->destroyBuffer(bPtr);
     dev->destroyBuffer(bPairs);
 
-    PXG_CHECK_MSG(bad == 0, "sortTriIndices: %zu mismatches", bad);
+    PXG_CHECK_MSG(bad == 0, "sortTriIndices (%s grid, %u groups): %zu mismatches", gridName, groupsFor(nbPairs), bad);
     PXG_CHECK_MSG(guardBad == 0, "sortTriIndices: %zu guard words moved (a run overran its region)",
                   guardBad);
     PXG_CHECK_MSG(scratchBad == 0,
@@ -260,6 +264,17 @@ PXG_TEST(sortTriIndices)
     PXG_CHECK_MSG(sawMultiPass > 0, "no active pair needs more than one strided pass");
     PXG_CHECK_MSG(sawFlagged > 0, "no active pair sets bit 31");
     PXG_CHECK_MSG(sawSkipped == 2, "both early-out counts must be present");
+}
+
+PXG_TEST(sortTriIndices)
+{
+    runSortTriIndices("port", [](uint32_t n) { return 2u * ((n + 1u) / 2u); });
+}
+
+PXG_TEST(sortTriIndicesCudaGrid)
+{
+    runSortTriIndices("CUDA", [](uint32_t n) { return (n + 1u) / 2u; });
+    runSortTriIndices("one-group", [](uint32_t) { return 1u; });
 }
 
 } // namespace

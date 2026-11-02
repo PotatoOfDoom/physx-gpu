@@ -684,7 +684,17 @@ void PxgAABBManager::updateBPSecondPass(PxU32 numCpuTasks, Cm::FlushPool& flushP
 			const PxU32 numWarpsPerBlocks = PxgBPKernelBlockDim::BP_AGGREGATE_SORT / numThreadsPerWarp;
 			const PxU32 numBlocks = (mNumAggregatesSlots + numWarpsPerBlocks - 1) / numWarpsPerBlocks;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// sortAndUpdateAggregateProjections (aggregateBda.slang) takes its warp index from the group
+			// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+			// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+			// bridge refuses a larger grid); the group-stride loop covers the rest.
+			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_SORT_UPDATE_PROJECTIONS, PxMin(numBlocks * numWarpsPerBlocks, 65535u), 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_SORT_UPDATE_PROJECTIONS, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 		}
 
 		{
@@ -695,7 +705,17 @@ void PxgAABBManager::updateBPSecondPass(PxU32 numCpuTasks, Cm::FlushPool& flushP
 			const PxU32 numWarpsPerBlocks = 16;
 			const PxU32 numBlocks = (mNumAggregatesSlots + numWarpsPerBlocks - 1) / numWarpsPerBlocks;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// doSelfCollision (aggregateBda.slang) takes its warp index from the group index and
+			// covers any grid with a group-stride loop; same arguments, same per-warp work.
+			// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+			// bridge refuses a larger grid); the group-stride loop covers the rest.
+			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_SELF_COLLISION, PxMin(numBlocks * numWarpsPerBlocks, 65535u), 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_SELF_COLLISION, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 
 #if GPU_AABB_DEBUG
 			//CUresult res = mCudaContext->memcpyDtoH((void*)&mAggregateDesc, aggDescd, sizeof(PxgAggregateDesc));
@@ -729,7 +749,15 @@ void PxgAABBManager::updateBPSecondPass(PxU32 numCpuTasks, Cm::FlushPool& flushP
 			//KS - we have no idea how many agg-actor pairs we might have, so we just have to launch a large-ish grid
 			const PxU32 numBlocks = 8192;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// doAggPairCollisions (aggregateBda.slang) takes its warp index from the group index and
+			// its stride from the group count; same arguments, same per-warp work.
+			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_PAIR_COLLISION, numBlocks * numWarpsPerBlocks, 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::AGG_PAIR_COLLISION, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 
 #if GPU_AABB_DEBUG
 			CUresult res = mCudaContext->memcpyDtoH((void*)mAggregateDesc, aggDescd, sizeof(PxgAggregateDesc));
@@ -1259,7 +1287,17 @@ void PxgAABBManager::gpuDmaDataUp()
 		const PxU32 numWarpsPerBlocks = 16;
 		const PxU32 numBlocks = (numDirtyAggregates + numWarpsPerBlocks - 1) / numWarpsPerBlocks;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// updateDirtyAggregate (aggregateBda.slang) takes its warp index from the group index and
+		// covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::UPDATE_DIRTY_AGGREGATE, PxMin(numBlocks * numWarpsPerBlocks, 65535u), 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::UPDATE_DIRTY_AGGREGATE, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 	}
 	
 	//reset found and lost pair count to zero
@@ -1288,7 +1326,17 @@ void PxgAABBManager::clearDirtyAggs()
 		const PxU32 numWarpsPerBlocks = 16;
 		const PxU32 numBlocks = (numDirtyAggregates + numWarpsPerBlocks - 1) / numWarpsPerBlocks;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// clearDirtyAggregates (aggregateBda.slang) takes its warp index from the group index and
+		// covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::CLEAR_DIRTY_AGGS, PxMin(numBlocks * numWarpsPerBlocks, 65535u), 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::CLEAR_DIRTY_AGGS, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 	}
 }
 
@@ -1372,7 +1420,17 @@ void PxgAABBManager::computeAggregateBounds()
 			const PxU32 numWarpsPerBlocks = 16;
 			const PxU32 numBlocks = (mNumAggregatesSlots + numWarpsPerBlocks - 1) / numWarpsPerBlocks;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// updateAggregateBounds (aggregateBda.slang) takes its warp index from the group index and
+			// covers any grid with a group-stride loop; same arguments, same per-warp work.
+			// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+			// bridge refuses a larger grid); the group-stride loop covers the rest.
+			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::UPDATE_AGGREGATE_BOUND, PxMin(numBlocks * numWarpsPerBlocks, 65535u), 1, 1, numThreadsPerWarp, 1, 1, 0, EPILOG);
+#else
 			_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::UPDATE_AGGREGATE_BOUND, numBlocks, 1, 1, numThreadsPerWarp, numWarpsPerBlocks, 1, 0, EPILOG);
+#endif
 		}
 	}
 }
@@ -1402,7 +1460,17 @@ void PxgAABBManager::markAggregateBoundsBitmap()
 		const PxU32 nbWarpsPerBlock = 8;
 		const PxU32 nbBlocks = (mNumAggregatesSlots + nbWarpsPerBlock-1) / nbWarpsPerBlock;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+		// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+		// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+		// markAggregateBoundsUpdatedBitmap (aggregateBda.slang) takes its warp index from the group
+		// index and covers any grid with a group-stride loop; same arguments, same per-warp work.
+		// The count is capped at 65535, Vulkan's guaranteed maxComputeWorkGroupCount[0] (the
+		// bridge refuses a larger grid); the group-stride loop covers the rest.
+		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::MARK_AGGREGATE_BOUND_BITMAP, PxMin(nbBlocks * nbWarpsPerBlock, 65535u), 1, 1, 32, 1, 1, 0, EPILOG);
+#else
 		_launch<GPU_AABB_DEBUG>(PROLOG, PxgKernelIds::MARK_AGGREGATE_BOUND_BITMAP, nbBlocks, 1, 1, 32, nbWarpsPerBlock, 1, 0, EPILOG);
+#endif
 	}
 
 }

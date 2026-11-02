@@ -52,6 +52,11 @@
 // turns warp-uniform into workgroup-uniform.  With two warps per group, one warp
 // could take the guard and the other not, and llvmpipe HANGS on a divergent
 // barrier rather than diagnosing it -- the lesson convexHfCoreBda's header records.
+// The CUDA block is 64 threads, two warps; the port's launch site
+// (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per
+// CUDA warp, so `groupID * 32 + lane` is the CUDA thread index and the stride below,
+// `WorkgroupCount().x * 32`, the CUDA's `gridDim.x * blockDim.x` (the block's two
+// warps used to run as two passes of that loop in one group).
 //
 // ===========================================================================
 // THE GRID-STRIDE LOOP IS NOT OPTIONAL HERE, AND THE SCENE PROVED IT

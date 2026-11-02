@@ -57,10 +57,14 @@
 // through (PxgVulkanCudaContext.cpp:293), so a [numthreads(32,1,1)] group is ONE warp and
 // indexing by gid.x alone would silently process only HALF the contact-manager pairs.
 // That exact bug shipped in femClothSelfCollisionBda and cost a long investigation; it is
-// avoided here from the first line.  The block's warps are walked SERIALLY in a
-// group-uniform loop (so the traversal's barriers stay uniform) while still covering every
-// pair.  Since the batched walk (pxgSlangBv32Batched) the group is 1024 threads, and EACH
-// contact manager is walked by the whole group, not by one 32-thread warp.
+// avoided here from the first line.  The block's warps used to be walked SERIALLY in a
+// group-uniform loop (so the traversal's barriers stay uniform); the launch site now
+// (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp, i.e. per
+// contact manager, so cmIdx = gid.x, and a group-stride loop (stride WorkgroupCount().x, a
+// group-uniform bound) still covers every pair at any smaller grid -- at the CUDA's own
+// grid a group takes up to two managers one grid-width apart.  Since the batched walk
+// (pxgSlangBv32Batched) the group is 1024 threads, and EACH contact manager is walked by
+// the whole group, not by one 32-thread warp.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted pair SET and the atomic
 // total):
@@ -250,8 +254,8 @@ struct SbTetLeaf : IBv32BatchedLeaf
 }
 
 // ===========================================================================
-// sb_midphaseGeneratePairsLaunch — the block's MIDPHASE_WARPS_PER_BLOCK contact managers
-// walked one after the other, each by the whole 1024-thread group (pxgSlangBv32Batched).
+// sb_midphaseGeneratePairsLaunch — one contact manager per group (one group per CUDA warp),
+// each walked by the whole 1024-thread group (pxgSlangBv32Batched).
 //
 // The CUDA's one warp pops the tree one node at a time: one serial dependent iteration
 // per LEAF (hint -> tet indices -> corners -> atomicAdd).  For a softbody on a ground
@@ -268,18 +272,16 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 {
     const uint tid = gtid.x;
 
-    // See the header: the engine packs MIDPHASE_WARPS_PER_BLOCK warps per block and the
-    // bridge forwards only gridDim, so the block's managers are walked serially here.
-    // `sub` and the break are group-uniform, so every barrier in the walk is reached
-    // uniformly.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // See the header: the engine packs MIDPHASE_WARPS_PER_BLOCK warps per block, and the
+    // port's launch site launches one group per CUDA warp; the group-stride loop covers any
+    // smaller grid.  The loop bound is group-uniform, so every barrier in the walk is
+    // reached uniformly.
+    for (uint cmLoop = gid.x; cmLoop < gMid.numWorkItems; cmLoop += WorkgroupCount().x)
     {
-    const uint cmIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
-    if (cmIdx >= gMid.numWorkItems)
-        break;
-    // llvmpipe runs the rest of this iteration with an EMPTY mask after the uniform
-    // break and still issues its loads (P9.22): reading cmInputs[numWorkItems] and
-    // then a shape at whatever index that garbage names faulted in the
+    const uint cmIdx = cmLoop;
+    // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask after the
+    // uniform loop exit and still issue its loads (P9.22): reading cmInputs[numWorkItems]
+    // and then a shape at whatever index that garbage names faulted in the
     // three-manager fixture.  The loads use a clamped index; every store and
     // atomic is masked, so the clamp is unobservable.
     const uint cmLoad = min(cmIdx, gMid.numWorkItems - 1u);

@@ -78,6 +78,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <initializer_list>
 #include <array>
 #include <limits>
 #include <numeric>
@@ -122,6 +123,24 @@ DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
     b.h = createBufferFrom(dev, data);
     b.addr = dev->getBufferDeviceAddress(b.h);
     return b;
+}
+
+// The rows a contact or pair kernel wrote, ORDER-FREE: `count` rows, each the concatenation of
+// `words` 32-bit words from every column (a downloaded output array), sorted.  Kernels whose
+// warps race for a global counter -- the port launches one 32-thread group per CUDA warp, so
+// the two (or four) warps of a CUDA block now race as they do in CUDA -- write the same rows
+// in an unspecified order; two dispatches of such a kernel at different grids must agree on
+// this view bit for bit.
+struct GridCol { const std::vector<uint32_t>* words; uint32_t perRow; };
+static std::vector<std::vector<uint32_t>> gridRows(uint32_t count, std::initializer_list<GridCol> cols)
+{
+    std::vector<std::vector<uint32_t>> rows(count);
+    for (uint32_t i = 0; i < count; ++i)
+        for (const GridCol& c : cols)
+            for (uint32_t w = 0; w < c.perRow; ++w)
+                rows[i].push_back((*c.words)[size_t(i) * c.perRow + w]);
+    std::sort(rows.begin(), rows.end());
+    return rows;
 }
 
 static const float PX_MAX_REAL_F = 3.40282347e+38f;
@@ -3023,7 +3042,9 @@ PXG_TEST(femClothSimTriMidphase)
     Kernel k("femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch", {}, sizeof(TriMidPush));
     PXG_CHECK_MSG(k.isValid(), "the cloth tri-midphase pipeline must build");
     if (!k.isValid()) return;
-    k.dispatch(/*gridX ceil(numTests / 2)*/ 1u, {}, push, 1u, 1u);
+    // ceil(numTests / 2) = 1 block of two warps, launched by the port as one group per CUDA warp
+    // (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT): 2 groups, the second past the one manager.
+    k.dispatch(/*gridX*/ 2u, {}, push, 1u, 1u);
     dev->flush();
 
     const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
@@ -3105,10 +3126,15 @@ PXG_TEST(femClothSimTriMidphaseOrder)
     const uint32_t POISON = 0xEEEEEEEEu;
     const float cd[3] = { 0.25f, 0.125f, 0.0625f };   // cloth, rigid A, rigid B
 
-    // nbTests 1..3; stackPairs 0 = room for everything.
-    auto runCase = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
-                       const std::vector<F4>& verts, const std::vector<Tri4>& tris,
-                       const W::Box rawA, const W::Box rawB, uint32_t nbTests, uint32_t stackPairs)
+    // nbTests 1..3; stackPairs 0 = room for everything.  `cudaGrid`: true dispatches the CUDA's
+    // own grid, ceil(numTests / 2) -- a group takes up to two managers, one grid-width apart,
+    // through the group-stride loop; false the port's launch (PxgNarrowphaseCore.cpp,
+    // PXG_NO_CUDA_TOOLKIT), one group per CUDA warp, i.e. per manager, racing for the counter
+    // as the CUDA's two warps do.
+    auto runCaseAt = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
+                         const std::vector<F4>& verts, const std::vector<Tri4>& tris,
+                         const W::Box rawA, const W::Box rawB, uint32_t nbTests, uint32_t stackPairs,
+                         bool cudaGrid)
     {
         // The fattened boxes, in float exactly as the kernel forms them.
         W::Box fat[2] = { rawA, rawB };
@@ -3183,17 +3209,20 @@ PXG_TEST(femClothSimTriMidphaseOrder)
         Kernel k("femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch", {}, sizeof(TriMidPush));
         PXG_CHECK_MSG(k.isValid(), "[%s] the pipeline must build", name);
         if (!k.isValid()) return;
-        // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK).
-        k.dispatch((nbTests + 1u) / 2u, {}, push, 1u, 1u);
+        // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK) blocks, launched by the port
+        // as twice as many one-manager groups.
+        const uint32_t blocks = (nbTests + 1u) / 2u;
+        const uint32_t groups = cudaGrid ? blocks : 2u * blocks;
+        k.dispatch(groups, {}, push, 1u, 1u);
         dev->flush();
 
         const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
         const auto gStack = downloadBuffer<U4>(dev, bStack.h, cap + SLACK);
-        PXG_CHECK_MSG(gCount == total, "[%s] the counter says %u pairs, the one-warp walk emits %u",
-                      name, gCount, total);
+        PXG_CHECK_MSG(gCount == total, "[%s, %u groups] the counter says %u pairs, the one-warp walk emits %u",
+                      name, groups, gCount, total);
         const uint32_t written = PxMin(gCount, cap);
         size_t mm = 0;
-        if (nbTests <= 2u)
+        if (groups == 1u)
         {
             // one group: manager 0's stream, then manager 1's, slot for slot
             std::vector<U4> seq;
@@ -3210,7 +3239,9 @@ PXG_TEST(femClothSimTriMidphaseOrder)
         }
         else
         {
-            // two groups race: each manager's own subsequence is still in walk order
+            // groups race: each manager's own subsequence is still in walk order -- the whole of
+            // it with room for everything, a PREFIX of it when the stack cuts the stream (which
+            // pairs land below the cut then depends on the race, in CUDA as here)
             std::vector<std::vector<uint32_t>> got(nbTests);
             for (uint32_t i = 0; i < written; ++i)
             {
@@ -3218,21 +3249,35 @@ PXG_TEST(femClothSimTriMidphaseOrder)
                 got[gStack[i].x].push_back(gStack[i].y);
             }
             for (uint32_t c = 0; c < nbTests; ++c)
-                if (got[c] != want[c]) { ++mm; std::printf("  [%s] manager %u: subsequence differs (%zu vs %zu)\n",
-                                                           name, c, got[c].size(), want[c].size()); }
+            {
+                const bool ok = (written == total)
+                    ? got[c] == want[c]
+                    : got[c].size() <= want[c].size() && std::equal(got[c].begin(), got[c].end(), want[c].begin());
+                if (!ok) { ++mm; std::printf("  [%s, %u groups] manager %u: subsequence differs (%zu vs %zu)\n",
+                                             name, groups, c, got[c].size(), want[c].size()); }
+            }
         }
         size_t badPoison = 0;
         for (uint32_t i = written; i < cap + SLACK; ++i)
             if (gStack[i].x != POISON || gStack[i].y != POISON) ++badPoison;
-        PXG_CHECK_MSG(mm == 0, "[%s] %zu slots differ from the CUDA's one-warp walk", name, mm);
-        PXG_CHECK_MSG(badPoison == 0, "[%s] %zu slots past the written range were touched", name, badPoison);
-        std::printf("    [ note ] %-10s %u managers, %u pairs (%u written), one-warp stack peak %u\n",
-                    name, nbTests, total, written, maxStack);
+        PXG_CHECK_MSG(mm == 0, "[%s, %u groups] %zu slots differ from the CUDA's one-warp walk",
+                      name, groups, mm);
+        PXG_CHECK_MSG(badPoison == 0, "[%s, %u groups] %zu slots past the written range were touched",
+                      name, groups, badPoison);
+        std::printf("    [ note ] %-10s %u managers, %u groups, %u pairs (%u written), one-warp stack peak %u\n",
+                    name, nbTests, groups, total, written, maxStack);
 
         dev->destroyBuffer(bTree.h); dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTris.h);
         dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h);
         dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bTc.h);
         dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+    };
+    auto runCase = [&](const char* name, const std::vector<std::vector<W::Child>>& nodes,
+                       const std::vector<F4>& verts, const std::vector<Tri4>& tris,
+                       const W::Box rawA, const W::Box rawB, uint32_t nbTests, uint32_t stackPairs)
+    {
+        runCaseAt(name, nodes, verts, tris, rawA, rawB, nbTests, stackPairs, /*cudaGrid*/ true);
+        runCaseAt(name, nodes, verts, tris, rawA, rawB, nbTests, stackPairs, /*cudaGrid*/ false);
     };
 
     auto boxOf = [](float x0, float y0, float z0, float x1, float y1, float z1) {
@@ -3677,13 +3722,14 @@ PXG_TEST(femClothSimSelfCollisionVT)
     Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseVTLaunch", {}, sizeof(SelfCollisionPush));
     // GRID MIRRORS THE ENGINE, and that is the whole point of this line.  The engine
     // packs MIDPHASE_WARPS_PER_BLOCK (=2) warps into one block and launches only
-    // ceil(N/2) blocks (PxgFEMClothCore.cpp:714); the bridge drops blockDim and passes
-    // gridDim straight through.  A test that dispatched one group per query would
-    // exercise a grid the engine NEVER issues -- which is exactly how a half-coverage
-    // bug survived here: the shader indexed by gid.x alone and this line handed it the
-    // generous grid that made that correct.  Unit tests choose their own grid, so this
-    // is the ONLY place that mismatch can be caught.
-    k.dispatch(/*gridX ceil(numVerts/2)*/ 2u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    // ceil(N/2) blocks (PxgFEMClothCore.cpp); the bridge drops blockDim and passes
+    // gridDim straight through.  A half-coverage bug survived here once: the shader
+    // indexed by gid.x alone and this line handed it one group per query, a grid the
+    // engine did not issue then.  The port's launch site now (PXG_NO_CUDA_TOOLKIT) DOES
+    // issue one group per CUDA warp, 2 * ceil(N/2), and the shader covers any smaller
+    // grid with a group-stride loop -- so the main dispatch is the port's grid and the
+    // re-runs below take the CUDA's own ceil(N/2) and a single group.
+    k.dispatch(/*gridX 2 * ceil(numVerts/2)*/ 4u, {}, push, /*gridY nbActive*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU predicate: exactly vertex 3 penetrates T0 ----
@@ -3712,6 +3758,68 @@ PXG_TEST(femClothSimSelfCollisionVT)
     if (gi.ref1 != refRef1) { ++mm; std::printf("  VT ref1 MM got 0x%llx ref 0x%llx\n", (unsigned long long)gi.ref1, (unsigned long long)refRef1); }
     PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseVT bit-exact vs CPU (%zu mismatches)", mm);
 
+    // The same contact at the CUDA's own grid (2: a group takes two vertices, one grid-width
+    // apart) and at one group (the loop walks all four).
+    for (uint32_t gx : { 2u, 1u })
+    {
+        DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+        SelfCollisionPush q = push;
+        q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+        k.dispatch(gx, {}, q, 1u, 1u);
+        dev->flush();
+        const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+        const FemPairInfoHost g = downloadBuffer<FemPairInfoHost>(dev, bO.h, 1)[0];
+        PXG_CHECK_MSG(n == 1u && g.ref0 == refRef0 && g.ref1 == refRef1,
+                      "at %u group(s) VT self-collision emitted %u contact(s), first (0x%llx, 0x%llx)",
+                      gx, n, (unsigned long long)g.ref0, (unsigned long long)g.ref1);
+        dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+    }
+
+    // ---- the surface-surface FILTER (5.12 mSurfaceSurfaceFilterPairs) ----
+    // The CUDA ends a filtered vertex's warp with `return` (femClothClothMidPhase.cu:758); a
+    // warp owns one query there.  A port group takes several queries at the CUDA grid, at
+    // one group and above the 65535 cap, so the return is a `continue` of the group-stride
+    // loop -- and only a run in which a group takes a filtered query AND a later one can
+    // tell the two apart.  One single-entry filter list per case, at grids 4, 2 and 1:
+    //   (v1, ANY): at grid 2 group 1 takes v1 then v3, at grid 1 the group walks all four;
+    //              v3's contact must survive (a `return`/`break` loses it);
+    //   (v3, ANY): only the early per-vertex filter removes v3 (the in-traversal test never
+    //              asks (vertex, ANY)), so deleting it brings the contact back;
+    //   (v3, T0) and (ANY, T0): the in-traversal isFiltered's two searches.
+    {
+        const uint32_t ANY = PxgDeformableRef::ANY_FEATURE;
+        struct FilterCase { const char* tag; FemPairInfoHost pair; uint32_t expect; };
+        const FilterCase cases[] = {
+            { "(v1, any triangle)", { encClothVertex(0u, 1u), encClothTriangle(0u, ANY) }, 1u },
+            { "(v3, any triangle)", { encClothVertex(0u, 3u), encClothTriangle(0u, ANY) }, 0u },
+            { "(v3, T0)", { encClothVertex(0u, 3u), encClothTriangle(0u, 0u) }, 0u },
+            { "(any vertex, T0)", { encClothVertex(0u, ANY), encClothTriangle(0u, 0u) }, 0u },
+        };
+        for (const FilterCase& fc : cases)
+        {
+            DevBuf bF = makeDev(dev, std::vector<FemPairInfoHost>{ fc.pair });
+            PxgFEMCloth cf = c;
+            cf.mSurfaceSurfaceFilterPairs = reinterpret_cast<decltype(cf.mSurfaceSurfaceFilterPairs)>(size_t(bF.addr));
+            cf.mNumSurfaceSurfaceFilterPairs = 1u;
+            DevBuf bDf = makeDev(dev, std::vector<PxgFEMCloth>{ cf });
+            for (uint32_t gx : { 4u, 2u, 1u })
+            {
+                DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+                SelfCollisionPush q = push;
+                q.clothes = bDf.addr; q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+                k.dispatch(gx, {}, q, 1u, 1u);
+                dev->flush();
+                const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+                const FemPairInfoHost g = downloadBuffer<FemPairInfoHost>(dev, bO.h, 1)[0];
+                PXG_CHECK_MSG(n == fc.expect && (n == 0u || (g.ref0 == refRef0 && g.ref1 == refRef1)),
+                              "filter %s at %u group(s): VT self-collision emitted %u contact(s), "
+                              "expected %u (v3 vs T0)", fc.tag, gx, n, fc.expect);
+                dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+            }
+            dev->destroyBuffer(bF.h); dev->destroyBuffer(bDf.h);
+        }
+    }
+
     // ---- non-penetrating case: lift vertex 3 above the fattened bound -> zero contacts ----
     std::vector<F4> posOut = pos;
     posOut[3] = F4{ 0.25f, 0.25f, 0.5f, 1.0f }; // z=0.5 > 0.2 fattened bound -> not contained
@@ -3725,14 +3833,15 @@ PXG_TEST(femClothSimSelfCollisionVT)
     SelfCollisionPush push2 = push;
     push2.clothes = bDesc2.addr;
     push2.totalContactCount = bCount2.addr;
-    k.dispatch(/*ceil(numVerts/2)*/ 2u, {}, push2, 1u, 1u);
+    k.dispatch(/*2 * ceil(numVerts/2)*/ 4u, {}, push2, 1u, 1u);
     dev->flush();
     const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
     PXG_CHECK_MSG(gCount2 == 0u, "VT self-collision (no penetration) emitted %u contacts (expected 0)", gCount2);
 
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bTri.h);
     dev->destroyBuffer(bTree.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
-    dev->destroyBuffer(bCd.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bOut.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bCd.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bOut.h);
+    dev->destroyBuffer(bCount.h);
     dev->destroyBuffer(bPosOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bCount2.h);
 }
 
@@ -3799,13 +3908,14 @@ PXG_TEST(femClothSimSelfCollisionEE)
     Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseEELaunch", {}, sizeof(SelfCollisionPush));
     // GRID MIRRORS THE ENGINE, and that is the whole point of this line.  The engine
     // packs MIDPHASE_WARPS_PER_BLOCK (=2) warps into one block and launches only
-    // ceil(N/2) blocks (PxgFEMClothCore.cpp:714); the bridge drops blockDim and passes
-    // gridDim straight through.  A test that dispatched one group per query would
-    // exercise a grid the engine NEVER issues -- which is exactly how a half-coverage
-    // bug survived here: the shader indexed by gid.x alone and this line handed it the
-    // generous grid that made that correct.  Unit tests choose their own grid, so this
-    // is the ONLY place that mismatch can be caught.
-    k.dispatch(/*gridX ceil(numTrisWithActiveEdges/2)*/ 1u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    // ceil(N/2) blocks (PxgFEMClothCore.cpp); the bridge drops blockDim and passes
+    // gridDim straight through.  A half-coverage bug survived here once: the shader
+    // indexed by gid.x alone and this line handed it one group per query, a grid the
+    // engine did not issue then.  The port's launch site now (PXG_NO_CUDA_TOOLKIT) DOES
+    // issue one group per CUDA warp, 2 * ceil(N/2), and the shader covers any smaller
+    // grid with a group-stride loop -- so the main dispatch is the port's grid and the
+    // re-runs below take the CUDA's own ceil(N/2) and a single group.
+    k.dispatch(/*gridX 2 * ceil(numTrisWithActiveEdges/2)*/ 2u, {}, push, /*gridY nbActive*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU transcription: the T1(query)-vs-T0(found) 3x3 edge loop ----
@@ -3862,6 +3972,49 @@ PXG_TEST(femClothSimSelfCollisionEE)
     }
     PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseEE bit-exact vs CPU (%zu mismatches)", mm);
 
+    // The same two contacts at the CUDA's own grid of one group, which takes the block's two
+    // triangles in turn.  Both come from ONE query (triangle 1), so they keep their order.
+    {
+        DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+        SelfCollisionPush q = push;
+        q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+        k.dispatch(1u, {}, q, 1u, 1u);
+        dev->flush();
+        const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+        const auto g = downloadBuffer<FemPairInfoHost>(dev, bO.h, 2u);
+        PXG_CHECK_MSG(n == 2u && std::memcmp(g.data(), refContacts.data(), 2u * sizeof(FemPairInfoHost)) == 0,
+                      "at the CUDA's grid of one group EE self-collision emitted %u contacts, not the "
+                      "reference two", n);
+        dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+    }
+
+    // ---- the surface-surface FILTER on an edge pair (5.12 isFiltered(e0, primitive, e1)) ----
+    // The EE query has no per-query early filter (nor does the CUDA's), so there is no
+    // `return` to keep here; this pins the in-traversal search instead.  Filtering the first
+    // crossing's exact (edge, edge) pair must leave only the second, at both grids.
+    {
+        DevBuf bF = makeDev(dev, std::vector<FemPairInfoHost>{ refContacts[0] });
+        PxgFEMCloth cf = c;
+        cf.mSurfaceSurfaceFilterPairs = reinterpret_cast<decltype(cf.mSurfaceSurfaceFilterPairs)>(size_t(bF.addr));
+        cf.mNumSurfaceSurfaceFilterPairs = 1u;
+        DevBuf bDf = makeDev(dev, std::vector<PxgFEMCloth>{ cf });
+        for (uint32_t gx : { 2u, 1u })
+        {
+            DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+            SelfCollisionPush q = push;
+            q.clothes = bDf.addr; q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+            k.dispatch(gx, {}, q, 1u, 1u);
+            dev->flush();
+            const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+            const FemPairInfoHost g = downloadBuffer<FemPairInfoHost>(dev, bO.h, 1)[0];
+            PXG_CHECK_MSG(n == 1u && std::memcmp(&g, &refContacts[1], sizeof(FemPairInfoHost)) == 0,
+                          "with the first crossing's edge pair filtered, EE self-collision at %u "
+                          "group(s) emitted %u contact(s), not the second crossing alone", gx, n);
+            dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+        }
+        dev->destroyBuffer(bF.h); dev->destroyBuffer(bDf.h);
+    }
+
     // ---- non-crossing case: lift T1 to z=1.0 -> no edge crossing -> zero contacts ----
     std::vector<F4> posOut = pos;
     posOut[3].z = 1.0f; posOut[4].z = 1.0f; posOut[5].z = 1.0f;
@@ -3875,7 +4028,7 @@ PXG_TEST(femClothSimSelfCollisionEE)
     SelfCollisionPush push2 = push;
     push2.clothes = bDesc2.addr;
     push2.totalContactCount = bCount2.addr;
-    k.dispatch(/*ceil(numTrisWithActiveEdges/2)*/ 1u, {}, push2, 1u, 1u);
+    k.dispatch(/*2 * ceil(numTrisWithActiveEdges/2)*/ 2u, {}, push2, 1u, 1u);
     dev->flush();
     const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
     PXG_CHECK_MSG(gCount2 == 0u, "EE self-collision (no crossing) emitted %u contacts (expected 0)", gCount2);
@@ -3985,8 +4138,10 @@ PXG_TEST(femClothSimUpdateClothContactValidity)
     PXG_CHECK_MSG(gVt2 == 77u && gEe2 == 88u, "non-adaptive update must not reset counts (got %u,%u)", gVt2, gEe2);
 
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bPrev.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bVt.h); dev->destroyBuffer(bEe.h);
-    dev->destroyBuffer(bPrev2.h); dev->destroyBuffer(bVt2.h); dev->destroyBuffer(bEe2.h); dev->destroyBuffer(bDesc2.h);
+    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bVt.h);
+    dev->destroyBuffer(bEe.h);
+    dev->destroyBuffer(bPrev2.h); dev->destroyBuffer(bVt2.h); dev->destroyBuffer(bEe2.h);
+    dev->destroyBuffer(bDesc2.h);
 }
 
 
@@ -5585,7 +5740,8 @@ PXG_TEST(femClothSimStepDampingAndFlags)
 //   * 5.12: the records are PxgDeformablePairInfo -- VT (vertex of MY cloth, triangle of
 //     the OTHER), EE two triangle-edge refs (MY triangle t0 / local edge e0, the OTHER's
 //     primitive / e1).  5.6.1's markValidity bit is gone with the auxInd field.  The
-//     per-cloth mSurfaceSurfaceFilterPairs are empty here (makeZeroDesc).
+//     per-cloth mSurfaceSurfaceFilterPairs are empty (makeZeroDesc) except in the VT
+//     fixture's filter sub-runs.
 //
 // The rest-pose filter is absent by construction (the call passes NULL rest buffers and
 // filterDistSq 0), so the descriptors below leave mRestPosition null -- a port that kept
@@ -5754,12 +5910,15 @@ PXG_TEST(femClothSimDifferentClothVT)
     Kernel k("femClothDifferentClothBda.spv", "cloth_differentClothCollisionVTLaunch", {},
              sizeof(DifferentClothPush));
     // GRID MIRRORS THE ENGINE: numBlocks = ceil(2*maxClothVerts / MIDPHASE_WARPS_PER_BLOCK),
-    // gridY = numTests (PxgFEMClothCore.cpp:790).  maxClothVerts = 5 -> 5 blocks, covering
-    // globalWarpIdx 0..9 against numQueries = 5 + 4 = 9.  Handing the shader a per-query grid
-    // instead would hide exactly the half-coverage bug the self-collision port shipped with.
+    // gridY = numTests (PxgFEMClothCore.cpp).  maxClothVerts = 5 -> 5 blocks of two warps,
+    // covering globalWarpIdx 0..9 against numQueries = 5 + 4 = 9; the port launches one group
+    // per CUDA warp (PXG_NO_CUDA_TOOLKIT), 10.  The CUDA's own 5 blocks -- where a group takes
+    // two queries, one grid-width apart, through the group-stride loop (5 groups alone are the
+    // half-coverage bug the self-collision port once shipped with) -- and a single group are
+    // re-run below.
     const uint32_t maxClothVerts = uint32_t(pos0.size() > pos1.size() ? pos0.size() : pos1.size());
     const uint32_t gridVT = (2u * maxClothVerts + 1u) / 2u;
-    k.dispatch(gridVT, {}, push, /*gridY numTests*/ 1u, 1u);
+    k.dispatch(2u * gridVT, {}, push, /*gridY numTests*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU reference: the full bidirectional sweep, predicate for predicate ----
@@ -5807,6 +5966,68 @@ PXG_TEST(femClothSimDifferentClothVT)
     const size_t mm = compareSets(std::vector<FemPairInfoHost>(got.begin(), got.begin() + gCount),
                                   ref, "VT");
     PXG_CHECK_MSG(mm == 0, "cloth_differentClothCollisionVT bit-exact vs CPU (%zu mismatches)", mm);
+    for (uint32_t gx : { gridVT, 1u })
+    {
+        DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+        DifferentClothPush q = push;
+        q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+        k.dispatch(gx, {}, q, 1u, 1u);
+        dev->flush();
+        const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+        const auto g = downloadBuffer<FemPairInfoHost>(dev, bO.h, n ? n : 1u);
+        const size_t m = (n == uint32_t(ref.size()))
+            ? compareSets(std::vector<FemPairInfoHost>(g.begin(), g.begin() + n), ref, "VT(grid)") : 1u;
+        PXG_CHECK_MSG(m == 0, "at %u group(s) different-cloth VT emitted %u contacts, not the reference set", gx, n);
+        dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+    }
+
+    // ---- the surface-surface FILTER (5.12): the QUERY cloth's mSurfaceSurfaceFilterPairs ----
+    // As in femClothSimSelfCollisionVT: the CUDA's `return` for a filtered vertex
+    // (femClothClothMidPhase.cu:960) is a `continue` of the port's group-stride loop, and
+    // only a group that takes a filtered query and a later one can tell them apart.  At the
+    // CUDA grid of 5, group 0 takes query 0 (cloth 0 v0) and query 5 (cloth 1 w0, reference
+    // contact [1]); at one group the loop walks all nine.
+    //   cloth 0 (v0, cloth 1 ANY): filters a query with no contact -- both references stay;
+    //   cloth 0 (v4, cloth 1 ANY): only the early filter removes reference [0];
+    //   cloth 1 (w0, cloth 0 triangle 0): only the in-traversal search removes reference [1],
+    //            and only if cloth 1's OWN list is the one searched for its queries.
+    {
+        const uint32_t ANY = PxgDeformableRef::ANY_FEATURE;
+        struct FilterCase { const char* tag; uint32_t owner; FemPairInfoHost pair; int keep; };
+        const FilterCase cases[] = {
+            { "cloth0 (v0, any)", 0u, { encClothVertex(0u, 0u), encClothTriangle(1u, ANY) }, -1 },
+            { "cloth0 (v4, any)", 0u, { encClothVertex(0u, 4u), encClothTriangle(1u, ANY) }, 1 },
+            { "cloth1 (w0, A)", 1u, { encClothVertex(1u, 0u), encClothTriangle(0u, 0u) }, 0 },
+        };
+        for (const FilterCase& fc : cases)
+        {
+            DevBuf bF = makeDev(dev, std::vector<FemPairInfoHost>{ fc.pair });
+            std::vector<PxgFEMCloth> df = descArr;
+            df[fc.owner].mSurfaceSurfaceFilterPairs =
+                reinterpret_cast<decltype(df[0].mSurfaceSurfaceFilterPairs)>(size_t(bF.addr));
+            df[fc.owner].mNumSurfaceSurfaceFilterPairs = 1u;
+            DevBuf bDf = makeDev(dev, df);
+            std::vector<FemPairInfoHost> want = ref;
+            if (fc.keep >= 0)
+                want = { ref[size_t(fc.keep)] };
+            for (uint32_t gx : { 2u * gridVT, gridVT, 1u })
+            {
+                DevBuf bO = makeDev(dev, outInfo), bC = makeDev(dev, std::vector<uint32_t>{ 0u });
+                DifferentClothPush q = push;
+                q.femClothes = bDf.addr; q.outContactInfo = bO.addr; q.totalContactCount = bC.addr;
+                k.dispatch(gx, {}, q, 1u, 1u);
+                dev->flush();
+                const uint32_t n = downloadBuffer<uint32_t>(dev, bC.h, 1)[0];
+                const auto g = downloadBuffer<FemPairInfoHost>(dev, bO.h, n ? n : 1u);
+                const size_t m = (n == uint32_t(want.size()))
+                    ? compareSets(std::vector<FemPairInfoHost>(g.begin(), g.begin() + n), want, "VT(filter)") : 1u;
+                PXG_CHECK_MSG(m == 0, "filter %s at %u group(s): different-cloth VT emitted %u contact(s), "
+                              "expected %zu", fc.tag, gx, n, want.size());
+                dev->destroyBuffer(bO.h); dev->destroyBuffer(bC.h);
+            }
+            dev->destroyBuffer(bF.h); dev->destroyBuffer(bDf.h);
+        }
+    }
 
     // ---- *updateContactPairs == 0 -> the whole launch is a no-op ----
     std::vector<uint32_t> upd0 = { 0u };
@@ -5816,7 +6037,7 @@ PXG_TEST(femClothSimDifferentClothVT)
     DifferentClothPush pushOff = push;
     pushOff.updateContactPairs = bUpd0.addr;
     pushOff.totalContactCount = bCount0.addr;
-    k.dispatch(gridVT, {}, pushOff, 1u, 1u);
+    k.dispatch(2u * gridVT, {}, pushOff, 1u, 1u);
     dev->flush();
     PXG_CHECK_MSG(downloadBuffer<uint32_t>(dev, bCount0.h, 1)[0] == 0u,
                   "different-cloth VT must early-exit when updateContactPairs is 0");
@@ -5960,7 +6181,9 @@ PXG_TEST(femClothSimDifferentClothEE)
                   (ref[0].ref1 & ~(3ull << 27)) == encClothEdge(1u, 1u, 0u),
                   "reference: the crossings must be cloth0 triangle 0 vs cloth1 PRIMITIVE 1");
 
-    // GRID MIRRORS THE ENGINE: ceil(maxClothTrianglesWithActiveEdges / 2) x numTests.
+    // GRID MIRRORS THE ENGINE: ceil(maxClothTrianglesWithActiveEdges / 2) blocks of two warps x
+    // numTests, which the port launches as one group per CUDA warp (PXG_NO_CUDA_TOOLKIT); each
+    // pair order also runs at the CUDA's own grid and at one group (the group-stride loop).
     const uint32_t maxTwae = uint32_t(twae0.size() > twae1.size() ? twae0.size() : twae1.size());
     const uint32_t gridEE = (maxTwae + 1u) / 2u;
     Kernel k("femClothDifferentClothBda.spv", "cloth_differentClothCollisionEELaunch", {},
@@ -5970,6 +6193,7 @@ PXG_TEST(femClothSimDifferentClothEE)
     // smaller cloth drive either way, so both must produce the identical contact set -- which
     // is what proves the branchless id select in its mask == 1 branch.
     for (uint32_t swapped = 0; swapped < 2u; ++swapped)
+    for (uint32_t gx : { 2u * gridEE, gridEE, 1u })
     {
         std::vector<CmInputHost> cms = swapped ? std::vector<CmInputHost>{ { 1u, 0u, 1u, 0u } }
                                                : std::vector<CmInputHost>{ { 0u, 1u, 0u, 1u } };
@@ -5988,13 +6212,13 @@ PXG_TEST(femClothSimDifferentClothEE)
         push.outContactInfo = bOut.addr;
         push.totalContactCount = bCount.addr;
 
-        k.dispatch(gridEE, {}, push, /*gridY numTests*/ 1u, 1u);
+        k.dispatch(gx, {}, push, /*gridY numTests*/ 1u, 1u);
         dev->flush();
 
         const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
         PXG_CHECK_MSG(gCount == uint32_t(ref.size()),
-                      "different-cloth EE (%s pair order) emitted %u contacts (expected %zu)",
-                      swapped ? "swapped" : "natural", gCount, ref.size());
+                      "different-cloth EE (%s pair order, %u groups) emitted %u contacts (expected %zu)",
+                      swapped ? "swapped" : "natural", gx, gCount, ref.size());
         const auto got = downloadBuffer<FemPairInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
         const size_t mm = compareSets(std::vector<FemPairInfoHost>(got.begin(), got.begin() + gCount),
                                       ref, swapped ? "EE(swap)" : "EE");
@@ -7565,9 +7789,12 @@ PXG_TEST(femClothSimMeshContactGen)
     push.wMaxContacts = MAXC;
 
     Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {}, sizeof(ClothMeshCgPush));
-    // The engine's grid (PxgNarrowphaseCore.cpp:6694): 2048 blocks of 128 threads.  Only block 0
-    // has pairs in range here, so the emitted slot order is deterministic.
-    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);
+    // The engine's grid (PxgNarrowphaseCore.cpp): 2048 blocks of 128 threads, i.e. four warps;
+    // the port launches one 32-thread group per CUDA warp (PXG_NO_CUDA_TOOLKIT), 8192.  Only
+    // block 0 has pairs in range here, in its warps 0 and 1 -- which used to run one after the
+    // other in one group and now race for the writer's counter as they do in CUDA, so the
+    // contacts are matched to the expected ones by their triangle, not by slot.
+    k.dispatch(/*gridX*/ 8192u, {}, push, 1u, 1u);
     dev->flush();
 
     // ---- the expected contacts, analytically -------------------------------------------------
@@ -7612,9 +7839,19 @@ PXG_TEST(femClothSimMeshContactGen)
 
     const V3 wn = qRot(clothQ, fixNormal);
     size_t mm = 0;
+    std::vector<bool> claimed(expect.size(), false);
     for (uint32_t s = 0; s < gCount && s < expect.size(); ++s)
     {
-        const Expect& e = expect[s];
+        // the expected contact this slot holds: the one whose triangle its ref1 names
+        const uint64_t slotRef1 = uint64_t(gInfo[s * 4 + 2]) | (uint64_t(gInfo[s * 4 + 3]) << 32);
+        size_t ei = expect.size();
+        for (size_t q = 0; q < expect.size(); ++q)
+            if (!claimed[q] && slotRef1 == encClothTriangle(0u, expect[q].tri)) { ei = q; break; }
+        if (ei == expect.size())
+        { ++mm; std::printf("  slot %u names no unclaimed expected triangle (ref1 0x%llx)\n", s,
+                            (unsigned long long)slotRef1); continue; }
+        claimed[ei] = true;
+        const Expect& e = expect[ei];
         std::printf("  slot %u: tri %u sep %.6f point (%.4f %.4f %.4f)\n", s, e.tri,
                     gNormalPen[s].w, gPoint[s].x, gPoint[s].y, gPoint[s].z);
         auto near1 = [&](float a, float b) { return std::fabs(a - b) < 2.0e-4f; };
@@ -7656,6 +7893,54 @@ PXG_TEST(femClothSimMeshContactGen)
         { ++mm; std::printf("  slot %u contactIndexSortedByX MM: got %u ref %u\n", s, gIdx[s], s); }
     }
     PXG_CHECK_MSG(mm == 0, "cloth_meshContactGen contact fields (%zu mismatches)", mm);
+
+    // The same contacts, order-free and bitwise (point, normal/pen, barycentric, refs, sort keys;
+    // the material stream is 16-bit and the slot-index array names the slot), at the CUDA's own
+    // block count 2048 (group g = threads 32g.., the block's other warps' threads further down
+    // the stride), at three groups and at one (the stride loop walks every pair).
+    if (gCount <= MAXC)
+    {
+        std::vector<std::vector<uint32_t>> ref;
+        for (uint32_t gx : { 0u, 2048u, 3u, 1u })   // 0: the port grid again, as the reference
+        {
+            DevBuf bC0 = makeDev(dev, outPoint);
+            DevBuf bC1 = makeDev(dev, outNormalPen);
+            DevBuf bC2 = makeDev(dev, outBary);
+            DevBuf bC3 = makeDev(dev, outInfo);
+            DevBuf bC4 = makeDev(dev, outByX);
+            DevBuf bC5 = makeDev(dev, outTempByX);
+            DevBuf bCnt = makeDev(dev, std::vector<uint32_t>{ 0u });
+            ClothMeshCgPush r = push;
+            r.wPoint = bC0.addr; r.wNormalPen = bC1.addr; r.wBary = bC2.addr; r.wInfo = bC3.addr;
+            r.wByX = bC4.addr; r.wTempByX = bC5.addr; r.wCount = bCnt.addr;
+            Kernel("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {}, sizeof(ClothMeshCgPush))
+                .dispatch(gx ? gx : 8192u, {}, r, 1u, 1u);
+            dev->flush();
+            const uint32_t nG = downloadBuffer<uint32_t>(dev, bCnt.h, 1)[0];
+            const auto w0 = downloadBuffer<uint32_t>(dev, bC0.h, size_t(MAXC) * 4u);
+            const auto w1 = downloadBuffer<uint32_t>(dev, bC1.h, size_t(MAXC) * 4u);
+            const auto w2 = downloadBuffer<uint32_t>(dev, bC2.h, size_t(MAXC) * 4u);
+            const auto w3 = downloadBuffer<uint32_t>(dev, bC3.h, size_t(MAXC) * 4u);
+            const auto w4 = downloadBuffer<uint32_t>(dev, bC4.h, size_t(MAXC) * 2u);
+            const auto w5 = downloadBuffer<uint32_t>(dev, bC5.h, size_t(MAXC) * 1u);
+            auto rows = gridRows(PxMin(nG, uint32_t(MAXC)),
+                                 { { &w0, 4u }, { &w1, 4u }, { &w2, 4u }, { &w3, 4u }, { &w4, 2u }, { &w5, 1u } });
+            if (gx == 0u)
+            {
+                PXG_CHECK_MSG(nG == gCount,
+                              "a second dispatch at the port's grid counted %u, the first %u", nG, gCount);
+                ref = rows;
+            }
+            else
+                PXG_CHECK_MSG(nG == gCount && rows == ref,
+                              "at %u groups the cloth-vs-mesh contact gen wrote %u contacts "
+                              "that differ from the port grid's %u "
+                              "(order-free, bitwise)", gx, nG, gCount);
+            dev->destroyBuffer(bC0.h); dev->destroyBuffer(bC1.h); dev->destroyBuffer(bC2.h);
+            dev->destroyBuffer(bC3.h); dev->destroyBuffer(bC4.h); dev->destroyBuffer(bC5.h);
+            dev->destroyBuffer(bCnt.h);
+        }
+    }
 
     // Slots past the last contact keep their sort-key poison.
     size_t touched = 0;
@@ -10173,7 +10458,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     hp.wMaxContacts = MAXC;
     Kernel kh("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch",
               {}, sizeof(ClothHfCgPush));
-    kh.dispatch(2048u, {}, hp, 1u, 1u);      // PxgNarrowphaseCore.cpp:7024
+    kh.dispatch(8192u, {}, hp, 1u, 1u);      // PxgNarrowphaseCore.cpp: 2048 x 4 one-warp groups
     dev->flush();
 
     // ---- run the MESH kernel over the identical geometry --------------------------------
@@ -10193,7 +10478,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     mp.wMaxContacts = MAXC;
     Kernel km("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch",
               {}, sizeof(p817cg::ClothMeshCgPush));
-    km.dispatch(2048u, {}, mp, 1u, 1u);
+    km.dispatch(8192u, {}, mp, 1u, 1u);      // 2048 blocks of four warps, one group per warp
     dev->flush();
 
     // ---- compare ------------------------------------------------------------------------
@@ -10242,6 +10527,32 @@ PXG_TEST(femClothSimHeightfieldContactGen)
     };
     const auto recHf = gather(nHf, pHf, nHfBuf, bHfBuf, iHf);
     const auto recMesh = gather(nMesh, pMesh, nMeshBuf, bMeshBuf, iMesh);
+
+    // The heightfield kernel again at the CUDA's own block count (2048: group g is CUDA warp g,
+    // the rest of the block's warps further down the stride) and at one group (its stride
+    // loop walks every pair): the same multiset, bit for bit.
+    for (uint32_t gx : { 2048u, 1u })
+    {
+        WriterBufs wg = makeWriter(dev, MAXC);
+        ClothHfCgPush gp = hp;
+        gp.wPoint = wg.point.addr; gp.wNormalPen = wg.normalPen.addr;
+        gp.wBary = wg.barycentric.addr; gp.wInfo = wg.info.addr; gp.wCount = wg.count.addr;
+        gp.wByX = wg.byRigid.addr; gp.wTempByX = wg.tempByRigid.addr;
+        gp.wIdxByX = wg.idxByRigid.addr; gp.wRigidMat = wg.rigidMat.addr;
+        kh.dispatch(gx, {}, gp, 1u, 1u);
+        dev->flush();
+        const uint32_t nG = downloadBuffer<uint32_t>(dev, wg.count.h, 1)[0];
+        const auto recG = gather(nG, downloadBuffer<F4>(dev, wg.point.h, MAXC),
+                                 downloadBuffer<F4>(dev, wg.normalPen.h, MAXC),
+                                 downloadBuffer<F4>(dev, wg.barycentric.h, MAXC),
+                                 downloadBuffer<uint32_t>(dev, wg.info.h, MAXC * 4u));
+        bool same = nG == nHf && recG.size() == recHf.size();
+        for (size_t i = 0; same && i < recG.size(); ++i)
+            same = recG[i].tri == recHf[i].tri && std::memcmp(recG[i].w, recHf[i].w, sizeof(recG[i].w)) == 0;
+        PXG_CHECK_MSG(same, "at %u group(s) the heightfield contact gen wrote %u contacts that differ "
+                            "from the port grid's %u (order-free, bitwise)", gx, nG, nHf);
+        destroyWriter(dev, wg);
+    }
 
     uint32_t mismatches = 0;
     for (size_t i = 0; i < recHf.size() && i < recMesh.size(); ++i)
@@ -10295,7 +10606,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
         std::vector<uint32_t> nd2 = { 0u };
         DevBuf bNd2 = makeDev(dev, nd2);
         tp.stackSizeNeededOnDevice = bNd2.addr;
-        kh.dispatch(2048u, {}, tp, 1u, 1u);
+        kh.dispatch(8192u, {}, tp, 1u, 1u);
         dev->flush();
         const auto tp4 = downloadBuffer<F4>(dev, wt.point.h, MAXC);
         uint32_t written = 0;
@@ -10562,7 +10873,7 @@ static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t
         p.wMaxContacts = w.maxContacts;
         Kernel k("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch", {},
                  sizeof(p927cg::ClothHfCgPush));
-        k.dispatch(2048u, {}, p, 1u, 1u);
+        k.dispatch(8192u, {}, p, 1u, 1u);   // 2048 blocks of four warps, one group per warp
     }
     else
     {
@@ -10581,7 +10892,7 @@ static void runOne(PxgSlangComputeDevice* dev, bool hf, const Case& cs, uint32_t
         p.wMaxContacts = w.maxContacts;
         Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {},
                  sizeof(p817cg::ClothMeshCgPush));
-        k.dispatch(2048u, {}, p, 1u, 1u);
+        k.dispatch(8192u, {}, p, 1u, 1u);   // 2048 blocks of four warps, one group per warp
     }
     dev->flush();
 
@@ -11925,7 +12236,9 @@ PXG_TEST(femClothSimPsMidphase)
 
     Kernel k("femClothPsMidphaseBda.spv", "cloth_psMidphaseGeneratePairsLaunch",
              {}, sizeof(ClothPsMidphasePush));
-    k.dispatch(1024u, {}, p, uint32_t(cms.size()), 1u);   // grid (1024, numTests, 1)
+    // The engine's grid (1024, numTests, 1) x block (32, 2, 1); the port launches one group per
+    // CUDA warp (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT): (2048, numTests, 1).
+    k.dispatch(2048u, {}, p, uint32_t(cms.size()), 1u);
     dev->flush();
 
     // ---- the expected set ----------------------------------------------------------
@@ -12001,7 +12314,7 @@ PXG_TEST(femClothSimPsMidphase)
         q.numWorkItems = 1u;                       // only manager 0 is real work
         q.stackPtr = bWideStack.addr; q.midphasePairsNum = bWideNum.addr;
         q.stackSizeBytes = NB_ALLOC * 16u;
-        k.dispatch(1024u, {}, q, 4u, 1u);          // FOUR y-groups for ONE work item
+        k.dispatch(2048u, {}, q, 4u, 1u);          // FOUR y-groups for ONE work item
         dev->flush();
 
         uint32_t oneMgr = 0u;
@@ -12018,19 +12331,27 @@ PXG_TEST(femClothSimPsMidphase)
     }
 
     // ---- M8, the WARP STRIDE, which the run above cannot reach --------------------
-    // The loop strides by gridDim.x * blockDim.y = 1024 * 2 warps.  With six
-    // particles every warp runs at most one iteration and the stride is never taken,
-    // so a mutant that replaces it with gridDim.x alone survives -- a survivor the
-    // rig cannot reach is a hole in the rig, which is what P9.29 measured the hard
-    // way.  So: more particles than the grid has warps, with the only contacting
-    // ones in the tail that a second iteration reaches.
+    // The loop strides by gridDim.x * blockDim.y = 1024 * 2 warps -- the group count at the
+    // port's launch, 2048, and 1024 at the CUDA's own grid; the port strides by
+    // WorkgroupCount().x.  With six particles every warp runs at most one iteration and
+    // the stride is never taken, so a mutant that replaces it with gridDim.x alone
+    // survives -- a survivor the rig cannot reach is a hole in the rig, which is what
+    // P9.29 measured the hard way.  So: more particles than the grid has warps, with the
+    // contacting ones in the tail that a second iteration reaches, and ONE in
+    // [1024, 2048): at the CUDA grid that particle is reached only by a group's second
+    // iteration at stride 1024, so a start of gid.x with the old constant stride 2048
+    // (the CUDA's blockDim.y * gridDim.x at the PORT grid) skips it there, and at 3 and
+    // 1 groups it skips almost the whole tail as well.
     {
-        const uint32_t NB_WARPS = 1024u * 2u;          // the shader's PS_NB_WARPS
+        const uint32_t NB_WARPS = 1024u * 2u;          // the CUDA's blockDim.y * gridDim.x at the port grid
         const uint32_t TAIL = 8u;
+        const uint32_t MID = 1500u;                    // in [1024, NB_WARPS)
         const uint32_t BIG = NB_WARPS + TAIL;
+        const uint32_t EXPECT = TAIL + 1u;
         std::vector<F4> big(BIG, F4{ 500.0f, 500.0f, 500.0f, 1.0f });   // far from everything
         for (uint32_t i = NB_WARPS; i < BIG; ++i)
             big[i] = F4{ 0.0f, 0.15f, 0.0f, 1.0f };    // over triangle 0, inside R
+        big[MID] = F4{ 5.0f, 0.05f, 0.0f, 1.0f };       // over triangle 5, inside R
         DevBuf bBigPart = makeDev(dev, big);
         std::vector<PxgParticleSystem> psBig(PS_ID + 1u);
         std::memset(psBig.data(), 0, psBig.size() * sizeof(PxgParticleSystem));
@@ -12042,23 +12363,45 @@ PXG_TEST(femClothSimPsMidphase)
         std::vector<uint32_t> z2 = { 0u };
         DevBuf bBigNum = makeDev(dev, z2);
 
+        // The port's one group per warp, the CUDA's grid, and two grids where every group
+        // takes many particles.  Each run gets a fresh stack; the rows it wrote are compared
+        // order-free and bitwise against the port grid's (gridRows).
+        std::vector<std::vector<uint32_t>> refRows;
+        for (uint32_t gx : { NB_WARPS, 1024u, 3u, 1u })
+        {
+        DevBuf bBigNumG = makeDev(dev, z2);
+        DevBuf bBigStackG = makeDev(dev, bigStack);
         ClothPsMidphasePush q = p;
         q.numWorkItems = 1u;                            // one manager keeps the count clean
         q.particleSystems = bPsBig.addr;
-        q.stackPtr = bBigStack.addr; q.midphasePairsNum = bBigNum.addr;
+        q.stackPtr = bBigStackG.addr; q.midphasePairsNum = bBigNumG.addr;
         q.stackSizeBytes = BIG * 16u;
-        k.dispatch(1024u, {}, q, 1u, 1u);
+        k.dispatch(gx, {}, q, 1u, 1u);
         dev->flush();
 
-        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bBigNum.h, 1)[0];
-        PXG_CHECK_MSG(n2 == TAIL,
-                      "the stride run found %u pairs, expected exactly %u.  %u particles were "
-                      "given to a grid of %u warps and only the last %u touch a triangle, so "
-                      "only a second iteration at the right stride finds them -- more means "
-                      "particles are being visited by several warps, fewer means the second "
-                      "iteration never happened", n2, TAIL, BIG, NB_WARPS, TAIL);
-        std::printf("    [ note ] stride run: %u particles over %u warps -> %u pairs from the "
-                    "%u-particle tail\n", BIG, NB_WARPS, n2, TAIL);
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bBigNumG.h, 1)[0];
+        PXG_CHECK_MSG(n2 == EXPECT,
+                      "the stride run at %u groups found %u pairs, expected exactly %u.  %u particles "
+                      "were given to a grid of %u groups and only particle %u and the last %u touch "
+                      "a triangle, so only later iterations at the right stride find them -- more "
+                      "means particles are being visited by several groups, fewer means a particle "
+                      "was skipped", gx, n2, EXPECT, BIG, gx, MID, TAIL);
+        const auto sw = downloadBuffer<uint32_t>(dev, bBigStackG.h, size_t(BIG) * 4u);
+        auto rows = gridRows(PxMin(n2, BIG), { { &sw, 4u } });
+        bool hasMid = false;
+        for (const auto& r : rows) hasMid |= (r[1] == MID && r[2] == 5u);
+        PXG_CHECK_MSG(hasMid, "at %u groups no pair (particle %u, triangle 5) was written", gx, MID);
+        if (gx == NB_WARPS)
+            refRows = rows;
+        else
+            PXG_CHECK_MSG(rows == refRows,
+                          "at %u groups the cloth-vs-particle midphase wrote pairs that differ from "
+                          "the port grid's (order-free, bitwise)", gx);
+        std::printf("    [ note ] stride run: %u particles over %u groups -> %u pairs (particle %u "
+                    "+ the %u-particle tail)\n", BIG, gx, n2, MID, TAIL);
+        dev->destroyBuffer(bBigNumG.h);
+        dev->destroyBuffer(bBigStackG.h);
+        }
 
         for (PxgBufferHandle h : { bBigPart.h, bPsBig.h, bBigStack.h, bBigNum.h })
             dev->destroyBuffer(h);

@@ -79,10 +79,11 @@
 // verbatim, so `flip = gid.z` needs nothing special -- but it does need to be there.
 //
 // The bridge DROPS blockDim (PxgVulkanCudaContext.cpp:292-331), so a [numthreads(32,1,1)] group
-// is ONE warp and the block's two warps are walked serially in a group-uniform `sub` loop,
-// with the grid stride kept at the CUDA `blockDim.y * gridDim.x` = 2048.  Same treatment, same
-// reasoning as softBodySelfCollisionBda -- see its header for why deriving the stride from the
-// group count instead is wrong.
+// is ONE warp.  The block's two warps used to be walked serially in one group; the launch site
+// now (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one group per CUDA warp,
+// (SB_SBMIDPHASE * 2, numTests, 2), so globalWarpIdx = gid.x and the stride is the group count
+// WorkgroupCount().x -- the CUDA's `blockDim.y * gridDim.x` = 2048, and at any other grid still
+// a stride that visits every vertex exactly once.  Same treatment as softBodySelfCollisionBda.
 //
 // DEVIATIONS from CUDA (recipe policy, each preserving the emitted contact SET and the atomic
 // total):
@@ -131,8 +132,6 @@ import pxgSlangTetClosest;     // getNormalized / isValidTet / isPointOutsideOfP
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 // PxgSoftBodyCoreKernelIndices.h:55 — SB_SBMIDPHASE, the fixed x-grid of this launch.
 static const uint SB_SBMIDPHASE = 1024u;
-// blockDim.y * gridDim.x, the CUDA grid stride over vertices.
-static const uint SS_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
@@ -288,13 +287,12 @@ void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
     Ptr<uint4> treeTetIndices = Ptr<uint4>(softbodies[softbodyId1].mTetIndices);
     const uint64_t surfaceTetHint1 = softbodies[softbodyId1].mTetMeshSurfaceHint;
 
-    // See the header on the grid: the block's two warps are walked serially, and the stride
-    // stays the CUDA blockDim.y * gridDim.x.
-    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header on the grid): globalWarpIdx is the group
+    // index and the stride the group count, i.e. blockDim.y * gridDim.x.
     {
-    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
+    const uint globalWarpIdx = gid.x;
 
-    for (uint vertIdx = globalWarpIdx; vertIdx < numVerts; vertIdx += SS_NB_WARPS)
+    for (uint vertIdx = globalWarpIdx; vertIdx < numVerts; vertIdx += WorkgroupCount().x)
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 

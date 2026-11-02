@@ -417,7 +417,16 @@ namespace physx
 			PxU32 numWarpsPerBlock = MIDPHASE_WARPS_PER_BLOCK;
 			PxU32 numBlocks = PxgSoftBodyKernelGridDim::SB_SBMIDPHASE;
 
+#ifdef PXG_NO_CUDA_TOOLKIT
+			// Slang/Vulkan port: the bridge forwards only gridDim, so the warps of a block would share
+			// one 32-thread workgroup and run one after the other.  One workgroup per CUDA warp instead:
+			// sb_selfCollisionMidphaseGeneratePairsLaunch (softBodySelfCollisionBda.slang) takes its warp
+			// index from the group index and its stride from the group count; same arguments, same
+			// per-warp work.
+			CUresult result = mCudaContext->launchKernel(scMidphaseFunction, numBlocks * numWarpsPerBlock, nbActiveSelfCollisionSoftbodies, 1, WARP_SIZE, 1, 1, 0, mStream, scMidphaseKernelParams, sizeof(scMidphaseKernelParams), 0, PX_FL);
+#else
 			CUresult result = mCudaContext->launchKernel(scMidphaseFunction, numBlocks, nbActiveSelfCollisionSoftbodies, 1, WARP_SIZE, numWarpsPerBlock, 1, 0, mStream, scMidphaseKernelParams, sizeof(scMidphaseKernelParams), 0, PX_FL);
+#endif
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sb_selfCollisionMidphaseGeneratePairsLaunch fail to launch kernel!!\n");
 

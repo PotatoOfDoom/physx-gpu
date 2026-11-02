@@ -375,16 +375,23 @@ PXG_TEST(cvxCoreTetNp)
     push.restDistance = bRest.addr;
 
     Kernel k("cvxCoreTetNpBda.spv", "convexCoreTetmeshNphase_Kernel32", {}, sizeof(CvxCoreTetPush));
-    // Engine launch: grid ceil(numTests / 4), block (32, 4).
-    auto run = [&](const CvxCoreTetPush& p, uint32_t maxContacts) {
+    // Engine launch: grid ceil(numTests / 4), block (32, 4); the port's launch site
+    // (PxgNarrowphaseCore.cpp, PXG_NO_CUDA_TOOLKIT) launches one 32-thread group per CUDA warp,
+    // 4 * ceil(numTests / 4), which `run` dispatches.  `runAt` takes any grid: the shader's
+    // group-stride loop covers the CUDA's own ceil(numTests / 4) too (case A runs it, case D
+    // runs one group), where a group takes its tests one grid-width apart.
+    auto runAt = [&](const CvxCoreTetPush& p, uint32_t maxContacts, uint32_t groups) {
         WriterBufs w = makeWriter(dev, maxContacts);
         CvxCoreTetPush q = p;
         fillWriter(q, w);
-        k.dispatch((q.numTests + 3u) / 4u, {}, q, 1u, 1u);
+        k.dispatch(groups, {}, q, 1u, 1u);
         dev->flush();
         TetRun r = readRun(dev, w);
         destroyWriter(dev, w);
         return r;
+    };
+    auto run = [&](const CvxCoreTetPush& p, uint32_t maxContacts) {
+        return runAt(p, maxContacts, 4u * ((p.numTests + 3u) / 4u));
     };
 
     // ---- the analytic expectations ----------------------------------------
@@ -501,6 +508,29 @@ PXG_TEST(cvxCoreTetNp)
     std::printf("    [ info ] cvxCoreTet A: %u contacts; test 0 tets (%u, %u), test 1 tets (%u, %u); "
                 "pen tet0 %.8g tet1 %.8g\n", a.count, ta.n[0][0], ta.n[0][1], ta.n[1][0], ta.n[1][1],
                 expectedPen(0u), expectedPen(1u));
+    {
+        // The CUDA's own grid, ceil(2 / 4) = 1 group taking both tests in turn: the same
+        // contacts, compared order-free and bitwise (the two tests race for the writer's
+        // counter at the port's grid, as the CUDA's two warps do).
+        const TetRun g = runAt(push, MAX_CONTACTS, 1u);
+        auto rowsOf = [](const TetRun& r) {
+            std::vector<std::vector<uint32_t>> rows;
+            for (uint32_t i = 0; i < std::min(r.count, uint32_t(r.point.size())); ++i)
+            {
+                std::vector<uint32_t> row(4 * 3 + 4 + 2 + 2);
+                std::memcpy(&row[0], &r.point[i], 16); std::memcpy(&row[4], &r.normalPen[i], 16);
+                std::memcpy(&row[8], &r.bary[i], 16); std::memcpy(&row[12], &r.info[i], 16);
+                std::memcpy(&row[16], &r.byRigid[i], 8);
+                row[18] = r.mat[i]; row[19] = r.tempByRigid[i];
+                rows.push_back(row);
+            }
+            std::sort(rows.begin(), rows.end());
+            return rows;
+        };
+        PXG_CHECK_MSG(g.count == a.count && rowsOf(g) == rowsOf(a),
+                      "at the CUDA's grid of one group the kernel wrote %u contacts that differ from the "
+                      "port grid's %u (order-free, bitwise)", g.count, a.count);
+    }
 
     // =======================================================================
     // CASE B -- numTests bounds the walk: with 3 the cm 2 pair (rigid C) appears,

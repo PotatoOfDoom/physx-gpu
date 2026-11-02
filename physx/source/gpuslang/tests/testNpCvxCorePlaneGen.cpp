@@ -35,6 +35,9 @@
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+#include "geometry/PxConvexCoreGeometry.h"
+
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -858,6 +861,335 @@ PXG_TEST(npCvxCorePlaneGen_contacts)
                   cHit, cMid, cFace, cTrig);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// convexCorePlaneNphase_Kernel (cvxCorePlaneNpBda.slang) -- the ENGINE kernel, end
+// to end, at every grid it can be launched with.  Second review of the
+// one-group-per-warp tranche: the shader's arithmetic is the layers verified above,
+// but no fixture loaded cvxCorePlaneNpBda.spv, so its wiring (TestInput, checkTypes,
+// the plane from the transform, makeConvexShape's arms, the writeOutput tail) and
+// above all its LAUNCH SHAPE were seen only by the convexcoreplane scene.  The port's
+// launch site issues 1024 / 64 = 16 groups of 64 per CUDA block and the shader takes
+// the flat thread id as the CUDA's, striding by WorkgroupCount().x * 64.  1100 tests
+// -- two CUDA blocks -- run at that port grid, at the CUDA's own block count (2: every
+// group then strides), and at 3 and 1 groups, each against refPlaneGen bitwise and
+// order-free: every test is read back through its OWN cmOutputs record.
+// ===========================================================================
+namespace cpnp
+{
+struct GpuShape
+{
+    float sx, sy, sz, rx, ry, rz, rw;
+    uint32_t materialIndex, hullLo, hullHi, type, particleOrSoftbodyId;
+};
+static_assert(sizeof(GpuShape) == 48, "PxgShape mirror");
+struct CmInput { uint32_t shapeRef0, shapeRef1, tcRef0, tcRef1; };
+struct CachedXf { float qx, qy, qz, qw, px, py, pz; uint32_t flags; };
+static_assert(sizeof(CachedXf) == 32, "PxsCachedTransform mirror");
+struct MaterialH { float dyn, sta, rest, damping; uint32_t flagsModes0, modes1; };
+static_assert(sizeof(MaterialH) == 24, "PxsMaterialData mirror");
+
+// cvxCorePlaneNpBda.slang's CvxCorePlaneParams == the CUDA parameter list (:449-468).
+struct NpPush
+{
+    uint32_t numTests, pad4;
+    uint64_t cmInputs, cmOutputs, shapes, transformCache, contactDistance, materials;
+    uint64_t contactStream, patchStream, counters, touchFlags, patchFlags;
+    uint64_t startPatches, startPoints, startForces;
+    uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit, pad132;
+};
+static_assert(sizeof(NpPush) == 136, "the kCvxCorePlane ABI row is 136 bytes");
+
+// quatBasisVector0Np: PxQuat::getBasisVector0's own formula (PxQuat.h:260-265).
+static V3 basis0(const F4& q)
+{
+    const float x2 = q.x * 2.0f, w2 = q.w * 2.0f;
+    return V3{ (q.w * w2) - 1.0f + (q.x * x2), (q.z * w2) + (q.y * x2), (-q.y * w2) + (q.z * x2) };
+}
+
+struct PlaneCase
+{
+    uint32_t geom;          // PxGeometryType of the convex slot
+    uint32_t coreType;      // eCONVEXCORE: the PxConvexCore::Type
+    float core[6];          // eCONVEXCORE: the PxMeshScale bytes; else sx/sy/sz
+    float margin;           // eCONVEXCORE: scale rotation w
+    F4 planeQ; V3 planeP;
+    F4 cq; V3 cp;
+    float cd0, cd1;         // plane's / convex's contact distance
+    bool swapped;           // the pair arrives convex-first (checkTypes swaps it)
+};
+} // namespace cpnp
+
+static void runCorePlaneEngine(const char* gridName, uint32_t (*groupsFor)(uint32_t))
+{
+    using namespace cpnp;
+    std::printf("    [ note ] %s grid\n", gridName);
+    const uint32_t G_PLANE = uint32_t(physx::PxGeometryType::ePLANE);
+    const uint32_t G_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE);
+    const uint32_t G_CAPSULE = uint32_t(physx::PxGeometryType::eCAPSULE);
+    const uint32_t G_BOX = uint32_t(physx::PxGeometryType::eBOX);
+    const uint32_t G_CORE = uint32_t(physx::PxGeometryType::eCONVEXCORE);
+    static_assert(uint32_t(physx::PxConvexCore::ePOINT) == CORE_POINT &&
+                  uint32_t(physx::PxConvexCore::eSEGMENT) == CORE_SEGMENT &&
+                  uint32_t(physx::PxConvexCore::eBOX) == CORE_BOX &&
+                  uint32_t(physx::PxConvexCore::eELLIPSOID) == CORE_ELLIPSOID, "PxConvexCore::Type numbering");
+
+    std::mt19937 rng(0x9C0EE51u);
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() {
+        float a[4]; float m2 = 0;
+        for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
+        const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+        return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i };
+    };
+
+    // ---- the cases and their oracle -----------------------------------------
+    // Cores without a trig path only (point, segment, box, ellipsoid), so every
+    // compared word is bitwise; the sphere / capsule / box geometries go through
+    // makeConvexShape's other three arms.
+    const uint32_t N = 1100;
+    std::vector<PlaneCase> cases(N);
+    std::vector<PgOut> ref(N);
+    const uint32_t coreTypes[4] = { CORE_POINT, CORE_SEGMENT, CORE_BOX, CORE_ELLIPSOID };
+    size_t cHit = 0, cMiss = 0, cMulti = 0, cSwapped = 0, cGeom[4] = { 0, 0, 0, 0 };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        PlaneCase& c = cases[i];
+        std::memset(&c, 0, sizeof(c));
+        const uint32_t kind = i % 4u;
+        c.geom = kind == 0 ? G_CORE : (kind == 1 ? G_SPHERE : (kind == 2 ? G_CAPSULE : G_BOX));
+        c.coreType = coreTypes[(i / 4u) % 4u];
+        for (float& w : c.core) w = rf(0.2f, 1.0f);
+        if (kind == 0 && c.coreType == CORE_POINT) for (float& w : c.core) w = 0.0f;
+        if (kind == 1) c.core[1] = c.core[2] = c.core[0];
+        if (kind == 2) c.core[2] = c.core[1];
+        c.margin = (kind == 0 && (i % 3u) != 0u) ? rf(0.01f, 0.2f) : 0.0f;
+        c.planeQ = (i % 7u == 3u) ? F4{ 0, 0, 0, 1 } : randQuat();
+        c.planeP = V3{ rf(-2, 2), rf(-2, 2), rf(-2, 2) };
+        c.cq = randQuat();
+        const V3 pn = basis0(c.planeQ);
+        const float off = (i % 3u == 0u) ? rf(-0.5f, 0.5f) : rf(0.2f, 2.0f);
+        c.cp = add(c.planeP, mul(pn, off));
+        c.cd0 = rf(0.0f, 0.05f); c.cd1 = rf(0.0f, 0.1f);
+        // checkTypes (:98-108) swaps only (eCONVEXCORE, ePLANE); the engine sends a
+        // sphere / capsule / box against a plane to their own kernels, so only the core
+        // kind arrives reversed here.
+        c.swapped = kind == 0 && ((i / 4u) % 2u) == 1u;
+
+        PgIn s{};
+        s.plane = F4{ pn.x, pn.y, pn.z, -dot3(c.planeP, pn) };   // PxPlane(p, n): d = -p.n
+        U4 core[3] = {};
+        float margin = 0.0f;
+        if (c.geom == G_CORE)
+        {
+            s.meta = U4{ c.coreType, 0, 0, 0 };
+            core[0] = U4{ f2u(c.core[0]), f2u(c.core[1]), f2u(c.core[2]), f2u(c.core[3]) };
+            core[1] = U4{ f2u(c.core[4]), f2u(c.core[5]), 0, 0 };
+            margin = c.margin;
+        }
+        else if (c.geom == G_SPHERE) { s.meta = U4{ CORE_POINT, 0, 0, 0 }; margin = c.core[0]; }
+        else if (c.geom == G_CAPSULE)
+        { s.meta = U4{ CORE_SEGMENT, 0, 0, 0 }; core[0].x = f2u(c.core[0] * 2.0f); margin = c.core[1]; }
+        else
+        {
+            s.meta = U4{ CORE_BOX, 0, 0, 0 };
+            core[0] = U4{ f2u(c.core[0] * 2.0f), f2u(c.core[1] * 2.0f), f2u(c.core[2] * 2.0f), 0 };
+        }
+        std::memcpy(s.core, core, sizeof(core));
+        s.poseQ = c.cq;
+        s.poseP = F4{ c.cp.x, c.cp.y, c.cp.z, margin };
+        s.cfg = F4{ c.cd0 + c.cd1, 0, 0, 0 };
+        refPlaneGen(s, ref[i]);
+        if (ref[i].counts.x) ++cHit; else ++cMiss;
+        if (ref[i].counts.x >= 2) ++cMulti;
+        if (c.swapped && ref[i].counts.x) ++cSwapped;
+        if (ref[i].counts.x) ++cGeom[kind];
+        PXG_CHECK_MSG(ref[i].counts.y == 0u, "case %u reached a trig path", i);
+    }
+    std::printf("    [ note ] %u tests: %zu with contacts (%zu multi-point, %zu swapped), %zu without; "
+                "with contacts per geometry core/sphere/capsule/box %zu/%zu/%zu/%zu\n",
+                N, cHit, cMulti, cSwapped, cMiss, cGeom[0], cGeom[1], cGeom[2], cGeom[3]);
+    PXG_CHECK_MSG(cHit > N / 4 && cMiss > N / 10 && cMulti > N / 20 && cSwapped > 20 &&
+                  cGeom[0] > 20 && cGeom[1] > 20 && cGeom[2] > 20 && cGeom[3] > 20, "coverage thin");
+    // Contacts on both sides of every 64-test group boundary of the first CUDA block,
+    // and in the second block: a skipped range shows up as a missing contact.
+    {
+        size_t lowHalf = 0, highHalf = 0, block1 = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            if (!ref[i].counts.x) continue;
+            if (i < 64) ++lowHalf; else if (i < 1024) ++highHalf; else ++block1;
+        }
+        PXG_CHECK_MSG(lowHalf > 4 && highHalf > 100 && block1 > 4, "contacts not spread over the grid");
+    }
+
+    // ---- the device run --------------------------------------------------------
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t MAT_PLANE = 1u, MAT_CVX = 2u;
+    std::vector<MaterialH> mats(3);
+    std::memset(mats.data(), 0, mats.size() * sizeof(MaterialH));
+    mats[MAT_PLANE] = MaterialH{ 0.5f, 0.75f, 0.25f, 0.125f, 0u, 0u };   // average combine
+    mats[MAT_CVX] = MaterialH{ 0.25f, 0.5f, 0.5f, 0.375f, 0u, 0u };
+
+    std::vector<GpuShape> shapes(2 * N);
+    std::vector<CachedXf> xf(2 * N);
+    std::vector<float> cdist(2 * N);
+    std::vector<CmInput> cms(N);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(GpuShape));
+    std::memset(xf.data(), 0, xf.size() * sizeof(CachedXf));
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const PlaneCase& c = cases[i];
+        GpuShape& sp = shapes[2 * i];
+        sp.sx = sp.sy = sp.sz = 1.0f; sp.rw = 1.0f;
+        sp.materialIndex = MAT_PLANE; sp.type = G_PLANE;
+        GpuShape& sc = shapes[2 * i + 1];
+        sc.sx = c.core[0]; sc.sy = c.core[1]; sc.sz = c.core[2];
+        sc.materialIndex = MAT_CVX; sc.type = c.geom;
+        if (c.geom == G_CORE)
+        {
+            sc.rx = c.core[3]; sc.ry = c.core[4]; sc.rz = c.core[5]; sc.rw = c.margin;
+            sc.hullLo = c.coreType;
+        }
+        else
+            sc.rw = 1.0f;
+        xf[2 * i] = CachedXf{ c.planeQ.x, c.planeQ.y, c.planeQ.z, c.planeQ.w, c.planeP.x, c.planeP.y, c.planeP.z, 0u };
+        xf[2 * i + 1] = CachedXf{ c.cq.x, c.cq.y, c.cq.z, c.cq.w, c.cp.x, c.cp.y, c.cp.z, 0u };
+        cdist[2 * i] = c.cd0; cdist[2 * i + 1] = c.cd1;
+        cms[i] = c.swapped ? CmInput{ 2 * i + 1, 2 * i, 2 * i + 1, 2 * i } : CmInput{ 2 * i, 2 * i + 1, 2 * i, 2 * i + 1 };
+    }
+
+    const uint32_t PATCH_WORDS = 16u, CONTACT_WORDS = 16u;
+    const uint64_t START_PATCHES = 0x0000100000000000ull, START_POINTS = 0x0000200000000040ull,
+                   START_FORCES = 0x0000300000000080ull;   // never dereferenced by the tail
+    std::vector<uint32_t> patchInit(size_t(N) * PATCH_WORDS, 0u), contactInit(size_t(N) * CONTACT_WORDS, 0xCDCDCDCDu);
+    std::vector<uint32_t> outInit(size_t(N) * 12u, 0u), flagInit(N, 0xFFFFFFFFu), ctrInit(4, 0u);
+
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapes);
+    PxgBufferHandle bXf = createBufferFrom(dev, xf);
+    PxgBufferHandle bCd = createBufferFrom(dev, cdist);
+    PxgBufferHandle bCms = createBufferFrom(dev, cms);
+    PxgBufferHandle bMat = createBufferFrom(dev, mats);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bContact = createBufferFrom(dev, contactInit);
+    PxgBufferHandle bPatch = createBufferFrom(dev, patchInit);
+    PxgBufferHandle bCtr = createBufferFrom(dev, ctrInit);
+    PxgBufferHandle bTouch = createBufferFrom(dev, flagInit);
+    PxgBufferHandle bPchg = createBufferFrom(dev, flagInit);
+
+    NpPush push{};
+    push.numTests = N;
+    push.cmInputs = dev->getBufferDeviceAddress(bCms);
+    push.cmOutputs = dev->getBufferDeviceAddress(bOut);
+    push.shapes = dev->getBufferDeviceAddress(bShapes);
+    push.transformCache = dev->getBufferDeviceAddress(bXf);
+    push.contactDistance = dev->getBufferDeviceAddress(bCd);
+    push.materials = dev->getBufferDeviceAddress(bMat);
+    push.contactStream = dev->getBufferDeviceAddress(bContact);
+    push.patchStream = dev->getBufferDeviceAddress(bPatch);
+    push.counters = dev->getBufferDeviceAddress(bCtr);
+    push.touchFlags = dev->getBufferDeviceAddress(bTouch);
+    push.patchFlags = dev->getBufferDeviceAddress(bPchg);
+    push.startPatches = START_PATCHES;
+    push.startPoints = START_POINTS;
+    push.startForces = START_FORCES;
+    push.patchBytesLimit = N * PATCH_WORDS * 4u;
+    push.contactBytesLimit = N * CONTACT_WORDS * 4u;
+    push.forceBytesLimit = N * 16u;
+
+    Kernel k("cvxCorePlaneNpBda.spv", "convexCorePlaneNphase_Kernel", {}, sizeof(NpPush));
+    k.dispatch(groupsFor(N), {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gOut = downloadBuffer<uint32_t>(dev, bOut, outInit.size());
+    const auto gContact = downloadBuffer<uint32_t>(dev, bContact, contactInit.size());
+    const auto gPatch = downloadBuffer<uint32_t>(dev, bPatch, patchInit.size());
+    const auto gCtr = downloadBuffer<uint32_t>(dev, bCtr, 4);
+    const auto gTouch = downloadBuffer<uint32_t>(dev, bTouch, N);
+    const auto gPchg = downloadBuffer<uint32_t>(dev, bPchg, N);
+
+    // combine (PxsMaterialCombiner, average mode on both sides), transcribed
+    const MaterialH& m0 = mats[MAT_PLANE]; const MaterialH& m1 = mats[MAT_CVX];
+    const float eRest = 1.0f * (0.5f * (m0.rest + m1.rest));
+    const float eDamp = 0.5f * (m0.damping + m1.damping);
+    const float eDyn = 0.5f * (m0.dyn + m1.dyn);
+    const float eStaF = 0.5f * (m0.sta + m1.sta);
+    const float eSta = (eStaF - eDyn) >= 0.0f ? eStaF : eDyn;
+
+    uint64_t sumPoints = 0, sumPatches = 0;
+    size_t mm = 0;
+    auto bad = [&](uint32_t i, const char* what, uint32_t got, uint32_t want) {
+        if (mm < 12)
+            std::printf("  corePlane test %u: %s got 0x%08x want 0x%08x\n", i, what, got, want);
+        ++mm;
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const PgOut& e = ref[i];
+        const uint32_t nPts = e.counts.x, nPatch = nPts ? 1u : 0u;
+        sumPoints += nPts; sumPatches += nPatch;
+        const uint32_t* o = &gOut[size_t(i) * 12u];
+        const uint32_t status = nPts ? 2u : 1u;    // eHAS_TOUCH / eHAS_NO_TOUCH, prior 0
+        if (o[8] != ((status << 16) | (nPatch << 8))) bad(i, "allflags", o[8], (status << 16) | (nPatch << 8));
+        if ((o[9] & 0xFFFFu) != nPts) bad(i, "nbContacts", o[9] & 0xFFFFu, nPts);
+        if (gTouch[i] != 1u) bad(i, "touchChange", gTouch[i], 1u);   // prior touch unknown
+        if (gPchg[i] != nPatch) bad(i, "patchChange", gPchg[i], nPatch);
+        const uint64_t cp = uint64_t(o[2]) | (uint64_t(o[3]) << 32);
+        if (nPts == 0)
+        {
+            if (cp != 0) bad(i, "contactPoints (none expected)", uint32_t(cp), 0u);
+            continue;
+        }
+        const uint64_t cOff = cp - START_POINTS;
+        if ((cOff & 15u) != 0 || cOff + 16u * nPts > uint64_t(contactInit.size()) * 4u)
+        { bad(i, "contactPoints offset", uint32_t(cOff), 0u); continue; }
+        for (uint32_t s = 0; s < nPts; ++s)
+            for (uint32_t kk = 0; kk < 4; ++kk)
+            {
+                const uint32_t got = gContact[size_t(cOff / 4u) + s * 4u + kk];
+                const uint32_t want = f2u((&e.points[s].x)[kk]);
+                if (got != want) bad(i, "contact word", got, want);
+            }
+        const uint64_t pp = uint64_t(o[0]) | (uint64_t(o[1]) << 32);
+        const uint64_t pOff = pp - START_PATCHES;
+        if ((pOff & 63u) != 0 || pOff + 64u > uint64_t(patchInit.size()) * 4u)
+        { bad(i, "contactPatches offset", uint32_t(pOff), 0u); continue; }
+        // the kernel passes -normal (:492): the plane's own normal
+        const uint32_t* w = &gPatch[size_t(pOff / 4u)];
+        const uint32_t want[14] = { f2u(1.0f), f2u(1.0f), f2u(1.0f), f2u(1.0f),
+                                    f2u(-e.normal.x), f2u(-e.normal.y), f2u(-e.normal.z),
+                                    f2u(eRest), f2u(eDyn), f2u(eSta), f2u(eDamp),
+                                    (nPts & 0xFFu) << 16,                       // matFlags 0
+                                    MAT_PLANE << 16, MAT_CVX };                 // shape0 = the plane
+        for (uint32_t kk = 0; kk < 14; ++kk)
+            if (w[kk] != want[kk]) bad(i, "patch word", w[kk], want[kk]);
+    }
+    PXG_CHECK_MSG(gCtr[0] == 64u * sumPatches && gCtr[1] == 16u * sumPoints && gCtr[2] == 4u * sumPoints && gCtr[3] == 0u,
+                  "counters: patches %u contacts %u forces %u overflow %u (want %llu %llu %llu 0)",
+                  gCtr[0], gCtr[1], gCtr[2], gCtr[3], (unsigned long long)(64u * sumPatches),
+                  (unsigned long long)(16u * sumPoints), (unsigned long long)(4u * sumPoints));
+    PXG_CHECK_MSG(mm == 0, "convexCorePlaneNphase_Kernel (%s grid, %u groups): %zu mismatching words "
+                  "against refPlaneGen", gridName, groupsFor(N), mm);
+
+    for (PxgBufferHandle hb : { bShapes, bXf, bCd, bCms, bMat, bOut, bContact, bPatch, bCtr, bTouch, bPchg })
+        dev->destroyBuffer(hb);
+}
+
+// The port's grid: 1024 / 64 = 16 groups of 64 per CUDA block (PxgNarrowphaseCore.cpp,
+// PXG_NO_CUDA_TOOLKIT).
+PXG_TEST(npCvxCorePlaneGen_engineKernel)
+{
+    runCorePlaneEngine("port", [](uint32_t n) { return 16u * ((n + 1023u) / 1024u); });
+}
+
+// The CUDA's own block count (each 64-wide group then strides over its share), and
+// 3 and 1 groups.
+PXG_TEST(npCvxCorePlaneGen_engineKernelCudaGrid)
+{
+    runCorePlaneEngine("CUDA", [](uint32_t n) { return (n + 1023u) / 1024u; });
+    runCorePlaneEngine("three-group", [](uint32_t) { return 3u; });
+    runCorePlaneEngine("one-group", [](uint32_t) { return 1u; });
 }
 
 } // namespace

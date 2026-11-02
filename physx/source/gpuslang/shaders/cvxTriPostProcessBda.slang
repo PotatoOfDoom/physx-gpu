@@ -211,8 +211,12 @@ void convexTrimeshPostProcess(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
     const uint64_t niIndexAddr = cvxTriNI + uint64_t(convexTriPairOffset) * 16UL + 12UL;
     const uint niWord = Ptr<uint>(niIndexAddr)[0];
 
+    // The CUDA's `return` here leaves convexTrimeshPostProcessCore, i.e. it ends one
+    // iteration of the caller's grid-stride loop; this body IS that loop's body, so it is
+    // a `continue`.  A `return` dropped every later pair of the thread whenever the grid
+    // is smaller than the queue (the 65535 cap, or a dense mesh at the CUDA grid).
     if (ppGetNbContacts(niWord) == 0u)
-        return;
+        continue;
 
     // ---- the cooked mesh blob ---------------------------------------------
     const CtShape trimeshShape = Ptr<CtShape>(gPp.shapes)[shapeID];

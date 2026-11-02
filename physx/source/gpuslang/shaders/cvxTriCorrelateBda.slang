@@ -16,15 +16,19 @@
 //
 // ONE WARP PER CONTACT MANAGER, AND THE COVERAGE IS EXACT.  The host launches
 // `ceil(numTests / CORRELATE_WARPS_PER_BLOCK)` blocks of two warps and passes
-// numTests as `numPairs` (PxgNarrowphaseCore.cpp:2702-2705) — there is no
-// grid-stride loop, so one workgroup per CUDA block with a constant-trip-2 loop
-// over its warps covers every pair exactly once, the same shape P8.48 uses.  No
+// numTests as `numPairs` (PxgNarrowphaseCore.cpp) — there is no grid-stride loop in
+// the CUDA.  The port's launch site (PXG_NO_CUDA_TOOLKIT) launches one 32-thread
+// group per CUDA warp, so the group index IS the CUDA's pair index; a group-stride
+// loop (stride WorkgroupCount().x, a group-uniform trip count) makes one pass at that
+// grid and still covers every pair at any smaller one -- at the CUDA's own grid a
+// group takes up to two pairs one grid-width apart.  No
 // ceiling, nothing silently skipped.
 //
 // `[numthreads(32,1,1)]` IS MANDATORY, not a preference: `crContactReduce6Cluster`
 // carries barriers in warp-uniform control flow, and llvmpipe does not error on a
-// divergent barrier — it HANGS.  The two warps of a CUDA block are therefore
-// serialised through one 32-thread group rather than run as a 64-thread one.
+// divergent barrier — it HANGS.  The two warps of a CUDA block therefore run as two
+// 32-thread groups rather than one 64-thread one (they used to be serialised through
+// one group).
 //
 // ===========================================================================
 // THE QUIRKS, ALL PORTED VERBATIM
@@ -279,13 +283,16 @@ void convexTrimeshCorrelate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
 {
     const uint lane = gtid.x;
 
-    for (uint sub = 0u; sub < CORRELATE_WARPS_PER_BLOCK; ++sub)
+    // One group per CUDA warp (see the header), and a group-stride loop so any smaller
+    // grid still covers every pair.  The loop bound is group-uniform.
+    for (uint pairLoop = gid.x; pairLoop < gCc.numPairs; pairLoop += WorkgroupCount().x)
     {
         AllMemoryBarrierWithGroupSync();
 
-        const uint pairIndex = gid.x * CORRELATE_WARPS_PER_BLOCK + sub;
-        if (pairIndex >= gCc.numPairs)
-            continue;
+        // llvmpipe can run a barrier-bearing loop body once more with an EMPTY mask and
+        // still issue its loads (P9.22, P9.49): the clamp keeps them inside the arrays.
+        // Every live iteration has pairIndex == pairLoop.
+        const uint pairIndex = min(pairLoop, max(gCc.numPairs, 1u) - 1u);
 
         // ConvexMeshPair, 56 B: PxTransform aToB (PxQuat q @0, PxVec3 p @16),
         // startIndex @28, count @32, cmIndex @36, roundedStartIndex @40.

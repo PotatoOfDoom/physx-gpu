@@ -602,9 +602,15 @@ struct CfPush
 };
 static_assert(sizeof(CfPush) == 160, "CfParams blob is 160 bytes");
 
-PXG_TEST(cvxTriFinish)
+// `groupsFor`: the dispatch for a pair count.  The engine launches ceil(numPairs / 2) blocks of
+// 64 threads, two warps (PxgNarrowphaseCore.cpp); the port's launch site (PXG_NO_CUDA_TOOLKIT)
+// launches one 32-thread group per CUDA warp, twice that, and the shader's group-stride loop
+// covers the CUDA's own grid, where one group takes the pair and then the decoy.  The decoy has
+// no manifold and reserves nothing, so the pair's atomics stay deterministic at either grid.
+static void runCvxTriFinish(const char* gridName, uint32_t (*groupsFor)(uint32_t))
 {
     PxgSlangComputeDevice* dev = testDevice();
+    std::printf("    [ note ] %s grid\n", gridName);
 
     std::mt19937 rng(4242001);
     // NRAND random cases, then NDIR directed ones (P9.86) that draw nothing from rng, so the random
@@ -951,7 +957,7 @@ PXG_TEST(cvxTriFinish)
             push.patchBytesLimit = in[i].cfg.x;
             push.contactBytesLimit = in[i].cfg.y;
             push.forceBytesLimit = in[i].cfg.z;
-            k.dispatch(1u, {}, push, 1u, 1u);
+            k.dispatch(groupsFor(push.numPairs), {}, push, 1u, 1u);
         }
         dev->flush();
     }
@@ -978,9 +984,10 @@ PXG_TEST(cvxTriFinish)
 
         // THE DECOY'S OWN OUTPUT.  Its allflags start at zero and it has no
         // manifolds, so the lane-0 block -- which runs whatever the manifold count
-        // -- must leave exactly this behind.  Checking it is what pins the
-        // constant-trip-2 warp loop: a kernel covering one warp per block would
-        // never reach pair 1 and these words would keep their 0xDEADBEEF/0 init.
+        // -- must leave exactly this behind.  Checking it is what pins the second
+        // warp: its own group at the port's grid, the second trip of the
+        // group-stride loop at the CUDA's -- a kernel covering one warp per block
+        // would never reach pair 1 and these words would keep their 0xDEADBEEF/0 init.
         const uint32_t* dco = &gOutB[i * 24 + 12];
         if (i % 5 == 2)
         {
@@ -1108,6 +1115,21 @@ PXG_TEST(cvxTriFinish)
                   "avg %zu flip %zu sphere %zu capsule %zu exact %zu conflict %zu)",
                   cOvfP, cOvfC, cOvfF, cZeroMan, cNoRes, cAvg, cFlip, cSphere, cCapsule,
                   cExact, cConflict);
+}
+
+PXG_TEST(cvxTriFinish)
+{
+    runCvxTriFinish("port", [](uint32_t n) { return 2u * ((n + 1u) / 2u); });
+}
+
+// The CUDA's grid, then one and three groups.  A dispatch here carries at most two pairs (the
+// case and its decoy), so one group IS the CUDA's grid for those and three groups give every
+// pair its own group: these two runs re-check the same partitions, they add no stride case.
+PXG_TEST(cvxTriFinishCudaGrid)
+{
+    runCvxTriFinish("CUDA", [](uint32_t n) { return (n + 1u) / 2u; });
+    runCvxTriFinish("one-group", [](uint32_t) { return 1u; });
+    runCvxTriFinish("three-group", [](uint32_t) { return 3u; });
 }
 
 } // namespace

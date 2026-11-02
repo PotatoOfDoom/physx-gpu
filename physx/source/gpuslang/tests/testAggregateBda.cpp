@@ -670,6 +670,31 @@ bool L(PxgCudaShim* shim, uint32_t id, uint32_t grid, const void* blob, uint32_t
 {
     return shim->launchKernel(id, grid, 1, 1, blob, size) == PxgResult::Success;
 }
+
+// The grid of a warp-per-item kernel with `warps` warps per CUDA block.  The engine launches
+// `cudaBlocks` blocks; the port's launch sites (PxgAABBManager.cpp, PXG_NO_CUDA_TOOLKIT) launch
+// one 32-thread group per CUDA warp, cudaBlocks * warps, and the shaders' group-stride loops
+// cover the CUDA's own grid too, where a group takes `warps` items one grid-width apart.  Every
+// test runs once at each (the ...CudaGrid twins set this flag), and the twins run again at
+// exactly one and three groups (gAggGroups), where every group takes many items.
+static bool gAggCudaGrid = false;
+static uint32_t gAggGroups = 0;   // nonzero: dispatch exactly this many groups
+static uint32_t aggGrid(uint32_t cudaBlocks, uint32_t warps)
+{
+    if (gAggGroups != 0u)
+        return gAggGroups;
+    return gAggCudaGrid ? cudaBlocks : cudaBlocks * warps;
+}
+// The CUDA grid, then one group, then three: the same scenario and the same oracle each time.
+static void aggTwinRuns(void (*run)())
+{
+    gAggCudaGrid = true; run(); gAggCudaGrid = false;
+    for (uint32_t g : { 1u, 3u })
+    {
+        std::printf("    [ note ] %u group(s)\n", g);
+        gAggGroups = g; run(); gAggGroups = 0u;
+    }
+}
 struct Two { uint64_t a, b; };
 struct One { uint64_t a; };
 
@@ -805,7 +830,7 @@ void makeAggregate(World& w, uint32_t g, const std::vector<uint32_t>& members, u
 }
 
 // ---------------------------------------------------------------------------
-PXG_TEST(aggregateBda_dirtyBounds)
+static void aggregateBda_dirtyBounds_run()
 {
     PxgSlangComputeDevice* dev = testDevice();
     PxgCudaShim* shim = makeShim(dev);
@@ -922,7 +947,7 @@ PXG_TEST(aggregateBda_dirtyBounds)
     struct MAD { uint64_t bp, desc, del; uint32_t nbDel, pad0; uint64_t add; uint32_t nbAdd, pad1; }
         mad = { w.bpDesc, w.desc, delB, nbDel, 0, addB, nbAdd, 0 };
     bool ok = true;
-    ok &= L(shim, K_UPD_DIRTY, (uint32_t(dirty.size()) + 15) / 16, &ud, sizeof(ud));
+    ok &= L(shim, K_UPD_DIRTY, aggGrid((uint32_t(dirty.size()) + 15) / 16, 16), &ud, sizeof(ud));
     shim->streamSynchronize();
     // ---- oracle: updateDirtyAggregate, compared on its own (clearDirty rewrites prevSize) ----
     for (uint32_t k = 0; k < dirty.size(); ++k)
@@ -942,9 +967,9 @@ PXG_TEST(aggregateBda_dirtyBounds)
         }
     }
     size_t badDirty = m.compare({}, "updateDirtyAggregate");
-    ok &= L(shim, K_MARK_BITMAP, (NAGG + 7) / 8, &mark, sizeof(mark));
-    ok &= L(shim, K_UPD_BOUNDS, (NAGG + 15) / 16, &ub, sizeof(ub));
-    ok &= L(shim, K_CLEAR_DIRTY, (uint32_t(dirty.size()) + 15) / 16, &cdp, sizeof(cdp));
+    ok &= L(shim, K_MARK_BITMAP, aggGrid((NAGG + 7) / 8, 8), &mark, sizeof(mark));
+    ok &= L(shim, K_UPD_BOUNDS, aggGrid((NAGG + 15) / 16, 16), &ub, sizeof(ub));
+    ok &= L(shim, K_CLEAR_DIRTY, aggGrid((uint32_t(dirty.size()) + 15) / 16, 16), &cdp, sizeof(cdp));
     // the host's grid: (max + (127) / 128) -- a precedence slip that launches max blocks
     ok &= L(shim, K_MARK_ADD_DEL, std::max(nbDel, nbAdd), &mad, sizeof(mad));
     shim->streamSynchronize();
@@ -1021,14 +1046,14 @@ PXG_TEST(aggregateBda_dirtyBounds)
 void runSortSelf(World& w, PxgCudaShim* shim, bool& ok)
 {
     Two ts = { w.bpDesc, w.desc };
-    ok &= L(shim, K_SORT, (w.nbAgg + 1) / 2, &ts, sizeof(ts));
-    ok &= L(shim, K_SELF, (w.nbAgg + 15) / 16, &ts, sizeof(ts));
+    ok &= L(shim, K_SORT, aggGrid((w.nbAgg + 1) / 2, 2), &ts, sizeof(ts));
+    ok &= L(shim, K_SELF, aggGrid((w.nbAgg + 15) / 16, 16), &ts, sizeof(ts));
     shim->streamSynchronize();
     oSort(w.m, w.bpDesc, w.desc);
     oSelf(w.m, w.bpDesc, w.desc);
 }
 
-PXG_TEST(aggregateBda_sortSelf)
+static void aggregateBda_sortSelf_run()
 {
     PxgSlangComputeDevice* dev = testDevice();
     PxgCudaShim* shim = makeShim(dev);
@@ -1119,7 +1144,7 @@ PXG_TEST(aggregateBda_sortSelf)
 }
 
 // ---------------------------------------------------------------------------
-PXG_TEST(aggregateBda_pairs)
+static void aggregateBda_pairs_run()
 {
     PxgSlangComputeDevice* dev = testDevice();
     PxgCudaShim* shim = makeShim(dev);
@@ -1160,7 +1185,7 @@ PXG_TEST(aggregateBda_pairs)
     // aggregate 2 loses three members, so its previous frame has prevSize = the old size
     bool ok = true;
     Two ts = { w.bpDesc, w.desc };
-    ok &= L(shim, K_SORT, (NAGG + 1) / 2, &ts, sizeof(ts));
+    ok &= L(shim, K_SORT, aggGrid((NAGG + 1) / 2, 2), &ts, sizeof(ts));
     shim->streamSynchronize();
     oSort(m, w.bpDesc, w.desc);
     size_t badSort = m.compare({}, "pairs: first sort");
@@ -1170,7 +1195,7 @@ PXG_TEST(aggregateBda_pairs)
         m.u32(a2 + A_SIZE) = m.u32(a2 + A_SIZE) - 3;
     }
     m.upload();
-    ok &= L(shim, K_SORT, (NAGG + 1) / 2, &ts, sizeof(ts));
+    ok &= L(shim, K_SORT, aggGrid((NAGG + 1) / 2, 2), &ts, sizeof(ts));
     shim->streamSynchronize();
     oSort(m, w.bpDesc, w.desc);
 
@@ -1217,7 +1242,7 @@ PXG_TEST(aggregateBda_pairs)
     One od = { w.desc };
     ok &= L(shim, K_ADD1, 64, &ab, sizeof(ab));
     ok &= L(shim, K_ADD2, 64, &ab, sizeof(ab));
-    ok &= L(shim, K_PAIR, 8192, &ts, sizeof(ts));
+    ok &= L(shim, K_PAIR, aggGrid(8192, 2), &ts, sizeof(ts));
     shim->streamSynchronize();
     oAdd(m, w.desc, w.bpDesc);
     oPairs(m, w.bpDesc, w.desc);
@@ -1272,5 +1297,12 @@ PXG_TEST(aggregateBda_pairs)
     PXG_CHECK_MSG(bad == 0, "%zu words differ from the CUDA transcription", bad);
     delete shim;
 }
+
+PXG_TEST(aggregateBda_dirtyBounds) { gAggCudaGrid = false; aggregateBda_dirtyBounds_run(); }
+PXG_TEST(aggregateBda_sortSelf) { gAggCudaGrid = false; aggregateBda_sortSelf_run(); }
+PXG_TEST(aggregateBda_pairs) { gAggCudaGrid = false; aggregateBda_pairs_run(); }
+PXG_TEST(aggregateBda_dirtyBoundsCudaGrid) { aggTwinRuns(aggregateBda_dirtyBounds_run); }
+PXG_TEST(aggregateBda_sortSelfCudaGrid) { aggTwinRuns(aggregateBda_sortSelf_run); }
+PXG_TEST(aggregateBda_pairsCudaGrid) { aggTwinRuns(aggregateBda_pairs_run); }
 
 } // namespace
