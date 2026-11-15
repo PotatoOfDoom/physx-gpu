@@ -1,10 +1,10 @@
 # physx-gpu — PhysX with Slang GPU kernels (CUDA migration)
 
-This repository tracks the migration of the **NVIDIA PhysX 5.6.1** GPU
-pipeline away from CUDA to **Slang** compute shaders with **Vulkan** and
-**Direct3D 12** backends.
+This repository is a port of all PhysX GPU kernels to Slang for usage in Vulkan and DirectX. This is 100% vibeslopped but I actively tested the functionality and verified everything on my amd gpu.
 
-- `physx/` — the imported PhysX 5.6.1 open-source release (BSD-3-Clause),
+Overview:
+
+- `physx/` — the imported PhysX 5.12 open-source release (BSD-3-Clause),
   unmodified baseline including the original CUDA sources.
   See [UPSTREAM_README.md](UPSTREAM_README.md) and [LICENSE.md](LICENSE.md).
 - `physx/source/gpuslang/` — the migration: Slang kernels, the
@@ -28,4 +28,18 @@ cmake --build build-gpuslang -j
 ctest --test-dir build-gpuslang --output-on-failure
 ```
 
-The suite runs GPU-less (Mesa llvmpipe) and on real GPUs alike.
+### Or if you are using Visual Studio
+
+1. Get the Vulkan SDK
+2. start physx/generate_projects.bat
+3. use preset 7 (vc18win64-vulkan)
+4. open the visual studio solution physx/compiler/vc18win64-vulkan/PhysXSDK.slnx
+5. Build the ALL_BUILD configuration
+6. Wait a little bit
+7. Go to physx/bin/win.x86_64.vc145.md/<YOUR_BUILD_PROFILE>/
+8. Enjoy the snippet physx examples running on your gpu using vulkan.
+9. Integrate this SDK into your project
+10. Be happy that you saved so many claude tokens for your project
+
+### Note
+The Directx 12 part is untested. I only really verified the Vulkan part.
